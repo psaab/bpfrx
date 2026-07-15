@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 
 	"github.com/psaab/xpf/pkg/api"
@@ -38,19 +39,17 @@ import (
 //     RETAINED (fail-closed, not mgmt-down), its fingerprint field is left
 //     unrecorded so the next commit RETRIES the bind (retry debt), and the error
 //     is surfaced.
-//   - AUTH ORDERING (revocation honored regardless of any rebind outcome): a
-//     credential TIGHTENING (a non-nil auth snapshot — the revoked credential
-//     removed from the set) is published to the live server UP FRONT, before any
-//     leg is touched, so a single commit that BOTH revokes a credential AND
-//     changes a bind that then fails to bind still rejects the revoked credential
-//     on the next request (the persistent listener already enforces it). A
-//     non-nil auth only ADDS a requirement, so it can never fail-open — publishing
-//     it early is unconditionally safe. Removing ALL api-auth (nil) is the one
-//     case deferred to convergence: it is published only once every leg is at its
-//     desired bind, so a non-loopback listener RETAINED by a failed rebind is
-//     never dropped to no-auth (next.Auth == nil is only reachable when the
-//     desired bind is loopback per the #4047/#5127 clamp, so on convergence the
-//     live state is loopback).
+//   - AUTH ORDERING (revocation decoupled from the HTTPS leg): auth publishes as
+//     soon as the HTTP leg is at its desired bind (httpOK), INDEPENDENT of the
+//     HTTPS-leg outcome — a committed credential revocation must not be blocked
+//     by an HTTPS bind failure. When httpOK the live HTTP listener is at
+//     next.Addr, whose #4047/#5127 loopback clamp justified next.Auth, so
+//     applying it there cannot fail-open; it defers ONLY when the HTTP leg's OWN
+//     rebind failed (the retained old bind may not match next.Auth's clamp). A
+//     TIGHTENING (non-nil) is published whatever the HTTPS outcome (it only ADDS
+//     a requirement). Removing ALL api-auth (nil) additionally requires the LIVE
+//     HTTPS to be off/loopback, so a non-loopback HTTPS retained by a failed
+//     rebind is never dropped to no-auth.
 //
 // The reconcile is serialized by mu; the apply path (applyConfigLocked under the
 // apply semaphore) already runs commits one at a time, so a newer generation can
@@ -152,28 +151,16 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		return nil
 	}
 
-	// #5866 revocation-honoring: publish a credential TIGHTENING (a non-nil auth
-	// snapshot — e.g. a revoked credential removed from the set) to the live
-	// server UP FRONT, before any listener leg is touched, so the revocation
-	// takes effect on the persistent listener(s) on the NEXT request REGARDLESS
-	// of any HTTP/HTTPS rebind outcome. A single commit that BOTH revokes a
-	// credential AND changes a bind that then fails to bind must NOT keep the
-	// revoked credential usable on the retained listener. A non-nil auth only
-	// ADDS a requirement — it can never fail-open — so publishing it early is
-	// unconditionally safe. Removing ALL api-auth (nil) is instead deferred to
-	// after the legs converge (below), so a non-loopback listener retained by a
-	// failed rebind is never dropped to no-auth (fail-open).
-	if next.Auth != nil {
-		m.srv.ReplaceAuth(next.Auth)
-	}
-
 	var errs []error
 
 	// HTTP leg: make-before-break rebind ONLY if the HTTP bind changed. Advance
-	// the converged fingerprint only on success (retry debt on failure).
+	// the converged fingerprint only on success (retry debt on failure); httpOK
+	// records whether the live HTTP listener is now at next.Addr.
+	httpOK := true
 	if next.Addr != m.cur.addr {
 		if err := m.srv.ReconcileHTTP(next.Addr); err != nil {
 			errs = append(errs, err)
+			httpOK = false
 		} else {
 			m.cur.addr = next.Addr
 		}
@@ -190,15 +177,26 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		}
 	}
 
-	if len(errs) == 0 {
-		// Every changed leg converged to its desired bind. If the commit removes
-		// ALL api-auth (nil), publish it now — safe because next.Auth == nil is
-		// only reachable when the desired bind is loopback (#4047/#5127 clamp), so
-		// the live state is loopback. (A non-nil tightening was already published
-		// above.)
-		if next.Auth == nil {
+	// Auth is published once the HTTP leg is at its desired bind, DECOUPLED from
+	// the HTTPS leg (#5866 Finding A): a committed credential revocation must not
+	// be blocked by an HTTPS bind failure. httpOK means the live HTTP listener is
+	// at next.Addr, whose #4047/#5127 loopback clamp JUSTIFIED next.Auth (incl. a
+	// legitimate nil-on-loopback), so applying next.Auth there cannot fail-open;
+	// it defers ONLY when the HTTP leg's OWN rebind failed (the retained old bind
+	// may not match next.Auth's clamp). A credential TIGHTENING (non-nil) only
+	// ADDS a requirement, so it is published as soon as the HTTP leg is good,
+	// regardless of the HTTPS outcome. Removing ALL api-auth (nil) additionally
+	// requires the LIVE HTTPS to be off or loopback, so a non-loopback HTTPS
+	// retained by a failed HTTPS rebind is never dropped to no-auth (fail-open).
+	if httpOK {
+		if next.Auth != nil {
+			m.srv.ReplaceAuth(next.Auth)
+		} else if !m.cur.tls || mgmtAddrIsLoopback(m.cur.httpsAddr) {
 			m.srv.ReplaceAuth(nil)
 		}
+	}
+
+	if len(errs) == 0 {
 		return nil
 	}
 	joined := errors.Join(errs...)
@@ -206,6 +204,21 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		"desired", endpointOf(next).summary(), "err", joined)
 	return fmt.Errorf("web-management reconcile to %s incomplete; retaining previous listener(s): %w",
 		endpointOf(next).summary(), joined)
+}
+
+// mgmtAddrIsLoopback reports whether a "host:port" bind is loopback, treating an
+// empty addr (no listener on that leg) as loopback and an unparseable host as
+// NON-loopback (fail-closed). Used to gate a nil-auth (remove-all-api-auth)
+// publish so a non-loopback listener is never dropped to no-auth (#5866).
+func mgmtAddrIsLoopback(addr string) bool {
+	if addr == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return hostIsLoopback(host)
 }
 
 // wait blocks until every serve goroutine (live + retiring legs) has drained.

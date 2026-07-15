@@ -441,6 +441,53 @@ func TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866(t *testing.T) {
 	}
 }
 
+// #5866 fail-open avoidance (the counterpart to the revocation-honoring case):
+// removing ALL api-auth (next.Auth == nil, which clamps the HTTP bind to
+// loopback) while the HTTP leg's OWN rebind to that loopback address FAILS must
+// NOT drop the retained NON-loopback HTTP listener to no-auth. The nil auth is
+// deferred (httpOK == false), so the retained listener keeps its previous
+// credential set — no fail-open — and converges on retry.
+func TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Live: non-loopback HTTP with auth (valid — auth present).
+	auth := &api.AuthConfig{Users: map[string]string{"admin": "secret"}}
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", auth)); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+	oldHTTP := reg.get("10.0.0.1:8080")
+
+	// Commit removes ALL api-auth -> the bind clamps to loopback (127.0.0.1),
+	// but that rebind FAILS. next.Auth == nil.
+	reg.failAddr["127.0.0.1:8080"] = true
+	err := m.reconcileTo(cfgFor(reg, "127.0.0.1:8080", false, "", nil))
+	if err == nil {
+		t.Fatal("a failed HTTP rebind must surface an error")
+	}
+
+	// The nil auth was NOT applied: the retained NON-loopback HTTP listener still
+	// enforces the previous credential — dropping it to no-auth would be a
+	// fail-open on a non-loopback bind.
+	snap := m.srv.AuthSnapshotForTest()
+	if snap == nil {
+		t.Fatal("api-auth was removed while the retained listener is still non-loopback — FAIL-OPEN (#5866): " +
+			"a nil-on-loopback auth must not be applied to a retained non-loopback listener")
+	}
+	if _, ok := snap.Users["admin"]; !ok {
+		t.Fatal("the retained listener lost its credential set on a failed HTTP rebind (#5866)")
+	}
+	// Old non-loopback listener retained + open; fingerprint not advanced.
+	if !oldHTTP.isOpen() {
+		t.Fatal("the old HTTP listener was closed on a failed rebind (mgmt went down)")
+	}
+	if m.cur.addr != "10.0.0.1:8080" {
+		t.Fatalf("HTTP fingerprint = %q, want the retained 10.0.0.1:8080 (retry debt)", m.cur.addr)
+	}
+}
+
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false

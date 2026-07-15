@@ -180,18 +180,20 @@ credential revocation is enforced even on an apply that returns early
   next commit retries (retry debt), and log the error. This does not brick an
   otherwise-successful commit (same posture as `reconcileSNMP` bind-failure
   retry).
-- **Auth ordering — revocation honored regardless of rebind outcome**: a
-  credential TIGHTENING (a non-nil snapshot — the revoked credential removed from
-  the set) is published to the live server UP FRONT, before any leg is touched,
-  so a single commit that BOTH revokes a credential AND changes a bind that then
-  fails to bind still rejects the revoked credential on the next request (the
-  persistent listener already enforces it). A non-nil auth only ADDS a
-  requirement — it can never fail-open — so publishing it early is unconditionally
-  safe. Removing ALL api-auth (nil) is the one case deferred to convergence, so a
-  non-loopback listener retained by a failed rebind is never dropped to no-auth
-  (`next.Auth == nil` is only reachable when the desired bind is loopback per the
-  #4047/#5127 clamp). Pinned by
-  `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`. The reconcile is
+- **Auth ordering — revocation decoupled from the HTTPS leg**: auth publishes as
+  soon as the HTTP leg is at its desired bind (`httpOK`), INDEPENDENT of the
+  HTTPS-leg outcome — a committed credential revocation must not be blocked by an
+  HTTPS bind failure. When `httpOK` the live HTTP listener is at `next.Addr`,
+  whose #4047/#5127 loopback clamp justified `next.Auth`, so applying it there
+  cannot fail-open; it defers ONLY when the HTTP leg's OWN rebind failed (the
+  retained old bind may not match `next.Auth`'s clamp). A tightening (non-nil)
+  publishes whatever the HTTPS outcome (it only ADDS a requirement). Removing ALL
+  api-auth (nil) additionally requires the live HTTPS to be off/loopback, so a
+  non-loopback HTTPS retained by a failed rebind is never dropped to no-auth.
+  Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
+  (revocation honored across a failing HTTPS rebind) +
+  `TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866` (nil auth NOT
+  applied to a retained non-loopback listener — no fail-open). The reconcile is
   serialized by its mutex and the apply semaphore, so a newer generation never
   completes behind an older one.
 
