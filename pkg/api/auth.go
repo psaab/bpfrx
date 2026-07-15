@@ -17,15 +17,15 @@ type AuthConfig struct {
 // authMiddleware wraps an http.Handler with Basic Auth / Bearer / X-API-Key
 // checks. /health always bypasses authentication (it exposes no sensitive data
 // and is a liveness probe). /metrics bypasses authentication only when
-// metricsRequireAuth is false — the loopback-bind default, the standard
-// Prometheus posture. When the HTTP API is rebound to a routable management
-// interface (metricsRequireAuth true), /metrics requires credentials like every
-// other endpoint so the aggregate session/counter surface is not exposed
-// unauthenticated on a routable interface (#4162).
+// metricsRequireAuth is false for a literal loopback bind, the standard
+// Prometheus posture. NewServer derives it independently from the configured
+// address of each enabled HTTP or HTTPS listener. A routable, wildcard,
+// hostname, malformed, or otherwise unprovable bind requires credentials for
+// /metrics like every other endpoint (#4162).
 func authMiddleware(cfg AuthConfig, metricsRequireAuth bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// /health is always exempt; /metrics is exempt unless the bind is
-		// non-loopback and auth-gating was requested.
+		// /health is always exempt; /metrics is exempt only when this listener
+		// has a literal loopback bind.
 		if r.URL.Path == "/health" || (r.URL.Path == "/metrics" && !metricsRequireAuth) {
 			next.ServeHTTP(w, r)
 			return

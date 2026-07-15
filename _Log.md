@@ -48013,3 +48013,21 @@ top.
   time.Minute` product turns the pathological cases RED — the products overflow
   non-positive (e.g. MaxInt64 → -1m0s, 200000000 → -1790762h...) and
   time.NewTicker panics "non-positive interval for NewTicker"; restored GREEN.
+
+- **Timestamp**: 2026-07-14 14:15 PDT
+  **Action**: Fix #4162 — make Prometheus metrics authentication listener-owned.
+  `NewServer` now builds the mux, Prometheus collector/limiter, and CSRF guard
+  once, then independently derives each HTTP/HTTPS owner handler from that
+  listener's configured bind. With API auth, only a literal loopback listener
+  leaves `/metrics` open; routable, wildcard, hostname, malformed, and
+  otherwise unprovable binds fail closed. Nil auth returns the unchanged shared
+  base. This preserves the global scrape limiter and session-gauge cache while
+  keeping `/health` exempt. The actual owner-handler matrix covers both mixed
+  listener orientations, Basic/Bearer/API-key credentials, IPv4/IPv6 loopback,
+  wildcard/hostname/malformed failure, auth-wrapped health/non-metrics routes,
+  nil-auth 404 pass-through, and persistence-degraded HTTPS installation.
+  **File(s)**: pkg/api/server.go, pkg/api/auth.go,
+  pkg/api/metrics_auth_gate_4162_test.go, docs/architecture.md, _Log.md
+  **Validation**: `gofmt -w pkg/api/server.go pkg/api/auth.go
+  pkg/api/metrics_auth_gate_4162_test.go`; focused #4162/cache/TLS/lifecycle
+  `go test ./pkg/api -run 'Test(IsLoopbackBindAddr|MetricsAuthGateNonLoopback|NewServerMetricsAuthIsOwnedByEachListener|SessionGaugeCacheWalksOncePerTTL|SessionGaugeCacheRefreshesAfterTTL|SessionGaugeCacheCoalescesConcurrentScrapes|SessionGaugeCacheValuesCorrect|HTTPSInstalledOnPersistFailure|RunClosesSurvivingListenerOnBindFailure|RunGracefulShutdownClosesBothListeners)$' -count=1`; `go test ./pkg/api -count=1`; `go test -race ./pkg/api -count=1`; `go vet ./pkg/api`; `go build ./pkg/api`; `go build ./cmd/xpfd`; all passed. `git diff --check` passed. Residual gaps: none; no true certificate-generation-failure seam exists in the approved scope.
