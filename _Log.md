@@ -48208,3 +48208,35 @@ top.
   artifact is erased (no secret-retention regression) and every unowned sibling
   survives. Restoring the `*.conf`/`rollback*` globs deletes the 4 siblings and
   flips both tests RED (verified).
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5807 (bug, audit, security): capture SIGTERM/SIGINT BEFORE the
+  mutating startup phases. Run() (pkg/daemon/daemon_run.go) loaded/bootstrapped
+  config, renamed interfaces, initialized managers (FRR/IPsec/RPM/cluster/VRRP/
+  DHCP), ran the first applyConfig, and loaded/Start-ed the dataplane, and only
+  THEN installed signal.NotifyContext (old PHASE 4). A SIGTERM (or daemon-mode
+  SIGINT) during phases 1-3 hit the process default action = immediate kill:
+  runShutdownSequence never ran, leaving partially-applied links/routes/FRR/
+  IPsec/DHCP/HA/dataplane state with no fencing. Fixed by capturing signals at
+  the TOP of Run via a new startupSignalContext() helper (same set: interactive
+  = SIGTERM, daemon = SIGTERM+SIGINT), reassigning ctx so it carries through all
+  phases. Wrapped phases 1-4 in a testable seam: runStartupPhases(ctx, phases)
+  checks ctx.Err() at each phase boundary; runStartupOrAbort(ctx, phases,
+  teardown) runs the ordered runShutdownSequence teardown for the initialized
+  subset (already nil-guarded per subsystem) and returns non-zero when a signal
+  cancels mid-startup, while preserving the pre-#5807 defers-only path for a
+  plain phase error (distinguished by ctx.Err(), not error identity). Kept
+  d.daemonCtx as the RAW signal-uncancelled parent for the four long-lived
+  startup runtimes (cluster.Start, watchClusterEvents, startKernelSelfRecovery,
+  dp.Start) — the teardown needs them live — so initManagers /
+  setupDataplaneAndInitialConfig no longer take a ctx param (dp.Start now uses
+  d.daemonCtx, matching the existing bootstrap-exit dp.Start). main.go unchanged
+  (signal captured inside Run).
+  **File(s)**: pkg/daemon/daemon_run.go, pkg/daemon/README.md,
+  pkg/daemon/startup_signal_5807_test.go, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/daemon/ ./cmd/xpfd/ -count=1`
+  (green); `go vet ./pkg/daemon/ ./cmd/xpfd/` clean. Fail-on-revert tests:
+  cancel between phases → later phases do NOT run + teardown fires with the
+  abort error; plain phase error → no teardown; startupSignalContext returns a
+  cancellable child (Done()!=nil, not Background). Removing the between-phase
+  ctx.Err() check flips the abort tests RED (verified: phases ran p1,p2,p3,p4).
