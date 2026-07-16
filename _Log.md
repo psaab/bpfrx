@@ -48841,3 +48841,21 @@ top.
     clear → error case silently transitions, tests RED).
   - **File(s)**: cmd/cli/shared.go, cmd/cli/config_exit_retry_5812_test.go,
     cmd/cli/README.md
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5939 gate REST SessionCount full-table walk (sibling of #5782/#5937).
+    statusHandler (GET /api/v1/status, pkg/api/health.go) called SessionCount() — a
+    full v4+v6 session-map walk under per-bucket BPF-map locks, O(table) — with no
+    limiter gate. Routed it through the SHARED diagcmd.SessionWalkLimiter (the same
+    instance sessions.go uses for the /security/sessions* scans); on contention
+    fail fast with HTTP 429 via writeError, mirroring sessionsHandler. Choice = 429
+    (not bounded-count-omit): the walk is in the AUTHENTICATED /api/v1/status query,
+    NOT the unauthenticated liveness /health (healthHandler, which does NOT walk),
+    so a 429 here cannot flap the liveness probe — the flap concern is moot and 429
+    matches the whole REST session-scan surface. Admitted path count unchanged.
+    Fail-on-revert proven via -overlay (remove the gate → walks + returns 200 w/
+    count regardless of the saturated limiter, bound test RED). Doc: limiter.go
+    surface list adds /api/v1/status. NOTE: touches the same limiter.go comment
+    sentence as the unmerged #5937 (adds the gRPC count surfaces) — reconcile at merge.
+  - **File(s)**: pkg/api/health.go, pkg/api/status_sessioncount_bound_5939_test.go,
+    pkg/diagcmd/limiter.go
