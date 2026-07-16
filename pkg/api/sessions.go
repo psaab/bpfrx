@@ -316,9 +316,24 @@ func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP s
 	var lastV4 dataplane.SessionKey
 	var lastV6 dataplane.SessionKeyV6
 
+	// Abort the walk when the REST client disconnects (#5233). A SELECTIVE or
+	// no-match cursor query never fills the page, so without this the callback
+	// runs the remainder of a multi-million-entry conntrack table holding
+	// per-bucket BPF-map locks for a page nobody will read — contending with the
+	// live dataplane session-sync path. The non-cursor sessionsOffset /
+	// summary / zone-pair walks already sample this (same helper); the cursor
+	// path was the residual (#5233 closeout). Sampled per batch off the
+	// per-session hot path; r.Context().Err() is re-checked directly at each
+	// phase boundary (cheap, once per phase) so a disconnect neither launches
+	// the second full walk nor writes a misleading terminal envelope.
+	cancelled := newRequestCancelSampler(r.Context(), sessionWalkCancelInterval)
+
 	// Phase 1: v4 from cursor.
 	if startV4 {
 		if err := iterDP.IterateSessionsFrom(cursorV4, func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if cancelled() {
+				return false
+			}
 			if len(all) >= pageSize {
 				return false
 			}
@@ -332,6 +347,9 @@ func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP s
 			writeError(w, http.StatusInternalServerError, "iterate sessions: "+err.Error())
 			return
 		}
+		// A full page is a complete, valid result — emit it even though the
+		// callback may have observed cancellation on its final probe (the client
+		// being gone only means the write is discarded).
 		if len(all) >= pageSize {
 			s.writeSessionList(w, r, SessionListResponse{
 				PageSize:      pageSize,
@@ -343,9 +361,18 @@ func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP s
 		startV6 = true
 	}
 
-	// Phase 2: v6.
+	// Phase 2: v6. The direct r.Context().Err() check gates BOTH the v4->v6
+	// transition and the v6-start-token path: never launch a second full-table
+	// walk for a client that has already disconnected, and never emit a
+	// (misleading) partial/terminal envelope to a dead connection (#5233).
 	if startV6 {
+		if r.Context().Err() != nil {
+			return
+		}
 		if err := iterDP.IterateSessionsV6From(cursorV6, func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if cancelled() {
+				return false
+			}
 			if len(all) >= pageSize {
 				return false
 			}
@@ -369,7 +396,12 @@ func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP s
 		}
 	}
 
-	// Both families exhausted — last page, empty next_page_token.
+	// Both families exhausted — last page, empty next_page_token. Suppress the
+	// terminal envelope if the client disconnected during the final walk: a
+	// "last page, no next token" reply would misrepresent iteration state.
+	if r.Context().Err() != nil {
+		return
+	}
 	s.writeSessionList(w, r, SessionListResponse{
 		PageSize: pageSize,
 		Sessions: all,
