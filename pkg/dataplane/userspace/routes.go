@@ -61,7 +61,7 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 				continue
 			}
 			tableName, familyName := normalizeRouteSnapshotFamily(table, family, route.Destination)
-			snap := RouteSnapshot{
+			base := RouteSnapshot{
 				Table:       tableName,
 				Family:      familyName,
 				Destination: route.Destination,
@@ -78,17 +78,69 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 				NextTable:  route.NextTable,
 				Preference: route.Preference,
 			}
+			// #5678: group next-hops by their EFFECTIVE preference. A
+			// qualified-next-hop carries its own admin distance (#3871
+			// HasPreference — the Junos floating-static idiom: a primary
+			// next-hop plus a less-preferred backup); a plain next-hop uses the
+			// route-level preference. Emit ONE snapshot per distinct preference
+			// so a backup lowers as a SEPARATE, higher-preference standby route,
+			// NOT co-installed with the primary as an equal-cost ECMP member.
+			// The Rust FIB tie-breaks same-prefix routes by ascending
+			// preference (#2390 sort_routes) and selects the lowest via
+			// first-match lookup, holding the higher-preference backup as a
+			// standby entry — so folding the backup into the primary's next-hop
+			// list load-balanced traffic across both instead of preferring the
+			// primary (the #5678 silent routing-semantics change). Next-hops
+			// that share a preference (a plain `next-hop [ a b ]` list, or
+			// qualified next-hops at the SAME distance) stay a single
+			// equal-cost ECMP snapshot — no regression for real ECMP. Mirrors
+			// the FRR renderer (pkg/frr/config_render.go), which emits one `ip
+			// route` line per next-hop at dist = nh.Preference when
+			// HasPreference else the route-level distance.
+			type prefGroup struct {
+				preference int
+				nextHops   []string
+			}
+			order := make([]int, 0, len(route.NextHops))
+			groups := make(map[int]*prefGroup)
 			for _, nh := range route.NextHops {
+				var target string
 				switch {
 				case nh.Address != "" && nh.Interface != "":
-					snap.NextHops = append(snap.NextHops, nh.Address+"@"+nh.Interface)
+					target = nh.Address + "@" + nh.Interface
 				case nh.Address != "":
-					snap.NextHops = append(snap.NextHops, nh.Address)
+					target = nh.Address
 				case nh.Interface != "":
-					snap.NextHops = append(snap.NextHops, "@"+nh.Interface)
+					target = "@" + nh.Interface
+				default:
+					continue
 				}
+				pref := route.Preference
+				if nh.HasPreference {
+					pref = nh.Preference
+				}
+				g, ok := groups[pref]
+				if !ok {
+					g = &prefGroup{preference: pref}
+					groups[pref] = g
+					order = append(order, pref)
+				}
+				g.nextHops = append(g.nextHops, target)
 			}
-			addSnapshot(snap)
+			if len(order) == 0 {
+				// No forwarding next-hops (discard / reject / next-table, or
+				// every next-hop had an empty target): emit the base
+				// disposition unchanged so the negative-route / leak entry is
+				// preserved.
+				addSnapshot(base)
+				continue
+			}
+			for _, pref := range order {
+				snap := base
+				snap.Preference = groups[pref].preference
+				snap.NextHops = groups[pref].nextHops
+				addSnapshot(snap)
+			}
 		}
 	}
 	interfaceTablesV4, interfaceTablesV6 := buildInterfaceRouteTables(cfg)

@@ -139,6 +139,27 @@ Route metadata crosses the Go→Rust snapshot boundary as `RouteSnapshot`
   preference). Two same-prefix routes in a table select by operator
   preference, not insertion order; same-prefix/same-preference routes
   keep insertion order (stable sort).
+- **Qualified-next-hop backups lower as distinct-preference standby
+  routes (#5678).** A Junos floating static (a primary `next-hop` plus a
+  `qualified-next-hop <gw> { preference N; }` backup, #3871) carries a
+  PER-next-hop admin distance. The Go snapshot builder
+  (`pkg/dataplane/userspace/routes.go`) groups a route's next-hops by
+  their EFFECTIVE preference (the qualified `nh.Preference` when
+  `HasPreference`, else the route-level `Preference`) and emits ONE
+  `RouteSnapshot` per distinct preference. So the backup arrives as a
+  SEPARATE, higher-preference route for the same prefix — the #2390
+  tie-break above then selects the primary and holds the backup as a
+  standby entry (first-match lookup never reaches it while the primary
+  route is present). Before #5678 the builder collapsed every next-hop
+  onto ONE route-level-preference snapshot, so the backup was installed
+  as an equal-cost ECMP member and traffic load-balanced across both
+  tiers — a silent routing-semantics change. Next-hops that SHARE a
+  preference (a plain `next-hop [ a b ]` list, or qualified next-hops at
+  the same distance) still collapse to one equal-cost ECMP snapshot, so
+  real ECMP is unaffected. This mirrors the FRR renderer
+  (`pkg/frr/config_render.go`), which emits one `ip route` line per
+  next-hop at `dist = nh.Preference` when `HasPreference` else the
+  route-level distance.
 
 All three wire fields (`routing_instance`, `next_hops`, `preference`)
 are additive: an old Rust helper ignores them (pre-fix behavior) and an
