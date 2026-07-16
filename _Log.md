@@ -1,3 +1,33 @@
+## 2026-07-16 — #5961 test: fail-on-revert cover config-sync transport wiring
+- **Timestamp**: 2026-07-16 (fix/5961-configsync-wiring-test)
+- **Action**: Closed the #5054 (PR #5958) test-coverage gap. The existing
+  fail-on-revert suite (`configsync_transport_5054_test.go`) exercised the
+  DECISION FUNCTION (`rg0ConfigSyncAuthority` + `commitAndApplyOperator`) but
+  NOT the per-transport WIRING — the gRPC/REST/local-shell `CommitFn` /
+  `CommitConfirmedFn` closures inlined at their construction sites in
+  `daemon_run.go`. Verified the gap live on origin/master (48672f892):
+  reverting the REST/shell `CommitFn` wiring to
+  `commitAndApply(ctx, comment, false)` left the ENTIRE `pkg/daemon` suite
+  green, so a single-transport #5054 regression was silent. Small testability
+  refactor: extracted the three transports' inline commit closures into six
+  named per-transport seams on `*Daemon` (`grpc/rest/shellCommitFn` +
+  `…CommitConfirmedFn`), each routing through
+  `commitAndApplyOperator` / `commitConfirmedAndApplyOperator`; rewired the
+  three `daemon_run.go` sites to call them. Added two table tests
+  (`TestTransportCommitFnWiringSyncsPeerByRG0Ownership`,
+  `TestTransportCommitConfirmedFnWiringSyncsPeerByRG0Ownership`) driving each
+  seam under rg0-owner / non-owner / standalone and asserting peer-sync IFF RG0
+  owner. Reverting ANY ONE seam to a hardcoded `syncPeer` reds exactly that
+  transport's sub-case (owner→false = 0 pushes; non-owner→true = 1 push);
+  proved each of gRPC/REST/shell reds independently. Corrected the
+  `configsync_transport_5054_test.go` header comment, which overstated that the
+  decision-function tests covered "the REST/shell wiring" — they invoke
+  `commitAndApplyOperator` directly, so a single-transport revert left them
+  green (the closed gap).
+- **File(s)**: pkg/daemon/daemon_run.go (extract 6 per-transport commit-fn
+  seams + rewire 3 sites), pkg/daemon/configsync_transport_5054_test.go
+  (2 new table tests + corrected header comment), _Log.md
+
 ## 2026-07-16 — #6027 cluster: purge m.garpCounts[rgID] on RG removal
 - **Timestamp**: 2026-07-16 (fix/6027-garpcounts-purge)
 - **Action**: Fixed the third same-id-re-add map-lifecycle gap in the
