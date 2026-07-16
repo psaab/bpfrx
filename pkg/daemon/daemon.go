@@ -555,6 +555,14 @@ type Daemon struct {
 	// wait for the 2-second periodic ticker.
 	reconcileNowCh chan struct{}
 
+	// reconcileTickHook, when non-nil, REPLACES the per-pass reconcile action
+	// (reconcileRGState) in reconcileRGStateLoop. Test-only seam (#5681 / M23):
+	// it lets the shutdown-ordering regression test make a reconcile pass
+	// observably in-flight so it can prove the loop is joined by the run
+	// WaitGroup BEFORE HA ownership-relinquish cleanup runs. Always nil in
+	// production; reconcileRGStatePass calls the real reconcileRGState.
+	reconcileTickHook func()
+
 	// Fabric cross-chassis forwarding state for periodic refresh.
 	fabricMu         sync.RWMutex
 	fabricIface      string // physical parent (XDP attachment point)
