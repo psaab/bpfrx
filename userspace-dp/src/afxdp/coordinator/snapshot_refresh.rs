@@ -29,6 +29,27 @@ impl super::Coordinator {
         // one link resolved this pass, so an all-unresolved refresh keeps the
         // working set (from a prior SyncFabricState) instead of wiping it.
         let replace = !new_fabrics.is_empty();
+        // #5686: when this pass resolves nothing (replace=false) we PRESERVE the
+        // working fabric set — but first drop any preserved link SUPERSEDED by a
+        // same-parent peer REPLACEMENT in the incoming snapshots. Otherwise the
+        // stale old peer stays a valid `resolve_fabric_redirect` target while the
+        // replacement peer is still unresolved (M01), and fabric-forwarded
+        // traffic is sent to a peer that is no longer current. Once the stale
+        // link is dropped, redirect for that parent yields no target during the
+        // resolution window and the packet takes its normal non-fabric
+        // disposition (safe). When replace=true the freshly-resolved
+        // `new_fabrics` is built entirely from the current snapshots, so no
+        // stale peer can survive there — the prune is only needed on the
+        // preserve path.
+        let superseded_removed = if replace {
+            false
+        } else {
+            let before = self.forwarding.fabrics.len();
+            self.forwarding
+                .fabrics
+                .retain(|link| !fabric_link_superseded_by_snapshots(link, snapshots));
+            before != self.forwarding.fabrics.len()
+        };
         // #3773 (M13): the skip list is pruned against whichever fabric set is
         // FINAL — a link kept from the prior resolved set is not reported as
         // "skipped" for the operator even if THIS pass could not re-resolve it
@@ -58,11 +79,23 @@ impl super::Coordinator {
             // use the snapshot's forwarding state which may have empty fabrics
             // if the peer MAC wasn't resolved at snapshot time.
             self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
-        } else if skips_changed {
-            // Nothing resolved this pass, but the skip diagnostics changed —
-            // publish the updated (named) skip set without disturbing the
-            // preserved working fabric links.
+        } else if skips_changed || superseded_removed {
+            // Nothing resolved this pass. Publish either because the skip
+            // diagnostics changed or because #5686 pruned a stale (superseded)
+            // link out of the preserved working set.
             self.forwarding.fabric_skips = pruned;
+            if superseded_removed {
+                // #5686: the pruned fabric set must also reach the worker
+                // fast-path Arc (`shared_fabrics` / `self.ha.fabrics`). The
+                // worker overwrites its forwarding.fabrics from that Arc ONLY
+                // when it is non-empty, so a stale non-empty `ha.fabrics` would
+                // re-add the superseded link the `ha.forwarding` store just
+                // removed. Store both so the stale peer is gone from every
+                // reader.
+                self.ha
+                    .fabrics
+                    .store(Arc::new(self.forwarding.fabrics.clone()));
+            }
             self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
         }
     }
@@ -152,7 +185,25 @@ impl super::Coordinator {
         // via refresh_fabric_links (SyncFabricState) and the snapshot
         // may not include them if the peer MAC wasn't resolved at
         // snapshot build time. Always keep the better-resolved set.
-        let preserved_fabrics = self.forwarding.fabrics.clone();
+        //
+        // #5686: but DROP any preserved link SUPERSEDED by a same-parent peer
+        // REPLACEMENT in this snapshot. If the snapshot names a new peer for a
+        // parent whose old peer is still resolved, keeping the old link would
+        // leave the STALE peer a valid `resolve_fabric_redirect` target while
+        // the replacement peer is still unresolved (its neighbor MAC not yet
+        // learned, so `populate_fabrics` skipped it and it is absent from the
+        // new build). Once dropped, redirect for that parent yields no target
+        // during the resolution window and the packet takes its normal
+        // non-fabric disposition (safe). A snapshot that still names the SAME
+        // peer (steady state) or omits the parent (fabric removed) does not
+        // supersede, so the working link survives as before.
+        let preserved_fabrics: Vec<FabricLink> = self
+            .forwarding
+            .fabrics
+            .iter()
+            .copied()
+            .filter(|link| !fabric_link_superseded_by_snapshots(link, &snapshot.fabrics))
+            .collect();
         // #3773 (M13): capture the prior fabric-skip set so the post-merge
         // transition log fires only when the named skip set actually changes.
         let old_fabric_skips = self.forwarding.fabric_skips.clone();

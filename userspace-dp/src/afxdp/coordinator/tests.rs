@@ -2035,6 +2035,128 @@ fn queue_warm_pass_warms_fabric_peer_over_parent_ifindex() {
     assert_eq!(item.hop, IpAddr::V4(Ipv4Addr::new(10, 99, 0, 2)));
 }
 
+// #5686: a fabric peer REPLACED under the same parent must not leave the OLD
+// peer selectable as a `resolve_fabric_redirect` target while the replacement
+// is still unresolved. A "resolved" fabric snapshot carries a parseable
+// `peer_mac`; an empty `peer_mac` (no neighbor) is the UNRESOLVED window that
+// `resolve_fabric_links_from_snapshots` skips.
+fn fabric_snap_5686(parent: i32, peer: &str, peer_mac: &str) -> crate::FabricSnapshot {
+    crate::FabricSnapshot {
+        name: format!("fab-{parent}"),
+        parent_ifindex: parent,
+        overlay_ifindex: parent + 1000,
+        peer_address: peer.to_string(),
+        local_mac: "02:bf:72:00:00:01".to_string(),
+        peer_mac: peer_mac.to_string(),
+        up: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn refresh_fabric_links_replacement_peer_invalidates_stale_old_5686() {
+    let mut coord = Coordinator::new();
+    let parent = 80i32;
+    let p_old: IpAddr = "10.99.0.2".parse().unwrap();
+    let p_new: IpAddr = "10.99.0.9".parse().unwrap();
+
+    // 1. Install P_old (resolved) under parent X → it is the redirect target.
+    coord.refresh_fabric_links(&[fabric_snap_5686(parent, "10.99.0.2", "02:00:00:00:00:02")]);
+    let res = resolve_fabric_redirect(&coord.forwarding).expect("P_old redirect after install");
+    assert_eq!(res.next_hop, Some(p_old), "P_old is the redirect target after install");
+    assert_eq!(res.egress_ifindex, parent);
+
+    // 2. Replace with P_new under the SAME parent while P_new is UNRESOLVED
+    //    (empty peer_mac → the resolver skips it, so nothing resolves this pass
+    //    and the preserve path runs). #5686: the stale P_old must NO LONGER be
+    //    a redirect target, and the unresolved P_new must not be returned.
+    coord.refresh_fabric_links(&[fabric_snap_5686(parent, "10.99.0.9", "")]);
+    assert!(
+        resolve_fabric_redirect(&coord.forwarding).is_none(),
+        "after a same-parent replacement the OLD peer is no longer a fabric \
+         redirect target, and the unresolved replacement is not returned either",
+    );
+    // The worker-visible fast-path Arc must be pruned too — otherwise its
+    // supplemental non-empty patch re-adds the stale peer on the hot path.
+    assert!(
+        coord.ha.fabrics.load().iter().all(|f| f.peer_addr != p_old),
+        "shared worker Arc (ha.fabrics) must not retain the stale old peer",
+    );
+
+    // 3. Once P_new RESOLVES → redirect returns P_new.
+    coord.refresh_fabric_links(&[fabric_snap_5686(parent, "10.99.0.9", "02:00:00:00:00:09")]);
+    let res = resolve_fabric_redirect(&coord.forwarding).expect("P_new redirect after resolve");
+    assert_eq!(res.next_hop, Some(p_new), "resolved replacement P_new is the redirect target");
+    assert_eq!(res.egress_ifindex, parent);
+}
+
+#[test]
+fn refresh_fabric_links_replacement_leaves_other_parent_untouched_5686() {
+    let mut coord = Coordinator::new();
+    let x = 80i32;
+    let y = 90i32;
+    let py: IpAddr = "10.99.1.2".parse().unwrap();
+
+    // Install both X→Px_old and Y→Py, both resolved.
+    coord.refresh_fabric_links(&[
+        fabric_snap_5686(x, "10.99.0.2", "02:00:00:00:00:02"),
+        fabric_snap_5686(y, "10.99.1.2", "02:00:00:00:01:02"),
+    ]);
+    assert_eq!(coord.forwarding.fabrics.len(), 2, "both fabrics resolved");
+
+    // Replace X's peer (UNRESOLVED) while Y still names the SAME peer (also
+    // unresolved this pass → replace=false, the preserve path). #5686 must drop
+    // ONLY the superseded X link and keep the untouched Y link.
+    coord.refresh_fabric_links(&[
+        fabric_snap_5686(x, "10.99.0.9", ""),
+        fabric_snap_5686(y, "10.99.1.2", ""),
+    ]);
+    let parents: Vec<i32> = coord.forwarding.fabrics.iter().map(|f| f.parent_ifindex).collect();
+    assert_eq!(parents, vec![y], "only Y survives; the superseded X link is dropped");
+    let res = resolve_fabric_redirect(&coord.forwarding).expect("Y still redirects");
+    assert_eq!(
+        res.next_hop,
+        Some(py),
+        "different-parent peer Y is unaffected by X's replacement",
+    );
+    assert_eq!(res.egress_ifindex, y);
+}
+
+#[test]
+fn fabric_link_superseded_by_snapshots_only_on_same_parent_different_peer_5686() {
+    let link = FabricLink {
+        parent_ifindex: 80,
+        overlay_ifindex: 1080,
+        peer_addr: "10.99.0.2".parse().unwrap(),
+        peer_mac: [2, 0, 0, 0, 0, 2],
+        local_mac: [2, 0xbf, 0x72, 0, 0, 1],
+        up: true,
+    };
+    // Same parent, DIFFERENT peer → superseded.
+    assert!(fabric_link_superseded_by_snapshots(
+        &link,
+        &[fabric_snap_5686(80, "10.99.0.9", "")]
+    ));
+    // Same parent, SAME peer (steady-state refresh) → NOT superseded.
+    assert!(!fabric_link_superseded_by_snapshots(
+        &link,
+        &[fabric_snap_5686(80, "10.99.0.2", "")]
+    ));
+    // DIFFERENT parent, different peer → NOT superseded (other fabric).
+    assert!(!fabric_link_superseded_by_snapshots(
+        &link,
+        &[fabric_snap_5686(90, "10.99.0.9", "")]
+    ));
+    // Parent OMITTED entirely (removal, not replacement) → NOT superseded.
+    assert!(!fabric_link_superseded_by_snapshots(&link, &[]));
+    // Unparseable replacement address on the same parent → NOT superseded
+    // (the malformed new link cannot resolve, so it is not yet a replacement).
+    assert!(!fabric_link_superseded_by_snapshots(
+        &link,
+        &[fabric_snap_5686(80, "not-an-ip", "")]
+    ));
+}
+
 #[test]
 fn queue_warm_pass_noop_without_worker_queue() {
     // No warm_queue installed (worker not yet spawned) → no panic, no-op.

@@ -217,6 +217,24 @@ next-hops, preference 0). The wire specimen lives in
       Fabric is an HA optimization, so a malformed link is
       skipped-with-visibility, NOT fail-closed-whole-snapshot. See
       `docs/fabric-cross-chassis-fwd.md`.
+    - **Same-parent peer replacement (#5686 M01).** The snapshot/refresh
+      paths PRESERVE a resolved `FabricLink` across a pass that could not
+      re-resolve it (peer MAC not yet learned). That preserve MUST NOT keep a
+      link whose peer has been REPLACED: if the incoming snapshots configure
+      the SAME parent but a DIFFERENT peer address, the old link is SUPERSEDED
+      and dropped (`fabric_link_superseded_by_snapshots`) — otherwise the stale
+      old peer stays a valid `resolve_fabric_redirect` target while the
+      replacement peer is still unresolved, and fabric-forwarded traffic is
+      sent to a peer that is no longer current. Once dropped, redirect for that
+      parent yields NO target during the resolution window and the packet takes
+      its normal non-fabric disposition (safe) rather than a wrong-peer
+      redirect; when the replacement resolves it installs normally. A snapshot
+      that still names the same peer (steady-state refresh) or omits the parent
+      (fabric removed, not replaced) is not a supersession, so the working link
+      survives. The prune runs in both `refresh_fabric_links` (SyncFabricState)
+      and `refresh_runtime_snapshot_inner` (config apply); the pruned set is
+      stored into BOTH the full `ha.forwarding` Arc AND the worker fast-path
+      `ha.fabrics` Arc so no reader retains the stale peer.
 
 ## Session identity is NOT VRF-aware — single forwarding domain (#2387)
 
