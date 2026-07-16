@@ -1,3 +1,100 @@
+## 2026-07-16 — #6027 cluster: purge m.garpCounts[rgID] on RG removal
+- **Timestamp**: 2026-07-16 (fix/6027-garpcounts-purge)
+- **Action**: Fixed the third same-id-re-add map-lifecycle gap in the
+  chassis-cluster `UpdateConfig` removed-RG cleanup loop (after #5990). The
+  manager keys `garpCounts` by RG id and WRITES it only when the config sets a
+  positive `gratuitous-arp-count` (`group_state.go` ~line 105). The removal loop
+  cleared `monitorWeights` and the group but NOT `garpCounts`, so a same-id RG
+  remove/re-add whose re-added config omitted an explicit count inherited the
+  PRIOR incarnation's stale count instead of the default — the consumers
+  (`pkg/vrrp`, `pkg/daemon`) treat an ABSENT `garpCounts` entry as the default
+  burst (3), so a surviving stale entry defeats that fallback. Fix: add
+  `delete(m.garpCounts, id)` in the same removed-RG loop, co-located with the
+  existing `monitorWeights`/`groups` deletes, under `m.mu` (held by
+  `UpdateConfig`). LOW severity — narrow trigger, wrong GARP burst count, not a
+  fail-open. Scanned the Manager struct for other per-RG (`map[int]`) maps
+  WRITTEN in `UpdateConfig` but not purged in the removal loop: only `groups`
+  and `garpCounts` are written in that function; the `peer*`/`failover*`
+  `map[int]` maps are not written in `UpdateConfig`, so no additional same-class
+  gap in scope.
+- **File(s)**: pkg/cluster/group_state.go (edit — removal loop
+  `delete(m.garpCounts, id)` + comment),
+  pkg/cluster/garpcounts_purge_6027_test.go (new — fail-on-revert test),
+  pkg/cluster/README.md (edit — per-RG cleanup-on-removal maps now list
+  garpCounts)
+- **Validation**: `GOCACHE=/dev/shm/cache go build ./...` clean; `go vet
+  ./pkg/cluster` clean; `gofmt -l` clean on touched files (pre-existing gofmt
+  flags on sync.go/sync_protocol.go left untouched). New fail-on-revert test
+  PROVEN RED firsthand — with the delete removed, after removal
+  `garpCounts[1]==7` survives → `garpcounts_purge_6027_test.go:56: garpCounts[1]
+  not purged on RG removal (#6027): got 7, want absent` → restored → GREEN. Full
+  `go test -race ./pkg/cluster` GREEN (10.2s). Go-only, no cargo. HA
+  test-failover smoke blocked by the loss-cluster shim-ABI wall — gated on the
+  fail-on-revert unit test + full -race suite; parent to record the smoke
+  deferral.
+
+## 2026-07-16 — #5990 cluster: purge Monitor per-RG ipState/ipDebts on RG removal
+- **Timestamp**: 2026-07-16 (fix/5990-monitor-ipstate-purge)
+- **Action**: Fixed a chassis-cluster HA monitor map-lifecycle fail-open. The
+  Monitor keys `ipState` by `(rgID, address)` and `ipDebts`/`ipThresholdState`
+  by rgID. On RG removal, `group_state.go UpdateConfig` cleared only the
+  MANAGER's `monitorWeights` for the removed RG (and #5080 reconciled
+  interface-monitor debt) — it never purged the Monitor's per-RG maps. A same-id
+  RG remove/re-add while a monitored ip target was DOWN then left stale
+  `ipDebts[rg.ID]` behind: `reconcileRGIPDebts` saw `desired==installed` by its
+  own stale record and fired no `SetMonitorWeight`, so the debt the manager had
+  cleared was never re-installed → the re-added RG carried a MISSING ip-monitor
+  debt (weight stuck at 255) until the target's next dampened transition, and
+  could stay primary with a dead monitored uplink. Fix: `Monitor.UpdateGroups`
+  now purges `ipState` (per-target, by removed rgID), `ipDebts`, and
+  `ipThresholdState` for every RG no longer in config — alongside the existing
+  `ifaceState` purge, under `mon.mu`, calling no `m.mu`-taking function (no lock
+  inversion). Purging `ipState` also means a re-added RG whose target has since
+  recovered starts from fresh dampening. A KEPT RG whose ip-monitoring/targets
+  merely changed is left to `reconcileRGIPDebts` (per-poll), unchanged.
+- **File(s)**: pkg/cluster/monitor.go,
+  pkg/cluster/monitor_ipstate_purge_5990_test.go (new), pkg/cluster/README.md
+- **Validation**: `go build ./...` + `go vet ./pkg/cluster` clean;
+  `gofmt -l` clean on touched files; full `go test -race ./pkg/cluster` green
+  (10.3s). New fail-on-revert test (independent + aggregate/global-threshold
+  modes) PROVEN RED on revert firsthand — with the purge removed, `ipDebts[1]`
+  survives removal and a same-id re-add leaves RG weight stuck at 255 (verified
+  with a throwaway probe that drove the full remove→re-add→poll path). Cluster
+  `make test-failover` loss-cluster smoke DEFERRED (shim-ABI wall) — gated on the
+  fail-on-revert unit tests + full `-race` suite.
+
+## 2026-07-16 — #5082 VRRP: fail-closed MASTER publish + generation-gated VIP reconcile
+- **Timestamp**: 2026-07-16 (fix/5082-vrrp-vip-gen)
+- **Action**: Fixed two VRRP HA correctness defects (codex-review-177
+  `[A5-b1-F7]`, High/High). (1) FAIL-OPEN publish: `becomeMaster` set
+  StateMaster, called void `addVIPs()`, then advertised/emitted regardless of
+  whether the kernel VIP add succeeded — a transient netlink failure made the
+  peer + dependent services trust a blackhole owner. (2) RECONCILE RACE:
+  `ReconcileVIPs` was check-then-act (`if state==Master { addVIPs }`) with no
+  ownership generation, so a superior-advert demotion to BACKUP could interleave
+  and re-add VIPs + force GARP while BACKUP (dup address / split routing). Fix:
+  `addVIPs`→`addVIPsLocked` returns a structured `vipActuationResult`
+  (applied/failed/linkErr); `becomeMaster` returns bool and gates advert/emit on
+  `res.ok()` — on failure it rolls back partial adds, reverts to StateBackup, and
+  the run-loop re-arms the master-down timer (`rearmForRetry`) to retry (no
+  parallel state system). A monotonic `ownerGen` (bumped by `setState` on every
+  real transition) is captured before the netlink add and revalidated after; a
+  new `vipMu` serializes add/remove + revalidation across the run-loop and the
+  manager's `ReconcileVIPs`, which now re-adds/GARPs only if still the
+  current-generation MASTER after the add. Netlink is behind injectable seams
+  (`linkByNameFn`/`addrAddFn`/`addrDelFn`). Success path unchanged (uncontended
+  lock) → ~60ms failover preserved.
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/manager.go,
+  pkg/vrrp/vip_gen_5082_test.go (new), pkg/vrrp/instance_preempt_gate_test.go,
+  pkg/vrrp/instance_preempt_holdtime_test.go, docs/critical-patterns.md
+- **Validation**: `go build ./...` + `go vet ./pkg/vrrp` clean; full
+  `go test -race ./pkg/vrrp` green. Two new fail-on-revert tests (fail-closed
+  publish + reconcile generation guard) PROVEN RED on revert firsthand. The
+  state-machine wiring tests use fake interfaces (fail-soft before); they now
+  install no-op success netlink seams (`installFakeVIPNetlink`) since
+  `becomeMaster` is fail-closed. Cluster `make test-failover` smoke DEFERRED
+  (shim-ABI wall); correctness gated on the unit tests + full -race suite.
+
 ## 2026-07-16 — #5816 review fold: fence the finally-rejoin after a lost lease (PR #6021)
 - **Timestamp**: 2026-07-16 (fix/5816-deploy-lease-renew-fence)
 - **Action**: Folded one MERGE-NEEDS-MINOR reviewer finding into PR #6021. Gap:
@@ -50277,3 +50374,100 @@ top.
 - **Timestamp**: 2026-07-16
 - **Action**: Fix #5085 (codex-review-177 A5-b1-F11, Medium/High HA correctness). STEP-0 confirmed live on origin/master 62fc5c19b: pkg/cluster/sync_bulk.go `doBulkSync` override path ran `BulkSyncOverride()` (daemon `bulkSyncViaEventStreamOrFallback` → `ExportAllSessionsViaEventStream`, an ASYNC control request; the Rust helper then pushes Open events → daemon reader → `QueueSessionV4/V6` → NON-BLOCKING `sendCh` cap 4096) and then `sendBulkMarkers()` which wrote an EMPTY BulkStart/BulkEnd. The receiver records session keys in `bulkRecvV4/V6` only for SessionV4/V6 frames arriving while `bulkInProgress`; an empty window recorded zero keys, and `reconcileStaleSessions` had a `len(recvV4)==0 && len(recvV6)==0` skip (band-aid commit 3e5c65be3), so a stale peer-owned session the standby held whose delete was missed was NEVER reconciled — cold-prime declared complete with stale state surviving (breaks failover correctness / NAT-policy revocation / manual-failover readiness gate). ROOT DECISION (Option A, team-lead-directed after a STOP-and-report design fork): the literal "bracket the async export with markers" fix is UNSAFE — the event-stream path is async AND lossy (drops frames at sendCh overflow), so reconciling against that incomplete set would DELETE LIVE peer-owned sessions merely dropped in transit (worse than stale-survival). Investigation (Explore subagent + maps_sync.go:590-591) established the shim `sessions`/`sessions_v6` BPF maps are a best-effort DISPLAY MIRROR the Rust helper writes via `publish_bpf_conntrack_entry`; the table-truth authoritative source is `ExportOwnerRGSessions`. `BulkSync()` iterates the mirror with LOSSLESS direct writes under writeMu (no sendCh drops) + `ShouldSyncZone` filtering — far more complete than the async stream and the pre-#418 reconcile path. Override rationale settled by fact: #418 (`18a486387`) introduced the override to avoid "control socket contention (event stream is a separate Unix socket)", but `BulkSync` reads the pinned BPF mirror via BatchLookup syscalls (yielding every 64 per #992868442) and uses the control socket ZERO times vs the override's one `export_all_sessions` trigger; since the authoritative reconcile MUST run BulkSync anyway, keeping the override only ADDS load → DROP. Fix: `doBulkSync` ALWAYS ends with the lossless `BulkSync()` window (BulkStart → sessions → BulkEnd); deleted `sendBulkMarkers`; removed the production `BulkSyncOverride` wiring in `startClusterComms` (cold-prime now uses BulkSync directly); `BulkSyncOverride` retained only as a regression-proof test/extension seam (BulkSync runs unconditionally after it, so empty markers can never recur). Receiver: removed the empty-bulk reconcile skip in `reconcileStaleSessions` so a COMPLETED real transfer with an empty authoritative set deletes all eligible-absent stale sessions (no dangerous "empty means delete-all" heuristic — just the normal absent-key delete; #5272 gate ensures only a real `bulkInProgress` transfer ever reconciles). Reversed the former `TestReconcileSkipsEmptyBulk` band-aid test → `TestReconcileEmptyBulkDeletesEligibleAbsent`. Fail-on-revert PROVEN firsthand (git-stashed sync_bulk.go+sync.go, kept tests): reverted → 3 tests RED (log shows "using bulk sync override (event stream)" → "reconcile stale sessions skipped (empty bulk)" → stale session survives) — `TestDoBulkSyncOverrideReconcilesStalePeerSession_5085` ("stale peer-owned session ... must be reconciled away"), `TestDoBulkSyncEmptyAuthoritativeReconcilesEligibleAbsent_5085`, `TestReconcileEmptyBulkDeletesEligibleAbsent`; restored → all GREEN. #5272 preserved: `TestDoBulkSyncSpuriousBulkEndDoesNotReconcile_5085` GREEN both ways (a spurious no-transfer BulkEnd still drops with no reconcile). New tests use an end-to-end net.Pipe sender→receiver pump driving the real `doBulkSync` seam. Residual (accepted, tracked as follow-up #6031): BulkSync reads the best-effort mirror (can drift: phantom-at-cap / no owner-RG filtering) = pre-override reconcile correctness; a table-truth ExportOwnerRGSessions snapshot is the follow-up. Validation: GOCACHE=/tmp/g5085cache GOTMPDIR=/tmp/g5085 go build ./... clean; go vet ./pkg/cluster clean; full pkg/cluster suite -race GREEN (10.3s). sync.go gofmt flag is PRE-EXISTING (SyncStats/SyncStatsSnapshot field alignment on origin/master; my added lines are gofmt-clean, left untouched per brief). pkg/daemon test binary can't compile in this env (pre-existing `net/http/httptest is not in std` toolchain gap in an unmodified test file — affects master identically; my 5-line daemon wiring removal compiles via `go build ./...`). test-failover smoke blocked by the loss-cluster shim-ABI wall — gated on the fail-on-revert unit tests + full -race suite; parent to record the smoke deferral.
 - **File(s)**: pkg/cluster/sync_bulk.go (edit — doBulkSync always runs lossless BulkSync; deleted sendBulkMarkers; BulkSync doc), pkg/cluster/sync.go (edit — removed empty-bulk reconcile skip in reconcileStaleSessions; BulkSyncOverride field doc), pkg/cluster/sync_conn.go (edit — comment refs to sendBulkMarkers), pkg/daemon/daemon_ha_sync.go (edit — removed BulkSyncOverride production wiring + rationale comment), pkg/cluster/sync_test.go (edit — reversed TestReconcileSkipsEmptyBulk → TestReconcileEmptyBulkDeletesEligibleAbsent), pkg/cluster/sync_bulk_override_5085_test.go (new — end-to-end fail-on-revert tests + #5272 guard), docs/sync-protocol.md (edit — #5085 authoritative-snapshot cold-prime subsection; receiver-table empty-bulk reconcile row; #5272 gate note)
+## 2026-07-16 — #5080 monitor reconcile: missing local link = down; clear stale debt
+- **Timestamp**: 2026-07-16
+- **Action**: Fix #5080 (codex-review-177 [A5-b1-F3], High/High HA correctness). STEP-0 confirmed BOTH defects live on origin/master 883b116c7 (line numbers shifted from the issue's 812bf30c1). Defect 1 (FAIL-OPEN): pkg/cluster/monitor.go pollInterfaceMonitors, on a LinkByName failure for a LOCAL member link (peer-slot guard not matched) only `slog.Warn("...local interface missing") + continue` — no SetMonitorWeight(down), so an already-primary node kept effective weight 255 and stayed primary while its data link was absent (cold boot / delete-recreate between polls) → blackhole. Defect 2 (STALE-DEBT): UpdateGroups only did `mon.groups = groups`; a debt installed for a monitor the operator later REMOVED or CHANGED (interface/weight) persisted in monitorWeights + the RG's MonitorFails + the monitor's ifaceState, stranding a healthy node secondary. Fix: (1) pollInterfaceMonitors now treats a missing LOCAL link as DOWN (`up = false`) through the same dampening machinery as a carrier-down link; the peer-slot skip (`SlotToNodeID(slot) != NodeID`) is preserved and still fires first. (2) New Manager.reconcileMonitorDebtsLocked(cfg) (election.go), called from UpdateConfig under m.mu BEFORE the election: builds the desired (rgID,iface)→weight map from the new config, clears monitorWeights + MonitorFails for removed/changed keys, re-derives the debt for a still-failed monitor whose weight changed, and recomputes each affected RG's weight (mirrors recalcWeight arithmetic, no re-election — the tail election runs after). Monitor.UpdateGroups now also drops ifaceState for monitors no longer desired. Deadlock-safe: UpdateGroups runs under the manager lock already held by UpdateConfig, so it deliberately does NOT call the locking SetMonitorWeight; the manager-side clear happens directly in reconcileMonitorDebtsLocked. Invariant: every reconcile derives effective RG weight from the COMPLETE current desired monitor set + observed state — missing local links = down, removed keys = zero, changed weights re-derived. Fail-on-revert PROVEN firsthand for BOTH halves: (A) reintroduce the fail-open `continue` in pollInterfaceMonitors → TestMonitorReconcile_MissingLocalLinkDemotes_5080 RED ("weight after local link missing = 255, want 0"); (B) disable the reconcileMonitorDebtsLocked call → TestMonitorReconcile_StaleDebtClearedOnMonitorRemoval_5080 RED ("weight after monitor removal = 0, want 255") + TestMonitorReconcile_ChangedMonitorReapplied_5080 both subtests RED (interface-change stranded at 155; weight-change stuck at old 100→155 not 55); restored → all GREEN. Validation: GOCACHE=/dev/shm/cache GOTMPDIR=/tmp/g5080 go build ./... clean; go vet ./pkg/cluster clean; full pkg/cluster suite -race GREEN (10.4s). Go-only, no cargo. test-failover smoke blocked by the loss-cluster shim-ABI wall — gated on the fail-on-revert unit tests + full -race suite; parent to record the smoke deferral.
+- **File(s)**: pkg/cluster/monitor.go (edit — pollInterfaceMonitors missing-local-link = down; UpdateGroups clears stale ifaceState), pkg/cluster/election.go (edit — reconcileMonitorDebtsLocked + config import), pkg/cluster/group_state.go (edit — UpdateConfig calls reconcileMonitorDebtsLocked before election), pkg/cluster/monitor_reconcile_5080_test.go (new — fail-open + stale-debt fail-on-revert tests), pkg/cluster/README.md (edit — "missing local link = down" + "reconcile monitor debt on config change" subsections)
+
+## 2026-07-16 — #5080 FOLD: reconcileMonitorDebtsLocked must not wipe ip-monitor debt
+- **Timestamp**: 2026-07-16 (fix/5080-monitor-reconcile, PR #6023)
+- **Action**: Fold a firsthand-confirmed MAJOR regression the #5080 fix
+  INTRODUCED. `Manager.reconcileMonitorDebtsLocked` (election.go) built its
+  `desired` key set from `cfg.RedundancyGroups[].InterfaceMonitors` ONLY, then
+  DELETED every `monitorWeights` key not in `desired` and dropped it from
+  `rg.MonitorFails`. But `monitorWeights` + `MonitorFails` are a SHARED
+  structure that also holds IP-MONITORING debts (installed by SetMonitorWeight
+  from the ip-monitor path, monitor.go, under the per-target `ip:<addr>` name
+  and the aggregate `ipAggregateMonitorName` = `"ip-monitoring"`). So EVERY
+  UpdateConfig wiped live ip-monitoring debt from monitorWeights + MonitorFails
+  and recomputed rg.Weight WITHOUT it — and it did NOT self-heal (the Monitor's
+  ipDebts still recorded the debt installed, so the next reconcileRGIPDebts poll
+  saw desired==installed and no-op'd). Failure: an RG whose ip-monitor target is
+  unreachable (Weight 155, SECONDARY) → operator commits ANY unrelated config
+  change → reconcile wipes the ip debt → Weight 255 → node can win election and
+  go PRIMARY while its monitored uplink is dead → blackhole. Fail-open — the
+  exact class this PR set out to fix. Fix (precise, bounded): the removal loop
+  in reconcileMonitorDebtsLocked now SKIPS any key whose iface is an ip-monitor
+  name via new `isIPMonitorName(iface)` helper (monitor.go, next to the
+  constant it keys on): `iface == ipAggregateMonitorName || strings.HasPrefix(
+  iface, "ip:")` — the SAME discriminator the ip-monitor install/status code
+  uses (monitor.go desiredRGIPDebts / status.go). ip debt is left entirely to
+  the Monitor's reconcileRGIPDebts (drives desired each poll, clears removed
+  ones) and the whole-RG teardown at RG removal. The reapply-changed-weight loop
+  iterates `desired` (interface-monitors only) so it cannot touch ip keys; the
+  affected-RG recompute now correctly sums the FULL rg.MonitorFails, which
+  retains the ip debts. Fail-on-revert PROVEN firsthand: neutralize the skip
+  (`if false && isIPMonitorName(...)`) → new
+  TestMonitorReconcile_IPDebtPreservedOnConfigChange_5080 goes RED on BOTH
+  subtests — daemon log shows the reviewer's exact line `cluster: monitor debt
+  reconciled on config change rg=1 old=155 new=255`, assertion `weight after
+  unrelated config change = 255, want 155`; per-target (`ip:10.0.0.1`) AND
+  aggregate (`ip-monitoring`) forms both fail; restored → GREEN. The 3 existing
+  #5080 tests (MissingLocalLinkDemotes, StaleDebtClearedOnMonitorRemoval,
+  ChangedMonitorReapplied) stay GREEN — interface-monitor reconcile behavior is
+  unchanged, only ip keys are excluded. Validation: GOCACHE=/dev/shm/cache
+  GOTMPDIR=/tmp/g5080b go build ./... clean; go vet ./pkg/cluster clean; full
+  pkg/cluster suite -race GREEN (10.2s). Go-only, no cargo. test-failover smoke
+  blocked by the loss-cluster shim-ABI wall — gated on the fail-on-revert unit
+  tests + full -race suite; parent to record the smoke deferral.
+- **File(s)**: pkg/cluster/election.go (edit — reconcileMonitorDebtsLocked
+  removal loop skips ip keys + doc comment), pkg/cluster/monitor.go (edit —
+  isIPMonitorName helper), pkg/cluster/monitor_reconcile_5080_ipfold_test.go
+  (new — ip-debt-preserved fail-on-revert test, per-target + aggregate),
+  pkg/cluster/README.md (edit — reconcileMonitorDebtsLocked reconciles
+  interface-monitor debt ONLY; ip debt owned by reconcileRGIPDebts)
+
+- **Timestamp**: 2026-07-16
+- **Action**: #5859 — fail closed on static-NAT `then static-nat inet`
+  (NAT64). The compiler accepted the Junos static-NAT NAT64 target `then
+  static-nat inet` (records StaticNATRule.Then=="inet"), but the userspace
+  snapshot builder emitted the LITERAL string "inet" into the same-family
+  static_nat table's InternalIP address slot. Rust parse_nat_prefix("inet")
+  fails and the rule was SILENTLY SKIPPED — a strict-valid config claimed NAT64
+  translation but installed nothing (an inert, security-relevant NAT rule).
+  Bounded fail-closed fix (issue option 2; full lowering into the native NAT64
+  IR deferred to a /research follow-up): (1) new
+  validateStaticNATInetTargetStrict hard-rejects the target at strict commit /
+  commit-check, naming the rule-set + rule and directing to the native
+  `security nat nat64` rule-set; (2) the call site in runUniformGates downgrades
+  the reject to a SURFACED cfg.Warnings entry on the tolerant load / peer-sync
+  path (opts.lenientFirewallRefs, #1960 no-brick) — never a silent skip; (3)
+  buildStaticNATSnapshots DROPS the inet rule with a slog.Warn so the
+  unparseable "inet" sentinel never reaches the dataplane (symmetric with the
+  #5101 out-of-range-port fail-closed drop). The native `security nat nat64`
+  rule-set (buildNAT64Snapshots from cfg.Security.NAT.NAT64) is untouched and
+  remains the supported IPv6->IPv4 path. Fail-on-revert PROVEN firsthand: (a)
+  neutralize validateStaticNATInetTargetStrict → TestStaticNATInetTargetRejected-
+  Strict RED ("expected CompileConfig to REJECT `then static-nat inet`"); (b)
+  remove the buildStaticNATSnapshots drop guard → TestBuildStaticNATSnapshots-
+  DropsInet RED (observes StaticNATRuleSnapshot{InternalIP:"inet"} sentinel).
+  Behavior change: a previously-accepted-but-inert syntax now loudly rejects at
+  strict commit — the intended safer posture. Updated 4 existing tests that
+  encoded the old accepted behavior (TestStaticNATInet, TestStaticNATInet-
+  SetSyntax, TestStaticNATThenInetRoutingInstanceAdvisory → lenient compile +
+  surfaced-warning assertion, still validating the compiler recording;
+  TestStaticNATHostMaskInetActionNotRejected → proves the rejection is the
+  #5859 inet gate, not a host-mask "host route" error). Validation:
+  GOCACHE=/dev/shm/cache go build ./... clean; go vet ./pkg/config
+  ./pkg/dataplane/userspace clean; full pkg/config + pkg/dataplane/userspace
+  suites GREEN. Go-only (control plane fail-closed); static_nat.rs untouched.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go (new
+  validateStaticNATInetTargetStrict + updated host-mask inet-exemption comment),
+  pkg/config/compiler_uniformgates.go (wire the gate with strict/lenient split),
+  pkg/config/types_security.go (StaticNATRule.Then doc), pkg/dataplane/userspace/
+  nat_static.go (buildStaticNATSnapshots inet drop guard), pkg/config/
+  static_nat_inet_failclosed_5859_test.go (new), pkg/dataplane/userspace/
+  static_nat_inet_failclosed_5859_test.go (new), pkg/config/parser_security_test.go
+  + pkg/config/compiler_nat_target_parity_hb167_test.go + pkg/config/
+  compiler_nat_host_mask_test.go (updated to new fail-closed behavior),
+  docs/config-schema.md (#5859 note)

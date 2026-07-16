@@ -1678,6 +1678,26 @@ superset to false-reject, making them leaf-complete by construction:
 As with every flip, the reject fires only on the strict commit path;
 `compileTreeLenient` downgrades it to a warning on `Store.Load` / `SyncApply`.
 
+**`then static-nat inet` (Junos NAT64) is rejected at strict commit (#5859).**
+The Junos static-NAT NAT64 target `then static-nat inet` parses and the compiler
+records `StaticNATRule.Then == "inet"`, but there is NO dataplane lowering of the
+keyword: the userspace snapshot builder stores an IP address in the static_nat
+table's `InternalIP` slot, so emitting the literal string `"inet"` made the Rust
+`parse_nat_prefix` fail and the rule was SILENTLY SKIPPED — a strict-valid config
+claimed NAT64 translation but installed nothing (an inert, security-relevant NAT
+rule). Until the keyword is lowered into the native NAT64 IR (a larger design
+change — match scope, source pool, routing-instance, counters, fragments,
+reverse BIB, HA sync — tracked as a `/research`-scoped follow-up), the compiler
+FAILS CLOSED: `validateStaticNATInetTargetStrict` hard-rejects the target at
+strict commit / commit-check (naming the rule-set + rule and directing the
+operator to the native `security nat nat64` rule-set); the tolerant load /
+peer-sync path downgrades to a surfaced warning and `buildStaticNATSnapshots`
+DROPS the rule so the unparseable `"inet"` sentinel never reaches the dataplane.
+The supported IPv6→IPv4 path is the xpf-native `security nat nat64` rule-set
+above (`buildNAT64Snapshots` from `cfg.Security.NAT.NAT64`), which is unaffected.
+Tests: `static_nat_inet_failclosed_5859_test.go` (both `pkg/config` and
+`pkg/dataplane/userspace`).
+
 **The systematic per-subtree closure continues (#4313).** Each of the flips
 above (destination-NAT then, the three IPsec option containers, master-password,
 the Phase-1 IKE proposal, now the Phase-2 IPsec proposal and the two

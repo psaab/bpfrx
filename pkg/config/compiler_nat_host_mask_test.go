@@ -111,7 +111,13 @@ func TestStaticNATHostMaskNPTv6PrefixNotRejected(t *testing.T) {
 // The NAT64 `then static-nat inet` rule is a prefix translation, not host-1:1
 // static NAT: its match destination-address is the NAT64 well-known prefix
 // (64:ff9b::/96, a legitimate non-host prefix). The whole rule must be exempt
-// from the host-mask gate (Then == "inet").
+// from the host-mask gate (Then == "inet") — the host-mask check must never be
+// the thing that flags it.
+//
+// #5859: `then static-nat inet` is itself now REJECTED at strict commit (no
+// dataplane lowering; the literal "inet" installed a silently inert rule). This
+// test proves the rejection is the #5859 inet gate — NOT a host-mask "host
+// route" complaint about the /96 match — so the host-mask exemption still holds.
 func TestStaticNATHostMaskInetActionNotRejected(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set security zones security-zone untrust",
@@ -120,8 +126,18 @@ func TestStaticNATHostMaskInetActionNotRejected(t *testing.T) {
 		"set security nat static rule-set rs1 rule r1 match destination-address 64:ff9b::/96",
 		"set security nat static rule-set rs1 rule r1 then static-nat inet",
 	})
-	if _, err := CompileConfig(tree); err != nil {
-		t.Fatalf("static-nat inet (NAT64) rule with prefix match must compile, got: %v", err)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("static-nat inet (NAT64) must be rejected at strict commit (#5859)")
+	}
+	// The rejection must come from the inet gate, not the host-mask gate: the
+	// /96 match is a legitimate NAT64 prefix and must never draw a "host route"
+	// error.
+	if strings.Contains(err.Error(), "host route") {
+		t.Fatalf("host-mask gate must EXEMPT the inet /96 match; got a host-route error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "nat64") {
+		t.Fatalf("rejection must be the #5859 inet gate (mention nat64), got: %v", err)
 	}
 }
 

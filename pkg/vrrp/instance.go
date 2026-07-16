@@ -219,6 +219,34 @@ type vrrpInstance struct {
 	lastGARPTime    atomic.Int64  // Unix nanos of last GARP send (dampens routine GARP only; forced sends bypass — see garpSendAllowed)
 	garpClampWarned atomic.Bool   // #5695: guards a once-per-instance warn when a configured GARPCount is clamped (never per-send)
 
+	// ownerGen is the identity of the current Master/Backup ownership tenure
+	// (#5082). setState bumps it whenever the state actually changes, so every
+	// state transition begins a fresh generation. Code that actuates the VIP
+	// set via netlink (becomeMaster, ReconcileVIPs) captures the generation
+	// before the netlink op and revalidates it afterward: if a demotion raced
+	// in and bumped ownerGen, the actuation is stale — roll back the added VIPs
+	// and do NOT advertise/emit/GARP for a tenure we have already left. Atomic
+	// so log/test readers stay lock-free; the load-bearing check-then-act runs
+	// under vipMu below.
+	ownerGen atomic.Uint64
+
+	// vipMu serializes VIP netlink actuation (addVIPs/removeVIPs) plus the
+	// ownership-generation revalidation across the two goroutines that touch
+	// VIPs: the run-loop (becomeMaster/becomeBackup) and the manager's
+	// ReconcileVIPs. Holding vipMu across "read gen + actuate + revalidate"
+	// makes the check-then-act atomic so a demotion cannot interleave a
+	// ReconcileVIPs re-add and strand a BACKUP announcing VIPs (#5082). The
+	// lock is uncontended on the normal failover path (ReconcileVIPs is a rare
+	// post-programRethMAC reconcile), so it adds no latency to ~60ms failover.
+	vipMu sync.Mutex
+
+	// netlink seams for VIP actuation. Production leaves them nil and the
+	// helpers call netlink live; unit tests inject them to drive addVIPs down
+	// a chosen success/failure path without a real kernel interface (#5082).
+	linkByNameFn func(name string) (netlink.Link, error)
+	addrAddFn    func(link netlink.Link, addr *netlink.Addr) error
+	addrDelFn    func(link netlink.Link, addr *netlink.Addr) error
+
 	// onEventDrop is called when an event is dropped due to a full eventCh.
 	// Set by the manager to trigger immediate reconciliation.
 	onEventDrop func()
@@ -665,8 +693,18 @@ func (vi *vrrpInstance) getState() VRRPState {
 
 func (vi *vrrpInstance) setState(s VRRPState) {
 	vi.mu.Lock()
+	changed := vi.state != s
 	vi.state = s
 	vi.mu.Unlock()
+	// A real state change starts a new ownership tenure. Bump the generation
+	// so any in-flight VIP actuation (becomeMaster/ReconcileVIPs) that captured
+	// the prior generation revalidates as stale and rolls back instead of
+	// advertising/GARPing for a tenure we have left (#5082). ownerGen is atomic
+	// and independent of vi.mu, so a concurrent ReconcileVIPs holding vipMu
+	// still observes this bump when it rechecks after its netlink add.
+	if changed {
+		vi.ownerGen.Add(1)
+	}
 }
 
 // advertInterval returns the advertisement interval as a Duration.
@@ -921,8 +959,11 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 				slog.Info("vrrp: held master silent during preempt hold-time, immediate takeover",
 					"key", vi.key())
 				vi.disarmPreemptHold(preemptHoldTimer)
-				vi.becomeMaster()
-				advertTimer.Reset(vi.advertInterval())
+				if vi.becomeMaster() {
+					advertTimer.Reset(vi.advertInterval())
+				} else {
+					vi.rearmForRetry(masterDownTimer)
+				}
 			} else {
 				// The held master is still alive (adverts keep arriving and
 				// refreshing lastMasterSeen). Preserve the preempt-hold intent:
@@ -948,8 +989,11 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 			vi.armPreemptHold(masterDownTimer, preemptHoldTimer, hold)
 			return false
 		}
-		vi.becomeMaster()
-		advertTimer.Reset(vi.advertInterval())
+		if vi.becomeMaster() {
+			advertTimer.Reset(vi.advertInterval())
+		} else {
+			vi.rearmForRetry(masterDownTimer)
+		}
 	case <-preemptHoldTimer.C:
 		// The preempt hold-time elapsed (#2850). The hold is no longer
 		// armed; clear the flag before deciding (#2900).
@@ -972,9 +1016,12 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 		if vi.shouldPreemptObservedMaster() {
 			slog.Info("vrrp: preempt hold-time elapsed, taking over",
 				"key", vi.key())
-			vi.becomeMaster()
-			advertTimer.Reset(vi.advertInterval())
-			masterDownTimer.Stop()
+			if vi.becomeMaster() {
+				advertTimer.Reset(vi.advertInterval())
+				masterDownTimer.Stop()
+			} else {
+				vi.rearmForRetry(masterDownTimer)
+			}
 		} else {
 			// Preemption is no longer warranted — do NOT become MASTER.
 			// Return to a normal BACKUP tenure by re-arming masterDownTimer
@@ -1023,12 +1070,15 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 		vi.forcePreemptOnce = false
 		vi.mu.Unlock()
 		if force || vi.shouldPreemptObservedMaster() {
-			vi.becomeMaster()
-			advertTimer.Reset(vi.advertInterval())
-			masterDownTimer.Stop()
-			// A coordinated/forced promotion supersedes any pending
-			// preempt hold-time countdown (#2850).
-			vi.disarmPreemptHold(preemptHoldTimer)
+			if vi.becomeMaster() {
+				advertTimer.Reset(vi.advertInterval())
+				masterDownTimer.Stop()
+				// A coordinated/forced promotion supersedes any pending
+				// preempt hold-time countdown (#2850).
+				vi.disarmPreemptHold(preemptHoldTimer)
+			} else {
+				vi.rearmForRetry(masterDownTimer)
+			}
 		}
 	}
 	return false
@@ -1874,16 +1924,55 @@ func (vi *vrrpInstance) vipFamilies() (hasIPv4, hasIPv6 bool) {
 	return hasIPv4, hasIPv6
 }
 
-// becomeMaster transitions to Master state: add VIPs, send advert, emit event,
+// becomeMaster transitions to Master state: add VIPs, and — only if the
+// required VIP set actually actuated in the kernel — send advert, emit event,
 // then send GARP/NA asynchronously. The critical path is addVIPs (kernel needs
 // VIP addresses for bpf_fib_lookup) + sendAdvert (tells peer to step down).
 // GARP only updates L2 switch/router MAC tables and runs in the background.
-func (vi *vrrpInstance) becomeMaster() {
+//
+// Fail-closed ownership (#5082): a transient netlink failure must NOT let the
+// peer and dependent services trust an owner that cannot receive VIP traffic.
+// addVIPs now returns a structured result; if any required VIP failed to
+// actuate (or a concurrent demotion superseded this tenure), becomeMaster rolls
+// back any partial adds, reverts to BACKUP, and returns false WITHOUT
+// advertising or emitting a MASTER event. The caller re-arms the master-down
+// timer so the election retries on the next horizon. On the clean success path
+// nothing is added versus before (the vipMu lock is uncontended), so the ~60ms
+// failover timing is preserved.
+//
+// Returns true iff ownership was claimed (VIP set actuated and advert/event
+// published).
+func (vi *vrrpInstance) becomeMaster() bool {
 	pri := vi.getPriority()
 	slog.Info("vrrp: transitioning to MASTER",
 		"key", vi.key(), "priority", pri)
 	vi.setState(StateMaster)
-	vi.addVIPs()
+	gen := vi.ownerGen.Load()
+
+	vi.vipMu.Lock()
+	res := vi.addVIPsLocked()
+	superseded := vi.ownerGen.Load() != gen
+	if !res.ok() || superseded {
+		// Fail-closed: the required VIP set did not actuate, or a newer
+		// transition superseded this one while we were in netlink. Roll back
+		// any partially-added VIPs, revert to a BACKUP tenure, and do NOT claim
+		// ownership. Reverting to StateBackup (an existing state) integrates
+		// with the run-loop's masterDownTimer retry — no parallel state system.
+		// (superseded is captured before the setState bump below so the log
+		// reflects the true reason, not the revert's own generation bump.)
+		vi.removeVIPsLocked(res.applied)
+		vi.setState(StateBackup)
+		vi.vipMu.Unlock()
+		slog.Error("vrrp: VIP actuation failed, not claiming ownership (fail-closed)",
+			"key", vi.key(), "failed", res.failed, "applied", res.applied,
+			"link_err", res.linkErr, "superseded", superseded)
+		// Publish the honest BACKUP state so dependent services never trust an
+		// ownership we could not back.
+		vi.emitEvent()
+		return false
+	}
+	vi.vipMu.Unlock()
+
 	vi.sendAdvert(pri)
 	vi.emitEvent()
 	vi.garpEpoch.Add(1)
@@ -1896,6 +1985,16 @@ func (vi *vrrpInstance) becomeMaster() {
 		slog.Info("vrrp: GARP suppressed (strict-vip-ownership)",
 			"key", vi.key())
 	}
+	return true
+}
+
+// rearmForRetry re-arms the master-down timer after a failed Master promotion
+// (VIP actuation failure in becomeMaster reverted us to BACKUP) so the election
+// retries on the next master-down horizon instead of leaving the instance idle.
+// Used by the run-loop's becomeMaster call sites (#5082).
+func (vi *vrrpInstance) rearmForRetry(masterDownTimer *time.Timer) {
+	stopAndDrainTimer(masterDownTimer)
+	masterDownTimer.Reset(vi.masterDownInterval())
 }
 
 // becomeBackup transitions to Backup state: remove VIPs, reset timers.
@@ -2123,18 +2222,75 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 }
 
 // addVIPs adds virtual IP addresses to the interface via netlink.
-func (vi *vrrpInstance) addVIPs() {
-	link, err := netlink.LinkByName(vi.cfg.Interface)
+// vipActuationResult reports the outcome of an attempt to add the instance's
+// virtual IP set on the interface (#5082). It lets becomeMaster/ReconcileVIPs
+// gate ownership publication on the ACTUAL kernel state instead of assuming the
+// add succeeded (the old void addVIPs swallowed every failure).
+type vipActuationResult struct {
+	// applied lists the VIPs confirmed present after the op — freshly added
+	// OR already present (EEXIST). These are the addresses to roll back if the
+	// tenure turns out to be stale/degraded.
+	applied []string
+	// failed lists VIPs that could not be actuated: an unresolvable interface
+	// (linkErr set — every VIP fails), a parse error, or a netlink AddrAdd
+	// error other than EEXIST.
+	failed []string
+	// linkErr is non-nil if the interface itself could not be resolved via
+	// netlink; in that case no VIP could be actuated at all.
+	linkErr error
+}
+
+// ok reports whether the FULL required VIP set actuated: the interface
+// resolved and no VIP failed. becomeMaster claims ownership only when ok().
+func (r vipActuationResult) ok() bool {
+	return r.linkErr == nil && len(r.failed) == 0
+}
+
+// nlLinkByName resolves an interface, via the test seam when set.
+func (vi *vrrpInstance) nlLinkByName(name string) (netlink.Link, error) {
+	if vi.linkByNameFn != nil {
+		return vi.linkByNameFn(name)
+	}
+	return netlink.LinkByName(name)
+}
+
+// nlAddrAdd adds an address, via the test seam when set.
+func (vi *vrrpInstance) nlAddrAdd(link netlink.Link, addr *netlink.Addr) error {
+	if vi.addrAddFn != nil {
+		return vi.addrAddFn(link, addr)
+	}
+	return netlink.AddrAdd(link, addr)
+}
+
+// nlAddrDel deletes an address, via the test seam when set.
+func (vi *vrrpInstance) nlAddrDel(link netlink.Link, addr *netlink.Addr) error {
+	if vi.addrDelFn != nil {
+		return vi.addrDelFn(link, addr)
+	}
+	return netlink.AddrDel(link, addr)
+}
+
+// addVIPsLocked adds the instance's configured virtual IP set to the interface
+// and returns which VIPs actuated and which failed. The caller MUST hold vipMu.
+// It replaces the old void addVIPs: a swallowed LinkByName/AddrAdd failure used
+// to let becomeMaster publish an owner that could not receive VIP traffic
+// (#5082). EEXIST counts as applied (the address is present regardless).
+func (vi *vrrpInstance) addVIPsLocked() vipActuationResult {
+	var res vipActuationResult
+	link, err := vi.nlLinkByName(vi.cfg.Interface)
 	if err != nil {
 		slog.Warn("vrrp: failed to find interface for VIP add",
 			"key", vi.key(), "err", err)
-		return
+		res.linkErr = err
+		res.failed = append(res.failed, vi.cfg.VirtualAddresses...)
+		return res
 	}
 	for _, vip := range vi.cfg.VirtualAddresses {
 		addr, err := netlink.ParseAddr(vip)
 		if err != nil {
 			slog.Warn("vrrp: failed to parse VIP",
 				"key", vi.key(), "vip", vip, "err", err)
+			res.failed = append(res.failed, vip)
 			continue
 		}
 		// Skip DAD for IPv6 VIPs — VRRP handles ownership; DAD would
@@ -2142,32 +2298,55 @@ func (vi *vrrpInstance) addVIPs() {
 		if addr.IP.To4() == nil {
 			addr.Flags |= unix.IFA_F_NODAD
 		}
-		if err := netlink.AddrAdd(link, addr); err != nil {
-			// EEXIST is fine — address already present.
-			if !strings.Contains(err.Error(), "exists") {
+		if err := vi.nlAddrAdd(link, addr); err != nil {
+			// EEXIST is fine — address already present, so it IS actuated.
+			if strings.Contains(err.Error(), "exists") {
+				res.applied = append(res.applied, vip)
+			} else {
 				slog.Warn("vrrp: failed to add VIP",
 					"key", vi.key(), "vip", vip, "err", err)
+				res.failed = append(res.failed, vip)
 			}
 		} else {
 			slog.Info("vrrp: added VIP", "key", vi.key(), "vip", vip)
+			res.applied = append(res.applied, vip)
 		}
 	}
+	return res
 }
 
-// removeVIPs removes virtual IP addresses from the interface via netlink.
+// removeVIPs removes ALL configured virtual IP addresses from the interface.
+// It acquires vipMu so it is safe to call from the run-loop (becomeBackup, run
+// startup/shutdown) without interleaving a concurrent ReconcileVIPs add (#5082).
 func (vi *vrrpInstance) removeVIPs() {
-	link, err := netlink.LinkByName(vi.cfg.Interface)
+	vi.vipMu.Lock()
+	vi.removeVIPsLocked(nil)
+	vi.vipMu.Unlock()
+}
+
+// removeVIPsLocked removes the given VIPs (nil ⇒ all configured VirtualAddresses)
+// from the interface via netlink. The caller MUST hold vipMu. Passing a subset
+// (res.applied) lets a failed/superseded actuation roll back exactly the
+// addresses it added.
+func (vi *vrrpInstance) removeVIPsLocked(vips []string) {
+	if vips == nil {
+		vips = vi.cfg.VirtualAddresses
+	}
+	if len(vips) == 0 {
+		return
+	}
+	link, err := vi.nlLinkByName(vi.cfg.Interface)
 	if err != nil {
 		slog.Debug("vrrp: failed to find interface for VIP remove",
 			"key", vi.key(), "err", err)
 		return
 	}
-	for _, vip := range vi.cfg.VirtualAddresses {
+	for _, vip := range vips {
 		addr, err := netlink.ParseAddr(vip)
 		if err != nil {
 			continue
 		}
-		if err := netlink.AddrDel(link, addr); err != nil {
+		if err := vi.nlAddrDel(link, addr); err != nil {
 			// Ignore "not found" — may have been removed already.
 			if !strings.Contains(err.Error(), "not found") &&
 				!strings.Contains(err.Error(), "no such") {
