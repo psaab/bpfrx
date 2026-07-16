@@ -50518,3 +50518,22 @@ top.
   userspace-dp/src/server/handlers/neighbors.rs,
   userspace-dp/src/server/tests.rs (3 new #5864 tests),
   userspace-dp/src/afxdp/forwarding/README.md (#5864 note)
+
+- **Timestamp**: 2026-07-16
+  **Action**: #5985 — remove `reflect` from userspace `manager_overlay.go` to
+  turn the RED retirement-boundary canary
+  `TestUserspaceManagerDoesNotImportReflectOrUnsafe` GREEN. Replaced the
+  `reflect.DeepEqual(cfg, applied)` content-equality fallback in
+  `routeOnlyPublishHybrid` with `configsContentEqual`, a JSON
+  serialize-and-compare (`json.Marshal` + `bytes.Equal`). Semantics preserved:
+  the config is already marshaled verbatim to userspace-dp on every
+  `apply_snapshot` (deterministic, map keys sorted), so byte-equality of the
+  encodings == "produces the same dataplane snapshot" — exactly the #5680
+  hybrid-ACK notion. Marshal error → NOT equal → fail-closed refuse. Added a
+  focused `TestRouteOnlyPublishHybridContentEquality` unit test pinning all four
+  branches (nil applied / pointer-identical / distinct-but-equal / divergent);
+  neutralizing `configsContentEqual` REDs it. Chose option (2) remove-reflect
+  over an allowlist exception to keep the canary strict.
+  **File(s)**: pkg/dataplane/userspace/manager_overlay.go,
+  pkg/dataplane/userspace/route_overlay_test.go (new test),
+  docs/rib-group-route-leaking.md

@@ -427,6 +427,61 @@ func TestPublishRouteOverlaySnapshotAcceptsEqualConfigDistinctPointer(t *testing
 	}
 }
 
+// TestRouteOnlyPublishHybridContentEquality is a focused, machinery-free guard
+// on the non-reflective content-equality that replaced reflect.DeepEqual in
+// routeOnlyPublishHybrid (#5985). It pins the exact boolean contract the
+// publish path depends on:
+//   - nil applied              -> not a hybrid (no policy identity to violate)
+//   - pointer-identical cfg     -> not a hybrid (cheap fast path)
+//   - distinct-but-equal cfg    -> not a hybrid (must NOT falsely refuse)
+//   - content-differing cfg     -> IS a hybrid (must refuse)
+//
+// RED-on-revert: neutralize configsContentEqual (e.g. `return true`) and the
+// content-differing case fails; neutralize it the other way (`return false`)
+// and the distinct-but-equal case fails. Either regression silently breaks the
+// #5680 hybrid-ACK guard, so this test is the correctness anchor for the
+// replacement equality.
+func TestRouteOnlyPublishHybridContentEquality(t *testing.T) {
+	t.Parallel()
+
+	applied := overlayTestConfig()
+
+	// nil applied: no established policy identity, never a hybrid.
+	if routeOnlyPublishHybrid(applied, nil) {
+		t.Fatal("nil applied must not be treated as a hybrid")
+	}
+
+	// Pointer-identical: the common legitimate fast path.
+	if routeOnlyPublishHybrid(applied, applied) {
+		t.Fatal("pointer-identical cfg must not be treated as a hybrid")
+	}
+
+	// Distinct pointer, identical content: a legitimate route-only publish
+	// (the actuator/reconcile hand back a distinct-but-equal object). Must be
+	// accepted, i.e. NOT a hybrid.
+	equal := overlayTestConfig()
+	if equal == applied {
+		t.Fatal("test setup: expected distinct config pointers")
+	}
+	if routeOnlyPublishHybrid(equal, applied) {
+		t.Fatal("distinct-but-content-equal cfg was falsely treated as a hybrid (false refusal)")
+	}
+	if !configsContentEqual(equal, applied) {
+		t.Fatal("configsContentEqual: distinct-but-content-equal configs compared NOT equal")
+	}
+
+	// Content divergence (a policy delta the dataplane never compiled): must be
+	// a hybrid so the publish is refused.
+	diff := overlayTestConfig()
+	diff.Security.DefaultPolicy = config.PolicyDeny
+	if !routeOnlyPublishHybrid(diff, applied) {
+		t.Fatal("content-differing cfg was NOT treated as a hybrid (missed refusal)")
+	}
+	if configsContentEqual(diff, applied) {
+		t.Fatal("configsContentEqual: content-differing configs compared equal")
+	}
+}
+
 // overlayControlServerToggle behaves like overlayControlServer but its
 // apply_snapshot handling can be flipped to fail (OK:false) via the
 // returned setter, so a publish failure can be exercised. All requests

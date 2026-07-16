@@ -1,9 +1,10 @@
 package userspace
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log/slog"
-	"reflect"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -244,9 +245,9 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 // Nil applied (no established policy identity — e.g. the config-less bootstrap
 // snapshot) is not a hybrid: there is no policy identity to violate. Pointer
 // identity is the common legitimate case and the cheap fast path; the
-// reflect.DeepEqual fallback ensures a distinct-but-content-equal config is
-// accepted (never a false refusal) while a genuinely divergent config is
-// refused.
+// content-equality fallback (configsContentEqual) ensures a distinct-but-
+// content-equal config is accepted (never a false refusal) while a genuinely
+// divergent config is refused.
 func routeOnlyPublishHybrid(cfg, applied *config.Config) bool {
 	if applied == nil {
 		return false
@@ -254,5 +255,56 @@ func routeOnlyPublishHybrid(cfg, applied *config.Config) bool {
 	if cfg == applied {
 		return false
 	}
-	return !reflect.DeepEqual(cfg, applied)
+	return !configsContentEqual(cfg, applied)
+}
+
+// configsContentEqual reports whether two configs produce the same dataplane
+// snapshot, by comparing the JSON encodings the control plane already ships to
+// userspace-dp: ConfigSnapshot.Config is marshaled verbatim on every
+// apply_snapshot (process_control.go), and the config store persists the same
+// tree as JSON. Byte-equality of those encodings therefore means "content-equal
+// for the snapshot the helper receives" — exactly the notion
+// routeOnlyPublishHybrid needs.
+//
+// This replaces a former reflect.DeepEqual so the userspace package stays free
+// of reflect/unsafe (retirement-boundary canary, #5985 /
+// TestUserspaceManagerDoesNotImportReflectOrUnsafe).
+//
+// NOTE — the JSON comparison is strictly COARSER than reflect.DeepEqual, in one
+// direction only (#6037 review): DeepEqual-equal ALWAYS implies JSON-equal (Go
+// sorts map keys, so the encoding is deterministic), but the converse fails for
+// two classes of field:
+//   - Secrets: config.Secret.MarshalJSON redacts every non-empty secret to the
+//     sentinel "<redacted>", so two configs differing ONLY in a non-empty secret
+//     (an IPsec PSK / auth-key / password rotation) compare EQUAL here though
+//     DeepEqual would call them different.
+//   - Unexported fields (e.g. SNMPCommunity.clientNets): json.Marshal omits them;
+//     DeepEqual compares them. These are derived from exported fields, so the
+//     coarsening is benign (arguably more correct).
+//
+// This coarsening is SAFE and correct for THIS guard: routeOnlyPublishHybrid
+// governs only what the helper's route-overlay snapshot contains, and the helper
+// ALWAYS receives the redacted JSON encoding (process_control.go) — it never sees
+// raw secrets. A secret-only change is therefore invisible to the snapshot the
+// helper gets, so it genuinely is NOT a route-overlay hybrid (the former
+// DeepEqual was over-strict, refusing a publish over a change the helper could
+// not observe). Secret-bearing subsystems (strongSwan/FRR/vrrp/cluster) apply on
+// separate paths, and the recorded appliedSnapshot.Config self-heals on the next
+// full apply. Do NOT restore this to a claim of full semantic preservation on
+// this fail-closed guard.
+//
+// A marshal error is never observed in practice — the very same object is
+// marshaled to the helper on each apply — but if one occurred we cannot prove
+// content-equality, so we report NOT equal and let the hybrid-ACK guard fail
+// closed (refuse the publish, per #5680) rather than risk ACK'ing a hybrid.
+func configsContentEqual(a, b *config.Config) bool {
+	ab, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	bb, err := json.Marshal(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(ab, bb)
 }
