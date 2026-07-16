@@ -1,3 +1,34 @@
+## 2026-07-16 — #5973 (config/CoS): validate forwarding-class queue-number at commit
+- **Timestamp**: 2026-07-16 (fix/5973-cos-queue-validate)
+- **Action**: The `class-of-service forwarding-classes queue <N> <fc>` parse
+  site in compiler_class_of_service.go SILENTLY DROPPED a queue token strconv.Atoi
+  could not parse (`strconv.Atoi -> continue`): the forwarding-class → queue
+  mapping never bound and CompileConfig accepted the stanza with no operator
+  error — the same mis-bind / silent-drop class #5963/#5933 closed on adjacent
+  CoS slots, surfaced during the independent review of PR #5972 (#5963). The
+  `queue` schema leaf carries no keyValidator, so SchemaValidate accepts a
+  non-numeric token and the compiler was the only gate. Fix: convert the silent
+  `continue` into a strict reject at commit (naming the forwarding-class + raw
+  token, "expected queue 0..255") with a warn-and-drop downgrade on the tolerant
+  load / peer-sync path via opts.lenientCoSForwardingClassQueue — the SAME #4594
+  flag the downstream forwarding-class queue-RANGE gate uses (#1960 no-brick; the
+  malformed queue was inert then too, the FC never bound). Division of labour: a
+  PARSEABLE but out-of-range (999) or negative queue still flows to the existing
+  #4594 range gate (validateClassOfServiceForwardingClassQueueStrict); this site
+  closes the ONE case that gate can never see — a strconv error means no Queue
+  int is left to range-check. Queue domain confirmed 0..255 (dataplane u8 queue
+  id), NOT Junos-classic 0..7, so CanonicalLogicalUnit (units 0..16385) was NOT
+  reused.
+- **File(s)**: pkg/config/compiler_class_of_service.go (parse-site gate),
+  pkg/config/cos_fc_queue_5973_test.go (new — strict reject of
+  non-numeric/overflow naming the token, valid queue 0/7/255 binds, lenient
+  warn-and-drop leaving the FC inert; RED on revert of the gate),
+  docs/config-schema.md (#5973 note), _Log.md.
+- **Validation**: go build ./... ; go vet ./pkg/config/ ; go test -race
+  ./pkg/config/ -count=1 — all GREEN. Fail-on-revert confirmed: restoring the
+  silent `strconv.Atoi -> continue` turns TestCoSForwardingClassQueue5973_Reject
+  RED.
+
 ## 2026-07-15 — #5827 (config/security): cap retained parse diagnostics (heap DoS)
 - **Timestamp**: 2026-07-15 (fix/5827-parse-error-cap)
 - **Action**: The recursive-descent config parser (pkg/config/parser.go) recorded

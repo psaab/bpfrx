@@ -152,11 +152,48 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig, opts compileOp
 			if len(queueNode.Keys) < 3 {
 				continue
 			}
-			queue, err := strconv.Atoi(queueNode.Keys[1])
-			if err != nil {
-				continue
-			}
 			name := queueNode.Keys[2]
+			rawQueue := queueNode.Keys[1]
+			queue, err := strconv.Atoi(rawQueue)
+			if err != nil {
+				// #5973: a non-numeric or integer-overflowing
+				// forwarding-class queue token was previously
+				// SILENTLY DROPPED here (strconv.Atoi -> continue):
+				// the forwarding-class -> queue mapping never bound
+				// and CompileConfig accepted the stanza with no
+				// effect — the same mis-bind / fail-open class
+				// #5963/#5933 closed on adjacent CoS slots, and
+				// inconsistent with the sibling fairness
+				// rss-expectation queue parse (which hard-rejects
+				// `err != nil || queue < 0 || queue > 255`). This is
+				// the ONE malformed case the downstream #4594
+				// forwarding-class queue-range gate
+				// (validateClassOfServiceForwardingClassQueueStrict)
+				// can never see: a strconv error means the FC never
+				// binds, so there is no Queue int left for the range
+				// gate to check. A PARSEABLE but out-of-range value
+				// (e.g. 999) or a negative one still flows through to
+				// that downstream gate, which already rejects it
+				// (strict) / warns (lenient). Reject at commit here;
+				// downgrade to a warning on the tolerant load /
+				// peer-sync path (opts.lenientCoSForwardingClassQueue,
+				// the SAME #4594 flag that downstream gate uses) so an
+				// already-persisted or peer-synced config an older
+				// binary accepted still boots — #1960 no-brick; the
+				// malformed queue was inert then too (the FC never
+				// bound).
+				detail := fmt.Errorf(
+					"class-of-service forwarding-classes forwarding-class %q queue %q: expected queue 0..255: %w",
+					name, rawQueue, err)
+				if opts.lenientCoSForwardingClassQueue {
+					if warnings != nil {
+						*warnings = append(*warnings, fmt.Sprintf(
+							"class-of-service forwarding-class queue (downgraded to warning on tolerant path): %v", detail))
+					}
+					continue
+				}
+				return detail
+			}
 			if existing, claimed := queueOwner[queue]; claimed && existing != name {
 				return fmt.Errorf(
 					"class-of-service forwarding-classes queue %d: "+
