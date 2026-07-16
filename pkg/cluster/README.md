@@ -529,6 +529,24 @@ removed/changed persisted and stranded a healthy node secondary forever.
 (it runs under the manager lock already held by `UpdateConfig`); the
 manager-side clear happens directly in `reconcileMonitorDebtsLocked`.
 
+`reconcileMonitorDebtsLocked` reconciles INTERFACE-monitor debt ONLY.
+`monitorWeights` + `MonitorFails` are a SHARED structure that also holds
+IP-MONITORING debts (installed by `SetMonitorWeight` from the ip-monitor
+path under the per-target `ip:<addr>` name and the aggregate
+`ipAggregateMonitorName` = `"ip-monitoring"`). Those ip debts are owned by
+the `Monitor`'s `reconcileRGIPDebts`, which drives them to the desired set
+on every poll and clears removed ones; a dropped RG is torn down wholesale
+at RG removal. Because `reconcileMonitorDebtsLocked` builds `desired` from
+`InterfaceMonitors` only, an ip key would always look "no longer desired",
+so the removal loop SKIPS every ip key (`isIPMonitorName` — `ip:` prefix or
+the aggregate constant). Without that skip, any unrelated config change
+wiped a LIVE ip-monitoring debt from `monitorWeights`/`MonitorFails` and
+recomputed the RG weight without it — and it did not self-heal (the
+Monitor's `ipDebts` still recorded the debt installed, so the next
+`reconcileRGIPDebts` poll saw `desired==installed` and no-op'd), so a node
+with a dead monitored uplink jumped back to weight 255 and could win
+election → blackhole. Fail-open (#5080 fold).
+
 `LinkAttrsUp` is exported because the same carrier-aware read is needed
 outside the monitor loop:
 

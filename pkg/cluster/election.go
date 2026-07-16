@@ -496,6 +496,15 @@ func (m *Manager) recalcWeight(rg *RedundancyGroupState) {
 // Each affected RG's effective weight is then recomputed from its now-current
 // debt set. The caller (UpdateConfig) re-runs the election after this returns,
 // so no election is triggered here. Must be called with m.mu held.
+//
+// This reconcile touches INTERFACE-monitor debt ONLY. IP-monitoring debt lives
+// in the same m.monitorWeights / rg.MonitorFails structure (installed by
+// SetMonitorWeight from the ip-monitor path under "ip:<addr>" and the aggregate
+// ipAggregateMonitorName) but is owned by the Monitor's reconcileRGIPDebts,
+// which drives it to the desired set every poll. `desired` here is built only
+// from InterfaceMonitors, so ip keys are skipped in the removal loop
+// (isIPMonitorName) — deleting them would wipe LIVE ip-monitoring debt on any
+// unrelated config change and fail open (#5080 fold).
 func (m *Manager) reconcileMonitorDebtsLocked(cfg *config.ClusterConfig) {
 	// Build the complete desired interface-monitor key→weight map.
 	desired := make(map[monitorKey]int)
@@ -510,6 +519,18 @@ func (m *Manager) reconcileMonitorDebtsLocked(cfg *config.ClusterConfig) {
 	// Clear debt for monitors no longer desired (removed, or the monitored
 	// interface was changed to a different name).
 	for key := range m.monitorWeights {
+		// IP-monitor debts share monitorWeights / MonitorFails with
+		// interface-monitor debts but are OWNED by reconcileRGIPDebts, which
+		// drives them to the desired set on every poll and clears removed ones
+		// (whole-RG teardown at RG removal handles a dropped RG). `desired`
+		// here is built only from InterfaceMonitors, so an ip key would always
+		// look "no longer desired" — deleting it would wipe a LIVE ip-monitoring
+		// debt on any unrelated config change, recompute the RG weight without
+		// it, and fail open (a node with a dead monitored uplink could win
+		// election). Skip every ip key (#5080 fold).
+		if isIPMonitorName(key.iface) {
+			continue
+		}
 		if _, ok := desired[key]; ok {
 			continue
 		}

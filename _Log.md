@@ -50200,3 +50200,51 @@ top.
 - **Timestamp**: 2026-07-16
 - **Action**: Fix #5080 (codex-review-177 [A5-b1-F3], High/High HA correctness). STEP-0 confirmed BOTH defects live on origin/master 883b116c7 (line numbers shifted from the issue's 812bf30c1). Defect 1 (FAIL-OPEN): pkg/cluster/monitor.go pollInterfaceMonitors, on a LinkByName failure for a LOCAL member link (peer-slot guard not matched) only `slog.Warn("...local interface missing") + continue` — no SetMonitorWeight(down), so an already-primary node kept effective weight 255 and stayed primary while its data link was absent (cold boot / delete-recreate between polls) → blackhole. Defect 2 (STALE-DEBT): UpdateGroups only did `mon.groups = groups`; a debt installed for a monitor the operator later REMOVED or CHANGED (interface/weight) persisted in monitorWeights + the RG's MonitorFails + the monitor's ifaceState, stranding a healthy node secondary. Fix: (1) pollInterfaceMonitors now treats a missing LOCAL link as DOWN (`up = false`) through the same dampening machinery as a carrier-down link; the peer-slot skip (`SlotToNodeID(slot) != NodeID`) is preserved and still fires first. (2) New Manager.reconcileMonitorDebtsLocked(cfg) (election.go), called from UpdateConfig under m.mu BEFORE the election: builds the desired (rgID,iface)→weight map from the new config, clears monitorWeights + MonitorFails for removed/changed keys, re-derives the debt for a still-failed monitor whose weight changed, and recomputes each affected RG's weight (mirrors recalcWeight arithmetic, no re-election — the tail election runs after). Monitor.UpdateGroups now also drops ifaceState for monitors no longer desired. Deadlock-safe: UpdateGroups runs under the manager lock already held by UpdateConfig, so it deliberately does NOT call the locking SetMonitorWeight; the manager-side clear happens directly in reconcileMonitorDebtsLocked. Invariant: every reconcile derives effective RG weight from the COMPLETE current desired monitor set + observed state — missing local links = down, removed keys = zero, changed weights re-derived. Fail-on-revert PROVEN firsthand for BOTH halves: (A) reintroduce the fail-open `continue` in pollInterfaceMonitors → TestMonitorReconcile_MissingLocalLinkDemotes_5080 RED ("weight after local link missing = 255, want 0"); (B) disable the reconcileMonitorDebtsLocked call → TestMonitorReconcile_StaleDebtClearedOnMonitorRemoval_5080 RED ("weight after monitor removal = 0, want 255") + TestMonitorReconcile_ChangedMonitorReapplied_5080 both subtests RED (interface-change stranded at 155; weight-change stuck at old 100→155 not 55); restored → all GREEN. Validation: GOCACHE=/dev/shm/cache GOTMPDIR=/tmp/g5080 go build ./... clean; go vet ./pkg/cluster clean; full pkg/cluster suite -race GREEN (10.4s). Go-only, no cargo. test-failover smoke blocked by the loss-cluster shim-ABI wall — gated on the fail-on-revert unit tests + full -race suite; parent to record the smoke deferral.
 - **File(s)**: pkg/cluster/monitor.go (edit — pollInterfaceMonitors missing-local-link = down; UpdateGroups clears stale ifaceState), pkg/cluster/election.go (edit — reconcileMonitorDebtsLocked + config import), pkg/cluster/group_state.go (edit — UpdateConfig calls reconcileMonitorDebtsLocked before election), pkg/cluster/monitor_reconcile_5080_test.go (new — fail-open + stale-debt fail-on-revert tests), pkg/cluster/README.md (edit — "missing local link = down" + "reconcile monitor debt on config change" subsections)
+
+## 2026-07-16 — #5080 FOLD: reconcileMonitorDebtsLocked must not wipe ip-monitor debt
+- **Timestamp**: 2026-07-16 (fix/5080-monitor-reconcile, PR #6023)
+- **Action**: Fold a firsthand-confirmed MAJOR regression the #5080 fix
+  INTRODUCED. `Manager.reconcileMonitorDebtsLocked` (election.go) built its
+  `desired` key set from `cfg.RedundancyGroups[].InterfaceMonitors` ONLY, then
+  DELETED every `monitorWeights` key not in `desired` and dropped it from
+  `rg.MonitorFails`. But `monitorWeights` + `MonitorFails` are a SHARED
+  structure that also holds IP-MONITORING debts (installed by SetMonitorWeight
+  from the ip-monitor path, monitor.go, under the per-target `ip:<addr>` name
+  and the aggregate `ipAggregateMonitorName` = `"ip-monitoring"`). So EVERY
+  UpdateConfig wiped live ip-monitoring debt from monitorWeights + MonitorFails
+  and recomputed rg.Weight WITHOUT it — and it did NOT self-heal (the Monitor's
+  ipDebts still recorded the debt installed, so the next reconcileRGIPDebts poll
+  saw desired==installed and no-op'd). Failure: an RG whose ip-monitor target is
+  unreachable (Weight 155, SECONDARY) → operator commits ANY unrelated config
+  change → reconcile wipes the ip debt → Weight 255 → node can win election and
+  go PRIMARY while its monitored uplink is dead → blackhole. Fail-open — the
+  exact class this PR set out to fix. Fix (precise, bounded): the removal loop
+  in reconcileMonitorDebtsLocked now SKIPS any key whose iface is an ip-monitor
+  name via new `isIPMonitorName(iface)` helper (monitor.go, next to the
+  constant it keys on): `iface == ipAggregateMonitorName || strings.HasPrefix(
+  iface, "ip:")` — the SAME discriminator the ip-monitor install/status code
+  uses (monitor.go desiredRGIPDebts / status.go). ip debt is left entirely to
+  the Monitor's reconcileRGIPDebts (drives desired each poll, clears removed
+  ones) and the whole-RG teardown at RG removal. The reapply-changed-weight loop
+  iterates `desired` (interface-monitors only) so it cannot touch ip keys; the
+  affected-RG recompute now correctly sums the FULL rg.MonitorFails, which
+  retains the ip debts. Fail-on-revert PROVEN firsthand: neutralize the skip
+  (`if false && isIPMonitorName(...)`) → new
+  TestMonitorReconcile_IPDebtPreservedOnConfigChange_5080 goes RED on BOTH
+  subtests — daemon log shows the reviewer's exact line `cluster: monitor debt
+  reconciled on config change rg=1 old=155 new=255`, assertion `weight after
+  unrelated config change = 255, want 155`; per-target (`ip:10.0.0.1`) AND
+  aggregate (`ip-monitoring`) forms both fail; restored → GREEN. The 3 existing
+  #5080 tests (MissingLocalLinkDemotes, StaleDebtClearedOnMonitorRemoval,
+  ChangedMonitorReapplied) stay GREEN — interface-monitor reconcile behavior is
+  unchanged, only ip keys are excluded. Validation: GOCACHE=/dev/shm/cache
+  GOTMPDIR=/tmp/g5080b go build ./... clean; go vet ./pkg/cluster clean; full
+  pkg/cluster suite -race GREEN (10.2s). Go-only, no cargo. test-failover smoke
+  blocked by the loss-cluster shim-ABI wall — gated on the fail-on-revert unit
+  tests + full -race suite; parent to record the smoke deferral.
+- **File(s)**: pkg/cluster/election.go (edit — reconcileMonitorDebtsLocked
+  removal loop skips ip keys + doc comment), pkg/cluster/monitor.go (edit —
+  isIPMonitorName helper), pkg/cluster/monitor_reconcile_5080_ipfold_test.go
+  (new — ip-debt-preserved fail-on-revert test, per-target + aggregate),
+  pkg/cluster/README.md (edit — reconcileMonitorDebtsLocked reconciles
+  interface-monitor debt ONLY; ip debt owned by reconcileRGIPDebts)

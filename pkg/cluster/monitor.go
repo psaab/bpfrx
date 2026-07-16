@@ -617,6 +617,19 @@ func (mon *Monitor) updateIPTargetDampenedState(rg *config.RedundancyGroup, targ
 // and from interface-monitor names so it never collides with them.
 const ipAggregateMonitorName = "ip-monitoring"
 
+// isIPMonitorName reports whether a monitor name in monitorWeights /
+// MonitorFails belongs to the IP-MONITORING path rather than an
+// interface-monitor. IP-monitor debts are installed by reconcileRGIPDebts under
+// two naming conventions — the per-target "ip:<addr>" form (independent mode)
+// and the fixed aggregate ipAggregateMonitorName (global-threshold mode). They
+// share the monitorWeights / MonitorFails structure with interface-monitor
+// debts, so any code that reconciles ONE class must use this discriminator to
+// avoid clobbering the other. reconcileRGIPDebts owns the IP class; the
+// interface-monitor reconcile (reconcileMonitorDebtsLocked) owns the rest.
+func isIPMonitorName(iface string) bool {
+	return iface == ipAggregateMonitorName || strings.HasPrefix(iface, "ip:")
+}
+
 // desiredRGIPDebts computes the ip-monitor election debts an RG SHOULD carry
 // given its current mode and dampened reachability — the single place the two
 // modes' semantics are expressed:
