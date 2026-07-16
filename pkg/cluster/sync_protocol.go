@@ -3,6 +3,9 @@ package cluster
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"log/slog"
+	"math"
 	"net"
 	"strings"
 	"time"
@@ -656,10 +659,22 @@ func decodeConfigPayload(payload []byte) (configText string, gen uint64) {
 // carries REMAINING LIFETIME (not absolute expiry) so the receiver re-anchors
 // to its local clock at seed (the #2239 clock invariant).
 
-// putLeaseString appends a uint16-length-prefixed string.
-func putLeaseString(b []byte, s string) []byte {
+// putLeaseString appends a uint16-length-prefixed string. It FAILS CLOSED when
+// s exceeds the uint16 wire prefix (math.MaxUint16 = 65535 bytes): the prefix
+// would otherwise silently narrow (uint16(len(s)) wraps to the low 16 bits) and
+// the peer's getLeaseString would read a truncated string, then misread the
+// record's trailing bytes as later fields — a cross-node lease-sync misframe
+// that corrupts the lease's identity/type/prefix-length/hostname on the standby
+// (#4892). The wire format is unchanged (getLeaseString still trusts the uint16
+// prefix); the writer simply never emits an oversized field — the encoder
+// rejects the whole lease instead. Real DHCP identifiers/DUIDs/hostnames are far
+// below 64 KiB, so this is defensive validation, not an expected path.
+func putLeaseString(b []byte, s string) ([]byte, error) {
+	if len(s) > math.MaxUint16 {
+		return nil, fmt.Errorf("lease-sync string field length %d exceeds uint16 wire limit %d", len(s), math.MaxUint16)
+	}
 	b = binary.LittleEndian.AppendUint16(b, uint16(len(s)))
-	return append(b, s...)
+	return append(b, s...), nil
 }
 
 // getLeaseString reads a uint16-length-prefixed string at off, returning the
@@ -679,11 +694,17 @@ func getLeaseString(buf []byte, off int) (string, int, bool) {
 
 // encodeOneLease serializes one SyncLease into a self-describing record body
 // (without the outer record-length prefix). Field order is fixed and append-
-// only; decoders read what the record length covers.
-func encodeOneLease(l dhcpserver.SyncLease) []byte {
+// only; decoders read what the record length covers. It returns an error when
+// any variable-length field exceeds the uint16 wire prefix (#4892): the lease is
+// rejected from the sync push rather than emitted misframed. err names the field
+// so the caller's warning is actionable.
+func encodeOneLease(l dhcpserver.SyncLease) ([]byte, error) {
 	b := make([]byte, 0, 96)
 	b = append(b, byte(l.Family))
-	b = putLeaseString(b, l.Address)
+	var err error
+	if b, err = putLeaseString(b, l.Address); err != nil {
+		return nil, fmt.Errorf("encode lease Address: %w", err)
+	}
 	b = binary.LittleEndian.AppendUint32(b, uint32(l.SubnetID))
 	b = binary.LittleEndian.AppendUint32(b, uint32(l.ValidLife))
 	b = binary.LittleEndian.AppendUint32(b, uint32(l.Remaining))
@@ -691,13 +712,23 @@ func encodeOneLease(l dhcpserver.SyncLease) []byte {
 	// identity + naming (variable). v4: hwaddr, clientid. v6: duid, iaid,
 	// leasetype, prefixlen. Both families carry all slots; the unused ones
 	// are empty/zero so the record layout is family-uniform and append-only.
-	b = putLeaseString(b, l.HWAddress)
-	b = putLeaseString(b, l.ClientID)
-	b = putLeaseString(b, l.DUID)
+	if b, err = putLeaseString(b, l.HWAddress); err != nil {
+		return nil, fmt.Errorf("encode lease HWAddress: %w", err)
+	}
+	if b, err = putLeaseString(b, l.ClientID); err != nil {
+		return nil, fmt.Errorf("encode lease ClientID: %w", err)
+	}
+	if b, err = putLeaseString(b, l.DUID); err != nil {
+		return nil, fmt.Errorf("encode lease DUID: %w", err)
+	}
 	b = binary.LittleEndian.AppendUint32(b, l.IAID)
-	b = putLeaseString(b, l.LeaseType)
+	if b, err = putLeaseString(b, l.LeaseType); err != nil {
+		return nil, fmt.Errorf("encode lease LeaseType: %w", err)
+	}
 	b = binary.LittleEndian.AppendUint32(b, uint32(l.PrefixLen))
-	b = putLeaseString(b, l.Hostname)
+	if b, err = putLeaseString(b, l.Hostname); err != nil {
+		return nil, fmt.Errorf("encode lease Hostname: %w", err)
+	}
 	var flags byte
 	if l.FQDNFwd {
 		flags |= 0x01
@@ -706,7 +737,7 @@ func encodeOneLease(l dhcpserver.SyncLease) []byte {
 		flags |= 0x02
 	}
 	b = append(b, flags)
-	return b
+	return b, nil
 }
 
 // decodeOneLease parses a record body produced by encodeOneLease. It is
@@ -783,10 +814,25 @@ func decodeOneLease(buf []byte) dhcpserver.SyncLease {
 // zero count (a legitimate "I serve no leases" message, distinct from a legacy
 // peer that never sends this type at all).
 func encodeDHCPLeasePayload(leases []dhcpserver.SyncLease) []byte {
-	b := make([]byte, 0, 8+len(leases)*64)
-	b = binary.LittleEndian.AppendUint32(b, uint32(len(leases)))
+	// Encode records first so an oversized field (which encodeOneLease rejects,
+	// #4892) DROPS just that lease — fail-closed — while the count prefix stays
+	// consistent with the records actually emitted. Dropping one unencodable
+	// lease is strictly safer than either misframing the peer's decode or
+	// blocking the entire push; the standby simply lacks that one lease (the
+	// client re-DHCPs on takeover) instead of seeding a corrupted identity.
+	recs := make([][]byte, 0, len(leases))
 	for _, l := range leases {
-		rec := encodeOneLease(l)
+		rec, err := encodeOneLease(l)
+		if err != nil {
+			slog.Warn("cluster sync: dropping unencodable DHCP lease from sync push",
+				"family", l.Family, "address", l.Address, "err", err)
+			continue
+		}
+		recs = append(recs, rec)
+	}
+	b := make([]byte, 0, 8+len(recs)*64)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(recs)))
+	for _, rec := range recs {
 		b = binary.LittleEndian.AppendUint32(b, uint32(len(rec)))
 		b = append(b, rec...)
 	}
