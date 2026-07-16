@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -1186,12 +1187,19 @@ func TestBuildPBRRules(t *testing.T) {
 		}
 	})
 
-	// M3: an expansion beyond maxPBRRules truncates and reports degraded.
-	t.Run("M3 truncation degrades", func(t *testing.T) {
+	// M3 / #5683: a term whose DSCP×proto×port×src×dst product exceeds the
+	// maxPBRRules cap is dropped WHOLE (fail-safe under-steer) and reported as
+	// degraded, WITHOUT ever materializing the full product. Pre-#5683 this
+	// materialized the entire cross-product and then truncated to the cap
+	// (rules[:maxPBRRules]) — the pre-cap memory/CPU blow-up. 40×25 = 1000 is the
+	// exact boundary; 40×26 = 1040 is the first over-cap product.
+	t.Run("M3 overflow term dropped without materializing product", func(t *testing.T) {
 		srcs := make([]string, 0, 40)
-		dsts := make([]string, 0, 40)
+		dsts := make([]string, 0, 26)
 		for i := 0; i < 40; i++ {
 			srcs = append(srcs, fmt.Sprintf("10.%d.0.0/16", i))
+		}
+		for i := 0; i < 26; i++ {
 			dsts = append(dsts, fmt.Sprintf("192.168.%d.0/24", i))
 		}
 		filter := &config.FirewallFilter{
@@ -1201,11 +1209,99 @@ func TestBuildPBRRules(t *testing.T) {
 			},
 		}
 		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
-		if len(rules) != maxPBRRules {
-			t.Errorf("expected truncation to %d rules, got %d", maxPBRRules, len(rules))
+		// The single over-cap term is dropped whole: 0 rules installed. Pre-#5683
+		// this asserted maxPBRRules (the truncated first-N of the materialized
+		// product), so removing the guard flips this RED.
+		if len(rules) != 0 {
+			t.Errorf("over-cap term must be dropped whole (0 rules), got %d", len(rules))
 		}
 		if err == nil {
-			t.Errorf("overflow must return a degraded build error")
+			t.Fatalf("overflow must return a degraded build error")
+		}
+		if !strings.Contains(err.Error(), "term t") || !strings.Contains(err.Error(), "cross-product") {
+			t.Errorf("overflow error must name the offending term and the cross-product, got: %v", err)
+		}
+	})
+
+	// #5683: the boundary term whose product is EXACTLY maxPBRRules builds fully
+	// (no false overflow) — 40 src × 25 dst = 1000.
+	t.Run("5683 exact-cap term builds fully", func(t *testing.T) {
+		srcs := make([]string, 0, 40)
+		dsts := make([]string, 0, 25)
+		for i := 0; i < 40; i++ {
+			srcs = append(srcs, fmt.Sprintf("10.%d.0.0/16", i))
+		}
+		for i := 0; i < 25; i++ {
+			dsts = append(dsts, fmt.Sprintf("192.168.%d.0/24", i))
+		}
+		filter := &config.FirewallFilter{
+			Name: "exact",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", SourceAddresses: srcs, DestAddresses: dsts, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if err != nil {
+			t.Fatalf("exact-cap term (product==%d) must not degrade, got: %v", maxPBRRules, err)
+		}
+		if len(rules) != maxPBRRules {
+			t.Errorf("exact-cap term must build all %d rules, got %d", maxPBRRules, len(rules))
+		}
+	})
+
+	// #5683: an astronomically large product (1000 src × 1000 dst = 1,000,000)
+	// must NOT be materialized — the guard aborts on the O(dimensions) size
+	// computation. Pre-#5683 this allocated ~1e6 PBRRule structs before
+	// truncating; the guard returns 0 rules + a degraded error essentially
+	// instantly. Asserting len==0 (not maxPBRRules) is the fail-on-revert: the
+	// reverted materialize-then-truncate path yields maxPBRRules.
+	t.Run("5683 astronomical product never materialized", func(t *testing.T) {
+		srcs := make([]string, 0, 1000)
+		dsts := make([]string, 0, 1000)
+		for i := 0; i < 1000; i++ {
+			srcs = append(srcs, fmt.Sprintf("10.%d.%d.0/24", i/256, i%256))
+			dsts = append(dsts, fmt.Sprintf("192.%d.%d.0/24", i/256, i%256))
+		}
+		filter := &config.FirewallFilter{
+			Name: "huge",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", SourceAddresses: srcs, DestAddresses: dsts, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 0 {
+			t.Errorf("astronomical product must be dropped whole (0 rules), got %d", len(rules))
+		}
+		if err == nil {
+			t.Errorf("astronomical product must return a degraded build error")
+		}
+	})
+
+	// #5683: an EARLIER under-cap term is preserved; only the later over-cap term
+	// is dropped. Proves the budget is threaded across terms, not reset per term.
+	t.Run("5683 earlier fitting term preserved when a later term overflows", func(t *testing.T) {
+		bigSrcs := make([]string, 0, 40)
+		bigDsts := make([]string, 0, 40)
+		for i := 0; i < 40; i++ {
+			bigSrcs = append(bigSrcs, fmt.Sprintf("172.%d.0.0/16", i))
+			bigDsts = append(bigDsts, fmt.Sprintf("198.18.%d.0/24", i))
+		}
+		filter := &config.FirewallFilter{
+			Name: "mix",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "small", DSCPs: []string{"ef"}, RoutingInstance: "ATT"},
+				{Name: "over", SourceAddresses: bigSrcs, DestAddresses: bigDsts, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 1 {
+			t.Fatalf("the fitting term must install 1 rule, the over-cap term 0; got %d", len(rules))
+		}
+		if err == nil {
+			t.Errorf("the dropped over-cap term must surface a degraded error")
+		}
+		if !strings.Contains(err.Error(), "term over") {
+			t.Errorf("overflow error must name the offending term 'over', got: %v", err)
 		}
 	})
 

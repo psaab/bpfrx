@@ -292,6 +292,24 @@ delegate to the owning domain. Exported types:
   applying the real, fully-qualified rule. `PBRRulePriorityBase` /
   `PBRRuleWindow` are the SSOT in `pkg/config`, shared by the install cap
   (`maxPBRRules`) here and the snapshot skip there so the two cannot drift.
+  **The `maxPBRRules` cap is enforced DURING expansion, not after (#5683).**
+  Each `routing-instance` term expands to a six-dimensional Cartesian product —
+  DSCP × protocol × source-port × destination-port × source × destination.
+  Before #5683 `buildPBRFromFilter` materialized the FULL product of every term
+  into one slice and only `BuildPBRRules` then truncated to the cap, so a config
+  whose dimensions multiply to millions of tuples exhausted memory/CPU DURING
+  expansion — the cap did not protect against the blow-up it was meant to bound
+  (a commit/apply/scrape DoS: `BuildPBRRules` runs on the apply path and on the
+  `PBRBuildStats` Prometheus scrape). The builder now computes each term's
+  product SIZE from the resolved dimension lengths (`pbrTermProduct`, O(dimensions)
+  with a saturating multiply) BEFORE the nested loop and DROPS WHOLE any term
+  that would push the running total past the remaining priority-window budget —
+  the same fail-safe under-steer as an unrepresentable predicate, with a degraded
+  error naming the offending filter/term and its product-vs-cap. The full
+  product is never allocated. A config UNDER the cap expands byte-identically
+  (the guard never fires); an over-cap term steers nothing in the kernel mirror
+  (the userspace filter path still enforces it exactly), so the operator sees the
+  degraded gauge/log and authors a tighter match.
 - `33000–33099`: rib-group inter-VRF leaking (`from all lookup
   <table>`). `ribGroupManager.Apply` only installs a leak rule when an
   instance's `interface-routes` rib-group imports a rib that resolves to
