@@ -931,7 +931,14 @@ type StaticNATRule struct {
 	// all-source mapping, a fail-open exposure, H01). The first element is
 	// mirrored into SourceAddress for back-compat. Empty = match any source.
 	SourceAddresses []string
-	Then            string // static-nat prefix (internal/private IP), or "inet" for NAT64
+	// Then is the static-nat prefix (internal/private IP). The Junos NAT64
+	// keyword `then static-nat inet` records the sentinel "inet" here, but it
+	// is REJECTED at strict commit (validateStaticNATInetTargetStrict, #5859):
+	// no dataplane lowering exists and emitting the literal "inet" into the
+	// static_nat address slot left the rule silently inert. Lenient load /
+	// peer-sync downgrades to a warning and the snapshot builder drops the rule
+	// (fail-closed). The supported IPv6->IPv4 path is `security nat nat64`.
+	Then string
 	// ThenPrefixName is the raw `then static-nat prefix-name <name>` reference
 	// (#4290). Junos static NAT `prefix-name` names a global address-book entry
 	// whose literal prefix is the 1:1 translation target — the named twin of

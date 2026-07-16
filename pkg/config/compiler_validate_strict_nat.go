@@ -1140,10 +1140,13 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// `then static-nat inet` is a NAT64 translation, not host-1:1
 			// static NAT: its `match destination-address` is the NAT64
 			// well-known prefix (e.g. 64:ff9b::/96, a legitimate non-host
-			// prefix) and the actual translation is driven by the separate
-			// NAT64 snapshot (buildNAT64Snapshots), not the static_nat table
-			// (the inet rule's static_nat snapshot entry is expected to be a
-			// no-op the Rust parse drops). Exempt the whole rule.
+			// prefix), so the host-mask check does not apply. The keyword is
+			// itself rejected at strict commit by validateStaticNATInetTarget-
+			// Strict (#5859) — no dataplane lowering exists, and emitting the
+			// literal "inet" left the rule silently inert — so this exemption
+			// only avoids a misleading second (host-mask) error on the same
+			// rule; the inet gate is the authoritative rejection. Exempt the
+			// whole rule.
 			if rule.Then == "inet" {
 				continue
 			}
@@ -1706,6 +1709,58 @@ func validateStaticNATThenTargetStrict(cfg *Config) error {
 					"translation and silently forward the packet untranslated "+
 					"(#4290)",
 				rs.Name, rule.Name)
+		}
+	}
+	return nil
+}
+
+// validateStaticNATInetTargetStrict rejects a static-NAT rule whose translation
+// target is the Junos NAT64 keyword `then static-nat inet` (#5859).
+//
+// The compiler ACCEPTS the keyword (compileNATStatic records rule.Then=="inet"),
+// but the userspace snapshot builder emits it as the LITERAL string "inet" in
+// the same-family static_nat table's InternalIP address slot. The Rust dataplane
+// (static_nat.rs) calls parse_nat_prefix on "inet", the parse fails, and the
+// rule is SILENTLY SKIPPED — a strict-valid config claims NAT64 translation but
+// is INERT (a security-relevant NAT rule that installs nothing). The dataplane
+// has no lowering of `static-nat inet` into the native NAT64 IR; the only
+// supported IPv6->IPv4 path is the native `security nat nat64` rule-set
+// (buildNAT64Snapshots reads cfg.Security.NAT.NAT64, NOT static-NAT rules).
+//
+// Until that lowering exists (a separate, larger design change: match scope,
+// source pool, routing-instance, counters, fragments, reverse BIB, HA sync),
+// fail CLOSED: hard-reject at strict commit so the operator sees a loud error
+// instead of a silently inert rule, and name the native rule-set as the
+// supported alternative. NPTv6 rules are skipped (Then holds the nptv6 prefix,
+// handled on a separate path). Rule-sets are walked in slice order for a
+// deterministic first error.
+//
+// Strict on commit / commit-check (hard reject); the call site downgrades to a
+// warning on the tolerant load / peer-sync path (#1960 no-brick), where the
+// snapshot builder (buildStaticNATSnapshots) independently DROPS the rule so the
+// unparseable "inet" sentinel never reaches the Rust static_nat table.
+func validateStaticNATInetTargetStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.IsNPTv6 {
+				continue
+			}
+			if rule.Then == "inet" {
+				return fmt.Errorf(
+					"static NAT rule-set %q rule %q uses `then static-nat "+
+						"inet` (NAT64), which is not yet representable in the "+
+						"dataplane and would install as a silently inert rule "+
+						"(the literal \"inet\" cannot parse as a translation "+
+						"address); author the native `security nat nat64` "+
+						"rule-set instead (#5859)",
+					rs.Name, rule.Name)
+			}
 		}
 	}
 	return nil
