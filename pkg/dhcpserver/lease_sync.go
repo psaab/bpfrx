@@ -89,7 +89,35 @@ type SyncLease struct {
 	FQDNRev   bool // client requested reverse DNS update
 	ValidLife int  // the lease's configured valid-lifetime (seconds)
 	Remaining int  // seconds of lifetime left at read time (clock-skew-safe)
-	State     int  // Kea lease state (0=default/active)
+
+	// PreferredRemaining is the SECONDS of PREFERRED lifetime left at the moment
+	// the SENDER read the lease. For DHCPv6 the preferred lifetime is a SEPARATE
+	// deadline from the valid lifetime: a DEPRECATED binding has preferred=0 with
+	// a still-positive valid lifetime (the client must stop using the address for
+	// new connections but the lease is not yet expired). It is re-anchored to the
+	// receiver's local clock at seed exactly like Remaining (the #2239 clock
+	// invariant) and the invariant 0 <= PreferredRemaining <= Remaining always
+	// holds (#5073). A value of 0 means DEPRECATED. For DHCPv4 (no preferred
+	// concept) and for leases synced from an OLDER peer that predates this field,
+	// PreferredRemaining defaults to Remaining (preferred==valid), preserving the
+	// pre-#5073 behavior.
+	PreferredRemaining int
+
+	State int // Kea lease state (0=default/active)
+}
+
+// clampPreferredRemaining enforces the #5073 invariant 0 <= pref <= remaining.
+// The preferred lifetime can never outlive the valid lifetime (RFC 8415 §6.3),
+// and a negative computed remainder (a deprecated lease whose preferred deadline
+// has already passed) floors to 0 (deprecated), never revives.
+func clampPreferredRemaining(pref, remaining int) int {
+	if pref < 0 {
+		return 0
+	}
+	if pref > remaining {
+		return remaining
+	}
+	return pref
 }
 
 // IdentityKey returns a stable per-lease identity used for dedup/diff on the
@@ -142,12 +170,17 @@ type keaLeaseJSON struct {
 	PrefixLen int    `json:"prefix-len,omitempty"` // v6 IA_PD
 	SubnetID  int    `json:"subnet-id,omitempty"`
 	ValidLft  int    `json:"valid-lft,omitempty"`
-	CLTT      int64  `json:"cltt,omitempty"`   // client-last-transaction-time epoch (get)
-	Expire    int64  `json:"expire,omitempty"` // absolute expiry epoch (add)
-	State     int    `json:"state"`
-	Hostname  string `json:"hostname,omitempty"`
-	FQDNFwd   bool   `json:"fqdn-fwd,omitempty"`
-	FQDNRev   bool   `json:"fqdn-rev,omitempty"`
+	// PreferredLft is a POINTER so an absent field (nil, an older Kea or a v4
+	// lease) is distinguishable from an explicit preferred-lft:0 (a DEPRECATED
+	// v6 binding). omitempty only drops a nil pointer, so a &0 still emits
+	// "preferred-lft":0 on the add path — the deprecation must reach Kea (#5073).
+	PreferredLft *int   `json:"preferred-lft,omitempty"`
+	CLTT         int64  `json:"cltt,omitempty"`   // client-last-transaction-time epoch (get)
+	Expire       int64  `json:"expire,omitempty"` // absolute expiry epoch (add)
+	State        int    `json:"state"`
+	Hostname     string `json:"hostname,omitempty"`
+	FQDNFwd      bool   `json:"fqdn-fwd,omitempty"`
+	FQDNRev      bool   `json:"fqdn-rev,omitempty"`
 }
 
 type keaLeaseGetAllArgs struct {
@@ -260,6 +293,18 @@ func keaLeaseToSync(kl keaLeaseJSON, family int, now time.Time) SyncLease {
 		rem = 0
 	}
 	l.Remaining = int(rem)
+	// #5073: preferred remaining is anchored to the SAME expire epoch as the
+	// valid remaining. Both lifetimes count from cltt, so
+	//   preferred_remaining = valid_remaining - (valid-lft - preferred-lft).
+	// A DEPRECATED lease (preferred-lft=0) yields a negative remainder that
+	// clamps to 0; a lease with preferred==valid yields exactly Remaining. When
+	// Kea reports no preferred-lft (nil — an older Kea or a v4 lease) default to
+	// preferred==valid (PreferredRemaining=Remaining), the pre-#5073 behavior.
+	if kl.PreferredLft != nil {
+		l.PreferredRemaining = clampPreferredRemaining(l.Remaining-(kl.ValidLft-*kl.PreferredLft), l.Remaining)
+	} else {
+		l.PreferredRemaining = l.Remaining
+	}
 	return l
 }
 
@@ -340,6 +385,17 @@ func readSyncLeasesViaMemfile(path string, family int, now time.Time) ([]SyncLea
 			continue
 		}
 		l.Remaining = int(rem)
+		// #5073: preferred remaining, re-anchored the SAME way as Remaining. The
+		// memfile expire epoch is cltt+valid_lifetime, so the preferred deadline
+		// is expire-valid_lifetime+pref_lifetime and
+		//   preferred_remaining = Remaining - (valid_lifetime - pref_lifetime),
+		// clamped [0, Remaining]. A DEPRECATED binding (pref_lifetime=0) floors
+		// to 0 and is not revived. When the pref_lifetime/valid_lifetime columns
+		// are absent (v4, or an old memfile) default preferred==valid.
+		l.PreferredRemaining = l.Remaining
+		if family == 6 && a.PrefLifetimeOK && a.ValidLifetime > 0 {
+			l.PreferredRemaining = clampPreferredRemaining(l.Remaining-(a.ValidLifetime-a.PrefLifetime), l.Remaining)
+		}
 		out = append(out, l)
 	}
 	return out, nil
@@ -551,6 +607,14 @@ func syncLeaseToKea(l SyncLease, now time.Time) keaLeaseJSON {
 	if l.Family == 6 {
 		kl.DUID = l.DUID
 		kl.IAID = l.IAID
+		// #5073: carry the PREFERRED remaining onto the socket add/update path so
+		// a DEPRECATED binding (PreferredRemaining=0) is seeded deprecated rather
+		// than revived. Clamp to [0, rem] (rem is the floored valid-lft) so the
+		// invariant preferred<=valid holds; the pointer emits "preferred-lft":0
+		// for a deprecated lease (omitempty only drops nil). A lease from an
+		// older peer defaults PreferredRemaining=Remaining, so preferred==valid.
+		prefRem := clampPreferredRemaining(l.PreferredRemaining, rem)
+		kl.PreferredLft = &prefRem
 		// Normalize the lease kind through the shared inverse so the socket-add
 		// path and the memfile pre-seed path agree on every type (#2268). An
 		// unknown string falls back to IA_NA, matching writeMemfile6.
@@ -768,6 +832,13 @@ func (m *Manager) writeMemfile6(path string, leases []SyncLease, now time.Time) 
 		}
 		rem := l.Remaining
 		expire := now.Unix() + int64(rem)
+		// #5073: the pref_lifetime column must carry the PREFERRED remaining, not
+		// the valid remaining. Writing `rem` here revived a DEPRECATED binding
+		// (preferred=0) as fully preferred on takeover. Clamp defensively to
+		// [0, rem] so the invariant preferred<=valid holds even if an upstream
+		// producer left PreferredRemaining unset (0 → deprecated, safe) or larger
+		// than rem (an older-peer default equals rem, so the clamp is a no-op).
+		prefRem := clampPreferredRemaining(l.PreferredRemaining, rem)
 		// Encode the v6 lease kind symmetrically with the read path
 		// (keaLeaseTypeToString) via the shared inverse so IA_NA / IA_TA / IA_PD
 		// all round-trip (#2268). An unknown string falls back to IA_NA (an
@@ -788,7 +859,7 @@ func (m *Manager) writeMemfile6(path string, leases []SyncLease, now time.Time) 
 		// state,user_context,hwtype,hwaddr_source,pool_id
 		fmt.Fprintf(&b, "%s,%s,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s,%s,%d,,,,0\n",
 			csvField(l.Address), csvField(l.DUID),
-			rem, expire, l.SubnetID, rem,
+			rem, expire, l.SubnetID, prefRem,
 			leaseType, l.IAID, prefixLen,
 			boolCSV(l.FQDNFwd), boolCSV(l.FQDNRev), csvField(l.Hostname),
 			csvField(l.HWAddress), keaStateDefault)

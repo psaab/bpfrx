@@ -990,6 +990,18 @@ func (s *SessionSync) peerDHCPLeasesAged(family int, now time.Time) []dhcpserver
 		if l.Remaining <= 0 {
 			continue // aged out on the standby — drop, never resurrect at seed
 		}
+		// #5073: the PREFERRED remaining counts down in the same real time as the
+		// valid remaining, so it must age by the same residence. Floor at 0
+		// (already-deprecated stays deprecated) and cap at the aged Remaining so
+		// the invariant PreferredRemaining <= Remaining survives residence. A
+		// deprecated lease held on the standby is never revived at seed.
+		l.PreferredRemaining -= residence
+		if l.PreferredRemaining < 0 {
+			l.PreferredRemaining = 0
+		}
+		if l.PreferredRemaining > l.Remaining {
+			l.PreferredRemaining = l.Remaining
+		}
 		out = append(out, l)
 	}
 	return out

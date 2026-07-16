@@ -1192,3 +1192,194 @@ func TestKeaMemfileHeadersMatchKea30xSchema(t *testing.T) {
 		}
 	}
 }
+
+// TestKeaLeaseToSync_PreferredRemaining is the #5073 socket-reader guard. Kea's
+// lease6-get-all reports valid-lft AND preferred-lft; both count from cltt, so
+// the preferred remaining is anchored to the same expire as the valid remaining:
+//
+//	preferred_remaining = valid_remaining - (valid-lft - preferred-lft)
+//
+// A DEPRECATED binding (preferred-lft=0) must read PreferredRemaining=0, NOT the
+// valid remaining — reading valid revives it on takeover. When Kea omits
+// preferred-lft (nil), default preferred==valid.
+//
+// FAIL-ON-REVERT: drop the preferred-lft handling in keaLeaseToSync and the
+// deprecated case reads PreferredRemaining=Remaining (revival) → RED.
+func TestKeaLeaseToSync_PreferredRemaining(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	intp := func(n int) *int { return &n }
+	// cltt+valid-lft-now = (now-600+3600)-now = 3000 valid remaining.
+	base := keaLeaseJSON{
+		IPAddress: "2001:db8::1", DUID: "00:01:00:01", IAID: 7, Type: "IA_NA",
+		SubnetID: 1, ValidLft: 3600, CLTT: now.Unix() - 600, State: keaStateDefault,
+	}
+	cases := []struct {
+		name    string
+		prefLft *int
+		want    int
+	}{
+		{"deprecated", intp(0), 0},           // 3000 - (3600-0) = -600 -> clamp 0
+		{"partial", intp(1200), 600},         // 3000 - (3600-1200) = 600
+		{"healthy", intp(3600), 3000},        // 3000 - 0 = 3000 == Remaining
+		{"absent-defaults-valid", nil, 3000}, // no preferred-lft -> preferred==valid
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kl := base
+			kl.PreferredLft = tc.prefLft
+			l := keaLeaseToSync(kl, 6, now)
+			if l.Remaining != 3000 {
+				t.Fatalf("Remaining = %d, want 3000", l.Remaining)
+			}
+			if l.PreferredRemaining != tc.want {
+				t.Errorf("PreferredRemaining = %d, want %d", l.PreferredRemaining, tc.want)
+			}
+			if l.PreferredRemaining < 0 || l.PreferredRemaining > l.Remaining {
+				t.Errorf("invariant 0 <= PreferredRemaining(%d) <= Remaining(%d) violated",
+					l.PreferredRemaining, l.Remaining)
+			}
+		})
+	}
+}
+
+// TestGetSyncLeases6_MemfileFallback_PreferredRemaining is the #5073 memfile-
+// reader guard. The v6 memfile carries distinct valid_lifetime and pref_lifetime
+// columns; the fallback read must recover a preferred remaining that does NOT
+// revive a deprecated (pref_lifetime=0) binding. valid_lifetime=3600 with
+// expire=now+1800 means the lease aged 1800s (Remaining=1800), so:
+//   - pref_lifetime=0    -> PreferredRemaining=0    (deprecated, not revived)
+//   - pref_lifetime=2400 -> PreferredRemaining=600  (1800-(3600-2400))
+//   - pref_lifetime=3600 -> PreferredRemaining=1800 (== Remaining, healthy)
+//
+// FAIL-ON-REVERT: drop the pref_lifetime handling and every lease reads
+// PreferredRemaining=Remaining, so the deprecated row's want-0 assertion goes RED.
+func TestGetSyncLeases6_MemfileFallback_PreferredRemaining(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile := filepath.Join(dir, "kea-leases6.csv")
+	expire := strconv.FormatInt(now.Unix()+1800, 10) // Remaining = 1800 for all rows
+	csv := keaMemfileHeader6 + "\n" +
+		// address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,lease_type,iaid,prefix_len,...
+		"2001:db8::dep,00:01:00:01,3600," + expire + ",1,0,0,1,128,0,0,dep,,0,,,,0\n" +
+		"2001:db8::par,00:01:00:02,3600," + expire + ",1,2400,0,2,128,0,0,par,,0,,,,0\n" +
+		"2001:db8::ok,00:01:00:03,3600," + expire + ",1,3600,0,3,128,0,0,ok,,0,,,,0\n"
+	if err := os.WriteFile(memfile, []byte(csv), 0644); err != nil {
+		t.Fatal(err)
+	}
+	m := New()
+	m.SetLeaseSyncSeamsForTesting(nil, "", filepath.Join(dir, "missing.sock"), "", memfile)
+
+	leases, err := m.GetSyncLeases6(context.Background(), now)
+	if err != nil {
+		t.Fatalf("GetSyncLeases6 (fallback): %v", err)
+	}
+	byAddr := map[string]SyncLease{}
+	for _, l := range leases {
+		byAddr[l.Address] = l
+	}
+	want := map[string]int{"2001:db8::dep": 0, "2001:db8::par": 600, "2001:db8::ok": 1800}
+	for addr, wantPref := range want {
+		l, ok := byAddr[addr]
+		if !ok {
+			t.Fatalf("lease %s missing from fallback read: %+v", addr, leases)
+		}
+		if l.Remaining != 1800 {
+			t.Errorf("%s Remaining = %d, want 1800", addr, l.Remaining)
+		}
+		if l.PreferredRemaining != wantPref {
+			t.Errorf("%s PreferredRemaining = %d, want %d", addr, l.PreferredRemaining, wantPref)
+		}
+	}
+}
+
+// TestGetSyncLeases6_MemfileFallback_AbsentPrefColumnDefaultsValid confirms an
+// OLD v6 memfile that lacks the pref_lifetime column defaults preferred==valid
+// (PreferredRemaining=Remaining), never 0 — an absent column must not deprecate.
+func TestGetSyncLeases6_MemfileFallback_AbsentPrefColumnDefaultsValid(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile := filepath.Join(dir, "kea-leases6.csv")
+	expire := strconv.FormatInt(now.Unix()+1800, 10)
+	// A minimal header WITHOUT pref_lifetime / valid_lifetime (only the required
+	// columns + expire). PreferredRemaining must default to Remaining.
+	csv := "address,duid,expire,subnet_id,lease_type,iaid,prefix_len,fqdn_fwd,fqdn_rev,hostname,state\n" +
+		"2001:db8::old,00:01:00:09," + expire + ",1,0,9,128,0,0,old,0\n"
+	if err := os.WriteFile(memfile, []byte(csv), 0644); err != nil {
+		t.Fatal(err)
+	}
+	m := New()
+	m.SetLeaseSyncSeamsForTesting(nil, "", filepath.Join(dir, "missing.sock"), "", memfile)
+
+	leases, err := m.GetSyncLeases6(context.Background(), now)
+	if err != nil {
+		t.Fatalf("GetSyncLeases6 (fallback): %v", err)
+	}
+	if len(leases) != 1 {
+		t.Fatalf("want 1 lease, got %d: %+v", len(leases), leases)
+	}
+	if leases[0].Remaining != 1800 || leases[0].PreferredRemaining != 1800 {
+		t.Errorf("absent pref_lifetime column: Remaining=%d PreferredRemaining=%d, want 1800/1800",
+			leases[0].Remaining, leases[0].PreferredRemaining)
+	}
+}
+
+// TestPreSeedMemfile6_PreferredLifetime is the #5073 pre-seed-writer guard. The
+// v6 memfile pref_lifetime column (index 5) must carry PreferredRemaining, while
+// valid_lifetime (index 2) carries the valid remaining — the two lifetimes are
+// written INDEPENDENTLY. A deprecated binding (PreferredRemaining=0, Remaining=
+// 1800) must emit pref_lifetime=0 with valid_lifetime=1800; before #5073 the
+// writer substituted the valid remaining into pref_lifetime, reviving it.
+//
+// FAIL-ON-REVERT: restore `rem` (the valid remaining) in the pref_lifetime slot
+// and the deprecated row emits pref_lifetime=1800 → the want-"0" assertion RED.
+func TestPreSeedMemfile6_PreferredLifetime(t *testing.T) {
+	localNow := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile6 := filepath.Join(dir, "kea-leases6.csv")
+	m := New()
+	m.SetLeaseSyncSeamsForTesting(nil, "", "", "", memfile6)
+
+	if err := m.PreSeedMemfile6([]SyncLease{
+		{Family: 6, Address: "2001:db8::dep", DUID: "00:01:00:01", IAID: 1,
+			LeaseType: "IA_NA", SubnetID: 1, Remaining: 1800, PreferredRemaining: 0,
+			State: keaStateDefault}, // deprecated
+		{Family: 6, Address: "2001:db8::par", DUID: "00:01:00:02", IAID: 2,
+			LeaseType: "IA_NA", SubnetID: 1, Remaining: 1800, PreferredRemaining: 600,
+			State: keaStateDefault}, // partially deprecated
+		{Family: 6, Address: "2001:db8::ok", DUID: "00:01:00:03", IAID: 3,
+			LeaseType: "IA_NA", SubnetID: 1, Remaining: 1800, PreferredRemaining: 1800,
+			State: keaStateDefault}, // healthy
+	}, localNow); err != nil {
+		t.Fatalf("PreSeedMemfile6: %v", err)
+	}
+
+	raw, err := os.ReadFile(memfile6)
+	if err != nil {
+		t.Fatalf("read pre-seeded memfile: %v", err)
+	}
+	rows := map[string][]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n")[1:] {
+		f := strings.Split(line, ",")
+		rows[f[0]] = f // key by address column
+	}
+	// v6 column order: address(0),duid(1),valid_lifetime(2),expire(3),
+	// subnet_id(4),pref_lifetime(5),lease_type(6),...
+	want := map[string]struct{ valid, pref string }{
+		"2001:db8::dep": {"1800", "0"},
+		"2001:db8::par": {"1800", "600"},
+		"2001:db8::ok":  {"1800", "1800"},
+	}
+	for addr, w := range want {
+		f, ok := rows[addr]
+		if !ok {
+			t.Fatalf("row for %s missing:\n%s", addr, raw)
+		}
+		if f[2] != w.valid {
+			t.Errorf("%s valid_lifetime(col2) = %q, want %q", addr, f[2], w.valid)
+		}
+		if f[5] != w.pref {
+			t.Errorf("%s pref_lifetime(col5) = %q, want %q (independent of valid_lifetime)",
+				addr, f[5], w.pref)
+		}
+	}
+}
