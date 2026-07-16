@@ -585,6 +585,36 @@ func shouldRemoveBlackholesOnClusterPrimary(s *rgStateMachine) bool {
 	return active
 }
 
+// expectedRethVRRPCounts returns the number of RETH VRRP instances the active
+// config expects per redundancy group. It mirrors the desired-set computation
+// in reconcileVRRPInstances / applyConfig (vrrp.CollectRethInstances) so the
+// posture check and the instance builder agree on the canonical set. The
+// posture check (CheckVRRPPosture, #5843) uses this to detect an
+// expected-but-missing VRRP instance that the instantiated-only inventory
+// (rgVRRP) cannot see — one MASTER instance plus one that failed to
+// instantiate must not read as complete primary posture.
+//
+// Returns an empty map (all lookups yield 0 → posture falls back to the
+// instantiated count) when config or cluster state is unavailable, or when
+// no-reth-vrrp / private-rg-election disables RETH VRRP entirely (in which
+// case CollectRethInstances returns nil and the posture check is skipped by
+// the noRethVRRP guard in reconcileRGState anyway).
+func (d *Daemon) expectedRethVRRPCounts() map[int]int {
+	counts := make(map[int]int)
+	if d.store == nil || d.cluster == nil {
+		return counts
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return counts
+	}
+	localPri := d.cluster.LocalPriorities()
+	for _, inst := range vrrp.CollectRethInstances(cfg, localPri) {
+		counts[rgIDFromVRID(inst.GroupID)]++
+	}
+	return counts
+}
+
 func (d *Daemon) reconcileRGState() {
 	if d.cluster == nil || d.vrrpMgr == nil {
 		return
@@ -619,6 +649,14 @@ func (d *Daemon) reconcileRGState() {
 		}
 		rgVRRP[rgID][ev.Interface] = (ev.State == vrrp.StateMaster)
 	}
+
+	// Expected RETH VRRP instance count per RG, derived from the active
+	// config (#5843). rgVRRP above only sees instances that actually
+	// instantiated, so an instance that failed to come up is invisible and
+	// the posture check would read "all present are MASTER" as complete
+	// primary posture. Passing the expected count to CheckVRRPPosture lets
+	// it detect an expected-but-missing instance (partial ownership).
+	expectedVRRP := d.expectedRethVRRPCounts()
 
 	// Collect all known RG IDs from three sources:
 	// 1) existing rgStates (event-driven)
@@ -749,7 +787,7 @@ func (d *Daemon) reconcileRGState() {
 		// The priority update fixes the dropped-event case (#86) while
 		// letting VRRP's preempt logic decide whether to transition.
 		if d.vrrpMgr != nil && !d.vrrpMgr.InSyncHold() && !noRethVRRP {
-			switch s.CheckVRRPPosture(time.Now()) {
+			switch s.CheckVRRPPosture(time.Now(), expectedVRRP[rgID]) {
 			case vrrpPostureNeedsMaster:
 				slog.Warn("reconcile: VRRP posture mismatch — cluster=primary but VRRP!=MASTER, re-sending priority",
 					"rg", rgID)

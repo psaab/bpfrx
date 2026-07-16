@@ -407,18 +407,18 @@ func TestRGStateMachine_CheckVRRPPosture_NoInstances(t *testing.T) {
 	s.SetCluster(true)
 
 	// First check — should return OK (no instances to correct).
-	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now, 1); got != vrrpPostureOK {
 		t.Errorf("no instances: expected OK, got %d", got)
 	}
 
 	// Even after delay — still OK because correction is impossible.
-	if got := s.CheckVRRPPosture(now.Add(20 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(20*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("no instances after delay: expected OK, got %d", got)
 	}
 
 	// Cluster secondary, no instances — also OK.
 	s.SetCluster(false)
-	if got := s.CheckVRRPPosture(now.Add(30 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(30*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("secondary no instances: expected OK, got %d", got)
 	}
 }
@@ -430,14 +430,14 @@ func TestRGStateMachine_CheckVRRPPosture_NoMismatch(t *testing.T) {
 	// Cluster Primary + VRRP MASTER → no mismatch.
 	s.SetCluster(true)
 	s.SetVRRP("reth0", true)
-	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now, 1); got != vrrpPostureOK {
 		t.Errorf("expected OK, got %d", got)
 	}
 
 	// Cluster Secondary + VRRP BACKUP → no mismatch.
 	s.SetCluster(false)
 	s.SetVRRP("reth0", false)
-	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now, 1); got != vrrpPostureOK {
 		t.Errorf("expected OK, got %d", got)
 	}
 }
@@ -451,22 +451,22 @@ func TestRGStateMachine_CheckVRRPPosture_NeedsMaster_DelayedAction(t *testing.T)
 	s.SetVRRP("reth0", false)
 
 	// First check: starts timer, returns OK (no immediate action).
-	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now, 1); got != vrrpPostureOK {
 		t.Errorf("first check should return OK, got %d", got)
 	}
 
 	// Check before delay expires: still OK.
-	if got := s.CheckVRRPPosture(now.Add(5 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(5*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("check at 5s should return OK, got %d", got)
 	}
 
 	// Check after delay expires: needs MASTER.
-	if got := s.CheckVRRPPosture(now.Add(11 * time.Second)); got != vrrpPostureNeedsMaster {
+	if got := s.CheckVRRPPosture(now.Add(11*time.Second), 1); got != vrrpPostureNeedsMaster {
 		t.Errorf("check at 11s should return NeedsMaster, got %d", got)
 	}
 
 	// Timer was reset — next check starts fresh.
-	if got := s.CheckVRRPPosture(now.Add(12 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(12*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("check after correction should return OK (timer reset), got %d", got)
 	}
 }
@@ -480,12 +480,12 @@ func TestRGStateMachine_CheckVRRPPosture_NeedsResign_DelayedAction(t *testing.T)
 	s.SetVRRP("reth0", true)
 
 	// First check: starts timer.
-	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now, 1); got != vrrpPostureOK {
 		t.Errorf("first check should return OK, got %d", got)
 	}
 
 	// After delay: needs resign.
-	if got := s.CheckVRRPPosture(now.Add(11 * time.Second)); got != vrrpPostureNeedsResign {
+	if got := s.CheckVRRPPosture(now.Add(11*time.Second), 1); got != vrrpPostureNeedsResign {
 		t.Errorf("check at 11s should return NeedsResign, got %d", got)
 	}
 }
@@ -499,25 +499,25 @@ func TestRGStateMachine_CheckVRRPPosture_MismatchClears(t *testing.T) {
 	s.SetVRRP("reth0", false)
 
 	// Start mismatch timer.
-	s.CheckVRRPPosture(now)
+	s.CheckVRRPPosture(now, 1)
 
 	// VRRP becomes MASTER before delay expires → mismatch clears.
 	s.SetVRRP("reth0", true)
-	if got := s.CheckVRRPPosture(now.Add(5 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(5*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("should return OK after mismatch cleared, got %d", got)
 	}
 
 	// Verify timer was reset: create mismatch again.
 	s.SetVRRP("reth0", false)
-	s.CheckVRRPPosture(now.Add(6 * time.Second)) // start timer
+	s.CheckVRRPPosture(now.Add(6*time.Second), 1) // start timer
 
 	// Check at original now+11s — should NOT trigger because timer was reset at +6s.
-	if got := s.CheckVRRPPosture(now.Add(11 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(11*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("should return OK — timer was reset at 6s, only 5s elapsed, got %d", got)
 	}
 
 	// Check at +17s (11s since reset at +6s) — should trigger.
-	if got := s.CheckVRRPPosture(now.Add(17 * time.Second)); got != vrrpPostureNeedsMaster {
+	if got := s.CheckVRRPPosture(now.Add(17*time.Second), 1); got != vrrpPostureNeedsMaster {
 		t.Errorf("should return NeedsMaster after 11s from timer reset, got %d", got)
 	}
 }
@@ -533,17 +533,17 @@ func TestRGStateMachine_CheckVRRPPosture_SteadyStateFasterDelay(t *testing.T) {
 	s.SetVRRP("reth0", false)
 
 	// First check: starts mismatch timer.
-	if got := s.CheckVRRPPosture(now); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now, 1); got != vrrpPostureOK {
 		t.Errorf("first check should return OK, got %d", got)
 	}
 
 	// At 1s: still within steady-state delay (2s).
-	if got := s.CheckVRRPPosture(now.Add(1 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(1*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("check at 1s should return OK (within 2s delay), got %d", got)
 	}
 
 	// At 3s: past steady-state delay → corrective action.
-	if got := s.CheckVRRPPosture(now.Add(3 * time.Second)); got != vrrpPostureNeedsMaster {
+	if got := s.CheckVRRPPosture(now.Add(3*time.Second), 1); got != vrrpPostureNeedsMaster {
 		t.Errorf("check at 3s should return NeedsMaster (past 2s delay), got %d", got)
 	}
 }
@@ -558,20 +558,20 @@ func TestRGStateMachine_CheckVRRPPosture_StartupUsesLongerDelay(t *testing.T) {
 	s.SetVRRP("reth0", false)
 
 	// First check: starts mismatch timer.
-	s.CheckVRRPPosture(now)
+	s.CheckVRRPPosture(now, 1)
 
 	// At 3s: would trigger in steady-state (2s delay) but NOT during startup (10s delay).
-	if got := s.CheckVRRPPosture(now.Add(3 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(3*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("check at 3s during startup should return OK (10s delay), got %d", got)
 	}
 
 	// At 5s: still within startup delay.
-	if got := s.CheckVRRPPosture(now.Add(5 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(5*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("check at 5s during startup should return OK, got %d", got)
 	}
 
 	// At 11s: past startup delay → corrective action.
-	if got := s.CheckVRRPPosture(now.Add(11 * time.Second)); got != vrrpPostureNeedsMaster {
+	if got := s.CheckVRRPPosture(now.Add(11*time.Second), 1); got != vrrpPostureNeedsMaster {
 		t.Errorf("check at 11s during startup should return NeedsMaster, got %d", got)
 	}
 }
@@ -586,10 +586,10 @@ func TestRGStateMachine_CheckVRRPPosture_SteadyStateResign(t *testing.T) {
 	s.SetVRRP("reth0", true)
 
 	// Start timer.
-	s.CheckVRRPPosture(now)
+	s.CheckVRRPPosture(now, 1)
 
 	// At 3s: past 2s steady-state delay → needs resign.
-	if got := s.CheckVRRPPosture(now.Add(3 * time.Second)); got != vrrpPostureNeedsResign {
+	if got := s.CheckVRRPPosture(now.Add(3*time.Second), 1); got != vrrpPostureNeedsResign {
 		t.Errorf("check at 3s should return NeedsResign (steady-state 2s delay), got %d", got)
 	}
 }
@@ -604,26 +604,204 @@ func TestRGStateMachine_CheckVRRPPosture_MismatchResetSteadyState(t *testing.T) 
 	s.SetVRRP("reth0", false)
 
 	// Start mismatch timer.
-	s.CheckVRRPPosture(now)
+	s.CheckVRRPPosture(now, 1)
 
 	// VRRP becomes MASTER at 1s → mismatch clears.
 	s.SetVRRP("reth0", true)
-	if got := s.CheckVRRPPosture(now.Add(1 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(1*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("should return OK after mismatch cleared, got %d", got)
 	}
 
 	// Mismatch again at 2s — timer should have been reset.
 	s.SetVRRP("reth0", false)
-	s.CheckVRRPPosture(now.Add(2 * time.Second)) // start timer
+	s.CheckVRRPPosture(now.Add(2*time.Second), 1) // start timer
 
 	// At 3s: only 1s since new mismatch — should NOT trigger (2s delay).
-	if got := s.CheckVRRPPosture(now.Add(3 * time.Second)); got != vrrpPostureOK {
+	if got := s.CheckVRRPPosture(now.Add(3*time.Second), 1); got != vrrpPostureOK {
 		t.Errorf("should return OK — only 1s since new mismatch, got %d", got)
 	}
 
 	// At 5s: 3s since new mismatch — past 2s delay.
-	if got := s.CheckVRRPPosture(now.Add(5 * time.Second)); got != vrrpPostureNeedsMaster {
+	if got := s.CheckVRRPPosture(now.Add(5*time.Second), 1); got != vrrpPostureNeedsMaster {
 		t.Errorf("should return NeedsMaster after 3s from timer reset, got %d", got)
+	}
+}
+
+// --- Partial-ownership posture tests (#5843) ---
+//
+// These prove that one MASTER VRRP instance no longer masks a partial or
+// missing-instance RETH ownership state. The posture check must require
+// EVERY expected VRRP instance to be MASTER (allExpectedMaster), not merely
+// ANY (the pre-#5843 anyMaster classification).
+
+// TestRGStateMachine_CheckVRRPPosture_PartialMasterNeedsRepair proves the core
+// #5843 fix: an RG with two RETH VRRP instances where one is MASTER and one is
+// BACKUP is NOT complete primary posture. It must keep the mismatch timer
+// running and, after the delay, signal NeedsMaster so the posture fixer
+// re-drives UpdateRGPriority.
+//
+// Fail-on-revert: change allExpectedMaster back to anyMaster in
+// CheckVRRPPosture and this test goes RED — anyMaster is true (reth0 MASTER),
+// so the partial state reads OK, the timer is cleared, and NeedsMaster never
+// fires.
+func TestRGStateMachine_CheckVRRPPosture_PartialMasterNeedsRepair(t *testing.T) {
+	s := newRGStateMachine()
+	// Past the startup window so the faster 2s steady-state delay applies.
+	s.startedAt = time.Now().Add(-time.Minute)
+	now := time.Now()
+
+	// Cluster primary. Two RETH VRRP instances: reth0 MASTER, reth1 BACKUP.
+	s.SetCluster(true)
+	s.SetVRRP("reth0", true)
+	s.SetVRRP("reth1", false)
+
+	// First detection: OK (no immediate action) but the mismatch timer MUST
+	// be running — a partial state is not "matched" and must not be cleared.
+	if got := s.CheckVRRPPosture(now, 2); got != vrrpPostureOK {
+		t.Fatalf("first check on partial ownership: expected OK, got %d", got)
+	}
+	if s.vrrpMismatchSince.IsZero() {
+		t.Fatalf("partial ownership must keep the mismatch timer RUNNING, but it was cleared")
+	}
+
+	// Sustained partial ownership past the 2s steady-state delay → repair.
+	if got := s.CheckVRRPPosture(now.Add(3*time.Second), 2); got != vrrpPostureNeedsMaster {
+		t.Errorf("sustained partial ownership: expected NeedsMaster (repair), got %d", got)
+	}
+}
+
+// TestRGStateMachine_CheckVRRPPosture_MissingInstanceNeedsRepair proves the
+// #5843 inventory-gap fix: an RG that config expects to have TWO VRRP
+// instances but with only ONE instantiated (the other failed to come up) is
+// NOT complete primary posture even if the single instantiated instance is
+// MASTER. The instantiated-only inventory (s.vrrpInstances) cannot see the
+// missing instance; the expected count passed by the caller closes the gap.
+//
+// Fail-on-revert: drop the `&& instantiated >= expected` clause from
+// allExpectedMaster (i.e. ignore the expected count) and this test goes RED —
+// the single MASTER instance reads as complete and NeedsMaster never fires.
+func TestRGStateMachine_CheckVRRPPosture_MissingInstanceNeedsRepair(t *testing.T) {
+	s := newRGStateMachine()
+	s.startedAt = time.Now().Add(-time.Minute)
+	now := time.Now()
+
+	// Cluster primary. Only ONE instance instantiated (reth0 MASTER); config
+	// expects TWO (the reth1 instance failed to instantiate / is missing).
+	s.SetCluster(true)
+	s.SetVRRP("reth0", true)
+
+	// With the expected count = 2, the missing instance makes this a partial
+	// state: OK on first detection, but the timer runs.
+	if got := s.CheckVRRPPosture(now, 2); got != vrrpPostureOK {
+		t.Fatalf("first check with missing instance: expected OK, got %d", got)
+	}
+	if s.vrrpMismatchSince.IsZero() {
+		t.Fatalf("missing expected instance must keep the mismatch timer RUNNING, but it was cleared")
+	}
+
+	// Sustained missing instance → repair.
+	if got := s.CheckVRRPPosture(now.Add(3*time.Second), 2); got != vrrpPostureNeedsMaster {
+		t.Errorf("sustained missing instance: expected NeedsMaster (repair), got %d", got)
+	}
+
+	// Control: the SAME instantiated state (one MASTER) with expected count 1
+	// (or the <=0 fallback) is complete — no missing instance — so posture is
+	// OK and the timer is cleared. This proves the expected count, not just
+	// the MASTER state, drives the inventory-gap classification.
+	s2 := newRGStateMachine()
+	s2.startedAt = time.Now().Add(-time.Minute)
+	s2.SetCluster(true)
+	s2.SetVRRP("reth0", true)
+	if got := s2.CheckVRRPPosture(now, 1); got != vrrpPostureOK {
+		t.Errorf("single expected MASTER instance: expected OK, got %d", got)
+	}
+	if !s2.vrrpMismatchSince.IsZero() {
+		t.Errorf("complete single-instance posture must CLEAR the timer, but it is running")
+	}
+	if got := s2.CheckVRRPPosture(now.Add(3*time.Second), 0); got != vrrpPostureOK {
+		t.Errorf("single MASTER with <=0 (no-expectation) fallback: expected OK, got %d", got)
+	}
+}
+
+// TestRGStateMachine_CheckVRRPPosture_AllExpectedMasterOK proves the no-flap
+// regression guard: a genuinely complete RG (every expected instance MASTER)
+// reads OK and clears the mismatch timer on every pass, so the fix introduces
+// no needless churn / repair storm.
+func TestRGStateMachine_CheckVRRPPosture_AllExpectedMasterOK(t *testing.T) {
+	s := newRGStateMachine()
+	s.startedAt = time.Now().Add(-time.Minute)
+	now := time.Now()
+
+	s.SetCluster(true)
+	s.SetVRRP("reth0", true)
+	s.SetVRRP("reth1", true)
+
+	if got := s.CheckVRRPPosture(now, 2); got != vrrpPostureOK {
+		t.Errorf("all-expected-MASTER: expected OK, got %d", got)
+	}
+	if !s.vrrpMismatchSince.IsZero() {
+		t.Errorf("all-expected-MASTER must clear the mismatch timer, but it is running")
+	}
+	// Well past the steady-state delay — still OK, no churn.
+	if got := s.CheckVRRPPosture(now.Add(10*time.Second), 2); got != vrrpPostureOK {
+		t.Errorf("all-expected-MASTER after delay: expected OK (no churn), got %d", got)
+	}
+	if !s.vrrpMismatchSince.IsZero() {
+		t.Errorf("all-expected-MASTER after delay must keep the timer cleared, but it is running")
+	}
+}
+
+// TestRGStateMachine_CheckVRRPPosture_AllBackupPrimaryUnchanged proves the
+// all-BACKUP classification on a cluster-primary RG is unchanged: it still
+// signals NeedsMaster after the delay (this case worked before #5843 and must
+// keep working).
+func TestRGStateMachine_CheckVRRPPosture_AllBackupPrimaryUnchanged(t *testing.T) {
+	s := newRGStateMachine()
+	s.startedAt = time.Now().Add(-time.Minute)
+	now := time.Now()
+
+	s.SetCluster(true)
+	s.SetVRRP("reth0", false)
+	s.SetVRRP("reth1", false)
+
+	if got := s.CheckVRRPPosture(now, 2); got != vrrpPostureOK {
+		t.Fatalf("all-BACKUP first check: expected OK, got %d", got)
+	}
+	if got := s.CheckVRRPPosture(now.Add(3*time.Second), 2); got != vrrpPostureNeedsMaster {
+		t.Errorf("all-BACKUP on cluster-primary: expected NeedsMaster, got %d", got)
+	}
+}
+
+// TestRGStateMachine_CheckVRRPPosture_SecondaryPartialResignUnchanged proves
+// the resignation path still keys off ANY master: a cluster-secondary RG with
+// one instance still MASTER (partial) must resign — unchanged by #5843, which
+// only tightened the primary-completeness classification.
+func TestRGStateMachine_CheckVRRPPosture_SecondaryPartialResignUnchanged(t *testing.T) {
+	s := newRGStateMachine()
+	s.startedAt = time.Now().Add(-time.Minute)
+	now := time.Now()
+
+	// Cluster secondary but reth0 still MASTER (reth1 already BACKUP).
+	s.SetCluster(false)
+	s.SetVRRP("reth0", true)
+	s.SetVRRP("reth1", false)
+
+	if got := s.CheckVRRPPosture(now, 2); got != vrrpPostureOK {
+		t.Fatalf("secondary-with-master first check: expected OK, got %d", got)
+	}
+	if got := s.CheckVRRPPosture(now.Add(3*time.Second), 2); got != vrrpPostureNeedsResign {
+		t.Errorf("secondary with a lingering MASTER: expected NeedsResign, got %d", got)
+	}
+
+	// Cluster secondary + all BACKUP → matched, OK (standalone-like steady
+	// secondary posture; unchanged).
+	s2 := newRGStateMachine()
+	s2.startedAt = time.Now().Add(-time.Minute)
+	s2.SetCluster(false)
+	s2.SetVRRP("reth0", false)
+	s2.SetVRRP("reth1", false)
+	if got := s2.CheckVRRPPosture(now.Add(3*time.Second), 2); got != vrrpPostureOK {
+		t.Errorf("secondary all-BACKUP: expected OK, got %d", got)
 	}
 }
 

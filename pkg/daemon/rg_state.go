@@ -314,24 +314,62 @@ const (
 // a faster 2s delay in steady state. Resets the mismatch timer when state
 // matches.
 //
+// expectedInstances is the number of RETH VRRP instances the active config
+// says SHOULD exist for this RG (derived by the caller from
+// vrrp.CollectRethInstances). It closes the instantiated-only inventory gap:
+// the instantiated set (s.vrrpInstances) only contains instances that
+// actually came up, so an instance that failed to instantiate is invisible
+// and "all present are MASTER" would wrongly read as complete primary
+// posture. A value <= 0 means the caller has no config-derived expectation,
+// in which case the instantiated count is used as the floor (no missing
+// instance is inferred).
+//
+// Complete primary posture (#5843) requires EVERY expected VRRP instance to
+// be MASTER — not merely ANY. The prior anyMaster classification masked
+// partial RETH ownership: with two RETH VRRP instances in one RG, one MASTER
+// + one BACKUP (or one MASTER + one failed-to-instantiate) read as OK, the
+// mismatch timer was cleared, and UpdateRGPriority was never re-driven, so
+// the non-MASTER interface's VIP stayed peer-owned / blackholed and was
+// never repaired.
+//
 // The caller is responsible for skipping this check during sync-hold.
-func (s *rgStateMachine) CheckVRRPPosture(now time.Time) vrrpPostureMismatch {
+func (s *rgStateMachine) CheckVRRPPosture(now time.Time, expectedInstances int) vrrpPostureMismatch {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// If no VRRP instances exist for this RG (e.g. member interface
-	// missing after reboot), posture correction is impossible — skip.
+	// missing after reboot), posture correction is impossible — there is
+	// nothing to drive UpdateRGPriority against — so skip. This bounds the
+	// inventory-gap fix to the PARTIAL case (>=1 instantiated): a fully
+	// absent RG is left to reconcileVRRPInstances' re-instantiation.
 	if len(s.vrrpInstances) == 0 {
 		s.vrrpMismatchSince = time.Time{}
 		return vrrpPostureOK
 	}
 
+	instantiated := len(s.vrrpInstances)
+	expected := expectedInstances
+	if expected < instantiated {
+		// No config expectation (<=0) or a stale under-count: never treat
+		// the instantiated instances themselves as "missing".
+		expected = instantiated
+	}
+
+	// Complete primary posture: every instantiated instance is MASTER AND
+	// no expected instance is missing. allMasterLocked covers the first
+	// clause; instantiated >= expected covers the inventory gap (an RG
+	// expecting 2 with only 1 instantiated is NOT complete even if that
+	// one is MASTER).
+	allExpectedMaster := s.allMasterLocked() && instantiated >= expected
+	// Resignation still keys off ANY master: when cluster=secondary, even
+	// a single lingering MASTER instance must resign.
 	anyMaster := s.anyMasterLocked()
 
 	var mismatch vrrpPostureMismatch
 	switch {
-	case s.clusterPri && !anyMaster:
-		// Cluster says we're primary but VRRP is not MASTER.
+	case s.clusterPri && !allExpectedMaster:
+		// Cluster says we're primary but not every expected VRRP instance
+		// is MASTER (some BACKUP/stuck, or an expected instance missing).
 		mismatch = vrrpPostureNeedsMaster
 	case !s.clusterPri && anyMaster:
 		// Cluster says secondary but VRRP is still MASTER.
