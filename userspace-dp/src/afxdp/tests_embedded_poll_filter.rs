@@ -363,6 +363,280 @@ fn embedded_icmp_nat_match_ignores_non_error_echo() {
     );
 }
 
+/// #5690 LITERAL fail-on-revert: drive an inbound NAT44 SNAT ICMP error
+/// (Time Exceeded, addressed to the firewall's SNAT address) through the REAL
+/// `poll_binding_process_descriptor` control flow — NOT the helper fn — and
+/// prove the inner quoted packet is reverse-translated back to the pre-NAT
+/// client on the production path.
+///
+/// The error is a non-query ICMP type, so `parse_session_flow_from_bytes`
+/// (#3290) returns None and the packet is FLOWLESS: it never enters the
+/// flow-backed session-miss arm where the generic embedded-ICMP NAT reversal
+/// historically lived. Before #5690 that made the reversal unreachable in
+/// production (helper-tested but dead). This test drives the flowless arm and
+/// asserts the reversed error is queued as a prebuilt forward toward the
+/// client with BOTH the outer destination and the embedded inner source
+/// translated from the SNAT address back to the real client.
+///
+/// Fail-on-revert: remove the `try_reverse_embedded_icmp_error` call from the
+/// flowless arm and the error takes normal flowless enforcement (LocalDelivery
+/// reinject) — no prebuilt reversed forward is queued, so `scratch_forwards`
+/// is empty and this test goes RED.
+#[test]
+fn poll_descriptor_embedded_icmp_reversal_reachable_on_flowless_path_5690() {
+    let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let snat_port: u16 = 40000;
+    let client_port: u16 = 12345;
+
+    // Outer: router -> snat_ip; embedded quoted: snat_ip:snat_port -> server:80.
+    let frame = build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP);
+
+    // allow_embedded_icmp gates the poll-path reversal — enable it.
+    let mut snapshot = nat_snapshot();
+    snapshot.flow.allow_embedded_icmp = true;
+    let forwarding = build_forwarding_state(&snapshot);
+
+    // The error ingresses on the WAN (reth0.80, ifindex 12) since it is
+    // addressed to the SNAT address; the reversal resolves egress toward the
+    // client on the LAN (reth1.0, ifindex 24), so learn the client neighbor.
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: meta_len as u16,
+        ingress_ifindex: 12,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 42,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        tcp_flags: 0,
+        dscp: 0,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(&frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(&binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    // Neighbor toward the client on the LAN unit so the reversed error resolves
+    // a tx interface + MAC (egress ifindex 24).
+    learn_dynamic_neighbor(
+        &forwarding,
+        &dynamic_neighbors,
+        24,
+        0,
+        IpAddr::V4(client_ip),
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+    );
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding: &forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        neighbor_resolver: None,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+
+    // Install the forward NAT session (client:client_port -> server:80 SNAT'd
+    // to snat_ip:snat_port) so the embedded reversal can recover the client.
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(server_ip),
+            src_port: client_port,
+            dst_port: 80,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_dst: None,
+                rewrite_src_port: Some(snat_port),
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        123_000_000_000,
+        PROTO_TCP,
+        0x18,
+    ));
+    let sessions_before = sessions.len();
+
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+
+    poll_binding_process_descriptor(
+        &mut binding,
+        0,
+        area_ptr,
+        1,
+        &mut sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        123_000_000_000,
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+
+    // The load-bearing #5690 assertion: the ICMP error was reverse-translated on
+    // the REAL poll path and queued as a prebuilt forward toward the client.
+    assert_eq!(
+        binding.scratch.scratch_forwards.len(),
+        1,
+        "embedded-ICMP NAT reversal must queue exactly one reversed forward on \
+         the flowless poll path (RED on revert: no forward is queued)"
+    );
+    let fwd = &binding.scratch.scratch_forwards[0];
+    let reversed = match &fwd.frame {
+        PendingForwardFrame::Prebuilt(bytes) => bytes,
+        _ => panic!("embedded-ICMP reversal must queue a PREBUILT reversed frame"),
+    };
+    assert_eq!(reversed[34], 11, "reversed frame stays an ICMP Time Exceeded");
+    let outer_dst = Ipv4Addr::new(reversed[30], reversed[31], reversed[32], reversed[33]);
+    assert_eq!(
+        outer_dst, client_ip,
+        "outer destination must be restored from the SNAT address to the client"
+    );
+    // Embedded IP at eth(14)+outerIP(20)+ICMP(8)=42; inner src at +12 = 54.
+    let embedded_src = Ipv4Addr::new(reversed[54], reversed[55], reversed[56], reversed[57]);
+    assert_eq!(
+        embedded_src, client_ip,
+        "embedded inner source must be reverse-translated from SNAT addr to client"
+    );
+    // Inner TCP source port at 42+20 = 62 restored to the pre-NAT client port.
+    let embedded_src_port = u16::from_be_bytes([reversed[62], reversed[63]]);
+    assert_eq!(
+        embedded_src_port, client_port,
+        "embedded inner source port must be reverse-translated to the client port"
+    );
+    // #5690: the non-query error must NOT become a session/cache authority.
+    assert!(
+        fwd.flow_key.is_none(),
+        "reversed ICMP error must carry flow_key=None (never seeds a session)"
+    );
+    // Egress resolves toward the client on the LAN unit (ifindex 24).
+    assert_eq!(fwd.target_ifindex, 24, "reversed error egresses toward the client");
+    // The error is stateless: it seeds no new session and is not recycled here.
+    assert_eq!(
+        sessions.len(),
+        sessions_before,
+        "the ICMP error must not seed a new session"
+    );
+    assert!(
+        binding.scratch.scratch_recycle.is_empty(),
+        "a queued prebuilt forward owns the descriptor; no recycle"
+    );
+}
+
 
 #[test]
 fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {

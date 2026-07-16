@@ -389,6 +389,22 @@ sync.
     default policy (fail-closed drop) until the deferred
     fragment-association-cache stage of the #3291 plan carries the first
     fragment's verdict; tracked as the deferred fragment-association-cache stage of #3291.
+  - **#5690 — generic embedded-ICMP NAT reversal on the flowless arm:** an
+    inbound non-query ICMP error (Time-Exceeded, Dest-Unreachable, PTB,
+    Parameter-Problem, Redirect) referencing a NAT'd flow is itself FLOWLESS
+    (#3290 above), so it never entered the flow-backed session-miss arm where
+    the reversal was historically wired — the capability was helper-tested but
+    DEAD in production (an ICMP error never has a flow). The flowless `else`
+    arm now calls `embedded_icmp::try_reverse_embedded_icmp_error` FIRST (before
+    the #3291 L3 enforcement): it matches the quoted inner packet against the
+    forward NAT session (`try_embedded_icmp_nat_match`), reverse-translates the
+    inner tuple + outer destination back to the pre-NAT client, classifies the
+    rebuilt frame's egress CoS/output filter with `flow_key = None` (a
+    synthesized L3 reply carries no trustworthy 5-tuple), and queues it as a
+    `Prebuilt` forward toward the client — or falls through to normal flowless
+    enforcement on any miss / no-source-rewrite / unbuildable frame / CoS drop.
+    The reversed error NEVER seeds a session or flow-cache entry (`flow_key =
+    None`), so the #3290 no-fake-session invariant is preserved, not bypassed.
 - `frame/` — packet parsing (L2 / L3 / L4), checksum helpers, TCP MSS
   clamp. `tests.rs` was relocated out of `mod.rs` in #1046 Phase 1.
   `headers.rs` holds the consolidated outer-header serializers (#1440).
