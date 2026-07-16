@@ -349,12 +349,34 @@ pub(in crate::afxdp) fn checksum16_ipv6(
     checksum16_finish(sum)
 }
 
+/// Narrow a byte length into a 16-bit on-the-wire length field — an
+/// IPv4/TCP/UDP pseudo-header length, an IPv4 `total_length`, or an IPv6
+/// `payload_length`. Saturates at `u16::MAX` instead of the historical bare
+/// `as u16`, which silently WRAPPED (65536 → 0), forging a plausible but
+/// wrong length.
+///
+/// Defense-in-depth (#5765). Every frame the AF_XDP dataplane touches comes
+/// from a single UMEM frame (a few KiB), and an IPv4 `total_length` is itself
+/// a 16-bit field, so `len` is always ≤ `u16::MAX` today and the result is
+/// byte-identical to the old cast — a legitimate packet checksums the same.
+/// Only a future frame-size increase / GRO super-frame / IPv6-jumbogram
+/// reassembly that presented a >64 KiB length would differ, and there
+/// saturating keeps the value deterministic and non-wrapping (the checksum is
+/// still "wrong" for such a frame — the field is 16-bit on the wire — but can
+/// never masquerade as a small valid length). Mirrors the validated-narrowing
+/// newtype idiom in `afxdp/forwarding_build/validated.rs`
+/// (`VlanId`/`TunnelTtl`/`QueueId`).
+#[inline]
+pub(in crate::afxdp) fn saturate_len16(len: usize) -> u16 {
+    u16::try_from(len).unwrap_or(u16::MAX)
+}
+
 pub(in crate::afxdp) fn checksum16_ipv4(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload: &[u8]) -> u16 {
     let mut sum = 0u32;
     sum = checksum16_add_bytes(sum, &src.octets());
     sum = checksum16_add_bytes(sum, &dst.octets());
     sum = checksum16_add_bytes(sum, &[0, protocol]);
-    sum = checksum16_add_bytes(sum, &(payload.len() as u16).to_be_bytes());
+    sum = checksum16_add_bytes(sum, &saturate_len16(payload.len()).to_be_bytes());
     sum = checksum16_add_bytes(sum, payload);
     checksum16_finish(sum)
 }
@@ -979,6 +1001,100 @@ mod l4_offset_helper_tests {
             u16::from_be_bytes([p[36], p[37]]),
             0,
             "IPv4 TCP computed-zero must NOT canonicalize"
+        );
+    }
+}
+
+// #5765: defense-in-depth for the 16-bit on-the-wire length narrowing.
+// These sites are unreachable-for-wrap in production (an AF_XDP frame is
+// bounded by the UMEM frame size and an IPv4 total_length is itself a
+// 16-bit field), so the tests construct a synthetic >64 KiB length
+// DIRECTLY at the function boundary — bypassing that upstream bound — to
+// prove the hardened path SATURATES rather than silently WRAPS.
+#[cfg(test)]
+mod len16_hardening_tests {
+    use super::*;
+
+    #[test]
+    fn saturate_len16_passes_through_in_range_and_saturates_above() {
+        // The valid path is byte-identical to the old `as u16` cast.
+        assert_eq!(saturate_len16(0), 0);
+        assert_eq!(saturate_len16(1000), 1000);
+        assert_eq!(saturate_len16(u16::MAX as usize), u16::MAX);
+        // The >64K path SATURATES to u16::MAX — NOT the wrapped value the
+        // bare `as u16` would produce. Neutralizing the helper body to
+        // `len as u16` makes each of these observe the wrap and go RED:
+        //   65536 -> 0, 65540 -> 4, 131072 -> 0.
+        assert_eq!(saturate_len16(65536), u16::MAX, "65536 must saturate, not wrap to 0");
+        assert_eq!(saturate_len16(65540), u16::MAX, "65540 must saturate, not wrap to 4");
+        assert_eq!(saturate_len16(131072), u16::MAX, "131072 must saturate, not wrap to 0");
+    }
+
+    // Reference pseudo-header checksum for `checksum16_ipv4`, computed with
+    // an explicit 16-bit length field so the test controls wrap vs saturate
+    // independently of the function under test.
+    fn ipv4_pseudo_checksum_with_len(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        protocol: u8,
+        len_field: u16,
+        payload: &[u8],
+    ) -> u16 {
+        let mut pseudo = Vec::with_capacity(12 + payload.len());
+        pseudo.extend_from_slice(&src.octets());
+        pseudo.extend_from_slice(&dst.octets());
+        pseudo.extend_from_slice(&[0, protocol]);
+        pseudo.extend_from_slice(&len_field.to_be_bytes());
+        pseudo.extend_from_slice(payload);
+        checksum16(&pseudo)
+    }
+
+    #[test]
+    fn checksum16_ipv4_in_range_is_byte_identical() {
+        // Regression guard: a legitimate (<64K) L4 segment must checksum
+        // exactly as before — the pseudo-header carries the true length.
+        let src = Ipv4Addr::new(192, 0, 2, 1);
+        let dst = Ipv4Addr::new(198, 51, 100, 2);
+        let payload: Vec<u8> = (0..1400u32).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect();
+        let got = checksum16_ipv4(src, dst, PROTO_TCP, &payload);
+        let want =
+            ipv4_pseudo_checksum_with_len(src, dst, PROTO_TCP, payload.len() as u16, &payload);
+        assert_eq!(got, want, "in-range checksum must be byte-identical to the true-length reference");
+    }
+
+    #[test]
+    fn checksum16_ipv4_saturates_length_above_u16() {
+        // A 65540-byte payload: the true length overflows the 16-bit
+        // pseudo-header field. The hardened code narrows via saturate_len16
+        // -> 0xffff; the pre-fix `payload.len() as u16` wrapped 65540 -> 4.
+        // All-zero payload keeps the payload's own checksum contribution 0,
+        // so the two computations differ ONLY in the length word — making
+        // the wrap-vs-saturate divergence sharp and unambiguous. (65540 not
+        // 65536: a 65536 wrap yields the length word 0x0000, which is the
+        // one's-complement negative-zero of the saturated 0xffff and would
+        // fold to the SAME checksum — hiding the very difference under test.)
+        let src = Ipv4Addr::new(192, 0, 2, 1);
+        let dst = Ipv4Addr::new(198, 51, 100, 2);
+        let payload = vec![0u8; 65540];
+        let got = checksum16_ipv4(src, dst, PROTO_TCP, &payload);
+
+        // saturate_len16(65540) == 0xffff; the pre-fix `65540 as u16` == 4.
+        let saturated =
+            ipv4_pseudo_checksum_with_len(src, dst, PROTO_TCP, u16::MAX, &payload);
+        let wrapped =
+            ipv4_pseudo_checksum_with_len(src, dst, PROTO_TCP, payload.len() as u16, &payload);
+
+        assert_ne!(
+            saturated, wrapped,
+            "test setup invariant: saturated(0xffff) and wrapped(4) length words must diverge"
+        );
+        assert_eq!(
+            got, saturated,
+            "checksum16_ipv4 must use a SATURATED 16-bit pseudo-header length for a >64K payload"
+        );
+        assert_ne!(
+            got, wrapped,
+            "checksum16_ipv4 must NOT silently wrap the length (65540 -> 4)"
         );
     }
 }
