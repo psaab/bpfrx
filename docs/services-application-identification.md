@@ -113,6 +113,34 @@ upfront what they're getting and not getting.
      alone (#3428); the session source port is threaded into
      `ResolveSessionName` for this purpose.
 
+**`UNKNOWN` name reserved out of the user namespace (#5821)**:
+because `ResolveSessionName` returns the literal `UNKNOWN` for the
+unclassified/unstamped/catalog-skew state and `SessionMatches`
+(`pkg/appid/runtime.go`) compares an operator `show ... application
+<name>` / `clear ... application <name>` filter against that same
+flattened name, a user-defined application (or application-set) named
+`UNKNOWN` would be indistinguishable from the sentinel — the filter
+could not tell "no known application" from the configured app, and a
+destructive filtered session clear could delete both groups. A
+commit-time gate (`validateReservedApplicationNamesStrict`,
+`pkg/config/compiler_validate_strict_application.go`) therefore
+**reserves `UNKNOWN` out of the `applications application` /
+`applications application-set` namespace, case-insensitively**
+(`SessionMatches` folds case, so `unknown`/`Unknown` alias the sentinel
+too). The reserved literal `config.ReservedApplicationName` is kept
+equal to `appid.Unknown` by the `pkg/appid`
+`TestReservedApplicationNameMatchesUnknownSentinel` canary. This is a
+**new fail-closed restriction** (release-note behavior change): a
+previously-valid config that already named an application `UNKNOWN` now
+hard-rejects on the operator's next commit. The tolerant load / peer-sync
+path downgrades the reject to a warning so an already-persisted or
+peer-synced config still boots (#1960 no-brick). A residual display-side
+gap remains for an already-stamped session whose real catalog app is
+literally `UNKNOWN` on a leniently-loaded legacy config — the sentinel and
+that app still flatten to the same string on the show/clear surface until
+the operator renames the app; carrying an explicit typed unknown-kind
+through the filter path is tracked as a follow-up.
+
 **`app_id` space cap (#3438 H4)**: `app_id` is a `u16` on the
 Rust wire with `0` reserved as the unknown sentinel, so real
 applications occupy ids `1..65535`. Both id-assignment walks

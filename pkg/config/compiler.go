@@ -564,6 +564,24 @@ type compileOpts struct {
 	// doctrine as lenientApplicationSpecs / lenientApplicationSetMembers.
 	lenientApplicationNameCollisions bool
 
+	// lenientReservedApplicationNames (#5821) downgrades the reserved-name gate
+	// (validateReservedApplicationNamesStrict) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
+	// user-defined `applications application <name>` or `application-set <name>`
+	// whose name equals the AppID unknown sentinel "UNKNOWN"
+	// (ReservedApplicationName) case-insensitively — a real catalog application
+	// so named is indistinguishable from the "no known application" sentinel on
+	// the AppID display/filter surface (ResolveSessionName / SessionMatches,
+	// pkg/appid/runtime.go), so a `show`/`clear ... application UNKNOWN` selector
+	// cannot separate the two and a filtered clear could delete both classes.
+	// This is a NEW fail-closed restriction that can reject a config an older
+	// binary accepted, so the tolerant load / peer-sync paths downgrade it to a
+	// warning: an already-persisted or peer-synced config carrying the reserved
+	// name still BOOTS (#1960 no-brick) rather than bricking a running node on
+	// upgrade, while the operator's next commit fails loudly. Same doctrine as
+	// lenientApplicationNameCollisions / lenientApplicationSpecs.
+	lenientReservedApplicationNames bool
+
 	// lenientFirewallFilterFamilyCollisions (#3884, fable-review-161 F-030)
 	// downgrades the firewall-filter cross-family name-collision gate
 	// (validateFirewallFilterFamilyCollisionsAST) from a hard compile error to a
@@ -1946,6 +1964,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRouteFilterMatchTypes:           true,
 		lenientApplicationSpecs:                true,
 		lenientApplicationNameCollisions:       true,
+		lenientReservedApplicationNames:        true,
 		lenientFirewallFilterFamilyCollisions:  true,
 		lenientFirewallFilterFamilyAnyMatches:  true,
 		lenientFilterProtocols:                 true,
@@ -2301,6 +2320,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRouteFilterMatchTypes:           true,
 		lenientApplicationSpecs:                true,
 		lenientApplicationNameCollisions:       true,
+		lenientReservedApplicationNames:        true,
 		lenientFirewallFilterFamilyCollisions:  true,
 		lenientFirewallFilterFamilyAnyMatches:  true,
 		lenientFilterProtocols:                 true,

@@ -797,6 +797,29 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5821 reserved application-name gate. The AppID display/filter surface
+	// (ResolveSessionName / SessionMatches, pkg/appid/runtime.go) uses the
+	// literal "UNKNOWN" as the "no known application" sentinel and carries a
+	// user-defined application/application-set name verbatim into the SAME
+	// flattened string, so a catalog application literally named UNKNOWN
+	// (case-insensitively, since SessionMatches folds case) is indistinguishable
+	// from the sentinel — `show ... application UNKNOWN` cannot tell unclassified
+	// sessions from the configured app, and the destructive `clear ...
+	// application UNKNOWN` selector could delete both. Reserve the sentinel out
+	// of the user application/application-set namespace at commit. This is a NEW
+	// fail-closed restriction that can reject a config an older binary accepted;
+	// lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config carrying the reserved name still BOOTS — #1960 no-brick), strict on
+	// commit so the operator's next edit fails loudly.
+	if err := validateReservedApplicationNamesStrict(cfg); err != nil {
+		if opts.lenientReservedApplicationNames {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("reserved application name (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2175 firewall-filter `from protocol <token>` fail-open gate. Strict on
 	// commit / commit-check (hard-reject a term whose protocol token is not
 	// resolvable by the centralized appid.ProtocolNumber SSOT — neither a
