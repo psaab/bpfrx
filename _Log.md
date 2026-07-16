@@ -1,3 +1,35 @@
+## 2026-07-16 — #5682 (security/HA): unreadable kernel-upgrade journal bypasses candidate election hold (codex-182 M24)
+- **Timestamp**: 2026-07-16 (fix/5682-upgrade-journal-failclosed)
+- **Action**: Fix #5682. `holdSecondaryIfKernelCandidateArmed`
+  (`pkg/daemon/kernel_selfrecover.go`) read the kernel-upgrade journal via
+  `KernelRunner.IsArmed()` and, on `err != nil || !armed`, RETURNED without
+  setting the election hold. `loadKernelJournal` already folds a clean `ENOENT`
+  to `KernelStateInit`+nil-err, so the `err != nil` branch is reached ONLY on a
+  genuine READ/PARSE failure (I/O error, corruption, malformed content) — an
+  UNREADABLE journal that CORRELATES with a bad upgrade. Treating it as "not
+  armed" failed OPEN: the node ran a normal candidate election, bypassing the
+  #1930 A/B kernel promote/rollback hold. Fix: split the branch — on `err != nil`
+  set `SetKernelUpgradeHold()` (fail-CLOSED, `slog.Warn` once) + mark
+  `Daemon.kernelUpgradeHoldFailClosed`; on `!armed` (clean read) proceed; on
+  armed hold as before. ENOENT still proceeds (never-armed node not bricked).
+  Not-stranded: `reconcileKernelUpgradeHold` self-heals a fail-closed hold — a
+  later successful NOT-armed read RELEASES it (transient blip), an armed read
+  CONVERTS it to a normal marker-gated hold, a still-unreadable read keeps
+  holding; the strict promotion-marker release is preserved for a genuinely-armed
+  hold (revert-window safety unchanged). Added `kernelRunnerFn`/`kernelSystemFn`
+  test seams to `Daemon`. Tests (fail-on-revert, firsthand RED-verified):
+  `kernel_upgrade_hold_failclosed_5682_test.go` — 4 mandated states
+  (unreadable-parse + unreadable-I/O→hold; ENOENT→no hold; armed→hold;
+  valid-not-armed→no hold) + self-heal release/convert + armed-marker-release
+  regression. Neutralizing the fix (unreadable→return) turned the two unreadable
+  cases + self-heal precondition RED. `go build ./...`, `go vet`, and full
+  `pkg/daemon` + `pkg/cluster` suites GREEN under `-race`. Docs:
+  `docs/in-place-upgrade.md` LANE-1 §"Election hold" item 1 updated with the
+  fail-closed + ENOENT-distinction + self-heal contract.
+- **File(s)**: pkg/daemon/kernel_selfrecover.go, pkg/daemon/daemon.go,
+  pkg/daemon/kernel_upgrade_hold_failclosed_5682_test.go (new),
+  docs/in-place-upgrade.md, _Log.md
+
 ## 2026-07-16 — #5695 (security/HA): VRRP/GARP gratuitous-arp-count accepts unbounded value (codex-182 M16)
 - **Timestamp**: 2026-07-16 (fix/5695-garp-count-cap)
 - **Action**: Fix #5695. `gratuitous-arp-count` had `ValidateIntegerMin(1)`

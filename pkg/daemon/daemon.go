@@ -40,6 +40,7 @@ import (
 	"github.com/psaab/xpf/pkg/rpm"
 	"github.com/psaab/xpf/pkg/scheduler"
 	"github.com/psaab/xpf/pkg/snmp"
+	"github.com/psaab/xpf/pkg/upgrade"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
@@ -337,11 +338,31 @@ type Daemon struct {
 	schedulerRepublishFailing        atomic.Bool
 	schedulerRepublishFirstFailNanos atomic.Int64
 	cluster                          *cluster.Manager
-	sessionSync                      *cluster.SessionSync
-	syncBulkPrimed                   atomic.Bool
-	syncPeerBulkPrimed               atomic.Bool
-	syncPeerConnected                atomic.Bool
-	lastStandbyNeighborRefresh       atomic.Int64
+	// kernelUpgradeHoldFailClosed records that the kernel-upgrade election hold
+	// was set FAIL-CLOSED because the kernel-upgrade journal was UNREADABLE at
+	// boot (I/O error / corruption / parse failure — NOT a clean ENOENT), rather
+	// than because a candidate was affirmatively ARMED (#5682 / codex-review-182
+	// M24). It distinguishes the two holds for reconcileKernelUpgradeHold: a
+	// normal armed hold releases ONLY on the durable promotion marker (so the
+	// revert window can't transiently promote an unverified candidate), whereas a
+	// fail-closed hold ALSO self-heals — a later SUCCESSFUL journal read that
+	// shows the node is not armed releases it, so a transient I/O blip does not
+	// strand the node SECONDARY forever. Written once at boot (before the
+	// self-recovery goroutine starts) and read/written only from that goroutine's
+	// reconcile tick thereafter, so no lock is needed.
+	kernelUpgradeHoldFailClosed bool
+	// kernelRunnerFn / kernelSystemFn are test seams for the kernel-upgrade
+	// election-hold path (#5682). nil in production: the real KernelRunner (over
+	// the /var/lib/xpf journal) and the real KernelSystem are used. Tests inject a
+	// runner pointed at a temp journal + a stub system to drive the
+	// armed/not-armed/unreadable branches without a live UEFI host.
+	kernelRunnerFn             func() (*upgrade.KernelRunner, error)
+	kernelSystemFn             func() upgrade.KernelSystem
+	sessionSync                *cluster.SessionSync
+	syncBulkPrimed             atomic.Bool
+	syncPeerBulkPrimed         atomic.Bool
+	syncPeerConnected          atomic.Bool
+	lastStandbyNeighborRefresh atomic.Int64
 	// neighborGuards groups the #1780 Path A per-phase supervision state for
 	// runPeriodicNeighborResolution (in-flight overlap guards, last-success
 	// timestamps, loop-started gate, plus the warmNeighborCache warmup guard).

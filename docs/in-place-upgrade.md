@@ -923,8 +923,31 @@ carrying traffic:
    set BEFORE `cluster.UpdateConfig` (which itself runs the first
    election) — not merely before `Start()` — so a candidate can never win
    even the initial single-node election. `SetKernelUpgradeHold` also
-   DEMOTES any already-primary group as defense in depth. The hold is
-   released only when the candidate is affirmatively VERIFIED+PROMOTED:
+   DEMOTES any already-primary group as defense in depth.
+
+   **Fail-closed on an UNREADABLE journal (#5682 / codex-review-182 M24).**
+   `holdSecondaryIfKernelCandidateArmed` reads the journal to decide
+   whether this is a candidate boot. A genuine read/parse FAILURE (I/O
+   error, corruption, malformed content) is a failure mode that itself
+   correlates with a bad upgrade, so it now sets the hold FAIL-CLOSED
+   rather than treating the unknown state as "not armed" and proceeding to
+   a normal election (which would bypass the hold and the promote/rollback
+   safety). A clean `ENOENT` is precisely distinguished (`loadKernelJournal`
+   folds a missing file to `KernelStateInit` with a nil error) and STILL
+   proceeds normally, so a node that simply never armed an upgrade is never
+   bricked into a spurious hold. A fail-closed hold is not stranded: it is
+   tracked distinctly (`Daemon.kernelUpgradeHoldFailClosed`) and
+   `reconcileKernelUpgradeHold` self-heals it — a later reconcile tick
+   re-reads the journal and RELEASES the hold once the read succeeds and
+   the node is definitively NOT armed (a transient I/O blip with no upgrade
+   pending), CONVERTS it to a normal armed hold if the read now shows a
+   genuine armed candidate (the strict marker gate then governs), or keeps
+   holding while the journal stays unreadable. The strict marker-only
+   release below is preserved for a genuinely-armed hold so the revert
+   window can never transiently promote an unverified candidate.
+
+   The hold is released only when the candidate is affirmatively
+   VERIFIED+PROMOTED:
    the promotion gate runs in a SEPARATE process
    (`xpf-kernel-promote.service`, `After=xpfd`) and writes a durable
    promotion marker for the running kernel, so the daemon reconciles the
