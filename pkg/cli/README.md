@@ -161,7 +161,17 @@ presenter's rendered output is byte-identical:
   a multi-million-entry table). This mirrors the already-bounded gRPC
   `ClearSessions` (#5454); using the cursor (not a bare rescan) keeps a
   broad clear O(N), avoiding the O(N²) CPU-stall that would starve the HA
-  watchdog (#4719).
+  watchdog (#4719). The cursor path terminates unconditionally (the cursor
+  advances every round regardless of delete success). The fresh-rescan
+  fallback re-collects from the top each round, so it depends on deletes
+  actually removing keys to converge; a #5948 no-progress guard breaks the
+  loop if a non-empty chunk removed NOTHING (every forward delete genuinely
+  failed → the same set would be re-collected forever). A not-found key
+  counts as removed (it will not reappear), so a concurrently-drained chunk
+  is still progress, not a stall. This is defense-in-depth: production always
+  takes the cursor path (both `dataplane.Manager` and the userspace
+  `LegacyDataPlaneAdapter` implement the cursor iterators), so the rescan is
+  test/edge only.
 - `show` PAGER auto-disable (`dispatchWithPager`, #4886): the pager only
   engages when `os.Stdout` is a real terminal (`stdoutIsTerminal`, probed
   via TCGETS — `/dev/null` is a CharDevice so `os.ModeCharDevice` is
