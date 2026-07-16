@@ -263,14 +263,35 @@ func routeOnlyPublishHybrid(cfg, applied *config.Config) bool {
 // userspace-dp: ConfigSnapshot.Config is marshaled verbatim on every
 // apply_snapshot (process_control.go), and the config store persists the same
 // tree as JSON. Byte-equality of those encodings therefore means "content-equal
-// for forwarding purposes" — exactly the notion routeOnlyPublishHybrid needs.
+// for the snapshot the helper receives" — exactly the notion
+// routeOnlyPublishHybrid needs.
 //
 // This replaces a former reflect.DeepEqual so the userspace package stays free
 // of reflect/unsafe (retirement-boundary canary, #5985 /
-// TestUserspaceManagerDoesNotImportReflectOrUnsafe). The semantics are
-// preserved: two configs that DeepEqual serialize to identical JSON (Go sorts
-// map keys, so the encoding is deterministic), and any JSON-visible divergence
-// yields a mismatch.
+// TestUserspaceManagerDoesNotImportReflectOrUnsafe).
+//
+// NOTE — the JSON comparison is strictly COARSER than reflect.DeepEqual, in one
+// direction only (#6037 review): DeepEqual-equal ALWAYS implies JSON-equal (Go
+// sorts map keys, so the encoding is deterministic), but the converse fails for
+// two classes of field:
+//   - Secrets: config.Secret.MarshalJSON redacts every non-empty secret to the
+//     sentinel "<redacted>", so two configs differing ONLY in a non-empty secret
+//     (an IPsec PSK / auth-key / password rotation) compare EQUAL here though
+//     DeepEqual would call them different.
+//   - Unexported fields (e.g. SNMPCommunity.clientNets): json.Marshal omits them;
+//     DeepEqual compares them. These are derived from exported fields, so the
+//     coarsening is benign (arguably more correct).
+//
+// This coarsening is SAFE and correct for THIS guard: routeOnlyPublishHybrid
+// governs only what the helper's route-overlay snapshot contains, and the helper
+// ALWAYS receives the redacted JSON encoding (process_control.go) — it never sees
+// raw secrets. A secret-only change is therefore invisible to the snapshot the
+// helper gets, so it genuinely is NOT a route-overlay hybrid (the former
+// DeepEqual was over-strict, refusing a publish over a change the helper could
+// not observe). Secret-bearing subsystems (strongSwan/FRR/vrrp/cluster) apply on
+// separate paths, and the recorded appliedSnapshot.Config self-heals on the next
+// full apply. Do NOT restore this to a claim of full semantic preservation on
+// this fail-closed guard.
 //
 // A marshal error is never observed in practice — the very same object is
 // marshaled to the helper on each apply — but if one occurred we cannot prove
