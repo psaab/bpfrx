@@ -832,6 +832,29 @@ under the daemon's errgroup. Nothing else imports this package.
     longer issue unbounded full-table scans; over-cap gRPC scans return
     `codes.ResourceExhausted`. A mix of REST + gRPC scrapers cannot collectively
     exceed `diagcmd.MaxConcurrentSessionWalks`.
+    **#5880 makes the shared limiter request-graph-aware to fix a reentrant
+    double-acquire.** A REST list/summary/zone-pair handler acquires a slot and
+    then delegates IN-PROCESS to the gRPC session service for `include_peer`
+    fan-out; that service acquired the SAME limiter AGAIN, double-charging one
+    logical operation and self-rejecting at capacity (`include_peer` failed under
+    load). The fix is an unforgeable **in-process admission lease** carried on
+    `context.Context` (`diagcmd.Limiter.AcquireCtx`, keyed by the private
+    `leaseKey{*Limiter}` — never derivable from any external header): the FIRST
+    handler to admit at the external trust boundary stamps the lease on the
+    context it delegates on (REST re-stamps the request via `r.WithContext`), and
+    the nested gRPC entry point REUSES that slot instead of re-acquiring. The
+    lease is **per-request-graph, not global**: two DISTINCT external requests
+    each acquire independently (the per-node bound is preserved), and the lease
+    never crosses a process/network boundary, so a peer node's own gRPC entry
+    acquires its own local slot (remote admission unchanged). Release stays
+    idempotent + cancellation-safe (a real slot via `sync.Once`; the lease-reuse
+    path is a no-op). Pinned by `TestAcquireCtx_5880` (mechanism),
+    `TestGetSessions_InProcessLeaseReuse_5880` (gRPC reuse at cap 1), and
+    `TestRESTIncludePeerReusesLease_5880` (REST include_peer succeeds at cap 1),
+    each RED on revert. The BROADER redesign #5880 also asks for — structural
+    per-surface admission via a registration/source-level test, weighted cost for
+    local+peer/cursor/clear, and a separate remote budget — is deferred to a
+    follow-up.
     **#5779 extends the SAME shared bound to the session-CLEAR (mutation)
     path**, which was the remaining uncovered full-table walk: `ClearAllSessions`
     is a chunked full-table scan+delete (not O(1)), and the gRPC `ClearSessions`
