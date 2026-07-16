@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/clusterfailover"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/wgkey"
@@ -181,59 +182,24 @@ func (c *ctl) handleRequestChassis(args []string) error {
 }
 
 func (c *ctl) handleRequestChassisClusterFailover(args []string) error {
-	if len(args) >= 1 && args[0] == "reset" {
-		if len(args) < 3 || args[1] != "redundancy-group" {
-			return fmt.Errorf("usage: request chassis cluster failover reset redundancy-group <N>")
-		}
-		action := "cluster-failover-reset:" + args[2]
-		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
-			Action: action,
-		})
-		if err != nil {
-			return fmt.Errorf("%v", err)
-		}
-		fmt.Println(resp.Message)
-		return nil
+	// One strict grammar, shared with the in-process CLI and the gRPC handler
+	// (pkg/clusterfailover). Reject a malformed selector, a missing/extra
+	// operand, or an out-of-range node BEFORE issuing the privileged
+	// SystemAction RPC — the old per-form ad-hoc parsing silently degraded a
+	// misspelled/truncated `node` selector into an untargeted RG failover
+	// (#5810, #4883-C).
+	op, err := clusterfailover.ParseCommand(args)
+	if err != nil {
+		return err
 	}
-
-	if len(args) >= 3 && args[0] == "data" && args[1] == "node" {
-		action := "cluster-failover-data:node" + args[2]
-		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
-			Action: action,
-		})
-		if err != nil {
-			return fmt.Errorf("%v", err)
-		}
-		fmt.Println(resp.Message)
-		return nil
+	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
+		Action: op.Action(),
+	})
+	if err != nil {
+		return fmt.Errorf("%v", err)
 	}
-
-	if len(args) >= 2 && args[0] == "redundancy-group" {
-		actionSuffix := args[1]
-		if len(args) >= 3 && args[2] == "node" {
-			// `node` was typed but its value is missing. The old
-			// `len(args) >= 4` gate silently dropped the bare `node` and
-			// sent an untargeted `cluster-failover:<rg>`, which the server
-			// treats as ManualFailover(<rg>) — a truncated automation token
-			// or an interactive omission triggers a REAL RG failover
-			// instead of a usage error (#4883-C). Require the node value.
-			if len(args) < 4 {
-				return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N> node <node-id>")
-			}
-			actionSuffix += ":node" + args[3]
-		}
-		action := "cluster-failover:" + actionSuffix
-		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
-			Action: action,
-		})
-		if err != nil {
-			return fmt.Errorf("%v", err)
-		}
-		fmt.Println(resp.Message)
-		return nil
-	}
-
-	return fmt.Errorf("usage: request chassis cluster failover {redundancy-group <N> [node <N>] | data node <N>}")
+	fmt.Println(resp.Message)
+	return nil
 }
 
 func (c *ctl) handleRequestChassisClusterDataPlane(args []string) error {
