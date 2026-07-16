@@ -18,9 +18,101 @@ import (
 )
 
 // instanceKey identifies a unique VRRP instance.
+//
+// family distinguishes a dual-stack VRRP group (#5083): an IPv4 and an IPv6
+// group configured on the SAME unit with the SAME VRID are two independent
+// VRRP protocol instances (distinct multicast groups / adverts), and the
+// generic collector emits one Instance per family. Without family in the key
+// they would collapse to one map entry and UpdateInstances would silently drop
+// a family (last-wins). The unit is already encoded in iface — the collector
+// stores the resolved KERNEL device name, so a VLAN sub-interface / non-zero
+// unit yields a distinct iface (ge-0-0-0.100) on its own. Generic instances
+// carry inet/inet6 even when single-stack; implicit RETH instances leave family
+// empty so their keys remain byte-identical to before.
 type instanceKey struct {
 	iface   string
 	groupID int
+	family  string
+}
+
+type electionKey struct {
+	iface   string
+	groupID int
+}
+
+type electionDomains struct {
+	mixed bool
+	inet  bool
+	inet6 bool
+}
+
+func (d *electionDomains) conflictingFamily(family string) (string, bool) {
+	switch family {
+	case "":
+		// Empty-family RETH consumes both wire families and therefore overlaps
+		// every existing domain. Keep the reported conflict deterministic.
+		if d.mixed {
+			return "", true
+		}
+		if d.inet {
+			return "inet", true
+		}
+		if d.inet6 {
+			return "inet6", true
+		}
+	case "inet", "inet6":
+		if d.mixed {
+			return "", true
+		}
+	}
+	return "", false
+}
+
+func (d *electionDomains) add(family string) {
+	switch family {
+	case "":
+		d.mixed = true
+	case "inet":
+		d.inet = true
+	case "inet6":
+		d.inet6 = true
+	}
+}
+
+// validateInstanceFamily enforces the generic-collector family identity at
+// the manager boundary. RETH instances intentionally leave Family empty and
+// may carry both families in one state machine; a family-tagged generic
+// instance must carry only VIPs from that election domain. The config commit
+// path normally guarantees this, but lenient/peer loads and direct callers
+// can reach the manager, where accepting a mismatch would reintroduce
+// cross-family election coupling under a misleading key.
+func validateInstanceFamily(inst *Instance) error {
+	if inst == nil {
+		return fmt.Errorf("nil VRRP instance")
+	}
+	if inst.Family == "" {
+		return nil
+	}
+	if inst.Family != "inet" && inst.Family != "inet6" {
+		return fmt.Errorf("invalid VRRP family %q on interface %q VRID %d", inst.Family, inst.Interface, inst.GroupID)
+	}
+	for _, vip := range inst.VirtualAddresses {
+		if family := familyOfAddrs([]string{vip}); family != "" && family != inst.Family {
+			return fmt.Errorf(
+				"VRRP family %q on interface %q VRID %d conflicts with VIP %q (%s)",
+				inst.Family, inst.Interface, inst.GroupID, vip, family,
+			)
+		}
+	}
+	return nil
+}
+
+// isRethInstance distinguishes the implicit cluster/RETH state machines from
+// generic standalone VRRP. CollectRethInstances deliberately leaves Family
+// empty; CollectInstances always assigns inet/inet6. Cluster control methods
+// must not commandeer a valid standalone VRID that happens to equal 100+RG.
+func isRethInstance(inst Instance) bool {
+	return inst.Family == ""
 }
 
 // Manager manages all VRRP instances.
@@ -326,8 +418,13 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 	// addr-watcher can recognise an address event for a configured interface
 	// that has no instance built yet (#2788, late-appearing interface).
 	desiredMap := make(map[instanceKey]*Instance, len(desired))
+	domainsByElection := make(map[electionKey]*electionDomains, len(desired))
 	desiredIfaces := make(map[string]struct{}, len(desired))
+	needsLinkWatcher := false
 	for _, inst := range desired {
+		if err := validateInstanceFamily(inst); err != nil {
+			return err
+		}
 		// #4573 defensive VRID range guard. The GroupID is truncated onto the
 		// single VRID wire byte (uint8(vi.cfg.GroupID) in instance.go). An
 		// out-of-range id normally cannot reach here — the config commit gate
@@ -342,19 +439,48 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 				"valid_range", fmt.Sprintf("%d..%d", MinVRID, MaxVRID))
 			continue
 		}
-		key := instanceKey{iface: inst.Interface, groupID: inst.GroupID}
+		key := instanceKey{iface: inst.Interface, groupID: inst.GroupID, family: inst.Family}
+		if _, exists := desiredMap[key]; exists {
+			return fmt.Errorf(
+				"duplicate VRRP instance identity interface=%q VRID=%d family=%q; refusing non-deterministic last-wins reconciliation",
+				inst.Interface, inst.GroupID, inst.Family,
+			)
+		}
+		wireKey := electionKey{iface: inst.Interface, groupID: inst.GroupID}
+		domains := domainsByElection[wireKey]
+		if domains == nil {
+			domains = &electionDomains{}
+			domainsByElection[wireKey] = domains
+		}
+		if conflict, overlaps := domains.conflictingFamily(inst.Family); overlaps {
+			first, second := conflict, inst.Family
+			if second < first {
+				first, second = second, first
+			}
+			return fmt.Errorf(
+				"overlapping VRRP election domains interface=%q VRID=%d families=%q,%q; empty-family RETH overlaps both wire families",
+				inst.Interface, inst.GroupID, first, second,
+			)
+		}
+		domains.add(inst.Family)
 		desiredMap[key] = inst
 		desiredIfaces[inst.Interface] = struct{}{}
-		// Lazily start the singleton link watcher once any instance
-		// tracks an interface (#1814). Idempotent under m.mu — repeat
-		// UpdateInstances churn never spawns a second goroutine.
 		if inst.TrackInterface != "" {
-			m.ensureLinkWatcherLocked()
+			needsLinkWatcher = true
 		}
-		// Lazily start the singleton address watcher once ANY instance
-		// exists (#2528). Every VRRP interface needs its advert source
-		// re-resolved when its address changes — not just tracked ones — so
-		// this is ungated. Idempotent under m.mu.
+	}
+	// Start watchers only after the entire desired set passes validation. A
+	// duplicate/malformed identity returns transactionally without publishing
+	// a partial desired-name set or starting background work for a rejected
+	// reconcile.
+	if needsLinkWatcher {
+		// Lazily start the singleton link watcher once any instance tracks an
+		// interface (#1814). Idempotent under m.mu.
+		m.ensureLinkWatcherLocked()
+	}
+	if len(desiredMap) > 0 {
+		// Every VRRP interface needs its advert source re-resolved when its
+		// address changes (#2528), not just tracked ones.
 		m.ensureAddrWatcherLocked()
 	}
 	// Publish the desired-name set for the addr-watcher (#2788). Replaced
@@ -532,7 +658,7 @@ func (m *Manager) ResignRG(rgID int) {
 	defer m.mu.RUnlock()
 	vrid := 100 + rgID
 	for _, vi := range m.instances {
-		if vi.cfg.GroupID == vrid {
+		if isRethInstance(vi.cfg) && vi.cfg.GroupID == vrid {
 			// Set priority to 0 BEFORE triggering resign. Without this,
 			// the masterDown timer (~97ms) can fire before the debounced
 			// priority update (500ms), causing the instance to re-elect
@@ -554,7 +680,7 @@ func (m *Manager) UpdateRGPriority(rgID int, priority int) {
 	defer m.mu.RUnlock()
 	vrid := 100 + rgID
 	for _, vi := range m.instances {
-		if vi.cfg.GroupID == vrid {
+		if isRethInstance(vi.cfg) && vi.cfg.GroupID == vrid {
 			vi.mu.Lock()
 			old := vi.cfg.Priority
 			vi.cfg.Priority = priority
@@ -578,7 +704,7 @@ func (m *Manager) ForceRGMaster(rgID int) {
 	defer m.mu.RUnlock()
 	vrid := 100 + rgID
 	for _, vi := range m.instances {
-		if vi.cfg.GroupID == vrid && vi.getState() != StateMaster {
+		if isRethInstance(vi.cfg) && vi.cfg.GroupID == vrid && vi.getState() != StateMaster {
 			slog.Info("vrrp: forcing MASTER (cluster authoritative)",
 				"key", vi.key())
 			vi.mu.Lock()
@@ -623,7 +749,7 @@ func (m *Manager) SetGARPSuppression(rgID int, suppress bool) {
 
 	vrid := 100 + rgID
 	for _, vi := range m.instances {
-		if vi.cfg.GroupID == vrid {
+		if isRethInstance(vi.cfg) && vi.cfg.GroupID == vrid {
 			// Swap (not Store) so we can detect the true->false EDGE.
 			// Lifting suppression on an instance that is ALREADY MASTER
 			// (common in active-active strict-vip negotiation where the
@@ -664,7 +790,7 @@ func (m *Manager) RGVRRPReady(rgID int, hasRETH bool) (bool, []string) {
 
 	vrid := 100 + rgID
 	for _, vi := range m.instances {
-		if vi.cfg.GroupID == vrid {
+		if isRethInstance(vi.cfg) && vi.cfg.GroupID == vrid {
 			return true, nil // instance exists for this RG
 		}
 	}
@@ -680,7 +806,7 @@ func (m *Manager) RGVRRPReady(rgID int, hasRETH bool) (bool, []string) {
 }
 
 // States returns the current state of all instances.
-// Key format: "VI_<iface>_<group>" → "MASTER", "BACKUP", "INIT".
+// Key format: "VI_<iface>_<group>[_<family>]" → "MASTER", "BACKUP", "INIT".
 func (m *Manager) States() map[string]string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -704,6 +830,7 @@ func (m *Manager) InstanceStates() []VRRPEvent {
 	for _, vi := range m.instances {
 		out = append(out, VRRPEvent{
 			Interface: vi.cfg.Interface,
+			Family:    vi.cfg.Family,
 			GroupID:   vi.cfg.GroupID,
 			State:     vi.getState(),
 		})
@@ -712,7 +839,7 @@ func (m *Manager) InstanceStates() []VRRPEvent {
 }
 
 // RXDropStats returns per-instance RX drop and received counts.
-// Key format: "VI_<iface>_<group>".
+// Key format: "VI_<iface>_<group>[_<family>]".
 func (m *Manager) RXDropStats() map[string]uint64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -747,7 +874,10 @@ func (m *Manager) Status() string {
 		if keys[i].iface != keys[j].iface {
 			return keys[i].iface < keys[j].iface
 		}
-		return keys[i].groupID < keys[j].groupID
+		if keys[i].groupID != keys[j].groupID {
+			return keys[i].groupID < keys[j].groupID
+		}
+		return keys[i].family < keys[j].family
 	})
 
 	for _, key := range keys {

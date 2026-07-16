@@ -237,6 +237,26 @@ func TestIsRethVRID(t *testing.T) {
 	}
 }
 
+func TestIsRethVRRPEvent_RequiresImplicitEmptyFamily(t *testing.T) {
+	tests := []struct {
+		name  string
+		event vrrp.VRRPEvent
+		want  bool
+	}{
+		{name: "implicit RETH", event: vrrp.VRRPEvent{GroupID: 101}, want: true},
+		{name: "standalone low VRID", event: vrrp.VRRPEvent{Family: "inet", GroupID: 5}, want: false},
+		{name: "standalone IPv4 collides numerically with RG", event: vrrp.VRRPEvent{Family: "inet", GroupID: 101}, want: false},
+		{name: "standalone IPv6 collides numerically with RG", event: vrrp.VRRPEvent{Family: "inet6", GroupID: 101}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRethVRRPEvent(tt.event); got != tt.want {
+				t.Fatalf("isRethVRRPEvent(%+v)=%v, want %v", tt.event, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNonRethVRRPDoesNotPollute(t *testing.T) {
 	d := newTestDaemon()
 

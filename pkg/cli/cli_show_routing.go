@@ -541,7 +541,7 @@ func (c *CLI) showVRRP() error {
 	fmt.Printf("%-14s %-6s %-8s %-10s %-16s %-8s\n",
 		"Interface", "Group", "State", "Priority", "VIP", "Preempt")
 	for _, inst := range instances {
-		key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
+		key := vrrp.StateKey(inst.Interface, inst.GroupID, inst.Family)
 		state := "INIT"
 		if s, ok := states[key]; ok {
 			state = s

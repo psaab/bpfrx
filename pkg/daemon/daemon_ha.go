@@ -380,10 +380,12 @@ func (d *Daemon) applyRG0OwnershipTransition(newState cluster.NodeState) {
 
 // rethVRIDBase is the VRRP GroupID offset for RETH instances.
 // RETH instances use GroupID = rethVRIDBase + rgID (set in pkg/vrrp/vrrp.go).
-// Standalone VRRP groups use GroupID < rethVRIDBase.
+// Standalone VRRP may use any valid VRID, including this numeric range, so
+// event classification must also require the empty-family RETH marker.
 const rethVRIDBase = 100
 
-// isRethVRID returns true if the VRRP GroupID belongs to a RETH instance.
+// isRethVRID reports whether a VRID is in the numeric RETH convention range;
+// it is not sufficient to classify an event without the Family marker.
 func isRethVRID(vrid int) bool {
 	return vrid >= rethVRIDBase
 }
@@ -392,6 +394,14 @@ func isRethVRID(vrid int) bool {
 // VRID = rethVRIDBase + RG ID (set in pkg/vrrp/vrrp.go).
 func rgIDFromVRID(vrid int) int {
 	return vrid - rethVRIDBase
+}
+
+// isRethVRRPEvent identifies events from the implicit cluster/RETH collector.
+// Generic standalone instances always carry inet/inet6; RETH instances leave
+// Family empty. The family guard prevents a valid standalone VRID in the
+// numeric 100+RG range from driving cluster ownership state (#5083).
+func isRethVRRPEvent(ev vrrp.VRRPEvent) bool {
+	return ev.Family == "" && isRethVRID(ev.GroupID)
 }
 
 // watchVRRPEvents monitors VRRP state changes and logs transitions.
@@ -410,12 +420,15 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 			if !ok {
 				return
 			}
-			// Standalone VRRP instances (GroupID < rethVRIDBase) do not
-			// participate in HA redundancy group state. Skip the
-			// rg_active/blackhole logic to avoid creating phantom RG entries.
-			if !isRethVRID(ev.GroupID) {
+			// Generic standalone instances carry an explicit address family;
+			// implicit RETH instances deliberately leave Family empty. Family is
+			// authoritative here because a valid standalone VRID may numerically
+			// equal rethVRIDBase+RG and must not be commandeered by cluster
+			// rg_active/blackhole control (#5083).
+			if !isRethVRRPEvent(ev) {
 				slog.Info("vrrp: standalone state change (non-RETH)",
 					"interface", ev.Interface,
+					"family", ev.Family,
 					"group", ev.GroupID,
 					"state", ev.State.String())
 				continue
@@ -572,11 +585,12 @@ func (d *Daemon) reconcileRGState() {
 	// Read authoritative VRRP instance states.
 	vrrpStates := d.vrrpMgr.InstanceStates()
 
-	// Build per-RG VRRP state map: rgID → { iface → isMaster }.
-	// Skip standalone (non-RETH) VRRP instances.
+	// Build per-RG VRRP state map: rgID → { iface → isMaster }. Generic
+	// standalone instances carry Family and are excluded even when their VRID
+	// falls in the numeric 100+RG range (#5083).
 	rgVRRP := make(map[int]map[string]bool)
 	for _, ev := range vrrpStates {
-		if !isRethVRID(ev.GroupID) {
+		if !isRethVRRPEvent(ev) {
 			continue
 		}
 		rgID := rgIDFromVRID(ev.GroupID)
