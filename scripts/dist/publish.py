@@ -620,8 +620,9 @@ def _parse_manifest_fields(text):
 
 
 def gate_provenance(dist, versions, pub):
-    """#4904 A: refuse to publish an image set that did not pass the in-guest
-    verify-dataplane validation gate.
+    """#4904 A/B: refuse to publish an image set that did not pass the in-guest
+    verify-dataplane validation gate OR whose Ubuntu base was not anchored to a
+    reviewed trust-anchor digest.
 
     A --skip-validate bake still produces a fully signed manifest/signature set
     that is byte-shape-indistinguishable from a validated release, so the
@@ -630,10 +631,20 @@ def gate_provenance(dist, versions, pub):
     true|false` provenance field into the xpf-<ver>.manifest sidecar (covered by
     the signed xpf-<ver>.SHA256SUMS, #5042); this gate REQUIRES validated: true.
 
+    Symmetrically (#5815), an XPF_ALLOW_UNPINNED_BASE=1 dev bake signs
+    `base_image_pinned: false` into that same sidecar — its own authenticated
+    metadata says the Ubuntu base was NOT anchored to a reviewed digest (#4904
+    B). This gate ALSO REQUIRES base_image_pinned: true, so a signed-but-unpinned
+    image cannot be released via the normal path. There is deliberately no
+    override — a signed unpinned image is not releasable.
+
     Fail-CLOSED: every version MUST carry a provenance sidecar that is (a) listed
-    in — and hash-matches — the signed manifest, and (b) says validated: true.
-    A missing sidecar, an unsigned/mismatched sidecar, or validated != true all
-    refuse the publish."""
+    in — and hash-matches — the signed manifest, (b) says validated: true, AND
+    (c) says base_image_pinned: true. A missing sidecar, an unsigned/mismatched
+    sidecar, validated != true, or base_image_pinned != true all refuse the
+    publish. A sidecar MISSING base_image_pinned (an old/tampered manifest that
+    does not assert pinning) is also refused — a sidecar that does not assert
+    pinning is not publishable."""
     for ver, sums in sorted(versions.items()):
         sig = sums + ".minisig"
         sidecar = os.path.join(dist, f"xpf-{ver}.manifest")
@@ -660,7 +671,25 @@ def gate_provenance(dist, versions, pub):
                 "the #4904 provenance field). Refusing to publish an "
                 "UNVALIDATED image with a release signature. Re-bake WITHOUT "
                 "--skip-validate.")
-        info(f"image set {ver}: provenance validated=true")
+        # #5815: the signed sidecar also asserts whether the Ubuntu base was
+        # anchored to a reviewed trust-anchor digest (base_image_pinned, #4904
+        # B). An XPF_ALLOW_UNPINNED_BASE=1 dev bake signs base_image_pinned:
+        # false — its OWN authenticated metadata says the base is not pinned —
+        # yet is otherwise byte-shape-identical to a release. Enforce it here
+        # symmetrically with validated (already-authenticated field, no new
+        # trust surface). Fail-CLOSED on a MISSING key too: an old/tampered
+        # sidecar that does not assert pinning is NOT publishable.
+        base_pinned = fields.get("base_image_pinned")
+        if base_pinned != "true":
+            die(f"image set {ver} provenance says base_image_pinned="
+                f"{base_pinned!r} (not 'true') — the Ubuntu base was NOT "
+                "anchored to a reviewed trust-anchor digest (built with "
+                "XPF_ALLOW_UNPINNED_BASE=1, or an older/tampered bake that does "
+                "not assert pinning). Refusing to publish an UNPINNED image with "
+                "a release signature: a signed dev/unpinned bake is not "
+                "releasable. Re-bake against a PINNED_BASE_SHA256 base WITHOUT "
+                "XPF_ALLOW_UNPINNED_BASE.")
+        info(f"image set {ver}: provenance validated=true base_image_pinned=true")
 
 
 def _gate_one_latest(dist, channel, pub, require_present):
