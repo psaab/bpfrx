@@ -169,10 +169,16 @@ the userspace dataplane admission boundary is in
   behavior, which deducted every failed target's weight independently and
   ignored `global-threshold` entirely. A target with no explicit `weight`
   contributes `global-weight` to the cumulative sum (the same effective weight
-  it would subtract in independent mode). The aggregate deduction is installed
-  under a fixed per-RG monitor name so it is released when `global-threshold` is
-  disabled or `ip-monitoring` is removed on a **kept** group — a stale
-  deduction would otherwise strand the RG at a wrong weight (#5271, Finding 1).
+  it would subtract in independent mode). Each poll **reconciles** the RG's
+  installed ip-monitor debts to exactly what the current mode + dampened
+  reachability dictate (firing only on a change), so a live `global-threshold`
+  edit while a target is down is correct in both directions: enabling it drops
+  the stale per-target debts in favor of the single aggregate deduction (else
+  they would coexist and over-demote the RG → spurious failover), and disabling
+  it (or removing `ip-monitoring`) on a **kept** group releases the stale
+  aggregate deduction (else the RG stays stuck demoted). An already-down target
+  produces no dampening transition, so this cleanup relies on the reconcile, not
+  transition edges (#5271).
   When `global-threshold` is unset (0),
   the historical **independent per-target** behavior is preserved exactly: each
   unreachable target subtracts its own `weight` (or `global-weight` when the

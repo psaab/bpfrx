@@ -232,6 +232,94 @@ func TestMonitor_GlobalThresholdClearedOnIPMonitoringRemoved_5271(t *testing.T) 
 	}
 }
 
+// TestMonitor_GlobalThresholdEnabledClearsPerTargetDebts_5271 is the symmetric
+// (Direction 2) Finding: enabling global-threshold on a KEPT group while a
+// monitored target is already down must drop the stale per-target "ip:<addr>"
+// debts installed in independent mode, replacing them with the single aggregate
+// global-weight debt. If they coexist the RG is OVER-demoted (55 instead of
+// 155 here) — a 100-point over-deduction that can force a spurious failover.
+//
+// The already-down targets produce no dampening transition after the switch, so
+// only a full per-cycle reconcile (not transition-edge cleanup) can clear them.
+//
+// Fail-on-revert: disable the reconcile's stale-debt removal and the per-target
+// debts persist alongside the aggregate debt → weight over-demotes below 155.
+func TestMonitor_GlobalThresholdEnabledClearsPerTargetDebts_5271(t *testing.T) {
+	// Independent mode (global-threshold 0): two weight-100 targets DOWN →
+	// per-target debts → 255 - 100 - 100 = 55.
+	rg := thresholdRG(0, 100, 0, 100, "10.0.0.1", "10.0.0.2")
+	cfg := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rg}}
+	m := NewManager(0, 1)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	reach := map[string]bool{"10.0.0.1": false, "10.0.0.2": false}
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	injectFakeNl(mon)
+	setNoDampening(mon)
+	mon.probeFn = reachProbeFn(reach)
+
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 55 {
+		t.Fatalf("independent-mode both-down weight = %d, want 55 (255-100-100)", w)
+	}
+
+	// Enable global-threshold 200, SAME group kept, targets STILL down.
+	rgAgg := thresholdRG(0, 100, 200, 100, "10.0.0.1", "10.0.0.2")
+	cfg2 := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rgAgg}}
+	m.UpdateConfig(cfg2)
+	mon.UpdateGroups(cfg2.RedundancyGroups)
+
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 155 {
+		t.Fatalf("after enabling global-threshold (targets still down) weight = %d, want 155 "+
+			"(aggregate global-weight ONLY; stale per-target debts must be cleared, not coexist for 55)", w)
+	}
+	if !mon.ipThresholdState[0] {
+		t.Errorf("ipThresholdState[0] = false, want true (aggregate installed)")
+	}
+}
+
+// TestMonitor_GlobalThresholdEnabledSubThresholdClearsPerTargetDebts_5271 is the
+// Direction 2 sub-threshold variant: enabling a global-threshold ABOVE the
+// current cumulative failure while targets are down must clear the per-target
+// debts and install NO aggregate debt → the RG returns to full health rather
+// than staying demoted by the stale per-target debts.
+func TestMonitor_GlobalThresholdEnabledSubThresholdClearsPerTargetDebts_5271(t *testing.T) {
+	rg := thresholdRG(0, 100, 0, 100, "10.0.0.1", "10.0.0.2") // independent, both down
+	cfg := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rg}}
+	m := NewManager(0, 1)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	reach := map[string]bool{"10.0.0.1": false, "10.0.0.2": false}
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	injectFakeNl(mon)
+	setNoDampening(mon)
+	mon.probeFn = reachProbeFn(reach)
+
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 55 {
+		t.Fatalf("independent-mode both-down weight = %d, want 55", w)
+	}
+
+	// Enable global-threshold 300 — above the cumulative failure (200) — group
+	// kept, targets still down. Aggregate NOT installed; per-target debts cleared.
+	rgAgg := thresholdRG(0, 100, 300, 100, "10.0.0.1", "10.0.0.2")
+	cfg2 := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rgAgg}}
+	m.UpdateConfig(cfg2)
+	mon.UpdateGroups(cfg2.RedundancyGroups)
+
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 255 {
+		t.Fatalf("after enabling sub-threshold global-threshold weight = %d, want 255 "+
+			"(cumulative 200 < 300 → no aggregate; stale per-target debts must be cleared)", w)
+	}
+	if mon.ipThresholdState[0] {
+		t.Errorf("ipThresholdState[0] = true, want false (below threshold)")
+	}
+}
+
 // TestMonitor_GlobalThresholdPerRGIndependence_5271 pins that one RG's
 // cumulative threshold state does not leak into another RG's decision.
 func TestMonitor_GlobalThresholdPerRGIndependence_5271(t *testing.T) {
