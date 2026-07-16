@@ -107,6 +107,21 @@ contract.
 - `CommitFn` (passed in by the daemon) holds the apply semaphore across
   `Commit()` and the dataplane apply. This is the same primitive `pkg/cli`
   uses; concurrent operator commits serialize via that semaphore (#846).
+- **Commit error-code contract (#5742).** `Commit` / `CommitConfirmed`
+  classify the callback error structurally via `commitApplyStatus`, keying
+  off whether the daemon returned the committed config alongside it:
+  a **non-fatal tail-reconcile / ordinary dataplane-apply** error (networkd
+  write, Kea restart, IPsec reload, interface reconcile, non-abort apply —
+  the daemon commits+arms the config and returns it *with* the error) →
+  `codes.Unavailable` (transient, **retryable**; the config was accepted and
+  self-heals on the next commit/feed retry, #5646). A true **config-validation
+  / compile-reject** (compiler/schema reject, `compileErrorMustAbortApply`
+  fail-closed gate, device-map preflight, bootstrap refusal, pre-promotion
+  persistence — no config committed, `nil` returned) → `codes.InvalidArgument`
+  (fix the config). `context.Canceled` / `DeadlineExceeded` are preserved and
+  take precedence. The human-readable message is unchanged; only the code
+  distinguishes "retry" from "fix your config". Unclassifiable errors fail
+  safe to `InvalidArgument`.
 - **Zeroize goes through the apply gate AND stops xpfd (#5281).** The
   `SystemAction{zeroize}` handler does NOT call `performZeroizeWipe`
   directly. It routes through `ZeroizeFn` (wired by the daemon to

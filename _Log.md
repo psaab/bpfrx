@@ -48898,3 +48898,30 @@ top.
     separate concern, not #5927.
   - **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/dhcpv6_zero_lifetime_invalidate_5927_test.go,
     pkg/dhcp/dhcpv6_iana_test.go (signature), pkg/dhcp/README.md
+  - **Action**: #5742 classify commit RPC apply errors. Commit / CommitConfirmed
+    blanket-mapped EVERY non-context commit-callback error to codes.InvalidArgument
+    ("you sent bad config"). But the daemon commit path (commitAndApply /
+    commitConfirmedAndApply -> applyAndSyncCommitted) returns a NON-FATAL
+    tail-reconcile / ordinary dataplane-apply error (networkd #1778, Kea #2987,
+    IPsec #4433, iface #5310, non-abort apply #5679, #5578 deletion-clear)
+    ALONGSIDE the committed config (compiled != nil) — the config is valid and
+    committed+active, only a transient control-socket step failed and self-heals
+    on retry (#5646). InvalidArgument misleads an operator/automation client into
+    EDITING valid config instead of retrying. Added commitApplyStatus(compiled,
+    err) — one private helper shared by both RPCs — classifying STRUCTURALLY on
+    the daemon's existing (compiled, err) contract (no sentinel / string match
+    needed): context.Canceled/DeadlineExceeded preserved and checked FIRST;
+    compiled != nil -> codes.Unavailable (transient, retryable); else keep
+    codes.InvalidArgument (compile/schema reject, compileErrorMustAbortApply
+    fail-closed gate, device-map preflight, bootstrap refusal, pre-promotion
+    persistence — all return nil config). Fail-safe: unclassifiable -> InvalidArgument.
+    Message text ("%v") byte-identical; only the code moves. Tail errors were
+    ALREADY distinctly encoded by the daemon (non-nil compiled on non-fatal via
+    applyAndSyncCommitted, daemon_apply.go ~332) so NO new sentinel was added.
+    Consumer check: no pkg/cli/cmd/cli code switches on the commit status code
+    (remote CLI wraps the message verbatim; local CLI calls store.Commit directly),
+    so NO consumer update needed. Fail-on-revert proven via -overlay (restore the
+    blanket default:InvalidArgument -> tail-reconcile->Unavailable rows RED for
+    both Commit and CommitConfirmed; schema/context rows stay green).
+  - **File(s)**: pkg/grpcapi/server_config.go,
+    pkg/grpcapi/server_config_commit_errclass_5742_test.go, pkg/grpcapi/README.md
