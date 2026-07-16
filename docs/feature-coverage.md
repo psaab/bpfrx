@@ -176,9 +176,13 @@ the userspace dataplane admission boundary is in
   the stale per-target debts in favor of the single aggregate deduction (else
   they would coexist and over-demote the RG → spurious failover), and disabling
   it (or removing `ip-monitoring`) on a **kept** group releases the stale
-  aggregate deduction (else the RG stays stuck demoted). An already-down target
-  produces no dampening transition, so this cleanup relies on the reconcile, not
-  transition edges (#5271).
+  aggregate deduction (else the RG stays stuck demoted), and a `global-weight`
+  value change while the RG stays crossed re-installs the deduction at the new
+  amount (else the stale amount would persist until the RG clears and
+  re-crosses). An already-down target produces no dampening transition, so this
+  cleanup relies on the reconcile, not transition edges; the reconcile fires
+  `SetMonitorWeight` only when the installed value actually changes, so steady
+  state is churn-free (#5271).
   When `global-threshold` is unset (0),
   the historical **independent per-target** behavior is preserved exactly: each
   unreachable target subtracts its own `weight` (or `global-weight` when the

@@ -320,6 +320,63 @@ func TestMonitor_GlobalThresholdEnabledSubThresholdClearsPerTargetDebts_5271(t *
 	}
 }
 
+// TestMonitor_GlobalWeightChangeReinstallsAggregate_5271 is the third
+// mode-switch edge: while an RG stays CROSSED (global-threshold unchanged,
+// targets still down), the operator changes global-weight. An edge-triggered
+// gate keyed only on the crossed↔cleared transition would skip re-installing
+// the debt, leaving the STALE amount deducted until the RG clears and
+// re-crosses. The per-cycle reconcile re-installs the aggregate at the CURRENT
+// global-weight, so the deduction tracks the config.
+//
+// It also pins that steady state is quiet: a no-op poll after the change emits
+// no new monitor event (the reconcile fires only on an actual change).
+//
+// Fail-on-revert: make the install loop skip when the debt name is already
+// present regardless of weight, and the global-weight change is ignored — the
+// RG stays at the stale 155 instead of 205.
+func TestMonitor_GlobalWeightChangeReinstallsAggregate_5271(t *testing.T) {
+	rg := thresholdRG(0, 100, 200, 100, "10.0.0.1", "10.0.0.2") // gw 100, threshold 200
+	cfg := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rg}}
+	m := NewManager(0, 1)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	reach := map[string]bool{"10.0.0.1": false, "10.0.0.2": false}
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	injectFakeNl(mon)
+	setNoDampening(mon)
+	mon.probeFn = reachProbeFn(reach)
+
+	// Both down → cumulative 200 >= 200 → deduct global-weight 100 → 155.
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 155 {
+		t.Fatalf("crossed weight = %d, want 155 (255 - global-weight 100)", w)
+	}
+
+	// Change global-weight 100 → 50, threshold unchanged, targets still down
+	// (still crossed). The aggregate must re-install at the new weight.
+	rg2 := thresholdRG(0, 50, 200, 100, "10.0.0.1", "10.0.0.2")
+	cfg2 := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rg2}}
+	m.UpdateConfig(cfg2)
+	mon.UpdateGroups(cfg2.RedundancyGroups)
+
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 205 {
+		t.Fatalf("after global-weight 100→50 (still crossed) weight = %d, want 205 (255-50), not stale 155", w)
+	}
+
+	// Steady state is quiet: a no-op poll (same config, same down state) must
+	// not re-fire SetMonitorWeight / RecordEvent.
+	before := len(m.EventHistoryFor(EventMonitor))
+	mon.poll()
+	if after := len(m.EventHistoryFor(EventMonitor)); after != before {
+		t.Errorf("steady-state poll emitted %d new monitor event(s); want 0 (reconcile must be idempotent/quiet)", after-before)
+	}
+	if w := m.GroupStates()[0].Weight; w != 205 {
+		t.Errorf("steady-state weight drifted to %d, want 205", w)
+	}
+}
+
 // TestMonitor_GlobalThresholdPerRGIndependence_5271 pins that one RG's
 // cumulative threshold state does not leak into another RG's decision.
 func TestMonitor_GlobalThresholdPerRGIndependence_5271(t *testing.T) {
