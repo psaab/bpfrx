@@ -48841,3 +48841,23 @@ top.
     clear → error case silently transitions, tests RED).
   - **File(s)**: cmd/cli/shared.go, cmd/cli/config_exit_retry_5812_test.go,
     cmd/cli/README.md
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5782 gate ungated SessionCount full-table walk. s.dp.SessionCount()
+    does a full v4+v6 session-map iteration holding the per-bucket BPF-map locks
+    for O(table) — the same lock-contention DoS class #5708 bounded for the
+    read-scans — reachable UNGATED via GetStatus (server_show_status.go) and
+    `show system buffers[-detail]` (showBuffers/showBuffersDetail, ShowText). Gated
+    all 3 client-reachable surfaces through the SHARED diagcmd.SessionWalkLimiter
+    (the same instance #5708/#5779 use), returning codes.ResourceExhausted on
+    contention exactly like sessions-top (ShowText propagates the handler error;
+    showBuffers/showBuffersDetail changed to return error). Left server_sessions.go:300
+    (setSessionsTotal) alone — it is only called from the already-limiter-held
+    GetSessions handler (gating again would draw a redundant second slot). Noted
+    api/health.go:119 as a same-class REST site OUTSIDE the grpcapi scope (follow-up).
+    Fail-on-revert proven via -overlay (remove the 3 gates → over-cap calls walk +
+    return normal responses, bound tests RED). Doc: limiter.go MaxConcurrentSessionWalks
+    surface list now includes GetStatus + show-buffers.
+  - **File(s)**: pkg/grpcapi/server_show_status.go, pkg/grpcapi/server_show_system.go,
+    pkg/grpcapi/server_show.go, pkg/diagcmd/limiter.go,
+    pkg/grpcapi/server_sessioncount_bound_5782_test.go
