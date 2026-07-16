@@ -49114,3 +49114,20 @@ top.
     0x8100/untagged/reject cases stay green).
   - **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/cbpf_8021ad_5088_test.go,
     pkg/vrrp/README.md
+
+- **Timestamp**: 2026-07-16 (fix/5878-canonical-unit-collision)
+  - **Action**: #5878 Phase 1 — CanonicalLogicalUnit normalizer + both-node
+    union interface-unit alias collision gate. Added CanonicalLogicalUnit to
+    schema_validators.go (ValidateLogicalUnit now delegates); rewrote
+    validateInterfaceUnitAliasCollisionsAST into a pre-expansion both-node
+    union (View 1 group union + Views 2/3 node0/node1 expansions) modeled on
+    validateTunnelEndpointIDCollisionAST; relocated its call from
+    runPreWalkGates into the pre-expansion gate block of
+    compileConfigForNodeWithOpts + compileConfigWithOpts so a peer-only
+    groups-node1/${node} alias that collides only in the STANDBY view is
+    rejected at a node0 commit. Lenient path stays warn-only (#1960). Phase 2
+    (reference-binder threading) deferred.
+  - **File(s)**: pkg/config/schema_validators.go,
+    pkg/config/compiler_interface_unit_alias.go, pkg/config/compiler.go,
+    pkg/config/compiler_prewalk.go,
+    pkg/config/interface_unit_parity_5878_test.go, docs/config-schema.md

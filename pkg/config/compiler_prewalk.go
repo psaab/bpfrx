@@ -442,24 +442,15 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
-	// #5631 (codex-review-181 M23) numeric interface-unit alias gate. Two
-	// distinct unit spellings under one interface that canonicalize to the
-	// same logical unit (`unit 00` and `unit 0`) collide on
-	// `ifc.Units[unitNum]` with last-writer-wins for the unit filter but
-	// append-only accumulation for the interface tunnel addresses — so the
-	// winning firewall filter and the surviving tunnel addresses depend on
-	// config order (a fail-open on the security filter). Runs on the group-
-	// expanded, inactive-pruned tree (apply-groups / interface-range aliases
-	// covered; `inactive:` units ignored) and AFTER expandInterfaceRanges so a
-	// range member's unit alias is seen. Strict (commit / commit-check):
-	// hard-reject naming the interface, spellings, and canonical unit. Lenient
-	// (load / peer-sync): warn so an already-persisted or peer-synced config an
-	// older binary accepted still boots (#1960).
-	unitAliasWarnings, err := validateInterfaceUnitAliasCollisionsAST(
-		tree.Children, opts.lenientInterfaceUnitAliasCollisions)
-	if err != nil {
-		return nil, err
-	}
+	// #5631 (codex-review-181 M23) numeric interface-unit alias gate MOVED to
+	// the PRE-expansion gate block of compileConfigForNodeWithOpts /
+	// compileConfigWithOpts in #5878 and PROMOTED to a both-node-effective
+	// union so a peer-only `groups node1`/`${node}` alias that collides only in
+	// the STANDBY node's effective view is rejected at either node's commit
+	// (see validateInterfaceUnitAliasCollisionsAST in
+	// compiler_interface_unit_alias.go). It no longer runs here — a
+	// post-`${node}`-expansion, node-LOCAL pre-walk could not see the peer's
+	// view.
 
 	// #5694 (codex-182 M15) chassis-cluster identity gate. compileChassis parses
 	// a `redundancy-group <name>` instance id and a per-RG `node <id>` with
@@ -505,7 +496,6 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, policyMissingMatchWarnings...)
 	warnings = append(warnings, dnatToScopeWarnings...)
 	warnings = append(warnings, natMixedScopeWarnings...)
-	warnings = append(warnings, unitAliasWarnings...)
 	warnings = append(warnings, chassisIdentityWarnings...)
 	return warnings, nil
 }
