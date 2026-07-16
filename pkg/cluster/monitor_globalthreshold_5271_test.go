@@ -139,6 +139,99 @@ func TestMonitor_GlobalThresholdUnsetIsIndependent_5271(t *testing.T) {
 	}
 }
 
+// TestMonitor_GlobalThresholdClearedOnDisable_5271 pins Finding 1: disabling
+// global-threshold on a KEPT group must release a previously installed
+// aggregate global-weight debt. UpdateConfig clears monitorWeights only for
+// REMOVED groups and UpdateGroups just swaps the slice, so without the
+// clear-on-disable path the deduction is stranded — the RG stays stuck at a
+// wrong weight that can wrongly suppress or force a failover.
+//
+// Fail-on-revert: restore the bare early-return in applyRGIPMonitorThreshold
+// and the crossed-then-disabled RG stays at 155 instead of returning to 255.
+func TestMonitor_GlobalThresholdClearedOnDisable_5271(t *testing.T) {
+	rg := thresholdRG(0, 100, 200, 100, "10.0.0.1", "10.0.0.2")
+	cfg := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rg}}
+	m := NewManager(0, 1)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	reach := map[string]bool{"10.0.0.1": true, "10.0.0.2": true}
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	injectFakeNl(mon)
+	setNoDampening(mon)
+	mon.probeFn = reachProbeFn(reach)
+
+	// Cross the threshold: both weight-100 targets fail → cumulative 200 >= 200
+	// → deduct global-weight 100.
+	reach["10.0.0.1"] = false
+	reach["10.0.0.2"] = false
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 155 {
+		t.Fatalf("crossed weight = %d, want 155 (255 - global-weight 100)", w)
+	}
+	if !mon.ipThresholdState[0] {
+		t.Fatalf("ipThresholdState[0] = false, want true after crossing")
+	}
+
+	// Live reconfigure: SAME group kept, global-threshold disabled (0), targets
+	// now healthy. UpdateConfig keeps the group and does NOT clear the stuck
+	// aggregate debt.
+	rgDisabled := thresholdRG(0, 100, 0, 100, "10.0.0.1", "10.0.0.2")
+	cfg2 := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rgDisabled}}
+	m.UpdateConfig(cfg2)
+	mon.UpdateGroups(cfg2.RedundancyGroups)
+	reach["10.0.0.1"] = true
+	reach["10.0.0.2"] = true
+
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 255 {
+		t.Fatalf("after disabling global-threshold (group kept) weight = %d, want 255 "+
+			"(stranded aggregate global-weight debt must be cleared)", w)
+	}
+	if mon.ipThresholdState[0] {
+		t.Errorf("ipThresholdState[0] = true after disable, want false")
+	}
+}
+
+// TestMonitor_GlobalThresholdClearedOnIPMonitoringRemoved_5271 is the harder
+// Finding 1 variant: ip-monitoring is removed ENTIRELY (rg.IPMonitoring == nil)
+// while the group is kept, so global-weight is no longer available to name the
+// debt. The clear path must still release it via the fixed aggregate monitor
+// name.
+func TestMonitor_GlobalThresholdClearedOnIPMonitoringRemoved_5271(t *testing.T) {
+	rg := thresholdRG(0, 100, 200, 100, "10.0.0.1", "10.0.0.2")
+	cfg := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rg}}
+	m := NewManager(0, 1)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	reach := map[string]bool{"10.0.0.1": false, "10.0.0.2": false}
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	injectFakeNl(mon)
+	setNoDampening(mon)
+	mon.probeFn = reachProbeFn(reach)
+
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 155 {
+		t.Fatalf("crossed weight = %d, want 155", w)
+	}
+
+	// Reconfigure: group kept but ip-monitoring dropped entirely.
+	rgNoIPM := &config.RedundancyGroup{ID: 0, NodePriorities: map[int]int{0: 200}}
+	cfg2 := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rgNoIPM}}
+	m.UpdateConfig(cfg2)
+	mon.UpdateGroups(cfg2.RedundancyGroups)
+
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 255 {
+		t.Fatalf("after removing ip-monitoring (group kept) weight = %d, want 255 "+
+			"(stranded aggregate debt must be cleared even when IPMonitoring is nil)", w)
+	}
+	if mon.ipThresholdState[0] {
+		t.Errorf("ipThresholdState[0] = true after ip-monitoring removal, want false")
+	}
+}
+
 // TestMonitor_GlobalThresholdPerRGIndependence_5271 pins that one RG's
 // cumulative threshold state does not leak into another RG's decision.
 func TestMonitor_GlobalThresholdPerRGIndependence_5271(t *testing.T) {

@@ -167,7 +167,13 @@ the userspace dataplane admission boundary is in
   is applied, so a single (or otherwise sub-threshold) probe loss cannot move
   services — closing the split-brain / premature-failover risk of the previous
   behavior, which deducted every failed target's weight independently and
-  ignored `global-threshold` entirely. When `global-threshold` is unset (0),
+  ignored `global-threshold` entirely. A target with no explicit `weight`
+  contributes `global-weight` to the cumulative sum (the same effective weight
+  it would subtract in independent mode). The aggregate deduction is installed
+  under a fixed per-RG monitor name so it is released when `global-threshold` is
+  disabled or `ip-monitoring` is removed on a **kept** group — a stale
+  deduction would otherwise strand the RG at a wrong weight (#5271, Finding 1).
+  When `global-threshold` is unset (0),
   the historical **independent per-target** behavior is preserved exactly: each
   unreachable target subtracts its own `weight` (or `global-weight` when the
   per-target weight is unset) immediately. The probe **validates the echo

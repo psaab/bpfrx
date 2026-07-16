@@ -353,23 +353,24 @@ func (mon *Monitor) pollCycle(ctx context.Context) {
 	ipIdx := 0
 	for _, rg := range groups {
 		statuses = mon.pollInterfaceMonitors(rg, statuses)
-		if rg.IPMonitoring == nil || len(rg.IPMonitoring.Targets) == 0 {
-			continue
-		}
-		for _, target := range rg.IPMonitoring.Targets {
-			res := ipResults[ipIdx]
-			ipIdx++
-			if !res.completed {
-				// Probe deferred or aborted this cycle (cycle deadline or
-				// Stop) — leave the dampening state untouched rather than
-				// counting an unmeasured target as a failure.
-				continue
+		if rg.IPMonitoring != nil && len(rg.IPMonitoring.Targets) > 0 {
+			for _, target := range rg.IPMonitoring.Targets {
+				res := ipResults[ipIdx]
+				ipIdx++
+				if !res.completed {
+					// Probe deferred or aborted this cycle (cycle deadline or
+					// Stop) — leave the dampening state untouched rather than
+					// counting an unmeasured target as a failure.
+					continue
+				}
+				mon.applyIPMonitorResult(rg, target, res.reachable)
 			}
-			mon.applyIPMonitorResult(rg, target, res.reachable)
 		}
-		// After every target's dampened state is updated, apply the RG's
-		// aggregate global-threshold gate (#5271). A no-op unless the RG
-		// configures ip-monitoring global-threshold > 0.
+		// Apply the RG's aggregate global-threshold gate (#5271) for EVERY RG —
+		// including one that has disabled or removed ip-monitoring while being
+		// kept — so a previously installed aggregate global-weight debt is
+		// released rather than stranded. A no-op unless the RG configures
+		// global-threshold > 0 or still carries a stuck aggregate debt.
 		mon.applyRGIPMonitorThreshold(rg)
 	}
 
@@ -595,6 +596,14 @@ func (mon *Monitor) applyIPMonitorResult(rg *config.RedundancyGroup, target *con
 		"reachable", reachable, "weight", weight)
 }
 
+// ipAggregateMonitorName is the per-RG monitor name under which the aggregate
+// global-threshold debt is installed. It is a fixed constant (not derived from
+// config) so the debt can be cleared even after ip-monitoring is reconfigured
+// or removed — when rg.IPMonitoring (and its GlobalWeight) is no longer
+// available. It is deliberately distinct from the per-target "ip:<addr>" debts
+// and from interface-monitor names so it never collides with them.
+const ipAggregateMonitorName = "ip-monitoring"
+
 // applyRGIPMonitorThreshold implements the Junos chassis-cluster ip-monitoring
 // cumulative global-threshold gate (#5271).
 //
@@ -606,13 +615,29 @@ func (mon *Monitor) applyIPMonitorResult(rg *config.RedundancyGroup, target *con
 // otherwise sub-threshold) probe loss cannot move services — the split-brain /
 // premature-failover risk the pre-#5271 per-target-independent deduction had.
 //
-// This is a no-op when the RG does not configure global-threshold; that
-// independent per-target path is handled in applyIPMonitorResult and is
-// unchanged. The aggregate debt is installed under a distinct per-RG monitor
-// name ("ip-monitoring") so it never collides with the per-target "ip:<addr>"
-// debts or with interface-monitor names.
+// When the RG does not configure global-threshold (or dropped ip-monitoring
+// entirely) the aggregate gate is inactive and the independent per-target path
+// in applyIPMonitorResult owns the election debt — EXCEPT that a previously
+// installed aggregate debt must still be cleared, or a live reconfigure from
+// threshold>0 (with the debt installed) to threshold<=0 while the group is
+// KEPT would strand the global-weight deduction forever (UpdateGroups swaps
+// mon.groups without resetting state; UpdateConfig clears monitorWeights only
+// for REMOVED groups). So the disable path releases a stuck debt rather than
+// bare-returning.
 func (mon *Monitor) applyRGIPMonitorThreshold(rg *config.RedundancyGroup) {
 	if rg.IPMonitoring == nil || rg.IPMonitoring.GlobalThreshold <= 0 {
+		// Aggregate gate inactive. Release any debt this RG still carries from
+		// a prior threshold>0 configuration (SetMonitorWeight(...,false,...)
+		// deletes the debt; the weight argument is unused on the clear path, so
+		// this is safe even when GlobalWeight is no longer available).
+		if mon.ipThresholdState[rg.ID] {
+			mon.ipThresholdState[rg.ID] = false
+			mon.mgr.SetMonitorWeight(rg.ID, ipAggregateMonitorName, false, 0)
+			mon.mgr.RecordEvent(EventMonitor, rg.ID,
+				"IP monitoring global-threshold disabled, clearing aggregate global-weight")
+			slog.Info("cluster monitor: IP monitoring aggregate threshold cleared on disable",
+				"rg", rg.ID)
+		}
 		return
 	}
 
@@ -636,8 +661,7 @@ func (mon *Monitor) applyRGIPMonitorThreshold(rg *config.RedundancyGroup) {
 	}
 	mon.ipThresholdState[rg.ID] = crossed
 
-	const aggMonName = "ip-monitoring"
-	mon.mgr.SetMonitorWeight(rg.ID, aggMonName, crossed, rg.IPMonitoring.GlobalWeight)
+	mon.mgr.SetMonitorWeight(rg.ID, ipAggregateMonitorName, crossed, rg.IPMonitoring.GlobalWeight)
 	if crossed {
 		mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
 			"IP monitoring cumulative failure weight %d reached global-threshold %d, deducting global-weight %d",
