@@ -530,6 +530,24 @@ never lock an operator out of a remote box it manages.
     in `Run`, so an early-error return (or an embedded library caller whose ctx
     cancels) that never reaches the shutdown sequence still cancels + joins both
     loops instead of leaking them.
+  - **The RG-state reconcile safety-net loop IS run-`WaitGroup`-registered so
+    `wg.Wait()` joins it BEFORE HA ownership relinquish (#5681 / M23).**
+    `reconcileRGStateLoop` (the periodic safety net that corrects `rg_active` /
+    blackhole-route drift) binds the run/signal `ctx`, so it belongs on the run
+    `WaitGroup` — not the daemonCtx cancel+join path above. `Run` launches it
+    through `startReconcileRGStateLoop(ctx, &wg)`, which does the
+    `wg.Add(1)`/`defer wg.Done()` wrap exactly like the sibling DDNS/proxy-ARP/
+    Surface-A reconcile loops. This is load-bearing: `wg.Wait()` runs BEFORE the
+    HA ownership-relinquish steps (the `rg_active` clear, RA withdraw, direct-
+    mode VIP removal, VRRP `Stop`), so a reconcile pass that was in flight (or a
+    tick that just passed the `ctx.Done()` select) COMPLETES and the loop EXITS
+    before ownership cleanup begins. As a bare `go` goroutine it was unjoined:
+    `stop()` cancelled its ctx but a late pass could re-enable forwarding /
+    re-add VIPs AFTER `wg.Wait()` returned — during ownership cleanup — and
+    re-assert mastership, opening a transient dual-master / blackhole window on
+    planned shutdown or failover. Quiescing it early removes no needed shutdown
+    behavior: the VRRP BACKUP transition during shutdown is driven by
+    `watchVRRPEvents` (deliberately on `context.Background()`), not this loop.
 - FRR reload runs with a 15 s context timeout to keep `systemctl reload
   frr` from hanging. The systemd unit has `TimeoutStopSec=20` as a safety
   net.

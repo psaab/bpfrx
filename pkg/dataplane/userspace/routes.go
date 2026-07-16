@@ -55,9 +55,27 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 		seen[key] = struct{}{}
 		out = append(out, snap)
 	}
-	addRoutes := func(table, family string, routes []*config.StaticRoute) {
+	addRoutes := func(table, family string, routes []*config.StaticRoute, perInstance bool) {
 		for _, route := range routes {
 			if route == nil {
+				continue
+			}
+			// #5830: a `next-table` authored UNDER a routing-instance is NOT
+			// programmed on the kernel/FRR forwarding plane — daemon_apply feeds
+			// only the GLOBAL routing-options statics to ApplyNextTableRules, the
+			// FRR renderer emits nothing for a NextTable route, and the kernel
+			// ip-rule leak carries no source-table scoping. Publishing it here as
+			// a live per-instance NextTable route made the userspace FIB leak
+			// traffic the kernel/FRR view never routes — a control-plane/data-
+			// plane split-brain. Skip it so both planes agree the per-instance
+			// next-table is ABSENT. The commit-time gate
+			// (validateNextTableTargetReferencesStrict, #5830) hard-rejects such a
+			// config; this companion drop keeps a tolerantly-loaded / peer-synced
+			// legacy config (its reject downgraded to a warning, #1960 no-brick)
+			// from leaking in the userspace dataplane. GLOBAL next-table
+			// (perInstance == false) IS programmed via ip rule and stays
+			// published so the Rust FIB can cross-reference the target table.
+			if perInstance && route.NextTable != "" {
 				continue
 			}
 			tableName, familyName := normalizeRouteSnapshotFamily(table, family, route.Destination)
@@ -154,8 +172,8 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 			addSnapshot(snap)
 		}
 	}
-	addRoutes("inet.0", "inet", cfg.RoutingOptions.StaticRoutes)
-	addRoutes("inet6.0", "inet6", cfg.RoutingOptions.Inet6StaticRoutes)
+	addRoutes("inet.0", "inet", cfg.RoutingOptions.StaticRoutes, false)
+	addRoutes("inet6.0", "inet6", cfg.RoutingOptions.Inet6StaticRoutes, false)
 
 	if len(cfg.RoutingInstances) > 0 {
 		insts := make([]*config.RoutingInstanceConfig, 0, len(cfg.RoutingInstances))
@@ -166,8 +184,8 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 		}
 		sort.Slice(insts, func(i, j int) bool { return insts[i].Name < insts[j].Name })
 		for _, ri := range insts {
-			addRoutes(ri.Name+".inet.0", "inet", ri.StaticRoutes)
-			addRoutes(ri.Name+".inet6.0", "inet6", ri.Inet6StaticRoutes)
+			addRoutes(ri.Name+".inet.0", "inet", ri.StaticRoutes, true)
+			addRoutes(ri.Name+".inet6.0", "inet6", ri.Inet6StaticRoutes, true)
 		}
 	}
 	for _, iface := range interfaces {

@@ -506,7 +506,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 // reconcileNowCh. Skips if cluster or dataplane is nil.
 func (d *Daemon) reconcileRGStateLoop(ctx context.Context) {
 	// Run immediately on startup to correct stale rg_active from prior run.
-	d.reconcileRGState()
+	d.reconcileRGStatePass()
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -516,11 +516,23 @@ func (d *Daemon) reconcileRGStateLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			d.reconcileRGState()
+			d.reconcileRGStatePass()
 		case <-d.reconcileNowCh:
-			d.reconcileRGState()
+			d.reconcileRGStatePass()
 		}
 	}
+}
+
+// reconcileRGStatePass runs one reconcile pass. In production it calls
+// reconcileRGState; a non-nil reconcileTickHook (test-only, #5681) substitutes
+// for it so the shutdown-ordering regression test can hold a pass in-flight and
+// prove the loop is joined before HA ownership cleanup.
+func (d *Daemon) reconcileRGStatePass() {
+	if d.reconcileTickHook != nil {
+		d.reconcileTickHook()
+		return
+	}
+	d.reconcileRGState()
 }
 
 // triggerReconcile requests an immediate RG state reconciliation pass.

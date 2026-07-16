@@ -366,6 +366,18 @@ standby can re-initiate the primary's tunnels on takeover:
   `encode/decodeIPsecSAPayload`).
 - **Hold** — the standby stores the peer's set wholesale in `peerIPsecSAs`
   (`sync_conn.go` overwrites, not merges), readable via `PeerIPsecSAs()`.
+- **Full-set ordering (#5706)** — because the set is REPLACED wholesale and both
+  fabric `receiveLoop`s run concurrently, a full-set reordered across the
+  redundant streams could overwrite a newer set with an older one. Each push now
+  carries a trailing `(incarnation, seq)` (`appendIPsecFullSetSeq`, which inserts
+  a `\n` delimiter before the trailer so an old newline-decoder never fuses the
+  trailer onto the last SA name); the receiver admits only a strictly-newer pair
+  per stream (`ipsecRecvSeq`, a `fullSetSeqGuard`), strips the delimiter
+  (`stripIPsecFullSetDelim`), and drops a stale reorder (`IPsecSAStaleIgnored`).
+  The guard is reset on a peer bulk re-prime (`resetRecvGen`) so an OS-rebooted
+  peer's fresh set (lower monotonic incarnation) is re-accepted. A legacy peer
+  sends no trailer → `(0,0)` → accept-always (mixed-version compat). See
+  `docs/sync-protocol.md` "Full-set state-sync ordering (#5706)".
 - **Re-initiate on takeover** — `reinitiateIPsecSAs` reads `PeerIPsecSAs()` and
   `InitiateConnection`s each name when this node becomes RG0-primary.
 - **Empty-set / tunnel-down handling (#4385)** — a NON-EMPTY set is advertised
@@ -433,6 +445,16 @@ mechanism (PATH C of `docs/research/2239-dhcp-ha-lease-sync/plan.md`):
   are far below it (#4892). The wire format is unchanged; the decoder
   (`getLeaseString`) is untouched — the writer just never emits an oversized
   field.
+- **Full-set ordering (#5706)** — like IPsec SA sync, each v4/v6 lease push is a
+  wholesale REPLACE, so a reorder across the two concurrent fabric `receiveLoop`s
+  could regress the held set. `QueueDHCPLeases` appends a per-family
+  `(incarnation, seq)` trailer (`appendFullSetSeq`, INDEPENDENT `dhcpV4SeqCounter`
+  / `dhcpV6SeqCounter`), and the receiver admits only a strictly-newer pair per
+  family (`dhcpV4RecvSeq` / `dhcpV6RecvSeq`), dropping a stale reorder
+  (`DHCPLeasesStaleIgnored`). An OLD receiver reads exactly its record count and
+  IGNORES the trailer (clean backward compat); a legacy sender's `(0,0)` is
+  accept-always. See `docs/sync-protocol.md` "Full-set state-sync ordering
+  (#5706)".
 - **Clock invariant** — each lease carries REMAINING LIFETIME, never an
   absolute wall-clock expiry (the channel only syncs a MONOTONIC offset). The
   promoting node re-anchors to its LOCAL clock at seed (`expire = now + remaining`),

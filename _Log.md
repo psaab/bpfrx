@@ -30,6 +30,108 @@
   no-regression / dual-stack test
   `interface_source_nat_translates_when_same_family_egress_addr_present` stays
   GREEN. Smoke deferred (loss-cluster shim-wall) — unit-covered fail-closed.
+## 2026-07-16 — #5830 (routing): per-instance next-table diverges between userspace and kernel/FRR (split-brain leak)
+- **Timestamp**: 2026-07-16 (fix/5830-per-instance-nexttable)
+- **Action**: Fix #5830. STEP-0 on origin/master 04e1527ab confirmed the
+  divergence across all three surfaces: `validateNextTableTargetReferencesStrict`
+  (`pkg/config/compiler_validate_strict_routing.go`) validated only GLOBAL
+  inet.0/inet6.0 next-table targets; `daemon_apply.go` feeds only global statics
+  to `ApplyNextTableRules` and `pkg/frr/config_render.go` renders nothing for a
+  NextTable route (kernel/FRR OMIT per-instance next-table); yet
+  `pkg/dataplane/userspace/routes.go` PUBLISHED every routing-instance's
+  next-table as a live `NextTable` snapshot in `<inst>.inet[6].0`. Result: a
+  committed per-instance next-table leaks in the userspace dataplane with no
+  kernel/FRR equivalent, and an UNDEFINED per-instance target bypassed the #5693
+  commit gate. **Direction chosen: (A) reject-consistently** — per-instance
+  next-table is NOT a supported/programmed feature (the kernel ip rule is a
+  global destination-only `to <dst> lookup <table>` with no source-table
+  scoping; true per-instance support needs iif/fwmark source-scoped rules, the
+  same substrate deferred to rib-group VRF→VRF Phase 2), so full-parity (B) is a
+  feature-add, out of scope. Fix: (1) extend
+  `validateNextTableTargetReferencesStrict` to hard-reject ANY per-instance
+  next-table at commit (defined or undefined; undefined additionally named),
+  strict on commit/commit-check, downgraded to a warning on tolerant load /
+  peer-sync via the existing `lenientNextTableRefs` flag (#1960 no-brick); (2)
+  `buildRouteSnapshots` no longer publishes a per-instance next-table
+  (`perInstance` guard in `addRoutes`) — global next-table still published (it
+  IS programmed via ip rule). Now all three surfaces agree per-instance
+  next-table is absent, the #5693 bypass is closed, and no userspace/kernel
+  forwarding divergence remains.
+- **File(s)**: pkg/config/compiler_validate_strict_routing.go,
+  pkg/dataplane/userspace/routes.go,
+  pkg/config/compiler_routing_nexttable_perinstance_5830_test.go (new),
+  pkg/dataplane/userspace/routes_perinstance_nexttable_5830_test.go (new),
+  pkg/dataplane/userspace/manager_routes_test.go (payload updated to a next-hop —
+  the old vehicle was a now-dropped per-instance next-table),
+  docs/rib-group-route-leaking.md, _Log.md
+- **Validation**: `go build ./...` clean; `go test -race ./pkg/config`
+  (153s, PASS), `./pkg/routing` (PASS), `./pkg/dataplane/userspace` (28.5s,
+  PASS); `go vet` clean. FAIL-ON-REVERT proven both directions: gating the
+  userspace `perInstance` skip → `TestBuildRouteSnapshotsDropsPerInstanceNextTable_5830`
+  RED (per-instance NextTable snapshot reappears); neutering the validator's
+  per-instance loop → all 4 `TestPerInstanceNextTableRejected_5830` subtests RED.
+  Pre-existing (unrelated) failure noted: `pkg/dataplane`
+  `TestUserspaceManagerDoesNotImportReflectOrUnsafe` flags `manager_overlay.go`
+  importing `reflect` — that file is byte-identical to origin/master and
+  untouched by this change.
+## 2026-07-16 — #5706 (cluster): IPsec/DHCP full-set state can regress across redundant receive streams (M32)
+- **Timestamp**: 2026-07-16 (fix/5706-ha-fullset-sequence)
+- **Action**: Fix #5706 (codex-review-182 M32). STEP-0 confirmed live on
+  origin/master f15869f89: IPsec SA sync (`QueueIPsecSA` → `syncMsgIPsecSA`,
+  received in `sync_conn.go handleMessage`) and DHCP-server lease sync
+  (`QueueDHCPLeases` → `syncMsgDHCPLeaseV4/V6`, `storePeerDHCPLeases`) are
+  FULL-SET pushes that REPLACE the peer's held set wholesale, and BOTH fabric
+  connections (`conn0`/`conn1`) run their own `receiveLoop` goroutine — so a
+  full-set delivered out of order across the redundant streams could overwrite a
+  newer set with an older one (a state regression: resurrected tunnel / revived
+  lease). Unlike sessions (#2170) and config (#3931), these carried NO sequence.
+  Fix (mirrors the #3931 config-gen precedent): each full-set now carries a
+  trailing `(incarnation, seq)` framing (`appendFullSetSeq`/`stripFullSetSeq`,
+  new `fullSetSeqMagic`, 24 trailing bytes). incarnation = the process
+  construction seed (`syncEpoch`, CLOCK_MONOTONIC nanos, constant per boot; a
+  process restart draws a strictly-greater epoch → supersedes). seq = a
+  per-type strictly-monotonic counter — IPsec / DHCP-v4 / DHCP-v6 draw from
+  INDEPENDENT counters (`ipsecSeqCounter`/`dhcpV4SeqCounter`/`dhcpV6SeqCounter`),
+  so a v4 push never gates a v6 one and an IPsec seq never gates a DHCP one. The
+  receiver keeps a `fullSetSeqGuard` high-water per stream
+  (`ipsecRecvSeq`/`dhcpV4RecvSeq`/`dhcpV6RecvSeq`, guarded by `recvSeqMu` because
+  both receiveLoops touch them) and admits only a strictly-newer pair
+  (lexicographic on (incarnation, seq) — higher incarnation always supersedes);
+  a stale reorder is DROPPED and counted (`IPsecSAStaleIgnored` /
+  `DHCPLeasesStaleIgnored`), held set untouched. BOTH SIDES updated: SENDER
+  stamps, RECEIVER compares. Cross-boot: an OS-rebooted peer restarts its
+  monotonic epoch LOWER, so the guards are `reset()` on a peer bulk re-prime
+  (`resetRecvGen`, fired on the reconnect BulkStart) — the rebooted peer's fresh
+  re-advertised set is then admitted (the #2198 F2 stale-RETAIN inverse). BACKWARD
+  COMPAT (mixed-version ISSU): the trailer is additive and self-detecting via the
+  magic, so NO `SessionSyncWireVersion` bump (the #2239/#3931 lesson — bumping
+  would refuse SESSION sync across a mixed-base pair). A legacy peer sends no
+  trailer → `stripFullSetSeq` yields `(0,0)` → guard accept-always (never wrongly
+  refused). New→old: the DHCP lease decoder reads its record count and IGNORES
+  the trailing bytes (fully clean); the IPsec newline decoder would keep the
+  trailer as bogus connection name(s) — fail-safe (takeover `reinitiateIPsecSAs`
+  merely warns on a name it cannot initiate; the REAL names decode ahead of the
+  trailer), only in the brief mixed window. Fail-on-revert PROVEN: neutralizing
+  `fullSetSeqGuard.admit` to always-true flips 4 tests RED —
+  TestIPsecSAOutOfOrderRejected (reordered seq=1 overwrites the seq=2 held set →
+  got [stale-vpn]), TestDHCPLeaseOutOfOrderRejected (reordered empty v4 set
+  regresses the held 2-lease set → 0), TestFullSetSeqReconnectResetReadmits, and
+  TestFullSetSeqGuardAdmit; restored → GREEN. Also covers per-type/per-family
+  independence, legacy-peer accept-always (compat), and the SENDER stamping via a
+  captureConn (both-sides). Validation: GOCACHE/GOTMPDIR go build ./... clean; go
+  vet ./pkg/cluster clean; go test -race ./pkg/cluster ./pkg/ipsec ./pkg/dhcp all
+  GREEN (cluster 10.1s). Unit-proven; test-failover shim-wall-blocked =
+  no-regression (the reorder scenario is unit-covered).
+- **File(s)**: pkg/cluster/sync_protocol.go (appendFullSetSeq/stripFullSetSeq +
+  fullSetSeqMagic wire codec), pkg/cluster/sync_conn.go (fullSetSeqGuard type +
+  admit/reset; strip+guard in the syncMsgIPsecSA/DHCPLeaseV4/V6 handlers;
+  resetRecvGen resets the guards), pkg/cluster/sync.go (syncEpoch +
+  per-type seq counters + recvSeqMu/guards struct fields; initGenState seeds
+  syncEpoch; QueueIPsecSA/QueueDHCPLeases stamp the trailer; IPsecSAStaleIgnored
+  /DHCPLeasesStaleIgnored stats + snapshot), pkg/cluster/fullset_seq_test.go
+  (new — fail-on-revert + codec/guard/compat/both-sides coverage),
+  docs/sync-protocol.md (full-set ordering section + message-type/handler/stats
+  tables), pkg/cluster/README.md (IPsec + DHCP full-set ordering notes)
 
 ## 2026-07-16 — #5566 (daemon): stale kernel host-inbound authorization after a coarse tightening (security fail-open)
 - **Timestamp**: 2026-07-16 (fix/5566-hostinbound-conntrack-flush)
@@ -49643,3 +49745,8 @@ top.
 - **Timestamp**: 2026-07-16
 - **Action**: Fix #5690 (codex-review-182 M07, Medium NAT correctness). STEP-0 confirmed live on origin/master 2d8eac093: the generic embedded-ICMP NAT reversal (`try_embedded_icmp_nat_match` → `build_nat_reversed_icmp_error_v4/v6`, which reverse-translates the inner quoted packet of an ICMP error so an error for a NAT'd flow reaches the real internal host) was wired ONLY into the FLOW-BACKED session-miss arm of `poll_binding_process_descriptor` (`if let Some(flow)`, old line ~2486, inside `if is_embedded_icmp_error`). But a non-query ICMP error is FLOWLESS by construction: `frame/inspect.rs::parse_session_flow_from_bytes` (#3290) discards the metadata pseudo-port for every non-query ICMP type (query/error are disjoint via `icmp_identifier_bearing`), so `parse_session_flow` returns `None` and the packet takes the flowless `else` arm — it NEVER enters the flow-backed arm. So `is_embedded_icmp_error` is structurally ALWAYS false where the reversal lived → the reversal was DEAD in production; the helper unit tests exercised `try_embedded_icmp_nat_match_from_frame` directly and bypassed the dead poll control flow (tested-but-not-live). WHY the suppression exists (must preserve): the XDP shim stamps `bytes[l4+4..l4+6]` as `flow_src_port` for every ICMP type with NO query gate; #3290 discards it for non-query ICMP so the ungated control word can't seed a bogus identifier-keyed session (session-table pollution / spurious collisions). That flowless routing is CORRECT and is NOT what the fix touches. Fix (control-flow reachability, no tuple/map-key/wire change): extracted the reversal into `poll_descriptor/embedded_icmp.rs::try_reverse_embedded_icmp_error` (flow-independent) and call it FIRST in the flowless `else` arm (before the #3291 L3 enforcement) when `allow_embedded_icmp && ICMP && inner-type is an error` (same #5140-safe inner-type classification via `packet_frame` at inner-relative `meta.l4_offset`). A match reverse-translates + queues the error as a `Prebuilt` forward toward the client and consumes the descriptor (`continue`); a miss / no-source-rewrite / unbuildable frame / CoS-drop falls through (or fail-closed recycles) to normal flowless enforcement. The pending forward carries `flow_key: None` so the non-query error NEVER becomes a session/flow-cache authority — the #3290 no-fake-session invariant is preserved, not bypassed (CoS also classifies with `flow_key = None`: a synthesized L3 reply carries no trustworthy 5-tuple, so port-bearing output/CoS terms fail closed). Removed the now-dead flow-backed reversal block + its `is_embedded_icmp_error` compute and the `!is_embedded_icmp_error` local-delivery-caching guard (both structurally always-false in that arm → behavior-preserving; the reversal logic is de-duplicated into the one helper). Fail-on-revert PROVEN through the REAL control flow: new descriptor-level test `poll_descriptor_embedded_icmp_reversal_reachable_on_flowless_path_5690` drives an inbound NAT44 SNAT ICMP Time-Exceeded (addressed to the firewall SNAT addr, quoting the post-SNAT tuple) through `poll_binding_process_descriptor` and asserts exactly one queued `Prebuilt` reversed forward with outer-dst + inner-src + inner-src-port restored to the pre-NAT client, `flow_key = None`, egress toward the client (ifindex 24), no new session, no recycle; disabling the flowless helper call (`if false && is_embedded_icmp_error`) → `scratch_forwards` empty → RED. Existing helper tests stay green. Smoke deferred (an ICMP-error-for-a-NAT'd-flow is impractical to stage on the shim-wall cluster; unit-through-real-path is the validation). Validation: `cargo build --release` clean; full `cargo test --release` = 3942 passed / 0 failed (the transient fairness-eval failures were a non-existent `TMPDIR=/tmp/ct5690` env artifact — `fs::File::create` in a temp-file test; re-ran with the dir present → 60/60 green).
 - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/embedded_icmp.rs (new — `try_reverse_embedded_icmp_error` + `EmbeddedIcmpReversal`), userspace-dp/src/afxdp/poll_descriptor/mod.rs (edit — module wire-up; flowless-arm reversal call; removed dead flow-backed reversal block + `is_embedded_icmp_error` compute + caching guard), userspace-dp/src/afxdp/tests_embedded_poll_filter.rs (edit — descriptor-level fail-on-revert test), userspace-dp/src/afxdp/README.md (edit — #5690 flowless-arm reversal bullet), userspace-dp/src/afxdp/frame/README.md (edit — corrected the stale "embedded-inner matching out of scope" note)
+
+## 2026-07-16 — #5681 join reconcile safety-net loop before HA ownership cleanup (M23)
+- **Timestamp**: 2026-07-16
+- **Action**: Fix #5681 (codex-review-182 M23, High HA correctness). STEP-0 confirmed live on origin/master 5da2b7bb6: pkg/daemon/daemon_run.go Run() spawned `go d.reconcileRGStateLoop(ctx)` as a BARE goroutine (was line ~692), unlike the sibling DDNS/proxy-ARP/Surface-A reconcile loops immediately above it which use the `wg.Add(1); go func(){ defer wg.Done(); ... }()` idiom on the run WaitGroup. So `wg.Wait()` in runShutdownSequence (line 990) did NOT join it. `stop()` cancels its ctx, but with no join a tick already past the `case <-ctx.Done(): return` select (or blocked mid-pass in reconcileRGState on a control-socket SetRGActive) can COMPLETE after wg.Wait() — during the LATER HA ownership-relinquish phase (rg_active clear line 1073+, RA withdraw 1093, direct-mode VIP removal 1101, VRRP Stop 1108) — and re-enable forwarding / re-add VIPs → transient dual-master / blackhole window on planned shutdown or failover. VERIFIED the ordering invariant holds: every ownership-relinquish step in runShutdownSequence runs strictly AFTER wg.Wait() (line 990), so registering the loop on the run WaitGroup is sufficient — no explicit cancel+join-before-teardown seam (the #5308 stopPolicyScheduler/stopPinRetry pattern) is needed, because the reconcile loop binds the run/signal ctx (cancelled by stop()), NOT the never-cancelled d.daemonCtx. VERIFIED quiescing it early removes no needed shutdown behavior: the VRRP BACKUP transition during shutdown is driven by watchVRRPEvents (daemon_run.go:687, deliberately on context.Background() so it outlives ctx cancel), NOT this safety-net loop. Fix (minimal, sibling idiom): extracted the spawn into `startReconcileRGStateLoop(ctx, *wg)` (matches the codebase's startHTTPServer/startGRPCServer/stopPinRetryLoop lifecycle-helper convention) doing the wg.Add(1)/defer wg.Done() wrap; Run() now calls it under the existing `if d.cluster != nil` guard. CAVEAT noted in PR: a reconcile pass's SetRGActive uses context.Background() (deliberate — the map update must complete), so an in-flight pass at cancel time delays the join by that pass's duration; bounded in the normal case (local BPF map update + unix-socket control send under m.mu, the same primitive the already-wg-registered sibling loops use) and backstopped by the systemd unit TimeoutStopSec=20. Fail-on-revert PROVEN: new pkg/daemon/ha_shutdown_reconcile_join_5681_test.go holds ONE reconcile pass in-flight via an injectable reconcileTickHook (test-only Daemon field routed through reconcileRGStatePass), spawns via the production startReconcileRGStateLoop seam, cancels ctx, then asserts wg.Wait() does NOT return while the pass is in flight (a 300ms window) and DOES return after the pass completes; reverting startReconcileRGStateLoop to bare `go` (drop wg.Add/wg.Done) → RED ("wg.Wait() returned while a reconcile pass was still in flight — reconcile loop not joined before HA ownership cleanup (#5681/M23 regression)"); restored → GREEN. Validation: GOCACHE=/tmp/gc5681 GOTMPDIR=/tmp/g5681 go build ./... clean; go vet ./pkg/daemon clean; full pkg/daemon suite -race GREEN (23.9s). Go-only, no cargo/Rust. test-failover smoke blocked by the loss-cluster shim-ABI wall — gated on the fail-on-revert ordering unit test; parent to record the smoke deferral.
+- **File(s)**: pkg/daemon/daemon_run.go (edit — startReconcileRGStateLoop helper; Run() call site), pkg/daemon/daemon_ha.go (edit — reconcileRGStatePass wrapper; loop routes 3 pass sites through it), pkg/daemon/daemon.go (edit — reconcileTickHook test-seam field), pkg/daemon/ha_shutdown_reconcile_join_5681_test.go (new — fail-on-revert ordering test), pkg/daemon/README.md (edit — shutdown-ordering contract: reconcile loop is run-WaitGroup-registered, joined before HA ownership relinquish)
