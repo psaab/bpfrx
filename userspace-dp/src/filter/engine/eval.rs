@@ -174,7 +174,10 @@ fn merge_matched_modifiers(acc: &mut FilterResult, filter: &Filter, term: &Filte
         acc.routing_instance = term.routing_instance.clone();
     }
     if !term.forwarding_class.is_empty() {
-        acc.forwarding_class = term.forwarding_class.clone();
+        // #5151: clone the Arc only when a term ACTUALLY sets a forwarding-class
+        // (the allocation happens on a match, not on every default). `None` on
+        // the default preserves the old empty-`""` "no forwarding-class" meaning.
+        acc.forwarding_class = Some(term.forwarding_class.clone());
     }
     if term.log {
         acc.log = true;

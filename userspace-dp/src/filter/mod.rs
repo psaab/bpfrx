@@ -838,7 +838,11 @@ pub(crate) struct FilterResult {
     pub(crate) dscp_rewrite: Option<u8>,
     pub(crate) policer_name: String,
     pub(crate) routing_instance: String,
-    pub(crate) forwarding_class: Arc<str>,
+    // #5151: `None` == no forwarding-class matched (semantically identical to
+    // the historical empty `""`). Mirrors TxSelection/CachedTxSelection which
+    // already use `Option<Arc<str>>` — the accumulator init no longer allocates
+    // an empty Arc header/data block on every full filter eval (packet path).
+    pub(crate) forwarding_class: Option<Arc<str>>,
     pub(crate) log: bool,
     pub(crate) log_match: Option<FilterLogMatch>,
 }
@@ -902,7 +906,10 @@ impl Default for FilterResult {
             dscp_rewrite: None,
             policer_name: String::new(),
             routing_instance: String::new(),
-            forwarding_class: Arc::<str>::from(""),
+            // #5151: zero-alloc default — no Arc header/data block allocated on
+            // the warmed packet path. A matching `then forwarding-class` term
+            // sets `Some(..)` in `merge_matched_modifiers`.
+            forwarding_class: None,
             log: false,
             log_match: None,
         }
