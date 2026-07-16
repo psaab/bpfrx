@@ -460,10 +460,14 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		s.showRootAuthentication(cfg, &buf)
 
 	case "buffers":
-		s.showBuffers(cfg, &buf)
+		if err := s.showBuffers(cfg, &buf); err != nil {
+			return nil, err
+		}
 
 	case "buffers-detail":
-		s.showBuffersDetail(cfg, &buf)
+		if err := s.showBuffersDetail(cfg, &buf); err != nil {
+			return nil, err
+		}
 
 	case "wireguard":
 		// #1865: WG tunnel telemetry (summary).
