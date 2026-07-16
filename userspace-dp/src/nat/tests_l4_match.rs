@@ -48,7 +48,7 @@ fn source_nat_match_destination_port_constrains_flow_3429() {
         "wan",
         src,
         dst,
-        PROTO_TCP,
+        Some(PROTO_TCP),
         12345,
         20001,
         egress_v4,
@@ -71,7 +71,7 @@ fn source_nat_match_destination_port_constrains_flow_3429() {
         "wan",
         src,
         dst,
-        PROTO_TCP,
+        Some(PROTO_TCP),
         12345,
         80,
         egress_v4,
@@ -114,7 +114,7 @@ fn source_nat_match_destination_port_constrains_off_exemption_3429() {
         "wan",
         src,
         dst,
-        PROTO_UDP,
+        Some(PROTO_UDP),
         40000,
         53,
         egress_v4,
@@ -137,7 +137,7 @@ fn source_nat_match_destination_port_constrains_off_exemption_3429() {
         "wan",
         src,
         dst,
-        PROTO_UDP,
+        Some(PROTO_UDP),
         40000,
         443,
         egress_v4,
@@ -185,7 +185,7 @@ fn source_nat_match_application_constrains_protocol_and_port_3429() {
             "wan",
             src,
             dst,
-            proto,
+            Some(proto),
             12345,
             dport,
             egress_v4,
@@ -253,7 +253,7 @@ fn source_nat_match_application_constrains_source_port_3491() {
             "wan",
             src,
             dst,
-            PROTO_TCP,
+            Some(PROTO_TCP),
             sport,
             dport,
             egress_v4,
@@ -305,7 +305,7 @@ fn source_nat_app_source_port_never_match_sentinel_3491() {
         "wan",
         "10.0.1.100".parse().unwrap(),
         "8.8.8.8".parse().unwrap(),
-        PROTO_TCP,
+        Some(PROTO_TCP),
         12345,
         443,
         egress_v4,
@@ -325,7 +325,7 @@ fn source_nat_app_source_port_never_match_sentinel_3491() {
 #[test]
 fn source_nat_unconstrained_rule_still_matches_any_l4_3429() {
     // A rule with NO L4 match fields keeps the pre-#3429 match-any behavior,
-    // including for the address-only (proto=0) tuple-unknown caller.
+    // including for the address-only (`None`) tuple-unknown caller.
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
         name: "snat".to_string(),
         from_zone: "lan".to_string(),
@@ -353,7 +353,7 @@ fn source_nat_unconstrained_rule_still_matches_any_l4_3429() {
 
 #[test]
 fn source_nat_l4_constrained_rule_fails_closed_on_unknown_tuple_3429() {
-    // The address-only (proto=0) caller cannot supply a port/protocol, so an
+    // The address-only (`None`) caller cannot supply a port/protocol, so an
     // L4-constrained rule fails closed (does not fire) rather than over-match.
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
         name: "snat".to_string(),
@@ -414,7 +414,7 @@ fn source_nat_never_match_port_sentinel_matches_nothing_3429() {
             "wan",
             src,
             dst,
-            PROTO_TCP,
+            Some(PROTO_TCP),
             12345,
             dport,
             egress_v4,
@@ -453,7 +453,7 @@ fn source_nat_app_protocol_never_vs_any_3429() {
             "wan",
             src,
             dst,
-            proto,
+            Some(proto),
             12345,
             443,
             egress_v4,
