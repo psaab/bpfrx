@@ -494,9 +494,23 @@ func junosHostBuildRule(family string, t junosHostTerm, permit []string, permitA
 	}
 	rule := JunosHostDenyRule{Family: family, L4: l4}
 	if t.srcExcluded {
-		// `source-address-excluded`: match every source NOT in the set. A family
-		// with no prefix in the excluded set therefore matches ALL of that family
-		// (mirrors matchAddr's "constrained, no F-prefix, except -> match ALL").
+		if srcAny {
+			// `any` (a family wildcard) + `source-address-excluded` is "every
+			// source EXCEPT every source" = the empty set: the term matches
+			// NOTHING for this family and MUST project no rule (#5828). This is
+			// keyed on the family-scoped srcAny, so `any` suppresses BOTH families
+			// while `any-ipv4`/`any-ipv6` suppress only their own. Falling through
+			// to the len(src)==0 => SrcAny arm below would invert this degenerate
+			// case into an unconditional all-source DROP — an over-deny that can
+			// lock out every direct host-bound flow on the ingress zone.
+			return JunosHostDenyRule{}, false
+		}
+		// A genuinely constrained excluded set: match every source NOT in the
+		// set. A family with no prefix in the excluded set therefore matches ALL
+		// of that family (mirrors matchAddr's "constrained, no F-prefix, except
+		// -> match ALL"). This is the intended match-all-of-opposite-family
+		// semantic — e.g. `source-address 10.0.0.0/8 + excluded` drops every IPv6
+		// source (no v6 prefix in the set) and every non-10/8 IPv4 source.
 		rule.SrcExcluded = len(src) > 0
 		rule.SrcAny = len(src) == 0
 		rule.Src = append([]string(nil), src...)
