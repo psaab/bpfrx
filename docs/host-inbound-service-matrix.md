@@ -353,9 +353,45 @@ snapshot produces a zero-drop table shell:
   the fence and left newly reachable addresses fail-open). A teardown **failure**
   (a table the delete could not remove may still be installed) does **not** clear
   it. True still proves neither current table presence nor coverage of current
-  addresses: program-only/new-address coverage remains #5789. All Stores are
-  serialized under `applySem`; nft completion and the following Go Store are
-  ordered but not one atomic publication.
+  addresses — the DAY-2 COVERAGE gap is tracked separately (#5789, below). All
+  Stores are serialized under `applySem`; nft completion and the following Go
+  Store are ordered but not one atomic publication.
+- `d.hostInboundCoveredAddrs` (a `Daemon` set, keyed `"<fam>|<addr>"`) is the
+  #5789 COVERAGE discriminator that the sticky boolean alone cannot provide.
+  `hostInboundEnforced=true` proves only that SOME protecting table loaded at SOME
+  earlier generation, NOT that the RETAINED (atomic-untouched) generation covers
+  the CURRENT desired destination set. Two fail-open paths otherwise remain: (1) a
+  previously-addressed zone gains another static/DHCP/SLAAC address and the next
+  real render fails — atomic nft retention keeps the OLD generation, which has no
+  deny for the new address; (2) a successful addressless program-only install
+  stores `enforced=true` with ZERO covered addresses, and an address later appears
+  before a failed rerender. `hostInboundCoveredAddrs` records the destination set
+  the currently-retained enforcement (last successful real load OR address-scoped
+  cold-boot fence) drops. On a failed rerender while `enforced=true`, the desired
+  drop set is diffed against it (`hostInboundUncoveredDropAddrs`); any UNCOVERED
+  destination gets an ADDITIVE gap fence (below). It is set to the desired set on a
+  successful real load / address-scoped fence, left UNCHANGED on any failure
+  (atomic retention keeps the old generation, so its coverage claim stands), and
+  CLEARED on a successful teardown (#5790 — no table covers nothing). `applySem`
+  serialized, like the `hostInboundFailOpen` maps.
+- `installHostInboundGapFence` / `buildHostInboundGapFencePayload` (#5789) build
+  the ADDITIVE gap fence: a SEPARATE `inet xpf_hostinbound_gap` base chain at
+  `nftHostInboundGapPriority` (11) — STRICTLY AFTER the main `xpf_hostinbound`
+  table (10), which is strictly after `xpf_lo0` (0); the three distinct
+  strictly-increasing hook-input priorities are pinned by
+  `nft_chain_priority_test.go`. It denies ONLY the uncovered addresses (with the
+  SAME mandatory L3 / return admits as the cold-boot fence, via the shared
+  `hostInboundFenceMandatoryAdmits`) and, unlike the whole-table cold-boot fence,
+  does NOT replace `xpf_hostinbound` — so the retained generation's per-service
+  ACCEPTS for already-covered addresses stay intact (the issue's "do not weaken
+  retained valid rules"). A newly-appeared uncovered address falls through the main
+  chain's `policy accept` (a `drop` is terminal, an `accept` is not, so an already
+  service-accepted or catch-all-dropped covered address keeps its main-table
+  verdict) and is dropped by the gap. The uncovered lists derive from the same
+  lifeline-subtracted views/unzoned sets, so the gap never fences management /
+  cluster-control traffic. A gap install failure JOINS the commit error
+  (fail-closed); the gap is torn down by the next successful real install (best
+  effort — a lingering gap fences only, never opens) and on a successful teardown.
 - `installHostInboundColdBootFence` / `buildHostInboundFencePayload`
   (`daemon_nft.go`) build the fence: the same atomic-replace `xpf_hostinbound`
   table reduced to the global mandatory admits (`ct established,related`, raw
@@ -393,9 +429,13 @@ load while state is false then renders another fallback from that invocation's
 snapshot. This is scoped to the **direct-host nft input authority** only; the
 AF_XDP transit arm / attach readiness is owned separately by #5275.
 Fail-on-revert proofs:
-`pkg/daemon/host_inbound_coldboot_fence_5644_test.go` and, for the
+`pkg/daemon/host_inbound_coldboot_fence_5644_test.go`; for the
 teardown-clears-the-gate ordering (#5790),
-`pkg/daemon/host_inbound_teardown_enforced_5790_test.go`.
+`pkg/daemon/host_inbound_teardown_enforced_5790_test.go`; and for the day-2
+coverage gap + additive gap fence (#5789),
+`pkg/daemon/host_inbound_coverage_gap_5789_test.go` (both the address-added and
+the program-only-then-address paths) plus the three-chain priority invariant in
+`pkg/daemon/nft_chain_priority_test.go`.
 
 ### Per-interface / per-family refinement (#3710)
 

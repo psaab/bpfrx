@@ -44,12 +44,14 @@ func TestHostInboundTeardownClearsEnforcedThenFailedReinstallFences_5790(t *test
 	}
 
 	// --- Step 2: non-enforceable config -> table teardown succeeds -> flag FALSE. ---
-	var deleteCalls int
+	// The teardown deletes BOTH the main and the additive gap table (#5789), so
+	// accept either target and record which were removed.
+	deleted := map[string]bool{}
 	nftDeleteTable = func(family, name string) ([]byte, error) {
-		deleteCalls++
-		if family != "inet" || name != "xpf_hostinbound" {
+		if family != "inet" || (name != "xpf_hostinbound" && name != "xpf_hostinbound_gap") {
 			t.Fatalf("step 2: unexpected delete target %q %q", family, name)
 		}
+		deleted[name] = true
 		return nil, nil // teardown succeeds
 	}
 	nftApplyPayload = func(payload string) ([]byte, error) {
@@ -59,8 +61,8 @@ func TestHostInboundTeardownClearsEnforcedThenFailedReinstallFences_5790(t *test
 	if err := d.applyHostInboundFilter(&config.Config{}); err != nil {
 		t.Fatalf("step 2 (teardown) apply: %v", err)
 	}
-	if deleteCalls != 1 {
-		t.Fatalf("step 2: expected exactly one nftDeleteTable call, got %d", deleteCalls)
+	if !deleted["xpf_hostinbound"] {
+		t.Fatalf("step 2: teardown must delete the main xpf_hostinbound table, deleted=%v", deleted)
 	}
 	if d.hostInboundEnforced.Load() {
 		t.Fatal("step 2 (THE #5790 BUG): a successful teardown must CLEAR hostInboundEnforced; " +
