@@ -70,12 +70,15 @@ func TestReconcileBackendChangeWithdrawsOldPublishesNew_5814(t *testing.T) {
 	}
 
 	// Pass 2 — SAME desired tuple, backend B (fingerprint "fpB"); the previous
-	// live backend (A) is retained as the per-family withdraw anchor.
+	// live backend (A) is retained as the per-family withdraw anchor, tagged with
+	// its own fingerprint "fpA" so the identity gate proves it published the
+	// owned record before withdrawing through it (#5814 review).
 	driveReconcile(t, m, &reconcileEnv{
 		pol:         [2]ddnsPolicy{pol, pol},
 		updater:     [2]DNSUpdater{updB, updB},
 		backendFP:   [2]string{"fpB", "fpB"},
 		prevUpdater: [2]DNSUpdater{updA, updA},
+		prevFP:      [2]string{"fpA", "fpA"},
 	}, []Lease{lease})
 
 	// (a) the NEW endpoint B received the publish.
@@ -129,12 +132,15 @@ func TestReconcileBackendChangeIsPerFamily_5814(t *testing.T) {
 		t.Fatalf("pass 1: v6 publish = %v, want 1", got)
 	}
 
-	// Pass 2 — ONLY the v4 backend changes (A4 -> B4); v6 stays on C6.
+	// Pass 2 — ONLY the v4 backend changes (A4 -> B4); v6 stays on C6. Each
+	// family's retained anchor carries its own fingerprint so the identity gate
+	// admits the v4 withdraw through A4 (fpA4 matches) and never disturbs v6.
 	driveReconcile(t, m, &reconcileEnv{
 		pol:         [2]ddnsPolicy{pol, pol},
 		updater:     [2]DNSUpdater{updB4, updC6},
 		backendFP:   [2]string{"fpB4", "fpC6"},
 		prevUpdater: [2]DNSUpdater{updA4, updC6},
+		prevFP:      [2]string{"fpA4", "fpC6"},
 	}, []Lease{l4, l6})
 
 	// v4 transitioned: withdraw on A4, publish on B4.
@@ -264,6 +270,110 @@ func TestReconcileScopedBackendChangeEndToEnd_5814(t *testing.T) {
 	}
 	if len(updB.upsertNames()) != beforeUp || len(updB.deleteNames()) != beforeDel {
 		t.Errorf("cycle 3: steady state on serverB was not settled (extra wire ops)")
+	}
+}
+
+// TestReconcileScopedBackendChangeAfterRestartOrphans_5814 is the post-restart
+// fail-on-revert guard (the #5814 review defect). After a daemon restart the
+// per-family anchor is lost, so the FIRST post-restart cycle correctly orphans.
+// But the anchor then re-seeds to the NEW endpoint, so a SECOND post-restart
+// cycle finds a non-nil anchor pointing at the WRONG server. Without the
+// prevFP==owned-fingerprint identity gate it would misroute the withdraw of the
+// OLD-endpoint record through the new server — orphaning the old server's record
+// and dropping ownership while OrphanedBackendChange froze at 1. The gate must
+// keep BOTH post-restart cycles on the orphan path: no delete to the new server,
+// ownership retained with the OLD fingerprint, and the alarm incrementing every
+// cycle. Reverting the gate (using prev whenever it is merely non-nil) misroutes
+// the cycle-2 delete to serverB, flipping the updB.del==empty assertion RED.
+func TestReconcileScopedBackendChangeAfterRestartOrphans_5814(t *testing.T) {
+	updA := newFakeUpdater()
+	updB := newFakeUpdater()
+	dir := t.TempDir()
+	src := &fakeLeaseSource{}
+	m := newManagerForTesting(
+		src.parser(),
+		nopUpdater{},
+		filepath.Join(dir, "state.json"),
+		filepath.Join(dir, "leases4.csv"),
+		filepath.Join(dir, "leases6.csv"),
+		"node0",
+		func() time.Time { return time.Unix(1_700_000_000, 0) },
+	)
+	m.newUpdater = func(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig) (DNSUpdater, error) {
+		if pol.backend != "rfc2136" || c == nil || c.UpdateServer == "" {
+			return nopUpdater{}, nil
+		}
+		switch c.UpdateServer {
+		case "serverA":
+			return updA, nil
+		case "serverB":
+			return updB, nil
+		}
+		return nopUpdater{}, nil
+	}
+	src.v4 = laptopMacLease()
+
+	// Cycle 0 — publish on serverA (ownership stored with serverA's fingerprint).
+	if err := m.Reconcile(context.Background(), ddnsCfg("serverA")); err != nil {
+		t.Fatalf("cycle 0 reconcile: %v", err)
+	}
+	if len(updA.upsertNames()) == 0 {
+		t.Fatalf("cycle 0: nothing published on serverA")
+	}
+	fpA := backendFPOf(t, m, "10.0.1.5")
+	if fpA == "" {
+		t.Fatalf("cycle 0: owned record has no fingerprint")
+	}
+
+	// Simulate a daemon RESTART: the in-process per-family anchor AND its
+	// fingerprint are lost (a fresh Manager zeroes them), but the ownership store
+	// persists the serverA fingerprint.
+	m.mu.Lock()
+	m.lastLiveUpdater = [2]DNSUpdater{}
+	m.lastLiveFP = [2]string{}
+	m.mu.Unlock()
+
+	// Post-restart cycle 1 (resolve serverB): the old endpoint is unreachable
+	// (anchor nil) → orphan + alarm=1. Nothing sent to serverB.
+	if err := m.Reconcile(context.Background(), ddnsCfg("serverB")); err != nil {
+		t.Fatalf("post-restart cycle 1 reconcile: %v", err)
+	}
+	if n := m.Stats().OrphanedBackendChange; n != 1 {
+		t.Errorf("post-restart cycle 1: alarm = %d, want 1", n)
+	}
+	if got := updB.deleteNames(); len(got) != 0 {
+		t.Errorf("post-restart cycle 1: misrouted delete to serverB: %v", got)
+	}
+	if got := updB.upsertNames(); len(got) != 0 {
+		t.Errorf("post-restart cycle 1: republish on serverB clobbering the old cleanup key: %v", got)
+	}
+
+	// Post-restart cycle 2 (resolve serverB again): the anchor is now RE-SEEDED to
+	// serverB, but the owned record's fingerprint is still serverA's. The identity
+	// gate must STILL treat the old endpoint as unreachable — the smoking gun the
+	// reviewer reproduced. No delete may reach serverB; ownership stays retained
+	// with the serverA fingerprint; the alarm increments (never freezes at 1).
+	if err := m.Reconcile(context.Background(), ddnsCfg("serverB")); err != nil {
+		t.Fatalf("post-restart cycle 2 reconcile: %v", err)
+	}
+	if got := updB.deleteNames(); len(got) != 0 {
+		t.Errorf("post-restart cycle 2: withdraw MISROUTED to serverB (wrong-endpoint delete): %v", got)
+	}
+	if got := updB.upsertNames(); len(got) != 0 {
+		t.Errorf("post-restart cycle 2: republish on serverB clobbering the old cleanup key: %v", got)
+	}
+	if n := m.Stats().OrphanedBackendChange; n != 2 {
+		t.Errorf("post-restart cycle 2: alarm = %d, want 2 (must fire every cycle, not freeze at 1)", n)
+	}
+	if !m.OwnedForTesting("mac:aa", "10.0.1.5") {
+		t.Errorf("post-restart cycle 2: ownership was dropped (cleanup authority lost)")
+	}
+	if fp := backendFPOf(t, m, "10.0.1.5"); fp != fpA {
+		t.Errorf("post-restart cycle 2: fingerprint = %q, want retained %q (never converged to the wrong endpoint)", fp, fpA)
+	}
+	// serverA never received a spurious extra op across the restart cycles.
+	if got := updA.deleteNames(); len(got) != 0 {
+		t.Errorf("serverA received a delete it should not have (old endpoint was unreachable): %v", got)
 	}
 }
 

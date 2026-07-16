@@ -264,13 +264,24 @@ no change in those packages:
   newly-resolved one — a delete sent to the new server would no-op and, on a
   "successful" no-op, would falsely drop ownership and orphan the old server's
   record. The anchor is PER FAMILY so a v4 endpoint change never routes v6
-  cleanup through v4's backend (#2663 independence). When the OLD endpoint is not
-  reachable in-process (a daemon restart lost the anchor), ownership is KEPT with
+  cleanup through v4's backend (#2663 independence). The retained anchor is only
+  trusted to withdraw a record when its IDENTITY proves it: a fingerprint kept in
+  lockstep (`Manager.lastLiveFP` → `reconcileEnv.prevFP`) must equal the record's
+  stored `BackendFingerprint`. This closes the POST-RESTART trap (the #5814
+  review): after a restart the anchor is nil for one cycle (correctly orphaned),
+  but the FIRST post-restart cycle RE-SEEDS it to the NEW endpoint, so a naive
+  non-nil check would find a live anchor pointing at the WRONG server and misroute
+  the old-endpoint record's delete through it — orphaning the old server's record,
+  dropping ownership, and freezing the alarm at 1. With the identity gate a
+  mismatched anchor is treated as unreachable. When the OLD endpoint is not
+  reachable in-process (anchor nil OR identity mismatch), ownership is KEPT with
   the old fingerprint (never a wrong-endpoint delete, never a republish that would
-  clobber the old cleanup key), `orphanedBackendChange` is counted, and a loud
-  `slog.Warn` + a `show services dynamic-dns` ALARM surface the cleanup-required
-  state — mirroring the Surface A #3735 deferred-withdrawal posture. Fail-on-
-  revert: `backend_change_5814_test.go`.
+  clobber the old cleanup key), `orphanedBackendChange` is counted EVERY cycle the
+  mismatch persists (never frozen), and a loud `slog.Warn` + a `show services
+  dynamic-dns` ALARM surface the cleanup-required state — mirroring the Surface A
+  #3735 deferred-withdrawal posture. Fail-on-revert:
+  `backend_change_5814_test.go` (in-process A→B, per-family, unreachable-orphan,
+  and the post-restart re-seeded-anchor misroute).
 - **Route 53 already-gone DELETE is idempotent (#2771)** — `backend_route53.go`
   `DeleteLease` treats a Route 53 DELETE of an already-absent record as success
   (nil), mirroring the rfc2136 backend's NXRRSET/NXDOMAIN handling
