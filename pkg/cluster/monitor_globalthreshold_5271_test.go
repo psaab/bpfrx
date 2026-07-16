@@ -334,7 +334,7 @@ func TestMonitor_GlobalThresholdEnabledSubThresholdClearsPerTargetDebts_5271(t *
 // Fail-on-revert: make the install loop skip when the debt name is already
 // present regardless of weight, and the global-weight change is ignored — the
 // RG stays at the stale 155 instead of 205.
-func TestMonitor_GlobalWeightChangeReinstallsAggregate_5271(t *testing.T) {
+func TestMonitor_GlobalThresholdGlobalWeightChangeWhileCrossed_5271(t *testing.T) {
 	rg := thresholdRG(0, 100, 200, 100, "10.0.0.1", "10.0.0.2") // gw 100, threshold 200
 	cfg := &config.ClusterConfig{RedundancyGroups: []*config.RedundancyGroup{rg}}
 	m := NewManager(0, 1)
