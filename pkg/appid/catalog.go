@@ -1,17 +1,12 @@
 package appid
 
 import (
-	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
-
-// maxCatalogAppID is the largest assignable application id. app_id is a uint16
-// on the Rust wire (userspace-dp/src/protocol/security.rs) where 0 is the
-// reserved "unknown" sentinel, so real applications take ids 1..65535 (#3438).
-const maxCatalogAppID = 65535
 
 // CatalogEntry is one application's L3/L4 classification rule, carrying the
 // numeric app_id that the dataplane stamps on a matching session. One config
@@ -78,18 +73,23 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 		return cat, err
 	}
 
+	// #5296: assign a STABLE, name-derived app_id to every catalog name through
+	// the shared config.AssignStableAppIDs SSOT. dataplane.compileApplications
+	// assigns ids through the SAME helper, so the two AppNames maps stay
+	// byte-identical (appid_catalog_parity_test.go). This replaces the legacy
+	// sorted 1..N positional counter, whose ids shifted whenever an
+	// earlier-sorting name was inserted and then mis-resolved a RETAINED
+	// session's frozen app_id against the rebuilt catalog (see StableAppID).
+	// The #3438 H4 uint16-overflow fail-closed boundary now lives inside
+	// AssignStableAppIDs (a config with >65535 distinct apps is rejected).
+	idByName, err := config.AssignStableAppIDs(names)
+	if err != nil {
+		return cat, err
+	}
+
 	userApps := cfg.Applications.Applications
-	// #3438 H4: app_id is a uint16 on the Rust wire with 0 reserved as the
-	// unknown sentinel, so the assignable id space is 1..65535. nextID is a
-	// uint32 working counter precisely so it CANNOT silently wrap a uint16 past
-	// 65535 back onto 0 (the reserved sentinel) — the boundary check below
-	// rejects a config that would need a 65536th id deterministically instead.
-	nextID := uint32(1)
 	for _, name := range names {
-		if nextID > maxCatalogAppID {
-			return cat, fmt.Errorf("application catalog exceeds %d entries: assigning app_id to %q would overflow the uint16 app_id space (0 is the reserved unknown sentinel); reduce the number of referenced applications", maxCatalogAppID, name)
-		}
-		appID := uint16(nextID)
+		appID := idByName[name]
 		app, found := config.ResolveApplication(name, userApps)
 		if !found {
 			// compileApplications hard-errors here; the snapshot builder must
@@ -256,8 +256,35 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 				}
 			}
 		}
-		nextID++
 	}
+
+	// #5296: emit entries in ASCENDING app_id order. The catalog snapshot the
+	// Rust classifier consumes (buildAppCatalogSnapshot) iterates this slice, and
+	// AppCatalog::from_snapshot resolves an exact-destination-port COLLISION by
+	// keeping the FIRST-emitted entry for that port (`exact_dst.or_insert`). Under
+	// the legacy positional ids sorted-name order == ascending-id order, so that
+	// first-writer was the lowest id; under the #5296 stable name-hash ids the two
+	// orders diverge, so we sort by id here to keep "first writer == lowest app_id"
+	// — the property the Rust exact-port tiebreak (and the scan-list min-id
+	// tiebreak) rely on to agree with the AppID-disabled Go fallback
+	// (resolveTupleFallback, keyed on lowest StableAppID). Secondary keys make the
+	// order fully deterministic for fan-out/same-id rows.
+	sort.Slice(cat.Entries, func(i, j int) bool {
+		a, b := cat.Entries[i], cat.Entries[j]
+		if a.AppID != b.AppID {
+			return a.AppID < b.AppID
+		}
+		if a.Protocol != b.Protocol {
+			return a.Protocol < b.Protocol
+		}
+		if a.DstPortLow != b.DstPortLow {
+			return a.DstPortLow < b.DstPortLow
+		}
+		if a.DstPortHigh != b.DstPortHigh {
+			return a.DstPortHigh < b.DstPortHigh
+		}
+		return a.SrcPortLow < b.SrcPortLow
+	})
 
 	return cat, nil
 }

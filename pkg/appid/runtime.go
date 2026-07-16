@@ -244,10 +244,22 @@ func resolveTupleFallback(proto uint8, srcPort, dstPort uint16, cfg *config.Conf
 		// match the same session, the more-specific port-based app must win,
 		// deterministically. Scan all matches, prefer a port-constrained app
 		// (a source-port and/or destination-port constraint) over a
-		// protocol-only one, and break ties by name so the result is stable
-		// regardless of map iteration order.
+		// protocol-only one, and break same-tier ties by LOWEST StableAppID.
+		//
+		// #5296: the within-tier tiebreak is keyed on config.StableAppID(name),
+		// NOT on the name alphabetically. This mirrors the AppID-ENABLED Rust
+		// catalog (AppCatalog::lookup_directional, #3612), which breaks a same-
+		// tier overlap by lowest app_id — and app_id is now the stable name-hash
+		// (StableAppID), no longer the sorted-name position. Keying this fallback
+		// on the same stable id keeps the AppID-on and AppID-off label paths in
+		// agreement (the #3612 cross-language precedence-parity contract,
+		// appid_precedence_v1.json). Before #5296 lowest-id == alphabetically-
+		// first, so the old `name < best` and the new stable-id key coincided;
+		// with stable ids the winner of a same-tier overlap is now the lowest
+		// StableAppID, which is what the dataplane stamps.
 		best := ""
 		bestPortBased := false
+		var bestID uint16
 		for name, app := range cfg.Applications.Applications {
 			// #4865: skip a tolerated nil user-application value (a JSON null
 			// decoding to a nil pointer on a lenient/HA-synced load, #3494).
@@ -272,10 +284,12 @@ func resolveTupleFallback(proto uint8, srcPort, dstPort uint16, cfg *config.Conf
 				continue
 			}
 			portBased := app.DestinationPort != "" || app.SourcePort != ""
+			id := config.StableAppID(name)
 			if best == "" || (portBased && !bestPortBased) ||
-				(portBased == bestPortBased && name < best) {
+				(portBased == bestPortBased && id < bestID) {
 				best = name
 				bestPortBased = portBased
+				bestID = id
 			}
 		}
 		if best != "" {
