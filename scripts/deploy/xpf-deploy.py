@@ -49,6 +49,7 @@ Examples:
 """
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -1117,6 +1118,70 @@ def _ver_key(v):
     return (rel_key, pre_rank)
 
 
+def _download_to(url, dst, workdir):
+    """Download `url` to `dst` via an EXCLUSIVELY-created, unpredictable temp in
+    `workdir`, then publish atomically with os.replace (#5817).
+
+    mkstemp opens with O_CREAT|O_EXCL and a random name, so a concurrent fetch
+    to the same --out, or a pre-planted predictable `<dst>.tmp`, cannot collide
+    with or clobber the in-flight download (the old shared `<dst>.tmp` had no
+    exclusive create — two fetches raced onto the same path). The temp is
+    unlinked on download failure and consumed by the atomic rename on success."""
+    fd, tmp = tempfile.mkstemp(
+        prefix="." + os.path.basename(dst) + ".", suffix=".tmp", dir=workdir)
+    os.close(fd)
+    r = subprocess.run(["curl", "-fsSL", "-o", tmp, url])
+    if r.returncode != 0:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        die(f"download failed: {url}")
+    os.replace(tmp, dst)
+
+
+@contextlib.contextmanager
+def _verified_private_artifacts(sign_mod, out, names, keys, manifest, sig):
+    """Yield a {key: path} map of artifacts COPIED into a private 0700 staging
+    dir and re-verified there — closing the verify-by-name / use-by-name TOCTOU
+    (#5817).
+
+    The public --out dir may be writable by another local process. Verifying a
+    file at its public pathname and THEN handing that same pathname to libvirt
+    (`_install_libvirt_golden` copy-to-golden) or `incus image import` lets a
+    dir-writer swap unauthenticated bytes into the file BETWEEN the checksum
+    check and the consumer's open — the verified inode is not retained. Instead
+    we copy each artifact into a mkdtemp (0700, owned by us, OUTSIDE --out — the
+    same private-copy pattern sign.verify_and_read / verify_listed_artifact_bytes
+    use for the directly-signed TOCTOU class) and verify the COPY in place, then
+    give the consumer THAT path. Nothing that can write --out can reach the
+    staging dir, so the bytes the consumer reads are exactly the bytes that were
+    verified. Portable for BOTH consumers: each accepts a pathname and this hands
+    them a private one whose bytes cannot be swapped after the check.
+
+    The manifest + its .minisig stay in --out: they are self-authenticating
+    (verify_and_read re-checks the signature over the manifest bytes on every
+    call, and an attacker without the secret key cannot forge a manifest listing
+    a tampered artifact's hash), so only the checksummed artifacts need staging."""
+    stage = tempfile.mkdtemp(prefix="xpf-verify-")
+    try:
+        os.chmod(stage, 0o700)
+        staged = {}
+        for k in keys:
+            name = names[k]
+            src = os.path.join(out, name)
+            dst = os.path.join(stage, name)
+            shutil.copyfile(src, dst)
+            try:
+                sign_mod.verify_image_artifact(dst, manifest, sig)
+            except sign_mod.SignError as e:
+                die(f"VERIFICATION FAILED for {name}: {e}")
+            staged[k] = dst
+        yield staged
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
 def cmd_fetch(args):
     """Download an appliance image from XPF_IMAGE_BASE_URL, VERIFY the exact
     downloaded bytes against the signed per-version manifest (#1924 §5.2),
@@ -1184,10 +1249,9 @@ def cmd_fetch(args):
             print(f"  (dry-run) curl -fsSL {url} -> {dst}")
             return dst
         print(f"==> fetching {url}")
-        r = subprocess.run(["curl", "-fsSL", "-o", dst + ".tmp", url])
-        if r.returncode != 0:
-            die(f"download failed: {url}")
-        os.replace(dst + ".tmp", dst)
+        # #5817: exclusive-create unpredictable temp + atomic publish (no shared
+        # predictable `<dst>.tmp` a concurrent fetch could collide/overwrite).
+        _download_to(url, dst, out)
         return dst
 
     # Need at least the manifest + sig + the artifact(s) the operator wants.
@@ -1232,13 +1296,20 @@ def cmd_fetch(args):
     # libvirt golden basename = deploy's `image:` default, so the incus alias
     # and the libvirt golden name AGREE (fable-165 H-30).
     img_name = args.alias or "xpf-appliance"
-    qcow2_src = os.path.join(out, names["qcow2"])
+    # Public path for the non-consuming (--no-import) message only. The two
+    # in-process consumers below read from a private staging dir, NOT this
+    # re-openable public path (#5817).
+    qcow2_pub = os.path.join(out, names["qcow2"])
 
     # H-30: bridge the fetch -> libvirt gap. `deploy --hypervisor libvirt`
     # reads the golden at libvirt_golden_path(image); --install-libvirt puts
     # the verified qcow2 there (shared path helper — the two can't drift).
     if args.install_libvirt:
-        _install_libvirt_golden(qcow2_src, img_name)
+        # #5817: install the qcow2 to the golden from the private staging copy,
+        # so a post-verify swap in --out cannot poison the golden.
+        with _verified_private_artifacts(
+                sign, out, names, ["qcow2"], manifest, sig) as staged:
+            _install_libvirt_golden(staged["qcow2"], img_name)
         print(f"==> done. Deploy with: xpf-deploy.py --hypervisor libvirt "
               f"deploy <appliance.yaml>  (image: {img_name})")
         return 0
@@ -1247,7 +1318,7 @@ def cmd_fetch(args):
         golden = libvirt_golden_path(img_name)
         print(f"==> verified into {out} (not imported). For libvirt/KVM, install "
               f"it to the golden path deploy reads:\n"
-              f"      sudo install -m 0644 -D {qcow2_src} {golden}\n"
+              f"      sudo install -m 0644 -D {qcow2_pub} {golden}\n"
               f"   (or re-run fetch with --install-libvirt), then: "
               f"xpf-deploy.py --hypervisor libvirt deploy <appliance.yaml> "
               f"(image: {img_name}). For incus, re-run without "
@@ -1258,9 +1329,13 @@ def cmd_fetch(args):
     subprocess.run(["incus", "image", "delete", alias],
                    capture_output=True, text=True)
     print(f"==> importing verified image as incus alias '{alias}'")
-    r = subprocess.run(["incus", "image", "import",
-                        os.path.join(out, names["metadata"]),
-                        os.path.join(out, names["qcow2"]), "--alias", alias])
+    # #5817: import from the private staging dir so a post-verify swap of the
+    # public metadata/qcow2 in --out cannot feed unauthenticated bytes to
+    # `incus image import`. The dir is rmtree'd once the import returns.
+    with _verified_private_artifacts(
+            sign, out, names, ["metadata", "qcow2"], manifest, sig) as staged:
+        r = subprocess.run(["incus", "image", "import",
+                            staged["metadata"], staged["qcow2"], "--alias", alias])
     if r.returncode != 0:
         die("incus image import failed")
     print(f"==> done. Deploy with: xpf-deploy.py deploy <appliance.yaml> "

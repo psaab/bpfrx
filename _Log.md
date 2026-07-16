@@ -1,3 +1,29 @@
+## 2026-07-16 — #5817 (scripts/deploy, security): fetch verify/use TOCTOU + non-exclusive temp
+- **Timestamp**: 2026-07-16 (fix/5817-deploy-verify-toctou)
+- **Action**: Fix #5817 (codex-183 audit, supply-chain TOCTOU). STEP-0 confirmed
+  live on origin/master (3b3b15eff): `sign.verify_image_artifact` hashes a path
+  and returns only `True` (no inode retained); `cmd_fetch` verifies each artifact
+  at its PUBLIC `--out` pathname, then hands that SAME pathname to a different
+  consumer — `_install_libvirt_golden` copy-to-golden or `incus image import` —
+  so a process able to write `--out` could swap unauthenticated bytes in between
+  the checksum check and the consumer's open (verify-by-name / use-by-name race).
+  Secondary: `fetch_one` downloaded to a predictable shared `<dst>.tmp` with no
+  exclusive create, so a concurrent fetch to the same `--out` could collide.
+  Mechanism (A): the two in-process consumers now read from a private 0700
+  mkdtemp OUTSIDE `--out` (`_verified_private_artifacts`) — each consumed
+  artifact is COPIED there and re-verified against the signed manifest, then that
+  private path is handed to the consumer (portable for BOTH libvirt and incus:
+  each takes a pathname; nothing that can write `--out` can reach the staging
+  dir). Downloads use `mkstemp` (O_CREAT|O_EXCL, unpredictable) + atomic
+  `os.replace` (`_download_to`). Verification itself is unchanged (not weakened).
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_verify_toctou.py (new), docs/install-images.md,
+  _Log.md
+- **Validation**: new `test_xpf_deploy_verify_toctou` (5 tests) — fail-on-revert
+  proven firsthand: neutralize the staging (hand back public path) → swap-reaches
+  -consumer asserts flip RED; neutralize to `dst + ".tmp"` → predictable-temp
+  clobber assert flips RED; both restore GREEN. `make selftest` green.
+
 ## 2026-07-16 — #5815 (scripts/dist, security): publish gate ignored signed base_image_pinned
 - **Timestamp**: 2026-07-16 (fix/5815-publish-base-pinned-gate)
 - **Action**: Fix #5815 (codex-183 audit, release-provenance bypass). STEP-0

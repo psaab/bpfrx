@@ -32,6 +32,19 @@ Two deliverables, same root disk:
 > (never part of an artifact filename) — so a crafted version cannot redirect
 > the download/write out of the output directory (#5992). This mirrors the
 > systemd-ExecStart version grammar hardened in #5713.
+>
+> `fetch` also closes the verify/use gap (#5817): the `--out` directory may be
+> writable by another local process, so authenticating an artifact at its public
+> pathname and then handing that SAME pathname to libvirt (copy-to-golden) or
+> `incus image import` would let a dir-writer swap unauthenticated bytes in
+> between the check and the consumer's open. Instead the two in-process consumers
+> read from a private 0700 staging dir OUTSIDE `--out` — each consumed artifact
+> is copied there and re-verified against the signed manifest, so the bytes the
+> consumer reads are exactly the bytes that were verified (the same private-copy
+> pattern `sign.verify_and_read` uses). Downloads land in an exclusively-created,
+> unpredictable temp (`mkstemp`, O_CREAT|O_EXCL) and publish atomically, so a
+> concurrent fetch to the same `--out` cannot collide with or clobber an
+> in-flight download via a predictable shared `<dst>.tmp`.
 
 ## Bake
 
