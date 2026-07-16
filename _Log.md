@@ -50501,3 +50501,43 @@ top.
   + pkg/config/compiler_nat_target_parity_hb167_test.go + pkg/config/
   compiler_nat_host_mask_test.go (updated to new fail-closed behavior),
   docs/config-schema.md (#5859 note)
+
+## 2026-07-16 — #5861 cluster RA stable-active reconcile-on-apply
+
+- **Timestamp**: 2026-07-16
+- **Action**: Fix High-severity RA convergence bug: config changes on a
+  stable-active cluster RG were never applied until an ownership transition.
+  In cluster mode the commit path deliberately SKIPPED `ra.Apply` (RA managed
+  by ownership events) and `reconcileRGState` re-applied RA only on an
+  `rg_active` transition (`if tr.Changed`). A day-2 RA edit on an RG that
+  stayed MASTER therefore kept advertising the OLD prefixes/lifetimes/options
+  until failover/restart. Added `reconcileClusterRAServices` — the single
+  authoritative cluster RA applier. It builds the desired set as the union of
+  `buildRAConfigs` filtered to the RGs this node is the CURRENT active owner
+  for (`snapshotRethMasterState`), hash-gates the apply (`lastRAReconcileHash`,
+  updated only on success), and serializes the ownership snapshot + `ra.Apply`
+  under a new `raReconcileMu`. Wired into the commit path
+  (`applyServicesReconcile` cluster branch), the periodic safety reconcile
+  (`reconcileRGState`, dropped-event net), and — unifying the RA path — the
+  VRRP MASTER/BACKUP transitions (`applyRethServicesForRG` /
+  `clearRethServicesForRG` now route RA through the reconciler). Demotion-race
+  guard: the demote path updates rg-state before driving the RA reconcile, so
+  under `raReconcileMu` the snapshot always reflects the true current owner at
+  apply time; an inactive owner never transmits, a removal emits the
+  lifetime-0 goodbye only from the current owner. Added a `raApplyFn` test
+  hook (mirrors `startupGoodbyeWithdrawFn`) to spy `ra.Apply`.
+  Validation: `go build ./...` clean; `go vet ./pkg/daemon ./pkg/ra` clean;
+  `go test -race ./pkg/daemon ./pkg/ra` GREEN (pkg/ra had one pre-existing
+  intermittent `-race` flake in `TestRestartTimeoutNoReplacementWhenNoGoodbye`
+  / `reclaimTombstoneWhenStopped` — untouched code, byte-identical to
+  origin/master, passes on isolation/rerun). Two new fail-on-revert tests,
+  both verbatim RED on revert.
+- **File(s)**: pkg/daemon/daemon.go (raReconcileMu / lastRAReconcileHash /
+  raApplyFn fields), pkg/daemon/daemon_ra_reconcile.go (new —
+  reconcileClusterRAServices + desiredClusterRA + raDesiredHash),
+  pkg/daemon/daemon_apply.go (commit-path cluster RA reconcile),
+  pkg/daemon/daemon_ha.go (applyRethServicesForRG / clearRethServicesForRG
+  route RA through the reconciler; reconcileRGState periodic safety pass),
+  pkg/daemon/ra_stable_active_5861_test.go (new — stable-active + demotion-race
+  fail-on-revert tests), pkg/daemon/README.md (Cluster mode: per-RG RA
+  reconcile section)

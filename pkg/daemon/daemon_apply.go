@@ -1584,6 +1584,17 @@ func (d *Daemon) applyServicesReconcile(cfg *config.Config) (error, error) {
 	// the reconcile loop sends goodbye RAs for inactive RGs.
 	//
 	// Stable link-local cleanup: handled by reconcile after election.
+	//
+	// #5861: a day-2 RA edit on an RG that stays MASTER never fires a VRRP
+	// event, so pre-#5861 the primary kept advertising the OLD prefixes/
+	// lifetimes/options until failover/restart. Reconcile the cluster RA
+	// senders against the union of buildRAConfigs for the RGs this node is
+	// CURRENTLY the active owner for — owner-gated + serialized so a commit
+	// racing a demotion can't re-arm RA on a now-inactive node. Hash-gated:
+	// a no-op when the effective RA set for the owned RGs did not change.
+	if isCluster {
+		d.reconcileClusterRAServices("commit")
+	}
 
 	// 6. Apply IPsec config
 	// Always call Apply so stale swanctl config is removed when VPNs are

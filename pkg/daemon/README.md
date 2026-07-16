@@ -203,6 +203,41 @@ Detected by the presence of `/etc/xpf/node-id` (contents `0` or `1`).
 Absent → standalone. Cluster mode triggers the bondless-RETH naming
 convention (`fxp0`, `em0`, `ge-{0,7}-0-X`).
 
+### Per-RG Router-Advertisement reconcile (#5861)
+
+In cluster mode RA senders run ONLY on the RG that is the current active
+owner: the desired RA set is the union of `buildRAConfigs` filtered to the
+RGs this node is MASTER for. Every RA-affecting cluster event —
+a day-2 config commit, a VRRP MASTER/BACKUP transition, and a periodic
+dropped-event safety pass (`reconcileRGState`) — funnels through the single
+authoritative applier `reconcileClusterRAServices` (`daemon_ra_reconcile.go`).
+
+Before #5861 the cluster commit path SKIPPED `ra.Apply` (RA was managed
+only by ownership events) and `reconcileRGState` re-applied RA only on an
+`rg_active` transition (`if tr.Changed`). So a day-2 RA edit (add/remove
+prefix, change DNS/MTU/lifetimes/options) on an RG that stayed MASTER never
+reached `ra.Apply` and the primary kept advertising the OLD set until
+failover/restart. `reconcileClusterRAServices` now re-applies RA on the
+active owner whenever the effective desired set changes even when ownership
+is stable, and `ra.Apply` diffs safely (no RA gap for unchanged senders).
+
+**Owner gating + demotion-race guard.** The desired set is built from
+`snapshotRethMasterState()` — an RG's interfaces are included ONLY while
+this node is its active owner. The ownership snapshot and the `ra.Apply`
+run under `raReconcileMu`, and the VRRP demote path updates rg-state
+(`SetVRRP`/`Reconcile`) BEFORE it drives the RA reconcile. So a config apply
+that races a demotion either snapshots the RG as already-inactive (its
+senders are withdrawn / never armed) or snapshots it active — in which case
+the node genuinely was the owner at apply time and the demote's own reconcile
+pass, serialized behind this one on `raReconcileMu`, withdraws immediately
+after. An inactive owner never transmits; a removal emits the lifetime-0
+goodbye only from the current owner (`ra.Apply`'s graceful-withdraw path).
+
+**Idempotence.** A stable digest of the desired set (`lastRAReconcileHash`,
+updated only on a successful apply) gates the actual `ra.Apply`, so the
+periodic safety pass costs nothing when nothing moved and a transient apply
+error is retried on the next pass rather than latched as converged.
+
 ### Direct-mode VIP failover (private-rg-election / no-reth-vrrp)
 
 When `no-reth-vrrp` or `private-rg-election` is configured, the daemon owns
