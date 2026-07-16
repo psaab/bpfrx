@@ -565,6 +565,19 @@ rather than inheriting a stale down/hold-down state. A KEPT RG whose
 ip-monitoring or targets merely changed is NOT purged here —
 `reconcileRGIPDebts` owns that reconcile per-poll.
 
+**Purge per-RG GARP count on RG removal (#6027).** `UpdateConfig` writes
+`m.garpCounts[rg.ID]` ONLY when the config sets a positive
+`gratuitous-arp-count`; the consumers (`pkg/vrrp`, `pkg/daemon`) treat an
+absent entry as the default burst (3). The removal loop now
+`delete(m.garpCounts, id)` alongside `monitorWeights` and `m.groups`, so a
+same-id RG remove/re-add where the re-add omits an explicit count does not
+inherit the prior incarnation's stale count — the entry stays absent and the
+default applies. This is the third same-id-re-add map-lifecycle gap closed in
+this loop, after the #5990 ip-monitor `ipState`/`ipDebts`/`ipThresholdState`
+purge. The per-RG cleanup-on-removal maps are: `holdTimer` (stopped, #5245),
+`monitorWeights` (interface + re-derivable ip debt), `garpCounts` (#6027), and
+the group itself.
+
 `LinkAttrsUp` is exported because the same carrier-aware read is needed
 outside the monitor loop:
 

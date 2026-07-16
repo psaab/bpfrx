@@ -1,3 +1,38 @@
+## 2026-07-16 — #6027 cluster: purge m.garpCounts[rgID] on RG removal
+- **Timestamp**: 2026-07-16 (fix/6027-garpcounts-purge)
+- **Action**: Fixed the third same-id-re-add map-lifecycle gap in the
+  chassis-cluster `UpdateConfig` removed-RG cleanup loop (after #5990). The
+  manager keys `garpCounts` by RG id and WRITES it only when the config sets a
+  positive `gratuitous-arp-count` (`group_state.go` ~line 105). The removal loop
+  cleared `monitorWeights` and the group but NOT `garpCounts`, so a same-id RG
+  remove/re-add whose re-added config omitted an explicit count inherited the
+  PRIOR incarnation's stale count instead of the default — the consumers
+  (`pkg/vrrp`, `pkg/daemon`) treat an ABSENT `garpCounts` entry as the default
+  burst (3), so a surviving stale entry defeats that fallback. Fix: add
+  `delete(m.garpCounts, id)` in the same removed-RG loop, co-located with the
+  existing `monitorWeights`/`groups` deletes, under `m.mu` (held by
+  `UpdateConfig`). LOW severity — narrow trigger, wrong GARP burst count, not a
+  fail-open. Scanned the Manager struct for other per-RG (`map[int]`) maps
+  WRITTEN in `UpdateConfig` but not purged in the removal loop: only `groups`
+  and `garpCounts` are written in that function; the `peer*`/`failover*`
+  `map[int]` maps are not written in `UpdateConfig`, so no additional same-class
+  gap in scope.
+- **File(s)**: pkg/cluster/group_state.go (edit — removal loop
+  `delete(m.garpCounts, id)` + comment),
+  pkg/cluster/garpcounts_purge_6027_test.go (new — fail-on-revert test),
+  pkg/cluster/README.md (edit — per-RG cleanup-on-removal maps now list
+  garpCounts)
+- **Validation**: `GOCACHE=/dev/shm/cache go build ./...` clean; `go vet
+  ./pkg/cluster` clean; `gofmt -l` clean on touched files (pre-existing gofmt
+  flags on sync.go/sync_protocol.go left untouched). New fail-on-revert test
+  PROVEN RED firsthand — with the delete removed, after removal
+  `garpCounts[1]==7` survives → `garpcounts_purge_6027_test.go:56: garpCounts[1]
+  not purged on RG removal (#6027): got 7, want absent` → restored → GREEN. Full
+  `go test -race ./pkg/cluster` GREEN (10.2s). Go-only, no cargo. HA
+  test-failover smoke blocked by the loss-cluster shim-ABI wall — gated on the
+  fail-on-revert unit test + full -race suite; parent to record the smoke
+  deferral.
+
 ## 2026-07-16 — #5990 cluster: purge Monitor per-RG ipState/ipDebts on RG removal
 - **Timestamp**: 2026-07-16 (fix/5990-monitor-ipstate-purge)
 - **Action**: Fixed a chassis-cluster HA monitor map-lifecycle fail-open. The
