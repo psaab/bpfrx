@@ -27,6 +27,7 @@
 
 mod cookie_reply;
 mod debug_log_throttle;
+mod embedded_icmp;
 mod filter;
 mod flow_cache_hit;
 mod nat_exception;
@@ -34,6 +35,7 @@ pub(in crate::afxdp) mod reject_reply;
 mod rx_telemetry;
 
 use debug_log_throttle::{policy_deny_debug_log_allowed, session_miss_debug_log_allowed};
+use embedded_icmp::{EmbeddedIcmpReversal, try_reverse_embedded_icmp_error};
 use flow_cache_hit::{FlowCacheOutcome, stage_flow_cache_hit};
 use rx_telemetry::record_rx_descriptor_telemetry;
 
@@ -2183,28 +2185,16 @@ pub(super) fn poll_binding_process_descriptor(
                             debug.from_zone = Some(from_zone_id);
                             debug.to_zone = Some(to_zone_id);
                         }
-                        // Compute embedded ICMP error flag early so we can skip
-                        // the BPF session map publish for ICMP errors. Publishing
-                        // them as PASS_TO_KERNEL causes subsequent ICMP errors to
-                        // bypass the userspace embedded ICMP NAT reversal.
-                        let is_embedded_icmp_error = if worker_ctx.forwarding.allow_embedded_icmp
-                            && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
-                        {
-                            // #5140: classify on the INNER ICMP type via
-                            // `packet_frame` (decapped frame post native-GRE, else
-                            // `raw_frame`). `meta.l4_offset` is inner-relative
-                            // after `stage_native_gre_decap`; indexing the outer
-                            // `raw_frame` could read an arbitrary outer byte and
-                            // misclassify an ordinary echo as an exempt embedded
-                            // error (permitted without policy check).
-                            packet_frame
-                                .get(meta.l4_offset as usize)
-                                .copied()
-                                .map(|icmp_type| is_icmp_error(meta.protocol, icmp_type))
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        };
+                        // #5690: a non-query ICMP error is FLOWLESS (#3290
+                        // discards its metadata pseudo-port so it never seeds a
+                        // session), so it never reaches this flow-backed
+                        // session-miss arm — a flow-backed ICMP packet here is
+                        // always an identifier-bearing query (echo), never an
+                        // error. The old `is_embedded_icmp_error` skip of the
+                        // local-delivery caching below was therefore a structural
+                        // no-op; the generic embedded-ICMP NAT reversal it guarded
+                        // now runs on the flowless path
+                        // (`embedded_icmp::try_reverse_embedded_icmp_error`).
                         // #3070 + #3485: on the session-MISS local-delivery path,
                         // the host-inbound-traffic zone gate runs BEFORE the lo0
                         // host-bound filter. A host-bound packet (destined to a
@@ -2352,7 +2342,6 @@ pub(super) fn poll_binding_process_descriptor(
                             continue;
                         }
                         if resolution.disposition == ForwardingDisposition::LocalDelivery
-                            && !is_embedded_icmp_error
                             && should_cache_local_delivery_session_on_miss(
                                 worker_ctx.forwarding,
                                 effective_resolution_target,
@@ -2483,172 +2472,13 @@ pub(super) fn poll_binding_process_descriptor(
                                 );
                             }
                         }
-                        if is_embedded_icmp_error {
-                            #[cfg(feature = "debug-log")]
-                            let icmpv6_trace = meta.protocol == PROTO_ICMPV6
-                                && ICMPV6_EMBED_LOGGED.fetch_add(1, Ordering::Relaxed) < 32;
-                            if let Some(icmp_match) = try_embedded_icmp_nat_match(
-                                // SAFETY: per the `area` contract in
-                                // this function's header comment.
-                                unsafe { &*area },
-                                desc,
-                                meta,
-                                sessions,
-                                worker_ctx.forwarding,
-                                worker_ctx.dynamic_neighbors,
-                                worker_ctx.shared_sessions,
-                                worker_ctx.shared_nat_sessions,
-                                worker_ctx.shared_forward_wire_sessions,
-                                now_ns,
-                            ) {
-                                #[cfg(feature = "debug-log")]
-                                if icmpv6_trace {
-                                    debug_log!(
-                                        "ICMPV6_EMBED: match orig_src={} orig_port={} nat={:?} resolution={:?} egress_if={} tx_if={} neigh={:?}",
-                                        icmp_match.original_src,
-                                        icmp_match.original_src_port,
-                                        icmp_match.nat,
-                                        icmp_match.resolution.disposition,
-                                        icmp_match.resolution.egress_ifindex,
-                                        icmp_match.resolution.tx_ifindex,
-                                        icmp_match.resolution.neighbor_mac,
-                                    );
-                                }
-                                if icmp_match.nat.rewrite_src.is_some() {
-                                    let icmp_resolution = finalize_embedded_icmp_resolution(
-                                        worker_ctx.forwarding,
-                                        worker_ctx.ha_state,
-                                        now_secs,
-                                        meta.ingress_ifindex as i32,
-                                        &icmp_match,
-                                    );
-                                    // #1145: reuse line-50 raw_frame bind.
-                                    let rewritten = match meta.addr_family as i32 {
-                                        libc::AF_INET => build_nat_reversed_icmp_error_v4(
-                                            raw_frame,
-                                            meta,
-                                            &icmp_match,
-                                        ),
-                                        libc::AF_INET6 => build_nat_reversed_icmp_error_v6(
-                                            raw_frame,
-                                            meta,
-                                            &icmp_match,
-                                        ),
-                                        _ => None,
-                                    };
-                                    if let Some(rewritten_frame) = rewritten {
-                                        let icmp_decision = SessionDecision {
-                                            resolution: icmp_resolution,
-                                            nat: NatDecision::default(),
-                                        };
-                                        let target_ifindex =
-                                            if icmp_decision.resolution.tx_ifindex > 0 {
-                                                icmp_decision.resolution.tx_ifindex
-                                            } else {
-                                                resolve_tx_binding_ifindex(
-                                                    worker_ctx.forwarding,
-                                                    icmp_decision.resolution.egress_ifindex,
-                                                )
-                                            };
-                                        let cos = resolve_cos_tx_selection_at(
-                                            worker_ctx.forwarding,
-                                            icmp_decision.resolution.egress_ifindex,
-                                            meta,
-                                            Some(&flow.forward_key),
-                                            // #2362 fold B: generated ICMP error
-                                            // reply — meta-only extra (tcp_flags
-                                            // authoritative; no per-packet frame
-                                            // re-read for this synthesized frame).
-                                            crate::afxdp::frame::term_match_extra_from_meta(
-                                                meta.into(),
-                                            ),
-                                            now_ns,
-                                        );
-                                        if !cos.drop {
-                                            binding.scratch.scratch_forwards.push(
-                                                PendingForwardRequest {
-                                                    target_ifindex,
-                                                    target_binding_index: worker_ctx
-                                                        .binding_lookup
-                                                        .target_index(
-                                                            binding_index,
-                                                            worker_ctx.ident.ifindex,
-                                                            worker_ctx.ident.queue_id,
-                                                            target_ifindex,
-                                                        ),
-                                                    ingress_queue_id: worker_ctx.ident.queue_id,
-                                                    desc,
-                                                    frame: PendingForwardFrame::Prebuilt(
-                                                        rewritten_frame,
-                                                    ),
-                                                    meta: meta.into(),
-                                                    decision: icmp_decision,
-                                                    apply_nat_on_fabric: false,
-                                                    expected_ports: None,
-                                                    flow_key: Some(flow.forward_key.clone()),
-                                                    nat64_reverse: None,
-                                                    cos_queue_id: cos.queue_id,
-                                                    dscp_rewrite: cos.dscp_rewrite,
-                                                    cos_tx_selection_resolved: true,
-                                                    // #hb166 T-7:
-                                                    // filter_match_extra
-                                                    // removed (write-only;
-                                                    // deferred recompute
-                                                    // deleted).
-                                                },
-                                            );
-                                            recycle_now = false;
-                                        }
-                                        #[cfg(feature = "debug-log")]
-                                        if icmpv6_trace {
-                                            debug_log!(
-                                                "ICMPV6_EMBED: queued resolution={:?} egress_if={} tx_if={} target_if={}",
-                                                icmp_decision.resolution.disposition,
-                                                icmp_decision.resolution.egress_ifindex,
-                                                icmp_decision.resolution.tx_ifindex,
-                                                target_ifindex,
-                                            );
-                                        }
-                                    } else {
-                                        #[cfg(feature = "debug-log")]
-                                        if icmpv6_trace {
-                                            debug_log!(
-                                                "ICMPV6_EMBED: build_none resolution={:?} egress_if={} tx_if={} neigh={:?}",
-                                                icmp_resolution.disposition,
-                                                icmp_resolution.egress_ifindex,
-                                                icmp_resolution.tx_ifindex,
-                                                icmp_resolution.neighbor_mac,
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    #[cfg(feature = "debug-log")]
-                                    if icmpv6_trace {
-                                        debug_log!(
-                                            "ICMPV6_EMBED: no_rewrite nat={:?}",
-                                            icmp_match.nat
-                                        );
-                                    }
-                                }
-                            } else {
-                                #[cfg(feature = "debug-log")]
-                                if icmpv6_trace {
-                                    debug_log!(
-                                        "ICMPV6_EMBED: no_match outer={}:{} -> {}:{} ingress_if={} from_zone={} to_zone={}",
-                                        flow.src_ip,
-                                        flow.forward_key.src_port,
-                                        flow.dst_ip,
-                                        flow.forward_key.dst_port,
-                                        meta.ingress_ifindex,
-                                        from_zone,
-                                        to_zone,
-                                    );
-                                }
-                            }
-                            // Permit without policy check or session install.
-                            // If NAT reversal was applied, the prebuilt frame
-                            // is already queued. If not, fall through to slow-path.
-                        } else if decision.resolution.disposition
+                        // #5690: the generic embedded-ICMP NAT reversal is
+                        // NOT wired here. A non-query ICMP error is FLOWLESS
+                        // (#3290 discards its pseudo-port so it never seeds a
+                        // session), so it never enters this flow-backed arm;
+                        // the reversal runs on the flowless path via
+                        // `embedded_icmp::try_reverse_embedded_icmp_error`.
+                        if decision.resolution.disposition
                             == ForwardingDisposition::ForwardCandidate
                         {
                             let owner_rg_id =
@@ -3621,6 +3451,63 @@ pub(super) fn poll_binding_process_descriptor(
                 {
                     hit
                 } else {
+                    // #5690: an inbound non-query ICMP error referencing a NAT'd
+                    // flow is FLOWLESS (#3290 discards its metadata pseudo-port so
+                    // it never seeds a session). Attempt the generic embedded-ICMP
+                    // NAT reversal HERE, on the path these errors actually take:
+                    // reverse-translate the inner quoted packet back to the
+                    // pre-NAT tuple and forward the error to the real internal
+                    // host. A match rebuilds + queues the reversed error and
+                    // consumes the descriptor; a miss / no-rewrite / unbuildable
+                    // frame falls through to the normal flowless L3 enforcement
+                    // below. The reversal was previously wired only into the
+                    // flow-backed session-miss arm and could never run in
+                    // production (an ICMP error never has a flow), so the
+                    // capability was helper-tested but dead; wiring it here makes
+                    // it live. #5140-safe classification: read the INNER ICMP type
+                    // from `packet_frame` (decapped post native-GRE, else
+                    // `raw_frame`) at the inner-relative `meta.l4_offset`.
+                    let is_embedded_icmp_error = worker_ctx.forwarding.allow_embedded_icmp
+                        && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+                        && packet_frame
+                            .get(meta.l4_offset as usize)
+                            .copied()
+                            .map(|icmp_type| is_icmp_error(meta.protocol, icmp_type))
+                            .unwrap_or(false);
+                    if is_embedded_icmp_error {
+                        match try_reverse_embedded_icmp_error(
+                            // SAFETY: per the `area` contract in this function's
+                            // header comment.
+                            unsafe { &*area },
+                            desc,
+                            raw_frame,
+                            meta,
+                            binding_index,
+                            sessions,
+                            worker_ctx,
+                            &mut binding.scratch.scratch_forwards,
+                            now_ns,
+                            now_secs,
+                        ) {
+                            EmbeddedIcmpReversal::Queued => {
+                                // Reversed error queued as a prebuilt forward; the
+                                // descriptor is owned by that request (no recycle).
+                                telemetry.counters.touched = true;
+                                continue;
+                            }
+                            EmbeddedIcmpReversal::Dropped => {
+                                // Matched but egress CoS / output-filter dropped
+                                // the reversed error — fail-closed silent drop
+                                // (never answer an ICMP error with an ICMP error).
+                                telemetry.counters.touched = true;
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
+                            }
+                            // No NAT match / no source rewrite / unbuildable frame:
+                            // fall through to the normal flowless enforcement below.
+                            EmbeddedIcmpReversal::NotHandled => {}
+                        }
+                    }
                     // #3291: flowless transit enforcement. A non-first fragment
                     // / no-L4 transit packet (#2344 makes it flowless so payload
                     // bytes are never read as L4 ports) STILL carries L3 identity
