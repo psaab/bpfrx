@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/psaab/xpf/pkg/clusterfailover"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -517,7 +518,7 @@ func (g *grpcCluster) ResetFailover() error {
 	}
 	var firstErr error
 	for _, rg := range rgs {
-		if err := g.systemAction(fmt.Sprintf("cluster-failover-reset:%d", rg)); err != nil {
+		if err := g.systemAction(clusterfailover.ResetFailover(rg).Action()); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}

@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -21,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/clusterfailover"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
@@ -658,10 +657,10 @@ var fabricAllowedStreamMethods = map[string]bool{
 // It returns ok=false — fail-closed — for any other action, a missing/empty
 // node target, a non-numeric rgID or nodeID, a trailing garbage suffix
 // (e.g. "cluster-failover:1:node1:node2"), or a nodeID outside the supported
-// cluster range (IsSupportedClusterNodeID == 0/1). The parse mirrors the
-// handler's own strconv.Atoi + IsSupportedClusterNodeID validation
-// (server_diag.go) so the fabric interceptor gate and the handler agree on
-// which failover actions are valid.
+// cluster range (0/1). It delegates the parse to clusterfailover.ParseAction —
+// the SAME grammar the loopback handler (server_diag_system_action.go) runs —
+// so the fabric interceptor gate and the handler can never disagree on which
+// failover actions are well-formed.
 //
 // Why the range check matters on the interceptor: the handler proxy-dials the
 // peer whenever targetNode != local BEFORE rejecting an out-of-range/garbage
@@ -672,34 +671,25 @@ var fabricAllowedStreamMethods = map[string]bool{
 // malformed action at the interceptor (PermissionDenied) so it never reaches
 // the handler.
 func parseProxiedFailoverAction(action string) (rgID, nodeID int, ok bool) {
-	const dataPrefix = "cluster-failover-data:node"
-	if strings.HasPrefix(action, dataPrefix) {
-		n, err := strconv.Atoi(strings.TrimPrefix(action, dataPrefix))
-		if err != nil || !cluster.IsSupportedClusterNodeID(n) {
-			return 0, 0, false
-		}
-		return -1, n, true
+	// Delegate the parse to the SAME strict grammar the loopback handler uses
+	// (pkg/clusterfailover) so the fabric interceptor gate and the handler can
+	// never disagree about which failover action strings are well-formed
+	// (#5810, #5851). Only the two node-targeted forms are proxyable over the
+	// fabric; the plain RG failover and reset forms are valid but local-only.
+	op, err := clusterfailover.ParseAction(action)
+	if err != nil {
+		return 0, 0, false
 	}
-	const rgPrefix = "cluster-failover:"
-	if strings.HasPrefix(action, rgPrefix) {
-		rest := strings.TrimPrefix(action, rgPrefix)
-		idx := strings.Index(rest, ":node")
-		if idx < 0 {
-			// No node target: this is the local-only failover form, never
-			// proxied over the fabric.
-			return 0, 0, false
-		}
-		rg, err := strconv.Atoi(rest[:idx])
-		if err != nil {
-			return 0, 0, false
-		}
-		n, err := strconv.Atoi(rest[idx+len(":node"):])
-		if err != nil || !cluster.IsSupportedClusterNodeID(n) {
-			return 0, 0, false
-		}
-		return rg, n, true
+	switch op.Kind {
+	case clusterfailover.KindRGFailoverNode:
+		return op.RG, op.Node, true
+	case clusterfailover.KindDataFailover:
+		// rgID = -1 sentinel: all data redundancy groups (the historical
+		// contract this helper's callers depend on).
+		return -1, op.Node, true
+	default:
+		return 0, 0, false
 	}
-	return 0, 0, false
 }
 
 // isFabricSafeSystemAction reports whether a SystemAction request carries a

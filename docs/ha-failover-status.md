@@ -78,6 +78,44 @@ The key fixes that made this work:
 | PRs #404-406 | Owner RG indexes — O(1) demotion/activation |
 | PR #407 | Priority barrier channel + decouple failover from bulk sync |
 
+### Failover command/action grammar — one strict parser (#5810, #5851)
+
+The manual-failover command and its wire action string are validated by a
+single, side-effect-free grammar in `pkg/clusterfailover`. Every entry point —
+the remote CLI (`cmd/cli/request.go`), the in-process CLI
+(`pkg/cli/cli_request_chassis.go`), the gRPC loopback handler
+(`pkg/grpcapi/server_diag_system_action.go`), and the fabric-allowlist
+interceptor (`pkg/grpcapi/server.go` `parseProxiedFailoverAction`) — routes
+through `clusterfailover.ParseCommand` (operator tokens) or
+`clusterfailover.ParseAction` (wire string) and acts on the SAME typed
+operation. Callers never assemble or partially parse the privileged action
+string ad hoc.
+
+The grammar is closed. Exactly four forms are accepted:
+
+| Operation | Command | Wire action |
+|-----------|---------|-------------|
+| Plain RG failover (untargeted) | `redundancy-group <rg>` | `cluster-failover:<rg>` |
+| Targeted RG failover | `redundancy-group <rg> node <0\|1>` | `cluster-failover:<rg>:node<0\|1>` |
+| Data failover | `data node <0\|1>` | `cluster-failover-data:node<0\|1>` |
+| Reset | `reset redundancy-group <rg>` | `cluster-failover-reset:<rg>` |
+
+`<rg>` is a non-negative decimal group ID; `<0|1>` is a supported chassis node.
+Unknown, missing, misspelled, duplicate, signed, whitespace-laden, or trailing
+tokens — and an empty `:node` suffix — are rejected with usage/`InvalidArgument`
+BEFORE any cluster method or peer dial. This closes the class where a truncated
+automation variable or a typo (`redundancy-group 1 nod 0`, `redundancy-group 1
+node`, or the gRPC `cluster-failover:1:node`) silently degraded to the broader
+untargeted `ManualFailover(<rg>)`, moving ownership in an unintended direction.
+
+The loopback handler and the fabric interceptor now share this parser, so they
+can never disagree on which action strings are well-formed. The fabric gate may
+still deny a valid but local-only form (plain RG failover, reset) by policy —
+only the two node-targeted forms are proxyable — but that denial is a policy
+choice, never a divergent parse. Shared accept/reject token-vector tables live
+in `pkg/clusterfailover/grammarvectors` and are exercised by all four layers'
+tests so the verdicts cannot drift.
+
 ## Persistent SNAT Lease Boundary
 
 Synced sessions carry the translated tuple needed for active-flow return
