@@ -1075,7 +1075,14 @@ func TestBulkEndTriggersCallback(t *testing.T) {
 		called <- struct{}{}
 	}
 
-	// Simulate receiving BulkEnd message.
+	// #5272: the callback only fires for a bulk that was actually in
+	// progress on our side. Establish an in-progress transfer with a
+	// BulkStart first, then send the matching BulkEnd. (A BulkEnd with no
+	// preceding BulkStart is now dropped as spurious — see
+	// TestBulkEndSpuriousNoTransferIgnored.)
+	ss.handleMessage(nil, syncMsgBulkStart, nil)
+
+	// Simulate receiving BulkEnd message (matching epoch 0).
 	ss.handleMessage(nil, syncMsgBulkEnd, nil)
 
 	select {
@@ -4714,4 +4721,139 @@ func TestBulkSyncRedriveInFlightGuard(t *testing.T) {
 	c0peerA.Close()
 	c0peerB.Close()
 	c1peer.Close()
+}
+
+// TestBulkEndSpuriousNoTransferIgnored proves the #5272 safety-gate fix on the
+// inbound path: a BulkEnd received with NO bulk transfer actually in progress
+// (bulkInProgress == false — a buggy / mixed-version / replaying peer frame)
+// must NOT release the stateful-failover safety gate. Concretely it must not
+// fire OnBulkSyncReceived and must not set bulkEverCompleted — releasing the
+// VRRP sync hold with an empty / stale peer session table breaks stateful
+// failover. A subsequent LEGITIMATE BulkStart -> BulkEnd (matching epoch,
+// bulkInProgress == true) MUST still complete and release the hold as today.
+func TestBulkEndSpuriousNoTransferIgnored(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6}: {IsReverse: 0, IngressZone: 2},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool { return false }
+	ss.SetZoneRGMap(map[uint16]int{2: 2})
+
+	// OnBulkSyncReceived fires on a goroutine spawned by handleMessage, so
+	// guard the flag against the test's reads (data race under -race).
+	var calledMu sync.Mutex
+	called := false
+	wasCalled := func() bool {
+		calledMu.Lock()
+		defer calledMu.Unlock()
+		return called
+	}
+	ss.OnBulkSyncReceived = func() {
+		calledMu.Lock()
+		called = true
+		calledMu.Unlock()
+	}
+
+	// Spurious BulkEnd (epoch 42) with NO preceding BulkStart — bulkInProgress
+	// is false.
+	var spuriousBuf [8]byte
+	binary.LittleEndian.PutUint64(spuriousBuf[:], 42)
+	ss.handleMessage(nil, syncMsgBulkEnd, spuriousBuf[:])
+
+	time.Sleep(50 * time.Millisecond)
+	if wasCalled() {
+		t.Fatal("#5272: OnBulkSyncReceived must NOT fire for a BulkEnd with no bulk transfer in progress (spurious frame released the VRRP sync hold)")
+	}
+	if ss.BulkEverCompleted() {
+		t.Fatal("#5272: bulkEverCompleted must NOT be set by a spurious BulkEnd (no active transfer)")
+	}
+	if _, ok := dp.v4sessions[dataplane.SessionKey{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6}]; !ok {
+		t.Fatal("#5272: session must not be reconciled/deleted by a spurious BulkEnd")
+	}
+
+	// Regression guard: a LEGITIMATE bulk (BulkStart -> BulkEnd, matching
+	// epoch, bulkInProgress == true) MUST still complete + release the hold.
+	var startBuf [8]byte
+	binary.LittleEndian.PutUint64(startBuf[:], 7)
+	ss.handleMessage(nil, syncMsgBulkStart, startBuf[:])
+	var endBuf [8]byte
+	binary.LittleEndian.PutUint64(endBuf[:], 7)
+	ss.handleMessage(nil, syncMsgBulkEnd, endBuf[:])
+
+	time.Sleep(50 * time.Millisecond)
+	if !wasCalled() {
+		t.Fatal("#5272: legitimate BulkStart->BulkEnd must still fire OnBulkSyncReceived (hold release must not be deadlocked)")
+	}
+	if !ss.BulkEverCompleted() {
+		t.Fatal("#5272: legitimate bulk must still set bulkEverCompleted")
+	}
+}
+
+// TestBulkAckNoPendingIgnored proves the #5272 safety-gate fix on the outbound
+// path: a BulkAck received with no pending outbound bulk (pendingBulkAckEpoch
+// == 0 — nothing we sent and are awaiting the ack for) must NOT set
+// bulkEverCompleted / outboundBulkAcked and must NOT fire OnBulkSyncAckReceived.
+// Doing so would release the outbound-bulk safety gate (and suppress the
+// #4090/#4360 stranded-bulk re-drive) with no real outbound transfer. A
+// subsequent ack for a genuinely pending outbound bulk MUST still complete.
+func TestBulkAckNoPendingIgnored(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+
+	var calledMu sync.Mutex
+	called := false
+	wasCalled := func() bool {
+		calledMu.Lock()
+		defer calledMu.Unlock()
+		return called
+	}
+	ss.OnBulkSyncAckReceived = func() {
+		calledMu.Lock()
+		called = true
+		calledMu.Unlock()
+	}
+
+	// Spurious BulkAck (epoch 9) with NO pending outbound bulk.
+	if ss.pendingBulkAckEpoch.Load() != 0 {
+		t.Fatal("precondition: expected no pending outbound bulk")
+	}
+	var spuriousBuf [8]byte
+	binary.LittleEndian.PutUint64(spuriousBuf[:], 9)
+	ss.handleMessage(nil, syncMsgBulkAck, spuriousBuf[:])
+
+	time.Sleep(50 * time.Millisecond)
+	if wasCalled() {
+		t.Fatal("#5272: OnBulkSyncAckReceived must NOT fire for a BulkAck with no pending outbound bulk")
+	}
+	if ss.outboundBulkAcked.Load() {
+		t.Fatal("#5272: outboundBulkAcked must NOT be set by a spurious BulkAck (no pending outbound bulk)")
+	}
+	if ss.BulkEverCompleted() {
+		t.Fatal("#5272: bulkEverCompleted must NOT be set by a spurious BulkAck")
+	}
+
+	// Regression guard: an ack for a genuinely pending outbound bulk MUST still
+	// complete — set the flags, fire the callback, and clear the pending epoch.
+	ss.pendingBulkAckEpoch.Store(7)
+	ss.pendingBulkAckSince.Store(time.Now().UnixNano())
+	var pendingBuf [8]byte
+	binary.LittleEndian.PutUint64(pendingBuf[:], 7)
+	ss.handleMessage(nil, syncMsgBulkAck, pendingBuf[:])
+
+	time.Sleep(50 * time.Millisecond)
+	if !wasCalled() {
+		t.Fatal("#5272: a matching outbound BulkAck must still fire OnBulkSyncAckReceived")
+	}
+	if !ss.outboundBulkAcked.Load() {
+		t.Fatal("#5272: a matching outbound BulkAck must still set outboundBulkAcked")
+	}
+	if !ss.BulkEverCompleted() {
+		t.Fatal("#5272: a matching outbound BulkAck must still set bulkEverCompleted")
+	}
+	if _, _, ok := ss.PendingBulkAck(); ok {
+		t.Fatal("#5272: a matching outbound BulkAck must clear the pending epoch")
+	}
 }

@@ -75,6 +75,61 @@
   scripts/deploy/test_xpf_deploy_image_roll_identity.py,
   docs/in-place-upgrade.md, _Log.md
 
+## 2026-07-16 — #5090 (pkg/vrrp, validation hardening): bound VRRPv3 advert address count before serialize
+- **Timestamp**: 2026-07-16 (fix/5090-vrrp-advert-count-cap)
+- **Action**: Fix #5090. STEP-0 confirmed live on origin/master: `Marshal` in
+  `pkg/vrrp/packet.go` took `count := len(p.IPAddresses)` (unbounded int),
+  serialized the full 8+N-byte payload, then narrowed the header Count field
+  with `buf[3] = uint8(count)` and NO address-count bound. With 256 addresses
+  Count wraps to 0 (256 mod 256) while the payload is fully serialized, so
+  receivers reject/misparse the advert. Trigger is impractical (IPv6 MTU caps a
+  single-family list well below 255) → Low validation hardening. Fix: add
+  `MinAdvertAddrCount=1`/`MaxAdvertAddrCount=255` constants (RFC 5798 §5.2.4 —
+  Count is an 8-bit field) and a guard at the top of `Marshal`, BEFORE buffer
+  allocation, that returns an error when `count < 1 || count > 255` — mirroring
+  the vrrp.go MinVRID/MaxVRID guard (#4573). REJECT, not silent truncate (a cap
+  would drop VIPs from the advert). Callers (`sendPacketIPv4`/`sendPacketIPv6`)
+  already propagate a Marshal error; `sendAdvert` only builds a packet when
+  `len(addrs) > 0`, so the lower bound never fires on the legit path. No wire-
+  format change; the normal 1..255 path is byte-identical.
+- **File(s)**: pkg/vrrp/packet.go,
+  pkg/vrrp/packet_addrcount_5090_test.go (new), _Log.md
+- **Validation**: new tests (`TestMarshal_RejectsOver255Addresses`,
+  `TestMarshal_AddressCountBoundaries`, `TestMarshal_NormalAdvertUnchanged`) —
+  fail-on-revert proven firsthand: neutralize the guard → 256-address Marshal
+  succeeds with serialized Count byte == 0 (RED), boundary count=0/256 no longer
+  error (RED); restore → GREEN. Full `pkg/vrrp` suite green under `-race`;
+  `go build ./...` + `go vet ./pkg/vrrp` clean. No doc change: README documents
+  state-machine/timing/checksum behavior, not a wire-format Count/Marshal
+  address-count contract — the code-level doc comment on the new constants is
+  the contract home.
+
+## 2026-07-16 — #5817 (scripts/deploy, security): fetch verify/use TOCTOU + non-exclusive temp
+- **Timestamp**: 2026-07-16 (fix/5817-deploy-verify-toctou)
+- **Action**: Fix #5817 (codex-183 audit, supply-chain TOCTOU). STEP-0 confirmed
+  live on origin/master (3b3b15eff): `sign.verify_image_artifact` hashes a path
+  and returns only `True` (no inode retained); `cmd_fetch` verifies each artifact
+  at its PUBLIC `--out` pathname, then hands that SAME pathname to a different
+  consumer — `_install_libvirt_golden` copy-to-golden or `incus image import` —
+  so a process able to write `--out` could swap unauthenticated bytes in between
+  the checksum check and the consumer's open (verify-by-name / use-by-name race).
+  Secondary: `fetch_one` downloaded to a predictable shared `<dst>.tmp` with no
+  exclusive create, so a concurrent fetch to the same `--out` could collide.
+  Mechanism (A): the two in-process consumers now read from a private 0700
+  mkdtemp OUTSIDE `--out` (`_verified_private_artifacts`) — each consumed
+  artifact is COPIED there and re-verified against the signed manifest, then that
+  private path is handed to the consumer (portable for BOTH libvirt and incus:
+  each takes a pathname; nothing that can write `--out` can reach the staging
+  dir). Downloads use `mkstemp` (O_CREAT|O_EXCL, unpredictable) + atomic
+  `os.replace` (`_download_to`). Verification itself is unchanged (not weakened).
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_verify_toctou.py (new), docs/install-images.md,
+  _Log.md
+- **Validation**: new `test_xpf_deploy_verify_toctou` (5 tests) — fail-on-revert
+  proven firsthand: neutralize the staging (hand back public path) → swap-reaches
+  -consumer asserts flip RED; neutralize to `dst + ".tmp"` → predictable-temp
+  clobber assert flips RED; both restore GREEN. `make selftest` green.
+
 ## 2026-07-16 — #5815 (scripts/dist, security): publish gate ignored signed base_image_pinned
 - **Timestamp**: 2026-07-16 (fix/5815-publish-base-pinned-gate)
 - **Action**: Fix #5815 (codex-183 audit, release-provenance bypass). STEP-0
@@ -50212,3 +50267,8 @@ top.
 - **Timestamp**: 2026-07-16
 - **Action**: Fix #5843 (codex-183 audit, High/High HA correctness). STEP-0 confirmed live on origin/master 9d4b7041d: pkg/daemon/rg_state.go CheckVRRPPosture computed `anyMaster := s.anyMasterLocked()` and reported NeedsMaster only on `clusterPri && !anyMaster`. So an RG with TWO RETH VRRP instances where ONE is MASTER and one is BACKUP/stuck read as complete primary posture — the mismatch timer was CLEARED and UpdateRGPriority was never re-driven, leaving the non-MASTER interface's VIP peer-owned/blackholed and never repaired. Second gap: reconcileRGState builds rgVRRP ONLY from currently-instantiated VRRP states (d.vrrpMgr.InstanceStates()), so an instance that failed to instantiate is invisible and "all present are MASTER" wrongly reads as complete. Fix: (1) CheckVRRPPosture now takes an expectedInstances count and classifies complete primary posture as `allMasterLocked() && instantiated >= expected` (allExpectedMaster), NOT anyMaster — a PARTIAL state (some master, some backup/stuck) keeps the mismatch timer running and, after the delay, signals NeedsMaster so the posture fixer re-drives UpdateRGPriority; the resign path still keys off anyMaster (a lingering MASTER on a secondary must resign). (2) reconcileRGState derives the expected per-RG count from the active config via new helper d.expectedRethVRRPCounts() (wraps vrrp.CollectRethInstances, keyed by rgIDFromVRID(GroupID)) and passes expectedVRRP[rgID] to CheckVRRPPosture, so an expected-but-missing instance (1 of 2 instantiated) is treated as non-master (needs repair) rather than absent-and-ignored. The len(vrrpInstances)==0 early-return is preserved (a fully-absent RG has nothing to drive UpdateRGPriority against; re-instantiation is reconcileVRRPInstances' job) — the inventory fix is bounded to the PARTIAL case. No-flap: a genuinely-complete RG (all expected MASTER) still reads OK and clears the timer; all-backup-on-primary and secondary-resign classifications are unchanged; only the PARTIAL case flips OK→needs-repair, and the pre-existing 2s/10s mismatch delay rides out transient election jitter so only a SUSTAINED partial triggers the (already-existing) re-drive. Fail-on-revert PROVEN firsthand: (a) neutralize allExpectedMaster→anyMaster → TestRGStateMachine_CheckVRRPPosture_PartialMasterNeedsRepair RED ("partial ownership must keep the mismatch timer RUNNING, but it was cleared"); (b) drop the `&& instantiated >= expected` clause → TestRGStateMachine_CheckVRRPPosture_MissingInstanceNeedsRepair RED (same assertion) while the partial test stays GREEN (allMaster intact) — isolates the inventory clause; restored → all GREEN. Regression guards added: AllExpectedMasterOK (no churn, timer cleared), AllBackupPrimaryUnchanged (NeedsMaster), SecondaryPartialResignUnchanged (NeedsResign + secondary all-backup OK). Validation: GOCACHE=/tmp/gc5843 GOTMPDIR=/tmp/g5843 go build ./... clean; go vet ./pkg/daemon clean; full pkg/daemon suite -race GREEN (23.8s). Go-only, no cargo. Module doc = the CheckVRRPPosture doc comment (updated); no separate markdown doc for the posture check exists. test-failover smoke blocked by the loss-cluster shim-ABI wall — gated on the fail-on-revert unit tests; parent to record the smoke deferral.
 - **File(s)**: pkg/daemon/rg_state.go (edit — CheckVRRPPosture allExpectedMaster + expectedInstances param + inventory-gap doc), pkg/daemon/daemon_ha.go (edit — expectedRethVRRPCounts helper; reconcileRGState wires expectedVRRP[rgID] into CheckVRRPPosture), pkg/daemon/rg_state_test.go (edit — 5 new #5843 fail-on-revert + regression tests; existing posture call sites take expected count)
+
+## 2026-07-16 — #5272 gate bulk-completion on an active/pending transaction
+- **Timestamp**: 2026-07-16
+- **Action**: Fix #5272 (security — stateful-failover safety-gate bypass). STEP-0 confirmed live on origin/master edfadc9d9: pkg/cluster/sync_conn.go `syncMsgBulkEnd` checked the epoch ONLY inside `if s.bulkInProgress && s.bulkRecvEpoch != epoch`; with NO bulk in progress (`bulkInProgress==false`) the condition was false, so a spurious/replayed BulkEnd STILL ran reconcileStaleSessions, ACKed, latched `bulkEverCompleted`, and fired `OnBulkSyncReceived` — which releases the VRRP sync hold → the node becomes MASTER-eligible while forwarding with an EMPTY/STALE peer session table (a mid-session failover blackholes). `syncMsgBulkAck` set `bulkEverCompleted`/`outboundBulkAcked` and fired `OnBulkSyncAckReceived` UNCONDITIONALLY, even when no outbound bulk was pending, so a spurious BulkAck released the outbound-bulk gate (and suppressed the #4090/#4360 stranded-bulk re-drive) with no real transfer. Fix (extend the existing in-progress guard to the not-in-progress case; LOCAL state, no wire field / no version bump): BulkEnd now drops (debug-log + break, no ACK/no completion/no callback) when `!bulkInProgress`, keeping the existing epoch check + full completion path unchanged when a bulk IS in progress; BulkAck now completes (clear pending, set flags, fire callback) ONLY when `pendingBulkAckEpoch != 0 && epoch >= pending` — the pre-existing pending-match condition (recorded before the outbound BulkEnd write per #3912) — and drops otherwise. Legit path preserved: a real BulkStart→sessions→BulkEnd (matching epoch, in progress) still reconciles + releases the hold; a real ack of our outbound bulk still completes. Back-compat: a legacy peer's legitimate bulk still completes because the gate keys on OUR local state, not a wire version. Fail-on-revert PROVEN firsthand: (a) neutralize the BulkEnd gate (revert to the `bulkInProgress && epoch-mismatch`-only check) → TestBulkEndSpuriousNoTransferIgnored RED ("OnBulkSyncReceived must NOT fire for a BulkEnd with no bulk transfer in progress", log shows "bulk transfer complete epoch=42"); (b) neutralize the BulkAck gate (unconditional flag-set + callback) → TestBulkAckNoPendingIgnored RED ("OnBulkSyncAckReceived must NOT fire for a BulkAck with no pending outbound bulk"); restored → both GREEN. Regression: updated TestBulkEndTriggersCallback (previously sent a bare BulkEnd with no BulkStart and expected the callback — that asserted the exact pre-fix buggy behavior) to establish an in-progress transfer via BulkStart first; new tests also assert the legit BulkStart→BulkEnd and matching-outbound-ack paths still complete. Validation: GOCACHE=/tmp/gc5272 GOTMPDIR=/tmp/g5272 go build ./... clean; go vet ./pkg/cluster clean; full pkg/cluster suite -race GREEN (10.4s). Go-only, no cargo. test-failover smoke blocked by the loss-cluster shim-ABI wall — gated on the fail-on-revert unit tests; parent to record the smoke deferral.
+- **File(s)**: pkg/cluster/sync_conn.go (edit — syncMsgBulkEnd `!bulkInProgress` drop + split epoch check; syncMsgBulkAck pending-match gate on flag-set+callback), pkg/cluster/sync_test.go (edit — TestBulkEndSpuriousNoTransferIgnored + TestBulkAckNoPendingIgnored fail-on-revert tests; TestBulkEndTriggersCallback now BulkStart→BulkEnd), docs/sync-protocol.md (edit — BulkEnd/BulkAck receiver-table rows + "Bulk completion safety gate (#5272)" subsection)
