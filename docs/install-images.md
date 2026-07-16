@@ -23,6 +23,15 @@ Two deliverables, same root disk:
 > $XPF_IMAGE_BASE_URL` downloads, verifies the exact bytes against the signed
 > manifest, and imports. The one-command `install.sh` + signed apt repo are the
 > package path. See `docs/distribution.md`.
+>
+> `--version` (both `fetch` and `bake.py`) is validated as a path-safe artifact
+> segment before it names any `xpf-<ver>.*` file — allow only
+> `[A-Za-z0-9][A-Za-z0-9._+~-]*` (git-describe / semver such as
+> `1.2.3-5-gabcdef`, `1.0.0+build.7`, `1.0.0~rc1`), and fail closed on a path
+> separator, `..`, absolute path, leading dash, `%`, or the Debian epoch `:`
+> (never part of an artifact filename) — so a crafted version cannot redirect
+> the download/write out of the output directory (#5992). This mirrors the
+> systemd-ExecStart version grammar hardened in #5713.
 
 ## Bake
 

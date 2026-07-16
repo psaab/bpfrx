@@ -124,5 +124,85 @@ class ValidateApplianceContainmentTests(unittest.TestCase):
         xpf_deploy.validate_appliance(_appliance(), "test.yaml")
 
 
+# --- #5992: --version path-safety at the artifact-name sink -----------------
+
+# Versions that MUST be rejected before they name an artifact file.
+_BAD_VERSIONS = [
+    "../../../../etc/cron.d/x",   # traversal -> escapes --out
+    "1.0/../x",                   # embedded traversal
+    "..",                         # bare parent
+    ".",                          # bare current
+    "a/b",                        # embedded separator
+    "a\\b",                       # windows-ish separator
+    "/abs/1.2.3",                 # absolute
+    "-rf",                        # leading dash (CLI-flag injection)
+    ".hidden",                    # leading dot
+    "1.0%n",                      # '%' (also the #5713 systemd class)
+    "1.0 2.0",                    # space
+    "a;rm -rf /",                 # shell metacharacters
+    "a$(whoami)",                 # command substitution
+    "1:2.3.4",                    # epoch ':' — excluded at the FILENAME sink
+    "",                           # empty
+]
+
+# Versions the artifact naming legitimately produces (git-describe / semver);
+# tightening the grammar must NOT reject these.
+_GOOD_VERSIONS = [
+    "1.2.3", "1.2.3-5-gabcdef", "1.2.3-dirty", "1.0.0+build.7",
+    "1.0.0~rc1", "v1.2.3", "dev", "0.9.0+deb1", "2.4.1-rc3",
+]
+
+
+class ValidateVersionTests(unittest.TestCase):
+    def test_rejects_path_escaping_versions(self):
+        for v in _BAD_VERSIONS:
+            with self.assertRaises(SystemExit, msg=f"{v!r} should be rejected"):
+                xpf_deploy.validate_version(v, "--version")
+
+    def test_accepts_build_versions(self):
+        for v in _GOOD_VERSIONS:
+            self.assertEqual(xpf_deploy.validate_version(v, "--version"), v)
+
+
+class FetchVersionSinkTests(unittest.TestCase):
+    """cmd_fetch must reject a crafted --version BEFORE it names/writes any
+    artifact, so a traversal version cannot redirect the download out of --out.
+
+    RED on revert: drop the validate_version(args.version) call in cmd_fetch (or
+    the contained_join at the write) and the traversal version is accepted — the
+    dst `os.path.join(out, "xpf-../../…​.qcow2")` escapes --out.
+    """
+
+    def _args(self, version, out, dry_run=False):
+        import argparse as _ap
+        return _ap.Namespace(
+            version=version, image_url="https://example.invalid",
+            out=out, alias=None, channel="stable", allow_rollback=True,
+            qcow2_only=False, dry_run=dry_run, install_libvirt=False,
+            no_import=False)
+
+    def test_fetch_rejects_traversal_version(self):
+        # dry-run so the ONLY thing that can raise is the path-safety gate
+        # (validate_version, with contained_join as the belt) — not a network
+        # failure. Reverting BOTH gates makes dry-run print the escaping dst and
+        # return 0, so this assertRaises flips (clean RED-on-revert).
+        import tempfile
+        with tempfile.TemporaryDirectory() as out:
+            with self.assertRaises(SystemExit):
+                xpf_deploy.cmd_fetch(
+                    self._args("../../../../tmp/owned", out, dry_run=True))
+            # Nothing written outside out.
+            self.assertFalse(
+                os.path.exists(os.path.join(os.path.dirname(out), "owned.qcow2")))
+
+    def test_fetch_accepts_legit_version_dryrun(self):
+        # A legit version passes validation; dry-run performs no network/write
+        # and the resolved artifact paths stay inside --out.
+        import tempfile
+        with tempfile.TemporaryDirectory() as out:
+            rc = xpf_deploy.cmd_fetch(self._args("1.2.3-5-gabcdef", out, dry_run=True))
+            self.assertEqual(rc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

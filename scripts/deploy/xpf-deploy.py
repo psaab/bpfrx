@@ -157,6 +157,52 @@ def validate_identifier(value, field):
     return value
 
 
+# A version string is interpolated straight into artifact WRITE paths —
+# `xpf-<ver>.qcow2` and its `.incus-metadata.tar.gz` / `.SHA256SUMS` /
+# `.minisig` siblings — under the fetch/bake out-dir. A path separator, a `..`
+# component, an absolute path, or a leading dash would escape the out-dir or be
+# read as a CLI flag (the #4905-B / #5713 path-escape class), so `--version
+# '../../../etc/cron.d/x'` would write outside `--out`. `_SAFE_IDENT` is too
+# strict for a version (it forbids `+`/`~`), so validate the version against a
+# version-appropriate allowlist instead (#5992).
+_SAFE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]*\Z")
+
+
+def validate_version(value, field):
+    """Reject a version that could escape the artifact output directory when
+    substituted into `xpf-<ver>.qcow2` (and siblings).
+
+    Same fail-closed discipline as validate_identifier, with a
+    version-appropriate charset: alnum start, then `[A-Za-z0-9._+~-]` — so no
+    `/`, `\\`, `..`, absolute path, leading `.`/`-`, whitespace, `%`, or shell
+    metacharacter. Accepts git-describe (`1.2.3-5-gabcdef`) and semver
+    (`1.0.0+build.7`, `1.0.0~rc1`).
+
+    The charset MIRRORS pkg/upgrade.ValidateVersionSegment (the #5713
+    systemd-ExecStart sink) EXCEPT it drops the Debian epoch `:`: an epoch is
+    never part of an artifact FILENAME (dpkg itself encodes `:` as `%3a`), and a
+    `:` in `xpf-<ver>.qcow2` would confuse the incus image alias / tooling. This
+    is the filename sink's need, which differs from the systemd exec-path sink.
+
+    Returns value on success; die()s with a clear message otherwise (#5992)."""
+    if not isinstance(value, str) or not value:
+        die(f"{field} is required and must be a non-empty string")
+    if os.path.isabs(value):
+        die(f"{field} '{value}' must not be an absolute path")
+    if "/" in value or "\\" in value or os.sep in value \
+            or (os.altsep and os.altsep in value):
+        die(f"{field} '{value}' must not contain a path separator")
+    if value.startswith("-"):
+        die(f"{field} '{value}' must not start with '-' (would be read as a "
+            "CLI flag)")
+    if not _SAFE_VERSION.match(value):
+        die(f"{field} '{value}' is not a safe version — allow only "
+            "[A-Za-z0-9][A-Za-z0-9._+~-]* (no separators, '..', '%', spaces, "
+            "or shell metacharacters), so it cannot escape the artifact output "
+            "directory (#5992)")
+    return value
+
+
 def contained_join(dirpath, basename, field):
     """Join basename onto dirpath and assert the result stays inside dirpath.
 
@@ -1086,7 +1132,11 @@ def cmd_fetch(args):
     if not base:
         die("fetch needs --image-url or XPF_IMAGE_BASE_URL (the image host).")
     base = base.rstrip("/")
-    ver = args.version
+    # #5992: the version is interpolated into artifact WRITE paths below
+    # (xpf-<ver>.qcow2 …). Reject a path-escaping / crafted version BEFORE it
+    # names any file, so `--version '../../etc/x'` cannot redirect the download
+    # out of --out. (contained_join at the write is the defense-in-depth belt.)
+    ver = validate_version(args.version, "--version")
     out = os.path.abspath(args.out or os.getcwd())
     os.makedirs(out, exist_ok=True)
 
@@ -1126,7 +1176,9 @@ def cmd_fetch(args):
     }
 
     def fetch_one(name):
-        dst = os.path.join(out, name)
+        # #5992 defense-in-depth: even with the validated version above, refuse
+        # a write target that resolves outside `out`.
+        dst = contained_join(out, name, "artifact")
         url = f"{base}/{name}"
         if args.dry_run:
             print(f"  (dry-run) curl -fsSL {url} -> {dst}")
