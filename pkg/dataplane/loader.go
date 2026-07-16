@@ -171,9 +171,6 @@ func (m *Manager) LoadUserspaceShim() error {
 // attaches only the retained userspace XDP shim. This keeps normal AF_XDP
 // startup independent from xdp_main and TC program objects.
 func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, error) {
-	if err := m.preflightCheckIfindexCaps(); err != nil {
-		return nil, err
-	}
 	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
 		return nil, err
 	}
@@ -185,6 +182,16 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	compilerDP := userspaceShimCompileDataplane{Manager: m}
 	result, err := CompileConfig(compilerDP, cfg, m.lastCompile != nil)
 	if err != nil {
+		return nil, err
+	}
+	// Scoped ifindex-cap early-warning (#5836): reject only when an
+	// interface XPF actually attaches AF_XDP to (result.pendingXDP) has an
+	// ifindex >= MaxInterfaces — an unrelated high-ifindex host link must
+	// not fail the compile. The compiler's shim dataplane methods are
+	// no-ops, so CompileConfig writes no ifindex-keyed map before this runs;
+	// the userspace_bindings ARRAY cap in maps_sync.go stays the real
+	// fail-closed guardrail.
+	if err := m.preflightCheckIfindexCaps(ifindexSet(result.pendingXDP)); err != nil {
 		return nil, err
 	}
 	if err := m.attachUserspaceShimXDP(result); err != nil {
@@ -999,17 +1006,47 @@ func (m *Manager) AddTxPort(ifindex int) error {
 // can inject a fake without spinning up a netns.
 var linkLister = netlink.LinkList
 
-// preflightCheckIfindexCaps enumerates kernel links and returns a
-// descriptive error if any ifindex already exceeds MaxInterfaces. Called
-// from Manager.Compile() so every compile cycle fires it — catching
-// cases where a new namespace pushed ifindex past the cap between
-// config snapshots, before AddTxPort hits E2BIG deep in zone apply.
+// ifindexSet builds a lookup set from a slice of interface indexes. It
+// returns nil for an empty input so preflightCheckIfindexCaps can cheaply
+// short-circuit a config that references no interfaces.
+func ifindexSet(ifindexes []int) map[int]bool {
+	if len(ifindexes) == 0 {
+		return nil
+	}
+	s := make(map[int]bool, len(ifindexes))
+	for _, idx := range ifindexes {
+		s[idx] = true
+	}
+	return s
+}
+
+// preflightCheckIfindexCaps scans kernel links and returns a descriptive
+// error if an interface XPF actually references (attaches AF_XDP to /
+// inserts into a dense per-interface dataplane map) has an ifindex outside
+// [0, MaxInterfaces). Callers pass `referenced` — the compiled port set
+// (result.pendingXDP) — so the check is SCOPED to XPF's own interfaces.
 //
-// This is a bonus early-warning gate; the call-site cap checks in
-// AddTxPort and userspace/maps_sync.go are the real guardrails. Both
-// layers exist because interfaces can appear via netlink events at any
-// time (HA reconcile, link hotplug), not only at compile.
-func (m *Manager) preflightCheckIfindexCaps() error {
+// #5836: an UNRELATED host link (a bridge, veth, container link, or an
+// abandoned operator netdev) with a high ifindex must NOT fail the compile.
+// Only a link whose ifindex would key a dense dataplane map can overflow it,
+// so only those links are candidates for rejection. Long-lived namespaces
+// reach ifindex >= 65536 through interface churn even when XPF's managed
+// ports stay low; the previous whole-namespace enumeration rejected every
+// subsequent compile in that state.
+//
+// This remains a best-effort early-warning gate; the call-site cap checks in
+// AddTxPort (tx_ports DEVMAP) and userspace/maps_sync.go (userspace_bindings
+// ARRAY, idx = ifindex*BindingQueuesPerIface + queue) are the real
+// fail-closed guardrails. Both layers exist because interfaces can appear via
+// netlink events at any time (HA reconcile, link hotplug), not only at
+// compile. Called after CompileConfig so `referenced` reflects the exact set
+// of interfaces the compile resolved.
+func (m *Manager) preflightCheckIfindexCaps(referenced map[int]bool) error {
+	if len(referenced) == 0 {
+		// No XPF-referenced interfaces resolved (e.g. empty config): nothing
+		// can overflow a per-interface map, so there is nothing to pre-check.
+		return nil
+	}
 	links, err := linkLister()
 	if err != nil {
 		// Non-fatal: a transient netlink error on preflight should not
@@ -1021,6 +1058,12 @@ func (m *Manager) preflightCheckIfindexCaps() error {
 	for _, l := range links {
 		attrs := l.Attrs()
 		if attrs == nil {
+			continue
+		}
+		if !referenced[attrs.Index] {
+			// Not an interface XPF attaches/maps — an unrelated bridge, veth,
+			// container link, or operator netdev with a high ifindex must not
+			// fail the compile (#5836).
 			continue
 		}
 		if attrs.Index < 0 || uint32(attrs.Index) >= MaxInterfaces {

@@ -1,3 +1,37 @@
+## 2026-07-16 — #5836 (dataplane loader): scope ifindex preflight to XPF-referenced links (codex-183)
+- **Timestamp**: 2026-07-16 (fix/5836-ifindex-preflight-scope)
+- **Action**: Fix #5836. `preflightCheckIfindexCaps` enumerated the WHOLE host
+  netns via `netlink.LinkList` and rejected the compile if ANY link had an
+  ifindex outside `[0, MaxInterfaces)` — so an unrelated bridge/veth/container
+  link or an abandoned operator netdev that churned past 65536 failed EVERY
+  subsequent userspace-dataplane compile, even though XPF's managed ports stayed
+  low. Chose **Option A (SCOPE)**: the preflight now takes a `referenced` set
+  and rejects only links XPF actually attaches AF_XDP to — the compiled port set
+  `result.pendingXDP` (physical zone interfaces, RETH members, VLAN parents,
+  tunnels, fabric parents, all resolved to `physIface.Index` in
+  compiler_iface.go). Moved both call sites (`CompileUserspaceShim` in loader.go;
+  retired-eBPF `Manager.Compile` in compiler.go) to run the check AFTER
+  `CompileConfig` so `pendingXDP` is populated — safe because every
+  ifindex-touching method of `userspaceShimCompileDataplane` (AddTxPort/SetZone/
+  SetVlanIfaceInfo/SetMirrorConfig) is a no-op, so CompileConfig writes no
+  ifindex-keyed kernel map before the check. Real fail-closed guardrails
+  UNCHANGED and preserved: `AddTxPort` tx_ports cap (loader.go) and the
+  `userspace_bindings` ARRAY cap `idx=ifindex*16+queue >= BindingArrayMaxEntries`
+  (userspace/maps_sync.go:696) still reject a genuinely-too-high XPF-mapped
+  ifindex. `userspace_ingress_ifaces` is a HASH (key=ifindex, no cap needed).
+  Rejected Option B (remove global preflight) because the userspace_bindings
+  guard fires at status-sync time (not compile) and the watchdog re-sync path
+  only logs-and-skips — keeping a scoped compile-time early-warning is safer.
+  Added `ifindexSet` helper. Tests (fail-on-revert, both firsthand RED-verified):
+  new `TestPreflightCheckIfindexCaps_UnrelatedHighIfindexIgnored` (the #5836 fix
+  — RED when scope guard reverted to whole-namespace),
+  `_ReferencedHighIfindexRejected` (real guard — RED when cap comparison
+  removed), `_EmptyReferencedPasses`; existing preflight tests updated to the
+  scoped signature. Build/vet clean; `pkg/dataplane` (minus pre-existing
+  unrelated `TestUserspaceManagerDoesNotImportReflectOrUnsafe`) + full
+  `pkg/dataplane/userspace` GREEN under `-race`.
+- **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/compiler.go, pkg/dataplane/constants_test.go, _Log.md
+
 ## 2026-07-16 — #5765 (Rust dataplane): u16 length-cast defense-in-depth (claude-spark-review-002)
 - **Timestamp**: 2026-07-16 (fix/5765-u16-lencast-hardening)
 - **Action**: Harden 4 `... as u16` casts on packet/segment/frame lengths in the
