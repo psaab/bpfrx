@@ -49158,3 +49158,8 @@ top.
     pkg/config/compiler_validate_strict_application.go,
     pkg/config/compiler_reserved_appname_5821_test.go,
     docs/services-application-identification.md
+
+## 2026-07-16 — #5963 CoS nested-unit validation
+- **Timestamp**: 2026-07-16
+- **Action**: Fix #5963 — reject a malformed NESTED `class-of-service interfaces <if> unit <n>` at commit instead of silently dropping it. Replaced the silent `strconv.Atoi(unitNode.Keys[1]); if err != nil { continue }` at the CoS parse site with `CanonicalLogicalUnit` (#5878 normalizer — returns the int used to key `iface.Units` + the shared #5829 acceptance check). Strict hard-reject on commit/commit-check; lenient warn-and-drop on the tolerant load/peer-sync path via the existing `lenientInterfaceUnitRef` flag (matches #5933's suffix-gate doctrine, #1960 no-brick). Valid unit still binds the shaper unchanged.
+- **File(s)**: pkg/config/compiler_class_of_service.go (edit), pkg/config/cos_nested_unit_5963_test.go (new, RED-on-revert), docs/config-schema.md (edit — #5933 section residual-closed note)

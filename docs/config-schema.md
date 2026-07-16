@@ -433,6 +433,35 @@ Covered by `pkg/config/interface_unit_ref_5933_test.go` (per-subsystem strict
 reject naming the subsystem + bad token, valid-unit accepted, bare-interface
 accepted, lenient warn), each subsystem independently RED on revert.
 
+#### Residual closed: the NESTED `class-of-service interfaces <if> unit <n>` form (#5963)
+
+#5933 above closed the three `.unit` SUFFIX references, but the DISTINCT nested
+grammar slot — `class-of-service interfaces <if> unit <n> ...`, where the unit is
+a CHILD node rather than a `.unit` suffix — remained unvalidated. Its schema node
+(`schema_cos.go`) carries no `keyValidator` (the `unit` key is a free
+`<unit-number>` placeholder), so `SchemaValidate` accepted a non-numeric `unit`,
+and the CoS compiler then SILENTLY DROPPED it: `strconv.Atoi(unitNode.Keys[1]); if
+err != nil { continue }` in `compiler_class_of_service.go`. `set class-of-service
+interfaces ge-0-0-0 unit abc shaping-rate 1m` compiled clean (`CompileConfig`
+returned nil) and the shaper never bound — the SAME mis-bind / silent-drop class
+#5829/#5933 closed, and arguably the more common Junos CoS syntax. #5933 could not
+catch it: by the time `validateInterfaceUnitReferencesStrict` runs the malformed
+unit is already dropped at parse, so there is nothing left at the reference gate.
+
+The fix routes `unitNode.Keys[1]` through the canonical `CanonicalLogicalUnit`
+normalizer (#5878) AT the CoS parse site — it returns the parsed int (used to key
+`iface.Units`) plus the shared #5829 acceptance check in one call, so a
+non-numeric / negative / integer-overflow / out-of-range `[0..MaxLogicalUnit]`
+unit is REJECTED at commit instead of dropped. Strict on commit / commit-check
+(hard-reject naming the interface + bad token); the `lenientInterfaceUnitRef` opt
+(the same flag the #5933 suffix gate uses) downgrades it to a `cfg.Warnings` entry
+on the tolerant load / peer-sync paths (#1960 no-brick — the malformed unit was
+inert before the gate too, the shaper simply did not bind). A VALID unit still
+binds the shaper unchanged. Covered by `pkg/config/cos_nested_unit_5963_test.go`
+(strict reject of non-numeric/negative/overflow/out-of-range naming the token,
+valid `unit 0`/`unit 100` binds the shaper, lenient warn-and-drop), RED on revert
+of the parse-site gate.
+
 ### security address-book same-name `address` + `address-set` collision (#5676)
 
 `address` and `address-set` entries share ONE operator-visible namespace (a
