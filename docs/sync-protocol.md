@@ -679,11 +679,42 @@ This is **additive** to the periodic sweep — it provides sub-millisecond sync 
 |------|--------|
 | SessionV4/V6 | Decode → install forward → create reverse → create dnat_table (SNAT) |
 | DeleteV4/V6 | Lookup → delete reverse → delete dnat_table (SNAT) → delete forward |
-| BulkStart/End | Log markers; BulkEnd triggers `OnBulkSyncReceived` (releases VRRP sync hold) |
+| BulkStart/End | Log markers; a BulkEnd for a bulk that was **actually in progress** (`bulkInProgress` set by a preceding BulkStart) with a matching epoch triggers `reconcileStaleSessions` + `OnBulkSyncReceived` (releases the VRRP sync hold). A BulkEnd with `bulkInProgress==false` — no active transfer — is dropped as spurious/replayed (#5272); it does NOT reconcile, ACK, set `bulkEverCompleted`, or release the hold |
+| BulkAck | Completes an **outbound** bulk only when it matches a pending outbound epoch (`pendingBulkAckEpoch != 0 && epoch >= pending`): clears the pending epoch, sets `bulkEverCompleted`/`outboundBulkAcked`, fires `OnBulkSyncAckReceived`. A BulkAck with no pending outbound bulk is dropped as spurious/replayed (#5272) — it does NOT set the flags or fire the callback |
 | Heartbeat | No-op (resets read deadline) |
 | Config | Decode `(text, gen)` → enqueue on the single-consumer ordered apply queue (`configApplyLoop`); `shouldApplyConfigGen` drops out-of-order older gens, then `OnConfigReceived` applies and the high-water advances (`recordAppliedConfigGen`) ONLY on a successful apply — a failure counts `ConfigsApplyFailed` and re-admits the peer's re-push (#3931, M-2/#4151) |
 | IPsecSA | `stripFullSetSeq` → `fullSetSeqGuard.admit`; a stale reorder is dropped (`IPsecSAStaleIgnored`), otherwise store names + call `OnIPsecSAReceived` (#5706) |
 | DHCPLeaseV4/V6 | `stripFullSetSeq` → per-family `fullSetSeqGuard.admit`; a stale reorder is dropped (`DHCPLeasesStaleIgnored`), otherwise store the lease set + call `OnDHCPLeasesReceived` (#2239/#5706) |
+
+### Bulk completion safety gate (#5272)
+
+`BulkEnd`/`BulkAck` are the two frames that release the stateful-failover
+safety gate — completing a bulk sets the sticky completion flags
+(`bulkEverCompleted`/`outboundBulkAcked`) and fires the callbacks that let VRRP
+release its sync hold, making the node MASTER-eligible. That release is only
+safe once a *real* bulk transfer has moved the peer's session table. Both
+handlers therefore require an **active, matching transaction** before they
+complete:
+
+- **`BulkEnd` requires `bulkInProgress`.** A BulkEnd is only honored when a
+  preceding `BulkStart` set `bulkInProgress = true` (then the existing epoch
+  check applies). A BulkEnd that arrives with `bulkInProgress == false` — a
+  buggy / mixed-version / replaying peer frame, or one that lands after the
+  transfer was torn down on disconnect — is dropped (debug log, no ACK, no
+  completion flag, no callback). Without this gate a spurious BulkEnd on a node
+  that never received a bulk would release the hold with an **empty/stale peer
+  session table**, so a failover mid-session blackholes.
+- **`BulkAck` requires a pending outbound bulk.** A BulkAck only completes when
+  it matches a pending outbound epoch (`pendingBulkAckEpoch != 0 && epoch >=
+  pending`, recorded before the outbound `BulkEnd` write per #3912). A BulkAck
+  with no pending outbound bulk is dropped — otherwise it would prematurely set
+  `outboundBulkAcked` (releasing the outbound-bulk gate and suppressing the
+  #4090/#4360 stranded-bulk re-drive) with no real outbound transfer acked.
+
+The gate is **local state** (`bulkInProgress` / `pendingBulkAckEpoch`), not a
+wire field — no protocol version bump — so a legacy peer's *legitimate* bulk
+(BulkStart → sessions → BulkEnd, or a real ack of our outbound bulk) still
+completes and releases the hold exactly as before.
 
 ### Session Reconstruction on Receiver
 

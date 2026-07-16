@@ -1543,7 +1543,24 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			epoch = binary.LittleEndian.Uint64(payload[:8])
 		}
 		s.bulkMu.Lock()
-		if s.bulkInProgress && s.bulkRecvEpoch != epoch {
+		if !s.bulkInProgress {
+			// #5272: a BulkEnd with NO bulk transfer actually in progress
+			// on our side is spurious or replayed — a buggy / mixed-version
+			// / replaying peer frame, or a BulkEnd that arrives after we
+			// tore the transfer down on disconnect. Completing it here would
+			// reconcile-as-done, ACK, latch bulkEverCompleted, and fire
+			// OnBulkSyncReceived, which RELEASES the VRRP sync hold: the node
+			// would become MASTER-eligible while forwarding with an empty /
+			// stale peer session table (stateful failover broken — a mid-
+			// session failover blackholes). Only a real BulkStart -> ... ->
+			// BulkEnd transfer may release the safety gate. This is LOCAL
+			// state (no wire field, no version bump), so a legacy peer's
+			// legitimate bulk still completes.
+			s.bulkMu.Unlock()
+			slog.Debug("cluster sync: ignoring BulkEnd with no bulk transfer in progress", "got", epoch)
+			break
+		}
+		if s.bulkRecvEpoch != epoch {
 			s.bulkMu.Unlock()
 			slog.Warn("cluster sync: ignoring BulkEnd with mismatched epoch", "expected", s.bulkRecvEpoch, "got", epoch)
 			break
@@ -1565,10 +1582,24 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		epoch := binary.LittleEndian.Uint64(payload[:8])
 		stats := s.Stats()
 		slog.Info("cluster sync: bulk ack received", "epoch", epoch, "local", connLocalAddrString(conn), "remote", connRemoteAddrString(conn), "sessions_sent", stats.SessionsSent, "sessions_received", stats.SessionsReceived, "sessions_installed", stats.SessionsInstalled, "queue_len", len(s.sendCh), "queue_cap", cap(s.sendCh))
-		if pending := s.pendingBulkAckEpoch.Load(); pending != 0 && epoch >= pending {
-			s.pendingBulkAckEpoch.Store(0)
-			s.pendingBulkAckSince.Store(0)
+		pending := s.pendingBulkAckEpoch.Load()
+		if pending == 0 || epoch < pending {
+			// #5272: a BulkAck with no matching pending outbound bulk (we
+			// never sent a bulk we are awaiting the ack for, or this ack is
+			// for a stale/older epoch) is spurious or replayed. Setting
+			// bulkEverCompleted / outboundBulkAcked and firing
+			// OnBulkSyncAckReceived would release the outbound-bulk safety
+			// gate (and suppress the #4090/#4360 stranded-bulk re-drive) with
+			// no real outbound transfer having been acknowledged. Ignore it.
+			// The gate is LOCAL pending-outbound state (recorded before we
+			// write the BulkEnd, #3912) — no wire field, no version bump — so
+			// a legacy peer's legitimate ack of our outbound bulk still
+			// completes.
+			slog.Debug("cluster sync: ignoring BulkAck with no pending outbound bulk", "got", epoch, "pending", pending)
+			return
 		}
+		s.pendingBulkAckEpoch.Store(0)
+		s.pendingBulkAckSince.Store(0)
 		s.bulkEverCompleted.Store(true)
 		// #4360: the peer acked OUR outbound bulk — record it on the
 		// outbound-only flag so a stranded outbound bulk can be re-driven on a
