@@ -575,7 +575,7 @@ fn build_syn_cookie_tcp_reply_v4(
     write_reply_eth_header(frame, &mut out, parsed.l3)?;
     let ip_out = out.get_mut(parsed.l3..parsed.l3 + total_len)?;
     ip_out[0] = 0x45;
-    ip_out[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    ip_out[2..4].copy_from_slice(&saturate_len16(total_len).to_be_bytes());
     ip_out[8] = SYN_COOKIE_REPLY_TTL;
     ip_out[9] = PROTO_TCP;
     ip_out[12..16].copy_from_slice(&dst.octets());
@@ -612,7 +612,7 @@ fn build_syn_cookie_tcp_reply_v6(
     write_reply_eth_header(frame, &mut out, parsed.l3)?;
     let ip_out = out.get_mut(parsed.l3..frame_len)?;
     ip_out[0] = 0x60;
-    ip_out[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+    ip_out[4..6].copy_from_slice(&saturate_len16(tcp_len).to_be_bytes());
     ip_out[6] = PROTO_TCP;
     ip_out[7] = SYN_COOKIE_REPLY_HOP_LIMIT;
     ip_out[8..24].copy_from_slice(dst);

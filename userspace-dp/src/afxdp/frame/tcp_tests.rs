@@ -1103,3 +1103,77 @@ fn frame_tcp_v6_non_tcp_after_ext_header() {
     assert!(extract_tcp_flags_and_window(&frame).is_none());
     assert_eq!(extract_tcp_window(&frame, libc::AF_INET6 as u8), None);
 }
+
+// ---------- #5765: SYN-cookie length-field narrowing (defense-in-depth) ----------
+//
+// `build_syn_cookie_tcp_reply_v{4,6}` narrow a length (v4: the IPv4
+// `total_length = 20 + tcp_len`; v6: the IPv6 `payload_length = tcp_len`) into
+// the 16-bit wire field. The bare `as u16` at those sites is hardened to
+// `saturate_len16` for idiom-consistency with the checksum sites, BUT the
+// truncation is TRULY UNREACHABLE — even at this function boundary: the builder
+// calls `write_syn_cookie_tcp_header`, which hard-REJECTS (returns None) any
+// `tcp_len` that is not exactly `TCP_MIN_HEADER_LEN` (20) or
+// `TCP_MIN_HEADER_LEN + TCP_MSS_OPTION_LEN` (24). So `total_len` is at most 44
+// and the length narrowing can never observe a >64K value: an oversized reply
+// is discarded (None), never emitted with a wrapped length. The two tests below
+// GUARD that structural gate (a huge `tcp_len` yields None, not a bad reply);
+// the fail-on-revert coverage for the `saturate_len16` primitive these sites now
+// share lives in `checksum::len16_hardening_tests`.
+
+#[test]
+fn syn_cookie_reply_v4_rejects_oversized_tcp_len() {
+    let frame = reject_v4_tcp_frame(TCP_FLAG_SYN, 0x1111_2222, 0);
+    let parsed = parse_tcp_reply_source(&frame).expect("valid v4 SYN frame parses");
+    // A >64K tcp_len (total_len = 20 + tcp_len overflows u16) is structurally
+    // rejected by write_syn_cookie_tcp_header BEFORE any reply escapes — this
+    // is exactly what makes the total_len narrowing unreachable-for-wrap.
+    let out = build_syn_cookie_tcp_reply_v4(
+        &frame,
+        parsed,
+        65_516usize,
+        0xdead_beef,
+        0x1111_2223,
+        TCP_FLAG_SYN | TCP_FLAG_ACK,
+        0,
+    );
+    assert!(out.is_none(), "oversized tcp_len must be rejected, never emitted with a wrapped total_length");
+}
+
+#[test]
+fn syn_cookie_reply_v6_rejects_oversized_tcp_len() {
+    let frame = reject_v6_tcp_frame(TCP_FLAG_SYN, 0x3333_4444, 0);
+    let parsed = parse_tcp_reply_source(&frame).expect("valid v6 SYN frame parses");
+    // A >64K tcp_len (= the IPv6 payload_length, overflows u16) is likewise
+    // rejected before any reply escapes.
+    let out = build_syn_cookie_tcp_reply_v6(
+        &frame,
+        parsed,
+        65_536usize,
+        0xdead_beef,
+        0x3333_4445,
+        TCP_FLAG_SYN | TCP_FLAG_ACK,
+        0,
+    );
+    assert!(out.is_none(), "oversized tcp_len must be rejected, never emitted with a wrapped payload_length");
+}
+
+#[test]
+fn syn_cookie_reply_v4_in_range_length_is_exact() {
+    // Regression guard: a normal-sized reply must carry the exact
+    // total_length, byte-identical to the pre-hardening cast.
+    let frame = reject_v4_tcp_frame(TCP_FLAG_SYN, 0x1111_2222, 0);
+    let parsed = parse_tcp_reply_source(&frame).expect("valid v4 SYN frame parses");
+    let tcp_len = 24usize; // header + MSS option, the real production size
+    let out = build_syn_cookie_tcp_reply_v4(
+        &frame,
+        parsed,
+        tcp_len,
+        0xdead_beef,
+        0x1111_2223,
+        TCP_FLAG_SYN | TCP_FLAG_ACK,
+        1460,
+    )
+    .expect("v4 SYN-cookie reply builds");
+    let total_len_field = u16::from_be_bytes([out[parsed.l3 + 2], out[parsed.l3 + 3]]);
+    assert_eq!(total_len_field, (20 + tcp_len) as u16, "in-range total_length must be exact");
+}
