@@ -31,6 +31,10 @@ func newHoldTestInstance(t *testing.T, priority, holdSec int) *vrrpInstance {
 	}, &net.Interface{Name: "eth0"}, make(chan VRRPEvent, 16), nil)
 	vi.setLocalIP(net.IPv4(10, 0, 0, 1))
 	vi.suppressGARP.Store(true)
+	// becomeMaster is fail-closed on VIP actuation (#5082); this test uses a
+	// fake interface, so install no-op success seams to keep the transition
+	// reachable — the hold-time logic under test is what matters here.
+	installFakeVIPNetlink(vi)
 	vi.setState(StateBackup)
 	return vi
 }
