@@ -536,9 +536,33 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig, opts compileOp
 			if len(unitNode.Keys) < 2 {
 				continue
 			}
-			unitID, err := strconv.Atoi(unitNode.Keys[1])
+			// #5963: the NESTED `class-of-service interfaces <if> unit <n>`
+			// form (unit as a child node, distinct from the `.unit` suffix
+			// references #5933 gated) previously SILENTLY DROPPED a malformed
+			// unit here (strconv.Atoi -> continue): the shaper/classifier
+			// never bound and CompileConfig accepted the stanza with no
+			// effect — the same mis-bind / fail-open class #5829/#5933
+			// closed. Route the identity through the canonical
+			// CanonicalLogicalUnit normalizer (#5878) so a non-numeric /
+			// negative / out-of-range unit is REJECTED at commit instead of
+			// dropped. Strict on commit / commit-check (hard-reject); on the
+			// tolerant load / peer-sync path (lenientInterfaceUnitRef, the
+			// same flag the #5933 gate uses) downgrade to a cfg.Warnings
+			// entry so an already-persisted or peer-synced config an older
+			// binary accepted still boots — #1960 no-brick; the malformed
+			// unit was inert then too (the shaper simply did not bind).
+			unitID, _, err := CanonicalLogicalUnit(unitNode.Keys[1])
 			if err != nil {
-				continue
+				if opts.lenientInterfaceUnitRef {
+					if warnings != nil {
+						*warnings = append(*warnings, fmt.Sprintf(
+							"class-of-service interfaces %s unit %q (downgraded to warning on tolerant path): %v",
+							iface.Name, unitNode.Keys[1], err))
+					}
+					continue
+				}
+				return fmt.Errorf("class-of-service interfaces %s unit %q: %w",
+					iface.Name, unitNode.Keys[1], err)
 			}
 			unit := &CoSInterfaceUnit{Unit: unitID}
 			parseCoSInterfaceUnitBody(unitNode, unit)
