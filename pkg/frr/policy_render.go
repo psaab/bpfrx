@@ -1573,6 +1573,37 @@ func partitionRouteFiltersByFamily(rfs []*config.RouteFilter) (v4, v6 []indexedR
 	return v4, v6
 }
 
+// fromPrefixListRef is one referenced Junos `from prefix-list` bound to a SINGLE
+// FRR address family. A mixed v4+v6 referenced list expands into TWO refs (ip +
+// ipv6) so each family binds its own `match ip|ipv6 address` line in a
+// family-correct route-map sequence — otherwise the collapsed single-family
+// match silently drops the other family's routes (#2607 referenced-prefix-list
+// residual). A single-family or undefined/empty list yields exactly one ref,
+// byte-identical to the pre-#2607 selection.
+type fromPrefixListRef struct {
+	name    string // referenced prefix-list name ("" = no from-prefix-list)
+	matchKW string // "ip" | "ipv6" — the family this ref binds
+}
+
+// fromPrefixListRefs expands one referenced prefix-list NAME into its per-family
+// refs. The "" sentinel (no from-prefix-list on this term) yields a single empty
+// ref so the from-* OR cross-product still emits exactly one sequence. A mixed
+// v4+v6 list is exactly the Junos OR "(in the list's v4 half) OR (in its v6
+// half)", so expanding it into two family refs reuses the SAME #2642 one-
+// sequence-per-OR-value mechanism the community / as-path / multi-prefix-list
+// sets already use — no new family model.
+func fromPrefixListRefs(po *config.PolicyOptionsConfig, name string) []fromPrefixListRef {
+	if name == "" {
+		return []fromPrefixListRef{{}}
+	}
+	fams := prefixListFamilies(po.PrefixLists[name])
+	refs := make([]fromPrefixListRef, len(fams))
+	for i, kw := range fams {
+		refs[i] = fromPrefixListRef{name: name, matchKW: kw}
+	}
+	return refs
+}
+
 // communityRegexChars are the characters whose presence in a community
 // member means it cannot be a plain literal ASN:VALUE (or well-known
 // name) and therefore requires an FRR `expanded` community-list (POSIX
@@ -1922,7 +1953,7 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 		// body) is the only structure where each family's routes hit a
 		// sequence they can satisfy (#2607; the same AND finding that
 		// drove #2071's single-matcher decision).
-		emitTermBody := func(seqFam string, seqNum int, rfs []indexedRouteFilter, plName, fromPrefixList, fromCommunity, fromASPath string) {
+		emitTermBody := func(seqFam string, seqNum int, rfs []indexedRouteFilter, plName string, fromPL fromPrefixListRef, fromCommunity, fromASPath string) {
 			fmt.Fprintf(&b, "route-map %s %s %d\n", routeMapName, action, seqNum)
 
 			// rfMatchEmitted / rfMatchV6 record whether THIS sequence emitted a
@@ -1989,54 +2020,45 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 				rfMatchV6 = matchV6
 			}
 
-			if fromPrefixList != "" {
-				// Choose the address-family matcher from the referenced
-				// prefix-list's entries, mirroring the route-filter match
-				// branch above. FRR keeps `ip` and `ipv6` prefix-lists in
-				// independent namespaces; emitting `match ip address` for an
-				// IPv6 list makes the filter a silent no-op in an IPv6
-				// routing-policy context (#2071). Emit exactly one matcher;
-				// any IPv6 entry selects the IPv6 matcher. A mixed (v4+v6)
-				// list therefore renders the IPv6 matcher — the same
-				// homogeneous-family limitation #2071 documented as a TRADE.
-				// Unknown/empty lists default to IPv4.
+			if fromPL.name != "" {
+				// The address family of THIS `from prefix-list` match is fixed
+				// by the typed ref (fromPrefixListRef.matchKW): a mixed v4+v6
+				// referenced list is expanded UPSTREAM (fromPrefixListRefs) into
+				// two refs — one "ip", one "ipv6" — each emitted in its own
+				// route-map sequence, so BOTH families bind their own `match
+				// ip|ipv6 address` line and neither family's routes silently
+				// fail the term (#2607). A single-family or undefined/empty list
+				// yields exactly one ref, byte-identical to the pre-#2607 render.
+				// FRR keeps `ip` and `ipv6` prefix-lists in independent
+				// namespaces, so `match ip address prefix-list PL` resolves to PL's
+				// v4 entries and `match ipv6 address prefix-list PL` to its v6
+				// entries even though both share the name PL.
 				//
-				// In a SPLIT mixed-route-filter term (seqFam != "") the
-				// `from prefix-list` match is ANDed with this family's
-				// route-filter match. When the referenced list's family is
-				// the OPPOSITE of seqFam, the match line MUST STILL be
-				// emitted: it names a different FRR match type than this
-				// sequence's `match ip/ipv6 address <route-filter>`, so the
-				// two coexist and the sequence AND-NOMATCHes every route of
-				// seqFam's family — exactly the intended Junos semantics
-				// ("(route-filter) AND (off-family prefix-list)" is
-				// unsatisfiable for this family, so the term is non-matching
-				// for it). Dropping the off-family match instead (the pre-#5702
-				// behavior) silently LOOSENED the term to its route-filter half:
-				// a v4 route matching the v4 route-filter matched the term even
-				// though the term also required membership in a v6-only
-				// prefix-list no v4 route can satisfy — a fail-open
-				// policy-semantics change (#5702). Emitting it fail-CLOSES the
-				// off-family sequence, matching the non-split term's behavior
-				// (where both `match ip` and `match ipv6` already co-reside and
-				// AND-NOMATCH). This is a DIFFERENT-type coexistence, NOT the
-				// #2071 same-type collision — a v4 route-filter is `match ip`
-				// and a v6 prefix-list is `match ipv6`, so neither replaces the
-				// other.
+				// In a SPLIT mixed-route-filter term (seqFam != "") this
+				// `from prefix-list` match is ANDed with this sequence's
+				// route-filter match. When the ref's family is the OPPOSITE of the
+				// route-filter's, the match line MUST STILL be emitted: it names a
+				// different FRR match type than the `match ip/ipv6 address
+				// <route-filter>`, so the two coexist and the sequence
+				// AND-NOMATCHes every route — exactly the intended Junos semantics
+				// ("(route-filter) AND (off-family prefix-list)" is unsatisfiable
+				// for this family, so the term is non-matching for it). Dropping
+				// the off-family match instead (the pre-#5702 behavior) silently
+				// LOOSENED the term to its route-filter half — a fail-open
+				// policy-semantics change (#5702). This is a DIFFERENT-type
+				// coexistence, NOT the #2071/#5730 same-type collision: a v4
+				// route-filter is `match ip` and a v6 prefix-list is `match ipv6`,
+				// so neither replaces the other.
 				//
-				// fromPrefixList is ONE entry of a possibly multi-valued
-				// `from prefix-list` set (#2642). Multiple entries match
-				// with OR ("any") semantics, but FRR's route_map_add_match
-				// REPLACES a same-type rule (lib/routemap.c), so two `match
-				// ip address prefix-list` lines in one index keep only the
-				// last. OR is therefore expressed by one route-map SEQUENCE
-				// per entry (the dispatch loop below), each carrying the full
-				// term body — exactly the #2607 split structure.
-				fromPL := po.PrefixLists[fromPrefixList]
-				// Address family the from-prefix-list renders under. Uses the
-				// shared selector (naming.go) so the route-filter ACL collision
-				// precheck and this renderer never disagree on the family.
-				matchKW := prefixListMatchKW(fromPL)
+				// A referenced list is ONE entry of a possibly multi-valued
+				// `from prefix-list` set (#2642), and a mixed list adds its own
+				// per-family OR-dimension (#2607). Both are the SAME structure:
+				// FRR's route_map_add_match REPLACES a same-type rule
+				// (lib/routemap.c), so OR is expressed by one route-map SEQUENCE
+				// per (list, family) value — the dispatch loop below — each
+				// carrying the full term body.
+				plObj := po.PrefixLists[fromPL.name]
+				matchKW := fromPL.matchKW
 				// #5730: when THIS sequence ALSO emitted a same-family
 				// route-filter "match ip|ipv6 address prefix-list" line, a
 				// second same-type "match ... prefix-list" for the
@@ -2058,11 +2080,11 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 					// SAME value backs the definition and the reference below, so
 					// they always agree; routeFilterACLNameCollision (wired into
 					// ApplyFull) fails the apply CLOSED on any residual collision.
-					aclName := routeFilterACLName(fromPrefixList, matchKW)
-					renderFromPrefixListACL(&b, aclName, matchKW, fromPL)
+					aclName := routeFilterACLName(fromPL.name, matchKW)
+					renderFromPrefixListACL(&b, aclName, matchKW, plObj)
 					fmt.Fprintf(&b, " match %s address %s\n", matchKW, aclName)
 				} else {
-					fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, fromPrefixList)
+					fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, fromPL.name)
 				}
 			}
 
@@ -2286,16 +2308,22 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 			return vs
 		}
 
-		// emitVariants emits the cross-product of the three from-* OR sets
-		// for one route-filter family group (seqFam/rfs/famPL), advancing
-		// seq by 10 per sequence. The iteration order (prefix-list,
-		// community, as-path) is fixed, so output is deterministic.
+		// emitVariants emits the cross-product of the from-* OR sets for one
+		// route-filter family group (seqFam/rfs/famPL), advancing seq by 10 per
+		// sequence. The iteration order (prefix-list, then its per-family refs,
+		// then community, then as-path) is fixed, so output is deterministic.
+		// Each referenced prefix-list expands into one ref per family it holds
+		// (fromPrefixListRefs): a single-family list yields one ref (unchanged
+		// output), a mixed v4+v6 list yields an ip ref and an ipv6 ref so BOTH
+		// families bind a family-correct match line (#2607).
 		emitVariants := func(seqFam string, rfs []indexedRouteFilter, famPL string) {
-			for _, pl := range orElseEmpty(term.PrefixList) {
-				for _, comm := range orElseEmpty(term.FromCommunity) {
-					for _, asp := range orElseEmpty(term.FromASPath) {
-						emitTermBody(seqFam, seq, rfs, famPL, pl, comm, asp)
-						seq += 10
+			for _, plName := range orElseEmpty(term.PrefixList) {
+				for _, plRef := range fromPrefixListRefs(po, plName) {
+					for _, comm := range orElseEmpty(term.FromCommunity) {
+						for _, asp := range orElseEmpty(term.FromASPath) {
+							emitTermBody(seqFam, seq, rfs, famPL, plRef, comm, asp)
+							seq += 10
+						}
 					}
 				}
 			}

@@ -48859,6 +48859,29 @@ top.
     sentence as the unmerged #5937 (adds the gRPC count surfaces) — reconcile at merge.
   - **File(s)**: pkg/api/health.go, pkg/api/status_sessioncount_bound_5939_test.go,
     pkg/diagcmd/limiter.go
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #2607 close the referenced-`from prefix-list` mixed-family residual.
+    The route-filter mixed-family split was already merged; the issue's own closeout
+    comment named the live residual: a REFERENCED `from prefix-list` that names a
+    mixed v4+v6 list collapsed to ONE family (prefixListMatchKW: "ipv6 if any v6
+    entry"), so only one of `match ip|ipv6 address prefix-list` was emitted and the
+    other family's routes silently failed the term (routing asymmetry / blackhole,
+    no commit error). Fixed by mirroring the #2642 OR-split: a mixed list is exactly
+    "(in its v4 half) OR (in its v6 half)", so fromPrefixListRefs expands it into one
+    `ip` ref + one `ipv6` ref, each emitted in its own route-map sequence (FRR ANDs
+    match clauses within one index, so the two families cannot share a sequence).
+    Replaced the single-family prefixListMatchKW with the per-family SSOT
+    prefixListFamilies (["ip"]/["ipv6"]/["ip","ipv6"]); routeFilterACLNameCollision
+    now checks EVERY family a list renders under (a mixed list can materialize an
+    ACL in both) — the fail-closed path. #5730 same-family ACL coexistence and #5702
+    off-family unsatisfiable-AND both preserved. Single-family / undefined / empty
+    lists render byte-identical. Fail-on-revert proven via -overlay (collapse
+    fromPrefixListRefs to a lone family → 6 mixed-family tests RED, "missing the IPv4
+    matcher — every v4 route silently fails the term").
+  - **File(s)**: pkg/frr/naming.go, pkg/frr/policy_render.go,
+    pkg/frr/policy_mixedfamily_frompl_2607_test.go, pkg/frr/frr_test.go,
+    pkg/frr/README.md
   - **Action**: #5782 gate ungated SessionCount full-table walk. s.dp.SessionCount()
     does a full v4+v6 session-map iteration holding the per-bucket BPF-map locks
     for O(table) — the same lock-contention DoS class #5708 bounded for the
