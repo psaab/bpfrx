@@ -95,7 +95,33 @@ func (s *Store) Commit() (*config.Config, error) {
 func (s *Store) CommitWithDescription(description string) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.commitWithDescriptionLocked(description)
+}
 
+// CommitWithDescriptionGen is CommitWithDescription bound to an expected
+// candidate generation (#5848). It promotes the candidate ONLY if the current
+// candidate generation still equals expectedGen — the token the caller captured
+// (via CompileCandidateGen) before running its external device-map pre-flight.
+// A concurrent set/delete/load/rollback/enter-exit between snapshot and promote
+// bumps the generation, so this returns ErrCandidateGenerationConflict WITHOUT
+// mutating any store state, and the caller re-runs the whole
+// snapshot→pre-flight→commit against the new generation. This closes the
+// examined-generation-vs-promoted-generation race: the compiled config the
+// daemon pre-flighted against live hardware is exactly the one promoted, or the
+// commit conflicts — never a silent substitution.
+func (s *Store) CommitWithDescriptionGen(description string, expectedGen uint64) (*config.Config, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.candidateGen != expectedGen {
+		return nil, fmt.Errorf("%w (examined generation %d, current %d)",
+			ErrCandidateGenerationConflict, expectedGen, s.candidateGen)
+	}
+	return s.commitWithDescriptionLocked(description)
+}
+
+// commitWithDescriptionLocked is the shared body of CommitWithDescription and
+// the generation-bound CommitWithDescriptionGen. Caller holds s.mu.Lock.
+func (s *Store) commitWithDescriptionLocked(description string) (*config.Config, error) {
 	// #3893: reject a user-session commit on a read-only secondary. The
 	// internal HA-sync ingress (SyncApply) and the commit-confirmed timeout
 	// revert (PromoteRollback) promote the active config directly and never
@@ -184,6 +210,7 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	// Promote candidate to active
 	s.active = s.candidate
 	s.candidate = s.active.Clone()
+	s.bumpCandidateGenLocked() // #5848: fresh candidate — advance the generation
 	s.compiled = compiled
 	s.dirty = false
 	s.touchConfigLockLocked() // #4476: a commit is activity — refresh the lease
@@ -291,7 +318,33 @@ const MaxCommitConfirmedMinutes = 65535
 func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.commitConfirmedLocked(minutes)
+}
 
+// CommitConfirmedGen is CommitConfirmed bound to an expected candidate
+// generation (#5848), the commit-confirmed analogue of CommitWithDescriptionGen.
+// It promotes+arms the auto-rollback timer ONLY if the candidate generation
+// still equals expectedGen, else returns ErrCandidateGenerationConflict without
+// mutating state. The rollback TARGET (the current active config the daemon
+// pre-flighted) is stable across the transaction: the daemon holds its apply
+// semaphore from pre-flight through this call, and every path that mutates the
+// active config (commit, commit-confirmed, peer SyncApply, confirm-timeout
+// rollback) runs under that same semaphore — so binding the (racy, semaphore-
+// free) candidate generation is sufficient to keep both the promoted candidate
+// and the stashed rollback target bound to what was examined.
+func (s *Store) CommitConfirmedGen(minutes int, expectedGen uint64) (*config.Config, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.candidateGen != expectedGen {
+		return nil, fmt.Errorf("%w (examined generation %d, current %d)",
+			ErrCandidateGenerationConflict, expectedGen, s.candidateGen)
+	}
+	return s.commitConfirmedLocked(minutes)
+}
+
+// commitConfirmedLocked is the shared body of CommitConfirmed and the
+// generation-bound CommitConfirmedGen. Caller holds s.mu.Lock.
+func (s *Store) commitConfirmedLocked(minutes int) (*config.Config, error) {
 	// #3893: reject a user-session commit-confirmed on a read-only secondary
 	// (same gate as CommitWithDescription).
 	if err := s.ensureWritableLocked(); err != nil {
@@ -384,6 +437,7 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	// Promote candidate to active
 	s.active = s.candidate
 	s.candidate = s.active.Clone()
+	s.bumpCandidateGenLocked() // #5848: fresh candidate — advance the generation
 	s.compiled = compiled
 	s.dirty = false
 	s.touchConfigLockLocked() // #4476: a commit is activity — refresh the lease
@@ -764,6 +818,7 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 	s.compiled = s.confirmPrevCfg
 	if s.candidate != nil {
 		s.candidate = s.active.Clone()
+		s.bumpCandidateGenLocked() // #5848: candidate reset on auto-rollback
 	}
 	s.dirty = false
 
@@ -884,6 +939,7 @@ func (s *Store) RollbackAs(sessionID string, n int) error {
 
 	if n == 0 {
 		s.candidate = s.active.Clone()
+		s.bumpCandidateGenLocked() // #5848: candidate replaced by rollback 0
 		s.dirty = false
 		return nil
 	}
@@ -893,6 +949,7 @@ func (s *Store) RollbackAs(sessionID string, n int) error {
 		return err
 	}
 	s.candidate = entry.Config.Clone()
+	s.bumpCandidateGenLocked() // #5848: candidate replaced by rollback n
 	s.dirty = true
 	return nil
 }

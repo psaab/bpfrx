@@ -119,6 +119,7 @@ func (s *Store) reclaimStaleLockLocked() bool {
 		"idle_for", time.Since(s.configLockAt).Round(time.Second),
 		"lease_ttl", configLockLeaseTTL)
 	s.candidate = nil
+	s.bumpCandidateGenLocked() // #5848: candidate discarded — advance the generation
 	s.configDir = false
 	s.dirty = false
 	s.exclusiveHolder = ""
@@ -164,6 +165,7 @@ func (s *Store) EnterConfigureSession(sessionID string) error {
 		}
 	}
 	s.candidate = s.active.Clone()
+	s.bumpCandidateGenLocked() // #5848: entered config mode — advance the generation
 	s.configDir = true
 	s.dirty = false
 	s.exclusiveHolder = ""
@@ -188,6 +190,7 @@ func (s *Store) EnterConfigureExclusive(holder string) error {
 		}
 	}
 	s.candidate = s.active.Clone()
+	s.bumpCandidateGenLocked() // #5848: entered config mode — advance the generation
 	s.configDir = true
 	s.dirty = false
 	s.configHolder = ""
@@ -234,6 +237,7 @@ func (s *Store) ExitConfigureSession(sessionID string) bool {
 		return false
 	}
 	s.candidate = nil
+	s.bumpCandidateGenLocked() // #5848: candidate discarded — advance the generation
 	s.configDir = false
 	s.dirty = false
 	s.exclusiveHolder = ""
@@ -253,6 +257,7 @@ func (s *Store) ForceExitConfigure() {
 	slog.Warn("force-releasing stale config lock", "holder", s.configHolder,
 		"held_for", time.Since(s.configLockAt).Round(time.Second))
 	s.candidate = nil
+	s.bumpCandidateGenLocked() // #5848: candidate discarded — advance the generation
 	s.configDir = false
 	s.dirty = false
 	s.exclusiveHolder = ""
@@ -283,6 +288,7 @@ func (s *Store) ExitConfigure() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.candidate = nil
+	s.bumpCandidateGenLocked() // #5848: candidate discarded — advance the generation
 	s.configDir = false
 	s.dirty = false
 	s.exclusiveHolder = ""

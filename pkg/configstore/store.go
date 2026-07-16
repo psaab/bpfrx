@@ -67,6 +67,24 @@ type Store struct {
 	configDir bool // true if in configuration mode
 	filePath  string
 
+	// candidateGen is a MONOTONIC token that changes whenever the candidate
+	// tree changes identity or content — every set/delete/load/rename/copy/
+	// insert/annotate/(de)activate mutation, every rollback, every
+	// enter/exit/reclaim of configuration mode, the peer-sync candidate reset,
+	// and the post-commit candidate reset. It backs the #5848 generation-bound
+	// commit transaction: the daemon snapshots+compiles the candidate and reads
+	// this token atomically (CompileCandidateGen), runs its external
+	// device-map hardware pre-flight on that immutable snapshot OUTSIDE the store
+	// lock, then commits ONLY if the token is unchanged (CommitWithDescriptionGen
+	// / CommitConfirmedGen). A concurrent candidate edit between snapshot and
+	// promote bumps the token, so the commit returns
+	// ErrCandidateGenerationConflict instead of silently promoting an unexamined
+	// generation. It is authoritative over content: a candidate edited and then
+	// reverted to byte-identical content still yields a new token (the examined
+	// generation is gone), so the conservative outcome is a conflict/retry.
+	// ALWAYS bumped via bumpCandidateGenLocked under s.mu.Lock.
+	candidateGen uint64
+
 	// Persistent storage
 	db      *DB
 	journal *journal.Journal
@@ -600,6 +618,7 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 	// If in config mode, update candidate too.
 	if s.configDir {
 		s.candidate = s.active.Clone()
+		s.bumpCandidateGenLocked() // #5848: candidate reset by authoritative load/sync
 	}
 
 	// #3861: an authoritative config synced from the cluster primary
