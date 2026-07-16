@@ -54,19 +54,47 @@ class GateProvenanceTests(unittest.TestCase):
         self.sidecar = os.path.join(self.dir, f"xpf-{VER}.manifest")
         self.sums = os.path.join(self.dir, f"xpf-{VER}.SHA256SUMS")
 
-    def _sign_set(self, validated):
-        """(Re)write the provenance sidecar with the given validated flag and
-        sign a manifest covering qcow + meta + sidecar (mirrors a real bake)."""
-        Path(self.sidecar).write_text(
-            f"version: {VER}\nbase_image_pinned: true\n"
-            f"validated: {'true' if validated else 'false'}\n")
+    def _sign_set(self, validated, base_pinned=True):
+        """(Re)write the provenance sidecar with the given validated /
+        base_image_pinned flags and sign a manifest covering qcow + meta +
+        sidecar (mirrors a real bake).
+
+        `base_pinned=None` omits the base_image_pinned line entirely, modelling
+        an old/tampered sidecar that never asserts pinning (#5815 fail-closed
+        missing-key case)."""
+        text = f"version: {VER}\n"
+        if base_pinned is not None:
+            text += f"base_image_pinned: {'true' if base_pinned else 'false'}\n"
+        text += f"validated: {'true' if validated else 'false'}\n"
+        Path(self.sidecar).write_text(text)
         sign.write_manifest(self.sums, [self.qcow, self.meta, self.sidecar])
         sign.sign_manifest(self.sums, self.sec, comment="provtest")
 
     def test_validated_true_passes(self):
-        self._sign_set(validated=True)
+        # Regression guard: a fully-pinned validated bake still publishes
+        # (validated:true AND base_image_pinned:true → no regression).
+        self._sign_set(validated=True, base_pinned=True)
         # Should not raise.
         publish.gate_provenance(self.dir, {VER: self.sums}, self.pub)
+
+    def test_base_unpinned_refused(self):
+        # #5815: a signed sidecar that is otherwise valid (validated:true) but
+        # says base_image_pinned:false (an XPF_ALLOW_UNPINNED_BASE=1 dev bake)
+        # must NOT publish. RED on revert: drop the base_image_pinned check ->
+        # no SystemExit here.
+        self._sign_set(validated=True, base_pinned=False)
+        with self.assertRaises(SystemExit) as ctx:
+            publish.gate_provenance(self.dir, {VER: self.sums}, self.pub)
+        self.assertNotEqual(ctx.exception.code, 0)
+
+    def test_base_pinned_missing_refused(self):
+        # #5815 fail-closed: a signed sidecar that never asserts base_image_pinned
+        # (old/tampered manifest) is NOT publishable — a sidecar that does not
+        # assert pinning must not default-allow.
+        self._sign_set(validated=True, base_pinned=None)
+        with self.assertRaises(SystemExit) as ctx:
+            publish.gate_provenance(self.dir, {VER: self.sums}, self.pub)
+        self.assertNotEqual(ctx.exception.code, 0)
 
     def test_validated_false_refused(self):
         self._sign_set(validated=False)

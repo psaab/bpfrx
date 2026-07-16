@@ -1,3 +1,46 @@
+## 2026-07-16 — #5815 (scripts/dist, security): publish gate ignored signed base_image_pinned
+- **Timestamp**: 2026-07-16 (fix/5815-publish-base-pinned-gate)
+- **Action**: Fix #5815 (codex-183 audit, release-provenance bypass). STEP-0
+  confirmed live on origin/master (18e86c1aa): `scripts/dist/publish.py`
+  `gate_provenance` verifies+parses the signed `xpf-<ver>.manifest` sidecar and
+  enforces ONLY `validated == "true"`, then returns WITHOUT checking
+  `base_image_pinned` — the field is parsed (`_parse_manifest_fields`) but
+  ignored. bake.py (`build_manifest_text`) signs `base_image_pinned: true|false`
+  into that same sidecar (#4904 B); an `XPF_ALLOW_UNPINNED_BASE=1` dev bake
+  correctly binds `base_image_pinned: false` and `authenticate_base_digest`
+  states the image is not publishable — but the publish gate let it through, so
+  a fully signed image whose OWN authenticated metadata says the Ubuntu base was
+  NOT anchored to a reviewed trust-anchor digest could be RELEASED
+  (release-provenance bypass). Fix: after the existing `validated != "true"`
+  rejection, `gate_provenance` now ALSO reads the already-authenticated
+  `base_image_pinned` field and rejects the publish when it is not `"true"` —
+  matching the exact string-compare idiom the sidecar uses for `validated` (no
+  new bool parse, no new trust surface: reads a field already verified against
+  the signed manifest). Fail-CLOSED on a MISSING key too: `fields.get(...)`
+  returns None and `None != "true"` → rejected, so an old/tampered sidecar that
+  does not assert pinning is NOT publishable (no default-allow). No
+  `--allow-unpinned` override was added — a signed unpinned image is
+  deliberately not releasable via the normal gate. The rejection die() names the
+  field, its value, the XPF_ALLOW_UNPINNED_BASE cause, and the re-bake remedy,
+  mirroring the `validated` rejection style/exit-path. Fail-on-revert PROVEN:
+  extended `scripts/dist/test_publish_provenance.py` (`_sign_set` parametrized
+  with `base_pinned=True|False|None`) with `test_base_unpinned_refused`
+  (validated:true + base_image_pinned:false → REJECTED) and
+  `test_base_pinned_missing_refused` (key omitted → REJECTED, fail-closed);
+  `test_validated_true_passes` doubles as the regression guard (validated:true +
+  base_image_pinned:true still PASSES). Neutralizing the check (`if False:`) →
+  both new tests RED ("AssertionError: SystemExit not raised"); restored →
+  all 7 GREEN. Validation: `python3 -m unittest test_publish_provenance` 7/7 OK
+  (minisign present, real signed sidecars); `make selftest` dist/publish leg
+  GREEN. Python-only (scripts/dist + docs), no Go/Rust, no loss-cluster smoke
+  (release-tooling change; selftest is the gate).
+- **File(s)**: scripts/dist/publish.py (edit — gate_provenance base_image_pinned
+  enforcement + docstring), scripts/dist/test_publish_provenance.py (edit —
+  parametrized _sign_set + 2 new fail-on-revert tests + regression-guard note),
+  docs/image-validation.md (edit — #5815 unpinned-base non-publishable
+  contract), scripts/dist/README.md (edit — publish.py base_image_pinned
+  requirement)
+
 ## 2026-07-16 — #5753 (pkg/dataplane/userspace, security): nested-set feed-binding partial-deny fail-open
 - **Timestamp**: 2026-07-16 (fix/5753-feeds-nested-alias-failopen)
 - **Action**: Close the residual nested-set arm of the #5645/#5751 partial-deny

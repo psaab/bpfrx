@@ -58,6 +58,17 @@ bake still signs, but the signed `xpf-<ver>.manifest` records `validated: false`
 image whose provenance is not `validated: true`, so an unvalidated dev/emergency
 image can never carry a release signature past the fail-closed publish boundary.
 
+**An `XPF_ALLOW_UNPINNED_BASE=1` (unpinned) bake is likewise non-publishable
+(#5815).** Such a bake signs `base_image_pinned: false` into the same
+`xpf-<ver>.manifest` — its own authenticated metadata says the Ubuntu base was
+NOT anchored to a reviewed trust-anchor digest. `scripts/dist/publish.py`'s
+`gate_provenance` REQUIRES `base_image_pinned: true` symmetrically with
+`validated: true`, so a fully signed but unpinned dev image cannot be released
+via the normal gate (there is no `--allow-unpinned` override — that is the
+point). The check is fail-CLOSED on a MISSING `base_image_pinned` key too: an
+old or tampered sidecar that does not assert pinning is refused rather than
+default-allowed.
+
 ---
 
 ## Tier 1 — automated first-boot gate (`validate.py`)
