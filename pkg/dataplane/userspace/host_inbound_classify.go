@@ -236,7 +236,10 @@ func ClassifyHostInboundForInterface(cfg *config.Config, fromZone, ifaceRef stri
 	// the enforcement view builder uses (unionHostInboundTokens over the zone-level
 	// stanza and the per-interface override, physical→unit inheritance included),
 	// then classify that single view.
-	svc, prot := unionHostInboundTokens(zone.HostInboundTraffic, buildInterfaceHostInboundMap(cfg)[ifaceRef])
+	// #5878 phase 2: look the override up on the ref's canonical logical-unit
+	// identity so a query for ge-0/0/0.01 finds an override authored as
+	// ge-0/0/0.1 (buildInterfaceHostInboundMap now keys by the canonical unit).
+	svc, prot := unionHostInboundTokens(zone.HostInboundTraffic, buildInterfaceHostInboundMap(cfg)[config.CanonicalInterfaceUnitRef(ifaceRef)])
 	v := ZoneHostInboundView{Zone: fromZone, Interfaces: []string{ifaceRef}, SystemServices: svc, Protocols: prot}
 	return classifyOneView(v, proto, hasProto, dstPort, icmpType, family)
 }
@@ -329,7 +332,10 @@ func ResolveHostInboundIngressInterface(cfg *config.Config, fromZone, ifaceRef s
 			return fmt.Errorf("ingress-interface %q is a physical interface; specify the logical unit, e.g. %s.%d", ifaceRef, ifaceRef, smallestUnitNumber(ic.Units))
 		}
 	}
-	zone := buildInterfaceZoneMap(cfg)[ifaceRef]
+	// #5878 phase 2: resolve the operator ref on its canonical logical-unit
+	// identity so `ingress-interface ge-0/0/0.01` validates against the zone the
+	// canonical unit ge-0/0/0.1 binds (buildInterfaceZoneMap now keys canonical).
+	zone := buildInterfaceZoneMap(cfg)[config.CanonicalInterfaceUnitRef(ifaceRef)]
 	if zone == "" {
 		return fmt.Errorf("unknown ingress-interface %q (not assigned to any security zone)", ifaceRef)
 	}

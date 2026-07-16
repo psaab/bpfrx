@@ -349,12 +349,68 @@ the reconciled `tunnelid_test.go` duplicate-spelling case, each RED on revert of
 the gate wiring (the parity test goes RED — node0 accepts — when the gate is put
 back node-local).
 
-**Phase 2 (deferred, #5878):** thread `CanonicalLogicalUnit` through the
-zone / CoS / routing-instance / NAT reference binders and the snapshot / status
-emitters so a `.01` reference resolves to the same runtime unit as the
-interface's canonical `.1` everywhere (the second, subtler half of #5878).
-Phase 1 (this section) closes the divergent-commit fail-open — the material
-security bug — and is sized separately from the reference-binder threading.
+**Phase 2 (#5878) — reference-binder canonicalization.** Phase 1 (above) closes
+the divergent-commit fail-open by rejecting a duplicate-spelling collision at
+commit. The second, subtler half of #5878 is that a cross-subsystem reference
+carrying a `.<unit>` suffix was BOUND by its raw string, not its canonical unit,
+so a `.01` reference and a `.1` reference resolved to DIFFERENT runtime units —
+even without a duplicate-spelling collision, a peer-only `${node}` rewrite that
+emits `.01` on the standby (vs `.1` on the active) could bind a zone / NAT /
+routing member to a different unit on standby. Phase 2 threads the canonical
+identity through the reference binders via one helper,
+`CanonicalInterfaceUnitRef(ref)` (`schema_validators.go`), which folds the
+`.<unit>` suffix through `CanonicalLogicalUnit` (`.01`→`.1`, `.+1`→`.1`,
+`.00`→`.0`) and returns a bare / trailing-dot / malformed-suffix ref unchanged (a
+malformed suffix is still rejected at commit by the #5933 reference gate). The
+per-unit interface snapshot keys every binder map by the canonical `"%s.%d"`
+unit name, so each binder now stores its map key on the canonical unit:
+
+  - **Security-zone membership** — `buildInterfaceZoneMap` (`zones.go`) and its
+    two mirrors, the #3072 conflict-detection SSOT `zoneIfaceLogicalKeys`
+    (`compiler_validate_strict_zones.go`) and the kernel host-deny scope map
+    `junosHostZoneByInterface` (`junos_host_deny.go`). Canonicalizing the
+    detector alongside the binder is load-bearing: without it, a `.01` member
+    would bind canonical unit 1 in `buildInterfaceZoneMap` (first-writer-wins)
+    while the detector still saw `.01` and `.1` as distinct keys, silently
+    reopening the multi-zone fail-open #3072 closed.
+  - **Routing-instance membership** — `buildInterfaceRoutingInstances` and
+    `buildInterfaceRouteTables` (`routes.go`).
+  - **Per-interface host-inbound override** — `buildInterfaceHostInboundMap`
+    (`zones_override.go`), plus the operator-facing lookups in
+    `ClassifyHostInboundForInterface` / `ResolveHostInboundIngressInterface`
+    (`host_inbound_classify.go`) so a `.01` ingress-interface ref resolves to
+    the canonical unit's zone.
+
+  **class-of-service** was already canonical: the nested `interfaces <if> unit
+  <n>` form keys `iface.Units[unitID]` by the canonical int (`CanonicalLogicalUnit`,
+  #5963), and the `.unit`-suffix-in-key form never resolves to a runtime unit in
+  the consumer (`interfaces.go` keys CoS by base name + int unit), so no CoS
+  divergence is possible. **NAT** rules bind by zone / routing-instance /
+  address, not by an interface-unit reference, so there is nothing to
+  canonicalize.
+
+  The daemon netlink VRF / tunnel-membership resolver is threaded too:
+  `riMemberLinuxName` (`pkg/daemon/daemon_run.go`) — shared by the step-0a VRF
+  bind loop and the `collectAppliedTunnels` RIListMember scan — now canonicalizes
+  the member ref BEFORE resolving it, so a `.01` routing-instance member binds the
+  SAME Linux device as `.1`. `TunnelNameMap` keys are built from the canonical int
+  unit number (`ifName + "." + strconv.Itoa(unitNum)`), so canonicalizing at the
+  top makes BOTH the tunnel-device path (tunMap hit) and the
+  `LinuxIfName`/unit-0-collapse path use the canonical name. This is NOT covered
+  by the Phase 1 alias gate: `validateInterfaceUnitAliasCollisionsAST` gates
+  `interfaces ... unit` DEFINITIONS, not routing-instance / zone membership
+  REFERENCES — a peer-only `groups node1 { routing-instances ri interface
+  ge-0/0/0.01 }` reference is a divergence the definition gate never sees, so the
+  reference must be canonicalized directly at the binder (it is). #5878 has no
+  remaining reference-binding residual.
+
+  Covered by `pkg/dataplane/userspace/unit_canonical_refbind_5878_test.go` (zone /
+  routing-instance / host-inbound `.01`→canonical-unit-1 binding, RED on revert of
+  each binder), `pkg/config/unit_canonical_refkey_5878_test.go`
+  (`CanonicalInterfaceUnitRef` matrix, `zoneIfaceLogicalKeys` canonical claim, and
+  a two-zone `.01`/`.1` duplicate-membership reject), and
+  `pkg/daemon/ri_member_canonical_5878_test.go` (netlink `.01`→canonical device
+  via both the tunnel-device and LinuxIfName paths, RED on revert).
 
 ### Non-numeric logical-unit identity fail-closed (#5829)
 

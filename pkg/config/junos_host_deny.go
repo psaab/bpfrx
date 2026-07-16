@@ -1120,10 +1120,15 @@ func junosHostZoneByInterface(cfg *Config) map[string]string {
 		if zone == nil {
 			continue
 		}
-		for _, iface := range zone.Interfaces {
-			if iface == "" {
+		for _, rawIface := range zone.Interfaces {
+			if rawIface == "" {
 				continue
 			}
+			// #5878 phase 2: bind on the canonical logical-unit identity so this
+			// mirror resolves ge-0/0/0.01 to the same runtime unit (ge-0/0/0.1)
+			// the dataplane snapshot does — the consumer looks this map up by the
+			// canonical "%s.%d" unit name.
+			iface := CanonicalInterfaceUnitRef(rawIface)
 			if _, exists := out[iface]; !exists {
 				out[iface] = zoneName
 			}

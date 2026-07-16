@@ -175,6 +175,34 @@ func CanonicalLogicalUnit(raw string) (int, string, error) {
 	return int(v), strconv.FormatInt(v, 10), nil
 }
 
+// CanonicalInterfaceUnitRef canonicalizes the optional ".<unit>" suffix of a
+// cross-subsystem interface reference (#5878 phase 2) so two textual spellings
+// of one logical unit — ge-0/0/0.01, ge-0/0/0.1, ge-0/0/0.+1 — resolve to ONE
+// runtime identity when a reference binder keys a map by the reference. The
+// suffix is split on the FIRST "." — exactly how each subsystem's runtime splits
+// the reference (buildInterfaceZoneMap, buildInterfaceRoutingInstances,
+// buildInterfaceRouteTables, buildInterfaceHostInboundMap, junosHostZoneBy
+// Interface, zoneIfaceLogicalKeys) — so schema acceptance, validation, and
+// binding stay aligned. Interface names carry no "." except the unit suffix.
+//
+// A bare interface (no "."), a trailing-dot form ("base." — the runtime treats
+// it as bare), or a suffix that is not a valid logical unit is returned
+// UNCHANGED: a malformed suffix is rejected at commit by the strict #5933
+// reference gate (validateInterfaceUnitReferencesStrict) and stays inert on the
+// tolerant load / peer-sync path exactly as before — canonicalization never
+// changes the acceptance set, only which runtime unit a VALID reference binds.
+func CanonicalInterfaceUnitRef(ref string) string {
+	base, unitTok, hasUnit := strings.Cut(ref, ".")
+	if !hasUnit || unitTok == "" {
+		return ref
+	}
+	_, canon, err := CanonicalLogicalUnit(unitTok)
+	if err != nil {
+		return ref
+	}
+	return base + "." + canon
+}
+
 // ValidateLogicalUnit is the ONE canonical numeric-identity validator for a
 // logical `unit <n>` slot (#5829). A `unit <identity>` slot has no positional
 // key validation, so a non-numeric identity such as `unit tenant` passed
