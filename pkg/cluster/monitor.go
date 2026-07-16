@@ -198,8 +198,8 @@ type ipMonitorKey struct {
 // NewMonitor creates a monitor that will poll interface and IP states.
 func NewMonitor(mgr *Manager, groups []*config.RedundancyGroup) *Monitor {
 	return &Monitor{
-		mgr:        mgr,
-		groups:     groups,
+		mgr:              mgr,
+		groups:           groups,
 		ifaceState:       make(map[monitorKey]*monitorState),
 		ipState:          make(map[ipMonitorKey]*monitorState),
 		ipDebts:          make(map[int]map[string]int),
@@ -292,10 +292,34 @@ func (mon *Monitor) Stop() {
 	}
 }
 
-// UpdateGroups replaces the monitored redundancy groups.
+// UpdateGroups replaces the monitored redundancy groups and drops dampening
+// state for interface monitors that are no longer in the desired set (removed,
+// or the monitored interface was changed). Leaving stale ifaceState behind
+// would (a) leak map entries for good, and (b) reuse a stale down/hold-down
+// state if the same monitor key is ever re-added — reporting an interface as
+// still-failed on the strength of a measurement from a prior config epoch.
+//
+// The MANAGER-side debt for these removed/changed monitors (monitorWeights and
+// each RG's MonitorFails) is cleared separately in reconcileMonitorDebtsLocked
+// under m.mu (#5080). UpdateGroups deliberately does NOT call the locking
+// SetMonitorWeight here: it is invoked from Manager.UpdateConfig with m.mu
+// already held, so re-acquiring m.mu would self-deadlock.
 func (mon *Monitor) UpdateGroups(groups []*config.RedundancyGroup) {
 	mon.mu.Lock()
 	defer mon.mu.Unlock()
+
+	desired := make(map[monitorKey]bool)
+	for _, rg := range groups {
+		for _, im := range rg.InterfaceMonitors {
+			desired[monitorKey{rgID: rg.ID, iface: im.Interface}] = true
+		}
+	}
+	for key := range mon.ifaceState {
+		if !desired[key] {
+			delete(mon.ifaceState, key)
+		}
+	}
+
 	mon.groups = groups
 }
 
@@ -412,18 +436,30 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 		// Translate Junos name (ge-0/0/0) to Linux name (ge-0-0-0).
 		linuxName := config.LinuxIfName(im.Interface)
 		link, err := nlh.LinkByName(linuxName)
+
+		// Resolve the observed carrier state. A LinkByName error means the
+		// kernel has no such interface.
+		var up bool
 		if err != nil {
-			// Check if interface belongs to peer based on FPC slot.
+			// A monitor on a PEER's FPC slot is not ours to evaluate — the
+			// peer publishes that interface's status via heartbeat. Skip it.
 			slot := config.InterfaceSlot(im.Interface)
 			if slot >= 0 && config.SlotToNodeID(slot) != mon.mgr.NodeID() {
 				continue // peer's interface
 			}
-			slog.Warn("cluster monitor: local interface missing",
+			// A configured LOCAL member link that is absent (cold boot, or a
+			// delete/recreate between polls) MUST count as DOWN and demote the
+			// RG weight — NOT be silently skipped. Skipping fails open: an
+			// already-primary node keeps effective weight 255 and stays
+			// primary while its data link is missing, blackholing traffic
+			// (#5080). Feed the absence through the same dampening machinery a
+			// carrier-down link uses so a transient netlink miss is debounced.
+			slog.Warn("cluster monitor: local interface missing, treating as down",
 				"rg", rg.ID, "interface", im.Interface)
-			continue
+			up = false
+		} else {
+			up = LinkAttrsUp(link.Attrs())
 		}
-
-		up := LinkAttrsUp(link.Attrs())
 
 		// Track local interface status for heartbeat propagation.
 		statuses = append(statuses, InterfaceMonitorInfo{
@@ -580,6 +616,19 @@ func (mon *Monitor) updateIPTargetDampenedState(rg *config.RedundancyGroup, targ
 // available. It is deliberately distinct from the per-target "ip:<addr>" debts
 // and from interface-monitor names so it never collides with them.
 const ipAggregateMonitorName = "ip-monitoring"
+
+// isIPMonitorName reports whether a monitor name in monitorWeights /
+// MonitorFails belongs to the IP-MONITORING path rather than an
+// interface-monitor. IP-monitor debts are installed by reconcileRGIPDebts under
+// two naming conventions — the per-target "ip:<addr>" form (independent mode)
+// and the fixed aggregate ipAggregateMonitorName (global-threshold mode). They
+// share the monitorWeights / MonitorFails structure with interface-monitor
+// debts, so any code that reconciles ONE class must use this discriminator to
+// avoid clobbering the other. reconcileRGIPDebts owns the IP class; the
+// interface-monitor reconcile (reconcileMonitorDebtsLocked) owns the rest.
+func isIPMonitorName(iface string) bool {
+	return iface == ipAggregateMonitorName || strings.HasPrefix(iface, "ip:")
+}
 
 // desiredRGIPDebts computes the ip-monitor election debts an RG SHOULD carry
 // given its current mode and dampened reachability — the single place the two
