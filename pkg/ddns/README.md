@@ -520,6 +520,20 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   (standalone / pre-wire boot) restores the pre-#5748 single-surface behavior.
   Surface A suppressions are counted (`SurfaceAStats.DeleteCoowned`); both
   directions are fail-on-revert covered by `cross_surface_clobber_5748_test.go`.
+  **Eventual-consistency caveat (#5748 follow-up):** the cross-surface
+  snapshot is rebuilt at the END of each reconcile pass, so cross-surface
+  visibility is eventually- (not strongly-) consistent. Two tight-race
+  windows remain — both a STRICT improvement over the prior deterministic,
+  always-reachable cross-surface clobber, not a new outage class: (a) a
+  just-published co-owner not yet in the peer snapshot when the other
+  surface tears down → a residual clobber that shrinks the prior 100%
+  clobber to a sub-millisecond race (operator-repairable via `request
+  system dynamic-dns update`, the #5710 force-update); (b) both surfaces
+  tearing down the SAME co-owned RR in overlapping passes each read the
+  other's pre-rebuild snapshot and both suppress → the RR — still holding
+  the identical published rdata (a valid, not-orphaned record) — is left on
+  the wire until an owner's later IP change re-issues it. A deterministic
+  suppression tie-break to close window (b) is tracked as a #5748 follow-up.
 - **Source / VRF binding (#2665, `backend_bind.go`)** — the per-family
   `source-address` / `destination-interface` / `routing-instance` leaves build a
   custom `net.Dialer` (one `Control` hook: `unix.Bind` for the source IP +
