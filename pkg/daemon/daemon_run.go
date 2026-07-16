@@ -731,18 +731,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// applyConfigFn stays wired for non-commit paths (rollback,
 		// confirm) that still need the full reconcile.
 		shell.SetApplyConfigFn(d.applyConfig)
-		shell.SetCommitFns(
-			func(ctx context.Context, comment string) (*config.Config, error) {
-				// #5054: in-process CLI commits sync to the peer on
-				// the SAME RG0-ownership policy as gRPC/REST — peer
-				// convergence is transport-independent, decided in
-				// commitAndApplyOperator, not by which API committed.
-				return d.commitAndApplyOperator(ctx, comment)
-			},
-			func(ctx context.Context, minutes int) (*config.Config, error) {
-				return d.commitConfirmedAndApplyOperator(ctx, minutes)
-			},
-		)
+		// #5054: in-process CLI commits sync to the peer on the SAME
+		// RG0-ownership policy as gRPC/REST — peer convergence is
+		// transport-independent, decided in commitAndApplyOperator, not
+		// by which API committed. Wiring lives in the shellCommitFn /
+		// shellCommitConfirmedFn seams so it is fail-on-revert covered
+		// (#5961, configsync_transport_5054_test.go).
+		shell.SetCommitFns(d.shellCommitFn(), d.shellCommitConfirmedFn())
 		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()
@@ -1173,6 +1168,62 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 	return runErr
 }
 
+// #5054/#5961: transport commit-wiring seams.
+//
+// The gRPC, HTTP/REST, and local-shell commit handlers must ALL route an
+// operator commit through commitAndApplyOperator / commitConfirmedAndApplyOperator
+// so the peer-sync decision is derived from RG0 ownership
+// (rg0ConfigSyncAuthority) and is transport-independent — the #5054 invariant.
+// Before #5054 only gRPC synced the peer; a REST/shell commit left the standby
+// on stale config.
+//
+// These closures were inlined at each transport's construction site, so no test
+// could exercise the wiring: reverting one transport back to
+// commitAndApply(ctx, comment, false) left every test green (#5961). They are
+// extracted here as three named per-transport seams — one method pair per
+// transport — so each transport's wiring is independently reachable from a test
+// and independently fail-on-revert covered (configsync_transport_5054_test.go).
+// They are intentionally identical: the whole point of #5054 is that every
+// transport resolves peer-sync the same way; keeping a distinct named seam per
+// transport is what lets a single-transport regression turn a single test case
+// RED instead of staying silent.
+
+func (d *Daemon) grpcCommitFn() func(context.Context, string) (*config.Config, error) {
+	return func(ctx context.Context, comment string) (*config.Config, error) {
+		return d.commitAndApplyOperator(ctx, comment)
+	}
+}
+
+func (d *Daemon) grpcCommitConfirmedFn() func(context.Context, int) (*config.Config, error) {
+	return func(ctx context.Context, minutes int) (*config.Config, error) {
+		return d.commitConfirmedAndApplyOperator(ctx, minutes)
+	}
+}
+
+func (d *Daemon) restCommitFn() func(context.Context, string) (*config.Config, error) {
+	return func(ctx context.Context, comment string) (*config.Config, error) {
+		return d.commitAndApplyOperator(ctx, comment)
+	}
+}
+
+func (d *Daemon) restCommitConfirmedFn() func(context.Context, int) (*config.Config, error) {
+	return func(ctx context.Context, minutes int) (*config.Config, error) {
+		return d.commitConfirmedAndApplyOperator(ctx, minutes)
+	}
+}
+
+func (d *Daemon) shellCommitFn() func(context.Context, string) (*config.Config, error) {
+	return func(ctx context.Context, comment string) (*config.Config, error) {
+		return d.commitAndApplyOperator(ctx, comment)
+	}
+}
+
+func (d *Daemon) shellCommitConfirmedFn() func(context.Context, int) (*config.Config, error) {
+	return func(ctx context.Context, minutes int) (*config.Config, error) {
+		return d.commitConfirmedAndApplyOperator(ctx, minutes)
+	}
+}
+
 // startGRPCServer constructs and launches the gRPC API server goroutine.
 // Extracted verbatim from Run()'s PHASE 5 (#4662 Increment 2); the leaf
 // startup block carries no ordering dependency (same code, same call point).
@@ -1248,13 +1299,11 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// that hasn't yet been propagated. #5054: the RG0-ownership
 		// peer-sync decision now lives in commitAndApplyOperator,
 		// shared with the REST and local-shell commit paths so every
-		// transport converges identically.
-		CommitFn: func(ctx context.Context, comment string) (*config.Config, error) {
-			return d.commitAndApplyOperator(ctx, comment)
-		},
-		CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
-			return d.commitConfirmedAndApplyOperator(ctx, minutes)
-		},
+		// transport converges identically. Wiring lives in the
+		// grpcCommitFn / grpcCommitConfirmedFn seams so it is
+		// fail-on-revert covered (#5961).
+		CommitFn:          d.grpcCommitFn(),
+		CommitConfirmedFn: d.grpcCommitConfirmedFn(),
 		// #5281: a gRPC zeroize runs the wipe under the SAME apply gate as
 		// commit/sync and enters a terminal reset generation so no concurrent
 		// or later config writer re-creates the erased state before the daemon
@@ -1339,13 +1388,11 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// RG0-ownership policy as gRPC/local-shell. Peer convergence
 		// is transport-independent (decided in commitAndApplyOperator),
 		// so a REST commit no longer leaves the standby on stale config
-		// until an unrelated transport-disconnect reverse-sync.
-		CommitFn: func(ctx context.Context, comment string) (*config.Config, error) {
-			return d.commitAndApplyOperator(ctx, comment)
-		},
-		CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
-			return d.commitConfirmedAndApplyOperator(ctx, minutes)
-		},
+		// until an unrelated transport-disconnect reverse-sync. Wiring
+		// lives in the restCommitFn / restCommitConfirmedFn seams so it
+		// is fail-on-revert covered (#5961).
+		CommitFn:          d.restCommitFn(),
+		CommitConfirmedFn: d.restCommitConfirmedFn(),
 		// #758: surface compile state so /health returns 503
 		// when the dataplane has never compiled successfully.
 		CompileHealthFn: func() api.CompileHealthSnapshot {
