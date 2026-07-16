@@ -83,11 +83,12 @@ var DefaultLimiter = NewLimiter(MaxConcurrentDiagnostics)
 // the gRPC GetSessions/GetSessionSummary/GetZonePairSummary RPCs, the ShowText
 // "sessions-top:*" scan, the gRPC ClearSessions clear (both the clear-all
 // and filtered full-table walks, #5779), and the count-only SessionCount()
-// walk reachable via the gRPC GetStatus RPC and the ShowText
+// walk reachable via the gRPC GetStatus RPC + the ShowText
 // "buffers"/"buffers-detail" (`show system buffers[-detail]`) surfaces (#5782)
-// — share the single SessionWalkLimiter below (#5708). SessionCount is
-// count-only (no per-entry alloc/enrich) but its KERNEL iteration + per-bucket
-// lock cost is the same O(table) contention, so it draws from the same budget.
+// AND the REST /api/v1/status handler (#5939) — share the single
+// SessionWalkLimiter below (#5708). SessionCount is count-only (no per-entry
+// alloc/enrich) but its KERNEL iteration + per-bucket lock cost is the same
+// O(table) contention, so it draws from the same budget.
 // Each walk holds
 // per-bucket BPF-map locks across the whole v4+v6 conntrack table while
 // contending with the live dataplane session-sync path, so an unbounded scan
