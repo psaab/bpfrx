@@ -1,3 +1,38 @@
+## 2026-07-16 — #5685 (dist/publish): validate the apt base URL BEFORE it is baked into the signed, root-run install.sh
+- **Timestamp**: 2026-07-16 (fix/5685-release-url-validate)
+- **Action**: Fix #5685 (security supply-chain, M40). `scripts/dist/publish.py
+  stamp_installer` took a lower-trust config input (`--apt-base-url` /
+  `XPF_APT_BASE_URL`) and substituted it LITERALLY (`text.replace("%%XPF_APT_BASE_URL%%",
+  apt_url)`) into `install.sh`, which is then SIGNED with minisign and piped to
+  `sudo sh` on a fresh host (Tier-A `curl … | sudo sh`). The marker sits inside a
+  SINGLE-QUOTED shell literal (`XPF_APT_BASE_URL_BAKED='%%XPF_APT_BASE_URL%%'`), so
+  a single quote in the URL (`https://x/apt'; rm -rf / #`) breaks out of the literal
+  and the tail becomes signed, root-executed shell — the unvalidated value crossed
+  the signing trust boundary (injection / supply-chain root; the signature attests
+  to whatever was stamped in). Sink confirmed on origin/master e60e23cd5, NOT
+  stale-fixed. Fix: added `validate_apt_url(value)` (fail-CLOSED via `die()`) called
+  in `stamp_installer` BEFORE any substitution. It requires a strict `https://` URL
+  and rejects, in two layers: (1) a per-character denylist — any shell metachar /
+  quote / whitespace / control byte / `%` / `=` (`_APT_URL_FORBIDDEN`); (2) a
+  structural allowlist via `urllib.parse.urlsplit` — scheme must be `https`, netloc
+  a bare `host[:port]` with no userinfo (`@`), and no query / fragment / non-
+  allowlisted path char. An apt base URL is a bare dists/+pool/ directory host, so
+  it never needs userinfo, a query, a fragment, or a percent-escape — the narrow
+  charset (`[A-Za-z0-9._~-]` + `/` in path + `:` for port) cannot host a shell
+  breakout. Mirrors the `validate_identifier` / `validate_version` fail-closed idiom
+  in `scripts/deploy/xpf-deploy.py`, widened to a URL charset (a plain identifier
+  allowlist is too strict for a URL). Fail-on-revert PROVEN: drop the
+  `validate_apt_url(apt_url)` call → `test_publish_url_validate.StampInstallerUrlGate.
+  test_malicious_url_not_stamped` REDs (the `'; touch /tmp/pwned #` payload is baked
+  into the installer, SystemExit not raised); restored GREEN. Validation:
+  `python3 scripts/dist/test_publish_url_validate.py` (4 OK) + `make selftest` 40
+  passed / 0 failed (new py test auto-discovered) + `scripts/dist/selftest.sh` 42
+  passed / 0 (new shell case "stamp refuses a shell-injecting apt URL (#5685)"). The
+  existing selftest stamp-installer path (`https://dl.selftest.invalid/apt`) still
+  passes — the validator accepts legit https URLs. Python-only (scripts/), no Go/Rust
+  change.
+- **File(s)**: scripts/dist/publish.py (validate_apt_url + _SAFE_APT_URL_NETLOC/_PATH + _APT_URL_FORBIDDEN; call in stamp_installer), scripts/dist/test_publish_url_validate.py (new — direct + end-to-end fail-on-revert), scripts/dist/selftest.sh (shell-injecting-URL rejection case), scripts/dist/README.md (validate_apt_url note on publish.py row)
+
 ## 2026-07-16 — #5687 (nat/SNAT): out-of-band tuple-unknown so real IPv4 protocol 0 (HOPOPT) is representable
 - **Timestamp**: 2026-07-16 (fix/5687-nat-proto0-sentinel)
 - **Action**: Fix #5687 (codex-review-182 M04). Rust userspace-dp SNAT used the
