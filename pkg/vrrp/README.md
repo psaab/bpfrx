@@ -561,10 +561,26 @@ fallback (unlike the link-watcher). The `subscribeAddrs` seam defaults to
 ### AF_PACKET cBPF filter + IPv6 extension headers (#2155)
 
 The AF_PACKET receiver attaches a cBPF prefilter
-(`openAfPacketReceiver`, `manager.go`) so the kernel drops non-VRRP
-frames before they reach the per-instance RX goroutine. It handles
-untagged and 802.1Q-tagged IPv4/IPv6:
+(`vrrpCBPFFilter`, attached in `openAfPacketReceiver`, `manager.go`) so
+the kernel drops non-VRRP frames before they reach the per-instance RX
+goroutine. It handles untagged and **single-tag** IPv4/IPv6, admitting
+BOTH `0x8100` (802.1Q) and `0x88a8` (802.1ad / S-tag) as the outer VLAN
+ethertype (#5088):
 
+- **Kernel prefilter and userspace parser MUST admit the same
+  encapsulation set (#5088).** A single S-tag has the identical layout as
+  a C-tag (real ethertype at offset 16), and `parseAfPacket`
+  (`instance.go`) accepts both `0x8100` and `0x88a8`. Before #5088 the
+  cBPF matched only `0x8100`, so on an S-tagged / provider-bridged segment
+  the kernel dropped every advert before Go — both nodes went mutually
+  deaf and could own the same VRID/VIPs (split-brain) despite the parser's
+  advertised 802.1ad support. Adding the `0x88a8` instruction shifts the
+  raw cBPF's relative jump offsets, which were recomputed; the exact
+  program is exercised in a `bpf.VM` (`cbpf_8021ad_5088_test.go`) against
+  untagged / 802.1Q / 802.1ad / non-VRRP frames. **Double-tag QinQ**
+  (`0x88a8` then `0x8100`, real ethertype at offset 20) is deliberately
+  NOT admitted — the Go parser does not decode it either, so the shared
+  contract stays "untagged + single-tag {0x8100, 0x88a8}".
 - IPv4 matches base protocol `== 112`; `parseAfPacketIPv4` then
   re-walks IHL + re-checks TTL 255 in Go (so IPv4 options are tolerated).
 - IPv6 matches the base **Next-Header** against the set

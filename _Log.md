@@ -49094,3 +49094,23 @@ top.
     green.
   - **File(s)**: pkg/cli/cli_clear.go,
     pkg/cli/cli_clear_rescan_no_progress_5948_test.go, pkg/cli/README.md
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5088 VRRP AF_PACKET cBPF: accept 802.1ad (0x88a8) alongside
+    802.1Q (0x8100). The raw sock_filter prefilter (pkg/vrrp/manager.go) matched
+    ONLY 0x8100 as the outer VLAN ethertype and rejected 0x88a8, while the Go
+    receiver parser (instance.go:1426) accepts BOTH — so on an S-tagged / provider-
+    bridged segment the kernel dropped every VRRP advert before Go, both nodes went
+    mutually deaf, and could own the same VRID/VIPs (split-brain). Inserted a
+    `jeq 0x88a8 -> check_vlan` instruction after the 0x8100 check (a single S-tag
+    has the identical layout: real ethertype @16) and RECOMPUTED all downstream
+    relative jump offsets for the +1 shift (instr 1 Jt 7->8, instr 2 Jt 14->15,
+    instr 3 Jt 1->2; the check_vlan/ipv4/ipv6 arms' offsets are unchanged since
+    both their source and target shifted together). Extracted the array into
+    vrrpCBPFFilter() so a bpf.VM test runs the EXACT program. Double-tag QinQ left
+    out of scope (the parser doesn't decode it either; contract = untagged +
+    single-tag {0x8100,0x88a8}). Fail-on-revert proven via -overlay + bpf.VM
+    (neutralize the 0x88a8 accept -> 802.1ad v4/v6 VRRP REJECTED, tests RED;
+    0x8100/untagged/reject cases stay green).
+  - **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/cbpf_8021ad_5088_test.go,
+    pkg/vrrp/README.md
