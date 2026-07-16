@@ -635,7 +635,16 @@ func TestQueue_ConcurrentProbesSerialize(t *testing.T) {
 
 // #2157 queue dedup: a second trigger of the SAME policy while the first is
 // stuck behind a held lock supersedes the older queued action (dedup-by-policy)
-// rather than queuing two; the drop is counted as queue_full.
+// rather than queuing two. #5853: the dedup runs on EVERY enqueue (not only when
+// the queue is full), so a same-policy burst keeps at most ONE pending action
+// and NEVER fills the bounded queue with duplicates. The dedup is counted as
+// Superseded (a benign replacement — the newer equivalent action still runs),
+// NOT DroppedQueueFull (which is reserved for a genuine capacity loss when the
+// queue is full of OTHER policies).
+//
+// FAIL-ON-REVERT: revert enqueue to dedup-only-when-full and Superseded stays 0
+// while DroppedQueueFull climbs, so the Superseded>=1 / QueueDepth<=1 /
+// DroppedQueueFull==0 assertions go RED.
 func TestQueue_DedupByPolicy(t *testing.T) {
 	s := newStore(t)
 	pol := &config.EventPolicy{
@@ -656,15 +665,25 @@ func TestQueue_DedupByPolicy(t *testing.T) {
 	e.HandleEvent(eventFor("ping_test_failed"))
 	waitFor(t, "worker retrying first action", func() bool { return e.Stats().Retried >= 1 })
 
-	// Fill the queue with same-policy triggers; dedup must keep at most one
-	// pending and count the rest as superseded. The cooldown is armed only on
-	// commit (not yet, since the lock is held), so evaluate does not filter
-	// these.
+	// Burst same-policy triggers; the early dedup (#5853) must keep at most one
+	// pending and supersede the rest. The cooldown is armed only on commit (not
+	// yet, since the lock is held), so evaluate does not filter these.
 	for i := 0; i < actionQueueDepth+4; i++ {
 		e.HandleEvent(eventFor("ping_test_failed"))
 	}
 
-	waitFor(t, "queue_full drops", func() bool { return e.Stats().DroppedQueueFull >= 1 })
+	// The benign dedup is counted as Superseded, not DroppedQueueFull, and the
+	// bounded queue never fills with duplicates: at most one same-policy action
+	// stays pending (the first event is already in-flight in the worker).
+	waitFor(t, "superseded dedup", func() bool { return e.Stats().Superseded >= 1 })
+	if got := e.Stats().DroppedQueueFull; got != 0 {
+		t.Errorf("DroppedQueueFull=%d; a same-policy burst is a benign dedup, not a "+
+			"capacity drop — it must not increment the queue_full metric (#5853)", got)
+	}
+	if got := e.Stats().QueueDepth; got > 1 {
+		t.Errorf("QueueDepth=%d; the one-pending-per-policy invariant must hold on "+
+			"every enqueue, so a same-policy burst occupies at most one slot (#5853)", got)
+	}
 
 	// Release and confirm it still converges to a single commit.
 	s.ExitConfigureSession("operator")

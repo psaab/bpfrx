@@ -49,9 +49,13 @@ func (s *Server) showInterfacesExtensive(cfg *config.Config, buf *strings.Builde
 	var rethMaps config.RethShowMaps
 	if cfg != nil {
 		rethMaps = cfg.RethShowMaps()
-		for _, ifc := range cfg.Interfaces.Interfaces {
+		// #5913: skip present-but-nil InterfaceConfig slots (tolerant load / HA
+		// config-sync path admits them) via the shared nil-safe iterator — a raw
+		// `range cfg.Interfaces.Interfaces` nil-derefs `ifc.Name` and panics the
+		// in-process daemon on a routine `show interfaces extensive`.
+		config.RangeInterfaces(cfg, func(_ string, ifc *config.InterfaceConfig) {
 			ifCfgMap[ifc.Name] = ifc
-		}
+		})
 		for _, z := range cfg.Security.Zones {
 			if z == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
 				continue
@@ -183,11 +187,15 @@ func (s *Server) showInterfacesDetail(cfg *config.Config, filter string, buf *st
 				ifZoneMap[ifName] = z.Name
 			}
 		}
-		for _, ifc := range cfg.Interfaces.Interfaces {
+		// #5913: skip present-but-nil InterfaceConfig slots via the shared
+		// nil-safe iterator (tolerant load / HA config-sync path) — a raw
+		// `range cfg.Interfaces.Interfaces` nil-derefs `ifc.Description` and
+		// panics on a routine `show interfaces detail`.
+		config.RangeInterfaces(cfg, func(_ string, ifc *config.InterfaceConfig) {
 			if ifc.Description != "" {
 				ifDescMap[ifc.Name] = ifc.Description
 			}
-		}
+		})
 	}
 	found := false
 	for _, link := range linksList {
@@ -409,8 +417,13 @@ func (s *Server) showVLANs(cfg *config.Config, buf *strings.Builder) {
 			trunk  bool
 		}
 		var entries []vlanEntry
-		for _, ifc := range cfg.Interfaces.Interfaces {
-			for unitNum, unit := range ifc.Units {
+		// #5910: the tolerant load / HA config-sync path admits present-but-nil
+		// InterfaceConfig / InterfaceUnit map values (#3494/#5068). Walk via the
+		// shared nil-safe iterators so a nil slot is skipped, not dereferenced —
+		// a raw `range ifc.Units` / `unit.VlanID` nil-derefs and panics the
+		// in-process daemon during a routine `show vlans`.
+		config.RangeInterfaces(cfg, func(_ string, ifc *config.InterfaceConfig) {
+			config.RangeUnits(ifc, func(unitNum int, unit *config.InterfaceUnit) {
 				if unit.VlanID > 0 || ifc.VlanTagging {
 					entries = append(entries, vlanEntry{
 						iface:  ifc.Name,
@@ -420,8 +433,8 @@ func (s *Server) showVLANs(cfg *config.Config, buf *strings.Builder) {
 						trunk:  ifc.VlanTagging,
 					})
 				}
-			}
-		}
+			})
+		})
 		if len(entries) == 0 {
 			buf.WriteString("No VLANs configured\n")
 		} else {

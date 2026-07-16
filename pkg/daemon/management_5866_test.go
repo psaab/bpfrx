@@ -1,0 +1,501 @@
+// #5866: the managementReconciler must, on a day-2 web-management change,
+// atomically replace the live HTTP/HTTPS listener + authentication snapshot
+// instead of leaving the boot-time server enforcing the old policy until a
+// restart. These tests drive reconcileTo/startTo with a FAKE listener factory
+// (no real ports) and cover: a bind/port change (new active, old closed),
+// make-before-break coexistence, a TLS-material change (new cert served),
+// a same-endpoint auth swap (no rebind), and a failed new-bind (old listener
+// RETAINED, error surfaced — fail-closed to the previous working state).
+//
+// FAIL-ON-REVERT: revert reconcileTo to close-old-before-binding-new and the
+// bind-failure test leaves nothing serving (RED); revert it to not swap and the
+// bind/port + auth tests do not converge (RED).
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/psaab/xpf/pkg/api"
+)
+
+// fakeLn is an in-memory net.Listener: Accept blocks until Close, so an
+// http.Server.Serve loop parks until Shutdown closes it (no real socket).
+type fakeLn struct {
+	addr   string
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (f *fakeLn) Accept() (net.Conn, error) { <-f.closed; return nil, net.ErrClosed }
+func (f *fakeLn) Close() error              { f.once.Do(func() { close(f.closed) }); return nil }
+func (f *fakeLn) Addr() net.Addr            { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+func (f *fakeLn) isOpen() bool {
+	select {
+	case <-f.closed:
+		return false
+	default:
+		return true
+	}
+}
+
+// fakeReg is the injected listener factory. It records, at each new listener's
+// creation, whether every previously-created listener was still open — the
+// make-before-break witness: a new endpoint must bind while the old is still
+// serving.
+type fakeReg struct {
+	mu              sync.Mutex
+	byAddr          map[string]*fakeLn
+	failAddr        map[string]bool
+	priorsOpenAtNew map[string]bool
+}
+
+func newFakeReg() *fakeReg {
+	return &fakeReg{byAddr: map[string]*fakeLn{}, failAddr: map[string]bool{}, priorsOpenAtNew: map[string]bool{}}
+}
+
+func (r *fakeReg) listen(network, addr string) (net.Listener, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failAddr[addr] {
+		return nil, fmt.Errorf("fake bind refused: %s", addr)
+	}
+	// #5866: model EADDRINUSE. Real net.Listen (Go sets SO_REUSEADDR, NOT
+	// SO_REUSEPORT) rejects a second LISTEN on an addr that is still open. The
+	// old whole-server rebuild re-bound the retained HTTP socket on a TLS enable
+	// and would hit exactly this; the per-listener fix binds ONLY the changed
+	// leg, so it never re-binds a still-open sibling. A closed addr may be
+	// re-bound (enable -> disable -> re-enable on the same HTTPS port).
+	if ln, ok := r.byAddr[addr]; ok && ln.isOpen() {
+		return nil, fmt.Errorf("fake bind: listen tcp %s: bind: address already in use", addr)
+	}
+	priorsOpen := true
+	for a, ln := range r.byAddr {
+		if a != addr && !ln.isOpen() {
+			priorsOpen = false
+		}
+	}
+	r.priorsOpenAtNew[addr] = priorsOpen
+	ln := &fakeLn{addr: addr, closed: make(chan struct{})}
+	r.byAddr[addr] = ln
+	return ln, nil
+}
+
+func (r *fakeReg) get(addr string) *fakeLn {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.byAddr[addr]
+}
+
+func cfgFor(reg *fakeReg, addr string, useTLS bool, httpsAddr string, auth *api.AuthConfig) api.Config {
+	return api.Config{Addr: addr, TLS: useTLS, HTTPSAddr: httpsAddr, Auth: auth, ListenFunc: reg.listen}
+}
+
+func newTestMgmt(reg *fakeReg) *managementReconciler {
+	// reconcileTo/startTo do not dereference d (only desired()/start() do), so a
+	// bare Daemon is sufficient for these listener-lifecycle tests.
+	return newManagementReconciler(&Daemon{}, api.Config{ListenFunc: reg.listen})
+}
+
+func waitClosed(t *testing.T, ln *fakeLn) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !ln.isOpen() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("listener %s did not close within the drain window", ln.addr)
+}
+
+// Bar 1 + Bar 4: a bind/port change replaces the listener make-before-break —
+// the new endpoint is active and the old is closed, and the new endpoint bound
+// while the old was still serving (no unreachable window).
+func TestMgmtReconcileBindChange_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+	old := reg.get("10.0.0.1:8080")
+	if old == nil || !old.isOpen() {
+		t.Fatal("initial listener not active")
+	}
+
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.2:8080", false, "", nil)); err != nil {
+		t.Fatalf("bind-change reconcile: %v", err)
+	}
+	// New endpoint recorded + active.
+	if m.cur.addr != "10.0.0.2:8080" {
+		t.Fatalf("current endpoint = %q, want the new bind 10.0.0.2:8080", m.cur.addr)
+	}
+	newLn := reg.get("10.0.0.2:8080")
+	if newLn == nil || !newLn.isOpen() {
+		t.Fatal("new listener is not active after the bind change")
+	}
+	// Make-before-break: the new endpoint bound while the old was still open.
+	if !reg.priorsOpenAtNew["10.0.0.2:8080"] {
+		t.Fatal("new listener bound only AFTER the old closed — not make-before-break (#5866): " +
+			"there was a window with no management listener")
+	}
+	// Old endpoint is retired.
+	waitClosed(t, old)
+}
+
+// Bar 2: a TLS-material change replaces the listener and serves a FRESH cert.
+func TestMgmtReconcileTLSChange_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start HTTP-only.
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+	if m.srv.HTTPSCertForTest() != nil {
+		t.Fatal("HTTP-only server must not serve a TLS cert")
+	}
+
+	// Enable HTTPS -> endpoint changes -> rebuild with a cert.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("enable-TLS reconcile: %v", err)
+	}
+	cert1 := m.srv.HTTPSCertForTest()
+	if cert1 == nil {
+		t.Fatal("HTTPS-enabled server must serve a TLS cert after the reconcile")
+	}
+	if reg.get("10.0.0.1:8443") == nil || !reg.get("10.0.0.1:8443").isOpen() {
+		t.Fatal("HTTPS listener not active after enabling TLS")
+	}
+
+	// Change the HTTPS bind -> rebuild -> a NEW self-signed cert is served.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.2:8443", nil)); err != nil {
+		t.Fatalf("https-rebind reconcile: %v", err)
+	}
+	cert2 := m.srv.HTTPSCertForTest()
+	if cert2 == nil {
+		t.Fatal("HTTPS cert missing after the https rebind")
+	}
+	if len(cert1.Certificate) == 0 || len(cert2.Certificate) == 0 {
+		t.Fatal("served TLS cert has no leaf certificate")
+	}
+	if bytesEqual(cert1.Certificate[0], cert2.Certificate[0]) {
+		t.Fatal("a TLS-material change must serve a NEW certificate, got the same leaf cert bytes (#5866)")
+	}
+}
+
+// Bar 3: a same-endpoint auth change swaps the LIVE auth snapshot in place — no
+// listener rebind (the server instance is unchanged), and the revoked credential
+// is rejected on the next request.
+func TestMgmtReconcileAuthSwapNoRebind_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	auth := &api.AuthConfig{Users: map[string]string{"admin": "secret"}}
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", auth)); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+	srvBefore := m.srv
+	ln := reg.get("10.0.0.1:8080")
+
+	// Revoke admin on the SAME endpoint.
+	revoked := &api.AuthConfig{Users: map[string]string{"other": "pw"}}
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", false, "", revoked)); err != nil {
+		t.Fatalf("auth-swap reconcile: %v", err)
+	}
+	// No rebind: the SAME server instance and the SAME listener are retained.
+	if m.srv != srvBefore {
+		t.Fatal("a same-endpoint auth change must NOT rebind the listener (server instance changed)")
+	}
+	if !ln.isOpen() {
+		t.Fatal("the listener was bounced on a same-endpoint auth change (#5866)")
+	}
+	// The live auth snapshot was swapped IN PLACE to the revoked set (admin gone,
+	// other present). The api-level TestServerReplaceAuthLiveSwap_5866 proves such
+	// a snapshot rejects the revoked credential on the next request.
+	snap := m.srv.AuthSnapshotForTest()
+	if snap == nil {
+		t.Fatal("live auth snapshot is nil after the revoke reconcile")
+	}
+	if _, ok := snap.Users["admin"]; ok {
+		t.Fatal("revoked credential 'admin' is STILL in the live auth snapshot — the swap did not " +
+			"take effect (#5866)")
+	}
+	if _, ok := snap.Users["other"]; !ok {
+		t.Fatal("the new credential 'other' is missing from the live auth snapshot")
+	}
+}
+
+// Bar 5: a failed new-bind RETAINS the old listener (fail-closed to the previous
+// working state, not mgmt-down) and surfaces the error. This is also the sharp
+// make-before-break lever: a close-old-first implementation would leave nothing
+// serving.
+func TestMgmtReconcileBindFailureRetainsOld_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+	old := reg.get("10.0.0.1:8080")
+	srvBefore := m.srv
+
+	reg.failAddr["10.0.0.2:8080"] = true
+	err := m.reconcileTo(cfgFor(reg, "10.0.0.2:8080", false, "", nil))
+	if err == nil {
+		t.Fatal("a failed listener replacement must surface an error")
+	}
+	// Old listener retained + still serving.
+	if m.srv != srvBefore {
+		t.Fatal("the live server was swapped despite the new bind failing (#5866)")
+	}
+	if m.cur.addr != "10.0.0.1:8080" {
+		t.Fatalf("endpoint fingerprint = %q, want the retained 10.0.0.1:8080 (retry debt)", m.cur.addr)
+	}
+	if !old.isOpen() {
+		t.Fatal("the OLD listener was closed on a failed replacement — management went DOWN " +
+			"(fail-open); make-before-break must retain the previous working listener (#5866)")
+	}
+	// Give any (incorrect) async close a chance, then re-assert the old is up.
+	time.Sleep(50 * time.Millisecond)
+	if !old.isOpen() {
+		t.Fatal("the OLD listener closed asynchronously after a failed replacement (#5866)")
+	}
+}
+
+// #5866 per-leg independence: a TLS enable/disable/re-enable rebinds ONLY the
+// HTTPS leg. The live HTTP listener is never re-bound (its socket stays the SAME
+// fakeLn, still open) — under the old whole-server rebuild this re-bound the
+// still-held HTTP socket and the strict fake rejects it with EADDRINUSE.
+func TestMgmtReconcileHTTPSEnableDisableReEnable_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err != nil {
+		t.Fatalf("initial HTTP-only start: %v", err)
+	}
+	httpLn := reg.get("10.0.0.1:8080")
+	if httpLn == nil || !httpLn.isOpen() {
+		t.Fatal("HTTP listener not active")
+	}
+
+	// Enable HTTPS -> only the HTTPS leg binds; HTTP is untouched.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("enable-TLS reconcile must succeed with the per-leg fix (no HTTP re-bind): %v", err)
+	}
+	if reg.get("10.0.0.1:8080") != httpLn || !httpLn.isOpen() {
+		t.Fatal("the live HTTP listener was disturbed by a TLS enable (#5866): it must be the SAME open socket")
+	}
+	if hln := reg.get("10.0.0.1:8443"); hln == nil || !hln.isOpen() {
+		t.Fatal("HTTPS listener not active after enable")
+	}
+
+	// Disable HTTPS -> HTTPS leg retires, HTTP untouched.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err != nil {
+		t.Fatalf("disable-TLS reconcile: %v", err)
+	}
+	waitClosed(t, reg.get("10.0.0.1:8443"))
+	if reg.get("10.0.0.1:8080") != httpLn || !httpLn.isOpen() {
+		t.Fatal("HTTP listener disturbed by a TLS disable (#5866)")
+	}
+
+	// Re-enable HTTPS on the SAME addr (now free) -> binds a fresh HTTPS leg.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("re-enable-TLS reconcile: %v", err)
+	}
+	if hln := reg.get("10.0.0.1:8443"); hln == nil || !hln.isOpen() {
+		t.Fatal("HTTPS listener not active after re-enable on the same port")
+	}
+	if reg.get("10.0.0.1:8080") != httpLn || !httpLn.isOpen() {
+		t.Fatal("HTTP listener disturbed by a TLS re-enable (#5866)")
+	}
+}
+
+// #5866: an HTTPS-bind-ONLY change (HTTP addr + TLS flag unchanged) make-before-
+// break rebinds only the HTTPS leg; the HTTP listener is untouched.
+func TestMgmtReconcileHTTPSBindOnlyChange_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("initial HTTP+HTTPS start: %v", err)
+	}
+	httpLn := reg.get("10.0.0.1:8080")
+	oldHTTPS := reg.get("10.0.0.1:8443")
+
+	// Move ONLY the HTTPS bind. HTTP stays on :8080.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.2:8443", nil)); err != nil {
+		t.Fatalf("https-bind-only reconcile must succeed (HTTP untouched): %v", err)
+	}
+	if reg.get("10.0.0.1:8080") != httpLn || !httpLn.isOpen() {
+		t.Fatal("the HTTP listener was re-bound by an HTTPS-only change (#5866)")
+	}
+	if newHTTPS := reg.get("10.0.0.2:8443"); newHTTPS == nil || !newHTTPS.isOpen() {
+		t.Fatal("new HTTPS listener not active")
+	}
+	// Make-before-break: the new HTTPS bound while the old HTTPS was still open.
+	if !reg.priorsOpenAtNew["10.0.0.2:8443"] {
+		t.Fatal("new HTTPS bound only after the old closed — not make-before-break (#5866)")
+	}
+	waitClosed(t, oldHTTPS)
+}
+
+// #5866 symmetric case: an HTTP-addr change while HTTPS is present + UNCHANGED
+// rebinds only the HTTP leg. The HTTPS listener is never re-bound (the old
+// whole-server rebuild would re-bind the still-held HTTPS socket -> EADDRINUSE).
+func TestMgmtReconcileHTTPChangeKeepsHTTPS_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("initial HTTP+HTTPS start: %v", err)
+	}
+	httpsLn := reg.get("10.0.0.1:8443")
+
+	// Change ONLY the HTTP bind. HTTPS stays on :8443.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.2:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("http-only reconcile must succeed without re-binding the unchanged HTTPS socket: %v", err)
+	}
+	if reg.get("10.0.0.1:8443") != httpsLn || !httpsLn.isOpen() {
+		t.Fatal("the HTTPS listener was re-bound by an HTTP-only change (#5866 symmetric collision)")
+	}
+	if newHTTP := reg.get("10.0.0.2:8080"); newHTTP == nil || !newHTTP.isOpen() {
+		t.Fatal("new HTTP listener not active")
+	}
+}
+
+// #5866 revocation-honoring (the elevated Finding A): a SINGLE commit that BOTH
+// revokes a credential AND changes the HTTPS endpoint to one that FAILS to bind
+// must still reject the revoked credential on the next request — the tightening
+// is published to the persistent HTTP listener UP FRONT, regardless of the HTTPS
+// rebind outcome — while the old HTTPS state is retained with retry debt.
+//
+// FAIL-ON-REVERT: without the up-front ReplaceAuth (publishing auth only after
+// the legs converge), the failed HTTPS rebind leaves the revoked credential in
+// the live snapshot -> the admin-absent assertion FAILS.
+func TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	auth := &api.AuthConfig{Users: map[string]string{"admin": "secret"}}
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", auth)); err != nil {
+		t.Fatalf("initial HTTP+HTTPS start: %v", err)
+	}
+	oldHTTPS := reg.get("10.0.0.1:8443")
+
+	// Bundled commit: revoke admin (new set has only "other") AND move the HTTPS
+	// bind to an address that fails to bind.
+	reg.failAddr["10.0.0.2:8443"] = true
+	revoked := &api.AuthConfig{Users: map[string]string{"other": "pw"}}
+	err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.2:8443", revoked))
+	if err == nil {
+		t.Fatal("a failed HTTPS rebind must surface an error (retry debt)")
+	}
+
+	// The revocation was honored despite the HTTPS bind failure: the live auth
+	// snapshot no longer contains admin.
+	snap := m.srv.AuthSnapshotForTest()
+	if snap == nil {
+		t.Fatal("live auth snapshot is nil after the revoke reconcile")
+	}
+	if _, ok := snap.Users["admin"]; ok {
+		t.Fatal("revoked credential 'admin' is STILL live after a bundled revoke + failed HTTPS rebind " +
+			"— a revoked credential must be rejected on the next request regardless of the rebind outcome (#5866)")
+	}
+	if _, ok := snap.Users["other"]; !ok {
+		t.Fatal("the tightened credential 'other' is missing from the live auth snapshot")
+	}
+
+	// The old HTTPS listener is retained (fail-closed) and its fingerprint is not
+	// advanced (retry debt).
+	if !oldHTTPS.isOpen() {
+		t.Fatal("the old HTTPS listener was closed on a failed rebind (mgmt HTTPS went down)")
+	}
+	if m.cur.httpsAddr != "10.0.0.1:8443" {
+		t.Fatalf("HTTPS fingerprint = %q, want the retained 10.0.0.1:8443 (retry debt)", m.cur.httpsAddr)
+	}
+	// The HTTP listener was never touched.
+	if hln := reg.get("10.0.0.1:8080"); hln == nil || !hln.isOpen() {
+		t.Fatal("the HTTP listener was disturbed by the HTTPS rebind")
+	}
+}
+
+// #5866 fail-open avoidance (the counterpart to the revocation-honoring case):
+// removing ALL api-auth (next.Auth == nil, which clamps the HTTP bind to
+// loopback) while the HTTP leg's OWN rebind to that loopback address FAILS must
+// NOT drop the retained NON-loopback HTTP listener to no-auth. The nil auth is
+// deferred (httpOK == false), so the retained listener keeps its previous
+// credential set — no fail-open — and converges on retry.
+func TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Live: non-loopback HTTP with auth (valid — auth present).
+	auth := &api.AuthConfig{Users: map[string]string{"admin": "secret"}}
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", auth)); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+	oldHTTP := reg.get("10.0.0.1:8080")
+
+	// Commit removes ALL api-auth -> the bind clamps to loopback (127.0.0.1),
+	// but that rebind FAILS. next.Auth == nil.
+	reg.failAddr["127.0.0.1:8080"] = true
+	err := m.reconcileTo(cfgFor(reg, "127.0.0.1:8080", false, "", nil))
+	if err == nil {
+		t.Fatal("a failed HTTP rebind must surface an error")
+	}
+
+	// The nil auth was NOT applied: the retained NON-loopback HTTP listener still
+	// enforces the previous credential — dropping it to no-auth would be a
+	// fail-open on a non-loopback bind.
+	snap := m.srv.AuthSnapshotForTest()
+	if snap == nil {
+		t.Fatal("api-auth was removed while the retained listener is still non-loopback — FAIL-OPEN (#5866): " +
+			"a nil-on-loopback auth must not be applied to a retained non-loopback listener")
+	}
+	if _, ok := snap.Users["admin"]; !ok {
+		t.Fatal("the retained listener lost its credential set on a failed HTTP rebind (#5866)")
+	}
+	// Old non-loopback listener retained + open; fingerprint not advanced.
+	if !oldHTTP.isOpen() {
+		t.Fatal("the old HTTP listener was closed on a failed rebind (mgmt went down)")
+	}
+	if m.cur.addr != "10.0.0.1:8080" {
+		t.Fatalf("HTTP fingerprint = %q, want the retained 10.0.0.1:8080 (retry debt)", m.cur.addr)
+	}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

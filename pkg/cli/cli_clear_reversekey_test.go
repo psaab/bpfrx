@@ -55,6 +55,17 @@ func (d *recordingClearCLIDP) IterateSessionsV6(fn func(dataplane.SessionKeyV6, 
 	return nil
 }
 
+// #4886: the bounded CLI clear prefers the cursor path (cliSessionCursor). This
+// fixture's table is well under cliClearFilteredBatch, so it clears in one chunk;
+// the cursor is irrelevant, so delegate to the full-scan iterators.
+func (d *recordingClearCLIDP) IterateSessionsFrom(_ *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	return d.IterateSessions(fn)
+}
+
+func (d *recordingClearCLIDP) IterateSessionsV6From(_ *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return d.IterateSessionsV6(fn)
+}
+
 func (d *recordingClearCLIDP) DeleteSession(key dataplane.SessionKey) error {
 	d.deletedV4 = append(d.deletedV4, key)
 	if d.missingV4[key] {

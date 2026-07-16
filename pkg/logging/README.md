@@ -19,12 +19,17 @@ reports.
   `n <= 0` as "return nothing" — a count argument never reaches
   `make([]EventRecord, n)` with a negative len (which panics).
 - `Subscription` — `eventbuf.go`. A consumer of the event ring.
-  `Subscribe(bufSize)` never fails and is the entry point for the TRUSTED,
-  inherently bounded internal consumers (gRPC event stream, CLI monitor).
-  The UNTRUSTED REST SSE surface (`/api/v1/events/stream`,
-  `/api/v1/logs/stream`) must use `TrySubscribe(bufSize)`, which returns
-  `nil` once the live subscriber count reaches `defaultMaxSubscribers` (64)
-  — the REST handler then responds `503` (#4484 L-2). Every `Add` fans out
+  `Subscribe(bufSize)` never fails and is the entry point ONLY for the
+  TRUSTED, genuinely bounded in-process consumers (the CLI monitor). Every
+  REQUEST-CREATED stream must use `TrySubscribe(bufSize)`, which returns
+  `nil` once the live subscriber count reaches `defaultMaxSubscribers` (64):
+  the UNTRUSTED REST SSE surface (`/api/v1/events/stream`,
+  `/api/v1/logs/stream`) — the REST handler then responds `503` (#4484 L-2) —
+  AND the gRPC `MonitorPacketDrop` stream, which is created per-RPC on the
+  loopback-but-UNAUTHENTICATED gRPC listener and so is NOT inherently
+  bounded (it returns `codes.ResourceExhausted` at the cap, #5850). A
+  request-created stream that used the uncapped `Subscribe` would let any
+  local process open an unbounded number of streams. Every `Add` fans out
   O(N) over the subscriber set and each subscription holds a buffered
   channel, so an unbounded set is a memory + per-event-CPU DoS vector on the
   untrusted surface; the cap mirrors `metricsMaxInFlight` (#4162). The cap

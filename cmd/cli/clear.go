@@ -7,6 +7,25 @@ import (
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
+// requireClearNoScope rejects any trailing operand on a GLOBAL-ONLY clear
+// command — one whose backend action can ONLY clear everything and has no
+// scoped variant. Such handlers historically recognized a fixed keyword prefix
+// and silently DISCARDED the remaining tokens, then issued the unscoped
+// mutation, so an operator who typed a scope (e.g. `clear arp 192.0.2.10`) got
+// a success message while the ENTIRE cache/table/counter set was wiped (#5811).
+// Require exact arity instead: return an error naming the stray tokens and
+// stating the command takes no scope, BEFORE any mutation runs. cmd is the full
+// command path shown in the message; clears names what it unconditionally
+// clears. The wording is kept byte-identical to pkg/cli's copy so both CLIs
+// reject the same input the same way.
+func requireClearNoScope(cmd, clears string, extra []string) error {
+	if len(extra) == 0 {
+		return nil
+	}
+	return fmt.Errorf("unexpected argument(s) %v after %q; this command clears %s "+
+		"and takes no scope (per-scope clear is not supported)", extra, cmd, clears)
+}
+
 func (c *ctl) handleClear(args []string) error {
 	showHelp := func() {
 		printRemoteTreeHelp("clear:", "clear")
@@ -18,7 +37,7 @@ func (c *ctl) handleClear(args []string) error {
 
 	switch args[0] {
 	case "arp":
-		return c.handleClearArp()
+		return c.handleClearArp(args[1:])
 	case "ipv6":
 		return c.handleClearIPv6(args[1:])
 	case "security":
@@ -42,6 +61,9 @@ func (c *ctl) handleClearSystem(args []string) error {
 		printRemoteTreeHelp("clear system:", "clear", "system")
 		return nil
 	}
+	if err := requireClearNoScope("clear system config-lock", "the configuration lock", args[1:]); err != nil {
+		return err
+	}
 	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 		Action: "clear-config-lock",
 	})
@@ -54,6 +76,9 @@ func (c *ctl) handleClearSystem(args []string) error {
 
 func (c *ctl) handleClearInterfaces(args []string) error {
 	if len(args) >= 1 && args[0] == "statistics" {
+		if err := requireClearNoScope("clear interfaces statistics", "all interface statistics", args[1:]); err != nil {
+			return err
+		}
 		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: "clear-interfaces-statistics",
 		})
@@ -67,7 +92,10 @@ func (c *ctl) handleClearInterfaces(args []string) error {
 	return nil
 }
 
-func (c *ctl) handleClearArp() error {
+func (c *ctl) handleClearArp(args []string) error {
+	if err := requireClearNoScope("clear arp", "the ARP cache", args); err != nil {
+		return err
+	}
 	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 		Action: "clear-arp",
 	})
@@ -82,6 +110,9 @@ func (c *ctl) handleClearIPv6(args []string) error {
 	if len(args) < 1 || args[0] != "neighbors" {
 		printRemoteTreeHelp("clear ipv6:", "clear", "ipv6")
 		return nil
+	}
+	if err := requireClearNoScope("clear ipv6 neighbors", "the IPv6 neighbor cache", args[1:]); err != nil {
+		return err
 	}
 	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 		Action: "clear-ipv6-neighbors",
@@ -102,6 +133,10 @@ func (c *ctl) handleClearSecurity(args []string) error {
 	switch args[0] {
 	case "nat":
 		if len(args) >= 3 && args[1] == "source" && args[2] == "persistent-nat-table" {
+			if err := requireClearNoScope("clear security nat source persistent-nat-table",
+				"the entire persistent NAT table", args[3:]); err != nil {
+				return err
+			}
 			resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 				Action: "clear-persistent-nat",
 			})
@@ -112,6 +147,10 @@ func (c *ctl) handleClearSecurity(args []string) error {
 			return nil
 		}
 		if len(args) >= 2 && args[1] == "statistics" {
+			if err := requireClearNoScope("clear security nat statistics",
+				"all NAT translation statistics", args[2:]); err != nil {
+				return err
+			}
 			resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 				Action: "clear-nat-counters",
 			})
@@ -202,10 +241,9 @@ func (c *ctl) handleClearSecurity(args []string) error {
 		if len(args) < 2 || args[1] != "hit-count" {
 			return fmt.Errorf("usage: clear security policies hit-count")
 		}
-		if len(args) > 2 {
-			return fmt.Errorf("unknown/unsupported selector %q for "+
-				"clear security policies hit-count; per-scope clear is not "+
-				"supported (this command clears ALL policy hit counters)", args[2])
+		if err := requireClearNoScope("clear security policies hit-count",
+			"all policy hit counters", args[2:]); err != nil {
+			return err
 		}
 		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: "clear-policy-counters",
@@ -217,6 +255,9 @@ func (c *ctl) handleClearSecurity(args []string) error {
 		return nil
 
 	case "counters":
+		if err := requireClearNoScope("clear security counters", "all counters", args[1:]); err != nil {
+			return err
+		}
 		_, err := c.client.ClearCounters(c.ctx(), &pb.ClearCountersRequest{})
 		if err != nil {
 			return fmt.Errorf("%v", err)
@@ -234,6 +275,9 @@ func (c *ctl) handleClearFirewall(args []string) error {
 	if len(args) < 1 || args[0] != "all" {
 		printRemoteTreeHelp("clear firewall:", "clear", "firewall")
 		return nil
+	}
+	if err := requireClearNoScope("clear firewall all", "all firewall filter counters", args[1:]); err != nil {
+		return err
 	}
 	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 		Action: "clear-firewall-counters",

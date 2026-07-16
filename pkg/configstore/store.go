@@ -129,6 +129,22 @@ type Store struct {
 	// false; only the degrade-not-fail resolution paths set it.
 	confirmResolvePendingPersist bool
 
+	// confirmRemoveDegraded records that a RESOLVED pending commit-confirmed
+	// window's confirm.json REMOVAL failed to become durable (#5835): either the
+	// unlink failed, or the post-unlink parent-dir fsync failed so the dirent
+	// removal is not yet durable on disk. UNLIKE confirmResolvePendingPersist
+	// (which waits for a replacement active WRITE to land before removing the
+	// record) this is a debt to re-run DeleteConfirm itself — the resolving
+	// config is already durable, but the stale crash-recovery record still
+	// lingers and a crash+restart could resurrect its rollback of an
+	// already-confirmed config. This is the operation state that distinguishes
+	// "removal durable / never existed" (false) from "unlink succeeded, dir sync
+	// still owed" (true), so an absent-file retry re-drives the #4864 dir fsync
+	// rather than reporting a false success. Surfaced via ConfigPersistDegraded()
+	// (and ConfirmRemovalDegraded()) until the singleton persist-retry loop lands
+	// the removal durably. Default false.
+	confirmRemoveDegraded bool
+
 	// Commit confirmed state. confirmGen is a generation token
 	// guarding the auto-rollback callback against staleness: a timer
 	// that has already fired and is blocked on s.mu when a nested
@@ -641,7 +657,9 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 		// The synced config is durable. Drop the confirm.json this sync
 		// superseded now that the replacement is on disk.
 		if syncSupersededConfirm {
-			s.removeConfirmState()
+			// #5835: a failed removal retains retry debt + degraded health
+			// rather than being swallowed.
+			s.resolveConfirmRemovalLocked("config_sync_remove")
 		}
 		// Also finalize any removal deferred by an EARLIER failed resolution
 		// write (e.g. a prior rollback whose persist failed): the synced config

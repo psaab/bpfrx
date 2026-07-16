@@ -251,15 +251,16 @@ editing cmdtree.
     `constantTimeAPIKeyMatch` skips an empty configured key) — the
     constant-time compare still runs unconditionally, so the #4157
     known/unknown-user timing profile is preserved.
-  - **`/metrics` posture (#4162).** The Prometheus endpoint is
-    unauthenticated on the loopback default bind — the standard Prometheus
-    posture. When `system services web-management http interface <if>`
-    rebinds the HTTP API to a routable management address AND auth is
-    configured, `/metrics` requires the same credentials as every other
-    endpoint (`isLoopbackBindAddr` → `authMiddleware` gate); a
-    routable-interface Prometheus scraper must then present the configured
-    API key / basic-auth. `/health` stays exempt (no sensitive data, no
-    table walk).
+  - **`/metrics` posture (#4162).** Authentication policy is owned by each
+    enabled HTTP or HTTPS listener, using that listener's configured/effective
+    `cfg.Addr` or `cfg.HTTPSAddr`; it is never inferred from the request host,
+    forwarded headers, URL, or the sibling listener. With API auth configured,
+    `/metrics` is unauthenticated only on a literal IPv4/IPv6 loopback bind
+    (the standard Prometheus posture). Every routable, wildcard, hostname,
+    malformed, or otherwise unprovable bind fails closed and requires the same
+    Basic, Bearer, or API-key credentials as every other protected endpoint.
+    `/health` remains exempt. With `cfg.Auth == nil`, no auth wrapper is
+    installed on either listener, so both use the shared base mux unchanged.
   - **Cross-site mutation guard (CSRF, #5055).** HTTP Basic auth is an
     *ambient* browser credential (`WWW-Authenticate: Basic`) — once a browser
     is challenged it reattaches the cached credentials to every request to the

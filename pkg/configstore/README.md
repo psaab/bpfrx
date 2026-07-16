@@ -422,6 +422,48 @@ per-path:
   ordered after its degrade-not-fail write. Distinct from #4864 (which made
   the delete itself dir-fsync-durable): #4864 fixes HOW the record is deleted,
   #5473 fixes WHEN.
+- **Confirmation is gated on DURABLE removal of `confirm.json` (#5835).**
+  #4864 made the delete dir-fsync-durable and #5473 ordered it after the
+  resolving write, but the removal itself was still **best-effort**:
+  `removeConfirmState` only LOGGED a `DeleteConfirm` failure. So a
+  confirmation (plain commit / HA sync / explicit `commit`-confirm /
+  demotion) reported SUCCESS while `confirm.json` lingered on disk — a
+  restart then read the stale record and resurrected its rollback,
+  reverting the operator-confirmed config (in HA, re-diverging a confirmed
+  standby). Three corrections close this:
+  - **Removal failure is surfaced/retained, never swallowed.**
+    `removeConfirmState` now RETURNS the error. The EXPLICIT `ConfirmCommit`
+    propagates it to the operator (the confirm took effect in memory but is
+    not durable). The non-returning paths route through
+    `resolveConfirmRemovalLocked`, which retains **retry debt**
+    (`confirmRemoveDegraded`) and starts the singleton persist-retry loop —
+    the SAME loop that heals a degraded active write — so the stale record
+    is re-deleted with backoff until durable. `ConfigPersistDegraded()`
+    (→ /health) is true while the debt stands; `ConfirmRemovalDegraded()`
+    exposes it specifically. The in-memory timer/rollback bookkeeping is
+    cancelled as before (the record delete needs only the file path, not the
+    tree), so nothing is irreversibly lost — the retry re-drives the delete.
+  - **The #4864 dir fsync is reachable on an absent-file RETRY.**
+    `DeleteConfirm` used to `return nil` on `os.IsNotExist` BEFORE the dir
+    fsync. If a prior attempt unlinked the file but its dir fsync FAILED, the
+    dirent removal was not yet durable, yet the absent-file retry reported a
+    false success. It now falls through to the dir fsync even when the file
+    is already absent (idempotent, harmless when it never existed), and keeps
+    returning an error until a fsync succeeds — the `confirmRemoveDegraded`
+    flag is the cross-call operation state distinguishing "never existed /
+    durable" from "unlink succeeded, dir sync owed".
+  - **The record is bound to the config it guards (`GuardedHash`).**
+    `confirm.json` records the sha256 of the unconfirmed active tree's
+    `Format()` at arm time (an additive JSON field). On boot recovery, if
+    the loaded active config no longer matches, a later commit/confirm has
+    advanced the active config while this record's removal had failed — the
+    record is STALE and `recoverPendingConfirmLocked` IGNORES it (no rollback,
+    no re-arm) rather than reverting an unrelated, already-confirmed
+    generation. A legacy record (empty `GuardedHash`, pre-#5835) skips the
+    check and recovers exactly as #4577, preserving the cross-upgrade hatch.
+    A residual case remains by design: an explicit confirm with NO later
+    commit + an immediate crash before the retry heals fails SAFE (reverts on
+    boot) — consistent with `ConfirmCommit` having returned an error.
 - **Durable deletes match durable writes (#5197).** A delete of a
   secret-bearing artifact fsyncs its parent directory so the removal is
   durable, mirroring the `fsatomic.WriteFileDurable` its writer used — a
@@ -448,6 +490,22 @@ per-path:
   top-level temp — and its secrets — would survive. The gRPC
   `zeroizeConfigDir` mirror in `pkg/grpcapi` carries the same barriers
   (its own `zeroizeSyncDir` seam) and the same `.<base>.tmp-*` sweep.
+- **Ownership-scoped deletion (#5768).** The top-level sweep matches ONLY
+  the artifacts xpf itself created/tracks — the live config file (by EXACT
+  name, `configBase`, so a non-`.conf` `-config` base like `site.cfg` is
+  erased too), `rescue.conf` (`RescueConfigBase`), `.config.journal[.N]`,
+  the numbered text rollback slots `<configBase>.<N>`, and fsatomic crash
+  temps — NEVER a broad `*.conf` suffix or `rollback*` prefix glob. The old
+  globs deleted UNOWNED siblings when a custom `-config` resolved the config
+  root to a shared directory or a subdir that slipped past the
+  `FactoryResetForbiddenRoots` denylist (`/data/xpf.conf` → wipes `/data/*`;
+  `/etc/frr/x.conf` → deletes xpf's own rendered `frr.conf`). A denylist is
+  inherently incomplete on a wildcard wipe; ownership scoping bounds the
+  deletion to xpf's own files instead, with the denylist kept as
+  defense-in-depth. `FactoryResetConfigDir` (CLI) and the gRPC
+  `zeroizeConfigDir` mirror apply the identical scoped match; the dedicated
+  `<root>/.configdb` and (gRPC-only) `<root>/tls` subdir `RemoveAll`s stay —
+  those are exclusively xpf-owned subdirectories.
 - **`FactoryResetArchiveDir` — local config-archive erasure (#5186).**
   `zeroize` must remove EVERY on-box generation of config secrets. The
   config archive (`<archive-dir>/config-*.conf`, 0600 full-config-text
@@ -587,10 +645,10 @@ and returned `false` **without clearing anything**. The exclusive lock
 then persisted with no live holder, and every subsequent
 `configure` / `configure exclusive` / `configure private` was rejected
 until daemon restart — a single operator running `configure exclusive`
-then disconnecting bricked all future config edits. The disconnect
-auto-release (`configLockInterceptor` in `pkg/grpcapi/server.go`) routes
-through `ExitConfigureSession`, so it silently failed too; matching the
-effective holder restores that stale-holder reclaim on disconnect.
+then disconnecting bricked all future config edits. The connection-close
+auto-release (`configLockStatsHandler`'s `ConnEnd`, `pkg/grpcapi`; #5849)
+routes through `ExitConfigureSession`, so it silently failed too; matching
+the effective holder restores that stale-holder reclaim on disconnect.
 
 `ConfigHolder()` likewise reports the effective holder, so
 `clear system config-lock` / diagnostic output attributes an exclusive
@@ -602,9 +660,11 @@ remains the unconditional operator override.
 
 ### Config lock: idle-lease reaper (#4476)
 
-The gRPC config path auto-releases the lock when a client disconnects
-(`configLockInterceptor` in `pkg/grpcapi/server.go` calls
-`ExitConfigureSession` once `ctx.Err() != nil`). The **REST** config
+The gRPC config path auto-releases the lock when a client's CONNECTION
+ends (`configLockStatsHandler`'s `ConnEnd` in `pkg/grpcapi`, #5849, calls
+`ExitConfigureSession` exactly once — keyed by the connection-scoped id,
+never on per-RPC cancellation, so a cancelled unary no longer discards the
+connection's candidate). The **REST** config
 path has no such hook: `POST /api/v1/config/enter`
 (`configEnterHandler`) takes the global lock with an empty holder, and a
 stateless HTTP client that never calls `/config/exit` leaves it held. On
@@ -711,10 +771,10 @@ it, `Annotate` was the one candidate mutator with no ownership check at all, so
 a non-holder could annotate another session's candidate and refresh the true
 holder's idle lease.) The commit-family RPCs whose mutation runs through a daemon
 callback (`Commit`, `CommitConfirmed`) call the exported `EnsureConfigHolder`
-first. The gRPC handlers thread `peerSessionID(ctx)` — the same identifier
-`EnterConfigureSession` records — into every one of these, so a second remote
-session is rejected with `ErrConfigLockedByOther` (mapped to
-`codes.PermissionDenied`).
+first. The gRPC handlers thread `connSessionID(ctx)` — the connection-scoped id
+(#5849), the same identifier `EnterConfigureSession` records — into every one
+of these, so a second remote session is rejected with `ErrConfigLockedByOther`
+(mapped to `codes.PermissionDenied`).
 
 Two deliberate bypasses keep the internal paths working:
 
@@ -726,8 +786,9 @@ Two deliberate bypasses keep the internal paths working:
 - **A lock with no recorded holder** (`effectiveHolderLocked() == ""`, i.e.
   the internal/local `EnterConfigure()` path) is not owned by any session, so
   a user session is not blocked from it. A remote gRPC caller always carries a
-  non-empty `peerSessionID` and records it on `EnterConfigureSession`, so it
-  cannot manufacture an empty-holder state to slip through.
+  non-empty `connSessionID` (its connection-scoped id, #5849) and records it on
+  `EnterConfigureSession`, so it cannot manufacture an empty-holder state to
+  slip through.
 
 Like `ErrClusterReadOnly`, `ErrConfigLockedByOther` is `errors.Is`-matchable;
 it is transient (the holder commits or exits). The internal `SyncApply` /

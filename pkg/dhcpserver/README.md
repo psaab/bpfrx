@@ -384,6 +384,39 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   destructive-delete class is now closed at BOTH the header level (required
   columns present, each once, no duplicates) and the row level (every data
   row long enough to supply every required column).
+- **Kea LFC file-set snapshot (#5796)** — Kea never rewrites the memfile in
+  place; it APPENDS every renewal/release/decline/reclaim and periodically runs
+  Lease File Cleanup (`kea-lfc`) to compact the log. During and after a cleanup
+  the live lease set is NOT the current file alone — it spans Kea's LFC file
+  set. For a current lease file `<f>` (authoritative from Kea src
+  `memfile_lease_mgr.cc appendSuffix` / `LFCFileType`): `<f>.1` is the INPUT file
+  (the current file the server moves aside at the START of a cleanup) and
+  `<f>.2` is the PREVIOUS file (the COMPACTED result of the last COMPLETED
+  cleanup, one row per active lease); `.output`/`.completed`/`.pid` are kea-lfc
+  scratch/markers with no lease union and are ignored. Reading only `<f>` LOST
+  every lease living in `.2`/`.1`: right after LFC rotates the current file it
+  is a fresh, often header-only append log while the active leases sit in the
+  compacted previous file — so a valid header-only current file wrongly read as
+  a trusted-empty set would authorize the DDNS reconciler to MASS-DELETE every
+  owned A/AAAA/PTR (fail-open). BOTH the destructive `parseActiveLeases4/6` and
+  the display `parseLeaseCSV` now read the whole set via the one shared
+  `keaLFCLeaseFilePaths` (`lease_lfc.go`) in Kea CHRONOLOGICAL order — PREVIOUS
+  (`.2`) → INPUT (`.1`) → CURRENT (`<f>`), oldest first — and replay the rows
+  through the SAME append-only, last-row-wins dedup, so a newer row in the input
+  or current file supersedes an older row in previous and a release/expiry row
+  still tombstones a lease a later re-allocation reclaims. A missing `.1`/`.2`
+  (the common no-LFC steady state) collapses the set to exactly the current file
+  (byte-identical to the pre-#5796 read). The fail-safe posture is preserved and
+  EXTENDED across the set: any EXISTING sibling that is headerless / mangled /
+  ragged makes the WHOLE family untrusted (error → destructive diff skipped),
+  and the trusted-empty result is returned only when every existing file in the
+  set validates AND the merged active set is empty. `readSyncLeasesViaMemfile`
+  (the HA lease-sync fallback) inherits the union through `parseActiveLeases`.
+  RESIDUAL (deferred to a follow-up, tracked on #5796): this reads the on-disk
+  LFC set coherently for the common phases, but does not yet prefer the live
+  `lease_cmds` control socket over the journal in every consumer, nor
+  crash-interrupted-cleanup generation proofs (`.output`/`.completed` mid-move),
+  nor a degraded-source banner on the display surfaces (issue invariants 2/3/8).
 - **Hostname normalization** — `deriveFQDN` / `finalizeFQDN`
   (`ddns_hostname.go`) ALWAYS contains the published name in the configured
   zone: the client picks the host part, the firewall picks the domain. A

@@ -36,6 +36,26 @@ Regression coverage: `pkg/config/parser_recursion_dos_hb164_test.go`,
 `pkg/configstore/config_size_ceiling_hb164_test.go`,
 `pkg/api/config_load_bodycap_hb164_test.go`,
 `pkg/grpcapi/server_recvsize_hb164_test.go`.
+
+**Retained-diagnostic cap is a fourth guard (#5827).** The parser records one
+`ParseError` per bad token; an all-invalid payload (up to `MaxConfigSize`)
+otherwise pins ~16 million `ParseError` structs — each holding a formatted
+message string — LIVE at once, an unbounded-heap OOM DoS reachable from the
+same unauthenticated config-load / HA-sync ingress. `addError`/`addErrorf` now
+cap the RETAINED diagnostic set at `maxParseErrors` (64): past the cap they
+count the drop in `Parser.suppressed` (and skip formatting) instead of
+appending, and `Parse` folds the count into ONE deterministic trailing
+`additional parse errors suppressed (N)` diagnostic — so `len(errs)` is bounded
+to `maxParseErrors+1` and the retained heap to O(cap) regardless of input size.
+The first ≤64 diagnostics keep their parse order + line/column. The lexer still
+drains the whole input O(input) for deterministic termination (only the
+parser's RETENTION is capped), mirroring the `skipToBlockClose` depth-cap
+suppression. `ParseSetVerb`/`ParseSetCommand` (flat-set) are already bounded —
+they return on the FIRST bad token. Do NOT remove the cap. Regression coverage:
+`pkg/config/parser_error_cap_5827_test.go` (16 MiB bound + retained-heap budget
++ ordering + depth×token interaction + `FuzzParseErrorBound_5827`),
+`pkg/configstore/parse_error_cap_5827_test.go` (load-path concise-error /
+no-partial-apply).
 - `ParseSetCommand(input string) ([]string, error)` — `parser.go`.
   Parses one flat-set line into the path components. The caller then
   applies that path with `tree.SetPath()` to build the AST.
@@ -203,6 +223,49 @@ hierarchical commits will break (or vice versa).
 parser treats newlines as whitespace and merges multiple set lines into
 one giant node. This trap has bitten the project repeatedly — see
 CLAUDE.md.
+
+**Interface-name canonicalization is not injective (#5832).**
+`LinuxIfName` only replaces `/` with `-`, so the DISTINCT authored names
+`ge-0/0/0` and `ge-0-0-0` collapse to the SAME Linux device / ifindex.
+Each authored interface still emits its own forwarding-snapshot row (zone,
+routing-instance, host-inbound, NAT, address, tunnel), but the Rust
+forwarding-state builder keys by ifindex and OVERWRITES the earlier row —
+the lexicographically later name silently wins, hijacking that device's
+security-zone / routing identity. `validateInterfaceNameCollisionStrict`
+(`compiler_validate_strict_ifname_collision.go`, wired into
+`runUniformGates`) hard-REJECTS such a collision — and a canonical name over
+the kernel IFNAMSIZ limit (15 bytes) — on the strict commit / commit-check
+path, naming both authored names, the shared device, and the winner. The
+tolerant load / peer-sync path downgrades to a warning
+(`opts.lenientIfNameCollision`, #1960 no-brick) so a grandfathered config
+still boots but the overwrite is no longer silent. The fix is a GATE, not a
+remapping: `LinuxIfName`'s mapping is unchanged, so every existing
+single-name config compiles exactly as before.
+
+**Present-but-nil interface/unit slots — walk via `RangeInterfaces` /
+`RangeUnits` (#5813).** The tolerant load / HA config-sync path admits a
+present-key/nil-value `InterfaceConfig` (`cfg.Interfaces.Interfaces["ge-0/0/0"]
+= nil`) or `InterfaceUnit` (`ifc.Units[7] = nil`) — same #3494/#5068 no-brick
+tolerance as the policy/zone nil cases above. A raw `for _, ifc := range
+cfg.Interfaces.Interfaces { for _, unit := range ifc.Units { unit.Number … } }`
+nil-derefs on such a slot and panics the in-process daemon during a routine
+read-only presentation (`show security flow session`, gRPC `GetSessions`, REST
+`/sessions`). `RangeInterfaces(cfg, fn)` and `RangeUnits(ifc, fn)`
+(`interfaces_iter.go`) are the shared nil-safe walk: they skip the nil slots (and
+no-op on a nil `cfg`/`ifc`), so every read-only presenter that walks the
+interface tree stays panic-safe with the guard in ONE place. The three session
+egress-interface map builders (CLI `buildSessionEgressIfacesWithLookup`, gRPC
+`buildSessionFilter`, REST `buildSessionView`) route through them, and #5910
+extended the same walk to the show presenters that the first pass missed —
+`showVLANs` (gRPC `show vlans`) and the `show security zones` detail renderers
+(gRPC `showZonesDetail`, CLI `showZonesDisplay`), where a bare
+`ifc, ok := …Interfaces[name]` proved key presence but not a non-nil value.
+#5913 extended it once more to the `show interfaces extensive`/`detail` text
+presenters (gRPC `showInterfacesExtensive`/`showInterfacesDetail`), whose
+config-map builders (`ifCfgMap`/`ifDescMap`) still carried the same raw
+`range cfg.Interfaces.Interfaces` reading `ifc.Name`/`ifc.Description`. New
+interface-tree presenters should route through these helpers too rather than
+reintroducing a raw range.
 
 **Comments (`# ...`, `// ...`, `/* ... */`) and unterminated blocks
 (M-8):** the lexer (`skipWhitespaceAndComments`) skips `#`/`//` line

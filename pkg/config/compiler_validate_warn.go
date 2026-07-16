@@ -1465,13 +1465,17 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, validateCoSOversubscriptionWarnings(cos)...)
 	}
 
-	// #1706: the next-table and rib-group ip-rule reconcilers program
-	// into fixed 100-priority windows that their clear() passes scan.
-	// The applier hard-caps at the window boundary so out-of-range rules
-	// never leak, but a config that exceeds the window would be silently
-	// truncated at apply time. Surface the over-limit condition here at
-	// commit time so the operator sees it before applying.
-	warnings = append(warnings, validateRoutingRuleWindowWarnings(cfg)...)
+	// #1706 / #5854: the next-table and rib-group ip-rule reconcilers program
+	// into fixed priority windows (100 next-table, 1000 rib-group) that their
+	// clear() passes scan; the applier hard-caps at the window boundary so
+	// out-of-range rules never leak, but a config that exceeds a window would be
+	// silently truncated at apply time (routes claimed but not programmed). This
+	// over-subscription is now a STRICT COMMIT REJECTION
+	// (validateRoutingRuleWindowsStrict, runUniformGates) rather than a warning:
+	// the strict commit / commit-check path hard-rejects it, and the tolerant
+	// load / peer-sync paths downgrade it to a single cfg.Warnings entry
+	// (opts.lenientRoutingRuleWindows), so it is no longer surfaced here (a
+	// second warning here would double-report it on the tolerant path).
 
 	// #3876: warn when an interface-routes rib-group import cannot be fully
 	// realized by the Phase-1 per-prefix leak (no enumerable static connected

@@ -267,7 +267,13 @@ type Daemon struct {
 	ipfixReconMu        sync.Mutex
 	ipfixExportErr      error
 	dhcpRelay           *dhcprelay.Manager
-	snmpAgent           *snmp.Agent
+	// mgmt owns the HTTP/HTTPS management-listener lifecycle (#5866): it starts
+	// the listener at boot and, on every day-2 commit, reconciles the live
+	// listener + authentication snapshot against the committed web-management
+	// config (make-before-break rebind on an endpoint change; live auth swap on
+	// an unchanged bind). nil when the API is not enabled (--api-addr empty).
+	mgmt      *managementReconciler
+	snmpAgent *snmp.Agent
 
 	// --- SNMP subsystem reconcile-on-commit state (#3967) ---
 	// The SNMP agent is a start-once-at-boot subsystem: the boot block in
@@ -468,19 +474,16 @@ type Daemon struct {
 	// map[string]bool types and are reached as d.hostInboundFailOpen.<field>.
 	hostInboundFailOpen hostInboundFailOpenState
 
-	// hostInboundEnforced records whether a host-inbound enforcement table
-	// (the real ruleset OR the #5644 cold-boot fail-closed fence) has been
-	// successfully installed at least once since this daemon started. It is the
-	// "enforcement established" signal that closes the cold-boot fail-open window
-	// (#5644, M37): on COLD BOOT both nft tables are absent, so a failed
-	// host-inbound install has no prior table to retain (the atomic `-f -` load's
-	// fail-closed guarantee only holds day-2), leaving host-bound services
-	// reachable with no host-inbound default-deny. applyHostInboundFilter reads
-	// this to decide whether a failed install is a cold-boot (false → install a
-	// deny-all fence so host services stay fenced) versus a day-2 failure (true →
-	// the prior table is retained, already fail-closed). Written under applySem in
-	// applyHostInboundFilter; atomic so a publication-readiness reader on another
-	// goroutine sees a consistent value without taking applySem.
+	// hostInboundEnforced is the process-local historical gate for the #5644
+	// cold-boot fallback. Successful real loads Store true, including program-only
+	// generations; successful fallbacks Store true only when their exact rendered
+	// snapshot contains an address-scoped DROP. A successful zero-drop fallback
+	// leaves false so a later failed real invocation can try another snapshot.
+	// True proves neither current xpf_hostinbound table presence nor coverage of
+	// every current local address (#5789, #5790). Production access is serialized
+	// under applySem; atomic.Bool preserves the existing type, not a current
+	// readiness reader. nft success and the following Store are ordered operations
+	// in separate state domains, not one atomic publication.
 	hostInboundEnforced atomic.Bool
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).

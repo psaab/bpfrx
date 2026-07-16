@@ -97,6 +97,24 @@ out-of-range value to a warning.
   lookup/dial failure from it. Before #5061 the resolver Control
   returned the raw error, so an EPERM/ENODEV resolver bind was counted
   as probe loss for icmp-ping/tcp-ping/http-get.
+- **Lifecycle cancellation holds state too** (#5852): a `StopAll` /
+  config replacement / daemon shutdown cancels the SHARED probe context
+  (`Apply` builds it as `context.WithCancel`; `m.cancel()` cancels it).
+  A probe interrupted mid-flight by that cancel is NEUTRAL to path
+  health — `runSingleTest` returns before touching counters, the
+  successive-loss threshold, events, or `fireTransition`, so
+  ip-monitoring never remediates routes DURING teardown/reconfigure. The
+  discriminator is the SHARED `ctx.Err()`, NOT the returned error's type:
+  a genuine probe TIMEOUT is a per-probe SOCKET deadline (icmp
+  `SetReadDeadline` / TCP dial timeout) that leaves `ctx.Err() == nil`
+  and MUST still count as real path loss (an actually-unreachable target
+  must still fail over). Only `m.cancel()` cancels the shared context, so
+  `ctx.Err() != nil` is exactly a lifecycle stop; a probe's own timeout
+  never cancels it. Regression-locked by
+  `TestRunSingleTestLifecycleCancelIsNeutral5852` (neutral) +
+  `TestRunSingleTestGenuineFailureStillCounts5852` /
+  `TestRunSingleTestProbeDeadlineWithLiveCtxCounts5852` (no
+  over-neutralization). Sibling of the setup-error hold above.
 - The raw-socket seam is injectable (`icmpListenFunc` in `icmp.go`) so
   prober logic is unit-testable without privileges.
 - **The http-get probe's transport is one-shot** (#4912): `probeHTTP`

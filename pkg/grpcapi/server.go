@@ -367,7 +367,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 	srv := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
-		grpc.UnaryInterceptor(s.configLockInterceptor),
+		// #5849: the config-lock lifecycle is owned by a connection-scoped
+		// stats.Handler (releases on ConnEnd), NOT a per-RPC interceptor that
+		// tore the session down on any per-RPC cancellation.
+		grpc.StatsHandler(&configLockStatsHandler{s: s}),
 	)
 	slog.Info("gRPC server listening", "addr", s.addr)
 	return s.serveUntilDone(ctx, srv, lis)
@@ -487,8 +490,12 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 func (s *Server) buildFabricServer() *grpc.Server {
 	return grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
-		grpc.ChainUnaryInterceptor(s.fabricAuthUnaryInterceptor, s.fabricAllowlistUnaryInterceptor, s.configLockInterceptor),
+		grpc.ChainUnaryInterceptor(s.fabricAuthUnaryInterceptor, s.fabricAllowlistUnaryInterceptor),
 		grpc.ChainStreamInterceptor(s.fabricAuthStreamInterceptor, s.fabricAllowlistStreamInterceptor),
+		// #5849: same connection-scoped config-lock release contract as the
+		// loopback server (a no-op for the fabric allowlist, which never admits
+		// the config RPCs, but keeps the lifecycle uniform across both servers).
+		grpc.StatsHandler(&configLockStatsHandler{s: s}),
 	)
 }
 
@@ -751,25 +758,13 @@ func (s *Server) fabricAllowlistStreamInterceptor(srv interface{}, ss grpc.Serve
 	return status.Errorf(codes.PermissionDenied, "stream method %s is not permitted on the cluster fabric listener", info.FullMethod)
 }
 
-// configLockInterceptor auto-releases stale config locks when a gRPC client
-// disconnects (context cancelled) without calling ExitConfigure.
-func (s *Server) configLockInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	resp, err := handler(ctx, req)
-
-	// If the client's context was cancelled (disconnect, Ctrl-C), release any
-	// config lock held by this connection.
-	if ctx.Err() != nil {
-		sessionID := peerSessionID(ctx)
-		if sessionID != "" {
-			if s.store.ExitConfigureSession(sessionID) {
-				slog.Info("auto-released config lock on client disconnect", "session", sessionID)
-			}
-		}
-	}
-	return resp, err
-}
-
 // peerSessionID derives a stable session identifier from the gRPC peer address.
+// #5849: this is now only the FALLBACK identity (connSessionID) for a direct
+// in-process call / unit test / the impossible crypto/rand-failure path — the
+// config-session lifecycle is otherwise keyed by the connection-scoped id from
+// configLockStatsHandler. It is NOT used as durable identity on its own: a
+// reused peer address must not inherit or release an earlier connection's
+// session.
 func peerSessionID(ctx context.Context) string {
 	p, ok := peer.FromContext(ctx)
 	if !ok {

@@ -43,16 +43,17 @@ func buildSessionEgressIfaces(cfg *config.Config) map[sessionIfaceKey]string {
 
 func buildSessionEgressIfacesWithLookup(cfg *config.Config, lookupIfindex func(string) (int, error)) map[sessionIfaceKey]string {
 	egressIfaces := make(map[sessionIfaceKey]string)
-	if cfg == nil {
-		return egressIfaces
-	}
-	for ifName, ifc := range cfg.Interfaces.Interfaces {
+	// RangeInterfaces/RangeUnits skip present-but-nil InterfaceConfig/
+	// InterfaceUnit slots admitted by the tolerant load / HA config-sync path
+	// (#3494/#5068). A raw range over the tolerant config nil-derefs here and
+	// panics the in-process daemon during a routine session display (#5813).
+	config.RangeInterfaces(cfg, func(ifName string, ifc *config.InterfaceConfig) {
 		resolvedParent := config.LinuxIfName(strings.SplitN(cfg.ResolveReth(ifName), ".", 2)[0])
 		parentIfindex, err := lookupIfindex(resolvedParent)
 		if err != nil {
-			continue
+			return
 		}
-		for _, unit := range ifc.Units {
+		config.RangeUnits(ifc, func(_ int, unit *config.InterfaceUnit) {
 			displayName := ifName
 			if unit.Number != 0 || unit.VlanID != 0 {
 				displayName = fmt.Sprintf("%s.%d", ifName, unit.Number)
@@ -64,7 +65,7 @@ func buildSessionEgressIfacesWithLookup(cfg *config.Config, lookupIfindex func(s
 			if _, exists := egressIfaces[key]; !exists {
 				egressIfaces[key] = displayName
 			}
-		}
-	}
+		})
+	})
 	return egressIfaces
 }

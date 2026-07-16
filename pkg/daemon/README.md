@@ -153,6 +153,50 @@ cluster (deferred to `/triple-review` per #4407, because regrouping it
 touches apply-ordering rather than being inert field motion). These are the
 natural stopping point for the mechanical decomposition.
 
+### Management-listener lifecycle (`managementReconciler`, #5866)
+
+`d.mgmt` (`management.go`) owns the HTTP/HTTPS management-listener lifecycle so a
+day-2 web-management commit actually replaces the live listener and the
+authentication snapshot instead of leaving the boot-time server enforcing the
+old bind/port/TLS/auth until a restart (a revoked credential stayed usable). It
+mirrors `reconcileSNMP`: `reconcileWebManagement` runs EARLY in
+`applyConfigLocked` — before the dataplane apply that can abort — so a committed
+credential revocation is enforced even on an apply that returns early
+(`store.Commit` has already promoted the config). Reconcile discipline:
+
+- **Auth change on an unchanged endpoint** → live `api.Server.ReplaceAuth`
+  (atomic snapshot swap, effective next request, no rebind, no window).
+- **Endpoint change** → reconcile ONLY the listener leg that changed, PER LEG:
+  an HTTP-bind change make-before-break rebinds only the HTTP leg
+  (`api.Server.ReconcileHTTP`); a TLS enable/disable or HTTPS-bind change rebinds
+  only the HTTPS leg (`api.Server.ReconcileHTTPS`) and never touches the live
+  HTTP listener. The whole-server rebuild it replaces re-bound the retained HTTP
+  socket on a TLS enable (`EADDRINUSE`, since `SO_REUSEADDR` ≠ `SO_REUSEPORT`),
+  so a TLS change could never converge without a restart. Each leg is
+  make-before-break inside `api.Server` (new socket serving before the old
+  retires — no unreachable window, no double-bind of an unchanged socket).
+- **Failed leg (re)bind** → **fail-safe**: retain THAT leg's previous listener
+  (fail-closed — not mgmt-down), leave its fingerprint field unrecorded so the
+  next commit retries (retry debt), and log the error. This does not brick an
+  otherwise-successful commit (same posture as `reconcileSNMP` bind-failure
+  retry).
+- **Auth ordering — revocation decoupled from the HTTPS leg**: auth publishes as
+  soon as the HTTP leg is at its desired bind (`httpOK`), INDEPENDENT of the
+  HTTPS-leg outcome — a committed credential revocation must not be blocked by an
+  HTTPS bind failure. When `httpOK` the live HTTP listener is at `next.Addr`,
+  whose #4047/#5127 loopback clamp justified `next.Auth`, so applying it there
+  cannot fail-open; it defers ONLY when the HTTP leg's OWN rebind failed (the
+  retained old bind may not match `next.Auth`'s clamp). A tightening (non-nil)
+  publishes whatever the HTTPS outcome (it only ADDS a requirement). Removing ALL
+  api-auth (nil) additionally requires the live HTTPS to be off/loopback, so a
+  non-loopback HTTPS retained by a failed rebind is never dropped to no-auth.
+  Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
+  (revocation honored across a failing HTTPS rebind) +
+  `TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866` (nil auth NOT
+  applied to a retained non-loopback listener — no fail-open). The reconcile is
+  serialized by its mutex and the apply semaphore, so a newer generation never
+  completes behind an older one.
+
 ## Cluster mode
 
 Detected by the presence of `/etc/xpf/node-id` (contents `0` or `1`).
@@ -417,15 +461,39 @@ never lock an operator out of a remote box it manages.
     window. `runShutdownSequence` drains `applySem` (bounded by
     `applyCloseoutDrainTimeout`) after `applyCancel()` so that closeout completes
     before teardown/exit.
+  - **Early signal capture — startup is abortable (#5807).** The shutdown
+    signal context is captured at the **TOP of `Run`** (`startupSignalContext`),
+    BEFORE the mutating startup phases (config load + bootstrap → interface
+    naming → manager init + first `applyConfig` → dataplane load/`Start`). Before
+    #5807 `signal.NotifyContext` was installed only AFTER those phases, so a
+    `SIGTERM` (or daemon-mode `SIGINT`) arriving DURING startup took the process
+    default action — immediate kill, no deferred cleanup — leaving partially
+    applied links / routes / FRR / IPsec / DHCP / HA / dataplane state with none
+    of the fencing steady-state shutdown performs. The phases now run through
+    `runStartupOrAbort` → `runStartupPhases`, which checks the signal context at
+    each phase boundary: a signal mid-startup skips the remaining phases and runs
+    the **same ordered `runShutdownSequence` teardown** for whatever was
+    initialized (every teardown step nil-guards its manager, so a partial init
+    tears down cleanly), then `Run` returns the non-nil abort error instead of
+    proceeding into steady state. A PLAIN phase error (no signal) keeps the
+    pre-#5807 path — return the error, deferred `#5308` loop stops are the
+    cleanup — distinguished from a signal abort by the signal context's state,
+    never the error's identity. The signal set matches the old late install
+    (interactive: `SIGTERM` only, so the CLI keeps `SIGINT` for Ctrl-C; daemon:
+    both). The four long-lived startup runtimes (`cluster.Start`,
+    `watchClusterEvents`, `startKernelSelfRecovery`, `dp.Start`) bind to
+    `d.daemonCtx` (the raw, signal-uncancelled parent), NOT the phase signal
+    context — the teardown needs them live — so `initManagers` /
+    `setupDataplaneAndInitialConfig` no longer take a `ctx` parameter.
   - **Wiring (the part that makes this actually fire on `systemctl stop`).**
     `applyCancelCtx` deliberately does **not** return `d.daemonCtx`. In
     production `cmd/xpfd` passes `context.Background()` into `Run`, and that
     `context.Background()` is what `d.daemonCtx` holds — it is never cancelled
-    (the signal-cancellable context is a *local* `ctx` created later by
-    `signal.NotifyContext`). Returning `d.daemonCtx` would make C1/C2/C3 dead
-    code on a real stop. Instead `Run` creates `d.applyCancelContext` as a
-    **child of the SIGTERM/SIGINT signal context** (right after
-    `signal.NotifyContext`), so a real `systemctl stop xpfd` cancels it, and the
+    (the signal-cancellable context is a *local* `ctx` captured at the TOP of
+    `Run` by `startupSignalContext` → `signal.NotifyContext`, #5807). Returning
+    `d.daemonCtx` would make C1/C2/C3 dead code on a real stop. Instead `Run`
+    creates `d.applyCancelContext` as a **child of the SIGTERM/SIGINT signal
+    context**, so a real `systemctl stop xpfd` cancels it, and the
     next coarse boundary observes `ctx.Err() != nil` and bails. `d.daemonCtx`
     stays the (uncancelled) parent of the long-lived background goroutines —
     flow-export/IPFIX relays, RPM probe-pin retry, the policy scheduler, cluster
@@ -581,6 +649,56 @@ never lock an operator out of a remote box it manages.
   (publish-fails-commit + bump-fails-commit fail-on-revert, duplicate-skip /
   helperless / clean-success stay-success, and the `applyTailReconciles` commit-join
   wiring proof).
+  **Routing-rule reconcile fail-closed (#5844, mirroring #5310/#5696):**
+  `applyRoutingRules` reconciles the kernel policy-routing (`ip rule`) table —
+  next-table (`ApplyNextTableRules`), rib-group (`ApplyRibGroupRules`), and
+  PBR/filter-based-forwarding (`ApplyPBRRules`). Each of those managers already
+  RETURNS a fail-closed error (a partial clear/add leaves stale-or-missing
+  cross-VRF policy in the kernel — `#3731`/`#5118`/`#2273`), but
+  `applyRoutingRules` was VOID and LOGGED-and-DROPPED all three, so a commit was
+  acknowledged after a partial reconcile — and the immediately-following
+  `reconcileRouteLeakSnapshot` then canonized that partial live kernel state into
+  the userspace FIB. It now collects the three errors via `errors.Join` (still
+  running every rule type after one fails — fail-closed but COMPLETE) and RETURNS
+  them; `applyConfigLocked` captures it (`routingRuleErr`) and threads it into the
+  tail `errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err,
+  ipsecErr, ifaceErr, routeLeakErr, routingRuleErr)`, so a partial ip-rule
+  reconcile fails the commit closed. The snapshot republish still runs (ordering
+  preserved: the deferred error does not abort it). `BuildPBRRules` *build
+  degradation* is DELIBERATELY not joined — a filter term that cannot be expressed
+  as an `ip rule` is a fail-SAFE under-steer (dropped to the main table, still
+  enforced by the userspace filter path), a representability warning rather than a
+  partial kernel mutation, so fail-closing it would reject configs that commit
+  fine today. Tests: `routing_rule_reconcile_failclosed_5844_test.go` (direct
+  applyRoutingRules fails-closed-and-complete via a `RuleList`-failing
+  `NewManagerWithRuleOpsForTest` fake, clean-config stays-success, and the
+  `applyTailReconciles` commit-join wiring proof).
+  **VRF setup / management-bind fail-closed (#5700, mirroring #5310/#5696/#5844):**
+  `applyVRFReconcile` LOGGED-and-DROPPED its `ReconcileVRFs` failure (WARN) and
+  returned only the #2926-C1 ctx-cancellation, even though `reconcileVRFs`'s
+  partial-failure contract still records the VRF in the managed set
+  (`IsManagedVRF` true) — so a commit reported the VRF configured while its
+  `vrf-*` device was absent on the kernel, with no retry owner (false
+  convergence). It now returns `(ctxErr, vrfErr)`: `ctxErr` is the unchanged C1
+  abort; `vrfErr` is the deferred VRF-device-setup failure, captured by
+  `applyConfigLocked` and threaded into the tail `errors.Join(..., mgmtRouteErr,
+  vrfErr)`. The AUTHORITATIVE post-networkd management-VRF re-bind (which
+  `networkctl reconfigure` necessitates by stripping the master binding) is
+  extracted into `rebindManagementVRFIfaces`, which aggregates and RETURNS its
+  bind failures; `applyDataplaneAndHACore` joins them into `networkdErr` (like the
+  #1956 device-map-teardown joins), so a genuine management-VRF bind failure also
+  fails the commit closed. A failed commit is the retry owner (the next apply
+  re-reconciles). Deliberately LEFT best-effort (WARN, not surfaced): the
+  routing-instance member binds (they run BEFORE `applyInterfaceReconcile` creates
+  tunnel/xfrmi members, so a not-yet-created member is an EXPECTED transient
+  absence, not a permanent failure) and the pre-networkd management bind (stripped
+  and re-established by the authoritative rebind above) — surfacing either would
+  reject configs that commit fine today. Tests:
+  `vrf_setup_bind_commit_truth_5700_test.go` (direct `applyVRFReconcile`
+  surfaces-setup / tolerates-success / ctx-cancel-is-not-a-VRF-error via a
+  `vrf-mgmt`-`LinkAdd`-failing `NewManagerWithLinkOpsForTest` fake; direct
+  `rebindManagementVRFIfaces` surfaces-bind / tolerates-success / empty-noop; and
+  the `applyTailReconciles` commit-join wiring proof).
   **Per-term disposition mirrors userspace (#3427):** `nftRulesFromTerm` maps a
   term's `then` action to the kernel verdict the SAME way the userspace lo0
   evaluator does (`pkg/dataplane/userspace/filters.go` `NextTerm =
@@ -803,12 +921,13 @@ never lock an operator out of a remote box it manages.
   (b) RETH VRRP VIPs resolved from config (so the deny is scoped on the backup
   node too, where the VIP is not yet live). SLAAC is not a separate case: xpfd sets
   `IPv6AcceptRA=no` on every managed interface (`pkg/networkd`), so DHCPv6 is the
-  only IPv6 dynamic path and the live snapshot captures it. **Refresh:** the chain
-  is rebuilt on every commit and on every DHCP/DHCPv6 lease change on a dataplane
-  interface (`onDHCPAddressChange` → `dhcpLeaseChangeRequiresRecompile` →
-  `applyConfig` → `applyHostInboundFilter`), so a renewed/flapped lease re-scopes
-  the deny within one reconcile rather than staying fail-open until the next
-  commit. **Lifeline safety:** a zone with NO stanza emits no deny (admit-all);
+  only IPv6 dynamic path and the live snapshot captures it. **Refresh:** a
+  DHCP/DHCPv6 lease callback classified for full recompile runs serialized
+  `applyConfig`; the chain receives a second fence/re-render opportunity only if
+  that apply reaches `applyTailReconciles`. A required protocol-gate error can
+  return before that tail, leaving the address for a later applicable successful
+  reconcile. The management-only callback branch is a distinct #5791 limitation.
+  **Lifeline safety:** a zone with NO stanza emits no deny (admit-all);
   management/cluster-control interfaces (fxp0 / em0 / fab*) are excluded from
   the address sets so a host-inbound deny can never strand management or break
   HA; `ct state established,related` and IPv6 ND + v4/v6 PMTUD control messages

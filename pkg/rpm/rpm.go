@@ -520,6 +520,27 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 
 		rtt, err := m.runProbe(ctx, test, key)
 
+		// #5852: a LIFECYCLE cancellation of the shared probe context —
+		// StopAll / config replacement / daemon shutdown calling m.cancel()
+		// (Apply builds probeCtx as context.WithCancel) — is NEUTRAL to path
+		// health. The probe was torn down; it never reached a health verdict,
+		// so it must not be mis-counted as path loss and trigger ip-monitoring
+		// route remediation DURING teardown/reconfigure. Detect it by the
+		// SHARED context's own state (ctx.Err()), NOT the returned error type: a
+		// genuine probe TIMEOUT is a per-probe SOCKET deadline (icmp
+		// SetReadDeadline / TCP dial timeout) that leaves ctx.Err()==nil and
+		// MUST still count as real path loss — the target is actually
+		// unreachable. Only m.cancel() cancels probeCtx, so ctx.Err()!=nil is
+		// exactly a lifecycle stop; a probe timeout never cancels it.
+		// errors.Is(err, context.Canceled) is the equivalent belt (icmp.go
+		// returns ctx.Err() on cancellation). RETURN — not just skip this probe
+		// — so the post-loop transition can never publish a stale pass/fail edge
+		// once teardown has begun. Mirrors the ErrProbeSetup hold below: no
+		// counters, no successive-loss advance, no events, no Transition.
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return
+		}
+
 		// ErrProbeSetup = environment/capability failure (raw socket
 		// open denied, marshal, probe pin not installed #1895): the
 		// probe never reached the wire — or must not be sent at all

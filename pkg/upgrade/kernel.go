@@ -64,9 +64,23 @@ const (
 	// move (re-asserted). The candidate is on disk but NOT armed.
 	KernelStateInstalled KernelState = "INSTALLED"
 
+	// KernelStateArming: PREPARED-INTENT to arm, durably recorded BEFORE any
+	// NVRAM mutation (#5847). The INACTIVE slot's selector is (being) written,
+	// but `efibootmgr --bootnext` has NOT been positively confirmed via a
+	// readback. A journal stuck HERE — a crash between recording intent and the
+	// verified ARMED transition — is NOT a genuine in-flight trial: the firmware
+	// still boots the known-good default (no confirmed one-shot), so `Arm` may
+	// RE-ARM from ARMING and self-recovery must NOT suppress expired-lease
+	// failback on it (the drained node can rejoin). Only after a POSITIVE
+	// BootNext readback does the runner transition ARMING -> ARMED.
+	KernelStateArming KernelState = "ARMING"
+
 	// KernelStateArmed: the INACTIVE slot's selector points at the candidate
-	// (atomic ESP write) and `efibootmgr --bootnext <inactive-slot>` is set.
-	// The next boot is the one-shot candidate trial.
+	// (atomic ESP write) AND `efibootmgr --bootnext <inactive-slot>` is set AND
+	// was POSITIVELY READ BACK (#5847), so the next boot is genuinely the
+	// one-shot candidate trial. Only this VERIFIED state counts as an in-flight
+	// trial (IsArmed true; self-recovery suppresses failback). The armed boot id
+	// + a per-attempt nonce are recorded for provenance.
 	KernelStateArmed KernelState = "ARMED"
 
 	// KernelStatePromoted: on the candidate boot the promotion gate passed
@@ -90,10 +104,12 @@ func (s KernelState) order() int {
 		return 1
 	case KernelStateInstalled:
 		return 2
-	case KernelStateArmed:
+	case KernelStateArming:
 		return 3
-	case KernelStatePromoted, KernelStateReverted:
+	case KernelStateArmed:
 		return 4
+	case KernelStatePromoted, KernelStateReverted:
+		return 5
 	default:
 		return -1
 	}
@@ -128,6 +144,24 @@ type KernelJournal struct {
 	// by maxPromoteAttempts so a read-only-root journal that cannot clear cannot
 	// loop reboots forever (r1 AGY catastrophic).
 	PromoteAttempts int `json:"promote_attempts,omitempty"`
+
+	// BootID is the Boot#### id (the inactive slot) that was armed as the
+	// one-shot BootNext AND POSITIVELY READ BACK before the ARMED transition
+	// (#5847). Empty until the verified ARMED state. On the candidate boot the
+	// promotion gate can tie BootCurrent to this id to confirm the firmware
+	// booted the slot we actually armed (provenance for a genuine trial).
+	BootID string `json:"boot_id,omitempty"`
+
+	// ArmNonce is a per-attempt token generated when ENTERING ARMING (#5847) and
+	// carried onto the verified ARMED journal. It distinguishes a fresh arm from
+	// a stale journal left by a prior or crashed attempt, so provenance is not
+	// confused across attempts.
+	ArmNonce string `json:"arm_nonce,omitempty"`
+
+	// ArmAttempts counts arm attempts (armCandidate entries) for THIS run so a
+	// fresh ArmNonce is unique across attempts even under a stuck test clock
+	// (#5847).
+	ArmAttempts int `json:"arm_attempts,omitempty"`
 }
 
 // ErrKernelChannelUnavailable marks a pre-assert failure that means LANE 1
@@ -196,6 +230,12 @@ type KernelSystem interface {
 	ReadSlotSelector(slot string) (string, error)
 	// SetBootNext arms the one-shot boot of the given Boot#### id.
 	SetBootNext(bootID string) error
+	// GetBootNext returns the Boot#### id currently armed as the one-shot
+	// BootNext, or "" if none is set (#5847). The two-phase arm reads this back
+	// AFTER SetBootNext to POSITIVELY CONFIRM the firmware accepted the one-shot
+	// before recording the verified ARMED journal — a firmware that silently
+	// dropped or partial-wrote the variable must not yield a false-ARMED journal.
+	GetBootNext() (string, error)
 	// ArmWatchdog arms the persistent watchdog before the reboot (best
 	// effort; the firmware BootNext clear is the loop-safety, the watchdog
 	// only converts a hang into the reset that triggers the fallback).

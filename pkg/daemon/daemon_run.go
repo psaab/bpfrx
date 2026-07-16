@@ -173,7 +173,31 @@ func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 
 // Run starts the daemon and blocks until shutdown.
 func (d *Daemon) Run(ctx context.Context) error {
+	// d.daemonCtx is the RAW parent (production: context.Background) for the
+	// long-lived background goroutines and the dataplane/cluster runtimes. The
+	// shutdown sequence tears those down EXPLICITLY and needs them LIVE during
+	// teardown (logFinalStats via dp.Telemetry, the HA rg_active clear via
+	// dp.HA()), so it is deliberately kept SEPARATE from — and never replaced by
+	// — the shutdown-signal context below (#5807).
 	d.daemonCtx = ctx
+
+	// #5807: capture the shutdown signals BEFORE the mutating startup phases
+	// (config load / interface naming / manager init / dataplane setup). A
+	// SIGTERM — or a daemon-mode SIGINT — that arrives DURING startup then
+	// cancels this context instead of the process taking its default action
+	// (immediate kill, no deferred cleanup): runStartupOrAbort below aborts the
+	// remaining phases and runs the ordered teardown for whatever was already
+	// initialized, so a signal mid-startup no longer strands partially-applied
+	// links / routes / FRR / IPsec / DHCP / HA / dataplane state with none of
+	// the fencing steady-state shutdown performs. The signal set matches the
+	// pre-#5807 late install: interactive mode catches only SIGTERM (the CLI
+	// keeps SIGINT for Ctrl-C command cancellation), daemon mode catches both.
+	// `ctx` is reassigned to this signal context and carries through every later
+	// phase, the apply-cancel context, and the main wait exactly as the old
+	// PHASE 4 install did.
+	ctx, stop := startupSignalContext(ctx)
+	defer stop()
+
 	// #5308: guarantee the two daemonCtx-bound background loops (policy
 	// scheduler + RPM probe-pin retry) are cancelled + joined even when Run
 	// returns WITHOUT reaching runShutdownSequence — an early-error return
@@ -186,6 +210,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer d.stopPinRetryLoop()
 	defer d.stopPolicySchedulerLoop()
 	d.startPolicySchedulerLoopLocked()
+
+	// WaitGroup for coordinated shutdown of background goroutines. Declared here
+	// (before the mutating phases) so the #5807 startup-abort path can hand it to
+	// runShutdownSequence; no goroutine is added until PHASE 5, so an early-abort
+	// wg.Wait() is a no-op.
+	var wg sync.WaitGroup
 
 	// Wrap the default slog handler to support system syslog forwarding.
 	// Syslog clients are added later when config is applied.
@@ -213,39 +243,42 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// harmless (the compiler is not exercised there).
 	dataplane.SetProtectedInterfaceResolver(d.resolveProtectedInterfaces)
 
-	// ===== PHASE 1: Config load + bootstrap =====
-	configCompileFailed, err := d.loadAndBootstrapConfig()
-	if err != nil {
+	// ===== PHASES 1-4: mutating startup, cancellable via the signal ctx (#5807) =====
+	// Each phase mutates real host / manager / dataplane state. runStartupOrAbort
+	// checks the shutdown-signal context BEFORE each phase, so a SIGTERM (or
+	// daemon-mode SIGINT) that arrives partway through skips the remaining phases
+	// and runs the ordered teardown for whatever was already initialized (every
+	// runShutdownSequence step nil-guards its manager, so a partial init tears
+	// down cleanly) — then Run returns the non-nil abort error rather than
+	// proceeding into steady state. A PLAIN phase error keeps the historical
+	// path: return the error and let the deferred loop stops (#5308) run.
+	var configCompileFailed bool
+	phases := []startupPhase{
+		{"config-load-bootstrap", func(context.Context) error {
+			var e error
+			configCompileFailed, e = d.loadAndBootstrapConfig()
+			return e
+		}},
+		{"interface-naming", func(context.Context) error {
+			d.setupInterfaceNaming()
+			return nil
+		}},
+		{"manager-init", func(context.Context) error {
+			return d.initManagers(configCompileFailed)
+		}},
+		{"dataplane-setup", func(context.Context) error {
+			return d.setupDataplaneAndInitialConfig()
+		}},
+	}
+	if err := d.runStartupOrAbort(ctx, phases, func(abortErr error) error {
+		return d.runShutdownSequence(&wg, stop, abortErr)
+	}); err != nil {
 		return err
 	}
-
-	// ===== PHASE 2: Interface naming + bootstrap lifeline =====
-	d.setupInterfaceNaming()
-
-	// ===== PHASE 3: Manager init (routing/FRR/IPsec/RPM/ipmon/event-engine/DHCP/cluster/VRRP/dataplane) + first applyConfig =====
-	if err := d.initManagers(ctx, configCompileFailed); err != nil {
-		return err
-	}
-
-	if err := d.setupDataplaneAndInitialConfig(ctx); err != nil {
-		return err
-	}
-
-	// ===== PHASE 4: Signal handling + apply-cancel context + event buffer + WaitGroup =====
-	// Handle signals for clean shutdown.
-	// In interactive mode, only SIGTERM triggers shutdown — SIGINT is handled
-	// by the CLI for command cancellation (Ctrl-C).
-	// In daemon mode, both SIGTERM and SIGINT trigger shutdown.
-	var stop context.CancelFunc
-	if isInteractive() {
-		ctx, stop = signal.NotifyContext(ctx, syscall.SIGTERM)
-	} else {
-		ctx, stop = signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
-	}
-	defer stop()
 
 	// #2926: dedicated apply-abort context. A child of the signal context
-	// above, so a real daemon stop (SIGTERM, plus SIGINT in daemon mode)
+	// captured at the top of Run, so a real daemon stop (SIGTERM, plus SIGINT in
+	// daemon mode)
 	// cancels an in-flight commit/remediation apply at its next coarse
 	// boundary (applyConfigLocked C1/C2/C3) instead of blocking termination
 	// behind netlink + an FRR reload + a Rust control-socket sync. It is kept
@@ -266,8 +299,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	eventBuf := logging.NewEventBuffer(1000)
 	d.eventBuf = eventBuf
 
-	// WaitGroup for coordinated shutdown of background goroutines
-	var wg sync.WaitGroup
+	// (wg is declared at the top of Run so the #5807 startup-abort path can pass
+	// it to runShutdownSequence.)
 
 	// NOTE: session sync dp wiring + sweep start moved into startClusterComms
 	// goroutine to avoid race: d.sessionSync is created asynchronously.
@@ -806,6 +839,82 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// ===== PHASE 7: Shutdown sequence (extracted to runShutdownSequence, #4662) =====
 	return d.runShutdownSequence(&wg, stop, runErr)
+}
+
+// startupSignalContext returns a child of parent that is cancelled when the
+// daemon receives a shutdown signal, captured at the TOP of Run so a signal
+// during the mutating startup phases aborts startup instead of the process
+// default-terminating (#5807). The signal set is mode-dependent and matches the
+// historical late install: interactive mode catches only SIGTERM so the CLI
+// keeps SIGINT for Ctrl-C command cancellation; daemon (non-interactive) mode
+// catches SIGTERM and SIGINT. Extracted as a named seam so a test can assert the
+// returned context is a cancellable child (not context.Background, whose Done()
+// is nil) without delivering a real OS signal.
+func startupSignalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if isInteractive() {
+		return signal.NotifyContext(parent, syscall.SIGTERM)
+	}
+	return signal.NotifyContext(parent, syscall.SIGTERM, syscall.SIGINT)
+}
+
+// startupPhase is one ordered, MUTATING startup step run under the
+// shutdown-signal context (#5807). name is used only for the abort log/error.
+type startupPhase struct {
+	name string
+	run  func(context.Context) error
+}
+
+// runStartupPhases executes the mutating startup phases in order, checking the
+// shutdown-signal context for cancellation BEFORE each phase and once more after
+// the last (#5807). A SIGTERM / daemon-SIGINT that arrives mid-startup therefore
+// stops the sequence at the next phase boundary — the remaining phases do NOT
+// run and their mutations never happen — and the wrapped context error is
+// returned. A phase's own error is returned as-is (unwrapped). It returns nil
+// only when every phase ran and the context was never cancelled.
+//
+// Cancellation is observed BETWEEN phases (a phase already in flight runs to
+// completion): the mutating phases use context.Background()-equivalent
+// long-lived wiring internally, so this coarse, boundary-level cancellation is
+// the abort granularity — matched to the coarse boot mutations it guards.
+func (d *Daemon) runStartupPhases(ctx context.Context, phases []startupPhase) error {
+	for _, p := range phases {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("startup aborted by shutdown signal before phase %q: %w", p.name, err)
+		}
+		if err := p.run(ctx); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("startup aborted by shutdown signal after the final phase: %w", err)
+	}
+	return nil
+}
+
+// runStartupOrAbort runs the mutating startup phases (runStartupPhases) and,
+// when a shutdown signal cancelled startup mid-way, runs the ordered teardown
+// for whatever was initialized before returning the non-nil abort error (#5807).
+// teardown is injected (Run passes runShutdownSequence) so the abort→cleanup
+// wiring is unit-testable without executing the real subsystem teardown.
+//
+// A PLAIN phase error (ctx NOT cancelled) is returned WITHOUT running teardown:
+// that preserves the pre-#5807 early-error path, where Run's deferred
+// stopPolicySchedulerLoop / stopPinRetryLoop (#5308) are the intended cleanup
+// and running the full ordered teardown was deliberately not done. The
+// distinguishing test is ctx.Err() (was the SIGNAL context cancelled), never the
+// returned error's identity, so a phase error that merely wraps a context error
+// is not mistaken for a signal abort.
+func (d *Daemon) runStartupOrAbort(ctx context.Context, phases []startupPhase, teardown func(error) error) error {
+	err := d.runStartupPhases(ctx, phases)
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		slog.Warn("xpf daemon: shutdown signal during startup — running teardown for the "+
+			"initialized subset before exit (partial-init safe)", "err", err)
+		return teardown(err)
+	}
+	return err
 }
 
 // applyCloseoutDrainTimeout bounds how long runShutdownSequence waits for an
@@ -1374,16 +1483,30 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			return d.grpcSrv
 		},
 	}
-	// Resolve interface bindings + api-auth from web-management config, then
-	// apply the #4047/#5127 loopback fail-safe on EVERY path (resolveAPIBinds).
-	d.resolveAPIBinds(&apiCfg, d.store.ActiveConfig())
-	srv := api.NewServer(apiCfg)
+	// #5866: the management HTTP/HTTPS listener is owned by
+	// managementReconciler. apiCfg here carries only the runtime deps; the
+	// reconciler re-derives the bind/port/TLS/auth from each ACTIVE config
+	// (resolveAPIBinds) so it can start the listener now AND, on every day-2
+	// commit, reconcile the live listener + authentication snapshot without a
+	// restart — make-before-break rebind on a bind/port/TLS change, live auth
+	// swap on an unchanged bind. Before #5866 the server was constructed once
+	// here and never reconciled, so a committed bind/TLS/port/auth change (e.g.
+	// a revoked credential) sat inert until a daemon restart.
+	d.mgmt = newManagementReconciler(d, apiCfg)
+	if err := d.mgmt.start(ctx); err != nil {
+		// A boot bind failure is non-fatal (matches the pre-#5866 async
+		// srv.Run error log): the daemon keeps running and the next commit's
+		// reconcileWebManagement retries the bind.
+		slog.Error("HTTP API server initial start failed", "err", err)
+	}
+	// Drain the management serve goroutines on daemon shutdown: ctx cancel
+	// triggers the api.Server bounded 5s graceful drain, and wait() joins every
+	// live + retiring listener goroutine so none leak past Run.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := srv.Run(ctx); err != nil {
-			slog.Error("API server error", "err", err)
-		}
+		<-ctx.Done()
+		d.mgmt.wait()
 	}()
 	slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
 }
@@ -1503,7 +1626,15 @@ func (d *Daemon) resolveAPIBinds(apiCfg *api.Config, cfg *config.Config) {
 // clearFRRForFailClosedBoot). Returns a non-nil error only on a fatal DHCP
 // manager-create failure (the sole early return in the original block), which
 // Run propagates unchanged.
-func (d *Daemon) initManagers(ctx context.Context, configCompileFailed bool) error {
+// initManagers constructs the routing/FRR/IPsec/RPM/ipmon/event-engine/DHCP/
+// cluster/VRRP managers and runs the first applyConfig. Its long-lived runtimes
+// (cluster monitor, cluster-event watcher, kernel self-recovery) bind to
+// d.daemonCtx — the RAW, signal-uncancelled daemon-lifetime parent — NOT the
+// startup-signal context, because the shutdown sequence tears them down
+// EXPLICITLY and needs them live during teardown; a startup signal aborts at the
+// phase boundary (runStartupPhases), it must not kill these runtimes underneath
+// the teardown (#5807).
+func (d *Daemon) initManagers(configCompileFailed bool) error {
 	// Initialize routing, FRR, and IPsec managers
 	if !d.opts.NoDataplane {
 		rm, err := routing.New()
@@ -1630,7 +1761,7 @@ func (d *Daemon) initManagers(ctx context.Context, configCompileFailed bool) err
 		d.holdSecondaryIfKernelCandidateArmed()
 
 		d.cluster.UpdateConfig(cc)
-		d.cluster.Start(ctx)
+		d.cluster.Start(d.daemonCtx)
 		// Wire event-drop callback: on dropped cluster events, trigger
 		// immediate reconciliation so the safety net doesn't wait 2s.
 		d.cluster.SetOnEventDrop(d.triggerReconcile)
@@ -1638,12 +1769,12 @@ func (d *Daemon) initManagers(ctx context.Context, configCompileFailed bool) err
 			"node", cc.NodeID, "cluster", cc.ClusterID)
 
 		// Watch cluster events for state transitions (primary/secondary).
-		go d.watchClusterEvents(ctx)
+		go d.watchClusterEvents(d.daemonCtx)
 
 		// #1930 INC-2: bounded local self-recovery for the LANE-1 HA kernel
 		// channel — auto-rejoin if an external kernel-roll orchestrator crashed
 		// while this node was drained+rebooting (no-op unless orphaned-drained).
-		d.startKernelSelfRecovery(ctx)
+		d.startKernelSelfRecovery(d.daemonCtx)
 	}
 
 	// Enable IP forwarding — required for the firewall to route packets.
@@ -1943,7 +2074,14 @@ func (d *Daemon) setupInterfaceNaming() {
 // the same Run() slot right after initManagers. Returns a non-nil error only
 // on a fatal dataplane-create failure (the block's sole early return), which
 // Run propagates unchanged.
-func (d *Daemon) setupDataplaneAndInitialConfig(ctx context.Context) error {
+// setupDataplaneAndInitialConfig loads the dataplane and runs the boot config
+// apply. The dataplane runtime (dp.Start) binds to d.daemonCtx — the RAW,
+// signal-uncancelled daemon-lifetime parent (mirroring the bootstrap-exit
+// dp.Start below) — NOT the startup-signal context: the shutdown sequence needs
+// the runtime live for logFinalStats (dp.Telemetry) and the HA rg_active clear
+// (dp.HA) during teardown, so a startup signal aborts at the phase boundary
+// rather than tearing the runtime out from under the teardown (#5807).
+func (d *Daemon) setupDataplaneAndInitialConfig() error {
 	// Create dataplane backend (unless in config-only mode)
 	if !d.opts.NoDataplane {
 		dpType := ""
@@ -2023,7 +2161,7 @@ func (d *Daemon) setupDataplaneAndInitialConfig(ctx context.Context) error {
 			slog.Info("bootstrap mode: dataplane arm and boot-time config apply suppressed")
 		} else {
 			if d.dp != nil {
-				if err := d.dp.Start(ctx); err != nil {
+				if err := d.dp.Start(d.daemonCtx); err != nil {
 					slog.Warn("failed to start dataplane, running in config-only mode",
 						"err", err)
 					d.dp = nil
