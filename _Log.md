@@ -1,3 +1,38 @@
+## 2026-07-16 — #5748 (pkg/ddns, security): cross-surface DDNS wire-RR clobber guard
+- **Timestamp**: 2026-07-16 (fix/5748-ddns-cross-surface-clobber)
+- **Action**: Extend the #5709 wire-RR co-ownership clobber guard across BOTH
+  DDNS ownership surfaces. The #5709 guard (`wireRRSharedWithOther`) scanned only
+  the Surface B lease store (`Manager.state.records`, rdata in `Address`); a
+  Surface A router/interface record (`SurfaceAManager`, rdata in `AddrText`) that
+  co-owns the identical wire RR (same canonical FQDN + forward type + IP) was
+  invisible, so a lease teardown could still issue a wire DELETE that clobbered
+  the Surface-A-owned RR (and symmetrically a Surface A teardown could clobber a
+  lease-owned RR). Fixed BOTH directions. Mechanism: each surface publishes a
+  LOCK-FREE snapshot of its wire-RR claims (`WireRRClaims`, backed by
+  `atomic.Pointer[[]WireRRClaim]`, rebuilt under the manager's own `mu` at the end
+  of every non-degraded reconcile pass + after load); the daemon injects each
+  surface's accessor into the other (`SetSurfaceACoownerSource` /
+  `SetLeaseCoownerSource` in `pkg/daemon/daemon_run.go`). The lease guard scans
+  the injected Surface A snapshot after its own store; the Surface A
+  `withdrawOwnedLocked` adds a per-target lease-coowner skip. **Deadlock-free by
+  construction:** the accessor is a bare atomic load, so a teardown holding its
+  own `mu` never blocks on the peer's `mu` (no AB-BA cycle). Nil accessor ⇒
+  pre-#5748 single-surface behavior; nil-safe.
+- **File(s)**: pkg/ddns/state.go (new `WireRRClaim` type + `wireRRClaim` helper),
+  pkg/ddns/manager.go (`surfaceACoowners`/`wireRRClaims` fields, `SetSurfaceA…`,
+  `WireRRClaims`, `rebuildWireRRClaimsLocked`, extended `wireRRSharedWithOther`,
+  seed on load), pkg/ddns/surface_a.go (`leaseCoowners`/`wireRRClaims` fields +
+  `deleteCoowned` counter, `SetLeaseCoownerSource`, `WireRRClaims`,
+  `rebuildWireRRClaimsLocked`, `leaseWireRRCoowner`, per-target skip in
+  `withdrawOwnedLocked`, `SurfaceAStats.DeleteCoowned`), pkg/daemon/daemon_run.go
+  (cross-wire the two accessors), pkg/ddns/cross_surface_clobber_5748_test.go
+  (new, 5 fail-on-revert + regression tests), pkg/ddns/README.md (co-ownership
+  section extended to both surfaces).
+- **Validation**: `go build ./...`, `go vet ./pkg/ddns ./pkg/daemon` clean;
+  `go test ./pkg/ddns ./pkg/daemon -race` GREEN. Fail-on-revert proven firsthand
+  BOTH directions: neutralize the lease-side arm → RED (lease teardown DELETED
+  host-a.example.com=10.0.0.10); neutralize the Surface A per-target skip → RED
+  (surface A teardown DELETED wan.example.net=203.0.113.5). Restored → GREEN.
 ## 2026-07-16 — #5791 (DHCP/host-inbound): gate lease-change recompile skip on host-inbound lifeline set, not the broad mgmt-VRF name class
 - **Timestamp**: 2026-07-16 (fix/5791-dhcp-hostinbound-reapply)
 - **Action**: Fix #5791 (security). `dhcpLeaseChangeRequiresRecompile`

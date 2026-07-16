@@ -1736,6 +1736,14 @@ func (d *Daemon) initManagers(configCompileFailed bool) error {
 		// publish). Constructed unconditionally for the same reason as the lease
 		// manager — a binding removal must have a running loop to withdraw.
 		d.surfaceA.mgr = ddns.NewSurfaceAManager()
+		// #5748: cross-wire the two DDNS ownership surfaces so each teardown guard
+		// can see a wire RR the OTHER surface co-owns and suppress a DELETE that
+		// would clobber it (the cross-surface arm of the #5709 co-ownership guard).
+		// Each accessor is a LOCK-FREE snapshot read (an atomic.Pointer load in the
+		// peer, never taking the peer's mutex), so a teardown holding its own
+		// manager's mu can consult the peer with no lock-order cycle / deadlock.
+		d.ddns.SetSurfaceACoownerSource(d.surfaceA.mgr.WireRRClaims)
+		d.surfaceA.mgr.SetLeaseCoownerSource(d.ddns.WireRRClaims)
 	}
 
 	// Create the RPM manager eagerly so the pointer is stable for the

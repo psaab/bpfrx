@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -412,6 +413,30 @@ type SurfaceAManager struct {
 	// the credential (mirrors manager.go upsertLocked's skippedNoBackend, #2691
 	// P3 review MAJOR).
 	skippedNoBackend uint64
+	// deleteCoowned counts wire deletes SUPPRESSED because the RR is still co-owned
+	// by a Surface B DHCP lease scope (#5748, the cross-surface arm of #5709). Like
+	// the lease Manager's deleteCoowned, dropping this surface's claim on a
+	// still-co-owned RR can never leak a stale record, so the suppression needs no
+	// write-ahead. Guarded by mu.
+	deleteCoowned uint64
+
+	// leaseCoowners, when non-nil, returns the wire-RR claims currently owned by
+	// the SEPARATE Surface B DHCP lease surface (Manager.state.records, rdata in
+	// Address). The daemon injects it (SetLeaseCoownerSource) so a Surface A
+	// teardown suppresses a wire DELETE that would clobber a lease-owned identical
+	// RR — the symmetric direction of the #5748 cross-surface guard. It is a
+	// LOCK-FREE snapshot accessor (Manager.WireRRClaims, a bare atomic load); it
+	// MUST NOT take Manager.mu, so withdrawOwnedLocked can call it while THIS
+	// manager holds m.mu without a lock-order cycle. Lock order: m.mu (held) →
+	// lock-free peer read (no peer mutex). Nil ⇒ no cross-surface suppression.
+	leaseCoowners func() []WireRRClaim
+
+	// wireRRClaims is the LOCK-FREE snapshot of the wire RRs THIS (Surface A)
+	// surface currently owns, published for the lease Manager's teardown guard to
+	// consult (#5748). Rebuilt under m.mu at the end of every non-degraded reconcile
+	// pass and after load, read via WireRRClaims() with a bare atomic load — never
+	// taking m.mu. Nil until the first rebuild.
+	wireRRClaims atomic.Pointer[[]WireRRClaim]
 }
 
 // NewSurfaceAManager constructs the production Surface A manager (plan §5.5). It
@@ -443,6 +468,10 @@ func NewSurfaceAManager() *SurfaceAManager {
 	// transport/connection pool rather than allocating a fresh one each pass.
 	m.newBackend = m.resolveBackend
 	m.seedFromStore()
+	// #5748: seed the cross-surface wire-RR claim snapshot from the loaded store so
+	// the lease guard sees this surface's ownership from the first pass. Single-
+	// threaded during construction.
+	m.rebuildWireRRClaimsLocked()
 	return m
 }
 
@@ -469,6 +498,7 @@ func newSurfaceAManagerForTesting(statePath string, backend DNSUpdater, now func
 		now:            now,
 	}
 	m.seedFromStore()
+	m.rebuildWireRRClaimsLocked() // #5748: seed the cross-surface claim snapshot
 	return m
 }
 
@@ -737,6 +767,11 @@ func (m *SurfaceAManager) observeIO(fn func()) {
 func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope, observe AddressObserver, gate ScopeGate, catalog map[string]*config.DDNSProvider, resolveIf ...func(string) string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// #5748: republish this surface's wire-RR claim snapshot for the lease Manager's
+	// teardown guard AFTER the pass mutates the store. Registered second so it runs
+	// BEFORE the unlock (LIFO), still under m.mu. A degraded pass returns early with
+	// an unchanged store, so the rebuild is a harmless nop.
+	defer m.rebuildWireRRClaimsLocked()
 
 	// #5070: refresh the per-pass interface-name resolver (read by resolveBackend
 	// + CheckIPClient under this same lock).
@@ -1474,7 +1509,24 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 	// candidate delete of this record (same family/FQDN/provider), so compute once.
 	sibling := m.siblingFamilyOwnedLocked(owned)
 	var firstErr error
+	var suppressed int
 	for _, a := range targets {
+		// #5748 (cross-surface arm of #5709): if a Surface B DHCP lease scope still
+		// co-owns THIS exact wire RR (canonical FQDN + forward type + this rdata),
+		// do NOT issue the wire delete — it would clobber the RR the lease surface
+		// still legitimately owns and refreshes. Release only this surface's claim
+		// (the ownership drop below) and leave the RR live; the lease surface, as the
+		// last claimant, issues the real delete when it in turn tears down. The
+		// leaseCoowners read is LOCK-FREE (no Manager.mu), so this is safe under m.mu.
+		if m.leaseWireRRCoowner(owned.FQDN, owned.ForwardType, a.String()) {
+			suppressed++
+			m.deleteCoowned++
+			slog.Debug("ddns surface-a: skipping wire delete — RR still co-owned by a DHCP lease scope; "+
+				"releasing this surface's claim only",
+				"fqdn", owned.FQDN, "type", owned.ForwardType, "addr", a.String(),
+				"provider", owned.scopeOf().PolicyID)
+			continue
+		}
 		rec, err := buildHostRecord(owned.FQDN, a, owned.TTL)
 		if err != nil {
 			if firstErr == nil {
@@ -1502,7 +1554,13 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 		m.deleteFail++
 		return fmt.Errorf("ddns surface-a: withdraw %s %s: %w", owned.ForwardType, owned.FQDN, firstErr)
 	}
-	m.deleteOK++
+	// deleteOK counts a real wire withdraw. If EVERY candidate was cross-surface
+	// co-owned and suppressed, nothing was deleted — do not inflate deleteOK; the
+	// deleteCoowned counter already recorded the suppression. Ownership is still
+	// released below (mirrors the lease path's #5709 claim release).
+	if suppressed < len(targets) {
+		m.deleteOK++
+	}
 
 	// Racing-op guard (#2778): drop ownership only if the live entry is STILL the
 	// exact record we deleted. A concurrent publish could have re-asserted this
@@ -1558,6 +1616,67 @@ func (m *SurfaceAManager) withdrawTargets(owned ownedRecord) []netip.Addr {
 		out = append(out, a)
 	}
 	return out
+}
+
+// SetLeaseCoownerSource injects the accessor the daemon wires so a Surface A
+// teardown can consult the Surface B DHCP lease surface for a cross-surface
+// wire-RR co-owner (#5748, symmetric direction). fn MUST be lock-free with respect
+// to Manager.mu (it is Manager.WireRRClaims, a bare atomic load) so calling it
+// under m.mu can never deadlock. Idempotent; nil clears it.
+func (m *SurfaceAManager) SetLeaseCoownerSource(fn func() []WireRRClaim) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.leaseCoowners = fn
+}
+
+// WireRRClaims returns a LOCK-FREE snapshot of the wire RRs this (Surface A)
+// surface currently owns, for the lease Manager's teardown guard to consult
+// (#5748). It does a bare atomic load and NEVER takes m.mu, so a peer holding
+// Manager.mu can call it with no lock-order cycle. Empty before the first rebuild.
+func (m *SurfaceAManager) WireRRClaims() []WireRRClaim {
+	if p := m.wireRRClaims.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// rebuildWireRRClaimsLocked recomputes this surface's published wire-RR claim
+// snapshot from the durable store and publishes it atomically for the lease
+// Manager's lock-free read (#5748). Caller holds m.mu. A Surface A record's rdata
+// is its AddrText (with the legacy lease-shape Address fallback — the same
+// precedence classifyOwnedBackend/withdrawTargets use); rdata-less rows are
+// skipped. The snapshot is an immutable slice, replaced wholesale.
+func (m *SurfaceAManager) rebuildWireRRClaimsLocked() {
+	claims := make([]WireRRClaim, 0, len(m.state.records))
+	for _, r := range m.state.records {
+		rdata := r.AddrText
+		if rdata == "" {
+			rdata = r.Address // legacy lease-shape entry (pre-AddrText)
+		}
+		if rdata == "" {
+			continue
+		}
+		claims = append(claims, wireRRClaim(r.FQDN, r.ForwardType, rdata))
+	}
+	m.wireRRClaims.Store(&claims)
+}
+
+// leaseWireRRCoowner reports whether a Surface B DHCP lease scope still co-owns
+// the wire RR (canonical FQDN + forward type + rdata) this Surface A teardown is
+// about to delete (#5748). It reads the injected lease-claim snapshot LOCK-FREE
+// (no Manager.mu), so it is safe to call while holding m.mu. Nil accessor ⇒ no
+// cross-surface co-owner (pre-#5748 behavior). Caller holds m.mu.
+func (m *SurfaceAManager) leaseWireRRCoowner(fqdn, forwardType, rdata string) bool {
+	if m.leaseCoowners == nil {
+		return false
+	}
+	want := wireRRClaim(fqdn, forwardType, rdata)
+	for _, c := range m.leaseCoowners() {
+		if c == want {
+			return true
+		}
+	}
+	return false
 }
 
 // siblingFamilyOwnedLocked reports whether ANOTHER owned record shares this
@@ -2004,6 +2123,11 @@ type SurfaceAStats struct {
 	Skipped          uint64
 	BackedOff        uint64
 	SkippedNoBackend uint64
+	// DeleteCoowned is the count of wire deletes SUPPRESSED because the RR is still
+	// co-owned by a Surface B DHCP lease scope (#5748, the cross-surface arm of the
+	// #5709 co-ownership guard). A non-zero value is normal when Surface A and a
+	// DHCP lease legitimately publish the same host/address.
+	DeleteCoowned uint64
 	// Orphaned is the count of records this node published at a PREVIOUS provider
 	// endpoint that a provider identity change (rename / in-place mutation /
 	// removed binding after an edit) left stale and un-withdrawable through the
@@ -2048,6 +2172,7 @@ func (m *SurfaceAManager) Stats() SurfaceAStats {
 		Skipped:          m.skipped,
 		BackedOff:        m.backedOff,
 		SkippedNoBackend: m.skippedNoBackend,
+		DeleteCoowned:    m.deleteCoowned,
 		Orphaned:         len(m.orphans),
 		Degraded:         m.degraded,
 		DegradedReason:   m.degradedReason,
