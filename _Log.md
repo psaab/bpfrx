@@ -1,3 +1,43 @@
+## 2026-07-16 — #5686 (HA/fabric): stale fabric peer usable as redirect target during same-parent replacement (codex-182 M01)
+- **Timestamp**: 2026-07-16 (fix/5686-fabric-stale-peer)
+- **Action**: Fix #5686. The fabric-authority preserve/merge paths kept an
+  already-resolved `FabricLink` across a build/refresh that could not
+  re-resolve it, keyed ONLY on `parent_ifindex`. When a fabric peer under the
+  SAME parent was REPLACED (configured `peer_address` changed), the replacement
+  arrived UNRESOLVED (empty peer_mac → skipped, absent from the new resolved
+  set), so the OLD link was preserved and the stale old peer stayed a valid
+  `resolve_fabric_redirect` target throughout the replacement's resolution
+  window — fabric-forwarded traffic could be sent to a peer no longer current.
+  Fix (invalidate-before-accept, keyed on peer identity): a preserved link is
+  SUPERSEDED when the incoming snapshots configure its parent but name a
+  different, parseable peer address (`fabric_link_superseded_by_snapshots`,
+  `src/afxdp/forwarding/mod.rs`); superseded links are dropped from the
+  preserved/merged set BEFORE they can be kept, in BOTH `refresh_fabric_links`
+  (SyncFabricState) and `refresh_runtime_snapshot_inner` (config apply,
+  `coordinator/snapshot_refresh.rs`). During the unresolved window redirect for
+  that parent yields NO target → the packet takes its normal non-fabric
+  disposition (safe fallback, matching the existing fail-closed contract), not
+  a wrong-peer redirect; the replacement installs on resolve. Steady-state
+  same-peer refresh and parent-omitted (removal) are NOT supersessions, so the
+  working link survives. Pruned set stored into BOTH `ha.forwarding` and the
+  worker fast-path `ha.fabrics` Arc (the worker only overwrites from a non-empty
+  `ha.fabrics`, so a stale non-empty Arc would re-add the removed link).
+  Tests (fail-on-revert, firsthand RED-verified):
+  `refresh_fabric_links_replacement_peer_invalidates_stale_old_5686`,
+  `refresh_fabric_links_replacement_leaves_other_parent_untouched_5686`,
+  `fabric_link_superseded_by_snapshots_only_on_same_parent_different_peer_5686`
+  (`src/afxdp/coordinator/tests.rs`). Neutralizing the prune (retain stale old
+  peer) turned the two integration tests RED (old peer still redirect target /
+  parents `[80, 90]` vs `[90]`); restored → GREEN. `cargo build --release`
+  clean, `cargo clippy` clean on touched code, full cargo suite 3894 passed / 0
+  failed. Docs: `docs/fabric-cross-chassis-fwd.md` + `forwarding/README.md`
+  (replacement/resolution-window invariant). Fabric HA dataplane —
+  test-failover smoke blocked by the loss-cluster shim-ABI wall; gated on the
+  fail-on-revert unit tests.
+- **File(s)**: src/afxdp/forwarding/mod.rs, src/afxdp/coordinator/snapshot_refresh.rs,
+  src/afxdp/coordinator/tests.rs, docs/fabric-cross-chassis-fwd.md,
+  src/afxdp/forwarding/README.md, _Log.md
+
 ## 2026-07-16 — #5682 (security/HA): unreadable kernel-upgrade journal bypasses candidate election hold (codex-182 M24)
 - **Timestamp**: 2026-07-16 (fix/5682-upgrade-journal-failclosed)
 - **Action**: Fix #5682. `holdSecondaryIfKernelCandidateArmed`
