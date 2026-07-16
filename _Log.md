@@ -1,3 +1,35 @@
+## 2026-07-16 — #5082 VRRP: fail-closed MASTER publish + generation-gated VIP reconcile
+- **Timestamp**: 2026-07-16 (fix/5082-vrrp-vip-gen)
+- **Action**: Fixed two VRRP HA correctness defects (codex-review-177
+  `[A5-b1-F7]`, High/High). (1) FAIL-OPEN publish: `becomeMaster` set
+  StateMaster, called void `addVIPs()`, then advertised/emitted regardless of
+  whether the kernel VIP add succeeded — a transient netlink failure made the
+  peer + dependent services trust a blackhole owner. (2) RECONCILE RACE:
+  `ReconcileVIPs` was check-then-act (`if state==Master { addVIPs }`) with no
+  ownership generation, so a superior-advert demotion to BACKUP could interleave
+  and re-add VIPs + force GARP while BACKUP (dup address / split routing). Fix:
+  `addVIPs`→`addVIPsLocked` returns a structured `vipActuationResult`
+  (applied/failed/linkErr); `becomeMaster` returns bool and gates advert/emit on
+  `res.ok()` — on failure it rolls back partial adds, reverts to StateBackup, and
+  the run-loop re-arms the master-down timer (`rearmForRetry`) to retry (no
+  parallel state system). A monotonic `ownerGen` (bumped by `setState` on every
+  real transition) is captured before the netlink add and revalidated after; a
+  new `vipMu` serializes add/remove + revalidation across the run-loop and the
+  manager's `ReconcileVIPs`, which now re-adds/GARPs only if still the
+  current-generation MASTER after the add. Netlink is behind injectable seams
+  (`linkByNameFn`/`addrAddFn`/`addrDelFn`). Success path unchanged (uncontended
+  lock) → ~60ms failover preserved.
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/manager.go,
+  pkg/vrrp/vip_gen_5082_test.go (new), pkg/vrrp/instance_preempt_gate_test.go,
+  pkg/vrrp/instance_preempt_holdtime_test.go, docs/critical-patterns.md
+- **Validation**: `go build ./...` + `go vet ./pkg/vrrp` clean; full
+  `go test -race ./pkg/vrrp` green. Two new fail-on-revert tests (fail-closed
+  publish + reconcile generation guard) PROVEN RED on revert firsthand. The
+  state-machine wiring tests use fake interfaces (fail-soft before); they now
+  install no-op success netlink seams (`installFakeVIPNetlink`) since
+  `becomeMaster` is fail-closed. Cluster `make test-failover` smoke DEFERRED
+  (shim-ABI wall); correctness gated on the unit tests + full -race suite.
+
 ## 2026-07-16 — #5816 review fold: fence the finally-rejoin after a lost lease (PR #6021)
 - **Timestamp**: 2026-07-16 (fix/5816-deploy-lease-renew-fence)
 - **Action**: Folded one MERGE-NEEDS-MINOR reviewer finding into PR #6021. Gap:

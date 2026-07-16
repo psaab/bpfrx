@@ -144,6 +144,23 @@ See the deploy backing table in
   and a 500ms time dampener; `force=true` (used by `ReconcileVIPs` after a
   MAC change) bypasses ONLY the dampener so the post-MAC-change GARP is not
   swallowed by a routine burst from the prior 500ms (#2081).
+- **Fail-closed VIP ownership (#5082)**: `becomeMaster()` gates the MASTER
+  advert/event on SUCCESSFUL required-VIP actuation. `addVIPs` returns a
+  structured result (which VIPs actuated, which failed) instead of void; a
+  swallowed LinkByName/AddrAdd failure no longer lets the peer and dependent
+  services trust an owner that cannot receive VIP traffic. On any required-VIP
+  failure `becomeMaster` rolls back partial adds, reverts to `StateBackup`, and
+  returns `false` WITHOUT advertising/emitting — the run-loop then re-arms the
+  master-down timer (`rearmForRetry`) to retry the election. The clean success
+  path is unchanged (the `vipMu` lock is uncontended), so ~60ms failover timing
+  is preserved. A monotonic **ownership generation** (`ownerGen`, bumped by
+  `setState` on every real transition) is captured before the netlink add and
+  revalidated after: `ReconcileVIPs` re-adds VIPs and forces GARP only if the
+  instance is STILL the current-generation MASTER after the add, closing the
+  check-then-act TOCTOU where a superior advert demoting to BACKUP could
+  interleave and re-add VIPs + force GARP while BACKUP (duplicate address,
+  split routing). `vipMu` serializes the add/remove + revalidation across the
+  run-loop and the manager's `ReconcileVIPs`.
 - **Fabric forwarding**: the userspace dataplane redirects packets for
   peer-owned synced sessions over the fabric link
   (`resolve_fabric_redirect()` / `ingress_is_fabric()` in
