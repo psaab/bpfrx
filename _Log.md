@@ -1,3 +1,45 @@
+## 2026-07-16 — #5678 (routing M12): carry qualified-next-hop preference across the AF_XDP snapshot boundary
+- **Timestamp**: 2026-07-16 (fix/5678-qnh-snapshot-pref)
+- **Action**: Fix #5678 (codex-review-182 M12, High). STEP-0 confirmed live on
+  origin/master e00ddcceb (NOT stale-fixed): `buildRouteSnapshots`
+  (`pkg/dataplane/userspace/routes.go`) collapsed EVERY next-hop of a static
+  route onto ONE `RouteSnapshot` at the single route-level `Preference`,
+  dropping the PER-next-hop admin distance a `qualified-next-hop <gw>
+  { preference N; }` backup carries (`NextHopEntry.HasPreference`/`Preference`,
+  #3871 — the Junos floating-static idiom). So a primary + a less-preferred
+  backup were installed at EQUAL cost and the Rust FIB load-balanced (ECMP)
+  across both instead of using the backup only as a standby — a silent
+  routing-semantics change. BOUNDED (not a snapshot-schema decision): the
+  snapshot already has a PER-ROUTE `Preference` field AND the Rust FIB
+  tie-breaks same-prefix routes by ascending preference (#2390 `sort_routes` +
+  first-match `routes.iter().find(prefix.contains)`), and a floating static is
+  naturally two same-prefix routes at different distances (exactly how the FRR
+  renderer emits it, `pkg/frr/config_render.go` — one `ip route` line per
+  next-hop at `dist = nh.Preference` when HasPreference else route-level). Fix:
+  group a route's next-hops by their EFFECTIVE preference (qualified
+  `nh.Preference` when HasPreference, else `route.Preference`) and emit ONE
+  RouteSnapshot per distinct preference. The backup then arrives as a SEPARATE,
+  higher-preference route; the Rust #2390 tie-break selects the primary and
+  holds the backup as a standby entry (never reached by first-match while the
+  primary is present). NO Rust change — the existing per-route preference wire
+  field + sort already handle same-prefix multi-preference routes. Next-hops
+  that SHARE a preference (plain `next-hop [ a b ]`, or qualified NHs at the
+  same distance) still collapse to one equal-cost ECMP snapshot — real ECMP
+  unaffected. Discard/reject/next-table routes (no forwarding next-hops) emit
+  the base disposition unchanged. Fail-on-revert PROVEN: reverting the
+  per-next-hop preference carry folds primary+backup into one ECMP snapshot
+  (`NextHops:[10.0.0.1 10.0.0.2] Preference:5`) → the two floating-static tests
+  RED; the plain-ECMP no-regression test stays GREEN; restore → all GREEN.
+  Validation: go build ./... clean; go vet clean; `go test -race` green for
+  pkg/dataplane/userspace (28.1s), pkg/config (149.8s), pkg/routing (1.9s),
+  pkg/frr (1.2s). Go lowering + docs only.
+- **File(s)**: pkg/dataplane/userspace/routes.go (edit — `addRoutes` groups
+  next-hops by effective preference, one RouteSnapshot per group),
+  pkg/dataplane/userspace/routes_qnh_preference_5678_test.go (new — RED-on-revert
+  floating-static distinct-standby + same-preference-group ECMP + plain-list
+  ECMP no-regression), userspace-dp/src/afxdp/forwarding/README.md (edit —
+  #5678 bullet under the #2390 preference tie-break contract)
+
 ## 2026-07-16 — #5685 (dist/publish): validate the apt base URL BEFORE it is baked into the signed, root-run install.sh
 - **Timestamp**: 2026-07-16 (fix/5685-release-url-validate)
 - **Action**: Fix #5685 (security supply-chain, M40). `scripts/dist/publish.py
