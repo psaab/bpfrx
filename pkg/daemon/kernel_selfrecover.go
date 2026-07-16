@@ -18,6 +18,26 @@ func (a kernelSRCluster) LocalDrained() (bool, error)       { return a.m.LocalDr
 func (a kernelSRCluster) PeerHealthyPrimary() (bool, error) { return a.m.PeerHealthyPrimary(), nil }
 func (a kernelSRCluster) ResetFailover() error              { return a.m.ResetAllFailover() }
 
+// newKernelRunner builds the KernelRunner used to read the kernel-upgrade
+// journal (IsArmed). Production path constructs it over the real /var/lib/xpf
+// journal + system surface; tests inject kernelRunnerFn to point it at a temp
+// journal (#5682 election-hold fail-closed coverage).
+func (d *Daemon) newKernelRunner() (*upgrade.KernelRunner, error) {
+	if d.kernelRunnerFn != nil {
+		return d.kernelRunnerFn()
+	}
+	return upgrade.NewKernelRunner(upgrade.KernelConfig{Sys: upgrade.NewKernelSystem()})
+}
+
+// newKernelSystem builds the KernelSystem used by the hold-reconcile promotion
+// check (RunningKernel / ReadPromotionMarker). Test seam: kernelSystemFn.
+func (d *Daemon) newKernelSystem() upgrade.KernelSystem {
+	if d.kernelSystemFn != nil {
+		return d.kernelSystemFn()
+	}
+	return upgrade.NewKernelSystem()
+}
+
 // holdSecondaryIfKernelCandidateArmed keeps a CANDIDATE-TRIAL boot SECONDARY
 // until the promotion gate verifies the dataplane (r2 AGY Critical). The drain
 // the orchestrator set is in-memory ManualFailover, lost across the reboot, so a
@@ -39,15 +59,36 @@ func (d *Daemon) holdSecondaryIfKernelCandidateArmed() {
 	if d.cluster == nil {
 		return
 	}
-	r, err := upgrade.NewKernelRunner(upgrade.KernelConfig{Sys: upgrade.NewKernelSystem()})
+	r, err := d.newKernelRunner()
 	if err != nil {
 		return
 	}
 	armed, j, err := r.IsArmed()
-	if err != nil || !armed {
+	if err != nil {
+		// #5682 (codex-review-182 M24): the journal is UNREADABLE — an I/O error,
+		// corruption, or parse failure. IsArmed/loadKernelJournal already fold a
+		// clean ENOENT ("never armed") to not-armed with a nil error, so reaching
+		// this branch means the journal EXISTS but cannot be read/parsed. That is
+		// a failure mode which itself CORRELATES with a bad upgrade (a candidate
+		// kernel that corrupted /var/lib/xpf, a half-written journal from a crash
+		// mid-roll). Treating the unknown state as "not armed" and proceeding to a
+		// normal election would let this node elect/promote as if no upgrade were
+		// pending — bypassing the candidate-election hold and the promote/rollback
+		// safety of the #1930 A/B kernel channel. Fail CLOSED: hold SECONDARY
+		// exactly as a definitively-armed candidate would. reconcileKernelUpgradeHold
+		// self-heals this hold on a later successful read (see below), so a
+		// transient read error does not strand the node SECONDARY forever.
+		d.cluster.SetKernelUpgradeHold()
+		d.kernelUpgradeHoldFailClosed = true
+		slog.Warn("kernel-upgrade journal unreadable, holding election fail-closed "+
+			"(SECONDARY) until the state can be re-read", "err", err)
+		return
+	}
+	if !armed {
 		return
 	}
 	d.cluster.SetKernelUpgradeHold()
+	d.kernelUpgradeHoldFailClosed = false
 	slog.Info("kernel-candidate boot: holding SECONDARY (election hold) until promotion "+
 		"verifies the dataplane", "candidate", j.CandidateVersion)
 }
@@ -73,12 +114,64 @@ func (d *Daemon) holdSecondaryIfKernelCandidateArmed() {
 //     cleared, IsArmed false) -> the hold is gone by construction.
 //   - still verifying: marker not yet written -> keep holding.
 //
+// EXCEPTION (#5682): a FAIL-CLOSED hold — one set because the journal was
+// UNREADABLE at boot rather than affirmatively ARMED — ALSO self-heals here. It
+// has no promotion marker to wait on when the underlying cause was a transient
+// I/O blip with no upgrade pending, so it would otherwise strand the node
+// SECONDARY forever. On each tick it re-reads the journal: still unreadable ->
+// keep holding; now armed -> convert to a normal armed hold (the marker gate
+// governs); now cleanly not-armed -> release (the read error was transient). The
+// strict marker-only release is preserved for a genuinely-armed hold so the
+// revert window can't transiently promote an unverified candidate.
+//
 // No-op unless the hold is set.
 func (d *Daemon) reconcileKernelUpgradeHold() {
 	if d.cluster == nil || !d.cluster.KernelUpgradeHeld() {
+		// The hold is gone (or never set), possibly cleared by another path
+		// (rejoin / manual reset). Drop our local fail-closed bookkeeping so a
+		// future hold starts clean.
+		d.kernelUpgradeHoldFailClosed = false
 		return
 	}
-	sys := upgrade.NewKernelSystem()
+
+	// #5682 self-heal for a FAIL-CLOSED hold (unreadable journal at boot). Unlike
+	// a definitively-armed hold — which is released ONLY by the durable promotion
+	// marker below, so the revert window can't transiently promote an unverified
+	// candidate — a fail-closed hold was set from an AMBIGUOUS read, and the
+	// promotion marker will never appear when the underlying cause was a transient
+	// I/O blip with no upgrade in progress. Re-read the journal:
+	//   - still unreadable        -> keep holding (nothing changed).
+	//   - now readable & ARMED    -> a real candidate IS in progress: convert to a
+	//                                normal armed hold (clear the fail-closed flag)
+	//                                and fall through to the promotion-marker gate.
+	//   - now readable & NOT armed-> the boot-time error was transient and there is
+	//                                no upgrade pending: release the hold so the
+	//                                node is not stranded SECONDARY forever.
+	if d.kernelUpgradeHoldFailClosed {
+		r, err := d.newKernelRunner()
+		if err != nil {
+			return // cannot construct a reader; keep holding fail-closed
+		}
+		armed, _, ierr := r.IsArmed()
+		switch {
+		case ierr != nil:
+			return // journal still unreadable; keep holding fail-closed
+		case armed:
+			// A genuine candidate is armed after all — this is now an ordinary
+			// armed hold; the promotion-marker gate below governs its release.
+			d.kernelUpgradeHoldFailClosed = false
+		default:
+			// Definitively not armed on a clean read: the boot-time read failure
+			// was transient and no kernel upgrade is pending. Release the hold.
+			d.kernelUpgradeHoldFailClosed = false
+			d.cluster.ClearKernelUpgradeHold()
+			slog.Warn("kernel-upgrade journal now readable and NOT armed; releasing the " +
+				"fail-closed SECONDARY election hold (transient read error self-healed)")
+			return
+		}
+	}
+
+	sys := d.newKernelSystem()
 	running, err := sys.RunningKernel()
 	if err != nil {
 		return
