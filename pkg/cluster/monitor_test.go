@@ -259,8 +259,11 @@ func TestMonitor_IPMonitoring(t *testing.T) {
 		ID:             0,
 		NodePriorities: map[int]int{0: 200},
 		IPMonitoring: &config.IPMonitoring{
-			GlobalWeight:    100,
-			GlobalThreshold: 200,
+			GlobalWeight: 100,
+			// No global-threshold: independent per-target debt mode. A single
+			// weight-50 target failing deducts exactly 50 (255->205). The
+			// cumulative global-threshold gate is covered separately in
+			// monitor_globalthreshold_5271_test.go (#5271).
 			Targets: []*config.IPMonitorTarget{
 				{Address: "10.0.1.1", Weight: 50},
 			},

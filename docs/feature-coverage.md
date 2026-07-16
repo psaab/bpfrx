@@ -157,9 +157,36 @@ the userspace dataplane admission boundary is in
   the tolerant load / peer-sync path (`validateVRRPAuthenticationAST`,
   `pkg/config/compiler_interfaces.go`).
 - **Redundancy-group IP monitoring** (`chassis cluster redundancy-group N
-  ip-monitoring`): each configured target is ICMP-echo probed every poll and
-  its `weight` is subtracted from the RG priority while the target is
-  unreachable, driving weight-based failover. The probe **validates the echo
+  ip-monitoring`): each configured target is ICMP-echo probed every poll,
+  driving weight-based failover. **`global-threshold` gates `global-weight`
+  (vSRX semantics, #5271):** when `global-threshold` is configured (> 0), each
+  unreachable target's `weight` accumulates into a per-RG cumulative
+  reachability-loss sum, and a **single** deduction of `global-weight` is
+  applied to the RG only while that cumulative sum is ≥ `global-threshold`
+  (cleared when it falls back below). Below the threshold **no** election debt
+  is applied, so a single (or otherwise sub-threshold) probe loss cannot move
+  services — closing the split-brain / premature-failover risk of the previous
+  behavior, which deducted every failed target's weight independently and
+  ignored `global-threshold` entirely. A target with no explicit `weight`
+  contributes `global-weight` to the cumulative sum (the same effective weight
+  it would subtract in independent mode). Each poll **reconciles** the RG's
+  installed ip-monitor debts to exactly what the current mode + dampened
+  reachability dictate (firing only on a change), so a live `global-threshold`
+  edit while a target is down is correct in both directions: enabling it drops
+  the stale per-target debts in favor of the single aggregate deduction (else
+  they would coexist and over-demote the RG → spurious failover), and disabling
+  it (or removing `ip-monitoring`) on a **kept** group releases the stale
+  aggregate deduction (else the RG stays stuck demoted), and a `global-weight`
+  value change while the RG stays crossed re-installs the deduction at the new
+  amount (else the stale amount would persist until the RG clears and
+  re-crosses). An already-down target produces no dampening transition, so this
+  cleanup relies on the reconcile, not transition edges; the reconcile fires
+  `SetMonitorWeight` only when the installed value actually changes, so steady
+  state is churn-free (#5271).
+  When `global-threshold` is unset (0),
+  the historical **independent per-target** behavior is preserved exactly: each
+  unreachable target subtracts its own `weight` (or `global-weight` when the
+  per-target weight is unset) immediately. The probe **validates the echo
   reply against the request** before counting it as reachable — the responder
   source must equal the probed target, the ICMP identifier must equal the
   one the request used, and the sequence must match the value just sent. The
