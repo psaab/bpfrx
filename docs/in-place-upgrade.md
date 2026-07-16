@@ -886,6 +886,52 @@ comfortably exceed the whole roll (`--boot-deadline` plus drain/rejoin
 margins). The same `--lease-ttl` contract applies to `image-roll`
 (#5470).
 
+The lease is RENEWED-WHILE-OWNED and FENCED-BEFORE-MUTATE (#5816). The
+one-shot lease of #5470/#5545 wrote `expires_at` ONCE and neither roll
+path renewed it nor re-checked ownership before its later mutations, so a
+positive TTL shorter than the real roll (boot/drain deadlines, an image
+recreate, ordinary reboot/rejoin latency) let BOTH node leases EXPIRE
+while a driver kept running — and a successor could then atomically
+reclaim both expired leases and start its own roll against the same pair
+(split-brain deploy). Two mechanisms close this, both keyed on the SAME
+owner-identity token (`nodename:pid<pid>`) the acquire/reclaim already
+use:
+
+- **Renewal** (`_renew_lease`): re-writes `expires_at = node_now + ttl`
+  iff the holder still matches, atomically (temp+rename) under the acquire
+  flock; a lease another orchestrator reclaimed (holder differs / file
+  gone) is reported LOST and left untouched — renewal never resurrects a
+  lost lease. It is fired every reboot-poll tick (keep-alive). The rolled
+  node is unreachable while it reboots (kernel-roll) or has a fresh
+  lease-less disk after recreate (image-roll), so during the wait ONLY the
+  still-up PEER's lease is renewed — that peer lease is the load-bearing
+  reservation (a successor can never acquire BOTH node leases while we
+  hold the peer's). A mid-reboot transport failure is NEVER misread as a
+  loss (the #4905-A discipline).
+- **Fence** (`_fence_before_mutate`): immediately before EACH pair-mutating
+  action (drain, arm+reboot, image-recreate, rejoin) it renews-and-verifies
+  ownership of every relevant lease and, unless it can prove we still own
+  them, `die()`s fail-closed. The load-bearing invariant: an orchestrator
+  that has lost (or cannot confirm) its lease MUST NOT mutate the pair.
+  Because `die()` is a `SystemExit`, `kernel-roll`'s `finally` still runs
+  after a fence-abort — and its own best-effort restore-forwarding rejoin
+  IS a pair mutation. So the fence records the loss (a `lost_lease` flag,
+  set on a confirmed loss OR an unconfirmable-after-retries lease — the same
+  fail-closed stance) and the `finally` SKIPS that rejoin whenever the flag
+  is set: an orchestrator that lost its lease must not un-drain a pair a
+  successor now owns. A clean abort where the lease is still confidently
+  held leaves the flag clear and the restore rejoin runs as before.
+
+Because renewal keeps the TTL a rolling window that never elapses while the
+driver is live, the `--lease-ttl` FLOOR was NOT raised: a short TTL is now
+safe (it is renewed). Size it above a single un-interruptible mutation the
+keep-alive cannot cover mid-call — chiefly the `image-roll` recreate hook,
+which the fence renews to a fresh full TTL immediately before invoking; the
+default 1800s comfortably exceeds a VM launch + day-0. This also sharpens
+the crashed-roll self-recovery contract below: the lease now stays alive
+ONLY while the orchestrator is live, so an EXPIRED lease is an unambiguous
+crash signal — a slow-but-alive driver no longer looks crashed.
+
 The poll decides "the node rebooted" from an AFFIRMATIVE signal only — a
 CHANGED `boot_id` (`/proc/sys/kernel/random/boot_id`, recorded pre-arm) or the
 candidate kernel actually running — never from an empty status read (#4905-A).
@@ -898,7 +944,9 @@ preflight WITHOUT rebooting) look like a finished revert; the `finally` then
 skipped its rejoin and left the node DRAINED + ForceSecondary with both leases
 released — a silent loss of redundancy. Rejoin is now decided from the
 confirmed drain state: a drained node that never affirmatively rebooted is
-always rejoined.
+rejoined — UNLESS the roll aborted because we lost the lease (see the Fence
+`lost_lease` note above), in which case the pair belongs to a successor and
+the finally must NOT un-drain it.
 
 If `rejoin` cannot confirm within its deadline, `RejoinAndConfirm`
 (`pkg/upgrade/kernel_drain.go`) now surfaces the last non-nil
