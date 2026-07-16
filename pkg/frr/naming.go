@@ -64,22 +64,45 @@ const (
 	routeFilterACLHashHexLen = 16
 )
 
-// prefixListMatchKW returns the FRR address-family keyword ("ip" / "ipv6") a
-// prefix-list renders under: IPv6 if ANY entry is an IPv6 prefix, else IPv4.
-// This mirrors the historical inline selection in the route-map renderer (a
-// mixed v4+v6 list renders under the IPv6 matcher — the #2071 homogeneous-family
-// trade) and is the SINGLE source of that decision, shared by the renderer and
-// the collision precheck so the two never disagree. A nil / empty list defaults
-// to IPv4.
-func prefixListMatchKW(pl *config.PrefixList) string {
+// prefixListFamilies returns the FRR address-family keyword(s) a prefix-list
+// renders under: "ip" if it holds any IPv4 entry, "ipv6" if it holds any IPv6
+// entry — BOTH (in that fixed, deterministic order) for a mixed v4+v6 list. A
+// nil / empty list defaults to ["ip"] (the undefined/empty list then NOMATCHes
+// every route, fail-closed).
+//
+// This is the per-family generalization of the pre-#2607 single-family selector
+// and is the SINGLE source of the family decision, shared by the renderer
+// (fromPrefixListRefs) and the collision precheck (routeFilterACLNameCollision)
+// so the two never disagree. Binding BOTH families for a mixed referenced
+// `from prefix-list` is the #2607 fix: the old collapse to one family
+// ("ipv6 if any v6 entry") emitted only one `match ip|ipv6 address` line, so the
+// other family's routes silently failed the term. A single-family (or empty)
+// list still yields exactly one keyword, so its render is byte-identical to the
+// pre-#2607 behavior.
+func prefixListFamilies(pl *config.PrefixList) []string {
+	hasV4, hasV6 := false, false
 	if pl != nil {
 		for _, p := range pl.Prefixes {
 			if strings.Contains(p, ":") {
-				return "ipv6"
+				hasV6 = true
+			} else {
+				hasV4 = true
 			}
 		}
 	}
-	return "ip"
+	var fams []string
+	if hasV4 {
+		fams = append(fams, "ip")
+	}
+	if hasV6 {
+		fams = append(fams, "ipv6")
+	}
+	if len(fams) == 0 {
+		// nil / empty list → default to IPv4; the referenced list is undefined
+		// or has no entries, so its match NOMATCHes every route (fail-closed).
+		fams = []string{"ip"}
+	}
+	return fams
 }
 
 // sanitizeFRRIdent maps an arbitrary (possibly operator-, peer-sync- or
@@ -174,21 +197,26 @@ func routeFilterACLNameCollision(po *config.PolicyOptionsConfig) error {
 		}
 	}
 
-	// Final-name collision within each address family.
+	// Final-name collision within each address family. A mixed v4+v6 referenced
+	// prefix-list can materialize an access-list in BOTH families (#2607), so
+	// check EVERY family the list renders under — not just one collapsed family
+	// — else two lists colliding on the off-checked family's ACL name would slip
+	// past and silently merge in FRR.
 	seen := map[string]string{} // "<family>\x00<finalName>" -> prefix-list name
 	for _, name := range names {
-		matchKW := prefixListMatchKW(po.PrefixLists[name])
-		final := routeFilterACLName(name, matchKW)
-		key := matchKW + "\x00" + final
-		if prev, ok := seen[key]; ok && prev != name {
-			return fmt.Errorf(
-				"prefix-lists %q and %q map to the same generated route-filter "+
-					"access-list name %q in the %s family (#5872 hash collision); "+
-					"FRR would merge them and silently alter a routing policy — "+
-					"refusing to render",
-				prev, name, final, matchKW)
+		for _, matchKW := range prefixListFamilies(po.PrefixLists[name]) {
+			final := routeFilterACLName(name, matchKW)
+			key := matchKW + "\x00" + final
+			if prev, ok := seen[key]; ok && prev != name {
+				return fmt.Errorf(
+					"prefix-lists %q and %q map to the same generated route-filter "+
+						"access-list name %q in the %s family (#5872 hash collision); "+
+						"FRR would merge them and silently alter a routing policy — "+
+						"refusing to render",
+					prev, name, final, matchKW)
+			}
+			seen[key] = name
 		}
-		seen[key] = name
 	}
 	return nil
 }
