@@ -1,3 +1,41 @@
+## 2026-07-16 — #5566 (daemon): stale kernel host-inbound authorization after a coarse tightening (security fail-open)
+- **Timestamp**: 2026-07-16 (fix/5566-hostinbound-conntrack-flush)
+- **Action**: Fix #5566 (security fail-open, direct-kernel host-inbound path).
+  STEP-0 confirmed live on origin/master d9cb7d1ff: the `inet xpf_hostinbound`
+  chain leads with `ct state established,related accept`
+  (`buildHostInboundFilterPayload`, `pkg/daemon/daemon_nft.go`) BEFORE the
+  per-zone coarse catch-all drops, and replacing the table does NOT flush Linux
+  netfilter conntrack. Removing a host service (SSH/HTTPS/SNMP/...) therefore left
+  an EXISTING direct-kernel connection authorized under the OLD config — the
+  established-accept short-circuits the new drop, no host-inbound deny
+  counter/log. The Rust userspace local-delivery path already tears down
+  now-denied sessions per hit (poll_descriptor/mod.rs); the kernel path had no
+  equivalent. Fix: a conntrack RECONCILE at the tail of `applyHostInboundFilter`
+  (new `pkg/daemon/host_inbound_conntrack_flush.go`). After a successful real
+  table load, delete every established/related kernel conntrack entry whose
+  original-direction destination is a covered firewall-local host-inbound address
+  (the #5789 `desiredDrop` set — lifelines excluded) and whose (proto, dport) the
+  CURRENT coarse rules no longer admit, so the next packet is re-evaluated and
+  dropped by the per-zone catch-all. Reconcile (not an old-vs-new delta): the
+  admit decision is derived from the SAME structured SSOT the nft chain renders
+  from (`config.HostInboundServiceMatch`/`HostInboundProtocolMatch`), so it cannot
+  drift; a still-permitted service's flows are kept (no reset regression); no
+  prior-config snapshot persisted; no-op on loosening/unchanged commits. Global
+  exemptions (ESP/AH 50/51, ICMP ND/PMTUD/echo, the #5582 WireGuard listen port)
+  are never flushed. Best effort — a flush failure is logged (WARN), not surfaced
+  as a commit failure, since NEW-connection enforcement is already applied and a
+  failure only leaves pre-existing flows on old authorization (pre-fix behavior).
+  Netfilter conntrack here tracks only host-terminated/kernel-forwarded flows
+  (transit runs through userspace-dp's own session table), so the swept table is
+  small. Seam: `conntrackDeleteFilters` package var wraps
+  `netlink.ConntrackDeleteFilters` (netlink is already a direct dep; no
+  conntrack-tools binary dependency). Tests: fail-on-revert proofs in
+  `host_inbound_conntrack_flush_5566_test.go` — neutering the matcher and removing
+  the wiring each go RED (verified). Full `go test -race ./pkg/daemon` green.
+- **File(s)**: pkg/daemon/host_inbound_conntrack_flush.go (new),
+  pkg/daemon/host_inbound_conntrack_flush_5566_test.go (new),
+  pkg/daemon/daemon_nft.go, docs/host-inbound-service-matrix.md, _Log.md
+
 ## 2026-07-16 — #5564 (daemon): HA config-sync tail failure permanently bypassed policy session invalidation (fail-open)
 - **Timestamp**: 2026-07-16 (fix/5564-syncapply-invalidators)
 - **Action**: Fix #5564 (security fail-open, HA receive side). STEP-0 confirmed

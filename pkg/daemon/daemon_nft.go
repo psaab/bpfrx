@@ -426,6 +426,17 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 		slog.Warn("failed to delete obsolete host-inbound gap fence after successful real install",
 			"err", err, "output", string(out))
 	}
+	// #5566: reconcile Linux netfilter conntrack against the just-applied
+	// host-inbound set. The chain's leading `ct state established,related accept`
+	// precedes the per-zone coarse drops and table replacement does not flush
+	// conntrack, so an EXISTING direct-kernel connection admitted under a looser
+	// prior config would keep that authorization after a service is removed. Flush
+	// the now-denied host-directed entries so the next original-direction packet is
+	// re-evaluated against the current rules — mirroring the Rust userspace
+	// local-delivery per-hit re-eval/teardown. Best effort (see the function doc):
+	// enforcement for NEW connections is already in place, so a flush failure never
+	// fails the commit.
+	d.flushDeniedHostInboundConntrack(views, unzonedV4, unzonedV6, wgListenPorts)
 	slog.Info("host-inbound filter applied", "zones", len(views),
 		"unzoned_deny_v4", len(unzonedV4), "unzoned_deny_v6", len(unzonedV6),
 		"junos_host_deny_programs", len(programs))
