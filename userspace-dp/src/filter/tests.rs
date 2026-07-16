@@ -2041,7 +2041,93 @@ fn interface_filter_assignment() {
         0,
         TermMatchExtra::default(),
     );
-    assert_eq!(result.forwarding_class.as_ref(), "bandwidth-10mb");
+    assert_eq!(result.forwarding_class.as_deref(), Some("bandwidth-10mb"));
+}
+
+/// #5151: FilterResult's forwarding-class accumulator is zero-allocation on the
+/// warmed packet path. The default (accumulator init for every full v4/v6/lo0
+/// eval) must be `None` — NOT an allocated empty `Arc::<str>::from("")`. A
+/// filter eval that matches NO `then forwarding-class` term must yield `None`
+/// (zero-alloc, semantically identical to the historical empty `""`), and a
+/// term that DOES set a forwarding-class must yield `Some("class")`.
+///
+/// Fail-on-revert: reverting the default to `Arc::<str>::from("")` makes the
+/// `None` assertions RED (the default becomes `Some("")`), and reverting the
+/// `merge_matched_modifiers` write to a bare `Arc` clone fails to compile.
+#[test]
+fn filter_result_forwarding_class_defaults_none_zero_alloc() {
+    // The accumulator init is `None` — no empty Arc header/data block allocated.
+    assert_eq!(FilterResult::default().forwarding_class, None);
+
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "ge-0/0/0.0".into(),
+        ifindex: 5,
+        filter_output_v4: "fc-egress".into(),
+        filter_output_v6: "plain-egress".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[
+            // Output filter WITH a `then forwarding-class` term.
+            FirewallFilterSnapshot {
+                name: "fc-egress".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "classify".into(),
+                    action: "accept".into(),
+                    forwarding_class: "iperf-a".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["5201".into()],
+                    ..Default::default()
+                }],
+            },
+            // Output filter with NO forwarding-class term at all.
+            FirewallFilterSnapshot {
+                name: "plain-egress".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "accept-all".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+
+    // A matching `then forwarding-class` term → Some("iperf-a").
+    let matched = evaluate_interface_output_filter(
+        &state,
+        5,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        1234,
+        5201,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(matched.forwarding_class.as_deref(), Some("iperf-a"));
+
+    // No forwarding-class term matched → None (zero-alloc, == old empty "").
+    let no_fc = evaluate_interface_output_filter(
+        &state,
+        5,
+        true,
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+        PROTO_TCP,
+        1234,
+        5201,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(no_fc.forwarding_class, None);
 }
 
 #[test]
@@ -2414,7 +2500,7 @@ fn interface_output_filter_counted_records_term_hits() {
         TermMatchExtra::default(),
         1514,
     );
-    assert_eq!(result.forwarding_class.as_ref(), "iperf-a");
+    assert_eq!(result.forwarding_class.as_deref(), Some("iperf-a"));
     let filter = state
         .filters
         .get("inet6:bandwidth-output")
@@ -2464,7 +2550,7 @@ fn interface_output_filter_without_count_does_not_record_term_hits() {
         TermMatchExtra::default(),
         1514,
     );
-    assert_eq!(result.forwarding_class.as_ref(), "iperf-a");
+    assert_eq!(result.forwarding_class.as_deref(), Some("iperf-a"));
     let filter = state
         .filters
         .get("inet6:bandwidth-output")
