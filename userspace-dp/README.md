@@ -178,6 +178,27 @@ logging rules, not these specific hot-path constants.
   published or deleted by this path. Fail-on-revert: the wiring test
   `close_delta_deletes_dnat_table_entry_for_snat_flow` plus the key-SSOT
   tests in `src/afxdp/tests.rs`.
+- **Interface-mode SNAT fails closed with no egress address (#5688)**:
+  interface source-NAT translates the source to the egress interface's
+  OWN address of the PACKET's family (`match_source_nat_result_for_tuple`
+  in `src/nat/source.rs`). When the egress interface has NO same-family
+  address (a v4 packet on an egress with only v6 addresses, or vice
+  versa) there is nothing to translate to. The pre-#5688 code returned
+  `Matched` with a `None` rewrite, so the packet was forwarded with its
+  private/internal source UNTRANSLATED onto the egress — an address leak.
+  The fix fails CLOSED: it returns
+  `SourceNatLookup::Unavailable(SourceNatFailureReason::InterfaceNoEgressAddress)`,
+  which funnels through the SAME drop / `nat_alloc_fail`
+  (`record_source_nat_failure`) disposition a pool-mode allocation
+  failure takes, so the flow is dropped and counted instead of leaking.
+  The families are resolved independently (a v4 packet checks the v4
+  egress address, a v6 packet the v6 one), and the working case — egress
+  HAS a same-family address — still translates. No NAT tuple / map-key /
+  wire layout change; disposition-only. Fail-on-revert:
+  `interface_source_nat_no_v4_egress_addr_fails_closed`,
+  `interface_source_nat_no_v6_egress_addr_fails_closed`, and
+  `interface_source_nat_translates_when_same_family_egress_addr_present`
+  in `src/nat/tests_source.rs`.
 - **Source-NAT pool subnet expansion (#3049)**: a source-NAT pool
   address entry may be a bare IP, a host CIDR (`/32`, `/128`), or a
   subnet CIDR (e.g. `203.0.113.0/28`). Junos uses the FULL prefix range
