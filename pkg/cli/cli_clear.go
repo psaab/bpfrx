@@ -301,16 +301,27 @@ func (b *cliClearBatchV4) collect(key dataplane.SessionKey, val dataplane.Sessio
 	return len(b.fwd) >= cliClearFilteredBatch
 }
 
-func (b *cliClearBatchV4) deleteAll(c *CLI, agg *sessionClearErrors) int {
-	deleted := 0
+// deleteAll deletes this chunk's forward keys plus reverse/DNAT companions.
+// It returns deleted (forward keys this call actually removed, for the operator
+// "N cleared" tally) and removed (forward keys no longer in the map after this
+// call = deleted PLUS already-gone/not-found). removed drives the #5948
+// rescan no-progress guard: a fresh rescan only shrinks the match set for the
+// forward keys that are gone, so removed==0 on a non-empty chunk means the next
+// identical rescan would re-collect the same set. A not-found forward key IS
+// progress (it will not reappear), so it counts toward removed but not deleted.
+func (b *cliClearBatchV4) deleteAll(c *CLI, agg *sessionClearErrors) (deleted, removed int) {
 	for _, key := range b.fwd {
 		// addExceptNotFound (not add): the cursor path leaves the chunk anchor
 		// live and may re-collect it next round, so a benign already-gone
 		// forward key must not read as a failure — matching grpcapi #5454.
 		if err := c.dp.DeleteSession(key); err != nil {
 			agg.addExceptNotFound("v4 forward delete", err)
+			if dataplane.IsKeyNotFound(err) {
+				removed++ // already gone: not a delete, but still progress
+			}
 		} else {
 			deleted++
+			removed++
 		}
 	}
 	for _, key := range b.rev {
@@ -319,7 +330,7 @@ func (b *cliClearBatchV4) deleteAll(c *CLI, agg *sessionClearErrors) int {
 	for _, dk := range b.dnat {
 		agg.addExceptNotFound("v4 DNAT companion delete", c.dp.DeleteDNATEntry(dk))
 	}
-	return deleted
+	return deleted, removed
 }
 
 // clearFilteredV4Bounded deletes every matching v4 session (plus companions)
@@ -352,12 +363,17 @@ func clearFilteredV4Bounded(c *CLI, f *sessionFilter, agg *sessionClearErrors) i
 			cliClearBatchObserver(len(cur.fwd))
 		}
 		if prevValid {
-			deleted += prev.deleteAll(c, agg)
+			// Cursor path terminates unconditionally (the cursor advances every
+			// round regardless of delete success), so the removed count is unused
+			// here — only the fresh-rescan fallback needs the no-progress guard.
+			d, _ := prev.deleteAll(c, agg)
+			deleted += d
 			prevValid = false
 		}
 		full := len(cur.fwd) >= cliClearFilteredBatch && iterErr == nil
 		if !full {
-			deleted += cur.deleteAll(c, agg)
+			d, _ := cur.deleteAll(c, agg)
+			deleted += d
 			return deleted
 		}
 		anchor := cur.fwd[len(cur.fwd)-1]
@@ -369,8 +385,13 @@ func clearFilteredV4Bounded(c *CLI, f *sessionFilter, agg *sessionClearErrors) i
 
 // clearFilteredV4Rescan is the bounded fallback for a cursor-less dataplane
 // (test/edge): collect up to cliClearFilteredBatch keys via a fresh iterate,
-// delete them, rescan — every collected key is deleted so a fresh scan returns
-// the next chunk, converging while holding only O(chunk) keys (#4886).
+// delete them, rescan — a deleted (or already-gone) key does not reappear, so a
+// fresh scan returns the next chunk, converging while holding only O(chunk) keys
+// (#4886). Progress depends on deletes actually removing keys, so a #5948
+// no-progress guard breaks the loop if a non-empty chunk removed nothing (every
+// forward delete genuinely failed → the same set would be re-collected forever).
+// The production cursor path (clearFilteredV4Bounded) does not need this — its
+// cursor advances every round regardless of delete success.
 func clearFilteredV4Rescan(c *CLI, f *sessionFilter, agg *sessionClearErrors) int {
 	deleted := 0
 	var b cliClearBatchV4
@@ -392,7 +413,19 @@ func clearFilteredV4Rescan(c *CLI, f *sessionFilter, agg *sessionClearErrors) in
 		if len(b.fwd) == 0 {
 			return deleted
 		}
-		deleted += b.deleteAll(c, agg)
+		d, removed := b.deleteAll(c, agg)
+		deleted += d
+		// #5948 no-progress guard. Unlike the cursor path, this fallback re-scans
+		// from the top each round and relies on the just-processed keys being GONE
+		// so the next scan returns a smaller set. If removed==0 — every forward key
+		// in this non-empty chunk failed to delete with a GENUINE (non-not-found)
+		// error, so all remain in the map — the next identical rescan would
+		// re-collect the same set forever. Stop with the aggregated delete errors
+		// already recorded rather than loop. A not-found key counts as removed (it
+		// will not reappear), so a concurrently-drained chunk still makes progress.
+		if removed == 0 {
+			return deleted
+		}
 		if len(b.fwd) < cliClearFilteredBatch || iterErr != nil {
 			return deleted
 		}
@@ -419,13 +452,18 @@ func (b *cliClearBatchV6) collect(key dataplane.SessionKeyV6, val dataplane.Sess
 	return len(b.fwd) >= cliClearFilteredBatch
 }
 
-func (b *cliClearBatchV6) deleteAll(c *CLI, agg *sessionClearErrors) int {
-	deleted := 0
+// deleteAll is the IPv6 analogue of cliClearBatchV4.deleteAll, returning the
+// same (deleted, removed) pair for the #5948 rescan no-progress guard.
+func (b *cliClearBatchV6) deleteAll(c *CLI, agg *sessionClearErrors) (deleted, removed int) {
 	for _, key := range b.fwd {
 		if err := c.dp.DeleteSessionV6(key); err != nil {
 			agg.addExceptNotFound("v6 forward delete", err)
+			if dataplane.IsKeyNotFound(err) {
+				removed++ // already gone: not a delete, but still progress
+			}
 		} else {
 			deleted++
+			removed++
 		}
 	}
 	for _, key := range b.rev {
@@ -434,7 +472,7 @@ func (b *cliClearBatchV6) deleteAll(c *CLI, agg *sessionClearErrors) int {
 	for _, dk := range b.dnat {
 		agg.addExceptNotFound("v6 DNAT companion delete", c.dp.DeleteDNATEntryV6(dk))
 	}
-	return deleted
+	return deleted, removed
 }
 
 func clearFilteredV6Bounded(c *CLI, f *sessionFilter, agg *sessionClearErrors) int {
@@ -463,12 +501,16 @@ func clearFilteredV6Bounded(c *CLI, f *sessionFilter, agg *sessionClearErrors) i
 			cliClearBatchObserver(len(cur.fwd))
 		}
 		if prevValid {
-			deleted += prev.deleteAll(c, agg)
+			// Cursor path terminates unconditionally; the removed count is unused
+			// here (only the fresh-rescan fallback needs the no-progress guard).
+			d, _ := prev.deleteAll(c, agg)
+			deleted += d
 			prevValid = false
 		}
 		full := len(cur.fwd) >= cliClearFilteredBatch && iterErr == nil
 		if !full {
-			deleted += cur.deleteAll(c, agg)
+			d, _ := cur.deleteAll(c, agg)
+			deleted += d
 			return deleted
 		}
 		anchor := cur.fwd[len(cur.fwd)-1]
@@ -499,7 +541,14 @@ func clearFilteredV6Rescan(c *CLI, f *sessionFilter, agg *sessionClearErrors) in
 		if len(b.fwd) == 0 {
 			return deleted
 		}
-		deleted += b.deleteAll(c, agg)
+		d, removed := b.deleteAll(c, agg)
+		deleted += d
+		// #5948 no-progress guard (see clearFilteredV4Rescan): a non-empty chunk
+		// that removed nothing (all forward deletes genuinely failed → keys remain)
+		// would be re-collected identically forever; stop with the errors recorded.
+		if removed == 0 {
+			return deleted
+		}
 		if len(b.fwd) < cliClearFilteredBatch || iterErr != nil {
 			return deleted
 		}

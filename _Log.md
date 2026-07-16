@@ -49024,3 +49024,26 @@ top.
     pkg/daemon/route_leak_snapshot_failclosed_5696_test.go,
     pkg/daemon/device_map_teardown_failclosed_5309_test.go,
     pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5948 harden clearFilteredV*Rescan with a no-progress guard
+    (#4886 follow-up, flagged as the optional note in the #5947 review). The
+    fresh-RESCAN fallback (pkg/cli/cli_clear.go, cursor-LESS dp only — test/edge,
+    unreachable in production since both dp types implement the cursor iterators)
+    re-collects matching keys from the top each round and relies on deletes
+    succeeding to shrink the set. A cursor-less dp whose DeleteSession
+    PERSISTENTLY errored (genuine, non-not-found) for >= batch matching keys would
+    re-collect the identical set forever (infinite loop). Fixed: cliClearBatchV*
+    .deleteAll now returns (deleted, removed) where removed = deleted + not-found
+    (forward keys no longer in the map); the rescan breaks with `if removed == 0`
+    on a non-empty chunk (all forward deletes genuinely failed) rather than
+    looping. removed (not deleted) is the progress metric so a concurrently-
+    drained (not-found = gone) chunk is still progress, not a false stall. The
+    cursor path is UNCHANGED (already unconditionally terminating; its call sites
+    ignore removed). Fail-on-revert: a cursor-less fake with persistently-failing
+    deletes + a round-cap backstop — remove the guard and the terminate test loops
+    past the cap (dp.exceeded → RED) rather than wedging the suite; positive
+    controls (succeeding deletes clear the full set; not-found is progress) stay
+    green.
+  - **File(s)**: pkg/cli/cli_clear.go,
+    pkg/cli/cli_clear_rescan_no_progress_5948_test.go, pkg/cli/README.md
