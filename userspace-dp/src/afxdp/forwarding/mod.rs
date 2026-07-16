@@ -597,6 +597,40 @@ pub(super) fn resolve_fabric_links_from_snapshots(
     (out, skips)
 }
 
+/// #5686: an already-resolved `FabricLink` is SUPERSEDED when the incoming
+/// fabric snapshots still configure its parent interface but now name a
+/// DIFFERENT peer address — a same-parent peer REPLACEMENT. Such a stale link
+/// must never be preserved across a snapshot/refresh merge: until the
+/// replacement peer resolves (its neighbor MAC is learned), redirecting fabric
+/// traffic to the OLD peer would send it to a peer that is no longer current
+/// (the M01 stale-fabric-peer window). Dropping the old link makes
+/// `resolve_fabric_redirect` return `None` for that parent during the
+/// resolution window, so a synced-session packet takes its normal non-fabric
+/// disposition (safe) instead of a wrong-peer redirect.
+///
+/// Only a same-parent, different-and-parseable peer address supersedes:
+/// - A snapshot that still names the SAME peer (the steady-state periodic
+///   `SyncFabricState` refresh) is NOT a supersession — the working link is
+///   preserved unchanged.
+/// - A snapshot that OMITS the parent entirely (fabric removed, not replaced)
+///   is NOT a supersession — link teardown is a separate concern, and the
+///   existing preserve-across-unresolved-refresh behavior is kept.
+/// - An UNPARSEABLE replacement address is ignored: the malformed new link
+///   cannot resolve anyway, so it is not yet a valid replacement to gate on.
+pub(super) fn fabric_link_superseded_by_snapshots(
+    old: &FabricLink,
+    snapshots: &[crate::FabricSnapshot],
+) -> bool {
+    snapshots.iter().any(|snap| {
+        snap.parent_ifindex == old.parent_ifindex
+            && snap
+                .peer_address
+                .parse::<IpAddr>()
+                .map(|addr| addr != old.peer_addr)
+                .unwrap_or(false)
+    })
+}
+
 pub(super) fn resolve_fabric_redirect(
     forwarding: &ForwardingState,
 ) -> Option<ForwardingResolution> {

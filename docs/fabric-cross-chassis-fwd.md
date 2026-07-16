@@ -395,6 +395,76 @@ re-resolves and re-syncs the fabric MACs within seconds. The persisted
 fabric set is therefore the **observability snapshot** (so `show` reflects
 the resolved truth), not the restore source.
 
+## Same-parent peer replacement must invalidate the stale peer (#5686 M01)
+
+The two fabric-authority paths PRESERVE an already-resolved `FabricLink`
+across a build/refresh that could not re-resolve it: `refresh_fabric_links`
+(the `SyncFabricState` / `update_fabrics` path) keeps the prior working set
+when *nothing* resolves this pass, and `refresh_runtime_snapshot_inner` (the
+config-apply path) merges old links back for any parent absent from the new
+build. That preserve exists because a fabric peer's neighbor MAC resolves
+asynchronously — the snapshot for a parent can be present but UNRESOLVED
+(empty `peer_mac`) for a window until ARP/NDP completes, and blindly wiping
+the resolved link during that window would blackhole cross-chassis
+forwarding.
+
+The bug (codex-review-182 M01): the preserve/merge keyed only on
+`parent_ifindex`. When a fabric peer under the SAME parent is **replaced**
+(the configured `peer_address` changes), the replacement arrives UNRESOLVED,
+so it is skipped and absent from the new resolved set — and the preserve
+logic kept the OLD link because its parent still existed. During the
+replacement's resolution window the STALE old peer therefore remained a valid
+`resolve_fabric_redirect` target, and a synced-session packet could be
+fabric-redirected to a peer that is no longer current.
+
+**The exact window:** from the moment the replacement `peer_address` is
+staged (a new snapshot for parent X names peer `P_new`, still unresolved)
+until `P_new`'s neighbor MAC resolves. Throughout that window the old link
+`X → P_old` was authoritative AND `P_new` was not yet installable.
+
+**Fix — invalidate-before-accept, keyed on peer identity.** A preserved link
+is SUPERSEDED when the incoming snapshots configure its parent but name a
+different, parseable peer address
+(`fabric_link_superseded_by_snapshots`, `afxdp/forwarding/mod.rs`). A
+superseded link is dropped from the preserved/merged set *before* it can be
+kept, in both paths. Consequences:
+
+- The moment the replacement is staged, `X → P_old` is gone. It is never
+  again returned by `resolve_fabric_redirect`.
+- While `P_new` is unresolved, `resolve_fabric_redirect` yields **no target**
+  for parent X, so the synced-session packet takes its normal non-fabric
+  disposition (its local/forward path) — the safe fallback, never a
+  wrong-peer redirect. This matches the pre-existing fail-closed contract:
+  redirecting to "nothing" degrades to normal forwarding, not a silent drop.
+- When `P_new` resolves, it installs normally and becomes the redirect
+  target.
+
+Only a same-parent **different-peer** snapshot supersedes. A snapshot that
+still names the same peer (the steady-state 30 s refresh) does not — the
+working link is preserved unchanged. A snapshot that OMITS the parent
+entirely (fabric removed, not replaced) does not — link teardown is a
+separate concern and the preserve-across-unresolved behavior is retained. An
+unparseable replacement address is ignored (the malformed new link cannot
+resolve anyway).
+
+**Reader visibility.** The pruned set is stored into BOTH the full
+`ha.forwarding` Arc (the worker's authoritative per-tick reload) AND the
+worker fast-path `ha.fabrics` Arc. The worker overwrites its
+`forwarding.fabrics` from `ha.fabrics` only when that Arc is non-empty, so
+leaving a stale non-empty `ha.fabrics` would re-add the superseded link the
+`ha.forwarding` store just removed — both must be updated in lock-step. A
+torn read (old link gone, replacement not yet visible) is harmless here
+because "no target → safe fallback"; the invariant that must never break is
+that the OLD link is not readable after the replacement is staged.
+
+Guarded by `refresh_fabric_links_replacement_peer_invalidates_stale_old_5686`
+(the fail-on-revert: neutralizing the prune makes the "old peer is no longer
+a redirect target" assertion go RED),
+`refresh_fabric_links_replacement_leaves_other_parent_untouched_5686`
+(a different-parent peer is unaffected during the replacement window), and
+`fabric_link_superseded_by_snapshots_only_on_same_parent_different_peer_5686`
+(the supersession predicate).
+
 ## Rate-based flood screens are not re-counted on fabric-redirected traffic (#4155)
 
 A packet that ingresses the **non-owner** node for a session the RG **owner**
