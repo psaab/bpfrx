@@ -11,10 +11,13 @@
 // (GRE/ESP/AH/OSPF/ICMP/...) gets IP-only translation — no pool port
 // is consumed and `rewrite_src_port` is left unset, so the packet
 // rewriters never overwrite its first two L4 bytes (GRE flags / ESP
-// SPI). `protocol == 0` is the synthetic "L4 tuple unknown" sentinel
-// used by the address-only `match_source_nat` callers; it keeps its
+// SPI). The out-of-band `None` protocol (#5687) is the "L4 tuple unknown"
+// signal used by the address-only `match_source_nat` callers; it keeps its
 // historical round-robin `try_next_port` behavior (never frame-written,
-// because the rewriters gate every L4 write on `has_l4_ports`).
+// because the rewriters gate every L4 write on `has_l4_ports`). A genuine
+// IPv4 protocol 0 (HOPOPT) arrives as `Some(0)` and is NOT the sentinel —
+// it takes the real port-less address-only path and its reverse tuple is
+// matchable.
 //
 // #5269: the address-only branch (`port no-translation` on a port-bearing
 // protocol, or a port-less protocol) selects a pool address but PRESERVES the
@@ -31,9 +34,9 @@
 // colliding flow (different preserved port, pool address, or remote) mints its
 // own token and succeeds. The token is freed by the SAME teardown path as a PAT
 // port (`release_source_nat_allocation`), which now derives the preserved port
-// from the flow key when the decision carried no port rewrite. The synthetic
-// `protocol == 0` wrapper mints NO token (never a real framed flow / reverse
-// session entry).
+// from the flow key when the decision carried no port rewrite. The
+// tuple-unknown (`None`) wrapper mints NO token (never a real framed flow /
+// reverse session entry).
 
 use super::allocator::{
     DeterministicV4, DeterministicV6, NS_PER_SEC, PersistentSourceKey, PoolAddressFamily,

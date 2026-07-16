@@ -325,7 +325,7 @@ fn source_nat_app_source_port_never_match_sentinel_3491() {
 #[test]
 fn source_nat_unconstrained_rule_still_matches_any_l4_3429() {
     // A rule with NO L4 match fields keeps the pre-#3429 match-any behavior,
-    // including for the address-only (proto=0) tuple-unknown caller.
+    // including for the address-only (`None`) tuple-unknown caller.
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
         name: "snat".to_string(),
         from_zone: "lan".to_string(),
@@ -353,7 +353,7 @@ fn source_nat_unconstrained_rule_still_matches_any_l4_3429() {
 
 #[test]
 fn source_nat_l4_constrained_rule_fails_closed_on_unknown_tuple_3429() {
-    // The address-only (proto=0) caller cannot supply a port/protocol, so an
+    // The address-only (`None`) caller cannot supply a port/protocol, so an
     // L4-constrained rule fails closed (does not fire) rather than over-match.
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
         name: "snat".to_string(),
