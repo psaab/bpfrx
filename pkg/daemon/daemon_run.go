@@ -689,7 +689,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start reconciliation loop — periodic safety net that corrects
 	// rg_active and blackhole route drift from dropped events.
 	if d.cluster != nil {
-		go d.reconcileRGStateLoop(ctx)
+		d.startReconcileRGStateLoop(ctx, &wg)
 	}
 
 	// Start HTTP API server if configured.
@@ -931,6 +931,27 @@ func (d *Daemon) runStartupOrAbort(ctx context.Context, phases []startupPhase, t
 		return teardown(err)
 	}
 	return err
+}
+
+// startReconcileRGStateLoop launches the RG-state reconcile safety-net loop and
+// registers it on the run WaitGroup so runShutdownSequence's wg.Wait() JOINS it
+// BEFORE the HA ownership-relinquish steps (rg_active clear, RA withdraw,
+// direct-mode VIP removal, VRRP Stop). #5681 / M23: as a bare goroutine the loop
+// was never joined — stop() cancelled its ctx, but a tick already past the
+// ctx.Done() select (or blocked mid-pass on a control-socket update) could
+// complete AFTER wg.Wait() during ownership cleanup and re-assert mastership
+// (re-enable forwarding / re-add VIPs), opening a transient dual-master /
+// blackhole window on planned shutdown or failover. Quiescing it early removes
+// no needed shutdown behavior: the VRRP BACKUP transition during shutdown is
+// driven by watchVRRPEvents (deliberately on context.Background()), not this
+// safety-net loop. Mirrors the sibling reconcile loops (DDNS/proxy-ARP/Surface
+// A) that were already wg-registered.
+func (d *Daemon) startReconcileRGStateLoop(ctx context.Context, wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.reconcileRGStateLoop(ctx)
+	}()
 }
 
 // applyCloseoutDrainTimeout bounds how long runShutdownSequence waits for an

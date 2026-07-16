@@ -101,6 +101,14 @@ pub(crate) enum SourceNatFailureReason {
     /// subscriber; an out-of-range source has no reserved block, so the
     /// allocation fails closed rather than silently round-robining it.
     DeterministicSubscriberOutOfRange,
+    /// #5688: an interface-mode source-NAT rule matched, but the egress interface
+    /// has NO address of the packet's family (a v4 packet on an egress interface
+    /// with only v6 addresses, or vice versa). Interface SNAT translates the
+    /// source to the egress interface's OWN same-family address; with none to
+    /// use there is nothing to translate to, so the flow fails CLOSED (drop +
+    /// count) rather than forwarding the private/internal source UNTRANSLATED
+    /// onto the egress — the leak this closes.
+    InterfaceNoEgressAddress,
 }
 
 impl SourceNatFailureReason {
@@ -116,6 +124,7 @@ impl SourceNatFailureReason {
             Self::DeterministicSubscriberOutOfRange => {
                 "source_nat_deterministic_subscriber_out_of_range"
             }
+            Self::InterfaceNoEgressAddress => "source_nat_interface_no_egress_address",
         }
     }
 }
@@ -1153,12 +1162,28 @@ pub(crate) fn match_source_nat_result_for_tuple(
         }
         *matched_counter = rule.hit_counter.clone();
         if rule.interface_mode {
+            // #5688: interface SNAT translates the source to the egress
+            // interface's OWN same-family address. Resolve it by the PACKET's
+            // family — a v4 packet needs a v4 egress address, a v6 packet a v6
+            // one. If the egress interface has NO address of that family there is
+            // nothing to translate to. Returning `Matched` with a `None` rewrite
+            // here forwarded the packet UNTRANSLATED — the private/internal source
+            // leaked onto the egress. Fail CLOSED instead: report `Unavailable`
+            // so the flow funnels through the same drop / `nat_alloc_fail`
+            // disposition a pool-mode allocation failure takes, and the leak
+            // cannot happen.
             let rewrite_src = match src_ip {
                 IpAddr::V4(_) => egress_v4.map(IpAddr::V4),
                 IpAddr::V6(_) => egress_v6.map(IpAddr::V6),
             };
+            let Some(rewrite_src) = rewrite_src else {
+                return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
+                    rule,
+                    SourceNatFailureReason::InterfaceNoEgressAddress,
+                ));
+            };
             return SourceNatLookup::Matched(NatDecision {
-                rewrite_src,
+                rewrite_src: Some(rewrite_src),
                 rewrite_dst: None,
                 ..NatDecision::default()
             });

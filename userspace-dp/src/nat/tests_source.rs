@@ -80,6 +80,151 @@ fn interface_source_nat_matches_v6_rule() {
     );
 }
 
+// === #5688: interface SNAT with no same-family egress address must fail CLOSED ===
+
+/// #5688 fail-on-revert: interface-mode SNAT translates the source to the egress
+/// interface's OWN address of the PACKET's family. When a v4 packet's egress
+/// interface has NO v4 address (only a v6 address here), there is nothing to
+/// translate to. Before the fix this returned `Matched` with a `None` rewrite,
+/// so the packet was forwarded with its private/internal source UNTRANSLATED —
+/// the leak. The fix fails CLOSED: `Unavailable(InterfaceNoEgressAddress)`, which
+/// funnels through the same drop / `nat_alloc_fail` disposition a pool-mode
+/// allocation failure takes. Reverting to `Matched`-with-`None` makes this panic
+/// (the returned lookup is no longer `Unavailable`). Passing a v6 egress address
+/// that must NOT be used also proves the RIGHT family is resolved.
+#[test]
+fn interface_source_nat_no_v4_egress_addr_fails_closed() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let lookup = match_source_nat_result(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.61.102".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        None, // egress interface has NO v4 address
+        // a v6 address is present but must NOT be used to translate a v4 packet
+        Some("2001:559:8585:80::8".parse().expect("egress v6")),
+    );
+    match lookup {
+        SourceNatLookup::Unavailable(f) => {
+            assert_eq!(f.reason, SourceNatFailureReason::InterfaceNoEgressAddress);
+        }
+        other => panic!(
+            "expected Unavailable (fail-closed drop), got {other:?} — a \
+             Matched-with-None-rewrite forwards the private source UNTRANSLATED (#5688 leak)"
+        ),
+    }
+}
+
+/// #5688 symmetric v6: a v6 packet whose egress interface has NO v6 address
+/// (only a v4 address present, which must NOT be used) fails closed the same
+/// way. Independent of the v4 branch — the dual-stack family check is per-packet.
+#[test]
+fn interface_source_nat_no_v6_egress_addr_fails_closed() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat6".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["::/0".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let lookup = match_source_nat_result(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "2001:559:8585:ef00::100".parse().expect("src"),
+        "2001:559:8585:80::200".parse().expect("dst"),
+        // a v4 address is present but must NOT be used to translate a v6 packet
+        Some("172.16.80.8".parse().expect("egress v4")),
+        None, // egress interface has NO v6 address
+    );
+    match lookup {
+        SourceNatLookup::Unavailable(f) => {
+            assert_eq!(f.reason, SourceNatFailureReason::InterfaceNoEgressAddress);
+        }
+        other => panic!(
+            "expected Unavailable (fail-closed drop), got {other:?} — a \
+             Matched-with-None-rewrite forwards the private source UNTRANSLATED (#5688 leak)"
+        ),
+    }
+}
+
+/// #5688 no-regression / dual-stack independence: the SAME lookup that fails
+/// closed for a family with no egress address still TRANSLATES when the egress
+/// interface HAS the packet's family address. A v6 packet is translated to the
+/// egress v6 address even though there is ALSO a v4 address present (which is
+/// irrelevant to a v6 packet), and vice versa — proving the working case is
+/// preserved and the families are resolved independently.
+#[test]
+fn interface_source_nat_translates_when_same_family_egress_addr_present() {
+    let rules = parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "snat4".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            interface_mode: true,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "snat6".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["::/0".to_string()],
+            interface_mode: true,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ]);
+    // v4 packet -> egress v4 address (v6 also present but unused).
+    let v4 = match_source_nat_result(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.61.102".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress v4")),
+        Some("2001:559:8585:80::8".parse().expect("egress v6")),
+    );
+    assert_eq!(
+        v4,
+        SourceNatLookup::Matched(NatDecision {
+            rewrite_src: Some("172.16.80.8".parse().expect("snat v4")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        })
+    );
+    // v6 packet -> egress v6 address (v4 also present but unused).
+    let v6 = match_source_nat_result(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "2001:559:8585:ef00::100".parse().expect("src"),
+        "2001:559:8585:80::200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress v4")),
+        Some("2001:559:8585:80::8".parse().expect("egress v6")),
+    );
+    assert_eq!(
+        v6,
+        SourceNatLookup::Matched(NatDecision {
+            rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat v6")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        })
+    );
+}
+
 #[test]
 fn off_rule_short_circuits_translation() {
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {

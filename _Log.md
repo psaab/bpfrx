@@ -28,6 +28,68 @@
   pkg/config/garp_clamp_5695_test.go (new), pkg/vrrp/instance_garp_clamp_5695_test.go (new),
   pkg/daemon/direct_garp_clamp_5695_test.go (new)
 
+## 2026-07-16 — #5863 (HA config-sync): level-triggered reconcile of the config-push invariant
+- **Timestamp**: 2026-07-16 (fix/5863-ha-configsync-reconcile)
+- **Action**: Fix #5863. Config replication to a reconnecting peer was
+  EDGE-TRIGGERED only by `OnPeerConnected`, which skipped the push when the node
+  was not RG0 primary at connect time OR had been up <30s — and nothing
+  re-evaluated the skipped work on a LATER promotion or 30s-stability crossing,
+  so a peer could stay INDEFINITELY divergent until an unrelated commit/reconnect.
+  Replaced the connect-only edge with reconcile-to-desired:
+  `reconcileConfigSyncToPeer` re-evaluates the invariant (RG0 authority AND
+  stable AND peer connected AND config-sync enabled AND current generation not
+  yet pushed on this connection) and pushes ONLY on divergence, at most once per
+  `(peer-connection-epoch × config-generation)`. Triggers: peer (re)connect
+  (`OnPeerConnected`), RG0 promotion (`applyRG0OwnershipTransition`), and a
+  low-frequency `configSyncReconcileLoop` that wakes at the stability threshold
+  and thereafter on a coarse 30s safety-net tick. `syncPeerConnEpoch` is bumped
+  on each connect so a fresh connection re-pushes; the commit-path push records
+  the same marker so a subsequent reconcile is a no-op. Control-socket-safe: an
+  already-satisfied evaluation is a cheap no-op (state gates + one hash, no
+  `QueueConfig`); stays RG0-primary-gated so a reconnecting SECONDARY never
+  overwrites authoritative config (#2239/#4385).
+- **File(s)**: pkg/daemon/daemon.go (marker/epoch/test-seam fields),
+  pkg/daemon/daemon_ha_sync.go (reconciler + loop + epoch bump + push marking +
+  OnPeerConnected rewire), pkg/daemon/daemon_ha.go (RG0-promotion hook),
+  pkg/daemon/configsync_reconcile_5863_test.go (fail-on-revert + regression
+  tests), docs/sync-protocol.md (reconcile-side trigger doc).
+- **Validation**: `go build ./...`, `go vet ./pkg/daemon`, `go test -race
+  ./pkg/daemon` all green; fail-on-revert proven (neutralize reconciler → RED,
+  restore → GREEN). Smoke (`test-failover`) blocked by the loss-cluster shim-ABI
+  wall; gated on the fail-on-revert unit tests.
+
+## 2026-07-16 — #5688 (Rust NAT): interface-mode SNAT with no same-family egress address leaked the source untranslated (fail-open)
+- **Timestamp**: 2026-07-16 (fix/5688-interface-snat-no-egress-drop)
+- **Action**: Fix #5688 (security/correctness fail-open, Rust userspace-dp
+  source NAT). STEP-0 confirmed live on origin/master 04e1527ab: in
+  `match_source_nat_result_for_tuple` (`userspace-dp/src/nat/source.rs`) the
+  `interface_mode` branch resolved `rewrite_src` from the egress interface's
+  same-family address (`egress_v4`/`egress_v6`) and returned
+  `SourceNatLookup::Matched` UNCONDITIONALLY — even when that address was
+  `None`. A `Matched` decision with a `None` source rewrite forwards the packet
+  UNTRANSLATED, so a v4 packet whose egress interface has no v4 address (or a v6
+  packet with no v6 egress address) leaked its private/internal source onto the
+  egress. Fix: fail CLOSED — when the same-family egress address is absent,
+  return `SourceNatLookup::Unavailable(SourceNatFailureReason::InterfaceNoEgressAddress)`
+  (new runtime-only reason, exception string
+  `source_nat_interface_no_egress_address`). That funnels through the SAME drop /
+  `nat_alloc_fail` disposition (`record_source_nat_failure`,
+  `poll_descriptor/nat_exception.rs`) a pool-mode allocation failure takes, so
+  the flow is dropped + counted instead of leaking. Disposition-only: no NAT
+  tuple / map-key / wire layout change. Families resolved independently (v4
+  packet → v4 egress addr, v6 packet → v6 egress addr); the working case (egress
+  HAS a same-family address) still translates.
+- **File(s)**: `userspace-dp/src/nat/source.rs` (new `InterfaceNoEgressAddress`
+  reason + exception string + fail-closed interface-mode branch),
+  `userspace-dp/src/nat/tests_source.rs` (3 fail-on-revert tests),
+  `userspace-dp/README.md` (source-NAT semantics bullet).
+- **Validation**: `cargo test --release` FULL suite 3945 passed / 0 failed.
+  Fail-on-revert proven: reverting to `Matched`-with-`None`-rewrite turns
+  `interface_source_nat_no_v4_egress_addr_fails_closed` and
+  `interface_source_nat_no_v6_egress_addr_fails_closed` RED while the
+  no-regression / dual-stack test
+  `interface_source_nat_translates_when_same_family_egress_addr_present` stays
+  GREEN. Smoke deferred (loss-cluster shim-wall) — unit-covered fail-closed.
 ## 2026-07-16 — #5830 (routing): per-instance next-table diverges between userspace and kernel/FRR (split-brain leak)
 - **Timestamp**: 2026-07-16 (fix/5830-per-instance-nexttable)
 - **Action**: Fix #5830. STEP-0 on origin/master 04e1527ab confirmed the
@@ -49743,3 +49805,8 @@ top.
 - **Timestamp**: 2026-07-16
 - **Action**: Fix #5690 (codex-review-182 M07, Medium NAT correctness). STEP-0 confirmed live on origin/master 2d8eac093: the generic embedded-ICMP NAT reversal (`try_embedded_icmp_nat_match` → `build_nat_reversed_icmp_error_v4/v6`, which reverse-translates the inner quoted packet of an ICMP error so an error for a NAT'd flow reaches the real internal host) was wired ONLY into the FLOW-BACKED session-miss arm of `poll_binding_process_descriptor` (`if let Some(flow)`, old line ~2486, inside `if is_embedded_icmp_error`). But a non-query ICMP error is FLOWLESS by construction: `frame/inspect.rs::parse_session_flow_from_bytes` (#3290) discards the metadata pseudo-port for every non-query ICMP type (query/error are disjoint via `icmp_identifier_bearing`), so `parse_session_flow` returns `None` and the packet takes the flowless `else` arm — it NEVER enters the flow-backed arm. So `is_embedded_icmp_error` is structurally ALWAYS false where the reversal lived → the reversal was DEAD in production; the helper unit tests exercised `try_embedded_icmp_nat_match_from_frame` directly and bypassed the dead poll control flow (tested-but-not-live). WHY the suppression exists (must preserve): the XDP shim stamps `bytes[l4+4..l4+6]` as `flow_src_port` for every ICMP type with NO query gate; #3290 discards it for non-query ICMP so the ungated control word can't seed a bogus identifier-keyed session (session-table pollution / spurious collisions). That flowless routing is CORRECT and is NOT what the fix touches. Fix (control-flow reachability, no tuple/map-key/wire change): extracted the reversal into `poll_descriptor/embedded_icmp.rs::try_reverse_embedded_icmp_error` (flow-independent) and call it FIRST in the flowless `else` arm (before the #3291 L3 enforcement) when `allow_embedded_icmp && ICMP && inner-type is an error` (same #5140-safe inner-type classification via `packet_frame` at inner-relative `meta.l4_offset`). A match reverse-translates + queues the error as a `Prebuilt` forward toward the client and consumes the descriptor (`continue`); a miss / no-source-rewrite / unbuildable frame / CoS-drop falls through (or fail-closed recycles) to normal flowless enforcement. The pending forward carries `flow_key: None` so the non-query error NEVER becomes a session/flow-cache authority — the #3290 no-fake-session invariant is preserved, not bypassed (CoS also classifies with `flow_key = None`: a synthesized L3 reply carries no trustworthy 5-tuple, so port-bearing output/CoS terms fail closed). Removed the now-dead flow-backed reversal block + its `is_embedded_icmp_error` compute and the `!is_embedded_icmp_error` local-delivery-caching guard (both structurally always-false in that arm → behavior-preserving; the reversal logic is de-duplicated into the one helper). Fail-on-revert PROVEN through the REAL control flow: new descriptor-level test `poll_descriptor_embedded_icmp_reversal_reachable_on_flowless_path_5690` drives an inbound NAT44 SNAT ICMP Time-Exceeded (addressed to the firewall SNAT addr, quoting the post-SNAT tuple) through `poll_binding_process_descriptor` and asserts exactly one queued `Prebuilt` reversed forward with outer-dst + inner-src + inner-src-port restored to the pre-NAT client, `flow_key = None`, egress toward the client (ifindex 24), no new session, no recycle; disabling the flowless helper call (`if false && is_embedded_icmp_error`) → `scratch_forwards` empty → RED. Existing helper tests stay green. Smoke deferred (an ICMP-error-for-a-NAT'd-flow is impractical to stage on the shim-wall cluster; unit-through-real-path is the validation). Validation: `cargo build --release` clean; full `cargo test --release` = 3942 passed / 0 failed (the transient fairness-eval failures were a non-existent `TMPDIR=/tmp/ct5690` env artifact — `fs::File::create` in a temp-file test; re-ran with the dir present → 60/60 green).
 - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/embedded_icmp.rs (new — `try_reverse_embedded_icmp_error` + `EmbeddedIcmpReversal`), userspace-dp/src/afxdp/poll_descriptor/mod.rs (edit — module wire-up; flowless-arm reversal call; removed dead flow-backed reversal block + `is_embedded_icmp_error` compute + caching guard), userspace-dp/src/afxdp/tests_embedded_poll_filter.rs (edit — descriptor-level fail-on-revert test), userspace-dp/src/afxdp/README.md (edit — #5690 flowless-arm reversal bullet), userspace-dp/src/afxdp/frame/README.md (edit — corrected the stale "embedded-inner matching out of scope" note)
+
+## 2026-07-16 — #5681 join reconcile safety-net loop before HA ownership cleanup (M23)
+- **Timestamp**: 2026-07-16
+- **Action**: Fix #5681 (codex-review-182 M23, High HA correctness). STEP-0 confirmed live on origin/master 5da2b7bb6: pkg/daemon/daemon_run.go Run() spawned `go d.reconcileRGStateLoop(ctx)` as a BARE goroutine (was line ~692), unlike the sibling DDNS/proxy-ARP/Surface-A reconcile loops immediately above it which use the `wg.Add(1); go func(){ defer wg.Done(); ... }()` idiom on the run WaitGroup. So `wg.Wait()` in runShutdownSequence (line 990) did NOT join it. `stop()` cancels its ctx, but with no join a tick already past the `case <-ctx.Done(): return` select (or blocked mid-pass in reconcileRGState on a control-socket SetRGActive) can COMPLETE after wg.Wait() — during the LATER HA ownership-relinquish phase (rg_active clear line 1073+, RA withdraw 1093, direct-mode VIP removal 1101, VRRP Stop 1108) — and re-enable forwarding / re-add VIPs → transient dual-master / blackhole window on planned shutdown or failover. VERIFIED the ordering invariant holds: every ownership-relinquish step in runShutdownSequence runs strictly AFTER wg.Wait() (line 990), so registering the loop on the run WaitGroup is sufficient — no explicit cancel+join-before-teardown seam (the #5308 stopPolicyScheduler/stopPinRetry pattern) is needed, because the reconcile loop binds the run/signal ctx (cancelled by stop()), NOT the never-cancelled d.daemonCtx. VERIFIED quiescing it early removes no needed shutdown behavior: the VRRP BACKUP transition during shutdown is driven by watchVRRPEvents (daemon_run.go:687, deliberately on context.Background() so it outlives ctx cancel), NOT this safety-net loop. Fix (minimal, sibling idiom): extracted the spawn into `startReconcileRGStateLoop(ctx, *wg)` (matches the codebase's startHTTPServer/startGRPCServer/stopPinRetryLoop lifecycle-helper convention) doing the wg.Add(1)/defer wg.Done() wrap; Run() now calls it under the existing `if d.cluster != nil` guard. CAVEAT noted in PR: a reconcile pass's SetRGActive uses context.Background() (deliberate — the map update must complete), so an in-flight pass at cancel time delays the join by that pass's duration; bounded in the normal case (local BPF map update + unix-socket control send under m.mu, the same primitive the already-wg-registered sibling loops use) and backstopped by the systemd unit TimeoutStopSec=20. Fail-on-revert PROVEN: new pkg/daemon/ha_shutdown_reconcile_join_5681_test.go holds ONE reconcile pass in-flight via an injectable reconcileTickHook (test-only Daemon field routed through reconcileRGStatePass), spawns via the production startReconcileRGStateLoop seam, cancels ctx, then asserts wg.Wait() does NOT return while the pass is in flight (a 300ms window) and DOES return after the pass completes; reverting startReconcileRGStateLoop to bare `go` (drop wg.Add/wg.Done) → RED ("wg.Wait() returned while a reconcile pass was still in flight — reconcile loop not joined before HA ownership cleanup (#5681/M23 regression)"); restored → GREEN. Validation: GOCACHE=/tmp/gc5681 GOTMPDIR=/tmp/g5681 go build ./... clean; go vet ./pkg/daemon clean; full pkg/daemon suite -race GREEN (23.9s). Go-only, no cargo/Rust. test-failover smoke blocked by the loss-cluster shim-ABI wall — gated on the fail-on-revert ordering unit test; parent to record the smoke deferral.
+- **File(s)**: pkg/daemon/daemon_run.go (edit — startReconcileRGStateLoop helper; Run() call site), pkg/daemon/daemon_ha.go (edit — reconcileRGStatePass wrapper; loop routes 3 pass sites through it), pkg/daemon/daemon.go (edit — reconcileTickHook test-seam field), pkg/daemon/ha_shutdown_reconcile_join_5681_test.go (new — fail-on-revert ordering test), pkg/daemon/README.md (edit — shutdown-ordering contract: reconcile loop is run-WaitGroup-registered, joined before HA ownership relinquish)
