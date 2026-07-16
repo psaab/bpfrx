@@ -181,8 +181,26 @@ func TestTunnelEndpointIDOverflowOnlyUnitHashesBareRef(t *testing.T) {
 		"set interfaces wg34524 unit 0 tunnel mode wireguard",
 		"set interfaces wg34524 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
-	if _, err := CompileConfig(tree); err == nil {
+	_, err := CompileConfig(tree)
+	if err == nil {
 		t.Fatalf("CompileConfig accepted a builder-emitted collision hidden behind an overflow-only unit spelling (wg0 emits bare ref, collides with wg34524.0)")
+	}
+	// #5934: pin the error to the tunnel-endpoint-ID collision gate
+	// (validateTunnelEndpointIDCollisionAST, "interfaces: tunnel endpoint id
+	// collision between %q and %q ..."). A bare `err != nil` would pass
+	// VACUOUSLY if a future gate reorder made the collision gate stop firing and
+	// a DIFFERENT error surfaced first — e.g. the #5829 fail-closed unit gate
+	// rejecting the overflow `unit 99999...`, or a parse error — silently no
+	// longer exercising the collision path this test exists to guard. Assert the
+	// SPECIFIC collision error (and the two colliding interface names) so a
+	// wrong error class fails loudly instead.
+	if !strings.Contains(err.Error(), "tunnel endpoint id collision") {
+		t.Fatalf("want the tunnel-endpoint-ID collision error (validateTunnelEndpointIDCollisionAST) — the collision gate did not fire / was shadowed by a different gate (#5934); got: %v", err)
+	}
+	for _, name := range []string{`"wg0"`, `"wg34524.0"`} {
+		if !strings.Contains(err.Error(), name) {
+			t.Fatalf("collision error must name the colliding interface %s (the bare-ref hash of wg0 == wg34524.0); got: %v", name, err)
+		}
 	}
 }
 
