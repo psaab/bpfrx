@@ -62,18 +62,6 @@ func buildStaticNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 			// dataplane — fail CLOSED, symmetric with the #5101 out-of-range
 			// port drop below. The supported IPv6->IPv4 path is the native
 			// `security nat nat64` rule-set (buildNAT64Snapshots), untouched.
-			// #5859: `then static-nat inet` is the Junos NAT64 keyword. The
-			// compiler records rule.Then=="inet", but this same-family
-			// static_nat table stores an IP address in InternalIP — emitting
-			// the literal "inet" makes the Rust parse_nat_prefix fail and the
-			// rule is SILENTLY SKIPPED (a strict-valid config claims NAT64 but
-			// installs nothing). Strict commit now REJECTS this target
-			// (validateStaticNATInetTargetStrict); on the lenient load /
-			// peer-sync path it is a surfaced compile warning. Drop the rule
-			// here too so the unparseable "inet" sentinel never reaches the
-			// dataplane — fail CLOSED, symmetric with the #5101 out-of-range
-			// port drop below. The supported IPv6->IPv4 path is the native
-			// `security nat nat64` rule-set (buildNAT64Snapshots), untouched.
 			if rule.Then == "inet" {
 				slog.Warn("userspace snapshot: dropping static NAT `then static-nat inet` (NAT64) rule; not representable in the static_nat table (use `security nat nat64`) (fail-closed, #5859)",
 					"ruleset", rs.Name, "rule", rule.Name)
