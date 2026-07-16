@@ -67,10 +67,17 @@ upfront what they're getting and not getting.
    only the colliding user apps can renumber — never the whole
    catalog. **Honest residual (#5296):** stability is NOT absolute —
    adding a user app that hash-collides with an existing user app can
-   renumber that small colliding set. The zero-residual path
-   (versioning application identity in the session state) is a
-   cross-language conntrack-ABI + HA-wire change, deliberately out of
-   scope for this bounded fix.
+   renumber that small colliding set. Because this is the one case that
+   warrants operator attention, `AssignStableAppIDs` emits a
+   `slog.Warn` at catalog build (config compile, never per-packet)
+   whenever a user app is displaced off its natural `StableAppID` slot —
+   naming the `application`, the `natural_app_id` slot it wanted, and
+   the `assigned_app_id` it was displaced to (#5988). An operator who
+   sees this log knows a displacement (and thus a possible
+   renumber-across-edit for that app) has occurred; a collision-free
+   catalog stays silent. The zero-residual path (versioning application
+   identity in the session state) is a cross-language conntrack-ABI +
+   HA-wire change, deliberately out of scope for this bounded fix.
 2. **Snapshot ship**: `buildAppCatalogSnapshot`
    (`pkg/dataplane/userspace/flow.go`) emits the catalog as the
    `app_catalog` field of the config snapshot — an ordered list
