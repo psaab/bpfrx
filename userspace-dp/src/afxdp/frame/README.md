@@ -163,8 +163,14 @@ inspect or rewrite a packet sitting in a UMEM frame.
   every non-query type, so transit ICMP error/control packets follow the
   route-based, session-less forward path instead of installing a bogus
   identifier-keyed stateful session that would pollute the session table and
-  risk spurious collisions. Matching ICMP errors to their embedded inner flow
-  remains out of scope (tracked as the larger #2393 model). **#3290 — the
+  risk spurious collisions. Matching an ICMP error to its embedded inner flow
+  for NAT reversal (#2393 model) does NOT need a session: the generic
+  embedded-ICMP NAT reversal runs on the FLOWLESS poll arm
+  (`poll_descriptor/embedded_icmp.rs::try_reverse_embedded_icmp_error`, #5690),
+  reverse-translating the inner quoted packet and forwarding the error to the
+  real internal host WITHOUT seeding a session (the prebuilt forward carries
+  `flow_key = None`) — so the flowless routing here is preserved, not bypassed.
+  **#3290 — the
   metadata path honors the SAME gate:** the XDP shim stamps
   `meta.flow_src_port = bytes[l4+4..l4+6]` for EVERY ICMP type with no
   query-type gate, so `parse_session_flow_from_bytes` could otherwise
