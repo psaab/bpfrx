@@ -423,7 +423,16 @@ mechanism (PATH C of `docs/research/2239-dhcp-ha-lease-sync/plan.md`):
   legacy set so a peer that predates the feature hits the `default` receive
   case and ignores them — no `CurrentHAProtocolVersion` bump (the change is
   additive AND config-knob-gated, so bumping would falsely block session sync
-  across a mixed-base pair).
+  across a mixed-base pair). Each per-lease string field (address, hwaddr,
+  clientid, DUID, leasetype, hostname) is `uint16`-length-prefixed, so the
+  writer FAILS CLOSED on a field longer than 65535 bytes: `putLeaseString` /
+  `encodeOneLease` return an error rather than let `uint16(len)` silently narrow
+  and misframe the peer's decode, and `encodeDHCPLeasePayload` DROPS that one
+  lease (with a warning; the count stays consistent) so the surviving leases
+  still round-trip — a >64 KiB field is defensive-only, real DHCP identifiers
+  are far below it (#4892). The wire format is unchanged; the decoder
+  (`getLeaseString`) is untouched — the writer just never emits an oversized
+  field.
 - **Clock invariant** — each lease carries REMAINING LIFETIME, never an
   absolute wall-clock expiry (the channel only syncs a MONOTONIC offset). The
   promoting node re-anchors to its LOCAL clock at seed (`expire = now + remaining`),
