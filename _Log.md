@@ -1,3 +1,33 @@
+## 2026-07-16 — #5990 cluster: purge Monitor per-RG ipState/ipDebts on RG removal
+- **Timestamp**: 2026-07-16 (fix/5990-monitor-ipstate-purge)
+- **Action**: Fixed a chassis-cluster HA monitor map-lifecycle fail-open. The
+  Monitor keys `ipState` by `(rgID, address)` and `ipDebts`/`ipThresholdState`
+  by rgID. On RG removal, `group_state.go UpdateConfig` cleared only the
+  MANAGER's `monitorWeights` for the removed RG (and #5080 reconciled
+  interface-monitor debt) — it never purged the Monitor's per-RG maps. A same-id
+  RG remove/re-add while a monitored ip target was DOWN then left stale
+  `ipDebts[rg.ID]` behind: `reconcileRGIPDebts` saw `desired==installed` by its
+  own stale record and fired no `SetMonitorWeight`, so the debt the manager had
+  cleared was never re-installed → the re-added RG carried a MISSING ip-monitor
+  debt (weight stuck at 255) until the target's next dampened transition, and
+  could stay primary with a dead monitored uplink. Fix: `Monitor.UpdateGroups`
+  now purges `ipState` (per-target, by removed rgID), `ipDebts`, and
+  `ipThresholdState` for every RG no longer in config — alongside the existing
+  `ifaceState` purge, under `mon.mu`, calling no `m.mu`-taking function (no lock
+  inversion). Purging `ipState` also means a re-added RG whose target has since
+  recovered starts from fresh dampening. A KEPT RG whose ip-monitoring/targets
+  merely changed is left to `reconcileRGIPDebts` (per-poll), unchanged.
+- **File(s)**: pkg/cluster/monitor.go,
+  pkg/cluster/monitor_ipstate_purge_5990_test.go (new), pkg/cluster/README.md
+- **Validation**: `go build ./...` + `go vet ./pkg/cluster` clean;
+  `gofmt -l` clean on touched files; full `go test -race ./pkg/cluster` green
+  (10.3s). New fail-on-revert test (independent + aggregate/global-threshold
+  modes) PROVEN RED on revert firsthand — with the purge removed, `ipDebts[1]`
+  survives removal and a same-id re-add leaves RG weight stuck at 255 (verified
+  with a throwaway probe that drove the full remove→re-add→poll path). Cluster
+  `make test-failover` loss-cluster smoke DEFERRED (shim-ABI wall) — gated on the
+  fail-on-revert unit tests + full `-race` suite.
+
 ## 2026-07-16 — #5082 VRRP: fail-closed MASTER publish + generation-gated VIP reconcile
 - **Timestamp**: 2026-07-16 (fix/5082-vrrp-vip-gen)
 - **Action**: Fixed two VRRP HA correctness defects (codex-review-177

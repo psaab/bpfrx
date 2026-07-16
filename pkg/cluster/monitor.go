@@ -299,17 +299,32 @@ func (mon *Monitor) Stop() {
 // state if the same monitor key is ever re-added — reporting an interface as
 // still-failed on the strength of a measurement from a prior config epoch.
 //
+// It applies the SAME per-RG cleanup to the IP-monitor state (#5990): the
+// dampened ipState (keyed by (rgID, address)) is dropped for any target whose
+// RG is no longer desired, and the per-RG ipDebts / ipThresholdState
+// bookkeeping is dropped for any RG no longer in config. Without this, a
+// same-id RG remove/re-add while a monitored target is down leaves stale
+// ipDebts[rg.ID] behind: the manager already cleared that RG's monitorWeights
+// on removal, but the next reconcileRGIPDebts sees desired==installed by its
+// OWN stale record and no-ops the install — the re-added RG silently carries a
+// MISSING ip-monitor debt and can stay primary with a dead monitored uplink
+// (fail-open). A clean per-RG slate forces the reconcile to re-derive the debt.
+//
 // The MANAGER-side debt for these removed/changed monitors (monitorWeights and
-// each RG's MonitorFails) is cleared separately in reconcileMonitorDebtsLocked
-// under m.mu (#5080). UpdateGroups deliberately does NOT call the locking
-// SetMonitorWeight here: it is invoked from Manager.UpdateConfig with m.mu
-// already held, so re-acquiring m.mu would self-deadlock.
+// each RG's MonitorFails) is cleared separately: interface monitors in
+// reconcileMonitorDebtsLocked, and a whole removed RG's keys in UpdateConfig's
+// removal loop — both under m.mu (#5080). UpdateGroups deliberately does NOT
+// call the locking SetMonitorWeight here: it is invoked from
+// Manager.UpdateConfig with m.mu already held, so re-acquiring m.mu would
+// self-deadlock. It touches only the Monitor's own maps (guarded by mon.mu).
 func (mon *Monitor) UpdateGroups(groups []*config.RedundancyGroup) {
 	mon.mu.Lock()
 	defer mon.mu.Unlock()
 
 	desired := make(map[monitorKey]bool)
+	desiredRGs := make(map[int]bool)
 	for _, rg := range groups {
+		desiredRGs[rg.ID] = true
 		for _, im := range rg.InterfaceMonitors {
 			desired[monitorKey{rgID: rg.ID, iface: im.Interface}] = true
 		}
@@ -317,6 +332,30 @@ func (mon *Monitor) UpdateGroups(groups []*config.RedundancyGroup) {
 	for key := range mon.ifaceState {
 		if !desired[key] {
 			delete(mon.ifaceState, key)
+		}
+	}
+
+	// Purge per-RG IP-monitor state for RGs removed from config (#5990).
+	// ipDebts / ipThresholdState are keyed directly by RG id; ipState embeds
+	// the RG id in its key. Dropping every entry whose RG is no longer desired
+	// gives a same-id re-add a clean slate so reconcileRGIPDebts re-derives the
+	// debt from a fresh probe instead of no-oping against stale bookkeeping.
+	// (A KEPT RG whose ip-monitoring/targets merely changed is NOT purged here —
+	// reconcileRGIPDebts owns that per-poll and clears the obsolete per-target
+	// debt itself.)
+	for key := range mon.ipState {
+		if !desiredRGs[key.rgID] {
+			delete(mon.ipState, key)
+		}
+	}
+	for rgID := range mon.ipDebts {
+		if !desiredRGs[rgID] {
+			delete(mon.ipDebts, rgID)
+		}
+	}
+	for rgID := range mon.ipThresholdState {
+		if !desiredRGs[rgID] {
+			delete(mon.ipThresholdState, rgID)
 		}
 	}
 
