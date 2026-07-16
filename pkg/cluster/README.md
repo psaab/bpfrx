@@ -547,6 +547,24 @@ Monitor's `ipDebts` still recorded the debt installed, so the next
 with a dead monitored uplink jumped back to weight 255 and could win
 election → blackhole. Fail-open (#5080 fold).
 
+**Purge per-RG IP-monitor state on RG removal (#5990).** The manager clears
+a removed RG's `monitorWeights` in `UpdateConfig`'s removal loop, but the
+Monitor keeps its OWN per-RG maps: dampened `ipState` (keyed by
+`(rgID, address)`), the installed-debt record `ipDebts` (keyed by rgID), and
+the `ipThresholdState` mirror. `Monitor.UpdateGroups` now drops every entry
+whose RG is no longer in config, alongside the `ifaceState` purge. Without
+this, a same-id RG remove/re-add while a monitored target is DOWN left stale
+`ipDebts[rg.ID]` behind: on re-add `reconcileRGIPDebts` saw
+`desired==installed` by its OWN stale record and fired no `SetMonitorWeight`,
+so the debt the manager already cleared was never re-installed — the re-added
+RG carried a MISSING ip-monitor debt (weight stuck at 255) until the target
+next transitioned (a dampened edge), and could stay primary with a dead
+monitored uplink. Fail-open, narrow trigger. Purging `ipState` too means a
+re-added RG whose target has since recovered starts from fresh dampening
+rather than inheriting a stale down/hold-down state. A KEPT RG whose
+ip-monitoring or targets merely changed is NOT purged here —
+`reconcileRGIPDebts` owns that reconcile per-poll.
+
 `LinkAttrsUp` is exported because the same carrier-aware read is needed
 outside the monitor loop:
 
