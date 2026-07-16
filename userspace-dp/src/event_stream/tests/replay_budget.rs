@@ -5,6 +5,20 @@
 use super::*;
 
 
+// #5267: build a header-only SESSION_OPEN wire frame carrying `seq`. Used as a
+// realistic session-sync backlog delta whose seq must be ordered below the
+// replay-gap FullResync barrier on the wire.
+fn session_open_frame(seq: u64) -> EventFrame {
+    let mut data = [0u8; 256];
+    data[4] = super::codec::MSG_SESSION_OPEN;
+    data[8..16].copy_from_slice(&seq.to_le_bytes());
+    EventFrame {
+        data,
+        len: FRAME_HEADER_SIZE as u16,
+        seq,
+    }
+}
+
 #[test]
 fn test_sequence_monotonicity() {
     let shared = Arc::new(EventStreamShared::new());
@@ -76,19 +90,226 @@ fn test_replay_gap_at_zero_ack_sends_full_resync() {
         replay_buf.push_back(EventFrame::encode_drain_complete(seq));
     }
 
-    replay_buffered(&helper_side, &mut replay_buf, 0, &shared).expect("replay gap");
-
-    let mut hdr = [0u8; FRAME_HEADER_SIZE];
-    daemon_side.read_exact(&mut hdr).expect("full resync frame");
-    assert_eq!(hdr[4], MSG_FULL_RESYNC);
-    assert_eq!(shared.frames_sent.load(Ordering::Relaxed), 1);
+    // #5267: the gap branch no longer writes the FullResync directly to the
+    // socket. It allocates the barrier's seq under `producer_seq_lock` and PARKS
+    // it in `pending_resync`; the connected loop's drain emits it in seq order.
+    let mut pending_resync: Option<EventFrame> = None;
+    replay_buffered(&helper_side, &mut replay_buf, 0, &shared, &mut pending_resync)
+        .expect("replay gap");
+    {
+        let barrier = pending_resync
+            .as_ref()
+            .expect("gap must park a FullResync barrier");
+        assert_eq!(barrier.as_bytes()[4], MSG_FULL_RESYNC);
+    }
+    assert_eq!(
+        shared.frames_sent.load(Ordering::Relaxed),
+        0,
+        "parking the barrier must NOT count it as sent until it is flushed"
+    );
     assert_eq!(
         replay_buf.front().map(|f| f.seq),
         Some(2),
         "full resync keeps stale replay window until the daemon ACKs"
     );
+
+    // Drain an empty channel: the parked barrier flushes into the write path in
+    // order (it is the current max seq) and reaches the socket.
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(8);
+    let mut write_buf: Vec<u8> = Vec::new();
+    let outcome = drain_channel_into_write_buf(
+        &rx,
+        &shared,
+        &mut replay_buf,
+        &mut write_buf,
+        false,
+        &mut pending_resync,
+    );
+    assert!(outcome.drained_any, "flushing the barrier is output");
+    assert!(pending_resync.is_none(), "barrier consumed on flush");
+    (&helper_side)
+        .set_nonblocking(false)
+        .expect("blocking for the write");
+    (&helper_side).write_all(&write_buf).expect("write barrier");
+
+    let mut hdr = [0u8; FRAME_HEADER_SIZE];
+    daemon_side.read_exact(&mut hdr).expect("full resync frame");
+    assert_eq!(hdr[4], MSG_FULL_RESYNC);
+    assert_eq!(shared.frames_sent.load(Ordering::Relaxed), 1);
 }
 
+
+// #5267 fail-on-revert guard: a replay-gap FullResync must be written to the
+// wire AFTER every lower-seq session delta already queued in the channel — wire
+// order == seq order. The old gap branch allocated the barrier's seq with a
+// bare `fetch_add` and wrote it DIRECTLY to the socket, ahead of the still-
+// queued lower-seq deltas the connected loop drains later, so a HIGHER seq
+// landed on the wire before a LOWER one. The Go reader (zero reorder tolerance)
+// then diagnoses a session gap on the first post-barrier delta, drops the
+// connection, and churns resyncs on the very HA-recovery barrier.
+//
+// This drives the exact interleave deterministically: three session deltas
+// (seq 11,12,13) are committed to the channel during a disconnect, then a
+// replay-buffer hole (empty buffer, acked=10) forces the FullResync (seq 14).
+// The assertion is that the emitted wire order is strictly monotonic by seq
+// with the FullResync LAST. Reverting the fix (direct out-of-lock write in
+// `replay_buffered`) writes seq 14 to the socket before 11,12,13 -> the socket
+// read loop sees 14 first, expects 11 -> RED.
+#[test]
+fn test_full_resync_orders_after_channel_backlog_5267() {
+    let (mut daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    daemon_side
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+
+    let capacity = 64;
+    let (tx, rx) = mpsc::sync_channel::<EventFrame>(capacity);
+    let shared = Arc::new(EventStreamShared::new());
+
+    // The daemon ACKed through seq 10, but the replay buffer was fully evicted
+    // (empty + acked>0) -> a genuine hole -> the gap branch fires. `next_seq`
+    // reflects the deltas already allocated (through 13), so the FullResync
+    // takes seq 14.
+    shared.acked_seq.store(10, Ordering::Release);
+    shared.next_seq.store(13, Ordering::Release);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+
+    // Backlog: session-sync deltas committed to the channel during the
+    // disconnect, all with seqs strictly BELOW the imminent FullResync (14).
+    for seq in 11..=13u64 {
+        tx.try_send(session_open_frame(seq)).expect("seed backlog");
+    }
+
+    // Gap branch: the FIX parks a FullResync barrier (seq 14, allocated under
+    // the producer lock) instead of writing it. A revert to the old out-of-lock
+    // direct write instead pushes seq 14 straight to the socket HERE — ahead of
+    // the still-queued backlog — which is the inversion this guards.
+    let mut pending_resync: Option<EventFrame> = None;
+    replay_buffered(&helper_side, &mut replay_buf, 10, &shared, &mut pending_resync)
+        .expect("replay gap");
+
+    // Drain the backlog. Under the fix the drain merges the parked barrier LAST,
+    // so write_buf holds 11,12,13,14 in order; under a revert the barrier is not
+    // parked and write_buf holds only 11,12,13 (14 is already on the socket).
+    let mut write_buf: Vec<u8> = Vec::new();
+    let _ = drain_channel_into_write_buf(
+        &rx,
+        &shared,
+        &mut replay_buf,
+        &mut write_buf,
+        false,
+        &mut pending_resync,
+    );
+
+    // Flush whatever the drain produced, then read the FULL wire in order. This
+    // is the #5267 ordering invariant, observed on the real socket: every seq is
+    // strictly increasing and the higher-seq FullResync never precedes a
+    // committed lower-seq delta. Under the out-of-lock revert the socket already
+    // holds seq 14 (written by `replay_buffered`) ahead of 11,12,13, so the read
+    // sees (14,11,12,13) and this assertion goes RED.
+    (&helper_side)
+        .set_nonblocking(false)
+        .expect("blocking for the write");
+    (&helper_side).write_all(&write_buf).expect("write frames");
+
+    let mut wire: Vec<(u8, u64)> = Vec::new();
+    for _ in 0..4 {
+        let mut hdr = [0u8; FRAME_HEADER_SIZE];
+        if daemon_side.read_exact(&mut hdr).is_err() {
+            break;
+        }
+        let payload_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+        if payload_len > 0 {
+            let mut sink = vec![0u8; payload_len];
+            daemon_side.read_exact(&mut sink).expect("payload");
+        }
+        wire.push((hdr[4], u64::from_le_bytes(hdr[8..16].try_into().unwrap())));
+    }
+    assert_eq!(
+        wire,
+        vec![
+            (super::codec::MSG_SESSION_OPEN, 11),
+            (super::codec::MSG_SESSION_OPEN, 12),
+            (super::codec::MSG_SESSION_OPEN, 13),
+            (MSG_FULL_RESYNC, 14),
+        ],
+        "wire order must be monotonic by seq with the FullResync barrier LAST; \
+         an inversion (higher-seq FullResync before a lower-seq delta) is exactly \
+         what the Go reader diagnoses as a session gap"
+    );
+    // The strictly-increasing invariant, stated explicitly.
+    let mut prev = 0u64;
+    for (_typ, seq) in &wire {
+        assert!(
+            *seq > prev,
+            "wire seq must be strictly increasing (no inversion): {seq} after {prev}"
+        );
+        prev = *seq;
+    }
+    assert_eq!(
+        wire.last().unwrap().0,
+        MSG_FULL_RESYNC,
+        "the FullResync barrier must be the LAST frame on the wire"
+    );
+}
+
+// #5267 fail-on-revert guard for the OTHER half of the fix: parking the
+// barrier is insufficient unless its sequence allocation participates in the
+// same producer critical section as allocate+enqueue. Hold that lock from this
+// thread and prove the replay-gap path cannot allocate until it is released.
+// Removing the lock while retaining the park-and-merge code makes the worker
+// complete during the held interval and this test fail.
+#[test]
+fn test_replay_gap_seq_allocation_waits_for_producer_lock_5267() {
+    let (_daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    let shared = Arc::new(EventStreamShared::new());
+    shared.acked_seq.store(10, Ordering::Release);
+    shared.next_seq.store(13, Ordering::Release);
+
+    let producer_guard = shared
+        .producer_seq_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let worker_shared = Arc::clone(&shared);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut replay_buf = VecDeque::new();
+        let mut pending_resync = None;
+        started_tx.send(()).expect("announce replay start");
+        replay_buffered(
+            &helper_side,
+            &mut replay_buf,
+            10,
+            &worker_shared,
+            &mut pending_resync,
+        )
+        .expect("replay gap");
+        done_tx
+            .send(pending_resync.expect("gap must park a barrier").seq)
+            .expect("publish barrier seq");
+    });
+
+    started_rx.recv().expect("worker started");
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "replay-gap allocation must block while producer_seq_lock is held"
+    );
+    assert_eq!(
+        shared.next_seq.load(Ordering::Acquire),
+        13,
+        "blocked replay-gap allocation must not advance next_seq"
+    );
+
+    drop(producer_guard);
+    assert_eq!(
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replay allocation must finish after lock release"),
+        14
+    );
+    worker.join().expect("replay worker");
+}
 
 #[test]
 fn dataplane_event_budget_stays_held_after_connected_loop_drains_channel() {
@@ -132,6 +353,7 @@ fn dataplane_event_budget_stays_held_after_connected_loop_drains_channel() {
             &loop_shared,
             &mut replay_buf,
             &mut ctrl_read_buf,
+            &mut None,
             Duration::from_secs(10),
         );
         drain_remaining(&rx, &loop_shared);
