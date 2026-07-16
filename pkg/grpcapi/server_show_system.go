@@ -411,8 +411,21 @@ func (s *Server) showTask(cfg *config.Config, buf *strings.Builder) {
 	fmt.Fprintf(buf, "  Uptime: %s\n", uptime)
 }
 
-func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) {
+func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) error {
 	if s.dp != nil {
+		// #5782: this render ends with a full v4+v6 SessionCount() table walk
+		// (same per-bucket BPF-map lock contention as the session read-scans).
+		// Gate the whole render through the shared diagcmd.SessionWalkLimiter and
+		// fail fast with ResourceExhausted on contention — the same mechanism
+		// sessions-top and the GetSessions RPCs use (ShowText returns this
+		// verbatim) — so a `show system buffers` scrape flood cannot drive
+		// unbounded concurrent table walks.
+		release, err := sessionWalkLimiter.Acquire()
+		if err != nil {
+			return status.Error(codes.ResourceExhausted,
+				"session scan concurrency limit reached; retry shortly")
+		}
+		defer release()
 		if provider, ok := s.dp.(userspaceStatusProvider); ok {
 			status, err := provider.Status()
 			if err != nil {
@@ -464,10 +477,18 @@ func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) {
 	} else {
 		buf.WriteString("Dataplane not loaded\n")
 	}
+	return nil
 }
 
-func (s *Server) showBuffersDetail(cfg *config.Config, buf *strings.Builder) {
+func (s *Server) showBuffersDetail(cfg *config.Config, buf *strings.Builder) error {
 	if s.dp != nil {
+		// #5782: same full-table SessionCount() walk gate as showBuffers.
+		release, err := sessionWalkLimiter.Acquire()
+		if err != nil {
+			return status.Error(codes.ResourceExhausted,
+				"session scan concurrency limit reached; retry shortly")
+		}
+		defer release()
 		if provider, ok := s.dp.(userspaceStatusProvider); ok {
 			status, err := provider.Status()
 			if err != nil {
@@ -532,6 +553,7 @@ func (s *Server) showBuffersDetail(cfg *config.Config, buf *strings.Builder) {
 	} else {
 		buf.WriteString("Dataplane not loaded\n")
 	}
+	return nil
 }
 
 func (s *Server) showBackupRouter(cfg *config.Config, buf *strings.Builder) {

@@ -32,6 +32,18 @@ func (s *Server) GetStatus(_ context.Context, _ *pb.GetStatusRequest) (*pb.GetSt
 	// this reported 0 sessions on every real deployment. SessionCount counts
 	// forward entries only, so it is the live session total.
 	if s.dp != nil && s.dp.IsLoaded() {
+		// #5782: SessionCount() is a full v4+v6 session-map iteration holding the
+		// per-bucket BPF-map locks for O(table) — the SAME lock-contention DoS
+		// class #5708 bounded for the session read-scans, reachable UNGATED here.
+		// Gate it through the shared diagcmd.SessionWalkLimiter (the same instance
+		// the GetSessions/sessions-top scans use); on contention fail fast with
+		// ResourceExhausted rather than driving another concurrent full-table walk.
+		release, err := sessionWalkLimiter.Acquire()
+		if err != nil {
+			return nil, status.Error(codes.ResourceExhausted,
+				"session scan concurrency limit reached; retry shortly")
+		}
+		defer release() // idempotent; released on panic too (limiter contract)
 		v4, v6 := s.dp.SessionCount()
 		resp.SessionCount = int32(v4 + v6)
 	}
