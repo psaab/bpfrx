@@ -412,11 +412,36 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   and the trusted-empty result is returned only when every existing file in the
   set validates AND the merged active set is empty. `readSyncLeasesViaMemfile`
   (the HA lease-sync fallback) inherits the union through `parseActiveLeases`.
-  RESIDUAL (deferred to a follow-up, tracked on #5796): this reads the on-disk
-  LFC set coherently for the common phases, but does not yet prefer the live
-  `lease_cmds` control socket over the journal in every consumer, nor
-  crash-interrupted-cleanup generation proofs (`.output`/`.completed` mid-move),
-  nor a degraded-source banner on the display surfaces (issue invariants 2/3/8).
+  The #5796 residual invariants 2/3/8 are now CLOSED (#5938):
+  - **Invariant 2 — live `lease_cmds` socket preference (display):** when the
+    `lease_cmds` hook is EXPECTED (lease-sync enabled), the display path
+    (`getDisplayLeases` → `GetLeasesWithSource{4,6}`, `lease_source.go`) queries
+    the authoritative live lease DB (`lease{4,6}-get-all` over the control
+    socket, reusing the HA-sync `keaControl` plumbing) and only falls back to the
+    memfile file set when the socket is unavailable. On a box WITHOUT the hook the
+    memfile is the normal source, so a memfile read there is NOT flagged degraded.
+    (The HA-sync `getSyncLeases` already preferred the socket; this extends the
+    same discipline to the display.)
+  - **Invariant 3 — crash-interrupted-cleanup safety:** the reader IGNORES
+    kea-lfc's `.output`/`.completed` intermediates. This is proven safe by an
+    exact argument (documented at `keaLFCLeaseFilePaths`, `lease_lfc.go`): every
+    lease reachable through `.output` is a subset of `.1 ∪ .2` (kea-lfc builds
+    `.output` by merging them) which the reader already ingests, and the atomic
+    `.output → .2` swap means no active lease is ever reachable ONLY through an
+    intermediate — so a torn cleanup never presents a stale-yet-authoritative set.
+    No generation protocol is needed for this read-only path. Pinned by
+    `TestKeaLFCIntermediatesIgnored_5938`.
+  - **Invariant 8 — degraded-source display banner:** a `LeaseSource`
+    (`lease_source.go`) is threaded from the read to the authoritative gRPC
+    `show dhcp server` handler; when the source is degraded — the expected live
+    socket was unavailable (memfile fallback in use) OR a present LFC sibling was
+    unreadable and skipped — a one-line banner is printed above the lease table so
+    a partial display is never mistaken for a healthy empty set. The memfile
+    file-set read on the display path is now degrade-TOLERANT
+    (`parseLeaseCSVDegradable`): an unreadable sibling is skipped (recorded) rather
+    than blanking the whole show. (The interactive-CLI local path keeps its #4908
+    read-error warning; the socket preference does not apply to its throwaway
+    manager, which has no hook context.)
 - **Hostname normalization** — `deriveFQDN` / `finalizeFQDN`
   (`ddns_hostname.go`) ALWAYS contains the published name in the configured
   zone: the client picks the host part, the firewall picks the domain. A

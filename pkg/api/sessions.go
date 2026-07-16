@@ -811,9 +811,23 @@ func (s *Server) clearSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
+	// Chunked clear-all is NON-atomic (#5882): ClearAllSessions clears the
+	// IPv4 table then the IPv6 table, so a failure can leave IPv4 already
+	// deleted while returning PARTIAL v4/v6 counts alongside the error.
+	// Surface those counts (with a Failures>0 / FailureSummary marker)
+	// instead of discarding them behind a bare HTTP 500 — mirroring the
+	// gRPC ClearSessions clear-all branch and the HA-delegated path above,
+	// so an operator learns what was actually revoked and whether a retry
+	// need only target the unfinished family.
 	v4, v6, err := s.dp.ClearAllSessions()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeOK(w, ClearSessionsResult{
+			IPv4Cleared:    v4,
+			IPv6Cleared:    v6,
+			NodeID:         s.nodeID(),
+			Failures:       1,
+			FailureSummary: "clear-all: " + err.Error(),
+		})
 		return
 	}
 	writeOK(w, ClearSessionsResult{IPv4Cleared: v4, IPv6Cleared: v6, NodeID: s.nodeID()})
