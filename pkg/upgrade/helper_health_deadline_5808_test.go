@@ -16,6 +16,38 @@ import (
 // status query, and the poll wait — so a wedged systemctl / hung DBus can never
 // strand the post-flip cutover past the rollback deadline.
 
+// gateBudget bounds how long a synchronous readiness-gate call may take before
+// the test declares a HANG (#5916 Gap 1). The #5808 fix makes the gate return
+// at its ~100ms test deadline; the elapsed-time assertions in each test already
+// catch a DEADLINE-OVERSHOOT regression (a gate that returns LATE) at 2-5s. This
+// budget sits above those (so it never preempts the more specific overshoot
+// message) yet well below the suite -timeout, so a loop-ctx-UNBOUNDED regression
+// (the gate that NEVER returns) surfaces as a clean bounded t.Fatal here instead
+// of a `panic: test timed out` hang.
+const gateBudget = 10 * time.Second
+
+// runGateBoundedOrFatal runs a synchronous readiness-gate call (HelperHealthProbe
+// / Runner.Run) in a goroutine and t.Fatal's FAST if it does not return within
+// gateBudget, so a loop-ctx-unbounded regression fails cleanly rather than
+// hanging the suite (#5916 Gap 1). On the normal path it is transparent: it
+// returns the gate's error, and the caller's own elapsed/error assertions run
+// unchanged. The channel send→receive orders the gate goroutine's writes (e.g. a
+// status-timeout recorder) before the caller reads them.
+func runGateBoundedOrFatal(t *testing.T, fn func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(gateBudget):
+		t.Fatalf("readiness gate did not return within %v — a loop-ctx-unbounded regression would "+
+			"strand the post-flip cutover past the deadline (#5916 Gap 1); failing FAST instead of "+
+			"hanging to the suite -timeout", gateBudget)
+		return nil // unreachable (t.Fatalf ends the test goroutine)
+	}
+}
+
 // writeFakeSystemctl installs a `systemctl` on PATH that sleeps far longer than
 // any test deadline, modelling a wedged is-active / hung DBus. exec.CommandContext
 // must KILL it at the deadline.
@@ -66,6 +98,46 @@ func TestUnitActive_WedgedSystemctlKilledByDeadline_5808(t *testing.T) {
 	}
 }
 
+// writeFakeSystemctlInactive installs a `systemctl` that models an INACTIVE unit:
+// `systemctl is-active` prints the state word to stdout and EXITS NON-ZERO (3),
+// the real systemd contract for inactive/failed/activating (#5916 Gap 2).
+func writeFakeSystemctlInactive(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("fake systemctl relies on a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho inactive\nexit 3\n"
+	path := filepath.Join(dir, "systemctl")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestUnitActive_DefinitiveInactive_5916 covers the branch writeFakeSystemctl's
+// wedge case never exercised: an `is-active` NON-ZERO exit (3) with a recognized
+// state word on stdout is a DEFINITIVE not-active answer (active=false, err=nil),
+// NOT a command failure. It pins the deliberately-added distinction in
+// unitActiveProbeCtx (system_linux.go): `errors.As(err, &ee) && state != "" →
+// state == "active"`.
+//
+// FAIL-ON-REVERT: drop the ExitError-with-state branch so an is-active exit-3
+// falls through to `return false, err` — UnitActive then returns a non-nil error
+// for a plainly-inactive unit and this test REDs.
+func TestUnitActive_DefinitiveInactive_5916(t *testing.T) {
+	writeFakeSystemctlInactive(t)
+
+	active, err := UnitActive(context.Background(), "xpfd")
+	if err != nil {
+		t.Fatalf("systemctl is-active exit-3 with a state word (inactive) is a DEFINITIVE answer, "+
+			"not a command failure — want (false, nil), got err %v", err)
+	}
+	if active {
+		t.Fatal("an inactive unit must report active=false")
+	}
+}
+
 // baseDeadlineDeps returns deps whose unit-active + status + exe are all
 // injectable seams (no real systemd), with the version-dir tie satisfied.
 func baseDeadlineDeps(t *testing.T, statusTimeoutRecorder *time.Duration) HelperHealthDeps {
@@ -101,7 +173,7 @@ func TestHelperHealth_StatusTimeoutBoundedByRemaining_5808(t *testing.T) {
 	deps.PollInterval = 5 * time.Millisecond
 
 	const deadline = 120 * time.Millisecond
-	err := HelperHealthProbe(deps)("9.9.9", deadline)
+	err := runGateBoundedOrFatal(t, func() error { return HelperHealthProbe(deps)("9.9.9", deadline) })
 	if err == nil {
 		t.Fatal("gate must fail closed (helper not forwarding)")
 	}
@@ -124,7 +196,7 @@ func TestHelperHealth_PollDoesNotOvershootDeadline_5808(t *testing.T) {
 
 	const deadline = 120 * time.Millisecond
 	start := time.Now()
-	err := HelperHealthProbe(deps)("9.9.9", deadline)
+	err := runGateBoundedOrFatal(t, func() error { return HelperHealthProbe(deps)("9.9.9", deadline) })
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -159,7 +231,7 @@ func TestHelperHealth_WedgedProbeReleasedAtDeadline_5808(t *testing.T) {
 
 	const deadline = 100 * time.Millisecond
 	start := time.Now()
-	err := HelperHealthProbe(deps)("9.9.9", deadline)
+	err := runGateBoundedOrFatal(t, func() error { return HelperHealthProbe(deps)("9.9.9", deadline) })
 	elapsed := time.Since(start)
 
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
@@ -216,7 +288,7 @@ func TestCutover_WedgedHealthProbeBoundedRollbackAndFence_5808(t *testing.T) {
 		}
 		fs.healthProbe = wedgedHealthProbe()
 		start := time.Now()
-		err = r.Run(opts)
+		err = runGateBoundedOrFatal(t, func() error { return r.Run(opts) })
 		elapsed = time.Since(start)
 		cur, _ := os.Readlink(filepath.Join(cfg.VersionsDir, "current"))
 		return err, elapsed, filepath.Base(cur)
