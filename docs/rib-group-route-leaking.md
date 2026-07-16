@@ -120,8 +120,13 @@ republish (and the ip-monitoring actuator) then pass that new `cfg`. The publish
 therefore **refuses** (`routeOnlyPublishHybrid`) whenever `cfg` is not the
 config `m.lastSnapshot` was compiled from — pointer-identical in every
 legitimate route-only publish (`store.ActiveConfig()` == the object handed to
-`ApplyConfig`), with a `reflect.DeepEqual` fallback so a distinct-but-equal
-config is never falsely refused. On refusal the old, fully-consistent snapshot
+`ApplyConfig`), with a JSON serialize-and-compare content-equality fallback
+(`configsContentEqual` — the same encoding shipped to userspace-dp on every
+`apply_snapshot`) so a distinct-but-equal config is never falsely refused. The
+fallback compares serialized bytes rather than using `reflect.DeepEqual`, which
+keeps `pkg/dataplane/userspace` free of `reflect`/`unsafe` per the
+retirement-boundary canary (`TestUserspaceManagerDoesNotImportReflectOrUnsafe`,
+#5985). On refusal the old, fully-consistent snapshot
 stays live, the desired-overlay cache stays at its baseline (the #3760
 mutate-after-success contract), and the caller reconverges once a full apply
 republishes the policy (`reconcileRouteLeakSnapshot` warns; the ip-monitoring

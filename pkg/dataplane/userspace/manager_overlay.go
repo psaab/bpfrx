@@ -1,9 +1,10 @@
 package userspace
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log/slog"
-	"reflect"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -244,9 +245,9 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 // Nil applied (no established policy identity — e.g. the config-less bootstrap
 // snapshot) is not a hybrid: there is no policy identity to violate. Pointer
 // identity is the common legitimate case and the cheap fast path; the
-// reflect.DeepEqual fallback ensures a distinct-but-content-equal config is
-// accepted (never a false refusal) while a genuinely divergent config is
-// refused.
+// content-equality fallback (configsContentEqual) ensures a distinct-but-
+// content-equal config is accepted (never a false refusal) while a genuinely
+// divergent config is refused.
 func routeOnlyPublishHybrid(cfg, applied *config.Config) bool {
 	if applied == nil {
 		return false
@@ -254,5 +255,35 @@ func routeOnlyPublishHybrid(cfg, applied *config.Config) bool {
 	if cfg == applied {
 		return false
 	}
-	return !reflect.DeepEqual(cfg, applied)
+	return !configsContentEqual(cfg, applied)
+}
+
+// configsContentEqual reports whether two configs produce the same dataplane
+// snapshot, by comparing the JSON encodings the control plane already ships to
+// userspace-dp: ConfigSnapshot.Config is marshaled verbatim on every
+// apply_snapshot (process_control.go), and the config store persists the same
+// tree as JSON. Byte-equality of those encodings therefore means "content-equal
+// for forwarding purposes" — exactly the notion routeOnlyPublishHybrid needs.
+//
+// This replaces a former reflect.DeepEqual so the userspace package stays free
+// of reflect/unsafe (retirement-boundary canary, #5985 /
+// TestUserspaceManagerDoesNotImportReflectOrUnsafe). The semantics are
+// preserved: two configs that DeepEqual serialize to identical JSON (Go sorts
+// map keys, so the encoding is deterministic), and any JSON-visible divergence
+// yields a mismatch.
+//
+// A marshal error is never observed in practice — the very same object is
+// marshaled to the helper on each apply — but if one occurred we cannot prove
+// content-equality, so we report NOT equal and let the hybrid-ACK guard fail
+// closed (refuse the publish, per #5680) rather than risk ACK'ing a hybrid.
+func configsContentEqual(a, b *config.Config) bool {
+	ab, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	bb, err := json.Marshal(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(ab, bb)
 }
