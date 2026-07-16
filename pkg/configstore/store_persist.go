@@ -207,6 +207,7 @@ func (s *Store) recoverPendingConfirmLocked() {
 		}
 		if s.candidate != nil {
 			s.candidate = s.active.Clone()
+			s.bumpCandidateGenLocked() // #5848: candidate reset by confirm-recovery rollback
 		}
 		if perr == nil {
 			// #5835: durable-or-retry removal — a failed DeleteConfirm retains

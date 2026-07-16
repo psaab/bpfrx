@@ -17,6 +17,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/eventengine"
@@ -76,7 +77,14 @@ func (d *Daemon) bootstrapFromFile() error {
 	// the day-0 import committed unchecked and the box could come up
 	// console-only from the very first boot. Refusing to commit here leaves
 	// the daemon in the lifeline-safe bootstrap state instead.
-	if cand, err := d.store.CompileCandidate(); err == nil {
+	// #5848: snapshot the candidate generation with the compile so the promotion
+	// below is bound to the EXACT candidate this pre-flight examined. Bootstrap
+	// runs single-threaded before the gRPC/HTTP servers start, so no concurrent
+	// candidate edit can occur and the generation always matches — this is
+	// belt-and-suspenders that keeps the examined-equals-promoted invariant
+	// uniform with the operator commit paths (commitWithGenBinding).
+	cand, gen, cerr := d.store.CompileCandidateGen()
+	if cerr == nil {
 		if perr := d.deviceMapCommitPreflight(cand, nil); perr != nil {
 			d.store.ExitConfigure()
 			slog.Error("bootstrap config REJECTED: its device-map would strand management on next "+
@@ -85,7 +93,7 @@ func (d *Daemon) bootstrapFromFile() error {
 			return fmt.Errorf("bootstrap device-map preflight: %w", perr)
 		}
 	}
-	if _, err := d.store.Commit(); err != nil {
+	if _, err := d.store.CommitWithDescriptionGen("", gen); err != nil {
 		d.store.ExitConfigure()
 		return fmt.Errorf("commit: %w", err)
 	}
@@ -229,6 +237,70 @@ func (d *Daemon) factoryReset(ctx context.Context, wipe func() error) error {
 	return nil
 }
 
+// maxCommitPreflightRetries bounds how many times commitWithGenBinding
+// re-snapshots + re-pre-flights + re-attempts a promotion when a concurrent
+// candidate edit invalidates the examined generation (#5848). A handful of
+// retries absorbs an operator/automation edit racing a commit; if the candidate
+// keeps changing under us we surface the conflict rather than spin forever, so
+// the REST/gRPC caller can retry the whole commit.
+const maxCommitPreflightRetries = 3
+
+// commitWithGenBinding runs the #5848 generation-bound commit transaction so
+// the candidate examined by the external #1956 device-map hardware pre-flight is
+// EXACTLY the candidate the store promotes — never a different one substituted
+// by a concurrent REST/CLI candidate edit (set/delete/load/rollback), which do
+// NOT take the apply semaphore.
+//
+// Each attempt: snapshot+compile the candidate and read its generation token
+// atomically (CompileCandidateGen); run the caller's preflight on that immutable
+// compiled snapshot OUTSIDE the store lock (s.mu is NOT held across netlink /
+// hardware probing); then commit bound to the snapshot generation. If a
+// candidate edit landed in between, the generation-checked commit returns
+// ErrCandidateGenerationConflict and we retry against the fresh generation
+// (bounded). commitFn performs the generation-checked promotion
+// (CommitWithDescriptionGen / CommitConfirmedGen).
+//
+// A snapshot that fails to compile (not in configuration mode / commit-check
+// error) skips the pre-flight — there is nothing to examine — but STILL
+// gen-binds the commit: a concurrent edit that turns a non-compiling candidate
+// into a valid, management-stranding one cannot be promoted unexamined; the
+// bound commit conflicts and the retry re-pre-flights it. When the candidate is
+// unchanged, the bound commit recompiles under the lock and surfaces the SAME
+// compile/mode error the pre-#5848 path did.
+//
+// Caller holds d.applySem. Returns the pre-commit active config (for the #4234
+// deletion-clear diff) and the compiled promoted config.
+func (d *Daemon) commitWithGenBinding(
+	preflight func(cand *config.Config) error,
+	commitFn func(expectedGen uint64) (*config.Config, error),
+) (oldActive, compiled *config.Config, err error) {
+	for attempt := 0; ; attempt++ {
+		cand, gen, cerr := d.store.CompileCandidateGen()
+		if cerr == nil {
+			// Run the hardware pre-flight on the exact compiled snapshot,
+			// OUTSIDE the store lock (CompileCandidateGen already released it).
+			if perr := preflight(cand); perr != nil {
+				return nil, nil, perr
+			}
+		}
+		// Capture the pre-commit active config right before the promotion so
+		// applyAndSyncCommitted can diff deleted policies (#4234). Active only
+		// changes under d.applySem (held here), so it is stable across the
+		// transaction.
+		oldActive = d.store.ActiveConfig()
+		compiled, err = commitFn(gen)
+		if err == nil {
+			return oldActive, compiled, nil
+		}
+		if errors.Is(err, configstore.ErrCandidateGenerationConflict) && attempt < maxCommitPreflightRetries {
+			slog.Warn("commit: candidate configuration changed during pre-flight; re-validating on the new generation",
+				"attempt", attempt+1)
+			continue
+		}
+		return nil, nil, err
+	}
+}
+
 // commitAndApply atomically promotes the candidate config and
 // applies it. Holds applySem across configstore.Commit and
 // applyConfigLocked so two concurrent committers can't interleave
@@ -285,29 +357,19 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 		return nil, errDaemonResetting
 	}
 
-	// #1956 R-8 device-map pre-flight: reject a candidate whose device-map
-	// would strand management on next boot, while the operator is still
-	// connected and BEFORE the store promotes it. Runs under applySem (after
-	// Acquire) but before Commit, so a reject never leaves a promoted store.
-	// Plain commit has no auto-rollback target, so pass nil.
-	if cand, err := d.store.CompileCandidate(); err == nil {
-		if err := d.deviceMapCommitPreflight(cand, nil); err != nil {
-			return nil, err
-		}
-	}
-
-	// Capture the pre-commit active config BEFORE Commit promotes the candidate,
-	// so applyAndSyncCommitted can diff it against the new config and clear the
-	// sessions of any deleted policy (#4234).
-	oldActive := d.store.ActiveConfig()
-
-	var compiled *config.Config
-	var err error
-	if comment != "" {
-		compiled, err = d.store.CommitWithDescription(comment)
-	} else {
-		compiled, err = d.store.Commit()
-	}
+	// #5848 generation-bound commit transaction. The #1956 R-8 device-map
+	// pre-flight (reject a candidate whose device-map would strand management on
+	// next boot, while the operator is still connected) and the store promotion
+	// used to be two separately-locked ops, so a concurrent REST/CLI candidate
+	// edit could land between them and the daemon would promote a candidate it
+	// never pre-flighted. commitWithGenBinding binds the examined generation to
+	// the promoted generation: the pre-flighted candidate is the one promoted, or
+	// the commit conflicts and re-validates. Plain commit has no auto-rollback
+	// target, so the pre-flight passes nil.
+	oldActive, compiled, err := d.commitWithGenBinding(
+		func(cand *config.Config) error { return d.deviceMapCommitPreflight(cand, nil) },
+		func(gen uint64) (*config.Config, error) { return d.store.CommitWithDescriptionGen(comment, gen) },
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -506,23 +568,23 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 		return nil, errDaemonResetting
 	}
 
-	// #1956 R-8/V-3 device-map pre-flight: validate BOTH the candidate AND
-	// the rollback target (the currently-active config, restored on a
-	// confirmed-commit timeout) against present hardware. If EITHER would
-	// strand management on next boot, reject while the operator is still
-	// connected — so when a timeout fires the target is KNOWN-safe and is
-	// applied UNCONDITIONALLY (OQ-15.2, no rollback-time abort). Runs under
-	// applySem before Commit, so a reject never leaves a promoted store.
-	if cand, err := d.store.CompileCandidate(); err == nil {
-		if err := d.deviceMapCommitPreflight(cand, d.store.ActiveConfig()); err != nil {
-			return nil, err
-		}
-	}
-
-	// Pre-commit active config for the #4234 deletion-clear (see commitAndApply).
-	oldActive := d.store.ActiveConfig()
-
-	compiled, err := d.store.CommitConfirmed(minutes)
+	// #5848 generation-bound commit transaction (commit-confirmed variant).
+	// #1956 R-8/V-3 device-map pre-flight: validate BOTH the candidate AND the
+	// rollback target (the currently-active config, restored on a confirmed-commit
+	// timeout) against present hardware. If EITHER would strand management on next
+	// boot, reject while the operator is still connected — so when a timeout fires
+	// the target is KNOWN-safe and is applied UNCONDITIONALLY (OQ-15.2, no
+	// rollback-time abort). The pre-flight and the promotion are now bound to one
+	// candidate generation, so a concurrent candidate edit cannot slip a different
+	// candidate into the promotion after the pre-flight cleared the examined one.
+	// The rollback target (active) is stable across the transaction: it changes
+	// only under d.applySem, held here from pre-flight through the commit.
+	oldActive, compiled, err := d.commitWithGenBinding(
+		func(cand *config.Config) error {
+			return d.deviceMapCommitPreflight(cand, d.store.ActiveConfig())
+		},
+		func(gen uint64) (*config.Config, error) { return d.store.CommitConfirmedGen(minutes, gen) },
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -266,6 +266,55 @@ inline archive-site passwords).
 
 `pkg/config` only.
 
+## Generation-bound commit transaction (#5848)
+
+Candidate compilation/pre-flight and candidate promotion are two separately
+locked store operations. `CompileCandidate`/`CommitCheck` take only
+`s.mu.RLock`; `CommitWithDescription`/`CommitConfirmed` separately take
+`s.mu.Lock` and recompile the *then-current* `s.candidate`. The daemon's
+commit path uses that gap to run an EXTERNAL pre-flight the store cannot do
+itself — the #1956 device-map management-lockout gate, which resolves the
+proposed config against LIVE hardware while the operator is still connected.
+Candidate mutations (`Set`/`Delete`/`LoadOverride`/`LoadMerge`/`LoadSet`/
+`Deactivate`/`Activate`/`Copy`/`Rename`/`Insert`/`Annotate`/`Rollback`) do
+NOT take the daemon apply semaphore, and REST/internal callers pass
+`sessionID == ""` which bypasses config-lock holder enforcement. So a
+concurrent edit could land between the daemon's pre-flight of candidate C1 and
+`Commit`'s promotion, and the daemon would persist+apply an unexamined C2 — a
+management-lockout-gate bypass (examined generation != promoted generation).
+
+The fix is a monotonic **candidate generation token** (`candidateGen`, bumped
+via `bumpCandidateGenLocked` under `s.mu.Lock` at EVERY candidate change:
+mutation, load, rollback, enter/exit/reclaim config mode, the peer-sync reset,
+and the post-commit reset — a table-driven test asserts each mutating op bumps
+it) plus a generation-bound commit path:
+
+- `CompileCandidateGen() (*config.Config, uint64, error)` — compiles the
+  candidate AND reads the generation under ONE `RLock`, so the compiled
+  snapshot and the token are a consistent pair. The daemon runs its hardware
+  pre-flight on that immutable snapshot OUTSIDE the store lock (`s.mu` is never
+  held across netlink/hardware probing).
+- `CommitWithDescriptionGen(desc, expectedGen)` / `CommitConfirmedGen(minutes,
+  expectedGen)` — promote ONLY if `candidateGen == expectedGen`, else return
+  `ErrCandidateGenerationConflict` without mutating any state. The plain
+  `CommitWithDescription`/`CommitConfirmed` remain for the direct callers (CLI,
+  event-engine) that perform no external pre-flight.
+
+The daemon (`commitWithGenBinding`, `pkg/daemon/daemon_apply.go`) snapshots →
+pre-flights → commits bound to the snapshot generation, retrying the whole
+sequence a bounded number of times on conflict and surfacing the conflict to
+the REST/gRPC caller if the candidate keeps changing. The token is
+**authoritative over content**: a candidate edited and reverted to
+byte-identical bytes still yields a new token, so the conservative outcome is a
+conflict/retry — never a silent substitution. The rollback target for
+commit-confirmed (the active config) is stable across the transaction because
+every path that mutates `active` runs under the daemon apply semaphore the
+commit path holds from pre-flight through promotion.
+
+Scope: REST configuration-session identity / ETag semantics remain a separate
+follow-up; generation binding is the invariant required even for
+same-session/internal concurrent callers.
+
 ## Persist-failure semantics (#1799)
 
 A `db.WriteActive` failure used to be non-fatal everywhere (one-shot

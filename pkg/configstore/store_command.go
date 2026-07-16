@@ -32,7 +32,8 @@ func (s *Store) SetAs(sessionID string, path []string) error {
 	if err := s.candidate.SetPath(path); err != nil {
 		return err
 	}
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
 }
@@ -71,7 +72,8 @@ func (s *Store) DeleteAs(sessionID string, path []string) error {
 	if err := s.candidate.DeletePath(path); err != nil {
 		return err
 	}
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
 }
@@ -121,7 +123,8 @@ func (s *Store) DeactivateFromInputAs(sessionID, input string) error {
 	if err := applyEditLine(s.candidate, "deactivate "+input); err != nil {
 		return err
 	}
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
 }
@@ -151,7 +154,8 @@ func (s *Store) ActivateFromInputAs(sessionID, input string) error {
 	if err := applyEditLine(s.candidate, "activate "+input); err != nil {
 		return err
 	}
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
 }
@@ -175,7 +179,8 @@ func (s *Store) CopyAs(sessionID string, srcPath, dstPath []string) error {
 	if err := s.candidate.CopyPath(srcPath, dstPath); err != nil {
 		return err
 	}
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
 }
@@ -199,7 +204,8 @@ func (s *Store) RenameAs(sessionID string, srcPath, dstPath []string) error {
 	if err := s.candidate.RenamePath(srcPath, dstPath); err != nil {
 		return err
 	}
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
 }
@@ -232,7 +238,8 @@ func (s *Store) InsertAs(sessionID string, elementPath, refPath []string, before
 	if err != nil {
 		return err
 	}
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
 }
@@ -288,7 +295,8 @@ func (s *Store) AnnotateAs(sessionID string, path []string, comment string) erro
 	if err := s.candidate.AnnotatePath(path, comment); err != nil {
 		return err
 	}
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
 }
@@ -321,7 +329,8 @@ func (s *Store) LoadOverrideAs(sessionID, content string) error {
 	}
 
 	s.candidate = tree
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
 }
@@ -415,7 +424,8 @@ func (s *Store) LoadMergeAs(sessionID, content string) error {
 	}
 
 	s.candidate = working
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
 }
@@ -538,7 +548,8 @@ func (s *Store) LoadSetAs(sessionID, content string) (int, error) {
 		count++
 	}
 	s.candidate = working
-	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
+	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
+	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return count, nil
 }
