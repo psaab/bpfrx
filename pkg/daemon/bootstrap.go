@@ -310,7 +310,15 @@ func (d *Daemon) exitBootstrapMode(reason string) {
 // Renames persist deliberately — reverting them would link-cycle a degraded
 // box for cosmetic benefit. Post-rollback state = renamed NICs + lifeline
 // fxp0 .network + zero config-driven claims. The caller holds d.applySem.
-func (d *Daemon) enterBootstrapMode() {
+//
+// #5868: the teardown is best-effort — every step is ATTEMPTED regardless of
+// earlier failures — but failures are NO LONGER discarded. Each failing step
+// is logged at ERROR with its name, and the aggregated error is returned to
+// the caller. When any step fails the daemon reports the rollback as DEGRADED
+// (config-driven takeover state may remain PARTIALLY live) rather than
+// falsely logging "rollback complete". A nil return means every step
+// converged and the box is cleanly back in bootstrap mode.
+func (d *Daemon) enterBootstrapMode() error {
 	d.bootstrapMode.Store(true)
 
 	// #2114: stop and DISCARD the NAT pool-alarm monitor. It may have been
@@ -325,21 +333,99 @@ func (d *Daemon) enterBootstrapMode() {
 	// no-op when no monitor is running). Runs under the caller's d.applySem.
 	d.stopAndDiscardNATPoolAlarm()
 
-	// Test seam: when the apply body is stubbed (unit tests), skip the
-	// real filesystem / networkctl / FRR / dataplane teardown — those touch
-	// /etc/systemd/network and run external commands. The flag flip above is
-	// the observable behavior under test.
-	if d.applyBodyForTest != nil {
-		return
+	var steps []bootstrapTeardownStep
+	switch {
+	case d.bootstrapTeardownForTest != nil:
+		// #5868 test seam: inject synthetic per-step outcomes to exercise the
+		// aggregation + honest-reporting wiring below without touching the
+		// real filesystem / networkctl / FRR / dataplane.
+		steps = d.bootstrapTeardownForTest()
+	case d.applyBodyForTest != nil:
+		// Existing unit-test seam (#2114 et al.): when the apply body is
+		// stubbed, skip the real fs / networkctl / FRR / dataplane teardown —
+		// those touch /etc/systemd/network and run external commands. No steps
+		// executed ⇒ the rollback summarizes as clean, matching what those
+		// tests expect. The bootstrap-mode flip above is the observable
+		// behavior under test.
+	default:
+		steps = d.runBootstrapTeardownSteps()
 	}
+
+	// #5868: aggregate the per-step outcomes and report HONESTLY. A partial
+	// teardown must never be logged/returned as a clean rollback.
+	aggErr, degraded := summarizeBootstrapTeardown(steps)
+	if degraded {
+		for _, s := range steps {
+			if s.err != nil {
+				slog.Error("bootstrap rollback: teardown step FAILED",
+					"step", s.name, "err", s.err)
+			}
+		}
+		slog.Error("bootstrap rollback DEGRADED: one or more teardown steps failed; the "+
+			"management lifeline is preserved but config-driven takeover state "+
+			"(networkd/FRR/dataplane) may remain PARTIALLY LIVE — the config rolled back "+
+			"FROM is not fully retired. 'commit confirmed' a corrected config and verify "+
+			"interfaces/routes/dataplane are clean",
+			"err", aggErr)
+		return aggErr
+	}
+
+	slog.Warn("bootstrap rollback complete: takeover removed, management lifeline preserved; " +
+		"system is back in bootstrap mode — 'commit confirmed' a corrected config")
+	return nil
+}
+
+// bootstrapTeardownStep records the outcome of one best-effort teardown step
+// in the first-confirmed-commit bootstrap rollback (#5868). name identifies
+// the step for attributable logging; err is non-nil when that step did not
+// converge. Every step is ATTEMPTED regardless of earlier failures.
+type bootstrapTeardownStep struct {
+	name string
+	err  error
+}
+
+// summarizeBootstrapTeardown aggregates the per-step outcomes of a bootstrap
+// rollback teardown (#5868). It returns a joined error naming every failed
+// step (nil when all steps converged) and a degraded flag. degraded is true
+// iff any step failed. The caller MUST report the rollback as DEGRADED and
+// MUST NOT log or persist "rollback complete" while degraded is true — a
+// partial teardown leaves config-driven takeover state (networkd/FRR/
+// dataplane) potentially live.
+func summarizeBootstrapTeardown(steps []bootstrapTeardownStep) (err error, degraded bool) {
+	var errs []error
+	for _, s := range steps {
+		if s.err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", s.name, s.err))
+		}
+	}
+	if len(errs) == 0 {
+		return nil, false
+	}
+	return errors.Join(errs...), true
+}
+
+// runBootstrapTeardownSteps performs the real, best-effort teardown of the
+// first-confirmed-commit bootstrap rollback (#5868) and returns the per-step
+// outcomes for the caller to aggregate. EVERY step is attempted regardless of
+// earlier failures — a bootstrap rollback tears down as much as it can — but
+// failures are captured (not discarded) so the caller can report DEGRADED.
+// Runs under the caller's d.applySem.
+func (d *Daemon) runBootstrapTeardownSteps() []bootstrapTeardownStep {
+	steps := make([]bootstrapTeardownStep, 0, 3)
 
 	// (2) Remove xpf-written takeover .network files (NOT the lifeline fxp0
 	// .network and NOT the .link rename files — those keep mgmt reachable and
 	// the rename stable). The lifeline .network is the bootstrap fxp0 file.
 	lifelineNetwork := linkPrefix + "fxp0.network"
 	entries, err := os.ReadDir(linkDir)
-	if err == nil {
+	if err != nil {
+		// The directory could not be enumerated — the takeover .network files
+		// (if any) are NOT removed. Surface it; still attempt FRR + dataplane
+		// teardown below.
+		steps = append(steps, bootstrapTeardownStep{name: "read link dir", err: err})
+	} else {
 		removed := false
+		var rmErrs []error
 		for _, e := range entries {
 			name := e.Name()
 			if !strings.HasPrefix(name, linkPrefix) {
@@ -350,15 +436,26 @@ func (d *Daemon) enterBootstrapMode() {
 				continue
 			}
 			if strings.HasSuffix(name, ".network") {
-				if err := os.Remove(filepath.Join(linkDir, name)); err == nil {
-					removed = true
-					slog.Info("bootstrap rollback: removed takeover .network file", "file", name)
+				if err := os.Remove(filepath.Join(linkDir, name)); err != nil {
+					// Best-effort: record the failure and keep removing the rest.
+					rmErrs = append(rmErrs, fmt.Errorf("%s: %w", name, err))
+					continue
 				}
+				removed = true
+				slog.Info("bootstrap rollback: removed takeover .network file", "file", name)
 			}
 		}
+		if len(rmErrs) > 0 {
+			steps = append(steps, bootstrapTeardownStep{
+				name: "remove takeover .network files",
+				err:  errors.Join(rmErrs...),
+			})
+		}
+		// Reload if we removed at least one file — a partial removal still
+		// changes the desired networkd state.
 		if removed {
 			if err := networkctlReload(); err != nil {
-				slog.Warn("bootstrap rollback: networkctl reload failed", "err", err)
+				steps = append(steps, bootstrapTeardownStep{name: "networkctl reload", err: err})
 			}
 		}
 	}
@@ -366,7 +463,7 @@ func (d *Daemon) enterBootstrapMode() {
 	// (3) Clear the FRR managed section.
 	if d.frr != nil {
 		if err := d.frr.Clear(); err != nil {
-			slog.Warn("bootstrap rollback: failed to clear FRR managed section", "err", err)
+			steps = append(steps, bootstrapTeardownStep{name: "clear FRR managed section", err: err})
 		}
 	}
 
@@ -374,12 +471,11 @@ func (d *Daemon) enterBootstrapMode() {
 	// confirmed commit re-arms it via runBootstrapExitStartup.
 	if d.dp != nil {
 		if err := d.dp.Teardown(); err != nil {
-			slog.Warn("bootstrap rollback: dataplane teardown failed", "err", err)
+			steps = append(steps, bootstrapTeardownStep{name: "dataplane teardown", err: err})
 		}
 	}
 
-	slog.Warn("bootstrap rollback complete: takeover removed, management lifeline preserved; " +
-		"system is back in bootstrap mode — 'commit confirmed' a corrected config")
+	return steps
 }
 
 // clearFRRForFailClosedBoot is the #1993 fail-closed boot refinement: on a

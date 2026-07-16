@@ -676,7 +676,19 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 		// the management lifeline. Runs under d.applySem (held above).
 		slog.Warn("commit confirmed (first commit) timed out; rolling back to BOOTSTRAP mode " +
 			"(removing interface/FRR/dataplane takeover, keeping the management lifeline)")
-		d.enterBootstrapMode()
+		// #5868: enterBootstrapMode now attempts every teardown step best-effort
+		// but returns an aggregated error (and has already logged each failed
+		// step + the DEGRADED summary at ERROR) if any step did not converge.
+		// This is a fire-and-forget rollback-timer callback with no downstream
+		// success action to gate, so we do not swallow the outcome silently:
+		// re-surface it once at the rollback-decision layer so the DEGRADED
+		// state is attributable to THIS first-commit-timeout event and an
+		// operator scraping for the timeout sees the box did not come back clean.
+		if err := d.enterBootstrapMode(); err != nil {
+			slog.Error("commit-confirmed first-commit rollback to bootstrap mode is DEGRADED: "+
+				"teardown did not fully converge (see the teardown step errors above); "+
+				"config-driven takeover state may remain partially live", "err", err)
+		}
 		// #3868: no peer re-sync here. This branch reverts a FIRST commit on a
 		// fresh store to the empty tree + bootstrap mode; the reverted active
 		// carries no chassis-cluster/config-sync stanza, so syncConfigToPeer ->

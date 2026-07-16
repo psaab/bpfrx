@@ -442,6 +442,14 @@ type Daemon struct {
 	// / commitAndApply paths without standing up the full dataplane.
 	applyBodyForTest func(*config.Config)
 
+	// bootstrapTeardownForTest, when non-nil, replaces the real per-step
+	// teardown executed inside enterBootstrapMode (#5868). Test-only seam:
+	// it lets bootstrap_rollback_report_test.go inject synthetic teardown
+	// step outcomes (including failures for the FRR-clear / dataplane-teardown
+	// steps) to exercise the failure-aggregation and honest DEGRADED/complete
+	// reporting without faking the concrete netlink/FRR/dataplane owners.
+	bootstrapTeardownForTest func() []bootstrapTeardownStep
+
 	// applyErrForTest is the error the applyBodyForTest seam returns from
 	// applyConfigLocked (default nil = success). Test-only: lets a test drive
 	// commitAndApply / commitConfirmedAndApply through the real apply→sync
