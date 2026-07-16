@@ -1001,6 +1001,85 @@ func buildAfPacketMembership(ifIndex int) unix.PacketMreq {
 	}
 }
 
+// vrrpCBPFFilter returns the AF_PACKET SOCK_RAW cBPF prefilter that admits VRRP
+// adverts and kernel-drops everything else, cutting RX-goroutine wakeups on a
+// data-bearing RETH VLAN. SOCK_RAW includes the Ethernet header.
+// Protocol/next-header offsets:
+//
+//	IPv4 untagged:  ethertype 0x0800 @12, proto @23 (14+9)
+//	IPv6 untagged:  ethertype 0x86DD @12, next-hdr @20 (14+6)
+//	IPv4 single-tag: outer 0x8100/0x88a8 @12, real 0x0800 @16, proto @27 (18+9)
+//	IPv6 single-tag: outer 0x8100/0x88a8 @12, real 0x86DD @16, next-hdr @24 (18+6)
+//
+// #5088: the outer-VLAN check admits BOTH 802.1Q (0x8100) AND 802.1ad (0x88a8)
+// — a single S-tag has the identical layout (real ethertype @16), and the Go
+// receiver (parseAfPacket, instance.go) already accepts both. Before this the
+// prefilter matched only 0x8100, so on an S-tagged / provider-bridged segment
+// the kernel dropped every advert before Go saw it and BOTH nodes went mutually
+// deaf → split-brain despite the parser's advertised 802.1ad support. The kernel
+// prefilter and the userspace parser MUST admit the same encapsulation set.
+// DOUBLE-tag QinQ (0x88a8 then 0x8100, real ethertype @20) is deliberately NOT
+// admitted here because the Go parser does not decode it either (a single-tag
+// walk); the shared contract stays "untagged + single-tag {0x8100, 0x88a8}".
+//
+// IPv4 matches base proto == 112 (the IPv4 arm re-validates IHL + TTL in Go, so
+// it tolerates IPv4 options). IPv6 must additionally admit VRRP adverts carrying
+// IPv6 extension headers (#2155): the base Next-Header is then the FIRST
+// ext-header's type, not 112. A fixed-offset cBPF cannot walk an ext-header
+// chain, so the IPv6 arm matches the base Next-Header against the small set
+//
+//	{112 VRRP, 0 Hop-by-Hop, 43 Routing, 60 Dest-Opts}
+//
+// (approach A2). Fragment (44) and AH (51) are deliberately NOT admitted (VRRP
+// adverts are never fragmented or AH-wrapped). The authoritative ext-header walk
+// + proto-112 + hop-limit-255 + VRID validation happens in Go; the cBPF is only
+// an in-kernel volume reducer.
+//
+// Jump offsets (Jt/Jf) are relative to the NEXT instruction; they were recomputed
+// for the inserted 0x88a8 instruction (#5088). A bpf.VM test
+// (cbpf_8021ad_5088_test.go) runs this exact array against synthetic frames.
+func vrrpCBPFFilter() []unix.SockFilter {
+	return []unix.SockFilter{
+		{Code: 0x28, K: 12},                    //  0: ldh [12] — ethertype
+		{Code: 0x15, Jt: 8, Jf: 0, K: 0x0800},  //  1: jeq 0x0800 → 10 (check_ipv4)
+		{Code: 0x15, Jt: 15, Jf: 0, K: 0x86DD}, //  2: jeq 0x86DD → 18 (check_ipv6)
+		{Code: 0x15, Jt: 2, Jf: 0, K: 0x8100},  //  3: jeq 0x8100 → 6 (check_vlan)
+		{Code: 0x15, Jt: 1, Jf: 0, K: 0x88a8},  //  4: jeq 0x88a8 → 6 (check_vlan); else reject
+		{Code: 0x06, K: 0},                     //  5: ret reject
+		// check_vlan: single-tag (0x8100 or 0x88a8) → real ethertype @16
+		{Code: 0x28, K: 16},                    //  6: ldh [16] — real ethertype
+		{Code: 0x15, Jt: 6, Jf: 0, K: 0x0800},  //  7: jeq 0x0800 → 14 (check_ipv4_vlan)
+		{Code: 0x15, Jt: 16, Jf: 0, K: 0x86DD}, //  8: jeq 0x86DD → 25 (check_ipv6_vlan)
+		{Code: 0x06, K: 0},                     //  9: ret reject
+		// check_ipv4: proto at 14+9=23
+		{Code: 0x30, K: 23},                // 10: ldb [23]
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 11: jeq 112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 12: ret accept
+		{Code: 0x06, K: 0},                 // 13: ret reject
+		// check_ipv4_vlan: proto at 18+9=27
+		{Code: 0x30, K: 27},                // 14: ldb [27]
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 15: jeq 112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 16: ret accept
+		{Code: 0x06, K: 0},                 // 17: ret reject
+		// check_ipv6: base next-header at 14+6=20. Accept {112,0,43,60}.
+		{Code: 0x30, K: 20},                // 18: ldb [20]
+		{Code: 0x15, Jt: 4, Jf: 0, K: 112}, // 19: jeq 112 → 24 accept
+		{Code: 0x15, Jt: 3, Jf: 0, K: 0},   // 20: jeq 0   → 24 accept (Hop-by-Hop)
+		{Code: 0x15, Jt: 2, Jf: 0, K: 43},  // 21: jeq 43  → 24 accept (Routing)
+		{Code: 0x15, Jt: 1, Jf: 0, K: 60},  // 22: jeq 60  → 24 accept (Dest-Opts)
+		{Code: 0x06, K: 0},                 // 23: ret reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 24: ret accept
+		// check_ipv6_vlan: base next-header at 18+6=24. Same accept set.
+		{Code: 0x30, K: 24},                // 25: ldb [24]
+		{Code: 0x15, Jt: 4, Jf: 0, K: 112}, // 26: jeq 112 → 31 accept
+		{Code: 0x15, Jt: 3, Jf: 0, K: 0},   // 27: jeq 0   → 31 accept (Hop-by-Hop)
+		{Code: 0x15, Jt: 2, Jf: 0, K: 43},  // 28: jeq 43  → 31 accept (Routing)
+		{Code: 0x15, Jt: 1, Jf: 0, K: 60},  // 29: jeq 60  → 31 accept (Dest-Opts)
+		{Code: 0x06, K: 0},                 // 30: ret reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 31: ret accept
+	}
+}
+
 // openAfPacketReceiver opens an AF_PACKET SOCK_RAW socket bound to the
 // given interface for receiving VRRP packets. This is used on VLAN sub-
 // interfaces where raw IP sockets don't reliably receive multicast.
@@ -1068,72 +1147,10 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 		slog.Debug("vrrp: failed to set allmulti", "err", err)
 	}
 
-	// BPF filter: accept VRRP for IPv4, IPv6, and 802.1Q-tagged variants.
-	// SOCK_RAW includes the Ethernet header. Protocol/next-header offsets:
-	//   IPv4 untagged:  ethertype 0x0800 @12, proto @23 (14+9)
-	//   IPv6 untagged:  ethertype 0x86DD @12, next-hdr @20 (14+6)
-	//   IPv4 802.1Q:    ethertype 0x8100 @12, real 0x0800 @16, proto @27 (18+9)
-	//   IPv6 802.1Q:    ethertype 0x8100 @12, real 0x86DD @16, next-hdr @24 (18+6)
-	//
-	// IPv4 matches base proto == 112 (the IPv4 arm already re-validates IHL +
-	// TTL in Go, so it tolerates IPv4 options). IPv6 must additionally admit
-	// VRRP adverts that carry one or more IPv6 extension headers (#2155): the
-	// base Next-Header of such a frame is the FIRST ext-header's type, not 112.
-	// A fixed-offset cBPF cannot walk an ext-header chain, so the IPv6 arm
-	// instead matches the base Next-Header against the small set
-	//   {112 VRRP, 0 Hop-by-Hop, 43 Routing, 60 Dest-Opts}
-	// (approach A2). Any conformant VRRP advert — bare or chained — starts with
-	// one of these, while ordinary IPv6 TCP/UDP/ICMPv6/ND stays kernel-dropped
-	// on a data-bearing RETH VLAN (e.g. reth0.80). Fragment (44) and AH (51)
-	// are deliberately NOT admitted: VRRP adverts are never legitimately
-	// fragmented (the receiver does no reassembly) and never AH-wrapped (VRRP
-	// has its own authentication, not IPsec-AH), so those frames stay
-	// kernel-dropped here rather than waking the RX goroutine only for the Go
-	// walker to drop them. The authoritative ext-header walk + proto-112 +
-	// hop-limit-255 + VRID validation happens in Go (parseAfPacketIPv6); the
-	// cBPF is only an in-kernel volume reducer.
-	//
-	// Jump offsets (Jt/Jf) are relative to the NEXT instruction.
-	filter := []unix.SockFilter{
-		{Code: 0x28, K: 12},                    //  0: ldh [12] — ethertype
-		{Code: 0x15, Jt: 7, Jf: 0, K: 0x0800},  //  1: jeq 0x0800 → 9 (check_ipv4)
-		{Code: 0x15, Jt: 14, Jf: 0, K: 0x86DD}, //  2: jeq 0x86DD → 17 (check_ipv6)
-		{Code: 0x15, Jt: 1, Jf: 0, K: 0x8100},  //  3: jeq 0x8100 → 5 (check_vlan); else reject
-		{Code: 0x06, K: 0},                     //  4: ret reject
-		// check_vlan:
-		{Code: 0x28, K: 16},                    //  5: ldh [16] — real ethertype
-		{Code: 0x15, Jt: 6, Jf: 0, K: 0x0800},  //  6: jeq 0x0800 → 13 (check_ipv4_vlan)
-		{Code: 0x15, Jt: 16, Jf: 0, K: 0x86DD}, //  7: jeq 0x86DD → 24 (check_ipv6_vlan)
-		{Code: 0x06, K: 0},                     //  8: ret reject
-		// check_ipv4: proto at 14+9=23
-		{Code: 0x30, K: 23},                //  9: ldb [23]
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 10: jeq 112 → accept; else reject
-		{Code: 0x06, K: 0xFFFFFFFF},        // 11: ret accept
-		{Code: 0x06, K: 0},                 // 12: ret reject
-		// check_ipv4_vlan: proto at 18+9=27
-		{Code: 0x30, K: 27},                // 13: ldb [27]
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 14: jeq 112 → accept; else reject
-		{Code: 0x06, K: 0xFFFFFFFF},        // 15: ret accept
-		{Code: 0x06, K: 0},                 // 16: ret reject
-		// check_ipv6: base next-header at 14+6=20. Accept the VRRP/ext-header
-		// set {112,0,43,60}; anything else (incl. Fragment 44, AH 51) is
-		// non-VRRP → reject in-kernel.
-		{Code: 0x30, K: 20},                // 17: ldb [20]
-		{Code: 0x15, Jt: 4, Jf: 0, K: 112}, // 18: jeq 112  → 23 accept
-		{Code: 0x15, Jt: 3, Jf: 0, K: 0},   // 19: jeq 0    → 23 accept (Hop-by-Hop)
-		{Code: 0x15, Jt: 2, Jf: 0, K: 43},  // 20: jeq 43   → 23 accept (Routing)
-		{Code: 0x15, Jt: 1, Jf: 0, K: 60},  // 21: jeq 60   → 23 accept (Dest-Opts)
-		{Code: 0x06, K: 0},                 // 22: ret reject
-		{Code: 0x06, K: 0xFFFFFFFF},        // 23: ret accept
-		// check_ipv6_vlan: base next-header at 18+6=24. Same accept set.
-		{Code: 0x30, K: 24},                // 24: ldb [24]
-		{Code: 0x15, Jt: 4, Jf: 0, K: 112}, // 25: jeq 112  → 30 accept
-		{Code: 0x15, Jt: 3, Jf: 0, K: 0},   // 26: jeq 0    → 30 accept (Hop-by-Hop)
-		{Code: 0x15, Jt: 2, Jf: 0, K: 43},  // 27: jeq 43   → 30 accept (Routing)
-		{Code: 0x15, Jt: 1, Jf: 0, K: 60},  // 28: jeq 60   → 30 accept (Dest-Opts)
-		{Code: 0x06, K: 0},                 // 29: ret reject
-		{Code: 0x06, K: 0xFFFFFFFF},        // 30: ret accept
-	}
+	// cBPF prefilter: accept VRRP for untagged + single-tag {802.1Q, 802.1ad}
+	// variants (#5088). Built by vrrpCBPFFilter so the exact instruction array
+	// the kernel runs can be exercised against synthetic frames in a bpf.VM.
+	filter := vrrpCBPFFilter()
 	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{
 		Len:    uint16(len(filter)),
 		Filter: &filter[0],
