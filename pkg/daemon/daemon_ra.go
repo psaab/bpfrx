@@ -60,7 +60,13 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 				result = append(result, ra)
 			}
 
-			slog.Info("DHCPv6 PD: advertising prefix via RA",
+			// Debug, not Info: buildRAConfigs is a pure builder now re-run on
+			// every ~2s periodic cluster RA reconcile (reconcileClusterRAServices),
+			// so this line would repeat per PD prefix every tick — per-poll-tick
+			// Info spam the logging discipline forbids. The one-time operational
+			// signal ("a PD prefix is being advertised") belongs on the actual
+			// apply, which the reconcile's hash-gated Info already carries.
+			slog.Debug("DHCPv6 PD: advertising prefix via RA",
 				"prefix", subPrefix, "interface", mapping.RAIface,
 				"delegated_from", mapping.Interface)
 		}

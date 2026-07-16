@@ -705,6 +705,32 @@ type Daemon struct {
 	// (#5093). Nil means use d.ra.WithdrawOnce.
 	startupGoodbyeWithdrawFn func([]*config.RAInterfaceConfig) []ra.GoodbyeResult
 
+	// Cluster RA convergence (#5861). In cluster mode RA senders run ONLY on
+	// the RG that is the current active owner; the desired RA set is the union
+	// of buildRAConfigs filtered to the currently-active RGs. reconcileClusterRA
+	// funnels EVERY cluster RA transition — a day-2 config commit, a VRRP
+	// MASTER/BACKUP transition, and a periodic dropped-event safety pass —
+	// through one owner-gated + serialized applier so a config edit on a
+	// stable-active RG (no ownership transition) actually re-applies RA instead
+	// of stranding stale prefixes/lifetimes/options until the next failover.
+	//
+	// raReconcileMu serializes the ownership snapshot and the ra.Apply so a
+	// config apply cannot race a demotion and re-arm/transmit RA on a node that
+	// just became inactive (the demotion-race guard): the VRRP demote path
+	// updates rg-state BEFORE taking this lock to withdraw, so under the lock
+	// the snapshot always reflects the true current owner at apply time.
+	//
+	// lastRAReconcileHash is the digest of the last successfully applied desired
+	// set (empty = no senders). A matching hash short-circuits the periodic pass
+	// so it costs nothing when nothing changed; a mismatch (config edit, PD
+	// prefix change, or ownership move) drives ra.Apply, which diffs safely.
+	//
+	// raApplyFn is the ra.Apply entry point; overridable in tests to spy on the
+	// applied desired set. Nil means use d.ra.Apply.
+	raReconcileMu       sync.Mutex
+	lastRAReconcileHash string
+	raApplyFn           func([]*config.RAInterfaceConfig) error
+
 	// startupActiveAnnounce tracks whether the one-shot active-side
 	// neighbor refresh has been sent for each RG on this daemon run.
 	// This covers restart/redeploy of an already-active direct-mode RG,

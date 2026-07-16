@@ -1,3 +1,53 @@
+## 2026-07-16 — #6036 fold: deterministic per-interface RA prefix order (#5861)
+
+- **Timestamp**: 2026-07-16 (fix/5861-ra-stable-active-reconcile)
+- **Action**: Folded the MERGE-READY reviewer MINOR on PR #6036. Root cause:
+  `desiredClusterRA` sorted the desired RA set BY interface but NOT the
+  `Prefixes` WITHIN each interface. `buildRAConfigs` appends DHCPv6-PD-delegated
+  prefixes in `DelegatedPrefixesForRA`'s map-iteration order (`m.delegatedPDs` is
+  a map). When 2+ delegated PDs target the SAME RA interface, their prefixes land
+  on one config's slice in nondeterministic order; because `raDesiredHash`
+  marshals order-sensitively and `ra.configEqual` compares prefixes
+  index-by-index, the new every-2s periodic cluster reconcile would FLAP the
+  digest → a spurious `ra.Apply` (sub-second RA gap) + a per-poll-tick apply log
+  (which the project's logging discipline forbids). Fix: `desiredClusterRA` now
+  sorts each interface's `Prefixes` by a stable total key (`sortRAPrefixes`:
+  Prefix string, then ValidLifetime/PreferredLife/OnLink/Autonomous tie-breaks;
+  nils last) after the by-interface sort. Safe to sort in place — `buildRAConfigs`
+  returns freshly-owned configs (static entries deep-cloned by
+  `cloneRAInterfaceConfig`, PD-only entries newly allocated), so no `Prefixes`
+  slice is aliased to the active config. Added `SeedDelegatedPrefixesForRATesting`
+  test seam to `pkg/dhcp/test_seams.go` so the daemon test can model several PD
+  sources feeding one RA interface.
+  Same fold, second per-poll-tick-spam site: `buildRAConfigs` logged
+  `slog.Info("DHCPv6 PD: advertising prefix via RA", …)` once per PD prefix. It
+  is a pure builder the periodic reconcile now re-runs every ~2s, so with PD
+  prefixes present that Info repeated every tick — per-poll-tick spam CLAUDE.md
+  forbids. Demoted to `slog.Debug` (gate-on-change would need stateful
+  bookkeeping in the pure builder — not clean; the one-time operational signal is
+  already carried by the reconcile's hash-gated apply Info). Scanned the whole
+  periodic path: the reconcile's own L76/L79 Info are hash-gated (fire only on an
+  actual apply, not every tick) and both Warn lines are error paths — left as-is;
+  daemon_ra.go:63 was the only unconditional per-tick Info.
+  Validation: `go build ./...` clean; `go vet ./pkg/daemon ./pkg/dhcp` clean;
+  `go test -race ./pkg/daemon` + `./pkg/dhcp` GREEN. New fail-on-revert test
+  `TestClusterRAMultiPDPrefixOrderStableNoFlap` drives the periodic reconcile 64×
+  on a stable-active owner and asserts (a) ra.Apply fires exactly ONCE (no digest
+  flap), (b) the applied prefixes are in sorted order, and (c) the PD-advertise
+  line does NOT reach an Info-level slog handler. Neutralizing the sort reds (a)
+  verbatim: "cluster RA reconcile flapped: ra.Apply called 13 times across 64
+  stable reconciles, want exactly 1"; reverting the Debug back to Info reds (c):
+  "buildRAConfigs logged the PD-advertise line at Info 256 times across 64
+  periodic reconciles". Both reverts keep the build GREEN (assertion failures,
+  not build breaks). The two existing #5861 tests
+  (TestClusterRAStableActiveReappliesOnCommit /
+  TestClusterRADemotionRaceDoesNotTransmit) stay GREEN.
+- **File(s)**: pkg/daemon/daemon_ra_reconcile.go (within-interface prefix sort +
+  sortRAPrefixes), pkg/daemon/daemon_ra.go (demote per-tick PD-advertise Info →
+  Debug), pkg/daemon/ra_stable_active_5861_test.go (new flap-guard + no-Info-spam
+  test), pkg/dhcp/test_seams.go (SeedDelegatedPrefixesForRATesting seam),
+  pkg/daemon/README.md (per-RG RA reconcile idempotence: within-interface sort)
+
 ## 2026-07-16 — #5961 test: fail-on-revert cover config-sync transport wiring
 - **Timestamp**: 2026-07-16 (fix/5961-configsync-wiring-test)
 - **Action**: Closed the #5054 (PR #5958) test-coverage gap. The existing
@@ -50501,6 +50551,46 @@ top.
   + pkg/config/compiler_nat_target_parity_hb167_test.go + pkg/config/
   compiler_nat_host_mask_test.go (updated to new fail-closed behavior),
   docs/config-schema.md (#5859 note)
+
+## 2026-07-16 — #5861 cluster RA stable-active reconcile-on-apply
+
+- **Timestamp**: 2026-07-16
+- **Action**: Fix High-severity RA convergence bug: config changes on a
+  stable-active cluster RG were never applied until an ownership transition.
+  In cluster mode the commit path deliberately SKIPPED `ra.Apply` (RA managed
+  by ownership events) and `reconcileRGState` re-applied RA only on an
+  `rg_active` transition (`if tr.Changed`). A day-2 RA edit on an RG that
+  stayed MASTER therefore kept advertising the OLD prefixes/lifetimes/options
+  until failover/restart. Added `reconcileClusterRAServices` — the single
+  authoritative cluster RA applier. It builds the desired set as the union of
+  `buildRAConfigs` filtered to the RGs this node is the CURRENT active owner
+  for (`snapshotRethMasterState`), hash-gates the apply (`lastRAReconcileHash`,
+  updated only on success), and serializes the ownership snapshot + `ra.Apply`
+  under a new `raReconcileMu`. Wired into the commit path
+  (`applyServicesReconcile` cluster branch), the periodic safety reconcile
+  (`reconcileRGState`, dropped-event net), and — unifying the RA path — the
+  VRRP MASTER/BACKUP transitions (`applyRethServicesForRG` /
+  `clearRethServicesForRG` now route RA through the reconciler). Demotion-race
+  guard: the demote path updates rg-state before driving the RA reconcile, so
+  under `raReconcileMu` the snapshot always reflects the true current owner at
+  apply time; an inactive owner never transmits, a removal emits the
+  lifetime-0 goodbye only from the current owner. Added a `raApplyFn` test
+  hook (mirrors `startupGoodbyeWithdrawFn`) to spy `ra.Apply`.
+  Validation: `go build ./...` clean; `go vet ./pkg/daemon ./pkg/ra` clean;
+  `go test -race ./pkg/daemon ./pkg/ra` GREEN (pkg/ra had one pre-existing
+  intermittent `-race` flake in `TestRestartTimeoutNoReplacementWhenNoGoodbye`
+  / `reclaimTombstoneWhenStopped` — untouched code, byte-identical to
+  origin/master, passes on isolation/rerun). Two new fail-on-revert tests,
+  both verbatim RED on revert.
+- **File(s)**: pkg/daemon/daemon.go (raReconcileMu / lastRAReconcileHash /
+  raApplyFn fields), pkg/daemon/daemon_ra_reconcile.go (new —
+  reconcileClusterRAServices + desiredClusterRA + raDesiredHash),
+  pkg/daemon/daemon_apply.go (commit-path cluster RA reconcile),
+  pkg/daemon/daemon_ha.go (applyRethServicesForRG / clearRethServicesForRG
+  route RA through the reconciler; reconcileRGState periodic safety pass),
+  pkg/daemon/ra_stable_active_5861_test.go (new — stable-active + demotion-race
+  fail-on-revert tests), pkg/daemon/README.md (Cluster mode: per-RG RA
+  reconcile section)
 
 - **Timestamp**: 2026-07-16
   **Action**: #5864 fix — authoritative empty NeighborReplace now clears the

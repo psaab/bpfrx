@@ -869,6 +869,14 @@ func (d *Daemon) reconcileRGState() {
 	if anyRGChanged {
 		d.reconcileIPMonGating()
 	}
+
+	// #5861: dropped-event safety net. A VRRP event that started/stopped RA
+	// could be lost (event queue overflow, restart mid-transition), or a day-2
+	// RA edit on a stable-active RG could have landed while this node was
+	// already MASTER. Reconcile the cluster RA senders to the current active
+	// owners every pass — hash-gated, so it is a no-op when the effective RA
+	// set did not move, and re-applies (via ra.Apply's safe diff) when it did.
+	d.reconcileClusterRAServices("reconcile")
 }
 
 // startupGoodbyeNeeded reports whether the cold-boot one-shot goodbye still
@@ -1093,44 +1101,12 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 	if cfg == nil {
 		return
 	}
-	rgIfaces := rethInterfacesForRG(cfg, rgID)
-	rgIfaceSet := make(map[string]bool, len(rgIfaces))
-	for _, n := range rgIfaces {
-		rgIfaceSet[n] = true
-	}
-
-	if d.ra != nil {
-		allRA := d.buildRAConfigs(cfg)
-		var rgRA []*config.RAInterfaceConfig
-		for _, ra := range allRA {
-			if rgIfaceSet[ra.Interface] {
-				rgRA = append(rgRA, ra)
-			}
-		}
-		// Collect RA configs from ALL master RGs (not just this one).
-		for otherRG, isMaster := range d.snapshotRethMasterState() {
-			if !isMaster || otherRG == rgID {
-				continue
-			}
-			otherIfaces := rethInterfacesForRG(cfg, otherRG)
-			otherSet := make(map[string]bool, len(otherIfaces))
-			for _, n := range otherIfaces {
-				otherSet[n] = true
-			}
-			for _, ra := range allRA {
-				if otherSet[ra.Interface] {
-					rgRA = append(rgRA, ra)
-				}
-			}
-		}
-		if len(rgRA) > 0 {
-			if err := d.ra.Apply(rgRA); err != nil {
-				slog.Warn("vrrp: failed to apply RA on MASTER", "rg", rgID, "err", err)
-			} else {
-				slog.Info("vrrp: RA senders started (MASTER)", "rg", rgID)
-			}
-		}
-	}
+	// RA senders (#5861): converge to the union of RA configs for every RG
+	// this node is currently the active owner for. reconcileClusterRAServices
+	// snapshots ownership + applies under raReconcileMu so this MASTER apply
+	// cannot race a concurrent commit/demotion; the state machine already
+	// marked rgID active before this call, so the snapshot includes it.
+	d.reconcileClusterRAServices(fmt.Sprintf("vrrp-master-rg%d", rgID))
 	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
 		dhcpCfg := d.filterDHCPConfigForMasterRGs(cfg)
 		if dhcpCfg != nil {
@@ -1198,19 +1174,14 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 		}
 	}
 
-	if d.ra != nil {
-		if anyOtherMaster {
-			// Withdraw only this RG's interfaces; reapply others.
-			rgIfaces := rethInterfacesForRG(cfg, rgID)
-			d.ra.WithdrawInterfaces(rgIfaces)
-		} else {
-			if err := d.ra.Withdraw(); err != nil {
-				slog.Warn("vrrp: failed to withdraw RA on BACKUP", "rg", rgID, "err", err)
-			} else {
-				slog.Info("vrrp: RA withdrawn (BACKUP, goodbye RA sent)", "rg", rgID)
-			}
-		}
-	}
+	// RA senders (#5861): converge to the union of RA configs for the RGs this
+	// node still owns. The state machine already marked rgID inactive before
+	// this call, so reconcileClusterRAServices drops rgID's interfaces from the
+	// desired set — ra.Apply emits the lifetime-0 goodbye for them and leaves
+	// any still-owned RG's senders running (subsuming the prior
+	// WithdrawInterfaces / Withdraw split). Owner-gated + serialized so a
+	// concurrent commit cannot re-arm the demoted RG's senders.
+	d.reconcileClusterRAServices(fmt.Sprintf("vrrp-backup-rg%d", rgID))
 	if d.dhcpServer != nil {
 		// ApplyAsync on both branches (#1835 F2): keeps this VRRP
 		// event loop off the 15s-bounded systemctl path AND funnels
