@@ -462,6 +462,38 @@ binds the shaper unchanged. Covered by `pkg/config/cos_nested_unit_5963_test.go`
 valid `unit 0`/`unit 100` binds the shaper, lenient warn-and-drop), RED on revert
 of the parse-site gate.
 
+#### Residual closed: the `forwarding-classes queue <N>` token (#5973)
+
+Surfaced during the independent review of PR #5972 (#5963): the SAME silent-drop
+class existed on a DISTINCT CoS field in the same file — the
+`class-of-service forwarding-classes queue <N> <fc>` parse site. Its schema node
+(`schema_cos.go`, the `queue` leaf) carries no `keyValidator`, so `SchemaValidate`
+accepts a non-numeric queue token; the CoS compiler then SILENTLY DROPPED a token
+`strconv.Atoi` could not parse (`strconv.Atoi(queueNode.Keys[1]); if err != nil {
+continue }` in `compiler_class_of_service.go`). `set class-of-service
+forwarding-classes queue abc iperf-video` compiled clean and the
+forwarding-class → queue mapping never bound — the same mis-bind / silent-drop
+class #5963/#5933 closed, and inconsistent with the sibling fairness
+rss-expectation queue parse in the same file, which hard-rejects
+`err != nil || queue < 0 || queue > 255`.
+
+Division of labour with the existing #4594 range gate: a PARSEABLE but
+out-of-range queue (e.g. `999`) or a negative one already flows to the downstream
+`validateClassOfServiceForwardingClassQueueStrict` gate, which rejects it on the
+strict path and warns on the tolerant path (queue domain is **0..255**, the
+dataplane's `u8` queue id — NOT the Junos-classic 0..7). #5973 closes the ONE
+case that range gate can never see: a `strconv.Atoi` error means the FC never
+binds, so there is no `Queue` int left for the range gate to check. The fix
+rejects the strconv-error token AT the parse site (strict on commit /
+commit-check, naming the forwarding-class + bad token); the
+`lenientCoSForwardingClassQueue` opt — the SAME #4594 flag the downstream range
+gate uses — downgrades it to a `cfg.Warnings` entry on the tolerant load /
+peer-sync paths (#1960 no-brick — the malformed queue was inert before the gate
+too, the FC simply did not bind). A VALID queue still binds unchanged. Covered by
+`pkg/config/cos_fc_queue_5973_test.go` (strict reject of non-numeric/overflow
+naming the token, valid `queue 0`/`7`/`255` binds, lenient warn-and-drop leaving
+the FC inert), RED on revert of the parse-site gate.
+
 ### security address-book same-name `address` + `address-set` collision (#5676)
 
 `address` and `address-set` entries share ONE operator-visible namespace (a
