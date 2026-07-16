@@ -48997,3 +48997,30 @@ top.
     pkg/dhcpserver/ddns_leases_streaming_4886_test.go,
     pkg/cli/cli_clear_reversekey_test.go, pkg/cli/cli_clear_errors_test.go,
     pkg/cli/README.md
+  - **Action**: #5700 surface VRF setup/mgmt-bind failure into commit truth (M25).
+    applyVRFReconcile (pkg/daemon/daemon_apply.go) LOGGED-and-DROPPED its
+    ReconcileVRFs failure at WARN and returned only the #2926-C1 ctx-cancellation,
+    even though reconcileVRFs's partial-failure contract records the VRF in the
+    managed set (IsManagedVRF true) — so a commit reported the VRF configured while
+    its vrf-* device was absent on the kernel, no retry owner (false convergence).
+    The authoritative post-networkd management-VRF re-bind (:1346, which networkctl
+    reconfigure necessitates by stripping the master binding) swallowed its failure
+    at WARN too. Mirrored the #5310 ifaceErr / #5696 routeLeakErr / #5844
+    routingRuleErr deferred-error joins: applyVRFReconcile now returns (ctxErr,
+    vrfErr) — ctxErr the UNCHANGED C1 abort, vrfErr the deferred ReconcileVRFs
+    (setup) failure threaded into the tail errors.Join; extracted
+    rebindManagementVRFIfaces which aggregates+RETURNS the authoritative mgmt-bind
+    failures, joined into networkdErr. A failed commit is the retry owner (next
+    apply re-reconciles). Left best-effort (documented): the routing-instance
+    member binds (run before tunnel/xfrmi creation -> expected transient absence)
+    and the pre-networkd mgmt bind (stripped+re-established by the authoritative
+    rebind) — surfacing either would false-fail valid commits. #2926-C1 semantics
+    preserved (TestC1PostPromotionCancelRunsHostAuthorizationCloseout stays green).
+    Fail-on-revert proven via -overlay (restore the three swallows -> the setup /
+    mgmt-bind / tail-join surface tests RED; positive controls stay green).
+  - **File(s)**: pkg/daemon/daemon_apply.go,
+    pkg/daemon/vrf_setup_bind_commit_truth_5700_test.go, pkg/daemon/README.md,
+    pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go,
+    pkg/daemon/route_leak_snapshot_failclosed_5696_test.go,
+    pkg/daemon/device_map_teardown_failclosed_5309_test.go,
+    pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go

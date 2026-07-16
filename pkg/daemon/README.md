@@ -673,6 +673,32 @@ never lock an operator out of a remote box it manages.
   applyRoutingRules fails-closed-and-complete via a `RuleList`-failing
   `NewManagerWithRuleOpsForTest` fake, clean-config stays-success, and the
   `applyTailReconciles` commit-join wiring proof).
+  **VRF setup / management-bind fail-closed (#5700, mirroring #5310/#5696/#5844):**
+  `applyVRFReconcile` LOGGED-and-DROPPED its `ReconcileVRFs` failure (WARN) and
+  returned only the #2926-C1 ctx-cancellation, even though `reconcileVRFs`'s
+  partial-failure contract still records the VRF in the managed set
+  (`IsManagedVRF` true) — so a commit reported the VRF configured while its
+  `vrf-*` device was absent on the kernel, with no retry owner (false
+  convergence). It now returns `(ctxErr, vrfErr)`: `ctxErr` is the unchanged C1
+  abort; `vrfErr` is the deferred VRF-device-setup failure, captured by
+  `applyConfigLocked` and threaded into the tail `errors.Join(..., mgmtRouteErr,
+  vrfErr)`. The AUTHORITATIVE post-networkd management-VRF re-bind (which
+  `networkctl reconfigure` necessitates by stripping the master binding) is
+  extracted into `rebindManagementVRFIfaces`, which aggregates and RETURNS its
+  bind failures; `applyDataplaneAndHACore` joins them into `networkdErr` (like the
+  #1956 device-map-teardown joins), so a genuine management-VRF bind failure also
+  fails the commit closed. A failed commit is the retry owner (the next apply
+  re-reconciles). Deliberately LEFT best-effort (WARN, not surfaced): the
+  routing-instance member binds (they run BEFORE `applyInterfaceReconcile` creates
+  tunnel/xfrmi members, so a not-yet-created member is an EXPECTED transient
+  absence, not a permanent failure) and the pre-networkd management bind (stripped
+  and re-established by the authoritative rebind above) — surfacing either would
+  reject configs that commit fine today. Tests:
+  `vrf_setup_bind_commit_truth_5700_test.go` (direct `applyVRFReconcile`
+  surfaces-setup / tolerates-success / ctx-cancel-is-not-a-VRF-error via a
+  `vrf-mgmt`-`LinkAdd`-failing `NewManagerWithLinkOpsForTest` fake; direct
+  `rebindManagementVRFIfaces` surfaces-bind / tolerates-success / empty-noop; and
+  the `applyTailReconciles` commit-join wiring proof).
   **Per-term disposition mirrors userspace (#3427):** `nftRulesFromTerm` maps a
   term's `then` action to the kernel verdict the SAME way the userspace lo0
   evaluator does (`pkg/dataplane/userspace/filters.go` `NextTerm =
