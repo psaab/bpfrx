@@ -2442,3 +2442,113 @@ fn nat64_synced_entry_rebuilds_reverse_bib_4565() {
         "non-nat64 keeps the generic SNAT source"
     );
 }
+
+// --- #5864: authoritative empty NeighborReplace clears the table --------
+
+/// Seed exactly one publishable manager neighbor through the real
+/// `update_neighbors` handler path and return the driven state.
+fn seed_one_manager_neighbor() -> Arc<Mutex<ServerState>> {
+    let state = new_state(ProcessStatus::default());
+    let mut seed = req("update_neighbors");
+    seed.neighbor_replace = true;
+    seed.neighbors = Some(vec![crate::NeighborSnapshot {
+        interface: "ge-0-0-1".to_string(),
+        ifindex: 7,
+        family: "inet".to_string(),
+        ip: "10.0.0.1".to_string(),
+        mac: "02:00:00:00:00:01".to_string(),
+        state: "REACHABLE".to_string(),
+        ..crate::NeighborSnapshot::default()
+    }]);
+    let resp = run_request(state.clone(), seed);
+    assert!(resp.ok, "seed update_neighbors failed: {}", resp.error);
+    assert_eq!(
+        state
+            .lock()
+            .expect("state")
+            .afxdp
+            .dynamic_neighbor_status()
+            .0,
+        1,
+        "seed must install exactly one manager neighbor"
+    );
+    state
+}
+
+/// #5864 fail-on-revert: an authoritative NeighborReplace with the field
+/// ABSENT on the wire (Go drops the empty slice under omitempty →
+/// neighbors=None) must CLEAR the manager-neighbor table, not early-return
+/// and leave the stale entry installed. Reverting the None/empty handling
+/// in `handlers::neighbors::update` (restoring `let Some(..) else return`)
+/// makes the final assertion go RED — the stale neighbor survives.
+#[test]
+fn update_neighbors_absent_replace_clears_table_5864() {
+    let state = seed_one_manager_neighbor();
+
+    let mut clear = req("update_neighbors");
+    clear.neighbor_replace = true;
+    clear.neighbors = None;
+    let resp = run_request(state.clone(), clear);
+    assert!(resp.ok, "empty replace failed: {}", resp.error);
+
+    assert_eq!(
+        state
+            .lock()
+            .expect("state")
+            .afxdp
+            .dynamic_neighbor_status()
+            .0,
+        0,
+        "authoritative replace with neighbors=None must clear the table"
+    );
+}
+
+/// #5864 companion: an explicit present-but-empty slice (the post-fix Go
+/// wire, `\"neighbors\":[]`) under NeighborReplace must clear identically.
+#[test]
+fn update_neighbors_explicit_empty_replace_clears_table_5864() {
+    let state = seed_one_manager_neighbor();
+
+    let mut clear = req("update_neighbors");
+    clear.neighbor_replace = true;
+    clear.neighbors = Some(Vec::new());
+    let resp = run_request(state.clone(), clear);
+    assert!(resp.ok, "empty-slice replace failed: {}", resp.error);
+
+    assert_eq!(
+        state
+            .lock()
+            .expect("state")
+            .afxdp
+            .dynamic_neighbor_status()
+            .0,
+        0,
+        "authoritative replace with neighbors=[] must clear the table"
+    );
+}
+
+/// #5864 guard: a NON-replace update with no neighbors must remain a
+/// no-op — it carries nothing to add and must NOT touch the existing
+/// table. Guards against the clear-on-empty fix over-reaching into the
+/// (defensive) non-replace path.
+#[test]
+fn update_neighbors_none_without_replace_is_noop_5864() {
+    let state = seed_one_manager_neighbor();
+
+    let mut noop = req("update_neighbors");
+    noop.neighbor_replace = false;
+    noop.neighbors = None;
+    let resp = run_request(state.clone(), noop);
+    assert!(resp.ok, "noop update failed: {}", resp.error);
+
+    assert_eq!(
+        state
+            .lock()
+            .expect("state")
+            .afxdp
+            .dynamic_neighbor_status()
+            .0,
+        1,
+        "non-replace update with no neighbors must not clear the table"
+    );
+}
