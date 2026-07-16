@@ -913,6 +913,14 @@ use:
   ownership of every relevant lease and, unless it can prove we still own
   them, `die()`s fail-closed. The load-bearing invariant: an orchestrator
   that has lost (or cannot confirm) its lease MUST NOT mutate the pair.
+  Because `die()` is a `SystemExit`, `kernel-roll`'s `finally` still runs
+  after a fence-abort — and its own best-effort restore-forwarding rejoin
+  IS a pair mutation. So the fence records the loss (a `lost_lease` flag,
+  set on a confirmed loss OR an unconfirmable-after-retries lease — the same
+  fail-closed stance) and the `finally` SKIPS that rejoin whenever the flag
+  is set: an orchestrator that lost its lease must not un-drain a pair a
+  successor now owns. A clean abort where the lease is still confidently
+  held leaves the flag clear and the restore rejoin runs as before.
 
 Because renewal keeps the TTL a rolling window that never elapses while the
 driver is live, the `--lease-ttl` FLOOR was NOT raised: a short TTL is now
@@ -936,7 +944,9 @@ preflight WITHOUT rebooting) look like a finished revert; the `finally` then
 skipped its rejoin and left the node DRAINED + ForceSecondary with both leases
 released — a silent loss of redundancy. Rejoin is now decided from the
 confirmed drain state: a drained node that never affirmatively rebooted is
-always rejoined.
+rejoined — UNLESS the roll aborted because we lost the lease (see the Fence
+`lost_lease` note above), in which case the pair belongs to a successor and
+the finally must NOT un-drain it.
 
 If `rejoin` cannot confirm within its deadline, `RejoinAndConfirm`
 (`pkg/upgrade/kernel_drain.go`) now surfaces the last non-nil

@@ -1,3 +1,41 @@
+## 2026-07-16 — #5816 review fold: fence the finally-rejoin after a lost lease (PR #6021)
+- **Timestamp**: 2026-07-16 (fix/5816-deploy-lease-renew-fence)
+- **Action**: Folded one MERGE-NEEDS-MINOR reviewer finding into PR #6021. Gap:
+  `cmd_kernel_roll`'s `finally` best-effort restore-forwarding rejoin fired on
+  `drained and not completed and not rebooted` with NO ownership check. Because
+  `die()` == `sys.exit()` == `SystemExit`, that `finally` STILL RUNS after a
+  fence-abort — so a reachable path (short TTL + slow blocking drain → our lease
+  expires mid-drain → successor reclaims → the fence-before-ARM detects "lost" →
+  `die()`) let the UNFENCED finally issue `xpfd upgrade kernel rejoin`, UN-draining
+  a pair the successor now owns — violating the PR's own invariant (a lost
+  orchestrator must NOT mutate the pair). Fix: added a `lost_lease` flag local to
+  `roll_one`; `_fence_before_mutate` gained an optional `on_lost` callback invoked
+  immediately before its `die()` on BOTH a confirmed loss AND an
+  unconfirmable-after-retries lease (treat unconfirmable ownership as unsafe-to-
+  mutate, same fail-closed stance as the fences). All three kernel fences pass
+  `on_lost=_note_lost_lease`; the keepalive-loss site sets the flag too. The
+  finally-rejoin is gated on `not lost_lease` — a clean abort where the lease is
+  still confidently held STILL rejoins (restore-forwarding preserved). image-roll's
+  finally (holder-guarded `_clear_lease` only, no rejoin) is already safe and was
+  left unchanged. New fail-on-revert test
+  (`KernelRollLostAfterDrainNoRejoinTests.test_fence_before_arm_loss_suppresses_finally_rejoin`)
+  drives drain-succeeds → lease-reclaimed → fence-before-arm LOST → `die()` and
+  asserts verbs == [('fw0','drain')], NOT [('fw0','drain'),('fw0','rejoin')] — the
+  fence-before-ARM-LOST → finally path the existing fence-before-DRAIN abort test
+  (drained never set) could not reach. RED-on-revert PROVEN firsthand: neutralizing
+  the `and not lost_lease` gate → the finally rejoins unconditionally → test RED
+  (`[('fw0','drain'),('fw0','rejoin')] != [('fw0','drain')]`, log "roll did not
+  complete and fw0 never rebooted; rejoining fw0 to restore forwarding..."); gate
+  restored → GREEN (18/18). Validation: `python3 -m unittest
+  test_xpf_deploy_lease_renew_fence` = 18 tests OK; `ast.parse` clean.
+- **File(s)**: scripts/deploy/xpf-deploy.py (edit — `_fence_before_mutate` on_lost
+  param; `roll_one` lost_lease flag + `_note_lost_lease`; 3 fence calls + keepalive
+  loss site set it; finally-rejoin gated on `not lost_lease`),
+  scripts/deploy/test_xpf_deploy_lease_renew_fence.py (edit — new
+  `_KernelLostAfterDrainBackend` + `KernelRollLostAfterDrainNoRejoinTests`),
+  docs/in-place-upgrade.md (edit — Fence `lost_lease` finally-suppression note +
+  corrected the "always rejoined" paragraph)
+
 ## 2026-07-16 — #5816 (scripts/deploy, security/correctness): cross-orchestrator lease renew + fence
 - **Timestamp**: 2026-07-16 (fix/5816-deploy-lease-renew-fence)
 - **Action**: Fix #5816 (codex-183 audit). STEP-0 confirmed live on origin/master

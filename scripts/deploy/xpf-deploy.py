@@ -1513,7 +1513,8 @@ def _keepalive_leases(runner, backend, targets, holder, ttl_secs):
     return None
 
 
-def _fence_before_mutate(runner, backend, targets, holder, ttl_secs, action):
+def _fence_before_mutate(runner, backend, targets, holder, ttl_secs, action,
+                         on_lost=None):
     """FENCE: renew-and-verify ownership of EVERY lease in `targets` immediately
     before a pair-mutating action, or die() fail-closed. This is the load-bearing
     invariant of #5816: an orchestrator that has lost (or cannot confirm) its
@@ -1526,7 +1527,16 @@ def _fence_before_mutate(runner, backend, targets, holder, ttl_secs, action):
     confirmed LOSS aborts immediately; a transient UNREACHABLE is retried a few
     times, then — still unable to prove ownership — also aborts fail-closed (we
     would rather stop a roll we cannot prove we own than risk mutating a pair a
-    peer may now own). `targets` is a list of (node_name, node_id)."""
+    peer may now own). `targets` is a list of (node_name, node_id).
+
+    `on_lost`, when supplied, is invoked immediately BEFORE the fail-closed
+    die() — on BOTH a confirmed loss AND an unconfirmable (persistently
+    unreachable) lease. die() raises SystemExit, so a caller's `finally` block
+    still runs while unwinding; a caller whose finally performs a best-effort
+    pair mutation (e.g. cmd_kernel_roll's restore-forwarding rejoin) uses this
+    hook to record that it no longer safely owns the pair and SUPPRESS that
+    mutation. An unconfirmable lease is treated as unsafe-to-mutate exactly like
+    a proven loss — the same fail-closed stance the fence itself takes."""
     if runner.dry:
         return
     import time as _time
@@ -1539,12 +1549,16 @@ def _fence_before_mutate(runner, backend, targets, holder, ttl_secs, action):
             if attempt < 2:
                 _time.sleep(1)   # brief retry to ride out a transient blip
         if st == "lost":
+            if on_lost is not None:
+                on_lost()
             die(f"{name}: LOST the roll lease before {action} — another "
                 f"orchestrator has reclaimed the HA-pair reservation. Refusing "
                 f"to {action}: an orchestrator that no longer holds the lease "
                 f"must NOT mutate the pair (split-brain deploy). Investigate "
                 f"the half-rolled cluster before retrying.")
         if st != "owned":
+            if on_lost is not None:
+                on_lost()
             die(f"{name}: could NOT confirm the roll lease before {action} "
                 f"(node unreachable / lock contended after retries). Refusing "
                 f"to {action} fail-closed — an orchestrator that cannot prove it "
@@ -1650,6 +1664,18 @@ def cmd_kernel_roll(args):
         completed = False      # the roll finished (rejoin confirmed) OR the node
                                # rebooted (revert/promote — drain state is gone)
         rebooted = False       # the node actually rebooted into the candidate
+        lost_lease = False     # a fence/keepalive proved (or could not disprove)
+                               # a successor reclaimed the pair reservation. The
+                               # best-effort restore-forwarding rejoin in the
+                               # finally MUST be suppressed once this is set: a
+                               # die() is a SystemExit, so the finally still runs
+                               # after a fence-abort, and an orchestrator that has
+                               # lost its lease must NOT mutate (un-drain) a pair a
+                               # successor now owns (#5816).
+
+        def _note_lost_lease():
+            nonlocal lost_lease
+            lost_lease = True
         try:
             # FENCE (#5816): renew-and-verify we still own BOTH node leases
             # immediately before the first pair-mutating action. A one-shot
@@ -1660,7 +1686,8 @@ def cmd_kernel_roll(args):
             # any mutation (state is untouched, so the finally releases the
             # leases rather than TTL-holding them).
             _fence_before_mutate(runner, backend, [(node, nid), (peer, nid)],
-                                 holder, lease_ttl, f"drain {node}")
+                                 holder, lease_ttl, f"drain {node}",
+                                 on_lost=_note_lost_lease)
             # 2. DRAIN node -> peer via the non-interactive in-guest verb, which
             #    CONFIRMS the strong drain predicate (peer holds RGs, sync clean)
             #    before returning — so we never arm an undrained primary (r1
@@ -1694,7 +1721,8 @@ def cmd_kernel_roll(args):
             # reboot. After this the node is down and its lease can't be renewed
             # until it is back; the peer lease keeps the reservation held.
             _fence_before_mutate(runner, backend, [(node, nid), (peer, nid)],
-                                 holder, lease_ttl, f"arm+reboot {node}")
+                                 holder, lease_ttl, f"arm+reboot {node}",
+                                 on_lost=_note_lost_lease)
             print(f"   arming candidate {version} on {node} (will reboot)...")
             _node_exec(runner, backend, node,
                        ["xpfd", "upgrade", "kernel", "arm", version], check=False)
@@ -1721,6 +1749,8 @@ def cmd_kernel_roll(args):
                                          [(node, nid), (peer, nid)],
                                          holder, lease_ttl)
                 if lost:
+                    lost_lease = True   # suppress the finally restore-rejoin: a
+                                        # reclaimed pair must not be un-drained
                     die(f"{lost}: LOST the roll lease mid-reboot-poll — another "
                         f"orchestrator reclaimed the pair reservation. Stopping "
                         f"the roll of {node}; investigate the half-rolled "
@@ -1798,7 +1828,8 @@ def cmd_kernel_roll(args):
             # If a successor reclaimed while we were rebooting, abort rather than
             # rejoin a pair the peer now owns.
             _fence_before_mutate(runner, backend, [(node, nid), (peer, nid)],
-                                 holder, lease_ttl, f"rejoin {node}")
+                                 holder, lease_ttl, f"rejoin {node}",
+                                 on_lost=_note_lost_lease)
             print(f"   rejoining {node} (confirming sync)...")
             _node_exec(runner, backend, node,
                        ["xpfd", "upgrade", "kernel", "rejoin"])  # check=True: abort on fail
@@ -1812,7 +1843,15 @@ def cmd_kernel_roll(args):
             #     with no lease and a later retry could drain the peer while this
             #     node is down, opening a no-primary window (r1 Codex High).
             #     (A node that rebooted has already lost the in-memory drain.)
-            if drained and not completed and not rebooted and not runner.dry:
+            #     BUT skip this rejoin when we LOST (or could not confirm) the
+            #     lease: die() is a SystemExit, so a fence-abort at arm/rejoin — or
+            #     a keepalive-detected loss — still reaches this finally, and
+            #     rejoining here would UN-DRAIN a pair a successor now owns,
+            #     violating the fence's own invariant (a lost orchestrator must not
+            #     mutate the pair, #5816). A clean abort where we still hold the
+            #     lease (`lost_lease` stays False) keeps rejoining as before.
+            if (drained and not completed and not rebooted
+                    and not lost_lease and not runner.dry):
                 print(f"   roll did not complete and {node} never rebooted; "
                       f"rejoining {node} to restore forwarding...")
                 try:

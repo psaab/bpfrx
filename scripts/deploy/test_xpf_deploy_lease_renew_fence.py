@@ -244,6 +244,81 @@ class KernelRollFenceAbortTests(unittest.TestCase):
                          "a lost-lease driver mutated the pair (split-brain)")
 
 
+# ── end-to-end: a lease LOST after the drain must NOT trigger the finally rejoin ─
+class _KernelLostAfterDrainBackend:
+    """Scripted `_node_exec_result` for cmd_kernel_roll where the lease is still
+    owned at the pre-DRAIN fence (drain runs) but a successor reclaims it before
+    the pre-ARM fence (every renew from the 3rd on answers LOST). The pre-arm
+    fence then die()s — and because die() is a SystemExit, roll_one's `finally`
+    still runs with drained=True / completed=False / rebooted=False, the exact
+    state that fires the best-effort restore-forwarding rejoin. Records
+    (node, verb) so a test can prove the drain ran but NO post-loss rejoin did:
+    an orchestrator that lost the lease must not un-drain a pair a successor owns.
+
+    Renew ordering in roll_one(fw0, fw1): pre-drain fence renews fw0 then fw1
+    (calls 1,2 -> RENEWED), the drain runs, then the pre-arm fence renews fw0
+    (call 3 -> LOST) and die()s before it renews fw1."""
+
+    def __init__(self):
+        self.verbs = []
+        self.renews = 0
+
+    def __call__(self, runner, backend, node, argv):
+        if argv[:2] == ["sh", "-c"]:
+            s = argv[-1]
+            if "RENEWED" in s:              # a renew/fence tick
+                self.renews += 1
+                # First two renews (pre-drain fence, fw0+fw1) grant ownership so
+                # the drain runs; from the third on a successor has reclaimed the
+                # lease, so the pre-arm fence reads LOST and aborts.
+                verdict = "RENEWED" if self.renews <= 2 else "LOST"
+                return R(0, verdict + "\n", "", True)
+            return R(0, "ACQUIRED\n", "", True)   # acquire / clear
+        if argv[:3] == ["xpfd", "upgrade", "kernel"]:
+            verb = argv[3]
+            if verb == "status":
+                return R(0, f"promoted={KNOWN_GOOD} armed=none\n", "", True)
+            self.verbs.append((node, verb))   # drain (ok) / rejoin (must NOT run)
+            return R(0, "", "", True)
+        if argv[:1] == ["cat"] and "boot_id" in argv[-1]:
+            return R(0, "BOOT\n", "", True)
+        if argv == ["uname", "-r"]:
+            return R(0, KNOWN_GOOD + "\n", "", True)
+        return R(0, "", "", True)
+
+
+class KernelRollLostAfterDrainNoRejoinTests(unittest.TestCase):
+    def test_fence_before_arm_loss_suppresses_finally_rejoin(self):
+        """A lease reclaimed AFTER the drain (fence-before-arm reports LOST) must
+        NOT let the finally best-effort rejoin fire — that would un-drain a pair a
+        successor now owns, breaking the fence's own invariant (a lost
+        orchestrator must not mutate the pair, #5816).
+
+        This exercises the fence-before-ARM-LOST -> finally path, which the
+        existing fence-abort test (fence-before-DRAIN, drained never set) does
+        NOT reach: there the finally's `drained` guard is False, so the rejoin
+        could never fire regardless of the lease state.
+
+        RED on revert: drop the `and not lost_lease` guard from roll_one's
+        finally-rejoin condition (let it rejoin unconditionally on
+        drained/not-completed/not-rebooted). The finally then issues
+        `xpfd upgrade kernel rejoin` on fw0 after the loss, so `verbs` becomes
+        [('fw0','drain'),('fw0','rejoin')] instead of [('fw0','drain')]."""
+        fake = _KernelLostAfterDrainBackend()
+        with mock.patch.object(xpf_deploy, "_node_exec_result", fake), \
+                mock.patch("time.sleep", return_value=None):
+            with self.assertRaises(SystemExit) as cm:
+                xpf_deploy.cmd_kernel_roll(_kernel_args())
+        msg = str(cm.exception)
+        self.assertIn("LOST", msg)
+        self.assertIn("arm+reboot fw0", msg)
+        # The drain ran (pre-drain fence granted ownership); the post-loss rejoin
+        # must NOT have run (the lost_lease gate suppressed the finally rejoin).
+        self.assertEqual(fake.verbs, [("fw0", "drain")],
+                         "a lost-lease driver un-drained the pair in the finally "
+                         "(split-brain rejoin)")
+
+
 # ── end-to-end: renewal keeps a legit-slow roll's lease valid throughout ────
 class _ExpiringLeaseKernelBackend:
     """Scripted `_node_exec_result` for cmd_kernel_roll that models a real
