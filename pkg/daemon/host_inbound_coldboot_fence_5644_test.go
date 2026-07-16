@@ -5,7 +5,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 )
 
 // #5644 (M37): cold boot with BOTH nft tables absent must not publish host
@@ -237,5 +239,232 @@ func TestColdBootFenceCatastrophicFailureSurfaced(t *testing.T) {
 	// The fence never loaded, so enforcement is NOT established.
 	if d.hostInboundEnforced.Load() {
 		t.Error("hostInboundEnforced must stay false when the fence also fails")
+	}
+}
+
+// TestColdBootZeroDropFenceRetriesAfterAddressAppears5759 proves that a
+// program-only fallback with no address-scoped DROP leaves the historical gate
+// false, allowing a later failed real invocation to fence an address visible in
+// that invocation's snapshot. The DHCP assertion proves classification only;
+// this test invokes applyHostInboundFilter directly and does not cover the
+// callback-to-applyTailReconciles path.
+func TestColdBootZeroDropFenceRetriesAfterAddressAppears5759(t *testing.T) {
+	unit := &config.InterfaceUnit{Number: 0, DHCP: true}
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"xpf5759wan": {
+			Name:  "xpf5759wan",
+			Units: map[int]*config.InterfaceUnit{0: unit},
+		},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"untrust": {
+			Name:               "untrust",
+			Interfaces:         []string{"xpf5759wan.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+		},
+	}
+	cfg.Security.AddressBook = &config.AddressBook{Addresses: map[string]*config.Address{
+		"bad-host": {Name: "bad-host", Value: "10.0.0.5/32"},
+	}}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "untrust",
+		ToZone:   "junos-host",
+		Policies: []*config.Policy{{
+			Name:   "block-bad-host",
+			Action: config.PolicyDeny,
+			Match: config.PolicyMatch{
+				SourceAddresses: []string{"bad-host"},
+				Applications:    []string{"any"},
+			},
+		}},
+	}}
+
+	d := &Daemon{}
+	d.publishMgmtVRFIfaces(map[string]bool{"fxp0": true, "fab0": true, "em0": true})
+	if !d.dhcpLeaseChangeRequiresRecompile(cfg) {
+		t.Fatal("fixture must be classified for full recompile; this does not prove the apply reaches host authorization")
+	}
+
+	assertProjection := func(wantV bool) {
+		t.Helper()
+		programs := dpuserspace.BuildJunosHostPrograms(cfg)
+		if len(programs) != 1 {
+			t.Fatalf("P = %d programs, want exactly 1", len(programs))
+		}
+		views := dpuserspace.BuildZoneHostInboundViews(cfg)
+		gotV := hostInboundHasEnforceableView(views)
+		if gotV != wantV {
+			t.Fatalf("V = %t, want %t; views=%+v", gotV, wantV, views)
+		}
+		unzonedV4, unzonedV6 := dpuserspace.BuildUnzonedHostInboundAddrs(cfg)
+		if len(unzonedV4) != 0 || len(unzonedV6) != 0 {
+			t.Fatalf("U4/U6 must both be false, got v4=%v v6=%v", unzonedV4, unzonedV6)
+		}
+		gotD := gotV || len(unzonedV4) > 0 || len(unzonedV6) > 0
+		if gotD != wantV {
+			t.Fatalf("D = %t, want %t solely from V", gotD, wantV)
+		}
+	}
+	assertProjection(false)
+	if d.hostInboundEnforced.Load() {
+		t.Fatal("precondition: hostInboundEnforced must start false")
+	}
+
+	injected := errors.New("nft: issue 5759 real load failure")
+	cn := xnft.HostInboundJunosHostDenyCounterName("untrust", "ip")
+	wantIIFDrop := `iifname "xpf5759wan" ip saddr 10.0.0.5/32 counter name "` + cn + `" drop`
+	wantAddressDrop := "ip daddr 198.51.100.57 drop"
+	var payloads []string
+	orig := nftApplyPayload
+	nftApplyPayload = func(payload string) ([]byte, error) {
+		index := len(payloads)
+		payloads = append(payloads, payload)
+		if !strings.Contains(payload, "table inet xpf_hostinbound") {
+			t.Fatalf("payload %d is not an xpf_hostinbound table:\n%s", index, payload)
+		}
+		switch index {
+		case 0:
+			if !strings.Contains(payload, wantIIFDrop) {
+				t.Fatalf("initial real payload missing %q:\n%s", wantIIFDrop, payload)
+			}
+			return []byte("injected real failure"), injected
+		case 1:
+			if strings.Contains(payload, "iifname") || strings.Contains(payload, " daddr ") {
+				t.Fatalf("initial fallback must have no iifname or address-scoped DROP:\n%s", payload)
+			}
+			return nil, nil
+		case 2:
+			if !strings.Contains(payload, wantIIFDrop) || !strings.Contains(payload, "ip daddr 198.51.100.57") {
+				t.Fatalf("addressed real payload missing iifname deny or appeared destination:\n%s", payload)
+			}
+			return []byte("injected real failure"), injected
+		case 3:
+			if strings.Contains(payload, "iifname") {
+				t.Fatalf("addressed fallback must not contain iifname:\n%s", payload)
+			}
+			if strings.Count(payload, wantAddressDrop) != 1 || strings.Count(payload, " daddr ") != 1 {
+				t.Fatalf("addressed fallback must contain exactly one %q and one daddr rule:\n%s", wantAddressDrop, payload)
+			}
+			if strings.Contains(payload, cn) || strings.Contains(payload, "tcp dport 22 accept") {
+				t.Fatalf("addressed fallback must not contain a junos-host counter or service accept:\n%s", payload)
+			}
+			return nil, nil
+		default:
+			t.Fatalf("unexpected nft payload index %d:\n%s", index, payload)
+			return nil, nil
+		}
+	}
+	defer func() { nftApplyPayload = orig }()
+
+	err := d.applyHostInboundFilter(cfg)
+	if !errors.Is(err, injected) {
+		t.Fatalf("initial apply error = %v, want wrapped sentinel", err)
+	}
+	if d.hostInboundEnforced.Load() {
+		t.Fatal("zero-drop fallback must leave state false")
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("initial apply payload count = %d, want 2", len(payloads))
+	}
+
+	unit.Addresses = []string{"198.51.100.57/24"}
+	assertProjection(true)
+	err = d.applyHostInboundFilter(cfg)
+	if !errors.Is(err, injected) {
+		t.Fatalf("addressed apply error = %v, want wrapped sentinel", err)
+	}
+	if !d.hostInboundEnforced.Load() {
+		t.Fatal("address-scoped fallback must publish state true")
+	}
+	if len(payloads) != 4 {
+		t.Fatalf("total payload count = %d, want 4", len(payloads))
+	}
+}
+
+// TestColdBootFenceUnzonedDropPublishesState5759 proves the independent U4 and
+// U6 terms of D. Each row uses a fresh daemon and a successful one-family
+// fallback transaction with nil views, so publication derives solely from the
+// selected unzoned-address term.
+func TestColdBootFenceUnzonedDropPublishesState5759(t *testing.T) {
+	tests := []struct {
+		name         string
+		views        []dpuserspace.ZoneHostInboundView
+		unzonedV4    []string
+		unzonedV6    []string
+		wantDrop     string
+		oppositeRule string
+	}{
+		{
+			name:         "ipv4",
+			unzonedV4:    []string{"192.0.2.57"},
+			wantDrop:     "ip daddr 192.0.2.57 drop",
+			oppositeRule: "ip6 daddr",
+		},
+		{
+			name:         "ipv6",
+			unzonedV6:    []string{"2001:db8:5759::57"},
+			wantDrop:     "ip6 daddr 2001:db8:5759::57 drop",
+			oppositeRule: "ip daddr",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Daemon{}
+			v := hostInboundHasEnforceableView(tc.views)
+			u4 := len(tc.unzonedV4) > 0
+			u6 := len(tc.unzonedV6) > 0
+			if v {
+				t.Fatal("V must be false for nil views")
+			}
+			if tc.name == "ipv4" && (!u4 || u6) {
+				t.Fatalf("ipv4 U terms = U4:%t U6:%t, want true/false", u4, u6)
+			}
+			if tc.name == "ipv6" && (u4 || !u6) {
+				t.Fatalf("ipv6 U terms = U4:%t U6:%t, want false/true", u4, u6)
+			}
+			if dValue := v || u4 || u6; !dValue {
+				t.Fatal("D must be true solely from the selected U term")
+			}
+			if d.hostInboundEnforced.Load() {
+				t.Fatal("fresh daemon state must be false")
+			}
+
+			calls := 0
+			orig := nftApplyPayload
+			nftApplyPayload = func(payload string) ([]byte, error) {
+				calls++
+				if calls != 1 {
+					t.Fatalf("fallback nft call count = %d, want exactly 1", calls)
+				}
+				if !strings.Contains(payload, "table inet xpf_hostinbound") {
+					t.Fatalf("fallback payload missing xpf_hostinbound table:\n%s", payload)
+				}
+				if strings.Count(payload, tc.wantDrop) != 1 || strings.Count(payload, " daddr ") != 1 {
+					t.Fatalf("fallback must contain exactly one %q and one daddr rule:\n%s", tc.wantDrop, payload)
+				}
+				if strings.Contains(payload, tc.oppositeRule) {
+					t.Fatalf("fallback contains opposite-family daddr rule %q:\n%s", tc.oppositeRule, payload)
+				}
+				for _, banned := range []string{"iifname", "counter name", "tcp dport", "udp dport", "icmp type echo-request"} {
+					if strings.Contains(payload, banned) {
+						t.Fatalf("fallback must not contain %q:\n%s", banned, payload)
+					}
+				}
+				return nil, nil
+			}
+			defer func() { nftApplyPayload = orig }()
+
+			if err := d.installHostInboundColdBootFence(tc.views, tc.unzonedV4, tc.unzonedV6, nil); err != nil {
+				t.Fatalf("installHostInboundColdBootFence: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("fallback nft call count = %d, want 1", calls)
+			}
+			if !d.hostInboundEnforced.Load() {
+				t.Fatal("successful U-only fallback must publish true")
+			}
+		})
 	}
 }

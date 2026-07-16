@@ -165,7 +165,20 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 	}
 
 	count := int(req.Count)
-	sub := s.eventBuf.Subscribe(256)
+	// #5850: bound concurrent event-stream subscribers. MonitorPacketDrop is a
+	// request-created stream on the loopback-but-UNAUTHENTICATED gRPC listener,
+	// so it must NOT bypass the admission cap (defaultMaxSubscribers) the way the
+	// uncapped Subscribe did. Each live stream adds a buffered channel AND expands
+	// the synchronous O(N) per-event fan-out the EventBuffer does for EVERY event,
+	// so any local process opening an unbounded number of these streams exhausts
+	// memory + event-production CPU (a DoS distinct from #4484 L-2, which capped
+	// only the REST SSE surface and wrongly treated gRPC as inherently bounded).
+	// TrySubscribe returns nil at the cap; reject with ResourceExhausted,
+	// mirroring the REST SSE 503 (pkg/api/sse.go).
+	sub := s.eventBuf.TrySubscribe(256)
+	if sub == nil {
+		return status.Error(codes.ResourceExhausted, "too many concurrent event subscribers")
+	}
 	defer sub.Close()
 
 	if err := stream.Send(&pb.MonitorPacketDropResponse{Line: "Starting packet drop:"}); err != nil {
@@ -295,6 +308,9 @@ func interfaceAliasSet(cfg *config.Config, name string) map[string]bool {
 		return nil
 	}
 	for key, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil { // #5886: skip present-but-nil InterfaceConfig
+			continue
+		}
 		aliases := map[string]bool{
 			key:                     true,
 			config.LinuxIfName(key): true,
@@ -411,7 +427,7 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 	// rethRG returns the redundancy group for a RETH interface, or -1.
 	rethRG := func(name string) int {
 		parts := strings.SplitN(name, ".", 2)
-		if ifc, ok := cfg.Interfaces.Interfaces[parts[0]]; ok && ifc.RedundancyGroup > 0 {
+		if ifc, ok := config.LookupInterface(cfg, parts[0]); ok && ifc.RedundancyGroup > 0 {
 			return ifc.RedundancyGroup
 		}
 		return -1

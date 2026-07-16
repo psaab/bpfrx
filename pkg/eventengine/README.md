@@ -161,12 +161,14 @@ one gate:
   OLD command set must not commit under the new definition. Dropped.
 - **Cooldown active (H3):** a successful commit of the SAME policy is within the
   30 s cooldown window. The enqueue-time cooldown check in `evaluateEvent` races
-  the arm-on-commit timing (the cooldown is armed only after a commit, and
-  `enqueue` dedups a same-policy duplicate ONLY when the queue is full), so a
-  duplicate can slip into the queue while the worker is blocked. Re-enforcing the
-  cooldown here at commit time suppresses the within-window duplicate instead of
-  double-committing — restoring the documented "not more than once in any 30 s
-  window" invariant even under lock contention.
+  the arm-on-commit timing (the cooldown is armed only after a commit), so a
+  duplicate can slip into the queue while the worker is blocked: the first event
+  is already IN-FLIGHT in the worker (dequeued, retrying under the held lock), so
+  the enqueue-time dedup finds no same-policy entry still QUEUED to supersede and
+  the duplicate is enqueued. Re-enforcing the cooldown here at commit time
+  suppresses the within-window duplicate instead of double-committing — restoring
+  the documented "not more than once in any 30 s window" invariant even under lock
+  contention.
 
 Legitimate remediations are unaffected: distinct policies and a re-fire AFTER the
 cooldown elapses pass the gate and commit. Regression-locked (fail-on-revert) by
@@ -248,19 +250,29 @@ cannot occur.
   parks the worker in the retry select under a held lock, closes the engine, and
   asserts the stop func was invoked — reverting to `time.After` never consults
   the seam and the test goes RED).
-- **Bounded queue, dedup-by-policy:** the queue holds at most one pending
-  action per policy — a newer trigger supersedes an older queued one (no value
-  in applying a stale remediation twice). Overflow bumps
+- **Bounded queue, dedup-by-policy (early — #5853):** the queue holds at most one
+  pending action per policy — a newer trigger supersedes an older queued one (no
+  value in applying a stale remediation twice). The dedup runs on **every**
+  enqueue via `supersede()`, not only once the channel is full. The pre-#5853
+  `enqueue` did an unconditional fast-path send and deduped only in the full
+  branch, so while the worker was blocked behind the config lock a burst from ONE
+  policy filled all 64 slots with redundant duplicates (later discarded by
+  cooldown/staleness) and the NEXT remediation for an UNRELATED policy was dropped
+  queue-full — one flapping policy could starve every other policy's remediation.
+  Early dedup keeps a same-policy burst to a single slot, leaving the rest free.
+  A same-policy replacement is a **benign** dedup (the newer equivalent action
+  still runs — nothing is lost) and is counted as
+  `xpf_event_actions_superseded_total`, **not** as a drop. A genuine capacity loss
+  — the queue full of unrelated policies with no same-policy entry to evict, so
+  the genuinely-unfittable new arrival cannot fit — bumps
   `xpf_event_actions_dropped_total{reason="queue_full"}` **exactly once per
-  dropped action**. When the queue is full of unrelated policies and there is no
-  stale same-policy entry to evict, the genuinely-unfittable new arrival is
-  dropped (the older FIFO survivors are kept) and counted once by `enqueue` —
-  `supersede()` does NOT also count that overflow in its refill loop (it only
-  counts a SURVIVOR it could not re-place). Loss is always counted, never silent,
-  and never double-counted (#2869).
-- **FIFO ordering across policies (#2869):** the queue is FIFO. When the queue
-  is full and `supersede()` drains/refills it to drop a stale same-policy entry,
-  it re-enqueues the surviving OTHER-policy actions in their original order and
+  dropped action** (counted by `enqueue`; `supersede()` does NOT also count that
+  overflow in its refill loop — it only counts a SURVIVOR it could not re-place).
+  Loss is always counted, never silent, and never double-counted (#2869), and the
+  benign dedup no longer inflates the alert-worthy `queue_full` metric.
+- **FIFO ordering across policies (#2869):** the queue is FIFO. Each enqueue's
+  `supersede()` drains/refills the queue to drop any stale same-policy entry, then
+  re-enqueues the surviving OTHER-policy actions in their original order and
   places the new (superseding) action at the **TAIL** — never the head.
   Prepending the new action would let the newest event jump ahead of every older
   queued remediation (LIFO), starving older policies under sustained event

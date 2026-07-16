@@ -235,13 +235,14 @@ func buildLo0FilterPayload(cfg *config.Config, filterV4, filterV6 string) string
 // Fail-closed (#3333): both the apply and the teardown surface their failure as
 // a returned error instead of a swallowed WARN. applyConfigLocked joins this
 // into the commit result, so a committed host-inbound deny that did not reach
-// the kernel reports commit FAILURE rather than silent success. The retained
-// kernel state is always the more- or equally-restrictive prior state: an `-f -`
-// apply loads atomically (the previous table is kept on failure), and a failed
-// teardown leaves the existing deny in place — neither can strand management,
-// since lifeline interfaces are excluded from the address sets. Boot / DHCP
-// re-applies go through applyConfig(), which only logs the error, so a transient
-// nft failure cannot brick startup; the next clean commit re-renders.
+// the kernel reports commit FAILURE rather than silent success. A failed `-f -`
+// apply retains only the exact prior kernel generation, if one exists; its rules
+// cover only the destinations represented in that generation (#5789). A failed
+// teardown likewise leaves the existing generation in place. Boot / DHCP full
+// applies use applyConfig(), which only logs the error, and get a host-inbound
+// retry opportunity only when they reach this function. hostInboundEnforced is
+// a historical fallback gate, not proof of current table presence or current-
+// address coverage (#5789, #5790).
 func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	views := dpuserspace.BuildZoneHostInboundViews(cfg)
 	// #4420 HI-2: firewall-local addresses on interfaces assigned to NO security
@@ -259,10 +260,12 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// resolvable address yet (DHCP WAN before its first lease, backup node before
 	// VIP install, or an unaddressed interface) contributes nothing to the deny
 	// scoping below, so host-bound traffic to a freshly-usable address can reach
-	// the kernel input path without the zone default-deny. The window self-heals
-	// once an address appears (the lease-change / commit paths re-render), but it
-	// is otherwise silent. Log only state TRANSITIONS (a zone entering/leaving the
-	// window) so repeated commits / DHCP renewals do not flood.
+	// the kernel input path without the zone default-deny. Address appearance is
+	// available to a later snapshot, but enforcement changes only when a later
+	// applicable apply reaches this function and its nft transaction succeeds.
+	// These transition logs describe the pre-publication address snapshot, not nft
+	// installation success. Log only state TRANSITIONS (a zone entering/leaving
+	// the window) so repeated commits / DHCP renewals do not flood.
 	d.logHostInboundAddresslessTransitions(cfg)
 	// #3710: the zone-level signal above collapses a MIXED zone (some interfaces
 	// addressed, some not; or one family up before the other) to "scoped" the
@@ -312,22 +315,23 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	if out, err := nftApplyPayload(nftConf); err != nil {
 		slog.Warn("failed to apply host-inbound filter", "err", err, "output", string(out))
 		// #5644 (M37) cold-boot fail-closed fence. The atomic `-f -` load leaves
-		// the PREVIOUS table untouched on failure, so day-2 a failed install is
-		// already fail-closed (the prior host-inbound default-deny stays in the
-		// kernel). But on COLD BOOT both tables are absent — there is no prior
+		// the exact PREVIOUS table untouched on failure, so day-2 its existing
+		// rules and destinations remain in the kernel. But on COLD BOOT both tables
+		// are absent — there is no prior
 		// generation to retain — so a failed install here would leave the host
 		// input path OPEN: host-bound services to firewall-local addresses become
 		// reachable with NO host-inbound default-deny (fail-open), and the boot
 		// apply only logs+discards this error (applyConfig), so the daemon proceeds
 		// to publish host service / VIP / HA-ready over an unenforced input path.
-		// d.hostInboundEnforced is still false only when no real/fence table has
-		// ever loaded this boot (i.e. cold boot), so gate the fence on it: install
-		// a maximally-restrictive deny-all fence (host services DENIED to every
-		// non-lifeline firewall-local address, only mandatory L3 / return traffic
-		// admitted) so enforcement is fail-closed until a clean commit re-renders
-		// the real ruleset. The commit still fails (we return the error), which is
-		// what drives the retry/re-render; the fence only closes the exposure in
-		// the meantime.
+		// A false hostInboundEnforced means no successful real load or fallback with
+		// an address-scoped DROP has been published; it can coexist with a loaded
+		// zero-drop table shell. Gate the fallback on that historical state and
+		// render it from this invocation's exact address snapshot. When that snapshot
+		// has destinations, the fallback denies every non-lifeline firewall-local
+		// address while admitting only mandatory L3 / return traffic. The requested
+		// real apply still fails (we return its error). Another opportunity requires
+		// a later failed real invocation that reaches this function while state is
+		// still false.
 		if !d.hostInboundEnforced.Load() {
 			if fenceErr := d.installHostInboundColdBootFence(views, unzonedV4, unzonedV6, wgListenPorts); fenceErr != nil {
 				return errors.Join(fmt.Errorf("apply host-inbound nftables filter: %w", err), fenceErr)
@@ -335,9 +339,10 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 		}
 		return fmt.Errorf("apply host-inbound nftables filter: %w", err)
 	}
-	// A real host-inbound table is now installed: enforcement is established, so a
-	// LATER failed install (day-2) is retained by the atomic load and needs no
-	// fence (#5644).
+	// A real host-inbound table is now installed. Record the historical success;
+	// a later failed install retains that exact generation and therefore skips the
+	// cold-boot fallback. This does not prove current table presence or coverage of
+	// addresses absent from that generation (#5789, #5790).
 	d.hostInboundEnforced.Store(true)
 	slog.Info("host-inbound filter applied", "zones", len(views),
 		"unzoned_deny_v4", len(unzonedV4), "unzoned_deny_v6", len(unzonedV6),
@@ -347,13 +352,14 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 
 // installHostInboundColdBootFence installs the #5644 (M37) cold-boot
 // fail-closed host-inbound fence: a minimal xpf_hostinbound table that DENIES
-// every host-bound service to firewall-local addresses, admitting only the
-// mandatory L3 / return traffic (established/related, raw ESP+AH for
+// every host-bound service to firewall-local addresses in its rendered
+// snapshot, admitting only the mandatory L3 / return traffic
+// (established/related, raw ESP+AH for
 // host-terminated IPsec, IPv6 ND, v4/v6 PMTUD+error, and the configured
-// WireGuard listen port(s)). It is installed ONLY when the real host-inbound
-// ruleset failed to load and no enforcement table exists yet this boot (cold
-// boot, both tables absent), so a failed install cannot leave the host input
-// path fail-open until the next clean commit.
+// WireGuard listen port(s)). It is attempted only when the real host-inbound
+// ruleset failed to load and hostInboundEnforced is false. False can coexist
+// with a successfully loaded zero-drop table shell; it does not prove table
+// absence.
 //
 // Safety: the fence drops only to the SAME address sets the real ruleset would
 // scope (views + the addressed-but-unzoned set), which are already
@@ -362,12 +368,15 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 // never strand management or break HA — it is strictly the real table with every
 // service ACCEPT removed. It carries no named counters (a fence is transient) so
 // it has fewer moving parts than the real payload and is more likely to load when
-// the real one hit a payload-specific nft error. On success the fence table
-// exists, so d.hostInboundEnforced is set true — a subsequent failed real apply
-// is then retained by the atomic `-f -` load (still fail-closed). On failure (nft
-// itself is broken) the error is returned and joined into the commit result; the
-// caller logs it and the daemon has done all it can short of holding forwarding.
+// the real one hit a payload-specific nft error. After successful nft completion,
+// hostInboundEnforced is set true only when this exact payload contains an
+// address-scoped DROP. A successful zero-drop shell leaves false so a later
+// failed real invocation reaching this function can try again with its snapshot.
+// On failure (nft itself is broken) the error is returned and joined into the
+// commit result; the caller logs it and the daemon has done all it can short of
+// holding forwarding.
 func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) error {
+	fenceHasScopedDrop := hostInboundHasEnforceableView(views) || len(unzonedV4) > 0 || len(unzonedV6) > 0
 	fence := buildHostInboundFencePayload(views, unzonedV4, unzonedV6, wgListenPorts)
 	if out, err := nftApplyPayload(fence); err != nil {
 		slog.Error("COLD-BOOT FAIL-OPEN GUARD: host-inbound install failed AND the fail-closed "+
@@ -376,23 +385,28 @@ func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInb
 			"err", err, "output", string(out))
 		return fmt.Errorf("install host-inbound cold-boot fail-closed fence: %w", err)
 	}
-	d.hostInboundEnforced.Store(true)
-	slog.Warn("host-inbound install failed at cold boot (no prior table to retain); installed a "+
-		"fail-closed DENY-ALL fence so host-bound services are NOT exposed — the next clean "+
-		"commit replaces it with the real host-inbound ruleset",
-		"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
-		"fenced_unzoned_v6", len(unzonedV6))
+	if fenceHasScopedDrop {
+		d.hostInboundEnforced.Store(true)
+		slog.Warn("host-inbound real install failed; fallback succeeded with address-scoped DROPs for its rendered snapshot",
+			"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
+			"fenced_unzoned_v6", len(unzonedV6))
+	} else {
+		slog.Warn("host-inbound real install failed; fallback succeeded with zero address-scoped DROPs; hostInboundEnforced remains false and another fallback requires a later failed real invocation reaching host-inbound while false",
+			"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
+			"fenced_unzoned_v6", len(unzonedV6))
+	}
 	return nil
 }
 
 // buildHostInboundFencePayload assembles the #5644 cold-boot fail-closed fence
 // payload (see installHostInboundColdBootFence). It is the atomic-replace
 // xpf_hostinbound table reduced to: the global mandatory accepts, then a
-// catch-all DROP for every firewall-local address the real ruleset would scope —
-// NO per-service accepts, NO named counters. Split out as a pure function so
-// tests can parse-check the full payload without invoking nft. A syntax error on
-// any line rejects the WHOLE payload (atomic load), so the fence fails
-// closed-as-absent rather than half-applied — exactly like the real builder.
+// catch-all DROP for every firewall-local address represented by the supplied
+// snapshot — NO per-service accepts, NO named counters. Empty address inputs
+// intentionally produce a zero-drop table shell. Split out as a pure function
+// so tests can parse-check the full payload without invoking nft. A syntax error
+// on any line rejects the WHOLE payload (atomic load), retaining only the exact
+// prior generation, if one exists — exactly like the real builder.
 func buildHostInboundFencePayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) string {
 	var rules []string
 	rules = append(rules, "add table inet xpf_hostinbound")
@@ -487,7 +501,9 @@ type hostInboundFailOpenState struct {
 // It compares the current addressless set against the set observed on the
 // previous apply (d.hostInboundFailOpen.addresslessZones) so a zone that stays addressless
 // across repeated commits / DHCP renewals is logged once (on entry), not every
-// apply — the low-noise contract for a self-healing window. Runs under applySem
+// apply — the low-noise contract for an address-snapshot transition. Recovery
+// is observed before the nft transaction below, so the log is not publication
+// proof. Runs under applySem
 // (the sole caller, applyHostInboundFilter, is invoked from applyConfigLocked),
 // so the map access needs no extra locking. The current window is also exported
 // as the xpf_host_inbound_addressless_zones gauge (pkg/api), which is scraped
@@ -503,6 +519,8 @@ func (d *Daemon) logHostInboundAddresslessTransitions(cfg *config.Config) {
 	}
 	for zone := range d.hostInboundFailOpen.addresslessZones {
 		if !current[zone] {
+			// This reports snapshot recovery before nftApplyPayload runs; installation
+			// success is determined later in applyHostInboundFilter.
 			slog.Info("host-inbound zone now has an address — host-inbound default-deny enforced (fail-open admit window closed)",
 				"zone", zone)
 		}
@@ -538,6 +556,8 @@ func (d *Daemon) logHostInboundAddresslessIfaceTransitions(cfg *config.Config) {
 	}
 	for key := range d.hostInboundFailOpen.addresslessIfaces {
 		if !current[key] {
+			// This reports snapshot recovery before nftApplyPayload runs; installation
+			// success is determined later in applyHostInboundFilter.
 			slog.Info("host-inbound interface now has an address in this family — host-inbound default-deny enforced (fail-open admit window closed)",
 				"key", key)
 		}
@@ -580,15 +600,17 @@ func (d *Daemon) logHostInboundAmbiguousTransitions(cfg *config.Config) {
 	d.hostInboundFailOpen.ambiguousAddrs = current
 }
 
-// hostInboundHasEnforceableView reports whether at least one view carries a
-// resolvable address. Static, VRRP-VIP and DHCP/DHCPv6-learned addresses all
+// hostInboundHasEnforceableView reports whether at least one view in this
+// snapshot carries a resolvable address. It is the view term of the fallback's
+// address-scoped-DROP predicate; unzoned v4/v6 slices are separate terms.
+// Static, VRRP-VIP and DHCP/DHCPv6-learned addresses all
 // count: the live interface snapshot enumerates every kernel address via
 // AddrList(FAMILY_ALL), so a DHCP-only interface with a live lease IS scoped
 // (#3224 — see BuildZoneHostInboundViews). The only no-address case left is a
 // configured zone whose interfaces have no static address AND no live address
-// yet (e.g. a DHCP WAN before its first lease). That zone produces nothing; if
-// NO zone is enforceable the whole table is removed (it self-heals once an
-// address appears, because the lease-change / commit paths re-render).
+// yet (e.g. a DHCP WAN before its first lease). That zone produces nothing for
+// this snapshot. A later address can contribute only when an applicable apply
+// reaches applyHostInboundFilter; nft success then determines kernel state.
 func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool {
 	for _, v := range views {
 		if len(v.V4Addrs) > 0 || len(v.V6Addrs) > 0 {

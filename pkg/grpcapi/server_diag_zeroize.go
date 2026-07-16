@@ -58,13 +58,16 @@ const (
 //   - .configdb/master.key      — the AES-GCM key that decrypts an encrypted DB
 //   - .configdb/                — the SSOT: active.json, candidate.json,
 //     rollback.N.json (Store.Load reloads active.json on next boot)
+//   - <configBase>              — the LIVE config file, matched by EXACT name
+//     (#5768) so a non-".conf" -config base (e.g. site.cfg) is erased too and a
+//     broad `*.conf` glob no longer catches unowned siblings
+//   - rescue.conf               — the rescue config (configstore.RescueConfigBase
+//     / rescuePath): full active-config TEXT with cleartext secret leaves (#4056)
 //   - <configBase>.<N>          — the CANONICAL text rollback slots
 //     (saveRollbackFiles / loadRollbackHistory), full config TEXT with
 //     cleartext secret leaves; loadRollbackHistory reloads them at boot, so
 //     leaving them behind would let the prior tenant's config be rolled back
 //     to — the exact leak #4576 closes
-//   - *.conf                    — the live config + rescue.conf (pre-#4576 set)
-//   - rollback*                 — legacy rollback naming (pre-#4576 set)
 //   - .<base>.tmp-*             — fsatomic crash-leaked write temps (#5475): a
 //     daemon killed between fsatomic's CreateTemp and its rename leaves a
 //     ".<base>.tmp-<rand>" file (pkg/fsatomic createTemp) still holding the FULL
@@ -148,16 +151,30 @@ func zeroizeConfigDir(configDir, configBase string) error {
 	// erase the whole tree explicitly.
 	fail(os.RemoveAll(filepath.Join(configDir, "tls")))
 
-	// Top-level artifacts in a single ReadDir pass.
+	// Top-level artifacts in a single ReadDir pass. #5768: match ONLY names xpf
+	// itself created/tracks — the live config file, the rescue config, the audit
+	// journal (+ rotated segments), the numbered text rollback slots, and fsatomic
+	// crash temps. The pre-#5768 code matched a broad `*.conf` suffix and
+	// `rollback*` prefix; when a custom -config resolved configDir to a shared or
+	// subdir location that slipped past ValidateFactoryResetRoot, those globs
+	// deleted UNOWNED siblings (a neighbor's foo.conf, xpf's own rendered
+	// /etc/frr/frr.conf, an unrelated rollback-notes file). Ownership scoping — not
+	// a bigger denylist — bounds the wipe to xpf's artifacts. The exact live-config
+	// match also erases a non-".conf" -config base the old suffix glob left behind.
+	// configstore writes no top-level `rollback*` file (canonical text slots are
+	// "<configBase>.<N>" via isTextRollbackFile; DB slots live inside .configdb,
+	// RemoveAll'd above), so dropping the legacy `rollback*` prefix loses no owned
+	// artifact. isFsatomicTemp stays a shape match: under-scoping a temp risks
+	// stranding an owned secret-bearing temp (#5475), the worse failure.
 	entries, err := os.ReadDir(configDir)
 	fail(err)
 	for _, f := range entries {
 		name := f.Name()
-		if strings.HasSuffix(name, ".conf") ||
-			strings.HasPrefix(name, "rollback") ||
+		if name == configBase || // the live config file (exact name, any extension)
+			name == configstore.RescueConfigBase || // the rescue config (rescuePath)
 			name == ".config.journal" ||
 			strings.HasPrefix(name, ".config.journal.") ||
-			isTextRollbackFile(name, configBase) ||
+			isTextRollbackFile(name, configBase) || // <configBase>.<N> text slots
 			isFsatomicTemp(name) {
 			fail(os.Remove(filepath.Join(configDir, name)))
 		}
@@ -699,6 +716,38 @@ func readProvisionedMarkerUID(path string) (int, error) {
 // parameterized: the rendered-config (frr/swanctl/kea), login-account,
 // config-archive, BPF-pin and networkd legs live at fixed system paths
 // independent of `-config` and stay as-is.
+// Rendered service-config wipe targets. Package vars defaulting to the fixed
+// system paths so the full-wipe primitive can be driven end-to-end against a
+// throwaway tree in tests (#5890) instead of erasing the real /etc/frr,
+// /etc/swanctl, /etc/kea — the config-root (parameter), login-account, and
+// archive legs are already seamable, and these close the last real-/etc leg so
+// PerformZeroizeWipe is fully hermetic under test. Production behavior is
+// unchanged (defaults == the former inline constants).
+var (
+	zeroizeFRRConf        = frr.DefaultFRRConf
+	zeroizeSwanctlSnippet = filepath.Join(ipsec.DefaultSwanctlDir, ipsec.BPFRXConfFile)
+	zeroizeKea4Conf       = dhcpserver.DefaultKea4ConfPath
+	zeroizeKea6Conf       = dhcpserver.DefaultKea6ConfPath
+	// Non-secret best-effort legs — also package vars so the full-wipe primitive
+	// is fully hermetic under test (never touches the real /sys/fs/bpf or
+	// /etc/systemd/network). Production behavior unchanged.
+	zeroizeBPFPinDir   = "/sys/fs/bpf/xpf"
+	zeroizeNetworkdDir = "/etc/systemd/network"
+)
+
+// PerformZeroizeWipe is the exported entry to the shared factory-reset wipe so
+// the in-process interactive console (pkg/cli `request system zeroize`)
+// DELEGATES to the SAME primitive the gRPC path uses (#5890). Both paths then
+// erase an IDENTICAL, single-source-of-truth OWNED-artifact set — config state
+// + tls/ + rendered service configs (frr/swanctl/kea) + provisioned login
+// accounts + config archive + BPF pins + networkd — so they cannot diverge and
+// leave secret residue on a re-tenanted device. configDir/configBase are the
+// CONFIGURED config root (see performZeroizeWipe); the caller resolves+validates
+// them (cli.zeroizeConfigRoot / grpcapi.zeroizeConfigRoot) before delegating.
+func PerformZeroizeWipe(configDir, configBase string) error {
+	return performZeroizeWipe(configDir, configBase)
+}
+
 var performZeroizeWipe = func(configDir, configBase string) error {
 	// Config state FIRST — the security-critical erasure. A failure here can
 	// leave prior-tenant config/secrets on disk, so it is surfaced to the
@@ -712,10 +761,10 @@ var performZeroizeWipe = func(configDir, configBase string) error {
 	// its first error into the surfaced result (the .configdb error takes
 	// priority) so a partial wipe is never reported as a clean factory reset.
 	if e := zeroizeRenderedConfigs(
-		frr.DefaultFRRConf,
-		filepath.Join(ipsec.DefaultSwanctlDir, ipsec.BPFRXConfFile),
-		dhcpserver.DefaultKea4ConfPath,
-		dhcpserver.DefaultKea6ConfPath,
+		zeroizeFRRConf,
+		zeroizeSwanctlSnippet,
+		zeroizeKea4Conf,
+		zeroizeKea6Conf,
 	); e != nil && err == nil {
 		err = e
 	}
@@ -748,13 +797,13 @@ var performZeroizeWipe = func(configDir, configBase string) error {
 	// BPF pins + managed networkd files carry no secret material, so their
 	// removal stays best-effort (logged, never fatal — they do not gate the
 	// success/failure of the factory reset).
-	if e := os.RemoveAll("/sys/fs/bpf/xpf"); e != nil {
+	if e := os.RemoveAll(zeroizeBPFPinDir); e != nil {
 		slog.Warn("zeroize: remove BPF pins failed", "err", e)
 	}
-	if ndFiles, e := os.ReadDir("/etc/systemd/network"); e == nil {
+	if ndFiles, e := os.ReadDir(zeroizeNetworkdDir); e == nil {
 		for _, f := range ndFiles {
 			if strings.HasPrefix(f.Name(), "10-xpf-") {
-				if re := os.Remove(filepath.Join("/etc/systemd/network", f.Name())); re != nil && !errors.Is(re, os.ErrNotExist) {
+				if re := os.Remove(filepath.Join(zeroizeNetworkdDir, f.Name())); re != nil && !errors.Is(re, os.ErrNotExist) {
 					slog.Warn("zeroize: remove networkd file failed", "file", f.Name(), "err", re)
 				}
 			}

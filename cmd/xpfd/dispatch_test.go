@@ -36,6 +36,10 @@ func TestClassifyCommand(t *testing.T) {
 		{"unknown positional verb with args", []string{"xpfd", "request", "system", "reboot"}, cmdUnknown},
 		{"leading-dash flag is daemon", []string{"xpfd", "--config", "/tmp/x.conf"}, cmdDaemon},
 		{"single-dash flag is daemon", []string{"xpfd", "-debug"}, cmdDaemon},
+		{"debug before cleanup stays daemon", []string{"xpfd", "--debug", "cleanup"}, cmdDaemon},
+		{"config before version stays daemon", []string{"xpfd", "--config", "/tmp/xpf.conf", "version"}, cmdDaemon},
+		{"no-dataplane before show stays daemon", []string{"xpfd", "--no-dataplane", "show", "system"}, cmdDaemon},
+		{"terminator before cleanup stays daemon", []string{"xpfd", "--", "cleanup"}, cmdDaemon},
 		{"empty first token is daemon", []string{"xpfd", ""}, cmdDaemon},
 	}
 	for _, tt := range tests {

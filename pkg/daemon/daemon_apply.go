@@ -716,6 +716,21 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// owns the first start, which honors config-only / bootstrap suppression.
 	d.reconcileSNMP(cfg)
 
+	// #5866: reconcile the live management HTTP/HTTPS listener + authentication
+	// snapshot against the committed web-management config, for the SAME reason
+	// and with the SAME early placement as reconcileSNMP above. The management
+	// server was constructed once at boot and never reconciled, so a committed
+	// bind/port/TLS/api-auth change (e.g. a REVOKED credential) sat inert until a
+	// daemon restart. Placed before the dataplane apply so a committed
+	// credential revocation is enforced even on an apply that aborts early. A
+	// bind-replacement failure is fail-safe (the old listener is retained) and
+	// only logged as retry debt — like reconcileSNMP it does not brick an
+	// otherwise-successful commit.
+	if err := d.reconcileWebManagement(cfg); err != nil {
+		slog.Warn("web-management listener reconcile did not converge; retrying on next commit",
+			"err", err)
+	}
+
 	// #1922 Item 2 bootstrap exit: the FIRST apply of a non-empty config
 	// (an interface-claiming confirmed commit, or a cluster SyncApply from
 	// the primary) leaves bootstrap mode and runs the one-time startup
@@ -747,16 +762,33 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		slog.Warn("config validation", "warning", w)
 	}
 
-	if err := d.applyVRFReconcile(ctx, cfg); err != nil {
+	ctxErr, vrfErr := d.applyVRFReconcile(ctx, cfg)
+	if ctxErr != nil {
 		// #5643 Gap B: the #2926 C1 boundary lives inside applyVRFReconcile and
 		// returns ctx.Err() before the netlink phase. Store.Commit already
 		// promoted UPSTREAM, so a daemon-stop cancel landing here is post-
 		// promotion too — funnel it through the same host-authorization closeout
 		// as C2/C3 so the committed nft/login/root-auth tightening is enforced
-		// even when the apply is abandoned at the earliest boundary. A genuine
-		// (non-cancellation) VRF reconcile failure returns unchanged.
-		return d.closeoutHostAuthOnCancel(err, cfg)
+		// even when the apply is abandoned at the earliest boundary.
+		return d.closeoutHostAuthOnCancel(ctxErr, cfg)
 	}
+	// #5700: vrfErr is the DEFERRED VRF-device-setup failure (a genuine, non-
+	// cancellation ReconcileVRFs error). The rest of the apply still runs; it is
+	// threaded into the tail commit-error join below so the commit fails closed
+	// (with a retry owner) instead of reporting a VRF configured while its device
+	// is absent — exactly like ifaceErr/routeLeakErr/routingRuleErr.
+
+	// #5867: program the DHCP-learned management-VRF routes and capture the
+	// RouteReplace / cleanup failure as a DEFERRED error. A route whose
+	// destination stayed but whose gateway/output-interface changed and then
+	// failed to replace no longer leaves the stale route protected (the reconcile
+	// keys the protect-set on the full route identity, so the stale route is
+	// cleaned up) — and the failure is threaded into the tail commit-error join
+	// below so the commit fails closed instead of acknowledging a management
+	// route pinned to a stale/de-authorized gateway. Deferred (not fatal here)
+	// exactly like ifaceErr/routeLeakErr/routingRuleErr: the rest of the apply
+	// still runs.
+	mgmtRouteErr := d.applyMgmtVRFRoutes()
 
 	// #5310: capture the interface-reconcile failure (xfrmi/bond/tunnel/legacy-
 	// reth) and thread it into the tail commit-error join so a genuine reconcile
@@ -798,7 +830,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		return d.closeoutHostAuthOnCancel(err, cfg)
 	}
 
-	d.applyRoutingRules(cfg, commitOverlay)
+	// #5844: applyRoutingRules RETURNS the joined next-table / rib-group / PBR
+	// ip-rule reconcile failures (a partial clear/add left stale-or-missing
+	// cross-VRF policy in the kernel). Capture it as a DEFERRED error — the
+	// snapshot republish below still runs (so it is not left stale), and the
+	// failure is threaded into the tail commit-error join so the commit fails
+	// closed instead of being acknowledged after a partial reconcile.
+	routingRuleErr := d.applyRoutingRules(cfg, commitOverlay)
 
 	// #5642: the full dataplane apply (applyDataplaneAndHACore → d.dp.ApplyConfig)
 	// ran BEFORE applyRoutingRules and built its userspace route snapshot from the
@@ -831,9 +869,11 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// errors (networkdErr/applyErr/dhcpServerErr/ipsecErr/ifaceErr) are threaded
 	// in — applyErr is the #5679 ordinary (non-abort) dataplane-apply failure
 	// that must fail the commit without disarming/aborting; routeLeakErr is the
-	// #5696 route-leak republish/FIB-bump failure; the helper creates
-	// lo0Err/hostInboundErr and returns the joined errors.
-	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr)
+	// #5696 route-leak republish/FIB-bump failure; routingRuleErr is the #5844
+	// next-table/rib-group/PBR ip-rule reconcile failure (a partial kernel
+	// policy-routing clear/add); the helper creates lo0Err/hostInboundErr and
+	// returns the joined errors.
+	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr)
 }
 
 // applyHostAuthorizationCloseout runs ONLY the security-critical host-
@@ -1305,13 +1345,18 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// 2.7. Re-bind management VRF interfaces after networkd.Apply().
 	// networkctl reconfigure strips VRF master bindings because networkd
 	// considers the daemon-created vrf-mgmt device "unmanaged" and ignores
-	// the VRF= directive. Re-bind here to restore VRF membership.
+	// the VRF= directive. Re-bind here to restore VRF membership. This is the
+	// AUTHORITATIVE management-VRF bind (post-networkd): #5700 surfaces its
+	// failure into commit truth (joined into networkdErr — mirroring the #1956
+	// device-map-teardown joins above) instead of swallowing at WARN, so a
+	// genuine bind failure fails the commit closed rather than reporting the
+	// management VRF configured while the interface carries no VRF membership.
+	// The management interfaces (fxp*/fab*/em*) exist by this phase, so the bind
+	// is transient-free (unlike the pre-networkd best-effort bind and the
+	// routing-instance tunnel-member binds in applyVRFReconcile).
 	if mgmtSet := d.mgmtVRFIfaceSet(); d.routing != nil && len(mgmtSet) > 0 {
-		for ifName := range mgmtSet {
-			if err := d.routing.BindInterfaceToVRF(ifName, "mgmt"); err != nil {
-				slog.Warn("failed to re-bind interface to management VRF",
-					"interface", ifName, "err", err)
-			}
+		if err := d.rebindManagementVRFIfaces(); err != nil {
+			networkdErr = errors.Join(networkdErr, err)
 		}
 		// Restart heartbeat after VRF rebind — networkd reconfigure moves
 		// the control interface (em0) out of vrf-mgmt temporarily, which
@@ -1503,7 +1548,20 @@ func (d *Daemon) applyServicesReconcile(cfg *config.Config) (error, error) {
 // early return. commitOverlay is the ip-monitoring route overlay folded into
 // the FRR assembly. Runs in the same slot, after the dataplane apply / RETH-MAC
 // sequence and before proactive neighbor resolution.
-func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.RouteOverlayEntry) {
+func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.RouteOverlayEntry) error {
+	// #5844: the kernel policy-routing (ip rule) reconciles below —
+	// next-table, rib-group, and PBR/filter-based-forwarding — each already
+	// RETURN a fail-closed error: a partial clear/add leaves stale-or-missing
+	// cross-VRF policy in the kernel, and the immediately-following userspace
+	// route snapshot (reconcileRouteLeakSnapshot) canonizes that partial live
+	// kernel state. The pre-#5844 call site LOGGED and DROPPED those returns, so
+	// a commit was acknowledged after a partial reconcile. Collect them here and
+	// return the joined error to applyConfigLocked, which threads it into the
+	// tail commit-error join. Fail-closed BUT complete: a single rule-type
+	// failure does NOT skip the others — every rule type runs, then the joined
+	// error surfaces (mirroring the #5310 ifaceErr / #5696 routeLeakErr pattern).
+	var routingErrs []error
+
 	// 3. Apply all routes + dynamic protocols via FRR.
 	// assembleFRRConfig is the SOLE frr.FullConfig constructor, shared
 	// with the ip-monitoring routes-only actuator (#1827) — the full
@@ -1544,6 +1602,7 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 		allRoutes = append(allRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
 		if err := d.routing.ApplyNextTableRules(allRoutes, cfg.RoutingInstances); err != nil {
 			slog.Warn("failed to apply next-table rules", "err", err)
+			routingErrs = append(routingErrs, fmt.Errorf("apply next-table rules: %w", err))
 		}
 	}
 
@@ -1571,6 +1630,7 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 		connectedPrefixes := config.RibGroupConnectedPrefixes(cfg)
 		if err := d.routing.ApplyRibGroupRules(cfg.RoutingOptions.RibGroups, cfg.RoutingInstances, connectedPrefixes); err != nil {
 			slog.Warn("failed to apply rib-group rules", "err", err)
+			routingErrs = append(routingErrs, fmt.Errorf("apply rib-group rules: %w", err))
 		}
 	}
 
@@ -1585,14 +1645,51 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 	if d.routing != nil {
 		pbrRules, buildErr := routing.BuildPBRRules(cfg)
 		if buildErr != nil {
+			// #5844: buildErr is DELIBERATELY not joined into the commit-error.
+			// It is a fail-SAFE representability degradation, not a partial
+			// kernel mutation. The kernel ip rule (BuildPBRRules) is only a
+			// MIRROR of the userspace FBF steer for SLOW-PATH (XDP_PASS) packets
+			// (rules.go: "the kernel also honors PBR for XDP_PASS'd packets, e.g.
+			// SNAT'd traffic destined for a VRF/GRE tunnel"). The AUTHORITATIVE
+			// fast-path enforcement of a `then routing-instance` term — with the
+			// FULL L4 match the kernel ip rule cannot express (port-except /
+			// tcp-flags / icmp / is-fragment / flex) — is the userspace filter
+			// engine: buildFilterTermSnapshots carries term.RoutingInstance +
+			// the full match into the FirewallTermSnapshot
+			// (pkg/dataplane/userspace/filters.go), and the Rust evaluator sets
+			// acc.routing_instance = term.routing_instance on a full-term match
+			// (userspace-dp/src/filter/engine/eval.rs
+			// evaluate_interface_filter_routing_instance_*). So a term that
+			// cannot be mirrored to an ip rule is DROPPED from the kernel mirror
+			// only; on the fast path it is still steered, and a slow-path packet
+			// UNDER-steers to the main table (the fail-safe direction — never an
+			// address-only OVER-steer / cross-VRF leak, rules.go BuildPBRRules).
+			// The degradation is already observable (this WARN + the #4422
+			// PBRBuildStats degraded gauge), not silent. ApplyPBRRules(pbrRules)
+			// below fully reconciles whatever WAS built (deleting any stale
+			// rule), so no stale-or-missing cross-VRF policy survives in the
+			// mirror — the #5844 bug class is the netlink RuleAdd/RuleDel failure
+			// below, not this representability drop. Fail-closing on buildErr
+			// would instead REJECT configs with such terms that commit fine
+			// today AND are enforced on the fast path, so it stays a
+			// warn-and-continue.
 			slog.Warn("PBR rule build degraded; some routing-instance filter terms "+
 				"are not mirrored to the kernel FBF path and fall back to the main "+
 				"table (userspace filter path still enforces them)", "err", buildErr)
 		}
+		// ApplyPBRRules IS a kernel reconcile: a failed clear/add leaves a
+		// half-installed FBF policy in the kernel ip-rule table, so its error is
+		// joined into the commit-error (fail-closed).
 		if err := d.routing.ApplyPBRRules(pbrRules); err != nil {
 			slog.Warn("failed to apply PBR rules", "err", err)
+			routingErrs = append(routingErrs, fmt.Errorf("apply PBR rules: %w", err))
 		}
 	}
+
+	// Fail-closed but COMPLETE: every rule type above ran regardless of an
+	// earlier failure; surface the joined error so a partial ip-rule reconcile
+	// fails the commit instead of being silently acknowledged (#5844).
+	return errors.Join(routingErrs...)
 }
 
 // reconcileRouteLeakSnapshot republishes the userspace route snapshot after
@@ -1786,18 +1883,29 @@ func (d *Daemon) applyFabricIPVLAN(cfg *config.Config) {
 // update/orphan-delete vrf-* devices), binding routing-instance member
 // interfaces to their VRFs, binding management interfaces (fxp*/fab*/em*) to
 // vrf-mgmt when it is managed, and applying the management-VRF routes.
-// Extracted verbatim from applyConfigLocked (#4407). Returns a non-nil error
-// only for the #2926-C1 ctx-cancellation check (the block's sole early return),
-// which applyConfigLocked propagates unchanged. Runs in the same slot, before
-// the interface-creation reconcile.
-func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) error {
+// Extracted verbatim from applyConfigLocked (#4407).
+//
+// Returns TWO errors (#5700). ctxErr is the #2926-C1 ctx-cancellation check (the
+// block's sole early return), which applyConfigLocked propagates unchanged
+// through the host-authorization closeout — the C1 abort semantics are
+// UNCHANGED. vrfErr is the DEFERRED VRF-device-setup failure: a ReconcileVRFs
+// error means the vrf-* device could not be created/reconciled, yet
+// reconcileVRFs's partial-failure contract still records the VRF in the
+// managed/tracked set (IsManagedVRF returns true below), so the commit used to
+// report the VRF configured while it was absent on the kernel — a false
+// convergence with no retry owner. vrfErr is threaded into the tail commit-error
+// join exactly like the #5310 ifaceErr / #5696 routeLeakErr / #5844
+// routingRuleErr deferred errors, so a failed commit fails closed and is the
+// retry owner (the next apply re-reconciles). Runs in the same slot, before the
+// interface-creation reconcile.
+func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) (ctxErr error, vrfErr error) {
 	// #2926 boundary C1: before the netlink reconcile phase. Nothing in the
 	// kernel / dataplane / FRR has been touched yet (the SNMP swap above is an
 	// idempotent in-memory pointer flip), so a cancellation here skips the
 	// entire pipeline cleanly. This is the cheapest, safest place to honor a
 	// daemon stop.
 	if err := ctx.Err(); err != nil {
-		return err
+		return err, nil
 	}
 
 	// 0. Reconcile VRF devices (routing-instance VRFs + management VRF).
@@ -1842,7 +1950,14 @@ func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) erro
 			})
 		}
 		if err := d.routing.ReconcileVRFs(desired); err != nil {
+			// #5700: the VRF DEVICE setup failed (vrf-* could not be created/
+			// reconciled). reconcileVRFs still records the VRF as managed on a
+			// partial failure, so surface this into commit truth rather than
+			// swallowing it at WARN — otherwise the commit reports the VRF
+			// configured while it is not on the kernel (false convergence). This is
+			// transient-free: VRF device creation depends on no other interface.
 			slog.Warn("failed to reconcile VRFs", "err", err)
+			vrfErr = errors.Join(vrfErr, fmt.Errorf("reconcile VRFs: %w", err))
 		}
 	}
 
@@ -1862,6 +1977,14 @@ func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) erro
 			}
 			for _, ifaceName := range ri.Interfaces {
 				linuxName := riMemberLinuxName(tunMap, ifaceName)
+				// #5700: deliberately best-effort (WARN, not surfaced). This runs
+				// BEFORE applyInterfaceReconcile creates tunnel/xfrmi devices, so a
+				// routing-instance member that is a later-created tunnel is legitimately
+				// "not found" here — an EXPECTED transient absence that must NOT be
+				// promoted into a permanent commit failure. Only the VRF DEVICE setup
+				// (ReconcileVRFs, surfaced above as vrfErr) and the authoritative
+				// post-networkd management re-bind (rebindManagementVRFIfaces) are
+				// load-bearing and transient-free.
 				if err := d.routing.BindInterfaceToVRF(linuxName, ri.Name); err != nil {
 					slog.Warn("failed to bind interface to VRF",
 						"interface", ifaceName, "linux", linuxName,
@@ -1885,6 +2008,12 @@ func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) erro
 	if d.routing != nil && len(mgmtIfaces) > 0 && d.routing.IsManagedVRF(mgmtVRFName) {
 		mgmtSet = mgmtIfaces
 		for ifName := range mgmtIfaces {
+			// #5700: this PRE-networkd bind is best-effort (WARN, not surfaced).
+			// applyNetworkdConfig's `networkctl reconfigure` strips the VRF master
+			// binding right after this phase, so the AUTHORITATIVE management-VRF
+			// bind is the post-networkd rebindManagementVRFIfaces (whose failure IS
+			// surfaced into commit truth). Surfacing this pre-strip bind would report
+			// a failure for a binding networkd is about to remove and re-establish.
 			if err := d.routing.BindInterfaceToVRF(ifName, mgmtVRFName); err != nil {
 				slog.Warn("failed to bind interface to management VRF",
 					"interface", ifName, "err", err)
@@ -1893,9 +2022,44 @@ func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) erro
 	}
 	d.publishMgmtVRFIfaces(mgmtSet)
 
-	// 0.6. Program default routes in the management VRF for DHCP leases.
-	d.applyMgmtVRFRoutes()
-	return nil
+	// #5867: the DHCP management-VRF route program+reconcile (formerly step 0.6
+	// here) now runs in applyConfigLocked immediately after this reconcile
+	// returns, so its RouteReplace / cleanup error is threaded into the tail
+	// commit-error join (fail-closed but complete) instead of being swallowed at
+	// this early phase. Moving it out of applyVRFReconcile also keeps a stale-
+	// route-pin failure from aborting the whole apply early (it must NOT skip the
+	// dataplane apply). Ordering is unchanged: it still runs after this reconcile
+	// (which publishes the mgmt-interface set it reads) and before the interface/
+	// dataplane reconciles.
+	return nil, vrfErr
+}
+
+// rebindManagementVRFIfaces re-binds the published management-VRF interface set
+// to vrf-mgmt after applyNetworkdConfig's `networkctl reconfigure` strips the
+// VRF master binding (it treats the daemon-created vrf-mgmt device as
+// unmanaged). This is the AUTHORITATIVE, load-bearing management-VRF bind:
+// #5700 aggregates and RETURNS the per-interface bind failures so the caller can
+// join them into commit truth (via networkdErr) instead of swallowing at WARN —
+// a genuine bind failure otherwise reports the management VRF configured while
+// the interface carries no VRF membership (false convergence, no retry owner).
+// The management interfaces exist by this phase, so a failure is genuine, not a
+// transient absence. Returns nil when there is nothing to bind or every bind
+// succeeds. Extracted so the fail-closed bind can be unit-tested directly,
+// mirroring applyInterfaceReconcile (#5310).
+func (d *Daemon) rebindManagementVRFIfaces() error {
+	mgmtSet := d.mgmtVRFIfaceSet()
+	if d.routing == nil || len(mgmtSet) == 0 {
+		return nil
+	}
+	var errs []error
+	for ifName := range mgmtSet {
+		if err := d.routing.BindInterfaceToVRF(ifName, "mgmt"); err != nil {
+			slog.Warn("failed to re-bind interface to management VRF",
+				"interface", ifName, "err", err)
+			errs = append(errs, fmt.Errorf("re-bind %s to management VRF: %w", ifName, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // applyInterfaceReconcile creates/reconciles the interface-level network
@@ -1989,10 +2153,12 @@ func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) error {
 // policy stays live); routeLeakErr is the #5696 route-leak snapshot
 // republish/FIB-bump failure (also head-produced, threaded in like ifaceErr);
 // vrrpErr originates in step 8 below when runtime identity validation rejects
-// the desired set; lo0Err/hostInboundErr originate in step 9.5. The returned
-// errors.Join preserves the explicit operand order
-// (#1778/#2987/#4433/#5083/#5310/#5679/#5696).
-func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr error) error {
+// the desired set (#5083); vrfErr is the #5700 VRF-device-setup (ReconcileVRFs)
+// failure and routingRuleErr/mgmtRouteErr are threaded from the caller;
+// lo0Err/hostInboundErr originate in step 9.5. The returned errors.Join
+// preserves the explicit operand order
+// (#1778/#2987/#4433/#5083/#5310/#5679/#5696/#5700).
+func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	var vrrpErr error
 	vrrpInstances := vrrp.CollectInstances(cfg)
@@ -2268,7 +2434,7 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// that left stale or missing kernel/swanctl/dataplane state fails the commit
 	// (fail-closed) instead of reporting success. All are joined so none masks the
 	// other.
-	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr, vrrpErr)
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, vrrpErr)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error

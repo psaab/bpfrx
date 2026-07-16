@@ -22,11 +22,33 @@ func (e ParseError) Error() string {
 // rather than recursing.
 const maxParseDepth = 256
 
+// maxParseErrors bounds the number of ParseError diagnostics a single parse
+// RETAINS (#5827). The parser records one ParseError per bad token
+// (parseStatements' TokenError branch, plus the statement-recovery / stray-brace
+// / depth-cap paths); a hostile or corrupt payload — e.g. a run of invalid
+// bytes up to the 16 MiB MaxConfigSize ceiling — otherwise produces MILLIONS of
+// ParseError structs, each pinning a formatted message string, all held LIVE
+// simultaneously until the parse returns. That is an unbounded-heap DoS on every
+// entry point that parses a config blob: config load/commit, HA config-sync, and
+// the CheckText validation path. Past the cap, addError/addErrorf stop retaining
+// (and stop formatting) diagnostics and bump `suppressed`; Parse appends a single
+// deterministic trailing "additional parse errors suppressed (N)" summary, so the
+// retained diagnostic set — and thus the retained heap — is bounded to O(cap)
+// regardless of input size. 64 is large enough to surface a useful set of real
+// errors in a genuinely-broken config while keeping the bound tight. The lexer
+// still drains the whole input in O(input) for deterministic termination; only
+// the parser's RETENTION is capped. This mirrors the depth-cap suppression
+// (skipToBlockClose) that already records one error for a pathological payload.
+const maxParseErrors = 64
+
 // Parser implements a recursive descent parser for Junos configuration syntax.
 type Parser struct {
 	lexer  *Lexer
 	errors []ParseError
 	depth  int // current block-nesting depth (bounded by maxParseDepth)
+	// suppressed counts ParseError diagnostics dropped once errors reached
+	// maxParseErrors (#5827). Parse folds it into a single trailing summary.
+	suppressed int
 }
 
 // NewParser creates a new Parser for the given configuration text.
@@ -60,10 +82,19 @@ func (p *Parser) Parse() (*ConfigTree, []ParseError) {
 		if tok.Type == TokenEOF {
 			break
 		}
-		p.addError(tok.Line, tok.Column,
-			fmt.Sprintf("unexpected %s at top level (unmatched '}'?)", tok))
+		p.addErrorf(tok.Line, tok.Column, "unexpected %s at top level (unmatched '}'?)", tok)
 		p.lexer.Next() // consume the stray token to guarantee forward progress
 		children = append(children, p.parseStatements()...)
+	}
+	// #5827: fold the suppressed-diagnostic count into a single deterministic
+	// trailing summary. Appended DIRECTLY (bypassing the cap) so it always
+	// surfaces exactly once even when the error set is at maxParseErrors, giving
+	// a bounded len(errors) <= maxParseErrors+1. The first maxParseErrors errors
+	// keep their parse order + line/column; this summary always sorts last.
+	if p.suppressed > 0 {
+		p.errors = append(p.errors, ParseError{
+			Message: fmt.Sprintf("additional parse errors suppressed (%d)", p.suppressed),
+		})
 	}
 	tree := &ConfigTree{Children: children}
 	return tree, p.errors
@@ -171,8 +202,8 @@ func (p *Parser) parseStatements() []*Node {
 	defer func() { p.depth-- }()
 	if p.depth > maxParseDepth {
 		tok := p.lexer.Peek()
-		p.addError(tok.Line, tok.Column,
-			fmt.Sprintf("configuration nesting exceeds maximum depth of %d", maxParseDepth))
+		p.addErrorf(tok.Line, tok.Column,
+			"configuration nesting exceeds maximum depth of %d", maxParseDepth)
 		// Drain the remainder of this over-deep block iteratively (no
 		// recursion) so a pathological payload records exactly one error and
 		// leaves the caller's matching '}' in place, rather than spamming one
@@ -252,8 +283,7 @@ func (p *Parser) parseStatement() *Node {
 		// Recovery: skip unexpected token
 		tok := p.lexer.Next()
 		if tok.Type != TokenEOF {
-			p.addError(tok.Line, tok.Column,
-				fmt.Sprintf("unexpected %s", tok))
+			p.addErrorf(tok.Line, tok.Column, "unexpected %s", tok)
 		}
 		return nil
 	}
@@ -321,8 +351,7 @@ func (p *Parser) parseStatement() *Node {
 		if closeTok.Type == TokenRBrace {
 			p.lexer.Next() // consume }
 		} else {
-			p.addError(closeTok.Line, closeTok.Column,
-				fmt.Sprintf("expected '}', got %s", closeTok))
+			p.addErrorf(closeTok.Line, closeTok.Column, "expected '}', got %s", closeTok)
 		}
 		return &Node{
 			Keys:     keys,
@@ -395,9 +424,36 @@ func (p *Parser) parseKeys() ([]string, []TokenType) {
 }
 
 func (p *Parser) addError(line, col int, msg string) {
+	// #5827: cap the retained diagnostic set. Past maxParseErrors, count the
+	// drop and return WITHOUT appending — so a pathological all-error payload
+	// never pins O(input) ParseError structs. Parse emits a single trailing
+	// summary of the suppressed count.
+	if len(p.errors) >= maxParseErrors {
+		p.suppressed++
+		return
+	}
 	p.errors = append(p.errors, ParseError{
 		Line:    line,
 		Column:  col,
 		Message: msg,
+	})
+}
+
+// addErrorf is addError with a lazily-formatted message: the fmt.Sprintf is
+// evaluated ONLY when the diagnostic is actually retained (#5827). Past the cap
+// it just bumps `suppressed`, so a hot error path (e.g. the stray-brace or
+// statement-recovery loops) does not allocate a per-token message string it
+// would immediately discard. The TokenError branch passes the lexer's
+// already-materialized tok.Value through addError; every call site that would
+// otherwise fmt.Sprintf a message uses addErrorf.
+func (p *Parser) addErrorf(line, col int, format string, args ...any) {
+	if len(p.errors) >= maxParseErrors {
+		p.suppressed++
+		return
+	}
+	p.errors = append(p.errors, ParseError{
+		Line:    line,
+		Column:  col,
+		Message: fmt.Sprintf(format, args...),
 	})
 }

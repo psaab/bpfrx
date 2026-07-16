@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -62,57 +61,45 @@ func TestCLIZeroizeFailsClosedWithoutConfigRoot(t *testing.T) {
 	}
 }
 
-// TestCLIZeroizeWipesConfiguredRootNotHardcoded drives the full CLI
-// config-state wipe (zeroizeConfigState) against a NON-default configured root
-// seeded with the on-disk secret artifacts a factory reset must erase, and
-// asserts they are gone. It is the end-to-end revert guard for #5554: with the
-// hardcoded `configDir := "/etc/xpf"` restored, FactoryResetConfigDir wipes
-// /etc/xpf (absent in the test => nil) while the temp root's .configdb +
-// rollback slots SURVIVE — so the "removed" assertions below fail.
+// TestCLIZeroizeWipesConfiguredRootNotHardcoded drives the full CLI console
+// factory-reset path (performConsoleZeroize) against a NON-default configured
+// root and asserts the CONFIGURED root — not a hardcoded /etc/xpf — is handed to
+// the shared full-wipe primitive. It is the console-path revert guard for #5554:
+// with the hardcoded `configDir := "/etc/xpf"` restored, the wipe would receive
+// /etc/xpf and the temp root's secrets would survive. The wipe primitive itself
+// is seamed to a spy so the test stays hermetic (no real /etc); the full
+// secret-set erasure is proven in pkg/grpcapi (#5890).
 func TestCLIZeroizeWipesConfiguredRootNotHardcoded(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "site.conf")
-	// newConfigStore -> configstore.New creates dir/.configdb (the SSOT the wipe
-	// must erase) and sets the store's ConfigPath to configPath.
 	store := newConfigStore(t, configPath)
 
-	// Point the archive wipe at an xpf-owned-default that is safe in the test:
-	// FactoryResetArchiveDir only touches DefaultArchiveDir, so aim it at an
-	// absent temp path (parent exists) => it no-ops cleanly instead of trying to
-	// erase the real /var/lib/xpf/archive.
-	origArchive := configstore.DefaultArchiveDir
-	configstore.DefaultArchiveDir = filepath.Join(t.TempDir(), "archive")
-	t.Cleanup(func() { configstore.DefaultArchiveDir = origArchive })
-
-	// Seed the secret-bearing artifacts under the CONFIGURED root: master.key,
-	// the live config text, and a numbered text rollback slot.
-	if err := os.WriteFile(filepath.Join(dir, ".configdb", "master.key"), []byte("KEY"), 0o600); err != nil {
-		t.Fatalf("seed master.key: %v", err)
+	var gotDir, gotBase string
+	var called bool
+	origWipe, origStop := zeroizeFullWipe, zeroizeStopDaemon
+	t.Cleanup(func() { zeroizeFullWipe, zeroizeStopDaemon = origWipe, origStop })
+	zeroizeFullWipe = func(configDir, configBase string) error {
+		called = true
+		gotDir, gotBase = configDir, configBase
+		return nil
 	}
-	if err := os.WriteFile(configPath, []byte("system { host-name fw; }\n"), 0o600); err != nil {
-		t.Fatalf("seed site.conf: %v", err)
-	}
-	rollbackSlot := configPath + ".1"
-	if err := os.WriteFile(rollbackSlot, []byte("system { host-name old; }\n"), 0o600); err != nil {
-		t.Fatalf("seed rollback slot: %v", err)
-	}
+	zeroizeStopDaemon = func() error { return nil }
 
 	c := &CLI{store: store}
-	if err := c.zeroizeConfigState(); err != nil {
-		t.Fatalf("zeroizeConfigState: %v", err)
+	if err := c.performConsoleZeroize(); err != nil {
+		t.Fatalf("performConsoleZeroize: %v", err)
 	}
 
-	// The config-DB SSOT under the CONFIGURED root must be gone.
-	if _, err := os.Stat(filepath.Join(dir, ".configdb")); !os.IsNotExist(err) {
-		t.Fatalf(".configdb under the configured root %q survived zeroize (stat err=%v); "+
-			"the wipe hit the wrong (hardcoded) directory", dir, err)
+	if !called {
+		t.Fatal("console zeroize did not invoke the shared full-wipe primitive")
 	}
-	// The numbered text rollback slot (full config text w/ secret leaves) too.
-	if _, err := os.Stat(rollbackSlot); !os.IsNotExist(err) {
-		t.Fatalf("rollback slot %q survived zeroize (stat err=%v)", rollbackSlot, err)
+	if gotDir != dir {
+		t.Fatalf("console zeroize wiped configDir %q, want the CONFIGURED root %q (not hardcoded /etc/xpf)", gotDir, dir)
 	}
-	// And the live config text.
-	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
-		t.Fatalf("config file %q survived zeroize (stat err=%v)", configPath, err)
+	if gotBase != "site.conf" {
+		t.Fatalf("console zeroize wiped configBase %q, want %q", gotBase, "site.conf")
+	}
+	if gotDir == "/etc/xpf" {
+		t.Fatalf("console zeroize resolved the hardcoded default /etc/xpf instead of %q", dir)
 	}
 }

@@ -396,6 +396,24 @@ func completePipeFilter(text string) (candidates []completionCandidate, handled 
 	return candidates, true
 }
 
+func appendPredefinedApplicationSetCompletions(out []config.SchemaCompletion) []config.SchemaCompletion {
+	emitted := make(map[string]struct{}, len(out)+len(config.PredefinedApplicationSets))
+	for _, candidate := range out {
+		emitted[candidate.Name] = struct{}{}
+	}
+	for name := range config.PredefinedApplicationSets {
+		if _, exists := emitted[name]; exists {
+			continue
+		}
+		out = append(out, config.SchemaCompletion{
+			Name: name,
+			Desc: "predefined application-set",
+		})
+		emitted[name] = struct{}{}
+	}
+	return out
+}
+
 // #1044c Phase 1: valueProvider relocated from cli.go (no behavior change).
 func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.SchemaCompletion {
 	cfg := c.store.ActiveConfig()
@@ -438,13 +456,13 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 		for name := range config.PredefinedApplications {
 			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
 		}
-		return out
+		return appendPredefinedApplicationSetCompletions(out)
 	case config.ValueHintAppSetName:
 		var out []config.SchemaCompletion
 		for _, as := range cfg.Applications.ApplicationSets {
 			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
 		}
-		return out
+		return appendPredefinedApplicationSetCompletions(out)
 	case config.ValueHintPoolName:
 		var out []config.SchemaCompletion
 		for name := range cfg.Security.NAT.SourcePools {
@@ -471,6 +489,9 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 	case config.ValueHintInterfaceName:
 		var out []config.SchemaCompletion
 		for name, iface := range cfg.Interfaces.Interfaces {
+			if iface == nil { // #5886: skip present-but-nil InterfaceConfig
+				continue
+			}
 			// #5068: skip a present-but-nil interface value (tolerant /
 			// HA-sync path admits it, #3494) rather than dereferencing
 			// iface.Description and panicking the completion.
@@ -512,7 +533,7 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 		for name := range config.PredefinedApplications {
 			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
 		}
-		return out
+		return appendPredefinedApplicationSetCompletions(out)
 	case config.ValueHintPolicyName:
 		// Extract zone pair from path: ["security","policies","from-zone","X","to-zone","Y","policy"]
 		// or global: ["security","policies","global","policy"]
@@ -571,6 +592,9 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 		}
 		var out []config.SchemaCompletion
 		for num, unit := range iface.Units {
+			if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+				continue
+			}
 			// #5068: skip a present-but-nil unit value (tolerant / HA-sync
 			// path admits it, #3494) rather than dereferencing
 			// unit.Description and panicking the completion.

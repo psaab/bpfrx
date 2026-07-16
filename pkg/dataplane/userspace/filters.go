@@ -11,6 +11,14 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
+// flexMatchStartUnrepresentable is the sentinel match-start emitted for a term
+// whose flexible-match-range is UNREPRESENTABLE on the wire (#5823: more than
+// one range named for a single term). It is deliberately NOT "layer-3" /
+// "layer-4", so the Rust filter compiler lowers it to
+// FlexMatchStart::Unsupported and flex_matches() returns false — the term
+// matches NOTHING (fail-closed) rather than enforcing only the first range.
+const flexMatchStartUnrepresentable = "unrepresentable-multi-range"
+
 // BuildFirewallFilterSnapshots returns the effective (compiled) firewall-filter
 // snapshots the userspace dataplane actually receives for cfg — the same value
 // buildSnapshot threads into ConfigSnapshot.Filters. It is exported so the
@@ -274,7 +282,37 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		// byte offset is L3-relative (match-start layer-3, the only start point
 		// the compiler emits). A zero effective length is dropped (no
 		// constraint) rather than emitted as a degenerate always-fail match.
-		if fm := term.FlexMatch; fm != nil {
+		if len(term.FlexMatchRangeNames) > 1 {
+			// #5823: the term names more than one flexible-match-range range;
+			// the wire matcher supports exactly one. The strict commit gate
+			// (validateFilterFlexMatchStrict) already rejects this, so a term
+			// reaches here ONLY on the tolerant load / peer-sync path (#1960).
+			// Silently enforcing just the first range is fail-OPEN — the packets
+			// the other ranges covered escape the intended match (an accept term
+			// over-permits, a discard/reject over-drops). Fail CLOSED: emit an
+			// UNREPRESENTABLE flex-match so the term matches NOTHING. A
+			// non-{layer-3,layer-4} match-start lowers to
+			// FlexMatchStart::Unsupported in the Rust matcher, whose
+			// flex_matches() returns false for the term (never the wrong-base
+			// match) — the existing per-term fail-closed channel, so no
+			// multi-range support is added to the wire/matcher. Length stays
+			// 1..=4 so flex_enabled is true (a length outside that range would
+			// instead reject the WHOLE snapshot); Value/Mask are unread once the
+			// start is Unsupported.
+			slog.Warn("firewall filter term names multiple flexible-match-range ranges; "+
+				"the dataplane supports one — poisoning the term to match nothing "+
+				"(fail-closed) until the config is split into separate terms",
+				"filter_term", term.Name,
+				"ranges", strings.Join(term.FlexMatchRangeNames, ","),
+				"issue", "#5823")
+			snap.FlexMatch = &FlexMatchSnapshot{
+				Offset:     0,
+				Length:     1,
+				Value:      0,
+				Mask:       0,
+				MatchStart: flexMatchStartUnrepresentable,
+			}
+		} else if fm := term.FlexMatch; fm != nil {
 			// #3203: round UP to whole bytes so a non-multiple-of-8 bit length
 			// (e.g. 12 bits -> 2 bytes) reads enough bytes to cover the field.
 			// Integer truncation (BitLength/8) gave 1 byte for 12 bits, dropping

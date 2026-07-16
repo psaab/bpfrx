@@ -1,3 +1,278 @@
+## 2026-07-15 — #5827 (config/security): cap retained parse diagnostics (heap DoS)
+- **Timestamp**: 2026-07-15 (fix/5827-parse-error-cap)
+- **Action**: The recursive-descent config parser (pkg/config/parser.go) recorded
+  one ParseError per bad token via an UNCAPPED addError — so an all-invalid
+  payload up to the 16 MiB MaxConfigSize pinned ~16 million ParseError structs
+  (each holding a formatted message string) LIVE simultaneously: an unbounded-heap
+  OOM DoS reachable unauthenticated from the localhost gRPC/REST config-load API
+  AND the HA peer config-sync ingress. Fix: added `const maxParseErrors = 64` and
+  capped the RETAINED diagnostic set in addError + a new addErrorf (lazy-format so
+  the fmt.Sprintf call sites don't even allocate past the cap). Past the cap, both
+  count the drop in a saturating `Parser.suppressed` and return without appending;
+  Parse folds the count into ONE deterministic trailing "additional parse errors
+  suppressed (N)" diagnostic → len(errs) bounded to maxParseErrors+1, retained heap
+  O(cap), regardless of input size. The first ≤64 diagnostics keep parse order +
+  line/column. The lexer still drains the whole input O(input) for deterministic
+  termination (only RETENTION is capped) — mirrors the existing depth-cap
+  suppression (skipToBlockClose). ParseSetVerb/ParseSetCommand (flat-set) are
+  already bounded (return on the first bad token) — the shared cap needs no change
+  there. No cancellation/deadline added: input is pre-capped at 16 MiB and the
+  parse is O(input) linear.
+- **Validation**: gofmt clean; go build ./...; go vet ./pkg/config/ clean;
+  go test -race ./pkg/config/ (131s — the 16 MiB / 8 MiB DoS regression tests
+  under race instrumentation) + ./pkg/configstore/ GREEN. Fail-on-revert (overlay,
+  uncap addError/addErrorf): the retained-heap-budget test RED (524 MiB retained
+  for an 8 MiB payload vs 64 MiB budget), the mixed-order test RED (len 192 vs
+  ≤65), the depth×token test RED (434 vs ≤65). Existing config tests unaffected
+  (they assert len==0/>0, cap-safe).
+- **File(s)**: pkg/config/parser.go (Edit),
+  pkg/config/parser_error_cap_5827_test.go (Write),
+  pkg/configstore/parse_error_cap_5827_test.go (Write),
+  pkg/config/README.md (Edit), _Log.md (Edit)
+
+## 2026-07-15 — #5832 (bug/audit/security): commit-time gate for Linux interface-name collisions
+- **Timestamp**: 2026-07-15 (fix/5832-ifname-collision-gate)
+- **Action**: config.LinuxIfName only does ReplaceAll("/","-") — NOT injective.
+  Distinct authored interface names ge-0/0/0 and ge-0-0-0 canonicalize to the
+  SAME Linux device / ifindex. The Go forwarding snapshot emits BOTH logical
+  rows (each with its own zone / routing-instance / host-inbound / NAT /
+  address / tunnel identity); the Rust forwarding-state builder keys by ifindex
+  and OVERWRITES the earlier row — and since the snapshot is walked in Go's
+  sorted-name order, the lexicographically LATER colliding name deterministically
+  wins, SILENTLY changing the security zone + routing identity of packets on that
+  shared device. No commit gate existed. Added
+  validateInterfaceNameCollisionStrict
+  (compiler_validate_strict_ifname_collision.go) wired into runUniformGates,
+  gated by new opts.lenientIfNameCollision: STRICT CompileConfig (interactive /
+  gRPC commit + commit-check) HARD-REJECTS a config where two distinct authored
+  names canonicalize to the same LinuxIfName (naming both names, the shared
+  device, and the lex-later winner) OR where a canonical name exceeds the kernel
+  IFNAMSIZ limit (15 bytes + NUL). LENIENT CompileConfigLenient /
+  CompileConfigForNodeLenient (Store.Load / SyncApply / peer-sync) downgrades to
+  a single cfg.Warnings entry naming the winner, so a grandfathered / peer-synced
+  collision still boots (#1960 no-brick) but the overwrite is no longer silent.
+  The fix is a GATE, not a remapping — LinuxIfName's mapping is unchanged, so
+  every existing single-name config compiles exactly as before (no false
+  reject; realistic vSRX names are well under 15 bytes and never collide).
+- **Validation**: gofmt clean; go build ./... + go vet ./pkg/config clean;
+  go test ./pkg/config + ./pkg/configstore + ./pkg/dataplane/userspace +
+  ./pkg/daemon green (no existing fixture collides). Fail-on-revert: neutralizing
+  the gate makes the colliding config compile (strict) and the lenient load emit
+  no warning → all three assertions RED; restored → GREEN.
+- **File(s)**: pkg/config/compiler_validate_strict_ifname_collision.go (Write),
+  pkg/config/compiler.go (Edit), pkg/config/compiler_uniformgates.go (Edit),
+  pkg/config/ifname_collision_5832_test.go (Write),
+  pkg/config/README.md (Edit), _Log.md (Edit)
+
+## 2026-07-15 — #5844 (bug/security/HIGH): routing-rule reconcile errors fail the commit closed
+- **Timestamp**: 2026-07-15 (fix/5844-routing-rule-reconcile-failclosed)
+- **Action**: `pkg/routing` correctly RETURNS next-table / rib-group / PBR
+  ip-rule reconcile failures, but the daemon call site (`applyRoutingRules`,
+  pkg/daemon/daemon_apply.go) was VOID and LOGGED-and-DROPPED them. So a commit
+  was ACKNOWLEDGED after a partial clear/add left stale-or-missing cross-VRF
+  policy in the kernel — and the immediately-following userspace route snapshot
+  (`reconcileRouteLeakSnapshot`) canonized that partial live kernel state into
+  the FIB. Made `applyRoutingRules` RETURN `errors.Join` of the three kernel
+  reconcile failures (ApplyNextTableRules / ApplyRibGroupRules / ApplyPBRRules),
+  collected while STILL running every rule type after one fails (fail-closed but
+  COMPLETE), keeping the per-error logging. `applyConfigLocked` captures it
+  (`routingRuleErr`) and threads it into the SAME tail `errors.Join` sink the
+  snapshot error uses (new final `applyTailReconciles` param); the snapshot
+  republish still runs first (ordering preserved). Mirrors the #5310 ifaceErr /
+  #5696 routeLeakErr deferred-error pattern. `BuildPBRRules` *build degradation*
+  is deliberately NOT joined — it is a fail-SAFE representability under-steer
+  (unrepresentable-as-ip-rule term dropped to the main table, still enforced by
+  the userspace filter path), not a partial kernel mutation, so fail-closing it
+  would reject configs that commit fine today.
+- **Validation**: gofmt clean; go build ./...; go test ./pkg/daemon/
+  ./pkg/routing/ -count=1 green; go vet ./pkg/daemon/ clean. Fail-on-revert
+  proven via overlay: dropping routingRuleErr from the tail join flips
+  TestApplyTailReconcilesSurfacesRoutingRuleError_5844 RED (commit returns nil
+  despite the injected failure); reverting applyRoutingRules to void breaks
+  compilation of the direct test.
+- **File(s)**: pkg/daemon/daemon_apply.go (Edit),
+  pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go (Write),
+  pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go (Edit, arity),
+  pkg/daemon/route_leak_snapshot_failclosed_5696_test.go (Edit, arity),
+  pkg/daemon/device_map_teardown_failclosed_5309_test.go (Edit, arity),
+  pkg/daemon/README.md (Edit), _Log.md (Edit)
+## 2026-07-15 — #5833 (bug/audit/security): quarantine SNMP community on malformed clients token (lenient fail-closed)
+- **Timestamp**: 2026-07-15 (fix/5833-snmp-lenient-quarantine)
+- **Action**: #4834 fixed STRICT-commit rejection of malformed SNMP `clients`
+  tokens but its LENIENT load/peer-sync branch preserved the pre-fix runtime
+  behaviour, which is FAIL-OPEN for the `restrict` typo: `clients 0.0.0.0/0
+  restric` (missing 't') detaches the modifier, so `0.0.0.0/0` survives as an
+  unrestricted allow and compileClientNets silently drops only the bad token —
+  on restart/upgrade/peer-sync the community answers from every IPv4 source.
+  Fix: on the lenient path, when a community's `clients` list carries ANY
+  malformed token, QUARANTINE that community to deny-all instead of keeping the
+  surviving broad allow. validateSNMPClients now also returns a `malformed`
+  flag; compileSNMP records it per-community (sticky across #5472 same-name
+  merge blocks so a later well-formed block cannot reopen it) and overrides the
+  community's clientNets enforcement cache with snmpQuarantineClientNets()
+  (explicit `0.0.0.0/0 restrict` + `::/0 restrict` → AllowsSource denies every
+  source). Only the derived clientNets cache is overridden, NOT comm.Clients
+  (the config surface marshaled to the API / hashed by the SNMP reconcile), so
+  the operator's config text is preserved for display/change-detection; only
+  runtime enforcement is forced closed. The rest of the config (other
+  communities, other stanzas) still loads with a warning. Strict commit path
+  unchanged (still hard-rejects). Well-formed communities are not
+  quarantined (no false positives).
+- **Validation**: gofmt clean; go build ./... + go vet ./pkg/config + go test
+  ./pkg/config green. Fail-on-revert: neutralizing the clientNets override makes
+  the quarantined community allow 8.8.8.8/10.1.2.3/192.168.1.1 → RED; restored →
+  GREEN. New tests assert deny-all + rest-of-config-loads + no-false-quarantine;
+  strict-reject tests unchanged.
+- **File(s)**: pkg/config/snmp_clients.go (Edit),
+  pkg/config/compiler_system.go (Edit),
+  pkg/config/snmp_clients_4834_test.go (Edit),
+  docs/feature-coverage.md (Edit), _Log.md (Edit)
+## 2026-07-15 — #5811 (bug/audit/security): global-only clear commands enforce exact arity
+- **Timestamp**: 2026-07-15 (fix/5811-clear-exact-arity)
+- **Action**: Global-only `clear` handlers (whose backend action can ONLY clear
+  everything, no scoped variant) recognized a fixed keyword prefix and silently
+  DISCARDED every trailing token, then issued the unscoped mutation. So a
+  scoped-LOOKING command — `clear arp 192.0.2.10`, `clear ipv6 neighbors
+  interface ge-0-0-0`, `clear interfaces statistics ge-0-0-0`, `clear security
+  nat statistics rule web`, `clear security nat source persistent-nat-table pool
+  p1`, `clear security counters zone untrust`, `clear firewall all filter edge`,
+  `clear system config-lock session 42` — reported success while wiping the
+  ENTIRE cache/counter/table. Added a `requireClearNoScope(cmd, clears, extra)`
+  helper (byte-identical copy in `cmd/cli/clear.go` and `pkg/cli/cli_clear.go`)
+  that REJECTS any trailing operand with an "unexpected argument(s) ...; this
+  command clears X and takes no scope" error BEFORE any mutation. Wired it into
+  every global-only clear on BOTH parsers, restoring arity parity (the in-process
+  `policies hit-count` now matches the remote's #5570 guard). Legit scoped clears
+  (`clear security flow session <filter>`, `clear dhcp client-identifier
+  interface <name>`) are untouched. Follow-up candidate (out of #5811 scope): the
+  in-process `clear dhcp client-identifier` does not mirror the remote's #4883-E
+  malformed-selector guard.
+- **Validation**: gofmt clean; go build ./... + go test ./cmd/cli/ ./pkg/cli/
+  -count=1 green; go vet clean apart from a pre-existing cli.go unreachable-code
+  note in an untouched file. Fail-on-revert proven via overlay: neutralizing
+  requireClearNoScope (discard suffix) flips the reject tests RED on BOTH parsers
+  (no error returned; the dp/RPC mutation runs).
+- **File(s)**: cmd/cli/clear.go (Edit), pkg/cli/cli_clear.go (Edit),
+  cmd/cli/clear_exact_arity_5811_test.go (Write),
+  pkg/cli/cli_clear_exact_arity_5811_test.go (Write), pkg/cli/README.md (Edit),
+  _Log.md (Edit)
+
+## 2026-07-15 — #5846 (bug/security/HIGH): stale-STOPPED upgrade recovery fails closed on restart failure
+- **Timestamp**: 2026-07-15 (fix/5846-stopped-recovery-restart-failclosed)
+- **Action**: In the resume-vs-fresh recovery (pkg/upgrade/cutover.go, Runner.Run),
+  when a stale journal's target A differs from the newly-staged B and its State is
+  STOPPED, recovery restarts the still-current KNOWN-GOOD daemon (the stopped cut
+  never flipped `current`). The pre-fix code only LOGGED a StartUnit failure, then
+  removeAllPartials + reset the journal and PROCEEDED into a fresh cut to B — so
+  the new cut used PreviousVersion (read from `current`) = the version that JUST
+  FAILED TO RESTART as its rollback target while the control plane was DOWN, and
+  the stale-recovery evidence was destroyed. Fix: if StartUnit fails during
+  stale-STOPPED recovery, return the error immediately (fail-closed) — do NOT
+  removeAllPartials, do NOT reset the journal. Preserve the stale journal +
+  partials so an operator or the next-boot re-run retries; a fresh cut proceeds
+  ONLY when the known-good restart succeeds. Scoped strictly to the STOPPED
+  sub-arm; the pure STAGED/PREFLIGHT/COPIED/VERIFIED sub-states (daemon never
+  stopped, live untouched) are unchanged. Mirrors the #5845 rolling.go/
+  kernel_drain.go fail-closed-on-lifecycle-error posture (errors-wrapped %w).
+- **Validation**: gofmt clean; go build ./...; go vet ./pkg/upgrade/ clean;
+  go test ./pkg/upgrade/ green. Fail-on-revert: a stale-STOPPED superseded
+  recovery with an injected StartUnit failure ABORTS (returns the error, current
+  stays 1.0.0, no verify/dropin for B, on-disk journal preserved as STOPPED/2.0.0,
+  partial dir preserved); the StartUnit-SUCCESS variant proceeds to the fresh 3.0.0
+  cut unchanged. Reverting to the swallow-and-log form flips the abort test RED
+  (confirmed via overlay).
+- **File(s)**: pkg/upgrade/cutover.go (Edit),
+  pkg/upgrade/stopped_recovery_restart_5846_test.go (Write),
+  docs/in-place-upgrade.md (Edit), _Log.md (Edit)
+## 2026-07-15 — #5853 (bug): event-options action queue dedups early (one-per-policy on every enqueue)
+- **Timestamp**: 2026-07-15 (fix/5853-eventqueue-dedup-early)
+- **Action**: The action queue documents "at most one pending action per policy"
+  (dedup-by-policy) but `enqueue` (pkg/eventengine/engine.go) did an unconditional
+  fast-path channel send and only ran the `supersede` dedup in the full/`default`
+  branch. So while the worker was blocked behind the config lock, a burst from ONE
+  policy filled all 64 slots with redundant duplicates (later discarded by
+  cooldown/staleness) and the NEXT remediation for an UNRELATED policy was dropped
+  queue-full — one flapping policy could starve every other policy. Fix: enqueue
+  now runs `supersede` on EVERY enqueue (removed the fast-path send + default), so
+  a same-policy duplicate REPLACES the queued entry (≤1 slot) instead of taking a
+  new one, leaving slots free for other policies. Reused the already-proven
+  supersede (drain → drop same-policy → refill survivors FIFO + new at tail,
+  #2869) under the producer-only enqueueMu — worker stays lock-free, no new shared
+  state. Counter correctness: the same-policy supersede-drop now increments a new
+  `Superseded` counter (benign dedup — the newer equivalent action still runs)
+  instead of `droppedQueueFull`; droppedQueueFull is reserved for genuine capacity
+  loss (queue full of OTHER policies, unfittable new arrival / lost survivor), so
+  the alert-worthy `xpf_event_actions_dropped_total{reason=queue_full}` metric is
+  no longer inflated by routine bursts. Exposed `xpf_event_actions_superseded_total`
+  in the Prometheus collector.
+- **Validation**: gofmt clean; go build ./...; go vet ./pkg/eventengine/
+  ./pkg/api/ clean; go test ./pkg/eventengine/ -race + ./pkg/api/ green.
+  Fail-on-revert: a same-policy burst of exactly actionQueueDepth events occupies
+  1 slot (pre-fix 64) and an unrelated policy still enqueues (pre-fix dropped);
+  reverting enqueue to dedup-only-when-full flips the new
+  TestQueue_SamePolicyBurstDoesNotStarveOthers_5853 + the updated
+  TestQueue_DedupByPolicy (Superseded>=1 / DroppedQueueFull==0 / QueueDepth<=1)
+  RED. The #3750 cooldown-suppresses-queued-duplicate test behavior is preserved
+  (event #1 is in-flight in the worker, so the early dedup finds nothing queued to
+  supersede and #2 still queues) — comment updated.
+- **File(s)**: pkg/eventengine/engine.go (Edit),
+  pkg/eventengine/engine_dedup_early_5853_test.go (Write),
+  pkg/eventengine/engine_integration_test.go (Edit),
+  pkg/eventengine/engine_stale_revalidate_3750_test.go (Edit),
+  pkg/eventengine/README.md (Edit), pkg/api/metrics.go (Edit),
+  pkg/api/metrics_descriptors.go (Edit), pkg/api/metrics_system.go (Edit),
+  _Log.md (Edit)
+
+## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
+- **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
+- **Action**: Aligned the CLI in-process commit path (reloadSyslog /
+  buildSyslogClients, pkg/cli/apply.go) with the daemon's applySyslogConfig on
+  the two remaining non-confidentiality divergences (#5712 covered the
+  security-relevant fields). Because the CLI reload writes LAST on a local
+  commit, these were not self-corrected. Gap 1 (source-interface fallback):
+  buildSyslogClients now resolves the global source-interface via
+  config.ResolveSyslogSourceAddr and uses it when a stream has no per-stream
+  source-address, byte-matching the daemon; previously it passed
+  stream.SourceAddress unconditionally so a source-interface-only stream bound a
+  kernel-chosen source on a local commit. Gap 2 (event mode): reloadSyslog now
+  honors Mode == "event" exactly like the daemon — clear remote clients + install
+  a local writer — and clears stale local writers in stream mode; previously it
+  unconditionally rebuilt remote clients, re-installing the ones the daemon had
+  cleared. Added SyslogClient.SourceAddr() and EventReader.LocalWriterCount()
+  observability accessors (symmetric with Protocol() / SyslogClientCount()) for
+  fail-on-revert assertions. The #5712 transport-idempotence tests remain green.
+- **Validation**: gofmt clean (touched files); go build ./... + go vet
+  (touched pkgs) clean apart from a pre-existing cli.go unreachable-code note in
+  an untouched file; go test ./pkg/cli/ ./pkg/logging/ ./pkg/config/
+  ./pkg/daemon/ green. Fail-on-revert proven RED then restored GREEN for gap 1
+  (source binding empties), gap 2 event-clear (remote count 1), and gap 2
+  stream-writer-clear (writer count 1).
+- **File(s)**: pkg/cli/apply.go (Edit),
+  pkg/cli/syslog_source_iface_parity_5738_test.go (Write),
+  pkg/logging/syslog.go (Edit), pkg/logging/ringbuf.go (Edit), _Log.md (Edit)
+
+## 2026-07-15 — #5738 (bug/syslog) commit 1/2: move resolveSourceAddr into pkg/config
+- **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
+- **Action**: Pure code-motion. The syslog source-interface resolver lived in
+  pkg/daemon (unexported resolveSourceAddr) so the CLI in-process commit path
+  could not reuse it. Moved it verbatim to pkg/config as the exported
+  ResolveSyslogSourceAddr (least-surprising shared home: it is a pure function
+  of a *config.Config, and pkg/config already documents its semantics in
+  ValidateSyslogSourceInterface). Behavior is byte-identical; only the package,
+  name, and receiver-parameter type change. Updated the sole daemon caller
+  (applySyslogConfig) to config.ResolveSyslogSourceAddr, dropped the now-unused
+  strconv import from daemon_system.go, moved the resolver unit tests into
+  pkg/config, and repointed the doc references in schema_validators_logging.go
+  to the new location. No behavior change; sets up commit 2 which teaches the
+  CLI path to use the shared fallback.
+- **Validation**: go build ./pkg/config/ ./pkg/daemon/ clean; go vet clean;
+  moved resolver tests pass in pkg/config; daemon syslog tests still green.
+- **File(s)**: pkg/config/syslog_source.go (Write),
+  pkg/config/syslog_source_test.go (Write),
+  pkg/daemon/daemon_system.go (Edit),
+  pkg/daemon/syslog_source_test.go (git rm),
+  pkg/config/schema_validators_logging.go (Edit), _Log.md (Edit)
+
 ## 2026-07-12 — #5633 (bug/config/routing): reject contradictory duplicate-route dispositions at commit
 - **Timestamp**: 2026-07-12 (fix/5633-dup-route-contradiction)
 - **Action**: codex-review-181 M25 / A3-b02-F03. The static-route merge in
@@ -47964,6 +48239,33 @@ top.
   the single-root no-regression case stayed GREEN; restored GREEN.
 
 - **Timestamp**: 2026-07-13
+  **Action**: #5302 (codex-review-178 A5-b1-F5, vsrx-parity) — RA sender cached
+  net.Interface.HardwareAddr at Start, so a post-RETH/VLAN-virtual-MAC-change
+  ResendBurst advertised a STALE ICMPv6 SLLA. buildRA (sender.go:800) marshals
+  s.iface.HardwareAddr, re-read only inside listen()'s bind-retry. A day-2
+  failover reprograms the virtual MAC while RA config is unchanged → RA
+  reconciliation keeps the sender and only requests a burst (ResendBurst →
+  burstCh) without re-resolving → the burst carries the OLD MAC → hosts point
+  the router's neighbor entry at a MAC the active node no longer owns (IPv6
+  blackhole, opposite of RA's neighbor-repair intent). Fix: added
+  interfaceByNameFn seam (default net.InterfaceByName; also backs listen()'s
+  existing re-read) and refreshInterfaceForBurst() — an OWNER-serialized
+  re-resolve (runs in the run() goroutine that solely owns s.iface, never
+  concurrent with listen()) invoked in the burstCh handler BEFORE
+  burstInterruptible; a successful refresh also freshens subsequent periodic
+  sends. On refresh failure the burst is SKIPPED + slog.Warn (advertising a
+  stale MAC is worse than sending nothing). No daemon_apply.go change needed —
+  the existing ResendBurst trigger (daemon_apply.go:1287, post-NotifyLinkCycle)
+  now refreshes automatically. Updated pkg/ra/README.md ResendBurst contract.
+  **File(s)**: pkg/ra/sender.go, pkg/ra/README.md,
+  pkg/ra/ra_mac_refresh_5302_test.go
+  GREEN: go test ./pkg/ra/... (incl -race on the new tests) passes; gofmt + go
+  vet + go build clean. Fail-on-revert proven: neutralizing the burstCh-handler
+  refresh (unconditional burstInterruptible) →
+  TestResendBurstRefreshesSLLAAfterMACChange_5302 RED (burst kept advertising
+  MAC ...00:0a, want ...00:0b) + TestResendBurstSkipsOnRefreshFailure_5302 RED
+  (burst sent 3 stale RAs, want 0); restored GREEN. Live post-failover
+  neighbor-repair verify is cluster-shim-ABI-walled → deferred.
   **Action**: Fix #5784 — `system archival transfer-interval` (config-minutes)
   was multiplied by time.Minute with no product-side overflow clamp before
   time.NewTicker (daemon_archive_timer.go runArchiveTimer). Same class as the
@@ -47992,3 +48294,762 @@ top.
 - **File(s)**: pkg/vrrp/vrrp.go, pkg/vrrp/manager.go, pkg/vrrp/instance.go, pkg/vrrp/collector_identity_5083_test.go, pkg/api/vrrp.go, pkg/grpcapi/server_nat.go, pkg/cli/cli_show_routing.go, pkg/vrrp/README.md, _Log.md
 - **Adversarial restack hardening (2026-07-14)**: Rebased onto master and closed four identity-boundary gaps missed by the original happy-path review. The parse key's configured address is now authoritative over a malformed VIP when deriving family. All raw/AF_PACKET RX paths reject the opposite family before state-machine admission; IPv6-only instances no longer require IPv4 raw sockets and required IPv6 socket failures roll back all opened descriptors instead of publishing a false-ready instance; duplicate `{kernel iface, VRID, family}` identities and empty-family RETH/generic wire-domain overlaps are rejected transactionally and propagated through the commit error join; and `VRRPEvent`/`InstanceStates` retain family so cluster RG controls ignore standalone VRIDs that numerically overlap `100+RG`. Added fail-on-revert parser, socket-selection/rollback, collision-transaction, commit-propagation, event-identity, and RETH-isolation tests.
 - **Additional file(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_ha.go, pkg/daemon/per_rg_test.go, pkg/daemon/vrrp_identity_failclosed_5083_test.go
+
+- **Timestamp**: 2026-07-13 20:15 PDT
+  **Action**: Fix #5759 — make successful cold-boot host-inbound fallback
+  publication exactly `S'=D`, where `D=V||U4||U6` is computed from the same
+  zone-view and unzoned-address slices rendered into the fallback. The nft
+  transaction completes before Store; a fallback containing an address-scoped
+  DROP stores true, while a successful zero-drop table shell leaves false so a
+  later failed real invocation reaching host authorization can try its own
+  snapshot. The flag remains historical rather than proof of table presence,
+  generation coverage, or atomic kernel/Go publication. Added the exact
+  four-payload addressless-to-addressed proof and independent fresh-daemon IPv4
+  and IPv6 U-only proofs. Full-recompile DHCP classification runs serialized
+  `applyConfig`, but provides another opportunity only when the apply reaches
+  `applyTailReconciles`; a required protocol-gate error returns before that tail
+  with no cancellation closeout. This does not add callback-to-tail integration
+  coverage. #5789 retains generation/new-address ownership, #5790 teardown
+  sticky-state ownership, and #5791 management-only classification ownership.
+  Corrected that contract in `zones_host_inbound.go`, the daemon README, source
+  comments, and the host-inbound service matrix.
+  **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/daemon.go,
+  pkg/daemon/host_inbound_coldboot_fence_5644_test.go,
+  pkg/dataplane/userspace/zones_host_inbound.go, pkg/daemon/README.md,
+  docs/host-inbound-service-matrix.md, _Log.md
+  **Mutation RED**: with successful-fallback Store temporarily unconditional,
+  `go test -count=1 ./pkg/daemon -run
+  'TestColdBootZeroDropFenceRetriesAfterAddressAppears5759$'` failed at
+  `zero-drop fallback must leave state false`; that fatal assertion ended the
+  test before a fourth-payload observation. With the predicate temporarily
+  reduced to `S'=V`, `go test -count=1 ./pkg/daemon -run
+  'TestColdBootFenceUnzonedDropPublishesState5759$'` validated each exact
+  fallback payload, then both `ipv4` and `ipv6` rows failed at `successful
+  U-only fallback must publish true`. Restored `S'=V||U4||U6` before GREEN.
+  **GREEN**: with `TMPDIR`, `GOTMPDIR`, and `GOCACHE` under `/dev/shm`, the
+  required focused daemon fence/DHCP test command passed; `go test -race
+  -count=1 ./pkg/daemon -run
+  'Test(ColdBootZeroDropFenceRetriesAfterAddressAppears5759|ColdBootFenceUnzonedDropPublishesState5759)$'`
+  passed; the required protocol-gate/cancellation-closeout daemon command,
+  userspace view/unzoned-builder command, and DHCP `TestCommitLease` command all
+  passed. `go test -count=1 ./pkg/daemon/...`, `go vet ./pkg/daemon/...
+  ./pkg/dataplane/userspace/...`, and `go build ./...` passed. The first full
+  daemon run used a long `/dev/shm/xpf-5759-gotmp` path and failed only because
+  the event-stream test socket exceeded the Unix path limit (`connect: invalid
+  argument`); the isolated test and full daemon suite both passed after using
+  the shorter pre-created `/dev/shm/g5` path. Required documentation regex
+  guards and `git diff --check` passed.
+- **Timestamp**: 2026-07-14 14:15 PDT
+  **Action**: Fix #4162 — make Prometheus metrics authentication listener-owned.
+  `NewServer` now builds the mux, Prometheus collector/limiter, and CSRF guard
+  once, then independently derives each HTTP/HTTPS owner handler from that
+  listener's configured bind. With API auth, only a literal loopback listener
+  leaves `/metrics` open; routable, wildcard, hostname, malformed, and
+  otherwise unprovable binds fail closed. Nil auth returns the unchanged shared
+  base. This preserves the global scrape limiter and session-gauge cache while
+  keeping `/health` exempt. The actual owner-handler matrix covers both mixed
+  listener orientations, Basic/Bearer/API-key credentials, IPv4/IPv6 loopback,
+  wildcard/hostname/malformed failure, auth-wrapped health/non-metrics routes,
+  nil-auth 404 pass-through, and persistence-degraded HTTPS installation.
+  **File(s)**: pkg/api/server.go, pkg/api/auth.go,
+  pkg/api/metrics_auth_gate_4162_test.go, docs/architecture.md, _Log.md
+  **Validation**: `gofmt -w pkg/api/server.go pkg/api/auth.go
+  pkg/api/metrics_auth_gate_4162_test.go`; focused #4162/cache/TLS/lifecycle
+  `go test ./pkg/api -run 'Test(IsLoopbackBindAddr|MetricsAuthGateNonLoopback|NewServerMetricsAuthIsOwnedByEachListener|SessionGaugeCacheWalksOncePerTTL|SessionGaugeCacheRefreshesAfterTTL|SessionGaugeCacheCoalescesConcurrentScrapes|SessionGaugeCacheValuesCorrect|HTTPSInstalledOnPersistFailure|RunClosesSurvivingListenerOnBindFailure|RunGracefulShutdownClosesBothListeners)$' -count=1`; `go test ./pkg/api -count=1`; `go test -race ./pkg/api -count=1`; `go vet ./pkg/api`; `go build ./pkg/api`; `go build ./cmd/xpfd`; all passed. `git diff --check` passed. Residual gaps: none; no true certificate-generation-failure seam exists in the approved scope.
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5302 review fold (MERGE-NEEDS-MINOR): remove the only
+  cross-goroutine `s.iface` read in the RA sender. rsReceiver's RFC 4861
+  §6.1.1 discard log read `s.iface.Name` from its own goroutine while the
+  new `refreshInterfaceForBurst` writes `s.iface` in run() — a formal
+  (value-benign, Name is invariant) data race per the Go memory model.
+  Switch that log to the immutable `s.cfg.Interface` (matches every other
+  log site) so `s.iface` is single-writer / no-other-reader, and correct
+  the ownership comment to state the reader disposition instead of
+  overstating "sole writer ⇒ no lock".
+  **File(s)**: pkg/ra/sender.go, _Log.md
+  **Validation**: `go build ./pkg/ra`; `go test -race ./pkg/ra
+  -run '5302|ResendBurst|RefreshInterface' -count=1` (green); full
+  `go test ./pkg/ra -count=1` re-run below; fail-on-revert of the
+  burstCh refresh still flips the 5302 tests RED.
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5872 (bug, audit, security): bound + namespace + collision-check
+  the generated FRR route-policy access-list name. When a route-map sequence
+  carries both a same-family route-filter `match ip|ipv6 address prefix-list`
+  line and a `from prefix-list` match, the renderer materializes the
+  from-prefix-list as an access-list (distinct FRR rule type, #5730). The name
+  was `fromPrefixList + "_rf"` — a bare concatenation of an operator-controlled
+  Junos identifier with no namespace, no byte-length bound, and no collision
+  registry: a long name could exceed FRR's ~128-byte access-list identifier
+  limit (reload rejection) and two long names sharing a >=125-byte prefix could
+  truncate-collide inside FRR to one stored token → two access-lists MERGE →
+  silent routing-policy widen/narrow. Added pkg/frr/naming.go:
+  routeFilterACLName(prefixList, matchKW) = reserved `xpf-rf-` namespace +
+  sanitizeFRRIdent-cleaned bounded readable slice + deterministic SHA-256 suffix
+  over (family, FULL name), total <=96 bytes (margin under 128). Hashing the
+  FULL name defeats truncation-collision; determinism = restart-stable. Same
+  value used for BOTH the access-list definition and the route-map reference
+  (one local var). routeFilterACLNameCollision(po) is a fail-closed commit belt
+  wired into ApplyFull beside redistAliasCollision/bgpComposedChainCollision:
+  rejects a reserved-namespace intrusion or a same-family final-name hash
+  collision (FRR keeps last-good config). prefixListMatchKW is the shared family
+  selector so renderer and precheck never disagree. Scoped to the route-policy
+  ACL surface; other FRR identifiers can adopt the helper as a follow-up.
+  **File(s)**: pkg/frr/naming.go, pkg/frr/policy_render.go, pkg/frr/manager.go,
+  pkg/frr/README.md, pkg/frr/naming_5872_test.go,
+  pkg/frr/frr_test.go, pkg/frr/policy_mixedfamily_prefixlist_5702_test.go,
+  _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/frr/ -count=1` (green);
+  `go vet ./pkg/frr/` clean. New fail-on-revert tests cover bound+namespace,
+  truncation-collision (two 200-char names collapse to one 128-byte token under
+  the old scheme), unicode, IPv4+IPv6 render, restart determinism, and
+  definition==reference. Reverting routeFilterACLName to `fromPrefixList +
+  "_rf"` flips the bound/namespace/truncation-collision/unicode tests RED
+  (verified). Updated 2 pre-existing tests that pinned the old `V6ONLY_rf`
+  literal to the helper output.
+  **Action**: #5768 (bug, security): bound factory-reset (zeroize) deletion
+  to xpf-OWNED artifacts. PR #5767 added the lexical FactoryResetForbiddenRoots
+  denylist, but a denylist is inherently incomplete on a wildcard-glob wipe: a
+  custom -config in an UNLISTED shared dir (/data/xpf.conf -> /data) or a SUBDIR
+  of a listed root (/opt/foo/x.conf -> /opt/foo; /opt denied, /opt/foo passes)
+  slipped past it, and the top-level sweep's broad `*.conf` suffix + `rollback*`
+  prefix globs then deleted UNOWNED siblings (a neighbor's foo.conf, xpf's own
+  rendered /etc/frr/frr.conf, a rollback-notes file). Replaced the two globs in
+  BOTH twin wipe primitives (grpcapi.zeroizeConfigDir, configstore.
+  FactoryResetConfigDir) with EXACT xpf-owned name matches: the live config
+  (name == configBase, any extension), rescue.conf (new shared
+  configstore.RescueConfigBase const, wired into Store.rescuePath), the audit
+  journal + rotated segments, the numbered text rollback slots
+  (<configBase>.<N>), and fsatomic crash temps. Dedicated xpf-owned subdir
+  RemoveAll's (.configdb, gRPC tls) and the isFsatomicTemp shape match are kept
+  (under-scoping a temp would strand an owned secret-bearing temp, #5475 — the
+  worse failure). ValidateFactoryResetRoot denylist retained as
+  defense-in-depth. The exact live-config match also fixes a latent bug: a
+  non-".conf" -config base (site.cfg) previously survived the suffix glob.
+  **File(s)**: pkg/grpcapi/server_diag_zeroize.go,
+  pkg/configstore/factory_reset.go, pkg/configstore/store_persist.go,
+  pkg/configstore/README.md,
+  pkg/grpcapi/zeroize_ownership_5768_test.go,
+  pkg/configstore/factory_reset_ownership_5768_test.go, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/grpcapi/ ./pkg/configstore/
+  -count=1` (green); `go vet` clean. New fail-on-revert tests seed a validated
+  config root with owned artifacts + unowned siblings (other.conf, frr.conf,
+  rollback, rollback.bak, an unrelated subdir); after the wipe every owned
+  artifact is erased (no secret-retention regression) and every unowned sibling
+  survives. Restoring the `*.conf`/`rollback*` globs deletes the 4 siblings and
+  flips both tests RED (verified).
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5807 (bug, audit, security): capture SIGTERM/SIGINT BEFORE the
+  mutating startup phases. Run() (pkg/daemon/daemon_run.go) loaded/bootstrapped
+  config, renamed interfaces, initialized managers (FRR/IPsec/RPM/cluster/VRRP/
+  DHCP), ran the first applyConfig, and loaded/Start-ed the dataplane, and only
+  THEN installed signal.NotifyContext (old PHASE 4). A SIGTERM (or daemon-mode
+  SIGINT) during phases 1-3 hit the process default action = immediate kill:
+  runShutdownSequence never ran, leaving partially-applied links/routes/FRR/
+  IPsec/DHCP/HA/dataplane state with no fencing. Fixed by capturing signals at
+  the TOP of Run via a new startupSignalContext() helper (same set: interactive
+  = SIGTERM, daemon = SIGTERM+SIGINT), reassigning ctx so it carries through all
+  phases. Wrapped phases 1-4 in a testable seam: runStartupPhases(ctx, phases)
+  checks ctx.Err() at each phase boundary; runStartupOrAbort(ctx, phases,
+  teardown) runs the ordered runShutdownSequence teardown for the initialized
+  subset (already nil-guarded per subsystem) and returns non-zero when a signal
+  cancels mid-startup, while preserving the pre-#5807 defers-only path for a
+  plain phase error (distinguished by ctx.Err(), not error identity). Kept
+  d.daemonCtx as the RAW signal-uncancelled parent for the four long-lived
+  startup runtimes (cluster.Start, watchClusterEvents, startKernelSelfRecovery,
+  dp.Start) — the teardown needs them live — so initManagers /
+  setupDataplaneAndInitialConfig no longer take a ctx param (dp.Start now uses
+  d.daemonCtx, matching the existing bootstrap-exit dp.Start). main.go unchanged
+  (signal captured inside Run).
+  **File(s)**: pkg/daemon/daemon_run.go, pkg/daemon/README.md,
+  pkg/daemon/startup_signal_5807_test.go, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/daemon/ ./cmd/xpfd/ -count=1`
+  (green); `go vet ./pkg/daemon/ ./cmd/xpfd/` clean. Fail-on-revert tests:
+  cancel between phases → later phases do NOT run + teardown fires with the
+  abort error; plain phase error → no teardown; startupSignalContext returns a
+  cancellable child (Done()!=nil, not Background). Removing the between-phase
+  ctx.Err() check flips the abort tests RED (verified: phases ran p1,p2,p3,p4).
+- **Action**: #5854 — hard-reject next-table/rib-group ip-rule window over-subscription at strict commit (was warn-only → silent apply-time truncation → routes claimed but not programmed). Added validateRoutingRuleWindowsStrict (new compiler_validate_strict_routing_rulewindows.go) wired into runUniformGates after the #5693 next-table gate, gated by new opts.lenientRoutingRuleWindows (true in both lenient blocks): strict CompileConfig hard-rejects >100 next-table routes / >1000 rib-group leak prefixes; CompileConfigLenient (Store.Load / SyncApply / peer-sync) still warns-and-loads so grandfathered/peer-synced generations don't fail-closed (#1960). Removed the now-redundant warn-only validateRoutingRuleWindowWarnings + its ValidateConfig call (runUniformGates runs before ValidateConfig, so strict aborts clean; the lenient downgrade is the single warning — no double-warn). Window consts (maxNextTableRules=100, maxRibGroupLeakRules=1000) duplicated in pkg/config with keep-in-sync comment (pkg/config cannot import pkg/routing — cycle). Fail-on-revert tests (gate-unit + compile-path strict-reject + lenient-warn); neutralizing the gate turns all reject AND lenient-warn assertions RED. gofmt/go vet/go build clean; go test ./pkg/config/ ./pkg/routing/ green. Doc: docs/rib-group-route-leaking.md new "Strict rejection — ip-rule window over-subscription (#5854)" section.
+- **File(s)**: pkg/config/compiler_validate_strict_routing_rulewindows.go (new), pkg/config/compiler_uniformgates.go, pkg/config/compiler.go, pkg/config/compiler_validate_warn.go, pkg/config/compiler_validate_warn_routing.go, pkg/config/compiler_routing_rules_test.go, docs/rib-group-route-leaking.md
+
+- **Timestamp**: 2026-07-15
+- **Action**: #5845 — rolling-upgrade drain-abort was discarding the ResetFailover (failback) error (`_ = cl.ResetFailover()`) and unconditionally claiming "aborted WITHOUT cutting (node still forwarding)". After ForceSecondary already DEMOTED the node, a FAILED failback can leave it force-secondary with peer takeover unproven — the "still forwarding" claim is then FALSE and both nodes could end up secondary (outage). Fixed rolling.go to capture `resetErr := cl.ResetFailover()`: on failure, return an error surfacing BOTH the drain failure AND the reset failure (errors.Join) and warning the node may be STRANDED DEMOTED / operator attention needed (mirroring the correct sibling kernel_drain.go); on success, keep the existing "still forwarding" message (true then). Extended the rolling_test.go fake with a `resetErr` seam; added TestRolling_DrainTimeoutFailbackFailsStrandedDemoted_5845 (asserts errors.Is(resetErr) surfaces + "STRANDED DEMOTED" present + NOT "still forwarding") and strengthened the failback-SUCCESS test to pin the unchanged "still forwarding" claim. Fail-on-revert verified: reverting to discard-resetErr + still-forwarding message flips the new test RED (rolling_test.go:229), restore → GREEN. gofmt/go vet/go build clean; go test ./pkg/upgrade green. Doc: docs/in-place-upgrade.md step-4 drain-abort updated (still-forwarding only on failback success; stranded-demoted on failure).
+- **File(s)**: pkg/upgrade/rolling.go, pkg/upgrade/rolling_test.go, docs/in-place-upgrade.md
+  **Action**: #5852 (bug): RPM lifecycle cancellation (StopAll / config
+  replacement / daemon shutdown) was mis-counted as path loss. When StopAll
+  cancels the shared probe context while runProbe is in flight, runSingleTest
+  treated the resulting context.Canceled (or the socket-timeout that follows a
+  cancel racing a blocking ReadFrom) as an ORDINARY probe failure: incremented
+  TotalSent/SuccFail, advanced the successive-loss threshold, emitted
+  ping_probe_failed, and could cross the loss threshold -> ping_test_failed +
+  fireTransition, so services ip-monitoring could change route preference DURING
+  teardown/reconfigure. Fixed by holding path state NEUTRAL on a lifecycle
+  cancel, mirroring the existing ErrProbeSetup hold: after runProbe, if
+  `ctx.Err() != nil || errors.Is(err, context.Canceled)` the probe RETURNs
+  before any counter/threshold/event/Transition. Discriminator is the SHARED
+  ctx.Err() (the probeCtx is context.WithCancel in Apply, cancelled ONLY by
+  m.cancel()), NOT the returned error type — a genuine probe TIMEOUT is a
+  per-probe socket deadline (icmp SetReadDeadline / TCP dial timeout) that
+  leaves ctx.Err()==nil and MUST still count as real path loss. RETURN (not
+  continue) so no post-loop fireTransition publishes a stale edge once teardown
+  begins. Deferred the optional icmp ReadFrom context-deadline responsiveness
+  tweak (StopAll can still wait up to the 3s socket deadline) as a follow-up —
+  the neutral classification is the load-bearing correctness fix and StopAll's
+  wg.Wait is bounded (<=3s, within TimeoutStopSec=20).
+  **File(s)**: pkg/rpm/rpm.go, pkg/rpm/README.md,
+  pkg/rpm/cancel_neutral_5852_test.go, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/rpm/ -count=1` (green);
+  `go vet ./pkg/rpm/` clean. Fail-on-revert: removing the neutral check flips
+  TestRunSingleTestLifecycleCancelIsNeutral5852 RED (cancelled probe advanced
+  TotalSent:1/SuccFail:1/LastStatus:fail) while the genuine-failure +
+  probe-owned-DeadlineExceeded tests stay GREEN (no over-neutralization).
+  (NOTE: the shared GOCACHE=/dev/shm/cache was contaminated by a prior
+  worktree — a fresh cache builds clean; used /dev/shm/cache5852.)
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5867 (bug, audit, security): failed management-VRF route
+  replacement preserved a stale gateway/ifindex as "desired". applyMgmtVRFRoutes
+  (pkg/daemon/daemon_flow.go) keyed its cleanup protect-set on
+  destination+family ONLY and inserted the key BEFORE RouteReplace succeeded,
+  and dropped the RouteReplace error. So a route that kept its destination but
+  changed gateway/output-interface and then FAILED to replace left the OLD stale
+  route in the kernel yet still protected from cleanup — management traffic
+  pinned to a stale/de-authorized gateway while the commit reported success.
+  Fixed by modeling DESIRED vs APPLIED separately: new mgmtRouteAppliedKey (dst +
+  gateway + link index) keys the protect-set on the FULL route identity, a route
+  is added to it ONLY after RouteReplace SUCCEEDS, and mgmtVRFRoutesToDelete
+  matches kernel routes against that full identity — so a stale same-destination
+  route (old gw/ifindex) is NOT protected and the reconcile deletes it.
+  applyMgmtVRFRoutes now returns the joined RouteReplace + non-ESRCH delete
+  errors; split into a thin wrapper + injectable applyMgmtVRFRoutesTo(nlh,
+  leases, mgmtSet) core (new mgmtRouteProgrammer seam). The error is threaded
+  into commit truth via the DEFERRED tail-join (#5310/#5844 pattern): the call
+  moved out of applyVRFReconcile (whose error early-aborts at daemon_apply.go:750
+  and would skip the dataplane apply) into applyConfigLocked as a deferred
+  mgmtRouteErr local, joined by applyTailReconciles (8th deferred arg) — so a
+  stale-pin failure fails the commit closed without skipping the rest of the
+  apply. The DHCP-callback refresh path (daemon_dhcp.go) logs the error (no
+  commit to fail). Happy path (successful gateway change) supersedes the old
+  route cleanly and protects the new identity — unchanged.
+  **File(s)**: pkg/daemon/daemon_flow.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_dhcp.go, pkg/daemon/mgmtvrf_route_applied_5867_test.go,
+  pkg/daemon/mgmtvrf_route_reconcile_5108_test.go (helper split
+  desiredKey=dest / appliedKey=full-tuple), plus the 4 applyTailReconciles
+  test callers updated for the 9th arg, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/daemon/ -count=1` (green);
+  `go vet ./pkg/daemon/` clean. Fail-on-revert: fake netlink handle drives a
+  same-dest gateway change whose RouteReplace FAILS —
+  TestApplyMgmtVRFRoutes_FailedGatewayChangeCleansStaleRoute_5867 asserts the
+  error is surfaced AND the stale route is deleted; reverting to the dest-only
+  key + insert-before-replace leaves the stale route protected (deleted=[]) →
+  RED (verified). A successful-gateway-change test guards the happy path (no
+  over-cleanup). Note: shared GOCACHE=/dev/shm/cache still yields a phantom
+  pkg/config redeclare error from a prior worktree — used a fresh cache.
+- **Action**: #5850 (security) — gRPC MonitorPacketDrop called EventBuffer.Subscribe(256) directly, bypassing the defaultMaxSubscribers=64 admission cap (only TrySubscribe enforces it). The primary gRPC listener is loopback-clamped but UNAUTHENTICATED, so any local process could open an unbounded number of packet-drop streams — each adding a buffered channel AND expanding the synchronous O(N) per-event fan-out — exhausting memory + event-production CPU (a DoS distinct from #4484 L-2, which capped only REST SSE and wrongly treated gRPC as inherently bounded). Fixed server_diag_monitor.go MonitorPacketDrop to use TrySubscribe(256); on nil (cap reached) return status.Error(codes.ResourceExhausted, "too many concurrent event subscribers") BEFORE the defer sub.Close() and before streaming — mirroring the REST SSE 503 (pkg/api/sse.go). No cap/fan-out change — admission gate only; the existing defer sub.Close() (Subscription.Close → unsubscribe) frees the slot on teardown. Tests (new monitor_packet_drop_subscriber_cap_5850_test.go): fill the buffer to cap via TrySubscribe, then MonitorPacketDrop is rejected with ResourceExhausted (TestMonitorPacketDropRejectsOverCap_5850); a stream that tears down frees its slot (TestMonitorPacketDropTeardownFreesSlot_5850, goroutine + ctx cancel). Under-cap streaming is already covered by the existing MonitorPacketDrop match tests (they run against the new TrySubscribe path). Fail-on-revert verified: reverting to Subscribe admits the over-cap stream (returns after the bounded ctx timeout, not ResourceExhausted) → RED; restore → GREEN. gofmt/go vet/go build clean; go test -race ./pkg/grpcapi/ ./pkg/logging/ green. Doc: pkg/logging/README.md subscriber-cap paragraph corrected (request-created gRPC MonitorPacketDrop now uses TrySubscribe, not just REST SSE).
+- **File(s)**: pkg/grpcapi/server_diag_monitor.go, pkg/grpcapi/monitor_packet_drop_subscriber_cap_5850_test.go, pkg/logging/README.md
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5822 (bug): config AST CopyPath could not resolve an existing
+  non-first same-keyword destination parent (and silently duplicated on
+  collision). CopyPath (pkg/config/ast_edit.go) resolved the destination parent
+  via insertNode (pkg/config/ast.go), whose per-level loop broke on the FIRST
+  child whose first keyword matched (matchNodeKeys returns 1 on a keyword-only
+  partial match) — so `copy ... to policy Z` with siblings [A B Z] descended
+  into policy A, could not find the rest of the dest-parent path, and failed
+  "destination parent ... not found" (or, on a resolvable existing target,
+  silently appended a duplicate). Fixed by routing CopyPath's dest-parent
+  resolution through childrenAtPath (longest-consumed-match) — the SAME resolver
+  RenamePath uses — unifying the two edit paths onto one navigator (the
+  divergence WAS the bug, per the issue). Added a collision guard (reject a copy
+  onto an existing same-identity target with keysEqual, like RenamePath) and
+  made it atomic (resolve parent + collision-check fully, THEN clone+append — a
+  failed copy leaves the tree byte-for-byte unchanged). A missing destination
+  parent (and a missing source) now wraps config.ErrPathNotFound so callers can
+  errors.Is it. Removed the now-dead insertNode helper (its only caller was
+  CopyPath).
+  **File(s)**: pkg/config/ast_edit.go, pkg/config/ast.go,
+  pkg/config/copypath_sibling_5822_test.go,
+  pkg/configstore/copy_sibling_5822_test.go, docs/config-schema.md, _Log.md
+  **Validation**: `go build ./...`; `go vet ./pkg/config/ ./pkg/configstore/`
+  clean; `go test -race ./pkg/config/ ./pkg/configstore/` green. Fail-on-revert:
+  restoring origin/master's ast.go+ast_edit.go (insertNode) flips the new tests
+  RED — non-first (app2/app3) + nested + integration copies error "destination
+  parent ... not found"; collision copy silently succeeds+duplicates;
+  missing-parent error is not ErrPathNotFound-wrapped. first-sibling (app1) is a
+  passing control. (Used a fresh GOCACHE=/dev/shm/cache5822 — shared cache is
+  contaminated.)
+- **Action**: #5849 (security) — gRPC config-lock lifecycle was owned by a per-RPC unary interceptor (configLockInterceptor) that, after every RPC, called ExitConfigureSession (DESTRUCTIVE: candidate=nil, dirty=false, lock released) when ctx.Err()!=nil, keyed by the peer ADDRESS. So per-RPC cancellation (a client Ctrl-C'ing one unrelated read, a request deadline) wiped a connection's staged candidate + released its lock, and a reused peer address could inherit/release an earlier session. Fixed: deleted configLockInterceptor; added configLockStatsHandler (a gRPC stats.Handler) installed on BOTH the loopback and fabric servers — TagConn allocates an unguessable crypto/rand connection id onto the conn context; connSessionID(ctx) reads it (fallback to peer for direct/in-process callers); ConnEnd releases ExitConfigureSession(connID) EXACTLY once (per-conn sync.Once + the store's holder guard), never on per-RPC cancellation. All 9 config-RPC keying sites in server_config.go moved from peerSessionID → connSessionID in lockstep. Explicit ExitConfigure (immediate) + the store idle-lease reclaim (reclaimStaleLockLocked, #4476) retained as backstops. Fabric handler is a no-op (allowlist never admits config RPCs) kept for a uniform contract. Tests (config_session_lifecycle_5849_test.go, bufconn + unit): reconnect-same-addr-cannot-inherit (deterministic headline), stats.Handler releases-exactly-once-on-ConnEnd (+ per-RPC/ConnBegin do NOT release), connSessionID identity (distinct per conn), per-RPC-cancel-does-not-tear-down, explicit-exit-immediate. Fail-on-revert verified firsthand: reverting connSessionID→peerSessionID makes reconnect-inherit RED (conn2 inherits conn1's leaked session because ConnEnd releases connID while RPCs key addr); restore→GREEN. Updated existing TestLoopbackListenerUnaffected (4122) + shutdown test (4910) for the deleted interceptor. gofmt/go vet ./pkg/grpcapi ./pkg/configstore/go build ./... clean; go test -race ./pkg/grpcapi/ ./pkg/configstore/ green. Docs: pkg/grpcapi/README.md + pkg/configstore/README.md config-session identity contract updated (connection-scoped id, ConnEnd release, no per-RPC teardown).
+- **File(s)**: pkg/grpcapi/config_session_lifecycle.go (new), pkg/grpcapi/config_session_lifecycle_5849_test.go (new), pkg/grpcapi/server.go, pkg/grpcapi/server_config.go, pkg/grpcapi/server_fabric_allowlist_4122_test.go, pkg/grpcapi/server_shutdown_monitor_4910_test.go, pkg/grpcapi/README.md, pkg/configstore/README.md
+  **Action**: #5867 review-fold — add TestApplyTailReconcilesSurfacesMgmtRouteError_5867 (deferred-tail-join wiring regression test mirroring #5844) per independent-review MINOR; injects a sentinel as the final applyTailReconciles operand and asserts errors.Is(commitErr, sentinel) so dropping mgmtRouteErr from the tail errors.Join is fail-on-revert-caught. Production unchanged.
+  **File(s)**: pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go
+
+## 2026-07-15 — #5808 upgrade deadline-authoritative helper-readiness gate
+
+- **Timestamp**: 2026-07-15
+- **Action**: Make `StartHealthDeadline` authoritative across every blocking
+  op in the post-flip helper-readiness gate so a wedged `systemctl`/DBus or
+  an unresponsive control socket can never strand the cut past the rollback
+  deadline. Unified is-active into ONE ctx-bounded primitive shared by
+  pkg/upgrade and cmd/xpfd.
+- **File(s)**: pkg/upgrade/helper_health.go (ctx.WithTimeout gate, boundByDeadline
+  min-bound, context-aware poll timer, deadlineGateErr wrapping ctx cause,
+  last-genuine-failure preservation), pkg/upgrade/system_linux.go
+  (unitActiveProbeCtx via exec.CommandContext + exported UnitActive; fallback
+  poll ctx-bounded), cmd/xpfd/upgrade.go (UnitActive seam ctx-aware, delegates
+  to shared upgrade.UnitActive), pkg/upgrade/helper_health_5286_test.go +
+  cmd/xpfd/upgrade_helper_health_5286_test.go (seam signature ctx-aware),
+  pkg/upgrade/helper_health_deadline_5808_test.go (NEW — 5 fail-on-revert tests),
+  docs/in-place-upgrade.md (#5808 deadline-authoritative subsection).
+- **Validation**: go build ./... clean; go vet ./pkg/upgrade/ ./cmd/xpfd/ clean;
+  go test -race ./pkg/upgrade/ ./cmd/xpfd/ -count=3 GREEN; 3 fail-on-revert
+  overlays proven RED (exec.Command hang, no min-bound=10s, time.Sleep(poll)
+  5s overshoot).
+- **Timestamp**: 2026-07-15
+  **Action**: #5835 (configstore: confirmation succeeded after durable confirm-record deletion failed → a restart resurrected a stale rollback and reverted an operator-confirmed config). removeConfirmState was best-effort (LOGGED a DeleteConfirm failure), so a confirmation (plain commit / HA sync / explicit ConfirmCommit / demotion) reported SUCCESS while confirm.json lingered; a restart read the stale record and resurrected its rollback. Fix (4 corrections): (1) removeConfirmState now RETURNS the error — ConfirmCommitAs propagates it (via clearPendingConfirmLocked now returning (bool,error)); the non-returning paths route through a new resolveConfirmRemovalLocked that retains retry debt (new confirmRemoveDegraded field) + starts the shared persist-retry loop (extended to also re-drive the delete) + surfaces DEGRADED health via ConfigPersistDegraded() (now ORs the new flag) and a dedicated ConfirmRemovalDegraded(). (2) DeleteConfirm now reaches the #4864 dir fsync on the ABSENT path (removed the os.IsNotExist short-circuit) so an unlink-succeeded/dir-sync-failed state is not laundered into a false success by an absent-file retry — the flag is the cross-call "sync owed" operation state. (3) confirmRecord gains an additive GuardedHash (sha256 of the unconfirmed active tree Format() at arm/re-arm time, set in writeConfirmState); recoverPendingConfirmLocked ignores a record whose GuardedHash != the loaded active config's (a later commit/confirm advanced active while removal failed) so a stale record can't revert an unrelated confirmed generation — legacy empty-hash records recover as #4577 (cross-upgrade hatch preserved). (4) the in-memory timer/rollback bookkeeping cancel is unchanged (the delete needs only the file path), so nothing is irreversibly lost. Explicit-confirm-with-no-later-commit + immediate crash fails SAFE (reverts on boot), consistent with ConfirmCommit having returned an error. Tests (confirm_durable_resolution_5835_test.go, injected rbRemove/rbSyncDir seams): explicit-confirm-returns-error+debt; dir-fsync-not-laundered-by-absent-retry; plain-commit/config-sync/demotion retain+expose debt then converge (fast-backoff heal); STALE record does not revert a durably-committed generation on boot (headline); nested-confirmed + first-commit generation-binding; -race concurrent retry-vs-reads. Updated the #4864 test that pinned the now-reversed absent-no-dir-sync behavior (renamed TestDeleteConfirmAbsentReachesDirSync). Fail-on-revert verified firsthand: swallow removeConfirmState→4 tests RED; disable GuardedHash check→2 tests RED; restore DeleteConfirm absent short-circuit→2 dir-sync tests RED. go build ./... + go vet ./pkg/configstore/ clean; go test -race ./pkg/configstore/ GREEN (covers timer-callback race + restart-after-injected-failure). Doc: pkg/configstore/README.md new #5835 bullet.
+  **File(s)**: pkg/configstore/db.go, pkg/configstore/store.go, pkg/configstore/store_commit.go, pkg/configstore/store_persist.go, pkg/configstore/confirm_durable_resolution_5835_test.go (new), pkg/configstore/confirm_delete_fsync_4864_test.go, pkg/configstore/README.md, _Log.md
+  **Action**: #5813 (CLI/gRPC/REST session display nil-slot panic) — the tolerant load / HA config-sync path admits present-but-nil InterfaceConfig / InterfaceUnit map values (#3494/#5068). THREE identical session egress-interface map builders walked cfg.Interfaces.Interfaces + ifc.Units with NO nil guard and nil-dereferenced/panicked the in-process daemon on a routine session display: CLI buildSessionEgressIfacesWithLookup (session_display.go), gRPC buildSessionFilter (server_sessions.go), REST buildSessionView (api/sessions.go). CENTRALIZED the tolerant walk into two shared nil-safe iterators in pkg/config — RangeInterfaces (skips nil InterfaceConfig) + RangeUnits (skips nil InterfaceUnit) in new interfaces_iter.go — and migrated all three builders onto them (first-wins ifindex/vlanID ordering preserved). Panic-recovery in CLI.Run NOT added: the nil-guard stands on its own and a shared helper is the durable fix; a blanket recover would mask future presenter bugs. AUDIT of the remote surfaces: the gRPC + REST session/filter builders had the IDENTICAL raw walk (not merely the CLI) — both fixed here; the broader interface-show presenters (terse/detail/extensive/summary/completers) were already guarded by #5068 and are out of scope, but the shared iterators are now available for future migration; interfaceAliasSet (server_diag_monitor.go) was already nil-safe. Tests (fail-on-revert): pkg/config interfaces_iter_5813_test.go (RangeInterfaces/RangeUnits skip nils, nil-receiver no-ops); pkg/cli session_display_nil_5813_test.go (deterministic-lookup seam with nil ifc + nil unit + valid siblings asserting first-wins mapping and nil-slots-omitted; REAL showFlowSession handler driven with fake loaded dp and nil slots on the loopback so the production net.InterfaceByName path reaches the deref; a -race concurrent-publish test — atomic.Pointer swap of fresh tolerant configs vs 8 concurrent read-only presenters); pkg/grpcapi + pkg/api nil-slot builder tests on a loopback-zone store. Fail-on-revert verified firsthand: removing the RangeUnits unit-guard → all four packages RED; removing either nil-interface guard (RangeInterfaces or RangeUnits ifc-guard — intentionally double-layered) → the dedicated pkg/config test RED. go build ./... clean; go vet clean on config/grpcapi/api (pkg/cli shows only the pre-existing cli.go:511 unreachable-code warning, unrelated — byte-identical on origin/master); go test -race green on all four packages. Doc: pkg/config/README.md Gotchas — new "Present-but-nil interface/unit slots" entry pointing at the shared iterators.
+  **File(s)**: pkg/config/interfaces_iter.go, pkg/config/interfaces_iter_5813_test.go, pkg/cli/session_display.go, pkg/cli/session_display_nil_5813_test.go, pkg/grpcapi/server_sessions.go, pkg/grpcapi/server_sessions_nil_5813_test.go, pkg/api/sessions.go, pkg/api/sessions_nil_5813_test.go, pkg/config/README.md, _Log.md
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5855 (dhcpv6: DUID-type change restarts the client but retained the old cached/persisted identity). Reconcile includes DUIDType in the client fingerprint and restarts on change, but getDUID returned the CACHED DUID first, else the PERSISTED DUID, WITHOUT validating that its actual type matched the newly-requested duid-ll/duid-llt mode → the restarted client kept the OLD type indefinitely. FIX (Option 1, atomic rotate — operator-friendly, no explicit clear required): getDUID now normalizes the requested type and reuses a cached/persisted DUID ONLY when actualDUIDType(d)==want; on a mismatch it drops the stale cache, ignores the mismatched persisted DUID, and atomically GENERATES + durably PERSISTS the requested type BEFORE returning it (persist-before-start holds: Reconcile stops+joins the old client, then Start calls getDUID synchronously before the first Solicit). Added actualDUIDType (concrete-type switch on *dhcpv6.DUIDLL/DUIDLLT) + normalizeDUIDType helpers. Reconcile drops m.duids[iface] on a type change (defense-in-depth). PERSISTENCE-FAILURE fail-safe: if the new-type persist fails during a ROTATION (loadErr==nil, a previous identity exists), getDUID RETAINS the previous persisted identity + re-caches it and returns it (old type) with NO error and NO unpersisted new DUID exposed — a partially-rotated DUID-LLT would be ephemeral; the client stays coherent until a later reconcile persists the new one. Cold-start (no prior identity) preserves the #4909 behavior (duid-llt persist failure → error; duid-ll → benign). show/API DUIDs() already reports duid.DUIDType().String() from the resolved DUID (actual active type), not m.duidTypes — verified. Added a package-var write seam duidWriteFile (wraps fsatomic.WriteFileDurable) so a test can inject a persist failure while loadDUID still reads the pre-seeded old DUID. Tests (duid_type_rotate_5855_test.go, fail-on-revert): warm-cache rotate both directions (cache type-check); cold-cache rotate both directions (persisted type-check, + reload asserts the new type is persisted); rotation-persist-failure retains the previous identity (byte-equal, no error, on-disk untouched); DUIDs() reports the ACTIVE type not the configured type; Reconcile invalidates the cached DUID on a type change (runClientForTest no-op). Fail-on-revert verified firsthand: drop the cache type-check → warm-cache RED; drop the persisted type-check → cold+warm RED; remove the rotation fail-safe → persist-failure RED; all restore GREEN. go build ./... + go vet ./pkg/dhcp/ clean; go test -race ./pkg/dhcp/ GREEN. Doc: pkg/dhcp/README.md new #5855 bullet (automatic rotation, persist-before-start, fail-safe, show reports active type).
+  **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/reconcile.go, pkg/dhcp/duid_type_rotate_5855_test.go (new), pkg/dhcp/README.md, _Log.md
+## 2026-07-15 — #5913 show interfaces extensive/detail nil-guard
+
+- **Timestamp**: 2026-07-15
+- **Action**: Route the config-map-build loops in showInterfacesExtensive
+  (ifCfgMap) and showInterfacesDetail (ifDescMap) through config.RangeInterfaces
+  so a present-but-nil InterfaceConfig slot (tolerant load / HA config-sync) no
+  longer nil-derefs ifc.Name/ifc.Description and panics the daemon. Same
+  #5813/#5910 class, same file #5910 patched.
+- **File(s)**: pkg/grpcapi/server_show_interfaces_text.go (2 loops → RangeInterfaces),
+  pkg/grpcapi/server_show_interfaces_nil_5913_test.go (NEW — 2 fail-on-revert
+  tests driving the real presenters), pkg/config/README.md (nil-safe-iterator
+  guarded-site enumeration extended to the interfaces presenters).
+- **Validation**: go build ./... clean; go vet ./pkg/grpcapi/ clean;
+  go test -race ./pkg/grpcapi/ GREEN; both raw-walk reverts proven RED via
+  -overlay (nil-deref panic caught by recover→t.Fatalf), each revert breaking
+  only its own test (independent guards).
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5890 (SECURITY: interactive-console `request system zeroize` retained tls key + rendered service configs + login accounts). REACHABILITY GATE first: confirmed the console handler (cli_request_system.go:80) calls c.zeroizeConfigState() DIRECTLY as a standalone console command (NOT routed through gRPC/performZeroizeWipe), so the bug is REACHABLE. Divergence confirmed: console (zeroizeConfigState → FactoryResetConfigDir + FactoryResetArchiveDir) erased config DB + archive but OMITTED tls/ (only wiped by gRPC's zeroizeConfigDir RemoveAll(<root>/tls)), rendered configs (zeroizeRenderedConfigs frr/swanctl/kea), and login accounts (zeroizeLoginAccounts shadow/authorized_keys/sudoers.d/xpf-*), while gRPC performZeroizeWipe erases all of them. FIX = OPTION A (delegate, single source of truth) — clean because pkg/cli ALREADY imports pkg/grpcapi (peer.go) with no cycle and performZeroizeWipe is a pure (configDir,configBase) function: exported grpcapi.PerformZeroizeWipe wrapper (keeps the performZeroizeWipe test-seam var); refactored the console into performConsoleZeroize() which resolves+validates the configured root (zeroizeConfigRoot, #5554/#5684, fail-closed) then delegates to grpcapi.PerformZeroizeWipe via a zeroizeFullWipe seam and stops xpfd via a zeroizeStopDaemon seam; DELETED the divergent zeroizeConfigState so it can't be reused. Owned-scope inherited from performZeroizeWipe (#5768) — no over-wipe. Fail-closed: a wipe error is surfaced and the daemon is NOT stopped. Testability: added grpcapi package-var seams for the rendered legs (zeroizeFRRConf/zeroizeSwanctlSnippet/zeroizeKea4Conf/zeroizeKea6Conf) + the non-secret BPF/networkd legs (zeroizeBPFPinDir/zeroizeNetworkdDir) so PerformZeroizeWipe is fully hermetic under test (production paths unchanged). Tests: pkg/grpcapi/zeroize_full_set_5890_test.go TestPerformZeroizeWipeErasesFullSecretSet_5890 — seed a temp root with .configdb/master.key + tls/key.pem + frr-managed-section-secret + swanctl PSK + kea + provisioned login (userdel/authorized_keys/sudoers xpf-*) + archive snapshot, all legs seamed (no real /etc), call PerformZeroizeWipe, assert EVERY secret gone + operator artifacts (FRR operator content, non-xpf sudoers, operator networkd) survive; pkg/cli/console_zeroize_full_wipe_5890_test.go — console delegates to the full wipe, propagates a wipe failure fail-closed (daemon NOT stopped), and fails closed on an undeterminable config root; migrated cli_zeroize_configured_root_5554_test.go's zeroizeConfigState test → performConsoleZeroize with a spy (configured-root revert guard preserved). Fail-on-revert verified firsthand: console reverted to skip the full wipe → 3 cli delegation tests RED; tls/ RemoveAll dropped from zeroizeConfigDir → full-set test RED (tls key survives); both restored GREEN. go build ./... clean; go vet ./pkg/grpcapi/ clean (pkg/cli shows only the pre-existing unrelated cli.go:511 unreachable-code warning — I did not touch cli.go); go test -race ./pkg/cli/ ./pkg/grpcapi/ GREEN (full suites). Docs: pkg/grpcapi/README.md + pkg/cli/README.md zeroize sections updated (console delegates to the shared PerformZeroizeWipe; identical owned-artifact set; fail-closed; hermetic-test seams).
+  **File(s)**: pkg/cli/cli_request_system.go, pkg/cli/cli_zeroize_configured_root_5554_test.go, pkg/cli/console_zeroize_full_wipe_5890_test.go (new), pkg/grpcapi/server_diag_zeroize.go, pkg/grpcapi/zeroize_full_set_5890_test.go (new), pkg/grpcapi/README.md, pkg/cli/README.md, _Log.md
+## 2026-07-15 — #5847 two-phase kernel arm (ARMING intent + BootNext readback)
+
+- **Timestamp**: 2026-07-15
+- **Action**: Fix the false-ARMED wedge — the kernel-roll arm persisted ARMED
+  BEFORE SetBootNext, so a crash in the gap left a journal claiming ARMED while
+  the firmware booted known-good and no trial happened, wedging HA self-recovery
+  (Arm refused-forever, self-recovery suppressed failback forever). Implemented
+  the two-phase arm: record ARMING (prepared intent + per-attempt nonce) before
+  any NVRAM mutation; SetBootNext; positively read GetBootNext() back ==
+  inactiveID; only then transition ARMING -> ARMED recording the confirmed
+  BootID. ARMING sits below ARMED in the state order, so Arm re-arms from ARMING,
+  self-recovery does not suppress on ARMING, and IsArmed is true only for the
+  verified ARMED.
+- **File(s)**: pkg/upgrade/kernel.go (KernelStateArming + reorder, journal
+  BootID/ArmNonce/ArmAttempts, GetBootNext interface method), pkg/upgrade/
+  kernel_linux.go (bootNextRE + GetBootNext efibootmgr readback), pkg/upgrade/
+  kernel_run.go (armCandidate two-phase rewrite + newArmNonce), pkg/upgrade/
+  kernel_test.go (fake GetBootNext + seams), pkg/upgrade/
+  kernel_arm_two_phase_5847_test.go (NEW — 4 fail-on-revert tests), docs/
+  in-place-upgrade.md (two-phase arm + BootNext-readback provenance + ARMING vs
+  verified-ARMED self-recovery semantics).
+- **Validation**: go build ./... clean; go vet ./pkg/upgrade/ clean; go test
+  -race ./pkg/upgrade/ GREEN; the ARMED-first revert (drop ARMING/readback)
+  proven RED via -overlay on Test 1 (re-arm + self-recovery) and Test 2
+  (readback mismatch), with Test 3 (no-regression) still green.
+
+## 2026-07-15 — #5866 day-2 web-management listener + auth reconcile
+
+- **Timestamp**: 2026-07-15
+- **Action**: The HTTP/HTTPS management server was constructed once at startup
+  and never reconciled, so a committed web-management change (bind/port/TLS/auth,
+  e.g. a REVOKED credential) sat inert until a daemon restart. Added a
+  managementReconciler that, on every commit, atomically replaces the live
+  listener + auth snapshot: same-endpoint auth change → live atomic ReplaceAuth
+  (no rebind); endpoint change → make-before-break rebind (bind new before
+  closing old); failed new bind → retain old listener + surface error (fail-safe,
+  retry debt). Wired into applyConfigLocked next to reconcileSNMP (early, before
+  the dataplane apply).
+- **File(s)**: pkg/api/server.go (atomic auth snapshot + dynamicAuthMiddleware +
+  ReplaceAuth + Start/bindListeners/serveBound + ListenFunc seam + AuthSnapshot/
+  HTTPSCert ForTest accessors), pkg/api/auth.go (extract shared authCheck +
+  writeAuthChallenge), pkg/daemon/management.go (NEW — managementReconciler),
+  pkg/daemon/daemon.go (d.mgmt field), pkg/daemon/daemon_run.go (startHTTPServer
+  hands listener lifecycle to the reconciler + shutdown drain), pkg/daemon/
+  daemon_apply.go (reconcileWebManagement call after reconcileSNMP),
+  pkg/api/server_authswap_5866_test.go + pkg/daemon/management_5866_test.go (NEW
+  fail-on-revert tests), pkg/api/README.md + pkg/daemon/README.md (lifecycle).
+- **Validation**: go build ./... clean; go vet ./pkg/daemon/ ./pkg/api/ clean;
+  go test -race ./pkg/api/ ./pkg/daemon/ GREEN. Fail-on-revert overlays proven
+  RED: (A) capture auth once → live-swap test RED (revoked cred still 200);
+  (B) close-old-before-bind-new → coexistence + retain-old tests RED.
+## 2026-07-15 — #5824 fold: cross-root policy-statement same-name term dedup
+
+- **Timestamp**: 2026-07-15
+- **Action**: Fold the independent-review MINOR on PR #5922. psTermIndex is a
+  LOCAL var in compilePolicyOptions, which runs once PER top-level policy-options
+  AST root (NewParser appends top-level nodes unmerged). Two separate top-level
+  `policy-options {}` roots each defining `policy-statement R { term x }` reused
+  the persisted ps but got a fresh empty termsByName, so term x was DUPLICATED
+  (malformed double route-map) instead of composing. FIX: seed the fresh
+  termsByName from the persisted ps.Terms when it is first created, so a same-name
+  term composes across roots exactly as within a root. Corrected the block
+  comment's inaccurate cross-root persistence claim.
+- **File(s)**: pkg/config/compiler_routing.go (ps.Terms seed + comment fix),
+  pkg/config/compiler_policy_block_merge_5824_test.go (new
+  TestPolicyStatementSameTermAcrossRootsMerges_5824).
+- **Validation**: go build ./... clean; go vet ./pkg/config/ ./pkg/frr/ clean;
+  go test -race ./pkg/config/ ./pkg/frr/ GREEN (all 5 5824 tests). Fail-on-revert:
+  dropping the ps.Terms seed via -overlay makes ONLY the cross-root test RED
+  (len(R.Terms)==2 duplicate); the 4 within-root tests stay green.
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5824 fold — cross-root policy-statement term compose. Seed the per-call psTermIndex from the persisted ps.Terms so a same-name term across SEPARATE top-level policy-options roots composes onto one PolicyTerm instead of duplicating (a malformed double route-map). Corrects the block-merge comment's cross-root claim. Parent RED-on-revert confirmed (neutralize seed → SameTermAcrossRootsMerges_5824 RED, got [x x]).
+  - **File(s)**: pkg/config/compiler_routing.go, pkg/config/compiler_policy_block_merge_5824_test.go
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5795 fix — DHCP renewal-timer RFC schedule. renewalTimers dropped the fixed 30s T1 / 1s T2 floor that pushed T1 past the RFC half-life for leases <60s and scheduled the renew at/after expiry for leases <30s (short-lease WAN forwarded on an expired binding). Now pure RFC 2131: t1=lease/2, t2Remaining=3/8·lease, plus an ok bool — a non-positive lease returns ok=false and both run loops fail closed into re-acquisition (paced by reacquireBackstop) instead of manufacturing a 30s plan. Infinite-sentinel divide-first form (#4526) preserved. Corrected commit_test.go rows that canonized the bug; added 1s/2s/30s/59s/60s + zero/negative/infinite boundary coverage and a strictly-before-expiry invariant. RED-on-revert confirmed: restoring the 30s/1s clamp turns the short-lease rows RED (2s→T2 at 31s vs 2s lease) via -overlay, worktree untouched.
+  - **File(s)**: pkg/dhcp/commit.go, pkg/dhcp/dhcp.go, pkg/dhcp/renew.go, pkg/dhcp/commit_test.go, pkg/dhcp/README.md
+## 2026-07-15 — #5825 scheduler block-merge (mirrors #5824)
+
+- **Timestamp**: 2026-07-15
+- **Action**: compileSchedulers allocated a FRESH SchedulerConfig per named AST
+  instance then unconditionally cfg.Schedulers[name]=sched, so a repeated
+  hierarchical `schedulers scheduler S {}` block (or a second top-level
+  `schedulers {}` root) REPLACED the earlier — every day/window authored earlier
+  vanished (a time-gated policy then active/inactive on the WRONG days). FIX:
+  reuse the existing map entry so distinct weekday windows UNION across
+  blocks/roots (Days map on the reused struct; no separate index needed). Scalars
+  (daily/date/all-day) follow flat-set/Junos-merge last-wins. Removed the
+  unconditional overwrite.
+- **File(s)**: pkg/config/compiler_system.go (reuse-and-merge),
+  pkg/config/compiler_scheduler_block_merge_5825_test.go (NEW 5 tests),
+  docs/config-schema.md (#5825 block-merge subsection).
+- **Validation**: go build ./... clean; go vet ./pkg/config/ clean; go test -race
+  ./pkg/config/ -run Scheduler GREEN; full pkg/config suite GREEN. Fail-on-revert:
+  restoring fresh-alloc+overwrite via -overlay -> the 4 merge tests RED (only the
+  last block's day survives), single-block stays green.
+
+## 2026-07-15 — #5826 address-set member dedup O(N²) → O(N)
+
+- **Timestamp**: 2026-07-15
+- **Action**: appendUniqueString linearly scanned the full member slice on every
+  append, so parseAddressBookEntries compiled an N-member address set in O(N²).
+  Replaced with a per-address-set O(1) map index (separate maps for direct-address
+  and nested-set members), seeded from existing members, append to the ordered
+  slice only on first-seen miss. Byte-identical output (first-seen order + exact
+  union-by-name dedup); compiler-local (not persisted). Removed appendUniqueString.
+- **File(s)**: pkg/config/compiler_security_addressbook.go (map-backed dedup,
+  appendUniqueString removed), pkg/config/addressset_dedup_5826_test.go (NEW —
+  correctness + namespace-independence + scaling guard + benchmark),
+  docs/bugs.md (#5826 entry + corrected #4706 appendUniqueString reference).
+- **Validation**: go build ./... clean; go vet ./pkg/config/ clean; go test -race
+  ./pkg/config/ -run 'AddressBook|AddressSet|AddrSet' GREEN; full pkg/config GREEN.
+  Fail-on-revert: restoring the linear scan makes the scaling test (N=80000) take
+  ~20s > 3s budget → RED (vs ~0.08s with the fix); #4706 behavior tests stay green.
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5886 nil interface/unit presenter panic fix. Added shared
+    nil-safe accessors config.LookupInterface / config.LookupUnit (ok implies a
+    safe deref — a present-but-nil InterfaceConfig/InterfaceUnit slot from
+    tolerant load / HA config-sync reads as ABSENT) and routed the gRPC + REST +
+    CLI interface/zone/cluster/completion presenters through them, so a read-only
+    operator RPC no longer panics xpfd on a present-but-nil slot. Canary tests per
+    package assert no-panic; TestLookupInterface_5886 / TestLookupUnit_5886 pin
+    the accessor semantics (RED if the nil-guard is dropped).
+  - **File(s)**: pkg/config/interfaces_iter.go (+ _5886 tests), pkg/api/interfaces.go
+    (+ nil test), pkg/grpcapi/{server_cluster,server_show_interfaces,server_show_zones_text,
+    server_diag_monitor}.go (+ nil test), pkg/cli/{cli_show_interfaces*,cli_show_cluster,
+    cli_show_security_zones,completion,apply,cli_helpers}.go.
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5886 review-fold (rev5930 MAJOR). The sweep missed
+    pkg/monitoriface/monitor.go:343 (a separate package) — a raw
+    `cfg.Interfaces.Interfaces[base]; ok && ifc.LocalFabricMember` map-index deref
+    on the read-only CLI `show interfaces` traffic-summary + gRPC MonitorInterface
+    path; a present-but-nil slot panicked xpfd. Routed it through
+    config.LookupInterface. Added a monitoriface nil-slot canary
+    (TestTrafficSummaryInterfacesNilSlotNoPanic_5886; RED-on-revert = panic).
+    Extended the source-scan canary to cover pkg/monitoriface AND the
+    map-INDEX-then-deref shape (`if v,ok:=m[k]; ok && v.F`) the range-only regex
+    missed — verified it now flags monitor.go:348 on revert.
+  - **File(s)**: pkg/monitoriface/monitor.go, pkg/monitoriface/monitor_nil_5886_test.go,
+    pkg/config/interface_nil_canary_5886_test.go
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5829 fail-closed non-numeric logical-unit id. `interfaces <if>
+    unit <identity>` had no positional key validation, so `unit tenant` passed
+    schema + commit and compileInterfaces silently DISCARDED the whole unit on
+    strconv failure — a unit-level firewall FILTER committed with no enforcement
+    (fail-open). Added one canonical validator config.ValidateLogicalUnit
+    (0..MaxLogicalUnit=16385: rejects non-numeric, negative, overflow,
+    out-of-range) and gated it at two layers: (1) schema — the `unit` node's
+    instance key now carries keyValidator ValidateLogicalUnit so commit/commit
+    check reject the malformed id naming the interface + token (flat-set +
+    hierarchical); (2) compiler — compiler_interfaces.go returns a hard error
+    instead of the bare continue; the tolerant load / peer-sync path
+    (new lenientNonNumericUnit opt on CompileConfigLenient /
+    CompileConfigForNodeLenient) warns + quarantines the unit instead (no silent
+    drop, no misattribution). Valid numeric units (incl. 0 and 16385) compile
+    bit-identically and reach ifc.Units. tunnelid.go's best-effort endpoint-name
+    union compiles leniently to preserve its pre-fix drop behavior.
+    Fail-on-revert proven via -overlay (revert gate + keyValidator → reject +
+    quarantine tests RED). RESIDUAL noted: cross-subsystem unit-reference slots
+    (CoS/zones/routing `.unit` suffix) still untyped — follow-up.
+  - **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_interfaces.go,
+    pkg/config/compiler.go, pkg/config/compiler_interfaces.go,
+    pkg/config/compiler_dispatch.go, pkg/config/tunnelid.go,
+    pkg/config/interface_unit_nonnumeric_5829_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5796 Kea LFC file-set lease read. All three dhcpserver memfile
+    consumers (DDNS `parseActiveLeases4/6`, display `parseLeaseCSV`, HA fallback
+    `readSyncLeasesViaMemfile`) opened ONLY the current `kea-leases{4,6}.csv`,
+    which after Lease File Cleanup starts is just the new append log — the active
+    set spans Kea's LFC file set. A header-only current file right after LFC
+    rotation was read as trusted-empty and the DDNS reconciler would MASS-DELETE
+    every owned A/AAAA/PTR (fail-open). Added ONE shared enumerator
+    `keaLFCLeaseFilePaths` (lease_lfc.go) returning the set in Kea CHRONOLOGICAL
+    order PREVIOUS(.2) -> INPUT(.1) -> CURRENT and refactored both parsers to a
+    per-file helper + accumulator so rows replay through the SAME append-only
+    last-row-wins dedup across files (newer supersedes older; release/expiry
+    tombstones survive). Suffix mapping verified against Kea source
+    memfile_lease_mgr.cc appendSuffix (.1=INPUT, .2=PREVIOUS) — the team-lead's
+    dispatch note had them swapped; the read ORDER (previous, then input, then
+    current) is unchanged. Fail-safe preserved+extended: any existing mangled
+    sibling makes the whole family untrusted; trusted-empty only when all files
+    validate and the merged set is empty; no-LFC steady state (.1/.2 absent) is
+    byte-identical to before. Fail-on-revert proven via -overlay: single-file
+    read -> union/display/fail-closed tests RED; reversed merge order ->
+    order test RED (resurrected released lease). go build ./... + vet +
+    -race dhcpserver/ddns green. RESIDUAL (issue invariants 2/3/8, follow-up):
+    no live lease_cmds socket preference in every consumer, no
+    crash-interrupted-cleanup generation proof, no degraded-source display
+    banner.
+  - **File(s)**: pkg/dhcpserver/lease_lfc.go (new),
+    pkg/dhcpserver/lease_lfc_5796_test.go (new), pkg/dhcpserver/ddns_leases.go,
+    pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/README.md
+  - **Action**: #5812 remote-CLI config-exit lock-retry. An explicit `exit`/`quit`
+    in remote configuration mode (cmd/cli/shared.go dispatchConfig) discarded the
+    ExitConfigure RPC error and unconditionally cleared local config-mode state, so
+    a transport timeout before the release reached the daemon left the server-side
+    config lock + candidate owned by the session while the client dropped to
+    operational mode believing it released — losing the in-process retry path. Made
+    explicit exit TRANSACTIONAL: check the error; on error surface it + STAY in
+    config mode (configMode/editPath/prompt preserved, Store(false) only on
+    success — the SIGINT goroutine reads configMode concurrently, #5053); on
+    success clear + print as before. The EOF/SIGINT/post-loop teardown path
+    (main.go exitConfigureBounded, best-effort bounded #5053) is deliberately
+    UNCHANGED. Fail-on-revert proven via -overlay (restore discard + unconditional
+    clear → error case silently transitions, tests RED).
+  - **File(s)**: cmd/cli/shared.go, cmd/cli/config_exit_retry_5812_test.go,
+    cmd/cli/README.md
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5939 gate REST SessionCount full-table walk (sibling of #5782/#5937).
+    statusHandler (GET /api/v1/status, pkg/api/health.go) called SessionCount() — a
+    full v4+v6 session-map walk under per-bucket BPF-map locks, O(table) — with no
+    limiter gate. Routed it through the SHARED diagcmd.SessionWalkLimiter (the same
+    instance sessions.go uses for the /security/sessions* scans); on contention
+    fail fast with HTTP 429 via writeError, mirroring sessionsHandler. Choice = 429
+    (not bounded-count-omit): the walk is in the AUTHENTICATED /api/v1/status query,
+    NOT the unauthenticated liveness /health (healthHandler, which does NOT walk),
+    so a 429 here cannot flap the liveness probe — the flap concern is moot and 429
+    matches the whole REST session-scan surface. Admitted path count unchanged.
+    Fail-on-revert proven via -overlay (remove the gate → walks + returns 200 w/
+    count regardless of the saturated limiter, bound test RED). Doc: limiter.go
+    surface list adds /api/v1/status. NOTE: touches the same limiter.go comment
+    sentence as the unmerged #5937 (adds the gRPC count surfaces) — reconcile at merge.
+  - **File(s)**: pkg/api/health.go, pkg/api/status_sessioncount_bound_5939_test.go,
+    pkg/diagcmd/limiter.go
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #2607 close the referenced-`from prefix-list` mixed-family residual.
+    The route-filter mixed-family split was already merged; the issue's own closeout
+    comment named the live residual: a REFERENCED `from prefix-list` that names a
+    mixed v4+v6 list collapsed to ONE family (prefixListMatchKW: "ipv6 if any v6
+    entry"), so only one of `match ip|ipv6 address prefix-list` was emitted and the
+    other family's routes silently failed the term (routing asymmetry / blackhole,
+    no commit error). Fixed by mirroring the #2642 OR-split: a mixed list is exactly
+    "(in its v4 half) OR (in its v6 half)", so fromPrefixListRefs expands it into one
+    `ip` ref + one `ipv6` ref, each emitted in its own route-map sequence (FRR ANDs
+    match clauses within one index, so the two families cannot share a sequence).
+    Replaced the single-family prefixListMatchKW with the per-family SSOT
+    prefixListFamilies (["ip"]/["ipv6"]/["ip","ipv6"]); routeFilterACLNameCollision
+    now checks EVERY family a list renders under (a mixed list can materialize an
+    ACL in both) — the fail-closed path. #5730 same-family ACL coexistence and #5702
+    off-family unsatisfiable-AND both preserved. Single-family / undefined / empty
+    lists render byte-identical. Fail-on-revert proven via -overlay (collapse
+    fromPrefixListRefs to a lone family → 6 mixed-family tests RED, "missing the IPv4
+    matcher — every v4 route silently fails the term").
+  - **File(s)**: pkg/frr/naming.go, pkg/frr/policy_render.go,
+    pkg/frr/policy_mixedfamily_frompl_2607_test.go, pkg/frr/frr_test.go,
+    pkg/frr/README.md
+  - **Action**: #5782 gate ungated SessionCount full-table walk. s.dp.SessionCount()
+    does a full v4+v6 session-map iteration holding the per-bucket BPF-map locks
+    for O(table) — the same lock-contention DoS class #5708 bounded for the
+    read-scans — reachable UNGATED via GetStatus (server_show_status.go) and
+    `show system buffers[-detail]` (showBuffers/showBuffersDetail, ShowText). Gated
+    all 3 client-reachable surfaces through the SHARED diagcmd.SessionWalkLimiter
+    (the same instance #5708/#5779 use), returning codes.ResourceExhausted on
+    contention exactly like sessions-top (ShowText propagates the handler error;
+    showBuffers/showBuffersDetail changed to return error). Left server_sessions.go:300
+    (setSessionsTotal) alone — it is only called from the already-limiter-held
+    GetSessions handler (gating again would draw a redundant second slot). Noted
+    api/health.go:119 as a same-class REST site OUTSIDE the grpcapi scope (follow-up).
+    Fail-on-revert proven via -overlay (remove the 3 gates → over-cap calls walk +
+    return normal responses, bound tests RED). Doc: limiter.go MaxConcurrentSessionWalks
+    surface list now includes GetStatus + show-buffers.
+  - **File(s)**: pkg/grpcapi/server_show_status.go, pkg/grpcapi/server_show_system.go,
+    pkg/grpcapi/server_show.go, pkg/diagcmd/limiter.go,
+    pkg/grpcapi/server_sessioncount_bound_5782_test.go
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5927 DHCPv6 explicit valid-lifetime-0 IA_NA invalidation (RFC 8415
+    §18.2.10.1). Diagnosis: the ticket's floor at dhcp.go (`LeaseTime==0 → 3600`)
+    is a RED HERRING — selectIANAAddress (#4383) already skips 0-lifetime IAADDRs,
+    so parseV6Reply errors before the floor (floor only hit in the degenerate no-IA
+    config). Real gap: the RENEW/REBIND loop treated the explicit-0 error as a
+    TRANSIENT failure (keep-and-wait-T2), keeping a server-invalidated address in
+    service. Fix: thread present-0-vs-absent through selectIANAAddress (added
+    sawZeroLifetime return) → parseV6Reply returns a DISTINCT errV6AddrInvalidated
+    sentinel ONLY when a present-but-0 IAADDR left no usable address (fail-safe
+    toward keep on absent/transient) → the renew AND rebind loops errors.Is-check
+    the sentinel and DECONFIGURE the held address + re-acquire (IA_NA analog of the
+    IA_PD withdrawal reconcile). Floor left as-is with a clarifying comment.
+    Guardrail: an ABSENT IA_NA (generic error) still KEEPS the address + retries
+    (no over-correction). Fail-on-revert proven via -overlay (remove the deconfigure
+    branches → (b) invalidation kept-and-rebinds, test RED; (d) absent stays green).
+    OUT OF SCOPE noted: address-change-on-renew (different addr, lifetime>0) is a
+    separate concern, not #5927.
+  - **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/dhcpv6_zero_lifetime_invalidate_5927_test.go,
+    pkg/dhcp/dhcpv6_iana_test.go (signature), pkg/dhcp/README.md
+  - **Action**: #5742 classify commit RPC apply errors. Commit / CommitConfirmed
+    blanket-mapped EVERY non-context commit-callback error to codes.InvalidArgument
+    ("you sent bad config"). But the daemon commit path (commitAndApply /
+    commitConfirmedAndApply -> applyAndSyncCommitted) returns a NON-FATAL
+    tail-reconcile / ordinary dataplane-apply error (networkd #1778, Kea #2987,
+    IPsec #4433, iface #5310, non-abort apply #5679, #5578 deletion-clear)
+    ALONGSIDE the committed config (compiled != nil) — the config is valid and
+    committed+active, only a transient control-socket step failed and self-heals
+    on retry (#5646). InvalidArgument misleads an operator/automation client into
+    EDITING valid config instead of retrying. Added commitApplyStatus(compiled,
+    err) — one private helper shared by both RPCs — classifying STRUCTURALLY on
+    the daemon's existing (compiled, err) contract (no sentinel / string match
+    needed): context.Canceled/DeadlineExceeded preserved and checked FIRST;
+    compiled != nil -> codes.Unavailable (transient, retryable); else keep
+    codes.InvalidArgument (compile/schema reject, compileErrorMustAbortApply
+    fail-closed gate, device-map preflight, bootstrap refusal, pre-promotion
+    persistence — all return nil config). Fail-safe: unclassifiable -> InvalidArgument.
+    Message text ("%v") byte-identical; only the code moves. Tail errors were
+    ALREADY distinctly encoded by the daemon (non-nil compiled on non-fatal via
+    applyAndSyncCommitted, daemon_apply.go ~332) so NO new sentinel was added.
+    Consumer check: no pkg/cli/cmd/cli code switches on the commit status code
+    (remote CLI wraps the message verbatim; local CLI calls store.Commit directly),
+    so NO consumer update needed. Fail-on-revert proven via -overlay (restore the
+    blanket default:InvalidArgument -> tail-reconcile->Unavailable rows RED for
+    both Commit and CommitConfirmed; schema/context rows stay green).
+  - **File(s)**: pkg/grpcapi/server_config.go,
+    pkg/grpcapi/server_config_commit_errclass_5742_test.go, pkg/grpcapi/README.md
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5233 close the CURSOR-path residual of the session-walk
+    context-cancel fix. The non-cursor session handlers (sessionsOffset /
+    sessionSummaryHandler / sessionZonePairHandler) were already guarded by the
+    merged newRequestCancelSampler; the issue's own closeout comment (codex-183)
+    named the residual: sessionsCursor (pkg/api/sessions.go) — the page_size>0
+    cursor path over IterateSessionsFrom/IterateSessionsV6From — checked only
+    len(all) >= pageSize, never r.Context(). A selective/no-match cursor query
+    never fills the page, so the callback walked the rest of a multi-million-entry
+    conntrack table holding per-bucket BPF-map locks for a page nobody will read,
+    and it transitioned into the v6 full walk unconditionally after v4. Wired the
+    SAME sampler into both cursor callbacks (return false on cancel) and added a
+    direct r.Context().Err() check before the v6 phase and before the terminal
+    envelope, so a disconnect neither launches the second walk nor emits a
+    misleading next_page_token/partial page (nor the include_peer fan-out inside
+    writeSessionList). Full-page writes stay unguarded (valid complete results);
+    non-cancelled page-token/error semantics unchanged. New cursor-capable
+    counting fake (cursorCountDP) + fail-on-revert tests extend
+    api_ctx_cancel_5232_5233_test.go. Fail-on-revert proven via -overlay (strip
+    the cursor checks -> cancelled walks run all 20480 entries + write an
+    envelope, tests RED). pkg/api/README.md cancel-contract section updated for
+    the cursor path.
+  - **File(s)**: pkg/api/sessions.go, pkg/api/api_ctx_cancel_5232_5233_test.go,
+    pkg/api/README.md
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #4886 control-plane unbounded-memory cohort — fixed the 3 LIVE
+    parts (STEP-0 found A-gRPC already bounded by #5454 and B-rebuffer already
+    streamed by #4731/#4709; did NOT touch those). A-CLI: cli_clear.go
+    clearFilteredSessions snapshotted every matching fwd/rev/DNAT key before
+    deleting → bounded it via a collect-≤cliClearFilteredBatch → delete → resume
+    loop mirroring the #5454 gRPC path (cursor primary IterateSessionsFrom to keep
+    it O(N) and avoid the O(N²) CPU-stall #4719, bounded rescan fallback);
+    peak O(batch). B: dispatchWithPager now TTY-gates via stdoutIsTerminal()
+    (TCGETS) — a non-TTY stdout (the `show | match` filter pipe) auto-disables the
+    pager, fixing the nested-pager --More---into-hidden-pipe hang. C:
+    ddns_leases.go parseActiveLeasesFileInto streams csv.Read() row-by-row into acc
+    instead of csv.ReadAll(), dropping the O(history) retained-rows transient.
+    Per-part fail-on-revert proven via -overlay: A snapshot-all → chunk 20 > batch 4
+    RED; B no-guard → --More-- leak RED; C ReadAll → 22.97MB > 19MB bound RED
+    (streaming 14.9MB). Also added cursor overrides to the 2 existing clear test
+    fakes (they embed *dataplane.Manager and only overrode IterateSessions).
+  - **File(s)**: pkg/cli/cli_clear.go, pkg/cli/cli_dispatch.go,
+    pkg/dhcpserver/ddns_leases.go, pkg/cli/cli_clear_bounded_4886_test.go,
+    pkg/cli/cli_dispatch_pager_tty_4886_test.go,
+    pkg/dhcpserver/ddns_leases_streaming_4886_test.go,
+    pkg/cli/cli_clear_reversekey_test.go, pkg/cli/cli_clear_errors_test.go,
+    pkg/cli/README.md
+  - **Action**: #5700 surface VRF setup/mgmt-bind failure into commit truth (M25).
+    applyVRFReconcile (pkg/daemon/daemon_apply.go) LOGGED-and-DROPPED its
+    ReconcileVRFs failure at WARN and returned only the #2926-C1 ctx-cancellation,
+    even though reconcileVRFs's partial-failure contract records the VRF in the
+    managed set (IsManagedVRF true) — so a commit reported the VRF configured while
+    its vrf-* device was absent on the kernel, no retry owner (false convergence).
+    The authoritative post-networkd management-VRF re-bind (:1346, which networkctl
+    reconfigure necessitates by stripping the master binding) swallowed its failure
+    at WARN too. Mirrored the #5310 ifaceErr / #5696 routeLeakErr / #5844
+    routingRuleErr deferred-error joins: applyVRFReconcile now returns (ctxErr,
+    vrfErr) — ctxErr the UNCHANGED C1 abort, vrfErr the deferred ReconcileVRFs
+    (setup) failure threaded into the tail errors.Join; extracted
+    rebindManagementVRFIfaces which aggregates+RETURNS the authoritative mgmt-bind
+    failures, joined into networkdErr. A failed commit is the retry owner (next
+    apply re-reconciles). Left best-effort (documented): the routing-instance
+    member binds (run before tunnel/xfrmi creation -> expected transient absence)
+    and the pre-networkd mgmt bind (stripped+re-established by the authoritative
+    rebind) — surfacing either would false-fail valid commits. #2926-C1 semantics
+    preserved (TestC1PostPromotionCancelRunsHostAuthorizationCloseout stays green).
+    Fail-on-revert proven via -overlay (restore the three swallows -> the setup /
+    mgmt-bind / tail-join surface tests RED; positive controls stay green).
+  - **File(s)**: pkg/daemon/daemon_apply.go,
+    pkg/daemon/vrf_setup_bind_commit_truth_5700_test.go, pkg/daemon/README.md,
+    pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go,
+    pkg/daemon/route_leak_snapshot_failclosed_5696_test.go,
+    pkg/daemon/device_map_teardown_failclosed_5309_test.go,
+    pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5948 harden clearFilteredV*Rescan with a no-progress guard
+    (#4886 follow-up, flagged as the optional note in the #5947 review). The
+    fresh-RESCAN fallback (pkg/cli/cli_clear.go, cursor-LESS dp only — test/edge,
+    unreachable in production since both dp types implement the cursor iterators)
+    re-collects matching keys from the top each round and relies on deletes
+    succeeding to shrink the set. A cursor-less dp whose DeleteSession
+    PERSISTENTLY errored (genuine, non-not-found) for >= batch matching keys would
+    re-collect the identical set forever (infinite loop). Fixed: cliClearBatchV*
+    .deleteAll now returns (deleted, removed) where removed = deleted + not-found
+    (forward keys no longer in the map); the rescan breaks with `if removed == 0`
+    on a non-empty chunk (all forward deletes genuinely failed) rather than
+    looping. removed (not deleted) is the progress metric so a concurrently-
+    drained (not-found = gone) chunk is still progress, not a false stall. The
+    cursor path is UNCHANGED (already unconditionally terminating; its call sites
+    ignore removed). Fail-on-revert: a cursor-less fake with persistently-failing
+    deletes + a round-cap backstop — remove the guard and the terminate test loops
+    past the cap (dp.exceeded → RED) rather than wedging the suite; positive
+    controls (succeeding deletes clear the full set; not-found is progress) stay
+    green.
+  - **File(s)**: pkg/cli/cli_clear.go,
+    pkg/cli/cli_clear_rescan_no_progress_5948_test.go, pkg/cli/README.md

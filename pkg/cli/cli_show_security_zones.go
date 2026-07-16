@@ -133,13 +133,18 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 							wantUnit = u
 						}
 					}
-					ifc, ok := cfg.Interfaces.Interfaces[base]
-					if !ok {
+					ifc, ok := config.LookupInterface(cfg, base)
+					// #5910: `ok` proves KEY presence, not a non-nil value — the
+					// tolerant load / HA config-sync path admits a present-but-nil
+					// InterfaceConfig (#3494/#5068). Guard nil AND walk units via
+					// the shared nil-safe iterator (a raw `range ifc.Units` /
+					// `unit.Number` nil-derefs and panics the daemon).
+					if !ok || ifc == nil {
 						continue
 					}
-					for _, unit := range ifc.Units {
+					config.RangeUnits(ifc, func(_ int, unit *config.InterfaceUnit) {
 						if wantUnit >= 0 && unit.Number != wantUnit {
-							continue
+							return
 						}
 						for _, addr := range unit.Addresses {
 							fmt.Printf("      Address: %s\n", addr)
@@ -150,7 +155,7 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 						if unit.DHCPv6 {
 							fmt.Printf("      DHCPv6: enabled\n")
 						}
-					}
+					})
 				}
 			}
 

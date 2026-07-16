@@ -186,7 +186,12 @@ func emitNodeExpandedTunnelNames(tree *ConfigTree, nodeID int, out map[string]st
 	}
 	ifaces := InterfacesConfig{Interfaces: make(map[string]*InterfaceConfig)}
 	for _, ifacesNode := range ifacesNodes {
-		if err := compileInterfaces(ifacesNode, &ifaces); err != nil {
+		// #5829: this is the best-effort tunnel-endpoint-name UNION used for
+		// ID allocation, not a commit gate — compile leniently so a malformed
+		// `unit <id>` is quarantined (dropped from the union, no hard error)
+		// exactly as the pre-#5829 bare-continue did. The strict commit path
+		// (compileSections) still hard-rejects the same config.
+		if err := compileInterfaces(ifacesNode, &ifaces, compileOpts{lenientNonNumericUnit: true}, nil); err != nil {
 			return
 		}
 	}

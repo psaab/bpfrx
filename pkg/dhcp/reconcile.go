@@ -93,6 +93,14 @@ func (m *Manager) Reconcile(specs []ClientSpec) {
 			if dt == "" {
 				dt = "duid-ll"
 			}
+			// #5855: on a DUID-type ROTATION (duid-ll<->duid-llt), drop the
+			// cached DUID so the restarted client cannot be handed the retired
+			// identity — getDUID re-resolves the requested type (regenerating +
+			// persisting it). The persisted file is left in place as getDUID's
+			// fail-safe fallback until a successful rotation overwrites it.
+			if prev, ok := m.duidTypes[key.iface]; ok && normalizeDUIDType(prev) != dt {
+				delete(m.duids, key.iface)
+			}
 			m.duidTypes[key.iface] = dt
 			m.v6opts[key.iface] = s.V6
 		}

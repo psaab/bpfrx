@@ -9,12 +9,12 @@ import (
 // ValidateSyslogSourceInterface accepts a `security log source-interface`
 // value: an interface name with an optional `.<unit>` suffix where the unit,
 // when present, MUST be a non-negative integer (#3349). The source resolver
-// (pkg/daemon/daemon_system.go resolveSourceAddr) splits on the FIRST '.' and
-// strconv.Atoi's the remainder; a non-numeric unit is an ignored error that
+// (ResolveSyslogSourceAddr, pkg/config/syslog_source.go) splits on the FIRST
+// '.' and strconv.Atoi's the remainder; a non-numeric unit is an ignored error that
 // silently falls back to unit 0 — binding the syslog source to the WRONG
 // logical unit's address. Rejecting it at commit makes the typo
 // operator-visible instead of misrouting the audit source IP. The split rule
-// (first '.') mirrors resolveSourceAddr's strings.Cut exactly.
+// (first '.') mirrors ResolveSyslogSourceAddr's strings.Cut exactly.
 func ValidateSyslogSourceInterface(raw string, _ *Config) error {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {

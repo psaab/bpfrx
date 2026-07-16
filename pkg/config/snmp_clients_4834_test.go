@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net"
 	"strings"
 	"testing"
 )
@@ -46,19 +47,29 @@ func TestSNMPClients_MalformedPrefixRejected(t *testing.T) {
 	}
 }
 
-// TestSNMPClients_RestrictTypoLenientWarns pins the no-brick contract
-// (#1960 doctrine): the malformed token the STRICT path rejects is
-// tolerated on the lenient load/peer-sync path, downgraded to a warning
-// so an already-persisted config an older binary accepted still boots.
-// compileClientNets keeps silently dropping the unparseable entry on this
-// path, matching pre-#4834 runtime behavior exactly (the warning is the
-// only new signal).
-func TestSNMPClients_RestrictTypoLenientWarns(t *testing.T) {
+// TestSNMPClients_RestrictTypoLenientQuarantines pins the #5833 fail-CLOSED
+// contract on the tolerant load / peer-sync path. The malformed token the
+// STRICT path rejects must NOT brick the node (#1960), but it must also NOT
+// leave the surviving broad allow live: `0.0.0.0/0 restric` + `10.0.0.0/8`
+// used to drop the bad token and keep `0.0.0.0/0` as a plain allow, so on
+// restart/upgrade/peer-sync the community answered from EVERY source (fail
+// open). The community is now QUARANTINED to deny-all instead, while the rest
+// of the config (a second, well-formed community) still loads, and the warning
+// is preserved.
+//
+// FAIL-ON-REVERT: reverting the quarantine (dropping the malformed token and
+// keeping the surviving 0.0.0.0/0 allow) makes AllowsSource("8.8.8.8") return
+// true, so the deny assertions below fire RED.
+func TestSNMPClients_RestrictTypoLenientQuarantines(t *testing.T) {
 	tree := &ConfigTree{}
 	lines := []string{
 		"set snmp community mon authorization read-only",
 		"set snmp community mon clients 0.0.0.0/0 restric",
 		"set snmp community mon clients 10.0.0.0/8",
+		// A second, WELL-FORMED community: the quarantine is scoped to the
+		// affected community, and the REST of the config must still load.
+		"set snmp community pub authorization read-only",
+		"set snmp community pub clients 192.168.0.0/16",
 	}
 	for _, line := range lines {
 		path, err := ParseSetCommand(line)
@@ -75,6 +86,76 @@ func TestSNMPClients_RestrictTypoLenientWarns(t *testing.T) {
 	}
 	if !hasWarningSubstr(cfg.Warnings, "restric") {
 		t.Fatalf("expected a downgraded clients-token warning naming 'restric', warnings=%v", cfg.Warnings)
+	}
+
+	mon := cfg.System.SNMP.Communities["mon"]
+	if mon == nil {
+		t.Fatal("community 'mon' missing from compiled config")
+	}
+	// Quarantined = DENY-ALL. Every source is denied — the surviving broad
+	// 0.0.0.0/0 allow (and the 10.0.0.0/8 allow) must NOT be honored, and IPv6
+	// is denied too.
+	for _, src := range []string{"8.8.8.8", "10.1.2.3", "192.168.1.1", "2001:db8::1"} {
+		if mon.AllowsSource(net.ParseIP(src)) {
+			t.Errorf("quarantined community must DENY %s, but it was allowed "+
+				"(fail-open: the broad allow survived the malformed \"restrict\" token, #5833)", src)
+		}
+	}
+
+	// The rest of the config loaded: the well-formed community keeps its
+	// intended allowlist policy (no false quarantine of a sibling community).
+	pub := cfg.System.SNMP.Communities["pub"]
+	if pub == nil {
+		t.Fatal("well-formed community 'pub' missing — the rest of the config failed to load")
+	}
+	if !pub.AllowsSource(net.ParseIP("192.168.1.1")) {
+		t.Error("well-formed community 'pub' must ALLOW its listed source 192.168.1.1")
+	}
+	if pub.AllowsSource(net.ParseIP("8.8.8.8")) {
+		t.Error("well-formed community 'pub' must DENY an unlisted source 8.8.8.8")
+	}
+}
+
+// TestSNMPClients_WellFormedLenientNoQuarantine confirms the #5833 quarantine
+// does not over-fire: a well-formed clients allowlist on the LENIENT path keeps
+// its intended longest-prefix restrict/allow semantics (a correctly-spelled
+// `restrict` is the modifier, never a malformed prefix entry), with no warning
+// and no deny-all quarantine.
+func TestSNMPClients_WellFormedLenientNoQuarantine(t *testing.T) {
+	tree := &ConfigTree{}
+	lines := []string{
+		"set snmp community mon authorization read-only",
+		"set snmp community mon clients 10.0.0.0/8 restrict", // deny the /8...
+		"set snmp community mon clients 10.1.0.0/16",         // ...except this more-specific /16
+	}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient failed on a well-formed allowlist: %v", err)
+	}
+	if hasWarningSubstr(cfg.Warnings, "restric") {
+		t.Fatalf("well-formed clients must not produce a token warning, warnings=%v", cfg.Warnings)
+	}
+	mon := cfg.System.SNMP.Communities["mon"]
+	if mon == nil {
+		t.Fatal("community 'mon' missing from compiled config")
+	}
+	// Longest-prefix restrict semantics intact (no false quarantine):
+	//   10.2.3.4 -> matched only by 10.0.0.0/8 restrict -> DENY
+	//   10.1.2.3 -> matched by more-specific 10.1.0.0/16 allow           -> ALLOW
+	if mon.AllowsSource(net.ParseIP("10.2.3.4")) {
+		t.Error("10.0.0.0/8 restrict must DENY 10.2.3.4")
+	}
+	if !mon.AllowsSource(net.ParseIP("10.1.2.3")) {
+		t.Error("more-specific 10.1.0.0/16 allow must PERMIT 10.1.2.3 (false quarantine?)")
 	}
 }
 

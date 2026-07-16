@@ -36,7 +36,7 @@ func compileSections(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 				return fmt.Errorf("security: %w", err)
 			}
 		case "interfaces":
-			if err := compileInterfaces(node, &cfg.Interfaces); err != nil {
+			if err := compileInterfaces(node, &cfg.Interfaces, opts, &cfg.Warnings); err != nil {
 				return fmt.Errorf("interfaces: %w", err)
 			}
 		case "applications":

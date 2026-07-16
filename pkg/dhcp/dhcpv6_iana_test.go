@@ -153,7 +153,7 @@ func TestSelectIANAAddressTieBreak(t *testing.T) {
 			ValidLifetime:     800 * time.Second,
 		},
 	)
-	addr, validLT := selectIANAAddress(adv)
+	addr, validLT, _ := selectIANAAddress(adv)
 	if addr != netip.MustParseAddr("2001:db8::c") {
 		t.Errorf("tie-break address = %v, want 2001:db8::c (first-seen)", addr)
 	}
@@ -186,7 +186,7 @@ func TestSelectIANAAddressMultipleIANA(t *testing.T) {
 	adv.AddOption(iana1)
 	adv.AddOption(iana2)
 
-	addr, validLT := selectIANAAddress(adv)
+	addr, validLT, _ := selectIANAAddress(adv)
 	if addr != netip.MustParseAddr("2001:db8::2") {
 		t.Errorf("address = %v, want 2001:db8::2 (longest preferred across IA_NA options)", addr)
 	}

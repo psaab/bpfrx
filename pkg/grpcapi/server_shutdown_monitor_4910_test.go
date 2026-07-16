@@ -45,7 +45,9 @@ func TestServeUntilDoneBoundedByStuckMonitorStream_4910(t *testing.T) {
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
-		grpc.UnaryInterceptor(s.configLockInterceptor),
+		// #5849: mirror the production loopback server — connection-scoped
+		// config-lock lifecycle via a stats.Handler, no per-RPC interceptor.
+		grpc.StatsHandler(&configLockStatsHandler{s: s}),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())

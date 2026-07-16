@@ -64,6 +64,23 @@ journal. The ONLY live-state mutations are STOP and FLIP-then-START;
 PREFLIGHT / COPY / VERIFY are pure and abortable (a failure there leaves
 the running daemon and config untouched).
 
+**Superseded stale cut (a NEWER version was staged before the old cut
+finished).** When the journaled target differs from the newly-staged
+version, the live system is recovered to a consistent state BEFORE a fresh
+cut starts, so the new cut's rollback target (`PreviousVersion`, read from
+`current`) is always a verified-live version. For a stale **STOPPED**
+journal the old cut already stopped the daemon but never flipped `current`,
+so recovery restarts the still-current KNOWN-GOOD daemon. That restart is
+**fail-closed** (#5846): if `StartUnit` FAILS, recovery ABORTS and returns
+the error — it does NOT sweep partials, reset the journal, or begin a fresh
+cut, because doing so would start a new cut whose rollback target is the
+version that JUST FAILED TO RESTART while the control plane is DOWN
+(possible unrecoverable state). The stale journal + partials are PRESERVED
+so an operator or the next-boot re-run retries recovery; a fresh cut
+proceeds only once the known-good daemon is confirmed restarted. This
+mirrors the fail-closed-on-lifecycle-error posture of the rolling/kernel
+drain paths (#5845).
+
 - **PREFLIGHT** — check `/var` free ≥ staged size + config-DB snapshot
   size + margin; GC eligible versions if short; take the pre-upgrade
   config-DB snapshot (`.partial`+rename, never torn) for rollback.
@@ -162,6 +179,41 @@ on. Per the #1373 eBPF retirement the userspace helper is the ONLY
 forwarding path, so a healthy post-upgrade node MUST have an armed
 forwarding helper — there is no legitimate no-helper case to exempt. A
 not-healthy result flows into the existing rollback path below.
+
+#### `StartHealthDeadline` is AUTHORITATIVE across every blocking op (#5808)
+
+The gate must RETURN by `StartHealthDeadline` no matter which dependency
+wedges — otherwise a hung `systemctl`/DBus or an unresponsive control
+socket strands the post-flip cut PAST the point where an automatic
+rollback (standalone) or an operator-driven fence (HA) is still timely.
+Before #5808 the `systemctl is-active` precondition ran under an
+unbounded `exec.Command`, so a wedged systemd could block the whole gate
+indefinitely.
+
+The probe now bounds **every** blocking call by one `context.WithTimeout`
+of `StartHealthDeadline`:
+
+- **is-active probe** runs under `exec.CommandContext`; a wedged
+  `systemctl` is SIGKILLed at the deadline, not left blocking. This is the
+  single shared primitive `upgrade.UnitActive(ctx, unit)` — the wired
+  `HelperHealthProbe` precondition, the probe-less fallback poll, AND
+  `cmd/xpfd`'s wiring all route through it (one timeout behavior, not two
+  divergent `exec.Command` impls).
+- **control-socket status query** is capped to `min(StatusTimeout,
+  time-remaining-to-deadline)`, so a `StatusTimeout` larger than the
+  deadline can never run the query past it.
+- **poll wait** uses a context-aware timer (`select` on `ctx.Done()` vs
+  the poll timer), so it never overshoots the deadline by a full poll
+  interval.
+
+The gate distinguishes a definitive *not-ready* (retry until the deadline)
+from a deadline/cancellation: a deadline failure wraps the context cause,
+so callers can `errors.Is(err, context.DeadlineExceeded)`. The most-recent
+GENUINE readiness failure (e.g. "helper not forwarding") is retained as
+the diagnostic `last:` cause — a deadline *symptom* (a killed probe, or the
+status query having no remaining budget) does not mask it. Standalone
+auto-rollback and HA fence (`SkipStartHealthRollback`) both trigger
+PROMPTLY at the deadline instead of hanging.
 
 ### Rollback (binary + DB atomic)
 
@@ -410,7 +462,13 @@ state machines are untouched.
 4. **strong drain predicate** — peer owns the RGs, local VRRP BACKUP with
    no VIPs, `rg_active` false, sync clean (NOT merely "weight 0 set" — an
    RG keeps forwarding while VRRP is still MASTER). On timeout: fail back
-   and ABORT WITHOUT cutting (node still forwarding — no harm).
+   (`ResetFailover`) and ABORT WITHOUT cutting. When the failback SUCCEEDS the
+   node resumed forwarding — no harm. But `ForceSecondary` already DEMOTED the
+   node, so a FAILED failback is NOT harmless: the abort surfaces BOTH failures
+   (`errors.Join`) and warns the node may be **stranded demoted** (force-
+   secondary not undone, peer takeover unproven → possible both-nodes-secondary
+   outage) so an operator investigates — it must NOT keep claiming "still
+   forwarding" (#5845, mirroring the kernel-roll drain path `kernel_drain.go`).
 5. single-node cut (auto-rollback disabled).
 6. wait for session sync to re-establish, bounded by `RejoinDeadline`
    (60s default). The cut just restarted xpfd, so the local gRPC socket
@@ -772,6 +830,31 @@ treats an unreadable observation as a definite safe state:
   failure (after still attempting the keepalive), and `DisarmWatchdog`
   propagates open/write/close failures (a genuinely-absent device is still
   a clean nil).
+- *Two-phase arm + BootNext readback (#5847).* The arm used to persist the
+  `ARMED` journal BEFORE `efibootmgr --bootnext`, on the theory that an
+  `ARMED`-without-`BootNext` journal is harmless. It is NOT: a crash in
+  that gap (or before the best-effort rollback ran) left a FALSE-ARMED
+  journal — the firmware still boots the known-good default and no trial
+  ever happens, yet `Arm` refused-forever (`>= ARMED`) and self-recovery
+  suppressed expired-lease failback INDEFINITELY (the drained node never
+  rejoined). Neither write order is atomic with the NVRAM mutation, so
+  `ARMED` is now made AUTHORITATIVE via a positive readback:
+  1. record `ARMING` (prepared intent, with a fresh per-attempt nonce)
+     BEFORE any NVRAM mutation;
+  2. `SetBootNext(inactiveID)`;
+  3. positively read `GetBootNext()` back and require it equals the armed
+     inactive-slot id — a firmware that silently dropped or partial-wrote
+     the variable must NOT yield a verified-ARMED journal;
+  4. only THEN durably transition `ARMING -> ARMED`, recording the
+     confirmed `BootID` for boot-provenance.
+
+  `ARMING` sits BELOW `ARMED` in the journal order, so a journal stuck
+  there (readback failed / never ran) lets `Arm` RE-ARM (the `>= ARMED`
+  refusal does not fire; `armCandidate` is idempotent) and does not
+  suppress self-recovery. Only the verified `ARMED` (readback confirmed)
+  counts as a genuine trial. The per-attempt `ArmNonce` (unique across
+  attempts even under a stuck clock) distinguishes a fresh arm from a
+  stale/crashed journal.
 
 In a cluster the roll is driven ONE NODE AT A TIME by the external
 orchestrator (`scripts/deploy/xpf-deploy.py kernel-roll`): drain
@@ -873,10 +956,15 @@ carrying traffic:
    can't silently age the deadline and let the next positive tick rejoin
    immediately.
 3. **Still-armed gate.** Self-recovery refuses to rejoin while the kernel
-   journal is still ARMED even if the lease has expired — a legitimately
-   long-hanging roll (one that outran its lease TTL) is still a trial in
-   flight; the promote/revert oneshot owns the resolution, and the
-   election hold keeps the node secondary meanwhile.
+   journal is at the VERIFIED `ARMED` state even if the lease has expired
+   — a legitimately long-hanging roll (one that outran its lease TTL) is
+   still a trial in flight; the promote/revert oneshot owns the
+   resolution, and the election hold keeps the node secondary meanwhile.
+   This gate is driven by `IsArmed`, which reports true ONLY for the
+   verified `ARMED` state — NOT the `ARMING` prepared-intent state (see
+   the two-phase arm below). A journal stuck at `ARMING` is NOT a genuine
+   trial, so self-recovery does NOT suppress on it and the drained node
+   can rejoin (#5847).
 
 ### Persistence precondition
 

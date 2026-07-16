@@ -22,7 +22,7 @@ var vrrpGroupPropertyKeywords = map[string]bool{
 	"track-priority-cost": true,
 }
 
-func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
+func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, warnings *[]string) error {
 	for _, child := range node.Children {
 		if child.IsLeaf {
 			continue
@@ -220,8 +220,29 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 
 		for _, unitInst := range namedInstances(child.FindChildren("unit")) {
 			unitNum, err := strconv.Atoi(unitInst.name)
-			if err != nil {
-				continue
+			if err != nil || unitNum < 0 || unitNum > MaxLogicalUnit {
+				// #5829: a non-numeric / negative / overflow / out-of-range
+				// logical-unit id is NOT a droppable no-op — every child
+				// (addresses, firewall filters, sampling, DHCP/DDNS, tunnel)
+				// carries security intent that would silently vanish (a
+				// unit-level filter would commit with no enforcement:
+				// fail-open). Fail CLOSED, mirroring the schema keyValidator
+				// (ValidateLogicalUnit) range. Strict compile hard-errors
+				// naming the interface + raw token; the tolerant load /
+				// peer-sync path (lenientNonNumericUnit) instead warns and
+				// QUARANTINES the unit — skipped here, its children never
+				// reattached to another unit — so an already-persisted config
+				// an older binary silently dropped still boots, now with a
+				// deterministic diagnostic.
+				msg := fmt.Sprintf("interfaces %s: logical unit %q must be an integer in 0..%d",
+					ifName, unitInst.name, MaxLogicalUnit)
+				if opts.lenientNonNumericUnit {
+					if warnings != nil {
+						*warnings = append(*warnings, msg)
+					}
+					continue
+				}
+				return fmt.Errorf("%s", msg)
 			}
 			unit := &InterfaceUnit{Number: unitNum}
 

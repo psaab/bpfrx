@@ -515,7 +515,24 @@ func (c *ctl) dispatchConfig(line string) error {
 		return c.dispatchOperational(strings.Join(parts[1:], " "))
 
 	case "exit", "quit":
-		_, _ = c.client.ExitConfigure(c.ctx(), &pb.ExitConfigureRequest{})
+		// #5812: an explicit exit/quit is a TRANSACTIONAL client state change,
+		// not best-effort teardown. If the ExitConfigure release RPC fails (a
+		// transport timeout/disconnect before it reaches the daemon), the
+		// server-side configuration lock + candidate may still be owned by THIS
+		// session — so do NOT clear local config-mode state. Clearing it would
+		// drop the operator to operational mode believing they released, throwing
+		// away the only immediate in-process retry path (the session still holds
+		// the lock, so re-issuing `exit` IS the correct recovery). Surface the
+		// error and stay in configuration mode with editPath/prompt intact. The
+		// RPC is idempotent server-side, so a retry after a response-lost success
+		// still returns success and transitions cleanly. Only Store(false) on
+		// success (the SIGINT goroutine reads configMode concurrently, #5053).
+		// The EOF / process-teardown path (main.go exitConfigureBounded) stays
+		// best-effort and is deliberately left unchanged — the client is exiting
+		// anyway and has no interactive recovery.
+		if _, err := c.client.ExitConfigure(c.ctx(), &pb.ExitConfigureRequest{}); err != nil {
+			return fmt.Errorf("failed to release configuration lock: %w; still in configuration mode, retry `exit`", err)
+		}
 		c.configMode.Store(false)
 		c.editPath = nil
 		if c.rl != nil {

@@ -367,6 +367,17 @@ func (er *EventReader) SyslogClientCount() int {
 	return len(er.syslogClients)
 }
 
+// LocalWriterCount reports how many local log writers are currently installed
+// (goroutine-safe). Observability/testability only — lets a caller confirm that
+// event mode installed a local writer (and that a stream-mode reload cleared
+// it), e.g. an in-process CLI commit reaching event-mode parity with the daemon
+// reconcile (#5738).
+func (er *EventReader) LocalWriterCount() int {
+	er.localMu.RLock()
+	defer er.localMu.RUnlock()
+	return len(er.localWriters)
+}
+
 // SetLocalWriters replaces the set of local log writers (goroutine-safe).
 func (er *EventReader) SetLocalWriters(writers []*LocalLogWriter) {
 	er.localMu.Lock()

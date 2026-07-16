@@ -705,16 +705,29 @@ func newCollector(srv *Server) *xpfCollector {
 			"xpf_event_actions_dropped_total",
 			"Total event-options remediation actions dropped (NOT applied). "+
 				"reason=lock_held: the config lock stayed held past the "+
-				"retry deadline. reason=queue_full: a newer same-policy "+
-				"action superseded this one, or the bounded action queue "+
-				"was full (#2157). reason=stale: at commit time the policy had "+
-				"been removed or redefined, or its 30s cooldown was now active — "+
-				"the action was revalidated and dropped rather than committing a "+
-				"batch no active policy authorizes (#3750). A nonzero "+
-				"lock_held/queue_full value means automated remediation was "+
-				"lost — investigate the lock holder; stale is expected under "+
-				"operator config churn or duplicate events.",
+				"retry deadline. reason=queue_full: the bounded action queue "+
+				"was full of OTHER policies' actions and this one could not fit "+
+				"(#2157; a same-policy dedup is counted separately as "+
+				"xpf_event_actions_superseded_total, #5853). reason=stale: at "+
+				"commit time the policy had been removed or redefined, or its 30s "+
+				"cooldown was now active — the action was revalidated and dropped "+
+				"rather than committing a batch no active policy authorizes "+
+				"(#3750). A nonzero lock_held/queue_full value means automated "+
+				"remediation was lost — investigate the lock holder; stale is "+
+				"expected under operator config churn or duplicate events.",
 			[]string{"reason"}, nil,
+		),
+		eventActionsSuperseded: prometheus.NewDesc(
+			"xpf_event_actions_superseded_total",
+			"Total event-options remediation actions SUPERSEDED by a newer "+
+				"same-policy trigger while queued (#5853). The dedup keeps at "+
+				"most one pending action per policy, so a burst from one policy "+
+				"cannot fill the bounded queue and starve other policies. This is "+
+				"benign — nothing is lost, the newer equivalent action still "+
+				"runs — and is expected under duplicate events; it is NOT a "+
+				"capacity drop (see reason=queue_full on "+
+				"xpf_event_actions_dropped_total).",
+			nil, nil,
 		),
 		eventAttributesInvalid: prometheus.NewDesc(
 			"xpf_event_attributes_match_invalid_total",

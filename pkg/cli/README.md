@@ -35,21 +35,23 @@ sibling files (same package, so unexported helpers stay reachable):
   `data-plane`.
 - `cli_request_system.go` — `request system reboot|halt|power-off|zeroize`
   and `software` / `configuration` / `dynamic-dns`.
-  - **`zeroize` erases the CONFIGURED config root, not a hardcoded `/etc/xpf`
-    (#5554).** `zeroizeConfigRoot` resolves the wipe target from
-    `configstore.Store.ConfigPath()` — the daemon's `-config` path, the SAME
-    file the store loads from and persists the `.configdb` SSOT + `master.key`
-    / numbered text rollback slots / `.config.journal` to — and threads
-    `filepath.Dir/Base` of it into the shared `configstore.FactoryResetConfigDir`
-    /`FactoryResetArchiveDir` primitives (`zeroizeConfigState`). The interactive
-    CLI runs in-process with the daemon and shares its store, so this is the
-    local twin of the gRPC `runZeroize`/`zeroizeConfigRoot` fix (#5280): a daemon
-    started with a non-default `-config` (e.g. `/srv/xpf/site.conf`) erases
-    `/srv/xpf`, not `/etc/xpf`. Resolution is fail-CLOSED — an undeterminable
-    store / config path returns an error rather than wiping the wrong path (or
-    nothing) while reporting a clean factory reset. The pre-fix wipe hardcoded
-    `/etc/xpf` and left the real root's `.configdb`/`master.key`/TLS material/
-    rollback slots on disk.
+  - **`zeroize` runs the FULL shared wipe, not a partial config-only one
+    (#5890).** `performConsoleZeroize` resolves+validates the configured
+    config root (`zeroizeConfigRoot`, #5554/#5684 — fail-CLOSED on an
+    undeterminable store/path so it never wipes the wrong directory) and then
+    DELEGATES to the exported `grpcapi.PerformZeroizeWipe(configDir,
+    configBase)` — the SAME primitive the gRPC `runZeroize` runs — before
+    stopping xpfd. Both paths therefore erase an IDENTICAL owned-artifact set
+    (config state + `tls/` + rendered service configs [frr/swanctl/kea] +
+    provisioned login accounts [shadow/authorized_keys/`sudoers.d/xpf-*`] +
+    config archive + BPF pins + networkd) and cannot diverge. Before #5890 the
+    console called only `zeroizeConfigState` (config DB + archive), which LEFT
+    `tls/`, the rendered secrets, and the login accounts on disk — secret
+    residue a re-tenanted device could recover. It is fail-CLOSED: a wipe that
+    does not complete surfaces the error and does NOT stop the daemon (never
+    reboot into a half-wiped, secret-retaining state). The `#5554`/`#5280`
+    configured-root resolution (a non-default `-config` erases its own root,
+    not a hardcoded `/etc/xpf`) is preserved inside `zeroizeConfigRoot`.
 - `cli_request_security.go` — `request security ipsec|policies|wireguard`.
 
 The security-sensitive `--` end-of-options separators in the diagcmd/tcpdump
@@ -149,6 +151,49 @@ presenter's rendered output is byte-identical:
   because an empty `ClearSessionsRequest` means clear-all to the peer.
   Key ports are network byte order (`ntohs` before comparing) and
   dataplane IPv4 NAT fields decode with NativeEndian (`uint32ToIP`).
+  The FILTERED clear (`clearFilteredSessions`) is BOUNDED (#4886): it
+  collects at most `cliClearFilteredBatch` forward keys (plus each
+  session's reverse/DNAT companion), deletes that chunk, and resumes —
+  cursor primary (`IterateSessionsFrom`, one O(N) forward pass, deferred
+  anchor delete) with a fresh-rescan fallback for a cursor-less dataplane
+  — so peak memory is O(batch), not O(matches). The pre-#4886 path
+  snapshotted every matching key first (hundreds of MB before deleting on
+  a multi-million-entry table). This mirrors the already-bounded gRPC
+  `ClearSessions` (#5454); using the cursor (not a bare rescan) keeps a
+  broad clear O(N), avoiding the O(N²) CPU-stall that would starve the HA
+  watchdog (#4719). The cursor path terminates unconditionally (the cursor
+  advances every round regardless of delete success). The fresh-rescan
+  fallback re-collects from the top each round, so it depends on deletes
+  actually removing keys to converge; a #5948 no-progress guard breaks the
+  loop if a non-empty chunk removed NOTHING (every forward delete genuinely
+  failed → the same set would be re-collected forever). A not-found key
+  counts as removed (it will not reappear), so a concurrently-drained chunk
+  is still progress, not a stall. This is defense-in-depth: production always
+  takes the cursor path (both `dataplane.Manager` and the userspace
+  `LegacyDataPlaneAdapter` implement the cursor iterators), so the rescan is
+  test/edge only.
+- `show` PAGER auto-disable (`dispatchWithPager`, #4886): the pager only
+  engages when `os.Stdout` is a real terminal (`stdoutIsTerminal`, probed
+  via TCGETS — `/dev/null` is a CharDevice so `os.ModeCharDevice` is
+  wrong). A `show … | match X` redirects `os.Stdout` to the filter pipe;
+  the inner bare `show` used to route back to the pager, which then wrote
+  `--More--` into the hidden outer pipe while blocking on stdin — the
+  command hung with no visible prompt. Auto-disabling on a non-TTY stdout
+  (pipe / file / scripted) fixes the nesting and streams straight through.
+- GLOBAL-ONLY clears (`cli_clear.go`) — commands whose backend action can
+  ONLY clear everything and have no scoped variant (`clear arp`, `clear ipv6
+  neighbors`, `clear interfaces statistics`, `clear system config-lock`,
+  `clear security nat statistics`, `clear security nat source
+  persistent-nat-table`, `clear security counters`, `clear security policies
+  hit-count`, `clear firewall all`) enforce EXACT ARITY via
+  `requireClearNoScope`: a trailing scope-looking operand (e.g. `clear arp
+  192.0.2.10`) is REJECTED before any mutation instead of being silently
+  discarded and clearing everything (#5811, extends the #5570 policy-hit-count
+  fix to the whole global-only set). The remote CLI (`cmd/cli/clear.go`) carries
+  a byte-identical `requireClearNoScope` so both parsers reject the same input
+  the same way. Scoped clears (`clear security flow session <filter>`, `clear
+  dhcp client-identifier interface <name>`) are unaffected — they legitimately
+  take a scope.
 - `show security match-policies` (`showMatchPolicies`) and `test policy`
   (`testPolicy`) are THIN adapters over the single shared policy simulator
   `pkg/policymatch` (#3042) — the same matcher the REST and gRPC surfaces

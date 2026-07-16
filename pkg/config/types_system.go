@@ -1327,6 +1327,20 @@ type FirewallFilterTerm struct {
 	// the commit; the tolerant load / peer-sync path downgrades to a warning
 	// (#1960 no-brick). Populated by compileFilterFrom.
 	UnknownFlexMatch []string
+	// FlexMatchRangeNames records EVERY named `flexible-match-range` range seen
+	// for this term, aggregated across ALL repeated flexible-match-range blocks
+	// and BOTH AST shapes (hierarchical + flat-set), including duplicate names
+	// and `from` group-expanded copies (#5823). The wire matcher supports at
+	// most ONE range per term; the pre-#5823 compiler silently kept only the
+	// FIRST and dropped the rest — an accept term then over-permitted and a
+	// discard/reject term over-dropped the traffic the missing ranges covered.
+	// len > 1 is a CARDINALITY violation: validateFilterFlexMatchStrict
+	// hard-rejects it at commit (naming every range), and the tolerant load /
+	// peer-sync path fails CLOSED — the userspace snapshot builder poisons the
+	// term to match NOTHING (an unrepresentable flex-match) rather than silently
+	// enforcing only the first range. A single range (len == 1) compiles exactly
+	// as before via FlexMatch. Populated by compileFilterFrom.
+	FlexMatchRangeNames []string
 	// UnknownFrom records `from` match leaves the dataplane does NOT enforce
 	// (#3307). The schema gate is opt-in (schema_walk.go), so an unknown `from`
 	// leaf (e.g. ttl / source-mac-address / ip-options / fragment-offset /

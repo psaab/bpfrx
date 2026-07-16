@@ -15,6 +15,25 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// requireClearNoScope rejects any trailing operand on a GLOBAL-ONLY clear
+// command — one whose backend action can ONLY clear everything and has no
+// scoped variant. Such handlers historically recognized a fixed keyword prefix
+// and silently DISCARDED the remaining tokens, then issued the unscoped
+// mutation, so an operator who typed a scope (e.g. `clear arp 192.0.2.10`) got
+// a success message while the ENTIRE cache/table/counter set was wiped (#5811).
+// Require exact arity instead: return an error naming the stray tokens and
+// stating the command takes no scope, BEFORE any mutation runs. cmd is the full
+// command path shown in the message; clears names what it unconditionally
+// clears. The wording is kept byte-identical to cmd/cli's copy so both CLIs
+// reject the same input the same way.
+func requireClearNoScope(cmd, clears string, extra []string) error {
+	if len(extra) == 0 {
+		return nil
+	}
+	return fmt.Errorf("unexpected argument(s) %v after %q; this command clears %s "+
+		"and takes no scope (per-scope clear is not supported)", extra, cmd, clears)
+}
+
 func (c *CLI) handleClear(args []string) error {
 	clearTree := operationalTree["clear"].Children
 	showHelp := func() {
@@ -28,7 +47,7 @@ func (c *CLI) handleClear(args []string) error {
 
 	switch args[0] {
 	case "arp":
-		return c.handleClearArp()
+		return c.handleClearArp(args[1:])
 	case "ipv6":
 		return c.handleClearIPv6(args[1:])
 	case "security":
@@ -52,6 +71,9 @@ func (c *CLI) handleClearSystem(args []string) error {
 		cmdtree.PrintTreeHelp("clear system:", operationalTree, "clear", "system")
 		return nil
 	}
+	if err := requireClearNoScope("clear system config-lock", "the configuration lock", args[1:]); err != nil {
+		return err
+	}
 	holder, locked := c.store.ConfigHolder()
 	if !locked {
 		fmt.Println("No configuration lock held")
@@ -64,6 +86,9 @@ func (c *CLI) handleClearSystem(args []string) error {
 
 func (c *CLI) handleClearInterfaces(args []string) error {
 	if len(args) >= 1 && args[0] == "statistics" {
+		if err := requireClearNoScope("clear interfaces statistics", "all interface statistics", args[1:]); err != nil {
+			return err
+		}
 		fmt.Println("Interface statistics counters noted")
 		fmt.Println("(kernel counters are cumulative and cannot be reset)")
 		return nil
@@ -72,7 +97,10 @@ func (c *CLI) handleClearInterfaces(args []string) error {
 	return nil
 }
 
-func (c *CLI) handleClearArp() error {
+func (c *CLI) handleClearArp(args []string) error {
+	if err := requireClearNoScope("clear arp", "the ARP cache", args); err != nil {
+		return err
+	}
 	out, err := exec.Command("ip", "-4", "neigh", "flush", "all").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("flush ARP: %s", strings.TrimSpace(string(out)))
@@ -85,6 +113,9 @@ func (c *CLI) handleClearIPv6(args []string) error {
 	if len(args) < 1 || args[0] != "neighbors" {
 		cmdtree.PrintTreeHelp("clear ipv6:", operationalTree, "clear", "ipv6")
 		return nil
+	}
+	if err := requireClearNoScope("clear ipv6 neighbors", "the IPv6 neighbor cache", args[1:]); err != nil {
+		return err
 	}
 	out, err := exec.Command("ip", "-6", "neigh", "flush", "all").CombinedOutput()
 	if err != nil {
@@ -104,9 +135,17 @@ func (c *CLI) handleClearSecurity(args []string) error {
 	switch args[0] {
 	case "nat":
 		if len(args) >= 3 && args[1] == "source" && args[2] == "persistent-nat-table" {
+			if err := requireClearNoScope("clear security nat source persistent-nat-table",
+				"the entire persistent NAT table", args[3:]); err != nil {
+				return err
+			}
 			return c.clearPersistentNAT()
 		}
 		if len(args) >= 2 && args[1] == "statistics" {
+			if err := requireClearNoScope("clear security nat statistics",
+				"all NAT translation statistics", args[2:]); err != nil {
+				return err
+			}
 			if c.dp == nil || !c.dp.IsLoaded() {
 				fmt.Println("dataplane not loaded")
 				return nil
@@ -146,20 +185,27 @@ func (c *CLI) handleClearSecurity(args []string) error {
 		return nil
 
 	case "policies":
-		if len(args) >= 2 && args[1] == "hit-count" {
-			if c.dp == nil || !c.dp.IsLoaded() {
-				fmt.Println("dataplane not loaded")
-				return nil
-			}
-			if err := c.dp.ClearPolicyCounters(); err != nil {
-				return fmt.Errorf("clear policy counters: %w", err)
-			}
-			fmt.Println("policy hit counters cleared")
+		if len(args) < 2 || args[1] != "hit-count" {
+			return fmt.Errorf("usage: clear security policies hit-count")
+		}
+		if err := requireClearNoScope("clear security policies hit-count",
+			"all policy hit counters", args[2:]); err != nil {
+			return err
+		}
+		if c.dp == nil || !c.dp.IsLoaded() {
+			fmt.Println("dataplane not loaded")
 			return nil
 		}
-		return fmt.Errorf("usage: clear security policies hit-count")
+		if err := c.dp.ClearPolicyCounters(); err != nil {
+			return fmt.Errorf("clear policy counters: %w", err)
+		}
+		fmt.Println("policy hit counters cleared")
+		return nil
 
 	case "counters":
+		if err := requireClearNoScope("clear security counters", "all counters", args[1:]); err != nil {
+			return err
+		}
 		if c.dp == nil || !c.dp.IsLoaded() {
 			fmt.Println("dataplane not loaded")
 			return nil
@@ -188,100 +234,325 @@ func (c *CLI) clearFilteredSessions(f sessionFilter) error {
 	// without this an interface-filtered clear matches nothing.
 	f.populateIfaceMaps(c)
 
-	v4Deleted := 0
-	v6Deleted := 0
 	var agg sessionClearErrors
-
-	var v4Keys []dataplane.SessionKey
-	var v4RevKeys []dataplane.SessionKey
-	var snatDNATKeys []dataplane.DNATKey
-	// Enumeration failure must be surfaced: a partial scan silently
-	// skips sessions the operator asked to clear (#2468).
-	agg.add("v4 iterate", c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
-		if val.IsReverse != 0 {
-			return true
-		}
-		if !f.matchesV4(key, val) {
-			return true
-		}
-		v4Keys = append(v4Keys, key)
-		// The reverse companion is installed keyed on val.ReverseKey
-		// (the TRANSLATED tuple for NAT'd sessions — session_store.go
-		// PutClusterSyncedV4 / manager_ha.go), NOT a naive src/dst swap
-		// of the forward key. For a non-NAT session the two coincide;
-		// for a NAT'd session a naive swap would leave the real reverse
-		// entry behind (#2733). A zero ReverseKey (Protocol==0) means no
-		// reverse companion was installed (the needsReverse gate), so
-		// skip it.
-		if val.ReverseKey.Protocol != 0 {
-			v4RevKeys = append(v4RevKeys, val.ReverseKey)
-		}
-		if val.Flags&dataplane.SessFlagSNAT != 0 &&
-			val.Flags&dataplane.SessFlagStaticNAT == 0 {
-			// Companion dnat_table key must match the write-side encoding
-			// (#2406: host-order port) or the delete silently misses.
-			snatDNATKeys = append(snatDNATKeys, dataplane.DNATKeyForSessionV4(key, val))
-		}
-		return true
-	}))
-
-	for _, key := range v4Keys {
-		if err := c.dp.DeleteSession(key); err != nil {
-			agg.add("v4 forward delete", err)
-		} else {
-			v4Deleted++
-		}
-	}
-	for _, key := range v4RevKeys {
-		agg.addExceptNotFound("v4 reverse delete", c.dp.DeleteSession(key))
-	}
-	for _, dk := range snatDNATKeys {
-		agg.addExceptNotFound("v4 DNAT companion delete", c.dp.DeleteDNATEntry(dk))
-	}
-
-	var v6Keys []dataplane.SessionKeyV6
-	var v6RevKeys []dataplane.SessionKeyV6
-	var snatDNATKeysV6 []dataplane.DNATKeyV6
-	agg.add("v6 iterate", c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-		if val.IsReverse != 0 {
-			return true
-		}
-		if !f.matchesV6(key, val) {
-			return true
-		}
-		v6Keys = append(v6Keys, key)
-		// Reverse companion at the TRANSLATED tuple val.ReverseKey, not a
-		// naive swap (see V4 above, #2733). Zero ReverseKey => no companion.
-		if val.ReverseKey.Protocol != 0 {
-			v6RevKeys = append(v6RevKeys, val.ReverseKey)
-		}
-		if val.Flags&dataplane.SessFlagSNAT != 0 &&
-			val.Flags&dataplane.SessFlagStaticNAT == 0 {
-			// Companion dnat_table_v6 key must match the write-side encoding
-			// (#2406: host-order port) or the delete silently misses.
-			snatDNATKeysV6 = append(snatDNATKeysV6, dataplane.DNATKeyForSessionV6(key, val))
-		}
-		return true
-	}))
-
-	for _, key := range v6Keys {
-		if err := c.dp.DeleteSessionV6(key); err != nil {
-			agg.add("v6 forward delete", err)
-		} else {
-			v6Deleted++
-		}
-	}
-	for _, key := range v6RevKeys {
-		agg.addExceptNotFound("v6 reverse delete", c.dp.DeleteSessionV6(key))
-	}
-	for _, dk := range snatDNATKeysV6 {
-		agg.addExceptNotFound("v6 DNAT companion delete", c.dp.DeleteDNATEntryV6(dk))
-	}
+	// #4886 A: bound the working set. The pre-#4886 CLI snapshotted EVERY
+	// matching forward key + its reverse and DNAT companions (v4 then v6) into
+	// growing slices before deleting, so a broad filtered clear on a
+	// multi-million-entry table allocated O(matches) up front and could OOM the
+	// in-process daemon before making progress. clearFilteredV4Bounded /
+	// clearFilteredV6Bounded collect at most cliClearFilteredBatch keys, delete
+	// that chunk, and resume (cursor primary; bounded rescan fallback) — peak
+	// O(batch). The filter and the f.validate() above are unchanged, so the exact
+	// set is cleared and a typo'd predicate still never widens to clear-all (#3439).
+	v4Deleted := clearFilteredV4Bounded(c, &f, &agg)
+	v6Deleted := clearFilteredV6Bounded(c, &f, &agg)
 
 	fmt.Printf("%d IPv4 and %d IPv6 matching sessions cleared\n", v4Deleted, v6Deleted)
 	agg.add("peer clear", c.clearPeerSessions(&f))
 	agg.report()
 	return nil
+}
+
+// cliClearFilteredBatch bounds the forward-key working set per chunk for the
+// filtered CLI session clear (#4886). A test seam shrinks it to exercise the
+// multi-chunk path on a small table.
+var cliClearFilteredBatch = 1024
+
+// cliClearBatchObserver, when non-nil, is invoked once per collected chunk with
+// the forward-key count — a test-only seam proving the working set is bounded.
+// A revert to the pre-#4886 snapshot-all path reports a single len==matches
+// chunk, so the bounded-batch assertion REDs (#4886).
+var cliClearBatchObserver func(chunkLen int)
+
+// cliSessionCursor is the cursor-iteration capability (the CLI mirror of
+// grpcapi.sessionCursorIterator, #5454). The production dataplane satisfies it,
+// so the CLI runs the O(N)-CPU bounded cursor path; only a cursor-less test fake
+// falls back to the bounded fresh-rescan. Using the cursor (not a bare rescan)
+// keeps a broad clear on a huge table a single O(N) forward pass rather than
+// O(N^2), which would trade the memory DoS for a CPU-stall able to starve the HA
+// watchdog (#4719) — the same reason the #5454 gRPC path prefers the cursor.
+type cliSessionCursor interface {
+	IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+}
+
+// cliClearBatchV4 accumulates one bounded chunk of matching v4 forward keys plus
+// each session's reverse companion (keyed on the TRANSLATED tuple val.ReverseKey,
+// #2733) and DNAT companion (#2406), mirroring grpcapi.clearBatchV4 (#5454/#4886).
+type cliClearBatchV4 struct {
+	fwd  []dataplane.SessionKey
+	rev  []dataplane.SessionKey
+	dnat []dataplane.DNATKey
+}
+
+func (b *cliClearBatchV4) reset() { b.fwd = b.fwd[:0]; b.rev = b.rev[:0]; b.dnat = b.dnat[:0] }
+
+// collect appends a matched forward session's keys and returns true once the
+// forward chunk is full. Callers must skip reverse entries (val.IsReverse != 0)
+// and non-matching keys BEFORE collect, preserving the pre-#4886 CLI semantics.
+func (b *cliClearBatchV4) collect(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	b.fwd = append(b.fwd, key)
+	if val.ReverseKey.Protocol != 0 {
+		b.rev = append(b.rev, val.ReverseKey)
+	}
+	if val.Flags&dataplane.SessFlagSNAT != 0 && val.Flags&dataplane.SessFlagStaticNAT == 0 {
+		b.dnat = append(b.dnat, dataplane.DNATKeyForSessionV4(key, val))
+	}
+	return len(b.fwd) >= cliClearFilteredBatch
+}
+
+// deleteAll deletes this chunk's forward keys plus reverse/DNAT companions.
+// It returns deleted (forward keys this call actually removed, for the operator
+// "N cleared" tally) and removed (forward keys no longer in the map after this
+// call = deleted PLUS already-gone/not-found). removed drives the #5948
+// rescan no-progress guard: a fresh rescan only shrinks the match set for the
+// forward keys that are gone, so removed==0 on a non-empty chunk means the next
+// identical rescan would re-collect the same set. A not-found forward key IS
+// progress (it will not reappear), so it counts toward removed but not deleted.
+func (b *cliClearBatchV4) deleteAll(c *CLI, agg *sessionClearErrors) (deleted, removed int) {
+	for _, key := range b.fwd {
+		// addExceptNotFound (not add): the cursor path leaves the chunk anchor
+		// live and may re-collect it next round, so a benign already-gone
+		// forward key must not read as a failure — matching grpcapi #5454.
+		if err := c.dp.DeleteSession(key); err != nil {
+			agg.addExceptNotFound("v4 forward delete", err)
+			if dataplane.IsKeyNotFound(err) {
+				removed++ // already gone: not a delete, but still progress
+			}
+		} else {
+			deleted++
+			removed++
+		}
+	}
+	for _, key := range b.rev {
+		agg.addExceptNotFound("v4 reverse delete", c.dp.DeleteSession(key))
+	}
+	for _, dk := range b.dnat {
+		agg.addExceptNotFound("v4 DNAT companion delete", c.dp.DeleteDNATEntry(dk))
+	}
+	return deleted, removed
+}
+
+// clearFilteredV4Bounded deletes every matching v4 session (plus companions)
+// while holding at most O(cliClearFilteredBatch) keys. Cursor primary
+// (IterateSessionsFrom from a live anchor, one O(N) pass, deferred anchor
+// delete); bounded fresh-rescan fallback for a cursor-less dataplane (#4886).
+func clearFilteredV4Bounded(c *CLI, f *sessionFilter, agg *sessionClearErrors) int {
+	iterDP, ok := c.dp.(cliSessionCursor)
+	if !ok {
+		return clearFilteredV4Rescan(c, f, agg)
+	}
+	deleted := 0
+	var a, b cliClearBatchV4
+	cur, prev := &a, &b
+	prevValid := false
+	var cursor *dataplane.SessionKey
+	for {
+		cur.reset()
+		iterErr := iterDP.IterateSessionsFrom(cursor, func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse != 0 {
+				return true
+			}
+			if !f.matchesV4(key, val) {
+				return true
+			}
+			return !cur.collect(key, val)
+		})
+		agg.add("v4 iterate", iterErr)
+		if cliClearBatchObserver != nil {
+			cliClearBatchObserver(len(cur.fwd))
+		}
+		if prevValid {
+			// Cursor path terminates unconditionally (the cursor advances every
+			// round regardless of delete success), so the removed count is unused
+			// here — only the fresh-rescan fallback needs the no-progress guard.
+			d, _ := prev.deleteAll(c, agg)
+			deleted += d
+			prevValid = false
+		}
+		full := len(cur.fwd) >= cliClearFilteredBatch && iterErr == nil
+		if !full {
+			d, _ := cur.deleteAll(c, agg)
+			deleted += d
+			return deleted
+		}
+		anchor := cur.fwd[len(cur.fwd)-1]
+		cursor = &anchor
+		cur, prev = prev, cur
+		prevValid = true
+	}
+}
+
+// clearFilteredV4Rescan is the bounded fallback for a cursor-less dataplane
+// (test/edge): collect up to cliClearFilteredBatch keys via a fresh iterate,
+// delete them, rescan — a deleted (or already-gone) key does not reappear, so a
+// fresh scan returns the next chunk, converging while holding only O(chunk) keys
+// (#4886). Progress depends on deletes actually removing keys, so a #5948
+// no-progress guard breaks the loop if a non-empty chunk removed nothing (every
+// forward delete genuinely failed → the same set would be re-collected forever).
+// The production cursor path (clearFilteredV4Bounded) does not need this — its
+// cursor advances every round regardless of delete success.
+func clearFilteredV4Rescan(c *CLI, f *sessionFilter, agg *sessionClearErrors) int {
+	deleted := 0
+	var b cliClearBatchV4
+	for {
+		b.reset()
+		iterErr := c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse != 0 {
+				return true
+			}
+			if !f.matchesV4(key, val) {
+				return true
+			}
+			return !b.collect(key, val)
+		})
+		agg.add("v4 iterate", iterErr)
+		if cliClearBatchObserver != nil {
+			cliClearBatchObserver(len(b.fwd))
+		}
+		if len(b.fwd) == 0 {
+			return deleted
+		}
+		d, removed := b.deleteAll(c, agg)
+		deleted += d
+		// #5948 no-progress guard. Unlike the cursor path, this fallback re-scans
+		// from the top each round and relies on the just-processed keys being GONE
+		// so the next scan returns a smaller set. If removed==0 — every forward key
+		// in this non-empty chunk failed to delete with a GENUINE (non-not-found)
+		// error, so all remain in the map — the next identical rescan would
+		// re-collect the same set forever. Stop with the aggregated delete errors
+		// already recorded rather than loop. A not-found key counts as removed (it
+		// will not reappear), so a concurrently-drained chunk still makes progress.
+		if removed == 0 {
+			return deleted
+		}
+		if len(b.fwd) < cliClearFilteredBatch || iterErr != nil {
+			return deleted
+		}
+	}
+}
+
+// cliClearBatchV6 is the IPv6 analogue of cliClearBatchV4.
+type cliClearBatchV6 struct {
+	fwd  []dataplane.SessionKeyV6
+	rev  []dataplane.SessionKeyV6
+	dnat []dataplane.DNATKeyV6
+}
+
+func (b *cliClearBatchV6) reset() { b.fwd = b.fwd[:0]; b.rev = b.rev[:0]; b.dnat = b.dnat[:0] }
+
+func (b *cliClearBatchV6) collect(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	b.fwd = append(b.fwd, key)
+	if val.ReverseKey.Protocol != 0 {
+		b.rev = append(b.rev, val.ReverseKey)
+	}
+	if val.Flags&dataplane.SessFlagSNAT != 0 && val.Flags&dataplane.SessFlagStaticNAT == 0 {
+		b.dnat = append(b.dnat, dataplane.DNATKeyForSessionV6(key, val))
+	}
+	return len(b.fwd) >= cliClearFilteredBatch
+}
+
+// deleteAll is the IPv6 analogue of cliClearBatchV4.deleteAll, returning the
+// same (deleted, removed) pair for the #5948 rescan no-progress guard.
+func (b *cliClearBatchV6) deleteAll(c *CLI, agg *sessionClearErrors) (deleted, removed int) {
+	for _, key := range b.fwd {
+		if err := c.dp.DeleteSessionV6(key); err != nil {
+			agg.addExceptNotFound("v6 forward delete", err)
+			if dataplane.IsKeyNotFound(err) {
+				removed++ // already gone: not a delete, but still progress
+			}
+		} else {
+			deleted++
+			removed++
+		}
+	}
+	for _, key := range b.rev {
+		agg.addExceptNotFound("v6 reverse delete", c.dp.DeleteSessionV6(key))
+	}
+	for _, dk := range b.dnat {
+		agg.addExceptNotFound("v6 DNAT companion delete", c.dp.DeleteDNATEntryV6(dk))
+	}
+	return deleted, removed
+}
+
+func clearFilteredV6Bounded(c *CLI, f *sessionFilter, agg *sessionClearErrors) int {
+	iterDP, ok := c.dp.(cliSessionCursor)
+	if !ok {
+		return clearFilteredV6Rescan(c, f, agg)
+	}
+	deleted := 0
+	var a, b cliClearBatchV6
+	cur, prev := &a, &b
+	prevValid := false
+	var cursor *dataplane.SessionKeyV6
+	for {
+		cur.reset()
+		iterErr := iterDP.IterateSessionsV6From(cursor, func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse != 0 {
+				return true
+			}
+			if !f.matchesV6(key, val) {
+				return true
+			}
+			return !cur.collect(key, val)
+		})
+		agg.add("v6 iterate", iterErr)
+		if cliClearBatchObserver != nil {
+			cliClearBatchObserver(len(cur.fwd))
+		}
+		if prevValid {
+			// Cursor path terminates unconditionally; the removed count is unused
+			// here (only the fresh-rescan fallback needs the no-progress guard).
+			d, _ := prev.deleteAll(c, agg)
+			deleted += d
+			prevValid = false
+		}
+		full := len(cur.fwd) >= cliClearFilteredBatch && iterErr == nil
+		if !full {
+			d, _ := cur.deleteAll(c, agg)
+			deleted += d
+			return deleted
+		}
+		anchor := cur.fwd[len(cur.fwd)-1]
+		cursor = &anchor
+		cur, prev = prev, cur
+		prevValid = true
+	}
+}
+
+func clearFilteredV6Rescan(c *CLI, f *sessionFilter, agg *sessionClearErrors) int {
+	deleted := 0
+	var b cliClearBatchV6
+	for {
+		b.reset()
+		iterErr := c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse != 0 {
+				return true
+			}
+			if !f.matchesV6(key, val) {
+				return true
+			}
+			return !b.collect(key, val)
+		})
+		agg.add("v6 iterate", iterErr)
+		if cliClearBatchObserver != nil {
+			cliClearBatchObserver(len(b.fwd))
+		}
+		if len(b.fwd) == 0 {
+			return deleted
+		}
+		d, removed := b.deleteAll(c, agg)
+		deleted += d
+		// #5948 no-progress guard (see clearFilteredV4Rescan): a non-empty chunk
+		// that removed nothing (all forward deletes genuinely failed → keys remain)
+		// would be re-collected identically forever; stop with the errors recorded.
+		if removed == 0 {
+			return deleted
+		}
+		if len(b.fwd) < cliClearFilteredBatch || iterErr != nil {
+			return deleted
+		}
+	}
 }
 
 // sessionClearErrors accumulates per-operation failures during a CLI
@@ -414,6 +685,9 @@ func (c *CLI) handleClearFirewall(args []string) error {
 		cmdtree.PrintTreeHelp("clear firewall:", operationalTree, "clear", "firewall")
 		return nil
 	}
+	if err := requireClearNoScope("clear firewall all", "all firewall filter counters", args[1:]); err != nil {
+		return err
+	}
 	if c.dp == nil || !c.dp.IsLoaded() {
 		fmt.Println("Dataplane not loaded")
 		return nil
@@ -431,13 +705,36 @@ func (c *CLI) handleClearDHCP(args []string) error {
 		return nil
 	}
 
+	// A bare `clear dhcp client-identifier` (no selector) is the intentional
+	// clear-ALL. But a malformed selector must NOT silently degrade to it:
+	// `... interface` (no name), `... interfce ge-0/0/0` (unknown selector),
+	// or a stray trailing token used to skip the scoped branch and fall
+	// through to ClearAllDUIDs(), wiping EVERY DHCPv6 DUID instead of the one
+	// the operator scoped. Validate the selector BEFORE any mutation and
+	// reject a malformed one, mirroring the remote CLI's #4883-E guard
+	// (cmd/cli/clear.go handleClearDHCP) so both parsers reject the same
+	// input the same way (#5896). Validation runs before the c.dhcp==nil
+	// check so bad input always errors, regardless of DHCP client state.
+	var ifName string
+	if len(args) >= 2 {
+		if args[1] != "interface" {
+			return fmt.Errorf("usage: clear dhcp client-identifier [interface <name>]")
+		}
+		if len(args) < 3 || args[2] == "" {
+			return fmt.Errorf("clear dhcp client-identifier: 'interface' requires a name")
+		}
+		if len(args) > 3 {
+			return fmt.Errorf("clear dhcp client-identifier: unexpected argument %q after interface name", args[3])
+		}
+		ifName = args[2]
+	}
+
 	if c.dhcp == nil {
 		fmt.Println("No DHCP clients running")
 		return nil
 	}
 
-	if len(args) >= 3 && args[1] == "interface" {
-		ifName := args[2]
+	if ifName != "" {
 		if err := c.dhcp.ClearDUID(ifName); err != nil {
 			return fmt.Errorf("clear DUID: %w", err)
 		}

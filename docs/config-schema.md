@@ -300,14 +300,54 @@ The gate is surgical: a single canonical `unit 0` (the overwhelming common case)
 and distinct unit numbers (`unit 0` + `unit 1`) never trip it, and same-spelling
 flat-set lines merge into one AST node upstream (they are the same unit, not an
 alias) — so non-colliding compilation is bit-identical. A non-numeric unit token
-is skipped (the compiler `continue`s on the identical Atoi error, so it never
-reaches `ifc.Units`). Where a duplicate-spelling config ALSO produces a
+is now REJECTED at commit rather than silently skipped (see the #5829 gate
+below). Where a duplicate-spelling config ALSO produces a
 pre-expansion tunnel-endpoint-id collision (#1873), that earlier gate rejects
 first — either way the aliased config is refused, never silently committed.
 Covered by `pkg/config/interface_unit_alias_5631_test.go` (both config orders
 reject identically = order-independent, lenient-warn, non-colliding-commits) and
 the reconciled `tunnelid_test.go` duplicate-spelling case, each RED on revert of
 the gate wiring.
+
+### Non-numeric logical-unit identity fail-closed (#5829)
+
+`interfaces <if> unit <identity>` had NO positional key validation: the `unit`
+schema node deliberately left its instance key untyped (deferred with the
+`vrrp-group <id>` class), and `compileInterfaces` parsed it with `strconv.Atoi`
+and a bare `continue` on error. So a non-numeric identity such as `unit tenant`
+passed schema + commit, and the compiler then **silently discarded the whole
+unit** — its addresses, firewall filters, sampling, DHCP/DDNS and tunnel state
+vanished with no diagnostic. The security bite: a unit-level input/output
+firewall FILTER committed with **no enforcement** (fail-open), the same class as
+the undefined-filter-reference gate.
+
+The fix is fail-CLOSED at two layers, both keyed to one canonical validator
+`ValidateLogicalUnit` (`schema_validators.go`, range `0..MaxLogicalUnit` = 16385
+— non-numeric, negative, integer overflow, and out-of-range all fail):
+
+- **Schema (strict commit/check):** the `unit` node carries
+  `keyValidator: ValidateLogicalUnit`, so `commit`/`commit check`
+  (`SchemaValidate`) reject a malformed identity naming the interface and the
+  raw token, for both the flat-set and hierarchical AST shapes (the shared
+  `validateKeySlot` path, same mechanism as the typed `address <cidr>` key).
+- **Compiler (defense-in-depth, all paths):** `compiler_interfaces.go` returns a
+  hard error instead of the bare `continue`. On the tolerant load / peer-sync
+  paths the `lenientNonNumericUnit` opt (set by `CompileConfigLenient` /
+  `CompileConfigForNodeLenient`) downgrades that to a `cfg.Warnings` entry and
+  **quarantines** the unit — dropped, its children never reattached to another
+  unit — so a config an older binary silently truncated still boots, now with a
+  deterministic warning instead of a silent drop.
+
+Valid numeric units (including the `0` and `16385` boundaries) compile
+bit-identically and reach the typed `ifc.Units` map. RESIDUAL: this pass types
+the `interfaces <if> unit <n>` slot; the cross-subsystem unit-reference grammar
+(class-of-service / security-zone / routing-instance interface references that
+carry a `.unit` suffix) still parses the suffix without this validator and is a
+follow-up (issue #5829 "every unit-reference slot"). Covered by
+`pkg/config/interface_unit_nonnumeric_5829_test.go` (strict reject via both
+gates naming the interface + token, valid-unit-reaches-map, lenient
+warn-and-quarantine), RED on revert of either the `keyValidator` or the compiler
+gate.
 
 ### security address-book same-name `address` + `address-set` collision (#5676)
 
@@ -633,6 +673,29 @@ append-on-reinsert) was removed. Covered by `TestRenameNonFirstSibling` in
 `[A B C]` order preserved and `then permit` sub-config intact, first-sibling
 `A->A2` still works, colliding `B->C` rejected with the tree unchanged, and a
 post-rename `CompileConfig` seeing `[A B2 C]`).
+
+**Copy-side contract: same resolver, same collision rule (#5822).** `copy <src>
+to <dst>` (`CopyPath`, `ast_edit.go`) is the copy-side sibling of the rename fix.
+The pre-#5822 implementation resolved the DESTINATION PARENT through `insertNode`,
+whose per-level loop broke on the FIRST child whose FIRST key matched (the same
+`matchNodeKeys`-returns-`1` keyword-only match) — so a copy whose destination
+parent was a non-first same-keyword sibling (`copy ... to policy Z` with siblings
+`[A B Z]`) descended into `policy A`, could not find the rest of the
+destination-parent path, and failed `destination parent ... not found` (the issue
+title), or — on a resolvable-but-existing target — silently appended a DUPLICATE.
+`CopyPath` now resolves BOTH the source (`findNodeWithParent`) and the destination
+parent (`childrenAtPath`) by full identity — the SAME longest-key-match navigator
+`RenamePath` uses — so the two edit paths no longer carry divergent navigation
+semantics (that divergence WAS the bug). It rejects a copy whose new identity
+already exists under the destination parent (never a silent merge/duplicate), and
+resolves + validates fully BEFORE cloning/appending so a failed copy (missing
+destination parent OR collision) leaves the tree byte-for-byte unchanged; a
+missing destination parent wraps `config.ErrPathNotFound`. The now-dead
+first-keyword-match `insertNode` helper was removed. Covered by
+`copypath_sibling_5822_test.go` (`pkg/config`) — first/middle/last + nested
+multi-key sibling parents, collision-rejected-unchanged, missing-parent sentinel
+— and `copy_sibling_5822_test.go` (`pkg/configstore`, the operational
+`Store.Copy` path).
 
 **`annotate <path> "comment"` resolves through `navigatePath` (#4587).**
 `annotate` attaches a `/* comment */` to the statement at a path, and — like
@@ -1696,6 +1759,61 @@ is exactly the repetition). The ordered list lands in `PolicyTerm.ASPathPrepend
 `TestGeneratePolicyOptions_ASPathPrepend` in
 `pkg/frr/policy_as_path_prepend_2892_test.go` (render).
 
+### Repeated policy-statement blocks MERGE, not last-win (#5824)
+
+A single `policy-options policy-statement <name>` may be authored across MULTIPLE
+separate hierarchical blocks (two `policy-statement P { ... }` braces), repeated
+`policy-options` roots, or group-expanded fragments — each is a distinct AST
+instance. `compilePolicyOptions` (`compiler_routing.go`) used to build a FRESH
+`PolicyStatement` per instance and do an unconditional
+`po.PolicyStatements[name] = ps`, so a second same-name block silently REPLACED
+the first — its terms, route-filters, actions, and default action vanished. Flat
+`set policy-options policy-statement P term ...` lines COMPOSE under one node via
+`SetPath`, so the hierarchical and flat spellings of the same policy diverged.
+Routing policy is ORDERED security/route-control state: a lost reject term
+over-exports/over-imports and a lost accept term withdraws reachability, while
+FRR receives a valid-but-incomplete route-map and commit + daemon apply both
+look successful.
+
+The policy-statement loop now mirrors the sibling `prefix-list` (#2641) and
+`community` (#2587) merge loops above: it REUSES the existing map entry AND a
+per-policy term index that persists ACROSS instances, so later blocks MERGE into
+the earlier one — new terms append in first-authored ORDER, and a repeated
+fragment of the SAME term composes onto the existing `PolicyTerm` (from-match /
+route-filters / then-action all accumulate via `parsePolicyTermChildren`). The
+policy-level default `then` composes as flat-set does (last-non-empty wins), so
+the two spellings compile to an identical `PolicyStatement`. Fail-on-revert
+covered by `pkg/config/compiler_policy_block_merge_5824_test.go` (two-block
+merge, hierarchical==flat parity, same-term-across-blocks compose, single-block
+unchanged) and the end-to-end render guard
+`pkg/frr/policy_block_merge_5824_test.go` (the early reject term's `deny`
+sequence + route-filter survive into the FRR route-map).
+
+### Repeated scheduler blocks MERGE, not last-win (#5825)
+
+The SAME block-merge rule applies to `schedulers scheduler <name>`. A scheduler
+may be authored across multiple hierarchical blocks (two `scheduler S { ... }`
+braces) or repeated top-level `schedulers { ... }` roots, each a distinct AST
+instance. `compileSchedulers` (`compiler_system.go`) used to allocate a FRESH
+`SchedulerConfig` per instance and do an unconditional `cfg.Schedulers[name] =
+sched`, so a later same-name block REPLACED the first — every day/window authored
+earlier vanished. Flat `set schedulers scheduler S <day> ...` lines compose under
+one path, so the hierarchical and flat spellings diverged, and a security policy
+time-gated by the scheduler became active/inactive on the WRONG days with a clean
+commit.
+
+The loop now REUSES the existing map entry, so distinct weekday windows UNION
+across blocks/roots (the `Days` map lives on the reused struct — no separate index
+is needed, unlike the policy-statement term index, because per-day dedup is the
+map key). The daily/date scalars (`start-time`/`stop-time`/`start-date`/
+`stop-date`, the `daily` window, `all-day`) follow flat-set / Junos load-merge
+LAST-WINS: a repeated leaf replaces, exactly as a second `set` of the same leaf
+does, so no order-dependent divergence from flat is introduced (a "conflict" is
+not representable in flat-set — the last `set` simply wins). Fail-on-revert
+covered by `pkg/config/compiler_scheduler_block_merge_5825_test.go` (two-block day
+merge, hierarchical==flat parity, across-roots merge, daily+weekday compose,
+single-block unchanged).
+
 ### Quoted-value escape round-trip contract (#3854)
 
 When a key or value contains a character that is not a bare Junos identifier
@@ -1720,6 +1838,49 @@ for characters the lexer does not interpret (e.g. `\t`) — that would over-esca
 and break the symmetry in the other direction. Pinned by
 `pkg/config/quotekey_roundtrip_3854_test.go` (`TestQuoteKeyLexerSymmetry3854`,
 `TestFormatParseRoundTrip3854`, `TestFormatParseIdempotent3854`).
+
+### `firewall ... from flexible-match-range` — at most ONE range per term (#5823)
+
+A firewall-filter term may name **at most one** `flexible-match-range range`.
+The userspace matcher (`flex_matches`, `userspace-dp/src/filter/engine/
+matching.rs`) evaluates a single byte-offset window per term; multi-range is a
+Junos-parity gap deliberately left unimplemented (defining the wire encoding +
+hot-path cost is a separate item).
+
+The pre-#5823 compiler (`compileFilterFrom`, `pkg/config/compiler_firewall.go`)
+iterated every named range but `break`ed after the first — silently keeping
+range #1 and dropping the rest. That is a **security fail-open**: an `accept`
+term stopped requiring the dropped ranges' condition (over-permit), and a
+`discard`/`reject` term stopped dropping the traffic they scoped (over-drop),
+with a clean commit.
+
+`compileFilterFrom` now aggregates EVERY named range across ALL repeated
+`flexible-match-range` blocks, both AST shapes (hierarchical + flat-set),
+duplicate names, and `from` group-expanded copies into
+`FirewallFilterTerm.FlexMatchRangeNames` (it still compiles only the first into
+`FlexMatch`, so a single-range term is byte-identical). This follows the
+#3203/#3205/#5832/#5833 strict/lenient discipline:
+
+- **Strict commit / commit-check** (`CompileConfig`): `validateFilterFlexMatchStrict`
+  (`compiler_validate_strict_filter.go`) hard-REJECTS `len(FlexMatchRangeNames) > 1`
+  BEFORE the dataplane apply, naming the family/filter/term and every range.
+- **Lenient load / peer-sync** (`CompileConfigLenient`, #1960 no-brick): the
+  strict error is downgraded to an operator-visible `cfg.Warnings` entry, and the
+  userspace snapshot builder (`buildFilterTermSnapshots`, `pkg/dataplane/
+  userspace/filters.go`) POISONS the term to match NOTHING — it emits a
+  `FlexMatchSnapshot` with the sentinel match-start `unrepresentable-multi-range`
+  (any non-`layer-3`/`layer-4` start lowers to `FlexMatchStart::Unsupported`,
+  whose `flex_matches()` returns `false`), plus a `slog.Warn`. This reuses the
+  existing per-term fail-closed channel — **no** multi-range support is added to
+  the wire/matcher. Silently enforcing only the first range (the pre-fix
+  behavior) would be fail-open.
+
+Pinned by `pkg/config/compiler_flexmatch_cardinality_5823_test.go` (strict
+reject for accept + discard terms; flat-set + group-expansion aggregation;
+lenient mark + warning; single-range unchanged) and
+`pkg/dataplane/userspace/filters_flex_multirange_5823_test.go` (wire poison +
+single-range byte-identical). Removing the aggregation, the strict gate, or the
+wire poison arm turns the matching test RED.
 
 ## Firewall-filter cross-family name collision fail-closed gate (#3884)
 

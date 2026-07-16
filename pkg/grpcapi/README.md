@@ -22,10 +22,25 @@ tab completion. The wire schema is `proto/xpf/v1`.
 ## Trust boundary (loopback-only, #5035)
 
 The primary listener started by `Run` installs **no** authentication or
-TLS — only `configLockInterceptor` — so every RPC (including destructive
-`SystemAction` zeroize/reboot/halt/power-off and Commit/Delete/Rollback)
-is inherently trusted. That trust holds only if the listener is
-loopback-bound. `Run` therefore clamps a non-loopback `--grpc-addr`
+TLS — only the connection-scoped config-lock lifecycle owner
+(`configLockStatsHandler`, a gRPC `stats.Handler`; #5849) — so every RPC
+(including destructive `SystemAction` zeroize/reboot/halt/power-off and
+Commit/Delete/Rollback) is inherently trusted. That trust holds only if
+the listener is loopback-bound.
+
+**Config-session identity (#5849).** The config lock / candidate DB is a
+per-CLIENT-CONNECTION resource. Each config RPC keys its session by
+`connSessionID(ctx)` — an **unguessable, connection-scoped id** allocated
+in `configLockStatsHandler.TagConn` (crypto/rand), NOT the reusable peer
+address. The lock is auto-released **exactly once** on `ConnEnd` (a
+per-connection `sync.Once`, plus the store's holder check), never on a
+per-RPC cancellation: a client cancelling one unrelated read, or a request
+deadline expiring, no longer discards the connection's staged candidate or
+steals its lock. Explicit `ExitConfigure` (immediate) and the store's
+bounded idle-lease reclaim (`reclaimStaleLockLocked`, #4476) remain as
+backstops for a connection whose `ConnEnd` notification is lost. The same
+`stats.Handler` is installed on the fabric listener for a uniform lifecycle
+(a no-op there — the fabric allowlist never admits config RPCs). `Run` therefore clamps a non-loopback `--grpc-addr`
 (`0.0.0.0`, a routable address, or the `:port` wildcard) back to a
 same-family loopback (`clampGRPCBindToLoopback`) and warns, mirroring the
 web-management (#4903) and cluster-bind (#4928) doctrine. There is no
@@ -92,6 +107,21 @@ contract.
 - `CommitFn` (passed in by the daemon) holds the apply semaphore across
   `Commit()` and the dataplane apply. This is the same primitive `pkg/cli`
   uses; concurrent operator commits serialize via that semaphore (#846).
+- **Commit error-code contract (#5742).** `Commit` / `CommitConfirmed`
+  classify the callback error structurally via `commitApplyStatus`, keying
+  off whether the daemon returned the committed config alongside it:
+  a **non-fatal tail-reconcile / ordinary dataplane-apply** error (networkd
+  write, Kea restart, IPsec reload, interface reconcile, non-abort apply —
+  the daemon commits+arms the config and returns it *with* the error) →
+  `codes.Unavailable` (transient, **retryable**; the config was accepted and
+  self-heals on the next commit/feed retry, #5646). A true **config-validation
+  / compile-reject** (compiler/schema reject, `compileErrorMustAbortApply`
+  fail-closed gate, device-map preflight, bootstrap refusal, pre-promotion
+  persistence — no config committed, `nil` returned) → `codes.InvalidArgument`
+  (fix the config). `context.Canceled` / `DeadlineExceeded` are preserved and
+  take precedence. The human-readable message is unchanged; only the code
+  distinguishes "retry" from "fix your config". Unclassifiable errors fail
+  safe to `InvalidArgument`.
 - **Zeroize goes through the apply gate AND stops xpfd (#5281).** The
   `SystemAction{zeroize}` handler does NOT call `performZeroizeWipe`
   directly. It routes through `ZeroizeFn` (wired by the daemon to
@@ -110,6 +140,21 @@ contract.
   action-journal write still happens BEFORE the wipe. `ZeroizeFn` is nil
   only in a NoDataplane / no-daemon build, where the handler falls back to
   an ungated direct wipe (there is no running reconcile loop to race).
+- **The interactive console shares ONE wipe primitive (#5890).** The
+  in-process console `request system zeroize` (`pkg/cli`) previously ran
+  its OWN partial wipe (`zeroizeConfigState`: config DB + archive only),
+  which LEFT `tls/`, the rendered service configs (frr/swanctl/kea), and
+  the provisioned login accounts (shadow/authorized_keys/`sudoers.d/xpf-*`)
+  on disk — secret residue on a re-tenanted device. The console now
+  DELEGATES to the exported `PerformZeroizeWipe(configDir, configBase)` —
+  the SAME primitive `runZeroize` runs — so both paths erase an IDENTICAL
+  single-source-of-truth OWNED-artifact set and cannot diverge again. The
+  console keeps its own root resolution (`cli.zeroizeConfigRoot`, #5554/
+  #5684) and daemon stop; it does NOT take the gRPC apply-gate (it runs
+  in-process and stops xpfd itself). The rendered/BPF/networkd leg targets
+  in `performZeroizeWipe` are package vars so the full primitive is
+  hermetically testable end-to-end (no real `/etc`) — production paths
+  unchanged.
 - **Zeroize erases the CONFIGURED config root, not a hardcoded `/etc/xpf`
   (#5280).** `runZeroize` resolves the config root from
   `configstore.Store.ConfigPath()` — the daemon's `-config` path, the SAME

@@ -25,6 +25,49 @@ func configMutationStatus(err error) error {
 	return status.Errorf(codes.InvalidArgument, "%v", err)
 }
 
+// commitApplyStatus maps a non-nil commit-callback error (commitFn /
+// commitConfirmedFn) to the right gRPC status code (#5742). The daemon commit
+// path (commitAndApply / commitConfirmedAndApply → applyAndSyncCommitted)
+// already encodes the error CLASS in whether it returns the committed config
+// alongside the error, so no error-text matching or new cross-package sentinel
+// is needed — classify structurally on (compiled, err):
+//
+//   - context.Canceled / context.DeadlineExceeded (checked FIRST so a wrapped
+//     context error can never be mis-mapped even if a caller also returns a
+//     non-nil config): the commit was aborted by a daemon stop or a busy
+//     apply-lock. Preserved as Canceled / DeadlineExceeded, unchanged.
+//   - A NON-FATAL tail-reconcile / ordinary dataplane-apply error — networkd
+//     write (#1778), Kea restart (#2987), IPsec reload (#4433), interface
+//     reconcile (#5310), non-abort apply (#5679), #5578 deletion-clear:
+//     applyAndSyncCommitted returns the committed config ALONGSIDE the error
+//     (compiled != nil). The config is VALID and committed+active; only a
+//     transient control-socket / subsystem step failed and self-heals on retry
+//     (#5646). Map to codes.Unavailable (transient, retryable) so an operator /
+//     automation client retries rather than editing a config that was never
+//     rejected — the whole point of #5742.
+//   - Everything else (compiled == nil): a real config-validation / compile
+//     reject (the #5679 abort gate compileErrorMustAbortApply), a device-map
+//     commit preflight reject, a bootstrap-mode refusal, or a pre-promotion
+//     store persistence error — the config was NOT committed. Keep the
+//     historical codes.InvalidArgument. This is the FAIL-SAFE default: an error
+//     that cannot be positively identified as a tail-reconcile stays
+//     InvalidArgument, so a client is never told to retry genuinely-bad config.
+//
+// Only the machine-readable code moves; the human-readable "%v" error text is
+// byte-identical to the pre-#5742 mapping. Callers MUST pass a non-nil err.
+func commitApplyStatus(compiled *config.Config, err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return status.Errorf(codes.Canceled, "commit busy: %v", err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.Errorf(codes.DeadlineExceeded, "commit busy: %v", err)
+	case compiled != nil:
+		return status.Errorf(codes.Unavailable, "%v", err)
+	default:
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+}
+
 // --- Config lifecycle RPCs ---
 
 func (s *Server) EnterConfigure(ctx context.Context, req *pb.EnterConfigureRequest) (*pb.EnterConfigureResponse, error) {
@@ -33,7 +76,7 @@ func (s *Server) EnterConfigure(ctx context.Context, req *pb.EnterConfigureReque
 	if s.cluster != nil && !s.cluster.IsLocalPrimary(0) {
 		return nil, status.Errorf(codes.FailedPrecondition, "node is not primary for RG0, configure on the primary node")
 	}
-	sessionID := peerSessionID(ctx)
+	sessionID := connSessionID(ctx)
 	var err error
 	if req.Exclusive {
 		err = s.store.EnterConfigureExclusive(sessionID)
@@ -47,7 +90,7 @@ func (s *Server) EnterConfigure(ctx context.Context, req *pb.EnterConfigureReque
 }
 
 func (s *Server) ExitConfigure(ctx context.Context, _ *pb.ExitConfigureRequest) (*pb.ExitConfigureResponse, error) {
-	sessionID := peerSessionID(ctx)
+	sessionID := connSessionID(ctx)
 	s.store.ExitConfigureSession(sessionID)
 	return &pb.ExitConfigureResponse{}, nil
 }
@@ -61,10 +104,11 @@ func (s *Server) GetConfigModeStatus(_ context.Context, _ *pb.GetConfigModeStatu
 }
 
 func (s *Server) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
-	// #5059: enforce config-lock ownership. peerSessionID identifies this
-	// connection; the store rejects a mutation whose caller is not the lock
-	// holder. An empty session (unit tests / internal) bypasses.
-	sessionID := peerSessionID(ctx)
+	// #5059: enforce config-lock ownership. connSessionID identifies this
+	// connection (the #5849 connection-scoped id); the store rejects a mutation
+	// whose caller is not the lock holder. An empty session (unit tests /
+	// internal) bypasses.
+	sessionID := connSessionID(ctx)
 	input := req.Input
 	if strings.HasPrefix(input, "copy ") || strings.HasPrefix(input, "rename ") {
 		return s.handleCopyRename(sessionID, input)
@@ -167,14 +211,14 @@ func (s *Server) handleInsert(sessionID, input string) (*pb.SetResponse, error) 
 }
 
 func (s *Server) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
-	if err := s.store.DeleteFromInputAs(peerSessionID(ctx), req.Input); err != nil {
+	if err := s.store.DeleteFromInputAs(connSessionID(ctx), req.Input); err != nil {
 		return nil, configMutationStatus(err)
 	}
 	return &pb.DeleteResponse{}, nil
 }
 
 func (s *Server) Load(ctx context.Context, req *pb.LoadRequest) (*pb.LoadResponse, error) {
-	sessionID := peerSessionID(ctx)
+	sessionID := connSessionID(ctx)
 	switch req.Mode {
 	case "override":
 		if err := s.store.LoadOverrideAs(sessionID, req.Content); err != nil {
@@ -205,7 +249,7 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 	// #5059: only the config-lock holder may commit the shared candidate. Reject
 	// a commit from a non-holder session before it can confirm/apply another
 	// session's pending work. Empty session (unit tests / internal) bypasses.
-	sessionID := peerSessionID(ctx)
+	sessionID := connSessionID(ctx)
 	if err := s.store.EnsureConfigHolder(sessionID); err != nil {
 		return nil, configMutationStatus(err)
 	}
@@ -230,14 +274,10 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 	}
 	compiled, err := s.commitFn(ctx, req.Comment)
 	if err != nil {
-		switch {
-		case errors.Is(err, context.Canceled):
-			return nil, status.Errorf(codes.Canceled, "commit busy: %v", err)
-		case errors.Is(err, context.DeadlineExceeded):
-			return nil, status.Errorf(codes.DeadlineExceeded, "commit busy: %v", err)
-		default:
-			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
-		}
+		// #5742: classify structurally — a non-fatal tail-reconcile / ordinary
+		// apply error (the daemon returns the committed config alongside it) is
+		// transient/retryable (Unavailable), NOT a config reject (InvalidArgument).
+		return nil, commitApplyStatus(compiled, err)
 	}
 	return &pb.CommitResponse{Summary: summary, Warnings: configWarnings(compiled)}, nil
 }
@@ -252,7 +292,7 @@ func (s *Server) CommitCheck(_ context.Context, _ *pb.CommitCheckRequest) (*pb.C
 
 func (s *Server) CommitConfirmed(ctx context.Context, req *pb.CommitConfirmedRequest) (*pb.CommitConfirmedResponse, error) {
 	// #5059: only the config-lock holder may commit the shared candidate.
-	if err := s.store.EnsureConfigHolder(peerSessionID(ctx)); err != nil {
+	if err := s.store.EnsureConfigHolder(connSessionID(ctx)); err != nil {
 		return nil, configMutationStatus(err)
 	}
 	if s.commitConfirmedFn == nil {
@@ -260,14 +300,10 @@ func (s *Server) CommitConfirmed(ctx context.Context, req *pb.CommitConfirmedReq
 	}
 	compiled, err := s.commitConfirmedFn(ctx, int(req.Minutes))
 	if err != nil {
-		switch {
-		case errors.Is(err, context.Canceled):
-			return nil, status.Errorf(codes.Canceled, "commit busy: %v", err)
-		case errors.Is(err, context.DeadlineExceeded):
-			return nil, status.Errorf(codes.DeadlineExceeded, "commit busy: %v", err)
-		default:
-			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
-		}
+		// #5742: same structural classification as Commit — commitConfirmedAndApply
+		// shares applyAndSyncCommitted, so a non-fatal tail error carries the
+		// committed config (Unavailable/retryable) vs a nil-config config reject.
+		return nil, commitApplyStatus(compiled, err)
 	}
 	return &pb.CommitConfirmedResponse{Warnings: configWarnings(compiled)}, nil
 }
@@ -275,7 +311,7 @@ func (s *Server) CommitConfirmed(ctx context.Context, req *pb.CommitConfirmedReq
 func (s *Server) ConfirmCommit(ctx context.Context, _ *pb.ConfirmCommitRequest) (*pb.ConfirmCommitResponse, error) {
 	// #5059: only the config-lock holder may confirm (and cancel the auto-
 	// rollback of) the pending commit-confirmed.
-	if err := s.store.ConfirmCommitAs(peerSessionID(ctx)); err != nil {
+	if err := s.store.ConfirmCommitAs(connSessionID(ctx)); err != nil {
 		if errors.Is(err, configstore.ErrConfigLockedByOther) {
 			return nil, status.Errorf(codes.PermissionDenied, "%v", err)
 		}
@@ -295,7 +331,7 @@ func (s *Server) Rollback(ctx context.Context, req *pb.RollbackRequest) (*pb.Rol
 		return nil, status.Errorf(codes.InvalidArgument,
 			"invalid n %d: rollback index must be non-negative (0 = revert to active)", req.N)
 	}
-	if err := s.store.RollbackAs(peerSessionID(ctx), int(req.N)); err != nil {
+	if err := s.store.RollbackAs(connSessionID(ctx), int(req.N)); err != nil {
 		return nil, configMutationStatus(err)
 	}
 	return &pb.RollbackResponse{}, nil
