@@ -10,8 +10,17 @@ pub(super) fn update(
     neighbors: Option<&Vec<NeighborSnapshot>>,
     replace: bool,
 ) {
-    let Some(neighbors) = neighbors else {
-        return;
+    // #5864: an authoritative replace with zero entries must CLEAR the
+    // manager-neighbor table. When the Go publishable set transitions to
+    // empty, the field can arrive as absent/None (older wire) or as an
+    // explicit `[]` (post-#5864 wire, omitempty removed). Both mean the
+    // same thing under NeighborReplace: clear. Only bail early on a
+    // NON-replace update with no neighbors — that carries nothing to add
+    // and must not touch the existing table.
+    let neighbors: &[NeighborSnapshot] = match neighbors {
+        Some(neighbors) => neighbors.as_slice(),
+        None if replace => &[],
+        None => return,
     };
     let mut resolved = Vec::with_capacity(neighbors.len());
     for neigh in neighbors {

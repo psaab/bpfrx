@@ -50501,3 +50501,20 @@ top.
   + pkg/config/compiler_nat_target_parity_hb167_test.go + pkg/config/
   compiler_nat_host_mask_test.go (updated to new fail-closed behavior),
   docs/config-schema.md (#5859 note)
+
+- **Timestamp**: 2026-07-16
+  **Action**: #5864 fix — authoritative empty NeighborReplace now clears the
+  helper manager-neighbor table (was omitted on the wire → stale L2 forwarding).
+  Go: dropped `omitempty` from `ControlRequest.Neighbors` so a present-empty
+  publishable set encodes as `"neighbors":[]` (distinct from absent). Rust:
+  `handlers::neighbors::update` no longer early-returns on `None`/empty when
+  `neighbor_replace=true` — it treats absent/`null`/`[]` under replace as a
+  CLEAR (routes an empty slice into `apply_manager_neighbors(true, &[])`); a
+  non-replace update with no neighbors stays a no-op. Transport confirmed local
+  Go-daemon → local userspace-dp control socket (no cross-node flag-day).
+  Bounded clear-on-empty fix; generation-envelope/ACK/retry deferred (follow-up).
+  **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/neighbor_replace_empty_5864_test.go (new),
+  userspace-dp/src/server/handlers/neighbors.rs,
+  userspace-dp/src/server/tests.rs (3 new #5864 tests),
+  userspace-dp/src/afxdp/forwarding/README.md (#5864 note)

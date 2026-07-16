@@ -202,6 +202,22 @@ next-hops, preference 0). The wire specimen lives in
       snapshot-refresh manager-key set, the `update_neighbors` handler,
       and `parse_neighbor_entries` share the same gate so an installed
       neighbor is never pruned as a stale key.
+    - **Authoritative empty replace clears (#5864).** An
+      `update_neighbors` request with `neighbor_replace=true` is an
+      AUTHORITATIVE replacement of the manager-neighbor table, so a
+      request with ZERO entries CLEARS it — the last usable neighbor
+      disappearing (kernel neighbor deletion) must drop the helper's
+      stale entry, not leave it forwarding to a dead MAC. The handler
+      therefore treats an absent/`null`/`[]` neighbors field under
+      `replace` as "clear", NOT as "no-op": it does not early-return on
+      `None` when `replace` is set. Go stopped sending the field with
+      `omitempty` so a present-empty set encodes as `"neighbors":[]`
+      (distinct from absent) rather than being dropped; the helper
+      accepts both the absent and explicit-empty forms as a clear. A
+      NON-replace update with no neighbors stays a no-op (nothing to
+      add). NOTE: this is the bounded clear-on-empty fix; it does NOT add
+      a replace-generation envelope / ACK / retry-debt (deferred
+      robustness, tracked separately).
     - **Fabric-link skips (#3773 M13).** `build_fabric_link_or_skip` is the
       SHARED classifier for both fabric-resolution passes
       (`populate_fabrics` snapshot build, `resolve_fabric_links_from_snapshots`

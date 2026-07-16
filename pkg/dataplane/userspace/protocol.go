@@ -27,21 +27,34 @@ const (
 )
 
 type ControlRequest struct {
-	Type               string                    `json:"type"`
-	SuppressStatus     bool                      `json:"suppress_status,omitempty"`
-	Snapshot           *ConfigSnapshot           `json:"snapshot,omitempty"`
-	Forwarding         *ForwardingControlRequest `json:"forwarding,omitempty"`
-	HAState            *HAStateUpdateRequest     `json:"ha_state,omitempty"`
-	Queue              *QueueControlRequest      `json:"queue,omitempty"`
-	Binding            *BindingControlRequest    `json:"binding,omitempty"`
-	Packet             *InjectPacketRequest      `json:"packet,omitempty"`
-	SessionSync        *SessionSyncRequest       `json:"session_sync,omitempty"`
-	SessionDeltas      *SessionDeltaDrainRequest `json:"session_deltas,omitempty"`
-	SessionExport      *SessionExportRequest     `json:"session_export,omitempty"`
-	Neighbors          []NeighborSnapshot        `json:"neighbors,omitempty"`
-	NeighborGeneration uint64                    `json:"neighbor_generation,omitempty"`
-	NeighborReplace    bool                      `json:"neighbor_replace,omitempty"`
-	Fabrics            []FabricSnapshot          `json:"fabrics,omitempty"`
+	Type           string                    `json:"type"`
+	SuppressStatus bool                      `json:"suppress_status,omitempty"`
+	Snapshot       *ConfigSnapshot           `json:"snapshot,omitempty"`
+	Forwarding     *ForwardingControlRequest `json:"forwarding,omitempty"`
+	HAState        *HAStateUpdateRequest     `json:"ha_state,omitempty"`
+	Queue          *QueueControlRequest      `json:"queue,omitempty"`
+	Binding        *BindingControlRequest    `json:"binding,omitempty"`
+	Packet         *InjectPacketRequest      `json:"packet,omitempty"`
+	SessionSync    *SessionSyncRequest       `json:"session_sync,omitempty"`
+	SessionDeltas  *SessionDeltaDrainRequest `json:"session_deltas,omitempty"`
+	SessionExport  *SessionExportRequest     `json:"session_export,omitempty"`
+	// Neighbors carries the manager-neighbor set for an update_neighbors
+	// request. It deliberately does NOT use omitempty (#5864): when the
+	// authoritative publishable set transitions to EMPTY, the send path
+	// still passes a present-but-empty slice with NeighborReplace=true to
+	// CLEAR the helper table. omitempty drops both nil and empty slices,
+	// which erased that clear on the wire (the helper decoded neighbors as
+	// absent and returned before applying the replacement, leaving stale
+	// dynamic neighbors installed → blackhole after kernel neighbor
+	// deletion). Without omitempty a present-empty replace encodes as
+	// "neighbors":[] — distinct from an absent field — so the helper
+	// applies the clear. A nil slice on non-neighbor requests encodes as
+	// "neighbors":null, which the Rust Option<Vec<..>> decodes back to
+	// None (harmless; those requests ignore the field).
+	Neighbors          []NeighborSnapshot `json:"neighbors"`
+	NeighborGeneration uint64             `json:"neighbor_generation,omitempty"`
+	NeighborReplace    bool               `json:"neighbor_replace,omitempty"`
+	Fabrics            []FabricSnapshot   `json:"fabrics,omitempty"`
 }
 
 type ControlResponse struct {
