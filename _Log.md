@@ -48948,3 +48948,28 @@ top.
     both Commit and CommitConfirmed; schema/context rows stay green).
   - **File(s)**: pkg/grpcapi/server_config.go,
     pkg/grpcapi/server_config_commit_errclass_5742_test.go, pkg/grpcapi/README.md
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5233 close the CURSOR-path residual of the session-walk
+    context-cancel fix. The non-cursor session handlers (sessionsOffset /
+    sessionSummaryHandler / sessionZonePairHandler) were already guarded by the
+    merged newRequestCancelSampler; the issue's own closeout comment (codex-183)
+    named the residual: sessionsCursor (pkg/api/sessions.go) — the page_size>0
+    cursor path over IterateSessionsFrom/IterateSessionsV6From — checked only
+    len(all) >= pageSize, never r.Context(). A selective/no-match cursor query
+    never fills the page, so the callback walked the rest of a multi-million-entry
+    conntrack table holding per-bucket BPF-map locks for a page nobody will read,
+    and it transitioned into the v6 full walk unconditionally after v4. Wired the
+    SAME sampler into both cursor callbacks (return false on cancel) and added a
+    direct r.Context().Err() check before the v6 phase and before the terminal
+    envelope, so a disconnect neither launches the second walk nor emits a
+    misleading next_page_token/partial page (nor the include_peer fan-out inside
+    writeSessionList). Full-page writes stay unguarded (valid complete results);
+    non-cancelled page-token/error semantics unchanged. New cursor-capable
+    counting fake (cursorCountDP) + fail-on-revert tests extend
+    api_ctx_cancel_5232_5233_test.go. Fail-on-revert proven via -overlay (strip
+    the cursor checks -> cancelled walks run all 20480 entries + write an
+    envelope, tests RED). pkg/api/README.md cancel-contract section updated for
+    the cursor path.
+  - **File(s)**: pkg/api/sessions.go, pkg/api/api_ctx_cancel_5232_5233_test.go,
+    pkg/api/README.md

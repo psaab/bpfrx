@@ -3,9 +3,11 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -213,4 +215,137 @@ func TestSessionHandlersAbortWalkOnCanceledContext(t *testing.T) {
 			}
 		})
 	}
+}
+
+// cursorCountDP is the CURSOR-path analogue of cancelCountDP: it serves nV4
+// forward v4 sessions and nV6 forward v6 sessions through the
+// sessionCursorIterator (IterateSessionsFrom / IterateSessionsV6From) that
+// s.sessionsCursor drives, counting how many of each family the walk visited
+// before it stopped. The embedded *dataplane.Manager satisfies the rest of the
+// apiRuntimeDataPlane surface (and its GetSessionV4/V6 "map not found" makes
+// enrichSessionV4/V6 a no-op merge). cancelCountDP deliberately implements only
+// the NON-cursor iterators, so sessionsCursor was never exercised and the
+// cursor-path context-cancel gap remained open until #5233's closeout.
+type cursorCountDP struct {
+	*dataplane.Manager
+	nV4, nV6             int
+	visitedV4, visitedV6 int
+}
+
+func (d *cursorCountDP) IsLoaded() bool { return true }
+
+func (d *cursorCountDP) IterateSessionsFrom(_ *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	for i := 0; i < d.nV4; i++ {
+		d.visitedV4++
+		var k dataplane.SessionKey
+		var v dataplane.SessionValue // IsReverse==0 => matchV4 admits it
+		if !fn(k, v) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (d *cursorCountDP) IterateSessionsV6From(_ *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	for i := 0; i < d.nV6; i++ {
+		d.visitedV6++
+		var k dataplane.SessionKeyV6
+		var v dataplane.SessionValueV6
+		if !fn(k, v) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// TestSessionsCursorAbortsWalkOnCanceledContext_5233 pins the cursor-path half
+// of #5233 (the residual left open when the non-cursor handlers were guarded).
+// A page_size>0 request routes to sessionsCursor via the sessionCursorIterator
+// assertion; a destination_port filter that no zero-value synthetic session can
+// match means the page NEVER fills, so ONLY the request-context checks can bound
+// the walk — isolating the fix from the len(all)>=pageSize page cap.
+//
+// FAIL-ON-REVERT: drop the cancelled()/r.Context().Err() checks from
+// sessionsCursor and the cancelled walks run every entry (v4 == n, v6 == n) and
+// write a terminal envelope — flipping every assertion below red.
+func TestSessionsCursorAbortsWalkOnCanceledContext_5233(t *testing.T) {
+	const n = 20 * sessionWalkCancelInterval
+	// No zero-key session matches destination_port=443, so len(all) stays 0 and
+	// the page (page_size=500) never fills.
+	const noMatch = "page_size=500&destination_port=443"
+
+	t.Run("cancelled no-match stops v4 within one window and skips v6", func(t *testing.T) {
+		dp := &cursorCountDP{Manager: dataplane.New(), nV4: n, nV6: n}
+		s := &Server{dp: dp}
+		rr := httptest.NewRecorder()
+		s.sessionsHandler(rr, cancelledRequest(httptest.NewRequest(http.MethodGet, "/api/v1/sessions?"+noMatch, nil)))
+
+		if dp.visitedV4 != sessionWalkCancelInterval {
+			t.Errorf("v4 visited %d, want %d (one sampling window before the abort)", dp.visitedV4, sessionWalkCancelInterval)
+		}
+		if dp.visitedV6 != 0 {
+			t.Errorf("v6 visited %d, want 0 (the v6 phase must not start after a cancelled v4 walk)", dp.visitedV6)
+		}
+		// No envelope: the handler returned before writeSessionList, so the
+		// (misleading) terminal page — AND the include_peer fan-out that
+		// writeSessionList performs first — never ran on the dead connection.
+		if rr.Body.Len() != 0 {
+			t.Errorf("cancelled cursor walk wrote a %d-byte envelope, want none: %s", rr.Body.Len(), rr.Body.String())
+		}
+	})
+
+	t.Run("cancelled v6start-token does not start the v6 walk", func(t *testing.T) {
+		dp := &cursorCountDP{Manager: dataplane.New(), nV6: n}
+		s := &Server{dp: dp}
+		rr := httptest.NewRecorder()
+		v6start := base64.RawURLEncoding.EncodeToString([]byte("v6start"))
+		s.sessionsHandler(rr, cancelledRequest(httptest.NewRequest(http.MethodGet,
+			"/api/v1/sessions?"+noMatch+"&page_token="+v6start, nil)))
+
+		if dp.visitedV6 != 0 {
+			t.Errorf("v6 visited %d on a cancelled v6start request, want 0 (the pre-v6 ctx check must fire before the walk)", dp.visitedV6)
+		}
+		if rr.Body.Len() != 0 {
+			t.Errorf("cancelled v6start walk wrote a %d-byte envelope, want none: %s", rr.Body.Len(), rr.Body.String())
+		}
+	})
+
+	t.Run("non-cancelled no-match walks BOTH families fully and writes the last page", func(t *testing.T) {
+		dp := &cursorCountDP{Manager: dataplane.New(), nV4: n, nV6: n}
+		s := &Server{dp: dp}
+		rr := httptest.NewRecorder()
+		s.sessionsHandler(rr, httptest.NewRequest(http.MethodGet, "/api/v1/sessions?"+noMatch, nil))
+
+		if dp.visitedV4 != n {
+			t.Errorf("v4 visited %d, want all %d (the cancel check must be inert on the normal path)", dp.visitedV4, n)
+		}
+		if dp.visitedV6 != n {
+			t.Errorf("v6 visited %d, want all %d", dp.visitedV6, n)
+		}
+		if rr.Code != http.StatusOK || rr.Body.Len() == 0 {
+			t.Errorf("non-cancelled cursor walk: code=%d body=%d, want 200 with a terminal envelope", rr.Code, rr.Body.Len())
+		}
+	})
+
+	// Page-token semantics preserved on the normal path: a match-all request
+	// fills exactly one page and emits a v4 next_page_token (omitempty, so its
+	// presence proves a resume token was issued).
+	t.Run("non-cancelled match-all fills a page and issues a next-page token", func(t *testing.T) {
+		dp := &cursorCountDP{Manager: dataplane.New(), nV4: n, nV6: n}
+		s := &Server{dp: dp}
+		rr := httptest.NewRecorder()
+		s.sessionsHandler(rr, httptest.NewRequest(http.MethodGet, "/api/v1/sessions?page_size=100", nil))
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("match-all cursor request: code=%d, want 200; body: %s", rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), `"next_page_token"`) {
+			t.Errorf("full page must emit a next_page_token (page-token semantics preserved); body: %s", rr.Body.String())
+		}
+		// The v4 walk stops one probe past the full page (pageSize appended, the
+		// next callback observes len(all)>=pageSize) and v6 is never reached.
+		if dp.visitedV4 != 101 || dp.visitedV6 != 0 {
+			t.Errorf("match-all page: v4 visited %d (want 101), v6 visited %d (want 0)", dp.visitedV4, dp.visitedV6)
+		}
+	})
 }

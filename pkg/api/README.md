@@ -440,8 +440,18 @@ under the daemon's errgroup. Nothing else imports this package.
   session-sync path (#5233) instead of holding it for a discarded scan. The
   sampler probes `ctx.Err()` once per batch (not per session) so the check
   adds no per-entry cost, and it never fires on the normal path — output and
-  ordering are unchanged. Pinned by `api_ctx_cancel_5232_5233_test.go`. This
-  is the REST analog of the gRPC `streamDiagCmd` cancellation cleanup (#5060).
+  ordering are unchanged. The `/sessions` CURSOR path (`page_size>0`,
+  `sessionsCursor` over `IterateSessionsFrom`/`IterateSessionsV6From`) uses the
+  SAME sampler in both cursor callbacks — a selective/no-match query never
+  fills the page, so without it the callback would walk the rest of the table —
+  PLUS a direct `r.Context().Err()` check at each phase boundary: it does not
+  start the second (v6) full walk after a cancelled v4 phase, and does not emit
+  a misleading terminal `next_page_token`/partial-page envelope (nor the
+  `include_peer` fan-out inside `writeSessionList`) to a dead connection. A full
+  page is still emitted normally — it is a complete, valid result. Pinned by
+  `api_ctx_cancel_5232_5233_test.go` (`TestSessionsCursorAbortsWalkOnCanceledContext_5233`
+  for the cursor path). This is the REST analog of the gRPC `streamDiagCmd`
+  cancellation cleanup (#5060).
 - Session-count metrics come from the LIVE dataplane session table, not
   the BPF GC sweep stats (#3929). `collectSessionGauges`
   (`metrics_sessions.go`) derives `xpf_sessions_active` (forward entries)
