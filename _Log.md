@@ -1,3 +1,47 @@
+## 2026-07-16 — #5791 (DHCP/host-inbound): gate lease-change recompile skip on host-inbound lifeline set, not the broad mgmt-VRF name class
+- **Timestamp**: 2026-07-16 (fix/5791-dhcp-hostinbound-reapply)
+- **Action**: Fix #5791 (security). `dhcpLeaseChangeRequiresRecompile`
+  (pkg/daemon/daemon_dhcp.go) decided whether a DHCP lease change may SKIP the
+  full dataplane/config reapply by testing each DHCP interface against the BROAD
+  management-VRF name class (`mgmtSet`, populated in daemon_apply.go from every
+  configured `fxp*`/`fab*`/`em*` interface). But the host-inbound LIFELINE class
+  is NARROWER (pkg/config/lifeline.go `HostInboundLifelineSet`): standalone
+  lifelines are only fxp0/em0/fab* (plus a configured chassis-cluster
+  control/fabric interface, #3277). So a zoned DHCP-only standalone `fxp1` — in
+  the broad mgmt class (`fxp*`) but NOT a lifeline — could start ADDRESSLESS
+  (no address-scoped host-inbound drop installed), acquire an address, and then
+  SKIP the reapply that rebuilds the host-inbound fence for the newly-reachable
+  address → the new address was reachable with NO host-inbound fence (security
+  gap). Fix: gate the skip on the config-derived host-inbound lifeline set — the
+  SAME `config.HostInboundLifelineSet` / `HostInboundLifelineInterface` the fence
+  application uses (pkg/dataplane/userspace/zones_host_inbound.go,
+  pkg/daemon/daemon_nft.go) — NOT the broad name class, so the skip decision and
+  the fence application agree by construction (no second, drifting classifier).
+  A non-lifeline DHCP interface now forces the full recompile that builds its
+  fence; a TRUE lifeline (fxp0 DHCPv4, em0, fab*, or a configured
+  control-interface) keeps the lightweight management-only fast path (no
+  churn/perf regression on routine mgmt lease renewals). Base-name mapping
+  (`fxp1.0`→`fxp1`) is handled by `HostInboundLifelineInterface`/`LifelineBaseName`
+  exactly as the fence does it. Kept the conservative
+  `len(mgmtSet)==0 → recompile` liveness guard (before-first-apply /
+  VRF-create-failed). Fail-on-revert PROVEN firsthand: new
+  `TestDHCPLeaseChangeRequiresRecompile_ZonedNonLifelineFxp1` asserts the REAL
+  recompile decision is TRUE for a zoned standalone fxp1; neutralizing the fix
+  (revert the per-interface proxy to `mgmtSet[config.DHCPLeaseIfName(...)]`) →
+  RED (`must require the full recompile so its address-scoped host-inbound fence
+  is (re)built`); restored → GREEN. Regression guards (all GREEN both ways):
+  `_LifelineFastPathPreserved` (fxp0/em0/fab0 still skip),
+  `_ClusterControlFxp1` (fxp1 as control-interface → lifeline → skip preserved),
+  `_ZonedDataInterfaceUnchanged` (ge-0/0/3 still recompiles). Validation:
+  `go build ./...` + `go vet ./pkg/daemon ./pkg/config` clean; `gofmt` clean;
+  `pkg/daemon` (24.6s) + `pkg/config` (148.6s) full suites `-race` GREEN.
+  Go-only, no cargo. Control-plane change → no loss-cluster smoke; gated on the
+  fail-on-revert unit tests.
+- **File(s)**: pkg/daemon/daemon_dhcp.go (edit — lifeline-set skip gate),
+  pkg/daemon/dhcp_recompile_test.go (edit — fail-on-revert + 3 regression
+  guards), pkg/daemon/README.md (edit — #5791 recompile-skip contract),
+  docs/host-inbound-service-matrix.md (edit — #5791 fixed note)
+
 ## 2026-07-16 — #5836 (dataplane loader): scope ifindex preflight to XPF-referenced links (codex-183)
 - **Timestamp**: 2026-07-16 (fix/5836-ifindex-preflight-scope)
 - **Action**: Fix #5836. `preflightCheckIfindexCaps` enumerated the WHOLE host

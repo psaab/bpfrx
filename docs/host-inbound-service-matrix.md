@@ -465,8 +465,15 @@ snapshot produces a zero-drop table shell:
   `applyConfig`, but classification does not prove host-inbound ran. A required
   protocol-gate error returns before `applyTailReconciles` and receives no
   cancellation closeout, leaving retry/re-render to a later applicable successful
-  reconcile that reaches the tail. The management-only classification branch is
-  the separate #5791 limitation.
+  reconcile that reaches the tail. **#5791 (fixed):** the callback's
+  management-only skip is now gated on the config-derived host-inbound LIFELINE
+  set (`config.HostInboundLifelineSet` / `HostInboundLifelineInterface` — the SAME
+  authority that lifeline-excludes these address sets), not the broad
+  management-VRF name class (fxp*/fab*/em*). So a zoned NON-lifeline DHCP interface
+  (a standalone `fxp1`) is classified for the full recompile that builds its
+  address-scoped fence; only a true lifeline (fxp0/em0/fab*/configured
+  control-interface) keeps the management-only fast path. The skip decision and
+  this fence now share one classifier and cannot drift.
 - If the fence **also** fails to load (nft itself broken), both errors are joined
   and an `ERROR`-level `COLD-BOOT FAIL-OPEN GUARD` log fires; `hostInboundEnforced`
   stays false. That is the irreducible catastrophic case — the daemon has done all
