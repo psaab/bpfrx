@@ -393,6 +393,21 @@ if $PY "$DIST/publish.py" stamp-installer --out "$WORK/np.sh" \
 else
     ok "stamp refuses a placeholder archive key"
 fi
+# stamp refuses a malicious apt URL that would inject shell into the SIGNED,
+# root-run install.sh (#5685 / M40). A single quote breaks out of install.sh's
+# single-quoted literal; the value must be validated before stamping.
+INJ="$WORK/inj.sh"
+if $PY "$DIST/publish.py" stamp-installer --out "$INJ" \
+     --archive-key "$AKEY" \
+     --apt-base-url "https://x.invalid/apt'; touch $WORK/pwned #" \
+     >/dev/null 2>&1; then
+    bad "stamp MUST refuse a shell-injecting apt URL but PASSED"
+elif [ -f "$INJ" ] && grep -q "touch $WORK/pwned" "$INJ" 2>/dev/null; then
+    bad "shell-injecting apt URL was baked into install.sh (#5685 gate missing)"
+else
+    ok "stamp refuses a shell-injecting apt URL (#5685)"
+fi
+rm -f "$WORK/pwned"
 
 # ── 8. publish gate: install.sh mandatory + stamped + signed ────────────────
 info "8. publish gate — install.sh mandatory, stamped, signed"

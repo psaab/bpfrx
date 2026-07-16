@@ -148,6 +148,72 @@ PGP_BLOCK_RE = re.compile(
 )
 MARKER_RE = re.compile(r"%%[A-Za-z0-9_]+%%")
 
+# The apt base URL is baked LITERALLY into install.sh inside a single-quoted
+# shell string (`XPF_APT_BASE_URL_BAKED='%%XPF_APT_BASE_URL%%'`) that is then
+# SIGNED with minisign and piped to `sudo sh` on a fresh host (the Tier-A
+# `curl … | sudo sh` one-liner). The value is a lower-trust config input
+# (--apt-base-url / XPF_APT_BASE_URL) that crosses the signing trust boundary:
+# a single quote breaks out of the literal and the tail becomes signed,
+# root-executed shell — command injection / supply-chain root (#5685, M40). It
+# also flows unquoted-in-a-heredoc into the deb822 `URIs:` line and into info()
+# output. So validate it to a strict https URL with NO shell metacharacter,
+# whitespace, control byte, or percent-escape BEFORE stamping, and fail CLOSED
+# on any violation — the signature must never attest to an injected command.
+#
+# An apt base URL is a bare `dists/`+`pool/` directory host, so it needs only
+# scheme + host[:port] + path; it never carries userinfo, a query, a fragment,
+# or a percent-escape. The netloc/path allowlists MIRROR the validate_identifier
+# / validate_version fail-closed idiom in scripts/deploy/xpf-deploy.py, widened
+# to the small unreserved-URL charset (`._~-` plus `/` in the path and `:` for a
+# port) — nothing in that charset can host a shell breakout.
+_SAFE_APT_URL_NETLOC = re.compile(
+    r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?\Z")
+_SAFE_APT_URL_PATH = re.compile(r"(/[A-Za-z0-9._~-]*)*\Z")
+# Characters that must never appear in the value: shell metacharacters, quoting
+# characters, whitespace, and `%`/`=` (a `%%` pair would also defeat install.sh's
+# unsubstituted-marker guard). Belt-and-suspenders alongside the structural
+# allowlists below — this scan yields a precise "which byte" fail-closed message.
+_APT_URL_FORBIDDEN = set("$\"'\\`;&|<>(){}[]*?!#@%=+, \t\r\n\v\f")
+
+
+def validate_apt_url(value, field="apt base URL"):
+    """Reject an apt base URL that could inject shell when baked into (and then
+    SIGNED with) install.sh — the #5685 / M40 supply-chain sink.
+
+    Fail-CLOSED (die()s, so the release aborts) unless `value` is a strict,
+    well-formed https URL with NO shell metacharacter, whitespace, control byte,
+    userinfo, query, fragment, or percent-escape. Returns the value on success.
+    Mirrors the validate_identifier / validate_version discipline in
+    scripts/deploy/xpf-deploy.py, with a URL-appropriate charset."""
+    if not isinstance(value, str) or not value:
+        die(f"{field} is required and must be a non-empty string")
+    # 1. per-character denylist: no shell metacharacter / whitespace / control
+    #    byte / percent-escape survives into the signed single-quoted literal.
+    for ch in value:
+        if ch in _APT_URL_FORBIDDEN or ord(ch) < 0x20 or ord(ch) == 0x7f:
+            die(f"{field} {value!r} contains a forbidden character {ch!r} — it "
+                "is baked into signed, root-executed shell (install.sh); reject "
+                "anything that could break out of the shell string context "
+                "(#5685).")
+    # 2. structural allowlist: https scheme, a valid host[:port], an allowlisted
+    #    path, and NO userinfo / query / fragment.
+    from urllib.parse import urlsplit
+    parts = urlsplit(value)
+    if parts.scheme != "https":
+        die(f"{field} {value!r} must use the https scheme (got "
+            f"{parts.scheme or '<none>'!r}) — the installer bakes it into a "
+            "signed root shell; only https is accepted (#5685).")
+    if "@" in parts.netloc or not _SAFE_APT_URL_NETLOC.match(parts.netloc):
+        die(f"{field} {value!r} has an invalid host — expected a bare "
+            "host[:port] with no userinfo (#5685).")
+    if parts.query or parts.fragment:
+        die(f"{field} {value!r} must not carry a query or fragment — an apt "
+            "base URL is a bare dists/+pool/ directory host (#5685).")
+    if parts.path and not _SAFE_APT_URL_PATH.match(parts.path):
+        die(f"{field} {value!r} has an invalid path — allow only "
+            "'/'-separated [A-Za-z0-9._~-] components (#5685).")
+    return value
+
 
 def _installer_key_block(text):
     """Return install.sh's embedded ASCII-armored ARCHIVE_KEY block, or None.
@@ -191,6 +257,10 @@ def stamp_installer(out, src=INSTALLSH_SRC, archive_key=None, apt_url=None,
         die("apt base URL required — set XPF_APT_BASE_URL or pass "
             "--apt-base-url. It is baked into install.sh so the Tier-A "
             "one-liner needs no env.")
+    # The apt URL crosses the signing trust boundary (it is baked into the
+    # about-to-be-signed install.sh, run as root). Validate it BEFORE any
+    # substitution so a malformed/injected value aborts the release (#5685).
+    validate_apt_url(apt_url)
     if channel not in ("stable", "edge"):
         die(f"channel must be stable|edge (got {channel!r}).")
     if archive_key is None:
