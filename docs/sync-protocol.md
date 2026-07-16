@@ -313,6 +313,26 @@ sender (`QueueConfig`) stamps a strictly-monotonic `gen` drawn from a
 process-wide counter seeded from `CLOCK_MONOTONIC` nanos (same cross-boot
 reasoning as the session install `genCounter`).
 
+**Commit-side trigger — transport-independent (#5054).** An operator commit
+pushes the newly-committed config to the peer regardless of which management
+transport delivered it: the gRPC, REST, and local interactive-shell commit
+handlers all route through `commitAndApplyOperator` /
+`commitConfirmedAndApplyOperator` (`pkg/daemon/daemon_apply.go`), which derive
+the push decision from **RG0 ownership** (`rg0ConfigSyncAuthority` — cluster
+configured AND this node is the RG0 config-authority primary), not from the
+transport. The same RG0-ownership rule gates the actual push in
+`syncConfigToPeer`, so a standalone / non-owner node never pushes. Before #5054
+only the gRPC handler synced; REST and the local shell passed `syncPeer=false`,
+so a REST/shell commit on a healthy cluster left the standby on the prior config
+until an unrelated transport-disconnect reverse-sync — an RG failover could then
+silently restore config the operator believed changed. The autonomous
+event-options engine is the deliberate exception: it commits with
+`syncPeer=false` because each node fires remediation independently from its own
+RPM events and must not push node-local state to the peer. There is no periodic
+config reconcile ticker — convergence is driven by the commit push plus the
+reverse-sync-on-reconnect path, so the commit-side trigger MUST fire on every
+operator transport.
+
 **Ordering guard (#3931).** Config sync historically applied via a racing
 `go OnConfigReceived` goroutine per message with no sequence number, so a rapid
 commit pair (C1 then C2) could apply out of order and leave the standby on the
