@@ -592,6 +592,18 @@ func (es *EventStream) readLoop(ctx context.Context) {
 				es.backoffCallbackNotReady(ctx)
 				return
 			}
+			// #5362: the FullResync(S) barrier re-baselines the sequence — the
+			// producer emits it in wire==seq order (#5361) and the next live
+			// delta is S+1. Advance prevSeq (and the persistent watermark) so
+			// that S+1 is contiguous and does NOT trip the session-sync gap
+			// check (seq > prevSeq+1), which would otherwise force one spurious
+			// reconnect on the active-traffic recovery path. This mirrors the
+			// delta cases' prevSeq/lastRecvSeq advance; markFrameApplied already
+			// ran inside dispatchOrQueueFullResyncFrame. Only the successful-
+			// dispatch path advances here — the drop paths use
+			// markDroppedFrameApplied, which advances prevSeq itself.
+			prevSeq = seq
+			es.lastRecvSeq.Store(seq)
 
 		case EventTypeKeepalive:
 			// Idle heartbeat from helper — no action needed, just keeps
