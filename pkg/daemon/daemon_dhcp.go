@@ -222,10 +222,31 @@ func (d *Daemon) dhcpLeaseChangeRequiresRecompile(cfg *config.Config) bool {
 	// If management VRF bindings are unavailable, stay conservative. Read a
 	// single lock-free snapshot (#5113) so the whole classification runs
 	// against one consistent map, never a torn/nil-transient publication.
+	// (This is a "before-first-apply / VRF-create-failed" liveness guard, not
+	// the host-inbound classification below.)
 	mgmtSet := d.mgmtVRFIfaceSet()
 	if len(mgmtSet) == 0 {
 		return true
 	}
+	// #5791: gate the "skip the full reapply" decision on the config-derived
+	// host-inbound LIFELINE set — the SAME authority the host-inbound fence
+	// application uses (config.HostInboundLifelineSet, see
+	// pkg/dataplane/userspace/zones_host_inbound.go and pkg/daemon/daemon_nft.go)
+	// — NOT the broad management-VRF name class (fxp*/fab*/em*). The broad class
+	// wrongly exempted a zoned NON-lifeline fxp1: standalone lifelines are only
+	// fxp0/em0/fab* (plus a configured chassis-cluster control/fabric interface),
+	// so a DHCP-only zoned fxp1 would start ADDRESSLESS, install no address-scoped
+	// host-inbound drop, acquire an address, and then SKIP the reapply that would
+	// build the fence for the newly reachable address (a host-inbound gap, #3277).
+	// A lease change on a TRUE lifeline (fxp0 DHCPv4, em0, fab*, or a configured
+	// control-interface) still takes the lightweight management-only fast path;
+	// only a non-lifeline DHCP interface now forces the recompile that (re)builds
+	// its fence. Sharing HostInboundLifelineInterface with the fence keeps the
+	// skip decision and the fence application in lockstep by construction, so a
+	// future name can never drift the two apart. The base-name mapping
+	// (fxp1.0 -> fxp1) is handled inside HostInboundLifelineInterface via
+	// LifelineBaseName, exactly as the fence does it.
+	lifelines := config.HostInboundLifelineSet(cfg)
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
 		if ifc == nil {
 			continue
@@ -234,7 +255,7 @@ func (d *Daemon) dhcpLeaseChangeRequiresRecompile(cfg *config.Config) bool {
 			if unit == nil || (!unit.DHCP && !unit.DHCPv6) {
 				continue
 			}
-			if !mgmtSet[config.DHCPLeaseIfName(ifName, unit)] {
+			if !config.HostInboundLifelineInterface(ifName, lifelines) {
 				return true
 			}
 		}
