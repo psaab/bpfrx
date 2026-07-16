@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"context"
+	"log/slog"
 	"net/netip"
 	"path/filepath"
 	"reflect"
@@ -13,6 +15,40 @@ import (
 	"github.com/psaab/xpf/pkg/dhcp"
 	"golang.org/x/sync/semaphore"
 )
+
+// recordingSlogHandler records the messages of every slog record it is asked to
+// handle at or above its level, so a test can assert whether a particular log
+// line fired (and how often). Used to prove a per-poll-tick line was demoted
+// below Info (#6036).
+type recordingSlogHandler struct {
+	mu    sync.Mutex
+	level slog.Level
+	msgs  []string
+}
+
+func (h *recordingSlogHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= h.level }
+
+func (h *recordingSlogHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, r.Message)
+	return nil
+}
+
+func (h *recordingSlogHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *recordingSlogHandler) WithGroup(_ string) slog.Handler      { return h }
+
+func (h *recordingSlogHandler) count(msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, m := range h.msgs {
+		if m == msg {
+			n++
+		}
+	}
+	return n
+}
 
 // raApplySpy records every desired set handed to ra.Apply so a test can assert
 // exactly what the daemon would transmit. It stands in for the concrete
@@ -269,6 +305,15 @@ func TestClusterRAMultiPDPrefixOrderStableNoFlap(t *testing.T) {
 	// Stable-active owner of RG1 — no transition for the rest of the test.
 	d.getOrCreateRGState(1).SetVRRP("reth0", true)
 
+	// Capture Info+ logs so we can prove buildRAConfigs' per-PD-prefix line does
+	// NOT fire on the periodic path (it is a pure builder re-run every ~2s, so an
+	// Info there is per-poll-tick spam — #6036). The handler drops anything below
+	// Info, so a correctly-demoted slog.Debug is invisible here.
+	rec := &recordingSlogHandler{level: slog.LevelInfo}
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(rec))
+	defer slog.SetDefault(prevLogger)
+
 	// Drive the periodic reconcile many times. Each pass re-derives the desired
 	// set (re-ranging m.delegatedPDs), so the digest must be invariant to the
 	// map order for the hash gate to hold ra.Apply at a single call.
@@ -296,5 +341,16 @@ func TestClusterRAMultiPDPrefixOrderStableNoFlap(t *testing.T) {
 		if !contains(got, p) {
 			t.Fatalf("applied RA set dropped prefix %s; got %v", p, got)
 		}
+	}
+
+	// buildRAConfigs runs on EVERY periodic pass (desiredClusterRA re-derives the
+	// set each tick), so its per-PD-prefix advertise line must be below Info or it
+	// is per-poll-tick spam. With the demote to slog.Debug it never reaches the
+	// Info-level handler. Reverting daemon_ra.go's slog.Debug back to slog.Info
+	// makes it fire once per PD prefix per pass (4*64) → this reds.
+	if n := rec.count("DHCPv6 PD: advertising prefix via RA"); n != 0 {
+		t.Fatalf("buildRAConfigs logged the PD-advertise line at Info %d times across "+
+			"%d periodic reconciles — per-poll-tick Info spam; it must be slog.Debug (#6036)",
+			n, passes)
 	}
 }

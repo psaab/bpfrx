@@ -246,6 +246,9 @@ the digest marshals order-sensitively and `ra.configEqual` compares prefixes
 index-by-index, the every-2s reconcile would FLAP the hash and spuriously
 re-apply RA (a sub-second RA gap + a per-poll-tick apply log). The in-place sort
 is safe because `buildRAConfigs` returns freshly-owned configs (#6036).
+Relatedly, `buildRAConfigs` is a pure builder the periodic reconcile now re-runs
+every tick, so its per-PD-prefix "advertising prefix via RA" line logs at
+`slog.Debug`, not `Info` — an `Info` there would be per-poll-tick spam (#6036).
 
 ### Direct-mode VIP failover (private-rg-election / no-reth-vrrp)
 

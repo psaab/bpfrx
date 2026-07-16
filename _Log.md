@@ -19,17 +19,32 @@
   slice is aliased to the active config. Added `SeedDelegatedPrefixesForRATesting`
   test seam to `pkg/dhcp/test_seams.go` so the daemon test can model several PD
   sources feeding one RA interface.
+  Same fold, second per-poll-tick-spam site: `buildRAConfigs` logged
+  `slog.Info("DHCPv6 PD: advertising prefix via RA", …)` once per PD prefix. It
+  is a pure builder the periodic reconcile now re-runs every ~2s, so with PD
+  prefixes present that Info repeated every tick — per-poll-tick spam CLAUDE.md
+  forbids. Demoted to `slog.Debug` (gate-on-change would need stateful
+  bookkeeping in the pure builder — not clean; the one-time operational signal is
+  already carried by the reconcile's hash-gated apply Info). Scanned the whole
+  periodic path: the reconcile's own L76/L79 Info are hash-gated (fire only on an
+  actual apply, not every tick) and both Warn lines are error paths — left as-is;
+  daemon_ra.go:63 was the only unconditional per-tick Info.
   Validation: `go build ./...` clean; `go vet ./pkg/daemon ./pkg/dhcp` clean;
   `go test -race ./pkg/daemon` + `./pkg/dhcp` GREEN. New fail-on-revert test
   `TestClusterRAMultiPDPrefixOrderStableNoFlap` drives the periodic reconcile 64×
-  on a stable-active owner and asserts ra.Apply fires exactly ONCE (no digest
-  flap) AND the applied prefixes are in sorted order; neutralizing the sort
-  (build stays green) reds it verbatim: "cluster RA reconcile flapped: ra.Apply
-  called 13 times across 64 stable reconciles, want exactly 1". The two existing
-  #5861 tests (TestClusterRAStableActiveReappliesOnCommit /
+  on a stable-active owner and asserts (a) ra.Apply fires exactly ONCE (no digest
+  flap), (b) the applied prefixes are in sorted order, and (c) the PD-advertise
+  line does NOT reach an Info-level slog handler. Neutralizing the sort reds (a)
+  verbatim: "cluster RA reconcile flapped: ra.Apply called 13 times across 64
+  stable reconciles, want exactly 1"; reverting the Debug back to Info reds (c):
+  "buildRAConfigs logged the PD-advertise line at Info 256 times across 64
+  periodic reconciles". Both reverts keep the build GREEN (assertion failures,
+  not build breaks). The two existing #5861 tests
+  (TestClusterRAStableActiveReappliesOnCommit /
   TestClusterRADemotionRaceDoesNotTransmit) stay GREEN.
 - **File(s)**: pkg/daemon/daemon_ra_reconcile.go (within-interface prefix sort +
-  sortRAPrefixes), pkg/daemon/ra_stable_active_5861_test.go (new flap-guard
+  sortRAPrefixes), pkg/daemon/daemon_ra.go (demote per-tick PD-advertise Info →
+  Debug), pkg/daemon/ra_stable_active_5861_test.go (new flap-guard + no-Info-spam
   test), pkg/dhcp/test_seams.go (SeedDelegatedPrefixesForRATesting seam),
   pkg/daemon/README.md (per-RG RA reconcile idempotence: within-interface sort)
 
