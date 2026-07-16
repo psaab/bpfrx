@@ -252,6 +252,20 @@ func TestCandidateGenerationBumps(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
+		{"insert", func(t *testing.T, s *Store) {
+			// Two ordered sibling nodes under the root so InsertBefore has a
+			// valid element + same-parent reference to reorder.
+			if err := s.SetFromInput("a"); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SetFromInput("b"); err != nil {
+				t.Fatal(err)
+			}
+		}, func(t *testing.T, s *Store) {
+			if err := s.Insert([]string{"a"}, []string{"b"}, true); err != nil {
+				t.Fatal(err)
+			}
+		}},
 		{"load-override", nil, func(t *testing.T, s *Store) {
 			if err := s.LoadOverride("system { host-name over; }"); err != nil {
 				t.Fatal(err)
@@ -314,5 +328,34 @@ func TestCandidateGenerationBumpsOnEnterExit(t *testing.T) {
 	g2 := s.CandidateGeneration()
 	if g2 <= g1 {
 		t.Fatalf("ExitConfigure did not advance candidateGen (%d -> %d)", g1, g2)
+	}
+}
+
+// Rollback to a NUMBERED history slot (n > 0) also advances the generation — a
+// distinct store_command/store_commit bump site from the rollback-0 case in the
+// table above (which reclones the active). Driven standalone because it needs a
+// committed history entry to roll back to.
+func TestCandidateGenerationBumpsOnRollbackN(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	// One commit creates a rollback slot (the pre-commit active config).
+	if err := s.SetFromInput("system host-name v1"); err != nil {
+		t.Fatalf("set v1: %v", err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	// Stage a further change so the candidate differs from the rollback target.
+	if err := s.SetFromInput("system host-name v2"); err != nil {
+		t.Fatalf("set v2: %v", err)
+	}
+	before := s.CandidateGeneration()
+	if err := s.Rollback(1); err != nil {
+		t.Fatalf("Rollback(1): %v", err)
+	}
+	if after := s.CandidateGeneration(); after <= before {
+		t.Fatalf("Rollback(1) did not advance candidateGen (before=%d after=%d)", before, after)
 	}
 }

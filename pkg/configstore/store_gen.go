@@ -18,10 +18,24 @@ var ErrCandidateGenerationConflict = errors.New(
 
 // bumpCandidateGenLocked advances the candidate generation token. It MUST be
 // called under s.mu.Lock at EVERY site that changes the candidate tree's
-// identity or content (mutation, load, rollback, enter/exit/reclaim config
-// mode, peer-sync reset, post-commit reset). Missing a site would let a
-// candidate change slip past the generation guard, so a table-driven test
-// (TestCandidateGenerationBumps*) asserts each mutating store op advances it.
+// identity or content: the public candidate MUTATORS (set/delete/deactivate/
+// activate/copy/rename/insert/annotate/load-override/load-merge/load-set,
+// rollback), the config-mode transitions (enter/exit/reclaim/force-exit), the
+// peer-sync + confirm-recovery + authoritative-load resets, and the post-commit
+// candidate reset. Missing a site would let a candidate change slip past the
+// generation guard.
+//
+// Test coverage is layered, not a single exhaustive table:
+//   - TestCandidateGenerationBumps drives every PUBLIC candidate mutator and
+//     asserts each advances the token;
+//   - TestCandidateGenerationBumpsOnEnterExit covers the config-mode
+//     transitions, and the commit/commit-confirmed/rollback tests exercise the
+//     post-commit and rollback reset bumps;
+//   - the remaining internal reset sites (peer-sync, confirm-recovery,
+//     reclaim/force-exit) are guarded by the structural invariant that every
+//     `s.candidate = …` reassignment is immediately followed by a bump —
+//     verified by code audit — plus the generation-conflict tests that would
+//     fail if a reset silently kept a stale token.
 func (s *Store) bumpCandidateGenLocked() {
 	s.candidateGen++
 }
