@@ -143,6 +143,38 @@ func ValidateInteger(min, max int64) LeafValidator {
 // InterfaceConfig.Units by this int (#5829).
 const MaxLogicalUnit = 16385
 
+// CanonicalLogicalUnit is the ONE canonical normalizer for a logical
+// `unit <n>` identity (#5878). It maps every textual spelling of a numeric
+// logical unit to its shared canonical identity: it parses the raw token as a
+// base-10 integer (so `01`==`1`, `+1`==`1`, `-0`==`0`, `00`==`0` all collapse)
+// and returns the canonical int plus its canonical decimal string
+// (strconv.FormatInt). A truly-malformed identity — non-numeric, negative
+// non-zero, integer overflow, or out-of-range [0..MaxLogicalUnit] — is rejected
+// via the same ValidateInteger check ValidateLogicalUnit has always used, so
+// the acceptance set and error text are unchanged.
+//
+// The canonicalization the compiler performs ad hoc via `strconv.Atoi` at ~10
+// call sites (compileInterfaces keys `ifc.Units[unitNum]` by the parsed int)
+// is centralized here so a collision gate, and eventually the zone/NAT/routing
+// reference binders (phase 2, #5878), can share one identity: two spellings
+// that fold to the same canonical unit are the SAME unit.
+func CanonicalLogicalUnit(raw string) (int, string, error) {
+	// Delegate the acceptance/range check to ValidateInteger so the error
+	// text is byte-identical to ValidateLogicalUnit's historical output
+	// (the #5829 tests and operator diagnostics depend on it). ValidateInteger
+	// ignores the *Config argument, so nil is safe here.
+	if err := ValidateInteger(0, MaxLogicalUnit)(raw, nil); err != nil {
+		return 0, "", err
+	}
+	// ParseInt with the same base/bitsize accepts exactly what ValidateInteger
+	// just accepted, so this never fails on the post-validate path.
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, "", err
+	}
+	return int(v), strconv.FormatInt(v, 10), nil
+}
+
 // ValidateLogicalUnit is the ONE canonical numeric-identity validator for a
 // logical `unit <n>` slot (#5829). A `unit <identity>` slot has no positional
 // key validation, so a non-numeric identity such as `unit tenant` passed
@@ -153,8 +185,12 @@ const MaxLogicalUnit = 16385
 // identity at commit instead: non-numeric, negative, integer overflow, and
 // out-of-range [0..MaxLogicalUnit] all fail here. Reuse this on every slot that
 // names an interface unit so the grammar stays consistent across subsystems.
+//
+// It now delegates the validation half to CanonicalLogicalUnit (#5878) — the
+// shared normalizer — so validation and canonicalization can never diverge.
 func ValidateLogicalUnit(raw string, cfg *Config) error {
-	return ValidateInteger(0, MaxLogicalUnit)(raw, cfg)
+	_, _, err := CanonicalLogicalUnit(raw)
+	return err
 }
 
 // validatePercent returns a closure that accepts a real number in

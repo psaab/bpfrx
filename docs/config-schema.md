@@ -262,7 +262,7 @@ valid-compiles-to-expected-if_id + tolerant-warn + schema-layer reject +
 #2933-non-regression, each RED on revert to the silent `continue` / untyped
 leaf).
 
-### Numeric interface-unit alias collision fail-closed (#5631)
+### Numeric interface-unit alias collision fail-closed (#5631, both-node union #5878)
 
 `compileInterfaces` (`compiler_interfaces.go`) keys logical units by their
 numeric value: it iterates `namedInstances(child.FindChildren("unit"))` and
@@ -285,29 +285,76 @@ DIFFERENT security state. Rather than pick an arbitrary winner (exactly the
 order-dependent ambiguity that makes this unsafe), the fix REJECTS the aliased
 config at commit so the operator authors a single canonical `unit <n>`:
 
-- **Compiled-config strict gate** — `validateInterfaceUnitAliasCollisionsAST`
-  (`compiler_interface_unit_alias.go`), wired into `runPreWalkGates`
-  (`compiler_prewalk.go`) after `expandInterfaceRanges`. It groups the distinct
-  raw unit spellings under each interface by their canonical `strconv.Atoi`
-  value (mirroring the compiler's own split) and, when two DISTINCT spellings
-  resolve to the same number, hard-rejects on the strict commit / commit-check
-  path naming the interface, the spellings, and the canonical unit — and
-  downgrades to a `cfg.Warnings` entry on the tolerant load / peer-sync path
+- **Compiled-config strict gate (both-node union)** —
+  `validateInterfaceUnitAliasCollisionsAST` (`compiler_interface_unit_alias.go`).
+  It groups the distinct raw unit spellings under each interface by their
+  canonical unit and, when two DISTINCT spellings resolve to the same unit,
+  hard-rejects on the strict commit / commit-check path naming the interface,
+  the spellings, and the canonical unit — and downgrades to a `cfg.Warnings`
+  entry on the tolerant load / peer-sync path
   (`lenientInterfaceUnitAliasCollisions`, #1960 fail-closed-on-load class), so an
   already-persisted or peer-synced config an older binary accepted still boots.
+
+**One canonical normalizer (#5878).** Canonicalization is centralized in
+`CanonicalLogicalUnit(raw) (int, string, error)` (`schema_validators.go`), the
+ONE function that folds every alias spelling of a numeric unit to its shared
+identity (`01`==`1`, `+1`==`1`, `-0`/`00`==`0`), rejecting a malformed /
+out-of-range token via the same range check `ValidateLogicalUnit` has always
+used (`ValidateLogicalUnit` now delegates to it, so validation and
+canonicalization can never diverge). The alias gate keys collisions by this
+canonical unit.
+
+**Both-node-effective union — the #5878 gap.** The #5631 gate originally ran
+INSIDE `compileExpanded` (`runPreWalkGates`) AFTER
+`tree.ExpandGroupsWithVars({node: nodeN})`, so it saw only the SUBMITTING node's
+post-`${node}` effective view, and commit compiles `s.nodeID` alone
+(`Store.compileTree` → `CompileConfigForNode`). A peer-only
+`groups node1 { … unit 01 }` applied through `apply-groups "${node}"` folds its
+aliasing spelling onto a base `unit 1` ONLY in the standby's effective view —
+invisible at a node0 commit. The active node commits green; the standby's
+compiled config then diverges (a different firewall filter / address set) and a
+failover silently changes forwarding / security posture despite a
+"synchronized" commit. The gate is now the BOTH-NODE UNION, modeled exactly on
+`validateTunnelEndpointIDCollisionAST` (`tunnelid.go`) and run in the
+**pre-expansion** gate block of `compileConfigForNodeWithOpts` /
+`compileConfigWithOpts` (beside the tunnel/zone/table-id gates):
+  - **View 1** — the pre-expansion presence union across every `interfaces`
+    root AND every `groups` block, grouped per interface by canonical unit.
+  - **Views 2/3** — the concrete per-interface unit spellings after expanding
+    the candidate for node0 and node1 (`ExpandGroupsWithVars` +
+    `expandInterfaceRanges`), so a wildcard / interface-range apply-group whose
+    alias only lands on a concrete interface post-expansion is caught. Per-node
+    expansion errors are non-fatal (contribute the empty set); View 1 still
+    covers any collision inside an un-expandable group.
+  Because all three views are pure functions of the same candidate config
+  (Views 2/3 computed on both nodes), the accept/reject verdict is IDENTICAL on
+  node0 and node1 (no originator-accepts / peer-rejects split) and MONOTONE over
+  the old single-view gate — the same HA-symmetry argument `tunnelid.go` makes.
+  A node0 commit now rejects a node1-only alias collision.
 
 The gate is surgical: a single canonical `unit 0` (the overwhelming common case)
 and distinct unit numbers (`unit 0` + `unit 1`) never trip it, and same-spelling
 flat-set lines merge into one AST node upstream (they are the same unit, not an
 alias) — so non-colliding compilation is bit-identical. A non-numeric unit token
-is now REJECTED at commit rather than silently skipped (see the #5829 gate
+is REJECTED at commit rather than silently skipped (see the #5829 gate
 below). Where a duplicate-spelling config ALSO produces a
 pre-expansion tunnel-endpoint-id collision (#1873), that earlier gate rejects
 first — either way the aliased config is refused, never silently committed.
 Covered by `pkg/config/interface_unit_alias_5631_test.go` (both config orders
-reject identically = order-independent, lenient-warn, non-colliding-commits) and
+reject identically = order-independent, lenient-warn, non-colliding-commits),
+`pkg/config/interface_unit_parity_5878_test.go` (peer-only-node1 collision
+rejected at a node0 commit, both-node verdict parity, alias-form + injection-
+vector matrices, VLAN-split regression guards, `CanonicalLogicalUnit` units) and
 the reconciled `tunnelid_test.go` duplicate-spelling case, each RED on revert of
-the gate wiring.
+the gate wiring (the parity test goes RED — node0 accepts — when the gate is put
+back node-local).
+
+**Phase 2 (deferred, #5878):** thread `CanonicalLogicalUnit` through the
+zone / CoS / routing-instance / NAT reference binders and the snapshot / status
+emitters so a `.01` reference resolves to the same runtime unit as the
+interface's canonical `.1` everywhere (the second, subtler half of #5878).
+Phase 1 (this section) closes the divergent-commit fail-open — the material
+security bug — and is sized separately from the reference-binder threading.
 
 ### Non-numeric logical-unit identity fail-closed (#5829)
 
@@ -323,7 +370,9 @@ the undefined-filter-reference gate.
 
 The fix is fail-CLOSED at two layers, both keyed to one canonical validator
 `ValidateLogicalUnit` (`schema_validators.go`, range `0..MaxLogicalUnit` = 16385
-— non-numeric, negative, integer overflow, and out-of-range all fail):
+— non-numeric, negative, integer overflow, and out-of-range all fail; since
+#5878 it delegates the validation half to `CanonicalLogicalUnit` so the same
+function both validates AND emits the canonical identity):
 
 - **Schema (strict commit/check):** the `unit` node carries
   `keyValidator: ValidateLogicalUnit`, so `commit`/`commit check`

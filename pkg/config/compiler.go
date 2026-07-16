@@ -2251,6 +2251,19 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		return nil, dupBlockErr
 	}
 
+	// #5878: numeric interface-unit alias gate (#5631) as a BOTH-NODE-effective
+	// union. Runs PRE-expansion, beside the tunnel/zone/table-id gates, so a
+	// peer-only `groups node1`/`${node}` alias that collides only in the
+	// STANDBY node's effective view is rejected at commit even on a generic
+	// (non-node) compile — the union is a pure function of the candidate and
+	// verdict-identical across both nodes. Strict rejects; lenient warns
+	// (#1960). See validateInterfaceUnitAliasCollisionsAST.
+	unitAliasWarnings, unitAliasErr := validateInterfaceUnitAliasCollisionsAST(
+		tree, opts.lenientInterfaceUnitAliasCollisions)
+	if unitAliasErr != nil {
+		return nil, unitAliasErr
+	}
+
 	usedNodeFallback := false
 
 	// Expand groups before compilation — resolve all apply-groups references.
@@ -2277,6 +2290,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
+	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	return cfg, nil
 }
 
@@ -2467,6 +2481,19 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, dupBlockErr
 	}
 
+	// #5878: numeric interface-unit alias gate (#5631) as a BOTH-NODE-effective
+	// union — see compileConfigWithOpts. Pre-expansion on purpose: the union
+	// across View 1 (groups) + Views 2/3 (node0/node1 expansions) is identical
+	// on both nodes, so a `groups node1`/`${node}` alias that collides only in
+	// the peer's effective view is rejected here even when THIS commit compiles
+	// s.nodeID alone (the #5878 divergent-commit defect). Strict rejects on the
+	// operator commit / commit-check path; lenient warns on load / peer-sync.
+	unitAliasWarnings, unitAliasErr := validateInterfaceUnitAliasCollisionsAST(
+		tree, opts.lenientInterfaceUnitAliasCollisions)
+	if unitAliasErr != nil {
+		return nil, unitAliasErr
+	}
+
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 	if err := tree.ExpandGroupsWithVars(vars); err != nil {
 		return nil, fmt.Errorf("apply-groups: %w", err)
@@ -2489,6 +2516,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
+	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	return cfg, nil
 }
 
