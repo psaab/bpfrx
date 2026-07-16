@@ -3,6 +3,7 @@ package dhcpserver
 import (
 	"encoding/csv"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -205,7 +206,21 @@ func parseActiveLeasesFileInto(path string, family int, now time.Time, acc *ddns
 	r := csv.NewReader(f)
 	r.FieldsPerRecord = -1 // memfile rows vary across Kea versions
 	r.Comment = '#'
-	records, err := r.ReadAll()
+	// #4886 C: stream row-by-row (r.Read) instead of csv.ReadAll(). A Kea LFC
+	// memfile accumulates many historical rows between compactions; ReadAll
+	// materialized ALL of them ([][]string) before reducing to acc (which keeps
+	// only the latest row per address) — an O(history) transient that can OOM the
+	// control plane under lease churn. Read the header first (for schema
+	// validation), then fold each data row into acc as it is read: peak memory
+	// O(unique addresses), not O(history). acc keeps latest-per-address, so this
+	// is semantically identical to the pre-#4886 ReadAll path.
+	header, err := r.Read()
+	if err == io.EOF {
+		// No header at all — anomalous (Kea always writes a header). Fail SAFE
+		// (untrusted → Reconcile SKIPS the destructive diff), not trusted-empty.
+		return fmt.Errorf("parse %s: Kea %s lease file has no header (anomalous: mid-write or corrupt)",
+			path, familyLabel(family))
+	}
 	if err != nil {
 		return fmt.Errorf("parse %s: %w", path, err)
 	}
@@ -231,11 +246,6 @@ func parseActiveLeasesFileInto(path string, family int, now time.Time, acc *ddns
 	//      -rows treated as a legitimate trusted zero-lease (nil, nil): a
 	//      healthy header + no active rows genuinely means "no active
 	//      leases", and clearing owned DNS records is then correct.
-	if len(records) == 0 {
-		return fmt.Errorf("parse %s: Kea %s lease file has no header (anomalous: mid-write or corrupt)",
-			path, familyLabel(family))
-	}
-
 	// Build the header->index map with CASE-INSENSITIVE keys. Kea's real
 	// memfile headers are lower-case, but normalizing defends against a
 	// mangled header ("Address"/"ADDRESS") silently resolving to no column.
@@ -253,7 +263,7 @@ func parseActiveLeasesFileInto(path string, family int, now time.Time, acc *ddns
 	// can never drive a destructive diff. Names compared case-insensitively
 	// (two "Address"/"address" columns collide).
 	cols := make(map[string]int)
-	for i, h := range records[0] {
+	for i, h := range header {
 		key := strings.ToLower(strings.TrimSpace(h))
 		if _, dup := cols[key]; dup {
 			return fmt.Errorf("parse %s: duplicate column %q in Kea %s lease header (ambiguous)",
@@ -308,14 +318,12 @@ func parseActiveLeasesFileInto(path string, family int, now time.Time, acc *ddns
 		}
 	}
 
-	// Header is present AND valid. A file with only a header (zero data rows)
-	// is a LEGITIMATE trusted zero-lease contribution — return before the
-	// per-row loop, adding nothing to acc, so a genuinely-empty file in the LFC
-	// set contributes no leases (and, alone, correctly clears owned records).
-	if len(records) < 2 {
-		return nil
-	}
-
+	// Header is present AND valid. A file with only a header (zero data rows) is
+	// a LEGITIMATE trusted zero-lease contribution: the streaming loop below reads
+	// zero data rows and returns nil, adding nothing to acc, so a genuinely-empty
+	// file in the LFC set contributes no leases (and, alone, correctly clears
+	// owned records).
+	//
 	// Kea appends rows; the LAST row for an address is authoritative (lease
 	// renewal / state change). We keep the last seen row per address (across
 	// the whole LFC file set, via acc) and emit in first-appearance order. The
@@ -328,7 +336,16 @@ func parseActiveLeasesFileInto(path string, family int, now time.Time, acc *ddns
 	// recorded in acc.order whenever it first appears, tombstone or not. Output
 	// order is stable; the tombstone filter at emit time drops still-inactive
 	// ones.
-	for rowNum, fields := range records[1:] {
+	rowNum := -1
+	for {
+		fields, rerr := r.Read()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return fmt.Errorf("parse %s: %w", path, rerr)
+		}
+		rowNum++
 		// Row-conformance (Codex r6): a row too short to supply every
 		// required column cannot be read reliably. Treat the whole family's
 		// source as unreliable (torn/truncated memfile) rather than silently

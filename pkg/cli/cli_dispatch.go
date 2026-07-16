@@ -195,7 +195,28 @@ func filterStream(src io.Reader, out io.Writer, pipeType, pipeArg string) {
 // to the terminal a screenful at a time rather than being buffered whole in
 // memory first (#4709). At most one screen of lines (plus one lookahead line
 // and the OS pipe buffer) is ever held at once, regardless of total output.
+// stdoutIsTerminal reports whether the process-global os.Stdout is a real
+// terminal (#4886 B). It probes with TCGETS, NOT os.ModeCharDevice — /dev/null
+// is a CharDevice too (CLAUDE.md TTY-detection rule). A pipe (the `| match`
+// filter's os.Stdout redirect), a file redirect, or a non-interactive run all
+// read as non-terminal, so the pager auto-disables and cannot nest / hang.
+func stdoutIsTerminal() bool {
+	_, err := unix.IoctlGetTermios(int(os.Stdout.Fd()), unix.TCGETS)
+	return err == nil
+}
+
 func (c *CLI) dispatchWithPager(line string) error {
+	// #4886 B: only page when stdout is a real terminal. A non-TTY stdout means
+	// output is redirected — most importantly into the `| match/except/…` filter
+	// pipe: dispatchWithPipe redirects os.Stdout to the pipe, then calls dispatch,
+	// which routes a bare `show` back HERE. Engaging the pager then wrote
+	// `--More--` into the hidden outer pipe while blocking on os.Stdin, so
+	// `show … | match X` HUNG with no visible prompt; it also mis-paged
+	// scripted / file-redirected shows. Standard pager auto-disable (like less):
+	// when stdout is not a TTY, stream straight through with no pager.
+	if !stdoutIsTerminal() {
+		return c.dispatchOperational(line)
+	}
 	origStdout := os.Stdout
 	r, w, err := os.Pipe()
 	if err != nil {

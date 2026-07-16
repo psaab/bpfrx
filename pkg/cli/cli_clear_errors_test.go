@@ -53,6 +53,17 @@ func (d *clearFaultCLIDP) IterateSessionsV6(fn func(dataplane.SessionKeyV6, data
 	return d.iterV6Err
 }
 
+// #4886: cursor overrides for the bounded CLI clear — the table is under
+// cliClearFilteredBatch, so it clears in one chunk; delegate to the full scans
+// (preserving iterErr/iterV6Err so the enumeration-failure tests still fire).
+func (d *clearFaultCLIDP) IterateSessionsFrom(_ *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	return d.IterateSessions(fn)
+}
+
+func (d *clearFaultCLIDP) IterateSessionsV6From(_ *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return d.IterateSessionsV6(fn)
+}
+
 func (d *clearFaultCLIDP) DeleteSession(key dataplane.SessionKey) error {
 	if _, isForward := d.v4Sessions[key]; isForward {
 		return d.fwdDelErr
