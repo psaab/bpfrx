@@ -48289,6 +48289,32 @@ top.
   non-positive (e.g. MaxInt64 → -1m0s, 200000000 → -1790762h...) and
   time.NewTicker panics "non-positive interval for NewTicker"; restored GREEN.
 
+- **Timestamp**: 2026-07-10
+  **Action**: #5273 [HIGH dataplane/HA] pkg/dataplane/userspace: fail closed
+  event-stream listener startup and HA takeover readiness. `EventStream.Start`
+  now returns listener-ownership/bind errors, serializes socket ownership with
+  a process-lifetime sidecar lock, removes only kernel-table-proven stale socket
+  artifacts without dialing/displacing a live helper, and exposes the local
+  listener lifecycle via `ListenerBound`;
+  `ensureProcessLocked` aborts before helper spawn when the listener cannot
+  bind; and `takeoverReadyLocked` requires the local listener to be bound
+  without requiring the local helper to remain connected. This
+  prevents a node from silently starting without its primary push stream while
+  preserving the existing `DrainSessionDeltas` polling fallback for transient
+  disconnects. Fail-on-revert tests cover bind failure, listener lifecycle,
+  competing-owner isolation, stale-socket recovery, and
+  failed/bound-disconnected/bound-connected readiness.
+  **File(s)**: pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/process.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/eventstream_test.go,
+  pkg/dataplane/userspace/manager_ha_test.go,
+  pkg/dataplane/userspace/manager_sessionsync_test.go,
+  pkg/dataplane/userspace/process_eventstream_start_5273_test.go,
+  docs/session-sync-architecture.md, docs/ha-failover-status.md, _Log.md
+  **Validation**: `go build ./...` and
+  `go test -race -count=1 ./pkg/dataplane/userspace/...` passed on the original
+  PR head. The HA failover cluster gate remains required after restacking.
 ## #5267 event-stream FullResync seq-ordering (2026-07-10)
 - **Timestamp**: 2026-07-10
 - **Action**: Fix replay-gap FullResync written outside
