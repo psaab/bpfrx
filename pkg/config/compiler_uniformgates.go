@@ -490,6 +490,26 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5933 cross-subsystem interface `.unit`-suffix reference gate. Strict on
+	// commit / commit-check (hard-reject a class-of-service / security-zone /
+	// routing-instance interface reference whose `.unit` suffix is non-numeric /
+	// negative / out of range — such a reference silently MIS-BINDS: the CoS
+	// shaper never attaches, the zone-membership key never matches a real unit,
+	// the route-leak member is dropped). Lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 no-brick; the
+	// runtime already ignores an unresolvable `.unit` suffix, so a leniently-
+	// loaded malformed reference is inert). Routes every reference through the
+	// same canonical ValidateLogicalUnit #5829 introduced for the `interfaces
+	// <if> unit <n>` instance key, closing the residual #5829 deferred to #5933.
+	if err := validateInterfaceUnitReferencesStrict(cfg); err != nil {
+		if opts.lenientInterfaceUnitRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("interface unit reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3200 host-inbound-traffic token gate. Strict on commit / commit-check
 	// (hard-reject an unknown/typo system-services or protocols token that
 	// would commit but enforce inconsistently — nft kernel mirror fails OPEN

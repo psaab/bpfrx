@@ -339,15 +339,50 @@ The fix is fail-CLOSED at two layers, both keyed to one canonical validator
   deterministic warning instead of a silent drop.
 
 Valid numeric units (including the `0` and `16385` boundaries) compile
-bit-identically and reach the typed `ifc.Units` map. RESIDUAL: this pass types
-the `interfaces <if> unit <n>` slot; the cross-subsystem unit-reference grammar
-(class-of-service / security-zone / routing-instance interface references that
-carry a `.unit` suffix) still parses the suffix without this validator and is a
-follow-up (issue #5829 "every unit-reference slot"). Covered by
+bit-identically and reach the typed `ifc.Units` map. This pass types the
+`interfaces <if> unit <n>` slot; the cross-subsystem `.unit`-reference grammar is
+closed by #5933 (below). Covered by
 `pkg/config/interface_unit_nonnumeric_5829_test.go` (strict reject via both
 gates naming the interface + token, valid-unit-reaches-map, lenient
 warn-and-quarantine), RED on revert of either the `keyValidator` or the compiler
 gate.
+
+### Cross-subsystem interface `.unit`-reference validation (#5933)
+
+The residual #5829 deferred: three subsystems reference an interface by a
+`<if>.<unit>` string (NOT the `interfaces <if> unit <n>` instance key), and each
+parsed the `.unit` suffix WITHOUT `ValidateLogicalUnit`:
+
+- **class-of-service** — `class-of-service interfaces <if>.<unit>` (the shaper /
+  classifier binding; the reference is the `cos.Interfaces` map key);
+- **security-zone membership** — `security zones security-zone <z> interfaces
+  <if>.<unit>` (`zone.Interfaces`);
+- **routing-instance membership** — `routing-instances <ri> interface
+  <if>.<unit>` (`ri.Interfaces`; the route-leak / VRF member split is
+  `strings.Cut` + `strconv.Atoi` with a bare `continue` on error).
+
+None fail-open a firewall FILTER (filters bind only inside the now-gated
+`interfaces <if> unit <n>` loop — materiality confirmed lower than #5829's core
+in the #5932 review), but a malformed `.unit` there silently **mis-binds**: the
+CoS shaper never attaches, the zone-membership key never matches a configured
+unit, the route-leak member is dropped — a committed reference that carries no
+effect.
+
+The fix (`validateInterfaceUnitReferencesStrict`, `compiler_validate_strict_unitref.go`,
+dispatched from `runUniformGates` after the zone-interface-defined gate) routes
+every `.unit` suffix through the SAME canonical `ValidateLogicalUnit`, splitting
+on the FIRST `.` exactly as each subsystem's runtime does so schema acceptance
+matches runtime binding. A bare interface (no `.`) or a trailing-dot bare form
+(`base.`) carries no unit and is skipped. Strict on commit / commit-check
+(hard-reject); the `lenientInterfaceUnitRef` opt downgrades it to a `cfg.Warnings`
+entry on the tolerant load / peer-sync paths (#1960 no-brick — the runtime already
+ignores an unresolvable `.unit` suffix, so a leniently-loaded malformed reference
+is inert). This is a compiler-layer gate only: unlike #5829's dedicated numeric
+`unit` instance key, the interface-name token here is a free wildcard (legitimately
+bare OR unit-qualified), so a schema `keyValidator` would over-reject bare names.
+Covered by `pkg/config/interface_unit_ref_5933_test.go` (per-subsystem strict
+reject naming the subsystem + bad token, valid-unit accepted, bare-interface
+accepted, lenient warn), each subsystem independently RED on revert.
 
 ### security address-book same-name `address` + `address-set` collision (#5676)
 

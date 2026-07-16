@@ -1897,6 +1897,19 @@ type compileOpts struct {
 	// paths anyway).
 	lenientNonNumericUnit bool
 
+	// lenientInterfaceUnitRef (#5933) downgrades the cross-subsystem interface
+	// `.unit`-suffix reference gate (a malformed logical unit in a
+	// class-of-service / security-zone / routing-instance interface reference)
+	// from a hard compile error to a cfg.Warnings entry. Strict commit /
+	// commit-check hard-reject so a malformed `.unit` reference cannot commit and
+	// then silently mis-bind (the CoS shaper never attaches, the zone-membership
+	// key never matches, the route-leak member is dropped). Set ONLY on the
+	// tolerant load / peer-sync paths so a config an older binary already
+	// persisted — which silently ignored the bad reference — still BOOTS, now
+	// with a deterministic warning. Same doctrine as lenientNonNumericUnit
+	// (#5829); this closes the residual #5829 deferred to #5933.
+	lenientInterfaceUnitRef bool
+
 	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
 	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
 	// check-config`) into compileExpanded so it can be stamped onto the
@@ -2049,6 +2062,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,
 		lenientNonNumericUnit:                  true,
+		lenientInterfaceUnitRef:                true,
 	})
 }
 
@@ -2405,6 +2419,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,
 		lenientNonNumericUnit:                  true,
+		lenientInterfaceUnitRef:                true,
 	})
 }
 
