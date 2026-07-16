@@ -4626,7 +4626,7 @@ func TestBulkSyncRedriveWhenOnlyInboundCompleted(t *testing.T) {
 	ss.stats.Connected.Store(true)
 	ss.mu.Unlock()
 
-	// Drain the survivor so the re-drive's post-override sendBulkMarkers write
+	// Drain the survivor so the re-drive's post-override BulkSync marker write
 	// (BulkStart/BulkEnd) completes and its goroutine returns cleanly.
 	go func() {
 		for {
@@ -4670,7 +4670,7 @@ func TestBulkSyncRedriveInFlightGuard(t *testing.T) {
 		return nil
 	}
 
-	// Survivor drainer so the post-release sendBulkMarkers write completes.
+	// Survivor drainer so the post-release BulkSync marker write completes.
 	go func() {
 		for {
 			if _, _, err := readSyncFrame(c1peer); err != nil {
