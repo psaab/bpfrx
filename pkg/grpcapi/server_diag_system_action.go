@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/clusterfailover"
 	"github.com/psaab/xpf/pkg/configstore"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
@@ -341,146 +342,22 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		return &pb.SystemActionResponse{Message: msg}, nil
 
 	default:
-		// Handle cluster failover actions: "cluster-failover:<rgID>" and "cluster-failover-reset:<rgID>"
-		if strings.HasPrefix(req.Action, "cluster-failover-reset:") {
+		// All cluster-failover actions (plain RG / targeted RG / data / reset)
+		// share ONE strict grammar with the two CLIs and the fabric interceptor
+		// (pkg/clusterfailover). Parsing here rejects a malformed selector, an
+		// empty/duplicate/trailing node suffix, or an out-of-range node with
+		// InvalidArgument BEFORE any cluster call or peer dial — the old
+		// per-form ad-hoc parsing let `cluster-failover:1:node` (empty suffix)
+		// fall through to an untargeted ManualFailover (#5810, #5851).
+		if clusterfailover.IsFailoverAction(req.Action) {
 			if s.cluster == nil {
 				return nil, status.Error(codes.Unavailable, "cluster not configured")
 			}
-			rgStr := strings.TrimPrefix(req.Action, "cluster-failover-reset:")
-			rgID, err := strconv.Atoi(rgStr)
+			op, err := clusterfailover.ParseAction(req.Action)
 			if err != nil {
-				return nil, status.Errorf(codes.InvalidArgument, "invalid redundancy-group ID: %s", rgStr)
+				return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 			}
-			if err := s.cluster.ResetFailover(rgID); err != nil {
-				return nil, status.Errorf(codes.NotFound, "%v", err)
-			}
-			return &pb.SystemActionResponse{
-				Message: fmt.Sprintf("Failover reset for redundancy group %d", rgID),
-			}, nil
-		}
-		if strings.HasPrefix(req.Action, "cluster-failover-data:node") {
-			if s.cluster == nil {
-				return nil, status.Error(codes.Unavailable, "cluster not configured")
-			}
-			nodeStr := strings.TrimPrefix(req.Action, "cluster-failover-data:node")
-			targetNode, err := strconv.Atoi(nodeStr)
-			if err != nil {
-				return nil, status.Errorf(codes.InvalidArgument, "invalid node ID: %s", nodeStr)
-			}
-			if !cluster.IsSupportedClusterNodeID(targetNode) {
-				return nil, status.Errorf(codes.InvalidArgument, "unsupported cluster failover target node %d", targetNode)
-			}
-			if targetNode != s.cluster.NodeID() {
-				if peerForwardedFromContext(ctx) {
-					return nil, status.Errorf(codes.FailedPrecondition, "forwarded cluster failover target node %d is not local", targetNode)
-				}
-				resp, err := s.proxyPeerSystemAction(ctx, req)
-				if err != nil {
-					if st, ok := status.FromError(err); ok {
-						return nil, st.Err()
-					}
-					return nil, status.Errorf(codes.Unavailable, "peer cluster failover proxy failed: %v", err)
-				}
-				return resp, nil
-			}
-
-			dataRGs := s.cluster.DataGroupIDs()
-			if len(dataRGs) == 0 {
-				return nil, status.Error(codes.FailedPrecondition, "no data redundancy groups configured")
-			}
-			moveRGs := make([]int, 0, len(dataRGs))
-			for _, rgID := range dataRGs {
-				if !s.cluster.IsLocalPrimary(rgID) {
-					moveRGs = append(moveRGs, rgID)
-				}
-			}
-			if len(moveRGs) == 0 {
-				return &pb.SystemActionResponse{
-					Message: fmt.Sprintf("All data redundancy groups are already primary on node %d", targetNode),
-				}, nil
-			}
-			if len(moveRGs) == 1 {
-				if err := s.cluster.RequestPeerFailover(moveRGs[0]); err != nil {
-					return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
-				}
-			} else {
-				if err := s.cluster.RequestPeerFailoverBatch(moveRGs); err != nil {
-					return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
-				}
-			}
-			return &pb.SystemActionResponse{
-				Message: fmt.Sprintf("Manual failover completed for data redundancy groups %v (transfer committed)", moveRGs),
-			}, nil
-		}
-		if strings.HasPrefix(req.Action, "cluster-failover:") {
-			if s.cluster == nil {
-				return nil, status.Error(codes.Unavailable, "cluster not configured")
-			}
-			rest := strings.TrimPrefix(req.Action, "cluster-failover:")
-
-			// Parse "cluster-failover:<rgID>[:node<N>]"
-			var rgStr, nodeStr string
-			if idx := strings.Index(rest, ":node"); idx >= 0 {
-				rgStr = rest[:idx]
-				nodeStr = rest[idx+5:] // skip ":node"
-			} else {
-				rgStr = rest
-			}
-
-			rgID, err := strconv.Atoi(rgStr)
-			if err != nil {
-				return nil, status.Errorf(codes.InvalidArgument, "invalid redundancy-group ID: %s", rgStr)
-			}
-
-			// If "node <N>" specified, route to correct node.
-			if nodeStr != "" {
-				targetNode, err := strconv.Atoi(nodeStr)
-				if err != nil {
-					return nil, status.Errorf(codes.InvalidArgument, "invalid node ID: %s", nodeStr)
-				}
-				// Reject an out-of-range node before the local/proxy routing
-				// decision (#4693, #4125 class). Without this a local caller's
-				// `cluster-failover:<rg>:node99` fell through to the outbound
-				// proxy-dial path (targetNode != NodeID), driving avoidable
-				// peer dials to a node ID that cannot exist. The sibling
-				// cluster-failover-data:node branch already validates this way.
-				if !cluster.IsSupportedClusterNodeID(targetNode) {
-					return nil, status.Errorf(codes.InvalidArgument, "unsupported cluster failover target node %d", targetNode)
-				}
-				if targetNode != s.cluster.NodeID() {
-					if peerForwardedFromContext(ctx) {
-						return nil, status.Errorf(codes.FailedPrecondition, "forwarded cluster failover target node %d is not local", targetNode)
-					}
-					resp, err := s.proxyPeerSystemAction(ctx, req)
-					if err != nil {
-						if st, ok := status.FromError(err); ok {
-							return nil, st.Err()
-						}
-						return nil, status.Errorf(codes.Unavailable, "peer cluster failover proxy failed: %v", err)
-					}
-					return resp, nil
-				}
-				// Target is local — make us primary.
-				if s.cluster.IsLocalPrimary(rgID) {
-					return &pb.SystemActionResponse{
-						Message: fmt.Sprintf("Redundancy group %d is already primary on node %d", rgID, targetNode),
-					}, nil
-				}
-				// Ask peer to transfer out so we can take primary.
-				if err := s.cluster.RequestPeerFailover(rgID); err != nil {
-					return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
-				}
-				return &pb.SystemActionResponse{
-					Message: fmt.Sprintf("Manual failover completed for redundancy group %d (transfer committed)", rgID),
-				}, nil
-			}
-
-			if err := s.cluster.ManualFailover(rgID); err != nil {
-				return nil, status.Errorf(codes.NotFound, "%v", err)
-			}
-			return &pb.SystemActionResponse{
-				Message: fmt.Sprintf("Manual failover triggered for redundancy group %d", rgID),
-			}, nil
+			return s.executeClusterFailover(ctx, req, op)
 		}
 		if strings.HasPrefix(req.Action, "userspace-inject:") {
 			provider, err := s.userspaceDataplaneControl()
@@ -584,4 +461,106 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		}
 		return nil, status.Errorf(codes.InvalidArgument, "unknown action: %s", req.Action)
 	}
+}
+
+// executeClusterFailover runs a parsed, validated cluster-failover op. The
+// shared grammar (pkg/clusterfailover) has already rejected malformed input, an
+// out-of-range node, and empty/duplicate/trailing suffixes, so no branch here
+// re-validates the action string — they only ROUTE (local execution vs. peer
+// proxy). Because both CLIs, this loopback handler, and the fabric interceptor
+// share that one parser, any form reaching this method is one all layers agree
+// is well-formed; the fabric allowlist may still deny a valid local-only form
+// (plain RG failover / reset) by policy, but never by a divergent parse.
+func (s *Server) executeClusterFailover(ctx context.Context, req *pb.SystemActionRequest, op clusterfailover.Op) (*pb.SystemActionResponse, error) {
+	switch op.Kind {
+	case clusterfailover.KindReset:
+		if err := s.cluster.ResetFailover(op.RG); err != nil {
+			return nil, status.Errorf(codes.NotFound, "%v", err)
+		}
+		return &pb.SystemActionResponse{
+			Message: fmt.Sprintf("Failover reset for redundancy group %d", op.RG),
+		}, nil
+
+	case clusterfailover.KindDataFailover:
+		targetNode := op.Node
+		if targetNode != s.cluster.NodeID() {
+			if peerForwardedFromContext(ctx) {
+				return nil, status.Errorf(codes.FailedPrecondition, "forwarded cluster failover target node %d is not local", targetNode)
+			}
+			resp, err := s.proxyPeerSystemAction(ctx, req)
+			if err != nil {
+				if st, ok := status.FromError(err); ok {
+					return nil, st.Err()
+				}
+				return nil, status.Errorf(codes.Unavailable, "peer cluster failover proxy failed: %v", err)
+			}
+			return resp, nil
+		}
+		dataRGs := s.cluster.DataGroupIDs()
+		if len(dataRGs) == 0 {
+			return nil, status.Error(codes.FailedPrecondition, "no data redundancy groups configured")
+		}
+		moveRGs := make([]int, 0, len(dataRGs))
+		for _, rgID := range dataRGs {
+			if !s.cluster.IsLocalPrimary(rgID) {
+				moveRGs = append(moveRGs, rgID)
+			}
+		}
+		if len(moveRGs) == 0 {
+			return &pb.SystemActionResponse{
+				Message: fmt.Sprintf("All data redundancy groups are already primary on node %d", targetNode),
+			}, nil
+		}
+		if len(moveRGs) == 1 {
+			if err := s.cluster.RequestPeerFailover(moveRGs[0]); err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+			}
+		} else {
+			if err := s.cluster.RequestPeerFailoverBatch(moveRGs); err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+			}
+		}
+		return &pb.SystemActionResponse{
+			Message: fmt.Sprintf("Manual failover completed for data redundancy groups %v (transfer committed)", moveRGs),
+		}, nil
+
+	case clusterfailover.KindRGFailoverNode:
+		targetNode := op.Node
+		if targetNode != s.cluster.NodeID() {
+			if peerForwardedFromContext(ctx) {
+				return nil, status.Errorf(codes.FailedPrecondition, "forwarded cluster failover target node %d is not local", targetNode)
+			}
+			resp, err := s.proxyPeerSystemAction(ctx, req)
+			if err != nil {
+				if st, ok := status.FromError(err); ok {
+					return nil, st.Err()
+				}
+				return nil, status.Errorf(codes.Unavailable, "peer cluster failover proxy failed: %v", err)
+			}
+			return resp, nil
+		}
+		// Target is local — make us primary.
+		if s.cluster.IsLocalPrimary(op.RG) {
+			return &pb.SystemActionResponse{
+				Message: fmt.Sprintf("Redundancy group %d is already primary on node %d", op.RG, targetNode),
+			}, nil
+		}
+		// Ask peer to transfer out so we can take primary.
+		if err := s.cluster.RequestPeerFailover(op.RG); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		return &pb.SystemActionResponse{
+			Message: fmt.Sprintf("Manual failover completed for redundancy group %d (transfer committed)", op.RG),
+		}, nil
+
+	case clusterfailover.KindRGFailover:
+		if err := s.cluster.ManualFailover(op.RG); err != nil {
+			return nil, status.Errorf(codes.NotFound, "%v", err)
+		}
+		return &pb.SystemActionResponse{
+			Message: fmt.Sprintf("Manual failover triggered for redundancy group %d", op.RG),
+		}, nil
+	}
+	// ParseAction only yields the four kinds above; defensive fallthrough.
+	return nil, status.Errorf(codes.InvalidArgument, "unknown action: %s", req.Action)
 }

@@ -4,9 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 
-	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/clusterfailover"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 )
@@ -36,47 +35,37 @@ func (c *CLI) handleRequestChassis(args []string) error {
 }
 
 func (c *CLI) handleRequestChassisClusterFailover(args []string) error {
+	// One strict grammar, shared with the remote CLI and the gRPC handler
+	// (pkg/clusterfailover). Parse BEFORE the nil-cluster / routing decision so
+	// a malformed selector or out-of-range node is rejected without any cluster
+	// call or peer dial — the old per-form gates degraded a misspelled/missing
+	// `node` selector into an untargeted ManualFailover (#5810).
+	op, err := clusterfailover.ParseCommand(args)
+	if err != nil {
+		return err
+	}
 	if c.cluster == nil {
 		return fmt.Errorf("cluster not configured")
 	}
-	// "request chassis cluster failover reset redundancy-group <N>"
-	if len(args) >= 1 && args[0] == "reset" {
-		if len(args) < 3 || args[1] != "redundancy-group" {
-			return fmt.Errorf("usage: request chassis cluster failover reset redundancy-group <N>")
-		}
-		rgID, err := strconv.Atoi(args[2])
-		if err != nil {
-			return fmt.Errorf("invalid redundancy-group ID: %s", args[2])
-		}
-		if err := c.cluster.ResetFailover(rgID); err != nil {
+
+	switch op.Kind {
+	case clusterfailover.KindReset:
+		if err := c.cluster.ResetFailover(op.RG); err != nil {
 			return err
 		}
-		fmt.Printf("Failover reset for redundancy group %d\n", rgID)
+		fmt.Printf("Failover reset for redundancy group %d\n", op.RG)
 		return nil
-	}
 
-	// "request chassis cluster failover data node <N>"
-	if len(args) >= 3 && args[0] == "data" && args[1] == "node" {
-		targetNode, err := strconv.Atoi(args[2])
-		if err != nil {
-			return fmt.Errorf("invalid node ID: %s", args[2])
-		}
-		if !cluster.IsSupportedClusterNodeID(targetNode) {
-			return fmt.Errorf("unsupported cluster failover target node %d", targetNode)
-		}
-		localNode := c.cluster.NodeID()
-		if targetNode != localNode {
-			message, err := c.requestPeerSystemAction(
-				context.Background(),
-				fmt.Sprintf("cluster-failover-data:node%d", targetNode),
-			)
+	case clusterfailover.KindDataFailover:
+		targetNode := op.Node
+		if targetNode != c.cluster.NodeID() {
+			message, err := c.requestPeerSystemAction(context.Background(), op.Action())
 			if err != nil {
 				return err
 			}
 			fmt.Println(message)
 			return nil
 		}
-
 		dataRGs := c.cluster.DataGroupIDs()
 		if len(dataRGs) == 0 {
 			return fmt.Errorf("no data redundancy groups configured")
@@ -102,48 +91,32 @@ func (c *CLI) handleRequestChassisClusterFailover(args []string) error {
 		}
 		fmt.Printf("Manual failover completed for data redundancy groups %v (transfer committed)\n", moveRGs)
 		return nil
-	}
 
-	// "request chassis cluster failover redundancy-group <N> [node <N>]"
-	if len(args) >= 2 && args[0] == "redundancy-group" {
-		rgID, err := strconv.Atoi(args[1])
-		if err != nil {
-			return fmt.Errorf("invalid redundancy-group ID: %s", args[1])
-		}
-
-		// If "node <N>" is specified, route to the correct node.
-		if len(args) >= 4 && args[2] == "node" {
-			targetNode, err := strconv.Atoi(args[3])
-			if err != nil {
-				return fmt.Errorf("invalid node ID: %s", args[3])
-			}
-			localNode := c.cluster.NodeID()
-			if targetNode == localNode {
-				if err := c.cluster.RequestPeerFailover(rgID); err != nil {
-					return err
-				}
-				fmt.Printf("Manual failover completed for redundancy group %d (transfer committed)\n", rgID)
-				return nil
-			}
-			message, err := c.requestPeerSystemAction(
-				context.Background(),
-				fmt.Sprintf("cluster-failover:%d:node%d", rgID, targetNode),
-			)
-			if err != nil {
+	case clusterfailover.KindRGFailoverNode:
+		if op.Node == c.cluster.NodeID() {
+			if err := c.cluster.RequestPeerFailover(op.RG); err != nil {
 				return err
 			}
-			fmt.Println(message)
+			fmt.Printf("Manual failover completed for redundancy group %d (transfer committed)\n", op.RG)
 			return nil
 		}
-
-		if err := c.cluster.ManualFailover(rgID); err != nil {
+		message, err := c.requestPeerSystemAction(context.Background(), op.Action())
+		if err != nil {
 			return err
 		}
-		fmt.Printf("Manual failover triggered for redundancy group %d\n", rgID)
+		fmt.Println(message)
+		return nil
+
+	case clusterfailover.KindRGFailover:
+		if err := c.cluster.ManualFailover(op.RG); err != nil {
+			return err
+		}
+		fmt.Printf("Manual failover triggered for redundancy group %d\n", op.RG)
 		return nil
 	}
 
-	return fmt.Errorf("usage: request chassis cluster failover {redundancy-group <N> [node <N>] | data node <N>}")
+	// ParseCommand only returns the four kinds above; this is unreachable.
+	return fmt.Errorf("%s", clusterfailover.CommandUsage)
 }
 
 func (c *CLI) handleRequestChassisClusterDataPlane(args []string) error {
