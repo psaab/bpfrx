@@ -1097,13 +1097,19 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 		req.Application == "" && req.Interface == "" &&
 		!req.NatOnly && req.SourceNatPool == "" {
 		v4, v6, err := s.dp.ClearAllSessions()
-		if err != nil {
-			// Bulk clear-all is atomic in the dataplane: a failure means
-			// nothing was reliably cleared, so this stays a hard RPC error
-			// rather than a partial-success count.
-			return nil, status.Errorf(codes.Internal, "%v", err)
-		}
 		var agg clearErrors
+		// Chunked clear-all is NON-atomic (#5882): ClearAllSessions walks and
+		// deletes the IPv4 table, THEN the IPv6 table (clearSessionsChunkedV4
+		// then …V6 in maps_session.go), so a V6-phase failure can leave IPv4
+		// already fully deleted. ClearAllSessions returns the PARTIAL v4/v6
+		// counts alongside the error, so surface them via the response
+		// Failures / FailureSummary instead of discarding them behind a bare
+		// RPC error — EXACTLY as the filtered clear path below does. An
+		// operator/monitor then learns what was actually revoked (e.g. IPv4
+		// cleared, IPv6 failed → retry only IPv6) instead of "0 cleared + hard
+		// error". agg.add ignores a nil err, so the success path is unchanged
+		// (Failures==0, accurate counts).
+		agg.add("clear-all", err)
 		if !forwarded {
 			agg.add("peer clear", s.clearPeerSessions(req))
 		}
