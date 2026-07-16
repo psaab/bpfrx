@@ -505,8 +505,11 @@ func (m *Manager) GetLeases6() ([]Lease, error) {
 	return parseLeaseCSV(m.leaseFile(6), time.Now())
 }
 
-// parseLeaseCSV parses Kea's append-only memfile CSV and returns the
-// CURRENT, ACTIVE leases for display (`show dhcp server leases`).
+// parseLeaseCSV parses Kea's append-only memfile CSV set and returns the
+// CURRENT, ACTIVE leases for display (`show dhcp server leases`). #5796: it
+// reads the FULL Kea LFC file set (previous `.2`, input `.1`, current) and
+// merges them, so the display never omits the compacted active leases that live
+// in the previous/input files right after an LFC rotation.
 //
 // Kea never rewrites the memfile in place between lease-file-cleanup
 // (LFC) compactions: every renewal, re-allocation, release, decline,
@@ -529,13 +532,55 @@ func (m *Manager) GetLeases6() ([]Lease, error) {
 // pre-#2085 behaviour for older Kea or exotic headers rather than
 // blanking the whole `show` on one odd row. now is injected so the
 // expiry comparison is deterministic in tests.
+// leaseCSVAccum accumulates the lenient last-row-wins display disposition per
+// address ACROSS the Kea LFC file set (#5796). A zero Lease (empty Address) is a
+// TOMBSTONE meaning the last row seen for that address (in chronological
+// file+row order) was inactive/expired. order keeps first-appearance order so
+// the display is stable and deterministic.
+type leaseCSVAccum struct {
+	latest map[string]Lease
+	order  []string
+	seen   map[string]struct{}
+}
+
 func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
+	acc := &leaseCSVAccum{
+		latest: make(map[string]Lease),
+		seen:   make(map[string]struct{}),
+	}
+	// #5796: read the whole Kea LFC file set (previous .2 → input .1 → current)
+	// in chronological order and merge, so `show dhcp server leases` does not
+	// omit the compacted active set that lives in the previous/input files right
+	// after an LFC rotation. A missing .1/.2 (the common no-LFC case) collapses
+	// the set to exactly the current file, byte-identical to the pre-#5796 read.
+	for _, f := range keaLFCLeaseFilePaths(path) {
+		if err := parseLeaseCSVFileInto(f, now, acc); err != nil {
+			return nil, err
+		}
+	}
+
+	leases := make([]Lease, 0, len(acc.order))
+	for _, addr := range acc.order {
+		if l := acc.latest[addr]; l.Address != "" {
+			leases = append(leases, l)
+		}
+	}
+	if len(leases) == 0 {
+		return nil, nil
+	}
+	return leases, nil
+}
+
+// parseLeaseCSVFileInto reads ONE Kea LFC-set file into acc using the lenient
+// display semantics. A genuinely-missing file is skipped (nil); a
+// non-IsNotExist open error is returned so the display surfaces it.
+func parseLeaseCSVFileInto(path string, now time.Time, acc *leaseCSVAccum) error {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil
 		}
-		return nil, err
+		return err
 	}
 	defer f.Close()
 
@@ -559,7 +604,8 @@ func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 
 	// cols maps header name -> column index; it stays nil until the
 	// first successful record (the header) is read. field() reads a named
-	// column out of a data row.
+	// column out of a data row. cols is FILE-LOCAL: each LFC-set file
+	// carries its own header.
 	var cols map[string]int
 	field := func(fields []string, name string) string {
 		if idx, ok := cols[name]; ok && idx >= 0 && idx < len(fields) {
@@ -567,16 +613,6 @@ func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 		}
 		return ""
 	}
-
-	// latest holds the final disposition per address; a zero Lease
-	// (empty Address) is a TOMBSTONE meaning the last row for that
-	// address was inactive/expired. order keeps first-appearance order
-	// so the display is stable and deterministic. Re-recording the
-	// disposition on every row lets a later active append RECLAIM an
-	// address an earlier row tombstoned (release-then-reallocate).
-	latest := make(map[string]Lease)
-	order := make([]string, 0)
-	seen := make(map[string]struct{})
 	nowUnix := now.Unix()
 
 	for {
@@ -597,7 +633,9 @@ func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 		}
 		if cols == nil {
 			// First successful record is the header; build the column
-			// index map and move on (mirrors the old records[0]).
+			// index map and move on (mirrors the old records[0]). A file
+			// with no header at all contributes nothing (the lenient
+			// display never errors on it).
 			cols = make(map[string]int, len(fields))
 			for i, h := range fields {
 				cols[h] = i
@@ -609,9 +647,9 @@ func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 		if addr == "" {
 			continue
 		}
-		if _, ok := seen[addr]; !ok {
-			seen[addr] = struct{}{}
-			order = append(order, addr)
+		if _, ok := acc.seen[addr]; !ok {
+			acc.seen[addr] = struct{}{}
+			acc.order = append(acc.order, addr)
 		}
 
 		// State filter (lenient): only Kea's default state (0 = active)
@@ -622,7 +660,7 @@ func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 		// active append can still reclaim it.
 		if s := field(fields, "state"); s != "" {
 			if st, e := strconv.Atoi(s); e == nil && st != 0 {
-				latest[addr] = Lease{}
+				acc.latest[addr] = Lease{}
 				continue
 			}
 		}
@@ -633,12 +671,12 @@ func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 		expireStr := field(fields, "expire")
 		if expireStr != "" {
 			if exp, e := strconv.ParseInt(expireStr, 10, 64); e == nil && exp > 0 && nowUnix >= exp {
-				latest[addr] = Lease{}
+				acc.latest[addr] = Lease{}
 				continue
 			}
 		}
 
-		latest[addr] = Lease{
+		acc.latest[addr] = Lease{
 			Address:    addr,
 			HWAddress:  field(fields, "hwaddr"),
 			Hostname:   field(fields, "hostname"),
@@ -648,24 +686,7 @@ func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 		}
 	}
 
-	if cols == nil {
-		// No header row was ever read (empty file, comment-only file, or
-		// a file whose only line was malformed). Mirrors the old
-		// len(records) < 2 ⇒ nil,nil guard. A header-only file falls
-		// through with an empty order and returns nil,nil below.
-		return nil, nil
-	}
-
-	leases := make([]Lease, 0, len(order))
-	for _, addr := range order {
-		if l := latest[addr]; l.Address != "" {
-			leases = append(leases, l)
-		}
-	}
-	if len(leases) == 0 {
-		return nil, nil
-	}
-	return leases, nil
+	return nil
 }
 
 // subnetInterface returns the per-subnet interface binding for a
