@@ -57,7 +57,9 @@ func TestPreflightCheckIfindexCaps_WithinCap(t *testing.T) {
 		makeFakeLink("fab0", int(MaxInterfaces-1)),
 	}, nil)
 	m := &Manager{}
-	if err := m.preflightCheckIfindexCaps(); err != nil {
+	// All three links are XPF-referenced and within cap.
+	referenced := ifindexSet([]int{1, 2, int(MaxInterfaces - 1)})
+	if err := m.preflightCheckIfindexCaps(referenced); err != nil {
 		t.Fatalf("preflightCheckIfindexCaps returned %v, want nil", err)
 	}
 }
@@ -69,7 +71,8 @@ func TestPreflightCheckIfindexCaps_OverCap(t *testing.T) {
 		makeFakeLink("fab0", over),
 	}, nil)
 	m := &Manager{}
-	err := m.preflightCheckIfindexCaps()
+	// fab0 IS referenced (XPF attaches to it) and is over cap: must fail.
+	err := m.preflightCheckIfindexCaps(ifindexSet([]int{1, over}))
 	if err == nil {
 		t.Fatal("preflightCheckIfindexCaps returned nil, want error")
 	}
@@ -88,7 +91,7 @@ func TestPreflightCheckIfindexCaps_AtCapFails(t *testing.T) {
 		makeFakeLink("fab0", int(MaxInterfaces)),
 	}, nil)
 	m := &Manager{}
-	if err := m.preflightCheckIfindexCaps(); err == nil {
+	if err := m.preflightCheckIfindexCaps(ifindexSet([]int{int(MaxInterfaces)})); err == nil {
 		t.Fatal("preflightCheckIfindexCaps at cap returned nil, want error")
 	}
 }
@@ -97,9 +100,87 @@ func TestPreflightCheckIfindexCaps_NetlinkErrorIsNonFatal(t *testing.T) {
 	withFakeLinkLister(t, nil, errors.New("netlink temporary failure"))
 	m := &Manager{}
 	// The preflight must NOT abort compile on a transient netlink error
-	// — the call-site cap checks remain the real guardrail.
-	if err := m.preflightCheckIfindexCaps(); err != nil {
+	// — the call-site cap checks remain the real guardrail. Pass a
+	// non-empty referenced set so the linkLister call is actually reached.
+	if err := m.preflightCheckIfindexCaps(ifindexSet([]int{1})); err != nil {
 		t.Fatalf("preflightCheckIfindexCaps on netlink error returned %v, want nil", err)
+	}
+}
+
+// TestPreflightCheckIfindexCaps_UnrelatedHighIfindexIgnored is the #5836
+// fix: an unrelated host link (a bridge, veth, container link, or abandoned
+// operator netdev) with an ifindex >= MaxInterfaces that XPF does NOT
+// reference must NOT fail the compile. Only XPF-referenced links can key a
+// dense per-interface map, so only they are cap-checked.
+//
+// Fail-on-revert: neutralize the scope (make the loop reject every high
+// ifindex regardless of `referenced`, i.e. restore the whole-namespace
+// check) and this test goes RED because the unrelated br-lan link is
+// wrongly rejected.
+func TestPreflightCheckIfindexCaps_UnrelatedHighIfindexIgnored(t *testing.T) {
+	unrelated := int(MaxInterfaces) + 4242
+	withFakeLinkLister(t, []netlink.Link{
+		makeFakeLink("lo", 1),
+		makeFakeLink("ge-0-0-0", 6),
+		makeFakeLink("ge-0-0-1", 7),
+		// Unrelated management bridge that churned past the cap. Not in the
+		// XPF port set.
+		makeFakeLink("br-lan", unrelated),
+	}, nil)
+	m := &Manager{}
+	// XPF references only its two dataplane ports, both within cap.
+	referenced := ifindexSet([]int{6, 7})
+	if err := m.preflightCheckIfindexCaps(referenced); err != nil {
+		t.Fatalf("unrelated high-ifindex link wrongly failed the compile: %v", err)
+	}
+}
+
+// TestPreflightCheckIfindexCaps_ReferencedHighIfindexRejected proves the
+// real fail-closed guard is preserved: an XPF-referenced / map-bound link
+// with ifindex >= MaxInterfaces still fails, with a legible error naming
+// the interface and the remediation pointer.
+//
+// Fail-on-revert: neutralize the real guard (drop the `>= MaxInterfaces`
+// comparison / always return nil) and this test goes RED.
+func TestPreflightCheckIfindexCaps_ReferencedHighIfindexRejected(t *testing.T) {
+	over := int(MaxInterfaces) + 7
+	withFakeLinkLister(t, []netlink.Link{
+		makeFakeLink("lo", 1),
+		// An unrelated link that is ALSO over cap but not referenced —
+		// it must not be what triggers the error.
+		makeFakeLink("br-lan", int(MaxInterfaces)+9000),
+		// XPF's own dataplane port pushed past the cap.
+		makeFakeLink("ge-0-0-2", over),
+	}, nil)
+	m := &Manager{}
+	err := m.preflightCheckIfindexCaps(ifindexSet([]int{1, over}))
+	if err == nil {
+		t.Fatal("referenced over-cap link returned nil, want fail-closed error")
+	}
+	if !strings.Contains(err.Error(), "ge-0-0-2") {
+		t.Fatalf("error must name the referenced offending interface, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "br-lan") {
+		t.Fatalf("error wrongly blamed the unrelated link: %v", err)
+	}
+	if !strings.Contains(err.Error(), "MAX_INTERFACES") {
+		t.Fatalf("error missing remediation pointer: %v", err)
+	}
+}
+
+// TestPreflightCheckIfindexCaps_EmptyReferencedPasses confirms that when
+// XPF references no interfaces (empty/nil set), the preflight is a no-op
+// even if the host namespace holds a high-ifindex link.
+func TestPreflightCheckIfindexCaps_EmptyReferencedPasses(t *testing.T) {
+	withFakeLinkLister(t, []netlink.Link{
+		makeFakeLink("br-lan", int(MaxInterfaces)+1),
+	}, nil)
+	m := &Manager{}
+	if err := m.preflightCheckIfindexCaps(nil); err != nil {
+		t.Fatalf("empty referenced set returned %v, want nil", err)
+	}
+	if err := m.preflightCheckIfindexCaps(ifindexSet(nil)); err != nil {
+		t.Fatalf("ifindexSet(nil) returned %v, want nil", err)
 	}
 }
 
