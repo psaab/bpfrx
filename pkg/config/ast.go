@@ -386,29 +386,6 @@ func (t *ConfigTree) findNode(path []string) (*Node, error) {
 	return navigateToNode(t.Children, path)
 }
 
-// insertNode inserts a node as a child at the given parent path.
-func (t *ConfigTree) insertNode(parentPath []string, node *Node) error {
-	children := &t.Children
-	pos := 0
-	for pos < len(parentPath) {
-		found := false
-		for _, child := range *children {
-			consumed := matchNodeKeys(child, parentPath, pos)
-			if consumed > 0 {
-				children = &child.Children
-				pos += consumed
-				found = true
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("destination parent path element %q not found", parentPath[pos])
-		}
-	}
-	*children = append(*children, node)
-	return nil
-}
-
 // findNodeWithParent navigates the tree and returns the target node
 // plus the parent's children slice (for insertion/removal at the correct level).
 func (t *ConfigTree) findNodeWithParent(path []string) (*Node, *[]*Node, error) {

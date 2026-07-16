@@ -250,12 +250,15 @@ func TestFabricAllowlistExcludesDestructiveMethods(t *testing.T) {
 	}
 }
 
-// TestLoopbackListenerUnaffected proves the loopback (Run) path is unchanged:
-// its only interceptor, configLockInterceptor, admits every method (including
-// the destructive ones the fabric listener denies). On a non-cancelled context
-// it simply invokes the handler and never touches s.store, so a zero-value
-// Server is sufficient. This is the #4122 invariant that the allowlist is
-// applied to the fabric surface ONLY.
+// TestLoopbackListenerUnaffected proves the loopback (Run) path applies NO
+// method allowlist: unlike the fabric listener, it admits every method
+// (including the destructive ones the fabric listener denies). The method
+// restriction lives ONLY in fabricAllowlistUnaryInterceptor, which the fabric
+// server chains and the loopback server does not — so the loopback admits these
+// by construction. (Post-#5849 the loopback has no config-lock unary
+// interceptor at all; the config-lock lifecycle moved to a connection-scoped
+// stats.Handler that never inspects the method.) This is the #4122 invariant
+// that the allowlist is applied to the fabric surface ONLY.
 func TestLoopbackListenerUnaffected(t *testing.T) {
 	s := &Server{}
 	for _, method := range []string{
@@ -264,17 +267,16 @@ func TestLoopbackListenerUnaffected(t *testing.T) {
 		pb.BpfrxService_Rollback_FullMethodName,
 		pb.BpfrxService_SystemAction_FullMethodName,
 	} {
+		// The restricting interceptor is fabric-only: verify it DENIES these
+		// destructive methods (so the loopback, which does not chain it, admits
+		// them). The loopback has no equivalent gate.
 		probe := &unaryCallProbe{}
 		info := &grpc.UnaryServerInfo{FullMethod: method}
-		resp, err := s.configLockInterceptor(context.Background(), &pb.SystemActionRequest{Action: "zeroize"}, info, probe.handler)
-		if err != nil {
-			t.Errorf("loopback configLockInterceptor denied %s: %v", method, err)
+		if _, err := s.fabricAllowlistUnaryInterceptor(context.Background(), &pb.SystemActionRequest{Action: "zeroize"}, info, probe.handler); err == nil {
+			t.Errorf("fabric allowlist admitted destructive method %s; the loopback (no allowlist) admits it, but the allowlist must be fabric-only (#4122)", method)
 		}
-		if !probe.called {
-			t.Errorf("loopback configLockInterceptor did not invoke handler for %s", method)
-		}
-		if resp != "ok" {
-			t.Errorf("loopback configLockInterceptor did not pass through response for %s", method)
+		if probe.called {
+			t.Errorf("fabric allowlist invoked the handler for denied method %s", method)
 		}
 	}
 }

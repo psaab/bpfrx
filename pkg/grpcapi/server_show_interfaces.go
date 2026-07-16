@@ -112,8 +112,8 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 			fmt.Sscanf(parts[1], "%d", &unitNum)
 		}
 		vlanID := 0
-		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
-			if unit, ok := ifCfg.Units[unitNum]; ok {
+		if ifCfg, ok := config.LookupInterface(cfg, physName); ok {
+			if unit, ok := config.LookupUnit(ifCfg, unitNum); ok {
 				vlanID = unit.VlanID
 			}
 		}
@@ -200,7 +200,7 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 		}
 
 		// Show interface description and configured speed/duplex from config
-		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+		if ifCfg, ok := config.LookupInterface(cfg, physName); ok {
 			if ifCfg.Description != "" {
 				fmt.Fprintf(&buf, "  Description: %s\n", ifCfg.Description)
 			}
@@ -259,7 +259,7 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 		fmt.Fprintf(&buf, "  Device flags   : %s\n", strings.Join(flags, " "))
 
 		// VLAN tagging
-		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg.VlanTagging {
+		if ifCfg, ok := config.LookupInterface(cfg, physName); ok && ifCfg.VlanTagging {
 			fmt.Fprintln(&buf, "  VLAN tagging: Enabled")
 		}
 
@@ -289,8 +289,8 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 			fmt.Fprintln(&buf)
 
 			// Show unit description
-			if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
-				if u, ok := ifCfg.Units[li.unitNum]; ok && u.Description != "" {
+			if ifCfg, ok := config.LookupInterface(cfg, physName); ok {
+				if u, ok := config.LookupUnit(ifCfg, li.unitNum); ok && u.Description != "" {
 					fmt.Fprintf(&buf, "    Description: %s\n", u.Description)
 				}
 			}
@@ -319,8 +319,8 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 
 			// DHCP annotations
 			var unit *config.InterfaceUnit
-			if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
-				if u, ok := ifCfg.Units[li.unitNum]; ok {
+			if ifCfg, ok := config.LookupInterface(cfg, physName); ok {
+				if u, ok := config.LookupUnit(ifCfg, li.unitNum); ok {
 					unit = u
 				}
 			}
@@ -441,19 +441,28 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 	var units []ifUnit
 	seen := make(map[string]bool)
 	for physName, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg == nil { // #5886: skip present-but-nil InterfaceConfig
+			continue
+		}
 		if filterName != "" && !strings.HasPrefix(physName, filterName) {
 			continue
 		}
 		seen[physName] = true
 		if rethName, ok := physToReth[physName]; ok {
 			// Physical RETH member: inherit units from RETH parent
-			if rethCfg, ok := cfg.Interfaces.Interfaces[rethName]; ok {
+			if rethCfg, ok := config.LookupInterface(cfg, rethName); ok {
 				for unitNum, unit := range rethCfg.Units {
+					if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+						continue
+					}
 					units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
 				}
 			}
 		} else {
 			for unitNum, unit := range ifCfg.Units {
+				if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+					continue
+				}
 				units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
 			}
 		}
@@ -518,6 +527,9 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 				peerCfg, err := config.CompileConfigForNodeLenient(tree, peerNodeID)
 				if err == nil {
 					for physName, ifCfg := range peerCfg.Interfaces.Interfaces {
+						if ifCfg == nil { // #5886: skip present-but-nil InterfaceConfig
+							continue
+						}
 						if _, isLocal := cfg.Interfaces.Interfaces[physName]; isLocal {
 							continue // shared (reth, fxp, fab, etc.)
 						}
@@ -527,13 +539,19 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 						peerIfaces[physName] = true
 						if ifCfg.RedundantParent != "" {
 							physToReth[physName] = ifCfg.RedundantParent
-							if rethCfg, ok := peerCfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok {
+							if rethCfg, ok := config.LookupInterface(peerCfg, ifCfg.RedundantParent); ok {
 								for unitNum, unit := range rethCfg.Units {
+									if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+										continue
+									}
 									units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
 								}
 							}
 						} else {
 							for unitNum, unit := range ifCfg.Units {
+								if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+									continue
+								}
 								units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
 							}
 						}
@@ -600,7 +618,7 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 			}
 			// Show description if configured
 			desc := ""
-			if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok && ifCfg.Description != "" {
+			if ifCfg, ok := config.LookupInterface(cfg, u.physName); ok && ifCfg.Description != "" {
 				desc = ifCfg.Description
 			}
 			if desc != "" {
@@ -648,8 +666,8 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 		// RETH interface: get addresses from config, status from physical member
 		if physMember, ok := rethToPhys[u.physName]; ok {
 			var v4Addrs, v6Addrs []string
-			if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok {
-				if unit, ok := ifCfg.Units[u.unitNum]; ok {
+			if ifCfg, ok := config.LookupInterface(cfg, u.physName); ok {
+				if unit, ok := config.LookupUnit(ifCfg, u.unitNum); ok {
 					for _, addr := range unit.Addresses {
 						ip, _, err := net.ParseCIDR(addr)
 						if err != nil {
@@ -846,7 +864,7 @@ func writeRethMemberSummary(buf *strings.Builder, cfg *config.Config, member, re
 		linkUp = "Down"
 	}
 	fmt.Fprintf(buf, "Physical interface: %s, %s, Physical link is %s\n", member, enabled, linkUp)
-	if ifc, ok := cfg.Interfaces.Interfaces[member]; ok && ifc.Description != "" {
+	if ifc, ok := config.LookupInterface(cfg, member); ok && ifc.Description != "" {
 		fmt.Fprintf(buf, "  Description: %s\n", ifc.Description)
 	}
 	fmt.Fprintf(buf, "  Redundant-ethernet: member of %s\n", reth)
@@ -898,7 +916,7 @@ func writeRethDetail(buf *strings.Builder, cfg *config.Config, maps config.RethS
 			linkStr = "Down"
 		}
 		fmt.Fprintf(buf, "Physical interface: %s, %s, Physical link is %s\n", reth, adminStr, linkStr)
-		if ifc, ok := cfg.Interfaces.Interfaces[reth]; ok && ifc.Description != "" {
+		if ifc, ok := config.LookupInterface(cfg, reth); ok && ifc.Description != "" {
 			fmt.Fprintf(buf, "  Description: %s\n", ifc.Description)
 		}
 		fmt.Fprintf(buf, "  Redundant-ethernet: aggregate over member %s\n", member)

@@ -163,64 +163,15 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 	return warnings
 }
 
-// validateRoutingRuleWindowWarnings emits commit-time warnings when a
-// config would program more next-table or rib-group ip rules than the
-// applier's fixed priority window can hold (see pkg/routing/rules.go:
-// nextTableRulePriority window of 100, ribGroupRulePriority window of
-// 100 split into 50 v4+v6 pairs). The counts here are CONSERVATIVE
-// upper bounds computed from the same inputs the applier consumes —
-// they intentionally do NOT replicate the applier's exact skip/dedup
-// logic (unknown-instance skips, self-only rib-groups, duplicate source
-// tables), so they may warn slightly early but never miss a real
-// truncation. The runtime accepts the config; the apply-time cap is the
-// hard guard against the rule leak.
-func validateRoutingRuleWindowWarnings(cfg *Config) []string {
-	var warnings []string
-
-	// next-table: the applier feeds it the global inet + inet6 static
-	// routes (daemon_apply.go), counting those with a NextTable set.
-	const nextTableWindow = 100
-	nextTableRoutes := 0
-	for _, sr := range cfg.RoutingOptions.StaticRoutes {
-		if sr != nil && sr.NextTable != "" {
-			nextTableRoutes++
-		}
-	}
-	for _, sr := range cfg.RoutingOptions.Inet6StaticRoutes {
-		if sr != nil && sr.NextTable != "" {
-			nextTableRoutes++
-		}
-	}
-	if nextTableRoutes > nextTableWindow {
-		warnings = append(warnings, fmt.Sprintf(
-			"routing-options: %d static routes use next-table, but only %d can be "+
-				"programmed as ip rules; routes beyond the limit will be ignored at "+
-				"apply time. Reduce the number of next-table routes.",
-			nextTableRoutes, nextTableWindow))
-	}
-
-	// rib-group (#3876): the applier now programs one ip rule PER CONNECTED
-	// PREFIX of each source instance whose interface-routes rib-group imports
-	// the main table, into a fixed window of maxRibGroupLeakRules (1000)
-	// priorities that clear() scans. Count the connected prefixes the applier
-	// would leak and warn if they exceed the window (an over-count against
-	// pkg/routing.maxRibGroupLeakRules — kept in lockstep here).
-	const ribGroupLeakLimit = 1000
-	leakPrefixes := 0
-	for _, prefixes := range RibGroupConnectedPrefixes(cfg) {
-		leakPrefixes += len(prefixes)
-	}
-	if leakPrefixes > ribGroupLeakLimit {
-		warnings = append(warnings, fmt.Sprintf(
-			"routing-options: interface-routes rib-group would leak %d connected "+
-				"prefixes as ip rules, but only %d can be programmed; prefixes beyond "+
-				"the limit will be ignored at apply time. Reduce the number of "+
-				"rib-group-leaked interface prefixes.",
-			leakPrefixes, ribGroupLeakLimit))
-	}
-
-	return warnings
-}
+// Note: the next-table / rib-group ip-rule WINDOW over-subscription check that
+// used to live here (validateRoutingRuleWindowWarnings, warn-only) moved to the
+// strict commit gate validateRoutingRuleWindowsStrict
+// (compiler_validate_strict_routing_windows.go, wired in runUniformGates) in
+// #5854: a config that exceeds the applier's fixed 100 next-table / 1000
+// rib-group ip-rule windows is now HARD-REJECTED at commit / commit-check
+// (silent apply-time truncation = routes claimed but not programmed) and only
+// downgraded to a warning on the tolerant load / peer-sync paths. The
+// leak-cannot-be-realized advisory below is a DIFFERENT check and is unchanged.
 
 // validateRibGroupLeakWarnings emits commit-time warnings for
 // interface-routes rib-group imports the #3876 Phase-1 per-prefix leak

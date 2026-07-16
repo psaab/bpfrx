@@ -1864,6 +1864,28 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5854: next-table / interface-routes rib-group ip-rule WINDOW gate. The
+	// runtime applier programs these leaks into FIXED priority windows
+	// (pkg/routing/rules.go: 100 next-table rules, 1000 rib-group leak rules) and
+	// HARD-CAPS at each boundary, silently skipping any rule past it. A config
+	// that exceeds a window therefore commits green but the reconciler stops at
+	// the limit and returns success — the committed generation CLAIMS routes the
+	// kernel never programs (blackhole / asymmetric routing / silent inter-VRF
+	// leak loss). This was previously WARN-only (ValidateConfig). Strict on
+	// commit / commit-check (hard reject so the over-subscription is
+	// operator-visible before it truncates); lenient on load / peer-sync (warn —
+	// #1960; the applier's window hard-cap keeps the excess inert, so an
+	// already-committed or peer-synced over-limit generation still boots).
+	// Mirrors validateNextTableTargetReferencesStrict.
+	if err := validateRoutingRuleWindowsStrict(cfg); err != nil {
+		if opts.lenientRoutingRuleWindows {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("routing-rule window over-subscription (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5633: static-route disposition-conflict gate. Repeated same-prefix
 	// static-route `set` lines merge into a single StaticRoute
 	// (compileStaticRoutes) that appends next-hops and latches sticky terminal /
@@ -2012,6 +2034,27 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		if opts.lenientRPMRoutingInstance {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("rpm routing-instance (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
+	// #5832: interface canonical-name collision / IFNAMSIZ gate. LinuxIfName
+	// only replaces '/' with '-', so two DISTINCT authored names (ge-0/0/0 and
+	// ge-0-0-0) canonicalize to the same Linux device / ifindex; each still
+	// emits its own logical snapshot row (zone / routing-instance /
+	// host-inbound / NAT), and the Rust forwarding-state builder keys by ifindex
+	// and OVERWRITES the earlier row — the lexicographically later name silently
+	// wins, hijacking that device's security-zone and routing identity. An
+	// over-IFNAMSIZ canonical name is a sibling hazard (the device never gets
+	// created). Strict on commit / commit-check (hard reject so the collision is
+	// operator-visible before it silently reroutes traffic); lenient on load /
+	// peer-sync (warn — #1960; naming the winner makes the overwrite visible so
+	// a grandfathered config still boots without a silent hijack).
+	if err := validateInterfaceNameCollisionStrict(cfg); err != nil {
+		if opts.lenientIfNameCollision {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("interface name collision (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return err
 		}

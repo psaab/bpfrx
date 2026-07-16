@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -100,7 +99,7 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 	// Prefer PrimaryAddress from config if set on the source interface unit.
 	var globalSourceAddr string
 	if cfg.Security.Log.SourceInterface != "" {
-		globalSourceAddr = resolveSourceAddr(cfg, cfg.Security.Log.SourceInterface)
+		globalSourceAddr = config.ResolveSyslogSourceAddr(cfg, cfg.Security.Log.SourceInterface)
 	}
 
 	var clients []*logging.SyslogClient
@@ -177,39 +176,6 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 	// stale destination.
 	er.ReplaceSyslogClients(clients)
 	d.applyAggregator(er, cfg)
-}
-
-// resolveSourceAddr returns the source IP for syslog from the given interface.
-// It prefers PrimaryAddress from config (stripped to bare IP); falls back to
-// the first IPv4 address on the kernel interface.
-func resolveSourceAddr(cfg *config.Config, srcIface string) string {
-	// Parse "iface.unit" — e.g. "reth1.100" → base="reth1", unit=100
-	base, unitStr, hasUnit := strings.Cut(srcIface, ".")
-	unitNum := 0
-	if hasUnit {
-		if n, err := strconv.Atoi(unitStr); err == nil {
-			unitNum = n
-		}
-	}
-	if ifc, ok := cfg.Interfaces.Interfaces[base]; ok && ifc != nil {
-		if unit, ok := ifc.Units[unitNum]; ok && unit.PrimaryAddress != "" {
-			// PrimaryAddress is CIDR — strip the prefix length
-			if ip, _, err := net.ParseCIDR(unit.PrimaryAddress); err == nil {
-				return ip.String()
-			}
-		}
-	}
-	// Fallback: first IPv4 from kernel
-	if iface, err := net.InterfaceByName(srcIface); err == nil {
-		if addrs, err := iface.Addrs(); err == nil {
-			for _, a := range addrs {
-				if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
-					return ipn.IP.String()
-				}
-			}
-		}
-	}
-	return ""
 }
 
 // aggregationCallback is the single, stable session-aggregation handler

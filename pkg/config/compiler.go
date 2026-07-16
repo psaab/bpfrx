@@ -955,6 +955,21 @@ type compileOpts struct {
 	// applier's tableIDs !ok guard keeps it inert. Same doctrine as
 	// lenientRibGroupRefs.
 	lenientNextTableRefs bool
+	// lenientRoutingRuleWindows (#5854) downgrades the next-table / rib-group
+	// ip-rule window over-subscription gate (validateRoutingRuleWindowsStrict)
+	// from a hard compile error to a cfg.Warnings entry. The runtime applier
+	// programs next-table and interface-routes rib-group leaks into FIXED
+	// priority windows (pkg/routing/rules.go: 100 next-table rules, 1000
+	// rib-group leak rules) and HARD-CAPS at each boundary, silently skipping any
+	// rule past it, so a config that exceeds a window commits green while the
+	// reconciler stops at the limit and returns success — the committed
+	// generation claims routes the kernel never programs (blackhole / asymmetric
+	// routing). The strict commit / commit-check path hard-rejects so the
+	// over-subscription is operator-visible; the tolerant load / peer-sync paths
+	// warn so an already-committed or peer-synced over-limit config still BOOTS
+	// (#1960) — the applier's window hard-cap keeps the excess inert. Same
+	// doctrine as lenientNextTableRefs.
+	lenientRoutingRuleWindows bool
 	// lenientPolicyRouteMapSeq (#5701) downgrades the route-map
 	// sequence-number overflow gate (validatePolicyRouteMapSequenceBoundStrict)
 	// from a hard compile error to a cfg.Warnings entry. A policy-statement
@@ -1491,6 +1506,19 @@ type compileOpts struct {
 	// id is bounded, not a wrong-VRID advert. Same doctrine as
 	// lenientVRRPGroupID.
 	lenientRethVRRPGroupID bool
+	// lenientIfNameCollision (#5832) downgrades the interface-name canonical
+	// collision / IFNAMSIZ gate (validateInterfaceNameCollisionStrict) from a
+	// hard compile error to a cfg.Warnings entry. LinuxIfName only replaces '/'
+	// with '-', so two distinct authored names (ge-0/0/0 and ge-0-0-0)
+	// canonicalize to the same Linux device / ifindex; the Rust
+	// forwarding-state builder overwrites the earlier row and the
+	// lexicographically later name silently wins, hijacking that device's
+	// security-zone / routing identity. The strict commit / commit-check path
+	// hard-rejects so the collision is operator-visible; the tolerant load /
+	// peer-sync paths warn (naming the winner) so an already-persisted or
+	// peer-synced config that predates this gate still BOOTS (#1960 no-brick).
+	// Same doctrine as lenientRethVRRPGroupID.
+	lenientIfNameCollision bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1835,6 +1863,22 @@ type compileOpts struct {
 	// lenientFirewallTCPFlags.
 	lenientCoSNumericCodePoint bool
 
+	// lenientNonNumericUnit (#5829) downgrades the malformed logical-unit
+	// identity gate (a non-numeric / negative / overflow `interfaces <if>
+	// unit <id>`) from a hard compile error to a cfg.Warnings entry with the
+	// offending unit quarantined (skipped, its children NOT reattached to any
+	// other unit). Strict commit / commit-check hard-reject so a unit-level
+	// firewall filter cannot commit and then silently vanish (fail-open). Set
+	// ONLY on the tolerant load / peer-sync paths (CompileConfigLenient /
+	// CompileConfigForNodeLenient) so a config an older binary already
+	// persisted — which silently dropped the bad unit — still BOOTS, now with
+	// a deterministic warning instead of a silent drop. Same doctrine as
+	// lenientCoSNumericCodePoint. Like the other lenient gates this is an
+	// AST-level compile decision the read-only SchemaValidate walk cannot make
+	// (and since #1319 PR 2 SchemaValidate violations only warn on tolerant
+	// paths anyway).
+	lenientNonNumericUnit bool
+
 	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
 	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
 	// check-config`) into compileExpanded so it can be stamped onto the
@@ -1928,6 +1972,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyMatchAddressSetMembers:    true,
 		lenientRibGroupRefs:                    true,
 		lenientNextTableRefs:                   true,
+		lenientRoutingRuleWindows:              true,
 		lenientPolicyRouteMapSeq:               true,
 		lenientRouteDispositionConflict:        true,
 		lenientDHCPStaticBindings:              true,
@@ -1964,6 +2009,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientVRRPGroupID:                     true,
 		lenientVRRPGroupPriority:               true,
 		lenientRethVRRPGroupID:                 true,
+		lenientIfNameCollision:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
@@ -1983,6 +2029,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,
+		lenientNonNumericUnit:                  true,
 	})
 }
 
@@ -2280,6 +2327,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyMatchAddressSetMembers:    true,
 		lenientRibGroupRefs:                    true,
 		lenientNextTableRefs:                   true,
+		lenientRoutingRuleWindows:              true,
 		lenientPolicyRouteMapSeq:               true,
 		lenientRouteDispositionConflict:        true,
 		lenientDHCPStaticBindings:              true,
@@ -2316,6 +2364,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientVRRPGroupID:                     true,
 		lenientVRRPGroupPriority:               true,
 		lenientRethVRRPGroupID:                 true,
+		lenientIfNameCollision:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
@@ -2335,6 +2384,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,
+		lenientNonNumericUnit:                  true,
 	})
 }
 

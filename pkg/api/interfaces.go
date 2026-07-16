@@ -98,6 +98,9 @@ func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config,
 	physToReth := make(map[string]string) // physical member → reth parent
 	rethToPhys := cfg.RethToPhysical()    // reth → physical member
 	for _, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg == nil { // #5886: skip present-but-nil InterfaceConfig
+			continue
+		}
 		if ifCfg.RedundantParent != "" {
 			physToReth[ifCfg.Name] = ifCfg.RedundantParent
 		}
@@ -157,13 +160,13 @@ func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config,
 				}
 			}
 			var addrs []string
-			if ifCfg, ok := cfg.Interfaces.Interfaces[baseName]; ok {
+			if ifCfg, ok := config.LookupInterface(cfg, baseName); ok {
 				// Determine which unit to look up
 				unitNum := 0
 				if parts := strings.SplitN(ifName, ".", 2); len(parts) == 2 {
 					fmt.Sscanf(parts[1], "%d", &unitNum)
 				}
-				if unit, ok := ifCfg.Units[unitNum]; ok {
+				if unit, ok := config.LookupUnit(ifCfg, unitNum); ok {
 					addrs = append(addrs, unit.Addresses...)
 				}
 			}

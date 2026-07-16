@@ -340,7 +340,12 @@ func resolveConfiguredTrafficKernel(cfg *config.Config, name string, canonicaliz
 		suffix = "." + parts[1]
 	}
 	if cfg != nil && cfg.Interfaces.Interfaces != nil {
-		if ifc, ok := cfg.Interfaces.Interfaces[base]; ok && ifc.LocalFabricMember != "" {
+		// #5886: LookupInterface returns ok only for a present, NON-nil slot, so
+		// `ifc.LocalFabricMember` cannot nil-deref on a present-but-nil value
+		// (which tolerant load / HA config-sync can leave). This is a read-only
+		// operator path (CLI `show interfaces` traffic summary + gRPC
+		// MonitorInterface), so a raw map-index deref here panicked xpfd.
+		if ifc, ok := config.LookupInterface(cfg, base); ok && ifc.LocalFabricMember != "" {
 			resolved := ifc.LocalFabricMember
 			if suffix != "" && !strings.Contains(resolved, ".") {
 				resolved += suffix

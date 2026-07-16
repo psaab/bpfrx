@@ -88,6 +88,36 @@ Acquisition and renewal share one commit path, `commitLease`
 new address, store the lease (and DHCPv6 delegated prefixes), and fire
 the debounced `onAddressChange` callback when content changed.
 
+- **Renewal timer contract (`renewalTimers`, RFC 2131 §4.4.5 / RFC 8415
+  §18.2.4, #5795)**: T1 (renew) fires at **50%** of the lease and T2
+  (rebind) at **87.5%** — `renewalTimers` returns `t1 = lease/2` and
+  `t2Remaining = 3/8·lease` (the additional wait from T1 to T2). There is
+  **no fixed floor**: the ratios are proportional to the lease, so for
+  every positive lease `T1 (50%) < T2 (87.5%) < expiry`, down to the 1s
+  minimum the wire can express (T1 500ms, T2 875ms). A fixed 30s T1 / 1s
+  T2 floor previously pushed T1 past the RFC half-life for any lease under
+  60s and scheduled the renew **at or after expiry** for a lease under 30s
+  (the run loop kept forwarding on an expired binding, then churned into
+  re-acquisition). A **non-positive** lease time is invalid (`ok=false`) —
+  RFC 2131 lease 0 is not the infinite sentinel (that is `0xFFFFFFFF`,
+  overflow-safe via divide-first, #4526); the run loop **fails closed**,
+  abandoning the cycle and re-acquiring, paced by `reacquireBackstop` so a
+  server that keeps granting a 0-second lease cannot become a tight
+  DISCOVER/SOLICIT loop. v4 and v6 share this one definition.
+- **DHCPv6 explicit valid-lifetime-0 invalidation (RFC 8415 §18.2.10.1,
+  #5927)**: a Reply that carries an IA_NA whose IAADDR(s) are **all
+  valid-lifetime 0** is the server's directive to STOP using the held
+  address. `selectIANAAddress` skips 0-lifetime IAADDRs (#4383) and
+  `parseV6Reply` reports this distinctly via the `errV6AddrInvalidated`
+  sentinel (present-but-0), separate from the generic "no usable IA_NA /
+  live IA_PD" error (an **absent / transient** reply). On the sentinel
+  during RENEW/REBIND the run loop **deconfigures** the held address and
+  re-acquires — the IA_NA analog of the IA_PD withdrawal reconcile — while
+  a merely absent/transient reply **keeps** the address and retries
+  (T1→T2→solicit, the #4874/#1844 anti-outage path). NOTE: the
+  `LeaseTime == 0 → 3600s` default in `parseV6Reply` is NOT this path — it
+  only applies to a degenerate no-IA config; the explicit-0 invalidation
+  is handled before it.
 - **Successful T1 renew / T2 rebind is committed**, and the run loop
   returns to the T1 wait with timers recomputed from the renewed
   lease. Pre-#1777 the renewal result was dead-assigned and the loop
@@ -154,7 +184,7 @@ the debounced `onAddressChange` callback when content changed.
   acquire→renew→rebind→re-acquire transitions and lease preservation)
   is exercised through the `doV4ExchangeForTest` / `doV6ExchangeForTest`
   / `afterForTest` / `waitLinkLocalForTest` seams (#2994), which replace
-  the real socket exchange and the 30 s T1 wait so a test drives the
+  the real socket exchange and the RFC T1/T2 waits so a test drives the
   real `runDHCPv4` / `runDHCPv6` without traffic — see `renew_test.go`.
   The wire builders (`buildV4RenewRequest`, `v4RenewDest`,
   `buildV6RenewMessage`) are pure and unit-tested directly.
@@ -188,6 +218,24 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
     `duid-llt` instead of silently handing out an unstable identity. A `duid-ll`
     is a pure function of the hardware address (byte-identical across restart),
     so its persist failure stays benign (logged, non-fatal).
+  - **A DUID-type change AUTOMATICALLY ROTATES the identity (#5855).** Changing
+    `duid-ll` <-> `duid-llt` restarts the DHCPv6 client (the type is part of the
+    reconcile fingerprint), but the client identity is rotated too — no explicit
+    `clear` is required (Option 1, operator-friendly). `getDUID` treats the
+    configured type + resolved DUID as one lifecycle object: it reuses a cached
+    or persisted DUID ONLY when its actual type (`actualDUIDType`) matches the
+    requested mode, and on a mismatch atomically regenerates the requested type
+    and durably persists it BEFORE the restarted client sends it (persist-before-
+    start holds because `Reconcile` stops the old client, waits for it, then
+    `Start` calls `getDUID` synchronously before the first Solicit). `Reconcile`
+    also drops the cached DUID on a type change so the restarted client can never
+    be handed the retired identity. **Persistence-failure fail-safe:** if the new
+    -type DUID cannot be durably persisted, `getDUID` RETAINS the previous
+    persisted identity and returns it (old type) — it exposes NO unpersisted new
+    DUID (a partially-rotated DUID-LLT would be ephemeral and diverge from disk),
+    and the client stays coherent on the old identity until a later reconcile
+    persists the new one. `show`/API (`DUIDs()`) reports the ACTUAL active DUID
+    type, never the configured-but-not-yet-rotated type.
   - **`ClearAllDUIDs` clears persisted DUIDs and surfaces errors (#4909).** It
     unions the in-memory cache with the `dhcpv6-duid-*` files on disk, so a DUID
     a client has not re-fetched since restart (on disk, absent from the cache)

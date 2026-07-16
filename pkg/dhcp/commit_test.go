@@ -56,18 +56,46 @@ func v4Lease(addr string, opts ...func(*Lease)) *Lease {
 	return l
 }
 
+// TestRenewalTimers pins the RFC 2131 §4.4.5 / RFC 8415 §18.2.4 renewal
+// schedule: T1 at 50% of the lease, T2 at 87.5% (t2Remaining = 37.5%),
+// with NO fixed floor. The pre-#5795 code clamped T1 to a 30s minimum and
+// t2Remaining to 1s; for any finite lease under 60s that pushed T1 past
+// the RFC half-life, and for a lease under 30s it scheduled the renew AT
+// OR AFTER expiry. These cases assert the corrected schedule and, for
+// every positive lease, that both waits land strictly before expiry with
+// T1 < T2. A non-positive lease is invalid (ok=false) — the caller fails
+// closed into re-acquisition instead of using a manufactured 30s/1s plan.
+//
+// Fail-on-revert: restoring the fixed 30s T1 / 1s T2 clamp makes the
+// short-lease rows go RED (40s wants T1=20s not 30s; 2s wants T1=1s not
+// 30s and t2Remaining=750ms not 1s; 30s/59s likewise). The zero/negative
+// rows assert ok=false, which the old unconditional 30s/1s plan also
+// failed. Proven by neutralizing renewalTimers via -overlay.
 func TestRenewalTimers(t *testing.T) {
 	tests := []struct {
 		name          string
 		leaseTime     time.Duration
 		wantT1        time.Duration
 		wantT2Remains time.Duration
+		wantOK        bool
 	}{
-		{"one hour", time.Hour, 30 * time.Minute, 1350 * time.Second},
-		{"t1 clamped to 30s", 40 * time.Second, 30 * time.Second, 15 * time.Second},
-		{"t2 remainder clamped to 1s", 2 * time.Second, 30 * time.Second, time.Second},
-		{"zero lease time", 0, 30 * time.Second, time.Second},
-		{"60s lease", 60 * time.Second, 30 * time.Second, 22500 * time.Millisecond},
+		// Long leases: unaffected by the old floor, kept as regression anchors.
+		{"one hour", time.Hour, 30 * time.Minute, 1350 * time.Second, true},
+		// Boundary where the old 30s T1 floor stopped biting (60/2 == 30).
+		{"60s lease", 60 * time.Second, 30 * time.Second, 22500 * time.Millisecond, true},
+		// Just under 60s: old code clamped T1 up to 30s (> 29.5s RFC).
+		{"59s lease", 59 * time.Second, 29500 * time.Millisecond, 22125 * time.Millisecond, true},
+		// 40s: the canonical bug — old code pinned T1=30s (75%); RFC is 20s.
+		{"40s lease T1 is 20s not 30s", 40 * time.Second, 20 * time.Second, 15 * time.Second, true},
+		// 30s: old code clamped T1 to 30s == full lease (renew AT expiry).
+		{"30s lease T1 before expiry", 30 * time.Second, 15 * time.Second, 11250 * time.Millisecond, true},
+		// 2s: old code scheduled T1=30s, 15x past expiry; RFC is 1s / 1.75s.
+		{"2s lease renews before expiry", 2 * time.Second, time.Second, 750 * time.Millisecond, true},
+		// 1s: smallest lease the wire can express — proves no zero-duration timer.
+		{"1s lease has non-zero sub-second waits", time.Second, 500 * time.Millisecond, 375 * time.Millisecond, true},
+		// Non-positive lease: invalid, fail closed (was 30s/1s — the bug).
+		{"zero lease is invalid", 0, 0, 0, false},
+		{"negative lease is invalid", -5 * time.Second, 0, 0, false},
 		// #4526: the 0xFFFFFFFF-second RFC infinite-lease sentinel. The
 		// old leaseTime*7/8 - leaseTime/2 form overflows int64 here and
 		// wraps negative → T2 was clamped to 1s. The divide-first form
@@ -76,16 +104,37 @@ func TestRenewalTimers(t *testing.T) {
 		{"max-uint32 infinite-lease sentinel",
 			0xFFFFFFFF * time.Second,
 			0xFFFFFFFF * time.Second / 2,
-			0xFFFFFFFF * time.Second / 8 * 3},
+			0xFFFFFFFF * time.Second / 8 * 3,
+			true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t1, t2 := renewalTimers(tt.leaseTime)
+			t1, t2, ok := renewalTimers(tt.leaseTime)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
 			if t1 != tt.wantT1 {
 				t.Errorf("t1 = %s, want %s", t1, tt.wantT1)
 			}
 			if t2 != tt.wantT2Remains {
 				t.Errorf("t2Remaining = %s, want %s", t2, tt.wantT2Remains)
+			}
+			// For every usable lease the whole schedule must land strictly
+			// before expiry with T1 < T2 — the invariant the fixed floor
+			// violated. Holds for the infinite sentinel too: T1+T2 is 7/8 of
+			// the sentinel (~3.76e18 ns), below both the lease and int64 (the
+			// divide-first #4526 form never overflows).
+			if tt.wantOK && tt.leaseTime > 0 {
+				t2Abs := t1 + t2
+				if t1 <= 0 {
+					t.Errorf("t1 = %s, must be positive for a %s lease", t1, tt.leaseTime)
+				}
+				if t2Abs >= tt.leaseTime {
+					t.Errorf("T2 absolute = %s, must be < lease %s", t2Abs, tt.leaseTime)
+				}
+				if t1 >= t2Abs {
+					t.Errorf("T1 %s must be < T2 absolute %s", t1, t2Abs)
+				}
 			}
 		})
 	}

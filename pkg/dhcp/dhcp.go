@@ -604,31 +604,47 @@ func (m *Manager) ClearAllDUIDs() error {
 // a new one as needed. The result is cached in memory and persisted.
 func (m *Manager) getDUID(ifaceName string) (dhcpv6.DUID, error) {
 	m.mu.Lock()
+	want := normalizeDUIDType(m.duidTypes[ifaceName])
 	if d, ok := m.duids[ifaceName]; ok {
-		m.mu.Unlock()
-		return d, nil
+		// #5855: only reuse the cached DUID when its ACTUAL type matches the
+		// requested mode. A `duid-ll`<->`duid-llt` config change restarts the
+		// client but leaves the OLD-type DUID cached; returning it kept the old
+		// identity indefinitely. On a mismatch, drop the stale cache and fall
+		// through to load/regenerate the requested type.
+		if actualDUIDType(d) == want {
+			m.mu.Unlock()
+			return d, nil
+		}
+		delete(m.duids, ifaceName)
 	}
-	duidType := m.duidTypes[ifaceName]
 	m.mu.Unlock()
 
-	// Try loading persisted DUID
-	if d, err := m.loadDUID(ifaceName); err == nil {
+	// Try the persisted DUID — reuse it ONLY when its type matches the requested
+	// mode (#5855). A persisted DUID of the RETIRED type is not reusable, but it
+	// IS retained below as the fail-safe fallback if regenerating the requested
+	// type cannot be persisted.
+	persisted, loadErr := m.loadDUID(ifaceName)
+	if loadErr == nil && actualDUIDType(persisted) == want {
 		m.mu.Lock()
-		m.duids[ifaceName] = d
+		m.duids[ifaceName] = persisted
 		m.mu.Unlock()
 		slog.Info("DHCPv6: loaded persisted DUID",
-			"interface", ifaceName, "duid", d)
-		return d, nil
+			"interface", ifaceName, "duid", persisted)
+		return persisted, nil
+	}
+	if loadErr == nil {
+		slog.Info("DHCPv6: persisted DUID type differs from configured mode; rotating",
+			"interface", ifaceName, "persisted", actualDUIDType(persisted), "want", want)
 	}
 
-	// Generate new DUID
+	// Generate a NEW DUID of the requested type.
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("interface lookup for DUID: %w", err)
 	}
 
 	var duid dhcpv6.DUID
-	switch duidType {
+	switch want {
 	case "duid-llt":
 		// Time-based — stable only via persistence
 		epoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -637,22 +653,39 @@ func (m *Manager) getDUID(ifaceName string) (dhcpv6.DUID, error) {
 			Time:          uint32(time.Since(epoch).Seconds()),
 			LinkLayerAddr: iface.HardwareAddr,
 		}
-	default: // "duid-ll" or empty (default to LL)
+	default: // "duid-ll"
 		duid = &dhcpv6.DUIDLL{
 			HWType:        iana.HWTypeEthernet,
 			LinkLayerAddr: iface.HardwareAddr,
 		}
 	}
 
-	// Persist. A DUID-LLT embeds a generation timestamp, so a DUID-LLT that
-	// never reaches disk is EPHEMERAL: the next restart regenerates a different
-	// Time, the DHCPv6 server sees a brand-new client, and the old lease lingers
-	// (#4909). Surface the persist failure for the time-based DUID instead of
-	// silently handing out an unstable identity. A DUID-LL is a pure function of
-	// the hardware address — byte-identical across restart even if never
-	// persisted — so a persist failure there is benign and only logged.
+	// Persist the NEW identity durably BEFORE it is cached or returned, so the
+	// restarted client never sends an identity that is not on disk (a DUID-LLT
+	// embeds a generation timestamp — an unpersisted one is ephemeral, #4909).
 	if err := m.saveDUID(ifaceName, duid); err != nil {
-		if duidType == "duid-llt" {
+		// #5855 rotation fail-safe: the new-type identity is NOT durable. If a
+		// PREVIOUS identity is persisted (loadErr==nil, i.e. this is a type
+		// rotation), RETAIN it — keep the running client coherent on the OLD
+		// identity and expose NO unpersisted new DUID (a partially-rotated
+		// DUID-LLT would be ephemeral and diverge from disk). getDUID then keeps
+		// returning the old (persisted) type until a later reconcile persists the
+		// new one; show/API reports that actual active type.
+		if loadErr == nil {
+			m.mu.Lock()
+			m.duids[ifaceName] = persisted
+			m.mu.Unlock()
+			slog.Warn("DHCPv6: DUID type rotation persist failed; retaining the previous "+
+				"persisted identity (no unpersisted identity exposed)",
+				"interface", ifaceName, "want", want,
+				"retained", actualDUIDType(persisted), "err", err)
+			return persisted, nil
+		}
+		// Cold start — no prior identity to fall back to. A DUID-LLT that never
+		// reaches disk is ephemeral, so surface the failure (#4909). A DUID-LL is
+		// a pure function of the hardware address — byte-identical across restart
+		// even if never persisted — so a persist failure there is benign.
+		if want == "duid-llt" {
 			return nil, fmt.Errorf("persist DUID-LLT for %s (unstable across restart if not persisted): %w",
 				ifaceName, err)
 		}
@@ -723,6 +756,16 @@ func (m *Manager) loadDUID(ifaceName string) (dhcpv6.DUID, error) {
 	return dhcpv6.DUIDFromBytes(data)
 }
 
+// duidWriteFile persists DUID bytes durably. A package var so a test can inject
+// a persist failure to exercise the #5855 rotation fail-safe (keep the previous
+// identity, expose no unpersisted new DUID) — loadDUID reads through the real
+// filesystem, so an injected write failure leaves a pre-seeded old DUID
+// readable while the new-type write fails deterministically (regardless of the
+// test's uid, unlike an unwritable-dir trick).
+var duidWriteFile = func(path string, data []byte, perm os.FileMode) error {
+	return fsatomic.WriteFileDurable(path, data, perm)
+}
+
 func (m *Manager) saveDUID(ifaceName string, duid dhcpv6.DUID) error {
 	path, err := m.duidPath(ifaceName)
 	if err != nil {
@@ -737,7 +780,34 @@ func (m *Manager) saveDUID(ifaceName string, duid dhcpv6.DUID) error {
 	// DurableState (#1894): the DUID is the client's stable DHCPv6
 	// identity — losing it to a power cut changes the identity the
 	// server knows us by across reboot (new leases, stale bindings).
-	return fsatomic.WriteFileDurable(path, duid.ToBytes(), 0644)
+	return duidWriteFile(path, duid.ToBytes(), 0644)
+}
+
+// actualDUIDType maps a resolved DUID to the configured type token
+// ("duid-ll" / "duid-llt"), or "" for an unrecognized type. It is how getDUID
+// detects a type ROTATION: a cached or persisted DUID whose REAL type differs
+// from the requested duid-ll/duid-llt mode must be regenerated, not silently
+// reused (#5855). loadDUID returns the concrete *DUIDLL / *DUIDLLT via
+// dhcpv6.DUIDFromBytes, and generation builds the same concrete types, so a
+// concrete-type switch is exhaustive for the modes xpf can configure.
+func actualDUIDType(d dhcpv6.DUID) string {
+	switch d.(type) {
+	case *dhcpv6.DUIDLLT:
+		return "duid-llt"
+	case *dhcpv6.DUIDLL:
+		return "duid-ll"
+	default:
+		return ""
+	}
+}
+
+// normalizeDUIDType resolves the empty config token to the duid-ll default,
+// matching fingerprintV6 and getDUID (#5855).
+func normalizeDUIDType(t string) string {
+	if t == "" {
+		return "duid-ll"
+	}
+	return t
 }
 
 // Leases returns a snapshot of all current DHCP leases.
@@ -858,7 +928,27 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 		// Renewal cycle: stay in this loop while T1 renews / T2 rebinds
 		// keep succeeding; break out only to re-acquire from scratch.
 		for {
-			t1, t2Remaining := renewalTimers(committed.LeaseTime)
+			t1, t2Remaining, ok := renewalTimers(committed.LeaseTime)
+			if !ok {
+				// A non-positive lease time is invalid (RFC 2131 lease 0 is
+				// not the infinite sentinel). The lease is unusable: do not
+				// schedule a renewal that would fire after it has already
+				// lapsed — abandon it and re-acquire, paced by
+				// reacquireBackstop so a server that keeps granting a
+				// 0-second lease does not become a tight loop (#5795).
+				slog.Warn("DHCPv4: non-positive lease time, re-acquiring",
+					"interface", ifaceName, "lease_time", committed.LeaseTime)
+				select {
+				case <-m.after(reacquireBackstop):
+				case <-ctx.Done():
+					m.removeAddress(ifaceName, committed)
+					m.mu.Lock()
+					delete(m.leases, key)
+					m.mu.Unlock()
+					return
+				}
+				break
+			}
 
 			// Wait for T1 (50% of lease time) for renewal
 			select {
@@ -954,6 +1044,21 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 // renew TIMEOUT (which still falls through to the T2 rebind). The
 // discriminator is errors.Is(err, errDHCPNAK); see runDHCPv4 (#3956).
 var errDHCPNAK = errors.New("DHCPv4 server sent NAK")
+
+// errV6AddrInvalidated signals that a DHCPv6 Reply EXPLICITLY invalidated the
+// held IA_NA address: the reply carried IA_NA IAADDR option(s) that were ALL
+// valid-lifetime 0 (RFC 8415 §18.2.10.1 — the address is no longer valid and
+// MUST be discarded), with no live IA_NA address and no live delegated prefix
+// to fall back to. It is DISTINCT from the generic "no usable IA_NA / live
+// IA_PD" error, which means the reply carried NO usable IAADDR at all (an
+// ABSENT / transient reply — server omission or packet loss). The
+// discriminator is errors.Is(err, errV6AddrInvalidated): on an EXPLICIT
+// invalidation the renew/rebind loop DECONFIGURES the held address and
+// re-acquires (§18.2.10.1); on the ABSENT/transient error it KEEPS the address
+// and retries (T1→T2→solicit), the correct #4874/#1844 anti-outage behavior.
+// Fail SAFE toward keep-and-retry: the sentinel is returned ONLY when a
+// present-but-0 IAADDR is positively observed (#5927).
+var errV6AddrInvalidated = errors.New("DHCPv6 reply explicitly invalidated the held IA_NA address (valid-lifetime 0)")
 
 // abandonLeaseAfterNAK deconfigures the interface and drops the lease
 // record after a DHCPNAK revoked the lease (RFC 2131 §4.4.5). The client
@@ -1291,7 +1396,28 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 		// Renewal cycle: stay in this loop while T1 renews / T2 rebinds
 		// keep succeeding; break out only to re-acquire from scratch.
 		for {
-			t1, t2Remaining := renewalTimers(committed.LeaseTime)
+			t1, t2Remaining, ok := renewalTimers(committed.LeaseTime)
+			if !ok {
+				// See runDHCPv4: a non-positive lease time is invalid and
+				// must not schedule a renewal past an already-lapsed lease.
+				// Abandon the cycle and re-acquire, paced by
+				// reacquireBackstop (#5795).
+				slog.Warn("DHCPv6: non-positive lease time, re-acquiring",
+					"interface", ifaceName, "lease_time", committed.LeaseTime)
+				select {
+				case <-m.after(reacquireBackstop):
+				case <-ctx.Done():
+					if committed.Address.IsValid() {
+						m.removeAddress(ifaceName, committed)
+					}
+					m.mu.Lock()
+					delete(m.leases, key)
+					delete(m.delegatedPDs, ifaceName)
+					m.mu.Unlock()
+					return
+				}
+				break
+			}
 
 			// Wait for T1
 			select {
@@ -1327,6 +1453,25 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 					"lease_time", committed.LeaseTime)
 				continue
 			}
+			if errors.Is(rerr, errV6AddrInvalidated) {
+				// #5927: the server EXPLICITLY invalidated the held IA_NA
+				// address (valid-lifetime 0). RFC 8415 §18.2.10.1: stop using
+				// it NOW — deconfigure + re-acquire, do NOT keep it and wait for
+				// T2 (which would keep a server-withdrawn address in service).
+				// This is the IA_NA analog of the IA_PD withdrawal reconcile
+				// above. A merely absent/transient renew reply keeps the
+				// generic error and the keep-and-wait-T2 path below (#4874).
+				slog.Info("DHCPv6: server invalidated held address (valid-lifetime 0), deconfiguring and re-acquiring",
+					"interface", ifaceName, "address", committed.Address)
+				if committed.Address.IsValid() {
+					m.removeAddress(ifaceName, committed)
+				}
+				m.mu.Lock()
+				delete(m.leases, key)
+				delete(m.delegatedPDs, ifaceName)
+				m.mu.Unlock()
+				break // re-acquire from a fresh solicit
+			}
 			slog.Warn("DHCPv6: T1 renewal failed, waiting for T2",
 				"interface", ifaceName, "err", rerr)
 
@@ -1361,6 +1506,22 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 					"delegated_prefixes", len(renewed.prefixes),
 					"lease_time", committed.LeaseTime)
 				continue
+			}
+			if errors.Is(rerr, errV6AddrInvalidated) {
+				// #5927: explicit invalidation on REBIND too — deconfigure the
+				// held address before falling back to a fresh solicit (the
+				// generic rebind-failure break below keeps it in service until
+				// re-acquire, which is correct only for a transient failure).
+				slog.Info("DHCPv6: server invalidated held address on rebind (valid-lifetime 0), deconfiguring and re-acquiring",
+					"interface", ifaceName, "address", committed.Address)
+				if committed.Address.IsValid() {
+					m.removeAddress(ifaceName, committed)
+				}
+				m.mu.Lock()
+				delete(m.leases, key)
+				delete(m.delegatedPDs, ifaceName)
+				m.mu.Unlock()
+				break
 			}
 			slog.Warn("DHCPv6: T2 rebind failed, lease will expire, re-acquiring",
 				"interface", ifaceName, "err", rerr)
@@ -1501,12 +1662,21 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string, mode dhcpExcha
 // caller pairs lease.LeaseTime with the right lifetime rather than a
 // stale one from a different IAADDR. Returns an invalid Addr and zero
 // duration when the reply carries no usable IA_NA address.
-func selectIANAAddress(adv *dhcpv6.Message) (netip.Addr, time.Duration) {
+//
+// The third return, sawZeroLifetime, reports whether the reply carried an
+// IA_NA IAADDR option with valid-lifetime 0 (an explicit stop-using directive,
+// RFC 8415 §18.2.10.1). Combined with an invalid returned Addr (no positive
+// address selectable), it lets the caller distinguish an EXPLICIT invalidation
+// (present-but-0 → discard the held address) from an ABSENT IA_NA (no IAADDR
+// at all → keep + retry). A reply with both a 0-lifetime and a positive IAADDR
+// still selects the positive one (valid Addr) — not an invalidation. (#5927)
+func selectIANAAddress(adv *dhcpv6.Message) (addr netip.Addr, validLT time.Duration, sawZeroLifetime bool) {
 	var (
 		best      netip.Addr
 		bestValid time.Duration
 		bestPref  time.Duration
 		found     bool
+		sawZero   bool
 	)
 	for _, opt := range adv.Options.Options {
 		ianaOpt, ok := opt.(*dhcpv6.OptIANA)
@@ -1518,8 +1688,11 @@ func selectIANAAddress(adv *dhcpv6.Message) (netip.Addr, time.Duration) {
 			if !ok {
 				continue
 			}
-			// Expired/declined address — never install it (F-264).
+			// Expired/declined address — never install it (F-264). Record
+			// that a present-but-0 IAADDR was seen so the caller can tell an
+			// EXPLICIT invalidation from an absent IA_NA (#5927).
 			if iaaddr.ValidLifetime == 0 {
+				sawZero = true
 				continue
 			}
 			a, ok := netip.AddrFromSlice(iaaddr.IPv6Addr)
@@ -1536,7 +1709,7 @@ func selectIANAAddress(adv *dhcpv6.Message) (netip.Addr, time.Duration) {
 			}
 		}
 	}
-	return best, bestValid
+	return best, bestValid, sawZero
 }
 
 // parseV6Reply extracts the lease (IA_NA address, lifetime, DNS, gateway)
@@ -1570,9 +1743,16 @@ func (m *Manager) parseV6Reply(ctx context.Context, ifaceName string, adv *dhcpv
 	// paired with a stale value from a different address (#4383).
 	var addr netip.Addr
 	var validLT time.Duration
+	// iaNAExplicitlyInvalidated: the reply carried IA_NA IAADDR(s) that were
+	// ALL valid-lifetime 0 (no positive address selectable) — the server's
+	// RFC 8415 §18.2.10.1 "stop using this address" directive (#5927). Kept
+	// distinct from an absent IA_NA so the caller can discard vs keep+retry.
+	var iaNAExplicitlyInvalidated bool
 
 	if wantNA {
-		addr, validLT = selectIANAAddress(adv)
+		var sawZeroLifetime bool
+		addr, validLT, sawZeroLifetime = selectIANAAddress(adv)
+		iaNAExplicitlyInvalidated = !addr.IsValid() && sawZeroLifetime
 	}
 
 	// Extract IA_PD delegated prefixes, split into live and (RFC 8415
@@ -1600,6 +1780,15 @@ func (m *Manager) parseV6Reply(ctx context.Context, ifaceName string, adv *dhcpv
 	// Codex F6). The trailing wantNA||wantPD guard keeps a degenerate
 	// no-IA config on its prior no-reject path.
 	if !addr.IsValid() && len(result.prefixes) == 0 && (wantNA || wantPD) {
+		// #5927: distinguish an EXPLICIT invalidation (the reply carried an
+		// IA_NA whose IAADDR(s) were all valid-lifetime 0 — RFC 8415
+		// §18.2.10.1, stop using the address) from an ABSENT / transient reply
+		// (no usable IAADDR at all). Only the former returns the
+		// errV6AddrInvalidated sentinel, on which the renew/rebind loop
+		// deconfigures the held address; the generic error keeps it + retries.
+		if iaNAExplicitlyInvalidated {
+			return nil, fmt.Errorf("DHCPv6 reply on %s: %w", ifaceName, errV6AddrInvalidated)
+		}
 		return nil, fmt.Errorf("no usable IA_NA address or live IA_PD prefix in DHCPv6 reply on %s", ifaceName)
 	}
 
@@ -1621,6 +1810,15 @@ func (m *Manager) parseV6Reply(ctx context.Context, ifaceName string, adv *dhcpv
 		lease.LeaseTime = result.prefixes[0].ValidLifetime
 	}
 
+	// A sane default for the DEGENERATE no-IA config (wantNA=false &&
+	// wantPD=false), the only shape that reaches here with LeaseTime 0: a
+	// selected IA_NA address and a live IA_PD prefix both carry a positive
+	// lifetime (selectIANAAddress skips valid-lifetime-0 IAADDRs, #4383;
+	// extractDelegatedPrefixes routes valid-lifetime-0 prefixes to
+	// withdrawnPDs). This is NOT the explicit-0 invalidation path — that is
+	// handled upstream at the "no usable IA_NA / live IA_PD" guard, which
+	// returns errV6AddrInvalidated so the renew/rebind loop deconfigures the
+	// held address (RFC 8415 §18.2.10.1, #5927), never reaching this floor.
 	if lease.LeaseTime == 0 {
 		lease.LeaseTime = 3600 * time.Second
 	}

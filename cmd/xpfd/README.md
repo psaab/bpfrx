@@ -6,14 +6,21 @@ and exposes gRPC + HTTP REST + an interactive CLI.
 
 ## Entry
 
-`main.go` parses flags and constructs `pkg/daemon.Daemon` via
-`daemon.New(opts)`. The daemon instance assembles every subsystem
-manager from `pkg/*` and runs them under an errgroup.
+`main.go` classifies the command, parses daemon arguments with the private
+`parseDaemonArgs` flag set, and constructs `pkg/daemon.Daemon` through
+`runDaemon` only after parsing and semantic validation succeed. The daemon
+instance assembles every subsystem manager from `pkg/*` and runs them under an
+errgroup. A typed daemon result keeps help, flag syntax, positional remainder,
+semantic, construction, and runtime failures distinct so `main` owns each
+diagnostic and exit status exactly once.
 
 `main()` first routes on `classifyCommand(os.Args)` — the pure,
 side-effect-free SSOT for the top-level subcommand decision (which
-subcommand runs for a given argv; `cmdDaemon` is the fall-through that
-parses the daemon flags). `xpfd upgrade` then routes on
+subcommand runs for a given argv; `cmdDaemon` is the fall-through that passes
+exactly `os.Args[1:]` to `parseDaemonArgs`). A subcommand is recognized only as
+the first argument. Daemon mode accepts flags only: every positional remainder
+is rejected before logging or daemon construction, and a bare `--` is accepted
+only when no token follows it. `xpfd upgrade` then routes on
 `upgradeArgsSelectKernel` (binary cut-over vs `upgrade kernel`). Both
 routing decisions and every subcommand arg parser
 (`parseUpgradeArgs`, `parseSeedRuntimeArgs`,
@@ -30,6 +37,10 @@ real upgrade/cleanup side effects (`dispatch_test.go`,
 - `-api-addr` — HTTP REST listener. Default `127.0.0.1:8080`.
 - `-grpc-addr` — gRPC listener. Default `127.0.0.1:50051`.
 - `-debug` — verbose logging.
+- `-cold-path-sample-mask` — powers-of-two-minus-one sampling mask. Default
+  `0xff`; an explicitly authored value is forwarded to the userspace dataplane.
+- `-enable-cold-path-1-in-1-sampling` — explicit bounded-benchmark override for
+  one-in-one cold-path sampling. Never use in production.
 
 ## Subcommands
 

@@ -141,12 +141,22 @@ func parseSNMPClients(node *Node) []SNMPClient {
 			if t == "" {
 				continue
 			}
-			if t == "restrict" {
-				if len(out) > 0 {
-					out[len(out)-1].Restrict = true
-				}
+			if t == "restrict" && len(out) > 0 {
+				out[len(out)-1].Restrict = true
 				continue
 			}
+			// #5898: a leading/orphan `restrict` (t == "restrict" with no
+			// preceding prefix to modify — an invalid-Junos-ordering typo like
+			// `clients restrict 0.0.0.0/0`) previously fell into the branch above
+			// and was SILENTLY DROPPED, leaving the following prefix a plain
+			// ALLOW — an SNMP community answerable from every source, with nothing
+			// recorded so #5833's quarantine never engaged. Do NOT drop it: record
+			// it AS a client entry. "restrict" is not a valid IP/CIDR, so
+			// validateSNMPClients flags it MALFORMED — strict commit hard-rejects
+			// it (naming the token) and the lenient / peer-sync path QUARANTINES
+			// the community to deny-all (snmpQuarantineClientNets) — fail-closed,
+			// on both paths (the bug was identical on both). A well-formed
+			// `<prefix> restrict` (len(out) > 0) still attaches above, unchanged.
 			out = append(out, SNMPClient{Prefix: t})
 		}
 	}
@@ -177,18 +187,26 @@ func parseSNMPClients(node *Node) []SNMPClient {
 // prefix typo now also gets a clear error instead of a silently-shrunk
 // allowlist. Strict (commit / commit-check): hard-reject, naming the bad
 // token. Lenient (load / peer-sync): warn so an already-persisted config
-// an older binary accepted still boots (#1960 fail-closed-on-load class);
-// compileClientNets keeps dropping the entry on that path, matching the
-// pre-#4834 behavior exactly.
+// an older binary accepted still boots (#1960 fail-closed-on-load class).
+//
+// #5833: on the LENIENT path the caller must NOT keep the surviving broad
+// allow live. Dropping the malformed token and compiling the rest of the
+// allowlist normally is FAIL-OPEN: `0.0.0.0/0 restric` degrades to a plain
+// `0.0.0.0/0` allow, so on restart/upgrade/peer-sync the community becomes
+// answerable from every source — a warning does not make that safe. The
+// second return value reports whether ANY entry was malformed so the caller
+// (compileSNMP) can QUARANTINE the affected community to deny-all
+// (snmpQuarantineClientNets) instead. The warning is preserved either way.
 //
 // The message never includes the community NAME (a secret, per the
 // snmpInertKnobWarnings convention) — only the offending token, which is
 // an IP/CIDR literal or a keyword typo, not a credential.
-func validateSNMPClients(clients []SNMPClient, lenient bool) (warnings []string, err error) {
+func validateSNMPClients(clients []SNMPClient, lenient bool) (warnings []string, malformed bool, err error) {
 	for _, cl := range clients {
 		if _, _, perr := parseClientPrefix(cl.Prefix); perr == nil {
 			continue
 		}
+		malformed = true
 		msg := fmt.Sprintf(
 			"snmp community clients entry %q is not a valid IP/CIDR prefix "+
 				"(if this was meant to be the \"restrict\" keyword, check for a "+
@@ -197,10 +215,36 @@ func validateSNMPClients(clients []SNMPClient, lenient bool) (warnings []string,
 				"unrestricted allow)",
 			cl.Prefix)
 		if lenient {
-			warnings = append(warnings, msg+" (ignored: entry dropped from the allowlist)")
+			warnings = append(warnings, msg+" (the affected community is quarantined to deny-all until the typo is fixed)")
 			continue
 		}
-		return nil, fmt.Errorf("%s", msg)
+		return nil, true, fmt.Errorf("%s", msg)
 	}
-	return warnings, nil
+	return warnings, malformed, nil
+}
+
+// snmpQuarantineClientNets returns a fail-CLOSED SNMP client match set: an
+// explicit `restrict` on all IPv4 (0.0.0.0/0) and all IPv6 (::/0) sources, so
+// SNMPCommunity.AllowsSource denies every query regardless of source family.
+//
+// It is installed on a community whose `clients` allowlist carried a MALFORMED
+// token on the tolerant load / peer-sync path (#5833). The strict commit path
+// rejects such a config outright; the lenient path must still boot (#1960), but
+// silently dropping the bad token and keeping the surviving broad allow is
+// fail-OPEN (the `restrict` typo turns `0.0.0.0/0 restrict` into an
+// unrestricted allow answerable from every source). Quarantining to deny-all
+// makes the lenient path fail CLOSED for the affected community while the rest
+// of the config loads, until the operator fixes the typo.
+//
+// This overrides only clientNets (the derived enforcement cache), not
+// comm.Clients (the config surface marshaled to the API / hashed by the SNMP
+// reconcile): the operator's config text is preserved for display and
+// change-detection; only runtime enforcement is forced closed.
+func snmpQuarantineClientNets() []compiledSNMPClient {
+	_, v4, _ := net.ParseCIDR("0.0.0.0/0")
+	_, v6, _ := net.ParseCIDR("::/0")
+	return []compiledSNMPClient{
+		{net: v4, ones: 0, restrict: true},
+		{net: v6, ones: 0, restrict: true},
+	}
 }

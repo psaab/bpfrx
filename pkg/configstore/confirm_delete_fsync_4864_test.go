@@ -64,10 +64,19 @@ func TestDeleteConfirmDirSynced(t *testing.T) {
 	}
 }
 
-// TestDeleteConfirmAbsentNoDirSync confirms the no-op path: deleting an absent
-// confirm.json is not an error and does NOT fsync the directory (nothing was
-// unlinked, so there is nothing to make durable).
-func TestDeleteConfirmAbsentNoDirSync(t *testing.T) {
+// TestDeleteConfirmAbsentReachesDirSync pins the #5835 correction to the #4864
+// durability contract: deleting an ABSENT confirm.json still fsyncs the parent
+// directory. The DB layer cannot tell "never existed" from "a prior call
+// unlinked it but its dir fsync failed" (the removal is then not yet durable),
+// so the absent path MUST fall through to the dir fsync — otherwise an
+// absent-file retry after an unlink-succeeded/dir-sync-failed report would
+// launder a non-durable removal into a false success, and a crash would replay
+// the stale dirent on reboot. Reaching the sync unconditionally is harmless
+// (idempotent) and makes the retry converge.
+//
+// RED on revert: restoring the old `os.IsNotExist -> return nil` short-circuit
+// (before the dir fsync) leaves syncedDir empty, tripping the assertion.
+func TestDeleteConfirmAbsentReachesDirSync(t *testing.T) {
 	restoreRollbackSeams(t)
 
 	var syncedDir string
@@ -77,11 +86,13 @@ func TestDeleteConfirmAbsentNoDirSync(t *testing.T) {
 	}
 
 	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
-	// No confirm.json written.
+	// No confirm.json written — the absent path.
 	if err := s.db.DeleteConfirm(); err != nil {
 		t.Fatalf("DeleteConfirm on absent file must be nil: %v", err)
 	}
-	if syncedDir != "" {
-		t.Errorf("absent-file delete must not fsync the directory, synced %q", syncedDir)
+	if syncedDir != filepath.Dir(s.db.confirmPath()) {
+		t.Errorf("absent-file delete must still fsync the confirm-state directory %q so an "+
+			"absent-file retry reaches the #4864 durability sync; synced %q",
+			filepath.Dir(s.db.confirmPath()), syncedDir)
 	}
 }

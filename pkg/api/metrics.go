@@ -245,6 +245,7 @@ type xpfCollector struct {
 	eventActionsRejected          *prometheus.Desc
 	eventActionsRetried           *prometheus.Desc
 	eventActionsDropped           *prometheus.Desc
+	eventActionsSuperseded        *prometheus.Desc
 	eventAttributesInvalid        *prometheus.Desc
 	eventActionQueueDepth         *prometheus.Desc
 	eventStreamSubscriberDropped  *prometheus.Desc
@@ -697,6 +698,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.eventActionsRejected
 	ch <- c.eventActionsRetried
 	ch <- c.eventActionsDropped
+	ch <- c.eventActionsSuperseded
 	ch <- c.eventAttributesInvalid
 	ch <- c.eventActionQueueDepth
 	ch <- c.eventStreamSubscriberDropped

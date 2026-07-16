@@ -116,6 +116,23 @@ func (s *Server) statusHandler(w http.ResponseWriter, _ *http.Request) {
 	// gc.Stats().TotalEntries is permanently 0 — this reported 0 sessions on
 	// every real deployment.
 	if s.dp != nil && s.dp.IsLoaded() {
+		// #5939: SessionCount() is a full v4+v6 session-map iteration holding the
+		// per-bucket BPF-map locks for O(table) — the SAME lock-contention DoS
+		// class #5708/#5782 bounded, reachable UNGATED here on the REST surface.
+		// Gate it through the shared diagcmd.SessionWalkLimiter (the same instance
+		// the /security/sessions* scans use, sessions.go) and fail fast with HTTP
+		// 429 on contention rather than driving another concurrent full-table walk,
+		// mirroring sessions.go. This is the AUTHENTICATED /api/v1/status query
+		// (authCheck exempts only /health + loopback-/metrics); the unauthenticated
+		// liveness /health handler does NOT walk the session table, so a 429 here
+		// cannot flap the liveness probe.
+		release, err := sessionWalkLimiter.Acquire()
+		if err != nil {
+			writeError(w, http.StatusTooManyRequests,
+				"session count concurrency limit reached; retry shortly")
+			return
+		}
+		defer release() // idempotent; released on panic too (limiter contract)
 		v4, v6 := s.dp.SessionCount()
 		resp.SessionCount = v4 + v6
 	}

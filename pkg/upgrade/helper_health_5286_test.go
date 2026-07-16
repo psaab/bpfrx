@@ -1,6 +1,7 @@
 package upgrade
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,7 +31,7 @@ func TestHelperHealthProbe_ArmedForwardingTargetVersion_Healthy(t *testing.T) {
 	versions := t.TempDir()
 	const target = "1.2.3"
 	probe := HelperHealthProbe(HelperHealthDeps{
-		UnitActive:   func() bool { return true },
+		UnitActive:   func(context.Context) (bool, error) { return true, nil },
 		Status:       fakeHelperStatus(true, true, 4242, nil),
 		HelperExe:    helperExeAt(versions, target),
 		VersionsDir:  versions,
@@ -49,8 +50,8 @@ func TestHelperHealthProbe_ActiveButNotForwarding_FailsClosed(t *testing.T) {
 	versions := t.TempDir()
 	const target = "1.2.3"
 	probe := HelperHealthProbe(HelperHealthDeps{
-		UnitActive:   func() bool { return true },              // process reported UP
-		Status:       fakeHelperStatus(true, false, 4242, nil), // enabled but NOT forwarding
+		UnitActive:   func(context.Context) (bool, error) { return true, nil }, // process reported UP
+		Status:       fakeHelperStatus(true, false, 4242, nil),                 // enabled but NOT forwarding
 		HelperExe:    helperExeAt(versions, target),
 		VersionsDir:  versions,
 		PollInterval: time.Millisecond,
@@ -72,7 +73,7 @@ func TestHelperHealthProbe_StaleVersionHelper_FailsClosed(t *testing.T) {
 	versions := t.TempDir()
 	const target = "2.0.0"
 	probe := HelperHealthProbe(HelperHealthDeps{
-		UnitActive:   func() bool { return true },
+		UnitActive:   func(context.Context) (bool, error) { return true, nil },
 		Status:       fakeHelperStatus(true, true, 4242, nil), // armed+forwarding...
 		HelperExe:    helperExeAt(versions, "1.0.0"),          // ...but the OLD binary
 		VersionsDir:  versions,
@@ -92,7 +93,7 @@ func TestHelperHealthProbe_StaleVersionHelper_FailsClosed(t *testing.T) {
 func TestHelperHealthProbe_UnitNotActive_FailsClosed(t *testing.T) {
 	versions := t.TempDir()
 	probe := HelperHealthProbe(HelperHealthDeps{
-		UnitActive:   func() bool { return false }, // process NOT up
+		UnitActive:   func(context.Context) (bool, error) { return false, nil }, // process NOT up
 		Status:       fakeHelperStatus(true, true, 1, nil),
 		HelperExe:    helperExeAt(versions, "1.2.3"),
 		VersionsDir:  versions,
@@ -108,7 +109,7 @@ func TestHelperHealthProbe_UnitNotActive_FailsClosed(t *testing.T) {
 func TestHelperHealthProbe_StatusQueryError_FailsClosed(t *testing.T) {
 	versions := t.TempDir()
 	probe := HelperHealthProbe(HelperHealthDeps{
-		UnitActive:   func() bool { return true },
+		UnitActive:   func(context.Context) (bool, error) { return true, nil },
 		Status:       fakeHelperStatus(false, false, 0, fmt.Errorf("dial unix: connection refused")),
 		HelperExe:    helperExeAt(versions, "1.2.3"),
 		VersionsDir:  versions,
@@ -130,9 +131,9 @@ func TestHelperHealthProbe_StatusQueryError_FailsClosed(t *testing.T) {
 // contrast is observable in a hostless test (the realSystem fallback otherwise
 // execs a real `systemctl is-active` that no test unit satisfies).
 func TestHelperHealthy_RevertToIsActiveOnly_RegressesToFalseHealthy(t *testing.T) {
-	old := unitActiveProbe
-	unitActiveProbe = func(string) bool { return true } // process reported UP
-	t.Cleanup(func() { unitActiveProbe = old })
+	old := unitActiveProbeCtx
+	unitActiveProbeCtx = func(context.Context, string) (bool, error) { return true, nil } // process reported UP
+	t.Cleanup(func() { unitActiveProbeCtx = old })
 
 	versions := t.TempDir()
 	const target = "9.9.9"
@@ -179,7 +180,7 @@ func TestRun_5286_NotForwardingHelper_DoesNotCommit(t *testing.T) {
 		writeFakeBin(t, filepath.Join(cfg.StagedDir, b), "binary-"+b+"-2.0.0")
 	}
 	fs.healthProbe = HelperHealthProbe(HelperHealthDeps{
-		UnitActive:   func() bool { return true },
+		UnitActive:   func(context.Context) (bool, error) { return true, nil },
 		Status:       fakeHelperStatus(true, false, 111, nil), // up but NOT forwarding
 		HelperExe:    helperExeAt(cfg.VersionsDir, "2.0.0"),
 		VersionsDir:  cfg.VersionsDir,

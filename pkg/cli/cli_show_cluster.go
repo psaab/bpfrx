@@ -240,11 +240,14 @@ func (c *CLI) showChassisClusterStatus() error {
 						wantUnit = u
 					}
 				}
-				ifCfg, ok := cfg.Interfaces.Interfaces[base]
+				ifCfg, ok := config.LookupInterface(cfg, base)
 				if !ok {
 					continue
 				}
 				for _, unit := range ifCfg.Units {
+					if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+						continue
+					}
 					if wantUnit >= 0 && unit.Number != wantUnit {
 						continue
 					}

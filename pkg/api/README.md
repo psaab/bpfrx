@@ -292,6 +292,40 @@ under the daemon's errgroup. Nothing else imports this package.
   length mismatch (reveals length, not content — acceptable). Pinned by
   `auth_consttime_4157_test.go`, including an AST regression guard that fails
   if any auth path reverts to a bare `cfg.APIKeys[...]` lookup.
+- **Day-2 listener + auth reconcile (#5866).** The management server used to be
+  constructed ONCE at daemon startup and never reconciled, so a committed
+  web-management change (bind address / port / TLS on/off / api-auth) reported
+  success while the process kept enforcing the old policy until a restart —
+  revoked or tightened credentials stayed usable, a bind removal left the API on
+  the old address. Two mechanisms close this:
+  - The authentication snapshot is a live `atomic.Pointer[AuthConfig]` (`s.auth`)
+    read per request by `dynamicAuthMiddleware`; `ReplaceAuth` swaps it, so a
+    revoked/tightened credential is rejected on the NEXT request with no listener
+    bounce and no restart. The `authCheck` core is shared with the static
+    `authMiddleware`, so the swap enforces byte-identical semantics (the #4157
+    constant-time + #5636 empty-secret guards, `/health` + loopback-`/metrics`
+    exemptions).
+  - The HTTP and HTTPS listeners run in INDEPENDENT legs (`listener.go`), each
+    make-before-break: `ReconcileHTTP(addr)` rebinds only the HTTP leg and
+    `ReconcileHTTPS(tls, addr)` enables / disables / rebinds only the HTTPS leg —
+    neither touches the sibling. This is the fix for the earlier whole-server
+    rebuild: enabling TLS keeps the HTTP bind, so re-binding the whole server
+    re-bound the still-held HTTP socket and failed `EADDRINUSE` (Go sets
+    `SO_REUSEADDR`, not `SO_REUSEPORT`), and the TLS change could never converge
+    without a restart — the same collision hit an HTTP-addr change that left the
+    HTTPS bind unchanged. Each leg binds the new socket and serves it BEFORE
+    retiring the old (no unreachable window on that plane, no double-bind of an
+    unchanged socket); a bind (or HTTPS cert) failure fail-closes to the retained
+    previous leg. `Start(ctx)` binds HTTP synchronously (fail-closed if it fails)
+    and HTTPS best-effort (a boot HTTPS failure leaves HTTP up, retried next
+    commit). `Wait()` joins every live + retiring leg goroutine on shutdown.
+    Listeners bind via `Config.ListenFunc` (default `net.Listen`) so tests inject
+    a fake factory that models `EADDRINUSE`. Pinned by
+    `server_authswap_5866_test.go` (live auth swap) +
+    `pkg/daemon/management_5866_test.go` (HTTP-bind change, TLS enable/disable/
+    re-enable, HTTPS-bind-only change, HTTP-change-keeps-HTTPS, auth swap,
+    bind-failure retain-old). `Run`/`serveBound` remain the single-lifecycle test
+    entry point.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during
@@ -406,8 +440,18 @@ under the daemon's errgroup. Nothing else imports this package.
   session-sync path (#5233) instead of holding it for a discarded scan. The
   sampler probes `ctx.Err()` once per batch (not per session) so the check
   adds no per-entry cost, and it never fires on the normal path — output and
-  ordering are unchanged. Pinned by `api_ctx_cancel_5232_5233_test.go`. This
-  is the REST analog of the gRPC `streamDiagCmd` cancellation cleanup (#5060).
+  ordering are unchanged. The `/sessions` CURSOR path (`page_size>0`,
+  `sessionsCursor` over `IterateSessionsFrom`/`IterateSessionsV6From`) uses the
+  SAME sampler in both cursor callbacks — a selective/no-match query never
+  fills the page, so without it the callback would walk the rest of the table —
+  PLUS a direct `r.Context().Err()` check at each phase boundary: it does not
+  start the second (v6) full walk after a cancelled v4 phase, and does not emit
+  a misleading terminal `next_page_token`/partial-page envelope (nor the
+  `include_peer` fan-out inside `writeSessionList`) to a dead connection. A full
+  page is still emitted normally — it is a complete, valid result. Pinned by
+  `api_ctx_cancel_5232_5233_test.go` (`TestSessionsCursorAbortsWalkOnCanceledContext_5233`
+  for the cursor path). This is the REST analog of the gRPC `streamDiagCmd`
+  cancellation cleanup (#5060).
 - Session-count metrics come from the LIVE dataplane session table, not
   the BPF GC sweep stats (#3929). `collectSessionGauges`
   (`metrics_sessions.go`) derives `xpf_sessions_active` (forward entries)

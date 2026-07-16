@@ -1,6 +1,7 @@
 package upgrade
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -168,10 +169,24 @@ func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) error {
 	//    here, so a predicate error is NOT expected — fail fast (the abort
 	//    direction below is safe: we have not cut yet, node still forwards).
 	if err := waitPredicate(rc, false, cl.DrainComplete); err != nil {
-		// Drain incomplete: the node may still be forwarding. Best-effort
-		// failback so we don't leave it half-drained, then abort.
+		// Drain incomplete: fail back so we don't leave the node half-drained,
+		// then abort. #5845: the ResetFailover (failback) error MUST NOT be
+		// discarded. ForceSecondary above already DEMOTED the local node; if the
+		// failback FAILS, the node may remain FORCE-DEMOTED with peer takeover
+		// unproven — it is NOT "still forwarding", and claiming so hides a
+		// possible both-nodes-secondary outage. Report BOTH failures and warn the
+		// node may be STRANDED DEMOTED so an operator investigates, mirroring the
+		// kernel-roll drain path (kernel_drain.go). Only when the failback
+		// SUCCEEDS is the "aborted without cutting, node still forwarding" claim
+		// true — keep it for that case.
 		logf("rolling: drain predicate not met within %s; resetting failover and aborting", rc.DrainDeadline)
-		_ = cl.ResetFailover()
+		if resetErr := cl.ResetFailover(); resetErr != nil {
+			return fmt.Errorf("rolling: strong drain predicate not satisfied within %s "+
+				"(peer-primary / local-VRRP-backup / rg_active-false / sync-clean) AND "+
+				"failback (ResetFailover) FAILED — node may be STRANDED DEMOTED "+
+				"(force-secondary not undone, peer takeover unproven); operator attention "+
+				"needed: %w", rc.DrainDeadline, errors.Join(err, resetErr))
+		}
 		return fmt.Errorf("rolling: strong drain predicate not satisfied within %s "+
 			"(peer-primary / local-VRRP-backup / rg_active-false / sync-clean); "+
 			"aborted WITHOUT cutting (node still forwarding): %w", rc.DrainDeadline, err)

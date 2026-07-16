@@ -24,6 +24,7 @@ var (
 	// Some entries have no loader path (no tab) — `[^\t]+` then tolerates EOL.
 	bootEntryRE          = regexp.MustCompile(`^Boot([0-9A-F]{4})\*?\s+([^\t]+?)(?:\t.*)?$`)
 	bootCurrentRE        = regexp.MustCompile(`^BootCurrent:\s*([0-9A-F]{4})`)
+	bootNextRE           = regexp.MustCompile(`^BootNext:\s*([0-9A-F]{4})`)
 	slotSelectorKernelRE = regexp.MustCompile(`xpf_slot_kernel="vmlinuz-([^"]+)"`)
 )
 
@@ -369,6 +370,25 @@ func (s *realKernelSystem) ReadSlotSelector(slot string) (string, error) {
 
 func (s *realKernelSystem) SetBootNext(bootID string) error {
 	return runCmd("efibootmgr", "--bootnext", bootID)
+}
+
+// GetBootNext parses the one-shot BootNext id out of efibootmgr's output (the
+// "BootNext: XXXX" line), or returns "" if no one-shot is armed (#5847). The
+// two-phase arm reads this back to POSITIVELY CONFIRM the firmware accepted the
+// SetBootNext write before recording the verified ARMED journal. A missing
+// BootNext line is NOT an error — it is the legitimate "no one-shot set" state.
+func (s *realKernelSystem) GetBootNext() (string, error) {
+	out, err := captureCmd("efibootmgr")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		m := bootNextRE.FindStringSubmatch(line)
+		if len(m) == 2 {
+			return m[1], nil
+		}
+	}
+	return "", nil
 }
 
 // watchdogTimeoutSecs is the timeout armed before the candidate reboot. It must

@@ -144,6 +144,23 @@ func (s *Store) recoverPendingConfirmLocked() {
 	if rec == nil {
 		return
 	}
+	// #5835: a stale record must not resurrect a rollback of an unrelated,
+	// already-confirmed generation. GuardedHash binds the record to the
+	// unconfirmed config it was armed for. The active config was already loaded
+	// into s.active above; if it no longer matches, a later commit / confirm
+	// advanced the active config while this record's durable removal had failed
+	// — the pending window it describes is long resolved. Ignore it (do NOT
+	// roll back or re-arm) and best-effort remove it, retaining retry debt so
+	// the stale record still converges to deletion. A legacy record (empty
+	// GuardedHash, written before #5835) skips this check and recovers exactly
+	// as #4577 so the cross-upgrade auto-rollback hatch is preserved.
+	if rec.GuardedHash != "" && rec.GuardedHash != journalConfigHash(s.active) {
+		slog.Warn("ignoring a stale pending commit-confirmed record on boot: it guards a config "+
+			"that is no longer active (a later commit/confirm superseded it); not resurrecting its "+
+			"rollback", "issue", "#5835")
+		s.resolveConfirmRemovalLocked("stale_confirm_recovery")
+		return
+	}
 	prevTree := rec.PrevTree
 	if prevTree == nil {
 		prevTree = &config.ConfigTree{}
@@ -192,7 +209,11 @@ func (s *Store) recoverPendingConfirmLocked() {
 			s.candidate = s.active.Clone()
 		}
 		if perr == nil {
-			s.removeConfirmState()
+			// #5835: durable-or-retry removal — a failed DeleteConfirm retains
+			// retry debt + degraded health so a crash before the retry heals
+			// re-reads the record (deadline still past) and re-reverts, rather
+			// than silently swallowing the failure.
+			s.resolveConfirmRemovalLocked("confirm_recovery_remove")
 		}
 		s.journalLog(&JournalEntry{
 			Action:     "auto_rollback",
@@ -318,12 +339,26 @@ func journalConfigHash(tree *config.ConfigTree) string {
 // ConfigPersistDegraded reports whether the running active config
 // failed to persist to disk on an Option-B path (SyncApply /
 // performAutoRollback) and the background retry has not yet succeeded
-// (#1799). While true, a daemon restart would load a STALE config;
-// /health returns 503 and xpf_daemon_config_persist_degraded reads 1.
+// (#1799), OR a resolved commit-confirmed window's confirm.json removal is not
+// yet durable (#5835). While true, a daemon restart would load a STALE config
+// or resurrect a resolved rollback; /health returns 503 and
+// xpf_daemon_config_persist_degraded reads 1.
 func (s *Store) ConfigPersistDegraded() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.persistDegraded
+	return s.persistDegraded || s.confirmRemoveDegraded
+}
+
+// ConfirmRemovalDegraded reports specifically whether a RESOLVED
+// commit-confirmed window's confirm.json removal is not yet durable (#5835) —
+// the stale crash-recovery record still lingers and the background retry has
+// not yet deleted it. It is a strict subset of ConfigPersistDegraded, exposed
+// separately so a caller (and the tests) can distinguish a confirm-removal
+// debt from an active-config persist failure.
+func (s *Store) ConfirmRemovalDegraded() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.confirmRemoveDegraded
 }
 
 // noteActivePersistFailureLocked records a WriteActive failure on an
@@ -345,19 +380,7 @@ func (s *Store) noteActivePersistFailureLocked(action string, err error) {
 		Action: "persist_error",
 		Detail: fmt.Sprintf("%s: write active config failed: %v", action, err),
 	})
-	if s.persistRetryActive {
-		return
-	}
-	s.persistRetryActive = true
-	initial := s.persistRetryInitialBackoff
-	if initial <= 0 {
-		initial = time.Second
-	}
-	maxBackoff := s.persistRetryMaxBackoff
-	if maxBackoff <= 0 {
-		maxBackoff = 60 * time.Second
-	}
-	go s.persistRetryLoop(initial, maxBackoff)
+	s.ensurePersistRetryLoopLocked()
 }
 
 // persistRetryLoop retries persisting the CURRENT active config with
@@ -377,38 +400,61 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 	for {
 		time.Sleep(backoff)
 		s.mu.Lock()
-		if !s.persistDegraded {
-			// A successful write on a commit/sync path already
-			// persisted the current active config.
+		if !s.persistDegraded && !s.confirmRemoveDegraded {
+			// A successful write on a commit/sync path already persisted the
+			// current active config and no stale confirm.json removal is owed.
 			s.persistRetryActive = false
 			s.mu.Unlock()
 			return
 		}
-		// #1922: re-write with the marker the failing path requested
-		// (committed=false only for a first-commit rollback). For every
-		// other path persistMarkerCommitted is true, so this matches the
-		// pre-#1922 committed=1 write exactly.
-		err := s.writeActiveMarker(s.active, s.persistMarkerCommitted)
-		if err == nil {
-			s.persistDegraded = false
+
+		if s.persistDegraded {
+			// #1922: re-write with the marker the failing path requested
+			// (committed=false only for a first-commit rollback). For every
+			// other path persistMarkerCommitted is true, so this matches the
+			// pre-#1922 committed=1 write exactly.
+			if err := s.writeActiveMarker(s.active, s.persistMarkerCommitted); err == nil {
+				s.persistDegraded = false
+				// #5473: the active config is now durable. If a commit-confirmed
+				// resolution (rollback / boot recovery / sync supersede) deferred
+				// its confirm.json removal because the resolving write failed, that
+				// replacement target is exactly what just landed durably — drop the
+				// crash-recovery record now (via resolveConfirmRemovalLocked, which
+				// re-arms retry debt if the delete itself fails). No-op unless a
+				// removal was deferred.
+				s.clearConfirmResolutionPendingLocked()
+				s.journalLog(&JournalEntry{
+					Action: "persist_recovered",
+					Detail: "active config persisted after earlier write failure",
+				})
+				slog.Info("active config persisted after earlier write failure", "issue", "#1799")
+			} else {
+				slog.Warn("active config persist retry failed", "err", err, "retry_in", backoff*2)
+			}
+		}
+
+		if s.confirmRemoveDegraded {
+			// #5835: re-drive the stale confirm.json removal. DeleteConfirm
+			// reaches the #4864 dir fsync even when the file is already absent,
+			// so an "unlink succeeded, dir-sync owed" state converges here.
+			if err := s.removeConfirmState(); err == nil {
+				s.confirmRemoveDegraded = false
+				s.journalLog(&JournalEntry{
+					Action: "confirm_remove_recovered",
+					Detail: "stale pending commit-confirmed record removed after earlier failure",
+				})
+				slog.Info("stale pending commit-confirmed record removed after earlier failure", "issue", "#5835")
+			} else {
+				slog.Warn("commit-confirmed record removal retry failed", "err", err, "retry_in", backoff*2)
+			}
+		}
+
+		if !s.persistDegraded && !s.confirmRemoveDegraded {
 			s.persistRetryActive = false
-			// #5473: the active config is now durable. If a commit-confirmed
-			// resolution (rollback / boot recovery / sync supersede) deferred its
-			// confirm.json removal because the resolving write failed, that
-			// replacement target is exactly what just landed durably — drop the
-			// crash-recovery record now so a later boot does not re-drive a
-			// completed rollback. No-op unless a removal was deferred.
-			s.clearConfirmResolutionPendingLocked()
-			s.journalLog(&JournalEntry{
-				Action: "persist_recovered",
-				Detail: "active config persisted after earlier write failure",
-			})
 			s.mu.Unlock()
-			slog.Info("active config persisted after earlier write failure", "issue", "#1799")
 			return
 		}
 		s.mu.Unlock()
-		slog.Warn("active config persist retry failed", "err", err, "retry_in", backoff*2)
 		backoff *= 2
 		if backoff > maxBackoff {
 			backoff = maxBackoff
@@ -551,9 +597,11 @@ func archiveRemoveErr(path string) error {
 	return nil
 }
 
-// rescuePath returns the path for the rescue configuration file.
+// rescuePath returns the path for the rescue configuration file. The base name
+// is RescueConfigBase (KEEP IN SYNC): the factory-reset wipe's ownership-scoped
+// top-level match (#5768) deletes exactly this name.
 func (s *Store) rescuePath() string {
-	return filepath.Join(filepath.Dir(s.filePath), "rescue.conf")
+	return filepath.Join(filepath.Dir(s.filePath), RescueConfigBase)
 }
 
 // SaveRescueConfig saves the active config as rescue configuration.

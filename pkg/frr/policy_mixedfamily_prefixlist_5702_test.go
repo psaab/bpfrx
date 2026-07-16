@@ -114,11 +114,14 @@ func TestMixedFamilyRouteFilterFromPrefixList_OffFamilyNonMatching_5702(t *testi
 	if v6seq == "" {
 		t.Fatalf("expected a v6 route-filter sequence in render:\n%s", got)
 	}
-	if !strings.Contains(v6seq, "match ipv6 address V6ONLY_rf\n") {
+	// The on-family V6ONLY predicate renders as an access-list under the #5872
+	// bounded/namespaced/hashed name (definition and reference share it).
+	v6ACL := routeFilterACLName("V6ONLY", "ipv6")
+	if !strings.Contains(v6seq, "match ipv6 address "+v6ACL+"\n") {
 		t.Fatalf("v6 sequence must AND the on-family V6ONLY predicate as an "+
 			"access-list (#5730), not a colliding same-type prefix-list match:\n%s", v6seq)
 	}
-	if !strings.Contains(got, "ipv6 access-list V6ONLY_rf seq 5 permit 2001:db8:aaaa::/48 exact-match\n") {
+	if !strings.Contains(got, "ipv6 access-list "+v6ACL+" seq 5 permit 2001:db8:aaaa::/48 exact-match\n") {
 		t.Fatalf("missing the #5730 access-list definition for the on-family V6ONLY predicate:\n%s", got)
 	}
 }

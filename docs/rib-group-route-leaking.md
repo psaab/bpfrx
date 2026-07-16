@@ -140,9 +140,31 @@ silently no-op — for the cases Phase 1 cannot fully realize:
   main). Phase 1 leaks only into the main table; a non-main import target is not
   yet installed.
 
-The window warn (`validateRoutingRuleWindowWarnings`) additionally flags a
-config that would leak more than `maxRibGroupLeakRules` (1000) connected
-prefixes.
+### Strict rejection — ip-rule window over-subscription (#5854)
+
+The applier programs next-table and interface-routes rib-group leaks into
+**fixed ip-rule priority windows** and hard-caps at each boundary: 100 rules for
+next-table (`pkg/routing/rules.go`, the `nextTableRulePriority+100` cap) and
+`maxRibGroupLeakRules` (1000) rules for the per-prefix rib-group leak (the
+`ribGroupLeakRulePriority+maxRibGroupLeakRules` cap). A config that exceeds a
+window used to commit green with only a **warning**
+(`validateRoutingRuleWindowWarnings`); the reconciler then silently stopped at
+the limit and returned success, so the committed generation **claimed routes the
+kernel never programmed** — a blackhole / asymmetric-routing / silent inter-VRF
+leak loss with no operator-visible signal.
+
+The over-subscription is now **hard-rejected at commit**
+(`validateRoutingRuleWindowsStrict`,
+`compiler_validate_strict_routing_rulewindows.go`, wired into `runUniformGates`):
+strict on commit / commit-check so the operator sees the over-limit condition
+before it truncates, downgraded to a single warning on the tolerant load /
+peer-sync paths (`opts.lenientRoutingRuleWindows`, #1960 no-brick) so an
+already-committed or peer-synced over-limit generation still boots (the
+applier's window hard-cap keeps the excess inert). The window sizes
+(`maxNextTableRules` = 100, `maxRibGroupLeakRules` = 1000) are duplicated in
+`pkg/config` with a keep-in-sync comment because `pkg/config` cannot import
+`pkg/routing` (that would be an import cycle — `pkg/routing` imports
+`pkg/config`); they MUST stay in lockstep with `pkg/routing/rules.go`.
 
 ### Strict rejection — undefined `next-table` target (#5693)
 

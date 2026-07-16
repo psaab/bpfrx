@@ -931,7 +931,25 @@ func validateFilterFlexMatchStrict(cfg *Config) error {
 				continue
 			}
 			for _, term := range filter.Terms {
-				if term == nil || len(term.UnknownFlexMatch) == 0 {
+				if term == nil {
+					continue
+				}
+				// #5823: a term may name at most ONE flexible-match-range range
+				// (the wire matcher supports one). More than one is a cardinality
+				// violation the pre-fix compiler silently collapsed to the first
+				// range — an accept term then over-permitted, a discard/reject
+				// over-dropped. Reject deterministically, naming every range so
+				// the operator knows exactly what to split into separate terms.
+				if len(term.FlexMatchRangeNames) > 1 {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: flexible-match-range "+
+							"specifies %d ranges (%s) but at most one range per term "+
+							"is supported; split the extra ranges into separate terms",
+						family, name, term.Name,
+						len(term.FlexMatchRangeNames),
+						strings.Join(term.FlexMatchRangeNames, ", "))
+				}
+				if len(term.UnknownFlexMatch) == 0 {
 					continue
 				}
 				return fmt.Errorf(

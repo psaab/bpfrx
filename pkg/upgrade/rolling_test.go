@@ -22,6 +22,11 @@ type fakeCluster struct {
 	syncPolls    int
 	forced       bool
 	resetCalled  bool
+	// #5845 test seam: when set, ResetFailover (failback) returns this error,
+	// modeling a failback that FAILS after ForceSecondary already demoted the
+	// node — so the drain-abort must surface it and warn stranded-demoted rather
+	// than falsely claim the node is still forwarding.
+	resetErr error
 	// #5138 per-RG rejoin gate. Default (zero value) reports rejoin COMPLETE
 	// so the many existing healthy-cluster tests keep passing without edits;
 	// a test sets rejoinIncomplete=true to model a configured RG still held in
@@ -57,7 +62,7 @@ func (f *fakeCluster) DrainComplete() (bool, error) {
 	f.drainPolls++
 	return f.drainPolls >= f.drainAfter, nil
 }
-func (f *fakeCluster) ResetFailover() error        { f.resetCalled = true; return nil }
+func (f *fakeCluster) ResetFailover() error        { f.resetCalled = true; return f.resetErr }
 func (f *fakeCluster) LocalPrimary() (bool, error) { return f.localPri, nil }
 func (f *fakeCluster) LocalRejoinComplete() (bool, error) {
 	if f.rejoinErr != nil {
@@ -174,6 +179,15 @@ func TestRolling_AbortsAndFailsBackIfDrainTimesOut(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "drain predicate not satisfied") {
 		t.Fatalf("expected drain-timeout abort, got %v", err)
 	}
+	// #5845: ResetFailover SUCCEEDS here (resetErr unset), so the failback
+	// undid the demotion and the "node still forwarding" claim is TRUE — the
+	// abort must keep it and must NOT warn stranded-demoted.
+	if !strings.Contains(err.Error(), "still forwarding") {
+		t.Errorf("failback succeeded, so the abort must report the node still forwarding, got %v", err)
+	}
+	if strings.Contains(err.Error(), "STRANDED DEMOTED") {
+		t.Errorf("failback succeeded — the abort must NOT warn stranded-demoted, got %v", err)
+	}
 	if !cl.forced {
 		t.Error("ForceSecondary should have been called before the drain wait")
 	}
@@ -182,6 +196,55 @@ func TestRolling_AbortsAndFailsBackIfDrainTimesOut(t *testing.T) {
 	}
 	if fs.dropinContent != "" {
 		t.Error("cut happened despite drain timeout (node was still forwarding)")
+	}
+}
+
+// TestRolling_DrainTimeoutFailbackFailsStrandedDemoted_5845 pins the #5845
+// fail-closed contract: when the drain times out AND the failback
+// (ResetFailover) FAILS, the abort error must (a) SURFACE the failback failure
+// (it used to be discarded, `_ = cl.ResetFailover()`) and (b) warn the node may
+// be STRANDED DEMOTED — it must NOT keep falsely claiming the node is "still
+// forwarding". ForceSecondary already demoted the node, so a failed failback can
+// leave it force-secondary with peer takeover unproven (both-nodes-secondary
+// outage). Mirrors the kernel-roll drain contract (kernel_drain.go).
+//
+// FAIL-ON-REVERT: reverting to `_ = cl.ResetFailover()` + the unconditional
+// "node still forwarding" message makes the surfaces-resetErr and
+// stranded-demoted assertions fail (and the not-still-forwarding assertion).
+func TestRolling_DrainTimeoutFailbackFailsStrandedDemoted_5845(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, _ := testEnv(t, fs)
+	resetFail := errors.New("injected: ResetFailover control-socket EIO")
+	// drainAfter huge so the predicate never holds; resetErr makes the failback
+	// after the timeout FAIL.
+	cl := &fakeCluster{peerAlive: true, synced: true, compatible: true, peerReady: true,
+		drainAfter: 1 << 30, resetErr: resetFail}
+
+	err := runRollingWith(r, cl, RollingConfig{DrainDeadline: 20 * time.Millisecond, PollInterval: time.Millisecond})
+	if err == nil {
+		t.Fatal("expected an abort error when the drain times out and the failback fails")
+	}
+	// (a) The failback failure must be surfaced, not discarded.
+	if !errors.Is(err, resetFail) {
+		t.Fatalf("abort error must surface the ResetFailover failure (#5845 discarded it), got %v", err)
+	}
+	// The underlying drain error must also still be surfaced (both reported).
+	if !strings.Contains(err.Error(), "drain predicate not satisfied") {
+		t.Fatalf("abort error must still report the drain failure too, got %v", err)
+	}
+	// (b) Must warn stranded-demoted and must NOT falsely claim still-forwarding.
+	if !strings.Contains(err.Error(), "STRANDED DEMOTED") {
+		t.Fatalf("abort error must warn the node may be stranded demoted, got %v", err)
+	}
+	if strings.Contains(err.Error(), "still forwarding") {
+		t.Fatalf("abort error must NOT claim the node is still forwarding when the failback failed, got %v", err)
+	}
+	// The failback WAS attempted, and no cut happened.
+	if !cl.resetCalled {
+		t.Error("ResetFailover should still be attempted before reporting the failure")
+	}
+	if fs.dropinContent != "" {
+		t.Error("cut happened despite drain timeout")
 	}
 }
 

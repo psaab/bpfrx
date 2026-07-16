@@ -640,10 +640,54 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 		}
 	}
 
-	// Parse policy-statements
+	// Parse policy-statements. A named policy-statement may be defined across
+	// MULTIPLE separate hierarchical blocks (two `policy-statement NAME { ... }`
+	// braces), repeated `policy-options` roots, or group-expanded fragments —
+	// each is a distinct AST instance. Flat `set policy-options policy-statement
+	// NAME ...` lines already COMPOSE under one node via SetPath, so hierarchical
+	// must merge the same way or the two shapes diverge. Reuse the existing map
+	// entry (po.PolicyStatements, which persists across every instance AND across
+	// repeated policy-options roots) AND a per-policy term index so later blocks
+	// MERGE into the earlier one: new terms append in first-authored ORDER
+	// (routing policy is ordered security/route-control state — an earlier reject
+	// term must not be lost or reordered), and a repeated fragment of the SAME
+	// term composes onto the existing PolicyTerm (route-filters / from / then all
+	// accumulate). Within ONE policy-options root the term index (psTermIndex,
+	// below) carries the composition across instances; ACROSS separate top-level
+	// policy-options roots (each a distinct compilePolicyOptions call with a fresh
+	// psTermIndex) the composition is re-seeded from the persisted ps.Terms
+	// (#5824). Mirrors the prefix-list / community merge loops above (#5824).
+	//
+	// The pre-#5824 code created a FRESH PolicyStatement per instance and did an
+	// unconditional `po.PolicyStatements[ps.Name] = ps`, so a second same-name
+	// block silently REPLACED the first — its terms / route-filters / actions /
+	// default action vanished. FRR then received a valid but INCOMPLETE route-map
+	// (a lost reject term over-exports/over-imports; a lost accept term withdraws
+	// reachability) while commit and daemon apply both looked successful.
+	psTermIndex := make(map[string]map[string]*PolicyTerm)
 	for _, inst := range namedInstances(node.FindChildren("policy-statement")) {
-		ps := &PolicyStatement{Name: inst.name}
-		termsByName := make(map[string]*PolicyTerm)
+		ps := po.PolicyStatements[inst.name]
+		if ps == nil {
+			ps = &PolicyStatement{Name: inst.name}
+			po.PolicyStatements[inst.name] = ps
+		}
+		termsByName := psTermIndex[inst.name]
+		if termsByName == nil {
+			termsByName = make(map[string]*PolicyTerm)
+			psTermIndex[inst.name] = termsByName
+			// #5824 cross-root: psTermIndex is LOCAL to this compilePolicyOptions
+			// call, but compilePolicyOptions runs once PER top-level policy-options
+			// AST root (NewParser appends top-level nodes without merging). So a
+			// second top-level `policy-options {}` root reuses the persisted `ps`
+			// (from po.PolicyStatements) but gets a FRESH, empty termsByName — a
+			// same-name term in that root would append as a DUPLICATE (a malformed
+			// double route-map sequence in FRR) instead of composing. Seed the fresh
+			// index from ps.Terms so a same-name term composes onto the existing
+			// PolicyTerm across roots, exactly as it already does within a root.
+			for _, t := range ps.Terms {
+				termsByName[t.Name] = t
+			}
+		}
 
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
@@ -687,8 +731,9 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 				}
 			}
 		}
-
-		po.PolicyStatements[ps.Name] = ps
+		// #5824: NO unconditional overwrite here — ps is the SHARED map entry, so
+		// this instance's contributions are already merged into any earlier
+		// same-name block's terms/actions in authored order.
 	}
 
 	return nil

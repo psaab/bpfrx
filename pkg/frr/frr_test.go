@@ -5142,12 +5142,15 @@ func TestGenerateProtocols_NewlineFreeTextDoesNotInject(t *testing.T) {
 	}
 }
 
-// --- #2071: from prefix-list match clause must honor the prefix-list's
-// address family. generatePolicyOptions previously emitted "match ip
-// address prefix-list" unconditionally, so an IPv6 prefix-list referenced
-// by `from prefix-list` was a silent no-op in an IPv6 routing-policy
-// context (OSPFv3 export, BGP inet6). The render now mirrors the
-// route-filter path and emits exactly one family-correct matcher.
+// --- #2071 / #2607: from prefix-list match clause must honor the
+// prefix-list's address family. generatePolicyOptions previously emitted
+// "match ip address prefix-list" unconditionally, so an IPv6 prefix-list
+// referenced by `from prefix-list` was a silent no-op in an IPv6
+// routing-policy context (OSPFv3 export, BGP inet6). #2071 made a
+// single-family list emit its one family-correct matcher; #2607 extends
+// this so a MIXED v4+v6 list binds BOTH families (one match line per family
+// in its own route-map sequence) instead of collapsing to ipv6 and silently
+// dropping every v4 route.
 
 func policyOptionsWithPrefixListTerm(plName string, prefixes []string, withRouteFilter bool) *config.PolicyOptionsConfig {
 	term := &config.PolicyTerm{
@@ -5204,49 +5207,60 @@ func TestPrefixListMatch_IPv6(t *testing.T) {
 	}
 }
 
-func TestPrefixListMatch_Mixed_PicksIPv6_SingleSequence(t *testing.T) {
+func TestPrefixListMatch_Mixed_BindsBothFamilies_2607(t *testing.T) {
 	m := New()
-	// Mixed list: a single FRR route-map index cannot match both families
-	// (FRR ANDs match clauses), so exactly one matcher is emitted and any
-	// IPv6 entry selects the IPv6 matcher.
+	// #2607: a mixed v4+v6 referenced list must bind BOTH families. FRR ANDs
+	// match clauses within one route-map index (a v4 route NOMATCHes the ipv6
+	// clause and vice versa → AND-deny for both), so the mixed list expands into
+	// a `match ip` sequence and a `match ipv6` sequence — mirroring the #2642
+	// one-sequence-per-OR-value split (a mixed list is exactly "(in v4 half) OR
+	// (in v6 half)"). Pre-#2607 it collapsed to a lone ipv6 matcher, silently
+	// dropping every IPv4 route.
 	po := policyOptionsWithPrefixListTerm("mixed", []string{"10.0.0.0/8", "2001:db8::/32"}, false)
 	got := m.generatePolicyOptions(po)
+	if !strings.Contains(got, " match ip address prefix-list mixed\n") {
+		t.Errorf("mixed prefix-list: missing the IPv4 matcher (v4 routes would silently fail the term) in:\n%s", got)
+	}
 	if !strings.Contains(got, " match ipv6 address prefix-list mixed\n") {
-		t.Errorf("mixed prefix-list: missing `match ipv6 address prefix-list mixed` in:\n%s", got)
+		t.Errorf("mixed prefix-list: missing the IPv6 matcher in:\n%s", got)
 	}
-	if strings.Contains(got, "match ip address prefix-list mixed") {
-		t.Errorf("mixed prefix-list: must NOT also emit the IPv4 matcher (would AND to a silent deny) in:\n%s", got)
-	}
-	// Exactly one route-map sequence for the term — guards against the
-	// rejected two-sequence design.
-	if n := strings.Count(got, "route-map p permit 10"); n != 1 {
-		t.Errorf("mixed prefix-list: want exactly 1 `route-map p permit 10` sequence, got %d in:\n%s", n, got)
-	}
-	if strings.Contains(got, "route-map p permit 20") {
-		t.Errorf("mixed prefix-list: must NOT emit a second route-map sequence for the term in:\n%s", got)
+	// The two matchers live in SEPARATE sequences (FRR ANDs within one index).
+	if !strings.Contains(got, "route-map p permit 10\n") || !strings.Contains(got, "route-map p permit 20\n") {
+		t.Errorf("mixed prefix-list: want two term sequences (permit 10 + permit 20), one per family, in:\n%s", got)
 	}
 }
 
-func TestPrefixListMatch_CoResidentRouteFilter_NoDuplication(t *testing.T) {
+func TestPrefixListMatch_CoResidentRouteFilter_2607(t *testing.T) {
 	m := New()
-	// Term with BOTH a v4 route-filter and a mixed prefix-list. The
-	// route-filter keeps its own (v4) matcher; the prefix-list adds exactly
-	// one IPv6 matcher; both live in the term's single sequence; the
-	// route-filter inline definition is emitted once and there is no
-	// second route-map sequence (no term-body duplication).
+	// Term with BOTH a v4 route-filter and a mixed prefix-list. Post-#2607 the
+	// mixed list expands per-family, so the term emits two sequences: the v4
+	// half co-resides with the v4 route-filter (same FRR type → the from-
+	// prefix-list v4 entries render as an ACCESS-LIST so FRR ANDs them, #5730),
+	// and the v6 half ANDs `match ipv6 address prefix-list mixed` with the v4
+	// route-filter — a distinct type, off-family unsatisfiable, emitted not
+	// dropped (#5702). The route-filter inline definition is re-emitted per
+	// sequence (idempotent in FRR), like the existing #2642 OR-split.
 	po := policyOptionsWithPrefixListTerm("mixed", []string{"10.0.0.0/8", "2001:db8::/32"}, true)
 	got := m.generatePolicyOptions(po)
 	if !strings.Contains(got, " match ip address prefix-list p-t1\n") {
 		t.Errorf("co-resident: route-filter v4 matcher missing in:\n%s", got)
 	}
+	// v4 half of the mixed list rendered as an access-list (#5730), not a
+	// colliding `match ip address prefix-list mixed`.
+	ipACL := routeFilterACLName("mixed", "ip")
+	if !strings.Contains(got, "access-list "+ipACL+" seq 5 permit 10.0.0.0/8 exact-match\n") {
+		t.Errorf("co-resident: mixed list v4 half must render as an access-list (#5730) in:\n%s", got)
+	}
+	if !strings.Contains(got, " match ip address "+ipACL+"\n") {
+		t.Errorf("co-resident: missing the access-list match for the mixed v4 half in:\n%s", got)
+	}
+	// v6 half still emitted (off-family AND, #5702).
 	if !strings.Contains(got, " match ipv6 address prefix-list mixed\n") {
-		t.Errorf("co-resident: prefix-list IPv6 matcher missing in:\n%s", got)
+		t.Errorf("co-resident: mixed list v6 half must still be emitted in:\n%s", got)
 	}
-	if n := strings.Count(got, "route-map p permit 10"); n != 1 {
-		t.Errorf("co-resident: want exactly 1 route-map sequence, got %d in:\n%s", n, got)
-	}
-	if n := strings.Count(got, "ip prefix-list p-t1 seq 5 permit 192.168.50.0/24"); n != 1 {
-		t.Errorf("co-resident: route-filter inline definition must appear exactly once, got %d in:\n%s", n, got)
+	// Two term sequences (one per mixed-list family).
+	if !strings.Contains(got, "route-map p permit 10\n") || !strings.Contains(got, "route-map p permit 20\n") {
+		t.Errorf("co-resident: want two term sequences (one per family) in:\n%s", got)
 	}
 }
 
@@ -6045,8 +6059,9 @@ func TestGenerateProtocols_ISISBFDInsideInterfaceBlock(t *testing.T) {
 // "(route-filter) AND (prefix-list)" to prefix-list-only).
 //
 // The fix renders the from-prefix-list as an ACCESS-LIST match
-// (`match ipv6 address <name>_rf`, a distinct FRR rule type from
-// `match ipv6 address prefix-list`). A v6 route in the prefix-list but OUTSIDE
+// (`match ipv6 address <generated ACL name>`, a distinct FRR rule type from
+// `match ipv6 address prefix-list`; the name is the #5872 bounded/namespaced/
+// hashed identifier). A v6 route in the prefix-list but OUTSIDE
 // the route-filter range therefore still fails the route-filter's prefix-list
 // clause and does NOT match the term.
 //
@@ -6086,14 +6101,17 @@ func TestPolicyRouteFilterPrefixListSameFamilyNoCollision(t *testing.T) {
 			"match ipv6 address prefix-list MIX-t1", got)
 	}
 	// The from-prefix-list must render as an ACCESS-LIST match (distinct FRR
-	// rule type) so FRR ANDs it with the route-filter's prefix-list match.
-	if !strings.Contains(got, "match ipv6 address V6ONLY_rf") {
+	// rule type) so FRR ANDs it with the route-filter's prefix-list match. The
+	// access-list name is the #5872 bounded/namespaced/hashed identifier; the
+	// definition and the reference MUST use the identical name (helper output).
+	aclName := routeFilterACLName("V6ONLY", "ipv6")
+	if !strings.Contains(got, "match ipv6 address "+aclName) {
 		t.Errorf("from-prefix-list not rendered as an access-list match; want %q in:\n%s",
-			"match ipv6 address V6ONLY_rf", got)
+			"match ipv6 address "+aclName, got)
 	}
 	// Its access-list definition must be emitted (exact-match preserves the
 	// Junos `from prefix-list` exact semantics).
-	wantACL := "ipv6 access-list V6ONLY_rf seq 5 permit 2001:db8:ffff::/48 exact-match"
+	wantACL := "ipv6 access-list " + aclName + " seq 5 permit 2001:db8:ffff::/48 exact-match"
 	if !strings.Contains(got, wantACL) {
 		t.Errorf("missing access-list definition; want %q in:\n%s", wantACL, got)
 	}
@@ -6149,7 +6167,7 @@ func TestPolicyRouteFilterPrefixListOffFamilyUnchanged(t *testing.T) {
 	if !strings.Contains(got, "match ipv6 address prefix-list V6ONLY") {
 		t.Errorf("off-family from-prefix-list must stay a prefix-list match (#5702); got:\n%s", got)
 	}
-	if strings.Contains(got, "V6ONLY_rf") {
-		t.Errorf("off-family from-prefix-list must NOT be converted to an access-list; got:\n%s", got)
+	if strings.Contains(got, routeFilterACLNamespace) {
+		t.Errorf("off-family from-prefix-list must NOT be converted to an access-list (#5872 generated-ACL namespace present); got:\n%s", got)
 	}
 }

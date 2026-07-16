@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""
+Fast dedup check for new findings against prior reviews + issues.
+Handles dynamic model naming: claude-spark-1.1 -> claude-spark, muse- -> claude-, version stripping.
+
+Usage: python3 scripts/review-dedup-check.py "NAT pool overflow" --check-issues
+"""
+
+import json, re, sys, glob, os
+from collections import defaultdict
+
+def normalize_whoami(raw):
+    if not raw:
+        return "unknown"
+    raw = raw.lower()
+    raw = re.sub(r'^muse-', 'claude-', raw)
+    if raw.startswith('claude-'):
+        parts = raw.split('-')
+        who = f"{parts[0]}-{parts[1]}" if len(parts) >= 2 else parts[0]
+    else:
+        who = raw.split('-')[0]
+    who = re.sub(r'-[0-9]+(\.[0-9]+)*$', '', who)
+    who = re.sub(r'-[0-9]{8,}$', '', who)
+    return who or "unknown"
+
+def load_review_titles():
+    titles = []
+    # From review-index.json if exists (faster)
+    try:
+        data = json.loads(open('/tmp/review-index.json').read())
+        for entry in data:
+            for t in entry.get('titles', []):
+                titles.append((entry['filename'], t))
+        return titles
+    except:
+        pass
+    # Fallback: glob
+    for path in glob.glob('/tmp/*-review*.md'):
+        try:
+            content = open(path, 'r', errors='ignore').read()
+            for m in re.finditer(r'^Title\s*[:\-]\s*([^\n]+)', content, re.MULTILINE | re.IGNORECASE):
+                titles.append((os.path.basename(path), m.group(1).strip()))
+        except:
+            pass
+    return titles
+
+def load_issue_titles():
+    try:
+        data = json.loads(open('/tmp/issue-pr-index.json').read())
+        return [(f"ISSUE #{i['number']}", i['title']) for i in data.get('issues',[])]
+    except:
+        return []
+
+def check_finding(new_title, threshold=0.5):
+    """Check if new_title is similar to prior review or issue"""
+    new_words = set(re.findall(r'\b\w{3,}\b', new_title.lower()))
+    matches = []
+    for fname, title in load_review_titles():
+        existing_words = set(re.findall(r'\b\w{3,}\b', title.lower()))
+        if not existing_words or not new_words:
+            continue
+        overlap = new_words & existing_words
+        jaccard = len(overlap) / len(new_words | existing_words) if (new_words | existing_words) else 0
+        if jaccard > threshold or (len(overlap) >= 3 and len(overlap)/len(new_words) > 0.6):
+            matches.append((fname, title, jaccard, overlap))
+    for fname, title in load_issue_titles():
+        existing_words = set(re.findall(r'\b\w{3,}\b', title.lower()))
+        overlap = new_words & existing_words
+        jaccard = len(overlap) / len(new_words | existing_words) if (new_words | existing_words) else 0
+        if jaccard > threshold:
+            matches.append((fname, title, jaccard, overlap))
+    matches = sorted(matches, key=lambda x: x[2], reverse=True)
+    return matches[:10]
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python3 scripts/review-dedup-check.py \"Finding title to check\"")
+        sys.exit(1)
+    new_title = sys.argv[1]
+    print(f"Checking dedup for: {new_title}")
+    print(f"Normalized whoami detection for current model:")
+    import os
+    raw = os.environ.get('ANTHROPIC_MODEL','') or os.environ.get('CLAUDE_CODE_SUBAGENT_MODEL','')
+    print(f"  ANTHROPIC_MODEL={raw} -> normalized whoami={normalize_whoami(raw)}")
+    matches = check_finding(new_title)
+    if not matches:
+        print("No close matches found — likely NEW finding")
+    else:
+        print(f"Found {len(matches)} potential duplicates:")
+        for fname, title, jaccard, overlap in matches:
+            print(f"  - {fname}: {title[:80]} (jaccard={jaccard:.2f}, overlap={overlap})")
+

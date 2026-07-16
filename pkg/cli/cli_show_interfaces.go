@@ -136,8 +136,8 @@ func (c *CLI) showInterfaces(args []string) error {
 			unitNum, _ = strconv.Atoi(parts[1])
 		}
 		vlanID := 0
-		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg != nil {
-			if unit, ok := ifCfg.Units[unitNum]; ok && unit != nil {
+		if ifCfg, ok := config.LookupInterface(cfg, physName); ok && ifCfg != nil {
+			if unit, ok := config.LookupUnit(ifCfg, unitNum); ok && unit != nil {
 				vlanID = unit.VlanID
 			}
 		}
@@ -222,7 +222,7 @@ func (c *CLI) showInterfaces(args []string) error {
 
 		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n",
 			physName, enabled, linkUp)
-		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg.Description != "" {
+		if ifCfg, ok := config.LookupInterface(cfg, physName); ok && ifCfg.Description != "" {
 			fmt.Printf("  Description: %s\n", ifCfg.Description)
 		}
 		if isReth {
@@ -280,7 +280,7 @@ func (c *CLI) showInterfaces(args []string) error {
 		}
 
 		// VLAN tagging
-		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg.VlanTagging {
+		if ifCfg, ok := config.LookupInterface(cfg, physName); ok && ifCfg.VlanTagging {
 			fmt.Println("  VLAN tagging: Enabled")
 		}
 
@@ -370,8 +370,8 @@ func (c *CLI) showInterfaces(args []string) error {
 
 			// DHCP annotations
 			var unit *config.InterfaceUnit
-			if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg != nil {
-				if u, ok := ifCfg.Units[li.unitNum]; ok {
+			if ifCfg, ok := config.LookupInterface(cfg, physName); ok && ifCfg != nil {
+				if u, ok := config.LookupUnit(ifCfg, li.unitNum); ok {
 					unit = u
 				}
 			}
@@ -478,7 +478,7 @@ func (c *CLI) showInterfacesRethMemberSummary(cfg *config.Config, member, reth s
 		linkUp = "Down"
 	}
 	fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", member, enabled, linkUp)
-	if ifCfg, ok := cfg.Interfaces.Interfaces[member]; ok && ifCfg.Description != "" {
+	if ifCfg, ok := config.LookupInterface(cfg, member); ok && ifCfg.Description != "" {
 		fmt.Printf("  Description: %s\n", ifCfg.Description)
 	}
 	fmt.Printf("  Redundant-ethernet: member of %s\n", reth)

@@ -31,17 +31,20 @@ func (s *Server) buildInterfacesInput() cluster.InterfacesInput {
 	cc := cfg.Chassis.Cluster
 	input.ControlInterface = cc.ControlInterface
 	input.FabricInterface = cc.FabricInterface
-	if fabIfc, ok := cfg.Interfaces.Interfaces[cc.FabricInterface]; ok {
+	if fabIfc, ok := config.LookupInterface(cfg, cc.FabricInterface); ok {
 		input.FabricMembers = fabIfc.FabricMembers
 	}
 	input.Fabric1Interface = cc.Fabric1Interface
-	if fab1Ifc, ok := cfg.Interfaces.Interfaces[cc.Fabric1Interface]; ok {
+	if fab1Ifc, ok := config.LookupInterface(cfg, cc.Fabric1Interface); ok {
 		input.Fabric1Members = fab1Ifc.FabricMembers
 	}
 
 	// Build RETH info from config.
 	rethMap := cfg.RethToPhysical() // reth-name -> physical-member
 	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil { // #5886: tolerant load / HA sync can leave a present-but-nil slot
+			continue
+		}
 		if ifc.RedundancyGroup > 0 && strings.HasPrefix(name, "reth") {
 			status := "Up"
 			if phys, ok := rethMap[name]; ok {
@@ -664,6 +667,24 @@ func (s *Server) completeConfigPairs(words []string, partial string) []completio
 	}
 }
 
+func appendPredefinedApplicationSetCompletions(out []config.SchemaCompletion) []config.SchemaCompletion {
+	emitted := make(map[string]struct{}, len(out)+len(config.PredefinedApplicationSets))
+	for _, candidate := range out {
+		emitted[candidate.Name] = struct{}{}
+	}
+	for name := range config.PredefinedApplicationSets {
+		if _, exists := emitted[name]; exists {
+			continue
+		}
+		out = append(out, config.SchemaCompletion{
+			Name: name,
+			Desc: "predefined application-set",
+		})
+		emitted[name] = struct{}{}
+	}
+	return out
+}
+
 func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.SchemaCompletion {
 	if s == nil || s.store == nil {
 		return nil
@@ -708,13 +729,13 @@ func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.Sc
 		for name := range config.PredefinedApplications {
 			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
 		}
-		return out
+		return appendPredefinedApplicationSetCompletions(out)
 	case config.ValueHintAppSetName:
 		var out []config.SchemaCompletion
 		for _, as := range cfg.Applications.ApplicationSets {
 			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
 		}
-		return out
+		return appendPredefinedApplicationSetCompletions(out)
 	case config.ValueHintPoolName:
 		var out []config.SchemaCompletion
 		for name := range cfg.Security.NAT.SourcePools {
@@ -741,6 +762,9 @@ func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.Sc
 	case config.ValueHintInterfaceName:
 		var out []config.SchemaCompletion
 		for name, iface := range cfg.Interfaces.Interfaces {
+			if iface == nil { // #5886: skip a present-but-nil slot
+				continue
+			}
 			desc := iface.Description
 			if desc == "" {
 				desc = "(configured)"
@@ -776,7 +800,7 @@ func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.Sc
 		for name := range config.PredefinedApplications {
 			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
 		}
-		return out
+		return appendPredefinedApplicationSetCompletions(out)
 	case config.ValueHintPolicyName:
 		var policies []*config.Policy
 		for i, tok := range path {
@@ -832,6 +856,9 @@ func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.Sc
 		}
 		var out []config.SchemaCompletion
 		for num, unit := range iface.Units {
+			if unit == nil { // #5886: skip a present-but-nil unit
+				continue
+			}
 			desc := unit.Description
 			if desc == "" {
 				desc = "(configured)"

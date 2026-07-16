@@ -179,6 +179,16 @@ type confirmRecord struct {
 	// state (committed=0 marker), matching the in-memory PromoteRollback
 	// #1922 Item 1b path — not persist an operator-committed-empty config.
 	FirstCommit bool `json:"first_commit"`
+	// GuardedHash binds this record to the still-UNCONFIRMED config it guards —
+	// the sha256 of the active tree's Format() text at arm time (#5835). On boot
+	// recovery, if the loaded active config's hash differs, a later commit /
+	// confirm has advanced the active config but this record's durable removal
+	// had failed: the record is STALE and must NOT resurrect a rollback of an
+	// unrelated, already-confirmed generation. An empty GuardedHash marks a
+	// legacy record (written before #5835); recovery then skips the binding
+	// check and behaves exactly as #4577, preserving the cross-upgrade
+	// auto-rollback hatch (confirmRecord evolves via additive JSON fields).
+	GuardedHash string `json:"guarded_hash,omitempty"`
 }
 
 // confirmPath returns the path to the pending commit-confirmed state file.
@@ -286,11 +296,19 @@ func (db *DB) ReadConfirm() (*confirmRecord, error) {
 // #3441) so a downgrade that drops the dir sync fails a test RED.
 func (db *DB) DeleteConfirm() error {
 	if err := rbRemove(db.confirmPath()); err != nil {
-		if os.IsNotExist(err) {
-			// Already absent: nothing was unlinked, so no dir sync is needed.
-			return nil
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("delete confirm state: %w", err)
 		}
-		return fmt.Errorf("delete confirm state: %w", err)
+		// Already absent. This is EITHER "never existed" OR "a prior call
+		// unlinked it but its dir fsync failed" — the removal is then not yet
+		// durable and a crash could replay the stale dirent (#5835). The DB
+		// layer cannot tell the two apart across calls, so it does NOT short-
+		// circuit here: it falls through to the dir fsync below so an absent-
+		// file RETRY still reaches the #4864 durability sync. The caller's
+		// confirmRemoveDegraded flag carries the cross-call "sync owed" state;
+		// this method keeps returning an error until a dir fsync succeeds, so a
+		// post-unlink sync failure can never be laundered into a false success
+		// by a subsequent absent-file retry.
 	}
 	if err := rbSyncDir(filepath.Dir(db.confirmPath())); err != nil {
 		return fmt.Errorf("sync dir after delete confirm state: %w", err)
