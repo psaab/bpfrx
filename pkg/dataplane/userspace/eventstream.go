@@ -3,17 +3,20 @@ package userspace
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/logging"
+	"golang.org/x/sys/unix"
 )
 
 const pendingCallbackFramesLimit = 4096
@@ -35,7 +38,11 @@ type pendingCallbackFrame struct {
 // disconnects, the accept loop waits for reconnection.
 type EventStream struct {
 	socketPath string
-	listener   net.Listener
+
+	lifecycleMu sync.Mutex
+	listener    net.Listener
+	socketLock  *os.File
+	ownsSocket  bool
 
 	mu   sync.Mutex
 	conn net.Conn // current helper connection; nil when disconnected
@@ -49,6 +56,14 @@ type EventStream struct {
 	// a potentially slow/blocked socket write, so widening mu to cover the
 	// write is not an option.
 	writeMu sync.Mutex
+
+	// listening is TRUE once net.Listen on the event socket succeeded in
+	// Start(), and FALSE again after Close(). It records whether the daemon
+	// can ACCEPT session deltas from a helper — the local listener is bound —
+	// which is distinct from `connected` below (a helper has dialed in). HA
+	// takeover-readiness gates on this: a node whose delta channel never bound
+	// must not advertise itself able to feed a standby after failover (#5273).
+	listening atomic.Bool
 
 	connected atomic.Bool
 	paused    atomic.Bool
@@ -156,31 +171,154 @@ func (es *EventStream) dataplaneCallbacks() (func(uint64, []byte), func(uint64, 
 }
 
 // Start creates the Unix socket listener and launches the accept loop.
-func (es *EventStream) Start(ctx context.Context) {
-	_ = os.Remove(es.socketPath)
+//
+// It returns an error when listener ownership or net.Listen fails
+// (path-too-long, an active owner, permission, missing directory). A sidecar
+// flock serializes owners; while holding it, Start removes only a socket whose
+// kernel socket-table check proves it is a stale crash artifact. The failure is NOT
+// swallowed: the event socket is the primary push channel over which the local
+// helper streams
+// post-bootstrap session open/close/update deltas to the daemon. Although the
+// daemon can poll DrainSessionDeltas while the stream is disconnected, a node
+// must not silently start in that degraded fallback state. The caller therefore
+// treats a Start error as a failed bring-up rather than storing a
+// non-nil-but-dead stream (#5273).
+func (es *EventStream) Start(ctx context.Context) error {
+	es.lifecycleMu.Lock()
+	defer es.lifecycleMu.Unlock()
+	if es.listener != nil || es.ownsSocket {
+		return errors.New("event stream listener already started")
+	}
+
+	lockFile, err := acquireEventStreamSocketLock(es.socketPath)
+	if err != nil {
+		return err
+	}
+	releaseLock := true
+	defer func() {
+		if releaseLock {
+			releaseEventStreamSocketLock(lockFile)
+		}
+	}()
+	if err := removeStaleEventStreamSocket(es.socketPath); err != nil {
+		return err
+	}
+
 	ln, err := net.Listen("unix", es.socketPath)
 	if err != nil {
 		slog.Error("event stream: failed to listen", "path", es.socketPath, "err", err)
-		return
+		return fmt.Errorf("event stream listen on %s: %w", es.socketPath, err)
 	}
 	es.listener = ln
+	es.socketLock = lockFile
+	es.ownsSocket = true
+	releaseLock = false
+	es.listening.Store(true)
 	slog.Info("event stream: listening", "path", es.socketPath)
-	go es.acceptLoop(ctx)
+	go es.acceptLoop(ctx, ln)
+	return nil
+}
+
+func acquireEventStreamSocketLock(socketPath string) (*os.File, error) {
+	lockPath := socketPath + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open event stream ownership lock %s: %w", lockPath, err)
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("acquire event stream ownership lock %s: %w", lockPath, err)
+	}
+	return f, nil
+}
+
+func releaseEventStreamSocketLock(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	_ = f.Close()
+}
+
+// removeStaleEventStreamSocket removes only a proven stale Unix-stream socket.
+// The caller must hold the sidecar ownership lock. A live listener, a path of a
+// different type, or an inconclusive kernel-table read fails closed and is never
+// unlinked. Inspecting /proc/net/unix is deliberately non-invasive: dialing the
+// event socket as a liveness probe would make the old daemon accept the probe as
+// its new helper and disconnect the real helper.
+func removeStaleEventStreamSocket(socketPath string) error {
+	info, err := os.Lstat(socketPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect event stream socket %s: %w", socketPath, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("event stream path %s exists and is not a Unix socket", socketPath)
+	}
+
+	active, err := eventStreamSocketActive(socketPath)
+	if err != nil {
+		return err
+	}
+	if active {
+		return fmt.Errorf("event stream socket %s already has a live listener", socketPath)
+	}
+	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale event stream socket %s: %w", socketPath, err)
+	}
+	return nil
+}
+
+func eventStreamSocketActive(socketPath string) (bool, error) {
+	data, err := os.ReadFile("/proc/net/unix")
+	if err != nil {
+		return false, fmt.Errorf("inspect kernel Unix socket table for %s: %w", socketPath, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 8 && strings.Join(fields[7:], " ") == socketPath {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ListenerBound reports whether the event-stream listener socket successfully
+// bound (net.Listen in Start() succeeded and Close() has not run). It is TRUE
+// as soon as the daemon can receive the local helper's session deltas,
+// independent of whether that helper has dialed in (that is IsConnected). HA
+// takeover-readiness gates on ListenerBound, not IsConnected: transient stream
+// disconnects use the DrainSessionDeltas polling fallback, while a listener
+// that never bound is a failed dependency rather than an accepted startup
+// state (#5273).
+func (es *EventStream) ListenerBound() bool {
+	return es.listening.Load()
 }
 
 // Close shuts down the listener and any active connection.
 func (es *EventStream) Close() {
+	es.lifecycleMu.Lock()
+	es.listening.Store(false)
 	if es.listener != nil {
-		es.listener.Close()
+		_ = es.listener.Close()
+		es.listener = nil
 	}
 	es.mu.Lock()
 	if es.conn != nil {
-		es.conn.Close()
+		_ = es.conn.Close()
 		es.conn = nil
 	}
 	es.connected.Store(false)
 	es.mu.Unlock()
-	_ = os.Remove(es.socketPath)
+	if es.ownsSocket {
+		_ = os.Remove(es.socketPath)
+		es.ownsSocket = false
+	}
+	releaseEventStreamSocketLock(es.socketLock)
+	es.socketLock = nil
+	es.lifecycleMu.Unlock()
 }
 
 // IsConnected returns true if the helper is currently connected.
@@ -278,14 +416,14 @@ func (es *EventStream) Status() EventStreamStatus {
 }
 
 // acceptLoop listens for helper connections. Only one is active at a time.
-func (es *EventStream) acceptLoop(ctx context.Context) {
+func (es *EventStream) acceptLoop(ctx context.Context, listener net.Listener) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		conn, err := es.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			slog.Debug("event stream: accept error", "err", err)

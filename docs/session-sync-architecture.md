@@ -531,6 +531,35 @@ peer sync stream. Ack frames flow back for replay buffer management. Pause and
 Resume frames throttle the stream. The DrainRequest / DrainComplete frame pair
 is **reserved and currently dormant** — see below.
 
+The daemon owns the listener; `EventStream.Start` binds it (`net.Listen`) before
+the helper is spawned so the local helper can dial immediately. This socket is
+the primary push channel for post-bootstrap deltas from the helper into the
+daemon's peer-sync pipeline. The daemon also polls `DrainSessionDeltas` while
+the stream is disconnected (the fallback described below), but a listener bind
+failure must not silently make that degraded path the startup baseline. A bind
+failure (path too long, `EADDRINUSE`, permission, missing directory) therefore
+fail-closes dataplane bring-up: `Start` returns an error,
+`ensureProcessLocked` aborts before launching the helper instead of storing a
+non-nil-but-dead stream, and takeover readiness is denied.
+`Start` first acquires a nonblocking process-lifetime sidecar lock. While it
+owns that lock it checks `/proc/net/unix` and removes an existing filesystem
+socket only when the kernel table proves there is no live owner. This check is
+non-invasive: dialing the old listener would displace its real helper because
+the event stream permits one connection. A live or inconclusive owner is never
+unlinked. `Close` tears down the listener and accepted connection, removes the
+socket only when that `EventStream` owns it, and then releases the lock. This
+makes active-owner collisions fail closed rather than detaching the first
+daemon's pathname.
+`EventStream.ListenerBound()` reports whether the local listener is up and is
+distinct from `IsConnected()` (the local helper has dialed in). Takeover
+readiness gates on `ListenerBound()`, not `IsConnected()`: transient helper
+disconnects are covered by polling, while a listener that never bound is a
+failed dependency rather than an accepted degraded startup (#5273). Before
+#5273 the `net.Listen` failure was logged and swallowed with a void `Start`, so
+the manager kept the dead stream and takeover readiness — which only checked
+the control socket, ping, forwarding-arm, and XSK liveness — could advertise a
+node without its primary delta stream.
+
 #### DrainRequest fence (#2876, #2920) — RESERVED / DORMANT
 
 > **Status: implemented and hardened, but not wired to any production path.**

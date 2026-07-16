@@ -48295,6 +48295,47 @@ top.
 - **Adversarial restack hardening (2026-07-14)**: Rebased onto master and closed four identity-boundary gaps missed by the original happy-path review. The parse key's configured address is now authoritative over a malformed VIP when deriving family. All raw/AF_PACKET RX paths reject the opposite family before state-machine admission; IPv6-only instances no longer require IPv4 raw sockets and required IPv6 socket failures roll back all opened descriptors instead of publishing a false-ready instance; duplicate `{kernel iface, VRID, family}` identities and empty-family RETH/generic wire-domain overlaps are rejected transactionally and propagated through the commit error join; and `VRRPEvent`/`InstanceStates` retain family so cluster RG controls ignore standalone VRIDs that numerically overlap `100+RG`. Added fail-on-revert parser, socket-selection/rollback, collision-transaction, commit-propagation, event-identity, and RETH-isolation tests.
 - **Additional file(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_ha.go, pkg/daemon/per_rg_test.go, pkg/daemon/vrrp_identity_failclosed_5083_test.go
 
+- **Timestamp**: 2026-07-10
+  **Action**: #5273 [HIGH dataplane/HA] pkg/dataplane/userspace: fail closed
+  event-stream listener startup and HA takeover readiness. `EventStream.Start`
+  now returns listener-ownership/bind errors, serializes socket ownership with
+  a process-lifetime sidecar lock, removes only kernel-table-proven stale socket
+  artifacts without dialing/displacing a live helper, and exposes the local
+  listener lifecycle via `ListenerBound`;
+  `ensureProcessLocked` aborts before helper spawn when the listener cannot
+  bind; and `takeoverReadyLocked` requires the local listener to be bound
+  without requiring the local helper to remain connected. This
+  prevents a node from silently starting without its primary push stream while
+  preserving the existing `DrainSessionDeltas` polling fallback for transient
+  disconnects. Fail-on-revert tests cover bind failure, listener lifecycle,
+  competing-owner isolation, stale-socket recovery, and
+  failed/bound-disconnected/bound-connected readiness.
+  **File(s)**: pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/process.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/eventstream_test.go,
+  pkg/dataplane/userspace/manager_ha_test.go,
+  pkg/dataplane/userspace/manager_sessionsync_test.go,
+  pkg/dataplane/userspace/process_eventstream_start_5273_test.go,
+  docs/session-sync-architecture.md, docs/ha-failover-status.md, _Log.md
+  **Validation**: `go build ./...` and
+  `go test -race -count=1 ./pkg/dataplane/userspace/...` passed on the original
+  PR head. The HA failover cluster gate remains required after restacking.
+## #5267 event-stream FullResync seq-ordering (2026-07-10)
+- **Timestamp**: 2026-07-10
+- **Action**: Fix replay-gap FullResync written outside
+  `producer_seq_lock` (out-of-order wire frames and HA resync churn). Allocate
+  the barrier sequence under the lock, park it in the per-connection
+  `pending_resync`, and merge it into the connected-loop drain in sequence
+  order. Added a deterministic RED-on-revert wire-order test and an independent
+  lock-held guard proving the replay-gap allocator cannot bypass the producer
+  critical section. Clarified that paused barriers follow the existing replay
+  behavior; #5328 owns the separate latent Resume replay-suffix gap.
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests/replay_budget.rs,
+  userspace-dp/src/event_stream/tests/backpressure.rs,
+  userspace-dp/src/event_stream/tests/drain.rs,
+  userspace-dp/src/event_stream/README.md, _Log.md
 - **Timestamp**: 2026-07-13 20:15 PDT
   **Action**: Fix #5759 — make successful cold-boot host-inbound fallback
   publication exactly `S'=D`, where `D=V||U4||U6` is computed from the same

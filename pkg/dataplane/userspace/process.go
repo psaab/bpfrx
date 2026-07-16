@@ -49,10 +49,19 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	if evtPath == "" {
 		evtPath = filepath.Join(filepath.Dir(cfg.ControlSocket), "userspace-dp-events.sock")
 	}
-	_ = os.Remove(evtPath)
 	es := NewEventStream(evtPath)
 	esCtx, esCancel := context.WithCancel(context.Background())
-	es.Start(esCtx)
+	// The event socket is the primary push path for post-bootstrap session
+	// deltas from the local helper to the daemon. If its listener fails to bind,
+	// fail the whole bring-up here — BEFORE spawning the helper — rather than
+	// silently starting in the slower DrainSessionDeltas polling fallback with a
+	// non-nil-but-dead stream that takeoverReadyLocked would wave through as
+	// healthy (#5273).
+	if err := es.Start(esCtx); err != nil {
+		esCancel()
+		es.Close()
+		return fmt.Errorf("start userspace dataplane event stream listener: %w", err)
+	}
 	m.eventStream = es
 	m.eventStreamCancel = esCancel
 	// Clear stale XSKMAP entries from previous helper instance.

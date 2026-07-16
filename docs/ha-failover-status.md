@@ -33,7 +33,15 @@ yet. Here is what is true today:
   explicit refresh RPC
 - Manual failover uses request/ack/commit protocol (PRs #395-#397) — not
   weight-zero heuristics
-- Takeover readiness gates on proven userspace dataplane health (#391)
+- Takeover readiness gates on proven userspace dataplane health (#391): the
+  control socket + ping, forwarding armed, XSK liveness, session mirror health,
+  AND — since #5273 — the local event-stream listener being bound
+  (`EventStream.ListenerBound()`). The listener is the primary local
+  helper-to-daemon push path feeding the peer-sync pipeline, so a node whose
+  `net.Listen` failed to bind is denied takeover readiness rather than silently
+  starting in the slower `DrainSessionDeltas` polling fallback. The gate keys on
+  the listener being UP, not on the local helper currently being connected;
+  transient stream disconnects are covered by polling
 - Blackhole routes skipped in userspace mode (#354)
 - Helper watchdog threshold aligned with sync cadence (#349)
 - Reverse companions pre-installed via sync path (#310)

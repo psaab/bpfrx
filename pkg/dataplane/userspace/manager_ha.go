@@ -344,6 +344,18 @@ func (m *Manager) takeoverReadyLocked() (bool, []string) {
 		}
 		reasons = append(reasons, reason)
 	}
+	// Gate on the LOCAL event-stream listener being bound — the primary push
+	// channel from the local helper into the daemon's peer-sync pipeline. A bind
+	// failure (path-too-long, EADDRINUSE, permission) must not be accepted as a
+	// healthy startup merely because the slower DrainSessionDeltas polling
+	// fallback exists (#5273). This gates on the listener being UP, not on the
+	// local helper currently being connected (IsConnected): transient stream
+	// disconnects are covered by polling. ensureProcessLocked already fails
+	// bring-up when the listener cannot bind, so a running proc normally has a
+	// bound stream; this defense-in-depth gate keeps that contract explicit.
+	if m.eventStream == nil || !m.eventStream.ListenerBound() {
+		reasons = append(reasons, "userspace event stream listener not bound")
+	}
 	return len(reasons) == 0, reasons
 }
 
