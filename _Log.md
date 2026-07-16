@@ -48975,6 +48975,28 @@ top.
     pkg/api/README.md
 
 - **Timestamp**: 2026-07-15
+  - **Action**: #4886 control-plane unbounded-memory cohort — fixed the 3 LIVE
+    parts (STEP-0 found A-gRPC already bounded by #5454 and B-rebuffer already
+    streamed by #4731/#4709; did NOT touch those). A-CLI: cli_clear.go
+    clearFilteredSessions snapshotted every matching fwd/rev/DNAT key before
+    deleting → bounded it via a collect-≤cliClearFilteredBatch → delete → resume
+    loop mirroring the #5454 gRPC path (cursor primary IterateSessionsFrom to keep
+    it O(N) and avoid the O(N²) CPU-stall #4719, bounded rescan fallback);
+    peak O(batch). B: dispatchWithPager now TTY-gates via stdoutIsTerminal()
+    (TCGETS) — a non-TTY stdout (the `show | match` filter pipe) auto-disables the
+    pager, fixing the nested-pager --More---into-hidden-pipe hang. C:
+    ddns_leases.go parseActiveLeasesFileInto streams csv.Read() row-by-row into acc
+    instead of csv.ReadAll(), dropping the O(history) retained-rows transient.
+    Per-part fail-on-revert proven via -overlay: A snapshot-all → chunk 20 > batch 4
+    RED; B no-guard → --More-- leak RED; C ReadAll → 22.97MB > 19MB bound RED
+    (streaming 14.9MB). Also added cursor overrides to the 2 existing clear test
+    fakes (they embed *dataplane.Manager and only overrode IterateSessions).
+  - **File(s)**: pkg/cli/cli_clear.go, pkg/cli/cli_dispatch.go,
+    pkg/dhcpserver/ddns_leases.go, pkg/cli/cli_clear_bounded_4886_test.go,
+    pkg/cli/cli_dispatch_pager_tty_4886_test.go,
+    pkg/dhcpserver/ddns_leases_streaming_4886_test.go,
+    pkg/cli/cli_clear_reversekey_test.go, pkg/cli/cli_clear_errors_test.go,
+    pkg/cli/README.md
   - **Action**: #5700 surface VRF setup/mgmt-bind failure into commit truth (M25).
     applyVRFReconcile (pkg/daemon/daemon_apply.go) LOGGED-and-DROPPED its
     ReconcileVRFs failure at WARN and returned only the #2926-C1 ctx-cancellation,

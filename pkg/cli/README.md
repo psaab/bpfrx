@@ -151,6 +151,25 @@ presenter's rendered output is byte-identical:
   because an empty `ClearSessionsRequest` means clear-all to the peer.
   Key ports are network byte order (`ntohs` before comparing) and
   dataplane IPv4 NAT fields decode with NativeEndian (`uint32ToIP`).
+  The FILTERED clear (`clearFilteredSessions`) is BOUNDED (#4886): it
+  collects at most `cliClearFilteredBatch` forward keys (plus each
+  session's reverse/DNAT companion), deletes that chunk, and resumes —
+  cursor primary (`IterateSessionsFrom`, one O(N) forward pass, deferred
+  anchor delete) with a fresh-rescan fallback for a cursor-less dataplane
+  — so peak memory is O(batch), not O(matches). The pre-#4886 path
+  snapshotted every matching key first (hundreds of MB before deleting on
+  a multi-million-entry table). This mirrors the already-bounded gRPC
+  `ClearSessions` (#5454); using the cursor (not a bare rescan) keeps a
+  broad clear O(N), avoiding the O(N²) CPU-stall that would starve the HA
+  watchdog (#4719).
+- `show` PAGER auto-disable (`dispatchWithPager`, #4886): the pager only
+  engages when `os.Stdout` is a real terminal (`stdoutIsTerminal`, probed
+  via TCGETS — `/dev/null` is a CharDevice so `os.ModeCharDevice` is
+  wrong). A `show … | match X` redirects `os.Stdout` to the filter pipe;
+  the inner bare `show` used to route back to the pager, which then wrote
+  `--More--` into the hidden outer pipe while blocking on stdin — the
+  command hung with no visible prompt. Auto-disabling on a non-TTY stdout
+  (pipe / file / scripted) fixes the nesting and streams straight through.
 - GLOBAL-ONLY clears (`cli_clear.go`) — commands whose backend action can
   ONLY clear everything and have no scoped variant (`clear arp`, `clear ipv6
   neighbors`, `clear interfaces statistics`, `clear system config-lock`,
