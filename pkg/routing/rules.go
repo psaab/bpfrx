@@ -772,8 +772,18 @@ func BuildPBRRules(cfg *config.Config) ([]PBRRule, error) {
 
 	var rules []PBRRule
 	var errs []error
+	// #5683: once the running rule count reaches maxPBRRules no further term can
+	// be materialized (the installer's priority window addresses only that many
+	// rules), so stop feeding attachments to the expander. This is the outer half
+	// of the bounded-materialization guard — buildPBRFromFilter enforces the same
+	// budget per term so the six-dimensional Cartesian product is NEVER allocated
+	// beyond the cap.
+	overflowed := false
 	build := func(atts []pbrAttachment, filters map[string]*config.FirewallFilter, family int) {
 		for _, att := range atts {
+			if overflowed {
+				return
+			}
 			filter := filters[att.Filter]
 			if filter == nil {
 				// Dangling attachment (filter named on an interface but not
@@ -793,26 +803,31 @@ func BuildPBRRules(cfg *config.Config) ([]PBRRule, error) {
 					att.Filter))
 				continue
 			}
-			r, e := buildPBRFromFilter(filter, family, tableIDs, pls)
+			// Budget the remaining priority window for this attachment so a term
+			// whose Cartesian product would overrun the cap is dropped BEFORE it
+			// is expanded (#5683), not materialized-then-truncated.
+			r, e, of := buildPBRFromFilter(filter, family, tableIDs, pls, maxPBRRules-len(rules))
 			// Scope every rule this attachment produced to its ingress interface.
 			for i := range r {
 				r[i].IifName = att.Iif
 			}
 			rules = append(rules, r...)
 			errs = append(errs, e...)
+			if of {
+				overflowed = true
+				return
+			}
 		}
 	}
 	build(inetAttached, fw.FiltersInet, unix.AF_INET)
 	build(inet6Attached, fw.FiltersInet6, unix.AF_INET6)
 
-	// M3: truncate to the priority window and report the overflow rather than
-	// silently dropping later terms' steering.
+	// #5683 defense-in-depth: buildPBRFromFilter's per-term budget guard already
+	// guarantees len(rules) <= maxPBRRules, so this truncation is a no-op belt
+	// (it can never allocate the pre-cap blow-up the guard prevents). The
+	// per-offender overflow error is emitted by buildPBRFromFilter, naming the
+	// filter and term whose product crossed the cap.
 	if len(rules) > maxPBRRules {
-		errs = append(errs, fmt.Errorf(
-			"PBR expansion produced %d ip rules, exceeding the limit of %d; "+
-				"steering for the %d rule(s) beyond the limit is dropped — reduce the "+
-				"DSCP×source×destination cross-product in the routing-instance filter terms",
-			len(rules), maxPBRRules, len(rules)-maxPBRRules))
 		rules = rules[:maxPBRRules]
 	}
 	return rules, errors.Join(errs...)
@@ -938,7 +953,19 @@ func sortAttachments(atts []pbrAttachment) {
 // The returned error slice carries per-term DEGRADED conditions (an
 // unrepresentable except set, a DSCP-0 match, or an ip-rule-unrepresentable
 // L4/per-packet predicate — #3730); the buildable rules are still returned.
-func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[string]int, pls map[string]*config.PrefixList) ([]PBRRule, []error) {
+//
+// budget is the number of ip rules the caller can still install before the
+// maxPBRRules priority window is full. Before expanding a term's six-dimensional
+// Cartesian product (DSCP × protocol × source-port × destination-port × source ×
+// destination), the term's product SIZE is computed from the resolved dimension
+// lengths — O(dimensions), not O(product) — and a term that would push the
+// running total past the remaining budget is DROPPED WHOLE (fail-safe
+// under-steer to the main table) with a degraded error rather than materialized
+// and then truncated (#5683). This makes the pre-cap memory/CPU blow-up
+// impossible: the full product is never allocated. The returned bool is true
+// when such an overflow drop occurred, signalling the caller to stop feeding
+// further attachments (the window is full).
+func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[string]int, pls map[string]*config.PrefixList, budget int) ([]PBRRule, []error, bool) {
 	var rules []PBRRule
 	var errs []error
 	for _, term := range filter.Terms {
@@ -1103,6 +1130,30 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 			dports = []*PBRPortRange{nil}
 		}
 
+		// #5683: cap the expansion BEFORE materializing it. The term expands to
+		// exactly len(toses)×len(protos)×len(sports)×len(dports)×len(srcs)×len(dsts)
+		// ip rules; computing that product from the dimension lengths is O(1) and
+		// cannot overflow (pbrTermProduct saturates). A term whose product would
+		// exhaust the remaining priority-window budget is dropped WHOLE (fail-safe
+		// under-steer, matching the unrepresentable/DSCP-0 drops above) rather than
+		// allocating millions of PBRRule structs and truncating — the pre-cap
+		// memory/CPU exhaustion the 1000-rule cap was meant to bound but did not.
+		remaining := budget - len(rules)
+		product := pbrTermProduct(len(toses), len(protos), len(sports), len(dports), len(srcs), len(dsts))
+		if remaining < 0 || product > remaining {
+			errs = append(errs, fmt.Errorf(
+				"PBR filter %s term %s expands to %s policy-based-routing ip rules "+
+					"(DSCP×protocol×source-port×destination-port×source×destination "+
+					"cross-product), which exceeds the remaining %d-rule budget of the "+
+					"%d-rule limit; steering for this term is dropped (fail-safe "+
+					"under-steer to the main table) — tighten the match (fewer source/"+
+					"destination addresses, DSCP values, protocols, or ports) so the "+
+					"total stays within %d rules",
+				filter.Name, term.Name, pbrProductString(product), max(remaining, 0),
+				maxPBRRules, maxPBRRules))
+			return rules, errs, true
+		}
+
 		for _, t := range toses {
 			for _, proto := range protos {
 				for _, sp := range sports {
@@ -1128,7 +1179,43 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 			}
 		}
 	}
-	return rules, errs
+	return rules, errs, false
+}
+
+// pbrTermProduct returns the size of a routing-instance term's Cartesian
+// expansion (the product of its per-dimension counts) SATURATED at
+// maxPBRRules+1, so a pathological config whose dimensions multiply past the
+// int range cannot overflow — the exact magnitude past the cap is irrelevant,
+// only that it EXCEEDS the bound. Each dimension is normalized to at least 1 by
+// the caller (an unconstrained dimension still contributes one rule), but a
+// defensive floor of 1 is applied here too. O(dimensions), never O(product):
+// it multiplies the slice lengths, it never visits a tuple.
+func pbrTermProduct(dims ...int) int {
+	const ceil = maxPBRRules + 1
+	product := 1
+	for _, d := range dims {
+		if d < 1 {
+			d = 1
+		}
+		if d > ceil {
+			return ceil
+		}
+		product *= d
+		if product > maxPBRRules {
+			return ceil
+		}
+	}
+	return product
+}
+
+// pbrProductString renders a saturated pbrTermProduct count for an operator
+// error: an exact count under the cap, or ">N" once the product saturated at
+// the ceiling (the true magnitude was deliberately never computed).
+func pbrProductString(product int) string {
+	if product > maxPBRRules {
+		return fmt.Sprintf(">%d", maxPBRRules)
+	}
+	return strconv.Itoa(product)
 }
 
 // pbrTermL4 classifies a routing-instance term's L4 / per-packet `from`
