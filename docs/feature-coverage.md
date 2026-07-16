@@ -157,9 +157,20 @@ the userspace dataplane admission boundary is in
   the tolerant load / peer-sync path (`validateVRRPAuthenticationAST`,
   `pkg/config/compiler_interfaces.go`).
 - **Redundancy-group IP monitoring** (`chassis cluster redundancy-group N
-  ip-monitoring`): each configured target is ICMP-echo probed every poll and
-  its `weight` is subtracted from the RG priority while the target is
-  unreachable, driving weight-based failover. The probe **validates the echo
+  ip-monitoring`): each configured target is ICMP-echo probed every poll,
+  driving weight-based failover. **`global-threshold` gates `global-weight`
+  (vSRX semantics, #5271):** when `global-threshold` is configured (> 0), each
+  unreachable target's `weight` accumulates into a per-RG cumulative
+  reachability-loss sum, and a **single** deduction of `global-weight` is
+  applied to the RG only while that cumulative sum is ≥ `global-threshold`
+  (cleared when it falls back below). Below the threshold **no** election debt
+  is applied, so a single (or otherwise sub-threshold) probe loss cannot move
+  services — closing the split-brain / premature-failover risk of the previous
+  behavior, which deducted every failed target's weight independently and
+  ignored `global-threshold` entirely. When `global-threshold` is unset (0),
+  the historical **independent per-target** behavior is preserved exactly: each
+  unreachable target subtracts its own `weight` (or `global-weight` when the
+  per-target weight is unset) immediately. The probe **validates the echo
   reply against the request** before counting it as reachable — the responder
   source must equal the probed target, the ICMP identifier must equal the
   one the request used, and the sequence must match the value just sent. The

@@ -73,6 +73,15 @@ type Monitor struct {
 	ifaceState map[monitorKey]*monitorState
 	ipState    map[ipMonitorKey]*monitorState
 
+	// ipThresholdState tracks, per RG, whether the cumulative IP-monitoring
+	// failure weight currently meets the configured global-threshold (so the
+	// single aggregate global-weight debt is installed). Only used when an RG
+	// configures ip-monitoring global-threshold > 0 (#5271); it lets the
+	// aggregate gate fire SetMonitorWeight/RecordEvent only on a real
+	// crossed↔cleared transition rather than every poll. The zero value
+	// (absent/false) means "no aggregate debt installed".
+	ipThresholdState map[int]bool
+
 	// localStatuses holds the latest local interface monitor states,
 	// rebuilt on every poll cycle. Used to populate heartbeat packets.
 	localStatuses []InterfaceMonitorInfo
@@ -181,8 +190,9 @@ func NewMonitor(mgr *Manager, groups []*config.RedundancyGroup) *Monitor {
 	return &Monitor{
 		mgr:        mgr,
 		groups:     groups,
-		ifaceState: make(map[monitorKey]*monitorState),
-		ipState:    make(map[ipMonitorKey]*monitorState),
+		ifaceState:       make(map[monitorKey]*monitorState),
+		ipState:          make(map[ipMonitorKey]*monitorState),
+		ipThresholdState: make(map[int]bool),
 	}
 }
 
@@ -357,6 +367,10 @@ func (mon *Monitor) pollCycle(ctx context.Context) {
 			}
 			mon.applyIPMonitorResult(rg, target, res.reachable)
 		}
+		// After every target's dampened state is updated, apply the RG's
+		// aggregate global-threshold gate (#5271). A no-op unless the RG
+		// configures ip-monitoring global-threshold > 0.
+		mon.applyRGIPMonitorThreshold(rg)
 	}
 
 	mon.mu.Lock()
@@ -518,20 +532,33 @@ launch:
 	return results
 }
 
-// applyIPMonitorResult folds one target's reachability into the dampened state
-// and fires SetMonitorWeight/RecordEvent on a transition. This is the exact
-// per-target body the old serial pollIPMonitors ran; it is called serially in
-// stable RG/target order so the failover decision is byte-identical.
+// ipTargetWeight resolves a target's effective monitor weight: its own weight,
+// or the RG global-weight when the per-target weight is unset (0). This is the
+// value the target contributes both as an independent debt (no global-threshold)
+// and to the cumulative failure sum (with global-threshold).
+func (mon *Monitor) ipTargetWeight(rg *config.RedundancyGroup, target *config.IPMonitorTarget) int {
+	if target.Weight != 0 {
+		return target.Weight
+	}
+	return rg.IPMonitoring.GlobalWeight
+}
+
+// applyIPMonitorResult folds one target's reachability into its dampened
+// per-target state. It is called serially in stable RG/target order.
+//
+// Election-debt handling depends on whether the RG configures a cumulative
+// ip-monitoring global-threshold:
+//
+//   - No global-threshold (0/unset): a dampened transition installs/removes
+//     that target's INDEPENDENT election debt immediately via SetMonitorWeight
+//     — the historical behavior, byte-identical for configs that never set
+//     global-threshold.
+//   - global-threshold > 0: the per-target transition updates only the dampened
+//     down/up state here; the RG election debt is owned entirely by the
+//     aggregate gate in applyRGIPMonitorThreshold (#5271), so a single or
+//     sub-threshold probe loss no longer deducts weight or moves services.
 func (mon *Monitor) applyIPMonitorResult(rg *config.RedundancyGroup, target *config.IPMonitorTarget, reachable bool) {
 	key := ipMonitorKey{rgID: rg.ID, address: target.Address}
-
-	weight := target.Weight
-	if weight == 0 {
-		weight = rg.IPMonitoring.GlobalWeight
-	}
-
-	// Use "ip:" prefix to distinguish from interface monitors.
-	monName := "ip:" + target.Address
 
 	state := mon.ipState[key]
 	if state == nil {
@@ -539,19 +566,91 @@ func (mon *Monitor) applyIPMonitorResult(rg *config.RedundancyGroup, target *con
 		mon.ipState[key] = state
 	}
 
-	if mon.evaluateTransition(state, !reachable) {
-		mon.mgr.SetMonitorWeight(rg.ID, monName, state.down, weight)
-		if state.down {
-			mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
-				"IP %s unreachable, weight %d", target.Address, weight))
-		} else {
-			mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
-				"IP %s reachable", target.Address))
-		}
-		slog.Info("cluster monitor: IP probe state changed",
-			"rg", rg.ID, "address", target.Address,
-			"reachable", reachable, "weight", weight)
+	transitioned := mon.evaluateTransition(state, !reachable)
+	if !transitioned {
+		return
 	}
+
+	// Aggregate-threshold mode: record the reachability change for operators
+	// but defer the election debt to the aggregate gate.
+	if rg.IPMonitoring.GlobalThreshold > 0 {
+		slog.Info("cluster monitor: IP probe state changed (aggregate global-threshold mode)",
+			"rg", rg.ID, "address", target.Address, "reachable", reachable)
+		return
+	}
+
+	// Independent mode: per-target debt, exactly as before.
+	weight := mon.ipTargetWeight(rg, target)
+	monName := "ip:" + target.Address // "ip:" prefix distinguishes from interface monitors
+	mon.mgr.SetMonitorWeight(rg.ID, monName, state.down, weight)
+	if state.down {
+		mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
+			"IP %s unreachable, weight %d", target.Address, weight))
+	} else {
+		mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
+			"IP %s reachable", target.Address))
+	}
+	slog.Info("cluster monitor: IP probe state changed",
+		"rg", rg.ID, "address", target.Address,
+		"reachable", reachable, "weight", weight)
+}
+
+// applyRGIPMonitorThreshold implements the Junos chassis-cluster ip-monitoring
+// cumulative global-threshold gate (#5271).
+//
+// vSRX semantics: each monitored target's weight contributes to a per-RG
+// cumulative "reachability loss" sum while the target is unreachable. The RG
+// election debt is a SINGLE synthetic deduction of global-weight, applied only
+// while that cumulative sum is >= global-threshold, and cleared when it falls
+// back below. Below the threshold NO election debt is applied, so a single (or
+// otherwise sub-threshold) probe loss cannot move services — the split-brain /
+// premature-failover risk the pre-#5271 per-target-independent deduction had.
+//
+// This is a no-op when the RG does not configure global-threshold; that
+// independent per-target path is handled in applyIPMonitorResult and is
+// unchanged. The aggregate debt is installed under a distinct per-RG monitor
+// name ("ip-monitoring") so it never collides with the per-target "ip:<addr>"
+// debts or with interface-monitor names.
+func (mon *Monitor) applyRGIPMonitorThreshold(rg *config.RedundancyGroup) {
+	if rg.IPMonitoring == nil || rg.IPMonitoring.GlobalThreshold <= 0 {
+		return
+	}
+
+	// Cumulative weight of currently-down (dampened) targets. Targets whose
+	// probe was deferred this cycle keep their last-known dampened state, so
+	// the sum still reflects the best-known reachability.
+	cumulative := 0
+	for _, target := range rg.IPMonitoring.Targets {
+		key := ipMonitorKey{rgID: rg.ID, address: target.Address}
+		if st := mon.ipState[key]; st != nil && st.down {
+			cumulative += mon.ipTargetWeight(rg, target)
+		}
+	}
+	crossed := cumulative >= rg.IPMonitoring.GlobalThreshold
+
+	// Fire only on a real crossed↔cleared transition. The zero value of the
+	// map (absent key) is false = no aggregate debt, so the first cycle in the
+	// healthy state is correctly a no-op.
+	if mon.ipThresholdState[rg.ID] == crossed {
+		return
+	}
+	mon.ipThresholdState[rg.ID] = crossed
+
+	const aggMonName = "ip-monitoring"
+	mon.mgr.SetMonitorWeight(rg.ID, aggMonName, crossed, rg.IPMonitoring.GlobalWeight)
+	if crossed {
+		mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
+			"IP monitoring cumulative failure weight %d reached global-threshold %d, deducting global-weight %d",
+			cumulative, rg.IPMonitoring.GlobalThreshold, rg.IPMonitoring.GlobalWeight))
+	} else {
+		mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
+			"IP monitoring cumulative failure weight %d fell below global-threshold %d, clearing global-weight",
+			cumulative, rg.IPMonitoring.GlobalThreshold))
+	}
+	slog.Info("cluster monitor: IP monitoring aggregate threshold",
+		"rg", rg.ID, "cumulative", cumulative,
+		"threshold", rg.IPMonitoring.GlobalThreshold,
+		"crossed", crossed, "global_weight", rg.IPMonitoring.GlobalWeight)
 }
 
 // probeICMP sends one ICMP echo to addr and reports (reachable, completed).
