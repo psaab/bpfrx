@@ -28,6 +28,38 @@
   restore → GREEN). Smoke (`test-failover`) blocked by the loss-cluster shim-ABI
   wall; gated on the fail-on-revert unit tests.
 
+## 2026-07-16 — #5688 (Rust NAT): interface-mode SNAT with no same-family egress address leaked the source untranslated (fail-open)
+- **Timestamp**: 2026-07-16 (fix/5688-interface-snat-no-egress-drop)
+- **Action**: Fix #5688 (security/correctness fail-open, Rust userspace-dp
+  source NAT). STEP-0 confirmed live on origin/master 04e1527ab: in
+  `match_source_nat_result_for_tuple` (`userspace-dp/src/nat/source.rs`) the
+  `interface_mode` branch resolved `rewrite_src` from the egress interface's
+  same-family address (`egress_v4`/`egress_v6`) and returned
+  `SourceNatLookup::Matched` UNCONDITIONALLY — even when that address was
+  `None`. A `Matched` decision with a `None` source rewrite forwards the packet
+  UNTRANSLATED, so a v4 packet whose egress interface has no v4 address (or a v6
+  packet with no v6 egress address) leaked its private/internal source onto the
+  egress. Fix: fail CLOSED — when the same-family egress address is absent,
+  return `SourceNatLookup::Unavailable(SourceNatFailureReason::InterfaceNoEgressAddress)`
+  (new runtime-only reason, exception string
+  `source_nat_interface_no_egress_address`). That funnels through the SAME drop /
+  `nat_alloc_fail` disposition (`record_source_nat_failure`,
+  `poll_descriptor/nat_exception.rs`) a pool-mode allocation failure takes, so
+  the flow is dropped + counted instead of leaking. Disposition-only: no NAT
+  tuple / map-key / wire layout change. Families resolved independently (v4
+  packet → v4 egress addr, v6 packet → v6 egress addr); the working case (egress
+  HAS a same-family address) still translates.
+- **File(s)**: `userspace-dp/src/nat/source.rs` (new `InterfaceNoEgressAddress`
+  reason + exception string + fail-closed interface-mode branch),
+  `userspace-dp/src/nat/tests_source.rs` (3 fail-on-revert tests),
+  `userspace-dp/README.md` (source-NAT semantics bullet).
+- **Validation**: `cargo test --release` FULL suite 3945 passed / 0 failed.
+  Fail-on-revert proven: reverting to `Matched`-with-`None`-rewrite turns
+  `interface_source_nat_no_v4_egress_addr_fails_closed` and
+  `interface_source_nat_no_v6_egress_addr_fails_closed` RED while the
+  no-regression / dual-stack test
+  `interface_source_nat_translates_when_same_family_egress_addr_present` stays
+  GREEN. Smoke deferred (loss-cluster shim-wall) — unit-covered fail-closed.
 ## 2026-07-16 — #5830 (routing): per-instance next-table diverges between userspace and kernel/FRR (split-brain leak)
 - **Timestamp**: 2026-07-16 (fix/5830-per-instance-nexttable)
 - **Action**: Fix #5830. STEP-0 on origin/master 04e1527ab confirmed the
