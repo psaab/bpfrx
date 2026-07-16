@@ -1,3 +1,33 @@
+## 2026-07-16 — #5695 (security/HA): VRRP/GARP gratuitous-arp-count accepts unbounded value (codex-182 M16)
+- **Timestamp**: 2026-07-16 (fix/5695-garp-count-cap)
+- **Action**: Fix #5695. `gratuitous-arp-count` had `ValidateIntegerMin(1)`
+  (min-only) at the schema and NO runtime upper bound, so a large count fanned an
+  unbounded per-VIP raw-socket GARP/NA burst on failover (1 immediate frame +
+  (count-1) 50ms follow-ups per VIP) — a self-inflicted CPU/socket exhaustion
+  vector. Grepped all consumers: two LIVE send sites — `pkg/vrrp/instance.go`
+  sendGARP (RETH/standalone VRRP) and `pkg/daemon/daemon_ha_vip.go`
+  directSendGARPs (direct-mode cluster). `pkg/cluster` `m.garpCounts` is written
+  but never read (dead). Fix, doctrine-aligned (no-schema-only-caps, PR #1845):
+  (1) PRIMARY runtime clamp — new `config.GratuitousARPBurstClamp = 32` (2× the
+  Junos 1..16 max; every legit config passes untouched, per-VIP tail hard-bounded
+  to ~(32-1)*50ms ≈ 1.55s) + `config.ClampGratuitousARPCount`; both send sites
+  clamp the effective count and slog.Warn ONCE (per-instance atomic.Bool in vrrp;
+  per-RG mutex-guarded map `warnGARPClampOnce` in daemon — never per-send). (2)
+  commit-side SIGNAL (option a) — new AST pre-walk `validateGratuitousARPCountAST`
+  in runPreWalkGates emits a WARNING (never hard-reject) when a count exceeds the
+  clamp, mirroring #1960 lenient/warn. Introduced `garpBurstFn`/`naBurstFn` test
+  seams in vrrp (mirror the existing `arpProbeFn` seam) to capture the effective
+  burst count. Tests (fail-on-revert, all firsthand RED-verified): config
+  `garp_clamp_5695_test.go` (helper + commit warning), vrrp
+  `instance_garp_clamp_5695_test.go` (sendGARP clamp), daemon
+  `direct_garp_clamp_5695_test.go` (directSendGARPs clamp). Build/vet clean; full
+  `pkg/config` + `pkg/vrrp` + `pkg/daemon` suites GREEN under `-race`.
+- **File(s)**: pkg/config/garp_clamp.go (new), pkg/config/compiler_chassis_garp_count.go (new),
+  pkg/config/compiler_prewalk.go, pkg/config/schema_chassis.go, pkg/vrrp/instance.go,
+  pkg/daemon/daemon_ha_vip.go, pkg/daemon/daemon.go, docs/config-schema.md,
+  pkg/config/garp_clamp_5695_test.go (new), pkg/vrrp/instance_garp_clamp_5695_test.go (new),
+  pkg/daemon/direct_garp_clamp_5695_test.go (new)
+
 ## 2026-07-16 — #5830 (routing): per-instance next-table diverges between userspace and kernel/FRR (split-brain leak)
 - **Timestamp**: 2026-07-16 (fix/5830-per-instance-nexttable)
 - **Action**: Fix #5830. STEP-0 on origin/master 04e1527ab confirmed the
