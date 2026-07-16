@@ -126,6 +126,12 @@ class _ArmFailedFake:
                 return R(255, "", "ssh: connect timeout", False)  # transient blip
             return R(0, KNOWN_GOOD + "\n", "", True)   # back, still known-good
         if argv[:2] == ["sh", "-c"]:
+            # The lease renew/fence scripts (#5816) echo RENEWED on success; the
+            # acquire/clear scripts echo ACQUIRED (clear ignores output). Answer
+            # a renew with a still-owned verdict so the fence never spuriously
+            # aborts on the happy path.
+            if "RENEWED" in argv[-1]:
+                return R(0, "RENEWED\n", "", True)
             return R(0, "ACQUIRED\n", "", True)   # lease acquire / clear
         return R(0, "", "", True)
 

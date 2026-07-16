@@ -1,3 +1,42 @@
+## 2026-07-16 — #5816 (scripts/deploy, security/correctness): cross-orchestrator lease renew + fence
+- **Timestamp**: 2026-07-16 (fix/5816-deploy-lease-renew-fence)
+- **Action**: Fix #5816 (codex-183 audit). STEP-0 confirmed live on origin/master
+  (3b3b15eff): `scripts/deploy/xpf-deploy.py` `_acquire_lease` writes
+  `expires_at = node_now + --lease-ttl` ONCE; neither `cmd_kernel_roll` nor
+  `cmd_image_roll` renewed the lease or re-checked ownership before their later
+  mutations (drain / arm+reboot / image-recreate / rejoin). #5470/#5545 fixed
+  only the `--lease-ttl<=0` degenerate case (positive_int floor). A positive TTL
+  shorter than boot/drain latency or the recreate hook expired BOTH node leases
+  mid-roll while the driver kept running → a successor could atomically reclaim
+  both and start its own roll on the same HA pair (split-brain deploy). Fix:
+  (1) `_renew_lease` re-writes `expires_at = now+ttl` iff the holder still
+  matches, atomically (temp+rename) under the acquire flock; a reclaimed lease
+  (holder differs / gone) → "lost" (never resurrected); a transport failure →
+  "unreachable" (never a false loss, #4905-A discipline). (2) `_keepalive_leases`
+  renews every reachable target each reboot-poll tick — during the wait only the
+  still-up PEER lease is renewed (rolled node is unreachable / has a fresh
+  lease-less disk), which is the load-bearing reservation. (3)
+  `_fence_before_mutate` renews-and-verifies ownership of every relevant lease
+  immediately before EACH mutation and die()s fail-closed on a lost/unconfirmable
+  lease. Owner-identity token (`nodename:pid<pid>`) is unchanged from
+  acquire/reclaim; acquire/reclaim atomicity untouched. TTL floor NOT raised
+  (renewal makes a short TTL safe; recreate hook is fenced to a fresh TTL right
+  before it). Fail-on-revert PROVEN firsthand (neutralize→RED→restore): remove
+  kernel fence-before-drain → drain executes on a lost pair; remove poll-loop
+  keepalive → lease expires mid-roll (TTL 15 < 30s promote) → pre-rejoin fence
+  aborts a roll that promoted; remove image fence-before-recreate → destructive
+  recreate runs on a lost pair. New `test_xpf_deploy_lease_renew_fence.py`
+  (17 tests: renew verdict mapping, fence gate, keepalive, + 3 end-to-end
+  gate/renewal tests). Verified: full deploy suite 143/143; `make selftest`
+  41/0/0; `make test-deploy-lib` 19/0; `make test-cluster-lock-lib` 12/12.
+  Doc: `docs/in-place-upgrade.md` lease-contract section extended with the
+  renew+fence mechanism and the sharpened self-recovery relation.
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_lease_renew_fence.py (new),
+  scripts/deploy/test_xpf_deploy_kernel_roll.py,
+  scripts/deploy/test_xpf_deploy_image_roll_identity.py,
+  docs/in-place-upgrade.md, _Log.md
+
 ## 2026-07-16 — #5815 (scripts/dist, security): publish gate ignored signed base_image_pinned
 - **Timestamp**: 2026-07-16 (fix/5815-publish-base-pinned-gate)
 - **Action**: Fix #5815 (codex-183 audit, release-provenance bypass). STEP-0

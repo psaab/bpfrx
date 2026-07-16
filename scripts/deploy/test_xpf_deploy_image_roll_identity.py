@@ -143,6 +143,13 @@ def _patches(fake):
     hook is a no-op, and time is faked so the poll loop terminates fast."""
     return [
         mock.patch.object(xpf_deploy, "_node_exec", fake),
+        # The #5816 renew/fence path goes through _node_exec_result (structured
+        # result) so a mid-reboot transport failure is not misread as a lost
+        # lease. These identity tests do not exercise lease loss, so answer every
+        # renew with a still-owned verdict (RENEWED) — the roll proceeds.
+        mock.patch.object(xpf_deploy, "_node_exec_result",
+                          lambda runner, backend, node, argv:
+                              xpf_deploy.NodeExecResult(0, "RENEWED\n", "", True)),
         mock.patch.object(xpf_deploy, "_recreate_node_from_image",
                           lambda *a, **k: None),
         mock.patch.object(xpf_deploy, "_verified_image_manifest_versions",
