@@ -493,11 +493,32 @@ type Daemon struct {
 	// first real load fails must take the cold-boot fence path rather than assume a
 	// retained table (#5790). A teardown FAILURE (a table may still be installed)
 	// does NOT clear it. True proves neither current xpf_hostinbound table presence
-	// nor coverage of every current local address (#5789, #5790). Production access
-	// is serialized under applySem; atomic.Bool preserves the existing type, not a
-	// current readiness reader. nft success and the following Store are ordered
-	// operations in separate state domains, not one atomic publication.
+	// nor coverage of every current local address — the day-2 COVERAGE gap is
+	// tracked separately by hostInboundCoveredAddrs (#5789, #5790). Production
+	// access is serialized under applySem; atomic.Bool preserves the existing type,
+	// not a current readiness reader. nft success and the following Store are
+	// ordered operations in separate state domains, not one atomic publication.
 	hostInboundEnforced atomic.Bool
+
+	// hostInboundCoveredAddrs is the set of firewall-local DESTINATION addresses
+	// (keyed "<fam>|<addr>", fam '4'/'6') that the currently-RETAINED host-inbound
+	// enforcement (the last successfully-loaded real table OR address-scoped
+	// cold-boot fence) installs a catch-all DROP for. It is the #5789 coverage
+	// discriminator: hostInboundEnforced only proves SOME protecting table loaded
+	// at SOME earlier generation, NOT that the retained generation covers the
+	// CURRENT desired destination set. When a new static/DHCP/SLAAC address appears
+	// and the next real render fails, atomic nft retention keeps the OLD generation
+	// — which has no deny for the new address (fail-open). Comparing this covered
+	// set against the current desired drop set detects those uncovered destinations
+	// so an ADDITIVE gap fence (inet xpf_hostinbound_gap, a separate input-hook
+	// table that preserves the retained table's accepts) can deny only them.
+	// Updated to the desired set on a successful real load / address-scoped fence;
+	// CLEARED on a successful teardown (#5790, no table covers nothing); left
+	// UNCHANGED on any failure (atomic retention keeps the old generation, so its
+	// coverage claim also stands). Serialized under applySem, like the
+	// hostInboundFailOpen maps; a nil/empty map means "nothing retained is known to
+	// be covered" (cold boot).
+	hostInboundCoveredAddrs map[string]struct{}
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.

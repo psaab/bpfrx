@@ -456,7 +456,8 @@ func TestColdBootFenceUnzonedDropPublishesState5759(t *testing.T) {
 			}
 			defer func() { nftApplyPayload = orig }()
 
-			if err := d.installHostInboundColdBootFence(tc.views, tc.unzonedV4, tc.unzonedV6, nil); err != nil {
+			if err := d.installHostInboundColdBootFence(tc.views, tc.unzonedV4, tc.unzonedV6, nil,
+				hostInboundDesiredDropAddrs(tc.views, tc.unzonedV4, tc.unzonedV6)); err != nil {
 				t.Fatalf("installHostInboundColdBootFence: %v", err)
 			}
 			if calls != 1 {

@@ -82,13 +82,47 @@ func TestNftLocalDeliveryChainsDistinctPriority(t *testing.T) {
 
 // TestNftLocalDeliveryPriorityConstantsOrdered guards the invariant at the
 // constant level (independent of payload rendering): nftLo0FilterPriority must be
-// strictly less than nftHostInboundPriority (#3364). Equalizing the two
-// constants — the simplest way to reintroduce the bug — turns this RED directly.
+// strictly less than nftHostInboundPriority (#3364), and the #5789 additive gap
+// fence must evaluate STRICTLY AFTER the main host-inbound table
+// (nftHostInboundGapPriority > nftHostInboundPriority) so it only backstops
+// destinations the main table leaves at policy-accept — the three chains
+// (xpf_lo0 < xpf_hostinbound < xpf_hostinbound_gap) must carry DISTINCT,
+// STRICTLY-INCREASING hook-input priorities. Equalizing any pair — the simplest
+// way to reintroduce order-nondeterminism — turns this RED directly.
 func TestNftLocalDeliveryPriorityConstantsOrdered(t *testing.T) {
 	if nftLo0FilterPriority >= nftHostInboundPriority {
 		t.Fatalf("nftLo0FilterPriority (%d) must be < nftHostInboundPriority (%d): "+
 			"the lo0 input filter must evaluate before the host-inbound backstop "+
 			"and the two base chains must carry distinct hook-input priorities (#3364)",
 			nftLo0FilterPriority, nftHostInboundPriority)
+	}
+	if nftHostInboundPriority >= nftHostInboundGapPriority {
+		t.Fatalf("nftHostInboundPriority (%d) must be < nftHostInboundGapPriority (%d): "+
+			"the #5789 additive gap fence must evaluate AFTER the main host-inbound "+
+			"table so it only denies uncovered destinations that fell through the "+
+			"main chain's policy-accept, and the three local-delivery base chains "+
+			"must carry distinct hook-input priorities",
+			nftHostInboundPriority, nftHostInboundGapPriority)
+	}
+}
+
+// TestNftHostInboundGapFenceChainPriority pins the rendered gap-fence payload's
+// hook-input priority to nftHostInboundGapPriority and asserts it is strictly
+// greater than the main host-inbound chain's — the #5789 evaluation-order
+// invariant at the payload level (mirrors the #3364 lo0-vs-host-inbound check).
+func TestNftHostInboundGapFenceChainPriority(t *testing.T) {
+	gapPayload := buildHostInboundGapFencePayload([]string{"172.16.50.8"}, nil, nil)
+	gapPri := nftHookInputPriority(t, "host-inbound-gap", gapPayload)
+	if gapPri != nftHostInboundGapPriority {
+		t.Errorf("gap payload priority %d != nftHostInboundGapPriority %d", gapPri, nftHostInboundGapPriority)
+	}
+
+	views := buildAndCheckViews(t, hostInboundTestConfig())
+	hiPayload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
+	hiPri := nftHookInputPriority(t, "host-inbound", hiPayload)
+	if gapPri <= hiPri {
+		t.Fatalf("xpf_hostinbound_gap priority %d must be STRICTLY GREATER THAN "+
+			"xpf_hostinbound priority %d so the gap evaluates as a backstop AFTER "+
+			"the retained main table (#5789)", gapPri, hiPri)
 	}
 }

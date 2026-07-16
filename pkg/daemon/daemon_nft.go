@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -85,6 +86,19 @@ const (
 	// kept well below the conventional `security` (50) / `srcnat` (100)
 	// priorities so it stays within the input-filter band.
 	nftHostInboundPriority = 10
+	// nftHostInboundGapPriority is the `hook input` priority of the ADDITIVE
+	// xpf_hostinbound_gap fence (#5789). It is STRICTLY GREATER THAN
+	// nftHostInboundPriority so it evaluates AFTER the main host-inbound table:
+	// the gap only denies destinations the retained main table does NOT cover
+	// (they fall through the main chain's `policy accept`), while an address the
+	// main table already handles is either service-accepted (non-terminal, reaches
+	// the gap but is not in its drop set) or catch-all DROPped (terminal at prio
+	// 10, never reaches the gap). Running last makes the gap a pure backstop for
+	// newly-appeared addresses without altering the retained table's verdicts —
+	// the same three-way distinct-priority discipline as xpf_lo0 (0) <
+	// xpf_hostinbound (10) < xpf_hostinbound_gap (11), pinned by
+	// nft_chain_priority_test.go. Still well below security (50).
+	nftHostInboundGapPriority = 11
 )
 
 // applyLo0Filter applies loopback filter rules for host-bound traffic.
@@ -308,18 +322,29 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 			slog.Warn("failed to delete stale host-inbound filter table", "err", err, "output", string(out))
 			return fmt.Errorf("delete stale host-inbound nftables table: %w", err)
 		}
-		// Teardown SUCCEEDED: no xpf_hostinbound table is installed now. Clear the
-		// historical gate (#5790). hostInboundEnforced means "a successful real load
-		// or address-scoped fallback established a protecting table"; with the table
-		// gone that is no longer true. Leaving it sticky-true is FAIL-OPEN: if a
-		// later generation becomes enforceable and its FIRST real load fails, the
-		// stale true would take the day-2 retention branch — which assumes a retained
-		// table still protects the addresses — and SKIP the cold-boot/fresh-install
-		// fence, leaving newly reachable local addresses unprotected. Publishing
-		// false here routes that failure through the !hostInboundEnforced fence path
-		// (fail closed) instead. Serialized under applySem with the Store(true) sites
-		// and every later apply, so this cannot race a subsequent install.
+		// #5789: also remove any additive gap fence. With the main table gone there
+		// is nothing for the gap to backstop, and a lingering gap deny would fence
+		// an address that is no longer enforced. A failed gap delete is treated like
+		// the main teardown failure above: a table the delete could not remove may
+		// still be installed, so KEEP the coverage/enforced state and surface the
+		// error (fail closed) rather than clearing state over a live gap table.
+		if out, err := nftDeleteTable("inet", "xpf_hostinbound_gap"); err != nil {
+			slog.Warn("failed to delete stale host-inbound gap fence table", "err", err, "output", string(out))
+			return fmt.Errorf("delete stale host-inbound gap fence nftables table: %w", err)
+		}
+		// Teardown SUCCEEDED: no xpf_hostinbound (or gap) table is installed now.
+		// Clear the historical gate (#5790) AND the coverage set (#5789): with no
+		// table installed nothing is covered. Leaving hostInboundEnforced sticky-true
+		// is FAIL-OPEN: if a later generation becomes enforceable and its FIRST real
+		// load fails, the stale true would take the day-2 retention branch — which
+		// assumes a retained table still protects the addresses — and SKIP the
+		// cold-boot/fresh-install fence, leaving newly reachable local addresses
+		// unprotected. Clearing the coverage set keeps the two in agreement (a stale
+		// covered set would falsely report the torn-down addresses as still covered).
+		// Serialized under applySem with the Store(true) sites and every later apply,
+		// so this cannot race a subsequent install.
 		d.hostInboundEnforced.Store(false)
+		d.hostInboundCoveredAddrs = nil
 		return nil
 	}
 	// #5582: the configured WireGuard listen port(s). The XDP shim steers
@@ -329,6 +354,10 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// when no WG tunnel is configured — buildHostInboundFilterPayload then emits
 	// no WG accept, so the restricted-default posture is unchanged.
 	wgListenPorts := cfg.WireGuardListenPorts()
+	// #5789: the exact firewall-local destination set this generation wants a
+	// catch-all DROP for. Compared on failure against the retained generation's
+	// covered set to detect addresses that appeared after that generation loaded.
+	desiredDrop := hostInboundDesiredDropAddrs(views, unzonedV4, unzonedV6)
 	nftConf := buildHostInboundFilterPayload(views, unzonedV4, unzonedV6, programs, wgListenPorts)
 	if out, err := nftApplyPayload(nftConf); err != nil {
 		slog.Warn("failed to apply host-inbound filter", "err", err, "output", string(out))
@@ -351,20 +380,82 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 		// a later failed real invocation that reaches this function while state is
 		// still false.
 		if !d.hostInboundEnforced.Load() {
-			if fenceErr := d.installHostInboundColdBootFence(views, unzonedV4, unzonedV6, wgListenPorts); fenceErr != nil {
+			if fenceErr := d.installHostInboundColdBootFence(views, unzonedV4, unzonedV6, wgListenPorts, desiredDrop); fenceErr != nil {
 				return errors.Join(fmt.Errorf("apply host-inbound nftables filter: %w", err), fenceErr)
+			}
+		} else {
+			// #5789 day-2 COVERAGE gap. hostInboundEnforced is true, so the cold-boot
+			// fence is skipped on the premise that the retained (atomic-untouched)
+			// generation still protects the addresses. But that generation only covers
+			// the destinations PRESENT when it loaded — a static/DHCP/SLAAC address (or
+			// the first address on a program-only generation) that appeared afterward
+			// has NO deny in the retained table, so this failed rerender leaves it
+			// fail-open. Compare the desired drop set against what the retained
+			// generation covers and, for any UNCOVERED destination, install an ADDITIVE
+			// gap fence (a separate xpf_hostinbound_gap table at a later hook priority)
+			// that denies only those addresses WITHOUT disturbing the retained table's
+			// valid accepts/denies. hostInboundCoveredAddrs is unchanged (the retained
+			// real table's coverage still stands); the gap is torn down by the next
+			// successful real install. A gap install failure joins the commit error so
+			// the newly reachable address is never silently left fail-open.
+			uncoveredV4, uncoveredV6 := hostInboundUncoveredDropAddrs(views, unzonedV4, unzonedV6, d.hostInboundCoveredAddrs)
+			if len(uncoveredV4) > 0 || len(uncoveredV6) > 0 {
+				if gapErr := d.installHostInboundGapFence(uncoveredV4, uncoveredV6, wgListenPorts); gapErr != nil {
+					return errors.Join(fmt.Errorf("apply host-inbound nftables filter: %w", err), gapErr)
+				}
 			}
 		}
 		return fmt.Errorf("apply host-inbound nftables filter: %w", err)
 	}
 	// A real host-inbound table is now installed. Record the historical success;
 	// a later failed install retains that exact generation and therefore skips the
-	// cold-boot fallback. This does not prove current table presence or coverage of
-	// addresses absent from that generation (#5789, #5790).
+	// cold-boot fallback. This does not prove current table presence (#5790).
 	d.hostInboundEnforced.Store(true)
+	// #5789: the retained generation now covers EXACTLY this desired drop set.
+	// Record it so a later failed rerender can tell which destinations a
+	// subsequently-appeared address left uncovered.
+	d.hostInboundCoveredAddrs = desiredDrop
+	// The real table now covers every desired destination, so any additive gap
+	// fence from a prior failed rerender is obsolete — a lingering gap would keep
+	// denying an address the real table now serves. Best effort: nftDeleteTable is
+	// idempotent (a no-op when absent, the common case), so a delete error here is
+	// a rare real kernel fault; log it but do NOT fail the successful commit (the
+	// enforcement is correct and the next apply retries the delete — a lingering
+	// gap fences only, never opens).
+	if out, err := nftDeleteTable("inet", "xpf_hostinbound_gap"); err != nil {
+		slog.Warn("failed to delete obsolete host-inbound gap fence after successful real install",
+			"err", err, "output", string(out))
+	}
 	slog.Info("host-inbound filter applied", "zones", len(views),
 		"unzoned_deny_v4", len(unzonedV4), "unzoned_deny_v6", len(unzonedV6),
 		"junos_host_deny_programs", len(programs))
+	return nil
+}
+
+// installHostInboundGapFence installs the #5789 ADDITIVE gap fence for the
+// supplied uncovered firewall-local addresses via nftApplyPayload. It is a
+// SEPARATE xpf_hostinbound_gap table (a distinct input-hook base chain at
+// nftHostInboundGapPriority, strictly after the main xpf_hostinbound table), so
+// it denies only the newly-appeared destinations the retained generation does not
+// cover WITHOUT replacing that generation — the retained table's per-service
+// accepts for already-covered addresses stay intact. It is attempted on a failed
+// day-2 rerender when hostInboundCoveredAddrs is missing >=1 desired destination.
+// A load failure returns the error (joined into the commit result by the caller)
+// so a newly reachable local address is never silently left without a host-inbound
+// deny. Caller guarantees >=1 uncovered address (the payload has >=1 DROP).
+func (d *Daemon) installHostInboundGapFence(uncoveredV4, uncoveredV6 []string, wgListenPorts []uint16) error {
+	gap := buildHostInboundGapFencePayload(uncoveredV4, uncoveredV6, wgListenPorts)
+	if out, err := nftApplyPayload(gap); err != nil {
+		slog.Error("COVERAGE-GAP FAIL-OPEN GUARD: host-inbound real install failed AND the additive "+
+			"gap fence for newly-appeared local addresses could not be installed; those addresses "+
+			"may be reachable without host-inbound enforcement until the next successful commit",
+			"err", err, "output", string(out),
+			"uncovered_v4", len(uncoveredV4), "uncovered_v6", len(uncoveredV6))
+		return fmt.Errorf("install host-inbound coverage-gap fence: %w", err)
+	}
+	slog.Warn("host-inbound real install failed; retained generation does not cover newly-appeared "+
+		"local addresses — installed an additive gap fence denying them (retained accepts preserved)",
+		"gap_v4", len(uncoveredV4), "gap_v6", len(uncoveredV6))
 	return nil
 }
 
@@ -393,7 +484,12 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 // On failure (nft itself is broken) the error is returned and joined into the
 // commit result; the caller logs it and the daemon has done all it can short of
 // holding forwarding.
-func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) error {
+//
+// desiredDrop is this snapshot's exact destination-drop set (#5789); on a
+// successful address-scoped fence the whole-table fence IS the retained
+// enforcement, so its coverage becomes hostInboundCoveredAddrs, letting a later
+// failed rerender detect a subsequently-appeared uncovered address.
+func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16, desiredDrop map[string]struct{}) error {
 	fenceHasScopedDrop := hostInboundHasEnforceableView(views) || len(unzonedV4) > 0 || len(unzonedV6) > 0
 	fence := buildHostInboundFencePayload(views, unzonedV4, unzonedV6, wgListenPorts)
 	if out, err := nftApplyPayload(fence); err != nil {
@@ -405,6 +501,9 @@ func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInb
 	}
 	if fenceHasScopedDrop {
 		d.hostInboundEnforced.Store(true)
+		// #5789: the address-scoped fence is now the retained enforcement; record
+		// exactly which destinations it covers so the day-2 coverage check works.
+		d.hostInboundCoveredAddrs = desiredDrop
 		slog.Warn("host-inbound real install failed; fallback succeeded with address-scoped DROPs for its rendered snapshot",
 			"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
 			"fenced_unzoned_v6", len(unzonedV6))
@@ -434,22 +533,7 @@ func buildHostInboundFencePayload(views []dpuserspace.ZoneHostInboundView, unzon
 	// Same hook/priority as the real host-inbound chain so the fence occupies the
 	// same evaluation slot (#3364).
 	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", nftHostInboundPriority))
-	// Mandatory admits — return traffic and core L3 control, NOT a service
-	// exposure (mirrors the real chain's global accepts, counters omitted):
-	rules = append(rules, "    ct state established,related accept")
-	// Raw ESP (50) / AH (51) so the kernel XFRM stack can decrypt host-terminated
-	// IPsec (mirrors the real chain and the userspace passthrough stage).
-	rules = append(rules, "    meta l4proto { 50, 51 } accept")
-	// IPv6 ND + v4/v6 PMTUD/error control messages — mandatory link operation.
-	rules = append(rules, "    icmpv6 type { 1, 2, 3, 4 } accept")
-	rules = append(rules, "    icmpv6 type { 133, 134, 135, 136, 137 } accept")
-	rules = append(rules, "    icmp type { destination-unreachable, time-exceeded, parameter-problem } accept")
-	// The XDP shim steers local-destination UDP on the WG listen port to the
-	// kernel WG socket; admit it so a responder-only tunnel is not black-holed by
-	// the fence (mirrors emitHostInboundWireGuardAccept). No-op when WG is unset.
-	if len(wgListenPorts) > 0 {
-		rules = append(rules, "    udp dport "+renderWireGuardPortSpec(wgListenPorts)+" accept")
-	}
+	rules = append(rules, hostInboundFenceMandatoryAdmits(wgListenPorts)...)
 	// Catch-all DROP for every firewall-local address the real ruleset would scope
 	// — per host-inbound-configured zone (default-deny parity, #3405) and the
 	// addressed-but-unzoned set (#4420 HI-2). These sets are already
@@ -469,6 +553,130 @@ func buildHostInboundFencePayload(views []dpuserspace.ZoneHostInboundView, unzon
 	}
 	if len(unzonedV6) > 0 {
 		rules = append(rules, "    ip6 daddr "+nftAddrSet(unzonedV6)+" drop")
+	}
+	rules = append(rules, "  }")
+	rules = append(rules, "}")
+	return strings.Join(rules, "\n") + "\n"
+}
+
+// hostInboundFenceMandatoryAdmits returns the fence chain's mandatory-admit lines
+// — return traffic and core L3 control, NOT a service exposure (mirrors the real
+// chain's global accepts, counters omitted). Shared by the whole-table cold-boot
+// fence (buildHostInboundFencePayload) and the additive gap fence
+// (buildHostInboundGapFencePayload, #5789) so their admit posture can never drift
+// apart: both must let established/related, host-terminated IPsec (ESP/AH), IPv6
+// ND, v4/v6 PMTUD+error, and the configured WireGuard listen port through while
+// dropping host-bound services to the fenced addresses.
+func hostInboundFenceMandatoryAdmits(wgListenPorts []uint16) []string {
+	admits := []string{
+		"    ct state established,related accept",
+		// Raw ESP (50) / AH (51) so the kernel XFRM stack can decrypt
+		// host-terminated IPsec (mirrors the real chain and userspace passthrough).
+		"    meta l4proto { 50, 51 } accept",
+		// IPv6 ND + v4/v6 PMTUD/error control messages — mandatory link operation.
+		"    icmpv6 type { 1, 2, 3, 4 } accept",
+		"    icmpv6 type { 133, 134, 135, 136, 137 } accept",
+		"    icmp type { destination-unreachable, time-exceeded, parameter-problem } accept",
+	}
+	// The XDP shim steers local-destination UDP on the WG listen port to the
+	// kernel WG socket; admit it so a responder-only tunnel is not black-holed by
+	// the fence (mirrors emitHostInboundWireGuardAccept). No-op when WG is unset.
+	if len(wgListenPorts) > 0 {
+		admits = append(admits, "    udp dport "+renderWireGuardPortSpec(wgListenPorts)+" accept")
+	}
+	return admits
+}
+
+// hostInboundDropAddrKey canonicalizes a firewall-local destination address into
+// the coverage-set key "<fam>|<addr>" (fam '4' or '6', #5789). The address text
+// is used verbatim (the builders already emit bare host addresses).
+func hostInboundDropAddrKey(fam byte, addr string) string {
+	return string(fam) + "|" + addr
+}
+
+// hostInboundDesiredDropAddrs returns the set of firewall-local DESTINATION
+// addresses the REAL host-inbound payload would install a catch-all DROP for in
+// THIS snapshot (#5789): the union of every zone view's V4/V6 addresses and the
+// addressed-but-unzoned sets, keyed by hostInboundDropAddrKey. This is the exact
+// destination-coverage set compared against the retained generation's covered set
+// to find an address that appeared AFTER the retained table was installed.
+// junos-host PROGRAM (iifname) scopes are deliberately excluded: a program is
+// address-independent, so a new ADDRESS on a program-covered interface surfaces
+// here as a new destination key — precisely the #5789 path-2 gap.
+func hostInboundDesiredDropAddrs(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string) map[string]struct{} {
+	set := map[string]struct{}{}
+	add := func(fam byte, addrs []string) {
+		for _, a := range addrs {
+			set[hostInboundDropAddrKey(fam, a)] = struct{}{}
+		}
+	}
+	for _, v := range views {
+		add('4', v.V4Addrs)
+		add('6', v.V6Addrs)
+	}
+	add('4', unzonedV4)
+	add('6', unzonedV6)
+	return set
+}
+
+// hostInboundUncoveredDropAddrs returns the desired-drop addresses (v4, v6, bare,
+// de-duplicated, sorted) that are NOT in `covered` — the destinations the
+// retained generation has no deny for (#5789). Empty covered (cold boot) makes
+// every desired address uncovered. The returned lists feed
+// buildHostInboundGapFencePayload.
+func hostInboundUncoveredDropAddrs(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, covered map[string]struct{}) (v4, v6 []string) {
+	seen4, seen6 := map[string]struct{}{}, map[string]struct{}{}
+	consider := func(fam byte, addrs []string, seen map[string]struct{}, out *[]string) {
+		for _, a := range addrs {
+			if _, dup := seen[a]; dup {
+				continue
+			}
+			if _, ok := covered[hostInboundDropAddrKey(fam, a)]; ok {
+				continue
+			}
+			seen[a] = struct{}{}
+			*out = append(*out, a)
+		}
+	}
+	for _, view := range views {
+		consider('4', view.V4Addrs, seen4, &v4)
+		consider('6', view.V6Addrs, seen6, &v6)
+	}
+	consider('4', unzonedV4, seen4, &v4)
+	consider('6', unzonedV6, seen6, &v6)
+	sort.Strings(v4)
+	sort.Strings(v6)
+	return v4, v6
+}
+
+// buildHostInboundGapFencePayload assembles the #5789 ADDITIVE gap fence: a
+// SEPARATE inet xpf_hostinbound_gap table at nftHostInboundGapPriority (strictly
+// AFTER the main xpf_hostinbound table) that denies ONLY the supplied uncovered
+// firewall-local addresses, admitting the same mandatory L3 / return traffic as
+// the cold-boot fence. Unlike the whole-table cold-boot fence it does NOT replace
+// xpf_hostinbound, so the retained generation's per-service ACCEPTS for
+// already-covered addresses stay intact (the issue's "do not weaken retained
+// valid rules"): a covered address is service-accepted or catch-all-dropped by
+// the main table (prio 10) and either way its verdict is unchanged, while a
+// newly-appeared uncovered address falls through the main chain's policy-accept
+// and is dropped here. The uncovered lists are already lifeline-excluded (they
+// derive from the same builder-subtracted views/unzoned sets), so the gap can
+// never fence management / cluster-control traffic. Callers must only invoke this
+// with a non-empty uncovered set (an all-empty payload would be a pointless
+// zero-drop shell); an empty set instead deletes the table.
+func buildHostInboundGapFencePayload(uncoveredV4, uncoveredV6 []string, wgListenPorts []uint16) string {
+	var rules []string
+	rules = append(rules, "add table inet xpf_hostinbound_gap")
+	rules = append(rules, "delete table inet xpf_hostinbound_gap")
+	rules = append(rules, "table inet xpf_hostinbound_gap {")
+	rules = append(rules, "  chain input {")
+	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", nftHostInboundGapPriority))
+	rules = append(rules, hostInboundFenceMandatoryAdmits(wgListenPorts)...)
+	if len(uncoveredV4) > 0 {
+		rules = append(rules, "    ip daddr "+nftAddrSet(uncoveredV4)+" drop")
+	}
+	if len(uncoveredV6) > 0 {
+		rules = append(rules, "    ip6 daddr "+nftAddrSet(uncoveredV6)+" drop")
 	}
 	rules = append(rules, "  }")
 	rules = append(rules, "}")
