@@ -29,7 +29,39 @@ package dhcpserver
 //	<f>.pid        kea-lfc's pid file.
 //
 // The .output/.completed/.pid files hold no lease union we must read and are
-// ignored. NOTE the suffix mapping: .1 is INPUT and .2 is PREVIOUS — so the
+// ignored.
+//
+// #5938 Invariant 3 — crash-interrupted-cleanup safety argument. A cleanup that
+// crashes mid-run can leave a stale `.output` and/or `.completed` behind, so the
+// reader must be provably correct to SKIP them. It is, and here is the exact
+// argument (no generation protocol is needed for this read-only display/DDNS
+// path):
+//
+//   - `.output` is kea-lfc's IN-PROGRESS compaction target: it is built by
+//     MERGING the INPUT (.1) and PREVIOUS (.2) files (Kea src: LFCController /
+//     memfile — kea-lfc reads `.1`+`.2` and writes the compacted union to
+//     `.output`). Every lease key that could appear in `.output` therefore ALSO
+//     appears in `.1` ∪ `.2`, which this reader already ingests. So `.output`
+//     contributes NO lease key we would otherwise miss — reading it could only
+//     re-assert rows we already have (idempotent under the last-row-wins dedup)
+//     or, worse, a TORN half-written merge (kea-lfc crashed mid-write) whose
+//     partial rows are strictly LESS complete than `.1`+`.2`. Skipping it is thus
+//     not merely safe but STRICTLY SAFER than reading it.
+//   - `.completed` is kea-lfc's zero-content FINISH MARKER (its presence tells
+//     the server the swap may proceed); it carries no lease rows at all.
+//   - The atomic swap kea-lfc performs on SUCCESS (`.output` → `.2`, unlink
+//     `.1`) means a lease is never in-flight-only: before the swap it lives in
+//     `.1`+`.2`; after the swap it lives in the new `.2`. At NO instant is an
+//     active lease reachable ONLY through `.output`/`.completed`. A crash at any
+//     point leaves the pre-swap `.1`+`.2` intact (or the post-swap `.2`), both of
+//     which this reader covers. Hence a torn cleanup can never briefly present a
+//     STALE-yet-authoritative set through the intermediates.
+//
+// TestKeaLFCIntermediatesIgnored pins this: `.output`/`.completed` present
+// alongside `.2`+`.1` do not change the resolved lease set, and a lease living
+// in `.output` is already covered by `.2`/`.1`.
+//
+// NOTE the suffix mapping: .1 is INPUT and .2 is PREVIOUS — so the
 // CHRONOLOGICAL read order (oldest → newest) is .2 → .1 → current, i.e. the
 // previous-compacted snapshot first, then the input file, then the current
 // append log.

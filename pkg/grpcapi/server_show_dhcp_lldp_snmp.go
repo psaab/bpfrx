@@ -90,8 +90,17 @@ func (s *Server) showDHCPServer(buf *strings.Builder) {
 		buf.WriteString("DHCP server not running\n")
 		return
 	}
-	leases4, _ := s.dhcpServer.GetLeases4()
-	leases6, _ := s.dhcpServer.GetLeases6()
+	// #5938 Invariant 2/8: prefer the live lease_cmds DB over the memfile
+	// snapshot, and surface a banner when the source is degraded (socket
+	// unavailable → memfile fallback, or an unreadable sibling was skipped) so a
+	// partial display is never mistaken for a healthy empty set.
+	leases4, src4 := s.dhcpServer.GetLeasesWithSource4()
+	leases6, src6 := s.dhcpServer.GetLeasesWithSource6()
+	if banner := src4.Banner(); banner != "" {
+		buf.WriteString(banner + "\n")
+	} else if banner := src6.Banner(); banner != "" {
+		buf.WriteString(banner + "\n")
+	}
 	if len(leases4) == 0 && len(leases6) == 0 {
 		buf.WriteString("No active leases\n")
 	}
@@ -170,8 +179,14 @@ func (s *Server) showDHCPServerDetail(cfg *config.Config, buf *strings.Builder) 
 	}
 	// Leases with subnet IDs
 	if s.dhcpServer != nil && s.dhcpServer.IsRunning() {
-		leases4, _ := s.dhcpServer.GetLeases4()
-		leases6, _ := s.dhcpServer.GetLeases6()
+		// #5938 Invariant 2/8: live-socket-preferred read + degraded-source banner.
+		leases4, src4 := s.dhcpServer.GetLeasesWithSource4()
+		leases6, src6 := s.dhcpServer.GetLeasesWithSource6()
+		if banner := src4.Banner(); banner != "" {
+			buf.WriteString(banner + "\n")
+		} else if banner := src6.Banner(); banner != "" {
+			buf.WriteString(banner + "\n")
+		}
 		if len(leases4) == 0 && len(leases6) == 0 {
 			buf.WriteString("Active leases: none\n")
 		}
