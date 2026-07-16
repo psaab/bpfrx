@@ -472,7 +472,7 @@ func (d *Daemon) pushCommittedConfigToPeer() {
 // promotion) + applyConfigLocked, so a peer-sync can't interleave
 // between a local committer's Commit and applyConfig (which would
 // briefly leave store=peer-config but kernel=local-config).
-func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPreserve func(*config.ConfigTree)) (*config.Config, error) {
+func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPreserve func(*config.ConfigTree)) (compiled *config.Config, retErr error) {
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
 		return nil, err
 	}
@@ -494,21 +494,48 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 	// primary's delete-sync).
 	oldActive := d.store.ActiveConfig()
 
-	compiled, err := d.store.SyncApply(configText, chassisPreserve)
-	if err != nil {
-		return nil, err
+	var syncErr error
+	compiled, syncErr = d.store.SyncApply(configText, chassisPreserve)
+	if syncErr != nil {
+		return nil, syncErr
 	}
-	var clearErr error
-	if compiled != nil {
-		if err := d.applyConfigLocked(d.applyCancelCtx(), compiled); err != nil {
-			return nil, err
+	if compiled == nil {
+		// No config to reconcile (e.g. a no-op sync): nothing was promoted, so
+		// there is no active-config session state to invalidate.
+		return compiled, nil
+	}
+
+	// #5564: SyncApply (above) has ALREADY promoted the peer config to active,
+	// and once applyConfigLocked arms the dataplane snapshot this node is
+	// forwarding under it. The three session invalidators
+	// (clearSessionsForPolicyChanges: the #4234 deletion-clear, the
+	// modified-policy re-eval, and the #4342 default-policy change) MUST
+	// therefore run to bring surviving established sessions' authorization in
+	// line with the now-active config. Skipping them is a security fail-open: a
+	// session a peer-tightened/deleted policy should now DENY keeps forwarding
+	// under its stale authorization — and because the store already holds the
+	// incoming text, the next equal-active-text re-push takes handleConfigSync's
+	// fast path and never re-enters here to correct it, making the omission
+	// PERMANENT (and visible at failover).
+	//
+	// The invalidation runs from ONE deferred, guarded place (armedActive) so it
+	// ALWAYS fires once the config reached active+armed — EVEN on a NON-FATAL
+	// best-effort tail failure (host-inbound/lo0 nft, networkd, ...) that
+	// applyConfigLocked joins and returns — and so a future early-return added
+	// between the apply and here cannot re-introduce the skip. It does NOT run on
+	// a genuinely-fatal apply (see below), where the config is not live-forwarding
+	// and there is no session state to invalidate.
+	var armedActive bool
+	defer func() {
+		if !armedActive {
+			return
 		}
 		// #5578: surface a PARTIAL session invalidation to handleConfigSync
 		// (which logs it and returns it up the sync-recv path) so a peer-pushed
 		// policy deletion/tightening that could not fully drop this node's synced
 		// sessions is not silently swallowed. A non-fatal partial clear does not
 		// abort the (already-promoted) sync — it is joined into the return only.
-		clearErr = d.clearSessionsForPolicyChanges(oldActive, compiled)
+		clearErr := d.clearSessionsForPolicyChanges(oldActive, compiled)
 		// #1956 V-1 passive-node device-map admission gate (OQ-15.1 option
 		// (a): passive gate + loud health alarm). The active node's strict
 		// commit can only validate ITS OWN hardware (R-8), so a synced
@@ -521,8 +548,25 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		// reboot. (Option (b), distributed pre-commit validation, is the
 		// documented end-state follow-up.)
 		d.deviceMapPassiveAdmissionAlarm(compiled)
+		retErr = errors.Join(retErr, clearErr)
+	}()
+
+	// #5564: capture the apply error instead of returning early on ANY error.
+	// applyErrSkipsPeerSync (shared with applyAndSyncCommitted) classifies the
+	// two FATAL classes — a required-protocol-gate error (dataplane DISARMED,
+	// #2138) or a daemon-stop context abort (#2926) — that mean the config is
+	// NOT live-forwarding. On those, discard the config and return the error
+	// WITHOUT invalidating (armedActive stays false; no spurious clear), exactly
+	// as the pre-#5564 early-return and applyAndSyncCommitted's fatal branch did.
+	// Every OTHER (non-fatal, best-effort tail) error leaves the config active +
+	// the snapshot armed, so the invalidators still run and the tail error is
+	// surfaced (joined with any partial-invalidation error), not swallowed.
+	applyErr := d.applyConfigLocked(d.applyCancelCtx(), compiled)
+	if applyErrSkipsPeerSync(applyErr) {
+		return nil, applyErr
 	}
-	return compiled, clearErr
+	armedActive = true
+	return compiled, applyErr
 }
 
 // deviceMapPassiveAdmissionAlarm raises a loud, never-silent HA-health alarm

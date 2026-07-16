@@ -39,6 +39,58 @@
   (merge_matched_modifiers write wraps Some(...)), userspace-dp/src/filter/tests.rs
   (3 result reads → .as_deref()==Some(..); new fail-on-revert test
   filter_result_forwarding_class_defaults_none_zero_alloc)
+## 2026-07-16 — #5564 (daemon): HA config-sync tail failure permanently bypassed policy session invalidation (fail-open)
+- **Timestamp**: 2026-07-16 (fix/5564-syncapply-invalidators)
+- **Action**: Fix #5564 (security fail-open, HA receive side). STEP-0 confirmed
+  live on origin/master 8a769005f: `syncAndApply`
+  (pkg/daemon/daemon_apply.go) promotes the peer config to active
+  (`configstore.SyncApply`) and arms the dataplane snapshot
+  (`applyConfigLocked`), but returned early on ANY apply error
+  (`if err := d.applyConfigLocked(...); err != nil { return nil, err }`) BEFORE
+  `clearSessionsForPolicyChanges` (the three invalidators: #4234 deletion-clear,
+  modified-policy re-eval, #4342 default-policy change). A NON-FATAL best-effort
+  tail failure (host-inbound/lo0 nft, networkd, ...) therefore left surviving
+  established sessions forwarding under their OLD authorization on an armed
+  standby. Because `configstore.SyncApply` already promoted the incoming text to
+  active, the primary's equal-active-text re-push hit `handleConfigSync`'s
+  fast path (`activeText == incomingText`) and returned nil without re-entering
+  `syncAndApply`, making the omission PERMANENT (visible at failover). The commit
+  path `applyAndSyncCommitted` already handled this correctly (classify via
+  `applyErrSkipsPeerSync`, run invalidators for non-fatal tail errors); the
+  receive path had diverged. Fix: mirror the commit path. Capture the apply
+  error instead of early-returning; return early ONLY for the two FATAL classes
+  `applyErrSkipsPeerSync` matches (required-protocol-gate → dataplane DISARMED,
+  #2138; daemon-stop context abort, #2926 — config not live-forwarding, no
+  session state to invalidate). For every other (non-fatal tail) error the config
+  reached active+armed, so the invalidators run and the tail error is surfaced
+  (joined with any #5578 partial-invalidation error), not swallowed. Structured
+  the invalidation as a DEFERRED, guarded (`armedActive`) block on a named-return
+  function so a future early-return added between the apply and the invalidators
+  cannot re-introduce the skip; it never runs on the fatal path (armedActive stays
+  false, config discarded to nil). `deviceMapPassiveAdmissionAlarm` moved into the
+  same guarded block (also runs whenever the config went active). Control-flow
+  fix only — no wire/protocol/failover-machinery change.
+- **Fail-on-revert**: new pkg/daemon/configsync_invalidate_5564_test.go builds a
+  real store (baseline p-first id-0 + p-web id-1 committed active) and a fake DP
+  holding v4+v6 ESTABLISHED sessions under p-web; the peer text (candidate
+  ShowCandidate) DELETES p-web. `TestSyncAndApplyRunsInvalidatorsOnNonFatalApplyError`
+  injects a non-fatal tail error via applyErrForTest → asserts BOTH v4+v6 sessions
+  are cleared (invalidators ran), the table was scanned, and the tail error is
+  surfaced. PROVEN RED on revert (early `return nil, err`): both sessions SURVIVE
+  ("fail-open: stale authorization keeps forwarding"), iterateCalls==0, config
+  dropped to nil. `TestSyncAndApplySkipsInvalidatorsOnFatalApplyError` (fatal
+  ErrPolicySchedulerProtocolIncompatible) asserts sessions survive + no scan + nil
+  config + error surfaced (no spurious invalidation, no regression).
+  `TestSyncAndApplyRunsInvalidatorsOnCleanApply` guards against over-suppression.
+  `TestSyncAndApplySurfacesPartialInvalidationError` (#5578 on the receive path,
+  delErr) asserts the partial-clear error is joined through the defer into the
+  return. Validation: GOCACHE/GOTMPDIR go build ./... + go vet ./pkg/daemon clean;
+  go test -race ./pkg/daemon ./pkg/cluster both GREEN. Not touching
+  wire/failover machinery, so test-failover shim-wall-blocked = no regression.
+- **File(s)**: pkg/daemon/daemon_apply.go (syncAndApply: named returns +
+  deferred/guarded invalidation + applyErrSkipsPeerSync fatal-vs-tail classify),
+  pkg/daemon/configsync_invalidate_5564_test.go (new, 4 tests), docs/sync-protocol.md
+  ("Receive-side session invalidation (#5564)" subsection)
 
 ## 2026-07-16 — #5155 (afxdp/session_glue): O(N) HashSet dedup for DemoteOwnerRGS cancelled_keys (was O(N^2) on packet worker)
 - **Timestamp**: 2026-07-16 (fix/5155-demote-dedup-hashset)
