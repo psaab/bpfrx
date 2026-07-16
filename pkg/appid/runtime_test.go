@@ -424,11 +424,19 @@ func TestResolveTupleFallbackNoMislabelOnMalformedPort(t *testing.T) {
 	}
 }
 
+// TestSessionMatchesUnknown pins the case-EXACT match of the UNKNOWN sentinel
+// (#5820). An unclassified session (app_id 0 with AppID enabled) resolves to the
+// upper-case sentinel "UNKNOWN", so only the exact "UNKNOWN" filter selects it —
+// a lowercase "unknown" filter no longer folds onto it.
 func TestSessionMatchesUnknown(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Services.ApplicationIdentification = true
-	if !SessionMatches("unknown", nil, cfg, 6, 40000, 80, 0) {
-		t.Fatal("SessionMatches() should match UNKNOWN when AppID is enabled")
+	if !SessionMatches("UNKNOWN", nil, cfg, 6, 40000, 80, 0) {
+		t.Fatal("SessionMatches(\"UNKNOWN\") should match the unclassified sentinel when AppID is enabled")
+	}
+	// #5820: case-exact — the lowercase spelling must NOT fold onto the sentinel.
+	if SessionMatches("unknown", nil, cfg, 6, 40000, 80, 0) {
+		t.Fatal("SessionMatches(\"unknown\") must NOT match the upper-case UNKNOWN sentinel (case-sensitive, #5820)")
 	}
 }
 

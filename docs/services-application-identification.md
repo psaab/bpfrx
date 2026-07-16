@@ -113,24 +113,43 @@ upfront what they're getting and not getting.
      alone (#3428); the session source port is threaded into
      `ResolveSessionName` for this purpose.
 
-**`UNKNOWN` name reserved out of the user namespace (#5821)**:
-because `ResolveSessionName` returns the literal `UNKNOWN` for the
-unclassified/unstamped/catalog-skew state and `SessionMatches`
+**Filter matching is case-sensitive (#5820)**: `SessionMatches`
 (`pkg/appid/runtime.go`) compares an operator `show ... application
-<name>` / `clear ... application <name>` filter against that same
-flattened name, a user-defined application (or application-set) named
-`UNKNOWN` would be indistinguishable from the sentinel — the filter
-could not tell "no known application" from the configured app, and a
-destructive filtered session clear could delete both groups. A
-commit-time gate (`validateReservedApplicationNamesStrict`,
+<name>` / `clear ... application <name>` filter against the session's
+resolved application name with **case-EXACT equality** (`==`, not
+`strings.EqualFold`). Application names are case-sensitive identifiers
+everywhere else in the stack — the parser, typed store, resolver,
+catalog, and AppID stamping all preserve and key on exact case, so
+`Payroll` and `payroll` are two DISTINCT applications with distinct
+AppIDs and distinct session labels, and a user `JUNOS-HTTP` never
+folds onto the predefined `junos-http`. The pre-#5820 fold was the sole
+inconsistency: it let a single-case filter collapse two distinct
+applications on the display path and — because the same predicate drives
+the destructive `ClearSessions` walk — broaden a filtered clear to delete
+sessions the operator did not name. Junos application filters are
+case-exact, so exact matching is the parity contract. Regression:
+`pkg/appid` `TestSessionMatchesCaseSensitive5820` (fail-on-revert).
+
+**`UNKNOWN` name reserved out of the user namespace (#5821, relaxed to
+exact-case in #5820)**: because `ResolveSessionName` returns the literal
+upper-case `UNKNOWN` for the unclassified/unstamped/catalog-skew state and
+`SessionMatches` compares an operator filter against that same flattened
+name, a user-defined application (or application-set) named `UNKNOWN`
+would be indistinguishable from the sentinel — the filter could not tell
+"no known application" from the configured app, and a destructive filtered
+session clear could delete both groups. A commit-time gate
+(`validateReservedApplicationNamesStrict`,
 `pkg/config/compiler_validate_strict_application.go`) therefore
 **reserves `UNKNOWN` out of the `applications application` /
-`applications application-set` namespace, case-insensitively**
-(`SessionMatches` folds case, so `unknown`/`Unknown` alias the sentinel
-too). The reserved literal `config.ReservedApplicationName` is kept
-equal to `appid.Unknown` by the `pkg/appid`
-`TestReservedApplicationNameMatchesUnknownSentinel` canary. This is a
-**new fail-closed restriction** (release-note behavior change): a
+`applications application-set` namespace, case-sensitively**. The
+sentinel is only ever rendered upper-case `UNKNOWN`, and now that filter
+matching is case-exact (#5820), only an application literally named
+`UNKNOWN` can alias it — `unknown` / `Unknown` are distinct names that are
+now ACCEPTED (this is the #5820 relaxation of the original #5821
+case-insensitive reservation). The reserved literal
+`config.ReservedApplicationName` is kept equal to `appid.Unknown` by the
+`pkg/appid` `TestReservedApplicationNameMatchesUnknownSentinel` canary.
+This is a **fail-closed restriction** (release-note behavior change): a
 previously-valid config that already named an application `UNKNOWN` now
 hard-rejects on the operator's next commit. The tolerant load / peer-sync
 path downgrades the reject to a warning so an already-persisted or

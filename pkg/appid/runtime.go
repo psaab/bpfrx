@@ -207,11 +207,24 @@ func ResolveSessionName(appNames map[uint16]string, cfg *config.Config, proto ui
 	return resolveTupleFallback(proto, srcPort, dstPort, cfg)
 }
 
+// SessionMatches reports whether a session's resolved application name equals
+// the operator's `show`/`clear ... application <name>` filter.
+//
+// The comparison is CASE-SENSITIVE exact equality (#5820). Application names
+// are case-sensitive identifiers everywhere else in the stack — the parser,
+// typed store, resolver, catalog, and AppID stamping all preserve and key on
+// exact case, so `Payroll` and `payroll` are two distinct applications with
+// distinct AppIDs and distinct session labels. A case-folded filter compare
+// here (the pre-#5820 strings.EqualFold) was the sole inconsistency: it let a
+// single-case filter collapse two distinct applications on the display path and
+// — because the same predicate drives the destructive ClearSessions walk —
+// broaden a filtered clear to delete sessions the operator did not name. Junos
+// application filters are case-exact, so exact `==` here is the parity contract.
 func SessionMatches(filter string, appNames map[uint16]string, cfg *config.Config, proto uint8, srcPort, dstPort uint16, appID uint16) bool {
 	if filter == "" {
 		return true
 	}
-	return strings.EqualFold(ResolveSessionName(appNames, cfg, proto, srcPort, dstPort, appID), filter)
+	return ResolveSessionName(appNames, cfg, proto, srcPort, dstPort, appID) == filter
 }
 
 func sortedNames(names map[string]struct{}) []string {

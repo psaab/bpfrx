@@ -743,17 +743,20 @@ const ReservedApplicationName = "UNKNOWN"
 // validateReservedApplicationNamesStrict hard-rejects, at commit /
 // commit-check, a user-defined `applications application <name>` or
 // `applications application-set <name>` whose name equals the AppID unknown
-// sentinel (ReservedApplicationName == "UNKNOWN") CASE-INSENSITIVELY (#5821).
+// sentinel (ReservedApplicationName == "UNKNOWN") CASE-SENSITIVELY (#5821,
+// relaxed to exact-case in #5820).
 //
 // Without this reservation the sentinel and a real catalog application share
 // one flat string on the AppID display/filter surface (ResolveSessionName /
 // SessionMatches, pkg/appid/runtime.go): `show ... application UNKNOWN` cannot
 // tell truly-unknown sessions from sessions classified as the user application,
 // and the destructive `clear ... application UNKNOWN` selector can delete both
-// groups. SessionMatches already folds case (strings.EqualFold), so "unknown"
-// and "Unknown" collide with the sentinel too; the reservation is therefore
-// case-insensitive to keep the whole case-folded name-slot owned by the
-// sentinel.
+// groups. The sentinel is only ever rendered upper-case `UNKNOWN` by
+// ResolveSessionName, and SessionMatches now compares filters case-exactly
+// (#5820), so only an application literally named `UNKNOWN` can alias it —
+// "unknown"/"Unknown" are distinct names that no longer collide. The
+// reservation is therefore case-sensitive, matching the case-exact namespace
+// contract of the store/catalog.
 //
 // Applications and application-sets share one flat Junos namespace, and a
 // multi-term application additionally mints an implicit application-set under
@@ -785,7 +788,7 @@ func validateReservedApplicationNamesStrict(cfg *Config) error {
 	}
 	sort.Strings(appNames)
 	for _, name := range appNames {
-		if strings.EqualFold(name, ReservedApplicationName) {
+		if name == ReservedApplicationName {
 			return reservedApplicationNameError("application", name)
 		}
 	}
@@ -795,7 +798,7 @@ func validateReservedApplicationNamesStrict(cfg *Config) error {
 	}
 	sort.Strings(setNames)
 	for _, name := range setNames {
-		if strings.EqualFold(name, ReservedApplicationName) {
+		if name == ReservedApplicationName {
 			return reservedApplicationNameError("application-set", name)
 		}
 	}
@@ -809,7 +812,7 @@ func reservedApplicationNameError(kind, name string) error {
 	return fmt.Errorf(
 		"applications %s %q: %q is reserved as the AppID \"no known application\" "+
 			"sentinel and may not name a user application or application-set "+
-			"(reserved case-insensitively) — the `show`/`clear ... application "+
+			"(reserved exact-case) — the `show`/`clear ... application "+
 			"<name>` filter and the session renderer cannot distinguish a real "+
 			"application named %q from the unclassified/unstamped state, so a "+
 			"filtered session clear could delete both; rename it (#5821)",
