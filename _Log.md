@@ -1,3 +1,32 @@
+## 2026-07-16 — #5090 (pkg/vrrp, validation hardening): bound VRRPv3 advert address count before serialize
+- **Timestamp**: 2026-07-16 (fix/5090-vrrp-advert-count-cap)
+- **Action**: Fix #5090. STEP-0 confirmed live on origin/master: `Marshal` in
+  `pkg/vrrp/packet.go` took `count := len(p.IPAddresses)` (unbounded int),
+  serialized the full 8+N-byte payload, then narrowed the header Count field
+  with `buf[3] = uint8(count)` and NO address-count bound. With 256 addresses
+  Count wraps to 0 (256 mod 256) while the payload is fully serialized, so
+  receivers reject/misparse the advert. Trigger is impractical (IPv6 MTU caps a
+  single-family list well below 255) → Low validation hardening. Fix: add
+  `MinAdvertAddrCount=1`/`MaxAdvertAddrCount=255` constants (RFC 5798 §5.2.4 —
+  Count is an 8-bit field) and a guard at the top of `Marshal`, BEFORE buffer
+  allocation, that returns an error when `count < 1 || count > 255` — mirroring
+  the vrrp.go MinVRID/MaxVRID guard (#4573). REJECT, not silent truncate (a cap
+  would drop VIPs from the advert). Callers (`sendPacketIPv4`/`sendPacketIPv6`)
+  already propagate a Marshal error; `sendAdvert` only builds a packet when
+  `len(addrs) > 0`, so the lower bound never fires on the legit path. No wire-
+  format change; the normal 1..255 path is byte-identical.
+- **File(s)**: pkg/vrrp/packet.go,
+  pkg/vrrp/packet_addrcount_5090_test.go (new), _Log.md
+- **Validation**: new tests (`TestMarshal_RejectsOver255Addresses`,
+  `TestMarshal_AddressCountBoundaries`, `TestMarshal_NormalAdvertUnchanged`) —
+  fail-on-revert proven firsthand: neutralize the guard → 256-address Marshal
+  succeeds with serialized Count byte == 0 (RED), boundary count=0/256 no longer
+  error (RED); restore → GREEN. Full `pkg/vrrp` suite green under `-race`;
+  `go build ./...` + `go vet ./pkg/vrrp` clean. No doc change: README documents
+  state-machine/timing/checksum behavior, not a wire-format Count/Marshal
+  address-count contract — the code-level doc comment on the new constants is
+  the contract home.
+
 ## 2026-07-16 — #5817 (scripts/deploy, security): fetch verify/use TOCTOU + non-exclusive temp
 - **Timestamp**: 2026-07-16 (fix/5817-deploy-verify-toctou)
 - **Action**: Fix #5817 (codex-183 audit, supply-chain TOCTOU). STEP-0 confirmed

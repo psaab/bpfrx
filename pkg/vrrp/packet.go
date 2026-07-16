@@ -16,6 +16,21 @@ const (
 	vrrpHeaderLen = 8
 )
 
+// MinAdvertAddrCount / MaxAdvertAddrCount bound the number of virtual IP
+// addresses a single VRRPv3 advertisement may carry. RFC 5798 §5.2.4 defines
+// the "Count IPvX Addr" field as 8 bits, so at most 255 addresses fit and a
+// valid advert carries at least one. Marshal writes this count straight onto
+// the single wire byte (`buf[3] = uint8(count)`), so an unbounded address
+// slice would truncate: 256 addresses wrap to Count 0, producing a
+// fully-serialized 8+N-byte payload whose header claims zero addresses — every
+// receiver then rejects (or misparses) the advert. Marshal range-checks the
+// slice length against these bounds BEFORE serializing and refuses to build
+// such a packet, mirroring the VRID guard (vrrp.go MinVRID/MaxVRID, #4573).
+const (
+	MinAdvertAddrCount = 1
+	MaxAdvertAddrCount = 255
+)
+
 // VRRPPacket represents a VRRPv3 advertisement packet (RFC 5798).
 type VRRPPacket struct {
 	VRID         uint8
@@ -39,6 +54,14 @@ func (p *VRRPPacket) Marshal(isIPv6 bool, srcIP, dstIP net.IP) ([]byte, error) {
 	}
 
 	count := len(p.IPAddresses)
+	// Reject before serializing: the count is written to a single u8 wire byte
+	// (buf[3]), so >255 addresses would narrow lossily (256→Count 0) and a
+	// 0-address advert is meaningless per RFC 5798 §5.2.4. Surface the
+	// misconfiguration instead of emitting an advert with a wrong Count.
+	if count < MinAdvertAddrCount || count > MaxAdvertAddrCount {
+		return nil, fmt.Errorf("VRRP advert address count %d out of range %d..%d",
+			count, MinAdvertAddrCount, MaxAdvertAddrCount)
+	}
 	pktLen := vrrpHeaderLen + count*addrSize
 	buf := make([]byte, pktLen)
 
