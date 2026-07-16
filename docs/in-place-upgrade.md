@@ -281,10 +281,19 @@ exist.
   binary from `versions/current`; it always returns a non-nil error so a
   flip failure is never reported as success.
 
-Version strings that key `versions/<ver>` are validated as safe single path
-segments (`ValidateVersionSegment`: no `/`, `..`, leading dot, whitespace,
-or control chars — but `+`/`:`/`~`/`-` are allowed, so Debian/semver
-versions pass).
+Version strings that key `versions/<ver>` — and, the strictest sink, the
+`ExecStart` line in the `10-xpf-version.conf` unit drop-in — are validated by a
+SINK-AWARE strict allowlist (`ValidateVersionSegment`, mirrored by the shell
+`is_safe_segment` in `debian/xpf.preinst`): only `[A-Za-z0-9]` plus
+`. _ + ~ - :` are accepted, so Debian/semver versions (`1:2.3.4-1`,
+`1.0.0~beta1`, `1.0.0+build.7`) pass while `/`, `..`, leading dot, whitespace,
+and control chars are rejected. It also rejects `%` and the other systemd
+argv metacharacters (`$`, `"`, `'`, `\`, backtick): although harmless as a bare
+filesystem path segment, `%` is a **systemd unit specifier** (`%i`, `%n`, …), so
+a `%`-bearing version substituted into the pinned `ExecStart` would be expanded
+by systemd and silently rewrite the executable path after the upgrade STOP
+(#5713 M41). None of these is legal in a Debian/semver version, so the allowlist
+fails closed rather than substituting them.
 
 **Lifecycle (`debian/xpf.postrm`):** remove/purge remove sbin links that
 resolve through `versions/current` (in addition to legacy direct-staged

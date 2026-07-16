@@ -50,9 +50,13 @@ BINS="xpfd cli xpf-userspace-dp xpf-day0-config"
 
 # is_safe_segment reports (exit 0) whether $1 is a safe single path segment:
 # non-empty, not "." / "..", no leading dot (collides with the runtime
-# dotfile namespace + hidden from GC), no "/", no whitespace/control chars.
-# Mirrors pkg/upgrade.ValidateVersionSegment so the shell migration keys
-# versions/<ver> by the same rule the Go cut machine enforces.
+# dotfile namespace + hidden from GC), no "/", and every remaining char in
+# the strict allowlist [A-Za-z0-9.:+~_-]. Mirrors pkg/upgrade.ValidateVersion
+# Segment so the shell migration keys versions/<ver> by the SAME rule the Go
+# cut machine enforces — including the #5713 M41 rejection of '%' (a systemd
+# unit specifier that would rewrite the pinned ExecStart path) and the other
+# systemd argv metacharacters ($ " ' \ backtick), none of which is legal in a
+# Debian/semver version.
 is_safe_segment() {
     seg="$1"
     [ -n "$seg" ] || return 1
@@ -61,18 +65,18 @@ is_safe_segment() {
         .*) return 1 ;;          # leading dot
         */*) return 1 ;;         # path separator
     esac
-    # Reject whitespace / control chars AND non-ASCII high bytes. `case` with
-    # a glob can't match a class portably, so strip the safe set and see if
-    # anything remains; printf|tr keeps it POSIX. A leftover char (incl.
-    # space/tab/newline + any byte >= 0x80, all of which [:graph:] excludes
-    # under the C locale) means unsafe.
+    # Strict allowlist: strip every ALLOWED char and see if anything remains.
+    # A leftover means a disallowed char — whitespace/control/non-ASCII (all
+    # excluded from the set) OR a systemd metacharacter like '%' '$' '"' '\'
+    # backtick '*' '?' '[' ']' (#5713 M41). `case` with a glob can't match a
+    # class portably, so printf|tr keeps it POSIX.
     #
-    # LC_ALL=C is MANDATORY (Copilot): [:graph:] membership is locale-
-    # dependent — under a UTF-8 locale a multibyte char can be classified as
-    # graph and stripped, letting a non-ASCII version slip through and break
-    # parity with the Go ValidateVersionSegment (which rejects rune >= 0x80).
-    # dpkg runs maintainer scripts under the inherited locale, so we pin C.
-    stripped=$(printf '%s' "$seg" | LC_ALL=C tr -d '[:graph:]')
+    # LC_ALL=C is MANDATORY (Copilot): character-class / byte membership is
+    # locale-dependent — under a UTF-8 locale a multibyte char could survive
+    # the strip and break parity with the Go ValidateVersionSegment (which
+    # rejects rune >= 0x80). dpkg runs maintainer scripts under the inherited
+    # locale, so we pin C.
+    stripped=$(printf '%s' "$seg" | LC_ALL=C tr -d 'A-Za-z0-9.:+~_-')
     [ -z "$stripped" ] || return 1
     return 0
 }
