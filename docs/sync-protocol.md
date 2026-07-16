@@ -391,6 +391,32 @@ apply the accepted config, and returns an `error` so the ordered apply loop
 advances the high-water mark only on a successful apply (see Apply-then-advance
 above).
 
+**Receive-side session invalidation (#5564).** `syncAndApply`
+(`pkg/daemon/daemon_apply.go`) is the receive-side analogue of the commit path's
+`applyAndSyncCommitted`. `configstore.SyncApply` promotes the peer config to
+active BEFORE the reconcile, and `applyConfigLocked` then arms the dataplane
+snapshot — so once the apply reaches its tail the standby is forwarding under the
+new policy set. The three session invalidators (`clearSessionsForPolicyChanges`:
+the #4234 deletion-clear, the modified-policy re-eval, and the #4342
+default-policy change) MUST therefore run to re-authorize surviving established
+sessions against the now-active config. They run from a deferred, guarded block
+so they ALWAYS fire once the config reached active+armed — including on a
+NON-FATAL best-effort tail failure (host-inbound/lo0 nft, networkd, ...) that
+`applyConfigLocked` joins and returns. Skipping them on such an error (the
+pre-#5564 early `return nil, err`) was a security fail-open: a session a
+peer-tightened/deleted policy should now DENY kept forwarding under its stale
+authorization, and because the store already held the incoming text the primary's
+equal-active-text re-push took the fast path (`activeText == incomingText`, at the
+top of `handleConfigSync`) and never re-entered `syncAndApply` to correct it,
+making the omission permanent (visible at failover). The classifier
+`applyErrSkipsPeerSync` (shared with the commit path) still distinguishes the two
+FATAL classes — a required-protocol-gate error (dataplane DISARMED, #2138) and a
+daemon-stop context abort (#2926) — where the config is not live-forwarding and
+the invalidators are correctly skipped; on those `syncAndApply` returns a nil
+config plus the error. Any other tail error is surfaced (joined with any partial
+#5578 invalidation error) AFTER the invalidators run, so the high-water mark still
+does not advance and the primary's re-push re-converges the mark on the fast path.
+
 ## IPsec SA Payload (Variable)
 
 Newline-separated (`\n`) list of strongSwan connection names (e.g., `vpn-gw1\nvpn-gw2`). On failover, the new primary calls `swanctl --initiate` for each name.
