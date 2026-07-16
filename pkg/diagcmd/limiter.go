@@ -1,6 +1,7 @@
 package diagcmd
 
 import (
+	"context"
 	"errors"
 	"sync"
 )
@@ -62,6 +63,53 @@ func (l *Limiter) Acquire() (release func(), err error) {
 	default:
 		return nil, ErrBusy
 	}
+}
+
+// leaseKey is the private, per-Limiter context key for an in-process admission
+// lease (#5880). Keyed by the *Limiter identity so a lease taken on one limiter
+// is never mistaken for another's, and UNFORGEABLE from outside the process: the
+// type is unexported and context values cannot be constructed from any external
+// input (HTTP header / gRPC metadata / request body), so only AcquireCtx below
+// can stamp it.
+type leaseKey struct{ l *Limiter }
+
+// AcquireCtx is the request-graph-aware form of Acquire (#5880). It admits ONE
+// logical scan per in-process request graph instead of once per handler, closing
+// the reentrant double-acquire where an outer handler (e.g. a REST list) holds a
+// slot and then delegates in-process to another handler (the gRPC session
+// service) that acquired the SAME limiter again — self-rejecting its own fan-out
+// at capacity.
+//
+//   - If ctx already carries THIS limiter's in-process admission lease (an
+//     ancestor handler in this process already acquired a slot and propagated
+//     the returned context), AcquireCtx returns a NO-OP release and ctx unchanged
+//     WITHOUT taking a second slot — the nested work reuses the ancestor's
+//     admission.
+//   - Otherwise it takes a slot exactly like Acquire (fail-fast, ErrBusy over
+//     cap) and returns a real release PLUS a child context stamped with the
+//     lease. The caller MUST propagate that context to any in-process delegation
+//     so the delegate reuses this slot instead of re-acquiring.
+//
+// The lease is per-REQUEST-GRAPH, NOT global: two DISTINCT external requests each
+// begin with an unstamped context and each acquire independently, so the global
+// per-node bound is preserved — only NESTED in-process delegation within ONE
+// request skips. The lease does NOT cross a process/network boundary (context
+// values are process-local and never serialized onto the wire), so a peer node's
+// own gRPC entry point sees no lease and acquires its own local slot — remote
+// admission is unchanged.
+//
+// The returned release is idempotent and cancellation-safe on BOTH paths: a real
+// slot rides Acquire's sync.Once, and the lease-reuse path is a bare no-op, so a
+// deferred release can never over-release another caller's slot.
+func (l *Limiter) AcquireCtx(ctx context.Context) (release func(), out context.Context, err error) {
+	if ctx.Value(leaseKey{l}) != nil {
+		return func() {}, ctx, nil
+	}
+	rel, err := l.Acquire()
+	if err != nil {
+		return nil, ctx, err
+	}
+	return rel, context.WithValue(ctx, leaseKey{l}, struct{}{}), nil
 }
 
 // InFlight reports the number of slots currently held. Intended for

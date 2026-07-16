@@ -109,13 +109,21 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	// rather than each driving its own simultaneous walk. Release on every
 	// exit path via defer. This covers both the offset and cursor paths. The
 	// limiter is shared with the summary/zone-pair scans (#5433).
-	release, err := sessionWalkLimiter.Acquire()
+	//
+	// #5880: acquire once at THIS external trust boundary and re-stamp the
+	// request context with the returned in-process admission lease. The
+	// include_peer fan-out (writeSessionList) delegates to the in-process gRPC
+	// session service on r.Context(), so re-stamping r propagates the lease and
+	// that nested call REUSES this slot instead of re-acquiring the same limiter
+	// and self-rejecting at capacity.
+	release, walkCtx, err := sessionWalkLimiter.AcquireCtx(r.Context())
 	if err != nil {
 		writeError(w, http.StatusTooManyRequests,
 			"session list concurrency limit reached; retry shortly")
 		return
 	}
 	defer release()
+	r = r.WithContext(walkCtx)
 
 	view := s.buildSessionView()
 	q, errMsg := buildSessionQuery(r, view)
@@ -647,13 +655,18 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	// over-cap request is rejected with HTTP 429 instead of driving its own
 	// simultaneous walk. Release on every exit path via the deferred idempotent
 	// release; nothing is released on the ErrBusy path (release is nil there).
-	release, err := sessionWalkLimiter.Acquire()
+	//
+	// #5880: acquire once at this boundary and re-stamp r with the in-process
+	// admission lease so the include_peer delegation to the in-process gRPC
+	// GetSessionSummary reuses this slot rather than re-acquiring.
+	release, walkCtx, err := sessionWalkLimiter.AcquireCtx(r.Context())
 	if err != nil {
 		writeError(w, http.StatusTooManyRequests,
 			"session scan concurrency limit reached; retry shortly")
 		return
 	}
 	defer release()
+	r = r.WithContext(walkCtx)
 
 	var summary SessionSummary
 
@@ -866,13 +879,18 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, r *http.Request) 
 	// walk. Gate after the not-loaded early return, which serves an empty
 	// breakdown without walking. Release on every exit path via the deferred
 	// idempotent release; nothing is released on the ErrBusy path.
-	release, err := sessionWalkLimiter.Acquire()
+	//
+	// #5880: acquire once at this boundary and re-stamp r with the in-process
+	// admission lease so the include_peer delegation to the in-process gRPC
+	// GetZonePairSummary reuses this slot rather than re-acquiring.
+	release, walkCtx, err := sessionWalkLimiter.AcquireCtx(r.Context())
 	if err != nil {
 		writeError(w, http.StatusTooManyRequests,
 			"session scan concurrency limit reached; retry shortly")
 		return
 	}
 	defer release()
+	r = r.WithContext(walkCtx)
 
 	// Build zone ID -> name reverse map
 	zoneNames := make(map[uint16]string)

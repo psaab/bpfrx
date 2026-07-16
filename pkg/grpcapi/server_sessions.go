@@ -62,7 +62,14 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	// than each driving its own simultaneous walk. The limiter is SHARED with
 	// the REST session scans, so a mix of REST+gRPC callers cannot collectively
 	// exceed the aggregate bound. Release on every exit path via defer.
-	release, err := sessionWalkLimiter.Acquire()
+	//
+	// #5880: use the request-graph-aware AcquireCtx so a REST list/summary
+	// handler that already holds a slot and delegates to this RPC IN-PROCESS
+	// (carrying the admission lease on ctx) REUSES that slot instead of
+	// re-acquiring the same limiter and self-rejecting its own include_peer
+	// fan-out at capacity. A direct external gRPC call carries no lease and
+	// acquires exactly one slot as before.
+	release, _, err := sessionWalkLimiter.AcquireCtx(ctx)
 	if err != nil {
 		return nil, status.Error(codes.ResourceExhausted,
 			"session scan concurrency limit reached; retry shortly")
@@ -763,7 +770,11 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 	// lock contention as the list). Gate it through the SAME shared limiter as
 	// GetSessions and the REST scans so a gRPC scrape flood cannot drive
 	// unbounded concurrent walks. Release on every exit path via defer.
-	release, err := sessionWalkLimiter.Acquire()
+	//
+	// #5880: AcquireCtx reuses an in-process admission lease so a REST
+	// summary handler delegating here for include_peer does not double-charge
+	// the limiter; a direct external gRPC caller acquires once as before.
+	release, _, err := sessionWalkLimiter.AcquireCtx(ctx)
 	if err != nil {
 		return nil, status.Error(codes.ResourceExhausted,
 			"session scan concurrency limit reached; retry shortly")
@@ -916,7 +927,11 @@ func (s *Server) GetZonePairSummary(ctx context.Context, req *pb.GetZonePairSumm
 	// zone-pairs is bounded on REST but unbounded on gRPC. Release on every exit
 	// path via defer; the peer fan-out below dials the peer (which gates its own
 	// walk), so this holds only the local slot.
-	release, err := sessionWalkLimiter.Acquire()
+	//
+	// #5880: AcquireCtx reuses an in-process admission lease so a REST zone-pair
+	// handler delegating here for include_peer does not double-charge the
+	// limiter; a direct external gRPC caller acquires once as before.
+	release, _, err := sessionWalkLimiter.AcquireCtx(ctx)
 	if err != nil {
 		return nil, status.Error(codes.ResourceExhausted,
 			"session scan concurrency limit reached; retry shortly")
