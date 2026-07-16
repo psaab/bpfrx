@@ -824,11 +824,18 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				d.scheduleStandbyNeighborRefresh()
 			}
 
-			// Wire bulk sync override: use event stream export (fast path)
-			// instead of BPF map iteration for initial bulk sync on connect.
-			d.sessionSync.BulkSyncOverride = func() error {
-				return d.bulkSyncViaEventStreamOrFallback(d.sessionSync)
-			}
+			// #5085: do NOT wire the event-stream export as the cold-prime
+			// bulk override. That path delivered sessions as async, LOSSY
+			// event-stream incrementals (QueueSessionV4/V6 -> non-blocking
+			// sendCh) and then sent an EMPTY BulkStart/BulkEnd, so the receiver
+			// recorded zero session keys and skipped authoritative stale
+			// reconciliation — a stale peer-owned session the standby held
+			// survived cold-prime. Cold-prime now uses the lossless BulkSync
+			// direct-write window (doBulkSync), which delimits a COMPLETE
+			// authoritative snapshot the receiver reconciles against. A
+			// table-truth, owner-RG-filtered snapshot via ExportOwnerRGSessions
+			// (eliminating the BulkSync mirror-map drift residual) is tracked as
+			// a follow-up.
 
 			d.sessionSync.OnPeerDisconnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer disconnected (all fabrics)")
