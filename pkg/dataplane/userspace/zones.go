@@ -55,10 +55,17 @@ func buildInterfaceZoneMap(cfg *config.Config) map[string]string {
 		if zone == nil {
 			continue
 		}
-		for _, iface := range zone.Interfaces {
-			if iface == "" {
+		for _, rawIface := range zone.Interfaces {
+			if rawIface == "" {
 				continue
 			}
+			// #5878 phase 2: bind the zone reference on its CANONICAL logical-unit
+			// identity so ge-0/0/0.01 and ge-0/0/0.1 resolve to the same runtime
+			// unit as the interface's `unit 1` definition. The per-unit snapshot
+			// consumer (buildInterfaceSnapshots) keys this map by the canonical
+			// "%s.%d" unit name, so a raw ".01" key would miss and the unit would
+			// bind to NO zone. A bare ref or a malformed suffix is unchanged.
+			iface := config.CanonicalInterfaceUnitRef(rawIface)
 			if _, exists := out[iface]; !exists {
 				out[iface] = zoneName
 			}

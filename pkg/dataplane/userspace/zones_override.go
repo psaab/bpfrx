@@ -135,6 +135,11 @@ func buildInterfaceHostInboundMap(cfg *config.Config) map[string]*config.HostInb
 				continue
 			}
 			if strings.Contains(ref, ".") {
+				// #5878 phase 2: resolve the unit ref on its canonical identity so
+				// a reth0.050 override lands on the same key (reth0.50) the per-unit
+				// snapshot consumer looks up, and the #5489 owner guard compares the
+				// canonical unit against the (now canonical) zone map.
+				canonRef := config.CanonicalInterfaceUnitRef(ref)
 				// #5489: a unit-level override must come ONLY from the unit's
 				// authoritative zone owner. buildInterfaceZoneMap resolves the
 				// owner as the first sorted zone that claims the unit; on a
@@ -145,7 +150,7 @@ func buildInterfaceHostInboundMap(cfg *config.Config) map[string]*config.HostInb
 				// InterfaceSnapshot / ZoneHostInboundView. Quarantine the leak with
 				// the SAME predicate the physical-expansion branch uses (#3720
 				// M01): skip when a DIFFERENT zone owns this unit.
-				if z := zoneByIface[ref]; z != "" && z != zn {
+				if z := zoneByIface[canonRef]; z != "" && z != zn {
 					continue
 				}
 				// Logical unit ref: the most specific override. Merge (union) it
@@ -153,7 +158,7 @@ func buildInterfaceHostInboundMap(cfg *config.Config) map[string]*config.HostInb
 				// refs are walked sorted and a bare physical ref sorts before its
 				// units, a same-zone physical expansion below has already run, so
 				// this yields physical ∪ unit.
-				out[ref] = mergeHostInboundTraffic(out[ref], hib)
+				out[canonRef] = mergeHostInboundTraffic(out[canonRef], hib)
 				continue
 			}
 			// Bare physical ref: first-writer-wins across zones for the bare key

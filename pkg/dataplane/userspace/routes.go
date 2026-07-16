@@ -346,8 +346,12 @@ func buildInterfaceRouteTables(cfg *config.Config) (map[string]string, map[strin
 			if ifname == "" {
 				continue
 			}
-			v4[ifname] = ri.Name + ".inet.0"
-			v6[ifname] = ri.Name + ".inet6.0"
+			// #5878 phase 2: canonicalize the .<unit> suffix so ge-0/0/0.01 binds
+			// the same route table as ge-0/0/0.1 (the per-unit snapshot consumer
+			// keys these maps by the canonical "%s.%d" unit name).
+			key := config.CanonicalInterfaceUnitRef(ifname)
+			v4[key] = ri.Name + ".inet.0"
+			v6[key] = ri.Name + ".inet6.0"
 		}
 	}
 	return v4, v6
@@ -374,7 +378,10 @@ func buildInterfaceRoutingInstances(cfg *config.Config) map[string]string {
 			if ifname == "" {
 				continue
 			}
-			out[ifname] = ri.Name
+			// #5878 phase 2: canonicalize the .<unit> suffix so ge-0/0/0.01 binds
+			// the same routing-instance as ge-0/0/0.1 (the per-unit snapshot
+			// consumer keys this map by the canonical "%s.%d" unit name).
+			out[config.CanonicalInterfaceUnitRef(ifname)] = ri.Name
 		}
 	}
 	return out

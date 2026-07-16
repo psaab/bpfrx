@@ -99,6 +99,20 @@ func buildRuntimeDataPlane(dpType string) (dataplane.RuntimeDataPlane, error) {
 // silently activate binds 0a has never performed and needs its own
 // ratification.
 func riMemberLinuxName(tunMap map[string]string, ifaceName string) string {
+	// #5878 phase 2: resolve the routing-instance member on its CANONICAL
+	// logical-unit identity BEFORE the tunMap lookup so a `.01` member resolves
+	// to the SAME device as `.1` (and as the interface's `unit 1`). TunnelNameMap
+	// keys are built from the canonical int unit number
+	// (ifName + "." + strconv.Itoa(unitNum)), so canonicalizing here makes BOTH
+	// the tunnel-device path (tunMap hit) AND the LinuxIfName/unit-0-collapse path
+	// use the canonical name — otherwise a peer-only
+	// `groups node1 { routing-instances ri interface ge-0/0/0.01 }` reference
+	// binds a DIFFERENT VRF/tunnel device on the standby (the #5878 HA-divergence
+	// class at the netlink layer). Note the P1 alias gate
+	// (validateInterfaceUnitAliasCollisionsAST) gates `interfaces ... unit`
+	// DEFINITIONS, NOT routing-instance/zone membership REFERENCES, so it does not
+	// prevent this reference divergence — the canonicalization does.
+	ifaceName = config.CanonicalInterfaceUnitRef(ifaceName)
 	if name, ok := tunMap[ifaceName]; ok && name != "" {
 		return name
 	}
