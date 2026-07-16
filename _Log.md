@@ -1,3 +1,62 @@
+## 2026-07-16 — #5706 (cluster): IPsec/DHCP full-set state can regress across redundant receive streams (M32)
+- **Timestamp**: 2026-07-16 (fix/5706-ha-fullset-sequence)
+- **Action**: Fix #5706 (codex-review-182 M32). STEP-0 confirmed live on
+  origin/master f15869f89: IPsec SA sync (`QueueIPsecSA` → `syncMsgIPsecSA`,
+  received in `sync_conn.go handleMessage`) and DHCP-server lease sync
+  (`QueueDHCPLeases` → `syncMsgDHCPLeaseV4/V6`, `storePeerDHCPLeases`) are
+  FULL-SET pushes that REPLACE the peer's held set wholesale, and BOTH fabric
+  connections (`conn0`/`conn1`) run their own `receiveLoop` goroutine — so a
+  full-set delivered out of order across the redundant streams could overwrite a
+  newer set with an older one (a state regression: resurrected tunnel / revived
+  lease). Unlike sessions (#2170) and config (#3931), these carried NO sequence.
+  Fix (mirrors the #3931 config-gen precedent): each full-set now carries a
+  trailing `(incarnation, seq)` framing (`appendFullSetSeq`/`stripFullSetSeq`,
+  new `fullSetSeqMagic`, 24 trailing bytes). incarnation = the process
+  construction seed (`syncEpoch`, CLOCK_MONOTONIC nanos, constant per boot; a
+  process restart draws a strictly-greater epoch → supersedes). seq = a
+  per-type strictly-monotonic counter — IPsec / DHCP-v4 / DHCP-v6 draw from
+  INDEPENDENT counters (`ipsecSeqCounter`/`dhcpV4SeqCounter`/`dhcpV6SeqCounter`),
+  so a v4 push never gates a v6 one and an IPsec seq never gates a DHCP one. The
+  receiver keeps a `fullSetSeqGuard` high-water per stream
+  (`ipsecRecvSeq`/`dhcpV4RecvSeq`/`dhcpV6RecvSeq`, guarded by `recvSeqMu` because
+  both receiveLoops touch them) and admits only a strictly-newer pair
+  (lexicographic on (incarnation, seq) — higher incarnation always supersedes);
+  a stale reorder is DROPPED and counted (`IPsecSAStaleIgnored` /
+  `DHCPLeasesStaleIgnored`), held set untouched. BOTH SIDES updated: SENDER
+  stamps, RECEIVER compares. Cross-boot: an OS-rebooted peer restarts its
+  monotonic epoch LOWER, so the guards are `reset()` on a peer bulk re-prime
+  (`resetRecvGen`, fired on the reconnect BulkStart) — the rebooted peer's fresh
+  re-advertised set is then admitted (the #2198 F2 stale-RETAIN inverse). BACKWARD
+  COMPAT (mixed-version ISSU): the trailer is additive and self-detecting via the
+  magic, so NO `SessionSyncWireVersion` bump (the #2239/#3931 lesson — bumping
+  would refuse SESSION sync across a mixed-base pair). A legacy peer sends no
+  trailer → `stripFullSetSeq` yields `(0,0)` → guard accept-always (never wrongly
+  refused). New→old: the DHCP lease decoder reads its record count and IGNORES
+  the trailing bytes (fully clean); the IPsec newline decoder would keep the
+  trailer as bogus connection name(s) — fail-safe (takeover `reinitiateIPsecSAs`
+  merely warns on a name it cannot initiate; the REAL names decode ahead of the
+  trailer), only in the brief mixed window. Fail-on-revert PROVEN: neutralizing
+  `fullSetSeqGuard.admit` to always-true flips 4 tests RED —
+  TestIPsecSAOutOfOrderRejected (reordered seq=1 overwrites the seq=2 held set →
+  got [stale-vpn]), TestDHCPLeaseOutOfOrderRejected (reordered empty v4 set
+  regresses the held 2-lease set → 0), TestFullSetSeqReconnectResetReadmits, and
+  TestFullSetSeqGuardAdmit; restored → GREEN. Also covers per-type/per-family
+  independence, legacy-peer accept-always (compat), and the SENDER stamping via a
+  captureConn (both-sides). Validation: GOCACHE/GOTMPDIR go build ./... clean; go
+  vet ./pkg/cluster clean; go test -race ./pkg/cluster ./pkg/ipsec ./pkg/dhcp all
+  GREEN (cluster 10.1s). Unit-proven; test-failover shim-wall-blocked =
+  no-regression (the reorder scenario is unit-covered).
+- **File(s)**: pkg/cluster/sync_protocol.go (appendFullSetSeq/stripFullSetSeq +
+  fullSetSeqMagic wire codec), pkg/cluster/sync_conn.go (fullSetSeqGuard type +
+  admit/reset; strip+guard in the syncMsgIPsecSA/DHCPLeaseV4/V6 handlers;
+  resetRecvGen resets the guards), pkg/cluster/sync.go (syncEpoch +
+  per-type seq counters + recvSeqMu/guards struct fields; initGenState seeds
+  syncEpoch; QueueIPsecSA/QueueDHCPLeases stamp the trailer; IPsecSAStaleIgnored
+  /DHCPLeasesStaleIgnored stats + snapshot), pkg/cluster/fullset_seq_test.go
+  (new — fail-on-revert + codec/guard/compat/both-sides coverage),
+  docs/sync-protocol.md (full-set ordering section + message-type/handler/stats
+  tables), pkg/cluster/README.md (IPsec + DHCP full-set ordering notes)
+
 ## 2026-07-16 — #5566 (daemon): stale kernel host-inbound authorization after a coarse tightening (security fail-open)
 - **Timestamp**: 2026-07-16 (fix/5566-hostinbound-conntrack-flush)
 - **Action**: Fix #5566 (security fail-open, direct-kernel host-inbound path).
