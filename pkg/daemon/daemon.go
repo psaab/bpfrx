@@ -486,12 +486,17 @@ type Daemon struct {
 	// cold-boot fallback. Successful real loads Store true, including program-only
 	// generations; successful fallbacks Store true only when their exact rendered
 	// snapshot contains an address-scoped DROP. A successful zero-drop fallback
-	// leaves false so a later failed real invocation can try another snapshot.
-	// True proves neither current xpf_hostinbound table presence nor coverage of
-	// every current local address (#5789, #5790). Production access is serialized
-	// under applySem; atomic.Bool preserves the existing type, not a current
-	// readiness reader. nft success and the following Store are ordered operations
-	// in separate state domains, not one atomic publication.
+	// leaves false so a later failed real invocation can try another snapshot. A
+	// successful no-enforcement TEARDOWN (the table is deleted because nothing is
+	// enforceable) Stores false: with no table installed the "a protecting table
+	// exists" premise no longer holds, so a later enforceable generation whose
+	// first real load fails must take the cold-boot fence path rather than assume a
+	// retained table (#5790). A teardown FAILURE (a table may still be installed)
+	// does NOT clear it. True proves neither current xpf_hostinbound table presence
+	// nor coverage of every current local address (#5789, #5790). Production access
+	// is serialized under applySem; atomic.Bool preserves the existing type, not a
+	// current readiness reader. nft success and the following Store are ordered
+	// operations in separate state domains, not one atomic publication.
 	hostInboundEnforced atomic.Bool
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).

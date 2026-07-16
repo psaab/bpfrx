@@ -345,10 +345,17 @@ snapshot produces a zero-drop table shell:
   fallback gate. A successful real load stores true, including a program-only
   generation; a successful fallback stores true only when that exact fallback
   contains an address-scoped DROP. Repeated successful zero-drop fallbacks leave
-  false. True proves neither current table presence nor coverage of current
-  addresses: program-only/new-address coverage remains #5789, and sticky true
-  after successful teardown remains #5790. nft completion and the following Go
-  Store are ordered but not one atomic publication.
+  false. A successful **no-enforcement teardown** (nothing is enforceable, so the
+  `xpf_hostinbound` table is deleted) stores **false** (#5790): with no table
+  installed the "a protecting table exists" premise is gone, so a later
+  enforceable generation whose first real load fails must take this cold-boot
+  fence path rather than assume a retained table (the pre-fix sticky-true skipped
+  the fence and left newly reachable addresses fail-open). A teardown **failure**
+  (a table the delete could not remove may still be installed) does **not** clear
+  it. True still proves neither current table presence nor coverage of current
+  addresses: program-only/new-address coverage remains #5789. All Stores are
+  serialized under `applySem`; nft completion and the following Go Store are
+  ordered but not one atomic publication.
 - `installHostInboundColdBootFence` / `buildHostInboundFencePayload`
   (`daemon_nft.go`) build the fence: the same atomic-replace `xpf_hostinbound`
   table reduced to the global mandatory admits (`ct established,related`, raw
@@ -386,7 +393,9 @@ load while state is false then renders another fallback from that invocation's
 snapshot. This is scoped to the **direct-host nft input authority** only; the
 AF_XDP transit arm / attach readiness is owned separately by #5275.
 Fail-on-revert proofs:
-`pkg/daemon/host_inbound_coldboot_fence_5644_test.go`.
+`pkg/daemon/host_inbound_coldboot_fence_5644_test.go` and, for the
+teardown-clears-the-gate ordering (#5790),
+`pkg/daemon/host_inbound_teardown_enforced_5790_test.go`.
 
 ### Per-interface / per-family refinement (#3710)
 
