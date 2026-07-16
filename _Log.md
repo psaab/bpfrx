@@ -1,3 +1,56 @@
+## 2026-07-16 — #5765 (Rust dataplane): u16 length-cast defense-in-depth (claude-spark-review-002)
+- **Timestamp**: 2026-07-16 (fix/5765-u16-lencast-hardening)
+- **Action**: Harden 4 `... as u16` casts on packet/segment/frame lengths in the
+  AF_XDP userspace-dp that would silently WRAP for a >64K length. All four are
+  unreachable-for-wrap on origin/master today (an AF_XDP frame is bounded by the
+  UMEM frame size; an IPv4 `total_length` is itself a 16-bit field), so this is
+  pre-emptive defense-in-depth per the claude-spark-review-002 cohort. Added one
+  shared saturating-narrowing helper `saturate_len16(usize) -> u16`
+  (`u16::try_from(len).unwrap_or(u16::MAX)`) in `afxdp/frame/checksum.rs`,
+  mirroring the validated-narrowing newtype idiom in
+  `afxdp/forwarding_build/validated.rs` (VlanId/TunnelTtl/QueueId). The valid
+  (<64K) path is byte-identical to the old cast — a legitimate packet checksums
+  / injects unchanged; only the (unreachable) >64K case changes from a silent
+  wrap to a deterministic saturate. Per-site disposition:
+    * Site 1 — `checksum16_ipv4` (`checksum.rs`, IPv4 pseudo-header length):
+      HARDENED. Reachable-in-principle (returns a plain u16 checksum);
+      fail-on-revert tested directly at the function boundary with a 65540-byte
+      payload.
+    * Site 2 — TCP/UDP checksum-verify pseudo-headers (`frame/mod.rs` x3, incl.
+      the CSUM_BAD debug block): HARDENED (routed through the shared helper).
+      Structurally capped by the u16 `ip_total_len` wire field, so the wrap is
+      unreachable at the `verify_checksums` boundary; coverage via the shared
+      helper test.
+    * Site 3 — `coordinator/inject.rs` (`frame_len.min(u16::MAX)`): LEFT AS-IS.
+      Already saturating + gated upstream by `check_inject_packet_length`
+      (#2443, REJECTs oversize). Touching it would be churn / risk regressing a
+      correct fail-closed path.
+    * Site 4 — SYN-cookie reply builders (`frame/tcp.rs`, IPv4 total_length /
+      IPv6 payload_length): HARDENED for idiom-consistency, but truly
+      unreachable-for-wrap even at the boundary — `write_syn_cookie_tcp_header`
+      hard-rejects any `tcp_len` ∉ {20,24} (returns None) BEFORE a reply can be
+      emitted, so total_len ≤ 44. Guarded that structural gate with tests
+      (oversized tcp_len → None) instead of a vacuous saturate test.
+  Fail-on-revert PROVEN firsthand: neutralizing `saturate_len16` to bare
+  `len as u16` turned `saturate_len16_passes_through_in_range_and_saturates_above`
+  (left 0 vs right 65535) and `checksum16_ipv4_saturates_length_above_u16`
+  (checksum 5054 vs 5058) RED; the in-range regression + SYN-cookie gate tests
+  stayed GREEN; restored → all 6 GREEN. Validation: `cargo build --release`
+  clean (only pre-existing warnings); full `cargo test --release` pass.
+  No module doc needs an update — the validated-newtype architecture doc
+  (`docs/userspace-dataplane-architecture.md`) describes the control-plane→
+  dataplane SNAPSHOT trust boundary, a different concern from the hot-path
+  per-packet length narrowing, which is fully documented in the
+  `saturate_len16` doc-comment. Low-materiality defense-in-depth, all sites
+  unreachable-for-wrap → safe to merge without loss-cluster smoke; gated on the
+  unit tests.
+- **File(s)**: `userspace-dp/src/afxdp/frame/checksum.rs` (new `saturate_len16`
+  helper + site 1 + fail-on-revert test module `len16_hardening_tests`),
+  `userspace-dp/src/afxdp/frame/mod.rs` (re-export + 3 site-2 call swaps),
+  `userspace-dp/src/afxdp/frame/tcp.rs` (2 site-4 call swaps),
+  `userspace-dp/src/afxdp/frame/tcp_tests.rs` (SYN-cookie structural-gate +
+  in-range tests).
+
 ## 2026-07-16 — #5688 (Rust NAT): interface-mode SNAT with no same-family egress address leaked the source untranslated (fail-open)
 - **Timestamp**: 2026-07-16 (fix/5688-interface-snat-no-egress-drop)
 - **Action**: Fix #5688 (security/correctness fail-open, Rust userspace-dp

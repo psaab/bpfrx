@@ -52,7 +52,7 @@ pub(in crate::afxdp) use checksum::{
     adjust_l4_checksum_ipv4_src, adjust_l4_checksum_ipv4_words, adjust_l4_checksum_ipv6_words,
     checksum16, checksum16_add_bytes, checksum16_adjust, checksum16_finish, checksum16_ipv4,
     checksum16_ipv6, ipv6_words_from_octets, ipv6_words_from_slice,
-    recompute_l4_checksum_ipv4, recompute_l4_checksum_ipv6,
+    recompute_l4_checksum_ipv4, recompute_l4_checksum_ipv6, saturate_len16,
 };
 
 // Phase 2: header inspection / parsing helpers extracted to `inspect`.
@@ -1628,7 +1628,7 @@ pub(super) fn verify_built_frame_checksums(frame: &[u8]) -> (bool, bool) {
         pseudo.extend_from_slice(&dst.octets());
         pseudo.push(0);
         pseudo.push(PROTO_TCP);
-        pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(&saturate_len16(segment.len()).to_be_bytes());
         pseudo.extend_from_slice(segment);
         // Zero the checksum field in pseudo buffer (offset 12 + 16 = 28..30).
         let csum_off = 12 + 16;
@@ -1654,7 +1654,7 @@ pub(super) fn verify_built_frame_checksums(frame: &[u8]) -> (bool, bool) {
             pseudo.extend_from_slice(&dst.octets());
             pseudo.push(0);
             pseudo.push(PROTO_UDP);
-            pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
+            pseudo.extend_from_slice(&saturate_len16(segment.len()).to_be_bytes());
             pseudo.extend_from_slice(segment);
             let csum_off = 12 + 6;
             if pseudo.len() > csum_off + 1 {
@@ -1709,7 +1709,7 @@ pub(super) fn verify_built_frame_checksums(frame: &[u8]) -> (bool, bool) {
                     pseudo.extend_from_slice(&dst.octets());
                     pseudo.push(0);
                     pseudo.push(PROTO_TCP);
-                    pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
+                    pseudo.extend_from_slice(&saturate_len16(segment.len()).to_be_bytes());
                     pseudo.extend_from_slice(segment);
                     pseudo[12 + 16] = 0;
                     pseudo[12 + 17] = 0;
