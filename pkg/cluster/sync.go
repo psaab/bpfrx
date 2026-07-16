@@ -119,13 +119,24 @@ type SyncStats struct {
 	ConfigsApplyFailed atomic.Uint64
 	IPsecSASent        atomic.Uint64
 	IPsecSAReceived    atomic.Uint64
+	// IPsecSAStaleIgnored counts IPsec SA full-sets dropped by the #5706
+	// ordering guard: an incoming (incarnation, seq) that was NOT strictly
+	// newer than the last-applied pair — a full-set reordered across the
+	// redundant fabric streams. A nonzero value means the guard prevented a
+	// stale IPsec SA set from regressing the standby's held set.
+	IPsecSAStaleIgnored atomic.Uint64
 	// #2239 HA DHCP-server lease sync counters. Sent/Received count
 	// full-set lease push MESSAGES (one per family per push); Seeded counts
 	// leases written into a freshly-started Kea on takeover; errors fold
 	// into the shared Errors counter (fail-open posture).
 	DHCPLeasesSent     atomic.Uint64
 	DHCPLeasesReceived atomic.Uint64
-	DHCPLeasesSeeded   atomic.Uint64
+	// DHCPLeasesStaleIgnored counts DHCP lease full-sets dropped by the #5706
+	// ordering guard (per family), the DHCP analog of IPsecSAStaleIgnored: a
+	// reordered older lease set that would otherwise have regressed the
+	// standby's held set for a family.
+	DHCPLeasesStaleIgnored atomic.Uint64
+	DHCPLeasesSeeded       atomic.Uint64
 	FencesSent         atomic.Uint64
 	FencesReceived     atomic.Uint64
 	Errors             atomic.Uint64
@@ -173,11 +184,13 @@ type SyncStatsSnapshot struct {
 	ConfigsReceived      uint64
 	ConfigsStaleIgnored  uint64
 	ConfigsApplyFailed   uint64
-	IPsecSASent          uint64
-	IPsecSAReceived      uint64
-	DHCPLeasesSent       uint64
-	DHCPLeasesReceived   uint64
-	DHCPLeasesSeeded     uint64
+	IPsecSASent            uint64
+	IPsecSAReceived        uint64
+	IPsecSAStaleIgnored    uint64
+	DHCPLeasesSent         uint64
+	DHCPLeasesReceived     uint64
+	DHCPLeasesStaleIgnored uint64
+	DHCPLeasesSeeded       uint64
 	FencesSent           uint64
 	FencesReceived       uint64
 	Errors               uint64
@@ -442,6 +455,36 @@ type SessionSync struct {
 	configGenCounter     atomic.Uint64
 	lastAppliedConfigGen atomic.Uint64
 	configApplyCh        chan configApplyItem
+
+	// #5706 full-set state-sync ordering guard (IPsec SA + DHCP leases).
+	//
+	// IPsec SA and DHCP lease sync are FULL-SET pushes — each message REPLACES
+	// the peer's held set. With two fabric receiveLoops (conn0/conn1) a
+	// full-set can arrive OUT OF ORDER across the redundant streams, so a stale
+	// older set could overwrite a newer one (a state regression). Each push now
+	// carries a trailing (incarnation, seq): syncEpoch is this process's
+	// incarnation (the construction seed, constant for the process lifetime;
+	// see initGenState) and the per-type counters give a strictly-monotonic
+	// sequence PER stream. The receiver tracks the last-applied (incarnation,
+	// seq) per stream (ipsecRecvSeq / dhcpV4RecvSeq / dhcpV6RecvSeq, guarded by
+	// recvSeqMu because both receiveLoops touch them) and admits only a
+	// strictly-newer pair (fullSetSeqGuard.admit); a stale reorder is dropped
+	// and counted. A legacy peer sends no trailer -> (0,0) -> accept-always
+	// (mixed-version compat). The receiver guards are reset on a peer bulk
+	// re-prime (resetRecvGen) so an OS-rebooted peer whose monotonic epoch
+	// restarts LOWER is re-accepted instead of stranded (the #2198 F2 reasoning
+	// applied to full-set sync). IPsec/DHCP-v4/DHCP-v6 have INDEPENDENT counters
+	// and high-water marks (per-type, per-family), so a v4 push never gates a v6
+	// push and an IPsec seq never gates a DHCP one.
+	syncEpoch        uint64
+	ipsecSeqCounter  atomic.Uint64
+	dhcpV4SeqCounter atomic.Uint64
+	dhcpV6SeqCounter atomic.Uint64
+
+	recvSeqMu     sync.Mutex
+	ipsecRecvSeq  fullSetSeqGuard
+	dhcpV4RecvSeq fullSetSeqGuard
+	dhcpV6RecvSeq fullSetSeqGuard
 }
 
 // configApplyItem is one config-sync payload queued for ordered apply by the
@@ -615,6 +658,18 @@ func (s *SessionSync) initGenState() {
 	s.configGenCounter.Store(seed)
 	s.lastAppliedConfigGen.Store(0)
 	s.configApplyCh = make(chan configApplyItem, 64)
+	// #5706: the full-set (IPsec/DHCP) ordering incarnation is this process's
+	// construction seed — constant for the process lifetime and, within a boot,
+	// strictly greater on a process restart (monotonic clock climbs), so a
+	// restart supersedes. CROSS-BOOT the monotonic clock resets lower, which is
+	// handled on the RECEIVER exactly as the session/config guards are: a peer
+	// bulk re-prime resets the per-stream high-water (resetRecvGen) so the
+	// rebooted peer's fresh set is admitted. The per-type seq counters start at
+	// 0 (first push draws 1) — since every incarnation change coincides with a
+	// reconnect+reset, a per-boot restart from 1 is safe. seed is already
+	// guarded >=1 above, so a stamped frame never collides with the (0,0)
+	// legacy sentinel.
+	s.syncEpoch = seed
 }
 
 // NewDualSessionSync creates a session sync manager with dual-fabric transport.
@@ -703,7 +758,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.
@@ -920,7 +975,12 @@ func (s *SessionSync) QueueIPsecSA(connectionNames []string) bool {
 	if conn == nil {
 		return false
 	}
-	payload := encodeIPsecSAPayload(connectionNames)
+	// #5706: stamp the (incarnation, seq) ordering trailer so the receiver can
+	// reject a stale full-set reordered across the redundant fabric streams.
+	// The seq is drawn even on a subsequent write failure (a gap is harmless —
+	// the receiver only requires strictly-increasing, not contiguous).
+	seq := s.ipsecSeqCounter.Add(1)
+	payload := appendFullSetSeq(encodeIPsecSAPayload(connectionNames), s.syncEpoch, seq)
 	s.writeMu.Lock()
 	err := writeMsg(conn, syncMsgIPsecSA, payload)
 	s.writeMu.Unlock()
@@ -1042,10 +1102,17 @@ func (s *SessionSync) QueueDHCPLeases(family int, leases []dhcpserver.SyncLease)
 		return
 	}
 	msgType := byte(syncMsgDHCPLeaseV4)
+	seqCounter := &s.dhcpV4SeqCounter
 	if family == 6 {
 		msgType = syncMsgDHCPLeaseV6
+		seqCounter = &s.dhcpV6SeqCounter
 	}
-	payload := encodeDHCPLeasePayload(leases)
+	// #5706: stamp the per-family (incarnation, seq) ordering trailer. v4 and v6
+	// draw from INDEPENDENT counters so a v4 push never gates a v6 one. An old
+	// receiver's lease decoder reads exactly its record count and ignores the
+	// trailer, so this stays backward compatible.
+	seq := seqCounter.Add(1)
+	payload := appendFullSetSeq(encodeDHCPLeasePayload(leases), s.syncEpoch, seq)
 	s.writeMu.Lock()
 	err := writeMsg(conn, msgType, payload)
 	s.writeMu.Unlock()

@@ -647,6 +647,66 @@ func decodeConfigPayload(payload []byte) (configText string, gen uint64) {
 	return string(payload), 0
 }
 
+// --- #5706 full-set state-sync ordering wire codec ------------------------
+//
+// IPsec SA and DHCP-server lease sync are FULL-SET pushes: each message
+// REPLACES the peer's held set wholesale. Two fabric receiveLoops
+// (conn0/conn1) process a peer's frames concurrently, so a full-set can be
+// delivered OUT OF ORDER across the redundant streams — a stale older set
+// could then overwrite a newer one (a state REGRESSION). To order them, each
+// full-set carries a trailing (incarnation, seq) framing analogous to the
+// #3931 config-generation trailer:
+//
+//	[ base payload ][ fullSetSeqMagic (8) ][ incarnation (8 LE) ][ seq (8 LE) ]
+//
+// incarnation is the SENDER's process epoch (constant for a boot; a restart
+// draws a fresh one); seq is a per-type strictly-monotonic counter. The
+// receiver admits only a strictly-newer (incarnation, seq) per stream and
+// drops a stale reorder (see fullSetSeqGuard).
+//
+// Backward compatibility (mixed-version ISSU): the trailer is ADDITIVE and
+// self-detecting via the magic, so NO SessionSyncWireVersion bump — the same
+// reasoning as #2239/#3931 (bumping it would make the #1930 mixed-base gate
+// refuse SESSION sync across the pair). A legacy sender emits no trailer, so
+// stripFullSetSeq returns (base, 0, 0) and the guard accept-always for that
+// peer (a zero incarnation/seq is the legacy sentinel). New sender -> old
+// receiver: the DHCP lease decoder reads exactly its record count and IGNORES
+// the trailing bytes (fully clean); the IPsec name decoder newline-splits and
+// would keep the trailer as bogus connection name(s) — fail-safe (on takeover
+// reinitiateIPsecSAs merely warns on a name that cannot be initiated; the REAL
+// SA names decode ahead of the trailer and still take effect), and only in the
+// brief mixed-version window.
+var fullSetSeqMagic = [8]byte{0x00, 0xff, 'x', 'p', 'f', 'F', 'S', 0x00}
+
+const fullSetSeqTrailerLen = 8 + 8 + 8 // magic + incarnation + seq
+
+// appendFullSetSeq appends the (incarnation, seq) ordering trailer to a
+// full-set payload. incarnation and seq MUST both be nonzero on a real sender
+// so the receiver never mistakes a stamped frame for a legacy one.
+func appendFullSetSeq(base []byte, incarnation, seq uint64) []byte {
+	out := make([]byte, 0, len(base)+fullSetSeqTrailerLen)
+	out = append(out, base...)
+	out = append(out, fullSetSeqMagic[:]...)
+	out = binary.LittleEndian.AppendUint64(out, incarnation)
+	out = binary.LittleEndian.AppendUint64(out, seq)
+	return out
+}
+
+// stripFullSetSeq splits a full-set payload into its base bytes and the
+// trailing (incarnation, seq). A payload WITHOUT the trailer (a legacy
+// pre-#5706 sender) yields the whole payload as base and (0, 0), which the
+// guard treats as accept-always.
+func stripFullSetSeq(payload []byte) (base []byte, incarnation, seq uint64) {
+	n := len(payload)
+	if n >= fullSetSeqTrailerLen &&
+		bytes.Equal(payload[n-fullSetSeqTrailerLen:n-16], fullSetSeqMagic[:]) {
+		incarnation = binary.LittleEndian.Uint64(payload[n-16 : n-8])
+		seq = binary.LittleEndian.Uint64(payload[n-8:])
+		return payload[: n-fullSetSeqTrailerLen], incarnation, seq
+	}
+	return payload, 0, 0
+}
+
 // --- #2239 HA DHCP-server lease sync wire codec ---------------------------
 //
 // A DHCP-lease payload is a full-set push of the active leases this node serves

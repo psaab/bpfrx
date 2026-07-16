@@ -42,7 +42,9 @@ All multi-byte integers in the wire format are **little-endian**, matching the n
 | 6    | BulkEnd          | Primary→Secondary | 0                   | Marks end of bulk transfer |
 | 7    | Heartbeat        | Bidirectional     | 0                   | Keepalive (sent on 30s idle) |
 | 8    | Config           | Primary→Secondary | Variable (UTF-8) + 16B gen framing | Full config text + monotonic config generation (#3931) |
-| 9    | IPsecSA          | Primary→Secondary | Variable (UTF-8)    | Newline-separated connection names |
+| 9    | IPsecSA          | Primary→Secondary | Variable (UTF-8) + 24B seq framing | Newline-separated connection names + full-set (incarnation, seq) ordering trailer (#5706) |
+| 25   | DHCPLeaseV4      | Primary→Secondary | count+records + 24B seq framing | Full-set v4 lease push (#2239) + (incarnation, seq) ordering trailer (#5706) |
+| 26   | DHCPLeaseV6      | Primary→Secondary | count+records + 24B seq framing | Full-set v6 lease push (#2239) + (incarnation, seq) ordering trailer (#5706) |
 
 ## Session V4 Payload Layout (120 bytes)
 
@@ -417,9 +419,71 @@ config plus the error. Any other tail error is surfaced (joined with any partial
 #5578 invalidation error) AFTER the invalidators run, so the high-water mark still
 does not advance and the primary's re-push re-converges the mark on the fast path.
 
+## Full-set state-sync ordering (#5706)
+
+IPsec SA sync (type 9) and DHCP-server lease sync (types 25/26) are **full-set
+pushes**: each message REPLACES the peer's held set wholesale. Both fabric
+connections (`conn0`/`conn1`) run their own `receiveLoop` goroutine, so a peer's
+frames are processed by two concurrent streams. A full-set delivered OUT OF
+ORDER across those redundant streams (or a reordered/duplicated stream) could
+overwrite a newer set with an older one — a state **regression** (a torn-down
+tunnel resurrected on the standby, a released lease revived). Unlike sessions
+(#2170) and config (#3931), these full-sets carried no sequence, so nothing
+rejected the reorder.
+
+**Wire trailer.** Each full-set now carries a trailing framing, analogous to the
+#3931 config-generation trailer, appended AFTER the existing payload:
+
+```
+[ base payload ][ fullSetSeqMagic (8B) ][ incarnation (8B LE) ][ seq (8B LE) ]
+```
+
+- `incarnation` is the SENDER's process epoch — the construction seed
+  (`syncEpoch`, from CLOCK_MONOTONIC nanos, constant for the process lifetime).
+  Within a boot a process restart draws a strictly-greater epoch, so a restart
+  supersedes; cross-boot the monotonic clock resets lower and the RECEIVER reset
+  (below) handles it.
+- `seq` is a **per-type strictly-monotonic** counter: IPsec, DHCP-v4, and
+  DHCP-v6 draw from INDEPENDENT counters (`ipsecSeqCounter`,
+  `dhcpV4SeqCounter`, `dhcpV6SeqCounter`), so a v4 push never gates a v6 one and
+  an IPsec seq never gates a DHCP one. The counters start at 0; the first push
+  draws 1, so a stamped frame is never `(0,0)`.
+
+**Ordering guard.** The receiver keeps a `fullSetSeqGuard` high-water per stream
+(`ipsecRecvSeq` / `dhcpV4RecvSeq` / `dhcpV6RecvSeq`, guarded by `recvSeqMu`
+because both `receiveLoop`s touch them). `admit(incarnation, seq)` accepts only a
+strictly-newer pair — lexicographic on `(incarnation, seq)`: a strictly-HIGHER
+incarnation always supersedes; within an incarnation a strictly-higher `seq`
+wins; anything else is stale and DROPPED (counted as `IPsecSAStaleIgnored` /
+`DHCPLeasesStaleIgnored`, logged once). The held set and its apply callback are
+left untouched on a rejected reorder.
+
+**Cross-boot / rebooted-peer reset.** A LOWER incarnation is normally stale, but
+an OS-rebooted peer restarts its monotonic epoch lower. The per-stream guards are
+`reset()` to zero on a peer bulk re-prime (`resetRecvGen`, fired on the reconnect
+`BulkStart`), so the rebooted peer's fresh full-set — re-advertised on reconnect
+— is admitted unconditionally instead of being stranded on the pre-reboot set.
+This is the #2198 F2 stale-RETAIN inverse, applied to full-set sync.
+
+**Wire compatibility (mixed-version ISSU).** The trailer is ADDITIVE and
+self-detecting via the magic, so #5706 does NOT bump `SessionSyncWireVersion`
+(same reasoning as #2239/#3931 — bumping it would refuse SESSION sync across a
+mixed-base pair). A LEGACY sender (pre-#5706) emits no trailer, so
+`stripFullSetSeq` yields `(base, 0, 0)`; the guard treats `incarnation==0 ||
+seq==0` as the legacy sentinel and accept-always for that peer (never wrongly
+refused). New sender → old receiver:
+
+- **DHCP (25/26):** the old lease decoder reads exactly its record count and
+  IGNORES the trailing bytes — fully clean.
+- **IPsec (9):** the old newline decoder would keep the trailer as bogus
+  connection name(s). This is fail-safe — on takeover `reinitiateIPsecSAs`
+  merely logs a warning for a name it cannot initiate, and the REAL SA names
+  decode ahead of the trailer and still take effect — and only occurs in the
+  brief mixed-version window.
+
 ## IPsec SA Payload (Variable)
 
-Newline-separated (`\n`) list of strongSwan connection names (e.g., `vpn-gw1\nvpn-gw2`). On failover, the new primary calls `swanctl --initiate` for each name.
+Newline-separated (`\n`) list of strongSwan connection names (e.g., `vpn-gw1\nvpn-gw2`), followed by the 24-byte #5706 (incarnation, seq) ordering trailer. On failover, the new primary calls `swanctl --initiate` for each name.
 
 ## Sync Algorithms
 
@@ -583,7 +647,8 @@ This is **additive** to the periodic sweep — it provides sub-millisecond sync 
 | BulkStart/End | Log markers; BulkEnd triggers `OnBulkSyncReceived` (releases VRRP sync hold) |
 | Heartbeat | No-op (resets read deadline) |
 | Config | Decode `(text, gen)` → enqueue on the single-consumer ordered apply queue (`configApplyLoop`); `shouldApplyConfigGen` drops out-of-order older gens, then `OnConfigReceived` applies and the high-water advances (`recordAppliedConfigGen`) ONLY on a successful apply — a failure counts `ConfigsApplyFailed` and re-admits the peer's re-push (#3931, M-2/#4151) |
-| IPsecSA | Store names, call `OnIPsecSAReceived` |
+| IPsecSA | `stripFullSetSeq` → `fullSetSeqGuard.admit`; a stale reorder is dropped (`IPsecSAStaleIgnored`), otherwise store names + call `OnIPsecSAReceived` (#5706) |
+| DHCPLeaseV4/V6 | `stripFullSetSeq` → per-family `fullSetSeqGuard.admit`; a stale reorder is dropped (`DHCPLeasesStaleIgnored`), otherwise store the lease set + call `OnDHCPLeasesReceived` (#2239/#5706) |
 
 ### Session Reconstruction on Receiver
 
@@ -639,6 +704,9 @@ All counters are `atomic.Uint64` / `atomic.Bool`, lock-free:
 | ConfigsStaleIgnored | Config messages dropped by the #3931 ordering guard (incoming generation not strictly newer than last-applied) |
 | ConfigsApplyFailed | Config messages admitted by the ordering guard but whose apply did NOT take effect (compile/promote failure or a transient RG0-primary rejection). The high-water is left unadvanced so the peer's re-push re-converges the standby (M-2/#4151) |
 | IPsecSASent/Received | IPsec SA list messages |
+| IPsecSAStaleIgnored | IPsec SA full-sets dropped by the #5706 ordering guard (incoming `(incarnation, seq)` not strictly newer — a reorder across the redundant fabric streams) |
+| DHCPLeasesSent/Received | DHCP-server full-set lease push messages (per family) |
+| DHCPLeasesStaleIgnored | DHCP lease full-sets dropped by the #5706 ordering guard (per family) — the DHCP analog of `IPsecSAStaleIgnored` |
 | Errors | Send failures, channel overflows, bad magic |
 | Connected | Peer TCP connection active |
 

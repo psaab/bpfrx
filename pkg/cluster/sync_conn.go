@@ -68,6 +68,55 @@ func (s *SessionSync) nextInstallGen() uint64 {
 	return s.genCounter.Add(1)
 }
 
+// fullSetSeqGuard is the receiver-side high-water mark for one FULL-SET sync
+// stream (IPsec SA, or DHCP leases per family) under #5706. It records the
+// last-applied (incarnation, seq) and admits only a strictly-newer pair, so a
+// stale full-set delivered out of order across the redundant fabric
+// receiveLoops (conn0/conn1) is dropped instead of regressing the held set.
+//
+// Ordering is lexicographic on (incarnation, seq): a strictly-higher
+// incarnation always supersedes (a peer restart draws a fresh epoch), and
+// within an incarnation the per-type seq orders the pushes. A LOWER
+// incarnation is stale and refused — EXCEPT that the guard is reset() to zero
+// on a peer bulk re-prime (resetRecvGen), so an OS-rebooted peer whose
+// monotonic epoch restarts LOWER is re-accepted from its fresh set rather than
+// stranded on the pre-reboot set (the #2198 F2 stale-RETAIN inverse, applied
+// to full-set sync). The zero value is the initial/legacy state.
+//
+// Access is serialized by SessionSync.recvSeqMu because the two fabric
+// receiveLoops can invoke admit concurrently.
+type fullSetSeqGuard struct {
+	incarnation uint64
+	seq         uint64
+}
+
+// admit reports whether a full-set stamped (incarnation, seq) is strictly
+// newer than the last-applied pair and, when it is, advances the high-water
+// mark. incarnation==0 || seq==0 marks a LEGACY (pre-#5706) sender that sends
+// no ordering trailer: admit-always and do NOT advance the mark, mirroring the
+// config-gen gen==0 accept-always compat. The caller holds recvSeqMu.
+func (g *fullSetSeqGuard) admit(incarnation, seq uint64) bool {
+	if incarnation == 0 || seq == 0 {
+		return true // legacy sender — no sequence, accept-always
+	}
+	if g.incarnation == 0 ||
+		incarnation > g.incarnation ||
+		(incarnation == g.incarnation && seq > g.seq) {
+		g.incarnation = incarnation
+		g.seq = seq
+		return true
+	}
+	return false
+}
+
+// reset returns the guard to its zero (accept-next) state. Called from
+// resetRecvGen on a peer bulk re-prime so a rebooted peer with a lower epoch is
+// re-accepted. The caller holds recvSeqMu.
+func (g *fullSetSeqGuard) reset() {
+	g.incarnation = 0
+	g.seq = 0
+}
+
 // stampInstallGenV4 assigns a fresh install generation to a v4 session being
 // sent and records it (keyed by wire key) so the matching delete can echo the
 // exact generation of the install it cancels (#2170 SMR fix #1). It mutates
@@ -299,6 +348,17 @@ func (s *SessionSync) resetRecvGen() {
 	// CURRENT config (pushConfigToPeer sends ShowActive), so the newest
 	// content still wins.
 	s.lastAppliedConfigGen.Store(0)
+	// #5706: reset the full-set (IPsec/DHCP) ordering high-water marks for the
+	// same reason. A reconnecting peer that OS-rebooted restarts its monotonic
+	// incarnation LOWER; without this reset the guard would refuse its fresh
+	// full-set re-push (nudged on reconnect) as stale and strand the standby on
+	// the pre-reboot set. Resetting to the zero state admits the next push
+	// unconditionally — it is always the peer's CURRENT set.
+	s.recvSeqMu.Lock()
+	s.ipsecRecvSeq.reset()
+	s.dhcpV4RecvSeq.reset()
+	s.dhcpV6RecvSeq.reset()
+	s.recvSeqMu.Unlock()
 }
 
 // Non-atomicity note (#2198 F3): the apply sequence — guard check
@@ -1558,27 +1618,61 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		}
 	case syncMsgIPsecSA:
 		s.stats.IPsecSAReceived.Add(1)
-		names := decodeIPsecSAPayload(payload)
+		// #5706: split off the (incarnation, seq) ordering trailer and admit
+		// only a strictly-newer full-set. A stale set reordered across the
+		// redundant fabric streams is dropped so it cannot regress the held SA
+		// set. A legacy peer sends no trailer -> (0,0) -> accept-always.
+		base, incarnation, seq := stripFullSetSeq(payload)
+		s.recvSeqMu.Lock()
+		admit := s.ipsecRecvSeq.admit(incarnation, seq)
+		s.recvSeqMu.Unlock()
+		if !admit {
+			s.stats.IPsecSAStaleIgnored.Add(1)
+			slog.Warn("cluster sync: dropping out-of-order IPsec SA set (stale sequence) — standby retains newer set",
+				"incarnation", incarnation, "seq", seq)
+			return
+		}
+		names := decodeIPsecSAPayload(base)
 		s.peerIPsecSAsMu.Lock()
 		s.peerIPsecSAs = names
 		s.peerIPsecSAsMu.Unlock()
-		slog.Debug("cluster sync: received IPsec SA list", "count", len(names))
+		slog.Debug("cluster sync: received IPsec SA list", "count", len(names), "incarnation", incarnation, "seq", seq)
 		if s.OnIPsecSAReceived != nil {
 			s.OnIPsecSAReceived(names)
 		}
 	case syncMsgDHCPLeaseV4:
 		s.stats.DHCPLeasesReceived.Add(1)
-		leases := decodeDHCPLeasePayload(payload)
+		base, incarnation, seq := stripFullSetSeq(payload)
+		s.recvSeqMu.Lock()
+		admit := s.dhcpV4RecvSeq.admit(incarnation, seq)
+		s.recvSeqMu.Unlock()
+		if !admit {
+			s.stats.DHCPLeasesStaleIgnored.Add(1)
+			slog.Warn("cluster sync: dropping out-of-order DHCP v4 lease set (stale sequence) — standby retains newer set",
+				"incarnation", incarnation, "seq", seq)
+			return
+		}
+		leases := decodeDHCPLeasePayload(base)
 		s.storePeerDHCPLeases(4, leases)
-		slog.Debug("cluster sync: received DHCP v4 lease set", "count", len(leases))
+		slog.Debug("cluster sync: received DHCP v4 lease set", "count", len(leases), "incarnation", incarnation, "seq", seq)
 		if s.OnDHCPLeasesReceived != nil {
 			s.OnDHCPLeasesReceived(4, leases)
 		}
 	case syncMsgDHCPLeaseV6:
 		s.stats.DHCPLeasesReceived.Add(1)
-		leases := decodeDHCPLeasePayload(payload)
+		base, incarnation, seq := stripFullSetSeq(payload)
+		s.recvSeqMu.Lock()
+		admit := s.dhcpV6RecvSeq.admit(incarnation, seq)
+		s.recvSeqMu.Unlock()
+		if !admit {
+			s.stats.DHCPLeasesStaleIgnored.Add(1)
+			slog.Warn("cluster sync: dropping out-of-order DHCP v6 lease set (stale sequence) — standby retains newer set",
+				"incarnation", incarnation, "seq", seq)
+			return
+		}
+		leases := decodeDHCPLeasePayload(base)
 		s.storePeerDHCPLeases(6, leases)
-		slog.Debug("cluster sync: received DHCP v6 lease set", "count", len(leases))
+		slog.Debug("cluster sync: received DHCP v6 lease set", "count", len(leases), "incarnation", incarnation, "seq", seq)
 		if s.OnDHCPLeasesReceived != nil {
 			s.OnDHCPLeasesReceived(6, leases)
 		}
