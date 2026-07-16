@@ -916,6 +916,24 @@ Manual failover uses the same demotion-prep path via
 peer not quiescent, barrier ack timeout). The cluster state machine can retry
 admission on retryable errors instead of proceeding unsafely.
 
+Once the RG is marked standby, each worker processes a
+`WorkerCommand::DemoteOwnerRGS` on its packet thread
+(`afxdp/session_glue/commands/demote_owner_rgs.rs`, `handle_demote_owner_rgs`):
+it walks every session in the demoted owner RG, re-resolves forwarding (the peer
+is now the forwarder), re-publishes the kernel session-map entry, and appends
+each demoted key — deduplicated — to `cancelled_keys` so the worker loop can drop
+any queued flow and delete stale local XSK redirect aliases. The dedup keeps a
+companion `FxHashSet` for an O(1) membership test (#5155): `demote_owner_rg`
+yields unique keys, so the pre-#5155 linear `cancelled_keys.iter().any(..)` scan
+was O(N²) over the growing Vec — ~8.6e9 `SessionKey` comparisons at
+`max_sessions` = 131072, all on the packet worker ahead of the heartbeat store,
+i.e. a failover-time stall. The set makes the pass O(N); `cancelled_keys` stays a
+Vec so the first-occurrence output order the worker loop iterates is preserved.
+The dedup is load-bearing, not belt-and-braces: `demote_owner_rg` only flips a
+session's origin to `SyncImport` (it does not remove the entry from the owner-RG
+bucket), so a repeated `Demote{[rg]}` in the same dispatch stream re-discovers
+the same key.
+
 ## Implementation Details
 
 ### Incremental Sync Pause/Resume

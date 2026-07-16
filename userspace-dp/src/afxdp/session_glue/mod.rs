@@ -595,6 +595,12 @@ pub(super) fn apply_worker_commands(
     let now_ns = monotonic_nanos();
     let now_secs = now_ns / 1_000_000_000;
     let mut cancelled_keys: Vec<SessionKey> = Vec::new();
+    // #5155: companion dedup set for `handle_demote_owner_rgs`. Kept
+    // beside `cancelled_keys` (not pre-sized) so the O(1) membership
+    // test persists across the multiple DemoteOwnerRGS arms in one
+    // dispatch loop while common (no-demote) ticks pay no allocation.
+    let mut cancelled_keys_seen: rustc_hash::FxHashSet<SessionKey> =
+        rustc_hash::FxHashSet::default();
     let mut exported_sequences = Vec::new();
     let mut export_owner_rgs: Vec<i32> = Vec::new();
     let mut shaped_tx_requests = Vec::new();
@@ -612,6 +618,7 @@ pub(super) fn apply_worker_commands(
                     now_ns,
                     now_secs,
                     &mut cancelled_keys,
+                    &mut cancelled_keys_seen,
                 );
             }
             WorkerCommand::RefreshOwnerRGS { owner_rgs } => {

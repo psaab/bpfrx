@@ -10,6 +10,25 @@ use super::super::*;
 /// `&mut Vec<SessionKey>` because the dispatcher builds the
 /// `WorkerCommandResults` accumulator after the loop (per #1346
 /// plan v2).
+///
+/// #5155: the dedup uses a companion `cancelled_keys_seen`
+/// `FxHashSet` for an O(1) membership test rather than a linear
+/// `cancelled_keys.iter().any(..)` scan. `SessionTable::demote_owner_rg`
+/// only flips origin to `SyncImport` — it does NOT remove the entry
+/// from `owner_rg_sessions[rg]` — so a repeated `Demote{[rg]}` in the
+/// same command stream re-discovers the same key and the dedup is
+/// load-bearing (see the dispatcher order-pin test). The old scan was
+/// O(N^2) over the growing `cancelled_keys` Vec: `demote_owner_rg`
+/// yields unique keys per RG, so every `.any()` reached the tail. With
+/// `max_sessions` = 131072 that is ~8.6e9 `SessionKey` comparisons on
+/// the packet worker before the heartbeat store — a failover-time
+/// stall. The set makes the whole pass O(N). The set is threaded from
+/// the caller so the dedup persists across the multiple
+/// `handle_demote_owner_rgs` calls in one dispatch loop, exactly as the
+/// shared `cancelled_keys` Vec did. `cancelled_keys` stays a Vec so the
+/// first-occurrence output order is preserved (the downstream
+/// `cancel_queued_flow_on_binding` iteration and the order-pin test both
+/// observe it).
 pub(in crate::afxdp::session_glue) fn handle_demote_owner_rgs(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
@@ -20,6 +39,7 @@ pub(in crate::afxdp::session_glue) fn handle_demote_owner_rgs(
     now_ns: u64,
     now_secs: u64,
     cancelled_keys: &mut Vec<SessionKey>,
+    cancelled_keys_seen: &mut rustc_hash::FxHashSet<SessionKey>,
 ) {
     let mut seen_owner_rgs = std::collections::BTreeSet::new();
     for owner_rg_id in owner_rgs {
@@ -95,7 +115,10 @@ pub(in crate::afxdp::session_glue) fn handle_demote_owner_rgs(
                 origin,
                 synced_entry_allows_local_replace(ha_state, owner_rg_id, now_secs),
             );
-            if !cancelled_keys.iter().any(|key| key == &demoted_key) {
+            // #5155: O(1) membership via the companion set. `insert`
+            // returns true only on first sight of the key, so the Vec
+            // still records each key once in first-occurrence order.
+            if cancelled_keys_seen.insert(demoted_key.clone()) {
                 cancelled_keys.push(demoted_key);
             }
         }
