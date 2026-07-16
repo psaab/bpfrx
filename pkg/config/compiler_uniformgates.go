@@ -1631,6 +1631,26 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5859: reject a static-NAT rule whose target is the NAT64 keyword `then
+	// static-nat inet`. The compiler accepts the keyword but the userspace
+	// snapshot emits the literal string "inet" into the same-family static_nat
+	// address slot; the Rust parse of "inet" fails and the rule is SILENTLY
+	// SKIPPED — a strict-valid config claims NAT64 but installs nothing. No
+	// dataplane lowering of `static-nat inet` exists (the supported IPv6->IPv4
+	// path is the native `security nat nat64` rule-set). Strict on commit /
+	// commit-check (hard reject so the inert rule is operator-visible, naming
+	// the native alternative); lenient on load / peer-sync (warn — #1960; the
+	// snapshot builder then DROPS the rule so the sentinel never reaches Rust).
+	// Reuses lenientFirewallRefs, the same opt the target gates above use.
+	if err := validateStaticNATInetTargetStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("static NAT inet (NAT64) target (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5628 (codex-review-181 M16): a source / destination NAT rule's complete
 	// `then` block must carry EXACTLY ONE NAT-terminal translation action. A
 	// rule with ZERO actions installs no translation (an intended `off`

@@ -217,9 +217,18 @@ func TestStaticNATThenInetRoutingInstanceAdvisory(t *testing.T) {
 		"set security nat static rule-set S rule R1 match destination-address 203.0.113.5/32",
 		"set security nat static rule-set S rule R1 then static-nat inet routing-instance vr-green",
 	}
-	cfg, err := CompileConfig(buildTree(t, cmds))
+	tree := buildTree(t, cmds)
+	// #5859: `then static-nat inet` (NAT64) is now rejected at strict commit —
+	// no dataplane lowering exists and the literal "inet" installed a silently
+	// inert rule. The compiler still records the target + its trailing
+	// routing-instance advisory; validate that recording on the tolerant
+	// (lenient) path, which downgrades the reject to a surfaced warning.
+	if _, serr := CompileConfig(tree); serr == nil {
+		t.Fatal("strict CompileConfig must REJECT `then static-nat inet` (#5859)")
+	}
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("then static-nat inet routing-instance must compile, got: %v", err)
+		t.Fatalf("lenient path must not brick on `then static-nat inet routing-instance`, got: %v", err)
 	}
 	rule := cfg.Security.NAT.Static[0].Rules[0]
 	if rule.Then != "inet" {
@@ -227,6 +236,9 @@ func TestStaticNATThenInetRoutingInstanceAdvisory(t *testing.T) {
 	}
 	if rule.ThenRoutingInstance != "vr-green" {
 		t.Fatalf("ThenRoutingInstance = %q, want vr-green", rule.ThenRoutingInstance)
+	}
+	if !hasWarningContaining(cfg.Warnings, "inet") {
+		t.Fatalf("lenient path must surface a downgrade warning for `static-nat inet`; warnings: %v", cfg.Warnings)
 	}
 }
 

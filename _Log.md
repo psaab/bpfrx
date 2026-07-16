@@ -50387,3 +50387,48 @@ top.
   (new — ip-debt-preserved fail-on-revert test, per-target + aggregate),
   pkg/cluster/README.md (edit — reconcileMonitorDebtsLocked reconciles
   interface-monitor debt ONLY; ip debt owned by reconcileRGIPDebts)
+
+- **Timestamp**: 2026-07-16
+- **Action**: #5859 — fail closed on static-NAT `then static-nat inet`
+  (NAT64). The compiler accepted the Junos static-NAT NAT64 target `then
+  static-nat inet` (records StaticNATRule.Then=="inet"), but the userspace
+  snapshot builder emitted the LITERAL string "inet" into the same-family
+  static_nat table's InternalIP address slot. Rust parse_nat_prefix("inet")
+  fails and the rule was SILENTLY SKIPPED — a strict-valid config claimed NAT64
+  translation but installed nothing (an inert, security-relevant NAT rule).
+  Bounded fail-closed fix (issue option 2; full lowering into the native NAT64
+  IR deferred to a /research follow-up): (1) new
+  validateStaticNATInetTargetStrict hard-rejects the target at strict commit /
+  commit-check, naming the rule-set + rule and directing to the native
+  `security nat nat64` rule-set; (2) the call site in runUniformGates downgrades
+  the reject to a SURFACED cfg.Warnings entry on the tolerant load / peer-sync
+  path (opts.lenientFirewallRefs, #1960 no-brick) — never a silent skip; (3)
+  buildStaticNATSnapshots DROPS the inet rule with a slog.Warn so the
+  unparseable "inet" sentinel never reaches the dataplane (symmetric with the
+  #5101 out-of-range-port fail-closed drop). The native `security nat nat64`
+  rule-set (buildNAT64Snapshots from cfg.Security.NAT.NAT64) is untouched and
+  remains the supported IPv6->IPv4 path. Fail-on-revert PROVEN firsthand: (a)
+  neutralize validateStaticNATInetTargetStrict → TestStaticNATInetTargetRejected-
+  Strict RED ("expected CompileConfig to REJECT `then static-nat inet`"); (b)
+  remove the buildStaticNATSnapshots drop guard → TestBuildStaticNATSnapshots-
+  DropsInet RED (observes StaticNATRuleSnapshot{InternalIP:"inet"} sentinel).
+  Behavior change: a previously-accepted-but-inert syntax now loudly rejects at
+  strict commit — the intended safer posture. Updated 4 existing tests that
+  encoded the old accepted behavior (TestStaticNATInet, TestStaticNATInet-
+  SetSyntax, TestStaticNATThenInetRoutingInstanceAdvisory → lenient compile +
+  surfaced-warning assertion, still validating the compiler recording;
+  TestStaticNATHostMaskInetActionNotRejected → proves the rejection is the
+  #5859 inet gate, not a host-mask "host route" error). Validation:
+  GOCACHE=/dev/shm/cache go build ./... clean; go vet ./pkg/config
+  ./pkg/dataplane/userspace clean; full pkg/config + pkg/dataplane/userspace
+  suites GREEN. Go-only (control plane fail-closed); static_nat.rs untouched.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go (new
+  validateStaticNATInetTargetStrict + updated host-mask inet-exemption comment),
+  pkg/config/compiler_uniformgates.go (wire the gate with strict/lenient split),
+  pkg/config/types_security.go (StaticNATRule.Then doc), pkg/dataplane/userspace/
+  nat_static.go (buildStaticNATSnapshots inet drop guard), pkg/config/
+  static_nat_inet_failclosed_5859_test.go (new), pkg/dataplane/userspace/
+  static_nat_inet_failclosed_5859_test.go (new), pkg/config/parser_security_test.go
+  + pkg/config/compiler_nat_target_parity_hb167_test.go + pkg/config/
+  compiler_nat_host_mask_test.go (updated to new fail-closed behavior),
+  docs/config-schema.md (#5859 note)

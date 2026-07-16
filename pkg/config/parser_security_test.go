@@ -4792,9 +4792,18 @@ security {
 	if len(errs) > 0 {
 		t.Fatalf("parse errors: %v", errs)
 	}
-	cfg, err := CompileConfig(tree)
+	// #5859: strict commit now REJECTS `then static-nat inet` (NAT64) — the
+	// dataplane has no lowering and the literal "inet" installed a silently
+	// inert rule. The compiler still PARSES and records the target
+	// (rule.Then=="inet"); use the tolerant load / peer-sync path
+	// (CompileConfigLenient) to validate that recording without tripping the
+	// strict reject, and confirm the reject surfaces as a warning.
+	if _, serr := CompileConfig(tree); serr == nil {
+		t.Fatal("strict CompileConfig must REJECT `then static-nat inet` (#5859)")
+	}
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("lenient path must not brick on `then static-nat inet`: %v", err)
 	}
 	if len(cfg.Security.NAT.Static) != 1 {
 		t.Fatalf("expected 1 static rule-set, got %d", len(cfg.Security.NAT.Static))
@@ -4816,6 +4825,9 @@ security {
 	if rule.Then != "inet" {
 		t.Errorf("then = %q, want inet", rule.Then)
 	}
+	if !hasWarningContaining(cfg.Warnings, "inet") {
+		t.Fatalf("lenient path must surface a downgrade warning for `static-nat inet`; warnings: %v", cfg.Warnings)
+	}
 }
 
 func TestStaticNATInetSetSyntax(t *testing.T) {
@@ -4830,9 +4842,15 @@ func TestStaticNATInetSetSyntax(t *testing.T) {
 			t.Fatalf("SetPath(%q): %v", line, err)
 		}
 	}
-	cfg, err := CompileConfig(tree)
+	// #5859: strict commit rejects `then static-nat inet`; the compiler still
+	// records the target on the tolerant path. Validate the recording via the
+	// lenient compile and confirm the reject surfaces as a warning.
+	if _, serr := CompileConfig(tree); serr == nil {
+		t.Fatal("strict CompileConfig must REJECT `then static-nat inet` (#5859)")
+	}
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("lenient path must not brick on `then static-nat inet`: %v", err)
 	}
 	if len(cfg.Security.NAT.Static) != 1 {
 		t.Fatalf("expected 1 static rule-set, got %d", len(cfg.Security.NAT.Static))
@@ -4843,6 +4861,9 @@ func TestStaticNATInetSetSyntax(t *testing.T) {
 	}
 	if rule.SourceAddress != "::/0" {
 		t.Errorf("source-address = %q, want ::/0", rule.SourceAddress)
+	}
+	if !hasWarningContaining(cfg.Warnings, "inet") {
+		t.Fatalf("lenient path must surface a downgrade warning for `static-nat inet`; warnings: %v", cfg.Warnings)
 	}
 }
 
