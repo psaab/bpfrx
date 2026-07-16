@@ -1,3 +1,41 @@
+## 2026-07-16 — #5155 (afxdp/session_glue): O(N) HashSet dedup for DemoteOwnerRGS cancelled_keys (was O(N^2) on packet worker)
+- **Timestamp**: 2026-07-16 (fix/5155-demote-dedup-hashset)
+- **Action**: Fix #5155 (perf, failover-time packet-worker stall).
+  `handle_demote_owner_rgs` (afxdp/session_glue/commands/demote_owner_rgs.rs)
+  deduped every demoted key against the accumulated `cancelled_keys` with a
+  linear `!cancelled_keys.iter().any(|key| key == &demoted_key)` scan before
+  pushing. `SessionTable::demote_owner_rg` yields UNIQUE keys, so every scan
+  reached the tail of the growing Vec → the whole demote pass is O(N^2). At
+  `max_sessions` = 131072 that is ~8.6e9 `SessionKey` comparisons ON THE PACKET
+  WORKER, ahead of the `heartbeat.store()` — a multi-second failover-time stall.
+  Fix: keep a companion `rustc_hash::FxHashSet<SessionKey>` (`cancelled_keys_seen`)
+  for an O(1) membership test; `set.insert(k.clone())` returns true only on first
+  sight, so the pass is O(N). Observable behavior is IDENTICAL — `cancelled_keys`
+  stays a `Vec` (first-occurrence order preserved for the downstream
+  `cancel_queued_flow_on_binding` / `delete_session_map_redirect_for_session`
+  iteration and the #1346 order-pin test); same set of keys, no dup processing.
+  The set is threaded from the caller (`apply_worker_commands`, session_glue/mod.rs)
+  alongside the Vec so the dedup persists across the multiple DemoteOwnerRGS arms
+  in one dispatch loop (the dedup is load-bearing: `demote_owner_rg` only flips
+  origin to `SyncImport`, does not clear the owner-RG bucket, so a repeated
+  `Demote{[rg]}` re-discovers keys). Not pre-sized — common no-demote ticks pay
+  no allocation; demotions are a cold failover path. No map-key/wire/protocol
+  change (internal dedup structure only). FxHashSet matches the crate's hasher
+  convention (rustc_hash used in nat/, event_stream/, etc.).
+- **Fail-on-revert**: new test
+  `apply_worker_commands_demote_dedup_is_linear_not_quadratic` installs N=48000
+  unique sessions on one inactive owner RG, issues one `DemoteOwnerRGS`, asserts
+  exactly N unique keys cancelled AND completes < 3s (session_map_fd=-1 → the
+  per-key publish early-returns, so the O(N^2) scan dominates the revert). PROVEN:
+  fix runs in **0.10s**; reverting the one dedup line to `Vec::contains` runs
+  **4.18s** and panics the 3s bound (~1.15e9 SessionKey compares). ~40x margin →
+  robust, non-flaky.
+- **Validation**: full `cargo test --release` suite (see PR body for pass count).
+- **File(s)**: userspace-dp/src/afxdp/session_glue/commands/demote_owner_rgs.rs
+  (FxHashSet param + O(1) dedup + doc), userspace-dp/src/afxdp/session_glue/mod.rs
+  (`cancelled_keys_seen` set + threaded arg), userspace-dp/src/afxdp/session_glue/tests.rs
+  (fail-on-revert test + updated dedup-contract comment),
+  docs/session-sync-architecture.md (worker-side DemoteOwnerRGS + O(N) dedup note).
 ## 2026-07-16 — #5678 (routing M12): carry qualified-next-hop preference across the AF_XDP snapshot boundary
 - **Timestamp**: 2026-07-16 (fix/5678-qnh-snapshot-pref)
 - **Action**: Fix #5678 (codex-review-182 M12, High). STEP-0 confirmed live on

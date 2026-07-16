@@ -4247,8 +4247,9 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
     //
     //   1. `seen_owner_rgs.insert` inside `handle_demote_owner_rgs`
     //      skips the second `5` in `Demote{[5, 5]}`.
-    //   2. `!cancelled_keys.iter().any(|key| key == &demoted_key)`
-    //      skips key_rg5 the SECOND time it surfaces. This is NOT
+    //   2. The `cancelled_keys_seen` FxHashSet dedup (#5155, was a
+    //      linear `!cancelled_keys.iter().any(|key| key == &demoted_key)`
+    //      scan) skips key_rg5 the SECOND time it surfaces. This is NOT
     //      belt-and-braces — `SessionTable::demote_owner_rg` only
     //      flips the session's origin to `SyncImport`; it does NOT
     //      remove the entry from `owner_rg_sessions[5]`. So the
@@ -4258,8 +4259,9 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
     //
     // Per Gemini r1 code-review feedback: an earlier comment here
     // claimed the bucket was cleared and the guard was belt-and-braces.
-    // That was empirically false — the `cancelled_keys.iter().any`
-    // guard is load-bearing.
+    // That was empirically false — the dedup guard is load-bearing.
+    // #5155 swapped its O(N) `Vec::contains` scan for an O(1) set
+    // membership test; the contract asserted here is unchanged.
     let rg5_count = results
         .cancelled_keys
         .iter()
@@ -4295,6 +4297,118 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
     assert!(
         pos_rg5 < pos_rg7,
         "DemoteOwnerRGS first-occurrence order must be preserved"
+    );
+}
+
+// === #5155 fail-on-revert: DemoteOwnerRGS dedup must be O(N), not O(N^2) =====
+//
+// `handle_demote_owner_rgs` deduplicates every demoted key against the
+// accumulated `cancelled_keys` before pushing. The original code did a
+// linear `cancelled_keys.iter().any(..)` scan per key. `demote_owner_rg`
+// yields UNIQUE keys, so each scan reaches the tail of the growing Vec —
+// the whole pass is O(N^2). At `max_sessions` = 131072 that is ~8.6e9
+// `SessionKey` comparisons ON THE PACKET WORKER, ahead of the heartbeat
+// store — a multi-second failover-time stall (#5155).
+//
+// #5155 replaces the scan with an FxHashSet membership test, making the
+// pass O(N). This test installs N unique sessions on a single inactive
+// owner RG and issues ONE `DemoteOwnerRGS`, demoting all N in a single
+// dispatch. It asserts:
+//   - correctness: exactly N keys cancelled, all unique (the dedup does
+//     not drop or duplicate any key), and
+//   - the pass completes well under a wall-clock bound. `session_map_fd`
+//     is -1 so `publish_worker_session_map_entry` early-returns and the
+//     per-key baseline is cheap; the O(N^2) scan dominates the revert.
+//
+// Wall-clock bound is deliberately generous (fix: tens of ms; reverting
+// to `Vec::contains` at this N runs for many seconds and blows the
+// bound). This is the only observable that distinguishes the O(N) fix
+// from the behavior-identical O(N^2) revert.
+#[test]
+fn apply_worker_commands_demote_dedup_is_linear_not_quadratic() {
+    // N chosen so the O(N^2) revert (~N^2/2 ≈ 1.1e9 SessionKey compares)
+    // takes several seconds while the O(N) fix stays in the tens of ms.
+    const N: usize = 48_000;
+    const OWNER_RG: i32 = 5;
+
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let mut sessions = SessionTable::new();
+
+    // Install N unique sessions all owned by OWNER_RG. Uniqueness comes
+    // from the low two octets of src_ip (65536 combos > N), so every
+    // demoted key is distinct and each dedup check reaches the Vec tail
+    // under the old linear scan.
+    for i in 0..N {
+        let key = SessionKey {
+            src_ip: IpAddr::V4(Ipv4Addr::new(
+                10,
+                200,
+                (i >> 8) as u8,
+                (i & 0xff) as u8,
+            )),
+            ..test_key()
+        };
+        let mut metadata = test_metadata();
+        metadata.owner_rg_id = OWNER_RG;
+        assert!(sessions.install_with_protocol_with_origin(
+            key,
+            test_decision(),
+            metadata,
+            SessionOrigin::ForwardFlow,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+    }
+
+    {
+        let mut pending = commands.lock().expect("commands lock");
+        pending.push_back(WorkerCommand::DemoteOwnerRGS {
+            owner_rgs: vec![OWNER_RG],
+        });
+    }
+
+    let forwarding = test_forwarding_state_with_fabric();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let mut ha_state = BTreeMap::new();
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    // Inactive so DemoteOwnerRGS actually demotes every session and the
+    // HA enforcement does not elide the cancellations.
+    ha_state.insert(OWNER_RG, inactive_ha_runtime(now_secs));
+
+    let start = std::time::Instant::now();
+    let results = apply_worker_commands(
+        &commands,
+        &mut sessions,
+        -1,
+        -1,
+        -1,
+        &forwarding,
+        &ha_state,
+        &dynamic_neighbors,
+    );
+    let elapsed = start.elapsed();
+
+    // Correctness: every unique key cancelled exactly once.
+    assert_eq!(
+        results.cancelled_keys.len(),
+        N,
+        "all {N} unique demoted keys must be cancelled exactly once"
+    );
+    let unique: std::collections::HashSet<_> = results.cancelled_keys.iter().collect();
+    assert_eq!(
+        unique.len(),
+        N,
+        "cancelled_keys must contain no duplicates"
+    );
+
+    // Fail-on-revert: the O(N) fix finishes in tens of ms; the O(N^2)
+    // `Vec::contains` revert runs for many seconds at this N. A 3s bound
+    // sits ~30-100x above the fix's runtime yet far below the revert's.
+    assert!(
+        elapsed.as_secs_f64() < 3.0,
+        "DemoteOwnerRGS dedup over {N} keys took {elapsed:?}; expected O(N) \
+         (<3s). An O(N^2) `Vec::contains` dedup regressed this path (#5155)."
     );
 }
 
