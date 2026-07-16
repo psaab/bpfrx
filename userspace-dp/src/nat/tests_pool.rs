@@ -51,7 +51,7 @@ fn pool_snat_single_address_rewrites_src_and_port() {
         "wan",
         "10.0.1.100".parse().expect("src"),
         "8.8.8.8".parse().expect("dst"),
-        PROTO_TCP,
+        Some(PROTO_TCP),
         12345,
         443,
         None,
@@ -103,7 +103,7 @@ fn pool_snat_portless_protocols_translate_ip_only_no_port() {
             "wan",
             "10.0.1.100".parse().expect("src"),
             "8.8.8.8".parse().expect("dst"),
-            proto,
+            Some(proto),
             0,
             0,
             None,
@@ -192,7 +192,7 @@ fn pool_snat_translates_icmp_query_id_distinct_per_host() {
             "wan",
             src_a,
             dst,
-            proto,
+            Some(proto),
             query_id,
             0,
             None,
@@ -210,7 +210,7 @@ fn pool_snat_translates_icmp_query_id_distinct_per_host() {
             "wan",
             src_b,
             dst,
-            proto,
+            Some(proto),
             query_id,
             0,
             None,
@@ -319,7 +319,7 @@ fn pool_snat_translates_icmp_query_id_zero_distinct_per_host() {
             "wan",
             src_a,
             dst,
-            proto,
+            Some(proto),
             query_id,
             0,
             None,
@@ -337,7 +337,7 @@ fn pool_snat_translates_icmp_query_id_zero_distinct_per_host() {
             "wan",
             src_b,
             dst,
-            proto,
+            Some(proto),
             query_id,
             0,
             None,
@@ -383,7 +383,7 @@ fn pool_snat_translates_icmp_query_id_zero_distinct_per_host() {
             "wan",
             src_a,
             dst,
-            proto,
+            Some(proto),
             query_id,
             0,
             None,
@@ -432,7 +432,7 @@ fn pool_snat_icmp_without_query_id_is_address_only() {
         "wan",
         "10.0.1.100".parse().unwrap(),
         "8.8.8.8".parse().unwrap(),
-        PROTO_ICMP,
+        Some(PROTO_ICMP),
         0, // flowless / non-identifier ICMP
         0,
         None,
@@ -486,7 +486,7 @@ fn pool_snat_no_translation_preserves_source_port() {
         "wan",
         "10.0.1.100".parse().expect("src"),
         "8.8.8.8".parse().expect("dst"),
-        PROTO_TCP,
+        Some(PROTO_TCP),
         12345,
         443,
         None,
@@ -547,7 +547,7 @@ fn addr_only_lookup(
         "wan",
         src_ip.parse().expect("src"),
         dst_ip.parse().expect("dst"),
-        protocol,
+        Some(protocol),
         src_port,
         dst_port,
         None,
@@ -758,6 +758,177 @@ fn pool_snat_portless_gre_collision_and_disambiguation_5269() {
         ],
     );
     assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 0);
+}
+
+// #5687 FAIL-ON-REVERT: a genuine IPv4 protocol 0 (HOPOPT) SNAT flow must be
+// treated as a REAL port-less protocol (like GRE/ESP), NOT confused with the
+// synthetic "L4 tuple unknown" sentinel that historically also used the value
+// 0. It takes the real address-only path and mints a reverse-identity occupancy
+// token (`rewrite_src_port: None`, ONE owner keyed on protocol 0), so a second
+// HOPOPT flow that would collide on the same public reverse tuple (same pool
+// addr + same remote) is DENIED as exhaustion — its reverse translation is
+// unambiguous. A HOPOPT flow to a DIFFERENT remote mints a DISTINCT identity and
+// is admitted.
+//
+// Reverting the #5687 sentinel (classify `Some(0)` as tuple_unknown again, e.g.
+// `let tuple_unknown = protocol.map_or(true, |p| p == 0)`) sends a real HOPOPT
+// down the synthetic round-robin path: it returns `rewrite_src_port: Some(_)`
+// and mints NO token, so the colliding second flow wrongly returns `Matched`
+// with a duplicate `(pool_addr)` tuple the reverse index cannot disambiguate —
+// turning every assertion below RED. The reverse translation for protocol 0 is
+// the concrete symptom the issue reports.
+#[test]
+fn pool_snat_protocol0_hopopt_is_real_address_only_not_unknown_5687() {
+    const PROTO_HOPOPT: u8 = 0;
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-hopopt".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    // Flow A: HOPOPT 10.0.1.100 -> 8.8.8.8 (port-less; src/dst port 0).
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.100",
+        0,
+        "8.8.8.8",
+        0,
+        PROTO_HOPOPT,
+    ));
+    assert_eq!(a.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(
+        a.rewrite_src_port, None,
+        "a real HOPOPT flow is port-less: it must preserve the wire source port \
+         (None), NOT take the synthetic tuple-unknown round-robin port path"
+    );
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "a real HOPOPT flow must mint a reverse-identity token (the #5687 fix)"
+    );
+
+    // Flow B: HOPOPT from a DIFFERENT host to the SAME remote — indistinguishable
+    // on the reverse path -> denied as exhaustion. Under the reverted sentinel
+    // this wrongly returns Matched (no token was minted).
+    match addr_only_lookup(&rules, "10.0.1.101", 0, "8.8.8.8", 0, PROTO_HOPOPT) {
+        SourceNatLookup::Unavailable(f) => {
+            assert_eq!(f.reason, SourceNatFailureReason::AllocatorExhausted)
+        }
+        other => panic!("colliding HOPOPT flow must be denied, got {other:?}"),
+    }
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+
+    // Flow C: HOPOPT to a DIFFERENT remote — distinct reverse identity -> admitted.
+    let c = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.102",
+        0,
+        "9.9.9.9",
+        0,
+        PROTO_HOPOPT,
+    ));
+    assert_eq!(c.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(c.rewrite_src_port, None);
+
+    let owners = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(
+        owners.len(),
+        2,
+        "A (8.8.8.8) and C (9.9.9.9) own distinct HOPOPT reverse identities"
+    );
+    // The reverse index keys on the REAL protocol number 0 — the in-map tuple
+    // layout is byte-identical to any other protocol; only the "is unknown?"
+    // test changed.
+    for (k, _) in owners.iter() {
+        assert_eq!(k.protocol, PROTO_HOPOPT, "owner keyed on real protocol 0");
+    }
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 0);
+}
+
+// #5687: the disambiguation must cut BOTH ways. The synthetic "tuple unknown"
+// caller (the address-only `match_source_nat` wrapper, `protocol == None`) keeps
+// its historical synthetic behavior — round-robin port, NO reverse-identity
+// token — while a real HOPOPT (`Some(0)`) takes the real address-only path, and
+// a normal TCP flow (`Some(6)`) still PATs. This proves a genuinely-unknown
+// tuple is still treated as unknown (not confused with protocol 0) and that
+// normal-protocol translation is unregressed.
+#[test]
+fn pool_snat_unknown_tuple_distinct_from_real_hopopt_5687() {
+    let make_rules = || {
+        parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            name: "pool-mixed".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "my-pool".to_string(),
+            pool_addresses: vec!["203.0.113.1/32".to_string()],
+            port_low: 1024,
+            port_high: 65535,
+            ..SourceNATRuleSnapshot::default()
+        }])
+    };
+
+    // (a) The synthetic address-only wrapper (protocol UNKNOWN / None) keeps its
+    // historical behavior: it selects a pool address, hands out a round-robin
+    // port, and mints NO reverse-identity token (there is no real reverse flow).
+    let ru = make_rules();
+    let unknown = match_source_nat(
+        &ru,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.1.100".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        None,
+        None,
+    )
+    .expect("an unconstrained pool rule matches the tuple-unknown wrapper");
+    assert_eq!(unknown.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert!(
+        unknown.rewrite_src_port.is_some(),
+        "the tuple-unknown wrapper keeps its historical round-robin port"
+    );
+    assert_eq!(
+        ru[0].pool_allocator.debug_address_only_owners().len(),
+        0,
+        "the synthetic unknown wrapper must NOT mint a reverse-identity token"
+    );
+
+    // (b) A REAL HOPOPT (Some(0)) on the same rule shape takes the real
+    // address-only path: it preserves the wire port and DOES mint a token.
+    let rh = make_rules();
+    let hopopt = expect_snat_decision(addr_only_lookup(&rh, "10.0.1.100", 0, "8.8.8.8", 0, 0));
+    assert_eq!(
+        hopopt.rewrite_src_port, None,
+        "real HOPOPT preserves the wire source port"
+    );
+    assert_eq!(
+        rh[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "real HOPOPT mints a reverse-identity token, unlike the unknown wrapper"
+    );
+
+    // (c) No regression for a normal TCP flow: it still PATs — a pool port is
+    // allocated and rewritten, and its reverse mapping is flow-keyed (address-
+    // only owners stay empty because TCP is not address-only).
+    let rt = make_rules();
+    let tcp = expect_snat_decision(addr_only_lookup(&rt, "10.0.1.100", 12345, "8.8.8.8", 443, 6));
+    assert_eq!(tcp.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert!(
+        tcp.rewrite_src_port.is_some(),
+        "a normal TCP flow must still allocate a translated port (no regression)"
+    );
+    assert_eq!(
+        rt[0].pool_allocator.debug_address_only_owners().len(),
+        0,
+        "TCP PAT does not use the address-only owner map"
+    );
 }
 
 // #5269 (no false exhaustion): distinct preserved ports on a ONE-address pool
@@ -1207,7 +1378,7 @@ fn tuple_snat_lookup_from_src(
         "wan",
         src_ip.parse().unwrap(),
         dst_ip.parse().unwrap(),
-        6,
+        Some(6),
         src_port,
         dst_port,
         None,
@@ -1766,7 +1937,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         "wan",
         "10.0.1.100".parse().unwrap(),
         "8.8.8.8".parse().unwrap(),
-        6,
+        Some(6),
         10000,
         53,
         None,
@@ -1785,7 +1956,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         "wan",
         "10.0.2.100".parse().unwrap(),
         "1.1.1.1".parse().unwrap(),
-        6,
+        Some(6),
         10001,
         53,
         None,
@@ -1847,7 +2018,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         "wan",
         "10.0.1.100".parse().unwrap(),
         "8.8.8.8".parse().unwrap(),
-        6,
+        Some(6),
         10000,
         53,
         None,
@@ -1866,7 +2037,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         "wan",
         "10.0.2.100".parse().unwrap(),
         "1.1.1.1".parse().unwrap(),
-        6,
+        Some(6),
         10001,
         53,
         None,
@@ -2905,7 +3076,7 @@ fn pool_snat_address_persistent_userspace_v2_selects_pool_addresses() {
             "wan",
             src.parse().unwrap(),
             dst.parse().unwrap(),
-            6,
+            Some(6),
             src_port,
             443,
             None,
@@ -3435,7 +3606,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
         "wan",
         "10.0.1.100".parse().unwrap(),
         "8.8.8.8".parse().unwrap(),
-        6,
+        Some(6),
         10000,
         53,
         None,
@@ -3460,7 +3631,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
         "wan",
         "10.0.1.100".parse().unwrap(),
         "8.8.8.8".parse().unwrap(),
-        6,
+        Some(6),
         10000,
         53,
         None,
@@ -3753,7 +3924,7 @@ fn deterministic_cgnat_v4_fixed_block_per_subscriber_reversible() {
             "inet",
             src.parse().expect("src"),
             dst.parse().expect("dst"),
-            PROTO_TCP,
+            Some(PROTO_TCP),
             sport,
             443,
             None,
@@ -3846,7 +4017,7 @@ fn deterministic_cgnat_absent_leaves_round_robin_pool_unchanged() {
         "inet",
         "100.64.0.5".parse().expect("src"),
         "8.8.8.8".parse().expect("dst"),
-        PROTO_TCP,
+        Some(PROTO_TCP),
         10001,
         443,
         None,

@@ -497,7 +497,9 @@ impl super::Coordinator {
             to_zone,
             src_ip,
             dst_ip,
-            protocol,
+            // #5687: this test helper drives real-protocol tuples, so wrap in
+            // `Some` (never the `None` tuple-unknown sentinel).
+            Some(protocol),
             src_port,
             dst_port,
             egress_v4,

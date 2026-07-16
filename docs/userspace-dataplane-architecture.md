@@ -667,7 +667,18 @@ the NAT module applies it:
   id==0 colliding on `(pool_addr, 0)`). A non-identifier ICMP control/error
   message parses flowless (no SessionFlow, `icmp_identifier_present` false) and,
   like a genuinely port-less protocol (GRE/ESP/AH/OSPF), takes the address-only
-  path — its L4 bytes are never rewritten. `port no-translation` preserves the
+  path — its L4 bytes are never rewritten. A genuine IPv4 **protocol 0**
+  (HOPOPT) packet is one such port-less protocol and is handled correctly:
+  `match_source_nat_result_for_tuple` carries the L4 protocol **out-of-band** as
+  `Option<u8>`, so the synthetic "L4 tuple unknown" caller (the address-only
+  `match_source_nat` wrapper) is `None` while a real HOPOPT packet is `Some(0)`
+  and is distinct from it (#5687). Before that fix the value 0 doubled as the
+  tuple-unknown sentinel, so a real protocol-0 flow took the synthetic
+  round-robin path and minted no reverse-identity token — its reverse
+  translation could not be matched. The in-map / HA-sync reverse tuple key still
+  stores the real protocol as a `u8` (0 for HOPOPT), so the layout is unchanged;
+  only the in-code "is this unknown?" test moved out-of-band. `port
+  no-translation` preserves the
   id just as it preserves a TCP/UDP source port. By default, pool address
   selection is round-robin within the packet address family. With global source
   NAT `address-persistent`, the userspace dataplane hashes a domain-tag seed,

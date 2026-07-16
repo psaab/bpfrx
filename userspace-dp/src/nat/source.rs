@@ -367,11 +367,16 @@ impl SourceNatRule {
     /// (unchanged match-any behavior). A non-empty set is AND-ed across the two
     /// kinds (destination-port AND application), mirroring Junos.
     ///
-    /// `protocol == 0` is the synthetic "L4 tuple unknown" sentinel used by the
-    /// address-only `match_source_nat` callers: a rule that carries ANY L4
-    /// constraint cannot be satisfied by an unknown tuple, so it fails closed
-    /// (an L4-scoped rule must never fire on traffic whose port/protocol the
-    /// caller could not supply). An unconstrained rule is unaffected.
+    /// #5687: `tuple_unknown` is the OUT-OF-BAND "L4 tuple unknown" signal (the
+    /// address-only `match_source_nat` wrapper, `protocol == None`) — NOT the
+    /// numeric value 0. A rule that carries ANY L4 constraint cannot be
+    /// satisfied by an unknown tuple, so it fails closed (an L4-scoped rule must
+    /// never fire on traffic whose port/protocol the caller could not supply).
+    /// A genuine HOPOPT packet (`Some(0)`, `tuple_unknown == false`) is NOT
+    /// short-circuited here: it falls through to the normal port/protocol
+    /// checks, which reject an L4-port-scoped rule anyway (its ports are 0) — so
+    /// the fail-closed behavior is preserved without conflating it with the
+    /// unknown sentinel. An unconstrained rule is unaffected.
     ///
     /// #3491: a `match application` term may also constrain the SOURCE port (an
     /// application defined with `source-port`). It is AND-ed with the protocol
@@ -379,11 +384,13 @@ impl SourceNatRule {
     /// term only when its protocol, destination port, AND source port all match.
     /// Before #3491 the source-port axis was dropped, so an app-scoped rule fired
     /// regardless of source port — the fail-open this fix closes.
-    fn l4_matches(&self, protocol: u8, src_port: u16, dst_port: u16) -> bool {
+    fn l4_matches(&self, tuple_unknown: bool, protocol: u8, src_port: u16, dst_port: u16) -> bool {
         if self.match_dst_ports.is_empty() && self.match_apps.is_empty() {
             return true;
         }
-        if protocol == 0 {
+        // #5687: fail closed on the OUT-OF-BAND unknown tuple, not `protocol == 0`
+        // (a real HOPOPT flows through to the normal checks below).
+        if tuple_unknown {
             return false;
         }
         if !self.match_dst_ports.is_empty() && !port_in_ranges(dst_port, &self.match_dst_ports) {
@@ -410,6 +417,7 @@ impl SourceNatRule {
         to_zone: &str,
         src_ip: IpAddr,
         dst_ip: IpAddr,
+        tuple_unknown: bool,
         protocol: u8,
         src_port: u16,
         dst_port: u16,
@@ -423,7 +431,7 @@ impl SourceNatRule {
         if !self.scope_matches(scope) {
             return false;
         }
-        if !self.l4_matches(protocol, src_port, dst_port) {
+        if !self.l4_matches(tuple_unknown, protocol, src_port, dst_port) {
             return false;
         }
         match (src_ip, dst_ip) {
@@ -1031,7 +1039,9 @@ pub(crate) fn match_source_nat_result(
         to_zone,
         src_ip,
         dst_ip,
-        0,
+        // #5687: `None` is the out-of-band "L4 tuple unknown" signal for the
+        // address-only wrapper — distinct from a real HOPOPT (`Some(0)`).
+        None,
         0,
         0,
         egress_v4,
@@ -1039,7 +1049,7 @@ pub(crate) fn match_source_nat_result(
         0,
         false,
         // #4088: the address-only wrapper never carries an ICMP query id
-        // (`protocol == 0`), so there is no identifier to preserve.
+        // (the tuple is unknown), so there is no identifier to preserve.
         false,
         &mut counter,
     )
@@ -1060,7 +1070,21 @@ pub(crate) fn match_source_nat_result_for_tuple(
     to_zone: &str,
     src_ip: IpAddr,
     dst_ip: IpAddr,
-    protocol: u8,
+    // #5687: the L4 protocol is OUT-OF-BAND optional so a genuine IPv4
+    // protocol 0 (HOPOPT) is representable and distinct from the synthetic
+    // "L4 tuple unknown" caller:
+    //   - `None`     => tuple unknown (the address-only `match_source_nat`
+    //     wrapper, which has no L4 tuple to supply). Fails L4-constrained
+    //     rules closed and takes the synthetic address-only path.
+    //   - `Some(0)`  => a REAL protocol-0 (HOPOPT) packet. It is port-less
+    //     like GRE/ESP/OSPF, so it takes the real address-only path
+    //     (`reserve_address_only` mints the reverse-identity occupancy
+    //     token) — its reverse tuple can now be matched.
+    //   - `Some(n)`  => any other real protocol (TCP=6, UDP=17, ICMP=1, ...),
+    //     byte-identical behavior to before this fix.
+    // The `SourceNatFlowKey.protocol` reverse-index key stays `u8` (the real
+    // value, 0 for HOPOPT), so the in-map / HA-sync tuple layout is unchanged.
+    protocol: Option<u8>,
     src_port: u16,
     dst_port: u16,
     egress_v4: Option<Ipv4Addr>,
@@ -1085,6 +1109,11 @@ pub(crate) fn match_source_nat_result_for_tuple(
     icmp_identifier_present: bool,
     matched_counter: &mut Option<Arc<NatRuleCounter>>,
 ) -> SourceNatLookup {
+    // #5687: decode the out-of-band protocol. `None` is the tuple-unknown
+    // signal (address-only wrapper); a real HOPOPT arrives as `Some(0)` and is
+    // NOT confused with it. The reverse-index key keeps the real u8 value.
+    let tuple_unknown = protocol.is_none();
+    let protocol = protocol.unwrap_or(0);
     let flow = SourceNatFlowKey {
         protocol,
         src_ip,
@@ -1102,7 +1131,15 @@ pub(crate) fn match_source_nat_result_for_tuple(
     // not re-sort or assume raw config order.
     for rule in rules {
         if !rule.matches(
-            scope, from_zone, to_zone, src_ip, dst_ip, protocol, src_port, dst_port,
+            scope,
+            from_zone,
+            to_zone,
+            src_ip,
+            dst_ip,
+            tuple_unknown,
+            protocol,
+            src_port,
+            dst_port,
         ) {
             continue;
         }
@@ -1163,12 +1200,16 @@ pub(crate) fn match_source_nat_result_for_tuple(
         // `protocol == 0`, so GRE/ESP/AH/OSPF fell through to
         // `allocate_translation` and were corrupted.
         //
-        // `protocol == 0` is the synthetic "L4 tuple unknown" sentinel used
-        // by the address-only `match_source_nat` callers (never a real
-        // packet). It keeps its historical behavior — a round-robin port
-        // via `try_next_port` with no flow-keyed mapping — because the
-        // packet rewriters gate every L4 write on `has_l4_ports`, so the
-        // port it returns can never be written to a frame.
+        // #5687: the "L4 tuple unknown" case is the OUT-OF-BAND `tuple_unknown`
+        // flag (`protocol == None` at the boundary), NOT the numeric value 0.
+        // It is set only by the address-only `match_source_nat` wrapper (never a
+        // real packet) and keeps its historical behavior — a round-robin port
+        // via `try_next_port` with no flow-keyed mapping — because the packet
+        // rewriters gate every L4 write on `has_l4_ports`, so the port it returns
+        // can never be written to a frame. A genuine HOPOPT packet arrives as
+        // `Some(0)` (`tuple_unknown == false`) and is classified `port_less`
+        // below, exactly like GRE/ESP/OSPF: it takes the real address-only path
+        // that mints a reverse-identity token, so its reverse tuple matches.
         // #4074 (RFC 5508 §3.1 "ICMP Query Mappings"): an ICMP/ICMPv6 echo or
         // query message carries a 16-bit Query Identifier that the flow parser
         // (`parse_flow_ports`) lifts into `src_port` (with `dst_port == 0`).
@@ -1188,8 +1229,13 @@ pub(crate) fn match_source_nat_result_for_tuple(
         // must be treated as a real, keyable query (allocate + rewrite +
         // reverse-recover its id like any other), not misread as flowless.
         let icmp_query = matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) && icmp_identifier_present;
-        let port_less = protocol != 0 && !crate::ip_proto::has_l4_ports(protocol) && !icmp_query;
-        let tuple_unknown = protocol == 0;
+        // #5687: gate `port_less` on the OUT-OF-BAND `tuple_unknown` flag, not
+        // `protocol != 0`. A real HOPOPT (`Some(0)`, tuple_unknown == false) has
+        // no L4 port, so it is port-less like GRE/ESP; the synthetic unknown
+        // caller (tuple_unknown == true) is excluded here and handled by the
+        // dedicated `tuple_unknown` branches below. `tuple_unknown` is decoded
+        // at the top of the function from `protocol.is_none()`.
+        let port_less = !tuple_unknown && !crate::ip_proto::has_l4_ports(protocol) && !icmp_query;
         // #3906: `port no-translation` translates the ADDRESS only and PRESERVES
         // the original source port. It takes the same address-only path as a
         // port-less protocol — pick a pool address, leave `rewrite_src_port`

@@ -1,3 +1,56 @@
+## 2026-07-16 — #5687 (nat/SNAT): out-of-band tuple-unknown so real IPv4 protocol 0 (HOPOPT) is representable
+- **Timestamp**: 2026-07-16 (fix/5687-nat-proto0-sentinel)
+- **Action**: Fix #5687 (codex-review-182 M04). Rust userspace-dp SNAT used the
+  protocol value `0` as an in-code "L4 tuple unknown" sentinel for the
+  address-only `match_source_nat` wrapper (`let tuple_unknown = protocol == 0`
+  in `match_source_nat_result_for_tuple`, `nat/source.rs`). That collided with
+  the real IPv4 protocol number 0 (HOPOPT): a genuine protocol-0 packet reached
+  the matcher via `match_source_nat_for_flow_result_at`
+  (`afxdp/forwarding/mod.rs`) with `flow.forward_key.protocol == 0`, was
+  misclassified as tuple-unknown, and took the synthetic round-robin path
+  (`try_next_port`, `rewrite_src_port: Some(_)`) that mints NO reverse-identity
+  occupancy token — instead of the real port-less address-only path
+  (`reserve_address_only`) used by GRE/ESP/OSPF. So a real HOPOPT flow's reverse
+  tuple could not be matched/disambiguated (the #5269 collision hole, but for
+  protocol 0). Fix: represent the protocol OUT-OF-BAND as `Option<u8>` at the
+  `match_source_nat_result_for_tuple` boundary — `None` = tuple unknown (the
+  address-only wrapper), `Some(0)` = real HOPOPT, `Some(n)` = any other real
+  protocol. Decode once at the top (`tuple_unknown = protocol.is_none();
+  protocol = protocol.unwrap_or(0)`), gate `port_less` on `!tuple_unknown`
+  (was `protocol != 0`), and thread `tuple_unknown` into `SourceNatRule::matches`
+  → `l4_matches` (was keyed on `protocol == 0`). A real HOPOPT is now port-less
+  like GRE/ESP: it takes the real address-only path, mints the reverse token,
+  and preserves the wire source port (`rewrite_src_port: None`). SURGICAL: the
+  `SourceNatFlowKey.protocol` reverse-index key stays `u8` (real value, 0 for
+  HOPOPT) — the in-map / HA-sync tuple KEY LAYOUT is byte-identical for ALL
+  protocols; only the in-code "is this unknown?" test moved out-of-band. No wire
+  / HA ABI change. Callers updated: the `match_source_nat_result` wrapper passes
+  `None`; the real flow caller and the `test_match_source_nat_result_for_tuple`
+  helper pass `Some(...)`; ~29 direct test call sites wrapped their real
+  protocol in `Some(...)`.
+- **Tests (fail-on-revert, cargo)**: added
+  `pool_snat_protocol0_hopopt_is_real_address_only_not_unknown_5687` (a HOPOPT
+  SNAT flow mints a reverse-identity token, preserves the wire port, and a
+  colliding second HOPOPT flow to the same remote is DENIED as exhaustion while
+  a different remote disambiguates — owner keyed on real protocol 0) and
+  `pool_snat_unknown_tuple_distinct_from_real_hopopt_5687` (the `None` unknown
+  wrapper keeps its synthetic round-robin, no-token behavior; `Some(0)` HOPOPT
+  mints a token; `Some(6)` TCP still PATs — no regression). PROVEN RED on revert:
+  reintroducing `let tuple_unknown = protocol.map_or(true, |p| p == 0)` sends a
+  real HOPOPT down the synthetic path → both tests FAIL at the
+  `rewrite_src_port == None` assertion; restored GREEN. Validation: `cargo test
+  --release nat::` = 240 passed / 0 failed; full `cargo test --release` suite
+  green. Proto-0 forwarding smoke deferred (no easy HOPOPT generator; loss
+  cluster shim-wall-blocked) — the fix is surgical (normal-protocol tuple
+  byte-identical) and full-cargo-tested.
+- **File(s)**: userspace-dp/src/nat/source.rs (Option<u8> boundary + tuple_unknown
+  threading through matches/l4_matches + wrapper `None`), userspace-dp/src/afxdp/
+  forwarding/mod.rs (`Some(flow.forward_key.protocol)`), userspace-dp/src/afxdp/
+  coordinator/status.rs (test helper `Some(protocol)`), userspace-dp/src/nat/
+  tests_pool.rs (2 new fail-on-revert tests + 20 call sites wrapped),
+  userspace-dp/src/nat/tests_l4_match.rs (9 call sites wrapped), docs/
+  userspace-dataplane-architecture.md (HOPOPT / out-of-band tuple-unknown note).
+
 ## 2026-07-16 — #5828 (config/host-inbound): `source-address any` + excluded must project no direct-host drop
 - **Timestamp**: 2026-07-16 (fix/5828-hostinbound-any-excluded)
 - **Action**: Fix #5828 — the direct-host `junos-host` deny projection

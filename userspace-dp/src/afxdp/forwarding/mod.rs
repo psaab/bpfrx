@@ -404,7 +404,12 @@ pub(super) fn match_source_nat_for_flow_result_at(
         to_zone,
         flow.src_ip,
         flow.dst_ip,
-        flow.forward_key.protocol,
+        // #5687: a real packet always carries a concrete L4 protocol — including
+        // IPv4 protocol 0 (HOPOPT) as `Some(0)`, distinct from the address-only
+        // wrapper's `None` (tuple unknown). This is what lets a genuine
+        // protocol-0 SNAT flow take the real address-only path and its reverse
+        // tuple be matched.
+        Some(flow.forward_key.protocol),
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
         egress.primary_v4,
