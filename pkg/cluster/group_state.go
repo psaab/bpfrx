@@ -105,6 +105,11 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 			m.garpCounts[rg.ID] = rg.GratuitousARPCount
 		}
 	}
+	// Reconcile installed interface-monitor debt against the new desired
+	// monitor set BEFORE electing, so a monitor the operator just removed or
+	// changed cannot strand this node with stale weight debt (#5080).
+	m.reconcileMonitorDebtsLocked(cfg)
+
 	if m.monitor != nil {
 		m.monitor.UpdateGroups(cfg.RedundancyGroups)
 	}

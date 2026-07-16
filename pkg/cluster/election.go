@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"sort"
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // EffectivePriority calculates the effective priority for a node.
@@ -471,5 +473,85 @@ func (m *Manager) recalcWeight(rg *RedundancyGroupState) {
 		m.runElection()
 	} else {
 		m.electSingleNode()
+	}
+}
+
+// reconcileMonitorDebtsLocked realigns each RG's installed interface-monitor
+// debt with the COMPLETE current desired monitor set (#5080). It is the
+// stale-debt half of the reconcile invariant: UpdateConfig otherwise only
+// swaps the desired monitor slice, so a debt installed for a monitor that the
+// operator later REMOVES or CHANGES (interface renamed) would persist,
+// stranding a healthy node secondary even though the failed monitor is gone.
+//
+// Two corrections are applied against m.monitorWeights (which holds exactly the
+// set of currently-failed monitors, kept in sync with each RG's MonitorFails):
+//
+//   - Removed/changed keys — a monitor whose (rgID, iface) is no longer desired
+//     has its debt cleared (weight deleted, name dropped from MonitorFails).
+//   - Changed weights — a still-failed monitor whose configured weight changed
+//     has its debt re-derived to the new weight. The interface stays down, so
+//     no dampening transition would re-fire SetMonitorWeight; the reconcile
+//     must apply it here.
+//
+// Each affected RG's effective weight is then recomputed from its now-current
+// debt set. The caller (UpdateConfig) re-runs the election after this returns,
+// so no election is triggered here. Must be called with m.mu held.
+func (m *Manager) reconcileMonitorDebtsLocked(cfg *config.ClusterConfig) {
+	// Build the complete desired interface-monitor key→weight map.
+	desired := make(map[monitorKey]int)
+	for _, rg := range cfg.RedundancyGroups {
+		for _, im := range rg.InterfaceMonitors {
+			desired[monitorKey{rgID: rg.ID, iface: im.Interface}] = im.Weight
+		}
+	}
+
+	affected := make(map[int]struct{})
+
+	// Clear debt for monitors no longer desired (removed, or the monitored
+	// interface was changed to a different name).
+	for key := range m.monitorWeights {
+		if _, ok := desired[key]; ok {
+			continue
+		}
+		delete(m.monitorWeights, key)
+		if rg, ok := m.groups[key.rgID]; ok {
+			for i, f := range rg.MonitorFails {
+				if f == key.iface {
+					rg.MonitorFails = append(rg.MonitorFails[:i], rg.MonitorFails[i+1:]...)
+					break
+				}
+			}
+			affected[key.rgID] = struct{}{}
+		}
+	}
+
+	// Reapply a changed weight for a monitor that is still failed.
+	for key, w := range desired {
+		if cur, ok := m.monitorWeights[key]; ok && cur != w {
+			m.monitorWeights[key] = w
+			affected[key.rgID] = struct{}{}
+		}
+	}
+
+	// Recompute the effective weight of each affected RG from its now-current
+	// debt set (mirrors recalcWeight's arithmetic without re-electing).
+	for rgID := range affected {
+		rg, ok := m.groups[rgID]
+		if !ok {
+			continue
+		}
+		totalLost := 0
+		for _, iface := range rg.MonitorFails {
+			totalLost += m.monitorWeights[monitorKey{rgID: rgID, iface: iface}]
+		}
+		oldWeight := rg.Weight
+		rg.Weight = 255 - totalLost
+		if rg.Weight < 0 {
+			rg.Weight = 0
+		}
+		if oldWeight != rg.Weight {
+			slog.Info("cluster: monitor debt reconciled on config change",
+				"rg", rgID, "old", oldWeight, "new", rg.Weight)
+		}
 	}
 }

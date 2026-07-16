@@ -503,6 +503,32 @@ sub-interfaces that report no independent carrier state); `OperDown` /
 track-interface detection. `pkg/routing/monitor.go` (the display-side
 `InterfaceMonitorStatus` path) carries its own identical copy.
 
+**Missing local link = down (#5080).** A `LinkByName` failure for a
+monitor on the LOCAL FPC slot means the configured member link is absent
+(cold boot before the NIC appears, or a delete/recreate between polls).
+`pollInterfaceMonitors` feeds that absence through the same dampening
+machinery as a carrier-down link — it must NOT be silently skipped.
+Skipping fails open: an already-primary node keeps effective weight 255
+and stays primary while its data link is missing, blackholing traffic. A
+monitor on a PEER's slot (`SlotToNodeID(slot) != NodeID`) is still
+skipped — the peer publishes that interface's status over heartbeat.
+
+**Reconcile monitor debt on config change (#5080).** Effective RG weight
+must always derive from the COMPLETE current desired monitor set. On
+`UpdateConfig` the manager runs `reconcileMonitorDebtsLocked`: it builds
+the desired `(rgID, iface)→weight` map from the new config, clears the
+installed debt (`monitorWeights` + each RG's `MonitorFails`) for any
+monitor that was REMOVED or whose interface CHANGED, re-derives the debt
+for a still-failed monitor whose configured weight changed, then
+recomputes each affected RG's weight — all before the election runs. In
+tandem, `Monitor.UpdateGroups` drops the dampening `ifaceState` for
+monitors no longer desired. Without this, `UpdateConfig` only swapped the
+desired slice, so a debt installed for a monitor the operator later
+removed/changed persisted and stranded a healthy node secondary forever.
+`UpdateGroups` deliberately does not call the locking `SetMonitorWeight`
+(it runs under the manager lock already held by `UpdateConfig`); the
+manager-side clear happens directly in `reconcileMonitorDebtsLocked`.
+
 `LinkAttrsUp` is exported because the same carrier-aware read is needed
 outside the monitor loop:
 
