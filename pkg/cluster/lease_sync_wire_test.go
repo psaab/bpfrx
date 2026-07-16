@@ -2,12 +2,98 @@ package cluster
 
 import (
 	"encoding/binary"
+	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/psaab/xpf/pkg/dhcpserver"
 )
+
+// TestDHCPLeaseEncode_OversizedFieldFailsClosed is the #4892 regression. The
+// lease-sync wire prefixes each string with a uint16 length; a field longer than
+// math.MaxUint16 (65535) bytes would silently narrow the prefix (uint16(len)
+// wraps) and the peer would misframe the record — reading the wrapped low-16
+// length and then the string's trailing bytes as later fields, corrupting the
+// lease identity/type/prefix-length/hostname on the standby.
+//
+// The fix bounds the writer: encodeOneLease REJECTS an oversized lease (returns
+// an error) rather than emitting a misframed record, and encodeDHCPLeasePayload
+// DROPS it from the push (count stays consistent) so the surviving leases still
+// round-trip byte-identical.
+//
+// FAIL-ON-REVERT: restoring `uint16(len(s))` narrowing in putLeaseString removes
+// the error, so (1) encodeOneLease returns nil error on the oversized lease and
+// this test's err==nil check fails, and (2) the oversized record is emitted
+// misframed, so the payload decodes 3 leases (the middle one corrupted) instead
+// of the 2 clean survivors — both assertions go RED.
+func TestDHCPLeaseEncode_OversizedFieldFailsClosed(t *testing.T) {
+	oversize := math.MaxUint16 + 1 // 65536: first length that overflows the uint16 prefix.
+
+	// Each variable-length field must independently fail closed — the error is
+	// threaded at every putLeaseString site in encodeOneLease.
+	cases := []struct {
+		field string
+		set   func(*dhcpserver.SyncLease)
+	}{
+		{"Address", func(l *dhcpserver.SyncLease) { l.Address = strings.Repeat("a", oversize) }},
+		{"HWAddress", func(l *dhcpserver.SyncLease) { l.HWAddress = strings.Repeat("b", oversize) }},
+		{"ClientID", func(l *dhcpserver.SyncLease) { l.ClientID = strings.Repeat("c", oversize) }},
+		{"DUID", func(l *dhcpserver.SyncLease) { l.DUID = strings.Repeat("d", oversize) }},
+		{"LeaseType", func(l *dhcpserver.SyncLease) { l.LeaseType = strings.Repeat("e", oversize) }},
+		{"Hostname", func(l *dhcpserver.SyncLease) { l.Hostname = strings.Repeat("f", oversize) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			l := dhcpserver.SyncLease{Family: 4, Address: "10.0.0.1", SubnetID: 1}
+			tc.set(&l)
+			if _, err := encodeOneLease(l); err == nil {
+				t.Fatalf("encodeOneLease with an oversized %s did not fail closed; "+
+					"the uint16 prefix silently narrowed and the record is misframed", tc.field)
+			}
+		})
+	}
+
+	// Boundary: exactly math.MaxUint16 bytes still fits the prefix and must encode.
+	atLimit := dhcpserver.SyncLease{Family: 4, Address: "10.0.0.2", SubnetID: 1,
+		Hostname: strings.Repeat("h", math.MaxUint16)}
+	if _, err := encodeOneLease(atLimit); err != nil {
+		t.Fatalf("encodeOneLease rejected a field of exactly %d bytes (must fit the uint16 prefix): %v",
+			math.MaxUint16, err)
+	}
+
+	// Payload-level: an oversized lease is DROPPED, the clean leases survive
+	// byte-identical, and the count reflects only what was emitted.
+	normal1 := dhcpserver.SyncLease{
+		Family: 4, Address: "10.0.61.7", SubnetID: 1,
+		HWAddress: "aa:bb:cc:dd:ee:07", ClientID: "01:aa:bb:cc:dd:ee:07",
+		ValidLife: 3600, Remaining: 3000, Hostname: "host-1", FQDNFwd: true,
+	}
+	oversized := dhcpserver.SyncLease{
+		Family: 6, Address: "2001:db8::dead", SubnetID: 2,
+		DUID: "00:01:00:03", IAID: 9, LeaseType: "IA_NA",
+		ValidLife: 7200, Remaining: 6000, Hostname: strings.Repeat("x", oversize),
+	}
+	normal2 := dhcpserver.SyncLease{
+		Family: 6, Address: "2001:db8::beef", SubnetID: 2,
+		DUID: "00:01:00:04", IAID: 11, LeaseType: "IA_PD", PrefixLen: 56,
+		ValidLife: 7200, Remaining: 6000, Hostname: "host-2", FQDNRev: true,
+	}
+	payload := encodeDHCPLeasePayload([]dhcpserver.SyncLease{normal1, oversized, normal2})
+	out := decodeDHCPLeasePayload(payload)
+	if len(out) != 2 {
+		t.Fatalf("payload decoded %d leases, want 2 (the oversized lease must be dropped, "+
+			"not emitted misframed): %+v", len(out), out)
+	}
+	if !reflect.DeepEqual(out[0], normal1) {
+		t.Errorf("first surviving lease not byte-identical:\n got=%+v\nwant=%+v", out[0], normal1)
+	}
+	if !reflect.DeepEqual(out[1], normal2) {
+		t.Errorf("second surviving lease not byte-identical (a misframed oversized record "+
+			"would surface here):\n got=%+v\nwant=%+v", out[1], normal2)
+	}
+}
 
 // Test: the #2239 DHCP-lease wire codec round-trips a mixed v4/v6 set,
 // including a PD lease and the FQDN flags.
@@ -61,7 +147,10 @@ func TestDHCPLeasePayload_LengthGated(t *testing.T) {
 		HWAddress: "aa", ValidLife: 100, Remaining: 50, State: 0,
 		Hostname: "h", FQDNFwd: true,
 	}
-	rec := encodeOneLease(l)
+	rec, err := encodeOneLease(l)
+	if err != nil {
+		t.Fatalf("encodeOneLease: %v", err)
+	}
 
 	// Newer peer: append 8 bytes of an unknown future field.
 	newer := append(append([]byte{}, rec...), 1, 2, 3, 4, 5, 6, 7, 8)
