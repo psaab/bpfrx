@@ -208,3 +208,53 @@ func TestApplyTailReconcilesSurfacesVRFError_5700(t *testing.T) {
 			"errors.Join wiring, got %v", err)
 	}
 }
+
+// TestApplyVRFReconcileMemberBindStaysBestEffort_5700 pins the transient-vs-fatal
+// boundary the #5700 fix deliberately draws (the gap the PR #5945 hostile review
+// surfaced). The PRE-networkd routing-instance MEMBER bind
+// (BindInterfaceToVRF(member, ri.Name)) runs BEFORE applyInterfaceReconcile
+// creates the tunnel/xfrmi member devices, so a member that is a later-created
+// tunnel is legitimately "not found" at that phase — an EXPECTED transient
+// absence. It MUST stay best-effort (WARN) and NOT surface into commit truth;
+// only the transient-free ReconcileVRFs device setup (vrfErr) and the
+// post-networkd rebindManagementVRFIfaces (networkdErr) are load-bearing.
+//
+// Isolation: ReconcileVRFs SUCCEEDS (vrf-blue LinkAdd has no addFail, so the
+// device-setup path cannot confound vrfErr) and no fxp*/fab*/em* interface is
+// present (so the management desired-VRF and its pre-networkd bind never run).
+// Only the RI member ge-0-0-5 is absent from the fake link table, so
+// BindInterfaceToVRF's LinkByName(member) returns LinkNotFoundError and ONLY the
+// member bind fails. applyVRFReconcile must still return vrfErr == nil.
+//
+// FAIL-ON-REVERT: add `vrfErr = errors.Join(vrfErr, err)` to the member-bind
+// loop in applyVRFReconcile (surface the transient) and this goes RED — the test
+// is load-bearing against a regression that promotes the expected member-bind
+// transient into a false commit failure. The existing
+// TestApplyVRFReconcileToleratesSuccess_5700 covers the pre-networkd MGMT bind's
+// best-effort-ness; this covers the routing-instance MEMBER bind.
+func TestApplyVRFReconcileMemberBindStaysBestEffort_5700(t *testing.T) {
+	ops := newReconcileFakeLinkOps()
+
+	d := &Daemon{routing: routing.NewManagerWithLinkOpsForTest(ops)}
+
+	cfg := &config.Config{}
+	cfg.RoutingInstances = []*config.RoutingInstanceConfig{
+		{
+			Name:         "blue",
+			InstanceType: "vrf",         // non-forwarding -> reconciled + member-bound
+			TableID:      100,           // vrf-blue LinkAdd succeeds (no addFail)
+			Interfaces:   []string{"ge-0/0/5"}, // ge-0-0-5: absent from ops.links -> bind fails
+		},
+	}
+
+	ctxErr, vrfErr := d.applyVRFReconcile(context.Background(), cfg)
+	if ctxErr != nil {
+		t.Fatalf("ctxErr = %v, want nil (not a #2926-C1 cancellation)", ctxErr)
+	}
+	if vrfErr != nil {
+		t.Fatalf("vrfErr = %v, want nil: a routing-instance MEMBER bind failure is "+
+			"best-effort (an expected transient before tunnel/xfrmi member creation) and "+
+			"must NOT surface into commit truth — only the ReconcileVRFs device setup does "+
+			"(#5700)", vrfErr)
+	}
+}
