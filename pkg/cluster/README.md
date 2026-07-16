@@ -369,12 +369,14 @@ standby can re-initiate the primary's tunnels on takeover:
 - **Full-set ordering (#5706)** — because the set is REPLACED wholesale and both
   fabric `receiveLoop`s run concurrently, a full-set reordered across the
   redundant streams could overwrite a newer set with an older one. Each push now
-  carries a trailing `(incarnation, seq)` (`appendFullSetSeq`); the receiver
-  admits only a strictly-newer pair per stream (`ipsecRecvSeq`, a
-  `fullSetSeqGuard`) and drops a stale reorder (`IPsecSAStaleIgnored`). The guard
-  is reset on a peer bulk re-prime (`resetRecvGen`) so an OS-rebooted peer's
-  fresh set (lower monotonic incarnation) is re-accepted. A legacy peer sends no
-  trailer → `(0,0)` → accept-always (mixed-version compat). See
+  carries a trailing `(incarnation, seq)` (`appendIPsecFullSetSeq`, which inserts
+  a `\n` delimiter before the trailer so an old newline-decoder never fuses the
+  trailer onto the last SA name); the receiver admits only a strictly-newer pair
+  per stream (`ipsecRecvSeq`, a `fullSetSeqGuard`), strips the delimiter
+  (`stripIPsecFullSetDelim`), and drops a stale reorder (`IPsecSAStaleIgnored`).
+  The guard is reset on a peer bulk re-prime (`resetRecvGen`) so an OS-rebooted
+  peer's fresh set (lower monotonic incarnation) is re-accepted. A legacy peer
+  sends no trailer → `(0,0)` → accept-always (mixed-version compat). See
   `docs/sync-protocol.md` "Full-set state-sync ordering (#5706)".
 - **Re-initiate on takeover** — `reinitiateIPsecSAs` reads `PeerIPsecSAs()` and
   `InitiateConnection`s each name when this node becomes RG0-primary.

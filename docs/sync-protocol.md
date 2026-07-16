@@ -42,7 +42,7 @@ All multi-byte integers in the wire format are **little-endian**, matching the n
 | 6    | BulkEnd          | Primary→Secondary | 0                   | Marks end of bulk transfer |
 | 7    | Heartbeat        | Bidirectional     | 0                   | Keepalive (sent on 30s idle) |
 | 8    | Config           | Primary→Secondary | Variable (UTF-8) + 16B gen framing | Full config text + monotonic config generation (#3931) |
-| 9    | IPsecSA          | Primary→Secondary | Variable (UTF-8) + 24B seq framing | Newline-separated connection names + full-set (incarnation, seq) ordering trailer (#5706) |
+| 9    | IPsecSA          | Primary→Secondary | Variable (UTF-8) + 1B delim + 24B seq framing | Newline-separated connection names + `\n` delimiter + full-set (incarnation, seq) ordering trailer (#5706) |
 | 25   | DHCPLeaseV4      | Primary→Secondary | count+records + 24B seq framing | Full-set v4 lease push (#2239) + (incarnation, seq) ordering trailer (#5706) |
 | 26   | DHCPLeaseV6      | Primary→Secondary | count+records + 24B seq framing | Full-set v6 lease push (#2239) + (incarnation, seq) ordering trailer (#5706) |
 
@@ -475,15 +475,23 @@ refused). New sender → old receiver:
 
 - **DHCP (25/26):** the old lease decoder reads exactly its record count and
   IGNORES the trailing bytes — fully clean.
-- **IPsec (9):** the old newline decoder would keep the trailer as bogus
-  connection name(s). This is fail-safe — on takeover `reinitiateIPsecSAs`
-  merely logs a warning for a name it cannot initiate, and the REAL SA names
-  decode ahead of the trailer and still take effect — and only occurs in the
-  brief mixed-version window.
+- **IPsec (9):** the name payload is newline-JOINED with no terminator, so
+  gluing the trailer straight on would FUSE it onto the LAST connection name —
+  an old newline-decoder (no `stripFullSetSeq`) would recover a corrupted final
+  name it can no longer `swanctl --initiate`, silently dropping that tunnel on
+  takeover. The IPsec full-set therefore inserts a single `\n` **delimiter**
+  between the name list and the trailer (`appendIPsecFullSetSeq`). An old
+  decoder then splits the trailer off as a SEPARATE trailing element — a bogus
+  name `reinitiateIPsecSAs` merely warns it cannot initiate — while EVERY real
+  SA name decodes cleanly. A new receiver removes the trailer
+  (`stripFullSetSeq`) and the delimiter (`stripIPsecFullSetDelim`), so a
+  new→new roundtrip decodes to exactly the sent names with no trailing empty
+  name. This is confined to the brief mixed-version window and self-heals once
+  both nodes are upgraded.
 
 ## IPsec SA Payload (Variable)
 
-Newline-separated (`\n`) list of strongSwan connection names (e.g., `vpn-gw1\nvpn-gw2`), followed by the 24-byte #5706 (incarnation, seq) ordering trailer. On failover, the new primary calls `swanctl --initiate` for each name.
+Newline-separated (`\n`) list of strongSwan connection names (e.g., `vpn-gw1\nvpn-gw2`), followed by a single `\n` delimiter and then the 24-byte #5706 (incarnation, seq) ordering trailer — i.e. `vpn-gw1\nvpn-gw2\n<trailer>`. The delimiter keeps the trailer from fusing onto the last name for an old newline-decoder (see the mixed-version note above); a new receiver strips both the trailer and the delimiter. On failover, the new primary calls `swanctl --initiate` for each name.
 
 ## Sync Algorithms
 

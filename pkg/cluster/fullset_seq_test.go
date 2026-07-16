@@ -276,6 +276,132 @@ func TestFullSetSeqReconnectResetReadmits(t *testing.T) {
 	}
 }
 
+// TestIPsecFullSetDelimOldDecoderRecoversAllNames is the #5706 review-fold
+// FAIL-ON-REVERT for the new-sender -> OLD-receiver direction. A NEW sender
+// inserts a '\n' delimiter between the SA name list and the trailer
+// (appendIPsecFullSetSeq). An OLD pre-#5706 receiver has no stripFullSetSeq: it
+// newline-splits the WHOLE frame. Every REAL connection name must decode
+// cleanly — in particular the LAST name must NOT be fused with the trailer
+// bytes. Reverting appendIPsecFullSetSeq to the bare appendFullSetSeq glues the
+// trailer onto "vpn-gw2", so got[1] != "vpn-gw2" -> RED.
+func TestIPsecFullSetDelimOldDecoderRecoversAllNames(t *testing.T) {
+	names := []string{"vpn-gw1", "vpn-gw2"}
+	// inc/seq deliberately avoid 0x0A bytes so the reverted (fused) frame splits
+	// into exactly [vpn-gw1, "vpn-gw2"+trailer], making the fusion unambiguous.
+	frame := appendIPsecFullSetSeq(encodeIPsecSAPayload(names), 0x1122334455667788, 42)
+
+	// OLD receiver: decode the whole frame with NO trailer strip.
+	got := decodeIPsecSAPayload(frame)
+	if len(got) < 2 {
+		t.Fatalf("old decoder must recover both real names, got %v", got)
+	}
+	if got[0] != "vpn-gw1" || got[1] != "vpn-gw2" {
+		t.Fatalf("old decoder fused a real SA name with the trailer: got %v, want first two [vpn-gw1 vpn-gw2]", got)
+	}
+	// The trailer becomes one-or-more SEPARATE trailing elements, never a real
+	// name — assert no real name reappears past the two we sent.
+	for i, n := range got {
+		if i >= len(names) && (n == "vpn-gw1" || n == "vpn-gw2") {
+			t.Fatalf("a real SA name reappeared as a trailer element (fusion/duplication): %v", got)
+		}
+	}
+}
+
+// TestIPsecFullSetDelimNewRoundTripExact pins the new->new SYMMETRY: the sender
+// inserts the delimiter before the trailer and the receiver removes BOTH the
+// trailer (stripFullSetSeq) and the delimiter (stripIPsecFullSetDelim), so the
+// decoded name list is EXACTLY the sent names with no trailing empty name, and
+// the (incarnation, seq) round-trips. This guards the byte-exact new->new
+// property independent of decodeIPsecSAPayload's empty-name filtering.
+func TestIPsecFullSetDelimNewRoundTripExact(t *testing.T) {
+	names := []string{"vpn-gw1", "vpn-gw2"}
+	frame := appendIPsecFullSetSeq(encodeIPsecSAPayload(names), 7777, 9)
+
+	base, inc, seq := stripFullSetSeq(frame)
+	if inc != 7777 || seq != 9 {
+		t.Fatalf("trailer round trip: got (inc=%d, seq=%d), want (7777, 9)", inc, seq)
+	}
+	// The sender must have inserted the delimiter between the names and trailer.
+	if n := len(base); n == 0 || base[n-1] != ipsecFullSetDelim {
+		t.Fatalf("new sender must insert the IPsec trailer delimiter before the trailer; base=%q", base)
+	}
+	stripped := stripIPsecFullSetDelim(base)
+	if n := len(stripped); n > 0 && stripped[n-1] == ipsecFullSetDelim {
+		t.Fatalf("stripIPsecFullSetDelim must remove the trailing delimiter; stripped=%q", stripped)
+	}
+	got := decodeIPsecSAPayload(stripped)
+	if len(got) != 2 || got[0] != "vpn-gw1" || got[1] != "vpn-gw2" {
+		t.Fatalf("new->new roundtrip must decode EXACTLY [vpn-gw1 vpn-gw2] with no trailing empty name, got %v (len %d)", got, len(got))
+	}
+
+	// An empty name set stays the bare trailer (no delimiter, no last name to
+	// protect) and round-trips to no names.
+	emptyFrame := appendIPsecFullSetSeq(encodeIPsecSAPayload(nil), 1, 1)
+	eBase, _, _ := stripFullSetSeq(emptyFrame)
+	if got := decodeIPsecSAPayload(stripIPsecFullSetDelim(eBase)); len(got) != 0 {
+		t.Fatalf("empty IPsec set must round-trip to no names, got %v", got)
+	}
+}
+
+// TestIPsecFullSetDelimReceiveEndToEnd drives a real new-sender frame through
+// the receiver's handleMessage path and asserts the held set is exactly the
+// sent names (no bogus trailing name from the delimiter or trailer).
+func TestIPsecFullSetDelimReceiveEndToEnd(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	var applied []string
+	ss.OnIPsecSAReceived = func(nn []string) { applied = nn }
+
+	ss.handleMessage(nil, syncMsgIPsecSA,
+		appendIPsecFullSetSeq(encodeIPsecSAPayload([]string{"vpn-gw1", "vpn-gw2"}), 5000, 3))
+
+	if got := ss.PeerIPsecSAs(); len(got) != 2 || got[0] != "vpn-gw1" || got[1] != "vpn-gw2" {
+		t.Fatalf("receiver must decode a delimited new-sender frame to exactly [vpn-gw1 vpn-gw2], got %v", got)
+	}
+	if len(applied) != 2 || applied[1] != "vpn-gw2" {
+		t.Fatalf("OnIPsecSAReceived must see exactly the sent names, got %v", applied)
+	}
+}
+
+// TestFullSetSeqDHCPBaseEndingInMagicSafe is reviewer Finding 3: lock the
+// steady-state both-new DHCP invariant that the sender appends EXACTLY ONE
+// trailer and the receiver strips EXACTLY ONE, even when the encoded lease base
+// coincidentally ends in the fullSetSeqMagic. The strip peels only the real
+// appended trailer (its magic sits at [n-24:n-16]); a legacy frame that merely
+// ends in the magic (final 8 bytes) is not mistaken for a stamped frame.
+func TestFullSetSeqDHCPBaseEndingInMagicSafe(t *testing.T) {
+	leases := []dhcpserver.SyncLease{
+		{Family: 4, Address: "10.0.0.5", HWAddress: "aa:bb:cc:dd:ee:01", Remaining: 3600, ValidLife: 3600},
+	}
+	base := encodeDHCPLeasePayload(leases)
+
+	// One stamp + one strip recovers the base byte-for-byte and the lease set.
+	stamped := appendFullSetSeq(base, 424242, 99)
+	gotBase, inc, seq := stripFullSetSeq(stamped)
+	if inc != 424242 || seq != 99 {
+		t.Fatalf("trailer round trip: got (inc=%d, seq=%d), want (424242, 99)", inc, seq)
+	}
+	if !bytes.Equal(gotBase, base) {
+		t.Fatalf("DHCP base must round-trip byte-exact through one stamp/strip; got %d bytes want %d", len(gotBase), len(base))
+	}
+	if got := decodeDHCPLeasePayload(gotBase); len(got) != 1 || got[0].Address != "10.0.0.5" {
+		t.Fatalf("recovered base must decode to the original lease set, got %+v", got)
+	}
+
+	// Pathological coincidence: a base whose OWN last 8 bytes ARE the magic. One
+	// stamp then one strip must peel only the real (appended) trailer and leave
+	// this magic-ending base intact — no double-strip into the payload.
+	trap := append(append([]byte(nil), base...), fullSetSeqMagic[:]...)
+	stamped2 := appendFullSetSeq(trap, 7, 8)
+	if gotTrap, _, _ := stripFullSetSeq(stamped2); !bytes.Equal(gotTrap, trap) {
+		t.Fatalf("a base ending in the magic must survive one stamp/strip intact")
+	}
+	// And a LEGACY frame (no trailer) that merely ends in the magic decodes as
+	// (whole, 0, 0): stripFullSetSeq checks [n-24:n-16], not the final 8 bytes.
+	if legacyGot, li, ls := stripFullSetSeq(trap); li != 0 || ls != 0 || !bytes.Equal(legacyGot, trap) {
+		t.Fatalf("legacy DHCP frame ending in magic must decode as (whole, 0, 0), got (inc=%d, seq=%d)", li, ls)
+	}
+}
+
 // captureConn is a net.Conn that records everything written, so a test can
 // inspect the frames a Queue* sender actually put on the wire.
 type captureConn struct {

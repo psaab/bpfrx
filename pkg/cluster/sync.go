@@ -979,8 +979,12 @@ func (s *SessionSync) QueueIPsecSA(connectionNames []string) bool {
 	// reject a stale full-set reordered across the redundant fabric streams.
 	// The seq is drawn even on a subsequent write failure (a gap is harmless —
 	// the receiver only requires strictly-increasing, not contiguous).
+	// appendIPsecFullSetSeq (not the bare appendFullSetSeq) inserts a '\n'
+	// delimiter before the trailer so an OLD pre-#5706 receiver decodes every
+	// real SA name cleanly instead of fusing the trailer onto the last name
+	// (#5706 review fold; see ipsecFullSetDelim).
 	seq := s.ipsecSeqCounter.Add(1)
-	payload := appendFullSetSeq(encodeIPsecSAPayload(connectionNames), s.syncEpoch, seq)
+	payload := appendIPsecFullSetSeq(encodeIPsecSAPayload(connectionNames), s.syncEpoch, seq)
 	s.writeMu.Lock()
 	err := writeMsg(conn, syncMsgIPsecSA, payload)
 	s.writeMu.Unlock()

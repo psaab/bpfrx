@@ -1632,7 +1632,11 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 				"incarnation", incarnation, "seq", seq)
 			return
 		}
-		names := decodeIPsecSAPayload(base)
+		// #5706 review fold: strip the '\n' delimiter a new sender inserts
+		// between the SA name list and the trailer so a new->new roundtrip
+		// leaves no trailing empty name. A legacy / pre-fold frame has no
+		// delimiter, so this is a no-op for it.
+		names := decodeIPsecSAPayload(stripIPsecFullSetDelim(base))
 		s.peerIPsecSAsMu.Lock()
 		s.peerIPsecSAs = names
 		s.peerIPsecSAsMu.Unlock()

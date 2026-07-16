@@ -671,11 +671,22 @@ func decodeConfigPayload(payload []byte) (configText string, gen uint64) {
 // stripFullSetSeq returns (base, 0, 0) and the guard accept-always for that
 // peer (a zero incarnation/seq is the legacy sentinel). New sender -> old
 // receiver: the DHCP lease decoder reads exactly its record count and IGNORES
-// the trailing bytes (fully clean); the IPsec name decoder newline-splits and
-// would keep the trailer as bogus connection name(s) — fail-safe (on takeover
-// reinitiateIPsecSAs merely warns on a name that cannot be initiated; the REAL
-// SA names decode ahead of the trailer and still take effect), and only in the
-// brief mixed-version window.
+// the trailing bytes (fully clean).
+//
+// The IPsec name payload is newline-JOINED with no terminator, so gluing the
+// trailer directly onto it would FUSE the 24-byte trailer onto the LAST
+// connection name — an old newline-decoder (no stripFullSetSeq) would recover a
+// corrupted final name it can no longer `swanctl --initiate`, silently dropping
+// the last tunnel on a mixed-version ISSU takeover. To avoid that, the IPsec
+// full-set inserts a single '\n' DELIMITER between the name list and the
+// trailer (appendIPsecFullSetSeq): the old decoder then sees the trailer as a
+// SEPARATE trailing element (a bogus name it merely warns it cannot initiate —
+// harmless) and EVERY real SA name decodes cleanly. A new receiver strips the
+// trailer (stripFullSetSeq) and the delimiter (stripIPsecFullSetDelim), so a
+// new->new roundtrip decodes to exactly the sent names with no trailing empty
+// name. DHCP keeps the delimiter-free appendFullSetSeq (binary count-prefixed;
+// its old decoder already ignores the trailer). All of this is confined to the
+// brief mixed-version window and self-heals once both nodes are upgraded.
 var fullSetSeqMagic = [8]byte{0x00, 0xff, 'x', 'p', 'f', 'F', 'S', 0x00}
 
 const fullSetSeqTrailerLen = 8 + 8 + 8 // magic + incarnation + seq
@@ -705,6 +716,52 @@ func stripFullSetSeq(payload []byte) (base []byte, incarnation, seq uint64) {
 		return payload[: n-fullSetSeqTrailerLen], incarnation, seq
 	}
 	return payload, 0, 0
+}
+
+// ipsecFullSetDelim separates the newline-joined IPsec SA name list from its
+// trailing (incarnation, seq) full-set trailer. encodeIPsecSAPayload joins
+// names with '\n' and appends NO terminator, so without this delimiter
+// appendFullSetSeq would glue the 24-byte trailer directly onto the LAST
+// connection name. An OLD pre-#5706 receiver has no stripFullSetSeq: it
+// newline-splits the whole frame, so a fused last name can no longer be
+// `swanctl --initiate`d and that tunnel is silently NOT re-initiated on a
+// mixed-version ISSU takeover. With the delimiter the old decoder sees the
+// trailer as a SEPARATE trailing element (a bogus name it merely warns it
+// cannot initiate — harmless) and EVERY real SA name decodes cleanly.
+const ipsecFullSetDelim = '\n'
+
+// appendIPsecFullSetSeq stamps the (incarnation, seq) ordering trailer onto an
+// IPsec SA payload, inserting ipsecFullSetDelim between the name list and the
+// trailer (see ipsecFullSetDelim). A NEW receiver removes the trailer with
+// stripFullSetSeq and the delimiter with stripIPsecFullSetDelim, so a new->new
+// roundtrip decodes to exactly the sent names (no trailing empty name). The
+// delimiter is inserted only for a non-empty name list — an empty payload has
+// no last name to protect, so it stays the bare trailer, matching the DHCP and
+// empty-set behavior. DHCP does NOT use this: its payload is binary
+// count-prefixed and its old decoder already ignores the trailer, so it keeps
+// the delimiter-free appendFullSetSeq.
+func appendIPsecFullSetSeq(names []byte, incarnation, seq uint64) []byte {
+	base := names
+	if len(names) > 0 {
+		base = make([]byte, 0, len(names)+1)
+		base = append(base, names...)
+		base = append(base, ipsecFullSetDelim)
+	}
+	return appendFullSetSeq(base, incarnation, seq)
+}
+
+// stripIPsecFullSetDelim removes the single trailing ipsecFullSetDelim a NEW
+// sender inserts between the SA name list and the (already-stripped) trailer.
+// It is the receive-side symmetric partner of appendIPsecFullSetSeq so a
+// new->new roundtrip leaves no trailing empty connection name. A frame from a
+// legacy or #5706-pre-fold sender carries no delimiter — the newline-JOINED
+// name list never ends in '\n' — so nothing is trimmed and those frames decode
+// unchanged.
+func stripIPsecFullSetDelim(base []byte) []byte {
+	if n := len(base); n > 0 && base[n-1] == ipsecFullSetDelim {
+		return base[:n-1]
+	}
+	return base
 }
 
 // --- #2239 HA DHCP-server lease sync wire codec ---------------------------
