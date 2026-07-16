@@ -195,11 +195,11 @@ func TestSeedDHCPLeasesFromPeer(t *testing.T) {
 	// Standby holds peer leases (would arrive over the sync channel).
 	d.sessionSync.SetPeerDHCPLeasesForTesting(4, []dhcpserver.SyncLease{
 		{Family: 4, Address: "10.0.61.50", HWAddress: "aa:bb:cc:dd:ee:01",
-			SubnetID: 1, Remaining: 1800, State: 0},
+			SubnetID: 1, Remaining: 1800, PreferredRemaining: 1800, State: 0},
 	})
 	d.sessionSync.SetPeerDHCPLeasesForTesting(6, []dhcpserver.SyncLease{
 		{Family: 6, Address: "2001:db8::100", DUID: "00:01:00:01", IAID: 9,
-			LeaseType: "IA_NA", SubnetID: 1, Remaining: 2400, State: 0},
+			LeaseType: "IA_NA", SubnetID: 1, Remaining: 2400, PreferredRemaining: 2400, State: 0},
 	})
 
 	d.seedDHCPLeasesFromPeer(context.Background())

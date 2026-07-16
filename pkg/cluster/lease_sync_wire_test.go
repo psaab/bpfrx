@@ -159,17 +159,26 @@ func TestDHCPLeasePayload_LengthGated(t *testing.T) {
 		t.Errorf("newer-peer record lost known fields: %+v", got)
 	}
 
-	// Legacy peer: truncate the record so the trailing flags byte (and
-	// hostname) are missing. The decoder must not panic and must zero the
-	// absent fields rather than mis-read.
-	short := rec[:len(rec)-3]
+	// Legacy peer: truncate the record so the trailing PreferredRemaining field
+	// (#5073), the FQDN flags byte, AND the hostname are missing. The record tail
+	// is [hostname len(2) + bytes][flags(1)][PreferredRemaining(4)]; cut 7 bytes
+	// (the pref field, the flags byte, and into the hostname) so the hostname
+	// read fails and every trailing field is absent. The decoder must not panic
+	// and must leave the absent fields at their defaults rather than mis-read.
+	short := rec[:len(rec)-7]
 	got2 := decodeOneLease(short)
 	if got2.Address != l.Address {
 		t.Errorf("legacy-peer record lost leading field address: %+v", got2)
 	}
-	// FQDNFwd was the last byte; truncated → must be false (zero).
+	// FQDNFwd lived in the flags byte, now truncated away → must be false (zero).
 	if got2.FQDNFwd {
 		t.Errorf("legacy-peer truncated record must not set absent flag")
+	}
+	// #5073: a record truncated before the trailing PreferredRemaining defaults
+	// it to Remaining (preferred==valid), never 0 (which would deprecate).
+	if got2.PreferredRemaining != got2.Remaining {
+		t.Errorf("legacy-peer truncated record must default PreferredRemaining to Remaining=%d, got %d",
+			got2.Remaining, got2.PreferredRemaining)
 	}
 }
 
@@ -290,5 +299,152 @@ func TestDHCPLeasePayload_HugeCountDoesNotOverAllocate(t *testing.T) {
 	out := decodeDHCPLeasePayload(payload)
 	if len(out) != 0 {
 		t.Errorf("huge-count empty-body frame: got %d leases, want 0", len(out))
+	}
+}
+
+// TestDHCPLease_PreferredRemaining_RoundTrip is the #5073 primary fail-on-revert.
+// A DEPRECATED DHCPv6 binding has a preferred lifetime of 0 with a still-positive
+// valid lifetime (the client must stop originating from the address but the lease
+// is not yet expired). Before #5073 the wire carried no preferred lifetime, so a
+// deprecated binding synced as PreferredRemaining==Remaining and takeover REVIVED
+// the address. The append-only trailing PreferredRemaining field carries it.
+//
+// FAIL-ON-REVERT: neutralize the encode/decode of the trailing field (drop the
+// AppendUint32 in encodeOneLease, or the guarded read in decodeOneLease) and the
+// deprecated lease decodes PreferredRemaining=Remaining(1800) via the default —
+// a revival — so the want==0 assertion goes RED.
+func TestDHCPLease_PreferredRemaining_RoundTrip(t *testing.T) {
+	in := []dhcpserver.SyncLease{
+		{ // deprecated IA_NA: preferred=0, valid=1800
+			Family: 6, Address: "2001:db8::dep", SubnetID: 2,
+			DUID: "00:01:00:0a", IAID: 3, LeaseType: "IA_NA",
+			ValidLife: 1800, Remaining: 1800, PreferredRemaining: 0,
+			Hostname: "dep", FQDNFwd: true,
+		},
+		{ // partially deprecated IA_PD: preferred < valid remaining
+			Family: 6, Address: "2001:db8:dead::", SubnetID: 2,
+			DUID: "00:01:00:0b", IAID: 4, LeaseType: "IA_PD", PrefixLen: 56,
+			ValidLife: 7200, Remaining: 6000, PreferredRemaining: 1200,
+		},
+		{ // healthy: preferred == valid remaining
+			Family: 6, Address: "2001:db8::ok", SubnetID: 2,
+			DUID: "00:01:00:0c", IAID: 5, LeaseType: "IA_NA",
+			ValidLife: 3600, Remaining: 3000, PreferredRemaining: 3000,
+		},
+	}
+	out := decodeDHCPLeasePayload(encodeDHCPLeasePayload(in))
+	if !reflect.DeepEqual(in, out) {
+		t.Fatalf("PreferredRemaining round-trip mismatch:\n in=%+v\nout=%+v", in, out)
+	}
+	if out[0].PreferredRemaining != 0 {
+		t.Errorf("deprecated binding revived: PreferredRemaining=%d, want 0 (a reverted "+
+			"trailing field defaults to Remaining=%d)", out[0].PreferredRemaining, out[0].Remaining)
+	}
+}
+
+// TestDHCPLease_BackwardCompat_AbsentPrefDefaultsRemaining is the LOAD-BEARING
+// #5073 compat guard. An OLDER peer that predates the trailing PreferredRemaining
+// field emits a record ending at the FQDN flags byte. The decoder MUST default
+// the absent field to Remaining (preferred==valid, the pre-#5073 behavior), NOT 0
+// — defaulting to 0 would wrongly deprecate every lease synced from that peer.
+//
+// The old-format record is manufactured by encoding a current record and
+// stripping the trailing 4-byte PreferredRemaining field, which is byte-exact
+// what an old peer would have put on the wire.
+//
+// FAIL-ON-REVERT: change decodeOneLease's default from `l.Remaining` to 0 and the
+// PreferredRemaining==Remaining assertion goes RED (old peers' leases deprecated).
+func TestDHCPLease_BackwardCompat_AbsentPrefDefaultsRemaining(t *testing.T) {
+	l := dhcpserver.SyncLease{
+		Family: 6, Address: "2001:db8::old", SubnetID: 2,
+		DUID: "00:01:00:0d", IAID: 6, LeaseType: "IA_NA",
+		ValidLife: 1800, Remaining: 1500, PreferredRemaining: 1500,
+		Hostname: "oldpeer", FQDNRev: true,
+	}
+	rec, err := encodeOneLease(l)
+	if err != nil {
+		t.Fatalf("encodeOneLease: %v", err)
+	}
+	// Strip the trailing 4-byte PreferredRemaining → an exact old-format record
+	// that ends at the FQDN flags byte.
+	oldRec := rec[:len(rec)-4]
+	got := decodeOneLease(oldRec)
+
+	if got.Remaining != 1500 {
+		t.Fatalf("old-format record lost Remaining: got %d, want 1500", got.Remaining)
+	}
+	if got.PreferredRemaining != got.Remaining {
+		t.Errorf("absent trailing field must default PreferredRemaining to Remaining=%d "+
+			"(preferred==valid), got %d — an old peer's leases must NOT be deprecated",
+			got.Remaining, got.PreferredRemaining)
+	}
+	// The FQDN flags byte (the old last field) must still decode.
+	if !got.FQDNRev || got.FQDNFwd {
+		t.Errorf("old-format record mis-decoded FQDN flags: fwd=%v rev=%v", got.FQDNFwd, got.FQDNRev)
+	}
+}
+
+// TestDHCPLease_FramingSkipsNewerLongerRecord confirms the per-record recLen
+// framing lets an older decoder step past a NEWER peer's longer record (the one
+// carrying the extra trailing PreferredRemaining) and still decode the record
+// that follows it. This is the #5073 mixed-version safety the append-only field
+// relies on: encodeDHCPLeasePayload writes each record with its own length
+// prefix, and decodeDHCPLeasePayload advances off += recLen regardless of how
+// many trailing fields decodeOneLease actually read.
+func TestDHCPLease_FramingSkipsNewerLongerRecord(t *testing.T) {
+	first := dhcpserver.SyncLease{
+		Family: 6, Address: "2001:db8::1", SubnetID: 2,
+		DUID: "00:01:00:01", IAID: 1, LeaseType: "IA_NA",
+		ValidLife: 1800, Remaining: 1500, PreferredRemaining: 0, // deprecated → longest-meaning trailing field
+		Hostname: "first",
+	}
+	second := dhcpserver.SyncLease{
+		Family: 4, Address: "10.0.0.2", SubnetID: 1,
+		HWAddress: "aa:bb", ValidLife: 600, Remaining: 500, PreferredRemaining: 500,
+		Hostname: "second",
+	}
+	out := decodeDHCPLeasePayload(encodeDHCPLeasePayload([]dhcpserver.SyncLease{first, second}))
+	if len(out) != 2 {
+		t.Fatalf("got %d leases, want 2 (recLen framing must step past the longer first record)", len(out))
+	}
+	if !reflect.DeepEqual(out[1], second) {
+		t.Errorf("record after a longer newer record mis-decoded:\n got=%+v\nwant=%+v", out[1], second)
+	}
+}
+
+// TestPeerDHCPLeasesAged_PreferredRemaining extends the #4871 aging guard to the
+// #5073 preferred lifetime: a held lease's PreferredRemaining counts down in the
+// same real time as Remaining, so standby residence must age BOTH. A deprecated
+// lease (PreferredRemaining=0) stays deprecated; a healthy lease's preferred ages
+// in lock-step and never exceeds the aged Remaining.
+//
+// FAIL-ON-REVERT: drop the PreferredRemaining aging in peerDHCPLeasesAged and the
+// healthy lease keeps PreferredRemaining=600 while Remaining ages to 500 —
+// violating PreferredRemaining<=Remaining — so the ==500 assertion goes RED.
+func TestPeerDHCPLeasesAged_PreferredRemaining(t *testing.T) {
+	s := &SessionSync{}
+	now := time.Unix(1_700_000_000, 0)
+	recvAt := now.Add(-100 * time.Second) // 100s residence
+	s.peerDHCPLeases6 = []dhcpserver.SyncLease{
+		{Family: 6, Address: "2001:db8::a", Remaining: 600, PreferredRemaining: 600}, // healthy
+		{Family: 6, Address: "2001:db8::b", Remaining: 600, PreferredRemaining: 0},   // deprecated
+	}
+	s.peerDHCPLeases6RecvAt = recvAt
+
+	got := s.peerDHCPLeasesAged(6, now)
+	if len(got) != 2 {
+		t.Fatalf("aged set: got %d leases, want 2: %+v", len(got), got)
+	}
+	byAddr := map[string]dhcpserver.SyncLease{}
+	for _, l := range got {
+		byAddr[l.Address] = l
+	}
+	if h := byAddr["2001:db8::a"]; h.Remaining != 500 || h.PreferredRemaining != 500 {
+		t.Errorf("healthy lease aging: Remaining=%d PreferredRemaining=%d, want 500/500",
+			h.Remaining, h.PreferredRemaining)
+	}
+	if d := byAddr["2001:db8::b"]; d.Remaining != 500 || d.PreferredRemaining != 0 {
+		t.Errorf("deprecated lease aging: Remaining=%d PreferredRemaining=%d, want 500/0 "+
+			"(must stay deprecated, never revived)", d.Remaining, d.PreferredRemaining)
 	}
 }

@@ -654,10 +654,14 @@ func decodeConfigPayload(payload []byte) (configText string, gen uint64) {
 // length-prefixed lease records. Each record is itself length-gated so the
 // schema can grow: a decoder reads only the fields the inner length covers,
 // tolerating a longer record from a newer peer (trailing fields ignored) and a
-// shorter record from an older peer (absent fields default to zero) — the same
-// length-gated-trailing-field discipline as #2170 sessions. The lease wire
-// carries REMAINING LIFETIME (not absolute expiry) so the receiver re-anchors
-// to its local clock at seed (the #2239 clock invariant).
+// shorter record from an older peer (absent fields default to zero, EXCEPT the
+// #5073 PreferredRemaining trailing field which defaults to Remaining so an
+// older peer's lease is not wrongly deprecated) — the same length-gated-
+// trailing-field discipline as #2170 sessions. The lease wire carries REMAINING
+// LIFETIME (not absolute expiry) so the receiver re-anchors to its local clock
+// at seed (the #2239 clock invariant). The trailing field order is, after the
+// FQDN flags byte: PreferredRemaining (uint32 LE, #5073). Adding a field here is
+// append-only and does NOT bump SessionSyncWireVersion.
 
 // putLeaseString appends a uint16-length-prefixed string. It FAILS CLOSED when
 // s exceeds the uint16 wire prefix (math.MaxUint16 = 65535 bytes): the prefix
@@ -737,6 +741,13 @@ func encodeOneLease(l dhcpserver.SyncLease) ([]byte, error) {
 		flags |= 0x02
 	}
 	b = append(b, flags)
+	// #5073 APPEND-ONLY trailing field: PreferredRemaining (seconds of preferred
+	// lifetime left). It MUST stay last so an older decoder (whose record ends at
+	// the FQDN flags byte) simply ignores it, and a newer decoder defaults it to
+	// Remaining when an older sender omits it (see decodeOneLease). This is a
+	// length-gated trailing field like the #3931 config-gen — it does NOT bump
+	// SessionSyncWireVersion.
+	b = binary.LittleEndian.AppendUint32(b, uint32(l.PreferredRemaining))
 	return b, nil
 }
 
@@ -771,6 +782,14 @@ func decodeOneLease(buf []byte) dhcpserver.SyncLease {
 	}
 	l.Remaining = int(binary.LittleEndian.Uint32(buf[off:]))
 	off += 4
+	// #5073: default PreferredRemaining to the valid Remaining (preferred==valid,
+	// the pre-#5073 behavior). This is LOAD-BEARING and set BEFORE any later
+	// early-return: an OLDER peer's record ends at the FQDN flags byte with NO
+	// trailing PreferredRemaining, and defaulting to Remaining (NOT 0) avoids
+	// wrongly deprecating every lease synced from that peer. The trailing-field
+	// read at the tail overrides this only when a newer sender actually supplied
+	// the field.
+	l.PreferredRemaining = l.Remaining
 	if off >= len(buf) {
 		return l
 	}
@@ -805,6 +824,15 @@ func decodeOneLease(buf []byte) dhcpserver.SyncLease {
 		flags := buf[off]
 		l.FQDNFwd = flags&0x01 != 0
 		l.FQDNRev = flags&0x02 != 0
+		off++ // advance past flags so the #5073 trailing field can follow
+	}
+	// #5073 append-only trailing field. PRESENT (a newer peer) → read it;
+	// ABSENT (an older peer whose record stopped at the FQDN flags byte) → leave
+	// the preferred==valid default set above. Guarded by remaining length so a
+	// truncated tail never over-reads.
+	if off+4 <= len(buf) {
+		l.PreferredRemaining = int(binary.LittleEndian.Uint32(buf[off:]))
+		off += 4
 	}
 	return l
 }

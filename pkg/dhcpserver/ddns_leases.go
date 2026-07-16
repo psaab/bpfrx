@@ -102,6 +102,17 @@ type ddnsLease struct {
 	LeaseType   int  // Kea numeric lease_type: 0=IA_NA, 1=IA_TA, 2=IA_PD
 	LeaseTypeOK bool // false ⇒ lease_type column present but unparseable
 	PrefixLen   int  // v6 IA_PD delegated prefix length (0 when absent)
+
+	// #5073: the v6 memfile carries DISTINCT valid_lifetime and pref_lifetime
+	// columns. The lease-sync memfile fallback (readSyncLeasesViaMemfile) needs
+	// both to recover a clock-skew-safe preferred remaining independent of the
+	// valid remaining, so a DEPRECATED binding (pref_lifetime=0) is not revived
+	// on takeover. Both are OPTIONAL columns (not in requiredLeaseColumns): an
+	// old memfile or a v4 file leaves them 0 with PrefLifetimeOK=false, and the
+	// sync path then defaults preferred==valid. The DDNS reconciler ignores both.
+	ValidLifetime  int  // memfile valid_lifetime column (seconds), 0 if absent
+	PrefLifetime   int  // memfile pref_lifetime column (seconds), 0 if absent
+	PrefLifetimeOK bool // true ⇒ pref_lifetime column present AND parseable
 }
 
 // Kea memfile lease_type column values (v6 only).
@@ -421,6 +432,22 @@ func parseActiveLeasesFileInto(path string, family int, now time.Time, acc *ddns
 			if pl := get(fields, "prefix_len"); pl != "" {
 				if v, e := strconv.Atoi(strings.TrimSpace(pl)); e == nil {
 					l.PrefixLen = v
+				}
+			}
+			// #5073: recover valid_lifetime + pref_lifetime so the lease-sync
+			// memfile fallback can derive a preferred remaining that does NOT
+			// revive a deprecated (pref_lifetime=0) binding on takeover. Both
+			// columns are OPTIONAL; an absent/unparseable pref_lifetime leaves
+			// PrefLifetimeOK false so the sync path defaults preferred==valid.
+			if vl := get(fields, "valid_lifetime"); vl != "" {
+				if v, e := strconv.Atoi(strings.TrimSpace(vl)); e == nil {
+					l.ValidLifetime = v
+				}
+			}
+			if pf := get(fields, "pref_lifetime"); pf != "" {
+				if v, e := strconv.Atoi(strings.TrimSpace(pf)); e == nil {
+					l.PrefLifetime = v
+					l.PrefLifetimeOK = true
 				}
 			}
 		} else {
