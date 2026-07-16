@@ -248,6 +248,40 @@ no change in those packages:
   live backend withdraws it for real. `reconcileOnceLocked` / `withdrawAllLocked`
   swallow the sentinel so a legitimate disabled-with-no-backend pass is not
   marked failed. Mirrors the Surface A `withdrawOwnedLocked` precedent.
+- **Surface B backend/update-server change is a TRANSITION (#5814)** — the
+  DHCP-lease reconciler used to define "settled" by DNS CONTENT alone
+  (`recordsEqual`: FQDN/type/address/PTR/TTL), so changing the `update-server`
+  (or the TSIG key/algorithm, or the source/interface/routing-instance transport
+  bind) while the lease + record were otherwise unchanged marked every owned
+  record settled: NO publish went to the new server and the OLD server's record
+  was left live forever. The fix stamps a NON-SECRET endpoint fingerprint
+  (`dhcpBackendFingerprint` — the Surface B analogue of `backendFingerprint`,
+  excluding `TSIGSecret`) onto every owned record and folds a
+  `backendChangedForOwned` check into the settled shortcut, so an endpoint change
+  forces the delete-old-then-add-new transition. Crucially, the OLD-endpoint
+  withdraw is routed through the PREVIOUS-cycle live backend for THAT family
+  (`reconcileEnv.prevUpdater`, seeded from `Manager.lastLiveUpdater`), NOT the
+  newly-resolved one — a delete sent to the new server would no-op and, on a
+  "successful" no-op, would falsely drop ownership and orphan the old server's
+  record. The anchor is PER FAMILY so a v4 endpoint change never routes v6
+  cleanup through v4's backend (#2663 independence). The retained anchor is only
+  trusted to withdraw a record when its IDENTITY proves it: a fingerprint kept in
+  lockstep (`Manager.lastLiveFP` → `reconcileEnv.prevFP`) must equal the record's
+  stored `BackendFingerprint`. This closes the POST-RESTART trap (the #5814
+  review): after a restart the anchor is nil for one cycle (correctly orphaned),
+  but the FIRST post-restart cycle RE-SEEDS it to the NEW endpoint, so a naive
+  non-nil check would find a live anchor pointing at the WRONG server and misroute
+  the old-endpoint record's delete through it — orphaning the old server's record,
+  dropping ownership, and freezing the alarm at 1. With the identity gate a
+  mismatched anchor is treated as unreachable. When the OLD endpoint is not
+  reachable in-process (anchor nil OR identity mismatch), ownership is KEPT with
+  the old fingerprint (never a wrong-endpoint delete, never a republish that would
+  clobber the old cleanup key), `orphanedBackendChange` is counted EVERY cycle the
+  mismatch persists (never frozen), and a loud `slog.Warn` + a `show services
+  dynamic-dns` ALARM surface the cleanup-required state — mirroring the Surface A
+  #3735 deferred-withdrawal posture. Fail-on-revert:
+  `backend_change_5814_test.go` (in-process A→B, per-family, unreachable-orphan,
+  and the post-restart re-seeded-anchor misroute).
 - **Route 53 already-gone DELETE is idempotent (#2771)** — `backend_route53.go`
   `DeleteLease` treats a Route 53 DELETE of an already-absent record as success
   (nil), mirroring the rfc2136 backend's NXRRSET/NXDOMAIN handling

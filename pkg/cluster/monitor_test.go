@@ -804,7 +804,7 @@ func TestProbeICMP_ReplyValidation(t *testing.T) {
 			mon := &Monitor{
 				icmpDialer: func(network string) (icmpConn, error) { return mc, nil },
 			}
-			if got := mon.probeICMP(tc.target); got != tc.want {
+			if got, _ := mon.probeICMP(context.Background(), tc.target); got != tc.want {
 				t.Errorf("probeICMP(%s) = %v, want %v", tc.target, got, tc.want)
 			}
 		})
@@ -819,7 +819,7 @@ func TestProbeICMP_StaleSequenceAcrossProbes(t *testing.T) {
 	mon := &Monitor{
 		icmpDialer: func(network string) (icmpConn, error) { return first, nil },
 	}
-	if !mon.probeICMP("10.0.1.1") {
+	if r, _ := mon.probeICMP(context.Background(), "10.0.1.1"); !r {
 		t.Fatal("first probe should succeed")
 	}
 
@@ -828,7 +828,7 @@ func TestProbeICMP_StaleSequenceAcrossProbes(t *testing.T) {
 	// stamped a fresh sequence.
 	replay := &mockICMPConn{reachable: true, localPort: 45502, badSeq: &first.lastSeq}
 	mon.icmpDialer = func(network string) (icmpConn, error) { return replay, nil }
-	if mon.probeICMP("10.0.1.1") {
+	if r, _ := mon.probeICMP(context.Background(), "10.0.1.1"); r {
 		t.Error("probe accepted a reply carrying the previous probe's sequence")
 	}
 }

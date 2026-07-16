@@ -168,7 +168,19 @@ the userspace dataplane admission boundary is in
   matched identifier is that port (per-probe unique), not a fixed constant;
   the sequence is stamped per probe. A reply failing any check is ignored, so
   a stray or spoofed echo reply cannot mask a genuinely down path and
-  suppress the intended failover (#4156). `pkg/cluster/monitor.go`.
+  suppress the intended failover (#4156). Each poll probes a per-cycle
+  immutable snapshot of every target (across all RGs) **concurrently** through
+  a bounded worker pool (`ipProbeConcurrency`) under an overall cycle deadline,
+  then applies the results **serially in stable RG/target order** — so a sweep
+  of N unreachable targets completes in roughly one probe deadline per
+  `ipProbeConcurrency` targets instead of N × the 800 ms per-socket deadline
+  (an all-down 64-target sweep no longer blocks ~51 s, starving later RGs and
+  delaying failover detection). The failover decision + weight accumulation is
+  byte-identical to the old serial path; only the probe I/O is parallelized.
+  `Stop()` cancels in-flight probe sockets so shutdown does not wait out a
+  sweep, and a cycle that exceeds its deadline records
+  `IPMonitorCycleOverruns` and defers (never fails) its unfinished targets
+  (#5301). `pkg/cluster/monitor.go`.
 - **Bondless RETH**: VRRP on physical member interfaces, per-node virtual
   MAC (`02:bf:72:CC:RR:NN`), no Linux bonding required.
 - **Session sync**: incremental 1s sweep + ring buffer + GC delete

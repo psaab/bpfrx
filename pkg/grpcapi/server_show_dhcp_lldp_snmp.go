@@ -254,6 +254,15 @@ func (s *Server) showDHCPDynamicDNS(cfg *config.Config, buf *strings.Builder, de
 		fmt.Fprintf(buf, "\n  ALARM: DDNS DEGRADED (fail-closed) — %s\n", st.DegradedReason)
 		buf.WriteString("    Publishing and withdrawals are SUSPENDED until the ownership state is resolved.\n")
 	}
+	if st.OrphanedBackendChange > 0 {
+		// #5814: an update-server/TSIG-key change was detected while the old
+		// endpoint was unreachable in-process; ownership is retained but the old
+		// server may hold a stale record until an operator resolves it.
+		fmt.Fprintf(buf, "\n  ALARM: %d record(s) pending backend-change cleanup — the update-server\n",
+			st.OrphanedBackendChange)
+		buf.WriteString("    changed while the old endpoint was unreachable; the old server may hold a\n")
+		buf.WriteString("    stale record. Ownership is retained (never deleted at the wrong endpoint).\n")
+	}
 	buf.WriteString("\n  Counters:\n")
 	fmt.Fprintf(buf, "    Upserts:    ok=%d fail=%d\n", st.UpsertOK, st.UpsertFail)
 	fmt.Fprintf(buf, "    Deletes:    ok=%d fail=%d\n", st.DeleteOK, st.DeleteFail)

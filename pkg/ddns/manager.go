@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -259,6 +261,13 @@ type Stats struct {
 	// records are half-published right now" gauge an operator watches for
 	// recovery. Surfaced in `show ... dynamic-dns` and Prometheus.
 	PTRPendingNow int
+	// OrphanedBackendChange counts owned records whose backend/update-server
+	// identity changed while the OLD endpoint was unreachable in-process (a daemon
+	// restart lost the anchor), so the record could NOT be withdrawn through the
+	// endpoint that published it (#5814). Ownership is KEPT and the record is never
+	// deleted at the wrong endpoint; a non-zero value means DNS may be stale on the
+	// old server and needs operator attention (mirrors the Surface A #3735 alarm).
+	OrphanedBackendChange uint64
 	// ReconcileOK / ReconcileFail count whole reconcile passes by outcome
 	// (a pass is "fail" when at least one record op errored this cycle).
 	ReconcileOK    uint64
@@ -287,6 +296,33 @@ type Manager struct {
 	mu      sync.Mutex
 	state   *ddnsState
 	updater DNSUpdater
+
+	// lastLiveUpdater retains the PREVIOUS reconcile's resolved LIVE backend per
+	// family (#5814): [0]=v4, [1]=v6. On an IN-PROCESS backend-identity change
+	// (update-server / zone / TSIG-key edit) the reconciler withdraws records that
+	// were published through the OLD endpoint via this retained updater BEFORE
+	// republishing on the newly-resolved one — so a server swap neither orphans
+	// the old endpoint's record nor deletes at the wrong (new) endpoint. Kept per
+	// family so a v4 change never routes v6 cleanup through v4's backend (#2663
+	// independence). NOT persisted: an in-process anchor only. Across a daemon
+	// restart it is nil, so the fingerprint-mismatch path keeps ownership + alarms
+	// rather than deleting at the wrong endpoint (the Surface A #3735 posture).
+	// Only advanced on the resolve-per-Reconcile path (newUpdater != nil); a
+	// fixed-updater test never populates it. Guarded by mu.
+	lastLiveUpdater [2]DNSUpdater
+
+	// lastLiveFP is the ENDPOINT FINGERPRINT of the backend held in
+	// lastLiveUpdater, advanced in LOCKSTEP with it (#5814). It is the load-
+	// bearing guard against a WRONG-endpoint withdraw after a daemon restart: the
+	// anchor updater alone is not enough, because after a restart the anchor is
+	// re-seeded to the NEW backend on the first post-restart cycle, so a later
+	// cycle would find a non-nil anchor that points at the NEW endpoint and could
+	// misroute a delete for an OLD-endpoint record through it. The transition path
+	// therefore withdraws through lastLiveUpdater ONLY when this fingerprint equals
+	// the owned record's stored fingerprint — i.e. the anchor is PROVABLY the
+	// endpoint that published the record. A mismatch (or an empty anchor) routes to
+	// the keep-ownership + alarm orphan branch instead. Per family; guarded by mu.
+	lastLiveFP [2]string
 
 	// degraded fails the manager CLOSED when the ownership state file could not
 	// be loaded (#2650): corrupt JSON, an unsupported/future version, or an
@@ -370,8 +406,18 @@ type Manager struct {
 	skippedPTRNotAuth atomic.Uint64 // reverse-zone PTR skipped (NOTAUTH/REFUSED)
 	skippedConflict   atomic.Uint64 // add skipped: exact RR already exists
 	ptrDeferred       atomic.Uint64 // forward published, PTR add failed (retry next cycle)
-	reconcileOK       atomic.Uint64 // reconcile passes with no record-op error
-	reconcileFail     atomic.Uint64 // reconcile passes with >=1 record-op error
+	// orphanedBackendChange counts owned records whose backend/update-server
+	// identity changed but whose OLD endpoint is not reachable in-process (a
+	// daemon restart lost the in-process anchor), so the record could NOT be
+	// withdrawn through the endpoint that published it (#5814). Ownership is KEPT
+	// (with the old fingerprint) so cleanup authority survives and the record is
+	// never deleted at the wrong endpoint; the reconciler does not republish that
+	// exact tuple onto the new endpoint (which would overwrite the ownership key
+	// and destroy the old cleanup key). A non-zero value means DNS may be stale on
+	// the old server and needs operator attention (mirrors Surface A #3735).
+	orphanedBackendChange atomic.Uint64
+	reconcileOK           atomic.Uint64 // reconcile passes with no record-op error
+	reconcileFail         atomic.Uint64 // reconcile passes with >=1 record-op error
 
 	lastReconcile  atomic.Int64 // unix nanos
 	lastReconcileN atomic.Int64
@@ -607,6 +653,37 @@ type reconcileEnv struct {
 	// force-now). It relaxes only the change-detection skip in Pass 1; the per-RG
 	// HA writer gate still governs which scopes may be published.
 	force bool
+	// backendFP is each family's CURRENT backend/update-server ENDPOINT identity
+	// fingerprint (#5814): a non-secret hash of the resolved rfc2136 endpoint
+	// (backend type + update-server + TSIG key name/algorithm + transport bind).
+	// It is STAMPED onto every desired ownedRecord published this pass and
+	// COMPARED against a record's stored fingerprint so an in-process
+	// update-server / zone / TSIG-key change is DETECTED (the content-only
+	// recordsEqual shortcut cannot see it). Empty ("") when the family has no live
+	// endpoint (disabled / no update-server / non-rfc2136 backend) or when the
+	// backend is not resolve-per-Reconcile (a fixed-updater test) — an empty
+	// fingerprint on EITHER side is treated as "cannot prove a change", never a
+	// false transition. Only populated on the resolve-per-Reconcile path
+	// (m.newUpdater != nil), so a fixed-updater test never transitions.
+	backendFP [2]string
+	// prevUpdater is each family's PREVIOUS-cycle live backend (#5814), retained
+	// so a detected endpoint change withdraws the OLD-endpoint record through the
+	// backend that PUBLISHED it — never the newly-resolved one (a delete sent to
+	// the new server no-ops at best and, on a "successful" no-op, would falsely
+	// drop ownership and orphan the record on the old server forever). Per family
+	// so a v4 endpoint change never routes v6 cleanup through v4's backend (#2663
+	// independence, #5814 design pt 7). Nil ⇒ the old endpoint is not reachable
+	// in-process (first pass, or a daemon restart lost the anchor): the reconciler
+	// then KEEPS ownership + alarms rather than deleting at the wrong endpoint.
+	prevUpdater [2]DNSUpdater
+	// prevFP is the ENDPOINT FINGERPRINT of prevUpdater per family (#5814),
+	// carried in lockstep from Manager.lastLiveFP. The transition path uses
+	// prevUpdater to withdraw an old-endpoint record ONLY when prevFP equals the
+	// record's stored fingerprint — proof that prevUpdater is the SAME endpoint
+	// that published it. Without this check a post-restart cycle whose anchor was
+	// re-seeded to the NEW endpoint would misroute the withdraw through the new
+	// (wrong) server, orphaning the old server's record and dropping ownership.
+	prevFP [2]string
 }
 
 // famIdx maps an engine family int (4/6) to the [2] env slot.
@@ -619,6 +696,33 @@ func famIdx(family int) int {
 
 // updaterFor returns the resolved backend for a record's family.
 func (e *reconcileEnv) updaterFor(family int) DNSUpdater { return e.updater[famIdx(family)] }
+
+// prevUpdaterFor returns the PREVIOUS-cycle live backend for a record's family
+// (#5814), used to withdraw a record through the endpoint that published it when
+// the current endpoint identity has changed. Nil when no in-process anchor is
+// held (first pass / post-restart) — the caller must NOT fall back to the new
+// endpoint's updater.
+func (e *reconcileEnv) prevUpdaterFor(family int) DNSUpdater { return e.prevUpdater[famIdx(family)] }
+
+// backendFPFor returns a family's current endpoint fingerprint (#5814).
+func (e *reconcileEnv) backendFPFor(family int) string { return e.backendFP[famIdx(family)] }
+
+// prevFPFor returns the endpoint fingerprint of the family's previous-cycle live
+// backend (#5814) — the identity of prevUpdaterFor(family). "" when no anchor is
+// held. Compared against an owned record's stored fingerprint to prove the anchor
+// is the endpoint that published it before withdrawing through it.
+func (e *reconcileEnv) prevFPFor(family int) string { return e.prevFP[famIdx(family)] }
+
+// backendChangedForOwned reports whether an owned record was published through a
+// DIFFERENT backend endpoint than the one now resolved for its family (#5814): a
+// server / zone / TSIG-key change. BOTH fingerprints must be non-empty to prove a
+// mismatch — an unknown fingerprint (a pre-#5814 store, a disabled family, or a
+// fixed-updater test) is compared as "cannot determine a change" and never
+// triggers a false transition.
+func (e *reconcileEnv) backendChangedForOwned(owned ownedRecord) bool {
+	cur := e.backendFPFor(owned.Family)
+	return owned.BackendFingerprint != "" && cur != "" && owned.BackendFingerprint != cur
+}
 
 // polFor returns the resolved policy for a family.
 func (e *reconcileEnv) polFor(family int) ddnsPolicy { return e.pol[famIdx(family)] }
@@ -743,6 +847,22 @@ func (m *Manager) ReconcileScoped(ctx context.Context, cfg *config.DHCPServerCon
 	// error (bad TSIG / unusable policy) for one family falls back to that
 	// family's no-op WITHOUT affecting the other family — independence (#2663).
 	if m.newUpdater != nil {
+		// #5814: this family's CURRENT endpoint identity fingerprint (stamped onto
+		// every record published this pass) + the PREVIOUS cycle's per-family live
+		// backend (to withdraw an old-endpoint record through the backend that
+		// published it). Computed from the operator config BEFORE resolveFamily-
+		// Updater runs (the production factory may rewrite c.UpdateServer to a lab
+		// address; the fingerprint tracks the committed identity, not the dialed
+		// one). Copy the anchor array (value semantics) before it is advanced below.
+		env.backendFP[0] = dhcpBackendFingerprint(pol4, ddns4)
+		env.backendFP[1] = dhcpBackendFingerprint(pol6, ddns6)
+		env.prevUpdater = m.lastLiveUpdater
+		// Carry the anchor's IDENTITY too (#5814): the transition path withdraws
+		// through prevUpdater only when its fingerprint proves it is the endpoint
+		// that published the owned record — otherwise (e.g. a post-restart anchor
+		// re-seeded to the NEW endpoint) it orphans + alarms instead of misrouting.
+		env.prevFP = m.lastLiveFP
+
 		env.updater[0] = m.resolveFamilyUpdater(pol4, ddns4)
 		env.updater[1] = m.resolveFamilyUpdater(pol6, ddns6)
 		// Keep the LIVE-updater-for-withdraw guard, now per family: if a family
@@ -764,6 +884,24 @@ func (m *Manager) ReconcileScoped(ctx context.Context, cfg *config.DHCPServerCon
 			m.updater = env.updater[0]
 		} else if !isNopUpdater(env.updater[1]) {
 			m.updater = env.updater[1]
+		}
+		// #5814: advance the PER-FAMILY live-backend anchor + its fingerprint for
+		// NEXT cycle's endpoint-change detection, in LOCKSTEP. Per family (not the
+		// single m.updater) so a v6 endpoint change never withdraws through v4's
+		// backend — the independence design pt 7 flags. A nop cycle PRESERVES both
+		// so a transient factory error (or a one-cycle disable) does not erase the
+		// anchor and misclassify the next live cycle as unreachable. Storing the
+		// fingerprint ALONGSIDE the updater is what lets the transition path prove a
+		// retained anchor is genuinely the endpoint that published a given record
+		// (owned.BackendFingerprint == prevFP) before withdrawing through it —
+		// closing the post-restart wrong-endpoint-delete gap.
+		if !isNopUpdater(env.updater[0]) {
+			m.lastLiveUpdater[0] = env.updater[0]
+			m.lastLiveFP[0] = env.backendFP[0]
+		}
+		if !isNopUpdater(env.updater[1]) {
+			m.lastLiveUpdater[1] = env.updater[1]
+			m.lastLiveFP[1] = env.backendFP[1]
 		}
 	}
 
@@ -1038,6 +1176,11 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, le
 			TTL:         rec.TTL,
 			OwnerID:     m.ownerWatermark(identity, l.Address),
 			ClientID:    l.Identity,
+			// #5814: stamp the CURRENT endpoint identity so a later reconcile can
+			// detect an update-server / TSIG-key change and withdraw the old
+			// endpoint's record through the backend that published it. Empty on the
+			// fixed-updater path (env.backendFP unset) — no transition ever fires.
+			BackendFingerprint: env.backendFPFor(l.Family),
 		}.withScope(scope)
 		want[ownedRecordKey(scope, identity, l.Address)] = &desired{rec: rec, ow: ow}
 	}
@@ -1056,7 +1199,14 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, le
 	for _, owned := range m.state.all() {
 		key := ownedRecordKey(owned.scopeOf(), owned.Identity, owned.Address)
 		d, stillWanted := want[key]
-		if stillWanted && recordsEqual(owned, d.ow) {
+		// #5814: the content-only recordsEqual shortcut MUST NOT settle a record
+		// whose backend/update-server ENDPOINT changed — the DNS tuple is identical
+		// but it now lives on the WRONG server. backendChangedForOwned forces the
+		// fall-through to the transition path below (withdraw at the old endpoint,
+		// republish at the new one). An unknown fingerprint on either side (pre-#5814
+		// store, disabled family, fixed-updater test) reports "no change", so the
+		// existing efficiency skip is preserved for every non-transition record.
+		if stillWanted && recordsEqual(owned, d.ow) && !env.backendChangedForOwned(owned) {
 			// The published forward/reverse tuple is unchanged. If the owned
 			// record still owes its reverse PTR (#2661 partial success), leave it
 			// owned (do NOT delete the live forward) but do NOT mark it settled —
@@ -1123,7 +1273,53 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, le
 		// Owned but not wanted (expired/released) OR wanted differently
 		// (the desired pass below re-adds the new form). Delete only the
 		// EXACT owned tuple — never anything not in the store.
-		if err := m.deleteOwnedLocked(ctx, env.updaterFor(owned.Family), owned); err != nil {
+		delUpdater := env.updaterFor(owned.Family)
+		if env.backendChangedForOwned(owned) {
+			// #5814: this record was published at a DIFFERENT endpoint than the one
+			// now resolved for its family (an update-server / zone / TSIG-key
+			// change). It MUST be withdrawn THROUGH the OLD endpoint — a delete sent
+			// to the newly-resolved server no-ops at best and, on a "successful"
+			// no-op, would falsely drop ownership and orphan the record on the old
+			// server forever. Route the withdraw through the retained previous-cycle
+			// backend for THIS family — but ONLY when its fingerprint PROVES it is
+			// the endpoint that published this record; Pass 2 publishes the new form
+			// on the new endpoint (delete-old-then-add-new).
+			prev := env.prevUpdaterFor(owned.Family)
+			if prev == nil || isNopUpdater(prev) || env.prevFPFor(owned.Family) != owned.BackendFingerprint {
+				// The OLD endpoint is not reachable in-process, OR the retained
+				// anchor is NOT the endpoint that published this record. The latter
+				// is the post-restart trap (#5814 review): after a restart the anchor
+				// is nil for one cycle (this branch, correctly), then the first
+				// post-restart cycle re-seeds it to the NEW endpoint — so a naive
+				// non-nil check would find a live anchor pointing at the WRONG server
+				// and delete the old-endpoint record through it, orphaning the old
+				// server's record and dropping ownership. The prevFP==owned
+				// fingerprint gate blocks that: unless the anchor's identity matches
+				// the record's, we treat the old endpoint as unreachable. Deleting at
+				// the wrong endpoint or overwriting ownership would destroy the old
+				// cleanup key and orphan the record with no authority to clean it.
+				// KEEP ownership (with the old fingerprint), raise the alarm EVERY
+				// cycle the mismatch persists (a cumulative counter — operators keep
+				// seeing it, it never freezes), and do NOT republish this exact tuple
+				// on the new endpoint this pass (that overwrite would clobber the old
+				// fingerprint). A later reconcile with the old backend reachable, or
+				// operator action, resolves it. Mirrors Surface A's deferred-
+				// withdrawal posture on a lost old endpoint (#3735).
+				m.orphanedBackendChange.Add(1)
+				slog.Warn("ddns: backend/update-server identity changed but the OLD "+
+					"endpoint is not reachable in-process; keeping ownership and NOT "+
+					"deleting at the new endpoint (cleanup authority preserved; the "+
+					"record may be stale on the old server — operator attention needed)",
+					"fqdn", owned.FQDN, "address", owned.Address, "type", owned.ForwardType,
+					"family", owned.Family)
+				if stillWanted {
+					d.seen = true // do not republish the same tuple onto the new endpoint
+				}
+				continue
+			}
+			delUpdater = prev
+		}
+		if err := m.deleteOwnedLocked(ctx, delUpdater, owned); err != nil {
 			// errDDNSNoBackendToWithdraw is a "kept ownership, no backend"
 			// non-failure (#2699): the record stays owned + cleanable, but no
 			// wire op was attempted, so it must NOT fail the reconcile pass (a
@@ -1472,6 +1668,42 @@ func (m *Manager) deleteOwnedLocked(ctx context.Context, updater DNSUpdater, own
 	return nil
 }
 
+// dhcpBackendFingerprint returns a STABLE, NON-SECRET fingerprint of the
+// DHCP-lease (Surface B) rfc2136 endpoint IDENTITY for one family (#5814): the
+// backend type + update-server + TSIG key NAME/algorithm + the transport bind
+// (source address / destination interface / routing-instance). It is the Surface
+// B analogue of surface_a.go's backendFingerprint and, like it, deliberately
+// EXCLUDES every credential — TSIGSecret is a config.Secret and is NEVER hashed
+// in or written out, so persisting this on the durable ownedRecord does NOT
+// reopen the #2053 plaintext-secret-on-disk class.
+//
+// It returns "" (UNKNOWN — compared as "cannot prove a change", never a false
+// transition) whenever the family has NO live endpoint: a nil/disabled config, a
+// non-rfc2136 backend (kea-d2 is reserved-but-nop), or an empty update-server.
+// That is EXACTLY the set of conditions under which NewProductionManager's
+// factory resolves the nopUpdater, so a non-empty fingerprint corresponds
+// one-to-one with a live resolved backend — a record's stored fingerprint and the
+// per-family anchor updater that published it always agree.
+func dhcpBackendFingerprint(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig) string {
+	if c == nil || !pol.enabled || pol.backend != "rfc2136" || c.UpdateServer == "" {
+		return ""
+	}
+	// Length-prefixed, order-fixed, credential-free tuple so no pair of adjacent
+	// fields can alias across the boundary (a value cannot inject the separator).
+	var sb strings.Builder
+	writeField := func(s string) { fmt.Fprintf(&sb, "%d:%s|", len(s), s) }
+	writeField("rfc2136")              // backend type (only live Surface B backend)
+	writeField(c.UpdateServer)         // authoritative server host[:port]
+	writeField(c.TSIGKeyName)          // TSIG key NAME (identity, not the secret)
+	writeField(c.TSIGAlgorithm)        // TSIG algorithm
+	writeField(c.SourceAddress)        // transport: bound source IP
+	writeField(c.DestinationInterface) // transport: SO_BINDTODEVICE target
+	writeField(c.RoutingInstance)      // transport: VRF bind
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(sb.String()))
+	return fmt.Sprintf("fpb1-%016x", h.Sum64())
+}
+
 // recordsEqual reports whether two owned records describe the same
 // published DNS state (name + type + address + ttl). Identity/subnet
 // metadata changes alone do not require a DNS re-write.
@@ -1536,24 +1768,25 @@ func (m *Manager) Stats() Stats {
 	m.mu.Unlock()
 
 	st := Stats{
-		Degraded:          degraded,
-		DegradedReason:    degradedReason,
-		UpsertOK:          m.upsertOK.Load(),
-		UpsertFail:        m.upsertFail.Load(),
-		DeleteOK:          m.deleteOK.Load(),
-		DeleteFail:        m.deleteFail.Load(),
-		DeleteCoowned:     m.deleteCoowned.Load(),
-		SkippedNoName:     m.skippedNoName.Load(),
-		SkippedNonAddress: m.skippedNonAddress.Load(),
-		SkippedNoBackend:  m.skippedNoBackend.Load(),
-		SkippedPTRNotAuth: m.skippedPTRNotAuth.Load(),
-		SkippedConflict:   m.skippedConflict.Load(),
-		PTRDeferred:       m.ptrDeferred.Load(),
-		PTRPendingNow:     pendingNow,
-		ReconcileOK:       m.reconcileOK.Load(),
-		ReconcileFail:     m.reconcileFail.Load(),
-		OwnedRecords:      n,
-		LastReconcileN:    int(m.lastReconcileN.Load()),
+		Degraded:              degraded,
+		DegradedReason:        degradedReason,
+		UpsertOK:              m.upsertOK.Load(),
+		UpsertFail:            m.upsertFail.Load(),
+		DeleteOK:              m.deleteOK.Load(),
+		DeleteFail:            m.deleteFail.Load(),
+		DeleteCoowned:         m.deleteCoowned.Load(),
+		SkippedNoName:         m.skippedNoName.Load(),
+		SkippedNonAddress:     m.skippedNonAddress.Load(),
+		SkippedNoBackend:      m.skippedNoBackend.Load(),
+		SkippedPTRNotAuth:     m.skippedPTRNotAuth.Load(),
+		SkippedConflict:       m.skippedConflict.Load(),
+		PTRDeferred:           m.ptrDeferred.Load(),
+		PTRPendingNow:         pendingNow,
+		OrphanedBackendChange: m.orphanedBackendChange.Load(),
+		ReconcileOK:           m.reconcileOK.Load(),
+		ReconcileFail:         m.reconcileFail.Load(),
+		OwnedRecords:          n,
+		LastReconcileN:        int(m.lastReconcileN.Load()),
 	}
 	if ns := m.lastReconcile.Load(); ns > 0 {
 		st.LastReconcile = time.Unix(0, ns)

@@ -299,9 +299,27 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 		// so the commit fails closed rather than reporting that host-inbound was
 		// relaxed when it was not.
 		if out, err := nftDeleteTable("inet", "xpf_hostinbound"); err != nil {
+			// Teardown FAILED: a stale xpf_hostinbound table may still be installed
+			// in the kernel. Surface the failure (fail closed) and — critically — do
+			// NOT clear hostInboundEnforced: the flag's meaning ("a real load or
+			// address-scoped fallback established a protecting table") may still hold
+			// for the table this delete could not remove, so a later failed install
+			// must keep retaining it rather than fencing over a live table (#5790).
 			slog.Warn("failed to delete stale host-inbound filter table", "err", err, "output", string(out))
 			return fmt.Errorf("delete stale host-inbound nftables table: %w", err)
 		}
+		// Teardown SUCCEEDED: no xpf_hostinbound table is installed now. Clear the
+		// historical gate (#5790). hostInboundEnforced means "a successful real load
+		// or address-scoped fallback established a protecting table"; with the table
+		// gone that is no longer true. Leaving it sticky-true is FAIL-OPEN: if a
+		// later generation becomes enforceable and its FIRST real load fails, the
+		// stale true would take the day-2 retention branch — which assumes a retained
+		// table still protects the addresses — and SKIP the cold-boot/fresh-install
+		// fence, leaving newly reachable local addresses unprotected. Publishing
+		// false here routes that failure through the !hostInboundEnforced fence path
+		// (fail closed) instead. Serialized under applySem with the Store(true) sites
+		// and every later apply, so this cannot race a subsequent install.
+		d.hostInboundEnforced.Store(false)
 		return nil
 	}
 	// #5582: the configured WireGuard listen port(s). The XDP shim steers
