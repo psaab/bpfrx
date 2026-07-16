@@ -36,6 +36,47 @@
   pkg/daemon/host_inbound_conntrack_flush_5566_test.go (new),
   pkg/daemon/daemon_nft.go, docs/host-inbound-service-matrix.md, _Log.md
 
+## 2026-07-16 — #5151 (filter): FilterResult.forwarding_class → Option<Arc<str>> (zero-alloc warmed-packet-path default)
+- **Timestamp**: 2026-07-16 (fix/5151-filterresult-option-fc)
+- **Action**: Fix #5151 (perf, zero-allocation warmed-packet-path invariant).
+  STEP-0 confirmed live on origin/master 8a769005f: `impl Default for
+  FilterResult` set `forwarding_class: Arc::<str>::from("")`, which allocates
+  an Arc header/data block on EVERY `FilterResult::default()`. That default is
+  the accumulator init for the full v4/v6/lo0 filter evaluators
+  (`evaluate_filter_ref_counted_v{4,6}`, etc.), so every full filter eval on the
+  packet path (session-miss / cache-sensitive) paid an empty-Arc allocation.
+  TxSelectionFilterResult and CachedTxSelectionFilterResult already use
+  `Option<Arc<str>> = None` — FilterResult was the inconsistent hold-out.
+  Fix (surgical, mirrors the TxSelection pattern): change
+  `FilterResult.forwarding_class` from `Arc<str>` to `Option<Arc<str>>` with a
+  `None` default (zero-alloc). The single write site — `merge_matched_modifiers`
+  in filter/engine/eval.rs, the ONLY place a matched term's forwarding-class is
+  folded into a FilterResult accumulator — now wraps in `Some(...)`, so the Arc
+  is cloned ONLY when a term ACTUALLY sets a forwarding-class (allocation on a
+  match, never on the default). `None` is semantically identical to the old
+  empty `""` ("no forwarding-class"). Consumer audit (grepped the whole crate):
+  NO production code reads `FilterResult.forwarding_class` — the CoS
+  forwarding-class classification path uses the dedicated TxSelection evaluators
+  (`evaluate_filter_ref_tx_selection_*`) whose result already carries
+  `Option`; the two FilterResult consumers in afxdp/poll_descriptor/filter.rs
+  (`evaluate_interface_filter_non_routing_counted`, `evaluate_lo0_filter_counted`)
+  read only `.action`/`.log_match`. The only readers are 3 tests, updated from
+  `result.forwarding_class.as_ref() == "x"` to `.as_deref() == Some("x")`.
+  FilterResult is a pure in-process eval result (`#[derive(Clone, Debug,
+  PartialEq, Eq)]`, NOT `#[repr(C)]`, NOT serialized / NOT HA-synced / NOT a map
+  struct) — no wire/serialized/map struct touched. Fail-on-revert PROVEN:
+  reverting the default to `Some(Arc::<str>::from(""))` (the faithful
+  re-introduction of the empty-Arc allocation under the new type) flips the new
+  `filter_result_forwarding_class_defaults_none_zero_alloc` test RED
+  (`assertion left == right failed  left: Some("")  right: None`); a bare `Arc`
+  clone at the write site fails to compile. Validation:
+  `CARGO_TARGET_DIR=/tmp/cargo-5151` release build clean (167 pre-existing
+  warnings, 0 errors); new test GREEN; full `cargo test --release` suite GREEN.
+- **File(s)**: userspace-dp/src/filter/mod.rs (FilterResult.forwarding_class:
+  Arc<str> → Option<Arc<str>>; Default → None), userspace-dp/src/filter/engine/eval.rs
+  (merge_matched_modifiers write wraps Some(...)), userspace-dp/src/filter/tests.rs
+  (3 result reads → .as_deref()==Some(..); new fail-on-revert test
+  filter_result_forwarding_class_defaults_none_zero_alloc)
 ## 2026-07-16 — #5564 (daemon): HA config-sync tail failure permanently bypassed policy session invalidation (fail-open)
 - **Timestamp**: 2026-07-16 (fix/5564-syncapply-invalidators)
 - **Action**: Fix #5564 (security fail-open, HA receive side). STEP-0 confirmed
