@@ -11,79 +11,45 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
-// BulkSync sends all locally-owned forward sessions to the peer.
-// doBulkSync runs BulkSyncOverride if set, otherwise falls back to BulkSync.
-// When the override is used, sessions are delivered as incremental updates
-// (via event stream), but we still send BulkStart/BulkEnd markers so the
-// peer completes the bulk receive handshake (releasing sync hold, etc.).
-// The peer sees an empty bulk and skips stale reconciliation.
+// doBulkSync delivers the cold-start / survivor-fabric re-drive bulk session
+// snapshot to the peer.
+//
+// #5085: the RECEIVER's authoritative stale-session reconcile
+// (reconcileStaleSessions) runs against exactly the key set delimited by a
+// BulkStart -> SessionV4/V6... -> BulkEnd window (bulkRecvV4/bulkRecvV6). It is
+// therefore only correct when that window carries a COMPLETE, authoritative
+// snapshot: a session merely absent from the window is treated as stale and
+// DELETED. BulkSync() builds exactly that snapshot with LOSSLESS direct writes
+// under writeMu (no lossy sendCh drops) and filters by owned zone, so doBulkSync
+// ALWAYS ends with BulkSync().
+//
+// BulkSyncOverride, if set, is a best-effort fast-population pre-step (the #418
+// event-stream export). It is NO LONGER wired in production (see
+// startClusterComms) and is retained only as a test/extension seam. Event-stream
+// delivery is async and LOSSY (QueueSessionV4/V6 -> non-blocking sendCh, cap
+// 4096): under load it drops session frames, and reconciling against that
+// incomplete set would DELETE live peer-owned sessions merely dropped in transit.
+// Historically the override path sent an EMPTY BulkStart/BulkEnd here
+// (sendBulkMarkers), so the receiver recorded zero keys and skipped stale
+// reconciliation entirely — a stale peer-owned session the standby held survived
+// cold-prime (the #5085 bug). Whether or not an override runs, the trailing
+// BulkSync() now guarantees the receiver always sees an authoritative window.
+// #5272 is preserved: BulkSync sends a real BulkStart (sets the receiver's
+// bulkInProgress), so only a genuine transfer — never a spurious no-transfer
+// BulkEnd — reconciles.
 func (s *SessionSync) doBulkSync() error {
 	if s.BulkSyncOverride != nil {
-		slog.Info("cluster sync: using bulk sync override (event stream)")
+		slog.Info("cluster sync: running bulk sync override (fast-population pre-step)")
 		if err := s.BulkSyncOverride(); err != nil {
-			slog.Warn("cluster sync: bulk sync override failed, falling back", "err", err)
-			return s.BulkSync()
+			slog.Warn("cluster sync: bulk sync override failed; authoritative BulkSync still runs", "err", err)
 		}
-		// Send empty BulkStart/BulkEnd so the peer completes the
-		// bulk receive handshake. Sessions were already delivered as
-		// incremental updates via the event stream.
-		return s.sendBulkMarkers()
 	}
 	return s.BulkSync()
 }
 
-// sendBulkMarkers sends a BulkStart/BulkEnd pair with no session data.
-// Used after event stream export to signal the peer that a complete
-// bulk transfer happened (the sessions were delivered incrementally).
-func (s *SessionSync) sendBulkMarkers() error {
-	s.bulkSendMu.Lock()
-	defer s.bulkSendMu.Unlock()
-
-	conn := s.getActiveConn()
-	if conn == nil {
-		return fmt.Errorf("no peer connection")
-	}
-
-	epoch := s.bulkSendNext.Add(1)
-	var epochBuf [8]byte
-	binary.LittleEndian.PutUint64(epochBuf[:], epoch)
-
-	slog.Info("cluster sync: sending bulk markers after event stream export",
-		"epoch", epoch,
-		"local", connLocalAddrString(conn),
-		"remote", connRemoteAddrString(conn))
-
-	s.writeMu.Lock()
-	err := writeMsg(conn, syncMsgBulkStart, epochBuf[:])
-	s.writeMu.Unlock()
-	if err != nil {
-		s.handleDisconnect(conn)
-		return err
-	}
-
-	// Record the pending bulk-ack epoch BEFORE writing the BulkEnd marker
-	// (record-then-send, #3912 — same TOCTOU as BulkSync). The BulkEnd
-	// marker is what solicits the peer's ack; recording the pending epoch
-	// first guarantees the read goroutine cannot process an early ack
-	// against a not-yet-set pending epoch and leave a phantom latched.
-	s.pendingBulkAckEpoch.Store(epoch)
-	s.pendingBulkAckSince.Store(time.Now().UnixNano())
-
-	s.writeMu.Lock()
-	err = writeMsg(conn, syncMsgBulkEnd, epochBuf[:])
-	s.writeMu.Unlock()
-	if err != nil {
-		s.pendingBulkAckEpoch.Store(0)
-		s.pendingBulkAckSince.Store(0)
-		s.handleDisconnect(conn)
-		return err
-	}
-
-	s.stats.BulkSyncs.Add(1)
-	slog.Info("cluster sync: bulk markers sent", "epoch", epoch)
-	return nil
-}
-
+// BulkSync sends all locally-owned forward sessions to the peer inside a
+// BulkStart -> sessions -> BulkEnd window, using lossless direct writes so the
+// receiver reconciles stale peer-owned sessions against the true snapshot.
 func (s *SessionSync) BulkSync() error {
 	s.bulkSendMu.Lock()
 	defer s.bulkSendMu.Unlock()

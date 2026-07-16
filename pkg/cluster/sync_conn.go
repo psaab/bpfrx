@@ -1938,7 +1938,7 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	} else if !s.outboundBulkAcked.Load() {
 		// #4090: a survivor fabric is still up but the cold-start bulk
 		// never completed. The bulk streams over a SINGLE connection
-		// (BulkSync/sendBulkMarkers pin s.getActiveConn once); if that
+		// (BulkSync pins s.getActiveConn once); if that
 		// connection dropped mid-stream the bulk is stranded — it is not
 		// retried on the survivor and handleNewConnection will not
 		// re-trigger it (its wasDisconnected gate needs BOTH fabrics to
@@ -1952,7 +1952,7 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		// suppress the re-drive of a stranded outbound bulk.
 		//
 		// This MUST be a goroutine, not inline: handleDisconnect holds
-		// s.mu, and doBulkSync -> BulkSync/sendBulkMarkers -> getActiveConn
+		// s.mu, and doBulkSync -> BulkSync -> getActiveConn
 		// re-locks s.mu (self-deadlock if run inline). The CAS guard bounds
 		// re-drives to one in-flight at a time so a survivor that also flaps
 		// (its own write failure re-entering handleDisconnect) cannot spawn a

@@ -545,12 +545,37 @@ ordering".
 
 Both forward and reverse entries are sent during bulk sync. The receiver calls `SetSessionV4/V6` to install each session directly into the BPF map.
 
+#### Authoritative-snapshot cold-prime (#5085)
+
+`doBulkSync` (the cold-prime and #4090 re-drive entry point) **always** delivers
+the snapshot via the lossless `BulkSync()` window above. The receiver's
+`reconcileStaleSessions` deletes every eligible peer-owned session **absent from
+the window's key set** (`bulkRecvV4`/`bulkRecvV6`), so that window must carry a
+COMPLETE, authoritative snapshot — a session merely absent is treated as stale
+and removed.
+
+An earlier optimization (#418, `BulkSyncOverride`) delivered sessions as async,
+LOSSY event-stream incrementals (`QueueSessionV4/V6` → non-blocking `sendCh`,
+cap 4096) and then sent an EMPTY `BulkStart`/`BulkEnd` pair (`sendBulkMarkers`).
+The receiver recorded zero keys and skipped reconciliation, so a stale
+peer-owned session the standby held survived cold-prime (the #5085 bug). Because
+the event-stream stream can drop frames under load, it can never delimit an
+authoritative snapshot: reconciling against an incomplete set would DELETE live
+peer-owned sessions merely dropped in transit. The override is therefore no
+longer wired in production (`startClusterComms`); `doBulkSync` always ends with
+`BulkSync()`, whose direct writes under `writeMu` are lossless and complete.
+`BulkSync` sources sessions from the shim `sessions`/`sessions_v6` BPF mirror
+maps (owner-RG-filtered by `ShouldSyncZone`); a table-truth source
+(`ExportOwnerRGSessions`) that removes the mirror-drift residual is tracked as a
+follow-up. `BulkSyncOverride` is retained only as a test/extension seam and is
+regression-proof: the trailing `BulkSync()` runs unconditionally, so an override
+can never re-send empty markers.
+
 #### Survivor-fabric cold-start bulk re-drive (#4090)
 
 The cold-start bulk streams over a **single** fabric connection: `BulkSync`
-(and the event-stream override's `sendBulkMarkers`) capture
-`getActiveConn()` once and pin every session + `BulkStart`/`BulkEnd` marker to
-that connection with no per-message failover. On a dual-fabric cluster both
+captures `getActiveConn()` once and pins every session + `BulkStart`/`BulkEnd`
+marker to that connection with no per-message failover. On a dual-fabric cluster both
 `conn0` and `conn1` are established concurrently, and the cold-start bulk is
 triggered exactly once — gated on `wasDisconnected` (BOTH conns nil) AND
 `!bulkEverCompleted` in `handleNewConnection`. If the pinned fabric dropped
@@ -566,7 +591,7 @@ up AND `!outboundBulkAcked.Load()` (our outbound bulk was never acked by the
 peer), it schedules a single re-drive of `doBulkSync()` over the survivor:
 
 - **Goroutine, not inline.** `handleDisconnect` holds `s.mu`, and
-  `doBulkSync → BulkSync/sendBulkMarkers → getActiveConn` re-locks `s.mu`; an
+  `doBulkSync → BulkSync → getActiveConn` re-locks `s.mu`; an
   inline call would self-deadlock. The re-drive runs on a `wg`-tracked
   goroutine that takes no lock across the `handleDisconnect` boundary.
 - **CAS in-flight guard.** `bulkRedriveInFlight` (an `atomic.Bool`,
@@ -679,7 +704,7 @@ This is **additive** to the periodic sweep — it provides sub-millisecond sync 
 |------|--------|
 | SessionV4/V6 | Decode → install forward → create reverse → create dnat_table (SNAT) |
 | DeleteV4/V6 | Lookup → delete reverse → delete dnat_table (SNAT) → delete forward |
-| BulkStart/End | Log markers; a BulkEnd for a bulk that was **actually in progress** (`bulkInProgress` set by a preceding BulkStart) with a matching epoch triggers `reconcileStaleSessions` + `OnBulkSyncReceived` (releases the VRRP sync hold). A BulkEnd with `bulkInProgress==false` — no active transfer — is dropped as spurious/replayed (#5272); it does NOT reconcile, ACK, set `bulkEverCompleted`, or release the hold |
+| BulkStart/End | Log markers; a BulkEnd for a bulk that was **actually in progress** (`bulkInProgress` set by a preceding BulkStart) with a matching epoch triggers `reconcileStaleSessions` + `OnBulkSyncReceived` (releases the VRRP sync hold). `reconcileStaleSessions` deletes every eligible peer-owned session absent from the window's key set — including when that set is EMPTY: a completed real transfer with zero sessions is an authoritative "peer holds nothing" snapshot, so all eligible-absent stale sessions are reconciled away (#5085; there is **no** empty-bulk skip). A BulkEnd with `bulkInProgress==false` — no active transfer — is dropped as spurious/replayed (#5272); it does NOT reconcile, ACK, set `bulkEverCompleted`, or release the hold |
 | BulkAck | Completes an **outbound** bulk only when it matches a pending outbound epoch (`pendingBulkAckEpoch != 0 && epoch >= pending`): clears the pending epoch, sets `bulkEverCompleted`/`outboundBulkAcked`, fires `OnBulkSyncAckReceived`. A BulkAck with no pending outbound bulk is dropped as spurious/replayed (#5272) — it does NOT set the flags or fire the callback |
 | Heartbeat | No-op (resets read deadline) |
 | Config | Decode `(text, gen)` → enqueue on the single-consumer ordered apply queue (`configApplyLoop`); `shouldApplyConfigGen` drops out-of-order older gens, then `OnConfigReceived` applies and the high-water advances (`recordAppliedConfigGen`) ONLY on a successful apply — a failure counts `ConfigsApplyFailed` and re-admits the peer's re-push (#3931, M-2/#4151) |
@@ -703,7 +728,11 @@ complete:
   transfer was torn down on disconnect — is dropped (debug log, no ACK, no
   completion flag, no callback). Without this gate a spurious BulkEnd on a node
   that never received a bulk would release the hold with an **empty/stale peer
-  session table**, so a failover mid-session blackholes.
+  session table**, so a failover mid-session blackholes. This gate is what makes
+  the #5085 empty-snapshot reconcile safe: only a **real** transfer
+  (`bulkInProgress` set by its own `BulkStart`) ever reaches
+  `reconcileStaleSessions`, so a spurious empty BulkEnd can never trigger a
+  delete-all-eligible pass.
 - **`BulkAck` requires a pending outbound bulk.** A BulkAck only completes when
   it matches a pending outbound epoch (`pendingBulkAckEpoch != 0 && epoch >=
   pending`, recorded before the outbound `BulkEnd` write per #3912). A BulkAck

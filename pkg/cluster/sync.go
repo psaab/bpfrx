@@ -304,7 +304,13 @@ type SessionSync struct {
 	OnForwardSessionInstalled func()
 	// OnBulkSyncReceived fires when an inbound bulk sync completes.
 	OnBulkSyncReceived func()
-	// BulkSyncOverride, if set, replaces the default BulkSync implementation.
+	// BulkSyncOverride, if set, runs as a best-effort fast-population pre-step
+	// BEFORE the authoritative BulkSync in doBulkSync (it does NOT replace it,
+	// #5085). It is NO LONGER wired in production — the async, lossy
+	// event-stream export (#418) cannot delimit an authoritative reconcile
+	// snapshot — and is retained only as a test/extension seam. doBulkSync
+	// always ends with the lossless BulkSync window, so an override can never
+	// reintroduce the empty-marker / skipped-reconcile regression.
 	BulkSyncOverride func() error
 	// OnBulkSyncAckReceived fires when the peer acknowledges our outbound bulk sync.
 	OnBulkSyncAckReceived func()
@@ -896,10 +902,16 @@ func (s *SessionSync) reconcileStaleSessions() {
 	s.bulkMu.Unlock()
 	start := time.Now()
 	slog.Info("cluster sync: reconcile stale sessions starting", "recv_v4", len(recvV4), "recv_v6", len(recvV6), "zones", len(zoneSnap))
-	if len(recvV4) == 0 && len(recvV6) == 0 {
-		slog.Info("cluster sync: reconcile stale sessions skipped (empty bulk)")
-		return
-	}
+	// #5085: do NOT skip on an empty received set. A completed bulk window
+	// (BulkStart -> BulkEnd, #5272-gated on bulkInProgress) is authoritative:
+	// an EMPTY authoritative snapshot means the peer legitimately holds no
+	// syncable sessions, so every eligible-absent stale peer-owned session
+	// MUST be reconciled away. The previous empty-bulk skip masked the #5085
+	// bug (the event-stream override sent empty markers), letting stale
+	// sessions survive cold-prime. The snapshot is now authoritative and
+	// lossless (doBulkSync always runs BulkSync's direct-write window), so the
+	// natural reconcile against an empty set is correct — no dangerous
+	// "empty means delete-all" heuristic, just the normal absent-key delete.
 	if s.sessions == nil {
 		slog.Info("cluster sync: reconcile stale sessions skipped (no dataplane)")
 		return

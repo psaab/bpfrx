@@ -2019,7 +2019,14 @@ func TestReconcileNoBulkInProgress(t *testing.T) {
 	}
 }
 
-func TestReconcileSkipsEmptyBulk(t *testing.T) {
+// TestReconcileEmptyBulkDeletesEligibleAbsent proves the #5085 receiver-side
+// behavior: a COMPLETED bulk window (BulkStart -> BulkEnd, #5272-gated on
+// bulkInProgress) with an EMPTY authoritative session set means the peer holds
+// no syncable sessions, so every eligible-absent stale peer-owned session MUST
+// be reconciled away. The local-owned session is untouched. This reverses the
+// former TestReconcileSkipsEmptyBulk, whose empty-bulk skip was a band-aid that
+// masked the #5085 bug (the event-stream override sent empty markers).
+func TestReconcileEmptyBulkDeletesEligibleAbsent(t *testing.T) {
 	peerOwnedKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 9, 1}, Protocol: 6, SrcPort: 1234, DstPort: 80}
 	localOwnedKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 9, 2}, Protocol: 6, SrcPort: 2345, DstPort: 443}
 
@@ -2035,14 +2042,15 @@ func TestReconcileSkipsEmptyBulk(t *testing.T) {
 	ss.IsPrimaryForRGFn = func(rgID int) bool { return rgID == 1 }
 	ss.SetZoneRGMap(map[uint16]int{1: 1, 2: 2})
 
+	// A real transfer: BulkStart (sets bulkInProgress) then an empty BulkEnd.
 	ss.handleMessage(nil, syncMsgBulkStart, nil)
 	ss.handleMessage(nil, syncMsgBulkEnd, nil)
 
-	if _, ok := dp.v4sessions[peerOwnedKey]; !ok {
-		t.Fatal("peer-owned session should not be deleted on empty bulk")
+	if _, ok := dp.v4sessions[peerOwnedKey]; ok {
+		t.Fatal("#5085: peer-owned session absent from the authoritative empty snapshot must be reconciled away")
 	}
 	if _, ok := dp.v4sessions[localOwnedKey]; !ok {
-		t.Fatal("local-owned session should remain on empty bulk")
+		t.Fatal("local-owned session (our RG) must never be reconciled")
 	}
 }
 
