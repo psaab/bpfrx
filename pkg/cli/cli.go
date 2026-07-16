@@ -64,6 +64,11 @@ type CLI struct {
 	lldpNeighborsFn    func() []*lldp.Neighbor
 	ddnsStatsFn        func() *dhcpserver.DDNSStats
 	ddnsOwnedRecordsFn func() []dhcpserver.DDNSOwnedRecordView
+	// dhcpServerFn builds the dhcpserver.Manager used by `show dhcp server`
+	// (#5967). Production leaves it nil → dhcpserver.New(); a test seam injects a
+	// manager pointed at a controlled Kea lease-file set so the degraded-source
+	// banner (parity with the gRPC handler) can be exercised without /var/lib/kea.
+	dhcpServerFn func() *dhcpserver.Manager
 	// #2691 P2: Surface A (router/interface-address) DDNS status sources for
 	// `show services dynamic-dns [detail]`.
 	surfaceADDNSStatsFn  func() *ddnspkg.SurfaceAStats

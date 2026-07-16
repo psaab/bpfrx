@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dhcpserver"
 )
 
 // showSNMP renders `cli show snmp` — community/trap-group/USM-user
@@ -96,10 +97,8 @@ func (s *Server) showDHCPServer(buf *strings.Builder) {
 	// partial display is never mistaken for a healthy empty set.
 	leases4, src4 := s.dhcpServer.GetLeasesWithSource4()
 	leases6, src6 := s.dhcpServer.GetLeasesWithSource6()
-	if banner := src4.Banner(); banner != "" {
-		buf.WriteString(banner + "\n")
-	} else if banner := src6.Banner(); banner != "" {
-		buf.WriteString(banner + "\n")
+	for _, b := range dhcpserver.DegradedBanners(src4, src6) {
+		buf.WriteString(b + "\n")
 	}
 	if len(leases4) == 0 && len(leases6) == 0 {
 		buf.WriteString("No active leases\n")
@@ -182,10 +181,8 @@ func (s *Server) showDHCPServerDetail(cfg *config.Config, buf *strings.Builder) 
 		// #5938 Invariant 2/8: live-socket-preferred read + degraded-source banner.
 		leases4, src4 := s.dhcpServer.GetLeasesWithSource4()
 		leases6, src6 := s.dhcpServer.GetLeasesWithSource6()
-		if banner := src4.Banner(); banner != "" {
-			buf.WriteString(banner + "\n")
-		} else if banner := src6.Banner(); banner != "" {
-			buf.WriteString(banner + "\n")
+		for _, b := range dhcpserver.DegradedBanners(src4, src6) {
+			buf.WriteString(b + "\n")
 		}
 		if len(leases4) == 0 && len(leases6) == 0 {
 			buf.WriteString("Active leases: none\n")

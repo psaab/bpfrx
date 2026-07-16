@@ -53,6 +53,31 @@ func (s LeaseSource) Banner() string {
 		"; the lease set shown below may be incomplete"
 }
 
+// DegradedBanners returns the operator banner line(s) for a combined v4+v6
+// lease display — one line per DEGRADED family, in v4-then-v6 order, with an
+// exact-duplicate collapsed to a single line (#5967).
+//
+// #5938 introduced the per-source banner but the show handlers rendered it as
+// `if src4.Banner() else if src6.Banner()`, so when BOTH families were degraded
+// only the v4 detail printed and a v6-specific reason (e.g. a DIFFERENT
+// unreadable sibling file) was silently suppressed — the operator was alerted
+// but lost the v6 detail. Centralizing the selection here keeps the authoritative
+// gRPC `show dhcp server` handler and the in-process interactive CLI in lockstep
+// (they were divergent before #5967): both call this and render every distinct
+// degraded-family detail. The exact-duplicate collapse avoids printing the same
+// line twice when both families fell back to the memfile for the identical
+// reason (identical Detail). A healthy source contributes no line.
+func DegradedBanners(src4, src6 LeaseSource) []string {
+	var out []string
+	if b := src4.Banner(); b != "" {
+		out = append(out, b)
+	}
+	if b := src6.Banner(); b != "" && (len(out) == 0 || out[0] != b) {
+		out = append(out, b)
+	}
+	return out
+}
+
 // skippedDetail renders the "N sibling(s) unreadable" degradation reason.
 func skippedDetail(paths []string) string {
 	return fmt.Sprintf("%d Kea lease file(s) unreadable and skipped: %s",
