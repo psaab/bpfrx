@@ -49,7 +49,7 @@ fn write_backlog_cap_halts_drain_and_counts_stall() {
     // prior socket writes returned WouldBlock.
     let mut write_buf: Vec<u8> = vec![0u8; WRITE_BACKLOG_MAX_BYTES];
 
-    let outcome = drain_channel_into_write_buf(&rx, &shared, &mut replay_buf, &mut write_buf, false);
+    let outcome = drain_channel_into_write_buf(&rx, &shared, &mut replay_buf, &mut write_buf, false, &mut None);
 
     assert!(outcome.stalled, "drain must report the backlog stall");
     assert!(!outcome.disconnected);
@@ -91,7 +91,7 @@ fn write_backlog_stall_makes_channel_the_backpressure_surface() {
     }
 
     // I/O thread cannot drain into the full backlog: channel stays full.
-    let outcome = drain_channel_into_write_buf(&rx, &shared, &mut replay_buf, &mut write_buf, false);
+    let outcome = drain_channel_into_write_buf(&rx, &shared, &mut replay_buf, &mut write_buf, false, &mut None);
     assert!(outcome.stalled);
     assert!(!outcome.drained_any);
 
@@ -124,7 +124,7 @@ fn paused_drain_ignores_backlog_cap_and_never_stalls() {
             .expect("seed channel");
     }
 
-    let outcome = drain_channel_into_write_buf(&rx, &shared, &mut replay_buf, &mut write_buf, true);
+    let outcome = drain_channel_into_write_buf(&rx, &shared, &mut replay_buf, &mut write_buf, true, &mut None);
     assert!(!outcome.stalled, "paused drain must not stall on the cap");
     assert!(outcome.drained_any);
     assert_eq!(
@@ -166,6 +166,7 @@ fn stalled_consumer_does_not_grow_backlog_unbounded_end_to_end() {
             &loop_shared,
             &mut replay_buf,
             &mut ctrl_read_buf,
+            &mut None,
             Duration::from_secs(10),
         )
     });
@@ -265,6 +266,7 @@ fn keeping_up_consumer_sees_full_fidelity_and_no_stalls() {
             &loop_shared,
             &mut replay_buf,
             &mut ctrl_read_buf,
+            &mut None,
             Duration::from_secs(10),
         )
     });

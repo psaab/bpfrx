@@ -252,10 +252,22 @@ struct EventStreamShared {
     /// workers cannot allocate N and N+1 but enqueue them inverted (F-152). The
     /// critical section is non-blocking (an atomic + a byte-copy encode + a
     /// non-blocking `try_send`); the lossless retry path releases it before any
-    /// sleep so a backpressured export never stalls the other producers. The
-    /// I/O thread's own FullResync/resync allocations do NOT take this lock —
-    /// they precede a reader reset, so their seq holes are benign; the rollback
-    /// CAS below guards the rare interleave with them.
+    /// sleep so a backpressured export never stalls the other producers.
+    ///
+    /// #5267: the I/O thread's replay-gap FullResync now ALSO allocates its seq
+    /// under this lock (`replay_buffered`). Holding the lock across just the
+    /// `fetch_add` guarantees every delta already committed to the channel has a
+    /// strictly LOWER seq (the channel commit is atomic under the same lock), so
+    /// no producer-committed lower seq can be assigned between the barrier's
+    /// allocation and those deltas. The FullResync is NOT written directly to
+    /// the socket; it is parked in `pending_resync` and emitted by the connected
+    /// loop's drain in seq order (`drain_channel_into_write_buf`), restoring the
+    /// wire==seq invariant the Go reader (zero reorder tolerance) depends on. No
+    /// socket write happens under the lock — the barrier is written later, on
+    /// the I/O thread's own write path — so a wedged reader cannot stall the
+    /// producers through this path. Only the DORMANT drain-poison resync
+    /// (`handle_drain_request`, which has no live caller) still allocates
+    /// outside this lock; the rollback CAS below tolerates that rare interleave.
     producer_seq_lock: Mutex<()>,
     /// Updated by I/O thread from Ack frames.
     acked_seq: AtomicU64,
@@ -532,8 +544,10 @@ impl EventStreamWorkerHandle {
     /// thread can have allocated after us — `seq` is the highest
     /// producer-allocated value and rolling it back frees it for the next
     /// enqueue, keeping the wire seq contiguous. The compare-exchange guards
-    /// the rare race with the I/O thread's own FullResync allocation
-    /// (`replay_buffered` / drain-poison, which do not take this lock): if it
+    /// the rare race with the I/O thread's own FullResync allocation (the
+    /// DORMANT drain-poison path in `handle_drain_request`, which does not take
+    /// this lock; #5267 moved `replay_buffered`'s FullResync allocation UNDER
+    /// this lock, so it no longer races here): if it
     /// bumped `next_seq` past `seq`, the CAS fails and we leave the counter
     /// alone — that seq is burned, but a FullResync is already in flight so the
     /// reader resets and the hole is moot. The CAS can never create a duplicate
@@ -959,12 +973,33 @@ fn io_thread_main(
             None => break, // stop requested during connect
         };
         stream.set_nonblocking(true).ok();
+        // #5267: `connected` stays set BEFORE `replay_buffered`. It gates only
+        // the LOSSLESS producer path (`send_lossless_encoded` fails closed when
+        // clear); deferring it past the non-gap replay window would make every
+        // worker `push_delta_lossless` return "not connected" mid-reconnect,
+        // which `flush_session_deltas` latches as loss-of-sync -> a spurious
+        // full owner-RG resync on every CLEAN reconnect (the exact churn class
+        // this fix removes). Wire ORDERING is instead guaranteed by allocating
+        // the replay-gap FullResync's seq under `producer_seq_lock` and merging
+        // it into the drain in seq order (below), so the `connected` timing is
+        // orthogonal to ordering.
         shared.connected.store(true, Ordering::Release);
         eprintln!("xpf-event-stream: connected to {}", socket_path);
 
-        // Replay buffered events from last acked seq
+        // #5267: per-connection slot for a replay-gap FullResync barrier.
+        // `replay_buffered` allocates the barrier's seq under `producer_seq_lock`
+        // and PARKS the frame here instead of writing it out of order; the
+        // connected loop's channel drain emits it in seq order relative to the
+        // concurrently-committed deltas. Fresh per connection so a stale barrier
+        // from a prior connection is never re-emitted.
+        let mut pending_resync: Option<EventFrame> = None;
+
+        // Replay buffered events from last acked seq. A replay-buffer gap parks
+        // an ordered FullResync barrier in `pending_resync` rather than writing
+        // it directly ahead of the still-queued lower-seq deltas.
         let acked = shared.acked_seq.load(Ordering::Acquire);
-        let replay_result = replay_buffered(&stream, &mut replay_buf, acked, &shared);
+        let replay_result =
+            replay_buffered(&stream, &mut replay_buf, acked, &shared, &mut pending_resync);
         if replay_result.is_err() {
             shared.connected.store(false, Ordering::Release);
             eprintln!("xpf-event-stream: replay failed, reconnecting");
@@ -979,6 +1014,7 @@ fn io_thread_main(
             &shared,
             &mut replay_buf,
             &mut ctrl_read_buf,
+            &mut pending_resync,
             KEEPALIVE_IDLE_INTERVAL,
         );
 
@@ -1018,6 +1054,7 @@ fn replay_buffered(
     replay_buf: &mut VecDeque<EventFrame>,
     acked_seq: u64,
     shared: &Arc<EventStreamShared>,
+    pending_resync: &mut Option<EventFrame>,
 ) -> io::Result<()> {
     // One shared deadline bounds the whole replay so a stuck reader cannot hold
     // the I/O thread for `frames * deadline` (#2877). `write_all_backpressured`
@@ -1032,17 +1069,41 @@ fn replay_buffered(
     let oldest_buffered = replay_buf.front().map(|f| f.seq).unwrap_or(0);
     let has_gap = (replay_buf.is_empty() && acked_seq > 0) || oldest_buffered > acked_seq + 1;
     if has_gap {
-        let seq = shared.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let frame = EventFrame::encode_full_resync(seq);
-        write_all_backpressured(stream, frame.as_bytes(), shared, deadline)?;
-        shared.frames_sent.fetch_add(1, Ordering::Relaxed);
+        // #5267: allocate the FullResync's seq UNDER `producer_seq_lock` and
+        // PARK the frame in `pending_resync` instead of writing it directly to
+        // the socket. Writing it here (outside the lock, ahead of the channel
+        // drain) put a HIGHER seq on the wire before the lower-seq deltas still
+        // queued in the channel: the Go reader (zero reorder tolerance) then
+        // diagnosed a session-sync gap on the first post-barrier delta and
+        // dropped the connection, churning resyncs on the very HA-recovery
+        // barrier. Holding the lock for JUST the `fetch_add` guarantees every
+        // delta already committed to the channel has a strictly LOWER seq (the
+        // channel commit is atomic under the same lock, #3878) and every delta
+        // committed afterward has a strictly higher seq; the connected loop's
+        // drain then merges this barrier into the write stream in seq order
+        // (`drain_channel_into_write_buf`). The lock is released immediately —
+        // no socket write happens under it, so a wedged reader can never stall
+        // the producers through this path, and there is no lock-ordering cycle
+        // (the section is a single atomic).
+        let seq = {
+            let _guard = shared
+                .producer_seq_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            shared.next_seq.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        *pending_resync = Some(EventFrame::encode_full_resync(seq));
         eprintln!(
-            "xpf-event-stream: sent FullResync (buffer gap: acked={}, oldest_buffered={})",
-            acked_seq, oldest_buffered
+            "xpf-event-stream: queued ordered FullResync seq {} (buffer gap: acked={}, oldest_buffered={})",
+            seq, acked_seq, oldest_buffered
         );
         // Keep the stale replay window until the daemon ACKs the FullResync.
         // Clearing here can make an acked_seq=0 reconnect look like a clean
         // fresh start and permanently suppress the required bulk export.
+        // `frames_sent` is bumped when the ordered drain accepts the barrier,
+        // matching producer-frame enqueue accounting. When the stream is
+        // paused that means replay retention rather than a socket write; #5328
+        // tracks the existing Resume path's missing replay-suffix scheduling.
         return Ok(());
     }
 
@@ -1128,6 +1189,7 @@ fn run_connected_loop(
     shared: &Arc<EventStreamShared>,
     replay_buf: &mut VecDeque<EventFrame>,
     ctrl_read_buf: &mut Vec<u8>,
+    pending_resync: &mut Option<EventFrame>,
     keepalive_interval: Duration,
 ) -> bool {
     use std::io::{Read, Write};
@@ -1144,7 +1206,14 @@ fn run_connected_loop(
 
         let paused = shared.paused.load(Ordering::Acquire);
 
-        let drain = drain_channel_into_write_buf(rx, shared, replay_buf, &mut write_buf, paused);
+        let drain = drain_channel_into_write_buf(
+            rx,
+            shared,
+            replay_buf,
+            &mut write_buf,
+            paused,
+            pending_resync,
+        );
         if drain.disconnected {
             return false;
         }
@@ -1588,6 +1657,7 @@ fn drain_channel_into_write_buf(
     replay_buf: &mut VecDeque<EventFrame>,
     write_buf: &mut Vec<u8>,
     paused: bool,
+    pending_resync: &mut Option<EventFrame>,
 ) -> DrainOutcome {
     let mut drained_any = false;
     loop {
@@ -1602,14 +1672,34 @@ fn drain_channel_into_write_buf(
         match rx.try_recv() {
             Ok(frame) => {
                 drained_any = true;
+                // #5267: flush a parked FullResync barrier just BEFORE the first
+                // channel frame whose seq exceeds it, so the wire stays
+                // monotonic. The barrier's seq was allocated under
+                // `producer_seq_lock`, so every delta already queued has a lower
+                // seq and is emitted first; only a delta committed AFTER the
+                // barrier has a higher seq and must follow it.
+                let flush_before_frame = match pending_resync.as_ref() {
+                    Some(barrier) => frame.seq > barrier.seq,
+                    None => false,
+                };
+                if flush_before_frame {
+                    flush_pending_resync(shared, replay_buf, write_buf, paused, pending_resync);
+                }
                 if !paused {
                     write_buf.extend_from_slice(frame.as_bytes());
                 }
                 push_replay_frame(shared, replay_buf, frame);
             }
             Err(TryRecvError::Empty) => {
+                // Channel fully drained: every delta with a lower seq than the
+                // barrier has been emitted (the barrier is the current max — its
+                // seq was allocated under the producer lock), so it is safe to
+                // flush the barrier now (#5267). Without a trailing higher-seq
+                // delta this is the ONLY place the barrier is emitted.
+                let flushed =
+                    flush_pending_resync(shared, replay_buf, write_buf, paused, pending_resync);
                 return DrainOutcome {
-                    drained_any,
+                    drained_any: drained_any || flushed,
                     disconnected: false,
                     stalled: false,
                 };
@@ -1622,6 +1712,37 @@ fn drain_channel_into_write_buf(
                 };
             }
         }
+    }
+}
+
+/// #5267: move a parked replay-gap FullResync barrier out of `pending_resync`
+/// into the ordered write/replay path so ACK-trim and a later reconnect treat
+/// it like any other accepted frame while keeping the replay buffer seq-ordered.
+///
+/// `frames_sent` is bumped HERE, when the ordered drain accepts the barrier,
+/// not when `replay_buffered` merely parks it. This matches the existing
+/// producer accounting, which counts a successful channel enqueue before the
+/// socket write. When paused, the barrier is appended to the replay buffer only
+/// (like every other paused frame) and NOT to `write_buf`; a reconnect replays
+/// it, while #5328 tracks the pre-existing defect that plain `MSG_RESUME` does
+/// not schedule the intact paused replay suffix on the same connection.
+/// Returns true if a barrier was consumed into the ordered output/replay path.
+fn flush_pending_resync(
+    shared: &Arc<EventStreamShared>,
+    replay_buf: &mut VecDeque<EventFrame>,
+    write_buf: &mut Vec<u8>,
+    paused: bool,
+    pending_resync: &mut Option<EventFrame>,
+) -> bool {
+    if let Some(barrier) = pending_resync.take() {
+        if !paused {
+            write_buf.extend_from_slice(barrier.as_bytes());
+        }
+        shared.frames_sent.fetch_add(1, Ordering::Relaxed);
+        push_replay_frame(shared, replay_buf, barrier);
+        true
+    } else {
+        false
     }
 }
 
