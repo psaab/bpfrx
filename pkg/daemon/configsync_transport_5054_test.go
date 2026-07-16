@@ -10,19 +10,32 @@
 // autonomous event-options engine keeps its explicit opt-out (syncPeer=false)
 // because each node fires remediation independently from its own RPM events.
 //
-// These tests pin (1) the pure decision function across the cluster-state table
-// and (2) the behavioral outcome: an operator commit syncs the peer iff this
-// node owns RG0, a standalone / non-owner node does not, and the event-engine
-// opt-out still suppresses the sync even on an RG0 owner.
+// These tests pin (1) the pure decision function across the cluster-state table,
+// (2) the behavioral outcome of the shared operator commit path — an operator
+// commit syncs the peer iff this node owns RG0, a standalone / non-owner node
+// does not, and the event-engine opt-out still suppresses the sync even on an
+// RG0 owner — and (3) the per-transport WIRING in daemon_run.go: the gRPC / REST
+// / local-shell commit closures (the grpc/rest/shell CommitFn/CommitConfirmedFn
+// seams) each route through commitAndApplyOperator / commitConfirmedAndApplyOperator,
+// so no single transport can silently diverge from the RG0-ownership policy.
 //
-// FAIL-ON-REVERT: reverting commitAndApplyOperator (or the REST/shell wiring) to
-// pass syncPeer=false turns TestOperatorCommitSyncsPeerWhenRG0Owner /
-// TestOperatorCommitConfirmedSyncsPeerWhenRG0Owner RED (0 pushes → standby stays
-// stale). Neutralizing rg0ConfigSyncAuthority to always-false turns both the
-// owner decision-table case and those behavioral tests RED.
+// FAIL-ON-REVERT: reverting commitAndApplyOperator itself (or neutralizing
+// rg0ConfigSyncAuthority to always-false) turns TestOperatorCommit* and the
+// owner decision-table case RED. INDEPENDENTLY, reverting ANY ONE transport seam
+// in daemon_run.go back to commitAndApply(ctx, comment, false) — the exact #5054
+// regression — turns that transport's owner sub-case in
+// TestTransportCommitFnWiringSyncsPeerByRG0Ownership /
+// TestTransportCommitConfirmedFnWiringSyncsPeerByRG0Ownership RED (0 pushes on
+// the RG0 owner); a hardcoded syncPeer=true reds its non-owner sub-case.
+//
+// The pre-#5961 decision-function / operator-path tests above did NOT cover the
+// transport wiring: they invoke commitAndApplyOperator directly, so reverting a
+// single transport's daemon_run.go closure left every one of them green. That is
+// the coverage gap the TestTransportCommit*Wiring tests close (#5961).
 package daemon
 
 import (
+	"context"
 	"testing"
 
 	"golang.org/x/sync/semaphore"
@@ -167,5 +180,78 @@ func TestOperatorCommitConfirmedSyncsPeerWhenRG0Owner(t *testing.T) {
 	}
 	if *calls != 1 {
 		t.Fatalf("operator commit-confirmed on the RG0 owner must sync the peer exactly once (#5054); got %d", *calls)
+	}
+}
+
+// syncByOwnershipCases is the shared per-transport wiring table: an operator
+// commit must sync the peer IFF this node owns RG0, on every transport. The
+// owner case reds a transport reverted to a hardcoded syncPeer=false (the #5054
+// regression); the non-owner / standalone cases red a hardcoded syncPeer=true.
+var syncByOwnershipCases = []struct {
+	name    string
+	cluster func(*testing.T) *cluster.Manager
+	want    int
+}{
+	{"rg0-owner", clusterOwningRG0, 1},
+	{"non-owner", clusterNotOwningRG0, 0},
+	{"standalone", func(*testing.T) *cluster.Manager { return nil }, 0},
+}
+
+// TestTransportCommitFnWiringSyncsPeerByRG0Ownership drives the EXACT commit
+// closures wired into the gRPC / REST / local-shell servers in daemon_run.go
+// (grpcCommitFn / restCommitFn / shellCommitFn) and asserts each resolves
+// peer-sync by RG0 ownership, never a per-transport constant. This is the
+// coverage the decision-function tests above lack: a single-transport wiring
+// regression turns exactly one sub-case RED here instead of staying silent.
+func TestTransportCommitFnWiringSyncsPeerByRG0Ownership(t *testing.T) {
+	transports := []struct {
+		name string
+		fn   func(*Daemon) func(context.Context, string) (*config.Config, error)
+	}{
+		{"grpc", (*Daemon).grpcCommitFn},
+		{"rest", (*Daemon).restCommitFn},
+		{"shell", (*Daemon).shellCommitFn},
+	}
+	for _, tr := range transports {
+		for _, tc := range syncByOwnershipCases {
+			t.Run(tr.name+"/"+tc.name, func(t *testing.T) {
+				d, calls := newSyncProbeDaemon(t, tc.cluster(t))
+				if _, err := tr.fn(d)(t.Context(), ""); err != nil {
+					t.Fatalf("%s CommitFn: %v", tr.name, err)
+				}
+				if *calls != tc.want {
+					t.Fatalf("%s CommitFn on %s: peer syncs = %d, want %d — the transport wiring must route through commitAndApplyOperator, not a hardcoded syncPeer (#5054/#5961)", tr.name, tc.name, *calls, tc.want)
+				}
+			})
+		}
+	}
+}
+
+// TestTransportCommitConfirmedFnWiringSyncsPeerByRG0Ownership is the
+// commit-confirmed analogue: the gRPC / REST / local-shell CommitConfirmedFn
+// closures (grpcCommitConfirmedFn / restCommitConfirmedFn / shellCommitConfirmedFn)
+// must route through commitConfirmedAndApplyOperator so `commit confirmed` obeys
+// the same transport-independent RG0-ownership peer-sync policy.
+func TestTransportCommitConfirmedFnWiringSyncsPeerByRG0Ownership(t *testing.T) {
+	transports := []struct {
+		name string
+		fn   func(*Daemon) func(context.Context, int) (*config.Config, error)
+	}{
+		{"grpc", (*Daemon).grpcCommitConfirmedFn},
+		{"rest", (*Daemon).restCommitConfirmedFn},
+		{"shell", (*Daemon).shellCommitConfirmedFn},
+	}
+	for _, tr := range transports {
+		for _, tc := range syncByOwnershipCases {
+			t.Run(tr.name+"/"+tc.name, func(t *testing.T) {
+				d, calls := newSyncProbeDaemon(t, tc.cluster(t))
+				if _, err := tr.fn(d)(t.Context(), 1); err != nil {
+					t.Fatalf("%s CommitConfirmedFn: %v", tr.name, err)
+				}
+				if *calls != tc.want {
+					t.Fatalf("%s CommitConfirmedFn on %s: peer syncs = %d, want %d — the transport wiring must route through commitConfirmedAndApplyOperator, not a hardcoded syncPeer (#5054/#5961)", tr.name, tc.name, *calls, tc.want)
+				}
+			})
+		}
 	}
 }
