@@ -62,8 +62,8 @@ func TestWebMgmtBindResolvesJunosIfnameToLinux_5714(t *testing.T) {
 	apiCfg := api.Config{Addr: "127.0.0.1:8080"}
 	d.resolveAPIBinds(&apiCfg, webmgmtIfnameCfg("ge-0/0/0.0"))
 
-	if apiCfg.Addr != "10.0.0.5:8080" {
-		t.Fatalf("web-mgmt bind Addr = %q, want 10.0.0.5:8080 (Junos ge-0/0/0.0 -> Linux ge-0-0-0). "+
+	if apiCfg.Addr != "10.0.0.5:80" {
+		t.Fatalf("web-mgmt bind Addr = %q, want 10.0.0.5:80 (Junos ge-0/0/0.0 -> Linux ge-0-0-0, canonical web-mgmt port #5715). "+
 			"127.0.0.1 means the authored Junos name reached the kernel lookup verbatim (the #5714 bug)", apiCfg.Addr)
 	}
 }
@@ -105,8 +105,10 @@ func TestWebMgmtBindUnresolvableLogsLoudError_5714(t *testing.T) {
 		t.Fatalf("unresolvable web-mgmt interface must log a LOUD ERROR naming the interface, "+
 			"not a silent fallback; got records: %+v", recs)
 	}
-	// Fallback is retained (loopback), so the mgmt API still serves locally.
-	if apiCfg.Addr != "127.0.0.1:8080" {
-		t.Fatalf("unresolvable interface bind Addr = %q, want loopback fallback 127.0.0.1:8080", apiCfg.Addr)
+	// Fallback is retained (loopback), so the mgmt API still serves locally —
+	// on the canonical web-mgmt port (#5715), since `web-management http` is
+	// explicitly configured.
+	if apiCfg.Addr != "127.0.0.1:80" {
+		t.Fatalf("unresolvable interface bind Addr = %q, want loopback fallback 127.0.0.1:80", apiCfg.Addr)
 	}
 }

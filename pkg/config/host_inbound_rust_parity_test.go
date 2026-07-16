@@ -4,8 +4,11 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/webmgmt"
 )
 
 // host_inbound_rust_parity_test.go closes the Go<->Rust drift gap for the
@@ -209,4 +212,53 @@ func TestHostInboundRustClassifierMatchesGoSSOT(t *testing.T) {
 	rustL2 := rustArrayTokens(l2Section)
 	assertSameSet(t, "L2 protocols (HOST_INBOUND_L2_PROTOCOLS vs HostInboundL2Protocols)",
 		goKeySet(HostInboundL2Protocols), rustL2)
+}
+
+// rustArmInsertPortRe captures the tcp-port the classify_system_service arm
+// starting at a given token inserts: from the token to the FIRST
+// `hi.tcp_ports.insert(<N>)` within the same `{ ... }` arm body (the `[^}]`
+// class stops the match at the arm's closing brace so it cannot leak into a
+// later arm). Tolerant of whitespace / newlines and the alias order inside the
+// pattern (`"http" | "webapi-clear-text"`).
+func rustArmInsertPort(t *testing.T, section, token string) uint16 {
+	t.Helper()
+	re := regexp.MustCompile(`"` + regexp.QuoteMeta(token) + `"[^}]*?hi\.tcp_ports\.insert\((\d+)\)`)
+	m := re.FindStringSubmatch(section)
+	if m == nil {
+		t.Fatalf("could not find `hi.tcp_ports.insert(N)` for the %q arm in classify_system_service — "+
+			"Rust web-management admit moved/renamed; update the #5715 port-parity test", token)
+	}
+	n, err := strconv.ParseUint(m[1], 10, 16)
+	if err != nil {
+		t.Fatalf("Rust %q arm inserts a non-uint16 port %q: %v", token, m[1], err)
+	}
+	return uint16(n)
+}
+
+// TestHostInboundRustWebPortsMatchSSOT_5715 is the cross-LANGUAGE PORT contract
+// the #5715 research flagged as missing: TestHostInboundRustClassifierMatchesGoSSOT
+// proves Go and Rust know the same http/https TOKENS, but NOT that they admit the
+// same PORTS. This asserts the Rust classifier inserts EXACTLY the webmgmt SSOT
+// ports (80/443) for the http and https arms — the same constants the Go catalog
+// (config.HostInboundServiceMatch) and the daemon listener bind derive from.
+//
+// FAIL-ON-REVERT: change the Rust `http` arm to `insert(8080)` (or the SSOT
+// constant) and this goes RED, naming the mismatch. It fails LOUDLY (never a
+// zero-match pass) if the Rust arm moves — rustArmInsertPort t.Fatals on no match.
+func TestHostInboundRustWebPortsMatchSSOT_5715(t *testing.T) {
+	raw, err := os.ReadFile(hostInboundRustSource)
+	if err != nil {
+		t.Fatalf("reading Rust host-inbound classifier %s: %v", hostInboundRustSource, err)
+	}
+	src := rustStripComments(string(raw))
+	svcSection := rustSection(t, src, "fn classify_system_service(", "fn classify_protocol(")
+
+	if got := rustArmInsertPort(t, svcSection, "http"); got != webmgmt.HTTPPort {
+		t.Errorf("Rust `http` admits TCP/%d, but the webmgmt SSOT (and Go catalog + listener) use %d — port drift",
+			got, webmgmt.HTTPPort)
+	}
+	if got := rustArmInsertPort(t, svcSection, "https"); got != webmgmt.HTTPSPort {
+		t.Errorf("Rust `https` admits TCP/%d, but the webmgmt SSOT (and Go catalog + listener) use %d — port drift",
+			got, webmgmt.HTTPSPort)
+	}
 }
