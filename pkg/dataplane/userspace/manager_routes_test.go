@@ -16,7 +16,13 @@ func TestBuildRouteSnapshotsNormalizesFamilyFromDestination(t *testing.T) {
 		{
 			Name: "blue",
 			StaticRoutes: []*config.StaticRoute{
-				{Destination: "2001:db8:1::/64", NextTable: "core"},
+				// #5830: a per-instance next-table is now DROPPED from the
+				// userspace snapshot (it is not programmed on kernel/FRR — a
+				// split-brain). This test only exercises family-normalization
+				// from the destination, so use a forwarding next-hop route (which
+				// survives) as the vehicle. A v6 destination in the inet-labeled
+				// StaticRoutes list must still normalize to inet6 / blue.inet6.0.
+				{Destination: "2001:db8:1::/64", NextHops: []config.NextHopEntry{{Address: "2001:db8:1::1"}}},
 			},
 		},
 	}

@@ -188,6 +188,52 @@ to `ApplyNextTableRules`. Strict on commit / commit-check; downgraded to a
 warning on the tolerant load / peer-sync paths (`opts.lenientNextTableRefs`,
 #1960 no-brick) since the applier keeps a dangling next-table inert.
 
+### Strict rejection — per-instance `next-table` is unsupported (#5830)
+
+`next-table` is only implemented for the **global** `routing-options` static
+routes. A `next-table` authored **under a routing-instance** was accepted at
+commit but the three forwarding surfaces diverged:
+
+- the strict definedness gate above only inspected the global `inet.0` /
+  `inet6.0` routes, so an undefined per-instance target bypassed the #5693
+  protection entirely;
+- `daemon_apply` feeds only `cfg.RoutingOptions.Static/Inet6StaticRoutes` to
+  `ApplyNextTableRules` (`pkg/routing.nextTableManager.Apply`), and the FRR
+  renderer emits nothing for a `NextTable` route
+  (`pkg/frr/config_render.go`), so the **kernel/FRR** plane omitted the
+  per-instance route entirely;
+- the **userspace** FIB builder published it as a live `NextTable` route in the
+  instance's `<inst>.inet[6].0` table (`pkg/dataplane/userspace/routes.go`).
+
+The same committed config therefore **leaked traffic in the userspace
+dataplane** while the kernel/FRR view had no equivalent route — a
+control-plane/data-plane split-brain, not merely a missing diagnostic.
+
+Because per-instance `next-table` is **not programmed on any kernel/FRR
+surface**, the fix makes the three surfaces agree that it is *not a live
+forwarding route*:
+
+- `validateNextTableTargetReferencesStrict` now **hard-rejects at commit** ANY
+  `next-table` under a routing-instance — defined *or* undefined target (an
+  undefined target's error additionally names it). Strict on commit /
+  commit-check; downgraded to a warning on the tolerant load / peer-sync paths
+  (`opts.lenientNextTableRefs`, #1960 no-brick) so an already-persisted or
+  peer-synced legacy config still boots.
+- `buildRouteSnapshots` no longer publishes a per-instance `next-table` into the
+  userspace FIB (`perInstance` guard in `addRoutes`). GLOBAL `next-table` IS
+  programmed via `ip rule` and stays published so the Rust FIB can
+  cross-reference the target table. A leniently-loaded legacy per-instance
+  `next-table` is thus inert on **both** planes.
+
+Supporting per-instance `next-table` for real is a **feature**, not a bug fix:
+the kernel `ip rule` the applier programs is a global destination-only
+`to <dst> lookup <table>` with no source-table scoping, so honoring a
+per-instance leak would need **source-table-scoped** (`iif`/fwmark) rules —
+the same substrate the rib-group **VRF→VRF import** target is deferred to
+Phase 2 for (see *Deferred* below). Appending per-instance routes to the
+existing global `ApplyNextTableRules` call would lose source-table identity and
+could steer traffic from unrelated VRFs, so it is deliberately **not** done.
+
 ### Strict rejection — contradictory static-route dispositions (#5633)
 
 A single static-route destination may carry only **one** disposition: a

@@ -741,12 +741,22 @@ func ribInstanceFromName(ribName string) (string, bool) {
 // so a "Comcst.inet.0" typo is quoted verbatim rather than as the stripped
 // "Comcst".
 //
-// Only the GLOBAL inet.0 + inet6.0 static routes are validated — those are
-// exactly the routes daemon_apply feeds to ApplyNextTableRules
-// (daemon_apply.go); next-table on a per-instance static route is never
-// programmed, so validating it would reject a target the applier never
-// resolves. Routes are walked inet.0 then inet6.0 in declaration order so the
-// first-reported error is deterministic.
+// The GLOBAL inet.0 + inet6.0 static routes are validated for target
+// DEFINEDNESS — those are exactly the routes daemon_apply feeds to
+// ApplyNextTableRules (daemon_apply.go). A next-table authored UNDER a
+// routing-instance is a different case (#5830): it is not programmed on the
+// kernel/FRR plane AT ALL (daemon_apply passes only the global statics; the
+// FRR renderer emits nothing for a NextTable route) yet the userspace FIB used
+// to publish it as a live route — a split-brain that leaked traffic in the
+// userspace dataplane with no kernel/FRR equivalent and, for an undefined
+// target, bypassed the definedness gate above. So the second loop rejects ANY
+// per-instance next-table as an unsupported forwarding disposition (defined or
+// undefined target); the userspace snapshot no longer publishes it
+// (pkg/dataplane/userspace/routes.go). Supporting per-instance next-table for
+// real needs source-table-scoped (iif/fwmark) ip rules — a feature deferred
+// alongside the rib-group VRF->VRF Phase-2 work, not a bug fix. Routes are
+// walked inet.0 then inet6.0 in declaration order so the first-reported error
+// is deterministic.
 //
 // Strict on commit / commit-check (hard reject so the typo is operator-
 // visible); the call site downgrades this to a warning on the tolerant load /
@@ -787,6 +797,49 @@ func validateNextTableTargetReferencesStrict(cfg *Config) error {
 					"leak is silently dropped at apply time and matching traffic "+
 					"follows the ingress table's own routes",
 				sr.Destination, raw, sr.NextTable, sr.NextTable)
+		}
+	}
+
+	// #5830: reject ANY next-table authored under a routing-instance. Unlike
+	// the global routes above, a per-instance next-table is not programmed on
+	// the kernel/FRR forwarding plane (see this function's doc comment), so a
+	// defined OR undefined target is unsupported — accepting it published a
+	// userspace-only NextTable leak with no kernel/FRR equivalent (a split-
+	// brain) and let an undefined per-instance target sidestep the definedness
+	// gate above. Walk each instance's inet.0 then inet6.0 route set in
+	// declaration order so the first-reported error is deterministic. Strict on
+	// commit / commit-check; downgraded to a warning on the tolerant load /
+	// peer-sync paths (opts.lenientNextTableRefs — same wiring as the global
+	// gate) so an already-persisted or peer-synced legacy config carrying a
+	// per-instance next-table still BOOTS (the userspace snapshot drops it and
+	// the kernel/FRR plane never programmed it, so it stays inert).
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil || ri.Name == "" {
+			continue
+		}
+		for _, routes := range [][]*StaticRoute{ri.StaticRoutes, ri.Inet6StaticRoutes} {
+			for _, sr := range routes {
+				if sr == nil || sr.NextTable == "" {
+					continue
+				}
+				raw := sr.NextTableRaw
+				if raw == "" {
+					raw = sr.NextTable
+				}
+				undefinedNote := ""
+				if !definedInstance[sr.NextTable] {
+					undefinedNote = fmt.Sprintf(
+						" (its target routing-instance %q is also undefined)", sr.NextTable)
+				}
+				return fmt.Errorf(
+					"routing-instances %s static route %q next-table %q is not "+
+						"supported: a next-table under a routing-instance is not "+
+						"programmed on the kernel/FRR forwarding plane and would "+
+						"leak only in the userspace dataplane (a split-brain); move "+
+						"the leak to the global `routing-options static route %s "+
+						"next-table %s` or remove it%s",
+					ri.Name, sr.Destination, raw, sr.Destination, raw, undefinedNote)
+			}
 		}
 	}
 	return nil

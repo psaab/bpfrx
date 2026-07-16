@@ -1,3 +1,48 @@
+## 2026-07-16 — #5830 (routing): per-instance next-table diverges between userspace and kernel/FRR (split-brain leak)
+- **Timestamp**: 2026-07-16 (fix/5830-per-instance-nexttable)
+- **Action**: Fix #5830. STEP-0 on origin/master 04e1527ab confirmed the
+  divergence across all three surfaces: `validateNextTableTargetReferencesStrict`
+  (`pkg/config/compiler_validate_strict_routing.go`) validated only GLOBAL
+  inet.0/inet6.0 next-table targets; `daemon_apply.go` feeds only global statics
+  to `ApplyNextTableRules` and `pkg/frr/config_render.go` renders nothing for a
+  NextTable route (kernel/FRR OMIT per-instance next-table); yet
+  `pkg/dataplane/userspace/routes.go` PUBLISHED every routing-instance's
+  next-table as a live `NextTable` snapshot in `<inst>.inet[6].0`. Result: a
+  committed per-instance next-table leaks in the userspace dataplane with no
+  kernel/FRR equivalent, and an UNDEFINED per-instance target bypassed the #5693
+  commit gate. **Direction chosen: (A) reject-consistently** — per-instance
+  next-table is NOT a supported/programmed feature (the kernel ip rule is a
+  global destination-only `to <dst> lookup <table>` with no source-table
+  scoping; true per-instance support needs iif/fwmark source-scoped rules, the
+  same substrate deferred to rib-group VRF→VRF Phase 2), so full-parity (B) is a
+  feature-add, out of scope. Fix: (1) extend
+  `validateNextTableTargetReferencesStrict` to hard-reject ANY per-instance
+  next-table at commit (defined or undefined; undefined additionally named),
+  strict on commit/commit-check, downgraded to a warning on tolerant load /
+  peer-sync via the existing `lenientNextTableRefs` flag (#1960 no-brick); (2)
+  `buildRouteSnapshots` no longer publishes a per-instance next-table
+  (`perInstance` guard in `addRoutes`) — global next-table still published (it
+  IS programmed via ip rule). Now all three surfaces agree per-instance
+  next-table is absent, the #5693 bypass is closed, and no userspace/kernel
+  forwarding divergence remains.
+- **File(s)**: pkg/config/compiler_validate_strict_routing.go,
+  pkg/dataplane/userspace/routes.go,
+  pkg/config/compiler_routing_nexttable_perinstance_5830_test.go (new),
+  pkg/dataplane/userspace/routes_perinstance_nexttable_5830_test.go (new),
+  pkg/dataplane/userspace/manager_routes_test.go (payload updated to a next-hop —
+  the old vehicle was a now-dropped per-instance next-table),
+  docs/rib-group-route-leaking.md, _Log.md
+- **Validation**: `go build ./...` clean; `go test -race ./pkg/config`
+  (153s, PASS), `./pkg/routing` (PASS), `./pkg/dataplane/userspace` (28.5s,
+  PASS); `go vet` clean. FAIL-ON-REVERT proven both directions: gating the
+  userspace `perInstance` skip → `TestBuildRouteSnapshotsDropsPerInstanceNextTable_5830`
+  RED (per-instance NextTable snapshot reappears); neutering the validator's
+  per-instance loop → all 4 `TestPerInstanceNextTableRejected_5830` subtests RED.
+  Pre-existing (unrelated) failure noted: `pkg/dataplane`
+  `TestUserspaceManagerDoesNotImportReflectOrUnsafe` flags `manager_overlay.go`
+  importing `reflect` — that file is byte-identical to origin/master and
+  untouched by this change.
+
 ## 2026-07-16 — #5566 (daemon): stale kernel host-inbound authorization after a coarse tightening (security fail-open)
 - **Timestamp**: 2026-07-16 (fix/5566-hostinbound-conntrack-flush)
 - **Action**: Fix #5566 (security fail-open, direct-kernel host-inbound path).
