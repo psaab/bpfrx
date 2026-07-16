@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net"
 	"strings"
@@ -49,6 +50,11 @@ func (d *Daemon) armSyncReadyTimer() {
 
 func (d *Daemon) onSessionSyncPeerConnected() {
 	d.syncPeerConnected.Store(true)
+	// #5863: a fresh connection is a new epoch. The config-sync reconciler
+	// keys its "already pushed" marker on this epoch, so bumping it here forces
+	// a re-push to the reconnected peer even if the prior connection had
+	// already been satisfied.
+	d.syncPeerConnEpoch.Add(1)
 	d.hbSuppressStart.Store(0) // fresh connection → reset suppression cap
 
 	// Determine whether this is a true cold start or a routine reconnect.
@@ -359,6 +365,158 @@ func (d *Daemon) pushConfigToPeer() {
 		return
 	}
 	d.sessionSync.QueueConfig(configText)
+	// #5863: record the reconcile marker so the level-triggered reconciler
+	// treats this generation as already pushed on the current connection
+	// epoch and does not redundantly re-push it. Only mark when a peer
+	// connection is actually up — QueueConfig no-ops with no active conn, and
+	// a later (re)connect bumps the epoch so the reconciler pushes fresh.
+	if d.syncPeerConnected.Load() {
+		d.markConfigSyncPushed(configText)
+	}
+}
+
+// configGenerationHash reduces the active config text to a compact generation
+// token (#5863). The reconciler pushes at most once per (peer-connection-epoch
+// × generation); a new commit changes the text and therefore the generation,
+// so a config change while a peer stays connected re-pushes exactly once.
+func configGenerationHash(configText string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(configText))
+	return h.Sum64()
+}
+
+// configSyncStableAfter is the uptime a node must have before it is trusted to
+// push its on-disk config to a peer (#5863). A freshly booted node must not
+// overwrite the peer with stale config before it has settled; the default
+// mirrors the historical 30s connect-edge gate. Overridable for tests.
+func (d *Daemon) configSyncStableAfter() time.Duration {
+	if d.configSyncStable > 0 {
+		return d.configSyncStable
+	}
+	return 30 * time.Second
+}
+
+// markConfigSyncPushed records that configText's generation has been pushed to
+// the peer on the current connection epoch (#5863). Any push path (commit sync
+// or the reconciler) records through here so the marker always reflects the
+// latest generation pushed on the live connection, and a redundant reconcile is
+// a no-op.
+func (d *Daemon) markConfigSyncPushed(configText string) {
+	gen := configGenerationHash(configText)
+	epoch := d.syncPeerConnEpoch.Load()
+	d.configSyncMu.Lock()
+	d.configSyncHasPushed = true
+	d.configSyncPushedEpoch = epoch
+	d.configSyncPushedGen = gen
+	d.configSyncMu.Unlock()
+}
+
+// reconcileConfigSyncToPeer is the level-triggered config-sync reconciler
+// (#5863). It re-evaluates the desired invariant — "if I am the RG0 config
+// authority AND stable (uptime ≥ stability threshold) AND a peer is connected
+// AND config sync is enabled AND I have not already pushed my current config
+// generation on this peer's current connection, then push it (once)" — and
+// pushes ONLY when desired-vs-actual diverges.
+//
+// It replaces the old edge-triggered OnPeerConnected-only push, which evaluated
+// the primary/stability gates solely at connect time: a later RG0 promotion or
+// the crossing of the stability threshold never re-pushed, so a peer that
+// connected while this node was secondary (or freshly booted) could stay
+// INDEFINITELY divergent until an unrelated commit/reconnect. The reconciler is
+// invoked on every input change (peer (re)connect, RG0 promotion, stability
+// timer, and a low-frequency safety-net tick).
+//
+// Control-socket safety (CLAUDE.md): the config push is heavy and the userspace
+// control socket is shared. The (epoch × generation) marker guarantees AT MOST
+// ONE push per connection per config generation — once satisfied every further
+// call is a cheap no-op (state gates + one hash, no QueueConfig), so a
+// safety-net tick or a burst of triggers cannot storm the socket or starve
+// session installs during bulk sync. It stays RG0-primary-gated exactly like
+// the old connect edge, so a reconnecting SECONDARY never overwrites the
+// authoritative primary's config (#2239/#4385).
+func (d *Daemon) reconcileConfigSyncToPeer(reason string) {
+	if d.sessionSync == nil && d.configSyncPushForTest == nil {
+		return
+	}
+	// Desired-state gates, re-read fresh on every call (persistent state, not
+	// a captured edge).
+	if !d.syncPeerConnected.Load() {
+		slog.Debug("cluster: config-sync reconcile skip (no peer connection)", "reason", reason)
+		return
+	}
+	if !rg0ConfigSyncAuthority(d.cluster) {
+		slog.Debug("cluster: config-sync reconcile skip (not RG0 primary)", "reason", reason)
+		return
+	}
+	if time.Since(d.startTime) < d.configSyncStableAfter() {
+		slog.Debug("cluster: config-sync reconcile skip (uptime below stability threshold)", "reason", reason)
+		return
+	}
+	if d.store == nil {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil || !cfg.Chassis.Cluster.ConfigSync {
+		slog.Debug("cluster: config-sync reconcile skip (config sync disabled)", "reason", reason)
+		return
+	}
+	configText := d.store.ShowActive()
+	if configText == "" {
+		return
+	}
+	gen := configGenerationHash(configText)
+	epoch := d.syncPeerConnEpoch.Load()
+
+	// Check-and-claim the (epoch × generation) marker under one lock so two
+	// concurrent triggers (e.g. a promotion racing the safety-net tick) push
+	// at most once. Claim the marker BEFORE the push: a failed/dropped send
+	// disconnects, and the next (re)connect bumps the epoch so the reconciler
+	// re-pushes on the fresh connection.
+	d.configSyncMu.Lock()
+	if d.configSyncHasPushed && d.configSyncPushedEpoch == epoch && d.configSyncPushedGen == gen {
+		d.configSyncMu.Unlock()
+		slog.Debug("cluster: config-sync reconcile no-op (already pushed for epoch/generation)",
+			"reason", reason, "epoch", epoch, "generation", gen)
+		return
+	}
+	d.configSyncHasPushed = true
+	d.configSyncPushedEpoch = epoch
+	d.configSyncPushedGen = gen
+	d.configSyncMu.Unlock()
+
+	slog.Info("cluster: config-sync reconcile pushing config to peer",
+		"reason", reason, "epoch", epoch, "generation", gen, "size", len(configText))
+	if d.configSyncPushForTest != nil {
+		d.configSyncPushForTest()
+		return
+	}
+	d.sessionSync.QueueConfig(configText)
+}
+
+// configSyncReconcileLoop is the low-frequency level-triggered safety net for
+// config sync (#5863). It wakes at the stability threshold (so a node that was
+// too young to push at connect time reconciles the moment it crosses the
+// threshold) and thereafter on a coarse periodic tick that recovers any dropped
+// promotion/connect edge. Every wake is a no-op once the (epoch × generation)
+// marker is satisfied, so it never adds sustained control-socket traffic.
+func (d *Daemon) configSyncReconcileLoop(ctx context.Context) {
+	const periodic = 30 * time.Second
+	for {
+		// Wake at the stability threshold while still too young to push, else
+		// on the coarse periodic tick.
+		delay := periodic
+		if until := d.configSyncStableAfter() - time.Since(d.startTime); until > 0 {
+			delay = until
+		}
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+			d.reconcileConfigSyncToPeer("reconcile-loop")
+		}
+	}
 }
 
 // errConfigSyncRejectedPrimary is returned by handleConfigSync when this node
@@ -618,10 +776,14 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				return d.handleConfigSync(configText)
 			}
 
-			// Wire peer connected callback: push config to returning peer.
-			// Only push if this node is RG0 primary (config authority) and
-			// has been running >30s (stable node). A freshly started node
-			// must NOT push stale config from disk.
+			// Wire peer connected callback: reconcile config to the returning
+			// peer. #5863: the push is level-triggered, not a one-shot connect
+			// edge — reconcileConfigSyncToPeer re-evaluates the RG0-authority +
+			// stability + config-generation invariant and pushes at most once
+			// per connection/generation. A node that is secondary or too young
+			// at connect time correctly skips here, and a LATER promotion or
+			// stability crossing re-pushes via the promotion hook / reconcile
+			// loop, instead of leaving the peer indefinitely divergent.
 			d.sessionSync.OnPeerConnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer connected")
 				d.onSessionSyncPeerConnected()
@@ -644,16 +806,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync {
 					d.nudgeIPsecSASync()
 				}
-				if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
-					slog.Info("cluster: skipping config push (not RG0 primary)")
-					return
-				}
-				if time.Since(d.startTime) < 30*time.Second {
-					slog.Info("cluster: skipping config push (daemon just started)")
-					return
-				}
-				slog.Info("cluster: pushing config to reconnected peer")
-				d.pushConfigToPeer()
+				d.reconcileConfigSyncToPeer("peer-connect")
 			}
 
 			d.sessionSync.OnBulkSyncReceived = func() {
@@ -828,6 +981,15 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			if cc.IPsecSASync && d.ipsec != nil {
 				go d.syncIPsecSAPeriodic(commsCtx)
 			}
+
+			// #5863: start the level-triggered config-sync reconcile loop.
+			// It is the low-frequency safety net that (a) fires the moment the
+			// node crosses the stability threshold and (b) recovers any dropped
+			// promotion/connect edge. Started unconditionally (config-sync may
+			// be enabled by a later commit without a comms restart); it is a
+			// cheap no-op on any node that is not the RG0 config authority or
+			// whose current generation is already pushed.
+			go d.configSyncReconcileLoop(commsCtx)
 
 			// #2239: start the DHCP-server lease-sync push loop if enabled.
 			// The loop is gated on the RG-MASTER node-level gate internally;

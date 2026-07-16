@@ -330,10 +330,37 @@ until an unrelated transport-disconnect reverse-sync — an RG failover could th
 silently restore config the operator believed changed. The autonomous
 event-options engine is the deliberate exception: it commits with
 `syncPeer=false` because each node fires remediation independently from its own
-RPM events and must not push node-local state to the peer. There is no periodic
-config reconcile ticker — convergence is driven by the commit push plus the
-reverse-sync-on-reconnect path, so the commit-side trigger MUST fire on every
-operator transport.
+RPM events and must not push node-local state to the peer. The commit-side
+trigger MUST still fire on every operator transport (a commit is the only edge
+that carries a *new* generation), but it is no longer the sole convergence path
+— the reconcile-side trigger below closes the connect/role/uptime ordering gap.
+
+**Reconnect/reconcile-side trigger — level-triggered (#5863).** The commit push
+alone is not sufficient. A peer can (re)connect while this node is not yet the
+RG0 authority or is still within the post-boot stability window; the historical
+code pushed only from the `OnPeerConnected` edge and evaluated the
+primary/stability gates *only at connect time*, so a **later** promotion or the
+crossing of the 30s stability threshold never re-pushed — the peer could stay
+INDEFINITELY divergent until an unrelated commit/reconnect. The push is now
+modeled as reconciliation to a desired state, not a one-shot edge.
+`reconcileConfigSyncToPeer` (`pkg/daemon/daemon_ha_sync.go`) re-evaluates the
+invariant — *this node is the RG0 config authority (`rg0ConfigSyncAuthority`)
+AND stable (uptime ≥ 30s) AND a peer is connected AND config sync is enabled AND
+the current config generation has not already been pushed on this peer's current
+connection* — and pushes ONLY when desired-vs-actual diverges, at most once per
+`(peer-connection-epoch × config-generation)`. It is invoked on every input
+change: peer (re)connect (`OnPeerConnected`), RG0 promotion
+(`applyRG0OwnershipTransition`), and a low-frequency reconcile loop
+(`configSyncReconcileLoop`) that wakes at the stability threshold and thereafter
+on a coarse 30s safety-net tick to recover any dropped promotion/connect edge.
+The `(epoch × generation)` marker makes every already-satisfied evaluation a
+cheap no-op (state gates + one config-text hash, no `QueueConfig`), so the
+shared userspace control socket never sees a push storm and session installs are
+never starved during bulk sync — the control-socket-contention rule. The
+reconcile stays RG0-primary-gated exactly like the commit push, so a
+reconnecting SECONDARY never overwrites the authoritative primary's config
+(#2239/#4385); a fresh connection bumps the epoch, so it always re-receives the
+config even when the generation is unchanged.
 
 **Ordering guard (#3931).** Config sync historically applied via a racing
 `go OnConfigReceived` goroutine per message with no sequence number, so a rapid

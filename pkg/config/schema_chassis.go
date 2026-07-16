@@ -197,15 +197,21 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 					children:      nil,
 				},
 			}},
-			// Runtime truth: any configured count > 0 is used verbatim
-			// as the GARP/NA burst length (pkg/vrrp/instance.go GARP
-			// loop, pkg/cluster/garp.go SendGratuitousARPBurst — both
-			// only special-case <= 0 to the default), read via
-			// daemon_ha_vip.go:475 and vrrp.go:94. Min-only per the
-			// no-schema-only-caps doctrine (Codex, PR #1845) — Junos
+			// Runtime truth: a configured count > 0 drives the GARP/NA
+			// burst length (pkg/vrrp/instance.go GARP loop, pkg/daemon
+			// directSendGARPs, pkg/cluster/garp.go SendGratuitousARPBurst
+			// — all only special-case <= 0 to the default). Min-only per
+			// the no-schema-only-caps doctrine (Codex, PR #1845) — Junos
 			// caps at 16, but enforcing that here would reject configs
 			// the runtime executes fine; a sanity cap belongs in the
-			// runtime first. Deployed: 8.
+			// runtime first. #5695 (codex-182 M16) added that runtime
+			// sanity cap: pkg/vrrp sendGARP and pkg/daemon directSendGARPs
+			// clamp the effective count to config.GratuitousARPBurstClamp
+			// (32, 2x the Junos max) so an unbounded count can no longer
+			// fan a per-VIP raw-socket exhaustion burst on failover. The
+			// commit path stays doctrine-aligned: a count over the clamp
+			// is ACCEPTED but WARNS (validateGratuitousARPCountAST), never
+			// hard-rejected. Deployed: 8.
 			"gratuitous-arp-count": {
 				desc:          "Gratuitous ARP/NA burst count on failover (default 3)",
 				args:          1,

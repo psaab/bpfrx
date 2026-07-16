@@ -352,6 +352,14 @@ func (d *Daemon) applyRG0OwnershipTransition(newState cluster.NodeState) {
 		slog.Info("cluster: became primary for RG0, enabling config writes")
 		d.store.SetClusterReadOnly(false)
 
+		// #5863: becoming the RG0 config authority is a desired-state change.
+		// A peer that connected while this node was secondary had its config
+		// push skipped by the connect edge; now that this node owns config,
+		// reconcile so the connected peer receives the authoritative config
+		// once (level-triggered, RG0-gated, deduped per epoch/generation) —
+		// instead of waiting for an unrelated commit/reconnect.
+		d.reconcileConfigSyncToPeer("rg0-promotion")
+
 		// On failover to primary: re-initiate synced IPsec SAs.
 		if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync && d.ipsec != nil && d.sessionSync != nil {
 			go d.reinitiateIPsecSAs()

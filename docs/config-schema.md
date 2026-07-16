@@ -2754,6 +2754,17 @@ reserved for whole-dataplane selection where a rewrite shim
   `node 0 priority <v>;` bypasses the gate (identity-token rule) even
   though `compileChassis` reads its inline tokens — pinned by
   `TestSchemaValidate_ChassisCluster_PackedOneLinerBypassesGate`.
+  **#5695 (codex-182 M16)** completes the `gratuitous-arp-count`
+  "sanity-cap-belongs-in-the-runtime" note above: the runtime now clamps
+  the effective GARP/NA burst to `config.GratuitousARPBurstClamp` (32, 2×
+  the Junos max) at every send site (`pkg/vrrp` sendGARP, `pkg/daemon`
+  directSendGARPs), so an unbounded configured count can no longer fan a
+  per-VIP raw-socket exhaustion burst on failover. The schema stays
+  min-only (doctrine); the extra commit-side signal is a WARNING (never a
+  reject) from the `validateGratuitousARPCountAST` pre-walk gate when a
+  count exceeds the clamp — pinned by `garp_clamp_5695_test.go`
+  (config), `instance_garp_clamp_5695_test.go` (vrrp), and
+  `direct_garp_clamp_5695_test.go` (daemon).
 - **PR 3 (this work):** the remaining converged-plan sections in one PR —
   (a) **interfaces**: `ValueIPAddress`/`ValueCIDR` value types, the typed
   KEY-slot walker feature, and 16 typed slots (mtu ×3, vlan-id,

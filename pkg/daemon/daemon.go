@@ -365,7 +365,30 @@ type Daemon struct {
 	syncReadyTimerMu   sync.Mutex
 	syncReadyTimer     *time.Timer
 	syncReadyTimeout   time.Duration
-	slogHandler        *logging.SyslogSlogHandler
+
+	// #5863: config-sync to a reconnecting peer is level-triggered, not a
+	// one-shot connect edge. syncPeerConnEpoch is bumped on every peer sync
+	// (re)connect so the reconciler can tell one live connection from the
+	// next. The config-sync marker (configSyncMu-guarded) records the
+	// (peer-connection-epoch × config-generation) that has already been
+	// pushed, so the reconciler pushes AT MOST ONCE per epoch/generation and
+	// is a no-op once the desired state is satisfied. This keeps the shared
+	// userspace control socket safe: a later RG0 promotion or the crossing of
+	// the stability threshold re-evaluates the invariant and pushes exactly
+	// once, instead of leaving the peer indefinitely divergent (the connect
+	// edge could have skipped the only push) OR re-pushing on every tick.
+	syncPeerConnEpoch     atomic.Uint64
+	configSyncMu          sync.Mutex
+	configSyncHasPushed   bool
+	configSyncPushedEpoch uint64
+	configSyncPushedGen   uint64
+	configSyncStable      time.Duration // stability threshold; 0 → default 30s (test override)
+	// configSyncPushForTest, when non-nil, replaces the reconciler's real
+	// SessionSync.QueueConfig push so a unit test can count pushes without a
+	// live TCP sync transport (mirrors syncPeerForTest for the commit path).
+	configSyncPushForTest func()
+
+	slogHandler *logging.SyslogSlogHandler
 	// #3932: the flow-traceoptions writer is published through an atomic
 	// pointer read lock-free by a SINGLE stable EventReader callback that
 	// traceCBOnce registers exactly once. Each commit that changes
@@ -681,6 +704,11 @@ type Daemon struct {
 	// VIP presence/removal idempotently every pass.
 	directVIPMu    sync.Mutex
 	directVIPOwned map[int]bool
+	// garpClampWarned dedups the #5695 per-RG "gratuitous-arp-count clamped"
+	// warning so directSendGARPs (per-failover path) logs it at most once per
+	// RG, not per send. Guarded by garpClampWarnMu.
+	garpClampWarnMu sync.Mutex
+	garpClampWarned map[int]bool
 	// localFailoverCommitReady tracks whether this node has already
 	// applied the local side of a freshly committed transfer request for
 	// each RG. The cluster manager waits on this before telling the peer
