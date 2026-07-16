@@ -312,19 +312,20 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 
 // Compile translates a typed Config into eBPF map entries and attaches programs.
 func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
-	// Bonus early-warning gate: if any kernel ifindex already exceeds
-	// MaxInterfaces, fail now with a named-interface error rather than
-	// deep inside zone apply (AddTxPort returning E2BIG as "key too big
-	// for map"). See issue #814 — the call-site cap checks in
-	// loader.go's AddTxPort and userspace/maps_sync.go are the real
-	// guardrails since interfaces can appear via netlink at any time;
-	// this preflight just makes the first-compile failure legible.
-	if err := m.preflightCheckIfindexCaps(); err != nil {
+	result, err := CompileConfig(m, cfg, m.lastCompile != nil)
+	if err != nil {
 		return nil, err
 	}
 
-	result, err := CompileConfig(m, cfg, m.lastCompile != nil)
-	if err != nil {
+	// Scoped early-warning gate (#5836): if an interface XPF actually
+	// references (result.pendingXDP) exceeds MaxInterfaces, fail with a
+	// named-interface error. Scoping to the compiled port set means an
+	// unrelated high-ifindex host link no longer aborts every compile. See
+	// issue #814 — the call-site cap checks in loader.go's AddTxPort and
+	// userspace/maps_sync.go remain the real fail-closed guardrails since
+	// interfaces can appear via netlink at any time; this preflight just
+	// makes the first-compile failure legible.
+	if err := m.preflightCheckIfindexCaps(ifindexSet(result.pendingXDP)); err != nil {
 		return nil, err
 	}
 

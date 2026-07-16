@@ -944,7 +944,15 @@ never lock an operator out of a remote box it manages.
   `applyConfig`; the chain receives a second fence/re-render opportunity only if
   that apply reaches `applyTailReconciles`. A required protocol-gate error can
   return before that tail, leaving the address for a later applicable successful
-  reconcile. The management-only callback branch is a distinct #5791 limitation.
+  reconcile. **#5791:** `dhcpLeaseChangeRequiresRecompile` now classifies the
+  management-only skip on the config-derived host-inbound LIFELINE set
+  (`config.HostInboundLifelineSet` / `HostInboundLifelineInterface`, the SAME
+  authority this fence uses), NOT the broad management-VRF name class
+  (fxp*/fab*/em*). Only a TRUE lifeline (fxp0, em0, fab*, or a configured
+  chassis-cluster control/fabric interface) takes the lightweight management-only
+  branch; a zoned NON-lifeline DHCP interface (e.g. a standalone `fxp1`) now forces
+  the full recompile that builds its address-scoped host-inbound fence, closing the
+  addressless→addressed gap where the broad class exempted it from that reapply.
   **Lifeline safety:** a zone with NO stanza emits no deny (admit-all);
   management/cluster-control interfaces (fxp0 / em0 / fab*) are excluded from
   the address sets so a host-inbound deny can never strand management or break

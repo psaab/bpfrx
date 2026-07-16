@@ -33,6 +33,114 @@
   BOTH directions: neutralize the lease-side arm → RED (lease teardown DELETED
   host-a.example.com=10.0.0.10); neutralize the Surface A per-target skip → RED
   (surface A teardown DELETED wan.example.net=203.0.113.5). Restored → GREEN.
+## 2026-07-16 — #5791 (DHCP/host-inbound): gate lease-change recompile skip on host-inbound lifeline set, not the broad mgmt-VRF name class
+- **Timestamp**: 2026-07-16 (fix/5791-dhcp-hostinbound-reapply)
+- **Action**: Fix #5791 (security). `dhcpLeaseChangeRequiresRecompile`
+  (pkg/daemon/daemon_dhcp.go) decided whether a DHCP lease change may SKIP the
+  full dataplane/config reapply by testing each DHCP interface against the BROAD
+  management-VRF name class (`mgmtSet`, populated in daemon_apply.go from every
+  configured `fxp*`/`fab*`/`em*` interface). But the host-inbound LIFELINE class
+  is NARROWER (pkg/config/lifeline.go `HostInboundLifelineSet`): standalone
+  lifelines are only fxp0/em0/fab* (plus a configured chassis-cluster
+  control/fabric interface, #3277). So a zoned DHCP-only standalone `fxp1` — in
+  the broad mgmt class (`fxp*`) but NOT a lifeline — could start ADDRESSLESS
+  (no address-scoped host-inbound drop installed), acquire an address, and then
+  SKIP the reapply that rebuilds the host-inbound fence for the newly-reachable
+  address → the new address was reachable with NO host-inbound fence (security
+  gap). Fix: gate the skip on the config-derived host-inbound lifeline set — the
+  SAME `config.HostInboundLifelineSet` / `HostInboundLifelineInterface` the fence
+  application uses (pkg/dataplane/userspace/zones_host_inbound.go,
+  pkg/daemon/daemon_nft.go) — NOT the broad name class, so the skip decision and
+  the fence application agree by construction (no second, drifting classifier).
+  A non-lifeline DHCP interface now forces the full recompile that builds its
+  fence; a TRUE lifeline (fxp0 DHCPv4, em0, fab*, or a configured
+  control-interface) keeps the lightweight management-only fast path (no
+  churn/perf regression on routine mgmt lease renewals). Base-name mapping
+  (`fxp1.0`→`fxp1`) is handled by `HostInboundLifelineInterface`/`LifelineBaseName`
+  exactly as the fence does it. Kept the conservative
+  `len(mgmtSet)==0 → recompile` liveness guard (before-first-apply /
+  VRF-create-failed). Fail-on-revert PROVEN firsthand: new
+  `TestDHCPLeaseChangeRequiresRecompile_ZonedNonLifelineFxp1` asserts the REAL
+  recompile decision is TRUE for a zoned standalone fxp1; neutralizing the fix
+  (revert the per-interface proxy to `mgmtSet[config.DHCPLeaseIfName(...)]`) →
+  RED (`must require the full recompile so its address-scoped host-inbound fence
+  is (re)built`); restored → GREEN. Regression guards (all GREEN both ways):
+  `_LifelineFastPathPreserved` (fxp0/em0/fab0 still skip),
+  `_ClusterControlFxp1` (fxp1 as control-interface → lifeline → skip preserved),
+  `_ZonedDataInterfaceUnchanged` (ge-0/0/3 still recompiles). Validation:
+  `go build ./...` + `go vet ./pkg/daemon ./pkg/config` clean; `gofmt` clean;
+  `pkg/daemon` (24.6s) + `pkg/config` (148.6s) full suites `-race` GREEN.
+  Go-only, no cargo. Control-plane change → no loss-cluster smoke; gated on the
+  fail-on-revert unit tests.
+- **File(s)**: pkg/daemon/daemon_dhcp.go (edit — lifeline-set skip gate),
+  pkg/daemon/dhcp_recompile_test.go (edit — fail-on-revert + 3 regression
+  guards), pkg/daemon/README.md (edit — #5791 recompile-skip contract),
+  docs/host-inbound-service-matrix.md (edit — #5791 fixed note)
+
+## 2026-07-16 — #5836 (dataplane loader): scope ifindex preflight to XPF-referenced links (codex-183)
+- **Timestamp**: 2026-07-16 (fix/5836-ifindex-preflight-scope)
+- **Action**: Fix #5836. `preflightCheckIfindexCaps` enumerated the WHOLE host
+  netns via `netlink.LinkList` and rejected the compile if ANY link had an
+  ifindex outside `[0, MaxInterfaces)` — so an unrelated bridge/veth/container
+  link or an abandoned operator netdev that churned past 65536 failed EVERY
+  subsequent userspace-dataplane compile, even though XPF's managed ports stayed
+  low. Chose **Option A (SCOPE)**: the preflight now takes a `referenced` set
+  and rejects only links XPF actually attaches AF_XDP to — the compiled port set
+  `result.pendingXDP` (physical zone interfaces, RETH members, VLAN parents,
+  tunnels, fabric parents, all resolved to `physIface.Index` in
+  compiler_iface.go). Moved both call sites (`CompileUserspaceShim` in loader.go;
+  retired-eBPF `Manager.Compile` in compiler.go) to run the check AFTER
+  `CompileConfig` so `pendingXDP` is populated — safe because every
+  ifindex-touching method of `userspaceShimCompileDataplane` (AddTxPort/SetZone/
+  SetVlanIfaceInfo/SetMirrorConfig) is a no-op, so CompileConfig writes no
+  ifindex-keyed kernel map before the check. Real fail-closed guardrails
+  UNCHANGED and preserved: `AddTxPort` tx_ports cap (loader.go) and the
+  `userspace_bindings` ARRAY cap `idx=ifindex*16+queue >= BindingArrayMaxEntries`
+  (userspace/maps_sync.go:696) still reject a genuinely-too-high XPF-mapped
+  ifindex. `userspace_ingress_ifaces` is a HASH (key=ifindex, no cap needed).
+  Rejected Option B (remove global preflight) because the userspace_bindings
+  guard fires at status-sync time (not compile) and the watchdog re-sync path
+  only logs-and-skips — keeping a scoped compile-time early-warning is safer.
+  Added `ifindexSet` helper. Tests (fail-on-revert, both firsthand RED-verified):
+  new `TestPreflightCheckIfindexCaps_UnrelatedHighIfindexIgnored` (the #5836 fix
+  — RED when scope guard reverted to whole-namespace),
+  `_ReferencedHighIfindexRejected` (real guard — RED when cap comparison
+  removed), `_EmptyReferencedPasses`; existing preflight tests updated to the
+  scoped signature. Build/vet clean; `pkg/dataplane` (minus pre-existing
+  unrelated `TestUserspaceManagerDoesNotImportReflectOrUnsafe`) + full
+  `pkg/dataplane/userspace` GREEN under `-race`.
+- **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/compiler.go, pkg/dataplane/constants_test.go, _Log.md
+## 2026-07-16 — #5682 (security/HA): unreadable kernel-upgrade journal bypasses candidate election hold (codex-182 M24)
+- **Timestamp**: 2026-07-16 (fix/5682-upgrade-journal-failclosed)
+- **Action**: Fix #5682. `holdSecondaryIfKernelCandidateArmed`
+  (`pkg/daemon/kernel_selfrecover.go`) read the kernel-upgrade journal via
+  `KernelRunner.IsArmed()` and, on `err != nil || !armed`, RETURNED without
+  setting the election hold. `loadKernelJournal` already folds a clean `ENOENT`
+  to `KernelStateInit`+nil-err, so the `err != nil` branch is reached ONLY on a
+  genuine READ/PARSE failure (I/O error, corruption, malformed content) — an
+  UNREADABLE journal that CORRELATES with a bad upgrade. Treating it as "not
+  armed" failed OPEN: the node ran a normal candidate election, bypassing the
+  #1930 A/B kernel promote/rollback hold. Fix: split the branch — on `err != nil`
+  set `SetKernelUpgradeHold()` (fail-CLOSED, `slog.Warn` once) + mark
+  `Daemon.kernelUpgradeHoldFailClosed`; on `!armed` (clean read) proceed; on
+  armed hold as before. ENOENT still proceeds (never-armed node not bricked).
+  Not-stranded: `reconcileKernelUpgradeHold` self-heals a fail-closed hold — a
+  later successful NOT-armed read RELEASES it (transient blip), an armed read
+  CONVERTS it to a normal marker-gated hold, a still-unreadable read keeps
+  holding; the strict promotion-marker release is preserved for a genuinely-armed
+  hold (revert-window safety unchanged). Added `kernelRunnerFn`/`kernelSystemFn`
+  test seams to `Daemon`. Tests (fail-on-revert, firsthand RED-verified):
+  `kernel_upgrade_hold_failclosed_5682_test.go` — 4 mandated states
+  (unreadable-parse + unreadable-I/O→hold; ENOENT→no hold; armed→hold;
+  valid-not-armed→no hold) + self-heal release/convert + armed-marker-release
+  regression. Neutralizing the fix (unreadable→return) turned the two unreadable
+  cases + self-heal precondition RED. `go build ./...`, `go vet`, and full
+  `pkg/daemon` + `pkg/cluster` suites GREEN under `-race`. Docs:
+  `docs/in-place-upgrade.md` LANE-1 §"Election hold" item 1 updated with the
+  fail-closed + ENOENT-distinction + self-heal contract.
+- **File(s)**: pkg/daemon/kernel_selfrecover.go, pkg/daemon/daemon.go,
+  pkg/daemon/kernel_upgrade_hold_failclosed_5682_test.go (new),
+  docs/in-place-upgrade.md, _Log.md
 
 ## 2026-07-16 — #5765 (Rust dataplane): u16 length-cast defense-in-depth (claude-spark-review-002)
 - **Timestamp**: 2026-07-16 (fix/5765-u16-lencast-hardening)
