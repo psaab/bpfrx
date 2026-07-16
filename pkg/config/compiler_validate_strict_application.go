@@ -721,3 +721,97 @@ func icmpConstraintDesc(app *Application) string {
 func ApplicationsToValidateStrict(cfg *Config) map[string]struct{} {
 	return applicationsToValidateStrict(cfg)
 }
+
+// ReservedApplicationName is the AppID display/filter sentinel that means "no
+// known application" (appid.Unknown == "UNKNOWN", pkg/appid/runtime.go).
+// ResolveSessionName returns this literal for an unstamped / catalog-skew
+// session when `services application-identification` is enabled, and
+// SessionMatches compares an operator `show ... application <name>` /
+// `clear ... application <name>` filter against the flattened result string. A
+// user-defined application (or application-set) name is carried verbatim into
+// that same flattened string, so a catalog application literally named
+// "UNKNOWN" is indistinguishable from the sentinel: a `show`/`clear` filter
+// cannot separate "no known application" from the configured application, and a
+// destructive filtered session clear can delete BOTH classes (#5821).
+//
+// pkg/config cannot import pkg/appid (appid imports config — an import cycle),
+// so the literal is duplicated here rather than referenced. The pkg/appid
+// canary TestReservedApplicationNameMatchesUnknownSentinel asserts the two stay
+// equal so the reservation cannot drift away from the sentinel it protects.
+const ReservedApplicationName = "UNKNOWN"
+
+// validateReservedApplicationNamesStrict hard-rejects, at commit /
+// commit-check, a user-defined `applications application <name>` or
+// `applications application-set <name>` whose name equals the AppID unknown
+// sentinel (ReservedApplicationName == "UNKNOWN") CASE-INSENSITIVELY (#5821).
+//
+// Without this reservation the sentinel and a real catalog application share
+// one flat string on the AppID display/filter surface (ResolveSessionName /
+// SessionMatches, pkg/appid/runtime.go): `show ... application UNKNOWN` cannot
+// tell truly-unknown sessions from sessions classified as the user application,
+// and the destructive `clear ... application UNKNOWN` selector can delete both
+// groups. SessionMatches already folds case (strings.EqualFold), so "unknown"
+// and "Unknown" collide with the sentinel too; the reservation is therefore
+// case-insensitive to keep the whole case-folded name-slot owned by the
+// sentinel.
+//
+// Applications and application-sets share one flat Junos namespace, and a
+// multi-term application additionally mints an implicit application-set under
+// its own name (cfg.Applications.ApplicationSets[<parent>]). Both maps are
+// walked so every authored spelling is caught: a simple `application UNKNOWN`
+// lands in Applications; an `application-set UNKNOWN` (or the implicit set of a
+// multi-term `application UNKNOWN`) lands in ApplicationSets. Generated per-term
+// names (`<parent>-<term>`) never equal the reserved name, so they are
+// unaffected. Iteration is sorted so the first-reported error is deterministic.
+//
+// This is a NEW fail-closed restriction (#5821): a previously-valid config that
+// already named an application/application-set UNKNOWN now hard-rejects on the
+// operator's next commit — the intended fix, called out as a release-note
+// behavior change (mirroring the #5539 RETH-generic guard). Strict on the
+// commit / commit-check path; the call site (compiler_uniformgates.go,
+// lenientReservedApplicationNames) downgrades a returned error to a warning on
+// the tolerant load / peer-sync path so an already-persisted or peer-synced
+// config carrying the reserved name still BOOTS (#1960 no-brick) rather than
+// bricking a running node on upgrade. Mirrors the strict commit-reservation
+// pattern of validateVRRPGroupIDStrict (#4573) and the sibling application
+// gates.
+func validateReservedApplicationNamesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	appNames := make([]string, 0, len(cfg.Applications.Applications))
+	for name := range cfg.Applications.Applications {
+		appNames = append(appNames, name)
+	}
+	sort.Strings(appNames)
+	for _, name := range appNames {
+		if strings.EqualFold(name, ReservedApplicationName) {
+			return reservedApplicationNameError("application", name)
+		}
+	}
+	setNames := make([]string, 0, len(cfg.Applications.ApplicationSets))
+	for name := range cfg.Applications.ApplicationSets {
+		setNames = append(setNames, name)
+	}
+	sort.Strings(setNames)
+	for _, name := range setNames {
+		if strings.EqualFold(name, ReservedApplicationName) {
+			return reservedApplicationNameError("application-set", name)
+		}
+	}
+	return nil
+}
+
+// reservedApplicationNameError builds the operator-visible commit error for a
+// user application / application-set that collides with the AppID unknown
+// sentinel. kind is "application" or "application-set".
+func reservedApplicationNameError(kind, name string) error {
+	return fmt.Errorf(
+		"applications %s %q: %q is reserved as the AppID \"no known application\" "+
+			"sentinel and may not name a user application or application-set "+
+			"(reserved case-insensitively) — the `show`/`clear ... application "+
+			"<name>` filter and the session renderer cannot distinguish a real "+
+			"application named %q from the unclassified/unstamped state, so a "+
+			"filtered session clear could delete both; rename it (#5821)",
+		kind, name, ReservedApplicationName, ReservedApplicationName)
+}
