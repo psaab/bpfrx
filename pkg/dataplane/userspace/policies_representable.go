@@ -59,7 +59,7 @@ func allAddressTokensRepresentable(addrRepresentable func(tok string) bool, addr
 // representable+enforced when its feed is live, and #3261-rejected (sentinel,
 // fail-closed) only when the feed is currently empty (an empty row -> MatchNone
 // -> the deny would otherwise drop silently).
-func nameRepresentable(ab *config.AddressBook, feedOverlay map[string][]string, name string, visited map[string]bool) bool {
+func nameRepresentable(ab *config.AddressBook, feedOverlay map[string][]string, bindings map[string]*config.AddressBinding, name string, visited map[string]bool) bool {
 	// The closure must be BOTH structurally resolvable AND contribute >=1
 	// concrete prefix. The >=1-concrete requirement is enforced HERE, exactly
 	// once at the top, mirroring strict's single `count==0` reject after
@@ -68,7 +68,14 @@ func nameRepresentable(ab *config.AddressBook, feedOverlay map[string][]string, 
 	// -> rejected; a mutual-cycle-with-concrete set is (true,true) -> accepted.
 	// (A direct feed name never reaches here — addrRepresentable short-circuits
 	// it via feedOverlay, preserving the #2049 direct-feed exemption.)
-	r, c := nameRepresentability(ab, feedOverlay, name, visited)
+	//
+	// #5753: `bindings` (cfg.Security.DynamicAddress.AddressBindings) is threaded
+	// into the recursion so that a DECLARED dynamic-address binding buried inside
+	// a nested address-set whose feed is UNREADY (absent from feedOverlay) is
+	// recognized as unresolved and fails CLOSED even when a static alias of the
+	// same name exists — the nested-set arm of the #5645/#5751 partial-deny
+	// fail-open. See nameRepresentability.
+	r, c := nameRepresentability(ab, feedOverlay, bindings, name, visited)
 	return r && c
 }
 
@@ -116,7 +123,20 @@ func nameRepresentable(ab *config.AddressBook, feedOverlay map[string][]string, 
 // (addrRepresentable short-circuits feed names BEFORE nameRepresentable, so a
 // policy referencing a feed name directly never reaches the top `r && c` gate),
 // preserving the #2049 direct-feed exemption.
-func nameRepresentability(ab *config.AddressBook, feedOverlay map[string][]string, name string, visited map[string]bool) (representable, concrete bool) {
+//
+// #5753: `bindings` is the declared dynamic-address binding set
+// (cfg.Security.DynamicAddress.AddressBindings). It is consulted AFTER the
+// feedOverlay branch and BEFORE the static ab.Addresses lookup — mirroring the
+// top-level addrRepresentable ordering — so a member name that is a DECLARED
+// binding whose feed is currently UNREADY (hence absent from feedOverlay) is
+// treated as unresolvable (false, false) even when a static address-book alias
+// of the same name exists. This closes the nested-set arm of the #5645/#5751
+// partial-deny fail-open: without it, the walk would resolve the static alias
+// and enforce only the partial static subset while the unready feed's prefixes
+// go unmatched (a `deny` fail-OPEN). A READY feed is still in feedOverlay and
+// resolves normally in the branch above (no regression); a static alias with NO
+// declared binding of that name is untouched (no over-block).
+func nameRepresentability(ab *config.AddressBook, feedOverlay map[string][]string, bindings map[string]*config.AddressBinding, name string, visited map[string]bool) (representable, concrete bool) {
 	if name == "" {
 		return false, false
 	}
@@ -140,6 +160,22 @@ func nameRepresentability(ab *config.AddressBook, feedOverlay map[string][]strin
 		// nameRepresentable), preserving the #2049 direct-feed exemption.
 		return true, len(feeds) > 0
 	}
+	// #5753: a DECLARED dynamic-address binding that is ABSENT from feedOverlay is
+	// UNRESOLVED (at least one feed constituent has no installed snapshot yet —
+	// SnapshotForBindings publishes a binding only when ALL feeds are ready). A
+	// READY binding is in feedOverlay and already resolved by the branch above, so
+	// reaching here means the feed is unready. It must fail CLOSED even when a
+	// STATIC address-book entry of the SAME name exists (the ab.Addresses branch
+	// below): otherwise a nested `deny <set-containing-name>` would enforce only
+	// the partial static subset while the unready feed's prefixes go unmatched (a
+	// deny fail-OPEN). Returning (false,false) here poisons the enclosing set so
+	// buildOneRuleSnapshot emits the __unsupported_address__ sentinel and the Rust
+	// preflight rejects the whole snapshot (previous-good retained / fresh-boot
+	// default-deny) — the nested-set analogue of the top-level addrRepresentable
+	// guard (#5751). Indexing a nil bindings map is safe (zero value nil).
+	if bindings[name] != nil {
+		return false, false
+	}
 	if ab == nil {
 		return false, false
 	}
@@ -161,7 +197,7 @@ func nameRepresentability(ab *config.AddressBook, feedOverlay map[string][]strin
 	anyConcrete := false
 	for _, member := range set.Addresses {
 		hasMember = true
-		r, c := nameRepresentability(ab, feedOverlay, member, visited)
+		r, c := nameRepresentability(ab, feedOverlay, bindings, member, visited)
 		if !r {
 			// A structurally-invalid member poisons the parent — matches strict's
 			// abort on resolve()==false (also fires when the member is an EMPTY
@@ -172,7 +208,7 @@ func nameRepresentability(ab *config.AddressBook, feedOverlay map[string][]strin
 	}
 	for _, nested := range set.AddressSets {
 		hasMember = true
-		r, c := nameRepresentability(ab, feedOverlay, nested, visited)
+		r, c := nameRepresentability(ab, feedOverlay, bindings, nested, visited)
 		if !r {
 			return false, false
 		}
