@@ -226,6 +226,16 @@ func (c *ctl) handleClearSecurity(args []string) error {
 			return fmt.Errorf("%v", err)
 		}
 		fmt.Printf("%d IPv4 and %d IPv6 session entries cleared\n", resp.Ipv4Cleared, resp.Ipv6Cleared)
+		// #5882: clear is non-atomic (chunked v4-then-v6 + peer clear), so the
+		// backend reports partial-failure detail via Failures/FailureSummary
+		// with an OK RPC status rather than a hard error. Surface it here or the
+		// operator reads "N cleared" and a nil error as full success while some
+		// entries were never removed (a visible-error -> silent-success gap on
+		// both the clear-all and filtered paths). Mirrors the local CLI
+		// (pkg/cli/cli_clear.go).
+		if resp.Failures > 0 {
+			fmt.Printf("warning: %d failure(s) during clear: %s\n", resp.Failures, resp.FailureSummary)
+		}
 		return nil
 
 	case "policies":
