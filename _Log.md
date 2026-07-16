@@ -1,3 +1,38 @@
+## 2026-07-16 — #6036 fold: deterministic per-interface RA prefix order (#5861)
+
+- **Timestamp**: 2026-07-16 (fix/5861-ra-stable-active-reconcile)
+- **Action**: Folded the MERGE-READY reviewer MINOR on PR #6036. Root cause:
+  `desiredClusterRA` sorted the desired RA set BY interface but NOT the
+  `Prefixes` WITHIN each interface. `buildRAConfigs` appends DHCPv6-PD-delegated
+  prefixes in `DelegatedPrefixesForRA`'s map-iteration order (`m.delegatedPDs` is
+  a map). When 2+ delegated PDs target the SAME RA interface, their prefixes land
+  on one config's slice in nondeterministic order; because `raDesiredHash`
+  marshals order-sensitively and `ra.configEqual` compares prefixes
+  index-by-index, the new every-2s periodic cluster reconcile would FLAP the
+  digest → a spurious `ra.Apply` (sub-second RA gap) + a per-poll-tick apply log
+  (which the project's logging discipline forbids). Fix: `desiredClusterRA` now
+  sorts each interface's `Prefixes` by a stable total key (`sortRAPrefixes`:
+  Prefix string, then ValidLifetime/PreferredLife/OnLink/Autonomous tie-breaks;
+  nils last) after the by-interface sort. Safe to sort in place — `buildRAConfigs`
+  returns freshly-owned configs (static entries deep-cloned by
+  `cloneRAInterfaceConfig`, PD-only entries newly allocated), so no `Prefixes`
+  slice is aliased to the active config. Added `SeedDelegatedPrefixesForRATesting`
+  test seam to `pkg/dhcp/test_seams.go` so the daemon test can model several PD
+  sources feeding one RA interface.
+  Validation: `go build ./...` clean; `go vet ./pkg/daemon ./pkg/dhcp` clean;
+  `go test -race ./pkg/daemon` + `./pkg/dhcp` GREEN. New fail-on-revert test
+  `TestClusterRAMultiPDPrefixOrderStableNoFlap` drives the periodic reconcile 64×
+  on a stable-active owner and asserts ra.Apply fires exactly ONCE (no digest
+  flap) AND the applied prefixes are in sorted order; neutralizing the sort
+  (build stays green) reds it verbatim: "cluster RA reconcile flapped: ra.Apply
+  called 13 times across 64 stable reconciles, want exactly 1". The two existing
+  #5861 tests (TestClusterRAStableActiveReappliesOnCommit /
+  TestClusterRADemotionRaceDoesNotTransmit) stay GREEN.
+- **File(s)**: pkg/daemon/daemon_ra_reconcile.go (within-interface prefix sort +
+  sortRAPrefixes), pkg/daemon/ra_stable_active_5861_test.go (new flap-guard
+  test), pkg/dhcp/test_seams.go (SeedDelegatedPrefixesForRATesting seam),
+  pkg/daemon/README.md (per-RG RA reconcile idempotence: within-interface sort)
+
 ## 2026-07-16 — #5961 test: fail-on-revert cover config-sync transport wiring
 - **Timestamp**: 2026-07-16 (fix/5961-configsync-wiring-test)
 - **Action**: Closed the #5054 (PR #5958) test-coverage gap. The existing

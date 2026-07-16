@@ -1,12 +1,16 @@
 package daemon
 
 import (
+	"net/netip"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"sync"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
+	"github.com/psaab/xpf/pkg/dhcp"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -208,6 +212,89 @@ func TestClusterRADemotionRaceDoesNotTransmit(t *testing.T) {
 		if ra.Interface == "ge-0-0-0.50" {
 			t.Fatalf("demoted node's desired set still includes %s — the owner "+
 				"gate did not drop the demoted RG", ra.Interface)
+		}
+	}
+}
+
+// TestClusterRAMultiPDPrefixOrderStableNoFlap is the #6036 fold guard. When 2+
+// DHCPv6-PD-delegated prefixes target the SAME RA interface, buildRAConfigs
+// appends them in DelegatedPrefixesForRA's map-iteration order (m.delegatedPDs
+// is a map — nondeterministic across ranges). raDesiredHash marshals
+// order-sensitively and ra.configEqual compares prefixes index-by-index, so an
+// unsorted within-interface order makes the every-2s periodic cluster reconcile
+// FLAP the desired-set digest → a spurious ra.Apply (sub-second RA gap + a
+// per-poll-tick apply log the project's logging discipline forbids).
+//
+// desiredClusterRA now sorts each interface's Prefixes by a stable total key, so
+// the digest is invariant to the source order. This test seeds two PD sources
+// feeding one RA interface (reth0.50), runs reconcileClusterRAServices many times
+// on a stable-active owner, and asserts BOTH:
+//
+//   - ra.Apply is called exactly ONCE across all passes (the hash never flaps),
+//     and
+//   - the applied prefixes are in deterministic sorted order.
+//
+// Reverting the sort (the `for _, ra := range desired { sortRAPrefixes(...) }`
+// loop in desiredClusterRA) reds both assertions: the applied prefixes come out
+// in map order (not sorted → second assertion RED) and that order varies between
+// passes (digest flaps → ra.Apply re-fires → first assertion RED).
+func TestClusterRAMultiPDPrefixOrderStableNoFlap(t *testing.T) {
+	// Static RA prefix sorts into the MIDDLE of the PD prefixes, so no
+	// map-iteration interleaving of the two PD sources yields a globally sorted
+	// sequence — the sorted-order assertion is deterministically RED on revert.
+	const staticPrefix = "2001:db8:50::/64"
+	s := raClusterStore(t, staticPrefix)
+
+	// Two PD sources, each contributing two /64s to the SAME RA interface
+	// (reth0.50). Each source's own slice is reverse-sorted; combined with the
+	// nondeterministic cross-source map order, the pre-fix append order is never
+	// sorted.
+	mgr := dhcp.NewManagerForTesting(nil)
+	mgr.SeedDelegatedPrefixesForRATesting("ge-0/0/3", "reth0.50", []dhcp.DelegatedPrefix{
+		{Interface: "ge-0/0/3", Prefix: netip.MustParsePrefix("2001:db8:40::/64")},
+		{Interface: "ge-0/0/3", Prefix: netip.MustParsePrefix("2001:db8:10::/64")},
+	})
+	mgr.SeedDelegatedPrefixesForRATesting("ge-0/0/4", "reth0.50", []dhcp.DelegatedPrefix{
+		{Interface: "ge-0/0/4", Prefix: netip.MustParsePrefix("2001:db8:90::/64")},
+		{Interface: "ge-0/0/4", Prefix: netip.MustParsePrefix("2001:db8:60::/64")},
+	})
+
+	spy := &raApplySpy{}
+	d := &Daemon{
+		store:     s,
+		dhcp:      mgr,
+		rgStates:  make(map[int]*rgStateMachine),
+		raApplyFn: spy.apply,
+	}
+	// Stable-active owner of RG1 — no transition for the rest of the test.
+	d.getOrCreateRGState(1).SetVRRP("reth0", true)
+
+	// Drive the periodic reconcile many times. Each pass re-derives the desired
+	// set (re-ranging m.delegatedPDs), so the digest must be invariant to the
+	// map order for the hash gate to hold ra.Apply at a single call.
+	const passes = 64
+	for i := 0; i < passes; i++ {
+		d.reconcileClusterRAServices("periodic")
+	}
+
+	if got := spy.count(); got != 1 {
+		t.Fatalf("cluster RA reconcile flapped: ra.Apply called %d times across %d "+
+			"stable reconciles, want exactly 1 (unsorted per-interface prefix order "+
+			"made the desired-set digest nondeterministic — #6036)", got, passes)
+	}
+
+	got := spy.lastPrefixes()
+	want := append([]string(nil), got...)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("applied RA prefixes are not in deterministic sorted order:\n got  %v\n want %v\n"+
+			"(desiredClusterRA must sort each interface's Prefixes — #6036)", got, want)
+	}
+	// Sanity: every seeded prefix plus the static one made it through.
+	for _, p := range []string{staticPrefix, "2001:db8:40::/64", "2001:db8:10::/64",
+		"2001:db8:90::/64", "2001:db8:60::/64"} {
+		if !contains(got, p) {
+			t.Fatalf("applied RA set dropped prefix %s; got %v", p, got)
 		}
 	}
 }

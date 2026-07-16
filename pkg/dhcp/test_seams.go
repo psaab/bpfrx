@@ -49,6 +49,25 @@ func NewManagerForTestingWithHooks(runClient func(ctx context.Context, ifaceName
 	}
 }
 
+// SeedDelegatedPrefixesForRATesting installs delegated prefixes under
+// sourceIface (preserving the given slice order within that source) and points
+// that source's DHCPv6 RA target at raIface, so DelegatedPrefixesForRA surfaces
+// them. Calling it with distinct sourceIface values but the same raIface models
+// several PD sources feeding one RA interface — the cross-source iteration order
+// is then map-nondeterministic, exactly the #6036 hash-flap input. Test-only;
+// not for production callers.
+func (m *Manager) SeedDelegatedPrefixesForRATesting(sourceIface, raIface string, pds []DelegatedPrefix) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.delegatedPDs[sourceIface] = append(m.delegatedPDs[sourceIface], pds...)
+	opts := m.v6opts[sourceIface]
+	if opts == nil {
+		opts = &DHCPv6Options{}
+		m.v6opts[sourceIface] = opts
+	}
+	opts.RAIface = raIface
+}
+
 // RunningClientHandlesForTesting returns an opaque handle per running
 // client keyed "iface/4" or "iface/6". Handles compare equal across
 // calls iff the same client goroutine is still registered — tests use

@@ -236,7 +236,16 @@ goodbye only from the current owner (`ra.Apply`'s graceful-withdraw path).
 **Idempotence.** A stable digest of the desired set (`lastRAReconcileHash`,
 updated only on a successful apply) gates the actual `ra.Apply`, so the
 periodic safety pass costs nothing when nothing moved and a transient apply
-error is retried on the next pass rather than latched as converged.
+error is retried on the next pass rather than latched as converged. For the
+digest to be stable, `desiredClusterRA` sorts the desired set both BY interface
+(the ownership snapshot iterates maps) AND, within each interface, its
+`Prefixes` slice (`sortRAPrefixes`). Without the within-interface sort, 2+
+DHCPv6-PD-delegated prefixes targeting one RA interface would append in
+`DelegatedPrefixesForRA`'s map-iteration order — nondeterministic — and, because
+the digest marshals order-sensitively and `ra.configEqual` compares prefixes
+index-by-index, the every-2s reconcile would FLAP the hash and spuriously
+re-apply RA (a sub-second RA gap + a per-poll-tick apply log). The in-place sort
+is safe because `buildRAConfigs` returns freshly-owned configs (#6036).
 
 ### Direct-mode VIP failover (private-rg-election / no-reth-vrrp)
 

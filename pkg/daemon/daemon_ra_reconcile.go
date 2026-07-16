@@ -109,7 +109,49 @@ func (d *Daemon) desiredClusterRA(cfg *config.Config) []*config.RAInterfaceConfi
 	sort.Slice(desired, func(i, j int) bool {
 		return desired[i].Interface < desired[j].Interface
 	})
+	// Sort the prefixes WITHIN each interface too. buildRAConfigs appends
+	// DHCPv6-PD-delegated prefixes in DelegatedPrefixesForRA's map-iteration
+	// order (m.delegatedPDs is a map), so when 2+ delegated PDs target the same
+	// RA interface their prefixes land on one config's slice in nondeterministic
+	// order. raDesiredHash marshals order-sensitively and ra.configEqual compares
+	// prefixes index-by-index, so an unsorted order would flap the digest and make
+	// the every-2s periodic reconcile spuriously re-apply RA (a sub-second RA gap
+	// + a per-poll-tick apply log). Sorting here gives a stable, total order.
+	// This is safe to do in place: buildRAConfigs returns freshly-owned configs
+	// (static entries are deep-cloned by cloneRAInterfaceConfig, PD-only entries
+	// are newly allocated), so no Prefixes slice is aliased to the active config.
+	for _, ra := range desired {
+		sortRAPrefixes(ra.Prefixes)
+	}
 	return desired
+}
+
+// sortRAPrefixes orders an RA interface's advertised prefixes by a stable, total
+// key so the desired-set digest and ra.configEqual observe a deterministic order
+// regardless of the source (map-iteration) order. nil entries sort last so a
+// slice carrying a nil placeholder still has a total order. Callers must own the
+// slice (see desiredClusterRA's in-place-sort safety note).
+func sortRAPrefixes(prefixes []*config.RAPrefix) {
+	sort.SliceStable(prefixes, func(i, j int) bool {
+		a, b := prefixes[i], prefixes[j]
+		if a == nil || b == nil {
+			// Non-nil before nil; two nils compare equal (stable keeps order).
+			return a != nil && b == nil
+		}
+		if a.Prefix != b.Prefix {
+			return a.Prefix < b.Prefix
+		}
+		if a.ValidLifetime != b.ValidLifetime {
+			return a.ValidLifetime < b.ValidLifetime
+		}
+		if a.PreferredLife != b.PreferredLife {
+			return a.PreferredLife < b.PreferredLife
+		}
+		if a.OnLink != b.OnLink {
+			return !a.OnLink // false sorts before true
+		}
+		return !a.Autonomous && b.Autonomous
+	})
 }
 
 // raDesiredHash returns a stable digest of the desired RA set. An empty set
