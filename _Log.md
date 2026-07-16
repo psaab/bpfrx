@@ -49131,3 +49131,30 @@ top.
     pkg/config/compiler_interface_unit_alias.go, pkg/config/compiler.go,
     pkg/config/compiler_prewalk.go,
     pkg/config/interface_unit_parity_5878_test.go, docs/config-schema.md
+- **Timestamp**: 2026-07-16
+  - **Action**: #5820 AppID session-match case sensitivity (Option A). Made
+    SessionMatches (pkg/appid/runtime.go) compare the operator `show`/`clear ...
+    application <name>` filter against the resolved application name with
+    case-EXACT equality (`==`) instead of strings.EqualFold. Application names are
+    case-sensitive identifiers everywhere else in the stack (parser, store,
+    resolver, catalog, AppID stamping), so the fold was the sole inconsistency: a
+    single-case filter collapsed two distinct apps on the display path and — since
+    the same predicate drives the destructive ClearSessions walk — broadened a
+    filtered clear to delete sessions the operator did not name. Coupled refinement
+    of #5821: relaxed validateReservedApplicationNamesStrict (compiler_validate_
+    strict_application.go) from EqualFold to exact `==` on both the application and
+    application-set walks — the sentinel is only ever rendered upper-case UNKNOWN
+    and matching is now case-exact, so only an app literally named UNKNOWN can
+    alias it; `unknown`/`Unknown` are now ACCEPTED. Flipped the #5821
+    TestReservedApplicationNameCaseVariantsRejected → CaseVariantsAccepted; updated
+    TestSessionMatchesUnknown to case-exact; added TestSessionMatchesCaseSensitive-
+    5820 (Payroll/payroll + JUNOS-HTTP/junos-http). Fail-on-revert proven for all
+    three (restoring EqualFold turns them RED). No dataplane/catalog/wire change; no
+    config previously accepted is now rejected (one #5821 class is re-accepted).
+    Validation: go build ./..., go vet, go test -race ./pkg/appid ./pkg/config all
+    green.
+  - **File(s)**: pkg/appid/runtime.go, pkg/appid/runtime_test.go,
+    pkg/appid/session_match_case_5820_test.go,
+    pkg/config/compiler_validate_strict_application.go,
+    pkg/config/compiler_reserved_appname_5821_test.go,
+    docs/services-application-identification.md

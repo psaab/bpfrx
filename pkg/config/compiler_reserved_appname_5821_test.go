@@ -14,11 +14,16 @@ import (
 // sessions from the configured app, and a filtered clear could delete both.
 //
 // These tests pin the strict reject at commit (CompileConfig) for the
-// application, application-set, and multi-term (implicit-set) spellings and for
-// every casing variant (SessionMatches folds case, so the reservation is
-// case-insensitive), plus the lenient downgrade-to-warning on the tolerant load
-// / peer-sync path (CompileConfigLenient) so an already-persisted config still
-// boots (#1960).
+// application, application-set, and multi-term (implicit-set) spellings of the
+// EXACT sentinel `UNKNOWN`, plus the lenient downgrade-to-warning on the
+// tolerant load / peer-sync path (CompileConfigLenient) so an already-persisted
+// config still boots (#1960).
+//
+// #5820 relaxed the reservation from case-insensitive to case-sensitive: the
+// sentinel is only ever rendered upper-case `UNKNOWN` and SessionMatches now
+// compares filters case-exactly, so casing variants ("unknown"/"Unknown") are
+// distinct application names that no longer alias the sentinel and are ACCEPTED
+// (see TestReservedApplicationNameCaseVariantsAccepted).
 //
 // buildTreeFromSet (ipsec_proposal_ref_test.go) builds the candidate tree the
 // way the configstore does (ParseSetCommand + SetPath), NOT NewParser — the
@@ -42,20 +47,24 @@ func TestReservedApplicationNameRejected(t *testing.T) {
 	}
 }
 
-// Casing variants must collide too: SessionMatches folds case, so "unknown" and
-// "Unknown" alias the sentinel just as "UNKNOWN" does.
-func TestReservedApplicationNameCaseVariantsRejected(t *testing.T) {
+// #5820: casing variants are now DISTINCT application names, not aliases of the
+// sentinel. The sentinel is only ever rendered upper-case `UNKNOWN` by
+// ResolveSessionName and SessionMatches compares filters case-exactly, so
+// "unknown"/"Unknown"/"uNkNoWn" can no longer collide with `UNKNOWN` on the
+// display/filter surface — the reservation is case-sensitive and ACCEPTS them.
+//
+// FAIL-ON-REVERT: restoring the pre-#5820 case-fold predicate in
+// validateReservedApplicationNamesStrict (strings.EqualFold(name,
+// ReservedApplicationName)) makes CompileConfig REJECT these variants again, so
+// this test goes RED (expects acceptance, gets a reserved-name error).
+func TestReservedApplicationNameCaseVariantsAccepted(t *testing.T) {
 	for _, variant := range []string{"unknown", "Unknown", "uNkNoWn"} {
 		tree := buildTreeFromSet(t, []string{
 			"set applications application " + variant + " protocol tcp",
 			"set applications application " + variant + " destination-port 80",
 		})
-		_, err := CompileConfig(tree)
-		if err == nil {
-			t.Fatalf("CompileConfig: expected rejection of application named %q (case variant of the sentinel), got nil", variant)
-		}
-		if !strings.Contains(err.Error(), "reserved") {
-			t.Fatalf("variant %q: unexpected error text: %v", variant, err)
+		if _, err := CompileConfig(tree); err != nil {
+			t.Fatalf("CompileConfig: expected case variant %q of the sentinel to be ACCEPTED (case-sensitive reservation, #5820), got: %v", variant, err)
 		}
 	}
 }
