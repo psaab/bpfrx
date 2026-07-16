@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
 )
 
@@ -212,10 +213,11 @@ type vrrpInstance struct {
 	lastDropWarn atomic.Int64
 
 	// GARP suppression for strict-vip-ownership mode.
-	suppressGARP  atomic.Bool   // when true, becomeMaster() skips GARP/NA
-	garpEpoch     atomic.Uint64 // incremented on each becomeMaster()/ReconcileVIPs transition
-	lastGARPEpoch atomic.Uint64 // epoch of last completed sendGARP()
-	lastGARPTime  atomic.Int64  // Unix nanos of last GARP send (dampens routine GARP only; forced sends bypass — see garpSendAllowed)
+	suppressGARP    atomic.Bool   // when true, becomeMaster() skips GARP/NA
+	garpEpoch       atomic.Uint64 // incremented on each becomeMaster()/ReconcileVIPs transition
+	lastGARPEpoch   atomic.Uint64 // epoch of last completed sendGARP()
+	lastGARPTime    atomic.Int64  // Unix nanos of last GARP send (dampens routine GARP only; forced sends bypass — see garpSendAllowed)
+	garpClampWarned atomic.Bool   // #5695: guards a once-per-instance warn when a configured GARPCount is clamped (never per-send)
 
 	// onEventDrop is called when an event is dropped due to a full eventCh.
 	// Set by the manager to trigger immediate reconciliation.
@@ -2243,6 +2245,15 @@ func (vi *vrrpInstance) garpSendAllowed(force bool, nowNanos int64) bool {
 // sender (#2152) without performing real AF_PACKET I/O.
 var arpProbeFn = cluster.SendARPProbe
 
+// garpBurstFn / naBurstFn are the IPv4 gratuitous-ARP / IPv6 unsolicited-NA
+// burst senders used by sendGARP. They are package vars so tests can capture
+// the burst COUNT sendGARP passes, proving the #5695 runtime clamp bounds the
+// effective per-VIP burst budget without performing real AF_PACKET I/O.
+var (
+	garpBurstFn = cluster.SendGratuitousARPBurstGated
+	naBurstFn   = cluster.SendGratuitousIPv6BurstGated
+)
+
 // GatewayProbeTarget computes the supplementary gateway-probe target for an
 // IPv4 VIP subnet: the first usable host address (network address + 1), which
 // is the most common gateway address. The second return value reports whether
@@ -2311,6 +2322,19 @@ func (vi *vrrpInstance) sendGARP(force bool) {
 	count := vi.cfg.GARPCount
 	if count <= 0 {
 		count = 3 // default
+	} else if clamped, was := config.ClampGratuitousARPCount(count); was {
+		// #5695 (codex-182 M16): an unbounded configured count fans the full
+		// per-VIP burst (1 immediate frame + (count-1) 50ms follow-ups) on
+		// every failover — a self-inflicted CPU/socket-exhaustion vector.
+		// Clamp to the runtime safety maximum. Warn at most ONCE per instance
+		// (never per-send: sendGARP runs on the per-failover path — logging
+		// rules forbid a Warn inside it).
+		if vi.garpClampWarned.CompareAndSwap(false, true) {
+			slog.Warn("vrrp: gratuitous-arp-count clamped to runtime safety maximum",
+				"key", vi.key(), "configured", count, "clamped", clamped,
+				"max", config.GratuitousARPBurstClamp)
+		}
+		count = clamped
 	}
 	// Abdication gate for the detached burst follow-up loops (#2867). The
 	// cluster burst helpers send the first frame synchronously, then fan the
@@ -2331,7 +2355,7 @@ func (vi *vrrpInstance) sendGARP(force bool) {
 			continue
 		}
 		if ip.To4() != nil {
-			if err := cluster.SendGratuitousARPBurstGated(vi.cfg.Interface, ip, count, stillMaster); err != nil {
+			if err := garpBurstFn(vi.cfg.Interface, ip, count, stillMaster); err != nil {
 				slog.Warn("vrrp: GARP failed", "key", vi.key(), "vip", ip, "err", err)
 			}
 			// Probe the first usable host (network address + 1) of the
@@ -2354,7 +2378,7 @@ func (vi *vrrpInstance) sendGARP(force bool) {
 				}
 			}
 		} else {
-			if err := cluster.SendGratuitousIPv6BurstGated(vi.cfg.Interface, ip, count, stillMaster); err != nil {
+			if err := naBurstFn(vi.cfg.Interface, ip, count, stillMaster); err != nil {
 				slog.Warn("vrrp: NA failed", "key", vi.key(), "vip", ip, "err", err)
 			}
 		}

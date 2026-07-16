@@ -528,6 +528,24 @@ func (d *Daemon) directBurstStillValid(rgID int, seq uint64) cluster.BurstStillV
 	}
 }
 
+// warnGARPClampOnce reports whether the #5695 "gratuitous-arp-count clamped"
+// warning for rgID has not yet been logged, recording it so subsequent
+// direct-mode bursts for the same RG stay silent. directSendGARPs runs on the
+// per-failover path, so the clamp warning must fire at most once per RG (the
+// logging rules forbid a per-send Warn).
+func (d *Daemon) warnGARPClampOnce(rgID int) bool {
+	d.garpClampWarnMu.Lock()
+	defer d.garpClampWarnMu.Unlock()
+	if d.garpClampWarned == nil {
+		d.garpClampWarned = make(map[int]bool)
+	}
+	if d.garpClampWarned[rgID] {
+		return false
+	}
+	d.garpClampWarned[rgID] = true
+	return true
+}
+
 // directSendGARPs sends gratuitous ARP/IPv6 NA bursts for all VIPs in the
 // given RG. Reads per-RG GratuitousARPCount (default 3).
 func (d *Daemon) directSendGARPs(rgID int) {
@@ -551,6 +569,20 @@ func (d *Daemon) directSendGARPs(rgID int) {
 				garpCount = rg.GratuitousARPCount
 			}
 		}
+	}
+	// #5695 (codex-182 M16): clamp the configured count to the runtime safety
+	// maximum before it drives per-VIP raw-socket bursts. Without the clamp an
+	// unbounded count would fan (count-1) 50ms follow-up frames per VIP on
+	// every direct-mode failover — a self-inflicted CPU/socket-exhaustion
+	// vector. Warn at most ONCE per RG (directSendGARPs runs on the
+	// per-failover path — never Warn per send).
+	if clamped, was := config.ClampGratuitousARPCount(garpCount); was {
+		if d.warnGARPClampOnce(rgID) {
+			slog.Warn("directSendGARPs: gratuitous-arp-count clamped to runtime safety maximum",
+				"rg", rgID, "configured", garpCount, "clamped", clamped,
+				"max", config.GratuitousARPBurstClamp)
+		}
+		garpCount = clamped
 	}
 
 	vipMap := vrrp.RethVIPsForRG(cfg, rgID)

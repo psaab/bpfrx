@@ -471,6 +471,14 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// #5695 (codex-182 M16): a redundancy-group gratuitous-arp-count over the
+	// runtime clamp (config.GratuitousARPBurstClamp) is accepted and compiled
+	// verbatim but WARNS — the value is clamped at runtime, never used as
+	// written. Never an error: the no-schema-only-caps doctrine forbids a
+	// commit hard-reject of a count the runtime safely clamps. The clamp itself
+	// (pkg/vrrp sendGARP, pkg/daemon directSendGARPs) is the primary fix.
+	garpCountWarnings := validateGratuitousARPCountAST(tree.Children)
+
 	var warnings []string
 	warnings = append(warnings, ctrlCharWarnings...)
 	warnings = append(warnings, trackWarnings...)
@@ -497,5 +505,6 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, dnatToScopeWarnings...)
 	warnings = append(warnings, natMixedScopeWarnings...)
 	warnings = append(warnings, chassisIdentityWarnings...)
+	warnings = append(warnings, garpCountWarnings...)
 	return warnings, nil
 }

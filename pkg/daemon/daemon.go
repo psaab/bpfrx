@@ -704,6 +704,11 @@ type Daemon struct {
 	// VIP presence/removal idempotently every pass.
 	directVIPMu    sync.Mutex
 	directVIPOwned map[int]bool
+	// garpClampWarned dedups the #5695 per-RG "gratuitous-arp-count clamped"
+	// warning so directSendGARPs (per-failover path) logs it at most once per
+	// RG, not per send. Guarded by garpClampWarnMu.
+	garpClampWarnMu sync.Mutex
+	garpClampWarned map[int]bool
 	// localFailoverCommitReady tracks whether this node has already
 	// applied the local side of a freshly committed transfer request for
 	// each RG. The cluster manager waits on this before telling the peer
