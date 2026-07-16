@@ -529,6 +529,39 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 	return d.applyAndSyncCommitted(oldActive, compiled, syncPeer)
 }
 
+// commitAndApplyOperator is the peer-sync-aware entry point for an
+// OPERATOR-initiated plain commit. The gRPC, REST, and local interactive-shell
+// commit handlers ALL route through it (#5054), so the peer-sync decision is
+// made in one place and no longer depends on which management transport
+// delivered the commit. It derives the decision from RG0 ownership
+// (rg0ConfigSyncAuthority) — the same rule the push site (syncConfigToPeer)
+// applies — so a commit that changes the shared firewall intent converges on
+// the cluster peer regardless of the transport.
+//
+// Before #5054 only the gRPC handler passed syncPeer=true; REST and the local
+// shell passed false, so a REST/shell commit on a healthy cluster left the
+// standby on the PRIOR config until an unrelated transport-disconnect
+// reverse-sync — an RG failover could then silently restore config the operator
+// believed changed. Because the RG0-ownership gate makes the push a no-op on a
+// standalone / non-owner node (identical to syncConfigToPeer's gate), the only
+// behavior change is that REST and shell commits now converge the peer exactly
+// as gRPC always did.
+//
+// The autonomous event-options engine deliberately does NOT use this wrapper: it
+// commits with syncPeer=false (commitAndApply directly, see initEventEngine)
+// because each node fires its remediation independently from that node's local
+// RPM events and must not push node-local state to the peer.
+func (d *Daemon) commitAndApplyOperator(ctx context.Context, comment string) (*config.Config, error) {
+	return d.commitAndApply(ctx, comment, rg0ConfigSyncAuthority(d.cluster))
+}
+
+// commitConfirmedAndApplyOperator is the commit-confirmed analogue of
+// commitAndApplyOperator: the same transport-independent RG0-ownership peer-sync
+// policy for an operator-initiated `commit confirmed` (#5054).
+func (d *Daemon) commitConfirmedAndApplyOperator(ctx context.Context, minutes int) (*config.Config, error) {
+	return d.commitConfirmedAndApply(ctx, minutes, rg0ConfigSyncAuthority(d.cluster))
+}
+
 // executeConfirmedRollback is the daemon-owned commit-confirmed timeout
 // rollback transaction (#1922 Item 1a). The configstore confirm timer
 // fires this (via SetRollbackExecutor) on its own goroutine, NOT under

@@ -718,13 +718,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		shell.SetApplyConfigFn(d.applyConfig)
 		shell.SetCommitFns(
 			func(ctx context.Context, comment string) (*config.Config, error) {
-				// In-process CLI commits don't sync to peer (the
-				// CLI is local; preserves prior per-transport
-				// behavior, same as HTTP).
-				return d.commitAndApply(ctx, comment, false)
+				// #5054: in-process CLI commits sync to the peer on
+				// the SAME RG0-ownership policy as gRPC/REST — peer
+				// convergence is transport-independent, decided in
+				// commitAndApplyOperator, not by which API committed.
+				return d.commitAndApplyOperator(ctx, comment)
 			},
 			func(ctx context.Context, minutes int) (*config.Config, error) {
-				return d.commitConfirmedAndApply(ctx, minutes, false)
+				return d.commitConfirmedAndApplyOperator(ctx, minutes)
 			},
 		)
 		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
@@ -1206,14 +1207,17 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// #2464: per-collector NetFlow v9 / IPFIX write-health for
 		// `show services flow-monitoring statistics`.
 		FlowCollectorHealthFn: d.FlowCollectorHealth,
-		// gRPC commits sync to cluster peer atomically inside
+		// gRPC commits sync to the cluster peer atomically inside
 		// the apply lock so the peer can never observe an apply
-		// that hasn't yet been propagated.
+		// that hasn't yet been propagated. #5054: the RG0-ownership
+		// peer-sync decision now lives in commitAndApplyOperator,
+		// shared with the REST and local-shell commit paths so every
+		// transport converges identically.
 		CommitFn: func(ctx context.Context, comment string) (*config.Config, error) {
-			return d.commitAndApply(ctx, comment, true)
+			return d.commitAndApplyOperator(ctx, comment)
 		},
 		CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
-			return d.commitConfirmedAndApply(ctx, minutes, true)
+			return d.commitConfirmedAndApplyOperator(ctx, minutes)
 		},
 		// #5281: a gRPC zeroize runs the wipe under the SAME apply gate as
 		// commit/sync and enters a terminal reset generation so no concurrent
@@ -1295,13 +1299,16 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		IPsec:    d.ipsec,
 		DHCP:     d.dhcp,
 		VRRPMgr:  d.vrrpMgr,
-		// HTTP commits don't sync to peer (preserves prior
-		// behavior; see #846 for follow-up).
+		// #5054: HTTP/REST commits sync to the peer on the SAME
+		// RG0-ownership policy as gRPC/local-shell. Peer convergence
+		// is transport-independent (decided in commitAndApplyOperator),
+		// so a REST commit no longer leaves the standby on stale config
+		// until an unrelated transport-disconnect reverse-sync.
 		CommitFn: func(ctx context.Context, comment string) (*config.Config, error) {
-			return d.commitAndApply(ctx, comment, false)
+			return d.commitAndApplyOperator(ctx, comment)
 		},
 		CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
-			return d.commitConfirmedAndApply(ctx, minutes, false)
+			return d.commitConfirmedAndApplyOperator(ctx, minutes)
 		},
 		// #758: surface compile state so /health returns 503
 		// when the dataplane has never compiled successfully.

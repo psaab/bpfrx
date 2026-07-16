@@ -307,14 +307,34 @@ func (d *Daemon) bulkSyncViaEventStreamOrFallback(ss *cluster.SessionSync) error
 	return ss.BulkSync()
 }
 
-// syncConfigToPeer sends the active config to the cluster peer if this node
-// is primary and config sync is enabled.
+// rg0ConfigSyncAuthority is the SINGLE, transport-independent rule for whether
+// this node should push its committed config to the cluster peer (#5054): the
+// node must be the RG0 (config-ownership group) PRIMARY of a configured cluster.
+// It depends only on cluster/RG0 state — never on which management transport
+// (gRPC, REST, or the local interactive shell) delivered the commit — so every
+// operator commit path resolves the peer-sync decision identically and the two
+// nodes cannot diverge by transport.
+//
+// A nil manager (a standalone, non-cluster node) is never an authority, so a
+// standalone node never attempts a peer push. Kept as a small pure function so
+// the decision is unit-testable in isolation and is reused by BOTH the operator
+// commit entry points (commitAndApplyOperator / commitConfirmedAndApplyOperator)
+// and the actual push site (syncConfigToPeer below), so the attempt-time and
+// push-time gates cannot drift.
+func rg0ConfigSyncAuthority(cl *cluster.Manager) bool {
+	return cl != nil && cl.IsLocalPrimary(0)
+}
+
+// syncConfigToPeer sends the active config to the cluster peer if this node is
+// the RG0 config-sync authority and config sync is enabled.
 func (d *Daemon) syncConfigToPeer() {
-	if d.cluster == nil || d.sessionSync == nil {
+	if d.sessionSync == nil {
 		return
 	}
-	// Only sync if this node is primary for RG0 (config ownership group).
-	if !d.cluster.IsLocalPrimary(0) {
+	// Only sync if this node is the RG0 (config ownership group) primary — the
+	// same rule the operator commit entry points use to decide whether to
+	// attempt a push (#5054).
+	if !rg0ConfigSyncAuthority(d.cluster) {
 		return
 	}
 	d.pushConfigToPeer()
