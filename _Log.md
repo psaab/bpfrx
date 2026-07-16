@@ -1,3 +1,33 @@
+## 2026-07-16 — #5863 (HA config-sync): level-triggered reconcile of the config-push invariant
+- **Timestamp**: 2026-07-16 (fix/5863-ha-configsync-reconcile)
+- **Action**: Fix #5863. Config replication to a reconnecting peer was
+  EDGE-TRIGGERED only by `OnPeerConnected`, which skipped the push when the node
+  was not RG0 primary at connect time OR had been up <30s — and nothing
+  re-evaluated the skipped work on a LATER promotion or 30s-stability crossing,
+  so a peer could stay INDEFINITELY divergent until an unrelated commit/reconnect.
+  Replaced the connect-only edge with reconcile-to-desired:
+  `reconcileConfigSyncToPeer` re-evaluates the invariant (RG0 authority AND
+  stable AND peer connected AND config-sync enabled AND current generation not
+  yet pushed on this connection) and pushes ONLY on divergence, at most once per
+  `(peer-connection-epoch × config-generation)`. Triggers: peer (re)connect
+  (`OnPeerConnected`), RG0 promotion (`applyRG0OwnershipTransition`), and a
+  low-frequency `configSyncReconcileLoop` that wakes at the stability threshold
+  and thereafter on a coarse 30s safety-net tick. `syncPeerConnEpoch` is bumped
+  on each connect so a fresh connection re-pushes; the commit-path push records
+  the same marker so a subsequent reconcile is a no-op. Control-socket-safe: an
+  already-satisfied evaluation is a cheap no-op (state gates + one hash, no
+  `QueueConfig`); stays RG0-primary-gated so a reconnecting SECONDARY never
+  overwrites authoritative config (#2239/#4385).
+- **File(s)**: pkg/daemon/daemon.go (marker/epoch/test-seam fields),
+  pkg/daemon/daemon_ha_sync.go (reconciler + loop + epoch bump + push marking +
+  OnPeerConnected rewire), pkg/daemon/daemon_ha.go (RG0-promotion hook),
+  pkg/daemon/configsync_reconcile_5863_test.go (fail-on-revert + regression
+  tests), docs/sync-protocol.md (reconcile-side trigger doc).
+- **Validation**: `go build ./...`, `go vet ./pkg/daemon`, `go test -race
+  ./pkg/daemon` all green; fail-on-revert proven (neutralize reconciler → RED,
+  restore → GREEN). Smoke (`test-failover`) blocked by the loss-cluster shim-ABI
+  wall; gated on the fail-on-revert unit tests.
+
 ## 2026-07-16 — #5830 (routing): per-instance next-table diverges between userspace and kernel/FRR (split-brain leak)
 - **Timestamp**: 2026-07-16 (fix/5830-per-instance-nexttable)
 - **Action**: Fix #5830. STEP-0 on origin/master 04e1527ab confirmed the
