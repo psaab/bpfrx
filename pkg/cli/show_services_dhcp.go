@@ -179,6 +179,16 @@ func (c *CLI) showDHCPRelay() error {
 	return nil
 }
 
+// newDHCPServer builds the dhcpserver.Manager used to read the live lease set
+// for `show dhcp server`. Production returns a fresh dhcpserver.New(); a test
+// seam (dhcpServerFn) overrides it to point at a controlled Kea lease-file set.
+func (c *CLI) newDHCPServer() *dhcpserver.Manager {
+	if c.dhcpServerFn != nil {
+		return c.dhcpServerFn()
+	}
+	return dhcpserver.New()
+}
+
 func (c *CLI) showDHCPServer(detail bool) error {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil || (cfg.System.DHCPServer.DHCPLocalServer == nil && cfg.System.DHCPServer.DHCPv6LocalServer == nil) {
@@ -237,31 +247,32 @@ func (c *CLI) showDHCPServer(detail bool) error {
 		}
 	}
 
-	// Read Kea lease files directly.
-	server := dhcpserver.New()
-	leases4, err4 := server.GetLeases4()
-	leases6, err6 := server.GetLeases6()
+	// Read the Kea lease set through the SOURCE-AWARE path (#5967): prefer the
+	// live lease_cmds DB and surface the #5938 degraded-source banner, matching
+	// the authoritative gRPC `show dhcp server` handler that the remote `cli`
+	// drives. The in-process interactive shell previously called GetLeases4/6
+	// (memfile only, no live-socket preference, no banner), so a degraded read
+	// on THIS surface alone looked like a healthy empty set — a divergence from
+	// the remote path. GetLeasesWithSource4/6 skips an unreadable Kea LFC sibling
+	// and records it in the LeaseSource banner detail instead of aborting, so the
+	// #4908 "a degraded read is never rendered as a clean empty table" invariant
+	// is preserved by the banner rather than the old per-family read warnings.
+	server := c.newDHCPServer()
+	leases4, src4 := server.GetLeasesWithSource4()
+	leases6, src6 := server.GetLeasesWithSource6()
 
-	// #4908 (C175-HC-121): surface a lease-file read/parse failure instead of
-	// rendering it as a clean empty table. An unreadable or parse-failing Kea
-	// lease file previously fell through to "No active leases", making a
-	// degraded server indistinguishable from a healthy one with no leases.
-	if err4 != nil {
-		fmt.Printf("warning: could not read DHCPv4 leases: %v\n", err4)
-	}
-	if err6 != nil {
-		fmt.Printf("warning: could not read DHCPv6 leases: %v\n", err6)
+	// Emit each degraded family's banner (shared selection with the gRPC handler
+	// via dhcpserver.DegradedBanners: both distinct details when both families
+	// are degraded, an exact duplicate collapsed to one line).
+	for _, b := range dhcpserver.DegradedBanners(src4, src6) {
+		fmt.Println(b)
 	}
 
 	if len(leases4) == 0 && len(leases6) == 0 {
-		// Only claim "no leases" when both reads actually succeeded; a warning
-		// was already emitted above for any failed read.
-		if err4 == nil && err6 == nil {
-			if !detail {
-				fmt.Println("No active leases")
-			} else {
-				fmt.Println("Active leases: none")
-			}
+		if !detail {
+			fmt.Println("No active leases")
+		} else {
+			fmt.Println("Active leases: none")
 		}
 		return nil
 	}

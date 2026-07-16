@@ -432,16 +432,32 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
     No generation protocol is needed for this read-only path. Pinned by
     `TestKeaLFCIntermediatesIgnored_5938`.
   - **Invariant 8 — degraded-source display banner:** a `LeaseSource`
-    (`lease_source.go`) is threaded from the read to the authoritative gRPC
-    `show dhcp server` handler; when the source is degraded — the expected live
+    (`lease_source.go`) is threaded from the read to BOTH the gRPC
+    `show dhcp server` handler AND the in-process interactive CLI (#5967 achieved
+    this parity — see below); when the source is degraded — the expected live
     socket was unavailable (memfile fallback in use) OR a present LFC sibling was
     unreadable and skipped — a one-line banner is printed above the lease table so
     a partial display is never mistaken for a healthy empty set. The memfile
     file-set read on the display path is now degrade-TOLERANT
     (`parseLeaseCSVDegradable`): an unreadable sibling is skipped (recorded) rather
-    than blanking the whole show. (The interactive-CLI local path keeps its #4908
-    read-error warning; the socket preference does not apply to its throwaway
-    manager, which has no hook context.)
+    than blanking the whole show. Both surfaces select which banner(s) to print
+    through the shared `DegradedBanners(src4, src6)` helper (`lease_source.go`),
+    which emits one line per DEGRADED family (v4 then v6) and collapses an exact
+    duplicate — so when BOTH families are degraded with DISTINCT reasons the
+    v6-specific detail is not suppressed (#5967 PART 2; the pre-#5967 handlers
+    used `if src4 else if src6` and dropped the v6 detail).
+  - **#5967 — local-CLI display parity:** the in-process interactive
+    `show dhcp server` (`pkg/cli/show_services_dhcp.go`) now reads through
+    `GetLeasesWithSource{4,6}` + `DegradedBanners`, matching the remote `cli` →
+    gRPC path. Before #5967 it called `GetLeases{4,6}` (memfile only, no live-
+    socket preference, no banner) and surfaced a read failure only as a
+    `warning: could not read ... leases` line — so a degraded read on this surface
+    alone looked like a healthy empty set. The #4908 "a degraded read is never
+    rendered as a clean empty table" invariant is now carried by the shared
+    degraded banner instead of the per-family read warning. (The local handler
+    still builds a throwaway `dhcpserver.New()` manager with no hook context, so
+    the live-socket preference is inert there; the banner — the operator-visible
+    signal — is what reaches parity.)
 - **Hostname normalization** — `deriveFQDN` / `finalizeFQDN`
   (`ddns_hostname.go`) ALWAYS contains the published name in the configured
   zone: the client picks the host part, the firewall picks the domain. A
