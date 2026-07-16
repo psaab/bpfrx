@@ -1,6 +1,10 @@
 package config
 
-import "sort"
+import (
+	"sort"
+
+	"github.com/psaab/xpf/pkg/webmgmt"
+)
 
 // host_inbound_tokens.go is the single source of truth (SSOT) for the set of
 // recognized `security zones <z> host-inbound-traffic { system-services ...;
@@ -345,9 +349,13 @@ func HostInboundServiceMatch(token, family string) []L4Match {
 	case "ftp":
 		return []L4Match{hiTCP(21)}
 	case "http", "webapi-clear-text":
-		return []L4Match{hiTCP(80)}
+		// #5715: the admit port is the canonical web-management HTTP listener
+		// port (webmgmt SSOT), the SAME constant pkg/daemon binds the listener
+		// to — so the host-inbound admit and the actual listener are ONE
+		// contract and cannot drift.
+		return []L4Match{hiTCP(webmgmt.HTTPPort)}
 	case "https", "webapi-ssl":
-		return []L4Match{hiTCP(443)}
+		return []L4Match{hiTCP(webmgmt.HTTPSPort)}
 	case "ping":
 		// #3201/#3240: echo-request only — v4 type 8, v6 type 128. Error/PMTUD +
 		// ND subtypes are admitted globally, not per-token.

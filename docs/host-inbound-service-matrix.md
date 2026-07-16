@@ -89,8 +89,8 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 | `ssh` | tcp 22 | tcp 22 | dual | |
 | `telnet` | tcp 23 | tcp 23 | dual | |
 | `ftp` | tcp 21 | tcp 21 | dual | Control port only; FTP data is an ALG/transit concern. |
-| `http` / `webapi-clear-text` | tcp 80 | tcp 80 | dual | |
-| `https` / `webapi-ssl` | tcp 443 | tcp 443 | dual | |
+| `http` / `webapi-clear-text` | tcp 80 | tcp 80 | dual | Web-management HTTP. The admit port is the canonical Junos J-Web port (`webmgmt.HTTPPort` = 80) and EQUALS the actual listener bind (#5715): `resolveAPIBinds` binds an explicitly-configured `web-management http` on TCP/80, not the pre-#5715 8080. Listener↔admit are one contract (`webmgmt` SSOT), guarded by `TestWebMgmtListenerMatchesHostInboundAdmit_5715` + the Go/Rust port-parity `TestHostInboundRustWebPortsMatchSSOT_5715`. |
+| `https` / `webapi-ssl` | tcp 443 | tcp 443 | dual | Web-management HTTPS. Admit port = `webmgmt.HTTPSPort` = 443 = the listener bind (#5715, was 8443). Same contract as `http` above. |
 | `ping` | icmp/icmpv6 echo-request | ICMP type 8 (v4) / 128 (v6) | dual | Echo-request only; ICMP errors are global-accepted (see below). |
 | `dns` | udp 53, tcp 53 | udp 53, tcp 53 | dual | |
 | `dhcp` / `bootp` | udp {67, 68} | udp 67, 68 | **ip (v4)** | DHCPv4; must not open on v6 (#3225). |

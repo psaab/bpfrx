@@ -41,6 +41,7 @@ import (
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
 	"github.com/psaab/xpf/pkg/vrrp"
+	"github.com/psaab/xpf/pkg/webmgmt"
 )
 
 // buildRuntimeDataPlane selects the userspace-native Boot() path for the
@@ -1535,25 +1536,35 @@ func (d *Daemon) resolveAPIBinds(apiCfg *api.Config, cfg *config.Config) {
 	if cfg != nil && cfg.System.Services != nil &&
 		cfg.System.Services.WebManagement != nil {
 		wm := cfg.System.Services.WebManagement
-		// Bind HTTP to configured interface
-		if wm.HTTPInterface != "" {
-			bindIP := resolveInterfaceAddr(cfg, wm.HTTPInterface, "127.0.0.1")
+		// #5715: an explicitly configured `web-management http` binds the
+		// canonical Junos J-Web port TCP/80 (webmgmt SSOT — the SAME port the
+		// host-inbound `http` service token admits, so the listener and the
+		// admission agree), on the configured interface address or loopback.
+		// With NO `web-management http` stanza (wm.HTTP false — e.g. an
+		// api-auth-only block) apiCfg.Addr is left untouched at the -api-addr
+		// default (127.0.0.1:8080), a loopback-only diagnostic path that is never
+		// host-inbound-admitted; that path must NOT be silently moved to port 80.
+		if wm.HTTP {
+			httpBindIP := "127.0.0.1"
+			if wm.HTTPInterface != "" {
+				httpBindIP = resolveInterfaceAddr(cfg, wm.HTTPInterface, "127.0.0.1")
+			}
 			// net.JoinHostPort (not string-concat) so an IPv6 interface
-			// address is bracketed ("[2001:db8::1]:8080") — a bare
-			// "2001:db8::1:8080" is unparseable by net.SplitHostPort (the
+			// address is bracketed ("[2001:db8::1]:80") — a bare
+			// "2001:db8::1:80" is unparseable by net.SplitHostPort (the
 			// clamp below) and net.Listen, blackholing an IPv6-only mgmt bind.
-			apiCfg.Addr = net.JoinHostPort(bindIP, "8080")
-			slog.Info("HTTP API bound to interface", "interface", wm.HTTPInterface, "addr", apiCfg.Addr)
+			apiCfg.Addr = net.JoinHostPort(httpBindIP, webmgmt.HTTPPortString())
+			slog.Info("HTTP web-management bound", "interface", wm.HTTPInterface, "addr", apiCfg.Addr)
 		}
-		// Enable HTTPS if configured
+		// Enable HTTPS if configured — bind the canonical TCP/443 (webmgmt SSOT).
 		if wm.HTTPS {
 			httpsBindIP := "127.0.0.1"
 			if wm.HTTPSInterface != "" {
 				httpsBindIP = resolveInterfaceAddr(cfg, wm.HTTPSInterface, "127.0.0.1")
-				slog.Info("HTTPS API bound to interface", "interface", wm.HTTPSInterface, "addr", net.JoinHostPort(httpsBindIP, "8443"))
 			}
 			apiCfg.TLS = true
-			apiCfg.HTTPSAddr = net.JoinHostPort(httpsBindIP, "8443")
+			apiCfg.HTTPSAddr = net.JoinHostPort(httpsBindIP, webmgmt.HTTPSPortString())
+			slog.Info("HTTPS web-management bound", "interface", wm.HTTPSInterface, "addr", apiCfg.HTTPSAddr)
 		}
 		// API authentication
 		if wm.APIAuth != nil && (len(wm.APIAuth.Users) > 0 || len(wm.APIAuth.APIKeys) > 0) {
