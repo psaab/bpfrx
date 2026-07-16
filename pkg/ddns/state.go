@@ -323,6 +323,50 @@ func ownedRecordKey(scope ScopeKey, identity, address string) string {
 	return scope.scopePrefix() + identity + "|" + address
 }
 
+// WireRRClaim identifies ONE forward DNS resource record that a DDNS ownership
+// surface currently claims: the CANONICAL FQDN, the forward record type
+// ("A"/"AAAA"), and the textual rdata (the published IP). Two owned records that
+// produce an EQUAL WireRRClaim CO-OWN one wire RR — whether they are two DDNS
+// scopes within ONE surface (the #5709 lease-vs-lease case) or one record from
+// EACH of the two ownership surfaces (the Surface B DHCP lease store in Manager
+// and the Surface A router/interface store in SurfaceAManager — the #5748
+// cross-surface case). Because the reverse PTR derives deterministically from
+// (FQDN, rdata), an equal forward claim implies an equal PTR RR, so matching the
+// forward tuple captures both directions (#5709).
+//
+// It is the cross-surface interchange type: each manager publishes a LOCK-FREE
+// snapshot of its own claims (Manager.WireRRClaims / SurfaceAManager.WireRRClaims,
+// backed by an atomic.Pointer) that the OTHER surface's teardown guard consults
+// WITHOUT taking the publisher's mutex. That lock-free read is what makes the
+// two guards deadlock-free despite each holding its own manager's lock (#5748).
+type WireRRClaim struct {
+	FQDN        string // canonical form (dnsCanonicalFQDN)
+	ForwardType string // "A" | "AAAA"
+	Rdata       string // textual published address (the rdata)
+}
+
+// wireRRClaim builds a canonicalized WireRRClaim from a name, forward type, and
+// textual rdata. The FQDN is DNS-canonicalized and the rdata is normalized
+// through netip so the two ownership surfaces — whose rdata reaches this helper
+// via DIFFERENT code paths (a Kea memfile string on the lease side, a
+// netip-formatted AddrText on the Surface A side) — compare EQUAL for the same
+// address even if their textual forms differ (e.g. an IPv6 address written
+// expanded vs compressed). An unparseable rdata is kept verbatim (best effort —
+// a stored address is normally well-formed). Empty rdata yields the zero-Rdata
+// claim; callers skip records with no rdata (a rdata-less claim must never
+// co-match another rdata-less one).
+func wireRRClaim(fqdn, forwardType, rdata string) WireRRClaim {
+	norm := rdata
+	if a, err := netip.ParseAddr(rdata); err == nil {
+		norm = a.Unmap().String()
+	}
+	return WireRRClaim{
+		FQDN:        dnsCanonicalFQDN(fqdn),
+		ForwardType: forwardType,
+		Rdata:       norm,
+	}
+}
+
 // ddnsState is the in-memory + on-disk ownership store. records is keyed
 // by ownedRecordKey. It is NOT goroutine-safe on its own; the DDNS
 // manager serializes all access under its own mutex.

@@ -424,6 +424,28 @@ type Manager struct {
 
 	// last resolved policy (for Stats()).
 	lastPolicy atomic.Pointer[ddnsPolicy]
+
+	// surfaceACoowners, when non-nil, returns the wire-RR claims currently owned
+	// by the SEPARATE Surface A ownership surface (router/interface DDNS records,
+	// whose rdata lives in AddrText not Address, in the SurfaceAManager store).
+	// The daemon injects it (SetSurfaceACoownerSource) so this lease teardown can
+	// suppress a wire DELETE that would clobber a Surface-A-owned identical RR —
+	// the cross-surface arm of the #5709 co-ownership class (#5748). It is a
+	// LOCK-FREE snapshot accessor (an atomic.Pointer load inside SurfaceAManager);
+	// it MUST NOT take SurfaceAManager.mu, so wireRRSharedWithOther can call it
+	// while THIS manager holds m.mu without any lock-order cycle. Lock order:
+	// m.mu (held) → lock-free peer read (no peer mutex). Nil in tests / standalone
+	// / a not-yet-wired boot ⇒ exactly the pre-#5748 Surface-B-only scan.
+	surfaceACoowners func() []WireRRClaim
+
+	// wireRRClaims is the LOCK-FREE snapshot of the wire RRs THIS (Surface B lease)
+	// surface currently owns, published for the Surface A teardown guard to consult
+	// symmetrically (#5748). Rebuilt under m.mu at the end of every non-degraded
+	// reconcile pass and after load (rebuildWireRRClaimsLocked), and read via
+	// WireRRClaims() with a bare atomic load — never taking m.mu — so the peer can
+	// query it while holding SurfaceAManager.mu without a deadlock. Nil until the
+	// first rebuild; WireRRClaims() then returns an empty slice.
+	wireRRClaims atomic.Pointer[[]WireRRClaim]
 }
 
 // loadStateOrDegrade loads the ownership store and classifies a load failure
@@ -508,7 +530,7 @@ func NewManager(parser LeaseParser, updater DNSUpdater, nodeID string) *Manager 
 			"(record reconcile logged-and-skipped until a backend exists)")
 		updater = nopUpdater{}
 	}
-	return &Manager{
+	m := &Manager{
 		state:          st,
 		degraded:       degraded,
 		degradedReason: reason,
@@ -519,6 +541,11 @@ func NewManager(parser LeaseParser, updater DNSUpdater, nodeID string) *Manager 
 		leasePath6:     "/var/lib/kea/kea-leases6.csv",
 		now:            time.Now,
 	}
+	// #5748: seed the cross-surface wire-RR claim snapshot from the loaded store so
+	// the Surface A guard sees this surface's ownership from the very first pass
+	// (before this manager's first reconcile). Construction is single-threaded.
+	m.rebuildWireRRClaimsLocked()
+	return m
 }
 
 // NewProductionManager constructs the always-on production manager
@@ -558,7 +585,7 @@ func newManagerForTesting(parser LeaseParser, updater DNSUpdater, statePath, lea
 	if updater == nil {
 		updater = nopUpdater{}
 	}
-	return &Manager{
+	m := &Manager{
 		state:          st,
 		degraded:       degraded,
 		degradedReason: reason,
@@ -569,6 +596,8 @@ func newManagerForTesting(parser LeaseParser, updater DNSUpdater, statePath, lea
 		leasePath6:     leasePath6,
 		now:            now,
 	}
+	m.rebuildWireRRClaimsLocked() // #5748: seed the cross-surface claim snapshot
+	return m
 }
 
 // NewManagerForTesting builds a Manager with injectable lease parser, state +
@@ -805,6 +834,11 @@ func (m *Manager) ReconcileScoped(ctx context.Context, cfg *config.DHCPServerCon
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// #5748: republish this surface's wire-RR claim snapshot for the Surface A
+	// teardown guard AFTER the pass has mutated the store. Registered second so it
+	// runs BEFORE the unlock (LIFO), i.e. still under m.mu. A degraded pass returns
+	// early below with an unchanged (empty) store, so the rebuild is a harmless nop.
+	defer m.rebuildWireRRClaimsLocked()
 
 	// #5070: refresh the interface-name resolver for THIS pass so a
 	// destination-interface binding resolves to the local node's real kernel
@@ -1033,6 +1067,16 @@ func (m *Manager) dhcidSharedWithOther(owned ownedRecord) bool {
 // surviving scope, as the LAST claimant, issues the real wire delete when it in
 // turn tears down. Address must be non-empty (a lease record's rdata is always
 // its Address) so two rdata-less rows never falsely co-match. Caller holds m.mu.
+//
+// #5748: the scan is now surface-agnostic. Beyond the Surface B lease store
+// (m.state.records) it also consults the SEPARATE Surface A ownership surface
+// (router/interface DDNS records, rdata in AddrText not Address) through the
+// injected surfaceACoowners accessor. A Surface A record and a Surface B lease
+// can legitimately resolve the same host to the same address and thus co-own one
+// wire RR; without the cross-surface arm a lease teardown would still issue a
+// DELETE that clobbers a Surface-A-owned identical RR. The accessor is a
+// LOCK-FREE snapshot read (see the field doc), so this runs while m.mu is held
+// with no lock-order cycle. Nil accessor ⇒ pre-#5748 Surface-B-only behavior.
 func (m *Manager) wireRRSharedWithOther(owned ownedRecord) bool {
 	if owned.Address == "" {
 		return false
@@ -1049,7 +1093,58 @@ func (m *Manager) wireRRSharedWithOther(owned ownedRecord) bool {
 			return true
 		}
 	}
+	// Cross-surface (#5748): a Surface A router/interface record may co-own the
+	// SAME wire RR (canonical FQDN + forward type + rdata). Its rdata lives in
+	// AddrText, already normalized into the Rdata field of each WireRRClaim; build
+	// the same canonical claim for this lease record and compare by value.
+	if m.surfaceACoowners != nil {
+		ownedClaim := wireRRClaim(owned.FQDN, owned.ForwardType, owned.Address)
+		for _, c := range m.surfaceACoowners() {
+			if c == ownedClaim {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+// SetSurfaceACoownerSource injects the accessor the daemon wires so a lease
+// teardown can consult the Surface A ownership surface for a cross-surface wire-RR
+// co-owner (#5748). fn MUST be lock-free with respect to SurfaceAManager.mu (it is
+// SurfaceAManager.WireRRClaims, a bare atomic load) so calling it under m.mu can
+// never deadlock. Idempotent; nil clears it (restores Surface-B-only behavior).
+func (m *Manager) SetSurfaceACoownerSource(fn func() []WireRRClaim) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.surfaceACoowners = fn
+}
+
+// WireRRClaims returns a LOCK-FREE snapshot of the wire RRs this (Surface B lease)
+// surface currently owns, for the Surface A teardown guard to consult (#5748). It
+// does a bare atomic load and NEVER takes m.mu, so a peer holding
+// SurfaceAManager.mu can call it with no lock-order cycle. Returns an empty slice
+// before the first rebuild.
+func (m *Manager) WireRRClaims() []WireRRClaim {
+	if p := m.wireRRClaims.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// rebuildWireRRClaimsLocked recomputes this surface's published wire-RR claim
+// snapshot from the durable store and publishes it atomically for the peer's
+// lock-free read (#5748). Caller holds m.mu. A lease record's rdata IS its
+// Address; rdata-less rows are skipped (they can never co-own a wire RR). The
+// snapshot is an immutable slice — replaced wholesale, never mutated in place.
+func (m *Manager) rebuildWireRRClaimsLocked() {
+	claims := make([]WireRRClaim, 0, len(m.state.records))
+	for _, r := range m.state.records {
+		if r.Address == "" {
+			continue
+		}
+		claims = append(claims, wireRRClaim(r.FQDN, r.ForwardType, r.Address))
+	}
+	m.wireRRClaims.Store(&claims)
 }
 
 // parseLeases reads a family's active leases via the injected LeaseParser

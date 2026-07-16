@@ -38,6 +38,118 @@
   src/afxdp/coordinator/tests.rs, docs/fabric-cross-chassis-fwd.md,
   src/afxdp/forwarding/README.md, _Log.md
 
+## 2026-07-16 — #5748 (pkg/ddns, security): cross-surface DDNS wire-RR clobber guard
+- **Timestamp**: 2026-07-16 (fix/5748-ddns-cross-surface-clobber)
+- **Action**: Extend the #5709 wire-RR co-ownership clobber guard across BOTH
+  DDNS ownership surfaces. The #5709 guard (`wireRRSharedWithOther`) scanned only
+  the Surface B lease store (`Manager.state.records`, rdata in `Address`); a
+  Surface A router/interface record (`SurfaceAManager`, rdata in `AddrText`) that
+  co-owns the identical wire RR (same canonical FQDN + forward type + IP) was
+  invisible, so a lease teardown could still issue a wire DELETE that clobbered
+  the Surface-A-owned RR (and symmetrically a Surface A teardown could clobber a
+  lease-owned RR). Fixed BOTH directions. Mechanism: each surface publishes a
+  LOCK-FREE snapshot of its wire-RR claims (`WireRRClaims`, backed by
+  `atomic.Pointer[[]WireRRClaim]`, rebuilt under the manager's own `mu` at the end
+  of every non-degraded reconcile pass + after load); the daemon injects each
+  surface's accessor into the other (`SetSurfaceACoownerSource` /
+  `SetLeaseCoownerSource` in `pkg/daemon/daemon_run.go`). The lease guard scans
+  the injected Surface A snapshot after its own store; the Surface A
+  `withdrawOwnedLocked` adds a per-target lease-coowner skip. **Deadlock-free by
+  construction:** the accessor is a bare atomic load, so a teardown holding its
+  own `mu` never blocks on the peer's `mu` (no AB-BA cycle). Nil accessor ⇒
+  pre-#5748 single-surface behavior; nil-safe.
+- **File(s)**: pkg/ddns/state.go (new `WireRRClaim` type + `wireRRClaim` helper),
+  pkg/ddns/manager.go (`surfaceACoowners`/`wireRRClaims` fields, `SetSurfaceA…`,
+  `WireRRClaims`, `rebuildWireRRClaimsLocked`, extended `wireRRSharedWithOther`,
+  seed on load), pkg/ddns/surface_a.go (`leaseCoowners`/`wireRRClaims` fields +
+  `deleteCoowned` counter, `SetLeaseCoownerSource`, `WireRRClaims`,
+  `rebuildWireRRClaimsLocked`, `leaseWireRRCoowner`, per-target skip in
+  `withdrawOwnedLocked`, `SurfaceAStats.DeleteCoowned`), pkg/daemon/daemon_run.go
+  (cross-wire the two accessors), pkg/ddns/cross_surface_clobber_5748_test.go
+  (new, 5 fail-on-revert + regression tests), pkg/ddns/README.md (co-ownership
+  section extended to both surfaces).
+- **Validation**: `go build ./...`, `go vet ./pkg/ddns ./pkg/daemon` clean;
+  `go test ./pkg/ddns ./pkg/daemon -race` GREEN. Fail-on-revert proven firsthand
+  BOTH directions: neutralize the lease-side arm → RED (lease teardown DELETED
+  host-a.example.com=10.0.0.10); neutralize the Surface A per-target skip → RED
+  (surface A teardown DELETED wan.example.net=203.0.113.5). Restored → GREEN.
+## 2026-07-16 — #5791 (DHCP/host-inbound): gate lease-change recompile skip on host-inbound lifeline set, not the broad mgmt-VRF name class
+- **Timestamp**: 2026-07-16 (fix/5791-dhcp-hostinbound-reapply)
+- **Action**: Fix #5791 (security). `dhcpLeaseChangeRequiresRecompile`
+  (pkg/daemon/daemon_dhcp.go) decided whether a DHCP lease change may SKIP the
+  full dataplane/config reapply by testing each DHCP interface against the BROAD
+  management-VRF name class (`mgmtSet`, populated in daemon_apply.go from every
+  configured `fxp*`/`fab*`/`em*` interface). But the host-inbound LIFELINE class
+  is NARROWER (pkg/config/lifeline.go `HostInboundLifelineSet`): standalone
+  lifelines are only fxp0/em0/fab* (plus a configured chassis-cluster
+  control/fabric interface, #3277). So a zoned DHCP-only standalone `fxp1` — in
+  the broad mgmt class (`fxp*`) but NOT a lifeline — could start ADDRESSLESS
+  (no address-scoped host-inbound drop installed), acquire an address, and then
+  SKIP the reapply that rebuilds the host-inbound fence for the newly-reachable
+  address → the new address was reachable with NO host-inbound fence (security
+  gap). Fix: gate the skip on the config-derived host-inbound lifeline set — the
+  SAME `config.HostInboundLifelineSet` / `HostInboundLifelineInterface` the fence
+  application uses (pkg/dataplane/userspace/zones_host_inbound.go,
+  pkg/daemon/daemon_nft.go) — NOT the broad name class, so the skip decision and
+  the fence application agree by construction (no second, drifting classifier).
+  A non-lifeline DHCP interface now forces the full recompile that builds its
+  fence; a TRUE lifeline (fxp0 DHCPv4, em0, fab*, or a configured
+  control-interface) keeps the lightweight management-only fast path (no
+  churn/perf regression on routine mgmt lease renewals). Base-name mapping
+  (`fxp1.0`→`fxp1`) is handled by `HostInboundLifelineInterface`/`LifelineBaseName`
+  exactly as the fence does it. Kept the conservative
+  `len(mgmtSet)==0 → recompile` liveness guard (before-first-apply /
+  VRF-create-failed). Fail-on-revert PROVEN firsthand: new
+  `TestDHCPLeaseChangeRequiresRecompile_ZonedNonLifelineFxp1` asserts the REAL
+  recompile decision is TRUE for a zoned standalone fxp1; neutralizing the fix
+  (revert the per-interface proxy to `mgmtSet[config.DHCPLeaseIfName(...)]`) →
+  RED (`must require the full recompile so its address-scoped host-inbound fence
+  is (re)built`); restored → GREEN. Regression guards (all GREEN both ways):
+  `_LifelineFastPathPreserved` (fxp0/em0/fab0 still skip),
+  `_ClusterControlFxp1` (fxp1 as control-interface → lifeline → skip preserved),
+  `_ZonedDataInterfaceUnchanged` (ge-0/0/3 still recompiles). Validation:
+  `go build ./...` + `go vet ./pkg/daemon ./pkg/config` clean; `gofmt` clean;
+  `pkg/daemon` (24.6s) + `pkg/config` (148.6s) full suites `-race` GREEN.
+  Go-only, no cargo. Control-plane change → no loss-cluster smoke; gated on the
+  fail-on-revert unit tests.
+- **File(s)**: pkg/daemon/daemon_dhcp.go (edit — lifeline-set skip gate),
+  pkg/daemon/dhcp_recompile_test.go (edit — fail-on-revert + 3 regression
+  guards), pkg/daemon/README.md (edit — #5791 recompile-skip contract),
+  docs/host-inbound-service-matrix.md (edit — #5791 fixed note)
+
+## 2026-07-16 — #5836 (dataplane loader): scope ifindex preflight to XPF-referenced links (codex-183)
+- **Timestamp**: 2026-07-16 (fix/5836-ifindex-preflight-scope)
+- **Action**: Fix #5836. `preflightCheckIfindexCaps` enumerated the WHOLE host
+  netns via `netlink.LinkList` and rejected the compile if ANY link had an
+  ifindex outside `[0, MaxInterfaces)` — so an unrelated bridge/veth/container
+  link or an abandoned operator netdev that churned past 65536 failed EVERY
+  subsequent userspace-dataplane compile, even though XPF's managed ports stayed
+  low. Chose **Option A (SCOPE)**: the preflight now takes a `referenced` set
+  and rejects only links XPF actually attaches AF_XDP to — the compiled port set
+  `result.pendingXDP` (physical zone interfaces, RETH members, VLAN parents,
+  tunnels, fabric parents, all resolved to `physIface.Index` in
+  compiler_iface.go). Moved both call sites (`CompileUserspaceShim` in loader.go;
+  retired-eBPF `Manager.Compile` in compiler.go) to run the check AFTER
+  `CompileConfig` so `pendingXDP` is populated — safe because every
+  ifindex-touching method of `userspaceShimCompileDataplane` (AddTxPort/SetZone/
+  SetVlanIfaceInfo/SetMirrorConfig) is a no-op, so CompileConfig writes no
+  ifindex-keyed kernel map before the check. Real fail-closed guardrails
+  UNCHANGED and preserved: `AddTxPort` tx_ports cap (loader.go) and the
+  `userspace_bindings` ARRAY cap `idx=ifindex*16+queue >= BindingArrayMaxEntries`
+  (userspace/maps_sync.go:696) still reject a genuinely-too-high XPF-mapped
+  ifindex. `userspace_ingress_ifaces` is a HASH (key=ifindex, no cap needed).
+  Rejected Option B (remove global preflight) because the userspace_bindings
+  guard fires at status-sync time (not compile) and the watchdog re-sync path
+  only logs-and-skips — keeping a scoped compile-time early-warning is safer.
+  Added `ifindexSet` helper. Tests (fail-on-revert, both firsthand RED-verified):
+  new `TestPreflightCheckIfindexCaps_UnrelatedHighIfindexIgnored` (the #5836 fix
+  — RED when scope guard reverted to whole-namespace),
+  `_ReferencedHighIfindexRejected` (real guard — RED when cap comparison
+  removed), `_EmptyReferencedPasses`; existing preflight tests updated to the
+  scoped signature. Build/vet clean; `pkg/dataplane` (minus pre-existing
+  unrelated `TestUserspaceManagerDoesNotImportReflectOrUnsafe`) + full
+  `pkg/dataplane/userspace` GREEN under `-race`.
+- **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/compiler.go, pkg/dataplane/constants_test.go, _Log.md
 ## 2026-07-16 — #5682 (security/HA): unreadable kernel-upgrade journal bypasses candidate election hold (codex-182 M24)
 - **Timestamp**: 2026-07-16 (fix/5682-upgrade-journal-failclosed)
 - **Action**: Fix #5682. `holdSecondaryIfKernelCandidateArmed`
