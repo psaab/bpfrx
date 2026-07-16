@@ -765,6 +765,25 @@ proto + optional dst/src port + optional ICMP type/code (application-sets
 OR-expanded to multiple rules); `match destination-address any`; **no**
 `scheduler-name`; ingress zone **not** `tcp-rst`.
 
+**Source-exclusion semantics (`source-address-excluded`).** The excluded arm
+projects *every source NOT in the resolved set*, per Junos `matchAddr`:
+- A **constrained** set (e.g. `source-address 10.0.0.0/8` + excluded) drops
+  every source EXCEPT the set on the family that carries a prefix (IPv4:
+  `saddr != 10.0.0.0/8`), and — because the set has no prefix of the *other*
+  family — drops **ALL** of that other family (IPv6 here): "everything except
+  10/8" is all IPv6. This match-all-of-opposite-family behavior is intentional.
+- The **wildcard** case `source-address any` (or the family-scoped `any-ipv4` /
+  `any-ipv6`) + excluded is the degenerate "every source EXCEPT every source" =
+  the **empty set**: it matches NOTHING and projects **no drop rule** for the
+  affected family (`junosHostBuildRule` returns `ok=false` when the family's
+  `srcAny` is set). `any` suppresses both families; `any-ipv4` / `any-ipv6`
+  suppress only their own. Emitting an unconditional all-source drop here (the
+  #5828 bug — the old `len(src)==0 => SrcAny` classification) would invert the
+  authored domain and could lock out **all** direct host-bound traffic on the
+  ingress zone. A plain `source-address any` + `then deny` with **no** exclusion
+  is unaffected — that is a legitimate drop-all deny and still emits the
+  unconditional drop.
+
 **Un-representable remainder (keeps the commit warning below):** feed-tainted
 source, multi-term / ALG application, an application scoped to an IPsec/ident
 exempt tuple, an **explicit** `match destination-address` (needs the live

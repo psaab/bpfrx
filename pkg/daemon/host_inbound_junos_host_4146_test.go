@@ -239,6 +239,47 @@ func TestJunosHostDenyAppScopedToExemptTupleUnrepresentable(t *testing.T) {
 	}
 }
 
+// TestJunosHostAnyExcludedEmitsNoDropLine is the #5828 projection-to-nft
+// fail-on-revert guard: `match source-address any` + `source-address-excluded`
+// + `then deny` is an EMPTY source match ("every source except every source"),
+// so it must render NO junos-host drop line for either family. The pre-fix
+// projection mis-classified `any`'s empty concrete set as `SrcAny` and emitted
+// an UNCONDITIONAL, source-predicate-less drop
+// (`iifname "ge-0-0-1" counter name "<cn>" drop`) — an over-deny that locks out
+// all direct host-bound traffic on the ingress zone.
+//
+// RED on revert: restoring the `len(src)==0 => SrcAny` behavior emits the
+// unconditional drop for both families, so the `counter name "<cn>" drop`
+// substring reappears and these assertions fail.
+func TestJunosHostAnyExcludedEmitsNoDropLine(t *testing.T) {
+	cfg := junosHostDenyTestConfig()
+	cfg.Security.Policies = []*config.ZonePairPolicies{
+		{FromZone: "untrust", ToZone: "junos-host",
+			Policies: zonePairDeny("untrust", "block-all", "srcx:any", "app:any")},
+	}
+	payload, programs := junosHostPayload(t, cfg)
+	// The term is inert: it projects zero rules, so BuildJunosHostPrograms
+	// filters the (representable) program out entirely — no kernel program, no
+	// drop line. On revert the any+excluded term emits an unconditional
+	// all-source drop for both families, so a program with rules reappears.
+	if len(programs) != 0 {
+		t.Fatalf("any+excluded must yield no junos-host program (inert term), got %d: %+v", len(programs), programs)
+	}
+	for _, fam := range []string{"ip", "ip6"} {
+		cn := xnft.HostInboundJunosHostDenyCounterName("untrust", fam)
+		if strings.Contains(payload, `counter name "`+cn+`" drop`) {
+			t.Errorf("junos-host %s drop line emitted for any+excluded (the #5828 over-deny); counter %q:\n%s", fam, cn, payload)
+		}
+	}
+	// No junos-host drop line at all in the section window (xpfjh_ tags every
+	// junos-host named counter).
+	for _, l := range junosHostSection(payload) {
+		if strings.Contains(l, "drop") && strings.Contains(l, "xpfjh_") {
+			t.Errorf("unexpected junos-host drop line for an inert any+excluded term: %q", l)
+		}
+	}
+}
+
 // TestJunosHostDenyNftParses feeds a representable junos-host DENY payload
 // through `nft -c -f -` so the rendered iifname / saddr / counter lines are
 // validated against the real nft parser (v1.1.6). nft absent => skip; a

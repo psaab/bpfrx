@@ -1,3 +1,34 @@
+## 2026-07-16 — #5828 (config/host-inbound): `source-address any` + excluded must project no direct-host drop
+- **Timestamp**: 2026-07-16 (fix/5828-hostinbound-any-excluded)
+- **Action**: Fix #5828 — the direct-host `junos-host` deny projection
+  miscompiled a policy term combining `match source-address any` +
+  `match source-address-excluded` + `then deny`. In Junos exclusion semantics
+  `any` + excluded = "every source EXCEPT every source" = the empty set → the
+  term matches nothing and must project NO drop rule. The pre-fix
+  `junosHostBuildRule` (pkg/config/junos_host_deny.go) resolved `any` to an
+  empty concrete family slice and, in the `t.srcExcluded` arm, classified
+  `len(src)==0` uniformly as `SrcAny=true` → an UNCONDITIONAL all-source DROP
+  (the nft renderer emits `iifname "<zone>" counter name "<cn>" drop` with no
+  saddr predicate) — an over-deny that can lock out ALL direct host-bound
+  traffic on the ingress zone (availability/security failure). Fix: in the
+  excluded arm, when the family-scoped `srcAny` is set, return `ok=false` (no
+  rule). Keyed on the per-family flag so `any` suppresses BOTH families while
+  `any-ipv4`/`any-ipv6` suppress only their own. The genuinely-constrained
+  excluded case (`source-address 10.0.0.0/8` + excluded → drop all except 10/8,
+  and match ALL of the opposite family with no prefix) and the deny-all case
+  (`source-address any` + deny, no exclusion → unconditional drop) are
+  UNCHANGED. Fail-on-revert proven: restoring `len(src)==0 => SrcAny` makes
+  TestJunosHostAnyExcludedProjectsNoRule (pkg/config) and
+  TestJunosHostAnyExcludedEmitsNoDropLine (pkg/daemon, projection-to-nft) go
+  RED; the 3 regression guards stay GREEN on both.
+- **File(s)**: pkg/config/junos_host_deny.go (edit — srcAny guard in
+  junosHostBuildRule excluded arm),
+  pkg/config/junos_host_deny_any_excluded_5828_test.go (new — set-command
+  ParseSetCommand+SetPath projection fail-on-revert + 3 regression guards),
+  pkg/daemon/host_inbound_junos_host_4146_test.go (edit — added
+  TestJunosHostAnyExcludedEmitsNoDropLine projection-to-nft guard),
+  docs/host-inbound-service-matrix.md (edit — source-exclusion semantics note).
+
 ## 2026-07-16 — #5973 (config/CoS): validate forwarding-class queue-number at commit
 - **Timestamp**: 2026-07-16 (fix/5973-cos-queue-validate)
 - **Action**: The `class-of-service forwarding-classes queue <N> <fc>` parse
