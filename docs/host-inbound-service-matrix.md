@@ -207,10 +207,62 @@ operation or session return traffic. nft: `buildHostInboundFilterPayload`; Rust:
 
 | Class | nft | Rust | Rationale |
 |---|---|---|---|
-| Established/related | `ct state established,related accept` | conntrack fast path | Return / ongoing host traffic. |
+| Established/related | `ct state established,related accept` | conntrack fast path | Return / ongoing host traffic. **On a tightening the kernel entry is reconciled — see "Stale kernel authorization on a tightening (#5566)" below.** |
 | Raw IPsec ESP/AH | `meta l4proto { 50, 51 } accept` | `stage_ipsec_passthrough_check` (before `host_inbound_admits`) | Kernel XFRM decrypts host-terminated IPsec; makes `ike`/`ipsec` a working superset. |
 | ICMPv4 errors/PMTUD | `icmp type { destination-unreachable, time-exceeded, parameter-problem }` | proto 1 types 3, 11, 12 | PMTUD / unreachable / traceroute-to-self signalling. Echo-request is NOT here (gated on `ping`). |
 | ICMPv6 errors + ND | `icmpv6 type { 1, 2, 3, 4, 133, 134, 135, 136, 137 }` | proto 58 types 1-4, 133-137 | v6 error/PMTUD (1-4) + Neighbor Discovery (133-137). Echo-request (128) is NOT here (gated on `ping`). |
+
+## Stale kernel authorization on a tightening (#5566)
+
+The `ct state established,related accept` above is the FIRST rule in the chain
+(and, in the `to-zone junos-host` program branch, the residual established accept
+follows the fine DROP but still precedes the per-zone coarse drops). Replacing the
+`xpf_hostinbound` table does **not** flush Linux netfilter conntrack. So an
+EXISTING direct-kernel host connection admitted under a looser prior config — an
+SSH / HTTPS / SNMP session to a firewall-local address — kept riding that leading
+established-accept after the operator REMOVED the service: the new per-zone
+catch-all DROP never saw the flow's original-direction packets. That was a
+host-inbound false-allow confined to the direct-kernel delivery path; the Rust
+userspace local-delivery path already re-checks the effective host-inbound set on
+every session hit and tears a now-denied session down
+(`userspace-dp/src/afxdp/poll_descriptor/mod.rs`), but the kernel path had no
+equivalent teardown.
+
+**Fix — conntrack reconcile after every successful apply**
+(`pkg/daemon/host_inbound_conntrack_flush.go`, wired at the tail of
+`applyHostInboundFilter`). After the real `xpf_hostinbound` table loads, the
+daemon deletes every established/related **kernel** conntrack entry whose
+original-direction destination is a **covered** firewall-local host-inbound
+address (an address that carries a default-deny — the same `desiredDrop` set as
+#5789) and whose `(proto, dport)` the CURRENT coarse rules no longer admit. The
+next original-direction packet is then re-evaluated and dropped by the per-zone
+catch-all instead of short-circuiting on the established-accept. Properties:
+
+- **Reconcile, not a delta.** The flush condition is "not admitted by the CURRENT
+  config", derived from the SAME structured SSOT the nft chain renders from
+  (`config.HostInboundServiceMatch` / `HostInboundProtocolMatch`), so the admit
+  decision cannot drift from the chain's per-zone accepts. No prior-config
+  snapshot is persisted; the sweep is a no-op on loosening / unchanged commits
+  because still-permitted flows are kept. A service that stays configured is never
+  flushed (no connection-reset regression).
+- **Lifeline-safe.** Only addresses in the covered default-deny set are eligible;
+  management / cluster-control lifelines (fxp0 / em0 / fab*) are excluded from the
+  host-inbound views, so their conntrack is never flushed. Addressed-but-unzoned
+  addresses (#4420 HI-2) are covered with an empty admit set (fully denied except
+  the global exemptions below).
+- **Global exemptions preserved.** ESP/AH (proto 50/51), ICMP ND/PMTUD/error, and
+  the configured WireGuard listen port (#5582) are never flushed, mirroring the
+  chain's global accepts. ICMP echo conntrack is short-lived and left to age out.
+- **Best effort.** The nft table is already applied, so enforcement for NEW
+  connections holds regardless; a conntrack-subsystem flush failure is logged, not
+  surfaced as a commit failure (failing the commit would roll back correct
+  enforcement over a transient error). It only leaves PRE-EXISTING flows on their
+  old authorization — the pre-fix behavior.
+
+Kernel netfilter conntrack on this appliance tracks only host-terminated /
+kernel-forwarded flows (transit forwarding runs through userspace-dp's own session
+table), so the swept table is small. Fail-on-revert proofs:
+`pkg/daemon/host_inbound_conntrack_flush_5566_test.go`.
 
 ## Fail-closed invariant for a nil / configured=false known zone (#3705)
 
