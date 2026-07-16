@@ -1,3 +1,44 @@
+## 2026-07-16 — #5753 (pkg/dataplane/userspace, security): nested-set feed-binding partial-deny fail-open
+- **Timestamp**: 2026-07-16 (fix/5753-feeds-nested-alias-failopen)
+- **Action**: Close the residual nested-set arm of the #5645/#5751 partial-deny
+  fail-open class for dynamic-address feed bindings. PR #5751 fail-closed the
+  TOP-LEVEL and composite cases: a DECLARED dynamic-address binding ABSENT from
+  the resolved feed overlay (feed unready) is treated as unresolved →
+  unrepresentable → the whole snapshot is rejected (previous-good retained /
+  fresh-boot default-deny), even when a STATIC address-book alias of the same
+  name exists. But #5751 threaded that guard ONLY into the top-level
+  `addrRepresentable`; the recursive `nameRepresentability` walk did NOT receive
+  `cfg.Security.DynamicAddress.AddressBindings`, so when it recursed into an
+  address-set member it resolved the STATIC alias instead of recognizing a
+  declared-but-unresolved dynamic binding. Result: a `deny <address-set>` where
+  the set nests a binding name that also has a static alias, with an unready
+  feed, compiled the set to a book row carrying only the partial static subset
+  while the unready feed's prefixes went unmatched — a deny fail-OPEN.
+  Fix: thread `AddressBindings` through `nameRepresentable` /
+  `nameRepresentability` and apply the SAME declared-but-unresolved guard in the
+  nested recursion, ordered AFTER the feedOverlay branch (a READY feed is in the
+  overlay and resolves normally — no regression) and BEFORE the static
+  `ab.Addresses` lookup (so an unready binding wins over a static alias of the
+  same name). A nested static member with no declared binding of that name is
+  untouched (no over-block). Mirrors #5751's fail-closed mechanism exactly
+  (`__unsupported_address__` sentinel → Rust preflight whole-snapshot reject);
+  did not invent a new disposition.
+- **File(s)**: pkg/dataplane/userspace/policies_representable.go (thread
+  `bindings` param into `nameRepresentable`/`nameRepresentability` + the
+  declared-binding guard + doc comments), pkg/dataplane/userspace/policies_lower.go
+  (pass `cfg.Security.DynamicAddress.AddressBindings` at the single call site),
+  pkg/dataplane/userspace/feed_nested_alias_failclosed_5753_test.go (new
+  fail-on-revert + regression guards), pkg/feeds/README.md (document the
+  nested-set arm in the all-constituent-readiness contract).
+- **Validation**: `go build ./...` clean; `gofmt` + `go vet ./pkg/dataplane/userspace
+  ./pkg/config` clean; `go test ./pkg/dataplane/userspace -race` GREEN (full
+  package, 29.5s). Fail-on-revert proven firsthand: neutralizing the nested guard
+  (`if false && bindings[name] != nil`) turns `TestNestedFeedBindingWithStaticAliasFailsClosed`
+  RED — the deny source routes as a book reference (`SourceBookIDs=[2750498671]`,
+  a partial-static deny fail-open) instead of the sentinel; restoring → GREEN.
+  Regression guards stay green: nested static-only set (no binding) resolves
+  normally; nested binding with a READY feed unions feed + static + sibling
+  prefixes; the #5751 top-level/composite siblings still pass.
 ## 2026-07-16 — #5686 (HA/fabric): stale fabric peer usable as redirect target during same-parent replacement (codex-182 M01)
 - **Timestamp**: 2026-07-16 (fix/5686-fabric-stale-peer)
 - **Action**: Fix #5686. The fabric-authority preserve/merge paths kept an

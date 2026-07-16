@@ -105,9 +105,18 @@ enforced only the static subset. The fix now requires **all** constituents ready
 (case 1), and the userspace `addrRepresentable` treats a **declared**
 dynamic-address binding that is **absent** from the overlay as unresolved →
 unrepresentable → fail-closed **even when a static alias of the same name
-exists** (case 2). Only the referencing security **policy** path is gated this
-way; NAT rules that reference an unready feed still fall back to the static
-subset (out of scope for the deny fail-open this issue names).
+exists** (case 2). A third residual arm of the same class was closed in **#5753**:
+a declared binding nested **inside an address-set** that also carries a static
+alias of that name stayed fail-open because the recursive representability walk
+(`nameRepresentability`) did not receive the binding set and resolved the static
+alias instead. That walk is now threaded `cfg.Security.DynamicAddress.AddressBindings`
+so the **nested** member gets the SAME declared-but-unresolved guard the top level
+has — an unready binding taints the enclosing set → the `deny` fails closed
+instead of narrowing to the partial static subset. A **ready** feed (present in
+the overlay) and a static member with **no** declared binding of that name are
+unaffected. Only the referencing security **policy** path is gated this way; NAT
+rules that reference an unready feed still fall back to the static subset (out of
+scope for the deny fail-open this issue names).
 
 ## Publication-debt retry — a rejected apply is retried, not swallowed (#5646)
 

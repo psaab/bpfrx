@@ -91,7 +91,11 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 			return false
 		}
 		if _, known := nameToID[tok]; known {
-			return nameRepresentable(cfg.Security.AddressBook, feedOverlay, tok, make(map[string]bool))
+			// #5753: thread the declared dynamic-address bindings into the walk so
+			// a binding buried inside a nested address-set with an UNREADY feed
+			// fails closed even when a static alias of the same name exists — the
+			// nested-set analogue of the top-level guard above.
+			return nameRepresentable(cfg.Security.AddressBook, feedOverlay, cfg.Security.DynamicAddress.AddressBindings, tok, make(map[string]bool))
 		}
 		return false
 	}
