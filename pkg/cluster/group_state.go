@@ -59,6 +59,14 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 					delete(m.monitorWeights, k)
 				}
 			}
+			// Purge the per-RG GARP count so a same-id re-add that omits an
+			// explicit gratuitous-arp-count does not inherit this incarnation's
+			// stale count (#6027). garpCounts is only WRITTEN when the config
+			// sets a positive count, so a re-add with no explicit count relies
+			// on the map entry being absent to fall back to the default. The
+			// third same-id-re-add map-lifecycle gap in this loop after #5990
+			// (ip-monitor ipState/ipDebts/ipThresholdState).
+			delete(m.garpCounts, id)
 			delete(m.groups, id)
 		}
 	}
