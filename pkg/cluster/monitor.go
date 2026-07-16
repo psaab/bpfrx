@@ -31,6 +31,31 @@ const (
 	DefaultMonitorHoldDown      = 5 * time.Second // hold-down after state change
 )
 
+// IP-probe sweep tuning (#5301). Before this the IP monitors were probed
+// SERIALLY, so an all-unreachable sweep blocked for len(targets) × the
+// per-socket read deadline (e.g. 64 targets × 800ms ≈ 51s), starving later
+// redundancy groups and delaying HA failover detection — and Stop() had to wait
+// the whole sweep out. The sweep now probes a per-cycle immutable target
+// snapshot through a small bounded worker pool with an overall cycle deadline,
+// then applies the results serially in stable RG/target order (the failover
+// decision is unchanged — only the probe I/O is parallelized).
+const (
+	// ipProbeConcurrency bounds how many ICMP probes run at once. A sweep of
+	// N targets completes in roughly ceil(N/ipProbeConcurrency) probe
+	// deadlines instead of N of them; for the common case (targets ≤ cap) that
+	// is a single deadline.
+	ipProbeConcurrency = 16
+
+	// ipProbeReadDeadline is the per-socket ICMP read deadline (unchanged from
+	// the original inline 800ms). Named so the cycle-budget helper can derive
+	// an overall deadline from it.
+	ipProbeReadDeadline = 800 * time.Millisecond
+
+	// ipProbeCycleSlack is the headroom added over the computed wave budget so
+	// a healthy sweep never trips the overall deadline on scheduling jitter.
+	ipProbeCycleSlack = 500 * time.Millisecond
+)
+
 // Monitor periodically checks interface link states and IP reachability,
 // updating the cluster Manager's monitor weights when changes occur.
 // State changes are dampened: an interface must fail/recover for multiple
@@ -72,6 +97,16 @@ type Monitor struct {
 	// network is "udp4" or "udp6".
 	icmpDialer func(network string) (icmpConn, error)
 
+	// probeFn performs a single reachability probe for one target address.
+	// It reports (reachable, completed); completed is false only when the
+	// probe was aborted by context cancellation (Stop or the overall cycle
+	// deadline) rather than run to a natural conclusion — the caller then
+	// skips it this cycle (no dampening advance), keeping the sweep
+	// failover-neutral. nil means use probeICMP (the real ICMP path).
+	// Overridable for tests so probe latency/cancellation can be injected
+	// without real sockets.
+	probeFn func(ctx context.Context, addr string) (reachable, completed bool)
+
 	// icmpSeq is a monotonically increasing per-probe ICMP echo sequence
 	// counter. Each probe stamps a fresh sequence into its request so a
 	// stale reply from an earlier poll cycle is rejected.
@@ -81,6 +116,19 @@ type Monitor struct {
 	FailThreshold int
 	PassThreshold int
 	HoldDown      time.Duration
+
+	// IPMonitorCycleTimeout bounds a single IP-probe sweep. 0 derives a
+	// generous per-cycle budget from the target count and the per-socket
+	// deadline (ipCycleTimeout), so a healthy sweep bounded by
+	// ipProbeConcurrency always completes; a smaller value bounds pathological
+	// configs and is set by tests to force the overrun path.
+	IPMonitorCycleTimeout time.Duration
+
+	// IPMonitorCycleOverruns counts IP-probe sweeps whose overall deadline
+	// fired before every target finished — a degraded/pathological probe path.
+	// Reachability decisions are unaffected: unfinished probes are deferred to
+	// the next cycle rather than counted as failures.
+	IPMonitorCycleOverruns atomic.Uint64
 
 	// nowFunc can be overridden for testing time-dependent behavior.
 	nowFunc func() time.Time
@@ -237,30 +285,78 @@ func (mon *Monitor) loop(ctx context.Context) {
 	defer ticker.Stop()
 
 	// Run immediately on start.
-	mon.poll()
+	mon.pollCycle(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			mon.poll()
+			mon.pollCycle(ctx)
 		}
 	}
 }
 
+// poll runs one monitoring cycle with a non-cancellable context. Retained for
+// tests and any caller that does not thread a lifecycle context.
 func (mon *Monitor) poll() {
+	mon.pollCycle(context.Background())
+}
+
+// pollCycle runs one monitoring cycle. It splits the IP-monitor work into a
+// parallel probe phase and a serial apply phase (#5301):
+//
+//	Phase 1  snapshot every IP target across all RGs in stable RG/target order
+//	Phase 2  probe that snapshot concurrently (bounded pool + overall deadline);
+//	         ctx cancellation (Stop) aborts in-flight probes promptly
+//	Phase 3  apply results SERIALLY in the SAME interface-then-IP, RG-by-RG,
+//	         target-by-target order the pre-parallel code used
+//
+// Only the probe I/O moves off the owner goroutine; the failover
+// decision/weight accumulation in Phase 3 is byte-identical to the old serial
+// path, so the change is failover-neutral. Interface link-state checks stay
+// serial — they are fast local netlink calls, not the ~800ms-per-target ICMP
+// blocking that motivated this.
+func (mon *Monitor) pollCycle(ctx context.Context) {
 	mon.mu.Lock()
 	groups := mon.groups
 	mon.mu.Unlock()
 
-	// Rebuild local statuses into a local slice, then swap under lock
-	// to avoid racing with LocalInterfaceStatuses().
-	var statuses []InterfaceMonitorInfo
+	// Phase 1: immutable IP-target snapshot in stable order.
+	var ipAddrs []string
+	for _, rg := range groups {
+		if rg.IPMonitoring == nil || len(rg.IPMonitoring.Targets) == 0 {
+			continue
+		}
+		for _, target := range rg.IPMonitoring.Targets {
+			ipAddrs = append(ipAddrs, target.Address)
+		}
+	}
 
+	// Phase 2: parallel probe.
+	ipResults := mon.probeIPTargets(ctx, ipAddrs)
+
+	// Phase 3: serial apply in stable order. Rebuild local statuses into a
+	// local slice, then swap under lock to avoid racing with
+	// LocalInterfaceStatuses().
+	var statuses []InterfaceMonitorInfo
+	ipIdx := 0
 	for _, rg := range groups {
 		statuses = mon.pollInterfaceMonitors(rg, statuses)
-		mon.pollIPMonitors(rg)
+		if rg.IPMonitoring == nil || len(rg.IPMonitoring.Targets) == 0 {
+			continue
+		}
+		for _, target := range rg.IPMonitoring.Targets {
+			res := ipResults[ipIdx]
+			ipIdx++
+			if !res.completed {
+				// Probe deferred or aborted this cycle (cycle deadline or
+				// Stop) — leave the dampening state untouched rather than
+				// counting an unmeasured target as a failure.
+				continue
+			}
+			mon.applyIPMonitorResult(rg, target, res.reachable)
+		}
 	}
 
 	mon.mu.Lock()
@@ -334,47 +430,137 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 	return statuses
 }
 
-func (mon *Monitor) pollIPMonitors(rg *config.RedundancyGroup) {
-	if rg.IPMonitoring == nil || len(rg.IPMonitoring.Targets) == 0 {
-		return
+// ipProbeResult is one target's probe outcome. completed is false when the
+// probe was aborted by the cycle deadline or Stop (not run to a natural
+// conclusion), in which case the caller skips it for this cycle.
+type ipProbeResult struct {
+	reachable bool
+	completed bool
+}
+
+// ipCycleTimeout returns the overall deadline for one IP-probe sweep. A caller-
+// set IPMonitorCycleTimeout wins (tests use it to force the overrun path);
+// otherwise it derives a generous budget from the wave count so a healthy sweep
+// bounded by ipProbeConcurrency always finishes without tripping the deadline.
+func (mon *Monitor) ipCycleTimeout(numTargets int) time.Duration {
+	if mon.IPMonitorCycleTimeout > 0 {
+		return mon.IPMonitorCycleTimeout
+	}
+	conc := ipProbeConcurrency
+	if numTargets < conc {
+		conc = numTargets
+	}
+	if conc < 1 {
+		conc = 1
+	}
+	waves := (numTargets + conc - 1) / conc
+	if waves < 1 {
+		waves = 1
+	}
+	return time.Duration(waves)*ipProbeReadDeadline + ipProbeCycleSlack
+}
+
+// probe dispatches one reachability probe, honoring the probeFn test seam.
+func (mon *Monitor) probe(ctx context.Context, addr string) (reachable, completed bool) {
+	if mon.probeFn != nil {
+		return mon.probeFn(ctx, addr)
+	}
+	return mon.probeICMP(ctx, addr)
+}
+
+// probeIPTargets probes addrs concurrently through a bounded worker pool under
+// an overall cycle deadline, returning a result per input index in the SAME
+// order (#5301). A probe that does not finish before the cycle deadline (or a
+// parent Stop) is left completed=false so the caller skips it this cycle,
+// keeping the sweep failover-neutral. A cycle whose own deadline fires (as
+// opposed to a parent Stop) records IPMonitorCycleOverruns.
+func (mon *Monitor) probeIPTargets(ctx context.Context, addrs []string) []ipProbeResult {
+	results := make([]ipProbeResult, len(addrs))
+	if len(addrs) == 0 {
+		return results
 	}
 
-	for _, target := range rg.IPMonitoring.Targets {
-		key := ipMonitorKey{rgID: rg.ID, address: target.Address}
+	cycleCtx, cancel := context.WithTimeout(ctx, mon.ipCycleTimeout(len(addrs)))
+	defer cancel()
 
-		reachable := mon.probeICMP(target.Address)
+	conc := ipProbeConcurrency
+	if len(addrs) < conc {
+		conc = len(addrs)
+	}
+	sem := make(chan struct{}, conc)
+	var wg sync.WaitGroup
 
-		weight := target.Weight
-		if weight == 0 {
-			weight = rg.IPMonitoring.GlobalWeight
+launch:
+	for i, addr := range addrs {
+		select {
+		case <-cycleCtx.Done():
+			// Deadline exceeded or parent Stop: stop launching. Unlaunched
+			// results stay completed=false (skipped by the caller).
+			break launch
+		case sem <- struct{}{}:
 		}
+		wg.Add(1)
+		go func(i int, addr string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			reachable, completed := mon.probe(cycleCtx, addr)
+			results[i] = ipProbeResult{reachable: reachable, completed: completed}
+		}(i, addr)
+	}
+	wg.Wait()
 
-		// Use "ip:" prefix to distinguish from interface monitors.
-		monName := "ip:" + target.Address
+	// Record an overrun only when this sweep's OWN deadline fired — not when a
+	// parent Stop cancelled the cycle (that is an orderly shutdown, not a
+	// degraded probe path).
+	if ctx.Err() == nil && cycleCtx.Err() == context.DeadlineExceeded {
+		mon.IPMonitorCycleOverruns.Add(1)
+	}
+	return results
+}
 
-		state := mon.ipState[key]
-		if state == nil {
-			state = &monitorState{}
-			mon.ipState[key] = state
+// applyIPMonitorResult folds one target's reachability into the dampened state
+// and fires SetMonitorWeight/RecordEvent on a transition. This is the exact
+// per-target body the old serial pollIPMonitors ran; it is called serially in
+// stable RG/target order so the failover decision is byte-identical.
+func (mon *Monitor) applyIPMonitorResult(rg *config.RedundancyGroup, target *config.IPMonitorTarget, reachable bool) {
+	key := ipMonitorKey{rgID: rg.ID, address: target.Address}
+
+	weight := target.Weight
+	if weight == 0 {
+		weight = rg.IPMonitoring.GlobalWeight
+	}
+
+	// Use "ip:" prefix to distinguish from interface monitors.
+	monName := "ip:" + target.Address
+
+	state := mon.ipState[key]
+	if state == nil {
+		state = &monitorState{}
+		mon.ipState[key] = state
+	}
+
+	if mon.evaluateTransition(state, !reachable) {
+		mon.mgr.SetMonitorWeight(rg.ID, monName, state.down, weight)
+		if state.down {
+			mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
+				"IP %s unreachable, weight %d", target.Address, weight))
+		} else {
+			mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
+				"IP %s reachable", target.Address))
 		}
-
-		if mon.evaluateTransition(state, !reachable) {
-			mon.mgr.SetMonitorWeight(rg.ID, monName, state.down, weight)
-			if state.down {
-				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
-					"IP %s unreachable, weight %d", target.Address, weight))
-			} else {
-				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
-					"IP %s reachable", target.Address))
-			}
-			slog.Info("cluster monitor: IP probe state changed",
-				"rg", rg.ID, "address", target.Address,
-				"reachable", reachable, "weight", weight)
-		}
+		slog.Info("cluster monitor: IP probe state changed",
+			"rg", rg.ID, "address", target.Address,
+			"reachable", reachable, "weight", weight)
 	}
 }
 
-func (mon *Monitor) probeICMP(addr string) bool {
+// probeICMP sends one ICMP echo to addr and reports (reachable, completed).
+// completed is false only when ctx was cancelled (Stop or the overall cycle
+// deadline) and aborted an in-flight probe; a natural conclusion — a matching
+// reply, a dial/marshal failure, or the 800ms read deadline — reports
+// completed=true. The per-socket matching and 800ms read-deadline behavior are
+// unchanged; ctx only adds prompt cancellation of the active socket (#5301).
+func (mon *Monitor) probeICMP(ctx context.Context, addr string) (reachable, completed bool) {
 	dialer := mon.icmpDialer
 	if dialer == nil {
 		dialer = defaultICMPDialer
@@ -382,7 +568,7 @@ func (mon *Monitor) probeICMP(addr string) bool {
 
 	ip := net.ParseIP(addr)
 	if ip == nil {
-		return false
+		return false, true
 	}
 
 	isIPv6 := ip.To4() == nil
@@ -406,9 +592,24 @@ func (mon *Monitor) probeICMP(addr string) bool {
 
 	conn, err := dialer(network)
 	if err != nil {
-		return false
+		return false, true
 	}
 	defer conn.Close()
+
+	// Cancellation watcher: closing the socket unblocks an in-flight ReadFrom
+	// so Stop() (or the overall cycle deadline) aborts this probe promptly
+	// instead of waiting out the full 800ms read deadline (#5301). probeDone is
+	// closed on return (deferred after this, so LIFO runs it before conn.Close
+	// on the normal path), letting the watcher exit without a spurious close.
+	probeDone := make(chan struct{})
+	defer close(probeDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-probeDone:
+		}
+	}()
 
 	// Identifier the reply must carry. This code uses a Linux SOCK_DGRAM
 	// ICMP socket ("udp4"/"udp6"); the kernel OVERWRITES the identifier we
@@ -443,12 +644,14 @@ func (mon *Monitor) probeICMP(addr string) bool {
 	}
 	b, err := msg.Marshal(nil)
 	if err != nil {
-		return false
+		return false, true
 	}
 
 	dst := &net.UDPAddr{IP: ip}
 	if _, err := conn.WriteTo(b, dst); err != nil {
-		return false
+		// A write error is a natural probe failure unless ctx cancellation
+		// closed the socket out from under us (then the probe did not complete).
+		return false, ctx.Err() == nil
 	}
 
 	// Read replies until one matches the request or the deadline expires.
@@ -456,12 +659,15 @@ func (mon *Monitor) probeICMP(addr string) bool {
 	// NOT be counted as a successful probe, and must NOT consume the single
 	// read and cause a false timeout — so keep reading until the deadline.
 	// The deadline is absolute, so subsequent ReadFrom calls inherit it.
-	conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+	conn.SetReadDeadline(time.Now().Add(ipProbeReadDeadline))
 	reply := make([]byte, 1500)
 	for {
 		n, peer, err := conn.ReadFrom(reply)
 		if err != nil {
-			return false
+			// Natural 800ms timeout / read error is a completed failure; a
+			// read error caused by ctx cancellation (watcher closed the
+			// socket) is NOT completed — the caller skips it this cycle.
+			return false, ctx.Err() == nil
 		}
 
 		// The responder source address must equal the probed target.
@@ -483,7 +689,7 @@ func (mon *Monitor) probeICMP(addr string) bool {
 		if echo.ID != wantID || echo.Seq != wantSeq {
 			continue
 		}
-		return true
+		return true, true
 	}
 }
 
