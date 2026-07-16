@@ -688,6 +688,20 @@ be lost across a second reconnect. HA backup nodes ACK and ignore session
 events because they are permanent non-owners, while transient primary readiness
 gaps withhold ACK for replay.
 
+**Go reader re-baselines `prevSeq` on the barrier (#5362)**: the producer emits
+the replay-gap `FullResync(S)` in wire==seq order (#5361), so `S` is the new
+sequence baseline and the next live delta is `S+1`. The daemon's Go reader
+(`eventstream.go` `readLoop`) must advance its local `prevSeq` to `S` when it
+successfully dispatches the barrier — exactly as the session-delta cases do —
+so `S+1` is contiguous. Without that advance the first post-barrier delta is
+compared against the stale pre-barrier `prevSeq` and trips the `#2874`
+session-sync gap check (`seq > prevSeq+1 && prevSeq > 0`), forcing one spurious
+`handleSessionSyncGap` → full re-export + reconnect on the active-traffic
+recovery path. With #5361's wire-monotonic barrier that was a single benign
+reconnect (not a loop); #5362 removes even that. Only the successful-dispatch
+path advances `prevSeq`; the drop paths already advance it via
+`markDroppedFrameApplied`.
+
 **Replay-buffer eviction loss (#2382)**: the replay buffer is bounded at
 `REPLAY_BUFFER_CAPACITY` (4096). If the daemon disconnects or withholds ACKs
 long enough for the buffer to wrap, the oldest accepted-and-enqueued frame is
