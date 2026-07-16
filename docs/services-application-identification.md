@@ -39,17 +39,38 @@ upfront what they're getting and not getting.
 1. **Compile time**: `pkg/appid/runtime.go:CatalogNames` builds
    the application catalog name set from policies + the
    predefined junos-* application list + user-defined
-   applications. Each name is assigned a `u16 app_id`
-   sequentially (from 1, in sorted-name order) — done in
+   applications. Each name is assigned a **STABLE, name-derived**
+   `u16 app_id` (#5296) — a FNV-1a fold of the application NAME into
+   `[1, 65535]` (`config.StableAppID`), assigned through the shared
+   `config.AssignStableAppIDs` SSOT called by BOTH
    `pkg/dataplane/compiler.go:compileApplications`
    (`CompileResult.AppNames`, the `app_id → name` map the show
-   path consumes) and, in lock-step, in
-   `pkg/appid/catalog.go:BuildCatalog`, which also carries each
-   application's `(protocol, dst-port-range, src-port-range)`
-   match rule. A Go test
-   (`pkg/dataplane/appid_catalog_parity_test.go`) pins that the
+   path consumes) and `pkg/appid/catalog.go:BuildCatalog` (which
+   also carries each application's
+   `(protocol, dst-port-range, src-port-range)` match rule). A Go
+   test (`pkg/dataplane/appid_catalog_parity_test.go`) pins that the
    two id assignments are identical, so an id stamped by the
    dataplane always resolves to the right name.
+
+   The id is a pure function of the NAME (never of the catalog set or
+   compile order), so an ordinary catalog edit that inserts an
+   earlier-sorting application no longer renumbers existing
+   applications — a RETAINED session's frozen `app_id` keeps
+   resolving to the application it was stamped under. This replaces
+   the legacy sorted `1..N` positional assignment, whose ids shifted
+   on any such edit and mis-labeled retained sessions (#5296); it is
+   the same name-hash pattern zone ids use (`config.StableZoneID`,
+   #3075). Predefined applications are a FIXED, mutually
+   collision-free set (frozen by `TestPredefinedAppIDsCollisionFree`)
+   and always own their `StableAppID` slot; a rare USER-app hash
+   collision is resolved by a deterministic displaced-slot fill, so
+   only the colliding user apps can renumber — never the whole
+   catalog. **Honest residual (#5296):** stability is NOT absolute —
+   adding a user app that hash-collides with an existing user app can
+   renumber that small colliding set. The zero-residual path
+   (versioning application identity in the session state) is a
+   cross-language conntrack-ABI + HA-wire change, deliberately out of
+   scope for this bounded fix.
 2. **Snapshot ship**: `buildAppCatalogSnapshot`
    (`pkg/dataplane/userspace/flow.go`) emits the catalog as the
    `app_catalog` field of the config snapshot — an ordered list
@@ -74,17 +95,40 @@ upfront what they're getting and not getting.
    (#3612):** when more than one catalogued app matches a tuple, the
    winner is the more SPECIFIC one — a port-constrained entry
    (destination and/or source port set) beats a bare protocol-only
-   entry — with ties broken by the lowest `app_id` (==
-   alphabetically-first name) within a tier. This is the SAME
-   binary-specificity rule the AppID-DISABLED Go fallback uses
-   (`resolveTupleFallback`, #2578), so the same 5-tuple is labeled
+   entry — with ties broken by the lowest `app_id` within a tier.
+   Since #5296 `app_id` is a stable name-hash (`config.StableAppID`),
+   NOT the sorted-name position, so "lowest `app_id`" no longer means
+   "alphabetically-first name" — it means lowest `StableAppID`. The
+   AppID-DISABLED Go fallback (`resolveTupleFallback`, #2578) was
+   re-keyed to break same-tier ties on the SAME `StableAppID` (rather
+   than alphabetically) so the two paths still agree. This is the SAME
+   binary-specificity rule on both, so the same 5-tuple is labeled
    identically whether AppID is on or off; the shared fixture
    `userspace-dp/tests/fixtures/appid_precedence_v1.json` pins the
    two paths together (Go `TestAppIDPrecedenceParityFixture` + Rust
    `app_catalog_precedence_parity_fixture`). Before #3612 the enabled
    path tie-broke on lowest `app_id` regardless of specificity, so a
    broad protocol-only app could shadow a specific port-based app on
-   the enabled path only. **Note**: only the local
+   the enabled path only.
+
+   > **Behavior change (#5296):** for a session that matches MULTIPLE
+   > overlapping same-tier catalog applications, the displayed
+   > application-name label winner changes from "alphabetically-first
+   > name" to "lowest `StableAppID`". It is deterministic and stable
+   > across reloads, and it is applied identically on the AppID-enabled
+   > (Rust) and AppID-disabled (Go) paths, so the two agree. This is a
+   > DISPLAY/log-label change only — it does NOT affect policy matching
+   > or forwarding (the policy `application` set is evaluated separately
+   > by `CompiledApplications`). To keep the enabled-path exact-port
+   > tiebreak (`AppCatalog::exact_dst` first-writer-wins) aligned with
+   > "lowest id", `BuildCatalog` now emits catalog entries in ascending
+   > `app_id` order. A zero-delta alternative that would preserve the
+   > exact alphabetical tiebreak — a classify-time `rank` field on the
+   > Go→Rust catalog snapshot (never stamped/persisted) that Rust ties
+   > on — decouples identity from precedence but is a cross-language
+   > change, tracked as a possible follow-up beyond this bounded fix.
+
+   **Note**: only the local
    session-owner stamps `app_id` in the conntrack map (the same
    property as `alg_type`); an HA-synced session on the standby
    peer is not mirrored into the conntrack map, and a session
@@ -164,12 +208,14 @@ through the filter path is tracked as a follow-up.
 Rust wire with `0` reserved as the unknown sentinel, so real
 applications occupy ids `1..65535`. Both id-assignment walks
 (`compiler.go:compileApplications` and `catalog.go:BuildCatalog`)
-reject a config that would need a 65536th id with a deterministic
-error rather than wrapping `uint16(65536)` back to `0` (which
-would stamp a real app with the unknown sentinel and overwrite
-earlier `AppNames`). The reject is fail-closed on the live apply
-path (`CompileUserspaceShim → CompileConfig → compileApplications`):
-the apply aborts and the daemon retains the previous-good snapshot.
+assign through `config.AssignStableAppIDs`, which rejects a config
+holding more than 65535 distinct applications with a deterministic
+error rather than assigning a duplicate or the reserved id `0`
+(#5296 moved the boundary from the positional counter into the
+shared assignment helper). The reject is fail-closed on the live
+apply path (`CompileUserspaceShim → CompileConfig →
+compileApplications`): the apply aborts and the daemon retains the
+previous-good snapshot.
 
 ### ICMP type/code constraint in policy matching (#3020)
 

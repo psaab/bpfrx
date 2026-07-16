@@ -546,27 +546,26 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 	result.AppNames = make(map[uint16]string)
 	var rangeIdx uint32 // next free slot in app_ranges ARRAY
 
-	appID := uint32(1)
 	userApps := cfg.Applications.Applications
 
 	refNames, err := appid.CatalogNames(cfg, cfg.Services.ApplicationIdentification)
 	if err != nil {
 		return err
 	}
+	// #5296: assign a STABLE, name-derived app_id to every catalog name through
+	// the shared config.AssignStableAppIDs SSOT — the SAME helper appid.Build
+	// Catalog uses, so the two AppNames maps stay byte-identical (appid_catalog_
+	// parity_test.go). This replaces the legacy sorted 1..N positional counter,
+	// whose ids shifted on an ordinary catalog edit and mis-resolved a retained
+	// session's frozen app_id. The #3438 H4 uint16-overflow fail-closed boundary
+	// (a config needing more than 65535 ids aborts the apply so the daemon keeps
+	// the previous-good snapshot) now lives inside AssignStableAppIDs.
+	idByName, err := config.AssignStableAppIDs(refNames)
+	if err != nil {
+		return err
+	}
 	for _, appName := range refNames {
-		// #3438 H4: app_id narrows to a uint16 on the Rust wire with 0 reserved
-		// as the unknown sentinel, so the assignable space is 1..65535. Reject a
-		// config that would assign a 65536th id BEFORE narrowing it — otherwise
-		// uint16(65536) wraps to 0 (the sentinel) and later ids overwrite earlier
-		// AppNames, corrupting session app resolution. This is the live path:
-		// CompileUserspaceShim -> CompileConfig -> compileApplications builds
-		// CompileResult.AppNames, which the AF_XDP show path consumes via
-		// applyResult(). The fail-closed error aborts the apply and the daemon
-		// retains the previous-good snapshot. appid.BuildCatalog enforces the
-		// same boundary on the catalog shipped to the helper.
-		if appID > 65535 {
-			return fmt.Errorf("application catalog exceeds 65535 entries: assigning app_id to %q would overflow the uint16 app_id space (0 is the reserved unknown sentinel); reduce the number of referenced applications", appName)
-		}
+		appID := uint32(idByName[appName])
 
 		app, found := config.ResolveApplication(appName, userApps)
 		if !found {
@@ -702,7 +701,6 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 
 		slog.Debug("application compiled", "name", appName, "id", appID,
 			"proto", proto, "dstPort", app.DestinationPort, "srcPort", app.SourcePort, "timeout", appTimeout)
-		appID++
 	}
 
 	// Zero remaining app_ranges slots (sentinel for BPF iteration).
