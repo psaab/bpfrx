@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"sort"
 )
 
@@ -131,6 +132,18 @@ func AssignStableAppIDs(names []string) (map[string]uint16, error) {
 		for i, n := range displaced {
 			out[n] = free[i]
 			taken[free[i]] = true
+			// A displaced app is the HONEST RESIDUAL (#5296): its stable,
+			// name-derived StableAppID hash-collided with an already-placed id
+			// (another user app, or — placed first — a predefined), so it was
+			// bumped to the lowest free id. That bumped id is NOT a pure
+			// function of the app name alone, so this small colliding set can
+			// renumber across catalog edits — the one case the doc says needs
+			// operator attention. This runs at catalog build (config compile),
+			// never per-packet/per-session, so a Warn is correct here (#5988).
+			slog.Warn("application id displaced by stable-id hash collision; its app_id may renumber across catalog edits (rare — see docs/services-application-identification.md)",
+				"application", n,
+				"natural_app_id", StableAppID(n),
+				"assigned_app_id", free[i])
 		}
 	}
 
