@@ -1045,6 +1045,21 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 // discriminator is errors.Is(err, errDHCPNAK); see runDHCPv4 (#3956).
 var errDHCPNAK = errors.New("DHCPv4 server sent NAK")
 
+// errV6AddrInvalidated signals that a DHCPv6 Reply EXPLICITLY invalidated the
+// held IA_NA address: the reply carried IA_NA IAADDR option(s) that were ALL
+// valid-lifetime 0 (RFC 8415 §18.2.10.1 — the address is no longer valid and
+// MUST be discarded), with no live IA_NA address and no live delegated prefix
+// to fall back to. It is DISTINCT from the generic "no usable IA_NA / live
+// IA_PD" error, which means the reply carried NO usable IAADDR at all (an
+// ABSENT / transient reply — server omission or packet loss). The
+// discriminator is errors.Is(err, errV6AddrInvalidated): on an EXPLICIT
+// invalidation the renew/rebind loop DECONFIGURES the held address and
+// re-acquires (§18.2.10.1); on the ABSENT/transient error it KEEPS the address
+// and retries (T1→T2→solicit), the correct #4874/#1844 anti-outage behavior.
+// Fail SAFE toward keep-and-retry: the sentinel is returned ONLY when a
+// present-but-0 IAADDR is positively observed (#5927).
+var errV6AddrInvalidated = errors.New("DHCPv6 reply explicitly invalidated the held IA_NA address (valid-lifetime 0)")
+
 // abandonLeaseAfterNAK deconfigures the interface and drops the lease
 // record after a DHCPNAK revoked the lease (RFC 2131 §4.4.5). The client
 // must stop using the address immediately and return to INIT — it must
@@ -1438,6 +1453,25 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 					"lease_time", committed.LeaseTime)
 				continue
 			}
+			if errors.Is(rerr, errV6AddrInvalidated) {
+				// #5927: the server EXPLICITLY invalidated the held IA_NA
+				// address (valid-lifetime 0). RFC 8415 §18.2.10.1: stop using
+				// it NOW — deconfigure + re-acquire, do NOT keep it and wait for
+				// T2 (which would keep a server-withdrawn address in service).
+				// This is the IA_NA analog of the IA_PD withdrawal reconcile
+				// above. A merely absent/transient renew reply keeps the
+				// generic error and the keep-and-wait-T2 path below (#4874).
+				slog.Info("DHCPv6: server invalidated held address (valid-lifetime 0), deconfiguring and re-acquiring",
+					"interface", ifaceName, "address", committed.Address)
+				if committed.Address.IsValid() {
+					m.removeAddress(ifaceName, committed)
+				}
+				m.mu.Lock()
+				delete(m.leases, key)
+				delete(m.delegatedPDs, ifaceName)
+				m.mu.Unlock()
+				break // re-acquire from a fresh solicit
+			}
 			slog.Warn("DHCPv6: T1 renewal failed, waiting for T2",
 				"interface", ifaceName, "err", rerr)
 
@@ -1472,6 +1506,22 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 					"delegated_prefixes", len(renewed.prefixes),
 					"lease_time", committed.LeaseTime)
 				continue
+			}
+			if errors.Is(rerr, errV6AddrInvalidated) {
+				// #5927: explicit invalidation on REBIND too — deconfigure the
+				// held address before falling back to a fresh solicit (the
+				// generic rebind-failure break below keeps it in service until
+				// re-acquire, which is correct only for a transient failure).
+				slog.Info("DHCPv6: server invalidated held address on rebind (valid-lifetime 0), deconfiguring and re-acquiring",
+					"interface", ifaceName, "address", committed.Address)
+				if committed.Address.IsValid() {
+					m.removeAddress(ifaceName, committed)
+				}
+				m.mu.Lock()
+				delete(m.leases, key)
+				delete(m.delegatedPDs, ifaceName)
+				m.mu.Unlock()
+				break
 			}
 			slog.Warn("DHCPv6: T2 rebind failed, lease will expire, re-acquiring",
 				"interface", ifaceName, "err", rerr)
@@ -1612,12 +1662,21 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string, mode dhcpExcha
 // caller pairs lease.LeaseTime with the right lifetime rather than a
 // stale one from a different IAADDR. Returns an invalid Addr and zero
 // duration when the reply carries no usable IA_NA address.
-func selectIANAAddress(adv *dhcpv6.Message) (netip.Addr, time.Duration) {
+//
+// The third return, sawZeroLifetime, reports whether the reply carried an
+// IA_NA IAADDR option with valid-lifetime 0 (an explicit stop-using directive,
+// RFC 8415 §18.2.10.1). Combined with an invalid returned Addr (no positive
+// address selectable), it lets the caller distinguish an EXPLICIT invalidation
+// (present-but-0 → discard the held address) from an ABSENT IA_NA (no IAADDR
+// at all → keep + retry). A reply with both a 0-lifetime and a positive IAADDR
+// still selects the positive one (valid Addr) — not an invalidation. (#5927)
+func selectIANAAddress(adv *dhcpv6.Message) (addr netip.Addr, validLT time.Duration, sawZeroLifetime bool) {
 	var (
 		best      netip.Addr
 		bestValid time.Duration
 		bestPref  time.Duration
 		found     bool
+		sawZero   bool
 	)
 	for _, opt := range adv.Options.Options {
 		ianaOpt, ok := opt.(*dhcpv6.OptIANA)
@@ -1629,8 +1688,11 @@ func selectIANAAddress(adv *dhcpv6.Message) (netip.Addr, time.Duration) {
 			if !ok {
 				continue
 			}
-			// Expired/declined address — never install it (F-264).
+			// Expired/declined address — never install it (F-264). Record
+			// that a present-but-0 IAADDR was seen so the caller can tell an
+			// EXPLICIT invalidation from an absent IA_NA (#5927).
 			if iaaddr.ValidLifetime == 0 {
+				sawZero = true
 				continue
 			}
 			a, ok := netip.AddrFromSlice(iaaddr.IPv6Addr)
@@ -1647,7 +1709,7 @@ func selectIANAAddress(adv *dhcpv6.Message) (netip.Addr, time.Duration) {
 			}
 		}
 	}
-	return best, bestValid
+	return best, bestValid, sawZero
 }
 
 // parseV6Reply extracts the lease (IA_NA address, lifetime, DNS, gateway)
@@ -1681,9 +1743,16 @@ func (m *Manager) parseV6Reply(ctx context.Context, ifaceName string, adv *dhcpv
 	// paired with a stale value from a different address (#4383).
 	var addr netip.Addr
 	var validLT time.Duration
+	// iaNAExplicitlyInvalidated: the reply carried IA_NA IAADDR(s) that were
+	// ALL valid-lifetime 0 (no positive address selectable) — the server's
+	// RFC 8415 §18.2.10.1 "stop using this address" directive (#5927). Kept
+	// distinct from an absent IA_NA so the caller can discard vs keep+retry.
+	var iaNAExplicitlyInvalidated bool
 
 	if wantNA {
-		addr, validLT = selectIANAAddress(adv)
+		var sawZeroLifetime bool
+		addr, validLT, sawZeroLifetime = selectIANAAddress(adv)
+		iaNAExplicitlyInvalidated = !addr.IsValid() && sawZeroLifetime
 	}
 
 	// Extract IA_PD delegated prefixes, split into live and (RFC 8415
@@ -1711,6 +1780,15 @@ func (m *Manager) parseV6Reply(ctx context.Context, ifaceName string, adv *dhcpv
 	// Codex F6). The trailing wantNA||wantPD guard keeps a degenerate
 	// no-IA config on its prior no-reject path.
 	if !addr.IsValid() && len(result.prefixes) == 0 && (wantNA || wantPD) {
+		// #5927: distinguish an EXPLICIT invalidation (the reply carried an
+		// IA_NA whose IAADDR(s) were all valid-lifetime 0 — RFC 8415
+		// §18.2.10.1, stop using the address) from an ABSENT / transient reply
+		// (no usable IAADDR at all). Only the former returns the
+		// errV6AddrInvalidated sentinel, on which the renew/rebind loop
+		// deconfigures the held address; the generic error keeps it + retries.
+		if iaNAExplicitlyInvalidated {
+			return nil, fmt.Errorf("DHCPv6 reply on %s: %w", ifaceName, errV6AddrInvalidated)
+		}
 		return nil, fmt.Errorf("no usable IA_NA address or live IA_PD prefix in DHCPv6 reply on %s", ifaceName)
 	}
 
@@ -1732,6 +1810,15 @@ func (m *Manager) parseV6Reply(ctx context.Context, ifaceName string, adv *dhcpv
 		lease.LeaseTime = result.prefixes[0].ValidLifetime
 	}
 
+	// A sane default for the DEGENERATE no-IA config (wantNA=false &&
+	// wantPD=false), the only shape that reaches here with LeaseTime 0: a
+	// selected IA_NA address and a live IA_PD prefix both carry a positive
+	// lifetime (selectIANAAddress skips valid-lifetime-0 IAADDRs, #4383;
+	// extractDelegatedPrefixes routes valid-lifetime-0 prefixes to
+	// withdrawnPDs). This is NOT the explicit-0 invalidation path — that is
+	// handled upstream at the "no usable IA_NA / live IA_PD" guard, which
+	// returns errV6AddrInvalidated so the renew/rebind loop deconfigures the
+	// held address (RFC 8415 §18.2.10.1, #5927), never reaching this floor.
 	if lease.LeaseTime == 0 {
 		lease.LeaseTime = 3600 * time.Second
 	}

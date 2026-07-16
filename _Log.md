@@ -48877,3 +48877,24 @@ top.
   - **File(s)**: pkg/grpcapi/server_show_status.go, pkg/grpcapi/server_show_system.go,
     pkg/grpcapi/server_show.go, pkg/diagcmd/limiter.go,
     pkg/grpcapi/server_sessioncount_bound_5782_test.go
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5927 DHCPv6 explicit valid-lifetime-0 IA_NA invalidation (RFC 8415
+    §18.2.10.1). Diagnosis: the ticket's floor at dhcp.go (`LeaseTime==0 → 3600`)
+    is a RED HERRING — selectIANAAddress (#4383) already skips 0-lifetime IAADDRs,
+    so parseV6Reply errors before the floor (floor only hit in the degenerate no-IA
+    config). Real gap: the RENEW/REBIND loop treated the explicit-0 error as a
+    TRANSIENT failure (keep-and-wait-T2), keeping a server-invalidated address in
+    service. Fix: thread present-0-vs-absent through selectIANAAddress (added
+    sawZeroLifetime return) → parseV6Reply returns a DISTINCT errV6AddrInvalidated
+    sentinel ONLY when a present-but-0 IAADDR left no usable address (fail-safe
+    toward keep on absent/transient) → the renew AND rebind loops errors.Is-check
+    the sentinel and DECONFIGURE the held address + re-acquire (IA_NA analog of the
+    IA_PD withdrawal reconcile). Floor left as-is with a clarifying comment.
+    Guardrail: an ABSENT IA_NA (generic error) still KEEPS the address + retries
+    (no over-correction). Fail-on-revert proven via -overlay (remove the deconfigure
+    branches → (b) invalidation kept-and-rebinds, test RED; (d) absent stays green).
+    OUT OF SCOPE noted: address-change-on-renew (different addr, lifetime>0) is a
+    separate concern, not #5927.
+  - **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/dhcpv6_zero_lifetime_invalidate_5927_test.go,
+    pkg/dhcp/dhcpv6_iana_test.go (signature), pkg/dhcp/README.md

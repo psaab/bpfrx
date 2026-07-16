@@ -104,6 +104,20 @@ the debounced `onAddressChange` callback when content changed.
   abandoning the cycle and re-acquiring, paced by `reacquireBackstop` so a
   server that keeps granting a 0-second lease cannot become a tight
   DISCOVER/SOLICIT loop. v4 and v6 share this one definition.
+- **DHCPv6 explicit valid-lifetime-0 invalidation (RFC 8415 §18.2.10.1,
+  #5927)**: a Reply that carries an IA_NA whose IAADDR(s) are **all
+  valid-lifetime 0** is the server's directive to STOP using the held
+  address. `selectIANAAddress` skips 0-lifetime IAADDRs (#4383) and
+  `parseV6Reply` reports this distinctly via the `errV6AddrInvalidated`
+  sentinel (present-but-0), separate from the generic "no usable IA_NA /
+  live IA_PD" error (an **absent / transient** reply). On the sentinel
+  during RENEW/REBIND the run loop **deconfigures** the held address and
+  re-acquires — the IA_NA analog of the IA_PD withdrawal reconcile — while
+  a merely absent/transient reply **keeps** the address and retries
+  (T1→T2→solicit, the #4874/#1844 anti-outage path). NOTE: the
+  `LeaseTime == 0 → 3600s` default in `parseV6Reply` is NOT this path — it
+  only applies to a degenerate no-IA config; the explicit-0 invalidation
+  is handled before it.
 - **Successful T1 renew / T2 rebind is committed**, and the run loop
   returns to the T1 wait with timers recomputed from the renewed
   lease. Pre-#1777 the renewal result was dead-assigned and the loop
