@@ -1611,6 +1611,18 @@ func ValidateConfig(cfg *Config) []string {
 	warnings = append(warnings, validateHostInboundMulticastWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundManagedRoutingMismatch(cfg)...)
 
+	// #5837 (Track-1 mitigation): a destination-NAT / static-NAT rule whose
+	// public (matched / external) destination address equals a configured
+	// interface address is INERT on the first packet — the userspace AF_XDP shim
+	// classifies a firewall-local destination as kernel-local and shunts it to the
+	// host BEFORE consulting DNAT/static-NAT (is_local_destination runs before
+	// pre_routing_dnat). Today that bypass is SILENT; this advisory makes it LOUD,
+	// naming the rule + the colliding interface address. WARN-only on both compile
+	// paths (valid Junos; works for reply/established traffic; the full dataplane
+	// fix is deferred to Track-2). See docs/nat-destination.md and the converged
+	// plan docs/research/5837-xdp-dnat-before-local/plan.md §0a.
+	warnings = append(warnings, validateNATInterfaceAddressCollisionWarnings(cfg)...)
+
 	return warnings
 }
 

@@ -1,3 +1,40 @@
+## 2026-07-16 — #5837 rev6052 fold: exclude interface-mode-SNAT-routed addrs from the NAT-interface-address advisory
+
+- **Timestamp**: 2026-07-16 (fix/5837-track1-interface-addr-nat-warning)
+- **Action**: Reviewer-found, parent-verified over-warn fold. The #5837 Track-1
+  advisory (`validateNATInterfaceAddressCollisionWarnings`) false-warned on the
+  CANONICAL masquerade + WAN-port-forward config: interface-mode source-NAT
+  `trust`→`untrust` plus a DNAT from `untrust` matching the untrust interface's
+  own WAN-IP. That translation is NOT inert — when interface-mode SNAT targets a
+  zone, the dataplane moves that zone's interface addresses out of the
+  kernel-local set and into `interface_nat`
+  (`nat_translated_local_exclusions`, `userspace-dp/src/afxdp/rst.rs`), so
+  `is_local_destination` returns FALSE (short-circuits on `USERSPACE_INTERFACE_NAT`
+  membership BEFORE the local_v4/v6 check) and inbound DNAT DOES apply.
+  Fix: replicated the rst.rs predicate on the Go side
+  (`interfaceModeSNATExcludedAddresses`): collect the to-zone of every
+  `cfg.Security.NAT.Source` rule that is `interface_mode && !off && to_zone != ""`
+  (mirrors rst.rs exactly — snapshot mapping confirmed in
+  `pkg/dataplane/userspace/nat_source.go:185-194`), then exclude the configured
+  addresses of every interface (via `buildZoneInterfaceMapLocal`, same package)
+  whose zone is in that set. Used the SAFE SUPERSET (all configured unit
+  addresses of a to-zone interface, not just `pick_interface_v4/v6`): never
+  false-warns, only slightly under-warns on a non-picked secondary address, and
+  is insulated from the kernel/config address-ordering divergence a runtime pick
+  would see. VRRP VIPs are NOT excluded (pick reads configured addresses, never
+  VIPs) — a VIP DNAT/static match stays inert and still warns.
+- **File(s)**: pkg/config/compiler_validate_warn_nat_iface_addr.go,
+  pkg/config/compiler_interface_addr_nat_warning_5837_test.go,
+  docs/userspace-dnat-plan.md, _Log.md
+- **Validation**: `go build ./...` clean, `go vet ./pkg/config` clean,
+  `go test ./pkg/config` green (11.9s). New fail-on-revert test
+  `TestDNATInterfaceAddressExcludedByInterfaceSNAT_5837` (canonical config → NO
+  advisory) proven RED when the `if excluded[host]` guard is disabled (assertion
+  failure, build stays clean); keep-green
+  `TestDNATInterfaceAddressStillWarnsWhenSNATToOtherZone_5837` proves the
+  exclusion is to-zone scoped (SNAT to a different zone still warns); existing 6
+  tests stay green.
+
 ## 2026-07-16 — #5293: filter change-detector omits six flex-match fields
 
 - **Timestamp**: 2026-07-16 (fix/5293-filter-flex-semantics-match)
@@ -50950,6 +50987,37 @@ top.
   pkg/configstore/store.go,
   pkg/configstore/peer_effective_snat_5876_test.go (new),
   docs/config-schema.md
+
+- **Timestamp**: 2026-07-16
+  **Action**: #5837 (Track-1 mitigation) — commit-time WARNING for the
+  first-packet interface-address DNAT/static-NAT bypass. On a session miss the
+  userspace AF_XDP shim classifies a packet destined to a firewall-local
+  interface address as kernel-local (`is_local_destination`) BEFORE consulting
+  destination-NAT / static-NAT (`pre_routing_dnat`), so a Junos port-forward /
+  static 1:1 mapping onto the WAN interface's own address is INERT on the first
+  packet (delivered to the host instead of translated + zone-policed); reply /
+  established traffic is unaffected. Today this is SILENT. Added
+  `validateNATInterfaceAddressCollisionWarnings`
+  (new `pkg/config/compiler_validate_warn_nat_iface_addr.go`), wired into
+  `ValidateConfig` so it fires on BOTH the strict commit and tolerant
+  load/peer-sync paths (WARN-only — valid Junos, never rejects/changes
+  forwarding). It checks each DNAT rule's `match destination-address` (the
+  PUBLIC address the outside targets — NOT the pool/translated-to address, which
+  the ingress classifier never inspects) and each static-NAT rule's `match`
+  external address against the set of configured interface addresses (static unit
+  addresses + VRRP VIPs, both families, normalized via `hostLocalAddrFamily`),
+  naming the rule-set/rule + colliding interface. Track-2 (the dedicated-intent-
+  map dataplane fix) stays deferred per the converged plan §0a. Fail-on-revert
+  proven firsthand (RED: "expected exactly one #5837 DNAT advisory, got 0" when
+  the emit is neutralized). NOTE for reviewer: §0a's literal wording says "DNAT
+  pool address" but the #5837 bypass is triggered by the MATCHED/ingress public
+  address (what `is_local_destination` inspects), matching the plan BACKGROUND
+  ("the address the outside world targets") — so the check keys on the match
+  address; a control test proves pool==iface does NOT warn.
+  **File(s)**: pkg/config/compiler_validate_warn_nat_iface_addr.go (new),
+  pkg/config/compiler_interface_addr_nat_warning_5837_test.go (new),
+  pkg/config/compiler_validate_warn.go,
+  docs/userspace-dnat-plan.md
 
 - **Timestamp**: 2026-07-16
   **Action**: #5875 — reject zone-qualified IPv6 SNAT pool addresses at strict
