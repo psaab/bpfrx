@@ -50949,3 +50949,78 @@ top.
   pkg/config/compiler_interface_addr_nat_warning_5837_test.go (new),
   pkg/config/compiler_validate_warn.go,
   docs/userspace-dnat-plan.md
+
+- **Timestamp**: 2026-07-16
+  **Action**: #5875 — reject zone-qualified IPv6 SNAT pool addresses at strict
+  commit (control-plane/dataplane representability). Strict source-NAT
+  validation ACCEPTED a scoped IPv6 literal (`fe80::1%eth0`) in a source-NAT
+  pool `address`: the Junos lexer admits `%` (`lexer.go` `isIdentChar`) and Go's
+  `netip.ParseAddr` honors a zone, so the scoped form passed the #5627
+  pool-address grammar gate and the snapshot builder shipped the raw string.
+  The Rust allocator parses each member as `std::net::IpAddr`
+  (`expand_pool_address`, `userspace-dp/src/nat/source.rs`), which has no scope
+  model, so the scoped form fails to parse, the whole pool is marked
+  `InvalidPool`, and the rule silently stops translating after apply — a
+  commit-vs-apply divergence. Fix (mirrors #5859/#5818/#5819 fail-closed shape):
+  added `validateSourceNATPoolAddressScopeStrict` (`compiler_validate_strict_nat.go`)
+  + shared detector `config.PoolAddressHasZoneScope` (a `%` substring test).
+  The gate hard-rejects a `%zone`-scoped pool address at strict commit (naming
+  the pool + address, advising removal of the suffix), iterates ONLY referenced
+  pools (same scoping as #5627), and runs BEFORE the grammar gate so a
+  scoped-CIDR gets the precise scope message rather than a generic invalid-CIDR
+  one. Dispatched in `runUniformGates` with the `lenientDestNATAddresses`
+  downgrade (warn on load / peer-sync, #1960 no-brick) and in the #5876
+  peer-effective SNAT view (`validateSourceNATStrictView`) so a
+  peer-`${node}`-only scoped address is rejected at the origin commit too. The
+  snapshot builder (`nat_source.go`) independently fails closed — marks the pool
+  unusable with reason `zone_scoped_pool_address` (Rust maps the unknown reason
+  to `InvalidPool` via the existing fallback, same as #5819's
+  `persistent_nat_no_translation`) — so a persisted/peer-synced scoped pool
+  installs nothing rather than shipping the unparseable string. No Rust change.
+  Fail-on-revert proven firsthand (RED verbatim): strict reject neutralized →
+  scoped address compiles clean; lenient warn absent; snapshot ships the raw
+  string with `PoolUnusable=false`. `go build ./...`, `go vet`, and the full
+  `pkg/config` + `pkg/dataplane/userspace` suites green.
+  **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates.go,
+  pkg/config/compiler_peer_effective_snat.go,
+  pkg/config/compiler_zone_scoped_snat_pool_5875_test.go (new),
+  pkg/dataplane/userspace/nat_source.go,
+  pkg/dataplane/userspace/nat_source_zone_scope_5875_test.go (new),
+  docs/config-schema.md, _Log.md
+
+## 2026-07-16 — #5873 ensure HA-clear retry loop before failed-clear return
+
+- **Timestamp**: 2026-07-16
+- **Action**: Fix an HA-state cleanup ordering bug: a standalone
+  (non-cluster) HA-state clear that fails records a `pendingHAStateClear`
+  retry debt (#5487), but that debt's ONLY retry consumer is the periodic
+  status loop (`retryPendingHAStateClearLocked` on the 1/s tick). The two
+  apply-path clear sites in `Compile` (manager_compile.go) could return the
+  fail-closed error BEFORE the loop was started: the first-startup full-publish
+  path returns from the failed-clear branch just ABOVE `ensureStatusLoopLocked`,
+  and the deferred-XSK resume path returns without ever calling it. On first
+  startup (or any apply with no pre-existing loop) a failed clear therefore
+  orphaned the debt — nothing ever retried the idempotent empty
+  `update_ha_state`, so stale helper HA groups persisted and kept owner-RG-0
+  transit `ForwardCandidate`s `HAInactive` (drop) indefinitely, contradicting
+  the debt's eventual-cleanup contract. Fix (minimal call-ordering): added a
+  thin wrapper `clearHelperHAStateWithDebtEnsureRetryLocked` (manager_ha.go,
+  next to the existing debt lifecycle) that runs `clearHelperHAStateWithDebtLocked`
+  and, on failure, calls `ensureStatusLoopLocked` (idempotent — guarded on
+  `m.syncCancel`) before returning the raw error. Both clear sites now use the
+  wrapper, so a recorded debt ALWAYS has a running worker to retry it. Ordering
+  preserved: record debt (inside WithDebt) -> ensure loop -> return err. The
+  clear still fails closed. Invariant now documented in code comments
+  (manager_ha.go / manager_compile.go); no prose doc described the clear-debt
+  retry, so no docs change beyond the code comments.
+  Validation: `go build ./...` clean; `go vet ./pkg/dataplane/userspace` clean;
+  `TMPDIR=/tmp go test ./pkg/dataplane/userspace` GREEN (14.8s). Fail-on-revert
+  proven firsthand: removing the `ensureStatusLoopLocked` call from the wrapper
+  turns `TestClearHelperHAStateEnsureRetryStartsLoopOnFailedClear` RED
+  (`syncCancel == nil`; the debt is orphaned). Smoke (`make test-failover`)
+  deferred — shim-wall-blocked, pure control-plane ordering fix gated on the
+  fail-on-revert unit test.
+  **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/manager_ha_clear_debt_5873_test.go (new)

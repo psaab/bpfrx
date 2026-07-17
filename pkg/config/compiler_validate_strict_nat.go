@@ -901,6 +901,110 @@ func validateSourceNATPoolAddressGrammarStrict(cfg *Config) error {
 	return nil
 }
 
+// PoolAddressHasZoneScope reports whether a source-NAT pool address literal
+// carries an IPv6 zone/scope qualifier (`%<zone>`), e.g. `fe80::1%eth0`
+// (#5875). The Junos lexer permits the `%`-qualified text (lexer.go isIdentChar
+// admits `%`) and Go's netip.ParseAddr accepts a zone, so a scoped literal
+// passes the source-pool address grammar gate. But the live Rust allocator
+// parses each pool member as std::net::IpAddr (`expand_pool_address`,
+// userspace-dp/src/nat/source.rs), which has NO zone model, so the scoped form
+// fails to parse and the whole pool is marked InvalidPool and dropped at apply.
+//
+// No legitimate source-NAT pool address ever carries a `%zone` suffix — a
+// global SNAT pool address needs no interface scope, and `%` is not part of any
+// IPv4/IPv6/CIDR literal — so a `%` anywhere in the member is unambiguously the
+// zone qualifier. Detection is a plain substring test so it also catches a
+// scoped-CIDR (`fe80::1%eth0/64`) form that netip.ParsePrefix would reject with
+// a less specific message. Shared by the strict validator
+// (validateSourceNATPoolAddressScopeStrict) and the userspace snapshot builder
+// (pkg/dataplane/userspace/nat_source.go) so both fail closed identically.
+func PoolAddressHasZoneScope(addr string) bool {
+	return strings.Contains(addr, "%")
+}
+
+// validateSourceNATPoolAddressScopeStrict (#5875) hard-rejects a source-NAT
+// pool, referenced by a pool-mode `then source-nat pool <name>` rule, whose
+// address membership carries an IPv6 zone/scope qualifier (`%<zone>`) that the
+// live Rust dataplane cannot represent — a NEW representability constraint
+// alongside validateSourceNATPoolAddressGrammarStrict (#5627).
+//
+// A scoped literal such as `fe80::1%eth0` passes the grammar gate because Go's
+// netip.ParseAddr accepts a zone identifier, and the snapshot builder copies
+// the raw string onto the wire. But Rust parses pool members as
+// std::net::IpAddr (no scope model), so `expand_pool_address` returns false,
+// the allocator marks the whole pool InvalidPool, and the rule silently stops
+// translating after apply — a commit-vs-apply divergence. Rejecting the scoped
+// form is safe: a global SNAT pool address never needs an interface scope, and
+// stripping the `%zone` silently would change the modeled address, so the fix
+// rejects rather than rewrites (per the issue's "do not strip %zone silently").
+//
+// Mirrors validateSourceNATPoolAddressGrammarStrict's scoping exactly: only
+// pools a pool-mode rule references are checked (an unreferenced pool never
+// reaches the Rust grammar), in sorted rule-set / declaration order for a
+// deterministic first-reported offender. Dispatched BEFORE the grammar gate so
+// a `%zone`-scoped member (including a scoped-CIDR the grammar gate would
+// otherwise reject with a generic invalid-CIDR message) gets this precise,
+// actionable scope diagnostic. Strict on commit / commit-check
+// (hard-reject so the un-representable pool is operator-visible); the call site
+// (runUniformGates) downgrades it to a warning on the tolerant load / peer-sync
+// path (#1960 no-brick) — the snapshot builder independently marks the pool
+// unusable (reason "zone_scoped_pool_address"), installing nothing rather than
+// shipping the unparseable string. Because it is registered in the SNAT strict
+// set, the #5876 peer-effective SNAT gate runs it against the peer view too.
+func validateSourceNATPoolAddressScopeStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	pools := cfg.Security.NAT.SourcePools
+	rulesets := append([]*NATRuleSet(nil), cfg.Security.NAT.Source...)
+	sort.SliceStable(rulesets, func(i, j int) bool {
+		if rulesets[i] == nil || rulesets[j] == nil {
+			return rulesets[i] != nil
+		}
+		return rulesets[i].Name < rulesets[j].Name
+	})
+	seen := make(map[string]bool)
+	for _, rs := range rulesets {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.Then.PoolName == "" {
+				continue
+			}
+			name := rule.Then.PoolName
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			pool, ok := pools[name]
+			if !ok || pool == nil {
+				// Undefined reference — validateNATPoolReferencesStrict (#5626).
+				continue
+			}
+			var addrs []string
+			if pool.Address != "" {
+				addrs = append(addrs, pool.Address)
+			}
+			addrs = append(addrs, pool.Addresses...)
+			for _, a := range addrs {
+				if PoolAddressHasZoneScope(a) {
+					return fmt.Errorf(
+						"source-nat pool %q (referenced by rule-set %q rule %q): "+
+							"address %q carries an IPv6 zone/scope qualifier (%%zone), "+
+							"which the dataplane cannot represent — Rust parses pool "+
+							"members as an unscoped IP address, so the rule commits but "+
+							"the dataplane marks the pool unusable (InvalidPool) and "+
+							"drops it at runtime, silently stopping translation; remove "+
+							"the %%zone suffix (a global SNAT pool address needs no scope)",
+						name, rs.Name, rule.Name, a)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // validateNATSourceAddressNameReferencesStrict hard-rejects a source or
 // destination NAT rule whose `match source-address-name <name>` OR `match
 // destination-address-name <name>` (#3229) names an address-book entry that

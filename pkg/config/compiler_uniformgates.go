@@ -683,6 +683,35 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5875 source-NAT pool ZONE-SCOPED ADDRESS gate. A source-NAT pool address
+	// may carry an IPv6 zone/scope qualifier (`fe80::1%eth0`): the Junos lexer
+	// admits `%` and Go's netip.ParseAddr honors a zone, so the scoped literal
+	// slipped through and the snapshot builder copied the raw string onto the
+	// wire. But the Rust allocator parses each pool member as std::net::IpAddr
+	// (no scope model), so the scoped form fails to parse, the pool is marked
+	// InvalidPool, and the rule silently stops translating after apply — a
+	// commit-vs-apply divergence. Reject the scoped form: a global SNAT pool
+	// address never needs an interface scope, and stripping `%zone` silently
+	// would change the modeled address. Strict on commit / commit-check
+	// (hard-reject so the un-representable pool is operator-visible); lenient on
+	// load / peer-sync (downgrade to a warning so a config persisted before this
+	// gate existed still boots — #1960 no-brick; the snapshot builder
+	// independently marks the pool unusable with reason "zone_scoped_pool_address").
+	// Shares the lenientDestNATAddresses flag (same NAT silent-drop /
+	// wrong-translate doctrine). Runs BEFORE the grammar gate so a `%zone`-scoped
+	// member (including a scoped-CIDR the grammar gate would otherwise reject with
+	// a generic invalid-CIDR message) gets the precise, actionable scope
+	// diagnostic. Registered in the SNAT strict set, so #5876's peer-effective
+	// SNAT gate covers it too.
+	if err := validateSourceNATPoolAddressScopeStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("source-nat pool zone-scoped address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5627 source-NAT pool ADDRESS-grammar gate. The strict path validated a
 	// source pool's `port range` but left its ADDRESS members unchecked, so a
 	// pool referenced by a pool-mode `then source-nat pool <name>` rule that
