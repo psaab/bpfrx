@@ -50918,3 +50918,42 @@ top.
   pkg/configstore/store.go,
   pkg/configstore/peer_effective_snat_5876_test.go (new),
   docs/config-schema.md
+
+- **Timestamp**: 2026-07-16
+  **Action**: #5875 — reject zone-qualified IPv6 SNAT pool addresses at strict
+  commit (control-plane/dataplane representability). Strict source-NAT
+  validation ACCEPTED a scoped IPv6 literal (`fe80::1%eth0`) in a source-NAT
+  pool `address`: the Junos lexer admits `%` (`lexer.go` `isIdentChar`) and Go's
+  `netip.ParseAddr` honors a zone, so the scoped form passed the #5627
+  pool-address grammar gate and the snapshot builder shipped the raw string.
+  The Rust allocator parses each member as `std::net::IpAddr`
+  (`expand_pool_address`, `userspace-dp/src/nat/source.rs`), which has no scope
+  model, so the scoped form fails to parse, the whole pool is marked
+  `InvalidPool`, and the rule silently stops translating after apply — a
+  commit-vs-apply divergence. Fix (mirrors #5859/#5818/#5819 fail-closed shape):
+  added `validateSourceNATPoolAddressScopeStrict` (`compiler_validate_strict_nat.go`)
+  + shared detector `config.PoolAddressHasZoneScope` (a `%` substring test).
+  The gate hard-rejects a `%zone`-scoped pool address at strict commit (naming
+  the pool + address, advising removal of the suffix), iterates ONLY referenced
+  pools (same scoping as #5627), and runs BEFORE the grammar gate so a
+  scoped-CIDR gets the precise scope message rather than a generic invalid-CIDR
+  one. Dispatched in `runUniformGates` with the `lenientDestNATAddresses`
+  downgrade (warn on load / peer-sync, #1960 no-brick) and in the #5876
+  peer-effective SNAT view (`validateSourceNATStrictView`) so a
+  peer-`${node}`-only scoped address is rejected at the origin commit too. The
+  snapshot builder (`nat_source.go`) independently fails closed — marks the pool
+  unusable with reason `zone_scoped_pool_address` (Rust maps the unknown reason
+  to `InvalidPool` via the existing fallback, same as #5819's
+  `persistent_nat_no_translation`) — so a persisted/peer-synced scoped pool
+  installs nothing rather than shipping the unparseable string. No Rust change.
+  Fail-on-revert proven firsthand (RED verbatim): strict reject neutralized →
+  scoped address compiles clean; lenient warn absent; snapshot ships the raw
+  string with `PoolUnusable=false`. `go build ./...`, `go vet`, and the full
+  `pkg/config` + `pkg/dataplane/userspace` suites green.
+  **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates.go,
+  pkg/config/compiler_peer_effective_snat.go,
+  pkg/config/compiler_zone_scoped_snat_pool_5875_test.go (new),
+  pkg/dataplane/userspace/nat_source.go,
+  pkg/dataplane/userspace/nat_source_zone_scope_5875_test.go (new),
+  docs/config-schema.md, _Log.md
