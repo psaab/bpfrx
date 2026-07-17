@@ -906,6 +906,17 @@ pub(super) fn poll_binding_process_descriptor(
                     .as_ref()
                     .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
                 let mut session_ingress_zone: Option<u16> = None;
+                // #5606: the matched session's NAT64 reverse info (original v6
+                // src/dst), carried out of the session-hit resolve scope so the
+                // live forward request built below can thread it onto
+                // `PendingForwardRequest.nat64_reverse`. The reverse (v4->v6)
+                // reply of a NAT64 flow hits the pre-installed reverse companion
+                // session whose metadata carries this; without threading it, the
+                // TX dispatcher's `build_nat64_forwarded_frame` AF_INET branch
+                // hard-requires `request.nat64_reverse` and returns None (the
+                // reply is dropped / an ICMP error cannot be translated). `None`
+                // for every non-NAT64 flow, so the common path stays untouched.
+                let mut session_nat64_reverse: Option<Nat64ReverseInfo> = None;
                 let mut flow_cache_owner_rg_id = 0i32;
                 // #3073: the admitting policy rule's 1-based hit-counter handle
                 // for this flow (0 = none). Set from the resolved session
@@ -1092,6 +1103,11 @@ pub(super) fn poll_binding_process_descriptor(
                             debug.to_zone = Some(resolved.metadata.egress_zone);
                         }
                         session_ingress_zone = Some(resolved.metadata.ingress_zone);
+                        // #5606: carry the matched session's NAT64 reverse info
+                        // (original v6 src/dst) so the live forward request built
+                        // below translates a v4->v6 reply back to IPv6. Set for
+                        // the reverse companion of a NAT64 flow; `None` otherwise.
+                        session_nat64_reverse = resolved.metadata.nat64_reverse;
                         flow_cache_owner_rg_id = resolved.metadata.owner_rg_id;
                         // #3073: carry the admitting rule's hit-counter handle so
                         // the flow-cache entry populated below re-counts cached
@@ -1470,6 +1486,15 @@ pub(super) fn poll_binding_process_descriptor(
                                     tx_pipeline: &mut binding.tx_pipeline,
                                     counters: telemetry.counters,
                                 }),
+                                // #5606: mirror the peer-return session metadata's
+                                // NAT64 reverse info onto the request. Always
+                                // `None` today — the peer-return fast path builds
+                                // metadata with `nat64_reverse: None` (the active
+                                // owner already validated/translated) — but reading
+                                // the Copy field here (before the metadata is moved
+                                // into the install below) keeps the invariant
+                                // uniform. Correctness-by-construction no-op.
+                                fabric_return_metadata.nat64_reverse,
                             ) {
                                 request.frame = owned_packet_frame
                                     .take()
@@ -4135,6 +4160,16 @@ pub(super) fn poll_binding_process_descriptor(
                             tx_pipeline: &mut binding.tx_pipeline,
                             counters: telemetry.counters,
                         }),
+                        // #5606: thread the matched session's NAT64 reverse info
+                        // (original v6 src/dst) — captured from `resolved.metadata`
+                        // in the session-hit resolve above — onto the request. The
+                        // reverse (v4->v6) reply of a NAT64 flow hits the
+                        // pre-installed reverse companion whose metadata carries
+                        // this; the TX dispatcher's `build_nat64_forwarded_frame`
+                        // AF_INET branch requires it to translate the reply back to
+                        // IPv6 (with `None` it returns `None` and drops the reply).
+                        // `None` for every non-NAT64 flow.
+                        session_nat64_reverse,
                     ) {
                         // #2362: capture the per-packet L4 match inputs from the
                         // frame BEFORE `owned_packet_frame.take()` below moves the

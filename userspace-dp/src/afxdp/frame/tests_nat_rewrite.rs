@@ -1102,6 +1102,69 @@ fn nat64_4381_reverse_frame_restores_each_clients_original_port() {
     }
 }
 
+// #5606: the NAT64 reverse (v4->v6) frame builder HARD-REQUIRES the request's
+// `nat64_reverse` (original v6 src/dst) to translate a server's IPv4 reply back
+// to IPv6. When the poll loop failed to thread it (the pre-#5606 hard-coded
+// `nat64_reverse: None` on the live forward request), this AF_INET branch
+// returned `None` and the reply was dropped. This pins BOTH halves of that
+// contract: `Some(info)` yields a correct IPv6 reply addressed to the original
+// client (NOT IPv4), and `None` fails closed (drops).
+#[test]
+fn nat64_5606_reverse_frame_requires_reverse_info_or_drops() {
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let translated = 40001u16;
+    let orig_sport = 5000u16;
+
+    // Reply: server:443 -> pool:translated (what the server replied to).
+    let reply = build_ipv4_tcp_frame(
+        server,
+        pool,
+        443,
+        translated,
+        1,
+        1,
+        crate::tcp_flags::TCP_ACK,
+    );
+    // Reverse decision = forward decision inverted (as poll_descriptor does).
+    let fwd = Nat64State::forward_decision(pool, server, translated);
+    let rev = fwd.reverse(IpAddr::V6(client), IpAddr::V6(synthetic), orig_sport, 443);
+    let decision = icmp_test_decision(rev);
+    let info = Nat64ReverseInfo {
+        orig_src_v6: client,
+        orig_dst_v6: synthetic,
+    };
+
+    // WITH reverse info: a correct IPv6 reply addressed to the original client.
+    // Output is IPv6 (eth 14 + ip 40): ethertype @12..14, src IP @22..38,
+    // dst IP @38..54.
+    let out = build_nat64_forwarded_frame(&reply, nat64_reverse_meta(), &decision, Some(&info), false)
+        .expect("#5606: reverse info present -> IPv6 reply built");
+    assert_eq!(
+        u16::from_be_bytes([out[12], out[13]]),
+        0x86dd,
+        "#5606: reverse reply must be IPv6 (ethertype 0x86dd), not IPv4"
+    );
+    assert_eq!(
+        &out[22..38],
+        &synthetic.octets(),
+        "#5606: src = original v6 server (NAT64-prefix embedded), not the v4 pool"
+    );
+    assert_eq!(
+        &out[38..54],
+        &client.octets(),
+        "#5606: dst = original v6 client, so the reply reaches the real host"
+    );
+
+    // WITHOUT reverse info: the builder cannot reconstruct the v6 tuple and
+    // fails closed (None) — the pre-#5606 dropped-reply symptom.
+    assert!(
+        build_nat64_forwarded_frame(&reply, nat64_reverse_meta(), &decision, None, false).is_none(),
+        "#5606: missing reverse info must fail closed (None) — the dropped-reply symptom"
+    );
+}
 
 #[test]
 fn rewrite_forwarded_frame_in_place_translates_icmpv6_echo_identifier() {

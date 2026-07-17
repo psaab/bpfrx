@@ -932,6 +932,8 @@ fn build_live_forward_request_emits_output_filter_log_event() {
         None,
         None,
         None,
+        // #5606: non-NAT64 test flow — no reverse info.
+        None,
     )
     .expect("output filter log should not block forwarding");
 
