@@ -120,6 +120,29 @@ func TestPeerOnlySNATDivergenceVectors_5876(t *testing.T) {
 			},
 			want: []string{"node1", "OnlyNode0"},
 		},
+		{
+			// #6048 review residual: a peer-only `match application` divergence.
+			// The application is defined only in groups node0, so the shared
+			// source-NAT rule references an UNDEFINED application on the node1
+			// (peer) view. validateNATMatchApplicationsStrict fails OPEN in the
+			// dataplane (undefined app -> wildcard translation), so if the peer
+			// gate did not run it, node0 would green-commit and strand node1 with
+			// a fail-open source-NAT rule.
+			name: "peer-only-undefined-match-application",
+			cmds: []string{
+				"set security nat source rule-set RS from zone trust",
+				"set security nat source rule-set RS to zone untrust",
+				"set security nat source rule-set RS rule R1 match source-address 10.0.0.0/24",
+				"set security nat source rule-set RS rule R1 match application AppOnNode0",
+				"set security nat source rule-set RS rule R1 then source-nat interface",
+				"set groups node0 applications application AppOnNode0 protocol tcp destination-port 80",
+				// node1 group exists (so apply-groups resolves) but does NOT define
+				// the application, leaving the node1 view's rule referencing it.
+				"set groups node1 system host-name fw1",
+				`set apply-groups "${node}"`,
+			},
+			want: []string{"node1", "AppOnNode0"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

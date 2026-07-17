@@ -78,18 +78,27 @@ func peerNodeID(nodeID int) (int, bool) {
 	}
 }
 
-// validateSourceNATStrictView runs the strict SOURCE-NAT representability
-// validators (the source-NAT subset of the NAT gates runUniformGates dispatches
-// on the local compiled view) against an ALREADY-COMPILED *Config. It REUSES the
-// existing validators verbatim — no new SNAT rules — so the peer-effective gate
-// (#5876) and the local commit path cannot drift on what a representable source
-// pool / reference is.
+// validateSourceNATStrictView runs the strict NAT representability validators
+// that touch source-NAT rules (the source-NAT-relevant validators the NAT gates
+// in runUniformGates dispatch on the local compiled view) against an
+// ALREADY-COMPILED *Config. It REUSES the existing validators verbatim — no new
+// SNAT rules — so the peer-effective gate (#5876) and the local commit path
+// cannot drift on what a representable source pool / rule is.
 //
-// validateNATPoolReferencesStrict and validateNATSourceAddressNameReferencesStrict
-// also cover destination NAT; they are included whole (splitting them would
-// duplicate logic) so the peer gate is a beneficial superset that matches their
-// local-view behavior exactly — a peer-only DNAT pool / address-name error is
-// caught too, never a false-reject.
+// The peer view is validated by exactly the strict validators that iterate the
+// source-NAT config, because the standby's own SyncApply is LENIENT — the origin's
+// peer gate is the SOLE strict check the peer view ever gets, so any strict
+// validator that could catch a peer-only ${node}/groups divergence in a source
+// rule must run here (else that divergence strands the standby, the #5876 shape).
+// This includes the pool/reference/grammar/persistent validators AND the
+// rule-match/action validators (match-destination-port, terminal-action
+// cardinality, and match-applications — the last fails OPEN to a wildcard
+// translation, so omitting it would leave a peer-only fail-open, #6048 review).
+// validateNATPoolReferencesStrict / validateNATSourceAddressNameReferencesStrict /
+// the three match-action validators also cover destination NAT; they are included
+// whole (splitting them would duplicate logic) so the peer gate is a beneficial
+// superset that matches their local-view behavior exactly — a peer-only DNAT
+// pool / address-name / match error is caught too, never a false-reject.
 func validateSourceNATStrictView(cfg *Config) error {
 	if cfg == nil {
 		return nil
@@ -107,6 +116,15 @@ func validateSourceNATStrictView(cfg *Config) error {
 		return err
 	}
 	if err := validateNATSourceAddressNameReferencesStrict(cfg); err != nil {
+		return err
+	}
+	if err := validateNATMatchDestinationPortStrict(cfg); err != nil {
+		return err
+	}
+	if err := validateNATTerminalActionCardinalityStrict(cfg); err != nil {
+		return err
+	}
+	if err := validateNATMatchApplicationsStrict(cfg); err != nil {
 		return err
 	}
 	return nil
