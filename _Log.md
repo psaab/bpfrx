@@ -50957,3 +50957,39 @@ top.
   pkg/dataplane/userspace/nat_source.go,
   pkg/dataplane/userspace/nat_source_zone_scope_5875_test.go (new),
   docs/config-schema.md, _Log.md
+
+## 2026-07-16 — #5873 ensure HA-clear retry loop before failed-clear return
+
+- **Timestamp**: 2026-07-16
+- **Action**: Fix an HA-state cleanup ordering bug: a standalone
+  (non-cluster) HA-state clear that fails records a `pendingHAStateClear`
+  retry debt (#5487), but that debt's ONLY retry consumer is the periodic
+  status loop (`retryPendingHAStateClearLocked` on the 1/s tick). The two
+  apply-path clear sites in `Compile` (manager_compile.go) could return the
+  fail-closed error BEFORE the loop was started: the first-startup full-publish
+  path returns from the failed-clear branch just ABOVE `ensureStatusLoopLocked`,
+  and the deferred-XSK resume path returns without ever calling it. On first
+  startup (or any apply with no pre-existing loop) a failed clear therefore
+  orphaned the debt — nothing ever retried the idempotent empty
+  `update_ha_state`, so stale helper HA groups persisted and kept owner-RG-0
+  transit `ForwardCandidate`s `HAInactive` (drop) indefinitely, contradicting
+  the debt's eventual-cleanup contract. Fix (minimal call-ordering): added a
+  thin wrapper `clearHelperHAStateWithDebtEnsureRetryLocked` (manager_ha.go,
+  next to the existing debt lifecycle) that runs `clearHelperHAStateWithDebtLocked`
+  and, on failure, calls `ensureStatusLoopLocked` (idempotent — guarded on
+  `m.syncCancel`) before returning the raw error. Both clear sites now use the
+  wrapper, so a recorded debt ALWAYS has a running worker to retry it. Ordering
+  preserved: record debt (inside WithDebt) -> ensure loop -> return err. The
+  clear still fails closed. Invariant now documented in code comments
+  (manager_ha.go / manager_compile.go); no prose doc described the clear-debt
+  retry, so no docs change beyond the code comments.
+  Validation: `go build ./...` clean; `go vet ./pkg/dataplane/userspace` clean;
+  `TMPDIR=/tmp go test ./pkg/dataplane/userspace` GREEN (14.8s). Fail-on-revert
+  proven firsthand: removing the `ensureStatusLoopLocked` call from the wrapper
+  turns `TestClearHelperHAStateEnsureRetryStartsLoopOnFailedClear` RED
+  (`syncCancel == nil`; the debt is orphaned). Smoke (`make test-failover`)
+  deferred — shim-wall-blocked, pure control-plane ordering fix gated on the
+  fail-on-revert unit test.
+  **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/manager_ha_clear_debt_5873_test.go (new)
