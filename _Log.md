@@ -1,3 +1,30 @@
+## 2026-07-17 — #5148: TCP segmentation must reject ALL IP fragments, not just non-first
+
+- **Timestamp**: 2026-07-17 (fix/5148-segment-first-fragment)
+- **Action**: The TCP-segmentation admission gate
+  `forwarded_tcp_may_need_segmentation` (tx/dispatch/mod.rs) rejected only
+  NON-first fragments (#1852, `is_non_first_fragment`). A FIRST IPv4 fragment
+  (MF=1, offset 0) or an IPv6 packet carrying a Fragment extension header still
+  carries a real TCP header, so it was ADMITTED into the segmentation builders,
+  which cloned the fragment-bearing IP header (Identification / MF / offset)
+  into every output while rewriting seq/checksum — emitting overlapping
+  offset-0 pseudo-fragments that break reassembly at the receiver. Replaced the
+  gate predicate with the existing `is_any_fragment` (#2362; IPv4 mask 0x3FFF =
+  MF+offset, IPv6 any Fragment header), so ANY fragment (first + non-first) is
+  now routed to the normal forwarding path unchanged — the same
+  pass-through-unsegmented disposition as the sibling #1852 non-first handling.
+  Added a defense-in-depth `is_any_fragment` guard at the top of the builder
+  `segment_forwarded_tcp_frames_from_frame` (frame/tcp_segmentation.rs) so a
+  future caller cannot bypass the gate. Updated the two `emit_*_segment`
+  `#1852: non_first_fragment=false` comments to cite the generalized gate.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
+  userspace-dp/src/afxdp/tx/dispatch/tests/segmentation.rs (2 gate RED-on-revert
+  tests), userspace-dp/src/afxdp/frame/tests_segment_tcp.rs (2 builder
+  RED-on-revert tests), userspace-dp/src/afxdp/tx/README.md
+- **Validation**: cargo build --release + cargo test (segment + dispatch
+  segmentation); firsthand RED-on-revert confirmed by reverting the gate.
+
 ## 2026-07-17 — #5162: GRE tunnel with mixed-family outer source/destination commits clean then silently drops
 
 - **Timestamp**: 2026-07-17 (fix/5162-gre-outer-family-gate)

@@ -35,6 +35,19 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
     if l3 >= frame.len() {
         return None;
     }
+    // #5148: defense in depth — never segment ANY IP fragment (first or
+    // non-first), symmetric with the frame/tcp_segmentation.rs copy-path
+    // twin. The load-bearing admission gate
+    // `forwarded_tcp_may_need_segmentation` (dispatch/mod.rs) already
+    // rejects every fragment before EITHER builder is reached, but this
+    // builder is the one the production path tries FIRST, so re-assert the
+    // invariant here too: a future direct caller of this twin cannot bypass
+    // the gate and let segmentation clone the fragment-bearing IP header
+    // (Identification / MF / offset) into overlapping offset-0
+    // pseudo-segments. Return None so the caller forwards the frame unchanged.
+    if is_any_fragment(&frame[l3..], meta.addr_family) {
+        return None;
+    }
     // #5141: clamp to the IP-declared datagram end (declared_l3_end) so
     // trailing Ethernet slack / attacker-appended bytes are never chunked
     // into fresh checksummed segments. This is the TX local-owner fast-path

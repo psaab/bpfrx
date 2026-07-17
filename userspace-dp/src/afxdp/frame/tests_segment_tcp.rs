@@ -928,6 +928,244 @@ fn segment_forwarded_tcp_frames_keeps_ipv4_snat_inside_native_gre() {
     assert_eq!(total_payload, tcp_payload_len);
 }
 
+// #5148: the segmentation builder must REFUSE any IP fragment — first or
+// non-first. A first IPv4 fragment (MF=1, offset 0) carries a real TCP header,
+// so before #5148 it flowed through the builder, which cloned the
+// fragment-bearing IP header (Identification / MF / offset) into every output
+// while rewriting seq/checksum — emitting overlapping offset-0 pseudo-fragments
+// that break reassembly at the receiver. The builder now carries its own
+// `is_any_fragment` guard (defense in depth behind the admission gate) and
+// returns None so the caller forwards the original frame unchanged. RED-on-
+// revert: remove the builder guard and this oversized-but-fragmented frame
+// segments (returns Some), tripping the assertion.
+#[test]
+fn segment_forwarded_tcp_frames_refuses_first_ipv4_fragment() {
+    let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
+    let src_port = 47308u16;
+    let dst_port = 5201u16;
+    let tcp_payload_len = 4096usize;
+    let tcp_header_len = 20usize;
+    let total_len = (20 + tcp_header_len + tcp_payload_len) as u16;
+
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6],
+        0,
+        0x0800,
+    );
+    frame.extend_from_slice(&[
+        0x45,
+        0x00,
+        (total_len >> 8) as u8,
+        total_len as u8,
+        0xd1,
+        0x43,
+        0x20, // flags: MF=1 (first fragment), fragment offset 0
+        0x00,
+        64,
+        PROTO_TCP,
+        0x00,
+        0x00,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x52, 0x04, 0xc1, 0xa3, // seq
+        0x73, 0x7f, 0x63, 0x1c, // ack
+        0x50, 0x10, 0x00, 0x3f, // data offset (5)/ACK/window
+        0x00, 0x00, 0x00, 0x00, // checksum/urgent
+    ]);
+    frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+    let ip_sum = checksum16(&frame[14..34]);
+    frame[24] = (ip_sum >> 8) as u8;
+    frame[25] = ip_sum as u8;
+    recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+    let mut area = MmapArea::new(16_384).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        flow_src_port: src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x16, 0x01, 0x00]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision::default(),
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x16, 0x01, 0x00],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
+            primary_v6: None,
+        },
+    );
+
+    let segments = segment_forwarded_tcp_frames(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &decision,
+        &forwarding,
+        Some((src_port, dst_port)),
+    );
+    assert!(
+        segments.is_none(),
+        "a first IPv4 fragment (MF=1) carrying a TCP header must NOT be \
+         segmented into overlapping offset-0 pseudo-fragments"
+    );
+}
+
+// #5148 IPv6 sibling: an IPv6 packet carrying a Fragment extension header
+// (next-header 44) — even the FIRST fragment (offset 0, M=1) — must never be
+// TCP-segmented. Same overlapping-pseudo-fragment defect, IPv6 flavor. The
+// builder's `is_any_fragment` guard returns None. RED-on-revert: remove the
+// guard and this oversized fragmented frame segments (returns Some).
+#[test]
+fn segment_forwarded_tcp_frames_refuses_ipv6_fragment_header() {
+    let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+    let src_port = 54688u16;
+    let dst_port = 5201u16;
+    let tcp_payload_len = 4096usize;
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    // payload_len = fragment header (8) + TCP header (20) + data.
+    let plen = (8 + 20 + tcp_payload_len) as u16;
+    frame.extend_from_slice(&[
+        0x60,
+        0x00,
+        0x00,
+        0x00,
+        (plen >> 8) as u8,
+        plen as u8,
+        44, // next-header: Fragment extension header
+        64, // hop limit
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    // Fragment extension header (8 bytes): next-header TCP, offset 0, M=1.
+    frame.extend_from_slice(&[
+        PROTO_TCP, 0x00, // next-header, reserved
+        0x00, 0x01, // fragment offset 0, res, M=1
+        0x00, 0x00, 0x00, 0x2a, // identification
+    ]);
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x31, 0x96, 0xc8, 0x32, // seq
+        0x08, 0xf0, 0x5a, 0xc6, // ack
+        0x50, 0x10, 0x00, 0x40, // data offset (5)/ACK/window
+        0x00, 0x00, 0x00, 0x00, // checksum/urgent
+    ]);
+    frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+    // L4 checksum is over the TCP header + data; the fragment ext header sits
+    // between the base header and TCP, so the rel-L4 offset is 40 + 8 = 48.
+    recompute_l4_checksum_ipv6(&mut frame[14..], 48, PROTO_TCP).expect("tcp sum");
+
+    let mut area = MmapArea::new(16_384).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 62, // 14 + 40 base + 8 fragment header
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        flow_src_port: src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision::default(),
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: None,
+            primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
+        },
+    );
+
+    let segments = segment_forwarded_tcp_frames(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &decision,
+        &forwarding,
+        Some((src_port, dst_port)),
+    );
+    assert!(
+        segments.is_none(),
+        "an IPv6 packet carrying a Fragment header must NOT be TCP-segmented"
+    );
+}
+
 // --- #2077: TCP-segmentation TTL/hop-limit gate v4/v6 symmetry ---
 //
 // The TTL==1 drop in the segmentation builders must be gated on
