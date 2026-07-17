@@ -51485,3 +51485,39 @@ top.
   pkg/dataplane/userspace/format/testdata/status_summary.golden,
   pkg/dataplane/userspace/format/status_golden_test.go,
   docs/feature-coverage.md, userspace-dp/src/FEATURES.md
+
+- **Timestamp**: 2026-07-17
+- **Action**: #5625 — NAT64 v6→v4 RFC 7915 §5.1 translation-eligibility gate.
+  The ext-header walker `ipv6_l4_offset_and_protocol` walked PAST AH (51),
+  active Routing (43 SL>0), Mobility (135), HIP (139), Shim6 (140) and the
+  translator then stripped/translated them — breaking AH authentication (ICV
+  covers rewritten IP fields) and silently dropping active extension semantics
+  with no IPv4 equivalent. Added `nat64_v6_translation_ineligible` chain walk +
+  a fail-closed reject in BOTH forward translators (`write_v6_to_v4_into` /
+  `write_v6_to_v4_nonfirst_into`) BEFORE L4 resolution; distinct
+  `nat64_exthdr_ineligible` counter attributed at the TX dispatcher via the
+  SSOT predicate `frame_is_nat64_exthdr_ineligible` (checked before the #2562
+  fragment predicate, mirroring translator guard order). HBH/Dest-Opts/
+  Routing-SL0/Fragment NOT over-rejected. Shared L4-resolution walker (parity
+  with afxdp::frame::inspect, #4435/#4517) UNCHANGED — gate scoped to the NAT64
+  translate path. RED-on-revert verified firsthand (assertion failures, not a
+  build break). Fail-on-revert cargo tests (a–f) + Go counter/golden tests +
+  docs.
+- **File(s)**:
+  userspace-dp/src/nat64.rs (new `nat64_v6_translation_ineligible`,
+    `frame_is_nat64_exthdr_ineligible`, reject in both forward translators),
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs (two None-sites attribute counter),
+  userspace-dp/src/afxdp/mod.rs (BatchCounters field + record + flush),
+  userspace-dp/src/afxdp/worker/mod.rs (BindingLiveSnapshot field),
+  userspace-dp/src/afxdp/umem/mod.rs (atomic + init),
+  userspace-dp/src/afxdp/umem/snapshot.rs (load),
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs (copy + reset),
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs (reset),
+  userspace-dp/src/protocol/binding.rs (serde field),
+  userspace-dp/src/nat64_tests.rs (7 new tests + updated mobility parity test),
+  pkg/dataplane/userspace/protocol.go (Go BindingStatus field),
+  pkg/dataplane/userspace/format/status_sections.go (agg + sum + print),
+  pkg/dataplane/userspace/format/status_test.go (new counter test),
+  pkg/dataplane/userspace/format/testdata/status_summary.golden,
+  pkg/dataplane/userspace/format/status_golden_test.go,
+  docs/feature-coverage.md, userspace-dp/src/FEATURES.md

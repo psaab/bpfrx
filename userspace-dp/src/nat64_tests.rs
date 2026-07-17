@@ -559,6 +559,202 @@ fn translate_v6_to_v4_tcp() {
     assert_eq!(checksum16_ipv4_pseudo(src, dst, PROTO_TCP, tcp_payload), 0);
 }
 
+// ---------------------------------------------------------------------------
+// #5625: RFC 7915 §5.1 translation-eligibility gate. A v6→v4 NAT64 forward
+// translation MUST NOT silently strip/translate an Authentication Header (AH),
+// an ACTIVE Routing header (Segments Left > 0), or a Mobility / HIP / Shim6
+// header. These tests pin the fail-closed reject (and, as the over-reject
+// guard, that Hop-by-Hop / Destination Options / Routing-SL0 / plain packets
+// STILL translate). They go RED if the gate in `write_v6_to_v4_into` is removed
+// (the walker would then resolve the inner L4 and translation would proceed).
+// ---------------------------------------------------------------------------
+
+/// Build an L3 IPv6 packet: fixed header (Next Header = `first_ext`) followed by
+/// one extension-header block `ext` (whose own byte[0] Next Header MUST point at
+/// the TCP that follows) and then a minimal TCP segment. Used by the #5625
+/// eligibility tests.
+fn make_ipv6_ext_then_tcp(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    first_ext: u8,
+    ext: &[u8],
+) -> Vec<u8> {
+    let payload = b"hi";
+    let tcp_len = 20 + payload.len();
+    let total = 40 + ext.len() + tcp_len;
+    let mut pkt = vec![0u8; total];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&((ext.len() + tcp_len) as u16).to_be_bytes());
+    pkt[6] = first_ext;
+    pkt[7] = 64; // hop limit
+    pkt[8..24].copy_from_slice(&src.octets());
+    pkt[24..40].copy_from_slice(&dst.octets());
+    // Extension-header block (its byte[0] chains to TCP).
+    pkt[40..40 + ext.len()].copy_from_slice(ext);
+    // Minimal TCP header + payload.
+    let t = 40 + ext.len();
+    pkt[t..t + 2].copy_from_slice(&12345u16.to_be_bytes());
+    pkt[t + 2..t + 4].copy_from_slice(&80u16.to_be_bytes());
+    pkt[t + 12] = 0x50; // data offset = 5
+    pkt[t + 13] = 0x02; // SYN
+    pkt[t + 14..t + 16].copy_from_slice(&1024u16.to_be_bytes());
+    pkt[t + 20..t + 20 + payload.len()].copy_from_slice(payload);
+    // Valid TCP checksum over the TCP region (IPv6 pseudo-header).
+    pkt[t + 16..t + 18].copy_from_slice(&[0, 0]);
+    let sum = checksum16_ipv6_pseudo(src, dst, PROTO_TCP, &pkt[t..]);
+    pkt[t + 16..t + 18].copy_from_slice(&sum.to_be_bytes());
+    pkt
+}
+
+fn nat64_test_addrs() -> (Ipv6Addr, Ipv6Addr, Ipv4Addr, Ipv4Addr) {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+    (src_v6, dst_v6, snat_v4, dst_v4)
+}
+
+/// (a) An AH-bearing v6 packet to a NAT64 prefix is DROPPED (not translated).
+/// RFC 7915 §5.1.1: a packet whose header chain includes AH "SHOULD be dropped
+/// and logged" — AH's ICV covers IP fields NAT64 rewrites, so a translated
+/// packet carries a broken ICV. RED if the gate is removed (the walker skips
+/// AH per RFC 4302 length math and resolves the inner TCP → translated).
+#[test]
+fn nat64_5625_ah_bearing_v6_is_dropped_not_translated() {
+    let (src_v6, dst_v6, snat_v4, dst_v4) = nat64_test_addrs();
+    // AH (proto 51): [next=TCP, payload_len=1, resv, SPI(4), Seq(4)] = 12 bytes.
+    let ah: [u8; 12] = [PROTO_TCP, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+    let pkt = make_ipv6_ext_then_tcp(src_v6, dst_v6, 51, &ah);
+    assert!(
+        translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).is_none(),
+        "AH-bearing v6 packet must be dropped, not translated (RFC 7915 §5.1.1)"
+    );
+    assert!(
+        nat64_v6_translation_ineligible(&pkt),
+        "AH chain must be classified translation-ineligible"
+    );
+}
+
+/// (b) A Routing header with Segments Left > 0 (an active, not-yet-delivered
+/// source route) is DROPPED. RFC 7915 §5.1: "If a Routing header with a
+/// non-zero Segments Left field is present, then the packet MUST NOT be
+/// translated". RED if the gate is removed.
+#[test]
+fn nat64_5625_active_routing_header_is_dropped() {
+    let (src_v6, dst_v6, snat_v4, dst_v4) = nat64_test_addrs();
+    // Routing (43): [next=TCP, hdr_ext_len=0, routing_type=0, segments_left=1, ...].
+    let rh: [u8; 8] = [PROTO_TCP, 0, 0, 1, 0, 0, 0, 0];
+    let pkt = make_ipv6_ext_then_tcp(src_v6, dst_v6, 43, &rh);
+    assert!(
+        translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).is_none(),
+        "active Routing header (SL>0) must be dropped, not translated (RFC 7915 §5.1)"
+    );
+    assert!(nat64_v6_translation_ineligible(&pkt));
+}
+
+/// (c) Mobility (135) / HIP (139) / Shim6 (140) headers — active end-to-end
+/// extension semantics with NO IPv4 equivalent — are DROPPED, not translated
+/// (which would silently strip them). RED if the gate is removed (the #4517
+/// parity walker skips them and resolves the inner TCP).
+#[test]
+fn nat64_5625_active_extension_headers_are_dropped() {
+    let (src_v6, dst_v6, snat_v4, dst_v4) = nat64_test_addrs();
+    for proto in [135u8, 139u8, 140u8] {
+        // 8-byte generic ext block chaining to TCP.
+        let ext: [u8; 8] = [PROTO_TCP, 0, 0, 0, 0, 0, 0, 0];
+        let pkt = make_ipv6_ext_then_tcp(src_v6, dst_v6, proto, &ext);
+        assert!(
+            translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).is_none(),
+            "ext header {proto} (Mobility/HIP/Shim6) must be dropped, not translated"
+        );
+        assert!(
+            nat64_v6_translation_ineligible(&pkt),
+            "ext header {proto} must be classified translation-ineligible"
+        );
+    }
+}
+
+/// (d) A Routing header with Segments Left == 0 is INERT (reached its final
+/// destination) and STILL translates. RFC 7915 §5.1: such a header "MUST be
+/// ignored ... and the packet translated normally." Guards against over-reject.
+#[test]
+fn nat64_5625_routing_header_sl0_still_translates() {
+    let (src_v6, dst_v6, snat_v4, dst_v4) = nat64_test_addrs();
+    // Routing (43) with segments_left = 0.
+    let rh: [u8; 8] = [PROTO_TCP, 0, 0, 0, 0, 0, 0, 0];
+    let pkt = make_ipv6_ext_then_tcp(src_v6, dst_v6, 43, &rh);
+    assert!(
+        !nat64_v6_translation_ineligible(&pkt),
+        "Routing SL==0 is inert — must not be flagged ineligible"
+    );
+    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false)
+        .expect("Routing SL==0 must still translate (RFC 7915 §5.1)");
+    assert_eq!(v4[9], PROTO_TCP, "translated protocol must be the inner TCP");
+}
+
+/// (e) Hop-by-Hop (0) and Destination Options (60) headers STILL translate.
+/// RFC 7915 §5.1: they "MUST be ignored ... and the packet translated
+/// normally." Guards against over-reject.
+#[test]
+fn nat64_5625_hopbyhop_and_destopts_still_translate() {
+    let (src_v6, dst_v6, snat_v4, dst_v4) = nat64_test_addrs();
+    for proto in [0u8, 60u8] {
+        let ext: [u8; 8] = [PROTO_TCP, 0, 0, 0, 0, 0, 0, 0];
+        let pkt = make_ipv6_ext_then_tcp(src_v6, dst_v6, proto, &ext);
+        assert!(
+            !nat64_v6_translation_ineligible(&pkt),
+            "ext header {proto} (HBH/Dest-Opts) must not be flagged ineligible"
+        );
+        let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false)
+            .unwrap_or_else(|| panic!("ext header {proto} must still translate"));
+        assert_eq!(v4[9], PROTO_TCP);
+    }
+}
+
+/// (f) A plain no-extension-header v6 TCP packet STILL translates (the common
+/// fast path is unchanged by the eligibility gate).
+#[test]
+fn nat64_5625_plain_no_exthdr_still_translates() {
+    let (src_v6, dst_v6, snat_v4, dst_v4) = nat64_test_addrs();
+    let pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"hello");
+    assert!(!nat64_v6_translation_ineligible(&pkt));
+    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).expect("plain packet must translate");
+    assert_eq!(v4[9], PROTO_TCP);
+}
+
+/// The TX-dispatcher SSOT predicate `frame_is_nat64_exthdr_ineligible` mirrors
+/// the translator guard: an AH-bearing L2 frame on the forward (`AF_INET6`)
+/// path is attributed, an eligible plain frame is not, and the reverse
+/// (`AF_INET`) path never attributes (IPv4 has no extension headers).
+#[test]
+fn nat64_5625_frame_predicate_attributes_exthdr_drop() {
+    let (src_v6, dst_v6, _snat, _dst) = nat64_test_addrs();
+    let ah: [u8; 12] = [PROTO_TCP, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+    let l3_ah = make_ipv6_ext_then_tcp(src_v6, dst_v6, 51, &ah);
+    let l3_plain = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"hello");
+    // Prepend a 14-byte Ethernet header (EtherType 0x86DD = IPv6) so the
+    // predicate's `frame_l3_offset` resolves the L3 start like a real frame.
+    let mut frame_ah = vec![0u8; 14];
+    frame_ah[12..14].copy_from_slice(&0x86DDu16.to_be_bytes());
+    frame_ah.extend_from_slice(&l3_ah);
+    let mut frame_plain = vec![0u8; 14];
+    frame_plain[12..14].copy_from_slice(&0x86DDu16.to_be_bytes());
+    frame_plain.extend_from_slice(&l3_plain);
+
+    assert!(
+        frame_is_nat64_exthdr_ineligible(&frame_ah, libc::AF_INET6),
+        "AH frame on the forward path must be attributed to the ext-header counter"
+    );
+    assert!(
+        !frame_is_nat64_exthdr_ineligible(&frame_plain, libc::AF_INET6),
+        "an eligible plain frame must not be attributed"
+    );
+    assert!(
+        !frame_is_nat64_exthdr_ineligible(&frame_ah, libc::AF_INET),
+        "reverse v4→v6 path has no IPv6 extension headers — never attribute"
+    );
+}
+
 /// #4499 A5: NAT64 translation preserves the L4 ports, so the `AppCatalog`
 /// application resolution — which keys ONLY on (protocol, src_port, dst_port)
 /// and is deliberately address-agnostic — yields the SAME application for the
@@ -2326,12 +2522,15 @@ fn translate_v6_to_v4_udp_behind_hop_by_hop() {
 
 #[test]
 fn translate_v6_to_v4_udp_behind_mobility_header() {
-    // #4517 FAIL-ON-REVERT: UDP behind a Mobility (135) extension header.
-    // Mobility is a generic length-prefixed EH (RFC 6275), so the NAT64
-    // walker must traverse it to the terminal UDP — parity with the
-    // canonical afxdp walkers. Before #4517 the nat64 walker enumerated
-    // only {0,43,44,51,60} and STOPPED at type 135, surrendering proto=135
-    // so the translation dropped or mis-parsed the packet.
+    // #4517 kept the NAT64 walker in PARITY with the canonical afxdp walkers so
+    // it RESOLVES the terminal L4 past a Mobility (135) header. #5625 preserves
+    // that L4-resolution parity for the forwarding/screen paths but ADDS a
+    // NAT64 translate-path RFC 7915 §5.1 eligibility reject: Mobility has no
+    // IPv4 equivalent, so translating would silently strip it. The walker still
+    // resolves the inner UDP (parity intact), but the TRANSLATOR now DROPS the
+    // packet instead of emitting a stripped IPv4 datagram. This test therefore
+    // pins BOTH invariants and goes RED if either regresses (walker stops
+    // resolving, or the translate-path reject is removed).
     let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
     let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
     let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
@@ -2344,13 +2543,26 @@ fn translate_v6_to_v4_udp_behind_mobility_header() {
     udp[8..12].copy_from_slice(b"data");
 
     let ipv6_pkt = build_v6_with_ext_then_l4(src_v6, dst_v6, 135, &[0u8; 6], PROTO_UDP, 64, &udp);
-    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false)
-        .expect("UDP behind a Mobility header must translate, not drop");
 
-    assert_eq!(v4[9], PROTO_UDP, "protocol must be the terminal L4, not 135");
-    assert_eq!(v4.len(), 20 + 12, "Mobility header stripped");
-    assert_eq!(u16::from_be_bytes([v4[20], v4[21]]), 5353);
-    assert_eq!(u16::from_be_bytes([v4[22], v4[23]]), 53);
+    // #4517 parity preserved: the shared L4-resolution walker STILL traverses
+    // the 8-byte Mobility header to the terminal UDP (unchanged behavior the
+    // forwarding/screen paths depend on).
+    assert_eq!(
+        ipv6_l4_offset_and_protocol(&ipv6_pkt),
+        Some((40 + 8, PROTO_UDP)),
+        "walker must still resolve the terminal UDP past Mobility (parity intact)"
+    );
+
+    // #5625: the NAT64 translate path now REJECTS it (fail-closed drop) — a
+    // Mobility header cannot be represented in IPv4 (RFC 7915 §5.1).
+    assert!(
+        translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false).is_none(),
+        "Mobility-header packet must be dropped by NAT64 translation (RFC 7915 §5.1)"
+    );
+    assert!(
+        nat64_v6_translation_ineligible(&ipv6_pkt),
+        "Mobility chain must be classified translation-ineligible"
+    );
 }
 
 #[test]
