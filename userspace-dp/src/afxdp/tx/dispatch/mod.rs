@@ -218,15 +218,23 @@ fn compute_forwarded_egress_ptb(
         {
             // RFC 792 / RFC 4443 suppression: never reply to
             // a non-first fragment or an inbound ICMP error.
-            // #2472: AND a per-reason token-bucket rate limit —
-            // an oversized-DF / IPv6 flood would otherwise emit
-            // one PTB per trigger packet, unbounded (CPU/TX
-            // amplification + reflection). On bucket-empty the
-            // PTB is suppressed (the `PacketTooBig` rate-limited
-            // counter is bumped inside `allow_generated_error`);
-            // the oversized original is still dropped below
-            // (`mtu_signalled`), so this never falls through to
-            // forward the MTU-violating frame.
+            // #2472/#5856: AND a per-reason, PER-INGRESS-ZONE
+            // token-bucket rate limit — an oversized-DF / IPv6
+            // flood would otherwise emit one PTB per trigger
+            // packet, unbounded (CPU/TX amplification +
+            // reflection). On bucket-empty the PTB is suppressed
+            // (the `PacketTooBig` rate-limited counter is bumped
+            // inside the gate); the oversized original is still
+            // dropped below (`mtu_signalled`), so this never
+            // falls through to forward the MTU-violating frame.
+            // #5856: the bucket is PER INGRESS (from) ZONE,
+            // resolved from `ingress_ident.ifindex` via
+            // `ifindex_to_zone_id` exactly as the #3618 reject
+            // path does, so an oversized-DF flood ingressing ONE
+            // zone can no longer drain a single global bucket and
+            // suppress legitimate PMTUD for every OTHER zone. An
+            // unzoned / unknown ingress (id 0) falls back to the
+            // shared `PACKET_TOO_BIG_FALLBACK_BUCKET`.
             if !ptb_reply_suppressed(source_frame, ptb_meta, l3, forwarding) {
                 // #5567: build the PTB FIRST — the build IS the feasibility
                 // proof (each builder returns None on a missing egress object
@@ -258,12 +266,26 @@ fn compute_forwarded_egress_ptb(
                     _ => None,
                 };
                 // A buildable reply the token DENIES is rate-limited (dropped,
-                // token consumed + `PacketTooBig` counter bumped inside
-                // `allow_generated_error`). An UNBUILDABLE reply short-circuits
-                // the `&&`, so the token is NOT consumed. Either way the
-                // oversized original is still dropped below (`mtu_signalled`),
-                // so the trigger disposition is unchanged.
-                if built.is_some() && allow_generated_error(GeneratedErrorReason::PacketTooBig) {
+                // token consumed + `PacketTooBig` counter bumped inside the
+                // gate). An UNBUILDABLE reply short-circuits the `&&`, so the
+                // token is NOT consumed. Either way the oversized original is
+                // still dropped below (`mtu_signalled`), so the trigger
+                // disposition is unchanged. #5856: the token is taken from the
+                // ingress zone's per-zone PTB bucket, resolved from
+                // `ingress_ident.ifindex` via `ifindex_to_zone_id` (unzoned /
+                // unknown → the shared `PACKET_TOO_BIG_FALLBACK_BUCKET`).
+                let from_zone_id = forwarding
+                    .ifindex_to_zone_id
+                    .get(&ingress_ident.ifindex)
+                    .copied()
+                    .unwrap_or(0);
+                if built.is_some()
+                    && allow_generated_error_zoned(
+                        forwarding,
+                        GeneratedErrorReason::PacketTooBig,
+                        from_zone_id,
+                    )
+                {
                     ptb_reply = built;
                 }
             }

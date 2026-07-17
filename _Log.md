@@ -1,3 +1,50 @@
+## 2026-07-16 — #5856: per-zone Time-Exceeded / Packet-Too-Big ICMP buckets
+
+- **Timestamp**: 2026-07-16 (fix/5856-per-zone-icmp-buckets)
+- **Action**: `userspace-dp/src/afxdp/icmp_ratelimit.rs` kept
+  `TIME_EXCEEDED_BUCKET` and `PACKET_TOO_BIG_BUCKET` as PROCESS-GLOBAL statics
+  (only Reject was split per-zone in #3618). Every worker / interface / routing
+  instance / RG / ingress zone consumed the SAME bucket per reason, so an
+  attacker in ONE untrusted zone could flood TTL=1/hop-limit=1 (→ Time-Exceeded)
+  or oversized-DF (→ Packet-Too-Big) traffic, keep the global bucket empty, and
+  SUPPRESS legitimate traceroute + PMTUD replies for every UNRELATED zone (a
+  cross-zone denial of the generated-ICMP-error service; suppressing PTB can
+  blackhole unrelated large flows).
+  Fix (mirrors the #3618 per-zone Reject split exactly — pattern-extension, not
+  a new mechanism):
+    - `ForwardingState` gains `time_exceeded_buckets` / `packet_too_big_buckets`
+      (`FastMap<u16, Arc<TokenBucket>>`), built in
+      `forwarding_build/zones.rs::populate_zones` from the SAME validated zone
+      set as `reject_buckets`; cardinality config-bounded (Go-capped ≤ 65533),
+      Arc-held so the atomics survive `ForwardingState::clone()` (fabric refresh).
+    - The `reject_bucket` accessor was generalized to
+      `generated_error_bucket(reason, from_zone_id)`; the limiter gate is now the
+      reason-parameterized `allow_generated_error_zoned[_at]`, with three
+      fallback buckets (`{REJECT,TIME_EXCEEDED,PACKET_TOO_BIG}_FALLBACK_BUCKET`)
+      and three aggregate atomics (`*_RATE_LIMITED_TOTAL`) for unzoned/unknown
+      zones and the observable metric. `allow_generated_reject[_at]` delegate to
+      it; `rate_limited_count`/`reset_bucket_for_test` read/clear the aggregate
+      for ALL reasons (wire contract unchanged).
+    - TE call site (`icmp.rs::build_local_time_exceeded_request`) and PTB call
+      site (`tx/dispatch/mod.rs`) resolve the from-zone from
+      `ingress_ident.ifindex` via `ifindex_to_zone_id` (unzoned → fallback),
+      exactly as the #3618 reject site resolves it.
+  - **File(s)**: `userspace-dp/src/afxdp/icmp_ratelimit.rs`,
+    `userspace-dp/src/afxdp/icmp_ratelimit_tests.rs`,
+    `userspace-dp/src/afxdp/types/forwarding.rs`,
+    `userspace-dp/src/afxdp/forwarding_build/zones.rs`,
+    `userspace-dp/src/afxdp/icmp.rs`,
+    `userspace-dp/src/afxdp/tx/dispatch/mod.rs`,
+    `userspace-dp/src/afxdp/mod.rs`,
+    `userspace-dp/src/afxdp/README.md`,
+    `docs/generated-reply-rate-limit.md`.
+  - **Validation**: cargo fail-on-revert — new headline tests
+    `{time_exceeded,packet_too_big}_per_zone_flood_does_not_starve_other_zone_5856`
+    go RED (zone A's flood suppresses zone B) when the per-zone split is
+    reverted, GREEN with the fix; plus fallback-bucket + aggregate-counter +
+    reason/zone-isolation tests. Full `cargo test --release` suite green.
+    Loss-cluster smoke deferred (shim-ABI wall) — correctness gated on the
+    cargo fail-on-revert test.
 ## 2026-07-16 — #5818: reject unsupported-scope NPTv6 rules (fail-closed)
 
 - **Timestamp**: 2026-07-16 (fix/5818-nptv6-scope-reject)

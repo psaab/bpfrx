@@ -202,14 +202,22 @@ pub(super) fn build_local_time_exceeded_request(
         _ => return None,
     }?;
 
-    // #2472/#5567: per-reason token-bucket rate limit on the LOCALLY-GENERATED
-    // Time Exceeded, consumed ONLY now that the reply is proven feasible + built
-    // (above). A TTL=1 / hop-limit=1 flood (a routing loop or a crafted low-TTL
-    // stream) would otherwise emit one generated ICMP error per trigger packet,
-    // unbounded — a CPU/TX amplification + reflection sink. The bucket is
-    // global-per-reason (Linux `icmp_msgs_per_sec` model); on empty we drop the
-    // generated error and bump the observable `TimeExceeded` rate-limited
-    // counter (inside `allow_generated_error`).
+    // #2472/#5567/#5856: per-reason, PER-INGRESS-ZONE token-bucket rate limit on
+    // the LOCALLY-GENERATED Time Exceeded, consumed ONLY now that the reply is
+    // proven feasible + built (above). A TTL=1 / hop-limit=1 flood (a routing
+    // loop or a crafted low-TTL stream) would otherwise emit one generated ICMP
+    // error per trigger packet, unbounded — a CPU/TX amplification + reflection
+    // sink. On empty we drop the generated error and bump the observable
+    // `TimeExceeded` rate-limited counter (inside the gate).
+    //
+    // #5856: the bucket is now PER INGRESS (from) ZONE, not a single global one
+    // — resolved from the LOGICAL ingress unit ifindex (`ingress_ident.ifindex`,
+    // the same SSOT the v4/v6 reply build + #3026 output-classify key off) via
+    // `ifindex_to_zone_id`, exactly as the #3618 reject path does. Before #5856
+    // one shared global TE bucket let a low-TTL flood ingressing ONE zone drain
+    // it and suppress legitimate traceroute for EVERY other zone. An unzoned /
+    // unknown ingress interface (id 0) falls back to the shared
+    // `TIME_EXCEEDED_FALLBACK_BUCKET` (never fail-open).
     //
     // #5567: the token was previously consumed BEFORE the egress lookup + build.
     // A flood of reply-eligible-but-UNBUILDABLE triggers on one interface
@@ -220,7 +228,12 @@ pub(super) fn build_local_time_exceeded_request(
     // #3656 H11 build-before-consume ordering. The trigger-packet disposition is
     // unchanged: an unbuildable attempt still returns None (drop) here, exactly
     // as before, only without spending a token.
-    if !allow_generated_error(GeneratedErrorReason::TimeExceeded) {
+    let from_zone_id = forwarding
+        .ifindex_to_zone_id
+        .get(&ingress_ident.ifindex)
+        .copied()
+        .unwrap_or(0);
+    if !allow_generated_error_zoned(forwarding, GeneratedErrorReason::TimeExceeded, from_zone_id) {
         counters.touched = true;
         return None;
     }

@@ -131,6 +131,26 @@ pub(super) fn populate_zones(snapshot: &ConfigSnapshot, state: &mut ForwardingSt
             zone.id,
             std::sync::Arc::new(crate::afxdp::icmp_ratelimit::TokenBucket::new()),
         );
+        // #5856: one per-zone Time-Exceeded and one per-zone Packet-Too-Big
+        // bucket per KNOWN zone, keyed by the SAME validated zone id, built
+        // identically to the reject bucket above. Before #5856 these two
+        // reasons shared a SINGLE process-global bucket, so a TTL=1/hop-limit=1
+        // (Time-Exceeded) or oversized-DF (Packet-Too-Big) flood ingressing one
+        // zone drained it and starved legitimate traceroute / PMTUD replies in
+        // every OTHER zone. Building one bucket per CONFIGURED zone here (not
+        // per-packet) bounds cardinality to the configured zone set and gives
+        // each ingress zone an independent budget. An unzoned / unknown
+        // from-zone (id 0, never in this table) falls back to the shared
+        // per-reason `*_FALLBACK_BUCKET` at the gate. Fresh buckets on every
+        // build = reset-on-commit, accepted for a diagnostic limiter.
+        state.time_exceeded_buckets.insert(
+            zone.id,
+            std::sync::Arc::new(crate::afxdp::icmp_ratelimit::TokenBucket::new()),
+        );
+        state.packet_too_big_buckets.insert(
+            zone.id,
+            std::sync::Arc::new(crate::afxdp::icmp_ratelimit::TokenBucket::new()),
+        );
         // #3071: record the per-zone Junos `tcp-rst` knob keyed by zone id so
         // the policy-deny hot path can answer a denied TCP flow whose ingress
         // (from) zone has tcp-rst with a RST instead of a silent drop. Only

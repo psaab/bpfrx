@@ -661,8 +661,13 @@ sync.
   zone — so a rejected-flow flood in one zone no longer starves reject
   generation in another. The observable aggregate `reject_rate_limited_total`
   stays a SINGLE atomic bumped on any per-zone deny, so the metric is unchanged
-  and `policy`+`filter` still sum to it. See
-  `docs/generated-reply-rate-limit.md`.
+  and `policy`+`filter` still sum to it. #5856 extended the SAME per-zone split
+  to the TimeExceeded and PacketTooBig reasons (`ForwardingState::
+  time_exceeded_buckets` / `packet_too_big_buckets`, resolved from
+  `ingress_ident.ifindex`), so a TTL=1/hop-limit=1 or oversized-DF flood in one
+  zone no longer suppresses traceroute / PMTUD replies in another; their
+  aggregates (`{time_exceeded,packet_too_big}_rate_limited_total`) are likewise
+  single atoms bumped per-zone. See `docs/generated-reply-rate-limit.md`.
   DSCP-matched input/output filters
   are intentionally not flow-cached because DSCP is packet metadata, not
   part of the session cache key; session hits re-evaluate DSCP-sensitive
