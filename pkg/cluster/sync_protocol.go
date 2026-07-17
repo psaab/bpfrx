@@ -112,7 +112,13 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	off += 4
 	buf[off] = val.State
 	off++
-	buf[off] = val.Flags
+	// #5460: SessionValue.Flags is uint16, but the HA sync wire carries only the
+	// low byte here. All SESS_FLAG_* bits currently set on a session are 0-7
+	// (SNAT..NAT64); bit 8 (SessFlagNPTV6) is never set today, so truncating to a
+	// byte is loss-free. If session-level NPTv6 flagging is ever added, carry the
+	// high byte as a trailing length-gated field (like Generation) rather than
+	// widening this fixed-offset byte in place — that would be a wire flag-day.
+	buf[off] = byte(val.Flags)
 	off++
 	buf[off] = val.TCPState
 	off++
@@ -207,7 +213,13 @@ func encodeSessionV6Payload(key dataplane.SessionKeyV6, val dataplane.SessionVal
 	off += 4
 	buf[off] = val.State
 	off++
-	buf[off] = val.Flags
+	// #5460: SessionValue.Flags is uint16, but the HA sync wire carries only the
+	// low byte here. All SESS_FLAG_* bits currently set on a session are 0-7
+	// (SNAT..NAT64); bit 8 (SessFlagNPTV6) is never set today, so truncating to a
+	// byte is loss-free. If session-level NPTv6 flagging is ever added, carry the
+	// high byte as a trailing length-gated field (like Generation) rather than
+	// widening this fixed-offset byte in place — that would be a wire flag-day.
+	buf[off] = byte(val.Flags)
 	off++
 	buf[off] = val.TCPState
 	off++
@@ -356,7 +368,9 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 	}
 	val.State = payload[off]
 	off++
-	val.Flags = payload[off]
+	// #5460: low byte only — see the encoder. Flags is uint16; the high byte
+	// (bits >=8, SessFlagNPTV6) is not carried on the wire and defaults to 0.
+	val.Flags = uint16(payload[off])
 	off++
 	val.TCPState = payload[off]
 	off++
@@ -470,7 +484,9 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 	}
 	val.State = payload[off]
 	off++
-	val.Flags = payload[off]
+	// #5460: low byte only — see the encoder. Flags is uint16; the high byte
+	// (bits >=8, SessFlagNPTV6) is not carried on the wire and defaults to 0.
+	val.Flags = uint16(payload[off])
 	off++
 	val.TCPState = payload[off]
 	off++
@@ -713,7 +729,7 @@ func stripFullSetSeq(payload []byte) (base []byte, incarnation, seq uint64) {
 		bytes.Equal(payload[n-fullSetSeqTrailerLen:n-16], fullSetSeqMagic[:]) {
 		incarnation = binary.LittleEndian.Uint64(payload[n-16 : n-8])
 		seq = binary.LittleEndian.Uint64(payload[n-8:])
-		return payload[: n-fullSetSeqTrailerLen], incarnation, seq
+		return payload[:n-fullSetSeqTrailerLen], incarnation, seq
 	}
 	return payload, 0, 0
 }

@@ -7,7 +7,8 @@ import "unsafe"
 // BPF HASH maps. They EXCLUDE the sync-only Generation field — they mirror the
 // C `struct session_value` / `session_value_v6` (bpf/headers/xpf_conntrack.h)
 // and the Rust `BpfSessionValueV4` / `BpfSessionValueV6` (size-asserted at
-// 128 / 176 in userspace-dp/src/afxdp/bpf_map_tests.rs).
+// 136 / 184 in userspace-dp/src/afxdp/bpf_map_tests.rs; 128 / 176 before the
+// #5460 flags widen from __u8 to __u16).
 //
 // This is the SINGLE source of truth for the map value_size: the production
 // registration (loader_userspace_shim.go) and every test fixture that creates a
@@ -23,24 +24,24 @@ var (
 //
 // The shared kernel-visible `sessions` / `sessions_v6` BPF HASH maps store the
 // C `struct session_value` / `struct session_value_v6` layout (bpf/headers/
-// xpf_conntrack.h), which the Rust helper mirrors as BpfSessionValueV4 (128
-// bytes) / BpfSessionValueV6 (176 bytes) — test-asserted at
+// xpf_conntrack.h), which the Rust helper mirrors as BpfSessionValueV4 (136
+// bytes) / BpfSessionValueV6 (184 bytes) — test-asserted at
 // userspace-dp/src/afxdp/bpf_map_tests.rs.
 //
-// SessionValue / SessionValueV6 (types.go) carry one EXTRA trailing field,
-// `Generation uint64` — the #2170 HA deferred-delete install-generation guard.
-// That field is userspace-sync-only metadata: it lives in the Go session table
-// and travels on the cluster session-sync wire (pkg/cluster/sync_protocol.go,
-// its own length-gated byte codec), and is deliberately NOT part of the BPF C
-// conntrack struct. So SessionValue is 8 bytes larger than the on-map layout
-// (136 vs 128 v4; 184 vs 176 v6).
+// SessionValue / SessionValueV6 (types.go) carry EXTRA sync-only trailing
+// fields the on-map ABI omits — `Generation uint64` (the #2170 HA
+// deferred-delete install-generation guard), `PolicyCounterIdx uint32` (#3301),
+// and (v6) `Nat64SnatV4 [4]byte` (#4565). Those live in the Go session table
+// and travel on the cluster session-sync wire (pkg/cluster/sync_protocol.go,
+// its own length-gated byte codec), and are deliberately NOT part of the BPF C
+// conntrack struct. So SessionValue is strictly larger than the on-map layout.
 //
 // Registering the map at sizeof(SessionValue) (the previous behaviour) made the
-// kernel value_size 8 bytes larger than every reader/writer's struct. A
-// bpf_map_lookup_elem from the Rust side into its 128/176-byte buffer then has
-// the kernel copy value_size (136/184) bytes into the smaller buffer — an
-// 8-byte stack out-of-bounds write (latent because the trailing bytes are
-// usually zero). See issue #2360.
+// kernel value_size larger than every reader/writer's on-map struct. A
+// bpf_map_lookup_elem from the Rust side into its 136/184-byte buffer then has
+// the kernel copy the larger value_size bytes into the smaller buffer — a
+// stack out-of-bounds write (latent because the trailing bytes are usually
+// zero). See issue #2360.
 //
 // bpfSessionValue / bpfSessionValueV6 are the dedicated on-map ABI types:
 // identical to SessionValue / SessionValueV6 minus the sync-only Generation.
@@ -49,13 +50,15 @@ var (
 // Go-facing accessors convert at the boundary; Generation never touches the
 // BPF map (it is sourced from the Go session table / sync path).
 
-// bpfSessionValue mirrors C `struct session_value` exactly (128 bytes). It is
-// SessionValue without the sync-only Generation field. Keep field-for-field in
-// sync with both SessionValue (types.go) and the C struct (xpf_conntrack.h);
-// the parity test in maps_session_test.go fails if the size drifts from 128.
+// bpfSessionValue mirrors C `struct session_value` exactly (136 bytes; 128
+// before the #5460 __u16 flags widen). It is SessionValue without the sync-only
+// trailing fields. Keep field-for-field in sync with both SessionValue
+// (types.go) and the C struct (xpf_conntrack.h); the parity test in
+// bpf_session_value_test.go fails if the size drifts from 136.
 type bpfSessionValue struct {
-	State      uint8
-	Flags      uint8
+	State uint8
+	// uint16 to match C `struct session_value.flags` (SessFlagNPTV6 = bit 8, #5460).
+	Flags      uint16
 	TCPState   uint8
 	IsReverse  uint8
 	AppTimeout uint32
@@ -93,11 +96,13 @@ type bpfSessionValue struct {
 	FibGen     uint16
 }
 
-// bpfSessionValueV6 mirrors C `struct session_value_v6` exactly (176 bytes). It
-// is SessionValueV6 without the sync-only Generation field.
+// bpfSessionValueV6 mirrors C `struct session_value_v6` exactly (184 bytes; 176
+// before the #5460 __u16 flags widen). It is SessionValueV6 without the
+// sync-only trailing fields.
 type bpfSessionValueV6 struct {
-	State      uint8
-	Flags      uint8
+	State uint8
+	// uint16 to match C `struct session_value_v6.flags` (see bpfSessionValue, #5460).
+	Flags      uint16
 	TCPState   uint8
 	IsReverse  uint8
 	AppTimeout uint32

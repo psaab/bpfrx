@@ -190,10 +190,53 @@ fn heartbeat_fresh_backward_monotonic_anomaly_clamps_fresh() {
 #[test]
 fn bpf_conntrack_struct_sizes_match_c() {
     // Must match C struct sizes from xpf_conntrack.h exactly.
+    // The value structs grew 128->136 / 176->184 when `flags` widened from
+    // __u8 to __u16 (#5460): the compiler pads the leading state/flags/
+    // tcp_state/is_reverse block from 8 to 16 bytes. The Go on-map ABI mirror
+    // (bpfSessionValue / bpfSessionValueV6) is asserted to the same 136/184 in
+    // pkg/dataplane/bpf_session_value_test.go.
     assert_eq!(core::mem::size_of::<BpfSessionKeyV4>(), 16);
-    assert_eq!(core::mem::size_of::<BpfSessionValueV4>(), 128);
+    assert_eq!(core::mem::size_of::<BpfSessionValueV4>(), 136);
     assert_eq!(core::mem::size_of::<BpfSessionKeyV6>(), 40);
-    assert_eq!(core::mem::size_of::<BpfSessionValueV6>(), 176);
+    assert_eq!(core::mem::size_of::<BpfSessionValueV6>(), 184);
+}
+
+// #5460: SESS_FLAG_NPTV6 is bit 8 (0x100 = 256), which does not fit the
+// __u8 `session_value.flags` field it belonged to before this fix — setting it
+// truncated to 0 (colliding with "no flags"). This is a counter-factual pin:
+// it writes the NPTv6 bit into the flags field and reads it back. On the
+// pre-fix u8 field `SESS_FLAG_NPTV6 as _` truncates to 0, so the read-back
+// masks to 0 and the assertion FAILS; on the u16 field the bit survives.
+#[test]
+fn nptv6_session_flag_survives_roundtrip_v4() {
+    const SESS_FLAG_NPTV6: u32 = 1 << 8; // 256
+    let mut v: BpfSessionValueV4 = unsafe { core::mem::zeroed() };
+    // `as _` casts 256 to whatever width `flags` is: u8 (pre-fix) => 0, u16 => 256.
+    v.flags = SESS_FLAG_NPTV6 as _;
+    // Round-trip through the exact bytes written to the BPF map.
+    let bytes: [u8; core::mem::size_of::<BpfSessionValueV4>()] =
+        unsafe { core::mem::transmute_copy(&v) };
+    let back: BpfSessionValueV4 = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) };
+    assert_ne!(
+        u32::from(back.flags) & SESS_FLAG_NPTV6,
+        0,
+        "NPTv6 session flag (bit 8) lost -- session_value.flags too narrow for SESS_FLAG_NPTV6",
+    );
+}
+
+#[test]
+fn nptv6_session_flag_survives_roundtrip_v6() {
+    const SESS_FLAG_NPTV6: u32 = 1 << 8; // 256
+    let mut v: BpfSessionValueV6 = unsafe { core::mem::zeroed() };
+    v.flags = SESS_FLAG_NPTV6 as _;
+    let bytes: [u8; core::mem::size_of::<BpfSessionValueV6>()] =
+        unsafe { core::mem::transmute_copy(&v) };
+    let back: BpfSessionValueV6 = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) };
+    assert_ne!(
+        u32::from(back.flags) & SESS_FLAG_NPTV6,
+        0,
+        "NPTv6 session flag (bit 8) lost -- session_value_v6.flags too narrow for SESS_FLAG_NPTV6",
+    );
 }
 
 #[test]

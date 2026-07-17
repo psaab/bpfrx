@@ -51485,3 +51485,21 @@ top.
   pkg/dataplane/userspace/format/testdata/status_summary.golden,
   pkg/dataplane/userspace/format/status_golden_test.go,
   docs/feature-coverage.md, userspace-dp/src/FEATURES.md
+
+---
+- **Timestamp**: 2026-07-17
+- **Action**: #5460 — widen session_value.flags __u8 -> __u16 (SESS_FLAG_NPTV6 bit 8 = 256 overflowed the __u8). Latent/dead constant (no runtime writer; live NPTv6 is stateless RFC 6296 in nptv6.rs). Widened flags across all C/Rust/Go mirrors keeping byte-parity; on-map conntrack ABI grew 128->136 (v4) / 176->184 (v6). HA sync wire keeps Flags at 1 byte (low 8 bits; bits >=8 never set today, loss-free, no wire flag-day). Shim ABI unaffected (make generate NOT needed): userspace_sessions is HashMap<UserspaceSessionKey,u8>; sessions/sessions_v6 maps registered at runtime from sizeof(bpfSessionValue). RED-on-revert verified firsthand (assertion failure, not build break).
+- **File(s)**:
+  bpf/headers/xpf_conntrack.h (flags __u8->__u16, both structs),
+  bpf/headers/xpf_common.h (SESS_FLAG_* block comment + NPTV6),
+  userspace-dp/src/afxdp/bpf_map/mod.rs (BpfSessionValueV4/V6.flags u8->u16, SESS_FLAG_* consts u8->u16, local flags var),
+  userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs (publish_v4/v6_session flags param u8->u16),
+  userspace-dp/src/afxdp/bpf_map_tests.rs (size asserts 128/176->136/184; NEW nptv6_session_flag_survives_roundtrip_v4/v6 RED-on-revert tests),
+  pkg/dataplane/types.go (SessionValue/V6.Flags uint8->uint16; SessFlagNAT64/SessFlagNPTV6 consts),
+  pkg/dataplane/bpf_session_value.go (bpfSessionValue/V6.Flags uint8->uint16 + ABI-size comments),
+  pkg/dataplane/bpf_session_value_test.go (conntrackValueSizeV4/V6 128/176->136/184 + comments),
+  pkg/cluster/sync_protocol.go (Flags wire encode byte(val.Flags) / decode uint16(payload) x2 + #5460 comment),
+  pkg/grpcapi/server_helpers.go (countNATSessions/add flag param uint8->uint16),
+  pkg/api/metrics_sessions.go (countForward flags param uint8->uint16),
+  pkg/api/nat_stats_test.go (emit flags param uint8->uint16),
+  docs/sync-protocol.md (Flags field-width note)

@@ -141,7 +141,11 @@ struct BpfSessionKeyV4 {
 #[derive(Clone, Copy)]
 struct BpfSessionValueV4 {
     state: u8,
-    flags: u8,
+    // __u16 to fit SESS_FLAG_NPTV6 (bit 8, 0x100), which overflows a u8 (#5460).
+    // The compiler inserts one pad byte after `state` and two before
+    // `app_timeout`; the layout matches C `struct session_value` and the Go
+    // `bpfSessionValue` mirror (size-asserted at 136 in bpf_map_tests.rs).
+    flags: u16,
     tcp_state: u8,
     is_reverse: u8,
     app_timeout: u32,
@@ -188,7 +192,9 @@ struct BpfSessionKeyV6 {
 #[derive(Clone, Copy)]
 struct BpfSessionValueV6 {
     state: u8,
-    flags: u8,
+    // __u16 to fit SESS_FLAG_NPTV6 (bit 8), see BpfSessionValueV4::flags (#5460).
+    // Layout matches C `struct session_value_v6` (size-asserted at 184).
+    flags: u16,
     tcp_state: u8,
     is_reverse: u8,
     app_timeout: u32,
@@ -218,9 +224,10 @@ struct BpfSessionValueV6 {
     fib_gen: u16,
 }
 
-/// Session flag constants matching C SESS_FLAG_* defines.
-const SESS_FLAG_SNAT: u8 = 1 << 0;
-const SESS_FLAG_DNAT: u8 = 1 << 1;
+/// Session flag constants matching C SESS_FLAG_* defines. `u16` because the
+/// `session_value.flags` field is `__u16` (SESS_FLAG_NPTV6 is bit 8, #5460).
+const SESS_FLAG_SNAT: u16 = 1 << 0;
+const SESS_FLAG_DNAT: u16 = 1 << 1;
 /// Session state constants matching C SESS_STATE_* defines.
 const SESS_STATE_ESTABLISHED: u8 = 4;
 
@@ -253,7 +260,7 @@ pub(super) fn publish_bpf_conntrack_entry(
 
     let now_secs = monotonic_nanos() / 1_000_000_000;
 
-    let mut flags: u8 = 0;
+    let mut flags: u16 = 0;
     if decision.nat.rewrite_src.is_some() {
         flags |= SESS_FLAG_SNAT;
     }
