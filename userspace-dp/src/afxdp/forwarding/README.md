@@ -703,8 +703,40 @@ established/return IKE ride `ct established,related accept` first.
 SECONDARY AF_XDP path (Stage 11) is reached only when IPsec is NOT
 shunted to the kernel: DNAT/static-NAT-to-self IKE, native-GRE inner
 IPsec whose inner destination is a firewall-local address (redirected to
-the XSK and decapped in userspace), and transit/NAT IPv4 AH. The #4323
-gate closes the NEW-inbound-IKE host-inbound parity gap on this path.
+the XSK and decapped in userspace), and transit/NAT IPv4 AH and IKE
+(UDP 500/4500) that the shim steered to the helper. The #4323 gate
+closes the NEW-inbound-IKE host-inbound parity gap on this path.
+
+### #5620: the passthrough claim is scoped to a firewall-local destination
+
+Stage 11 claims the kernel-XFRM passthrough short-circuit ONLY when the
+packet's destination is an address the firewall itself answers for
+(`ForwardingState::owns_configured_ip(flow.dst_ip)` — the configured
+interface IPs incl. the SNAT/WAN IP and VIPs, PLUS the static-NAT/DNAT
+externals appended to `local_v*`). Before #5620 the stage claimed ANY
+ESP/AH/IKE packet the shim steered to the helper regardless of
+destination, so a TRANSIT UDP/500, UDP/4500 or IPv4 AH packet routed to
+a remote host was reinjected to the local XFRM stack and SKIPPED transit
+zone-policy enforcement (codex-review-181 M03; raw outer ESP was never
+affected because the shim shunts it to the kernel unconditionally, so
+only the shim-steered UDP-IKE and IPv4-AH transit classes were
+reachable).
+
+Stage 11 runs BEFORE NAT resolution (only native-GRE decap precedes it),
+so `flow.dst_ip` is the RAW on-the-wire destination. Gating on the raw
+dst is nonetheless correct for the DNAT/static-NAT-to-self cases: the NAT
+externals are already members of `local_v*` (appended in
+`forwarding_build`), so `owns_configured_ip` recognises a DNAT-to-self
+external without needing the post-NAT address. GRE-inner-local IPsec is
+likewise covered — the decapped inner destination is a firewall
+interface address. A remote/transit destination is owned by nobody here,
+so the packet returns `NotClaimed` and continues to normal transit
+forwarding + zone policy. The predicate runs BEFORE the #4323
+host-inbound admission block, which only makes sense for genuinely
+host-inbound (local-destined) IKE. Regression-guarded by
+`stage_ipsec_passthrough_rejects_remote_transit_dst_5620` (remote dst →
+NotClaimed) and `stage_ipsec_passthrough_claims_local_and_nat_to_self_dst_5620`
+(local / WAN-IP / DNAT-to-self dst → Passthrough).
 
 **Zone resolution.** The gate resolves the LOGICAL ingress ifindex +
 from-zone exactly as the local-delivery resolver does
