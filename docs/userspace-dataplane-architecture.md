@@ -962,6 +962,27 @@ inbound traffic, the Go compiler validates static-NAT `from-zone` references
 against the defined zones at commit and warns on an undefined zone (mirroring
 the source-NAT zone validation). Junos static NAT has no `to` clause.
 
+**Pre-routing scope keys on the LOGICAL VLAN unit (#5802, security).** The
+inbound DNAT / static-NAT / NPTv6 pre-routing lookups run before the FIB/zone
+lookup, and their `from zone` / `from interface` / `from routing-instance`
+scope is matched against the INGRESS identity — the zone name, config-interface
+name, and routing-instance of the unit that received the frame. That identity
+MUST be the LOGICAL VLAN unit, not the physical AF_XDP bind interface. On a
+trunk the parent physical netdev carries every VLAN unit's frames (see *VLAN
+unit AF_XDP binding target*), and `ifindex_to_zone_id` /
+`ifindex_to_config_name` / `ifindex_to_routing_instance` are keyed by the
+logical unit ifindex — the physical parent maps only to its FIRST unit. The
+pre-routing site resolves the logical unit via `prerouting_ingress_scope`
+(`poll_descriptor/mod.rs`, using `resolve_ingress_logical_ifindex` on the
+`(bind ifindex, VLAN id)` key), the SAME identity the later zone-pair policy /
+input-filter / CoS path uses (#3021). Before #5802 the scope was taken from the
+raw physical `meta.ingress_ifindex`, so on a trunk whose units sit in distinct
+zones / interfaces / routing-instances a packet on one unit could match another
+unit's scoped NAT rule (or miss its own) — applying or skipping translation
+outside the configured `from` boundary, ahead of the correct logical zone
+policy (a NAT scope-escape). An untagged port has no `(parent, VLAN)` mapping,
+so it resolves logical == physical and the scope is byte-identical to pre-#5802.
+
 #### Slow Path (`slowpath.rs`)
 
 A TUN device (`xpf-usp0`) for packets that need kernel processing:
