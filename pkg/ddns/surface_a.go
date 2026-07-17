@@ -413,11 +413,16 @@ type SurfaceAManager struct {
 	// the credential (mirrors manager.go upsertLocked's skippedNoBackend, #2691
 	// P3 review MAJOR).
 	skippedNoBackend uint64
-	// deleteCoowned counts wire deletes SUPPRESSED because the RR is still co-owned
-	// by a Surface B DHCP lease scope (#5748, the cross-surface arm of #5709). Like
-	// the lease Manager's deleteCoowned, dropping this surface's claim on a
-	// still-co-owned RR can never leak a stale record, so the suppression needs no
-	// write-ahead. Guarded by mu.
+	// deleteCoowned counts wire deletes DEFERRED because the RR is still co-owned
+	// by a Surface B DHCP lease scope (#5748 cross-surface arm of #5709, tie-break
+	// #6015). UNLIKE the lease Manager (which is the sole suppression AUTHORITY and
+	// drops its claim), Surface A is the NON-AUTHORITY: on a co-owned teardown it
+	// does NOT drop its claim and does NOT issue the wire delete. It DEFERS — it
+	// re-UPSERTs the RR (self-heal) and KEEPS its ownership claim, retrying the
+	// teardown each pass until the lease authority releases (window-(b) fix: two
+	// surfaces releasing the same co-owned RR in overlapping passes would orphan
+	// it). So this counter tallies deferred passes, not one-shot suppressions.
+	// Guarded by mu.
 	deleteCoowned uint64
 
 	// leaseCoowners, when non-nil, returns the wire-RR claims currently owned by
@@ -1596,6 +1601,12 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 	// authority has released. rebuildWireRRClaimsLocked keeps advertising the claim
 	// so the lease side still sees the co-ownership. A later pass, once the lease no
 	// longer co-owns, falls through to the real delete + ownership release.
+	//
+	// Steady-state note (#6015): if a live DHCP lease legitimately co-owns this RR
+	// indefinitely while A's own binding is permanently removed, A defers FOREVER —
+	// it re-UPSERTs the identical RR and keeps its Scopes claim every reconcile pass
+	// until the lease releases. That is correct (never orphan, never clobber) and
+	// bounded to ~1 idempotent UPSERT per poll at DDNS cadence (not per-packet).
 	if deferredCoowned > 0 {
 		return nil
 	}
