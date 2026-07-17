@@ -86,6 +86,26 @@ inspect or rewrite a packet sitting in a UMEM frame.
   `packet_rel_l4_offset_and_protocol` so MSS clamping reaches
   ext-headered v6 SYNs (the shared helper is left unchanged — GRE decap
   and tunnel local-origin read it to forward fragmented inner packets).
+- **The descriptor rewrite is transactional (#5466)**: `rewrite/mod.rs`
+  splits the eth preamble into a pure plan (`rewrite_plan_eth_from_parts`)
+  and a mutating commit (`rewrite_commit_eth_from_plan`, the eth-header
+  write + VLAN-push `copy_within` memmove). ALL bail gates
+  (`is_non_first_fragment`, `validate_rewrite_descriptor_ipv4/ipv6` —
+  header length, TTL/hop-limit, DMA-race port mismatch) run against the
+  PRISTINE frame at `plan.l3` BEFORE the commit. A `None` return therefore
+  leaves the UMEM frame byte-identical, which is required because the flow
+  cache caller chains `apply_rewrite_descriptor(...).or_else(generic)`: a
+  frame mutated before the bail (scribbled L2 / shifted payload) would
+  corrupt the generic fallback's reprocessing. The gates read from the
+  original L3 offset (before the commit's memmove relocates the payload)
+  and use the plan's `frame_len`/`payload_len` for length checks, so their
+  decisions are byte-identical to the pre-#5466 post-commit checks; the
+  infallible `apply_*` mutation half then reproduces the success-path
+  output exactly (guarded by the P-N3 differential + the
+  `pin_5466_*`/`pin_*_declines` fail-on-revert pins). The generic
+  in-place rewrite (`rewrite_forwarded_frame_in_place`) is the TERMINAL
+  fallback and still writes L2 before its own gate — harmless, nothing
+  reprocesses the frame after its `None`.
 - **Port-less protocols never get an L4 port written (#3111)**: only
   TCP/UDP carry a rewritable 16-bit port pair at L4 offset +0/+2. Every
   port-write site — the generic `apply_nat_port_rewrite` and the

@@ -388,12 +388,21 @@ fn pin_packet(v6: bool, protocol: u8, ttl: u8, ext: Vec<ExtHdr>) -> ValidPacket 
     })
 }
 
-/// (a) TTL/hop-limit ≤ 1 → BOTH paths decline with bytes from L3
-/// onward untouched. The L2 header IS legitimately scribbled — both
-/// paths write the Ethernet header during `rewrite_prepare_eth*`
-/// BEFORE TTL validation (frame/mod.rs:403/413 via mod.rs:581,
-/// rewrite/mod.rs:56); harmless in production because the caller
-/// drops the frame on `None`.
+/// (a) TTL/hop-limit ≤ 1 → both paths decline.
+///
+/// The GENERIC path (`rewrite_forwarded_frame_in_place`) is the TERMINAL
+/// fallback: it writes the Ethernet header during `rewrite_prepare_eth`
+/// BEFORE its TTL validation, so its L2 header IS scribbled on decline —
+/// harmless because nothing reprocesses the frame after the terminal
+/// `None`. Hence the generic assertion checks L3+ only.
+///
+/// The DESCRIPTOR path is now TRANSACTIONAL (#5466): its bail gates run
+/// against the pristine frame BEFORE `rewrite_commit_eth_from_plan`
+/// mutates anything, so a `None` return leaves the ENTIRE frame (L2
+/// included) byte-identical — required because the caller chains
+/// `apply_rewrite_descriptor(...).or_else(generic)` and a scribbled L2 /
+/// shifted payload would corrupt the generic reprocessing. The descriptor
+/// assertion therefore checks the full frame (FAIL-ON-REVERT for #5466).
 #[test]
 fn pin_ttl_expired_declines_l3_untouched() {
     for v6 in [false, true] {
@@ -429,14 +438,21 @@ fn pin_ttl_expired_declines_l3_untouched() {
             "descriptor path must decline TTL≤1 (v6={v6})"
         );
         let after = area.slice(DIFF_ADDR, pkt.frame.len()).unwrap();
-        assert_eq!(&after[pkt.l3..], &pkt.frame[pkt.l3..]);
+        assert_eq!(
+            after,
+            &pkt.frame[..],
+            "descriptor TTL decline must be transactional (#5466): \
+             full frame byte-identical, incl. L2 (v6={v6})"
+        );
     }
 }
 
-/// (b) Descriptor port-mismatch (DMA-race guard, rewrite/ipv4.rs:36)
-/// → `None` with L3+ untouched. The generic path treats expected
-/// ports differently (post-NAT enforce) — that is exactly why P-N3
-/// runs with `expected_ports = None`.
+/// (b) Descriptor port-mismatch (DMA-race guard,
+/// `validate_rewrite_descriptor_ipv4`) → `None` with the WHOLE frame
+/// byte-identical (#5466 transactional guarantee: the DMA-race gate runs
+/// before any UMEM mutation, so the eth header is NOT scribbled either).
+/// The generic path treats expected ports differently (post-NAT enforce)
+/// — that is exactly why P-N3 runs with `expected_ports = None`.
 #[test]
 fn pin_descriptor_port_mismatch_declines() {
     let pkt = pin_packet(false, PROTO_TCP, 64, Vec::new());
@@ -453,7 +469,153 @@ fn pin_descriptor_port_mismatch_declines() {
         "descriptor must decline on expected-port mismatch"
     );
     let after = area.slice(DIFF_ADDR, pkt.frame.len()).unwrap();
-    assert_eq!(&after[pkt.l3..], &pkt.frame[pkt.l3..]);
+    assert_eq!(
+        after,
+        &pkt.frame[..],
+        "descriptor port-mismatch decline must be transactional (#5466): \
+         full frame byte-identical, incl. L2"
+    );
+}
+
+/// #5466 FAIL-ON-REVERT (fragment): a descriptor rewrite that bails at
+/// the non-first-fragment gate must leave the ENTIRE frame byte-identical.
+/// Before the transactional split, `rewrite_prepare_eth` wrote the new
+/// Ethernet header BEFORE the fragment gate, so the caller's
+/// `.or_else(generic)` fallback reprocessed a scribbled frame. Reverting
+/// the fix (mutate before the gate) makes the full-frame assertion FAIL:
+/// the frame's L2 (DST_MAC/SRC_MAC) would be overwritten by the
+/// descriptor's distinct MACs.
+#[test]
+fn pin_5466_descriptor_fragment_decline_frame_untouched() {
+    let pkt = pin_packet(false, PROTO_TCP, 64, Vec::new()); // v4, l3 = 14
+    let l3 = pkt.l3;
+    let mut bytes = pkt.frame.clone();
+    // Turn the datagram into a NON-first IPv4 fragment: set the
+    // fragment-offset field (IP header bytes 6-7) to a nonzero offset.
+    // `ipv4_is_non_first_fragment` gates on `(frag_off & 0x1FFF) != 0`.
+    bytes[l3 + 6] = 0x00;
+    bytes[l3 + 7] = 0x10; // offset 0x10 → non-first fragment (MF/DF clear)
+    let before = bytes.clone();
+
+    let area = area_with_frame(&bytes);
+    let desc = XdpDesc {
+        addr: DIFF_ADDR as u64,
+        len: bytes.len() as u32,
+        options: 0,
+    };
+    // Descriptor MACs differ from the frame's DST_MAC/SRC_MAC, so a
+    // pre-gate eth write is detectable by the full-frame compare.
+    let rd = make_descriptor(&pkt, NatDecision::default(), 0);
+    assert!(
+        apply_rewrite_descriptor(&area, desc, pkt.meta, &rd, None).is_none(),
+        "descriptor must decline a non-first fragment"
+    );
+    let after = area.slice(DIFF_ADDR, bytes.len()).unwrap();
+    assert_eq!(
+        after,
+        &before[..],
+        "#5466: fragment decline must leave the full frame byte-identical (no eth scribble)"
+    );
+}
+
+/// #5466 FAIL-ON-REVERT (memmove — the worst manifestation): a VLAN push
+/// with no UMEM headroom takes the `copy_within` payload memmove path in
+/// `rewrite_commit_eth_from_plan`. If a bail gate ran AFTER that commit,
+/// the memmove would have SHIFTED the L3 payload and the generic fallback
+/// would reprocess doubly-shifted bytes — unrecoverable corruption. Here
+/// the descriptor bails at the fragment gate; the whole frame must stay
+/// byte-identical (no shift, no L2 scribble). Reverting the fix mutates
+/// (memmove + eth write) before the gate → RED.
+#[test]
+fn pin_5466_descriptor_vlan_push_memmove_decline_frame_untouched() {
+    let pkt = pin_packet(false, PROTO_TCP, 64, Vec::new()); // no VLAN → l3 = 14
+    let l3 = pkt.l3;
+    let mut bytes = pkt.frame.clone();
+    // Non-first fragment so the descriptor bails at the fragment gate.
+    bytes[l3 + 6] = 0x00;
+    bytes[l3 + 7] = 0x10;
+    let before = bytes.clone();
+
+    // Place the frame at a UMEM-frame boundary so a VLAN push (tx = rx - 4)
+    // leaves the current chunk → `VlanPushMemmoveNoHeadroom` → the commit
+    // would `copy_within`. FRAME_BASE == UMEM_FRAME_SIZE.
+    const FRAME_BASE: usize = 4096;
+    let mut area = MmapArea::new(8192).expect("mmap");
+    area.slice_mut(FRAME_BASE, bytes.len())
+        .expect("frame fits area")
+        .copy_from_slice(&bytes);
+    let desc = XdpDesc {
+        addr: FRAME_BASE as u64,
+        len: bytes.len() as u32,
+        options: 0,
+    };
+    // tx_vlan_id > 0 → target eth_len 18 → VLAN push (memmove, no headroom).
+    let rd = make_descriptor(&pkt, NatDecision::default(), 100);
+    assert!(
+        apply_rewrite_descriptor(&area, desc, pkt.meta, &rd, None).is_none(),
+        "descriptor must decline a non-first fragment on the vlan-push memmove path"
+    );
+    let after = area.slice(FRAME_BASE, bytes.len()).unwrap();
+    assert_eq!(
+        after,
+        &before[..],
+        "#5466: memmove-path decline must NOT shift the payload or scribble L2"
+    );
+}
+
+/// #5466 success control: a valid descriptor rewrite still succeeds and
+/// produces output byte-identical to the generic path — the transactional
+/// split must not change any success-path byte. Deterministic companion to
+/// the P-N3 `descriptor_generic_differential` proptest, covering v4, v6,
+/// and the VLAN-push (descriptor-view) success path.
+#[test]
+fn pin_5466_descriptor_success_matches_generic() {
+    for (v6, tx_vlan) in [(false, 0u16), (true, 0u16), (false, 100u16)] {
+        let pkt = pin_packet(v6, PROTO_TCP, 64, Vec::new());
+        let nat = NatDecision {
+            rewrite_src_port: Some(0x5a5a),
+            ..NatDecision::default()
+        };
+        let desc = XdpDesc {
+            addr: DIFF_ADDR as u64,
+            len: pkt.frame.len() as u32,
+            options: 0,
+        };
+
+        let area_g = area_with_frame(&pkt.frame);
+        let generic = rewrite_forwarded_frame_in_place(
+            &area_g,
+            desc,
+            pkt.meta,
+            &make_decision(&pkt, nat, tx_vlan),
+            false,
+            None,
+        )
+        .expect("generic rewrite must succeed");
+
+        let area_d = area_with_frame(&pkt.frame);
+        let fast = apply_rewrite_descriptor(
+            &area_d,
+            desc,
+            pkt.meta,
+            &make_descriptor(&pkt, nat, tx_vlan),
+            None,
+        )
+        .expect("descriptor rewrite must succeed (#5466 success path intact)");
+
+        assert_eq!(
+            generic, fast,
+            "InPlaceRewriteResult must agree (v6={v6}, vlan={tx_vlan})"
+        );
+        let out_g = area_g
+            .slice(generic.offset as usize, generic.len as usize)
+            .unwrap();
+        let out_d = area_d.slice(fast.offset as usize, fast.len as usize).unwrap();
+        assert_eq!(
+            out_g, out_d,
+            "descriptor success output must be byte-identical to generic (v6={v6}, vlan={tx_vlan})"
+        );
+    }
 }
 
 /// (c) NAT64 descriptors decline BEFORE the eth prep (rewrite/mod.rs)

@@ -17,12 +17,12 @@
 mod ipv4;
 mod ipv6;
 
-use ipv4::apply_rewrite_descriptor_ipv4;
-use ipv6::apply_rewrite_descriptor_ipv6;
+use ipv4::{apply_rewrite_descriptor_ipv4, validate_rewrite_descriptor_ipv4};
+use ipv6::{apply_rewrite_descriptor_ipv6, validate_rewrite_descriptor_ipv6};
 
 use super::{
-    is_non_first_fragment, rewrite_prepare_eth_from_parts, verify_built_frame_checksums,
-    InPlaceRewriteResult, RewriteEthParams,
+    is_non_first_fragment, rewrite_commit_eth_from_plan, rewrite_plan_eth_from_parts,
+    verify_built_frame_checksums, InPlaceRewriteResult, RewriteEthParams,
 };
 use crate::afxdp::{MmapArea, RewriteDescriptor, UserspaceDpMeta, XdpDesc};
 
@@ -70,56 +70,71 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
         return None;
     }
 
-    let prep = rewrite_prepare_eth_from_parts(
-        area,
-        desc,
-        meta.into(),
-        RewriteEthParams {
-            dst_mac: rd.dst_mac,
-            src_mac: rd.src_mac,
-            vlan_id: rd.tx_vlan_id,
-            ether_type: rd.ether_type,
-            apply_nat: !rd.fabric_redirect || rd.apply_nat_on_fabric,
-        },
-    )?;
-    let packet = unsafe { area.slice_mut_unchecked(prep.tx_offset as usize, prep.frame_len)? };
-    let frame_len = prep.frame_len;
-    let ip = prep.ip_start;
-    let skip_ttl = prep.skip_ttl;
-    let apply_nat = prep.apply_nat;
+    let eth_params = RewriteEthParams {
+        dst_mac: rd.dst_mac,
+        src_mac: rd.src_mac,
+        vlan_id: rd.tx_vlan_id,
+        ether_type: rd.ether_type,
+        apply_nat: !rd.fabric_redirect || rd.apply_nat_on_fabric,
+    };
 
-    // #1852: the descriptor fast path applies a precomputed L4-checksum
-    // delta (rd.l4_csum_delta) and inline port writes at the L4 offset,
-    // both of which would corrupt a non-first fragment's payload. Rather
-    // than re-derive the precomputed deltas for the IP-only case, fall
-    // back to the generic path (`rewrite_forwarded_frame_in_place` via
-    // the caller's `.or_else(...)`), which carries the leaf-level
-    // fragment gate. Returning None here preserves the #1838 P-N3
-    // descriptor-vs-generic byte parity (the generic path becomes the
-    // single source of truth for fragments).
-    if ip < packet.len() && is_non_first_fragment(&packet[ip..], meta.addr_family) {
-        return None;
-    }
+    // #5466: make the descriptor rewrite transactional. Compute the eth
+    // rewrite plan WITHOUT mutating UMEM, then run every bail gate
+    // (non-first-fragment, header length, TTL/hop-limit, DMA-race port
+    // mismatch) against the PRISTINE frame. `rewrite_commit_eth_from_plan`
+    // mutates the buffer (eth-header write + VLAN-push memmove), so any gate
+    // that can still return `None` MUST run before the commit — otherwise
+    // the caller's `.or_else(generic-rewrite)` fallback reprocesses a frame
+    // we already clobbered (corrupt eth header / shifted payload). The gates
+    // read the ORIGINAL L3 payload at `plan.l3`; because the commit's memmove
+    // is a pure relocation and the eth-header write never touches the L3/L4
+    // region, these decisions are byte-identical to the post-commit checks
+    // they replace, and `validate_*` returns the L4 offset the infallible
+    // `apply_*` mutation half needs.
+    let plan = rewrite_plan_eth_from_parts(area, desc, meta.into(), &eth_params)?;
+    let skip_ttl = plan.prep.skip_ttl;
+    let apply_nat = plan.prep.apply_nat;
+
+    let rel_l4 = {
+        let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+        let l3_end = plan.l3.checked_add(plan.payload_len)?;
+        let l3_payload = frame.get(plan.l3..l3_end)?;
+        // #1852: the descriptor fast path applies a precomputed L4-checksum
+        // delta and inline port writes at the L4 offset, both of which would
+        // corrupt a non-first fragment's payload. Defer to the generic path
+        // (`rewrite_forwarded_frame_in_place` via the caller's
+        // `.or_else(...)`), which carries the leaf-level fragment gate. This
+        // preserves the #1838 P-N3 descriptor-vs-generic byte parity (the
+        // generic path is the single source of truth for fragments).
+        if !l3_payload.is_empty() && is_non_first_fragment(l3_payload, meta.addr_family) {
+            return None;
+        }
+        match rd.ether_type {
+            0x0800 => {
+                validate_rewrite_descriptor_ipv4(l3_payload, skip_ttl, meta, expected_ports)?
+            }
+            0x86dd => {
+                validate_rewrite_descriptor_ipv6(l3_payload, skip_ttl, meta, expected_ports)?
+            }
+            _ => return None,
+        }
+    };
+
+    // All gates cleared: commit the eth rewrite (first UMEM mutation). From
+    // here NO path returns None — the commit's remaining fallible checks are
+    // frame-geometry checks decided by the plan, and the `apply_*` halves are
+    // infallible (validation already proved the byte layout).
+    rewrite_commit_eth_from_plan(area, desc, &plan, &eth_params)?;
+    let packet = unsafe {
+        area.slice_mut_unchecked(plan.prep.tx_offset as usize, plan.prep.frame_len)?
+    };
+    let frame_len = plan.prep.frame_len;
+    let ip = plan.prep.ip_start;
 
     match rd.ether_type {
-        0x0800 => apply_rewrite_descriptor_ipv4(
-            packet,
-            ip,
-            skip_ttl,
-            apply_nat,
-            meta,
-            rd,
-            expected_ports,
-        )?,
-        0x86dd => apply_rewrite_descriptor_ipv6(
-            packet,
-            ip,
-            skip_ttl,
-            apply_nat,
-            meta,
-            rd,
-            expected_ports,
-        )?,
+        0x0800 => apply_rewrite_descriptor_ipv4(packet, ip, rel_l4, skip_ttl, apply_nat, meta, rd),
+        0x86dd => apply_rewrite_descriptor_ipv6(packet, ip, rel_l4, skip_ttl, apply_nat, meta, rd),
+        // Unreachable: `rd.ether_type` was validated above before the commit.
         _ => return None,
     }
 
@@ -128,8 +143,8 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
         verify_built_frame_checksums(&packet[..frame_len]);
     }
     Some(InPlaceRewriteResult {
-        offset: prep.tx_offset,
+        offset: plan.prep.tx_offset,
         len: frame_len as u32,
-        l2_rewrite: prep.l2_rewrite,
+        l2_rewrite: plan.prep.l2_rewrite,
     })
 }
