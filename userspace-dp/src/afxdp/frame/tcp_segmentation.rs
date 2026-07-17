@@ -73,6 +73,18 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
     if l3 >= frame.len() {
         return None;
     }
+    // #5148: defense in depth — never segment ANY IP fragment (first or
+    // non-first). The admission gate `forwarded_tcp_may_need_segmentation`
+    // in dispatch/mod.rs already rejects every fragment, so this builder is
+    // not reached for one, but re-assert the invariant here so a future
+    // caller cannot bypass the gate and let segmentation clone the
+    // fragment-bearing IP header (Identification / MF / offset) into
+    // overlapping offset-0 pseudo-segments. A fragmented datagram is never
+    // transformed into independent TCP segments; return None so the caller
+    // forwards the original frame unchanged.
+    if is_any_fragment(&frame[l3..], meta.addr_family) {
+        return None;
+    }
     // #5141: the datagram's authoritative end is the IP header's declared
     // length (IPv4 total_len / IPv6 40 + payload_len), CLAMPED to the backing
     // slice by `declared_l3_end`. Slicing the full `&frame[l3..]` backing
@@ -300,9 +312,10 @@ fn emit_ipv4_segment(
             return None;
         }
         if apply_nat {
-            // #1852: non_first_fragment=false — the segmentation
-            // admission gate (forwarded_tcp_may_need_segmentation)
-            // never admits a non-first fragment.
+            // #1852 + #5148: non_first_fragment=false — the segmentation
+            // admission gate (forwarded_tcp_may_need_segmentation) and the
+            // builder's own #5148 guard never admit ANY fragment (first or
+            // non-first), so no fragment reaches this NAT leaf.
             apply_nat_ipv4(packet, meta.protocol, decision.nat, false)?;
         }
         if (meta.meta_flags & 0x80) == 0 {
@@ -379,7 +392,8 @@ fn emit_ipv6_segment(
             // `ip_header_len` IS the ext-aware rel_l4: it is
             // `frame_l4_offset - l3` and the segment copies
             // the full IP header incl. the ext chain.
-            // #1852: non_first_fragment=false (admission gate).
+            // #1852 + #5148: non_first_fragment=false — the admission gate
+            // and the builder's #5148 guard never admit ANY fragment.
             apply_nat_ipv6(packet, ip_header_len, meta.protocol, decision.nat, false)?;
         }
         if (meta.meta_flags & 0x80) == 0 {

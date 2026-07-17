@@ -1527,14 +1527,22 @@ fn forwarded_tcp_may_need_segmentation(
     if l3 >= frame.len() {
         return false;
     }
-    // #1852: a non-first IP fragment has no TCP header at the post-IP
-    // offset — never segment it. `meta.protocol == PROTO_TCP` is true for
-    // a non-first fragment of a TCP datagram (the shim reads the protocol
-    // from the IP header / v6 fragment next-header), so without this gate
-    // a large non-first fragment would enter the segmentation builders,
-    // which parse payload bytes as a TCP header and run NAT/checksum at
-    // the fake offset. Route it to the normal forwarding path instead.
-    if is_non_first_fragment(&frame[l3..], meta.addr_family) {
+    // #1852 + #5148: NEVER TCP-segment ANY IP fragment — first or
+    // non-first. A non-first fragment (#1852) has no TCP header at the
+    // post-IP offset (its "L4" bytes are payload). A FIRST fragment (IPv4
+    // MF=1 offset=0, or an IPv6 packet carrying a Fragment header) DOES
+    // carry a real TCP header, so the pre-#5148 non-first-only gate
+    // admitted it into the segmentation builders. Segmentation then cloned
+    // the fragment-bearing IP header (Identification / MF / offset) into
+    // every output while rewriting seq/checksum — emitting overlapping
+    // offset-0 pseudo-fragments that break reassembly at the receiver.
+    // `meta.protocol == PROTO_TCP` holds for both classes (the shim reads
+    // the protocol from the IP header / v6 fragment next-header). A
+    // fragmented datagram must never be transformed into independent TCP
+    // segments — segmentation is only for WHOLE (unfragmented) over-MTU TCP
+    // datagrams. Route any fragment to the normal forwarding path unchanged
+    // (same disposition as the sibling #1852 non-first handling).
+    if is_any_fragment(&frame[l3..], meta.addr_family) {
         return false;
     }
     // #5141: admit on the IP-DECLARED datagram length, not the raw backing
