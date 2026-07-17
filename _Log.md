@@ -1,3 +1,47 @@
+## 2026-07-17 — #5658: static block-to-block & DNAT prefix minimum-prefix floor (fail-open on /0)
+
+- **Timestamp**: 2026-07-17 (fix/5658-static-nat-min-prefix-floor)
+- **Action**: Closed a NAT fail-open where neither the Go strict commit-check
+  nor the Rust helper backstop enforced a minimum prefix on static
+  block-to-block (#3031) or DNAT-prefix (#3228/#3164) installs. Per the issue's
+  authoritative refined contract, the two findings need DIFFERENT fixes:
+  (1) STATIC BLOCK — a `/0 <-> /0` equal-length block remaps the entire address
+  family 1:1 (host mask all-ones → `contains()` matches everything; offset remap
+  preserves all host bits = identity NAT) and, installed in the ordered block
+  scan, shadows every narrower static/DNAT rule. Now HARD-REJECTED at strict
+  commit (`validateNATHostMaskStrict`, pkg/config/compiler_validate_strict_nat.go)
+  with an operator-facing "zero-length (/0)" error, downgraded to a warning on
+  the tolerant load / peer-sync path; the Rust `StaticNatTable::from_snapshots`
+  block branch (userspace-dp/src/nat/static_nat.rs) drops it fail-closed with a
+  bounded `record_parse_error` diagnostic. Zero-length reject ONLY — no arbitrary
+  non-zero floor, so a legitimate `/8`/`/64` block still commits (documented
+  subnet parity preserved). v4 + v6.
+  (2) DNAT PREFIX — a `/0` DNAT match (`0.0.0.0/0` / `::/0`) is a LEGITIMATE "all
+  routed destinations" rule and is NOT rejected (the pre-routing lookup keys on
+  the destination directly, independent of the local set). The actual defect was
+  `destination_ips_scoped` (userspace-dp/src/nat/destination.rs) unconditionally
+  projecting the prefix's network base — the UNSPECIFIED address for a `/0` —
+  into `local_v4`/`local_v6`, registering `0.0.0.0` / `::` as a firewall-local /
+  proxy-ARP / ND-owned target. Now skipped via `!net.is_unspecified()`. Host
+  expansion for a `/0` was already bounded out by MAX_LOCAL_PREFIX_HOSTS.
+- **Divergence from brief**: the team-lead brief asked to floor/reject the
+  DNAT-prefix `/0` install symmetrically with the static block. Per the issue
+  author's refined comment, rejecting a `/0` DNAT match would be a FALSE-REJECT
+  regression of documented vSRX "all routed destinations" parity — the DNAT fix
+  is the narrower local-projection skip instead.
+- **Validation**: `go build ./...` + `go vet ./pkg/config` clean; `go test
+  ./pkg/config` GREEN. `cargo build` + full `cargo test --release` GREEN (0
+  failed). RED-on-revert proven firsthand BOTH sides: neutralizing the Go floor
+  → the /0 static block commits (3 tests RED); neutralizing the Rust static
+  floor + the DNAT unspecified guard → the /0 block installs + 0.0.0.0/:: get
+  registered local (5 tests RED). Loss-cluster smoke DEFERRED — Go + cargo cover
+  the reject/backstop deterministically.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_nat_host_mask_test.go,
+  userspace-dp/src/nat/static_nat.rs, userspace-dp/src/nat/destination.rs,
+  userspace-dp/src/nat/tests_static.rs, userspace-dp/src/nat/tests_destination.rs,
+  docs/feature-coverage.md
+
 ## 2026-07-17 — #5802: pre-routing NAT scope keys on the LOGICAL VLAN unit, not the physical bind ifindex
 
 - **Timestamp**: 2026-07-17 (fix/5802-vlan-prerouting-nat-scope-logical)

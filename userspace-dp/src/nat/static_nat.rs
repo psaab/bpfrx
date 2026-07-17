@@ -389,6 +389,36 @@ impl StaticNatTable {
                 {
                     continue;
                 }
+                // #5658: a zero-length (`/0`) block prefix maps the ENTIRE
+                // address family 1:1. `host_mask_v4(0)` / `host_mask_v6(0)` is
+                // all-ones, so `!hm == 0` and `contains()` matches EVERY address
+                // in the family — and the equal-length offset remap preserves all
+                // host bits, making it an identity translation regardless of the
+                // operator-written bases. Installed in the ordered block scan it
+                // would shadow every narrower static/DNAT rule while claiming to
+                // translate (traffic hijack / blackhole / policy bypass on the
+                // translated address). Reject it fail-closed BEFORE block
+                // insertion / local-target extraction / counter allocation,
+                // mirroring the family/length/port drops above. The lengths are
+                // equal here, so testing either side suffices; test both for
+                // robustness. The Go strict commit-check rejects this too
+                // (validateNATHostMaskStrict); this is the lenient-load /
+                // peer-sync backstop. No non-zero floor is imposed — a legitimate
+                // large-but-intentional block (e.g. `/8`, `/64`) still installs.
+                if ext_prefix.len == 0 || int_prefix.len == 0 {
+                    nat_counters.record_parse_error(&format!(
+                        "static-NAT rule {:?}: block prefix {}/{} <-> {}/{} has a \
+                         zero-length (/0) prefix that remaps the entire address \
+                         family 1:1 (identity NAT shadowing all destinations) — \
+                         rejected",
+                        snap.name,
+                        ext_prefix.base,
+                        ext_prefix.len,
+                        int_prefix.base,
+                        int_prefix.len
+                    ));
+                    continue;
+                }
                 // #3202: a block (subnet) pair that ALSO carries a port match or
                 // a mapped-port is not representable here. `StaticNatBlock` does
                 // an address-only, ALL-PORT offset remap with no port fields, so

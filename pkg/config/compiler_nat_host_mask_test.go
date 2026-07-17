@@ -434,6 +434,70 @@ func TestStaticNATBlockMixedFamilyRejected(t *testing.T) {
 	}
 }
 
+// #5658: a block-to-block pair whose prefix length is ZERO (`/0` on both
+// sides) maps the ENTIRE address family 1:1 — an identity translation that
+// shadows every narrower static/DNAT rule. It must be HARD-REJECTED at strict
+// commit even though isStaticBlockPair (equal-length non-host same-family)
+// otherwise accepts it. v4 (0.0.0.0/0) and v6 (::/0) both.
+func TestStaticNATBlockZeroLengthV4Rejected(t *testing.T) {
+	tree := buildTree(t, staticNATSet("0.0.0.0/0", "10.0.0.0/0"))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("a /0 <-> /0 block static-NAT must be rejected (remaps the entire IPv4 family 1:1)")
+	}
+	if !strings.Contains(err.Error(), "zero-length") || !strings.Contains(err.Error(), "/0") {
+		t.Fatalf("error must cite the zero-length /0 mapping, got: %v", err)
+	}
+}
+
+func TestStaticNATBlockZeroLengthV6Rejected(t *testing.T) {
+	tree := buildTree(t, staticNATSet("::/0", "fd00::/0"))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("a ::/0 <-> ::/0 block static-NAT must be rejected (remaps the entire IPv6 family 1:1)")
+	}
+	if !strings.Contains(err.Error(), "zero-length") {
+		t.Fatalf("error must cite the zero-length /0 mapping, got: %v", err)
+	}
+}
+
+// #5658 lenient path: a /0 block must NOT brick a restart / peer-sync — it
+// downgrades to a warning (the Rust backstop drops the whole rule) while a
+// legitimate strict commit is rejected.
+func TestStaticNATBlockZeroLengthLenientWarns(t *testing.T) {
+	tree := buildTree(t, staticNATSet("0.0.0.0/0", "10.0.0.0/0"))
+	// Strict rejects.
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("strict CompileConfig must reject a /0 block")
+	}
+	// Lenient accepts + warns (must not fail the compile).
+	cfg, err := CompileConfigLenient(buildTree(t, staticNATSet("0.0.0.0/0", "10.0.0.0/0")))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient must NOT fail on a /0 block (brick-on-restart), got: %v", err)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "zero-length") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("lenient load must emit a zero-length block warning, warnings=%v", cfg.Warnings)
+	}
+}
+
+// #5658 false-reject guard: the fix is a ZERO-length reject ONLY, not an
+// arbitrary non-zero floor. A legitimate large-but-intentional equal-length
+// block (e.g. a /8 -> /8) must still compile clean — proving documented subnet
+// static-NAT parity is preserved.
+func TestStaticNATBlockLargeNonZeroPrefixStillCompiles(t *testing.T) {
+	tree := buildTree(t, staticNATSet("10.0.0.0/8", "172.16.0.0/8"))
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("a legitimate /8 -> /8 block must still compile (no arbitrary non-zero floor), got: %v", err)
+	}
+}
+
 // #3202: a block-to-block (subnet) static-NAT rule that ALSO specifies a
 // `match destination-port` and `then static-nat mapped-port` MUST be rejected
 // at strict commit-check. The dataplane installs a block as an address-only,

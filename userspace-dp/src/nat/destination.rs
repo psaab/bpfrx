@@ -1047,7 +1047,24 @@ impl DnatTable {
                 }
                 let instance = slot.entry.from_routing_instance.as_ref();
                 if let Some(net) = slot.network() {
-                    out.push((net, instance));
+                    // #5658: never register the UNSPECIFIED address (0.0.0.0 / ::)
+                    // as a firewall-local / proxy-ARP / ND-owned target. A `/0`
+                    // DNAT match prefix is a legitimate "all routed destinations"
+                    // rule and is preserved — the pre-routing packet-path lookup
+                    // keys on the destination directly and is INDEPENDENT of this
+                    // local set, so translation for routed traffic still works.
+                    // But its network base is the unspecified address, which is
+                    // not an owned unicast VIP; registering it perturbs
+                    // local-delivery classification and would proxy-ARP for
+                    // 0.0.0.0. (Any prefix whose canonical base is unspecified —
+                    // e.g. a `/0`, or the reserved 0.0.0.0/8 — is skipped; such a
+                    // base is never a valid on-segment VIP.) Host expansion for a
+                    // `/0` is already skipped by the MAX_LOCAL_PREFIX_HOSTS bound
+                    // below (host_count is u32::MAX / None), so only the base push
+                    // needed this guard.
+                    if !net.is_unspecified() {
+                        out.push((net, instance));
+                    }
                 }
                 match (slot.v4, slot.v6) {
                     (Some(p), _) => {

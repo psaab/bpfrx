@@ -1239,6 +1239,69 @@ fn dnat_prefix_destination_ips_registers_small_block_base_only_for_large() {
 }
 
 #[test]
+fn dnat_prefix_zero_length_does_not_register_unspecified_local_v4() {
+    // #5658: a `/0` DNAT match prefix is a legitimate "all routed destinations"
+    // rule — it must still MATCH routed traffic (the packet-path lookup keys on
+    // the destination directly and is independent of the local set). But its
+    // canonical network base is the UNSPECIFIED address 0.0.0.0, which is not an
+    // owned unicast VIP and must NOT enter the firewall-local / proxy-ARP set.
+    //
+    // FAIL-ON-REVERT: dropping the `!net.is_unspecified()` guard in
+    // destination_ips_scoped re-registers 0.0.0.0 as local → the contains()
+    // assertion below RED.
+    let row = dnat_row("all", "0.0.0.0", "0.0.0.0/0", "10.0.0.5", 0);
+    let table = DnatTable::from_snapshots(&[row], &crate::nat::NatCounterStore::default());
+    let ips: std::collections::HashSet<IpAddr> = table.destination_ips().collect();
+    assert!(
+        !ips.contains(&"0.0.0.0".parse::<IpAddr>().unwrap()),
+        "a /0 DNAT prefix must NOT register the unspecified 0.0.0.0 as a local address; ips={ips:?}"
+    );
+    // The /0 match still translates a routed destination (match is independent
+    // of the local set): an arbitrary internet host is DNAT'd to the pool.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+            443,
+            "",
+        ),
+        Some(NatDecision {
+            rewrite_dst: Some("10.0.0.5".parse().unwrap()),
+            ..NatDecision::default()
+        }),
+        "a /0 DNAT match must still translate routed traffic"
+    );
+}
+
+#[test]
+fn dnat_prefix_zero_length_does_not_register_unspecified_local_v6() {
+    // #5658 IPv6 equivalent: a `::/0` DNAT prefix must not register the
+    // unspecified `::` as a local address, but must still match routed v6.
+    let row = dnat_row("all6", "::", "::/0", "2001:db8::5", 0);
+    let table = DnatTable::from_snapshots(&[row], &crate::nat::NatCounterStore::default());
+    let ips: std::collections::HashSet<IpAddr> = table.destination_ips().collect();
+    assert!(
+        !ips.contains(&"::".parse::<IpAddr>().unwrap()),
+        "a ::/0 DNAT prefix must NOT register the unspecified :: as a local address; ips={ips:?}"
+    );
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "2001:db8:1::1".parse().unwrap(),
+            "2606:4700:4700::1111".parse().unwrap(),
+            443,
+            "",
+        ),
+        Some(NatDecision {
+            rewrite_dst: Some("2001:db8::5".parse().unwrap()),
+            ..NatDecision::default()
+        }),
+        "a ::/0 DNAT match must still translate routed v6 traffic"
+    );
+}
+
+#[test]
 fn dnat_port_aware_reverse() {
     // DNAT: rewrite dst to internal, rewrite dst_port from 80 to 8080
     let decision = NatDecision {
