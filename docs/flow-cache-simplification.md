@@ -386,14 +386,17 @@ went stale and kept rewriting to the old MAC until the session expired or an
 unrelated config/route event bumped `fib_generation` — blackholing
 long-lived flows.
 
-The fix adds a single monotonic `mac_change_epoch` (`AtomicU32`) to
-`ShardedNeighborMap` (`sharded_neighbor.rs`). It is bumped ONLY when a write
-REPLACES an existing neighbor's hwaddr with a DIFFERENT MAC — never on a
-first insert of a new neighbor (no cached flow can reference a MAC that did
-not previously exist) and never on a same-MAC ARP/NDP refresh (the
-overwhelmingly common case; bumping there would flush the whole flow cache on
-every neighbor refresh and collapse the fast-path hit rate). All FIVE
-neighbor write paths are covered:
+The fix adds monotonic MAC-change epochs to `ShardedNeighborMap`
+(`sharded_neighbor.rs`). **Per #5147 these are PER-SHARD**
+(`shard_mac_epochs: [AtomicU32; NUM_SHARDS]`), not a single global counter:
+a write bumps ONLY the epoch of the shard that holds the changed neighbor
+key. The epoch is bumped ONLY when a write REPLACES an existing neighbor's
+hwaddr with a DIFFERENT MAC — never on a first insert of a new neighbor (no
+cached flow can reference a MAC that did not previously exist) and never on a
+same-MAC ARP/NDP refresh (the overwhelmingly common case; bumping there would
+flush that shard's cached flows on every neighbor refresh and collapse the
+fast-path hit rate). All FIVE neighbor write paths are covered, each bumping
+the specific shard(s) it mutates:
 
 - the netlink monitor (`insert_if_changed`, the primary RTM_NEWNEIGH path);
 - the data-path ARP-reply / NDP-NA learn (`poll_stages.rs`), now routed
@@ -420,10 +423,11 @@ neighbor write paths are covered:
   `remove(old)` BEFORE `insert(new)` under the bulk lock, so the prior MAC
   is already gone by insert time. `bulk_replace_neighbors` therefore
   SNAPSHOTS each incoming key's prior MAC UNDER the bulk lock BEFORE the
-  removes, then bumps the epoch exactly once for the whole batch if any
-  incoming MAC differs from its snapshotted prior (a pure same-MAC refresh
-  and brand-new keys with no prior do NOT bump). HA peer-promoted session
-  closes remain out of scope;
+  removes, then (per #5147) bumps the shard of each key whose incoming MAC
+  differs from its snapshotted prior — one bump per changed shard, deduped
+  via a `[bool; NUM_SHARDS]` mask so two changed keys colliding in one shard
+  bump it once (a pure same-MAC refresh and brand-new keys with no prior do
+  NOT bump). HA peer-promoted session closes remain out of scope;
 - the #1787 RX source-MAC data-path learn (`learn_dynamic_neighbor` in
   `neighbor_dispatch.rs`), now routed through
   `ShardedNeighborMap::learn_pair_if_changed` (#3169). This learn snoops the
@@ -445,66 +449,96 @@ neighbor write paths are covered:
   sighting and same-MAC re-learn add a single Relaxed read per key and no
   bump, matching the per-key semantics.
 
-`FlowCacheEntry` carries a `neighbor_mac_epoch`. The worker fast path
-(`poll_descriptor/flow_cache_hit.rs`) re-reads the epoch on every hit; a
-mismatch (`FlowCacheEntry::neighbor_mac_epoch_stale`) evicts the slot and
-falls through to the slow path, which re-resolves the current MAC. This is
-the same lazy epoch-compare pattern as `rg_epochs` — chosen over an explicit
-cross-worker `FlushFlowCaches` so invalidation is lock-free and self-healing
-on the next packet.
+`FlowCacheEntry` carries a `neighbor_mac_epoch` PLUS (per #5147) a
+`neighbor_shard` — the index of the shard holding this flow's resolved
+next-hop `(egress_ifindex, next_hop)`, precomputed once at cache-miss time
+(`ShardedNeighborMap::shard_index`). The worker fast path
+(`poll_descriptor/flow_cache_hit.rs`) re-reads only THAT shard's epoch on
+every hit (`FlowCacheEntry::neighbor_mac_epoch_stale` → `shard_mac_epoch`, a
+single indexed relaxed load + compare); a mismatch evicts the slot and falls
+through to the slow path, which re-resolves the current MAC. A flow with no
+resolved next-hop (`NEIGHBOR_SHARD_NONE`) has no dynamic-neighbor dependency
+and is never MAC-stale. This is the same lazy epoch-compare pattern as
+`rg_epochs` — chosen over an explicit cross-worker `FlushFlowCaches` so
+invalidation is lock-free and self-healing on the next packet.
 
-**Read-before-resolve (#3918).** The stamped epoch is SNAPSHOTTED BEFORE the
-next-hop MAC is resolved, not re-read at insert time. `poll_descriptor/mod.rs`
-captures `dynamic_neighbors.mac_change_epoch()` into
-`neighbor_mac_epoch_at_resolve` at the top of per-descriptor processing —
-before `resolve_flow_session_decision` / the session-miss
-`finalize_new_flow_ha_resolution` consult the neighbor table — and threads
-that value into `FlowCacheEntry::from_forward_decision` (a `neighbor_mac_epoch`
-value parameter; the constructor has no `dynamic_neighbors` handle, so it
-cannot re-read the live epoch). Re-reading the epoch AT insert time (after the
-resolve) was a TOCTOU that re-opened the #3048 blackhole: a VRRP gateway
-failover landing between the resolve (which read the OLD MAC) and the stamp
-would capture the NEW epoch onto the cached OLD `dst_mac` — a fresh-looking
-stale entry that survives every hit until it ages out. Reading first
-guarantees the stamped epoch is `<=` the epoch observed at resolve time, so
-the MAC-change bump makes the entry stale on its next hit and it re-resolves
-to the new MAC. A Relaxed load suffices: the snapshot and the stamp run on the
-one worker thread (program order sequences the snapshot before the resolve),
-and the neighbor shard `Mutex` — not this counter — synchronizes the MAC
-bytes; the epoch is a monotonic invalidation signal needing only eventual
-cross-thread visibility. Mirrors the #2170/#3912 record-before-use discipline.
+**Read-before-resolve (#3918 / #5147).** The stamped epoch is SNAPSHOTTED
+BEFORE the next-hop MAC is resolved, not re-read at insert time. Because the
+resolved shard is not known until after the resolve, `poll_descriptor/mod.rs`
+snapshots the WHOLE per-shard epoch vector
+(`dynamic_neighbors.snapshot_shard_epochs()` → `neighbor_epoch_snapshot`) at
+the top of per-descriptor processing — before `resolve_flow_session_decision`
+/ the session-miss `finalize_new_flow_ha_resolution` consult the neighbor
+table. After the resolve it extracts the resolved shard's snapshotted value
+(`neighbor_epoch_snapshot.epoch_for(&(egress_ifindex, next_hop))`) and threads
+it into `FlowCacheEntry::from_forward_decision` (a `neighbor_mac_epoch` value
+parameter; the constructor independently derives the matching `neighbor_shard`
+from the same `decision.resolution`, and has no `dynamic_neighbors` handle so
+it cannot re-read the live epoch). Re-reading the shard epoch AT insert time
+(after the resolve) was a TOCTOU that re-opened the #3048 blackhole: a VRRP
+gateway failover landing between the resolve (which read the OLD MAC) and the
+stamp would capture the NEW shard epoch onto the cached OLD `dst_mac` — a
+fresh-looking stale entry that survives every hit until it ages out.
+Snapshotting first guarantees the stamped shard epoch is `<=` the shard epoch
+observed at resolve time, so the MAC-change bump makes the entry stale on its
+next hit and it re-resolves to the new MAC. Relaxed loads suffice: the
+snapshot and the stamp run on the one worker thread (program order sequences
+the snapshot before the resolve), and the neighbor shard `Mutex` — not these
+counters — synchronizes the MAC bytes; the epochs are monotonic invalidation
+signals needing only eventual cross-thread visibility. Mirrors the
+#2170/#3912 record-before-use discipline. The snapshot is NUM_SHARDS relaxed
+loads on the cold cache-miss/resolve path only (established flows hit the
+cache and never reach it).
 
-**Scope / tradeoff (documented per #3048):** the flow cache is keyed by the
-flow 5-tuple, not by next-hop, so next-hop-scoped invalidation is not
-possible without a second index. `mac_change_epoch` is therefore a SINGLE
-global epoch: any genuine neighbor MAC change lazily invalidates ALL cached
-flows (each re-misses once on its next packet and re-resolves). This is the
-"coarser flush" the issue accepts — acceptable because genuine MAC changes
-are rare (failover / NIC swap) while same-MAC refreshes (which never bump)
-are the steady-state norm.
+**Scope / tradeoff (per #5147, superseding the #3048 global epoch):** the
+flow cache is keyed by the flow 5-tuple, not by next-hop, so it cannot key
+invalidation on the exact neighbor. #3048's first cut used a SINGLE global
+epoch, which meant ANY neighbor's MAC change lazily invalidated ALL cached
+flows. That was an attacker-driven cache-thrash / DoS: an on-link sender
+alternating one IP's MAC advanced the global epoch faster than entries could
+warm, collapsing the whole flow cache to ~1 packet (#5147). The fix stamps
+each cached flow with the epoch of the SPECIFIC shard its resolved next-hop
+lives in and bumps only the changed neighbor's shard, so a MAC change on
+neighbor A invalidates a cached flow using neighbor B only if A and B hash to
+the SAME shard (probability 1/NUM_SHARDS = 1/64), never map-wide. This trades
+exact per-neighbor precision for a fixed-size (64-slot) epoch vector that
+keeps the hot-path check to one indexed load — a genuine per-neighbor index
+would require a hashmap probe on every fast-path hit, defeating the flow
+cache. Genuine MAC changes are rare (failover / NIC swap) and same-MAC
+refreshes (which never bump) are the steady-state norm, so the residual
+1/64 same-shard collision costs at most a single spurious re-resolve.
 
-Validation: `mac_change_epoch_*` (sharded_neighbor_tests.rs) cover
-starts-at-zero, no-bump-on-first-insert, no-bump-on-same-mac-refresh,
-bump-on-change (fail-on-revert for `insert_if_changed`), per-key changes
-accumulating on the single global epoch, the three resolver cases
-(first-insert no-bump, change bumps — fail-on-revert for the resolver —,
-epoch-reject no-bump), and the four bulk-replace cases
-(`mac_change_epoch_bulk_replace_*`: change bumps — fail-on-revert for
-`bulk_replace_neighbors` —, same-MAC refresh no-bump, brand-new-keys
-no-bump, and a single bump for a multi-key batch), and the four RX-learn
+Validation: `mac_change_epoch_*` (sharded_neighbor_tests.rs) cover, now
+PER-SHARD via `mac_change_epoch_for(&key)`: starts-at-zero,
+no-bump-on-first-insert, no-bump-on-same-mac-refresh, bump-on-change
+(fail-on-revert for `insert_if_changed`), `mac_change_epoch_isolated_per_
+shard_across_neighbors` (a change on A bumps only A's shard, leaving an
+unrelated neighbor B in a different shard at 0 — the #5147 isolation guard;
+RED under the old global epoch), the three resolver cases (first-insert
+no-bump, change bumps — fail-on-revert for the resolver —, epoch-reject
+no-bump), the bulk-replace cases (`mac_change_epoch_bulk_replace_*`: change
+bumps — fail-on-revert for `bulk_replace_neighbors` —, same-MAC refresh
+no-bump, brand-new-keys no-bump, and `..._bumps_each_changed_shard_once`:
+two distinct-shard keys each bump their own shard once), and the RX-learn
 cases (`mac_change_epoch_rx_learn_*`: first-sighting no-bump, same-MAC
 re-learn no-bump, change bumps — fail-on-revert for `learn_pair_if_changed`
-—, and a single bump for the multi-key #949 pair-write).
-`cached_descriptor_evicted_only_on_neighbor_mac_change`
-(flow_cache_tests.rs) is the end-to-end fail-on-revert: a descriptor stamped
-at the live epoch survives a same-MAC refresh and is evicted on a MAC change.
-Neutralizing either `mac_change_epoch.fetch_add` turns the change/eviction
-assertions RED. `flow_cache_stamps_pre_resolve_epoch_survives_interleaved_
-gateway_failover` (flow_cache_tests.rs) is the #3918 read-before-resolve
-fail-on-revert: it snapshots the epoch, interleaves a gateway-MAC failover
-(bumping the live epoch), stamps a real `from_forward_decision` entry with the
-PRE-resolve snapshot, and asserts the entry is stale on its next hit — and
-that a POST-resolve read (the pre-#3918 bug) would look fresh (the blackhole).
+—, and `..._pair_bumps_each_key_shard`: each key of the #949 pair-write
+bumps its own shard). At the flow-cache layer:
+`cached_descriptor_evicted_only_on_neighbor_mac_change` (flow_cache_tests.rs)
+is the #3048-preserved over-eviction guard — a descriptor stamped against its
+OWN neighbor's shard survives a same-MAC refresh and is evicted on a change
+to that neighbor; `unrelated_neighbor_mac_change_does_not_evict_cached_flow`
+is the #5147 targeted-invalidation guard — with two neighbors A/B in distinct
+shards, changing A evicts F_a (uses A) but leaves F_b (uses B) a cache hit
+(RED under the old global epoch, where both evict). Neutralizing
+`bump_shard_epoch` (or making it bump all shards) turns these RED.
+`flow_cache_stamps_pre_resolve_epoch_survives_interleaved_gateway_failover`
+(flow_cache_tests.rs) is the #3918 read-before-resolve fail-on-revert: it
+snapshots the per-shard epochs, interleaves a gateway-MAC failover (bumping
+the neighbor's shard epoch), stamps a real `from_forward_decision` entry with
+the PRE-resolve snapshot value, and asserts the entry is stale on its next
+hit — and that a POST-resolve read (the pre-#3918 bug) would look fresh (the
+blackhole).
 Reverting the fix so the constructor ignores the caller's pre-resolve epoch
 turns it RED. `flow_cache_normal_resolve_caches_and_serves_neighbor_mac` is
 the companion no-interleave case: a normal resolve must not spuriously evict.

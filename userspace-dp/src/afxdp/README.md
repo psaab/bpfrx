@@ -37,16 +37,23 @@ sync.
   `(ifindex, ip) -> mac` binding into `dynamic_neighbors` AND the kernel
   neighbor table, so these parsers are a MAC->IP write primitive — they
   MUST fail closed on untrusted input.
-  - **MAC-change invalidation (`#3048`):** the learn goes through
+  - **MAC-change invalidation (`#3048` / `#5147`):** the learn goes through
     `insert_if_changed`, NOT a plain `insert`, so a MAC change observed
     directly on the wire (e.g. an upstream gateway VRRP failover whose
-    ARP reply / NDP NA traverses our XSK) advances the neighbor
-    `mac_change_epoch` and evicts the now-stale cached `dst_mac`. A plain
-    insert would write the new MAC first and then SHADOW the kernel-monitor
-    RTM_NEWNEIGH that follows `add_kernel_neighbor` (the monitor would see
-    `prior == new` and not bump), leaving the flow cache stale until session
-    expiry. See `docs/flow-cache-simplification.md` "Neighbor MAC-change
-    invalidation".
+    ARP reply / NDP NA traverses our XSK) advances that neighbor's
+    **per-shard** MAC-change epoch (`ShardedNeighborMap::shard_mac_epochs`,
+    indexed by the changed neighbor's shard) and evicts the now-stale
+    cached `dst_mac`. Per #5147 the epoch is PER-SHARD, not a single global
+    counter: a cached flow stamps the epoch of the specific shard its
+    resolved next-hop lives in (`FlowCacheEntry::neighbor_shard`) and
+    re-reads only that slot on each hit, so a MAC change to an UNRELATED
+    neighbor (a different shard) no longer evicts it — closing the
+    attacker-driven map-wide cache-thrash where one on-link IP's MAC flap
+    collapsed the whole flow cache. A plain insert would write the new MAC
+    first and then SHADOW the kernel-monitor RTM_NEWNEIGH that follows
+    `add_kernel_neighbor` (the monitor would see `prior == new` and not
+    bump), leaving the flow cache stale until session expiry. See
+    `docs/flow-cache-simplification.md` "Neighbor MAC-change invalidation".
   - **Logical-ifindex keying (`#2370`):** the `ifindex` in that
     `(ifindex, ip)` key is the LOGICAL (L3) ifindex, NOT the physical
     ingress port. For a frame arriving on a VLAN sub-interface,
@@ -165,7 +172,7 @@ sync.
     `(ifindex, our_own_ip) -> attacker_mac`. The gate is the
     `ForwardingState::owns_configured_ip(ip)` predicate, applied at three
     sites BEFORE the cache write (so a rejected own-IP neither inserts nor
-    bumps `mac_change_epoch`):
+    bumps the neighbor's per-shard MAC-change epoch):
       - the ARP-reply arm and the NDP-NA arm of `stage_link_layer_classify`
         (`poll_stages.rs`), and
       - the **RX source-MAC learn path** `learn_dynamic_neighbor`

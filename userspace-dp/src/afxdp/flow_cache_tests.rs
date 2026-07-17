@@ -110,6 +110,9 @@ fn make_entry(
         observed_bytes: 0,
         last_used_epoch: 0,
         neighbor_mac_epoch: 0,
+        // #5147: default to no dynamic-neighbor dependency; tests that
+        // exercise MAC-change eviction set `neighbor_shard` explicitly.
+        neighbor_shard: NEIGHBOR_SHARD_NONE,
     }
 }
 
@@ -2634,14 +2637,17 @@ fn flow_cache_not_populated_by_control_segment_via_insertion_site() {
         );
     }
 
-// ── #3048: cached dst_mac eviction on neighbor MAC change ─────────────
+// ── #3048/#5147: cached dst_mac eviction on the flow's OWN neighbor ────
 // End-to-end at the flow-cache layer: a descriptor is stamped with the
-// live neighbor mac_change_epoch at insert. The worker fast path keeps
-// the entry while the epoch is unchanged (same-MAC refresh) and evicts
-// it once the neighbor table records a genuine MAC change. Reverting the
-// `mac_change_epoch.fetch_add` in ShardedNeighborMap::insert_if_changed
-// leaves the epoch at 0 after the change → neighbor_mac_epoch_stale()
-// returns false → the stale dst_mac persists → this test goes RED.
+// per-shard MAC-change epoch of its OWN next-hop neighbor at insert. The
+// worker fast path keeps the entry while that shard's epoch is unchanged
+// (same-MAC refresh) and evicts it once the neighbor table records a
+// genuine MAC change to THIS neighbor. This is the #5147 over-eviction
+// guard IN REVERSE — it proves the targeted scheme still evicts on a real
+// change to the flow's own neighbor (preserving #3048). Reverting the
+// `bump_shard_epoch` in ShardedNeighborMap::insert_if_changed leaves the
+// shard epoch at 0 after the change → neighbor_mac_epoch_stale() returns
+// false → the stale dst_mac persists → this test goes RED.
 #[test]
 fn cached_descriptor_evicted_only_on_neighbor_mac_change() {
     use crate::afxdp::sharded_neighbor::ShardedNeighborMap;
@@ -2653,8 +2659,9 @@ fn cached_descriptor_evicted_only_on_neighbor_mac_change() {
     // Resolve the gateway with its initial MAC (first insert — no bump).
     neighbors.insert_if_changed(nh, NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] });
 
-    // Build a cached forwarding descriptor and stamp it with the live
-    // epoch exactly as poll_descriptor does at insert time.
+    // Build a cached forwarding descriptor and stamp it against the flow's
+    // OWN next-hop shard exactly as poll_descriptor / from_forward_decision
+    // do at insert time (shard of `nh`, that shard's current epoch).
     let stamp = FlowCacheStamp {
         config_generation: 5,
         fib_generation: 3,
@@ -2663,22 +2670,90 @@ fn cached_descriptor_evicted_only_on_neighbor_mac_change() {
         owner_rg_lease_until: 0,
     };
     let mut entry = make_entry(make_key(), stamp, 1);
-    entry.neighbor_mac_epoch = neighbors.mac_change_epoch();
+    entry.neighbor_shard = ShardedNeighborMap::shard_index(&nh) as u16;
+    entry.neighbor_mac_epoch = neighbors.mac_change_epoch_for(&nh);
 
     // Steady state: a same-MAC ARP/NDP refresh must NOT evict the entry.
     neighbors.insert_if_changed(nh, NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] });
     assert!(
-        !entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
+        !entry.neighbor_mac_epoch_stale(&neighbors),
         "same-MAC refresh must not evict the cached descriptor (#3048)"
     );
 
-    // Gateway VRRP failover: the neighbor's MAC changes. The cached
-    // dst_mac is now stale and the entry MUST be evicted so the next
-    // packet re-resolves the current MAC.
+    // Gateway VRRP failover: the flow's OWN neighbor MAC changes. The cached
+    // dst_mac is now stale and the entry MUST be evicted so the next packet
+    // re-resolves the current MAC (#3048 preserved under the #5147 scheme).
     neighbors.insert_if_changed(nh, NeighborEntry { mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x99] });
     assert!(
-        entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
-        "neighbor MAC change must evict the cached stale dst_mac (#3048)"
+        entry.neighbor_mac_epoch_stale(&neighbors),
+        "a MAC change to the flow's own neighbor must evict its stale dst_mac (#3048)"
+    );
+}
+
+// ── #5147: TARGETED invalidation — an unrelated neighbor's MAC change ──
+// must NOT evict a cached flow using a different neighbor. This is the
+// primary fail-on-revert guard for the map-wide-thrash / DoS fix: under
+// the old single global epoch BOTH flows stamped and compared the ONE
+// counter, so changing neighbor A's MAC advanced it and evicted F_b too —
+// the `!f_b...` assertion below would go RED. With per-shard epochs, A's
+// change bumps only A's shard, leaving F_b (a different shard) a cache
+// hit. It exercises the REAL primitives (ShardedNeighborMap per-shard
+// bump + shard_index stamping + neighbor_mac_epoch_stale).
+#[test]
+fn unrelated_neighbor_mac_change_does_not_evict_cached_flow() {
+    use crate::afxdp::sharded_neighbor::ShardedNeighborMap;
+    use crate::afxdp::types::NeighborEntry;
+    use std::net::Ipv4Addr;
+
+    let neighbors = ShardedNeighborMap::new();
+
+    // Two neighbors A and B guaranteed to live in DIFFERENT shards, so a
+    // change to one cannot touch the other's shard epoch.
+    let (na, nb) = {
+        let a = (6i32, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1)));
+        let base_shard = ShardedNeighborMap::shard_index(&a);
+        let mut b = None;
+        for octet in 2..=254u8 {
+            let cand = (6i32, IpAddr::V4(Ipv4Addr::new(172, 16, 50, octet)));
+            if ShardedNeighborMap::shard_index(&cand) != base_shard {
+                b = Some(cand);
+                break;
+            }
+        }
+        (a, b.expect("distinct-shard neighbor B exists"))
+    };
+    neighbors.insert_if_changed(na, NeighborEntry { mac: [0xaa, 0, 0, 0, 0, 0x01] });
+    neighbors.insert_if_changed(nb, NeighborEntry { mac: [0xbb, 0, 0, 0, 0, 0x02] });
+
+    let stamp = FlowCacheStamp {
+        config_generation: 5,
+        fib_generation: 3,
+        owner_rg_id: 1,
+        owner_rg_epoch: 0,
+        owner_rg_lease_until: 0,
+    };
+    // F_a depends on neighbor A; F_b on neighbor B.
+    let mut f_a = make_entry(make_key(), stamp, 1);
+    f_a.neighbor_shard = ShardedNeighborMap::shard_index(&na) as u16;
+    f_a.neighbor_mac_epoch = neighbors.mac_change_epoch_for(&na);
+    let mut f_b = make_entry(make_key(), stamp, 1);
+    f_b.neighbor_shard = ShardedNeighborMap::shard_index(&nb) as u16;
+    f_b.neighbor_mac_epoch = neighbors.mac_change_epoch_for(&nb);
+
+    // Neighbor A's MAC flaps (an on-link sender alternating one IP's MAC).
+    neighbors.insert_if_changed(na, NeighborEntry { mac: [0xaa, 0, 0, 0, 0, 0x99] });
+
+    // F_a (uses A) is invalidated → re-resolves.
+    assert!(
+        f_a.neighbor_mac_epoch_stale(&neighbors),
+        "a MAC change to A must evict a flow that uses A (#3048)"
+    );
+    // F_b (uses B) is STILL a cache hit — NOT evicted. RED under the old
+    // global epoch (the map-wide-thrash defect).
+    assert!(
+        !f_b.neighbor_mac_epoch_stale(&neighbors),
+        "a MAC change to an UNRELATED neighbor A must NOT evict a flow that \
+         uses neighbor B (#5147 targeted invalidation)"
     );
 }
 
@@ -2709,27 +2784,32 @@ fn flow_cache_stamps_pre_resolve_epoch_survives_interleaved_gateway_failover() {
     use crate::afxdp::types::NeighborEntry;
 
     let neighbors = ShardedNeighborMap::new();
-    let nh = (6i32, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1)));
+    // The next-hop MUST match the round-trip decision's resolved next-hop
+    // (`egress_ifindex=6`, `next_hop=10.0.1.1`) so `from_forward_decision`
+    // stamps THIS neighbor's shard and the failover below bumps that same
+    // shard.
+    let nh = (6i32, IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)));
     // Gateway resolved with its pre-failover MAC (first insert — no bump).
     neighbors.insert_if_changed(nh, NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] });
 
-    // poll_descriptor snapshots the epoch BEFORE resolving the neighbor MAC.
-    let epoch_at_resolve = neighbors.mac_change_epoch();
+    // poll_descriptor snapshots EVERY shard's epoch BEFORE resolving the
+    // neighbor MAC (the resolved shard is not yet known).
+    let pre_resolve_snapshot = neighbors.snapshot_shard_epochs();
 
     // ── Interleaved VRRP gateway failover ──
     // A kernel ARP/NDP update REPLACES the gateway MAC AFTER the resolve read
     // the old MAC but BEFORE the flow-cache entry is stamped. This advances the
-    // live epoch past the pre-resolve snapshot.
+    // neighbor's shard epoch past the pre-resolve snapshot.
     neighbors.insert_if_changed(nh, NeighborEntry { mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x99] });
     assert_ne!(
-        epoch_at_resolve,
-        neighbors.mac_change_epoch(),
-        "the interleaved failover must advance the live epoch past the \
-         pre-resolve snapshot (otherwise the test proves nothing)"
+        pre_resolve_snapshot.epoch_for(&nh),
+        neighbors.mac_change_epoch_for(&nh),
+        "the interleaved failover must advance the neighbor's shard epoch past \
+         the pre-resolve snapshot (otherwise the test proves nothing)"
     );
 
     // Build + stamp the flow-cache entry exactly as poll_descriptor does after
-    // the resolve: `from_forward_decision` stamps the PRE-RESOLVE snapshot
+    // the resolve: it stamps the resolved shard's PRE-RESOLVE snapshot value
     // (`neighbor_mac_epoch` param), NOT a fresh post-resolve read.
     let (flow, meta, validation, decision, forwarding, ha_state) = make_v4_round_trip_inputs();
     let rg_epochs = default_rg_epochs();
@@ -2747,25 +2827,25 @@ fn flow_cache_stamps_pre_resolve_epoch_survives_interleaved_gateway_failover() {
         &ha_state,
         false,
         &rg_epochs,
-        epoch_at_resolve, // #3918: pre-resolve snapshot, not a post-resolve read
+        pre_resolve_snapshot.epoch_for(&nh), // #3918: pre-resolve shard value
     )
     .expect("v4 round-trip decision is cacheable");
 
-    // On the NEXT fast-path hit the entry's stamped (pre-failover) epoch != the
-    // current live epoch -> treated STALE -> evicted + re-resolved to the new
-    // MAC. This is the fix.
+    // On the NEXT fast-path hit the entry's stamped (pre-failover) shard epoch
+    // != the current live shard epoch -> treated STALE -> evicted + re-resolved
+    // to the new MAC. This is the fix.
     assert!(
-        entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
-        "an entry stamped with the pre-resolve epoch must be stale after an \
+        entry.neighbor_mac_epoch_stale(&neighbors),
+        "an entry stamped with the pre-resolve shard epoch must be stale after an \
          interleaved gateway-MAC failover so the stale dst_mac is re-resolved (#3918)"
     );
 
     // Contrast: the pre-#3918 behavior read the epoch AFTER the resolve (i.e.
-    // after the failover bump modeled above). That post-resolve value EQUALS
-    // the current live epoch, so the stale entry looks FRESH and is never
-    // evicted — the blackhole. Encoding it here makes the revert's failure mode
-    // explicit and guards against a regression that re-reads at stamp time.
-    let post_resolve_read = neighbors.mac_change_epoch();
+    // after the failover bump modeled above). That post-resolve shard value
+    // EQUALS the current live shard epoch, so the stale entry looks FRESH and is
+    // never evicted — the blackhole. Encoding it here makes the revert's failure
+    // mode explicit and guards against a regression that re-reads at stamp time.
+    let post_resolve_snapshot = neighbors.snapshot_shard_epochs();
     let buggy_entry = FlowCacheEntry::from_forward_decision(
         &flow,
         meta,
@@ -2780,11 +2860,11 @@ fn flow_cache_stamps_pre_resolve_epoch_survives_interleaved_gateway_failover() {
         &ha_state,
         false,
         &rg_epochs,
-        post_resolve_read,
+        post_resolve_snapshot.epoch_for(&nh),
     )
     .expect("v4 round-trip decision is cacheable");
     assert!(
-        !buggy_entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
+        !buggy_entry.neighbor_mac_epoch_stale(&neighbors),
         "a POST-resolve stamp (the pre-#3918 bug) looks fresh after failover — \
          this is the stale-MAC blackhole the fix closes (#3918)"
     );
@@ -2800,11 +2880,13 @@ fn flow_cache_normal_resolve_caches_and_serves_neighbor_mac() {
     use crate::afxdp::types::NeighborEntry;
 
     let neighbors = ShardedNeighborMap::new();
-    let nh = (6i32, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1)));
+    // Match the round-trip decision's resolved next-hop (egress_ifindex=6,
+    // next_hop=10.0.1.1) so the stamped shard matches the mutated neighbor.
+    let nh = (6i32, IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)));
     neighbors.insert_if_changed(nh, NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] });
 
     // Snapshot pre-resolve; NO failover interleaves.
-    let epoch_at_resolve = neighbors.mac_change_epoch();
+    let pre_resolve_snapshot = neighbors.snapshot_shard_epochs();
 
     let (flow, meta, validation, decision, forwarding, ha_state) = make_v4_round_trip_inputs();
     let rg_epochs = default_rg_epochs();
@@ -2822,14 +2904,15 @@ fn flow_cache_normal_resolve_caches_and_serves_neighbor_mac() {
         &ha_state,
         false,
         &rg_epochs,
-        epoch_at_resolve,
+        pre_resolve_snapshot.epoch_for(&nh),
     )
     .expect("v4 round-trip decision is cacheable");
 
-    // A same-MAC refresh does not advance the epoch, so the entry stays fresh.
+    // A same-MAC refresh does not advance the shard epoch, so the entry stays
+    // fresh.
     neighbors.insert_if_changed(nh, NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] });
     assert!(
-        !entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
+        !entry.neighbor_mac_epoch_stale(&neighbors),
         "a normal resolve with no interleaved MAC change must serve the cached \
          entry, not spuriously evict it (#3918)"
     );
