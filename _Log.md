@@ -51486,6 +51486,23 @@ top.
   pkg/dataplane/userspace/format/status_golden_test.go,
   docs/feature-coverage.md, userspace-dp/src/FEATURES.md
 
+- **Timestamp**: 2026-07-17
+- **Action**: #4894 — bound binding queue-id to the fixed 16-slot stride
+  before the flat `userspace_bindings` index is computed. QueueID >= 16 on
+  ifindex N aliased the queue-0 slot of ifindex N+1 (idx N*16+16 ==
+  (N+1)*16+0); the existing `idx >= BindingArrayMaxEntries` cap (#814) did
+  not catch it. Added a fail-closed guard at all 4 index sites (primary
+  apply, VLAN-alias apply, watchdog verify, watchdog alias): apply paths
+  disable ctrl via failClosedUserspaceCtrlLocked, watchdog paths log+skip.
+  Never clamp/modulo the queue-id. Added RED-on-revert test asserting the
+  adjacent ifindex queue-0 slot is not written. Documented the flat-index
+  layout + both bounds in docs/afxdp-packet-processing.md. Rust producer
+  (replan_bindings_from_candidates) can emit queue_id>=16 on >16-queue NICs
+  but a naive cap-at-16 is unclean (strands RX queues >=16 under AF_XDP
+  queue-binding) — Go boundary is the enforcement point.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/maps_sync_queue_id_bound_4894_test.go,
+  docs/afxdp-packet-processing.md
 - **Timestamp**: 2026-07-17 (#4867)
   **Action**: cluster: route dual-active "winner stays" reaffirm event's
     full-channel drop through the reliable fallback. Inline non-blocking
