@@ -301,6 +301,14 @@ pub(crate) struct Nat64ReverseInfo {
 //     growth. Short TTL (~2s): we ASSOCIATE, we do not RFC-reassemble — real
 //     fragments of one datagram arrive within microseconds-milliseconds; the
 //     short TTL covers reorder/jitter while evicting attack residue fast.
+//   * PRUNE-BEFORE-EVICT (#5447): on a full shard `install` reclaims EXPIRED
+//     entries FIRST (same monotonic clock `lookup` prunes with) and only evicts
+//     the oldest LIVE entry if the shard is STILL at cap. Without this, a flood
+//     of first fragments (each a distinct ident) fills the shard and the LRU
+//     eviction would sacrifice a still-LIVE association — whose non-first
+//     fragments have not yet arrived — to an EXPIRED slot squatting in front,
+//     dropping legitimate fragments fail-closed. When every entry is live the
+//     hard capacity bound is unchanged (oldest live entry still evicted).
 //   * CROSS-WORKER visible for free: the cache rides `Nat64State`, which is
 //     shared across all workers behind `Arc<ForwardingState>` (ArcSwap) and
 //     threaded across config reloads by `from_snapshots_with_previous` — the
@@ -422,9 +430,13 @@ impl Nat64FragAssoc {
     /// Install (or refresh) the association a FIRST fragment established. Only a
     /// first fragment reaches this (the caller gates on offset 0 / MF=1 + an
     /// admitted, resolved decision), so non-first fragments can never grow the
-    /// table. On a full shard the OLDEST (front) entry is evicted -> hard,
-    /// fixed memory ceiling. A repeat install of the same key refreshes the
-    /// deadline and moves the entry to the back (most-recently-used).
+    /// table. On a full shard EXPIRED entries are pruned first (reclaiming dead
+    /// slots that a first-fragment flood would otherwise leave squatting), and
+    /// only if the shard is STILL at cap is the OLDEST (front) LIVE entry
+    /// evicted -> hard, fixed memory ceiling that no longer sacrifices a live
+    /// association to an expired one (#5447). A repeat install of the same key
+    /// refreshes the deadline and moves the entry to the back
+    /// (most-recently-used).
     pub(crate) fn install(
         &self,
         key: Nat64FragKey,
@@ -446,7 +458,20 @@ impl Nat64FragAssoc {
             return;
         }
         if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
-            shard.remove(0);
+            // Reclaim EXPIRED slots before touching a live one. Under a flood of
+            // first fragments (each a distinct ident -> a fresh install) the
+            // shard fills with entries, some already past their (short) TTL. A
+            // bare `remove(0)` would evict the OLDEST entry regardless of
+            // liveness, dropping a still-live association whose non-first
+            // fragments have not arrived yet (they would then miss + fail
+            // closed, #5447). Prune expired first using the SAME monotonic clock
+            // `lookup` uses; only if the shard is STILL at cap (every entry
+            // live) do we fall back to evicting the oldest live entry — the
+            // unavoidable hard capacity bound.
+            shard.retain(|e| e.deadline_ns > now_ns);
+            if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
+                shard.remove(0);
+            }
         }
         shard.push(Nat64FragEntry {
             key,
