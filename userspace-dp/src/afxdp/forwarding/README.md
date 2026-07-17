@@ -459,10 +459,43 @@ selects only WHICH tokens a zone admits, never WHETHER it is enforced.
 Consequently `None`
 now means only a genuinely unknown / global ingress zone (id not in the table),
 which keeps the admit default. The global ICMP/ND/PMTUD accepts precede the
-per-zone deny, and lifeline interfaces (fxp0/em0/fab*) never reach this AF_XDP
+per-zone deny, and lifeline interfaces (`fxp*`/`em*`/`fab*`/`lo0`) never reach this AF_XDP
 classifier (the kernel serves their host-bound traffic and excludes them from
 the deny address sets), so the default-deny cannot strand management or break
-HA. Token
+HA.
+
+**Empty-zone addressed-interface backstop (#5659).** The #2391 zone-id backstop
+in `forwarding_build::interfaces::populate_interfaces` (fail-closed on a
+NON-EMPTY unknown zone name) is guarded by `!iface.zone.is_empty()`, so an
+ADDRESSED interface with an EMPTY `security-zone` string is skipped: it gets no
+`ifindex_to_zone_id` entry and resolves to the global `zone_id 0`, while its IP
+is STILL registered into `local_v4`/`local_v6` as a local-delivery target. On
+its own that would let `host_inbound_admits(0)` hit the `None => true`
+global-zone admit arm and admit every host-bound service (SSH/NETCONF/BGP/SNMP)
+on that interface — an asymmetry vs the #2391/#3405 fail-closed posture. To
+restore symmetry, `populate_interfaces` inserts an EMPTY `ZoneHostInbound`
+sentinel into `ifindex_host_inbound` keyed by that interface's logical ifindex,
+so the ingress-interface-keyed `host_inbound_admits_iface` DENIES host-bound
+services there. The insert is scoped to an interface that (a) is unzoned, (b)
+actually registered a `local_v4`/`local_v6` target, (c) has no explicit
+per-interface `host_inbound_configured` override (never clobber the operator's
+set), and (d) is not a lifeline (`fxp*`/`em*`/`fab*` prefixes plus `lo0`, matched
+by base name to mirror the authoritative Go SSOT `userspaceSkipsIngressInterface`
+— never arm a deny on a management/HA/loopback link; the earlier `fxp0`/`em0`-only
+form was narrower than the SSOT and would have stranded an unzoned-addressed `lo0`
+router-id/BGP-`update-source` loopback in the exact future case this backstop
+hardens). Keying by ifindex — rather than inserting
+`zone_host_inbound[0]` — deliberately leaves the genuinely-global `zone_id 0`
+path untouched, so a legitimately-zoneless NON-addressed control interface keeps
+its admit default and the global ICMP/ND/PMTUD accepts (checked before the set)
+still deliver control traffic. Reachability today is bind-gated
+(`buildUserspaceBindNetdevs` skips a zoneless interface), so this is a
+fail-closed-SYMMETRY / defense-in-depth hardening: it closes the asymmetry so a
+future change that binds a zoneless-addressed interface (or a quarantine path,
+#3719, that keeps an interface bound while stripping its zone) cannot silently
+become a host-inbound bypass.
+
+Token
 classification covers the common Junos `system-services` (ssh, ping, dns,
 dhcp/dhcpv6, ike, ntp, snmp, ...) and `protocols` (ospf, bgp,
 router-discovery, ...) names; `system-services all` / `any-service`
