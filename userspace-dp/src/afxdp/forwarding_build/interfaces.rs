@@ -357,28 +357,44 @@ pub(in crate::afxdp) fn connected_route_tables(routing_instance: &str) -> (Strin
     }
 }
 
-/// #5659: base-name lifeline match, mirroring the UNCONDITIONAL defaults of the
-/// Go SSOT `config.HostInboundLifelineInterface` (fxp0 / em0 / fab*). A lifeline
-/// interface's host-bound traffic is served UNCONDITIONALLY by the kernel path
-/// (excluded from the AF_XDP host-inbound deny sets), so the empty-zone
-/// fail-closed backstop in [`populate_interfaces`] must never arm a deny
-/// sentinel for one — that would strand management / break the HA heartbeat the
-/// moment a future change bound it.
+/// #5659: base-name lifeline match, mirroring the NAME/prefix exclusions of the
+/// authoritative Go SSOT `userspaceSkipsIngressInterface`
+/// (pkg/dataplane/userspace/maps_sync.go): the `fxp*` / `em*` / `fab*` prefixes
+/// plus `lo0`. A lifeline interface's host-bound traffic is served
+/// UNCONDITIONALLY by the kernel path (excluded from the AF_XDP host-inbound
+/// deny sets), so the empty-zone fail-closed backstop in [`populate_interfaces`]
+/// must never arm a deny sentinel for one — that would strand management / break
+/// the HA heartbeat the moment a future change bound it.
+///
+/// The earlier form matched only the exact `fxp0` / `em0` names, which was
+/// NARROWER than the SSOT and would arm a deny sentinel on an unzoned+addressed
+/// `lo0` (a router-id / BGP `update-source` loopback) or an `fxp1` / `em1` in
+/// the exact future case this backstop hardens — reintroducing a
+/// management-strand. The remaining arms of `userspaceSkipsIngressInterface` are
+/// handled elsewhere or moot here:
+///   - the mgmt/control-ZONE arm is unreachable — the sentinel branch already
+///     requires an EMPTY zone;
+///   - the `LocalFabric != ""` (fabric parent) arm is subsumed by the `fab*`
+///     prefix, so a fabric parent that gains an L3 address stays exempt;
+///   - the `Tunnel` arm is inert — a tunnel interface is likewise excluded from
+///     the AF_XDP ingress-ifindex map by the same SSOT, so a sentinel on one is
+///     never consulted.
 ///
 /// The config-derived control/fabric names (#3277: a renamed `control-interface`
-/// / non-default fabric) are NOT mirrored here because the snapshot does not
-/// carry them. That is safe: such a renamed lifeline is zoneless and thus not
-/// AF_XDP-bound today (`buildUserspaceBindNetdevs` skips a zoneless interface),
-/// so a missed match leaves an INERT sentinel that is never consulted — and the
-/// canonical em0/fab*/fxp0 names (the only ones present in default configs) are
-/// matched. The unit suffix is stripped so `em0.0` / `fab1.0` match too.
+/// / non-default fabric) are still NOT mirrored here because the snapshot does
+/// not carry them; that stays safe only because such a renamed lifeline is
+/// zoneless and thus not AF_XDP-bound today (`buildUserspaceBindNetdevs` skips a
+/// zoneless interface), so a missed match leaves an INERT sentinel that is never
+/// consulted. If a future change binds a zoneless interface, this predicate MUST
+/// be reconciled with `userspaceSkipsIngressInterface` (add a parity test). The
+/// unit suffix is stripped so `em0.0` / `fab1.0` / `lo0.0` match too.
 fn is_host_inbound_lifeline(name: &str) -> bool {
     let base = match name.split_once('.') {
         Some((b, _)) => b,
         None => name,
     }
     .trim();
-    base == "fxp0" || base == "em0" || base.starts_with("fab")
+    base.starts_with("fxp") || base.starts_with("em") || base.starts_with("fab") || base == "lo0"
 }
 
 pub(in crate::afxdp) fn pick_interface_v4(iface: &InterfaceSnapshot) -> Option<Ipv4Addr> {

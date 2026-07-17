@@ -1559,6 +1559,7 @@ fn empty_zone_addressed_interface_denies_host_inbound() {
     const UNZONED_IFINDEX: i32 = 80;
     const EM0_IFINDEX: i32 = 81;
     const TRUST_IFINDEX: i32 = 82;
+    const LO0_IFINDEX: i32 = 83;
     const PROTO_TCP: u8 = 6;
     const PROTO_ICMP: u8 = 1;
     const PROTO_ICMP6: u8 = 58;
@@ -1602,6 +1603,22 @@ fn empty_zone_addressed_interface_denies_host_inbound() {
                 addresses: vec![InterfaceAddressSnapshot {
                     family: "inet".into(),
                     address: "10.99.0.1/24".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            // #5659 fold: a zoneless-addressed lo0 loopback (router-id / BGP
+            // update-source) is a LIFELINE and must NOT get a deny sentinel —
+            // the earlier fxp0/em0-only predicate missed lo0 and would have
+            // stranded BGP-to-loopback the moment a future change bound it.
+            InterfaceSnapshot {
+                name: "lo0".into(),
+                zone: String::new(),
+                ifindex: LO0_IFINDEX,
+                hardware_addr: "02:00:00:00:00:83".into(),
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "10.255.0.1/32".into(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -1683,6 +1700,19 @@ fn empty_zone_addressed_interface_denies_host_inbound() {
     assert!(
         host_inbound_admits_iface(&state, EM0_IFINDEX, 0, PROTO_TCP, 22, false, 0),
         "em0 lifeline keeps its unconditional admit"
+    );
+
+    // Scope guard 3 (#5659 fold): lo0 is zoneless+addressed but is a lifeline
+    // per the widened predicate (mirrors `userspaceSkipsIngressInterface`), so it
+    // must NOT get a deny sentinel and must keep admitting host-bound bgp — the
+    // earlier fxp0/em0-only predicate would have armed a strand-management deny.
+    assert!(
+        !state.ifindex_host_inbound.contains_key(&LO0_IFINDEX),
+        "lo0 loopback lifeline must not get an empty-zone deny sentinel (#5659 fold)"
+    );
+    assert!(
+        host_inbound_admits_iface(&state, LO0_IFINDEX, 0, PROTO_TCP, 179, false, 0),
+        "lo0 loopback keeps host-bound bgp admit (router-id / update-source)"
     );
 
     // Anti-over-reject: the normal trust zone still admits its configured ssh.

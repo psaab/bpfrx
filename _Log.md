@@ -1,5 +1,21 @@
-## 2026-07-17 — #5659: empty-zone addressed-interface host-inbound fail-closed backstop
+## 2026-07-17 — #5659 fold: widen lifeline predicate to mirror userspaceSkipsIngressInterface
 
+- **Timestamp**: 2026-07-17 (fix/5659-empty-zone-host-inbound-failclosed, review fold)
+- **Action**: Folded the sole substantive finding from the independent hostile
+  review of PR #6065. `is_host_inbound_lifeline` matched only the exact `fxp0` /
+  `em0` names + `fab*`, NARROWER than the authoritative Go SSOT
+  `userspaceSkipsIngressInterface` (maps_sync.go), which excludes `fxp*` / `em*`
+  / `fab*` prefixes PLUS `lo0`. In the exact future case this backstop hardens
+  (a change binds a zoneless-addressed interface), the narrow predicate would
+  arm a deny sentinel on an unzoned-addressed `lo0` (router-id / BGP
+  `update-source` loopback) or an `fxp1` / `em1` → strand SSH/BGP-to-loopback /
+  break the HA heartbeat. Widened the predicate to
+  `starts_with("fxp") || starts_with("em") || starts_with("fab") || == "lo0"`,
+  documented the SSOT it mirrors + which arms are moot/handled-elsewhere, added a
+  `lo0`-no-sentinel test case, and updated forwarding/README.md.
+- **File(s)**: userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md
 - **Timestamp**: 2026-07-17 (fix/5659-empty-zone-host-inbound-failclosed)
 - **Action**: Closed the #2391 fail-closed-symmetry gap where an ADDRESSED
   interface with an EMPTY `security-zone` string is skipped by the
