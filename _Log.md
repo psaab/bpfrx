@@ -1,3 +1,33 @@
+## 2026-07-17 — #5162: GRE tunnel with mixed-family outer source/destination commits clean then silently drops
+
+- **Timestamp**: 2026-07-17 (fix/5162-gre-outer-family-gate)
+- **Action**: added a cross-field outer-family gate for non-WireGuard
+  tunnels. A GRE/IPIP tunnel whose outer `tunnel source` and `tunnel
+  destination` are different address families (v4 src + v6 dst, or the
+  reverse) passed per-leaf validation and COMMITTED CLEAN, but the Go
+  snapshot producer tags the endpoint `inet6` when EITHER endpoint is v6,
+  so the Rust GRE encoder hit the AF_INET6 arm, found a v4 endpoint, and
+  returned None → every encapsulated packet was silently dropped. New Go
+  strict commit gate `validateTunnelOuterFamilyStrict` (mirrors the
+  WireGuard endpoint-family gate — one encap = one outer family) rejects
+  the mixed pair at commit / commit-check and downgrades to a warning on
+  the tolerant load / peer-sync path (`lenientTunnelOuterFamily`, #1960
+  no-brick). Rust `populate_tunnel_endpoints` gains a helper-boundary
+  backstop that SKIPS a mixed-family non-WG row with a loud `eprintln!`
+  (mirrors the WG hydrate row-drop / allowed-ips skip-and-continue) for a
+  mixed-version peer-sync / corrupt snapshot the Go gate cannot cover.
+  Fail-on-revert tests verified RED both sides (Go commit-path reject,
+  Rust row-skip).
+- **File(s)**:
+  pkg/config/compiler_validate_tunnel_family.go (new gate),
+  pkg/config/compiler_tailgates.go (wire gate after the WG gate),
+  pkg/config/compiler.go (`lenientTunnelOuterFamily` flag + both lenient
+    entry points),
+  pkg/config/compiler_validate_tunnel_family_5162_test.go (new Go tests),
+  userspace-dp/src/afxdp/forwarding_build/tunnels.rs (Rust backstop skip),
+  userspace-dp/src/afxdp/forwarding_build/tests.rs (3 new Rust tests),
+  docs/feature-coverage.md (GRE row same-outer-family note)
+
 ## 2026-07-17 — #5620: IPsec passthrough claim needs a local-destination predicate
 
 - **Timestamp**: 2026-07-17 (fix/5620-ipsec-passthrough-local-dest)

@@ -355,7 +355,7 @@ The exact admission boundary is documented in
 | Screen/IDS (16 checks) | Yes; userspace SYN-cookie runtime is wired |
 | Firewall filters + policers | Filters yes; three-color policers admitted for the reviewed color-blind `then discard` slice; broader color-aware and non-drop action work is tracked as production hardening |
 | TCP MSS clamping | Yes |
-| GRE tunnel transit | Yes (passthrough) |
+| GRE tunnel transit | Yes (passthrough). **Same-outer-family required (#5162):** a GRE/IPIP tunnel's outer `tunnel source` and `tunnel destination` must be the SAME address family (both IPv4 or both IPv6). A mixed pair (v4 source + v6 destination, or the reverse) passes per-leaf validation but the snapshot producer tags it `inet6` whenever either endpoint is v6, so the encoder hits the AF_INET6 arm, finds the v4 endpoint, and silently drops every encapsulated packet. It is HARD-REJECTED at strict commit (`validateTunnelOuterFamilyStrict`, mirroring the WireGuard endpoint-family gate — one encap = one outer family), downgraded to a warning on the tolerant load / peer-sync path (#1960 no-brick), and the Rust `populate_tunnel_endpoints` independently SKIPS a mixed-family non-WG row with a loud diagnostic so a peer-synced degenerate row installs nothing rather than a blackhole |
 | IPsec / XFRM | Yes (passthrough) |
 | VLANs (802.1Q) | Yes |
 | Flow export (NetFlow v9) | Yes |
