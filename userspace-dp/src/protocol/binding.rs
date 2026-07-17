@@ -545,6 +545,16 @@ pub(crate) struct BindingStatus {
     /// it and Go/Rust read 0).
     #[serde(rename = "nat64_frag_dropped", default)]
     pub nat64_frag_dropped: u64,
+    /// #5623: fail-closed NAT64 SOURCE-ineligibility drops — an incoming IPv6
+    /// packet whose SOURCE lies within a configured Pref64 (a looping/synthesized
+    /// "already-translated" source, the RFC 6146 §5 hairpin construction — plus
+    /// the lower/upper Pref64 boundary and any embedded non-global v4) dropped
+    /// BEFORE route lookup, policy, or `allocate_source` per RFC 6146 §3.5.
+    /// Distinct from the pool counters (config/capacity on an ELIGIBLE flow) —
+    /// this is an input-validation reject. `default` keeps cross-version wire
+    /// safety (an older helper omits it and Go/Rust read 0).
+    #[serde(rename = "nat64_ineligible_source", default)]
+    pub nat64_ineligible_source: u64,
     /// #4477: source-NAT allocation failures (rule matched, no translated
     /// mapping could be allocated → packet dropped). `default` keeps the same
     /// cross-version wire safety as the siblings above (an older helper omits it

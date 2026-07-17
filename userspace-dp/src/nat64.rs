@@ -627,6 +627,20 @@ pub(crate) enum Nat64Match {
     /// the Go side emits for a no-source-pool rule) OR the stateful allocator
     /// is exhausted. The packet MUST be dropped, not routed as IPv6.
     MatchUnavailable,
+    /// #5623: the IPv6 SOURCE is Pref64-INELIGIBLE — it lies within a configured
+    /// NAT64 prefix, i.e. a looping/synthesized "already-translated" source (the
+    /// RFC 6146 §5 hairpin-loop construction). RFC 6146 §3.5 mandates dropping
+    /// every incoming IPv6 packet whose source contains Pref64. The high-96-bit
+    /// match subsumes the degenerate boundaries the issue calls out — the lower
+    /// boundary `<prefix>::` (embedded v4 `0.0.0.0`), the upper boundary
+    /// `<prefix>::ffff:ffff` (embedded v4 `255.255.255.255`), and any source
+    /// whose embedded v4 is non-global/looping (still inside the prefix). The
+    /// caller MUST drop fail-closed with a distinct counter BEFORE route lookup,
+    /// policy, or `allocate_source`, so no session/BIB/allocation state is minted
+    /// for a spoofed or looping source. A legitimate global-unicast source
+    /// outside every Pref64 never reaches this arm, so eligible traffic is
+    /// untouched.
+    IneligibleSource,
 }
 
 /// Parse a NAT64 source-pool IPv4 address that may carry a canonical host
@@ -908,6 +922,44 @@ impl Nat64State {
         None
     }
 
+    /// #5623: RFC 6146 §3.5 source-eligibility test. A NAT64 translator MUST
+    /// drop an incoming IPv6 packet whose SOURCE address itself lies within a
+    /// configured Pref64 — such a source is a synthesized / "already-translated"
+    /// address, the RFC 6146 §5 hairpin-loop construction. Comparing the high 96
+    /// bits against every configured prefix subsumes the degenerate cases the
+    /// issue enumerates:
+    ///   * the lower boundary `<prefix>::` (embedded v4 `0.0.0.0`),
+    ///   * the upper boundary `<prefix>::ffff:ffff` (embedded v4 `255.255.255.255`),
+    ///   * any source whose embedded v4 is non-global / looping (it is still
+    ///     inside the prefix, so it matches here).
+    ///
+    /// A legitimate global-unicast source outside every Pref64 never matches, so
+    /// eligible traffic is untouched (no over-reject). The scan is one pass over
+    /// the small prefix list — identical cost and shape to `match_ipv6_dest` —
+    /// and allocation-free, so it is safe on the session-miss hot path.
+    pub(crate) fn source_within_pref64(&self, src: Ipv6Addr) -> bool {
+        let octets = src.octets();
+        self.prefixes
+            .iter()
+            .any(|prefix| octets[..12] == prefix.prefix_bytes)
+    }
+
+    /// #5623: source-eligibility-gated NAT64 classification. Runs the RFC 6146
+    /// §3.5 source drop BEFORE the destination match, so a Pref64-sourced
+    /// (looping/synthesized) packet returns the distinct fail-closed
+    /// [`Nat64Match::IneligibleSource`] the caller counts and drops — it never
+    /// reaches route lookup, policy, or `allocate_source`, so no session, BIB,
+    /// or allocation state is minted for it. An eligible (non-Pref64) source
+    /// falls through to the unchanged [`Self::classify_ipv6_dest`], preserving
+    /// the exact forward v6→v4 behavior for every legitimate global-unicast
+    /// source.
+    pub(crate) fn classify_ipv6_packet(&self, src: Ipv6Addr, dst: Ipv6Addr) -> Nat64Match {
+        if self.source_within_pref64(src) {
+            return Nat64Match::IneligibleSource;
+        }
+        self.classify_ipv6_dest(dst)
+    }
+
     /// Tri-state NAT64 destination lookup (#2291).
     ///
     /// Returns [`Nat64Match::NoPrefixMatch`] when `dst` matches no configured
@@ -918,6 +970,11 @@ impl Nat64State {
     /// IPv6 destination upstream). This is the fail-closed replacement for the
     /// `match_ipv6_dest(...).and_then(allocate_v4_source)` chain that
     /// collapsed the unallocatable case into "no match".
+    ///
+    /// #5623: this stays destination-only; the source-eligibility gate lives in
+    /// [`Self::classify_ipv6_packet`], which calls this after clearing the
+    /// source. Callers on the forward IPv6 path should use `classify_ipv6_packet`
+    /// so an ineligible source is rejected before translation.
     pub(crate) fn classify_ipv6_dest(&self, dst: Ipv6Addr) -> Nat64Match {
         match self.match_ipv6_dest(dst) {
             None => Nat64Match::NoPrefixMatch,
