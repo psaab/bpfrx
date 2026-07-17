@@ -75,9 +75,9 @@ type statusSummaryAggregates struct {
 	policyRejectRateLimitDrops        uint64
 	filterRejectRateLimitDrops        uint64
 
-	snatPackets        uint64
-	dnatPackets        uint64
-	nat64Translations  uint64
+	snatPackets           uint64
+	dnatPackets           uint64
+	nat64Translations     uint64
 	nat64NoSourcePool     uint64
 	nat64PoolExhausted    uint64
 	nat64FragDropped      uint64
