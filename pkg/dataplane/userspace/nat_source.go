@@ -124,6 +124,24 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 							persistentNATInactivityTimeout = 300
 						}
 					}
+					// #5819: `persistent-nat` + `port no-translation` on the same
+					// pool is unsupported. The no-translation (address-only) path
+					// bypasses the persistent-lease machinery, so a config that
+					// claims persistence silently behaves as ordinary per-flow
+					// address-only NAT (no lease, no permit-scope reuse, and with
+					// global `source address-persistent` off the public address can
+					// change per flow). The strict commit gate
+					// (validateSourceNATPersistentNoTranslationStrict) hard-rejects
+					// this; on the tolerant load / peer-sync path that gate only
+					// warns, so fail CLOSED here — mark the pool unusable rather than
+					// ship the silent degradation. Full address-only persistent
+					// leases are a deferred #5819 follow-up.
+					if pool.PersistentNAT != nil && pool.PortNoTranslation {
+						slog.Warn("userspace snapshot: marking source NAT rule with persistent-nat + port no-translation unusable",
+							"rule", rule.Name, "pool", rule.Then.PoolName)
+						poolUnusable = true
+						poolUnusableReason = "persistent_nat_no_translation"
+					}
 					// #4559: deterministic CGNAT block-allocation params. Only
 					// meaningful for a usable pool with a valid port range; a
 					// zero mode leaves the dataplane on the round-robin path.
