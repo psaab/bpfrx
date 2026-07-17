@@ -1,3 +1,32 @@
+## 2026-07-17 — #5447: NAT64 frag-assoc install prunes EXPIRED before evicting a LIVE entry
+
+- **Timestamp**: 2026-07-17 (fix/5447-nat64-frag-prune-before-evict)
+- **Action**: The NAT64 fragment-association cache (`Nat64FragAssoc::install`,
+  userspace-dp/src/nat64.rs) evicted the OLDEST (front) entry on a full shard
+  with a bare `shard.remove(0)`, WITHOUT first pruning expired entries — only
+  `lookup` pruned (`retain(deadline_ns > now_ns)`) and there is no background GC.
+  Under a flood of first fragments (each a distinct ident → a fresh install) the
+  shard fills with entries, some already past their short (~2s) TTL, and the LRU
+  eviction sacrificed a still-LIVE association — whose non-first fragments had
+  not yet arrived — to an EXPIRED slot squatting at the front. Those legitimate
+  non-first fragments then miss and drop fail-closed (#4617). Fix: on a full
+  shard `install` now prunes expired entries first (`retain(|e| e.deadline_ns >
+  now_ns)`, the SAME monotonic clock `lookup` uses) and only evicts the oldest
+  LIVE entry if the shard is STILL at cap. When every entry is live the hard
+  capacity bound is unchanged. Added two RED-on-revert cargo unit tests
+  (`nat64_frag_assoc_install_prunes_expired_before_evicting_live` +
+  `..._all_live_still_evicts_oldest` control) that fill a single shard
+  deterministically via a colliding-ident helper. Reverting to the bare
+  `remove(0)` makes the live-survival test RED (`#5447: live association must
+  survive a first-fragment flood`) while the all-live capacity-bound control
+  stays green.
+- **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  _Log.md
+- **Validation**: `cargo build` clean; `cargo test --release nat64` green;
+  full `cargo test --release` green; RED-on-revert captured verbatim. Loss-
+  cluster fragment-transit smoke DEFERRED (obscured by pre-existing #6057/#6059);
+  fix is gated on the cargo RED-on-revert unit test.
+
 ## 2026-07-16 — #5364: stop verify-dataplane false-rejecting rolling deploys on the CPU-sized userspace_cpumap live pin
 
 - **Timestamp**: 2026-07-16 (fix/5364-cpumap-verify-possiblecpu)

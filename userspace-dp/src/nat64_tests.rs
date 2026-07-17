@@ -4445,3 +4445,158 @@ fn nat64_frag_assoc_ttl_evicts() {
     );
     assert_eq!(cache.len(), 0, "expired entry pruned");
 }
+
+/// Collect `count` distinct idents that all hash to the SAME shard for a fixed
+/// (family, src, dst). Lets the cap-eviction path be exercised deterministically
+/// on a single shard instead of relying on the statistical spread of the shared
+/// cache. Panics if not enough colliding idents are found in the scan window
+/// (16 shards -> ~1/16 of idents land in any one shard, so the window is ample).
+fn frag_idents_in_one_shard(
+    src: IpAddr,
+    dst: IpAddr,
+    family: u8,
+    count: usize,
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(count);
+    let target = nat64_frag_shard_index(&Nat64FragKey {
+        addr_family: family,
+        src,
+        dst,
+        ident: 0,
+    });
+    let mut ident: u32 = 0;
+    while out.len() < count && ident < 1_000_000 {
+        let key = Nat64FragKey {
+            addr_family: family,
+            src,
+            dst,
+            ident,
+        };
+        if nat64_frag_shard_index(&key) == target {
+            out.push(ident);
+        }
+        ident += 1;
+    }
+    assert!(
+        out.len() == count,
+        "wanted {count} colliding idents, found {}",
+        out.len(),
+    );
+    out
+}
+
+#[test]
+fn nat64_frag_assoc_install_prunes_expired_before_evicting_live() {
+    // #5447: under a first-fragment flood the shard fills with entries, some
+    // already EXPIRED. `install` on a full shard must reclaim an EXPIRED slot
+    // before it evicts the OLDEST (front) LIVE entry -- otherwise a live
+    // association whose non-first fragments have not yet arrived is dropped and
+    // those fragments fail closed.
+    //
+    // RED-on-revert: replace the prune-then-evict body with a bare
+    // `shard.remove(0)` and the LIVE association (installed FIRST, so it is the
+    // front/oldest) is evicted -> the final lookup for it misses.
+    let src = IpAddr::V6("2001:db8::1".parse().unwrap());
+    let dst = IpAddr::V6("64:ff9b::0808:0808".parse().unwrap());
+    let family = libc::AF_INET6 as u8;
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(8, 8, 8, 8),
+        5000,
+    ));
+
+    // Need CAP idents to fill one shard, plus one more for the flood install.
+    let idents = frag_idents_in_one_shard(src, dst, family, NAT64_FRAG_CAP_PER_SHARD + 1);
+    let mk = |ident: u32| Nat64FragKey {
+        addr_family: family,
+        src,
+        dst,
+        ident,
+    };
+
+    let cache = Nat64FragAssoc::new();
+
+    // The LIVE association: installed FIRST so it sits at the front (oldest by
+    // insertion order). Its deadline is FAR in the future.
+    let live_key = mk(idents[0]);
+    let live_now = 2 * NAT64_FRAG_TTL_NS; // deadline = 4*TTL
+    cache.install(live_key, decision, None, live_now);
+
+    // Fill the rest of the shard to cap with EXPIRED entries: installed at
+    // now=0 so their deadline is TTL, which the flood/lookup times below exceed.
+    for &ident in &idents[1..NAT64_FRAG_CAP_PER_SHARD] {
+        cache.install(mk(ident), decision, None, 0);
+    }
+    assert_eq!(
+        cache.len(),
+        NAT64_FRAG_CAP_PER_SHARD,
+        "shard filled to cap (1 live front + CAP-1 expired)",
+    );
+
+    // The flood: a NEW first fragment installs at a time past the expired
+    // deadlines but well within the LIVE entry's window.
+    let flood_now = NAT64_FRAG_TTL_NS + 1; // > TTL (expired) but < 4*TTL (live alive)
+    let new_key = mk(idents[NAT64_FRAG_CAP_PER_SHARD]);
+    cache.install(new_key, decision, None, flood_now);
+
+    // The LIVE association survived (expired slots were reclaimed first)...
+    assert!(
+        cache.lookup(&live_key, flood_now + 1).is_some(),
+        "#5447: live association must survive a first-fragment flood",
+    );
+    // ...and the NEW association was installed into a reclaimed slot.
+    assert!(
+        cache.lookup(&new_key, flood_now + 1).is_some(),
+        "new association installed into a reclaimed expired slot",
+    );
+}
+
+#[test]
+fn nat64_frag_assoc_install_all_live_still_evicts_oldest() {
+    // Control / capacity-bound preservation: when EVERY entry in a full shard is
+    // LIVE, pruning reclaims nothing, so `install` still evicts the OLDEST
+    // (front) entry -- the hard fixed ceiling is unchanged. This holds BOTH with
+    // and without the #5447 prune (the prune is a no-op when nothing is expired).
+    let src = IpAddr::V6("2001:db8::2".parse().unwrap());
+    let dst = IpAddr::V6("64:ff9b::0909:0909".parse().unwrap());
+    let family = libc::AF_INET6 as u8;
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 2),
+        Ipv4Addr::new(9, 9, 9, 9),
+        5001,
+    ));
+
+    let idents = frag_idents_in_one_shard(src, dst, family, NAT64_FRAG_CAP_PER_SHARD + 1);
+    let mk = |ident: u32| Nat64FragKey {
+        addr_family: family,
+        src,
+        dst,
+        ident,
+    };
+
+    let cache = Nat64FragAssoc::new();
+    // Fill the shard to cap with entries that are ALL live at the times below.
+    for &ident in &idents[..NAT64_FRAG_CAP_PER_SHARD] {
+        cache.install(mk(ident), decision, None, 1_000);
+    }
+    assert_eq!(cache.len(), NAT64_FRAG_CAP_PER_SHARD, "shard filled to cap");
+
+    let oldest_key = mk(idents[0]);
+    let new_key = mk(idents[NAT64_FRAG_CAP_PER_SHARD]);
+    // Install a NEW key while every existing entry is still live.
+    cache.install(new_key, decision, None, 1_000);
+
+    // The oldest (front) live entry is evicted -- capacity bound preserved.
+    assert!(
+        cache.lookup(&oldest_key, 1_000).is_none(),
+        "capacity bound: oldest live entry evicted when the shard is all-live",
+    );
+    assert!(
+        cache.lookup(&new_key, 1_000).is_some(),
+        "new entry installed",
+    );
+    assert!(
+        cache.len() <= NAT64_FRAG_CAP_PER_SHARD,
+        "shard never exceeds cap",
+    );
+}
