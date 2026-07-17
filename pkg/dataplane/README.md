@@ -124,14 +124,34 @@ Guard layers (`build-userspace-xdp.sh`):
    generate-userspace-xdp`." A **live-pin mismatch**
    (`validateUserspaceShimLivePins`) is the OPPOSITE situation: it compares
    this build's embedded shim against the RUNNING (old) daemon's pinned
-   map, so the pin is ALWAYS the stale side — in the upgrade direction
-   (embedded `MaxEntries` > pinned, e.g. the `userspace_cpumap` 16→256
-   bump) AND in a downgrade. The embedded shim is the intended, un-broken
-   target, so `make generate` is the WRONG action; instead it prints
-   `userspaceShimStalePinRemediation`, directing a FULL dataplane reload
-   (stop xpfd so the old pin is released, then start it to load the new
-   shim). A rolling deploy cannot cross a shim-map ABI change because the
-   new map can only be pinned after the stale pin is released.
+   map, so the pin is ALWAYS the stale side. The embedded shim is the
+   intended, un-broken target, so `make generate` is the WRONG action;
+   instead it prints `userspaceShimStalePinRemediation`, directing a FULL
+   dataplane reload (stop xpfd so the old pin is released, then start it to
+   load the new shim). A rolling deploy cannot cross a genuine shim-map ABI
+   change because the new map can only be pinned after the stale pin is
+   released.
+
+   **CPUMAP MaxEntries is CPU-sized, not a stale-pin signal (#5364):**
+   `userspace_cpumap` is a `BPF_MAP_TYPE_CPUMAP`. The shim declares it as
+   `CpuMap::with_max_entries(256, 0)` — a template MAX — but cilium/ebpf's
+   `MapSpec.fixupMagicFields` clamps a CPUMAP's `MaxEntries` to
+   `nr_possible_cpus` before it creates OR ABI-compares the map, so a fresh
+   daemon ALWAYS pins it at `nr_possible_cpus` (16 on the loss VMs), never
+   256. Because `MapSpec.Compatible` (the exact `ErrMapIncompatible` check
+   this pre-flight predicts) runs the identical clamp, the real PinByName
+   load compares `nr_possible_cpus == nr_possible_cpus` and succeeds. The
+   pre-flight therefore resolves the reference `MaxEntries` through
+   `livePinRefABI`, which applies the same clamp for a CPUMAP — so the old
+   "`cpumap=16` pin vs embedded `cpumap=256` shim" diff (mischaracterized as
+   a stale 16→256 ABI bump, which false-rejected EVERY rolling
+   cluster-deploy) is no longer produced. The relaxation is scoped to the
+   `MaxEntries` axis of the CPUMAP only: no other ABI-checked shim map is
+   CPU-count-sized (per-CPU ARRAY/HASH maps keep their declared `MaxEntries`
+   and replicate the VALUE per-CPU; XskMap keeps its declared size), so every
+   other map keeps a strict `MaxEntries` check, and a genuine cpumap
+   Type/KeySize/ValueSize/Flags break still yields the full-reload
+   remediation.
 
    **Residual (documented, not caught here):** a *same-size* Go/Rust
    value **field reorder** — identical `KeySize`/`ValueSize`/`Type`/
@@ -146,7 +166,13 @@ Guard layers (`build-userspace-xdp.sh`):
    `TestVerifyUserspaceShimShrinkEquivalence` proves the verify-only
    hash-map MaxEntries shrink (memory hygiene for live-node
    pre-flights) never changes the verifier verdict, using the
-   preserved incident object in `testdata/`.
+   preserved incident object in `testdata/`. The #5364 cpumap
+   CPU-count-clamp handling is covered by
+   `TestCPUMapLivePinPossibleCPUAccepted` (a CPU-sized cpumap live pin is
+   accepted, not false-rejected), `TestCPUMapLivePinGenuineBreakStillRejected`
+   (a genuine cpumap ValueSize break is still rejected), and
+   `TestNonCPUMapMaxEntriesStillStrict` (no other map's MaxEntries check is
+   weakened).
 
 **Recovery runbook** (symptom: `load Rust xdp_userspace collection:
 ... BPF program is too large. Processed 1000001 insn`, daemon in
