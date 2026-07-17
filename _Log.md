@@ -51,6 +51,43 @@
   userspace-dp/src/afxdp/poll_descriptor/filter.rs,
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/filter/README.md, _Log.md
+## 2026-07-16 — #6015 ddns cross-surface deterministic suppression tie-break (close window (b))
+
+- **Timestamp**: 2026-07-16 (fix/6015-ddns-suppression-tiebreak)
+- **Action**: Closed the #5748/#6012 cross-surface mutual-suppression window (b):
+  when BOTH ownership surfaces (Surface B lease `Manager`, Surface A
+  `SurfaceAManager`) tore down the SAME co-owned wire RR in overlapping passes,
+  each read the OTHER's pre-rebuild end-of-pass snapshot (still listing the RR
+  owned) and each suppress-and-RELEASED → the RR was left on the wire UNOWNED.
+  Fix: a deterministic tie-break. Surface B (lease Manager) is the SOLE
+  SUPPRESSION AUTHORITY — it alone suppress-and-releases a cross-surface co-owned
+  RR (UNCHANGED from #6012). Surface A is the NON-AUTHORITY: on a co-owned-RR
+  teardown it does NOT delete (would clobber B's still-owned RR — the #6012
+  caution) and does NOT suppress-and-release (the window-(b) orphan); instead it
+  DEFERS — RE-ASSERTS (re-UPSERTs) the RR so a leaked RR self-heals, and KEEPS its
+  ownership claim, retrying the teardown each pass until the lease authority has
+  RELEASED (a later pass finds `leaseWireRRCoowner` false and deletes + releases
+  normally). Because B always releases first and A always defers-until-B-is-gone,
+  exactly one surface ever deletes a cross-surface co-owned RR: mutual suppression
+  can never orphan it and A never clobbers B. `rebuildWireRRClaimsLocked` keeps
+  advertising A's deferred claim so B still sees the co-ownership. Window (a) (a
+  just-published co-owner not yet in the peer snapshot) is accepted as-is
+  (operator-repairable via `request system dynamic-dns update`; the new A re-assert
+  self-heals it on the next deferred pass).
+- **File(s)**: pkg/ddns/surface_a.go (withdrawOwnedLocked defer+re-assert branch,
+  SurfaceAStats.DeleteCoowned doc), pkg/ddns/cross_surface_clobber_5748_test.go
+  (updated TestSurfaceATeardownSuppressedByLeaseCoowner_5748 →
+  TestSurfaceATeardownDefersToLeaseCoowner_5748_6015; added
+  TestCrossSurfaceMutualTeardownNotOrphaned_6015), pkg/ddns/README.md
+  (Cross-surface co-ownership → #6015 tie-break).
+- **Validation**: `go build ./...` clean; `go vet ./pkg/ddns` clean; `go test
+  -race ./pkg/ddns` green (whole suite incl. #6012 cross-surface tests). Both new
+  guards proven RED-on-revert firsthand: neutralizing the deferred keep-claim
+  (`if false && deferredCoowned > 0`) → window-(b) test orphans (Scopes=0) RED;
+  naive "A always deletes" (delete instead of defer) → no-clobber test issues a
+  wire DELETE of the lease-co-owned RR RED. STEP 0: window (b) confirmed live on
+  origin/master 60067bedb (both surfaces rebuild snapshots at end-of-pass, both
+  suppress-and-release, no tie-break).
 
 ## 2026-07-16 — #6036 fold: deterministic per-interface RA prefix order (#5861)
 
