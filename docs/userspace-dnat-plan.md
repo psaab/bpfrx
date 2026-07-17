@@ -938,6 +938,31 @@ Scope: literal `match destination-address` values are checked; address-book-NAME
 matches are out of scope (resolving them needs the address-book fold, and the
 common case uses a literal address).
 
+**Interface-mode-SNAT exclusion (rev6052): only fires when the address is
+genuinely kernel-local.** An interface address is NOT always kernel-local. When
+an interface-mode source-NAT rule translates traffic TO a zone, the dataplane
+moves every address of that zone's interfaces OUT of the kernel-local set and
+INTO `interface_nat` (`nat_translated_local_exclusions`,
+`userspace-dp/src/afxdp/rst.rs`). `is_local_destination` then short-circuits to
+FALSE for such an address (it checks `USERSPACE_INTERFACE_NAT` membership BEFORE
+the `local_v4`/`local_v6` check), so the first SYN reaches the helper and inbound
+DNAT / static-NAT DOES apply — the translation is NOT inert. Warning on it would
+be a false-warn on the CANONICAL masquerade + WAN-port-forward config (interface
+SNAT `trust`→`untrust` + a DNAT from `untrust` matching the untrust interface's
+own WAN-IP). The advisory therefore excludes any matched address that
+interface-mode source-NAT routes into `interface_nat`: it iterates
+`cfg.Security.NAT.Source`, collects the to-zone of every rule that is
+`interface_mode && !off && to_zone != ""` (mirroring the rst.rs predicate
+exactly), and excludes the configured addresses of every interface in those
+zones. The Go mirror excludes the SAFE SUPERSET (all configured unit addresses of
+a to-zone interface, not just the single `pick_interface_v4/v6` result), so it
+can never false-warn; it may only slightly under-warn on a genuinely-inert
+SECONDARY (non-picked) address of a multi-address interface. VRRP VIPs are NOT
+excluded — `pick_interface_v4/v6` reads configured interface addresses, never
+VIPs, so a VIP stays kernel-local and a DNAT/static match on it is still inert
+(still warns). The advisory now fires only when the address is genuinely
+kernel-local, not when it is interface-NAT-routed.
+
 **Track-2 (deferred): the full dataplane fix.** A dedicated intent map probed
 before the local classification (Option B) is a large, verifier-gated, HA-aware
 project deferred by the converged #5837 research plan

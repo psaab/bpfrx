@@ -177,3 +177,81 @@ func TestDNATPoolAddressIsInterfaceNoWarn(t *testing.T) {
 		t.Fatalf("pool-address collision is not the #5837 bypass; must not warn, got: %v", ws)
 	}
 }
+
+// #5837 rev6052 (fold): interface-mode source-NAT to a zone routes THAT zone's
+// interface addresses out of the kernel-local set and into interface_nat (the
+// dataplane's nat_translated_local_exclusions, userspace-dp/src/afxdp/rst.rs).
+// is_local_destination then returns FALSE for such an address — it short-circuits
+// on USERSPACE_INTERFACE_NAT membership BEFORE the local_v4/v6 check — so the
+// first SYN reaches the helper and inbound DNAT applies. The translation is NOT
+// inert, so the advisory must be SUPPRESSED. This is the canonical masquerade +
+// WAN-port-forward config (interface SNAT trust->untrust + DNAT from untrust
+// matching the untrust interface's own WAN-IP). Reverting the exclusion
+// (interfaceModeSNATExcludedAddresses / the `if excluded[host]` guard) makes this
+// warn again — RED.
+func TestDNATInterfaceAddressExcludedByInterfaceSNAT_5837(t *testing.T) {
+	lines := []string{
+		// trust (LAN) interface + zone
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.61.1/24",
+		"set security zones security-zone trust interfaces ge-0/0/1.0",
+		// untrust (WAN) interface + zone — its own address is the WAN-IP
+		"set interfaces ge-0/0/2 unit 0 family inet address 172.16.50.8/24",
+		"set security zones security-zone untrust interfaces ge-0/0/2.0",
+		// interface-mode source-NAT trust -> untrust (canonical masquerade)
+		"set security nat source rule-set S from zone trust",
+		"set security nat source rule-set S to zone untrust",
+		"set security nat source rule-set S rule R match source-address 10.0.61.0/24",
+		"set security nat source rule-set S rule R then source-nat interface",
+		// WAN port-forward: DNAT from untrust matching the untrust WAN-IP
+		"set security nat destination pool P1 address 10.0.30.100",
+		"set security nat destination rule-set RD from zone untrust",
+		"set security nat destination rule-set RD rule R1 match destination-address 172.16.50.8/32",
+		"set security nat destination rule-set RD rule R1 then destination-nat pool P1",
+	}
+	cfg, err := CompileConfig(buildTree(t, lines))
+	if err != nil {
+		t.Fatalf("config must compile, got: %v", err)
+	}
+	if ws := nat5837Warnings(cfg); len(ws) != 0 {
+		t.Fatalf("interface-mode SNAT routes the WAN-IP into interface_nat; the "+
+			"DNAT is NOT inert and must not warn (rev6052 false-warn), got: %v", ws)
+	}
+}
+
+// Keep-green control: interface-mode source-NAT exists but its to-zone is NOT
+// the zone that owns the matched WAN-IP, so that address stays kernel-local (it
+// is not routed into interface_nat) and the DNAT is still inert — it must STILL
+// warn. Proves the exclusion is to-zone scoped (mirrors the rst.rs predicate),
+// not a blanket "any interface-mode SNAT suppresses every advisory".
+func TestDNATInterfaceAddressStillWarnsWhenSNATToOtherZone_5837(t *testing.T) {
+	lines := []string{
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.61.1/24",
+		"set security zones security-zone trust interfaces ge-0/0/1.0",
+		"set interfaces ge-0/0/2 unit 0 family inet address 172.16.50.8/24",
+		"set security zones security-zone untrust interfaces ge-0/0/2.0",
+		"set interfaces ge-0/0/3 unit 0 family inet address 10.0.30.10/24",
+		"set security zones security-zone dmz interfaces ge-0/0/3.0",
+		// interface-mode SNAT trust -> DMZ (NOT untrust)
+		"set security nat source rule-set S from zone trust",
+		"set security nat source rule-set S to zone dmz",
+		"set security nat source rule-set S rule R match source-address 10.0.61.0/24",
+		"set security nat source rule-set S rule R then source-nat interface",
+		// DNAT from untrust matching the untrust WAN-IP — untrust is NOT the SNAT to-zone
+		"set security nat destination pool P1 address 10.0.30.100",
+		"set security nat destination rule-set RD from zone untrust",
+		"set security nat destination rule-set RD rule R1 match destination-address 172.16.50.8/32",
+		"set security nat destination rule-set RD rule R1 then destination-nat pool P1",
+	}
+	cfg, err := CompileConfig(buildTree(t, lines))
+	if err != nil {
+		t.Fatalf("config must compile, got: %v", err)
+	}
+	ws := nat5837Warnings(cfg)
+	if len(ws) != 1 {
+		t.Fatalf("SNAT to a different zone must not exclude the untrust WAN-IP; "+
+			"expected exactly 1 advisory, got %d: %v", len(ws), ws)
+	}
+	if !strings.Contains(ws[0], "172.16.50.8") {
+		t.Fatalf("advisory should name the WAN-IP, got: %s", ws[0])
+	}
+}

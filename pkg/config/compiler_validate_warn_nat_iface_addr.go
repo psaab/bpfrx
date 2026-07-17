@@ -116,10 +116,119 @@ func interfaceLocalAddressIndex(cfg *Config) map[string]string {
 	return out
 }
 
+// interfaceModeSNATExcludedAddresses mirrors the userspace-dp dataplane's
+// nat_translated_local_exclusions (userspace-dp/src/afxdp/rst.rs:15-40): it
+// returns the set of normalized host IPs the dataplane moves OUT of the
+// kernel-local set and INTO interface_nat_v4/v6. Those addresses are therefore
+// NOT classified kernel-local by is_local_destination (which short-circuits to
+// FALSE for a USERSPACE_INTERFACE_NAT member BEFORE the local_v4/v6 check), so a
+// DNAT / static-NAT rule matching one of them is NOT inert on the first packet —
+// the SYN reaches the helper and inbound DNAT applies (static_nat.rs inbound DNAT
+// is not gated on local membership). Warning on such a rule is a false-warn; the
+// #5837 rev6052 fold excludes these addresses.
+//
+// Predicate mirror (rst.rs): collect the to-zone of every source-NAT rule that is
+// interface-mode, not `off`, and has a non-empty to-zone
+// (rule.interface_mode && !rule.off && !rule.to_zone.is_empty()); then, for every
+// interface whose security zone is in that to-zone set, the dataplane excludes
+// that interface's picked v4/v6 address (pick_interface_v4/v6). The Go predicate
+// mirrors the snapshot mapping exactly: SourceNATRuleSnapshot.InterfaceMode is
+// rule.Then.Interface, .Off is rule.Then.Off, and .ToZone is the rule-set ToZone
+// (pkg/dataplane/userspace/nat_source.go:185-194).
+//
+// This mirror uses the SAFE SUPERSET: it excludes EVERY configured address of
+// such an interface unit, not just the single pick_interface_v4/v6 result. The
+// superset can never false-warn (the whole point of this fold — the canonical
+// masquerade + WAN-port-forward config no longer trips the advisory); it can only
+// slightly UNDER-warn on a genuinely-inert SECONDARY (non-picked) address of a
+// multi-address interface, an accepted trade vs a false-warn on the canonical
+// config, and one that also insulates the commit-time check from the kernel /
+// config address-ordering divergence a runtime pick_interface would see. VRRP
+// VIPs are deliberately NOT excluded: pick_interface_v4/v6 iterates
+// iface.addresses (configured unit addresses), never VIPs, so the dataplane keeps
+// a VIP kernel-local and a DNAT/static match on a VIP stays genuinely inert (it
+// must still warn).
+func interfaceModeSNATExcludedAddresses(cfg *Config) map[string]bool {
+	if cfg == nil {
+		return nil
+	}
+	// Step 1: the interface-mode SNAT to-zone set (rst.rs predicate).
+	toZones := make(map[string]bool)
+	for _, rs := range cfg.Security.NAT.Source {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			if rule.Then.Interface && !rule.Then.Off && rs.ToZone != "" {
+				toZones[rs.ToZone] = true
+			}
+		}
+	}
+	if len(toZones) == 0 {
+		return nil
+	}
+	// Step 2: every interface unit whose security zone is in that to-zone set;
+	// exclude all of its configured addresses (safe superset of the dataplane's
+	// pick_interface_v4/v6). zoneByIface keys both `name.unit` and (when a bare
+	// interface is zone-listed) the physical `name`, so try the unit key first.
+	zoneByIface := buildZoneInterfaceMapLocal(cfg)
+	if len(zoneByIface) == 0 {
+		return nil
+	}
+	excluded := make(map[string]bool)
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, name)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		ifc := cfg.Interfaces.Interfaces[ifName]
+		if ifc == nil {
+			continue
+		}
+		unitNums := make([]int, 0, len(ifc.Units))
+		for un := range ifc.Units {
+			unitNums = append(unitNums, un)
+		}
+		sort.Ints(unitNums)
+		for _, un := range unitNums {
+			unit := ifc.Units[un]
+			if unit == nil {
+				continue
+			}
+			unitName := fmt.Sprintf("%s.%d", ifName, un)
+			zone := zoneByIface[unitName]
+			if zone == "" {
+				zone = zoneByIface[ifName]
+			}
+			if zone == "" || !toZones[zone] {
+				continue
+			}
+			for _, a := range unit.Addresses {
+				if host, _ := hostLocalAddrFamily(a); host != "" {
+					excluded[host] = true
+				}
+			}
+		}
+	}
+	if len(excluded) == 0 {
+		return nil
+	}
+	return excluded
+}
+
 // validateNATInterfaceAddressCollisionWarnings emits the Track-1 (#5837)
 // commit-time advisory for each destination-NAT / static-NAT rule whose public
 // (matched / external) destination address equals a configured interface address.
 // See the file header for the mechanism. WARN-only, both compile paths.
+//
+// An address that interface-mode source-NAT routes into interface_nat (the
+// dataplane's nat_translated_local_exclusions) is EXCLUDED: it is not
+// kernel-local, so a DNAT/static match on it is not inert — warning there is the
+// #5837 rev6052 false-warn on the canonical masquerade + WAN-port-forward config.
 func validateNATInterfaceAddressCollisionWarnings(cfg *Config) []string {
 	if cfg == nil {
 		return nil
@@ -128,6 +237,7 @@ func validateNATInterfaceAddressCollisionWarnings(cfg *Config) []string {
 	if len(ifAddrs) == 0 {
 		return nil
 	}
+	excluded := interfaceModeSNATExcludedAddresses(cfg)
 	var warnings []string
 
 	// Destination NAT: the address the outside world targets is the rule's
@@ -150,6 +260,11 @@ func validateNATInterfaceAddressCollisionWarnings(cfg *Config) []string {
 					host, _ := hostLocalAddrFamily(addr)
 					if host == "" {
 						continue
+					}
+					if excluded[host] {
+						continue // interface-mode SNAT routes this addr into
+						// interface_nat (rst.rs) — NOT kernel-local, so the DNAT
+						// translation is not inert (#5837 rev6052).
 					}
 					if iface, ok := ifAddrs[host]; ok {
 						warnings = append(warnings, fmt.Sprintf(
@@ -188,6 +303,11 @@ func validateNATInterfaceAddressCollisionWarnings(cfg *Config) []string {
 			host, _ := hostLocalAddrFamily(rule.Match)
 			if host == "" {
 				continue
+			}
+			if excluded[host] {
+				continue // interface-mode SNAT routes this addr into interface_nat
+				// (rst.rs) — NOT kernel-local, so the static translation is not
+				// inert (#5837 rev6052).
 			}
 			if iface, ok := ifAddrs[host]; ok {
 				warnings = append(warnings, fmt.Sprintf(
