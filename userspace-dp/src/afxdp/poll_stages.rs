@@ -896,6 +896,22 @@ pub(super) enum IpsecPassthroughOutcome {
 /// still enforced on the PRIMARY path by the kernel nftables host-inbound chain
 /// (`pkg/daemon/daemon_nft.go`).
 ///
+/// #5620: the kernel-XFRM passthrough short-circuit is claimed ONLY when the
+/// packet's (post-GRE-decap, on-the-wire) destination is an address the
+/// firewall itself answers for (`forwarding.owns_configured_ip` — configured
+/// interface IPs incl. the SNAT/WAN IP and any VIP, plus the static-NAT/DNAT
+/// externals appended to `local_v*`). Stage 11 runs BEFORE NAT resolution, so
+/// `flow.dst_ip` is the RAW destination; because the NAT externals are already
+/// members of the local set, the raw-dst check still recognises the legitimate
+/// SECONDARY-path cases — DNAT/static-NAT-to-self IKE (the external is a
+/// firewall-owned address) and native-GRE-inner local IPsec (the decapped
+/// inner destination is a firewall interface address). A remote / transit ESP,
+/// AH or IKE destination is owned by nobody here → `NotClaimed`, so the packet
+/// is NOT reinjected to the local XFRM stack and instead continues to normal
+/// transit forwarding + zone-policy evaluation. Without this predicate any
+/// ESP/AH/IKE packet — including one transiting to a remote host — bypassed
+/// transit policy.
+///
 /// Non-IPsec packets fall through unchanged (`NotClaimed`).
 #[inline]
 pub(super) fn stage_ipsec_passthrough_check(
@@ -911,6 +927,29 @@ pub(super) fn stage_ipsec_passthrough_check(
     };
     let dst_port = flow.forward_key.dst_port;
     if !is_ipsec_traffic(meta.protocol, dst_port) {
+        return IpsecPassthroughOutcome::NotClaimed;
+    }
+    // #5620: claim the kernel-XFRM passthrough short-circuit ONLY for
+    // IPsec whose destination is a firewall-local address. Stage 11 runs
+    // BEFORE NAT resolution (only GRE decap precedes it), so `flow.dst_ip`
+    // is the RAW on-the-wire destination — but `owns_configured_ip` already
+    // includes the static-NAT/DNAT externals appended to `local_v*`, so this
+    // still claims DNAT/static-NAT-to-self IKE and native-GRE-inner local
+    // IPsec (whose decapped inner dst is a firewall interface address). A
+    // remote / transit ESP/AH/IKE destination is owned by nobody here →
+    // `NotClaimed`, so the packet is NOT reinjected to the local stack and
+    // instead continues to transit forwarding + zone-policy evaluation. This
+    // gate runs BEFORE the #4323 host-inbound admission block, which only
+    // makes sense for genuinely host-inbound (local-destined) IKE.
+    //
+    // Caveat: a DNAT external that maps to ANOTHER host (transit-DNAT IPsec,
+    // e.g. IKE VIP -> internal gateway) is ALSO in `local_v*` (proxy-ARP/ND
+    // ownership), so this raw-dst check still claims it as local passthrough
+    // rather than DNAT-forwarding it onward. That exotic case is UNCHANGED by
+    // #5620 — pre-#5620 Stage 11 claimed ALL IPsec, so it was already
+    // reinjected locally; #5620 only fixes the transit-to-REMOTE bypass and
+    // leaves the transit-DNAT-to-another-host behavior bit-identical.
+    if !worker_ctx.forwarding.owns_configured_ip(flow.dst_ip) {
         return IpsecPassthroughOutcome::NotClaimed;
     }
     // #4323 Option B: gate ONLY a NEW inbound IKE initiation; ESP/AH and every

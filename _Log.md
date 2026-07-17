@@ -1,3 +1,38 @@
+## 2026-07-17 — #5620: IPsec passthrough claim needs a local-destination predicate
+
+- **Timestamp**: 2026-07-17 (fix/5620-ipsec-passthrough-local-dest)
+- **Action**: `stage_ipsec_passthrough_check` (Stage 11) claimed ANY
+  ESP/AH/IKE packet the shim steered to the helper for kernel-XFRM
+  passthrough, with no check that the destination was firewall-local — so a
+  TRANSIT UDP/500, UDP/4500 or IPv4 AH packet routed to a remote host was
+  reinjected to the local XFRM stack and SKIPPED transit zone policy
+  (codex-review-181 M03, High). Added a local-destination predicate:
+  `if !worker_ctx.forwarding.owns_configured_ip(flow.dst_ip) { return
+  NotClaimed; }` immediately after the `is_ipsec_traffic` gate and BEFORE the
+  #4323 host-inbound admission block. Stage 11 runs BEFORE NAT resolution
+  (only native-GRE decap precedes it), so `flow.dst_ip` is the RAW dst — but
+  `owns_configured_ip` (`configured_iface_v* ∪ local_v*`) already includes the
+  static-NAT/DNAT externals appended to `local_v*` in `forwarding_build`, so
+  the raw-dst check still claims DNAT/static-NAT-to-self IKE and native-GRE
+  inner local IPsec, and covers the SNAT/WAN interface IP + VIPs that
+  `local_v*` alone excludes. Raw outer ESP was never reachable here (the shim
+  shunts it to the kernel unconditionally), so only the shim-steered UDP-IKE /
+  IPv4-AH transit classes were the live bypass. Preserved the #4323
+  NEW-inbound-IKE host-inbound gate (runs after, only for local-destined IKE).
+- **File(s)**: `userspace-dp/src/afxdp/poll_stages.rs` (predicate + stage doc
+  comment), `userspace-dp/src/afxdp/poll_stages_tests.rs` (retargeted
+  `ipsec_flow` default dst to firewall-local, added `ipsec_flow_to` variant +
+  `run_stage11` harness + `stage_ipsec_passthrough_rejects_remote_transit_dst_5620`
+  RED-on-revert test + `stage_ipsec_passthrough_claims_local_and_nat_to_self_dst_5620`
+  over-reject/DNAT-to-self guard), `userspace-dp/src/afxdp/forwarding/README.md`
+  (#5620 subsection), `docs/host-inbound-service-matrix.md` (SECONDARY-path
+  scope note).
+- **Validation**: `cargo build --release` green; `cargo test --release`
+  poll/forwarding/ipsec filters → 335 passed, 0 failed incl. the 2 new tests
+  and the updated exempt/#4323 tests. RED-on-revert verified firsthand: with
+  the predicate neutralized (`if false && ...`, imports still used), both new
+  tests FAIL while the existing tests stay green.
+
 ## 2026-07-17 — #5659 fold: widen lifeline predicate to mirror userspaceSkipsIngressInterface
 
 - **Timestamp**: 2026-07-17 (fix/5659-empty-zone-host-inbound-failclosed, review fold)

@@ -2152,17 +2152,31 @@ fn fabric_ingress_skips_rate_flood_direct_still_counts_4155() {
 //      and leaves non-IPsec traffic untouched (`Continue`).
 // If Option B is ever implemented these tests must be updated deliberately.
 
+/// A firewall-LOCAL-destined IPsec flow. Since #5620, Stage 11 claims the
+/// kernel-XFRM passthrough short-circuit ONLY when `flow.dst_ip` is an address
+/// the firewall owns, so the exemption / host-inbound-gate assertions below —
+/// which are all about LOCAL-destined IPsec — must use a firewall-local
+/// destination. `10.0.61.1` / `2001:559:8585:ef00::1` is the lan interface IP
+/// in both the `nat_snapshot` and `ike_gate_snapshot` fixtures (it lives in
+/// `local_v*` AND `configured_iface_v*`). Remote/transit-destination cases use
+/// [`ipsec_flow_to`] with a non-firewall address.
 fn ipsec_flow(family: i32, protocol: u8, dst_port: u16) -> SessionFlow {
-    let (src_ip, dst_ip) = if family == libc::AF_INET6 {
-        (
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10)),
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1)),
-        )
+    let dst_ip = if family == libc::AF_INET6 {
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x559, 0x8585, 0xef00, 0, 0, 0, 0x1))
     } else {
-        (
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
-            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
-        )
+        IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1))
+    };
+    ipsec_flow_to(family, protocol, dst_port, dst_ip)
+}
+
+/// As [`ipsec_flow`] but with an explicit destination — used by the #5620
+/// remote/transit-destination tests (a non-firewall dst that `owns_configured_ip`
+/// rejects) and the DNAT-to-self preservation test (a NAT external in `local_v*`).
+fn ipsec_flow_to(family: i32, protocol: u8, dst_port: u16, dst_ip: IpAddr) -> SessionFlow {
+    let src_ip = if family == libc::AF_INET6 {
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10))
+    } else {
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))
     };
     SessionFlow {
         src_ip,
@@ -2633,4 +2647,230 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
         ),
         "raw ESP must stay unconditionally exempt on any zone (#4323)",
     );
+}
+
+/// #5620 test harness: run Stage 11 against `forwarding` with a full but inert
+/// (`slow_path: None`) WorkerContext and return the stage outcome. The frame /
+/// meta are supplied by the caller; the ingress ifindex (24) matches the lan
+/// interface in `nat_snapshot`, so the #4323 host-inbound resolve keys the lan
+/// zone (which carries `system-services all`).
+fn run_stage11(
+    forwarding: &ForwardingState,
+    flow: &SessionFlow,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+) -> IpsecPassthroughOutcome {
+    let ident = BindingIdentity {
+        slot: 0,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from("reth1.0"),
+        ifindex: 24,
+    };
+    let live = BindingLiveState::new();
+    let binding_lookup = WorkerBindingLookup::default();
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        neighbor_resolver: None,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+    stage_ipsec_passthrough_check(Some(flow), frame, meta, None, &live, &worker_ctx)
+}
+
+/// #5620 RED-on-revert: Stage 11 must NOT claim the kernel-XFRM passthrough
+/// short-circuit for IPsec whose destination is REMOTE (not a firewall-local
+/// address). Before the fix, `is_ipsec_traffic` claimed ANY ESP/AH/IKE packet
+/// regardless of destination, so a TRANSIT ESP/AH/IKE packet was reinjected to
+/// the local XFRM stack and skipped transit zone-policy enforcement.
+///
+/// A remote-destination UDP/500, UDP/4500, IPv4 AH (proto 51), IPv4 ESP
+/// (proto 50) and IPv6 ESP packet must each return `NotClaimed` so it falls
+/// through to normal transit forwarding + policy.
+///
+/// Fail-on-revert: drop the `owns_configured_ip(flow.dst_ip)` predicate in
+/// `stage_ipsec_passthrough_check` and every assertion below flips to
+/// `Passthrough` — the transit-policy bypass returns.
+#[test]
+fn stage_ipsec_passthrough_rejects_remote_transit_dst_5620() {
+    let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
+
+    // Frame bytes are immaterial: the #5620 predicate returns `NotClaimed`
+    // before `classify_ipsec_admission` ever parses the frame. Classification
+    // keys on `meta.protocol` + `flow.forward_key.dst_port` + `flow.dst_ip`.
+    let frame = tcp_v4_frame(
+        Ipv4Addr::new(192, 0, 2, 10),
+        Ipv4Addr::new(198, 51, 100, 1),
+        40000,
+        500,
+        TCP_FLAG_ACK,
+        1,
+        1,
+    );
+    let remote_v4 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+    let remote_v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1));
+
+    // (family, proto, dst_port, remote_dst, label)
+    let cases: [(i32, u8, u16, IpAddr, &str); 5] = [
+        (libc::AF_INET, PROTO_UDP, 500, remote_v4, "IKE UDP/500 v4"),
+        (libc::AF_INET, PROTO_UDP, 4500, remote_v4, "NAT-T UDP/4500 v4"),
+        (libc::AF_INET, PROTO_AH, 0, remote_v4, "AH proto 51 v4"),
+        (libc::AF_INET, PROTO_ESP, 0, remote_v4, "ESP proto 50 v4"),
+        (libc::AF_INET6, PROTO_ESP, 0, remote_v6, "ESP proto 50 v6"),
+    ];
+    for (family, protocol, dst_port, dst_ip, label) in cases {
+        let flow = ipsec_flow_to(family, protocol, dst_port, dst_ip);
+        let mut meta = tcp_v4_meta(&frame, TCP_FLAG_ACK);
+        meta.addr_family = family as u8;
+        meta.protocol = protocol;
+        assert!(
+            matches!(
+                run_stage11(&forwarding, &flow, &frame, meta),
+                IpsecPassthroughOutcome::NotClaimed
+            ),
+            "#5620: remote-destination {label} must NOT be claimed by Stage 11 \
+             (NotClaimed) — it must fall through to transit zone policy, not be \
+             reinjected to the local XFRM stack",
+        );
+    }
+}
+
+/// #5620 over-reject guard + DNAT-to-self preservation: Stage 11 MUST still
+/// claim legitimate LOCAL-destined IPsec after the local-destination predicate
+/// is added. This pins the CRITICAL preservation cases the fix must not break
+/// (breaking VPN termination is worse than the transit bypass):
+///
+///   - ESP to the lan interface IP (`10.0.61.1`, in `local_v*`)          → Passthrough
+///   - ESP to the WAN/SNAT interface IP (`172.16.80.8`) — EXCLUDED from
+///     `local_v*` by the interface-mode-SNAT `nat_translated_local_exclusions`
+///     but present in `configured_iface_v*`, so `owns_configured_ip` still
+///     recognises it (the most common VPN termination address)             → Passthrough
+///   - ESP to a DNAT-to-self external (`203.0.113.9`, appended to `local_v*`
+///     by the DNAT rule's destination address) — proves the RAW pre-NAT dst
+///     check does NOT wrongly reject NAT-to-self                            → Passthrough
+///
+/// A never-configured remote address (`203.0.113.200`) is the control: it is
+/// in neither set → `NotClaimed`, proving the DNAT append (not a blanket
+/// accept) is what claims `203.0.113.9`.
+///
+/// Fail-on-revert: this test guards AGAINST over-reject; it stays GREEN with
+/// the fix and would break if the predicate rejected a firewall-owned dst.
+#[test]
+fn stage_ipsec_passthrough_claims_local_and_nat_to_self_dst_5620() {
+    let mut snap = super::super::test_fixtures::nat_snapshot();
+    // DNAT a public external (UDP/500 IKE) to the firewall itself — NAT-to-self.
+    // The rule's `destination_address` is appended to `local_v4`, so the raw
+    // pre-NAT dst check in Stage 11 recognises it as firewall-local.
+    snap.destination_nat_rules = vec![crate::DestinationNATRuleSnapshot {
+        name: "ike-dnat-to-self".to_string(),
+        from_zone: "wan".to_string(),
+        destination_address: "203.0.113.9".to_string(),
+        destination_port: 500,
+        protocol: "udp".to_string(),
+        pool_address: "10.0.61.1".to_string(),
+        pool_port: 500,
+        ..Default::default()
+    }];
+    let forwarding = build_forwarding_state(&snap);
+    // Precondition: the DNAT external is a firewall-local address; the control
+    // remote address is not.
+    assert!(
+        forwarding
+            .owns_configured_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)))
+    );
+    assert!(
+        !forwarding
+            .owns_configured_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200)))
+    );
+
+    let frame = tcp_v4_frame(
+        Ipv4Addr::new(192, 0, 2, 10),
+        Ipv4Addr::new(203, 0, 113, 9),
+        40000,
+        500,
+        TCP_FLAG_ACK,
+        1,
+        1,
+    );
+
+    // (dst, expect_passthrough, label)
+    let cases: [(IpAddr, bool, &str); 4] = [
+        (
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
+            true,
+            "lan interface IP (local_v4)",
+        ),
+        (
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            true,
+            "WAN/SNAT interface IP (configured_iface_v4 only)",
+        ),
+        (
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+            true,
+            "DNAT-to-self external (local_v4 via DNAT append)",
+        ),
+        (
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200)),
+            false,
+            "never-configured remote (control)",
+        ),
+    ];
+    for (dst, expect_passthrough, label) in cases {
+        // Raw ESP: unconditionally exempt from the #4323 host-inbound gate, so
+        // this isolates the #5620 local-destination predicate.
+        let flow = ipsec_flow_to(libc::AF_INET, PROTO_ESP, 0, dst);
+        let mut meta = tcp_v4_meta(&frame, TCP_FLAG_ACK);
+        meta.protocol = PROTO_ESP;
+        let outcome = run_stage11(&forwarding, &flow, &frame, meta);
+        if expect_passthrough {
+            assert!(
+                matches!(outcome, IpsecPassthroughOutcome::Passthrough),
+                "#5620: LOCAL-destined ESP to {label} must stay claimed \
+                 (Passthrough) — over-rejecting it would break VPN termination",
+            );
+        } else {
+            assert!(
+                matches!(outcome, IpsecPassthroughOutcome::NotClaimed),
+                "#5620: ESP to {label} must be NotClaimed (proves the claim is \
+                 scoped to firewall-owned addresses, not a blanket accept)",
+            );
+        }
+    }
 }

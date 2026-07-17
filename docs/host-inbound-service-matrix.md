@@ -50,7 +50,12 @@ that MUST agree on the token set:
 3. **Rust AF_XDP classifier — SECONDARY enforcement.** The XSK
    local-delivery path, reached only by the subset of host-bound traffic that
    arrives on the AF_XDP fast path (e.g. DNAT/static-NAT to a firewall-local
-   address).
+   address). The IPsec passthrough stage (`stage_ipsec_passthrough_check`) is
+   likewise scoped to a firewall-local destination since #5620: it claims the
+   kernel-XFRM passthrough short-circuit ONLY when `flow.dst_ip` is an address
+   the firewall owns (`owns_configured_ip`), so a TRANSIT ESP/AH/IKE packet
+   routed to a remote host falls through to transit zone policy instead of
+   being reinjected to the local XFRM stack (codex-review-181 M03).
    - `classify_system_service` / `classify_protocol` —
      `userspace-dp/src/afxdp/forwarding/host_inbound.rs`
    - `is_icmp_host_inbound_global_accept` — same file (global ICMP/ND accepts)
