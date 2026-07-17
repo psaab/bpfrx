@@ -1,3 +1,41 @@
+## 2026-07-17 — #5802: pre-routing NAT scope keys on the LOGICAL VLAN unit, not the physical bind ifindex
+
+- **Timestamp**: 2026-07-17 (fix/5802-vlan-prerouting-nat-scope-logical)
+- **Action**: The inbound DNAT / static-NAT / NPTv6 pre-routing scope lookups
+  in `poll_binding_process_descriptor` (userspace-dp/src/afxdp/poll_descriptor/
+  mod.rs) derived `ingress_zone_name` / `ingress_ifname_dnat` / `ingress_ri_dnat`
+  from the PHYSICAL AF_XDP bind ifindex (`meta.ingress_ifindex`). On a trunk the
+  parent physical netdev carries every VLAN unit's frames, and
+  `ifindex_to_zone_id` / `ifindex_to_config_name` / `ifindex_to_routing_instance`
+  are keyed by the LOGICAL unit ifindex (the physical parent maps only to its
+  FIRST unit), so a packet on one VLAN unit could match (or miss) a scoped NAT
+  rule using the parent/first-unit identity — applying or skipping translation
+  OUTSIDE the configured `from zone` / `from interface` / `from routing-instance`
+  boundary, before the correct logical zone policy ran (a NAT scope-escape). The
+  same miss path LATER resolves the logical VLAN identity for zone-policy /
+  filter / CoS (#3021), so the correct identity was computed but not used for the
+  earlier pre-routing scope. Fix: extract `prerouting_ingress_scope`, which
+  resolves the logical unit via `resolve_ingress_logical_ifindex((bind ifindex,
+  VLAN id))` and reads the zone / config-name / routing-instance from it; the
+  pre-routing site consumes it and threads the resolved `logical_ifindex` into
+  the later zone-pair policy so both sites share ONE ingress identity (no
+  recompute). A fabric-encoded zone override still wins first (unchanged). An
+  untagged port has no `(parent, VLAN)` mapping → logical == physical →
+  byte-identical. Added three RED-on-revert cargo tests
+  (`prerouting_scope_tests`): a zone-scoped DNAT (wrong-APPLY escape), an
+  interface-scoped static DNAT (wrong-SKIP escape), and a non-VLAN control.
+  Reverting the scope to the physical parent makes the two escape tests RED
+  (`left: 11, right: 12` on `logical_ifindex`; `left: "", right: "reth0.50"` on
+  the ifname); the non-VLAN control stays green.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
+- **Validation**: `cargo build` clean; `cargo test --release nat` green (726
+  passed); full `cargo test --release` green except the known pre-existing
+  parallel flake `wg_encap_frame_resolves_outer_route_once_v4` (passes isolated).
+  RED-on-revert captured verbatim. Loss-cluster smoke DEFERRED — cargo covers
+  the logical-scope selection; a VLAN-trunk per-zone NAT cluster test is a
+  possible later add.
+
 ## 2026-07-17 — #5447: NAT64 frag-assoc install prunes EXPIRED before evicting a LIVE entry
 
 - **Timestamp**: 2026-07-17 (fix/5447-nat64-frag-prune-before-evict)
