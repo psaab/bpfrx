@@ -273,9 +273,16 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		// helper side here too so the standalone state is consistent
 		// regardless of which apply path runs. (Idempotent empty update.)
 		if !m.clusterHA {
-			if err := m.clearHelperHAStateWithDebtLocked(); err != nil {
+			if err := m.clearHelperHAStateWithDebtEnsureRetryLocked(); err != nil {
 				// Debt recorded — the status poll retries the clear until it
 				// succeeds; still surface the error so the apply fails closed.
+				// #5873: this deferred-publish resume path returns without
+				// reaching the ensureStatusLoopLocked() call on the normal apply
+				// path, so the WithDebtEnsureRetry wrapper starts the loop (the
+				// debt's only retry consumer) before this failure propagates —
+				// otherwise the failed clear would orphan the debt with no worker
+				// to retry it. The pendingXSKStartup precondition guarantees
+				// m.proc != nil, so the loop can actually run.
 				return result, fmt.Errorf("clear userspace HA state (deferred startup): %w", err)
 			}
 		}
@@ -362,7 +369,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		if err := m.syncHAStateLocked(); err != nil {
 			return result, fmt.Errorf("publish userspace HA state: %w", err)
 		}
-	} else if err := m.clearHelperHAStateWithDebtLocked(); err != nil {
+	} else if err := m.clearHelperHAStateWithDebtEnsureRetryLocked(); err != nil {
 		// Non-cluster node: ensure neither the manager nor the helper retains
 		// HA groups. seedHAGroupInventoryLocked already cleared m.haGroups
 		// above; this also clears any groups a prior clustered apply pushed to
@@ -371,6 +378,13 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		// On failure a retry debt is recorded (#5487) so the status poll
 		// re-attempts the idempotent clear until the helper reports no groups;
 		// the error is still surfaced so this apply fails closed.
+		// #5873: the recorded debt's ONLY retry consumer is the periodic status
+		// loop, which the success path starts below via ensureStatusLoopLocked().
+		// On first startup (or any apply with no pre-existing loop) returning
+		// here BEFORE that call would orphan the debt — no worker would ever
+		// retry the clear, so the stale helper HA groups (and the owner-RG-0
+		// transit-drop gate) would persist indefinitely. The WithDebtEnsureRetry
+		// wrapper starts the loop (idempotent) before this failure propagates.
 		return result, fmt.Errorf("clear userspace HA state: %w", err)
 	}
 	if err := m.syncDesiredForwardingStateLocked(); err != nil {
