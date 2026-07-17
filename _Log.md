@@ -1,3 +1,46 @@
+## 2026-07-16 — #5819: reject persistent-nat + port no-translation (fail-closed)
+
+- **Timestamp**: 2026-07-16 (fix/5819-persistent-nat-notranslation-reject)
+- **Action**: A source-NAT pool could configure BOTH `persistent-nat` and
+  `port no-translation`, but the userspace dataplane's no-translation
+  (address-only) path bypasses the persistent-lease machinery — it selects a
+  pool address by round-robin / global-hash and records the flow with
+  `persistent_key: None`, so no `persistent_by_source` lease, permit-scope
+  reuse, or inactivity timer exists. With global `source address-persistent`
+  off, sequential flows from one source could leave through DIFFERENT public
+  addresses and status showed no lease: a strict-valid config that CLAIMS
+  persistence silently degraded to ordinary per-flow address-only NAT. This is
+  the bounded fail-closed path (option 2) of #5819; the full address-only
+  persistent-lease implementation (option 1) is a large NAT-allocator design
+  change deferred to a /research follow-up.
+  Fix (mirrors the #5859/#6028 static-nat `then inet` fail-closed pattern):
+    - `pkg/config/compiler_validate_strict_nat.go`:
+      `validateSourceNATPersistentNoTranslationStrict` hard-rejects a pool with
+      both modifiers, naming the pool + the unsupported combo.
+    - `pkg/config/compiler_uniformgates.go`: dispatched after the source-pool
+      address-grammar gate, sharing `lenientDestNATAddresses` — hard-reject on
+      strict commit / commit-check, downgrade to a warning on the tolerant load
+      / peer-sync path (#1960 no-brick).
+    - `pkg/dataplane/userspace/nat_source.go`: the SNAT snapshot builder
+      independently fails CLOSED, marking the pool unusable with reason
+      `persistent_nat_no_translation`, so a leniently-loaded / peer-synced
+      config installs NOTHING rather than shipping the silent degradation. The
+      Rust `source_nat_failure_reason_from_snapshot` `_` fallback maps the new
+      reason to `InvalidPool` (fail-closed drop); source.rs untouched.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates.go, pkg/dataplane/userspace/nat_source.go,
+  pkg/config/compiler_persistent_nat_notranslation_5819_test.go (new),
+  pkg/dataplane/userspace/nat_source_persistent_notranslation_5819_test.go
+  (new), docs/userspace-dataplane-gaps.md, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/config` clean;
+  `go test ./pkg/config` green (12.3s). New tests RED-on-revert proven
+  firsthand (strict-reject + lenient-warning break when the config gate is
+  neutralized; snapshot PoolUnusable breaks when the builder marker is
+  neutralized). pkg/dataplane/userspace has pre-existing unrelated failures
+  (EventStream/Takeover/PublishRouteOverlay) that are IDENTICAL on clean
+  origin/master 379ca5d25 — verified via a throwaway clean worktree; my NAT
+  tests pass and the failure set is unchanged (zero new failures).
+
 ## 2026-07-16 — #5857: lo0 firewall policers now meter host-bound traffic
 
 - **Timestamp**: 2026-07-16 (fix/5857-lo0-policer-meter)
