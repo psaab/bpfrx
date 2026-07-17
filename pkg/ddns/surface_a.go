@@ -1509,29 +1509,57 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 	// candidate delete of this record (same family/FQDN/provider), so compute once.
 	sibling := m.siblingFamilyOwnedLocked(owned)
 	var firstErr error
-	var suppressed int
+	noteFirst := func(e error) {
+		if e != nil && firstErr == nil {
+			firstErr = e
+		}
+	}
+	var deferredCoowned int // #6015: targets a DHCP lease still co-owns (defer + re-assert)
+	var deleted int         // real wire deletes issued this pass
 	for _, a := range targets {
-		// #5748 (cross-surface arm of #5709): if a Surface B DHCP lease scope still
-		// co-owns THIS exact wire RR (canonical FQDN + forward type + this rdata),
-		// do NOT issue the wire delete — it would clobber the RR the lease surface
-		// still legitimately owns and refreshes. Release only this surface's claim
-		// (the ownership drop below) and leave the RR live; the lease surface, as the
-		// last claimant, issues the real delete when it in turn tears down. The
+		// #5748 + #6015 (cross-surface arm of #5709): if a Surface B DHCP lease
+		// scope still co-owns THIS exact wire RR (canonical FQDN + forward type +
+		// this rdata), Surface A must not issue the wire delete — that would clobber
+		// the RR the lease surface still legitimately owns and refreshes (the #6012
+		// caution). But it must also not suppress-and-RELEASE its own claim the way
+		// the lease side does: that is the #6015 window-(b) mutual-suppression path.
+		// If BOTH surfaces tear down the SAME co-owned RR in overlapping passes, each
+		// reads the OTHER's pre-rebuild (end-of-pass) snapshot — still listing the RR
+		// as owned — so if both released their claims the RR would be left on the
+		// wire UNOWNED (orphaned).
+		//
+		// The deterministic tie-break (#6015): Surface B (the lease Manager) is the
+		// SOLE SUPPRESSION AUTHORITY — it alone suppress-and-RELEASES a cross-surface
+		// co-owned RR (unchanged from #6012, deleteOwnedLocked / wireRRSharedWithOther).
+		// Surface A is the NON-AUTHORITY: it DEFERS — it RE-ASSERTS (re-UPSERTs) the
+		// RR so a leaked RR self-heals, and KEEPS its ownership claim, retrying the
+		// teardown on later passes. The real delete is deferred until the lease
+		// authority has RELEASED its co-ownership (a later pass finds
+		// leaseWireRRCoowner false for every target and deletes normally below).
+		// Because B always releases first and A always defers-until-B-is-gone, exactly
+		// ONE surface ever deletes a cross-surface co-owned RR — mutual suppression can
+		// never orphan it, and A never clobbers B's still-owned record. The
 		// leaseCoowners read is LOCK-FREE (no Manager.mu), so this is safe under m.mu.
 		if m.leaseWireRRCoowner(owned.FQDN, owned.ForwardType, a.String()) {
-			suppressed++
+			deferredCoowned++
 			m.deleteCoowned++
-			slog.Debug("ddns surface-a: skipping wire delete — RR still co-owned by a DHCP lease scope; "+
-				"releasing this surface's claim only",
+			// Re-assert the RR (self-heal): re-UPSERT the exact owned RR so a leaked
+			// co-owned record (e.g. the residual window-(a) sub-ms clobber) is
+			// restored. Re-adding an identical RR is idempotent at the provider.
+			if rec, err := buildHostRecord(owned.FQDN, a, owned.TTL); err == nil {
+				noteFirst(m.providerIO(func() error { return backend.UpsertLease(ctx, rec) }))
+			} else {
+				noteFirst(err)
+			}
+			slog.Debug("ddns surface-a: cross-surface co-owned RR — deferring wire delete and "+
+				"re-asserting; a DHCP lease scope still co-owns it (keeping claim until it releases)",
 				"fqdn", owned.FQDN, "type", owned.ForwardType, "addr", a.String(),
 				"provider", owned.scopeOf().PolicyID)
 			continue
 		}
 		rec, err := buildHostRecord(owned.FQDN, a, owned.TTL)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+			noteFirst(err)
 			continue
 		}
 		rec.SiblingFamilyOwned = sibling
@@ -1540,26 +1568,36 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 		// candidate is a benign no-op (the backend maps not-found to success), so an
 		// error here is a REAL provider failure.
 		if err := m.providerIO(func() error { return backend.DeleteLease(ctx, rec) }); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+			noteFirst(err)
+		} else {
+			deleted++
 		}
 	}
 	if firstErr != nil {
-		// A candidate delete failed with a real provider error. Keep ownership so the
-		// next reconcile retries EVERY candidate (an already-deleted one is a benign
-		// no-op) — a genuinely-live value is never orphaned. The
-		// errGenericDeleteUnsupported sentinel is preserved (%w) so withdrawScopeLocked
-		// marks the scope terminal instead of retrying a structurally-unsupported verb.
+		// A candidate delete (or a deferred re-assert) failed with a real provider
+		// error. Keep ownership so the next reconcile retries EVERY candidate (an
+		// already-deleted one is a benign no-op) — a genuinely-live value is never
+		// orphaned. The errGenericDeleteUnsupported sentinel is preserved (%w) so
+		// withdrawScopeLocked marks the scope terminal instead of retrying a
+		// structurally-unsupported verb.
 		m.deleteFail++
 		return fmt.Errorf("ddns surface-a: withdraw %s %s: %w", owned.ForwardType, owned.FQDN, firstErr)
 	}
-	// deleteOK counts a real wire withdraw. If EVERY candidate was cross-surface
-	// co-owned and suppressed, nothing was deleted — do not inflate deleteOK; the
-	// deleteCoowned counter already recorded the suppression. Ownership is still
-	// released below (mirrors the lease path's #5709 claim release).
-	if suppressed < len(targets) {
+	// deleteOK counts a real wire withdraw. If every candidate was cross-surface
+	// co-owned (deferred) nothing was deleted — do not inflate deleteOK; the
+	// deleteCoowned counter already recorded the suppression.
+	if deleted > 0 {
 		m.deleteOK++
+	}
+	// #6015 deterministic tie-break: if ANY target is still cross-surface co-owned
+	// by a DHCP lease, this record is a DEFERRED cross-surface teardown — KEEP the
+	// ownership claim (do NOT drop it below) so the RR is never orphaned and Surface
+	// A stays the deterministic last-claimant that deletes only once the lease
+	// authority has released. rebuildWireRRClaimsLocked keeps advertising the claim
+	// so the lease side still sees the co-ownership. A later pass, once the lease no
+	// longer co-owns, falls through to the real delete + ownership release.
+	if deferredCoowned > 0 {
+		return nil
 	}
 
 	// Racing-op guard (#2778): drop ownership only if the live entry is STILL the
@@ -2123,10 +2161,15 @@ type SurfaceAStats struct {
 	Skipped          uint64
 	BackedOff        uint64
 	SkippedNoBackend uint64
-	// DeleteCoowned is the count of wire deletes SUPPRESSED because the RR is still
+	// DeleteCoowned is the count of wire deletes DEFERRED because the RR is still
 	// co-owned by a Surface B DHCP lease scope (#5748, the cross-surface arm of the
-	// #5709 co-ownership guard). A non-zero value is normal when Surface A and a
-	// DHCP lease legitimately publish the same host/address.
+	// #5709 co-ownership guard). Under the #6015 deterministic tie-break Surface A is
+	// the NON-AUTHORITY: rather than suppress-and-release like the lease side, each
+	// such pass DEFERS the delete, RE-ASSERTS the RR, and KEEPS the ownership claim
+	// until the lease authority releases — so this counter tallies deferred passes,
+	// not one-shot suppressions, and grows once per reconcile while the co-ownership
+	// persists. A non-zero value is normal when Surface A and a DHCP lease
+	// legitimately publish the same host/address.
 	DeleteCoowned uint64
 	// Orphaned is the count of records this node published at a PREVIOUS provider
 	// endpoint that a provider identity change (rename / in-place mutation /
