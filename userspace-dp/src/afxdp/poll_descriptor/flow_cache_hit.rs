@@ -517,6 +517,15 @@ pub(super) fn stage_flow_cache_hit(
                     // drop already returned above at the cached-drop check), so
                     // the precomputed selection is never a reject.
                     None,
+                    // #5606: mirror the cached session's NAT64 reverse info onto
+                    // the request. Always `None` here — NAT64 flows are excluded
+                    // from the flow cache by `FlowCacheEntry::should_cache` (a
+                    // version-changing translation cannot use the in-place
+                    // byte-rewrite fast path), so a NAT64 reply never reaches
+                    // this fast path — but threading it keeps the invariant
+                    // "request.nat64_reverse mirrors its driving session
+                    // metadata" holding uniformly across every builder call.
+                    cached_metadata.nat64_reverse,
                 ) {
                     request.frame = owned_packet_frame
                         .take()

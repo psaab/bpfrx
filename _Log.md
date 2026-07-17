@@ -51250,3 +51250,50 @@ top.
   userspace-dp/src/afxdp/frame/rewrite/ipv6.rs,
   userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
   userspace-dp/src/afxdp/frame/README.md
+
+## 2026-07-17 — #5606 thread NAT64 reverse info onto the live TX request
+
+- **Timestamp**: 2026-07-17
+  **Action**: #5606 — the NAT64 reverse `Nat64ReverseInfo` (original v6
+  src/dst) lived only on `SessionMetadata`; the live-forwarding
+  `PendingForwardRequest` that drives the TX dispatcher hard-coded
+  `nat64_reverse: None`. So a server's IPv4 reply to a NAT64 flow reached
+  the AF_INET (v4->v6) branch of `build_nat64_forwarded_frame` with no
+  reverse info — that branch fails closed (`nat64_reverse?` -> `None`) and
+  DROPPED the reply / could not translate an embedded ICMP error. Fix:
+  `build_live_forward_request_from_frame` takes a new `nat64_reverse`
+  parameter its poll-loop callers thread from the matched reverse-companion
+  session's metadata (`resolved.metadata.nat64_reverse` on the session-hit
+  resolve, carried out via a `session_nat64_reverse` local). Threading is
+  uniform across all three callers (slow-path transit, cluster-peer-return,
+  flow-cache fallback) so the invariant "request.nat64_reverse mirrors its
+  driving session metadata" holds everywhere — the latter two are `None`
+  today (NAT64 is excluded from the flow cache; peer-return metadata is
+  `None`). STEP 0: on origin/master `53774ffd4` only the LIVE constructor
+  (`forward_request.rs`) was a live bug — the two other issue-cited
+  constructors (embedded-ICMP `embedded_icmp.rs`, generated-time-exceeded
+  `icmp.rs`) build PREBUILT frames with a `NatDecision::default()`
+  (non-NAT64) decision, so the dispatcher enqueues their bytes directly and
+  never calls `build_nat64_forwarded_frame`; their `nat64_reverse` is inert
+  (they translate internally). The issue was filed against stale
+  `4e0c7f74c` (pre the #5690 embedded-ICMP prebuilt rework).
+  **Validation**: `cargo build` clean; `cargo test --release nat64` GREEN
+  (166 passed, 0 failed), including the two new pins. Fail-on-revert proven
+  firsthand: restoring the constructor's hard-coded `nat64_reverse: None`
+  (ignoring the param) makes
+  `build_live_forward_request_threads_nat64_reverse_info_5606` go RED
+  (`assertion left == right failed ... left: None, right:
+  Some(Nat64ReverseInfo { ... })`). Consumer contract pinned by
+  `nat64_5606_reverse_frame_requires_reverse_info_or_drops` (Some ->
+  IPv6 reply to the original client; None -> drop). Loss-cluster smoke
+  DEFERRED — cargo covers the reverse-info threading + the v6-reply
+  assertion; a v6-from-v4-reply cluster test is a possible later add.
+  **File(s)**: userspace-dp/src/afxdp/forward_request.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/types/tx.rs,
+  userspace-dp/src/afxdp/tests_bind_forward.rs,
+  userspace-dp/src/afxdp/tests_fragment.rs,
+  userspace-dp/src/afxdp/frame/tests_nat_rewrite.rs,
+  userspace-dp/src/afxdp/frame/tests_ports_live_forward.rs,
+  userspace-dp/src/FEATURES.md

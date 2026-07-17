@@ -271,12 +271,142 @@ fn build_live_forward_request_from_frame_uses_precomputed_hints() {
         Some(hints),
         None,
         None,
+        // #5606: non-NAT64 test flow — no reverse info.
+        None,
     )
     .expect("request");
 
     assert_eq!(req.expected_ports, hints.expected_ports);
     assert_eq!(req.target_binding_index, hints.target_binding_index);
     assert_eq!(req.target_ifindex, 11);
+}
+
+// #5606: a NAT64 reverse (v4->v6) reply is forwarded through
+// `build_live_forward_request_from_frame`. The matched reverse-companion
+// session's `SessionMetadata` carries the original v6 src/dst
+// (`Nat64ReverseInfo`); the poll loop threads it into the builder's
+// `nat64_reverse` parameter, which the builder packs onto
+// `PendingForwardRequest.nat64_reverse`. The TX dispatcher's
+// `build_nat64_forwarded_frame` AF_INET (v4->v6) branch hard-requires that
+// field to translate the reply back to IPv6 — with `None` it returns `None`
+// and the reply is dropped. This pins that the builder carries the threaded
+// value through, and that a non-NAT64 flow keeps `None`.
+//
+// RED on revert: restoring the constructor's hard-coded `nat64_reverse: None`
+// (ignoring the new parameter) makes the `Some(reverse_info)` assertion fail.
+#[test]
+fn build_live_forward_request_threads_nat64_reverse_info_5606() {
+    let lookup = WorkerBindingLookup::default();
+    let ingress_ident = BindingIdentity {
+        slot: 7,
+        queue_id: 3,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-2"),
+        ifindex: 10,
+    };
+    let desc = XdpDesc {
+        addr: 0,
+        len: 0,
+        options: 0,
+    };
+    // The reverse reply arrives as IPv4 (server -> pool address).
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    };
+    let orig_client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let orig_server: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    // NAT64 reverse decision (nat64 = true): the reply is translated v4 -> v6.
+    // `NatDecision::reverse` restores the original v6 src/dst; here we assemble
+    // the equivalent decision directly.
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(orig_client)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V6(orig_server)),
+            rewrite_dst: Some(IpAddr::V6(orig_client)),
+            rewrite_src_port: None,
+            rewrite_dst_port: Some(5000),
+            nat64: true,
+            nptv6: false,
+        },
+    };
+    let reverse_info = Nat64ReverseInfo {
+        orig_src_v6: orig_client,
+        orig_dst_v6: orig_server,
+    };
+
+    // Threaded: the built request carries the reverse info verbatim.
+    let req = build_live_forward_request_from_frame(
+        &lookup,
+        2,
+        &ingress_ident,
+        desc,
+        &[],
+        meta,
+        &decision,
+        &ForwardingState::default(),
+        None,
+        None,
+        false,
+        0,
+        None,
+        None,
+        None,
+        None,
+        Some(reverse_info),
+    )
+    .expect("request");
+    assert_eq!(
+        req.nat64_reverse,
+        Some(reverse_info),
+        "#5606: the builder must thread the NAT64 reverse info (original v6 \
+         src/dst) onto the request so the v4->v6 reply can be translated"
+    );
+
+    // Control: a non-NAT64 flow (no reverse info) keeps `nat64_reverse: None`.
+    let plain_decision = SessionDecision {
+        resolution: decision.resolution,
+        nat: NatDecision::default(),
+    };
+    let plain = build_live_forward_request_from_frame(
+        &lookup,
+        2,
+        &ingress_ident,
+        desc,
+        &[],
+        meta,
+        &plain_decision,
+        &ForwardingState::default(),
+        None,
+        None,
+        false,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("request");
+    assert!(
+        plain.nat64_reverse.is_none(),
+        "#5606: a non-NAT64 request must keep nat64_reverse == None (the common \
+         IPv4/IPv6 same-family path is unchanged)"
+    );
 }
 
 
@@ -376,6 +506,8 @@ fn build_live_forward_request_from_frame_drops_logged_output_filter_discard() {
         Some(&event_handle),
         None,
         None,
+        None,
+        // #5606: non-NAT64 test flow — no reverse info.
         None,
     );
 
@@ -563,6 +695,8 @@ fn build_live_forward_request_from_frame_output_filter_reject_sends_rst_3608() {
             tx_pipeline: &mut tx_pipeline,
             counters: &mut counters,
         }),
+        // #5606: non-NAT64 test flow — no reverse info.
+        None,
     );
 
     assert!(
@@ -711,6 +845,8 @@ fn output_filter_matches_post_snat_source_forward_leg_3642() {
         None,
         None,
         None,
+        // #5606: non-NAT64 test flow — no reverse info.
+        None,
     );
     assert!(
         req.is_none(),
@@ -838,6 +974,8 @@ fn output_filter_matches_post_snat_dest_reverse_leg_3642() {
         None,
         None,
         None,
+        // #5606: non-NAT64 test flow — no reverse info.
+        None,
     );
     assert!(
         req.is_none(),
@@ -959,6 +1097,8 @@ fn output_filter_matches_post_dnat_dest_3642() {
         Some(&event_handle),
         None,
         None,
+        None,
+        // #5606: non-NAT64 test flow — no reverse info.
         None,
     );
     assert!(

@@ -59,6 +59,8 @@ fn non_first_fragment_v4_not_dropped_by_port_matching_output_filter() {
         None,
         None,
         None,
+        // #5606: non-NAT64 test flow — no reverse info.
+        None,
     );
 
     let req = req.expect(
@@ -134,6 +136,8 @@ fn control_icmp_v4_installs_no_synthesized_tx_flow_key() {
         None,
         None,
         None,
+        // #5606: non-NAT64 test flow — no reverse info.
+        None,
     )
     .expect("control ICMP must still forward (TCP-only output filter does not match)");
 
@@ -184,6 +188,8 @@ fn flowless_non_fragmented_tcp_still_hits_port_matching_output_filter() {
         Some(&event_handle),
         None,
         None,
+        None,
+        // #5606: non-NAT64 test flow — no reverse info.
         None,
     );
 
@@ -697,6 +703,8 @@ fn non_first_fragment_v6_not_dropped_by_port_matching_output_filter() {
         Some(&event_handle),
         None,
         None,
+        None,
+        // #5606: non-NAT64 test flow — no reverse info.
         None,
     );
 

@@ -71,6 +71,10 @@ pub(super) fn build_live_forward_request(
         None,
         None,
         None,
+        // #5606: test-only wrapper — a NAT64 reverse reply is exercised through
+        // `build_live_forward_request_from_frame` directly, so this convenience
+        // path carries no reverse info.
+        None,
     )
 }
 
@@ -91,6 +95,15 @@ pub(super) fn build_live_forward_request_from_frame(
     hints: Option<PendingForwardHints>,
     precomputed_tx_selection: Option<&CachedTxSelectionDescriptor>,
     reject_reply: Option<ForwardRejectReply<'_>>,
+    // #5606: the driving session's NAT64 reverse info (original v6 src/dst), or
+    // `None` for every non-NAT64 flow. Threaded straight onto
+    // `PendingForwardRequest.nat64_reverse`: the TX dispatcher's
+    // `build_nat64_forwarded_frame` AF_INET (v4->v6) branch hard-requires it to
+    // translate a NAT64 reply back to IPv6 — with `None` it returns `None` and
+    // the reply is dropped. The reverse companion session installed for a NAT64
+    // flow carries this in its `SessionMetadata`, so the session-hit resolve
+    // that produced `decision` supplies it here.
+    nat64_reverse: Option<Nat64ReverseInfo>,
 ) -> Option<PendingForwardRequest> {
     let hints = hints.unwrap_or_default();
     let target_ifindex = if decision.resolution.tx_ifindex > 0 {
@@ -309,7 +322,11 @@ pub(super) fn build_live_forward_request_from_frame(
         apply_nat_on_fabric,
         expected_ports,
         flow_key: tx_selection_flow.map(|flow| flow.forward_key.clone()),
-        nat64_reverse: None,
+        // #5606: carry the driving session's NAT64 reverse info so the TX
+        // dispatcher can translate a v4->v6 NAT64 reply back to IPv6. `None` for
+        // every non-NAT64 flow (the common IPv4/IPv6 same-family path is
+        // byte-identical to before).
+        nat64_reverse,
         cos_queue_id: cos.queue_id,
         dscp_rewrite: cos.dscp_rewrite,
         cos_tx_selection_resolved: true,

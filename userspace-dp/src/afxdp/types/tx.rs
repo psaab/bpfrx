@@ -81,6 +81,15 @@ pub(in crate::afxdp) struct PendingForwardRequest {
     pub(in crate::afxdp) apply_nat_on_fabric: bool,
     pub(in crate::afxdp) expected_ports: Option<(u16, u16)>,
     pub(in crate::afxdp) flow_key: Option<SessionKey>,
+    /// #5606: the NAT64 flow's original IPv6 src/dst, threaded from the matched
+    /// reverse-companion session's `SessionMetadata` by
+    /// `build_live_forward_request_from_frame`. The TX dispatcher hands this to
+    /// `build_nat64_forwarded_frame`; its AF_INET (v4->v6) reverse branch
+    /// hard-requires it to translate a server's IPv4 reply back to IPv6 — with
+    /// `None` the branch returns `None` and the reply is dropped. `None` for
+    /// every non-NAT64 flow, and inert for PREBUILT-frame requests (embedded-ICMP
+    /// / generated-time-exceeded) whose non-NAT64 decision routes them past the
+    /// frame builder entirely.
     pub(in crate::afxdp) nat64_reverse: Option<Nat64ReverseInfo>,
     pub(in crate::afxdp) cos_queue_id: Option<u8>,
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,
