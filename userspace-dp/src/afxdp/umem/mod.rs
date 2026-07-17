@@ -492,6 +492,15 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// Distinct from the pool counters (config/capacity on an ELIGIBLE flow) —
     /// this is an input-validation reject.
     pub(super) nat64_ineligible_source: AtomicU64,
+    /// #5625: cumulative fail-closed NAT64 EXTENSION-HEADER ineligibility drops
+    /// — a v6→v4 forward translation rejected because the IPv6 packet carried an
+    /// Authentication Header (51), an ACTIVE Routing header (43, Segments
+    /// Left > 0), or a Mobility (135) / HIP (139) / Shim6 (140) header, none of
+    /// which a stateless NAT64 translation can carry to IPv4 (RFC 7915 §5.1 /
+    /// §5.1.1). Surfaced as the `NAT64 ext-header ineligible drops` operator
+    /// counter; a non-zero value flags AH-protected or active-extension traffic
+    /// aimed at a NAT64 prefix. Distinct from the source/pool/fragment counters.
+    pub(super) nat64_exthdr_ineligible: AtomicU64,
     /// #4477: cumulative source-NAT allocation failures (rule matched, no
     /// translated mapping could be allocated — missing/empty/invalid/exhausted
     /// pool, wrong family, or a non-first fragment on a port-translating rule).
@@ -909,6 +918,7 @@ impl BindingLiveState {
             nat64_pool_exhausted: AtomicU64::new(0),
             nat64_frag_dropped: AtomicU64::new(0),
             nat64_ineligible_source: AtomicU64::new(0),
+            nat64_exthdr_ineligible: AtomicU64::new(0),
             nat_alloc_fail: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),
