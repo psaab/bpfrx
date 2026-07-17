@@ -3385,6 +3385,98 @@ fn tunnel_ttl_negative_maps_to_default_not_zero() {
     );
 }
 
+/// #5162: a non-WireGuard tunnel whose outer source and destination are
+/// DIFFERENT address families (v4 source + v6 destination) is skipped by
+/// `populate_tunnel_endpoints` — a helper-boundary backstop for a
+/// mixed-version peer-sync / corrupt snapshot the Go commit gate
+/// (`validateTunnelOuterFamilyStrict`) did not reject. Before the fix such
+/// a row was tagged `inet6` (Go picks inet6 if EITHER endpoint is v6) and
+/// installed, then silently dropped every encap in the GRE AF_INET6 arm.
+/// fail-on-revert: removing the family-mismatch skip installs the endpoint
+/// and this `assert!(!contains_key)` goes red.
+#[test]
+fn tunnel_mixed_outer_family_is_skipped() {
+    let snapshot = ConfigSnapshot {
+        tunnel_endpoints: vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+            id: 12,
+            interface: "gr-0/0/0".into(),
+            ifindex: 53,
+            mode: "gre".into(),
+            // Go would tag this `inet6` (destination is v6); the source is v4.
+            outer_family: "inet6".into(),
+            source: "203.0.113.1".into(),
+            destination: "2001:db8::1".into(),
+            ttl: 64,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        !state.tunnel_endpoints.contains_key(&12),
+        "a mixed-family (v4 src / v6 dst) GRE endpoint must be skipped, not installed"
+    );
+    // And it must not be indexed for GRE decap either.
+    assert!(
+        !state
+            .gre_decap_index
+            .values()
+            .any(|ids| ids.contains(&12)),
+        "a skipped mixed-family endpoint must not enter the GRE decap index"
+    );
+}
+
+/// #5162 anti-over-reject: a same-family (v4 src / v4 dst) GRE tunnel still
+/// installs exactly. Guards the family-mismatch skip from swallowing a
+/// legitimate same-family tunnel.
+#[test]
+fn tunnel_same_outer_family_builds_exactly() {
+    let snapshot = ConfigSnapshot {
+        tunnel_endpoints: vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+            id: 13,
+            interface: "gr-0/0/0".into(),
+            ifindex: 54,
+            mode: "gre".into(),
+            outer_family: "inet".into(),
+            source: "203.0.113.1".into(),
+            destination: "198.51.100.1".into(),
+            ttl: 64,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        state.tunnel_endpoints.contains_key(&13),
+        "a same-family v4/v4 GRE endpoint must install"
+    );
+}
+
+/// #5162 anti-over-reject: a same-family (v6 src / v6 dst) GRE tunnel still
+/// installs exactly.
+#[test]
+fn tunnel_same_outer_family_v6_builds_exactly() {
+    let snapshot = ConfigSnapshot {
+        tunnel_endpoints: vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+            id: 14,
+            interface: "gr-0/0/0".into(),
+            ifindex: 55,
+            mode: "gre".into(),
+            outer_family: "inet6".into(),
+            source: "2001:db8::1".into(),
+            destination: "2001:db8::2".into(),
+            ttl: 64,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        state.tunnel_endpoints.contains_key(&14),
+        "a same-family v6/v6 GRE endpoint must install"
+    );
+}
+
 /// #2410: a CoS forwarding-class queue id outside 0..=255 fails the
 /// snapshot CLOSED via `CosQueueIdOutOfRange`. fail-on-revert: restoring
 /// the `filter_map` range check silently DROPS the class, the build

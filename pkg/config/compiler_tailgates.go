@@ -195,6 +195,26 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	}
 	cfg.Warnings = append(cfg.Warnings, wgPeerWarnings...)
 
+	// #5162: non-WireGuard tunnel outer-family cross-field gate. A GRE/IPIP
+	// tunnel whose OUTER source and destination are different address
+	// families (v4 source + v6 destination, or the reverse) passes per-leaf
+	// validation and COMMITS CLEAN, but the snapshot producer tags the
+	// endpoint `inet6` when EITHER endpoint is v6, so the Rust GRE encoder
+	// hits the AF_INET6 arm, finds a v4 endpoint, and returns None → every
+	// encapsulated packet is silently dropped. Strict (commit /
+	// commit-check): hard-reject the mixed-family pair, mirroring the
+	// WireGuard endpoint-family gate above (one encap = one outer family).
+	// Lenient (load / peer-sync): warn so a config committed before this
+	// gate existed still boots — the Rust helper independently skips a
+	// mixed-family non-WG row (forwarding_build/tunnels.rs), so the bad
+	// tunnel is inert rather than a silent blackhole. Runs after the WG gate
+	// so a WG-specific error still wins the first-error slot.
+	tunnelFamilyWarnings, err := validateTunnelOuterFamilyStrict(cfg, opts.lenientTunnelOuterFamily)
+	if err != nil {
+		return err
+	}
+	cfg.Warnings = append(cfg.Warnings, tunnelFamilyWarnings...)
+
 	// #1892: retired DPDK-era `system dataplane` knobs (cores, memory,
 	// socket-mem, rx-mode, ports) parse for stored-config compatibility
 	// but configure nothing — warn so the operator knows the stanza is

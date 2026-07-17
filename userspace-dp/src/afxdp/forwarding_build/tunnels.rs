@@ -40,6 +40,25 @@ pub(super) fn populate_tunnel_endpoints(
             let Ok(destination) = endpoint.destination.parse::<IpAddr>() else {
                 continue;
             };
+            // #5162: a non-WireGuard tunnel encapsulates in ONE outer IP
+            // family, so the outer source and destination MUST be the same
+            // family. The Go commit gate (validateTunnelOuterFamilyStrict)
+            // rejects a mixed pair, but a config synced from an older peer
+            // (pre-#5162) or a corrupt snapshot can still carry one — and the
+            // Go producer tags such a row `inet6` when EITHER endpoint is v6,
+            // which drives the GRE encoder into the AF_INET6 arm where the v4
+            // endpoint yields None → a SILENT per-packet drop. Skip the
+            // degenerate row loudly here instead so it installs nothing rather
+            // than a blackhole (fail-closed, mirroring the WG hydrate
+            // row-drop and the allowed-ips prefix-drop skip-and-continue
+            // posture in this file).
+            if source.is_ipv6() != destination.is_ipv6() {
+                eprintln!(
+                    "xpf-userspace-dp: tunnel endpoint {} outer source {} and destination {} are different address families; skipping this endpoint (a GRE/IPIP tunnel encapsulates in one outer family — #5162)",
+                    endpoint.id, source, destination
+                );
+                continue;
+            }
             (source, destination)
         };
         let outer_family = match (endpoint.outer_family.as_str(), destination) {
