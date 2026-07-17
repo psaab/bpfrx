@@ -24,9 +24,10 @@ The shim checks several conditions before redirecting a packet to userspace:
 3. A binding must exist in `userspace_bindings` for (ifindex, queue_id) and be
    marked `USERSPACE_BINDING_READY`. `userspace_bindings` is a flat array
    indexed by `idx = ifindex * BINDING_QUEUES_PER_IFACE + queue_id`, where
-   `BINDING_QUEUES_PER_IFACE == 16` (the fixed per-interface stride, mirrored
-   in `userspace-xdp/src/lib.rs`, `bpf/headers`, and `pkg/dataplane`
-   `BindingQueuesPerIface`). Because the stride is fixed, the control plane
+   `BINDING_QUEUES_PER_IFACE == 16` (the fixed per-interface stride, defined in
+   `userspace-xdp/src/lib.rs` and mirrored in `pkg/dataplane`
+   `BindingQueuesPerIface` — NOT in `bpf/headers`, which only carries
+   `MAX_INTERFACES`). Because the stride is fixed, the control plane
    (`pkg/dataplane/userspace/maps_sync.go`) fails closed on two dimension
    overflows before writing any slot: a `queue_id >= 16` would alias the
    queue-0 slot of the adjacent ifindex (`ifindex*16 + 16 == (ifindex+1)*16`,
