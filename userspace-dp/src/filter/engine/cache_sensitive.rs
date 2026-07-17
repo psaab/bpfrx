@@ -285,58 +285,136 @@ fn three_color_policer_semantics_match(
 }
 
 fn filter_term_semantics_match(old: &FilterTerm, new: &FilterTerm) -> bool {
-    old.name == new.name
-        && old.source_v4 == new.source_v4
-        && old.source_v6 == new.source_v6
-        && old.dest_v4 == new.dest_v4
-        && old.dest_v6 == new.dest_v6
+    // #5293: derive this change-detector from an EXHAUSTIVE destructure of the
+    // FilterTerm with NO `..` rest pattern. Every field is bound either to a
+    // name (and compared against `old` below) or explicitly to `_` (a field
+    // that is deliberately NOT part of match semantics). Adding a new field to
+    // FilterTerm therefore FAILS TO COMPILE here until the author classifies it
+    // — making it impossible to silently omit a match-relevant field from the
+    // per-worker session-purge change detector, the way the six `flex_*` fields
+    // were omitted originally.
+    //
+    // The bug this closes: the flexible-match-range fields (#3077, #3232) were
+    // absent from the comparison, so a filter/PBR rotation that changed ONLY a
+    // flex value/mask/offset/length/enable/match-start compared EQUAL here. The
+    // worker then skipped its per-packet-L4 session purge, and an established
+    // session kept its stale (pre-rotation) routing-instance / forwarding
+    // decision until timeout — a cross-VRF policy-coherency failure (stranded
+    // reachability / egress / zone-path / NAT), not merely stale telemetry.
+    //
+    // Fields intentionally EXCLUDED from match semantics (bound to `_`):
+    //   id      — synthetic per-term identity, never a match/action criterion.
+    //   counter — runtime hit-counter Arc (shared handle), not config state.
+    let FilterTerm {
+        id: _,
+        name,
+        source_v4,
+        source_v6,
+        dest_v4,
+        dest_v6,
         // #2400: the *_constrained flags change match semantics (fail-closed vs
         // match-any) WITHOUT changing the parsed vecs/matcher in the
         // unscoped<->all-malformed transition (both leave empty vecs /
-        // PortMatcher::Any), so they MUST be compared here or a flow-cache
-        // rebuild would keep stale match-any decisions.
-        && old.source_addr_constrained == new.source_addr_constrained
-        && old.dest_addr_constrained == new.dest_addr_constrained
+        // PortMatcher::Any), so they MUST be compared or a flow-cache rebuild
+        // would keep stale match-any decisions.
+        source_addr_constrained,
+        dest_addr_constrained,
         // #2506: the except inversion flips the address decision without
-        // changing the parsed prefix vecs, so it must be compared here too — a
+        // changing the parsed prefix vecs, so it must be compared too — a
         // snapshot toggling `except` on/off otherwise keeps stale decisions.
-        && old.source_except == new.source_except
-        && old.dest_except == new.dest_except
-        && old.protocol_bitmap == new.protocol_bitmap
-        && old.protocol_match_enabled == new.protocol_match_enabled
-        && old.source_ports == new.source_ports
-        && old.dest_ports == new.dest_ports
-        && old.source_port_constrained == new.source_port_constrained
-        && old.dest_port_constrained == new.dest_port_constrained
+        source_except,
+        dest_except,
+        protocol_bitmap,
+        protocol_match_enabled,
+        source_ports,
+        dest_ports,
+        source_port_constrained,
+        dest_port_constrained,
         // #2622: the port-except inversion flips the port decision without
-        // changing the parsed port matcher, so it must be compared here too —
-        // a snapshot toggling `*-port-except` on/off otherwise keeps stale
+        // changing the parsed port matcher, so it must be compared too — a
+        // snapshot toggling `*-port-except` on/off otherwise keeps stale
         // flow-cache decisions (sibling of source_except/dest_except above).
-        && old.source_port_except == new.source_port_except
-        && old.dest_port_except == new.dest_port_except
-        && old.dscp_bitmap == new.dscp_bitmap
-        && old.dscp_match_enabled == new.dscp_match_enabled
-        && old.tcp_flags_mask == new.tcp_flags_mask
-        && old.tcp_flags_forbidden == new.tcp_flags_forbidden
-        && old.is_fragment == new.is_fragment
-        && old.icmp_type_bitmap == new.icmp_type_bitmap
-        && old.icmp_type_match_enabled == new.icmp_type_match_enabled
-        && old.icmp_code_bitmap == new.icmp_code_bitmap
-        && old.icmp_code_match_enabled == new.icmp_code_match_enabled
-        && old.action == new.action
+        source_port_except,
+        dest_port_except,
+        dscp_bitmap,
+        dscp_match_enabled,
+        tcp_flags_mask,
+        tcp_flags_forbidden,
+        is_fragment,
+        icmp_type_bitmap,
+        icmp_type_match_enabled,
+        icmp_code_bitmap,
+        icmp_code_match_enabled,
+        // #5293: flexible-match-range (#3077, #3232). All six fields change
+        // WHICH packets the term matches (byte-offset window, value/mask,
+        // enable, and the L3/L4 base), yet none are part of the 5-tuple
+        // SessionKey — so a rotation touching any of them must invalidate
+        // cached per-session decisions here.
+        flex_enabled,
+        flex_offset,
+        flex_length,
+        flex_value,
+        flex_mask,
+        flex_match_start,
+        action,
         // #2544: continue_term flips a matched term between terminate-here and
         // apply-modifiers-and-fall-through WITHOUT changing the parsed match
         // vecs, so toggling `then next term` on/off must rebuild flow-cache
         // decisions — compare it here.
-        && old.continue_term == new.continue_term
-        && old.count == new.count
-        && old.has_count == new.has_count
-        && old.log == new.log
-        && old.policer_name == new.policer_name
-        && three_color_policer_semantics_match(&old.three_color_policer, &new.three_color_policer)
-        && old.routing_instance == new.routing_instance
-        && old.forwarding_class == new.forwarding_class
-        && old.dscp_rewrite == new.dscp_rewrite
+        continue_term,
+        count,
+        has_count,
+        log,
+        policer_name,
+        three_color_policer,
+        routing_instance,
+        forwarding_class,
+        dscp_rewrite,
+        counter: _,
+    } = new;
+
+    old.name == *name
+        && old.source_v4 == *source_v4
+        && old.source_v6 == *source_v6
+        && old.dest_v4 == *dest_v4
+        && old.dest_v6 == *dest_v6
+        && old.source_addr_constrained == *source_addr_constrained
+        && old.dest_addr_constrained == *dest_addr_constrained
+        && old.source_except == *source_except
+        && old.dest_except == *dest_except
+        && old.protocol_bitmap == *protocol_bitmap
+        && old.protocol_match_enabled == *protocol_match_enabled
+        && old.source_ports == *source_ports
+        && old.dest_ports == *dest_ports
+        && old.source_port_constrained == *source_port_constrained
+        && old.dest_port_constrained == *dest_port_constrained
+        && old.source_port_except == *source_port_except
+        && old.dest_port_except == *dest_port_except
+        && old.dscp_bitmap == *dscp_bitmap
+        && old.dscp_match_enabled == *dscp_match_enabled
+        && old.tcp_flags_mask == *tcp_flags_mask
+        && old.tcp_flags_forbidden == *tcp_flags_forbidden
+        && old.is_fragment == *is_fragment
+        && old.icmp_type_bitmap == *icmp_type_bitmap
+        && old.icmp_type_match_enabled == *icmp_type_match_enabled
+        && old.icmp_code_bitmap == *icmp_code_bitmap
+        && old.icmp_code_match_enabled == *icmp_code_match_enabled
+        && old.flex_enabled == *flex_enabled
+        && old.flex_offset == *flex_offset
+        && old.flex_length == *flex_length
+        && old.flex_value == *flex_value
+        && old.flex_mask == *flex_mask
+        && old.flex_match_start == *flex_match_start
+        && old.action == *action
+        && old.continue_term == *continue_term
+        && old.count == *count
+        && old.has_count == *has_count
+        && old.log == *log
+        && old.policer_name == *policer_name
+        && three_color_policer_semantics_match(&old.three_color_policer, three_color_policer)
+        && old.routing_instance == *routing_instance
+        && old.forwarding_class == *forwarding_class
+        && old.dscp_rewrite == *dscp_rewrite
 }
 
 fn dscp_sensitive_filter_semantics_match(old: &Filter, new: &Filter) -> bool {
@@ -582,5 +660,73 @@ mod cache_sensitive_2400_tests {
             !super::filter_term_semantics_match(&unscoped, &all_malformed),
             "unscoped vs all-malformed port must NOT be cache-equal"
         );
+    }
+
+    /// #5293: the six flexible-match-range fields (`flex_enabled`,
+    /// `flex_offset`, `flex_length`, `flex_value`, `flex_mask`,
+    /// `flex_match_start`) change WHICH packets a term matches but are NOT part
+    /// of the 5-tuple SessionKey. A filter/PBR rotation that touches ONLY a flex
+    /// field must be reported as NOT cache-equal so the per-worker session purge
+    /// runs — otherwise an established session strands on its stale (pre-
+    /// rotation) routing-instance / forwarding decision until timeout.
+    ///
+    /// Each case clones one compiled base term and mutates exactly ONE flex
+    /// field, so the ONLY distinguishing bit is that field. REVERT (dropping the
+    /// `flex_*` comparisons from `filter_term_semantics_match`) makes every
+    /// "changed flex field" assertion FAIL — the comparator would wrongly return
+    /// `true` (equal) and skip the purge.
+    #[test]
+    fn flex_field_change_is_not_cache_equal() {
+        let base = term_from(FirewallTermSnapshot {
+            name: "t".into(),
+            action: "discard".into(),
+            ..Default::default()
+        });
+
+        // Control: a term compared with an untouched clone stays cache-equal
+        // (no spurious invalidation for a no-op rotation).
+        let identical = base.clone();
+        assert!(
+            super::filter_term_semantics_match(&base, &identical),
+            "an identical term must be cache-equal (no spurious purge)"
+        );
+
+        // Each mutated clone differs from `base` in EXACTLY one flex field.
+        let mut flex_enabled = base.clone();
+        flex_enabled.flex_enabled = !base.flex_enabled;
+
+        let mut flex_offset = base.clone();
+        flex_offset.flex_offset = base.flex_offset.wrapping_add(1);
+
+        let mut flex_length = base.clone();
+        flex_length.flex_length = base.flex_length.wrapping_add(1);
+
+        let mut flex_value = base.clone();
+        flex_value.flex_value = base.flex_value ^ 0xA5A5_A5A5;
+
+        let mut flex_mask = base.clone();
+        flex_mask.flex_mask = base.flex_mask ^ 0xA5A5_A5A5;
+
+        let mut flex_match_start = base.clone();
+        // Pick a variant strictly different from the base's (default Layer3).
+        flex_match_start.flex_match_start = match base.flex_match_start {
+            FlexMatchStart::Layer3 => FlexMatchStart::Layer4,
+            _ => FlexMatchStart::Layer3,
+        };
+
+        for (label, mutated) in [
+            ("flex_enabled", &flex_enabled),
+            ("flex_offset", &flex_offset),
+            ("flex_length", &flex_length),
+            ("flex_value", &flex_value),
+            ("flex_mask", &flex_mask),
+            ("flex_match_start", &flex_match_start),
+        ] {
+            assert!(
+                !super::filter_term_semantics_match(&base, mutated),
+                "a change to `{label}` must NOT be cache-equal (the rotation \
+                 purge must run so sessions do not strand on stale decisions)"
+            );
+        }
     }
 }
