@@ -512,6 +512,9 @@ pub(super) fn apply_lo0_filter_action(
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
+    // #5857: poll-iteration monotonic timestamp — threaded so the lo0 filter
+    // METERS each matched term's three-color policer (control-plane rate limit).
+    now_ns: u64,
 ) -> (crate::filter::FilterAction, Option<PendingFilterLog>) {
     let Some(flow) = flow else {
         return (crate::filter::FilterAction::Accept, None);
@@ -528,7 +531,27 @@ pub(super) fn apply_lo0_filter_action(
         meta.dscp,
         extra,
         meta.pkt_len as u64,
+        // #5857: Some(now_ns) meters the policer on every matched lo0 term
+        // (drop + color decision), exactly like the interface TX-selection leg.
+        Some(now_ns),
     );
+    // #5857: a policer that marked this host-bound packet as exceeding/violating
+    // (`policer_drop`) forces a DROP even when the matched term's verdict was
+    // Accept. This is the control-plane rate-limit enforcement that was inert
+    // before #5857: the compiler linked the policer runtime and the evaluator
+    // reported a match, but the lo0/local-delivery path never metered nor
+    // dropped. A policer drop is a SILENT discard (Junos policer semantics — no
+    // TCP RST / ICMP unreachable is synthesized), so it maps to `Discard`, not
+    // `Reject`. An already-terminal `Discard`/`Reject` verdict is left intact
+    // (the packet drops either way; the term's own action governs reply
+    // semantics). Because `policer_drop` is OR-accumulated across the whole
+    // `next term` chain, a later permit cannot erase an earlier policer drop.
+    let action =
+        if result.policer_drop && matches!(result.action, crate::filter::FilterAction::Accept) {
+            crate::filter::FilterAction::Discard
+        } else {
+            result.action
+        };
     // #3615: DEFER the filter-log emit — return the matched record so the caller
     // can emit it AFTER the reject-reply enqueue outcome is known (flow-backed)
     // or with reject_reply_enqueued=false (flowless). This preserves the exact
@@ -548,7 +571,7 @@ pub(super) fn apply_lo0_filter_action(
         // #2520: AppID via the hot-path app_catalog.lookup.
         app_id: resolve_flow_app_id(&forwarding.app_catalog, flow),
     });
-    (result.action, pending)
+    (action, pending)
 }
 
 /// #3485: host-inbound zone admission MUST gate the lo0 (host-bound) firewall
@@ -597,6 +620,8 @@ pub(super) fn host_inbound_gated_lo0_action(
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
     lo0_ingress_zone_override: Option<u16>,
+    // #5857: poll-iteration monotonic timestamp for the lo0 policer meter.
+    now_ns: u64,
 ) -> Option<(crate::filter::FilterAction, Option<PendingFilterLog>)> {
     // Host-inbound gate FIRST — a denied packet is a fail-closed silent drop
     // with NO lo0 side-effects (#3485). #3362: keyed by ingress interface so a
@@ -630,6 +655,7 @@ pub(super) fn host_inbound_gated_lo0_action(
         Some(flow),
         meta,
         lo0_ingress_zone_override,
+        now_ns,
     ))
 }
 
@@ -750,6 +776,7 @@ mod lo0_gate_tests {
             &flow,
             meta,
             Some(DENY_ZONE),
+            0, // #5857: now_ns — irrelevant (host-inbound denies before lo0 eval)
         );
         assert!(
             action.is_none(),
@@ -780,6 +807,7 @@ mod lo0_gate_tests {
             &flow,
             meta,
             Some(ADMIT_ZONE),
+            0, // #5857: now_ns — no policer term in these tests, so unused
         );
         assert_eq!(
             action.map(|(a, _)| a),
@@ -843,6 +871,7 @@ mod lo0_gate_tests {
             &flow,
             meta,
             Some(ADMIT_ZONE),
+            0, // #5857: now_ns — no policer term in these tests, so unused
         );
         assert!(
             action.is_none(),
@@ -853,6 +882,144 @@ mod lo0_gate_tests {
             lo0_term_packets(&fw),
             0,
             "lo0 filter must NOT run when the logical override denies (#3609)",
+        );
+    }
+
+    /// #5857: a lo0 (host-bound) firewall filter term carrying a named policer
+    /// must METER host-bound traffic and DROP packets that exceed the configured
+    /// rate. Before #5857 the control-plane rate limit was INERT — the compiler
+    /// linked the three-color runtime and `evaluate_lo0_filter_counted` reported
+    /// a match + copied `policer_name`, but the local-delivery path
+    /// (`apply_lo0_filter_action`) consumed only `action` + `log_match`: it never
+    /// metered the policer nor dropped an exceeding packet. An untrusted peer
+    /// could therefore exceed the operator's control-plane protection envelope.
+    ///
+    /// This drives `host_inbound_gated_lo0_action` — the single helper both
+    /// LocalDelivery call sites (session-HIT and session-MISS) route through —
+    /// with a conforming then an exceeding host-bound UDP packet on an admit-all
+    /// zone, and asserts the exceeding packet DROPS and the policer drop counter
+    /// advances (proving the meter actually ran, not just that a verdict flipped).
+    ///
+    /// Fail-on-revert: neutralizing the metering wire-in (the
+    /// `apply_term_three_color_policer` call in `eval::merge_matched_modifiers`,
+    /// or the `policer_drop`→`Discard` downgrade in `apply_lo0_filter_action`)
+    /// leaves the second packet ACCEPTED and `drop_packets` at 0 — RED on both.
+    #[test]
+    fn lo0_policer_meters_and_drops_host_bound_traffic() {
+        // lo0 filter: UDP host-bound traffic is accepted but rate-limited by a
+        // single-rate policer (1000-byte bucket) — a control-plane protect-RE
+        // filter policing a host-bound service.
+        let mut fw = ForwardingState::default();
+        fw.filter_state = crate::filter::parse_filter_state(
+            &[crate::FirewallFilterSnapshot {
+                name: "protect-re".into(),
+                family: "inet".into(),
+                terms: vec![crate::FirewallTermSnapshot {
+                    name: "police-udp".into(),
+                    protocols: vec!["udp".into()],
+                    policer: "rl-1kb".into(),
+                    action: "accept".into(),
+                    count: "lo0-udp".into(),
+                    ..Default::default()
+                }],
+            }],
+            &[crate::PolicerSnapshot {
+                name: "rl-1kb".into(),
+                bandwidth_bps: 8_000, // 1000 bytes/sec committed rate
+                burst_bytes: 1_000,   // 1000-byte token bucket
+                discard_excess: true,
+            }],
+            &[],
+            "protect-re",
+            "",
+        )
+        .expect("filter state compiles");
+
+        let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        // meta.pkt_len drives the policer byte count (apply_lo0_filter_action
+        // passes it as `packet_bytes`).
+        let make = |pkt_len: u16| {
+            let meta = UserspaceDpMeta {
+                protocol: crate::ip_proto::PROTO_UDP,
+                addr_family: libc::AF_INET as u8,
+                l3_offset: 14,
+                l4_offset: 34,
+                pkt_len,
+                ..UserspaceDpMeta::default()
+            };
+            let flow = SessionFlow {
+                src_ip: src,
+                dst_ip: dst,
+                forward_key: SessionKey {
+                    addr_family: libc::AF_INET as u8,
+                    protocol: crate::ip_proto::PROTO_UDP,
+                    src_ip: src,
+                    dst_ip: dst,
+                    src_port: 40000,
+                    dst_port: 5000,
+                },
+            };
+            (flow, meta)
+        };
+        let extra_udp = TermMatchExtra {
+            l4_present: true,
+            ..Default::default()
+        };
+        // now_ns fixed so the token bucket does NOT refill between the packets.
+        const NOW_NS: u64 = 1_000;
+
+        // First 900-byte packet drains most of the 1000-byte bucket — conforming
+        // → delivered (Accept).
+        let (flow1, meta1) = make(900);
+        let first = host_inbound_gated_lo0_action(
+            &fw,
+            meta1.ingress_ifindex as i32,
+            ADMIT_ZONE,
+            5000,
+            false,
+            0,
+            extra_udp,
+            &flow1,
+            meta1,
+            Some(ADMIT_ZONE),
+            NOW_NS,
+        );
+        assert_eq!(
+            first.map(|(a, _)| a),
+            Some(FilterAction::Accept),
+            "a conforming host-bound packet must be delivered",
+        );
+
+        // Second 900-byte packet exceeds the ~100 remaining tokens — the policer
+        // drops it. Before #5857 this was ACCEPTED (rate limit inert).
+        let (flow2, meta2) = make(900);
+        let second = host_inbound_gated_lo0_action(
+            &fw,
+            meta2.ingress_ifindex as i32,
+            ADMIT_ZONE,
+            5000,
+            false,
+            0,
+            extra_udp,
+            &flow2,
+            meta2,
+            Some(ADMIT_ZONE),
+            NOW_NS,
+        );
+        assert_eq!(
+            second.map(|(a, _)| a),
+            Some(FilterAction::Discard),
+            "host-bound traffic above the lo0 policer rate must be dropped (#5857)",
+        );
+
+        // The policer's drop counter advanced — proving the meter ran on the
+        // host-bound path.
+        let status = fw.filter_state.three_color_policer_statuses();
+        assert_eq!(status.len(), 1, "one lowered single-rate policer");
+        assert!(
+            status[0].drop_packets >= 1,
+            "the lo0 policer must record the host-bound drop",
         );
     }
 }

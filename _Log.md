@@ -1,3 +1,57 @@
+## 2026-07-16 — #5857: lo0 firewall policers now meter host-bound traffic
+
+- **Timestamp**: 2026-07-16 (fix/5857-lo0-policer-meter)
+- **Action**: Wired the existing three-color policer metering into the lo0 /
+  local-delivery filter path. Root cause: a firewall filter on `lo0` can carry
+  a `then policer`, and the compiler links the three-color runtime onto the
+  term, but the local-delivery path (`apply_lo0_filter_action`) consumed only
+  `result.action` + `result.log_match` — it never called
+  `apply_term_three_color_policer`, never metered the named policer, and never
+  applied a policer drop. So a strict-valid control-plane rate limit
+  (SSH/BGP/routing/ICMP to the RE) was INERT (a security / control-plane-
+  protection gap: an untrusted peer could exceed the operator's envelope).
+  Fix REUSES the proven runtime (used by interface TX-selection + cached-flow
+  paths), it does not reimplement it:
+    - `filter/engine/eval.rs`: threaded `now_ns: Option<u64>` through the shared
+      `evaluate_filter_ref_counted` → `_v4`/`_v6` → `merge_matched_modifiers`.
+      `Some(now_ns)` (the lo0 path) meters each matched term's three-color
+      policer via `apply_term_three_color_policer` and folds the drop into
+      `FilterResult.policer_drop` (OR-accumulated across a `then next term`
+      chain, so a later permit cannot erase an earlier drop) with the policer's
+      DSCP-rewrite precedence over the term's. `None` (interface input/output
+      action-eval + PBR prechecks — which meter their policer in the separate
+      tx-selection walk) skips metering here → byte-for-byte identical to the
+      pre-fix behavior (no double-meter). `evaluate_lo0_filter_counted` gained
+      the `now_ns` param; the `evaluate_lo0_filter` test wrapper passes `None`.
+    - `filter/mod.rs`: added `FilterResult.policer_drop` (default false; set only
+      by the metered lo0 walk).
+    - `afxdp/poll_descriptor/filter.rs`: `apply_lo0_filter_action` +
+      `host_inbound_gated_lo0_action` take `now_ns: u64`; `apply_lo0_filter_action`
+      passes `Some(now_ns)` and downgrades an `Accept` verdict to a silent
+      `Discard` when `policer_drop` (Junos policer drops are silent — no RST /
+      ICMP reject). All 3 LocalDelivery call sites in `poll_descriptor/mod.rs`
+      (flowless, session-HIT, session-MISS) pass `now_ns`.
+  - **Test (fail-on-revert)**: `lo0_policer_meters_and_drops_host_bound_traffic`
+    in `poll_descriptor/filter.rs` drives `host_inbound_gated_lo0_action` with a
+    conforming then an exceeding host-bound UDP packet on an admit-all zone;
+    asserts the exceeding packet returns `Discard` AND the policer `drop_packets`
+    counter advances. Reverting the wire-in → second packet ACCEPTED → RED
+    (verified firsthand: `assertion left == right failed: host-bound traffic
+    above the lo0 policer rate must be dropped`).
+  - **Validation**: full Rust suite `cargo test --release` → 3867 passed, 0
+    failed; lo0 (13) + policer (16) suites green; `cargo build --release` clean;
+    my hunk rustfmt-clean. Smoke deferred (loss-cluster shim-ABI wall);
+    correctness gated on the cargo fail-on-revert test.
+  - **Scope note**: host-bound DSCP/color rewrite for a policed lo0 packet is
+    NOT applied to the delivered frame (the lo0 local-delivery path has no
+    frame-DSCP-rewrite mechanism — even a term's plain `then dscp` is unapplied
+    on lo0); only the drop is enforced. Documented in `filter/README.md`.
+- **File(s)**: userspace-dp/src/filter/engine/eval.rs,
+  userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/filter/README.md, _Log.md
+
 ## 2026-07-16 — #6036 fold: deterministic per-interface RA prefix order (#5861)
 
 - **Timestamp**: 2026-07-16 (fix/5861-ra-stable-active-reconcile)

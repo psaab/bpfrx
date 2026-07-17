@@ -848,6 +848,39 @@ a lo0 decision in the first place. This is noted here so future
 readers do not repeat the v1 plan investigation that mistook lo0
 for a missing cache-sensitive gate.
 
+### lo0 host-bound filters meter their policer (#5857)
+
+A firewall filter attached to `lo0` can carry a `then policer`, and the
+compiler links the three-color runtime onto the term exactly as it does
+for interface filters. Before #5857 the lo0 / local-delivery path
+evaluated the filter with `evaluate_lo0_filter_counted` but consumed only
+`action` + `log_match` — it never metered the named policer nor applied a
+policer drop, so a strict-valid control-plane rate limit (SSH / BGP /
+routing / ICMP to the routing engine) was **inert** (a
+control-plane-protection gap: an untrusted peer could exceed the
+operator's envelope).
+
+lo0 has NO separate tx-selection leg (unlike interface input/output
+filters, which meter their policer in the tx-selection walk), so the lo0
+action-eval is the ONLY place its policer can be metered — there is no
+double-meter risk. `evaluate_lo0_filter_counted` now threads a
+poll-iteration `now_ns` (`Some(..)` on the live path) so the shared
+term walk meters each matched term's three-color policer via
+`apply_term_three_color_policer` — the SAME runtime the interface
+tx-selection leg uses — folding the drop into `FilterResult.policer_drop`
+(OR-accumulated across a `then next term` chain, so a later permit cannot
+erase an earlier policer drop). `apply_lo0_filter_action` then downgrades
+an `Accept` verdict to a silent `Discard` when `policer_drop` is set
+(policer drops are silent per Junos semantics — no TCP RST / ICMP
+unreachable is synthesized). The three non-lo0 callers of the shared walk
+(interface input/output action-eval + PBR prechecks) pass `now_ns = None`
+so they do NOT meter here (byte-for-byte identical to pre-#5857). Test:
+`lo0_policer_meters_and_drops_host_bound_traffic` in
+`poll_descriptor/filter.rs`. Host-bound **DSCP/color rewrite** for a
+policed lo0 packet is not applied to the delivered frame (the lo0
+local-delivery path has no frame-DSCP-rewrite mechanism — even a term's
+plain `then dscp` is not applied on lo0); only the drop is enforced.
+
 ### `then reject` synthesizes an active reply (#2521)
 
 `FilterAction::Reject` (`then reject`) no longer realizes as a silent

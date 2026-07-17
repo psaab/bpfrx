@@ -837,6 +837,15 @@ pub(crate) struct FilterResult {
     pub(crate) action: FilterAction,
     pub(crate) dscp_rewrite: Option<u8>,
     pub(crate) policer_name: String,
+    // #5857: OR of every matched term's three-color-policer drop decision. Only
+    // the METERED walk (`evaluate_lo0_filter_counted` with `now_ns = Some`, the
+    // lo0 host-bound path) sets this; the shared action-eval walk leaves it false
+    // (its policer is metered in the tx-selection leg, not here). A late permit
+    // cannot erase an earlier policer drop because this is OR-accumulated across
+    // the whole `next term` chain. The lo0 caller downgrades an `Accept` verdict
+    // to a silent `Discard` when this is set — enforcing the configured
+    // control-plane rate limit that was previously inert on host-bound traffic.
+    pub(crate) policer_drop: bool,
     pub(crate) routing_instance: String,
     // #5151: `None` == no forwarding-class matched (semantically identical to
     // the historical empty `""`). Mirrors TxSelection/CachedTxSelection which
@@ -905,6 +914,8 @@ impl Default for FilterResult {
             action: FilterAction::Accept,
             dscp_rewrite: None,
             policer_name: String::new(),
+            // #5857: no policer drop by default; set only by the metered lo0 walk.
+            policer_drop: false,
             routing_instance: String::new(),
             // #5151: zero-alloc default — no Arc header/data block allocated on
             // the warmed packet path. A matching `then forwarding-class` term
