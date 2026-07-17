@@ -518,22 +518,36 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   snapshot WITHOUT taking the peer's mutex, so a guard holding its own manager's
   `mu` never blocks on the peer's `mu` (no AB-BA cycle). A nil accessor
   (standalone / pre-wire boot) restores the pre-#5748 single-surface behavior.
-  Surface A suppressions are counted (`SurfaceAStats.DeleteCoowned`); both
+  Surface A deferrals are counted (`SurfaceAStats.DeleteCoowned`); both
   directions are fail-on-revert covered by `cross_surface_clobber_5748_test.go`.
-  **Eventual-consistency caveat (#5748 follow-up):** the cross-surface
-  snapshot is rebuilt at the END of each reconcile pass, so cross-surface
-  visibility is eventually- (not strongly-) consistent. Two tight-race
-  windows remain — both a STRICT improvement over the prior deterministic,
-  always-reachable cross-surface clobber, not a new outage class: (a) a
-  just-published co-owner not yet in the peer snapshot when the other
-  surface tears down → a residual clobber that shrinks the prior 100%
-  clobber to a sub-millisecond race (operator-repairable via `request
-  system dynamic-dns update`, the #5710 force-update); (b) both surfaces
-  tearing down the SAME co-owned RR in overlapping passes each read the
-  other's pre-rebuild snapshot and both suppress → the RR — still holding
-  the identical published rdata (a valid, not-orphaned record) — is left on
-  the wire until an owner's later IP change re-issues it. A deterministic
-  suppression tie-break to close window (b) is tracked as a #5748 follow-up.
+  **Deterministic suppression tie-break (#6015, closes window (b)):** the
+  cross-surface snapshot is rebuilt at the END of each reconcile pass, so
+  cross-surface visibility is eventually- (not strongly-) consistent. Without a
+  tie-break, if BOTH surfaces tore down the SAME co-owned RR in overlapping
+  passes, each read the OTHER's pre-rebuild snapshot (still listing the RR
+  owned) and each suppress-and-RELEASED → the RR was left on the wire UNOWNED
+  (orphaned window (b)). The tie-break designates **Surface B (the lease
+  `Manager`) as the SOLE SUPPRESSION AUTHORITY**: only Surface B may
+  suppress-and-release a cross-surface co-owned RR (unchanged from #6012 —
+  `deleteOwnedLocked` / `wireRRSharedWithOther`). **Surface A is the
+  NON-AUTHORITY**: on a teardown of a co-owned RR it does NOT delete (that would
+  clobber the lease-owned RR — the #6012 caution) and does NOT suppress-and-release
+  (that is the window-(b) orphan). Instead it **DEFERS**: it RE-ASSERTS (re-UPSERTs)
+  the RR so a leaked RR self-heals, and KEEPS its ownership claim, retrying the
+  teardown on later passes. The real wire delete is deferred until the lease
+  authority has RELEASED its co-ownership — a later pass finds `leaseWireRRCoowner`
+  false for every target and deletes + releases normally
+  (`SurfaceAManager.withdrawOwnedLocked`). Because Surface B always releases first
+  and Surface A always defers-until-B-is-gone, exactly ONE surface ever deletes a
+  cross-surface co-owned RR: mutual suppression can never orphan it (Surface A stays
+  the deterministic last-claimant), and Surface A never clobbers a record Surface B
+  still owns. `rebuildWireRRClaimsLocked` keeps advertising Surface A's deferred
+  claim so the lease side continues to see the co-ownership. The remaining
+  **window (a)** (a just-published co-owner not yet in the peer snapshot when the
+  other surface tears down → a residual sub-millisecond clobber) is accepted as-is:
+  it is operator-repairable via `request system dynamic-dns update` (the #5710
+  force-update), and the #6015 Surface A re-assert self-heals it on the next
+  deferred pass.
 - **Source / VRF binding (#2665, `backend_bind.go`)** — the per-family
   `source-address` / `destination-interface` / `routing-instance` leaves build a
   custom `net.Dialer` (one `Control` hook: `unix.Bind` for the source IP +
