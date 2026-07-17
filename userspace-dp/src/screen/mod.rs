@@ -187,12 +187,18 @@ pub(crate) struct ScreenState {
     /// threshold` is per destination). Present (Some) only for zones whose
     /// `icmp_flood_threshold > 0`; reuses the #3315 count-min `SynRateSketch`
     /// substrate. PRIMARY cap — checked before the per-zone aggregate ceiling.
-    icmp_dst_sketch: FxHashMap<String, SynRateSketch>,
+    /// #5805: the sketch cells are monotonic-ns `TokenBucket`s, not
+    /// `RateCounter`s, so a destination parked at exactly `icmp_flood_threshold`
+    /// pps stays admitted STEADILY (the count-all `RateCounter` collapsed it to
+    /// ~0 after the first second) while an over-threshold destination is still
+    /// limited down to the configured rate.
+    icmp_dst_sketch: FxHashMap<String, SynRateSketch<TokenBucket>>,
     /// #4112: per-zone per-DESTINATION (IP + PORT) UDP flood sketch (Junos `udp
     /// flood threshold` is per destination IP AND port). Present only for zones
     /// whose `udp_flood_threshold > 0`; reuses the #3315 sketch via
     /// `increment_ip_port`. PRIMARY cap — checked before the per-zone aggregate.
-    udp_dst_sketch: FxHashMap<String, SynRateSketch>,
+    /// #5805: `TokenBucket` cells (see `icmp_dst_sketch`).
+    udp_dst_sketch: FxHashMap<String, SynRateSketch<TokenBucket>>,
     syn_cookie_active_until_secs: FxHashMap<String, u64>,
     /// #3607: the standby SYN-cookie ACK validation budget is a validate-budget
     /// shaper ("admitted" = "spend a SipHash on a plausible returning ACK"; a
@@ -434,12 +440,12 @@ impl ScreenState {
             if profiles[zone].icmp_flood_threshold > 0 {
                 self.icmp_dst_sketch
                     .entry(zone.clone())
-                    .or_insert_with(SynRateSketch::for_dst);
+                    .or_insert_with(SynRateSketch::for_flood_dst);
             }
             if profiles[zone].udp_flood_threshold > 0 {
                 self.udp_dst_sketch
                     .entry(zone.clone())
-                    .or_insert_with(SynRateSketch::for_dst);
+                    .or_insert_with(SynRateSketch::for_flood_dst);
             }
             self.syn_cookie_active_until_secs
                 .entry(zone.clone())
@@ -651,13 +657,15 @@ impl ScreenState {
         dst_ip: &IpAddr,
         threshold: u32,
         now_ns: u64,
-        now_secs: u64,
     ) -> bool {
-        // (1) per-DESTINATION cap — PRIMARY (Junos parity). Still the #3315
-        // count-min `RateCounter` sketch (deferred from the #3607 migration —
-        // see the plan §5b); keyed on `now_secs`.
+        // (1) per-DESTINATION cap — PRIMARY (Junos parity). #5805: the count-min
+        // sketch now carries monotonic-ns `TokenBucket` cells (keyed on `now_ns`,
+        // the batch-cached `loop_now_ns`), so a destination parked at exactly
+        // `threshold` pps is admitted STEADILY instead of collapsing to ~0 after
+        // the first second (the count-all `RateCounter` defect). An
+        // over-threshold destination is still limited down to `threshold`.
         if let Some(sketch) = self.icmp_dst_sketch.get_mut(zone)
-            && sketch.increment(dst_ip, now_secs, threshold)
+            && sketch.increment(dst_ip, now_ns, threshold)
         {
             return true;
         }
@@ -686,10 +694,10 @@ impl ScreenState {
         dst_port: u16,
         threshold: u32,
         now_ns: u64,
-        now_secs: u64,
     ) -> bool {
-        // (1) per-DESTINATION cap — PRIMARY (Junos parity). Still the #3315
-        // `RateCounter` sketch (deferred, `now_secs`).
+        // (1) per-DESTINATION cap — PRIMARY (Junos parity). #5805: `TokenBucket`
+        // sketch cells keyed on `now_ns` (see `icmp_flood_drop`), so a
+        // (dst_ip, dst_port) parked at exactly `threshold` pps stays admitted.
         //
         // #4567: a non-first IP fragment carries no L4 header, so the flowless
         // caller passes `dst_port == 0`. Counting it via `increment_ip_port(ip,
@@ -707,9 +715,9 @@ impl ScreenState {
         // lacks, so the per-IP fold is the bounded, honest abstraction.
         if let Some(sketch) = self.udp_dst_sketch.get_mut(zone) {
             let over = if dst_port == 0 {
-                sketch.increment(dst_ip, now_secs, threshold)
+                sketch.increment(dst_ip, now_ns, threshold)
             } else {
-                sketch.increment_ip_port(dst_ip, dst_port, now_secs, threshold)
+                sketch.increment_ip_port(dst_ip, dst_port, now_ns, threshold)
             };
             if over {
                 return true;
@@ -878,7 +886,7 @@ impl ScreenState {
         // (SECONDARY). Junos measures this rate per destination IP (#4112 F18).
         if icmp_flood_threshold > 0
             && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
-            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_ns, now_secs)
+            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_ns)
         {
             return ScreenVerdict::Drop("icmp-flood");
         }
@@ -888,14 +896,7 @@ impl ScreenState {
         // (#4112 F18).
         if udp_flood_threshold > 0
             && pkt.protocol == PROTO_UDP
-            && self.udp_flood_drop(
-                zone,
-                &pkt.dst_ip,
-                pkt.dst_port,
-                udp_flood_threshold,
-                now_ns,
-                now_secs,
-            )
+            && self.udp_flood_drop(zone, &pkt.dst_ip, pkt.dst_port, udp_flood_threshold, now_ns)
         {
             return ScreenVerdict::Drop("udp-flood");
         }
@@ -1228,7 +1229,7 @@ impl ScreenState {
         // fragment-based flood from evading the per-destination cap.
         if icmp_flood_threshold > 0
             && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
-            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_ns, now_secs)
+            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_ns)
         {
             return ScreenVerdict::Drop("icmp-flood");
         }
@@ -1240,14 +1241,7 @@ impl ScreenState {
         // stray `(ip, 0)` cell (#4112 F18, #4567).
         if udp_flood_threshold > 0
             && pkt.protocol == PROTO_UDP
-            && self.udp_flood_drop(
-                zone,
-                &pkt.dst_ip,
-                pkt.dst_port,
-                udp_flood_threshold,
-                now_ns,
-                now_secs,
-            )
+            && self.udp_flood_drop(zone, &pkt.dst_ip, pkt.dst_port, udp_flood_threshold, now_ns)
         {
             return ScreenVerdict::Drop("udp-flood");
         }

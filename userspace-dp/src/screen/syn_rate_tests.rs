@@ -226,3 +226,112 @@ fn single_source_flood_trips_under_pinned_seed() {
         );
     }
 }
+
+// ================================================================
+// #5805: the ICMP/UDP per-destination FLOOD sketch (`for_flood_dst`) carries
+// `TokenBucket` cells. `increment` here takes `now_ns` (monotonic nanoseconds),
+// NOT `now_secs`. These pin the token-bucket sketch invariants directly.
+// ================================================================
+
+/// One whole nanosecond-second for readable `now_ns` arithmetic.
+const NS: u64 = 1_000_000_000;
+
+/// #5805: the flood sketch is still fixed at `ROWS * DST_COLS` cells and does
+/// NOT grow under a flood of distinct destinations — the token-bucket cell is
+/// the same 16 bytes as `RateCounter`, so the operator memory advisory bound is
+/// unchanged.
+#[test]
+fn flood_sketch_capacity_fixed_and_no_growth() {
+    let mut s = SynRateSketch::for_flood_dst();
+    let before = s.capacity();
+    assert_eq!(
+        before,
+        ROWS * DST_COLS,
+        "flood sketch capacity is ROWS * DST_COLS"
+    );
+    let now_ns = 5 * NS;
+    for k in 0..50_000u32 {
+        let dst = v4((k >> 24) as u8, (k >> 16) as u8, (k >> 8) as u8, k as u8);
+        s.increment(&dst, now_ns, 20);
+    }
+    assert_eq!(
+        s.capacity(),
+        before,
+        "token-bucket flood sketch must not grow under a flood"
+    );
+}
+
+/// #5805: enforcement preserved — an instantaneous burst ABOVE the per-cell
+/// capacity drains all `ROWS` cells, so the count-min AND reports over-limit.
+/// The token-bucket migration does not weaken the flood cap.
+#[test]
+fn flood_sketch_over_threshold_trips_at_instant() {
+    let mut s = SynRateSketch::for_flood_dst();
+    const T: u32 = 5;
+    let victim = v4(10, 0, 0, 1);
+    let now_ns = 3 * NS;
+    // Cold-start capacity is T; the first T admit, the (T+1)th (same instant)
+    // finds every row drained → trips.
+    for _ in 0..T {
+        assert!(
+            !s.increment(&victim, now_ns, T),
+            "first {T} admitted (cold-start capacity)"
+        );
+    }
+    assert!(
+        s.increment(&victim, now_ns, T),
+        "an over-capacity burst trips (all rows drained)"
+    );
+}
+
+/// #5805 unit-level RED-ON-REVERT: a destination parked at EXACTLY `threshold`
+/// events/second, paced across 20 one-second boundaries, stays admitted on the
+/// token-bucket flood sketch. The count-all `RateCounter` (the reverted cell)
+/// would collapse it to ~one window after the first second.
+#[test]
+fn flood_sketch_sustained_at_threshold_admits_across_seconds() {
+    const T: u32 = 200;
+    let mut s = SynRateSketch::for_flood_dst();
+    let dst = v4(10, 0, 2, 1);
+    let interval_ns = NS / T as u64;
+    let mut now_ns = 4 * NS;
+    let total = T * 20;
+    let mut admitted = 0u32;
+    for _ in 0..total {
+        if !s.increment(&dst, now_ns, T) {
+            admitted += 1;
+        }
+        now_ns += interval_ns;
+    }
+    assert!(
+        admitted as f64 >= 0.99 * total as f64,
+        "sustained at-threshold destination must stay admitted (#5805): {admitted}/{total}"
+    );
+}
+
+/// #5805: distinct destination PORTS count independently on the token-bucket
+/// sketch (`increment_ip_port`), matching Junos `udp flood threshold`. Two ports
+/// to the same IP, each sustained at threshold, both stay admitted.
+#[test]
+fn flood_sketch_distinct_ports_independent_sustained() {
+    const T: u32 = 100;
+    let mut s = SynRateSketch::for_flood_dst();
+    let dst = v4(10, 0, 2, 9);
+    let interval_ns = NS / T as u64;
+    let mut now_ns = 4 * NS;
+    let total = T * 10;
+    let (mut ok80, mut ok443) = (0u32, 0u32);
+    for _ in 0..total {
+        if !s.increment_ip_port(&dst, 80, now_ns, T) {
+            ok80 += 1;
+        }
+        if !s.increment_ip_port(&dst, 443, now_ns, T) {
+            ok443 += 1;
+        }
+        now_ns += interval_ns;
+    }
+    assert!(
+        ok80 as f64 >= 0.99 * total as f64 && ok443 as f64 >= 0.99 * total as f64,
+        "each (ip,port) sustained at threshold stays admitted independently: {ok80}/{ok443} of {total}"
+    );
+}

@@ -13,15 +13,34 @@
 //! additionally per destination PORT), not per zone aggregate. `increment` keys
 //! on the destination IP (ICMP, and a port-less UDP fragment — #4567);
 //! `increment_ip_port` mixes the destination port in (UDP with a real L4 port).
-//! The per-zone aggregate `RateCounter` is retained as a coarser SECONDARY
+//! The per-zone aggregate `TokenBucket` is retained as a coarser SECONDARY
 //! ceiling above these per-destination caps.
 //!
-//! ## Substrate — count-min sketch of `RateCounter`s, NO eviction
+//! ## The cell type is generic over [`SketchCell`] (#5805)
+//!
+//! The sketch is parameterized over its per-cell limiter so the SAME count-min
+//! structure serves two consumers with different admission semantics:
+//!
+//! - The #3315 SYN per-source / per-destination sketches use `RateCounter`
+//!   cells (the DEFAULT `SynRateSketch<RateCounter>` — `for_dst` / `for_src`).
+//!   There "admitted" means "skip a recoverable security response", so the
+//!   count-all sustained-at-threshold over-throttle is deliberate.
+//! - The #4112 / #5805 ICMP/UDP per-destination flood sketches use `TokenBucket`
+//!   cells (`SynRateSketch<TokenBucket>` — `for_flood_dst`). A flood cap is a
+//!   pure rate gate: a destination parked at exactly `threshold` events/second
+//!   must stay admitted STEADILY. `RateCounter` collapsed it to ~0 after the
+//!   first second (count-all whole-second window, #5805); the token bucket
+//!   refills continuously so the configured rate is honoured, while a
+//!   sub-millisecond boundary straddle still sees at most `threshold` tokens
+//!   (#2937 preserved) and an over-threshold destination is still limited DOWN
+//!   to the rate.
+//!
+//! ## Substrate — count-min sketch of `SketchCell`s, NO eviction
 //!
 //! The limiter is a **count-min sketch (CMS)**: `ROWS` independent rows of
-//! `cols` `RateCounter`s. A key (an IP) maps, via `ROWS` INDEPENDENT seeded
-//! hashes, to one cell per row. `increment` advances and counts the key in all
-//! `ROWS` cells and reports whether it is over the threshold.
+//! `cols` cells. A key (an IP) maps, via `ROWS` INDEPENDENT seeded hashes, to
+//! one cell per row. `increment` advances and counts the key in all `ROWS`
+//! cells and reports whether it is over the threshold.
 //!
 //! Trip ⟺ EVERY one of the `ROWS` cells reports over-threshold. Because the
 //! smallest over-threshold cell implies all cells exceed it, this is exactly
@@ -74,14 +93,63 @@
 //! eviction scan — steady-state AND under a spoofed flood. Allocated once at
 //! config for zones that configure a threshold; freed when disabled.
 //!
-//! `RateCounter` ≈ 16 B. Per configured zone, per worker: per-dest
-//! `ROWS*DST_COLS*16 = 64 KiB` + per-source `ROWS*SRC_COLS*16 = 128 KiB` =
-//! 192 KiB/zone, × num_workers. Bounded by the Go commit-time memory advisory.
+//! Both `RateCounter` and `TokenBucket` cells are ≈ 16 B, so the per-cell size
+//! (and thus the sketch's memory bound) is identical whichever cell the sketch
+//! carries. Per configured zone, per worker: per-dest `ROWS*DST_COLS*16 = 64
+//! KiB` + per-source `ROWS*SRC_COLS*16 = 128 KiB` = 192 KiB/zone, ×
+//! num_workers. Fixed at construction, never resized — bounded by the Go
+//! commit-time memory advisory.
 
-use super::rate::RateCounter;
+use super::rate::{RateCounter, TokenBucket};
 use rustc_hash::FxHasher;
 use std::hash::Hasher;
 use std::net::IpAddr;
+
+/// One count-min sketch cell: charge an event and report whether the key is
+/// OVER its per-cell limit. This abstracts the two per-cell limiters the sketch
+/// can carry so the count-min structure (rows, seeded hashing, all-row update,
+/// AND/MIN reduction) is written ONCE and shared:
+///
+/// - [`RateCounter`] — the count-all two-bucket sliding window. Used by the
+///   #3315 SYN per-source / per-destination sketches, where "admitted" means
+///   "skip a recoverable security response" (activate SYN cookies / raise the
+///   alarm) and the sustained-at-threshold over-throttle is DELIBERATE.
+/// - [`TokenBucket`] — the monotonic-nanosecond shaper (#3607). Used by the
+///   #4112 / #5805 ICMP/UDP per-destination FLOOD sketches, a pure rate gate
+///   that MUST admit a destination parked at exactly `threshold` events/second
+///   without collapsing after the first second (the #5805 fix).
+///
+/// Both cells are 16 bytes, so the sketch's `ROWS*cols*16` memory bound is
+/// identical for either. `now` is a monotonic time value whose UNIT is defined
+/// by the impl — wall/monotonic SECONDS for `RateCounter`, monotonic
+/// NANOSECONDS for `TokenBucket` — and the caller passes the matching clock
+/// (`now_secs` for the SYN sketches, the batch-cached `loop_now_ns` for the
+/// flood sketches).
+pub(super) trait SketchCell: Clone + Default {
+    /// Charge one event against this cell; return `true` when the key is OVER
+    /// LIMIT (drop) and `false` when admitted — the `true == drop` polarity the
+    /// count-min AND-reduction expects. The event is charged in every row cell
+    /// (the count-min side effect) whatever the verdict.
+    fn charge(&mut self, now: u64, threshold: u32) -> bool;
+}
+
+impl SketchCell for RateCounter {
+    #[inline]
+    fn charge(&mut self, now_secs: u64, threshold: u32) -> bool {
+        self.increment(now_secs, threshold)
+    }
+}
+
+impl SketchCell for TokenBucket {
+    #[inline]
+    fn charge(&mut self, now_ns: u64, threshold: u32) -> bool {
+        // The token bucket consumes a token only on ADMIT: a rejected packet
+        // OBSERVES capacity but does not charge it (the #5805 fix — a sustained
+        // at-threshold destination is never starved by its own rejected
+        // packets, unlike `RateCounter`'s count-all window).
+        self.admit_is_over(now_ns, threshold)
+    }
+}
 
 /// Number of independent hash rows (`d`). 4 keeps the over-count false-positive
 /// rate (`~load^4`) below noise while bounding the per-packet cache-line touches.
@@ -120,11 +188,17 @@ const ROW_SEEDS: [u64; ROWS] = [
     0x27D4_EB2F_1656_67C5,
 ];
 
-/// Count-min sketch of `RateCounter`s with no eviction. See module docs.
-pub(super) struct SynRateSketch {
-    /// `ROWS` rows of `cols` counters. `Box<[Box<[RateCounter]>]>` is allocated
-    /// once at construction and never resized — the hot path only indexes.
-    rows: Box<[Box<[RateCounter]>]>,
+/// Count-min sketch of [`SketchCell`]s with no eviction. See module docs.
+///
+/// Generic over the per-cell limiter `C`. The DEFAULT `RateCounter` keeps the
+/// SYN per-source / per-destination sketches (#3315) bit-identical; the
+/// ICMP/UDP per-destination flood sketches use `SynRateSketch<TokenBucket>`
+/// (#5805) so a sustained-at-threshold destination is admitted at the
+/// configured rate rather than collapsing after the first second.
+pub(super) struct SynRateSketch<C = RateCounter> {
+    /// `ROWS` rows of `cols` cells. `Box<[Box<[C]>]>` is allocated once at
+    /// construction and never resized — the hot path only indexes.
+    rows: Box<[Box<[C]>]>,
     /// Index mask (`cols - 1`); `cols` is a power of two.
     mask: usize,
     /// Per-boot secret folded into the cell hash alongside `ROW_SEEDS[row]`
@@ -136,23 +210,22 @@ pub(super) struct SynRateSketch {
     seed: u64,
 }
 
-impl SynRateSketch {
-    fn with_cols(cols: usize) -> Self {
-        Self::with_cols_seeded(cols, crate::hot_hash_seed::hot_path_hash_seed())
-    }
-
-    /// Seed-parameterized core of `with_cols`. Split out so adversarial tests can
-    /// pin the seed and assert (a) intra-seed stability of the key→cell mapping
-    /// and (b) cross-seed reshuffling — mirroring `FlowCache::set_index_seeded`.
-    /// Production always calls through `with_cols`, which supplies the per-boot
-    /// process seed.
-    fn with_cols_seeded(cols: usize, seed: u64) -> Self {
+impl<C: SketchCell> SynRateSketch<C> {
+    /// Seed-parameterized generic core. Builds `ROWS` rows of `cols`
+    /// default-initialised cells. Split out so adversarial tests can pin the
+    /// seed and assert (a) intra-seed stability of the key→cell mapping and (b)
+    /// cross-seed reshuffling — mirroring `FlowCache::set_index_seeded`.
+    /// Production allocates through the typed `with_cols` / `for_flood_dst`
+    /// constructors, which supply the per-boot process seed. Both cell types
+    /// cold-start correctly from `default()` (an empty `RateCounter` window / a
+    /// cold `TokenBucket` that begins FULL on first use).
+    fn build_seeded(cols: usize, seed: u64) -> Self {
         debug_assert!(
             cols.is_power_of_two(),
             "SynRateSketch cols must be a power of two"
         );
         let rows = (0..ROWS)
-            .map(|_| vec![RateCounter::default(); cols].into_boxed_slice())
+            .map(|_| vec![C::default(); cols].into_boxed_slice())
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
@@ -160,16 +233,6 @@ impl SynRateSketch {
             mask: cols - 1,
             seed,
         }
-    }
-
-    /// Allocate the per-DESTINATION sketch (`DST_COLS` columns).
-    pub(super) fn for_dst() -> Self {
-        Self::with_cols(DST_COLS)
-    }
-
-    /// Allocate the per-SOURCE sketch (`SRC_COLS` columns).
-    pub(super) fn for_src() -> Self {
-        Self::with_cols(SRC_COLS)
     }
 
     /// Cell index for `ip` in row `row` (independent seeded hash, masked to the
@@ -186,20 +249,22 @@ impl SynRateSketch {
         (h.finish() as usize) & self.mask
     }
 
-    /// Count one SYN for `ip` and report whether `ip` is over `threshold` in the
-    /// trailing 1-second window.
+    /// Count one event for `ip` and report whether `ip` is over `threshold`.
     ///
-    /// Every row cell is incremented (the count-min side effect MUST happen in
-    /// all rows even when an earlier row is already under threshold), then the
+    /// `now` is the cell's clock unit — `now_secs` for a `RateCounter` sketch,
+    /// the batch-cached `loop_now_ns` for a `TokenBucket` sketch.
+    ///
+    /// Every row cell is charged (the count-min side effect MUST happen in all
+    /// rows even when an earlier row is already under threshold), then the
     /// per-row over-threshold results are AND-ed: the key trips ⟺ ALL rows
     /// report over-threshold (= `min` over rows > threshold). `&=` here is the
     /// non-short-circuiting bitwise-and assignment, so it never skips a row's
-    /// `increment`.
-    pub(super) fn increment(&mut self, ip: &IpAddr, now_secs: u64, threshold: u32) -> bool {
+    /// `charge`.
+    pub(super) fn increment(&mut self, ip: &IpAddr, now: u64, threshold: u32) -> bool {
         let mut over_all = true;
         for row in 0..ROWS {
             let idx = self.cell_index(row, ip);
-            let over = self.rows[row][idx].increment(now_secs, threshold);
+            let over = self.rows[row][idx].charge(now, threshold);
             over_all &= over;
         }
         over_all
@@ -223,21 +288,21 @@ impl SynRateSketch {
     }
 
     /// Count one packet for `(ip, port)` and report whether it is over
-    /// `threshold` in the trailing 1-second window. Mirrors `increment` but keys
-    /// on the L4 destination port too — the UDP per-destination-port flood cap
-    /// (#4112 F18). Every row cell is still incremented (non-short-circuiting
-    /// AND), so the count-min side effect happens in all rows.
+    /// `threshold`. Mirrors `increment` but keys on the L4 destination port too
+    /// — the UDP per-destination-port flood cap (#4112 F18). Every row cell is
+    /// still charged (non-short-circuiting AND), so the count-min side effect
+    /// happens in all rows. `now` is the cell's clock unit (see `increment`).
     pub(super) fn increment_ip_port(
         &mut self,
         ip: &IpAddr,
         port: u16,
-        now_secs: u64,
+        now: u64,
         threshold: u32,
     ) -> bool {
         let mut over_all = true;
         for row in 0..ROWS {
             let idx = self.cell_index_ip_port(row, ip, port);
-            let over = self.rows[row][idx].increment(now_secs, threshold);
+            let over = self.rows[row][idx].charge(now, threshold);
             over_all &= over;
         }
         over_all
@@ -262,12 +327,54 @@ impl SynRateSketch {
 
     /// Directly drive a specific `(row, col)` cell over `threshold`, simulating
     /// colliding hot keys without searching for collider IPs. Test seam only.
+    /// Charges the cell `threshold + 1` times at the SAME `now`, which drives a
+    /// `RateCounter` window strictly above `threshold` AND drains a `TokenBucket`
+    /// cell to empty (cold-start capacity is `threshold`), so the cell reports
+    /// over-limit for either cell type.
     #[cfg(test)]
-    pub(super) fn saturate_cell(&mut self, row: usize, col: usize, now_secs: u64, threshold: u32) {
-        // Drive the trailing-window sum strictly above threshold.
+    pub(super) fn saturate_cell(&mut self, row: usize, col: usize, now: u64, threshold: u32) {
         for _ in 0..=threshold {
-            self.rows[row][col].increment(now_secs, threshold);
+            self.rows[row][col].charge(now, threshold);
         }
+    }
+}
+
+impl SynRateSketch<RateCounter> {
+    fn with_cols(cols: usize) -> Self {
+        Self::with_cols_seeded(cols, crate::hot_hash_seed::hot_path_hash_seed())
+    }
+
+    /// Seed-pinned `RateCounter` constructor. Production calls through
+    /// `with_cols`; adversarial tests pin the seed to assert key→cell mapping
+    /// stability and cross-seed reshuffling.
+    fn with_cols_seeded(cols: usize, seed: u64) -> Self {
+        Self::build_seeded(cols, seed)
+    }
+
+    /// Allocate the per-DESTINATION SYN sketch (`DST_COLS` columns) with
+    /// count-all `RateCounter` cells (#3315). Deliberately NOT `TokenBucket`:
+    /// "admitted" here means "skip a recoverable security response".
+    pub(super) fn for_dst() -> Self {
+        Self::with_cols(DST_COLS)
+    }
+
+    /// Allocate the per-SOURCE SYN sketch (`SRC_COLS` columns), `RateCounter`
+    /// cells (#3315).
+    pub(super) fn for_src() -> Self {
+        Self::with_cols(SRC_COLS)
+    }
+}
+
+impl SynRateSketch<TokenBucket> {
+    /// Allocate the per-DESTINATION ICMP/UDP FLOOD sketch (`DST_COLS` columns)
+    /// with monotonic-ns `TokenBucket` cells (#5805). A distinct constructor
+    /// name (not `for_dst`) keeps the SYN-path `SynRateSketch::for_dst()`
+    /// unambiguously the `RateCounter` variant. The token bucket admits a
+    /// destination parked at exactly `threshold` events/second steadily (the
+    /// #5805 fix) while still bounding a burst to capacity (#2937) and limiting
+    /// an over-threshold destination down to the configured rate.
+    pub(super) fn for_flood_dst() -> Self {
+        Self::build_seeded(DST_COLS, crate::hot_hash_seed::hot_path_hash_seed())
     }
 }
 

@@ -182,9 +182,13 @@ code-vs-comment contradiction). A per-IP trip hard-drops with the existing
 `syn-flood` reason id (no Go gRPC/CLI change); per-source vs per-destination is
 distinguished by separate per-worker counters.
 
-Substrate (`userspace-dp/src/screen/syn_rate.rs`): a per-zone **count-min sketch
-of `RateCounter`s** — `ROWS=4` independent seeded-hash rows × `DST_COLS=1024` /
-`SRC_COLS=2048` columns — with **no eviction**. A key always counts in its
+Substrate (`userspace-dp/src/screen/syn_rate.rs`): a per-zone **count-min sketch**
+generic over its per-cell limiter (`SynRateSketch<C>`) — `ROWS=4` independent
+seeded-hash rows × `DST_COLS=1024` / `SRC_COLS=2048` columns — with **no
+eviction**. The SYN per-source/per-destination sketches use count-all
+`RateCounter` cells (this section); the #5805 ICMP/UDP per-destination flood
+sketches use monotonic-ns `TokenBucket` cells (see the #4112 section above). A
+key always counts in its
 `ROWS` cells and trips ⟺ ALL cells are over threshold (the CMS `min` read,
 implemented as the AND of the per-row results, never OR/MAX). No eviction means
 no Hot-Set-Lockout / Cold-Start-Eviction-Race starvation (a victim is always
@@ -357,16 +361,19 @@ to ~0 until a fully idle second (the #3607 over-throttle) — while a
 sub-millisecond boundary straddle still sees at most `budget` tokens, so an
 attacker cannot double the plausible-ACK validation budget across a wall-second
 boundary (#2937 preserved). The same token bucket is the drop authority for the
-ICMP/UDP flood per-zone aggregates and for the SYN-flood aggregate DROP path
-when `syn-cookie` is OFF (with no cookie to bypass, a sustained-at-threshold
-legitimate SYN stream must be admitted, so the bucket — not the count-all
-counter — is the sole drop gate on every initial SYN). The SYN-flood aggregate
-that ACTIVATES cookies when `syn-cookie` is ON, the alarm-threshold arrival-rate
-measurement, and the #3315 per-source/per-destination sketch deliberately stay
-on the count-all sliding-window `RateCounter`: there "admitted" means "skip a
-security response" (the cookie challenge, the alarm, the per-IP cap), so the
-sustained-at-threshold over-throttle is protective or benign rather than a bug
-(see `screen/rate.rs` and `docs/research/3607-screen-rate/plan.md`).
+ICMP/UDP flood per-zone aggregates, for the #5805 ICMP/UDP per-DESTINATION flood
+sketch cells (`SynRateSketch<TokenBucket>`, `for_flood_dst` — a sustained
+at-threshold destination must stay admitted, the same shaper argument as the
+aggregate), and for the SYN-flood aggregate DROP path when `syn-cookie` is OFF
+(with no cookie to bypass, a sustained-at-threshold legitimate SYN stream must be
+admitted, so the bucket — not the count-all counter — is the sole drop gate on
+every initial SYN). The SYN-flood aggregate that ACTIVATES cookies when
+`syn-cookie` is ON, the alarm-threshold arrival-rate measurement, and the #3315
+per-source/per-destination SYN sketch deliberately stay on the count-all
+sliding-window `RateCounter`: there "admitted" means "skip a security response"
+(the cookie challenge, the alarm, the per-IP cap), so the sustained-at-threshold
+over-throttle is protective or benign rather than a bug (see `screen/rate.rs` and
+`docs/research/3607-screen-rate/plan.md`).
 Invalid ACKs outside a local active flood window remain ordinary session-miss
 traffic instead of being counted as cookie failures.
 

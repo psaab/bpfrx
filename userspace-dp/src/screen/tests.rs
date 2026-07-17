@@ -2132,39 +2132,65 @@ fn icmp_flood_triggers() {
 }
 
 #[test]
-fn icmp_flood_sliding_window_blocks_boundary_burst_then_recovers() {
-    // #2937: the rate counter is a two-bucket sliding window, NOT a fixed
-    // wall-second window. After the budget is exhausted in second 100, the
-    // immediately following second (101) must NOT hand out a fresh full
-    // budget — the previous second's tally still counts for the whole of
-    // second 101. A full empty second must elapse before the budget frees.
+fn icmp_flood_per_dest_token_bucket_bounds_burst_and_refills() {
+    // #5805: the per-destination ICMP flood cap is now a monotonic-ns TOKEN
+    // BUCKET (was a count-all `RateCounter`). Two properties:
+    //   (a) #2937 preserved — an instantaneous burst is bounded to `threshold`
+    //       (the capacity), and a sub-millisecond straddle hands out no fresh
+    //       budget; and
+    //   (b) #5805 fixed — a FULL second later the bucket has refilled to
+    //       capacity and admits the budget again, WITHOUT requiring a fully idle
+    //       second. The reverted `RateCounter` kept the destination dropped in
+    //       the second immediately following an at-threshold second (its
+    //       previous-second tally weighed the whole current second) — this final
+    //       assertion is RED on the reverted count-all cell.
+    const THRESHOLD: u32 = 2;
     let mut profile = ScreenProfile::default();
-    profile.icmp_flood_threshold = 2;
+    profile.icmp_flood_threshold = THRESHOLD;
     let mut state = make_state("trust", profile);
     let pkt = icmp_pkt(
         IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
         IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
         84,
     );
-    assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
-    assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
-    // Exceeds in window 100.
+    // Instantaneous burst at second 100: exactly `threshold` admitted, the rest
+    // dropped (cold-start capacity bound).
+    let now_ns = 100 * NS;
+    let mut admitted = 0u32;
+    for _ in 0..(THRESHOLD * 3) {
+        if state.check_packet_with_zone_id_opts("trust", 3, &pkt, now_ns, 100, false)
+            == ScreenVerdict::Pass
+        {
+            admitted += 1;
+        }
+    }
     assert_eq!(
-        state.check_packet("trust", &pkt, 100),
-        ScreenVerdict::Drop("icmp-flood")
+        admitted, THRESHOLD,
+        "instantaneous burst bounded to capacity (#2937)"
     );
-    // Boundary into second 101: the previous second contributed 3 events,
-    // so the trailing 1-second sum is already over the threshold and the
-    // first packet of the new second is still dropped (fixed-window reset
-    // would have admitted it — that was the boundary-burst bug).
+    // A sub-millisecond straddle 100us later must NOT refill a fresh budget.
+    let straddle_ns = now_ns + 100_000;
     assert_eq!(
-        state.check_packet("trust", &pkt, 101),
-        ScreenVerdict::Drop("icmp-flood")
+        state.check_packet_with_zone_id_opts("trust", 3, &pkt, straddle_ns, 100, false),
+        ScreenVerdict::Drop("icmp-flood"),
+        "a sub-ms straddle must not hand out a second budget (#2937)"
     );
-    // After a full empty second (102 has no traffic from 101), second 103
-    // sees prev_count == 0 and admits the budget again.
-    assert_eq!(state.check_packet("trust", &pkt, 103), ScreenVerdict::Pass);
-    assert_eq!(state.check_packet("trust", &pkt, 103), ScreenVerdict::Pass);
+    // A FULL second later the bucket has refilled to capacity → the budget is
+    // admitted again, WITHOUT needing a fully idle second (the #5805 fix; the
+    // count-all RateCounter would still be dropping here).
+    let next_secs_ns = now_ns + NS;
+    let mut admitted2 = 0u32;
+    for _ in 0..THRESHOLD {
+        if state.check_packet_with_zone_id_opts("trust", 3, &pkt, next_secs_ns, 101, false)
+            == ScreenVerdict::Pass
+        {
+            admitted2 += 1;
+        }
+    }
+    assert_eq!(
+        admitted2, THRESHOLD,
+        "a full second later the per-destination budget refills (#5805 recovery)"
+    );
 }
 
 // ================================================================
@@ -2326,6 +2352,164 @@ fn icmp_flood_flowless_per_destination_independent() {
         state.check_flowless_screens("trust", &flowless_icmp_pkt(src, dst_a), true, 100),
         ScreenVerdict::Drop("icmp-flood"),
         "flowless single-destination flood still capped"
+    );
+}
+
+/// #5805 RED-ON-REVERT (headline): a single destination receiving ICMP at
+/// EXACTLY the per-destination `icmp flood threshold` rate, SUSTAINED for 20
+/// seconds (the clock advanced past every 1-second boundary), stays admitted.
+/// The per-destination token bucket refills continuously at the configured
+/// rate, so the destination is served steadily. Reverting the sketch cell to
+/// the count-all `RateCounter` collapses admission to ~one window after the
+/// first second (its whole-second boundary reset counts even the rejected
+/// packets) → this assertion goes RED. Events are paced at the real monotonic
+/// rate via `now_ns`, mirroring `syn_flood_cookie_off_sustained_at_threshold`.
+#[test]
+fn icmp_flood_per_dest_sustained_at_threshold_admitted() {
+    const THRESHOLD: u32 = 100;
+    let mut profile = ScreenProfile::default();
+    profile.icmp_flood_threshold = THRESHOLD;
+    let mut state = make_state("trust", profile);
+    let pkt = icmp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        84,
+    );
+    let interval_ns = NS / THRESHOLD as u64; // exactly threshold events/second
+    let mut now_ns = 9 * NS;
+    let total = THRESHOLD * 20; // 20 seconds sustained at threshold
+    let mut admitted = 0u32;
+    for _ in 0..total {
+        let now_secs = now_ns / NS;
+        if state.check_packet_with_zone_id_opts("trust", 3, &pkt, now_ns, now_secs, false)
+            == ScreenVerdict::Pass
+        {
+            admitted += 1;
+        }
+        now_ns += interval_ns;
+    }
+    assert!(
+        admitted as f64 >= 0.99 * total as f64,
+        "per-destination ICMP at threshold must stay admitted across 20s (#5805): {admitted}/{total}"
+    );
+}
+
+/// #5805 RED-ON-REVERT: the UDP per-destination-PORT flood cap has the same
+/// token-bucket behaviour — a `(dst_ip, dst_port)` parked at exactly `udp flood
+/// threshold` pps for 20 seconds stays admitted. RED on the reverted
+/// `RateCounter` cell.
+#[test]
+fn udp_flood_per_dest_port_sustained_at_threshold_admitted() {
+    const THRESHOLD: u32 = 100;
+    let mut profile = ScreenProfile::default();
+    profile.udp_flood_threshold = THRESHOLD;
+    let mut state = make_state("trust", profile);
+    let mut pkt = udp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+    );
+    pkt.dst_port = 443;
+    let interval_ns = NS / THRESHOLD as u64;
+    let mut now_ns = 9 * NS;
+    let total = THRESHOLD * 20;
+    let mut admitted = 0u32;
+    for _ in 0..total {
+        let now_secs = now_ns / NS;
+        if state.check_packet_with_zone_id_opts("trust", 3, &pkt, now_ns, now_secs, false)
+            == ScreenVerdict::Pass
+        {
+            admitted += 1;
+        }
+        now_ns += interval_ns;
+    }
+    assert!(
+        admitted as f64 >= 0.99 * total as f64,
+        "per-(dst,port) UDP at threshold must stay admitted across 20s (#5805): {admitted}/{total}"
+    );
+}
+
+/// #5805 enforcement preserved (IPv6): an OVER-threshold destination (sending at
+/// 2× the per-destination cap) is still LIMITED down to the configured rate —
+/// the fix must not weaken enforcement. The token bucket admits ≈ `threshold`
+/// per second plus the one-time cold-start capacity, so over 20 seconds a 2×
+/// flood sees ≈ `threshold × 21` admitted: well below the `threshold × 40`
+/// offered (a real flood is still dropped, enforcement holds) AND well above the
+/// ~`threshold` a reverted count-all `RateCounter` would admit (no collapse —
+/// the lower bound is RED on revert). Uses an IPv6 destination.
+#[test]
+fn icmp_flood_per_dest_over_threshold_still_limited() {
+    const THRESHOLD: u32 = 100;
+    const SECS: u32 = 20;
+    let mut profile = ScreenProfile::default();
+    profile.icmp_flood_threshold = THRESHOLD;
+    let mut state = make_state("trust", profile);
+    let pkt = icmp_pkt(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x50)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x99)),
+        84,
+    );
+    // Offer 2× the cap, evenly spaced.
+    let interval_ns = NS / (2 * THRESHOLD) as u64;
+    let mut now_ns = 9 * NS;
+    let total = 2 * THRESHOLD * SECS;
+    let mut admitted = 0u32;
+    for _ in 0..total {
+        let now_secs = now_ns / NS;
+        if state.check_packet_with_zone_id_opts("trust", 3, &pkt, now_ns, now_secs, false)
+            == ScreenVerdict::Pass
+        {
+            admitted += 1;
+        }
+        now_ns += interval_ns;
+    }
+    // Enforcement: a real 2× flood is limited, not passed wholesale.
+    assert!(
+        admitted < total,
+        "an over-threshold destination must still be rate-limited: {admitted}/{total}"
+    );
+    assert!(
+        admitted <= THRESHOLD * (SECS + 2),
+        "admitted must be bounded to ~the configured rate (+cold-start burst): {admitted}"
+    );
+    // No collapse: the configured rate IS delivered every second (RED on the
+    // reverted count-all cell, which admits ~one window total).
+    assert!(
+        admitted >= THRESHOLD * SECS,
+        "the configured rate must be delivered steadily, not collapsed (#5805): {admitted}"
+    );
+}
+
+/// #5805 RED-ON-REVERT (flowless fragment path): a UDP non-first fragment carries
+/// no L4 port, so `udp_flood_drop` folds it into the per-destination-IP token
+/// bucket (#4567). A sustained at-threshold fragment stream to one destination
+/// IP stays admitted across seconds. RED on the reverted `RateCounter` cell.
+#[test]
+fn udp_flood_flowless_fragment_sustained_at_threshold_admitted() {
+    const THRESHOLD: u32 = 100;
+    let mut profile = ScreenProfile::default();
+    profile.udp_flood_threshold = THRESHOLD;
+    let mut state = make_state("trust", profile);
+    let pkt = flowless_nonfirst_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+    );
+    let interval_ns = NS / THRESHOLD as u64;
+    let mut now_ns = 9 * NS;
+    let total = THRESHOLD * 20;
+    let mut admitted = 0u32;
+    for _ in 0..total {
+        let now_secs = now_ns / NS;
+        if state.check_flowless_screens_opts("trust", &pkt, true, now_ns, now_secs, false)
+            == ScreenVerdict::Pass
+        {
+            admitted += 1;
+        }
+        now_ns += interval_ns;
+    }
+    assert!(
+        admitted as f64 >= 0.99 * total as f64,
+        "flowless UDP fragment at threshold must stay admitted across 20s (#5805): {admitted}/{total}"
     );
 }
 
@@ -5150,7 +5334,11 @@ fn udp_flood_flowless_fragment_folds_into_per_ip_bucket_4567() {
     let cells = state.udp_dst_sketch.get("trust").unwrap().cell_indices(&d);
     let sketch = state.udp_dst_sketch.get_mut("trust").unwrap();
     for (row, &col) in cells.iter().enumerate() {
-        sketch.saturate_cell(row, col, 100, T);
+        // #5805: the flood sketch cells are token buckets keyed on `now_ns`; the
+        // check below runs at `now_secs=100` (→ `now_ns = 100 * NANOS_PER_SEC`),
+        // so saturate at the SAME instant or the bucket would "refill" across the
+        // apparent elapsed second and un-saturate.
+        sketch.saturate_cell(row, col, 100 * NS, T);
     }
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
     let pkt = flowless_nonfirst_fragment(src, d, PROTO_UDP);
@@ -5180,7 +5368,11 @@ fn udp_flood_first_fragment_still_counts_per_ip_port_4567() {
     let cells = state.udp_dst_sketch.get("trust").unwrap().cell_indices(&d);
     let sketch = state.udp_dst_sketch.get_mut("trust").unwrap();
     for (row, &col) in cells.iter().enumerate() {
-        sketch.saturate_cell(row, col, 100, T);
+        // #5805: the flood sketch cells are token buckets keyed on `now_ns`; the
+        // check below runs at `now_secs=100` (→ `now_ns = 100 * NANOS_PER_SEC`),
+        // so saturate at the SAME instant or the bucket would "refill" across the
+        // apparent elapsed second and un-saturate.
+        sketch.saturate_cell(row, col, 100 * NS, T);
     }
     let pkt = udp_pkt(src, d); // dst_port = 5001 (real L4 port, flow path)
     for i in 0..T {
