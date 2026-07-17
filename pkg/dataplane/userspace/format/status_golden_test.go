@@ -94,7 +94,7 @@ func goldenStatusSummaryFixture() userspace.ProcessStatus {
 				PolicyRejectReplyBudgetDrops: 3, FilterRejectReplyBudgetDrops: 1,
 				PolicyRejectRateLimitDrops: 4, FilterRejectRateLimitDrops: 6,
 				SNATPackets: 30, DNATPackets: 20,
-				Nat64Translations: 12, Nat64NoSourcePool: 3, Nat64PoolExhausted: 5, Nat64FragDropped: 2,
+				Nat64Translations: 12, Nat64NoSourcePool: 3, Nat64PoolExhausted: 5, Nat64FragDropped: 2, Nat64IneligibleSource: 4,
 				TXPackets: 70, TXBytes: 9000, TXErrors: 100, DbgCoSQueueOverflow: 40,
 				TXSharedRecycleUnknownSlotDrops: 1, TXCompletions: 65,
 				MirroredPackets: 4, MirroredBytes: 512, MirrorDropsNoFrame: 1, MirrorDropsTXFrameReserve: 1,

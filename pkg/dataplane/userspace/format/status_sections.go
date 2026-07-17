@@ -75,12 +75,13 @@ type statusSummaryAggregates struct {
 	policyRejectRateLimitDrops        uint64
 	filterRejectRateLimitDrops        uint64
 
-	snatPackets        uint64
-	dnatPackets        uint64
-	nat64Translations  uint64
-	nat64NoSourcePool  uint64
-	nat64PoolExhausted uint64
-	nat64FragDropped   uint64
+	snatPackets           uint64
+	dnatPackets           uint64
+	nat64Translations     uint64
+	nat64NoSourcePool     uint64
+	nat64PoolExhausted    uint64
+	nat64FragDropped      uint64
+	nat64IneligibleSource uint64
 
 	txPackets                       uint64
 	txBytes                         uint64
@@ -219,6 +220,7 @@ func aggregateStatusSummary(status userspace.ProcessStatus) statusSummaryAggrega
 		agg.nat64NoSourcePool += binding.Nat64NoSourcePool
 		agg.nat64PoolExhausted += binding.Nat64PoolExhausted
 		agg.nat64FragDropped += binding.Nat64FragDropped
+		agg.nat64IneligibleSource += binding.Nat64IneligibleSource
 		agg.txPackets += binding.TXPackets
 		agg.txBytes += binding.TXBytes
 		agg.txErrors += binding.TXErrors
@@ -497,6 +499,7 @@ func writeNATCountersSection(b *strings.Builder, agg statusSummaryAggregates) {
 	fmt.Fprintf(b, "  NAT64 no-source-pool drops:%d\n", agg.nat64NoSourcePool)
 	fmt.Fprintf(b, "  NAT64 pool-exhausted drops:%d\n", agg.nat64PoolExhausted)
 	fmt.Fprintf(b, "  NAT64 fragment drops:      %d\n", agg.nat64FragDropped)
+	fmt.Fprintf(b, "  NAT64 ineligible-source drops:%d\n", agg.nat64IneligibleSource)
 }
 
 // writeSourceNATPoolsSection renders the per-pool source-NAT table, sorted by

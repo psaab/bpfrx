@@ -51379,3 +51379,29 @@ top.
   userspace-dp/src/afxdp/frame/tests_nat_rewrite.rs,
   userspace-dp/src/afxdp/frame/tests_ports_live_forward.rs,
   userspace-dp/src/FEATURES.md
+
+## 2026-07-17 — #5623 NAT64 Pref64 source-eligibility rejection
+
+- **Timestamp**: 2026-07-17
+- **Action**: Add RFC 6146 §3.5 source-eligibility gate to NAT64 forward path —
+  reject a v6 source inside a configured Pref64 (looping/synthesized, incl.
+  lower/upper boundary + non-global embedded v4) BEFORE allocation/translation;
+  distinct fail-closed `nat64_ineligible_source` counter. Fail-on-revert cargo
+  tests + docs.
+- **File(s)**:
+  userspace-dp/src/nat64.rs (new `Nat64Match::IneligibleSource`,
+    `source_within_pref64`, `classify_ipv6_packet`),
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs (source-gated classify + drop),
+  userspace-dp/src/afxdp/mod.rs (BatchCounters field + record + flush),
+  userspace-dp/src/afxdp/worker/mod.rs (snapshot field),
+  userspace-dp/src/afxdp/umem/mod.rs (atomic + init),
+  userspace-dp/src/afxdp/umem/snapshot.rs (load),
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs (copy + reset),
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs (reset),
+  userspace-dp/src/protocol/binding.rs (serde field),
+  userspace-dp/src/nat64_tests.rs (5 fail-on-revert tests),
+  pkg/dataplane/userspace/protocol.go (Go struct field),
+  pkg/dataplane/userspace/format/status_sections.go (agg + print),
+  pkg/dataplane/userspace/format/testdata/status_summary.golden,
+  pkg/dataplane/userspace/format/status_golden_test.go,
+  docs/feature-coverage.md, userspace-dp/src/FEATURES.md

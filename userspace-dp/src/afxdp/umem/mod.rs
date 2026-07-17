@@ -482,6 +482,16 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// fragments traverse end-to-end is deferred, so this is the observable-drop
     /// half of #2562.
     pub(super) nat64_frag_dropped: AtomicU64,
+    /// #5623: cumulative fail-closed NAT64 SOURCE-ineligibility drops — an
+    /// incoming IPv6 packet whose SOURCE lies within a configured Pref64 (a
+    /// looping/synthesized "already-translated" source, the RFC 6146 §5 hairpin
+    /// construction — plus the lower/upper Pref64 boundary and any embedded
+    /// non-global v4) dropped BEFORE route lookup, policy, or `allocate_source`
+    /// per RFC 6146 §3.5. Surfaced as the `NAT64 ineligible-source drops`
+    /// operator counter; a non-zero value flags spoofed/looping v6 sources.
+    /// Distinct from the pool counters (config/capacity on an ELIGIBLE flow) —
+    /// this is an input-validation reject.
+    pub(super) nat64_ineligible_source: AtomicU64,
     /// #4477: cumulative source-NAT allocation failures (rule matched, no
     /// translated mapping could be allocated — missing/empty/invalid/exhausted
     /// pool, wrong family, or a non-first fragment on a port-translating rule).
@@ -898,6 +908,7 @@ impl BindingLiveState {
             nat64_no_source_pool: AtomicU64::new(0),
             nat64_pool_exhausted: AtomicU64::new(0),
             nat64_frag_dropped: AtomicU64::new(0),
+            nat64_ineligible_source: AtomicU64::new(0),
             nat_alloc_fail: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),

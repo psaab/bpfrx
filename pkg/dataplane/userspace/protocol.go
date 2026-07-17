@@ -2605,6 +2605,15 @@ type BindingStatus struct {
 	// omitempty + the Rust serde `default` keep cross-version wire safety (an
 	// older helper omits it → 0).
 	Nat64FragDropped uint64 `json:"nat64_frag_dropped,omitempty"`
+	// #5623: fail-closed NAT64 SOURCE-ineligibility drops — an incoming IPv6
+	// packet whose SOURCE lies within a configured Pref64 (a looping/synthesized
+	// "already-translated" source, the RFC 6146 §5 hairpin construction — plus
+	// the lower/upper Pref64 boundary and any embedded non-global v4) dropped
+	// BEFORE route lookup, policy, or allocate_source per RFC 6146 §3.5. Distinct
+	// from the pool counters above (config/capacity on an ELIGIBLE flow); this is
+	// an input-validation reject. omitempty + the Rust serde `default` keep
+	// cross-version wire safety (an older helper omits it → 0).
+	Nat64IneligibleSource uint64 `json:"nat64_ineligible_source,omitempty"`
 	// #4477: source-NAT allocation failures (a source-NAT rule matched but no
 	// translated mapping could be allocated — missing/empty/invalid/exhausted
 	// pool, wrong family, or a non-first fragment on a port-translating rule);

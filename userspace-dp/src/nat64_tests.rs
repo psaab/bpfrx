@@ -4600,3 +4600,108 @@ fn nat64_frag_assoc_install_all_live_still_evicts_oldest() {
         "shard never exceeds cap",
     );
 }
+
+// ===========================================================================
+// #5623: NAT64 SOURCE-eligibility rejection (RFC 6146 §3.5).
+//
+// A NAT64 translator MUST drop an incoming IPv6 packet whose SOURCE lies within
+// a configured Pref64 — a looping/synthesized "already-translated" source (the
+// §5 hairpin construction). `classify_ipv6_packet` folds this check ahead of the
+// destination match, returning the distinct fail-closed `IneligibleSource`
+// BEFORE any allocation/translation. These are the fail-on-revert guards: each
+// reject test uses a VALID Pref64 destination, so WITHOUT the source gate the
+// classifier would return `MatchReady` (translate) — removing the gate flips the
+// assertion RED. The eligible-source test stays green, guarding against
+// over-reject of legitimate global-unicast sources.
+// ===========================================================================
+
+#[test]
+fn nat64_5623_source_lower_pref64_boundary_rejected() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    // Lower boundary: <prefix>:: — the embedded v4 is 0.0.0.0.
+    let src: Ipv6Addr = "64:ff9b::".parse().unwrap();
+    // A destination that WOULD translate (MatchReady) if the source were eligible.
+    let dst: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap(); // ::198.51.100.50
+    assert_eq!(
+        state.classify_ipv6_packet(src, dst),
+        Nat64Match::IneligibleSource,
+        "a lower-boundary Pref64 source (<prefix>::) must be rejected before translation"
+    );
+    // Counterfactual: without the source gate this destination is MatchReady.
+    assert!(
+        matches!(state.classify_ipv6_dest(dst), Nat64Match::MatchReady { .. }),
+        "the destination alone must be a translate candidate — proves the reject is source-driven"
+    );
+}
+
+#[test]
+fn nat64_5623_source_upper_pref64_boundary_rejected() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    // Upper boundary: <prefix>::ffff:ffff — the embedded v4 is 255.255.255.255.
+    let src: Ipv6Addr = "64:ff9b::ffff:ffff".parse().unwrap();
+    let dst: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    assert_eq!(
+        state.classify_ipv6_packet(src, dst),
+        Nat64Match::IneligibleSource,
+        "an upper-boundary Pref64 source (<prefix>::ffff:ffff) must be rejected before translation"
+    );
+}
+
+#[test]
+fn nat64_5623_source_looping_synthesized_rejected() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    // Looping/synthesized: a source that already claims to be a translated
+    // Pref64 address (embedded v4 192.0.2.1). RFC 6146 §5 hairpin-loop input.
+    let src: Ipv6Addr = "64:ff9b::c000:0201".parse().unwrap(); // ::192.0.2.1
+    let dst: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    assert_eq!(
+        state.classify_ipv6_packet(src, dst),
+        Nat64Match::IneligibleSource,
+        "a looping/synthesized Pref64 source must be rejected before translation"
+    );
+    // The primitive the caller drops on is also directly asserted, so a gate
+    // neutralization that leaves `source_within_pref64` returning false is RED.
+    assert!(
+        state.source_within_pref64(src),
+        "a source inside the configured Pref64 must be flagged ineligible"
+    );
+}
+
+#[test]
+fn nat64_5623_eligible_global_unicast_source_translates() {
+    // Over-reject guard: a legitimate global-unicast source OUTSIDE every Pref64
+    // must still translate exactly as before — the gate rejects only Pref64
+    // sources, never eligible traffic.
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    let src: Ipv6Addr = "2001:db8::1".parse().unwrap(); // outside 64:ff9b::/96
+    let dst: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap(); // ::198.51.100.50
+    match state.classify_ipv6_packet(src, dst) {
+        Nat64Match::MatchReady {
+            prefix_idx,
+            dst_v4,
+            dst_v6,
+        } => {
+            assert_eq!(prefix_idx, 0);
+            assert_eq!(dst_v4, Ipv4Addr::new(198, 51, 100, 50));
+            assert_eq!(dst_v6, dst);
+        }
+        other => panic!("expected MatchReady for an eligible source, got {other:?}"),
+    }
+    assert!(
+        !state.source_within_pref64(src),
+        "a global-unicast source outside every Pref64 must NOT be flagged ineligible"
+    );
+}
+
+#[test]
+fn nat64_5623_eligible_source_non_nat64_dest_still_routes() {
+    // A legitimate source with a NON-NAT64 destination continues ordinary IPv6
+    // routing — the source gate does not perturb the no-match path.
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst: Ipv6Addr = "2001:db8::2".parse().unwrap(); // not the NAT64 prefix
+    assert_eq!(
+        state.classify_ipv6_packet(src, dst),
+        Nat64Match::NoPrefixMatch
+    );
+}

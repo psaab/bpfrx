@@ -574,6 +574,16 @@ pub(in crate::afxdp) struct BatchCounters {
     // let real fragments traverse end-to-end (#3291 stage 4) is deferred, so
     // this is the observable-drop half of #2562.
     nat64_frag_dropped: u64,
+    // #5623: fail-closed NAT64 SOURCE-ineligibility drops — an incoming IPv6
+    // packet whose SOURCE lies within a configured Pref64 (a looping/synthesized
+    // "already-translated" source, the RFC 6146 §5 hairpin construction — plus
+    // the lower/upper Pref64 boundary and any embedded non-global v4) is dropped
+    // BEFORE route lookup, policy, or `allocate_source`, per RFC 6146 §3.5.
+    // Distinct from the pool counters above (those are a config/capacity issue on
+    // an ELIGIBLE flow; this is an input-validation reject). Flushed to
+    // BindingLiveState.nat64_ineligible_source and surfaced as the `NAT64
+    // ineligible-source drops` operator counter.
+    nat64_ineligible_source: u64,
     // #4477: source-NAT allocation failures — a source-NAT rule matched but no
     // translated mapping could be allocated (missing/empty/invalid pool,
     // exhausted port allocator, wrong family, or a non-first fragment on a
@@ -727,6 +737,19 @@ impl BatchCounters {
         self.nat64_frag_dropped += 1;
     }
 
+    /// #5623: record a fail-closed NAT64 SOURCE-ineligibility drop — an incoming
+    /// IPv6 packet whose source lies within a configured Pref64 (looping /
+    /// synthesized, the RFC 6146 §3.5 mandatory drop). Bumped at the pre-routing
+    /// NAT64 classification (`classify_ipv6_packet` → `Nat64Match::IneligibleSource`)
+    /// before any route lookup, policy, or `allocate_source`, so no session/BIB/
+    /// allocation state is minted. Batched like the sibling nat64 drop counters
+    /// and flushed to `BindingLiveState.nat64_ineligible_source`.
+    #[inline]
+    pub(in crate::afxdp) fn record_nat64_ineligible_source(&mut self) {
+        self.touched = true;
+        self.nat64_ineligible_source += 1;
+    }
+
     fn flush(&mut self, live: &BindingLiveState) {
         if !self.touched {
             return;
@@ -813,6 +836,13 @@ impl BatchCounters {
             live.nat64_frag_dropped
                 .fetch_add(self.nat64_frag_dropped, Ordering::Relaxed);
             self.nat64_frag_dropped = 0;
+        }
+        // #5623: fail-closed NAT64 source-ineligibility tally, batched like the
+        // sibling nat64 drop counters above.
+        if self.nat64_ineligible_source != 0 {
+            live.nat64_ineligible_source
+                .fetch_add(self.nat64_ineligible_source, Ordering::Relaxed);
+            self.nat64_ineligible_source = 0;
         }
         // #4477: source-NAT allocation-failure tally.
         if self.nat_alloc_fail != 0 {

@@ -1425,6 +1425,10 @@ pub(crate) struct BindingLiveSnapshot {
     /// #2562: cumulative fail-closed NAT64 fragment drops snapshotted from
     /// BindingLiveState (a non-first fragment or a real ICMP/ICMPv6 fragment).
     pub(crate) nat64_frag_dropped: u64,
+    /// #5623: cumulative fail-closed NAT64 source-ineligibility drops snapshotted
+    /// from BindingLiveState (an incoming IPv6 packet whose source lies within a
+    /// configured Pref64 — the RFC 6146 §3.5 mandatory hairpin/source drop).
+    pub(crate) nat64_ineligible_source: u64,
     /// #4477: cumulative source-NAT allocation failures snapshotted from
     /// BindingLiveState. Bridged into `GlobalCtrNATAllocFail` (Go side).
     pub(crate) nat_alloc_fail: u64,

@@ -1741,7 +1741,30 @@ pub(super) fn poll_binding_process_descriptor(
                         // counter); only NoPrefixMatch continues IPv6 routing.
                         let nat64_match = if pre_routing_dnat.is_none() && nptv6_inbound.is_none() {
                             if let IpAddr::V6(dst_v6) = resolution_target {
-                                match worker_ctx.forwarding.nat64.classify_ipv6_dest(dst_v6) {
+                                // #5623: gate on SOURCE eligibility BEFORE any
+                                // NAT64 allocation/translation. RFC 6146 §3.5
+                                // mandates dropping an incoming IPv6 packet whose
+                                // source itself lies within a configured Pref64 —
+                                // a looping/synthesized "already-translated"
+                                // source (the §5 hairpin construction), including
+                                // the lower/upper Pref64 boundary and any embedded
+                                // non-global v4. `classify_ipv6_packet` folds that
+                                // check ahead of the unchanged destination match,
+                                // so an eligible global-unicast source translates
+                                // exactly as before. An IPv6 destination always
+                                // pairs with an IPv6 source at L3; the V4 arm is
+                                // unreachable for a real packet and degrades to the
+                                // dest-only classify rather than asserting.
+                                let nat64_result = match flow.forward_key.src_ip {
+                                    IpAddr::V6(src_v6) => worker_ctx
+                                        .forwarding
+                                        .nat64
+                                        .classify_ipv6_packet(src_v6, dst_v6),
+                                    IpAddr::V4(_) => {
+                                        worker_ctx.forwarding.nat64.classify_ipv6_dest(dst_v6)
+                                    }
+                                };
+                                match nat64_result {
                                     crate::nat64::Nat64Match::NoPrefixMatch => None,
                                     // #4381: the source `(snat_v4, port)` is no
                                     // longer allocated here — it is allocated
@@ -1752,6 +1775,17 @@ pub(super) fn poll_binding_process_descriptor(
                                         dst_v4,
                                         dst_v6,
                                     } => Some((prefix_idx, dst_v4, dst_v6)),
+                                    crate::nat64::Nat64Match::IneligibleSource => {
+                                        // #5623: RFC 6146 §3.5 source/hairpin drop.
+                                        // The source is inside a configured Pref64
+                                        // (looping/synthesized). Fail closed with a
+                                        // distinct counter BEFORE route lookup,
+                                        // policy, or `allocate_source` — no session,
+                                        // BIB, or allocation state is minted.
+                                        telemetry.counters.record_nat64_ineligible_source();
+                                        binding.scratch.scratch_recycle.push(desc.addr);
+                                        continue;
+                                    }
                                     crate::nat64::Nat64Match::MatchUnavailable => {
                                         // Fail closed: a NAT64 prefix matched
                                         // but the source pool is empty/exhausted.
