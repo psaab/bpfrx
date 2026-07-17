@@ -7,7 +7,7 @@
 //! sources per-zone volume. This module is the userspace POPULATE half
 //! (design of record: `docs/research/3643-dead-counters/plan.md` §5A).
 //!
-//! ## Hot path (no per-packet hash, no per-packet atomic)
+//! ## Hot path (no per-packet hash, no per-packet atomic, no per-batch lock)
 //!
 //! [`ZoneCounterSlotMap`] is a flat direct-index `[u8; 65536]` zone-id → slot
 //! LUT built at config-apply time. A forwarded packet resolves its ingress and
@@ -16,21 +16,38 @@
 //! thread-local dense [`ZonePending`] accumulator — the same coalesce-then-fold
 //! technique `policy::record_policy_hit_counter` / `filter::record_filter_counter`
 //! use. The per-RX-batch [`flush_recorded_zone_counters`] folds the coalesced
-//! per-slot deltas into the coordinator-owned [`ZoneCounterStore`].
+//! per-slot deltas into the shared per-zone atomics the slot map caches.
 //!
-//! ## Store (zone-id keyed → no slot-reassignment hazard)
+//! ## Store (lock-free per-batch fold, mutex only off the hot path — #5163)
 //!
-//! The shared store is keyed by the STABLE zone id, not by slot. The flush
-//! translates slot → zone id through the slot map's inverse, so a config apply
-//! that renumbers slots never mis-attributes counts: accumulate and flush
-//! inside one loop iteration always use the same slot map, and the store cell
-//! is addressed by the stable zone id. That removes the cold-path `zero_slot`
-//! reassignment machinery entirely. The store rides `ForwardingState` (cloned
-//! forward from the previous state across applies, like a persistent Arc) so
-//! totals survive config commits, and is reset only by the operator
-//! `clear_zone_counters` control IPC.
+//! Before #5163 the fold locked a single `Arc<Mutex<FxHashMap>>` on the shared
+//! [`ZoneCounterStore`] EVERY RX batch on EVERY worker, so all RX queues
+//! bounced one mutex cache line at line rate — cross-worker serialization on
+//! the hot path. The store now holds one [`ZoneTotalsAtomic`] block PER zone id
+//! (`Arc<Mutex<FxHashMap<u16, Arc<ZoneTotalsAtomic>>>>`) and the mutex guards
+//! only the MAP STRUCTURE — get-or-create at config-apply, and iterate at
+//! snapshot / clear / reconcile — all off the hot path (≤ once per commit or per
+//! 1 s status poll). Each configured slot caches its zone's `Arc<ZoneTotalsAtomic>`
+//! in the slot map at build time, so the per-batch fold is a straight `Relaxed`
+//! `fetch_add` into per-zone atomics with NO lock and NO map lookup — exactly
+//! the lock-free shared-counter shape the `policy`/`filter` hit counters already
+//! use.
+//!
+//! The store stays keyed by the STABLE zone id, not by slot, so a config apply
+//! that renumbers slots never mis-attributes counts: the slot map's cached
+//! `Arc` is resolved from the zone-id-keyed store, so a surviving zone keeps the
+//! SAME atomic block across applies (get-or-create returns the existing Arc)
+//! while a renumbered slot simply points at that same stable block. That removes
+//! the cold-path `zero_slot` reassignment machinery entirely. The store rides
+//! `ForwardingState` (cloned forward from the previous state across applies,
+//! like a persistent Arc) so totals survive config commits. `clear` resets each
+//! zone's atomics IN PLACE (it must not drop the map entry, or a live slot map
+//! would keep folding into an orphaned Arc that the snapshot no longer sees) so
+//! the operator `clear_zone_counters` control IPC zeroes the totals while
+//! forwarding keeps counting from zero.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -63,6 +80,12 @@ pub(in crate::afxdp) const ZONE_COUNTER_LAYOUT_VERSION: u32 = 1;
 pub(in crate::afxdp) struct ZoneCounterSlotMap {
     slot_of: Box<[u8; 65536]>,
     inverse: [u16; ZONE_COUNTER_SLOTS],
+    /// #5163: per-slot handle to the assigned zone's shared atomic block,
+    /// resolved from the zone-id-keyed [`ZoneCounterStore`] at build time. The
+    /// per-batch fold reads `slot_totals[slot]` and `fetch_add`s directly, so
+    /// it never locks the store or does a map lookup on the hot path. `None`
+    /// for an unassigned slot (slot 0 and any slot past the configured zones).
+    slot_totals: [Option<Arc<ZoneTotalsAtomic>>; ZONE_COUNTER_SLOTS],
     /// True if some configured zone could not be assigned a slot because the
     /// `ZONE_COUNTER_ASSIGNABLE_SLOTS` capacity was exhausted. Surfaced as
     /// `ProcessStatus.zone_counter_overflow_active`.
@@ -92,6 +115,7 @@ impl ZoneCounterSlotMap {
         Self {
             slot_of: Box::new([0u8; 65536]),
             inverse: [0u16; ZONE_COUNTER_SLOTS],
+            slot_totals: std::array::from_fn(|_| None),
             overflow_active: false,
         }
     }
@@ -102,13 +126,21 @@ impl ZoneCounterSlotMap {
     /// assignment does NOT need to be stable across applies (unlike the
     /// cold-path histogram, whose slot IS the accumulator index), so this is a
     /// plain rebuild with no previous-map retention.
-    pub(in crate::afxdp) fn build(zone_ids: &[u16]) -> Self {
+    ///
+    /// #5163: each assigned slot caches its zone's shared `Arc<ZoneTotalsAtomic>`,
+    /// resolved (get-or-create) from `store`. A zone that survives this apply
+    /// gets the SAME atomic block it had before (the store is zone-id keyed and
+    /// carried forward), so counts never reset or double across a slot renumber;
+    /// the per-batch fold then never touches the store's mutex.
+    pub(in crate::afxdp) fn build(zone_ids: &[u16], store: &ZoneCounterStore) -> Self {
         let mut ids: Vec<u16> = zone_ids.iter().copied().filter(|&z| z != 0).collect();
         ids.sort_unstable();
         ids.dedup();
 
         let mut slot_of = Box::new([0u8; 65536]);
         let mut inverse = [0u16; ZONE_COUNTER_SLOTS];
+        let mut slot_totals: [Option<Arc<ZoneTotalsAtomic>>; ZONE_COUNTER_SLOTS] =
+            std::array::from_fn(|_| None);
         let mut overflow_active = false;
         let mut next_slot = 1usize;
         for zid in ids {
@@ -118,11 +150,13 @@ impl ZoneCounterSlotMap {
             }
             slot_of[zid as usize] = next_slot as u8;
             inverse[next_slot] = zid;
+            slot_totals[next_slot] = Some(store.zone_totals(zid));
             next_slot += 1;
         }
         Self {
             slot_of,
             inverse,
+            slot_totals,
             overflow_active,
         }
     }
@@ -134,66 +168,136 @@ impl ZoneCounterSlotMap {
     }
 }
 
-/// Cumulative per-zone traffic totals, guarded by a single mutex (folded into
-/// off the hot path, at RX-batch cadence, so the lock is uncontended in
-/// practice — mirrors the `PolicyCounterStore` registry lock).
-#[derive(Clone, Copy, Debug, Default)]
-struct ZoneTotals {
-    ingress_packets: u64,
-    ingress_bytes: u64,
-    egress_packets: u64,
-    egress_bytes: u64,
+/// #5163: shared cumulative per-zone traffic totals as four `Relaxed` atomics.
+/// One block per configured zone id; the per-batch worker fold `fetch_add`s
+/// into it lock-free (the same lock-free shared-counter shape as
+/// `PolicyRuleCounter`), and the ≤ 1 s status/clear path reads/zeroes it under
+/// the store mutex. Cache-line sharing between workers `fetch_add`ing the same
+/// zone is the accepted policy/filter-counter posture — vastly cheaper than the
+/// pre-#5163 global mutex the whole fold used to take every batch.
+#[derive(Debug, Default)]
+struct ZoneTotalsAtomic {
+    ingress_packets: AtomicU64,
+    ingress_bytes: AtomicU64,
+    egress_packets: AtomicU64,
+    egress_bytes: AtomicU64,
+}
+
+impl ZoneTotalsAtomic {
+    #[inline]
+    fn add_ingress(&self, packets: u64, bytes: u64) {
+        if packets != 0 {
+            self.ingress_packets.fetch_add(packets, Ordering::Relaxed);
+        }
+        if bytes != 0 {
+            self.ingress_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn add_egress(&self, packets: u64, bytes: u64) {
+        if packets != 0 {
+            self.egress_packets.fetch_add(packets, Ordering::Relaxed);
+        }
+        if bytes != 0 {
+            self.egress_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Independent relaxed loads of the four fields. Each field is exact; the
+    /// quad is eventual-consistent (a snapshot may straddle one in-flight
+    /// fold), the same contract `PolicyRuleCounter::snapshot` accepts.
+    fn load(&self) -> (u64, u64, u64, u64) {
+        (
+            self.ingress_packets.load(Ordering::Relaxed),
+            self.ingress_bytes.load(Ordering::Relaxed),
+            self.egress_packets.load(Ordering::Relaxed),
+            self.egress_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Zero all four fields in place (operator clear). In place — never dropped
+    /// from the store map — so a live slot map's cached `Arc` keeps counting
+    /// from zero instead of folding into an orphaned block.
+    fn reset(&self) {
+        self.ingress_packets.store(0, Ordering::Relaxed);
+        self.ingress_bytes.store(0, Ordering::Relaxed);
+        self.egress_packets.store(0, Ordering::Relaxed);
+        self.egress_bytes.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Coordinator-owned, config-apply-surviving cumulative per-zone traffic
-/// store, keyed by the stable zone id. `Clone` shares the inner `Arc<Mutex>`,
-/// so cloning `ForwardingState` (worker publish) keeps every generation
-/// pointing at the same totals.
+/// store, keyed by the stable zone id. The mutex guards only the MAP STRUCTURE
+/// (get-or-create at config-apply, iterate at snapshot/clear/reconcile) — all
+/// off the hot path. The per-batch fold never locks it: it `fetch_add`s into
+/// the per-zone `Arc<ZoneTotalsAtomic>` the slot map cached at build time
+/// (#5163). `Clone` shares the inner `Arc<Mutex>`, so cloning `ForwardingState`
+/// (worker publish) keeps every generation pointing at the same totals.
 #[derive(Clone, Debug, Default)]
 pub(in crate::afxdp) struct ZoneCounterStore {
-    totals: Arc<Mutex<FxHashMap<u16, ZoneTotals>>>,
+    totals: Arc<Mutex<FxHashMap<u16, Arc<ZoneTotalsAtomic>>>>,
 }
 
 impl ZoneCounterStore {
+    /// Get-or-create the shared atomic block for a stable zone id, under the
+    /// map mutex. Config-apply path only (called from `ZoneCounterSlotMap::build`
+    /// to cache the `Arc` per slot); NOT the hot path. A surviving zone gets the
+    /// SAME `Arc` back across applies, so its totals never reset or double.
+    fn zone_totals(&self, zone_id: u16) -> Arc<ZoneTotalsAtomic> {
+        let mut totals = self.totals.lock().expect("zone counter store poisoned");
+        Arc::clone(totals.entry(zone_id).or_default())
+    }
+
     /// Sparse snapshot for the status wire: one row per zone with any traffic.
     /// Deterministic order (sorted by zone id) for a stable wire.
     pub(in crate::afxdp) fn snapshot(&self) -> Vec<ZoneTrafficCounterStatus> {
         let totals = self.totals.lock().expect("zone counter store poisoned");
         let mut out: Vec<ZoneTrafficCounterStatus> = totals
             .iter()
-            .filter(|(_, t)| {
-                t.ingress_packets != 0
-                    || t.ingress_bytes != 0
-                    || t.egress_packets != 0
-                    || t.egress_bytes != 0
-            })
-            .map(|(&zone_id, t)| ZoneTrafficCounterStatus {
-                zone_id,
-                ingress_packets: t.ingress_packets,
-                ingress_bytes: t.ingress_bytes,
-                egress_packets: t.egress_packets,
-                egress_bytes: t.egress_bytes,
+            .filter_map(|(&zone_id, t)| {
+                let (ingress_packets, ingress_bytes, egress_packets, egress_bytes) = t.load();
+                if ingress_packets == 0
+                    && ingress_bytes == 0
+                    && egress_packets == 0
+                    && egress_bytes == 0
+                {
+                    return None;
+                }
+                Some(ZoneTrafficCounterStatus {
+                    zone_id,
+                    ingress_packets,
+                    ingress_bytes,
+                    egress_packets,
+                    egress_bytes,
+                })
             })
             .collect();
         out.sort_unstable_by_key(|s| s.zone_id);
         out
     }
 
-    /// Operator clear (`clear_zone_counters` IPC): drop all cumulative totals
-    /// so the helper reports 0 on the next status poll (otherwise the Go side's
-    /// absolute `SetZoneCounterOffset` overwrite would snap the cleared value
-    /// back within <= 1 s). Load-bearing half of the operator clear.
+    /// Operator clear (`clear_zone_counters` IPC): zero every zone's cumulative
+    /// totals so the helper reports 0 on the next status poll (otherwise the Go
+    /// side's absolute `SetZoneCounterOffset` overwrite would snap the cleared
+    /// value back within <= 1 s). Load-bearing half of the operator clear.
+    ///
+    /// #5163: resets each block IN PLACE rather than clearing the map, because a
+    /// live slot map caches each zone's `Arc`; dropping the map entry would
+    /// leave workers folding into an orphaned block the snapshot no longer sees
+    /// (traffic would appear to stop counting until the next config apply).
     pub(in crate::afxdp) fn clear(&self) {
-        self.totals
-            .lock()
-            .expect("zone counter store poisoned")
-            .clear();
+        let totals = self.totals.lock().expect("zone counter store poisoned");
+        for block in totals.values() {
+            block.reset();
+        }
     }
 
     /// Drop totals for zones that are no longer configured (config apply
     /// hygiene). Correctness does not depend on this — the coordinator snapshot
     /// accessor also filters to configured zones — but it bounds the map to the
-    /// live zone set.
+    /// live zone set. A `configured` zone's `Arc` is retained, so a slot map
+    /// rebuilt in the same apply resolves the SAME block (no reset/double).
     pub(in crate::afxdp) fn reconcile(&self, configured: &FxHashSet<u16>) {
         self.totals
             .lock()
@@ -201,16 +305,24 @@ impl ZoneCounterStore {
             .retain(|zone_id, _| configured.contains(zone_id));
     }
 
-    /// Fold a worker's coalesced per-slot deltas into the store, translating
-    /// slot → zone id via the slot map inverse. Off the hot path (once per RX
-    /// batch), so the single lock acquisition is cheap.
+    /// #5163: fold a worker's coalesced per-slot deltas into the shared per-zone
+    /// atomics the slot map cached at build time. LOCK-FREE — a straight
+    /// `Relaxed` `fetch_add` per touched slot; it does NOT lock `self.totals`
+    /// (that mutex is only for the ≤ 1 s snapshot/clear/reconcile map-structure
+    /// ops). This is the load-bearing change: the pre-#5163 fold locked
+    /// `self.totals` on EVERY worker EVERY batch, bouncing one cache line at
+    /// line rate. Reintroducing a `self.totals.lock()` here (the per-batch
+    /// global fold) is exactly what
+    /// `worker_fold_makes_progress_while_status_reader_holds_the_lock` catches.
+    /// The slot → zone attribution is fixed by which `Arc` each slot cached at
+    /// build time, so a slot renumber across applies cannot mis-attribute (the
+    /// fold and the intervening `record_zone_traffic` calls always read the SAME
+    /// slot map).
     fn fold_pending(&self, pending: &ZonePending, slot_map: &ZoneCounterSlotMap) {
-        let mut totals = self.totals.lock().expect("zone counter store poisoned");
         for slot in 1..ZONE_COUNTER_SLOTS {
-            let zone_id = slot_map.inverse[slot];
-            if zone_id == 0 {
+            let Some(totals) = &slot_map.slot_totals[slot] else {
                 continue;
-            }
+            };
             let ip = pending.ingress_packets[slot];
             let ib = pending.ingress_bytes[slot];
             let ep = pending.egress_packets[slot];
@@ -218,12 +330,19 @@ impl ZoneCounterStore {
             if ip == 0 && ib == 0 && ep == 0 && eb == 0 {
                 continue;
             }
-            let entry = totals.entry(zone_id).or_default();
-            entry.ingress_packets = entry.ingress_packets.saturating_add(ip);
-            entry.ingress_bytes = entry.ingress_bytes.saturating_add(ib);
-            entry.egress_packets = entry.egress_packets.saturating_add(ep);
-            entry.egress_bytes = entry.egress_bytes.saturating_add(eb);
+            totals.add_ingress(ip, ib);
+            totals.add_egress(ep, eb);
         }
+    }
+
+    /// Test-only handle to the map mutex, so a test can hold the shared store
+    /// lock (as the ≤ 1 s snapshot/clear path does) and prove the per-batch fold
+    /// still makes progress — the #5163 lock-freedom invariant.
+    #[cfg(test)]
+    fn lock_totals_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, FxHashMap<u16, Arc<ZoneTotalsAtomic>>> {
+        self.totals.lock().expect("zone counter store poisoned")
     }
 }
 
@@ -300,12 +419,18 @@ pub(in crate::afxdp) fn record_zone_traffic(
     });
 }
 
-/// Fold this worker thread's coalesced per-zone deltas into the shared store.
-/// Called once per RX batch alongside `flush_recorded_filter_counters` /
-/// `flush_recorded_policy_hit_counters`. `slot_map` must be the SAME map the
-/// intervening `record_zone_traffic` calls used (guaranteed: both read the
-/// loop iteration's `forwarding` snapshot), so the slot → zone-id translation
-/// is consistent.
+/// Fold this worker thread's coalesced per-zone deltas into the shared per-zone
+/// atomics the slot map caches. Called once per RX batch alongside
+/// `flush_recorded_filter_counters` / `flush_recorded_policy_hit_counters`.
+/// `slot_map` must be the SAME map the intervening `record_zone_traffic` calls
+/// used (guaranteed: both read the loop iteration's `forwarding` snapshot), so
+/// each slot's cached atomic block matches the zone it accumulated for.
+///
+/// #5163: lock-free — the fold `fetch_add`s into the slot map's cached
+/// `Arc<ZoneTotalsAtomic>` blocks and never takes the `store` mutex, so the
+/// per-batch worker path no longer serializes on a cross-worker lock. `store`
+/// stays in the signature as the aggregation owner (the ≤ 1 s snapshot/clear
+/// path locks it); the fold itself does not.
 pub(in crate::afxdp) fn flush_recorded_zone_counters(
     store: &ZoneCounterStore,
     slot_map: &ZoneCounterSlotMap,
@@ -323,12 +448,16 @@ pub(in crate::afxdp) fn flush_recorded_zone_counters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn build_assigns_slots_for_wide_stable_hash_zone_ids() {
         // #3075 stable name-hash ids span [1, 65533]; a dense id-indexed table
         // would drop these. The flat LUT + slot map must count them.
-        let map = ZoneCounterSlotMap::build(&[40000, 7, 65533]);
+        let store = ZoneCounterStore::default();
+        let map = ZoneCounterSlotMap::build(&[40000, 7, 65533], &store);
         assert!(!map.overflow_active);
         // sorted → 7 gets slot 1, 40000 slot 2, 65533 slot 3.
         assert_eq!(map.slot_of(7), 1);
@@ -344,7 +473,8 @@ mod tests {
 
     #[test]
     fn build_dedups_and_skips_zero() {
-        let map = ZoneCounterSlotMap::build(&[0, 5, 5, 9, 0, 5]);
+        let store = ZoneCounterStore::default();
+        let map = ZoneCounterSlotMap::build(&[0, 5, 5, 9, 0, 5], &store);
         assert_eq!(map.slot_of(5), 1);
         assert_eq!(map.slot_of(9), 2);
         assert_eq!(map.slot_of(0), 0);
@@ -353,8 +483,9 @@ mod tests {
 
     #[test]
     fn build_sets_overflow_past_capacity() {
+        let store = ZoneCounterStore::default();
         let ids: Vec<u16> = (1..=(ZONE_COUNTER_ASSIGNABLE_SLOTS as u16 + 5)).collect();
-        let map = ZoneCounterSlotMap::build(&ids);
+        let map = ZoneCounterSlotMap::build(&ids, &store);
         assert!(
             map.overflow_active,
             "exceeding {ZONE_COUNTER_ASSIGNABLE_SLOTS} assignable slots must set overflow_active"
@@ -367,7 +498,7 @@ mod tests {
     #[test]
     fn record_flush_snapshot_accumulates_both_directions() {
         let store = ZoneCounterStore::default();
-        let map = ZoneCounterSlotMap::build(&[100, 200]);
+        let map = ZoneCounterSlotMap::build(&[100, 200], &store);
         // A packet from zone 100 to zone 200: +ingress on 100, +egress on 200.
         record_zone_traffic(&map, 100, 200, 1500);
         record_zone_traffic(&map, 100, 200, 500);
@@ -397,7 +528,7 @@ mod tests {
     #[test]
     fn unassigned_and_zero_zones_are_uncounted() {
         let store = ZoneCounterStore::default();
-        let map = ZoneCounterSlotMap::build(&[100]);
+        let map = ZoneCounterSlotMap::build(&[100], &store);
         // Egress zone 999 is unconfigured (slot 0); ingress 0 is unzoned.
         record_zone_traffic(&map, 0, 999, 1500);
         // Ingress 100 counted; egress 999 uncounted.
@@ -413,18 +544,26 @@ mod tests {
     #[test]
     fn clear_resets_totals() {
         let store = ZoneCounterStore::default();
-        let map = ZoneCounterSlotMap::build(&[100]);
+        let map = ZoneCounterSlotMap::build(&[100], &store);
         record_zone_traffic(&map, 100, 100, 64);
         flush_recorded_zone_counters(&store, &map);
         assert_eq!(store.snapshot().len(), 1);
         store.clear();
         assert!(store.snapshot().is_empty());
+        // #5163: clear resets the atomics IN PLACE (keeps the map entry), so the
+        // live slot map's cached Arc keeps counting from zero after the clear.
+        record_zone_traffic(&map, 100, 100, 64);
+        flush_recorded_zone_counters(&store, &map);
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].ingress_packets, 1);
+        assert_eq!(snap[0].egress_packets, 1);
     }
 
     #[test]
     fn reconcile_drops_removed_zones() {
         let store = ZoneCounterStore::default();
-        let map = ZoneCounterSlotMap::build(&[100, 200]);
+        let map = ZoneCounterSlotMap::build(&[100, 200], &store);
         record_zone_traffic(&map, 100, 200, 64);
         flush_recorded_zone_counters(&store, &map);
         assert_eq!(store.snapshot().len(), 2);
@@ -433,5 +572,130 @@ mod tests {
         let snap = store.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].zone_id, 100);
+    }
+
+    #[test]
+    fn surviving_zone_keeps_the_same_atomic_block_across_a_slot_renumber() {
+        // #5163: the store is zone-id keyed and carried forward across applies.
+        // A rebuild that renumbers slots (a lower id appears) must NOT reset or
+        // double a surviving zone's totals — the new slot map resolves the SAME
+        // Arc for the surviving zone.
+        let store = ZoneCounterStore::default();
+        let map1 = ZoneCounterSlotMap::build(&[200], &store);
+        assert_eq!(map1.slot_of(200), 1);
+        record_zone_traffic(&map1, 200, 200, 100);
+        flush_recorded_zone_counters(&store, &map1);
+        // Config apply adds zone 100 (< 200), which takes slot 1 and pushes 200
+        // to slot 2 — a renumber. Store carried forward (same instance here).
+        let map2 = ZoneCounterSlotMap::build(&[100, 200], &store);
+        assert_eq!(map2.slot_of(100), 1);
+        assert_eq!(map2.slot_of(200), 2);
+        record_zone_traffic(&map2, 200, 200, 100);
+        flush_recorded_zone_counters(&store, &map2);
+        let snap = store.snapshot();
+        let z200 = snap.iter().find(|s| s.zone_id == 200).expect("zone 200");
+        // 2 packets total across the renumber — not reset to 1, not doubled.
+        assert_eq!(z200.ingress_packets, 2);
+        assert_eq!(z200.egress_packets, 2);
+        assert_eq!(z200.ingress_bytes, 200);
+    }
+
+    // ── #5163 RED-on-revert gate ──────────────────────────────────────────
+    //
+    // Two assertions together pin the contention fix. Reverting the fold to the
+    // pre-#5163 per-batch global-mutex fold makes AT LEAST the lock-freedom
+    // test fail:
+    //
+    //   1. `concurrent_workers_fold_lock_free_without_lost_counts` — correctness
+    //      of the new accumulation: N worker threads each fold M batches into
+    //      the SHARED store concurrently; the merged total must equal N*M with
+    //      no lost or double counts. (A broken fetch_add merge fails here; a
+    //      mutex fold would also pass, so this is the correctness half.)
+    //
+    //   2. `worker_fold_makes_progress_while_status_reader_holds_the_lock` — the
+    //      LOAD-BEARING structural assertion: while the ≤1 s status/clear path
+    //      holds the shared store mutex, a worker's per-batch fold must still
+    //      COMPLETE promptly. The lock-free fold `fetch_add`s into the slot
+    //      map's cached atomics and returns in microseconds. Reverting to the
+    //      per-batch-global-mutex fold makes the fold BLOCK on the held mutex
+    //      until the reader releases (300 ms here), so the `< 150 ms` bound
+    //      FAILS — a clean assertion failure, not a hang (the holder always
+    //      releases).
+
+    #[test]
+    fn concurrent_workers_fold_lock_free_without_lost_counts() {
+        const WORKERS: u64 = 8;
+        const PER_WORKER: u64 = 20_000;
+        const BYTES: u64 = 100;
+        let store = ZoneCounterStore::default();
+        // One shared slot map, exactly as every worker shares `forwarding`.
+        let map = Arc::new(ZoneCounterSlotMap::build(&[100, 200], &store));
+
+        let mut handles = Vec::new();
+        for _ in 0..WORKERS {
+            let map = Arc::clone(&map);
+            // The shared store, exactly as every worker holds a ForwardingState
+            // clone that shares the same `Arc<Mutex>` store.
+            let store = store.clone();
+            handles.push(thread::spawn(move || {
+                // Each worker (own thread → own ZONE_PENDING) records and folds
+                // one "batch" per iteration, hammering the shared per-zone
+                // atomics concurrently with every other worker.
+                for _ in 0..PER_WORKER {
+                    record_zone_traffic(&map, 100, 200, BYTES);
+                    flush_recorded_zone_counters(&store, &map);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let snap = store.snapshot();
+        let z100 = snap.iter().find(|s| s.zone_id == 100).expect("zone 100");
+        assert_eq!(z100.ingress_packets, WORKERS * PER_WORKER);
+        assert_eq!(z100.ingress_bytes, WORKERS * PER_WORKER * BYTES);
+        let z200 = snap.iter().find(|s| s.zone_id == 200).expect("zone 200");
+        assert_eq!(z200.egress_packets, WORKERS * PER_WORKER);
+        assert_eq!(z200.egress_bytes, WORKERS * PER_WORKER * BYTES);
+    }
+
+    #[test]
+    fn worker_fold_makes_progress_while_status_reader_holds_the_lock() {
+        let store = ZoneCounterStore::default();
+        let map = ZoneCounterSlotMap::build(&[100], &store);
+
+        // A second thread parks on the shared store mutex for 300 ms — standing
+        // in for the ≤1 s status/clear path holding it under contention.
+        let held = store.clone();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let guard = held.lock_totals_for_test();
+            locked_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(300));
+            drop(guard);
+        });
+        // Wait until the lock is definitely held elsewhere.
+        locked_rx.recv().unwrap();
+
+        // A worker records + folds while the shared lock is held. The lock-free
+        // fold must return without waiting on that mutex.
+        let start = Instant::now();
+        record_zone_traffic(&map, 100, 100, 64);
+        flush_recorded_zone_counters(&store, &map);
+        let elapsed = start.elapsed();
+
+        holder.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "per-batch worker fold blocked on the shared store lock for {elapsed:?} \
+             — the fold must be lock-free (issue #5163). A per-batch global-mutex \
+             fold would block until the status reader released the lock (~300 ms)."
+        );
+        // The fold still landed the count (lock-free path is correct, not a no-op).
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].ingress_packets, 1);
+        assert_eq!(snap[0].egress_packets, 1);
     }
 }

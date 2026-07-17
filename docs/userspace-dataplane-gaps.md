@@ -123,7 +123,14 @@ counters (see below).
   per-packet hash, no per-packet atomic — the same coalesce-then-fold pattern
   as the policy/filter hit counters), folded per RX batch into a
   coordinator-owned, zone-id-keyed `ZoneCounterStore` that rides `ForwardingState`
-  and survives config commits. The helper pre-sums across workers into ONE
+  and survives config commits. The per-batch fold is **lock-free** (#5163): the
+  store holds one four-`AtomicU64` `ZoneTotalsAtomic` block per zone id and each
+  slot caches its zone's block, so the fold `fetch_add`s straight into per-zone
+  atomics with no shared mutex — the `ZoneCounterStore` mutex only guards the
+  map STRUCTURE for the ≤ 1 s snapshot / clear / reconcile ops. (Before #5163 the
+  fold locked that single mutex on every worker every batch, bouncing one cache
+  line at line rate — cross-worker serialization on the hot path.) The helper
+  pre-sums across workers into ONE
   `ProcessStatus`-level sparse per-zone block (`zone_traffic_counters`, layout
   version 1, only nonzero rows). The Go status poll
   (`syncBPFCountersLocked`) mirrors each row into the bpfShim offset map via
