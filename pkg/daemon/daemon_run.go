@@ -1873,6 +1873,19 @@ func (d *Daemon) initManagers(configCompileFailed bool) error {
 		// Wire event-drop callback: on dropped cluster events, trigger
 		// immediate reconciliation so the safety net doesn't wait 2s.
 		d.cluster.SetOnEventDrop(d.triggerReconcile)
+		// Wire dual-active reaffirm-drop callback (#4867): if the
+		// "winner stays" event is dropped on a full channel, the generic
+		// reconcile above does NOT re-announce for a steady VIP owner, so
+		// re-drive the direct-mode GARP/NA refresh directly. Runs off the
+		// election goroutine (cluster m.mu held during the callback) — spawn
+		// so the announce I/O never blocks election under that lock.
+		d.cluster.SetOnDualActiveWinDrop(func(rgID int) {
+			go func() {
+				if d.isNoRethVRRP() {
+					d.scheduleDirectAnnounce(rgID, "dual-active-win-drop")
+				}
+			}()
+		})
 		slog.Info("cluster manager initialized",
 			"node", cc.NodeID, "cluster", cc.ClusterID)
 

@@ -51486,6 +51486,21 @@ top.
   pkg/dataplane/userspace/format/status_golden_test.go,
   docs/feature-coverage.md, userspace-dp/src/FEATURES.md
 
+- **Timestamp**: 2026-07-17 (#4867)
+  **Action**: cluster: route dual-active "winner stays" reaffirm event's
+    full-channel drop through the reliable fallback. Inline non-blocking
+    select in runElection now logs + invokes onEventDrop (reconcile) AND a
+    new onDualActiveWinDrop callback (re-drives scheduleDirectAnnounce). The
+    generic reconcile alone does not re-announce for a steady VIP owner
+    (announce=!prev||added>0 is false), so the dedicated callback is needed to
+    genuinely cover the lost post-split-brain GARP/NA refresh. Added
+    SetOnDualActiveWinDrop + field; wired daemon (noRethVRRP-gated, spawned
+    off the election lock). Fail-on-revert test
+    TestElection_DualActiveWinDrop_InvokesReconcileFallback +
+    TestElection_DualActiveWin_NormalPathDelivers.
+  **File(s)**: pkg/cluster/manager.go, pkg/cluster/election.go,
+    pkg/cluster/election_test.go, pkg/daemon/daemon_run.go,
+    docs/vrrp-elimination-study.md
 - **Timestamp**: 2026-07-17
 - **Action**: #5625 — NAT64 v6→v4 RFC 7915 §5.1 translation-eligibility gate.
   The ext-header walker `ipv6_l4_offset_and_protocol` walked PAST AH (51),
