@@ -67,6 +67,11 @@ func TestNptv6SnapshotScopeFailClosed_5818(t *testing.T) {
 			"set security nat static rule-set rs1 rule r1 match destination-address 2001:db8:1::/48",
 			"set security nat static rule-set rs1 rule r1 match source-address 2001:db8:100::/64",
 			"set security nat static rule-set rs1 rule r1 then static-nat nptv6-prefix fd00:1::/48"}},
+		{"match-destination-port", []string{
+			"set security nat static rule-set rs1 from zone trust",
+			"set security nat static rule-set rs1 rule r1 match destination-address 2001:db8:1::/48",
+			"set security nat static rule-set rs1 rule r1 match destination-port 443",
+			"set security nat static rule-set rs1 rule r1 then static-nat nptv6-prefix fd00:1::/48"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
