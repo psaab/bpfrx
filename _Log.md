@@ -1,3 +1,32 @@
+## 2026-07-17 — #5659: empty-zone addressed-interface host-inbound fail-closed backstop
+
+- **Timestamp**: 2026-07-17 (fix/5659-empty-zone-host-inbound-failclosed)
+- **Action**: Closed the #2391 fail-closed-symmetry gap where an ADDRESSED
+  interface with an EMPTY `security-zone` string is skipped by the
+  `!iface.zone.is_empty()`-guarded zone-id backstop, resolving to the global
+  `zone_id 0` while its IP is still registered into `local_v4`/`local_v6`.
+  `host_inbound_admits(0)` would then hit the `None => true` global-zone admit
+  arm and admit every host-bound service (SSH/NETCONF/BGP/SNMP). Fix:
+  `populate_interfaces` now inserts an EMPTY `ZoneHostInbound` sentinel into
+  `ifindex_host_inbound` keyed by the interface's logical ifindex, so the
+  ingress-interface-keyed `host_inbound_admits_iface` DENIES host-bound services
+  on it. Scoped to unzoned + local-registered + no explicit override + non-
+  lifeline (fxp0/em0/fab*). Keying by ifindex (not `zone_host_inbound[0]`)
+  preserves the genuinely-global zone_id-0 admit path (ND/PMTUD control + a
+  legitimately-zoneless NON-addressed control interface). Global ICMP/ND/PMTUD
+  accepts (checked before the set) unaffected. Fail-closed-SYMMETRY / defense-in-
+  depth: reachability is bind-gated today (`buildUserspaceBindNetdevs` skips a
+  zoneless interface); this closes the asymmetry so a future bind-a-zoneless
+  change or a #3719 quarantine path cannot become a live host-inbound bypass.
+  Rust-only (helper-boundary backstop, matching #2391/#2409); Go side unchanged.
+  RED-on-revert test `empty_zone_addressed_interface_denies_host_inbound`
+  (forwarding_build/tests.rs) verified: fails at the SSH-deny assertion when the
+  sentinel insert is neutralized.
+- **File(s)**: userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs (doc),
+  userspace-dp/src/afxdp/forwarding_build/tests.rs (test),
+  userspace-dp/src/afxdp/forwarding/README.md (doc), _Log.md
+
 ## 2026-07-17 — #5658: static block-to-block & DNAT prefix minimum-prefix floor (fail-open on /0)
 
 - **Timestamp**: 2026-07-17 (fix/5658-static-nat-min-prefix-floor)

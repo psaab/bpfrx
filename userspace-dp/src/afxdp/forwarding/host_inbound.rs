@@ -497,6 +497,14 @@ pub(in crate::afxdp) fn host_inbound_admits(
         // security zone). Such traffic keeps the admit default — narrowing it is
         // out of scope for the configured-zone default-deny fix and risks
         // breaking ND / control delivery on the global context.
+        //
+        // #5659: an ADDRESSED interface with an EMPTY security-zone also resolves
+        // to id 0 here, but its host-inbound is denied WITHOUT touching this
+        // global admit arm — `populate_interfaces` inserts an empty
+        // `ZoneHostInbound` sentinel into `ifindex_host_inbound` keyed by that
+        // interface's ifindex, so the ingress-interface-keyed
+        // `host_inbound_admits_iface` denies it while this zone-only path (and a
+        // legitimately-zoneless NON-addressed control interface) keeps admit.
         None => true,
         // A configured zone — including one with no `host-inbound-traffic` stanza
         // (empty set) — denies anything its set does not admit (#3405).

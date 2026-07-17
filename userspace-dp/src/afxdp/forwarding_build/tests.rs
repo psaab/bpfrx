@@ -1535,6 +1535,167 @@ fn build_forwarding_state_nil_zone_default_denies() {
     );
 }
 
+// #5659: an ADDRESSED interface with an EMPTY security-zone string registers its
+// IP into local_v4/local_v6 (a local-delivery target) but is skipped by the
+// #2391 zone-id backstop (guarded by `!iface.zone.is_empty()`), so it resolves to
+// zone_id 0. Without the empty-zone fail-closed sentinel, the ingress-interface-
+// keyed `host_inbound_admits_iface` falls back to `host_inbound_admits(0)` which
+// hits the `None => true` global-zone admit arm and would admit EVERY host-bound
+// service on that interface. The fix inserts an empty `ZoneHostInbound` sentinel
+// keyed by the interface's ifindex so host-bound services are DENIED there.
+//
+// Fail-on-revert: removing the sentinel insert in `populate_interfaces`
+// (forwarding_build/interfaces.rs) makes `host_inbound_admits_iface(unzoned)`
+// admit SSH/BGP again -> the deny assertions below turn RED. The ICMP/ND accepts
+// and the genuinely-global zone_id 0 path (no ifindex override) stay untouched,
+// and the em0 lifeline keeps its unconditional admit -> those anti-over-reject
+// assertions guard the fix's scope.
+#[test]
+fn empty_zone_addressed_interface_denies_host_inbound() {
+    use crate::ZoneSnapshot;
+    use crate::afxdp::forwarding::{host_inbound_admits, host_inbound_admits_iface};
+    use crate::protocol::snapshot::InterfaceAddressSnapshot;
+
+    const UNZONED_IFINDEX: i32 = 80;
+    const EM0_IFINDEX: i32 = 81;
+    const TRUST_IFINDEX: i32 = 82;
+    const PROTO_TCP: u8 = 6;
+    const PROTO_ICMP: u8 = 1;
+    const PROTO_ICMP6: u8 = 58;
+
+    let snapshot = ConfigSnapshot {
+        zones: vec![ZoneSnapshot {
+            name: "trust".into(),
+            id: 22,
+            host_inbound_configured: true,
+            host_inbound_system_services: vec!["ssh".into()],
+            ..Default::default()
+        }],
+        interfaces: vec![
+            // The gap: an ADDRESSED interface with NO security-zone.
+            InterfaceSnapshot {
+                name: "ge-0/0/9".into(),
+                zone: String::new(),
+                ifindex: UNZONED_IFINDEX,
+                hardware_addr: "02:00:00:00:00:80".into(),
+                addresses: vec![
+                    InterfaceAddressSnapshot {
+                        family: "inet".into(),
+                        address: "10.0.99.1/24".into(),
+                        ..Default::default()
+                    },
+                    InterfaceAddressSnapshot {
+                        family: "inet6".into(),
+                        address: "2001:db8:99::1/64".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            // A zoneless-addressed LIFELINE (em0) must NOT get a deny sentinel —
+            // its host traffic is served unconditionally.
+            InterfaceSnapshot {
+                name: "em0".into(),
+                zone: String::new(),
+                ifindex: EM0_IFINDEX,
+                hardware_addr: "02:00:00:00:00:81".into(),
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "10.99.0.1/24".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            // A normally-zoned addressed interface — unaffected.
+            InterfaceSnapshot {
+                name: "ge-0/0/8".into(),
+                zone: "trust".into(),
+                ifindex: TRUST_IFINDEX,
+                hardware_addr: "02:00:00:00:00:82".into(),
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "10.0.61.1/24".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+
+    // Precondition: the unzoned interface's IPs ARE registered as local-delivery
+    // targets (the exposure the sentinel closes), and it resolved to zone_id 0
+    // (no ifindex_to_zone_id entry).
+    assert!(
+        state.local_v4.contains(&"10.0.99.1".parse::<Ipv4Addr>().unwrap()),
+        "unzoned interface v4 IP must be a local-delivery target"
+    );
+    assert!(
+        state
+            .local_v6
+            .contains(&"2001:db8:99::1".parse::<std::net::Ipv6Addr>().unwrap()),
+        "unzoned interface v6 IP must be a local-delivery target"
+    );
+    assert!(
+        !state.ifindex_to_zone_id.contains_key(&UNZONED_IFINDEX),
+        "unzoned interface must resolve to zone_id 0 (no zone-id entry)"
+    );
+
+    // The FIX: a host-bound service ingressing on the unzoned interface is DENIED
+    // (empty sentinel), even though its resolved zone id is the global 0.
+    assert!(
+        !host_inbound_admits_iface(&state, UNZONED_IFINDEX, 0, PROTO_TCP, 22, false, 0),
+        "empty-zone addressed interface must DENY host-bound ssh (tcp/22) — #5659"
+    );
+    assert!(
+        !host_inbound_admits_iface(&state, UNZONED_IFINDEX, 0, PROTO_TCP, 179, false, 0),
+        "empty-zone addressed interface must DENY host-bound bgp (tcp/179) — #5659"
+    );
+
+    // ICMP error/PMTUD (v4 type 3) and IPv6 ND (type 135) STILL admitted globally
+    // on the unzoned interface — the sentinel must not black-hole control traffic.
+    assert!(
+        host_inbound_admits_iface(&state, UNZONED_IFINDEX, 0, PROTO_ICMP, 0, false, 3),
+        "ICMPv4 destination-unreachable stays globally admitted on the unzoned interface"
+    );
+    assert!(
+        host_inbound_admits_iface(&state, UNZONED_IFINDEX, 0, PROTO_ICMP6, 0, true, 135),
+        "IPv6 Neighbor Solicitation stays globally admitted on the unzoned interface"
+    );
+
+    // Scope guard 1: the genuinely-global zone_id 0 path (no ifindex override)
+    // KEEPS its admit default — a legitimately-zoneless NON-addressed control
+    // interface is not affected. This is why the sentinel is keyed by ifindex, not
+    // inserted into zone_host_inbound at id 0.
+    assert!(
+        host_inbound_admits(&state, 0, PROTO_TCP, 22, false, 0),
+        "global zone_id 0 (zone-only path) keeps the admit default — not broken by #5659"
+    );
+
+    // Scope guard 2: the em0 lifeline is zoneless+addressed but must NOT get a
+    // deny sentinel — its host traffic is served unconditionally.
+    assert!(
+        !state.ifindex_host_inbound.contains_key(&EM0_IFINDEX),
+        "em0 lifeline must not get an empty-zone deny sentinel (#5659 scope)"
+    );
+    assert!(
+        host_inbound_admits_iface(&state, EM0_IFINDEX, 0, PROTO_TCP, 22, false, 0),
+        "em0 lifeline keeps its unconditional admit"
+    );
+
+    // Anti-over-reject: the normal trust zone still admits its configured ssh.
+    assert!(
+        host_inbound_admits_iface(&state, TRUST_IFINDEX, 22, PROTO_TCP, 22, false, 0),
+        "configured trust zone still admits ssh (tcp/22)"
+    );
+    assert!(
+        !host_inbound_admits_iface(&state, TRUST_IFINDEX, 22, PROTO_TCP, 179, false, 0),
+        "configured trust zone (ssh only) still denies bgp (tcp/179)"
+    );
+}
+
 // #3299: `host-inbound-traffic protocols bfd` must admit multi-hop BFD control
 // (UDP 4784, RFC 5883) in addition to single-hop control (3784) + echo (3785).
 // Multi-hop BFD (for multi-hop BGP / BFD over multi-hop static routes) carries

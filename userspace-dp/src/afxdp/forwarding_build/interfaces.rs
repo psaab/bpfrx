@@ -125,6 +125,12 @@ pub(super) fn populate_interfaces(
         // prefix owned by a different routing-instance.
         let (connected_table_v4, connected_table_v6) =
             connected_route_tables(&iface.routing_instance);
+        // #5659: track whether this interface registered at least one
+        // local-delivery target (an address that landed in local_v4/local_v6,
+        // NOT one routed into interface_nat_*). Only such an addressed
+        // local-delivery target is a host-inbound exposure worth the empty-zone
+        // fail-closed sentinel installed after this loop.
+        let mut registered_local = false;
         for addr in &iface.addresses {
             // #2409: fail CLOSED on an unparseable interface address rather
             // than silently `continue`-ing past it. The pre-fix skip lost the
@@ -151,6 +157,7 @@ pub(super) fn populate_interfaces(
                         state.interface_nat_v4.insert(v4.addr(), iface.ifindex);
                     } else {
                         state.local_v4.insert(v4.addr());
+                        registered_local = true;
                         // #3769: record the interface host address's owning
                         // table for the table-scoped local-delivery DECISION.
                         // Keyed by the HOST `.addr()`, NOT the (masked)
@@ -177,6 +184,7 @@ pub(super) fn populate_interfaces(
                         state.interface_nat_v6.insert(v6.addr(), iface.ifindex);
                     } else {
                         state.local_v6.insert(v6.addr());
+                        registered_local = true;
                         // #3769: record the interface host address's owning
                         // table (see the v4 arm).
                         state
@@ -193,6 +201,56 @@ pub(super) fn populate_interfaces(
                     });
                 }
             }
+        }
+        // #5659: empty-zone host-inbound fail-closed backstop — SYMMETRY with
+        // the #2391 non-empty-unknown-zone backstop above. That backstop is
+        // guarded by `!iface.zone.is_empty()`, so an ADDRESSED interface with an
+        // EMPTY security-zone string is skipped: no `ifindex_to_zone_id` entry ->
+        // ingress resolves to zone_id 0, while its IP is STILL registered into
+        // local_v4/local_v6 as a local-delivery target. `host_inbound_admits(0)`
+        // then hits the `None => true` global-zone admit arm and would admit
+        // every host-bound service (SSH/NETCONF/BGP/SNMP...), breaking the
+        // fail-closed symmetry #2391/#3405 established.
+        //
+        // Fix: insert an EMPTY `ZoneHostInbound` sentinel keyed by this
+        // interface's LOGICAL ifindex, so the ingress-interface-keyed
+        // `host_inbound_admits_iface` (the local-delivery poll path's entry
+        // point) DENIES host-bound services for a packet ingressing on it. The
+        // global ICMP/ND/PMTUD accepts (`is_icmp_host_inbound_global_accept`,
+        // checked BEFORE the set in `host_inbound_admits_iface`) still deliver
+        // control traffic. Keying by ifindex — NOT by inserting zone_host_inbound
+        // at id 0 — deliberately leaves the genuinely-global zone_id 0 path
+        // (`host_inbound_admits` with no matching ifindex override) untouched, so
+        // a legitimately-zoneless NON-addressed control interface keeps its admit
+        // default.
+        //
+        // Scope guards:
+        //   - registered_local: only an interface that actually registered a
+        //     local_v4/local_v6 target is a host-inbound exposure. A fully
+        //     NAT-excluded (interface_nat only) or address-less interface is not.
+        //   - !iface.host_inbound_configured: an explicit per-interface override
+        //     already inserted its own (possibly deny-all) `ifindex_host_inbound`
+        //     entry above; never clobber the operator's configured admit set.
+        //   - !is_host_inbound_lifeline: fxp0/em0/fab* are served UNCONDITIONALLY
+        //     (kernel path, excluded from the AF_XDP deny sets). Never arm a deny
+        //     sentinel for a lifeline — doing so would strand management / break
+        //     HA heartbeat the moment a future change bound one.
+        //
+        // Reachability today is bind-gated (`buildUserspaceBindNetdevs` skips a
+        // zoneless interface), so this is a fail-closed-SYMMETRY / defense-in-
+        // depth hardening, not a live bypass: it closes the asymmetry so any
+        // future change that binds a zoneless-addressed interface (or a quarantine
+        // path, cf. #3719, that keeps an interface bound while stripping its zone)
+        // cannot silently become a host-inbound bypass.
+        if iface.zone.is_empty()
+            && registered_local
+            && !iface.host_inbound_configured
+            && !is_host_inbound_lifeline(&iface.name)
+        {
+            state
+                .ifindex_host_inbound
+                .entry(iface.ifindex)
+                .or_default();
         }
     }
 
@@ -297,6 +355,30 @@ pub(in crate::afxdp) fn connected_route_tables(routing_instance: &str) -> (Strin
             format!("{routing_instance}.inet6.0"),
         )
     }
+}
+
+/// #5659: base-name lifeline match, mirroring the UNCONDITIONAL defaults of the
+/// Go SSOT `config.HostInboundLifelineInterface` (fxp0 / em0 / fab*). A lifeline
+/// interface's host-bound traffic is served UNCONDITIONALLY by the kernel path
+/// (excluded from the AF_XDP host-inbound deny sets), so the empty-zone
+/// fail-closed backstop in [`populate_interfaces`] must never arm a deny
+/// sentinel for one — that would strand management / break the HA heartbeat the
+/// moment a future change bound it.
+///
+/// The config-derived control/fabric names (#3277: a renamed `control-interface`
+/// / non-default fabric) are NOT mirrored here because the snapshot does not
+/// carry them. That is safe: such a renamed lifeline is zoneless and thus not
+/// AF_XDP-bound today (`buildUserspaceBindNetdevs` skips a zoneless interface),
+/// so a missed match leaves an INERT sentinel that is never consulted — and the
+/// canonical em0/fab*/fxp0 names (the only ones present in default configs) are
+/// matched. The unit suffix is stripped so `em0.0` / `fab1.0` match too.
+fn is_host_inbound_lifeline(name: &str) -> bool {
+    let base = match name.split_once('.') {
+        Some((b, _)) => b,
+        None => name,
+    }
+    .trim();
+    base == "fxp0" || base == "em0" || base.starts_with("fab")
 }
 
 pub(in crate::afxdp) fn pick_interface_v4(iface: &InterfaceSnapshot) -> Option<Ipv4Addr> {
