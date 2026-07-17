@@ -254,6 +254,15 @@ type Manager struct {
 	// channel. The daemon uses this to trigger immediate reconciliation.
 	onEventDrop func()
 
+	// onDualActiveWinDrop is called when the dual-active "winner stays"
+	// reaffirm event is dropped due to a full channel. The generic
+	// onEventDrop reconcile is NOT sufficient for this event: the direct-VIP
+	// ownership reconcile only re-announces on an ownership CHANGE, and a
+	// dual-active winner is already the steady owner, so a plain reconcile
+	// would not re-drive the post-split-brain GARP/NA refresh. The daemon
+	// wires this to re-drive scheduleDirectAnnounce directly (#4867).
+	onDualActiveWinDrop func(groupID int)
+
 	// takeoverHoldTime is the minimum duration an RG must be ready before
 	// election will promote it to primary. Zero means immediate takeover
 	// once readiness is established.
@@ -376,6 +385,19 @@ func (m *Manager) SetOnEventDrop(fn func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onEventDrop = fn
+}
+
+// SetOnDualActiveWinDrop registers a callback invoked when the dual-active
+// "winner stays" reaffirm event is dropped due to a full channel. The daemon
+// wires this to re-drive the direct-mode GARP/NA announce so the
+// post-split-brain refresh survives a saturated event channel — a plain
+// reconcile does not re-announce for a steady VIP owner (#4867). The callback
+// runs with m.mu held during runElection and must not re-enter the manager
+// lock or perform blocking work inline.
+func (m *Manager) SetOnDualActiveWinDrop(fn func(groupID int)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onDualActiveWinDrop = fn
 }
 
 func (m *Manager) sendEvent(groupID int, oldState, newState NodeState, reason string) {

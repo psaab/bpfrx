@@ -22,7 +22,23 @@ The shim checks several conditions before redirecting a packet to userspace:
 1. `userspace_ctrl` must be enabled with matching metadata version.
 2. Ingress ifindex must be in `userspace_ingress_ifaces` map.
 3. A binding must exist in `userspace_bindings` for (ifindex, queue_id) and be
-   marked `USERSPACE_BINDING_READY`.
+   marked `USERSPACE_BINDING_READY`. `userspace_bindings` is a flat array
+   indexed by `idx = ifindex * BINDING_QUEUES_PER_IFACE + queue_id`, where
+   `BINDING_QUEUES_PER_IFACE == 16` (the fixed per-interface stride, defined in
+   `userspace-xdp/src/lib.rs` and mirrored in `pkg/dataplane`
+   `BindingQueuesPerIface` — NOT in `bpf/headers`, which only carries
+   `MAX_INTERFACES`). Because the stride is fixed, the control plane
+   (`pkg/dataplane/userspace/maps_sync.go`) fails closed on two dimension
+   overflows before writing any slot: a `queue_id >= 16` would alias the
+   queue-0 slot of the adjacent ifindex (`ifindex*16 + 16 == (ifindex+1)*16`,
+   #4894), and an `ifindex >= MAX_INTERFACES` would overflow the array cap
+   (#814). Out-of-stride queue IDs are never clamped/moduloed (that would
+   still steer to a wrong slot) — the apply path disables `userspace_ctrl`
+   and the watchdog logs and skips. A NIC exposing more than 16 RX queues
+   therefore requires reducing its channel count (`ethtool -L`) or a
+   coordinated stride bump; the helper planner
+   (`replan_bindings_from_candidates`) does not cap the queue count, so the
+   Go boundary is the enforcement point.
 4. The binding's heartbeat (written every 250ms by the worker) must not be
    stale (default 5s timeout).
 5. ICMP/ICMPv6 is handled by the userspace dataplane or passed to the kernel

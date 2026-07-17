@@ -25,6 +25,36 @@
 - **Validation**: cargo build --release + cargo test (segment + dispatch
   segmentation); firsthand RED-on-revert confirmed by reverting the gate.
 
+## 2026-07-17 — #5162: GRE tunnel with mixed-family outer source/destination commits clean then silently drops
+
+- **Timestamp**: 2026-07-17 (fix/5162-gre-outer-family-gate)
+- **Action**: added a cross-field outer-family gate for non-WireGuard
+  tunnels. A GRE/IPIP tunnel whose outer `tunnel source` and `tunnel
+  destination` are different address families (v4 src + v6 dst, or the
+  reverse) passed per-leaf validation and COMMITTED CLEAN, but the Go
+  snapshot producer tags the endpoint `inet6` when EITHER endpoint is v6,
+  so the Rust GRE encoder hit the AF_INET6 arm, found a v4 endpoint, and
+  returned None → every encapsulated packet was silently dropped. New Go
+  strict commit gate `validateTunnelOuterFamilyStrict` (mirrors the
+  WireGuard endpoint-family gate — one encap = one outer family) rejects
+  the mixed pair at commit / commit-check and downgrades to a warning on
+  the tolerant load / peer-sync path (`lenientTunnelOuterFamily`, #1960
+  no-brick). Rust `populate_tunnel_endpoints` gains a helper-boundary
+  backstop that SKIPS a mixed-family non-WG row with a loud `eprintln!`
+  (mirrors the WG hydrate row-drop / allowed-ips skip-and-continue) for a
+  mixed-version peer-sync / corrupt snapshot the Go gate cannot cover.
+  Fail-on-revert tests verified RED both sides (Go commit-path reject,
+  Rust row-skip).
+- **File(s)**:
+  pkg/config/compiler_validate_tunnel_family.go (new gate),
+  pkg/config/compiler_tailgates.go (wire gate after the WG gate),
+  pkg/config/compiler.go (`lenientTunnelOuterFamily` flag + both lenient
+    entry points),
+  pkg/config/compiler_validate_tunnel_family_5162_test.go (new Go tests),
+  userspace-dp/src/afxdp/forwarding_build/tunnels.rs (Rust backstop skip),
+  userspace-dp/src/afxdp/forwarding_build/tests.rs (3 new Rust tests),
+  docs/feature-coverage.md (GRE row same-outer-family note)
+
 ## 2026-07-17 — #5620: IPsec passthrough claim needs a local-destination predicate
 
 - **Timestamp**: 2026-07-17 (fix/5620-ipsec-passthrough-local-dest)
@@ -51513,6 +51543,38 @@ top.
   pkg/dataplane/userspace/format/status_golden_test.go,
   docs/feature-coverage.md, userspace-dp/src/FEATURES.md
 
+- **Timestamp**: 2026-07-17
+- **Action**: #4894 — bound binding queue-id to the fixed 16-slot stride
+  before the flat `userspace_bindings` index is computed. QueueID >= 16 on
+  ifindex N aliased the queue-0 slot of ifindex N+1 (idx N*16+16 ==
+  (N+1)*16+0); the existing `idx >= BindingArrayMaxEntries` cap (#814) did
+  not catch it. Added a fail-closed guard at all 4 index sites (primary
+  apply, VLAN-alias apply, watchdog verify, watchdog alias): apply paths
+  disable ctrl via failClosedUserspaceCtrlLocked, watchdog paths log+skip.
+  Never clamp/modulo the queue-id. Added RED-on-revert test asserting the
+  adjacent ifindex queue-0 slot is not written. Documented the flat-index
+  layout + both bounds in docs/afxdp-packet-processing.md. Rust producer
+  (replan_bindings_from_candidates) can emit queue_id>=16 on >16-queue NICs
+  but a naive cap-at-16 is unclean (strands RX queues >=16 under AF_XDP
+  queue-binding) — Go boundary is the enforcement point.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/maps_sync_queue_id_bound_4894_test.go,
+  docs/afxdp-packet-processing.md
+- **Timestamp**: 2026-07-17 (#4867)
+  **Action**: cluster: route dual-active "winner stays" reaffirm event's
+    full-channel drop through the reliable fallback. Inline non-blocking
+    select in runElection now logs + invokes onEventDrop (reconcile) AND a
+    new onDualActiveWinDrop callback (re-drives scheduleDirectAnnounce). The
+    generic reconcile alone does not re-announce for a steady VIP owner
+    (announce=!prev||added>0 is false), so the dedicated callback is needed to
+    genuinely cover the lost post-split-brain GARP/NA refresh. Added
+    SetOnDualActiveWinDrop + field; wired daemon (noRethVRRP-gated, spawned
+    off the election lock). Fail-on-revert test
+    TestElection_DualActiveWinDrop_InvokesReconcileFallback +
+    TestElection_DualActiveWin_NormalPathDelivers.
+  **File(s)**: pkg/cluster/manager.go, pkg/cluster/election.go,
+    pkg/cluster/election_test.go, pkg/daemon/daemon_run.go,
+    docs/vrrp-elimination-study.md
 - **Timestamp**: 2026-07-17
 - **Action**: #5625 — NAT64 v6→v4 RFC 7915 §5.1 translation-eligibility gate.
   The ext-header walker `ipv6_l4_offset_and_protocol` walked PAST AH (51),

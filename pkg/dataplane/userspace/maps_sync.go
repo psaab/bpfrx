@@ -687,6 +687,21 @@ ctrlReady:
 			// RX, so this does not deadlock startup (plan §4).
 			flags = userspaceBindingReady
 		}
+		// Queue-dimension bound guard (#4894): a queue-id at or above the
+		// fixed stride makes idx = ifindex*stride + queue land on
+		// (ifindex+1)*stride + (queue-stride) — aliasing a slot that
+		// belongs to the ADJACENT ifindex. The dense-cap guard below
+		// cannot catch this (the aliased index is in range), so bound the
+		// queue dimension explicitly and fail closed rather than steer an
+		// interface's packets into another interface's XSK. Never
+		// clamp/modulo the queue-id: that would still steer to a wrong
+		// slot.
+		if binding.QueueID >= bindingQueuesPerIface {
+			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
+				"update userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (ifindex=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/lib.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
+				binding.QueueID, uint32(bindingQueuesPerIface), binding.Ifindex,
+			))
+		}
 		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
 		// Call-site cap guard (#814): the aya Array is sized to
 		// dataplane.BindingArrayMaxEntries = MaxInterfaces *
@@ -720,6 +735,15 @@ ctrlReady:
 			if bindingForwardingLive(binding, deadWorkers) {
 				// #1666: unify the VLAN-alias child with the primary gate.
 				flags = userspaceBindingReady
+			}
+			// Queue-dimension bound guard (#4894): see primary apply above.
+			// The alias child uses its own ifindex, but the queue-id comes
+			// from the parent's binding, so bound it here too.
+			if binding.QueueID >= bindingQueuesPerIface {
+				return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
+					"update aliased userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (child=%d parent=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/lib.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
+					binding.QueueID, uint32(bindingQueuesPerIface), childIfindex, parentIfindex,
+				))
 			}
 			idx := childIfindex*bindingQueuesPerIface + binding.QueueID
 			// Call-site cap guard (#814): see primary apply above.
@@ -1265,6 +1289,16 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 		if !bindingForwardingLive(binding, deadWorkers) {
 			continue
 		}
+		// Queue-dimension bound guard (#4894): repair-only, log-and-skip
+		// (never unwind). A queue-id at/above the stride would alias the
+		// adjacent ifindex queue-0 slot; the dense-cap guard below cannot
+		// catch that, so skip the binding instead of repairing a wrong slot.
+		if binding.QueueID >= bindingQueuesPerIface {
+			slog.Warn("userspace: bindings watchdog: queue-id at/above stride would alias adjacent ifindex queue-0 slot, skipping (#4894)",
+				"ifindex", binding.Ifindex, "queue", binding.QueueID,
+				"stride", uint32(bindingQueuesPerIface))
+			continue
+		}
 		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
 		// Call-site cap guard (#814): the watchdog is repair-only and
 		// must not unwind. Log and skip if the ifindex would overflow
@@ -1311,6 +1345,15 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 				}
 				// #1666: same forwarding-live gate as the primary repair.
 				if !bindingForwardingLive(binding, deadWorkers) {
+					continue
+				}
+				// Queue-dimension bound guard (#4894): repair-only,
+				// log-and-skip. Same aliasing risk as the primary watchdog
+				// path; the queue-id comes from the parent binding.
+				if binding.QueueID >= bindingQueuesPerIface {
+					slog.Warn("userspace: bindings watchdog alias: queue-id at/above stride would alias adjacent ifindex queue-0 slot, skipping (#4894)",
+						"child", childIfindex, "parent", parentIfindex,
+						"queue", binding.QueueID, "stride", uint32(bindingQueuesPerIface))
 					continue
 				}
 				idx := childIfindex*bindingQueuesPerIface + binding.QueueID

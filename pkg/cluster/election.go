@@ -342,6 +342,33 @@ func (m *Manager) runElection() {
 					DualActiveWin: true,
 				}:
 				default:
+					// Full channel. The dual-active reaffirm is the ONLY
+					// signal that drives the daemon's post-split-brain
+					// GARP/NA refresh (daemon_ha.go: DualActiveWin ->
+					// scheduleDirectAnnounce). A silent drop here blackholes
+					// that refresh — peers keep the losing node's MAC in their
+					// ARP/NDP caches after the winner is elected (#4867).
+					//
+					// Match sendEvent's reliable drop handling: log and fire
+					// the generic reconcile fallback (onEventDrop ->
+					// triggerReconcile). But the reconcile alone does NOT
+					// cover this event — the direct-VIP ownership reconcile
+					// only re-announces on an ownership CHANGE
+					// (announce = !prev || added>0), and a dual-active winner
+					// is already the steady owner, so triggerReconcile would
+					// not re-drive the announce. Also invoke the dedicated
+					// reaffirm-drop callback (onDualActiveWinDrop ->
+					// scheduleDirectAnnounce) so the GARP/NA refresh genuinely
+					// survives the drop. Both callbacks run with m.mu held and
+					// must not re-enter the manager lock or block inline.
+					slog.Warn("cluster: event channel full, dropping dual-active reaffirm event; invoking reconcile + re-announce fallback",
+						"rg", rg.GroupID)
+					if m.onEventDrop != nil {
+						m.onEventDrop()
+					}
+					if m.onDualActiveWinDrop != nil {
+						m.onDualActiveWinDrop(rg.GroupID)
+					}
 				}
 				m.history.Record(EventRG, rg.GroupID, "dual-active resolved: winner reaffirm")
 			}
