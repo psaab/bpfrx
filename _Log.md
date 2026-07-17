@@ -1,3 +1,43 @@
+## 2026-07-16 — #5364: stop verify-dataplane false-rejecting rolling deploys on the CPU-sized userspace_cpumap live pin
+
+- **Timestamp**: 2026-07-16 (fix/5364-cpumap-verify-possiblecpu)
+- **Action**: `make cluster-deploy`'s verify-dataplane pre-flight rejected EVERY
+  rolling deploy with `userspace shim map userspace_cpumap is ABI-incompatible
+  with the live pinned map ... MaxEntries embedded=256 pinned=16`. Root cause
+  (corrected from the #5363 "stale 16→256 ABI bump" framing): `userspace_cpumap`
+  is a `BPF_MAP_TYPE_CPUMAP`; the shim declares it `CpuMap::with_max_entries(256,
+  0)` as a TEMPLATE MAX, but cilium/ebpf's `MapSpec.fixupMagicFields` clamps a
+  CPUMAP's `MaxEntries` to `nr_possible_cpus` before it creates OR ABI-compares
+  the map, so a fresh daemon ALWAYS pins it at `nr_possible_cpus` (16 on the loss
+  VMs), never 256. `MapSpec.Compatible` (the exact `ErrMapIncompatible` check the
+  pre-flight predicts) runs the identical clamp, so the real PinByName load
+  compares 16==16 and succeeds — the pre-flight's manual `userspaceMapABIDiff`
+  replicated `Compatible()` but OMITTED the clamp, producing a phantom MaxEntries
+  diff on every deploy. Fix (option a): `validateUserspaceShimLivePins` now
+  resolves the reference `MaxEntries` through `livePinRefABI` +
+  `cpuMapFixupMaxEntries`, which applies cilium/ebpf's CPUMAP clamp
+  (`MustPossibleCPU()`) so the reference matches the shape the loader actually
+  pins. Scoped to the CPUMAP `MaxEntries` axis only — confirmed `userspace_cpumap`
+  is the ONLY CPU-count-sized ABI-checked map (no PerfEventArray/map-of-maps in
+  the shim-declared set or `userspaceShimSharedMapSpecs`; XskMap keeps 4096;
+  per-CPU ARRAY/HASH maps keep declared MaxEntries and replicate the VALUE
+  per-CPU) — so Type/KeySize/ValueSize/Flags and every other map's MaxEntries
+  stay strict. Corrected the `userspaceShimStalePinRemediation` const doc and the
+  #5363 test's cpumap cases (which encoded the false premise) so the full-reload
+  remediation now fires only for a GENUINE cross-version break of a non-cpumap
+  map or a real cpumap Type/KeySize/ValueSize/Flags change. See #5363.
+- **File(s)**: pkg/dataplane/loader_userspace_shim.go,
+  pkg/dataplane/verify_cpumap_possiblecpu_5364_test.go,
+  pkg/dataplane/stalepin_remediation_5363_test.go,
+  pkg/dataplane/README.md, _Log.md
+- **Validation**: `go build ./...` clean, `go vet ./pkg/dataplane` clean,
+  `go test ./pkg/dataplane` green (2.1s). Fail-on-revert proven firsthand:
+  reverting `livePinRefABI(ref)` → `mapABIFromSpec(ref)` makes
+  `TestCPUMapLivePinPossibleCPUAccepted` fail with the exact production symptom
+  (`MaxEntries embedded=256 pinned=16`); restore → green. New guards
+  `TestCPUMapLivePinGenuineBreakStillRejected` and
+  `TestNonCPUMapMaxEntriesStillStrict` keep the relaxation scoped.
+
 ## 2026-07-16 — #5837 rev6052 fold: exclude interface-mode-SNAT-routed addrs from the NAT-interface-address advisory
 
 - **Timestamp**: 2026-07-16 (fix/5837-track1-interface-addr-nat-warning)

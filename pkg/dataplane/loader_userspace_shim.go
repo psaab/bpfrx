@@ -28,15 +28,24 @@ import (
 const (
 	bpfPinPath                       = "/sys/fs/bpf/xpf"
 	userspaceShimGenerateRemediation = "Re-run `make generate-userspace-xdp`."
-	// userspaceShimStalePinRemediation is the remediation for a LIVE-PIN ABI
-	// mismatch (validateUserspaceShimLivePins): the running daemon's pinned map
-	// predates this build's shim-map ABI. That is NOT an embedded-vs-Go SSOT
+	// userspaceShimStalePinRemediation is the remediation for a GENUINE LIVE-PIN
+	// ABI mismatch (validateUserspaceShimLivePins): the running daemon's pinned
+	// map predates this build's shim-map ABI. That is NOT an embedded-vs-Go SSOT
 	// drift — the embedded shim is the intended deploy target and is not broken
 	// — so `make generate` is the WRONG action. A rolling deploy cannot cross a
 	// shim-map ABI change because the new map can only be pinned after the stale
-	// pin is released; the fix is a full dataplane reload. This is the exact
-	// scenario that blocks a cluster stuck on an old cpumap=16 pin vs an
-	// embedded cpumap=256 shim (#5363).
+	// pin is released; the fix is a full dataplane reload.
+	//
+	// #5364: this message is NOT reachable for a userspace_cpumap MaxEntries
+	// gap. That map is a BPF_MAP_TYPE_CPUMAP whose MaxEntries the kernel/loader
+	// clamps to nr_possible_cpus (the shim's `CpuMap::with_max_entries(256, 0)`
+	// is only a template max), so a fresh daemon ALWAYS pins it at
+	// nr_possible_cpus, never 256. livePinRefABI applies the identical clamp to
+	// the reference shape, so the old "cpumap=16 pin vs embedded cpumap=256
+	// shim" diff that #5363 mischaracterized as a stale pin (and that blocked
+	// EVERY rolling cluster-deploy) is no longer produced. This remediation now
+	// fires only for a real cross-version ABI break of a NON-cpumap map, or a
+	// genuine cpumap Type/KeySize/ValueSize/Flags change.
 	userspaceShimStalePinRemediation = "The RUNNING daemon's pinned map predates " +
 		"this build's shim-map ABI. A rolling deploy CANNOT cross a shim-map ABI " +
 		"change: the new map can only be pinned after the stale pin is released. " +
@@ -278,6 +287,45 @@ func mapABIFromSpec(ms *ebpf.MapSpec) userspaceMapABI {
 	}
 }
 
+// livePinRefABI is the reference ABI shape the live-pin comparison diffs against
+// the RUNNING daemon's pinned map. For every map except a BPF_MAP_TYPE_CPUMAP it
+// is the reference spec's shape verbatim (mapABIFromSpec). For a CPUMAP it
+// applies the SAME nr_possible_cpus MaxEntries clamp cilium/ebpf's
+// MapSpec.fixupMagicFields runs before it creates OR ABI-compares the map: a
+// CPUMAP's MaxEntries is clamped to PossibleCPU() (the shim's
+// `CpuMap::with_max_entries(256, 0)` is only a template max cap), so the map is
+// created — and pinned — at nr_possible_cpus, never the .o's 256. MapSpec.Compatible
+// (the exact ErrMapIncompatible check this pre-flight predicts) runs the identical
+// fixup, so without this clamp the pre-flight rejects EVERY rolling deploy on a
+// phantom "MaxEntries embedded=256 pinned=<nr_possible_cpus>" diff even though the
+// real PinByName load compares <nr_possible_cpus>==<nr_possible_cpus> and succeeds
+// (#5364). The relaxation is scoped to CPUMAP: no other ABI-checked shim map is
+// CPU-count-sized — per-CPU ARRAY/HASH maps keep their declared MaxEntries and
+// replicate the VALUE per-CPU, and XskMap keeps its declared size — so every other
+// map keeps a strict MaxEntries check. A genuine cpumap ABI change still diffs on
+// Type/KeySize/ValueSize/Flags (and on MaxEntries when the pin drops below
+// nr_possible_cpus).
+func livePinRefABI(ref *ebpf.MapSpec) userspaceMapABI {
+	abi := mapABIFromSpec(ref)
+	if ref.Type == ebpf.CPUMap {
+		abi.MaxEntries = cpuMapFixupMaxEntries(abi.MaxEntries)
+	}
+	return abi
+}
+
+// cpuMapFixupMaxEntries mirrors the CPUMap arm of cilium/ebpf
+// MapSpec.fixupMagicFields: clamp MaxEntries to nr_possible_cpus when the
+// declared value is 0 or exceeds the CPU count. This is the shape the loader
+// actually creates+pins and the shape MapSpec.Compatible compares against, so
+// the live-pin pre-flight must use it to avoid a false MaxEntries rejection.
+func cpuMapFixupMaxEntries(declared uint32) uint32 {
+	n := uint32(ebpf.MustPossibleCPU())
+	if declared == 0 || declared > n {
+		return n
+	}
+	return declared
+}
+
 // userspaceMapABIDiff reports the first ABI field in which the embedded shim map
 // spec differs from a reference shape (the Go expected shape or the live pinned
 // map), or "" when compatible. It mirrors cilium/ebpf MapSpec.Compatible: Type,
@@ -403,10 +451,13 @@ func userspaceABICheckedPinnedMaps() []string {
 // The reference shape is resolved per map by abiCheckedRefSpec: the embedded
 // shim's own MapSpec for a shim-declared map (dnat_table, dnat_table_v6, the
 // userspace_* maps), else the Go-side SSOT spec for a shared map the loader
-// creates itself (sessions_v6, the HA/counter family). Both are spec-derived
-// (userspaceMapABIDiff(mapABIFromSpec(ref), live)) — never a hardcoded live
-// shape — so a healthy deploy where live pin == the shape that created it
-// yields no diff and only a real cross-version ABI break is caught (#5484).
+// creates itself (sessions_v6, the HA/counter family). The reference ABI is
+// spec-derived via livePinRefABI — never a hardcoded live shape — so a healthy
+// deploy where live pin == the shape that created it yields no diff and only a
+// real cross-version ABI break is caught (#5484). livePinRefABI applies the
+// nr_possible_cpus MaxEntries clamp cilium/ebpf uses for a CPUMAP
+// (userspace_cpumap), so the CPU-count-sized live pin is not mistaken for an
+// ABI break on a rolling deploy (#5364).
 func validateUserspaceShimLivePins(userspaceSpec *ebpf.CollectionSpec, readPin userspacePinnedMapABIReader) error {
 	if readPin == nil {
 		return nil
@@ -424,7 +475,7 @@ func validateUserspaceShimLivePins(userspaceSpec *ebpf.CollectionSpec, readPin u
 		if !exists {
 			continue // fresh node / first load: nothing pinned yet
 		}
-		if diff := userspaceMapABIDiff(mapABIFromSpec(ref), live); diff != "" {
+		if diff := userspaceMapABIDiff(livePinRefABI(ref), live); diff != "" {
 			return fmt.Errorf(
 				"userspace shim map %s is ABI-incompatible with the live pinned map at %s: %s. "+
 					"Loading the new dataplane would fail with ErrMapIncompatible AFTER the running "+

@@ -15,11 +15,19 @@ import (
 // remediation must be the full-dataplane-reload guidance, NEVER `make generate`
 // (which would tell the operator to rebuild a shim that is not broken).
 //
-// This is direction-INDEPENDENT: it holds both in the upgrade direction
-// (embedded MaxEntries > pinned — the userspace_cpumap 16→256 bump that blocked
-// a real cluster) AND in a downgrade (embedded < pinned). Both cases exercise
-// the SAME live-pin mismatch branch, so a single stale-pin remediation is
-// correct for the whole branch — no MaxEntries >-vs-< heuristic.
+// This is direction-INDEPENDENT: it holds both when the embedded shape is the
+// larger side AND when it is the smaller side. Both cases exercise the SAME
+// live-pin mismatch branch, so a single stale-pin remediation is correct for
+// the whole branch — no MaxEntries >-vs-< heuristic.
+//
+// #5364 CORRECTION: the userspace_cpumap "16 vs 256 MaxEntries" gap that #5363
+// originally used as its example is NOT a genuine ABI break — a CPUMAP's
+// MaxEntries is clamped to nr_possible_cpus at load, so the map is pinned at
+// nr_possible_cpus and MapSpec.Compatible accepts it. That case is now handled
+// by livePinRefABI and is no longer rejected (see TestCPUMapLivePinPossibleCPU*).
+// The cases below therefore use a genuine cpumap ABI break (a ValueSize change)
+// and a genuine non-cpumap MaxEntries drift, both of which are still stale-pin
+// mismatches that must carry the full-reload remediation.
 //
 // RED-on-revert: with the pre-#5363 code the live-pin error appended
 // userspaceShimGenerateRemediation ("Re-run `make generate-userspace-xdp`."),
@@ -36,24 +44,17 @@ func TestLivePinABIMismatchUsesStalePinRemediation(t *testing.T) {
 		wantDiffFrag string          // substring naming the offending field
 	}{
 		{
-			// The exact #5363 scenario: an old daemon pinned userspace_cpumap
-			// with 16 entries; this build's shim embeds 256. Upgrade direction
-			// (embedded > pinned).
-			name:         "cpumap-upgrade-embedded-gt-pinned",
+			// #5364: a GENUINE cpumap ABI break. The MaxEntries axis is
+			// CPU-count-clamped and no longer diffs (the map is pinned at
+			// nr_possible_cpus), so this uses a ValueSize change — a real
+			// cross-version ABI break that is still a stale-pin mismatch.
+			// The live pin's MaxEntries is nr_possible_cpus (what a fresh
+			// daemon actually pins) so only ValueSize drives the diff.
+			name:         "cpumap-genuine-valuesize-break",
 			mapName:      "userspace_cpumap",
-			embedded:     &ebpf.MapSpec{Type: ebpf.CPUMap, KeySize: 4, ValueSize: 4, MaxEntries: 256},
-			pinnedShape:  userspaceMapABI{Type: ebpf.CPUMap, KeySize: 4, ValueSize: 4, MaxEntries: 16},
-			wantDiffFrag: "MaxEntries embedded=256 pinned=16",
-		},
-		{
-			// Downgrade direction (embedded < pinned): the pin is STILL the
-			// stale side, so the remediation is STILL a full reload — proving
-			// the fix is direction-independent (no >-vs-< heuristic).
-			name:         "cpumap-downgrade-embedded-lt-pinned",
-			mapName:      "userspace_cpumap",
-			embedded:     &ebpf.MapSpec{Type: ebpf.CPUMap, KeySize: 4, ValueSize: 4, MaxEntries: 16},
-			pinnedShape:  userspaceMapABI{Type: ebpf.CPUMap, KeySize: 4, ValueSize: 4, MaxEntries: 256},
-			wantDiffFrag: "MaxEntries embedded=16 pinned=256",
+			embedded:     &ebpf.MapSpec{Type: ebpf.CPUMap, KeySize: 4, ValueSize: 8, MaxEntries: 256},
+			pinnedShape:  userspaceMapABI{Type: ebpf.CPUMap, KeySize: 4, ValueSize: 4, MaxEntries: uint32(ebpf.MustPossibleCPU())},
+			wantDiffFrag: "ValueSize embedded=8 pinned=4",
 		},
 		{
 			// A shim-declared shared map (dnat_table): embedded shape is the
