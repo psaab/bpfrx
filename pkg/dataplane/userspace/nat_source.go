@@ -90,6 +90,25 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 						poolUnusable = true
 						poolUnusableReason = "empty_pool"
 					}
+					// #5875: an IPv6 pool address carrying a `%<zone>` scope
+					// qualifier (`fe80::1%eth0`) is not dataplane-representable —
+					// the Rust allocator parses each member as std::net::IpAddr,
+					// which has no zone model, so expand_pool_address returns false
+					// and the whole pool is marked InvalidPool and dropped. The
+					// strict commit gate (validateSourceNATPoolAddressScopeStrict)
+					// hard-rejects this; on the tolerant load / peer-sync path that
+					// gate only warns, so fail CLOSED here — mark the pool unusable
+					// rather than ship the unparseable string to Rust. A global SNAT
+					// pool address never needs an interface scope.
+					for _, a := range poolAddresses {
+						if config.PoolAddressHasZoneScope(a) {
+							slog.Warn("userspace snapshot: marking source NAT rule with zone-scoped pool address unusable",
+								"rule", rule.Name, "pool", rule.Then.PoolName, "address", a)
+							poolUnusable = true
+							poolUnusableReason = "zone_scoped_pool_address"
+							break
+						}
+					}
 					// #3906: `port no-translation` preserves the source port.
 					// The dataplane takes the address-only path and ignores the
 					// port range in this mode, so a defaulted/valid range is

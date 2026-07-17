@@ -8,7 +8,7 @@ import "fmt"
 // installable before promotion (#5876).
 //
 // The strict SNAT gates (validateSourceNATPoolStrict,
-// validateSourceNATPoolAddressGrammarStrict,
+// validateSourceNATPoolAddressGrammarStrict, validateSourceNATPoolAddressScopeStrict,
 // validateSourceNATPersistentNoTranslationStrict, validateNATPoolReferencesStrict,
 // validateNATSourceAddressNameReferencesStrict) already run inside
 // compileExpanded — but ONLY against the single node the commit compiles for.
@@ -107,6 +107,9 @@ func validateSourceNATStrictView(cfg *Config) error {
 		return err
 	}
 	if err := validateNATPoolReferencesStrict(cfg); err != nil {
+		return err
+	}
+	if err := validateSourceNATPoolAddressScopeStrict(cfg); err != nil {
 		return err
 	}
 	if err := validateSourceNATPoolAddressGrammarStrict(cfg); err != nil {

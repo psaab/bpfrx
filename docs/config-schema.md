@@ -3405,6 +3405,40 @@ reserved for whole-dataplane selection where a rewrite shim
     Fail-on-revert: `TestSourceNATPoolBadGrammarRejected` /
     `TestSourceNATPoolBadGrammarLenientWarns`
     (`pkg/config/strict_nat_pool_grammar_5627_test.go`).
+  - `security nat source pool <name> address <member>` zone/scope qualifier
+    (#5875) — a NEW representability constraint alongside #5627. A source-NAT
+    pool address may carry an IPv6 **zone/scope qualifier** (`fe80::1%eth0`):
+    the Junos lexer admits `%` (`lexer.go` `isIdentChar`) and Go's
+    `netip.ParseAddr` honors a zone, so the scoped literal passed the #5627
+    grammar gate (a bare IP with a zone parses fine) and the snapshot builder
+    copied the raw string onto the wire. But the Rust allocator parses each pool
+    member as `std::net::IpAddr` (`expand_pool_address`,
+    `userspace-dp/src/nat/source.rs`), which has **no scope model**, so the
+    scoped form fails to parse, the whole pool is marked `InvalidPool`, and the
+    rule silently stops translating after apply — the same commit-vs-apply
+    outage as #5627 but from a different cause. `validateSourceNATPoolAddressScopeStrict`
+    (`compiler_validate_strict_nat.go`) **rejects a `%zone`-scoped pool address
+    at strict commit**, naming the pool and the offending address, and telling
+    the operator to remove the `%zone` suffix. The reject is safe: a global SNAT
+    pool address never needs an interface scope, and the issue forbids silently
+    stripping `%zone` (it would change the modeled address). The gate iterates
+    ONLY referenced pools (same scoping as #5627) and runs BEFORE the #5627
+    grammar gate so a `%zone`-scoped member — including a scoped-CIDR the grammar
+    gate would otherwise reject with a generic invalid-CIDR message — gets the
+    precise scope diagnostic. It reuses the `lenientDestNATAddresses` downgrade
+    (warn on load / peer-sync, #1960 no-brick); the snapshot builder
+    independently marks such a pool unusable
+    (reason `zone_scoped_pool_address`), installing nothing rather than shipping
+    the unparseable string. Registered in the SNAT strict set, so the #5876
+    peer-effective SNAT gate rejects a peer-`${node}`-only scoped address too.
+    The shared detector is `config.PoolAddressHasZoneScope` (a `%` substring
+    test), used by both the Go validator and the snapshot builder. Fail-on-revert:
+    `TestSourceNATPoolZoneScopedAddressRejected` /
+    `TestSourceNATPoolZoneScopedAddressLenientWarns` /
+    `TestPeerOnlyZoneScopedSNATPoolRejected_5875`
+    (`pkg/config/compiler_zone_scoped_snat_pool_5875_test.go`) and
+    `TestSourceNATSnapshotZoneScopedPoolUnusable_5875`
+    (`pkg/dataplane/userspace/nat_source_zone_scope_5875_test.go`).
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix
