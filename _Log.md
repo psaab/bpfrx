@@ -50856,3 +50856,30 @@ top.
   **File(s)**: pkg/dataplane/userspace/manager_overlay.go,
   pkg/dataplane/userspace/route_overlay_test.go (new test),
   docs/rib-group-route-leaking.md
+
+- **Timestamp**: 2026-07-16
+  **Action**: #5876 — strict SOURCE-NAT validation now covers the PEER node's
+  effective compiled view before promotion. The strict commit gate compiled
+  `s.nodeID` alone (`compileTreeStrict` → `CompileConfigForNode`), so a `${node}`
+  apply-group / per-node rewrite selecting a source-NAT pool or reference valid
+  on the origin but invalid on the peer (per-node pool `address` / `port range`,
+  or a shared top-level rule referencing a pool only a peer `groups nodeN` block
+  defines) passed green — then the standby lenient-loaded the synced snapshot
+  (`SyncApply` → `CompileConfigForNodeLenient`) and failed SNAT closed. Added
+  `ValidatePeerEffectiveSourceNATStrict(tree, localNodeID)` (new
+  `pkg/config/compiler_peer_effective_snat.go`): compiles the peer via
+  `CompileConfigForNodeLenient(peerID)` — the exact standby transform — and
+  re-runs the existing strict SOURCE-NAT validators
+  (`validateSourceNATPoolStrict`, `validateSourceNATPoolAddressGrammarStrict`,
+  `validateSourceNATPersistentNoTranslationStrict`,
+  `validateNATPoolReferencesStrict`,
+  `validateNATSourceAddressNameReferencesStrict`) against it, rejecting at the
+  origin commit naming the peer node + offending pool. Wired into
+  `configstore.compileTreeStrict` after the local compile + cross-checks.
+  Standalone (`nodeID < 0`) is a no-op. Fail-on-revert proven firsthand (RED in
+  both packages when the gate is neutralized).
+  **File(s)**: pkg/config/compiler_peer_effective_snat.go (new),
+  pkg/config/compiler_peer_effective_snat_5876_test.go (new),
+  pkg/configstore/store.go,
+  pkg/configstore/peer_effective_snat_5876_test.go (new),
+  docs/config-schema.md

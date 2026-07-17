@@ -353,6 +353,20 @@ func compileTreeStrict(tree *config.ConfigTree, nodeID int) (*config.Config, err
 	if err := crossCheckRAIntervals(compiled); err != nil {
 		return nil, err
 	}
+	// #5876: a chassis-cluster commit must prove BOTH node-effective source-NAT
+	// views are representable before promotion, not only the submitting node's.
+	// This gate compiles for the local node alone (CompileConfigForNode above),
+	// so a ${node} apply-group substitution / per-node rewrite that selects a
+	// source-NAT pool or reference valid on the origin but invalid on the peer
+	// passes green — then the standby lenient-loads the synced snapshot and
+	// silently fails its SNAT closed. Re-run the strict SOURCE-NAT validators
+	// against the peer's effective compile (the same CompileConfigForNodeLenient
+	// transform the standby applies) so a peer-only pool/reference error is
+	// rejected here, at the one strict gate that ever sees this config.
+	// Standalone (nodeID < 0) has no peer and is a no-op.
+	if err := config.ValidatePeerEffectiveSourceNATStrict(tree, nodeID); err != nil {
+		return nil, err
+	}
 	return compiled, nil
 }
 
