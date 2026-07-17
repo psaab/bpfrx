@@ -112,6 +112,30 @@ func (m *Manager) clearHelperHAStateWithDebtLocked() error {
 	return nil
 }
 
+// clearHelperHAStateWithDebtEnsureRetryLocked runs the standalone clear via
+// clearHelperHAStateWithDebtLocked and, when it fails, guarantees the periodic
+// status loop is running before the error propagates (#5873). The recorded
+// pendingHAStateClear debt has exactly one retry consumer — the status-loop
+// tick (retryPendingHAStateClearLocked). Both apply-path clear sites can return
+// the failure BEFORE reaching the normal ensureStatusLoopLocked() call: the
+// first-startup full-publish path (returns from the failed-clear branch just
+// above ensureStatusLoopLocked) and the deferred-XSK resume path (returns
+// without ever calling it). Either way, without a running loop the debt is
+// orphaned — nothing ever retries the idempotent clear, so stale helper HA
+// groups keep the owner-RG-0 transit ForwardCandidates HAInactive (drop)
+// indefinitely, contradicting the debt's eventual-cleanup contract. Ensuring
+// the loop here (idempotent — guarded on m.syncCancel) gives the just-recorded
+// debt a worker on its very first tick. The clear still fails closed: the raw
+// error is returned so the caller surfaces the apply failure. Ordering: record
+// debt (inside WithDebt) -> ensure loop -> return err.
+func (m *Manager) clearHelperHAStateWithDebtEnsureRetryLocked() error {
+	if err := m.clearHelperHAStateWithDebtLocked(); err != nil {
+		m.ensureStatusLoopLocked()
+		return err
+	}
+	return nil
+}
+
 // retryPendingHAStateClearLocked settles a stranded standalone HA-state clear
 // debt from the status poll tick. It runs OUTSIDE the m.clusterHA HA-sync guard
 // (that guard is exactly why a standalone clear is never retried), but only
