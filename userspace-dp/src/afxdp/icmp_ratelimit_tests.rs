@@ -219,6 +219,264 @@ fn forwarding_with_reject_zones(zone_ids: &[u16]) -> ForwardingState {
     }
 }
 
+/// #5856 test helper: build a `ForwardingState` carrying a fresh per-zone
+/// bucket for EVERY reason (Reject, Time-Exceeded, Packet-Too-Big) for each
+/// given zone id — the shape `populate_zones` produces for a configured zone.
+fn forwarding_with_all_zone_buckets(zone_ids: &[u16]) -> ForwardingState {
+    let mut reject_buckets: FastMap<u16, Arc<TokenBucket>> = FastMap::default();
+    let mut time_exceeded_buckets: FastMap<u16, Arc<TokenBucket>> = FastMap::default();
+    let mut packet_too_big_buckets: FastMap<u16, Arc<TokenBucket>> = FastMap::default();
+    for &id in zone_ids {
+        reject_buckets.insert(id, Arc::new(TokenBucket::new()));
+        time_exceeded_buckets.insert(id, Arc::new(TokenBucket::new()));
+        packet_too_big_buckets.insert(id, Arc::new(TokenBucket::new()));
+    }
+    ForwardingState {
+        reject_buckets,
+        time_exceeded_buckets,
+        packet_too_big_buckets,
+        ..ForwardingState::default()
+    }
+}
+
+/// #5856 HEADLINE fail-on-revert: a TTL=1/hop-limit=1 flood that drains ZONE
+/// A's per-zone Time-Exceeded bucket must NOT prevent ZONE B from generating
+/// its Time-Exceeded reply. Before #5856 TE used a SINGLE process-global
+/// bucket, so draining A emptied the one shared bucket and B was then denied —
+/// a cross-zone denial of the generated-error service. Reverting the per-zone
+/// split (collapsing TE back to one global bucket, e.g. by making
+/// `generated_error_bucket(TimeExceeded, _)` return `None`) makes this
+/// assertion go RED. Direct proof of the #5856 per-zone isolation fix.
+#[test]
+fn time_exceeded_per_zone_flood_does_not_starve_other_zone_5856() {
+    let _g = global_bucket_test_lock();
+    let reason = GeneratedErrorReason::TimeExceeded;
+    // Sparse, realistic stable-name-hash zone ids (NOT dense 1,2).
+    let zone_a = 41_337u16;
+    let zone_b = 9_002u16;
+    let t0 = 3_100_000_000u64;
+    let forwarding = forwarding_with_all_zone_buckets(&[zone_a, zone_b]);
+    // Drain zone A at a frozen instant (burst = 4).
+    for i in 0..4 {
+        assert!(
+            allow_generated_error_zoned_at(&forwarding, reason, zone_a, t0, 1000, 4),
+            "zone A Time-Exceeded token {i} within burst must pass"
+        );
+    }
+    assert!(
+        !allow_generated_error_zoned_at(&forwarding, reason, zone_a, t0, 1000, 4),
+        "zone A Time-Exceeded bucket must be drained after its burst"
+    );
+    // Zone B, under no load, still generates its Time-Exceeded at the SAME
+    // instant — per-zone isolation.
+    assert!(
+        allow_generated_error_zoned_at(&forwarding, reason, zone_b, t0, 1000, 4),
+        "zone B must NOT be starved by zone A's Time-Exceeded flood (per-zone isolation)"
+    );
+}
+
+/// #5856 HEADLINE fail-on-revert (Packet-Too-Big sibling): an oversized-DF
+/// flood that drains ZONE A's per-zone PTB bucket must NOT prevent ZONE B from
+/// generating its PMTUD reply. Reverting to a single global PTB bucket makes
+/// draining A suppress B → RED.
+#[test]
+fn packet_too_big_per_zone_flood_does_not_starve_other_zone_5856() {
+    let _g = global_bucket_test_lock();
+    let reason = GeneratedErrorReason::PacketTooBig;
+    let zone_a = 41_337u16;
+    let zone_b = 9_002u16;
+    let t0 = 3_200_000_000u64;
+    let forwarding = forwarding_with_all_zone_buckets(&[zone_a, zone_b]);
+    for i in 0..4 {
+        assert!(
+            allow_generated_error_zoned_at(&forwarding, reason, zone_a, t0, 1000, 4),
+            "zone A Packet-Too-Big token {i} within burst must pass"
+        );
+    }
+    assert!(
+        !allow_generated_error_zoned_at(&forwarding, reason, zone_a, t0, 1000, 4),
+        "zone A Packet-Too-Big bucket must be drained after its burst"
+    );
+    assert!(
+        allow_generated_error_zoned_at(&forwarding, reason, zone_b, t0, 1000, 4),
+        "zone B must NOT be starved by zone A's oversized-DF flood (per-zone isolation)"
+    );
+}
+
+/// #5856: an unzoned (id 0) or otherwise-unknown from-zone id has no per-zone
+/// TE/PTB bucket, so the gate falls back to the reason's shared process-global
+/// `*_FALLBACK_BUCKET` — a real bucket (never fail-open) that still rate-limits
+/// and never panics on the absent key. Both an unknown id and id 0 SHARE the
+/// one fallback budget.
+#[test]
+fn generated_error_unknown_and_unzoned_share_fallback_bucket_5856() {
+    let _g = global_bucket_test_lock();
+    for reason in [
+        GeneratedErrorReason::TimeExceeded,
+        GeneratedErrorReason::PacketTooBig,
+    ] {
+        let t0 = 6_100_000_000u64;
+        // Reset the reason's fallback bucket (+ aggregate) to full at epoch t0.
+        reset_bucket_for_test(reason, t0);
+        // Empty map: every zone id resolves to the fallback.
+        let forwarding = ForwardingState::default();
+        let unknown = 55_555u16;
+        // burst = 2 on the shared fallback: an unknown-id and an unzoned (id 0)
+        // error each take one token; the third is denied.
+        assert!(allow_generated_error_zoned_at(
+            &forwarding,
+            reason,
+            unknown,
+            t0,
+            1000,
+            2
+        ));
+        assert!(allow_generated_error_zoned_at(
+            &forwarding,
+            reason,
+            0,
+            t0,
+            1000,
+            2
+        ));
+        assert!(
+            !allow_generated_error_zoned_at(&forwarding, reason, unknown, t0, 1000, 2),
+            "unknown / unzoned {reason:?} errors share and are bounded by the fallback bucket"
+        );
+    }
+}
+
+/// #5856 metric-preservation fail-on-revert: the aggregate
+/// `{time_exceeded,packet_too_big}_rate_limited_total` (a SINGLE global atomic
+/// per reason, NOT a per-zone sum) is bumped on EVERY per-zone deny, so the
+/// coordinator status / Prometheus contract is unchanged by the per-zone split.
+/// Drain two zones by K1 and K2 and assert the aggregate advanced by exactly
+/// K1 + K2.
+#[test]
+fn generated_error_aggregate_counter_sums_across_zones_5856() {
+    let _g = global_bucket_test_lock();
+    for reason in [
+        GeneratedErrorReason::TimeExceeded,
+        GeneratedErrorReason::PacketTooBig,
+    ] {
+        let t0 = 8_100_000_000u64;
+        reset_bucket_for_test(reason, t0); // aggregate -> 0
+        let zone_a = 111u16;
+        let zone_b = 222u16;
+        let forwarding = forwarding_with_all_zone_buckets(&[zone_a, zone_b]);
+        let before = rate_limited_count(reason);
+        let k1 = 3u64;
+        let k2 = 5u64;
+        // burst = 1 per zone: one pass, then K denies each.
+        assert!(allow_generated_error_zoned_at(
+            &forwarding,
+            reason,
+            zone_a,
+            t0,
+            1000,
+            1
+        ));
+        for _ in 0..k1 {
+            assert!(!allow_generated_error_zoned_at(
+                &forwarding,
+                reason,
+                zone_a,
+                t0,
+                1000,
+                1
+            ));
+        }
+        assert!(allow_generated_error_zoned_at(
+            &forwarding,
+            reason,
+            zone_b,
+            t0,
+            1000,
+            1
+        ));
+        for _ in 0..k2 {
+            assert!(!allow_generated_error_zoned_at(
+                &forwarding,
+                reason,
+                zone_b,
+                t0,
+                1000,
+                1
+            ));
+        }
+        assert_eq!(
+            rate_limited_count(reason),
+            before + k1 + k2,
+            "aggregate {reason:?} rate_limited_total must sum every per-zone deny (metric unchanged)"
+        );
+    }
+}
+
+/// #5856: the three reasons stay isolated from each other AND per-zone within a
+/// reason. Draining zone A's Time-Exceeded bucket must not affect zone A's
+/// Packet-Too-Big or Reject bucket (reason isolation), nor zone B's
+/// Time-Exceeded (per-zone isolation).
+#[test]
+fn generated_error_reason_and_zone_isolation_5856() {
+    let _g = global_bucket_test_lock();
+    let zone_a = 700u16;
+    let zone_b = 701u16;
+    let t0 = 10_100_000_000u64;
+    let forwarding = forwarding_with_all_zone_buckets(&[zone_a, zone_b]);
+    // Drain zone A's Time-Exceeded bucket (burst = 1).
+    assert!(allow_generated_error_zoned_at(
+        &forwarding,
+        GeneratedErrorReason::TimeExceeded,
+        zone_a,
+        t0,
+        1000,
+        1
+    ));
+    assert!(!allow_generated_error_zoned_at(
+        &forwarding,
+        GeneratedErrorReason::TimeExceeded,
+        zone_a,
+        t0,
+        1000,
+        1
+    ));
+    // Same zone, DIFFERENT reasons — untouched.
+    assert!(
+        allow_generated_error_zoned_at(
+            &forwarding,
+            GeneratedErrorReason::PacketTooBig,
+            zone_a,
+            t0,
+            1000,
+            1
+        ),
+        "zone A Packet-Too-Big must be independent of its Time-Exceeded exhaustion"
+    );
+    assert!(
+        allow_generated_error_zoned_at(
+            &forwarding,
+            GeneratedErrorReason::Reject,
+            zone_a,
+            t0,
+            1000,
+            1
+        ),
+        "zone A Reject must be independent of its Time-Exceeded exhaustion"
+    );
+    // Different zone, SAME reason — untouched.
+    assert!(
+        allow_generated_error_zoned_at(
+            &forwarding,
+            GeneratedErrorReason::TimeExceeded,
+            zone_b,
+            t0,
+            1000,
+            1
+        ),
+        "zone B Time-Exceeded must be independent of zone A's exhaustion"
+    );
+}
+
 /// #3618 HEADLINE fail-on-revert: a rejected-flow flood that drains ZONE A's
 /// per-zone Reject bucket must NOT prevent ZONE B from generating its
 /// reject. Reverting to a SINGLE global Reject bucket makes draining A empty

@@ -15,8 +15,8 @@ gates:
 
 | Reason | Generator | Rate-limit scope |
 |--------|-----------|------------------|
-| `TimeExceeded` | ICMPv4 Time Exceeded / ICMPv6 Hop-Limit Exceeded (`icmp::build_local_time_exceeded_request`) | Single global bucket |
-| `PacketTooBig` | ICMPv4 Frag-Needed / ICMPv6 Packet Too Big (PMTUD, #2301/#2330) | Single global bucket |
+| `TimeExceeded` | ICMPv4 Time Exceeded / ICMPv6 Hop-Limit Exceeded (`icmp::build_local_time_exceeded_request`) | **Per ingress (from) zone (#5856)** |
+| `PacketTooBig` | ICMPv4 Frag-Needed / ICMPv6 Packet Too Big (PMTUD, #2301/#2330) | **Per ingress (from) zone (#5856)** |
 | `Reject` | Policy `then reject`, firewall-filter / lo0 `then reject`, and a zone `tcp-rst` deny → TCP RST or ICMP/ICMPv6 admin-prohibited unreachable (`poll_descriptor::reject_reply`) | **Per ingress (from) zone (#3618)** |
 
 Without a limiter, an attacker driving a flood of TTL-1 packets, oversized DF=1
@@ -32,62 +32,79 @@ double-credit or over-admit (#2955). Default rate/burst are compile-time
 constants `DEFAULT_RATE_PER_SEC = DEFAULT_BURST = 1000`; a zero rate disables the
 limiter.
 
-## #2472 → #3618: why the Reject reason is per-zone
+## #2472 → #3618 → #5856: why every reason is per-zone
 
-`#2472` introduced a **single global** bucket per reason. For the Reject reason
-that global bucket coupled all zones: a rejected-flow flood ingressing **one**
-(e.g. untrusted WAN) zone drained the shared bucket, so a legitimate policy /
-filter reject in a **different** (e.g. trusted/internal) zone fail-closed to a
-silent drop even though that zone was not under attack. The aggregate cap was
-being asked to also deliver per-zone fairness, and it could not — an operator
-troubleshooting a policy misconfiguration in the quiet zone never saw that zone's
-reject diagnostic while the busy zone stayed flooded.
+`#2472` introduced a **single global** bucket per reason. That global bucket
+coupled all zones: a flood ingressing **one** (e.g. untrusted WAN) zone drained
+the shared bucket, so a legitimate generated error in a **different** (e.g.
+trusted/internal) zone fail-closed to a silent drop even though that zone was not
+under attack. The aggregate cap was being asked to also deliver per-zone
+fairness, and it could not — an operator troubleshooting in the quiet zone never
+saw that zone's diagnostic while the busy zone stayed flooded.
 
-`#3618` splits the Reject reason into **one bucket per configured zone**:
+`#3618` split the **Reject** reason into one bucket per configured zone.
+`#5856` extended the IDENTICAL mechanism to **TimeExceeded** and **PacketTooBig**
+(their generator call sites always carried ingress identity — the missing zone
+key was an API omission, not absence of attribution). All three reasons now use
+**one bucket per configured zone**:
 
-- `ForwardingState::reject_buckets: FastMap<u16, Arc<TokenBucket>>` — one GCRA
-  bucket per configured zone id, built in `forwarding_build::zones::populate_zones`
-  from the SAME validated zone set as `zone_id_to_name`. Cardinality = configured
-  zones (the Go control plane caps distinct zones at `MaxUsableZoneID = 65533`),
-  so it is config-bounded, never attacker-growable.
-- At the reject call site (`poll_descriptor::reject_reply::enqueue_reject_reply`)
-  the ingress **from-zone** is resolved from the LOGICAL ingress unit ifindex via
-  `ifindex_to_zone_id` (the same SSOT the #3976 reply build and #3035 output
-  classify key off, so a VLAN sub-interface keys its own zone's bucket, and a
-  non-VLAN port resolves identically through the parent mapping).
-- An unzoned (id 0) or otherwise-unknown from-zone falls back to the
-  process-global `REJECT_FALLBACK_BUCKET` — a real bucket, so the gate is **never
-  fail-open** and never panics on a missing key. Unzoned/unknown rejects share
-  that one budget (the rare/degenerate case).
+- `ForwardingState::{reject_buckets, time_exceeded_buckets, packet_too_big_buckets}:
+  FastMap<u16, Arc<TokenBucket>>` — one GCRA bucket per configured zone id per
+  reason, built in `forwarding_build::zones::populate_zones` from the SAME
+  validated zone set as `zone_id_to_name`. Cardinality = configured zones (the Go
+  control plane caps distinct zones at `MaxUsableZoneID = 65533`), so it is
+  config-bounded, never attacker-growable.
+- At each generator call site the ingress **from-zone** is resolved from the
+  LOGICAL ingress unit ifindex via `ifindex_to_zone_id` (the same SSOT the reply
+  build and output classify key off, so a VLAN sub-interface keys its own zone's
+  bucket, and a non-VLAN port resolves identically through the parent mapping):
+  - Reject — `poll_descriptor::reject_reply::enqueue_reject_reply` (`logical_ingress_ifindex`).
+  - TimeExceeded — `icmp::build_local_time_exceeded_request` (`ingress_ident.ifindex`).
+  - PacketTooBig — the TX dispatch PTB path (`ingress_ident.ifindex`).
+- An unzoned (id 0) or otherwise-unknown from-zone falls back to the reason's
+  process-global `{REJECT,TIME_EXCEEDED,PACKET_TOO_BIG}_FALLBACK_BUCKET` — a real
+  bucket, so the gate is **never fail-open** and never panics on a missing key.
+  Unzoned/unknown errors share that one budget (the rare/degenerate case).
+
+The zone-keyed lookup is the single accessor
+`ForwardingState::generated_error_bucket(reason, from_zone_id)`, and the single
+gate is `icmp_ratelimit::allow_generated_error_zoned[_at]` (the `Reject`-specific
+`allow_generated_reject[_at]` wrappers delegate to it).
 
 Zone ids are sparse `u16` stable name-hashes over `[0, 65533]` (NOT dense
-`[0, 64)`), so the map is keyed by zone id, not a dense array.
+`[0, 64)`), so the maps are keyed by zone id, not a dense array.
 
 ### Why this does not weaken the anti-amplification cap
 
 The realistic reflection attacker floods ONE ingress path (the WAN zone); each
-zone's bucket still caps that path at 1000/s — **identical** to the pre-#3618
-global cap for the single-ingress case. Per-zone buckets remove the cross-zone
-starvation while preserving the per-ingress-zone cap. Reaching the `N × 1000/s`
-aggregate requires an attacker already inside the trust boundary driving rejects
-across many zones at once (a multi-VLAN trunk / compromised internal host), who
-can emit far more damaging traffic than reflected RST/ICMP backscatter; each zone
-is still individually capped. A global second-level ceiling for that east-west
-amplifier is a filed optional follow-up, not built here.
+zone's bucket still caps that path at 1000/s per reason — **identical** to the
+pre-split global cap for the single-ingress case. Per-zone buckets remove the
+cross-zone starvation while preserving the per-ingress-zone cap. Reaching the
+`N × 1000/s` aggregate requires an attacker already inside the trust boundary
+driving errors across many zones at once (a multi-VLAN trunk / compromised
+internal host), who can emit far more damaging traffic than reflected
+RST/ICMP/PTB backscatter; each zone is still individually capped. A global
+second-level ceiling for that east-west amplifier is a filed optional follow-up,
+not built here.
 
-### TimeExceeded / PacketTooBig stay global
+### #5856: TimeExceeded / PacketTooBig are now per-zone too
 
-TE/PTB keep their single global-per-reason bucket. Their generator sites
-(`icmp.rs`, `tx/dispatch/mod.rs`) do not cleanly carry an ingress zone id (TE is
-built deep in the ICMP builder, PTB in the TX dispatch path); scoping them
-per-zone is a separate change with its own zone plumbing. Out of scope for #3618.
+Before #5856, TE and PTB kept their single global-per-reason bucket, so an
+attacker flooding TTL=1/hop-limit=1 (→ Time-Exceeded) or oversized-DF (→
+Packet-Too-Big) traffic through ONE untrusted zone drained the shared bucket and
+**suppressed legitimate traceroute / PMTUD replies for every OTHER zone** — a
+cross-zone denial of the generated-error service (suppressing PTB can turn
+unrelated large flows into persistent PMTUD blackholes). The generator sites DID
+carry ingress identity (`ingress_ident.ifindex`); the missing zone key was an
+API/design omission. #5856 resolves the from-zone at each site and keys a
+per-zone bucket exactly as #3618 did for Reject, closing the cross-zone denial.
 
 ## Lifetime / sharing model (why `Arc<TokenBucket>`)
 
-All workers gate against the SAME per-zone bucket: each worker holds an
-`Arc<ForwardingState>` loaded from the shared `ArcSwap` (`load_full()`), so within
-one forwarding generation they share the one `ForwardingState` instance and its
-atomics — the cap is per-zone, not per-worker.
+All workers gate against the SAME per-zone bucket (for every reason): each worker
+holds an `Arc<ForwardingState>` loaded from the shared `ArcSwap` (`load_full()`),
+so within one forwarding generation they share the one `ForwardingState` instance
+and its atomics — the cap is per-zone, not per-worker.
 
 The buckets are held behind `Arc` (not plain values) because the coordinator
 re-stores a CLONE of the forwarding state at runtime cadence (fabric refresh,
@@ -101,13 +118,16 @@ operator-initiated, and a fresh burst allowance right after a commit is benign).
 
 ## Observability (metric unchanged)
 
-The aggregate `reject_rate_limited_total` is a SINGLE process-global atomic
-(`REJECT_RATE_LIMITED_TOTAL`) bumped on ANY per-zone (or fallback) deny — NOT a
-sum over the per-zone buckets' fields — so `rate_limited_count(Reject)` stays an
-O(1) atomic load and the coordinator status / Prometheus
-`xpf_userspace_reject_rate_limited_total` wire contract is UNCHANGED by the
-per-zone split. Each per-zone `TokenBucket` keeps its own `rate_limited` field
-for OPTIONAL future per-zone attribution; the aggregate metric never reads it.
+Each reason's aggregate `*_rate_limited_total` is a SINGLE process-global atomic
+(`{REJECT,TIME_EXCEEDED,PACKET_TOO_BIG}_RATE_LIMITED_TOTAL`) bumped on ANY
+per-zone (or fallback) deny — NOT a sum over the per-zone buckets' fields — so
+`rate_limited_count(reason)` stays an O(1) atomic load and the coordinator status
+/ Prometheus `xpf_userspace_{reject,time_exceeded,packet_too_big}_rate_limited_total`
+wire contract is UNCHANGED by the per-zone split. Each per-zone `TokenBucket`
+keeps its own `rate_limited` field for OPTIONAL future per-zone attribution; the
+aggregate metric never reads it. (Before #5856, TE/PTB read their single global
+bucket's field directly; now they read the dedicated aggregate atomic, which the
+per-zone and fallback gates both bump — the surfaced value is unchanged.)
 
 The per-source split (#3661) — `policy_reject_rate_limit_drops` /
 `filter_reject_rate_limit_drops` — is orthogonal and still sums to the
@@ -131,10 +151,13 @@ source-neutral aggregate.
   ingress ifindex, no primary address of the inbound family, or an unparseable
   trigger). Previously the token was consumed BEFORE the build, so a flood of
   reply-eligible-but-UNBUILDABLE triggers on ONE interface (e.g. a wrong-family or
-  no-egress ingress) drained the shared global TE/PTB bucket and starved buildable
-  PMTUD / traceroute diagnostics on ANOTHER interface — a cross-interface
-  false-deny DoS. The gate order is: RFC/suppression gate → build (feasibility
-  proof) → token. A buildable reply that the token denies is still dropped
+  no-egress ingress) drained the TE/PTB bucket (then a single global one;
+  per-zone since #5856) and starved buildable PMTUD / traceroute diagnostics on
+  ANOTHER interface — a cross-interface false-deny DoS. The build-before-consume
+  ordering still matters per-zone: it stops an unbuildable flood from draining
+  even the ingress zone's own bucket. The gate order is: RFC/suppression gate →
+  build (feasibility proof) → token. A buildable reply that the token denies is
+  still dropped
   (rate-limited, counter bumped); an unbuildable reply never touches the token.
   The trigger-packet disposition is unchanged in every case: TE returns `None`
   (drop) exactly as before, and the oversized-original PTB drop stays gated on

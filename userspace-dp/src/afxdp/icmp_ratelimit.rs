@@ -25,20 +25,31 @@
 // a TTL-exceeded flood cannot starve the PTB or reject reasons (and vice-versa)
 // — per-reason isolation.
 //
-// #3618: the Reject reason is further split PER INGRESS (from) ZONE — one
-// bucket per configured zone, held in `ForwardingState::reject_buckets` and
-// resolved at the reject call site (`poll_descriptor::reject_reply`), with a
-// process-global `REJECT_FALLBACK_BUCKET` for an unzoned/unknown zone. This
-// removes the cross-zone starvation the single global Reject bucket had: a
-// rejected-flow flood ingressing one zone can no longer drain the bucket and
-// suppress a legitimate reject in another zone. TimeExceeded / PacketTooBig
-// keep their single global-per-reason bucket (their generator sites lack a
-// clean ingress zone id — see `docs/generated-reply-rate-limit.md`). The
-// observable aggregate `reject_rate_limited_total` stays a SINGLE atomic
-// (`REJECT_RATE_LIMITED_TOTAL`) bumped on any per-zone deny, so the coordinator
-// status / Prometheus metric format is unchanged. Cardinality is
-// config-bounded (configured zones, Go-capped ≤ 65533), so there is still no
-// attacker-driven map growth.
+// #3618 / #5856: ALL THREE reasons are split PER INGRESS (from) ZONE — one
+// bucket per configured zone, held in `ForwardingState::{reject_buckets,
+// time_exceeded_buckets, packet_too_big_buckets}` and resolved at each
+// generator call site from the ingress ifindex, with a process-global
+// per-reason fallback bucket (`{REJECT,TIME_EXCEEDED,PACKET_TOO_BIG}_
+// FALLBACK_BUCKET`) for an unzoned/unknown zone. This removes the cross-zone
+// starvation the single global buckets had: a flood ingressing one zone can
+// no longer drain the bucket and suppress a legitimate generated error in
+// another zone.
+//
+// #3618 split ONLY Reject (the reject call site carried `from_zone_id`);
+// #5856 extends the IDENTICAL per-zone mechanism to TimeExceeded (resolved
+// from `ingress_ident.ifindex` in `icmp::build_local_time_exceeded_request`)
+// and PacketTooBig (resolved from `ingress_ident.ifindex` in the TX dispatch
+// PTB path) — closing the cross-zone denial that let one zone flood
+// TTL=1/hop-limit=1 or oversized-DF traffic and suppress legitimate
+// traceroute / PMTUD replies for every OTHER zone. The generator sites always
+// carried ingress identity; the missing zone key was an API omission, not
+// absence of attribution (see `docs/generated-reply-rate-limit.md`).
+//
+// The observable aggregate `*_rate_limited_total` stays a SINGLE atomic per
+// reason (`{REJECT,TIME_EXCEEDED,PACKET_TOO_BIG}_RATE_LIMITED_TOTAL`) bumped on
+// any per-zone deny, so the coordinator status / Prometheus metric format is
+// unchanged. Cardinality is config-bounded for every reason (configured zones,
+// Go-capped ≤ 65533), so there is still no attacker-driven map growth.
 //
 // Hot-path: the check is a single CAS loop over ONE atomic word (a GCRA
 // theoretical-arrival-time; #2955 collapsed the prior split token-count +
@@ -106,14 +117,15 @@ const NANOS_PER_SEC: u64 = 1_000_000_000;
 /// tear against — the single CAS atomically refills AND consumes. This is the
 /// same single-TAT pattern used by `event_stream/producer.rs`.
 ///
-/// #3618: exposed as `pub(in crate::afxdp)` so `ForwardingState` can hold a
-/// per-zone map of these for the Reject reason (`reject_buckets`). The fields
-/// stay private to this module; the only cross-module entry points are
-/// `TokenBucket::new()` (to build a fresh per-zone bucket at config apply) and
-/// the `allow_generated_reject*` gates below (which do the `try_take` +
-/// counter bump). Held behind an `Arc` in `ForwardingState` so the shared
-/// atomics survive `ForwardingState::clone()` (fabric refresh re-stores a
-/// clone at runtime cadence — see `forwarding.rs`).
+/// #3618/#5856: exposed as `pub(in crate::afxdp)` so `ForwardingState` can hold
+/// per-zone maps of these for EVERY reason (`reject_buckets`,
+/// `time_exceeded_buckets`, `packet_too_big_buckets`). The fields stay private
+/// to this module; the only cross-module entry points are `TokenBucket::new()`
+/// (to build a fresh per-zone bucket at config apply) and the
+/// `allow_generated_*` gates below (which do the `try_take` + counter bump).
+/// Held behind an `Arc` in `ForwardingState` so the shared atomics survive
+/// `ForwardingState::clone()` (fabric refresh re-stores a clone at runtime
+/// cadence — see `forwarding.rs`).
 #[derive(Debug)]
 pub(in crate::afxdp) struct TokenBucket {
     /// Theoretical arrival time (monotonic nanos). The whole limiter state.
@@ -185,101 +197,126 @@ impl TokenBucket {
     }
 }
 
-static TIME_EXCEEDED_BUCKET: TokenBucket = TokenBucket::new();
-static PACKET_TOO_BIG_BUCKET: TokenBucket = TokenBucket::new();
-
-/// #3618: shared fallback Reject bucket used when a reject's ingress (from)
-/// zone has NO per-zone bucket — an unzoned (id 0) or otherwise-unknown zone
-/// id. It is a REAL bucket (never a fail-open skip), so an unzoned/unknown
-/// reject is still rate-limited; such rejects all share this one budget (the
-/// rare/degenerate case, not a per-zone diagnostic). This replaces the former
-/// single global `REJECT_BUCKET`: the per-zone buckets now live in
-/// `ForwardingState::reject_buckets` (built from the configured zone set), so a
-/// rejected-flow flood on one zone can no longer drain a single global bucket
-/// and starve reject-generation in another zone.
+/// #3618/#5856: shared per-reason fallback bucket used when a generated error's
+/// ingress (from) zone has NO per-zone bucket — an unzoned (id 0) or
+/// otherwise-unknown zone id. Each is a REAL bucket (never a fail-open skip),
+/// so an unzoned/unknown error is still rate-limited; such errors all share the
+/// reason's one fallback budget (the rare/degenerate case, not a per-zone
+/// diagnostic). The per-zone buckets now live in `ForwardingState`
+/// (`reject_buckets` #3618; `time_exceeded_buckets` / `packet_too_big_buckets`
+/// #5856), built from the configured zone set, so a flood on one zone can no
+/// longer drain a single global bucket and starve error-generation in another
+/// zone.
 static REJECT_FALLBACK_BUCKET: TokenBucket = TokenBucket::new();
+static TIME_EXCEEDED_FALLBACK_BUCKET: TokenBucket = TokenBucket::new();
+static PACKET_TOO_BIG_FALLBACK_BUCKET: TokenBucket = TokenBucket::new();
 
-/// #3618: process-global aggregate count of Reject replies dropped because the
-/// (per-zone OR fallback) bucket was empty. A SINGLE atomic bumped on ANY
-/// per-zone deny — NOT a sum over the per-zone buckets' `rate_limited` fields —
-/// so `rate_limited_count(Reject)` stays an O(1) atomic load and the
-/// coordinator status / Prometheus `reject_rate_limited_total` wire contract is
-/// UNCHANGED by the per-zone split. Each per-zone `TokenBucket` keeps its own
-/// `rate_limited` field for OPTIONAL future per-zone attribution; the aggregate
-/// metric never reads those fields.
+/// #3618/#5856: process-global aggregate count, PER reason, of generated error
+/// replies dropped because the (per-zone OR fallback) bucket was empty. A
+/// SINGLE atomic per reason bumped on ANY per-zone deny — NOT a sum over the
+/// per-zone buckets' `rate_limited` fields — so `rate_limited_count(reason)`
+/// stays an O(1) atomic load and the coordinator status / Prometheus
+/// `*_rate_limited_total` wire contract is UNCHANGED by the per-zone split.
+/// Each per-zone `TokenBucket` keeps its own `rate_limited` field for OPTIONAL
+/// future per-zone attribution; the aggregate metric never reads those fields.
 static REJECT_RATE_LIMITED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TIME_EXCEEDED_RATE_LIMITED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PACKET_TOO_BIG_RATE_LIMITED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// TE / PTB keep their single global-per-reason bucket. For the Reject reason
-/// this returns the shared `REJECT_FALLBACK_BUCKET`: it is the bucket the
-/// non-zone-keyed `allow_generated_error(Reject)` back-compat entry point and
-/// the test reset/drain helpers operate on. The zone-keyed reject path
-/// (`allow_generated_reject*`) resolves a per-zone bucket first and falls back
-/// to this same static, so both stay consistent.
+/// The reason's shared fallback bucket: the bucket the non-zone-keyed
+/// `allow_generated_error_at` back-compat/test entry point and the test
+/// reset/drain helpers operate on. The zone-keyed gates
+/// (`allow_generated_error_zoned*`) resolve a per-zone bucket first and fall
+/// back to this same static, so both stay consistent.
 fn bucket_for(reason: GeneratedErrorReason) -> &'static TokenBucket {
     match reason {
-        GeneratedErrorReason::TimeExceeded => &TIME_EXCEEDED_BUCKET,
-        GeneratedErrorReason::PacketTooBig => &PACKET_TOO_BIG_BUCKET,
+        GeneratedErrorReason::TimeExceeded => &TIME_EXCEEDED_FALLBACK_BUCKET,
+        GeneratedErrorReason::PacketTooBig => &PACKET_TOO_BIG_FALLBACK_BUCKET,
         GeneratedErrorReason::Reject => &REJECT_FALLBACK_BUCKET,
     }
 }
 
-/// Returns true when a locally-generated error reply for `reason` MAY be sent
-/// (a token was available), false when it MUST be dropped because the
-/// per-reason bucket is empty. On a deny the per-reason `rate_limited` counter
-/// is bumped so the suppression is observable via the coordinator status.
-///
-/// Uses the compile-time `DEFAULT_RATE_PER_SEC` / `DEFAULT_BURST`. The bucket
-/// is global-per-reason (no per-source state), matching Linux's
-/// `icmp_msgs_per_sec` model.
-pub(in crate::afxdp) fn allow_generated_error(reason: GeneratedErrorReason) -> bool {
-    allow_generated_error_at(
-        reason,
-        monotonic_nanos(),
-        DEFAULT_RATE_PER_SEC,
-        DEFAULT_BURST,
-    )
+/// The reason's process-global aggregate rate-limited counter. A SINGLE atomic
+/// per reason, bumped on every per-zone (and fallback) deny, read O(1) by
+/// `rate_limited_count`. This is what keeps the observable `*_rate_limited_total`
+/// wire contract unchanged across the per-zone split (#3618/#5856).
+fn rate_limited_total(reason: GeneratedErrorReason) -> &'static AtomicU64 {
+    match reason {
+        GeneratedErrorReason::TimeExceeded => &TIME_EXCEEDED_RATE_LIMITED_TOTAL,
+        GeneratedErrorReason::PacketTooBig => &PACKET_TOO_BIG_RATE_LIMITED_TOTAL,
+        GeneratedErrorReason::Reject => &REJECT_RATE_LIMITED_TOTAL,
+    }
 }
 
-/// Testable core of [`allow_generated_error`] with an injected clock + rate /
-/// burst, so the unit tests can drive a deterministic burst-then-refill
-/// sequence without sleeping.
+/// Non-zone-keyed testable core: try one token against `reason`'s FALLBACK
+/// bucket with an injected clock + rate / burst, so the unit tests can drive a
+/// deterministic burst-then-refill sequence without sleeping. On a deny it
+/// bumps BOTH the fallback bucket's own `rate_limited` field and the reason's
+/// aggregate `*_RATE_LIMITED_TOTAL`, so `rate_limited_count(reason)` (which
+/// reads the aggregate) stays authoritative regardless of entry point.
+///
+/// Test-only: production TE/PTB/Reject gates all go through the zone-keyed
+/// [`allow_generated_error_zoned_at`] (which itself falls back to this reason's
+/// FALLBACK bucket for an unzoned/unknown zone), so the pure-fallback path is
+/// exercised directly only by the unit tests.
+#[cfg(test)]
 pub(in crate::afxdp) fn allow_generated_error_at(
     reason: GeneratedErrorReason,
     now_ns: u64,
     rate_per_sec: u64,
     burst: u64,
 ) -> bool {
-    let bucket = bucket_for(reason);
-    let allowed = bucket.try_take(now_ns, rate_per_sec, burst);
-    if !allowed {
-        bucket.rate_limited.fetch_add(1, Ordering::Relaxed);
-        // #3618: keep the aggregate Reject counter authoritative regardless of
-        // which entry point denied. `rate_limited_count(Reject)` now reads the
-        // dedicated `REJECT_RATE_LIMITED_TOTAL`, so this back-compat entry point
-        // (still reachable via `allow_generated_error(Reject)` + the test
-        // drain/reset helpers, which operate on `REJECT_FALLBACK_BUCKET`) must
-        // bump it too. TE/PTB keep their per-bucket field as the aggregate.
-        if reason == GeneratedErrorReason::Reject {
-            REJECT_RATE_LIMITED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    allowed
+    take_and_account(bucket_for(reason), reason, now_ns, rate_per_sec, burst)
 }
 
-/// #3618: zone-scoped variant of the Reject gate. Returns true when a
-/// locally-generated reject reply whose ingress (from) zone is `from_zone_id`
-/// MAY be sent (its per-zone bucket had a token), false when it MUST be dropped
-/// because that zone's bucket is empty. The per-zone bucket comes from
-/// `forwarding.reject_buckets` (built from the configured zone set at config
+/// #3618/#5856: zone-scoped generated-error gate. Returns true when a
+/// locally-generated error reply for `reason` whose ingress (from) zone is
+/// `from_zone_id` MAY be sent (its per-zone bucket had a token), false when it
+/// MUST be dropped because that zone's bucket is empty. The per-zone bucket
+/// comes from `ForwardingState` (`reject_buckets` / `time_exceeded_buckets` /
+/// `packet_too_big_buckets`, built from the configured zone set at config
 /// apply); an unzoned (id 0) or otherwise-unknown zone id falls back to the
-/// shared process-global `REJECT_FALLBACK_BUCKET` — a real bucket, so the gate
-/// is NEVER fail-open and never panics on a missing key. On a deny the single
-/// aggregate `REJECT_RATE_LIMITED_TOTAL` is bumped (metric unchanged) alongside
-/// the bucket's own `rate_limited` field (optional per-zone attribution).
-///
-/// TimeExceeded / PacketTooBig stay on the global-per-reason
-/// `allow_generated_error` — they lack a clean ingress zone at their generator
-/// sites (see `docs/generated-reply-rate-limit.md`).
+/// reason's shared process-global `*_FALLBACK_BUCKET` — a real bucket, so the
+/// gate is NEVER fail-open and never panics on a missing key. On a deny the
+/// reason's single aggregate `*_RATE_LIMITED_TOTAL` is bumped (metric
+/// unchanged) alongside the bucket's own `rate_limited` field (optional
+/// per-zone attribution).
+pub(in crate::afxdp) fn allow_generated_error_zoned(
+    forwarding: &ForwardingState,
+    reason: GeneratedErrorReason,
+    from_zone_id: u16,
+) -> bool {
+    allow_generated_error_zoned_at(
+        forwarding,
+        reason,
+        from_zone_id,
+        monotonic_nanos(),
+        DEFAULT_RATE_PER_SEC,
+        DEFAULT_BURST,
+    )
+}
+
+/// Testable core of [`allow_generated_error_zoned`] with an injected clock +
+/// rate / burst, so the unit tests can drive a deterministic per-zone
+/// burst-then-drain sequence without sleeping.
+pub(in crate::afxdp) fn allow_generated_error_zoned_at(
+    forwarding: &ForwardingState,
+    reason: GeneratedErrorReason,
+    from_zone_id: u16,
+    now_ns: u64,
+    rate_per_sec: u64,
+    burst: u64,
+) -> bool {
+    let bucket = forwarding
+        .generated_error_bucket(reason, from_zone_id)
+        .unwrap_or_else(|| bucket_for(reason));
+    take_and_account(bucket, reason, now_ns, rate_per_sec, burst)
+}
+
+/// #3618: reject-reason convenience wrapper over the generic zone-keyed gate.
+/// Kept as a named entry point for `poll_descriptor::reject_reply` and the
+/// existing reject unit tests; behaviour is identical to
+/// `allow_generated_error_zoned(_, Reject, _)`.
 pub(in crate::afxdp) fn allow_generated_reject(
     forwarding: &ForwardingState,
     from_zone_id: u16,
@@ -293,9 +330,8 @@ pub(in crate::afxdp) fn allow_generated_reject(
     )
 }
 
-/// Testable core of [`allow_generated_reject`] with an injected clock + rate /
-/// burst, so the unit tests can drive a deterministic per-zone burst-then-drain
-/// sequence without sleeping.
+/// Testable core of [`allow_generated_reject`] — delegates to the generic
+/// zone-keyed gate with the Reject reason.
 pub(in crate::afxdp) fn allow_generated_reject_at(
     forwarding: &ForwardingState,
     from_zone_id: u16,
@@ -303,31 +339,45 @@ pub(in crate::afxdp) fn allow_generated_reject_at(
     rate_per_sec: u64,
     burst: u64,
 ) -> bool {
-    let bucket = forwarding
-        .reject_bucket(from_zone_id)
-        .unwrap_or(&REJECT_FALLBACK_BUCKET);
+    allow_generated_error_zoned_at(
+        forwarding,
+        GeneratedErrorReason::Reject,
+        from_zone_id,
+        now_ns,
+        rate_per_sec,
+        burst,
+    )
+}
+
+/// Consume one token from `bucket` and, on a deny, bump BOTH the bucket's own
+/// per-zone/fallback `rate_limited` field (optional attribution) and the
+/// reason's single aggregate `*_RATE_LIMITED_TOTAL` (the observable metric).
+/// This is the ONE accounting site shared by the zone-keyed and fallback gates,
+/// so every deny — per-zone or fallback — advances the aggregate exactly once.
+fn take_and_account(
+    bucket: &TokenBucket,
+    reason: GeneratedErrorReason,
+    now_ns: u64,
+    rate_per_sec: u64,
+    burst: u64,
+) -> bool {
     let allowed = bucket.try_take(now_ns, rate_per_sec, burst);
     if !allowed {
-        // Per-zone attribution (optional future accessor).
         bucket.rate_limited.fetch_add(1, Ordering::Relaxed);
-        // Aggregate metric — a single atomic, bumped on every per-zone deny.
-        REJECT_RATE_LIMITED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        rate_limited_total(reason).fetch_add(1, Ordering::Relaxed);
     }
     allowed
 }
 
 /// Observable per-reason count of generated error replies dropped because the
 /// reason's token bucket was empty. Surfaced via the coordinator status
-/// (`*_rate_limited_total`). #3618: the Reject reason reads the dedicated
-/// process-global aggregate (`REJECT_RATE_LIMITED_TOTAL`), which is bumped on
-/// every per-zone (and fallback) deny — an O(1) atomic load, never a sum over
-/// the per-zone buckets, so the wire/metric format is unchanged. TE/PTB still
-/// read their single bucket's `rate_limited` field.
+/// (`*_rate_limited_total`). #3618/#5856: EVERY reason now reads its dedicated
+/// process-global aggregate (`{REJECT,TIME_EXCEEDED,PACKET_TOO_BIG}_RATE_
+/// LIMITED_TOTAL`), which is bumped on every per-zone (and fallback) deny — an
+/// O(1) atomic load, never a sum over the per-zone buckets, so the wire/metric
+/// format is unchanged by the per-zone split.
 pub(in crate::afxdp) fn rate_limited_count(reason: GeneratedErrorReason) -> u64 {
-    match reason {
-        GeneratedErrorReason::Reject => REJECT_RATE_LIMITED_TOTAL.load(Ordering::Relaxed),
-        _ => bucket_for(reason).rate_limited.load(Ordering::Relaxed),
-    }
+    rate_limited_total(reason).load(Ordering::Relaxed)
 }
 
 /// #2955: serialises every test that drives the GLOBAL per-reason buckets.
@@ -362,12 +412,10 @@ pub(in crate::afxdp) fn reset_bucket_for_test(reason: GeneratedErrorReason, now_
         .theoretical_arrival_ns
         .store(now_ns, Ordering::Relaxed);
     bucket.rate_limited.store(0, Ordering::Relaxed);
-    // #3618: also clear the dedicated aggregate so a test that asserts an exact
-    // `rate_limited_count(Reject)` starts from a clean slate (the Reject
-    // aggregate is a separate atomic from the fallback bucket's field).
-    if reason == GeneratedErrorReason::Reject {
-        REJECT_RATE_LIMITED_TOTAL.store(0, Ordering::Relaxed);
-    }
+    // #3618/#5856: also clear the reason's dedicated aggregate so a test that
+    // asserts an exact `rate_limited_count(reason)` starts from a clean slate
+    // (the aggregate is a separate atomic from the fallback bucket's field).
+    rate_limited_total(reason).store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
