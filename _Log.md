@@ -35,6 +35,38 @@
   exclusion is to-zone scoped (SNAT to a different zone still warns); existing 6
   tests stay green.
 
+## 2026-07-16 — #5293: filter change-detector omits six flex-match fields
+
+- **Timestamp**: 2026-07-16 (fix/5293-filter-flex-semantics-match)
+- **Action**: `filter_term_semantics_match` (`engine/cache_sensitive.rs`) is the
+  per-term change detector behind the forwarding-rotation session purge. It
+  compared every neighboring discriminator (addresses, ports, protocol, ICMP
+  type/code, tcp-flags, dscp, action, modifiers) but went DIRECTLY from the ICMP
+  fields to the action, OMITTING all six flexible-match-range fields
+  (`flex_enabled`, `flex_offset`, `flex_length`, `flex_value`, `flex_mask`,
+  `flex_match_start`; #3077/#3232). A filter/PBR rotation that changed ONLY a
+  flex field therefore compared EQUAL, the worker skipped its per-packet-L4
+  session purge, and an established session kept its stale (pre-rotation)
+  routing-instance / forwarding decision until timeout — a cross-VRF
+  policy-coherency failure (stranded reachability / egress / zone-path / NAT),
+  not merely stale telemetry.
+  Fix: rebuilt the comparator on an EXHAUSTIVE `let FilterTerm { .. } = new;`
+  destructure with NO `..` rest pattern. Every field is bound to a name (and
+  compared) or explicitly to `_` (`id`/`counter`, deliberately not match
+  semantics). A newly-added FilterTerm field now FAILS TO COMPILE here until it
+  is classified — so a 7th match field can never silently regress the change
+  detector the way the flex fields did. The six flex fields are now compared.
+  Validation: added `flex_field_change_is_not_cache_equal` (clones one compiled
+  base term, mutates exactly one of the six flex fields per case, asserts NOT
+  cache-equal; control: identical term → equal). RED-on-revert proven firsthand
+  — dropping the six flex comparisons makes the test panic
+  (`a change to \`flex_enabled\` must NOT be cache-equal`). `cargo test --release
+  filter` all green (265 + 5 in the touched suites); full `cargo test --release`
+  clean. Cluster smoke DEFERRED — shim-wall blocked this window; pure
+  comparator-logic fix gated on the cargo RED-on-revert unit test.
+- **File(s)**: userspace-dp/src/filter/engine/cache_sensitive.rs,
+  userspace-dp/src/filter/README.md, _Log.md
+
 ## 2026-07-16 — #5805: per-destination ICMP/UDP flood sketches → token bucket
 
 - **Timestamp**: 2026-07-16 (fix/5805-per-dest-flood-tokenbucket)
