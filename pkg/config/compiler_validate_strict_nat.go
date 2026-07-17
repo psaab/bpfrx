@@ -1355,6 +1355,31 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// non-host cases (host-vs-block, mismatched length, mixed family,
 			// malformed mask) fall through to the host-route rejection below.
 			blockPair := isStaticBlockPair(rule.Match, rule.Then)
+			// #5658: a valid block pair whose prefix length is ZERO (`/0` on
+			// both sides — isStaticBlockPair already requires equal length) maps
+			// the ENTIRE address family 1:1. The dataplane host mask for a /0 is
+			// all-ones, so every address matches and the equal-length offset
+			// remap preserves all host bits — an identity translation that,
+			// installed in the ordered block scan, SHADOWS every narrower
+			// static/DNAT rule while claiming to translate. Reject it at strict
+			// commit-check with an operator-facing error (downgraded to a warning
+			// on the tolerant load / peer-sync path — the Rust backstop drops the
+			// whole rule and records a bounded NAT parse error). This is a
+			// zero-length reject ONLY, not an arbitrary non-zero floor: a
+			// legitimate large-but-intentional block (`/8`, `/64`, …) still
+			// commits, preserving documented subnet static-NAT parity. Applies to
+			// IPv4 (0.0.0.0/0) and IPv6 (::/0) identically (natStaticPrefixInfo is
+			// family-agnostic on the length). Runs BEFORE the #3202 port check so
+			// the whole-family identity NAT is the primary reported error.
+			if blockPair {
+				if _, bits, _, _ := natStaticPrefixInfo(rule.Match); bits == 0 {
+					if err := emit(fmt.Sprintf(
+						"security nat static rule-set %q rule %q maps a block-to-block subnet with a zero-length (/0) prefix (match destination-address %q <-> then static-nat prefix %q); a /0 mapping remaps the ENTIRE address family 1:1 (an identity translation that shadows every narrower static/DNAT rule) — use a specific subnet prefix",
+						rs.Name, rule.Name, rule.Match, rule.Then)); err != nil {
+						return nil, err
+					}
+				}
+			}
 			// #3202: a block-to-block (subnet) static-NAT rule that ALSO
 			// carries a `match destination-port` or a `then static-nat
 			// mapped-port` is not representable in the dataplane. The Rust

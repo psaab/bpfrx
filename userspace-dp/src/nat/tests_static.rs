@@ -286,6 +286,83 @@ fn static_nat_block_with_match_port_only_is_dropped() {
 }
 
 #[test]
+fn static_nat_block_zero_length_v4_is_rejected() {
+    // #5658: a /0 <-> /0 equal-length block pair remaps the ENTIRE IPv4
+    // internet 1:1 (host_mask_v4(0) == u32::MAX, so contains() matches every
+    // address; the offset remap preserves all host bits → identity NAT). The
+    // backstop drops it fail-closed and records a bounded parse error instead
+    // of installing a whole-family block that shadows every narrower rule.
+    //
+    // Fail-on-revert: removing the `ext_prefix.len == 0 || int_prefix.len == 0`
+    // skip in from_snapshots installs the /0 block → table non-empty and
+    // 8.8.8.8 DNATs → RED.
+    let counters = crate::nat::NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[block_snapshot("0.0.0.0/0", "10.0.0.0/0", "untrust")],
+        &counters,
+    );
+    assert!(
+        table.is_empty(),
+        "a /0 static block must be dropped, not installed as a whole-family identity NAT"
+    );
+    assert_eq!(
+        table.match_dnat("8.8.8.8".parse().expect("arbitrary internet host"), "untrust"),
+        None,
+        "no address may be translated by a rejected /0 block"
+    );
+    assert_eq!(
+        counters.parse_errors(),
+        1,
+        "the rejected /0 block must record exactly one bounded parse error"
+    );
+}
+
+#[test]
+fn static_nat_block_zero_length_v6_is_rejected() {
+    // #5658: the IPv6 equivalent — ::/0 <-> ::/0 remaps the entire v6 family
+    // 1:1 (host_mask_v6(0) == u128::MAX). Same fail-closed drop + parse error.
+    let counters = crate::nat::NatCounterStore::default();
+    let table =
+        StaticNatTable::from_snapshots(&[block_snapshot("::/0", "fd00::/0", "untrust")], &counters);
+    assert!(table.is_empty(), "a ::/0 static block must be dropped");
+    assert_eq!(
+        table.match_dnat("2606:4700:4700::1111".parse().expect("arbitrary v6 host"), "untrust"),
+        None
+    );
+    assert_eq!(counters.parse_errors(), 1);
+}
+
+#[test]
+fn static_nat_block_zero_length_does_not_shadow_narrower_rule() {
+    // #5658 (issue contract): a rejected /0 block MUST NOT shadow a valid
+    // narrower block that follows it. Before the fix the /0 block installed
+    // first and matched every inbound dst, short-circuiting the /24 rule.
+    let counters = crate::nat::NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[
+            block_snapshot("0.0.0.0/0", "10.0.0.0/0", "untrust"),
+            block_snapshot("198.51.100.0/24", "192.168.1.0/24", "untrust"),
+        ],
+        &counters,
+    );
+    // The narrower rule still translates with its offset preserved.
+    assert_eq!(
+        table.match_dnat("198.51.100.7".parse().expect("ext host"), "untrust"),
+        Some(NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some("192.168.1.7".parse().expect("int host")),
+            ..NatDecision::default()
+        }),
+        "a rejected /0 block must not shadow the valid /24 block that follows"
+    );
+    // An address outside the /24 is NOT swept up by a phantom /0 block.
+    assert_eq!(
+        table.match_dnat("8.8.8.8".parse().expect("outside all blocks"), "untrust"),
+        None
+    );
+}
+
+#[test]
 fn static_nat_host_v4_unchanged_with_block_support() {
     // #3031 regression: a /32 host rule still behaves byte-identical to
     // pre-#3031 (exact 1:1, no offset math). Both directions.
