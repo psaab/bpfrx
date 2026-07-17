@@ -450,7 +450,7 @@ exactly one of these two classes:
 | `is_fragment` (#2362) | NO — cache-sensitive | Junos `is-fragment`: matches ANY fragment (IPv4 MF set OR offset != 0; IPv6 fragment header present). Computed by `is_any_fragment` |
 | (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
 | `icmp_type` / `icmp_code` (#2362) | NO — cache-sensitive | exact match on the ICMP/ICMPv6 type/code byte; non-ICMP packets never match. Could later be promoted to cache-key by adding (type, code) to `SessionKey` |
-| `flex_match` (#3077, #3232) | NO — cache-sensitive | Junos `from flexible-match-range`: reads `length` bytes (1..4) at `offset` from the START of the base header selected by `flex_match_start` (#3232) — `Layer3` (match-start layer-3, the default) reads from `TermMatchExtra::flex_l3` (the L3/IP header); `Layer4` (match-start layer-4) reads from `TermMatchExtra::flex_l4` (the transport header at `meta.l4_offset`); `Unsupported` (any other match-start, e.g. `payload`, that the Go commit gate rejects but the tolerant peer-sync path could still deliver) always FAILS CLOSED. The chosen bytes are ANDed with `mask` and required to `== value`. Byte-offset read, fully per-packet. The base slice being `None` (no frame / deferred CoS path; or, for layer-4, a non-first fragment whose post-IP bytes are payload) or a packet too short for the window FAILS CLOSED (no match, no OOB). **#5150: both base slices end at the IP-DECLARED datagram end (`l3_offset + IPv4 total-length`, or `l3_offset + 40 + IPv6 payload-length`), CLAMPED to `frame.len()` — NOT the physical frame end.** So attacker-controlled bytes in Ethernet slack (padding beyond the declared IP length) are excluded (a byte-match can only see the logical IP datagram), and a lying oversized IP length can never over-read past the frame. Before #5150 the slices extended to `frame.len()`, letting a flex term match padding bytes (match-on-padding / filter-evasion). Compiled from `FlexMatchSnapshot`; before #3077 the constraint was parsed but dropped on the wire (matched too broadly, fail-open); before #3232 a layer-4/payload match-start was silently evaluated at the L3 base (wrong-offset match — security evasion) |
+| `flex_match` (#3077, #3232) | NO — cache-sensitive | Junos `from flexible-match-range`: reads `length` bytes (1..4) at `offset` from the START of the base header selected by `flex_match_start` (#3232) — `Layer3` (match-start layer-3, the default) reads from `TermMatchExtra::flex_l3` (the L3/IP header); `Layer4` (match-start layer-4) reads from `TermMatchExtra::flex_l4` (the transport header at `meta.l4_offset`); `Unsupported` (any other match-start, e.g. `payload`, that the Go commit gate rejects but the tolerant peer-sync path could still deliver) always FAILS CLOSED. The chosen bytes are ANDed with `mask` and required to `== value`. Byte-offset read, fully per-packet. The base slice being `None` (no frame / deferred CoS path; or, for layer-4, a non-first fragment whose post-IP bytes are payload) or a packet too short for the window FAILS CLOSED (no match, no OOB). **#5150: both base slices end at the IP-DECLARED datagram end (`l3_offset + IPv4 total-length`, or `l3_offset + 40 + IPv6 payload-length`), CLAMPED to `frame.len()` — NOT the physical frame end.** So attacker-controlled bytes in Ethernet slack (padding beyond the declared IP length) are excluded (a byte-match can only see the logical IP datagram), and a lying oversized IP length can never over-read past the frame. Before #5150 the slices extended to `frame.len()`, letting a flex term match padding bytes (match-on-padding / filter-evasion). Compiled from `FlexMatchSnapshot`; before #3077 the constraint was parsed but dropped on the wire (matched too broadly, fail-open); before #3232 a layer-4/payload match-start was silently evaluated at the L3 base (wrong-offset match — security evasion). **#5293: all six `flex_*` fields (`flex_enabled`, `flex_offset`, `flex_length`, `flex_value`, `flex_mask`, `flex_match_start`) are now compared in `filter_term_semantics_match` (`engine/cache_sensitive.rs`) — before #5293 they were omitted from the forwarding-rotation change detector, so a rotation touching only a flex field skipped the session purge and stranded established sessions on their stale routing-instance / forwarding decision (cross-VRF policy-coherency failure)** |
 
 The `tcp_flags_mask` / `tcp_flags_forbidden` / `is_fragment` / `icmp_type` /
 `icmp_code` inputs (and the #3077 `flex_match` L3 slice, `flex_l3`) are
@@ -793,11 +793,27 @@ implementation (#1430); use it as the template:
    `userspace-dp/src/afxdp/worker/loop_body/mod.rs:295-330`
    uses `input_dscp_filter_families_changed` to decide whether
    to purge sessions. Extend the semantics-match comparison in
-   `userspace-dp/src/filter/engine/cache_sensitive.rs:104-143`
-   to cover the new match field's aggregate flag and per-term
-   content. **Compare by content, never by compiler-positional
-   filter/term IDs** — `Filter.id` and `FilterTerm.id` are
-   stable only within a snapshot.
+   `userspace-dp/src/filter/engine/cache_sensitive.rs`
+   (`filter_term_semantics_match`) to cover the new match
+   field's aggregate flag and per-term content. **Compare by
+   content, never by compiler-positional filter/term IDs** —
+   `Filter.id` and `FilterTerm.id` are stable only within a
+   snapshot. **#5293: `filter_term_semantics_match` now derives
+   its equality from an EXHAUSTIVE `let FilterTerm { .. } = new;`
+   destructure with NO `..` rest pattern** — a newly-added
+   FilterTerm field fails to compile there until it is classified
+   as compared (bound to a name and checked) or intentionally
+   ignored (bound to `_`, e.g. `id`/`counter`). This closes the
+   class of bug where a match field is silently omitted from the
+   change detector: before #5293 the six `flex_*`
+   flexible-match-range fields (#3077/#3232) were absent, so a
+   PBR/filter rotation touching ONLY a flex value/mask/offset/
+   length/enable/match-start compared equal, the worker skipped
+   its per-packet-L4 session purge, and an established session
+   stranded on its stale (pre-rotation) routing-instance /
+   forwarding decision until timeout. Regression test:
+   `filter/engine/cache_sensitive.rs`
+   ::`flex_field_change_is_not_cache_equal`.
 7. **Tests** in `userspace-dp/src/afxdp/flow_cache_tests.rs`
    following the DSCP runbook pattern in
    `from_forward_decision_skips_cache_for_dscp_matched_input_filter`
