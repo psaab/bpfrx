@@ -1748,6 +1748,27 @@ func validateNPTv6ScopeStrict(cfg *Config, lenient bool) ([]string, error) {
 					return nil, err
 				}
 			}
+			// Per-rule `match destination-port` (#5818 review residual): the port
+			// scope is schema-permitted and the compiler records it, but the NPTv6
+			// snapshot carries only from-zone + prefixes, so the port constraint is
+			// dropped and the rewrite applied to EVERY port — the same
+			// security-widening class as the source match. (The ordinary
+			// destination-port strict gate skips NPTv6 rules, so this is the only
+			// place that catches it.) MappedPort can never attach to an
+			// nptv6-prefix then-branch, so destination-port is the sole remaining
+			// reachable narrowing dimension.
+			if rule.MatchDestinationPort != 0 {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q is an NPTv6 (nptv6-prefix) "+
+						"rule carrying `match destination-port %d`, but the NPTv6 dataplane "+
+						"honors only `from zone` and does not evaluate a destination-port "+
+						"constraint; the port match would be dropped and the prefix rewrite "+
+						"applied to every port — remove the destination-port match until "+
+						"scoped NPTv6 support lands (#5818)",
+					rs.Name, rule.Name, rule.MatchDestinationPort)); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 

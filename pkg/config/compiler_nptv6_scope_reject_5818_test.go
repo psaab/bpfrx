@@ -84,6 +84,15 @@ func TestNPTv6ScopeRejectedAtCommit_5818(t *testing.T) {
 				"set security nat static rule-set rs1 rule r1 match source-address [ 2001:db8:100::/64 2001:db8:200::/64 ]"),
 			want: []string{"rs1", "r1", "source-address", "5818"},
 		},
+		{
+			// #5818 review residual: `match destination-port` is schema-permitted
+			// on an NPTv6 rule and recorded by the compiler, but dropped by the
+			// snapshot — the same security-widening class as the source match.
+			name: "match-destination-port",
+			lines: nptv6ScopeRuleSet("from zone trust",
+				"set security nat static rule-set rs1 rule r1 match destination-port 443"),
+			want: []string{"rs1", "r1", "destination-port", "5818"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -29,12 +29,14 @@ func buildNptv6Snapshots(cfg *config.Config) []Nptv6RuleSnapshot {
 			if rule == nil || !rule.IsNPTv6 {
 				continue
 			}
-			// A per-rule `match source-address` is likewise dropped by the wire, so
-			// a source-scoped rule would translate every source — exclude it too.
-			if scopeUnsupported || len(rule.SourceAddresses) > 0 || rule.SourceAddress != "" {
+			// A per-rule `match source-address` OR `match destination-port` is
+			// likewise dropped by the wire, so a source- or port-scoped rule would
+			// translate every source / every port — exclude it too (#5818, incl. the
+			// destination-port review residual).
+			if scopeUnsupported || len(rule.SourceAddresses) > 0 || rule.SourceAddress != "" || rule.MatchDestinationPort != 0 {
 				slog.Warn("userspace snapshot: dropping NPTv6 rule carrying an unsupported match scope "+
-					"(from-interface/from-routing-instance/source-address); the NPTv6 dataplane honors "+
-					"only from-zone, so installing it would widen the rewrite (fail-closed, #5818)",
+					"(from-interface/from-routing-instance/source-address/destination-port); the NPTv6 dataplane "+
+					"honors only from-zone, so installing it would widen the rewrite (fail-closed, #5818)",
 					"rule_set", rs.Name, "rule", rule.Name,
 					"from_interface", rs.FromInterface, "from_routing_instance", rs.FromRoutingInstance)
 				continue
