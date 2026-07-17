@@ -248,7 +248,20 @@ pub(super) fn build_live_forward_request_from_frame(
     } else {
         false
     };
-    if let (Some(filter_log), Some(flow)) = (cos.filter_log, tx_selection_flow) {
+    // #5467: a flowless packet (non-first fragment / non-query ICMP) has NO
+    // `tx_selection_flow`, yet an interface output `then log` term may have
+    // matched its L3 tuple inside `resolve_cos_tx_selection_at` (the flowless
+    // enforcement gate). Rebuild the L3-only flow (ports 0) SOLELY to attribute
+    // that filter-log event so egress logging is not silently bypassed. The
+    // reject reply above stays gated on `tx_selection_flow`, so a flowless deny
+    // remains a silent drop (#3615 — no L4 header to synthesize a reply from).
+    let flowless_log_flow = if tx_selection_flow.is_none() && cos.filter_log.is_some() {
+        crate::afxdp::frame::l3_session_flow_from_meta(meta)
+    } else {
+        None
+    };
+    let log_flow = tx_selection_flow.or(flowless_log_flow.as_ref());
+    if let (Some(filter_log), Some(flow)) = (cos.filter_log, log_flow) {
         let ingress_zone_id = fabric_ingress_zone
             .filter(|id| forwarding.zone_id_to_name.contains_key(id))
             .or_else(|| {

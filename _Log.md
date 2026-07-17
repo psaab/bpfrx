@@ -35,6 +35,51 @@
   exclusion is to-zone scoped (SNAT to a different zone still warns); existing 6
   tests stay green.
 
+## 2026-07-16 — #5467: flowless packets skip the egress output filter (fail-open)
+
+- **Timestamp**: 2026-07-16 (fix/5467-flowless-output-filter)
+- **Action**: `resolve_cos_tx_selection_internal`
+  (`afxdp/tx/cos_classify.rs`) resolves the CoS TX queue AND evaluates the
+  interface `filter output` on the egress path. Its flowless early-return
+  (`let Some(flow_key) = flow_key else { ... }`) resolved the BA/DSCP queue but
+  returned `drop:false, reject:false, filter_log:None` WITHOUT ever evaluating
+  the output filter. So a flowless packet — a non-first IP fragment or a
+  non-query ICMP error/control packet, both with no usable L4 ports (#2344 /
+  #3290) — egressed even when the interface output filter had a matching
+  `then discard`/`reject`/`log` term: egress deny/reject/log was silently
+  bypassed (fail-OPEN). The flow-keyed path below the early-return DID evaluate
+  the output filter; only the flowless arm skipped it.
+  Fix: the flowless arm now reconstructs the packet's own L3 tuple from the
+  shim-stamped meta (new `ForwardPacketMeta::l3_addrs`, mirroring
+  `frame::l3_session_flow_from_meta`; L4 ports forced to 0 since the header is
+  absent) and evaluates the output filter through the SAME entry point the
+  flow-keyed path uses (`interface_output_filter_needs_tx_eval` +
+  `evaluate_filter_ref_tx_selection_{,runtime_}counted`), collapsing
+  `drop`/`reject`/`filter_log` identically. Ports are 0, so a port-BEARING
+  output term never matches a fragment (no spurious drop — the #2357/#3290
+  guarantee holds); only an L3-only term takes effect, and with no matching
+  term the packet still egresses. Queue / DSCP-rewrite selection is preserved —
+  the gate ADDS enforcement only. `ForwardPacketMeta` gained
+  `flow_src_addr`/`flow_dst_addr` (copied through from `UserspaceDpMeta` in the
+  `From` impls); all existing struct literals use `..default()` so the zeroed
+  addrs report as absent. `forward_request` drops the packet on `cos.drop`
+  (existing gate), keeps the reject reply gated on a real L4 flow (a flowless
+  deny stays SILENT, #3615), and now attributes a flowless `then log` event via
+  an L3-only flow (`frame::l3_session_flow_from_meta`).
+- **File(s)**: `userspace-dp/src/afxdp/types/mod.rs`,
+  `userspace-dp/src/afxdp/tx/cos_classify.rs`,
+  `userspace-dp/src/afxdp/tx/cos_classify_tests.rs`,
+  `userspace-dp/src/afxdp/forward_request.rs`,
+  `userspace-dp/src/afxdp/README.md`
+- **Validation**: `cargo build` clean; `cargo test --release` full suite
+  3976 passed / 0 failed. Four new cargo unit tests in `cos_classify_tests.rs`
+  (flowless `then discard` / `reject` / `log` enforcement + a port-term
+  no-spurious-drop control); RED-on-revert proven firsthand — restoring the
+  bare early-return fails the discard/reject/log assertions (drop:false /
+  filter_log:None, fail-open) while the port-term control stays green. Cluster
+  smoke DEFERRED (shim-wall this window); filter-eval logic fix gated on the
+  cargo RED-on-revert unit test.
+
 ## 2026-07-16 — #5293: filter change-detector omits six flex-match fields
 
 - **Timestamp**: 2026-07-16 (fix/5293-filter-flex-semantics-match)

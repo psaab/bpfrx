@@ -1758,6 +1758,236 @@ fn resolve_cos_tx_selection_drops_reject_output_filter_without_log() {
     assert_eq!(selection.filter_log, None);
 }
 
+// #5467: build a UserspaceDpMeta for a FLOWLESS packet (non-first fragment /
+// non-query ICMP) — the shim stamps the L3 addresses but there is NO usable L4
+// header, so it reaches `resolve_cos_tx_selection` with `flow_key = None`. The
+// output-filter enforcement gate must reconstruct the L3 tuple from the meta.
+fn flowless_v4_meta(dst: [u8; 4]) -> UserspaceDpMeta {
+    let mut flow_src_addr = [0u8; 16];
+    let mut flow_dst_addr = [0u8; 16];
+    flow_src_addr[..4].copy_from_slice(&[10, 0, 61, 100]);
+    flow_dst_addr[..4].copy_from_slice(&dst);
+    UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        dscp: 0,
+        pkt_len: 1514,
+        // A non-first fragment carries NO L4 header: ports absent (0) and
+        // `l4_present = false` so port-bearing terms fail closed.
+        flow_src_addr,
+        flow_dst_addr,
+        ..Default::default()
+    }
+}
+
+// #5467: the frame-derived per-packet match inputs for a flowless (non-first
+// fragment) packet — L4 absent, is-fragment set.
+fn flowless_extra() -> TermMatchExtra<'static> {
+    TermMatchExtra {
+        is_fragment: true,
+        l4_present: false,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn resolve_cos_tx_selection_flowless_enforces_output_discard() {
+    // #5467 RED-on-revert: a flowless packet (flow_key = None) whose L3 tuple
+    // matches an interface output `then discard` term MUST fail CLOSED. Before
+    // the fix the flowless early-return skipped output-filter evaluation and
+    // returned drop:false — a silent egress deny bypass (fail-OPEN).
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-drop-l3".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-drop-l3".into(),
+            family: "inet".into(),
+            // L3-only term (address + protocol, NO ports) so it matches a
+            // flowless packet whose L4 ports are absent (0).
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-host".into(),
+                destination_addresses: vec!["172.16.80.200/32".into()],
+                destination_constrained: true,
+                protocols: vec!["tcp".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    // Flowless packet whose L3 dst MATCHES the deny term → fail closed.
+    let matched = resolve_cos_tx_selection(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        None,
+        flowless_extra(),
+    );
+    assert!(
+        matched.drop,
+        "#5467: a flowless packet matching an output `then discard` term must drop"
+    );
+    assert!(!matched.reject, "then discard is a silent drop, not a reject");
+    assert_eq!(matched.filter_log, None);
+
+    // Control: a flowless packet that does NOT match any deny term still
+    // egresses (pass-through unchanged, #2357/#3290 preserved).
+    let unmatched = resolve_cos_tx_selection(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 201]),
+        None,
+        flowless_extra(),
+    );
+    assert!(
+        !unmatched.drop,
+        "#5467: a flowless packet not matching any deny term must NOT drop"
+    );
+}
+
+#[test]
+fn resolve_cos_tx_selection_flowless_enforces_output_reject() {
+    // #5467 RED-on-revert: a flowless packet matching an output `then reject`
+    // term must set drop:true AND reject:true (the caller keeps the reject
+    // reply silent for a flowless packet — no L4 to synthesize from — but the
+    // packet is still denied).
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-reject-l3".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-reject-l3".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "reject-host".into(),
+                destination_addresses: vec!["172.16.80.200/32".into()],
+                destination_constrained: true,
+                protocols: vec!["tcp".into()],
+                action: "reject".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let selection = resolve_cos_tx_selection(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        None,
+        flowless_extra(),
+    );
+    assert!(selection.drop, "#5467: flowless `then reject` must drop");
+    assert!(
+        selection.reject,
+        "#5467: flowless `then reject` must set the reject flag"
+    );
+}
+
+#[test]
+fn resolve_cos_tx_selection_flowless_enforces_output_log() {
+    // #5467 RED-on-revert: a flowless packet matching an output `then log`
+    // term must surface the filter-log match (before the fix filter_log was
+    // always None on the flowless path — the log was silently bypassed).
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-log-l3".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-log-l3".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "log-host".into(),
+                destination_addresses: vec!["172.16.80.200/32".into()],
+                destination_constrained: true,
+                protocols: vec!["tcp".into()],
+                action: "accept".into(),
+                log: true,
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let selection = resolve_cos_tx_selection(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        None,
+        flowless_extra(),
+    );
+    assert!(
+        selection.filter_log.is_some(),
+        "#5467: a flowless packet matching an output `then log` term must log"
+    );
+    assert!(
+        !selection.drop,
+        "a `then accept` + log term must not drop the packet"
+    );
+}
+
+#[test]
+fn resolve_cos_tx_selection_flowless_port_term_does_not_spuriously_drop() {
+    // #5467 / #2357 / #3290: the flowless output-filter gate matches on the L3
+    // tuple with ports FORCED TO 0, so a port-BEARING terminal term never
+    // matches a fragment — it must NOT be spuriously dropped. This guards the
+    // fix from over-dropping legitimate flowless traffic.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-drop-port".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-drop-port".into(),
+            family: "inet".into(),
+            // Port-bearing terminal term: a flowless packet (port 0, L4 absent)
+            // must NOT match it.
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let selection = resolve_cos_tx_selection(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        None,
+        flowless_extra(),
+    );
+    assert!(
+        !selection.drop,
+        "#5467: a port-bearing output term must NOT drop a flowless (port 0) packet"
+    );
+}
+
 #[test]
 fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filter_exists() {
     let snapshot = ConfigSnapshot {
