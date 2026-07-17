@@ -13,6 +13,9 @@
 
 use super::super::*;
 use super::matching::{term_matches, term_matches_v4, term_matches_v6};
+// #5857: the lo0 host-bound filter meters its three-color policer on the same
+// runtime the interface TX-selection leg uses (`merge_matched_tx_modifiers`).
+use super::policer::apply_term_three_color_policer;
 
 /// Evaluate a named filter against a packet flow. First matching term wins.
 /// If no term matches, the implicit action is Accept.
@@ -57,9 +60,22 @@ pub(crate) fn evaluate_filter_counted(
         dscp,
         extra,
         packet_bytes,
+        // #5857: interface input/output filters meter their three-color policer
+        // in the tx-selection walk, not in this action-eval — pass None so this
+        // walk does NOT meter (metering here would double-meter).
+        None,
     )
 }
 
+/// #5857: `now_ns` selects whether matched terms meter their three-color
+/// policer. `Some(now_ns)` — the lo0 host-bound path — meters every matched
+/// term (drop + color/DSCP decision) exactly like the interface TX-selection
+/// leg. `None` — the interface input/output filter action-eval and the PBR
+/// prechecks — does NOT meter here: those filters meter their policer in the
+/// separate tx-selection walk (`evaluate_filter_ref_tx_selection_*`), so
+/// metering in this action-eval too would DOUBLE-meter. With `None` the walk is
+/// byte-for-byte identical to the pre-#5857 behavior (no drop, term dscp-rewrite
+/// precedence unchanged).
 #[inline]
 pub(super) fn evaluate_filter_ref_counted(
     filter: &Filter,
@@ -71,6 +87,7 @@ pub(super) fn evaluate_filter_ref_counted(
     dscp: u8,
     extra: TermMatchExtra<'_>,
     packet_bytes: u64,
+    now_ns: Option<u64>,
 ) -> FilterResult {
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_counted_v4(
@@ -83,6 +100,7 @@ pub(super) fn evaluate_filter_ref_counted(
             dscp,
             extra,
             packet_bytes,
+            now_ns,
         ),
         (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_counted_v6(
             filter,
@@ -94,6 +112,7 @@ pub(super) fn evaluate_filter_ref_counted(
             dscp,
             extra,
             packet_bytes,
+            now_ns,
         ),
         _ => FilterResult::default(),
     }
@@ -110,6 +129,7 @@ fn evaluate_filter_ref_counted_v4(
     dscp: u8,
     extra: TermMatchExtra<'_>,
     packet_bytes: u64,
+    now_ns: Option<u64>,
 ) -> FilterResult {
     // #2544: accumulate modifiers across fall-through terms. A matched
     // fall-through term (continue_term) applies its modifiers and continues; a
@@ -125,7 +145,7 @@ fn evaluate_filter_ref_counted_v4(
         if term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
-        merge_matched_modifiers(&mut acc, filter, term);
+        merge_matched_modifiers(&mut acc, filter, term, now_ns, packet_bytes);
         if !term.continue_term {
             acc.action = term.action;
             normalize_log_match_action(&mut acc);
@@ -162,11 +182,36 @@ fn normalize_log_match_action(acc: &mut FilterResult) {
 /// NOT set here — the caller sets it only for a terminating term, and
 /// `normalize_log_match_action` (#2616) rewrites the stored log_match action to
 /// the final verdict before the result is returned.
+///
+/// #5857: `now_ns` gates the three-color policer METER — a side effect that
+/// (like the tx-selection leg's `merge_matched_tx_modifiers`) must run on EVERY
+/// matched term, fall-through or terminating, exactly once. `Some(now_ns)` (the
+/// lo0 host-bound path) meters `term.three_color_policer` and folds its drop
+/// (OR-accumulated so a later permit cannot erase an earlier drop) and its
+/// color/DSCP rewrite (policer rewrite wins over the term's configured rewrite,
+/// matching the tx-selection precedence). `None` (interface input/output
+/// action-eval + PBR prechecks, which meter their policer in the tx-selection
+/// walk) skips the meter and is byte-for-byte identical to pre-#5857.
 #[inline]
-fn merge_matched_modifiers(acc: &mut FilterResult, filter: &Filter, term: &FilterTerm) {
-    if term.dscp_rewrite.is_some() {
-        acc.dscp_rewrite = term.dscp_rewrite;
+fn merge_matched_modifiers(
+    acc: &mut FilterResult,
+    filter: &Filter,
+    term: &FilterTerm,
+    now_ns: Option<u64>,
+    packet_bytes: u64,
+) {
+    // #5857: meter the three-color policer once per matched term when the caller
+    // requested metering (lo0). `now_ns == None` returns the default no-op action
+    // (drop=false, dscp_rewrite=None), preserving the non-metered paths exactly.
+    let policer_action = apply_term_three_color_policer(term, now_ns, packet_bytes);
+    // #5857: policer color/DSCP rewrite takes precedence over the term's
+    // configured rewrite; otherwise the term's rewrite carries forward (a `None`
+    // policer action + no term rewrite leaves any earlier term's rewrite intact,
+    // matching the pre-#5857 `if term.dscp_rewrite.is_some()` assignment).
+    if let Some(rewrite) = policer_action.dscp_rewrite.or(term.dscp_rewrite) {
+        acc.dscp_rewrite = Some(rewrite);
     }
+    acc.policer_drop |= policer_action.drop;
     if !term.policer_name.is_empty() {
         acc.policer_name = term.policer_name.clone();
     }
@@ -198,6 +243,7 @@ fn evaluate_filter_ref_counted_v6(
     dscp: u8,
     extra: TermMatchExtra<'_>,
     packet_bytes: u64,
+    now_ns: Option<u64>,
 ) -> FilterResult {
     // #2544: see evaluate_filter_ref_counted_v4 — accumulate fall-through
     // modifiers; return on the first terminating matched term.
@@ -211,7 +257,7 @@ fn evaluate_filter_ref_counted_v6(
         if term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
-        merge_matched_modifiers(&mut acc, filter, term);
+        merge_matched_modifiers(&mut acc, filter, term, now_ns, packet_bytes);
         if !term.continue_term {
             acc.action = term.action;
             normalize_log_match_action(&mut acc);
@@ -336,7 +382,9 @@ fn evaluate_filter_ref_non_routing_counted_v4(
         if always_count && term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
-        merge_matched_modifiers(&mut acc, filter, term);
+        // #5857: the non-routing input-filter evaluator does NOT meter its
+        // policer here (it is metered in the tx-selection walk); pass None.
+        merge_matched_modifiers(&mut acc, filter, term, None, packet_bytes);
         // This loop variant never carries a routing-instance through the
         // result (it defers to the routing-instance evaluator); keep that.
         acc.routing_instance = String::new();
@@ -429,7 +477,9 @@ fn evaluate_filter_ref_non_routing_counted_v6(
         if always_count && term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
-        merge_matched_modifiers(&mut acc, filter, term);
+        // #5857: the non-routing input-filter evaluator does NOT meter its
+        // policer here (it is metered in the tx-selection walk); pass None.
+        merge_matched_modifiers(&mut acc, filter, term, None, packet_bytes);
         acc.routing_instance = String::new();
         if !term.continue_term {
             acc.action = term.action;
@@ -620,11 +670,20 @@ pub(crate) fn evaluate_lo0_filter(
     dscp: u8,
     extra: TermMatchExtra<'_>,
 ) -> FilterResult {
+    // #5857: the test convenience wrapper does NOT meter (now_ns = None); it is
+    // used only by tests that assert the verdict/counters, not policer metering.
     evaluate_lo0_filter_counted(
-        state, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, 0,
+        state, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, 0, None,
     )
 }
 
+/// #5857: `now_ns` threads the poll-iteration monotonic timestamp so the lo0
+/// host-bound filter METERS each matched term's three-color policer (the same
+/// runtime the interface TX-selection leg meters). `Some(now_ns)` — the live
+/// local-delivery path — enforces the configured control-plane rate limit;
+/// `None` — the `evaluate_lo0_filter` test convenience wrapper — evaluates the
+/// verdict/counters without metering. lo0 has no separate tx-selection leg, so
+/// this is the ONLY place its policer is metered (no double-meter risk).
 pub(crate) fn evaluate_lo0_filter_counted(
     state: &FilterState,
     is_v6: bool,
@@ -636,6 +695,7 @@ pub(crate) fn evaluate_lo0_filter_counted(
     dscp: u8,
     extra: TermMatchExtra<'_>,
     packet_bytes: u64,
+    now_ns: Option<u64>,
 ) -> FilterResult {
     let filter = if is_v6 {
         state.lo0_filter_v6_fast.as_deref()
@@ -655,6 +715,7 @@ pub(crate) fn evaluate_lo0_filter_counted(
         dscp,
         extra,
         packet_bytes,
+        now_ns,
     )
 }
 
@@ -728,6 +789,10 @@ pub(crate) fn evaluate_interface_filter_counted(
         dscp,
         extra,
         packet_bytes,
+        // #5857: interface input/output filters meter their three-color policer
+        // in the tx-selection walk, not in this action-eval — pass None so this
+        // walk does NOT meter (metering here would double-meter).
+        None,
     )
 }
 
@@ -1003,6 +1068,10 @@ pub(crate) fn evaluate_interface_output_filter_counted(
         dscp,
         extra,
         packet_bytes,
+        // #5857: interface input/output filters meter their three-color policer
+        // in the tx-selection walk, not in this action-eval — pass None so this
+        // walk does NOT meter (metering here would double-meter).
+        None,
     )
 }
 

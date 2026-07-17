@@ -437,6 +437,7 @@ fn flowless_local_delivery_verdict(
         flow,
         meta,
         ingress_zone_override,
+        now_ns,
     ) {
         None => {
             // #3610: emit the tuple-rich host-inbound deny event before the
@@ -1201,6 +1202,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 flow,
                                 meta,
                                 Some(resolved.metadata.ingress_zone),
+                                now_ns,
                             ) {
                                 None => {
                                     // Host-inbound denied: silent drop, tear down
@@ -2246,6 +2248,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 flow,
                                 meta,
                                 ingress_zone_override,
+                                now_ns,
                             ) {
                                 None => {
                                     // Host-inbound denied: silent drop, never
