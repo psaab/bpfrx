@@ -349,6 +349,42 @@ the reconciled `tunnelid_test.go` duplicate-spelling case, each RED on revert of
 the gate wiring (the parity test goes RED — node0 accepts — when the gate is put
 back node-local).
 
+**Peer-effective SOURCE-NAT — the #5876 gap.** The same divergent-commit class
+bit the strict SOURCE-NAT gates. Those validators
+(`validateSourceNATPoolStrict`, `validateSourceNATPoolAddressGrammarStrict`,
+`validateSourceNATPersistentNoTranslationStrict`,
+`validateNATPoolReferencesStrict`, `validateNATSourceAddressNameReferencesStrict`
+in `compiler_validate_strict_nat.go`) run inside `runUniformGates`, so a commit
+that compiles `s.nodeID` alone (`Store.compileTree` → `CompileConfigForNode`)
+strict-validated only the SUBMITTING node's source-NAT view. A `${node}`
+apply-group substitution / per-node rewrite that selects a source-NAT pool or
+reference valid on the origin but INVALID on the peer — a per-node pool
+`address` / `port range`, or a shared top-level rule whose
+`then source-nat pool <name>` names a pool only a peer `groups nodeN` block
+defines — passed green, and the standby then lenient-loaded the config-synced
+snapshot (`Store.SyncApply` → `CompileConfigForNodeLenient`, which downgrades the
+strict SNAT gate to a warning and fails the translation CLOSED). SNAT silently
+degraded on the node that just took over. Unlike the #5631/#5878 unit-alias gate
+— a pure-AST union that can be computed pre-expansion — source-NAT
+representability needs the fully COMPILED per-node view (pools resolved), so the
+fix RE-COMPILES rather than unions: `ValidatePeerEffectiveSourceNATStrict(tree,
+localNodeID)` (`compiler_peer_effective_snat.go`), wired into
+`configstore.compileTreeStrict` after the local compile + cross-checks, compiles
+the PEER node with `CompileConfigForNodeLenient(peerID)` — the exact transform
+the standby applies — and re-runs the strict SOURCE-NAT validators against that
+peer-effective `*Config`. A peer-only source-NAT error is now rejected at the
+origin commit, naming the peer node and the offending pool, so BOTH
+node-effective source-NAT outputs are proven representable before promotion.
+Non-source-NAT gate errors on the peer view are out of scope (downgraded to
+warnings by the lenient compile); a peer view that will not compile at all is
+left to the peer's own load path (no false-reject of the origin commit).
+Standalone (`nodeID < 0`) has no peer and is a no-op — zero behavior change off a
+cluster. Covered by `pkg/config/compiler_peer_effective_snat_5876_test.go`
+(peer-only reversed-range / per-node address / dangling-pool-reference vectors,
+both-views-valid + standalone over-reject guards, node0/node1 symmetry) and
+`pkg/configstore/peer_effective_snat_5876_test.go` (store-gate wiring), each RED
+on revert of the peer gate (node0 accepts the peer-only SNAT error).
+
 **Phase 2 (#5878) — reference-binder canonicalization.** Phase 1 (above) closes
 the divergent-commit fail-open by rejecting a duplicate-spelling collision at
 commit. The second, subtler half of #5878 is that a cross-subsystem reference
