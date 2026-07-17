@@ -941,6 +941,14 @@ pub(super) fn stage_ipsec_passthrough_check(
     // instead continues to transit forwarding + zone-policy evaluation. This
     // gate runs BEFORE the #4323 host-inbound admission block, which only
     // makes sense for genuinely host-inbound (local-destined) IKE.
+    //
+    // Caveat: a DNAT external that maps to ANOTHER host (transit-DNAT IPsec,
+    // e.g. IKE VIP -> internal gateway) is ALSO in `local_v*` (proxy-ARP/ND
+    // ownership), so this raw-dst check still claims it as local passthrough
+    // rather than DNAT-forwarding it onward. That exotic case is UNCHANGED by
+    // #5620 — pre-#5620 Stage 11 claimed ALL IPsec, so it was already
+    // reinjected locally; #5620 only fixes the transit-to-REMOTE bypass and
+    // leaves the transit-DNAT-to-another-host behavior bit-identical.
     if !worker_ctx.forwarding.owns_configured_ip(flow.dst_ip) {
         return IpsecPassthroughOutcome::NotClaimed;
     }
