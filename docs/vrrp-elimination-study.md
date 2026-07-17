@@ -110,6 +110,28 @@ if noRethVRRP {
 
 If `directAddVIPs()` actually added any addresses (returns count > 0), emit a rate-limited GARP burst to update upstream MAC tables.
 
+> **Dual-active reaffirm reconcile-fallback guarantee (#4867).** The
+> "winner stays" resolution (`electRG` → `electNoChange`, reason
+> `Dual-active: winner stays`) emits a `DualActiveWin` reaffirm event that
+> the daemon turns into `scheduleDirectAnnounce` — the *only* signal that
+> refreshes upstream ARP/NDP after a split-brain heals, because the winner
+> never changed state (no `sendEvent` transition fires). That event is
+> emitted through an inline non-blocking `select`; on a **full** `eventCh`
+> it used to be silently dropped, bypassing the `onEventDrop` reconcile
+> fallback that the normal `sendEvent` path uses, so the GARP/NA refresh was
+> lost and peers held the losing node's MAC until cache aging.
+>
+> The drop now matches `sendEvent`'s reliable handling — it logs and fires
+> `onEventDrop` (→ `triggerReconcile`) — **and** invokes a dedicated
+> `onDualActiveWinDrop` callback that re-drives `scheduleDirectAnnounce`
+> directly. The generic reconcile alone is not sufficient here: the
+> direct-VIP ownership reconcile (2b) only re-announces on an *ownership
+> change* (`announce = !prev || added > 0`), and a dual-active winner is
+> already the steady owner (`prev = true`, `added = 0`), so
+> `triggerReconcile` would not re-announce. The dedicated callback closes
+> that gap so the post-split-brain refresh survives a saturated event
+> channel.
+
 **2c. Per-RG owner epoch in cluster manager**
 
 Add `Epoch uint64` to `RedundancyGroupState`. Increment on every state transition. Include in heartbeat wire format (1 additional byte per RG, wrapping). Reject stale transitions when epoch mismatch detected.

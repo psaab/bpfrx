@@ -1429,6 +1429,12 @@ pub(crate) struct BindingLiveSnapshot {
     /// from BindingLiveState (an incoming IPv6 packet whose source lies within a
     /// configured Pref64 — the RFC 6146 §3.5 mandatory hairpin/source drop).
     pub(crate) nat64_ineligible_source: u64,
+    /// #5625: cumulative fail-closed NAT64 ext-header ineligibility drops
+    /// snapshotted from BindingLiveState (a v6→v4 forward translation rejected
+    /// because the IPv6 packet carried an Authentication Header, an active
+    /// Routing header (Segments Left > 0), or a Mobility / HIP / Shim6 header —
+    /// RFC 7915 §5.1 / §5.1.1).
+    pub(crate) nat64_exthdr_ineligible: u64,
     /// #4477: cumulative source-NAT allocation failures snapshotted from
     /// BindingLiveState. Bridged into `GlobalCtrNATAllocFail` (Go side).
     pub(crate) nat_alloc_fail: u64,

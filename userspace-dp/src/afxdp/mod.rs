@@ -584,6 +584,19 @@ pub(in crate::afxdp) struct BatchCounters {
     // BindingLiveState.nat64_ineligible_source and surfaced as the `NAT64
     // ineligible-source drops` operator counter.
     nat64_ineligible_source: u64,
+    // #5625: fail-closed NAT64 EXTENSION-HEADER ineligibility drops — a v6→v4
+    // forward translation was rejected BEFORE it proceeded because the IPv6
+    // packet carried an Authentication Header (51), an ACTIVE Routing header
+    // (43, Segments Left > 0), or a Mobility (135) / HIP (139) / Shim6 (140)
+    // header, none of which a stateless NAT64 translation can carry to IPv4
+    // (RFC 7915 §5.1 / §5.1.1) — translating would strip the active extension
+    // semantics or break AH authentication. Bumped from the TX dispatcher when
+    // `build_nat64_forwarded_frame` returns `None` and
+    // `nat64::frame_is_nat64_exthdr_ineligible` attributes it. Flushed to
+    // BindingLiveState.nat64_exthdr_ineligible and surfaced as the `NAT64
+    // ext-header ineligible drops` operator counter. Distinct from the
+    // source/pool/fragment counters — this is an ext-header input reject.
+    nat64_exthdr_ineligible: u64,
     // #4477: source-NAT allocation failures — a source-NAT rule matched but no
     // translated mapping could be allocated (missing/empty/invalid pool,
     // exhausted port allocator, wrong family, or a non-first fragment on a
@@ -750,6 +763,20 @@ impl BatchCounters {
         self.nat64_ineligible_source += 1;
     }
 
+    /// #5625: record a fail-closed NAT64 extension-header ineligibility drop —
+    /// a v6→v4 forward translation rejected because the IPv6 packet carried an
+    /// Authentication Header, an active Routing header (Segments Left > 0), or a
+    /// Mobility / HIP / Shim6 header (RFC 7915 §5.1 / §5.1.1). Bumped from the
+    /// TX dispatcher when `build_nat64_forwarded_frame` returns `None` and
+    /// `nat64::frame_is_nat64_exthdr_ineligible` attributes the `None`. Batched
+    /// like the sibling nat64 drop counters and flushed to
+    /// `BindingLiveState.nat64_exthdr_ineligible`.
+    #[inline]
+    pub(in crate::afxdp) fn record_nat64_exthdr_ineligible(&mut self) {
+        self.touched = true;
+        self.nat64_exthdr_ineligible += 1;
+    }
+
     fn flush(&mut self, live: &BindingLiveState) {
         if !self.touched {
             return;
@@ -843,6 +870,13 @@ impl BatchCounters {
             live.nat64_ineligible_source
                 .fetch_add(self.nat64_ineligible_source, Ordering::Relaxed);
             self.nat64_ineligible_source = 0;
+        }
+        // #5625: fail-closed NAT64 ext-header-ineligibility tally, batched like
+        // the sibling nat64 drop counters above.
+        if self.nat64_exthdr_ineligible != 0 {
+            live.nat64_exthdr_ineligible
+                .fetch_add(self.nat64_exthdr_ineligible, Ordering::Relaxed);
+            self.nat64_exthdr_ineligible = 0;
         }
         // #4477: source-NAT allocation-failure tally.
         if self.nat_alloc_fail != 0 {

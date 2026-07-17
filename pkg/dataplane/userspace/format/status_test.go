@@ -251,6 +251,26 @@ func TestFormatStatusSummaryShowsNAT64FragDropped(t *testing.T) {
 	}
 }
 
+// #5625: the status summary surfaces the fail-closed NAT64 extension-header
+// ineligibility counter — a v6→v4 forward translation rejected because the
+// IPv6 packet carried an Authentication Header, an active Routing header
+// (Segments Left > 0), or a Mobility/HIP/Shim6 header (RFC 7915 §5.1/§5.1.1)
+// — as its own row, summed across bindings, distinct from the source/pool/
+// fragment NAT64 drop counters.
+func TestFormatStatusSummaryShowsNAT64ExthdrIneligible(t *testing.T) {
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
+			{Slot: 0, Nat64ExthdrIneligible: 6},
+			{Slot: 1, Nat64ExthdrIneligible: 9},
+		},
+	}
+
+	out := FormatStatusSummary(status)
+	if !strings.Contains(out, "NAT64 ext-header ineligible drops:15") {
+		t.Fatalf("summary missing NAT64 ext-header ineligible drop row (want 15):\n%s", out)
+	}
+}
+
 // #3657 (H13/H14) / #3661 (M02): the status summary surfaces the per-source
 // reject reply SUCCESS ("Generated-reply sent"), the TX-frame reply-budget
 // suppression ("Generated-reply budget drops"), and the rate-limit
