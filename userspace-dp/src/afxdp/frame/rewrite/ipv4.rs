@@ -1,9 +1,14 @@
 //! IPv4 arm of `apply_rewrite_descriptor`.
 //!
-//! Body is byte-identical to the `0x0800` match arm at
-//! `frame/mod.rs:937..1037` before this split. The orchestrator at
-//! `frame/rewrite/mod.rs` validates `RewriteEthParams` via
-//! `rewrite_prepare_eth_from_parts`, then dispatches here.
+//! Split into a read-only `validate_rewrite_descriptor_ipv4` (all
+//! None-returning bail gates) and an infallible
+//! `apply_rewrite_descriptor_ipv4` (mutation only). #5466 requires the
+//! gates to run against the PRISTINE frame BEFORE the eth-header write /
+//! VLAN-push memmove commit, so the orchestrator calls `validate_*` on
+//! the original L3 payload and only calls `apply_*` after the commit —
+//! keeping the rewrite transactional (no UMEM mutation before a possible
+//! `None`). The apply body is byte-identical to the pre-split mutation
+//! block, so the success-path output is unchanged.
 
 use super::super::byte_writes::{
     write_ipv4_dst, write_ipv4_src, write_l4_dst_port, write_l4_src_port,
@@ -12,39 +17,61 @@ use crate::afxdp::{RewriteDescriptor, UserspaceDpMeta, PROTO_TCP, PROTO_UDP};
 use crate::ip_proto::has_l4_ports;
 use std::net::IpAddr;
 
+/// Read-only bail gates for the IPv4 descriptor rewrite. `l3_payload` is
+/// the frame from the L3 offset onward (`&frame[ip..ip + payload_len]`),
+/// so all length checks and byte reads are relative to offset 0 — this
+/// makes the gate decisions identical whether run on the ORIGINAL frame
+/// (pre-commit, at `plan.l3`) or the committed TX frame (at `eth_len`),
+/// because the commit's memmove is a pure relocation. Returns the L4
+/// offset relative to the IP header (the IHL) on success; `None` on any
+/// bail (header too short, TTL expired, DMA-race port mismatch).
 #[inline(always)]
-pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv4(
-    packet: &mut [u8],
-    ip: usize,
+pub(in crate::afxdp::frame) fn validate_rewrite_descriptor_ipv4(
+    l3_payload: &[u8],
     skip_ttl: bool,
-    apply_nat: bool,
     meta: UserspaceDpMeta,
-    rd: &RewriteDescriptor,
     expected_ports: Option<(u16, u16)>,
-) -> Option<()> {
-    if packet.len() < ip + 20 {
+) -> Option<usize> {
+    if l3_payload.len() < 20 {
         return None;
     }
-    let ihl = ((packet[ip] & 0x0f) as usize) * 4;
-    if ihl < 20 || packet.len() < ip + ihl {
+    let ihl = ((l3_payload[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || l3_payload.len() < ihl {
         return None;
     }
-    if !skip_ttl && packet[ip + 8] <= 1 {
+    if !skip_ttl && l3_payload[8] <= 1 {
         return None; // TTL expired
     }
-    let l4 = ip + ihl;
 
     // Port validation (DMA race guard).
     // If ports don't match, fall back to generic path for repair.
     if let Some((exp_src, exp_dst)) = expected_ports {
-        if matches!(meta.protocol, PROTO_TCP | PROTO_UDP) && packet.len() >= l4 + 4 {
-            let cur_src = u16::from_be_bytes([packet[l4], packet[l4 + 1]]);
-            let cur_dst = u16::from_be_bytes([packet[l4 + 2], packet[l4 + 3]]);
+        if matches!(meta.protocol, PROTO_TCP | PROTO_UDP) && l3_payload.len() >= ihl + 4 {
+            let cur_src = u16::from_be_bytes([l3_payload[ihl], l3_payload[ihl + 1]]);
+            let cur_dst = u16::from_be_bytes([l3_payload[ihl + 2], l3_payload[ihl + 3]]);
             if cur_src != exp_src || cur_dst != exp_dst {
                 return None;
             }
         }
     }
+    Some(ihl)
+}
+
+/// Infallible mutation half of the IPv4 descriptor rewrite. MUST be called
+/// only after `validate_rewrite_descriptor_ipv4` cleared the gates; `rel_l4`
+/// is that call's return (the IHL). No path returns `None` — every write is
+/// bounds-safe given the validated `packet.len() >= ip + rel_l4` layout.
+#[inline(always)]
+pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv4(
+    packet: &mut [u8],
+    ip: usize,
+    rel_l4: usize,
+    skip_ttl: bool,
+    apply_nat: bool,
+    meta: UserspaceDpMeta,
+    rd: &RewriteDescriptor,
+) {
+    let l4 = ip + rel_l4;
 
     // NAT: direct byte writes for IP addresses (#963 PR-B
     // helpers). Caller-side `if let Some(IpAddr::V4(_))`
@@ -128,5 +155,4 @@ pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv4(
             }
         }
     }
-    Some(())
 }

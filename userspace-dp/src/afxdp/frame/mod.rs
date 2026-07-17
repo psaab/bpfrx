@@ -516,13 +516,36 @@ fn classify_in_place_l2_rewrite(
     Some((rx_addr, InPlaceL2Rewrite::UnsupportedMemmove))
 }
 
+/// The read-only output of `rewrite_plan_eth_from_parts`: the descriptor
+/// rewrite plan plus the ORIGINAL-frame geometry the descriptor fast path
+/// needs to run its bail gates before mutating UMEM (#5466).
+pub(in crate::afxdp::frame) struct EthRewritePlan {
+    /// L3 offset within the ORIGINAL (RX) frame at `desc.addr`. Before the
+    /// commit's VLAN-push memmove relocates the L3 payload, this is where
+    /// the descriptor bail gates must read the IP/L4 header.
+    pub(in crate::afxdp::frame) l3: usize,
+    /// Trimmed L3 payload length (`== frame_len - eth_len`).
+    pub(in crate::afxdp::frame) payload_len: usize,
+    /// Post-commit descriptor result (offsets + L2 classification).
+    pub(in crate::afxdp::frame) prep: RewritePrep,
+}
+
+/// Read-only half of the descriptor rewrite preamble (#5466). Computes the
+/// L3 offset, trimmed payload length, target Ethernet length, TX descriptor
+/// view, and L2-rewrite classification WITHOUT touching the UMEM frame.
+///
+/// Split out of `rewrite_prepare_eth_from_parts` so the descriptor fast path
+/// can run every bail gate (non-first-fragment / header length / TTL / DMA-race
+/// port mismatch) against the pristine frame BEFORE any mutation. A `None`
+/// return from a gate then leaves the frame byte-identical, so the caller's
+/// generic `.or_else(...)` fallback reprocesses an un-corrupted packet.
 #[inline]
-fn rewrite_prepare_eth_from_parts(
+fn rewrite_plan_eth_from_parts(
     area: &MmapArea,
     desc: XdpDesc,
     meta: ForwardPacketMeta,
-    params: RewriteEthParams,
-) -> Option<RewritePrep> {
+    params: &RewriteEthParams,
+) -> Option<EthRewritePlan> {
     let current_len = desc.len as usize;
     let (l3, payload_len) = {
         let frame = area.slice(desc.addr as usize, current_len)?;
@@ -538,9 +561,48 @@ fn rewrite_prepare_eth_from_parts(
     let eth_len = if params.vlan_id > 0 { 18usize } else { 14usize };
     let frame_len = eth_len.checked_add(payload_len)?;
     let (tx_offset, l2_rewrite) = classify_in_place_l2_rewrite(desc.addr, l3, eth_len, frame_len)?;
+    // Fabric-ingress packets already had TTL decremented by the
+    // sending peer (FABRIC_INGRESS_FLAG = 0x80).
+    let skip_ttl = (meta.meta_flags & 0x80) != 0;
+    Some(EthRewritePlan {
+        l3,
+        payload_len,
+        prep: RewritePrep {
+            eth_len,
+            ip_start: eth_len,
+            frame_len,
+            tx_offset,
+            l2_rewrite,
+            apply_nat: params.apply_nat,
+            skip_ttl,
+            vlan_id: params.vlan_id,
+        },
+    })
+}
+
+/// Mutating half of the descriptor rewrite preamble (#5466). Writes the new
+/// Ethernet header and, on the VLAN-push-no-headroom / unsupported paths,
+/// performs the payload `copy_within` memmove. Every write here mutates UMEM,
+/// so this MUST be called only after all descriptor bail gates have passed.
+///
+/// Body is byte-identical to the mutation block of the pre-#5466
+/// `rewrite_prepare_eth_from_parts`, so the generic path (which composes
+/// plan + commit via `rewrite_prepare_eth_from_parts` below) is unchanged.
+#[inline]
+fn rewrite_commit_eth_from_plan(
+    area: &MmapArea,
+    desc: XdpDesc,
+    plan: &EthRewritePlan,
+    params: &RewriteEthParams,
+) -> Option<()> {
+    let l3 = plan.l3;
+    let payload_len = plan.payload_len;
+    let eth_len = plan.prep.eth_len;
+    let frame_len = plan.prep.frame_len;
+    let tx_offset = plan.prep.tx_offset;
 
     if matches!(
-        l2_rewrite,
+        plan.prep.l2_rewrite,
         InPlaceL2Rewrite::VlanPushMemmoveNoHeadroom | InPlaceL2Rewrite::UnsupportedMemmove
     ) {
         let frame_size = UMEM_FRAME_SIZE as u64;
@@ -552,6 +614,12 @@ fn rewrite_prepare_eth_from_parts(
         if frame_len > frame.len() || source_end > frame.len() {
             return None;
         }
+        // NOTE: the two `?` below (get_mut, write_eth_header_slice) run AFTER
+        // this copy_within, but they cannot fail: frame.len() >= frame_len >=
+        // eth_len, and write_eth_header_slice only rejects a buffer shorter
+        // than eth_len. All fallible geometry checks are above this line, so
+        // the transactional guarantee (no mutation before a possible None)
+        // holds — the sole mutation past a possible None is unreachable.
         frame.copy_within(l3..source_end, eth_len);
         write_eth_header_slice(
             frame.get_mut(..eth_len)?,
@@ -570,19 +638,19 @@ fn rewrite_prepare_eth_from_parts(
             params.ether_type,
         )?;
     }
-    // Fabric-ingress packets already had TTL decremented by the
-    // sending peer (FABRIC_INGRESS_FLAG = 0x80).
-    let skip_ttl = (meta.meta_flags & 0x80) != 0;
-    Some(RewritePrep {
-        eth_len,
-        ip_start: eth_len,
-        frame_len,
-        tx_offset,
-        l2_rewrite,
-        apply_nat: params.apply_nat,
-        skip_ttl,
-        vlan_id: params.vlan_id,
-    })
+    Some(())
+}
+
+#[inline]
+fn rewrite_prepare_eth_from_parts(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: ForwardPacketMeta,
+    params: RewriteEthParams,
+) -> Option<RewritePrep> {
+    let plan = rewrite_plan_eth_from_parts(area, desc, meta, &params)?;
+    rewrite_commit_eth_from_plan(area, desc, &plan, &params)?;
+    Some(plan.prep)
 }
 
 #[inline]

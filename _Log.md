@@ -51138,3 +51138,46 @@ top.
   **File(s)**: pkg/dataplane/userspace/manager_ha.go,
   pkg/dataplane/userspace/manager_compile.go,
   pkg/dataplane/userspace/manager_ha_clear_debt_5873_test.go (new)
+
+- **Timestamp**: 2026-07-17
+  **Action**: #5466 — make the userspace-dp descriptor rewrite transactional
+  (no UMEM mutation before a possible None bail).
+  **Why**: `apply_rewrite_descriptor` (frame/rewrite/mod.rs) called
+  `rewrite_prepare_eth_from_parts`, which MUTATES the UMEM frame (eth-header
+  write via `write_eth_header_slice`, and in the VLAN-push-no-headroom /
+  unsupported case a payload `frame.copy_within` memmove), BEFORE hitting the
+  non-first-fragment gate and the v4/v6 DMA-race port-mismatch guards that can
+  return None. The flow-cache caller chains
+  `apply_rewrite_descriptor(...).or_else(|| rewrite_forwarded_frame_in_place(...))`,
+  so a None-after-mutation handed the generic fallback a CORRUPTED frame
+  (scribbled L2 / shifted payload) → wrong bytes on the wire / checksum
+  corruption / mis-forwarded packet.
+  **Fix (plan-then-commit split)**: split `rewrite_prepare_eth_from_parts` into
+  a pure `rewrite_plan_eth_from_parts` (no mutation) + a mutating
+  `rewrite_commit_eth_from_plan`; the old name now composes the two so the
+  generic path is byte-identical. Split the v4/v6 arms into read-only
+  `validate_rewrite_descriptor_ipv4/ipv6` (all None-returning gates, returns the
+  rel-L4 offset) + infallible `apply_rewrite_descriptor_ipv4/ipv6` (mutation
+  only). The orchestrator now: plan (no mutation) -> run the fragment gate +
+  family validation against the PRISTINE frame at `plan.l3` -> only then commit
+  the eth rewrite -> apply. Gates read the original L3 payload and use the
+  plan's frame_len/payload_len for length checks; because the commit's memmove
+  is a pure relocation and the eth-header write never touches the L3/L4 region,
+  the gate DECISIONS and the success-path OUTPUT are byte-identical to
+  pre-#5466.
+  **Validation**: `cargo build` clean; `cargo test --release rewrite` +
+  full `cargo test --release` GREEN. Fail-on-revert proven firsthand: with the
+  commit reordered before the gates, `pin_5466_descriptor_fragment_decline`,
+  `pin_5466_descriptor_vlan_push_memmove_decline`,
+  `pin_descriptor_port_mismatch_declines`, and
+  `pin_ttl_expired_declines_l3_untouched` all go RED (`assertion left == right
+  failed` on the full-frame byte-identity check). Cluster smoke DEFERRED
+  (verify-dataplane cpumap false-rejection #5364 blocks loss-cluster deploy);
+  this is a frame-transactionality logic fix gated on the cargo RED-on-revert
+  pins.
+  **File(s)**: userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/frame/rewrite/mod.rs,
+  userspace-dp/src/afxdp/frame/rewrite/ipv4.rs,
+  userspace-dp/src/afxdp/frame/rewrite/ipv6.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
+  userspace-dp/src/afxdp/frame/README.md
