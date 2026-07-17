@@ -50918,3 +50918,34 @@ top.
   pkg/configstore/store.go,
   pkg/configstore/peer_effective_snat_5876_test.go (new),
   docs/config-schema.md
+
+- **Timestamp**: 2026-07-16
+  **Action**: #5837 (Track-1 mitigation) — commit-time WARNING for the
+  first-packet interface-address DNAT/static-NAT bypass. On a session miss the
+  userspace AF_XDP shim classifies a packet destined to a firewall-local
+  interface address as kernel-local (`is_local_destination`) BEFORE consulting
+  destination-NAT / static-NAT (`pre_routing_dnat`), so a Junos port-forward /
+  static 1:1 mapping onto the WAN interface's own address is INERT on the first
+  packet (delivered to the host instead of translated + zone-policed); reply /
+  established traffic is unaffected. Today this is SILENT. Added
+  `validateNATInterfaceAddressCollisionWarnings`
+  (new `pkg/config/compiler_validate_warn_nat_iface_addr.go`), wired into
+  `ValidateConfig` so it fires on BOTH the strict commit and tolerant
+  load/peer-sync paths (WARN-only — valid Junos, never rejects/changes
+  forwarding). It checks each DNAT rule's `match destination-address` (the
+  PUBLIC address the outside targets — NOT the pool/translated-to address, which
+  the ingress classifier never inspects) and each static-NAT rule's `match`
+  external address against the set of configured interface addresses (static unit
+  addresses + VRRP VIPs, both families, normalized via `hostLocalAddrFamily`),
+  naming the rule-set/rule + colliding interface. Track-2 (the dedicated-intent-
+  map dataplane fix) stays deferred per the converged plan §0a. Fail-on-revert
+  proven firsthand (RED: "expected exactly one #5837 DNAT advisory, got 0" when
+  the emit is neutralized). NOTE for reviewer: §0a's literal wording says "DNAT
+  pool address" but the #5837 bypass is triggered by the MATCHED/ingress public
+  address (what `is_local_destination` inspects), matching the plan BACKGROUND
+  ("the address the outside world targets") — so the check keys on the match
+  address; a control test proves pool==iface does NOT warn.
+  **File(s)**: pkg/config/compiler_validate_warn_nat_iface_addr.go (new),
+  pkg/config/compiler_interface_addr_nat_warning_5837_test.go (new),
+  pkg/config/compiler_validate_warn.go,
+  docs/userspace-dnat-plan.md

@@ -900,3 +900,46 @@ drops the pool-less `off` entry (reverting to the pre-#3844 fail-open, never a
 crash); a newer helper honoring an older control plane that omits the field
 defaults it `false` (a normal translate entry). `protocol_wire_v1.json`
 regenerated (one `"off": false` line on the DNAT specimen).
+
+## Known limitation: first-packet interface-address DNAT / static-NAT bypass (#5837)
+
+**Symptom.** A destination-NAT or static-NAT rule whose PUBLIC (matched /
+external) destination address is one of the firewall's own configured interface
+addresses is INERT on the FIRST packet of a new flow. The client's initial
+packet is delivered to the local host stack instead of being translated and
+zone-policed. Reply packets and packets on an already-established session are
+unaffected (the translation applies once a session exists) — only the very first
+packet of each new flow is misrouted.
+
+**Root cause.** On a non-GRE session miss the userspace AF_XDP shim
+(`userspace-xdp/src/lib.rs` `try_xdp_userspace` / `is_local_destination`)
+classifies a packet destined to a firewall-local interface address as
+kernel-local and shunts it to the host BEFORE consulting destination-NAT /
+static-NAT (`is_local_destination` runs ahead of `pre_routing_dnat`).
+`is_local_destination` inspects the INGRESS destination — for a DNAT rule that is
+the `match destination-address` (the public IP the client targets), NOT the
+`then destination-nat pool` address (the internal translation TARGET, which the
+ingress classifier never sees). So a legitimate Junos port-forward / static 1:1
+mapping onto the WAN interface's own address never fires on the first packet.
+
+**Track-1 mitigation (shipped): a commit-time WARNING.** The Go config compiler
+now emits a WARN-only advisory (`validateNATInterfaceAddressCollisionWarnings`,
+`pkg/config/compiler_validate_warn_nat_iface_addr.go`, wired into
+`ValidateConfig`) for each destination-NAT / static-NAT rule whose matched /
+external public address equals a configured interface address (static unit
+addresses AND VRRP VIPs, both families). It names the rule-set/rule and the
+colliding interface address. The advisory fires on BOTH the strict commit path
+and the tolerant load / peer-sync path — the config is legal Junos and works for
+reply / established traffic, so it never rejects or changes forwarding (a hard
+reject would also brick a boot on a previously-committed config). This makes the
+previously SILENT bypass LOUD so the operator can either move the service to a
+non-interface public address or knowingly accept first-packet local delivery.
+Scope: literal `match destination-address` values are checked; address-book-NAME
+matches are out of scope (resolving them needs the address-book fold, and the
+common case uses a literal address).
+
+**Track-2 (deferred): the full dataplane fix.** A dedicated intent map probed
+before the local classification (Option B) is a large, verifier-gated, HA-aware
+project deferred by the converged #5837 research plan
+(`docs/research/5837-xdp-dnat-before-local/plan.md` §0/§0a/§0b). Until it lands
+the commit warning is the honest mitigation.
