@@ -137,6 +137,31 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	}
 	cfg.Warnings = append(cfg.Warnings, nptv6Warnings...)
 
+	// #5818: NPTv6 unsupported-scope fail-closed gate. The config model supports
+	// the full static-NAT match scope (rule-set `from interface` / `from routing-
+	// instance`, per-rule `match source-address`), but NPTv6 compilation carries
+	// only `from zone` (buildNptv6Snapshots + Nptv6RuleSnapshot). An NPTv6 rule
+	// scoped to an interface/VRF or a client source prefix was therefore installed
+	// as a broader zone/global prefix rewrite — traffic that cannot match the
+	// configured rule was still translated (the security-widening class #5176
+	// fixed for `from zone`, for the remaining scope dimensions). Until the wire +
+	// dataplane carry and evaluate those dimensions (deferred /research follow-up),
+	// reject the unsupported-scope NPTv6 rule at strict commit rather than silently
+	// widen it. Strict (commit / commit-check): hard-reject naming the rule-set /
+	// rule + the unsupported constraint. Lenient (load / peer-sync): warn so a
+	// config persisted before this gate existed still boots (#1960 no-brick); the
+	// snapshot builder (buildNptv6Snapshots) independently EXCLUDES the scope-
+	// carrying rule so it installs nothing rather than a widened rewrite. A
+	// from-zone-only / fully-unscoped NPTv6 rule is unaffected (#5176-correct
+	// path); an ordinary static-NAT rule with the same dimensions is honored, not
+	// touched. Runs AFTER validateNPTv6Strict so a malformed-prefix error still
+	// wins the first-error slot.
+	nptv6ScopeWarnings, err := validateNPTv6ScopeStrict(cfg, opts.lenientNPTv6)
+	if err != nil {
+		return err
+	}
+	cfg.Warnings = append(cfg.Warnings, nptv6ScopeWarnings...)
+
 	// #3886: NAT64 prefix commit gate. A NAT64 rule-set `prefix` is read
 	// verbatim into the wire snapshot and parsed at dataplane apply by the Rust
 	// Nat64State::try_from_snapshots /96-integrity check. A non-/96 or malformed

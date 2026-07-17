@@ -1619,6 +1619,162 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 	return warnings, nil
 }
 
+// validateNPTv6ScopeStrict is the #5818 fail-closed gate for NPTv6 (RFC 6296)
+// static-NAT rules that carry a match-scope dimension the NPTv6 dataplane does
+// NOT yet honor.
+//
+// The config model retains the full static-NAT match scope: a rule-set `from
+// interface` / `from routing-instance` scope (StaticNATRuleSet.FromInterface /
+// FromRoutingInstance, #3096) and a per-rule `match source-address`
+// (StaticNATRule.SourceAddress / SourceAddresses, #3435). But NPTv6 compilation
+// discards every constraint except `from zone`: buildNptv6Snapshots
+// (pkg/dataplane/userspace/nat_nptv6.go) emits only name + from-zone + the two
+// prefixes, Nptv6RuleSnapshot has no interface / routing-instance / source-
+// prefix field, and the Rust helper (userspace-dp/src/nptv6.rs) matches on
+// ingress/egress zone only. An NPTv6 rule scoped to a specific interface, VRF,
+// or client source prefix was therefore installed as a broader zone/global
+// prefix rewrite: traffic that CANNOT match the configured rule (wrong
+// interface/VRF/source) was still translated and routed — the same security-
+// widening class #5176 fixed for `from zone`, for the remaining scope
+// dimensions.
+//
+// Carrying and evaluating those dimensions end-to-end (typed scope union +
+// canonical source-prefix list on the Go and Rust wire, stable logical-
+// interface / routing-instance identity at both lookup points, symmetric
+// outbound interpretation for stateless NPTv6, and overlap-registry
+// partitioning) is a substantial wire+dataplane change deferred to a /research
+// follow-up. Until then the only correct disposition is to reject the
+// unsupported-scope NPTv6 rule LOUDLY at commit rather than silently install an
+// over-broad rewrite.
+//
+// Reject condition (precise): an NPTv6 rule-set (one containing >= 1 nptv6-prefix
+// rule) whose FromInterface != "" OR FromRoutingInstance != "", or any NPTv6 rule
+// carrying a `match source-address`. A `from zone`-only or fully-unscoped/global
+// NPTv6 rule is UNAFFECTED (the #5176-correct path). An ordinary (non-NPTv6)
+// static-NAT rule carrying the SAME dimensions is ALSO unaffected: from-interface
+// / from-routing-instance scope (#3096) and match source-address (#3435) ARE
+// honored for static NAT, so those rule-sets are skipped here.
+//
+// Strict (commit / commit-check): hard-reject naming the rule-set/rule and the
+// unsupported constraint. Lenient (load / peer-sync, #1960 / #1979 doctrine):
+// return the message as a warning so a config committed before this gate existed
+// (or peer-synced) still boots — the snapshot builder (buildNptv6Snapshots)
+// independently EXCLUDES the scope-carrying rule so nothing installs rather than
+// a widened rewrite. Mirrors the #5859 static-nat `then inet` and #5819
+// persistent-nat + no-translation fail-closed patterns. Uses the same
+// opts.lenientNPTv6 flag as validateNPTv6Strict.
+func validateNPTv6ScopeStrict(cfg *Config, lenient bool) ([]string, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	var warnings []string
+	emit := func(msg string) error {
+		if lenient {
+			warnings = append(warnings,
+				msg+" (this NPTv6 rule is excluded from the dataplane snapshot so it"+
+					" installs nothing rather than a broader zone/global rewrite; it will"+
+					" not take effect until the unsupported constraint is removed or full"+
+					" scoped NPTv6 support lands)")
+			return nil
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		// Scope only applies to NPTv6 rule-sets. A rule-set with NO nptv6-prefix
+		// rule is ordinary static NAT, whose interface/RI scope and source-address
+		// match ARE honored — leave it untouched.
+		hasNptv6 := false
+		for _, rule := range rs.Rules {
+			if rule != nil && rule.IsNPTv6 {
+				hasNptv6 = true
+				break
+			}
+		}
+		if !hasNptv6 {
+			continue
+		}
+
+		// Rule-set FromInterface scope. Reported before FromRoutingInstance and
+		// the per-rule source match for a deterministic first offender.
+		if rs.FromInterface != "" {
+			if err := emit(fmt.Sprintf(
+				"security nat static rule-set %q is an NPTv6 (nptv6-prefix) rule-set "+
+					"scoped `from interface %q`, but the NPTv6 dataplane honors only "+
+					"`from zone`; the interface constraint would be dropped and the "+
+					"prefix rewrite installed over a broader scope, translating traffic "+
+					"the interface scope excludes — remove the interface scope until "+
+					"scoped NPTv6 support lands (#5818)",
+				rs.Name, rs.FromInterface)); err != nil {
+				return nil, err
+			}
+		}
+		if rs.FromRoutingInstance != "" {
+			if err := emit(fmt.Sprintf(
+				"security nat static rule-set %q is an NPTv6 (nptv6-prefix) rule-set "+
+					"scoped `from routing-instance %q`, but the NPTv6 dataplane honors "+
+					"only `from zone`; the routing-instance constraint would be dropped "+
+					"and the prefix rewrite installed over a broader scope, translating "+
+					"traffic the routing-instance scope excludes — remove the routing-"+
+					"instance scope until scoped NPTv6 support lands (#5818)",
+				rs.Name, rs.FromRoutingInstance)); err != nil {
+				return nil, err
+			}
+		}
+
+		// Per-rule `match source-address`. Prefer the full bracket-list
+		// (SourceAddresses); fall back to the singular SourceAddress for an
+		// older typed config, mirroring buildNptv6Snapshots' fail-closed check.
+		for _, rule := range rs.Rules {
+			if rule == nil || !rule.IsNPTv6 {
+				continue
+			}
+			srcAddrs := append([]string(nil), rule.SourceAddresses...)
+			if len(srcAddrs) == 0 && rule.SourceAddress != "" {
+				srcAddrs = append(srcAddrs, rule.SourceAddress)
+			}
+			if len(srcAddrs) > 0 {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q is an NPTv6 (nptv6-prefix) "+
+						"rule carrying `match source-address %s`, but the NPTv6 dataplane "+
+						"honors only `from zone` and does not evaluate a source-address "+
+						"constraint; the source match would be dropped and the prefix "+
+						"rewrite applied to every source — remove the source-address match "+
+						"until scoped NPTv6 support lands (#5818)",
+					rs.Name, rule.Name, strings.Join(srcAddrs, ", "))); err != nil {
+					return nil, err
+				}
+			}
+			// Per-rule `match destination-port` (#5818 review residual): the port
+			// scope is schema-permitted and the compiler records it, but the NPTv6
+			// snapshot carries only from-zone + prefixes, so the port constraint is
+			// dropped and the rewrite applied to EVERY port — the same
+			// security-widening class as the source match. (The ordinary
+			// destination-port strict gate skips NPTv6 rules, so this is the only
+			// place that catches it.) MappedPort can never attach to an
+			// nptv6-prefix then-branch, so destination-port is the sole remaining
+			// reachable narrowing dimension.
+			if rule.MatchDestinationPort != 0 {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q is an NPTv6 (nptv6-prefix) "+
+						"rule carrying `match destination-port %d`, but the NPTv6 dataplane "+
+						"honors only `from zone` and does not evaluate a destination-port "+
+						"constraint; the port match would be dropped and the prefix rewrite "+
+						"applied to every port — remove the destination-port match until "+
+						"scoped NPTv6 support lands (#5818)",
+					rs.Name, rule.Name, rule.MatchDestinationPort)); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	return warnings, nil
+}
+
 // validateNAT64PrefixStrict is the #3886 strict-vs-lenient gate for a NAT64
 // rule-set's `prefix` (`security nat nat64 rule-set <r> prefix <p>`).
 //
