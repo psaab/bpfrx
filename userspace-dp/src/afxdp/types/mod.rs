@@ -156,6 +156,44 @@ pub(super) struct ForwardPacketMeta {
     pub(super) dscp: u8,
     pub(super) flow_src_port: u16,
     pub(super) flow_dst_port: u16,
+    // #5467: the shim-stamped L3 (src, dst) addresses, carried through from the
+    // wire `UserspaceDpMeta` so the flowless output-filter enforcement gate
+    // (`resolve_cos_tx_selection_internal`) can evaluate the interface `filter
+    // output` against a fragment / non-query-ICMP packet's own L3 tuple. Zeroed
+    // (unspecified) for a synthetic/test meta, which `l3_addrs()` reports as
+    // absent — leaving the flowless pass-through behavior unchanged.
+    pub(super) flow_src_addr: [u8; 16],
+    pub(super) flow_dst_addr: [u8; 16],
+}
+
+impl ForwardPacketMeta {
+    /// #5467: reconstruct the packet's L3 `(src, dst)` addresses from the
+    /// shim-stamped meta for the flowless output-filter enforcement gate.
+    /// Mirrors [`crate::afxdp::frame::l3_session_flow_from_meta`]: returns
+    /// `None` for a non-IP family or an unspecified address, in which case the
+    /// caller leaves the flowless (default-queue, no-output-filter)
+    /// pass-through behavior unchanged.
+    pub(super) fn l3_addrs(&self) -> Option<(IpAddr, IpAddr)> {
+        let (src_ip, dst_ip) = match self.addr_family as i32 {
+            libc::AF_INET => {
+                let src = self.flow_src_addr.get(..4)?;
+                let dst = self.flow_dst_addr.get(..4)?;
+                (
+                    IpAddr::V4(Ipv4Addr::new(src[0], src[1], src[2], src[3])),
+                    IpAddr::V4(Ipv4Addr::new(dst[0], dst[1], dst[2], dst[3])),
+                )
+            }
+            libc::AF_INET6 => (
+                IpAddr::V6(Ipv6Addr::from(self.flow_src_addr)),
+                IpAddr::V6(Ipv6Addr::from(self.flow_dst_addr)),
+            ),
+            _ => return None,
+        };
+        if src_ip.is_unspecified() || dst_ip.is_unspecified() {
+            return None;
+        }
+        Some((src_ip, dst_ip))
+    }
 }
 
 impl From<UserspaceDpMeta> for ForwardPacketMeta {
@@ -176,6 +214,8 @@ impl From<UserspaceDpMeta> for ForwardPacketMeta {
             dscp: meta.dscp,
             flow_src_port: meta.flow_src_port,
             flow_dst_port: meta.flow_dst_port,
+            flow_src_addr: meta.flow_src_addr,
+            flow_dst_addr: meta.flow_dst_addr,
         }
     }
 }
@@ -206,8 +246,8 @@ impl From<ForwardPacketMeta> for UserspaceDpMeta {
             reserved: 0,
             flow_src_port: meta.flow_src_port,
             flow_dst_port: meta.flow_dst_port,
-            flow_src_addr: [0; 16],
-            flow_dst_addr: [0; 16],
+            flow_src_addr: meta.flow_src_addr,
+            flow_dst_addr: meta.flow_dst_addr,
             config_generation: 0,
             fib_generation: 0,
             reserved2: 0,

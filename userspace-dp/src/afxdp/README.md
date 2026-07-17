@@ -389,6 +389,30 @@ sync.
     default policy (fail-closed drop) until the deferred
     fragment-association-cache stage of the #3291 plan carries the first
     fragment's verdict; tracked as the deferred fragment-association-cache stage of #3291.
+  - **#5467 — egress `filter output` on the flowless TX path:** the #3291 gate
+    above enforces the INGRESS input filter / PBR / zone policy on a flowless
+    packet, but the EGRESS interface `filter output` was evaluated only on the
+    flow-keyed TX-selection path (`resolve_cos_tx_selection_*`,
+    `afxdp/tx/cos_classify.rs`). A non-first fragment / non-query ICMP packet
+    reached that resolver with `flow_key = None` and hit an early return that
+    skipped output-filter evaluation entirely — so an egress
+    `then discard`/`reject`/`log` term matching such a packet was silently
+    bypassed (fail-OPEN). The flowless `None` arm now reconstructs the packet's
+    own L3 tuple from the shim-stamped meta (`ForwardPacketMeta::l3_addrs`,
+    ports forced to 0) and evaluates the output filter through the SAME entry
+    point the flow-keyed path uses (`interface_output_filter_needs_tx_eval` +
+    `evaluate_filter_ref_tx_selection_{,runtime_}counted`), collapsing
+    `drop`/`reject`/`filter_log` identically. Ports are 0, so a port-BEARING
+    output term never matches a fragment (no spurious drop — the #2357/#3290
+    guarantee is preserved); only an L3-only term
+    (`source-address`/`destination-address`/`protocol`/bare `then`) takes
+    effect, and with no matching term the packet still egresses (pass-through
+    unchanged). Queue / DSCP-rewrite selection is untouched — this gate ADDS
+    enforcement only. A flowless `then reject` is a SILENT drop (the fragment
+    has no L4 header to synthesize a reply from, #3615) — `forward_request`
+    keeps the reject reply gated on a real L4 flow — but the packet is still
+    dropped, and when a `then log` term matched, the filter-log event is
+    attributed via the L3-only flow (`frame::l3_session_flow_from_meta`).
   - **#5690 — generic embedded-ICMP NAT reversal on the flowless arm:** an
     inbound non-query ICMP error (Time-Exceeded, Dest-Unreachable, PTB,
     Parameter-Problem, Redirect) referencing a NAT'd flow is itself FLOWLESS
