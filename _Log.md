@@ -1,3 +1,38 @@
+## 2026-07-16 — #5805: per-destination ICMP/UDP flood sketches → token bucket
+
+- **Timestamp**: 2026-07-16 (fix/5805-per-dest-flood-tokenbucket)
+- **Action**: The #3607 token-bucket migration fixed the per-ZONE aggregate
+  ICMP/UDP flood gates but deliberately left the PRIMARY per-DESTINATION
+  sketches on `RateCounter`, which has the count-all / whole-second defect: a
+  destination sending exactly the configured threshold in one second is dropped
+  to ~0 in every subsequent second until a fully idle second (rejected packets
+  keep incrementing the window). So the primary Junos-compatible per-destination
+  ICMP/UDP flood limits did NOT implement the configured rate — a legitimate
+  at-threshold destination was starved.
+  Fix (pattern-extension of #3607 — reuse the proven `TokenBucket`, no new
+  mechanism): made the count-min `SynRateSketch` GENERIC over its per-cell
+  limiter via a new `SketchCell` trait (`RateCounter::increment` /
+  `TokenBucket::admit_is_over`). The SYN per-source/per-destination sketches keep
+  `RateCounter` cells (count-all is deliberate there — "admitted" activates SYN
+  cookies / the alarm); the ICMP/UDP per-destination flood sketches now use
+  `SynRateSketch<TokenBucket>` (`for_flood_dst`, keyed on `loop_now_ns`). A
+  sustained at-threshold destination is admitted STEADILY (token bucket refills
+  continuously), an over-threshold destination is still limited DOWN to the rate,
+  a sub-ms straddle sees at most `threshold` tokens (#2937 preserved), and live
+  threshold changes grant no unintended burst (capacity clamp, inherited from
+  `TokenBucket`). Both cells are 16 B, so the sketch memory bound (ROWS*cols*16)
+  is unchanged and the no-eviction / seeded-mapping / AND-min semantics are
+  preserved.
+- **File(s)**: `userspace-dp/src/screen/syn_rate.rs` (SketchCell trait, generic
+  sketch, `for_flood_dst`), `userspace-dp/src/screen/mod.rs` (flood sketch field
+  types → `SynRateSketch<TokenBucket>`, `for_flood_dst` alloc, `now_ns` in the
+  flood-drop helpers), `userspace-dp/src/screen/syn_rate_tests.rs` (+4
+  token-bucket sketch tests), `userspace-dp/src/screen/tests.rs` (+4 RED-on-revert
+  integration tests: ICMP/UDP/flowless sustained-at-threshold across 20s, IPv6
+  over-threshold-still-limited; rewrote the old RateCounter boundary test to the
+  token-bucket burst-bound-and-refill semantics),
+  `docs/syn-cookie-flood-protection.md`.
+
 ## 2026-07-16 — #5856: per-zone Time-Exceeded / Packet-Too-Big ICMP buckets
 
 - **Timestamp**: 2026-07-16 (fix/5856-per-zone-icmp-buckets)
