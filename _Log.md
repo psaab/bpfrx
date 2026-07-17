@@ -1,3 +1,51 @@
+## 2026-07-16 — #5818: reject unsupported-scope NPTv6 rules (fail-closed)
+
+- **Timestamp**: 2026-07-16 (fix/5818-nptv6-scope-reject)
+- **Action**: The config model retains the full static-NAT match scope for
+  NPTv6 (RFC 6296) rule-sets — a rule-set `from interface` / `from routing-
+  instance` scope (`StaticNATRuleSet.FromInterface`/`FromRoutingInstance`,
+  #3096) and a per-rule `match source-address`
+  (`StaticNATRule.SourceAddress`/`SourceAddresses`, #3435) — but NPTv6
+  compilation carries ONLY `from zone`: `buildNptv6Snapshots` emits name +
+  from-zone + the two prefixes, `Nptv6RuleSnapshot` has no interface/routing-
+  instance/source field, and the Rust helper matches on ingress/egress zone
+  only. An NPTv6 rule scoped to an interface, VRF, or client source prefix was
+  therefore installed as a broader zone/global prefix rewrite — traffic that
+  could NOT match the configured rule was still translated and routed (the
+  same security-widening class #5176 fixed for `from zone`, for the remaining
+  scope dimensions). Confirmed live on origin/master 7d2cd112f: the scoped
+  rule was accepted at strict commit and compiled to a from-zone-only (often
+  empty-zone = global) snapshot.
+  Fix (bounded fail-closed; mirrors #5819/#5859 patterns — full scoped support
+  deferred to /research):
+    - `pkg/config/compiler_validate_strict_nat.go`: `validateNPTv6ScopeStrict`
+      rejects an NPTv6 rule-set with `FromInterface`/`FromRoutingInstance` set,
+      or any NPTv6 rule with `match source-address`, naming the rule-set/rule +
+      the unsupported constraint. Non-NPTv6 static NAT (which DOES honor those
+      dimensions) is skipped; a from-zone-only / fully-unscoped NPTv6 rule is
+      unaffected.
+    - `pkg/config/compiler_tailgates.go`: dispatched after `validateNPTv6Strict`
+      using `opts.lenientNPTv6` — hard-reject on strict commit / commit-check,
+      downgrade to a warning on the tolerant load / peer-sync path (#1960
+      no-brick).
+    - `pkg/dataplane/userspace/nat_nptv6.go`: `buildNptv6Snapshots` independently
+      EXCLUDES a scope-carrying NPTv6 rule (from-interface/from-routing-instance
+      rule-set, or a rule with source-address), so a leniently-loaded /
+      peer-synced config installs NOTHING rather than shipping the widened
+      rewrite.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_tailgates.go, pkg/dataplane/userspace/nat_nptv6.go,
+  pkg/config/compiler_nptv6_scope_reject_5818_test.go (new),
+  pkg/dataplane/userspace/nptv6_scope_failclosed_5818_test.go (new),
+  docs/feature-coverage.md, docs/userspace-dataplane-gaps.md, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/config
+  ./pkg/dataplane/userspace` clean; `go test ./pkg/config` green (12.9s);
+  `go test ./pkg/dataplane/userspace` green (14.5s, TMPDIR=/tmp). New tests
+  RED-on-revert proven firsthand: neutralizing `validateNPTv6ScopeStrict`
+  breaks the strict-reject + lenient-warning tests; neutralizing the
+  `buildNptv6Snapshots` scope check ships the rule with empty `FromZone`
+  (global rewrite) and breaks the fail-closed test.
+
 ## 2026-07-16 — #5819: reject persistent-nat + port no-translation (fail-closed)
 
 - **Timestamp**: 2026-07-16 (fix/5819-persistent-nat-notranslation-reject)
