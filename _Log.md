@@ -52782,3 +52782,24 @@ top.
   the transient + #2477 tests stayed GREEN).
 - **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/slowpath_tests.rs,
   docs/xdp-io-uring-userspace-dataplane.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5161 /research (docs-only, no production code). Scoped the
+  interface-only ECMP width-1 starvation and produced a PLAN-READY plan-of-action
+  centered on a reactive cold-path bootstrap-probe (reuse the existing
+  try_enqueue_resolver rate-limited resolver; NOT the coordinator warmer, which
+  has no packet destination and cannot warm per-destination interface-only
+  members). Design resolves: sibling-enumeration seam (extract a shared
+  terminal-route-candidate helper, refactor over drift-prone re-walk),
+  per-destination width semantics, the on-link-vs-p2p gate (probe only if a
+  connected prefix on the member's ifindex covers the dst — prevents ARP-forever),
+  neg_neigh/throttle/RG interactions, host-vs-prefix scope, and the
+  only-on-unconverged-ECMP probe gate. Hostile Claude SMR (r1) folded in F1
+  (on-link applicability boundary — off-link "default via 2 uplinks" was never
+  fast-path-live, out of scope), F2 (full-forwarding-suite hard gate + isolated
+  code-motion commit for the extraction), F3 (test must inject a real resolver;
+  stock harness sets neighbor_resolver=None), F4 (double-walk optimization), F5
+  (per-flow stickiness). Codex/AGY deferred (infra-block pattern + non-merge plan
+  review) → SMR-only 1-of-3. Verdict PLAN-READY → recommend /engineer 5161.
+- **File(s)**: docs/research/5161-ecmp-interface-only/plan.md,
+  docs/research/5161-ecmp-interface-only/claude-smr-plan-r1.md
