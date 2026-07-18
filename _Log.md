@@ -52960,3 +52960,35 @@ top.
   the transient + #2477 tests stayed GREEN).
 - **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/slowpath_tests.rs,
   docs/xdp-io-uring-userspace-dataplane.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5159 — remove the 1280-byte MTU floor that bypassed TCP
+  segmentation for valid sub-1280 IPv4 egress MTUs. Three plain-forward sites
+  did `.unwrap_or_default().max(1280)`, flooring every plain-interface egress
+  MTU to the IPv6 minimum LINK MTU (1280 is NOT an IPv4 floor; IPv4 min is 68).
+  A valid egress MTU of 68-1279 was raised to 1280, so a non-DF TCP datagram
+  with L3 length in (real_mtu, 1280] was never flagged for segmentation and was
+  submitted OVERSIZE to AF_XDP TX (blackhole); the `if mtu==0` guard was dead
+  code. Fixed all three: (1) the admission gate forwarded_tcp_may_need_
+  segmentation (dispatch/mod.rs:1519) — removed the floor + added the now-live
+  `if mtu==0 return false` guard; (2) the TX local-owner fast-path builder
+  segment_forwarded_tcp_frames_into_prepared (tx/tcp_segmentation.rs:30) —
+  removed the floor (mtu==0 guard already present); (3) the copy-path twin
+  segment_forwarded_tcp_frames_from_frame plain branch (frame/tcp_segmentation.rs)
+  — removed the floor (mtu==0 guard already present; the tunnel branch already
+  had no floor). DF and is_any_fragment handling untouched (segmentation
+  preserves DF per-segment; fragments still never segmented). IPv6-minimum floor
+  belongs at interface config, not the per-packet segmenter. Added 3 fail-on-
+  revert tests: copy-builder (egress MTU 900, ~1100 L3 non-DF TCP -> >=2 segments
+  each <=900) — target-count-1 gate for the frame/ floor; predicate sub-1280
+  admission test; predicate unknown-MTU (mtu==0 -> no flag) guard test. Updated
+  tx/README.md. Full release suite 3999 passed / 0 failed. Fail-on-revert:
+  restoring the copy-builder floor -> only the copy-builder test RED (target-
+  count 1, verified); restoring the predicate floor+guard -> 2 predicate tests
+  RED.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/tx/tcp_segmentation.rs,
+  userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
+  userspace-dp/src/afxdp/frame/tests_segment_tcp.rs,
+  userspace-dp/src/afxdp/tx/dispatch/tests/segmentation.rs,
+  userspace-dp/src/afxdp/tx/README.md

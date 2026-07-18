@@ -265,6 +265,60 @@ fn forwarded_tcp_may_need_segmentation_uses_declared_len_not_backing() {
     );
 }
 
+/// #5159 RED-on-revert: the admission gate must use the ACTUAL egress MTU. A
+/// valid IPv4 egress MTU of 900 (below the wrongly-applied 1280 IPv6-link-MTU
+/// floor) with a declared 1100-byte datagram (in the (real_mtu, 1280]
+/// blackhole band) MUST be flagged for segmentation. Restoring the `.max(1280)`
+/// floor raises the MTU to 1280, so 1100 <= 1280 and the gate returns false —
+/// the datagram is submitted OVERSIZE to AF_XDP TX. RED.
+#[test]
+fn forwarded_tcp_may_need_segmentation_honors_sub_1280_ipv4_egress_mtu_5159() {
+    let forwarding = test_forwarding_with_egress_mtu(900);
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        ..UserspaceDpMeta::default()
+    };
+    let mut frame = vec![0u8; 14 + 1100];
+    frame[14] = 0x45; // IPv4, ihl=5
+    let total_len: u16 = 1100; // in (900, 1280]
+    frame[16] = (total_len >> 8) as u8;
+    frame[17] = total_len as u8;
+    frame[23] = PROTO_TCP;
+    assert!(
+        forwarded_tcp_may_need_segmentation(&frame, meta, &test_decision(), &forwarding),
+        "a 1100-byte datagram at a 900 egress MTU MUST be admitted for \
+         segmentation — 1280 is the IPv6 link minimum, not an IPv4 floor (#5159)"
+    );
+}
+
+/// #5159: with the floor removed, a decision whose egress interface is unknown
+/// (no egress entry → mtu resolves to 0) must NOT be flagged for segmentation —
+/// the now-live `mtu == 0` guard forwards it unchanged rather than segmenting
+/// on a guessed 1280. Removing that guard makes the gate flag every oversized
+/// frame with an unknown MTU (spurious `seg_needed_but_none`).
+#[test]
+fn forwarded_tcp_may_need_segmentation_unknown_egress_mtu_does_not_flag_5159() {
+    let forwarding = ForwardingState::default(); // no egress entries → mtu 0
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        ..UserspaceDpMeta::default()
+    };
+    let mut frame = vec![0u8; 14 + 1600];
+    frame[14] = 0x45;
+    let total_len: u16 = 1600;
+    frame[16] = (total_len >> 8) as u8;
+    frame[17] = total_len as u8;
+    frame[23] = PROTO_TCP;
+    assert!(
+        !forwarded_tcp_may_need_segmentation(&frame, meta, &test_decision(), &forwarding),
+        "an unknown egress MTU (0) must forward unchanged, not segment on a guessed 1280"
+    );
+}
+
 // #5148 RED-on-revert: a FIRST IPv4 fragment (MF=1, offset 0) carries a real
 // TCP header at the post-IP offset, so the pre-#5148 non-first-only gate
 // (`is_non_first_fragment`, mask 0x1FFF over the offset bits only) treated it

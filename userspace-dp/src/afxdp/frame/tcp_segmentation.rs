@@ -37,8 +37,9 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
         // floor a tunnel budget to 1280: a tunnel with a small outer MTU
         // has a genuinely smaller inner budget, and flooring it would
         // re-introduce the oversized-then-dropped blackhole this fix
-        // exists to prevent. The 1280 floor stays on the plain-forward
-        // path only (its historical semantics).
+        // exists to prevent. #5159: the plain-forward path below no longer
+        // floors either — the same oversized blackhole applies to a plain
+        // interface with a valid sub-1280 IPv4 MTU.
         let kind = forwarding
             .tunnel_endpoints
             .get(&decision.resolution.tunnel_endpoint_id)
@@ -56,13 +57,18 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
             Some(TunnelKind::Unknown) | None => 0,
         }
     } else {
+        // #5159: use the ACTUAL egress MTU. The prior `.max(1280)` floored a
+        // valid IPv4 MTU of 68-1279 to the IPv6-minimum LINK MTU (1280, NOT an
+        // IPv4 floor — IPv4 min is 68), so a non-DF TCP datagram whose L3 length
+        // fell in (real_mtu, 1280] was chunked to 1280 and still oversize. A
+        // 0 result (no egress entry / unknown MTU) fails closed via the
+        // `mtu == 0` guard below (previously dead under the floor).
         forwarding
             .egress
             .get(&decision.resolution.egress_ifindex)
             .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))
             .map(|egress| egress.mtu)
             .unwrap_or_default()
-            .max(1280)
     };
     if mtu == 0 {
         return None;
