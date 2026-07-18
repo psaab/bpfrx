@@ -1,3 +1,41 @@
+## 2026-07-18 — #5213: unify show-flow-session id with the RT_FLOW session id
+
+- **Timestamp**: 2026-07-18 (fix/5213-unify-session-id)
+- **Action**: PR #5211 (#4915) assigned a stable node-unique u64
+  `SessionEntry.session_id` and carried it on RT_FLOW (SESSION_CREATE/CLOSE),
+  but DEFERRED unifying it with `show security flow session`: the conntrack
+  mirror `publish_conntrack` hardcoded `session_id: 0`, so the Go render
+  (`cli_show_flow.go`) always fell back to the per-row iteration index — the
+  two surfaces showed different ids for the same session. Fix (Rust): threaded
+  the stable id into the conntrack mirror. Extracted pure, testable
+  `build_conntrack_value_v4`/`_v6` builders (map-write split out) that stamp
+  `session_id` (was `0`); added a `session_id: u64` param through
+  `publish_bpf_conntrack_entry`→`publish_v4/v6_session` and a
+  `SessionTable::session_id_for(&key)` accessor; the 3 live-session-create
+  publish sites in `poll_descriptor` resolve the id from the just-installed
+  table entry (`sessions.session_id_for(&flow.forward_key)`). `ConntrackCtx`
+  gained a `session_id` field for its (currently unexercised) mirror path. Fix
+  (Go): `cli_show_flow.go` already read `val.SessionID`; extracted
+  `flowSessionDisplayID(dpSessionID, ordinalIdx)` used by printV4/printV6 — it
+  renders the real dataplane id and keeps the ordinal fallback ONLY when the id
+  is 0 (absent/legacy). The dataplane id is now non-zero (minting starts at 1,
+  #4915), so the real id renders. Byte-offset parity already guaranteed
+  (`bpfSessionValue.SessionID` #6082 explicit-pad, size-asserted 136). Docs:
+  session/README.md + event_stream/README.md follow-up (2) marked RESOLVED.
+- **File(s)**: userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/mod.rs, userspace-dp/src/afxdp/bpf_map_tests.rs,
+  pkg/cli/cli_show_flow.go, pkg/cli/cli_show_flow_test.go,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/event_stream/README.md, _Log.md
+- **Validation**: Rust `cargo build` clean; new builder tests (v4+v6) GREEN
+  (`test result: ok. 2 passed`); RED-on-revert (`session_id: 0`) →
+  `2 failed` (`left: 0, right: <SID>`); bpf_map 17/0, session 176/0. Go
+  `go build ./...` clean; `TestFlowSessionDisplayIDMatchesDataplaneID` GREEN;
+  RED-on-revert (helper→always-ordinal) → FAIL (`id = 3, want ...974634`); full
+  pkg/cli suite GREEN. No smoke (observability id; unit-provable).
+
 ## 2026-07-18 — #6038: deflake TestWireUserspaceEventStreamCallbacks...WiresSessionAndFullResync (2s deadline races the wiring under load)
 
 - **Timestamp**: 2026-07-18 (fix/6038-eventstream-test-flake)

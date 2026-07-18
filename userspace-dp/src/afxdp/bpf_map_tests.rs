@@ -357,3 +357,61 @@ fn bpf_conntrack_key_port_byte_order() {
     assert_eq!(bytes[10], 0x01, "dst_port high byte");
     assert_eq!(bytes[11], 0xBB, "dst_port low byte");
 }
+
+// #5213 FAIL-ON-REVERT: the v4 conntrack mirror value must carry the STABLE
+// dataplane session id resolved from the session table
+// (`SessionEntry.session_id`, #4915) — NOT the `0` it hardcoded before.
+// `show security flow session` reads this exact slot
+// (`dataplane.SessionValue.SessionID`) and, when non-zero, renders it verbatim
+// so the id matches the one RT_FLOW emits (SESSION_CREATE/CLOSE) for the same
+// session. Reverting the builder to `session_id: 0` turns this RED (and the Go
+// render then falls back to the per-iteration ordinal — the #5213 mismatch).
+#[test]
+fn build_conntrack_value_stamps_stable_session_id_v4() {
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: 6,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 41086,
+        dst_port: 5201,
+    };
+    let decision = local_delivery_decision(0);
+    let metadata = synced_forward_metadata();
+    // worker 7 (high 16 bits) + per-worker counter 42 — a representative
+    // #4915-namespaced id that is clearly not 0 or a small ordinal.
+    const SID: u64 = (7u64 << 48) | 42;
+    let value = publish_conntrack::build_conntrack_value_v4(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, SID,
+    )
+    .expect("a v4 session must map to a v4 conntrack value");
+    assert_eq!(
+        value.session_id, SID,
+        "conntrack mirror must carry the stable session id, not 0"
+    );
+}
+
+// #5213 FAIL-ON-REVERT: v6 sibling of the above — the v6 conntrack mirror value
+// must likewise carry the stable session id.
+#[test]
+fn build_conntrack_value_stamps_stable_session_id_v6() {
+    let key = SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: 6,
+        src_ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x102)),
+        dst_ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200)),
+        src_port: 41086,
+        dst_port: 5201,
+    };
+    let decision = local_delivery_decision(0);
+    let metadata = synced_forward_metadata();
+    const SID: u64 = (3u64 << 48) | 7;
+    let value = publish_conntrack::build_conntrack_value_v6(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, SID,
+    )
+    .expect("a v6 session must map to a v6 conntrack value");
+    assert_eq!(
+        value.session_id, SID,
+        "v6 conntrack mirror must carry the stable session id, not 0"
+    );
+}

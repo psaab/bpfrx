@@ -889,13 +889,14 @@ peer-synced session is assigned a FRESH node-local id on import, so a session
 that opens on the primary and closes on the standby after a failover carries
 different ids on the two nodes. Making them identical needs the id on the
 session-sync wire (a second additive wire growth), like the #3395 P2
-policy-id-on-wire deferral above. (2) `show security flow session` still surfaces
-the `cli_show_flow.go` iteration-index fallback (`val.SessionID == 0`) because
-`publish_conntrack` was not unified onto the same `SessionEntry.session_id`;
-doing so (populating the conntrack-map `session_id` from the entry, and the
-`iter_with_idle`/refresh path) makes the live-session view show the SAME id the
-RT_FLOW frames carry. Both are additive and node-local-safe on top of this
-change.
+policy-id-on-wire deferral above. (2) RESOLVED in #5213: `show security flow
+session` now shows the SAME id the RT_FLOW frames carry. `publish_conntrack`
+(`build_conntrack_value_v4`/`_v6`) stamps the conntrack-map `session_id` from
+`SessionTable::session_id_for(&forward_key)` at each live-session-create publish
+site, and `cli_show_flow.go` renders `val.SessionID` (via `flowSessionDisplayID`),
+keeping the `cli_show_flow.go` iteration-index fallback ONLY when
+`val.SessionID == 0` (an absent/legacy id). Additive and node-local-safe.
+Follow-up (1) above (cross-HA-node id IDENTITY) is still open.
 
 ## Per-IP session-limit lifecycle (#2134; #3122 peer-synced fix; #2128 leak-fix preserved)
 
