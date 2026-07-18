@@ -1,3 +1,33 @@
+## 2026-07-18 — #6103: deterministic-fix event_stream stalled-consumer backpressure test (host socket-buffer dependency)
+
+- **Timestamp**: 2026-07-18 (fix/6103-eventstream)
+- **Action**: `event_stream::tests::backpressure::stalled_consumer_does_not_
+  grow_backlog_unbounded_end_to_end` failed 10/10 on pristine origin/master
+  on this host. Root cause (confirmed, not guessed): the test wedges an
+  AF_UNIX reader so `write()` returns `WouldBlock` and the I/O thread's
+  `write_buf` backs up to the 16 MiB `WRITE_BACKLOG_MAX_BYTES` cap. But the
+  test only pumps `3 × 16 MiB ≈ 48 MiB` of frames, and this fleet tunes
+  `net.core.{r,w}mem_default = 67108864` (64 MiB), so a wedged AF_UNIX
+  socketpair absorbs ~53 MiB before `WouldBlock` (measured) — MORE than the
+  pump — so `write_buf` never accumulates, the cap is never hit,
+  `frames_write_stalled` stays 0, and the `> 0` assertion fails. Instrumented
+  run confirmed `sent_ok=3.05M`, `frames_dropped=97k`, `frames_write_stalled=0`.
+  This is a host-sysctl-dependent deterministic failure of the TEST's hidden
+  assumption (small default socket buffer), NOT a product backpressure
+  regression — the product cap works (proven by the 4 unit-level backpressure
+  tests and by fail-on-revert below).
+- **Fix**: shrink both ends of the test socketpair (`SO_SNDBUF` on the writer,
+  `SO_RCVBUF` on the reader) to 64 KiB via `libc::setsockopt` before wedging,
+  so a non-reading peer backs up after ~108 KiB regardless of host tuning.
+  Test-only change; product code untouched.
+- **Validation**: 10/10 green alone (0.34 s each, was 5.5 s failing); full
+  `event_stream::` module 85/85 in-suite; fail-on-revert — disabling the
+  `write_buf.len() >= WRITE_BACKLOG_MAX_BYTES` cap makes the test FAIL again
+  (`must trip the backlog cap`, bounded ~48 MiB write_buf, no OOM).
+- **Docs**: no change needed — `event_stream/README.md` documents the PRODUCT
+  cap semantics, which this test-determinism fix does not alter.
+- **File(s)**: userspace-dp/src/event_stream/tests/backpressure.rs, _Log.md
+
 ## 2026-07-18 — #6103: regen stale wire_invariant fixture (missing #5623/#5625 nat64 fields)
 
 - **Timestamp**: 2026-07-18 03:53 PDT (fix/6103-wire-fixture)
