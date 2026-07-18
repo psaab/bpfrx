@@ -78,7 +78,16 @@ Port mirroring now has snapshot/wire plumbing plus a bounded runtime slice
 that samples and queues discardable full-L2 mirror clones with drop counters.
 Runtime coverage includes the pending-forward path, self-target flow-cache
 mirror surface, deferred neighbor-resolution retry path, CoS-bound reserve
-handling, and mirror-specific counter attribution. The
+handling, and mirror-specific counter attribution. **#5167: both branches of
+`enqueue_sampled_mirror_clone` (`mirror/fast_path.rs`) run the worker-local
+sampler (`mirror_sample_allows`) BEFORE reserving the target clone queue. The
+cross-worker (to-live) branch previously reserved first
+(`admit_mirror_clone_to_live`, a true-shared AcqRel CAS on the target's
+`pending_tx_admitted`, #4096) and sampled second, so acknowledged cross-core
+true-sharing scaled with the FULL unsampled ingress rate O(PPS) instead of the
+sample rate O(PPS/R) and sampling could not bound clone cost. Sample-first means
+a non-sampled packet reserves, copies, and reports clone-queue pressure for
+NOTHING it will not send. The
 `deriveUserspaceCapabilities()` gate has been removed; #1376 is closed for the
 feature-gap audit, and the #1477 final-validation artifact set is closed.
 Any further mirror-fidelity and pressure-survival work is production hardening,
