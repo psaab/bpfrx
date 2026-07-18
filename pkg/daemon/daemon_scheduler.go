@@ -297,3 +297,24 @@ func (d *Daemon) SchedulerRepublishStaleSeconds() float64 {
 	}
 	return time.Duration(age).Seconds()
 }
+
+// SchedulerRepublishFailClosed reports whether the current scheduler-republish
+// failure streak has persisted past scheduler.RepublishFailClosedAge, at which
+// point the scheduler escalates from the #3780 silent retry to FAIL-CLOSED:
+// it forces scheduled policies to the inactive (deny) disposition and emits a
+// one-time alarm so a scheduled permit stops forwarding past its window close
+// instead of relying on an eventual republish recovery (#5669). Computed from
+// the same failure-streak start the stale-seconds gauge uses and the single
+// shared bound, so the alarm and the scheduler's own latch agree. Lock-free;
+// safe for the metrics collector goroutine.
+func (d *Daemon) SchedulerRepublishFailClosed() bool {
+	if !d.schedulerRepublishFailing.Load() {
+		return false
+	}
+	first := d.schedulerRepublishFirstFailNanos.Load()
+	if first == 0 {
+		return false
+	}
+	age := time.Now().UnixNano() - first
+	return age >= int64(scheduler.RepublishFailClosedAge)
+}

@@ -204,6 +204,13 @@ type Config struct {
 	// xpf_scheduler_republish_stale_seconds gauge. Optional; if nil, the
 	// gauge is not emitted.
 	SchedulerRepublishStaleSecondsFn func() float64
+	// SchedulerRepublishFailClosedFn reports whether the scheduler-republish
+	// failure streak has persisted past the bounded age and the scheduler has
+	// escalated to fail-closed — forcing scheduled policies inactive (deny) so
+	// a permit stops forwarding past its window close (#5669). Backs the
+	// xpf_scheduler_republish_fail_closed gauge (0/1, no labels). Optional; if
+	// nil, the gauge is not emitted.
+	SchedulerRepublishFailClosedFn func() bool
 	// FeedsFn surfaces live dynamic-address feed status for the
 	// xpf_feed_seconds_since_last_success / xpf_feed_stale gauges (#2050).
 	// A feed that has never fetched successfully, or whose last-good
@@ -326,6 +333,7 @@ type Server struct {
 	ipsecRebindPendingFn             func() bool
 	schedulerRepublishFailedFn       func() bool
 	schedulerRepublishStaleSecondsFn func() float64
+	schedulerRepublishFailClosedFn   func() bool
 	ipmonStatusFn                    func() []ipmon.PolicyStatus
 	ipmonActuationFailuresFn         func() uint64
 	eventActionStatsFn               func() eventengine.Stats
@@ -411,6 +419,7 @@ func NewServer(cfg Config) *Server {
 		ipsecRebindPendingFn:             cfg.IPsecRebindPendingFn,
 		schedulerRepublishFailedFn:       cfg.SchedulerRepublishFailedFn,
 		schedulerRepublishStaleSecondsFn: cfg.SchedulerRepublishStaleSecondsFn,
+		schedulerRepublishFailClosedFn:   cfg.SchedulerRepublishFailClosedFn,
 		ipmonStatusFn:                    cfg.IPMonStatusFn,
 		ipmonActuationFailuresFn:         cfg.IPMonActuationFailuresFn,
 		eventActionStatsFn:               cfg.EventActionStatsFn,
