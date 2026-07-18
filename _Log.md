@@ -52541,3 +52541,29 @@ top.
   userspace-dp/src/afxdp/tx/dispatch/slow_path.rs, userspace-dp/src/afxdp/mod.rs,
   userspace-dp/src/afxdp/coordinator/status_tests.rs,
   userspace-dp/src/afxdp/coordinator/README.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #6075 (#5147/#6074 follow-up) — added an INDEPENDENT fail-on-revert
+  test pinning site (2), the poll_descriptor pre-resolve `neighbor_mac_epoch`
+  SNAPSHOT site (`epoch_for(&(outer_neighbor_ifindex(.., None, ..), nh))`). The
+  existing site-(1) test (`tunnel_flow_cache_keys_mac_change_shard_on_outer_
+  neighbor_not_logical_ifindex`) injects `neighbor_mac_epoch = 0` directly, so it
+  does NOT bind the poll snapshot; reverting only site (2) to the logical
+  `egress_ifindex` left it green. New test
+  `poll_descriptor_stamps_neighbor_mac_epoch_from_outer_neighbor_shard_not_
+  logical_6075` (tests_txn_flow_cache.rs) drives the REAL poll path
+  (`poll_binding_process_descriptor`) for a native-GRE transit forward with the
+  OUTER transport neighbor's shard MAC-change epoch pre-bumped in a caller-owned
+  dynamic-neighbor map, then asserts the seeded flow-cache entry's stamped
+  `neighbor_mac_epoch` equals the OUTER shard's snapshot epoch (not the logical
+  tunnel shard's). Added test-support harness `txn_run_descriptor_with_neighbors`
+  (accepts a caller-provided `dynamic_neighbors` so a test can seed shard epochs
+  before the poll's pre-resolve snapshot). Reverting site (2) -> new test RED
+  (left 0, right 1), site-(1) test stays GREEN (isolation). WireGuard NOT covered:
+  the build zeroes a WG endpoint's outer transport destination, so a WG transit
+  resolution NoRoutes at admit time and never seeds a ForwardCandidate flow-cache
+  entry; the site-(2) stamp path is native-GRE territory. No production change
+  (test-coverage only); no docs change needed (contract already documented in the
+  #6074 flow_cache.rs / poll_descriptor comments + site-(1) test).
+- **File(s)**: userspace-dp/src/afxdp/tests_txn_flow_cache.rs,
+  userspace-dp/src/afxdp/tests_support.rs
