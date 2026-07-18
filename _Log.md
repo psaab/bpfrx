@@ -1,3 +1,145 @@
+## 2026-07-18 — #5160: move redirect-sample sequence off the shared destination atomic to producer-local TLS
+
+- **Timestamp**: 2026-07-18 (fix/5160-redirect-sample-local)
+- **Action**: `enqueue_tx_owned` (umem/mod.rs) did an unconditional
+  `fetch_add(1, Relaxed)` on `owner_profile_peer.redirect_sample_counter`, a
+  SHARED atomic on the destination `BindingLiveState` (Arc). Every producer
+  worker redirecting into one owner binding paid a contended RMW on that
+  cacheline for EVERY MPSC enqueue — a 1-in-256 sampler imposing a 1-in-1
+  shared atomic, a SECOND contended sequencing line on top of the inbox head
+  CAS (the in-code "producer-local" comment was inaccurate: the counter was
+  seeded per-binding/shared). Moved the sample SEQUENCE to a producer-local
+  thread-local `REDIRECT_SAMPLE_SEQ: Cell<u64>` via a `next_redirect_sample()`
+  helper — each producer worker (its own OS thread) advances its OWN counter
+  with a plain TLS load/store, no atomic, no shared cacheline. Removed
+  `redirect_sample_counter` from `OwnerProfilePeerWrites` (profile.rs) and the
+  test-only `new_seeded` seeder (production always used `new()`, so the
+  per-worker seed never actually ran). The destination's aggregate histogram
+  `redirect_acquire_hist` STAYS shared and is written ONLY on the sampled op —
+  unchanged. Sample RATE is preserved: each producer samples
+  1-in-(REDIRECT_SAMPLE_MASK+1) of its own enqueues, so each destination's
+  histogram still receives ~1/256 of the enqueues into it (identical aggregate
+  in expectation). Docs (profile.rs struct, umem field + inline comments)
+  corrected off the stale "producer-local"→now-actually-TLS wording.
+- **File(s)**: userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/profile.rs,
+  userspace-dp/src/afxdp/umem/tests/latency_buckets.rs, _Log.md
+- **Validation**: `cargo build` clean. New fail-on-revert test
+  `redirect_sample_sequence_is_producer_local_not_destination_shared`: 4
+  producer threads each do ONE enqueue into the SAME destination → 4 samples
+  (each fresh thread's TLS starts at 0). RED-on-revert (swap TLS → shared
+  atomic): `test result: FAILED. 0 passed; 1 failed` — `left: 1, right: 4`.
+  Restored GREEN: umem 42/0 (incl. the retained rate test
+  `redirect_acquire_hist_samples_one_in_mask_plus_one`, still exactly 1 sample
+  per 256 consecutive enqueues, phase-independent); mirror 25/0, cos 300/0,
+  tx 112/0. SMOKE: assessed NOT warranted — behavior is sample-equivalent (no
+  forwarding/correctness change; the MPSC push path is byte-identical), and the
+  perf win (one fewer contended atomic per enqueue) is sub-ns and not reliably
+  measurable in a line-rate cluster smoke; the issue's suggested 2/4/8-producer
+  criterion microbench is a reasonable follow-up but not a merge gate.
+
+## 2026-07-18 — #5689 (dataplane/nat): ordinary NAT/NPTv6 non-first fragment translation
+- **Timestamp**: 2026-07-18 (fix/5689-nat-frag-assoc)
+- **Action**: A flowless non-first fragment of an ORDINARY same-family NAT /
+  NPTv6 flow resolved `NatDecision::default()` on the flowless arm of
+  `afxdp/poll_descriptor/mod.rs` and was forwarded UNTRANSLATED — leaking the
+  internal source (SNAT/NPTv6) or the pre-DNAT destination. Only NAT64 had a
+  fragment association (`Nat64FragAssoc`, #2562). Fix mirrors that precedent
+  for ordinary NAT: the `Nat64FragAssoc` cache is already generic (family-
+  agnostic port-free key + full `SessionDecision` value), so a first fragment
+  of a SNAT/DNAT/static-NAT/NPTv6 flow now installs an association at the cold-
+  path forward-commit point (`nat_install_forward_fragment_assoc`, gated on a
+  same-family address rewrite + ForwardCandidate + resolved neighbor + a
+  first-fragment key), and its non-first fragments consult it on the flowless
+  arm (`nat_consult_forward_fragment_assoc`, chained after the NAT64 consult,
+  for BOTH IPv4 and IPv6). A hit inherits the first fragment's permitted verdict
+  + egress and the existing forward-build path applies an ADDRESS-ONLY L3
+  rewrite (`apply_nat_ipv4`/`apply_nat_ipv6` already skip the L4 checksum + port
+  rewrite for a non-first fragment, #1852). The cached decision's `nat64` flag
+  keeps NAT64 and ordinary entries from aliasing; the shared `build_generation`
+  guard (advances on every `snapshot.generation` commit) invalidates a stale
+  ordinary-NAT association after a SNAT/DNAT rule change. Forward-only, matching
+  the NAT64 forward-first wiring (reverse-reply is a deferred increment). No new
+  cache type, state machinery, or NAT-decision-path changes — it reuses the
+  existing generic cache. IMPORTANT ASYMMETRY (not a "mechanical mirror" on the
+  miss path): a consult MISS (reorder / TTL straddle / eviction / generation bump
+  / first-fragment-didn't-forward) forwards the permitted NAT'd non-first fragment
+  UNTRANSLATED — the leak PERSISTS on those edges, fail-OPEN, the OPPOSITE of the
+  NAT64 sibling's fail-CLOSED no-association drop (#4617). Deliberate: the flowless
+  arm cannot distinguish a NAT'd-miss from a legitimate no-NAT fragmented flow, so
+  a blind drop would blackhole ordinary un-NAT'd fragmented traffic. Strictly
+  narrows the pre-existing leak (not a regression); the flowless miss path still
+  runs policy (a denied flow's fragments still drop — the residual is a
+  permitted-flow source info-leak only). A fail-closed miss (needs a NAT'd-miss
+  discriminator) is a tracked follow-up (#6122; see the
+  `nat_consult_forward_fragment_assoc` doc-comment).
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs (two helpers +
+  flowless consult wiring + cold-path install), userspace-dp/src/afxdp/tests_fragment.rs
+  (fail-on-revert test), userspace-dp/src/FEATURES.md (nat64.rs #5689 note).
+- **Validation**: `cargo build` clean; `cargo test --bin xpf-userspace-dp
+  fragment` (133) + `nat64` (179) GREEN; new
+  `flowless_non_first_fragment_inherits_ordinary_snat_translation_5689` 5x
+  no-flake. Fail-on-revert proven both ways: neutralizing the CONSULT wiring →
+  RED (non-first fragment resolves `nat_applied_none`, not `nat_applied_snat`);
+  neutralizing the INSTALL wiring → RED (`frag_assoc.len() != 1`). Two
+  pre-existing failures on the branch base (`protocol::wire_invariant_default_specimens`
+  = stale fixture missing #5623/#5625 fields; `event_stream backpressure
+  end-to-end`) confirmed present with my changes stashed — not caused by #5689.
+## 2026-07-18 — #5174: NAT64 MissingNeighbor cold path fail-closed (bounded fix)
+
+- **Timestamp**: 2026-07-18 (fix/5174-nat64-missingneighbor)
+- **Scope**: SCOPED first (team-approved). The team-scoped full parity (seed a
+  NAT64 decision + replay applies NAT64 translation) BALLOONS — it needs NAT64
+  classify+alloc hoisted into the ~1000-line MissingNeighbor arm, a HA-synced
+  `MissingNeighborSeed` carrying `nat64_reverse` (BIB), a NEW cross-family replay
+  branch in neighbor_dispatch (`build_nat64_forwarded_frame`), and a
+  size-guarded `PendingNeighPacket` (`==264`) grown — 4 files + wire/HA. Filed
+  separately for /research. Shipped the BOUNDED fail-closed alternative here.
+- **Action**: NAT64 classification + source allocation are gated inside the
+  `if disposition==ForwardCandidate` + `Permit` branch of the session-miss path
+  (poll_descriptor `decision.nat = Nat64State::forward_decision`, ~:2822), so a
+  NAT64 flow whose extracted-IPv4 next-hop is UNRESOLVED reaches the
+  MissingNeighbor arm (the `else` of that `if`, arm ~:4598-5595) with
+  `decision.nat` default (rewrite_dst None, nat64 false). It evaluated policy on
+  the SYNTHETIC IPv6 dst (Harm A — policy divergence; a v4-dst rule matches the
+  synthetic v6 dst as match-any) and seeded a SNAT-only `MissingNeighborSeed`
+  (HA-synced) + buffered the IPv6 frame, which the same-family replay
+  (`rewrite_forwarded_frame_in_place`, MAC/VLAN/NAT only) TXes UNTRANSLATED to
+  the IPv4 gateway (Harm B — untranslated forward + poisoned session).
+  Bounded fix, ALL in the MissingNeighbor arm:
+  1. Re-classify NAT64 at the arm top (`classify_ipv6_dest(flow.dst_ip)` →
+     `nat64_dst_v4`); the pre-routing classify already enforced source
+     eligibility/hairpin, so a cheap dest-only lookup suffices.
+  2. Evaluate the arm's policy on the extracted V4 dst when `nat64_dst_v4` is
+     Some (the #2358 cross-family (V6 src, V4 dst) tuple) — fixes Harm A.
+  3. For a PERMITTED NAT64 flow: let the existing kernel ARP/NDP probe fire
+     (`trigger_kernel_arp_probe`), then recycle+`continue` BEFORE the seed and
+     the pending_neigh buffer — NO untranslated seed/buffer/replay, NO broken
+     HA session (fixes Harm B + the poisoning). Counted as a new debug counter
+     `DebugPollCounters.nat64_missing_neigh_drop`. The flow recovers via the
+     ForwardCandidate path once the neighbor resolves (cold-start: first
+     packet(s) drop, TCP retransmits). Non-NAT64 and NAT64-deny paths untouched.
+- **Tests (fail-on-revert, deterministic; tests_nat64_tunnel.rs)**:
+  - `nat64_missing_neighbor_fail_closed_drop_5174` (Harm B): permitted NAT64
+    flow (permit `8.8.8.8/32`, default-deny) + unresolved gw → asserts
+    `nat64_missing_neigh_drop==1`, `sessions.len()==0`, `pending_neigh` empty.
+    Neutralize the divert → seeds+buffers → RED.
+  - `nat64_missing_neighbor_denied_no_fail_closed_drop_5174` (Harm A): NAT64
+    flow to 8.8.8.8 under a `9.9.9.9/32` permit → denied on the correct V4
+    tuple. Neutralize the policy-tuple fix → the synthetic-IPv6 eval matches the
+    v4-dst rule as match-any → WRONGLY PERMITTED → RED.
+  - `non_nat64_missing_neighbor_still_buffers_5174` (control): plain v4
+    MissingNeighbor still seeds/buffers, counter 0 (unregressed).
+  - GREEN: 3 new pass; FULL `cargo test` (userspace-dp) = 3994 passed, 0 failed.
+    RED-on-revert proven for BOTH harms (divert → primary RED; policy-tuple →
+    deny-control RED). Build clean.
+- **Smoke**: a loss-cluster NAT64 smoke would be warranted-if-configured
+  (forwarding + neighbor-resolution behavior), but NAT64 may not be configured
+  on the loss cluster and the fix is fully unit-proven (real descriptor path +
+  forced MissingNeighbor). FLAGGED, not assumed.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/tests_nat64_tunnel.rs, docs/feature-coverage.md
 ## 2026-07-18 — #5168: widen WG replay window to the reference 8128-counter ring
 
 - **Timestamp**: 2026-07-18 (fix/5168-wg-replay-window)

@@ -161,25 +161,48 @@ fn redirect_acquire_hist_samples_one_in_mask_plus_one() {
     );
 }
 
+// #5160 FAIL-ON-REVERT: the redirect sample sequence must be PRODUCER-LOCAL
+// (thread-local), NOT a shared atomic on the destination BindingLiveState.
+//
+// Proof: PRODUCERS independent producer threads each do exactly ONE enqueue
+// into the SAME destination binding. With a producer-local sequence, every
+// fresh thread's counter starts at 0, so its first (and only) enqueue is the
+// sampled 1-in-(MASK+1) op — PRODUCERS samples land in the destination
+// histogram. With the pre-#5160 SHARED counter, the PRODUCERS enqueues bump ONE
+// counter (0..PRODUCERS-1) so only the first is sampled — 1 sample. Asserting
+// the total == PRODUCERS goes RED if the shared per-destination RMW is
+// restored (it would read 1). PRODUCERS < REDIRECT_SAMPLE_MASK+1 so the shared
+// counter would not wrap into a second sample.
 #[test]
-fn new_seeded_initialises_redirect_sample_counter_from_worker_id() {
-    // #709: per-worker seeding prevents lockstep sampling. Two
-    // workers with different ids must start at different positions
-    // in the 1-in-(MASK+1) cycle. Seed with 0 and 1 and verify
-    // both new_seeded instances hold distinct initial counter
-    // values.
-    let a = BindingLiveState::new_seeded(0);
-    let b = BindingLiveState::new_seeded(1);
+fn redirect_sample_sequence_is_producer_local_not_destination_shared() {
+    const PRODUCERS: usize = 4;
+    let live = std::sync::Arc::new(BindingLiveState::new());
+    live.max_pending_tx.store(8192, Ordering::Relaxed);
+    let handles: Vec<_> = (0..PRODUCERS)
+        .map(|p| {
+            let live = std::sync::Arc::clone(&live);
+            std::thread::spawn(move || {
+                // Each fresh thread's REDIRECT_SAMPLE_SEQ starts at 0, so this
+                // single enqueue is the sampled op for that producer.
+                live.enqueue_tx_owned(test_tx_request_for_inbox(p as u8))
+                    .expect("push");
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("producer thread join");
+    }
+    let total_samples: u64 = live
+        .owner_profile_peer
+        .redirect_acquire_hist
+        .iter()
+        .map(|slot| slot.load(Ordering::Relaxed))
+        .sum();
     assert_eq!(
-        a.owner_profile_peer
-            .redirect_sample_counter
-            .load(Ordering::Relaxed),
-        0
-    );
-    assert_eq!(
-        b.owner_profile_peer
-            .redirect_sample_counter
-            .load(Ordering::Relaxed),
-        1
+        total_samples, PRODUCERS as u64,
+        "each producer thread must sample its OWN first enqueue \
+         (producer-local sequence); a shared destination counter would sample \
+         only 1-in-{} across all producers",
+        REDIRECT_SAMPLE_MASK + 1
     );
 }
