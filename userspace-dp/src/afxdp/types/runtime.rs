@@ -438,8 +438,8 @@ pub(in crate::afxdp) struct WorkerContext<'a> {
     pub(in crate::afxdp) event_stream: Option<&'a crate::event_stream::EventStreamWorkerHandle>,
     pub(in crate::afxdp) local_tunnel_deliveries:
         &'a Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
-    pub(in crate::afxdp) recent_exceptions: &'a Arc<Mutex<VecDeque<ExceptionStatus>>>,
-    pub(in crate::afxdp) last_resolution: &'a Arc<Mutex<Option<PacketResolution>>>,
+    pub(in crate::afxdp) recent_exceptions: &'a Arc<Mutex<ExceptionEventRing>>,
+    pub(in crate::afxdp) last_resolution: &'a Arc<Mutex<Option<ResolutionEvent>>>,
     pub(in crate::afxdp) peer_worker_commands: &'a [Arc<Mutex<VecDeque<WorkerCommand>>>],
     pub(in crate::afxdp) dnat_fds: &'a DnatTableFds,
     pub(in crate::afxdp) rg_epochs: &'a [AtomicU32; MAX_RG_EPOCHS],

@@ -266,9 +266,23 @@ pub(super) fn bring_up_workers(
             .get(&worker_id)
             .cloned()
             .unwrap_or_else(|| Arc::new(Mutex::new(VecDeque::new())));
-        let recent_exceptions = coord.recent_exceptions.clone();
+        // #5289: give each worker its OWN exception ring + last-resolution
+        // slot (registered in the coordinator so the ~1 Hz status thread can
+        // drain them). This replaces the shared process-global
+        // `recent_exceptions`/`last_resolution` mutexes whose cross-worker
+        // contention was the DoS. The per-worker mutex is locked only by its
+        // owning worker plus the status reader — no cross-worker false
+        // sharing. Paired with the `.remove(&worker_id)` on the spawn-Err arm
+        // and the teardown clear.
+        let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
+        coord
+            .worker_exception_rings
+            .insert(worker_id, recent_exceptions.clone());
+        let last_resolution = Arc::new(Mutex::new(None));
+        coord
+            .worker_last_resolution
+            .insert(worker_id, last_resolution.clone());
         let recent_session_deltas = coord.recent_session_deltas.clone();
-        let last_resolution = coord.last_resolution.clone();
         let slow_path = coord.slow_path.clone();
         let local_tunnel_deliveries = coord.local_tunnel_deliveries.clone();
         let shared_forwarding = coord.ha.forwarding.clone();
@@ -392,14 +406,15 @@ pub(super) fn bring_up_workers(
                 // spawn; drop it now so a snapshot reader doesn't
                 // see a phantom slot for a worker that never ran.
                 coord.worker_panics.remove(&worker_id);
+                // #5289: the per-worker ring/last-resolution slots were
+                // inserted before spawn; drop them so a status reader does
+                // not see phantom slots for a worker that never ran.
+                coord.worker_exception_rings.remove(&worker_id);
+                coord.worker_last_resolution.remove(&worker_id);
                 if let Ok(mut recent) = coord.recent_exceptions.lock() {
                     push_recent_exception(
                         &mut recent,
-                        ExceptionStatus {
-                            timestamp: Utc::now(),
-                            reason: format!("spawn_worker_failed:{worker_id}:{err}"),
-                            ..ExceptionStatus::default()
-                        },
+                        control_notice_event("", format!("spawn_worker_failed:{worker_id}:{err}")),
                     );
                 }
             }

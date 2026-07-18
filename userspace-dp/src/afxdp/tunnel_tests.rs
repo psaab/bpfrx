@@ -180,7 +180,7 @@ fn endpoint_attachment_valid_rejects_mode_flip() {
 fn drain_local_tunnel_deliveries_observes_stop_under_busy_producer() {
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
     let stop = Arc::new(AtomicBool::new(true));
-    let recent = Arc::new(Mutex::new(VecDeque::new()));
+    let recent = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let producer_quit = Arc::new(AtomicBool::new(false));
     let producer_quit_clone = producer_quit.clone();
     let producer = thread::spawn(move || {
@@ -219,7 +219,7 @@ fn drain_local_tunnel_deliveries_drains_then_returns_when_not_stopped() {
     tx.try_send(vec![1, 2, 3]).expect("queued");
     tx.try_send(vec![4, 5]).expect("queued");
     let stop = Arc::new(AtomicBool::new(false));
-    let recent = Arc::new(Mutex::new(VecDeque::new()));
+    let recent = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let mut sink: Vec<u8> = Vec::new();
     let outcome = {
         let mut write_packet = |buf: &[u8]| {
@@ -265,7 +265,7 @@ fn drain_survives_einval_write_and_thread_keeps_draining() {
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
     tx.try_send(vec![0u8, 0x50, 0x86, 0xdd]).expect("queued");
     let stop = Arc::new(AtomicBool::new(false));
-    let recent = Arc::new(Mutex::new(VecDeque::new()));
+    let recent = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let outcome =
         drain_local_tunnel_deliveries(&mut einval_writer, &rx, &stop, "gre1881einval", &recent);
     assert!(
@@ -303,7 +303,7 @@ fn drain_gre_delivery_calls_write_seam_once_with_whole_packet() {
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
     tx.try_send(vec![0xAAu8; 100]).expect("queued");
     let stop = Arc::new(AtomicBool::new(false));
-    let recent = Arc::new(Mutex::new(VecDeque::new()));
+    let recent = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let outcome =
         drain_local_tunnel_deliveries(&mut short_writer, &rx, &stop, "gre2438short", &recent);
     assert!(

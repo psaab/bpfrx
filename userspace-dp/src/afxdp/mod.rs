@@ -1128,13 +1128,10 @@ use neighbor_dispatch::{learn_dynamic_neighbor, pair_write_needed};
 // afxdp/disposition.rs.
 mod disposition;
 use disposition::{
-    DispositionCounters, record_disposition, record_exception, record_forwarding_disposition,
+    DispositionCounters, ExceptionEvent, ExceptionEventRing, ResolutionEvent, control_notice_event,
+    record_disposition, record_exception, record_exception_owned, record_forwarding_disposition,
     record_source_nat_exception,
 };
-// `update_last_resolution` is only referenced by tests in afxdp/tests.rs;
-// gate its import behind cfg(test).
-#[cfg(test)]
-use disposition::update_last_resolution;
 
 // Issue 67.4: forward-request builders extracted into
 // afxdp/forward_request.rs.

@@ -27,7 +27,7 @@ pub(in crate::afxdp) fn handle_forward_build_failure(
     live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     dbg: &mut DebugPollCounters,
     _target_ifindex: i32,
     packet_length: u32,
@@ -111,7 +111,7 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path(
     desc: XdpDesc,
     meta: impl Into<UserspaceDpMeta>,
     decision: SessionDecision,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     forwarding: &ForwardingState,
 ) {
     let meta = meta.into();
@@ -191,7 +191,7 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
     frame: &[u8],
     meta: impl Into<UserspaceDpMeta>,
     decision: SessionDecision,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     reason: &str,
     forwarding: &ForwardingState,
 ) {
@@ -301,26 +301,24 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
         Ok(EnqueueOutcome::RateLimited) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
             live.slow_path_rate_limited.fetch_add(1, Ordering::Relaxed);
-            record_exception(
+            record_exception_owned(
                 recent_exceptions,
                 binding,
                 &format!("{reason}_rate_limited"),
                 frame.len() as u32,
                 Some(meta),
                 None,
-                forwarding,
             );
         }
         Ok(EnqueueOutcome::QueueFull) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-            record_exception(
+            record_exception_owned(
                 recent_exceptions,
                 binding,
                 &format!("{reason}_queue_full"),
                 frame.len() as u32,
                 Some(meta),
                 None,
-                forwarding,
             );
         }
         // #2471: the slow path is degraded (MTU programming failed); the live
@@ -328,27 +326,25 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
         // counted exception rather than being silently dropped by the kernel.
         Ok(EnqueueOutcome::MtuExceeded) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-            record_exception(
+            record_exception_owned(
                 recent_exceptions,
                 binding,
                 &format!("{reason}_slow_path_mtu_exceeded"),
                 frame.len() as u32,
                 Some(meta),
                 None,
-                forwarding,
             );
         }
         Err(err) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
             live.set_error(err);
-            record_exception(
+            record_exception_owned(
                 recent_exceptions,
                 binding,
                 &format!("{reason}_enqueue_failed"),
                 frame.len() as u32,
                 Some(meta),
                 None,
-                forwarding,
             );
         }
     }

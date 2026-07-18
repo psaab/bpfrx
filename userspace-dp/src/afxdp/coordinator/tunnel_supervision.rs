@@ -246,12 +246,7 @@ impl super::Coordinator {
                 if let Ok(mut recent) = self.recent_exceptions.lock() {
                     push_recent_exception(
                         &mut recent,
-                        ExceptionStatus {
-                            timestamp: Utc::now(),
-                            interface: tunnel_name.clone(),
-                            reason: format!("local_tunnel_wake_eventfd_failed:{id}:{err}"),
-                            ..ExceptionStatus::default()
-                        },
+                        control_notice_event(&tunnel_name, format!("local_tunnel_wake_eventfd_failed:{id}:{err}")),
                     );
                 }
                 eprintln!(
@@ -320,12 +315,7 @@ impl super::Coordinator {
                 if let Ok(mut recent) = self.recent_exceptions.lock() {
                     push_recent_exception(
                         &mut recent,
-                        ExceptionStatus {
-                            timestamp: Utc::now(),
-                            interface: tunnel_name.clone(),
-                            reason: format!("spawn_local_tunnel_source_failed:{id}:{err}"),
-                            ..ExceptionStatus::default()
-                        },
+                        control_notice_event(&tunnel_name, format!("spawn_local_tunnel_source_failed:{id}:{err}")),
                     );
                 }
                 eprintln!(
@@ -796,12 +786,7 @@ impl super::Coordinator {
                 if let Ok(mut recent) = self.recent_exceptions.lock() {
                     push_recent_exception(
                         &mut recent,
-                        ExceptionStatus {
-                            timestamp: Utc::now(),
-                            interface: tunnel_name.clone(),
-                            reason: format!("spawn_wg_control_failed:{id}:{err}"),
-                            ..ExceptionStatus::default()
-                        },
+                        control_notice_event(&tunnel_name, format!("spawn_wg_control_failed:{id}:{err}")),
                     );
                 }
                 eprintln!(

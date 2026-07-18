@@ -165,7 +165,7 @@ fn poll_loop_fixture() -> (
     UdpSocket,
     std::fs::File, // tun stand-in (pipe read end)
     std::fs::File, // pipe write end (keep open!)
-    std::sync::Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    std::sync::Arc<Mutex<ExceptionEventRing>>,
     std::sync::Arc<AtomicBool>,
 ) {
     use std::os::fd::FromRawFd;
@@ -191,7 +191,7 @@ fn poll_loop_fixture() -> (
     set_fd_nonblocking(read_fd).unwrap();
     let tun = unsafe { std::fs::File::from_raw_fd(read_fd) };
     let pipe_w = unsafe { std::fs::File::from_raw_fd(write_fd) };
-    let exceptions = std::sync::Arc::new(Mutex::new(VecDeque::new()));
+    let exceptions = std::sync::Arc::new(Mutex::new(ExceptionEventRing::new()));
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     (engine, socket, tun, pipe_w, exceptions, stop)
 }
@@ -200,7 +200,7 @@ fn spawn_poll_loop(
     engine: std::sync::Arc<crate::afxdp::wg::WgEngine>,
     socket: UdpSocket,
     tun: std::fs::File,
-    exceptions: std::sync::Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    exceptions: std::sync::Arc<Mutex<ExceptionEventRing>>,
     stop: std::sync::Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -381,7 +381,7 @@ fn giveup_paces_keepalive_no_session_by_one_interval() {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket.set_nonblocking(true).unwrap();
     let ep: SocketAddr = "127.0.0.1:39998".parse().unwrap();
-    let exceptions = std::sync::Arc::new(Mutex::new(VecDeque::new()));
+    let exceptions = std::sync::Arc::new(Mutex::new(ExceptionEventRing::new()));
     let mut encap_buf = vec![0u8; 2048];
 
     // An attempt that has run the full 90s window — the next

@@ -694,7 +694,7 @@ fn poll_descriptor_junos_host_deny_drops_local_delivery_session_hit() {
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();

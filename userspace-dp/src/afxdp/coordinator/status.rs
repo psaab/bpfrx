@@ -1,4 +1,8 @@
 use super::*;
+// #5289: per-worker exception-ring reconstruction on the status thread.
+use crate::afxdp::disposition::{
+    EXCEPTION_RING_CAPACITY, ExceptionEvent, MonoWallAnchor, ResolutionEvent,
+};
 
 /// Operator-status surface split out of `coordinator/mod.rs` to keep
 /// the gRPC / HTTP status methods in one place. Most are pure-read
@@ -384,11 +388,29 @@ impl super::Coordinator {
         }
     }
 
+    /// #5289: drain the control-thread ring + every per-worker ring, format
+    /// each compact POD `ExceptionEvent` into an `ExceptionStatus` here (on
+    /// the control/status thread — NOT the packet path), merge by monotonic
+    /// timestamp and cap at the historical ring depth. The wall-clock and
+    /// `String`/IP/zone formatting that the retired inline path did per
+    /// terminal packet now runs once per status read.
     pub fn recent_exceptions(&self) -> Vec<ExceptionStatus> {
-        self.recent_exceptions
-            .lock()
-            .map(|recent| recent.iter().cloned().collect())
-            .unwrap_or_default()
+        let anchor = MonoWallAnchor::capture();
+        let mut events: Vec<ExceptionEvent> = Vec::new();
+        if let Ok(ring) = self.recent_exceptions.lock() {
+            events.extend(ring.iter().cloned());
+        }
+        for ring in self.worker_exception_rings.values() {
+            if let Ok(ring) = ring.lock() {
+                events.extend(ring.iter().cloned());
+            }
+        }
+        events.sort_by_key(|e| e.mono);
+        let start = events.len().saturating_sub(EXCEPTION_RING_CAPACITY);
+        events[start..]
+            .iter()
+            .map(|e| e.to_status(anchor, &self.forwarding))
+            .collect()
     }
 
     pub fn recent_session_deltas(&self) -> Vec<SessionDeltaInfo> {
@@ -398,11 +420,27 @@ impl super::Coordinator {
             .unwrap_or_default()
     }
 
+    /// #5289: the most-recent forwarding resolution across the control-thread
+    /// slot and every per-worker slot (by monotonic timestamp), rebuilt into a
+    /// `PacketResolution` on the control thread from its compact POD form.
     pub fn last_resolution(&self) -> Option<PacketResolution> {
-        self.last_resolution
-            .lock()
-            .ok()
-            .and_then(|last| last.clone())
+        let mut newest: Option<ResolutionEvent> = None;
+        let mut consider = |candidate: Option<ResolutionEvent>| {
+            if let Some(ev) = candidate
+                && newest.as_ref().is_none_or(|n| ev.mono >= n.mono)
+            {
+                newest = Some(ev);
+            }
+        };
+        if let Ok(last) = self.last_resolution.lock() {
+            consider(last.clone());
+        }
+        for slot in self.worker_last_resolution.values() {
+            if let Ok(last) = slot.lock() {
+                consider(last.clone());
+            }
+        }
+        newest.map(|ev| ev.to_resolution(&self.forwarding))
     }
 
     pub fn slow_path_status(&self) -> SlowPathStatus {

@@ -38,7 +38,7 @@ fn maybe_reinject_slow_path_ignores_forward_candidate_disposition() {
         ifindex: 5,
     };
     let live = BindingLiveState::new();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,
@@ -138,7 +138,7 @@ fn maybe_reinject_slow_path_drops_ineligible_dispositions() {
             ifindex: 5,
         };
         let live = BindingLiveState::new();
-        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
             version: USERSPACE_META_VERSION,
@@ -211,7 +211,7 @@ fn maybe_reinject_slow_path_records_extract_failure_for_invalid_desc() {
         ifindex: 5,
     };
     let live = BindingLiveState::new();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,
@@ -276,7 +276,7 @@ fn maybe_reinject_slow_path_from_frame_records_unavailable() {
         ifindex: 6,
     };
     let live = BindingLiveState::new();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,
@@ -336,7 +336,7 @@ fn handle_forward_build_failure_records_build_and_slow_path_failures() {
         ifindex: 6,
     };
     let live = BindingLiveState::new();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,
@@ -387,7 +387,7 @@ fn handle_forward_build_failure_records_build_and_slow_path_failures() {
         .lock()
         .expect("exceptions")
         .iter()
-        .map(|entry| entry.reason.clone())
+        .map(|entry| entry.reason().to_string())
         .collect();
     assert_eq!(
         reasons,
@@ -408,7 +408,7 @@ fn handle_forward_build_failure_without_fallback_only_records_build_failure() {
         ifindex: 6,
     };
     let live = BindingLiveState::new();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,
@@ -459,7 +459,7 @@ fn handle_forward_build_failure_without_fallback_only_records_build_failure() {
         .lock()
         .expect("exceptions")
         .iter()
-        .map(|entry| entry.reason.clone())
+        .map(|entry| entry.reason().to_string())
         .collect();
     assert_eq!(reasons, vec!["forward_build_failed"]);
 }
@@ -484,7 +484,7 @@ fn handle_forward_build_failure_drops_fabric_redirect_fail_closed() {
         ifindex: 6,
     };
     let live = BindingLiveState::new();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,
@@ -545,7 +545,7 @@ fn handle_forward_build_failure_drops_fabric_redirect_fail_closed() {
         .lock()
         .expect("exceptions")
         .iter()
-        .map(|entry| entry.reason.clone())
+        .map(|entry| entry.reason().to_string())
         .collect();
     assert_eq!(
         reasons,
@@ -572,7 +572,7 @@ fn handle_forward_build_failure_still_reinjects_forward_candidate() {
         ifindex: 6,
     };
     let live = BindingLiveState::new();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,
@@ -629,7 +629,7 @@ fn handle_forward_build_failure_still_reinjects_forward_candidate() {
         .lock()
         .expect("exceptions")
         .iter()
-        .map(|entry| entry.reason.clone())
+        .map(|entry| entry.reason().to_string())
         .collect();
     assert_eq!(
         reasons,
@@ -666,7 +666,7 @@ fn slow_path_accept_is_categorized_by_reason_and_disposition() {
 #[test]
 fn disposition_counters_hot_accumulates_in_batch_not_live() {
     let live = BindingLiveState::new();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let binding = BindingIdentity {
         slot: 1,
         queue_id: 0,
@@ -732,7 +732,7 @@ fn disposition_counters_hot_accumulates_in_batch_not_live() {
 #[test]
 fn disposition_counters_cold_writes_live_immediately() {
     let live = BindingLiveState::new();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let binding = BindingIdentity {
         slot: 1,
         queue_id: 0,

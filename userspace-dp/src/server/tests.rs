@@ -2063,7 +2063,7 @@ fn wg1866_disarmed_same_plan_apply_does_not_hold_wg_ports() {
         .lock()
         .expect("exceptions")
         .iter()
-        .filter(|e| e.reason.contains("wg_bind_listen_port"))
+        .filter(|e| e.reason().contains("wg_bind_listen_port"))
         .count();
     assert_eq!(
         exceptions, 0,
