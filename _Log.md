@@ -51673,6 +51673,34 @@ top.
   pkg/dataplane/userspace/format/status_golden_test.go,
   docs/feature-coverage.md, userspace-dp/src/FEATURES.md
 
+## 2026-07-17 — #5381 native-GRE encap: borrow inner packet, drop redundant `.to_vec()`
+- **Timestamp**: 2026-07-17
+- **Action**: `encapsulate_native_gre_frame` (userspace-dp/src/afxdp/gre.rs)
+  copied the inner packet into a fresh heap `Vec` via `.to_vec()` and THEN
+  `copy_from_slice`'d it into the output frame — two copies + one redundant
+  per-packet heap allocation on the native GRE egress fast path. Confirmed
+  every use of the inner is READ-ONLY across the whole fn body
+  (`packet_trimmed_len`, `inner_tos_byte`, `.len()`, and as the
+  `copy_from_slice` SOURCE into the separately-allocated `out`). Replaced the
+  `.to_vec()` with a borrowed slice into `inner_frame` (`inner_slice` →
+  trim via `packet_trimmed_len` → reslice `&inner_slice[..inner_len]`). The
+  single `copy_from_slice` into `out` remains the only copy; `inner_frame`
+  outlives the borrow and `out` is a distinct allocation, so no aliasing.
+  Wire output is byte-identical — this is a perf fix (one fewer alloc+copy
+  per encapsulated frame). Added a regression guard
+  (`gre_encap_output_is_byte_identical_and_trims_inner_slack`) that feeds an
+  inner buffer with trailing slack beyond its IPv4 total-length and asserts
+  the full emitted frame equals an independently hand-built expected frame
+  (outer eth/VLAN + IPv6 + GRE + TRIMMED inner) and that the slack never
+  leaks. The guard pins output-correctness after the alloc removal (it does
+  NOT go RED on a `.to_vec()` revert — the output is identical either way;
+  the alloc removal is verified by inspection). Full gre/encap module 7/7
+  passed 5× (no flakes); full afxdp::tunnel module 34/34 green. Perf-only —
+  no behavior/doc change beyond _Log.md.
+- **File(s)**:
+  userspace-dp/src/afxdp/gre.rs (borrow inner packet, drop `.to_vec()`),
+  userspace-dp/src/afxdp/tunnel_tests.rs (regression guard test)
+
 ## #5147 — Per-shard neighbor MAC-change epoch (targeted flow-cache invalidation)
 - **Timestamp**: 2026-07-17
 - **Action**: Replace the single global `ShardedNeighborMap.mac_change_epoch`
