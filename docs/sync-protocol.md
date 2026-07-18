@@ -59,7 +59,7 @@ Offset  Size  Field
 13      3     Pad             -
 ── Value (104 bytes) ───────────────────
 16      1     State           uint8 (0=new, 1=established, 2=closing)
-17      1     Flags           uint8 (SNAT/DNAT/StaticNAT bits)
+17      1     Flags           uint8 -- low byte of SessionValue.Flags (SNAT/DNAT/StaticNAT/NAT64 bits 0-7)
 18      1     TCPState        uint8
 19      1     IsReverse       uint8 (always 0 for synced entries)
 20      4     Pad0            -
@@ -90,6 +90,16 @@ Offset  Size  Field
 114     2     Pad1            -
 116     4     (unused)        -
 ```
+
+> **Flags field width (#5460).** `SessionValue.Flags` is a `uint16` in memory
+> (the C `session_value.flags` and Rust `BpfSessionValueV4.flags` mirrors were
+> widened from `__u8` to `__u16` so `SessFlagNPTV6` — bit 8, 0x100 — fits). The
+> sync wire above still carries only the **low byte** at offset 17, because every
+> flag a session actually sets today is in bits 0-7 (SNAT/DNAT/StaticNAT/NAT64).
+> Bits ≥ 8 are never set at runtime, so the low-byte encoding is loss-free and
+> the wire is unchanged (no version bump). If session-level NPTv6 flagging is
+> ever added, carry the high byte as a length-gated trailing field (like
+> `Generation`) rather than widening this fixed-offset byte in place.
 
 ## Session V6 Payload Layout (~196 bytes)
 

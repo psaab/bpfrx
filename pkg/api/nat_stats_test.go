@@ -214,7 +214,7 @@ func (d *natIfaceSNATSessionsDP) LastApplyResult() *dataplane.ApplyResult {
 }
 
 func (d *natIfaceSNATSessionsDP) IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
-	emit := func(ingress, egress uint16, reverse uint8, flags uint8) {
+	emit := func(ingress, egress uint16, reverse uint8, flags uint16) {
 		fn(dataplane.SessionKey{Protocol: 6}, dataplane.SessionValue{
 			IsReverse:   reverse,
 			Flags:       flags,

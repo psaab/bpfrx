@@ -8,13 +8,13 @@ import (
 // Sizes of the on-map C `struct session_value` / `struct session_value_v6`
 // conntrack ABI (bpf/headers/xpf_conntrack.h), mirrored by the Rust helper's
 // BpfSessionValueV4 / BpfSessionValueV6 and asserted on the Rust side at
-// userspace-dp/src/afxdp/bpf_map_tests.rs (size_of == 128 / 176). These are
-// the authoritative on-map value sizes — the Go map registration MUST match
-// them, not sizeOf[SessionValue] (which is 8 bytes larger due to the sync-only
-// Generation field, #2360).
+// userspace-dp/src/afxdp/bpf_map_tests.rs (size_of == 136 / 184; 128 / 176
+// before the #5460 __u16 flags widen). These are the authoritative on-map
+// value sizes — the Go map registration MUST match them, not sizeOf[SessionValue]
+// (which is larger due to sync-only trailing fields, #2360).
 const (
-	conntrackValueSizeV4 = 128
-	conntrackValueSizeV6 = 176
+	conntrackValueSizeV4 = 136
+	conntrackValueSizeV6 = 184
 )
 
 // TestBPFSessionValueMatchesConntrackABI pins the dedicated on-map ABI types to
@@ -86,11 +86,12 @@ func TestSessionValueCarriesSyncOnlyGeneration(t *testing.T) {
 
 // TestSessionMapRegisteredAtConntrackABISize is the regression guard for
 // #2360: the `sessions` / `sessions_v6` BPF maps MUST be registered with the
-// on-map conntrack ABI value_size (128 / 176), NOT sizeOf[SessionValue] /
-// sizeOf[SessionValueV6] (136 / 184). Registering at the larger SessionValue
-// size makes the kernel value_size exceed the Rust helper's 128/176-byte lookup
-// buffer, causing an 8-byte out-of-bounds copy. This test fails if anyone
-// reverts the registration to sizeOf[SessionValue].
+// on-map conntrack ABI value_size (136 / 184 post-#5460; 128 / 176 before),
+// NOT sizeOf[SessionValue] / sizeOf[SessionValueV6], which are larger by the
+// sync-only trailing fields (Generation, PolicyCounterIdx, ...). Registering at
+// the larger SessionValue size makes the kernel value_size exceed the Rust
+// helper's on-map lookup buffer, causing an out-of-bounds copy. This test fails
+// if anyone reverts the registration to sizeOf[SessionValue].
 func TestSessionMapRegisteredAtConntrackABISize(t *testing.T) {
 	specs := userspaceShimSharedMapSpecs()
 	valueSize := make(map[string]uint32, len(specs))
@@ -126,34 +127,34 @@ func TestSessionMapRegisteredAtConntrackABISize(t *testing.T) {
 // the cluster sync wire, so dropping it at the map boundary is correct.
 func TestSessionValueBPFRoundTripDropsGeneration(t *testing.T) {
 	orig := SessionValue{
-		State:       3,
-		Flags:       SessFlagSNAT,
-		TCPState:    4,
-		IsReverse:   0,
-		AppTimeout:  120,
-		SessionID:   0xdeadbeefcafef00d,
-		Created:     111,
-		LastSeen:    222,
-		Timeout:     300,
-		PolicyID:    7,
-		IngressZone: 1,
-		EgressZone:  2,
-		NATSrcIP:    0x0a000001,
-		NATDstIP:    0x0a000002,
-		NATSrcPort:  1234,
-		NATDstPort:  5678,
-		FwdPackets:  10,
-		FwdBytes:    1000,
-		RevPackets:  20,
-		RevBytes:    2000,
-		ReverseKey:  SessionKey{SrcPort: 5678, DstPort: 1234, Protocol: 6},
-		ALGType:     1,
-		LogFlags:    2,
-		AppID:       42,
-		FibIfindex:  9,
-		FibVlanID:   50,
-		FibDmac:     [6]byte{1, 2, 3, 4, 5, 6},
-		FibSmac:     [6]byte{6, 5, 4, 3, 2, 1},
+		State:            3,
+		Flags:            SessFlagSNAT,
+		TCPState:         4,
+		IsReverse:        0,
+		AppTimeout:       120,
+		SessionID:        0xdeadbeefcafef00d,
+		Created:          111,
+		LastSeen:         222,
+		Timeout:          300,
+		PolicyID:         7,
+		IngressZone:      1,
+		EgressZone:       2,
+		NATSrcIP:         0x0a000001,
+		NATDstIP:         0x0a000002,
+		NATSrcPort:       1234,
+		NATDstPort:       5678,
+		FwdPackets:       10,
+		FwdBytes:         1000,
+		RevPackets:       20,
+		RevBytes:         2000,
+		ReverseKey:       SessionKey{SrcPort: 5678, DstPort: 1234, Protocol: 6},
+		ALGType:          1,
+		LogFlags:         2,
+		AppID:            42,
+		FibIfindex:       9,
+		FibVlanID:        50,
+		FibDmac:          [6]byte{1, 2, 3, 4, 5, 6},
+		FibSmac:          [6]byte{6, 5, 4, 3, 2, 1},
 		FibGen:           99,
 		Generation:       0x1122334455667788, // sync-only — must NOT survive to the map
 		PolicyCounterIdx: 7,                  // #3301 sync-only — must NOT survive to the map
@@ -169,34 +170,34 @@ func TestSessionValueBPFRoundTripDropsGeneration(t *testing.T) {
 	}
 
 	origV6 := SessionValueV6{
-		State:       3,
-		Flags:       SessFlagDNAT,
-		TCPState:    4,
-		IsReverse:   1,
-		AppTimeout:  60,
-		SessionID:   0x0102030405060708,
-		Created:     1,
-		LastSeen:    2,
-		Timeout:     30,
-		PolicyID:    8,
-		IngressZone: 2,
-		EgressZone:  1,
-		NATSrcIP:    [16]byte{0xfe, 0x80, 15: 1},
-		NATDstIP:    [16]byte{0x20, 0x01, 15: 2},
-		NATSrcPort:  4321,
-		NATDstPort:  8765,
-		FwdPackets:  5,
-		FwdBytes:    500,
-		RevPackets:  6,
-		RevBytes:    600,
-		ReverseKey:  SessionKeyV6{SrcPort: 8765, DstPort: 4321, Protocol: 17},
-		ALGType:     2,
-		LogFlags:    3,
-		AppID:       43,
-		FibIfindex:  10,
-		FibVlanID:   80,
-		FibDmac:     [6]byte{9, 8, 7, 6, 5, 4},
-		FibSmac:     [6]byte{4, 5, 6, 7, 8, 9},
+		State:            3,
+		Flags:            SessFlagDNAT,
+		TCPState:         4,
+		IsReverse:        1,
+		AppTimeout:       60,
+		SessionID:        0x0102030405060708,
+		Created:          1,
+		LastSeen:         2,
+		Timeout:          30,
+		PolicyID:         8,
+		IngressZone:      2,
+		EgressZone:       1,
+		NATSrcIP:         [16]byte{0xfe, 0x80, 15: 1},
+		NATDstIP:         [16]byte{0x20, 0x01, 15: 2},
+		NATSrcPort:       4321,
+		NATDstPort:       8765,
+		FwdPackets:       5,
+		FwdBytes:         500,
+		RevPackets:       6,
+		RevBytes:         600,
+		ReverseKey:       SessionKeyV6{SrcPort: 8765, DstPort: 4321, Protocol: 17},
+		ALGType:          2,
+		LogFlags:         3,
+		AppID:            43,
+		FibIfindex:       10,
+		FibVlanID:        80,
+		FibDmac:          [6]byte{9, 8, 7, 6, 5, 4},
+		FibSmac:          [6]byte{4, 5, 6, 7, 8, 9},
 		FibGen:           77,
 		Generation:       0x8877665544332211,
 		PolicyCounterIdx: 11, // #3301 sync-only — must NOT survive to the map

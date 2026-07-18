@@ -14,8 +14,12 @@ type SessionKey struct {
 
 // SessionValue mirrors the C struct session_value.
 type SessionValue struct {
-	State      uint8
-	Flags      uint8
+	State uint8
+	// Flags is uint16 (not uint8): SessFlagNPTV6 is bit 8 (0x100), which
+	// overflows a byte (#5460). The C `struct session_value.flags` and the Rust
+	// `BpfSessionValueV4::flags` mirror this width; the on-map ABI is size-
+	// asserted at 136 (bpf_session_value_test.go / bpf_map_tests.rs).
+	Flags      uint16
 	TCPState   uint8
 	IsReverse  uint8
 	AppTimeout uint32 // per-application inactivity timeout (seconds), 0=use default
@@ -95,8 +99,9 @@ type SessionKeyV6 struct {
 
 // SessionValueV6 mirrors the C struct session_value_v6.
 type SessionValueV6 struct {
-	State      uint8
-	Flags      uint8
+	State uint8
+	// Flags is uint16: see SessionValue.Flags (#5460). SessFlagNPTV6 is bit 8.
+	Flags      uint16
 	TCPState   uint8
 	IsReverse  uint8
 	AppTimeout uint32 // per-application inactivity timeout (seconds), 0=use default
@@ -563,11 +568,15 @@ const MaxNATPoolIPsPerPool = 256
 const MaxNATRuleCounters = 256
 const SNATModeOff = 0xFF // source-nat off: match but don't translate
 
-// Session flag constants.
+// Session flag constants. These mirror the C SESS_FLAG_* defines
+// (bpf/headers/xpf_common.h) and are stored in SessionValue.Flags (uint16).
+// SessFlagNPTV6 is bit 8, which is why Flags is uint16 and not a byte (#5460).
 const (
 	SessFlagSNAT      = 1 << 0
 	SessFlagDNAT      = 1 << 1
 	SessFlagStaticNAT = 1 << 6
+	SessFlagNAT64     = 1 << 7
+	SessFlagNPTV6     = 1 << 8 // bit 8 -- requires uint16 Flags
 )
 
 // StaticNATKeyV4 mirrors the C struct static_nat_key_v4.

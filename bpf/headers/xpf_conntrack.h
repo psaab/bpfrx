@@ -17,7 +17,11 @@ struct session_key {
 struct session_value {
 	/* Connection state */
 	__u8  state;           /* SESS_STATE_* */
-	__u8  flags;           /* SESS_FLAG_* */
+	__u16 flags;           /* SESS_FLAG_* -- __u16: SESS_FLAG_NPTV6 is bit 8
+				* (0x100), which does not fit a __u8 (#5460). The
+				* compiler inserts one pad byte after `state` and
+				* two after `is_reverse`; the C/Rust/Go layouts
+				* stay byte-identical (size-asserted 136/184). */
 	__u8  tcp_state;       /* TCP-specific sub-state */
 	__u8  is_reverse;      /* 1 if this is the reverse direction entry */
 	__u32 app_timeout;     /* per-application inactivity timeout (seconds), 0=use default */
@@ -78,7 +82,8 @@ struct session_key_v6 {
 struct session_value_v6 {
 	/* Connection state */
 	__u8  state;           /* SESS_STATE_* */
-	__u8  flags;           /* SESS_FLAG_* */
+	__u16 flags;           /* SESS_FLAG_* -- __u16 (see session_value.flags,
+				* #5460): SESS_FLAG_NPTV6 (bit 8) overflows __u8. */
 	__u8  tcp_state;       /* TCP-specific sub-state */
 	__u8  is_reverse;      /* 1 if this is the reverse direction entry */
 	__u32 app_timeout;     /* per-application inactivity timeout (seconds), 0=use default */

@@ -183,7 +183,11 @@ struct icmp6hdr {
 #define SESS_STATE_TIME_WAIT   7
 #define SESS_STATE_CLOSED      8
 
-/* Session flags */
+/* Session flags -- stored in session_value.flags, a __u16 (xpf_conntrack.h).
+ * Bits 0-7 occupy the low byte; SESS_FLAG_NPTV6 is bit 8 and needs the high
+ * byte, which is why `flags` is __u16 and not __u8 (#5460). Keep the field
+ * width >= the highest bit used here, and mirror any new bit into the Rust
+ * (BpfSessionValue*) and Go (bpfSessionValue*) structs. */
 #define SESS_FLAG_SNAT         (1 << 0)
 #define SESS_FLAG_DNAT         (1 << 1)
 #define SESS_FLAG_LOG          (1 << 2)
@@ -192,7 +196,7 @@ struct icmp6hdr {
 #define SESS_FLAG_PREDICTED    (1 << 5)
 #define SESS_FLAG_STATIC_NAT   (1 << 6)
 #define SESS_FLAG_NAT64        (1 << 7)
-#define SESS_FLAG_NPTV6        (1 << 8)
+#define SESS_FLAG_NPTV6        (1 << 8)   /* bit 8 -- requires __u16 flags */
 
 /* pkt_meta.meta_flags bits */
 #define META_FLAG_EMBEDDED_ICMP      (1 << 0)
