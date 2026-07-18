@@ -52050,3 +52050,45 @@ top.
   userspace-dp/src/afxdp/session_glue/tests.rs,
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/session_glue/README.md, _Log.md
+
+## 2026-07-18 — #5877 unbounded aggregate source-NAT pool cardinality
+
+- **Timestamp**: 2026-07-18
+- **Action**: Add a strict-commit AGGREGATE source-NAT pool cardinality budget
+  (`validateSourceNATAggregateCardinalityStrict`). The per-field / per-member
+  gates bound ONE pool (member host count to `MaxSourceNATPoolPrefixHosts`,
+  port range to 1..65535) but nothing bounded the AGGREGATE — pool COUNT, total
+  address cardinality, or total port capacity — across a config. Snapshot/apply
+  builds a `PortAllocator` (per-address occupancy bitmap sized to the port
+  range) for each pool-mode rule BEFORE reuse dedup, so a large-but-valid config
+  forces multi-gigabyte allocator construction during a security-critical
+  commit-apply (stalling commits, watchdogs, HA convergence, the Rust
+  dataplane). The gate rejects an over-budget config at COMMIT, fail-closed,
+  before apply builds any allocator state.
+- **Budgets** (`compiler_validate_strict_nat.go`): `MaxSourceNATPoolCount = 1024`
+  distinct pool-mode-referenced pools; `MaxSourceNATAggregatePoolAddresses =
+  16 × MaxSourceNATPoolPrefixHosts = 1,048,576` total pool addresses;
+  `MaxSourceNATAggregatePortCapacity = 2^33 = 8,589,934,592` total port slots
+  (Σ addresses × port-range ⇒ occupancy bitmaps capped at ~1 GiB).
+- **Scoping**: iterates only the DISTINCT pools a pool-mode `then source-nat
+  pool <name>` rule references — the exact set apply expands into a
+  `PortAllocator` (same scoping as #5627/#5875), so a NAT64-referenced or
+  unreferenced pool is out of scope. Runs AFTER the per-pool value/grammar gates
+  (first-error slot), reuses the `lenientDestNATAddresses` downgrade (warn on
+  load / peer-sync, #1960 no-brick), and is registered in the SNAT strict set
+  (`validateSourceNATStrictView`) so #5876's peer-effective gate bounds the
+  standby too. Saturating arithmetic (`checkedAddU64` + existing `checkedMulU64`)
+  so a pathological v6 prefix trips the budget instead of wrapping.
+- **Tests**: `compiler_nat_source_pool_aggregate_5877_test.go` — count / address
+  / port-capacity over-budget rejects with the specific error + just-under
+  accepts; lenient path warns-and-boots; unreferenced pools not counted; the
+  per-member host-count helper pinned to the Rust `expand_pool_address`
+  enumeration. Fail-on-revert verified (neutralizing the validator turns the 4
+  reject/warn cases RED).
+- **Validation**: `go build ./...` clean; `go test ./pkg/config/...` green
+  (incl. the pre-existing NAT64 host-mask test, which the referenced-only
+  scoping keeps passing); gofmt clean.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates.go, pkg/config/compiler_peer_effective_snat.go,
+  pkg/config/compiler_nat_source_pool_aggregate_5877_test.go,
+  docs/config-schema.md, _Log.md
