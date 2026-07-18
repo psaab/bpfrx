@@ -52,6 +52,25 @@ pub(super) fn purge_queued_flows_for_closed_deltas(
 // disconnected) — #2874. The caller latches loss-of-sync so the worker loop
 // re-exports the full owner-RG snapshot (the #2442 recovery path) and the peer
 // re-derives a complete session view instead of silently missing the delta.
+//
+// #5468 (aggregate bound): `worker_lossless_wedged` is an in/out per-drain-cycle
+// latch shared by EVERY `flush_session_deltas` call the worker loop makes in one
+// iteration (the steady-state incremental drain, the #2442 loss-of-sync resync,
+// AND the #2653 command export). Each individual call already bounds its lossless
+// backpressure to a single `WORKER_LOSSLESS_QUEUE_BUDGET` wait, but the resync /
+// export paths call this ONCE PER 256-delta batch across the entire owned-session
+// set — so for K owned sessions an unread peer would cost ~(K/256) budgets of
+// worker-loop stall, re-crossing `HEARTBEAT_STALE_AFTER` for large K and
+// re-triggering the SAME spurious failover via the resync path. To bound the
+// AGGREGATE, the first wedged call sets `*worker_lossless_wedged`; every
+// subsequent call this cycle inherits it and SKIPS the lossless wait entirely
+// (it never attempts a push, so no further budget is spent), while still draining
+// each delta to its other consumers — the per-binding live RPC buffer, the shared
+// conntrack/session tables, peer-worker delete replication, and the best-effort
+// RT_FLOW frames. Losslessness is preserved: every wedged call still returns
+// `true` so the caller keeps the loss-of-sync latch set and the resync retries
+// next cycle (deliver-or-resync, never a silent drop). Net effect: the worker
+// loop's total lossless WAIT per drain cycle is ~1 budget regardless of K.
 pub(super) fn flush_session_deltas(
     ident: &BindingIdentity,
     live: Option<&BindingLiveState>,
@@ -72,6 +91,8 @@ pub(super) fn flush_session_deltas(
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     event_stream: &Option<crate::event_stream::EventStreamWorkerHandle>,
     forwarding: &ForwardingState,
+    // #5468: per-drain-cycle aggregate lossless-wedge latch (see doc above).
+    worker_lossless_wedged: &mut bool,
 ) -> bool {
     let zone_name_to_id = &forwarding.zone_name_to_id;
     let zone_id_to_name = &forwarding.zone_id_to_name;
@@ -84,7 +105,13 @@ pub(super) fn flush_session_deltas(
     // is itself bounded to `WORKER_LOSSLESS_QUEUE_BUDGET` (well below
     // `HEARTBEAT_STALE_AFTER`), so the worst case is one short worker stall per
     // drain cycle rather than a full 5 s heartbeat-threatening block.
-    let mut event_stream_out_of_sync = false;
+    //
+    // #5468 (aggregate): seed the flag from the per-drain-cycle wedge latch so a
+    // resync/export that calls this once per 256-delta batch does NOT pay a fresh
+    // budget wait on every batch. If a prior batch this cycle already wedged, we
+    // start out-of-sync and never attempt another lossless push — the aggregate
+    // worker-loop wait stays ~1 budget regardless of the owned-session count K.
+    let mut event_stream_out_of_sync = *worker_lossless_wedged;
     for delta in deltas {
         // #919/#922: emit both the resolved zone NAMES (legacy field,
         // empty when the ID is unknown) and the u16 IDs. New daemons
@@ -365,6 +392,13 @@ pub(super) fn flush_session_deltas(
                 );
             }
         }
+    }
+    // #5468: propagate this batch's wedge into the per-drain-cycle latch so the
+    // NEXT `flush_session_deltas` call this cycle (the next resync/export batch)
+    // inherits it and skips the lossless wait — bounding the aggregate worker-loop
+    // wait to ~1 budget regardless of the owned-session count.
+    if event_stream_out_of_sync {
+        *worker_lossless_wedged = true;
     }
     event_stream_out_of_sync
 }

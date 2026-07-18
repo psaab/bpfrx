@@ -122,6 +122,22 @@ pub(crate) fn worker_loop(
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
+    // #5468: per-drain-cycle aggregate lossless-wedge latch. `flush_session_deltas`
+    // bounds each individual lossless send to `WORKER_LOSSLESS_QUEUE_BUDGET`, but
+    // the #2442 loss-of-sync resync and the #2653 command export call it ONCE PER
+    // 256-delta batch across the whole owned-session set — so an unread peer would
+    // otherwise cost ~(K/256) budgets of worker-loop stall for K owned sessions,
+    // re-crossing HEARTBEAT_STALE_AFTER for large K and re-triggering the SAME
+    // spurious failover via the resync path. Seeded false at the top of every loop
+    // iteration below and threaded through EVERY `flush_session_deltas` call this
+    // cycle: the first wedge sets it, and later batches inherit it and skip the
+    // lossless wait (still draining to the live buffers / shared tables / peer
+    // delete replication), so the aggregate worker-loop lossless wait stays ~1
+    // budget regardless of K. The loss-of-sync latch still fires on every wedged
+    // batch, so the resync retries next cycle (deliver-or-resync, never a drop).
+    // Declared uninitialized: the loop-top reset below is the first write every
+    // iteration, so a healthy consumer never inherits a stale wedge.
+    let mut worker_lossless_wedged: bool;
     // #2669: flush a freshly-drained delta batch to its consumers. Used at
     // all three drain sites (resync macro, exported-sequences branch, else
     // branch). The drain that produced `$deltas` already popped them off the
@@ -158,6 +174,7 @@ pub(crate) fn worker_loop(
                         &peer_worker_commands,
                         &event_stream,
                         forwarding.as_ref(),
+                        &mut worker_lossless_wedged,
                     )
                 }
                 None => {
@@ -184,6 +201,7 @@ pub(crate) fn worker_loop(
                         &peer_worker_commands,
                         &event_stream,
                         forwarding.as_ref(),
+                        &mut worker_lossless_wedged,
                     )
                 }
             };
@@ -239,6 +257,12 @@ pub(crate) fn worker_loop(
     const WR_PUBLISH_INTERVAL_NS: u64 = 1_000_000_000;
     while !stop.load(Ordering::Relaxed) {
         let loop_now_ns = monotonic_nanos();
+        // #5468: reset the per-drain-cycle aggregate lossless-wedge latch. It is
+        // threaded through every `flush_session_deltas` call this iteration (the
+        // steady-state drain, the #2442 resync, and the #2653 export) so the
+        // FIRST wedge caps the whole cycle's lossless wait at ~1 budget; a fresh
+        // iteration must start un-wedged so a healthy consumer pays no penalty.
+        worker_lossless_wedged = false;
         // #869: attribute elapsed delta to the previous loop's state.
         {
             let delta = loop_now_ns.saturating_sub(wr_last_loop_ns);
