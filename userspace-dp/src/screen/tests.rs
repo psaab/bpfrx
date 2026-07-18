@@ -2131,6 +2131,106 @@ fn icmp_flood_triggers() {
     );
 }
 
+/// #4969 fail-on-revert: a `ZoneScreenState` constructed from a `ScreenProfile`
+/// with a configured limiter has ALL of that limiter's flood sub-state PRESENT
+/// by construction, so a configured zone can NEVER present a fail-open (missing)
+/// sub-state on the screened path.
+///
+/// This is the correctness win of the #4969 map consolidation. In the pre-#4969
+/// parallel `FxHashMap<String, _>` shape the profile table and the sketch tables
+/// could DISAGREE: a profile could carry `icmp_flood_threshold > 0` while its
+/// `icmp_dst_sketch` entry was absent (a missed prepopulation step in
+/// `update_profiles`), and the screened path's `if let Some(sketch) = ...` then
+/// fell through to a fail-open Pass — the PRIMARY per-destination cap silently
+/// disabled. Building every sub-state together in `from_profile` makes
+/// `Some ⟺ configured` a construction invariant.
+///
+/// Part 1 asserts the construction invariant directly (RED on revert: if a
+/// future edit stops constructing a configured limiter's sub-state, the
+/// `is_some()` assertion fails by assertion, not a build break). Part 2 proves
+/// the sub-state's presence is LOAD-BEARING for enforcement: nulling
+/// `icmp_dst_sketch` (the parallel-map "configured-but-missing" shape) FAILS THE
+/// SCREEN OPEN — the per-destination cap a correctly-constructed zone enforces
+/// no longer trips.
+#[test]
+fn zone_screen_state_construction_has_no_fail_open_gap_4969() {
+    // --- Part 1: construction invariant (Some ⟺ configured). ---
+    let mut configured = ScreenProfile::default();
+    configured.icmp_flood_threshold = 3;
+    configured.udp_flood_threshold = 3;
+    configured.syn_flood_dst_threshold = 3;
+    configured.syn_flood_src_threshold = 3;
+    configured.syn_flood_alarm_threshold = 2;
+    configured.syn_flood_threshold = 10;
+
+    let z = ZoneScreenState::from_profile(configured.clone());
+    assert!(
+        z.icmp_dst_sketch.is_some(),
+        "icmp_flood_threshold>0 must construct the icmp_dst_sketch"
+    );
+    assert!(
+        z.udp_dst_sketch.is_some(),
+        "udp_flood_threshold>0 must construct the udp_dst_sketch"
+    );
+    assert!(
+        z.syn_dst_sketch.is_some(),
+        "syn_flood_dst_threshold>0 must construct the syn_dst_sketch"
+    );
+    assert!(
+        z.syn_src_sketch.is_some(),
+        "syn_flood_src_threshold>0 must construct the syn_src_sketch"
+    );
+
+    // Symmetric negative: an unconfigured profile constructs NONE of the
+    // sketches, so the Option is a faithful `Some ⟺ configured` flag (memory
+    // still tracks live config), not a lazy "always Some".
+    let bare = ZoneScreenState::from_profile(ScreenProfile::default());
+    assert!(bare.icmp_dst_sketch.is_none());
+    assert!(bare.udp_dst_sketch.is_none());
+    assert!(bare.syn_dst_sketch.is_none());
+    assert!(bare.syn_src_sketch.is_none());
+
+    // --- Part 2: the sub-state is load-bearing for enforcement. ---
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let victim = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+
+    // (a) Correctly-constructed zone: the PRIMARY per-destination ICMP cap
+    // (threshold 3) enforces — 3 admitted, the 4th to the victim Drops.
+    let mut enforced = make_state("trust", configured.clone());
+    for _ in 0..3 {
+        assert_eq!(
+            enforced.check_packet("trust", &icmp_pkt(src, victim, 84), 100),
+            ScreenVerdict::Pass
+        );
+    }
+    assert_eq!(
+        enforced.check_packet("trust", &icmp_pkt(src, victim, 84), 100),
+        ScreenVerdict::Drop("icmp-flood"),
+        "configured per-destination ICMP cap must enforce on the screened path"
+    );
+
+    // (b) Fail-open simulation: null the per-destination sketch (the pre-#4969
+    // "configured-but-missing entry" shape). The PRIMARY cap can no longer trip;
+    // only the SECONDARY aggregate ceiling (8× threshold = 24) gates, so the 4th
+    // packet that Dropped in (a) now PASSES — the exact fail-open the #4969
+    // construction invariant forecloses. (tests is a child module, so it may
+    // reach the private `zones` map / `ZoneScreenState` fields to inject the gap.)
+    let mut leaky = make_state("trust", configured);
+    leaky
+        .zones
+        .get_mut("trust")
+        .expect("zone present")
+        .icmp_dst_sketch = None;
+    for i in 0..8u8 {
+        assert_eq!(
+            leaky.check_packet("trust", &icmp_pkt(src, victim, 84), 100),
+            ScreenVerdict::Pass,
+            "with icmp_dst_sketch missing (pre-#4969 fail-open) the per-destination \
+             cap does NOT trip (packet {i} of a would-be-dropped burst)"
+        );
+    }
+}
+
 #[test]
 fn icmp_flood_per_dest_token_bucket_bounds_burst_and_refills() {
     // #5805: the per-destination ICMP flood cap is now a monotonic-ns TOKEN
