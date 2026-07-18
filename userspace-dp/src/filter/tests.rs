@@ -2130,6 +2130,84 @@ fn filter_result_forwarding_class_defaults_none_zero_alloc() {
     assert_eq!(no_fc.forwarding_class, None);
 }
 
+/// #5444: a matched term's `policer`, `routing-instance`, and
+/// `forwarding-class` modifiers round-trip into the FilterResult accumulator.
+///
+/// This is a PERF change with a CORRECTNESS guard — NOT a RED-on-revert. The
+/// fix converts the two owned `String` modifier slots
+/// (`FilterTerm`/`FilterResult` `policer_name` and `routing_instance`) to
+/// reference-counted `Arc<str>` so `merge_matched_modifiers` propagates them
+/// with a refcount bump instead of a per-packet String heap allocation+copy on
+/// the filter fast path. The VALUES carried are byte-identical either way, so a
+/// revert to `String` would still pass this test. It exists so a future
+/// refactor of the modifier merge cannot silently drop or mis-propagate a
+/// modifier, and to pin the zero-alloc `None` default on the no-match path.
+#[test]
+fn filter_result_modifiers_roundtrip_5444() {
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "ge-0/0/0.0".into(),
+        ifindex: 9,
+        filter_input_v4: "steer".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "steer".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "mark".into(),
+                action: "accept".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["5201".into()],
+                policer: "p-lo".into(),
+                routing_instance: "blue".into(),
+                forwarding_class: "assured".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+
+    // A matching flow carries all three modifiers into the FilterResult.
+    let matched = evaluate_interface_filter(
+        &state,
+        9,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        5201,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(matched.action, FilterAction::Accept);
+    assert_eq!(matched.policer_name.as_deref(), Some("p-lo"));
+    assert_eq!(matched.routing_instance.as_deref(), Some("blue"));
+    assert_eq!(matched.forwarding_class.as_deref(), Some("assured"));
+
+    // A non-matching flow leaves every modifier at the zero-alloc default None.
+    let unmatched = evaluate_interface_filter(
+        &state,
+        9,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        22,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(unmatched.policer_name, None);
+    assert_eq!(unmatched.routing_instance, None);
+    assert_eq!(unmatched.forwarding_class, None);
+}
+
 #[test]
 fn parse_filter_state_prequalifies_interface_and_lo0_filter_keys() {
     let ifaces = vec![crate::InterfaceSnapshot {
@@ -3373,7 +3451,9 @@ fn interface_filter_non_routing_counted_defers_pbr_term() {
         NonRoutingCountPolicy::Always,
     );
     assert_eq!(pbr.action, FilterAction::Accept);
-    assert!(pbr.routing_instance.is_empty());
+    // #5444: FilterResult.routing_instance is Option<Arc<str>>; the non-routing
+    // evaluator resets it to None (it defers PBR to the routing-instance eval).
+    assert!(pbr.routing_instance.is_none());
     let filter = state.iface_filter_v4_fast.get(&12).expect("input filter");
     assert_eq!(filter.terms[0].counter.packets.load(Ordering::Relaxed), 0);
 
@@ -7654,7 +7734,9 @@ fn pbr_miss_path_counts_fallthrough_term_exactly_once() {
         policy,
     );
     assert_eq!(precheck.action, FilterAction::Accept);
-    assert!(precheck.routing_instance.is_empty());
+    // #5444: FilterResult.routing_instance is Option<Arc<str>>; None on the
+    // non-routing precheck (the PBR override rides FilterRoutingInstanceResult).
+    assert!(precheck.routing_instance.is_none());
 
     // Step 2 — routing-instance evaluator (route override). It owns the count.
     let routing = evaluate_interface_filter_routing_instance_event_counted(

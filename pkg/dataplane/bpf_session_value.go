@@ -55,13 +55,33 @@ var (
 // trailing fields. Keep field-for-field in sync with both SessionValue
 // (types.go) and the C struct (xpf_conntrack.h); the parity test in
 // bpf_session_value_test.go fails if the size drifts from 136.
+//
+// EXPLICIT PADDING (#6082): every byte the C/Go compiler inserts as implicit
+// alignment padding is declared as a named `_ [N]byte` gap. This is NOT
+// cosmetic — cilium/ebpf's map I/O (Lookup / Iterate / BatchLookup, via
+// internal/sysenc.Unmarshal) takes a zero-copy fast path ONLY when
+// binary.Size(T) == unsafe.Sizeof(T) (it compares encoding/binary's field-sum
+// size against the native slice-element size). encoding/binary does not count
+// implicit padding, so with the three head gaps left implicit binary.Size was
+// 129 while unsafe.Sizeof is 136; sysenc then fell back to binary.Decode, which
+// consumes only 129 of every 136 kernel value bytes and fails the whole batch
+// with "unmarshaling []dataplane.bpfSessionValue doesn't consume all data",
+// breaking the 60s HA session-sync sweep. Making the padding explicit keeps
+// binary.Size == unsafe.Sizeof == 136 (blank `_` fields ARE counted by
+// encoding/binary yet do NOT count as "unexported" for the fast path), so the
+// zero-copy path stays engaged. The on-map ABI bytes are unchanged: these pads
+// occupy the exact offsets the compiler already padded, so unsafe.Sizeof and
+// every real field offset are byte-identical to before.
 type bpfSessionValue struct {
 	State uint8
+	_     [1]byte // pad: C aligns __u16 flags after state (#5460 __u16 widen; #6082)
 	// uint16 to match C `struct session_value.flags` (SessFlagNPTV6 = bit 8, #5460).
 	Flags      uint16
 	TCPState   uint8
 	IsReverse  uint8
+	_          [2]byte // pad: C aligns __u32 app_timeout (#6082)
 	AppTimeout uint32
+	_          [4]byte // pad: C aligns __u64 session_id to 8-byte boundary (#6082)
 
 	SessionID uint64
 
@@ -98,14 +118,19 @@ type bpfSessionValue struct {
 
 // bpfSessionValueV6 mirrors C `struct session_value_v6` exactly (184 bytes; 176
 // before the #5460 __u16 flags widen). It is SessionValueV6 without the
-// sync-only trailing fields.
+// sync-only trailing fields. The head padding is declared explicitly for the
+// same cilium/ebpf marshal-size reason as bpfSessionValue (#6082) — see that
+// type's doc comment.
 type bpfSessionValueV6 struct {
 	State uint8
+	_     [1]byte // pad: C aligns __u16 flags after state (#5460 __u16 widen; #6082)
 	// uint16 to match C `struct session_value_v6.flags` (see bpfSessionValue, #5460).
 	Flags      uint16
 	TCPState   uint8
 	IsReverse  uint8
+	_          [2]byte // pad: C aligns __u32 app_timeout (#6082)
 	AppTimeout uint32
+	_          [4]byte // pad: C aligns __u64 session_id to 8-byte boundary (#6082)
 
 	SessionID uint64
 

@@ -137,10 +137,10 @@ type SyncStats struct {
 	// standby's held set for a family.
 	DHCPLeasesStaleIgnored atomic.Uint64
 	DHCPLeasesSeeded       atomic.Uint64
-	FencesSent         atomic.Uint64
-	FencesReceived     atomic.Uint64
-	Errors             atomic.Uint64
-	DeletesDropped     atomic.Uint64
+	FencesSent             atomic.Uint64
+	FencesReceived         atomic.Uint64
+	Errors                 atomic.Uint64
+	DeletesDropped         atomic.Uint64
 	// DeletesStaleIgnored counts deletes refused by the #2170 install-
 	// generation guard: a journaled/deferred delete whose generation was
 	// strictly older than the currently-installed same-key entry. A nonzero
@@ -174,16 +174,16 @@ type SyncStats struct {
 // SyncStatsSnapshot is a point-in-time copy of SyncStats with plain
 // non-atomic fields, safe to copy by value and pass across API boundaries.
 type SyncStatsSnapshot struct {
-	SessionsSent         uint64
-	SessionsReceived     uint64
-	SessionsInstalled    uint64
-	DeletesSent          uint64
-	DeletesReceived      uint64
-	BulkSyncs            uint64
-	ConfigsSent          uint64
-	ConfigsReceived      uint64
-	ConfigsStaleIgnored  uint64
-	ConfigsApplyFailed   uint64
+	SessionsSent           uint64
+	SessionsReceived       uint64
+	SessionsInstalled      uint64
+	DeletesSent            uint64
+	DeletesReceived        uint64
+	BulkSyncs              uint64
+	ConfigsSent            uint64
+	ConfigsReceived        uint64
+	ConfigsStaleIgnored    uint64
+	ConfigsApplyFailed     uint64
 	IPsecSASent            uint64
 	IPsecSAReceived        uint64
 	IPsecSAStaleIgnored    uint64
@@ -191,22 +191,22 @@ type SyncStatsSnapshot struct {
 	DHCPLeasesReceived     uint64
 	DHCPLeasesStaleIgnored uint64
 	DHCPLeasesSeeded       uint64
-	FencesSent           uint64
-	FencesReceived       uint64
-	Errors               uint64
-	DeletesDropped       uint64
-	DeletesStaleIgnored  uint64
-	InstallsStaleIgnored uint64
-	GenMapOverflow       uint64
-	Connected            bool
-	ActiveFabric         int
-	BulkSyncStartTime    int64
-	BulkSyncEndTime      int64
-	BulkSyncSessions     uint64
-	LastConfigSyncTime   int64
-	LastConfigSyncSize   uint64
-	LastFenceSeq         uint64
-	LastFenceAckAt       int64
+	FencesSent             uint64
+	FencesReceived         uint64
+	Errors                 uint64
+	DeletesDropped         uint64
+	DeletesStaleIgnored    uint64
+	InstallsStaleIgnored   uint64
+	GenMapOverflow         uint64
+	Connected              bool
+	ActiveFabric           int
+	BulkSyncStartTime      int64
+	BulkSyncEndTime        int64
+	BulkSyncSessions       uint64
+	LastConfigSyncTime     int64
+	LastConfigSyncSize     uint64
+	LastFenceSeq           uint64
+	LastFenceAckAt         int64
 }
 
 // TransferReadinessSnapshot captures session-sync state that determines whether
@@ -340,9 +340,20 @@ type SessionSync struct {
 	// IsPrimaryFn reports whether the local node is primary for the default sync scope.
 	IsPrimaryFn func() bool
 	// IsPrimaryForRGFn reports whether the local node is primary for a given RG.
-	IsPrimaryForRGFn     func(rgID int) bool
-	lastSweepTime        uint64
-	syncBackfillNeeded   atomic.Bool
+	IsPrimaryForRGFn   func(rgID int) bool
+	lastSweepTime      uint64
+	syncBackfillNeeded atomic.Bool
+	// forceResync arms a full authoritative bulk resync after a delete-journal
+	// overflow dropped session-delete records the standby still needs (#5450).
+	// It is DISTINCT from syncBackfillNeeded: that flag re-drives the INSTALL
+	// sweep (re-sends live sessions), but a dropped delete is a teardown for a
+	// session that no longer exists locally, so no install sweep can re-derive
+	// it — the only recovery is a full BulkSync so the peer's
+	// reconcileStaleSessions deletes the sessions the primary already closed.
+	// Armed once per overflow episode (CAS) by rejournalTail/journalDelete and
+	// consumed by whichever of the sweep loop (syncSweep) or the next reconnect
+	// (handleNewConnection) runs first.
+	forceResync          atomic.Bool
 	lastNewCounter       uint64
 	lastClosedCounter    uint64
 	lastSweepEmpty       bool

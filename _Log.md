@@ -1,3 +1,111 @@
+## 2026-07-17 — #5450: delete-journal overflow must arm a full bulk resync
+
+- **Timestamp**: 2026-07-17 (fix/5450-delete-journal-reconcile)
+- **Action**: On a full/disconnected send stream the delete journal
+  (`pkg/cluster/sync_conn.go`) evicts the OLDEST queued session-delete records
+  to stay under `deleteJournalCap`. Dropped deletes were counted
+  (`DeletesDropped`) but never otherwise recovered — the standby kept the
+  sessions the primary already closed until the next unrelated full bulk
+  reconcile, which under an extended control-link partition with high churn
+  could be far away (ghost sessions → wrong forwarding + inflated session
+  count). Fix: added a `forceResync atomic.Bool`; both drop sites
+  (`journalDelete` append-past-cap and `rejournalTail` re-journal-past-cap) now
+  arm it via a shared `armDeleteResync()` CAS (pure atomic under
+  `deleteJournalMu` — no I/O, idempotent, armed once per overflow episode). It
+  is consumed by whichever runs first: the connected sweep (`syncSweep`) or the
+  next reconnect (`handleNewConnection`, re-read AFTER `flushDeleteJournal` so an
+  eviction during that flush is caught), each firing a full authoritative
+  `doBulkSync` even when already primed. The peer's `reconcileStaleSessions` at
+  `BulkEnd` then deletes exactly the sessions absent from the snapshot. On a
+  failed bulk the arm is restored so a later sweep/reconnect retries.
+  `forceResync` is kept DISTINCT from `bulkEverCompleted` (daemon reads it for
+  VRRP sync-hold gating) and from `syncBackfillNeeded` (re-drives INSTALLS only
+  — a dropped delete has no live session to re-derive).
+- **File(s)**: pkg/cluster/sync.go (field), pkg/cluster/sync_conn.go
+  (armDeleteResync, journalDelete, rejournalTail, syncSweep,
+  handleNewConnection), pkg/cluster/sync_test.go
+  (TestDeleteJournalOverflowArmsForceResync, fail-on-revert),
+  docs/session-sync-architecture.md.
+- **Validation**: `go build ./...` clean; `go test ./pkg/cluster/...` green
+  (incl. `-race`); fail-on-revert confirmed (removing the rejournalTail
+  arm fails `rejournal_overflow_arms`). Failover smoke advised on the loss
+  userspace cluster (parent to run) — this touches session-sync.
+## 2026-07-17 — #6082: bpfSessionValue implicit padding breaks cilium/ebpf batch marshal
+
+- **Timestamp**: 2026-07-17 (fix/6082-session-value-marshal-size)
+- **Action**: The 60s HA session-sync sweep failed EVERY iteration on the loss
+  cluster (both nodes) with `batch lookup sessions: map batch lookup:
+  unmarshaling []dataplane.bpfSessionValue doesn't consume all data`. Root
+  cause (confirmed empirically): cilium/ebpf v0.20 `internal/sysenc.Unmarshal`
+  takes its zero-copy fast path ONLY when `binary.Size(T) == unsafe.Sizeof(T)`
+  (marshal.go:143 + layout.go). `bpfSessionValue`/`V6` carried 7 bytes of
+  IMPLICIT head alignment padding (gaps after State@1, after IsReverse@6-7,
+  before SessionID@12-15) introduced when #5460 widened `flags` __u8->__u16.
+  `unsafe.Sizeof` = 136/184 but `binary.Size` = 129/177, so sysenc fell back to
+  `binary.Decode`, which consumes only 129/177 of each 136/184-byte kernel
+  record → the whole batch errors. Every map read (BatchLookup, Iterate, single
+  Lookup) was affected; the sweep is just where it logged.
+- **Fix**: made all three head-padding gaps EXPLICIT via named `_ [N]byte`
+  fields in `bpfSessionValue` and `bpfSessionValueV6`, mirroring the C
+  `struct session_value{,_v6}` byte layout. binary.Size now == unsafe.Sizeof ==
+  136/184, so the zero-copy path stays engaged. No real field type/order/offset
+  changed; on-map ABI bytes byte-identical (unsafe.Sizeof + every offset
+  unchanged). Blank `_` fields are counted by encoding/binary but do NOT count
+  as "unexported" for the fast path (layout.go:28).
+- **Tests**: added `TestBPFSessionValueMarshalsAtConntrackABISize` (asserts
+  binary.Size == unsafe.Sizeof == 136/184 for both structs — the fail-on-revert
+  guard #6082 needed; verified RED with pads removed while the old
+  unsafe.Sizeof-only ABI test stayed GREEN, proving the old test could not catch
+  it) and `TestBatchLookupSessionsRoundTrip` (real kernel v4/v6 maps: install
+  via Set/toBPF, read back via BatchIterateSessions/V6 + GetSessionV4/V6;
+  skips unprivileged, runs on the privileged cluster where #6082 was seen).
+- **File(s)**: pkg/dataplane/bpf_session_value.go,
+  pkg/dataplane/bpf_session_value_test.go
+- **Validation**: `go build ./...`, `go test ./pkg/dataplane/...`,
+  `go test ./pkg/cluster/... ./pkg/conntrack/...` all green (round-trip skips
+  unprivileged). gofmt -w on both touched files.
+
+## 2026-07-17 — #5444: filter modifier propagation is Arc<str>, not per-packet String clone
+
+- **Timestamp**: 2026-07-17 (fix/5444-filter-modifier-clone)
+- **Action**: `merge_matched_modifiers` (userspace-dp filter action-eval hot
+  path, runs per matched term on every input/output/lo0 filter walk)
+  heap-cloned two owned `String` fields (`policer_name`, `routing_instance`)
+  into the per-packet `FilterResult` for EVERY matched term — two allocation
+  +copy events on the filter fast path. Converted `FilterTerm.policer_name`
+  and `FilterTerm.routing_instance` from `String` to `Arc<str>` (interned once
+  at compile time in `compiler.rs`, mirroring the existing
+  `forwarding_class: Arc<str>`), and `FilterResult.policer_name` /
+  `.routing_instance` from `String` to `Option<Arc<str>>` (mirroring the #5151
+  `forwarding_class: Option<Arc<str>>` pattern). The merge is now a refcount
+  bump; the accumulator default and the non-routing reset are zero-alloc
+  (`None`) instead of `String::new()`. Output is byte-identical — the same
+  policer/routing-instance/forwarding-class values flow downstream. Verified
+  no non-test consumer reads either FilterResult field (the live routing-
+  instance override rides the separate `FilterRoutingInstanceResult<'a>` with
+  its `&'a str`, untouched); neither field is mutated in place; the config-
+  owned source outlives every FilterResult. `cache_sensitive.rs` term-compare
+  (`Arc<str> == Arc<str>`) and PBR evaluators (`&*term.routing_instance`)
+  adjusted. Two test asserts on `FilterResult.routing_instance` moved from
+  `.is_empty()` to `.is_none()`.
+- **File(s)**: userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/engine/eval.rs, userspace-dp/src/filter/tests.rs
+- **Validation**: `cargo build` clean; filter suite 189 tests green, run 5×
+  no flakes; new perf-with-correctness-guard test
+  `filter_result_modifiers_roundtrip_5444` asserts all three modifiers round-
+  trip into FilterResult on a match and default to `None` on a miss (NOT a
+  RED-on-revert — values are byte-identical either way; it guards against a
+  future refactor silently dropping a modifier). Grepped the changed fn: the
+  three remaining `.clone()` are all `Arc<str>` refcount bumps, zero
+  `String::`/`.to_string()`. Two full-suite failures
+  (`wire_invariant_default_specimens` nat64 stats fixture drift,
+  `stalled_consumer_...backlog_unbounded_end_to_end` backpressure timing) are
+  PRE-EXISTING — reproduced identically with this change stashed; unrelated to
+  the filter module. Perf-only change with byte-identical output, so no
+  design-doc/contract update needed (the #5444 in-code comments, mirroring the
+  #5151/#5857 precedent, are the documentation surface).
+
 ## 2026-07-17 — #5469: write_state serializes+fsyncs OUTSIDE the ServerState lock
 
 - **Timestamp**: 2026-07-17 (fix/5469-writestate-lock-convoy)
@@ -51767,6 +51875,30 @@ top.
   `mac_change_epoch_isolated_per_shard_across_neighbors` RED while the #3048
   over-eviction guard stays green.
 
+## 2026-07-17 — #5306 fabric snapshot writeback (Go control plane)
+- **Timestamp**: 2026-07-17
+- **Action**: Fix HA fabric-snapshot revert bug. `SyncFabricState`
+  resolved fabric peer MACs and shipped them over `update_fabrics` but
+  never wrote the resolved set back into Go's `m.lastSnapshot.Fabrics`.
+  The partial-rebuild publish paths (`PublishRouteOverlaySnapshot`, the
+  policy-scheduler republish, the #5134 worker-arm re-apply) each do
+  `next := *m.lastSnapshot` and rebuild only Routes, re-publishing the
+  STALE unresolved-MAC fabrics verbatim and silently reverting the helper
+  during the HA window fabric forwarding must preserve. Added
+  `persistResolvedFabricsLocked` (mirrors `RegenerateNeighborSnapshot`'s
+  post-publish writeback: bump generation + publishedSnapshot, refresh
+  lastSnapshotHash, no-op on unchanged) called after a successful
+  `update_fabrics`. Added an injectable `fabricSnapshotBuilder` seam for
+  deterministic unit testing.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/manager_fabric_writeback_5306_test.go,
+  docs/fabric-cross-chassis-fwd.md
+- **Validation**: `go build ./...` green; `go test
+  ./pkg/dataplane/userspace/...` green. RED-on-revert verified firsthand:
+  neutralizing the `persistResolvedFabricsLocked` writeback turns
+  `TestSyncFabricStatePersistsResolvedFabricsIntoLastSnapshot` RED (both
+  the direct-writeback and end-to-end apply_snapshot assertions).
 ## 2026-07-17 — #5660 nat/allocator bounded-hardening (2 items)
 - **Timestamp**: 2026-07-17
 - **Action**: Item 1 — replace the O(N) `pool_v4.iter().position()` linear scan
