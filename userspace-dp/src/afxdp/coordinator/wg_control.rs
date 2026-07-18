@@ -450,8 +450,9 @@ fn run_wg_control_loop(
                     // receive.)
                     match outcome {
                         InboundOutcome::CompletedInitiator(peer) => {
-                            let _ = engine.take_rekey_request();
-                            let _ = engine.take_handshake_request();
+                            // #5164: drain only THIS completed peer's edges.
+                            let _ = engine.take_rekey_request(&peer);
+                            let _ = engine.take_handshake_request(&peer);
                             // Post-msg2 key-confirmation keepalive
                             // (Codex r2 C4, Linux receive.c parity):
                             // the peer's responder-role session is
@@ -473,9 +474,10 @@ fn run_wg_control_loop(
                                 recent_exceptions,
                             );
                         }
-                        InboundOutcome::CompletedResponder(_) => {
-                            let _ = engine.take_rekey_request();
-                            let _ = engine.take_handshake_request();
+                        InboundOutcome::CompletedResponder(peer) => {
+                            // #5164: drain only THIS completed peer's edges.
+                            let _ = engine.take_rekey_request(&peer);
+                            let _ = engine.take_handshake_request(&peer);
                         }
                         _ => {}
                     }
@@ -731,8 +733,8 @@ fn drive_attempt_machine(
             // Only traffic AFTER this boundary may re-trigger.
             engine.abort_pending_for_peer(peer_pubkey);
             engine.clear_t7_arm(peer_pubkey);
-            let _ = engine.take_rekey_request();
-            let _ = engine.take_handshake_request();
+            let _ = engine.take_rekey_request(peer_pubkey);
+            let _ = engine.take_handshake_request(peer_pubkey);
             *attempt = None;
             // #2961: advance the T8 pacing anchor to the GIVE-UP time so
             // a permanently-down persistent-keepalive peer waits a full
@@ -791,8 +793,11 @@ fn drive_attempt_machine(
     // initiation-predicate table. Edges are consume-once; a consumed
     // edge with no known endpoint is dropped (any subsequent send on a
     // stale session re-arms it, so it cannot be permanently lost).
-    let rekey_edge = engine.take_rekey_request();
-    let nosession_edge = engine.take_handshake_request();
+    // #5164: consume ONLY this peer's edges — the per-peer loop iterates
+    // pubkey-sorted peers, so a global edge here let the first-sorted peer
+    // drain an edge peer B raised, blackholing B.
+    let rekey_edge = engine.take_rekey_request(peer_pubkey);
+    let nosession_edge = engine.take_handshake_request(peer_pubkey);
     let trigger = if rekey_edge {
         Some(AttemptTrigger::RekeyEdge)
     } else if nosession_edge && !engine.peer_has_confirmed_session(peer_pubkey) {
@@ -1564,9 +1569,9 @@ fn encap_and_send(
             }
         }
         Err(crate::afxdp::wg::EncapError::NoSession) => {
-            // No confirmed session yet — request a handshake (rate-
-            // limited) and drop this packet.
-            engine.request_handshake(monotonic_nanos());
+            // No confirmed session yet — request a handshake for THIS peer
+            // (rate-limited, #5164) and drop this packet.
+            engine.request_handshake(peer_pubkey, monotonic_nanos());
         }
         Err(_e) => {
             debug_log!("WG[{}]: encap drop reason={:?}", tunnel_name, _e);

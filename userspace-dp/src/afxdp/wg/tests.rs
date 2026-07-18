@@ -2459,41 +2459,163 @@ mod framed_handshake {
 #[test]
 fn wg_request_handshake_is_rate_limited_per_interval() {
     use super::engine::WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS;
+    let (_resp_priv, pk) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
         local_private_key: keypair().0.into(),
         listen_port: 51820,
-        peers: vec![],
+        peers: vec![WgPeerConfig {
+            pubkey: pk,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32].into(),
+        }],
     });
     // First edge at t=0 records.
-    assert!(engine.request_handshake(0), "first request must record an edge");
+    assert!(engine.request_handshake(&pk, 0), "first request must record an edge");
     // A flood within the interval must NOT record additional edges.
     for t in 1..1000u64 {
         assert!(
-            !engine.request_handshake(t),
+            !engine.request_handshake(&pk, t),
             "request within the rate-limit interval must be suppressed at t={t}"
         );
     }
     // After the interval elapses, a fresh edge is allowed again.
     assert!(
-        engine.request_handshake(WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS + 1),
+        engine.request_handshake(&pk, WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS + 1),
         "request after the interval must record a fresh edge"
     );
 }
 
 #[test]
 fn wg_take_handshake_request_consumes_a_single_edge() {
+    let (_resp_priv, pk) = keypair();
     let engine = WgEngine::new(WgEngineConfig {
         local_private_key: keypair().0.into(),
         listen_port: 51820,
-        peers: vec![],
+        peers: vec![WgPeerConfig {
+            pubkey: pk,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32].into(),
+        }],
     });
-    assert!(!engine.take_handshake_request(), "no edge pending initially");
-    engine.request_handshake(0);
-    assert!(engine.take_handshake_request(), "pending edge must be taken");
+    assert!(!engine.take_handshake_request(&pk), "no edge pending initially");
+    engine.request_handshake(&pk, 0);
+    assert!(engine.take_handshake_request(&pk), "pending edge must be taken");
     assert!(
-        !engine.take_handshake_request(),
+        !engine.take_handshake_request(&pk),
         "edge must be cleared after one take"
     );
+}
+
+/// #5164: build a two-peer engine whose peers sort A < B by pubkey, so A is
+/// the "first-sorted" peer whose iteration runs first in the control thread's
+/// pubkey-sorted per-peer loop (`engine.peer_pubkeys()` returns table order).
+fn two_peer_engine_sorted() -> (WgEngine, [u8; 32], [u8; 32]) {
+    let (_a, k1) = keypair();
+    let (_b, k2) = keypair();
+    let (peer_a, peer_b) = if k1 < k2 { (k1, k2) } else { (k2, k1) };
+    assert!(peer_a < peer_b, "A must sort strictly before B");
+    let engine = WgEngine::new(WgEngineConfig {
+        local_private_key: keypair().0.into(),
+        listen_port: 51820,
+        peers: vec![
+            WgPeerConfig {
+                pubkey: peer_a,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32].into(),
+            },
+            WgPeerConfig {
+                pubkey: peer_b,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32].into(),
+            },
+        ],
+    });
+    (engine, peer_a, peer_b)
+}
+
+/// #5164 fail-on-revert: the NoSession handshake-request edge is PER PEER — an
+/// edge raised by higher-sorted peer B must be consumed by B's own attempt
+/// machine, and the lower-sorted peer A's iteration (which runs first in the
+/// pubkey-sorted control loop) must NOT drain it. With the pre-#5164
+/// engine-GLOBAL `AtomicBool`, A's `take_handshake_request` drained the single
+/// shared edge, so B never saw its NoSession edge and — with no keepalive to
+/// re-arm it — was BLACKHOLED. Reverting the per-peer scoping to a shared edge
+/// makes the "A must not drain B" assertion RED.
+#[test]
+fn wg_handshake_request_edge_is_per_peer_not_drained_by_lower_sorted_sibling() {
+    let (engine, peer_a, peer_b) = two_peer_engine_sorted();
+
+    // Higher-sorted peer B's egress hit NoSession and armed ITS edge.
+    assert!(
+        engine.request_handshake(&peer_b, 0),
+        "B arms its own handshake-request edge"
+    );
+
+    // The lower-sorted peer A runs FIRST in the control loop. It must NOT
+    // consume B's edge (the #5164 blackhole).
+    assert!(
+        !engine.take_handshake_request(&peer_a),
+        "lower-sorted peer A must NOT drain an edge raised for B (#5164 blackhole)"
+    );
+    // B's own iteration consumes B's edge.
+    assert!(
+        engine.take_handshake_request(&peer_b),
+        "B's iteration consumes B's own handshake-request edge"
+    );
+    // Consume-once, per peer.
+    assert!(
+        !engine.take_handshake_request(&peer_b),
+        "B's edge is cleared after B's own take"
+    );
+
+    // Symmetry: an edge for A is likewise private to A (B must not drain it).
+    assert!(engine.request_handshake(&peer_a, 0), "A arms its own edge");
+    assert!(
+        !engine.take_handshake_request(&peer_b),
+        "B must NOT drain an edge raised for A"
+    );
+    assert!(engine.take_handshake_request(&peer_a), "A consumes its own edge");
+}
+
+/// #5164 fail-on-revert (rekey edge): identical ownership contract for the
+/// "session is stale, rekey" edge. A stale-session rekey armed by peer B must
+/// drive B's attempt, not be drained by lower-sorted peer A. Reverting to the
+/// engine-global rekey `AtomicBool` makes the "A must not drain B" assert RED.
+#[test]
+fn wg_rekey_request_edge_is_per_peer_not_drained_by_lower_sorted_sibling() {
+    let (engine, peer_a, peer_b) = two_peer_engine_sorted();
+
+    // Peer B's stale session armed ITS rekey edge (T1/T2/T3 use sites).
+    engine.request_rekey(&peer_b);
+
+    assert!(
+        !engine.take_rekey_request(&peer_a),
+        "lower-sorted peer A must NOT drain B's rekey edge (#5164)"
+    );
+    assert!(
+        engine.take_rekey_request(&peer_b),
+        "B's iteration consumes B's own rekey edge"
+    );
+    assert!(
+        !engine.take_rekey_request(&peer_b),
+        "B's rekey edge is cleared after B's own take"
+    );
+
+    // Symmetry.
+    engine.request_rekey(&peer_a);
+    assert!(
+        !engine.take_rekey_request(&peer_b),
+        "B must NOT drain an edge raised for A"
+    );
+    assert!(engine.take_rekey_request(&peer_a), "A consumes its own rekey edge");
 }
 
 #[test]
@@ -2524,7 +2646,7 @@ fn wg_no_session_encap_triggers_single_init_per_interval() {
     for _ in 0..256 {
         match engine.try_encap(&resp_pub, &pkt, &mut out) {
             Err(EncapError::NoSession) => {
-                if engine.request_handshake(0) {
+                if engine.request_handshake(&resp_pub, 0) {
                     edges += 1;
                 }
             }
@@ -2533,9 +2655,9 @@ fn wg_no_session_encap_triggers_single_init_per_interval() {
     }
     assert_eq!(edges, 1, "exactly one handshake edge per interval under flood");
     // The control thread consumes the single edge.
-    assert!(engine.take_handshake_request());
+    assert!(engine.take_handshake_request(&resp_pub));
     // After the interval, another flood produces one more edge.
-    assert!(engine.request_handshake(WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS + 1));
+    assert!(engine.request_handshake(&resp_pub, WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS + 1));
 }
 
 #[test]
@@ -2699,10 +2821,17 @@ fn wg_request_handshake_single_edge_under_concurrent_callers() {
     // simultaneously; exactly one must observe `true`.
     use std::sync::Arc as StdArc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_resp_priv, pk) = keypair();
     let engine = StdArc::new(WgEngine::new(WgEngineConfig {
         local_private_key: keypair().0.into(),
         listen_port: 51820,
-        peers: vec![],
+        peers: vec![WgPeerConfig {
+            pubkey: pk,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32].into(),
+        }],
     }));
     let wins = StdArc::new(AtomicUsize::new(0));
     let start = StdArc::new(std::sync::Barrier::new(16));
@@ -2714,7 +2843,7 @@ fn wg_request_handshake_single_edge_under_concurrent_callers() {
         handles.push(std::thread::spawn(move || {
             b.wait();
             // All callers use the same timestamp inside one interval.
-            if e.request_handshake(1) {
+            if e.request_handshake(&pk, 1) {
                 w.fetch_add(1, Ordering::Relaxed);
             }
         }));
@@ -2727,7 +2856,7 @@ fn wg_request_handshake_single_edge_under_concurrent_callers() {
         1,
         "exactly one concurrent caller must win the rate-limit window"
     );
-    assert!(engine.take_handshake_request(), "the winning edge is pending");
+    assert!(engine.take_handshake_request(&pk), "the winning edge is pending");
 }
 
 // ===================================================================
@@ -3019,9 +3148,9 @@ mod telemetry_counters {
     /// count (the rate-limited duplicates do not).
     #[test]
     fn handshake_request_edges_count_accepted_only() {
-        let (init, _resp, _init_pub, _resp_pub) = framed_engine_pair();
-        assert!(init.request_handshake(10));
-        assert!(!init.request_handshake(20), "inside the rate window");
+        let (init, _resp, _init_pub, resp_pub) = framed_engine_pair();
+        assert!(init.request_handshake(&resp_pub, 10));
+        assert!(!init.request_handshake(&resp_pub, 20), "inside the rate window");
         assert_eq!(
             init.counters().hs_requests_armed.load(Ordering::Relaxed),
             1
@@ -3151,26 +3280,26 @@ mod s5_timer_tests {
 
         // Aging alone arms nothing.
         init.set_mock_now_ns(t0 + 130 * SEC);
-        assert!(!init.take_rekey_request());
+        assert!(!init.take_rekey_request(&resp_pub));
 
         // 118s: send does not arm (margin below the 120s threshold).
         init.set_mock_now_ns(t0 + 118 * SEC);
         init.try_encap(&resp_pub, &inner_from_init(), &mut wire)
             .unwrap();
-        assert!(!init.take_rekey_request(), "below REKEY_AFTER_TIME");
+        assert!(!init.take_rekey_request(&resp_pub), "below REKEY_AFTER_TIME");
 
         // 121s: send arms.
         init.set_mock_now_ns(t0 + 121 * SEC);
         init.try_encap(&resp_pub, &inner_from_init(), &mut wire)
             .unwrap();
-        assert!(init.take_rekey_request(), "at/after REKEY_AFTER_TIME");
-        assert!(!init.take_rekey_request(), "edge is consume-once");
+        assert!(init.take_rekey_request(&resp_pub), "at/after REKEY_AFTER_TIME");
+        assert!(!init.take_rekey_request(&resp_pub), "edge is consume-once");
 
         // Responder-role session: same age, no arm.
         resp.set_mock_now_ns(t0 + 121 * SEC);
         resp.try_encap(&init_pub, &inner_from_resp(), &mut wire)
             .unwrap();
-        assert!(!resp.take_rekey_request(), "responder never age-rekeys");
+        assert!(!resp.take_rekey_request(&init_pub), "responder never age-rekeys");
     }
 
     /// T3 encap: refused at/after REJECT_AFTER_TIME with the session's
@@ -3189,7 +3318,7 @@ mod s5_timer_tests {
             init.counters().encap_drops_expired.load(Ordering::Relaxed),
             1
         );
-        assert!(init.take_rekey_request(), "send-side T3 arms the edge");
+        assert!(init.take_rekey_request(&resp_pub), "send-side T3 arms the edge");
         let session = init
             .sessions_by_local_index
             .read()
@@ -3313,7 +3442,7 @@ mod s5_timer_tests {
     /// handshake cadence).
     #[test]
     fn t3_decap_refused_drop_only_no_rekey_arm() {
-        let (init, resp, init_pub, _resp_pub, t0) = pair();
+        let (init, resp, init_pub, resp_pub, t0) = pair();
         let mut wire = [0u8; 2048];
         let mut out = [0u8; 2048];
         // Responder encrypts while its own clock is fresh.
@@ -3330,7 +3459,7 @@ mod s5_timer_tests {
             1
         );
         assert!(
-            !init.take_rekey_request(),
+            !init.take_rekey_request(&resp_pub),
             "decap T3 is drop-only — no rekey arm"
         );
     }
@@ -3351,7 +3480,7 @@ mod s5_timer_tests {
             .unwrap();
         init.set_mock_now_ns(t0 + 166 * SEC);
         init.try_decap(&wire[..enc.len], &mut out).unwrap();
-        assert!(init.take_rekey_request(), "initiator receive past 165s");
+        assert!(init.take_rekey_request(&resp_pub), "initiator receive past 165s");
 
         // Initiator-to-responder record, responder at 166s: no arm.
         init.set_mock_now_ns(t0 + 2 * SEC);
@@ -3359,10 +3488,10 @@ mod s5_timer_tests {
             .try_encap(&resp_pub, &inner_from_init(), &mut wire)
             .unwrap();
         // The encap above stamped/armed init-side state; drain its edge.
-        let _ = init.take_rekey_request();
+        let _ = init.take_rekey_request(&resp_pub);
         resp.set_mock_now_ns(t0 + 166 * SEC);
         resp.try_decap(&wire[..enc2.len], &mut out).unwrap();
-        assert!(!resp.take_rekey_request(), "responder never age-rekeys");
+        assert!(!resp.take_rekey_request(&init_pub), "responder never age-rekeys");
     }
 
     /// expire_sessions tears down current sessions past 180s, removes

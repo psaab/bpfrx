@@ -444,8 +444,9 @@ pub(super) fn wg_encap_frame(
     ) {
         Ok(o) => o,
         Err(EncapError::NoSession) => {
-            // Request a handshake (rate-limited relaxed atomic) and drop.
-            engine.request_handshake(monotonic_nanos());
+            // Request a handshake for THIS peer (rate-limited relaxed atomic,
+            // #5164) and drop.
+            engine.request_handshake(&peer_pubkey, monotonic_nanos());
             return None;
         }
         Err(_) => return None,

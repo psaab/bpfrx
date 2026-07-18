@@ -437,30 +437,20 @@ pub(crate) struct WgEngine {
     /// reconcile; only peer REMOVAL touches both (we drain a
     /// dropped peer's sessions out of this map during reconcile).
     pub(in crate::afxdp::wg) sessions_by_local_index: RwLock<FxHashMap<u32, Arc<WgSession>>>,
-    /// Worker→control "please initiate a handshake" edge (#1432 S2a
-    /// §4.3). When an egress `try_encap` hits `NoSession`, the worker
-    /// arms this edge via a single relaxed atomic store, rate-limited by
-    /// `handshake_request_last_ns` to at most one edge per
-    /// `WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS`. The control thread polls
-    /// and consumes it. This is the ONLY worker→control coupling in S2a
-    /// and it carries no packet data — the worker never builds a
-    /// `HandshakeState` (control-thread-only crypto invariant, §6).
-    pub(in crate::afxdp::wg) handshake_request_pending: std::sync::atomic::AtomicBool,
-    /// Monotonic timestamp of the last accepted request edge (0 = never).
-    /// Used only for the rate-limit gate; distinct from the pending flag
-    /// so a request at `now_ns == 0` (tests) is not confused with "no
-    /// request".
-    pub(in crate::afxdp::wg) handshake_request_last_ns: std::sync::atomic::AtomicU64,
+    /// #5164: the "please initiate a handshake" (NoSession) and "rekey"
+    /// worker→control edges are now PER-PEER, stored on each `Peer`
+    /// (`handshake_request_pending` / `handshake_request_last_ns` /
+    /// `rekey_request_pending` in `peer.rs`) and driven via
+    /// `request_handshake(peer_pubkey, …)` / `take_handshake_request(peer_pubkey)`
+    /// / `request_rekey(peer_pubkey)` / `take_rekey_request(peer_pubkey)`. They
+    /// were engine-global `AtomicBool`s in S2a (single-peer); a global edge
+    /// raised by peer B was drained by the first pubkey-sorted peer A in the
+    /// control loop, blackholing B (#5164). See `Peer` for the fields.
     /// #1865: per-engine telemetry counters (relaxed atomics). Bound
     /// to the engine Arc: survives control-thread respawns and
     /// unrelated commits (engine reuse); resets with the engine on an
     /// identity-changing rebuild — see counters.rs.
     pub(in crate::afxdp::wg) counters: WgCounters,
-    /// #1888 S5: "session is stale, rekey" edge — armed by the encap
-    /// (T1 / send-side T3) and decap (T2 receive-horizon) use sites,
-    /// consumed by the control loop's attempt machine, which initiates
-    /// WITHOUT the confirmed-session gate. See wg/timers.rs.
-    pub(in crate::afxdp::wg) rekey_request_pending: std::sync::atomic::AtomicBool,
     /// #4094 PR-A: responder cookie-reply / MAC2 under-load DoS mitigation
     /// — a per-tunnel rotating secret, an inbound-initiation load gate, a
     /// cookie-reply emission budget, and MAC2 verification, all keyed on
@@ -520,10 +510,7 @@ impl WgEngine {
             table: ArcSwap::from_pointee(PeerTable::empty()),
             reconcile_lock: std::sync::Mutex::new(()),
             sessions_by_local_index: RwLock::new(FxHashMap::default()),
-            handshake_request_pending: std::sync::atomic::AtomicBool::new(false),
-            handshake_request_last_ns: std::sync::atomic::AtomicU64::new(0),
             counters: WgCounters::default(),
-            rekey_request_pending: std::sync::atomic::AtomicBool::new(false),
             cookie: super::cookie::CookieChecker::new(&local_public_key),
             cookie_gen: std::sync::Mutex::new(FxHashMap::default()),
             #[cfg(test)]
@@ -534,34 +521,38 @@ impl WgEngine {
     }
 
     /// Worker side of the NoSession handshake-request edge (#1432 S2a
-    /// §4.3). Records a "please initiate" request at `now_ns`, rate-
-    /// limited to one edge per `WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS`.
-    /// Hot-path safe: a single relaxed load plus an at-most-one relaxed
-    /// store, no lock, no handshake state. Returns `true` if this call
-    /// recorded a fresh edge.
-    pub(crate) fn request_handshake(&self, now_ns: u64) -> bool {
+    /// §4.3), scoped PER PEER (#5164). Records a "please initiate" request for
+    /// `peer_pubkey` at `now_ns`, rate-limited to one edge per
+    /// `WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS` **for that peer**. Hot-path safe:
+    /// a table lookup plus a single relaxed load and an at-most-one relaxed
+    /// store on the peer's own atomics, no handshake state. Returns `true` if
+    /// this call recorded a fresh edge (false if the peer is unknown, still
+    /// inside its rate window, or lost the CAS).
+    pub(crate) fn request_handshake(&self, peer_pubkey: &[u8; WG_KEY_LEN], now_ns: u64) -> bool {
         use std::sync::atomic::Ordering;
-        let last = self.handshake_request_last_ns.load(Ordering::Relaxed);
+        let Some(peer) = self.peer_arc(peer_pubkey) else {
+            return false;
+        };
+        let last = peer.handshake_request_last_ns.load(Ordering::Relaxed);
         // `last == 0` means "never requested" → always allow the first.
         if last != 0 && now_ns.saturating_sub(last) < WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS {
             return false;
         }
         // Claim the rate-limit window with a CAS so exactly one concurrent
-        // NoSession caller wins per interval (Copilot: a plain load+store
-        // let multiple workers all observe the stale `last` and re-arm the
-        // edge each tick). A CAS failure means another worker already
-        // claimed the window; we drop without re-arming. Relaxed is
-        // sufficient — the control thread only needs eventual visibility,
-        // and a lost CAS merely means a peer worker recorded the edge.
+        // NoSession caller wins per interval FOR THIS PEER (Copilot: a plain
+        // load+store let multiple workers all observe the stale `last` and
+        // re-arm the edge each tick). A CAS failure means another worker
+        // already claimed the window; we drop without re-arming. Relaxed is
+        // sufficient — the control thread only needs eventual visibility.
         let stamp = now_ns.max(1);
-        if self
+        if peer
             .handshake_request_last_ns
             .compare_exchange(last, stamp, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
             return false;
         }
-        self.handshake_request_pending.store(true, Ordering::Relaxed);
+        peer.handshake_request_pending.store(true, Ordering::Relaxed);
         WgCounters::bump(&self.counters.hs_requests_armed);
         true
     }
@@ -654,11 +645,16 @@ impl WgEngine {
         }
     }
 
-    /// Control side of the NoSession edge. Returns `true` if a handshake
-    /// request is pending and clears it. Slow path (control thread).
-    pub(crate) fn take_handshake_request(&self) -> bool {
+    /// Control side of the NoSession edge, scoped PER PEER (#5164). Returns
+    /// `true` if a handshake request is pending FOR `peer_pubkey` and clears
+    /// only that peer's edge, so a lower-sorted peer's iteration can no longer
+    /// drain an edge raised for another peer. `false` if the peer is unknown or
+    /// has no pending edge. Slow path (control thread).
+    pub(crate) fn take_handshake_request(&self, peer_pubkey: &[u8; WG_KEY_LEN]) -> bool {
         use std::sync::atomic::Ordering;
-        self.handshake_request_pending.swap(false, Ordering::Relaxed)
+        self.peer_arc(peer_pubkey)
+            .map(|peer| peer.handshake_request_pending.swap(false, Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     /// The pubkey of the first (S2a: only) configured peer, if any.
@@ -1295,13 +1291,13 @@ impl WgEngine {
         let age_ns = now_ns.saturating_sub(session.created_ns);
         if age_ns >= super::session::REJECT_AFTER_TIME_NS {
             WgCounters::bump(&self.counters.encap_drops_expired);
-            self.request_rekey();
+            self.request_rekey(&session.peer_pubkey);
             return Err(EncapError::NoSession);
         }
         if session.role == super::session::SessionRole::Initiator
             && age_ns >= super::session::REKEY_AFTER_TIME_NS
         {
-            self.request_rekey();
+            self.request_rekey(&session.peer_pubkey);
         }
 
         // WG spec §5.4.6 mandates the plaintext be zero-padded to a
@@ -1559,7 +1555,7 @@ impl WgEngine {
                 && now_ns.saturating_sub(session.created_ns)
                     >= super::session::RECV_REKEY_HORIZON_NS
             {
-                self.request_rekey();
+                self.request_rekey(&session.peer_pubkey);
             }
         }
         // #1865: authenticated ZERO-length transport record == WG

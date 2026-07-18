@@ -1,3 +1,90 @@
+## 2026-07-18 — #5160: move redirect-sample sequence off the shared destination atomic to producer-local TLS
+
+- **Timestamp**: 2026-07-18 (fix/5160-redirect-sample-local)
+- **Action**: `enqueue_tx_owned` (umem/mod.rs) did an unconditional
+  `fetch_add(1, Relaxed)` on `owner_profile_peer.redirect_sample_counter`, a
+  SHARED atomic on the destination `BindingLiveState` (Arc). Every producer
+  worker redirecting into one owner binding paid a contended RMW on that
+  cacheline for EVERY MPSC enqueue — a 1-in-256 sampler imposing a 1-in-1
+  shared atomic, a SECOND contended sequencing line on top of the inbox head
+  CAS (the in-code "producer-local" comment was inaccurate: the counter was
+  seeded per-binding/shared). Moved the sample SEQUENCE to a producer-local
+  thread-local `REDIRECT_SAMPLE_SEQ: Cell<u64>` via a `next_redirect_sample()`
+  helper — each producer worker (its own OS thread) advances its OWN counter
+  with a plain TLS load/store, no atomic, no shared cacheline. Removed
+  `redirect_sample_counter` from `OwnerProfilePeerWrites` (profile.rs) and the
+  test-only `new_seeded` seeder (production always used `new()`, so the
+  per-worker seed never actually ran). The destination's aggregate histogram
+  `redirect_acquire_hist` STAYS shared and is written ONLY on the sampled op —
+  unchanged. Sample RATE is preserved: each producer samples
+  1-in-(REDIRECT_SAMPLE_MASK+1) of its own enqueues, so each destination's
+  histogram still receives ~1/256 of the enqueues into it (identical aggregate
+  in expectation). Docs (profile.rs struct, umem field + inline comments)
+  corrected off the stale "producer-local"→now-actually-TLS wording.
+- **File(s)**: userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/profile.rs,
+  userspace-dp/src/afxdp/umem/tests/latency_buckets.rs, _Log.md
+- **Validation**: `cargo build` clean. New fail-on-revert test
+  `redirect_sample_sequence_is_producer_local_not_destination_shared`: 4
+  producer threads each do ONE enqueue into the SAME destination → 4 samples
+  (each fresh thread's TLS starts at 0). RED-on-revert (swap TLS → shared
+  atomic): `test result: FAILED. 0 passed; 1 failed` — `left: 1, right: 4`.
+  Restored GREEN: umem 42/0 (incl. the retained rate test
+  `redirect_acquire_hist_samples_one_in_mask_plus_one`, still exactly 1 sample
+  per 256 consecutive enqueues, phase-independent); mirror 25/0, cos 300/0,
+  tx 112/0. SMOKE: assessed NOT warranted — behavior is sample-equivalent (no
+  forwarding/correctness change; the MPSC push path is byte-identical), and the
+  perf win (one fewer contended atomic per enqueue) is sub-ns and not reliably
+  measurable in a line-rate cluster smoke; the issue's suggested 2/4/8-producer
+  criterion microbench is a reasonable follow-up but not a merge gate.
+
+## 2026-07-18 — #5689 (dataplane/nat): ordinary NAT/NPTv6 non-first fragment translation
+- **Timestamp**: 2026-07-18 (fix/5689-nat-frag-assoc)
+- **Action**: A flowless non-first fragment of an ORDINARY same-family NAT /
+  NPTv6 flow resolved `NatDecision::default()` on the flowless arm of
+  `afxdp/poll_descriptor/mod.rs` and was forwarded UNTRANSLATED — leaking the
+  internal source (SNAT/NPTv6) or the pre-DNAT destination. Only NAT64 had a
+  fragment association (`Nat64FragAssoc`, #2562). Fix mirrors that precedent
+  for ordinary NAT: the `Nat64FragAssoc` cache is already generic (family-
+  agnostic port-free key + full `SessionDecision` value), so a first fragment
+  of a SNAT/DNAT/static-NAT/NPTv6 flow now installs an association at the cold-
+  path forward-commit point (`nat_install_forward_fragment_assoc`, gated on a
+  same-family address rewrite + ForwardCandidate + resolved neighbor + a
+  first-fragment key), and its non-first fragments consult it on the flowless
+  arm (`nat_consult_forward_fragment_assoc`, chained after the NAT64 consult,
+  for BOTH IPv4 and IPv6). A hit inherits the first fragment's permitted verdict
+  + egress and the existing forward-build path applies an ADDRESS-ONLY L3
+  rewrite (`apply_nat_ipv4`/`apply_nat_ipv6` already skip the L4 checksum + port
+  rewrite for a non-first fragment, #1852). The cached decision's `nat64` flag
+  keeps NAT64 and ordinary entries from aliasing; the shared `build_generation`
+  guard (advances on every `snapshot.generation` commit) invalidates a stale
+  ordinary-NAT association after a SNAT/DNAT rule change. Forward-only, matching
+  the NAT64 forward-first wiring (reverse-reply is a deferred increment). No new
+  cache type, state machinery, or NAT-decision-path changes — it reuses the
+  existing generic cache. IMPORTANT ASYMMETRY (not a "mechanical mirror" on the
+  miss path): a consult MISS (reorder / TTL straddle / eviction / generation bump
+  / first-fragment-didn't-forward) forwards the permitted NAT'd non-first fragment
+  UNTRANSLATED — the leak PERSISTS on those edges, fail-OPEN, the OPPOSITE of the
+  NAT64 sibling's fail-CLOSED no-association drop (#4617). Deliberate: the flowless
+  arm cannot distinguish a NAT'd-miss from a legitimate no-NAT fragmented flow, so
+  a blind drop would blackhole ordinary un-NAT'd fragmented traffic. Strictly
+  narrows the pre-existing leak (not a regression); the flowless miss path still
+  runs policy (a denied flow's fragments still drop — the residual is a
+  permitted-flow source info-leak only). A fail-closed miss (needs a NAT'd-miss
+  discriminator) is a tracked follow-up (#6122; see the
+  `nat_consult_forward_fragment_assoc` doc-comment).
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs (two helpers +
+  flowless consult wiring + cold-path install), userspace-dp/src/afxdp/tests_fragment.rs
+  (fail-on-revert test), userspace-dp/src/FEATURES.md (nat64.rs #5689 note).
+- **Validation**: `cargo build` clean; `cargo test --bin xpf-userspace-dp
+  fragment` (133) + `nat64` (179) GREEN; new
+  `flowless_non_first_fragment_inherits_ordinary_snat_translation_5689` 5x
+  no-flake. Fail-on-revert proven both ways: neutralizing the CONSULT wiring →
+  RED (non-first fragment resolves `nat_applied_none`, not `nat_applied_snat`);
+  neutralizing the INSTALL wiring → RED (`frag_assoc.len() != 1`). Two
+  pre-existing failures on the branch base (`protocol::wire_invariant_default_specimens`
+  = stale fixture missing #5623/#5625 fields; `event_stream backpressure
+  end-to-end`) confirmed present with my changes stashed — not caused by #5689.
 ## 2026-07-18 — #5174: NAT64 MissingNeighbor cold path fail-closed (bounded fix)
 
 - **Timestamp**: 2026-07-18 (fix/5174-nat64-missingneighbor)
@@ -53021,3 +53108,31 @@ top.
   tunnel-branch fail-closed comments (:32/:36/:443) and the tx/dispatch plain
   comments (already "forward unchanged") are untouched.
 - **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs
+- **Action**: #5164 — rescope the WireGuard NoSession handshake-request and
+  rekey worker→control edges from engine-GLOBAL AtomicBools to PER-PEER. The
+  engine held global `handshake_request_pending`/`handshake_request_last_ns`/
+  `rekey_request_pending`; wg_control consumed both inside a pubkey-sorted
+  per-peer loop (`drive_attempt_machine`), so the first-sorted peer A drained a
+  global edge raised by peer B → B (without keepalive) was blackholed. Moved the
+  three fields onto the long-lived `Arc<Peer>` (peer.rs; reused per pubkey across
+  commits, so edge/rate-limit state survives reconcile like the timer stamps).
+  Re-keyed the four APIs by peer: request_handshake(peer_pubkey, now) /
+  take_handshake_request(peer_pubkey) (engine.rs), request_rekey(peer_pubkey) /
+  take_rekey_request(peer_pubkey) (timers.rs), resolving via the existing
+  peer_arc. Raise sites pass the pubkey (try_encap/try_decap use
+  session.peer_pubkey; worker frame/wg.rs + control encap_and_send pass the
+  egress peer_pubkey). Consume sites (per-peer attempt machine 794/795, give-up
+  drain 734/735, handshake-completion drains 453/454 + 477/478) consume only
+  that peer's edge; bound CompletedResponder's peer. Allocation-free (atomics on
+  existing Peer), no wire/HA change; per-peer rate-limit preserved. Added 2
+  fail-on-revert tests (handshake + rekey): two peers A<B; B arms its edge;
+  lower-sorted A must NOT drain it, B consumes its own. Reverting the per-peer
+  keying to a shared/first-peer slot (global-equivalent) → both tests RED
+  (A drains B). Updated all existing wg/tests.rs edge call sites to the new
+  signatures. Documented the per-peer edge ownership in the 1888-wg-timers plan
+  (design of record) §5.1. Full suite 3996 passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/wg/peer.rs,
+  userspace-dp/src/afxdp/wg/engine.rs, userspace-dp/src/afxdp/wg/timers.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  userspace-dp/src/afxdp/frame/wg.rs, userspace-dp/src/afxdp/wg/tests.rs,
+  docs/research/1888-wg-timers/plan.md
