@@ -7,20 +7,43 @@
 //! replay window are entirely the caller's responsibility, which is
 //! exactly what we want for AF_XDP worker integration.
 //!
-//! Replay window: RFC 6479-style 64-bit sliding bitmap. Single
-//! `Mutex` covers `(highest, bitmap)` — contention is bounded
-//! because we only ever decap from the worker that owns the binding
-//! the session was demuxed onto. Encap uses a separate `AtomicU64`
-//! counter because we are the sole producer.
+//! Replay window: the reference WireGuard RFC 6479 ring bitmap
+//! (kernel `noise.c` `counter_validate` / wireguard-go `replay.go`
+//! `ValidateCounter`) — a `[u64; 128]` ring of 8192 bits giving an
+//! 8128-counter reorder window (#5168). The single 64-wide `u64`
+//! window it replaced (#5168) rejected authentic packets ~2 orders
+//! of magnitude earlier than a reference peer under multi-queue /
+//! path-diversity reorder. A single `Mutex` covers `(counter,
+//! backtrack)` — contention is bounded because we only ever decap
+//! from the worker that owns the binding the session was demuxed
+//! onto. Encap uses a separate `AtomicU64` counter because we are
+//! the sole producer.
 
 use snow::StatelessTransportState;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Width of the replay window in packets. 64 is a tight fit for a
-/// single u64 bitmap; if we widen to 128 in the future we can swap
-/// the type without touching the API.
-pub(crate) const REPLAY_WINDOW: u64 = 64;
+/// #5168: reference WireGuard replay-ring geometry, byte-for-byte the
+/// kernel/wireguard-go constants:
+///   COUNTER_BITS_TOTAL     = RING_BLOCKS * BLOCK_BITS = 128 * 64 = 8192
+///   COUNTER_REDUNDANT_BITS = BLOCK_BITS               = 64
+///   COUNTER_WINDOW_SIZE    = 8192 - 64                = 8128  (== REPLAY_WINDOW)
+/// The one redundant block (64 counters) is the headroom that lets the
+/// advance-clear never wipe a bit still inside the window.
+const BLOCK_BITS: u64 = 64;
+const BLOCK_BIT_LOG: u64 = 6; // log2(BLOCK_BITS)
+const RING_BLOCKS: usize = 128; // ring word count (power of two)
+const BLOCK_MASK: usize = RING_BLOCKS - 1; // 127
+const BIT_MASK: u64 = BLOCK_BITS - 1; // 63
+
+/// Maximum reorder age (in counters) the replay window tolerates — the
+/// reference WireGuard `COUNTER_WINDOW_SIZE` (kernel/wireguard-go). A counter
+/// whose age exceeds this is rejected as too old; a counter at age exactly
+/// `REPLAY_WINDOW` is still IN the window (the reference reject test is
+/// `highest - c > REPLAY_WINDOW`, a STRICT `>`), matching the reference
+/// byte-for-byte. Was `64` before #5168 (a single-u64 window that dropped
+/// authentic reordered traffic ~2 orders of magnitude early).
+pub(crate) const REPLAY_WINDOW: u64 = (RING_BLOCKS as u64 - 1) * BLOCK_BITS; // 8128
 /// WireGuard reject-after-messages limit.
 ///
 /// Per the protocol, a session must stop encrypting after this many
@@ -228,83 +251,89 @@ impl WgSession {
     }
 }
 
-/// Sliding-window replay tracker. Tracks the most recent 64
-/// counters seen, anchored at `highest`.
+/// Reference WireGuard RFC 6479 ring-bitmap replay tracker (#5168) —
+/// the kernel `counter_validate` / wireguard-go `ValidateCounter`
+/// algorithm. `counter` is the highest counter accepted so far;
+/// `backtrack` is a ring of [`RING_BLOCKS`] u64 words indexed by
+/// `(c >> BLOCK_BIT_LOG) & BLOCK_MASK`, bit `c & BIT_MASK` recording
+/// that counter `c` was seen. A counter `c` is fresh iff
+///   - `c > counter` (new high water mark — the passed-over ring
+///     blocks are cleared forward), OR
+///   - `counter - c <= REPLAY_WINDOW` AND its bit is currently unset.
 ///
-/// State invariant after the first accepted counter: `bitmap` bit 0
-/// always corresponds to `highest`. A counter `c` is fresh iff
-///   - `c > highest`, OR
-///   - `highest - c < REPLAY_WINDOW` AND the corresponding bit is
-///     unset.
-///
-/// `started == false` means no counters have been seen yet, which
-/// is distinguishable from "the all-zero state happens to be the
-/// post-first-accept state for counter 0". Without this flag the
-/// `c == highest` arm would incorrectly accept the duplicate of
-/// counter 0 immediately after the first accept.
-#[derive(Debug, Default, Clone, Copy)]
+/// No `started` flag is needed (unlike the pre-#5168 single-u64
+/// window): the pristine all-zero filter accepts counter 0 on first
+/// sight (its bit is unset) and rejects the replay (its bit is now
+/// set) purely from the bitmap, exactly as the reference does.
+#[derive(Debug, Clone)]
 pub(crate) struct ReplayState {
-    pub(crate) highest: u64,
-    pub(crate) bitmap: u64,
-    pub(crate) started: bool,
+    /// Highest counter accepted so far (wireguard-go `f.counter`).
+    pub(crate) counter: u64,
+    /// Ring of `RING_BLOCKS` 64-bit words; `backtrack[(c >> 6) &
+    /// BLOCK_MASK]` bit `c & 63` == 1 means counter `c` was seen.
+    pub(crate) backtrack: [u64; RING_BLOCKS],
+}
+
+impl Default for ReplayState {
+    #[inline]
+    fn default() -> Self {
+        // `[u64; 128]` has no std `Default`; the pristine filter is
+        // all-zero (counter 0, empty ring) — the reference zero value.
+        ReplayState {
+            counter: 0,
+            backtrack: [0u64; RING_BLOCKS],
+        }
+    }
 }
 
 impl ReplayState {
     /// Cheap pre-crypto reject for trivially stale counters.
     ///
-    /// This never rejects in-window candidates for the current replay
-    /// state snapshot, so it is safe to run before AEAD without
-    /// creating false drops. Under concurrent decap another packet may
-    /// advance `highest` between this check and post-decrypt update,
-    /// so this is a best-effort CPU guard rather than a hard guarantee.
+    /// This never rejects a candidate the authoritative
+    /// [`Self::check_and_update`] would accept for the current snapshot,
+    /// so it is safe to run before AEAD without creating false drops:
+    /// it uses the SAME `counter - c > REPLAY_WINDOW` boundary as the
+    /// commit, and `counter` only ever advances, so a candidate that is
+    /// definitely-out here stays out at commit. Best-effort CPU guard
+    /// under concurrent decap, not a hard guarantee.
     #[inline]
     pub(crate) fn definitely_out_of_window(&self, c: u64) -> bool {
-        self.started && c.saturating_add(REPLAY_WINDOW) <= self.highest
+        self.counter.saturating_sub(c) > REPLAY_WINDOW
     }
 
     /// Check-and-update for inbound counter `c`. Returns
-    /// `ReplayDecision::Accept` if the counter is fresh (and the
-    /// window is updated atomically with the accept), or one of
-    /// the reject variants otherwise.
+    /// `ReplayDecision::Accept` if the counter is fresh (and the ring is
+    /// updated atomically with the accept), `Repeat` if its bit is
+    /// already set, or `OutOfWindow` if it is older than the window.
     ///
-    /// Algorithm: RFC 6479 (anti-replay window). Worth reading the
-    /// RFC if you're changing this — the test suite covers the
-    /// in-order / repeat / out-of-window / gap-fill arms explicitly.
+    /// Algorithm: the reference WireGuard RFC 6479 ring window
+    /// (kernel/wireguard-go). The test suite covers the in-order /
+    /// repeat / out-of-window / gap-fill / far-jump arms and the
+    /// reference age boundary (64/127/8127/8128 accepted, 8129 rejected)
+    /// explicitly — read the reference if you change this.
     pub(crate) fn check_and_update(&mut self, c: u64) -> ReplayDecision {
-        if !self.started {
-            self.started = true;
-            self.highest = c;
-            self.bitmap = 1;
-            return ReplayDecision::Accept;
+        let index_block = (c >> BLOCK_BIT_LOG) as usize;
+        if c > self.counter {
+            // New high water mark: clear the ring blocks now passed over
+            // (wrapping mod RING_BLOCKS), capped at the whole ring for a
+            // jump wider than the ring, then adopt the new counter.
+            let current = (self.counter >> BLOCK_BIT_LOG) as usize;
+            let diff = (index_block - current).min(RING_BLOCKS);
+            for i in (current + 1)..=(current + diff) {
+                self.backtrack[i & BLOCK_MASK] = 0;
+            }
+            self.counter = c;
+        } else if self.counter - c > REPLAY_WINDOW {
+            // Older than the window (strict `>`, matching the reference).
+            return ReplayDecision::OutOfWindow;
         }
-        if c > self.highest {
-            // New high water mark — shift the bitmap left by the
-            // gap and set bit 0 for the newly-accepted counter.
-            let gap = c - self.highest;
-            if gap >= 64 {
-                self.bitmap = 1;
-            } else {
-                self.bitmap = (self.bitmap << gap) | 1;
-            }
-            self.highest = c;
-            ReplayDecision::Accept
+        let block = index_block & BLOCK_MASK;
+        let mask = 1u64 << (c & BIT_MASK);
+        if self.backtrack[block] & mask != 0 {
+            ReplayDecision::Repeat
         } else {
-            // c <= highest: this is either a repeat of `highest`
-            // (which post-init is always already-seen because we
-            // marked bit 0 on accept) or a strictly older counter.
-            let age = self.highest - c;
-            if age >= REPLAY_WINDOW {
-                ReplayDecision::OutOfWindow
-            } else {
-                let mask = 1u64 << age;
-                if self.bitmap & mask != 0 {
-                    ReplayDecision::Repeat
-                } else {
-                    // In-window gap fill: accept and mark the bit.
-                    self.bitmap |= mask;
-                    ReplayDecision::Accept
-                }
-            }
+            self.backtrack[block] |= mask;
+            ReplayDecision::Accept
         }
     }
 }
@@ -340,10 +369,10 @@ mod session_tests {
     #[test]
     fn out_of_window_rejects() {
         let mut r = ReplayState::default();
-        assert_eq!(r.check_and_update(1000), ReplayDecision::Accept);
-        // Counter 1000 - 64 = 936 is exactly at the window edge;
-        // anything <= that is out-of-window.
-        assert_eq!(r.check_and_update(936), ReplayDecision::OutOfWindow);
+        assert_eq!(r.check_and_update(10_000), ReplayDecision::Accept);
+        // Age 8129 (10000 - 8129 = 1871) is the first counter BEYOND the
+        // 8128-wide reference window — too old.
+        assert_eq!(r.check_and_update(1_871), ReplayDecision::OutOfWindow);
         assert_eq!(r.check_and_update(0), ReplayDecision::OutOfWindow);
     }
 
@@ -365,15 +394,16 @@ mod session_tests {
 
     #[test]
     fn jump_ahead_resets_bitmap() {
-        // Counter jumping forward by more than the window width
-        // resets the bitmap to "only the new counter seen".
+        // A counter jumping forward by more than the ring capacity
+        // (RING_BLOCKS*BLOCK_BITS = 8192) clears the whole ring; the old
+        // counter is then far out of window.
         let mut r = ReplayState::default();
         assert_eq!(r.check_and_update(10), ReplayDecision::Accept);
-        assert_eq!(r.check_and_update(1000), ReplayDecision::Accept);
-        // The old counter 10 is now far out of window.
+        assert_eq!(r.check_and_update(20_000), ReplayDecision::Accept);
+        // The old counter 10 is now age 19990 — far out of the 8128 window.
         assert_eq!(r.check_and_update(10), ReplayDecision::OutOfWindow);
-        // The new counter 1000 is at the head and must repeat-fail.
-        assert_eq!(r.check_and_update(1000), ReplayDecision::Repeat);
+        // The new counter 20000 is at the head and must repeat-fail.
+        assert_eq!(r.check_and_update(20_000), ReplayDecision::Repeat);
     }
 
     #[test]
@@ -383,21 +413,103 @@ mod session_tests {
         // window code.
         let mut r = ReplayState::default();
         assert_eq!(r.check_and_update(0), ReplayDecision::Accept);
-        // Move the window so 0 is at the trailing edge but still
-        // in-window: highest = 63, age = 63 < 64.
-        assert_eq!(r.check_and_update(63), ReplayDecision::Accept);
+        // Move the window so 0 sits at the INCLUSIVE trailing edge:
+        // highest = REPLAY_WINDOW (8128), age = 8128 == REPLAY_WINDOW is
+        // still in-window (reference strict `>`), so the seen 0 repeats.
+        assert_eq!(r.check_and_update(REPLAY_WINDOW), ReplayDecision::Accept);
         assert_eq!(r.check_and_update(0), ReplayDecision::Repeat);
-        // One more step pushes 0 out: highest = 64, age = 64 = REPLAY_WINDOW.
-        assert_eq!(r.check_and_update(64), ReplayDecision::Accept);
+        // One more step pushes 0 out: highest = 8129, age = 8129 > window.
+        assert_eq!(r.check_and_update(REPLAY_WINDOW + 1), ReplayDecision::Accept);
         assert_eq!(r.check_and_update(0), ReplayDecision::OutOfWindow);
     }
 
     #[test]
     fn precheck_out_of_window_matches_window_width() {
         let mut r = ReplayState::default();
-        assert_eq!(r.check_and_update(1000), ReplayDecision::Accept);
-        assert!(!r.definitely_out_of_window(937));
-        assert!(r.definitely_out_of_window(936));
+        assert_eq!(r.check_and_update(10_000), ReplayDecision::Accept);
+        // Age 8128 (10000-8128=1872) is the inclusive edge — still in window,
+        // so the precheck must NOT declare it out.
+        assert!(!r.definitely_out_of_window(1_872));
+        // Age 8129 (10000-8129=1871) is out — the precheck matches the commit
+        // boundary exactly.
+        assert!(r.definitely_out_of_window(1_871));
+    }
+
+    // #5168 FAIL-ON-REVERT: the reference WireGuard window tolerates ~8128
+    // counters of reorder. UNSEEN counters at ages 64, 127, 8127, and the
+    // inclusive edge 8128 must ALL be ACCEPTED — the pre-#5168 single-u64
+    // 64-wide window falsely rejected everything from age 64 onward, collapsing
+    // authentic reordered traffic ~2 orders of magnitude early. A counter one
+    // past the window (age 8129) is still rejected as too old. Reverting
+    // REPLAY_WINDOW to 64 (or the old single-u64 algorithm) turns the
+    // age-64/127/8127/8128 accepts RED.
+    #[test]
+    fn unseen_counters_within_reference_window_accepted() {
+        let mut r = ReplayState::default();
+        // High-water mark well above the window so each age maps to a
+        // distinct, non-negative counter.
+        const HIGH: u64 = 100_000;
+        assert_eq!(r.check_and_update(HIGH), ReplayDecision::Accept);
+        for age in [64u64, 127, 8127, REPLAY_WINDOW] {
+            assert_eq!(
+                r.check_and_update(HIGH - age),
+                ReplayDecision::Accept,
+                "unseen counter at age {age} must be accepted \
+                 (reference window {REPLAY_WINDOW})"
+            );
+        }
+        // One counter past the inclusive edge is too old.
+        assert_eq!(
+            r.check_and_update(HIGH - (REPLAY_WINDOW + 1)),
+            ReplayDecision::OutOfWindow,
+            "age {} (one past the window) must be rejected as too old",
+            REPLAY_WINDOW + 1
+        );
+    }
+
+    // #5168: widening the window must NOT weaken the core anti-replay
+    // property — a genuine replay (an already-accepted counter) is still
+    // rejected at every in-window age.
+    #[test]
+    fn replayed_counter_rejected_at_every_age() {
+        let mut r = ReplayState::default();
+        const HIGH: u64 = 100_000;
+        assert_eq!(r.check_and_update(HIGH), ReplayDecision::Accept);
+        for age in [0u64, 1, 64, 127, 8127, REPLAY_WINDOW] {
+            let c = HIGH - age;
+            if age != 0 {
+                // age 0 is HIGH itself, already accepted above.
+                assert_eq!(
+                    r.check_and_update(c),
+                    ReplayDecision::Accept,
+                    "seed unseen counter at age {age}"
+                );
+            }
+            assert_eq!(
+                r.check_and_update(c),
+                ReplayDecision::Repeat,
+                "replay of counter at age {age} must be rejected"
+            );
+        }
+    }
+
+    // #5168: the ring must preserve an in-window bit across many block
+    // boundaries — accept a counter, advance ~62 blocks forward, and confirm
+    // the still-in-window older counter repeats (its bit survived the
+    // forward-clear).
+    #[test]
+    fn ring_preserves_in_window_bit_across_blocks() {
+        let mut r = ReplayState::default();
+        assert_eq!(r.check_and_update(5_000), ReplayDecision::Accept);
+        assert_eq!(r.check_and_update(9_000), ReplayDecision::Accept);
+        // 5000 is now age 4000 — well inside the 8128 window; its bit must
+        // still be set (a false Accept here would mean a replay slipped
+        // through the ring clearing).
+        assert_eq!(
+            r.check_and_update(5_000),
+            ReplayDecision::Repeat,
+            "in-window bit must survive across block boundaries"
+        );
     }
 
     #[test]
