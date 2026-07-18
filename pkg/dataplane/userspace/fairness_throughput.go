@@ -127,6 +127,11 @@ func (w *FairnessThroughputWindow) Update(now time.Time, status ProcessStatus) [
 		activeWorkerFlows = fairnessQueueActiveWorkerFlows(status, workerSlots)
 	}
 	seen := make(map[fairnessFlowThroughputKey]uint64)
+	// currentQueues holds the (ifindex, queueID) identities observed in
+	// THIS status. A queue state is only ever created from a FlowWorkerMap
+	// row, so this set is the authoritative "still present" signal used to
+	// decide retirement of vanished identities below.
+	currentQueues := make(map[fairnessQueueKey]struct{})
 	sampleQueues := make(map[fairnessQueueKey]struct{}, len(w.queues))
 	for queue := range w.queues {
 		sampleQueues[queue] = struct{}{}
@@ -145,6 +150,7 @@ func (w *FairnessThroughputWindow) Update(now time.Time, status ProcessStatus) [
 			key.tuple = row.SessionKey
 		}
 		sampleQueues[key.queue] = struct{}{}
+		currentQueues[key.queue] = struct{}{}
 		seen[key] = row.ObservedBytes
 		previous, ok := w.prev[key]
 		w.prev[key] = row.ObservedBytes
@@ -192,8 +198,26 @@ func (w *FairnessThroughputWindow) Update(now time.Time, status ProcessStatus) [
 			})
 		}
 	}
-	for _, state := range w.queues {
+	// Prune expired samples, then retire queue identities that have
+	// vanished from the current status AND hold no live telemetry. Without
+	// this, a (ifindex, queueID) that disappears (interface removal /
+	// ifindex churn) lingers for the process lifetime: the seed-all-keys
+	// loop above keeps appending empty idle-advancement samples to it every
+	// update, so its state never drains on its own, and every scrape below
+	// re-seeds and re-sorts the full historical key slice under the
+	// collector mutex. Retiring drained-and-absent keys bounds both the
+	// memory and the per-scrape cost to currently-observed identities plus
+	// one window of recently-active ones. Retirement cannot change scrape
+	// output: a drained queue (empty bytesByFlow) is skipped by the summary
+	// loop below regardless. A retired key that reappears re-registers
+	// cleanly via queueState with a fresh baseline (its w.prev flow entries
+	// were cleared the same update it vanished, so the first post-reappearance
+	// delta is measured exactly like any first observation).
+	for key, state := range w.queues {
 		state.prune(now.Add(-w.window))
+		if _, current := currentQueues[key]; !current && state.isDrained() {
+			delete(w.queues, key)
+		}
 	}
 
 	keys := make([]fairnessQueueKey, 0, len(w.queues))
@@ -260,6 +284,19 @@ func (q *fairnessQueueThroughputWindow) addSample(sample fairnessThroughputSampl
 	for workerID, delta := range sample.workerDeltas {
 		q.bytesByWorker[workerID] += delta
 	}
+}
+
+// isDrained reports whether the queue window holds no live telemetry:
+// no accumulated flow bytes, worker bytes, or starvation records. A
+// drained queue's remaining samples slice can only contain empty
+// idle-advancement entries, which contribute nothing to any summary
+// (the scrape skips queues whose bytesByFlow is empty). Callers retire a
+// drained queue that is also absent from the current active set so
+// vanished identities do not accumulate for the process lifetime.
+func (q *fairnessQueueThroughputWindow) isDrained() bool {
+	return len(q.bytesByFlow) == 0 &&
+		len(q.bytesByWorker) == 0 &&
+		len(q.starvedFlows) == 0
 }
 
 func (q *fairnessQueueThroughputWindow) prune(cutoff time.Time) {
