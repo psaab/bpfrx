@@ -1,6 +1,0 @@
-# test log
-open /sys/class/net/ge-0-0-0/queues
-open /sys/class/net/ge-7-0-0/queues
-getenv GOTMPDIR
-open /proc/sys/net/core/somaxconn
-open /tmp

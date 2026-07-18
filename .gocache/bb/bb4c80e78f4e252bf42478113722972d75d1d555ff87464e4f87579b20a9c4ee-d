@@ -1,7 +1,0 @@
-./ddns.go
-./ddns_leases.go
-./dhcpserver.go
-./lease_lfc.go
-./lease_source.go
-./lease_sync.go
-./test_seams.go

@@ -1,4 +1,0 @@
-# test log
-getenv GOTMPDIR
-open /proc/sys/net/core/somaxconn
-open /tmp

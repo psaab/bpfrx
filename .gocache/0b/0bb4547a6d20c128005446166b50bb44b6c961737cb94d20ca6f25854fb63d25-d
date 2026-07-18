@@ -1,5 +1,0 @@
-./host_inbound_accept_counters.go
-./host_inbound_counters.go
-./host_inbound_junos_host_counters.go
-./lo0_counters.go
-./rst_suppress.go
