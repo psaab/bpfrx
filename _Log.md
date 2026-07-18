@@ -52992,3 +52992,21 @@ top.
   userspace-dp/src/afxdp/frame/tests_segment_tcp.rs,
   userspace-dp/src/afxdp/tx/dispatch/tests/segmentation.rs,
   userspace-dp/src/afxdp/tx/README.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5159 follow-up — close the last coverage seam by binding the TX
+  local-owner FAST-PATH builder (segment_forwarded_tcp_frames_into_prepared,
+  tx/tcp_segmentation.rs) with its own fail-on-revert test. Previously only the
+  copy-path twin + predicate were bound; the TX builder (the primary production
+  path) tripped 0 tests on revert, so a future twin-divergence could silently
+  re-floor the common path. Added
+  segment_forwarded_tcp_frames_into_prepared_honors_sub_1280_ipv4_egress_mtu_5159
+  (tx/dispatch/tests/segmentation.rs): drives the builder via a
+  BindingWorker::new_for_mirror_test with a 900-byte egress MTU + a non-DF IPv4
+  TCP datagram of L3 length 1100; asserts >=2 prepared TX segments each with L3
+  <= 900 (via the returned (segments,_,max_frame) tuple + per-req.len check on
+  pending_tx_prepared). Restoring `.max(1280)` at tx/tcp_segmentation.rs ALONE
+  turns ONLY this test RED (target-count 1, verified: 20 passed; 1 failed). All
+  three floor sites now have a target-count-1 gate. Full release suite 4000
+  passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/tests/segmentation.rs
