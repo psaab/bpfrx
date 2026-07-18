@@ -1095,31 +1095,41 @@ never fail-opened the *forwarding* path, but it suppressed scan/sweep
 *detection*.
 
 The new-source path now makes BOUNDED room instead of skipping. When a brand-
-new `(zone, src_ip)` arrives at a full zone, the tracker scans a FIXED PREFIX
-of the source table (`iter().take(EVICT_SCAN_LIMIT)`, `EVICT_SCAN_LIMIT = 64`
-— the budget counts EVERY iterated entry, same-zone or not), reclaims the
-first expired same-zone window it finds, and if none is expired evicts the
-LEAST-SUSPICIOUS live same-zone entry within that prefix — the one with the
-FEWEST accumulated distinct destinations, breaking ties on the stalest
-`window_start` (#4418). A brand-new decoy source sits at count 1, while a slow
-scanner that has already probed several destinations sits near the detection
-count, so a flood of fresh decoys evicts one another (or the lowest-count live
-entry) and CANNOT displace a near-threshold slow scanner. The pre-#4418 policy
-evicted the stalest `window_start` regardless of count, which let an attacker
-keeping the table full of fresher decoys evict a slow scanner whose window
-opened earlier (its old-but-LIVE window made it "stalest") — reopening the
-slow-scan evasion on the source-saturation axis. This branch only runs when
-the TARGET zone alone holds `>= MAX_SOURCES_PER_ZONE` keys, so same-zone
-entries are dense in the table and the prefix reliably contains a victim — a
-fresh real scanner is therefore admissible and the detection-suppression cliff
-is gone. The per-new-flow worst case is
-O(`EVICT_SCAN_LIMIT`), NOT an O(sources) min-scan over 4096 entries, which
-under a saturation flood would itself be an O(n)-per-packet amplifier. The
-per-zone source count is maintained incrementally (`per_zone_count`) so the
-cap test is O(1); the only walk is the bounded prefix. In the pathological
-many-zones-sparsely-interleaved case where the prefix holds no same-zone
-victim, the path degrades back to skip-on-full (`skipped_pressure`) — still
-bounded, still never fail-open.
+new `(zone, src_ip)` arrives at a full zone, the tracker samples at most
+`EVICT_SCAN_LIMIT = 64` SAME-ZONE sources from a PER-ZONE source index
+(`per_zone_srcs`, #4890), reclaims the first expired same-zone window it finds,
+and if none is expired evicts the LEAST-SUSPICIOUS live same-zone entry within
+that sample — the one with the FEWEST accumulated distinct destinations,
+breaking ties on the stalest `window_start` (#4418). A brand-new decoy source
+sits at count 1, while a slow scanner that has already probed several
+destinations sits near the detection count, so a flood of fresh decoys evicts
+one another (or the lowest-count live entry) and CANNOT displace a
+near-threshold slow scanner. The pre-#4418 policy evicted the stalest
+`window_start` regardless of count, which let an attacker keeping the table
+full of fresher decoys evict a slow scanner whose window opened earlier (its
+old-but-LIVE window made it "stalest") — reopening the slow-scan evasion on the
+source-saturation axis.
+
+Because the sample is drawn from the TARGET zone's OWN index, every one of the
+`EVICT_SCAN_LIMIT` examined entries is a same-zone candidate and the budget is
+never consumed by other zones. Since this path only runs when the target zone
+alone holds `>= MAX_SOURCES_PER_ZONE` keys (>> `EVICT_SCAN_LIMIT`), a same-zone
+victim is ALWAYS found and a fresh real scanner is ALWAYS admissible under
+saturation — regardless of how the zones interleave in the global `per_src`
+table. The pre-#4890 search instead sampled a fixed GLOBAL prefix of `per_src`
+(`iter().take(EVICT_SCAN_LIMIT)`, budget counting EVERY iterated entry,
+same-zone or not); in a many-zone / sparse-interleave table whose first
+`EVICT_SCAN_LIMIT` global positions held no target-zone entry, eviction found
+no victim, the fresh scanner was skipped, its distinct-destination count never
+accrued, and port-scan / ip-sweep detection never fired for it even though its
+packets were still forwarded (the #4890 fail-open of DETECTION; forwarding was
+never fail-open). The per-new-flow worst case is O(`EVICT_SCAN_LIMIT`), NOT an
+O(sources) min-scan over 4096 entries, which under a saturation flood would
+itself be an O(n)-per-packet amplifier. The per-zone source count AND the
+victim-search domain are both served by `per_zone_srcs` (its `.len()` is the
+O(1) cap test), so the only walk is the bounded same-zone sample. The
+skip-on-full fallback (`skipped_pressure`) remains only as a defensive guard —
+still bounded, still never fail-open.
 
 Each eviction bumps `evicted_pressure` (surfaced via
 `ScreenState::scan_sweep_evicted_pressure`), and a rare LOGARITHMIC threshold

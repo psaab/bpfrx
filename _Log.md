@@ -53435,3 +53435,29 @@ top.
   userspace-dp/src/server/tests.rs,
   userspace-dp/src/server/README.md,
   docs/userspace-dataplane-architecture.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #4890 — per-zone victim search in `evict_stalest_in_zone`.
+  The source-saturation eviction sampled a fixed GLOBAL prefix of `per_src`
+  (`iter().take(EVICT_SCAN_LIMIT)`), so non-target-zone entries consumed the
+  budget; in a many-zone / sparse-interleave table whose first
+  `EVICT_SCAN_LIMIT` global positions held no zone-Z entry, eviction found no
+  same-zone victim → returned false → `check()` skipped the fresh scanner in
+  saturated zone Z → its distinct-dest count never accrued → port-scan/ip-sweep
+  detection never fired (detection fail-open; forwarding was never fail-open).
+  Fix: replaced the `per_zone_count` map with a per-zone source index
+  `per_zone_srcs: FxHashMap<u16, FxHashSet<IpAddr>>` that doubles as the O(1)
+  cap count AND the eviction victim-search domain — `evict_stalest_in_zone` now
+  samples `EVICT_SCAN_LIMIT` SAME-ZONE candidates from that index, so the
+  budget is never spent on other zones and a saturated zone always yields a
+  victim. Cost stays O(EVICT_SCAN_LIMIT); memory bounded by the same
+  per-zone/source caps. Victim-choice semantics (least-suspicious, expired-first,
+  stalest tiebreak) unchanged. Added FAIL-ON-REVERT test
+  `fresh_scanner_admitted_when_zone_entries_outside_global_prefix_4890`
+  (100k other-zone pad + 3 live target-zone entries; asserts per-zone eviction
+  finds the least-suspicious victim and an admitted scanner fires detection).
+  Parent-RED verified: reverting evict to the global-prefix sample makes the
+  test RED ("same-zone victim MUST be found"). Rust suite: 4028 passed / 0
+  failed; new test 3x no flake. NOT HA (no failover smoke needed).
+- **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/session/README.md
