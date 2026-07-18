@@ -255,6 +255,7 @@ fn active_flow_debug_test_entry(
     FlowCacheEntry {
         key,
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         descriptor: RewriteDescriptor {
             dst_mac: [0x56, 0x4a, 0xe8, 0x1e, 0xa8, 0x32],
             src_mac: [0x02, 0xbf, 0x72, 0x16, 0x01, 0x00],
@@ -400,6 +401,7 @@ fn idle_debug_updater_ages_active_flow_snapshots() {
         .insert(active_flow_debug_test_entry(key.clone(), stamp));
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };

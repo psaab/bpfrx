@@ -805,6 +805,133 @@ fn segment_forwarded_tcp_frames_keeps_ipv4_tcp_ports_after_vlan_snat() {
 }
 
 
+/// #5159 RED-on-revert: a valid IPv4 egress MTU BELOW the wrongly-applied 1280
+/// IPv6-link-MTU floor must actually chunk a non-DF TCP datagram. Egress MTU
+/// 900; a ~1100-byte L3 TCP datagram (in the (real_mtu, 1280] blackhole band):
+/// the builder MUST segment it into >=2 pieces each <= 900. Restoring the
+/// builder's `.max(1280)` floor raises the MTU to 1280, so the 1100-byte
+/// datagram is `<= mtu` and the builder returns None (no segmentation) — RED.
+#[test]
+fn segment_forwarded_tcp_frames_honors_sub_1280_ipv4_egress_mtu_5159() {
+    let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
+    let src_port = 47308u16;
+    let dst_port = 5201u16;
+    let egress_mtu = 900usize;
+    // 20 (IP) + 20 (TCP, no options) + 1060 payload = 1100-byte L3 datagram.
+    let tcp_payload_len = 1060usize;
+    let total_len = (20 + 20 + tcp_payload_len) as u16;
+    assert!(
+        (egress_mtu as u16) < total_len && total_len <= 1280,
+        "datagram must sit in the (real_mtu, 1280] blackhole band"
+    );
+
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6],
+        0,
+        0x0800,
+    );
+    frame.extend_from_slice(&[
+        0x45, 0x00, // v4, ihl=5, dscp/ecn
+        (total_len >> 8) as u8, total_len as u8, // total_len = 1100
+        0xd1, 0x43, // identification
+        0x00, 0x00, // flags/frag: NON-DF (0x0000), offset 0
+        64, PROTO_TCP, 0x00, 0x00, // ttl, proto, checksum placeholder
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x52, 0x04, 0xc1, 0xa3, // seq
+        0x73, 0x7f, 0x63, 0x1c, // ack
+        0x50, 0x10, 0x00, 0x3f, // data offset (20, no opts) / flags / window
+        0x00, 0x00, 0x00, 0x00, // checksum / urgent
+    ]);
+    frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+    let ip_sum = checksum16(&frame[14..34]);
+    frame[24] = (ip_sum >> 8) as u8;
+    frame[25] = ip_sum as u8;
+    recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+    let mut area = MmapArea::new(65_536).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        flow_src_port: src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x16, 0x01, 0x00]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision::default(),
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu: egress_mtu, // 900 — below the bogus 1280 floor, above the real IPv4 min (68)
+            src_mac: [0x02, 0xbf, 0x72, 0x16, 0x01, 0x00],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
+            primary_v6: None,
+        },
+    );
+
+    let segments = segment_forwarded_tcp_frames(
+        &area,
+        XdpDesc { addr: 0, len: frame.len() as u32, options: 0 },
+        meta,
+        &decision,
+        &forwarding,
+        Some((src_port, dst_port)),
+    )
+    .expect(
+        "a 1100-byte L3 datagram MUST segment at a 900-byte egress MTU; the \
+         1280 floor is an IPv6-link-MTU value, not an IPv4 floor (#5159)",
+    );
+    assert!(
+        segments.len() >= 2,
+        "the datagram must split into >=2 segments, got {}",
+        segments.len()
+    );
+    // Output frames are VLAN-tagged (tx_vlan_id=80): L2 is 18 bytes, so L3
+    // starts at offset 18 and the IPv4 total_len is at seg[20..22].
+    for seg in &segments {
+        let ip_total_len = u16::from_be_bytes([seg[20], seg[21]]) as usize;
+        assert!(
+            ip_total_len <= egress_mtu,
+            "each segment's IPv4 total_len must be <= the 900 egress MTU, got {ip_total_len}"
+        );
+        assert!(seg.len() <= 18 + egress_mtu);
+    }
+}
+
+
 #[test]
 fn segment_forwarded_tcp_frames_keeps_ipv4_snat_inside_native_gre() {
     let src_ip = Ipv4Addr::new(10, 0, 61, 102);

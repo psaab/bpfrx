@@ -53,6 +53,49 @@
   flagged, not warranted.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
   pkg/dataplane/compiler_rxvlan_failclosed_5268_test.go, docs/feature-coverage.md
+## 2026-07-18 — #5139: flow-cache identity must include the logical (VLAN) ingress ifindex
+
+- **Timestamp**: 2026-07-18 (fix/5139-flowcache-logical-ifindex)
+- **Action**: The userspace-dp flow cache keyed BOTH lookup and insert on
+  `meta.ingress_ifindex` (the PHYSICAL parent). The logical (VLAN-unit) ingress
+  ifindex — which selects the security zone-pair — was resolved
+  (`resolve_ingress_logical_ifindex`) only for DSCP/L4 filter checks, never
+  stamped into the cache KEY. So two VLAN units co-parented on ONE physical
+  interface with the SAME 5-tuple aliased to ONE cache entry: a HIT replayed
+  VLAN A's decision/NAT/egress for VLAN B BEFORE the slow-path zone-pair policy
+  ran → cross-zone policy/NAT fail-OPEN (High, security). Fix: added
+  `logical_ingress_ifindex` to `FlowCacheLookup` + `FlowCacheEntry` as an
+  ADDITIONAL in-set match discriminator (lookup match + insert dedup);
+  `for_packet` resolves it the same way `from_forward_decision` does, so lookup
+  identity == insert identity for a packet. DESIGN CHOICE (the invalidation
+  crux): `set_index` and `invalidate_slot` STAY keyed on the physical ifindex,
+  because the GC (loop_body) and RST-teardown (lifecycle) invalidate paths drive
+  `invalidate_slot(key, binding.ifindex=PHYSICAL)` and cannot recover the
+  logical unit from a bare session key — keeping those physical keeps eviction
+  coherent. Invalidate matches physical-only → over-evicts a co-5-tuple VLAN
+  sibling (safe: a re-miss re-evaluates from policy), never strands a stale
+  entry (the team-lead's watch item). NOT HA/session-adjacent: `FlowCacheEntry`
+  derives only `Clone` (no serde), the flow cache is per-worker
+  `WorkerFlowCacheState`, never HA-synced — so the added field breaks no wire/
+  sync layout (verified).
+- **File(s)**: userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/umem/tests/debug_state.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+- **Validation**: full `cargo test --release --bin xpf-userspace-dp` → 4000
+  passed, 0 failed, 2 ignored (pre-existing). Fail-on-revert test
+  `coparented_vlan_same_5tuple_distinct_logical_ifindex_misses_5139`
+  (flow_cache_tests.rs): same physical parent + 5-tuple, distinct logical
+  100/101 — VLAN B must MISS VLAN A's entry, VLAN A's own lookup still HITS.
+  RED-on-revert (drop the logical discriminator from the lookup match →
+  physical-only key): `test result: FAILED. 83 passed; 1 failed` (target-count
+  1) — panic "co-parented VLAN B (logical 101) must MISS VLAN A's entry (logical
+  100)". Restored GREEN: flow_cache 84/0. SMOKE: unit-provable at the cache
+  identity layer (the miss/hit is fully determined by the in-set match); no
+  loss-cluster forwarding surface a smoke would add over the unit test.
 
 ## 2026-07-18 — #5160: move redirect-sample sequence off the shared destination atomic to producer-local TLS
 
@@ -53105,6 +53148,65 @@ top.
   docs/xdp-io-uring-userspace-dataplane.md
 
 - **Timestamp**: 2026-07-18
+- **Action**: #5159 — remove the 1280-byte MTU floor that bypassed TCP
+  segmentation for valid sub-1280 IPv4 egress MTUs. Three plain-forward sites
+  did `.unwrap_or_default().max(1280)`, flooring every plain-interface egress
+  MTU to the IPv6 minimum LINK MTU (1280 is NOT an IPv4 floor; IPv4 min is 68).
+  A valid egress MTU of 68-1279 was raised to 1280, so a non-DF TCP datagram
+  with L3 length in (real_mtu, 1280] was never flagged for segmentation and was
+  submitted OVERSIZE to AF_XDP TX (blackhole); the `if mtu==0` guard was dead
+  code. Fixed all three: (1) the admission gate forwarded_tcp_may_need_
+  segmentation (dispatch/mod.rs:1519) — removed the floor + added the now-live
+  `if mtu==0 return false` guard; (2) the TX local-owner fast-path builder
+  segment_forwarded_tcp_frames_into_prepared (tx/tcp_segmentation.rs:30) —
+  removed the floor (mtu==0 guard already present); (3) the copy-path twin
+  segment_forwarded_tcp_frames_from_frame plain branch (frame/tcp_segmentation.rs)
+  — removed the floor (mtu==0 guard already present; the tunnel branch already
+  had no floor). DF and is_any_fragment handling untouched (segmentation
+  preserves DF per-segment; fragments still never segmented). IPv6-minimum floor
+  belongs at interface config, not the per-packet segmenter. Added 3 fail-on-
+  revert tests: copy-builder (egress MTU 900, ~1100 L3 non-DF TCP -> >=2 segments
+  each <=900) — target-count-1 gate for the frame/ floor; predicate sub-1280
+  admission test; predicate unknown-MTU (mtu==0 -> no flag) guard test. Updated
+  tx/README.md. Full release suite 3999 passed / 0 failed. Fail-on-revert:
+  restoring the copy-builder floor -> only the copy-builder test RED (target-
+  count 1, verified); restoring the predicate floor+guard -> 2 predicate tests
+  RED.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/tx/tcp_segmentation.rs,
+  userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
+  userspace-dp/src/afxdp/frame/tests_segment_tcp.rs,
+  userspace-dp/src/afxdp/tx/dispatch/tests/segmentation.rs,
+  userspace-dp/src/afxdp/tx/README.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5159 follow-up — close the last coverage seam by binding the TX
+  local-owner FAST-PATH builder (segment_forwarded_tcp_frames_into_prepared,
+  tx/tcp_segmentation.rs) with its own fail-on-revert test. Previously only the
+  copy-path twin + predicate were bound; the TX builder (the primary production
+  path) tripped 0 tests on revert, so a future twin-divergence could silently
+  re-floor the common path. Added
+  segment_forwarded_tcp_frames_into_prepared_honors_sub_1280_ipv4_egress_mtu_5159
+  (tx/dispatch/tests/segmentation.rs): drives the builder via a
+  BindingWorker::new_for_mirror_test with a 900-byte egress MTU + a non-DF IPv4
+  TCP datagram of L3 length 1100; asserts >=2 prepared TX segments each with L3
+  <= 900 (via the returned (segments,_,max_frame) tuple + per-req.len check on
+  pending_tx_prepared). Restoring `.max(1280)` at tx/tcp_segmentation.rs ALONE
+  turns ONLY this test RED (target-count 1, verified: 20 passed; 1 failed). All
+  three floor sites now have a target-count-1 gate. Full release suite 4000
+  passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/tests/segmentation.rs
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5159 review nit (rev6101, team-lead-verified) — corrected the
+  PLAIN-branch mtu==0 comment in frame/tcp_segmentation.rs. It said "fails closed
+  via the mtu==0 guard", but for a plain (non-tunnel) forward mtu==0 → builder
+  returns None → the frame is forwarded WHOLE (best-effort / fail-OPEN), NOT
+  dropped. Rewrote to state that accurately and contrast it with the TUNNEL
+  branch's genuine fail-CLOSED (un-encapsulable → drop). Comment-only; the
+  tunnel-branch fail-closed comments (:32/:36/:443) and the tx/dispatch plain
+  comments (already "forward unchanged") are untouched.
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs
 - **Action**: #5164 — rescope the WireGuard NoSession handshake-request and
   rekey worker→control edges from engine-GLOBAL AtomicBools to PER-PEER. The
   engine held global `handshake_request_pending`/`handshake_request_last_ns`/

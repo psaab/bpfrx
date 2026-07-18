@@ -1562,6 +1562,7 @@ mod reap_flow_cache_tests {
         binding.flow.flow_cache.insert(FlowCacheEntry {
             key: key.clone(),
             ingress_ifindex: REAP_INGRESS_IF,
+            logical_ingress_ifindex: REAP_INGRESS_IF,
             descriptor: RewriteDescriptor {
                 dst_mac: [0; 6],
                 src_mac: [0; 6],
@@ -1613,6 +1614,7 @@ mod reap_flow_cache_tests {
                 key,
                 FlowCacheLookup {
                     ingress_ifindex: REAP_INGRESS_IF,
+                    logical_ingress_ifindex: REAP_INGRESS_IF,
                     config_generation: 1,
                     fib_generation: 1,
                 },
