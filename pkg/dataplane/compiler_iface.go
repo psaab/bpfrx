@@ -480,7 +480,17 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				// (otherwise NIC strips them into skb->vlan_tci which XDP can't read).
 				// Check current state first — toggling rxvlan on iavf VFs causes a
 				// driver reset that drops in-flight packets (kills active TCP sessions).
-				result.ensureRxVlanOff(physName)
+				// #5268: if the offload cannot be disabled AND this parent carries
+				// configured VLAN subinterfaces, FAIL ACTIVATION CLOSED — proceeding
+				// to shim attachment would let HW-stripped tagged traffic inherit the
+				// parent's zone (cross-zone bypass). A plain parent (no 802.1Q units)
+				// tolerates the failure (the disable-failure is still logged inside
+				// ensureRxVlanOff).
+				if err := rxVlanOffloadActivationError(
+					cfg, cfgName, physName, result.ensureRxVlanOff(physName),
+				); err != nil {
+					return err
+				}
 
 				// Single cached netlink lookup for MTU, speed/duplex, and UP/DOWN.
 				nl, nlErr := result.cachedLinkByIndex(physIface.Index)
