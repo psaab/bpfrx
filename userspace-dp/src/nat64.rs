@@ -307,9 +307,15 @@ pub(crate) struct Nat64ReverseInfo {
 //     the key and derives the synthetic-prefix v4 dst identically for both).
 //     This is the same inherent NAT + fragmentation + ident-reuse hazard
 //     RFC 6864 describes, not a new exposure.
-//   * ONLY a first fragment (offset 0, MF=1, admitted + resolved) INSTALLS an
-//     entry. Non-first fragments only CONSULT — the load-bearing DoS property:
-//     an attacker cannot grow the table with cheap headerless fragments.
+//   * ONLY a first fragment (offset 0, MF=1, admitted + resolved + COMMITTED)
+//     INSTALLS an entry. #5146: the install fires at the POST-COMMIT site (after
+//     `can_admit` passes AND the forward session install succeeds), NOT at NAT64
+//     source-allocation time — a first fragment that is then rolled back
+//     (hop-limit ICMP-TE, admission refusal, install-partial) never publishes an
+//     association, so a non-first fragment cannot inherit a rolled-back verdict +
+//     a released (reusable) translation. Non-first fragments only CONSULT — the
+//     load-bearing DoS property: an attacker cannot grow the table with cheap
+//     headerless fragments.
 //   * BOUNDED: a fixed shard count x a fixed per-shard cap, LRU eviction, no
 //     growth. Short TTL (~2s): we ASSOCIATE, we do not RFC-reassemble — real
 //     fragments of one datagram arrive within microseconds-milliseconds; the

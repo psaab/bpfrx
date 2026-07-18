@@ -167,6 +167,13 @@ pub(crate) struct BindingWorker {
     /// `binding.timers.last_X_ns` etc.
     pub(crate) timers: WorkerTimers,
     pub(crate) last_learned_neighbor: Option<LearnedNeighborKey>,
+    /// #5288: per-worker gate for the data-path ARP/NDP kernel-neighbor
+    /// program. Bounds the netlink `socket()`/`sendto()`/`close()` +
+    /// allocations `add_kernel_neighbor` performs so a repeat/flood of accepted
+    /// adverts cannot starve this XSK worker. Touched only by the owning worker
+    /// thread (the ARP/NDP learn in `stage_link_layer_classify`); no cross-core
+    /// sync — neighbor programming is LOCAL, not HA/session-sync state.
+    pub(crate) neigh_program_limiter: super::KernelNeighborProgramLimiter,
     /// #959 Phase 1: 23 `dbg_*` debug counters extracted into
     /// `WorkerTelemetry` to reduce BindingWorker's mutable surface
     /// area. Field semantics unchanged; access via `binding.telemetry.dbg_X`.
@@ -563,6 +570,7 @@ impl BindingWorker {
                 empty_rx_polls: 0,
             },
             last_learned_neighbor: None,
+            neigh_program_limiter: super::KernelNeighborProgramLimiter::new(),
             telemetry: WorkerTelemetry::default(),
             tx_counters: WorkerTxCounters {
                 pending_direct_tx_packets: 0,
@@ -703,6 +711,7 @@ impl BindingWorker {
                 empty_rx_polls: 0,
             },
             last_learned_neighbor: None,
+            neigh_program_limiter: super::KernelNeighborProgramLimiter::new(),
             telemetry: WorkerTelemetry::default(),
             tx_counters: WorkerTxCounters {
                 pending_direct_tx_packets: 0,
@@ -822,6 +831,7 @@ impl BindingWorker {
                 empty_rx_polls: 0,
             },
             last_learned_neighbor: None,
+            neigh_program_limiter: super::KernelNeighborProgramLimiter::new(),
             telemetry: WorkerTelemetry::default(),
             tx_counters: WorkerTxCounters {
                 pending_direct_tx_packets: 0,

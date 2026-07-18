@@ -76,6 +76,19 @@ use filter::{
 /// missing neighbor) is never cached, so a non-first fragment then misses and
 /// drops fail-closed. Only a first fragment (offset 0, MF=1) installs; a
 /// non-first fragment can never populate the table.
+///
+/// #5146: called ONLY at the POST-COMMIT install site (after `can_admit` passes
+/// AND the forward session install succeeds), NOT at NAT64 source-allocation
+/// time. Publishing pre-commit left the association LIVE behind every rollback
+/// arm (hop-limit ICMP-TE bounce, admission refusal, install-partial), and the
+/// rollback releases only the pool port — so a non-first fragment of a
+/// rolled-back first fragment inherited a rolled-back verdict AND a now-reusable
+/// translation (cross-flow NAT64 fragment ambiguity under port reuse). Moving
+/// the install to the commit point makes the association visible ONLY on the
+/// outcome the anchor fragment actually authorized. Self-gated on
+/// `decision.nat.nat64` so it is safe to call unconditionally at the shared
+/// commit site next to `nat_install_forward_fragment_assoc`; the two are
+/// mutually exclusive (NAT64 vs ordinary same-family), so exactly one fires.
 #[inline]
 fn nat64_install_forward_fragment_assoc(
     forwarding: &ForwardingState,
@@ -84,6 +97,13 @@ fn nat64_install_forward_fragment_assoc(
     decision: &SessionDecision,
     now_ns: u64,
 ) {
+    // #5146: only a genuine NAT64 (cross-family) decision installs here. The
+    // ordinary same-family NAT / NPTv6 association is installed by
+    // `nat_install_forward_fragment_assoc` (which self-gates the other way), so
+    // both can be called at one commit site and exactly one populates the table.
+    if !decision.nat.nat64 {
+        return;
+    }
     if decision.resolution.disposition != ForwardingDisposition::ForwardCandidate
         || decision.resolution.neighbor_mac.is_none()
     {
@@ -926,9 +946,13 @@ pub(super) fn poll_binding_process_descriptor(
                 // #946 Phase 1 stage 5: ARP / NDP link-layer
                 // classification. ARP frames recycle without
                 // transiting; NDP NA learns and falls through.
-                if let StageOutcome::RecycleAndContinue =
-                    stage_link_layer_classify(raw_frame, meta, worker_ctx)
-                {
+                if let StageOutcome::RecycleAndContinue = stage_link_layer_classify(
+                    raw_frame,
+                    meta,
+                    now_ns,
+                    &mut binding.neigh_program_limiter,
+                    worker_ctx,
+                ) {
                     binding.scratch.scratch_recycle.push(desc.addr);
                     continue;
                 }
@@ -2926,24 +2950,22 @@ pub(super) fn poll_binding_process_descriptor(
                                                 dst_v4,
                                                 translated_port,
                                             );
-                                            // #2562: if THIS is a first fragment
-                                            // (offset 0, MF=1), install the
-                                            // fragment association so its
-                                            // non-first fragments inherit this
-                                            // translation instead of dropping
-                                            // fail-closed (#4617). No-op for a
-                                            // non-fragmented / atomic packet.
-                                            if let Some(l3_packet) =
-                                                packet_frame.get(meta.l3_offset as usize..)
-                                            {
-                                                nat64_install_forward_fragment_assoc(
-                                                    worker_ctx.forwarding,
-                                                    l3_packet,
-                                                    meta.addr_family as i32,
-                                                    &decision,
-                                                    now_ns,
-                                                );
-                                            }
+                                            // #2562/#5146: the first-fragment
+                                            // association is NO LONGER installed
+                                            // here. Source allocation is not the
+                                            // commit point — the flow can still be
+                                            // rolled back (hop-limit ICMP-TE,
+                                            // admission refusal, install-partial),
+                                            // and the rollback releases only the
+                                            // pool port, leaving a pre-published
+                                            // association live to hand a non-first
+                                            // fragment a rolled-back verdict + a
+                                            // now-reusable translation (#5146). The
+                                            // install moved to the POST-COMMIT site
+                                            // (inside `if forward_installed`),
+                                            // alongside the ordinary-NAT install,
+                                            // so it is published ONLY on the
+                                            // outcome the anchor authorized.
                                             Some(Nat64ReverseInfo {
                                                 orig_src_v6,
                                                 orig_dst_v6,
@@ -3299,6 +3321,30 @@ pub(super) fn poll_binding_process_descriptor(
                                         if let Some(l3_packet) =
                                             packet_frame.get(meta.l3_offset as usize..)
                                         {
+                                            // #5146: publish the NAT64 (cross-
+                                            // family) first-fragment association
+                                            // ONLY now — the flow has COMMITTED
+                                            // (past `can_admit` and a successful
+                                            // forward session install). Publishing
+                                            // it at source-allocation time left the
+                                            // association live behind every
+                                            // rollback arm (hop-limit ICMP-TE,
+                                            // admission refusal, install-partial),
+                                            // and the rollback releases only the
+                                            // pool port — so a non-first fragment
+                                            // of a rolled-back first fragment
+                                            // inherited a rolled-back verdict AND a
+                                            // now-reusable translation (#5146). Both
+                                            // helpers self-gate (NAT64 vs ordinary
+                                            // same-family), so exactly one fires for
+                                            // a given committed first fragment.
+                                            nat64_install_forward_fragment_assoc(
+                                                worker_ctx.forwarding,
+                                                l3_packet,
+                                                meta.addr_family as i32,
+                                                &decision,
+                                                now_ns,
+                                            );
                                             nat_install_forward_fragment_assoc(
                                                 worker_ctx.forwarding,
                                                 l3_packet,

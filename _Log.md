@@ -59,6 +59,62 @@
 - **File(s)**: `pkg/dataplane/userspace/eventstream.go`,
   `pkg/dataplane/userspace/eventstream_decode_syncbreak_5483_test.go`,
   `docs/session-sync-architecture.md`, `_Log.md`
+## 2026-07-18 — #5146 (security/correctness): NAT64 first-fragment association published pre-commit
+
+- **Timestamp**: 2026-07-18 (fix/5146-nat64-frag-rollback)
+- **Action**: `nat64_install_forward_fragment_assoc` (the #2562 cross-family
+  fragment cache) was called at NAT64 source-allocation time — BEFORE the flow
+  commits. The hop-limit ICMP-TE bounce, the `can_admit` admission preflight, and
+  the install-partial arm each `rollback_nat64_allocation` (releases the pool port
+  ONLY), so a pre-published association stayed LIVE ~2s (NAT64_FRAG_TTL_NS) with
+  NO exact-key remove. A non-first fragment of a rolled-back first fragment then
+  inherited a rolled-back verdict AND the now-reusable translation (cross-flow
+  NAT64 fragment ambiguity under port reuse). Fix = Option A: DELAY the install to
+  the single POST-COMMIT site (inside `if forward_installed`, next to the ordinary
+  same-family `nat_install_forward_fragment_assoc`); helper now self-gates on
+  `decision.nat.nat64` so both installs share one commit site and exactly one
+  fires. Every rollback arm (ICMP-TE / admission / install-partial / track-false)
+  now leaves NO live association; the committed success path still publishes
+  (#2562/#6095 preserved). NOT HA — Nat64FragAssoc is per-process, never synced.
+  Added 2 poll-path tests through `poll_binding_process_descriptor`: SUCCESS
+  (committed first fragment publishes 1 assoc, non-first inherits + translates)
+  and FAIL-ON-REVERT (can_admit-refused first fragment leaves 0 assoc; non-first
+  misses — `nat64_translations == 0`, drops fail-closed). Reverting the fix →
+  rollback test RED at the `frag_assoc.len() == 0` assertion (`left: 1`),
+  target-count 1; success test stays green.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_nat64_tunnel.rs,
+  docs/pr/5146-nat64-frag-rollback/plan.md
+## 2026-07-18 — #5288: bound data-path kernel-neighbor programming on the XSK worker
+
+- **Timestamp**: 2026-07-18 (fix/5288-neighbor-netlink-bounded)
+- **Action**: `stage_link_layer_classify` called `add_kernel_neighbor`
+  UNCONDITIONALLY per accepted ARP reply / NDP NA — a raw `AF_NETLINK`
+  `socket()`/`sendto()`/`close()` + request/IP `Vec` allocations, on the
+  latency-sensitive XSK worker — even for a same-key/same-MAC repeat whose
+  `insert_if_changed` result was discarded. An attacker streaming valid
+  adverts for a non-owned unicast IP could storm netlink per frame →
+  forwarding starvation (perf/DoS). Fix: a new per-worker
+  `KernelNeighborProgramLimiter` (`neighbor_program_limiter.rs`, 256-slot
+  direct-mapped table) gates both learn arms. It skips repeats the kernel
+  already holds (proved by the slot OR `insert_if_changed == false`),
+  rate-caps a changed-flood to ≤1 program per 50 ms per slot (which also
+  bounds the AGGREGATE per-worker netlink rate to ≤ SLOTS/interval under a
+  many-IP flood), and never loses a genuine change — a real MAC change after
+  steady state programs immediately (steady-state re-adverts do not consume
+  the rate budget), and a change rate-limited amid a flood stays "owed" and
+  is retried on the next advert. The `should_program` decision is pure
+  (no alloc, no syscall) with 7 unit tests incl. the #5288 fail-on-revert
+  (an identical-repeat flood must program ONCE, not N times). NOT
+  HA/session-sync — neighbor programming is a LOCAL kernel-table op, so the
+  limiter is per-worker with no peer coordination. Persistent-socket +
+  off-worker coalescing of the send itself is a DEFERRED follow-up. Full
+  userspace-dp suite 4011 passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/neighbor_program_limiter.rs (new),
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_stages_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/afxdp/README.md
 
 ## 2026-07-18 — #5149: trim_l3_payload must be IP-declared-length authoritative (tunnel L4 checksum over Ethernet slack)
 
