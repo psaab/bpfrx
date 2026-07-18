@@ -156,10 +156,10 @@ func TestStopPolicySchedulerLoopCancelsJoins(t *testing.T) {
 	}, func(map[string]bool) error { return nil }, time.Now())
 
 	d := &Daemon{
-		scheduler: sched,
 		applySem:  semaphore.NewWeighted(1),
 		daemonCtx: context.Background(), // production: never cancelled
 	}
+	d.scheduler.Store(sched)
 	d.startPolicySchedulerLoopLocked()
 	if d.schedulerCancel == nil {
 		t.Fatal("scheduler loop did not start")

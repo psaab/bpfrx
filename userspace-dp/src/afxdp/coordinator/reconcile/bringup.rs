@@ -18,6 +18,29 @@ use super::super::super::*;
 use super::super::supervisor::{spawn_supervised_aux, spawn_supervised_worker};
 use super::super::{Coordinator, WorkerHandle};
 
+/// Bring up the worker threads for the just-applied snapshot.
+///
+/// #4952: this runs on the POST-TEARDOWN destructive path — `tear_down`
+/// has already stopped the previous workers, so a worker-thread spawn
+/// failure here leaves the affected queue set with NO XSK-bound worker
+/// (a silent forwarding outage). The spawn (`spawn_supervised_worker` ->
+/// `thread::Builder::spawn` -> `pthread_create`) can return EAGAIN/ENOMEM
+/// under resource exhaustion. On the FIRST such failure this ABORTS the
+/// remaining launches (the data plane is already broken — spawning more
+/// XSK-bound workers cannot restore forwarding and only compounds the
+/// pressure), PRESERVES the `spawn_worker_failed:<id>:<err>` stage (it does
+/// NOT overwrite it with `spawned:..`), skips the auxiliary-thread bring-up,
+/// and returns `Err(stage)`. The caller (`reconcile`) maps that to
+/// `ReconcileError::WorkerSpawn` so the control handler fails closed and
+/// does NOT persist the broken snapshot as the boot baseline. On success
+/// returns `Ok(())`.
+///
+/// Full pre-teardown preflight of the spawn is not tractable — a real
+/// `pthread_create` cannot be probed without spawning the thread, and the
+/// old workers must be torn down first to free the XSK queue bindings the
+/// new workers claim. So this is the minimal fail-closed guarantee (do not
+/// persist a known-broken snapshot); a staged spawn-before-teardown is a
+/// possible follow-up.
 pub(super) fn bring_up_workers(
     coord: &mut Coordinator,
     snapshot: &ConfigSnapshot,
@@ -25,7 +48,7 @@ pub(super) fn bring_up_workers(
     fds: ReconcileSnapshotFds,
     ring_entries: usize,
     preserved_synced_sessions: Vec<SyncedSessionEntry>,
-) {
+) -> Result<(), String> {
     let ReconcileSnapshotFds {
         map_fd,
         heartbeat_map_fd,
@@ -256,6 +279,11 @@ pub(super) fn bring_up_workers(
             }
         }
     }
+    // #4952: set on the FIRST worker-spawn failure; carries the preserved
+    // `spawn_worker_failed:<id>:<err>` stage. Once set, the loop breaks
+    // (abort remaining launches) and the tail returns Err(stage) so the
+    // reconcile fails closed instead of persisting a broken snapshot.
+    let mut spawn_failure: Option<String> = None;
     for (worker_id, binding_plans) in workers {
         let plan_count = binding_plans.len();
         let stop = Arc::new(AtomicBool::new(false));
@@ -334,48 +362,66 @@ pub(super) fn bring_up_workers(
         // a helper without re-validating the panic-payload contract.
         let panic_slot = Arc::new(Mutex::new(None::<String>));
         coord.worker_panics.insert(worker_id, panic_slot.clone());
-        let join =
-            spawn_supervised_worker(worker_id, runtime_atomics.clone(), panic_slot, move || {
-                worker_loop(
-                    worker_id,
-                    binding_plans,
-                    shared_validation,
-                    shared_forwarding,
-                    ha_state,
-                    dynamic_neighbors,
-                    neighbor_resolver,
-                    shared_sessions,
-                    shared_nat_sessions,
-                    shared_forward_wire_sessions,
-                    shared_owner_rg_indexes,
-                    slow_path,
-                    local_tunnel_deliveries,
-                    recent_exceptions,
-                    recent_session_deltas,
-                    last_resolution,
-                    commands_clone,
-                    peer_commands_clone,
-                    worker_commands_by_id,
-                    stop_clone,
-                    heartbeat_clone,
-                    session_export_ack_clone,
-                    worker_poll_mode,
-                    dnat_fds,
-                    shared_fabrics,
-                    event_stream_handle,
-                    rg_epochs,
-                    shared_cos_owner_worker_by_queue,
-                    shared_cos_owner_live_by_queue,
-                    shared_cos_root_leases,
-                    shared_cos_exact_backlogs,
-                    shared_cos_queue_leases,
-                    shared_cos_queue_vtime_floors,
-                    shared_mirror_targets,
-                    cos_status_clone,
-                    runtime_atomics_clone,
-                    cold_path_atomics_clone,
-                );
-            });
+        let body = move || {
+            worker_loop(
+                worker_id,
+                binding_plans,
+                shared_validation,
+                shared_forwarding,
+                ha_state,
+                dynamic_neighbors,
+                neighbor_resolver,
+                shared_sessions,
+                shared_nat_sessions,
+                shared_forward_wire_sessions,
+                shared_owner_rg_indexes,
+                slow_path,
+                local_tunnel_deliveries,
+                recent_exceptions,
+                recent_session_deltas,
+                last_resolution,
+                commands_clone,
+                peer_commands_clone,
+                worker_commands_by_id,
+                stop_clone,
+                heartbeat_clone,
+                session_export_ack_clone,
+                worker_poll_mode,
+                dnat_fds,
+                shared_fabrics,
+                event_stream_handle,
+                rg_epochs,
+                shared_cos_owner_worker_by_queue,
+                shared_cos_owner_live_by_queue,
+                shared_cos_root_leases,
+                shared_cos_exact_backlogs,
+                shared_cos_queue_leases,
+                shared_cos_queue_vtime_floors,
+                shared_mirror_targets,
+                cos_status_clone,
+                runtime_atomics_clone,
+                cold_path_atomics_clone,
+            );
+        };
+        // #4952 test seam: force the fallible worker spawn to fail so the
+        // post-teardown fail-closed propagation is unit-verifiable without a
+        // real (unprovokable) pthread_create EAGAIN/ENOMEM. Declines the real
+        // spawn, drops the worker body unspawned, and synthesizes the same
+        // `std::io::Error` a resource-exhausted spawn returns. Always 0 in
+        // release builds (`force_worker_spawn_fail` is `#[cfg(test)]`).
+        #[cfg(test)]
+        let join = if coord.force_worker_spawn_fail > 0 {
+            coord.force_worker_spawn_fail -= 1;
+            drop(body);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "forced worker spawn failure (test seam #4952)",
+            ))
+        } else {
+            spawn_supervised_worker(worker_id, runtime_atomics.clone(), panic_slot, body)
+        };
+        #[cfg(not(test))]
+        let join = spawn_supervised_worker(worker_id, runtime_atomics.clone(), panic_slot, body);
         match join {
             Ok(join) => {
                 eprintln!(
@@ -401,7 +447,8 @@ pub(super) fn bring_up_workers(
                     "xpf-userspace-dp: failed to start worker thread worker_id={} err={}",
                     worker_id, err
                 );
-                coord.last_reconcile_stage = format!("spawn_worker_failed:{worker_id}:{err}");
+                let stage = format!("spawn_worker_failed:{worker_id}:{err}");
+                coord.last_reconcile_stage = stage.clone();
                 // #925 Phase 1: the panic slot was inserted before
                 // spawn; drop it now so a snapshot reader doesn't
                 // see a phantom slot for a worker that never ran.
@@ -412,13 +459,34 @@ pub(super) fn bring_up_workers(
                 coord.worker_exception_rings.remove(&worker_id);
                 coord.worker_last_resolution.remove(&worker_id);
                 if let Ok(mut recent) = coord.recent_exceptions.lock() {
-                    push_recent_exception(
-                        &mut recent,
-                        control_notice_event("", format!("spawn_worker_failed:{worker_id}:{err}")),
-                    );
+                    push_recent_exception(&mut recent, control_notice_event("", stage.clone()));
                 }
+                // #4952: a spawn failed on the POST-TEARDOWN destructive
+                // path — the old workers are gone, so this queue set now has
+                // NO XSK-bound worker (silent forwarding outage). ABORT the
+                // remaining launches (the data plane is already broken;
+                // spawning more XSK-bound workers cannot restore forwarding
+                // and only compounds the resource pressure) and remember the
+                // preserved stage so the tail returns Err and the caller
+                // fails closed instead of persisting a broken snapshot.
+                spawn_failure = Some(stage);
+                break;
             }
         }
+    }
+    // #4952: on a post-teardown spawn failure, PRESERVE the
+    // "spawn_worker_failed:.." stage (do NOT overwrite it with
+    // "spawned:.."), skip the auxiliary-thread bring-up (forwarding is
+    // down — the next successful reconcile starts them), and return the
+    // failure so `reconcile` maps it to `ReconcileError::WorkerSpawn` and
+    // the control handler fails closed, NOT persisting this broken snapshot
+    // as the boot baseline.
+    if let Some(stage) = spawn_failure {
+        eprintln!(
+            "xpf-userspace-dp: worker bring-up FAILED ({stage}); a queue set has no \
+             XSK-bound worker after teardown — failing reconcile closed"
+        );
+        return Err(stage);
     }
     coord.last_reconcile_stage = format!(
         "spawned:workers={}:identities={}:live={}",
@@ -499,6 +567,7 @@ pub(super) fn bring_up_workers(
     // the spawn-pass worker gate).
     coord.reconcile_local_tunnel_sources();
     coord.spawn_wg_control_threads();
+    Ok(())
 }
 
 /// #1830 follow-up (Codex review on PR #1841): array length needed to

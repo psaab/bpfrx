@@ -611,6 +611,17 @@ func newCollector(srv *Server) *xpfCollector {
 				"for that long while the daemon retries.",
 			nil, nil,
 		),
+		schedulerRepublishFailClosed: prometheus.NewDesc(
+			"xpf_scheduler_republish_fail_closed",
+			"1 while the scheduler-republish failure streak has persisted past "+
+				"the bounded age and the scheduler has escalated to FAIL-CLOSED "+
+				"(#5669): scheduled policies are forced inactive (deny) so a "+
+				"scheduled permit stops forwarding past its window close instead "+
+				"of relying on an eventual republish recovery. 0 when healthy or "+
+				"still inside the bounded retry window (xpf_scheduler_republish_"+
+				"failed=1, xpf_scheduler_republish_stale_seconds climbing).",
+			nil, nil,
+		),
 		configPersistDegraded: prometheus.NewDesc(
 			"xpf_daemon_config_persist_degraded",
 			"1 while the running active configuration failed to persist "+

@@ -193,6 +193,12 @@ type xpfCollector struct {
 	// failure streak in seconds (0 when healthy).
 	schedulerRepublishFailed *prometheus.Desc
 	schedulerRepublishStale  *prometheus.Desc
+	// #5669: 0/1 gauge — 1 while the scheduler-republish failure streak has
+	// persisted past the bounded age and the scheduler has escalated to
+	// fail-closed (forcing scheduled policies inactive/deny), distinct from the
+	// climbing stale-seconds age so an operator can alarm on the crisp
+	// fail-closed crossing.
+	schedulerRepublishFailClosed *prometheus.Desc
 
 	// #1799: 0/1 gauge — 1 while the running active config failed to
 	// persist to disk and the configstore's background retry has not
@@ -682,6 +688,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ipsecRebindPending
 	ch <- c.schedulerRepublishFailed
 	ch <- c.schedulerRepublishStale
+	ch <- c.schedulerRepublishFailClosed
 	ch <- c.configPersistDegraded
 	ch <- c.rollbackHistoryDegraded
 	ch <- c.userspacePolicyContentRejected
@@ -992,6 +999,14 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	if c.srv.schedulerRepublishStaleSecondsFn != nil {
 		ch <- prometheus.MustNewConstMetric(c.schedulerRepublishStale,
 			prometheus.GaugeValue, c.srv.schedulerRepublishStaleSecondsFn())
+	}
+	if c.srv.schedulerRepublishFailClosedFn != nil {
+		v := 0.0
+		if c.srv.schedulerRepublishFailClosedFn() {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.schedulerRepublishFailClosed,
+			prometheus.GaugeValue, v)
 	}
 
 	// #2050: dynamic-address feed staleness is a control-plane signal (the

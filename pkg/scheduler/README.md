@@ -25,6 +25,11 @@ during specific windows.
 - `RepublishPending() bool` / `RepublishFailureStatus() (pending bool,
   failures uint64, since time.Time)` — `scheduler.go`. Expose the #3780
   self-heal state for tests and metrics.
+- `RepublishFailClosed() bool` — `scheduler.go`. True once a republish has
+  been failing past `RepublishFailClosedAge` and the scheduler has
+  escalated to fail-closed (forces scheduled policies inactive/deny +
+  one-time alarm, #5669). Feeds the `xpf_scheduler_republish_fail_closed`
+  gauge.
 
 ## Time-window model (#3849)
 
@@ -125,6 +130,90 @@ plus `xpf_scheduler_republish_stale_seconds` (age of the current failure
 streak), and logs an `ERROR` on the transition into failure. See
 `pkg/daemon/daemon_scheduler.go` (`publishPolicyScheduleState`,
 `recordSchedulerRepublishResult`).
+
+## Bounded-age fail-closed (#5669)
+
+The #3780 self-heal retries a failed republish every tick, but a
+**persistently** failing republish — a wedged control socket (the shared
+helper control socket carries status poll, HA sync, session installs, and
+snapshot sync, per `CLAUDE.md`), an incompatible helper — leaves the stale
+window **fail-open** (a scheduled permit still forwarding past its close)
+for as long as the retry keeps failing, silently, with no operator signal
+beyond the climbing stale-seconds gauge.
+
+Once the failure streak exceeds `RepublishFailClosedAge` (5 min ≈ five
+60 s ticks — long enough to absorb transient control-socket contention
+without a false alarm, short enough to surface a genuinely stuck republish
+promptly), the scheduler latches `republishFailClosed` and:
+
+- emits a **one-time** `slog.Warn` fail-closed alarm (not per tick), and
+- forces **every scheduled policy to the `inactive` (deny) disposition** in
+  the authoritative active-state map on the next evaluation, and tries to
+  publish that all-inactive snapshot.
+
+**What this actually buys — and what it does NOT.** Be precise about the
+packet-path effect, because the honest scope is narrower than "force
+inactive ⇒ the permit stops forwarding":
+
+The forced-inactive snapshot is published through **the same `updateFn`
+channel** (`Manager.UpdatePolicyScheduleState` → `apply_snapshot`) whose
+failures *define* the streak. In a **persistently-wedged** dataplane — the
+exact case that latches fail-closed — that publish also fails, so the
+all-inactive snapshot **does not reach the helper**: the stale scheduled
+**permit keeps forwarding** past its window close until the control socket
+recovers. The latch does **not** itself stop packets in a wedged dataplane.
+
+So the fail-closed escalation does not close the packet-path fail-open
+window; it **bounds the *silent* fail-open window** and converts it into a
+loud, observable, authoritative-deny posture. Concretely it delivers:
+
+- **(a) a one-time loud alarm** (`slog.Warn`, "FAIL-CLOSED") — the operator
+  is told enforcement is wedged instead of only seeing a climbing
+  stale-seconds gauge;
+- **(b) the `xpf_scheduler_republish_fail_closed` 0/1 gauge** for
+  monitoring/alerting;
+- **(c) authoritative + surface deny consistency** — `ActiveState()` /
+  `IsActive()` (and any `show`/policy-match surface reading them) report the
+  scheduled policies **inactive (deny)**, so the control-plane view matches
+  the intended fail-closed disposition rather than advertising an active
+  permit the dataplane cannot honor;
+- **(d) deny-lands-first on recovery** — when the republish recovers the
+  scheduler first publishes the all-inactive snapshot and clears the latch,
+  and only the **next** tick republishes the true (possibly reopened)
+  window. So the moment the socket unwedges, the helper receives *deny*
+  before it receives any reopened permit — the recovery cannot briefly
+  re-open a stale permit ahead of the correct state.
+
+The latch clears on the next **successful** republish, after which the true
+window state is republished and any legitimately-open permit reopens (no
+permanent false-deny). Because the latch engages **only** while a republish
+is failing — enforcement is already broken — it never force-denies a
+converged, genuinely-active window (those have `republishPending == false`).
+`RepublishFailClosed()` exposes the latch; the daemon's
+`SchedulerRepublishFailClosed` reads **that same latch** (not a second
+daemon-side timer) and feeds it to the
+`xpf_scheduler_republish_fail_closed` gauge, so the gauge equals the
+scheduler's force-inactive/alarm decision exactly rather than approximately
+(#5669 review fold).
+
+**By-design: a scheduler config change resets the streak.** A commit that
+changes the scheduler policy set (its `policySchedulerConfigHash`) tears
+down and re-primes the scheduler with a fresh `republishFailClosed=false`
+and a reset failure streak/clock, so repeated scheduler edits while the
+dataplane stays wedged could keep restarting the 5 min bound and indefinitely
+delay the fail-closed alarm. This is intentional — a new config is a new
+streak — but operators editing schedulers during a control-socket outage
+should watch `xpf_scheduler_republish_failed`/`_stale_seconds`, which are not
+reset by the escalation logic itself.
+
+**Limitation (block-engage scope).** The fail-closed disposition is
+`inactive` (drop the scheduled rule → default-deny), which is the correct
+fail-closed for the dominant **scheduled-permit** case. A scheduled
+**block** whose engage-activation was never published is already un-engaged
+in the wedged dataplane; forcing it `inactive` matches that state but cannot
+*engage* a block, which requires a successful publish. Actively engaging a
+stuck block would need per-policy action awareness in the dataplane, out of
+this package's scope.
 
 ## Callers
 

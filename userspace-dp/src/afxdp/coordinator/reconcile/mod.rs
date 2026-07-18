@@ -33,10 +33,18 @@ pub(super) mod teardown;
 /// handler mirror #3766: report `ok=false`, restore the prior snapshot +
 /// status fields, and NOT persist.
 ///
-/// Every variant is raised ONLY by a pre-teardown early return, where
-/// #2440/#2484 keep the prior workers + forwarding + published generation
-/// fully live. The handler restore is therefore a status/bookkeeping
-/// rollback, not a forwarding recovery — the data plane never moved.
+/// The `Integrity` and `MapSetup` variants are raised ONLY by a
+/// pre-teardown early return, where #2440/#2484 keep the prior workers +
+/// forwarding + published generation fully live. For those, the handler
+/// restore is a status/bookkeeping rollback, not a forwarding recovery —
+/// the data plane never moved.
+///
+/// #4952: `WorkerSpawn` is the exception — it is raised AFTER `tear_down`
+/// has already stopped the old workers, so the data plane HAS moved (a
+/// queue set is left with no XSK-bound worker). There is no prior-state
+/// restore that brings the torn-down workers back; the handler still fails
+/// closed (report `ok=false`, do NOT persist the broken snapshot as the
+/// boot baseline) and recovery is a retry / last-good reconcile.
 #[derive(Debug)]
 pub(crate) enum ReconcileError {
     /// A snapshot integrity fault surfaced by the top-of-reconcile policy
@@ -49,6 +57,15 @@ pub(crate) enum ReconcileError {
     /// (defensively unreachable post-#2484). Carries the
     /// `last_reconcile_stage` descriptor for the control-plane error.
     MapSetup(String),
+    /// #4952: a worker thread failed to spawn on the POST-TEARDOWN
+    /// destructive path (`bring_up_workers` -> `spawn_supervised_worker` ->
+    /// `pthread_create` EAGAIN/ENOMEM under resource exhaustion). Unlike the
+    /// two pre-teardown variants above, `tear_down` has already stopped the
+    /// old workers, so the affected queue set has NO XSK-bound worker and
+    /// forwarding is DOWN. Surfaced so the control handler fails closed and
+    /// does NOT persist the broken snapshot as the boot baseline. Carries
+    /// the preserved `spawn_worker_failed:<id>:<err>` stage.
+    WorkerSpawn(String),
 }
 
 impl std::fmt::Display for ReconcileError {
@@ -56,6 +73,7 @@ impl std::fmt::Display for ReconcileError {
         match self {
             ReconcileError::Integrity(err) => write!(f, "{err}"),
             ReconcileError::MapSetup(stage) => write!(f, "map setup failed ({stage})"),
+            ReconcileError::WorkerSpawn(stage) => write!(f, "worker spawn failed ({stage})"),
         }
     }
 }
@@ -347,7 +365,7 @@ impl Coordinator {
             // fail-closed backstop, not a prior-state restore).
             return Err(ReconcileError::MapSetup(self.last_reconcile_stage.clone()));
         };
-        bringup::bring_up_workers(
+        let bringup_result = bringup::bring_up_workers(
             self,
             snapshot,
             bindings,
@@ -355,7 +373,17 @@ impl Coordinator {
             ring_entries,
             preserved.synced_sessions,
         );
+        // Reflect the real per-binding state either way — a partial spawn
+        // (some workers up, then a spawn aborted the rest) still needs the
+        // refresh so status shows which slots came up and which did not.
         self.refresh_bindings(bindings);
-        Ok(())
+        // #4952: a POST-TEARDOWN worker-spawn failure fails the reconcile
+        // closed. `bring_up_workers` preserved the `spawn_worker_failed:..`
+        // stage and returned it; surface it as `ReconcileError::WorkerSpawn`
+        // so the control handler reports ok=false and does NOT persist this
+        // broken snapshot as the boot baseline (the old workers are already
+        // torn down — there is no forwarding to restore, only fail-closed
+        // bookkeeping + a retry/last-good path).
+        bringup_result.map_err(ReconcileError::WorkerSpawn)
     }
 }

@@ -3520,6 +3520,76 @@ fn reconcile_missing_pin_returns_map_setup_err_3789() {
     }
 }
 
+/// #4952: a worker-thread spawn failure on the POST-TEARDOWN destructive
+/// path (`bring_up_workers` -> `spawn_supervised_worker`) must FAIL CLOSED —
+/// `reconcile` returns `Err(ReconcileError::WorkerSpawn(_))` and
+/// `last_reconcile_stage` RETAINS the `spawn_worker_failed:..` descriptor
+/// (it is NOT overwritten with `spawned:workers=..`).
+///
+/// Before #4952 `bring_up_workers` returned `()`, only LOGGED the spawn
+/// failure + recorded an exception, then unconditionally overwrote the
+/// stage with `spawned:..` and returned success. So a post-teardown
+/// `pthread_create` EAGAIN/ENOMEM left a queue set with NO XSK-bound worker
+/// yet `reconcile` returned `Ok(())` — the control handler then acked
+/// ok=true AND persisted the broken snapshot as the boot baseline (a silent
+/// forwarding outage with no retry). #3789 fail-closes only the PRE-teardown
+/// integrity/map legs, not this post-teardown spawn failure.
+///
+/// The per-instance `force_worker_spawn_fail` seam forces the spawn to
+/// return the EAGAIN/ENOMEM error a resource-exhausted `pthread_create`
+/// returns (unprovokable in-process), so the propagation is unit-verifiable.
+///
+/// Fail-on-revert: revert the propagation (`bring_up_workers` back to `()` +
+/// the unconditional `spawned:..` stage overwrite) and BOTH the
+/// `Err(WorkerSpawn)` match and the `spawn_worker_failed` stage assertion
+/// flip (`reconcile` returns `Ok`, stage becomes `spawned:workers=..`).
+#[test]
+fn reconcile_post_teardown_worker_spawn_failure_fails_closed_4952() {
+    let mut coordinator = Coordinator::new();
+    // One registered binding => exactly one planned worker to spawn.
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        worker_id: 0,
+        queue_id: 0,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        ..BindingStatus::default()
+    }];
+    // Force the (only) planned worker's spawn to fail on the post-teardown
+    // path — the fallible step the fix propagates.
+    coordinator.force_worker_spawn_fail = 1;
+
+    // All mandatory pins open so the reconcile clears the pre-teardown
+    // integrity legs, tears down, applies the snapshot, and REACHES the
+    // worker spawn (the destructive path #4952 guards).
+    let snap = mandatory_ok_snapshot(5);
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert!(
+        matches!(result, Err(ReconcileError::WorkerSpawn(ref stage)) if !stage.is_empty()),
+        "a post-teardown worker-spawn failure must surface as Err(WorkerSpawn) with a \
+         non-empty stage, got {result:?}"
+    );
+    assert!(
+        coordinator
+            .last_reconcile_stage
+            .starts_with("spawn_worker_failed:"),
+        "the spawn-failure stage must be PRESERVED (not overwritten with spawned:..), got {:?}",
+        coordinator.last_reconcile_stage
+    );
+    assert!(
+        !coordinator.last_reconcile_stage.starts_with("spawned:"),
+        "the reconcile must NOT report a successful spawn after a spawn failure, got {:?}",
+        coordinator.last_reconcile_stage
+    );
+    // The seam consumed its single forced failure (no over-fire).
+    assert_eq!(
+        coordinator.force_worker_spawn_fail, 0,
+        "exactly one forced spawn failure should have been consumed"
+    );
+}
+
 /// #5171: the side-effect-free `validate_snapshot_buildable` gate (used by
 /// the deferred-activation apply path, which never reaches `reconcile`) and
 /// the worker-spawning `reconcile` MUST reject the IDENTICAL non-buildable

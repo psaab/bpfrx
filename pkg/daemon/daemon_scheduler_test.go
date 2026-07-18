@@ -15,7 +15,8 @@ func TestStartPolicySchedulerLoopLockedWaitsForDaemonContext(t *testing.T) {
 		"always": {Name: "always"},
 	}, func(map[string]bool) error { return nil }, time.Now())
 
-	d := &Daemon{scheduler: sched}
+	d := &Daemon{}
+	d.scheduler.Store(sched)
 	d.startPolicySchedulerLoopLocked()
 	if d.schedulerCancel != nil {
 		t.Fatal("scheduler loop started before daemon context was available")
@@ -40,10 +41,10 @@ func TestReconcilePolicySchedulerLockedKeepsByteIdenticalScheduler(t *testing.T)
 	d := &Daemon{}
 
 	first := d.reconcilePolicySchedulerLocked(cfg)
-	if d.scheduler == nil {
+	if d.scheduler.Load() == nil {
 		t.Fatal("scheduler was not created")
 	}
-	sched := d.scheduler
+	sched := d.scheduler.Load()
 	epoch := d.policySchedulerEpoch.Load()
 
 	second := d.reconcilePolicySchedulerLocked(&config.Config{
@@ -51,7 +52,7 @@ func TestReconcilePolicySchedulerLockedKeepsByteIdenticalScheduler(t *testing.T)
 			"always": {Name: "always"},
 		},
 	})
-	if d.scheduler != sched {
+	if d.scheduler.Load() != sched {
 		t.Fatal("byte-identical scheduler config recreated the scheduler")
 	}
 	if got := d.policySchedulerEpoch.Load(); got != epoch {

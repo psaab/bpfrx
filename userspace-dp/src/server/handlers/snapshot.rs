@@ -200,11 +200,26 @@ pub(super) fn apply(
                 guard.status.last_snapshot_at = prev_last_snapshot_at;
                 guard.status.capabilities = prev_capabilities;
                 response.ok = false;
-                response.error = format!("snapshot integrity error: {}", err);
-                eprintln!(
-                    "CTRL_REQ: same-plan apply_snapshot rejected (integrity build): {} — keeping previous state",
-                    err
-                );
+                // #4952: distinguish the POST-TEARDOWN worker-spawn failure
+                // (old workers gone, dataplane down — refresh status to the
+                // real per-binding state) from the pre-teardown integrity
+                // faults (prior workers still live). Both fail closed and do
+                // NOT persist; only the message + status refresh differ.
+                if let crate::afxdp::ReconcileError::WorkerSpawn(stage) = &err {
+                    response.error = format!(
+                        "worker spawn failed after teardown ({stage}); dataplane down — snapshot not persisted"
+                    );
+                    refresh_status(guard);
+                    eprintln!(
+                        "CTRL_REQ: same-plan apply_snapshot rejected (post-teardown worker spawn failure): {stage} — dataplane down, NOT persisting"
+                    );
+                } else {
+                    response.error = format!("snapshot integrity error: {}", err);
+                    eprintln!(
+                        "CTRL_REQ: same-plan apply_snapshot rejected (integrity build): {} — keeping previous state",
+                        err
+                    );
+                }
                 return;
             }
         } else {
@@ -324,6 +339,35 @@ pub(super) fn apply(
                 "CTRL_REQ: apply_snapshot defer_workers=true — skipping worker spawn (RETH MAC pending)"
             );
         } else if let Err(err) = reconcile_status_bindings(guard) {
+            if let crate::afxdp::ReconcileError::WorkerSpawn(stage) = &err {
+                // #4952: POST-TEARDOWN worker-spawn failure. Unlike the
+                // pre-teardown integrity/map faults below — where the old
+                // workers + forwarding stayed live and restoring the prior
+                // bindings is truthful — here tear_down already stopped the
+                // old workers and one or more new workers failed to spawn, so
+                // this queue set has NO XSK-bound worker: the data plane is
+                // DOWN. Fail closed so the broken snapshot is NOT persisted as
+                // the boot baseline. Roll the in-memory baseline back to the
+                // prior good snapshot + status generation (a retry / forwarding
+                // toggle then reconciles last-good), but DO NOT restore
+                // existing_bindings — refresh_status must report the REAL
+                // post-teardown per-binding state, not the pre-teardown
+                // workers that no longer exist.
+                guard.snapshot = prev_snapshot;
+                guard.status.last_snapshot_generation = prev_last_snapshot_generation;
+                guard.status.last_fib_generation = prev_last_fib_generation;
+                guard.status.last_snapshot_at = prev_last_snapshot_at;
+                guard.status.capabilities = prev_capabilities;
+                response.ok = false;
+                response.error = format!(
+                    "worker spawn failed after teardown ({stage}); dataplane down — snapshot not persisted"
+                );
+                refresh_status(guard);
+                eprintln!(
+                    "CTRL_REQ: apply_snapshot rejected (post-teardown worker spawn failure): {stage} — dataplane down, NOT persisting"
+                );
+                return;
+            }
             // #3789: full-reconcile leg fail-closed (the #2484 domain, out
             // of #3766's same-plan-refresh scope). reconcile_status_bindings
             // ran the fallible pre-teardown build; on a non-policy integrity

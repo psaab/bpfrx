@@ -1,3 +1,46 @@
+## 2026-07-18 — #6137 fold: scheduler fail-closed honest docs + gauge SSOT wiring + gauge test (#5669)
+
+- **Timestamp**: 2026-07-18 (fix/5669-scheduler-failopen-bound)
+- **Action**: Folded 4 review findings into the #5669 scheduler bounded-age
+  fail-closed PR. (1) Doc honesty: the forced-inactive snapshot is published
+  through the SAME failing updateFn channel that defines the streak, so in a
+  persistently-wedged dataplane it never reaches the helper and the stale
+  scheduled PERMIT keeps forwarding until the socket recovers. Softened
+  pkg/scheduler/README.md "Bounded-age fail-closed" + the
+  scheduler_failclosed_5669_test.go comments so they match the code's own
+  slog.Warn: the mechanism BOUNDS the SILENT fail-open window with (a) a
+  one-time loud alarm, (b) the 0/1 gauge, (c) authoritative + surface deny
+  consistency, (d) deny-lands-first on recovery — it does NOT itself stop
+  packets in a wedged dataplane. (2) Metric SSOT: `d.scheduler` is now an
+  `atomic.Pointer[scheduler.Scheduler]` and `SchedulerRepublishFailClosed`
+  reads the scheduler's OWN latch (`RepublishFailClosed`) instead of a second
+  daemon-side age timer (`schedulerRepublishFirstFailNanos`), so the gauge ==
+  the force-inactive/alarm latch EXACTLY (no ~1-tick sub-tick lead). The
+  atomic makes the metrics-collector's lock-free pointer read race-clean
+  without blocking scrapes behind applySem; RepublishFailClosed takes only the
+  scheduler's own RLock. All reconcile mutations stay under applySem. (3)
+  Gauge test: added `TestSchedulerRepublishFailClosedGaugeReadsSSOTLatch_5669`
+  (pkg/daemon) — drives the daemon timer and scheduler latch into disagreement
+  (timer hot, latch cold) and asserts the gauge follows the latch, plus
+  nil-safety; it RED-fails the retired timer accessor and stays GREEN on the
+  scheduler-latch revert (so it does NOT inflate the fail-on-revert
+  target-count). The "reads 1 at the bound" transition remains pinned by the
+  existing `TestScheduler_RepublishFailClosedAfterBoundedAge` (which asserts
+  `RepublishFailClosed()`, now the gauge source). (4) By-design note in the
+  README: a scheduler config-set hash change tears down + re-primes the
+  scheduler (fresh streak/clock), so repeated edits while wedged can restart
+  the 5 min bound. Parent-RED re-verified: reverting the latch block →
+  target-count 1 (only TestScheduler_RepublishFailClosedAfterBoundedAge RED),
+  control green, daemon gauge test green. `go test -race
+  ./pkg/scheduler/... ./pkg/api/... ./pkg/daemon/...` green; gofmt + vet clean;
+  named scheduler + daemon gauge tests 3x no flake.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_scheduler.go,
+  pkg/daemon/daemon_ipmon.go, pkg/daemon/daemon_scheduler_test.go,
+  pkg/daemon/daemon_goroutine_shutdown_5308_test.go,
+  pkg/daemon/policy_scheduler_apply_test.go,
+  pkg/daemon/daemon_scheduler_failclosed_5669_test.go,
+  pkg/scheduler/README.md, pkg/scheduler/scheduler_failclosed_5669_test.go
+
 ## 2026-07-18 — #5568 (security): SCALAR L4/fragment classifier bounded to IP-declared datagram end
 
 - **Timestamp**: 2026-07-18 (fix/5568-scalar-l4-declared-bound)
@@ -53507,3 +53550,41 @@ top.
   userspace-dp/src/event_stream/tests/backpressure.rs,
   userspace-dp/src/event_stream/tests/replay_budget.rs,
   userspace-dp/src/event_stream/README.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #4952 — fail closed on POST-teardown worker-spawn failure.
+  `bring_up_workers` (afxdp/coordinator/reconcile/bringup.rs) runs after
+  `tear_down` stopped the old workers; a per-worker `spawn_supervised_worker`
+  (→ pthread_create EAGAIN/ENOMEM) left a queue set with no XSK-bound worker
+  yet the old code returned `()`, only logged, and UNCONDITIONALLY overwrote
+  `last_reconcile_stage` with `spawned:workers=..` — so reconcile returned
+  Ok, the handler acked ok=true AND persisted the broken snapshot (silent
+  forwarding outage, no retry). Fix: `bring_up_workers` now returns
+  `Result<(), String>` — on the FIRST spawn failure it aborts remaining
+  launches, PRESERVES the `spawn_worker_failed:<id>:<err>` stage, skips the
+  aux-thread bring-up, and returns the stage. `reconcile` maps it to the new
+  `ReconcileError::WorkerSpawn` (the only variant raised AFTER teardown).
+  snapshot.rs `apply` full-apply + same-plan-needs_reconcile legs special-case
+  it: ok=false + "worker spawn failed after teardown (...)", refresh_status to
+  the real (broken) per-binding state (no existing_bindings restore), roll the
+  baseline back to the prior snapshot, return BEFORE persist. Sibling handlers
+  (binding/queue/rebind/forwarding, #6134/#6135) already fail closed on any
+  Err — unchanged. Minimal fail-close, NOT full pre-teardown preflight (a real
+  pthread_create can't be probed without spawning, and old workers must free
+  the XSK queue bindings first) — noted as a follow-up. Per-instance
+  `#[cfg(test)] force_worker_spawn_fail` seam. Tests:
+  `reconcile_post_teardown_worker_spawn_failure_fails_closed_4952`
+  (coordinator: Err(WorkerSpawn) + stage preserved) and
+  `post_teardown_spawn_failure_fails_closed_no_persist_4952` (handler:
+  ok=false + state file NOT written + baseline restored + stage preserved).
+  Parent-RED verified: neutralize the propagation → both tests RED (2 failed /
+  0 passed), target-count 1 each. NOT HA — unit-provable via spawn-failure
+  injection; no cluster smoke.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/server/handlers/snapshot.rs,
+  userspace-dp/src/server/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/server/README.md
