@@ -138,6 +138,110 @@ fn enqueue_refuses_frame_above_live_mtu() {
     );
 }
 
+/// #5801 fail-on-revert: a day-2 reconcile that raises the MTU must advance the
+/// live MTU and clear degraded on a SUCCESSFUL program (the day-2 sibling of
+/// `apply_mtu_status_clean_on_success`).
+#[test]
+fn reprogram_mtu_status_advances_on_success() {
+    let status = SharedStatus::new(); // live_mtu starts at the 1500 default
+    let live = status.reprogram_mtu_status("xpf-usp0", 9000, |name, mtu| {
+        assert_eq!(name, "xpf-usp0");
+        assert_eq!(mtu, 9000);
+        Ok(())
+    });
+    assert_eq!(live, 9000, "a successful reconcile installs the desired MTU");
+    let snap = status.snapshot();
+    assert!(!snap.degraded, "a successful reconcile is not degraded");
+    assert_eq!(snap.live_mtu, 9000, "live MTU converges to the new ceiling");
+}
+
+/// #5801 fail-on-revert: a FAILED day-2 reconcile must KEEP the current live
+/// MTU — unlike the creation-time `apply_mtu_status`, which falls a failure
+/// back to the 1500 kernel default because the TUN was just created at 1500. On
+/// a reconcile the running TUN already carries its last-programmed MTU, so
+/// resetting `live_mtu` to 1500 would wrongly refuse frames the device can
+/// still carry. If `reprogram_mtu_status` reverts to the creation-path 1500
+/// fallback (or to `apply_mtu_status`), the retained-MTU assertion fails.
+#[test]
+fn reprogram_mtu_status_keeps_live_on_failure() {
+    let status = SharedStatus::new();
+    // Simulate a TUN already reconciled up to a 9000 jumbo ceiling.
+    status.live_mtu.store(9000, Ordering::Relaxed);
+    status.degraded.store(false, Ordering::Relaxed);
+
+    // A later reconcile whose SIOCSIFMTU fails must leave the live MTU at 9000
+    // (the running TUN is unchanged), mark degraded, and record the error.
+    let live = status.reprogram_mtu_status("xpf-usp0", 4000, |_name, _mtu| {
+        Err("SIOCSIFMTU xpf-usp0 mtu=4000: Operation not permitted".to_string())
+    });
+    assert_eq!(
+        live, 9000,
+        "a failed reconcile retains the current live MTU, not the 1500 default"
+    );
+    let snap = status.snapshot();
+    assert_eq!(snap.live_mtu, 9000, "live MTU is unchanged on a failed program");
+    assert!(snap.degraded, "a failed reconcile marks the path degraded");
+    assert!(
+        !snap.last_error.is_empty(),
+        "the ioctl error is recorded for the operator"
+    );
+}
+
+/// #5801 fail-on-revert (METHOD): a day-2 reconcile on the PRESERVED reinjector
+/// must reprogram its live MTU field AND converge enqueue admission, so a frame
+/// between the old (1500) and new (9000) ceiling is no longer MTU-refused. An
+/// injected SUCCEEDING programmer stands in for the real `SIOCSIFMTU` (unit
+/// tests run without CAP_NET_ADMIN). With the bug (reconcile is a no-op) `mtu()`
+/// and `live_mtu` stay at 1500 and the 8000-byte frame stays `MtuExceeded`, so
+/// the post-reconcile assertions fail.
+#[test]
+fn reconcile_mtu_reprograms_live_tun_and_admission() {
+    let reinjector =
+        SlowPathReinjector::new("xpf-usp-recon0", 1500).expect("construct reinjector");
+    // Force the deterministic 1500 startup state (the worker may not have run,
+    // and without CAP_NET_ADMIN its TUN open fails — irrelevant to the MTU
+    // admission gate, which is driven entirely by status.live_mtu).
+    reinjector
+        .status
+        .live_mtu
+        .store(DEFAULT_TUN_MTU as i64, Ordering::Relaxed);
+    reinjector.status.degraded.store(false, Ordering::Relaxed);
+    assert_eq!(reinjector.mtu(), 1500, "reinjector starts at the 1500 ceiling");
+
+    // Pre: an 8000-byte frame (between the old 1500 and new 9000 ceiling) is
+    // MTU-refused. This return path precedes the tx channel, so it is
+    // independent of whether the worker's TUN actually opened.
+    let before = reinjector.enqueue(vec![0u8; 8000]).expect("enqueue pre-reconcile");
+    assert!(
+        matches!(before, EnqueueOutcome::MtuExceeded),
+        "an 8000-byte frame must be MTU-refused while the live TUN is 1500"
+    );
+
+    // Day-2 reconcile 1500 -> 9000 with a SUCCEEDING injected programmer.
+    let live = reinjector.reconcile_mtu(9000, |_name, _mtu| Ok(()));
+    assert_eq!(live, 9000, "a successful reconcile installs the desired MTU");
+    assert_eq!(
+        reinjector.mtu(),
+        9000,
+        "reconcile updates the reinjector's live mtu() field"
+    );
+    let snap = reinjector.status();
+    assert_eq!(snap.live_mtu, 9000, "live_mtu converges to the new ceiling");
+    assert!(!snap.degraded, "a successful reconcile is not degraded");
+
+    // Post: the same 8000-byte frame is NO LONGER MTU-refused. Depending on
+    // whether the worker's TUN opened, enqueue now returns Accepted (worker
+    // alive) or a worker-not-running Err (the worker could not open the TUN in
+    // this environment) — either way it is NOT the MtuExceeded outcome the
+    // pre-reconcile 1500 state produced. If the reconcile were a no-op the live
+    // MTU would still be 1500 and this WOULD be MtuExceeded.
+    let after = reinjector.enqueue(vec![0u8; 8000]);
+    assert!(
+        !matches!(after, Ok(EnqueueOutcome::MtuExceeded)),
+        "after reconcile to 9000 the 8000-byte frame must not be MTU-refused"
+    );
+}
+
 #[test]
 fn rate_limiter_refills_after_window() {
     // Token-bucket: drain the 1-token budget, then advance the injected

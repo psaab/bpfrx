@@ -1,3 +1,40 @@
+## 2026-07-18 — #5801: day-2 slow-path TUN MTU reconcile
+
+- **Timestamp**: 2026-07-18 (fix/5801-slowpath-mtu-reconcile)
+- **Action**: The persistent slow-path reinjector (`SlowPathReinjector`) is
+  preserved across snapshot reconciles, and its TUN MTU + immutable `mtu` field
+  were programmed only at creation (#2408). A valid day-2 config raising a
+  data-interface MTU updated the accepted snapshot but NOT the live TUN, so
+  reinjected frames above the old ceiling dropped persistently (`MtuExceeded`)
+  until helper restart — the reconcile path only WARNED. Fix: give the
+  reinjector a reconcile op that reprograms the live TUN and converges its
+  state. `SharedStatus::reprogram_mtu_status` is the day-2 sibling of
+  `apply_mtu_status`: on success it advances `live_mtu` and clears `degraded`;
+  on a FAILED `SIOCSIFMTU` it KEEPS the current live MTU (the running TUN
+  retains its last-programmed value — NOT the 1500 creation fallback), marks
+  degraded, and records the error. `SlowPathReinjector::reconcile_mtu` reads the
+  live device name, calls that helper, and stores the installed MTU into the now
+  interior-mutable `mtu: AtomicI64` field so `mtu()`, `live_mtu`, and enqueue
+  admission agree. In `apply_snapshot` the preserved-reinjector branch now calls
+  the extracted `reconcile_preserved_slow_path_mtu` seam (passing
+  `slowpath::set_if_mtu`) instead of only warning — deduped per distinct desired
+  value via `last_slow_path_mtu_warned` so a steady-state reconcile loop does
+  not re-issue the ioctl.
+- **Fail-on-revert tests**: `slowpath::tests::reprogram_mtu_status_advances_on_success`,
+  `reprogram_mtu_status_keeps_live_on_failure`,
+  `reconcile_mtu_reprograms_live_tun_and_admission`, and
+  `afxdp::coordinator::reconcile::snapshot::slow_path_mtu_tests::day2_mtu_increase_reprograms_preserved_reinjector`.
+  Programmer is an injected seam (no real `SIOCSIFMTU`; unit tests run without
+  CAP_NET_ADMIN). Neutralizing the fix (reconcile → no-op, failure arm → 1500
+  fallback, wiring → warn-only) turns 3 of the 4 RED (`left: 1500, right: 9000`);
+  the success-arm companion stays green. Restored fix: `test result: ok. 4
+  passed; 0 failed`.
+- **Validation**: `cargo build` clean; `cargo test --release slowpath` →
+  `35 passed; 0 failed`; the 4 new tests green by explicit filter.
+- **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/slowpath_tests.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
+
 ## 2026-07-18 — #5290: fair HA session-delta drain + overflow resync latch
 
 - **Timestamp**: 2026-07-18 (fix/5290-drain-deltas-fairness)
