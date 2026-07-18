@@ -1,3 +1,50 @@
+## 2026-07-18 — #5167: mirror cross-worker clone samples before reserving
+
+- **Timestamp**: 2026-07-18 (fix/5167-mirror-sample-first)
+- **Action**: Reordered the cross-worker (else) branch of
+  `enqueue_sampled_mirror_clone` (`userspace-dp/src/afxdp/mirror/fast_path.rs`)
+  to run the worker-local sampler `mirror_sample_allows` BEFORE
+  `admit_mirror_clone_to_live`, matching the same-worker branch. The old
+  order reserved the contended live clone queue first — a true-shared AcqRel
+  CAS on the target's `pending_tx_admitted` (#4096) — then sampled, so every
+  unsampled packet reserved/copied/reported clone-queue pressure and
+  acknowledged cross-core true-sharing scaled O(PPS) instead of O(PPS/R);
+  sampling could not bound clone cost. A non-sampled packet now returns `None`
+  having touched nothing shared.
+- **Scope (corrected per rev6101)**: #6113 fixes the `enqueue_sampled_mirror_clone`
+  DISPATCH path only — the session-miss / neighbor-resolution-retry callers
+  (`neighbor_dispatch.rs`, `tx/dispatch/mod.rs`). Two other reserve-before-sample
+  sites exist:
+  - `enqueue_sampled_mirror_clone_to_live` (fast_path.rs) is DEAD CODE
+    (`#[cfg_attr(not(test), allow(dead_code))]`, test-only callers) — harmless,
+    not a live regression; NOT the sibling worth chasing.
+  - The REAL remaining LIVE instance is
+    `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs:386-398` — the
+    ESTABLISHED-FLOW HOT PATH (flow-cache HIT), which inlines
+    `admit_mirror_clone_to_live` (:386, the same #5167 shared CAS) BEFORE
+    `mirror_sample_allows` (:398). #6113 does NOT touch it. Sustained high-PPS
+    mirror is dominated by flow-cache HITS, so #5167's O(PPS/R) goal is NOT yet
+    met on the dominant path — #6113 fixed only the session-miss minority path.
+    Tracked as follow-up #6114.
+- **Tests**: 4 new in `mirror/mod_tests.rs` (the target function had ZERO
+  prior tests; the existing queue-full test is for `_to_live`, untouched):
+  - `cross_worker_nonsampled_does_not_reserve_full_queue_5167` (FAIL-ON-
+    REVERT): full clone queue + a NON-sampled packet → `None` (sample-first,
+    no reserve). Revert to reserve-before-sample → admit fails on the full
+    queue → `Some(QueueFullCrossWorker)` → RED.
+  - `cross_worker_sampled_reports_queue_full_5167` (also RED-on-revert via
+    the sample counter): a SELECTED packet on a full queue reports pressure
+    AND consumes a sample; reverted, admit fails before the sampler runs so
+    the counter never advances.
+  - `cross_worker_sampled_enqueues_clone_5167` (happy path) +
+    `cross_worker_nonsampled_no_clone_nonfull_5167` (sanity).
+  - GREEN: `cargo test mirror::` = 25 passed (4 new + 21 existing).
+    RED-on-revert proven: reverting the reorder → `test result: FAILED. 2
+    passed; 2 failed` (the two full-queue tests RED; the happy-path + sanity
+    stayed GREEN). Build clean.
+- **File(s)**: userspace-dp/src/afxdp/mirror/fast_path.rs,
+  userspace-dp/src/afxdp/mirror/mod_tests.rs, docs/userspace-dataplane-gaps.md
+
 ## 2026-07-18 — #5165: neighbor-monitor JoinHandle (no mutation after teardown)
 
 - **Timestamp**: 2026-07-18 (fix/5165-neigh-monitor-join)
