@@ -434,6 +434,39 @@ Use io_uring for:
 
 This is where io_uring is a real win.
 
+#### Slow-path TUN reinjection: `WriteMode` demotion contract
+
+The slow-path reinjector (`src/slowpath.rs`) writes reinjected local/exception
+frames to a TUN device, preferring io_uring and falling back to a synchronous
+`write()`. Its `WriteMode` (`IoUring` | `SyncFallback`) is governed by three
+linked invariants:
+
+- **Per-call fallback (#2477).** An io_uring failure that put NOTHING on the TUN
+  (`WriteError::NothingWritten`, `safe_to_retry`) is rescued by a synchronous
+  write of the SAME packet — the frame is still deliverable. An
+  ambiguous/partial failure (`WriteError::Transferred`) is DROPPED, never
+  sync-resent: bytes may be in flight, so re-sending would double-transmit
+  (truncated frame + duplicate to local BGP/OSPF listeners).
+- **Runtime demotion (#5172, mirrors state_writer #2958).** A structured
+  per-write outcome separates packet-transfer certainty from RING HEALTH. On a
+  TERMINAL ring failure — an ambiguous submit/reap, i.e. the ring is wedged (a
+  partial write cannot occur on an atomic TUN write, so `Transferred` here means
+  the transport, not the packet) — the worker retires the ring ONCE: it drops
+  the `IoUring` (closing its fd, which the kernel uses to cancel outstanding
+  SQEs) and flips `WriteMode` to `SyncFallback` plus reports `mode = "sync"`.
+  Every later packet then takes the sync branch directly instead of retrying the
+  broken ring (which otherwise degrades BGP/OSPF/mgmt/local traffic). The
+  demotion is PERMANENT (no cooldown re-promotion — avoids flapping).
+- **Transient does NOT demote.** A `safe_to_retry` failure the sync fallback
+  rescued keeps io_uring live — a momentary blip must not abandon the ring.
+- **Buffer lifetime (#2297).** The current packet's buffer outlives the ring
+  drop (the worker loop owns it until after the demotion applies), so no kernel
+  reference can dangle across the retirement.
+
+Unlike `state_writer`, the slow path's `active` flag tracks TUN/worker liveness,
+not io_uring, so a demotion flips `mode` but leaves `active` set — the path is
+still up, just in sync mode.
+
 Important:
 
 - this slow path should live in the native dataplane process
