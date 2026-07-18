@@ -3638,7 +3638,11 @@ fn validate_snapshot_buildable_does_not_prune_live_zone_counters_5171() {
     let coord = Coordinator::new();
     // Seed the LIVE forwarding zone-counter store with cumulative totals for
     // zones A and B, as steady-state forwarded traffic would.
-    let seed_map = ZoneCounterSlotMap::build(&[ZONE_A, ZONE_B]);
+    // #5163: build the seed map FROM the live store so its cached per-zone
+    // atomics are the coordinator's — the lock-free fold then lands directly in
+    // `coord.forwarding.zone_counter_store`.
+    let seed_map =
+        ZoneCounterSlotMap::build(&[ZONE_A, ZONE_B], &coord.forwarding.zone_counter_store);
     record_zone_traffic(&seed_map, ZONE_A, ZONE_B, 1000);
     record_zone_traffic(&seed_map, ZONE_B, ZONE_A, 500);
     flush_recorded_zone_counters(&coord.forwarding.zone_counter_store, &seed_map);

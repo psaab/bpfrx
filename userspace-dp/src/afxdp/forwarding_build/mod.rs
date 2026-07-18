@@ -373,14 +373,20 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     {
         use crate::afxdp::zone_counters::{ZoneCounterSlotMap, ZoneCounterStore};
         let zone_ids: Vec<u16> = snapshot.zones.iter().map(|z| z.id).collect();
-        state.zone_counter_slot_map = std::sync::Arc::new(ZoneCounterSlotMap::build(&zone_ids));
-        state.zone_counter_store = previous
+        // Carry the cumulative store forward (first apply creates it) so totals
+        // survive config commits. Drop totals for zones no longer configured
+        // (memory hygiene; the status accessor also filters to configured
+        // zones) BEFORE the slot map resolves each slot's shared atomic block
+        // from the store — a surviving zone keeps its SAME block so the #5163
+        // lock-free per-slot fold never resets or double-counts across a slot
+        // renumber.
+        let store = previous
             .map(|p| p.zone_counter_store.clone())
             .unwrap_or_else(ZoneCounterStore::default);
-        // Drop totals for zones no longer configured (memory hygiene; the
-        // status accessor also filters to configured zones).
         let configured: rustc_hash::FxHashSet<u16> = zone_ids.iter().copied().collect();
-        state.zone_counter_store.reconcile(&configured);
+        store.reconcile(&configured);
+        state.zone_counter_slot_map = std::sync::Arc::new(ZoneCounterSlotMap::build(&zone_ids, &store));
+        state.zone_counter_store = store;
     }
     // Build filter state from snapshot. #2505: this is fallible — an
     // unresolvable `from protocol` token raises a SnapshotIntegrityError that

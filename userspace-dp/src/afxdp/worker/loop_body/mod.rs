@@ -828,6 +828,9 @@ pub(crate) fn worker_loop(
         // shared zone-counter store, same cadence. `forwarding` is stable
         // across this iteration's binding sweep, so the slot map matches the
         // one the `record_zone_traffic` calls used.
+        // #5163: the fold is lock-free — it `fetch_add`s into the slot map's
+        // cached per-zone atomics, so this per-batch call no longer takes the
+        // shared store mutex that every worker used to bounce at line rate.
         crate::afxdp::zone_counters::flush_recorded_zone_counters(
             &forwarding.zone_counter_store,
             &forwarding.zone_counter_slot_map,

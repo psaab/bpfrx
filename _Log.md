@@ -1,3 +1,37 @@
+## 2026-07-17 — #5163: zone-counter fold must be lock-free (no per-batch global mutex)
+
+- **Timestamp**: 2026-07-17 (fix/5163-zone-counter-contention)
+- **Action**: The per-zone traffic-counter fold
+  (`ZoneCounterStore::fold_pending`, called every RX batch by every worker via
+  `flush_recorded_zone_counters`) locked a single `Arc<Mutex<FxHashMap>>` on the
+  shared store on the hot path, so all RX queues/workers bounced one mutex cache
+  line at line rate — cross-worker serialization introduced by #3651. Replaced
+  the mutex-guarded `FxHashMap<u16, ZoneTotals>` value with per-zone
+  `ZoneTotalsAtomic` blocks (`FxHashMap<u16, Arc<ZoneTotalsAtomic>>`): the map
+  mutex now guards ONLY structural ops (get-or-create at config-apply, iterate at
+  snapshot/clear/reconcile — all ≤ once per commit or per 1 s status poll), and
+  each configured slot caches its zone's `Arc<ZoneTotalsAtomic>` in
+  `ZoneCounterSlotMap.slot_totals` at build time. The per-batch fold is now a
+  lock-free `Relaxed` `fetch_add` per touched slot — the same lock-free
+  shared-counter shape the policy/filter hit counters already use. Store stays
+  zone-id keyed so a slot renumber across applies keeps a surviving zone on the
+  SAME atomic block (no reset/double). `clear` resets each block IN PLACE (never
+  drops the map entry) so a live slot map keeps counting from zero. `build` now
+  takes `&ZoneCounterStore` to resolve the per-slot Arcs; forwarding_build
+  reconciles the carried-forward store BEFORE the slot map resolves its Arcs.
+  Added RED-on-revert tests: `concurrent_workers_fold_lock_free_without_lost_counts`
+  (8 workers × 20k folds into the shared store → merged total exact, no lost/
+  double counts) and the load-bearing
+  `worker_fold_makes_progress_while_status_reader_holds_the_lock` (a worker fold
+  must complete < 150 ms while a second thread holds the store mutex for 300 ms;
+  re-introducing the per-batch `self.totals.lock()` makes it FAIL cleanly at
+  ~300 ms — verified). Plus `surviving_zone_keeps_the_same_atomic_block_across_a_slot_renumber`.
+- **File(s)**: userspace-dp/src/afxdp/zone_counters.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  docs/userspace-dataplane-gaps.md
+
 ## 2026-07-17 — #5148: TCP segmentation must reject ALL IP fragments, not just non-first
 
 - **Timestamp**: 2026-07-17 (fix/5148-segment-first-fragment)
