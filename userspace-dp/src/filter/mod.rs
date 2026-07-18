@@ -250,9 +250,14 @@ pub(crate) struct FilterTerm {
     pub(crate) count: String,
     pub(crate) has_count: bool,
     pub(crate) log: bool,
-    pub(crate) policer_name: String,
+    // #5444: `policer_name`/`routing_instance` are `Arc<str>` (like
+    // `forwarding_class`) so `merge_matched_modifiers` propagates them into the
+    // per-packet `FilterResult` with a refcount bump instead of a String heap
+    // allocation+copy on every matched term. Config-owned, set once at compile
+    // time, read-only downstream.
+    pub(crate) policer_name: Arc<str>,
     pub(crate) three_color_policer: Option<Arc<ThreeColorPolicerRuntime>>,
-    pub(crate) routing_instance: String,
+    pub(crate) routing_instance: Arc<str>,
     pub(crate) forwarding_class: Arc<str>,
     pub(crate) dscp_rewrite: Option<u8>,
     pub(crate) counter: Arc<FilterTermCounter>,
@@ -836,7 +841,12 @@ impl FilterState {
 pub(crate) struct FilterResult {
     pub(crate) action: FilterAction,
     pub(crate) dscp_rewrite: Option<u8>,
-    pub(crate) policer_name: String,
+    // #5444: `None` == no policer matched (semantically identical to the
+    // historical empty `""`). `Option<Arc<str>>` mirrors `forwarding_class`
+    // (#5151): the accumulator init and the non-routing reset are zero-alloc
+    // (`None`), and a matched `then policer` term propagates it with an Arc
+    // refcount bump instead of a String heap allocation on the packet path.
+    pub(crate) policer_name: Option<Arc<str>>,
     // #5857: OR of every matched term's three-color-policer drop decision. Only
     // the METERED walk (`evaluate_lo0_filter_counted` with `now_ns = Some`, the
     // lo0 host-bound path) sets this; the shared action-eval walk leaves it false
@@ -846,7 +856,9 @@ pub(crate) struct FilterResult {
     // to a silent `Discard` when this is set — enforcing the configured
     // control-plane rate limit that was previously inert on host-bound traffic.
     pub(crate) policer_drop: bool,
-    pub(crate) routing_instance: String,
+    // #5444: `Option<Arc<str>>` for the same reason as `policer_name` above —
+    // refcount-bump propagation, zero-alloc `None` default/reset.
+    pub(crate) routing_instance: Option<Arc<str>>,
     // #5151: `None` == no forwarding-class matched (semantically identical to
     // the historical empty `""`). Mirrors TxSelection/CachedTxSelection which
     // already use `Option<Arc<str>>` — the accumulator init no longer allocates
@@ -913,10 +925,14 @@ impl Default for FilterResult {
         Self {
             action: FilterAction::Accept,
             dscp_rewrite: None,
-            policer_name: String::new(),
+            // #5444: zero-alloc default — no String buffer allocated on the
+            // warmed packet path. A matching `then policer` term sets `Some(..)`
+            // in `merge_matched_modifiers` (Arc refcount bump).
+            policer_name: None,
             // #5857: no policer drop by default; set only by the metered lo0 walk.
             policer_drop: false,
-            routing_instance: String::new(),
+            // #5444: zero-alloc default, as `policer_name` above.
+            routing_instance: None,
             // #5151: zero-alloc default — no Arc header/data block allocated on
             // the warmed packet path. A matching `then forwarding-class` term
             // sets `Some(..)` in `merge_matched_modifiers`.
