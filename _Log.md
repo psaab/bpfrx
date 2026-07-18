@@ -52326,3 +52326,39 @@ top.
   253 passed / 0 failed; new tests 5x flake check all green.
 - **File(s)**: userspace-dp/src/nat/source.rs,
   userspace-dp/src/nat/tests_pool.rs, _Log.md
+
+## 2026-07-18 — #5611: lock the NPTv6 wildcard-vs-concrete overlap-reject edge
+- **Timestamp**: 2026-07-18
+- **Action**: Test-coverage lock-in follow-up to #5176 (PR #5610). The NPTv6
+  `from_zone` scope-overlap gate `zones_conflict(a,b) = a.is_empty() ||
+  b.is_empty() || a == b` correctly REJECTS a wildcard (`from_zone=""`) rule
+  overlapping a concrete-zone rule with the same prefix (the empty short-circuit
+  → conflict → snapshot rejected) and a same-concrete-zone duplicate (the `a==b`
+  arm), but neither edge had an explicit regression-locking test. Existing
+  overlap tests use both-empty `from_zone`; the split-horizon test covers the
+  distinct-non-empty ADMIT. Added two fail-on-revert tests to lock both reject
+  paths. COVERAGE ONLY — no production behavior change.
+- **Tests** (userspace-dp/src/nptv6_tests.rs):
+  - `nptv6_wildcard_vs_concrete_same_prefix_rejected_5611` (:923) — wildcard +
+    concrete same internal `fd00:1::/48`, distinct external prefixes, BOTH
+    argument orderings (wildcard-first and concrete-first) → `expect_err`
+    `Nptv6OverlappingPrefix`. Binds the empty short-circuit and argument-order
+    symmetry (an asymmetric simplification checking only one side's emptiness is
+    caught). Goes RED under the `zones_conflict -> a == b` neutralization.
+  - `nptv6_same_concrete_zone_same_prefix_rejected_5611` (:963) — `untrust` +
+    `untrust` same internal prefix → `expect_err`. Guards the `a == b` arm
+    (stays GREEN under the `a==b` neutralization, RED if the equality arm is
+    dropped).
+- **Docs**: added a `#4339` fail-closed doc paragraph above `zones_conflict`
+  (nptv6.rs) — the `a == b` arm also rejects a degenerate same-name/same-prefix
+  duplicate a Go scope-expansion (#4339) could emit; a fail-CLOSED config
+  rejection (keeps prior live state), never a translation bypass.
+- **Validation** (release, uncontended target dir): baseline GREEN
+  `test result: ok. 2 passed; 0 failed`; neutralized `zones_conflict -> a == b`
+  → `nptv6_wildcard_vs_concrete_same_prefix_rejected_5611 ... FAILED`,
+  `test result: FAILED. 1 passed; 1 failed`; restored production
+  `test result: ok. 2 passed; 0 failed`. Full `cargo test --release nptv6`
+  module GREEN (44 passed, 0 failed) with fmt clean. Test-only + no forwarding
+  bytes change → no cluster smoke required (#5611 exemption).
+- **File(s)**: userspace-dp/src/nptv6.rs, userspace-dp/src/nptv6_tests.rs,
+  _Log.md

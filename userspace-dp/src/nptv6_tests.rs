@@ -909,6 +909,79 @@ fn nptv6_wildcard_from_zone_matches_any_zone_5176() {
     assert!(state.translate_outbound(&mut c, "whatever"));
 }
 
+// #5611 fail-on-revert: a WILDCARD (`from_zone = ""`) rule and a CONCRETE-zone
+// rule sharing the same INTERNAL prefix (distinct external prefixes) DO overlap
+// — the wildcard matches EVERY zone, so it can match the same packet the
+// concrete rule matches and first-match resolution would be order-dependent.
+// The empty short-circuit in `zones_conflict` (`a.is_empty() || b.is_empty()`)
+// makes this a conflict, so `try_from_snapshots` must reject the whole snapshot.
+// Both argument orderings are exercised so an asymmetric simplification that
+// inspects only one side's emptiness (e.g. only `candidate_zone.is_empty()`) is
+// caught. Neutralize the short-circuits — make `zones_conflict` return `a == b`
+// (nptv6.rs) — and this test goes RED: the wildcard-vs-concrete pair is admitted.
+#[test]
+fn nptv6_wildcard_vs_concrete_same_prefix_rejected_5611() {
+    let wildcard = Nptv6RuleSnapshot {
+        name: "wildcard".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:1::/48".to_string(),
+        external_prefix: "2001:db8:1::/48".to_string(),
+    };
+    let concrete = Nptv6RuleSnapshot {
+        name: "scoped-untrust".to_string(),
+        from_zone: "untrust".to_string(),
+        internal_prefix: "fd00:1::/48".to_string(),
+        external_prefix: "2001:db8:2::/48".to_string(),
+    };
+
+    // Wildcard first, concrete second — reject on the internal (outbound) prefix.
+    let err = Nptv6State::try_from_snapshots(&[wildcard.clone(), concrete.clone()])
+        .expect_err("wildcard + concrete same-prefix pair must reject");
+    assert!(
+        matches!(err, SnapshotIntegrityError::Nptv6OverlappingPrefix { .. }),
+        "expected Nptv6OverlappingPrefix, got {err:?}"
+    );
+
+    // Reversed — concrete first, wildcard second — must ALSO reject (the wildcard
+    // is now the candidate; pins argument-order symmetry of `zones_conflict`).
+    let err = Nptv6State::try_from_snapshots(&[concrete, wildcard])
+        .expect_err("concrete + wildcard same-prefix pair must also reject");
+    assert!(
+        matches!(err, SnapshotIntegrityError::Nptv6OverlappingPrefix { .. }),
+        "expected Nptv6OverlappingPrefix, got {err:?}"
+    );
+}
+
+// #5611 fail-on-revert: two rules scoped to the SAME concrete zone ("untrust")
+// with the same INTERNAL prefix (distinct external prefixes) overlap — a single
+// untrust packet matches both, so first-match resolution is order-dependent.
+// The `a == b` arm of `zones_conflict` makes this a conflict and the snapshot
+// must reject. This is the same-concrete-zone duplicate edge, distinct from the
+// both-wildcard reject the existing `overlapping_prefixes_rejected_*` tests
+// cover and from the distinct-non-empty-zone ADMIT of the split-horizon test.
+#[test]
+fn nptv6_same_concrete_zone_same_prefix_rejected_5611() {
+    let err = Nptv6State::try_from_snapshots(&[
+        Nptv6RuleSnapshot {
+            name: "untrust-a".to_string(),
+            from_zone: "untrust".to_string(),
+            internal_prefix: "fd00:1::/48".to_string(),
+            external_prefix: "2001:db8:1::/48".to_string(),
+        },
+        Nptv6RuleSnapshot {
+            name: "untrust-b".to_string(),
+            from_zone: "untrust".to_string(),
+            internal_prefix: "fd00:1::/48".to_string(),
+            external_prefix: "2001:db8:2::/48".to_string(),
+        },
+    ])
+    .expect_err("same-zone same-prefix duplicate must reject");
+    assert!(
+        matches!(err, SnapshotIntegrityError::Nptv6OverlappingPrefix { .. }),
+        "expected Nptv6OverlappingPrefix, got {err:?}"
+    );
+}
+
 /// Compute ones-complement sum of 8 words (for checksum neutrality test).
 fn ones_complement_sum(words: &[u16; 8]) -> u16 {
     let mut sum: u32 = 0;
