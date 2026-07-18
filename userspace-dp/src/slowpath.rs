@@ -244,6 +244,42 @@ impl SharedStatus {
         }
     }
 
+    /// Reprogram the live TUN MTU on a day-2 reconcile (#5801) and update
+    /// status, returning the live MTU now in effect.
+    ///
+    /// This is the day-2 sibling of [`Self::apply_mtu_status`]. The creation
+    /// path falls a FAILED program back to the kernel-default 1500 because the
+    /// TUN was just created at 1500. On a reconcile the running TUN already
+    /// carries whatever MTU it was last programmed with, so a failed
+    /// `SIOCSIFMTU` must KEEP the existing `live_mtu` (resetting it to 1500
+    /// would wrongly refuse frames the device can still carry). On success
+    /// `live_mtu` advances to `desired_mtu` and `degraded` clears; on failure
+    /// `live_mtu` is unchanged, `degraded` is set, and the error is recorded.
+    fn reprogram_mtu_status(
+        &self,
+        name: &str,
+        desired_mtu: i32,
+        programmer: impl FnOnce(&str, i32) -> Result<(), String>,
+    ) -> i32 {
+        match programmer(name, desired_mtu) {
+            Ok(()) => {
+                self.live_mtu.store(desired_mtu as i64, Ordering::Relaxed);
+                self.degraded.store(false, Ordering::Relaxed);
+                desired_mtu
+            }
+            Err(err) => {
+                let live = self.live_mtu.load(Ordering::Relaxed) as i32;
+                eprintln!(
+                    "xpf-slowpath: reconcile MTU {desired_mtu} on {name}: {err} \
+                     (slow-path DEGRADED: live TUN stays at {live}; frames > {live} refused)"
+                );
+                self.set_last_error(err);
+                self.degraded.store(true, Ordering::Relaxed);
+                live
+            }
+        }
+    }
+
     fn set_mode(&self, mode: &str) {
         if let Ok(mut value) = self.mode.lock() {
             *value = mode.to_string();
@@ -295,12 +331,14 @@ pub struct SlowPathReinjector {
     tx: SyncSender<PacketRequest>,
     limiter: Mutex<RateLimiter>,
     status: Arc<SharedStatus>,
-    /// MTU the slow-path TUN was programmed with at creation (#2408). The TUN
-    /// MTU is set once when the worker opens the device; a later config MTU
-    /// change is NOT applied to the live TUN (the reinjector is preserved
-    /// across reconciles), so the reconcile path compares this against the
-    /// new snapshot MTU to warn the operator (see `apply_snapshot`).
-    mtu: i32,
+    /// MTU the live slow-path TUN is currently programmed with. Set at
+    /// creation (#2408) and, on a day-2 config MTU change (#5801), updated by
+    /// [`Self::reconcile_mtu`]: the reinjector is PRESERVED across snapshot
+    /// reconciles, so a later MTU change must reprogram the RUNNING TUN and
+    /// record the new value here so `mtu()`, `live_mtu`, and enqueue admission
+    /// stay in agreement. `AtomicI64` (mirroring `SharedStatus::live_mtu`) so
+    /// `mtu()`/`reconcile_mtu` need no `&mut` on the Arc-shared reinjector.
+    mtu: AtomicI64,
 }
 
 impl SlowPathReinjector {
@@ -326,13 +364,53 @@ impl SlowPathReinjector {
                 DEFAULT_RATE_LIMIT_BYTES_PER_SEC,
             )),
             status,
-            mtu,
+            mtu: AtomicI64::new(mtu as i64),
         })
     }
 
-    /// The MTU the slow-path TUN was programmed with at creation (#2408).
+    /// The MTU the live slow-path TUN is currently programmed with. Equals the
+    /// creation MTU (#2408) until a day-2 [`Self::reconcile_mtu`] reprograms it
+    /// (#5801).
     pub fn mtu(&self) -> i32 {
-        self.mtu
+        self.mtu.load(Ordering::Relaxed) as i32
+    }
+
+    /// Reprogram the live slow-path TUN to `desired_mtu` on a day-2 config MTU
+    /// change (#5801) and return the MTU now in effect.
+    ///
+    /// The reinjector is preserved across snapshot reconciles, so a config MTU
+    /// change committed after startup does NOT reach the running TUN unless the
+    /// live device is reprogrammed here. This:
+    ///   1. reprograms the live TUN via `programmer` (`set_if_mtu`/`SIOCSIFMTU`
+    ///      in production; injectable in tests),
+    ///   2. updates `live_mtu`/`degraded` from the result so enqueue admission
+    ///      (which reads `live_mtu`) converges, and
+    ///   3. records the installed MTU as this reinjector's `mtu()`.
+    ///
+    /// A failed `SIOCSIFMTU` is non-fatal: [`SharedStatus::reprogram_mtu_status`]
+    /// KEEPS the current live MTU (the running TUN retains whatever it was last
+    /// programmed with — it is NOT reset to the 1500 creation default), marks
+    /// the path DEGRADED, and records the error; `mtu()` then reports the
+    /// retained value, so `mtu()`, `live_mtu`, and admission still agree.
+    pub(crate) fn reconcile_mtu(
+        &self,
+        desired_mtu: i32,
+        programmer: impl FnOnce(&str, i32) -> Result<(), String>,
+    ) -> i32 {
+        let name = self
+            .status
+            .device_name
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let live = self
+            .status
+            .reprogram_mtu_status(&name, desired_mtu, programmer);
+        // Record what was ACTUALLY installed (== desired on success, or the
+        // retained live MTU on a failed program) so mtu() never over-reports a
+        // ceiling the device cannot honour.
+        self.mtu.store(live as i64, Ordering::Relaxed);
+        live
     }
 
     pub fn enqueue(&self, bytes: Vec<u8>) -> Result<EnqueueOutcome, String> {
@@ -825,7 +903,7 @@ fn set_if_up(name: &str) -> Result<(), String> {
 /// `mtu` must be > 0; a non-positive value is a programming error and is
 /// rejected without touching the device. Returns `Err` (caller logs and
 /// continues) on socket/ioctl failure.
-fn set_if_mtu(name: &str, mtu: i32) -> Result<(), String> {
+pub(crate) fn set_if_mtu(name: &str, mtu: i32) -> Result<(), String> {
     if mtu <= 0 {
         return Err(format!("invalid MTU {mtu} for {name}"));
     }
