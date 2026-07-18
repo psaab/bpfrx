@@ -1,0 +1,7 @@
+./config_render.go
+./manager.go
+./naming.go
+./policy_render.go
+./status_parse.go
+./testseam.go
+./vtysh.go

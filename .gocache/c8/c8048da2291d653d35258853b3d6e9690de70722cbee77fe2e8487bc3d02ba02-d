@@ -1,0 +1,10 @@
+=== RUN   TestBuildFabricSnapshotsUsesLocalMemberAndPeer
+--- PASS: TestBuildFabricSnapshotsUsesLocalMemberAndPeer (0.01s)
+=== RUN   TestSyncFabricStatePersistsResolvedFabricsIntoLastSnapshot
+2026/07/17 22:37:03 WARN userspace: failed to sync helper status after route overlay publish err="userspace_ctrl map not loaded"
+2026/07/17 22:37:03 INFO userspace: route overlay snapshot published generation=3 overlay_routes=1
+--- PASS: TestSyncFabricStatePersistsResolvedFabricsIntoLastSnapshot (0.01s)
+=== RUN   TestPersistResolvedFabricsLockedNoOpOnUnchanged
+--- PASS: TestPersistResolvedFabricsLockedNoOpOnUnchanged (0.00s)
+PASS
+ok  	github.com/psaab/xpf/pkg/dataplane/userspace	0.045s

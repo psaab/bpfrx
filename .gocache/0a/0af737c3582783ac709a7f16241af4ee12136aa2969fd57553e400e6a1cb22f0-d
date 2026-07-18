@@ -1,0 +1,8 @@
+./auxv.go
+./cpu.go
+./doc.go
+./kconfig.go
+./platform.go
+./statfs.go
+./vdso.go
+./version.go

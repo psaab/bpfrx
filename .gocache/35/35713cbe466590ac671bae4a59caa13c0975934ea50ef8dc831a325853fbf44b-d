@@ -1,0 +1,15 @@
+./clear.go
+./main.go
+./monitor.go
+./request.go
+./shared.go
+./show.go
+./show_dhcp.go
+./show_firewall_effective.go
+./show_flow.go
+./show_interfaces.go
+./show_nat.go
+./show_protocols.go
+./show_security.go
+./show_services.go
+./show_system.go

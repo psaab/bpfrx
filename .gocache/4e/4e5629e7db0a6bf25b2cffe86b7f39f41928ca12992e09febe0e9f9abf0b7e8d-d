@@ -1,0 +1,3 @@
+./cache.go
+./kallsyms.go
+./reader.go

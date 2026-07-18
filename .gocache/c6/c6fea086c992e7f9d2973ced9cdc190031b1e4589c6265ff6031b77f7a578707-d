@@ -1,0 +1,16 @@
+./alu.go
+./alu_string.go
+./doc.go
+./func.go
+./func_lin.go
+./func_string.go
+./func_win.go
+./instruction.go
+./jump.go
+./jump_string.go
+./load_store.go
+./load_store_string.go
+./metadata.go
+./opcode.go
+./opcode_string.go
+./register.go

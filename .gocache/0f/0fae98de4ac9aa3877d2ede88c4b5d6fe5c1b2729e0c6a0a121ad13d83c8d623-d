@@ -1,0 +1,6 @@
+=== RUN   TestUserspaceManagerDoesNotImportReflectOrUnsafe
+=== PAUSE TestUserspaceManagerDoesNotImportReflectOrUnsafe
+=== CONT  TestUserspaceManagerDoesNotImportReflectOrUnsafe
+--- PASS: TestUserspaceManagerDoesNotImportReflectOrUnsafe (0.00s)
+PASS
+ok  	github.com/psaab/xpf/pkg/dataplane	0.008s
