@@ -45,6 +45,25 @@ this surface over a Unix socket using a newline-delimited text protocol.
 - `helpers.rs` — shared daemon-loop utilities (`replan_queues`,
   `replan_bindings_from_candidates`, `summarize_queues`, capability
   checks).
+  - **`write_state` holds the `ServerState` lock only to snapshot, not to
+    persist (#5469).** Persisting the state file used to run
+    `refresh_status`, `serde_json::to_vec_pretty` over the whole
+    `ProcessStatus` + `ConfigSnapshot`, AND `StateWriter::persist` (file +
+    parent-dir fsync) all under the `ServerState` lock. Because the fallback
+    session-delta poll sets `persist_state` on every nonempty request, under
+    session churn each delta poll serialized+fsynced the full state while
+    holding the lock that also gates snapshot apply, status, and HA/control
+    ops — a lock convoy. `write_state` now holds the lock ONLY long enough to
+    `refresh_status` and clone a minimal owned payload (`build_state_payload`,
+    the sole guard-touching half) plus a cheap Arc bump of the writer handle,
+    then DROPS the guard before `encode()` (the `to_vec_pretty`) and
+    `persist`. All persists still funnel through `StateWriter`'s single writer
+    thread and publish via temp+atomic-rename (`finalize_durably`), so
+    concurrent lock-free writers never tear the file; semantics are
+    last-writer-wins and any transient staleness self-corrects on the next
+    periodic write. `write_state_releases_lock_before_persist` is the
+    fail-on-revert guard (a same-thread `try_lock` at the persist point, which
+    a non-reentrant `Mutex` grants only if the guard was truly dropped).
 - `tests.rs` — colocated unit tests for the dispatcher, the per-verb
   handler error/gating arms, and the pure helper predicates (#1653
   §3.1). Handlers are driven through the real `handle_stream` call site

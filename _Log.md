@@ -1,3 +1,40 @@
+## 2026-07-17 — #5469: write_state serializes+fsyncs OUTSIDE the ServerState lock
+
+- **Timestamp**: 2026-07-17 (fix/5469-writestate-lock-convoy)
+- **Action**: `write_state` (userspace-dp state-file persist) held the
+  `ServerState` lock across `refresh_status`, `serde_json::to_vec_pretty` over
+  the whole `ProcessStatus` + `ConfigSnapshot`, AND `StateWriter::persist`
+  (file + parent-dir fsync). The fallback session-delta poll sets
+  `persist_state` on every nonempty request, so under session churn each delta
+  poll serialized+fsynced the full state while holding the lock that also gates
+  snapshot apply, status, and HA/control ops → lock convoy + delayed control
+  ops (same class as configstore #4829). Shrank the critical section: split out
+  `build_state_payload(&mut ServerState)` (the ONLY guard-touching half — runs
+  `refresh_status`, clones `status` + `snapshot` into an owned
+  `OwnedStatePayload`) and `OwnedStatePayload::encode()` (owns its data → cannot
+  reach the guard). `write_state` now holds the lock only for
+  `build_state_payload` + a cheap Arc bump of the writer handle, DROPS the
+  guard, then runs `encode()` (`to_vec_pretty`) and `persist` lock-free.
+  Confirmed `persist` is atomic (temp+rename via `finalize_durably`) and
+  single-writer-thread FIFO, so concurrent lock-free writers never tear the
+  file — last-writer-wins, transient staleness self-corrects on the next
+  periodic write. Byte-for-byte identical encoding to pre-#5469. Fail-on-revert
+  test `write_state_releases_lock_before_persist` uses a same-thread `try_lock`
+  probe at the persist point (a non-reentrant `Mutex` grants it only if the
+  guard was truly dropped); verified RED when the guard is put back across
+  persist. Ran server::tests 5× (67 passed, no flakes). Two full-suite
+  failures (`wire_invariant_default_specimens`,
+  `stalled_consumer_..._backlog_unbounded`) are pre-existing: the wire fixture
+  drift is from #25afac254 NAT64 `BindingStatus` counters (untouched here),
+  fails deterministically in isolation; the backpressure test is a known timing
+  flake (FAIL/OK/FAIL in isolation). Neither touches server/helpers.
+- **File(s)**:
+  userspace-dp/src/server/helpers.rs (split write_state + owned payload + test
+    probe),
+  userspace-dp/src/server/tests.rs (fail-on-revert test),
+  userspace-dp/src/server/README.md (helpers.rs write_state lock-discipline note),
+  _Log.md
+
 ## 2026-07-17 — #5163: zone-counter fold must be lock-free (no per-batch global mutex)
 
 - **Timestamp**: 2026-07-17 (fix/5163-zone-counter-contention)
