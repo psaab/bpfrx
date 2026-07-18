@@ -1,3 +1,33 @@
+## 2026-07-18 — #5149: trim_l3_payload must be IP-declared-length authoritative (tunnel L4 checksum over Ethernet slack)
+
+- **Timestamp**: 2026-07-18 (fix/5149-trim-l3-declared-len)
+- **Action**: `trim_l3_payload` was METADATA-led: when `meta.pkt_len` yielded a
+  length equal to the full backing slice (INCLUDING trailing Ethernet slack —
+  NIC min-frame zero-pad or attacker-appended bytes), it returned the
+  slack-inclusive L3 suffix and never reached the IP-header `total_len` clamp.
+  On the tunnel-forced L4 recompute path (`force_tunnel_l4_recompute`, consumed
+  by `wg::wg_encap_frame` / `encapsulate_native_gre_frame`), the L4 checksum
+  then covered the slack, but GRE/WG encap transmits only the IP-declared inner
+  length → the peer verifies the inner L4 checksum over bytes no longer present
+  → remote DROP. Fix: made the IP-declared datagram length AUTHORITATIVE —
+  `trim_l3_payload` now returns `&raw_payload[..declared_l3_end]` (the same
+  `inspect::declared_l3_end` SSOT the #5141 segmentation clamp and #2361 port
+  bound use; IPv4 `total_len` / IPv6 `40 + payload_len`, clamped to backing).
+  Metadata `pkt_len` is only a FALLBACK for when `declared_l3_end` is
+  unavailable (truncated/malformed L3 header, unknown addr_family). No-slack
+  common path is byte-identical (total_len == metadata L3 length). A declaration
+  too short to cover the L4 header fails closed downstream (recompute helpers
+  return None → drop).
+- **File(s)**: userspace-dp/src/afxdp/frame/mod.rs (trim_l3_payload),
+  userspace-dp/src/afxdp/frame/tests_parse_forward_pbr.rs (RED-on-revert test
+  `trim_l3_payload_excludes_ethernet_slack_beyond_ip_declared_len_5149`),
+  userspace-dp/src/afxdp/frame/README.md.
+- **Validation**: full `cargo test --release --bin xpf-userspace-dp` green;
+  RED-on-revert confirmed target-count 1 (neutralizing the `declared_l3_end`
+  branch fails ONLY the new test at the `trimmed.len() == 40` assertion; the two
+  existing corrupt-header trim tests stay green because a zeroed IHL makes
+  `declared_l3_end` return None → metadata fallback).
+
 ## 2026-07-18 — #5268 (High, security): RX-VLAN-offload-disable is a fail-closed activation precondition
 
 - **Timestamp**: 2026-07-18 (fix/5268-rxvlan-failclosed)
