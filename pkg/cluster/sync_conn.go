@@ -603,10 +603,23 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 			slog.Info("cluster sync: scheduling OnPeerConnected callback", "fabric", fabricIdx)
 			go s.OnPeerConnected()
 		}
-		if coldStart {
-			slog.Info("cluster sync: starting bulk sync on cold start", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
+		// Re-read the resync arm AFTER flushDeleteJournal: a rejournalTail
+		// eviction during that flush (or a journalDelete drop while we were
+		// disconnected) arms forceResync, and dropped deletes are only
+		// recoverable via a full authoritative bulk snapshot (#5450). Force the
+		// bulk even when already primed so the peer's reconcileStaleSessions
+		// deletes the sessions we already closed.
+		forced := s.forceResync.Load()
+		if coldStart || forced {
+			if forced && !coldStart {
+				slog.Warn("cluster sync: forcing full bulk resync on reconnect after delete-journal overflow (standby may retain stale sessions)", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
+			} else {
+				slog.Info("cluster sync: starting bulk sync on cold start", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
+			}
 			if err := s.doBulkSync(); err != nil {
 				slog.Warn("cluster sync: bulk sync failed", "err", err, "fabric", fabricIdx)
+			} else {
+				s.forceResync.Store(false)
 			}
 		} else {
 			slog.Info("cluster sync: skipping bulk sync on reconnect (already primed)", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
@@ -807,6 +820,20 @@ func (s *SessionSync) syncSweep() int {
 	if s.sessions == nil {
 		return 0
 	}
+	// #5450: a delete-journal overflow (rejournalTail/journalDelete dropped
+	// records) armed forceResync — the standby may still hold sessions the
+	// primary already closed. Recover by sending a full authoritative bulk
+	// snapshot so the peer's reconcileStaleSessions deletes them. Consume the
+	// arm exactly once (CAS true->false); re-arm on failure so a later sweep or
+	// reconnect retries. flushDeleteJournal already ran this tick, so any tail
+	// still queued replays before this snapshot's window closes.
+	if s.forceResync.CompareAndSwap(true, false) {
+		slog.Warn("cluster sync: forcing full bulk resync after delete-journal overflow (standby may retain stale sessions)")
+		if err := s.doBulkSync(); err != nil {
+			s.forceResync.Store(true)
+			slog.Warn("cluster sync: forced resync bulk failed, will retry", "err", err)
+		}
+	}
 	if s.lastSweepEmpty && !s.syncBackfillNeeded.Load() {
 		if s.telemetry != nil {
 			newCtr, err1 := s.telemetry.GlobalCounter(dataplane.GlobalCtrSessionsNew)
@@ -970,21 +997,44 @@ func (s *SessionSync) QueueDeleteV6(key dataplane.SessionKeyV6) {
 	}
 }
 
+// armDeleteResync marks that a delete-journal overflow dropped session-delete
+// records the standby still needs, arming a full authoritative bulk resync
+// (#5450). It is a pure atomic CAS — safe to call while holding
+// deleteJournalMu because it never blocks and performs no I/O — and idempotent:
+// repeated drops in one overflow episode re-arm the already-set flag as a
+// no-op. The arm is consumed once by whichever of the sweep loop (syncSweep) or
+// the next reconnect (handleNewConnection) runs first; both send a full
+// BulkSync so the peer's reconcileStaleSessions deletes the sessions the
+// primary already closed. Returns true only on the false->true transition so
+// the caller can log the episode exactly once (outside the lock).
+func (s *SessionSync) armDeleteResync() bool {
+	return s.forceResync.CompareAndSwap(false, true)
+}
+
 // journalDelete stores a delete message in the bounded ring buffer for replay
-// on reconnect. If the journal is full, the oldest entry is evicted and
-// DeletesDropped is incremented.
+// on reconnect. If the journal is full, the oldest entry is evicted,
+// DeletesDropped is incremented, and a full bulk resync is armed (#5450) so the
+// standby does not silently retain the session the evicted delete would have
+// torn down.
 func (s *SessionSync) journalDelete(msg []byte) {
 	s.deleteJournalMu.Lock()
-	defer s.deleteJournalMu.Unlock()
 	cap := s.deleteJournalCap
 	if cap <= 0 {
 		cap = deleteJournalDefaultCap
 	}
+	armed := false
 	if len(s.deleteJournal) >= cap {
 		s.deleteJournal = s.deleteJournal[1:]
 		s.stats.DeletesDropped.Add(1)
+		armed = s.armDeleteResync()
 	}
 	s.deleteJournal = append(s.deleteJournal, msg)
+	s.deleteJournalMu.Unlock()
+	if armed {
+		slog.Warn("cluster sync: delete journal full, evicted oldest delete and armed full bulk resync to reconcile standby",
+			"deletes_dropped_total", s.stats.DeletesDropped.Load(),
+			"journal_cap", cap)
+	}
 }
 
 func (s *SessionSync) flushDeleteJournal() {
@@ -1060,6 +1110,14 @@ func (s *SessionSync) rejournalTail(tail [][]byte) {
 	}
 	dropped := total - capN
 	s.stats.DeletesDropped.Add(uint64(dropped))
+	// #5450: the evicted deletes are session teardowns the standby still needs;
+	// they are gone from our local table, so no incremental install sweep can
+	// re-derive them. Arm a full authoritative bulk resync (consumed by the
+	// sweep loop / next reconnect) so the peer's reconcileStaleSessions deletes
+	// the sessions we already closed instead of carrying ghosts until the next
+	// far-off full reconcile. Pure atomic CAS under deleteJournalMu — no I/O,
+	// idempotent, armed once per overflow episode.
+	s.armDeleteResync()
 	merged := make([][]byte, 0, capN)
 	if dropped < len(tail) {
 		// Drop the oldest prefix of the tail; keep the rest plus all of the

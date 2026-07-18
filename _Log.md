@@ -1,3 +1,36 @@
+## 2026-07-17 — #5450: delete-journal overflow must arm a full bulk resync
+
+- **Timestamp**: 2026-07-17 (fix/5450-delete-journal-reconcile)
+- **Action**: On a full/disconnected send stream the delete journal
+  (`pkg/cluster/sync_conn.go`) evicts the OLDEST queued session-delete records
+  to stay under `deleteJournalCap`. Dropped deletes were counted
+  (`DeletesDropped`) but never otherwise recovered — the standby kept the
+  sessions the primary already closed until the next unrelated full bulk
+  reconcile, which under an extended control-link partition with high churn
+  could be far away (ghost sessions → wrong forwarding + inflated session
+  count). Fix: added a `forceResync atomic.Bool`; both drop sites
+  (`journalDelete` append-past-cap and `rejournalTail` re-journal-past-cap) now
+  arm it via a shared `armDeleteResync()` CAS (pure atomic under
+  `deleteJournalMu` — no I/O, idempotent, armed once per overflow episode). It
+  is consumed by whichever runs first: the connected sweep (`syncSweep`) or the
+  next reconnect (`handleNewConnection`, re-read AFTER `flushDeleteJournal` so an
+  eviction during that flush is caught), each firing a full authoritative
+  `doBulkSync` even when already primed. The peer's `reconcileStaleSessions` at
+  `BulkEnd` then deletes exactly the sessions absent from the snapshot. On a
+  failed bulk the arm is restored so a later sweep/reconnect retries.
+  `forceResync` is kept DISTINCT from `bulkEverCompleted` (daemon reads it for
+  VRRP sync-hold gating) and from `syncBackfillNeeded` (re-drives INSTALLS only
+  — a dropped delete has no live session to re-derive).
+- **File(s)**: pkg/cluster/sync.go (field), pkg/cluster/sync_conn.go
+  (armDeleteResync, journalDelete, rejournalTail, syncSweep,
+  handleNewConnection), pkg/cluster/sync_test.go
+  (TestDeleteJournalOverflowArmsForceResync, fail-on-revert),
+  docs/session-sync-architecture.md.
+- **Validation**: `go build ./...` clean; `go test ./pkg/cluster/...` green
+  (incl. `-race`); fail-on-revert confirmed (removing the rejournalTail
+  arm fails `rejournal_overflow_arms`). Failover smoke advised on the loss
+  userspace cluster (parent to run) — this touches session-sync.
+
 ## 2026-07-17 — #5163: zone-counter fold must be lock-free (no per-batch global mutex)
 
 - **Timestamp**: 2026-07-17 (fix/5163-zone-counter-contention)
