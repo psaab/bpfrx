@@ -149,6 +149,56 @@ impl PartialEq for SessionMetadata {
 
 impl Eq for SessionMetadata {}
 
+impl SessionMetadata {
+    /// #5445: clone every field EXCEPT the bound `policy_counter` `Arc`, which
+    /// is left `None`. Used by the per-packet established-session lookup return
+    /// (`SessionLookup`, produced in `lookup_with_origin`) so the packet-
+    /// forwarding hot path no longer bumps the SHARED `Arc<PolicyRuleCounter>`
+    /// refcount — an atomic `LOCK XADD` on a cacheline every established-session
+    /// lookup contends across workers, the #919 hot-path-atomic problem the
+    /// plain `#[derive(Clone)]` reintroduced.
+    ///
+    /// The bound counter is still owned by the session-table `SessionEntry`
+    /// (unchanged) and is re-sourced BY BORROW via
+    /// `SessionTable::bound_policy_counter_for` for the per-packet policy
+    /// hit-count and cloned at most once per flow into the flow-cache entry —
+    /// so #3322 reorder-stable attribution is preserved with no per-packet
+    /// atomic. Every other field is `Copy`, so this clone allocates nothing and
+    /// touches no refcount. The explicit field list is deliberate: adding a new
+    /// `SessionMetadata` field forces a compile error here (struct-literal
+    /// exhaustiveness), so a future field cannot silently regress the hot path.
+    #[inline]
+    pub(crate) fn clone_without_policy_counter(&self) -> Self {
+        Self {
+            ingress_zone: self.ingress_zone,
+            egress_zone: self.egress_zone,
+            owner_rg_id: self.owner_rg_id,
+            fabric_ingress: self.fabric_ingress,
+            is_reverse: self.is_reverse,
+            nat64_reverse: self.nat64_reverse,
+            log_session_init: self.log_session_init,
+            log_session_close: self.log_session_close,
+            policy_id: self.policy_id,
+            inactivity_timeout_ns: self.inactivity_timeout_ns,
+            policy_counter_idx: self.policy_counter_idx,
+            // #5445: the SHARED Arc is deliberately dropped from the per-packet
+            // lookup return — see the method doc.
+            policy_counter: None,
+        }
+    }
+}
+
+/// The per-packet result of an established-session lookup.
+///
+/// #5445: `metadata.policy_counter` is ALWAYS `None` on the value returned by
+/// the primary/alias `SessionTable::lookup`(`_with_origin`) — the bound
+/// `Arc<PolicyRuleCounter>` is intentionally NOT cloned onto the hot path (that
+/// clone was a per-packet `LOCK XADD` on the shared refcount). Consumers that
+/// need the bound counter borrow it from the owning `SessionEntry` via
+/// `SessionTable::bound_policy_counter_for`. (Note: `ForwardSessionMatch`
+/// returned by the once-per-flow `find_forward_*_match` finders still carries
+/// the `Arc` — those feed reverse-companion install, an owner handoff, not the
+/// per-packet fast path.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionLookup {
     pub(crate) decision: SessionDecision,

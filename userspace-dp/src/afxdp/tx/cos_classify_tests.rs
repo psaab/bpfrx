@@ -1989,6 +1989,182 @@ fn resolve_cos_tx_selection_flowless_port_term_does_not_spuriously_drop() {
 }
 
 #[test]
+fn resolve_cached_cos_tx_selection_flowless_enforces_output_discard() {
+    // #6055 RED-on-revert: the CACHED flowless arm (`resolve_cached_cos_tx_selection`
+    // with flow_key = None) must honor an interface output `then discard` term
+    // against a flowless packet's L3 tuple, exactly like the #5467 fix on the
+    // non-cached `_at` arm. Before this fix the cached flowless arm returned
+    // drop:false WITHOUT evaluating the output filter at all — a LATENT
+    // fail-open. Reverting the hardening back to an unconditional `drop: false`
+    // makes the `matched.drop` assertion below FAIL.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-drop-l3".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-drop-l3".into(),
+            family: "inet".into(),
+            // L3-only term (address + protocol, NO ports) so it matches a
+            // flowless packet whose L4 ports are absent (0).
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-host".into(),
+                destination_addresses: vec!["172.16.80.200/32".into()],
+                destination_constrained: true,
+                protocols: vec!["tcp".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    // Flowless packet whose L3 dst MATCHES the deny term → must fail closed.
+    let matched =
+        resolve_cached_cos_tx_selection(&forwarding, 202, flowless_v4_meta([172, 16, 80, 200]), None);
+    assert!(
+        matched.drop,
+        "#6055: a flowless cached-arm packet matching an output `then discard` \
+         term must drop (not fail open)"
+    );
+    assert!(!matched.reject, "then discard is a silent drop, not a reject");
+    assert_eq!(matched.filter_log, None);
+
+    // Control: a flowless packet that does NOT match any deny term still
+    // egresses (pass-through unchanged, #2357/#3290 preserved).
+    let unmatched =
+        resolve_cached_cos_tx_selection(&forwarding, 202, flowless_v4_meta([172, 16, 80, 201]), None);
+    assert!(
+        !unmatched.drop,
+        "#6055: a flowless cached-arm packet not matching any deny term must NOT drop"
+    );
+}
+
+#[test]
+fn resolve_cached_cos_tx_selection_flowless_enforces_output_reject() {
+    // #6055 RED-on-revert: the cached flowless arm must set drop:true AND
+    // reject:true for a `then reject` output term (parity with #5467). A revert
+    // to the unconditional `reject: false` makes the reject assertion FAIL.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-reject-l3".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-reject-l3".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "reject-host".into(),
+                destination_addresses: vec!["172.16.80.200/32".into()],
+                destination_constrained: true,
+                protocols: vec!["tcp".into()],
+                action: "reject".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let selection =
+        resolve_cached_cos_tx_selection(&forwarding, 202, flowless_v4_meta([172, 16, 80, 200]), None);
+    assert!(selection.drop, "#6055: flowless cached `then reject` must drop");
+    assert!(
+        selection.reject,
+        "#6055: flowless cached `then reject` must set the reject flag"
+    );
+}
+
+#[test]
+fn resolve_cached_cos_tx_selection_flowless_enforces_output_log() {
+    // #6055 RED-on-revert: a flowless cached-arm packet matching an output
+    // `then log` term must surface the filter-log match (before the fix
+    // filter_log was always None on the cached flowless path — the log was
+    // silently bypassed).
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-log-l3".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-log-l3".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "log-host".into(),
+                destination_addresses: vec!["172.16.80.200/32".into()],
+                destination_constrained: true,
+                protocols: vec!["tcp".into()],
+                action: "accept".into(),
+                log: true,
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let selection =
+        resolve_cached_cos_tx_selection(&forwarding, 202, flowless_v4_meta([172, 16, 80, 200]), None);
+    assert!(
+        selection.filter_log.is_some(),
+        "#6055: a flowless cached-arm packet matching an output `then log` term must log"
+    );
+    assert!(
+        !selection.drop,
+        "a `then accept` + log term must not drop the packet"
+    );
+}
+
+#[test]
+fn resolve_cached_cos_tx_selection_flowless_port_term_does_not_spuriously_drop() {
+    // #6055 / #2357 / #3290: the cached flowless output gate forces ports to 0,
+    // so a port-BEARING terminal term never matches a fragment — no spurious
+    // drop of legitimate flowless traffic. Guards the hardening from
+    // over-dropping.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-drop-port".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-drop-port".into(),
+            family: "inet".into(),
+            // Port-bearing terminal term: a flowless packet (port 0, L4 absent)
+            // must NOT match it.
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let selection =
+        resolve_cached_cos_tx_selection(&forwarding, 202, flowless_v4_meta([172, 16, 80, 200]), None);
+    assert!(
+        !selection.drop,
+        "#6055: a port-bearing output term must NOT drop a flowless (port 0) cached packet"
+    );
+}
+
+#[test]
 fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filter_exists() {
     let snapshot = ConfigSnapshot {
         interfaces: vec![

@@ -420,6 +420,33 @@ sync.
     keeps the reject reply gated on a real L4 flow — but the packet is still
     dropped, and when a `then log` term matched, the filter-log event is
     attributed via the L3-only flow (`frame::l3_session_flow_from_meta`).
+  - **#6055 — cached flowless TX arm brought to #5467 parity (latent
+    fail-open closed):** the #5467 fix above landed only on
+    `resolve_cos_tx_selection_internal` (the non-cached `_at`/queue-id path).
+    Its sibling `resolve_cached_cos_tx_selection` (the flow-cache SEED / mirror
+    descriptor builder, `afxdp/tx/cos_classify.rs`) kept a flowless
+    (`flow_key = None`) arm that returned `drop:false, reject:false,
+    filter_log:None` WITHOUT evaluating the output filter. That arm is
+    UNREACHABLE for enforcement today (the seed caller always passes
+    `Some(&key)`; the mirror caller reads only `.queue_id`), so there is no
+    active bypass — but any future caller reading `.drop`/`.reject` from a
+    `flow_key = None` result would silently reintroduce the #5467 fail-open.
+    The cached flowless arm now evaluates the output filter through the SAME
+    entry the flow-keyed cached arm uses
+    (`interface_output_filter_needs_tx_eval` +
+    `evaluate_filter_ref_tx_selection_cached`, ports forced to 0) and collapses
+    `drop`/`reject`/`filter_log` identically, so an L3-matching egress deny
+    FAILS CLOSED at parity with `_at`. The cached eval applies
+    `TermMatchExtra::default()` (every per-packet-L4 term fails closed); the
+    flow-cache SEED path already declines caching for any filter carrying such
+    a term (`interface_output_filter_has_per_packet_l4_match`,
+    `afxdp/flow_cache.rs`), so no per-packet-L4 output term ever reaches this
+    arm. The `drop` bit is the OUTPUT terminal action only (a three-color
+    policer runs at replay via `apply_cached_three_color_policers`), matching
+    the flow-keyed arm's #3608 convention. rev5467 MINOR 2 (`port_match` not
+    gated on `l4_present`, an over-block that is fail-CLOSED and pre-existing on
+    both the #3291 input and this output flowless path) is left as a tracked
+    follow-up.
   - **#5690 — generic embedded-ICMP NAT reversal on the flowless arm:** an
     inbound non-query ICMP error (Time-Exceeded, Dest-Unreachable, PTB,
     Parameter-Problem, Redirect) referencing a NAT'd flow is itself FLOWLESS

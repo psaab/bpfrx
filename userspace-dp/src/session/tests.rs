@@ -78,6 +78,89 @@ fn metadata() -> SessionMetadata {
     }
 }
 
+// #5445: the per-packet established-session lookup must NOT clone the bound
+// `Arc<PolicyRuleCounter>`. Cloning `SessionMetadata` by value on every lookup
+// bumped the SHARED refcount (a `LOCK XADD`) on the packet-forwarding hot path
+// — the #919 hot-path-atomic problem. This is a perf-with-strong-count guard,
+// not a behavioral RED-on-revert: reverting `clone_without_policy_counter` back
+// to `entry.metadata.clone()` makes the returned `SessionLookup` hold an owned
+// strong reference, so `Arc::strong_count` GROWS while the lookup result is
+// alive → the equality assertion fails (RED). The accounting half proves the
+// bound counter is still reachable BY BORROW and still increments.
+#[test]
+fn lookup_does_not_clone_policy_counter_arc_5445() {
+    let mut table = SessionTable::new();
+    let counter = std::sync::Arc::new(crate::policy::PolicyRuleCounter::default());
+    let key = key_v4();
+
+    let mut md = metadata();
+    md.policy_counter = Some(counter.clone());
+    md.policy_counter_idx = 7;
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        md,
+        1_000,
+        PROTO_TCP,
+        TCP_SYN | TCP_ACK,
+    ));
+    // Drain the install's Open delta — it holds a `SessionMetadata` clone (with
+    // the Arc) until consumed, which would otherwise inflate the baseline.
+    let _ = table.drain_deltas(8);
+
+    // Baseline: the original test handle + the session entry's owned handle.
+    let base = std::sync::Arc::strong_count(&counter);
+    assert_eq!(base, 2, "entry owns exactly one bound-counter reference");
+
+    // The per-packet established-session lookup (the #919 hot path).
+    let lookup = table
+        .lookup(&key, 2_000, TCP_ACK)
+        .expect("established session hit");
+    let during = std::sync::Arc::strong_count(&counter);
+    assert_eq!(
+        base, during,
+        "#5445: the per-packet SessionLookup must NOT clone the policy_counter \
+         Arc — reverting to `entry.metadata.clone()` bumps strong_count while \
+         the lookup is held (RED)"
+    );
+    // The returned lookup carries the Copy fields but drops the bound Arc.
+    assert!(
+        lookup.metadata.policy_counter.is_none(),
+        "the hot-path lookup return no longer carries the bound counter Arc"
+    );
+    assert_eq!(
+        lookup.metadata.policy_counter_idx, 7,
+        "the positional idx (Copy) still rides the lookup return"
+    );
+    drop(lookup);
+
+    // The bound counter is still reachable BY BORROW from the owning entry (no
+    // clone, no strong-count bump) and its accounting still increments.
+    let before = counter.test_packet_count();
+    {
+        let bound = table
+            .bound_policy_counter_for(&key)
+            .expect("bound counter borrowable from the entry");
+        assert_eq!(
+            std::sync::Arc::strong_count(&counter),
+            base,
+            "resolving the bound counter by borrow must not bump strong_count"
+        );
+        crate::policy::record_policy_hit_counter(bound, 1_200);
+    }
+    assert_eq!(
+        counter.test_packet_count(),
+        before + 1,
+        "#5445: the policy hit-count still increments via the borrowed handle"
+    );
+    // And no leaked reference survived the borrow-and-record.
+    assert_eq!(
+        std::sync::Arc::strong_count(&counter),
+        base,
+        "no strong reference leaked onto the hot path"
+    );
+}
+
 /// #4109: a TCP IPv6 forward key. The shared `key_v6()` is UDP, but the TCP
 /// state-machine tests need a v6 TCP flow to cover the second address family.
 fn tcp_key_v6() -> SessionKey {

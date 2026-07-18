@@ -34,6 +34,97 @@
   userspace-dp/src/afxdp/worker/loop_body/mod.rs,
   userspace-dp/src/afxdp/coordinator/README.md,
   userspace-dp/src/event_stream/README.md
+## 2026-07-18 — #6055: harden cached flowless CoS arm against a latent output-filter fail-open
+
+- **Timestamp**: 2026-07-18 (fix/6055-flowless-cos-failopen)
+- **Action**: Follow-up to #5467/#6054. `resolve_cached_cos_tx_selection`'s
+  flowless (`flow_key == None`) arm in `afxdp/tx/cos_classify.rs` returned
+  `drop:false, reject:false, filter_log:None` WITHOUT evaluating the interface
+  `filter output` — the #5467 fix was applied only to
+  `resolve_cos_tx_selection_internal` (the non-cached `_at` path). The cached
+  arm is UNREACHABLE for enforcement today (the seed caller `flow_cache.rs`
+  always passes `Some(&key)`; `mirror/resolver.rs` reads only `.queue_id`), so
+  there is no active bypass — but it is a LATENT fail-open: a future caller
+  reading `.drop`/`.reject` from a `flow_key = None` result silently
+  reintroduces the #5467 egress-deny bypass. Fix: the cached flowless arm now
+  reconstructs the packet's own L3 tuple (`ForwardPacketMeta::from(meta)
+  .l3_addrs()`, ports forced to 0) and evaluates the output filter through the
+  SAME entry the flow-keyed cached arm uses
+  (`interface_output_filter_needs_tx_eval` +
+  `evaluate_filter_ref_tx_selection_cached`), collapsing `drop`/`reject`/
+  `filter_log`/`filter_counters`/`three_color_policers` identically — so an
+  L3-matching egress deny FAILS CLOSED at parity with `_at`. Approach:
+  consult-the-verdict (not decline-shortcut). Ports are 0 so a port-BEARING
+  term never matches (no spurious drop, #2357/#3290 preserved); the cached eval
+  applies `TermMatchExtra::default()` (per-packet-L4 terms fail closed), and the
+  flow-cache SEED path already declines caching for any per-packet-L4 filter, so
+  no such term reaches this arm. `drop` is the OUTPUT terminal action only
+  (policer runs at replay), matching the flow-keyed #3608 convention. Queue /
+  DSCP-rewrite selection untouched — enforcement ADDED only.
+- **Tests**: `cos_classify_tests.rs` — four cached-arm fail-on-revert tests
+  reusing the #5467 `flowless_v4_meta` harness: L3-only `then discard` drops (+
+  non-matching control passes), `then reject` sets drop+reject, `then log`
+  surfaces filter_log, and a port-bearing term does NOT spuriously drop a
+  port-0 flowless packet. RED-on-revert verified: gating the new eval with
+  `false &&` flips the discard/reject/log asserts RED while the port-term
+  control stays green.
+- **Validation**: `cargo build` clean; `cargo test --bin xpf-userspace-dp
+  cos_classify` green (63 passed), 5x flake check all green. Two unrelated
+  failures in the full suite (`protocol::tests::wire_invariant_default_specimens`
+  golden drift, `event_stream ... stalled_consumer` backpressure timing) confirmed
+  PRE-EXISTING on the clean base (stash-and-rerun). rev5467 MINOR 2 (`port_match`
+  not gated on `l4_present`) left as a tracked follow-up — fail-CLOSED,
+  pre-existing on both input (#3291) and this output flowless path.
+- **File(s)**: userspace-dp/src/afxdp/tx/cos_classify.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+
+## 2026-07-18 — #5445: per-packet SessionLookup must not clone the policy_counter Arc
+
+- **Timestamp**: 2026-07-18 (fix/5445-session-metadata-clone)
+- **Action**: The primary/alias `SessionTable::lookup`(`_with_origin`) return
+  cloned `SessionMetadata` BY VALUE on every established-session lookup (the
+  per-packet hot path: TCP control segments + flow-cache-miss packets). Since
+  `SessionMetadata::policy_counter` is an `Arc<PolicyRuleCounter>` (#3322 bound
+  handle), that clone did a `LOCK XADD` refcount bump on the SHARED counter
+  control block — the #919 hot-path-atomic problem (workers contending one
+  cacheline). Fix: `lookup_with_origin` now builds its `SessionLookup.metadata`
+  via the new `SessionMetadata::clone_without_policy_counter` (all Copy fields,
+  `policy_counter = None`, zero atomics). The bound counter stays owned by the
+  `SessionEntry`; the established-hit fast path re-sources it BY BORROW via the
+  new `SessionTable::bound_policy_counter_for` for the per-packet policy
+  hit-count and clones the Arc at most once per flow to hand ownership to the
+  flow-cache entry. `poll_descriptor` sources the handle once (prefer the value
+  the resolve threaded on the miss/forward-wire owner paths, else borrow-clone
+  from the per-worker table) and reuses it for both the count and the flow-cache
+  stamp — removing the two prior per-packet Arc clones (lookup return +
+  materialize) and the redundant stamp clone (3 atomics -> 1 per hit, and 0 in
+  `lookup` itself). #3322 reorder-stable attribution is unchanged (same Arc
+  instance, borrowed not cloned). The once-per-flow `find_forward_*_match`
+  finders keep carrying the Arc on `ForwardSessionMatch` (reverse-companion
+  install, an owner handoff — not the per-packet path).
+- **Soundness**: a BORROW out of `lookup` is unsound (the caller mutates
+  `sessions` after — materialize/promote), and a raw-pointer/Copy handle is
+  unsound (`PolicyCounterStore::reconcile_rules` drops a deleted rule's Arc, so
+  the session's Arc is load-bearing across rule deletion per #3322). The
+  chosen split keeps the Arc owned by the table entry (lifetime-guaranteed to
+  outlive the packet on the per-worker table) and only borrows it on the hot
+  path — the sound option (b) the issue endorsed.
+- **Tests**: `lookup_does_not_clone_policy_counter_arc_5445` — a perf-with-
+  strong-count guard (NOT behavioral RED): asserts `Arc::strong_count` is stable
+  across a `lookup` while the result is held, the returned metadata carries
+  `policy_counter = None` + the Copy idx, and the counter still increments via
+  the borrowed `bound_policy_counter_for` handle. RED-verified by reverting to
+  `entry.metadata.clone()` (strong_count grows -> fails). 5x flake green.
+- **Validation**: `cargo build` clean; full session suite 176 passed; the whole
+  `--bin` suite green except two PRE-EXISTING failures reproduced on the stashed
+  clean base (`protocol::tests::wire_invariant_default_specimens` fixture drift,
+  `event_stream ... stalled_consumer ...` backpressure) — unrelated to this
+  change. Smoke on the loss userspace cluster is blocked by the shim-ABI wall.
+- **File(s)**: userspace-dp/src/session/entry.rs,
+  userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md, _Log.md
 
 ## 2026-07-18 — #5624: NAT64 fragment-association must invalidate on config change
 

@@ -763,6 +763,29 @@ longer attributable to an extant rule" beats a confidently-wrong name. An
 peer-synced session carrying only the wire scalar) has no local stable identity
 and keeps its frozen id — preserving the "no policy" rendering for id 0.
 
+**Hot-path lookup does not clone the bound counter Arc (#5445).** The bound
+`SessionMetadata::policy_counter` is an `Arc<PolicyRuleCounter>`; a plain
+`#[derive(Clone)]` copy of `SessionMetadata` therefore does a `LOCK XADD`
+refcount increment on the SHARED counter control block. The primary/alias
+`SessionTable::lookup`(`_with_origin`) return runs on the packet-forwarding hot
+path (every established-session lookup — every TCP control segment, every
+flow-cache-miss packet), so cloning the metadata by value there reintroduced the
+#919 hot-path-atomic problem: many workers bumping the same rule's refcount
+contend one cacheline. The fix strips the `Arc` from the per-packet return —
+`lookup_with_origin` builds its `SessionLookup.metadata` via
+`SessionMetadata::clone_without_policy_counter` (all Copy fields, `policy_counter
+= None`, zero atomics). The bound counter stays owned by the `SessionEntry`, and
+the established-hit fast path re-sources it **by borrow** via
+`SessionTable::bound_policy_counter_for` for the per-packet policy hit-count,
+cloning the `Arc` at most once per flow to hand ownership to the flow-cache
+entry (`poll_descriptor`). #3322 reorder-stable attribution is unchanged — the
+same `Arc` instance is used, just borrowed instead of cloned per packet. The
+once-per-flow `find_forward_*_match` finders (which feed reverse-companion
+install, an owner handoff) keep carrying the `Arc` on `ForwardSessionMatch`.
+Pinned by `lookup_does_not_clone_policy_counter_arc_5445` (an `Arc::strong_count`
+stability guard: reverting to `entry.metadata.clone()` makes the count grow while
+the lookup result is held → RED).
+
 **Scope — re-resolution is LOCAL only; the HA peer is the deferred P2.**
 `SessionMetadata` carries no serde, so `policy_id` and the bound `policy_counter`
 handle ride the shared-session map and sibling-worker replicas automatically.
