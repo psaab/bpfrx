@@ -207,6 +207,247 @@ fn dnat_off_exemption_not_local_address() {
     );
 }
 
+// #6025 FAIL-ON-REVERT: a specific `/32 destination-nat off` exemption that
+// shadows a BROADER translate prefix must NOT leave the exempt host registered
+// as a firewall-local address. The broad translate prefix (`203.0.113.0/24`)
+// expands host-by-host into the local set (the #3164 on-segment proxy-ARP
+// mechanism); before #6025 that expansion re-registered the exempt `/32`
+// (203.0.113.50) even though the exact-host `off` entry correctly WINS the DNAT
+// match (exact-host entries are probed before any prefix — see
+// `lookup_with_counter_scoped`). The result was a silent blackhole: the exempt
+// host wins the match (no translation) but its inbound packets are still
+// consumed via LocalDelivery instead of being routed to the real host.
+//
+// The fix (`destination_ips_scoped`) withdraws a prefix-expanded address when an
+// exact-host `off` exemption whose scope is a superset of the registering
+// translate slot shadows it. The assertion below proves both halves:
+//   - the exempt /32 is NOT local (routed/forwarded, not LocalDelivered) — RED
+//     before the fix, because the /24 expansion registered it;
+//   - a NON-exempt host under the same /24 is STILL local (the fix is surgical
+//     and does not break the common DNAT-to-firewall-VIP delivery).
+#[test]
+fn dnat_off_exemption_shadowing_broad_translate_prefix_not_local() {
+    let table = DnatTable::from_snapshots(
+        &[
+            // Specific /32 exemption — configured in the same rule-set (same
+            // `from zone`) as the broad translate below, the common operator
+            // idiom. An exact-host entry always beats the prefix in the lookup.
+            DestinationNATRuleSnapshot {
+                name: "exempt-host".to_string(),
+                destination_address: "203.0.113.50".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                off: true,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            // Broad translate over the whole /24 -> a pool. Its bounded prefix
+            // expansion registers every usable host (incl. the exempt .50) as a
+            // firewall-local proxy-ARP target.
+            DestinationNATRuleSnapshot {
+                name: "web-pool".to_string(),
+                destination_prefix: "203.0.113.0/24".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+
+    // The exempt host wins the DNAT match: no translation (exact-host `off`
+    // short-circuits before the /24 prefix). This is the disposition the local
+    // set must agree with — routed, not owned.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.50".parse().unwrap(),
+            80,
+            "untrust",
+        ),
+        None,
+        "exempt /32 must not be DNAT-translated (the off rule wins the match)"
+    );
+    // A non-exempt host under the same /24 is still translated.
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.51".parse().unwrap(),
+                80,
+                "untrust",
+            )
+            .is_some(),
+        "a non-exempt host under the /24 must still be DNAT-translated"
+    );
+
+    let locals: std::collections::HashSet<IpAddr> = table.destination_ips().collect();
+    // The bug: exempt /32 must NOT be a firewall-local address (else it is
+    // LocalDelivered instead of routed to the real host).
+    assert!(
+        !locals.contains(&"203.0.113.50".parse::<IpAddr>().unwrap()),
+        "exempt /32 (won by `destination-nat off`) must be routed, not \
+         LocalDelivered — it must not be a firewall-local address; locals={locals:?}"
+    );
+    // Surgical: a non-exempt host in the same /24 IS still local so its DNAT
+    // traffic is delivered/translated by the firewall as before.
+    assert!(
+        locals.contains(&"203.0.113.51".parse::<IpAddr>().unwrap()),
+        "a non-exempt host under the translate /24 must remain a firewall-local \
+         address; locals={locals:?}"
+    );
+}
+
+// #6025 FAIL-ON-REVERT (negative-scope): a `/32 destination-nat off` that
+// shadows the same broad `/24` translate BY DESTINATION IDENTITY but is NOT a
+// match-scope superset of it must NOT withdraw the host from the firewall-local
+// set. Here the exemption is SOURCE-SCOPED (`match source-address
+// 198.51.100.0/24`), so it wins only for that source — every OTHER source is
+// still DNAT-translated by the `/24` rule, which means the host genuinely still
+// receives translated traffic and MUST stay firewall-local (else the translated
+// portion is blackholed by the reverse of #6025). `off_scope_superset` returns
+// false for a source-constrained off, so the withdrawal correctly does NOT fire.
+//
+// This exercises the SCOPE axis that the positive test's `.51`-stays-local
+// assertion cannot: `.51` stays local purely because its dst_ip does not equal
+// the off's (`off_key.dst_ip == addr` is false), never touching
+// `off_scope_superset`. Here the destination identity MATCHES (.50 == .50) and
+// only the scope check keeps the host registered.
+//
+// RED-on-revert: loosen `off_scope_superset` (e.g. change
+// `!off.source_constrained` at destination.rs to an always-true term) — the
+// source-scoped off is then treated as a superset, `.50` is wrongly withdrawn,
+// and the "remains firewall-local" assertion below goes RED. Restore -> GREEN.
+#[test]
+fn dnat_off_exemption_non_superset_source_scope_stays_local() {
+    let table = DnatTable::from_snapshots(
+        &[
+            // Source-scoped /32 exemption: only exempts sources in
+            // 198.51.100.0/24. NOT a scope superset of the unconstrained /24
+            // translate below.
+            DestinationNATRuleSnapshot {
+                name: "exempt-one-source".to_string(),
+                destination_address: "203.0.113.50".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                source_addresses: vec!["198.51.100.0/24".to_string()],
+                off: true,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            // Broad, source-UNCONSTRAINED translate over the whole /24.
+            DestinationNATRuleSnapshot {
+                name: "web-pool".to_string(),
+                destination_prefix: "203.0.113.0/24".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+
+    // For a source INSIDE the exemption's scope, the off wins -> no translation.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.10".parse().unwrap(),
+            "203.0.113.50".parse().unwrap(),
+            80,
+            "untrust",
+        ),
+        None,
+        "the source-scoped off wins for a source within its scope"
+    );
+    // For a source OUTSIDE the exemption's scope, `.50` is STILL translated by
+    // the broad /24 -> the host genuinely receives translated traffic.
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "192.0.2.1".parse().unwrap(),
+                "203.0.113.50".parse().unwrap(),
+                80,
+                "untrust",
+            )
+            .is_some(),
+        "an out-of-scope source is still DNAT-translated for the same host"
+    );
+
+    let locals: std::collections::HashSet<IpAddr> = table.destination_ips().collect();
+    // The crux: a NON-superset (source-scoped) off must NOT withdraw the VIP —
+    // `.50` still has translated traffic and must remain firewall-local.
+    assert!(
+        locals.contains(&"203.0.113.50".parse::<IpAddr>().unwrap()),
+        "a host shadowed only by a NON-superset (source-scoped) off must remain \
+         firewall-local — some traffic to it is still translated; locals={locals:?}"
+    );
+}
+
+// #6025: v6 analog of the positive withdrawal test — the v6 prefix-expansion
+// path applies the same `shadowed` filter. A broad `2001:db8::/120` translate
+// with a `2001:db8::50/128 destination-nat off` exemption must withdraw the
+// exempt /128 from the firewall-local set while a non-exempt sibling stays.
+#[test]
+fn dnat_off_exemption_shadowing_broad_translate_prefix_not_local_v6() {
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                name: "exempt-host6".to_string(),
+                destination_address: "2001:db8::50".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                off: true,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "web-pool6".to_string(),
+                destination_prefix: "2001:db8::/120".to_string(),
+                protocol: "tcp".to_string(),
+                destination_port: 80,
+                from_zone: "untrust".to_string(),
+                pool_address: "fd00::10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "2001:db8:1::1".parse().unwrap(),
+            "2001:db8::50".parse().unwrap(),
+            80,
+            "untrust",
+        ),
+        None,
+        "exempt /128 must not be DNAT-translated (the off rule wins the match)"
+    );
+
+    let locals: std::collections::HashSet<IpAddr> = table.destination_ips().collect();
+    assert!(
+        !locals.contains(&"2001:db8::50".parse::<IpAddr>().unwrap()),
+        "exempt /128 (won by `destination-nat off`) must be routed, not \
+         LocalDelivered; locals={locals:?}"
+    );
+    assert!(
+        locals.contains(&"2001:db8::51".parse::<IpAddr>().unwrap()),
+        "a non-exempt /128 under the translate /120 must remain firewall-local; \
+         locals={locals:?}"
+    );
+}
+
 // #3844: a source-scoped exemption — exempt one source subnet from DNAT while
 // every other source is still translated by a later (unconstrained) rule. This
 // exercises both outcomes and the tier short-circuit across the source axis.

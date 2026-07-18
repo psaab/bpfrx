@@ -40,6 +40,67 @@
   pkg/dataplane/userspace/nat_source.go,
   pkg/dataplane/userspace/nat_source_persistent_notranslation_5819_test.go,
   docs/userspace-dataplane-gaps.md
+## 2026-07-18 — #6025 fold: negative-scope + v6 coverage (rev6101 MERGE-NEEDS-MINOR)
+
+- **Timestamp**: 2026-07-18 (fix/6025-dnat-off-localdelivery, follow-up)
+- **Action**: Folded the one substantive review MINOR from rev6101 — a
+  coverage gap on the crux. The positive test's `.51`-stays-local assertion
+  passes purely by the destination-identity check (`off_key.dst_ip == addr`,
+  .51 != .50), so it never exercises `off_scope_superset`'s SCOPE axes; a
+  future loosening of `off_scope_superset` would over-withdraw a
+  still-translated VIP uncaught. Added two tests to
+  `nat/tests_destination.rs`: (1)
+  `dnat_off_exemption_non_superset_source_scope_stays_local` — a
+  SOURCE-SCOPED `/32 off` that shadows the same broad `/24` translate BY
+  DESTINATION IDENTITY but is NOT a scope superset (source_constrained), so
+  the exempt host MUST remain firewall-local (it is still translated for
+  out-of-scope sources); asserts in-scope source → no DNAT, out-of-scope
+  source → translated, and `.50` stays local. (2)
+  `dnat_off_exemption_shadowing_broad_translate_prefix_not_local_v6` — v6
+  analog of the positive test exercising the v6 prefix-expansion `shadowed`
+  path (`2001:db8::/120` translate + `2001:db8::50/128 off`). No production
+  code change — the fix already handled both; these are the missing
+  fail-on-revert guards.
+- **File(s)**: userspace-dp/src/nat/tests_destination.rs, _Log.md
+- **Validation**: negative-scope RED-on-revert — loosened
+  `off_scope_superset` (`!off.source_constrained` → `true`): `test result:
+  FAILED. 0 passed; 1 failed` (panic tests_destination.rs:388, `.50` wrongly
+  withdrawn). Restored: `test result: ok. 47 passed; 0 failed`
+  (nat::tests_destination, up from 45 — both new tests GREEN).
+
+## 2026-07-18 — #6025: withdraw a shadowed translate VIP on a winning `destination-nat off`
+
+- **Timestamp**: 2026-07-18 (fix/6025-dnat-off-localdelivery)
+- **Action**: CONFIRMED then fixed the #6025 NAT correctness bug. A specific
+  `/32 destination-nat off` exemption that shadows a BROADER translate DNAT
+  prefix (pool DNAT over a subnet, one host exempted) correctly WINS the DNAT
+  match (exact-host entries are probed before any prefix in
+  `lookup_with_counter_scoped`), so the exempt host is never translated. But
+  the broad translate prefix registers its VIP firewall-local via the #3164
+  bounded host-by-host expansion, and that expansion re-registered the exempt
+  `/32` even though the `off` entry itself was skipped (#3844). The exempt host
+  therefore won the match (no translation) yet was consumed via LocalDelivery
+  instead of routed — a silent blackhole of the exact host the operator meant
+  to pass through. Confirm-first repro
+  (`dnat_off_exemption_shadowing_broad_translate_prefix_not_local`) FAILED on
+  pristine origin/master (exempt `203.0.113.50` present in
+  `destination_ips()`), proving the bug. Fix in
+  `nat/destination.rs::destination_ips_scoped` (option (a) — the cleaner,
+  more-local fix): withdraw a prefix-expanded / prefix-base address when a
+  superset exact-host `off` exemption shadows it for that translate slot
+  (`off_scope_superset`: protocol/port/zone/interface/routing-instance
+  wildcard-or-equal, source + #3437/#3449 L4 axes unconstrained). Conservative
+  — never over-suppresses, so a non-exempt host under the same prefix stays
+  firewall-local; per-slot, so a host exempt for one slot but translated by
+  another is still registered by the other. Doc updated
+  (docs/userspace-dnat-plan.md §15).
+- **File(s)**: userspace-dp/src/nat/destination.rs,
+  userspace-dp/src/nat/tests_destination.rs, docs/userspace-dnat-plan.md,
+  _Log.md
+- **Validation**: RED-on-revert (unmodified code): `test result: FAILED. 0
+  passed; 1 failed` on the exempt-host-routed assertion. GREEN (fixed):
+  `test result: ok. 45 passed; 0 failed` (nat::tests_destination); full
+  `nat::` 254 passed / 0 failed; `forwarding` 265 passed / 0 failed.
 
 ## 2026-07-18 — #6103: deterministic-fix event_stream stalled-consumer backpressure test (host socket-buffer dependency)
 
@@ -52584,3 +52645,29 @@ top.
   userspace-dp/src/afxdp/tx/dispatch/slow_path.rs, userspace-dp/src/afxdp/mod.rs,
   userspace-dp/src/afxdp/coordinator/status_tests.rs,
   userspace-dp/src/afxdp/coordinator/README.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #6075 (#5147/#6074 follow-up) — added an INDEPENDENT fail-on-revert
+  test pinning site (2), the poll_descriptor pre-resolve `neighbor_mac_epoch`
+  SNAPSHOT site (`epoch_for(&(outer_neighbor_ifindex(.., None, ..), nh))`). The
+  existing site-(1) test (`tunnel_flow_cache_keys_mac_change_shard_on_outer_
+  neighbor_not_logical_ifindex`) injects `neighbor_mac_epoch = 0` directly, so it
+  does NOT bind the poll snapshot; reverting only site (2) to the logical
+  `egress_ifindex` left it green. New test
+  `poll_descriptor_stamps_neighbor_mac_epoch_from_outer_neighbor_shard_not_
+  logical_6075` (tests_txn_flow_cache.rs) drives the REAL poll path
+  (`poll_binding_process_descriptor`) for a native-GRE transit forward with the
+  OUTER transport neighbor's shard MAC-change epoch pre-bumped in a caller-owned
+  dynamic-neighbor map, then asserts the seeded flow-cache entry's stamped
+  `neighbor_mac_epoch` equals the OUTER shard's snapshot epoch (not the logical
+  tunnel shard's). Added test-support harness `txn_run_descriptor_with_neighbors`
+  (accepts a caller-provided `dynamic_neighbors` so a test can seed shard epochs
+  before the poll's pre-resolve snapshot). Reverting site (2) -> new test RED
+  (left 0, right 1), site-(1) test stays GREEN (isolation). WireGuard NOT covered:
+  the build zeroes a WG endpoint's outer transport destination, so a WG transit
+  resolution NoRoutes at admit time and never seeds a ForwardCandidate flow-cache
+  entry; the site-(2) stamp path is native-GRE territory. No production change
+  (test-coverage only); no docs change needed (contract already documented in the
+  #6074 flow_cache.rs / poll_descriptor comments + site-(1) test).
+- **File(s)**: userspace-dp/src/afxdp/tests_txn_flow_cache.rs,
+  userspace-dp/src/afxdp/tests_support.rs
