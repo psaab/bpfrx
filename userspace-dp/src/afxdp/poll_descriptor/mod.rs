@@ -140,6 +140,89 @@ fn nat64_consult_forward_fragment_assoc(
     Some(decision)
 }
 
+/// #5689: on a FIRST fragment of an ORDINARY same-family NAT / NPTv6 flow that
+/// translated and will forward, install a fragment association keyed by
+/// `(family, src, dst, ip_id)` so its non-first fragments inherit `decision`
+/// and translate L3-only (address-only rewrite) instead of being forwarded
+/// UNTRANSLATED (the #5689 leak). Mirrors [`nat64_install_forward_fragment_assoc`]
+/// but for the SNAT / DNAT / static-NAT / NPTv6 path. It REUSES the generic
+/// `Nat64FragAssoc` cache: the key + value are family-agnostic and the `nat64`
+/// flag on the cached decision distinguishes a NAT64 entry from an ordinary one
+/// (a given datagram installs exactly one entry, so the two never alias). The
+/// shared cache is stamped with `build_generation` — which advances on EVERY
+/// config commit (`snapshot.generation`), not only NAT64 changes — so a SNAT /
+/// DNAT rule change invalidates a stale ordinary-NAT association on lookup.
+///
+/// Only a first fragment (offset 0, MF=1) carrying a same-family address
+/// rewrite whose resolution is a ForwardCandidate with a resolved neighbor
+/// installs; a NAT64 decision (its own install stamps reverse info), a decision
+/// with no address rewrite, or one that will not forward is never cached, so an
+/// unassociated non-first fragment still falls to the flowless default policy.
+#[inline]
+fn nat_install_forward_fragment_assoc(
+    forwarding: &ForwardingState,
+    l3_packet: &[u8],
+    addr_family: i32,
+    decision: &SessionDecision,
+    now_ns: u64,
+) {
+    // Cross-family NAT64 has its own install (which also stamps the reverse
+    // info); here we cache only an ordinary same-family address rewrite.
+    if decision.nat.nat64
+        || (decision.nat.rewrite_src.is_none() && decision.nat.rewrite_dst.is_none())
+    {
+        return;
+    }
+    if decision.resolution.disposition != ForwardingDisposition::ForwardCandidate
+        || decision.resolution.neighbor_mac.is_none()
+    {
+        return;
+    }
+    if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family) {
+        forwarding.nat64.frag_assoc.install(
+            key,
+            *decision,
+            None,
+            now_ns,
+            forwarding.nat64.build_generation,
+        );
+    }
+}
+
+/// #5689: consult the fragment association for a NON-first ORDINARY same-family
+/// NAT / NPTv6 forward fragment. On a hit whose cached decision carries a
+/// same-family address rewrite (SNAT / DNAT / static-NAT / NPTv6, NOT NAT64),
+/// return that decision so the flowless arm inherits the first fragment's
+/// permitted verdict + egress resolution and the forward-build path
+/// L3-translates the fragment (address-only: `apply_nat_ipv4` / `apply_nat_ipv6`
+/// skip the L4-checksum + port rewrite for a non-first fragment). A miss returns
+/// `None` and the caller falls through to the flowless L3 enforcement (default
+/// policy). Unlike the NAT64 forward consult (v6-only) this works for BOTH IPv4
+/// and IPv6. The reverse-direction (reply) association is a deferred increment,
+/// mirroring the NAT64 forward-only wiring.
+#[inline]
+fn nat_consult_forward_fragment_assoc(
+    forwarding: &ForwardingState,
+    l3_packet: &[u8],
+    addr_family: i32,
+    now_ns: u64,
+) -> Option<SessionDecision> {
+    let key = crate::nat64::nat64_nonfirst_fragment_key(l3_packet, addr_family)?;
+    let (decision, _reverse) =
+        forwarding
+            .nat64
+            .frag_assoc
+            .lookup(&key, now_ns, forwarding.nat64.build_generation)?;
+    // Only an ordinary same-family NAT / NPT rewrite routes here; a NAT64
+    // (cross-family) association is handled by `nat64_consult_forward_fragment_assoc`.
+    if decision.nat.nat64
+        || (decision.nat.rewrite_src.is_none() && decision.nat.rewrite_dst.is_none())
+    {
+        return None;
+    }
+    Some(decision)
+}
+
 #[inline]
 fn policy_packet_icmp(packet_frame: &[u8], meta: UserspaceDpMeta) -> Option<(u8, u8)> {
     if !matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
@@ -3171,6 +3254,29 @@ pub(super) fn poll_binding_process_descriptor(
                                         if let Some(c) = source_nat_counter.as_ref() {
                                             c.add(nat_hit_len);
                                         }
+                                        // #5689: install the ordinary same-family
+                                        // NAT / NPTv6 fragment association for a
+                                        // FIRST fragment of this now-committed
+                                        // flow, so its non-first fragments inherit
+                                        // this translation on the flowless arm
+                                        // (address-only L3 rewrite) instead of
+                                        // being forwarded UNTRANSLATED. No-op
+                                        // unless this packet is a first fragment
+                                        // (offset 0, MF=1) carrying a same-family
+                                        // rewrite; the cross-family NAT64 path
+                                        // installs its own association (with
+                                        // reverse info) earlier on the cold path.
+                                        if let Some(l3_packet) =
+                                            packet_frame.get(meta.l3_offset as usize..)
+                                        {
+                                            nat_install_forward_fragment_assoc(
+                                                worker_ctx.forwarding,
+                                                l3_packet,
+                                                meta.addr_family as i32,
+                                                &decision,
+                                                now_ns,
+                                            );
+                                        }
                                         let forward_entry = SyncedSessionEntry {
                                             key: flow.forward_key.clone(),
                                             decision,
@@ -3640,6 +3746,22 @@ pub(super) fn poll_binding_process_descriptor(
                             meta.addr_family as i32,
                             now_ns,
                         )
+                        // #5689: fall back to the ORDINARY same-family NAT /
+                        // NPTv6 fragment association so a non-first fragment of
+                        // a SNAT/DNAT/static-NAT/NPTv6 flow inherits its
+                        // translation (address-only L3 rewrite) instead of being
+                        // forwarded UNTRANSLATED (the #5689 leak). NAT64
+                        // (cross-family) is tried first; a given datagram
+                        // installs exactly one association, so at most one
+                        // consult returns a hit.
+                        .or_else(|| {
+                            nat_consult_forward_fragment_assoc(
+                                worker_ctx.forwarding,
+                                l3,
+                                meta.addr_family as i32,
+                                now_ns,
+                            )
+                        })
                     })
                 {
                     hit
