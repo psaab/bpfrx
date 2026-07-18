@@ -921,3 +921,152 @@ fn txn_policy_denied_missing_neighbor_skips_neg_cache_fast_fail() {
     );
 }
 
+
+// =====================================================================
+// #5174: NAT64 MissingNeighbor cold-path fail-closed. NAT64 classification +
+// source allocation are gated inside the ForwardCandidate session-miss branch,
+// so a NAT64 flow whose extracted-IPv4 next-hop is UNRESOLVED reaches the
+// MissingNeighbor arm with a non-NAT64 `decision.nat` — the arm previously
+// evaluated policy on the SYNTHETIC IPv6 dst and seeded/buffered an untranslated
+// forward (an HA-synced broken session that replays the IPv6 frame to the IPv4
+// gateway). The bounded fix: re-classify NAT64 in the arm (policy on the
+// extracted V4 dst), and for a permitted NAT64 flow fire the neighbor probe then
+// DROP (no seed, no untranslated buffer) — the flow recovers via ForwardCandidate
+// once the neighbor resolves. Full buffer-and-translate parity is a follow-up.
+// =====================================================================
+
+fn nat64_v6_syn_meta(frame_len: usize) -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 24,
+        l3_offset: 14,
+        l4_offset: 54,
+        payload_offset: 74,
+        pkt_len: (frame_len - 14) as u16,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+/// #5174 FAIL-ON-REVERT: a PERMITTED NAT64 flow whose extracted-IPv4 next-hop is
+/// UNRESOLVED must be handled fail-closed — (a) policy is evaluated on the
+/// extracted IPv4 dst (8.8.8.8), NOT the synthetic IPv6 dst (64:ff9b::808:808),
+/// and (b) NO MissingNeighborSeed is installed and NO untranslated frame is
+/// buffered (the arm probes then drops). The permit rule's destination is the
+/// IPv4 host `8.8.8.8/32` under a default-deny, so the flow is permitted ONLY if
+/// policy matched the extracted IPv4 dst (proves (a)). Reverting the fix:
+///   - drop the policy-tuple fix → policy denies on the synthetic IPv6 →
+///     `nat64_missing_neigh_drop == 0` → RED;
+///   - drop the fail-closed divert → the permitted flow seeds + buffers the
+///     untranslated frame → `sessions.len() >= 1` / `pending_neigh` non-empty /
+///     counter 0 → RED.
+#[test]
+fn nat64_missing_neighbor_fail_closed_drop_5174() {
+    let mut snapshot = nat64_snapshot(lan_to_wan_permit("8.8.8.8/32", "permit-nat64-v4"));
+    // The extracted IPv4 dst 8.8.8.8 routes via the default gw 172.16.80.1;
+    // clear neighbors so that gateway is unresolved -> MissingNeighbor.
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst (extracts 8.8.8.8)");
+    let frame = build_txn_tcp_syn_frame_v6(src, dst, 12345, 443);
+    let meta = nat64_v6_syn_meta(frame.len());
+    let (_batch, dbg) =
+        txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    assert_eq!(
+        dbg.nat64_missing_neigh_drop, 1,
+        "a permitted NAT64 flow with an unresolved extracted-IPv4 next-hop must \
+         fail-closed drop (policy matched the V4 dst AND the arm recycled after the probe)"
+    );
+    assert_eq!(
+        sessions.len(),
+        0,
+        "NAT64 MissingNeighbor must NOT seed a (non-NAT64) MissingNeighborSeed session"
+    );
+    assert!(
+        binding.pending_neigh.is_empty(),
+        "NAT64 MissingNeighbor must NOT buffer the untranslated IPv6 frame for in-place replay"
+    );
+}
+
+/// #5174 control: a PERMITTED NON-NAT64 flow (plain IPv4) whose next-hop is
+/// unresolved is UNCHANGED — it still seeds/buffers the normal MissingNeighbor
+/// cold path (the #5174 divert fires ONLY for a NAT64 flow). Counter stays 0.
+#[test]
+fn non_nat64_missing_neighbor_still_buffers_5174() {
+    let mut snapshot = nat64_snapshot(lan_to_wan_permit("9.9.9.9/32", "permit-v4"));
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(9, 9, 9, 9),
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch, dbg) =
+        txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    assert_eq!(
+        dbg.nat64_missing_neigh_drop, 0,
+        "the NAT64 fail-closed divert must NOT fire for a non-NAT64 flow"
+    );
+    assert!(
+        sessions.len() >= 1 || !binding.pending_neigh.is_empty(),
+        "a permitted non-NAT64 MissingNeighbor flow must still seed/buffer (unregressed cold path)"
+    );
+}
+
+/// #5174 FAIL-ON-REVERT (Harm A — policy tuple): a NAT64 flow to the extracted
+/// IPv4 dst 8.8.8.8 under a permit rule for a DIFFERENT v4 host (9.9.9.9) must be
+/// DENIED — policy is evaluated on the correct extracted V4 dst (8.8.8.8 ∉
+/// 9.9.9.9/32 → default-deny), so it exits via the normal PolicyDenied path, NOT
+/// the NAT64 fail-closed divert. Reverting the policy-tuple fix evaluates policy
+/// on the SYNTHETIC IPv6 dst (64:ff9b::808:808): a v4-destination rule matches a
+/// v6 destination as match-any (the cross-family legacy convention), so the flow
+/// is WRONGLY PERMITTED → it hits the divert (`nat64_missing_neigh_drop == 1`,
+/// `policy_deny == 0`) → RED. This is the policy-divergence security bug the arm
+/// classification fixes.
+#[test]
+fn nat64_missing_neighbor_denied_no_fail_closed_drop_5174() {
+    let mut snapshot = nat64_snapshot(lan_to_wan_permit("9.9.9.9/32", "permit-other-v4"));
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst (extracts 8.8.8.8)");
+    let frame = build_txn_tcp_syn_frame_v6(src, dst, 12345, 443);
+    let meta = nat64_v6_syn_meta(frame.len());
+    let (_batch, dbg) =
+        txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
+
+    assert_eq!(
+        dbg.nat64_missing_neigh_drop, 0,
+        "a DENIED NAT64 flow must exit at the policy deny, NOT the fail-closed divert"
+    );
+    assert!(dbg.policy_deny >= 1, "the NAT64 flow to a non-permitted v4 dst must be policy-denied");
+    assert_eq!(sessions.len(), 0);
+    assert!(binding.pending_neigh.is_empty());
+}

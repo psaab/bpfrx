@@ -38,6 +38,61 @@
   measurable in a line-rate cluster smoke; the issue's suggested 2/4/8-producer
   criterion microbench is a reasonable follow-up but not a merge gate.
 
+## 2026-07-18 — #5174: NAT64 MissingNeighbor cold path fail-closed (bounded fix)
+
+- **Timestamp**: 2026-07-18 (fix/5174-nat64-missingneighbor)
+- **Scope**: SCOPED first (team-approved). The team-scoped full parity (seed a
+  NAT64 decision + replay applies NAT64 translation) BALLOONS — it needs NAT64
+  classify+alloc hoisted into the ~1000-line MissingNeighbor arm, a HA-synced
+  `MissingNeighborSeed` carrying `nat64_reverse` (BIB), a NEW cross-family replay
+  branch in neighbor_dispatch (`build_nat64_forwarded_frame`), and a
+  size-guarded `PendingNeighPacket` (`==264`) grown — 4 files + wire/HA. Filed
+  separately for /research. Shipped the BOUNDED fail-closed alternative here.
+- **Action**: NAT64 classification + source allocation are gated inside the
+  `if disposition==ForwardCandidate` + `Permit` branch of the session-miss path
+  (poll_descriptor `decision.nat = Nat64State::forward_decision`, ~:2822), so a
+  NAT64 flow whose extracted-IPv4 next-hop is UNRESOLVED reaches the
+  MissingNeighbor arm (the `else` of that `if`, arm ~:4598-5595) with
+  `decision.nat` default (rewrite_dst None, nat64 false). It evaluated policy on
+  the SYNTHETIC IPv6 dst (Harm A — policy divergence; a v4-dst rule matches the
+  synthetic v6 dst as match-any) and seeded a SNAT-only `MissingNeighborSeed`
+  (HA-synced) + buffered the IPv6 frame, which the same-family replay
+  (`rewrite_forwarded_frame_in_place`, MAC/VLAN/NAT only) TXes UNTRANSLATED to
+  the IPv4 gateway (Harm B — untranslated forward + poisoned session).
+  Bounded fix, ALL in the MissingNeighbor arm:
+  1. Re-classify NAT64 at the arm top (`classify_ipv6_dest(flow.dst_ip)` →
+     `nat64_dst_v4`); the pre-routing classify already enforced source
+     eligibility/hairpin, so a cheap dest-only lookup suffices.
+  2. Evaluate the arm's policy on the extracted V4 dst when `nat64_dst_v4` is
+     Some (the #2358 cross-family (V6 src, V4 dst) tuple) — fixes Harm A.
+  3. For a PERMITTED NAT64 flow: let the existing kernel ARP/NDP probe fire
+     (`trigger_kernel_arp_probe`), then recycle+`continue` BEFORE the seed and
+     the pending_neigh buffer — NO untranslated seed/buffer/replay, NO broken
+     HA session (fixes Harm B + the poisoning). Counted as a new debug counter
+     `DebugPollCounters.nat64_missing_neigh_drop`. The flow recovers via the
+     ForwardCandidate path once the neighbor resolves (cold-start: first
+     packet(s) drop, TCP retransmits). Non-NAT64 and NAT64-deny paths untouched.
+- **Tests (fail-on-revert, deterministic; tests_nat64_tunnel.rs)**:
+  - `nat64_missing_neighbor_fail_closed_drop_5174` (Harm B): permitted NAT64
+    flow (permit `8.8.8.8/32`, default-deny) + unresolved gw → asserts
+    `nat64_missing_neigh_drop==1`, `sessions.len()==0`, `pending_neigh` empty.
+    Neutralize the divert → seeds+buffers → RED.
+  - `nat64_missing_neighbor_denied_no_fail_closed_drop_5174` (Harm A): NAT64
+    flow to 8.8.8.8 under a `9.9.9.9/32` permit → denied on the correct V4
+    tuple. Neutralize the policy-tuple fix → the synthetic-IPv6 eval matches the
+    v4-dst rule as match-any → WRONGLY PERMITTED → RED.
+  - `non_nat64_missing_neighbor_still_buffers_5174` (control): plain v4
+    MissingNeighbor still seeds/buffers, counter 0 (unregressed).
+  - GREEN: 3 new pass; FULL `cargo test` (userspace-dp) = 3994 passed, 0 failed.
+    RED-on-revert proven for BOTH harms (divert → primary RED; policy-tuple →
+    deny-control RED). Build clean.
+- **Smoke**: a loss-cluster NAT64 smoke would be warranted-if-configured
+  (forwarding + neighbor-resolution behavior), but NAT64 may not be configured
+  on the loss cluster and the fix is fully unit-proven (real descriptor path +
+  forced MissingNeighbor). FLAGGED, not assumed.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/tests_nat64_tunnel.rs, docs/feature-coverage.md
 ## 2026-07-18 — #5168: widen WG replay window to the reference 8128-counter ring
 
 - **Timestamp**: 2026-07-18 (fix/5168-wg-replay-window)
