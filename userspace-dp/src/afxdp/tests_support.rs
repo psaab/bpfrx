@@ -801,7 +801,7 @@ pub(super) fn run_input_filter_accept_log_poll(
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
@@ -908,7 +908,7 @@ pub(super) fn record_noroute_with_dst(
     counters: &mut BatchCounters,
     dst: std::net::IpAddr,
 ) {
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let binding = BindingIdentity {
         slot: 1,
         queue_id: 0,
@@ -1089,7 +1089,7 @@ pub(super) fn txn_run_descriptor_with_deliveries(
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
@@ -1200,7 +1200,7 @@ pub(super) fn txn_run_descriptor_capturing_events(
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
@@ -1306,7 +1306,7 @@ pub(super) fn build_txn_tcp_syn_frame_v6(
 pub(super) fn tunnel_gate_test_fixture() -> (
     BindingIdentity,
     BindingLiveState,
-    Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    Arc<Mutex<ExceptionEventRing>>,
     UserspaceDpMeta,
     Vec<u8>,
 ) {
@@ -1320,7 +1320,7 @@ pub(super) fn tunnel_gate_test_fixture() -> (
         ifindex: 6,
     };
     let live = BindingLiveState::new();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,

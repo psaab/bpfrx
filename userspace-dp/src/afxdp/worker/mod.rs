@@ -1245,14 +1245,14 @@ fn apply_worker_shaped_tx_requests(
     }
 }
 
+/// #5289: push an already-built POD event onto a ring, bypassing the
+/// sampler. Used only by the rare control-thread manual-notice sites
+/// (spawn / tunnel-setup failures) which are not attacker-floodable.
 pub(crate) fn push_recent_exception(
-    recent_exceptions: &mut VecDeque<ExceptionStatus>,
-    exception: ExceptionStatus,
+    recent_exceptions: &mut ExceptionEventRing,
+    exception: ExceptionEvent,
 ) {
-    if recent_exceptions.len() >= MAX_RECENT_EXCEPTIONS {
-        recent_exceptions.pop_front();
-    }
-    recent_exceptions.push_back(exception);
+    recent_exceptions.push(exception);
 }
 
 pub(crate) fn push_recent_session_delta(

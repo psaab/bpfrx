@@ -42,7 +42,7 @@ fn enqueue_pending_forwards_mirrors_live_frame_and_records_counter() {
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
     let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
     let mut dbg = DebugPollCounters::default();
     let (left, rest) = bindings.split_at_mut(0);
@@ -125,7 +125,7 @@ fn enqueue_pending_forwards_counts_prebuilt_fabric_redirect_no_binding() {
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
     let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
     let mut dbg = DebugPollCounters::default();
     let (left, rest) = bindings.split_at_mut(0);
@@ -164,7 +164,7 @@ fn enqueue_pending_forwards_counts_prebuilt_fabric_redirect_no_binding() {
         .lock()
         .expect("exceptions")
         .iter()
-        .map(|entry| entry.reason.clone())
+        .map(|entry| entry.reason().to_string())
         .collect();
     assert_eq!(reasons, vec!["fabric_redirect_no_binding"]);
 }
@@ -246,7 +246,7 @@ fn enqueue_failure_recycles_ingress_descriptor_and_reinjects_slow_path() {
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
     let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
     let mut dbg = DebugPollCounters::default();
 
@@ -299,7 +299,7 @@ fn enqueue_failure_recycles_ingress_descriptor_and_reinjects_slow_path() {
         .lock()
         .expect("exceptions")
         .iter()
-        .map(|e| e.reason.clone())
+        .map(|e| e.reason().to_string())
         .collect();
     assert!(
         reasons.iter().any(|r| r == "forward_build_failed"),
@@ -327,7 +327,7 @@ fn oversized_forward_frame_recycles_ingress_descriptor_without_reinject() {
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
     let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
     let mut dbg = DebugPollCounters::default();
 
@@ -377,7 +377,7 @@ fn oversized_forward_frame_recycles_ingress_descriptor_without_reinject() {
         .lock()
         .expect("exceptions")
         .iter()
-        .map(|e| e.reason.clone())
+        .map(|e| e.reason().to_string())
         .collect();
     assert!(
         reasons.iter().any(|r| r == "oversized_forward_frame"),
@@ -431,7 +431,7 @@ fn enqueue_failure_conserves_free_frames_across_many_forwards() {
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
     let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
     let mut dbg = DebugPollCounters::default();
 
@@ -534,7 +534,7 @@ fn direct_tx_tuple_mismatch_recycles_frame_exactly_once() {
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
     let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
     let mut dbg = DebugPollCounters::default();
 
@@ -592,7 +592,7 @@ fn direct_tx_tuple_mismatch_recycles_frame_exactly_once() {
             .lock()
             .expect("exceptions")
             .iter()
-            .map(|e| e.reason.clone())
+            .map(|e| e.reason().to_string())
             .collect();
         assert!(
             reasons

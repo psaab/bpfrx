@@ -120,7 +120,7 @@ fn run_ptb_dispatch_with_forwarding(
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
     let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
     let mut dbg = DebugPollCounters::default();
     let mut counters = BatchCounters::default();
@@ -152,7 +152,7 @@ fn run_ptb_dispatch_with_forwarding(
         .lock()
         .expect("exceptions")
         .iter()
-        .map(|e| e.reason.clone())
+        .map(|e| e.reason().to_string())
         .collect();
     (bindings, dbg, counters, reasons)
 }

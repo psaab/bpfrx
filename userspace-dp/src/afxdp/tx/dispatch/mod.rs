@@ -168,7 +168,7 @@ fn compute_forwarded_egress_ptb(
     is_nat64: bool,
     uses_native_tunnel: bool,
     ingress_ident: &BindingIdentity,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
 ) -> (Option<Vec<u8>>, bool) {
     let mut ptb_reply: Option<Vec<u8>> = None;
     let mut mtu_signalled = false;
@@ -334,7 +334,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
     ingress_live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     dbg: &mut DebugPollCounters,
     counters: &mut BatchCounters,
     worker_id: u32,
@@ -632,14 +632,13 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                     request.meta.protocol,
                                 ),
                             ) {
-                                record_exception(
+                                record_exception_owned(
                                     recent_exceptions,
                                     ingress_ident,
                                     &reason,
                                     frame.len() as u32,
                                     Some(request.meta.into()),
                                     None,
-                                    forwarding,
                                 );
                                 build_failed = true;
                                 break;
@@ -833,15 +832,14 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                             request.meta.protocol,
                                         ),
                                     ) {
-                                        record_exception(
-                                            recent_exceptions,
-                                            ingress_ident,
-                                            &reason,
-                                            frame.len() as u32,
-                                            Some(request.meta.into()),
-                                            None,
-                                            forwarding,
-                                        );
+                                        record_exception_owned(
+                                    recent_exceptions,
+                                    ingress_ident,
+                                    &reason,
+                                    frame.len() as u32,
+                                    Some(request.meta.into()),
+                                    None,
+                                );
                                         // Don't continue — the frame was built successfully,
                                         // forward it anyway. Mismatch is diagnostic only.
                                     }
@@ -1046,15 +1044,14 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                     // double-free on the debug-log build). The
                                     // `record_exception` below still surfaces
                                     // the mismatch to operators.
-                                    record_exception(
-                                        recent_exceptions,
-                                        ingress_ident,
-                                        &reason,
-                                        written as u32,
-                                        Some(request.meta.into()),
-                                        None,
-                                        forwarding,
-                                    );
+                                    record_exception_owned(
+                                    recent_exceptions,
+                                    ingress_ident,
+                                    &reason,
+                                    written as u32,
+                                    Some(request.meta.into()),
+                                    None,
+                                );
                                     build_failed = true;
                                 }
                             }
@@ -1171,15 +1168,14 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                             request.meta.protocol,
                                         ),
                                     ) {
-                                        record_exception(
-                                            recent_exceptions,
-                                            ingress_ident,
-                                            &reason,
-                                            frame.len() as u32,
-                                            Some(request.meta.into()),
-                                            None,
-                                            forwarding,
-                                        );
+                                        record_exception_owned(
+                                    recent_exceptions,
+                                    ingress_ident,
+                                    &reason,
+                                    frame.len() as u32,
+                                    Some(request.meta.into()),
+                                    None,
+                                );
                                         // Don't continue — the frame was built successfully,
                                         // forward it anyway. Mismatch is diagnostic only.
                                     }
@@ -1443,7 +1439,7 @@ fn count_forwarded_tcp_segmentation_miss_if_needed(
 #[inline(always)]
 fn record_forwarded_tcp_segmentation_miss(
     cap: &std::cell::Cell<u32>,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     ingress_ident: &BindingIdentity,
     source_frame: &[u8],
     request: &PendingForwardRequest,

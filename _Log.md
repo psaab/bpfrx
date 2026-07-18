@@ -52364,6 +52364,44 @@ top.
 - **File(s)**: userspace-dp/src/nat/source.rs,
   userspace-dp/src/nat/tests_pool.rs, _Log.md
 
+## 2026-07-18 — #5289 per-worker POD exception ring (drop-disposition DoS)
+
+- **Timestamp**: 2026-07-18
+- **Action**: Replace the process-global `recent_exceptions`
+  (`Arc<Mutex<VecDeque<ExceptionStatus>>>`) and `last_resolution`
+  (`Arc<Mutex<Option<PacketResolution>>>`) mutexes — locked + heap-formatted
+  on EVERY terminal packet — with PER-WORKER POD rings. `record_exception`
+  now writes a compact `ExceptionEvent` (static `&str` reason, `Arc<str>`
+  interface clone, `Copy` `IpAddr`s, numeric zone ids, monotonic `Instant`)
+  under a per-worker mutex with a per-(reason,5-tuple) sampler; NO `String`
+  alloc, NO `Utc::now` on the packet path. The control/status thread
+  (`Coordinator::recent_exceptions` / `last_resolution`) drains all
+  per-worker rings + the control ring and formats each POD event into the
+  unchanged `ExceptionStatus` / `PacketResolution` via a single captured
+  `MonoWallAnchor` (monotonic→wall). Batched `BindingLiveState` counters
+  remain the lossless signal; externally-visible status shape unchanged (no
+  wire change). Cold control-thread notices (spawn/tunnel-setup failures)
+  keep dynamic reasons via `control_notice_event` / `reason_owned`.
+- **File(s)**: userspace-dp/src/afxdp/disposition.rs (new
+  ExceptionEvent/ResolutionEvent/ExceptionEventRing/MonoWallAnchor + record
+  path), coordinator/mod.rs (per-worker registries + clears),
+  coordinator/reconcile/bringup.rs (per-worker Arc spawn/teardown),
+  coordinator/status.rs (drain+format accessors), coordinator/README.md,
+  tx/dispatch/{mod,slow_path}.rs (record_exception_owned for dynamic
+  reasons), tunnel.rs, coordinator/tunnel_supervision.rs, worker/*, mod.rs,
+  ~40 signature type-swaps, test constructions + assertions, _Log.md.
+- **Validation**: `cargo build` clean (no errors); `cargo test --release`
+  3952 passed / 2 failed — both failures (`wire_invariant_default_specimens`,
+  event_stream `stalled_consumer...end_to_end`) confirmed PRE-EXISTING on a
+  pristine origin/master worktree (I touched neither module). New
+  fail-on-revert tests in disposition.rs::tests_5289_exception_ring:
+  `record_exception_writes_pod_event_and_samples_flood` (POD fields + sampler
+  suppression), `to_status_reconstructs_human_readable_exception` (round-trip
+  vs old formatted output), `source_nat_exception_round_trips_rule_and_pool`
+  — all green. `segmentation_miss_recorder_is_rate_capped` updated for the
+  sampler (identical flood collapses to one ring entry; #1282 cap counter
+  still saturates at 20).
+
 ## 2026-07-18 — #5611: lock the NPTv6 wildcard-vs-concrete overlap-reject edge
 - **Timestamp**: 2026-07-18
 - **Action**: Test-coverage lock-in follow-up to #5176 (PR #5610). The NPTv6
