@@ -73,13 +73,32 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v4(
         frame[embedded_ip_start + 19],
     );
     let l4_off = embedded_ip_start + ihl;
+    // #5568: bound the quoted-inner L4 read by the QUOTED IPv4 datagram's
+    // declared total-length, not merely the outer backing frame. An ICMP error
+    // whose outer frame carries slack/padding beyond the quoted datagram's
+    // declared length would otherwise have those bytes read as inner ports — a
+    // manufactured embedded-session tuple that could touch an existing session.
+    // The quoted datagram ends at `embedded_ip_start + total_len`; the port read
+    // must lie within it. A quote whose declared length legitimately EXCEEDS the
+    // available bytes (an RFC-792 minimum, intentionally truncated quote) is NOT
+    // rejected: `total_len` is large, so the window check passes and `frame.get`
+    // then bounds the read to what is actually present.
+    let inner_total =
+        u16::from_be_bytes([frame[embedded_ip_start + 2], frame[embedded_ip_start + 3]]) as usize;
+    let inner_declared_end = embedded_ip_start.saturating_add(inner_total);
     let (src_port, dst_port) = if matches!(proto, PROTO_TCP | PROTO_UDP) {
+        if l4_off.saturating_add(4) > inner_declared_end {
+            return None;
+        }
         let bytes = frame.get(l4_off..l4_off + 4)?;
         (
             u16::from_be_bytes([bytes[0], bytes[1]]),
             u16::from_be_bytes([bytes[2], bytes[3]]),
         )
     } else if matches!(proto, PROTO_ICMP) {
+        if l4_off.saturating_add(6) > inner_declared_end {
+            return None;
+        }
         let bytes = frame.get(l4_off + 4..l4_off + 6)?;
         (u16::from_be_bytes([bytes[0], bytes[1]]), 0)
     } else {
@@ -184,7 +203,21 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v6(
     if frame.len() < embedded_ip_start + 48 {
         return None;
     }
-    let (rel_l4, proto) = parse_embedded_v6_l4(frame.get(embedded_ip_start..)?)?;
+    // #5568: bound BOTH the quoted-inner extension-header walk AND the L4 read by
+    // the QUOTED IPv6 datagram's declared length (`embedded_ip_start + 40 +
+    // payload_len`), clamped to the available quote bytes — not the raw outer
+    // frame. Otherwise outer-frame slack/padding beyond the quoted datagram could
+    // be walked as ext headers and read as inner ports (a manufactured
+    // embedded-session tuple). A truncated RFC-minimum quote whose declared
+    // `payload_len` exceeds the available bytes is NOT rejected: the clamp keeps
+    // the slice at `frame.len()` there, identical to the pre-#5568 read.
+    let inner_payload_len =
+        u16::from_be_bytes([frame[embedded_ip_start + 4], frame[embedded_ip_start + 5]]) as usize;
+    let inner_declared_end = embedded_ip_start
+        .saturating_add(40)
+        .saturating_add(inner_payload_len)
+        .min(frame.len());
+    let (rel_l4, proto) = parse_embedded_v6_l4(frame.get(embedded_ip_start..inner_declared_end)?)?;
     let src_wire = Ipv6Addr::from(
         <[u8; 16]>::try_from(&frame[embedded_ip_start + 8..embedded_ip_start + 24]).ok()?,
     );
@@ -193,12 +226,18 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v6(
     ));
     let l4_off = embedded_ip_start + rel_l4;
     let (src_port, dst_port) = if matches!(proto, PROTO_TCP | PROTO_UDP) {
+        if l4_off.saturating_add(4) > inner_declared_end {
+            return None;
+        }
         let bytes = frame.get(l4_off..l4_off + 4)?;
         (
             u16::from_be_bytes([bytes[0], bytes[1]]),
             u16::from_be_bytes([bytes[2], bytes[3]]),
         )
     } else if matches!(proto, PROTO_ICMPV6) {
+        if l4_off.saturating_add(6) > inner_declared_end {
+            return None;
+        }
         let bytes = frame.get(l4_off + 4..l4_off + 6)?;
         (u16::from_be_bytes([bytes[0], bytes[1]]), 0)
     } else {
@@ -428,6 +467,46 @@ mod embedded_v6_parse_tests {
             parse_embedded_v6_l4(&embedded_v6(&[hbh], esp)).expect("ESP after one EH resolves");
         assert_eq!((rel, proto), (48, esp));
     }
+
+    // #5568 IPv6 sibling (embedded-session tuple from slack): a quoted inner
+    // IPv6 datagram declaring payload_len 0 (declared datagram = 40 bytes, NO L4)
+    // whose next-header is TCP. Outer-frame slack past byte 40 forges ports. The
+    // parser MUST bound BOTH the ext-header walk AND the L4 read by the quoted
+    // datagram's declared length and refuse. Reverting to the outer-frame bound
+    // returns Some(_) with the forged ports → RED.
+    #[test]
+    fn embedded_v6_ports_from_slack_beyond_declared_end_not_manufactured() {
+        let mut inner = vec![0u8; 40];
+        inner[0] = 0x60;
+        inner[6] = PROTO_TCP; // next header = TCP directly
+        // payload_len (bytes 4..6) stays 0 → declared datagram end = 40.
+        inner[8..24].copy_from_slice(&[0x20; 16]);
+        inner[24..40].copy_from_slice(&[0x30; 16]);
+        // Forged ports in the outer slack beyond the declared datagram.
+        inner.extend_from_slice(&[0x30, 0x39, 0x14, 0x51, 0, 0, 0, 0]);
+        assert!(
+            parse_embedded_v6(&inner, 0).is_none(),
+            "ports in slack beyond the quoted IPv6 payload_len (0) must not be read"
+        );
+    }
+
+    // #5568 anti-over-gate (IPv6): a truncated RFC-minimum quote whose declared
+    // payload_len (1280) legitimately EXCEEDS the quoted bytes must STILL parse
+    // its quoted ports — the declared-length bound clamps to the available quote,
+    // it does not reject a legitimately-truncated quote.
+    #[test]
+    fn embedded_v6_truncated_quote_still_parses() {
+        let mut inner = vec![0u8; 40];
+        inner[0] = 0x60;
+        inner[6] = PROTO_TCP;
+        inner[4..6].copy_from_slice(&1280u16.to_be_bytes()); // original datagram was large
+        inner[8..24].copy_from_slice(&[0x20; 16]);
+        inner[24..40].copy_from_slice(&[0x30; 16]);
+        inner.extend_from_slice(&[0x11, 0x11, 0x22, 0x22, 0, 0, 0, 1]); // 8 quoted L4 bytes
+        let hdr =
+            parse_embedded_v6(&inner, 0).expect("truncated RFC-minimum v6 quote must still parse");
+        assert_eq!((hdr.src_port, hdr.dst_port), (0x1111, 0x2222));
+    }
 }
 
 #[cfg(test)]
@@ -473,5 +552,52 @@ mod embedded_v4_fragment_tests {
                 "quoted non-first fragment (frag_off {frag_off:#06x}) must not parse"
             );
         }
+    }
+
+    // #5568 (security — embedded-session tuple from slack): an ICMP error quotes
+    // an inner IPv4 datagram declaring total-length 20 (a bare IP header, NO L4).
+    // Outer-frame slack/padding beyond the quoted datagram forges TCP ports of an
+    // existing session. The parser MUST bound the L4 read by the quoted IP's
+    // declared total-length and refuse — else the forged ports drive a bogus
+    // embedded-session/NAT match. Reverting to the outer-frame-only bound returns
+    // Some(_) with the forged ports → RED (embedded axis, target-count 1).
+    #[test]
+    fn embedded_v4_ports_from_slack_beyond_declared_end_not_manufactured() {
+        let mut inner = vec![0u8; 20];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&20u16.to_be_bytes()); // total-length 20 — no L4
+        inner[9] = PROTO_TCP;
+        inner[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        inner[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        // Outer slack past the declared inner datagram: forged src/dst ports
+        // (12345 / 5201) that would look like an existing session tuple.
+        inner.extend_from_slice(&[0x30, 0x39, 0x14, 0x51, 0, 0, 0, 0]);
+        assert!(
+            parse_embedded_v4(&inner, 0).is_none(),
+            "ports lie in slack beyond the quoted IP's declared total-length (20) — \
+             the parser must not manufacture an embedded-session tuple from them"
+        );
+    }
+
+    // #5568 anti-over-gate: a legitimate ICMP error quotes only the inner IP
+    // header + first 8 bytes (RFC 792 minimum). The inner ORIGINAL total-length
+    // (1500) legitimately EXCEEDS the quoted bytes — the parser must still read
+    // the 8 quoted L4 bytes (ports), NOT reject the quote.
+    #[test]
+    fn embedded_v4_truncated_rfc_minimum_quote_still_parses() {
+        let mut inner = vec![0u8; 20];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&1500u16.to_be_bytes()); // original datagram was large
+        inner[9] = PROTO_TCP;
+        inner[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        inner[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        inner.extend_from_slice(&[0x11, 0x11, 0x22, 0x22, 0, 0, 0, 1]); // the 8 quoted bytes
+        let hdr =
+            parse_embedded_v4(&inner, 0).expect("truncated RFC-minimum quote must still parse");
+        assert_eq!(
+            (hdr.src_port, hdr.dst_port),
+            (0x1111, 0x2222),
+            "the quoted ports are within the (large) declared length → read them"
+        );
     }
 }

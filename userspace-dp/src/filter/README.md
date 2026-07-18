@@ -484,6 +484,27 @@ the live frame.)
 `(0, 0, 0)` AND drop `l4_present`, failing the icmp-type/code terms closed rather
 than spuriously matching `icmp-type 0` / `icmp-code 0`.
 
+**#5568 (SCALAR declared-length bound).** #2449 keyed the ICMP presence test on
+the physical `frame.len()`; #5568 keys EVERY scalar L4/fragment input on the
+IP-DECLARED datagram end (`ip_declared_end` — the same SSOT that bounds the
+#5150 flex slices), computed FIRST in both frame builders. The shim stamps
+`l3_offset`/`l4_offset` from the raw frame, so without this, attacker-controlled
+Ethernet padding beyond the declared IP length manufactures a scalar match out of
+slack. Concretely: (a) the fragment walkers (`is_any_fragment` /
+`is_non_first_fragment`) see only `frame.get(l3..declared_end)`, so an IPv6
+fragment/extension header lurking in padding beyond `payload_len` — or an IPv4
+`frag_off` in slack — cannot manufacture fragment state; (b) ICMP type/code
+presence requires `l4_offset + 2 <= declared_end`; (c) TCP flags require
+`l4_offset + TCP_FLAGS_DECLARED_MIN (14) <= declared_end` (the flags byte at TCP
+offset 13) — a short/padded TCP frame whose declared length stops before the
+flags byte drops `l4_present`, failing tcp-flags terms closed. On the common
+no-slack path `declared_end == frame.len()`, so classification is byte-identical.
+The sibling `parse_embedded_v4`/`parse_embedded_v6` quote parsers
+(`icmp_embed/parse.rs`) apply the same bound to the QUOTED inner datagram's
+declared length (clamped to the available quote — a legitimately-truncated
+RFC-792 minimum quote whose original length exceeds the quoted bytes is NOT
+rejected), so outer-frame padding cannot manufacture an embedded-session tuple.
+
 **Meta-only builder (`term_match_extra_from_meta`, #3008 — meta sibling of
 #2449).** A few cold TX-selection callers (re-derived locally-generated replies,
 ARP/NDP-deferred forwards, control-plane injects;
