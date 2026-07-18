@@ -606,64 +606,15 @@ func validateSourceNATPoolStrict(cfg *Config) error {
 	return nil
 }
 
-// validateSourceNATPersistentNoTranslationStrict (#5819) hard-rejects a
-// source-NAT pool that configures BOTH `persistent-nat` and `port
-// no-translation`. The combination is silently WRONG: `port no-translation`
-// forces the userspace dataplane onto the address-only path
-// (userspace-dp/src/nat/source.rs), which selects a pool address by round-robin
-// / global-hash and records the flow with NO persistent lease. It never enters
-// the `allocate_translation(... persistent_nat ...)` machinery, so no
-// `persistent_by_source` lease, no inactivity timer, and no permit-scope reuse
-// exist. When global `source address-persistent` is off, two flows that the
-// configured persistent binding should pin to one public address can leave
-// through DIFFERENT public addresses, and status reports no persistent lease. A
-// strict-valid config that CLAIMS persistence silently degrades to ordinary
-// per-flow address-only NAT.
-//
-// Until address-only persistent leases are implemented (the full parity path in
-// #5819, deferred to a follow-up), the only correct disposition is to reject the
-// unsupported combination LOUDLY at commit rather than accept a config whose
-// persistence contract cannot be honored. Strict on commit / commit-check
-// (hard-reject so the unsupported combo is operator-visible); the caller
-// downgrades to a warning on the tolerant load / peer-sync path
-// (opts.lenientDestNATAddresses — #1960 no-brick), where the SNAT snapshot
-// builder independently FAILS CLOSED (marks the pool unusable with reason
-// "persistent_nat_no_translation") so a leniently-loaded config installs nothing
-// rather than shipping the silent address-only degradation. Mirrors the #5859
-// static-nat `then inet` fail-closed pattern. Pools are walked in sorted name
-// order for a deterministic first-reported offender.
-func validateSourceNATPersistentNoTranslationStrict(cfg *Config) error {
-	if cfg == nil {
-		return nil
-	}
-	pools := cfg.Security.NAT.SourcePools
-	names := make([]string, 0, len(pools))
-	for name := range pools {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		pool := pools[name]
-		if pool == nil {
-			continue
-		}
-		if pool.PersistentNAT != nil && pool.PortNoTranslation {
-			return fmt.Errorf(
-				"source-nat pool %q: `persistent-nat` combined with `port "+
-					"no-translation` is not supported. The no-translation (address-"+
-					"only) path bypasses the persistent-lease machinery, so no "+
-					"persistent binding is recorded: with global `source address-"+
-					"persistent` off each new flow round-robins to a possibly "+
-					"different public address and status shows no lease — the pool "+
-					"silently behaves as ordinary per-flow address-only NAT despite "+
-					"claiming persistence. Remove either `persistent-nat` or `port "+
-					"no-translation` from the pool until address-only persistent "+
-					"leases are implemented (#5819)",
-				name)
-		}
-	}
-	return nil
-}
+// #6041: validateSourceNATPersistentNoTranslationStrict (the #5819 fail-closed
+// reject of `persistent-nat` + `port no-translation`) was REMOVED here. The
+// userspace dataplane now implements an address-only persistent lease
+// (reserve_address_only_persistent, userspace-dp/src/nat/allocator.rs) that
+// pins a public pool ADDRESS across the configured permit scope without
+// consuming a translated pool port, so the combination is supported and no
+// longer silently degrades. The paired snapshot fail-closed marker
+// ("persistent_nat_no_translation" in pkg/dataplane/userspace/nat_source.go)
+// was removed with it.
 
 // validateNATPoolReferencesStrict (#5626) hard-rejects a source- or
 // destination-NAT rule whose `then ... pool <name>` names a pool that is NOT

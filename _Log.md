@@ -1,3 +1,46 @@
+## 2026-07-18 — #6041: address-only (`port no-translation`) persistent-NAT leases (parity follow-up to #5819)
+
+- **Timestamp**: 2026-07-18 (fix/6041-address-only-persist-nat)
+- **Action**: Implemented address-only persistent-NAT leases so
+  `persistent-nat` + `port no-translation` on the same source-NAT pool is now
+  SUPPORTED (was REJECTED fail-closed under #5819). New allocator method
+  `reserve_address_only_persistent` pins a public pool ADDRESS across the
+  configured `PersistentSourceKey` permit scope WITHOUT consuming a translated
+  pool port: it reuses a live/valid lease's pinned address (refcount up, expiry
+  refresh, activation-rollback re-arm), tears down an expired-idle lease (no
+  port to free), or picks a fresh address via `address_index`. Added an
+  `address_only: bool` field to `PersistentLease`; gated all three lease
+  port-free teardown sites (`reuse_existing_lease_locked` expired,
+  `rollback_flow` remove-lease, `reclaim_expired_lease_locked` GC) on
+  `!address_only`. Restructured `release_flow`/`rollback_flow` so an
+  address-only PERSISTENT flow (persistent_key=Some AND address_only=true)
+  clears its #5269 reverse-identity token AND decrements the lease refcount.
+  Wired the two round-robin address-only branches in `source.rs` (v4 + v6) to
+  route `rule.persistent_nat` through the new lease method. Removed the Go
+  fail-closed reject: `validateSourceNATPersistentNoTranslationStrict` (both
+  dispatch sites + the function) and the `persistent_nat_no_translation`
+  snapshot marker. HA behavior is consistent with ordinary persistent leases
+  (in-memory, not synced; address-only synced sessions carry no translated
+  port so `reserve_synced_source_nat_allocation` reserves nothing — same as the
+  #5269 non-persistent path; #1449 gate still refuses HA persistent pools).
+- **Tests**: 6 fail-on-revert Rust tests in `tests_pool.rs`
+  (`notrans_persistent_*_6041`): two-flow one-address reuse (v4+v6),
+  refcount release + inactivity-expiry reclamation, #5269 collision guard,
+  idempotent re-entry, permit-scope keying (any-remote-host shares one lease /
+  target-host-port keys distinct). Flipped the two Go 5819 test files to assert
+  the combo is now accepted + usable. RED-on-revert proven: neutralizing the
+  lease routing (persistent → round-robin `reserve_address_only`) turns all 6
+  RED. `cargo test nat::` = 259 passed; `go test ./pkg/config/
+  ./pkg/dataplane/userspace/` both ok.
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs, pkg/config/compiler_uniformgates.go,
+  pkg/config/compiler_peer_effective_snat.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_persistent_nat_notranslation_5819_test.go,
+  pkg/dataplane/userspace/nat_source.go,
+  pkg/dataplane/userspace/nat_source_persistent_notranslation_5819_test.go,
+  docs/userspace-dataplane-gaps.md
+
 ## 2026-07-18 — #6103: deterministic-fix event_stream stalled-consumer backpressure test (host socket-buffer dependency)
 
 - **Timestamp**: 2026-07-18 (fix/6103-eventstream)
