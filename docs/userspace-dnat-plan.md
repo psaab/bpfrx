@@ -894,6 +894,30 @@ match stay DISTINCT and the earlier-inserted (config-order-first) entry wins the
 destination is NOT registered as a firewall-local address (no proxy-ARP/ND for a
 real routed host, only for a translated VIP).
 
+**Shadowed-VIP withdrawal (#6025).** Excluding the `off` entry *itself* from
+`destination_ips_scoped` is not sufficient. The common operator idiom is a
+specific `/32 destination-nat off` inside a BROADER translate rule (a pool DNAT
+over a subnet, one host exempted). The exempt `/32` correctly WINS the DNAT match
+— an exact-host entry is probed before any prefix in `lookup_with_counter_scoped`
+— so it is never translated. But the broader translate PREFIX registers its VIP
+via the #3164 bounded host-by-host expansion, and that expansion re-registered
+the exempt `/32` as a firewall-local address even though the `off` entry was
+skipped. Result: the exempt host wins the match (no translation) yet its inbound
+traffic was consumed via LocalDelivery instead of being routed to the real host —
+a silent blackhole of exactly the host the operator meant to pass through.
+`destination_ips_scoped` now withdraws a prefix-expanded (or prefix-base) address
+when a superset exact-host `off` exemption shadows it: `off_scope_superset`
+requires the exemption to catch every packet the translate slot would (protocol,
+port, zone, interface, routing-instance are wildcard-or-equal; source and the
+#3437/#3449 L4-application axes must be unconstrained). Because the exact-host
+exemption is probed before the prefix, a superset match GUARANTEES the exemption
+wins for that host, so withdrawing it can never blackhole genuinely-translated
+traffic; a partially-scoped exemption (a narrower source/port/proto than the
+translate) never suppresses, so a non-exempt host under the same translate prefix
+stays firewall-local and its DNAT delivery is preserved. The withdrawal is
+per-translate-slot, so a host exempt for one slot but translated by another slot
+is still registered by the other slot.
+
 **Wire.** One additive, skew-safe field: `DestinationNATRuleSnapshot.off`
 (`json:"off,omitempty"` / `#[serde(default)]`). An older helper that ignores it
 drops the pool-less `off` entry (reverting to the pre-#3844 fail-open, never a
