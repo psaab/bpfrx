@@ -1,3 +1,38 @@
+## 2026-07-17 — #6082: bpfSessionValue implicit padding breaks cilium/ebpf batch marshal
+
+- **Timestamp**: 2026-07-17 (fix/6082-session-value-marshal-size)
+- **Action**: The 60s HA session-sync sweep failed EVERY iteration on the loss
+  cluster (both nodes) with `batch lookup sessions: map batch lookup:
+  unmarshaling []dataplane.bpfSessionValue doesn't consume all data`. Root
+  cause (confirmed empirically): cilium/ebpf v0.20 `internal/sysenc.Unmarshal`
+  takes its zero-copy fast path ONLY when `binary.Size(T) == unsafe.Sizeof(T)`
+  (marshal.go:143 + layout.go). `bpfSessionValue`/`V6` carried 7 bytes of
+  IMPLICIT head alignment padding (gaps after State@1, after IsReverse@6-7,
+  before SessionID@12-15) introduced when #5460 widened `flags` __u8->__u16.
+  `unsafe.Sizeof` = 136/184 but `binary.Size` = 129/177, so sysenc fell back to
+  `binary.Decode`, which consumes only 129/177 of each 136/184-byte kernel
+  record → the whole batch errors. Every map read (BatchLookup, Iterate, single
+  Lookup) was affected; the sweep is just where it logged.
+- **Fix**: made all three head-padding gaps EXPLICIT via named `_ [N]byte`
+  fields in `bpfSessionValue` and `bpfSessionValueV6`, mirroring the C
+  `struct session_value{,_v6}` byte layout. binary.Size now == unsafe.Sizeof ==
+  136/184, so the zero-copy path stays engaged. No real field type/order/offset
+  changed; on-map ABI bytes byte-identical (unsafe.Sizeof + every offset
+  unchanged). Blank `_` fields are counted by encoding/binary but do NOT count
+  as "unexported" for the fast path (layout.go:28).
+- **Tests**: added `TestBPFSessionValueMarshalsAtConntrackABISize` (asserts
+  binary.Size == unsafe.Sizeof == 136/184 for both structs — the fail-on-revert
+  guard #6082 needed; verified RED with pads removed while the old
+  unsafe.Sizeof-only ABI test stayed GREEN, proving the old test could not catch
+  it) and `TestBatchLookupSessionsRoundTrip` (real kernel v4/v6 maps: install
+  via Set/toBPF, read back via BatchIterateSessions/V6 + GetSessionV4/V6;
+  skips unprivileged, runs on the privileged cluster where #6082 was seen).
+- **File(s)**: pkg/dataplane/bpf_session_value.go,
+  pkg/dataplane/bpf_session_value_test.go
+- **Validation**: `go build ./...`, `go test ./pkg/dataplane/...`,
+  `go test ./pkg/cluster/... ./pkg/conntrack/...` all green (round-trip skips
+  unprivileged). gofmt -w on both touched files.
+
 ## 2026-07-17 — #5469: write_state serializes+fsyncs OUTSIDE the ServerState lock
 
 - **Timestamp**: 2026-07-17 (fix/5469-writestate-lock-convoy)
