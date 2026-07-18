@@ -31,3 +31,4 @@ test/xsk-repro/xdp-tools*
 /dist/
 # .deb build-staging dir — a sibling of the publish root dist/ (HB165 H-5)
 /dist-deb/
+/target/

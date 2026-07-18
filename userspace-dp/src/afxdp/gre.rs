@@ -834,9 +834,16 @@ pub(super) fn encapsulate_native_gre_frame(
         Some(offset) => offset,
         None => inner_meta.l3_offset as usize,
     };
-    let inner_packet = inner_frame.get(inner_l3..)?.to_vec();
-    let inner_len = packet_trimmed_len(&inner_packet, inner_meta.addr_family)?;
-    let inner_packet = &inner_packet[..inner_len];
+    // #5381: borrow the inner packet directly out of `inner_frame` rather
+    // than `.to_vec()`-ing it. Every use below is read-only
+    // (`packet_trimmed_len`, `inner_tos_byte`, `.len()`, and as the
+    // `copy_from_slice` SOURCE into the separately-allocated `out`), so the
+    // heap copy was redundant — the frame is copied exactly once, into
+    // `out`. `inner_frame` outlives the borrow and `out` is a distinct
+    // allocation, so there is no aliasing.
+    let inner_slice = inner_frame.get(inner_l3..)?;
+    let inner_len = packet_trimmed_len(inner_slice, inner_meta.addr_family)?;
+    let inner_packet = &inner_slice[..inner_len];
     // #2303: copy the inner DSCP+ECN onto the outer header (uniform
     // DSCP model + RFC 6040 ECN ingress copy) instead of hardcoding 0.
     let outer_tos = inner_tos_byte(inner_packet, inner_meta.addr_family);

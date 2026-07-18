@@ -585,6 +585,124 @@ fn inner_tos_byte_reads_ipv4_and_ipv6() {
     );
 }
 
+// --- #5381 native-GRE encap: borrowed inner, single copy ---------------
+//
+// `encapsulate_native_gre_frame` used to `.to_vec()` the inner packet
+// (redundant heap alloc + copy) and THEN `copy_from_slice` it into the
+// output frame — two copies on the egress fast path. #5381 replaces the
+// `.to_vec()` with a borrowed slice into `inner_frame`; every use of the
+// inner is read-only, so the wire output is unchanged and the copy count
+// drops from two to one.
+//
+// This is a PERF fix: reverting to `.to_vec()` produces a byte-identical
+// frame, so a pure byte-equality test cannot go RED on the revert. It is
+// therefore a REGRESSION GUARD — it pins that the alloc removal keeps the
+// built frame byte-for-byte correct. The alloc removal itself is verified
+// by inspection (one fewer `Vec` allocation on the path; see gre.rs). The
+// guard is sharpened against the borrow/reslice math the fix touches: the
+// inner buffer carries trailing slack beyond its IPv4 total-length, and
+// the emitted inner region MUST be the TRIMMED bytes only (the slack must
+// never leak into the encapsulated output).
+#[test]
+fn gre_encap_output_is_byte_identical_and_trims_inner_slack() {
+    // Inner IPv4: 20-byte header declaring total_length = 40, a
+    // distinctive 20-byte payload, then 20 bytes of 0xEE trailing slack
+    // that `packet_trimmed_len` must drop. If the #5381 reslice math were
+    // wrong (wrong offset/length, or slicing the untrimmed backing), the
+    // slack would leak or the payload would shift — this test would fail.
+    let inner_declared = 40usize;
+    let slack = 20usize;
+    let mut inner = vec![0u8; inner_declared + slack];
+    inner[0] = 0x45; // version 4, IHL 5
+    inner[1] = 0x00; // TOS 0 -> outer IPv6 Traffic Class 0
+    inner[2..4].copy_from_slice(&(inner_declared as u16).to_be_bytes()); // total length = 40
+    inner[8] = 64; // TTL
+    inner[9] = PROTO_TCP;
+    inner[12..16].copy_from_slice(&[10, 0, 0, 1]); // src
+    inner[16..20].copy_from_slice(&[10, 0, 0, 2]); // dst
+    for (i, b) in inner[20..40].iter_mut().enumerate() {
+        *b = 0xA0 + i as u8; // distinctive payload pattern
+    }
+    for b in inner[40..].iter_mut() {
+        *b = 0xEE; // trailing slack — must NOT appear in the output
+    }
+    let expected_inner = inner[..inner_declared].to_vec();
+
+    let inner_frame = wrap_raw_ip_packet_for_tunnel(&inner, libc::AF_INET as u8);
+
+    let state = gre1881_state();
+    let decision = SessionDecision {
+        resolution: gre_encap_resolution(),
+        nat: NatDecision::default(),
+    };
+    let mut meta = ForwardPacketMeta::default();
+    meta.addr_family = libc::AF_INET as u8;
+    meta.protocol = PROTO_TCP;
+    meta.l3_offset = 14;
+
+    let out = encapsulate_native_gre_frame(&inner_frame, meta, &decision, &state)
+        .expect("gre encap must build a frame");
+
+    // Independently derive the expected wire frame from the fixture
+    // constants (gre1881 endpoint: IPv6 outer, no key, ttl 64, src
+    // 2001:559:8585:80::8, dst 2602:ffd3:0:2::7; resolution: VLAN 80,
+    // dst_mac 00:11:22:33:44:55, src_mac 02:bf:72:00:50:08).
+    let mut expected = Vec::new();
+    // Ethernet + 802.1Q VLAN-80 tag (18 bytes).
+    expected.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // dst mac
+    expected.extend_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]); // src mac
+    expected.extend_from_slice(&0x8100u16.to_be_bytes()); // TPID 802.1Q
+    expected.extend_from_slice(&80u16.to_be_bytes()); // TCI: PCP0/DEI0/VID80
+    expected.extend_from_slice(&0x86ddu16.to_be_bytes()); // ethertype IPv6
+    // Outer IPv6 header (40 bytes).
+    let payload_len = (4 + inner_declared) as u16; // GRE(4) + inner
+    expected.push(0x60); // version 6, TC high nibble 0
+    expected.push(0x00); // TC low nibble 0, flow-label high nibble 0
+    expected.push(0x00); // flow label
+    expected.push(0x00); // flow label
+    expected.extend_from_slice(&payload_len.to_be_bytes());
+    expected.push(crate::ip_proto::PROTO_GRE); // next header
+    expected.push(64); // hop limit (endpoint ttl)
+    expected.extend_from_slice(
+        &"2001:559:8585:80::8"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets(),
+    );
+    expected.extend_from_slice(
+        &"2602:ffd3:0:2::7"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets(),
+    );
+    // GRE header (4 bytes, no key): flags 0x0000, proto 0x0800 (inner IPv4).
+    expected.extend_from_slice(&0x0000u16.to_be_bytes());
+    expected.extend_from_slice(&0x0800u16.to_be_bytes());
+    // Inner packet — TRIMMED (slack dropped).
+    expected.extend_from_slice(&expected_inner);
+
+    assert_eq!(
+        out.len(),
+        18 + 40 + 4 + inner_declared,
+        "frame length = eth/VLAN(18) + IPv6 outer(40) + GRE(4) + trimmed inner(40)"
+    );
+    assert_eq!(
+        out, expected,
+        "#5381: the borrowed-inner encap must emit a byte-identical frame; \
+         the trailing 0xEE slack must be trimmed, not copied"
+    );
+    // Explicit sharpener on the region the fix touches: the inner bytes
+    // land verbatim at offset 62 and carry no slack.
+    assert_eq!(
+        &out[62..], &expected_inner[..],
+        "inner region must equal the trimmed inner packet exactly"
+    );
+    assert!(
+        !out[62..].contains(&0xEE),
+        "trailing slack must never leak into the encapsulated inner"
+    );
+}
+
 // --- #2315 RFC 6040 §4.2 decap-side ECN combine -----------------------
 
 use super::super::gre::{
