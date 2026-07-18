@@ -1,3 +1,39 @@
+## 2026-07-18 — #5624: NAT64 fragment-association must invalidate on config change
+
+- **Timestamp**: 2026-07-18 (fix/5624-nat64-fragassoc-generation)
+- **Action**: The NAT64 cross-family fragment-association cache
+  (`nat64::Nat64FragAssoc`, #2562) is Arc-shared across config reloads so
+  in-flight fragmented datagrams keep translating, but each entry is a per-flow
+  deny/NAT64 verdict resolved under ONE config generation. Nothing stamped the
+  generation, so a commit that changed deny/NAT64 rules left prior-generation
+  associations in the shared cache to be hit-refreshed and used — fragments a
+  NEW config would drop kept getting associated + forwarded via the stale
+  entry. Fix: stamp every `Nat64FragEntry` with the config-snapshot generation
+  it was installed under (`Nat64State::build_generation`, threaded from
+  `snapshot.generation` through `from_snapshots_with_previous`), and on
+  `lookup` REJECT (treat as miss + EVICT) an entry whose stamped generation !=
+  the current generation. `install` re-stamps on a same-key refresh so a
+  re-admitted first fragment adopts the current generation. Mirrors the
+  flow-cache `config_generation` guard (`afxdp/flow_cache.rs`). Fast-path cost
+  is one `u64` compare; valid same-generation reassembly is unchanged. The two
+  poll-loop callers (`nat64_install_forward_fragment_assoc` /
+  `nat64_consult_forward_fragment_assoc`) read `forwarding.nat64.build_generation`,
+  so install and consult under the same `ForwardingState` Arc always agree, and
+  a reload between them (Arc swap → `build_generation` advances) invalidates.
+- **File(s)**: userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/nat64_tests.rs, docs/feature-coverage.md
+- **Validation**: `cargo build` clean; 179 nat64 tests + full nat/forwarding/
+  poll_descriptor suites green (2 failures — `wire_invariant_default_specimens`,
+  `event_stream ... stalled_consumer` — confirmed PRE-EXISTING on the stashed
+  clean tree, both in subsystems this change never touches). New RED-on-revert
+  test `nat64_frag_assoc_generation_change_invalidates_stale_association`:
+  installs under gen 7, asserts same-gen replay hits, bumps to gen 8 and asserts
+  the stale association misses + is evicted, then re-establishes + hits under
+  gen 8. Neutralizing the guard (`if false`) fails it via assertion (verified);
+  5x flake check green.
+
 ## 2026-07-18 — #5468 (PR #6085 fold): bound the AGGREGATE worker-loop lossless wait (resync/export), not just per-call
 
 - **Timestamp**: 2026-07-18 (fix/5468-lossless-worker-stall, folding rev5468 review finding #2)

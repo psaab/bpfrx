@@ -328,8 +328,17 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // changed pool resets to a fresh allocator inside `reuse_allocator`. Mirrors
     // the source-NAT `parse_source_nat_rules_with_previous` reuse above. The
     // complementary HA cross-node failover reservation sync is #4512.
-    state.nat64 =
-        Nat64State::from_snapshots_with_previous(&snapshot.nat64_rules, previous.map(|p| &p.nat64));
+    // #5624: thread the config-snapshot generation so each NAT64 fragment
+    // association is stamped with the generation it was installed under. The
+    // Arc-shared frag-association cache survives this reload (in-flight
+    // datagrams keep translating), but an association minted under a PRIOR
+    // generation is rejected on lookup once the generation advances — a commit
+    // that changed deny/NAT64 rules no longer keeps forwarding stale fragments.
+    state.nat64 = Nat64State::from_snapshots_with_previous(
+        &snapshot.nat64_rules,
+        previous.map(|p| &p.nat64),
+        snapshot.generation,
+    );
     // #2240: fail CLOSED on an unparseable / unsupported / mismatched NPTv6
     // rule. The preflight in the reconcile/refresh apply paths catches this
     // Err and keeps the previous live forwarding state rather than installing a
