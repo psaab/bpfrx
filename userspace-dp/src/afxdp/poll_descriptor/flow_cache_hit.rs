@@ -98,16 +98,17 @@ pub(super) fn stage_flow_cache_hit(
         &worker_ctx.rg_epochs,
         meta.pkt_len,
     ) {
-        // #3048: a kernel ARP/NDP update may have REPLACED this
+        // #3048/#5147: a kernel ARP/NDP update may have REPLACED this
         // descriptor's next-hop MAC since it was cached (gateway VRRP
-        // failover, NIC swap). The neighbor map advances its
-        // mac_change_epoch only on a genuine MAC change — never on a
+        // failover, NIC swap). The neighbor map advances the epoch of the
+        // changed neighbor's SHARD only on a genuine MAC change — never on a
         // same-MAC refresh — so this comparison is free of steady-state
-        // re-misses. A mismatch means the cached dst_mac may be stale;
-        // evict and re-resolve on the slow path. Read the epoch once
-        // before the &cached borrow is needed mutably below.
-        let neighbor_mac_stale =
-            cached.neighbor_mac_epoch_stale(worker_ctx.dynamic_neighbors.mac_change_epoch());
+        // re-misses, and a MAC change to a neighbor in a DIFFERENT shard does
+        // NOT evict this flow (the #5147 map-wide-thrash fix). The check reads
+        // only this flow's own shard slot: a single indexed relaxed atomic
+        // load + compare. A mismatch means the cached dst_mac may be stale;
+        // evict and re-resolve on the slow path.
+        let neighbor_mac_stale = cached.neighbor_mac_epoch_stale(worker_ctx.dynamic_neighbors);
         if neighbor_mac_stale
             || !cached_flow_decision_valid(
                 worker_ctx.forwarding,

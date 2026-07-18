@@ -51700,3 +51700,32 @@ top.
 - **File(s)**:
   userspace-dp/src/afxdp/gre.rs (borrow inner packet, drop `.to_vec()`),
   userspace-dp/src/afxdp/tunnel_tests.rs (regression guard test)
+
+## #5147 — Per-shard neighbor MAC-change epoch (targeted flow-cache invalidation)
+- **Timestamp**: 2026-07-17
+- **Action**: Replace the single global `ShardedNeighborMap.mac_change_epoch`
+  (AtomicU32) with a PER-SHARD `shard_mac_epochs: [AtomicU32; NUM_SHARDS]`. A
+  MAC replacement now bumps only the changed neighbor's shard epoch; a cached
+  flow stamps + re-validates against the epoch of the shard its resolved
+  next-hop `(egress_ifindex, next_hop)` lives in (`FlowCacheEntry
+  .neighbor_shard`). Closes the map-wide cache-thrash / DoS where one on-link
+  IP's MAC flap invalidated every cached flow. Hot-path check stays one
+  indexed relaxed load + compare. Pre-resolve WHOLE-vector snapshot
+  (`snapshot_shard_epochs`) preserves the #3918 TOCTOU fix per shard; #3048
+  eviction of a flow's OWN neighbor is preserved.
+- **File(s)**: userspace-dp/src/afxdp/sharded_neighbor.rs,
+  userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/sharded_neighbor_tests.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/umem/tests/debug_state.rs,
+  userspace-dp/src/afxdp/README.md, docs/flow-cache-simplification.md
+- **Validation**: `cargo build --release` green; `cargo test --release`
+  neighbor+flow_cache 20/20 green. RED-on-revert verified firsthand:
+  neutralizing `bump_shard_epoch` to bump-all-shards (global behavior) turns
+  `unrelated_neighbor_mac_change_does_not_evict_cached_flow` and
+  `mac_change_epoch_isolated_per_shard_across_neighbors` RED while the #3048
+  over-eviction guard stays green.

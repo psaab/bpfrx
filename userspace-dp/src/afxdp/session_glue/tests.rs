@@ -2023,6 +2023,8 @@ fn epoch_based_flow_cache_invalidation_for_demoted_owner_rg() {
         observed_bytes: 0,
         last_used_epoch: 0,
         neighbor_mac_epoch: 0,
+        // #5147: no dynamic-neighbor dependency in this test entry.
+        neighbor_shard: crate::afxdp::flow_cache::NEIGHBOR_SHARD_NONE,
     });
 
     // Before epoch bump, lookup should hit.
@@ -2107,6 +2109,8 @@ fn epoch_based_flow_cache_unrelated_rg_not_invalidated() {
         observed_bytes: 0,
         last_used_epoch: 0,
         neighbor_mac_epoch: 0,
+        // #5147: no dynamic-neighbor dependency in this test entry.
+        neighbor_shard: crate::afxdp::flow_cache::NEIGHBOR_SHARD_NONE,
     });
 
     // Bump epoch for RG 2 (unrelated).

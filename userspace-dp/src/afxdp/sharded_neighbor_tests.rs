@@ -15,6 +15,21 @@ fn key_v4(ifindex: i32, last_octet: u8) -> (i32, IpAddr) {
     (ifindex, IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet)))
 }
 
+/// #5147: two v4 neighbor keys guaranteed to live in DIFFERENT shards. A MAC
+/// change on one bumps only its shard's epoch, so the other's stays put —
+/// the per-neighbor isolation the map-wide-thrash fix provides.
+fn keys_in_distinct_shards() -> ((i32, IpAddr), (i32, IpAddr)) {
+    let base = key_v4(7, 1);
+    let base_shard = ShardedNeighborMap::shard_index(&base);
+    for octet in 2..=255u8 {
+        let cand = key_v4(7, octet);
+        if ShardedNeighborMap::shard_index(&cand) != base_shard {
+            return (base, cand);
+        }
+    }
+    panic!("no distinct-shard key pair found among /24 last octets");
+}
+
 #[test]
 fn get_returns_inserted_value() {
     let map = ShardedNeighborMap::new();
@@ -289,20 +304,23 @@ fn concurrent_per_key_with_bulk_replace_no_deadlock() {
     assert!(map.len() > 0);
 }
 
-// ── #3048: neighbor MAC-change epoch ─────────────────────────────────
-// The worker flow cache stamps `mac_change_epoch()` into each cached
-// forwarding descriptor and re-reads it on every fast-path hit. The
-// epoch MUST advance only on a genuine MAC CHANGE so a stale cached
-// dst_mac is evicted; it MUST NOT advance on a first insert or a
-// same-MAC refresh, or steady-state traffic would re-miss the cache on
-// every neighbor refresh. Reverting any `mac_change_epoch.fetch_add`
-// makes the corresponding "change bumps" assertion fail (RED), so these
-// are the fail-on-revert guards for the #3048 invalidation.
+// ── #3048/#5147: PER-SHARD neighbor MAC-change epoch ──────────────────
+// The worker flow cache stamps the epoch of the SPECIFIC shard its
+// resolved next-hop lives in (`FlowCacheEntry::neighbor_shard`) and
+// re-reads that one slot on every fast-path hit. A shard's epoch MUST
+// advance only on a genuine MAC CHANGE to a neighbor IN THAT SHARD, so a
+// stale cached dst_mac is evicted; it MUST NOT advance on a first insert
+// or a same-MAC refresh, and a change to a neighbor in a DIFFERENT shard
+// MUST leave this shard's epoch untouched (#5147 — the old single global
+// epoch let one neighbor's MAC flap invalidate every cached flow).
+// Reverting any `bump_shard_epoch` makes the corresponding "change bumps"
+// assertion fail (RED); the isolation test fails if a change bumps a
+// shard other than its own.
 
 #[test]
 fn mac_change_epoch_starts_at_zero() {
     let map = ShardedNeighborMap::new();
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&key_v4(7, 42)), 0);
 }
 
 #[test]
@@ -310,9 +328,9 @@ fn mac_change_epoch_not_bumped_on_first_insert() {
     let map = ShardedNeighborMap::new();
     let k = key_v4(7, 42);
     // A brand-new neighbor: no cached flow can reference a MAC that did
-    // not previously exist, so the epoch must stay put.
+    // not previously exist, so the shard epoch must stay put.
     assert!(map.insert_if_changed(k, entry(0xAB)));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
 }
 
 #[test]
@@ -321,10 +339,10 @@ fn mac_change_epoch_not_bumped_on_same_mac_refresh() {
     let k = key_v4(7, 42);
     assert!(map.insert_if_changed(k, entry(0xAB)));
     // The common case: a periodic ARP/NDP refresh re-learning the SAME
-    // MAC must not bump the epoch (else the whole flow cache flushes on
-    // every neighbor refresh and the fast-path hit rate collapses).
+    // MAC must not bump the shard epoch (else that shard's cached flows
+    // flush on every neighbor refresh and the fast-path hit rate collapses).
     assert!(!map.insert_if_changed(k, entry(0xAB)));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
 }
 
 #[test]
@@ -332,35 +350,46 @@ fn mac_change_epoch_bumped_on_mac_change() {
     let map = ShardedNeighborMap::new();
     let k = key_v4(7, 42);
     assert!(map.insert_if_changed(k, entry(0xAB)));
-    assert_eq!(map.mac_change_epoch(), 0);
-    // Genuine MAC change (gateway VRRP failover / NIC swap): the epoch
-    // MUST advance so the worker fast path evicts cached descriptors
-    // holding the old dst_mac. Fail-on-revert guard for insert_if_changed.
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
+    // Genuine MAC change (gateway VRRP failover / NIC swap): this
+    // neighbor's shard epoch MUST advance so the worker fast path evicts
+    // cached descriptors holding the old dst_mac. Fail-on-revert guard for
+    // insert_if_changed's bump_shard_epoch.
     assert!(map.insert_if_changed(k, entry(0xCD)));
-    assert_eq!(map.mac_change_epoch(), 1);
+    assert_eq!(map.mac_change_epoch_for(&k), 1);
     // A subsequent same-MAC refresh does not advance it further.
     assert!(!map.insert_if_changed(k, entry(0xCD)));
-    assert_eq!(map.mac_change_epoch(), 1);
+    assert_eq!(map.mac_change_epoch_for(&k), 1);
     // Another distinct change bumps again.
     assert!(map.insert_if_changed(k, entry(0xEF)));
-    assert_eq!(map.mac_change_epoch(), 2);
+    assert_eq!(map.mac_change_epoch_for(&k), 2);
 }
 
 #[test]
-fn mac_change_epoch_per_key_independent_changes_accumulate() {
+fn mac_change_epoch_isolated_per_shard_across_neighbors() {
+    // #5147: the core targeted-invalidation guard. A MAC change on
+    // neighbor A bumps ONLY A's shard epoch; an unrelated neighbor B in a
+    // different shard is untouched. Under the old single global epoch this
+    // test would go RED (B's read would advance too), which is exactly the
+    // map-wide cache-thrash / DoS this fixes.
     let map = ShardedNeighborMap::new();
-    let k1 = key_v4(7, 1);
-    let k2 = key_v4(7, 2);
-    map.insert_if_changed(k1, entry(0x11));
-    map.insert_if_changed(k2, entry(0x22));
-    assert_eq!(map.mac_change_epoch(), 0);
-    // A MAC change on either key bumps the single global epoch (the
-    // flow cache is keyed by flow 5-tuple, not next-hop, so #3048 uses a
-    // coarse global epoch — documented tradeoff).
-    map.insert_if_changed(k1, entry(0x99));
-    assert_eq!(map.mac_change_epoch(), 1);
-    map.insert_if_changed(k2, entry(0x88));
-    assert_eq!(map.mac_change_epoch(), 2);
+    let (a, b) = keys_in_distinct_shards();
+    map.insert_if_changed(a, entry(0x11));
+    map.insert_if_changed(b, entry(0x22));
+    assert_eq!(map.mac_change_epoch_for(&a), 0);
+    assert_eq!(map.mac_change_epoch_for(&b), 0);
+    // Change A's MAC: A's shard advances, B's does not.
+    map.insert_if_changed(a, entry(0x99));
+    assert_eq!(map.mac_change_epoch_for(&a), 1);
+    assert_eq!(
+        map.mac_change_epoch_for(&b),
+        0,
+        "an unrelated neighbor's shard must not advance on A's MAC change (#5147)"
+    );
+    // Change B's MAC: B's shard advances, A's stays at its own value.
+    map.insert_if_changed(b, entry(0x88));
+    assert_eq!(map.mac_change_epoch_for(&b), 1);
+    assert_eq!(map.mac_change_epoch_for(&a), 1);
 }
 
 #[test]
@@ -371,7 +400,7 @@ fn mac_change_epoch_confirmed_resolver_first_insert_no_bump() {
     let generation = AtomicU64::new(5);
     // Resolver servicing a missing next-hop: prior == None, no bump.
     assert!(map.insert_confirmed_if_unchanged(k, entry(0xAB), &generation, 5));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
 }
 
 #[test]
@@ -381,14 +410,14 @@ fn mac_change_epoch_confirmed_resolver_bumps_on_change() {
     let k = key_v4(7, 42);
     let generation = AtomicU64::new(5);
     assert!(map.insert_confirmed_if_unchanged(k, entry(0xAB), &generation, 5));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
     // A confirmed re-resolution observing a different MAC must bump,
     // matching the monitor path. Fail-on-revert guard for the resolver.
     assert!(map.insert_confirmed_if_unchanged(k, entry(0xCD), &generation, 5));
-    assert_eq!(map.mac_change_epoch(), 1);
+    assert_eq!(map.mac_change_epoch_for(&k), 1);
     // Same MAC re-confirm does not bump.
     assert!(map.insert_confirmed_if_unchanged(k, entry(0xCD), &generation, 5));
-    assert_eq!(map.mac_change_epoch(), 1);
+    assert_eq!(map.mac_change_epoch_for(&k), 1);
 }
 
 #[test]
@@ -397,7 +426,7 @@ fn mac_change_epoch_bulk_replace_bumps_on_mac_change() {
     let k = key_v4(7, 42);
     // Seed an existing neighbor (e.g. the gateway) at MAC 0xAB.
     map.insert(k, entry(0xAB));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
     // The Go control-plane snapshot push (apply_manager_neighbors with
     // NeighborReplace: true) removes the old key and re-inserts the same
     // key with a DIFFERENT MAC — the VRRP-failover gateway MAC change
@@ -409,7 +438,7 @@ fn mac_change_epoch_bulk_replace_bumps_on_mac_change() {
     let insert = [(7, k.1, entry(0xCD))];
     map.bulk_replace_neighbors(&remove, &insert);
     assert_eq!(map.get(&k), Some(entry(0xCD)));
-    assert_eq!(map.mac_change_epoch(), 1);
+    assert_eq!(map.mac_change_epoch_for(&k), 1);
 }
 
 #[test]
@@ -417,18 +446,18 @@ fn mac_change_epoch_bulk_replace_no_bump_on_same_mac() {
     let map = ShardedNeighborMap::new();
     let k = key_v4(7, 42);
     map.insert(k, entry(0xAB));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
     // A pure refresh: the snapshot re-learns the SAME MAC for every key.
     // Even though replace removes then re-inserts, the prior-MAC snapshot
-    // (taken before the remove) equals the incoming MAC, so the epoch
-    // must NOT advance — otherwise steady-state Go snapshot pushes would
-    // flush the whole flow cache. This case must stay GREEN when the
-    // bump is neutralized.
+    // (taken before the remove) equals the incoming MAC, so this shard's
+    // epoch must NOT advance — otherwise steady-state Go snapshot pushes
+    // would flush that shard's cached flows. This case must stay GREEN
+    // when the bump is neutralized.
     let remove = [k];
     let insert = [(7, k.1, entry(0xAB))];
     map.bulk_replace_neighbors(&remove, &insert);
     assert_eq!(map.get(&k), Some(entry(0xAB)));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
 }
 
 #[test]
@@ -440,23 +469,26 @@ fn mac_change_epoch_bulk_replace_no_bump_on_brand_new_keys() {
     let insert: Vec<_> = (0..5u8).map(|i| (7, key_v4(7, i).1, entry(0x22))).collect();
     map.bulk_replace_neighbors(&[], &insert);
     assert_eq!(map.len(), 5);
-    assert_eq!(map.mac_change_epoch(), 0);
+    for i in 0..5u8 {
+        assert_eq!(map.mac_change_epoch_for(&key_v4(7, i)), 0);
+    }
 }
 
 #[test]
-fn mac_change_epoch_bulk_replace_single_bump_for_batch() {
+fn mac_change_epoch_bulk_replace_bumps_each_changed_shard_once() {
     let map = ShardedNeighborMap::new();
-    let k1 = key_v4(7, 1);
-    let k2 = key_v4(7, 2);
+    // #5147: two neighbors in DISTINCT shards both change MAC in one
+    // snapshot push. Each changed neighbor bumps its OWN shard exactly once
+    // — not a single shared global epoch — so an unrelated cached flow
+    // (resolved to a third shard) survives.
+    let (k1, k2) = keys_in_distinct_shards();
     map.insert(k1, entry(0x11));
     map.insert(k2, entry(0x22));
-    // Two keys change MAC in one snapshot push. The flow-cache flush is
-    // a coarse global epoch, so the whole batch bumps the epoch exactly
-    // ONCE (not once per changed key).
     let remove = [k1, k2];
-    let insert = [(7, k1.1, entry(0x99)), (7, k2.1, entry(0x88))];
+    let insert = [(k1.0, k1.1, entry(0x99)), (k2.0, k2.1, entry(0x88))];
     map.bulk_replace_neighbors(&remove, &insert);
-    assert_eq!(map.mac_change_epoch(), 1);
+    assert_eq!(map.mac_change_epoch_for(&k1), 1);
+    assert_eq!(map.mac_change_epoch_for(&k2), 1);
 }
 
 #[test]
@@ -471,17 +503,17 @@ fn mac_change_epoch_confirmed_resolver_epoch_reject_no_bump() {
     // written and the epoch must not move.
     generation.store(6, std::sync::atomic::Ordering::Release);
     assert!(!map.insert_confirmed_if_unchanged(k, entry(0xCD), &generation, 5));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
     assert_eq!(map.get(&k), Some(entry(0xAB)));
 }
 
 // ── #3169: RX source-MAC data-path learn (learn_pair_if_changed) ─────
 // The fifth neighbor-MAC write path. learn_dynamic_neighbor routes its
 // #949 pair-write through learn_pair_if_changed, which must follow the
-// same epoch semantics as the other four paths: a genuine MAC change on
-// an existing dynamic neighbor bumps mac_change_epoch (so a flow-cache
-// dst_mac resolved via the dynamic_neighbors fallback is evicted), while
-// a first sighting and a same-MAC re-learn do not.
+// same per-shard epoch semantics as the other four paths: a genuine MAC
+// change on an existing dynamic neighbor bumps that neighbor's shard epoch
+// (so a flow-cache dst_mac resolved via the dynamic_neighbors fallback is
+// evicted), while a first sighting and a same-MAC re-learn do not.
 
 #[test]
 fn mac_change_epoch_rx_learn_no_bump_on_first_sighting() {
@@ -491,7 +523,7 @@ fn mac_change_epoch_rx_learn_no_bump_on_first_sighting() {
     // MAC for a neighbor that did not exist, so the epoch stays put.
     map.learn_pair_if_changed(&[k], entry(0xAB));
     assert_eq!(map.get(&k), Some(entry(0xAB)));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
 }
 
 #[test]
@@ -503,7 +535,7 @@ fn mac_change_epoch_rx_learn_no_bump_on_same_mac_relearn() {
     // bump, else every RX packet from a known source would flush the
     // flow cache. This case must stay GREEN when the bump is neutralized.
     map.learn_pair_if_changed(&[k], entry(0xAB));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
 }
 
 #[test]
@@ -511,7 +543,7 @@ fn mac_change_epoch_rx_learn_bumps_on_mac_change() {
     let map = ShardedNeighborMap::new();
     let k = key_v4(7, 42);
     map.learn_pair_if_changed(&[k], entry(0xAB));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&k), 0);
     // An RX-learned MAC change for an existing dynamic neighbor (the
     // pair_write_needed gate fires on `current != Some(src_mac)`, not
     // just first sighting). lookup_neighbor_entry falls back to this map
@@ -520,25 +552,30 @@ fn mac_change_epoch_rx_learn_bumps_on_mac_change() {
     // learn_pair_if_changed: neutralizing its fetch_add makes this RED.
     map.learn_pair_if_changed(&[k], entry(0xCD));
     assert_eq!(map.get(&k), Some(entry(0xCD)));
-    assert_eq!(map.mac_change_epoch(), 1);
+    assert_eq!(map.mac_change_epoch_for(&k), 1);
     // A subsequent same-MAC re-learn does not advance it further.
     map.learn_pair_if_changed(&[k], entry(0xCD));
-    assert_eq!(map.mac_change_epoch(), 1);
+    assert_eq!(map.mac_change_epoch_for(&k), 1);
 }
 
 #[test]
-fn mac_change_epoch_rx_learn_pair_single_bump_for_both_keys() {
+fn mac_change_epoch_rx_learn_pair_bumps_each_key_shard() {
     let map = ShardedNeighborMap::new();
-    // The #949 pair-write installs the same MAC under the physical and
-    // the resolved logical (VLAN sub-) ifindex. Seed both, then change
-    // the MAC on both in one learn: the coarse global epoch bumps exactly
-    // ONCE for the pair, not once per key.
+    // #5147: the #949 pair-write installs the same MAC under the physical
+    // and the resolved logical (VLAN sub-) ifindex, which hash to
+    // independent shards. Seed both, then change the MAC on both in one
+    // learn: each key's own shard epoch must advance (a flow resolved via
+    // either ifindex must be evicted), rather than one shared global epoch.
     let phys = key_v4(7, 42);
     let logical = key_v4(99, 42);
     map.learn_pair_if_changed(&[phys, logical], entry(0xAB));
-    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.mac_change_epoch_for(&phys), 0);
+    assert_eq!(map.mac_change_epoch_for(&logical), 0);
     map.learn_pair_if_changed(&[phys, logical], entry(0xCD));
     assert_eq!(map.get(&phys), Some(entry(0xCD)));
     assert_eq!(map.get(&logical), Some(entry(0xCD)));
-    assert_eq!(map.mac_change_epoch(), 1);
+    // Each changed key bumps its own shard (>= 1 covers the case where the
+    // two ifindexes happen to hash to the same shard).
+    assert!(map.mac_change_epoch_for(&phys) >= 1);
+    assert!(map.mac_change_epoch_for(&logical) >= 1);
 }
