@@ -51729,3 +51729,32 @@ top.
   `unrelated_neighbor_mac_change_does_not_evict_cached_flow` and
   `mac_change_epoch_isolated_per_shard_across_neighbors` RED while the #3048
   over-eviction guard stays green.
+
+## 2026-07-17 — #5660 nat/allocator bounded-hardening (2 items)
+- **Timestamp**: 2026-07-17
+- **Action**: Item 1 — replace the O(N) `pool_v4.iter().position()` linear scan
+  in `reverse_deterministic_v4`/`reverse_deterministic_v6` with an O(1)
+  `PoolReverseIndex` (`FxHashMap<Ipv4Addr,u32>`) built once by
+  `build_pool_reverse_index()`. Verified the pool is an ARBITRARY, possibly
+  non-contiguous ordered Vec (NAT64 parses pool strings; tests use gapped
+  `[198.51.100.1, .5]`), so a direct `translated_ip - pool_base` subtraction
+  would be wrong — first-match hash mirrors `position()` exactly. Reverse is the
+  provable inverse of the forward `pool_v4[ip_idx]` selection.
+- **Action**: Item 2 — `AddressOccupancy::port_of` now range-checks the offset
+  before the `u32 -> u16` narrowing (returns `Option<u16>`, `None` when
+  `offset >= range`) so an out-of-range value is REJECTED, not silently
+  truncated into a valid-looking wrong port. The sole claim-path caller holds
+  `offset < range`, so no behavior change on the hot path.
+- **Tests**: added `deterministic_reverse_v4_o1_index_is_exact_inverse_across_pool_boundaries`
+  (round-trips every subscriber over a NON-CONTIGUOUS pool covering ip_idx
+  0/mid/last — RED-verified against the contiguous-subtraction shortcut:
+  `Some(8)` vs `Some(1)` for 10.0.0.9) and
+  `port_of_rejects_out_of_range_offset_no_silent_truncation` (RED-verified by
+  neutralizing the guard: `Some(2048)` vs `None`). Updated the 7 existing
+  reverse-test call sites to build the index once. 5x flake check green.
+- **Validation**: `cargo build` clean; full `nat` suite 746 passed; full
+  userspace-dp suite 3931 passed (the 2 failing `protocol wire golden` +
+  `backpressure` tests pre-exist on the base commit with my changes stashed —
+  unrelated to nat).
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/tests_pool.rs,
+  docs/deterministic-nat-cgnat.md, _Log.md

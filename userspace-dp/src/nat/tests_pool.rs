@@ -8,8 +8,9 @@
 
 use super::allocator::{
     ALLOCATION_GC_BUDGET, DeterministicV4, DeterministicV6, NS_PER_SEC, PersistentLease,
-    PersistentSourceKey, PoolAddressFamily, TranslatedTuple, deterministic_indices_v6,
-    reverse_deterministic_v4, reverse_deterministic_v6, sticky_pool_index,
+    PersistentSourceKey, PoolAddressFamily, TranslatedTuple, build_pool_reverse_index,
+    deterministic_indices_v4, deterministic_indices_v6, reverse_deterministic_v4,
+    reverse_deterministic_v6, sticky_pool_index,
 };
 use super::source::{
     PersistentNatPermit, SOURCE_NAT_PROTO_ANY, SourceNatFailureReason, SourceNatFlowKey,
@@ -3915,6 +3916,10 @@ fn deterministic_cgnat_v4_fixed_block_per_subscriber_reversible() {
         "mode-1 IPv4 deterministic snapshot must build a deterministic rule"
     );
 
+    // #5660: the reverse path indexes the pool via the O(1) reverse map built
+    // once from the ordered pool, not a per-lookup linear scan.
+    let pool_index = build_pool_reverse_index(&pool);
+
     let alloc = |src: &str, dst: &str, sport: u16| -> (Ipv4Addr, u16) {
         let mut counter = None;
         let d = expect_snat_decision(match_source_nat_result_for_tuple(
@@ -3962,12 +3967,12 @@ fn deterministic_cgnat_v4_fixed_block_per_subscriber_reversible() {
 
     // Reverse: (external IP, port) -> subscriber, no per-flow state.
     assert_eq!(
-        reverse_deterministic_v4(&det, &pool, 1024, a_ip, a_port),
+        reverse_deterministic_v4(&det, &pool_index, 1024, a_ip, a_port),
         Some(Ipv4Addr::new(100, 64, 0, 5)),
         "reverse must recover subscriber A from (external IP, port) alone"
     );
     assert_eq!(
-        reverse_deterministic_v4(&det, &pool, 1024, a2_ip, a2_port),
+        reverse_deterministic_v4(&det, &pool_index, 1024, a2_ip, a2_port),
         Some(Ipv4Addr::new(100, 64, 0, 5)),
         "the second flow reverses to the same subscriber A"
     );
@@ -3981,7 +3986,7 @@ fn deterministic_cgnat_v4_fixed_block_per_subscriber_reversible() {
         "subscriber B port {b_port} must fall in its deterministic block [3072,3583]"
     );
     assert_eq!(
-        reverse_deterministic_v4(&det, &pool, 1024, b_ip, b_port),
+        reverse_deterministic_v4(&det, &pool_index, 1024, b_ip, b_port),
         Some(Ipv4Addr::new(100, 64, 1, 0)),
         "reverse must recover subscriber B"
     );
@@ -4065,6 +4070,8 @@ fn deterministic_napt64_v6_fixed_block_per_subscriber_reversible() {
     };
     // One shared allocator sized like the NAT64 per-prefix allocator.
     let alloc = PortAllocator::new(pool.len(), 1024, 65535);
+    // #5660: O(1) reverse index over the ordered pool (built once, reused).
+    let pool_index = build_pool_reverse_index(&pool);
 
     let alloc_for = |src: &str, sport: u16| -> (Ipv4Addr, u16) {
         let flow = SourceNatFlowKey {
@@ -4103,12 +4110,12 @@ fn deterministic_napt64_v6_fixed_block_per_subscriber_reversible() {
 
     // Reverse: (external IPv4, port) -> subscriber prefix, no per-flow state.
     assert_eq!(
-        reverse_deterministic_v6(&det, &pool, 1024, a_ip, a_port),
+        reverse_deterministic_v6(&det, &pool_index, 1024, a_ip, a_port),
         Some("2001:db8:0:5::".parse().unwrap()),
         "reverse must recover subscriber A from (external IPv4, port) alone"
     );
     assert_eq!(
-        reverse_deterministic_v6(&det, &pool, 1024, a2_ip, a2_port),
+        reverse_deterministic_v6(&det, &pool_index, 1024, a2_ip, a2_port),
         Some("2001:db8:0:5::".parse().unwrap()),
         "the second flow reverses to the same subscriber A"
     );
@@ -4122,7 +4129,7 @@ fn deterministic_napt64_v6_fixed_block_per_subscriber_reversible() {
         "subscriber B port {b_port} must fall in its deterministic block [3072,3583]"
     );
     assert_eq!(
-        reverse_deterministic_v6(&det, &pool, 1024, b_ip, b_port),
+        reverse_deterministic_v6(&det, &pool_index, 1024, b_ip, b_port),
         Some("2001:db8:0:100::".parse().unwrap()),
         "reverse must recover subscriber B"
     );
@@ -4219,6 +4226,8 @@ fn deterministic_napt64_v6_rejects_out_of_prefix_shared_word() {
     // allocation CLOSED (no external tuple handed out, so no lying reverse
     // map), while the in-prefix source still allocates and reverses correctly.
     let alloc = PortAllocator::new(pool.len(), 1024, 65535);
+    // #5660: O(1) reverse index over the ordered pool (built once, reused).
+    let pool_index = build_pool_reverse_index(&pool);
     let flow_for = |src: &str| SourceNatFlowKey {
         protocol: PROTO_TCP,
         src_ip: IpAddr::V6(src.parse().expect("src")),
@@ -4251,9 +4260,127 @@ fn deterministic_napt64_v6_rejects_out_of_prefix_shared_word() {
     };
     assert_eq!(ext_ip, pool[0], "in-prefix subscriber 5 maps to pool[0]");
     assert_eq!(
-        reverse_deterministic_v6(&det, &pool, 1024, ext_ip, ok.port),
+        reverse_deterministic_v6(&det, &pool_index, 1024, ext_ip, ok.port),
         Some("2001:db8:0:5::".parse().unwrap()),
         "the reverse map recovers the true in-prefix subscriber"
+    );
+}
+
+// #5660: the O(1) reverse index must be the EXACT inverse of the forward
+// deterministic mapping across EVERY subscriber and pool-address position — idx
+// 0 (first), the middle addresses, and the LAST address. The pool here is
+// deliberately NON-CONTIGUOUS (gaps between 10.0.0.1/.9/.100/.200), which is the
+// realistic shape (NAT64 parses arbitrary pool strings; source-NAT pools span
+// disjoint ranges). This is the guard against the tempting-but-WRONG "O(1)"
+// shortcut of `translated_ip - pool_base`: a contiguous-subtraction reverse
+// would attribute .9/.100/.200 to the wrong index and turn this RED. Both the
+// old `position()` scan and the new hash index satisfy this round-trip, so it is
+// a correctness guard for the refactor (the perf change itself is unobservable).
+#[test]
+fn deterministic_reverse_v4_o1_index_is_exact_inverse_across_pool_boundaries() {
+    // Non-contiguous 4-address pool. block_size 4, blocks_per_ip 3 -> each pool
+    // address serves 3 subscriber blocks; host_count = 4 * 3 = 12 subscribers.
+    let pool = [
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(10, 0, 0, 9),
+        Ipv4Addr::new(10, 0, 0, 100),
+        Ipv4Addr::new(10, 0, 0, 200),
+    ];
+    let port_low = 1024u16;
+    let host_base = u32::from(Ipv4Addr::new(100, 64, 0, 0));
+    let det = DeterministicV4 {
+        block_size: 4,
+        blocks_per_ip: 3,
+        host_base,
+        host_count: 12,
+    };
+    let pool_index = build_pool_reverse_index(&pool);
+
+    // Every subscriber (sub_idx 0..host_count) round-trips forward -> reverse.
+    // sub_idx spans ip_idx 0 (first), 1, 2 (middle), and 3 (last).
+    for sub_idx in 0..det.host_count {
+        let src = Ipv4Addr::from(host_base + sub_idx);
+        let (ip_idx, block_idx) =
+            deterministic_indices_v4(&det, src).expect("in-range subscriber maps forward");
+        assert_eq!(ip_idx, (sub_idx / 3) as usize, "forward ip_idx");
+        let external = pool[ip_idx];
+        // Confirm the reverse index recovers the SAME position the forward used.
+        assert_eq!(
+            pool_index.get(&external).copied(),
+            Some(ip_idx as u32),
+            "reverse index must return the forward pool position for {external}"
+        );
+        // The whole port block reverses to the same subscriber.
+        let block_start = port_low as u32 + block_idx * det.block_size as u32;
+        for p in block_start..block_start + det.block_size as u32 {
+            let port = p as u16;
+            assert_eq!(
+                reverse_deterministic_v4(&det, &pool_index, port_low, external, port),
+                Some(src),
+                "reverse of (external {external}, port {port}) must recover subscriber {src}"
+            );
+        }
+    }
+
+    // Idx 0 / middle / last explicitly, as the ticket calls out.
+    for &ip_idx in &[0usize, 1, 2, 3] {
+        let external = pool[ip_idx];
+        let expected_sub = (ip_idx as u32) * det.blocks_per_ip as u32; // block_idx 0
+        let expected_src = Ipv4Addr::from(host_base + expected_sub);
+        assert_eq!(
+            reverse_deterministic_v4(&det, &pool_index, port_low, external, port_low),
+            Some(expected_src),
+            "pool boundary idx {ip_idx} ({external}) reverses to {expected_src}"
+        );
+    }
+
+    // An external IP NOT in the pool is rejected (the reverse index misses).
+    assert_eq!(
+        reverse_deterministic_v4(
+            &det,
+            &pool_index,
+            port_low,
+            Ipv4Addr::new(10, 0, 0, 2),
+            port_low,
+        ),
+        None,
+        "an address absent from the pool must not reverse to any subscriber"
+    );
+}
+
+// #5660 RED-on-revert (item 2): `AddressOccupancy::port_of` must REJECT an
+// offset outside the port range instead of silently truncating it through the
+// `u32 -> u16` cast into a valid-looking but WRONG port. Removing the range
+// guard (keeping the `Option` shape, e.g. `if false && offset >= self.range`)
+// makes the out-of-range asserts below return `Some(<forged port>)` and turns
+// this RED — a bare `offset as u16` wraps `65536 + k` back to `k`, forging the
+// port `port_low + k` inside the pool.
+#[test]
+fn port_of_rejects_out_of_range_offset_no_silent_truncation() {
+    // port_low 1024, port_high 2047 -> range 1024 (offsets 0..=1023 valid).
+    let alloc = PortAllocator::new(1, 1024, 2047);
+
+    // In-range offsets map to the exact wire port (no truncation).
+    assert_eq!(alloc.debug_port_of(0, 0), Some(1024), "offset 0 -> port_low");
+    assert_eq!(
+        alloc.debug_port_of(0, 1023),
+        Some(2047),
+        "last valid offset -> port_high"
+    );
+
+    // offset == range is one past the end: rejected, not wrapped to port_low.
+    assert_eq!(
+        alloc.debug_port_of(0, 1024),
+        None,
+        "offset == range must be rejected"
+    );
+
+    // The truncation forgery: offset 65536+5 casts (as u16) to 5, which would
+    // forge the VALID in-range port 1029. The range check rejects it instead.
+    assert_eq!(
+        alloc.debug_port_of(0, 65536 + 5),
+        None,
+        "an offset whose u16 truncation forges a valid port must be rejected"
     );
 }
 
