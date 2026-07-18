@@ -228,11 +228,18 @@ fn compute_forwarded_egress_ptb(
             // dropped below (`mtu_signalled`), so this never
             // falls through to forward the MTU-violating frame.
             // #5856: the bucket is PER INGRESS (from) ZONE,
-            // resolved from `ingress_ident.ifindex` via
-            // `ifindex_to_zone_id` exactly as the #3618 reject
-            // path does, so an oversized-DF flood ingressing ONE
-            // zone can no longer drain a single global bucket and
-            // suppress legitimate PMTUD for every OTHER zone. An
+            // resolved from the PHYSICAL ingress bind ifindex
+            // `ingress_ident.ifindex` via `ifindex_to_zone_id`. This
+            // site does NOT resolve the logical unit like the #3618
+            // reject path does, so VLAN sub-interfaces on one physical
+            // port SHARE that port's PTB bucket (the physical parent
+            // inherits its first sub-interface's zone); an untagged
+            // port has physical == logical, so its zone is exact. Even
+            // so an oversized-DF flood ingressing ONE physical port can
+            // no longer drain a single global bucket and suppress
+            // legitimate PMTUD for every OTHER port/zone — strictly
+            // better than the pre-#5856 global bucket, just coarser than
+            // the reject path's per-logical-unit granularity. An
             // unzoned / unknown ingress (id 0) falls back to the
             // shared `PACKET_TOO_BIG_FALLBACK_BUCKET`.
             if !ptb_reply_suppressed(source_frame, ptb_meta, l3, forwarding) {
@@ -271,9 +278,12 @@ fn compute_forwarded_egress_ptb(
                 // token is NOT consumed. Either way the oversized original is
                 // still dropped below (`mtu_signalled`), so the trigger
                 // disposition is unchanged. #5856: the token is taken from the
-                // ingress zone's per-zone PTB bucket, resolved from
-                // `ingress_ident.ifindex` via `ifindex_to_zone_id` (unzoned /
-                // unknown → the shared `PACKET_TOO_BIG_FALLBACK_BUCKET`).
+                // ingress zone's per-zone PTB bucket, resolved from the PHYSICAL
+                // ingress bind ifindex `ingress_ident.ifindex` via
+                // `ifindex_to_zone_id` — NOT the logical unit (unlike the #3618
+                // reject path), so VLAN sub-interfaces on one physical port share
+                // that port's bucket (unzoned / unknown → the shared
+                // `PACKET_TOO_BIG_FALLBACK_BUCKET`).
                 let from_zone_id = forwarding
                     .ifindex_to_zone_id
                     .get(&ingress_ident.ifindex)

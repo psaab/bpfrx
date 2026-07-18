@@ -503,6 +503,12 @@ fn find_overlap(
 /// packet carries exactly one relevant zone, so two rules conflict only when
 /// either scope is a wildcard (empty) or both name the same zone. Two distinct
 /// non-empty zones are disjoint — legitimate split-horizon.
+///
+/// #4339 fail-closed note: the `a == b` arm also rejects a degenerate
+/// same-name/same-prefix duplicate that a Go scope-expansion (#4339) could emit
+/// lowering to the SAME zone — there is no name-identity skip. That is a
+/// fail-CLOSED config rejection (the snapshot is dropped and the previous live
+/// state kept), never a translation bypass.
 #[inline]
 fn zones_conflict(a: &str, b: &str) -> bool {
     a.is_empty() || b.is_empty() || a == b

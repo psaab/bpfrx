@@ -1,3 +1,73 @@
+## 2026-07-18 — #5801: day-2 slow-path TUN MTU reconcile
+
+- **Timestamp**: 2026-07-18 (fix/5801-slowpath-mtu-reconcile)
+- **Action**: The persistent slow-path reinjector (`SlowPathReinjector`) is
+  preserved across snapshot reconciles, and its TUN MTU + immutable `mtu` field
+  were programmed only at creation (#2408). A valid day-2 config raising a
+  data-interface MTU updated the accepted snapshot but NOT the live TUN, so
+  reinjected frames above the old ceiling dropped persistently (`MtuExceeded`)
+  until helper restart — the reconcile path only WARNED. Fix: give the
+  reinjector a reconcile op that reprograms the live TUN and converges its
+  state. `SharedStatus::reprogram_mtu_status` is the day-2 sibling of
+  `apply_mtu_status`: on success it advances `live_mtu` and clears `degraded`;
+  on a FAILED `SIOCSIFMTU` it KEEPS the current live MTU (the running TUN
+  retains its last-programmed value — NOT the 1500 creation fallback), marks
+  degraded, and records the error. `SlowPathReinjector::reconcile_mtu` reads the
+  live device name, calls that helper, and stores the installed MTU into the now
+  interior-mutable `mtu: AtomicI64` field so `mtu()`, `live_mtu`, and enqueue
+  admission agree. In `apply_snapshot` the preserved-reinjector branch now calls
+  the extracted `reconcile_preserved_slow_path_mtu` seam (passing
+  `slowpath::set_if_mtu`) instead of only warning — deduped per distinct desired
+  value via `last_slow_path_mtu_warned` so a steady-state reconcile loop does
+  not re-issue the ioctl.
+- **Fail-on-revert tests**: `slowpath::tests::reprogram_mtu_status_advances_on_success`,
+  `reprogram_mtu_status_keeps_live_on_failure`,
+  `reconcile_mtu_reprograms_live_tun_and_admission`, and
+  `afxdp::coordinator::reconcile::snapshot::slow_path_mtu_tests::day2_mtu_increase_reprograms_preserved_reinjector`.
+  Programmer is an injected seam (no real `SIOCSIFMTU`; unit tests run without
+  CAP_NET_ADMIN). Neutralizing the fix (reconcile → no-op, failure arm → 1500
+  fallback, wiring → warn-only) turns 3 of the 4 RED (`left: 1500, right: 9000`);
+  the success-arm companion stays green. Restored fix: `test result: ok. 4
+  passed; 0 failed`.
+- **Validation**: `cargo build` clean; `cargo test --release slowpath` →
+  `35 passed; 0 failed`; the 4 new tests green by explicit filter.
+- **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/slowpath_tests.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
+
+## 2026-07-18 — #5100: retire vanished queue identities in fairness throughput window
+
+- **Timestamp**: 2026-07-18 (fix/5100-fairness-window-retire)
+- **Action**: The collector's rolling per-queue fairness throughput window
+  (`FairnessThroughputWindow`, consumed under the collector mutex by
+  `emitFairnessThroughputGauges` in `pkg/api/metrics_userspace.go`) never
+  deleted a key from `w.queues`. The seed-all-keys loop appended an empty
+  idle-advancement sample to EVERY historical `(ifindex, queueID)` each
+  update, so a queue that vanished (interface removal / ifindex churn / test
+  namespaces) never drained on its own and lingered for the process lifetime
+  — unbounded memory plus an ever-growing per-scrape seed+sort of the full
+  historical key slice under the mutex. Fix: after `prune`, RETIRE a queue
+  that is absent from the current status AND drained (empty `bytesByFlow`,
+  `bytesByWorker`, and `starvedFlows`). Added `currentQueues` (the identities
+  observed in this update's `FlowWorkerMap` — the sole creator of queue
+  states) and `fairnessQueueThroughputWindow.isDrained()`; the prune loop now
+  `delete(w.queues, key)` for drained-and-absent keys. Retirement is
+  metric-invariant: the scrape already skips queues with empty `bytesByFlow`,
+  so a retired queue produced no gauge sample anyway; a still-active queue is
+  never retired (its window samples keep `bytesByFlow` non-empty); a retired
+  identity that reappears re-registers cleanly via `queueState` with a fresh
+  baseline. Retention is now bounded by currently-observed identities plus one
+  window of recently-active ones.
+- **File(s)**: `pkg/dataplane/userspace/fairness_throughput.go`,
+  `pkg/dataplane/userspace/fairness_throughput_test.go`,
+  `docs/cos-traffic-shaping.md`, `_Log.md`
+- **Validation**: `go build`, `go vet`, `go test ./pkg/dataplane/userspace/`
+  (full package green, 14.6s); fairness subset `-count=5` no flakes. New
+  `TestFairnessThroughputWindowRetiresVanishedQueueIdentity` (fail-on-revert:
+  neutralizing the `delete` leaves the vanished key present → FAIL) and
+  `TestFairnessThroughputWindowBoundsMemoryUnderQueueChurn` (200 churned
+  identities → peak `w.queues` size = 2 with the fix, ~200 without).
+
 ## 2026-07-18 — #5290: fair HA session-delta drain + overflow resync latch
 
 - **Timestamp**: 2026-07-18 (fix/5290-drain-deltas-fairness)
@@ -52331,3 +52401,67 @@ top.
   — all green. `segmentation_miss_recorder_is_rate_capped` updated for the
   sampler (identical flood collapses to one ring entry; #1282 cap counter
   still saturates at 20).
+
+## 2026-07-18 — #5611: lock the NPTv6 wildcard-vs-concrete overlap-reject edge
+- **Timestamp**: 2026-07-18
+- **Action**: Test-coverage lock-in follow-up to #5176 (PR #5610). The NPTv6
+  `from_zone` scope-overlap gate `zones_conflict(a,b) = a.is_empty() ||
+  b.is_empty() || a == b` correctly REJECTS a wildcard (`from_zone=""`) rule
+  overlapping a concrete-zone rule with the same prefix (the empty short-circuit
+  → conflict → snapshot rejected) and a same-concrete-zone duplicate (the `a==b`
+  arm), but neither edge had an explicit regression-locking test. Existing
+  overlap tests use both-empty `from_zone`; the split-horizon test covers the
+  distinct-non-empty ADMIT. Added two fail-on-revert tests to lock both reject
+  paths. COVERAGE ONLY — no production behavior change.
+- **Tests** (userspace-dp/src/nptv6_tests.rs):
+  - `nptv6_wildcard_vs_concrete_same_prefix_rejected_5611` (:923) — wildcard +
+    concrete same internal `fd00:1::/48`, distinct external prefixes, BOTH
+    argument orderings (wildcard-first and concrete-first) → `expect_err`
+    `Nptv6OverlappingPrefix`. Binds the empty short-circuit and argument-order
+    symmetry (an asymmetric simplification checking only one side's emptiness is
+    caught). Goes RED under the `zones_conflict -> a == b` neutralization.
+  - `nptv6_same_concrete_zone_same_prefix_rejected_5611` (:963) — `untrust` +
+    `untrust` same internal prefix → `expect_err`. Guards the `a == b` arm
+    (stays GREEN under the `a==b` neutralization, RED if the equality arm is
+    dropped).
+- **Docs**: added a `#4339` fail-closed doc paragraph above `zones_conflict`
+  (nptv6.rs) — the `a == b` arm also rejects a degenerate same-name/same-prefix
+  duplicate a Go scope-expansion (#4339) could emit; a fail-CLOSED config
+  rejection (keeps prior live state), never a translation bypass.
+- **Validation** (release, uncontended target dir): baseline GREEN
+  `test result: ok. 2 passed; 0 failed`; neutralized `zones_conflict -> a == b`
+  → `nptv6_wildcard_vs_concrete_same_prefix_rejected_5611 ... FAILED`,
+  `test result: FAILED. 1 passed; 1 failed`; restored production
+  `test result: ok. 2 passed; 0 failed`. Full `cargo test --release nptv6`
+  module GREEN (44 passed, 0 failed) with fmt clean. Test-only + no forwarding
+  bytes change → no cluster smoke required (#5611 exemption).
+- **File(s)**: userspace-dp/src/nptv6.rs, userspace-dp/src/nptv6_tests.rs,
+  _Log.md
+
+## 2026-07-18 — #6046 TE/PTB per-zone bucket doc/comment accuracy (doc-only)
+- **Timestamp**: 2026-07-18
+- **Action**: Corrected the #5856 per-zone ICMP TE/PTB bucket docs + comments,
+  which OVERCLAIMED per-VLAN-subinterface granularity. Verified firsthand that
+  the TE/PTB generators key the per-zone bucket on the PHYSICAL ingress bind
+  ifindex (`ingress_ident.ifindex`, the fixed per-binding socket-bind port) via
+  `ifindex_to_zone_id` WITHOUT calling `resolve_ingress_logical_ifindex`, so VLAN
+  sub-interfaces on the same physical port SHARE that port's TE/PTB bucket. Only
+  the Reject path resolves the LOGICAL unit (`logical_ingress_ifindex`) and thus
+  gets per-sub-interface granularity. Kept the correct framing: the per-zone split
+  is still correct and strictly better than the pre-#5856 single global bucket.
+- **Evidence** (all origin/master @ cdd26a5): TE bucket keys physical at
+  `icmp.rs:231-235` (`ifindex_to_zone_id.get(&ingress_ident.ifindex)`, no
+  resolve); PTB bucket keys physical at `tx/dispatch/mod.rs:277-281`;
+  `ingress_ident` = `worker_ctx.ident` = `binding.identity()` = physical
+  socket-bind ifindex (`worker/mod.rs:855-863`, `641`; `lifecycle.rs:170-172`;
+  `bringup.rs:66-72`). Reject resolves logical at
+  `poll_descriptor/reject_reply.rs:272-274` then keys the bucket on it at
+  `:398-402`; reject is invoked with the physical `binding.ifindex`
+  (`poll_descriptor/mod.rs:1280`). `ifindex_to_zone_id` is keyed by the LOGICAL
+  `iface.ifindex`, physical parent inherits only the FIRST sub-if's zone
+  (`forwarding_build/interfaces.rs:81-91`).
+- **Change**: comment/doc-only — NO code logic touched. `cargo build` clean;
+  `git diff` shows only `//` comment hunks in the two .rs files + the .md.
+- **File(s)**: docs/generated-reply-rate-limit.md,
+  userspace-dp/src/afxdp/icmp.rs, userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  _Log.md

@@ -434,6 +434,160 @@ func TestFairnessThroughputWindowEqualFlowEstimateCapsWorkerIDs(t *testing.T) {
 	}
 }
 
+// TestFairnessThroughputWindowRetiresVanishedQueueIdentity asserts that a
+// (ifindex, queueID) that disappears from the status and then idles past the
+// rolling window is DELETED from w.queues (retired), while a still-active
+// queue is retained. Without retirement the vanished key lingers for the
+// process lifetime: the seed-all-keys idle-advancement loop keeps appending
+// empty samples to it, so its state never drains on its own, and every scrape
+// re-seeds and re-sorts the full historical key slice. Reverting the
+// retirement leaves the vanished key present and fails this test.
+func TestFairnessThroughputWindowRetiresVanishedQueueIdentity(t *testing.T) {
+	window := NewFairnessThroughputWindow(15 * time.Second)
+	now := time.Unix(100, 0)
+	qA := uint8(4)
+	qB := uint8(5)
+	keyA := fairnessQueueKey{ifindex: 80, queueID: qA}
+	keyB := fairnessQueueKey{ifindex: 80, queueID: qB}
+
+	build := func(includeA bool, aBytes, bBytes uint64) ProcessStatus {
+		var flows []FlowWorkerStatus
+		if includeA {
+			flows = append(flows, FlowWorkerStatus{
+				EgressIfindex: 80,
+				CoSQueueID:    &qA,
+				WorkerID:      0,
+				ForwardWireKey: FlowTupleStatus{
+					AddrFamily: 2, Protocol: 6,
+					SrcIP: "10.0.0.1", DstIP: "198.51.100.1",
+					SrcPort: 10001, DstPort: 5201,
+				},
+				ObservedBytes: aBytes,
+			})
+		}
+		flows = append(flows, FlowWorkerStatus{
+			EgressIfindex: 80,
+			CoSQueueID:    &qB,
+			WorkerID:      1,
+			ForwardWireKey: FlowTupleStatus{
+				AddrFamily: 2, Protocol: 6,
+				SrcIP: "10.0.0.2", DstIP: "198.51.100.1",
+				SrcPort: 10002, DstPort: 5201,
+			},
+			ObservedBytes: bBytes,
+		})
+		return ProcessStatus{
+			Workers: 2,
+			CoSInterfaces: []CoSInterfaceStatus{{
+				Ifindex: 80,
+				Queues: []CoSQueueStatus{
+					{QueueID: int(qA), TransmitRateBytes: 500},
+					{QueueID: int(qB), TransmitRateBytes: 500},
+				},
+			}},
+			FlowWorkerMap: flows,
+		}
+	}
+
+	// Baseline observation (no delta yet).
+	window.Update(now, build(true, 1_000, 1_000))
+	// Both queues take a real sample and register in w.queues.
+	window.Update(now.Add(10*time.Second), build(true, 6_000, 6_000))
+	if _, ok := window.queues[keyA]; !ok {
+		t.Fatalf("queue A missing after active sample")
+	}
+	if _, ok := window.queues[keyB]; !ok {
+		t.Fatalf("queue B missing after active sample")
+	}
+
+	// Queue A vanishes from the status but its last sample is still inside
+	// the window: it must be RETAINED (recently active), not retired.
+	window.Update(now.Add(20*time.Second), build(false, 0, 11_000))
+	if _, ok := window.queues[keyA]; !ok {
+		t.Fatalf("queue A retired while still inside the rolling window")
+	}
+
+	// Advance well past the window with A still absent. A's real sample ages
+	// out, draining its state; A is absent from the active set and must be
+	// retired. B stays active and must be retained.
+	got := window.Update(now.Add(100*time.Second), build(false, 0, 16_000))
+	if _, ok := window.queues[keyA]; ok {
+		t.Fatalf("vanished queue A not retired from w.queues after idling past the window")
+	}
+	if _, ok := window.queues[keyB]; !ok {
+		t.Fatalf("active queue B was retired")
+	}
+
+	// Correctness preserved: the retired queue emits no summary, the active
+	// one still does.
+	for _, summary := range got {
+		if summary.QueueID == qA {
+			t.Fatalf("retired queue A still produced a summary: %+v", summary)
+		}
+	}
+	sawB := false
+	for _, summary := range got {
+		if summary.QueueID == qB {
+			sawB = true
+		}
+	}
+	if !sawB {
+		t.Fatalf("active queue B produced no summary: %+v", got)
+	}
+
+	// A retired key that reappears re-registers cleanly with a fresh
+	// baseline (one update to seed w.prev, the next measures a delta).
+	window.Update(now.Add(110*time.Second), build(true, 21_000, 21_000))
+	window.Update(now.Add(120*time.Second), build(true, 26_000, 26_000))
+	if _, ok := window.queues[keyA]; !ok {
+		t.Fatalf("queue A did not re-register after reappearing")
+	}
+}
+
+// TestFairnessThroughputWindowBoundsMemoryUnderQueueChurn drives a long run
+// where a fresh (ifindex, queueID) appears, delivers one real sample, then
+// vanishes forever — the interface-recreation / ifindex-churn pattern from
+// the bug report. With retirement, w.queues is bounded by the active queue
+// plus the handful still inside the rolling window; without it, every churned
+// identity accumulates for the process lifetime (hundreds here).
+func TestFairnessThroughputWindowBoundsMemoryUnderQueueChurn(t *testing.T) {
+	window := NewFairnessThroughputWindow(15 * time.Second)
+	base := time.Unix(100, 0)
+	q := uint8(0)
+	maxSeen := 0
+	// Each identity spans two updates: a baseline observation then a real
+	// delta sample, after which a new ifindex takes over and it never returns.
+	for j := 0; j < 400; j++ {
+		ifindex := 2_000 + j/2
+		observed := uint64(1_000)
+		if j%2 == 1 {
+			observed = 6_000
+		}
+		status := ProcessStatus{
+			Workers: 1,
+			FlowWorkerMap: []FlowWorkerStatus{{
+				EgressIfindex: ifindex,
+				CoSQueueID:    &q,
+				WorkerID:      0,
+				ForwardWireKey: FlowTupleStatus{
+					AddrFamily: 2, Protocol: 6,
+					SrcIP: "10.0.0.1", DstIP: "198.51.100.1",
+					SrcPort: 10001, DstPort: 5201,
+				},
+				ObservedBytes: observed,
+			}},
+		}
+		window.Update(base.Add(time.Duration(j)*10*time.Second), status)
+		if n := len(window.queues); n > maxSeen {
+			maxSeen = n
+		}
+	}
+	t.Logf("peak w.queues size under churn = %d (200 distinct identities churned)", maxSeen)
+	if maxSeen > 8 {
+		t.Fatalf("w.queues grew to %d identities under churn; retirement is not bounding memory", maxSeen)
+	}
+}
+
 func throughputStatus(queueID uint8, firstBytes uint64, secondBytes uint64) ProcessStatus {
 	return ProcessStatus{
 		Workers: 2,
