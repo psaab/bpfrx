@@ -28,7 +28,9 @@ import (
 // (offload toggles, ring resizes, RSS key writes on mlx5) would hang every
 // commit and HA config sync (#1794/#1800 U3, AGY r2). WaitDelay caps the
 // post-SIGKILL pipe-drain window.
-func runEthtool(args ...string) ([]byte, error) {
+// A package var (not a plain func) so the #5268 fail-closed activation gate can
+// be unit-tested by substituting a fake ethtool without a real NIC.
+var runEthtool = func(args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ethtool", args...)
@@ -1382,35 +1384,124 @@ func parsePortRange(spec string) (uint16, uint16, error) {
 	return uint16(port), uint16(port), nil
 }
 
-// ensureRxVlanOff disables rx-vlan-offload on iface if not already off.
-// Results are cached to avoid redundant ethtool subprocess calls.
-// Toggling rxvlan on iavf VFs causes a driver reset that drops in-flight
-// packets, so we check current state before changing.
-func (r *CompileResult) ensureRxVlanOff(iface string) {
+// ensureRxVlanOff disables rx-vlan-offload on iface so the XDP parser sees the
+// 802.1Q tag in packet data (a NIC that strips the tag into skb->vlan_tci,
+// which XDP cannot read, would make every tagged frame parse as vlan_id=0).
+// Results are cached to avoid redundant ethtool subprocess calls. Toggling
+// rxvlan on iavf VFs causes a driver reset that drops in-flight packets, so we
+// check current state before changing.
+//
+// #5268: returns an error when the offload is ACTIVE and could NOT be turned
+// off (or the state cannot be determined and disabling failed). A NIC whose
+// query reports the feature ABSENT, or already `off`/`off [fixed]` (e.g.
+// virtio), never strips tags, so it returns nil without touching `-K`. The
+// caller (compiler_iface.go) uses `rxVlanOffloadActivationError` to fail the
+// compile CLOSED on a returned error ONLY when the parent carries configured
+// VLAN subinterfaces (see the security rationale there) — a plain parent with
+// no 802.1Q units is unaffected.
+func (r *CompileResult) ensureRxVlanOff(iface string) error {
 	if r.rxVlanOffCache[iface] {
-		return
+		return nil
 	}
 	// Check current state via ethtool -k.
 	out, err := runEthtool("-k", iface)
 	if err == nil {
+		featurePresent := false
 		for _, line := range strings.Split(string(out), "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "rx-vlan-offload:") {
-				if strings.Contains(line, "off") {
+			l := strings.TrimSpace(line)
+			if strings.HasPrefix(l, "rx-vlan-offload:") {
+				featurePresent = true
+				// Parse the VALUE after the colon — NOT `Contains(l, "off")`,
+				// which matches the feature NAME "rx-vlan-offLOAD" and so read
+				// EVERY line (on or off) as "off", meaning an ACTIVE offload was
+				// never actually disabled (pre-#5268 latent bug). The value is
+				// "on" or "off"/"off [fixed]".
+				value := strings.TrimSpace(strings.TrimPrefix(l, "rx-vlan-offload:"))
+				if strings.HasPrefix(value, "off") {
+					// Already off (includes "off [fixed]"): no tags stripped.
 					r.rxVlanOffCache[iface] = true
-					return
+					return nil
 				}
+				// Reported "on": fall through to disable below.
 				break
 			}
 		}
+		if !featurePresent {
+			// A SUCCESSFUL query that lists no rx-vlan-offload feature at all
+			// means the NIC has no such offload, so it never strips tags —
+			// safe. Do NOT attempt `-K` (which would fail "not supported" on
+			// such a NIC and falsely trip the fail-closed gate for a virtio
+			// VLAN parent).
+			r.rxVlanOffCache[iface] = true
+			return nil
+		}
 	}
-	// Not off yet — disable it.
+	// Either the offload is ON, or the query failed (state unknown): attempt to
+	// disable. Success => off; failure => the caller may fail closed.
 	if out, err := runEthtool("-K", iface, "rxvlan", "off"); err != nil {
-		slog.Warn("failed to disable rxvlan offload (VLAN parsing may fail)",
+		slog.Warn("failed to disable rxvlan offload (HW-stripped tags cannot be parsed by XDP)",
 			"interface", iface, "err", err, "output", strings.TrimSpace(string(out)))
-	} else {
-		r.rxVlanOffCache[iface] = true
-		slog.Info("disabled VLAN RX offload for XDP", "interface", iface)
+		return fmt.Errorf("disable rx-vlan-offload on %s: %w (output: %s)",
+			iface, err, strings.TrimSpace(string(out)))
 	}
+	r.rxVlanOffCache[iface] = true
+	slog.Info("disabled VLAN RX offload for XDP", "interface", iface)
+	return nil
+}
+
+// parentHasVlanSubinterface reports whether the config interface cfgName carries
+// at least one configured 802.1Q VLAN subinterface (a logical unit with
+// VlanID > 0). #5268 gates the fail-closed RX-VLAN-offload activation check on
+// this: only a parent that classifies traffic by in-frame VLAN tag is at risk
+// when the tag is HW-stripped; a plain parent (no 802.1Q units) does not care
+// about the offload state, so a disable failure there is tolerated.
+func parentHasVlanSubinterface(cfg *config.Config, cfgName string) bool {
+	if cfg == nil {
+		return false
+	}
+	ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]
+	if !ok || ifCfg == nil {
+		return false
+	}
+	for _, unit := range ifCfg.Units {
+		if unit != nil && unit.VlanID > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// rxVlanOffloadActivationError decides whether a failure to disable RX-VLAN
+// hardware offload on physName must FAIL ACTIVATION CLOSED (#5268). It returns
+// a non-nil error ONLY when `ensureErr != nil` AND the parent config interface
+// cfgName carries ≥1 configured 802.1Q VLAN subinterface.
+//
+// Security rationale: the XDP dataplane derives VLAN (security-domain) identity
+// SOLELY from the in-frame 802.1Q tag. If a NIC's RX-VLAN offload strips the tag
+// into skb->vlan_tci (which XDP cannot read) and xpf cannot disable it, every
+// tagged frame parses as vlan_id=0 and `resolve_ingress_logical_ifindex` falls
+// back to the PHYSICAL parent ifindex, which maps to the parent's / first
+// subinterface's zone — so untrusted VLAN traffic is classified into a TRUSTED
+// zone (a screen/policy bypass). Pre-#5268 this degraded to a single warning and
+// activation continued into shim attachment. Now it is an activation
+// precondition. A parent with no VLAN subinterfaces does not classify by tag, so
+// the offload state is irrelevant and the failure is tolerated (nil) — plain-
+// interface deploys and NICs that legitimately lack the offload knob are
+// unaffected.
+func rxVlanOffloadActivationError(cfg *config.Config, cfgName, physName string, ensureErr error) error {
+	if ensureErr == nil {
+		return nil
+	}
+	if !parentHasVlanSubinterface(cfg, cfgName) {
+		return nil
+	}
+	return fmt.Errorf(
+		"interface %s carries configured VLAN subinterface(s) but RX-VLAN hardware "+
+			"offload could not be disabled (%w): XDP reads 802.1Q identity only from "+
+			"in-frame tags, so HW-stripped tagged traffic would fall back to the parent "+
+			"ifindex and be classified into the parent's zone (cross-zone security "+
+			"bypass) — failing activation closed",
+		physName, ensureErr)
 }
 
 // applyEthtool applies speed and duplex settings via ethtool if configured.
