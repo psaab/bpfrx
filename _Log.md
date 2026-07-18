@@ -1,3 +1,44 @@
+## 2026-07-17 — #5444: filter modifier propagation is Arc<str>, not per-packet String clone
+
+- **Timestamp**: 2026-07-17 (fix/5444-filter-modifier-clone)
+- **Action**: `merge_matched_modifiers` (userspace-dp filter action-eval hot
+  path, runs per matched term on every input/output/lo0 filter walk)
+  heap-cloned two owned `String` fields (`policer_name`, `routing_instance`)
+  into the per-packet `FilterResult` for EVERY matched term — two allocation
+  +copy events on the filter fast path. Converted `FilterTerm.policer_name`
+  and `FilterTerm.routing_instance` from `String` to `Arc<str>` (interned once
+  at compile time in `compiler.rs`, mirroring the existing
+  `forwarding_class: Arc<str>`), and `FilterResult.policer_name` /
+  `.routing_instance` from `String` to `Option<Arc<str>>` (mirroring the #5151
+  `forwarding_class: Option<Arc<str>>` pattern). The merge is now a refcount
+  bump; the accumulator default and the non-routing reset are zero-alloc
+  (`None`) instead of `String::new()`. Output is byte-identical — the same
+  policer/routing-instance/forwarding-class values flow downstream. Verified
+  no non-test consumer reads either FilterResult field (the live routing-
+  instance override rides the separate `FilterRoutingInstanceResult<'a>` with
+  its `&'a str`, untouched); neither field is mutated in place; the config-
+  owned source outlives every FilterResult. `cache_sensitive.rs` term-compare
+  (`Arc<str> == Arc<str>`) and PBR evaluators (`&*term.routing_instance`)
+  adjusted. Two test asserts on `FilterResult.routing_instance` moved from
+  `.is_empty()` to `.is_none()`.
+- **File(s)**: userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/engine/eval.rs, userspace-dp/src/filter/tests.rs
+- **Validation**: `cargo build` clean; filter suite 189 tests green, run 5×
+  no flakes; new perf-with-correctness-guard test
+  `filter_result_modifiers_roundtrip_5444` asserts all three modifiers round-
+  trip into FilterResult on a match and default to `None` on a miss (NOT a
+  RED-on-revert — values are byte-identical either way; it guards against a
+  future refactor silently dropping a modifier). Grepped the changed fn: the
+  three remaining `.clone()` are all `Arc<str>` refcount bumps, zero
+  `String::`/`.to_string()`. Two full-suite failures
+  (`wire_invariant_default_specimens` nat64 stats fixture drift,
+  `stalled_consumer_...backlog_unbounded_end_to_end` backpressure timing) are
+  PRE-EXISTING — reproduced identically with this change stashed; unrelated to
+  the filter module. Perf-only change with byte-identical output, so no
+  design-doc/contract update needed (the #5444 in-code comments, mirroring the
+  #5151/#5857 precedent, are the documentation surface).
+
 ## 2026-07-17 — #5469: write_state serializes+fsyncs OUTSIDE the ServerState lock
 
 - **Timestamp**: 2026-07-17 (fix/5469-writestate-lock-convoy)
