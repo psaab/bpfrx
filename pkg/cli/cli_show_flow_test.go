@@ -52,3 +52,27 @@ func TestSessionBriefWriterPreservesLongValues(t *testing.T) {
 		t.Fatalf("brief output still contains tabs after flush:\n%s", out)
 	}
 }
+
+// TestFlowSessionDisplayIDMatchesDataplaneID is the #5213 correlation invariant:
+// the id shown by `show security flow session` must equal the STABLE dataplane
+// session id (dataplane.SessionValue.SessionID) that the userspace-dp conntrack
+// mirror stamps from SessionEntry.session_id (#4915) — the SAME u64 RT_FLOW
+// emits on SESSION_CREATE/CLOSE for that session. Only an absent (0) id may fall
+// back to the per-row ordinal. Reverting flowSessionDisplayID to always return
+// the ordinal turns the first assertion RED.
+func TestFlowSessionDisplayIDMatchesDataplaneID(t *testing.T) {
+	// A real, RT_FLOW-correlated dataplane id (worker 7 in the high 16 bits,
+	// per-worker counter 42). show-flow MUST render this exact value, NOT the
+	// per-row ordinal — that equality IS the cross-surface correlation.
+	const rtFlowSessionID uint64 = (7 << 48) | 42
+	const ordinal = 3
+	if got := flowSessionDisplayID(rtFlowSessionID, ordinal); got != rtFlowSessionID {
+		t.Fatalf("show-flow id = %d, want dataplane/RT_FLOW id %d (not ordinal %d)",
+			got, rtFlowSessionID, ordinal)
+	}
+	// Defensive fallback: an absent (0) dataplane id renders the ordinal, never
+	// a bare 0 — the pre-#5213 legacy display for a row with no stamped id.
+	if got := flowSessionDisplayID(0, ordinal); got != uint64(ordinal) {
+		t.Fatalf("absent dataplane id must fall back to ordinal %d, got %d", ordinal, got)
+	}
+}

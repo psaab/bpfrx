@@ -1000,6 +1000,17 @@ impl SessionTable {
         self.record_by_key_mut(key).map(|r| &mut r.entry)
     }
 
+    /// #5213: the STABLE session id (`SessionEntry.session_id`, #4915) for the
+    /// live entry keyed by `key`, or `0` when no live entry exists. Used by the
+    /// conntrack-mirror publish (`show security flow session`) so its id matches
+    /// the one RT_FLOW emits for the same session; `0` keeps the legacy ordinal
+    /// fallback on the Go render side. Mirrors the same `entry_by_key(...).
+    /// session_id` read the Open/Close delta harvest already performs.
+    #[inline]
+    pub(crate) fn session_id_for(&self, key: &SessionKey) -> u64 {
+        self.entry_by_key(key).map(|e| e.session_id).unwrap_or(0)
+    }
+
     #[inline]
     fn contains_key(&self, key: &SessionKey) -> bool {
         self.key_to_handle.contains_key(key)

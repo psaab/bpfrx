@@ -1279,10 +1279,13 @@ pub(crate) fn match_source_nat_result_for_tuple(
                 // IPv4 fixes both the external pool address and the port block, so
                 // no per-flow log is needed to reverse (external IP, port) back to
                 // the subscriber. Address-only cases (port-less / no-translation /
-                // tuple-unknown) still pick the DETERMINISTIC external address; the
-                // PAT case additionally allocates a port inside the subscriber's
-                // fixed block. An out-of-range subscriber fails closed rather than
-                // silently round-robining.
+                // tuple-unknown) still pick the DETERMINISTIC external address; a
+                // REAL address-only flow additionally mints a reverse-identity
+                // occupancy token so a colliding second flow fails closed (#5341,
+                // mirroring the round-robin/persistent #5269/#5336 fix), while the
+                // synthetic tuple-unknown wrapper mints none. The PAT case allocates
+                // a port inside the subscriber's fixed block. An out-of-range
+                // subscriber fails closed rather than silently round-robining.
                 if let Some(det) = rule.deterministic_v4 {
                     if address_only {
                         let Some((ip_idx, _)) = deterministic_indices_v4(&det, src_v4) else {
@@ -1298,25 +1301,70 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             ));
                         }
                         let pool_addr = rule.pool_addresses_v4[ip_idx];
-                        let port = if tuple_unknown && !rule.no_translation {
-                            match rule.pool_allocator.try_next_port(ip_idx) {
-                                Ok(port) => Some(port),
-                                Err(reason) => {
-                                    return SourceNatLookup::Unavailable(
-                                        SourceNatFailure::for_rule(rule, reason),
-                                    );
+                        if tuple_unknown {
+                            // Synthetic address-only wrapper (protocol == 0, never
+                            // a framed packet): keep the historical round-robin port
+                            // for the non-no-translation case, or preserve (None)
+                            // for no-translation. No occupancy token — there is no
+                            // real flow / reverse session entry to disambiguate and
+                            // the returned port is never written to a frame.
+                            // Symmetric with the round-robin/persistent branch
+                            // below (#5269).
+                            let port = if rule.no_translation {
+                                None
+                            } else {
+                                match rule.pool_allocator.try_next_port(ip_idx) {
+                                    Ok(port) => Some(port),
+                                    Err(reason) => {
+                                        return SourceNatLookup::Unavailable(
+                                            SourceNatFailure::for_rule(rule, reason),
+                                        );
+                                    }
                                 }
+                            };
+                            return SourceNatLookup::Matched(NatDecision {
+                                rewrite_src: Some(IpAddr::V4(pool_addr)),
+                                rewrite_dst: None,
+                                rewrite_src_port: port,
+                                rewrite_dst_port: None,
+                                ..NatDecision::default()
+                            });
+                        }
+                        // #5341: a REAL address-only flow on a DETERMINISTIC-CGNAT
+                        // (mode 1) pool — `port no-translation` on a port-bearing
+                        // protocol, or a port-less protocol (GRE/ESP/...). Like the
+                        // round-robin/persistent branch (#5269, fixed in #5336),
+                        // mint a reverse-identity occupancy token on the chosen
+                        // DETERMINISTIC external address so a second flow that would
+                        // collide on the SAME public reverse tuple (two subscribers
+                        // sharing one deterministic pool address, same preserved
+                        // source port, same remote) is DENIED as exhaustion instead
+                        // of receiving an unowned duplicate the reverse (1:N) index
+                        // cannot disambiguate. The wire packet keeps its own source
+                        // port (rewrite_src_port left None — checksum.rs preserves
+                        // it; the port-less frame rewriter is gated on
+                        // `has_l4_ports`). The token is freed by the SAME teardown
+                        // path (`release_source_nat_allocation` -> `release_flow`)
+                        // as the round-robin branch — no new release site, no leak.
+                        match rule
+                            .pool_allocator
+                            .reserve_address_only(flow, IpAddr::V4(pool_addr))
+                        {
+                            Ok(translated) => {
+                                return SourceNatLookup::Matched(NatDecision {
+                                    rewrite_src: Some(translated.ip),
+                                    rewrite_dst: None,
+                                    rewrite_src_port: None,
+                                    rewrite_dst_port: None,
+                                    ..NatDecision::default()
+                                });
                             }
-                        } else {
-                            None
-                        };
-                        return SourceNatLookup::Matched(NatDecision {
-                            rewrite_src: Some(IpAddr::V4(pool_addr)),
-                            rewrite_dst: None,
-                            rewrite_src_port: port,
-                            rewrite_dst_port: None,
-                            ..NatDecision::default()
-                        });
+                            Err(reason) => {
+                                return SourceNatLookup::Unavailable(
+                                    SourceNatFailure::for_rule(rule, reason),
+                                );
+                            }
+                        }
                     }
                     let translated = match rule.pool_allocator.allocate_deterministic_v4(
                         flow,
@@ -1383,10 +1431,29 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     // wire packet still keeps its own source port (rewrite_src_port
                     // left None — checksum.rs preserves it; the port-less frame
                     // rewriter is gated on `has_l4_ports`).
-                    match rule
-                        .pool_allocator
-                        .reserve_address_only(flow, IpAddr::V4(pool_addr))
-                    {
+                    //
+                    // #6041: when the pool also configures `persistent-nat`, pin a
+                    // public ADDRESS across the configured permit scope via an
+                    // address-only persistent LEASE (the lease picks/reuses the
+                    // address itself, so the round-robin `pool_addr` chosen above
+                    // is bypassed — persistence no longer depends on the global
+                    // `address-persistent` hash). The per-flow reverse-identity
+                    // token is still minted for the #5269 collision guard.
+                    let reserved = if rule.persistent_nat {
+                        rule.pool_allocator.reserve_address_only_persistent(
+                            flow,
+                            PoolAddressFamily::V4(&rule.pool_addresses_v4),
+                            0,
+                            rule.address_persistent,
+                            rule.persistent_nat_permit,
+                            rule.persistent_nat_timeout_ns,
+                            now_ns,
+                        )
+                    } else {
+                        rule.pool_allocator
+                            .reserve_address_only(flow, IpAddr::V4(pool_addr))
+                    };
+                    match reserved {
                         Ok(translated) => {
                             return SourceNatLookup::Matched(NatDecision {
                                 rewrite_src: Some(translated.ip),
@@ -1465,11 +1532,26 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     }
                     // #5269: REAL address-only flow — mint a reverse-identity
                     // occupancy token (deny a colliding second flow as exhaustion),
-                    // symmetric with the v4 branch above.
-                    match rule
-                        .pool_allocator
-                        .reserve_address_only(flow, IpAddr::V6(pool_addr))
-                    {
+                    // symmetric with the v4 branch above. #6041: route the
+                    // `persistent-nat` combination through the address-only
+                    // persistent lease so the public address is pinned across the
+                    // permit scope (the lease selects the address; the round-robin
+                    // `pool_addr` above is bypassed).
+                    let reserved = if rule.persistent_nat {
+                        rule.pool_allocator.reserve_address_only_persistent(
+                            flow,
+                            PoolAddressFamily::V6(&rule.pool_addresses_v6),
+                            v6_offset,
+                            rule.address_persistent,
+                            rule.persistent_nat_permit,
+                            rule.persistent_nat_timeout_ns,
+                            now_ns,
+                        )
+                    } else {
+                        rule.pool_allocator
+                            .reserve_address_only(flow, IpAddr::V6(pool_addr))
+                    };
+                    match reserved {
                         Ok(translated) => {
                             return SourceNatLookup::Matched(NatDecision {
                                 rewrite_src: Some(translated.ip),

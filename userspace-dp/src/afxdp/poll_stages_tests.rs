@@ -209,7 +209,7 @@ fn session_miss_ack_stage_invokes_syn_cookie_runtime_validation() {
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
@@ -410,7 +410,7 @@ fn priority_tagged_vlan0_screen_stage_parses_l3_at_offset_18() {
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
@@ -619,7 +619,7 @@ fn neighbor_learn_ctx(
     let shared_owner_rg_indexes = Box::leak(Box::new(SharedSessionOwnerRgIndexes::default()));
     let local_tunnel_deliveries =
         Box::leak(Box::new(Arc::new(ArcSwap::from_pointee(BTreeMap::new()))));
-    let recent_exceptions = Box::leak(Box::new(Arc::new(Mutex::new(VecDeque::new()))));
+    let recent_exceptions = Box::leak(Box::new(Arc::new(Mutex::new(ExceptionEventRing::new()))));
     let last_resolution = Box::leak(Box::new(Arc::new(Mutex::new(None))));
     let peer_worker_commands = Box::leak(Box::new(Vec::new()));
     let dnat_fds = Box::leak(Box::new(DnatTableFds::default()));
@@ -1593,7 +1593,7 @@ fn screen_zone_lookup_uses_logical_ingress_ifindex_3022() {
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
@@ -1804,7 +1804,7 @@ fn run_stage_screen(
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
@@ -2233,7 +2233,7 @@ fn stage_ipsec_passthrough_exempts_all_classes_3616() {
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
@@ -2499,7 +2499,7 @@ fn stage_ipsec_passthrough_gates_new_ike_4323() {
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
@@ -2677,7 +2677,7 @@ fn run_stage11(
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();

@@ -244,6 +244,42 @@ impl SharedStatus {
         }
     }
 
+    /// Reprogram the live TUN MTU on a day-2 reconcile (#5801) and update
+    /// status, returning the live MTU now in effect.
+    ///
+    /// This is the day-2 sibling of [`Self::apply_mtu_status`]. The creation
+    /// path falls a FAILED program back to the kernel-default 1500 because the
+    /// TUN was just created at 1500. On a reconcile the running TUN already
+    /// carries whatever MTU it was last programmed with, so a failed
+    /// `SIOCSIFMTU` must KEEP the existing `live_mtu` (resetting it to 1500
+    /// would wrongly refuse frames the device can still carry). On success
+    /// `live_mtu` advances to `desired_mtu` and `degraded` clears; on failure
+    /// `live_mtu` is unchanged, `degraded` is set, and the error is recorded.
+    fn reprogram_mtu_status(
+        &self,
+        name: &str,
+        desired_mtu: i32,
+        programmer: impl FnOnce(&str, i32) -> Result<(), String>,
+    ) -> i32 {
+        match programmer(name, desired_mtu) {
+            Ok(()) => {
+                self.live_mtu.store(desired_mtu as i64, Ordering::Relaxed);
+                self.degraded.store(false, Ordering::Relaxed);
+                desired_mtu
+            }
+            Err(err) => {
+                let live = self.live_mtu.load(Ordering::Relaxed) as i32;
+                eprintln!(
+                    "xpf-slowpath: reconcile MTU {desired_mtu} on {name}: {err} \
+                     (slow-path DEGRADED: live TUN stays at {live}; frames > {live} refused)"
+                );
+                self.set_last_error(err);
+                self.degraded.store(true, Ordering::Relaxed);
+                live
+            }
+        }
+    }
+
     fn set_mode(&self, mode: &str) {
         if let Ok(mut value) = self.mode.lock() {
             *value = mode.to_string();
@@ -295,12 +331,14 @@ pub struct SlowPathReinjector {
     tx: SyncSender<PacketRequest>,
     limiter: Mutex<RateLimiter>,
     status: Arc<SharedStatus>,
-    /// MTU the slow-path TUN was programmed with at creation (#2408). The TUN
-    /// MTU is set once when the worker opens the device; a later config MTU
-    /// change is NOT applied to the live TUN (the reinjector is preserved
-    /// across reconciles), so the reconcile path compares this against the
-    /// new snapshot MTU to warn the operator (see `apply_snapshot`).
-    mtu: i32,
+    /// MTU the live slow-path TUN is currently programmed with. Set at
+    /// creation (#2408) and, on a day-2 config MTU change (#5801), updated by
+    /// [`Self::reconcile_mtu`]: the reinjector is PRESERVED across snapshot
+    /// reconciles, so a later MTU change must reprogram the RUNNING TUN and
+    /// record the new value here so `mtu()`, `live_mtu`, and enqueue admission
+    /// stay in agreement. `AtomicI64` (mirroring `SharedStatus::live_mtu`) so
+    /// `mtu()`/`reconcile_mtu` need no `&mut` on the Arc-shared reinjector.
+    mtu: AtomicI64,
 }
 
 impl SlowPathReinjector {
@@ -326,13 +364,53 @@ impl SlowPathReinjector {
                 DEFAULT_RATE_LIMIT_BYTES_PER_SEC,
             )),
             status,
-            mtu,
+            mtu: AtomicI64::new(mtu as i64),
         })
     }
 
-    /// The MTU the slow-path TUN was programmed with at creation (#2408).
+    /// The MTU the live slow-path TUN is currently programmed with. Equals the
+    /// creation MTU (#2408) until a day-2 [`Self::reconcile_mtu`] reprograms it
+    /// (#5801).
     pub fn mtu(&self) -> i32 {
-        self.mtu
+        self.mtu.load(Ordering::Relaxed) as i32
+    }
+
+    /// Reprogram the live slow-path TUN to `desired_mtu` on a day-2 config MTU
+    /// change (#5801) and return the MTU now in effect.
+    ///
+    /// The reinjector is preserved across snapshot reconciles, so a config MTU
+    /// change committed after startup does NOT reach the running TUN unless the
+    /// live device is reprogrammed here. This:
+    ///   1. reprograms the live TUN via `programmer` (`set_if_mtu`/`SIOCSIFMTU`
+    ///      in production; injectable in tests),
+    ///   2. updates `live_mtu`/`degraded` from the result so enqueue admission
+    ///      (which reads `live_mtu`) converges, and
+    ///   3. records the installed MTU as this reinjector's `mtu()`.
+    ///
+    /// A failed `SIOCSIFMTU` is non-fatal: [`SharedStatus::reprogram_mtu_status`]
+    /// KEEPS the current live MTU (the running TUN retains whatever it was last
+    /// programmed with — it is NOT reset to the 1500 creation default), marks
+    /// the path DEGRADED, and records the error; `mtu()` then reports the
+    /// retained value, so `mtu()`, `live_mtu`, and admission still agree.
+    pub(crate) fn reconcile_mtu(
+        &self,
+        desired_mtu: i32,
+        programmer: impl FnOnce(&str, i32) -> Result<(), String>,
+    ) -> i32 {
+        let name = self
+            .status
+            .device_name
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let live = self
+            .status
+            .reprogram_mtu_status(&name, desired_mtu, programmer);
+        // Record what was ACTUALLY installed (== desired on success, or the
+        // retained live MTU on a failed program) so mtu() never over-reports a
+        // ceiling the device cannot honour.
+        self.mtu.store(live as i64, Ordering::Relaxed);
+        live
     }
 
     pub fn enqueue(&self, bytes: Vec<u8>) -> Result<EnqueueOutcome, String> {
@@ -432,30 +510,173 @@ fn slow_path_worker(name: &str, mtu: i32, rx: Receiver<PacketRequest>, status: A
 
     while let Ok(req) = rx.recv() {
         status.queued_packets.fetch_sub(1, Ordering::Relaxed);
-        let result = match &mut mode {
-            WriteMode::IoUring(ring) => {
-                write_packet_io_uring_or_sync(ring, tun.as_raw_fd(), &req.bytes)
-            }
-            WriteMode::SyncFallback => write_packet_sync(tun.as_raw_fd(), &req.bytes),
-        };
-        match result {
-            Ok(()) => {
-                status.injected_packets.fetch_add(1, Ordering::Relaxed);
-                status
-                    .injected_bytes
-                    .fetch_add(req.bytes.len() as u64, Ordering::Relaxed);
-            }
-            Err(err) => {
-                status.write_errors.fetch_add(1, Ordering::Relaxed);
-                status.dropped_packets.fetch_add(1, Ordering::Relaxed);
-                status
-                    .dropped_bytes
-                    .fetch_add(req.bytes.len() as u64, Ordering::Relaxed);
-                status.set_last_error(err);
-            }
-        }
+        // `req` (and `req.bytes`) stays owned by this loop iteration until the
+        // end of the body — AFTER `apply_slowpath_outcome` may drop the ring on
+        // a terminal demotion. That ordering is what upholds the #2297
+        // buffer-lifetime invariant across a demotion: closing the ring fd
+        // cancels any still-outstanding SQE while its buffer is still alive.
+        let outcome = write_packet_with_mode(&mut mode, tun.as_raw_fd(), &req.bytes);
+        apply_slowpath_outcome(outcome, &mut mode, req.bytes.len(), &status);
     }
     status.active.store(false, Ordering::Relaxed);
+}
+
+/// The fate of ONE slow-path packet write, separating PACKET-TRANSFER CERTAINTY
+/// from io_uring RING HEALTH (#5172).
+///
+/// The two axes are independent:
+///   * `result` — did THIS packet reach the TUN (`Ok`, counted as injected) or
+///     was it dropped (`Err`, counted as a write error + drop). This is the
+///     #2477 per-call decision: an io_uring failure that put nothing on the
+///     device is rescued by a synchronous write; an ambiguous/partial one is
+///     dropped (NO-RETRY — re-sending could double-transmit).
+///   * `ring_terminal` — is the io_uring ring itself durably broken, so the
+///     worker must stop submitting to it for the rest of its life. Set ONLY for
+///     a non-`safe_to_retry` io_uring failure (an ambiguous submit/reap — the
+///     ring is wedged; a packet-fd short write cannot occur on an atomic TUN
+///     write, so this variant means the ring, not the packet). A transient
+///     `NothingWritten` failure that the sync fallback rescued does NOT set it
+///     (keep io_uring, do not demote on a momentary blip).
+struct SlowPathWriteOutcome {
+    result: Result<(), String>,
+    ring_terminal: bool,
+    /// The io_uring error that triggered the demotion, formatted for the status
+    /// `last_error` so an operator can see WHY the ring was retired. `Some` iff
+    /// `ring_terminal`.
+    demotion_cause: Option<String>,
+}
+
+/// Write one packet under the current [`WriteMode`], returning a structured
+/// outcome (packet fate + ring health). The io_uring arm classifies a runtime
+/// ring failure via [`classify_io_uring_write`]; the sync arm can never fail the
+/// ring, so it is always healthy.
+fn write_packet_with_mode(
+    mode: &mut WriteMode,
+    fd: i32,
+    bytes: &[u8],
+) -> SlowPathWriteOutcome {
+    match mode {
+        WriteMode::IoUring(ring) => {
+            classify_io_uring_write(write_packet_io_uring(ring, fd, bytes), || {
+                write_packet_sync(fd, bytes)
+            })
+        }
+        WriteMode::SyncFallback => SlowPathWriteOutcome {
+            result: write_packet_sync(fd, bytes),
+            ring_terminal: false,
+            demotion_cause: None,
+        },
+    }
+}
+
+/// Classify a single io_uring write attempt into a [`SlowPathWriteOutcome`]
+/// (#5172). Separates packet-transfer certainty (delegated to the #2477
+/// [`decide_sync_fallback`] decision) from ring health:
+///
+///   * `Ok` — delivered via io_uring; ring healthy.
+///   * `Err(NothingWritten)` (`safe_to_retry`) — nothing reached the TUN, so a
+///     synchronous retry from offset 0 rescues THIS packet. TRANSIENT: the ring
+///     may be momentarily full or hit a per-packet completion error; keep
+///     io_uring mode (do not demote).
+///   * `Err(Transferred)` (not `safe_to_retry`) — the submit/reap was ambiguous,
+///     so bytes may be in flight on the ring; the packet is DROPPED (no-retry —
+///     re-sending could double-transmit). On a packet-oriented TUN a partial
+///     write cannot occur (the kernel writes a whole packet or fails), so this
+///     variant means the io_uring transport itself is wedged: TERMINAL — demote.
+///
+/// Factored so the classification is unit-testable without a live ring or TUN.
+fn classify_io_uring_write<F>(
+    io_result: Result<(), crate::io_uring_write::WriteError>,
+    sync_fallback: F,
+) -> SlowPathWriteOutcome
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let ring_terminal = matches!(&io_result, Err(err) if !err.safe_to_retry());
+    let demotion_cause = match &io_result {
+        Err(err) if !err.safe_to_retry() => Some(format!(
+            "slow-path io_uring ring failure, demoting to sync: {err}"
+        )),
+        _ => None,
+    };
+    SlowPathWriteOutcome {
+        result: decide_sync_fallback(io_result, sync_fallback),
+        ring_terminal,
+        demotion_cause,
+    }
+}
+
+/// Apply a [`SlowPathWriteOutcome`] to the worker's shared status and, on a
+/// TERMINAL ring failure, demote the write mode ONCE (#5172). This is the
+/// runtime-demotion chokepoint, mirroring `state_writer::apply_outcome` (#2958):
+///
+///   * On `ring_terminal`, if still in io_uring mode, retire the ring
+///     ([`retire_ring_to_sync`]) and flip the reported `mode` to `"sync"`. Every
+///     later packet then takes the sync branch directly, never re-submitting to
+///     the broken ring — the fix for the "every packet retries the broken ring"
+///     degradation. The demotion is PERMANENT (no cooldown re-promotion — avoids
+///     flapping). Unlike `state_writer`, the slow path's `active` flag tracks
+///     TUN/worker liveness (not io_uring), so it is left untouched — the path is
+///     still active, just in sync mode.
+///   * Counters mirror the pre-#5172 loop exactly: `Ok` → injected; `Err` →
+///     write error + drop, with `last_error` set. On a demotion the more useful
+///     `demotion_cause` (which embeds the ring error) is recorded last.
+///
+/// Extracting this lets a unit test drive the exact demotion (fail-on-revert):
+/// remove the `*mode = SyncFallback` assignment and the mode stays io_uring.
+fn apply_slowpath_outcome(
+    outcome: SlowPathWriteOutcome,
+    mode: &mut WriteMode,
+    bytes_len: usize,
+    status: &SharedStatus,
+) {
+    if outcome.ring_terminal && matches!(mode, WriteMode::IoUring(_)) {
+        retire_ring_to_sync(mode);
+        status.set_mode("sync");
+    }
+    match &outcome.result {
+        Ok(()) => {
+            status.injected_packets.fetch_add(1, Ordering::Relaxed);
+            status
+                .injected_bytes
+                .fetch_add(bytes_len as u64, Ordering::Relaxed);
+        }
+        Err(err) => {
+            status.write_errors.fetch_add(1, Ordering::Relaxed);
+            status.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            status
+                .dropped_bytes
+                .fetch_add(bytes_len as u64, Ordering::Relaxed);
+            status.set_last_error(err.clone());
+        }
+    }
+    // Record the demotion cause LAST so it overrides the generic drop error as
+    // `last_error`: an operator inspecting status sees WHY io_uring was retired.
+    if let Some(cause) = outcome.demotion_cause {
+        status.set_last_error(cause);
+    }
+}
+
+/// Retire the io_uring ring to [`WriteMode::SyncFallback`] (#5172).
+///
+/// Best-effort drains any completions already posted, then overwrites `*mode`,
+/// which DROPS the ring and closes its fd. The fd close is the authoritative
+/// retirement: the kernel cancels any SQE still outstanding when the ring fd
+/// closes. The current packet's buffer is still owned by the caller at this
+/// point (the worker loop drops `req` only after `apply_slowpath_outcome`
+/// returns), so no kernel reference can outlive the buffer — the #2297
+/// buffer-lifetime invariant holds across the demotion. No re-promotion.
+fn retire_ring_to_sync(mode: &mut WriteMode) {
+    if let WriteMode::IoUring(ring) = mode {
+        // Bounded best-effort CQE drain (the ring holds at most its 256 entries,
+        // and the slow path keeps a single write in flight). Mirrors the
+        // `ring.completion().next()` idiom used by `io_uring_write`.
+        let mut drained = 0;
+        while drained < 4096 && ring.completion().next().is_some() {
+            drained += 1;
+        }
+    }
+    *mode = WriteMode::SyncFallback;
 }
 
 fn write_packet_sync(fd: i32, bytes: &[u8]) -> Result<(), String> {
@@ -640,25 +861,6 @@ fn write_packet_io_uring(
     crate::io_uring_write::write_all_to_fd(ring, fd, bytes, false, "slow-path")
 }
 
-/// Write one packet to the TUN via io_uring, falling back to a synchronous
-/// `write()` ONLY when the io_uring attempt put nothing on the device (#2477).
-///
-/// A naive `io_uring().or_else(sync)` re-sends the whole packet on ANY io_uring
-/// error — including a partial write that already placed bytes on the
-/// packet-oriented TUN. The fallback then injects the full frame again, so the
-/// TUN sees a truncated frame followed by a duplicate full frame (parser errors
-/// / duplicate delivery to local BGP/OSPF listeners). The synchronous fallback
-/// is therefore gated on [`crate::io_uring_write::WriteError::safe_to_retry`]:
-/// only a failure that transferred nothing (submit-queue full, a kernel
-/// completion error, a zero-byte completion) may retry. A partial transfer — or
-/// an ambiguous submit/wait error where the SQE may be in flight — drops the
-/// packet instead.
-fn write_packet_io_uring_or_sync(ring: &mut IoUring, fd: i32, bytes: &[u8]) -> Result<(), String> {
-    decide_sync_fallback(write_packet_io_uring(ring, fd, bytes), || {
-        write_packet_sync(fd, bytes)
-    })
-}
-
 /// The #2477 fallback DECISION, factored out so it is unit-testable without a
 /// live io_uring ring or TUN fd. Given the io_uring write `result` and a
 /// `sync_fallback` thunk, only invokes the synchronous fallback when the
@@ -825,7 +1027,7 @@ fn set_if_up(name: &str) -> Result<(), String> {
 /// `mtu` must be > 0; a non-positive value is a programming error and is
 /// rejected without touching the device. Returns `Err` (caller logs and
 /// continues) on socket/ioctl failure.
-fn set_if_mtu(name: &str, mtu: i32) -> Result<(), String> {
+pub(crate) fn set_if_mtu(name: &str, mtu: i32) -> Result<(), String> {
     if mtu <= 0 {
         return Err(format!("invalid MTU {mtu} for {name}"));
     }

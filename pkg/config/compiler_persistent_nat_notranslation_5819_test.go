@@ -1,23 +1,19 @@
-// #5819: a source-NAT pool could configure BOTH `persistent-nat` and `port
-// no-translation`, but the userspace dataplane's address-only (no-translation)
-// branch BYPASSES the persistent-lease machinery. It selects a pool address by
-// round-robin / global-hash and records each flow with no persistent lease — no
-// permit-scope reuse, no inactivity timer. With global `source address-
-// persistent` off, two flows that the configured persistent binding should pin
-// to one public address can leave through DIFFERENT public addresses, and
-// status reports no lease. A strict-valid config that CLAIMS persistence
-// silently degrades to ordinary per-flow address-only NAT.
+// #6041 (full-parity follow-up to #5819): a source-NAT pool may configure BOTH
+// `persistent-nat` and `port no-translation`. The userspace dataplane now
+// implements an ADDRESS-ONLY persistent lease
+// (reserve_address_only_persistent, userspace-dp/src/nat/allocator.rs) that
+// pins a public pool ADDRESS across the configured permit scope WITHOUT
+// consuming a translated pool port. The combination is therefore SUPPORTED:
+// it commits cleanly at strict commit AND on the tolerant/lenient load path,
+// and the pool materializes as usable (no "persistent_nat_no_translation"
+// fail-closed marker).
 //
-// Until address-only persistent leases are implemented (option 1 of #5819,
-// deferred), the fix REJECTS the unsupported combination at strict commit and
-// FAILS CLOSED on the tolerant/lenient load path (downgraded to a warning; the
-// SNAT snapshot builder independently marks the pool unusable). This mirrors the
-// #5859 static-nat `then inet` fail-closed pattern.
+// This replaces the #5819 fail-closed reject
+// (validateSourceNATPersistentNoTranslationStrict + its dispatch, removed).
 //
-// RED-on-revert:
-//   - remove validateSourceNATPersistentNoTranslationStrict (or its dispatch):
-//     the combo compiles clean at strict commit and the lenient path emits no
-//     warning — both RED.
+// RED-on-revert: reinstating the strict reject makes
+// TestSourceNATPersistentNoTranslationAcceptedAtCommit_6041 RED (CompileConfig
+// would return an error again).
 //
 // Flat-set syntax MUST be built via ParseSetCommand/SetPath (snatPoolTree),
 // never NewParser.
@@ -28,11 +24,11 @@ import (
 	"testing"
 )
 
-// TestSourceNATPersistentNoTranslationRejectedAtCommit_5819: a pool configuring
-// both `persistent-nat` and `port no-translation` hard-rejects at strict commit
-// with an error naming the pool and the unsupported combination. RED-on-revert
-// (validator/dispatch removed): CompileConfig accepts it.
-func TestSourceNATPersistentNoTranslationRejectedAtCommit_5819(t *testing.T) {
+// TestSourceNATPersistentNoTranslationAcceptedAtCommit_6041: a pool configuring
+// both `persistent-nat` and `port no-translation` now COMMITS cleanly at strict
+// commit and materializes with both modifiers set. RED-on-revert (reject
+// reinstated): CompileConfig returns an error.
+func TestSourceNATPersistentNoTranslationAcceptedAtCommit_6041(t *testing.T) {
 	cases := []struct {
 		name string
 		pool []string
@@ -61,28 +57,28 @@ func TestSourceNATPersistentNoTranslationRejectedAtCommit_5819(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tree := snatPoolTree(t, tc.pool...)
-			_, err := CompileConfig(tree)
-			if err == nil {
-				t.Fatalf("CompileConfig accepted persistent-nat + port no-translation pool (want reject)")
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("CompileConfig rejected persistent-nat + port no-translation pool (now supported, #6041): %v", err)
 			}
-			msg := err.Error()
-			for _, want := range []string{"p1", "persistent-nat", "no-translation"} {
-				if !strings.Contains(msg, want) {
-					t.Fatalf("reject error missing %q: %v", want, msg)
-				}
+			pool := cfg.Security.NAT.SourcePools["p1"]
+			if pool == nil {
+				t.Fatalf("pool p1 missing from compiled config")
+			}
+			if !pool.PortNoTranslation {
+				t.Fatalf("PortNoTranslation lost")
+			}
+			if pool.PersistentNAT == nil {
+				t.Fatalf("PersistentNAT lost")
 			}
 		})
 	}
 }
 
-// TestSourceNATPersistentNoTranslationLenientFailClosed_5819: on the tolerant /
-// lenient load path the combo does NOT hard-reject the whole config (a config
-// persisted before this gate existed still boots — #1960), but the error is
-// SURFACED as a warning rather than silently accepted. RED-on-revert: no
-// warning is produced (the rule ships silently as address-only). The dataplane
-// snapshot builder independently marks the pool unusable (fail closed); that is
-// asserted in the pkg/dataplane/userspace suite.
-func TestSourceNATPersistentNoTranslationLenientFailClosed_5819(t *testing.T) {
+// TestSourceNATPersistentNoTranslationLenientAccepted_6041: the combo also
+// compiles cleanly on the tolerant / lenient load path with NO fail-closed
+// warning — the pool is fully supported, not degraded.
+func TestSourceNATPersistentNoTranslationLenientAccepted_6041(t *testing.T) {
 	tree := snatPoolTree(t,
 		"set security nat source pool p1 address 203.0.113.5/32",
 		"set security nat source pool p1 address 203.0.113.6/32",
@@ -90,29 +86,23 @@ func TestSourceNATPersistentNoTranslationLenientFailClosed_5819(t *testing.T) {
 		"set security nat source pool p1 persistent-nat permit any-remote-host")
 	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("CompileConfigLenient hard-rejected the combo (want warn-and-compile): %v", err)
+		t.Fatalf("CompileConfigLenient rejected the now-supported combo: %v", err)
 	}
-	found := false
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "no-translation") && strings.Contains(w, "persistent-nat") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("CompileConfigLenient produced no persistent-nat + no-translation warning; warnings=%v", cfg.Warnings)
-	}
-	// The pool is still materialized (lenient load keeps the config), but its
-	// unsupported nature is now surfaced, not silent.
 	if cfg.Security.NAT.SourcePools["p1"] == nil {
 		t.Fatalf("pool p1 missing from leniently-compiled config")
 	}
+	// No fail-closed downgrade warning should be emitted for the (now supported)
+	// combination.
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "no-translation") && strings.Contains(w, "persistent-nat") {
+			t.Fatalf("unexpected fail-closed warning for a supported combo: %q", w)
+		}
+	}
 }
 
-// TestSourceNATPersistentNoTranslationNoFalseReject_5819: the gate must fire
-// ONLY when BOTH modifiers are present. persistent-nat alone, port
-// no-translation alone, and a plain pool must all still compile clean.
-func TestSourceNATPersistentNoTranslationNoFalseReject_5819(t *testing.T) {
+// TestSourceNATPersistentNoTranslationOtherModifiers_6041: each modifier alone,
+// and a plain pool, still compile clean (unchanged behaviour).
+func TestSourceNATPersistentNoTranslationOtherModifiers_6041(t *testing.T) {
 	t.Run("persistent-nat-without-no-translation", func(t *testing.T) {
 		tree := snatPoolTree(t,
 			"set security nat source pool p1 address 203.0.113.5/32",

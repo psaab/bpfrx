@@ -461,6 +461,19 @@ pub(super) struct PersistentLease {
     pub(super) activation_saw_completion: bool,
     pub(super) activation_previous_expires_at_ns: u64,
     pub(super) activation_had_previous_lease: bool,
+    // #6041: an ADDRESS-ONLY persistent lease (`persistent-nat` + `port
+    // no-translation` / a port-less protocol). It pins a public ADDRESS across
+    // the permit scope but consumes NO pool port — `translated.port` carries the
+    // FIRST flow's preserved source port for status/debug only and is never a
+    // bit on the occupancy bitmap. So every lease teardown site
+    // (`reuse_existing_lease_locked` expired, `rollback_flow` remove-lease,
+    // `reclaim_expired_lease_locked` GC) MUST skip `free_translated_port` when
+    // this is set — there is no port bit to free, and freeing address `port`
+    // would clear a DIFFERENT flow's PAT bit that happens to share the offset.
+    // Per-flow reverse-identity collision ownership (#5269) is still tracked in
+    // `address_only_owners`, minted/cleared per flow, independent of the lease.
+    // `false` for every port-translating PAT lease (unchanged behaviour).
+    pub(super) address_only: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1167,6 +1180,7 @@ impl PortAllocator {
                         activation_saw_completion: false,
                         activation_previous_expires_at_ns: 0,
                         activation_had_previous_lease: false,
+                        address_only: false,
                     },
                 );
             }
@@ -1237,7 +1251,12 @@ impl PortAllocator {
                 lease.expires_at_ns = expires_at_ns;
                 reusable = Some((translated, addr_index));
             } else {
-                expired = Some((lease.translated, lease.addr_index, lease.expires_at_ns));
+                expired = Some((
+                    lease.translated,
+                    lease.addr_index,
+                    lease.expires_at_ns,
+                    lease.address_only,
+                ));
             }
         }
         if let Some((addr_index, expires_at_ns)) = remove_expiry {
@@ -1257,9 +1276,16 @@ impl PortAllocator {
             self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
             return Some(translated);
         }
-        if let Some((translated, addr_index, expires_at_ns)) = expired {
+        if let Some((translated, addr_index, expires_at_ns, address_only)) = expired {
             Self::remove_lease_expiration_locked(live, addr_index, expires_at_ns, key);
-            self.free_translated_port(addr_index, translated.port, true);
+            // #6041: an address-only lease owns no pool port, so there is no bit
+            // to free — its per-flow reverse-identity tokens were already cleared
+            // when each flow released (the lease is idle here). Freeing
+            // `translated.port` would clear an UNRELATED PAT flow's bit that
+            // happens to share the offset.
+            if !address_only {
+                self.free_translated_port(addr_index, translated.port, true);
+            }
             live.persistent_by_source.remove(&key);
         }
         None
@@ -1303,6 +1329,23 @@ impl PortAllocator {
             return false;
         }
         live.live_by_flow.remove(&flow);
+        // #6041: the address-only reverse-identity token (#5269) is orthogonal to
+        // the persistent lease. Clear THIS flow's ownership first — it exists for
+        // BOTH a non-persistent address-only flow AND an address-only PERSISTENT
+        // flow (`persistent_key = Some` AND `address_only = true`). No pool port
+        // bit was claimed for any address-only flow, so nothing is freed on the
+        // occupancy bitmap. The key mirrors what `reserve_address_only` /
+        // `reserve_address_only_persistent` inserted (stored translated tuple +
+        // the flow's remote endpoint).
+        if existing.address_only {
+            live.address_only_owners.remove(&AddressOnlyReverseKey {
+                protocol: flow.protocol,
+                translated_ip: existing.translated.ip,
+                translated_port: existing.translated.port,
+                dst_ip: flow.dst_ip,
+                dst_port: flow.dst_port,
+            });
+        }
         if let Some(key) = existing.persistent_key {
             let mut refresh_expiry = None;
             if let Some(lease) = live.persistent_by_source.get_mut(&key) {
@@ -1320,23 +1363,12 @@ impl PortAllocator {
                 Self::remove_lease_expiration_locked(&mut live, addr_index, old_expires_at_ns, key);
                 Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
-        } else if existing.address_only {
-            // #5269: address-only token — no pool port bit was claimed, so free
-            // the reverse-identity owner instead. Recompute the key from the
-            // stored translated tuple + the flow's remote endpoint (the SAME key
-            // `reserve_address_only` inserted).
-            live.address_only_owners.remove(&AddressOnlyReverseKey {
-                protocol: flow.protocol,
-                translated_ip: existing.translated.ip,
-                translated_port: existing.translated.port,
-                dst_ip: flow.dst_ip,
-                dst_port: flow.dst_port,
-            });
-        } else {
+        } else if !existing.address_only {
             // Non-persistent (or deterministic) flow owns its port outright:
             // free the bit, recycling it unless it is a deterministic block
-            // port (#4559). The persistent case keeps the port on the lease
-            // until the lease itself is torn down.
+            // port (#4559). The persistent case keeps the port/address on the
+            // lease until the lease itself is torn down; the address-only case
+            // (handled above) never claimed a port bit to free.
             self.free_translated_port(
                 existing.addr_index,
                 translated.port,
@@ -1371,6 +1403,19 @@ impl PortAllocator {
             return false;
         }
         live.live_by_flow.remove(&flow);
+        // #6041: clear this flow's address-only reverse-identity token first
+        // (present for both a #5269 non-persistent and a #6041 persistent
+        // address-only flow); it is independent of the lease refcount below and
+        // no pool port bit is ever freed for an address-only flow.
+        if existing.address_only {
+            live.address_only_owners.remove(&AddressOnlyReverseKey {
+                protocol: flow.protocol,
+                translated_ip: existing.translated.ip,
+                translated_port: existing.translated.port,
+                dst_ip: flow.dst_ip,
+                dst_port: flow.dst_port,
+            });
+        }
         if let Some(key) = existing.persistent_key {
             let mut remove_lease = false;
             let mut insert_expiry = None;
@@ -1391,22 +1436,17 @@ impl PortAllocator {
             }
             if remove_lease {
                 live.persistent_by_source.remove(&key);
-                self.free_translated_port(existing.addr_index, translated.port, true);
+                // #6041: an address-only lease holds no pool port bit — only a
+                // PAT lease frees its port when the fresh-activation rollback
+                // removes it.
+                if !existing.address_only {
+                    self.free_translated_port(existing.addr_index, translated.port, true);
+                }
             }
             if let Some((addr_index, expires_at_ns)) = insert_expiry {
                 Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
-        } else if existing.address_only {
-            // #5269: address-only token rollback — clear the reverse-identity
-            // owner (no pool port bit to free), mirroring `release_flow`.
-            live.address_only_owners.remove(&AddressOnlyReverseKey {
-                protocol: flow.protocol,
-                translated_ip: existing.translated.ip,
-                translated_port: existing.translated.port,
-                dst_ip: flow.dst_ip,
-                dst_port: flow.dst_port,
-            });
-        } else {
+        } else if !existing.address_only {
             self.free_translated_port(
                 existing.addr_index,
                 translated.port,
@@ -1723,6 +1763,187 @@ impl PortAllocator {
         Ok(translated)
     }
 
+    /// #6041: reserve an ADDRESS-ONLY PERSISTENT-NAT lease for a `port
+    /// no-translation` (or port-less) flow whose pool also configures
+    /// `persistent-nat`. Unlike [`reserve_address_only`] (the per-flow #5269
+    /// collision token with NO lease) this PINS a public pool ADDRESS across the
+    /// configured permit scope: every flow keyed to the same
+    /// [`PersistentSourceKey`] reuses the SAME public address for the lease's
+    /// lifetime, so persistence no longer depends on the global
+    /// `address-persistent` hash (the #5819/#6041 defect the fail-closed reject
+    /// stood in for). No pool PORT is consumed — the packet keeps its own source
+    /// port on the wire — so the lease records `address_only = true` and every
+    /// lease teardown site skips `free_translated_port`.
+    ///
+    /// Lifecycle mirrors the port-translating persistent lease
+    /// ([`allocate_translation_locked`] + [`reuse_existing_lease_locked`]):
+    ///   - a live/valid lease REUSES its pinned address, bumps `active_flows`,
+    ///     re-arms the activation-rollback bookkeeping on the 0->1 edge, drops
+    ///     its idle expiry-index entry, and pushes the inactivity expiry out;
+    ///   - an EXPIRED idle lease is torn down (NO port to free) and a fresh
+    ///     address is picked via [`address_index`];
+    ///   - no lease => a fresh address is picked and a new lease created.
+    ///
+    /// The #5269 reverse-identity collision guard still runs PER FLOW: THIS
+    /// flow's `(protocol, chosen address, preserved source port, remote)` token
+    /// is claimed in `address_only_owners` and DENIED as exhaustion if a
+    /// DIFFERENT flow already owns it (two flows sharing one public reverse tuple
+    /// cannot coexist). On a collision the lease is left untouched. The token AND
+    /// the lease refcount are torn down PER FLOW by the SAME teardown path
+    /// (`release_flow`/`rollback_flow`) — no new delete site. Idempotent: a
+    /// second packet of the same flow returns its existing translated tuple.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn reserve_address_only_persistent(
+        &self,
+        flow: SourceNatFlowKey,
+        family_addresses: PoolAddressFamily<'_>,
+        family_offset: usize,
+        address_persistent: bool,
+        persistent_nat_permit: super::source::PersistentNatPermit,
+        persistent_nat_timeout_ns: u64,
+        now_ns: u64,
+    ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
+        let family_len = family_addresses.len();
+        if family_len == 0 {
+            return Err(super::source::SourceNatFailureReason::WrongAddressFamily);
+        }
+        let key = flow.persistent_source_key(persistent_nat_permit);
+        let timeout_ns = persistent_nat_timeout_ns.max(NS_PER_SEC);
+
+        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        self.gc_expired_locked(&mut live, now_ns, ALLOCATION_GC_BUDGET);
+
+        // Idempotent re-entry: a second packet of the same flow reuses its first
+        // decision rather than re-keying / double-counting the lease refcount.
+        if let Some(existing) = live.live_by_flow.get(&flow) {
+            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+            return Ok(existing.translated);
+        }
+        if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
+        }
+
+        // Resolve the lease's pinned address: reuse a still-valid lease, tear down
+        // an expired-idle one, else pick fresh.
+        let mut reuse_addr: Option<(IpAddr, usize)> = None;
+        let mut expired: Option<(usize, u64)> = None;
+        if let Some(lease) = live.persistent_by_source.get(&key).copied() {
+            if lease.active_flows > 0 || lease.expires_at_ns > now_ns {
+                reuse_addr = Some((lease.translated.ip, lease.addr_index));
+            } else {
+                expired = Some((lease.addr_index, lease.expires_at_ns));
+            }
+        }
+        if let Some((addr_index, expires_at_ns)) = expired {
+            // Idle + past its inactivity window: drop it (an address-only lease
+            // holds NO port bit to free) so a fresh address is picked below.
+            Self::remove_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
+            live.persistent_by_source.remove(&key);
+        }
+
+        let reusing = reuse_addr.is_some();
+        let (translated_ip, addr_index) = match reuse_addr {
+            Some((ip, idx)) => (ip, idx),
+            None => {
+                let abs =
+                    self.address_index(flow.src_ip, family_offset, family_len, address_persistent);
+                let rel = abs.saturating_sub(family_offset) % family_len;
+                (family_addresses.ip_at(rel), family_offset + rel)
+            }
+        };
+
+        // #5269 reverse-identity collision guard for THIS flow, checked BEFORE any
+        // lease mutation so a denied flow leaves the lease untouched. The
+        // preserved source port keys the reverse identity (0 for a port-less
+        // protocol); it is never written to the wire (the caller leaves
+        // `rewrite_src_port` unset).
+        let rkey = AddressOnlyReverseKey {
+            protocol: flow.protocol,
+            translated_ip,
+            translated_port: flow.src_port,
+            dst_ip: flow.dst_ip,
+            dst_port: flow.dst_port,
+        };
+        if live.address_only_owners.contains_key(&rkey) {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
+        }
+
+        // Lease-table pressure cap for a FRESH lease, mirroring
+        // `allocate_translation_locked`: one bounded GC pass, then treat a still-
+        // full table as exhaustion.
+        if !reusing && live.persistent_by_source.len() >= self.shared.max_tracked_flows {
+            self.gc_expired_locked(&mut live, now_ns, PRESSURE_GC_BUDGET);
+            if live.persistent_by_source.len() >= self.shared.max_tracked_flows {
+                self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+                return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
+            }
+        }
+
+        let translated = TranslatedTuple {
+            ip: translated_ip,
+            port: flow.src_port,
+        };
+        let expires_at_ns = now_ns.saturating_add(timeout_ns);
+
+        // Commit this flow's reverse-identity token (freed per flow on teardown).
+        live.address_only_owners.insert(rkey, flow);
+
+        if reusing {
+            // Bump the existing lease. On the 0->1 active-flow edge re-arm the
+            // activation-rollback bookkeeping and drop the stale idle expiry-index
+            // entry (an ACTIVE lease is not indexed). Always push the inactivity
+            // expiry out.
+            let mut remove_expiry = None;
+            if let Some(lease) = live.persistent_by_source.get_mut(&key) {
+                if lease.active_flows == 0 {
+                    remove_expiry = Some((lease.addr_index, lease.expires_at_ns));
+                    lease.activation_saw_completion = false;
+                    lease.activation_previous_expires_at_ns = lease.expires_at_ns;
+                    lease.activation_had_previous_lease = true;
+                }
+                lease.active_flows = lease.active_flows.saturating_add(1);
+                lease.expires_at_ns = expires_at_ns;
+            }
+            if let Some((idx, old_expires_at_ns)) = remove_expiry {
+                Self::remove_lease_expiration_locked(&mut live, idx, old_expires_at_ns, key);
+            }
+            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            live.persistent_by_source.insert(
+                key,
+                PersistentLease {
+                    translated,
+                    addr_index,
+                    expires_at_ns,
+                    timeout_ns,
+                    active_flows: 1,
+                    completed_flows: 0,
+                    activation_saw_completion: false,
+                    activation_previous_expires_at_ns: 0,
+                    activation_had_previous_lease: false,
+                    address_only: true,
+                },
+            );
+            self.shared
+                .allocations_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        live.live_by_flow.insert(
+            flow,
+            LiveAllocation {
+                translated,
+                persistent_key: Some(key),
+                addr_index,
+                deterministic: false,
+                address_only: true,
+            },
+        );
+        Ok(translated)
+    }
+
     /// Test-only: snapshot the address-only reverse-identity ownership map so a
     /// white-box test can assert the reverse index resolves each public tuple to
     /// exactly one owning forward flow (#5269).
@@ -1960,7 +2181,12 @@ impl PortAllocator {
         // free, a concurrent claim cannot re-hand-out the port even after the
         // lease is gone from the map.
         live.persistent_by_source.remove(&key);
-        freed.push((lease.addr_index, lease.translated.port));
+        // #6041: an address-only persistent lease holds no pool port bit — its
+        // reverse-identity tokens were cleared per flow on release — so there is
+        // nothing to free on the occupancy bitmap. A PAT lease records its port.
+        if !lease.address_only {
+            freed.push((lease.addr_index, lease.translated.port));
+        }
         true
     }
 }

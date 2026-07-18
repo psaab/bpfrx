@@ -116,7 +116,7 @@ fn segmentation_miss_records_operator_visible_exception() {
     let request =
         test_live_forward_request_for_frame(1518, test_forwarding_decision_to_bound_ifindex(11));
     let ingress_ident = test_binding_identity();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let source_frame = vec![0u8; 1518];
     let cap = std::cell::Cell::new(0u32);
 
@@ -148,7 +148,7 @@ fn segmentation_miss_recorder_is_rate_capped() {
     let request =
         test_live_forward_request_for_frame(1518, test_forwarding_decision_to_bound_ifindex(11));
     let ingress_ident = test_binding_identity();
-    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
     let source_frame = vec![0u8; 1518];
     let cap = std::cell::Cell::new(0u32);
 
@@ -165,15 +165,22 @@ fn segmentation_miss_recorder_is_rate_capped() {
     }
 
     assert_eq!(cap.get(), 20, "cap counter saturates at 20");
-    // The cap must also stop *exception generation*, not just the
-    // counter: prove only 20 exceptions were recorded across 25 calls,
-    // so the 5 over-cap calls never reached `record_exception` (and thus
-    // never locked the `recent_exceptions` mutex on the hot path).
+    // The #1282 cap stops *exception generation* at 20 (the 5 over-cap
+    // calls return before `record_exception`, so `cap` never exceeds 20).
+    // #5289 adds a second bound: the per-(reason,5-tuple) sampler collapses
+    // this identical seg-miss flood to a SINGLE ring entry, so the operator
+    // sees one representative `tcp_segmentation_miss` rather than 20 copies.
+    // Both bounds ensure a pathological per-packet seg-miss cannot thrash
+    // the ring on the hot path.
+    let ring = recent_exceptions.lock().expect("lock");
     assert_eq!(
-        recent_exceptions.lock().expect("lock").len(),
-        20,
-        "no exceptions recorded past the cap — the 5 over-cap calls never \
-         locked the recent_exceptions mutex",
+        ring.len(),
+        1,
+        "the #5289 sampler collapses the identical seg-miss flood to one entry",
+    );
+    assert_eq!(
+        ring.back().expect("entry").reason(),
+        "tcp_segmentation_miss",
     );
 }
 

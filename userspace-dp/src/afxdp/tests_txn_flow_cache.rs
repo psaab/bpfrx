@@ -1044,6 +1044,181 @@ fn txn_failed_reply_repair_forwards_uncached_then_self_heals_below_cap() {
 }
 
 
+// ── #6075 (#5147 / #6074 follow-up): the poll_descriptor PRE-RESOLVE
+// `neighbor_mac_epoch` SNAPSHOT site must key on the OUTER transport neighbor
+// ifindex, not the logical tunnel `egress_ifindex` ──
+//
+// The #6074 fold routed BOTH neighbor-MAC-epoch key sites through
+// `outer_neighbor_ifindex(state, None, &resolution)`:
+//   (1) `flow_cache.rs` — the `neighbor_shard` STAMP on the cached entry.
+//   (2) `poll_descriptor/mod.rs` — the pre-resolve `neighbor_mac_epoch`
+//       SNAPSHOT (`epoch_for(&(outer_neighbor_ifindex(..), nh))`).
+// The existing `tunnel_flow_cache_keys_mac_change_shard_on_outer_neighbor_not_
+// logical_ifindex` (flow_cache_tests.rs) pins ONLY site (1): it calls
+// `from_forward_decision` directly with an INJECTED `neighbor_mac_epoch = 0`,
+// bypassing poll_descriptor entirely. Reverting ONLY site (2) to the logical
+// `egress_ifindex` would NOT fail that test — the pre-resolve snapshot site is
+// unbound. That desync (stamp keyed on outer, snapshot keyed on logical) causes
+// spurious eviction (a perf regression, not a blackhole), and #6075 asks for an
+// independent fail-on-revert test that isolates site (2).
+//
+// This test drives the REAL poll_descriptor path (`poll_binding_process_
+// descriptor` via `txn_run_descriptor_with_neighbors`) for a native-GRE transit
+// forward, with the OUTER transport neighbor's shard MAC-change epoch pre-bumped
+// in the caller-owned dynamic-neighbor map BEFORE the poll takes its pre-resolve
+// snapshot. It then reads the flow-cache entry the poll seeded and asserts the
+// stamped `neighbor_mac_epoch` equals the OUTER neighbor shard's snapshot epoch
+// (non-zero) and NOT the logical tunnel shard's epoch (zero).
+//
+// RED-ON-REVERT / ISOLATION: reverting site (2)'s
+// `epoch_for(&(outer_neighbor_ifindex(..), nh))` to
+// `epoch_for(&(decision.resolution.egress_ifindex, nh))` makes the poll snapshot
+// the LOGICAL (362) shard's epoch (0) instead of the OUTER (12) shard's epoch
+// (bumped), so `entry.neighbor_mac_epoch` becomes 0 and the primary assert
+// fails. The assertion is on `neighbor_mac_epoch` (site 2's output), NOT
+// `neighbor_shard` (site 1's output), so it fails on a site-(2)-only revert
+// while the site-(1) test stays green — genuinely isolating the snapshot site.
+//
+// WireGuard is intentionally NOT covered here: the build ZEROES a WG endpoint's
+// outer transport destination (the peer carries the hop, see
+// frame/wg_tests.rs::wg_resolver_stores_zero_tx_ifindex_so_no_tx_fallback_is_
+// possible), so a WG transit resolution NoRoutes at admit time and never seeds a
+// ForwardCandidate flow-cache entry — the site-(2) stamp path is only reached by
+// tunnels that resolve a static/dynamic outer neighbor at admit time (native
+// GRE). WG shares the identical `outer_neighbor_ifindex` helper, which is
+// covered at the resolution layer in frame/wg_tests.rs.
+#[test]
+fn poll_descriptor_stamps_neighbor_mac_epoch_from_outer_neighbor_shard_not_logical_6075() {
+    use crate::afxdp::sharded_neighbor::ShardedNeighborMap;
+    use crate::afxdp::types::NeighborEntry;
+
+    // native_gre_snapshot(true): GRE tunnel endpoint 1 -> logical ifindex 362
+    // (gr-0-0-0); the OUTER transport neighbor (2001:559:8585:80::1) lives on
+    // reth0.80, ifindex 12. The PBR variant adds a LAN ingress (reth1.0, ifindex
+    // 5) whose input filter steers 10.255.192.40/30 into sfmix.inet.0. Add an
+    // explicit lan->sfmix permit so the transit forward is admitted (the fixture
+    // is otherwise default-deny with no policies).
+    let mut snapshot = native_gre_pbr_snapshot(true);
+    snapshot.default_policy = "deny".to_string();
+    snapshot.policies = vec![PolicyRuleSnapshot {
+        name: "lan-sfmix".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "sfmix".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+        ..Default::default()
+    }];
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 5, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // The OUTER transport next-hop the GRE outer packet resolves to (reth0.80,
+    // ifindex 12). Seed the caller-owned dynamic-neighbor map and REPLACE the MAC
+    // once so ONLY this outer shard's MAC-change epoch advances (a first insert
+    // does not bump; a genuine MAC change does). The poll takes its pre-resolve
+    // shard-epoch snapshot from THIS map, so the snapshot's outer shard is
+    // non-zero while the logical (362) shard stays at the baseline 0.
+    let outer_nh = IpAddr::V6("2001:559:8585:80::1".parse().unwrap());
+    let outer_if = 12_i32;
+    let logical_if = 362_i32;
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    neighbors.insert_if_changed((outer_if, outer_nh), NeighborEntry { mac: [0xaa; 6] });
+    neighbors.insert_if_changed((outer_if, outer_nh), NeighborEntry { mac: [0xbb; 6] });
+
+    let outer_epoch = neighbors.mac_change_epoch_for(&(outer_if, outer_nh));
+    let logical_epoch = neighbors.mac_change_epoch_for(&(logical_if, outer_nh));
+    // Preconditions: the outer bump advanced the outer shard's epoch, and the
+    // outer and logical ifindexes hash to DIFFERENT shards for this next-hop
+    // (else the test cannot distinguish the outer key from the logical key).
+    assert_ne!(
+        outer_epoch, logical_epoch,
+        "test precondition: the outer-neighbor bump must advance the OUTER shard's \
+         epoch above the untouched logical (362) shard's epoch"
+    );
+    assert_ne!(
+        ShardedNeighborMap::shard_index(&(outer_if, outer_nh)),
+        ShardedNeighborMap::shard_index(&(logical_if, outer_nh)),
+        "test precondition: the outer (12) and logical (362) ifindexes must hash to \
+         DIFFERENT shards for this next-hop"
+    );
+
+    // A cache-eligible ESTABLISHED (pure-ACK) TCP flow ingressing the LAN (ifindex
+    // 5), destined into the GRE tunnel's connected /30 (10.255.192.41). PBR steers
+    // it into sfmix.inet.0 -> tunnel endpoint 1 (ForwardCandidate; the outer
+    // neighbor resolves from the static NeighborSnapshot), which the poll installs
+    // and seeds into the flow cache.
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 100),
+        Ipv4Addr::new(10, 255, 192, 41),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let meta = txn_meta_v4(5, 0x10_u8, (frame.len() - 14) as u16);
+    let (_batch, dbg) = txn_run_descriptor_with_neighbors(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+        &neighbors,
+    );
+    assert_eq!(dbg.tx, 1, "the GRE transit forward must forward its trigger packet");
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        1,
+        "the forwarded established tunnel flow must seed exactly one flow-cache entry"
+    );
+
+    let entry = binding
+        .flow
+        .flow_cache
+        .entries
+        .iter()
+        .flatten()
+        .next()
+        .expect("the tunnel forward seeded a flow-cache entry");
+    // The seeded entry is the tunnel forward (logical egress 362, endpoint 1),
+    // resolving the outer transport next-hop.
+    assert_eq!(entry.decision.resolution.tunnel_endpoint_id, 1);
+    assert_eq!(entry.decision.resolution.egress_ifindex, logical_if);
+    assert_eq!(entry.decision.resolution.next_hop, Some(outer_nh));
+
+    // PRIMARY (site-2 isolation): the poll_descriptor pre-resolve snapshot stamped
+    // the OUTER neighbor shard's epoch, NOT the logical tunnel shard's epoch.
+    // Reverting site (2) to `decision.resolution.egress_ifindex` snapshots the
+    // logical (362) shard (epoch 0) and this assert fails — independently of the
+    // `neighbor_shard` STAMP (site 1), which this does not touch.
+    assert_eq!(
+        entry.neighbor_mac_epoch, outer_epoch,
+        "the poll_descriptor pre-resolve snapshot MUST stamp the OUTER transport \
+         neighbor's shard epoch (ifindex {outer_if}); keying the snapshot on the \
+         logical tunnel egress ifindex (362) stamps the wrong shard's epoch and \
+         spuriously evicts the tunnel flow on every hit (#6075 / #5147 site 2)"
+    );
+    assert_ne!(
+        entry.neighbor_mac_epoch, logical_epoch,
+        "the stamped epoch must NOT be the logical tunnel shard's (362) epoch"
+    );
+
+    // BEHAVIORAL: because the stamped epoch matches the live OUTER shard epoch,
+    // the freshly-seeded entry is NOT spuriously MAC-stale. Reverting site (2)
+    // stamps the logical epoch (0) while `neighbor_shard` (site 1) still reads the
+    // live OUTER shard epoch (non-zero) -> a spurious eviction on the next hit.
+    assert!(
+        !entry.neighbor_mac_epoch_stale(&neighbors),
+        "a tunnel flow seeded from the correct OUTER-neighbor snapshot must not be \
+         spuriously stale against the same map"
+    );
+}
+
+
 // I6: a MissingNeighborSeed install refused at cap must NOT buffer the
 // frame for neighbor-resolution replay (the replay would forward on the
 // rolled-back SNAT tuple with no session). Below cap the seed installs

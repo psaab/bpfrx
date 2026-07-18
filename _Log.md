@@ -20,7 +20,19 @@
   guard (advances on every `snapshot.generation` commit) invalidates a stale
   ordinary-NAT association after a SNAT/DNAT rule change. Forward-only, matching
   the NAT64 forward-first wiring (reverse-reply is a deferred increment). No new
-  cache type, state machinery, or NAT-decision-path changes — a mechanical mirror.
+  cache type, state machinery, or NAT-decision-path changes — it reuses the
+  existing generic cache. IMPORTANT ASYMMETRY (not a "mechanical mirror" on the
+  miss path): a consult MISS (reorder / TTL straddle / eviction / generation bump
+  / first-fragment-didn't-forward) forwards the permitted NAT'd non-first fragment
+  UNTRANSLATED — the leak PERSISTS on those edges, fail-OPEN, the OPPOSITE of the
+  NAT64 sibling's fail-CLOSED no-association drop (#4617). Deliberate: the flowless
+  arm cannot distinguish a NAT'd-miss from a legitimate no-NAT fragmented flow, so
+  a blind drop would blackhole ordinary un-NAT'd fragmented traffic. Strictly
+  narrows the pre-existing leak (not a regression); the flowless miss path still
+  runs policy (a denied flow's fragments still drop — the residual is a
+  permitted-flow source info-leak only). A fail-closed miss (needs a NAT'd-miss
+  discriminator) is a tracked follow-up (#6122; see the
+  `nat_consult_forward_fragment_assoc` doc-comment).
 - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs (two helpers +
   flowless consult wiring + cold-path install), userspace-dp/src/afxdp/tests_fragment.rs
   (fail-on-revert test), userspace-dp/src/FEATURES.md (nat64.rs #5689 note).
@@ -33,6 +45,491 @@
   pre-existing failures on the branch base (`protocol::wire_invariant_default_specimens`
   = stale fixture missing #5623/#5625 fields; `event_stream backpressure
   end-to-end`) confirmed present with my changes stashed — not caused by #5689.
+## 2026-07-18 — #5174: NAT64 MissingNeighbor cold path fail-closed (bounded fix)
+
+- **Timestamp**: 2026-07-18 (fix/5174-nat64-missingneighbor)
+- **Scope**: SCOPED first (team-approved). The team-scoped full parity (seed a
+  NAT64 decision + replay applies NAT64 translation) BALLOONS — it needs NAT64
+  classify+alloc hoisted into the ~1000-line MissingNeighbor arm, a HA-synced
+  `MissingNeighborSeed` carrying `nat64_reverse` (BIB), a NEW cross-family replay
+  branch in neighbor_dispatch (`build_nat64_forwarded_frame`), and a
+  size-guarded `PendingNeighPacket` (`==264`) grown — 4 files + wire/HA. Filed
+  separately for /research. Shipped the BOUNDED fail-closed alternative here.
+- **Action**: NAT64 classification + source allocation are gated inside the
+  `if disposition==ForwardCandidate` + `Permit` branch of the session-miss path
+  (poll_descriptor `decision.nat = Nat64State::forward_decision`, ~:2822), so a
+  NAT64 flow whose extracted-IPv4 next-hop is UNRESOLVED reaches the
+  MissingNeighbor arm (the `else` of that `if`, arm ~:4598-5595) with
+  `decision.nat` default (rewrite_dst None, nat64 false). It evaluated policy on
+  the SYNTHETIC IPv6 dst (Harm A — policy divergence; a v4-dst rule matches the
+  synthetic v6 dst as match-any) and seeded a SNAT-only `MissingNeighborSeed`
+  (HA-synced) + buffered the IPv6 frame, which the same-family replay
+  (`rewrite_forwarded_frame_in_place`, MAC/VLAN/NAT only) TXes UNTRANSLATED to
+  the IPv4 gateway (Harm B — untranslated forward + poisoned session).
+  Bounded fix, ALL in the MissingNeighbor arm:
+  1. Re-classify NAT64 at the arm top (`classify_ipv6_dest(flow.dst_ip)` →
+     `nat64_dst_v4`); the pre-routing classify already enforced source
+     eligibility/hairpin, so a cheap dest-only lookup suffices.
+  2. Evaluate the arm's policy on the extracted V4 dst when `nat64_dst_v4` is
+     Some (the #2358 cross-family (V6 src, V4 dst) tuple) — fixes Harm A.
+  3. For a PERMITTED NAT64 flow: let the existing kernel ARP/NDP probe fire
+     (`trigger_kernel_arp_probe`), then recycle+`continue` BEFORE the seed and
+     the pending_neigh buffer — NO untranslated seed/buffer/replay, NO broken
+     HA session (fixes Harm B + the poisoning). Counted as a new debug counter
+     `DebugPollCounters.nat64_missing_neigh_drop`. The flow recovers via the
+     ForwardCandidate path once the neighbor resolves (cold-start: first
+     packet(s) drop, TCP retransmits). Non-NAT64 and NAT64-deny paths untouched.
+- **Tests (fail-on-revert, deterministic; tests_nat64_tunnel.rs)**:
+  - `nat64_missing_neighbor_fail_closed_drop_5174` (Harm B): permitted NAT64
+    flow (permit `8.8.8.8/32`, default-deny) + unresolved gw → asserts
+    `nat64_missing_neigh_drop==1`, `sessions.len()==0`, `pending_neigh` empty.
+    Neutralize the divert → seeds+buffers → RED.
+  - `nat64_missing_neighbor_denied_no_fail_closed_drop_5174` (Harm A): NAT64
+    flow to 8.8.8.8 under a `9.9.9.9/32` permit → denied on the correct V4
+    tuple. Neutralize the policy-tuple fix → the synthetic-IPv6 eval matches the
+    v4-dst rule as match-any → WRONGLY PERMITTED → RED.
+  - `non_nat64_missing_neighbor_still_buffers_5174` (control): plain v4
+    MissingNeighbor still seeds/buffers, counter 0 (unregressed).
+  - GREEN: 3 new pass; FULL `cargo test` (userspace-dp) = 3994 passed, 0 failed.
+    RED-on-revert proven for BOTH harms (divert → primary RED; policy-tuple →
+    deny-control RED). Build clean.
+- **Smoke**: a loss-cluster NAT64 smoke would be warranted-if-configured
+  (forwarding + neighbor-resolution behavior), but NAT64 may not be configured
+  on the loss cluster and the fix is fully unit-proven (real descriptor path +
+  forced MissingNeighbor). FLAGGED, not assumed.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/tests_nat64_tunnel.rs, docs/feature-coverage.md
+## 2026-07-18 — #5168: widen WG replay window to the reference 8128-counter ring
+
+- **Timestamp**: 2026-07-18 (fix/5168-wg-replay-window)
+- **Action**: The WG transport replay filter used a single-u64 64-wide RFC
+  6479 window (`REPLAY_WINDOW=64`, `ReplayState{highest,bitmap,started}`),
+  rejecting any post-AEAD counter of age ≥ 64. Reference WireGuard
+  (kernel `noise.c` / wireguard-go `replay.go`) uses an 8128-counter window,
+  so under multi-queue / path-diversity reorder the 64-wide window falsely
+  rejected UNSEEN AUTHENTIC packets ~2 orders of magnitude early → TCP
+  retransmit/throughput collapse a reference peer would not show. Replaced
+  `ReplayState` internals with the reference ring: `counter` (high-water) +
+  `backtrack: [u64; 128]` (8192-bit ring), `REPLAY_WINDOW = (RING_BLOCKS-1) *
+  BLOCK_BITS = 8128`. `check_and_update` is the exact wireguard-go
+  `ValidateCounter` port (advance-and-forward-clear on a new high-water mark,
+  strict `counter - c > REPLAY_WINDOW` too-old reject, per-bit accept/repeat);
+  the `started` flag is gone (the all-zero ring accepts counter 0 on first
+  sight and rejects its replay purely from the bitmap, as the reference does).
+  `definitely_out_of_window` uses the SAME `counter - c > REPLAY_WINDOW`
+  boundary (non-mutating; `counter` only advances so a precheck-out stays out
+  at commit — no false pre-AEAD drop). API unchanged; the two engine.rs decap
+  sites (precheck + commit) are untouched. NOTE (reference fidelity): the
+  kernel/wireguard-go window ACCEPTS age exactly 8128 (inclusive edge, strict
+  `>`) and rejects age 8129 — the issue's "age 8128 rejected" is an off-by-one
+  from the true reference; I matched the reference byte-for-byte per the
+  "match reference exactly" security mandate and pinned the true edge in tests.
+- **File(s)**: userspace-dp/src/afxdp/wg/session.rs,
+  docs/pr/wireguard-clean/plan.md, _Log.md
+- **Validation**: `cargo build` clean. New fail-on-revert tests:
+  `unseen_counters_within_reference_window_accepted` (ages 64/127/8127/8128
+  ACCEPTED, 8129 OutOfWindow), `replayed_counter_rejected_at_every_age`
+  (replay Repeat at ages 0/1/64/127/8127/8128),
+  `ring_preserves_in_window_bit_across_blocks`. Updated the four
+  boundary-bound legacy tests (out_of_window/jump_ahead/window_edge/precheck)
+  to the 8128 edge. RED-on-revert (`REPLAY_WINDOW=64`): `test result:
+  FAILED. 0 passed; 1 failed` — panic `unseen counter at age 127 must be
+  accepted (reference window 64)`. Restored GREEN: session_tests 13/0; full
+  `afxdp::wg` 188/0. No smoke (pure in-process replay filter, unit-provable).
+
+## 2026-07-18 — #5213: unify show-flow-session id with the RT_FLOW session id
+
+- **Timestamp**: 2026-07-18 (fix/5213-unify-session-id)
+- **Action**: PR #5211 (#4915) assigned a stable node-unique u64
+  `SessionEntry.session_id` and carried it on RT_FLOW (SESSION_CREATE/CLOSE),
+  but DEFERRED unifying it with `show security flow session`: the conntrack
+  mirror `publish_conntrack` hardcoded `session_id: 0`, so the Go render
+  (`cli_show_flow.go`) always fell back to the per-row iteration index — the
+  two surfaces showed different ids for the same session. Fix (Rust): threaded
+  the stable id into the conntrack mirror. Extracted pure, testable
+  `build_conntrack_value_v4`/`_v6` builders (map-write split out) that stamp
+  `session_id` (was `0`); added a `session_id: u64` param through
+  `publish_bpf_conntrack_entry`→`publish_v4/v6_session` and a
+  `SessionTable::session_id_for(&key)` accessor; the 3 live-session-create
+  publish sites in `poll_descriptor` resolve the id from the just-installed
+  table entry (`sessions.session_id_for(&flow.forward_key)`). `ConntrackCtx`
+  gained a `session_id` field for its (currently unexercised) mirror path. Fix
+  (Go): `cli_show_flow.go` already read `val.SessionID`; extracted
+  `flowSessionDisplayID(dpSessionID, ordinalIdx)` used by printV4/printV6 — it
+  renders the real dataplane id and keeps the ordinal fallback ONLY when the id
+  is 0 (absent/legacy). The dataplane id is now non-zero (minting starts at 1,
+  #4915), so the real id renders. Byte-offset parity already guaranteed
+  (`bpfSessionValue.SessionID` #6082 explicit-pad, size-asserted 136). Docs:
+  session/README.md + event_stream/README.md follow-up (2) marked RESOLVED.
+- **File(s)**: userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/mod.rs, userspace-dp/src/afxdp/bpf_map_tests.rs,
+  pkg/cli/cli_show_flow.go, pkg/cli/cli_show_flow_test.go,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/event_stream/README.md, _Log.md
+- **Validation**: Rust `cargo build` clean; new builder tests (v4+v6) GREEN
+  (`test result: ok. 2 passed`); RED-on-revert (`session_id: 0`) →
+  `2 failed` (`left: 0, right: <SID>`); bpf_map 17/0, session 176/0. Go
+  `go build ./...` clean; `TestFlowSessionDisplayIDMatchesDataplaneID` GREEN;
+  RED-on-revert (helper→always-ordinal) → FAIL (`id = 3, want ...974634`); full
+  pkg/cli suite GREEN. No smoke (observability id; unit-provable).
+
+## 2026-07-18 — #5167: mirror cross-worker clone samples before reserving
+
+- **Timestamp**: 2026-07-18 (fix/5167-mirror-sample-first)
+- **Action**: Reordered the cross-worker (else) branch of
+  `enqueue_sampled_mirror_clone` (`userspace-dp/src/afxdp/mirror/fast_path.rs`)
+  to run the worker-local sampler `mirror_sample_allows` BEFORE
+  `admit_mirror_clone_to_live`, matching the same-worker branch. The old
+  order reserved the contended live clone queue first — a true-shared AcqRel
+  CAS on the target's `pending_tx_admitted` (#4096) — then sampled, so every
+  unsampled packet reserved/copied/reported clone-queue pressure and
+  acknowledged cross-core true-sharing scaled O(PPS) instead of O(PPS/R);
+  sampling could not bound clone cost. A non-sampled packet now returns `None`
+  having touched nothing shared.
+- **Scope (corrected per rev6101)**: #6113 fixes the `enqueue_sampled_mirror_clone`
+  DISPATCH path only — the session-miss / neighbor-resolution-retry callers
+  (`neighbor_dispatch.rs`, `tx/dispatch/mod.rs`). Two other reserve-before-sample
+  sites exist:
+  - `enqueue_sampled_mirror_clone_to_live` (fast_path.rs) is DEAD CODE
+    (`#[cfg_attr(not(test), allow(dead_code))]`, test-only callers) — harmless,
+    not a live regression; NOT the sibling worth chasing.
+  - The REAL remaining LIVE instance is
+    `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs:386-398` — the
+    ESTABLISHED-FLOW HOT PATH (flow-cache HIT), which inlines
+    `admit_mirror_clone_to_live` (:386, the same #5167 shared CAS) BEFORE
+    `mirror_sample_allows` (:398). #6113 does NOT touch it. Sustained high-PPS
+    mirror is dominated by flow-cache HITS, so #5167's O(PPS/R) goal is NOT yet
+    met on the dominant path — #6113 fixed only the session-miss minority path.
+    Tracked as follow-up #6114.
+- **Tests**: 4 new in `mirror/mod_tests.rs` (the target function had ZERO
+  prior tests; the existing queue-full test is for `_to_live`, untouched):
+  - `cross_worker_nonsampled_does_not_reserve_full_queue_5167` (FAIL-ON-
+    REVERT): full clone queue + a NON-sampled packet → `None` (sample-first,
+    no reserve). Revert to reserve-before-sample → admit fails on the full
+    queue → `Some(QueueFullCrossWorker)` → RED.
+  - `cross_worker_sampled_reports_queue_full_5167` (also RED-on-revert via
+    the sample counter): a SELECTED packet on a full queue reports pressure
+    AND consumes a sample; reverted, admit fails before the sampler runs so
+    the counter never advances.
+  - `cross_worker_sampled_enqueues_clone_5167` (happy path) +
+    `cross_worker_nonsampled_no_clone_nonfull_5167` (sanity).
+  - GREEN: `cargo test mirror::` = 25 passed (4 new + 21 existing).
+    RED-on-revert proven: reverting the reorder → `test result: FAILED. 2
+    passed; 2 failed` (the two full-queue tests RED; the happy-path + sanity
+    stayed GREEN). Build clean.
+- **File(s)**: userspace-dp/src/afxdp/mirror/fast_path.rs,
+  userspace-dp/src/afxdp/mirror/mod_tests.rs, docs/userspace-dataplane-gaps.md
+
+## 2026-07-18 — #5165: neighbor-monitor JoinHandle (no mutation after teardown)
+
+- **Timestamp**: 2026-07-18 (fix/5165-neigh-monitor-join)
+- **Action**: Fixed a control-plane thread-lifetime race. The neighbor
+  MONITOR thread was spawned `spawn_supervised_aux(...).ok()`, DISCARDING
+  its JoinHandle; `stop_inner` signalled `monitor_stop` but could not JOIN
+  before a reconcile cleared/rebuilt the shared `Arc<ShardedNeighborMap>`,
+  so a retired old-generation netlink consumer could mutate the fresh
+  baseline. Asymmetric with the sibling resolver (`resolver_join`). Fix
+  mirrors the resolver exactly:
+  1. Added `monitor_join: Option<JoinHandle<()>>` to `NeighborManager` +
+     `stop_and_join_monitor()` (signal `monitor_stop`, then JOIN).
+  2. `bringup.rs`: retain the join handle via `match spawn_supervised_aux`
+     (was `.ok()`), installing `monitor_stop` + `monitor_join` together
+     ONLY on successful spawn (spawn-fail leaves both None → next reconcile
+     retries, unchanged).
+  3. `stop_inner` calls `stop_and_join_monitor()` (was a bare
+     `monitor_stop.take().store(true)`), so the monitor is provably gone
+     before the map is cleared. Join latency bounded by the monitor's
+     existing 500ms `SO_RCVTIMEO` (the wake — mirrors the resolver's 500ms
+     recv-timeout bound; no new fd-sharing protocol invented).
+  4. `neigh_monitor_thread`: extracted the steady-state loop into
+     `neigh_monitor_steady_state(fd, stop, map, gen, counters)` (a
+     deterministic test seam) and added a post-`recv()` `stop` re-check
+     BEFORE mutating — a stop signalled while blocked in recv retires the
+     thread, so the just-received old-generation batch is dropped.
+- **Tests (fail-on-revert, deterministic, no real netlink)**:
+  - `steady_state_drops_batch_received_after_stop_5165`
+    (neighbor.rs): drives the REAL steady-state loop over an AF_UNIX
+    SOCK_DGRAM socketpair, injecting hand-crafted RTM_NEWNEIGH via the
+    existing `build_newneigh_request`. Event 1 (pre-stop) is applied;
+    after the loop is confirmed blocked in recv, stop is set and event 2
+    injected — the post-recv re-check drops it. Revert (remove the
+    re-check) → event 2 applied → RED.
+  - `stop_and_join_monitor_waits_for_thread` (neighbor_manager.rs):
+    a stand-in thread does bounded work AFTER observing stop; the JOIN
+    makes `stop_and_join_monitor` block until `done==true`. Revert (drop
+    the handle without `join()`) → returns early, `done==false` → RED.
+  - Plus `steady_state_exits_on_stop_when_idle_5165` and
+    `stop_and_join_monitor_no_monitor_is_noop` (liveness / no-op).
+  - GREEN: 4 new pass; `neighbor` suite 167 passed, `coordinator::` 133
+    passed. RED-on-revert proven: neutralizing the re-check AND the join
+    turned exactly the two targeted tests RED (the liveness/no-op stayed
+    GREEN, correctly). Build clean.
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs,
+  userspace-dp/src/afxdp/coordinator/neighbor_manager.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/README.md
+## 2026-07-18 — #6038: deflake TestWireUserspaceEventStreamCallbacks...WiresSessionAndFullResync (2s deadline races the wiring under load)
+
+- **Timestamp**: 2026-07-18 (fix/6038-eventstream-test-flake)
+- **Action**: Fixed the timing-flaky pkg/daemon test. Root cause (firsthand):
+  the wiring's happy path is ~0.2s because each of the two ACKs (session-open
+  seq 1, full-resync seq 2) is flushed by the eventstream `ackLoop`'s 100ms
+  ticker (`eventstream.go:924`), so two ACKs cost ~200ms. The test's ACK wait
+  (`waitForAckSeqForWiringTest`) and the socket dial loop each capped on a
+  FIXED `time.Now().Add(2 * time.Second)` — only ~1.8s of headroom. Under
+  concurrent build/test load the `ackLoop`/`acceptLoop`/`readLoop` goroutines
+  starve; the ACK slips past the 500ms per-read window repeatedly until the 2s
+  overall cap is exhausted (~4×500ms) → a spurious 2.01s timeout, non-monotonic
+  across commits (the issue's bisect FAIL→pass→FAIL). Fix: added
+  `wiringTestDeadline(t)` returning a GENEROUS cap that tracks `t.Deadline()`
+  (`go test -timeout`, default 10m) less a 5s margin, else a 30s fallback; both
+  the ACK wait and the dial loop now use it. The loops STILL gate on the actual
+  completion event (successful connect, then ACK seq >= want) — only the
+  wall-clock backstop was widened, no assertion weakened, no `#[ignore]`. Also
+  now check `es.Start(ctx)`'s previously-discarded error (Start binds the Unix
+  listener synchronously before the accept loop, so a bind failure should
+  surface directly, not as a confusing dial-loop timeout).
+- **File(s)**: pkg/daemon/userspace_sync_test.go, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/daemon/` clean; target
+  test `-count=50` → 50/50 pass; SAME `-count=50` under heavy CPU+build load
+  (GOMAXPROCS=2, 3×nproc busy loops + 3 parallel builds) → 50/50 pass, slowest
+  run 0.22s (no 2s outliers); full `go test ./pkg/daemon/` green. Cap-is-the-
+  lever contrast (per-read forced to 10ms to emulate the load timeout condition,
+  varying ONLY the overall cap): cap=50ms → RED (`read ack frame: i/o timeout`,
+  0.05s); cap=3000ms → GREEN (0.20s) — proving the overall deadline is the sole
+  pass/fail lever the fix widens. The genuine >2s ACK stall is load-dependent /
+  nondeterministic (per the issue's own bisect) and did not reproduce on this
+  box even under extreme oversubscription.
+
+## 2026-07-18 — #6041: address-only (`port no-translation`) persistent-NAT leases (parity follow-up to #5819)
+
+- **Timestamp**: 2026-07-18 (fix/6041-address-only-persist-nat)
+- **Action**: Implemented address-only persistent-NAT leases so
+  `persistent-nat` + `port no-translation` on the same source-NAT pool is now
+  SUPPORTED (was REJECTED fail-closed under #5819). New allocator method
+  `reserve_address_only_persistent` pins a public pool ADDRESS across the
+  configured `PersistentSourceKey` permit scope WITHOUT consuming a translated
+  pool port: it reuses a live/valid lease's pinned address (refcount up, expiry
+  refresh, activation-rollback re-arm), tears down an expired-idle lease (no
+  port to free), or picks a fresh address via `address_index`. Added an
+  `address_only: bool` field to `PersistentLease`; gated all three lease
+  port-free teardown sites (`reuse_existing_lease_locked` expired,
+  `rollback_flow` remove-lease, `reclaim_expired_lease_locked` GC) on
+  `!address_only`. Restructured `release_flow`/`rollback_flow` so an
+  address-only PERSISTENT flow (persistent_key=Some AND address_only=true)
+  clears its #5269 reverse-identity token AND decrements the lease refcount.
+  Wired the two round-robin address-only branches in `source.rs` (v4 + v6) to
+  route `rule.persistent_nat` through the new lease method. Removed the Go
+  fail-closed reject: `validateSourceNATPersistentNoTranslationStrict` (both
+  dispatch sites + the function) and the `persistent_nat_no_translation`
+  snapshot marker. HA behavior is consistent with ordinary persistent leases
+  (in-memory, not synced; address-only synced sessions carry no translated
+  port so `reserve_synced_source_nat_allocation` reserves nothing — same as the
+  #5269 non-persistent path; #1449 gate still refuses HA persistent pools).
+- **Tests**: 6 fail-on-revert Rust tests in `tests_pool.rs`
+  (`notrans_persistent_*_6041`): two-flow one-address reuse (v4+v6),
+  refcount release + inactivity-expiry reclamation, #5269 collision guard,
+  idempotent re-entry, permit-scope keying (any-remote-host shares one lease /
+  target-host-port keys distinct). Flipped the two Go 5819 test files to assert
+  the combo is now accepted + usable. RED-on-revert proven: neutralizing the
+  lease routing (persistent → round-robin `reserve_address_only`) turns all 6
+  RED. `cargo test nat::` = 259 passed; `go test ./pkg/config/
+  ./pkg/dataplane/userspace/` both ok.
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs, pkg/config/compiler_uniformgates.go,
+  pkg/config/compiler_peer_effective_snat.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_persistent_nat_notranslation_5819_test.go,
+  pkg/dataplane/userspace/nat_source.go,
+  pkg/dataplane/userspace/nat_source_persistent_notranslation_5819_test.go,
+  docs/userspace-dataplane-gaps.md
+## 2026-07-18 — #6025 fold: negative-scope + v6 coverage (rev6101 MERGE-NEEDS-MINOR)
+
+- **Timestamp**: 2026-07-18 (fix/6025-dnat-off-localdelivery, follow-up)
+- **Action**: Folded the one substantive review MINOR from rev6101 — a
+  coverage gap on the crux. The positive test's `.51`-stays-local assertion
+  passes purely by the destination-identity check (`off_key.dst_ip == addr`,
+  .51 != .50), so it never exercises `off_scope_superset`'s SCOPE axes; a
+  future loosening of `off_scope_superset` would over-withdraw a
+  still-translated VIP uncaught. Added two tests to
+  `nat/tests_destination.rs`: (1)
+  `dnat_off_exemption_non_superset_source_scope_stays_local` — a
+  SOURCE-SCOPED `/32 off` that shadows the same broad `/24` translate BY
+  DESTINATION IDENTITY but is NOT a scope superset (source_constrained), so
+  the exempt host MUST remain firewall-local (it is still translated for
+  out-of-scope sources); asserts in-scope source → no DNAT, out-of-scope
+  source → translated, and `.50` stays local. (2)
+  `dnat_off_exemption_shadowing_broad_translate_prefix_not_local_v6` — v6
+  analog of the positive test exercising the v6 prefix-expansion `shadowed`
+  path (`2001:db8::/120` translate + `2001:db8::50/128 off`). No production
+  code change — the fix already handled both; these are the missing
+  fail-on-revert guards.
+- **File(s)**: userspace-dp/src/nat/tests_destination.rs, _Log.md
+- **Validation**: negative-scope RED-on-revert — loosened
+  `off_scope_superset` (`!off.source_constrained` → `true`): `test result:
+  FAILED. 0 passed; 1 failed` (panic tests_destination.rs:388, `.50` wrongly
+  withdrawn). Restored: `test result: ok. 47 passed; 0 failed`
+  (nat::tests_destination, up from 45 — both new tests GREEN).
+
+## 2026-07-18 — #6025: withdraw a shadowed translate VIP on a winning `destination-nat off`
+
+- **Timestamp**: 2026-07-18 (fix/6025-dnat-off-localdelivery)
+- **Action**: CONFIRMED then fixed the #6025 NAT correctness bug. A specific
+  `/32 destination-nat off` exemption that shadows a BROADER translate DNAT
+  prefix (pool DNAT over a subnet, one host exempted) correctly WINS the DNAT
+  match (exact-host entries are probed before any prefix in
+  `lookup_with_counter_scoped`), so the exempt host is never translated. But
+  the broad translate prefix registers its VIP firewall-local via the #3164
+  bounded host-by-host expansion, and that expansion re-registered the exempt
+  `/32` even though the `off` entry itself was skipped (#3844). The exempt host
+  therefore won the match (no translation) yet was consumed via LocalDelivery
+  instead of routed — a silent blackhole of the exact host the operator meant
+  to pass through. Confirm-first repro
+  (`dnat_off_exemption_shadowing_broad_translate_prefix_not_local`) FAILED on
+  pristine origin/master (exempt `203.0.113.50` present in
+  `destination_ips()`), proving the bug. Fix in
+  `nat/destination.rs::destination_ips_scoped` (option (a) — the cleaner,
+  more-local fix): withdraw a prefix-expanded / prefix-base address when a
+  superset exact-host `off` exemption shadows it for that translate slot
+  (`off_scope_superset`: protocol/port/zone/interface/routing-instance
+  wildcard-or-equal, source + #3437/#3449 L4 axes unconstrained). Conservative
+  — never over-suppresses, so a non-exempt host under the same prefix stays
+  firewall-local; per-slot, so a host exempt for one slot but translated by
+  another is still registered by the other. Doc updated
+  (docs/userspace-dnat-plan.md §15).
+- **File(s)**: userspace-dp/src/nat/destination.rs,
+  userspace-dp/src/nat/tests_destination.rs, docs/userspace-dnat-plan.md,
+  _Log.md
+- **Validation**: RED-on-revert (unmodified code): `test result: FAILED. 0
+  passed; 1 failed` on the exempt-host-routed assertion. GREEN (fixed):
+  `test result: ok. 45 passed; 0 failed` (nat::tests_destination); full
+  `nat::` 254 passed / 0 failed; `forwarding` 265 passed / 0 failed.
+
+## 2026-07-18 — #6103: deterministic-fix event_stream stalled-consumer backpressure test (host socket-buffer dependency)
+
+- **Timestamp**: 2026-07-18 (fix/6103-eventstream)
+- **Action**: `event_stream::tests::backpressure::stalled_consumer_does_not_
+  grow_backlog_unbounded_end_to_end` failed 10/10 on pristine origin/master
+  on this host. Root cause (confirmed, not guessed): the test wedges an
+  AF_UNIX reader so `write()` returns `WouldBlock` and the I/O thread's
+  `write_buf` backs up to the 16 MiB `WRITE_BACKLOG_MAX_BYTES` cap. But the
+  test only pumps `3 × 16 MiB ≈ 48 MiB` of frames, and this fleet tunes
+  `net.core.{r,w}mem_default = 67108864` (64 MiB), so a wedged AF_UNIX
+  socketpair absorbs ~53 MiB before `WouldBlock` (measured) — MORE than the
+  pump — so `write_buf` never accumulates, the cap is never hit,
+  `frames_write_stalled` stays 0, and the `> 0` assertion fails. Instrumented
+  run confirmed `sent_ok=3.05M`, `frames_dropped=97k`, `frames_write_stalled=0`.
+  This is a host-sysctl-dependent deterministic failure of the TEST's hidden
+  assumption (small default socket buffer), NOT a product backpressure
+  regression — the product cap works (proven by the 4 unit-level backpressure
+  tests and by fail-on-revert below).
+- **Fix**: shrink both ends of the test socketpair (`SO_SNDBUF` on the writer,
+  `SO_RCVBUF` on the reader) to 64 KiB via `libc::setsockopt` before wedging,
+  so a non-reading peer backs up after ~108 KiB regardless of host tuning.
+  Test-only change; product code untouched.
+- **Validation**: 10/10 green alone (0.34 s each, was 5.5 s failing); full
+  `event_stream::` module 85/85 in-suite; fail-on-revert — disabling the
+  `write_buf.len() >= WRITE_BACKLOG_MAX_BYTES` cap makes the test FAIL again
+  (`must trip the backlog cap`, bounded ~48 MiB write_buf, no OOM).
+- **Docs**: no change needed — `event_stream/README.md` documents the PRODUCT
+  cap semantics, which this test-determinism fix does not alter.
+- **File(s)**: userspace-dp/src/event_stream/tests/backpressure.rs, _Log.md
+
+## 2026-07-18 — #6103: regen stale wire_invariant fixture (missing #5623/#5625 nat64 fields)
+
+- **Timestamp**: 2026-07-18 03:53 PDT (fix/6103-wire-fixture)
+- **Action**: `protocol::wire_invariant_default_specimens` failed on a
+  pristine origin/master. The golden fixture
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json` was stale: the
+  `binding_status` specimen was missing the two `BindingStatus` counter
+  fields added by #5623 (`nat64_ineligible_source`) and #5625
+  (`nat64_exthdr_ineligible`) — those feature PRs added the serde fields
+  (`src/protocol/binding.rs`) but never regenerated the wire golden.
+  Regenerated the fixture via the sanctioned mechanism
+  `XPF_PROTOCOL_WIRE_REGEN=1 cargo test --release --bin xpf-userspace-dp
+  wire_invariant_default_specimens`. Confirmed the diff is EXACTLY the two
+  new `nat64_exthdr_ineligible` / `nat64_ineligible_source` keys (BTreeMap
+  alpha order) and nothing else, so the invariant stays meaningful. The
+  event_stream backpressure half of #6103 is a genuine (deterministic,
+  5/5) failure root-caused to this host's 64 MiB socket send buffer vs the
+  test's ~48 MiB pump — deferred to separate work, NOT bundled here.
+- **File(s)**: userspace-dp/tests/fixtures/protocol_wire_v1.json, _Log.md
+- **Validation**: `cargo test --release wire_invariant` GREEN; full
+  `protocol::` module 75 passed / 0 failed.
+
+## 2026-07-18 — #5801: day-2 slow-path TUN MTU reconcile
+
+- **Timestamp**: 2026-07-18 (fix/5801-slowpath-mtu-reconcile)
+- **Action**: The persistent slow-path reinjector (`SlowPathReinjector`) is
+  preserved across snapshot reconciles, and its TUN MTU + immutable `mtu` field
+  were programmed only at creation (#2408). A valid day-2 config raising a
+  data-interface MTU updated the accepted snapshot but NOT the live TUN, so
+  reinjected frames above the old ceiling dropped persistently (`MtuExceeded`)
+  until helper restart — the reconcile path only WARNED. Fix: give the
+  reinjector a reconcile op that reprograms the live TUN and converges its
+  state. `SharedStatus::reprogram_mtu_status` is the day-2 sibling of
+  `apply_mtu_status`: on success it advances `live_mtu` and clears `degraded`;
+  on a FAILED `SIOCSIFMTU` it KEEPS the current live MTU (the running TUN
+  retains its last-programmed value — NOT the 1500 creation fallback), marks
+  degraded, and records the error. `SlowPathReinjector::reconcile_mtu` reads the
+  live device name, calls that helper, and stores the installed MTU into the now
+  interior-mutable `mtu: AtomicI64` field so `mtu()`, `live_mtu`, and enqueue
+  admission agree. In `apply_snapshot` the preserved-reinjector branch now calls
+  the extracted `reconcile_preserved_slow_path_mtu` seam (passing
+  `slowpath::set_if_mtu`) instead of only warning — deduped per distinct desired
+  value via `last_slow_path_mtu_warned` so a steady-state reconcile loop does
+  not re-issue the ioctl.
+- **Fail-on-revert tests**: `slowpath::tests::reprogram_mtu_status_advances_on_success`,
+  `reprogram_mtu_status_keeps_live_on_failure`,
+  `reconcile_mtu_reprograms_live_tun_and_admission`, and
+  `afxdp::coordinator::reconcile::snapshot::slow_path_mtu_tests::day2_mtu_increase_reprograms_preserved_reinjector`.
+  Programmer is an injected seam (no real `SIOCSIFMTU`; unit tests run without
+  CAP_NET_ADMIN). Neutralizing the fix (reconcile → no-op, failure arm → 1500
+  fallback, wiring → warn-only) turns 3 of the 4 RED (`left: 1500, right: 9000`);
+  the success-arm companion stays green. Restored fix: `test result: ok. 4
+  passed; 0 failed`.
+- **Validation**: `cargo build` clean; `cargo test --release slowpath` →
+  `35 passed; 0 failed`; the 4 new tests green by explicit filter.
+- **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/slowpath_tests.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
+
+## 2026-07-18 — #5100: retire vanished queue identities in fairness throughput window
+
+- **Timestamp**: 2026-07-18 (fix/5100-fairness-window-retire)
+- **Action**: The collector's rolling per-queue fairness throughput window
+  (`FairnessThroughputWindow`, consumed under the collector mutex by
+  `emitFairnessThroughputGauges` in `pkg/api/metrics_userspace.go`) never
+  deleted a key from `w.queues`. The seed-all-keys loop appended an empty
+  idle-advancement sample to EVERY historical `(ifindex, queueID)` each
+  update, so a queue that vanished (interface removal / ifindex churn / test
+  namespaces) never drained on its own and lingered for the process lifetime
+  — unbounded memory plus an ever-growing per-scrape seed+sort of the full
+  historical key slice under the mutex. Fix: after `prune`, RETIRE a queue
+  that is absent from the current status AND drained (empty `bytesByFlow`,
+  `bytesByWorker`, and `starvedFlows`). Added `currentQueues` (the identities
+  observed in this update's `FlowWorkerMap` — the sole creator of queue
+  states) and `fairnessQueueThroughputWindow.isDrained()`; the prune loop now
+  `delete(w.queues, key)` for drained-and-absent keys. Retirement is
+  metric-invariant: the scrape already skips queues with empty `bytesByFlow`,
+  so a retired queue produced no gauge sample anyway; a still-active queue is
+  never retired (its window samples keep `bytesByFlow` non-empty); a retired
+  identity that reappears re-registers cleanly via `queueState` with a fresh
+  baseline. Retention is now bounded by currently-observed identities plus one
+  window of recently-active ones.
+- **File(s)**: `pkg/dataplane/userspace/fairness_throughput.go`,
+  `pkg/dataplane/userspace/fairness_throughput_test.go`,
+  `docs/cos-traffic-shaping.md`, `_Log.md`
+- **Validation**: `go build`, `go vet`, `go test ./pkg/dataplane/userspace/`
+  (full package green, 14.6s); fairness subset `-count=5` no flakes. New
+  `TestFairnessThroughputWindowRetiresVanishedQueueIdentity` (fail-on-revert:
+  neutralizing the `delete` leaves the vanished key present → FAIL) and
+  `TestFairnessThroughputWindowBoundsMemoryUnderQueueChurn` (200 churned
+  identities → peak `w.queues` size = 2 with the fix, ~200 without).
 
 ## 2026-07-18 — #5290: fair HA session-delta drain + overflow resync latch
 
@@ -52292,3 +52789,221 @@ top.
   pkg/config/compiler_uniformgates.go, pkg/config/compiler_peer_effective_snat.go,
   pkg/config/compiler_nat_source_pool_aggregate_5877_test.go,
   docs/config-schema.md, _Log.md
+
+## 2026-07-18 — #5341: deterministic-CGNAT address-only occupancy token
+
+- **Timestamp**: 2026-07-18
+- **Action**: Fixed the un-tokened deterministic-CGNAT (mode 1) address-only
+  sub-branch — follow-up to #5336's round-robin/persistent #5269 fix. A REAL
+  address-only flow (`port no-translation` on a port-bearing protocol, or a
+  port-less protocol) on a deterministic pool now mints the SAME
+  reverse-identity occupancy token via `PortAllocator::reserve_address_only`,
+  so two subscribers sharing one deterministic external address (same preserved
+  source port + remote) can no longer both receive the identical public reverse
+  tuple the 1:N index cannot disambiguate — the second collides and fails
+  closed as exhaustion, mirroring #5336 exactly. The synthetic tuple-unknown
+  wrapper still mints no token (never a framed flow). The token is freed by the
+  SAME teardown path (`release_source_nat_allocation` → `release_flow`) as the
+  round-robin branch — no new release site, no leak, no double-free.
+- **Scope note**: only ONE site needed the fix. `SourceNatRule` carries only
+  `deterministic_v4`; deterministic v6 (mode 2 / NAPT64) is the NAT64 path
+  (`allocate_nat64_pool_port_deterministic_v6`), which is ALWAYS PAT (returns
+  `(Ipv4Addr, u16)`, always sets `rewrite_src_port`) and has no address-only
+  sub-branch — no token gap there.
+- **Docs**: the #5269/#5336 occupancy-token invariant is documented in the
+  `source.rs`/`allocator.rs` code comments, not the FEATURES.md `nat.rs`
+  config-surface row, so the doc contract for this change is the inline
+  comments — updated the deterministic branch lead comment + added the #5341
+  mint block.
+- **Tests**: `deterministic_cgnat_no_translation_collision_denies_second_flow_5341`
+  (fail-on-revert: A mints token, B collides → exhaustion),
+  `deterministic_cgnat_no_translation_token_released_on_teardown_5341`
+  (release-on-close: token freed, B then succeeds),
+  `deterministic_cgnat_no_translation_distinct_remote_both_succeed_5341`
+  (disambiguation: distinct remotes → distinct reverse identities coexist on
+  one deterministic address). Reverting the mint turns all 3 RED (verified).
+- **Validation**: cargo build clean; `cargo test --bin xpf-userspace-dp nat::`
+  253 passed / 0 failed; new tests 5x flake check all green.
+- **File(s)**: userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs, _Log.md
+
+## 2026-07-18 — #5289 per-worker POD exception ring (drop-disposition DoS)
+
+- **Timestamp**: 2026-07-18
+- **Action**: Replace the process-global `recent_exceptions`
+  (`Arc<Mutex<VecDeque<ExceptionStatus>>>`) and `last_resolution`
+  (`Arc<Mutex<Option<PacketResolution>>>`) mutexes — locked + heap-formatted
+  on EVERY terminal packet — with PER-WORKER POD rings. `record_exception`
+  now writes a compact `ExceptionEvent` (static `&str` reason, `Arc<str>`
+  interface clone, `Copy` `IpAddr`s, numeric zone ids, monotonic `Instant`)
+  under a per-worker mutex with a per-(reason,5-tuple) sampler; NO `String`
+  alloc, NO `Utc::now` on the packet path. The control/status thread
+  (`Coordinator::recent_exceptions` / `last_resolution`) drains all
+  per-worker rings + the control ring and formats each POD event into the
+  unchanged `ExceptionStatus` / `PacketResolution` via a single captured
+  `MonoWallAnchor` (monotonic→wall). Batched `BindingLiveState` counters
+  remain the lossless signal; externally-visible status shape unchanged (no
+  wire change). Cold control-thread notices (spawn/tunnel-setup failures)
+  keep dynamic reasons via `control_notice_event` / `reason_owned`.
+- **File(s)**: userspace-dp/src/afxdp/disposition.rs (new
+  ExceptionEvent/ResolutionEvent/ExceptionEventRing/MonoWallAnchor + record
+  path), coordinator/mod.rs (per-worker registries + clears),
+  coordinator/reconcile/bringup.rs (per-worker Arc spawn/teardown),
+  coordinator/status.rs (drain+format accessors), coordinator/README.md,
+  tx/dispatch/{mod,slow_path}.rs (record_exception_owned for dynamic
+  reasons), tunnel.rs, coordinator/tunnel_supervision.rs, worker/*, mod.rs,
+  ~40 signature type-swaps, test constructions + assertions, _Log.md.
+- **Validation**: `cargo build` clean (no errors); `cargo test --release`
+  3952 passed / 2 failed — both failures (`wire_invariant_default_specimens`,
+  event_stream `stalled_consumer...end_to_end`) confirmed PRE-EXISTING on a
+  pristine origin/master worktree (I touched neither module). New
+  fail-on-revert tests in disposition.rs::tests_5289_exception_ring:
+  `record_exception_writes_pod_event_and_samples_flood` (POD fields + sampler
+  suppression), `to_status_reconstructs_human_readable_exception` (round-trip
+  vs old formatted output), `source_nat_exception_round_trips_rule_and_pool`
+  — all green. `segmentation_miss_recorder_is_rate_capped` updated for the
+  sampler (identical flood collapses to one ring entry; #1282 cap counter
+  still saturates at 20).
+
+## 2026-07-18 — #5611: lock the NPTv6 wildcard-vs-concrete overlap-reject edge
+- **Timestamp**: 2026-07-18
+- **Action**: Test-coverage lock-in follow-up to #5176 (PR #5610). The NPTv6
+  `from_zone` scope-overlap gate `zones_conflict(a,b) = a.is_empty() ||
+  b.is_empty() || a == b` correctly REJECTS a wildcard (`from_zone=""`) rule
+  overlapping a concrete-zone rule with the same prefix (the empty short-circuit
+  → conflict → snapshot rejected) and a same-concrete-zone duplicate (the `a==b`
+  arm), but neither edge had an explicit regression-locking test. Existing
+  overlap tests use both-empty `from_zone`; the split-horizon test covers the
+  distinct-non-empty ADMIT. Added two fail-on-revert tests to lock both reject
+  paths. COVERAGE ONLY — no production behavior change.
+- **Tests** (userspace-dp/src/nptv6_tests.rs):
+  - `nptv6_wildcard_vs_concrete_same_prefix_rejected_5611` (:923) — wildcard +
+    concrete same internal `fd00:1::/48`, distinct external prefixes, BOTH
+    argument orderings (wildcard-first and concrete-first) → `expect_err`
+    `Nptv6OverlappingPrefix`. Binds the empty short-circuit and argument-order
+    symmetry (an asymmetric simplification checking only one side's emptiness is
+    caught). Goes RED under the `zones_conflict -> a == b` neutralization.
+  - `nptv6_same_concrete_zone_same_prefix_rejected_5611` (:963) — `untrust` +
+    `untrust` same internal prefix → `expect_err`. Guards the `a == b` arm
+    (stays GREEN under the `a==b` neutralization, RED if the equality arm is
+    dropped).
+- **Docs**: added a `#4339` fail-closed doc paragraph above `zones_conflict`
+  (nptv6.rs) — the `a == b` arm also rejects a degenerate same-name/same-prefix
+  duplicate a Go scope-expansion (#4339) could emit; a fail-CLOSED config
+  rejection (keeps prior live state), never a translation bypass.
+- **Validation** (release, uncontended target dir): baseline GREEN
+  `test result: ok. 2 passed; 0 failed`; neutralized `zones_conflict -> a == b`
+  → `nptv6_wildcard_vs_concrete_same_prefix_rejected_5611 ... FAILED`,
+  `test result: FAILED. 1 passed; 1 failed`; restored production
+  `test result: ok. 2 passed; 0 failed`. Full `cargo test --release nptv6`
+  module GREEN (44 passed, 0 failed) with fmt clean. Test-only + no forwarding
+  bytes change → no cluster smoke required (#5611 exemption).
+- **File(s)**: userspace-dp/src/nptv6.rs, userspace-dp/src/nptv6_tests.rs,
+  _Log.md
+
+## 2026-07-18 — #6046 TE/PTB per-zone bucket doc/comment accuracy (doc-only)
+- **Timestamp**: 2026-07-18
+- **Action**: Corrected the #5856 per-zone ICMP TE/PTB bucket docs + comments,
+  which OVERCLAIMED per-VLAN-subinterface granularity. Verified firsthand that
+  the TE/PTB generators key the per-zone bucket on the PHYSICAL ingress bind
+  ifindex (`ingress_ident.ifindex`, the fixed per-binding socket-bind port) via
+  `ifindex_to_zone_id` WITHOUT calling `resolve_ingress_logical_ifindex`, so VLAN
+  sub-interfaces on the same physical port SHARE that port's TE/PTB bucket. Only
+  the Reject path resolves the LOGICAL unit (`logical_ingress_ifindex`) and thus
+  gets per-sub-interface granularity. Kept the correct framing: the per-zone split
+  is still correct and strictly better than the pre-#5856 single global bucket.
+- **Evidence** (all origin/master @ cdd26a5): TE bucket keys physical at
+  `icmp.rs:231-235` (`ifindex_to_zone_id.get(&ingress_ident.ifindex)`, no
+  resolve); PTB bucket keys physical at `tx/dispatch/mod.rs:277-281`;
+  `ingress_ident` = `worker_ctx.ident` = `binding.identity()` = physical
+  socket-bind ifindex (`worker/mod.rs:855-863`, `641`; `lifecycle.rs:170-172`;
+  `bringup.rs:66-72`). Reject resolves logical at
+  `poll_descriptor/reject_reply.rs:272-274` then keys the bucket on it at
+  `:398-402`; reject is invoked with the physical `binding.ifindex`
+  (`poll_descriptor/mod.rs:1280`). `ifindex_to_zone_id` is keyed by the LOGICAL
+  `iface.ifindex`, physical parent inherits only the FIRST sub-if's zone
+  (`forwarding_build/interfaces.rs:81-91`).
+- **Change**: comment/doc-only — NO code logic touched. `cargo build` clean;
+  `git diff` shows only `//` comment hunks in the two .rs files + the .md.
+- **File(s)**: docs/generated-reply-rate-limit.md,
+  userspace-dp/src/afxdp/icmp.rs, userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  _Log.md
+
+## #6101 — slow-path record_exception alloc + cross-worker exception-ring merge test (2026-07-18)
+
+- **Timestamp**: 2026-07-18
+- **Action**: Item 1 — make the slow-path reinject-failure exception record path
+  alloc-free. Added `ExceptionEvent::reason_suffix: &'static str` and
+  `disposition::record_exception_suffixed()` (base `&'static` reason + `&'static`
+  suffix, no per-event `format!`/`String`). Replaced the four
+  `record_exception_owned(&format!("{reason}_..."))` sites in `slow_path.rs`
+  (`_rate_limited` / `_queue_full` / `_slow_path_mtu_exceeded` /
+  `_enqueue_failed`) with `record_exception_suffixed`. `ExceptionEvent::reason()`
+  now returns `Cow<str>` reconstructing `"{reason}{suffix}"` on the status thread
+  (borrowed for the common no-suffix case). `maybe_reinject_slow_path_from_frame`
+  `reason` param tightened to `&'static str`. Corrected the `record_exception_owned`
+  doc-comment (now genuinely debug-log-only after the slow-path sites moved off it).
+  Item 2 — added `status_tests.rs::exception_ring_merge_6101` covering the
+  cross-worker `recent_exceptions()` merge/sort/cap across 2 per-worker rings +
+  control ring, `last_resolution()` newest-across-slots, and the bringup/teardown
+  `.remove` drop. Added `#[cfg(test)]` `ExceptionEvent::for_test` /
+  `ResolutionEvent::for_test` constructors.
+- **File(s)**: userspace-dp/src/afxdp/disposition.rs,
+  userspace-dp/src/afxdp/tx/dispatch/slow_path.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/status_tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #6075 (#5147/#6074 follow-up) — added an INDEPENDENT fail-on-revert
+  test pinning site (2), the poll_descriptor pre-resolve `neighbor_mac_epoch`
+  SNAPSHOT site (`epoch_for(&(outer_neighbor_ifindex(.., None, ..), nh))`). The
+  existing site-(1) test (`tunnel_flow_cache_keys_mac_change_shard_on_outer_
+  neighbor_not_logical_ifindex`) injects `neighbor_mac_epoch = 0` directly, so it
+  does NOT bind the poll snapshot; reverting only site (2) to the logical
+  `egress_ifindex` left it green. New test
+  `poll_descriptor_stamps_neighbor_mac_epoch_from_outer_neighbor_shard_not_
+  logical_6075` (tests_txn_flow_cache.rs) drives the REAL poll path
+  (`poll_binding_process_descriptor`) for a native-GRE transit forward with the
+  OUTER transport neighbor's shard MAC-change epoch pre-bumped in a caller-owned
+  dynamic-neighbor map, then asserts the seeded flow-cache entry's stamped
+  `neighbor_mac_epoch` equals the OUTER shard's snapshot epoch (not the logical
+  tunnel shard's). Added test-support harness `txn_run_descriptor_with_neighbors`
+  (accepts a caller-provided `dynamic_neighbors` so a test can seed shard epochs
+  before the poll's pre-resolve snapshot). Reverting site (2) -> new test RED
+  (left 0, right 1), site-(1) test stays GREEN (isolation). WireGuard NOT covered:
+  the build zeroes a WG endpoint's outer transport destination, so a WG transit
+  resolution NoRoutes at admit time and never seeds a ForwardCandidate flow-cache
+  entry; the site-(2) stamp path is native-GRE territory. No production change
+  (test-coverage only); no docs change needed (contract already documented in the
+  #6074 flow_cache.rs / poll_descriptor comments + site-(1) test).
+- **File(s)**: userspace-dp/src/afxdp/tests_txn_flow_cache.rs,
+  userspace-dp/src/afxdp/tests_support.rs
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5172 — demote slow-path io_uring WriteMode to SyncFallback after a
+  TERMINAL runtime ring failure (mirror state_writer #2958). Previously WriteMode
+  was chosen once at init and the packet-loop Err arm only bumped counters +
+  set_last_error, so every packet kept retrying a broken ring (degrading
+  BGP/OSPF/mgmt/local slow-path traffic); #2477 only added a per-CALL sync
+  fallback without changing the mode. Introduced a structured SlowPathWriteOutcome
+  (packet-transfer certainty vs RING HEALTH), classify_io_uring_write
+  (terminal-vs-transient: an ambiguous/wedged `Transferred` failure is terminal —
+  a partial write cannot occur on an atomic TUN write, so it means the transport,
+  not the packet; a `safe_to_retry` `NothingWritten` failure is transient and the
+  per-call sync fallback rescues it, no demote), write_packet_with_mode, and
+  apply_slowpath_outcome (the runtime-demotion chokepoint). On a terminal failure
+  retire_ring_to_sync drains + drops the ring (fd close cancels outstanding SQEs;
+  the current packet's buffer outlives the drop, so #2297 holds), flips
+  WriteMode=SyncFallback + status mode="sync" ONCE (permanent, no flap; leaves
+  `active` set since it tracks TUN/worker liveness not io_uring). The ambiguous
+  current packet is DROPPED, never sync-resent (no double-transmit). Removed the
+  now-unused write_packet_io_uring_or_sync (folded into write_packet_with_mode);
+  decide_sync_fallback + its #2477 tests unchanged. Added 5 fail-on-revert tests:
+  classify_{terminal,transient,successful}, terminal_ring_failure_demotes_write_
+  mode_to_sync (RED-on-revert anchor), transient_outcome_does_not_demote_write_
+  mode. Documented the WriteMode demotion contract in
+  docs/xdp-io-uring-userspace-dataplane.md. Full suite 3981 passed / 0 failed;
+  fail-on-revert proven (removing `*mode=SyncFallback` -> demotion test RED while
+  the transient + #2477 tests stayed GREEN).
+- **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/slowpath_tests.rs,
+  docs/xdp-io-uring-userspace-dataplane.md

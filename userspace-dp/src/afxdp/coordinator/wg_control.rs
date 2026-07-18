@@ -124,7 +124,7 @@ pub(super) fn wg_control_loop(
     engine: Arc<crate::afxdp::wg::WgEngine>,
     listen_port: u16,
     outer_mtu: usize,
-    recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: Arc<Mutex<ExceptionEventRing>>,
     stop: Arc<AtomicBool>,
 ) {
     // Bind the UDP socket. v6 dual-stack ([::]:port) accepts both v4 and
@@ -336,7 +336,7 @@ fn run_wg_control_loop(
     socket_is_v6: bool,
     mut tun: std::fs::File,
     outer_mtu: usize,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     stop: &AtomicBool,
 ) {
     use std::collections::HashMap;
@@ -660,7 +660,7 @@ fn start_attempt(
     now_ns: u64,
     encap_buf: &mut [u8],
     tunnel_name: &str,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
 ) -> Option<HandshakeAttempt> {
     engine.clear_t7_arm(peer_pubkey);
     let counters = engine.counters();
@@ -706,7 +706,7 @@ fn drive_attempt_machine(
     attempt: &mut Option<HandshakeAttempt>,
     encap_buf: &mut [u8],
     tunnel_name: &str,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
 ) -> u64 {
     use crate::afxdp::wg::session::{REKEY_ATTEMPT_TIME_NS, REKEY_TIMEOUT_NS};
     use crate::afxdp::wg::timers::{InitiateReason, WG_NO_DEADLINE_NS};
@@ -839,7 +839,7 @@ fn send_keepalive(
     now_ns: u64,
     encap_buf: &mut [u8],
     tunnel_name: &str,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
 ) {
     use crate::afxdp::wg::timers::KeepaliveKind;
     match engine.create_keepalive(peer_pubkey, encap_buf) {
@@ -1269,7 +1269,7 @@ fn drive_initiation(
     endpoint: SocketAddr,
     out: &mut [u8],
     tunnel_name: &str,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
 ) {
     // #1865: create_initiation Ok/Err accounting is engine-internal
     // (hs_initiations_created / hs_initiation_build_failures); the
@@ -1315,7 +1315,7 @@ fn dispatch_inbound(
     decap_buf: &mut [u8],
     response_buf: &mut [u8],
     tunnel_name: &str,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
 ) -> InboundOutcome {
     let Some(&wg_type) = datagram.first() else {
         return InboundOutcome::Unauthenticated;
@@ -1530,7 +1530,7 @@ fn encap_and_send(
     out: &mut [u8],
     outer_mtu: usize,
     tunnel_name: &str,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
 ) {
     // Exact pad-aware MTU guard (plan §4.3 / AGY H1) — symmetric with the
     // transit-egress guard in frame/wg.rs, AND against the SAME MTU model

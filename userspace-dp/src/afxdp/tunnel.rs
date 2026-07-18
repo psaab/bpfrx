@@ -171,7 +171,7 @@ pub(super) fn drain_local_tunnel_deliveries(
     delivery_rx: &Receiver<Vec<u8>>,
     stop: &AtomicBool,
     tunnel_name: &str,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
 ) -> LocalTunnelDrainOutcome {
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -250,7 +250,7 @@ pub(super) fn local_tunnel_source_loop(
     // TUN fd. Producers (worker slow path) and the stop path signal it
     // to wake the loop, replacing the 1ms busy-poll.
     wake: Arc<TunnelWake>,
-    recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: Arc<Mutex<ExceptionEventRing>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut tun = match open_tun(&tunnel_name) {
@@ -826,19 +826,11 @@ pub(super) fn set_fd_nonblocking(fd: c_int) -> Result<(), String> {
 mod tests;
 
 pub(super) fn record_local_tunnel_exception(
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     tunnel_name: &str,
     reason: String,
 ) {
     if let Ok(mut recent) = recent_exceptions.lock() {
-        push_recent_exception(
-            &mut recent,
-            ExceptionStatus {
-                timestamp: Utc::now(),
-                interface: tunnel_name.to_string(),
-                reason,
-                ..ExceptionStatus::default()
-            },
-        );
+        push_recent_exception(&mut recent, control_notice_event(tunnel_name, reason));
     }
 }

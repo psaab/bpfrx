@@ -738,32 +738,15 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
-	// #5819 source-NAT pool `persistent-nat` + `port no-translation` gate. A
-	// pool that configures BOTH committed cleanly and then silently degraded:
-	// the no-translation (address-only) dataplane path bypasses the persistent-
-	// lease machinery, so no lease is recorded, no permit-scope reuse or
-	// inactivity timer applies, and with global `source address-persistent` off
-	// each new flow can leave through a different public address — a config that
-	// claims persistence quietly behaves as ordinary per-flow address-only NAT.
-	// Reject the unsupported combination at strict commit / commit-check (hard-
-	// reject so it is operator-visible); lenient on load / peer-sync (downgrade
-	// to a warning so a config persisted before this gate existed still boots —
-	// #1960 no-brick; the SNAT snapshot builder independently fails CLOSED,
-	// marking the pool unusable with reason "persistent_nat_no_translation" so
-	// nothing installs rather than shipping the silent degradation). Shares the
-	// lenientDestNATAddresses flag (same NAT silent-drop doctrine as the sibling
-	// source-pool gates). Mirrors the #5859 static-nat `then inet` fail-closed
-	// pattern. Runs AFTER the pool address-grammar gate so a structurally broken
-	// pool definition still wins the first-error slot. Full address-only
-	// persistent leases (option 1 of #5819) are a deferred follow-up.
-	if err := validateSourceNATPersistentNoTranslationStrict(cfg); err != nil {
-		if opts.lenientDestNATAddresses {
-			cfg.Warnings = append(cfg.Warnings,
-				fmt.Sprintf("source-nat persistent-nat + no-translation (downgraded to warning on tolerant path): %v", err))
-		} else {
-			return err
-		}
-	}
+	// #6041: `persistent-nat` + `port no-translation` on one source-NAT pool is
+	// now SUPPORTED. The userspace dataplane implements an address-only
+	// persistent lease (reserve_address_only_persistent in
+	// userspace-dp/src/nat/allocator.rs) that pins a public pool ADDRESS across
+	// the configured permit scope without consuming a translated pool port, so
+	// the combination no longer silently degrades to per-flow address-only NAT.
+	// The #5819 fail-closed reject (validateSourceNATPersistentNoTranslationStrict
+	// + the "persistent_nat_no_translation" snapshot marker) was therefore
+	// removed — the combo commits cleanly and installs a usable pool.
 
 	// #5877 source-NAT AGGREGATE pool-cardinality gate. The per-field and
 	// per-member source-pool gates above bound ONE pool (a member's host count to

@@ -1021,6 +1021,364 @@ fn pool_snat_no_translation_two_address_pool_both_succeed_5269() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #6041: address-only ("port no-translation") PERSISTENT-NAT leases.
+//
+// A pool configuring BOTH `persistent-nat` and `port no-translation` now pins a
+// public pool ADDRESS across the configured permit scope WITHOUT consuming a
+// translated pool port (`reserve_address_only_persistent`). This replaces the
+// #5819 fail-closed reject. The per-flow #5269 reverse-identity collision guard
+// still applies.
+// ---------------------------------------------------------------------------
+
+/// Build a `persistent-nat` + `port no-translation` pool rule. Source scope
+/// matches both families so the same helper drives the v4 and v6 tests.
+fn notrans_persistent_rules(
+    pool_addresses: Vec<&str>,
+    permit: &str,
+    timeout_secs: i64,
+    address_persistent: bool,
+) -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "notrans-persist".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+        pool_name: "np-pool".to_string(),
+        pool_addresses: pool_addresses.into_iter().map(str::to_string).collect(),
+        port_low: 1024,
+        port_high: 65535,
+        pool_no_translation: true,
+        persistent_nat: true,
+        persistent_nat_permit: permit.to_string(),
+        persistent_nat_inactivity_timeout: timeout_secs,
+        address_persistent,
+        ..SourceNATRuleSnapshot::default()
+    }])
+}
+
+fn notrans_persistent_lookup(
+    rules: &[SourceNatRule],
+    src_ip: &str,
+    src_port: u16,
+    dst_ip: &str,
+    dst_port: u16,
+    proto: u8,
+    now_ns: u64,
+) -> SourceNatLookup {
+    let mut counter = None;
+    match_source_nat_result_for_tuple(
+        rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        src_ip.parse().unwrap(),
+        dst_ip.parse().unwrap(),
+        Some(proto),
+        src_port,
+        dst_port,
+        None,
+        None,
+        now_ns,
+        false,
+        false,
+        &mut counter,
+    )
+}
+
+// #6041 FAIL-ON-REVERT: two flows keyed to the SAME address-only persistent
+// source (any-remote-host, DIFFERENT remotes) reuse ONE public address even on
+// a TWO-address pool with global `address-persistent` OFF. The lease pins the
+// address; reverting `reserve_address_only_persistent` to the round-robin
+// `reserve_address_only` sends the second flow to the OTHER pool address,
+// turning the equality assertion RED.
+#[test]
+fn notrans_persistent_two_flows_reuse_one_address_6041() {
+    let rules = notrans_persistent_rules(
+        vec!["203.0.113.1/32", "203.0.113.2/32"],
+        "any-remote-host",
+        300,
+        false, // address-persistent OFF: round-robin would split the addresses
+    );
+    let now = NS_PER_SEC;
+    let a = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    assert!(a.rewrite_src.is_some());
+    assert_eq!(
+        a.rewrite_src_port, None,
+        "no-translation preserves the source port"
+    );
+
+    // SAME local source tuple, DIFFERENT remote endpoint. any-remote-host keys
+    // the lease by the local source only -> reuse A's public address.
+    let b = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "9.9.9.9", 8080, PROTO_TCP, now,
+    ));
+    assert_eq!(
+        a.rewrite_src, b.rewrite_src,
+        "address-only persistent lease must pin ONE public address across the permit scope",
+    );
+    assert_eq!(b.rewrite_src_port, None);
+
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(live.persistent_by_source.len(), 1, "one address-only lease");
+        let lease = live.persistent_by_source.values().next().unwrap();
+        assert!(lease.address_only, "lease must be flagged address_only");
+        assert_eq!(lease.active_flows, 2, "two live flows share the lease");
+    }
+    assert_eq!(
+        source_nat_pool_statuses(&rules)[0].used_ports,
+        0,
+        "address-only lease consumes no pool port",
+    );
+    // Two distinct reverse-identity tokens (distinct remotes), same address.
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 2);
+}
+
+// #6041: releasing the flows decrements the lease refcount; at refcount 0 the
+// lease enters the idle expiry window and is reclaimed once the inactivity
+// timeout elapses. A NEW flow after reclamation mints a fresh lease — proving
+// the address is freed at refcount 0 + timeout, not leaked.
+#[test]
+fn notrans_persistent_refcount_release_and_expiry_6041() {
+    let timeout_secs = 300i64;
+    let rules =
+        notrans_persistent_rules(vec!["203.0.113.1/32"], "any-remote-host", timeout_secs, false);
+    let now = NS_PER_SEC;
+
+    let a = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    let b = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "9.9.9.9", 80, PROTO_TCP, now,
+    ));
+    assert_eq!(a.rewrite_src, b.rewrite_src);
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.values().next().unwrap().active_flows,
+            2
+        );
+    }
+
+    // Release flow A: refcount 2 -> 1, lease stays (address still pinned), its
+    // token cleared; an active lease is NOT in the expiry index.
+    release_source_nat_allocation(
+        &rules,
+        &session_key_from_src("10.0.1.100", 40000, "8.8.8.8", 443),
+        a,
+        false,
+        now,
+    );
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        let lease = live.persistent_by_source.values().next().unwrap();
+        assert_eq!(lease.active_flows, 1, "one flow still live");
+        assert_eq!(
+            live.lease_expirations.len(),
+            0,
+            "an active lease is not indexed for expiry"
+        );
+    }
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+
+    // Release flow B: refcount 1 -> 0, lease goes idle and is indexed for expiry.
+    release_source_nat_allocation(
+        &rules,
+        &session_key_from_src("10.0.1.100", 40000, "9.9.9.9", 80),
+        b,
+        false,
+        now,
+    );
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.len(),
+            1,
+            "idle lease survives until the inactivity timeout"
+        );
+        assert_eq!(
+            live.persistent_by_source.values().next().unwrap().active_flows,
+            0
+        );
+        assert_eq!(
+            live.lease_expirations.len(),
+            1,
+            "idle lease is indexed for expiry"
+        );
+    }
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        0,
+        "all reverse-identity tokens freed at refcount 0",
+    );
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 0);
+
+    // After the inactivity window a fresh lookup reclaims the idle lease (GC) and
+    // mints a new one for the new source.
+    let past = now + (timeout_secs as u64 + 1) * NS_PER_SEC;
+    let c = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.2.50", 50000, "8.8.8.8", 443, PROTO_TCP, past,
+    ));
+    assert!(c.rewrite_src.is_some());
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.len(),
+            1,
+            "old idle lease reclaimed; only the fresh lease remains"
+        );
+        assert_eq!(
+            live.persistent_by_source.values().next().unwrap().active_flows,
+            1
+        );
+    }
+}
+
+// #6041: the #5269 reverse-identity collision guard still fires under persistent
+// leases. Two DIFFERENT internal hosts (distinct lease keys) landing on the SAME
+// pool address with the SAME preserved source port + SAME remote produce an
+// indistinguishable public reverse tuple -> the second is DENIED as exhaustion.
+// Reverting the guard lets host B create a second lease + duplicate token and
+// return Matched, turning the Unavailable assertion RED.
+#[test]
+fn notrans_persistent_collision_guard_denies_conflicting_owner_6041() {
+    // One-address pool so both hosts' leases pin the SAME public address.
+    let rules = notrans_persistent_rules(vec!["203.0.113.1/32"], "any-remote-host", 300, false);
+    let now = NS_PER_SEC;
+
+    let a = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    assert_eq!(a.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+
+    match notrans_persistent_lookup(&rules, "10.0.1.101", 40000, "8.8.8.8", 443, PROTO_TCP, now) {
+        SourceNatLookup::Unavailable(f) => assert_eq!(
+            f.reason,
+            SourceNatFailureReason::AllocatorExhausted,
+            "colliding owner must fail closed as exhaustion",
+        ),
+        other => panic!("colliding owner must be denied, got {other:?}"),
+    }
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "denied host B minted no token",
+    );
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.len(),
+            1,
+            "denied host B created no lease",
+        );
+    }
+}
+
+// #6041: a second packet of the SAME flow (racing session install) returns the
+// same decision and does NOT double-count the lease refcount.
+#[test]
+fn notrans_persistent_idempotent_reentry_6041() {
+    let rules = notrans_persistent_rules(vec!["203.0.113.1/32"], "any-remote-host", 300, false);
+    let now = NS_PER_SEC;
+    let a1 = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    let a2 = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    assert_eq!(a1.rewrite_src, a2.rewrite_src);
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.values().next().unwrap().active_flows,
+            1,
+            "re-entry of the same flow must not double-count the refcount",
+        );
+    }
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+}
+
+// #6041: the configured permit scope drives lease keying independent of the
+// global address-persistent flag. any-remote-host shares ONE lease across
+// remotes; target-host-port keys a DISTINCT lease per remote endpoint.
+#[test]
+fn notrans_persistent_permit_scope_keying_6041() {
+    let now = NS_PER_SEC;
+    let any = notrans_persistent_rules(
+        vec!["203.0.113.1/32", "203.0.113.2/32"],
+        "any-remote-host",
+        300,
+        false,
+    );
+    let _ = notrans_persistent_lookup(&any, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now);
+    let _ = notrans_persistent_lookup(&any, "10.0.1.100", 40000, "9.9.9.9", 80, PROTO_TCP, now);
+    assert_eq!(
+        any[0].pool_allocator.debug_live().persistent_by_source.len(),
+        1,
+        "any-remote-host: one lease shared across remotes",
+    );
+
+    let thp = notrans_persistent_rules(
+        vec!["203.0.113.1/32", "203.0.113.2/32"],
+        "target-host-port",
+        300,
+        false,
+    );
+    let _ = notrans_persistent_lookup(&thp, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now);
+    let _ = notrans_persistent_lookup(&thp, "10.0.1.100", 40000, "9.9.9.9", 80, PROTO_TCP, now);
+    assert_eq!(
+        thp[0].pool_allocator.debug_live().persistent_by_source.len(),
+        2,
+        "target-host-port: distinct lease per remote endpoint",
+    );
+}
+
+// #6041: IPv6 twin of the core reuse test — an address-only persistent lease
+// pins one public v6 address across the permit scope, no port consumed.
+#[test]
+fn notrans_persistent_ipv6_reuse_one_address_6041() {
+    let rules = notrans_persistent_rules(
+        vec!["2001:db8::1/128", "2001:db8::2/128"],
+        "any-remote-host",
+        300,
+        false,
+    );
+    let now = NS_PER_SEC;
+    let a = expect_snat_decision(notrans_persistent_lookup(
+        &rules,
+        "2001:db8:1::100",
+        40000,
+        "2001:4860::8888",
+        443,
+        PROTO_TCP,
+        now,
+    ));
+    let b = expect_snat_decision(notrans_persistent_lookup(
+        &rules,
+        "2001:db8:1::100",
+        40000,
+        "2001:4860::9999",
+        80,
+        PROTO_TCP,
+        now,
+    ));
+    assert!(a.rewrite_src.unwrap().is_ipv6());
+    assert_eq!(
+        a.rewrite_src, b.rewrite_src,
+        "v6 address-only persistent lease must pin one public address",
+    );
+    assert_eq!(a.rewrite_src_port, None);
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(live.persistent_by_source.len(), 1);
+        assert!(live.persistent_by_source.values().next().unwrap().address_only);
+    }
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 0);
+}
+
 #[test]
 fn pool_snat_multiple_addresses_round_robin() {
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
@@ -3992,6 +4350,223 @@ fn deterministic_cgnat_v4_fixed_block_per_subscriber_reversible() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #5341: address-only occupancy tokens on the DETERMINISTIC-CGNAT (mode 1)
+// address-only sub-branch.
+//
+// Follow-up to #5336, which minted the #5269 reverse-identity occupancy token
+// on the ROUND-ROBIN/persistent address-only branch. The deterministic-CGNAT
+// (mode 1) `port no-translation` / port-less sub-branch was left UN-tokened: it
+// selected the deterministic external address and returned without claiming the
+// translated reverse identity, so two subscribers sharing one deterministic
+// pool address (same preserved source port + remote) both received the SAME
+// public tuple the reverse (1:N) index cannot disambiguate — the same #5269
+// collision class. The deterministic branch now mints the SAME token (same
+// `reserve_address_only` allocator API, same reservation semantics, freed by
+// the SAME teardown path), closing the gap.
+//
+// blocks_per_ip = 126 (from the #4559 test): sub_idx / 126 = ip_idx, so
+// subscribers 100.64.0.5 (sub_idx 5) and 100.64.0.6 (sub_idx 6) BOTH map to
+// ip_idx 0 -> pool[0] = 203.0.113.1, and collide when they share a preserved
+// source port + remote. 100.64.1.0 (sub_idx 256) maps to ip_idx 2 -> pool[2].
+// ---------------------------------------------------------------------------
+
+fn deterministic_notrans_rule() -> Vec<SourceNatRule> {
+    let host_base = u32::from(Ipv4Addr::new(100, 64, 0, 0));
+    parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "cgnat-notrans".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["100.64.0.0/22".to_string()],
+        pool_name: "cgn-pool".to_string(),
+        pool_addresses: vec![
+            "203.0.113.1/32".to_string(),
+            "203.0.113.2/32".to_string(),
+            "203.0.113.3/32".to_string(),
+            "203.0.113.4/32".to_string(),
+        ],
+        port_low: 1024,
+        port_high: 65535,
+        // `port no-translation` — the source port is PRESERVED, so this is a
+        // REAL address-only flow, not the PAT case.
+        pool_no_translation: true,
+        deterministic_mode: 1,
+        deterministic_block_size: 512,
+        deterministic_blocks_per_ip: 126,
+        deterministic_host_base: host_base,
+        deterministic_host_count: 1024,
+        ..SourceNATRuleSnapshot::default()
+    }])
+}
+
+// #5341 FAIL-ON-REVERT: deterministic-CGNAT pool with `port no-translation`.
+// Subscriber A (100.64.0.5) and subscriber B (100.64.0.6) BOTH map to the same
+// deterministic external address (203.0.113.1). With the same preserved source
+// port + remote they collide on the identical public reverse tuple. A gets the
+// tuple AND an occupancy token; B MUST be denied as exhaustion. Reverting the
+// `reserve_address_only` mint makes B return `Matched` with A's rewrite_src and
+// `rewrite_src_port: None` — an unowned duplicate — turning the `Unavailable`
+// assertion RED. The deterministic rule must be built (gating assertion) so the
+// tested sub-branch is actually the deterministic one.
+#[test]
+fn deterministic_cgnat_no_translation_collision_denies_second_flow_5341() {
+    let rules = deterministic_notrans_rule();
+    assert!(
+        rules[0].deterministic_v4.is_some(),
+        "mode-1 deterministic no-translation snapshot must build a deterministic rule"
+    );
+
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "100.64.0.5",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(
+        a.rewrite_src,
+        Some("203.0.113.1".parse().unwrap()),
+        "subscriber A must translate to its deterministic external address"
+    );
+    // Wire contract (unchanged): `no-translation` PRESERVES the source port.
+    assert_eq!(a.rewrite_src_port, None);
+
+    // The deterministic branch minted exactly one reverse-identity token,
+    // resolving the public tuple to EXACTLY flow A.
+    let flow_a = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "100.64.0.5".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 12345,
+        dst_port: 443,
+    };
+    let owners = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(
+        owners.len(),
+        1,
+        "deterministic address-only flow A must mint exactly one occupancy token"
+    );
+    assert_eq!(owners[0].1, flow_a, "reverse index must resolve to flow A");
+    assert_eq!(
+        owners[0].0.translated_ip,
+        "203.0.113.1".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(owners[0].0.translated_port, 12345);
+
+    // Flow B: DIFFERENT subscriber that maps to the SAME deterministic address,
+    // SAME preserved port + SAME remote -> SAME public tuple. Fail closed.
+    match addr_only_lookup(&rules, "100.64.0.6", 12345, "8.8.8.8", 443, PROTO_TCP) {
+        SourceNatLookup::Unavailable(f) => assert_eq!(
+            f.reason,
+            SourceNatFailureReason::AllocatorExhausted,
+            "colliding deterministic address-only flow must fail closed as exhaustion",
+        ),
+        other => panic!("flow B must be denied (exhaustion), got {other:?}"),
+    }
+
+    // The reverse index STILL resolves uniquely to flow A — B minted nothing.
+    let owners_after = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(owners_after.len(), 1, "denied flow B must not add a token");
+    assert_eq!(owners_after[0].1, flow_a);
+
+    // No pool PORT is consumed (address-only tokens are off the port bitmap).
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].used_ports, 0);
+    assert_eq!(status[0].live_flows, 1, "only flow A is tracked");
+}
+
+// #5341: the deterministic address-only token is freed by the SAME teardown
+// path used for PAT ports (`release_source_nat_allocation`), so the colliding
+// identity becomes reusable after the first flow tears down — no leak, no
+// double-free, matching the round-robin branch's token lifecycle.
+#[test]
+fn deterministic_cgnat_no_translation_token_released_on_teardown_5341() {
+    let rules = deterministic_notrans_rule();
+
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "100.64.0.5",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+
+    // Tear down flow A. `release_source_nat_allocation` derives the preserved
+    // port from the flow key (the decision left `rewrite_src_port` unset) and
+    // clears the reverse-identity token.
+    let key_a = session_key_from_src("100.64.0.5", 12345, "8.8.8.8", 443);
+    release_source_nat_allocation(&rules, &key_a, a, false, 1);
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        0,
+        "deterministic address-only token must be freed on teardown (no leak)",
+    );
+    assert_eq!(source_nat_pool_statuses(&rules)[0].live_flows, 0);
+
+    // The previously-colliding subscriber B now succeeds (identity is free).
+    let b = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "100.64.0.6",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(b.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+}
+
+// #5341: two subscribers sharing the SAME deterministic external address but
+// talking to DIFFERENT remotes have DISTINCT reverse identities, so both mint
+// their own token and succeed — the token denies only a genuine collision, it
+// does not over-block. Guards against a fix that keys the token on the pool
+// address alone rather than the full reverse tuple.
+#[test]
+fn deterministic_cgnat_no_translation_distinct_remote_both_succeed_5341() {
+    let rules = deterministic_notrans_rule();
+
+    // A: 100.64.0.5 -> 8.8.8.8 (ip_idx 0 -> 203.0.113.1).
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "100.64.0.5",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    // B: 100.64.0.6 -> 9.9.9.9 (SAME deterministic address, DIFFERENT remote).
+    let b = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "100.64.0.6",
+        12345,
+        "9.9.9.9",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(a.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(
+        b.rewrite_src,
+        Some("203.0.113.1".parse().unwrap()),
+        "both subscribers share the deterministic address; distinct remotes keep \
+         their reverse identities distinct"
+    );
+    assert_eq!(a.rewrite_src_port, None);
+    assert_eq!(b.rewrite_src_port, None);
+
+    // Two distinct reverse-identity tokens coexist on the one pool address.
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        2,
+        "non-colliding deterministic address-only flows each mint their own token"
+    );
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].used_ports, 0, "address-only tokens claim no pool port");
+    assert_eq!(status[0].live_flows, 2);
+}
+
 // #4559 companion: a pool WITHOUT the deterministic mode is unchanged — it
 // builds a non-deterministic rule (`deterministic_v4 == None`) and round-robins
 // as before. Guards the gate so the deterministic path never engages for a
@@ -4735,6 +5310,7 @@ fn install_expired_idle_leases(
                     activation_saw_completion: true,
                     activation_previous_expires_at_ns: 0,
                     activation_had_previous_lease: false,
+                    address_only: false,
                 },
             );
             live.lease_expirations.insert((expires_at_ns, key));
@@ -4832,6 +5408,7 @@ fn pool_snat_gc_chunked_spares_active_and_unexpired_leases() {
                 activation_saw_completion: false,
                 activation_previous_expires_at_ns: 0,
                 activation_had_previous_lease: false,
+                address_only: false,
             },
         );
         // Idle but not-yet-expired lease (expiry 10_000, past now=1000).
@@ -4850,6 +5427,7 @@ fn pool_snat_gc_chunked_spares_active_and_unexpired_leases() {
                 activation_saw_completion: true,
                 activation_previous_expires_at_ns: 0,
                 activation_had_previous_lease: false,
+                address_only: false,
             },
         );
         live.lease_expirations.insert((10_000, future_key));

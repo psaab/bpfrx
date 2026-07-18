@@ -116,9 +116,6 @@ func validateSourceNATStrictView(cfg *Config) error {
 	if err := validateSourceNATPoolAddressGrammarStrict(cfg); err != nil {
 		return err
 	}
-	if err := validateSourceNATPersistentNoTranslationStrict(cfg); err != nil {
-		return err
-	}
 	if err := validateSourceNATAggregateCardinalityStrict(cfg); err != nil {
 		return err
 	}

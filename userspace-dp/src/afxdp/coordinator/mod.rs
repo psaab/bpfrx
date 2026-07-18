@@ -243,9 +243,9 @@ pub struct Coordinator {
     /// owned alongside `policy_counters` and threaded into the
     /// forwarding-state build so parsed rules share its `Arc`s.
     pub(crate) nat_counters: crate::nat::NatCounterStore,
-    pub(crate) recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    pub(crate) recent_exceptions: Arc<Mutex<ExceptionEventRing>>,
     pub(crate) recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
-    pub(crate) last_resolution: Arc<Mutex<Option<PacketResolution>>>,
+    pub(crate) last_resolution: Arc<Mutex<Option<ResolutionEvent>>>,
     pub(crate) validation: ValidationState,
     pub(crate) reconcile_calls: u64,
     /// #2522: count of teardowns that paid the 500ms mlx5 zero-copy
@@ -278,6 +278,18 @@ pub struct Coordinator {
     /// stably; written exactly once when the worker dies, read at most
     /// once per gRPC status poll (~1 Hz). Not on the packet hot path.
     pub(crate) worker_panics: BTreeMap<u32, Arc<Mutex<Option<String>>>>,
+    /// #5289: per-worker exception rings, keyed by `worker_id`. Each worker
+    /// owns one `Arc<Mutex<ExceptionEventRing>>` (inserted at bring-up,
+    /// removed on teardown/reset) and pushes compact POD events into it on
+    /// the terminal-packet path — no process-global mutex, no per-packet
+    /// `String`/`Utc::now`. The status thread (`recent_exceptions`) drains
+    /// all rings + `self.recent_exceptions` (the control-thread ring) at
+    /// ~1 Hz and formats them there. Mirrors `worker_panics`.
+    pub(crate) worker_exception_rings: BTreeMap<u32, Arc<Mutex<ExceptionEventRing>>>,
+    /// #5289: per-worker last-forwarding-resolution slots, keyed by
+    /// `worker_id`. Replaces the shared `last_resolution` mutex on the
+    /// packet path; the status thread picks the newest across all workers.
+    pub(crate) worker_last_resolution: BTreeMap<u32, Arc<Mutex<Option<ResolutionEvent>>>>,
 }
 
 impl Coordinator {
@@ -300,7 +312,7 @@ impl Coordinator {
             forwarding: ForwardingState::default(),
             policy_counters: PolicyCounterStore::default(),
             nat_counters: crate::nat::NatCounterStore::default(),
-            recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
+            recent_exceptions: Arc::new(Mutex::new(ExceptionEventRing::new())),
             recent_session_deltas: Arc::new(Mutex::new(VecDeque::with_capacity(
                 MAX_RECENT_SESSION_DELTAS,
             ))),
@@ -317,6 +329,8 @@ impl Coordinator {
             last_cache_flush_at: Arc::new(AtomicU64::new(0)),
             rg_epochs: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
             worker_panics: BTreeMap::new(),
+            worker_exception_rings: BTreeMap::new(),
+            worker_last_resolution: BTreeMap::new(),
         }
     }
 
@@ -422,9 +436,14 @@ impl Coordinator {
     }
 
     pub(crate) fn stop_inner(&mut self, clear_synced_state: bool) {
-        if let Some(stop) = self.neighbors.monitor_stop.take() {
-            stop.store(true, Ordering::Relaxed);
-        }
+        // #5165: signal AND JOIN the neighbor monitor before any downstream
+        // teardown clears/rebuilds the shared neighbor map. The bare stop store
+        // (pre-#5165) left the monitor detached: a retired old-generation
+        // monitor blocked in recv() could apply a queued kernel event to
+        // `dynamic` after a fresh baseline repopulated it. Joining (bounded by
+        // the monitor's 500ms SO_RCVTIMEO) is the real no-mutation-after-stop
+        // guard, mirroring the resolver join below.
+        self.neighbors.stop_and_join_monitor();
         // #1636: stop the neighbor warmer and drop the producer handle so
         // the worker's recv side disconnects and it exits cleanly. The
         // 500ms recv timeout bounds the join latency.
@@ -501,6 +520,10 @@ impl Coordinator {
         // workers themselves so a long-running daemon that reconciles
         // through many worker-id sets doesn't accumulate stale slots.
         self.worker_panics.clear();
+        // #5289: drop per-worker exception rings + last-resolution slots
+        // alongside the workers, mirroring `worker_panics`.
+        self.worker_exception_rings.clear();
+        self.worker_last_resolution.clear();
         self.cos_owner_worker_by_queue.clear();
         self.cos
             .owner_worker_by_queue
@@ -568,6 +591,19 @@ impl Coordinator {
         }
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
+        }
+        // #5289: clear per-worker exception rings + last-resolution slots too,
+        // so a stop/clear does not leave stale samples behind for the status
+        // reader to surface.
+        for ring in self.worker_exception_rings.values() {
+            if let Ok(mut ring) = ring.lock() {
+                ring.clear();
+            }
+        }
+        for slot in self.worker_last_resolution.values() {
+            if let Ok(mut slot) = slot.lock() {
+                *slot = None;
+            }
         }
         if let Ok(mut recent) = self.recent_session_deltas.lock() {
             recent.clear();
