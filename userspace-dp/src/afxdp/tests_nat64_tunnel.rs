@@ -1070,3 +1070,241 @@ fn nat64_missing_neighbor_denied_no_fail_closed_drop_5174() {
     assert_eq!(sessions.len(), 0);
     assert!(binding.pending_neigh.is_empty());
 }
+
+// =====================================================================
+// #5146: NAT64 first-fragment association is published ONLY post-commit
+// =====================================================================
+//
+// The first-fragment association (the #2562 cross-family fragment cache) must
+// become visible ONLY after the anchor first fragment COMMITS to the outcome it
+// authorizes — i.e. past `can_admit` AND a successful forward session install.
+// Before #5146 the install fired at NAT64 source-allocation time (pre-commit);
+// a subsequent rollback (hop-limit ICMP-TE, admission refusal, install-partial)
+// released only the pool port and left the association LIVE for ~2s. A non-first
+// fragment of that rolled-back datagram then inherited a rolled-back verdict AND
+// a now-reusable translation — cross-flow NAT64 fragment ambiguity under port
+// reuse. These two tests pin both directions of the invariant through the real
+// `poll_binding_process_descriptor` path.
+
+/// eth(14) + IPv6(40, next-header 44 Fragment) + Fragment(8) + TCP(20).
+/// `frag_off` is the IPv6 Fragment-Header offset/flags word: `0x0001` => offset
+/// 0, MF=1 (FIRST fragment — installs); `0x0008` => offset 1 (8-octet units),
+/// MF=0 (NON-first fragment — flowless, consults only). `ident` is the 32-bit
+/// Fragment Identification shared by every fragment of one datagram. src is a
+/// lan v6 host; dst is the NAT64 synthetic prefix `64:ff9b::808:808` (extracts
+/// 8.8.8.8). For a first fragment the trailing 20 bytes are a real TCP header
+/// (sport/dport); for a non-first fragment they are opaque payload (#2344 — never
+/// read as L4 ports).
+fn nat64_v6_frag_frame(
+    frag_off: u16,
+    ident: u32,
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+) -> Vec<u8> {
+    let mut f = vec![
+        0x02, 0xbf, 0x72, 0x01, 0x00, 0x01, 0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5, 0x86, 0xdd,
+    ];
+    let mut ip = vec![0u8; 40];
+    ip[0] = 0x60; // version 6
+    let payload_len = (8 + 20) as u16; // fragment header + TCP
+    ip[4..6].copy_from_slice(&payload_len.to_be_bytes());
+    ip[6] = 44; // next header = Fragment
+    ip[7] = 64; // hop limit (> 1: no ICMP-TE)
+    ip[8..24].copy_from_slice(&src.octets());
+    ip[24..40].copy_from_slice(&dst.octets());
+    f.extend_from_slice(&ip);
+    // Fragment extension header (8 bytes).
+    let mut frag = [0u8; 8];
+    frag[0] = PROTO_TCP; // next header after the fragment header
+    frag[2..4].copy_from_slice(&frag_off.to_be_bytes());
+    frag[4..8].copy_from_slice(&ident.to_be_bytes());
+    f.extend_from_slice(&frag);
+    // TCP header (20 bytes). A transit router does not verify the ingress L4
+    // checksum, so it is left 0 (matches the #5689 udp_frag fixture).
+    let mut tcp = vec![0u8; 20];
+    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    tcp[3 + 9] = 0x50; // data offset (byte 12)
+    tcp[13] = TCP_FLAG_SYN;
+    tcp[14..16].copy_from_slice(&0xfaf0u16.to_be_bytes());
+    f.extend_from_slice(&tcp);
+    f
+}
+
+/// Metadata for a v6 NAT64 fragment: the L4 header sits after the 8-byte
+/// Fragment extension header, so `l4_offset = 14 + 40 + 8 = 62`.
+fn nat64_v6_frag_meta(frame_len: usize) -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 24,
+        l3_offset: 14,
+        l4_offset: 62,
+        payload_offset: 82,
+        pkt_len: (frame_len - 14) as u16,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+fn nat64_frag_snapshot() -> ConfigSnapshot {
+    let mut snapshot = nat_snapshot();
+    snapshot.nat64_rules = vec![crate::protocol::NAT64RuleSnapshot {
+        name: "nat64".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec!["172.16.80.50".to_string()],
+        no_v6_frag_header: false,
+        ..Default::default()
+    }];
+    // Drop the v6 default route: the synthetic `64:ff9b::/96` NAT64 prefix is
+    // never v6-routable in production (it is a translation prefix, not a
+    // forwardable v6 destination). Without this, the fixture's `::/0` route
+    // would forward a MISSED NAT64 non-first fragment UNTRANSLATED instead of
+    // dropping it fail-closed (#4617). The NAT64 FORWARD resolves the extracted
+    // IPv4 dst (8.8.8.8) via inet.0, so a COMMITTED first fragment still
+    // translates + forwards; only the association-less v6 miss loses its route.
+    snapshot.routes.retain(|r| r.family != "inet6");
+    snapshot
+}
+
+// #5146 SUCCESS path (the #2562/#6095 feature must survive the fix): a COMMITTED
+// NAT64 first fragment DOES publish its association, and a non-first fragment of
+// the same datagram inherits the translation and forwards. If this went RED the
+// fix would have broken legitimate NAT64 fragment forwarding.
+#[test]
+fn nat64_committed_first_fragment_publishes_frag_assoc_and_nonfirst_inherits_5146() {
+    let forwarding = build_forwarding_state(&nat64_frag_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(16);
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst (extracts 8.8.8.8)");
+
+    // FIRST fragment (offset 0, MF=1). Runs the full ported cold path: NAT64
+    // source allocation, admission, forward+reverse install, THEN (post-commit)
+    // the first-fragment association install.
+    let first = nat64_v6_frag_frame(0x0001, 0x1234_5678, src, dst, 12345, 443);
+    let (b1, dbg1) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &first,
+        nat64_v6_frag_meta(first.len()),
+    );
+    assert_eq!(dbg1.tx, 1, "the committed NAT64 first fragment must translate + forward");
+    assert_eq!(b1.nat64_translations, 1, "the first fragment is NAT64-translated");
+    assert_eq!(sessions.len(), 2, "NAT64 forward + reverse install below cap");
+    assert_eq!(
+        forwarding.nat64.frag_assoc.len(),
+        1,
+        "#5146: a COMMITTED NAT64 first fragment MUST publish exactly one association \
+         (the #2562 feature — RED if the post-commit install is removed)"
+    );
+
+    // NON-first fragment (offset 1, SAME ident) is flowless: it consults the
+    // association and inherits the first fragment's NAT64 translation.
+    let non_first = nat64_v6_frag_frame(0x0008, 0x1234_5678, src, dst, 0, 0);
+    let (b2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &non_first,
+        nat64_v6_frag_meta(non_first.len()),
+    );
+    assert_eq!(
+        dbg2.tx, 1,
+        "#5146: the non-first fragment must INHERIT the committed association and forward"
+    );
+    assert_eq!(
+        b2.nat64_translations, 1,
+        "#5146: the inherited non-first fragment must be NAT64-translated (the #2562 feature)"
+    );
+}
+
+// #5146 FAIL-ON-REVERT: a NAT64 first fragment whose flow is ROLLED BACK (the
+// session table is at cap, so `can_admit` refuses) must leave NO live fragment
+// association, and a subsequent non-first fragment of the same datagram must
+// MISS (drop fail-closed) rather than inherit the released translation.
+//
+// RED on revert: with the pre-commit install (association published at NAT64
+// source-allocation time, before `can_admit`), the rolled-back first fragment
+// still publishes -> `frag_assoc.len() == 1` -> the `== 0` assertion goes RED,
+// and the non-first fragment inherits + forwards -> the `dbg2.tx == 0`
+// assertion goes RED. Target-count 1 (this single test).
+#[test]
+fn nat64_rolled_back_first_fragment_publishes_no_frag_assoc_5146() {
+    let forwarding = build_forwarding_state(&nat64_frag_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    // Cap 0: the forward session `can_admit` preflight refuses, so the NAT64
+    // forward flow is ROLLED BACK (pool port released) after source allocation.
+    sessions.set_max_sessions_for_test(0);
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst (extracts 8.8.8.8)");
+
+    // FIRST fragment (offset 0, MF=1) — admission-refused, rolled back.
+    let first = nat64_v6_frag_frame(0x0001, 0x0bad_f00d, src, dst, 12345, 443);
+    let (_b1, dbg1) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &first,
+        nat64_v6_frag_meta(first.len()),
+    );
+    assert_eq!(dbg1.tx, 0, "a refused NAT64 first fragment must not forward");
+    assert_eq!(sessions.admission_refused(), 1, "the flow must hit the can_admit rollback arm");
+    assert_eq!(
+        forwarding.nat64.frag_assoc.len(),
+        0,
+        "#5146: a ROLLED-BACK NAT64 first fragment must publish NO association \
+         (RED on revert: the pre-commit install leaves 1 live association behind \
+          the released pool port)"
+    );
+
+    // NON-first fragment (offset 1, SAME ident). With no live association it
+    // MISSES and drops fail-closed (#4617) — it must NOT inherit the released
+    // translation. Cap is irrelevant to a flowless fragment (it installs no
+    // session), so raise it to isolate the miss from any admission effect.
+    sessions.set_max_sessions_for_test(16);
+    let non_first = nat64_v6_frag_frame(0x0008, 0x0bad_f00d, src, dst, 0, 0);
+    let (b2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &non_first,
+        nat64_v6_frag_meta(non_first.len()),
+    );
+    assert_eq!(
+        b2.nat64_translations, 0,
+        "#5146: a non-first fragment of a rolled-back first fragment must NOT inherit the \
+         released NAT64 translation (RED on revert: the pre-commit association makes it \
+         inherit + translate -> 1)"
+    );
+    assert_eq!(
+        dbg2.tx, 0,
+        "#5146: with no association to inherit and no v6 route for the synthetic NAT64 \
+         prefix, the missed non-first fragment drops fail-closed (#4617)"
+    );
+    assert_eq!(
+        forwarding.nat64.frag_assoc.len(),
+        0,
+        "#5146: the consult miss must not resurrect an association"
+    );
+}
