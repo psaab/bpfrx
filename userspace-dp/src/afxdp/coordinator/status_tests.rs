@@ -267,3 +267,154 @@ fn drain_session_deltas_no_overflow_leaves_latch_clear() {
         );
     }
 }
+
+// #6101 (item 2): cross-worker exception-ring MERGE + bringup/teardown
+// wiring. `Coordinator::recent_exceptions()` drains the control-thread ring
+// plus EVERY per-worker ring, sorts by monotonic timestamp, and caps at the
+// historical ring depth; `last_resolution()` picks the newest across the
+// control slot and every per-worker slot. The per-worker rings are inserted
+// at bring-up (`reconcile/bringup.rs`) and dropped on teardown/spawn-Err
+// (`worker_exception_rings.remove` / `worker_last_resolution.remove`). Prior
+// coverage exercised only the single-ring POD/sampler/reconstruction path;
+// these lock the cross-worker merge/sort/cap + the teardown drop.
+mod exception_ring_merge_6101 {
+    use super::*;
+    use crate::afxdp::disposition::{ExceptionEvent, ResolutionEvent};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn recent_exceptions_merges_and_sorts_across_workers_and_control_ring() {
+        let mut coord = Coordinator::new();
+        let base = Instant::now();
+
+        // Control-thread ring: one event at t+30ms.
+        coord.recent_exceptions.lock().expect("control ring").push(
+            ExceptionEvent::for_test(base + Duration::from_millis(30), "control_ev", "ctl"),
+        );
+
+        // Worker 0 ring: events at t+10ms and t+50ms.
+        let w0 = Arc::new(Mutex::new(ExceptionEventRing::new()));
+        {
+            let mut g = w0.lock().expect("w0");
+            g.push(ExceptionEvent::for_test(base + Duration::from_millis(10), "w0_a", "w0"));
+            g.push(ExceptionEvent::for_test(base + Duration::from_millis(50), "w0_b", "w0"));
+        }
+        coord.worker_exception_rings.insert(0, w0);
+
+        // Worker 1 ring: events at t+20ms and t+40ms.
+        let w1 = Arc::new(Mutex::new(ExceptionEventRing::new()));
+        {
+            let mut g = w1.lock().expect("w1");
+            g.push(ExceptionEvent::for_test(base + Duration::from_millis(20), "w1_a", "w1"));
+            g.push(ExceptionEvent::for_test(base + Duration::from_millis(40), "w1_b", "w1"));
+        }
+        coord.worker_exception_rings.insert(1, w1);
+
+        // Merge: all 5 events from 2 workers + the control ring, ordered by
+        // monotonic timestamp (the read-side contract: oldest-first among the
+        // newest CAP). A no-op or unsorted merge fails this exact ordering.
+        let merged = coord.recent_exceptions();
+        let reasons: Vec<&str> = merged.iter().map(|s| s.reason.as_str()).collect();
+        assert_eq!(
+            reasons,
+            vec!["w0_a", "w1_a", "control_ev", "w1_b", "w0_b"],
+            "events from 2 workers + the control ring merge sorted by monotonic timestamp"
+        );
+
+        // Teardown: removing worker 0's ring (mirroring bringup.rs's
+        // `.remove(&worker_id)` on spawn-Err / teardown) drops its events from
+        // the drain; worker 1 + control remain, still sorted.
+        coord.worker_exception_rings.remove(&0);
+        let after: Vec<String> = coord
+            .recent_exceptions()
+            .into_iter()
+            .map(|s| s.reason)
+            .collect();
+        assert_eq!(
+            after,
+            vec!["w1_a", "control_ev", "w1_b"],
+            "a removed worker's ring is no longer drained"
+        );
+    }
+
+    #[test]
+    fn recent_exceptions_caps_merged_output_at_ring_capacity() {
+        let mut coord = Coordinator::new();
+        let base = Instant::now();
+
+        // Two workers, 20 events each (each under the per-ring cap), 40 total
+        // — more than EXCEPTION_RING_CAPACITY (32). Worker 1's timestamps are
+        // strictly newer than worker 0's.
+        for (wid, offset, reason) in [(0u32, 0u64, "w0_ev"), (1u32, 1_000u64, "w1_ev")] {
+            let ring = Arc::new(Mutex::new(ExceptionEventRing::new()));
+            {
+                let mut g = ring.lock().expect("ring");
+                for i in 0..20u64 {
+                    g.push(ExceptionEvent::for_test(
+                        base + Duration::from_millis(offset + i),
+                        reason,
+                        "w",
+                    ));
+                }
+            }
+            coord.worker_exception_rings.insert(wid, ring);
+        }
+
+        let merged = coord.recent_exceptions();
+        assert_eq!(
+            merged.len(),
+            EXCEPTION_RING_CAPACITY,
+            "merged output is capped at the historical ring depth"
+        );
+        // The newest CAP survive: all 20 of worker 1 (newest) + the newest 12
+        // of worker 0; the 8 oldest worker-0 events are dropped by the cap.
+        let w1_count = merged.iter().filter(|s| s.reason == "w1_ev").count();
+        let w0_count = merged.iter().filter(|s| s.reason == "w0_ev").count();
+        assert_eq!(w1_count, 20, "all 20 newest (worker 1) events survive the cap");
+        assert_eq!(
+            w0_count,
+            EXCEPTION_RING_CAPACITY - 20,
+            "only the newest 12 worker-0 events survive; the 8 oldest are dropped"
+        );
+    }
+
+    #[test]
+    fn last_resolution_picks_newest_across_workers_and_survives_teardown() {
+        let mut coord = Coordinator::new();
+        let base = Instant::now();
+
+        // Control slot: t+10ms, egress 10.
+        *coord.last_resolution.lock().expect("control") =
+            Some(ResolutionEvent::for_test(base + Duration::from_millis(10), 10));
+        // Worker 0 slot: t+30ms, egress 30 (the newest).
+        coord.worker_last_resolution.insert(
+            0,
+            Arc::new(Mutex::new(Some(ResolutionEvent::for_test(
+                base + Duration::from_millis(30),
+                30,
+            )))),
+        );
+        // Worker 1 slot: t+20ms, egress 20.
+        coord.worker_last_resolution.insert(
+            1,
+            Arc::new(Mutex::new(Some(ResolutionEvent::for_test(
+                base + Duration::from_millis(20),
+                20,
+            )))),
+        );
+
+        let newest = coord.last_resolution().expect("resolution");
+        assert_eq!(
+            newest.egress_ifindex, 30,
+            "the newest-by-monotonic slot wins (worker 0)"
+        );
+
+        // Teardown of the newest slot → the next-newest (worker 1, t+20) wins.
+        coord.worker_last_resolution.remove(&0);
+        let after = coord.last_resolution().expect("resolution");
+        assert_eq!(
+            after.egress_ifindex, 20,
+            "after teardown of the newest slot, the next-newest wins"
+        );
+    }
+}

@@ -192,7 +192,7 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
     meta: impl Into<UserspaceDpMeta>,
     decision: SessionDecision,
     recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
-    reason: &str,
+    reason: &'static str,
     forwarding: &ForwardingState,
 ) {
     let meta = meta.into();
@@ -301,10 +301,15 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
         Ok(EnqueueOutcome::RateLimited) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
             live.slow_path_rate_limited.fetch_add(1, Ordering::Relaxed);
-            record_exception_owned(
+            // #6101: `reason` + a `'static` suffix — recorded alloc-free
+            // (no per-event `format!`) so a reinject-failure flood cannot
+            // allocate a `String` per event. The operator-visible reason is
+            // reconstructed as `"{reason}_rate_limited"` on the status thread.
+            record_exception_suffixed(
                 recent_exceptions,
                 binding,
-                &format!("{reason}_rate_limited"),
+                reason,
+                "_rate_limited",
                 frame.len() as u32,
                 Some(meta),
                 None,
@@ -312,10 +317,11 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
         }
         Ok(EnqueueOutcome::QueueFull) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-            record_exception_owned(
+            record_exception_suffixed(
                 recent_exceptions,
                 binding,
-                &format!("{reason}_queue_full"),
+                reason,
+                "_queue_full",
                 frame.len() as u32,
                 Some(meta),
                 None,
@@ -326,10 +332,11 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
         // counted exception rather than being silently dropped by the kernel.
         Ok(EnqueueOutcome::MtuExceeded) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-            record_exception_owned(
+            record_exception_suffixed(
                 recent_exceptions,
                 binding,
-                &format!("{reason}_slow_path_mtu_exceeded"),
+                reason,
+                "_slow_path_mtu_exceeded",
                 frame.len() as u32,
                 Some(meta),
                 None,
@@ -338,10 +345,11 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
         Err(err) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
             live.set_error(err);
-            record_exception_owned(
+            record_exception_suffixed(
                 recent_exceptions,
                 binding,
-                &format!("{reason}_enqueue_failed"),
+                reason,
+                "_enqueue_failed",
                 frame.len() as u32,
                 Some(meta),
                 None,
