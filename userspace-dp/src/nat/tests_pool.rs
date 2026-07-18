@@ -3992,6 +3992,223 @@ fn deterministic_cgnat_v4_fixed_block_per_subscriber_reversible() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #5341: address-only occupancy tokens on the DETERMINISTIC-CGNAT (mode 1)
+// address-only sub-branch.
+//
+// Follow-up to #5336, which minted the #5269 reverse-identity occupancy token
+// on the ROUND-ROBIN/persistent address-only branch. The deterministic-CGNAT
+// (mode 1) `port no-translation` / port-less sub-branch was left UN-tokened: it
+// selected the deterministic external address and returned without claiming the
+// translated reverse identity, so two subscribers sharing one deterministic
+// pool address (same preserved source port + remote) both received the SAME
+// public tuple the reverse (1:N) index cannot disambiguate — the same #5269
+// collision class. The deterministic branch now mints the SAME token (same
+// `reserve_address_only` allocator API, same reservation semantics, freed by
+// the SAME teardown path), closing the gap.
+//
+// blocks_per_ip = 126 (from the #4559 test): sub_idx / 126 = ip_idx, so
+// subscribers 100.64.0.5 (sub_idx 5) and 100.64.0.6 (sub_idx 6) BOTH map to
+// ip_idx 0 -> pool[0] = 203.0.113.1, and collide when they share a preserved
+// source port + remote. 100.64.1.0 (sub_idx 256) maps to ip_idx 2 -> pool[2].
+// ---------------------------------------------------------------------------
+
+fn deterministic_notrans_rule() -> Vec<SourceNatRule> {
+    let host_base = u32::from(Ipv4Addr::new(100, 64, 0, 0));
+    parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "cgnat-notrans".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["100.64.0.0/22".to_string()],
+        pool_name: "cgn-pool".to_string(),
+        pool_addresses: vec![
+            "203.0.113.1/32".to_string(),
+            "203.0.113.2/32".to_string(),
+            "203.0.113.3/32".to_string(),
+            "203.0.113.4/32".to_string(),
+        ],
+        port_low: 1024,
+        port_high: 65535,
+        // `port no-translation` — the source port is PRESERVED, so this is a
+        // REAL address-only flow, not the PAT case.
+        pool_no_translation: true,
+        deterministic_mode: 1,
+        deterministic_block_size: 512,
+        deterministic_blocks_per_ip: 126,
+        deterministic_host_base: host_base,
+        deterministic_host_count: 1024,
+        ..SourceNATRuleSnapshot::default()
+    }])
+}
+
+// #5341 FAIL-ON-REVERT: deterministic-CGNAT pool with `port no-translation`.
+// Subscriber A (100.64.0.5) and subscriber B (100.64.0.6) BOTH map to the same
+// deterministic external address (203.0.113.1). With the same preserved source
+// port + remote they collide on the identical public reverse tuple. A gets the
+// tuple AND an occupancy token; B MUST be denied as exhaustion. Reverting the
+// `reserve_address_only` mint makes B return `Matched` with A's rewrite_src and
+// `rewrite_src_port: None` — an unowned duplicate — turning the `Unavailable`
+// assertion RED. The deterministic rule must be built (gating assertion) so the
+// tested sub-branch is actually the deterministic one.
+#[test]
+fn deterministic_cgnat_no_translation_collision_denies_second_flow_5341() {
+    let rules = deterministic_notrans_rule();
+    assert!(
+        rules[0].deterministic_v4.is_some(),
+        "mode-1 deterministic no-translation snapshot must build a deterministic rule"
+    );
+
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "100.64.0.5",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(
+        a.rewrite_src,
+        Some("203.0.113.1".parse().unwrap()),
+        "subscriber A must translate to its deterministic external address"
+    );
+    // Wire contract (unchanged): `no-translation` PRESERVES the source port.
+    assert_eq!(a.rewrite_src_port, None);
+
+    // The deterministic branch minted exactly one reverse-identity token,
+    // resolving the public tuple to EXACTLY flow A.
+    let flow_a = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "100.64.0.5".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 12345,
+        dst_port: 443,
+    };
+    let owners = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(
+        owners.len(),
+        1,
+        "deterministic address-only flow A must mint exactly one occupancy token"
+    );
+    assert_eq!(owners[0].1, flow_a, "reverse index must resolve to flow A");
+    assert_eq!(
+        owners[0].0.translated_ip,
+        "203.0.113.1".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(owners[0].0.translated_port, 12345);
+
+    // Flow B: DIFFERENT subscriber that maps to the SAME deterministic address,
+    // SAME preserved port + SAME remote -> SAME public tuple. Fail closed.
+    match addr_only_lookup(&rules, "100.64.0.6", 12345, "8.8.8.8", 443, PROTO_TCP) {
+        SourceNatLookup::Unavailable(f) => assert_eq!(
+            f.reason,
+            SourceNatFailureReason::AllocatorExhausted,
+            "colliding deterministic address-only flow must fail closed as exhaustion",
+        ),
+        other => panic!("flow B must be denied (exhaustion), got {other:?}"),
+    }
+
+    // The reverse index STILL resolves uniquely to flow A — B minted nothing.
+    let owners_after = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(owners_after.len(), 1, "denied flow B must not add a token");
+    assert_eq!(owners_after[0].1, flow_a);
+
+    // No pool PORT is consumed (address-only tokens are off the port bitmap).
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].used_ports, 0);
+    assert_eq!(status[0].live_flows, 1, "only flow A is tracked");
+}
+
+// #5341: the deterministic address-only token is freed by the SAME teardown
+// path used for PAT ports (`release_source_nat_allocation`), so the colliding
+// identity becomes reusable after the first flow tears down — no leak, no
+// double-free, matching the round-robin branch's token lifecycle.
+#[test]
+fn deterministic_cgnat_no_translation_token_released_on_teardown_5341() {
+    let rules = deterministic_notrans_rule();
+
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "100.64.0.5",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+
+    // Tear down flow A. `release_source_nat_allocation` derives the preserved
+    // port from the flow key (the decision left `rewrite_src_port` unset) and
+    // clears the reverse-identity token.
+    let key_a = session_key_from_src("100.64.0.5", 12345, "8.8.8.8", 443);
+    release_source_nat_allocation(&rules, &key_a, a, false, 1);
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        0,
+        "deterministic address-only token must be freed on teardown (no leak)",
+    );
+    assert_eq!(source_nat_pool_statuses(&rules)[0].live_flows, 0);
+
+    // The previously-colliding subscriber B now succeeds (identity is free).
+    let b = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "100.64.0.6",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(b.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+}
+
+// #5341: two subscribers sharing the SAME deterministic external address but
+// talking to DIFFERENT remotes have DISTINCT reverse identities, so both mint
+// their own token and succeed — the token denies only a genuine collision, it
+// does not over-block. Guards against a fix that keys the token on the pool
+// address alone rather than the full reverse tuple.
+#[test]
+fn deterministic_cgnat_no_translation_distinct_remote_both_succeed_5341() {
+    let rules = deterministic_notrans_rule();
+
+    // A: 100.64.0.5 -> 8.8.8.8 (ip_idx 0 -> 203.0.113.1).
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "100.64.0.5",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    // B: 100.64.0.6 -> 9.9.9.9 (SAME deterministic address, DIFFERENT remote).
+    let b = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "100.64.0.6",
+        12345,
+        "9.9.9.9",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(a.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(
+        b.rewrite_src,
+        Some("203.0.113.1".parse().unwrap()),
+        "both subscribers share the deterministic address; distinct remotes keep \
+         their reverse identities distinct"
+    );
+    assert_eq!(a.rewrite_src_port, None);
+    assert_eq!(b.rewrite_src_port, None);
+
+    // Two distinct reverse-identity tokens coexist on the one pool address.
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        2,
+        "non-colliding deterministic address-only flows each mint their own token"
+    );
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].used_ports, 0, "address-only tokens claim no pool port");
+    assert_eq!(status[0].live_flows, 2);
+}
+
 // #4559 companion: a pool WITHOUT the deterministic mode is unchanged — it
 // builds a non-deterministic rule (`deterministic_v4 == None`) and round-robins
 // as before. Guards the gate so the deterministic path never engages for a
