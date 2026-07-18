@@ -878,3 +878,185 @@ fn successful_iouring_write_skips_sync_fallback() {
     );
     assert!(res.is_ok());
 }
+
+// ── #5172: io_uring WriteMode must DEMOTE to SyncFallback after a TERMINAL
+// runtime ring failure, so subsequent slow-path packets stop retrying the
+// broken ring (which degrades BGP/OSPF/mgmt/local traffic). Mirrors the
+// state_writer #2958 runtime-demotion, adding a terminal-vs-transient split. ──
+
+/// #5172: `classify_io_uring_write` separates packet-transfer certainty from
+/// ring health. A TERMINAL (ambiguous / wedged) io_uring failure — `Transferred`,
+/// NOT `safe_to_retry` — must (a) flag `ring_terminal` so the loop demotes, and
+/// (b) DROP the packet WITHOUT invoking the sync fallback (the current ambiguous
+/// packet may be in flight; re-sending it would double-transmit — NO-RETRY).
+#[test]
+fn classify_terminal_ring_failure_flags_demote_and_does_not_resend() {
+    let sync_ran = Cell::new(false);
+    let outcome = classify_io_uring_write(
+        Err(WriteError::Transferred(
+            "slow-path io_uring submit/wait: ring wedged".to_string(),
+        )),
+        || {
+            sync_ran.set(true);
+            Ok(())
+        },
+    );
+    assert!(
+        outcome.ring_terminal,
+        "an ambiguous/wedged io_uring failure must be classified TERMINAL so the \
+         worker demotes to sync (#5172)"
+    );
+    assert!(
+        !sync_ran.get(),
+        "the current ambiguous packet must NOT be sync-resent (no double-transmit)"
+    );
+    assert!(
+        outcome.result.is_err(),
+        "the ambiguous packet is dropped (no-retry), so the result is Err"
+    );
+    assert!(
+        outcome.demotion_cause.is_some(),
+        "a terminal failure records a demotion cause for status.last_error"
+    );
+}
+
+/// #5172 (complement / #2477 preserved): a TRANSIENT io_uring failure —
+/// `NothingWritten`, `safe_to_retry` — put nothing on the TUN, so the per-call
+/// sync fallback rescues THIS packet and the ring is NOT demoted (do not abandon
+/// io_uring on a momentary blip). `ring_terminal` must be false.
+#[test]
+fn classify_transient_ring_failure_keeps_iouring_and_rescues_packet() {
+    let sync_ran = Cell::new(false);
+    let outcome = classify_io_uring_write(
+        Err(WriteError::NothingWritten(
+            "slow-path io_uring write failed: Input/output error".to_string(),
+        )),
+        || {
+            sync_ran.set(true);
+            Ok(())
+        },
+    );
+    assert!(
+        !outcome.ring_terminal,
+        "a safe-to-retry io_uring failure is TRANSIENT — keep io_uring, do not demote"
+    );
+    assert!(
+        sync_ran.get(),
+        "a transient (nothing-written) failure must sync-rescue the packet (#2477)"
+    );
+    assert!(outcome.result.is_ok(), "the sync fallback delivered the packet");
+    assert!(outcome.demotion_cause.is_none());
+}
+
+/// #5172: a successful io_uring write is healthy — no demotion, no cause.
+#[test]
+fn classify_successful_write_is_healthy() {
+    let outcome = classify_io_uring_write(Ok(()), || Ok(()));
+    assert!(!outcome.ring_terminal);
+    assert!(outcome.result.is_ok());
+    assert!(outcome.demotion_cause.is_none());
+}
+
+/// #5172 fail-on-revert: `apply_slowpath_outcome` is the runtime-demotion
+/// chokepoint. On a TERMINAL ring failure it MUST demote `WriteMode` to
+/// `SyncFallback` so every subsequent packet takes the sync branch (never the
+/// broken ring), flip the reported `mode` to "sync", and record the demotion
+/// cause. Reverting the `*mode = SyncFallback` assignment in `retire_ring_to_sync`
+/// leaves `mode` as `IoUring`, turning the `matches!(mode, SyncFallback)`
+/// assertion RED.
+#[test]
+fn terminal_ring_failure_demotes_write_mode_to_sync() {
+    // Production always starts in io_uring when a ring is available; construct
+    // that state. If the kernel cannot provide a ring (older CI), the demotion
+    // path is unreachable — skip rather than give a false pass (mirrors the
+    // state_writer #2958 demotion test).
+    let ring = match IoUring::new(256) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("io_uring unavailable on this kernel; skipping demotion test");
+            return;
+        }
+    };
+    let mut mode = WriteMode::IoUring(ring);
+    let status = SharedStatus::new();
+    status.set_mode("io_uring");
+
+    // A terminal outcome as `classify_io_uring_write` would produce for a wedged
+    // ring: the packet is dropped (Err), the ring is terminal, a cause is set.
+    let cause = "slow-path io_uring ring failure, demoting to sync: ring wedged".to_string();
+    let outcome = SlowPathWriteOutcome {
+        result: Err("slow-path io_uring submit/wait: ring wedged".to_string()),
+        ring_terminal: true,
+        demotion_cause: Some(cause.clone()),
+    };
+    apply_slowpath_outcome(outcome, &mut mode, 1400, &status);
+
+    // (a) mode demoted — the core #5172 fix (fail-on-revert anchor).
+    assert!(
+        matches!(mode, WriteMode::SyncFallback),
+        "a terminal io_uring ring failure MUST demote WriteMode to SyncFallback \
+         so later packets stop retrying the broken ring (#5172)"
+    );
+    // (b) reported status flipped to sync, and the drop counters advanced with
+    // the demotion cause recorded as last_error.
+    let snap = status.snapshot();
+    assert_eq!(snap.mode, "sync", "status.mode must report sync after demotion");
+    assert_eq!(snap.write_errors, 1, "the dropped ambiguous packet counts a write error");
+    assert_eq!(snap.dropped_packets, 1);
+    assert_eq!(snap.dropped_bytes, 1400);
+    assert_eq!(
+        snap.last_error, cause,
+        "last_error must record WHY io_uring was retired"
+    );
+
+    // (c) the demotion is durable: a following packet takes the SyncFallback
+    // branch structurally (the enum can no longer reach the ring). A transient
+    // (or successful) outcome on the now-sync mode must NOT resurrect io_uring.
+    let ok = SlowPathWriteOutcome {
+        result: Ok(()),
+        ring_terminal: false,
+        demotion_cause: None,
+    };
+    apply_slowpath_outcome(ok, &mut mode, 100, &status);
+    assert!(
+        matches!(mode, WriteMode::SyncFallback),
+        "mode must stay sync for the worker's lifetime (no flapping / re-promote)"
+    );
+    assert_eq!(status.snapshot().injected_packets, 1, "the sync write injected");
+}
+
+/// #5172 guard: a TRANSIENT outcome must NOT demote — reverting the
+/// `ring_terminal` gate to demote on every failure would abandon io_uring on a
+/// momentary blip, which this catches (mode must stay IoUring).
+#[test]
+fn transient_outcome_does_not_demote_write_mode() {
+    let ring = match IoUring::new(256) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("io_uring unavailable on this kernel; skipping no-demote test");
+            return;
+        }
+    };
+    let mut mode = WriteMode::IoUring(ring);
+    let status = SharedStatus::new();
+    status.set_mode("io_uring");
+
+    // A transient failure that the sync fallback rescued: Ok result, not terminal.
+    let outcome = SlowPathWriteOutcome {
+        result: Ok(()),
+        ring_terminal: false,
+        demotion_cause: None,
+    };
+    apply_slowpath_outcome(outcome, &mut mode, 512, &status);
+
+    assert!(
+        matches!(mode, WriteMode::IoUring(_)),
+        "a transient (non-terminal) failure must NOT demote — io_uring stays live"
+    );
+    assert_eq!(
+        status.snapshot().mode,
+        "io_uring",
+        "status.mode must remain io_uring when no terminal failure occurred"
+    );
+    assert_eq!(status.snapshot().injected_packets, 1);
+}

@@ -52753,3 +52753,32 @@ top.
   #6074 flow_cache.rs / poll_descriptor comments + site-(1) test).
 - **File(s)**: userspace-dp/src/afxdp/tests_txn_flow_cache.rs,
   userspace-dp/src/afxdp/tests_support.rs
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5172 — demote slow-path io_uring WriteMode to SyncFallback after a
+  TERMINAL runtime ring failure (mirror state_writer #2958). Previously WriteMode
+  was chosen once at init and the packet-loop Err arm only bumped counters +
+  set_last_error, so every packet kept retrying a broken ring (degrading
+  BGP/OSPF/mgmt/local slow-path traffic); #2477 only added a per-CALL sync
+  fallback without changing the mode. Introduced a structured SlowPathWriteOutcome
+  (packet-transfer certainty vs RING HEALTH), classify_io_uring_write
+  (terminal-vs-transient: an ambiguous/wedged `Transferred` failure is terminal —
+  a partial write cannot occur on an atomic TUN write, so it means the transport,
+  not the packet; a `safe_to_retry` `NothingWritten` failure is transient and the
+  per-call sync fallback rescues it, no demote), write_packet_with_mode, and
+  apply_slowpath_outcome (the runtime-demotion chokepoint). On a terminal failure
+  retire_ring_to_sync drains + drops the ring (fd close cancels outstanding SQEs;
+  the current packet's buffer outlives the drop, so #2297 holds), flips
+  WriteMode=SyncFallback + status mode="sync" ONCE (permanent, no flap; leaves
+  `active` set since it tracks TUN/worker liveness not io_uring). The ambiguous
+  current packet is DROPPED, never sync-resent (no double-transmit). Removed the
+  now-unused write_packet_io_uring_or_sync (folded into write_packet_with_mode);
+  decide_sync_fallback + its #2477 tests unchanged. Added 5 fail-on-revert tests:
+  classify_{terminal,transient,successful}, terminal_ring_failure_demotes_write_
+  mode_to_sync (RED-on-revert anchor), transient_outcome_does_not_demote_write_
+  mode. Documented the WriteMode demotion contract in
+  docs/xdp-io-uring-userspace-dataplane.md. Full suite 3981 passed / 0 failed;
+  fail-on-revert proven (removing `*mode=SyncFallback` -> demotion test RED while
+  the transient + #2477 tests stayed GREEN).
+- **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/slowpath_tests.rs,
+  docs/xdp-io-uring-userspace-dataplane.md
