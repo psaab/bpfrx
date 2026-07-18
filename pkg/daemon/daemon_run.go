@@ -1443,6 +1443,12 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// monitoring.
 		SchedulerRepublishFailedFn:       d.SchedulerRepublishFailed,
 		SchedulerRepublishStaleSecondsFn: d.SchedulerRepublishStaleSeconds,
+		// #5669: surface the bounded-age fail-closed escalation so
+		// xpf_scheduler_republish_fail_closed reads 1 once a persistently
+		// failing republish has crossed the bounded age and the scheduler has
+		// forced scheduled policies inactive (deny) — a crisp alarm distinct
+		// from the climbing stale-seconds age.
+		SchedulerRepublishFailClosedFn: d.SchedulerRepublishFailClosed,
 		// #1827: ip-monitoring policy state for the xpf_ipmon_*
 		// metric family.
 		IPMonStatusFn: func() []ipmon.PolicyStatus {

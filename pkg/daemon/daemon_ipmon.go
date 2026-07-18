@@ -308,8 +308,8 @@ func (d *Daemon) actuateRouteOverlayLocked(cfg *config.Config) bool {
 		return true
 	}
 	var schedulerState map[string]bool
-	if d.scheduler != nil {
-		schedulerState = d.scheduler.ActiveState()
+	if sched := d.scheduler.Load(); sched != nil {
+		schedulerState = sched.ActiveState()
 	}
 	published, err := pub.PublishRouteOverlaySnapshot(cfg, overlay, schedulerState)
 	if err != nil {

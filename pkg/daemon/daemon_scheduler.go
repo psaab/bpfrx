@@ -28,16 +28,16 @@ func (d *Daemon) reconcilePolicySchedulerLocked(cfg *config.Config) map[string]b
 
 func (d *Daemon) reconcilePolicySchedulerLockedAt(cfg *config.Config, now time.Time) map[string]bool {
 	hash, hasSchedulers := policySchedulerConfigHash(cfg)
-	if hasSchedulers && d.scheduler != nil && hash == d.policySchedulerConfigHash {
+	if sched := d.scheduler.Load(); hasSchedulers && sched != nil && hash == d.policySchedulerConfigHash {
 		d.startPolicySchedulerLoopLocked()
-		return d.scheduler.ActiveState()
+		return sched.ActiveState()
 	}
 
 	if d.schedulerCancel != nil {
 		d.schedulerCancel()
 		d.schedulerCancel = nil
 	}
-	d.scheduler = nil
+	d.scheduler.Store(nil)
 	// #3780: the scheduler set is being removed or replaced. Clear any
 	// stale republish-failure metric from the outgoing scheduler; a new
 	// scheduler's initial state is published by the fallible apply path,
@@ -53,7 +53,7 @@ func (d *Daemon) reconcilePolicySchedulerLockedAt(cfg *config.Config, now time.T
 	sched, activeState := scheduler.NewPrimed(cfg.Schedulers, func(activeState map[string]bool) error {
 		return d.publishPolicyScheduleState(epoch, activeState)
 	}, now)
-	d.scheduler = sched
+	d.scheduler.Store(sched)
 	d.policySchedulerConfigHash = hash
 	d.startPolicySchedulerLoopLocked()
 	return activeState
@@ -64,8 +64,8 @@ func (d *Daemon) policySchedulerActiveStateForApplyLocked(cfg *config.Config, no
 	if !hasSchedulers {
 		return nil
 	}
-	if d.scheduler != nil && hash == d.policySchedulerConfigHash {
-		return d.scheduler.ActiveState()
+	if sched := d.scheduler.Load(); sched != nil && hash == d.policySchedulerConfigHash {
+		return sched.ActiveState()
 	}
 	_, activeState := scheduler.NewPrimed(cfg.Schedulers, func(map[string]bool) error { return nil }, now)
 	return activeState
@@ -141,15 +141,15 @@ func (d *Daemon) startPolicySchedulerLoopLocked() {
 	// schedulerStopped latches at shutdown (stopPolicySchedulerLoop): once the
 	// loop has been cancelled + joined, a late reconcile must NOT start a new
 	// generation — that Add would race the shutdown's schedulerWg.Wait (#5308).
-	if d.schedulerStopped || d.daemonCtx == nil || d.scheduler == nil || d.schedulerCancel != nil {
+	// Capture the scheduler pointer at start time (a config-replace reconcile
+	// may reassign d.scheduler) and track the goroutine on schedulerWg so
+	// shutdown can join every generation after cancelling.
+	sched := d.scheduler.Load()
+	if d.schedulerStopped || d.daemonCtx == nil || sched == nil || d.schedulerCancel != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(d.daemonCtx)
 	d.schedulerCancel = cancel
-	// Capture the scheduler pointer at start time (a config-replace reconcile
-	// may reassign d.scheduler) and track the goroutine on schedulerWg so
-	// shutdown can join every generation after cancelling.
-	sched := d.scheduler
 	d.schedulerWg.Add(1)
 	go func() {
 		defer d.schedulerWg.Done()
@@ -296,4 +296,28 @@ func (d *Daemon) SchedulerRepublishStaleSeconds() float64 {
 		return 0
 	}
 	return time.Duration(age).Seconds()
+}
+
+// SchedulerRepublishFailClosed reports whether the scheduler has escalated from
+// the #3780 silent retry to FAIL-CLOSED: once a scheduler-republish failure
+// streak persists past scheduler.RepublishFailClosedAge the scheduler forces
+// scheduled policies to the inactive (deny) disposition and emits a one-time
+// alarm so a scheduled permit stops (re)opening while the dataplane cannot
+// enforce the schedule (#5669).
+//
+// This reads the scheduler's OWN latch (RepublishFailClosed) rather than
+// recomputing the age daemon-side, so the xpf_scheduler_republish_fail_closed
+// gauge is the single source of truth with the scheduler's force-inactive/alarm
+// decision — no second continuous-time timer that could read 1 up to one 60 s
+// tick before the scheduler actually latches. Lock-free at the daemon level:
+// d.scheduler is an atomic.Pointer, and RepublishFailClosed takes only the
+// scheduler's own RLock (never applySem), so the metrics collector never blocks
+// behind a long apply or a wedged republish. Returns false when no scheduler is
+// installed (nil pointer).
+func (d *Daemon) SchedulerRepublishFailClosed() bool {
+	sched := d.scheduler.Load()
+	if sched == nil {
+		return false
+	}
+	return sched.RepublishFailClosed()
 }

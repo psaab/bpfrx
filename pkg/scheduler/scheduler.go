@@ -36,11 +36,38 @@ type Scheduler struct {
 	republishFirstFail time.Time
 	republishFailures  uint64
 	lastRepublishErr   error
+
+	// #5669: bounded-age fail-closed. The #3780 self-heal retries a failed
+	// republish every tick, but a PERSISTENTLY failing republish (a wedged
+	// control socket, an incompatible helper) leaves the stale window
+	// fail-OPEN — a scheduled permit still forwarding past its close — for as
+	// long as the retry keeps failing, silently. Once the failure streak
+	// exceeds republishFailClosedAge the streak can no longer be a single
+	// transient stall, so the scheduler latches republishFailClosed: it emits
+	// a one-time alert AND forces every scheduled policy to the INACTIVE
+	// (deny) disposition in the published + authoritative active map, refusing
+	// to keep or open any scheduled permit while enforcement is known-wedged.
+	// This is safe because it engages ONLY while the republish is failing
+	// (enforcement already broken — never a converged, genuinely-active
+	// window) and clears on the next successful republish. Guarded by mu.
+	republishFailClosed bool
 }
 
 const (
 	wallClockDriftTolerance = 5 * time.Second
 	wallClockRecoveryHold   = 2 * time.Minute
+
+	// RepublishFailClosedAge bounds how long a scheduler-driven republish may
+	// keep failing before the scheduler escalates from the #3780 silent retry
+	// to a loud fail-closed posture (see the republishFailClosed field). Five
+	// minutes is roughly five 60 s evaluate ticks: long enough to absorb a
+	// burst of control-socket contention (status poll + HA sync + session
+	// installs + snapshot sync share the socket, see CLAUDE.md) without a false
+	// alarm, short enough that a genuinely stuck republish is surfaced and
+	// failed closed promptly. Exported so the daemon's
+	// xpf_scheduler_republish_fail_closed alarm shares this single bound
+	// (#5669).
+	RepublishFailClosedAge = 5 * time.Minute
 )
 
 // NewPrimed creates a Scheduler, evaluates the initial active-state map, and
@@ -132,10 +159,21 @@ func (s *Scheduler) evaluate(now time.Time, notify bool) {
 		}
 	}
 
+	// #5669: while the republish has been failing past the bounded age
+	// (republishFailClosed, latched in recordRepublishResultLocked), force
+	// every scheduled policy to the INACTIVE (deny) disposition instead of
+	// publishing or keeping an ACTIVE permit the wedged dataplane cannot
+	// enforce. Read the latch once so the whole map is a coherent fail-closed
+	// view; it clears on the next successful republish, after which the true
+	// window state is republished and any legitimately-open permit reopens.
+	failClosed := s.republishFailClosed
 	for name, sched := range s.schedulers {
 		cur := false
 		if !wallClockUnsafe {
 			cur = isWithinWindow(now, sched)
+		}
+		if failClosed {
+			cur = false
 		}
 		newActive[name] = cur
 		if prev, ok := s.active[name]; !ok || prev != cur {
@@ -189,10 +227,31 @@ func (s *Scheduler) recordRepublishResultLocked(err error, now time.Time) {
 		s.republishPending = true
 		s.republishFailures++
 		s.lastRepublishErr = err
+		// #5669: bounded-age fail-closed escalation. Once the failure streak
+		// exceeds RepublishFailClosedAge the stale enforcement window has
+		// persisted well beyond a single 60 s retry, so escalate ONCE from the
+		// silent #3780 retry to a loud fail-closed alarm. The latch makes the
+		// next evaluate publish an all-inactive (deny) map, so a scheduled
+		// permit stops forwarding past its close instead of relying on an
+		// eventual republish recovery that may never come.
+		if !s.republishFailClosed && !s.republishFirstFail.IsZero() &&
+			now.Sub(s.republishFirstFail) >= RepublishFailClosedAge {
+			s.republishFailClosed = true
+			slog.Warn("scheduler: republish FAIL-CLOSED — enforcement has been stale past the bounded age; forcing scheduled policies inactive (deny) and refusing to reopen them until republish recovers (a scheduled permit may still be forwarding past its window close in a wedged dataplane — investigate the helper/control socket)",
+				"stale_for", now.Sub(s.republishFirstFail),
+				"bound", RepublishFailClosedAge,
+				"failures", s.republishFailures,
+				"err", err)
+		}
 		return
+	}
+	if s.republishFailClosed {
+		slog.Info("scheduler: republish recovered from fail-closed; republishing the true schedule window state",
+			"failures", s.republishFailures)
 	}
 	s.republishPending = false
 	s.republishFirstFail = time.Time{}
+	s.republishFailClosed = false
 	s.lastRepublishErr = nil
 }
 
@@ -213,6 +272,19 @@ func (s *Scheduler) RepublishFailureStatus() (pending bool, failures uint64, sin
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.republishPending, s.republishFailures, s.republishFirstFail
+}
+
+// RepublishFailClosed reports whether a scheduler-driven republish has been
+// failing continuously for longer than RepublishFailClosedAge, i.e. the stale
+// enforcement window has persisted past the bounded age and the scheduler has
+// escalated to fail-closed: it forces every scheduled policy to the inactive
+// (deny) disposition and has emitted the fail-closed alarm. Latched at the
+// bound, cleared on the next successful republish. Feeds the
+// xpf_scheduler_republish_fail_closed alarm (#5669).
+func (s *Scheduler) RepublishFailClosed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.republishFailClosed
 }
 
 func (s *Scheduler) wallClockDiscontinuousLocked(now time.Time) bool {
