@@ -135,14 +135,88 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
                 meta.ingress_vlan_present != 0,
             )
         });
+        // #6055: bring this cached flowless arm to PARITY with the #5467 fix on
+        // `resolve_cos_tx_selection_internal`'s flowless arm. Before this gate the
+        // cached flowless arm returned `drop:false, reject:false, filter_log:None`
+        // WITHOUT ever evaluating the interface `filter output` — a LATENT
+        // fail-open: any caller that reads `.drop`/`.reject` from a `flow_key=None`
+        // result (a future seed/mirror refactor) would silently wave a
+        // would-be-dropped flowless packet (a non-first IP fragment / non-query
+        // ICMP error/control packet, #2344/#3290) past an egress `then discard`/
+        // `reject` term. Evaluate the output filter against the packet's own L3
+        // tuple (src/dst/protocol from `meta`; L4 ports forced to 0 since the
+        // header is absent) and honor the drop/reject/log verdict exactly as the
+        // flow-keyed arm below does, so an L3-matching deny FAILS CLOSED.
+        //
+        // Uses the cache-replay eval (`evaluate_filter_ref_tx_selection_cached`)
+        // the flow-keyed arm uses — it captures `then count`/policer handles into
+        // the descriptor and applies `TermMatchExtra::default()`, which fails
+        // every per-packet-L4 term (tcp-flags/icmp-type/icmp-code/is-fragment/
+        // flex) closed. The flow-cache SEED path already DECLINES caching for a
+        // filter carrying such a term (`interface_output_filter_has_per_packet_l4_match`,
+        // flow_cache.rs), so no per-packet-L4 output term reaches this arm; only
+        // an L3-only (`from source-address`/`destination-address`/`protocol`/bare
+        // `then`) term takes effect, matching the #5467 flowless contract. Ports
+        // are 0, so a port-BEARING term never matches (no spurious drop). The
+        // `drop` bit is the OUTPUT filter's terminal action only (a three-color
+        // policer runs at replay via `apply_cached_three_color_policers`),
+        // identical to the flow-keyed arm's #3608 convention.
+        let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
+        let mut drop = false;
+        let mut reject = false;
+        let mut filter_log = None;
+        let mut filter_counters = crate::filter::CachedFilterCounters::default();
+        let mut three_color_policers = crate::filter::CachedThreeColorPolicers::default();
+        if crate::filter::interface_output_filter_needs_tx_eval(
+            &forwarding.filter_state,
+            egress_ifindex,
+            is_v6,
+        ) && let Some((src_ip, dst_ip)) = ForwardPacketMeta::from(meta).l3_addrs()
+        {
+            let output_filter = if is_v6 {
+                forwarding
+                    .filter_state
+                    .iface_filter_out_v6_fast
+                    .get(&egress_ifindex)
+                    .map(Arc::as_ref)
+            } else {
+                forwarding
+                    .filter_state
+                    .iface_filter_out_v4_fast
+                    .get(&egress_ifindex)
+                    .map(Arc::as_ref)
+            };
+            if let Some(output_filter) = output_filter.filter(|filter| {
+                filter.affects_tx_selection
+                    || filter.has_counter_terms
+                    || filter.has_log_terms
+                    || filter.has_terminal_action_terms
+                    || filter.has_three_color_policer_terms
+            }) {
+                let output_result = crate::filter::evaluate_filter_ref_tx_selection_cached(
+                    output_filter,
+                    src_ip,
+                    dst_ip,
+                    meta.protocol,
+                    0,
+                    0,
+                    meta.dscp,
+                );
+                drop = output_result.action != crate::filter::FilterAction::Accept;
+                reject = output_result.action == crate::filter::FilterAction::Reject;
+                filter_log = output_result.log_match;
+                filter_counters = output_result.counters;
+                three_color_policers = output_result.three_color_policers;
+            }
+        }
         return CachedTxSelectionDescriptor {
             queue_id,
             dscp_rewrite,
-            drop: false,
-            reject: false,
-            filter_counters: crate::filter::CachedFilterCounters::default(),
-            three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
-            filter_log: None,
+            drop,
+            reject,
+            filter_counters,
+            three_color_policers,
+            filter_log,
             // Flowless packets are re-resolved per packet (no cache entry),
             // so there is nothing to mark for hit-path re-classification.
             ba_reclassify: false,

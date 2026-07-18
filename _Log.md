@@ -1,3 +1,48 @@
+## 2026-07-18 — #6055: harden cached flowless CoS arm against a latent output-filter fail-open
+
+- **Timestamp**: 2026-07-18 (fix/6055-flowless-cos-failopen)
+- **Action**: Follow-up to #5467/#6054. `resolve_cached_cos_tx_selection`'s
+  flowless (`flow_key == None`) arm in `afxdp/tx/cos_classify.rs` returned
+  `drop:false, reject:false, filter_log:None` WITHOUT evaluating the interface
+  `filter output` — the #5467 fix was applied only to
+  `resolve_cos_tx_selection_internal` (the non-cached `_at` path). The cached
+  arm is UNREACHABLE for enforcement today (the seed caller `flow_cache.rs`
+  always passes `Some(&key)`; `mirror/resolver.rs` reads only `.queue_id`), so
+  there is no active bypass — but it is a LATENT fail-open: a future caller
+  reading `.drop`/`.reject` from a `flow_key = None` result silently
+  reintroduces the #5467 egress-deny bypass. Fix: the cached flowless arm now
+  reconstructs the packet's own L3 tuple (`ForwardPacketMeta::from(meta)
+  .l3_addrs()`, ports forced to 0) and evaluates the output filter through the
+  SAME entry the flow-keyed cached arm uses
+  (`interface_output_filter_needs_tx_eval` +
+  `evaluate_filter_ref_tx_selection_cached`), collapsing `drop`/`reject`/
+  `filter_log`/`filter_counters`/`three_color_policers` identically — so an
+  L3-matching egress deny FAILS CLOSED at parity with `_at`. Approach:
+  consult-the-verdict (not decline-shortcut). Ports are 0 so a port-BEARING
+  term never matches (no spurious drop, #2357/#3290 preserved); the cached eval
+  applies `TermMatchExtra::default()` (per-packet-L4 terms fail closed), and the
+  flow-cache SEED path already declines caching for any per-packet-L4 filter, so
+  no such term reaches this arm. `drop` is the OUTPUT terminal action only
+  (policer runs at replay), matching the flow-keyed #3608 convention. Queue /
+  DSCP-rewrite selection untouched — enforcement ADDED only.
+- **Tests**: `cos_classify_tests.rs` — four cached-arm fail-on-revert tests
+  reusing the #5467 `flowless_v4_meta` harness: L3-only `then discard` drops (+
+  non-matching control passes), `then reject` sets drop+reject, `then log`
+  surfaces filter_log, and a port-bearing term does NOT spuriously drop a
+  port-0 flowless packet. RED-on-revert verified: gating the new eval with
+  `false &&` flips the discard/reject/log asserts RED while the port-term
+  control stays green.
+- **Validation**: `cargo build` clean; `cargo test --bin xpf-userspace-dp
+  cos_classify` green (63 passed), 5x flake check all green. Two unrelated
+  failures in the full suite (`protocol::tests::wire_invariant_default_specimens`
+  golden drift, `event_stream ... stalled_consumer` backpressure timing) confirmed
+  PRE-EXISTING on the clean base (stash-and-rerun). rev5467 MINOR 2 (`port_match`
+  not gated on `l4_present`) left as a tracked follow-up — fail-CLOSED,
+  pre-existing on both input (#3291) and this output flowless path.
+- **File(s)**: userspace-dp/src/afxdp/tx/cos_classify.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+
 ## 2026-07-18 — #5445: per-packet SessionLookup must not clone the policy_counter Arc
 
 - **Timestamp**: 2026-07-18 (fix/5445-session-metadata-clone)
