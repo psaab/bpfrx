@@ -1,3 +1,37 @@
+## 2026-07-18 — #6025: withdraw a shadowed translate VIP on a winning `destination-nat off`
+
+- **Timestamp**: 2026-07-18 (fix/6025-dnat-off-localdelivery)
+- **Action**: CONFIRMED then fixed the #6025 NAT correctness bug. A specific
+  `/32 destination-nat off` exemption that shadows a BROADER translate DNAT
+  prefix (pool DNAT over a subnet, one host exempted) correctly WINS the DNAT
+  match (exact-host entries are probed before any prefix in
+  `lookup_with_counter_scoped`), so the exempt host is never translated. But
+  the broad translate prefix registers its VIP firewall-local via the #3164
+  bounded host-by-host expansion, and that expansion re-registered the exempt
+  `/32` even though the `off` entry itself was skipped (#3844). The exempt host
+  therefore won the match (no translation) yet was consumed via LocalDelivery
+  instead of routed — a silent blackhole of the exact host the operator meant
+  to pass through. Confirm-first repro
+  (`dnat_off_exemption_shadowing_broad_translate_prefix_not_local`) FAILED on
+  pristine origin/master (exempt `203.0.113.50` present in
+  `destination_ips()`), proving the bug. Fix in
+  `nat/destination.rs::destination_ips_scoped` (option (a) — the cleaner,
+  more-local fix): withdraw a prefix-expanded / prefix-base address when a
+  superset exact-host `off` exemption shadows it for that translate slot
+  (`off_scope_superset`: protocol/port/zone/interface/routing-instance
+  wildcard-or-equal, source + #3437/#3449 L4 axes unconstrained). Conservative
+  — never over-suppresses, so a non-exempt host under the same prefix stays
+  firewall-local; per-slot, so a host exempt for one slot but translated by
+  another is still registered by the other. Doc updated
+  (docs/userspace-dnat-plan.md §15).
+- **File(s)**: userspace-dp/src/nat/destination.rs,
+  userspace-dp/src/nat/tests_destination.rs, docs/userspace-dnat-plan.md,
+  _Log.md
+- **Validation**: RED-on-revert (unmodified code): `test result: FAILED. 0
+  passed; 1 failed` on the exempt-host-routed assertion. GREEN (fixed):
+  `test result: ok. 45 passed; 0 failed` (nat::tests_destination); full
+  `nat::` 254 passed / 0 failed; `forwarding` 265 passed / 0 failed.
+
 ## 2026-07-18 — #6103: regen stale wire_invariant fixture (missing #5623/#5625 nat64 fields)
 
 - **Timestamp**: 2026-07-18 03:53 PDT (fix/6103-wire-fixture)

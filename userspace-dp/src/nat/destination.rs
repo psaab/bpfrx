@@ -1040,12 +1040,40 @@ impl DnatTable {
                 out.push((key.dst_ip, entry.from_routing_instance.as_ref()));
             }
         }
-        for slots in self.prefix_entries.values() {
+        // #6025: exact-host `off` exemptions that can shadow a translate prefix.
+        // An exact-host entry is probed before ANY prefix in the DNAT lookup
+        // (see `lookup_with_counter_scoped`), so a specific `/32 destination-nat
+        // off` whose match scope is a SUPERSET of a broader translate prefix
+        // ALWAYS wins the match for that host — it is never translated. The
+        // bounded prefix expansion below would otherwise still register the
+        // exempt host as a firewall-local proxy-ARP/ND target and LocalDeliver
+        // its inbound traffic instead of routing it to the real host (the #6025
+        // silent blackhole). Collected once; empty (the common case, no
+        // exemptions) makes the per-host `shadowed` check a cheap no-op.
+        let exact_off: Vec<(&DnatKey, &DnatEntry)> = self
+            .entries
+            .iter()
+            .flat_map(|(key, entries)| entries.iter().filter(|e| e.off).map(move |e| (key, e)))
+            .collect();
+        for (proto_port, slots) in &self.prefix_entries {
             for slot in slots {
                 if slot.entry.off {
                     continue;
                 }
                 let instance = slot.entry.from_routing_instance.as_ref();
+                // #6025: a prefix-registered address is withdrawn when a
+                // superset exact-host `off` exemption (see `exact_off`) shadows
+                // it for THIS translate slot — the off wins the DNAT match for
+                // that host, so registering it firewall-local would blackhole
+                // the exempt host via LocalDelivery. A non-superset (partially
+                // scoped) off never suppresses, so a genuinely-translated
+                // address is preserved.
+                let shadowed = |addr: IpAddr| -> bool {
+                    exact_off.iter().any(|(off_key, off)| {
+                        off_key.dst_ip == addr
+                            && off_scope_superset(off_key, off, proto_port, &slot.entry)
+                    })
+                };
                 if let Some(net) = slot.network() {
                     // #5658: never register the UNSPECIFIED address (0.0.0.0 / ::)
                     // as a firewall-local / proxy-ARP / ND-owned target. A `/0`
@@ -1062,7 +1090,7 @@ impl DnatTable {
                     // `/0` is already skipped by the MAX_LOCAL_PREFIX_HOSTS bound
                     // below (host_count is u32::MAX / None), so only the base push
                     // needed this guard.
-                    if !net.is_unspecified() {
+                    if !net.is_unspecified() && !shadowed(net) {
                         out.push((net, instance));
                     }
                 }
@@ -1074,7 +1102,10 @@ impl DnatTable {
                                 Ipv4Net::new(p.addr(), p.prefix_len())
                             {
                                 for host in net.hosts() {
-                                    out.push((IpAddr::V4(host), instance));
+                                    let ip = IpAddr::V4(host);
+                                    if !shadowed(ip) {
+                                        out.push((ip, instance));
+                                    }
                                 }
                             }
                         }
@@ -1088,7 +1119,10 @@ impl DnatTable {
                                 Ipv6Net::new(p.addr(), p.prefix_len())
                             {
                                 for host in net.hosts() {
-                                    out.push((IpAddr::V6(host), instance));
+                                    let ip = IpAddr::V6(host);
+                                    if !shadowed(ip) {
+                                        out.push((ip, instance));
+                                    }
                                 }
                             }
                         }
@@ -1123,4 +1157,50 @@ fn host_count_v6(prefix_len: u8) -> Option<u128> {
         Some(host_bits) if host_bits < 128 => Some(1u128 << host_bits),
         _ => None,
     }
+}
+
+/// #6025: is the exact-host `off` exemption `off` (keyed `off_key`) a match-scope
+/// SUPERSET of the translate prefix slot (`slot`, keyed `slot_key`)? That is,
+/// does the exemption catch every packet the translate slot would? An exact-host
+/// entry is probed before ANY prefix in the DNAT lookup, so when the exemption's
+/// scope is a superset it is GUARANTEED to win the match for the shared
+/// destination — the address is never translated by that slot and can be safely
+/// withdrawn from the firewall-local set (it must be routed to the real host,
+/// not LocalDelivered).
+///
+/// The test is deliberately conservative — each axis is a wildcard-or-equal
+/// check, and the source and L4-application axes require the exemption to be
+/// UNCONSTRAINED. A partially-scoped exemption (a specific source, port range,
+/// ICMP type, protocol, or port that the translate does not fully share) leaves
+/// some traffic to the address translated, so the address stays firewall-local.
+/// This never over-suppresses, so a genuine DNAT-to-firewall VIP is never
+/// blackholed.
+fn off_scope_superset(
+    off_key: &DnatKey,
+    off: &DnatEntry,
+    slot_key: &DnatProtoPortKey,
+    slot: &DnatEntry,
+) -> bool {
+    // Protocol: the exemption is keyed on the protocol wildcard (PROTO_ANY) or
+    // exactly the slot's protocol.
+    (off_key.protocol == PROTO_ANY || off_key.protocol == slot_key.protocol)
+        // Port: the exemption is keyed on the wildcard port (0) or exactly the
+        // slot's port.
+        && (off_key.dst_port == 0 || off_key.dst_port == slot_key.dst_port)
+        // Zone: the exemption is zone-wildcard or shares the slot's from-zone.
+        && (off.from_zone.is_empty() || off.from_zone == slot.from_zone)
+        // Interface: interface-wildcard or the same from-interface (#3096).
+        && (off.from_interface.is_empty() || off.from_interface == slot.from_interface)
+        // Routing-instance: RI-wildcard or the same from-routing-instance.
+        && (off.from_routing_instance.is_empty()
+            || off.from_routing_instance == slot.from_routing_instance)
+        // Source: the exemption must match ANY source — a source-scoped off
+        // leaves other sources translated.
+        && !off.source_constrained
+        // L4 application constraints (#3437/#3449): the exemption must carry
+        // none — a src-port / dst-port range or ICMP type/code constraint leaves
+        // the complementary L4 traffic translated.
+        && off.match_src_ports.is_empty()
+        && off.match_dst_ports.is_empty()
+        && off.match_icmp_type.is_none()
 }
