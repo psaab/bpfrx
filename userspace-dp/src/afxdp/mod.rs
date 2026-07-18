@@ -1129,8 +1129,8 @@ use neighbor_dispatch::{learn_dynamic_neighbor, pair_write_needed};
 mod disposition;
 use disposition::{
     DispositionCounters, ExceptionEvent, ExceptionEventRing, ResolutionEvent, control_notice_event,
-    record_disposition, record_exception, record_exception_owned, record_forwarding_disposition,
-    record_source_nat_exception,
+    record_disposition, record_exception, record_exception_owned, record_exception_suffixed,
+    record_forwarding_disposition, record_source_nat_exception,
 };
 
 // Issue 67.4: forward-request builders extracted into

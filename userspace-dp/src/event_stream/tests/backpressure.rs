@@ -3,6 +3,44 @@
 // Split from event_stream/tests.rs (#4664).
 
 use super::*;
+use std::os::unix::io::AsRawFd;
+
+/// Force a small kernel socket buffer on both ends of a test AF_UNIX pair.
+///
+/// The end-to-end wedged-reader test relies on a never-reading peer causing
+/// `write()` to return `WouldBlock` quickly, so the I/O thread's `write_buf`
+/// backs up and reaches `WRITE_BACKLOG_MAX_BYTES`. That only happens if the
+/// kernel socket buffer is SMALLER than the volume we pump. Linux defaults are
+/// ~208 KiB, but a host that tunes `net.core.{r,w}mem_default` high (this test
+/// fleet runs on boxes set to 64 MiB) lets a wedged AF_UNIX socket absorb
+/// ~53 MiB before `WouldBlock` — MORE than the frames the test pumps — so the
+/// backlog never fills and the cap under test is never reached (#6103, a
+/// host-sysctl-dependent deterministic failure, not a product regression).
+///
+/// Requesting 64 KiB (the kernel doubles it and enforces a floor, yielding an
+/// effective ~100-130 KiB) makes the wedged reader back up well below the
+/// 16 MiB cap regardless of the host default, so the test is deterministic.
+fn shrink_socket_buffers(reader: &UnixStream, writer: &UnixStream) {
+    let sz: libc::c_int = 64 * 1024;
+    // AF_UNIX stream send is gated by the sender's SO_SNDBUF and the peer's
+    // SO_RCVBUF; shrink both so neither can hide the backpressure.
+    for (fd, opt) in [
+        (writer.as_raw_fd(), libc::SO_SNDBUF),
+        (reader.as_raw_fd(), libc::SO_RCVBUF),
+    ] {
+        // SAFETY: `fd` is a valid, open socket borrowed for this call only.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &sz as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt(SO_*BUF) must succeed on the test socket");
+    }
+}
 
 
 #[test]
@@ -145,6 +183,10 @@ fn stalled_consumer_does_not_grow_backlog_unbounded_end_to_end() {
     // channel (frames_dropped grows, stalls counted) instead of migrating
     // every frame into an unbounded write_buf.
     let (daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    // Force a small kernel socket buffer so the wedged reader trips `WouldBlock`
+    // (and thus the write-backlog cap) independent of the host's tuned
+    // `net.core.{r,w}mem_default`; see `shrink_socket_buffers` (#6103).
+    shrink_socket_buffers(&daemon_side, &helper_side);
     helper_side.set_nonblocking(true).unwrap();
     // Never read on the daemon side: let the socket buffer wedge.
 
