@@ -555,6 +555,17 @@ pub(crate) struct BindingStatus {
     /// safety (an older helper omits it and Go/Rust read 0).
     #[serde(rename = "nat64_ineligible_source", default)]
     pub nat64_ineligible_source: u64,
+    /// #5625: fail-closed NAT64 EXTENSION-HEADER ineligibility drops — a v6→v4
+    /// forward translation rejected because the IPv6 packet carried an
+    /// Authentication Header (51), an ACTIVE Routing header (43, Segments
+    /// Left > 0), or a Mobility (135) / HIP (139) / Shim6 (140) header, none of
+    /// which a stateless NAT64 translation can carry to IPv4 (RFC 7915 §5.1 /
+    /// §5.1.1) — translating would strip the active extension semantics or break
+    /// AH authentication. Distinct from the source/pool/fragment counters — this
+    /// is an ext-header input reject. `default` keeps cross-version wire safety
+    /// (an older helper omits it and Go/Rust read 0).
+    #[serde(rename = "nat64_exthdr_ineligible", default)]
+    pub nat64_exthdr_ineligible: u64,
     /// #4477: source-NAT allocation failures (rule matched, no translated
     /// mapping could be allocated → packet dropped). `default` keeps the same
     /// cross-version wire safety as the siblings above (an older helper omits it

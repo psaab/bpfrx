@@ -1,3 +1,60 @@
+## 2026-07-17 — #5148: TCP segmentation must reject ALL IP fragments, not just non-first
+
+- **Timestamp**: 2026-07-17 (fix/5148-segment-first-fragment)
+- **Action**: The TCP-segmentation admission gate
+  `forwarded_tcp_may_need_segmentation` (tx/dispatch/mod.rs) rejected only
+  NON-first fragments (#1852, `is_non_first_fragment`). A FIRST IPv4 fragment
+  (MF=1, offset 0) or an IPv6 packet carrying a Fragment extension header still
+  carries a real TCP header, so it was ADMITTED into the segmentation builders,
+  which cloned the fragment-bearing IP header (Identification / MF / offset)
+  into every output while rewriting seq/checksum — emitting overlapping
+  offset-0 pseudo-fragments that break reassembly at the receiver. Replaced the
+  gate predicate with the existing `is_any_fragment` (#2362; IPv4 mask 0x3FFF =
+  MF+offset, IPv6 any Fragment header), so ANY fragment (first + non-first) is
+  now routed to the normal forwarding path unchanged — the same
+  pass-through-unsegmented disposition as the sibling #1852 non-first handling.
+  Added a defense-in-depth `is_any_fragment` guard at the top of the builder
+  `segment_forwarded_tcp_frames_from_frame` (frame/tcp_segmentation.rs) so a
+  future caller cannot bypass the gate. Updated the two `emit_*_segment`
+  `#1852: non_first_fragment=false` comments to cite the generalized gate.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
+  userspace-dp/src/afxdp/tx/dispatch/tests/segmentation.rs (2 gate RED-on-revert
+  tests), userspace-dp/src/afxdp/frame/tests_segment_tcp.rs (2 builder
+  RED-on-revert tests), userspace-dp/src/afxdp/tx/README.md
+- **Validation**: cargo build --release + cargo test (segment + dispatch
+  segmentation); firsthand RED-on-revert confirmed by reverting the gate.
+
+## 2026-07-17 — #5162: GRE tunnel with mixed-family outer source/destination commits clean then silently drops
+
+- **Timestamp**: 2026-07-17 (fix/5162-gre-outer-family-gate)
+- **Action**: added a cross-field outer-family gate for non-WireGuard
+  tunnels. A GRE/IPIP tunnel whose outer `tunnel source` and `tunnel
+  destination` are different address families (v4 src + v6 dst, or the
+  reverse) passed per-leaf validation and COMMITTED CLEAN, but the Go
+  snapshot producer tags the endpoint `inet6` when EITHER endpoint is v6,
+  so the Rust GRE encoder hit the AF_INET6 arm, found a v4 endpoint, and
+  returned None → every encapsulated packet was silently dropped. New Go
+  strict commit gate `validateTunnelOuterFamilyStrict` (mirrors the
+  WireGuard endpoint-family gate — one encap = one outer family) rejects
+  the mixed pair at commit / commit-check and downgrades to a warning on
+  the tolerant load / peer-sync path (`lenientTunnelOuterFamily`, #1960
+  no-brick). Rust `populate_tunnel_endpoints` gains a helper-boundary
+  backstop that SKIPS a mixed-family non-WG row with a loud `eprintln!`
+  (mirrors the WG hydrate row-drop / allowed-ips skip-and-continue) for a
+  mixed-version peer-sync / corrupt snapshot the Go gate cannot cover.
+  Fail-on-revert tests verified RED both sides (Go commit-path reject,
+  Rust row-skip).
+- **File(s)**:
+  pkg/config/compiler_validate_tunnel_family.go (new gate),
+  pkg/config/compiler_tailgates.go (wire gate after the WG gate),
+  pkg/config/compiler.go (`lenientTunnelOuterFamily` flag + both lenient
+    entry points),
+  pkg/config/compiler_validate_tunnel_family_5162_test.go (new Go tests),
+  userspace-dp/src/afxdp/forwarding_build/tunnels.rs (Rust backstop skip),
+  userspace-dp/src/afxdp/forwarding_build/tests.rs (3 new Rust tests),
+  docs/feature-coverage.md (GRE row same-outer-family note)
+
 ## 2026-07-17 — #5620: IPsec passthrough claim needs a local-destination predicate
 
 - **Timestamp**: 2026-07-17 (fix/5620-ipsec-passthrough-local-dest)
@@ -51503,3 +51560,81 @@ top.
   pkg/api/metrics_sessions.go (countForward flags param uint8->uint16),
   pkg/api/nat_stats_test.go (emit flags param uint8->uint16),
   docs/sync-protocol.md (Flags field-width note)
+- **DEPLOY CAVEAT (#5460)**: the on-map conntrack value_size grows 128->136
+  (v4) / 176->184 (v6). verify-dataplane REFUSES a rolling cluster-deploy
+  across this ABI bump (the #5307/#5364/#5484 live-pin guardrail —
+  ValueSize diff; NO strand or session corruption, the old daemon keeps
+  forwarding). Crossing it requires a PLANNED FULL dataplane reload per
+  node (releases the stale bpffs pin, flushes the conntrack table, brief
+  downtime; HA sessions re-sync from the peer post-reload). Call this out
+  in the release notes — there is no in-place rolling upgrade across the
+  bump. Validated by a full-reload loss-cluster smoke (v4+v6 forwarding +
+  session re-sync survive the flush).
+
+- **Timestamp**: 2026-07-17
+- **Action**: #4894 — bound binding queue-id to the fixed 16-slot stride
+  before the flat `userspace_bindings` index is computed. QueueID >= 16 on
+  ifindex N aliased the queue-0 slot of ifindex N+1 (idx N*16+16 ==
+  (N+1)*16+0); the existing `idx >= BindingArrayMaxEntries` cap (#814) did
+  not catch it. Added a fail-closed guard at all 4 index sites (primary
+  apply, VLAN-alias apply, watchdog verify, watchdog alias): apply paths
+  disable ctrl via failClosedUserspaceCtrlLocked, watchdog paths log+skip.
+  Never clamp/modulo the queue-id. Added RED-on-revert test asserting the
+  adjacent ifindex queue-0 slot is not written. Documented the flat-index
+  layout + both bounds in docs/afxdp-packet-processing.md. Rust producer
+  (replan_bindings_from_candidates) can emit queue_id>=16 on >16-queue NICs
+  but a naive cap-at-16 is unclean (strands RX queues >=16 under AF_XDP
+  queue-binding) — Go boundary is the enforcement point.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/maps_sync_queue_id_bound_4894_test.go,
+  docs/afxdp-packet-processing.md
+- **Timestamp**: 2026-07-17 (#4867)
+  **Action**: cluster: route dual-active "winner stays" reaffirm event's
+    full-channel drop through the reliable fallback. Inline non-blocking
+    select in runElection now logs + invokes onEventDrop (reconcile) AND a
+    new onDualActiveWinDrop callback (re-drives scheduleDirectAnnounce). The
+    generic reconcile alone does not re-announce for a steady VIP owner
+    (announce=!prev||added>0 is false), so the dedicated callback is needed to
+    genuinely cover the lost post-split-brain GARP/NA refresh. Added
+    SetOnDualActiveWinDrop + field; wired daemon (noRethVRRP-gated, spawned
+    off the election lock). Fail-on-revert test
+    TestElection_DualActiveWinDrop_InvokesReconcileFallback +
+    TestElection_DualActiveWin_NormalPathDelivers.
+  **File(s)**: pkg/cluster/manager.go, pkg/cluster/election.go,
+    pkg/cluster/election_test.go, pkg/daemon/daemon_run.go,
+    docs/vrrp-elimination-study.md
+- **Timestamp**: 2026-07-17
+- **Action**: #5625 — NAT64 v6→v4 RFC 7915 §5.1 translation-eligibility gate.
+  The ext-header walker `ipv6_l4_offset_and_protocol` walked PAST AH (51),
+  active Routing (43 SL>0), Mobility (135), HIP (139), Shim6 (140) and the
+  translator then stripped/translated them — breaking AH authentication (ICV
+  covers rewritten IP fields) and silently dropping active extension semantics
+  with no IPv4 equivalent. Added `nat64_v6_translation_ineligible` chain walk +
+  a fail-closed reject in BOTH forward translators (`write_v6_to_v4_into` /
+  `write_v6_to_v4_nonfirst_into`) BEFORE L4 resolution; distinct
+  `nat64_exthdr_ineligible` counter attributed at the TX dispatcher via the
+  SSOT predicate `frame_is_nat64_exthdr_ineligible` (checked before the #2562
+  fragment predicate, mirroring translator guard order). HBH/Dest-Opts/
+  Routing-SL0/Fragment NOT over-rejected. Shared L4-resolution walker (parity
+  with afxdp::frame::inspect, #4435/#4517) UNCHANGED — gate scoped to the NAT64
+  translate path. RED-on-revert verified firsthand (assertion failures, not a
+  build break). Fail-on-revert cargo tests (a–f) + Go counter/golden tests +
+  docs.
+- **File(s)**:
+  userspace-dp/src/nat64.rs (new `nat64_v6_translation_ineligible`,
+    `frame_is_nat64_exthdr_ineligible`, reject in both forward translators),
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs (two None-sites attribute counter),
+  userspace-dp/src/afxdp/mod.rs (BatchCounters field + record + flush),
+  userspace-dp/src/afxdp/worker/mod.rs (BindingLiveSnapshot field),
+  userspace-dp/src/afxdp/umem/mod.rs (atomic + init),
+  userspace-dp/src/afxdp/umem/snapshot.rs (load),
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs (copy + reset),
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs (reset),
+  userspace-dp/src/protocol/binding.rs (serde field),
+  userspace-dp/src/nat64_tests.rs (7 new tests + updated mobility parity test),
+  pkg/dataplane/userspace/protocol.go (Go BindingStatus field),
+  pkg/dataplane/userspace/format/status_sections.go (agg + sum + print),
+  pkg/dataplane/userspace/format/status_test.go (new counter test),
+  pkg/dataplane/userspace/format/testdata/status_summary.golden,
+  pkg/dataplane/userspace/format/status_golden_test.go,
+  docs/feature-coverage.md, userspace-dp/src/FEATURES.md

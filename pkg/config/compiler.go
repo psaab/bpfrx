@@ -1041,6 +1041,18 @@ type compileOpts struct {
 	// reconcile is dup-pubkey-safe, so a leniently-loaded bad config is
 	// inert. Same doctrine as lenientNATHostMask.
 	lenientWireguardPeers bool
+	// lenientTunnelOuterFamily (#5162) downgrades the non-WireGuard tunnel
+	// outer-family cross-field gate (validateTunnelOuterFamilyStrict) from a
+	// hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a GRE/IPIP tunnel whose outer source
+	// and destination are different address families (a mixed pair commits
+	// clean but the dataplane silently drops every encapsulated packet). The
+	// tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config still BOOTS (#1960 no-brick) —
+	// the Rust populate_tunnel_endpoints independently skips a mixed-family
+	// non-WG row (fail-closed with a loud eprintln), so a leniently-loaded
+	// bad tunnel is inert. Same doctrine as lenientWireguardPeers.
+	lenientTunnelOuterFamily bool
 	// lenientPolicyZoneRefs (#2401) downgrades the security-policy
 	// zone-pair reference gate (validatePolicyZoneReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -2009,6 +2021,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRouteDispositionConflict:        true,
 		lenientDHCPStaticBindings:              true,
 		lenientWireguardPeers:                  true,
+		lenientTunnelOuterFamily:               true,
 		lenientPolicyZoneRefs:                  true,
 		lenientZoneCount:                       true,
 		lenientWebManagementAuth:               true,
@@ -2380,6 +2393,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRouteDispositionConflict:        true,
 		lenientDHCPStaticBindings:              true,
 		lenientWireguardPeers:                  true,
+		lenientTunnelOuterFamily:               true,
 		lenientPolicyZoneRefs:                  true,
 		lenientZoneCount:                       true,
 		lenientWebManagementAuth:               true,

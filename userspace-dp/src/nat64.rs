@@ -1458,6 +1458,155 @@ fn ipv6_l4_offset_and_protocol(packet: &[u8]) -> Option<(usize, u8)> {
     None
 }
 
+/// RFC 7915 §5.1 translation-eligibility gate (#5625).
+///
+/// Walk the IPv6 extension-header chain of an L3-relative IPv6 packet and
+/// return `true` iff the packet carries an extension header that a stateless
+/// NAT64 v6→v4 translation MUST NOT silently strip/translate. The forward
+/// translator (`write_v6_to_v4_into` / `write_v6_to_v4_nonfirst_into`) calls
+/// this BEFORE resolving the terminal L4 and rejects (fail-closed drop) when it
+/// returns `true`, instead of letting `ipv6_l4_offset_and_protocol` walk PAST
+/// the header and translate the deeper transport — which silently drops the
+/// extension semantics (there is no IPv4 equivalent) or, for AH, emits an
+/// IPv4 packet whose authentication no longer covers the rewritten header.
+///
+/// INELIGIBLE (returns `true` → drop):
+///   * **Authentication Header (51)** — AH's ICV covers IP header fields NAT64
+///     rewrites (source/destination address), so a translated packet carries a
+///     stale/broken ICV the receiver rejects. RFC 7915 §5.1.1 makes this
+///     explicit for the fragmented case ("If the Next Header field of the
+///     Fragment Header is an extension header (except ESP, but including the
+///     Authentication Header (AH)), then the packet SHOULD be dropped and
+///     logged."); we extend the same fail-closed drop to the non-fragmented
+///     case, where the literal §5.1 "copy the Next Header value" rule would
+///     otherwise strip AH and emit a broken protocol-51 IPv4 packet.
+///   * **Routing header (43) with Segments Left > 0** — an ACTIVE source route
+///     that has NOT reached its final destination. RFC 7915 §5.1: "If a Routing
+///     header with a non-zero Segments Left field is present, then the packet
+///     MUST NOT be translated". (Segments Left == 0 is inert and handled below.)
+///   * **Mobility (135) / HIP (139) / Shim6 (140)** — active end-to-end
+///     extension semantics with NO IPv4 equivalent. The parity walker
+///     (`ipv6_l4_offset_and_protocol`, #4517) walks PAST them to resolve the
+///     inner L4, so translating would silently strip them and break the
+///     protocol (Mobility binding updates, HIP handshakes, Shim6 locator
+///     management). Reject rather than translate-and-strip.
+///
+/// ELIGIBLE (returns `false` → translate normally, no over-reject):
+///   * **Hop-by-Hop Options (0) / Destination Options (60) / Routing with
+///     Segments Left == 0 (43)** — RFC 7915 §5.1: "those IPv6 extension headers
+///     MUST be ignored ... and the packet translated normally." Skipped.
+///   * **Fragment (44)** — owned by the NAT64 fragment logic; skipped here.
+///   * **ESP (50)** — not flagged here; it falls through to the translator's
+///     protocol match, which already drops it (not TCP/UDP/ICMPv6). Unchanged.
+///   * **No Next Header (59)** and a real upper-layer protocol — eligible.
+///   * A **malformed/truncated** chain is NOT flagged ineligible here; it is
+///     dropped fail-closed by the translator's own length guards /
+///     `ipv6_l4_offset_and_protocol` returning `None`.
+///
+/// This gate is NAT64-translate-path specific: it does NOT change the L4
+/// resolution the forwarding/screen parity walkers perform (#4435). Bounded to
+/// `MAX_IPV6_EXT_HEADERS` like the sibling walkers. For ordinary traffic (the
+/// first Next Header is TCP/UDP/ICMPv6) this returns on the first iteration
+/// with zero extension-header reads, so the fast path is unaffected.
+fn nat64_v6_translation_ineligible(packet: &[u8]) -> bool {
+    if packet.len() < 40 {
+        return false; // too short → the translator's length guard drops it
+    }
+    let mut protocol = packet[6];
+    let mut offset = 40usize;
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
+        match protocol {
+            // Authentication Header (51): ICV covers rewritten IP fields —
+            // MUST NOT translate. RFC 7915 §5.1.1.
+            51 => return true,
+            // Mobility (135) / HIP (139) / Shim6 (140): active end-to-end
+            // semantics with no IPv4 equivalent — reject rather than strip.
+            135 | 139 | 140 => return true,
+            // Routing header (43): ineligible ONLY when Segments Left > 0 (an
+            // active, not-yet-delivered source route — RFC 7915 §5.1). A
+            // Routing header with Segments Left == 0 is inert; skip it.
+            43 => {
+                let hdr = match packet.get(offset..offset + 4) {
+                    Some(h) => h,
+                    None => return false, // truncated → translator drops it
+                };
+                if hdr[3] > 0 {
+                    return true; // Segments Left > 0 → active source route
+                }
+                protocol = hdr[0];
+                offset = match offset.checked_add((usize::from(hdr[1]) + 1) * 8) {
+                    Some(o) => o,
+                    None => return false,
+                };
+                if packet.len() < offset {
+                    return false;
+                }
+            }
+            // Hop-by-Hop (0) / Destination Options (60) / experimental
+            // (253/254): "MUST be ignored ... translated normally" (RFC 7915
+            // §5.1). Length in 8-byte units, not counting the first 8 bytes.
+            0 | 60 | 253 | 254 => {
+                let hdr = match packet.get(offset..offset + 2) {
+                    Some(h) => h,
+                    None => return false,
+                };
+                protocol = hdr[0];
+                offset = match offset.checked_add((usize::from(hdr[1]) + 1) * 8) {
+                    Some(o) => o,
+                    None => return false,
+                };
+                if packet.len() < offset {
+                    return false;
+                }
+            }
+            // Fragment header (44): fixed 8 bytes; NAT64 fragment logic owns it.
+            44 => {
+                let frag = match packet.get(offset..offset + 8) {
+                    Some(f) => f,
+                    None => return false,
+                };
+                protocol = frag[0];
+                offset = match offset.checked_add(8) {
+                    Some(o) => o,
+                    None => return false,
+                };
+                if packet.len() < offset {
+                    return false;
+                }
+            }
+            // No Next Header (59) or a real upper-layer protocol → eligible.
+            _ => return false,
+        }
+    }
+    // Chain still on an extension header after the bound: not classified as an
+    // eligibility reject here — the translator's `ipv6_l4_offset_and_protocol`
+    // fails CLOSED (`None`) at the same bound (#4435), so the packet is dropped
+    // regardless. Do not double-attribute it to the ext-header counter.
+    false
+}
+
+/// #5625: does this L2 frame trigger a NAT64 RFC 7915 §5.1 translation-
+/// eligibility drop for the given ingress address family? Only the forward
+/// (`AF_INET6` → v6→v4) direction can carry IPv6 extension headers; IPv4 has no
+/// extension headers, so the reverse (`AF_INET`) direction is always `false`.
+///
+/// Used by the TX dispatcher to attribute a NAT64 build-returned-`None` to the
+/// `nat64_exthdr_ineligible` counter without re-deriving the reason inline,
+/// mirroring `frame_is_nat64_fragment_drop` (#2562). Returns false for a
+/// malformed/short frame or an unrecognized family.
+pub(crate) fn frame_is_nat64_exthdr_ineligible(frame: &[u8], addr_family: i32) -> bool {
+    if addr_family != libc::AF_INET6 {
+        return false;
+    }
+    let Some(l3) = frame_l3_offset(frame) else {
+        return false;
+    };
+    let Some(packet) = frame.get(l3..) else {
+        return false;
+    };
+    nat64_v6_translation_ineligible(packet)
+}
+
 /// Is this L3-relative IPv6 packet a NON-first fragment (#2290)?
 ///
 /// Walks the (bounded) extension-header chain looking for a Fragment header
@@ -1670,6 +1819,16 @@ pub(crate) fn write_v6_to_v4_into(
     no_v6_frag_header: bool,
 ) -> Option<usize> {
     if packet.len() < 40 {
+        return None;
+    }
+    // #5625: RFC 7915 §5.1 translation-eligibility gate. Reject (fail-closed
+    // drop) a packet carrying an Authentication Header (51), an ACTIVE Routing
+    // header (43, Segments Left > 0), or Mobility (135) / HIP (139) / Shim6
+    // (140) BEFORE resolving the terminal L4 — translating would silently strip
+    // the (non-translatable) active extension semantics or break AH
+    // authentication. Hop-by-Hop / Destination Options / Routing-with-SL0 /
+    // Fragment are eligible and translate normally (no over-reject).
+    if nat64_v6_translation_ineligible(packet) {
         return None;
     }
     // IPv6 header fields.
@@ -2911,6 +3070,14 @@ pub(crate) fn write_v6_to_v4_nonfirst_into(
     dst_v4: Ipv4Addr,
 ) -> Option<usize> {
     if packet.len() < 40 {
+        return None;
+    }
+    // #5625: RFC 7915 §5.1 translation-eligibility gate — same reject as the
+    // first-fragment/atomic translator. A fragmented datagram whose
+    // unfragmentable part carries an ACTIVE Routing header (SL > 0), or whose
+    // Fragment Header's Next Header names AH / Mobility / HIP / Shim6, is not
+    // safely translatable v6→v4; drop fail-closed rather than strip.
+    if nat64_v6_translation_ineligible(packet) {
         return None;
     }
     let traffic_class = ((packet[0] & 0x0f) << 4) | (packet[1] >> 4);

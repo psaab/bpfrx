@@ -1002,3 +1002,116 @@ func drainEvents(m *Manager, n int) {
 		}
 	}
 }
+
+// setupDualActiveWinner drives the manager to the dual-active "winner stays"
+// resolution: local is primary with higher priority, peer is also primary with
+// lower priority, non-preempt. runElection (inside handlePeerHeartbeat) then
+// takes the electNoChange "Dual-active: winner stays" branch that emits the
+// DualActiveWin reaffirm event.
+func setupDualActiveWinner(t *testing.T) *Manager {
+	t.Helper()
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200})) // non-preempt, high priority
+	m.UpdateConfig(cfg)
+	<-m.Events() // drain the UpdateConfig event
+
+	m.mu.Lock()
+	m.groups[0].State = StatePrimary
+	m.mu.Unlock()
+	return m
+}
+
+func dualActiveWinnerHeartbeat() *HeartbeatPacket {
+	return &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+}
+
+// TestElection_DualActiveWinDrop_InvokesReconcileFallback is the #4867
+// fail-on-revert guard. When eventCh is FULL at the dual-active "winner stays"
+// resolution, the inline emission must NOT silently drop the reaffirm event:
+// it must fire the generic reconcile fallback (onEventDrop) AND the dedicated
+// reaffirm-drop callback (onDualActiveWinDrop) that re-drives the daemon's
+// post-split-brain GARP/NA refresh. Reverting the fix (a bare `default:` that
+// drops without invoking either callback) makes this test RED.
+func TestElection_DualActiveWinDrop_InvokesReconcileFallback(t *testing.T) {
+	m := setupDualActiveWinner(t)
+
+	// Replace eventCh with an unbuffered channel with no receiver so the
+	// inline dual-active select deterministically hits the full-channel
+	// default arm.
+	m.mu.Lock()
+	m.eventCh = make(chan ClusterEvent)
+	m.mu.Unlock()
+
+	var eventDrops, reaffirmDrops int
+	reaffirmRG := -1
+	m.SetOnEventDrop(func() { eventDrops++ })
+	m.SetOnDualActiveWinDrop(func(rgID int) {
+		reaffirmDrops++
+		reaffirmRG = rgID
+	})
+
+	m.handlePeerHeartbeat(dualActiveWinnerHeartbeat())
+
+	// The winner stays primary regardless.
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("dual-active winner must stay primary")
+	}
+	// The dedicated reaffirm-drop callback MUST fire so the GARP/NA refresh
+	// is re-driven — this is the load-bearing assertion the revert breaks.
+	if reaffirmDrops != 1 {
+		t.Errorf("dropped dual-active reaffirm must invoke onDualActiveWinDrop exactly once, got %d", reaffirmDrops)
+	}
+	if reaffirmRG != 0 {
+		t.Errorf("onDualActiveWinDrop must carry RG id 0, got %d", reaffirmRG)
+	}
+	// The generic reconcile fallback must also fire, matching sendEvent.
+	if eventDrops != 1 {
+		t.Errorf("dropped dual-active reaffirm must invoke onEventDrop (reconcile fallback), got %d", eventDrops)
+	}
+}
+
+// TestElection_DualActiveWin_NormalPathDelivers proves the non-full path still
+// delivers the DualActiveWin event through the channel and does NOT invoke the
+// drop-fallback callbacks (the reconcile/re-announce path is drop-only).
+func TestElection_DualActiveWin_NormalPathDelivers(t *testing.T) {
+	m := setupDualActiveWinner(t)
+
+	var eventDrops, reaffirmDrops int
+	m.SetOnEventDrop(func() { eventDrops++ })
+	m.SetOnDualActiveWinDrop(func(int) { reaffirmDrops++ })
+
+	m.handlePeerHeartbeat(dualActiveWinnerHeartbeat())
+
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("dual-active winner must stay primary")
+	}
+
+	select {
+	case ev := <-m.Events():
+		if !ev.DualActiveWin {
+			t.Errorf("expected DualActiveWin event, got %+v", ev)
+		}
+		if ev.GroupID != 0 {
+			t.Errorf("expected DualActiveWin event for RG 0, got %d", ev.GroupID)
+		}
+		if ev.OldState != StatePrimary || ev.NewState != StatePrimary {
+			t.Errorf("dual-active reaffirm must report primary->primary, got %s->%s", ev.OldState, ev.NewState)
+		}
+	default:
+		t.Fatal("DualActiveWin event was not delivered on the non-full path")
+	}
+
+	// The drop-only fallbacks must NOT fire when the channel had room.
+	if eventDrops != 0 {
+		t.Errorf("onEventDrop must not fire on the non-full path, got %d", eventDrops)
+	}
+	if reaffirmDrops != 0 {
+		t.Errorf("onDualActiveWinDrop must not fire on the non-full path, got %d", reaffirmDrops)
+	}
+}

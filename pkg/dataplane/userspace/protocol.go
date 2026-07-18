@@ -2614,6 +2614,16 @@ type BindingStatus struct {
 	// an input-validation reject. omitempty + the Rust serde `default` keep
 	// cross-version wire safety (an older helper omits it → 0).
 	Nat64IneligibleSource uint64 `json:"nat64_ineligible_source,omitempty"`
+	// #5625: fail-closed NAT64 EXTENSION-HEADER ineligibility drops — a v6→v4
+	// forward translation rejected because the IPv6 packet carried an
+	// Authentication Header (51), an ACTIVE Routing header (43, Segments
+	// Left > 0), or a Mobility (135) / HIP (139) / Shim6 (140) header, none of
+	// which a stateless NAT64 translation can carry to IPv4 (RFC 7915 §5.1 /
+	// §5.1.1) — translating would strip the active extension semantics or break
+	// AH authentication. Distinct from the source/pool/fragment counters; this
+	// is an ext-header input reject. omitempty + the Rust serde `default` keep
+	// cross-version wire safety (an older helper omits it → 0).
+	Nat64ExthdrIneligible uint64 `json:"nat64_exthdr_ineligible,omitempty"`
 	// #4477: source-NAT allocation failures (a source-NAT rule matched but no
 	// translated mapping could be allocated — missing/empty/invalid/exhausted
 	// pool, wrong family, or a non-first fragment on a port-translating rule);

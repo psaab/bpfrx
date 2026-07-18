@@ -902,21 +902,31 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             None => {
                                 build_failed = true;
                                 fallback_to_slow_path = true;
-                                // #2562: attribute a NAT64 fragment fail-closed
-                                // drop (a non-first fragment, or a real
-                                // ICMP/ICMPv6 fragment whose checksum covers the
-                                // whole datagram) to `nat64_frag_dropped`. Only
-                                // fires when the build-`None` is actually a
-                                // fragment (the SSOT predicate mirrors the
-                                // translator guards) — an unrelated build
-                                // failure is not counted here.
-                                if is_nat64
-                                    && crate::nat64::frame_is_nat64_fragment_drop(
+                                // Attribute a NAT64 build-`None` to a distinct
+                                // fail-closed drop counter. The order mirrors the
+                                // translator's own guard order: #5625's RFC 7915
+                                // §5.1 ext-header eligibility gate runs BEFORE the
+                                // #2562 fragment guards inside `write_v6_to_v4_into`,
+                                // so an AH / active-Routing / Mobility / HIP / Shim6
+                                // packet is attributed to `nat64_exthdr_ineligible`
+                                // and only a non-ext-header fragment drop (a
+                                // non-first fragment, or a real ICMP/ICMPv6 fragment
+                                // whose checksum covers the whole datagram) falls
+                                // through to `nat64_frag_dropped`. Each SSOT
+                                // predicate mirrors its translator guard — an
+                                // unrelated build failure is counted by neither.
+                                if is_nat64 {
+                                    if crate::nat64::frame_is_nat64_exthdr_ineligible(
                                         source_frame,
                                         request.meta.addr_family as i32,
-                                    )
-                                {
-                                    counters.record_nat64_frag_dropped();
+                                    ) {
+                                        counters.record_nat64_exthdr_ineligible();
+                                    } else if crate::nat64::frame_is_nat64_fragment_drop(
+                                        source_frame,
+                                        request.meta.addr_family as i32,
+                                    ) {
+                                        counters.record_nat64_frag_dropped();
+                                    }
                                 }
                             }
                         },
@@ -1223,17 +1233,24 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             None => {
                                 build_failed = true;
                                 fallback_to_slow_path = true;
-                                // #2562: attribute a NAT64 fragment fail-closed
-                                // drop to `nat64_frag_dropped` (same SSOT
-                                // predicate + rationale as the direct/in-place
-                                // copy path above).
-                                if is_nat64
-                                    && crate::nat64::frame_is_nat64_fragment_drop(
+                                // Attribute a NAT64 build-`None` to a distinct
+                                // fail-closed drop counter — #5625 ext-header
+                                // ineligibility first, else #2562 fragment drop
+                                // (same SSOT predicates + translator-order
+                                // rationale as the direct/in-place copy path
+                                // above).
+                                if is_nat64 {
+                                    if crate::nat64::frame_is_nat64_exthdr_ineligible(
                                         source_frame,
                                         request.meta.addr_family as i32,
-                                    )
-                                {
-                                    counters.record_nat64_frag_dropped();
+                                    ) {
+                                        counters.record_nat64_exthdr_ineligible();
+                                    } else if crate::nat64::frame_is_nat64_fragment_drop(
+                                        source_frame,
+                                        request.meta.addr_family as i32,
+                                    ) {
+                                        counters.record_nat64_frag_dropped();
+                                    }
                                 }
                             }
                         }
@@ -1510,14 +1527,22 @@ fn forwarded_tcp_may_need_segmentation(
     if l3 >= frame.len() {
         return false;
     }
-    // #1852: a non-first IP fragment has no TCP header at the post-IP
-    // offset — never segment it. `meta.protocol == PROTO_TCP` is true for
-    // a non-first fragment of a TCP datagram (the shim reads the protocol
-    // from the IP header / v6 fragment next-header), so without this gate
-    // a large non-first fragment would enter the segmentation builders,
-    // which parse payload bytes as a TCP header and run NAT/checksum at
-    // the fake offset. Route it to the normal forwarding path instead.
-    if is_non_first_fragment(&frame[l3..], meta.addr_family) {
+    // #1852 + #5148: NEVER TCP-segment ANY IP fragment — first or
+    // non-first. A non-first fragment (#1852) has no TCP header at the
+    // post-IP offset (its "L4" bytes are payload). A FIRST fragment (IPv4
+    // MF=1 offset=0, or an IPv6 packet carrying a Fragment header) DOES
+    // carry a real TCP header, so the pre-#5148 non-first-only gate
+    // admitted it into the segmentation builders. Segmentation then cloned
+    // the fragment-bearing IP header (Identification / MF / offset) into
+    // every output while rewriting seq/checksum — emitting overlapping
+    // offset-0 pseudo-fragments that break reassembly at the receiver.
+    // `meta.protocol == PROTO_TCP` holds for both classes (the shim reads
+    // the protocol from the IP header / v6 fragment next-header). A
+    // fragmented datagram must never be transformed into independent TCP
+    // segments — segmentation is only for WHOLE (unfragmented) over-MTU TCP
+    // datagrams. Route any fragment to the normal forwarding path unchanged
+    // (same disposition as the sibling #1852 non-first handling).
+    if is_any_fragment(&frame[l3..], meta.addr_family) {
         return false;
     }
     // #5141: admit on the IP-DECLARED datagram length, not the raw backing

@@ -220,11 +220,22 @@ proptest! {
     ) {
         let forwarding = seg_fixture(mtu, tx_vlan);
         let decision = seg_decision(pkt.dst_ip, tx_vlan, NatDecision::default());
-        let segs = segment_forwarded_tcp_frames_from_frame(
+        let result = segment_forwarded_tcp_frames_from_frame(
             &pkt.frame, pkt.meta, &decision, &forwarding, false, None,
-        ).expect("oversized valid TCP frame must segment");
-        let want = expected_tuple(&pkt, NatDecision::default());
-        check_segments(&segs, &pkt, mtu, tx_vlan, &want)?;
+        );
+        // #5148: a fragmented datagram must NEVER be TCP-segmented. The
+        // packet strategy's IPv6 ext chain includes Fragment headers (type
+        // 44), so some generated packets are fragments; the splitter now
+        // declines them (None) and the caller forwards the original frame
+        // unchanged. Reassembly identity applies only to WHOLE (unfragmented)
+        // over-MTU datagrams.
+        if is_any_fragment(&pkt.frame[pkt.l3..], pkt.addr_family) {
+            prop_assert_eq!(result, None);
+        } else {
+            let segs = result.expect("oversized valid TCP frame must segment");
+            let want = expected_tuple(&pkt, NatDecision::default());
+            check_segments(&segs, &pkt, mtu, tx_vlan, &want)?;
+        }
     }
 
     /// P-T4: NAT composition — every segment carries the rewritten
@@ -242,15 +253,23 @@ proptest! {
         let forwarding = seg_fixture(mtu, tx_vlan);
         let decision = seg_decision(pkt.dst_ip, tx_vlan, nat);
         let want = expected_tuple(&pkt, nat);
-        let segs = segment_forwarded_tcp_frames_from_frame(
+        let result = segment_forwarded_tcp_frames_from_frame(
             &pkt.frame,
             pkt.meta,
             &decision,
             &forwarding,
             false,
             Some((want.src_port, want.dst_port)),
-        ).expect("oversized valid TCP frame must segment under NAT");
-        check_segments(&segs, &pkt, mtu, tx_vlan, &want)?;
+        );
+        // #5148: fragments (incl. the strategy's IPv6 Fragment-header ext
+        // chain) are declined by the splitter — NAT composition applies only
+        // to WHOLE over-MTU datagrams.
+        if is_any_fragment(&pkt.frame[pkt.l3..], pkt.addr_family) {
+            prop_assert_eq!(result, None);
+        } else {
+            let segs = result.expect("oversized valid TCP frame must segment under NAT");
+            check_segments(&segs, &pkt, mtu, tx_vlan, &want)?;
+        }
     }
 
     /// P-T3 precondition gate: SYN/FIN/RST oversized frames are

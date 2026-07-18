@@ -257,3 +257,75 @@ fn forwarded_tcp_may_need_segmentation_uses_declared_len_not_backing() {
         "admission must read the IP-declared length, not the backing slack"
     );
 }
+
+// #5148 RED-on-revert: a FIRST IPv4 fragment (MF=1, offset 0) carries a real
+// TCP header at the post-IP offset, so the pre-#5148 non-first-only gate
+// (`is_non_first_fragment`, mask 0x1FFF over the offset bits only) treated it
+// as "not a fragment" and ADMITTED it into the segmentation builders — which
+// then cloned the fragment-bearing IP header (Identification / MF / offset)
+// into every output while rewriting seq/checksum, emitting overlapping
+// offset-0 pseudo-fragments. The fix uses `is_any_fragment` (mask 0x3FFF =
+// MF+offset), so an over-MTU FIRST fragment is now rejected from segmentation.
+// Reverting the gate to `is_non_first_fragment` makes this assertion fail
+// (the gate returns true and admits the fragment).
+#[test]
+fn forwarded_tcp_may_need_segmentation_rejects_first_ipv4_fragment() {
+    let forwarding = test_forwarding_with_egress_mtu(1500);
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        ..UserspaceDpMeta::default()
+    };
+    // Same oversized IPv4 datagram as `..._flags_oversized_frame` (total_len
+    // 1600 > MTU 1500), but MF=1 marks it the FIRST fragment of a larger
+    // datagram. The gate must NOT admit it for TCP segmentation.
+    let mut frame = vec![0u8; 14 + 1600];
+    frame[14] = 0x45; // IPv4, ihl=5 (20 bytes)
+    let total_len: u16 = 1600;
+    frame[16] = (total_len >> 8) as u8;
+    frame[17] = total_len as u8;
+    frame[20] = 0x20; // flags: MF=1, fragment offset 0 → a FIRST fragment
+    frame[23] = PROTO_TCP;
+    assert!(
+        !forwarded_tcp_may_need_segmentation(&frame, meta, &test_decision(), &forwarding),
+        "a first IPv4 fragment (MF=1) must never be admitted for TCP segmentation"
+    );
+}
+
+// #5148 RED-on-revert: an IPv6 packet carrying a Fragment extension header
+// (next-header 44) — even the FIRST fragment (offset 0, M=1) — must never be
+// TCP-segmented. The pre-#5148 gate (`ipv6_is_non_first_fragment`, which
+// requires the offset bits to be non-zero) treated a first fragment as "not a
+// fragment" and admitted it. `is_any_fragment` triggers on the Fragment header
+// itself regardless of offset. Reverting the gate makes this assertion fail.
+#[test]
+fn forwarded_tcp_may_need_segmentation_rejects_ipv6_fragment_header() {
+    let forwarding = test_forwarding_with_egress_mtu(1500);
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        ..UserspaceDpMeta::default()
+    };
+    // IPv6 base header declaring an oversized datagram (payload_len 1600 →
+    // 40 + 1600 = 1640 > MTU 1500), next-header = 44 (Fragment). The 8-byte
+    // fragment header that follows is a FIRST fragment (offset 0, M=1),
+    // next-header TCP.
+    let mut frame = vec![0u8; 14 + 40 + 1600];
+    frame[12] = 0x86;
+    frame[13] = 0xdd; // IPv6 ethertype
+    frame[14] = 0x60; // version 6
+    let payload_len: u16 = 1600;
+    frame[18] = (payload_len >> 8) as u8;
+    frame[19] = payload_len as u8;
+    frame[20] = 44; // next-header: Fragment extension header
+    frame[21] = 64; // hop limit
+    // Fragment header at frame[54..62]: next-header TCP, offset 0, M=1.
+    frame[54] = PROTO_TCP;
+    frame[57] = 0x01; // M (more-fragments) bit; fragment offset 0
+    assert!(
+        !forwarded_tcp_may_need_segmentation(&frame, meta, &test_decision(), &forwarding),
+        "an IPv6 packet with a Fragment header must never be admitted for TCP segmentation"
+    );
+}
