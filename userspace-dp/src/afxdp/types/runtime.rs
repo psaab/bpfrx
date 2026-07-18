@@ -347,6 +347,14 @@ pub(in crate::afxdp) struct DebugPollCounters {
     pub(in crate::afxdp) no_route: u64,
     #[allow(dead_code)]
     pub(in crate::afxdp) missing_neigh: u64,
+    /// #5174: NAT64 MissingNeighbor fail-closed drops. Bumped when a PERMITTED
+    /// NAT64 flow (IPv6 dst matching a Pref64) whose extracted-IPv4 next-hop is
+    /// unresolved is dropped after firing the neighbor probe instead of seeding
+    /// a plain-forward session + buffering the untranslated IPv6 frame (which the
+    /// same-family cold-path replay cannot translate). The flow recovers via the
+    /// ForwardCandidate path once the IPv4 neighbor resolves.
+    #[allow(dead_code)]
+    pub(in crate::afxdp) nat64_missing_neigh_drop: u64,
     /// #1651 B3: dead-host negative-cache fast-fail count. Bumped when a
     /// MissingNeighbor packet to a negatively-cached (un-expired,
     /// still-unresolved) dst is recycled without buffering.
