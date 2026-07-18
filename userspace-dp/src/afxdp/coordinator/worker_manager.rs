@@ -31,6 +31,15 @@ pub(in crate::afxdp) struct WorkerManager {
     pub(super) last_planned_workers: usize,
     pub(super) last_planned_bindings: usize,
     pub(super) last_planned_worker_slots: usize,
+    /// #5290: rotating cursor for the fair RPC-fallback session-delta drain
+    /// (`Coordinator::drain_session_deltas`). Persists the binding index the
+    /// last drain stopped at so the next drain resumes there, guaranteeing no
+    /// binding is perpetually starved across successive polls. A positional
+    /// index into the slot-ordered `live` map (`% live.len()` at use), not a
+    /// slot key — membership changes are rare (reconcile only) and the rotation
+    /// self-corrects, so a stale index costs at most one poll of imperfect
+    /// fairness, never permanent starvation.
+    pub(in crate::afxdp) session_delta_drain_cursor: std::sync::atomic::AtomicUsize,
 }
 
 impl WorkerManager {
@@ -42,6 +51,7 @@ impl WorkerManager {
             last_planned_workers: 0,
             last_planned_bindings: 0,
             last_planned_worker_slots: 0,
+            session_delta_drain_cursor: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 

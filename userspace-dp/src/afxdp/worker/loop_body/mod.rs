@@ -951,6 +951,21 @@ pub(crate) fn worker_loop(
                 }
             }};
         }
+        // #5290: fold the per-binding RPC-fallback loss-of-sync latch into the
+        // SessionTable latch. The control-thread fair drain
+        // (`Coordinator::drain_session_deltas`) arms `BindingLiveState`'s latch
+        // when the caller-wide budget overflowed and left this worker's deltas
+        // undrained, and `push_session_delta` arms it when the per-binding
+        // fallback buffer overflowed and dropped a delta. Either way the standby
+        // missed HA-relevant open/close events, so drive the SAME #2442 owner-RG
+        // resync below (table-truth rescan) — deliver-or-resync, never a silent
+        // drop. A single AtomicBool per binding, so a burst raises exactly one
+        // resync (debounced by the swap in `take_delta_loss`).
+        for binding in &bindings {
+            if binding.live.take_delta_loss() {
+                sessions.set_delta_loss();
+            }
+        }
         if sessions.take_delta_loss() {
             // #2442 loss-of-sync resync. If `push_delta` dropped any delta
             // since the last drain, the in-worker session-delta ring

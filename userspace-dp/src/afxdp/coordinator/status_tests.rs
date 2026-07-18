@@ -148,3 +148,122 @@ fn flow_fair_flow_count_overlay_targets_matching_queue_rows() {
         "queue with no flow-cache rows stays at the serde default"
     );
 }
+
+// -------------------------------------------------------------
+// #5290: fair, rotating-cursor RPC-fallback session-delta drain.
+// -------------------------------------------------------------
+
+/// Insert `n` live bindings (slots `0..n`) into `coord`, each pre-loaded with
+/// `per_binding` pending session deltas, and return the Arcs so a test can
+/// inspect their residual state after a drain.
+fn seed_pending_delta_bindings(
+    coord: &mut Coordinator,
+    n: u32,
+    per_binding: usize,
+) -> Vec<Arc<BindingLiveState>> {
+    let mut out = Vec::new();
+    for slot in 0..n {
+        let live = Arc::new(BindingLiveState::new());
+        for _ in 0..per_binding {
+            live.push_session_delta(SessionDeltaInfo::default());
+        }
+        coord.workers.live.insert(slot, live.clone());
+        out.push(live);
+    }
+    out
+}
+
+#[test]
+fn drain_session_deltas_serves_every_worker_and_arms_overflow() {
+    // #5290 fail-on-revert: a budget strictly below the aggregate pending count
+    // must be spread FAIRLY across every live binding (each gets budget/N),
+    // never handed whole to the first slot. Reverting to the old
+    // whole-budget-first-slot drain would drain all 40 from binding 0 and leave
+    // bindings 1..4 untouched — failing both the per-binding fairness assertion
+    // AND the overflow loss-of-sync arming (the old code armed nothing).
+    let mut coord = Coordinator::new();
+    let bindings = seed_pending_delta_bindings(&mut coord, 4, 50); // 200 total
+
+    let drained = coord.drain_session_deltas(40); // 40 < 200, quantum = 10
+    assert_eq!(drained.len(), 40, "drain must return exactly the budget");
+
+    // FAIRNESS: every binding was served its 10-delta quantum, so each has
+    // exactly 40 left. The old whole-budget-first drain would leave binding 0
+    // with 10 and bindings 1..4 with 50.
+    for (i, live) in bindings.iter().enumerate() {
+        let residual = live.drain_session_deltas(usize::MAX).len();
+        assert_eq!(
+            residual, 40,
+            "binding {i} must have been served an equal 10-delta quantum \
+             (fair drain), leaving 40 — a whole-budget-first drain would not"
+        );
+    }
+}
+
+#[test]
+fn drain_session_deltas_overflow_arms_loss_of_sync_latch() {
+    // #5290: when the budget cannot drain everything, the residual bindings
+    // must be latched loss-of-sync so the owning worker's `take_delta_loss`
+    // resync recovers the undrained deltas (never a silent drop). The old drain
+    // armed no latch at all.
+    let mut coord = Coordinator::new();
+    let bindings = seed_pending_delta_bindings(&mut coord, 3, 20); // 60 total
+
+    let _ = coord.drain_session_deltas(9); // 9 < 60 => overflow
+
+    for (i, live) in bindings.iter().enumerate() {
+        assert!(
+            live.take_delta_loss(),
+            "binding {i} still holds undrained deltas after a budget overflow, \
+             so its loss-of-sync latch must be armed for a resync"
+        );
+    }
+}
+
+#[test]
+fn drain_session_deltas_cursor_rotates_so_no_worker_is_starved() {
+    // #5290 fail-on-revert: with a tiny budget (< N) only some bindings are
+    // served per drain, but the rotating cursor resumes at the next binding, so
+    // across successive drains EVERY binding is served. Reverting to the old
+    // no-cursor whole-budget-first drain would serve only binding 0 every drain,
+    // starving bindings 1 and 2 indefinitely.
+    let mut coord = Coordinator::new();
+    let bindings = seed_pending_delta_bindings(&mut coord, 3, 10); // 30 total
+
+    // budget 2 < 3 bindings => quantum 1, two bindings served per drain.
+    for _ in 0..3 {
+        let _ = coord.drain_session_deltas(2);
+    }
+
+    for (i, live) in bindings.iter().enumerate() {
+        let residual = live.drain_session_deltas(usize::MAX).len();
+        assert!(
+            residual < 10,
+            "binding {i} must have been served at least once across three \
+             cursor-rotated drains (residual {residual} < 10) — a no-cursor \
+             drain would starve every binding but slot 0"
+        );
+    }
+}
+
+#[test]
+fn drain_session_deltas_no_overflow_leaves_latch_clear() {
+    // A budget >= aggregate pending drains everything and must NOT arm a
+    // spurious resync (no thundering-resync when the fallback keeps up).
+    let mut coord = Coordinator::new();
+    let bindings = seed_pending_delta_bindings(&mut coord, 3, 5); // 15 total
+
+    let drained = coord.drain_session_deltas(100); // 100 >= 15
+    assert_eq!(drained.len(), 15, "generous budget drains everything");
+
+    for (i, live) in bindings.iter().enumerate() {
+        assert!(
+            !live.has_pending_session_deltas(),
+            "binding {i} fully drained"
+        );
+        assert!(
+            !live.take_delta_loss(),
+            "binding {i} fully drained — no overflow, latch must stay clear"
+        );
+    }
+}
