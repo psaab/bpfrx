@@ -1,3 +1,31 @@
+## 2026-07-18 — #6025 fold: negative-scope + v6 coverage (rev6101 MERGE-NEEDS-MINOR)
+
+- **Timestamp**: 2026-07-18 (fix/6025-dnat-off-localdelivery, follow-up)
+- **Action**: Folded the one substantive review MINOR from rev6101 — a
+  coverage gap on the crux. The positive test's `.51`-stays-local assertion
+  passes purely by the destination-identity check (`off_key.dst_ip == addr`,
+  .51 != .50), so it never exercises `off_scope_superset`'s SCOPE axes; a
+  future loosening of `off_scope_superset` would over-withdraw a
+  still-translated VIP uncaught. Added two tests to
+  `nat/tests_destination.rs`: (1)
+  `dnat_off_exemption_non_superset_source_scope_stays_local` — a
+  SOURCE-SCOPED `/32 off` that shadows the same broad `/24` translate BY
+  DESTINATION IDENTITY but is NOT a scope superset (source_constrained), so
+  the exempt host MUST remain firewall-local (it is still translated for
+  out-of-scope sources); asserts in-scope source → no DNAT, out-of-scope
+  source → translated, and `.50` stays local. (2)
+  `dnat_off_exemption_shadowing_broad_translate_prefix_not_local_v6` — v6
+  analog of the positive test exercising the v6 prefix-expansion `shadowed`
+  path (`2001:db8::/120` translate + `2001:db8::50/128 off`). No production
+  code change — the fix already handled both; these are the missing
+  fail-on-revert guards.
+- **File(s)**: userspace-dp/src/nat/tests_destination.rs, _Log.md
+- **Validation**: negative-scope RED-on-revert — loosened
+  `off_scope_superset` (`!off.source_constrained` → `true`): `test result:
+  FAILED. 0 passed; 1 failed` (panic tests_destination.rs:388, `.50` wrongly
+  withdrawn). Restored: `test result: ok. 47 passed; 0 failed`
+  (nat::tests_destination, up from 45 — both new tests GREEN).
+
 ## 2026-07-18 — #6025: withdraw a shadowed translate VIP on a winning `destination-nat off`
 
 - **Timestamp**: 2026-07-18 (fix/6025-dnat-off-localdelivery)
