@@ -1021,6 +1021,364 @@ fn pool_snat_no_translation_two_address_pool_both_succeed_5269() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #6041: address-only ("port no-translation") PERSISTENT-NAT leases.
+//
+// A pool configuring BOTH `persistent-nat` and `port no-translation` now pins a
+// public pool ADDRESS across the configured permit scope WITHOUT consuming a
+// translated pool port (`reserve_address_only_persistent`). This replaces the
+// #5819 fail-closed reject. The per-flow #5269 reverse-identity collision guard
+// still applies.
+// ---------------------------------------------------------------------------
+
+/// Build a `persistent-nat` + `port no-translation` pool rule. Source scope
+/// matches both families so the same helper drives the v4 and v6 tests.
+fn notrans_persistent_rules(
+    pool_addresses: Vec<&str>,
+    permit: &str,
+    timeout_secs: i64,
+    address_persistent: bool,
+) -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "notrans-persist".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+        pool_name: "np-pool".to_string(),
+        pool_addresses: pool_addresses.into_iter().map(str::to_string).collect(),
+        port_low: 1024,
+        port_high: 65535,
+        pool_no_translation: true,
+        persistent_nat: true,
+        persistent_nat_permit: permit.to_string(),
+        persistent_nat_inactivity_timeout: timeout_secs,
+        address_persistent,
+        ..SourceNATRuleSnapshot::default()
+    }])
+}
+
+fn notrans_persistent_lookup(
+    rules: &[SourceNatRule],
+    src_ip: &str,
+    src_port: u16,
+    dst_ip: &str,
+    dst_port: u16,
+    proto: u8,
+    now_ns: u64,
+) -> SourceNatLookup {
+    let mut counter = None;
+    match_source_nat_result_for_tuple(
+        rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        src_ip.parse().unwrap(),
+        dst_ip.parse().unwrap(),
+        Some(proto),
+        src_port,
+        dst_port,
+        None,
+        None,
+        now_ns,
+        false,
+        false,
+        &mut counter,
+    )
+}
+
+// #6041 FAIL-ON-REVERT: two flows keyed to the SAME address-only persistent
+// source (any-remote-host, DIFFERENT remotes) reuse ONE public address even on
+// a TWO-address pool with global `address-persistent` OFF. The lease pins the
+// address; reverting `reserve_address_only_persistent` to the round-robin
+// `reserve_address_only` sends the second flow to the OTHER pool address,
+// turning the equality assertion RED.
+#[test]
+fn notrans_persistent_two_flows_reuse_one_address_6041() {
+    let rules = notrans_persistent_rules(
+        vec!["203.0.113.1/32", "203.0.113.2/32"],
+        "any-remote-host",
+        300,
+        false, // address-persistent OFF: round-robin would split the addresses
+    );
+    let now = NS_PER_SEC;
+    let a = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    assert!(a.rewrite_src.is_some());
+    assert_eq!(
+        a.rewrite_src_port, None,
+        "no-translation preserves the source port"
+    );
+
+    // SAME local source tuple, DIFFERENT remote endpoint. any-remote-host keys
+    // the lease by the local source only -> reuse A's public address.
+    let b = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "9.9.9.9", 8080, PROTO_TCP, now,
+    ));
+    assert_eq!(
+        a.rewrite_src, b.rewrite_src,
+        "address-only persistent lease must pin ONE public address across the permit scope",
+    );
+    assert_eq!(b.rewrite_src_port, None);
+
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(live.persistent_by_source.len(), 1, "one address-only lease");
+        let lease = live.persistent_by_source.values().next().unwrap();
+        assert!(lease.address_only, "lease must be flagged address_only");
+        assert_eq!(lease.active_flows, 2, "two live flows share the lease");
+    }
+    assert_eq!(
+        source_nat_pool_statuses(&rules)[0].used_ports,
+        0,
+        "address-only lease consumes no pool port",
+    );
+    // Two distinct reverse-identity tokens (distinct remotes), same address.
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 2);
+}
+
+// #6041: releasing the flows decrements the lease refcount; at refcount 0 the
+// lease enters the idle expiry window and is reclaimed once the inactivity
+// timeout elapses. A NEW flow after reclamation mints a fresh lease — proving
+// the address is freed at refcount 0 + timeout, not leaked.
+#[test]
+fn notrans_persistent_refcount_release_and_expiry_6041() {
+    let timeout_secs = 300i64;
+    let rules =
+        notrans_persistent_rules(vec!["203.0.113.1/32"], "any-remote-host", timeout_secs, false);
+    let now = NS_PER_SEC;
+
+    let a = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    let b = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "9.9.9.9", 80, PROTO_TCP, now,
+    ));
+    assert_eq!(a.rewrite_src, b.rewrite_src);
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.values().next().unwrap().active_flows,
+            2
+        );
+    }
+
+    // Release flow A: refcount 2 -> 1, lease stays (address still pinned), its
+    // token cleared; an active lease is NOT in the expiry index.
+    release_source_nat_allocation(
+        &rules,
+        &session_key_from_src("10.0.1.100", 40000, "8.8.8.8", 443),
+        a,
+        false,
+        now,
+    );
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        let lease = live.persistent_by_source.values().next().unwrap();
+        assert_eq!(lease.active_flows, 1, "one flow still live");
+        assert_eq!(
+            live.lease_expirations.len(),
+            0,
+            "an active lease is not indexed for expiry"
+        );
+    }
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+
+    // Release flow B: refcount 1 -> 0, lease goes idle and is indexed for expiry.
+    release_source_nat_allocation(
+        &rules,
+        &session_key_from_src("10.0.1.100", 40000, "9.9.9.9", 80),
+        b,
+        false,
+        now,
+    );
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.len(),
+            1,
+            "idle lease survives until the inactivity timeout"
+        );
+        assert_eq!(
+            live.persistent_by_source.values().next().unwrap().active_flows,
+            0
+        );
+        assert_eq!(
+            live.lease_expirations.len(),
+            1,
+            "idle lease is indexed for expiry"
+        );
+    }
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        0,
+        "all reverse-identity tokens freed at refcount 0",
+    );
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 0);
+
+    // After the inactivity window a fresh lookup reclaims the idle lease (GC) and
+    // mints a new one for the new source.
+    let past = now + (timeout_secs as u64 + 1) * NS_PER_SEC;
+    let c = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.2.50", 50000, "8.8.8.8", 443, PROTO_TCP, past,
+    ));
+    assert!(c.rewrite_src.is_some());
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.len(),
+            1,
+            "old idle lease reclaimed; only the fresh lease remains"
+        );
+        assert_eq!(
+            live.persistent_by_source.values().next().unwrap().active_flows,
+            1
+        );
+    }
+}
+
+// #6041: the #5269 reverse-identity collision guard still fires under persistent
+// leases. Two DIFFERENT internal hosts (distinct lease keys) landing on the SAME
+// pool address with the SAME preserved source port + SAME remote produce an
+// indistinguishable public reverse tuple -> the second is DENIED as exhaustion.
+// Reverting the guard lets host B create a second lease + duplicate token and
+// return Matched, turning the Unavailable assertion RED.
+#[test]
+fn notrans_persistent_collision_guard_denies_conflicting_owner_6041() {
+    // One-address pool so both hosts' leases pin the SAME public address.
+    let rules = notrans_persistent_rules(vec!["203.0.113.1/32"], "any-remote-host", 300, false);
+    let now = NS_PER_SEC;
+
+    let a = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    assert_eq!(a.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+
+    match notrans_persistent_lookup(&rules, "10.0.1.101", 40000, "8.8.8.8", 443, PROTO_TCP, now) {
+        SourceNatLookup::Unavailable(f) => assert_eq!(
+            f.reason,
+            SourceNatFailureReason::AllocatorExhausted,
+            "colliding owner must fail closed as exhaustion",
+        ),
+        other => panic!("colliding owner must be denied, got {other:?}"),
+    }
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "denied host B minted no token",
+    );
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.len(),
+            1,
+            "denied host B created no lease",
+        );
+    }
+}
+
+// #6041: a second packet of the SAME flow (racing session install) returns the
+// same decision and does NOT double-count the lease refcount.
+#[test]
+fn notrans_persistent_idempotent_reentry_6041() {
+    let rules = notrans_persistent_rules(vec!["203.0.113.1/32"], "any-remote-host", 300, false);
+    let now = NS_PER_SEC;
+    let a1 = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    let a2 = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    assert_eq!(a1.rewrite_src, a2.rewrite_src);
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.values().next().unwrap().active_flows,
+            1,
+            "re-entry of the same flow must not double-count the refcount",
+        );
+    }
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+}
+
+// #6041: the configured permit scope drives lease keying independent of the
+// global address-persistent flag. any-remote-host shares ONE lease across
+// remotes; target-host-port keys a DISTINCT lease per remote endpoint.
+#[test]
+fn notrans_persistent_permit_scope_keying_6041() {
+    let now = NS_PER_SEC;
+    let any = notrans_persistent_rules(
+        vec!["203.0.113.1/32", "203.0.113.2/32"],
+        "any-remote-host",
+        300,
+        false,
+    );
+    let _ = notrans_persistent_lookup(&any, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now);
+    let _ = notrans_persistent_lookup(&any, "10.0.1.100", 40000, "9.9.9.9", 80, PROTO_TCP, now);
+    assert_eq!(
+        any[0].pool_allocator.debug_live().persistent_by_source.len(),
+        1,
+        "any-remote-host: one lease shared across remotes",
+    );
+
+    let thp = notrans_persistent_rules(
+        vec!["203.0.113.1/32", "203.0.113.2/32"],
+        "target-host-port",
+        300,
+        false,
+    );
+    let _ = notrans_persistent_lookup(&thp, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now);
+    let _ = notrans_persistent_lookup(&thp, "10.0.1.100", 40000, "9.9.9.9", 80, PROTO_TCP, now);
+    assert_eq!(
+        thp[0].pool_allocator.debug_live().persistent_by_source.len(),
+        2,
+        "target-host-port: distinct lease per remote endpoint",
+    );
+}
+
+// #6041: IPv6 twin of the core reuse test — an address-only persistent lease
+// pins one public v6 address across the permit scope, no port consumed.
+#[test]
+fn notrans_persistent_ipv6_reuse_one_address_6041() {
+    let rules = notrans_persistent_rules(
+        vec!["2001:db8::1/128", "2001:db8::2/128"],
+        "any-remote-host",
+        300,
+        false,
+    );
+    let now = NS_PER_SEC;
+    let a = expect_snat_decision(notrans_persistent_lookup(
+        &rules,
+        "2001:db8:1::100",
+        40000,
+        "2001:4860::8888",
+        443,
+        PROTO_TCP,
+        now,
+    ));
+    let b = expect_snat_decision(notrans_persistent_lookup(
+        &rules,
+        "2001:db8:1::100",
+        40000,
+        "2001:4860::9999",
+        80,
+        PROTO_TCP,
+        now,
+    ));
+    assert!(a.rewrite_src.unwrap().is_ipv6());
+    assert_eq!(
+        a.rewrite_src, b.rewrite_src,
+        "v6 address-only persistent lease must pin one public address",
+    );
+    assert_eq!(a.rewrite_src_port, None);
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(live.persistent_by_source.len(), 1);
+        assert!(live.persistent_by_source.values().next().unwrap().address_only);
+    }
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 0);
+}
+
 #[test]
 fn pool_snat_multiple_addresses_round_robin() {
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
@@ -4952,6 +5310,7 @@ fn install_expired_idle_leases(
                     activation_saw_completion: true,
                     activation_previous_expires_at_ns: 0,
                     activation_had_previous_lease: false,
+                    address_only: false,
                 },
             );
             live.lease_expirations.insert((expires_at_ns, key));
@@ -5049,6 +5408,7 @@ fn pool_snat_gc_chunked_spares_active_and_unexpired_leases() {
                 activation_saw_completion: false,
                 activation_previous_expires_at_ns: 0,
                 activation_had_previous_lease: false,
+                address_only: false,
             },
         );
         // Idle but not-yet-expired lease (expiry 10_000, past now=1000).
@@ -5067,6 +5427,7 @@ fn pool_snat_gc_chunked_spares_active_and_unexpired_leases() {
                 activation_saw_completion: true,
                 activation_previous_expires_at_ns: 0,
                 activation_had_previous_lease: false,
+                address_only: false,
             },
         );
         live.lease_expirations.insert((10_000, future_key));
