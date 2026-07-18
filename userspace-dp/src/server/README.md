@@ -193,11 +193,12 @@ queues. See PR #1243's kill record for why i40e doesn't reshape.
   / forwarding-state change, not a new config, so there is no rejected
   snapshot to un-persist — but the reconcile can still fault (mandatory-pin
   preflight / forwarding-build integrity error). #5621: `set_binding_state`,
-  `set_queue_state`, and `rebind` now SURFACE that `Err` (report `ok=false` +
-  the error, refresh status, do NOT `persist_state`) instead of the old
+  `set_queue_state`, and `rebind` (#6134) — and `set_forwarding_state`
+  (#6135, the 4th site #5621 had excluded) — now SURFACE that `Err` (report
+  `ok=false` + "`<site> reconcile failed: {err}`", refresh status, and return
+  BEFORE `wait_for_binding_settle` / `persist_state=true`) instead of the old
   `let _ = reconcile_status_bindings(..)` discard that acked `ok=true` after a
-  failed (re)bind; `rebind::handle` took a `response` parameter for this.
-  `set_forwarding_state` still discards the outcome (scoped follow-up). When
+  failed (re)bind; `rebind::handle` took a `response` parameter for this. When
   `should_run_afxdp` does NOT hold (forwarding disarmed / unsupported) it
   `stop()`s every worker and then routes the per-binding status through
   `refresh_bindings` — which sends each now-workerless slot through

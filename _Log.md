@@ -53435,3 +53435,21 @@ top.
   userspace-dp/src/server/tests.rs,
   userspace-dp/src/server/README.md,
   docs/userspace-dataplane-architecture.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #6135 — set_forwarding_state surfaces failed reconcile (4th
+  site of #5621, excluded from #6134). forwarding::set replaced
+  `let _ = reconcile_status_bindings(guard)` with the Err-fail-closed shape:
+  on Err → response.ok=false + "forwarding reconcile failed: {err}" +
+  refresh_status(guard) + return BEFORE wait_for_binding_settle /
+  persist_state=true. Success path unchanged. Added fail-on-revert test
+  `set_forwarding_state_failed_reconcile_reports_error_6135` (armed +
+  /33-unparseable snapshot → armed reconcile arm returns Err → ok=false).
+  Firsthand full suite: 4028 passed / 0 failed / 2 ignored. Parent-RED:
+  revert-to-discard → exactly 1 fail (the new test, tests.rs:1883,
+  assert !response.ok), 0 collateral. NOT HA/session-sync — local
+  control-socket reconcile; no smoke.
+- **File(s)**: userspace-dp/src/server/handlers/forwarding.rs,
+  userspace-dp/src/server/tests.rs,
+  userspace-dp/src/server/README.md,
+  docs/userspace-dataplane-architecture.md
