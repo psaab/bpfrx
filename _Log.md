@@ -1,3 +1,50 @@
+## 2026-07-18 — #5445: per-packet SessionLookup must not clone the policy_counter Arc
+
+- **Timestamp**: 2026-07-18 (fix/5445-session-metadata-clone)
+- **Action**: The primary/alias `SessionTable::lookup`(`_with_origin`) return
+  cloned `SessionMetadata` BY VALUE on every established-session lookup (the
+  per-packet hot path: TCP control segments + flow-cache-miss packets). Since
+  `SessionMetadata::policy_counter` is an `Arc<PolicyRuleCounter>` (#3322 bound
+  handle), that clone did a `LOCK XADD` refcount bump on the SHARED counter
+  control block — the #919 hot-path-atomic problem (workers contending one
+  cacheline). Fix: `lookup_with_origin` now builds its `SessionLookup.metadata`
+  via the new `SessionMetadata::clone_without_policy_counter` (all Copy fields,
+  `policy_counter = None`, zero atomics). The bound counter stays owned by the
+  `SessionEntry`; the established-hit fast path re-sources it BY BORROW via the
+  new `SessionTable::bound_policy_counter_for` for the per-packet policy
+  hit-count and clones the Arc at most once per flow to hand ownership to the
+  flow-cache entry. `poll_descriptor` sources the handle once (prefer the value
+  the resolve threaded on the miss/forward-wire owner paths, else borrow-clone
+  from the per-worker table) and reuses it for both the count and the flow-cache
+  stamp — removing the two prior per-packet Arc clones (lookup return +
+  materialize) and the redundant stamp clone (3 atomics -> 1 per hit, and 0 in
+  `lookup` itself). #3322 reorder-stable attribution is unchanged (same Arc
+  instance, borrowed not cloned). The once-per-flow `find_forward_*_match`
+  finders keep carrying the Arc on `ForwardSessionMatch` (reverse-companion
+  install, an owner handoff — not the per-packet path).
+- **Soundness**: a BORROW out of `lookup` is unsound (the caller mutates
+  `sessions` after — materialize/promote), and a raw-pointer/Copy handle is
+  unsound (`PolicyCounterStore::reconcile_rules` drops a deleted rule's Arc, so
+  the session's Arc is load-bearing across rule deletion per #3322). The
+  chosen split keeps the Arc owned by the table entry (lifetime-guaranteed to
+  outlive the packet on the per-worker table) and only borrows it on the hot
+  path — the sound option (b) the issue endorsed.
+- **Tests**: `lookup_does_not_clone_policy_counter_arc_5445` — a perf-with-
+  strong-count guard (NOT behavioral RED): asserts `Arc::strong_count` is stable
+  across a `lookup` while the result is held, the returned metadata carries
+  `policy_counter = None` + the Copy idx, and the counter still increments via
+  the borrowed `bound_policy_counter_for` handle. RED-verified by reverting to
+  `entry.metadata.clone()` (strong_count grows -> fails). 5x flake green.
+- **Validation**: `cargo build` clean; full session suite 176 passed; the whole
+  `--bin` suite green except two PRE-EXISTING failures reproduced on the stashed
+  clean base (`protocol::tests::wire_invariant_default_specimens` fixture drift,
+  `event_stream ... stalled_consumer ...` backpressure) — unrelated to this
+  change. Smoke on the loss userspace cluster is blocked by the shim-ABI wall.
+- **File(s)**: userspace-dp/src/session/entry.rs,
+  userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md, _Log.md
+
 ## 2026-07-18 — #5624: NAT64 fragment-association must invalidate on config change
 
 - **Timestamp**: 2026-07-18 (fix/5624-nat64-fragassoc-generation)

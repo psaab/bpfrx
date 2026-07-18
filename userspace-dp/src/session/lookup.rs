@@ -180,7 +180,14 @@ impl SessionTable {
                 (
                     SessionLookup {
                         decision: entry.decision,
-                        metadata: entry.metadata.clone(),
+                        // #5445: strip the bound `policy_counter` Arc from the
+                        // per-packet lookup return. `entry.metadata.clone()`
+                        // bumped the SHARED `Arc<PolicyRuleCounter>` refcount
+                        // (a `LOCK XADD`) on EVERY established-session lookup —
+                        // the #919 hot-path atomic. The counter stays owned by
+                        // this `SessionEntry`; hot-path consumers re-source it
+                        // by borrow via `bound_policy_counter_for`.
+                        metadata: entry.metadata.clone_without_policy_counter(),
                     },
                     entry.origin,
                 ),
@@ -311,6 +318,40 @@ impl SessionTable {
             }
         }
         None
+    }
+
+    /// #5445: borrow the admitting rule's bound hit-counter handle (`#3322`)
+    /// directly from this worker's session-table entry, WITHOUT cloning the
+    /// `Arc`. The per-packet established-session lookup (`lookup_with_origin`)
+    /// no longer carries the bound `Arc<PolicyRuleCounter>` on its returned
+    /// `SessionLookup.metadata` — cloning it there bumped the shared refcount (a
+    /// `LOCK XADD`) on the packet-forwarding hot path, reintroducing the #919
+    /// hot-path-atomic problem. The counter itself is still owned by the
+    /// `SessionEntry` (lifetime-guaranteed to outlive the packet's processing
+    /// on this per-worker table), so the fast path re-sources it BY BORROW here
+    /// for the per-packet policy hit-count and, once per flow, clones it into
+    /// the flow-cache entry.
+    ///
+    /// Resolution mirrors `lookup_with_origin` — the direct primary key, then
+    /// the reverse-translated (NAT alias) index — the exact two paths whose
+    /// `SessionLookup` return is now counter-stripped. The `forward_wire` finder
+    /// path is not mirrored: it returns a `ForwardSessionMatch` that still
+    /// carries the `Arc`, so `resolve_flow_session_decision` already threads the
+    /// bound handle for that (rarer, interface-mode-SNAT) case and never falls
+    /// back to this accessor. Returns `None` for a miss or an entry with no
+    /// bound counter (idx-0 / peer-synced entries carrying only the wire idx),
+    /// which the caller resolves via the positional `policy_counter_idx`
+    /// fallback exactly as `resolve_session_hit_counter(None, idx)` did before.
+    pub fn bound_policy_counter_for(
+        &self,
+        key: &SessionKey,
+    ) -> Option<&std::sync::Arc<crate::policy::PolicyRuleCounter>> {
+        if let Some(entry) = self.entry_by_key(key) {
+            return entry.metadata.policy_counter.as_ref();
+        }
+        let handle = self.resolve_reverse_translated_handle(key)?;
+        let record = self.entries.get(handle as usize)?;
+        record.entry.metadata.policy_counter.as_ref()
     }
 
     pub fn entry_with_origin(

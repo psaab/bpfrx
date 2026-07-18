@@ -1134,12 +1134,42 @@ pub(super) fn poll_binding_process_descriptor(
                         // attribution — policy_id / log flags / the bound counter
                         // handle used for close-time re-resolution + HA sync —
                         // stays stamped on the session.
+                        //
+                        // #5445: the bound hit-counter Arc is NO LONGER carried
+                        // on the per-packet established-hit `SessionLookup`
+                        // (cloning it there bumped the shared `Arc` refcount —
+                        // a `LOCK XADD` — on every established-session lookup,
+                        // the #919 hot-path atomic). Re-source it once here:
+                        // prefer the value the resolve threaded (the session-
+                        // MISS / forward-wire paths still carry it, an owner
+                        // handoff), else BORROW-and-clone it from THIS worker's
+                        // own session-table entry (the established-hit path,
+                        // whose lookup return is now counter-stripped). Both
+                        // sources are contention-free (owned local metadata /
+                        // per-worker table). `None` (idx-0 / peer-synced
+                        // transient not in the local table) falls back to the
+                        // positional `policy_counter_idx`, exactly as
+                        // `resolve_session_hit_counter(None, idx)` did before.
+                        // The single clone here replaces the two prior per-
+                        // packet Arc clones (the lookup return + the flow-cache
+                        // stamp), and hands ownership straight to the flow-cache
+                        // entry below.
+                        let bound_policy_counter = match resolved
+                            .metadata
+                            .policy_counter
+                            .clone()
+                        {
+                            some @ Some(_) => some,
+                            None => sessions
+                                .bound_policy_counter_for(&flow.forward_key)
+                                .cloned(),
+                        };
                         if resolved.decision.resolution.disposition
                             != ForwardingDisposition::LocalDelivery
                         {
                             if let Some(counter) =
                                 worker_ctx.forwarding.policy.resolve_session_hit_counter(
-                                    resolved.metadata.policy_counter.as_ref(),
+                                    bound_policy_counter.as_ref(),
                                     resolved.metadata.policy_counter_idx,
                                 )
                             {
@@ -1217,7 +1247,12 @@ pub(super) fn poll_binding_process_descriptor(
                         flow_cache_policy_counter_idx = resolved.metadata.policy_counter_idx;
                         // #3322: carry the bound handle from the established
                         // session onto the flow-cache entry too.
-                        flow_cache_policy_counter = resolved.metadata.policy_counter.clone();
+                        // #5445: hand the already-sourced bound counter to the
+                        // flow-cache entry (was `resolved.metadata.policy_counter
+                        // .clone()`, a SECOND per-packet Arc clone on top of the
+                        // now-removed lookup-return clone). `bound_policy_counter`
+                        // above already resolved the same handle exactly once.
+                        flow_cache_policy_counter = bound_policy_counter;
                         apply_nat_on_fabric = true;
                         if let Some(input_filter_eval) =
                             evaluate_dscp_sensitive_input_filter_on_session_hit(
