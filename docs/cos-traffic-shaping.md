@@ -1215,6 +1215,23 @@ Notes for this specific test:
   missed — and the measurement-only
   `xpf_fairness_equal_flow_unsampled_active_workers` estimator gauge
   (#1304) is unrelated to the removed cap.
+- **Fairness throughput-window retention is bounded (#5100).** The
+  collector's rolling per-queue throughput window (which feeds the
+  `xpf_fairness_saturated` / `xpf_fairness_observed_cov` /
+  `xpf_fairness_starved_flows` gauges and the equal-flow estimator, all
+  keyed by `(ifindex, queue_id)`) now RETIRES a queue identity that has
+  vanished from the current status AND holds no live telemetry — no
+  accumulated flow bytes, worker bytes, or starvation records after the
+  30 s window drains. Previously a `(ifindex, queue_id)` that disappeared
+  (interface removal / ifindex churn / test namespaces) was retained for
+  the process lifetime, so long-running systems accumulated telemetry
+  state and paid an ever-growing per-scrape seed+sort of the full
+  historical key slice under the collector mutex. Retention is now bounded
+  by currently-observed identities plus one window of recently-active
+  ones. Retirement is metric-invariant: a drained queue produces no gauge
+  sample regardless (the scrape skips empty queues), a still-active queue
+  is never retired, and a retired identity that reappears re-registers
+  cleanly with a fresh baseline.
 - `loss-priority` on CoS DSCP rewrite-rules is **enforced** (#3995): the
   userspace dataplane keys the egress DSCP rewrite on
   `(forwarding-class, loss-priority)`, so a rule that rewrites

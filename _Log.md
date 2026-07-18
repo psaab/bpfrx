@@ -35,6 +35,39 @@
   userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
 
+## 2026-07-18 — #5100: retire vanished queue identities in fairness throughput window
+
+- **Timestamp**: 2026-07-18 (fix/5100-fairness-window-retire)
+- **Action**: The collector's rolling per-queue fairness throughput window
+  (`FairnessThroughputWindow`, consumed under the collector mutex by
+  `emitFairnessThroughputGauges` in `pkg/api/metrics_userspace.go`) never
+  deleted a key from `w.queues`. The seed-all-keys loop appended an empty
+  idle-advancement sample to EVERY historical `(ifindex, queueID)` each
+  update, so a queue that vanished (interface removal / ifindex churn / test
+  namespaces) never drained on its own and lingered for the process lifetime
+  — unbounded memory plus an ever-growing per-scrape seed+sort of the full
+  historical key slice under the mutex. Fix: after `prune`, RETIRE a queue
+  that is absent from the current status AND drained (empty `bytesByFlow`,
+  `bytesByWorker`, and `starvedFlows`). Added `currentQueues` (the identities
+  observed in this update's `FlowWorkerMap` — the sole creator of queue
+  states) and `fairnessQueueThroughputWindow.isDrained()`; the prune loop now
+  `delete(w.queues, key)` for drained-and-absent keys. Retirement is
+  metric-invariant: the scrape already skips queues with empty `bytesByFlow`,
+  so a retired queue produced no gauge sample anyway; a still-active queue is
+  never retired (its window samples keep `bytesByFlow` non-empty); a retired
+  identity that reappears re-registers cleanly via `queueState` with a fresh
+  baseline. Retention is now bounded by currently-observed identities plus one
+  window of recently-active ones.
+- **File(s)**: `pkg/dataplane/userspace/fairness_throughput.go`,
+  `pkg/dataplane/userspace/fairness_throughput_test.go`,
+  `docs/cos-traffic-shaping.md`, `_Log.md`
+- **Validation**: `go build`, `go vet`, `go test ./pkg/dataplane/userspace/`
+  (full package green, 14.6s); fairness subset `-count=5` no flakes. New
+  `TestFairnessThroughputWindowRetiresVanishedQueueIdentity` (fail-on-revert:
+  neutralizing the `delete` leaves the vanished key present → FAIL) and
+  `TestFairnessThroughputWindowBoundsMemoryUnderQueueChurn` (200 churned
+  identities → peak `w.queues` size = 2 with the fix, ~200 without).
+
 ## 2026-07-18 — #5290: fair HA session-delta drain + overflow resync latch
 
 - **Timestamp**: 2026-07-18 (fix/5290-drain-deltas-fairness)
