@@ -319,7 +319,9 @@ un-sent tail at the front of the ring (FIFO-preserving, evicting the oldest on
 overflow) so they replay on the next reconnect flush — the same
 journal-on-failure contract `QueueDeleteV4`/`V6` use for runtime deletes (#2121
 fixed an earlier silent drop here). Genuine loss only occurs at the journal cap
-and is counted in `DeletesDropped`.
+and is counted in `DeletesDropped`; a cap eviction now also arms a full bulk
+resync so the standby reconciles the evicted deletes (#5450, see "Delete Journal
+Overflow" below).
 
 Because deletes are key-only on the peer (no generation/session-identity guard
 yet), a re-journaled delete that replays after a same-key replacement session
@@ -1026,9 +1028,32 @@ the lower-latency userspace delta path scoped to the AF_XDP helper.
 
 ### Delete Journal Overflow
 
-The delete journal is bounded. Extended disconnects with high churn can evict
-old deletes. The next bulk reconciliation eventually cleans this up, but not
-immediately.
+The delete journal is bounded (`deleteJournalCap`, default 10000). Extended
+disconnects with high churn can push it past the cap, evicting the oldest queued
+deletes. Those evicted records are session teardowns the standby still needs;
+they are already gone from the primary's local table, so no incremental install
+sweep can re-derive them.
+
+**Recovery (#5450):** whenever an eviction actually DROPS records — in either
+`journalDelete` (append past cap) or `rejournalTail` (re-journal-on-failure past
+cap) — the drop site arms `forceResync` (a single atomic, CAS-armed once per
+overflow episode; counted in `DeletesDropped`). `forceResync` is consumed by
+whichever runs first:
+
+- the periodic sweep (`syncSweep`) while connected, or
+- the next reconnect (`handleNewConnection`, re-read AFTER `flushDeleteJournal`
+  so an eviction during that flush is caught) even when the node is already
+  primed (`bulkEverCompleted`),
+
+and it sends a full authoritative `doBulkSync`/`BulkSync` snapshot. The peer's
+`reconcileStaleSessions` (run at `BulkEnd`) then DELETES any session absent from
+the snapshot — precisely the sessions the evicted deletes would have torn down.
+On a failed bulk the arm is restored so a later sweep/reconnect retries. Before
+#5450 an overflow only self-healed at the next unrelated full bulk reconcile,
+which could be far away, so the standby carried ghost sessions (wrong forwarding
++ inflated session count) for a long time. `forceResync` is deliberately kept
+distinct from `bulkEverCompleted` (which the daemon reads for VRRP sync-hold
+gating) and from `syncBackfillNeeded` (which only re-drives INSTALLS).
 
 ### Counter Divergence
 

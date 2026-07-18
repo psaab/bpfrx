@@ -212,11 +212,16 @@ fn merge_matched_modifiers(
         acc.dscp_rewrite = Some(rewrite);
     }
     acc.policer_drop |= policer_action.drop;
+    // #5444: `policer_name`/`routing_instance` are `Arc<str>` (interned at
+    // compile time), so these writes are refcount bumps — NOT per-packet String
+    // heap allocations. Mirrors the `forwarding_class` clone below (#5151); the
+    // Arc clone only runs when a term ACTUALLY sets the modifier, and `None` on
+    // the default/reset preserves the old empty-`""` "unset" meaning.
     if !term.policer_name.is_empty() {
-        acc.policer_name = term.policer_name.clone();
+        acc.policer_name = Some(term.policer_name.clone());
     }
     if !term.routing_instance.is_empty() {
-        acc.routing_instance = term.routing_instance.clone();
+        acc.routing_instance = Some(term.routing_instance.clone());
     }
     if !term.forwarding_class.is_empty() {
         // #5151: clone the Arc only when a term ACTUALLY sets a forwarding-class
@@ -387,7 +392,7 @@ fn evaluate_filter_ref_non_routing_counted_v4(
         merge_matched_modifiers(&mut acc, filter, term, None, packet_bytes);
         // This loop variant never carries a routing-instance through the
         // result (it defers to the routing-instance evaluator); keep that.
-        acc.routing_instance = String::new();
+        acc.routing_instance = None;
         if !term.continue_term {
             acc.action = term.action;
             if !always_count && term.action != FilterAction::Accept {
@@ -480,7 +485,7 @@ fn evaluate_filter_ref_non_routing_counted_v6(
         // #5857: the non-routing input-filter evaluator does NOT meter its
         // policer here (it is metered in the tx-selection walk); pass None.
         merge_matched_modifiers(&mut acc, filter, term, None, packet_bytes);
-        acc.routing_instance = String::new();
+        acc.routing_instance = None;
         if !term.continue_term {
             acc.action = term.action;
             if !always_count && term.action != FilterAction::Accept {
@@ -582,7 +587,7 @@ fn evaluate_filter_ref_routing_instance_counted_v4<'a>(
             continue;
         }
         let routing_instance =
-            (!term.routing_instance.is_empty()).then_some(term.routing_instance.as_str())?;
+            (!term.routing_instance.is_empty()).then_some(&*term.routing_instance)?;
         // The routing-instance term itself may also carry `then log`; latest
         // matched wins so it supersedes any earlier fall-through log.
         if let Some(lm) = filter_log_match(filter, term) {
@@ -637,7 +642,7 @@ fn evaluate_filter_ref_routing_instance_counted_v6<'a>(
             continue;
         }
         let routing_instance =
-            (!term.routing_instance.is_empty()).then_some(term.routing_instance.as_str())?;
+            (!term.routing_instance.is_empty()).then_some(&*term.routing_instance)?;
         if let Some(lm) = filter_log_match(filter, term) {
             acc_log = Some(lm);
         }

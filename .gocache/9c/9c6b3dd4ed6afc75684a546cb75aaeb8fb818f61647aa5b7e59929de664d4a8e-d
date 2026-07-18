@@ -1,0 +1,10 @@
+./deque.go
+./elf.go
+./endian_le.go
+./errors.go
+./feature.go
+./io.go
+./math.go
+./output.go
+./prog.go
+./version.go

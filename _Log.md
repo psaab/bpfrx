@@ -1,3 +1,148 @@
+## 2026-07-17 — #5450: delete-journal overflow must arm a full bulk resync
+
+- **Timestamp**: 2026-07-17 (fix/5450-delete-journal-reconcile)
+- **Action**: On a full/disconnected send stream the delete journal
+  (`pkg/cluster/sync_conn.go`) evicts the OLDEST queued session-delete records
+  to stay under `deleteJournalCap`. Dropped deletes were counted
+  (`DeletesDropped`) but never otherwise recovered — the standby kept the
+  sessions the primary already closed until the next unrelated full bulk
+  reconcile, which under an extended control-link partition with high churn
+  could be far away (ghost sessions → wrong forwarding + inflated session
+  count). Fix: added a `forceResync atomic.Bool`; both drop sites
+  (`journalDelete` append-past-cap and `rejournalTail` re-journal-past-cap) now
+  arm it via a shared `armDeleteResync()` CAS (pure atomic under
+  `deleteJournalMu` — no I/O, idempotent, armed once per overflow episode). It
+  is consumed by whichever runs first: the connected sweep (`syncSweep`) or the
+  next reconnect (`handleNewConnection`, re-read AFTER `flushDeleteJournal` so an
+  eviction during that flush is caught), each firing a full authoritative
+  `doBulkSync` even when already primed. The peer's `reconcileStaleSessions` at
+  `BulkEnd` then deletes exactly the sessions absent from the snapshot. On a
+  failed bulk the arm is restored so a later sweep/reconnect retries.
+  `forceResync` is kept DISTINCT from `bulkEverCompleted` (daemon reads it for
+  VRRP sync-hold gating) and from `syncBackfillNeeded` (re-drives INSTALLS only
+  — a dropped delete has no live session to re-derive).
+- **File(s)**: pkg/cluster/sync.go (field), pkg/cluster/sync_conn.go
+  (armDeleteResync, journalDelete, rejournalTail, syncSweep,
+  handleNewConnection), pkg/cluster/sync_test.go
+  (TestDeleteJournalOverflowArmsForceResync, fail-on-revert),
+  docs/session-sync-architecture.md.
+- **Validation**: `go build ./...` clean; `go test ./pkg/cluster/...` green
+  (incl. `-race`); fail-on-revert confirmed (removing the rejournalTail
+  arm fails `rejournal_overflow_arms`). Failover smoke advised on the loss
+  userspace cluster (parent to run) — this touches session-sync.
+## 2026-07-17 — #6082: bpfSessionValue implicit padding breaks cilium/ebpf batch marshal
+
+- **Timestamp**: 2026-07-17 (fix/6082-session-value-marshal-size)
+- **Action**: The 60s HA session-sync sweep failed EVERY iteration on the loss
+  cluster (both nodes) with `batch lookup sessions: map batch lookup:
+  unmarshaling []dataplane.bpfSessionValue doesn't consume all data`. Root
+  cause (confirmed empirically): cilium/ebpf v0.20 `internal/sysenc.Unmarshal`
+  takes its zero-copy fast path ONLY when `binary.Size(T) == unsafe.Sizeof(T)`
+  (marshal.go:143 + layout.go). `bpfSessionValue`/`V6` carried 7 bytes of
+  IMPLICIT head alignment padding (gaps after State@1, after IsReverse@6-7,
+  before SessionID@12-15) introduced when #5460 widened `flags` __u8->__u16.
+  `unsafe.Sizeof` = 136/184 but `binary.Size` = 129/177, so sysenc fell back to
+  `binary.Decode`, which consumes only 129/177 of each 136/184-byte kernel
+  record → the whole batch errors. Every map read (BatchLookup, Iterate, single
+  Lookup) was affected; the sweep is just where it logged.
+- **Fix**: made all three head-padding gaps EXPLICIT via named `_ [N]byte`
+  fields in `bpfSessionValue` and `bpfSessionValueV6`, mirroring the C
+  `struct session_value{,_v6}` byte layout. binary.Size now == unsafe.Sizeof ==
+  136/184, so the zero-copy path stays engaged. No real field type/order/offset
+  changed; on-map ABI bytes byte-identical (unsafe.Sizeof + every offset
+  unchanged). Blank `_` fields are counted by encoding/binary but do NOT count
+  as "unexported" for the fast path (layout.go:28).
+- **Tests**: added `TestBPFSessionValueMarshalsAtConntrackABISize` (asserts
+  binary.Size == unsafe.Sizeof == 136/184 for both structs — the fail-on-revert
+  guard #6082 needed; verified RED with pads removed while the old
+  unsafe.Sizeof-only ABI test stayed GREEN, proving the old test could not catch
+  it) and `TestBatchLookupSessionsRoundTrip` (real kernel v4/v6 maps: install
+  via Set/toBPF, read back via BatchIterateSessions/V6 + GetSessionV4/V6;
+  skips unprivileged, runs on the privileged cluster where #6082 was seen).
+- **File(s)**: pkg/dataplane/bpf_session_value.go,
+  pkg/dataplane/bpf_session_value_test.go
+- **Validation**: `go build ./...`, `go test ./pkg/dataplane/...`,
+  `go test ./pkg/cluster/... ./pkg/conntrack/...` all green (round-trip skips
+  unprivileged). gofmt -w on both touched files.
+
+## 2026-07-17 — #5444: filter modifier propagation is Arc<str>, not per-packet String clone
+
+- **Timestamp**: 2026-07-17 (fix/5444-filter-modifier-clone)
+- **Action**: `merge_matched_modifiers` (userspace-dp filter action-eval hot
+  path, runs per matched term on every input/output/lo0 filter walk)
+  heap-cloned two owned `String` fields (`policer_name`, `routing_instance`)
+  into the per-packet `FilterResult` for EVERY matched term — two allocation
+  +copy events on the filter fast path. Converted `FilterTerm.policer_name`
+  and `FilterTerm.routing_instance` from `String` to `Arc<str>` (interned once
+  at compile time in `compiler.rs`, mirroring the existing
+  `forwarding_class: Arc<str>`), and `FilterResult.policer_name` /
+  `.routing_instance` from `String` to `Option<Arc<str>>` (mirroring the #5151
+  `forwarding_class: Option<Arc<str>>` pattern). The merge is now a refcount
+  bump; the accumulator default and the non-routing reset are zero-alloc
+  (`None`) instead of `String::new()`. Output is byte-identical — the same
+  policer/routing-instance/forwarding-class values flow downstream. Verified
+  no non-test consumer reads either FilterResult field (the live routing-
+  instance override rides the separate `FilterRoutingInstanceResult<'a>` with
+  its `&'a str`, untouched); neither field is mutated in place; the config-
+  owned source outlives every FilterResult. `cache_sensitive.rs` term-compare
+  (`Arc<str> == Arc<str>`) and PBR evaluators (`&*term.routing_instance`)
+  adjusted. Two test asserts on `FilterResult.routing_instance` moved from
+  `.is_empty()` to `.is_none()`.
+- **File(s)**: userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/engine/eval.rs, userspace-dp/src/filter/tests.rs
+- **Validation**: `cargo build` clean; filter suite 189 tests green, run 5×
+  no flakes; new perf-with-correctness-guard test
+  `filter_result_modifiers_roundtrip_5444` asserts all three modifiers round-
+  trip into FilterResult on a match and default to `None` on a miss (NOT a
+  RED-on-revert — values are byte-identical either way; it guards against a
+  future refactor silently dropping a modifier). Grepped the changed fn: the
+  three remaining `.clone()` are all `Arc<str>` refcount bumps, zero
+  `String::`/`.to_string()`. Two full-suite failures
+  (`wire_invariant_default_specimens` nat64 stats fixture drift,
+  `stalled_consumer_...backlog_unbounded_end_to_end` backpressure timing) are
+  PRE-EXISTING — reproduced identically with this change stashed; unrelated to
+  the filter module. Perf-only change with byte-identical output, so no
+  design-doc/contract update needed (the #5444 in-code comments, mirroring the
+  #5151/#5857 precedent, are the documentation surface).
+
+## 2026-07-17 — #5469: write_state serializes+fsyncs OUTSIDE the ServerState lock
+
+- **Timestamp**: 2026-07-17 (fix/5469-writestate-lock-convoy)
+- **Action**: `write_state` (userspace-dp state-file persist) held the
+  `ServerState` lock across `refresh_status`, `serde_json::to_vec_pretty` over
+  the whole `ProcessStatus` + `ConfigSnapshot`, AND `StateWriter::persist`
+  (file + parent-dir fsync). The fallback session-delta poll sets
+  `persist_state` on every nonempty request, so under session churn each delta
+  poll serialized+fsynced the full state while holding the lock that also gates
+  snapshot apply, status, and HA/control ops → lock convoy + delayed control
+  ops (same class as configstore #4829). Shrank the critical section: split out
+  `build_state_payload(&mut ServerState)` (the ONLY guard-touching half — runs
+  `refresh_status`, clones `status` + `snapshot` into an owned
+  `OwnedStatePayload`) and `OwnedStatePayload::encode()` (owns its data → cannot
+  reach the guard). `write_state` now holds the lock only for
+  `build_state_payload` + a cheap Arc bump of the writer handle, DROPS the
+  guard, then runs `encode()` (`to_vec_pretty`) and `persist` lock-free.
+  Confirmed `persist` is atomic (temp+rename via `finalize_durably`) and
+  single-writer-thread FIFO, so concurrent lock-free writers never tear the
+  file — last-writer-wins, transient staleness self-corrects on the next
+  periodic write. Byte-for-byte identical encoding to pre-#5469. Fail-on-revert
+  test `write_state_releases_lock_before_persist` uses a same-thread `try_lock`
+  probe at the persist point (a non-reentrant `Mutex` grants it only if the
+  guard was truly dropped); verified RED when the guard is put back across
+  persist. Ran server::tests 5× (67 passed, no flakes). Two full-suite
+  failures (`wire_invariant_default_specimens`,
+  `stalled_consumer_..._backlog_unbounded`) are pre-existing: the wire fixture
+  drift is from #25afac254 NAT64 `BindingStatus` counters (untouched here),
+  fails deterministically in isolation; the backpressure test is a known timing
+  flake (FAIL/OK/FAIL in isolation). Neither touches server/helpers.
+- **File(s)**:
+  userspace-dp/src/server/helpers.rs (split write_state + owned payload + test
+    probe),
+  userspace-dp/src/server/tests.rs (fail-on-revert test),
+  userspace-dp/src/server/README.md (helpers.rs write_state lock-discipline note),
+  _Log.md
+
 ## 2026-07-17 — #5163: zone-counter fold must be lock-free (no per-batch global mutex)
 
 - **Timestamp**: 2026-07-17 (fix/5163-zone-counter-contention)
@@ -51754,3 +51899,31 @@ top.
   neutralizing the `persistResolvedFabricsLocked` writeback turns
   `TestSyncFabricStatePersistsResolvedFabricsIntoLastSnapshot` RED (both
   the direct-writeback and end-to-end apply_snapshot assertions).
+## 2026-07-17 — #5660 nat/allocator bounded-hardening (2 items)
+- **Timestamp**: 2026-07-17
+- **Action**: Item 1 — replace the O(N) `pool_v4.iter().position()` linear scan
+  in `reverse_deterministic_v4`/`reverse_deterministic_v6` with an O(1)
+  `PoolReverseIndex` (`FxHashMap<Ipv4Addr,u32>`) built once by
+  `build_pool_reverse_index()`. Verified the pool is an ARBITRARY, possibly
+  non-contiguous ordered Vec (NAT64 parses pool strings; tests use gapped
+  `[198.51.100.1, .5]`), so a direct `translated_ip - pool_base` subtraction
+  would be wrong — first-match hash mirrors `position()` exactly. Reverse is the
+  provable inverse of the forward `pool_v4[ip_idx]` selection.
+- **Action**: Item 2 — `AddressOccupancy::port_of` now range-checks the offset
+  before the `u32 -> u16` narrowing (returns `Option<u16>`, `None` when
+  `offset >= range`) so an out-of-range value is REJECTED, not silently
+  truncated into a valid-looking wrong port. The sole claim-path caller holds
+  `offset < range`, so no behavior change on the hot path.
+- **Tests**: added `deterministic_reverse_v4_o1_index_is_exact_inverse_across_pool_boundaries`
+  (round-trips every subscriber over a NON-CONTIGUOUS pool covering ip_idx
+  0/mid/last — RED-verified against the contiguous-subtraction shortcut:
+  `Some(8)` vs `Some(1)` for 10.0.0.9) and
+  `port_of_rejects_out_of_range_offset_no_silent_truncation` (RED-verified by
+  neutralizing the guard: `Some(2048)` vs `None`). Updated the 7 existing
+  reverse-test call sites to build the index once. 5x flake check green.
+- **Validation**: `cargo build` clean; full `nat` suite 746 passed; full
+  userspace-dp suite 3931 passed (the 2 failing `protocol wire golden` +
+  `backpressure` tests pre-exist on the base commit with my changes stashed —
+  unrelated to nat).
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/tests_pool.rs,
+  docs/deterministic-nat-cgnat.md, _Log.md

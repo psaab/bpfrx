@@ -1,0 +1,4 @@
+# test log
+open testdata/system_buffers.golden
+open testdata/cos_summary.golden
+open testdata/status_summary.golden

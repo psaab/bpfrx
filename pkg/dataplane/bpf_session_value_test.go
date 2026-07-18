@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"encoding/binary"
 	"testing"
 	"unsafe"
 )
@@ -36,6 +37,113 @@ func TestBPFSessionValueMatchesConntrackABI(t *testing.T) {
 	}
 	if ConntrackSessionValueSizeV6 != conntrackValueSizeV6 {
 		t.Fatalf("ConntrackSessionValueSizeV6 = %d, want %d", ConntrackSessionValueSizeV6, conntrackValueSizeV6)
+	}
+}
+
+// TestBPFSessionValueMarshalsAtConntrackABISize is the fail-on-revert guard for
+// #6082. cilium/ebpf's map I/O (Lookup / Iterate / BatchLookup) unmarshals the
+// on-map value through internal/sysenc.Unmarshal, which only takes the correct
+// zero-copy fast path when encoding/binary's binary.Size(T) equals the native
+// unsafe.Sizeof(T). encoding/binary does NOT count implicit alignment padding,
+// so when the three head-padding gaps (after State, after IsReverse, before
+// SessionID) are left implicit, binary.Size is 129/177 while unsafe.Sizeof is
+// 136/184. sysenc then falls back to binary.Decode, which consumes only
+// binary.Size bytes of every value_size-byte kernel record and fails the batch
+// with "unmarshaling []dataplane.bpfSessionValue doesn't consume all data" —
+// the live HA session-sync sweep breakage.
+//
+// Declaring the padding explicitly (named `_ [N]byte` gaps) makes binary.Size
+// == unsafe.Sizeof == value_size, keeping the fast path engaged. This test goes
+// RED if the explicit pads are removed (reverting to implicit padding), because
+// binary.Size drops back to 129/177. It asserts all three sizes are equal AND
+// equal to the on-map conntrack ABI value_size (136/184) — the exact invariant
+// cilium/ebpf relies on.
+func TestBPFSessionValueMarshalsAtConntrackABISize(t *testing.T) {
+	cases := []struct {
+		name    string
+		native  uintptr
+		binSize int
+		want    int
+	}{
+		{"bpfSessionValue", unsafe.Sizeof(bpfSessionValue{}), binary.Size(bpfSessionValue{}), conntrackValueSizeV4},
+		{"bpfSessionValueV6", unsafe.Sizeof(bpfSessionValueV6{}), binary.Size(bpfSessionValueV6{}), conntrackValueSizeV6},
+	}
+	for _, tc := range cases {
+		if int(tc.native) != tc.want {
+			t.Errorf("unsafe.Sizeof(%s) = %d, want %d (on-map conntrack ABI value_size)", tc.name, tc.native, tc.want)
+		}
+		// The load-bearing #6082 assertion: encoding/binary's field-sum size
+		// must equal the native size, or cilium/ebpf's sysenc falls off the
+		// zero-copy path and mis-sizes every batch element.
+		if tc.binSize != int(tc.native) {
+			t.Errorf("binary.Size(%s) = %d, want %d (== unsafe.Sizeof); implicit padding makes cilium/ebpf "+
+				"mis-marshal the batch element and fail the HA sync sweep (#6082) — declare pads explicitly",
+				tc.name, tc.binSize, tc.native)
+		}
+		if tc.binSize != tc.want {
+			t.Errorf("binary.Size(%s) = %d, want %d (kernel value_size)", tc.name, tc.binSize, tc.want)
+		}
+	}
+}
+
+// TestBatchLookupSessionsRoundTrip drives the actual failing #6082 path: it
+// creates real kernel v4/v6 session HASH maps at the on-map ABI value_size,
+// installs entries through the production Set/toBPF path, then reads them back
+// via the batch sweep (BatchIterateSessions / V6). Before the explicit-padding
+// fix this returns "batch lookup sessions: ... doesn't consume all data". Skips
+// on unprivileged CI (no BPF map create); runs on the privileged cluster where
+// #6082 was observed.
+func TestBatchLookupSessionsRoundTrip(t *testing.T) {
+	m := newClearTestManager(t)
+
+	const flows = 400 // spans multiple 256-entry batch chunks
+	for i := uint32(0); i < flows; i++ {
+		v4 := SessionValue{State: 1, Flags: SessFlagSNAT, TCPState: 2, SessionID: uint64(i) + 1, PolicyID: i, AppID: uint16(i)}
+		if err := m.SetSessionV4(clearTestV4Key(i, false), v4); err != nil {
+			t.Fatalf("set v4 %d: %v", i, err)
+		}
+		v6 := SessionValueV6{State: 1, Flags: SessFlagDNAT, TCPState: 2, SessionID: uint64(i) + 1, PolicyID: i, AppID: uint16(i)}
+		if err := m.SetSessionV6(clearTestV6Key(i, false), v6); err != nil {
+			t.Fatalf("set v6 %d: %v", i, err)
+		}
+	}
+
+	got := map[uint32]SessionValue{}
+	if err := m.BatchIterateSessions(func(k SessionKey, v SessionValue) bool {
+		got[binary.BigEndian.Uint32(k.SrcIP[:])] = v
+		return true
+	}); err != nil {
+		t.Fatalf("BatchIterateSessions (the #6082 failing path): %v", err)
+	}
+	if len(got) != flows {
+		t.Fatalf("BatchIterateSessions returned %d sessions, want %d", len(got), flows)
+	}
+	// Spot-check a value survived the marshal round trip with correct field
+	// offsets (a mis-sized element would smear fields across the boundary).
+	if v, ok := got[7]; !ok || v.SessionID != 8 || v.PolicyID != 7 || v.Flags != SessFlagSNAT || v.AppID != 7 {
+		t.Fatalf("v4 flow 7 round-trip mismatch: %+v (ok=%v)", v, ok)
+	}
+
+	gotV6 := map[uint32]SessionValueV6{}
+	if err := m.BatchIterateSessionsV6(func(k SessionKeyV6, v SessionValueV6) bool {
+		gotV6[binary.BigEndian.Uint32(k.SrcIP[12:])] = v
+		return true
+	}); err != nil {
+		t.Fatalf("BatchIterateSessionsV6 (the #6082 failing path): %v", err)
+	}
+	if len(gotV6) != flows {
+		t.Fatalf("BatchIterateSessionsV6 returned %d sessions, want %d", len(gotV6), flows)
+	}
+	if v, ok := gotV6[7]; !ok || v.SessionID != 8 || v.PolicyID != 7 || v.Flags != SessFlagDNAT || v.AppID != 7 {
+		t.Fatalf("v6 flow 7 round-trip mismatch: %+v (ok=%v)", v, ok)
+	}
+
+	// Single-entry Lookup (GetSessionV4/V6) shares the same sysenc path.
+	if v, err := m.GetSessionV4(clearTestV4Key(9, false)); err != nil || v.SessionID != 10 {
+		t.Fatalf("GetSessionV4 flow 9: v=%+v err=%v", v, err)
+	}
+	if v, err := m.GetSessionV6(clearTestV6Key(9, false)); err != nil || v.SessionID != 10 {
+		t.Fatalf("GetSessionV6 flow 9: v=%+v err=%v", v, err)
 	}
 }
 

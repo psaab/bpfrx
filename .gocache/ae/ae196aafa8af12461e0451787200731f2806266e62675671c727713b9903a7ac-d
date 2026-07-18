@@ -1,0 +1,8 @@
+./align.go
+./attribute.go
+./conn.go
+./conn_linux.go
+./debug.go
+./doc.go
+./errors.go
+./message.go

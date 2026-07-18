@@ -947,9 +947,12 @@ fn parse_term(
         count: snap.count.clone(),
         has_count: !snap.count.is_empty(),
         log: snap.log,
-        policer_name: snap.policer.clone(),
+        // #5444: intern the modifier strings into `Arc<str>` once at compile
+        // time (mirrors `forwarding_class`) so per-packet propagation into the
+        // FilterResult accumulator is a refcount bump, not a String heap copy.
+        policer_name: Arc::<str>::from(snap.policer.as_str()),
         three_color_policer: three_color_policers.get(&snap.policer).cloned(),
-        routing_instance: snap.routing_instance.clone(),
+        routing_instance: Arc::<str>::from(snap.routing_instance.as_str()),
         forwarding_class: Arc::<str>::from(snap.forwarding_class.as_str()),
         dscp_rewrite,
         counter: Arc::new(FilterTermCounter::default()),

@@ -231,16 +231,46 @@ pub(crate) fn deterministic_indices_v4(
     Some((ip_idx, block_idx))
 }
 
+/// #5660: O(1) reverse index for a deterministic-NAT external pool. Maps each
+/// external pool IPv4 address to its position in the ordered `pool_v4` list —
+/// the SAME index the forward path selects with `pool_v4[ip_idx]`. It replaces
+/// the reverse path's `pool_v4.iter().position()` linear scan (up to
+/// `MAX_POOL_PREFIX_HOSTS` = 65536 addresses) with a single hash lookup.
+///
+/// The pool is an ARBITRARY, possibly non-contiguous ordered address list (the
+/// NAT64 path builds it by parsing configured pool strings, and a source-NAT
+/// pool may span several disjoint ranges), so `ip_idx` is a POSITION in the
+/// list, not an arithmetic offset from a base — a direct `translated_ip -
+/// pool_base` subtraction would be wrong. Build this ONCE at prefix/rule build
+/// time with [`build_pool_reverse_index`] and reuse it for every reverse
+/// lookup; rebuilding it per lookup is O(N) again (and allocates). First
+/// occurrence of a (pathologically) duplicated pool address wins, exactly
+/// mirroring the `position()` first-match semantics it replaces.
+pub(crate) type PoolReverseIndex = FxHashMap<Ipv4Addr, u32>;
+
+/// #5660: build the [`PoolReverseIndex`] from an ordered deterministic-NAT
+/// external pool. First-match wins for a duplicated address (matches the
+/// `position()` scan this replaces).
+pub(crate) fn build_pool_reverse_index(pool_v4: &[Ipv4Addr]) -> PoolReverseIndex {
+    let mut index = FxHashMap::default();
+    index.reserve(pool_v4.len());
+    for (idx, &addr) in pool_v4.iter().enumerate() {
+        index.entry(addr).or_insert(idx as u32);
+    }
+    index
+}
+
 /// #4559: reverse a deterministic translated `(external pool IP, port)` back to
 /// the subscriber's internal IPv4 with NO per-flow state — the CGN-compliance
-/// property that motivates deterministic NAT. `pool_v4` is the rule's ordered
-/// external-address list (same order the forward path indexes); `port_low` is
-/// the pool's low port. Returns `None` when the tuple does not fall in the
-/// deterministic space (unknown external IP, port below `port_low`, or a
-/// block/subscriber index out of range).
+/// property that motivates deterministic NAT. `pool_index` is the pool's O(1)
+/// reverse index ([`build_pool_reverse_index`], keyed by the same ordered
+/// external-address list the forward path indexes); `port_low` is the pool's
+/// low port. Returns `None` when the tuple does not fall in the deterministic
+/// space (unknown external IP, port below `port_low`, or a block/subscriber
+/// index out of range).
 pub(crate) fn reverse_deterministic_v4(
     params: &DeterministicV4,
-    pool_v4: &[Ipv4Addr],
+    pool_index: &PoolReverseIndex,
     port_low: u16,
     translated_ip: Ipv4Addr,
     translated_port: u16,
@@ -248,7 +278,7 @@ pub(crate) fn reverse_deterministic_v4(
     if params.block_size == 0 {
         return None;
     }
-    let ip_idx = pool_v4.iter().position(|&a| a == translated_ip)?;
+    let ip_idx = *pool_index.get(&translated_ip)?;
     if translated_port < port_low {
         return None;
     }
@@ -257,7 +287,7 @@ pub(crate) fn reverse_deterministic_v4(
     if block_idx >= params.blocks_per_ip as u32 {
         return None;
     }
-    let sub_idx = (ip_idx as u32)
+    let sub_idx = ip_idx
         .checked_mul(params.blocks_per_ip as u32)?
         .checked_add(block_idx)?;
     if sub_idx >= params.host_count {
@@ -371,16 +401,17 @@ pub(crate) fn deterministic_indices_v6(
 
 /// #4559: reverse a deterministic translated `(external IPv4 pool address,
 /// port)` back to the subscriber's IPv6 prefix with NO per-flow state — the
-/// CGN-compliance property that motivates deterministic NAPT64. `pool_v4` is
-/// the prefix's ordered external-address list (same order the forward path
-/// indexes); `port_low` is the allocator's low port. The recovered address is
-/// the subscriber PREFIX (network base + subscriber word, trailing
-/// interface-identifier bytes left as the base's — zero for a network base):
-/// the deterministic unit is the subscriber prefix, not the full /128 host.
-/// Returns `None` when the tuple does not fall in the deterministic space.
+/// CGN-compliance property that motivates deterministic NAPT64. `pool_index` is
+/// the prefix's O(1) reverse index ([`build_pool_reverse_index`], keyed by the
+/// same ordered external-address list the forward path indexes); `port_low` is
+/// the allocator's low port. The recovered address is the subscriber PREFIX
+/// (network base + subscriber word, trailing interface-identifier bytes left as
+/// the base's — zero for a network base): the deterministic unit is the
+/// subscriber prefix, not the full /128 host. Returns `None` when the tuple
+/// does not fall in the deterministic space.
 pub(crate) fn reverse_deterministic_v6(
     params: &DeterministicV6,
-    pool_v4: &[Ipv4Addr],
+    pool_index: &PoolReverseIndex,
     port_low: u16,
     translated_ip: Ipv4Addr,
     translated_port: u16,
@@ -388,7 +419,7 @@ pub(crate) fn reverse_deterministic_v6(
     if params.block_size == 0 {
         return None;
     }
-    let ip_idx = pool_v4.iter().position(|&a| a == translated_ip)?;
+    let ip_idx = *pool_index.get(&translated_ip)?;
     if translated_port < port_low {
         return None;
     }
@@ -397,7 +428,7 @@ pub(crate) fn reverse_deterministic_v6(
     if block_idx >= params.blocks_per_ip as u32 {
         return None;
     }
-    let sub_idx = (ip_idx as u32)
+    let sub_idx = ip_idx
         .checked_mul(params.blocks_per_ip as u32)?
         .checked_add(block_idx)?;
     if sub_idx >= params.host_count {
@@ -499,9 +530,20 @@ impl AddressOccupancy {
         (off < self.range).then_some(off)
     }
 
+    /// Map a bitmap `offset` back to its wire port. #5660: the offset is
+    /// range-checked before the `u32 -> u16` narrowing so an out-of-range value
+    /// is REJECTED (`None`) rather than silently truncated into a valid-looking
+    /// but WRONG port. `offset < range` guarantees `port_low + offset <=
+    /// port_high <= u16::MAX`, so the cast neither truncates nor overflows; a
+    /// bare `offset as u16` would wrap (e.g. `65536 + k` -> `k`) and forge a
+    /// port `port_low + k` inside the pool. Callers on the claim path already
+    /// hold `offset < range`, so this returns `Some` for every legitimate claim.
     #[inline]
-    fn port_of(&self, offset: u32) -> u16 {
-        self.port_low + offset as u16
+    fn port_of(&self, offset: u32) -> Option<u16> {
+        if offset >= self.range {
+            return None;
+        }
+        Some(self.port_low + offset as u16)
     }
 
     /// CAS-set the bit at `offset`. Returns true iff this call transitioned it
@@ -558,7 +600,8 @@ impl AddressOccupancy {
             // (fresh), but an out-of-band occupant (reserve/persistent/HA) may
             // have set it — then CAS fails and we advance to the next offset.
             if self.claim_offset(cur) {
-                return Some(self.port_of(cur));
+                // `cur < self.range` (checked above), so `port_of` is `Some`.
+                return self.port_of(cur);
             }
         }
 
@@ -787,6 +830,18 @@ impl PortAllocator {
             },
             None => false,
         }
+    }
+
+    /// Test-only: map a bitmap `offset` to its port on pool address
+    /// `addr_index`, exercising the #5660 range-checked `port_of`. Returns
+    /// `None` for an unknown address OR an out-of-range offset (the value a bare
+    /// `offset as u16` would silently truncate).
+    #[cfg(test)]
+    pub(super) fn debug_port_of(&self, addr_index: usize, offset: u32) -> Option<u16> {
+        self.shared
+            .occupancy
+            .get(addr_index)
+            .and_then(|occ| occ.port_of(offset))
     }
 
     /// Test-only: total occupied ports across all pool addresses.

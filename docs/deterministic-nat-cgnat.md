@@ -255,6 +255,14 @@ subscriber = ntohl(host_base) + sub_idx        # subscriber IP
 This allows ISP logging of just `(public_ip, port_range, subscriber)` tuples
 at pool configuration time, instead of per-session SNAT logs.
 
+`lookup(public_ip)` is an O(1) hash into a reverse index built ONCE from the
+ordered pool (`build_pool_reverse_index`, #5660), not a per-lookup linear scan
+of the pool (which could be up to `MAX_POOL_PREFIX_HOSTS` = 65536 addresses on
+the reverse/session-miss cold path). The pool is an arbitrary, possibly
+non-contiguous ordered list — `ip_idx` is a POSITION in that list, so a direct
+`public_ip - pool_base` subtraction would be wrong; the index maps each pool
+address to the same position the forward path selects with `pool_v4[ip_idx]`.
+
 ## Userspace Dataplane Implementation (#4559)
 
 Both the IPv4 (mode 1) and the IPv6/NAPT64 (mode 2) paths are implemented in the
@@ -270,7 +278,7 @@ reused while a session is alive.
 | `pkg/dataplane/userspace/nat_source.go` | `deterministicSourceNATFields()` precomputes `mode`/`block_size`/`blocks_per_ip`/`host_base` (host-order u32)/`host_count` from the pool + the defaulted port range, and stamps them on `SourceNATRuleSnapshot`. IPv4 host → mode 1; an IPv6 host takes the NAT64 (mode 2) path below, not this one. |
 | `pkg/dataplane/userspace/protocol.go` | `SourceNATRuleSnapshot` gains the five additive `deterministic_*` wire fields (omitempty, #1961 skew-safe). |
 | `userspace-dp/src/protocol/nat.rs` | Rust mirror of the wire fields (`#[serde(default)]` — an old control plane omits them → round-robin). |
-| `userspace-dp/src/nat/allocator.rs` | `DeterministicV4` params; `deterministic_indices_v4()` (subscriber IPv4 → `(ip_idx, block_idx)`); `allocate_deterministic_v4()` (claims the first free port in the subscriber's block against the live owner map, collision-free); `reverse_deterministic_v4()` (`(external IP, port)` → subscriber IPv4, no per-flow state). A deterministic allocation is NOT recycled on release (its block is re-scanned directly), so a deterministic-only pool never grows the recycle queue. |
+| `userspace-dp/src/nat/allocator.rs` | `DeterministicV4` params; `deterministic_indices_v4()` (subscriber IPv4 → `(ip_idx, block_idx)`); `allocate_deterministic_v4()` (claims the first free port in the subscriber's block against the live owner map, collision-free); `reverse_deterministic_v4()` (`(external IP, port)` → subscriber IPv4, no per-flow state — the external-IP→`ip_idx` step is an O(1) `PoolReverseIndex` hash built once by `build_pool_reverse_index()`, #5660, not a per-lookup pool scan). A deterministic allocation is NOT recycled on release (its block is re-scanned directly), so a deterministic-only pool never grows the recycle queue. |
 | `userspace-dp/src/nat/source.rs` | Builds `SourceNatRule.deterministic_v4` from the snapshot (mode 1 only) and routes a deterministic-pool match through `allocate_deterministic_v4` instead of the round-robin allocator. An out-of-range subscriber fails CLOSED (`DeterministicSubscriberOutOfRange`) rather than silently round-robining. |
 
 ### Mode 2 (IPv6 subscriber / NAPT64, NAT64 forward path)
@@ -280,7 +288,7 @@ reused while a session is alive.
 | `pkg/dataplane/userspace/nat64.go` | `deterministicNAT64V6Fields()` computes `block_size`/`blocks_per_ip` (against the FIXED NAT64 range)/`host_prefix_len` (32 or 64)/`host_base_v6` from the referenced source pool, and `buildNAT64Snapshots` stamps them on `NAT64RuleSnapshot`. Only a `/32`-or-`/64` IPv6 host referenced by a NAT64 rule-set yields the params; anything else stays zero (round-robin + advisory). |
 | `pkg/dataplane/userspace/protocol.go` | `NAT64RuleSnapshot` gains the four additive `deterministic_*` wire fields (omitempty, #1961 skew-safe). |
 | `userspace-dp/src/protocol/nat.rs` | Rust mirror of the four NAT64 wire fields (`#[serde(default)]`). |
-| `userspace-dp/src/nat/allocator.rs` | `DeterministicV6` params; `deterministic_indices_v6()` (IPv6 subscriber → `(ip_idx, block_idx)` from the 32-bit word after the prefix — offset 4 for `/32`, offset 8 for `/64`; #4863 rejects sources whose prefix bytes before the subscriber word differ from `host_base`, so an out-of-prefix source sharing the subscriber word fails CLOSED instead of stealing the in-prefix subscriber's block); `allocate_deterministic_v6()` (mirrors the v4 claim, collision-free, not recycled); `reverse_deterministic_v6()` (`(external IPv4, port)` → subscriber IPv6 prefix, no per-flow state). |
+| `userspace-dp/src/nat/allocator.rs` | `DeterministicV6` params; `deterministic_indices_v6()` (IPv6 subscriber → `(ip_idx, block_idx)` from the 32-bit word after the prefix — offset 4 for `/32`, offset 8 for `/64`; #4863 rejects sources whose prefix bytes before the subscriber word differ from `host_base`, so an out-of-prefix source sharing the subscriber word fails CLOSED instead of stealing the in-prefix subscriber's block); `allocate_deterministic_v6()` (mirrors the v4 claim, collision-free, not recycled); `reverse_deterministic_v6()` (`(external IPv4, port)` → subscriber IPv6 prefix, no per-flow state — same O(1) `PoolReverseIndex` for the external-IP→`ip_idx` step, #5660). |
 | `userspace-dp/src/nat64.rs` | `Nat64Prefix` gains `deterministic_v6: Option<DeterministicV6>`, built from the snapshot at `from_snapshots` time (`host_count` derived from the parsed pool size, pool-bounded). `allocate_source` routes through `allocate_deterministic_v6` when set. An out-of-range subscriber fails CLOSED. |
 | `pkg/config/compiler_validate_warn.go` | The #4560 advisory is narrowed to residual UNENFORCEABLE deterministic pools only (an IPv6 host not referenced by a NAT64 rule-set, or an unsupported prefix length); an enforced mode-1 or mode-2 pool no longer warns (`deterministicIPv4Enforced` / `deterministicNAPT64Enforced`). |
 

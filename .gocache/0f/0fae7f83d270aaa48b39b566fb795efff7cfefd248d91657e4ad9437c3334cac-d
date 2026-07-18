@@ -1,0 +1,10 @@
+./doc.go
+./fd.go
+./fd_other.go
+./pinning_other.go
+./ptr.go
+./ptr_64.go
+./signals.go
+./syscall.go
+./syscall_other.go
+./types.go

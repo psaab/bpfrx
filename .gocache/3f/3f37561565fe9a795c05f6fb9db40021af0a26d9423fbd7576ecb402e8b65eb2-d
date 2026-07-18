@@ -1,0 +1,5 @@
+./doc.go
+./reader.go
+./reader_other.go
+./ring.go
+./ring_other.go
