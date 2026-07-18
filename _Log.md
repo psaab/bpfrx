@@ -1,3 +1,25 @@
+## 2026-07-18 — #6103: regen stale wire_invariant fixture (missing #5623/#5625 nat64 fields)
+
+- **Timestamp**: 2026-07-18 03:53 PDT (fix/6103-wire-fixture)
+- **Action**: `protocol::wire_invariant_default_specimens` failed on a
+  pristine origin/master. The golden fixture
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json` was stale: the
+  `binding_status` specimen was missing the two `BindingStatus` counter
+  fields added by #5623 (`nat64_ineligible_source`) and #5625
+  (`nat64_exthdr_ineligible`) — those feature PRs added the serde fields
+  (`src/protocol/binding.rs`) but never regenerated the wire golden.
+  Regenerated the fixture via the sanctioned mechanism
+  `XPF_PROTOCOL_WIRE_REGEN=1 cargo test --release --bin xpf-userspace-dp
+  wire_invariant_default_specimens`. Confirmed the diff is EXACTLY the two
+  new `nat64_exthdr_ineligible` / `nat64_ineligible_source` keys (BTreeMap
+  alpha order) and nothing else, so the invariant stays meaningful. The
+  event_stream backpressure half of #6103 is a genuine (deterministic,
+  5/5) failure root-caused to this host's 64 MiB socket send buffer vs the
+  test's ~48 MiB pump — deferred to separate work, NOT bundled here.
+- **File(s)**: userspace-dp/tests/fixtures/protocol_wire_v1.json, _Log.md
+- **Validation**: `cargo test --release wire_invariant` GREEN; full
+  `protocol::` module 75 passed / 0 failed.
+
 ## 2026-07-18 — #5801: day-2 slow-path TUN MTU reconcile
 
 - **Timestamp**: 2026-07-18 (fix/5801-slowpath-mtu-reconcile)
