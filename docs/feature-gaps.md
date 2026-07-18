@@ -154,8 +154,16 @@ feed-backed binding now merges that member's live feed prefixes into the set's
 address-book row (the feed-aware `expandBookNameRecursive`) — a `deny
 <set-containing-a-feed>` enforces the feed portion instead of under-denying it,
 and a DIRECT feed reference now also COMMITS under strict validation (the #2008
-`bookNames` one-liner). The NAT path's recursive (feed-member-in-an-address-set)
-resolution remains a tracked residual (it was deliberately out of #3294 scope).
+`bookNames` one-liner). #4925 closes the last piece of this parity: the NAT
+path's recursive (feed-member-in-an-address-set) case is no longer a residual —
+`resolveNATAddressNamePrefixes` now resolves a NAT `match
+source-address-name` / `match destination-address-name` reference through the
+SAME `expandBookNameRecursive` expander, so a NAT rule scoped to an address-SET
+whose member is a feed (feed-only OR mixed static+feed) resolves that nested
+member's live feed prefixes exactly as the policy path does. Fail-closed is
+preserved: a set whose only member is a genuinely unresolvable non-feed token
+still yields no match (the raw book-name token keeps the constraint non-empty
+and unmatchable) rather than widening to match-any.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|

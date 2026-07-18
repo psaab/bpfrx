@@ -1,3 +1,32 @@
+## 2026-07-18 — #4925: NAT feed-resolves nested address-set members in match address-name
+
+- **Timestamp**: 2026-07-18 (fix/4925-nat-feed-nested-set)
+- **Action**: Closed the fail-closed parity gap where a NAT `match
+  {source,destination}-address-name` reference to an address-SET whose MEMBER
+  is a dynamic-address feed resolved to NO feed prefixes (static
+  `resolveUserspaceAddressBookEntry` never consulted feedOverlay for nested
+  members and poisoned the whole set on the unresolvable feed member;
+  feedOverlay is keyed by the direct feed name, not the containing set). Rewired
+  `resolveNATAddressNamePrefixes` to reuse the SAME feed-aware recursive
+  `expandBookNameRecursive` the security-policy path uses (#3294 SSOT), sorting +
+  deduping the union to keep the static resolver's output shape (the #2416
+  exact-slice pins stay byte-identical). Fail-closed preserved: an empty set /
+  a set whose only member is a genuinely unresolvable non-feed token still
+  yields no match (raw book-name token, unmatchable), never widening to
+  match-any. Added fail-on-revert tests
+  `Test_nat_source_address_name_set_with_feed_member_resolved_4925` /
+  `Test_nat_dest_address_name_set_with_feed_member_resolved_4925` (SNAT+DNAT,
+  source+destination, feed-only AND mixed static+feed sets) plus a fail-closed
+  pin `Test_nat_address_name_set_unresolvable_nonfeed_member_fails_closed_4925`.
+  Validation: full pkg/dataplane/userspace suite green; 4925 tests 3x no flake;
+  gofmt + go vet clean. Parent-RED: reverting the resolver to the static
+  expander makes exactly the two "resolved" tests RED (target-count 2, 0
+  collateral) while the fail-closed pin + all pre-existing #3303/#3425/#2416
+  tests stay green. NOT HA (config compilation; unit-provable, no cluster smoke).
+- **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_feed_nested_set_4925_test.go,
+  docs/feature-gaps.md
+
 ## 2026-07-18 — #6137 fold: scheduler fail-closed honest docs + gauge SSOT wiring + gauge test (#5669)
 
 - **Timestamp**: 2026-07-18 (fix/5669-scheduler-failopen-bound)
