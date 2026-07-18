@@ -563,6 +563,15 @@ impl PolicyRuleCounter {
         }
     }
 
+    /// #5445 (test-only): the shared packet total, for asserting that the
+    /// established-session hit-count still increments when the bound counter is
+    /// resolved BY BORROW from the session table (`bound_policy_counter_for`)
+    /// after the per-packet `SessionLookup` stopped cloning the counter `Arc`.
+    #[cfg(test)]
+    pub(crate) fn test_packet_count(&self) -> u64 {
+        self.packets.load(Ordering::Relaxed)
+    }
+
     /// #3395: the stable rule identity this counter belongs to (empty for a
     /// `Default` placeholder). See the `rule_id` field doc.
     pub(crate) fn rule_id(&self) -> &str {
