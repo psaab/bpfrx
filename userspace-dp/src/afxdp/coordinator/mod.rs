@@ -264,6 +264,17 @@ pub struct Coordinator {
     /// release builds.
     #[cfg(test)]
     pub(crate) last_quiesce_ms: u64,
+    /// #4952 test seam (per-instance, NOT a process-global): under
+    /// `cfg(test)`, `bring_up_workers` treats a positive value as N forced
+    /// worker-thread spawn failures — it declines to call
+    /// `spawn_supervised_worker` and synthesizes the EAGAIN/ENOMEM
+    /// `std::io::Error` a real `pthread_create` returns under resource
+    /// exhaustion, decrementing the counter for each planned worker. This
+    /// exercises the POST-TEARDOWN fail-closed propagation deterministically
+    /// (a real spawn failure is not provokable in-process). Always 0 in
+    /// release builds; per-instance so parallel tests never race.
+    #[cfg(test)]
+    pub(crate) force_worker_spawn_fail: u32,
     pub(crate) last_reconcile_stage: String,
     pub(crate) poll_mode: crate::PollMode,
     pub(crate) event_stream: Option<crate::event_stream::EventStreamSender>,
@@ -322,6 +333,8 @@ impl Coordinator {
             reconcile_quiesce_count: 0,
             #[cfg(test)]
             last_quiesce_ms: 0,
+            #[cfg(test)]
+            force_worker_spawn_fail: 0,
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,

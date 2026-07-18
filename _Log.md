@@ -53520,3 +53520,41 @@ top.
   userspace-dp/src/server/tests.rs,
   userspace-dp/src/server/README.md,
   docs/userspace-dataplane-architecture.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #4952 — fail closed on POST-teardown worker-spawn failure.
+  `bring_up_workers` (afxdp/coordinator/reconcile/bringup.rs) runs after
+  `tear_down` stopped the old workers; a per-worker `spawn_supervised_worker`
+  (→ pthread_create EAGAIN/ENOMEM) left a queue set with no XSK-bound worker
+  yet the old code returned `()`, only logged, and UNCONDITIONALLY overwrote
+  `last_reconcile_stage` with `spawned:workers=..` — so reconcile returned
+  Ok, the handler acked ok=true AND persisted the broken snapshot (silent
+  forwarding outage, no retry). Fix: `bring_up_workers` now returns
+  `Result<(), String>` — on the FIRST spawn failure it aborts remaining
+  launches, PRESERVES the `spawn_worker_failed:<id>:<err>` stage, skips the
+  aux-thread bring-up, and returns the stage. `reconcile` maps it to the new
+  `ReconcileError::WorkerSpawn` (the only variant raised AFTER teardown).
+  snapshot.rs `apply` full-apply + same-plan-needs_reconcile legs special-case
+  it: ok=false + "worker spawn failed after teardown (...)", refresh_status to
+  the real (broken) per-binding state (no existing_bindings restore), roll the
+  baseline back to the prior snapshot, return BEFORE persist. Sibling handlers
+  (binding/queue/rebind/forwarding, #6134/#6135) already fail closed on any
+  Err — unchanged. Minimal fail-close, NOT full pre-teardown preflight (a real
+  pthread_create can't be probed without spawning, and old workers must free
+  the XSK queue bindings first) — noted as a follow-up. Per-instance
+  `#[cfg(test)] force_worker_spawn_fail` seam. Tests:
+  `reconcile_post_teardown_worker_spawn_failure_fails_closed_4952`
+  (coordinator: Err(WorkerSpawn) + stage preserved) and
+  `post_teardown_spawn_failure_fails_closed_no_persist_4952` (handler:
+  ok=false + state file NOT written + baseline restored + stage preserved).
+  Parent-RED verified: neutralize the propagation → both tests RED (2 failed /
+  0 passed), target-count 1 each. NOT HA — unit-provable via spawn-failure
+  injection; no cluster smoke.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/server/handlers/snapshot.rs,
+  userspace-dp/src/server/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/server/README.md

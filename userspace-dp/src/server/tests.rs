@@ -1114,6 +1114,141 @@ fn apply_snapshot_same_plan_needs_reconcile_build_failure_rejects_and_keeps_prio
     );
 }
 
+/// #4952 POST-TEARDOWN worker-spawn failure fails closed and does NOT
+/// persist. The same-plan-needs-reconcile leg reconciles the ALREADY
+/// registered binding directly (no replan_queues), so with all mandatory
+/// pins open and a buildable snapshot the reconcile clears the pre-teardown
+/// integrity legs, tears down the old workers, and REACHES the fallible
+/// worker spawn. The per-instance `force_worker_spawn_fail` seam forces that
+/// spawn to return EAGAIN/ENOMEM (a real pthread_create failure is not
+/// provokable in-process), leaving the queue set with NO XSK-bound worker.
+///
+/// The handler MUST: (a) report ok=false with a descriptive error, (b) NOT
+/// persist the broken snapshot as the boot baseline (persist_state stays
+/// false -> the state file is never written), and (c) the coordinator's
+/// `last_reconcile_stage` MUST retain the `spawn_worker_failed:..`
+/// descriptor (NOT `spawned:workers=..`).
+///
+/// Fail-on-revert: before #4952 `bring_up_workers` returned () and swallowed
+/// the spawn error (overwriting the stage with `spawned:..`), so
+/// `afxdp.reconcile` returned Ok, the handler acked ok=true, PERSISTED the
+/// snapshot (the state file appears), and advanced the stored baseline to
+/// gen 2. Every assertion below flips.
+#[test]
+fn post_teardown_spawn_failure_fails_closed_no_persist_4952() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    // Prior snapshot deferred workers -> previous_defer_workers=true makes
+    // same_plan_apply_needs_binding_reconcile return true on the next
+    // (non-defer) same-plan apply. Tunnel-only interface set -> the plan
+    // key is address-independent, so gen-1 and gen-2 are same-plan.
+    let prior = ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 1,
+        fib_generation: 1,
+        generated_at: chrono::Utc::now(),
+        defer_workers: true,
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![tunnel_iface_3789("10.0.0.1/24")],
+        ..ConfigSnapshot::default()
+    };
+
+    // Armed + supported + one runnable binding (registered, ifindex>0) so
+    // the needs-reconcile gate fires AND bring_up plans exactly one worker.
+    let status = ProcessStatus {
+        forwarding_armed: true,
+        capabilities: forwarding_caps(),
+        last_snapshot_generation: 1,
+        last_fib_generation: 1,
+        bindings: vec![BindingStatus {
+            slot: 0,
+            registered: true,
+            ifindex: 10,
+            ..BindingStatus::default()
+        }],
+        ..ProcessStatus::default()
+    };
+
+    let state = Arc::new(Mutex::new(ServerState {
+        status,
+        snapshot: Some(prior),
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }));
+
+    // Force the single planned worker's spawn to fail on the post-teardown
+    // path (the destructive step the fix guards).
+    state.lock().expect("state").afxdp.force_worker_spawn_fail = 1;
+
+    // New same-plan apply: defer_workers=false, VALID address so the
+    // forwarding build SUCCEEDS and the reconcile reaches the worker spawn.
+    let mut request = req("apply_snapshot");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 2,
+        fib_generation: 2,
+        generated_at: chrono::Utc::now(),
+        defer_workers: false,
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![tunnel_iface_3789("10.0.0.1/24")],
+        ..ConfigSnapshot::default()
+    });
+
+    let state_file = unique_state_file("spawn_fail_4952");
+    assert!(
+        !std::path::Path::new(&state_file).exists(),
+        "precondition: state file must not exist before the request"
+    );
+
+    let response = run_request_on_file(state.clone(), request, &state_file);
+
+    // (a) fail closed with a non-empty, descriptive error.
+    assert!(
+        !response.ok,
+        "a post-teardown worker-spawn failure must report ok=false"
+    );
+    assert!(
+        !response.error.is_empty() && response.error.contains("worker spawn failed"),
+        "unexpected error: {}",
+        response.error
+    );
+
+    // (b) persist_state was NOT set -> the state file was never written.
+    assert!(
+        !std::path::Path::new(&state_file).exists(),
+        "a post-teardown spawn failure must NOT persist the broken snapshot as the boot baseline"
+    );
+
+    let guard = state.lock().expect("state");
+    // The prior (gen 1, deferred) snapshot is still the boot baseline.
+    assert_eq!(
+        guard.snapshot.as_ref().map(|s| s.generation),
+        Some(1),
+        "the rejected snapshot must not overwrite the persisted baseline"
+    );
+    assert!(
+        guard.snapshot.as_ref().is_some_and(|s| s.defer_workers),
+        "the prior (deferred) snapshot must be restored intact"
+    );
+    assert_eq!(
+        guard.status.last_snapshot_generation, 1,
+        "rejected apply must not bump last_snapshot_generation"
+    );
+    // (c) last_reconcile_stage retains the spawn_worker_failed descriptor.
+    assert!(
+        guard
+            .afxdp
+            .last_reconcile_stage
+            .starts_with("spawn_worker_failed:"),
+        "the spawn-failure stage must be preserved (not overwritten with spawned:..), got {:?}",
+        guard.afxdp.last_reconcile_stage
+    );
+
+    let _ = std::fs::remove_file(&state_file);
+}
+
 // --- apply_snapshot deferred-activation integrity build (#5171) ---------
 
 /// #5171 fail-closed DEFERRED apply — MISSING MANDATORY MAP PIN: a

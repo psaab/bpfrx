@@ -131,3 +131,31 @@ Differences that matter (#1881):
   no split-brain (validation ahead of a stale forwarding table), no
   deleted-neighbor blackhole, no `ok=true` on a rejected snapshot.
   Distinct from #2484 (full-apply teardown) and #2916 (queue replan).
+- **A POST-teardown worker-spawn failure fails closed (#4952).** The
+  #2440/#2484/#3789 fail-closed legs above all abort BEFORE `tear_down`,
+  so the prior workers stay live. `bring_up_workers` runs AFTER teardown:
+  its per-worker `spawn_supervised_worker` (→ `pthread_create`) can return
+  EAGAIN/ENOMEM under resource exhaustion, and the old workers are already
+  gone — a queue set left with no XSK-bound worker is a silent forwarding
+  outage. Pre-#4952 `bring_up_workers` returned `()`, only LOGGED the
+  failure + recorded an exception, then UNCONDITIONALLY overwrote
+  `last_reconcile_stage` with `spawned:workers=..` and returned success —
+  so `reconcile` returned `Ok(())`, the control handler acked `ok=true`,
+  and PERSISTED the broken snapshot as the boot baseline (no retry). Now
+  `bring_up_workers` returns `Result<(), String>`: on the FIRST spawn
+  failure it ABORTS the remaining launches (the data plane is already
+  broken; more XSK-bound workers cannot restore forwarding and only widen
+  the resource pressure), PRESERVES the `spawn_worker_failed:<id>:<err>`
+  stage (no `spawned:..` overwrite), skips the auxiliary-thread bring-up,
+  and returns the stage. `reconcile` maps it to
+  `ReconcileError::WorkerSpawn` — the ONE `ReconcileError` variant raised
+  AFTER teardown (the data plane HAS moved; there is no prior-state restore
+  that brings the torn-down workers back, only fail-closed bookkeeping +
+  a retry/last-good reconcile). Full pre-teardown preflight of the spawn is
+  not tractable (a real `pthread_create` cannot be probed without spawning,
+  and the old workers must free the XSK queue bindings first), so this is
+  the minimal fail-closed guarantee: do not persist a known-broken
+  snapshot. A per-instance `#[cfg(test)] force_worker_spawn_fail` seam
+  drives the regression tests (coordinator-level
+  `reconcile_post_teardown_worker_spawn_failure_fails_closed_4952` +
+  handler-level `post_teardown_spawn_failure_fails_closed_no_persist_4952`).
