@@ -1,3 +1,64 @@
+## 2026-07-18 — #6130: undecodable session frame must break the resync/reconnect loop, not withhold the ACK
+
+- **Timestamp**: 2026-07-18 (fix/5483-eventstream-decode-syncbreak, follow-on)
+- **Action**: The first #5483 fix (b9cb3eb34) reused the #2874 gap mechanics
+  verbatim for a decode failure: force a resync, WITHHOLD the ACK, drop the
+  connection. That WEDGED the stream on a PERSISTENTLY-undecodable session frame
+  (codec bug / version-skewed helper). Unlike a gap (frame ABSENT → Rust
+  `replay_buffered` sees `has_gap` and parks a re-baselining barrier), an
+  undecodable frame is PRESENT: the Rust replay buffer re-sends it verbatim and
+  `has_gap` is FALSE, so no barrier parks. Withholding the ACK made the helper
+  re-send the identical frame every reconnect → unbounded busy-loop hammering the
+  shared control socket + slog.Warn flood; worst case a STANDBY (corrective
+  no-op) in pure churn. Fix (#6130): `handleSessionDecodeFailure(seq, *prevSeq)`
+  now ADVANCES the watermark PAST the undecodable frame unconditionally
+  (`markFrameApplied` + prevSeq) and the caller `continue`s (keeps the
+  connection, mirroring the #5362 helper-FullResync path, not the gap path). The
+  ACK then trims the frame (`front.seq <= acked`) so it is never re-sent — one
+  bad frame → exactly one resync; persistent skew → ≤1 resync per
+  `decodeFailureResyncInterval` (2s), the rest counted in
+  `DecodeResyncSuppressed`. Anti-divergence holds: we advance only under cover of
+  a table-truth FullResync (superset of an undecodable OPEN; missed CLOSE
+  degrades to the pre-existing idle-GC self-heal per #2880) — NOT the pre-#5483
+  silent skip. Standby: export early-returns not-primary (cheap no-op) + a
+  decoded delta is itself a no-op there, so advancing loses nothing and cannot
+  spin. Rate-limited resync trigger + WARN (control-socket + log-flood
+  protection). Go-side only. Rewrote the #5483 test to the corrected behavior
+  (advance + connection-survives + recovery frame dispatched) and added
+  `TestEventStreamPersistentUndecodableSessionFramesDoNotLoop_6130` (3 back-to-
+  back undecodable frames → watermark to recovery frame, exactly 1 resync, 2
+  suppressed). Parent-RED verified (target-count 1): reverting the advance +
+  restoring `return` turns both RED via assertion timeout, not a build break.
+  Docs: `docs/session-sync-architecture.md` FullResync section rewritten to state
+  the decode failure does NOT mirror the gap self-heal and how termination is now
+  guaranteed.
+- **File(s)**: `pkg/dataplane/userspace/eventstream.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/eventstream_decode_syncbreak_5483_test.go`,
+  `docs/session-sync-architecture.md`, `_Log.md`
+
+## 2026-07-18 — #5483: undecodable session-sync frame must force a hard sync-break
+
+- **Timestamp**: 2026-07-18 (fix/5483-eventstream-decode-syncbreak)
+- **Action**: The EventStream reader (`pkg/dataplane/userspace/eventstream.go`)
+  handled a COMPLETE-but-undecodable SESSION frame (open/close/update) with
+  `es.DecodeErrors.Add(1); continue` — a silent skip that left the sequence
+  watermark below the hole. A later lossy TELEMETRY frame at seq+1 then only
+  recorded a benign gap, marked itself applied, and let `sendAckIfNeeded`
+  advance the cumulative ACK PAST the unapplied session seq. The Rust replay
+  buffer trims through the ACK watermark (`seq <= acked`), discarding the
+  never-applied session frame, and no later gap fires — the standby silently
+  diverged with no recovery. Fix: route a session-frame decode failure through
+  new `handleSessionDecodeFailure(seq)`, which reuses the #2874 gap sync-break
+  mechanics (bump `SessionSyncResyncs`, call `onFullResync`, return so the reader
+  drops the connection) WITHOUT advancing prevSeq/lastAppliedSeq/ACK past the
+  hole. Scope: SESSION frames only — a telemetry decode failure still skips
+  (best-effort, no HA state). Go-side only; the Rust ACK-trim is watermark-gated
+  and already correct. Docs: `docs/session-sync-architecture.md` FullResync
+  trigger list updated.
+- **File(s)**: `pkg/dataplane/userspace/eventstream.go`,
+  `pkg/dataplane/userspace/eventstream_decode_syncbreak_5483_test.go`,
+  `docs/session-sync-architecture.md`, `_Log.md`
 ## 2026-07-18 — #5146 (security/correctness): NAT64 first-fragment association published pre-commit
 
 - **Timestamp**: 2026-07-18 (fix/5146-nat64-frag-rollback)
