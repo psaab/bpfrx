@@ -51795,3 +51795,36 @@ top.
   unrelated to nat).
 - **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/tests_pool.rs,
   docs/deterministic-nat-cgnat.md, _Log.md
+
+---
+- **Timestamp**: 2026-07-17
+- **Action**: #5622 — `delete_terminal_filtered_session` (session_glue/mod.rs)
+  now performs a FULL-PAIR teardown + allocator release for translated
+  LocalDelivery terminal hits. The pre-fix helper deleted only the resolved
+  key and released no NAT state, so a translated flow's same-worker
+  forward<->reverse COMPANION entry AND its source-NAT/NAT64 pool RESERVATION
+  leaked on every host-inbound / lo0-input-filter / `to-zone junos-host`
+  terminal deny (the three `poll_descriptor` call sites) — the ordinary idle
+  reap and DSCP-filter purge already release per entry.
+- **Fix**: extracted `delete_terminal_half` (release source-NAT + NAT64
+  allocation self-gated on `is_reverse`; delete map/conntrack aliases; drop
+  worker-local + shared entries; queue `DeleteSynced`; emit close delta).
+  `delete_terminal_filtered_session` recovers the companion via
+  `reverse_session_key(key, decision.nat)` (its own inverse) and runs the half
+  teardown for the resolved key AND the companion — freeing the reservation
+  exactly once (reverse release is a no-op; `release_flow` is idempotent), so
+  no double free. Added `forwarding: &ForwardingState` + `now_ns` params to the
+  4 call sites; the DSCP purge dropped its now-redundant explicit release (the
+  helper owns it).
+- **Tests**: `delete_terminal_filtered_session_releases_companion_and_allocator_5622`
+  reserves a real single-address pool port, installs forward+reverse translated
+  LocalDelivery sessions, drives the terminal hit on BOTH directions, and
+  asserts (a) both entries gone and (b) `used_ports == 0`. RED-verified by
+  neutralizing the companion teardown + allocator release (fails at the
+  companion/used_ports asserts). 5x flake check green.
+- **Validation**: `cargo build` clean; session_glue 88 passed, session 175,
+  nat 746, poll_descriptor 90 — all green.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/session_glue/README.md, _Log.md

@@ -1319,10 +1319,12 @@ pub(super) fn poll_binding_process_descriptor(
                                         worker_ctx.shared_forward_wire_sessions,
                                         &worker_ctx.shared_owner_rg_indexes,
                                         worker_ctx.peer_worker_commands,
+                                        worker_ctx.forwarding,
                                         &resolved.key,
                                         resolved.decision,
                                         &resolved.metadata,
                                         resolved.origin,
+                                        now_ns,
                                     );
                                     telemetry.dbg.local += 1;
                                     // #3610/M07: account the host-inbound deny on
@@ -1387,10 +1389,12 @@ pub(super) fn poll_binding_process_descriptor(
                                             worker_ctx.shared_forward_wire_sessions,
                                             &worker_ctx.shared_owner_rg_indexes,
                                             worker_ctx.peer_worker_commands,
+                                            worker_ctx.forwarding,
                                             &resolved.key,
                                             resolved.decision,
                                             &resolved.metadata,
                                             resolved.origin,
+                                            now_ns,
                                         );
                                         telemetry.dbg.local += 1;
                                         telemetry.dbg.policy_deny += 1;
@@ -1441,10 +1445,12 @@ pub(super) fn poll_binding_process_descriptor(
                                 worker_ctx.shared_forward_wire_sessions,
                                 &worker_ctx.shared_owner_rg_indexes,
                                 worker_ctx.peer_worker_commands,
+                                worker_ctx.forwarding,
                                 &resolved.key,
                                 resolved.decision,
                                 &resolved.metadata,
                                 resolved.origin,
+                                now_ns,
                             );
                             telemetry.dbg.local += 1;
                             telemetry.dbg.policy_deny += 1;

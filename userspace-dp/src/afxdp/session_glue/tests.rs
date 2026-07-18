@@ -5864,3 +5864,167 @@ fn refresh_owner_rgs_active_owner_local_delivery_publishes_kernel_local_4805() {
         "owner-active synced LocalDelivery keeps the kernel-local publish path"
     );
 }
+
+// #5622 FAIL-ON-REVERT: a translated LocalDelivery terminal hit (host-inbound
+// deny, lo0 input-filter deny, or `to-zone junos-host` deny on the session-HIT
+// path) must tear down BOTH the forward and the reverse companion session
+// entries AND release the source-NAT pool reservation — matching the ordinary
+// idle reap and the DSCP-filter purge. The pre-#5622 helper deleted ONLY the
+// resolved key and released NO allocator state, so the same-worker companion
+// entry AND the pool port both leaked. This drives the terminal teardown on
+// BOTH a forward hit and a reverse hit (the finding's `K=F` and `K=R` legs) and
+// asserts (a) the companion entry is gone and (b) the allocator reservation is
+// freed. Reverting the fix (companion left installed / pool port not returned)
+// turns the companion + `used_ports` assertions RED.
+#[test]
+fn delete_terminal_filtered_session_releases_companion_and_allocator_5622() {
+    for hit_reverse in [false, true] {
+        // A single-address pool source-NAT rule so the translated flow holds a
+        // real pool port that the teardown must return.
+        let mut forwarding = ForwardingState::default();
+        forwarding.source_nat_rules = crate::nat::parse_source_nat_rules(&[
+            crate::SourceNATRuleSnapshot {
+                name: "pool-snat".to_string(),
+                from_zone: "lan".to_string(),
+                to_zone: "wan".to_string(),
+                source_addresses: vec!["0.0.0.0/0".to_string()],
+                pool_name: "p".to_string(),
+                pool_addresses: vec!["203.0.113.1/32".to_string()],
+                port_low: 1024,
+                port_high: 65535,
+                ..crate::SourceNATRuleSnapshot::default()
+            },
+        ]);
+
+        // Forward: a source-NAT-translated flow that is locally delivered.
+        let fwd_key = test_key();
+        let fwd_nat = NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+            rewrite_src_port: Some(40000),
+            ..NatDecision::default()
+        };
+        let fwd_decision = SessionDecision {
+            resolution: test_local_delivery_decision().resolution,
+            nat: fwd_nat,
+        };
+        let fwd_metadata = test_metadata();
+
+        // Reverse companion: keyed on the return tuple, carrying the reversed
+        // NAT decision + `is_reverse = true` — exactly how the reverse half is
+        // installed in production.
+        let rev_key = reverse_session_key(&fwd_key, fwd_nat);
+        let rev_nat = fwd_nat.reverse(
+            fwd_key.src_ip,
+            fwd_key.dst_ip,
+            fwd_key.src_port,
+            fwd_key.dst_port,
+        );
+        let rev_decision = SessionDecision {
+            resolution: fwd_decision.resolution,
+            nat: rev_nat,
+        };
+        let mut rev_metadata = test_metadata();
+        rev_metadata.is_reverse = true;
+
+        // Reserve the pool port for the forward flow (the reservation the
+        // forward-half teardown's `release_source_nat_allocation` must free).
+        crate::nat::reserve_synced_source_nat_allocation(
+            &forwarding.source_nat_rules,
+            &fwd_key,
+            fwd_nat,
+            false,
+        );
+        assert_eq!(
+            crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports,
+            1,
+            "precondition: the translated forward flow holds one pool port",
+        );
+
+        let mut sessions = SessionTable::new();
+        assert!(sessions.install_with_protocol_with_origin(
+            fwd_key.clone(),
+            fwd_decision,
+            fwd_metadata.clone(),
+            SessionOrigin::LocalMiss,
+            1,
+            PROTO_TCP,
+            TCP_FLAG_SYN,
+        ));
+        assert!(sessions.install_with_protocol_with_origin(
+            rev_key.clone(),
+            rev_decision,
+            rev_metadata.clone(),
+            SessionOrigin::LocalMiss,
+            1,
+            PROTO_TCP,
+            TCP_FLAG_SYN,
+        ));
+        assert!(sessions.entry_with_origin(&fwd_key).is_some());
+        assert!(sessions.entry_with_origin(&rev_key).is_some());
+        let _ = sessions.drain_deltas(16);
+
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+
+        // Drive the terminal hit on the requested direction. Either half may be
+        // the packet that re-evaluates the (now-deny) terminal gate.
+        let (hit_key, hit_decision, hit_metadata) = if hit_reverse {
+            (rev_key.clone(), rev_decision, rev_metadata.clone())
+        } else {
+            (fwd_key.clone(), fwd_decision, fwd_metadata.clone())
+        };
+        delete_terminal_filtered_session(
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &peer_worker_commands,
+            &forwarding,
+            &hit_key,
+            hit_decision,
+            &hit_metadata,
+            SessionOrigin::LocalMiss,
+            2,
+        );
+
+        // (a) BOTH the resolved entry and its same-worker companion are gone.
+        assert!(
+            sessions.entry_with_origin(&fwd_key).is_none(),
+            "hit_reverse={hit_reverse}: forward entry must be torn down",
+        );
+        assert!(
+            sessions.entry_with_origin(&rev_key).is_none(),
+            "hit_reverse={hit_reverse}: reverse companion entry must be torn down",
+        );
+        // (b) the NAT pool reservation is released exactly once (no leak).
+        assert_eq!(
+            crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports,
+            0,
+            "hit_reverse={hit_reverse}: the translated flow's pool port must be freed",
+        );
+        // A single forward-direction Close delta is emitted regardless of which
+        // half took the terminal hit — the reverse-hit path now fires the
+        // forward companion's close (the pre-#5622 helper dropped it when K=R).
+        let deltas = sessions.drain_deltas(16);
+        let closes: Vec<_> = deltas
+            .iter()
+            .filter(|d| d.kind == SessionDeltaKind::Close)
+            .collect();
+        assert_eq!(
+            closes.len(),
+            1,
+            "hit_reverse={hit_reverse}: exactly one forward Close delta expected",
+        );
+        assert_eq!(
+            closes[0].key, fwd_key,
+            "hit_reverse={hit_reverse}: the Close delta is on the forward key",
+        );
+    }
+}
