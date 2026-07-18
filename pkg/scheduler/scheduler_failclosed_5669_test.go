@@ -19,8 +19,11 @@ import (
 //
 // Once the failure streak exceeds RepublishFailClosedAge the scheduler must
 // escalate to fail-closed: emit the one-time alarm AND force every scheduled
-// policy to the INACTIVE (deny) disposition so the permit STOPS permitting,
-// even when its window legitimately reopens, until a republish succeeds again.
+// policy to the INACTIVE (deny) disposition in the authoritative + published
+// state, refusing to reopen it even when its window legitimately reopens, until
+// a republish succeeds again. (This bounds the SILENT fail-open window with a
+// loud alarm + authoritative deny; it does not itself stop packets in a
+// persistently-wedged dataplane — see the scope note below and the README.)
 //
 // RED-on-revert: removing the bounded-age latch in
 // recordRepublishResultLocked makes RepublishFailClosed() never true — the
@@ -100,13 +103,23 @@ func TestScheduler_RepublishFailClosedAfterBoundedAge(t *testing.T) {
 
 	// The permit's window LEGITIMATELY reopens the next day (09:00-17:00),
 	// desired active=true — but enforcement is still wedged, so fail-closed
-	// must REFUSE to publish an ACTIVE permit and keep denying (stop
-	// permitting). This is the packet-path fail-closed: a scheduled permit
-	// does not forward while the dataplane cannot enforce the schedule.
+	// must build an INACTIVE (deny) snapshot and report the permit inactive on
+	// the authoritative state, refusing to reopen it, until a republish
+	// succeeds again.
+	//
+	// Scope note (honest): this asserts the CONTROL-PLANE disposition — the
+	// published snapshot and the authoritative ActiveState/IsActive both say
+	// DENY. It does NOT prove the packet path stops forwarding: that same
+	// snapshot is pushed through the same failing updateFn channel that defines
+	// the streak, so in a persistently-wedged dataplane it never reaches the
+	// helper and the stale permit keeps forwarding until the socket recovers.
+	// The value of fail-closed is the loud alarm + authoritative deny +
+	// deny-lands-first-on-recovery, not packet-path enforcement in a wedged
+	// dataplane (see README "Bounded-age fail-closed").
 	reopen := time.Date(2026, 2, 13, 10, 0, 0, 0, time.UTC)
 	s.evaluate(reopen, true)
 	if lastState["workhours"] {
-		t.Fatal("fail-closed must publish the permit INACTIVE (deny) even when its window reopens, not forward")
+		t.Fatal("fail-closed must build the permit INACTIVE (deny) in the published snapshot even when its window reopens")
 	}
 	if s.IsActive("workhours") {
 		t.Fatal("fail-closed authoritative state must report the permit inactive (deny)")
@@ -131,6 +144,19 @@ func TestScheduler_RepublishFailClosedAfterBoundedAge(t *testing.T) {
 		t.Fatal("after recovery the reopened window must report active")
 	}
 }
+
+// Note on gauge coverage (#6137 finding 3): the value the daemon's
+// xpf_scheduler_republish_fail_closed gauge reads is the scheduler's own
+// RepublishFailClosed() latch (the SSOT the daemon accessor delegates to after
+// finding 2). Its 0→1 transition at the bound and 1→0 clear on recovery are
+// already pinned by TestScheduler_RepublishFailClosedAfterBoundedAge above (it
+// asserts RepublishFailClosed() directly). Deliberately NOT re-asserting
+// "reads 1 at the bound" in a second test here keeps the latch-block
+// fail-on-revert target-count at exactly one. The genuinely-new gauge coverage
+// — that the DAEMON accessor reads this latch (SSOT) rather than a second
+// daemon-side age timer — lives in pkg/daemon's
+// TestSchedulerRepublishFailClosedGaugeReadsSSOTLatch_5669, which does not
+// depend on the latch reaching true and so stays green on the revert.
 
 // TestScheduler_WithinBoundTransientNeverFailsClosed is the control: a normal
 // successful window transition and a transient failure that recovers INSIDE the

@@ -312,8 +312,15 @@ type Daemon struct {
 	lldpMgr          *lldp.Manager
 	lldpApplied      *lldp.LLDPConfig // last effective LLDP config Apply()'d (#2372 diff-guard); nil = stopped
 	lldpApplyInit    bool             // true once reconcileLLDP has run at least once
-	scheduler        *scheduler.Scheduler
-	schedulerCancel  context.CancelFunc
+	// scheduler is the live policy-window scheduler. It is an atomic.Pointer so
+	// the metrics collector can read it lock-free for the
+	// xpf_scheduler_republish_fail_closed SSOT gauge
+	// (SchedulerRepublishFailClosed → scheduler.RepublishFailClosed) while a
+	// commit-time reconcile swaps it under applySem. All mutations still happen
+	// under applySem (the "Locked" reconcile convention); the atomic only makes
+	// the concurrent lock-free read of the pointer word race-clean (#5669).
+	scheduler       atomic.Pointer[scheduler.Scheduler]
+	schedulerCancel context.CancelFunc
 	// schedulerWg tracks every policy-scheduler Run() goroutine generation so
 	// daemon shutdown can join it after cancelling, and schedulerStopped
 	// latches on shutdown so no new generation is started after the join

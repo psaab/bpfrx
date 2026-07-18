@@ -229,9 +229,9 @@ func TestApplyConfigProtocolAbortPreservesExistingScheduler(t *testing.T) {
 	}
 	d := &Daemon{
 		dp:                        dp,
-		scheduler:                 oldScheduler,
 		policySchedulerConfigHash: oldHash,
 	}
+	d.scheduler.Store(oldScheduler)
 	d.policySchedulerEpoch.Store(42)
 	newCfg := &config.Config{
 		Schedulers: map[string]*config.SchedulerConfig{
@@ -242,7 +242,7 @@ func TestApplyConfigProtocolAbortPreservesExistingScheduler(t *testing.T) {
 	if err := d.applyConfigLocked(context.Background(), newCfg); !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
 		t.Fatalf("applyConfigLocked error = %v, want protocol incompatibility", err)
 	}
-	if d.scheduler != oldScheduler {
+	if d.scheduler.Load() != oldScheduler {
 		t.Fatal("protocol abort replaced scheduler before apply completed")
 	}
 	if got := d.policySchedulerEpoch.Load(); got != 42 {
@@ -251,7 +251,7 @@ func TestApplyConfigProtocolAbortPreservesExistingScheduler(t *testing.T) {
 	if d.policySchedulerConfigHash != oldHash {
 		t.Fatal("protocol abort changed scheduler config hash")
 	}
-	if got := d.scheduler.ActiveState()["old"]; got != oldState["old"] {
+	if got := d.scheduler.Load().ActiveState()["old"]; got != oldState["old"] {
 		t.Fatalf("old scheduler active state = %t, want %t", got, oldState["old"])
 	}
 }
