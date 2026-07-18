@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 
 use crate::afxdp::worker::BindingWorker;
 
-use super::{recycle_prepared_immediately_with_shared, TxError};
+use super::{recycle_prepared_immediately_with_shared, TxDropReason, TxError};
 
 #[inline]
 pub(super) fn verify_umem_slices_for_staged(
@@ -48,10 +48,10 @@ pub(super) fn verify_umem_slices_for_staged(
                     .tx_errors
                     .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
             }
-            return Err(TxError::Drop(format!(
-                "prepared tx frame slice out of range: offset={} len={}",
-                err_offset, err_len
-            )));
+            return Err(TxError::Drop(TxDropReason::PreparedSliceOutOfRange {
+                offset: err_offset,
+                len: err_len,
+            }));
         }
     }
     Ok(())

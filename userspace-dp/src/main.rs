@@ -27,6 +27,16 @@ mod tcp_flags;
 #[allow(dead_code)]
 mod xsk_ffi;
 
+// #4971: test-only counting global allocator. Lets the TX hot-path
+// regression tests assert that an expected TX backpressure retry
+// performs ZERO heap allocations per drain pass. Compiled only under
+// `cfg(test)`; production builds keep the system allocator untouched.
+#[cfg(test)]
+mod test_alloc;
+#[cfg(test)]
+#[global_allocator]
+static TEST_COUNTING_ALLOC: test_alloc::CountingAlloc = test_alloc::CountingAlloc;
+
 mod protocol;
 mod server;
 // Re-export at the crate root so other modules (afxdp/bind, afxdp/coordinator)

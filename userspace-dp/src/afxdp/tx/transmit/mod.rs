@@ -14,9 +14,100 @@ use crate::xsk_ffi::xdp::XdpDesc;
 use super::rings::{maybe_wake_tx, reap_tx_completions};
 use super::stats::stamp_submits;
 
+/// TX submit outcome error (#4971). Both payloads are `Copy` C-like
+/// reason codes, NOT `String`s: the expected-backpressure retry path
+/// recurs every drain pass under ring pressure, so allocating a fresh
+/// `String` there violated the hot-path no-allocation discipline.
+/// `Retry` is the expected-congestion path (allocation-free + surfaced
+/// lock-free via `BindingLiveState::last_tx_retry_status`); `Drop` is
+/// the exceptional capacity/slice-fault path (rare — it may still
+/// render a message via `set_error` on the exceptional branch).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(in crate::afxdp) enum TxError {
-    Retry(String),
-    Drop(String),
+    Retry(TxRetryReason),
+    Drop(TxDropReason),
+}
+
+/// Copyable classification of an expected TX backpressure retry
+/// (#4971). Each variant maps 1:1 to a former allocated retry string;
+/// `as_str()` renders the exact legacy operator-facing text so status
+/// and log scraping are unchanged. `#[repr(u8)]` with explicit
+/// discriminants backs the lock-free `BindingLiveState`
+/// `last_tx_retry_status` atomic (0 = none).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(in crate::afxdp) enum TxRetryReason {
+    NoFreeTxFrame = 1,
+    NoPreparedTxFrame = 2,
+    TxRingInsertFailed = 3,
+    PreparedTxRingInsertFailed = 4,
+}
+
+impl TxRetryReason {
+    /// The exact legacy operator-facing message for this retry reason.
+    /// Kept byte-identical to the pre-#4971 `TxError::Retry(String)`
+    /// text so `show`/status/log scraping is unaffected.
+    pub(in crate::afxdp) fn as_str(self) -> &'static str {
+        match self {
+            TxRetryReason::NoFreeTxFrame => "no free TX frame available",
+            TxRetryReason::NoPreparedTxFrame => "no prepared TX frame available",
+            TxRetryReason::TxRingInsertFailed => "tx ring insert failed",
+            TxRetryReason::PreparedTxRingInsertFailed => "prepared tx ring insert failed",
+        }
+    }
+
+    /// Reverse of the `#[repr(u8)]` discriminant used by the
+    /// lock-free `last_tx_retry_status` atomic. `0` (or any unknown
+    /// code) → `None` (no retry recorded yet).
+    pub(in crate::afxdp) fn from_u8(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(TxRetryReason::NoFreeTxFrame),
+            2 => Some(TxRetryReason::NoPreparedTxFrame),
+            3 => Some(TxRetryReason::TxRingInsertFailed),
+            4 => Some(TxRetryReason::PreparedTxRingInsertFailed),
+            _ => None,
+        }
+    }
+}
+
+/// Copyable classification of an exceptional TX drop (#4971). Unlike
+/// `TxRetryReason` this is NOT the expected-backpressure hot path — it
+/// fires only on capacity or slice-bounds faults. It still carries the
+/// offending geometry so the operator-facing message rendered on the
+/// (rare) drop branch via `set_error` is byte-identical to the former
+/// allocated `format!` strings. `Copy` because every field is a scalar
+/// — constructing the error never allocates; only the exceptional
+/// `message()` render does.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) enum TxDropReason {
+    LocalFrameExceedsCapacity { len: usize, cap: usize },
+    LocalSliceOutOfRange { offset: u64, len: usize },
+    PreparedFrameExceedsCapacity { len: u32, cap: usize },
+    PreparedSliceOutOfRange { offset: u64, len: u32 },
+}
+
+impl TxDropReason {
+    /// Render the operator-facing message. Only called on the rare
+    /// exceptional drop branch (capacity / slice fault), so the
+    /// `format!` allocation here is acceptable — the hot expected-retry
+    /// path never constructs a `String`. Text is byte-identical to the
+    /// pre-#4971 `TxError::Drop(String)` messages.
+    pub(in crate::afxdp) fn message(self) -> String {
+        match self {
+            TxDropReason::LocalFrameExceedsCapacity { len, cap } => {
+                format!("local tx frame exceeds UMEM frame capacity: len={len} cap={cap}")
+            }
+            TxDropReason::LocalSliceOutOfRange { offset, len } => {
+                format!("tx frame slice out of range: offset={offset} len={len}")
+            }
+            TxDropReason::PreparedFrameExceedsCapacity { len, cap } => {
+                format!("prepared tx frame exceeds UMEM frame capacity: len={len} cap={cap}")
+            }
+            TxDropReason::PreparedSliceOutOfRange { offset, len } => {
+                format!("prepared tx frame slice out of range: offset={offset} len={len}")
+            }
+        }
+    }
 }
 
 pub(in crate::afxdp) fn recycle_cancelled_prepared_offset_with_shared(
@@ -90,7 +181,7 @@ pub(in crate::afxdp) fn transmit_batch(
         .min(TX_BATCH_SIZE);
     if batch_size == 0 {
         maybe_wake_tx(binding, true, now_ns);
-        return Err(TxError::Retry("no free TX frame available".to_string()));
+        return Err(TxError::Retry(TxRetryReason::NoFreeTxFrame));
     }
 
     binding.scratch.scratch_local_tx.clear();
@@ -121,11 +212,10 @@ pub(in crate::afxdp) fn transmit_batch(
                 binding.tx_pipeline.free_tx_frames.push_back(off);
                 pending.push_front(r);
             }
-            return Err(TxError::Drop(format!(
-                "local tx frame exceeds UMEM frame capacity: len={} cap={}",
-                req.bytes.len(),
-                tx_frame_capacity()
-            )));
+            return Err(TxError::Drop(TxDropReason::LocalFrameExceedsCapacity {
+                len: req.bytes.len(),
+                cap: tx_frame_capacity(),
+            }));
         }
         let Some(offset) = binding.tx_pipeline.free_tx_frames.pop_front() else {
             pending.push_front(req);
@@ -145,10 +235,10 @@ pub(in crate::afxdp) fn transmit_batch(
                 binding.tx_pipeline.free_tx_frames.push_back(off);
                 pending.push_front(r);
             }
-            return Err(TxError::Drop(format!(
-                "tx frame slice out of range: offset={offset} len={}",
-                req.bytes.len()
-            )));
+            return Err(TxError::Drop(TxDropReason::LocalSliceOutOfRange {
+                offset,
+                len: req.bytes.len(),
+            }));
         };
         frame.copy_from_slice(&req.bytes);
         // RST detection: log when we're about to transmit a TCP RST
@@ -191,7 +281,7 @@ pub(in crate::afxdp) fn transmit_batch(
             return Ok((0, 0));
         }
         maybe_wake_tx(binding, true, now_ns);
-        return Err(TxError::Retry("no prepared TX frame available".to_string()));
+        return Err(TxError::Retry(TxRetryReason::NoPreparedTxFrame));
     }
 
     let mut writer = binding
@@ -240,7 +330,7 @@ pub(in crate::afxdp) fn transmit_batch(
             binding.tx_pipeline.free_tx_frames.push_front(offset);
             pending.push_front(req);
         }
-        return Err(TxError::Retry("tx ring insert failed".to_string()));
+        return Err(TxError::Retry(TxRetryReason::TxRingInsertFailed));
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
     binding.tx_pipeline.outstanding_tx =
@@ -248,18 +338,25 @@ pub(in crate::afxdp) fn transmit_batch(
 
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
-    let mut retry_tail = Vec::new();
-    for (idx, (offset, req)) in binding.scratch.scratch_local_tx.drain(..).enumerate() {
+    // #4971: reverse-pop the staged scratch instead of collecting the
+    // un-inserted tail into a fresh `Vec` per drain pass. `pop()`
+    // yields the highest staged index first; after each pop the
+    // scratch's new `len()` equals the popped item's index, so we can
+    // split sent-prefix from retry-tail without a side buffer. Pushing
+    // the tail with `push_front` in this reverse order restores the
+    // ORIGINAL front-to-back FIFO at the head of `pending` (t3 then t4
+    // → [t3, t4, ...]) — same ordering the prior `retry_tail` +
+    // `.rev()` produced, now allocation-free. free_tx_frames order is
+    // fungible.
+    while let Some((offset, req)) = binding.scratch.scratch_local_tx.pop() {
+        let idx = binding.scratch.scratch_local_tx.len();
         if idx < inserted as usize {
             sent_packets += 1;
             sent_bytes += req.bytes.len() as u64;
         } else {
             binding.tx_pipeline.free_tx_frames.push_front(offset);
-            retry_tail.push(req);
+            pending.push_front(req);
         }
-    }
-    for req in retry_tail.into_iter().rev() {
-        pending.push_front(req);
     }
 
     // Latency-sensitive reply traffic can stall indefinitely on otherwise idle zerocopy

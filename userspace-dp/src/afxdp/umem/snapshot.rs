@@ -283,11 +283,27 @@ impl BindingLiveState {
                 self.last_heartbeat.load(Ordering::Relaxed),
                 now_mono,
             ),
-            last_error: self
-                .last_error
-                .lock()
-                .map(|v| v.clone())
-                .unwrap_or_default(),
+            // #4971: prefer a genuine error string (mutex, written by
+            // the exceptional drop / bind / reconcile paths). If empty,
+            // fall back to the lock-free TX-retry status so an expected
+            // backpressure reason stays visible in `show` output —
+            // without the send hot path ever taking the mutex.
+            last_error: {
+                let err = self
+                    .last_error
+                    .lock()
+                    .map(|v| v.clone())
+                    .unwrap_or_default();
+                if err.is_empty() {
+                    crate::afxdp::tx::TxRetryReason::from_u8(
+                        self.last_tx_retry_status.load(Ordering::Relaxed),
+                    )
+                    .map(|r| r.as_str().to_string())
+                    .unwrap_or_default()
+                } else {
+                    err
+                }
+            },
             // #709 / #746: owner-profile telemetry snapshot.
             // Histograms are copied bucket-by-bucket under `Relaxed`
             // through the cacheline-isolated owner/peer structs.

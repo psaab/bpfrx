@@ -53558,3 +53558,51 @@ top.
   userspace-dp/src/server/tests.rs,
   userspace-dp/src/afxdp/coordinator/README.md,
   userspace-dp/src/server/README.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #4971 — allocation-free + lock-free expected TX retry path.
+  `TxError::Retry`/`Drop` payloads changed from heap `String` to `Copy`
+  reason codes (`TxRetryReason` #[repr(u8)] + `TxDropReason` C-like enum
+  carrying scalar geometry). The expected-backpressure retry path recurs
+  every drain pass under ring pressure, so allocating a fresh `String`
+  there (and taking the `last_error` mutex) violated the hot-path
+  no-allocation discipline. Fixes: (1) copyable reason enums, each mapping
+  1:1 to a former retry/drop string; `TxRetryReason::as_str()` renders the
+  exact legacy operator text so status/log scraping is unchanged; (2) the
+  retry tail (un-inserted suffix) is now restored to `pending` by
+  reverse-popping the staged scratch (`pop()` → new `len()` == popped
+  index), preserving FIFO order with NO side `Vec` — replaces
+  `retry_tail = Vec::new()` in `transmit/mod.rs` AND `transmit/finalise.rs`;
+  (3) the expected-retry sites record a lock-free
+  `BindingLiveState::last_tx_retry_status` AtomicU8 via `set_tx_retry_status`
+  instead of the `last_error` mutex; the status snapshot surfaces it as the
+  `last_error` fallback (read side, ~1s poll) so operator visibility is
+  preserved. Exceptional `TxError::Drop` (capacity/slice fault) still renders
+  `reason.message()` via `set_error` — rare, off the hot path. Also converted
+  the six identical exact-CoS direct-service `set_error(<literal>.to_string())`
+  backpressure sites in `queue_service/service.rs` to `set_tx_retry_status`.
+  Tests (target-count 3): `tx_retry_tail_is_allocation_free_4971` +
+  `tx_retry_outcome_codes_4971` (counting global allocator, `src/test_alloc.rs`,
+  #[cfg(test)] only — assert ZERO heap allocs per drain pass) and
+  `tx_retry_status_lock_free_4971` (last_error mutex stays empty on retry).
+  Parent-RED verified: reverting to `retry_tail = Vec::new()` /
+  `Retry(String)` / `set_error(...)` makes each test RED as an ASSERTION
+  failure (crate still compiles — not a build break), 3 failed / 0 passed.
+  NOT HA (TX drain path; unit-provable, no cluster smoke).
+- **File(s)**: userspace-dp/src/afxdp/tx/transmit/mod.rs,
+  userspace-dp/src/afxdp/tx/transmit/finalise.rs,
+  userspace-dp/src/afxdp/tx/transmit/stage.rs,
+  userspace-dp/src/afxdp/tx/transmit/rewrite.rs,
+  userspace-dp/src/afxdp/tx/transmit/verify.rs,
+  userspace-dp/src/afxdp/tx/transmit_tests.rs,
+  userspace-dp/src/afxdp/tx/mod.rs,
+  userspace-dp/src/afxdp/tx/drain/phase_backup.rs,
+  userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/service.rs,
+  userspace-dp/src/afxdp/cos/queue_service/submit_local.rs,
+  userspace-dp/src/afxdp/cos/queue_service/submit_prepared.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests/drain.rs,
+  userspace-dp/src/main.rs, userspace-dp/src/test_alloc.rs,
+  userspace-dp/src/afxdp/tx/README.md

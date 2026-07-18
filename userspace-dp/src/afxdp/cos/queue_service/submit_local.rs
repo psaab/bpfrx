@@ -145,12 +145,14 @@ pub(super) fn submit_local(
             );
             cos_batch_tx_made_progress(Ok((packets, bytes)))
         }
-        Err(TxError::Retry(err)) => {
-            binding.live.set_error(err);
+        Err(TxError::Retry(reason)) => {
+            // #4971: expected TX backpressure — record the reason
+            // lock-free instead of taking the `last_error` mutex.
+            binding.live.set_tx_retry_status(reason);
             restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
-            cos_batch_tx_made_progress(Err(TxError::Retry(String::new())))
+            cos_batch_tx_made_progress(Err(TxError::Retry(reason)))
         }
-        Err(TxError::Drop(err)) => {
+        Err(TxError::Drop(reason)) => {
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
             // #710: frame-level submit drop during CoS batch
             // transmit; items are restored to the queue head,
@@ -160,9 +162,11 @@ pub(super) fn submit_local(
                 .live
                 .tx_submit_error_drops
                 .fetch_add(1, Ordering::Relaxed);
-            binding.live.set_error(err);
+            // #4971: exceptional drop path (rare) still renders the
+            // diagnostic message via the mutex-backed set_error.
+            binding.live.set_error(reason.message());
             restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
-            cos_batch_tx_made_progress(Err(TxError::Drop(String::new())))
+            cos_batch_tx_made_progress(Err(TxError::Drop(reason)))
         }
     }
 }
