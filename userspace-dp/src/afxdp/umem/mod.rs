@@ -176,11 +176,38 @@ const _: () = assert!(DRAIN_HIST_BUCKETS == 16);
 /// #709: sample mask for the redirect-acquire timer. We sample the
 /// timer 1-in-(MASK+1) = 1-in-256 pushes. The mask is required to be a
 /// power-of-two minus one so `counter & MASK == 0` fires uniformly on
-/// exactly one value per wrap. Producer-local counter is seeded from
-/// `worker_id` so samples from different workers don't lockstep onto
-/// the same slot.
+/// exactly one value per wrap.
 pub(super) const REDIRECT_SAMPLE_MASK: u64 = 0xff;
 const _: () = assert!(REDIRECT_SAMPLE_MASK.count_ones() == REDIRECT_SAMPLE_MASK.trailing_ones());
+
+thread_local! {
+    /// #5160: PRODUCER-LOCAL redirect-sample sequence. Before #5160 this was a
+    /// shared `AtomicU64` (`redirect_sample_counter`) on the DESTINATION
+    /// `BindingLiveState.owner_profile_peer`, so every producer worker
+    /// redirecting into one owner binding paid a contended `fetch_add` RMW on
+    /// that shared cacheline for EVERY MPSC enqueue — a 1-in-256 sampler
+    /// imposing a 1-in-1 shared atomic, turning one contended sequencing line
+    /// (the inbox head CAS) into two. A `Cell<u64>` in thread-local storage
+    /// gives each producer worker (its own OS thread) its OWN sequence — a plain
+    /// TLS load/store, no atomic, no shared cacheline. The aggregate sample RATE
+    /// is unchanged: each producer samples 1-in-(`REDIRECT_SAMPLE_MASK`+1) of
+    /// its own enqueues, so each destination's `redirect_acquire_hist` still
+    /// receives ~1/256 of the enqueues INTO it (only the sampled op touches the
+    /// shared destination histogram, exactly as before).
+    static REDIRECT_SAMPLE_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// #5160: advance this producer thread's redirect-sample sequence and report
+/// whether THIS push is the sampled 1-in-(`REDIRECT_SAMPLE_MASK`+1) op. Purely
+/// thread-local — no shared atomic on the redirect hot path.
+#[inline]
+fn next_redirect_sample() -> bool {
+    REDIRECT_SAMPLE_SEQ.with(|seq| {
+        let v = seq.get();
+        seq.set(v.wrapping_add(1));
+        (v & REDIRECT_SAMPLE_MASK) == 0
+    })
+}
 
 /// #812: per-queue TX submit→completion latency histogram bucket count.
 ///
@@ -705,10 +732,13 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// #709 / #746: peer-written telemetry, cacheline-isolated.
     /// `redirect_acquire_hist` is the redirect-acquire latency
     /// histogram, sampled 1-in-(`REDIRECT_SAMPLE_MASK`+1) on
-    /// producers. `redirect_sample_counter` is the producer-local
-    /// sample counter; seeded from `worker_id` at construction so
-    /// different producer workers don't lockstep their samples onto
-    /// the same call. `peer_pps` is the peer-redirect pps window.
+    /// producers. `peer_pps` is the peer-redirect pps window.
+    ///
+    /// #5160: the sample SEQUENCE that decides which push is the 1-in-256
+    /// sampled op is a producer-local thread-local (`REDIRECT_SAMPLE_SEQ`),
+    /// NOT an atomic on this shared struct — so the many-producer redirect
+    /// hot path pays no second contended RMW per enqueue. Only the sampled
+    /// op writes `redirect_acquire_hist` here.
     ///
     /// Multi-writer: every worker that redirects a TX request into
     /// this binding's inbox increments a bucket on a sampled push.
@@ -974,10 +1004,9 @@ impl BindingLiveState {
             // #709 / #746: owner-profile telemetry, split by writer
             // into two cacheline-isolated groups. Histograms are zero-
             // init fixed-cap arrays; sum of buckets == drain_invocations
-            // invariant holds at `new()` (both 0). The redirect-sample
-            // counter seed is left at zero by `new()`; call sites that
-            // have a worker_id in hand should use `new_seeded()` instead
-            // so per-worker samples don't lockstep onto the same push.
+            // invariant holds at `new()` (both 0). #5160: the redirect-sample
+            // sequence is a producer-local thread-local (`REDIRECT_SAMPLE_SEQ`),
+            // no longer a per-binding atomic, so there is nothing to seed here.
             owner_profile_owner: OwnerProfileOwnerWrites::new(),
             owner_profile_peer: OwnerProfilePeerWrites::new(),
             direct_tx_packets: AtomicU64::new(0),
@@ -1026,26 +1055,6 @@ impl BindingLiveState {
         }
     }
 
-    /// #709: construct a binding live state with the redirect-sample
-    /// counter pre-seeded from `worker_id`. Seeding is cosmetic — the
-    /// sample mask fires exactly 1-in-(MASK+1) regardless of start
-    /// value — but it prevents every worker from firing its first
-    /// sample on its very first push, which avoids an early-startup
-    /// lockstep burst that would bias bucket 0 heavily on the first
-    /// scrape.
-    pub(super) fn new_seeded(worker_id: u32) -> Self {
-        let mut state = Self::new();
-        // `worker_id as u64` preserves the distinct-per-worker property
-        // we care about without needing a randomness source. The mask
-        // treats the counter modulo (MASK+1), so any seed ∈ [0, MASK]
-        // suffices; larger worker_ids just wrap cheaply.
-        //
-        // #746: the sample counter moved into `owner_profile_peer`
-        // when the owner/peer split landed; seeding writes through the
-        // new nested path but the effect is identical.
-        state.owner_profile_peer.redirect_sample_counter = AtomicU64::new(worker_id as u64);
-        state
-    }
 
     pub(super) fn set_bound(&self, socket_fd: c_int) {
         self.bound.store(true, Ordering::Relaxed);
@@ -1201,16 +1210,14 @@ impl BindingLiveState {
         // `~(2 * 15 + 2) / 256 ≈ 0.13 ns` per push — well below the
         // noise floor of the redirect path itself.
         //
-        // The timer wraps only `push_redirect_inbox`. We do NOT add a
-        // second atomic to the MPSC inbox itself; the sample counter
-        // lives on `BindingLiveState` next to the other per-binding
-        // atomics. MPSC invariants from #715 are preserved.
-        let sample = (self
-            .owner_profile_peer
-            .redirect_sample_counter
-            .fetch_add(1, Ordering::Relaxed)
-            & REDIRECT_SAMPLE_MASK)
-            == 0;
+        // The timer wraps only `push_redirect_inbox`. #5160: the sample
+        // sequence is PRODUCER-LOCAL (thread-local `REDIRECT_SAMPLE_SEQ`),
+        // NOT a shared atomic on the destination `BindingLiveState` — so a
+        // many-producer redirect into one owner pays only the inbox head CAS,
+        // never a second contended RMW on a shared sample-counter cacheline.
+        // Only the SAMPLED op touches the shared destination histogram below.
+        // MPSC invariants from #715 are preserved.
+        let sample = next_redirect_sample();
         let start = if sample {
             Some(monotonic_nanos())
         } else {
