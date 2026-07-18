@@ -1,9 +1,0 @@
-./aggregator.go
-./event_filter_args.go
-./eventbuf.go
-./goid.go
-./locallog.go
-./ringbuf.go
-./slog_handler.go
-./syslog.go
-./trace.go

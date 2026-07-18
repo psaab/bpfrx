@@ -1,6 +1,0 @@
-./exporterid.go
-./ipfix.go
-./manager.go
-./netflow.go
-./routemask.go
-./transport.go

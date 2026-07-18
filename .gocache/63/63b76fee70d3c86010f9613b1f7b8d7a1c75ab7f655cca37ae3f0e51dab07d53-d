@@ -1,4 +1,0 @@
-./l2send_linux.go
-./relay.go
-./relay_giaddr_linux.go
-./sockopt_linux.go

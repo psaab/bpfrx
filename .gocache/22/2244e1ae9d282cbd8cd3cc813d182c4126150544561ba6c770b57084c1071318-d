@@ -1,5 +1,0 @@
-./commit.go
-./dhcp.go
-./reconcile.go
-./renew.go
-./test_seams.go

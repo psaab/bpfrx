@@ -1,5 +1,0 @@
-./main.go
-./publish_generation.go
-./seed_runtime.go
-./upgrade.go
-./upgrade_kernel.go
