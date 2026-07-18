@@ -1,3 +1,41 @@
+## 2026-07-18 — #5168: widen WG replay window to the reference 8128-counter ring
+
+- **Timestamp**: 2026-07-18 (fix/5168-wg-replay-window)
+- **Action**: The WG transport replay filter used a single-u64 64-wide RFC
+  6479 window (`REPLAY_WINDOW=64`, `ReplayState{highest,bitmap,started}`),
+  rejecting any post-AEAD counter of age ≥ 64. Reference WireGuard
+  (kernel `noise.c` / wireguard-go `replay.go`) uses an 8128-counter window,
+  so under multi-queue / path-diversity reorder the 64-wide window falsely
+  rejected UNSEEN AUTHENTIC packets ~2 orders of magnitude early → TCP
+  retransmit/throughput collapse a reference peer would not show. Replaced
+  `ReplayState` internals with the reference ring: `counter` (high-water) +
+  `backtrack: [u64; 128]` (8192-bit ring), `REPLAY_WINDOW = (RING_BLOCKS-1) *
+  BLOCK_BITS = 8128`. `check_and_update` is the exact wireguard-go
+  `ValidateCounter` port (advance-and-forward-clear on a new high-water mark,
+  strict `counter - c > REPLAY_WINDOW` too-old reject, per-bit accept/repeat);
+  the `started` flag is gone (the all-zero ring accepts counter 0 on first
+  sight and rejects its replay purely from the bitmap, as the reference does).
+  `definitely_out_of_window` uses the SAME `counter - c > REPLAY_WINDOW`
+  boundary (non-mutating; `counter` only advances so a precheck-out stays out
+  at commit — no false pre-AEAD drop). API unchanged; the two engine.rs decap
+  sites (precheck + commit) are untouched. NOTE (reference fidelity): the
+  kernel/wireguard-go window ACCEPTS age exactly 8128 (inclusive edge, strict
+  `>`) and rejects age 8129 — the issue's "age 8128 rejected" is an off-by-one
+  from the true reference; I matched the reference byte-for-byte per the
+  "match reference exactly" security mandate and pinned the true edge in tests.
+- **File(s)**: userspace-dp/src/afxdp/wg/session.rs,
+  docs/pr/wireguard-clean/plan.md, _Log.md
+- **Validation**: `cargo build` clean. New fail-on-revert tests:
+  `unseen_counters_within_reference_window_accepted` (ages 64/127/8127/8128
+  ACCEPTED, 8129 OutOfWindow), `replayed_counter_rejected_at_every_age`
+  (replay Repeat at ages 0/1/64/127/8127/8128),
+  `ring_preserves_in_window_bit_across_blocks`. Updated the four
+  boundary-bound legacy tests (out_of_window/jump_ahead/window_edge/precheck)
+  to the 8128 edge. RED-on-revert (`REPLAY_WINDOW=64`): `test result:
+  FAILED. 0 passed; 1 failed` — panic `unseen counter at age 127 must be
+  accepted (reference window 64)`. Restored GREEN: session_tests 13/0; full
+  `afxdp::wg` 188/0. No smoke (pure in-process replay filter, unit-provable).
+
 ## 2026-07-18 — #5213: unify show-flow-session id with the RT_FLOW session id
 
 - **Timestamp**: 2026-07-18 (fix/5213-unify-session-id)
