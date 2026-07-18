@@ -161,7 +161,7 @@ func (c *xpfCollector) sessionGaugeSnapshotCached(dp apiRuntimeDataPlane) (sessi
 //	not established.
 func walkSessionGauges(dp apiRuntimeDataPlane) (sessionGaugeSnapshot, error) {
 	var s sessionGaugeSnapshot
-	countForward := func(state uint8, flags uint8, ipCounter *int) {
+	countForward := func(state uint8, flags uint16, ipCounter *int) {
 		s.active++
 		*ipCounter++
 		if state == dataplane.SessStateEstablished {

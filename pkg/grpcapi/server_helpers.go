@@ -130,7 +130,7 @@ func (s *Server) countDNATSessions(zoneByID map[uint16]string) natSessionCounts 
 	return s.countNATSessions(dataplane.SessFlagDNAT, zoneByID)
 }
 
-func (s *Server) countNATSessions(flag uint8, zoneByID map[uint16]string) natSessionCounts {
+func (s *Server) countNATSessions(flag uint16, zoneByID map[uint16]string) natSessionCounts {
 	counts := natSessionCounts{
 		ruleSetSessions: make(map[natRuleSetKey]int32),
 	}
@@ -138,7 +138,7 @@ func (s *Server) countNATSessions(flag uint8, zoneByID map[uint16]string) natSes
 		return counts
 	}
 
-	add := func(isReverse uint8, flags uint8, ingressZone, egressZone uint16) {
+	add := func(isReverse uint8, flags uint16, ingressZone, egressZone uint16) {
 		if isReverse != 0 || flags&flag == 0 {
 			return
 		}
