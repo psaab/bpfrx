@@ -2917,3 +2917,124 @@ fn flow_cache_normal_resolve_caches_and_serves_neighbor_mac() {
          entry, not spuriously evict it (#3918)"
     );
 }
+
+// ── #5147 review MAJOR: TUNNEL-egress flows must key the MAC-change shard on
+// the OUTER neighbor ifindex, not the logical tunnel egress_ifindex ──
+// A GRE/WireGuard flow resolves its dst_mac from the OUTER transport neighbor,
+// which the kernel keys (and `insert_if_changed` bumps) under
+// `(outer.egress_ifindex, outer_next_hop)`. But the flow-cache entry stamps a
+// `neighbor_shard`; if it derives that shard from the LOGICAL tunnel
+// `egress_ifindex` (gr-/wg-, != the outer ifindex), the stamped shard never
+// advances on the outer gateway's MAC change -> `neighbor_mac_epoch_stale`
+// stays false forever -> the cached descriptor serves the dead gateway MAC
+// until idle timeout (a #3048 stale-MAC blackhole reintroduced for tunnels by
+// the naive per-shard #5147 change). The fix keys the shard on
+// `outer_neighbor_ifindex(.., None, ..)`, which returns the outer ifindex for a
+// tunnel and `egress_ifindex` for a direct resolution.
+//
+// RED-ON-REVERT: reverting either stamp site to `decision.resolution.egress_ifindex`
+// makes `entry.neighbor_shard` the LOGICAL (362) shard, so (1) the structural
+// assert fails (shard != outer shard) and (2) the behavioral assert fails (a
+// bump on the OUTER shard leaves the logical shard's epoch untouched -> not
+// stale -> no eviction).
+#[test]
+fn tunnel_flow_cache_keys_mac_change_shard_on_outer_neighbor_not_logical_ifindex() {
+    use crate::afxdp::sharded_neighbor::ShardedNeighborMap;
+    use crate::afxdp::types::NeighborEntry;
+
+    // GRE state: tunnel endpoint 1 -> logical ifindex 362 (gr-0-0-0), outer
+    // transport egress ifindex 12 (reth0.80 VLAN subif). See
+    // forwarding/tests.rs resolve_tunnel_outer_returns_outer_l3_egress.
+    let forwarding =
+        crate::afxdp::forwarding_build::build_forwarding_state(
+            &crate::afxdp::test_fixtures::native_gre_snapshot(true),
+        );
+
+    // A cacheable v4 forward decision, retargeted as a TUNNEL egress: keep its
+    // resolved next-hop + neighbor_mac + ForwardCandidate disposition, but mark
+    // it tunnel endpoint 1 with the LOGICAL egress ifindex (362) — exactly what
+    // resolve_tunnel_forwarding_resolution produces.
+    let (flow, meta, validation, mut decision, _direct_forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    decision.resolution.tunnel_endpoint_id = 1;
+    decision.resolution.egress_ifindex = 362;
+    let nh = decision
+        .resolution
+        .next_hop
+        .expect("a cacheable forward decision carries a resolved next-hop");
+
+    // The neighbor's ACTUAL key ifindex is the OUTER transport ifindex (12),
+    // NOT the logical tunnel egress (362).
+    let outer_if =
+        crate::afxdp::forwarding::outer_neighbor_ifindex(&forwarding, None, &decision.resolution);
+    assert_eq!(
+        outer_if, 12,
+        "outer_neighbor_ifindex must resolve tunnel endpoint 1 to its OUTER \
+         transport ifindex (12), not the logical tunnel egress (362)"
+    );
+    let outer_shard = ShardedNeighborMap::shard_index(&(outer_if, nh)) as u16;
+    let logical_shard = ShardedNeighborMap::shard_index(&(362, nh)) as u16;
+    assert_ne!(
+        outer_shard, logical_shard,
+        "test precondition: the outer (12) and logical (362) ifindexes must hash \
+         to DIFFERENT shards for this next-hop, else the test cannot distinguish \
+         the bug from the fix"
+    );
+
+    let rg_epochs = default_rg_epochs();
+    // Stamp the pre-resolve epoch as 0 (a fresh map's baseline); the entry
+    // derives its neighbor_shard internally via outer_neighbor_ifindex.
+    let entry = FlowCacheEntry::from_forward_decision(
+        &flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(3),
+        Some(7),
+        None,
+        crate::filter::CachedFilterCounters::default(),
+        &forwarding,
+        &ha_state,
+        false,
+        &rg_epochs,
+        0, // #3918 pre-resolve shard epoch (outer shard baseline == 0)
+    )
+    .expect("a tunnel ForwardCandidate decision is cacheable");
+
+    // STRUCTURAL: the entry stamps the OUTER neighbor's shard, not the logical.
+    assert_eq!(
+        entry.neighbor_shard, outer_shard,
+        "a tunnel flow must stamp the OUTER neighbor's shard (ifindex {outer_if}); \
+         stamping the logical tunnel egress ifindex (362) means the flow never \
+         evicts on the outer gateway's MAC change (#5147 review MAJOR / #3048)"
+    );
+    assert_ne!(
+        entry.neighbor_shard, logical_shard,
+        "the stamped shard must NOT be the logical tunnel egress shard"
+    );
+
+    // BEHAVIORAL: a MAC change on the OUTER neighbor evicts the tunnel flow.
+    let neighbors = ShardedNeighborMap::new();
+    assert!(
+        !entry.neighbor_mac_epoch_stale(&neighbors),
+        "a freshly-stamped entry (epoch 0) is not stale against a fresh map"
+    );
+    // First insert = no bump; a REPLACE with a different MAC bumps the OUTER
+    // neighbor's shard (the gateway VRRP-failover event).
+    neighbors.insert_if_changed(
+        (outer_if, nh),
+        NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] },
+    );
+    neighbors.insert_if_changed(
+        (outer_if, nh),
+        NeighborEntry { mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x99] },
+    );
+    assert!(
+        entry.neighbor_mac_epoch_stale(&neighbors),
+        "the tunnel flow MUST be evicted after its OUTER gateway's MAC change — \
+         keying the shard on the logical egress ifindex leaves the logical shard's \
+         epoch untouched by the outer bump, so the stale dst_mac would be served \
+         forever (#5147 review MAJOR)"
+    );
+}

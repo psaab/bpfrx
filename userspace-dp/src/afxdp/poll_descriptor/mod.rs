@@ -4365,17 +4365,32 @@ pub(super) fn poll_binding_process_descriptor(
                         // resolved next-hop shard from the whole-vector
                         // snapshot taken before the resolve. Computed here,
                         // while `decision` is still owned (it is moved into
-                        // `from_forward_decision` below), from the SAME neighbor
-                        // key `lookup_neighbor_entry` used —
-                        // `(egress_ifindex, next_hop)`. `from_forward_decision`
-                        // independently derives the matching `neighbor_shard`
-                        // from the same `decision.resolution`, so the stamp and
-                        // the hit-path re-read agree on the shard. A resolution
-                        // with no next-hop stamps 0 (paired with a
+                        // `from_forward_decision` below), from the neighbor's
+                        // ACTUAL key ifindex — the OUTER transport ifindex for a
+                        // tunnel egress, the `egress_ifindex` for a direct
+                        // resolution — via `outer_neighbor_ifindex`, the same
+                        // ifindex `insert_if_changed` bumps on. `from_forward_decision`
+                        // derives `neighbor_shard` with the IDENTICAL
+                        // `outer_neighbor_ifindex(.., None, ..)` call, so the
+                        // stamped epoch and the hit-path re-read agree on the
+                        // shard (both `None` for the neighbor handle: the outer
+                        // ifindex is route-derived, so `None` yields the same
+                        // ifindex as the live resolve and keeps the two sites
+                        // coupled). Keying on the logical `egress_ifindex` for
+                        // tunnels was the review MAJOR — it stamped a different
+                        // shard than the bump, so a tunnel flow never evicted on
+                        // its outer gateway's MAC change (#3048 blackhole). A
+                        // resolution with no next-hop stamps 0 (paired with a
                         // `NEIGHBOR_SHARD_NONE` shard → never MAC-stale).
                         let neighbor_mac_epoch_at_resolve = match decision.resolution.next_hop {
-                            Some(nh) => neighbor_epoch_snapshot
-                                .epoch_for(&(decision.resolution.egress_ifindex, nh)),
+                            Some(nh) => neighbor_epoch_snapshot.epoch_for(&(
+                                outer_neighbor_ifindex(
+                                    worker_ctx.forwarding,
+                                    None,
+                                    &decision.resolution,
+                                ),
+                                nh,
+                            )),
                             None => 0,
                         };
                         if !flow_cache_install_failed

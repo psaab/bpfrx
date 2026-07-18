@@ -501,16 +501,32 @@ impl FlowCacheEntry {
         let mut input_filter_counters = input_filter_counters;
         input_filter_counters.retain_absent_from(&tx_selection.filter_counters);
         // #5147: the shard of this flow's resolved next-hop neighbor
-        // `(egress_ifindex, next_hop)` — the SAME key `lookup_neighbor_entry`
-        // used to resolve `decision.resolution.neighbor_mac`. `neighbor_shard`
+        // `(neighbor_ifindex, next_hop)`, where `neighbor_ifindex` is the
+        // ifindex the neighbor is actually keyed under in the ShardedNeighborMap
+        // — the OUTER transport ifindex for a tunnel (gr-/wg-) egress, NOT the
+        // logical tunnel `egress_ifindex`. `outer_neighbor_ifindex` returns
+        // `egress_ifindex` unchanged for a direct/connected/static resolution
+        // (identical to the pre-#5147-review behavior) and the outer ifindex for
+        // a tunnel, matching the `(ifindex, ip)` key `insert_if_changed` bumps
+        // on when the kernel updates the OUTER neighbor. Keying on the logical
+        // `egress_ifindex` for tunnels (the review MAJOR) stamped a DIFFERENT
+        // shard than the bump, so a tunnel flow never evicted on its outer
+        // gateway's MAC change — a #3048 stale-MAC blackhole. `neighbor_shard`
         // scopes the MAC-change invalidation: only a change to a neighbor in
-        // THIS shard evicts the entry (targeted, per #5147), not every
-        // neighbor change. A cacheable disposition (ForwardCandidate /
-        // FabricRedirect) always carries a next-hop; the `None` arm marks a
-        // no-dynamic-neighbor-dependency flow that is never MAC-stale.
+        // THIS shard evicts the entry (targeted, per #5147), not every neighbor
+        // change. A cacheable disposition (ForwardCandidate / FabricRedirect)
+        // always carries a next-hop; the `None` arm marks a
+        // no-dynamic-neighbor-dependency flow that is never MAC-stale. NOTE:
+        // this MUST use the IDENTICAL computation as the pre-resolve epoch
+        // snapshot key in poll_descriptor (`outer_neighbor_ifindex(.., None,
+        // ..)`), or the stamped epoch and this shard would key different shards.
         let neighbor_shard = match decision.resolution.next_hop {
             Some(nh) => crate::afxdp::sharded_neighbor::ShardedNeighborMap::shard_index(&(
-                decision.resolution.egress_ifindex,
+                crate::afxdp::forwarding::outer_neighbor_ifindex(
+                    forwarding,
+                    None,
+                    &decision.resolution,
+                ),
                 nh,
             )) as u16,
             None => NEIGHBOR_SHARD_NONE,
