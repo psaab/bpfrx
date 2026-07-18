@@ -57,6 +57,95 @@ fn trim_l3_payload_uses_vlan_frame_length_metadata_relative_to_l3_offset_without
 
 
 #[test]
+fn trim_l3_payload_excludes_ethernet_slack_beyond_ip_declared_len_5149() {
+    // #5149: the L4 checksum on the tunnel-forced recompute path must cover
+    // ONLY the bytes inside the IP-declared datagram length (IPv4 total_len),
+    // never trailing Ethernet slack (NIC min-frame zero-pad or appended
+    // bytes). GRE/WireGuard encap transmits only the IP-declared inner length,
+    // so a checksum that covered slack would be verified by the peer over
+    // bytes no longer present -> the peer DROPS the packet.
+    //
+    // Construct an L3 frame whose IP total_len (40 = 20 IP + 20 TCP) is SHORTER
+    // than the backing slice, which carries 12 bytes of trailing slack. The
+    // metadata reports pkt_len == the FULL slack-inclusive backing length, so
+    // the pre-fix metadata-led `trim_l3_payload` returned the slack-inclusive
+    // suffix. The fix makes the IP-declared length authoritative.
+    const IHL: usize = 20;
+    const DECLARED_LEN: usize = 40; // 20 IP + 20 TCP, no slack
+    const SLACK: usize = 12;
+    let src = Ipv4Addr::new(10, 0, 0, 1);
+    let dst = Ipv4Addr::new(10, 0, 0, 2);
+
+    let mut raw_payload = Vec::new();
+    // IPv4 header (20 bytes): version 4 / IHL 5, total_len = 40, proto TCP.
+    raw_payload.extend_from_slice(&[0x45, 0x00]);
+    raw_payload.extend_from_slice(&(DECLARED_LEN as u16).to_be_bytes());
+    raw_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // id + flags/frag
+    raw_payload.extend_from_slice(&[64, PROTO_TCP, 0x00, 0x00]); // ttl, proto, hdr csum=0
+    raw_payload.extend_from_slice(&src.octets());
+    raw_payload.extend_from_slice(&dst.octets());
+    // TCP header (20 bytes): ports, seq/ack, data-offset 5 + ACK, window, csum=0.
+    raw_payload.extend_from_slice(&40000u16.to_be_bytes()); // src port
+    raw_payload.extend_from_slice(&443u16.to_be_bytes()); // dst port
+    raw_payload.extend_from_slice(&1u32.to_be_bytes()); // seq
+    raw_payload.extend_from_slice(&2u32.to_be_bytes()); // ack
+    raw_payload.extend_from_slice(&[0x50, 0x10]); // data offset 5, ACK
+    raw_payload.extend_from_slice(&64u16.to_be_bytes()); // window
+    raw_payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // csum=0, urg=0
+    assert_eq!(raw_payload.len(), DECLARED_LEN);
+    // Trailing Ethernet slack — NON-zero so it perturbs any checksum computed
+    // over it (0xEE, not 0-pad, to make the divergence unambiguous).
+    raw_payload.extend_from_slice(&[0xEEu8; SLACK]);
+    assert_eq!(raw_payload.len(), DECLARED_LEN + SLACK);
+
+    // Metadata reports the FULL slack-inclusive length — the exact condition
+    // under which the pre-fix code returned the slack-inclusive suffix.
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        pkt_len: raw_payload.len() as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    };
+
+    // RED-on-revert (target-count 1): the trimmed extent — which is exactly the
+    // extent the tunnel-forced `recompute_l4_checksum_ipv4` checksums — must be
+    // the IP-declared length (40), NOT the slack-inclusive metadata length (52).
+    // Reverting `trim_l3_payload` to metadata-led returns 52 and this fails.
+    let trimmed = trim_l3_payload(raw_payload.as_slice(), meta);
+    assert_eq!(
+        trimmed.len(),
+        DECLARED_LEN,
+        "trim_l3_payload must trim to the IP-declared datagram length (40), \
+         excluding the {SLACK}-byte Ethernet slack — the checksummed extent"
+    );
+
+    // Mechanism proof #1: a checksum computed over the trimmed (declared)
+    // extent VALIDATES for the peer, who receives only the declared datagram
+    // after encap trims to the inner IP length.
+    let mut declared = trimmed.to_vec();
+    recompute_l4_checksum_ipv4(&mut declared, IHL, PROTO_TCP, true)
+        .expect("recompute over declared extent");
+    assert_eq!(
+        checksum16_ipv4(src, dst, PROTO_TCP, &declared[IHL..]),
+        0,
+        "the peer validates the TCP checksum over the declared datagram"
+    );
+
+    // Mechanism proof #2 (the #5149 bug): a checksum computed over the
+    // slack-inclusive extent does NOT validate when the peer checks only the
+    // declared datagram it actually received — this is the remote drop.
+    let mut slack_inclusive = raw_payload.clone();
+    recompute_l4_checksum_ipv4(&mut slack_inclusive, IHL, PROTO_TCP, true)
+        .expect("recompute over slack-inclusive extent");
+    assert_ne!(
+        checksum16_ipv4(src, dst, PROTO_TCP, &slack_inclusive[IHL..DECLARED_LEN]),
+        0,
+        "a slack-covering checksum fails the peer's declared-datagram verification"
+    );
+}
+
+#[test]
 fn parse_session_flow_reparses_vlan_ipv4_reply_without_meta_offsets() {
     let frame = vlan_icmp_reply_frame();
     let mut area = MmapArea::new(4096).expect("mmap");
