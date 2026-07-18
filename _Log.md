@@ -47,6 +47,38 @@
   userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/afxdp/coordinator/README.md
+## 2026-07-18 — #6038: deflake TestWireUserspaceEventStreamCallbacks...WiresSessionAndFullResync (2s deadline races the wiring under load)
+
+- **Timestamp**: 2026-07-18 (fix/6038-eventstream-test-flake)
+- **Action**: Fixed the timing-flaky pkg/daemon test. Root cause (firsthand):
+  the wiring's happy path is ~0.2s because each of the two ACKs (session-open
+  seq 1, full-resync seq 2) is flushed by the eventstream `ackLoop`'s 100ms
+  ticker (`eventstream.go:924`), so two ACKs cost ~200ms. The test's ACK wait
+  (`waitForAckSeqForWiringTest`) and the socket dial loop each capped on a
+  FIXED `time.Now().Add(2 * time.Second)` — only ~1.8s of headroom. Under
+  concurrent build/test load the `ackLoop`/`acceptLoop`/`readLoop` goroutines
+  starve; the ACK slips past the 500ms per-read window repeatedly until the 2s
+  overall cap is exhausted (~4×500ms) → a spurious 2.01s timeout, non-monotonic
+  across commits (the issue's bisect FAIL→pass→FAIL). Fix: added
+  `wiringTestDeadline(t)` returning a GENEROUS cap that tracks `t.Deadline()`
+  (`go test -timeout`, default 10m) less a 5s margin, else a 30s fallback; both
+  the ACK wait and the dial loop now use it. The loops STILL gate on the actual
+  completion event (successful connect, then ACK seq >= want) — only the
+  wall-clock backstop was widened, no assertion weakened, no `#[ignore]`. Also
+  now check `es.Start(ctx)`'s previously-discarded error (Start binds the Unix
+  listener synchronously before the accept loop, so a bind failure should
+  surface directly, not as a confusing dial-loop timeout).
+- **File(s)**: pkg/daemon/userspace_sync_test.go, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/daemon/` clean; target
+  test `-count=50` → 50/50 pass; SAME `-count=50` under heavy CPU+build load
+  (GOMAXPROCS=2, 3×nproc busy loops + 3 parallel builds) → 50/50 pass, slowest
+  run 0.22s (no 2s outliers); full `go test ./pkg/daemon/` green. Cap-is-the-
+  lever contrast (per-read forced to 10ms to emulate the load timeout condition,
+  varying ONLY the overall cap): cap=50ms → RED (`read ack frame: i/o timeout`,
+  0.05s); cap=3000ms → GREEN (0.20s) — proving the overall deadline is the sole
+  pass/fail lever the fix widens. The genuine >2s ACK stall is load-dependent /
+  nondeterministic (per the issue's own bisect) and did not reproduce on this
+  box even under extreme oversubscription.
 
 ## 2026-07-18 — #6041: address-only (`port no-translation`) persistent-NAT leases (parity follow-up to #5819)
 

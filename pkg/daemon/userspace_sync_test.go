@@ -78,9 +78,43 @@ func writeEventFrameForWiringTest(t *testing.T, conn net.Conn, typ uint8, seq ui
 	}
 }
 
+// wiringTestDeadline returns a generous absolute deadline for the event-stream
+// wiring poll loops (socket connect, then the per-seq ACK wait). Those loops
+// already gate on the actual completion event — a successful connect, then an
+// ACK frame with seq >= want — so this cap is only a backstop against a genuine
+// hang, NOT the mechanism that decides success. It is deliberately large so it
+// never fires from mere goroutine-scheduling latency under concurrent
+// build/test load.
+//
+// #6038: the previous fixed 2s cap left only ~1.8s of headroom over the ~0.2s
+// happy path (each ACK is flushed by the eventstream ackLoop's 100ms ticker, so
+// the two ACKs cost ~200ms). On a loaded box the ackLoop / acceptLoop / readLoop
+// goroutines starve, the flush slips past 2s, and the loop tripped a spurious
+// 2.01s timeout — non-monotonic across commits, the signature of a load-racing
+// deadline rather than a product regression. Gating on the actual ACK with a
+// generous cap removes the wall-clock race without weakening any assertion.
+//
+// When `go test -timeout` is in effect (the default is 10m) the cap tracks that
+// deadline less a small margin, so a real hang fails HERE with a precise message
+// just before the whole test binary is killed; with `-timeout 0` it falls back
+// to a fixed generous window.
+func wiringTestDeadline(t *testing.T) time.Time {
+	t.Helper()
+	const (
+		fallback = 30 * time.Second
+		margin   = 5 * time.Second
+	)
+	if d, ok := t.Deadline(); ok {
+		if capped := d.Add(-margin); capped.After(time.Now()) {
+			return capped
+		}
+	}
+	return time.Now().Add(fallback)
+}
+
 func waitForAckSeqForWiringTest(t *testing.T, conn net.Conn, want uint64) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := wiringTestDeadline(t)
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
 			t.Fatalf("set read deadline: %v", err)
@@ -972,7 +1006,13 @@ func TestWireUserspaceEventStreamCallbacksStandaloneWiresSessionAndFullResync(t 
 	es := dpuserspace.NewEventStream(socketPath)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	es.Start(ctx)
+	// Start binds the Unix listener synchronously before launching the accept
+	// loop, so a successful return means the socket is connectable. #6038: check
+	// the error instead of discarding it — a silent bind failure would otherwise
+	// surface only as a confusing dial-loop timeout below.
+	if err := es.Start(ctx); err != nil {
+		t.Fatalf("start event stream: %v", err)
+	}
 	defer es.Close()
 
 	d := &Daemon{}
@@ -982,8 +1022,11 @@ func TestWireUserspaceEventStreamCallbacksStandaloneWiresSessionAndFullResync(t 
 
 	var conn net.Conn
 	var err error
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	// #6038: gate on a successful connect with a generous cap (see
+	// wiringTestDeadline) instead of a fixed 2s wall-clock that races the
+	// listener under load.
+	dialDeadline := wiringTestDeadline(t)
+	for time.Now().Before(dialDeadline) {
 		conn, err = net.Dial("unix", socketPath)
 		if err == nil {
 			break
