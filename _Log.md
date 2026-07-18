@@ -1,3 +1,43 @@
+## 2026-07-18 — #5160: move redirect-sample sequence off the shared destination atomic to producer-local TLS
+
+- **Timestamp**: 2026-07-18 (fix/5160-redirect-sample-local)
+- **Action**: `enqueue_tx_owned` (umem/mod.rs) did an unconditional
+  `fetch_add(1, Relaxed)` on `owner_profile_peer.redirect_sample_counter`, a
+  SHARED atomic on the destination `BindingLiveState` (Arc). Every producer
+  worker redirecting into one owner binding paid a contended RMW on that
+  cacheline for EVERY MPSC enqueue — a 1-in-256 sampler imposing a 1-in-1
+  shared atomic, a SECOND contended sequencing line on top of the inbox head
+  CAS (the in-code "producer-local" comment was inaccurate: the counter was
+  seeded per-binding/shared). Moved the sample SEQUENCE to a producer-local
+  thread-local `REDIRECT_SAMPLE_SEQ: Cell<u64>` via a `next_redirect_sample()`
+  helper — each producer worker (its own OS thread) advances its OWN counter
+  with a plain TLS load/store, no atomic, no shared cacheline. Removed
+  `redirect_sample_counter` from `OwnerProfilePeerWrites` (profile.rs) and the
+  test-only `new_seeded` seeder (production always used `new()`, so the
+  per-worker seed never actually ran). The destination's aggregate histogram
+  `redirect_acquire_hist` STAYS shared and is written ONLY on the sampled op —
+  unchanged. Sample RATE is preserved: each producer samples
+  1-in-(REDIRECT_SAMPLE_MASK+1) of its own enqueues, so each destination's
+  histogram still receives ~1/256 of the enqueues into it (identical aggregate
+  in expectation). Docs (profile.rs struct, umem field + inline comments)
+  corrected off the stale "producer-local"→now-actually-TLS wording.
+- **File(s)**: userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/profile.rs,
+  userspace-dp/src/afxdp/umem/tests/latency_buckets.rs, _Log.md
+- **Validation**: `cargo build` clean. New fail-on-revert test
+  `redirect_sample_sequence_is_producer_local_not_destination_shared`: 4
+  producer threads each do ONE enqueue into the SAME destination → 4 samples
+  (each fresh thread's TLS starts at 0). RED-on-revert (swap TLS → shared
+  atomic): `test result: FAILED. 0 passed; 1 failed` — `left: 1, right: 4`.
+  Restored GREEN: umem 42/0 (incl. the retained rate test
+  `redirect_acquire_hist_samples_one_in_mask_plus_one`, still exactly 1 sample
+  per 256 consecutive enqueues, phase-independent); mirror 25/0, cos 300/0,
+  tx 112/0. SMOKE: assessed NOT warranted — behavior is sample-equivalent (no
+  forwarding/correctness change; the MPSC push path is byte-identical), and the
+  perf win (one fewer contended atomic per enqueue) is sub-ns and not reliably
+  measurable in a line-rate cluster smoke; the issue's suggested 2/4/8-producer
+  criterion microbench is a reasonable follow-up but not a merge gate.
+
 ## 2026-07-18 — #5689 (dataplane/nat): ordinary NAT/NPTv6 non-first fragment translation
 - **Timestamp**: 2026-07-18 (fix/5689-nat-frag-assoc)
 - **Action**: A flowless non-first fragment of an ORDINARY same-family NAT /

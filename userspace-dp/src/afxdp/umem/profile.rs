@@ -113,15 +113,19 @@ pub(in crate::afxdp) struct OwnerProfileOwnerWrites {
 /// #746: peer-worker-written owner-profile telemetry. Every redirecting
 /// worker is a writer of these atomics. Isolated onto its own 64-byte
 /// cacheline so peer writes do not invalidate the owner's cacheline
-/// (see `OwnerProfileOwnerWrites`) and so the redirect-sample counter
-/// churn does not ping-pong unrelated `BindingLiveState` fields.
+/// (see `OwnerProfileOwnerWrites`) and so the sampled-op histogram
+/// writes do not ping-pong unrelated `BindingLiveState` fields.
 ///
 /// The owner reads the peer-written counters only via `snapshot()`;
 /// there is no owner-write path into this struct.
+///
+/// #5160: the redirect-sample SEQUENCE counter is NOT here — it moved to a
+/// producer-local thread-local (`REDIRECT_SAMPLE_SEQ`, umem/mod.rs) so the
+/// many-producer redirect hot path pays no shared RMW per enqueue. Only the
+/// sampled op writes `redirect_acquire_hist` (the destination's aggregate).
 #[repr(align(64))]
 pub(in crate::afxdp) struct OwnerProfilePeerWrites {
     pub(in crate::afxdp) redirect_acquire_hist: [AtomicU64; DRAIN_HIST_BUCKETS],
-    pub(in crate::afxdp) redirect_sample_counter: AtomicU64,
     /// #709: peer-redirect pps window. Formerly `pps_owner_vs_peer[1]`;
     /// split by writer for cacheline isolation (#746). Any worker that
     /// redirects into this binding is a writer; the owner reads via
@@ -147,8 +151,9 @@ const _: () = assert!(core::mem::align_of::<OwnerProfilePeerWrites>() == 64);
 // Ceiling raised to 512 B (plan §3.2 cap-raise). `#[repr(align(64))]`
 // alignment invariant is unchanged — the separate align assert
 // above still holds at 64 B.
-// Peer struct is unchanged (16 hist + 2 scalar AtomicU64 = 144 B,
-// padded to 192 B).
+// Peer struct: 16 hist + 1 scalar AtomicU64 (peer_pps) = 136 B, padded
+// to 192 B (#5160 dropped the shared redirect_sample_counter — now a
+// producer-local thread-local, not a per-binding atomic).
 const _: () = assert!(core::mem::size_of::<OwnerProfileOwnerWrites>() <= 512);
 const _: () = assert!(core::mem::size_of::<OwnerProfilePeerWrites>() <= 320);
 
@@ -185,7 +190,6 @@ impl OwnerProfilePeerWrites {
     pub(super) fn new() -> Self {
         Self {
             redirect_acquire_hist: std::array::from_fn(|_| AtomicU64::new(0)),
-            redirect_sample_counter: AtomicU64::new(0),
             peer_pps: AtomicU64::new(0),
         }
     }
