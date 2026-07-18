@@ -9,8 +9,9 @@ import "fmt"
 //
 // The strict SNAT gates (validateSourceNATPoolStrict,
 // validateSourceNATPoolAddressGrammarStrict, validateSourceNATPoolAddressScopeStrict,
-// validateSourceNATPersistentNoTranslationStrict, validateNATPoolReferencesStrict,
-// validateNATSourceAddressNameReferencesStrict) already run inside
+// validateSourceNATPersistentNoTranslationStrict, validateSourceNATAggregateCardinalityStrict,
+// validateNATPoolReferencesStrict, validateNATSourceAddressNameReferencesStrict)
+// already run inside
 // compileExpanded — but ONLY against the single node the commit compiles for.
 // The strict commit gate (configstore.compileTreeStrict) compiles
 // CompileConfigForNode(localNodeID) alone, so a source-NAT pool / reference error
@@ -116,6 +117,9 @@ func validateSourceNATStrictView(cfg *Config) error {
 		return err
 	}
 	if err := validateSourceNATPersistentNoTranslationStrict(cfg); err != nil {
+		return err
+	}
+	if err := validateSourceNATAggregateCardinalityStrict(cfg); err != nil {
 		return err
 	}
 	if err := validateNATSourceAddressNameReferencesStrict(cfg); err != nil {

@@ -90,10 +90,17 @@ fn nat64_install_forward_fragment_assoc(
         return;
     }
     if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family) {
-        forwarding
-            .nat64
-            .frag_assoc
-            .install(key, *decision, None, now_ns);
+        // #5624: stamp the association with the generation of the forwarding
+        // state that admitted this first fragment. `build_generation` advances
+        // on every config reload, so an association installed here is rejected
+        // once a later commit changes deny/NAT64 rules.
+        forwarding.nat64.frag_assoc.install(
+            key,
+            *decision,
+            None,
+            now_ns,
+            forwarding.nat64.build_generation,
+        );
     }
 }
 
@@ -115,7 +122,16 @@ fn nat64_consult_forward_fragment_assoc(
         return None;
     }
     let key = crate::nat64::nat64_nonfirst_fragment_key(l3_packet, addr_family)?;
-    let (decision, _reverse) = forwarding.nat64.frag_assoc.lookup(&key, now_ns)?;
+    // #5624: consult under the CURRENT forwarding state's generation. An
+    // association installed under a prior generation (before a config commit
+    // changed deny/NAT64 rules) is treated as a miss + evicted here, so the
+    // non-first fragment falls through to the #4617 fail-closed drop instead of
+    // inheriting a stale verdict.
+    let (decision, _reverse) =
+        forwarding
+            .nat64
+            .frag_assoc
+            .lookup(&key, now_ns, forwarding.nat64.build_generation)?;
     // Only a genuine NAT64 forward decision (nat64=true, rewrite_src/dst set)
     // routes to the NAT64 frame builder.
     if !decision.nat.nat64 {
