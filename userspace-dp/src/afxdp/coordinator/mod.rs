@@ -436,9 +436,14 @@ impl Coordinator {
     }
 
     pub(crate) fn stop_inner(&mut self, clear_synced_state: bool) {
-        if let Some(stop) = self.neighbors.monitor_stop.take() {
-            stop.store(true, Ordering::Relaxed);
-        }
+        // #5165: signal AND JOIN the neighbor monitor before any downstream
+        // teardown clears/rebuilds the shared neighbor map. The bare stop store
+        // (pre-#5165) left the monitor detached: a retired old-generation
+        // monitor blocked in recv() could apply a queued kernel event to
+        // `dynamic` after a fresh baseline repopulated it. Joining (bounded by
+        // the monitor's 500ms SO_RCVTIMEO) is the real no-mutation-after-stop
+        // guard, mirroring the resolver join below.
+        self.neighbors.stop_and_join_monitor();
         // #1636: stop the neighbor warmer and drop the producer handle so
         // the worker's recv side disconnects and it exits cleanly. The
         // 500ms recv timeout bounds the join latency.

@@ -1,3 +1,53 @@
+## 2026-07-18 — #5165: neighbor-monitor JoinHandle (no mutation after teardown)
+
+- **Timestamp**: 2026-07-18 (fix/5165-neigh-monitor-join)
+- **Action**: Fixed a control-plane thread-lifetime race. The neighbor
+  MONITOR thread was spawned `spawn_supervised_aux(...).ok()`, DISCARDING
+  its JoinHandle; `stop_inner` signalled `monitor_stop` but could not JOIN
+  before a reconcile cleared/rebuilt the shared `Arc<ShardedNeighborMap>`,
+  so a retired old-generation netlink consumer could mutate the fresh
+  baseline. Asymmetric with the sibling resolver (`resolver_join`). Fix
+  mirrors the resolver exactly:
+  1. Added `monitor_join: Option<JoinHandle<()>>` to `NeighborManager` +
+     `stop_and_join_monitor()` (signal `monitor_stop`, then JOIN).
+  2. `bringup.rs`: retain the join handle via `match spawn_supervised_aux`
+     (was `.ok()`), installing `monitor_stop` + `monitor_join` together
+     ONLY on successful spawn (spawn-fail leaves both None → next reconcile
+     retries, unchanged).
+  3. `stop_inner` calls `stop_and_join_monitor()` (was a bare
+     `monitor_stop.take().store(true)`), so the monitor is provably gone
+     before the map is cleared. Join latency bounded by the monitor's
+     existing 500ms `SO_RCVTIMEO` (the wake — mirrors the resolver's 500ms
+     recv-timeout bound; no new fd-sharing protocol invented).
+  4. `neigh_monitor_thread`: extracted the steady-state loop into
+     `neigh_monitor_steady_state(fd, stop, map, gen, counters)` (a
+     deterministic test seam) and added a post-`recv()` `stop` re-check
+     BEFORE mutating — a stop signalled while blocked in recv retires the
+     thread, so the just-received old-generation batch is dropped.
+- **Tests (fail-on-revert, deterministic, no real netlink)**:
+  - `steady_state_drops_batch_received_after_stop_5165`
+    (neighbor.rs): drives the REAL steady-state loop over an AF_UNIX
+    SOCK_DGRAM socketpair, injecting hand-crafted RTM_NEWNEIGH via the
+    existing `build_newneigh_request`. Event 1 (pre-stop) is applied;
+    after the loop is confirmed blocked in recv, stop is set and event 2
+    injected — the post-recv re-check drops it. Revert (remove the
+    re-check) → event 2 applied → RED.
+  - `stop_and_join_monitor_waits_for_thread` (neighbor_manager.rs):
+    a stand-in thread does bounded work AFTER observing stop; the JOIN
+    makes `stop_and_join_monitor` block until `done==true`. Revert (drop
+    the handle without `join()`) → returns early, `done==false` → RED.
+  - Plus `steady_state_exits_on_stop_when_idle_5165` and
+    `stop_and_join_monitor_no_monitor_is_noop` (liveness / no-op).
+  - GREEN: 4 new pass; `neighbor` suite 167 passed, `coordinator::` 133
+    passed. RED-on-revert proven: neutralizing the re-check AND the join
+    turned exactly the two targeted tests RED (the liveness/no-op stayed
+    GREEN, correctly). Build clean.
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs,
+  userspace-dp/src/afxdp/coordinator/neighbor_manager.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/README.md
+
 ## 2026-07-18 — #6041: address-only (`port no-translation`) persistent-NAT leases (parity follow-up to #5819)
 
 - **Timestamp**: 2026-07-18 (fix/6041-address-only-persist-nat)
