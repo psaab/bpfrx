@@ -2844,9 +2844,7 @@ fn syn_flood_dest_runs_when_cookie_active() {
     let mut state = make_state("trust", profile);
     state.update_syn_cookie_master_key(Some(syn_cookie_key()));
     // Force the zone cookie-active for the test window.
-    state
-        .syn_cookie_active_until_secs
-        .insert("trust".to_string(), 100_000);
+    state.force_syn_cookie_active_for_test("trust", 100_000);
     let victim = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 7));
     for i in 0..2u8 {
         let pkt = tcp_pkt(
@@ -2940,9 +2938,7 @@ fn syn_flood_source_skipped_when_cookie_active() {
     profile.syn_flood_src_threshold = 2;
     let mut state = make_state("trust", profile);
     state.update_syn_cookie_master_key(Some(syn_cookie_key()));
-    state
-        .syn_cookie_active_until_secs
-        .insert("trust".to_string(), 100_000);
+    state.force_syn_cookie_active_for_test("trust", 100_000);
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
     // Many SYNs from one source, far over source-threshold, all Pass (per-source
     // skipped while cookie-active).
@@ -3017,8 +3013,8 @@ fn syn_flood_sketches_allocated_only_when_configured() {
         m.insert("trust".to_string(), p.clone());
         m
     });
-    assert!(!state.syn_dst_sketch.contains_key("trust"));
-    assert!(!state.syn_src_sketch.contains_key("trust"));
+    assert!(!state.syn_dst_sketch_present("trust"));
+    assert!(!state.syn_src_sketch_present("trust"));
     // Configure dst + src → sketches appear.
     let mut p2 = p.clone();
     p2.syn_flood_dst_threshold = 5;
@@ -3028,16 +3024,16 @@ fn syn_flood_sketches_allocated_only_when_configured() {
         m.insert("trust".to_string(), p2);
         m
     });
-    assert!(state.syn_dst_sketch.contains_key("trust"));
-    assert!(state.syn_src_sketch.contains_key("trust"));
+    assert!(state.syn_dst_sketch_present("trust"));
+    assert!(state.syn_src_sketch_present("trust"));
     // Remove them → sketches freed.
     state.update_profiles({
         let mut m = FxHashMap::default();
         m.insert("trust".to_string(), p);
         m
     });
-    assert!(!state.syn_dst_sketch.contains_key("trust"));
-    assert!(!state.syn_src_sketch.contains_key("trust"));
+    assert!(!state.syn_dst_sketch_present("trust"));
+    assert!(!state.syn_src_sketch_present("trust"));
 }
 
 // ================================================================
@@ -5331,8 +5327,8 @@ fn udp_flood_flowless_fragment_folds_into_per_ip_bucket_4567() {
     let d = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
     // Drive the per-DESTINATION-IP cells for D over threshold directly (test
     // seam), leaving the `(D, port=0)` cells untouched.
-    let cells = state.udp_dst_sketch.get("trust").unwrap().cell_indices(&d);
-    let sketch = state.udp_dst_sketch.get_mut("trust").unwrap();
+    let cells = state.udp_dst_sketch_mut_for_test("trust").cell_indices(&d);
+    let sketch = state.udp_dst_sketch_mut_for_test("trust");
     for (row, &col) in cells.iter().enumerate() {
         // #5805: the flood sketch cells are token buckets keyed on `now_ns`; the
         // check below runs at `now_secs=100` (→ `now_ns = 100 * NANOS_PER_SEC`),
@@ -5365,8 +5361,8 @@ fn udp_flood_first_fragment_still_counts_per_ip_port_4567() {
     let mut state = make_state("trust", profile);
     let d = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    let cells = state.udp_dst_sketch.get("trust").unwrap().cell_indices(&d);
-    let sketch = state.udp_dst_sketch.get_mut("trust").unwrap();
+    let cells = state.udp_dst_sketch_mut_for_test("trust").cell_indices(&d);
+    let sketch = state.udp_dst_sketch_mut_for_test("trust");
     for (row, &col) in cells.iter().enumerate() {
         // #5805: the flood sketch cells are token buckets keyed on `now_ns`; the
         // check below runs at `now_secs=100` (→ `now_ns = 100 * NANOS_PER_SEC`),
