@@ -1989,6 +1989,7 @@ fn epoch_based_flow_cache_invalidation_for_demoted_owner_rg() {
     flow_cache.insert(FlowCacheEntry {
         key: key.clone(),
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         descriptor: RewriteDescriptor {
             dst_mac: [0; 6],
             src_mac: [0; 6],
@@ -2034,6 +2035,7 @@ fn epoch_based_flow_cache_invalidation_for_demoted_owner_rg() {
                 &key,
                 FlowCacheLookup {
                     ingress_ifindex: 7,
+                    logical_ingress_ifindex: 7,
                     config_generation: 1,
                     fib_generation: 1,
                 },
@@ -2053,6 +2055,7 @@ fn epoch_based_flow_cache_invalidation_for_demoted_owner_rg() {
                 &key,
                 FlowCacheLookup {
                     ingress_ifindex: 7,
+                    logical_ingress_ifindex: 7,
                     config_generation: 1,
                     fib_generation: 1,
                 },
@@ -2075,6 +2078,7 @@ fn epoch_based_flow_cache_unrelated_rg_not_invalidated() {
     flow_cache.insert(FlowCacheEntry {
         key: key.clone(),
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         descriptor: RewriteDescriptor {
             dst_mac: [0; 6],
             src_mac: [0; 6],
@@ -2123,6 +2127,7 @@ fn epoch_based_flow_cache_unrelated_rg_not_invalidated() {
                 &key,
                 FlowCacheLookup {
                     ingress_ifindex: 7,
+                    logical_ingress_ifindex: 7,
                     config_generation: 1,
                     fib_generation: 1,
                 },
