@@ -10,6 +10,22 @@ const TEST_NOW_SECS: u64 = 128;
 const TEST_NOW_NS: u64 = TEST_NOW_SECS * 1_000_000_000;
 const TCP_FLAG_ACK: u8 = 0x10;
 
+/// Test wrapper for `stage_link_layer_classify` (#5288 added a `now_ns` +
+/// per-worker `KernelNeighborProgramLimiter` to its signature). These tests
+/// assert on the learned userspace neighbor MAP, which `insert_if_changed`
+/// updates unconditionally; the #5288 limiter only gates the (un-observable)
+/// netlink `add_kernel_neighbor` syscall, so a fresh limiter per call is
+/// correct here. The limiter's own repeat/flood gating is pinned directly in
+/// `neighbor_program_limiter::tests`.
+fn classify(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    ctx: &WorkerContext,
+) -> StageOutcome<()> {
+    let mut neigh_limiter = KernelNeighborProgramLimiter::new();
+    stage_link_layer_classify(frame, meta, TEST_NOW_NS, &mut neigh_limiter, ctx)
+}
+
 fn tcp_v4_frame(
     src: Ipv4Addr,
     dst: Ipv4Addr,
@@ -709,7 +725,7 @@ fn arp_learns_vlan_neighbor_under_logical_ifindex_2370() {
         "fixture must map parent ifindex 11 / VLAN 80 to logical 12"
     );
 
-    let outcome = stage_link_layer_classify(&frame, meta, ctx);
+    let outcome = classify(&frame, meta, ctx);
     assert!(matches!(outcome, StageOutcome::RecycleAndContinue));
 
     // The forwarder looks up by the logical (route egress) ifindex.
@@ -751,7 +767,7 @@ fn arp_learns_untagged_neighbor_under_same_ifindex_2370() {
     let frame = arp_reply_frame(sender_ip, sender_mac);
     let meta = link_layer_meta(24, 0);
 
-    let outcome = stage_link_layer_classify(&frame, meta, ctx);
+    let outcome = classify(&frame, meta, ctx);
     assert!(matches!(outcome, StageOutcome::RecycleAndContinue));
 
     let found = lookup_neighbor_entry(forwarding, Some(&neighbors), 24, IpAddr::V4(sender_ip));
@@ -793,9 +809,9 @@ fn arp_two_vlans_same_ip_distinct_logical_keys_2370() {
 
     // Same physical port (11), same neighbor IP, different VLANs.
     let _ =
-        stage_link_layer_classify(&arp_reply_frame(ip, mac_v80), link_layer_meta(11, 80), ctx);
+        classify(&arp_reply_frame(ip, mac_v80), link_layer_meta(11, 80), ctx);
     let _ =
-        stage_link_layer_classify(&arp_reply_frame(ip, mac_v50), link_layer_meta(11, 50), ctx);
+        classify(&arp_reply_frame(ip, mac_v50), link_layer_meta(11, 50), ctx);
 
     assert_eq!(
         neighbors.get(&(12, IpAddr::V4(ip))).map(|e| e.mac),
@@ -831,7 +847,7 @@ fn ndp_learns_vlan_neighbor_under_logical_ifindex_2370() {
     // already-stripped L2 header for the learn-key decision).
     let meta = link_layer_meta(11, 80);
 
-    let outcome = stage_link_layer_classify(&frame, meta, ctx);
+    let outcome = classify(&frame, meta, ctx);
     assert!(matches!(outcome, StageOutcome::Continue(())));
 
     let found = lookup_neighbor_entry(forwarding, Some(&neighbors), 12, target_ip);
@@ -953,7 +969,7 @@ fn arp_invalid_sender_ip_not_learned_2790() {
     let good_ip = Ipv4Addr::new(10, 0, 61, 50);
     let good_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x18];
     let outcome =
-        stage_link_layer_classify(&arp_reply_frame(good_ip, good_mac), meta, ctx);
+        classify(&arp_reply_frame(good_ip, good_mac), meta, ctx);
     assert!(matches!(outcome, StageOutcome::RecycleAndContinue));
     assert_eq!(
         neighbors.get(&(24, IpAddr::V4(good_ip))).map(|e| e.mac),
@@ -971,7 +987,7 @@ fn arp_invalid_sender_ip_not_learned_2790() {
     ] {
         let bad_mac = [0x02, 0x00, 0x00, 0x00, 0xba, 0xad];
         let outcome =
-            stage_link_layer_classify(&arp_reply_frame(bad_ip, bad_mac), meta, ctx);
+            classify(&arp_reply_frame(bad_ip, bad_mac), meta, ctx);
         // ARP is always recycled (it never transits the firewall).
         assert!(
             matches!(outcome, StageOutcome::RecycleAndContinue),
@@ -1041,7 +1057,7 @@ fn arp_own_ip_reply_not_learned_2851() {
     // 1) Spoofed reply claiming the router's OWN IP — must NOT learn.
     let attacker_mac = [0x02, 0x00, 0x00, 0x00, 0xba, 0xad];
     let outcome =
-        stage_link_layer_classify(&arp_reply_frame(own_ip, attacker_mac), meta, ctx);
+        classify(&arp_reply_frame(own_ip, attacker_mac), meta, ctx);
     assert!(
         matches!(outcome, StageOutcome::RecycleAndContinue),
         "an ARP reply (even an own-IP one) is still recycled"
@@ -1056,7 +1072,7 @@ fn arp_own_ip_reply_not_learned_2851() {
     //    learns — the own-IP gate must not over-reject.
     let good_ip = Ipv4Addr::new(10, 0, 61, 50);
     let good_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x18];
-    let _ = stage_link_layer_classify(&arp_reply_frame(good_ip, good_mac), meta, ctx);
+    let _ = classify(&arp_reply_frame(good_ip, good_mac), meta, ctx);
     assert_eq!(
         neighbors.get(&(24, IpAddr::V4(good_ip))).map(|e| e.mac),
         Some(good_mac),
@@ -1091,7 +1107,7 @@ fn ndp_own_ip_advert_not_learned_2851() {
     // 1) NA advertising the router's OWN IPv6 — must NOT learn.
     let (frame, target_ip, _mac) = ndp_na_frame_with_target(own_v6_bytes);
     assert_eq!(target_ip, own_v6, "frame target must be the own IPv6");
-    let outcome = stage_link_layer_classify(&frame, meta, ctx);
+    let outcome = classify(&frame, meta, ctx);
     assert!(matches!(outcome, StageOutcome::Continue(())));
     assert!(
         neighbors.get(&(24, own_v6)).is_none(),
@@ -1107,7 +1123,7 @@ fn ndp_own_ip_advert_not_learned_2851() {
         !forwarding.owns_configured_ip(good_target),
         "the default NA target must be a non-own neighbor"
     );
-    let _ = stage_link_layer_classify(&good_frame, meta, ctx);
+    let _ = classify(&good_frame, meta, ctx);
     assert_eq!(
         neighbors.get(&(24, good_target)).map(|e| e.mac),
         Some(good_mac),
@@ -1154,7 +1170,7 @@ fn ndp_na_override0_does_not_overwrite_live_differing_lla_4475() {
     // 1) Override=0 (default) NA advertising a DIFFERENT MAC — must be
     //    refused; the live entry is left untouched. The NA frame still
     //    transits (Continue).
-    let outcome = stage_link_layer_classify(&frame_ov0, meta, ctx);
+    let outcome = classify(&frame_ov0, meta, ctx);
     assert!(matches!(outcome, StageOutcome::Continue(())));
     assert_eq!(
         neighbors.get(&(24, target)).map(|e| e.mac),
@@ -1173,7 +1189,7 @@ fn ndp_na_override0_does_not_overwrite_live_differing_lla_4475() {
             .override_flag,
         "test frame must carry Override=1"
     );
-    let outcome = stage_link_layer_classify(&frame_ov1, meta, ctx);
+    let outcome = classify(&frame_ov1, meta, ctx);
     assert!(matches!(outcome, StageOutcome::Continue(())));
     assert_eq!(
         neighbors.get(&(24, target)).map(|e| e.mac),
@@ -1208,7 +1224,7 @@ fn ndp_na_override0_first_time_learn_still_creates_4475() {
         "the base frame is Override=0"
     );
 
-    let outcome = stage_link_layer_classify(&frame, meta, ctx);
+    let outcome = classify(&frame, meta, ctx);
     assert!(matches!(outcome, StageOutcome::Continue(())));
     assert_eq!(
         neighbors.get(&(24, target)).map(|e| e.mac),
@@ -1258,7 +1274,7 @@ fn arp_nat_excluded_wan_ip_not_learned_3182() {
     // 1) Spoofed reply claiming the router's OWN WAN IP — must NOT learn.
     let attacker_mac = [0x02, 0x00, 0x00, 0x00, 0xba, 0xad];
     let outcome =
-        stage_link_layer_classify(&arp_reply_frame(wan_ip, attacker_mac), meta, ctx);
+        classify(&arp_reply_frame(wan_ip, attacker_mac), meta, ctx);
     assert!(matches!(outcome, StageOutcome::RecycleAndContinue));
     assert!(
         neighbors.get(&(12, IpAddr::V4(wan_ip))).is_none(),
@@ -1273,7 +1289,7 @@ fn arp_nat_excluded_wan_ip_not_learned_3182() {
     // 2) A legitimate NON-own neighbor on the same VLAN still learns.
     let good_ip = Ipv4Addr::new(172, 16, 80, 9);
     let good_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x09];
-    let _ = stage_link_layer_classify(&arp_reply_frame(good_ip, good_mac), meta, ctx);
+    let _ = classify(&arp_reply_frame(good_ip, good_mac), meta, ctx);
     assert_eq!(
         neighbors.get(&(12, IpAddr::V4(good_ip))).map(|e| e.mac),
         Some(good_mac),
@@ -1308,7 +1324,7 @@ fn ndp_nat_excluded_wan_ip_not_learned_3182() {
 
     let (frame, target_ip, _mac) = ndp_na_frame_with_target(wan_v6_bytes);
     assert_eq!(target_ip, wan_v6, "frame target must be the own WAN IPv6");
-    let outcome = stage_link_layer_classify(&frame, meta, ctx);
+    let outcome = classify(&frame, meta, ctx);
     assert!(matches!(outcome, StageOutcome::Continue(())));
     assert!(
         neighbors.get(&(12, wan_v6)).is_none() && neighbors.get(&(11, wan_v6)).is_none(),

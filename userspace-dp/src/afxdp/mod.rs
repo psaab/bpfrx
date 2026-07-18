@@ -1093,6 +1093,14 @@ use session_delta::{flush_session_deltas, purge_queued_flows_for_closed_deltas};
 mod neg_neigh;
 use neg_neigh::{neg_neigh_gate, neg_neigh_record};
 
+// #5288: bounded, per-worker rate limiter for kernel neighbor-table
+// programming on the data-path ARP/NDP learn. Skips the netlink
+// socket()/sendto()/close() + allocations for same-key/same-MAC repeats and
+// rate-caps a changed-flood so an accepted-advert flood cannot starve the XSK
+// worker.
+mod neighbor_program_limiter;
+use neighbor_program_limiter::KernelNeighborProgramLimiter;
+
 // #1769: shared, per-key, rate-limited on-demand neighbor resolver. On a
 // negative-cache fast-fail the worker enqueues the dst here; the resolver
 // thread issues a single-key RTM_GETNEIGH, caches a confirmed lladdr

@@ -1,3 +1,34 @@
+## 2026-07-18 — #5288: bound data-path kernel-neighbor programming on the XSK worker
+
+- **Timestamp**: 2026-07-18 (fix/5288-neighbor-netlink-bounded)
+- **Action**: `stage_link_layer_classify` called `add_kernel_neighbor`
+  UNCONDITIONALLY per accepted ARP reply / NDP NA — a raw `AF_NETLINK`
+  `socket()`/`sendto()`/`close()` + request/IP `Vec` allocations, on the
+  latency-sensitive XSK worker — even for a same-key/same-MAC repeat whose
+  `insert_if_changed` result was discarded. An attacker streaming valid
+  adverts for a non-owned unicast IP could storm netlink per frame →
+  forwarding starvation (perf/DoS). Fix: a new per-worker
+  `KernelNeighborProgramLimiter` (`neighbor_program_limiter.rs`, 256-slot
+  direct-mapped table) gates both learn arms. It skips repeats the kernel
+  already holds (proved by the slot OR `insert_if_changed == false`),
+  rate-caps a changed-flood to ≤1 program per 50 ms per slot (which also
+  bounds the AGGREGATE per-worker netlink rate to ≤ SLOTS/interval under a
+  many-IP flood), and never loses a genuine change — a real MAC change after
+  steady state programs immediately (steady-state re-adverts do not consume
+  the rate budget), and a change rate-limited amid a flood stays "owed" and
+  is retried on the next advert. The `should_program` decision is pure
+  (no alloc, no syscall) with 7 unit tests incl. the #5288 fail-on-revert
+  (an identical-repeat flood must program ONCE, not N times). NOT
+  HA/session-sync — neighbor programming is a LOCAL kernel-table op, so the
+  limiter is per-worker with no peer coordination. Persistent-socket +
+  off-worker coalescing of the send itself is a DEFERRED follow-up. Full
+  userspace-dp suite 4011 passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/neighbor_program_limiter.rs (new),
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_stages_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/afxdp/README.md
+
 ## 2026-07-18 — #5139: flow-cache identity must include the logical (VLAN) ingress ifindex
 
 - **Timestamp**: 2026-07-18 (fix/5139-flowcache-logical-ifindex)
