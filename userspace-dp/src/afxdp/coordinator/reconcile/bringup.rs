@@ -440,16 +440,34 @@ pub(super) fn bring_up_workers(
         // #925-A: wrap aux thread in catch_unwind so a panic in the
         // netlink path doesn't kill the daemon. No respawn — see
         // spawn_supervised_aux doc for operator-visible degradation.
-        spawn_supervised_aux("neigh-monitor", move || {
+        //
+        // #5165: RETAIN the join handle (was discarded via `.ok()`), mirroring
+        // the sibling `neigh-resolver` above. Install `monitor_stop` +
+        // `monitor_join` together ONLY when the thread actually spawned, so
+        // `stop_inner` can JOIN the monitor after signalling stop and enforce
+        // no-mutation-after-stop. On spawn failure leave BOTH `None` so the
+        // `monitor_stop.is_none()` guard above lets the NEXT reconcile retry —
+        // the neighbor cache still fills from the workers' RX-learned path and
+        // the on-demand resolver, so there is no availability regression.
+        match spawn_supervised_aux("neigh-monitor", move || {
             neigh_monitor_thread(
                 stop_clone,
                 dynamic_neighbors,
                 neighbor_generation,
                 monitor_counters,
             )
-        })
-        .ok();
-        coord.neighbors.monitor_stop = Some(stop);
+        }) {
+            Ok(join) => {
+                coord.neighbors.monitor_stop = Some(stop);
+                coord.neighbors.monitor_join = Some(join);
+            }
+            Err(err) => {
+                eprintln!(
+                    "xpf-userspace-dp: neighbor monitor thread spawn failed: {err}; \
+                     kernel neighbor sync disabled this reconcile (will retry)"
+                );
+            }
+        }
     }
     // #1636 option C: spawn the long-lived neighbor-warmer worker. Fed
     // by Coordinator::queue_warm_pass via a bounded MPSC queue; fires

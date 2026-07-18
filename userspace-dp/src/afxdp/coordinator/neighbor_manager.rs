@@ -40,6 +40,16 @@ pub(crate) struct NeighborManager {
     pub(crate) generation: Arc<AtomicU64>,
     pub(crate) manager_keys: Arc<Mutex<FastSet<(i32, IpAddr)>>>,
     pub(crate) monitor_stop: Option<Arc<AtomicBool>>,
+    /// #5165: join handle for the neighbor-monitor thread. Retained (like the
+    /// sibling `resolver_join`, no longer discarded via `.ok()`) so `stop_inner`
+    /// can JOIN the monitor after signalling stop — joining is what enforces the
+    /// no-mutation-after-stop invariant that the loop's stop re-check alone
+    /// cannot: a retired old-generation monitor blocked in `recv()` could
+    /// otherwise apply a queued kernel neighbor event to `dynamic` AFTER a
+    /// reconcile cleared the map and a fresh baseline repopulated it. Join
+    /// latency is bounded by the monitor's 500ms `SO_RCVTIMEO` (the same bound
+    /// the resolver's 500ms recv timeout provides).
+    pub(crate) monitor_join: Option<std::thread::JoinHandle<()>>,
     // #1636 option C: proactive neighbor warming.
     /// Per-(ifindex, hop) last-probe timestamp (monotonic ns) for the
     /// 5s per-key rate-limit. Shared with the warmer worker thread.
@@ -107,6 +117,7 @@ impl NeighborManager {
             generation: Arc::new(AtomicU64::new(0)),
             manager_keys: Arc::new(Mutex::new(FastSet::default())),
             monitor_stop: None,
+            monitor_join: None,
             last_probed_at: Arc::new(Mutex::new(FastMap::default())),
             warm_queue: None,
             warm_stop: None,
@@ -130,5 +141,75 @@ impl NeighborManager {
             resolver_stop: None,
             resolver_join: None,
         }
+    }
+
+    /// #5165: signal the neighbor-monitor thread to stop and JOIN it, mirroring
+    /// the resolver teardown in `stop_inner`. Signalling alone is a check-then-
+    /// act race (the loop only re-checks `stop` around its `recv()`); JOINING is
+    /// what guarantees the retired monitor has exited BEFORE the caller proceeds
+    /// to clear/reset the shared neighbor map, so an old-generation event can
+    /// never mutate a freshly-rebuilt baseline. Idempotent: a monitor that was
+    /// never spawned (both fields `None`) is a no-op. Join latency is bounded by
+    /// the monitor's 500ms `SO_RCVTIMEO`.
+    pub(crate) fn stop_and_join_monitor(&mut self) {
+        if let Some(stop) = self.monitor_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(join) = self.monitor_join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod monitor_join_tests_5165 {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// #5165 FAIL-ON-REVERT (join): `stop_and_join_monitor` must JOIN the
+    /// monitor thread (wait for it to finish), not merely signal stop. The join
+    /// is what enforces no-mutation-after-stop — `stop_inner` clears the shared
+    /// neighbor map only AFTER this returns, so the retired monitor must be
+    /// provably gone. A stand-in thread performs a bounded unit of work AFTER
+    /// observing stop; a real JOIN makes `stop_and_join_monitor` block until it
+    /// finishes (`done == true`). Reverting to the pre-#5165 `.ok()` discard
+    /// (drop the handle without `join()`) returns immediately with
+    /// `done == false` -> RED.
+    #[test]
+    fn stop_and_join_monitor_waits_for_thread() {
+        let mut mgr = NeighborManager::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (s, d) = (stop.clone(), done.clone());
+        let handle = std::thread::spawn(move || {
+            // Mirror a monitor blocked in recv when stop is signalled: wake,
+            // then perform one final bounded unit of work before exiting.
+            while !s.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(40));
+            d.store(true, Ordering::Relaxed);
+        });
+        mgr.monitor_stop = Some(stop);
+        mgr.monitor_join = Some(handle);
+
+        mgr.stop_and_join_monitor();
+
+        assert!(
+            done.load(Ordering::Relaxed),
+            "stop_and_join_monitor must JOIN the retired monitor (wait for it), not just signal stop",
+        );
+        assert!(mgr.monitor_stop.is_none(), "monitor_stop must be taken");
+        assert!(mgr.monitor_join.is_none(), "monitor_join must be taken");
+    }
+
+    /// A monitor that was never spawned (both handles `None`, e.g. a spawn
+    /// failure that installed neither) is a safe no-op.
+    #[test]
+    fn stop_and_join_monitor_no_monitor_is_noop() {
+        let mut mgr = NeighborManager::new();
+        mgr.stop_and_join_monitor();
+        assert!(mgr.monitor_stop.is_none() && mgr.monitor_join.is_none());
     }
 }
