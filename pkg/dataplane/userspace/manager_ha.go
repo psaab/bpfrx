@@ -159,7 +159,11 @@ func (m *Manager) SyncFabricState() {
 	if m.proc == nil || m.proc.Process == nil || m.lastSnapshot == nil {
 		return
 	}
-	fabrics := buildFabricSnapshots(m.lastSnapshot.Config)
+	build := m.fabricSnapshotBuilder
+	if build == nil {
+		build = buildFabricSnapshots
+	}
+	fabrics := build(m.lastSnapshot.Config)
 	if len(fabrics) == 0 {
 		return
 	}
@@ -170,7 +174,67 @@ func (m *Manager) SyncFabricState() {
 	}
 	if err := m.requestLocked(req, &status); err != nil {
 		slog.Debug("userspace: failed to sync fabric state", "err", err)
+		return
 	}
+	// #5306: persist the resolved fabrics into the Go-side lastSnapshot. The
+	// update_fabrics send above already handed the helper the freshly-resolved
+	// peer MACs, but the partial-rebuild publish paths
+	// (PublishRouteOverlaySnapshot, the policy-scheduler republish, the #5134
+	// worker-arm re-apply) each start from `next := *m.lastSnapshot` and rebuild
+	// ONLY Routes, re-publishing every other section — Fabrics included —
+	// verbatim. Without this writeback that verbatim Fabrics is the STALE,
+	// unresolved-MAC set baked in at the last full apply, so the next such
+	// apply_snapshot silently reverts the helper to the unresolved fabric MAC —
+	// exactly during the HA window fabric cross-chassis forwarding exists to
+	// preserve. Write back only after the send succeeds (mutate-after-success):
+	// a transient control-socket error leaves lastSnapshot.Fabrics matching what
+	// the helper actually has. Mirrors RegenerateNeighborSnapshot's post-publish
+	// writeback for the neighbor table.
+	m.persistResolvedFabricsLocked(fabrics)
+}
+
+// persistResolvedFabricsLocked writes the fabric snapshots SyncFabricState just
+// pushed to the helper back into m.lastSnapshot so the partial-rebuild publish
+// paths (which do `next := *m.lastSnapshot` and refresh only Routes) carry the
+// resolved peer MAC forward instead of reverting to the stale set (#5306).
+//
+// It mirrors RegenerateNeighborSnapshot's post-publish bookkeeping: advance the
+// generation + publishedSnapshot and refresh lastSnapshotHash so the status
+// reconcile loop does not mistake the mutated snapshot for an unpublished
+// generation (a redundant full apply_snapshot) and the content-dedup gate
+// compares against the now-current content. No-op when the fabric set is
+// unchanged so the daemon's post-refreshFabricFwd SyncFabricState cadence does
+// not churn the generation on every steady-state call. Caller holds m.mu.
+func (m *Manager) persistResolvedFabricsLocked(fabrics []FabricSnapshot) {
+	if m.lastSnapshot == nil {
+		return
+	}
+	if fabricSnapshotsEqual(m.lastSnapshot.Fabrics, fabrics) {
+		return
+	}
+	m.lastSnapshot.Fabrics = fabrics
+	m.generation++
+	m.lastSnapshot.Generation = m.generation
+	m.publishedSnapshot = m.lastSnapshot.Generation
+	if h, ok := snapshotContentHash(m.lastSnapshot); ok {
+		m.lastSnapshotHash = h
+	}
+}
+
+// fabricSnapshotsEqual reports whether two fabric snapshot slices are
+// element-wise identical. FabricSnapshot is a flat struct of comparable fields,
+// so a direct == comparison suffices — no reflect (retirement-boundary canary,
+// TestUserspaceManagerDoesNotImportReflectOrUnsafe).
+func fabricSnapshotsEqual(a, b []FabricSnapshot) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ExportAllSessionsViaEventStream tells the Rust helper to push all current

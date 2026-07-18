@@ -51729,3 +51729,28 @@ top.
   `unrelated_neighbor_mac_change_does_not_evict_cached_flow` and
   `mac_change_epoch_isolated_per_shard_across_neighbors` RED while the #3048
   over-eviction guard stays green.
+
+## 2026-07-17 — #5306 fabric snapshot writeback (Go control plane)
+- **Timestamp**: 2026-07-17
+- **Action**: Fix HA fabric-snapshot revert bug. `SyncFabricState`
+  resolved fabric peer MACs and shipped them over `update_fabrics` but
+  never wrote the resolved set back into Go's `m.lastSnapshot.Fabrics`.
+  The partial-rebuild publish paths (`PublishRouteOverlaySnapshot`, the
+  policy-scheduler republish, the #5134 worker-arm re-apply) each do
+  `next := *m.lastSnapshot` and rebuild only Routes, re-publishing the
+  STALE unresolved-MAC fabrics verbatim and silently reverting the helper
+  during the HA window fabric forwarding must preserve. Added
+  `persistResolvedFabricsLocked` (mirrors `RegenerateNeighborSnapshot`'s
+  post-publish writeback: bump generation + publishedSnapshot, refresh
+  lastSnapshotHash, no-op on unchanged) called after a successful
+  `update_fabrics`. Added an injectable `fabricSnapshotBuilder` seam for
+  deterministic unit testing.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/manager_fabric_writeback_5306_test.go,
+  docs/fabric-cross-chassis-fwd.md
+- **Validation**: `go build ./...` green; `go test
+  ./pkg/dataplane/userspace/...` green. RED-on-revert verified firsthand:
+  neutralizing the `persistResolvedFabricsLocked` writeback turns
+  `TestSyncFabricStatePersistsResolvedFabricsIntoLastSnapshot` RED (both
+  the direct-writeback and end-to-end apply_snapshot assertions).
