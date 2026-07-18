@@ -159,16 +159,39 @@ impl FlowCacheStamp {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FlowCacheLookup {
+    /// PHYSICAL parent ingress ifindex (`meta.ingress_ifindex`). Used for set
+    /// placement (`set_index`) and invalidation — the value the GC / RST
+    /// teardown paths pass (`binding.ifindex`), so those stay coherent.
     pub(super) ingress_ifindex: i32,
+    /// #5139: LOGICAL ingress ifindex — the VLAN-unit ifindex that selects the
+    /// security zone. On a non-VLAN interface this equals `ingress_ifindex`.
+    /// It is an ADDITIONAL in-set match discriminator (see `FlowCacheEntry`) so
+    /// two VLAN units co-parented on ONE physical interface with the SAME
+    /// 5-tuple do NOT alias to one entry (cross-zone policy/NAT replay).
+    pub(super) logical_ingress_ifindex: i32,
     pub(super) config_generation: u64,
     pub(super) fib_generation: u32,
 }
 
 impl FlowCacheLookup {
     #[inline]
-    pub(super) fn for_packet(meta: UserspaceDpMeta, validation: ValidationState) -> Self {
+    pub(super) fn for_packet(
+        meta: UserspaceDpMeta,
+        validation: ValidationState,
+        forwarding: &ForwardingState,
+    ) -> Self {
+        // #5139: resolve the LOGICAL (VLAN-selecting) ingress ifindex the same
+        // way the cache-insert path does (`from_forward_decision`), so the
+        // lookup identity matches the stamped entry identity for the same
+        // packet. Non-VLAN ingress (no mapping) falls back to the physical
+        // ifindex, so co-parented VLANs differ but bare interfaces are
+        // unchanged.
+        let physical = meta.ingress_ifindex as i32;
+        let logical = resolve_ingress_logical_ifindex(forwarding, physical, meta.ingress_vlan_id)
+            .unwrap_or(physical);
         Self {
-            ingress_ifindex: meta.ingress_ifindex as i32,
+            ingress_ifindex: physical,
+            logical_ingress_ifindex: logical,
             config_generation: validation.config_generation,
             fib_generation: validation.fib_generation,
         }
@@ -179,7 +202,20 @@ impl FlowCacheLookup {
 #[derive(Clone)]
 pub(super) struct FlowCacheEntry {
     pub(super) key: crate::session::SessionKey,
+    /// PHYSICAL parent ingress ifindex — hashed by `set_index` for set
+    /// placement and matched by `invalidate_slot` (which the GC / RST teardown
+    /// paths drive with `binding.ifindex`). Keeping this physical keeps those
+    /// invalidations coherent (they cannot recover the logical ifindex from a
+    /// bare session key). Invalidate matches physical-only, so it over-evicts
+    /// co-5-tuple VLAN siblings — safe (a re-miss re-evaluates from policy),
+    /// never stranding a stale entry.
     pub(super) ingress_ifindex: i32,
+    /// #5139: LOGICAL (VLAN-unit) ingress ifindex that selects the security
+    /// zone. An ADDITIONAL in-set match key (alongside `key` + `ingress_ifindex`)
+    /// so a HIT requires the SAME logical VLAN, not just the same physical
+    /// parent — closing the co-parented-VLAN cross-zone policy/NAT replay.
+    /// Equals `ingress_ifindex` on a non-VLAN interface.
+    pub(super) logical_ingress_ifindex: i32,
     pub(super) descriptor: RewriteDescriptor,
     pub(super) decision: SessionDecision,
     pub(super) metadata: SessionMetadata,
@@ -533,7 +569,12 @@ impl FlowCacheEntry {
         };
         Some(Self {
             key: flow.forward_key.clone(),
+            // Physical parent for set placement / invalidation coherence.
             ingress_ifindex: meta.ingress_ifindex as i32,
+            // #5139: the LOGICAL (VLAN-selecting) ingress ifindex resolved above
+            // (`ingress_ifindex` local) is the zone-selecting identity; stamp it
+            // as the additional in-set match discriminator.
+            logical_ingress_ifindex: ingress_ifindex,
             descriptor: RewriteDescriptor {
                 dst_mac: decision.resolution.neighbor_mac.unwrap_or([0; 6]),
                 src_mac: decision.resolution.src_mac.unwrap_or([0; 6]),
@@ -928,7 +969,15 @@ impl FlowCache {
         for way in 0..FLOW_CACHE_WAYS {
             let entry_idx = base + way;
             if let Some(entry) = &self.entries[entry_idx] {
-                if entry.key != *key || entry.ingress_ifindex != lookup.ingress_ifindex {
+                // #5139: identity requires the SAME logical (VLAN-selecting)
+                // ingress ifindex, not just the same 5-tuple + physical parent
+                // — otherwise two co-parented VLAN units with one 5-tuple alias
+                // and VLAN B replays VLAN A's decision/NAT/egress before the
+                // slow-path zone-pair policy runs (cross-zone fail-open).
+                if entry.key != *key
+                    || entry.ingress_ifindex != lookup.ingress_ifindex
+                    || entry.logical_ingress_ifindex != lookup.logical_ingress_ifindex
+                {
                     continue;
                 }
                 // Key match. Validate generation/epoch/lease.
@@ -998,7 +1047,14 @@ impl FlowCache {
         for way in 0..FLOW_CACHE_WAYS {
             let entry_idx = base + way;
             if let Some(existing) = &self.entries[entry_idx] {
-                if existing.key == entry.key && existing.ingress_ifindex == entry.ingress_ifindex {
+                // #5139: an in-place update targets the SAME identity — same
+                // 5-tuple, same physical parent, AND same logical VLAN — so a
+                // second VLAN's insert allocates a distinct way instead of
+                // overwriting the first VLAN's entry.
+                if existing.key == entry.key
+                    && existing.ingress_ifindex == entry.ingress_ifindex
+                    && existing.logical_ingress_ifindex == entry.logical_ingress_ifindex
+                {
                     self.entries[entry_idx] = Some(entry);
                     self.promote_lru(set, way as u8);
                     return;

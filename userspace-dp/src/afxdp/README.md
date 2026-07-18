@@ -132,7 +132,24 @@ sync.
         Before #3609 it passed the raw physical `meta.ingress_ifindex`, so a
         host-bound packet on a VLAN sub-interface missed its per-interface
         override and silently fell back to the zone set.
-    Untagged ports resolve physical == logical, so all eight sites are
+      - **#5139 — flow-cache identity:** the per-worker flow cache
+        (`flow_cache.rs`) now carries the LOGICAL ingress ifindex as an
+        additional in-set match discriminator (`FlowCacheEntry.
+        logical_ingress_ifindex` / `FlowCacheLookup.logical_ingress_ifindex`,
+        resolved by `for_packet` the same way the insert path does), so a HIT
+        requires the SAME VLAN unit, not just the same physical parent + 5-tuple.
+        Before #5139 both lookup and insert keyed only on the physical
+        `meta.ingress_ifindex`, so two VLAN units co-parented on one interface
+        with the same 5-tuple aliased to one entry and VLAN B replayed VLAN A's
+        decision/NAT/egress BEFORE the slow-path zone-pair policy ran
+        (cross-zone fail-OPEN). Set placement (`set_index`) and invalidation stay
+        keyed on the physical ifindex — the GC / RST-teardown invalidate paths
+        drive `invalidate_slot` with `binding.ifindex` and cannot recover the
+        logical unit from a bare session key, so keeping those physical keeps
+        eviction coherent; invalidate matches physical-only and thus over-evicts
+        a co-5-tuple VLAN sibling (safe — a re-miss re-evaluates from policy),
+        never stranding a stale entry.
+    Untagged ports resolve physical == logical, so all nine sites are
     no-ops there (non-VLAN behavior preserved).
   - **NA validation (`#2368`, RFC 4861 §7.1.2 / RFC 4443):** before an
     NA learns a Target Link-Layer Address, `parse_ndp_neighbor_advert`

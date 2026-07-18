@@ -93,7 +93,10 @@ pub(super) fn stage_flow_cache_hit(
 
     if let Some(cached) = flow_state.flow_cache.lookup_counted(
         &flow.forward_key,
-        FlowCacheLookup::for_packet(meta, validation),
+        // #5139: resolve the LOGICAL (VLAN-selecting) ingress ifindex into the
+        // lookup identity so co-parented VLANs don't alias — `worker_ctx.
+        // forwarding` carries the (physical, vlan) → logical map.
+        FlowCacheLookup::for_packet(meta, validation, worker_ctx.forwarding),
         now_secs,
         &worker_ctx.rg_epochs,
         meta.pkt_len,

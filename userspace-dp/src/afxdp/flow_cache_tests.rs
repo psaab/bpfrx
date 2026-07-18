@@ -103,6 +103,7 @@ fn make_entry(
     FlowCacheEntry {
         key,
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         descriptor: make_descriptor(),
         decision: make_decision(ForwardingDisposition::ForwardCandidate),
         metadata: make_metadata(owner_rg_id),
@@ -139,6 +140,7 @@ fn cache_hit_with_matching_stamp() {
 
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 5,
         fib_generation: 3,
     };
@@ -146,6 +148,64 @@ fn cache_hit_with_matching_stamp() {
     assert!(hit.is_some(), "expected cache hit with matching stamp");
     assert_eq!(cache.hits, 1);
     assert_eq!(cache.misses, 0);
+}
+
+// #5139 FAIL-ON-REVERT: two VLAN units co-parented on ONE physical interface
+// (same physical ingress ifindex) with the SAME 5-tuple have DISTINCT logical
+// (VLAN-selecting) ingress ifindexes. A flow-cache entry stamped by VLAN A must
+// NOT be replayed for VLAN B — the logical ifindex selects the security
+// zone-pair, so aliasing them fail-OPENs cross-zone policy/NAT. VLAN B must MISS
+// and fall to the slow-path zone-pair policy. Reverting the lookup identity to
+// the physical parent (dropping the `logical_ingress_ifindex` discriminator)
+// makes VLAN B HIT VLAN A's entry → the `is_none()` assertion below goes RED.
+#[test]
+fn coparented_vlan_same_5tuple_distinct_logical_ifindex_misses_5139() {
+    let rg_epochs = default_rg_epochs();
+    let mut cache = FlowCache::new();
+    let key = make_key();
+    let stamp = FlowCacheStamp {
+        config_generation: 5,
+        fib_generation: 3,
+        owner_rg_id: 1,
+        owner_rg_epoch: 0,
+        owner_rg_lease_until: 0,
+    };
+    const PHYS_PARENT: i32 = 7; // one physical interface (the aliasing parent)
+    const VLAN_A_LOGICAL: i32 = 100; // e.g. reth0.50 logical unit
+    const VLAN_B_LOGICAL: i32 = 101; // e.g. reth0.80 logical unit — SAME parent
+
+    // VLAN A caches its decision: physical parent 7, logical unit 100.
+    let mut entry_a = make_entry(key.clone(), stamp, 1);
+    entry_a.ingress_ifindex = PHYS_PARENT;
+    entry_a.logical_ingress_ifindex = VLAN_A_LOGICAL;
+    cache.insert(entry_a);
+
+    // VLAN B: SAME physical parent, SAME 5-tuple, DIFFERENT logical unit.
+    let vlan_b_lookup = FlowCacheLookup {
+        ingress_ifindex: PHYS_PARENT,
+        logical_ingress_ifindex: VLAN_B_LOGICAL,
+        config_generation: 5,
+        fib_generation: 3,
+    };
+    assert!(
+        cache.lookup(&key, vlan_b_lookup, 0, &rg_epochs).is_none(),
+        "co-parented VLAN B (logical {VLAN_B_LOGICAL}) must MISS VLAN A's entry \
+         (logical {VLAN_A_LOGICAL}) — else cross-zone policy/NAT replay (#5139)"
+    );
+
+    // Control: VLAN A's OWN lookup (same logical) still HITS — the cache works
+    // per-VLAN; only the co-parented sibling is isolated. This proves the miss
+    // above is the logical discriminator, not a set/stamp coincidence.
+    let vlan_a_lookup = FlowCacheLookup {
+        ingress_ifindex: PHYS_PARENT,
+        logical_ingress_ifindex: VLAN_A_LOGICAL,
+        config_generation: 5,
+        fib_generation: 3,
+    };
+    assert!(
+        cache.lookup(&key, vlan_a_lookup, 0, &rg_epochs).is_some(),
+        "VLAN A's own flow must still hit its cached entry"
+    );
 }
 
 #[test]
@@ -164,6 +224,7 @@ fn cache_hit_accumulates_observed_bytes() {
 
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 5,
         fib_generation: 3,
     };
@@ -202,6 +263,7 @@ fn stale_config_generation_causes_miss() {
 
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 2, // newer than entry's 1
         fib_generation: 1,
     };
@@ -229,6 +291,7 @@ fn stale_fib_generation_causes_miss() {
 
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 6, // newer than entry's 5
     };
@@ -261,6 +324,7 @@ fn stale_rg_epoch_causes_miss() {
 
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -293,6 +357,7 @@ fn unrelated_rg_epoch_bump_still_hits() {
 
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -346,6 +411,7 @@ fn out_of_range_owner_rg_invalidates_on_node_level_bump() {
 
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -383,6 +449,7 @@ fn in_range_owner_rg_unchanged_by_node_level_bump() {
 
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -419,6 +486,7 @@ fn expired_owner_rg_lease_causes_miss_without_epoch_bump() {
 
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -443,6 +511,7 @@ fn expired_owner_rg_lease_causes_miss_for_out_of_range_rg() {
 
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -1658,6 +1727,7 @@ fn flow_cache_4way_no_eviction_under_4_distinct_keys_in_same_set() {
     for key in &keys {
         let lookup = FlowCacheLookup {
             ingress_ifindex: 7,
+            logical_ingress_ifindex: 7,
             config_generation: 1,
             fib_generation: 1,
         };
@@ -1697,6 +1767,7 @@ fn flow_cache_4way_lru_evicts_oldest_on_5th_insert() {
     // keys[0] must be gone, keys[1..=4] present.
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -1740,6 +1811,7 @@ fn flow_cache_4way_lookup_promotes_to_mru() {
     // Look up keys[0] — should promote it to MRU.
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -1784,6 +1856,7 @@ fn flow_cache_4way_invalidate_clears_only_matching_way() {
     cache.invalidate_slot(&keys[1], 7);
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -1840,6 +1913,7 @@ fn flow_cache_4way_dedup_replaces_existing_and_promotes() {
     // have been evicted on lookup).
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 2,
         fib_generation: 1,
     };
@@ -1875,6 +1949,7 @@ fn flow_cache_4way_lru_permutation_invariant_holds() {
     }
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -1944,6 +2019,7 @@ fn count_active_flows_marks_recently_hit() {
     cache.tick_advance_epoch();
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -1973,6 +2049,7 @@ fn active_flow_debug_entries_include_worker_join_keys() {
     cache.tick_advance_epoch();
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -2018,6 +2095,7 @@ fn active_flow_debug_entries_report_truncation_without_losing_count() {
     cache.tick_advance_epoch();
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -2051,6 +2129,7 @@ fn active_flow_debug_entries_count_cos_queues_without_row_limit_loss() {
         cache.tick_advance_epoch();
         let lookup = FlowCacheLookup {
             ingress_ifindex: 7,
+            logical_ingress_ifindex: 7,
             config_generation: 1,
             fib_generation: 1,
         };
@@ -2086,6 +2165,7 @@ fn count_active_flows_ages_out_after_window() {
     cache.tick_advance_epoch();
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -2121,6 +2201,7 @@ fn count_active_flows_handles_epoch_wraparound() {
     cache.tick_advance_epoch(); // u16::MAX
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -2167,6 +2248,7 @@ fn count_active_flows_entry_at_epoch_max_not_confused_with_sentinel() {
     cache.current_epoch = u16::MAX;
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 1,
         fib_generation: 1,
     };
@@ -2194,6 +2276,7 @@ fn issue_1741_stamp_and_lookup() -> (FlowCache, crate::session::SessionKey, Flow
     let key = make_key();
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
+        logical_ingress_ifindex: 7,
         config_generation: 5,
         fib_generation: 3,
     };
@@ -2477,6 +2560,7 @@ fn flow_cache_not_populated_by_control_segment_via_insertion_site() {
         let _ = key;
         FlowCacheLookup {
             ingress_ifindex: meta.ingress_ifindex as i32,
+            logical_ingress_ifindex: meta.ingress_ifindex as i32,
             config_generation: validation.config_generation,
             fib_generation: validation.fib_generation,
         }

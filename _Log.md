@@ -1,3 +1,47 @@
+## 2026-07-18 — #5139: flow-cache identity must include the logical (VLAN) ingress ifindex
+
+- **Timestamp**: 2026-07-18 (fix/5139-flowcache-logical-ifindex)
+- **Action**: The userspace-dp flow cache keyed BOTH lookup and insert on
+  `meta.ingress_ifindex` (the PHYSICAL parent). The logical (VLAN-unit) ingress
+  ifindex — which selects the security zone-pair — was resolved
+  (`resolve_ingress_logical_ifindex`) only for DSCP/L4 filter checks, never
+  stamped into the cache KEY. So two VLAN units co-parented on ONE physical
+  interface with the SAME 5-tuple aliased to ONE cache entry: a HIT replayed
+  VLAN A's decision/NAT/egress for VLAN B BEFORE the slow-path zone-pair policy
+  ran → cross-zone policy/NAT fail-OPEN (High, security). Fix: added
+  `logical_ingress_ifindex` to `FlowCacheLookup` + `FlowCacheEntry` as an
+  ADDITIONAL in-set match discriminator (lookup match + insert dedup);
+  `for_packet` resolves it the same way `from_forward_decision` does, so lookup
+  identity == insert identity for a packet. DESIGN CHOICE (the invalidation
+  crux): `set_index` and `invalidate_slot` STAY keyed on the physical ifindex,
+  because the GC (loop_body) and RST-teardown (lifecycle) invalidate paths drive
+  `invalidate_slot(key, binding.ifindex=PHYSICAL)` and cannot recover the
+  logical unit from a bare session key — keeping those physical keeps eviction
+  coherent. Invalidate matches physical-only → over-evicts a co-5-tuple VLAN
+  sibling (safe: a re-miss re-evaluates from policy), never strands a stale
+  entry (the team-lead's watch item). NOT HA/session-adjacent: `FlowCacheEntry`
+  derives only `Clone` (no serde), the flow cache is per-worker
+  `WorkerFlowCacheState`, never HA-synced — so the added field breaks no wire/
+  sync layout (verified).
+- **File(s)**: userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/umem/tests/debug_state.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+- **Validation**: full `cargo test --release --bin xpf-userspace-dp` → 4000
+  passed, 0 failed, 2 ignored (pre-existing). Fail-on-revert test
+  `coparented_vlan_same_5tuple_distinct_logical_ifindex_misses_5139`
+  (flow_cache_tests.rs): same physical parent + 5-tuple, distinct logical
+  100/101 — VLAN B must MISS VLAN A's entry, VLAN A's own lookup still HITS.
+  RED-on-revert (drop the logical discriminator from the lookup match →
+  physical-only key): `test result: FAILED. 83 passed; 1 failed` (target-count
+  1) — panic "co-parented VLAN B (logical 101) must MISS VLAN A's entry (logical
+  100)". Restored GREEN: flow_cache 84/0. SMOKE: unit-provable at the cache
+  identity layer (the miss/hit is fully determined by the in-set match); no
+  loss-cluster forwarding surface a smoke would add over the unit test.
+
 ## 2026-07-18 — #5160: move redirect-sample sequence off the shared destination atomic to producer-local TLS
 
 - **Timestamp**: 2026-07-18 (fix/5160-redirect-sample-local)
