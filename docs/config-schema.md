@@ -3439,6 +3439,50 @@ reserved for whole-dataplane selection where a rewrite shim
     (`pkg/config/compiler_zone_scoped_snat_pool_5875_test.go`) and
     `TestSourceNATSnapshotZoneScopedPoolUnusable_5875`
     (`pkg/dataplane/userspace/nat_source_zone_scope_5875_test.go`).
+  - `security nat source pool` AGGREGATE cardinality budget (#5877) — the
+    per-field / per-member gates above bound ONE pool (a member's host count to
+    `MaxSourceNATPoolPrefixHosts = 65536`, a pool's port range to 1..65535), but
+    nothing bounded the AGGREGATE across a whole config: pool COUNT, the SUM of
+    every pool's address cardinality, or total port capacity. Snapshot/apply
+    builds a `PortAllocator` for each pool-mode source-NAT rule BEFORE reuse
+    dedup is known (`userspace-dp/src/nat/{source,allocator}.rs`) — every pool
+    address gets a per-address occupancy bitmap sized to the port range (one bit
+    per port) plus a per-address counter — so a large-but-syntactically-valid
+    config forces substantial memory + CPU during a security-critical
+    commit-apply (stalling commits, watchdogs, HA convergence, or the Rust
+    dataplane), and repeated applies magnify it.
+    `validateSourceNATAggregateCardinalityStrict` (`compiler_validate_strict_nat.go`)
+    rejects an over-budget config at strict commit, fail-closed, before apply
+    constructs any allocator. Three explicit budgets (`compiler_validate_strict_nat.go`):
+    - **`MaxSourceNATPoolCount = 1024`** — max DISTINCT pool-mode-referenced
+      pools (allocator instances).
+    - **`MaxSourceNATAggregatePoolAddresses = 16 × MaxSourceNATPoolPrefixHosts =
+      1,048,576`** — max SUM of every referenced pool's address host-count (a
+      bare IP counts 1; a CIDR counts its full prefix range, matching the Rust
+      `expand_pool_address` enumeration). A /12 worth of public addresses,
+      vastly more than any real SNAT allocation.
+    - **`MaxSourceNATAggregatePortCapacity = 2^33 = 8,589,934,592`** — max SUM of
+      (address host-count × port range) = the total occupancy-bitmap SLOTS the
+      allocator builds (one bit/slot ⇒ ~1 GiB cap). Admits, e.g., two full /16
+      pools at the default 1024-65535 PAT range (65,536 × 64,512 ≈ 4.23e9 slots
+      each) or hundreds of realistic CGNAT pools, while rejecting a config that
+      would force multi-gigabyte bitmap construction at apply.
+    The gate iterates ONLY the DISTINCT pools a pool-mode `then source-nat pool
+    <name>` rule references — the exact set apply expands into a `PortAllocator`
+    (same scoping as #5627/#5875) — in sorted rule-set order for a deterministic
+    first offender, counting hosts off the prefix LENGTH without enumerating.
+    Runs AFTER the per-pool value/grammar gates so a single structurally broken
+    pool still wins the first-error slot. It reuses the `lenientDestNATAddresses`
+    downgrade (warn on load / peer-sync, #1960 no-brick: a config persisted
+    before this gate existed still boots — apply builds the state it always did
+    and the operator is warned to shrink it). Registered in the SNAT strict set,
+    so the #5876 peer-effective SNAT gate bounds the standby's identical
+    allocator build too. Fail-on-revert:
+    `TestSourceNATAggregatePoolCountRejected` /
+    `TestSourceNATAggregateAddressesRejected` /
+    `TestSourceNATAggregatePortCapacityRejected` /
+    `TestSourceNATAggregateLenientWarns`
+    (`pkg/config/compiler_nat_source_pool_aggregate_5877_test.go`).
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix

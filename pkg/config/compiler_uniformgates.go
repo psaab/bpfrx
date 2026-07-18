@@ -765,6 +765,35 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5877 source-NAT AGGREGATE pool-cardinality gate. The per-field and
+	// per-member source-pool gates above bound ONE pool (a member's host count to
+	// MaxSourceNATPoolPrefixHosts, a pool's port range to 1..65535), but nothing
+	// bounded the AGGREGATE across a whole config: pool COUNT, the SUM of every
+	// pool's address cardinality, or total port capacity. Snapshot/apply builds a
+	// PortAllocator for each pool-mode rule BEFORE reuse dedup is known
+	// (userspace-dp/src/nat/{source,allocator}.rs) — every pool address gets a
+	// per-address occupancy bitmap sized to the port range — so a
+	// large-but-syntactically-valid config forces substantial memory + CPU during
+	// a security-critical commit-apply (stalling commits, watchdogs, HA
+	// convergence, or the Rust dataplane), and repeated applies magnify it. Reject
+	// an over-budget config at commit, fail-closed, before apply constructs any
+	// allocator state. Strict on commit / commit-check (hard-reject naming the
+	// exceeded budget and by how much); lenient on load / peer-sync (downgrade to
+	// a warning so a config persisted before this gate existed still boots — #1960
+	// no-brick; apply builds the state it always did and the operator is warned to
+	// shrink it). Shares the lenientDestNATAddresses flag (same NAT silent-drop /
+	// resource-safety doctrine as the sibling source-pool gates). Runs AFTER the
+	// per-pool value/grammar gates so a single structurally broken pool still wins
+	// the first-error slot.
+	if err := validateSourceNATAggregateCardinalityStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("source-nat aggregate pool cardinality (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2243 DHCP-server static (fixed/reserved) host bindings. Strict on
 	// commit / commit-check (hard-reject a fixed-address that is malformed,
 	// family-mismatched, outside the enclosing pool subnet, or duplicates

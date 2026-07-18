@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"sort"
@@ -2220,6 +2221,211 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 			cfg.Security.NAT.Destination.RuleSets); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// Aggregate source-NAT pool cardinality budgets (#5877). The per-member
+// grammar gate (validateSourceNATPoolAddressGrammarStrict) bounds a SINGLE pool
+// address member to MaxSourceNATPoolPrefixHosts, and the port gate
+// (validateSourceNATPoolStrict) bounds a single pool's range to 1..65535 — but
+// NOTHING bounded the AGGREGATE across a whole config: the number of pools, the
+// SUM of every pool's address cardinality, or the total port capacity.
+//
+// Snapshot/apply constructs a PortAllocator for each pool-mode source-NAT rule
+// BEFORE reuse dedup is known (userspace-dp/src/nat/{source,allocator}.rs): every
+// pool address gets a per-address occupancy bitmap sized to the port range (one
+// bit per port) plus a per-address counter. So a large-but-syntactically-valid
+// config forces substantial memory + CPU during a security-critical
+// commit-apply — stalling commits, watchdogs, HA convergence, or the Rust
+// dataplane; repeated applies magnify it. These budgets reject such a config at
+// COMMIT, fail-closed, before apply builds any allocator state.
+//
+// The budgets are deliberately generous multiples of the per-member cap so no
+// realistic SNAT / CGNAT config approaches them, while a memory-exhaustion
+// config is rejected.
+const (
+	// MaxSourceNATPoolCount bounds the number of DISTINCT pool-mode-referenced
+	// source-NAT pools in one config. Real deployments use a handful to low-tens
+	// of pools; 1024 is far beyond any legitimate config but caps the count of
+	// allocator instances the apply path can be asked to build.
+	MaxSourceNATPoolCount = 1024
+
+	// MaxSourceNATAggregatePoolAddresses bounds the SUM of every pool's address
+	// host-count (a bare IP counts 1; a CIDR counts its full prefix range,
+	// matching the Rust expand_pool_address enumeration). = 16 ×
+	// MaxSourceNATPoolPrefixHosts — a /12 worth of public addresses aggregated
+	// across every pool, vastly more than any real SNAT allocation, while
+	// capping the per-address counter arrays and per-address allocator structs.
+	MaxSourceNATAggregatePoolAddresses = 16 * MaxSourceNATPoolPrefixHosts // 1,048,576
+
+	// MaxSourceNATAggregatePortCapacity bounds the SUM over pools of
+	// (address host-count × port-range) — the total per-address occupancy-bitmap
+	// SLOTS the allocator constructs (one bit per slot). 2^33 slots ⇒ the
+	// occupancy bitmaps are capped at ~1 GiB. It admits, e.g., two full /16
+	// pools at the default 1024-65535 PAT range (65,536 × 64,512 ≈ 4.23e9 slots
+	// each) or hundreds of realistically-sized CGNAT pools, while rejecting a
+	// config that would force multi-gigabyte bitmap construction at apply.
+	MaxSourceNATAggregatePortCapacity uint64 = 1 << 33 // 8,589,934,592
+)
+
+// checkedAddU64 adds two uint64 values, saturating to math.MaxUint64 on overflow
+// instead of wrapping (companion to checkedMulU64). The aggregate SNAT
+// cardinality accumulators use it so a pathological v6 pool member (a /0 counts
+// 2^128 hosts, clamped to MaxUint64) trips the budget instead of wrapping back
+// into the in-bound range.
+func checkedAddU64(a, b uint64) uint64 {
+	if a > math.MaxUint64-b {
+		return math.MaxUint64
+	}
+	return a + b
+}
+
+// sourceNATPoolMemberHostCount returns how many host addresses a single
+// source-NAT pool address member expands into, matching the Rust
+// expand_pool_address enumeration exactly: a bare IP is one host; a CIDR is its
+// FULL prefix range (1 << (addrbits - prefixlen)). An unparseable member counts
+// zero (it builds no valid allocator entry — the grammar gate rejects it when
+// the pool is referenced). A prefix with >= 64 host bits is clamped to
+// math.MaxUint64 so it saturates the aggregate budget rather than overflowing a
+// shift.
+func sourceNATPoolMemberHostCount(addr string) uint64 {
+	if strings.Contains(addr, "/") {
+		p, err := netip.ParsePrefix(addr)
+		if err != nil {
+			return 0
+		}
+		addrBits := 32
+		if p.Addr().Is6() {
+			addrBits = 128
+		}
+		hostBits := addrBits - p.Bits()
+		if hostBits <= 0 {
+			return 1
+		}
+		if hostBits >= 64 {
+			return math.MaxUint64
+		}
+		return uint64(1) << uint(hostBits)
+	}
+	if _, err := netip.ParseAddr(addr); err != nil {
+		return 0
+	}
+	return 1
+}
+
+// validateSourceNATAggregateCardinalityStrict (#5877) hard-rejects a config
+// whose AGGREGATE source-NAT pool cardinality exceeds a resource budget: too
+// many pools, too many total pool addresses, or too much total port capacity.
+// The per-field / per-member gates bound ONE pool; this bounds the SUM across
+// every pool so a large-but-syntactically-valid config cannot force the apply
+// path to build multi-gigabyte allocator state (a per-address occupancy bitmap
+// per pool address, sized to the port range) during a security-critical
+// commit-apply. Fail-closed at COMMIT, before apply constructs any allocator.
+//
+// Scoping mirrors validateSourceNATPoolAddressGrammarStrict EXACTLY: it walks
+// only the DISTINCT pools a pool-mode `then source-nat pool <name>` rule
+// references — the exact set `parse_source_nat_rules`
+// (userspace-dp/src/nat/source.rs) expands into a PortAllocator. An
+// unreferenced pool never reaches that path and builds no allocator, so it is
+// out of scope (a NAT64-referenced pool uses the separate parse_pool_v4 path and
+// is bounded by isNAT64PoolHostAddress, not here). Because this gate runs AFTER
+// the grammar gate in runUniformGates, every counted member is already validated
+// (parseable, host count <= MaxSourceNATPoolPrefixHosts) on the strict path, so
+// the sums are accurate; the saturating arithmetic only matters on the tolerant
+// path, where a still-over-cap member trips the budget rather than wrapping.
+//
+// Rule-sets are walked in sorted name order and pools deduped by name (a pool
+// referenced by many rules counts once — allocator reuse dedups on the same key)
+// for a deterministic first-reported offender.
+//
+// Strict on commit / commit-check (hard-reject naming the exceeded budget and by
+// how much); the call site (runUniformGates) downgrades it to a warning on the
+// tolerant load / peer-sync path (opts.lenientDestNATAddresses — #1960 no-brick:
+// a config persisted before this gate existed still boots, apply builds the
+// state it always did, and the operator is warned to shrink it). Shares the SNAT
+// silent-drop doctrine flag with the sibling source-pool gates. Registered in
+// the SNAT strict set (validateSourceNATStrictView) so #5876's peer-effective
+// gate bounds the standby's identical allocator build too.
+func validateSourceNATAggregateCardinalityStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	pools := cfg.Security.NAT.SourcePools
+	rulesets := append([]*NATRuleSet(nil), cfg.Security.NAT.Source...)
+	sort.SliceStable(rulesets, func(i, j int) bool {
+		if rulesets[i] == nil || rulesets[j] == nil {
+			return rulesets[i] != nil
+		}
+		return rulesets[i].Name < rulesets[j].Name
+	})
+	seen := make(map[string]bool)
+	var poolCount int
+	var totalAddrs uint64
+	var totalPortCap uint64
+	for _, rs := range rulesets {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.Then.PoolName == "" {
+				continue
+			}
+			name := rule.Then.PoolName
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			pool, ok := pools[name]
+			if !ok || pool == nil {
+				// Undefined reference — validateNATPoolReferencesStrict (#5626).
+				continue
+			}
+			poolCount++
+			var poolAddrs uint64
+			if pool.Address != "" {
+				poolAddrs = checkedAddU64(poolAddrs, sourceNATPoolMemberHostCount(pool.Address))
+			}
+			for _, a := range pool.Addresses {
+				poolAddrs = checkedAddU64(poolAddrs, sourceNATPoolMemberHostCount(a))
+			}
+			totalAddrs = checkedAddU64(totalAddrs, poolAddrs)
+			// Port range mirrors the Rust allocator's defaulting (source.rs): an
+			// unset/zero low/high defaults to 1024/65535, and a reversed range yields
+			// a zero-width allocator (no bitmap). compileNATSource already defaults
+			// PortLow/PortHigh to 1024/65535, so a pool with no `port` leaf
+			// contributes the full 64,512-slot PAT range per address.
+			var portRange uint64
+			if pool.PortLow > 0 && pool.PortHigh >= pool.PortLow {
+				portRange = uint64(pool.PortHigh-pool.PortLow) + 1
+			}
+			totalPortCap = checkedAddU64(totalPortCap, checkedMulU64(poolAddrs, portRange))
+		}
+	}
+	if poolCount > MaxSourceNATPoolCount {
+		return fmt.Errorf(
+			"source-nat references %d distinct pools, over the aggregate budget of "+
+				"%d (by %d); each pool builds allocator state at apply, so an unbounded "+
+				"pool count can exhaust memory and stall the commit-apply — reduce the "+
+				"number of referenced `security nat source pool` stanzas (#5877)",
+			poolCount, MaxSourceNATPoolCount, poolCount-MaxSourceNATPoolCount)
+	}
+	if totalAddrs > uint64(MaxSourceNATAggregatePoolAddresses) {
+		return fmt.Errorf(
+			"source-nat pools define %d total pool addresses, over the aggregate "+
+				"budget of %d; every pool address gets a per-address occupancy bitmap "+
+				"at apply, so an unbounded address cardinality can exhaust memory and "+
+				"stall the commit-apply — shrink the pool address ranges (#5877)",
+			totalAddrs, uint64(MaxSourceNATAggregatePoolAddresses))
+	}
+	if totalPortCap > MaxSourceNATAggregatePortCapacity {
+		return fmt.Errorf(
+			"source-nat pools define %d total port slots (sum of pool addresses × "+
+				"port range), over the aggregate budget of %d; each slot is a bit in a "+
+				"per-address occupancy bitmap the apply path builds, so an unbounded "+
+				"total exhausts memory and stalls the commit-apply — shrink the pool "+
+				"address ranges or narrow the port ranges (#5877)",
+			totalPortCap, MaxSourceNATAggregatePortCapacity)
 	}
 	return nil
 }
