@@ -242,7 +242,7 @@ pub(crate) fn handle_stream(
                 // handle. The blocking push loop runs after the lock drops.
                 all_export = export::all_kick(&mut guard, &mut response);
             }
-            "rebind" => rebind::handle(&mut guard, &mut persist_state),
+            "rebind" => rebind::handle(&mut guard, &mut response, &mut persist_state),
             "stop_workers" => stop_workers::handle(&mut guard, &mut persist_state),
             "shutdown" => {
                 guard.afxdp.stop_with_event_stream();

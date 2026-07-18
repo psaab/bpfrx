@@ -189,8 +189,15 @@ queues. See PR #1243's kill record for why i40e doesn't reshape.
   snapshot + status fields and reporting `ok=false` instead of persisting
   the rejected snapshot (see `docs/userspace-dataplane-architecture.md`,
   "Control-plane handler observes the reconcile outcome"). The
-  already-accepted-snapshot callers (`set_queue_state`, `set_binding_state`,
-  `rebind`, `set_forwarding_state`) discard the outcome. When
+  already-accepted-snapshot callers reconcile a registration toggle / rebind
+  / forwarding-state change, not a new config, so there is no rejected
+  snapshot to un-persist — but the reconcile can still fault (mandatory-pin
+  preflight / forwarding-build integrity error). #5621: `set_binding_state`,
+  `set_queue_state`, and `rebind` now SURFACE that `Err` (report `ok=false` +
+  the error, refresh status, do NOT `persist_state`) instead of the old
+  `let _ = reconcile_status_bindings(..)` discard that acked `ok=true` after a
+  failed (re)bind; `rebind::handle` took a `response` parameter for this.
+  `set_forwarding_state` still discards the outcome (scoped follow-up). When
   `should_run_afxdp` does NOT hold (forwarding disarmed / unsupported) it
   `stop()`s every worker and then routes the per-binding status through
   `refresh_bindings` — which sends each now-workerless slot through
