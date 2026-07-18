@@ -2702,6 +2702,88 @@ func TestRejournalTailFIFOPrependAndOverflow(t *testing.T) {
 	})
 }
 
+// TestDeleteJournalOverflowArmsForceResync is the #5450 fail-on-revert guard: a
+// delete-journal overflow that DROPS session-delete records must arm a full
+// authoritative bulk resync (forceResync) so the standby re-learns the true
+// session set and stops carrying the sessions the evicted deletes would have
+// torn down. A rejournal / journal that stays within cap (no drops) must NOT
+// arm. Reverting the armDeleteResync() call in rejournalTail/journalDelete
+// makes this fail.
+func TestDeleteJournalOverflowArmsForceResync(t *testing.T) {
+	mk := func(n int) []byte { return encodeDeleteV4(deleteKeyN(n), 0) }
+
+	// rejournalTail WITHOUT overflow: fits within cap, drops nothing, must not
+	// arm the resync.
+	t.Run("rejournal_no_overflow_not_armed", func(t *testing.T) {
+		ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+		ss.deleteJournalCap = 10
+		ss.deleteJournal = [][]byte{mk(1), mk(2)}
+		ss.rejournalTail([][]byte{mk(3), mk(4), mk(5)})
+		if ss.stats.DeletesDropped.Load() != 0 {
+			t.Fatalf("precondition: expected 0 dropped, got %d", ss.stats.DeletesDropped.Load())
+		}
+		if ss.forceResync.Load() {
+			t.Fatal("forceResync armed without any dropped deletes")
+		}
+	})
+
+	// rejournalTail WITH overflow: exceeds cap, drops records, must arm the
+	// resync so the standby's reconcileStaleSessions runs on the next bulk.
+	t.Run("rejournal_overflow_arms", func(t *testing.T) {
+		ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+		ss.deleteJournalCap = 2
+		ss.deleteJournal = [][]byte{mk(1), mk(2), mk(3)}
+		ss.rejournalTail([][]byte{mk(4), mk(5), mk(6)})
+		if ss.stats.DeletesDropped.Load() == 0 {
+			t.Fatal("precondition: expected drops on overflow, got 0")
+		}
+		if !ss.forceResync.Load() {
+			t.Fatal("forceResync NOT armed after rejournalTail dropped records (#5450 regression)")
+		}
+	})
+
+	// journalDelete WITH overflow (via QueueDeleteV4 while disconnected): the
+	// second drop site must arm the resync too.
+	t.Run("journal_delete_overflow_arms", func(t *testing.T) {
+		ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+		ss.deleteJournalCap = 5
+		for i := 0; i < 8; i++ {
+			ss.QueueDeleteV4(dataplane.SessionKey{
+				SrcIP:    [4]byte{10, 0, 1, byte(i)},
+				Protocol: 6,
+				SrcPort:  uint16(1000 + i),
+				DstPort:  80,
+			})
+		}
+		if ss.stats.DeletesDropped.Load() == 0 {
+			t.Fatal("precondition: expected drops after 8 deletes into cap-5 journal, got 0")
+		}
+		if !ss.forceResync.Load() {
+			t.Fatal("forceResync NOT armed after journalDelete evicted records (#5450 regression)")
+		}
+	})
+
+	// journalDelete WITHOUT overflow: within cap, drops nothing, must not arm.
+	t.Run("journal_delete_no_overflow_not_armed", func(t *testing.T) {
+		ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+		ss.deleteJournalCap = 16
+		for i := 0; i < 4; i++ {
+			ss.QueueDeleteV4(dataplane.SessionKey{
+				SrcIP:    [4]byte{10, 0, 2, byte(i)},
+				Protocol: 6,
+				SrcPort:  uint16(2000 + i),
+				DstPort:  443,
+			})
+		}
+		if ss.stats.DeletesDropped.Load() != 0 {
+			t.Fatalf("precondition: expected 0 dropped, got %d", ss.stats.DeletesDropped.Load())
+		}
+		if ss.forceResync.Load() {
+			t.Fatal("forceResync armed without any dropped deletes")
+		}
+	})
+}
+
 // TestDeleteJournalFlushAllFit: with room in the send queue, every
 // journaled delete is enqueued and the journal empties.
 func TestDeleteJournalFlushAllFit(t *testing.T) {
