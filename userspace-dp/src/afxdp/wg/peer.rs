@@ -17,7 +17,7 @@
 use super::session::{SessionRole, WgSession};
 use super::tai64n::TAI64N_LEN;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Immutable per-snapshot peer config tuple (#2836).
@@ -191,6 +191,30 @@ pub(crate) struct Peer {
     /// WG-spec-permitted bounded reset (see `tai64n.rs` cross-restart
     /// note).
     pub(crate) greatest_tai64n: Mutex<[u8; TAI64N_LEN]>,
+    /// #5164: worker→control "please initiate a handshake" edge, scoped
+    /// PER PEER. When THIS peer's egress `try_encap` hits `NoSession`, the
+    /// worker arms this via a single relaxed store, rate-limited by
+    /// `handshake_request_last_ns` to one edge per
+    /// `WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS`. The control thread's per-peer
+    /// attempt machine consumes ONLY this peer's edge (via
+    /// `WgEngine::take_handshake_request(peer_pubkey)`), so an edge raised by
+    /// peer B is never drained by a lower-sorted peer A. Peer-resident
+    /// (`Arc<Peer>` reused per pubkey), so it survives config commits like the
+    /// timer stamps above. Was an engine-GLOBAL `AtomicBool` in S2a
+    /// (single-peer); this is the #1434/S6 per-peer generalization.
+    pub(crate) handshake_request_pending: AtomicBool,
+    /// #5164: monotonic timestamp of THIS peer's last accepted handshake
+    /// request edge (0 = never). Drives the per-peer rate-limit gate only;
+    /// distinct from `handshake_request_pending` so a request at `now_ns == 0`
+    /// (tests) is not read as "no request".
+    pub(crate) handshake_request_last_ns: AtomicU64,
+    /// #5164: "session is stale, rekey" edge, scoped PER PEER. Armed by THIS
+    /// peer's encap (T1 / send-side T3) and decap (T2 receive-horizon) use
+    /// sites, consumed by the control loop's per-peer attempt machine (via
+    /// `WgEngine::take_rekey_request(peer_pubkey)`) WITHOUT the
+    /// confirmed-session gate. Was an engine-GLOBAL `AtomicBool` (S2a); this is
+    /// the per-peer generalization so peer B's rekey drives B's attempt.
+    pub(crate) rekey_request_pending: AtomicBool,
 }
 
 impl std::fmt::Debug for Peer {
@@ -219,6 +243,9 @@ impl Peer {
             previous: RwLock::new(None),
             next: RwLock::new(None),
             greatest_tai64n: Mutex::new([0u8; TAI64N_LEN]),
+            handshake_request_pending: AtomicBool::new(false),
+            handshake_request_last_ns: AtomicU64::new(0),
+            rekey_request_pending: AtomicBool::new(false),
         }
     }
 

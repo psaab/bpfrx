@@ -378,6 +378,24 @@ pub(crate) t8_last_attempt_ns:         AtomicU64, // T8 skip/fail pacing anchor 
 pub(in crate::afxdp::wg) rekey_request_pending: AtomicBool,
 ```
 
+> **UPDATE (#5164): the per-peer generalization above is now DONE.** Both the
+> NoSession handshake-request edge and the rekey edge were engine-GLOBAL
+> `AtomicBool`s while `wg_control` consumed them inside a **pubkey-sorted**
+> per-peer loop — so the first-sorted peer A drained a global edge raised for
+> peer B, and B (with no keepalive to re-arm it) was **blackholed**. The three
+> edge fields (`handshake_request_pending` / `handshake_request_last_ns` /
+> `rekey_request_pending`) now live on each long-lived `Arc<Peer>` (`peer.rs`,
+> reused per pubkey across config commits, so the edge/rate-limit state survives
+> a reconcile like the timer stamps), and the four APIs are keyed by peer:
+> `request_handshake(peer_pubkey, now)` / `take_handshake_request(peer_pubkey)` /
+> `request_rekey(peer_pubkey)` / `take_rekey_request(peer_pubkey)` (resolved via
+> the existing `WgEngine::peer_arc`). The raise sites pass the pubkey
+> (`try_encap`/`try_decap` use `session.peer_pubkey`; the worker/control
+> NoSession sites pass the egress `peer_pubkey`), and every consume site — the
+> per-peer attempt machine, the give-up drain, and the handshake-completion
+> drain — consumes ONLY that peer's edge. Allocation-free (atomics on the
+> existing `Peer`), no wire/HA change.
+
 **Engine clock** — v5 (Codex r2 C2 reversed the v3 cached-clock
 adjudication): `WgEngine::now_ns()` reads CLOCK_MONOTONIC per use
 (`counters::monotonic_now_ns()`, a vDSO call, ~20-25ns). The v3 publisher

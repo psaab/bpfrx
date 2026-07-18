@@ -100,22 +100,28 @@ impl WgEngine {
     }
 
     /// Arm the "session is stale, rekey" edge (T1 age threshold,
-    /// T2 receive horizon, send-side T3 expiry). Relaxed atomic —
-    /// same pattern as the NoSession handshake-request edge. The
-    /// control loop consumes it and initiates WITHOUT the
-    /// confirmed-session gate (a confirmed-but-stale session is
-    /// exactly what is being replaced). Per-ENGINE (single peer in
-    /// S2a); per-peer generalization rides with #1434/S6, same as
-    /// `handshake_request_pending`.
+    /// T2 receive horizon, send-side T3 expiry) for `peer_pubkey`. Relaxed
+    /// atomic on that peer's own slot — same pattern as the NoSession
+    /// handshake-request edge. The control loop consumes it and initiates
+    /// WITHOUT the confirmed-session gate (a confirmed-but-stale session is
+    /// exactly what is being replaced). #5164: scoped PER PEER (was
+    /// per-engine in S2a) so a rekey edge armed by peer B's stale session
+    /// drives B's attempt, not a lower-sorted peer A's. No-op if the peer is
+    /// not in the current table.
     #[inline]
-    pub(crate) fn request_rekey(&self) {
-        self.rekey_request_pending.store(true, Ordering::Relaxed);
+    pub(crate) fn request_rekey(&self, peer_pubkey: &[u8; 32]) {
+        if let Some(peer) = self.peer_arc(peer_pubkey) {
+            peer.rekey_request_pending.store(true, Ordering::Relaxed);
+        }
     }
 
-    /// Control side of the rekey edge: returns true if armed, and
-    /// clears it.
-    pub(crate) fn take_rekey_request(&self) -> bool {
-        self.rekey_request_pending.swap(false, Ordering::Relaxed)
+    /// Control side of the rekey edge, scoped PER PEER (#5164): returns true
+    /// if `peer_pubkey`'s edge is armed, and clears only that peer's edge.
+    /// `false` if the peer is unknown or has no pending rekey edge.
+    pub(crate) fn take_rekey_request(&self, peer_pubkey: &[u8; 32]) -> bool {
+        self.peer_arc(peer_pubkey)
+            .map(|peer| peer.rekey_request_pending.swap(false, Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     /// The current session's `local_index` for the named peer, if any.

@@ -53047,3 +53047,33 @@ top.
   the transient + #2477 tests stayed GREEN).
 - **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/slowpath_tests.rs,
   docs/xdp-io-uring-userspace-dataplane.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5164 — rescope the WireGuard NoSession handshake-request and
+  rekey worker→control edges from engine-GLOBAL AtomicBools to PER-PEER. The
+  engine held global `handshake_request_pending`/`handshake_request_last_ns`/
+  `rekey_request_pending`; wg_control consumed both inside a pubkey-sorted
+  per-peer loop (`drive_attempt_machine`), so the first-sorted peer A drained a
+  global edge raised by peer B → B (without keepalive) was blackholed. Moved the
+  three fields onto the long-lived `Arc<Peer>` (peer.rs; reused per pubkey across
+  commits, so edge/rate-limit state survives reconcile like the timer stamps).
+  Re-keyed the four APIs by peer: request_handshake(peer_pubkey, now) /
+  take_handshake_request(peer_pubkey) (engine.rs), request_rekey(peer_pubkey) /
+  take_rekey_request(peer_pubkey) (timers.rs), resolving via the existing
+  peer_arc. Raise sites pass the pubkey (try_encap/try_decap use
+  session.peer_pubkey; worker frame/wg.rs + control encap_and_send pass the
+  egress peer_pubkey). Consume sites (per-peer attempt machine 794/795, give-up
+  drain 734/735, handshake-completion drains 453/454 + 477/478) consume only
+  that peer's edge; bound CompletedResponder's peer. Allocation-free (atomics on
+  existing Peer), no wire/HA change; per-peer rate-limit preserved. Added 2
+  fail-on-revert tests (handshake + rekey): two peers A<B; B arms its edge;
+  lower-sorted A must NOT drain it, B consumes its own. Reverting the per-peer
+  keying to a shared/first-peer slot (global-equivalent) → both tests RED
+  (A drains B). Updated all existing wg/tests.rs edge call sites to the new
+  signatures. Documented the per-peer edge ownership in the 1888-wg-timers plan
+  (design of record) §5.1. Full suite 3996 passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/wg/peer.rs,
+  userspace-dp/src/afxdp/wg/engine.rs, userspace-dp/src/afxdp/wg/timers.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  userspace-dp/src/afxdp/frame/wg.rs, userspace-dp/src/afxdp/wg/tests.rs,
+  docs/research/1888-wg-timers/plan.md
