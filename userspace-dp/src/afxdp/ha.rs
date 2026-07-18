@@ -909,9 +909,15 @@ impl OwnerRgExportWait {
         }
         let mut out = Vec::new();
         let mut remaining = if self.max == 0 { usize::MAX } else { self.max.max(1) };
+        // #5290: thread the fair-drain cursor across the batched export so a
+        // low-slot binding cannot hog every 1024-batch and starve higher-slot
+        // bindings within one capped export.
+        let mut cursor = 0usize;
         while remaining > 0 {
             let batch_size = remaining.min(1024);
-            let drained = drain_session_deltas_from_live(&self.live, batch_size);
+            let (drained, next_cursor) =
+                drain_session_deltas_from_live(&self.live, batch_size, cursor);
+            cursor = next_cursor;
             if drained.is_empty() {
                 break;
             }
@@ -922,25 +928,26 @@ impl OwnerRgExportWait {
     }
 }
 
-/// Drain up to `max` session deltas across the captured per-binding
-/// buffers. Mirrors `Coordinator::drain_session_deltas` exactly, but over
-/// an owned snapshot of the `Arc<BindingLiveState>` values so it needs no
-/// `&Coordinator` (and therefore no `ServerState` lock).
+/// Drain up to `max` session deltas across the captured per-binding buffers,
+/// starting the fair round-robin at `start_cursor` and returning the cursor to
+/// resume from. Mirrors `Coordinator::drain_session_deltas`'s fair rotating
+/// drain (#5290), but over an owned snapshot of the `Arc<BindingLiveState>`
+/// values so it needs no `&Coordinator` (and therefore no `ServerState` lock).
+///
+/// Unlike the steady-state fallback drain, this bulk owner-RG export path does
+/// NOT arm the overflow loss-of-sync latch: this export IS the resync/snapshot
+/// mechanism, and its completeness is governed by the caller-supplied `max`
+/// (the outer `wait_and_collect` loop drains to empty when `max == 0`). Arming
+/// a worker resync from inside a resync export would be circular.
 fn drain_session_deltas_from_live(
     live: &[Arc<BindingLiveState>],
     max: usize,
-) -> Vec<SessionDeltaInfo> {
-    let mut remaining = max.max(1);
-    let mut out = Vec::new();
-    for binding in live {
-        if remaining == 0 {
-            break;
-        }
-        let drained = binding.drain_session_deltas(remaining);
-        remaining = remaining.saturating_sub(drained.len());
-        out.extend(drained);
-    }
-    out
+    start_cursor: usize,
+) -> (Vec<SessionDeltaInfo>, usize) {
+    let bindings: Vec<&BindingLiveState> = live.iter().map(|b| b.as_ref()).collect();
+    let (out, cursor, _overflow) =
+        crate::afxdp::session_delta::drain_session_deltas_fair(&bindings, max, start_cursor);
+    (out, cursor)
 }
 
 #[cfg(test)]

@@ -808,6 +808,19 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// against the owner's drain.
     pub(super) pending_tx: MpscInbox<TxRequest>,
     pub(super) pending_session_deltas: Mutex<VecDeque<SessionDeltaInfo>>,
+    /// #5290: per-binding loss-of-sync latch for the RPC-fallback session-delta
+    /// buffer (`pending_session_deltas`). Set when a delta is silently dropped
+    /// because the buffer hit `MAX_PENDING_SESSION_DELTAS`, OR when the
+    /// caller-wide fair drain (`drain_session_deltas_fair`) could not keep up
+    /// and left deltas undrained (budget overflow). Consumed by the owning
+    /// worker loop, which folds it into `SessionTable::set_delta_loss` so the
+    /// existing #2442/#2874 `take_delta_loss` resync re-exports the full
+    /// owner-RG snapshot (table truth) — the standby recovers the lost/undrained
+    /// deltas instead of silently diverging. A single bool, so a burst raises
+    /// exactly one resync (debounced by `take_delta_loss`). Cross-thread
+    /// (control drain arms, worker consumes), so `AtomicBool` rather than the
+    /// plain `bool` `SessionTable` can use under its `&mut self`.
+    pub(super) delta_loss_pending: AtomicBool,
 }
 
 pub(in crate::afxdp) struct PendingTxAdmission {
@@ -1009,6 +1022,7 @@ impl BindingLiveState {
             last_error: Mutex::new(String::new()),
             pending_tx: MpscInbox::new(PENDING_TX_INBOX_HARD_CAP),
             pending_session_deltas: Mutex::new(VecDeque::new()),
+            delta_loss_pending: AtomicBool::new(false),
         }
     }
 
@@ -1349,14 +1363,49 @@ impl BindingLiveState {
             Ok(mut pending) => {
                 if pending.len() >= MAX_PENDING_SESSION_DELTAS {
                     self.session_delta_dropped.fetch_add(1, Ordering::Relaxed);
+                    // #5290: a dropped RPC-fallback delta is a HA-relevant
+                    // open/close the standby will never observe — the fallback
+                    // stream just went lossy. Latch loss-of-sync so the owning
+                    // worker forces a full owner-RG resync (table-truth rescan),
+                    // mirroring `SessionTable::push_delta`'s #2442 behavior.
+                    self.delta_loss_pending.store(true, Ordering::Relaxed);
                     return;
                 }
                 pending.push_back(delta);
             }
             Err(_) => {
                 self.session_delta_dropped.fetch_add(1, Ordering::Relaxed);
+                self.delta_loss_pending.store(true, Ordering::Relaxed);
             }
         }
+    }
+
+    /// #5290: true if the RPC-fallback buffer still holds undrained deltas.
+    /// Used by the fair-drain overflow scan to arm loss-of-sync only on the
+    /// bindings that actually fell behind. A poisoned lock is treated as "not
+    /// pending" — the separate poison path in `push_session_delta` already
+    /// latched loss-of-sync, so this avoids double-counting.
+    pub(super) fn has_pending_session_deltas(&self) -> bool {
+        self.pending_session_deltas
+            .lock()
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// #5290: arm the per-binding loss-of-sync latch. Called by the control-
+    /// thread fair drain when the caller budget overflowed and left this
+    /// binding's deltas undrained. Mirror of `SessionTable::set_delta_loss`.
+    pub(super) fn set_delta_loss(&self) {
+        self.delta_loss_pending.store(true, Ordering::Relaxed);
+    }
+
+    /// #5290: consume the per-binding loss-of-sync latch. Called once per drain
+    /// cycle by the owning worker loop, which folds a true result into
+    /// `SessionTable::set_delta_loss` to drive the existing owner-RG resync.
+    /// Single bool swap, so a burst that armed it repeatedly before this read
+    /// raises exactly one resync (debounce by construction).
+    pub(super) fn take_delta_loss(&self) -> bool {
+        self.delta_loss_pending.swap(false, Ordering::Relaxed)
     }
 
     pub(super) fn drain_session_deltas(&self, max: usize) -> Vec<SessionDeltaInfo> {

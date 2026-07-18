@@ -578,15 +578,35 @@ impl super::Coordinator {
     }
 
     pub fn drain_session_deltas(&self, max: usize) -> Vec<SessionDeltaInfo> {
-        let mut remaining = max.max(1);
-        let mut out = Vec::new();
-        for live in self.workers.live.values() {
-            if remaining == 0 {
-                break;
+        // #5290: fair, rotating-cursor drain instead of whole-budget-first-slot.
+        // The old drain handed the entire caller budget to each live binding in
+        // slot order with an early break, so during the event-stream RPC
+        // fallback a low-slot worker with many pending deltas consumed the whole
+        // budget and starved higher-slot workers — HA state quality then
+        // depended on worker-slot assignment.
+        let bindings: Vec<&BindingLiveState> =
+            self.workers.live.values().map(|b| b.as_ref()).collect();
+        let start = self
+            .workers
+            .session_delta_drain_cursor
+            .load(Ordering::Relaxed);
+        let (out, next_cursor, overflow) =
+            crate::afxdp::session_delta::drain_session_deltas_fair(&bindings, max, start);
+        self.workers
+            .session_delta_drain_cursor
+            .store(next_cursor, Ordering::Relaxed);
+        if overflow {
+            // #5290: the caller-wide budget could not keep up — deltas remain
+            // undrained in the per-binding fallback buffers. Arm loss-of-sync on
+            // exactly the residual bindings so the owning worker's
+            // `take_delta_loss` resync re-exports the full owner-RG snapshot
+            // (table truth) and no delta is silently lost. Mirrors the
+            // #2442/#2874 push_delta loss latch (deliver-or-resync).
+            for b in self.workers.live.values() {
+                if b.has_pending_session_deltas() {
+                    b.set_delta_loss();
+                }
             }
-            let drained = live.drain_session_deltas(remaining);
-            remaining = remaining.saturating_sub(drained.len());
-            out.extend(drained);
         }
         out
     }

@@ -331,6 +331,16 @@ cluster-scoped.
   attempting further lossless pushes for the rest of that batch, so one call
   incurs at most one lossless wait — the snapshot supersedes the remaining
   incremental deltas.
+  - **#5290: the RPC-fallback drain feeds the SAME resync.** When the event
+    stream is down and the Go control plane polls `drain_session_deltas`, that
+    fallback path uses a fair rotating-cursor drain
+    (`session_delta::drain_session_deltas_fair`) so a low-slot worker cannot
+    consume the whole caller budget and starve higher slots. On budget overflow
+    (undrained deltas remain) — or a per-binding `pending_session_deltas` buffer
+    overflow that drops a delta — it arms `BindingLiveState::set_delta_loss`,
+    which the worker loop folds into `SessionTable::set_delta_loss` so the same
+    `take_delta_loss` owner-RG resync recovers the lost/undrained deltas.
+    Debounced by a single `AtomicBool` per binding: one episode → one resync.
   - **#5468: the worker-loop lossless wait is BOUNDED — per call AND in
     aggregate.** `flush_session_deltas` runs on the packet worker loop, so it
     uses `push_delta_lossless_within` with a short `WORKER_LOSSLESS_QUEUE_BUDGET`

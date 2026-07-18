@@ -1035,3 +1035,35 @@ fn purge_remapped_tunnel_sessions_no_drop_on_lossless_success() {
         "no drop must be recorded when the close delta was queued losslessly"
     );
 }
+
+#[test]
+fn drain_session_deltas_from_live_is_fair_across_bindings() {
+    // #5290: the owner-RG bulk-export mirror of `Coordinator::drain_session_deltas`
+    // must share the same fair rotating-cursor drain — a capped export budget
+    // below the aggregate pending count is spread across every binding, not
+    // handed whole to the first. Reverting to whole-budget-first would drain all
+    // 30 from binding 0 and leave bindings 1..3 untouched.
+    let live: Vec<Arc<BindingLiveState>> = (0..3)
+        .map(|_| {
+            let b = Arc::new(BindingLiveState::new());
+            for _ in 0..40 {
+                b.push_session_delta(SessionDeltaInfo::default());
+            }
+            b
+        })
+        .collect();
+
+    let (drained, cursor) = drain_session_deltas_from_live(&live, 30, 0); // quantum 10
+    assert_eq!(drained.len(), 30, "capped export returns exactly the budget");
+    // Cursor wrapped back to 0 after serving all three (10 each).
+    assert_eq!(cursor % 3, 0, "cursor rotated through every binding");
+
+    for (i, b) in live.iter().enumerate() {
+        let residual = b.drain_session_deltas(usize::MAX).len();
+        assert_eq!(
+            residual, 30,
+            "binding {i} must have been served an equal 10-delta quantum, \
+             leaving 30 — a whole-budget-first export would not"
+        );
+    }
+}

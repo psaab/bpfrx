@@ -1,3 +1,40 @@
+## 2026-07-18 — #5290: fair HA session-delta drain + overflow resync latch
+
+- **Timestamp**: 2026-07-18 (fix/5290-drain-deltas-fairness)
+- **Action**: `Coordinator::drain_session_deltas` (the RPC-fallback session-delta
+  poll used when the event stream is down) iterated live workers in BTreeMap
+  (slot) order, handing the FULL caller budget to each in turn with an early
+  break. During the event-stream fallback a low-slot worker with many pending
+  deltas consumed the whole budget and STARVED higher-slot workers — HA state
+  quality depended on worker-slot assignment, and starved bindings could grow
+  their `pending_session_deltas` buffer to `MAX_PENDING_SESSION_DELTAS` and
+  DROP deltas silently (only a counter, no resync). Fix: a shared
+  `session_delta::drain_session_deltas_fair` helper spreads a
+  `budget/num_bindings` quantum across every live binding using a rotating
+  cursor persisted on `WorkerManager::session_delta_drain_cursor`, so no worker
+  is starved across successive drains. On budget overflow (undrained deltas
+  remain) the drain arms `BindingLiveState::set_delta_loss` on the residual
+  bindings; `push_session_delta` now also arms it on a real buffer-overflow
+  drop. The owning worker loop folds that per-binding latch into
+  `SessionTable::set_delta_loss`, driving the EXISTING #2442/#2874 `take_delta_loss`
+  owner-RG resync (table-truth rescan) — deliver-or-resync, never a silent drop,
+  debounced to one resync per episode by a single `AtomicBool`. The owner-RG
+  bulk-export mirror `ha.rs::drain_session_deltas_from_live` shares the same fair
+  helper (threaded cursor) but does NOT arm the latch: that path IS the resync,
+  and its completeness is governed by the caller-supplied `max`. Fail-on-revert
+  tests assert single-drain fairness, cursor rotation across drains, overflow
+  arming, and no-spurious-arm; 4-of-5 go RED on the whole-budget-first revert.
+  A loss-cluster failover smoke is advised (parent runs it).
+- **File(s)**: userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/session_delta.rs,
+  userspace-dp/src/afxdp/coordinator/worker_manager.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/coordinator/status_tests.rs,
+  userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/event_stream/README.md
+
 ## 2026-07-18 — #5624: NAT64 fragment-association must invalidate on config change
 
 - **Timestamp**: 2026-07-18 (fix/5624-nat64-fragassoc-generation)

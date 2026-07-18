@@ -11,6 +11,76 @@
 
 use super::*;
 
+/// #5290: fairly drain up to `max` session deltas across `bindings` using a
+/// rotating cursor and a per-binding quantum, instead of handing the whole
+/// budget to each binding in slot order with an early break.
+///
+/// The old whole-budget-first-binding drain let a single low-slot worker with
+/// many pending deltas consume the entire caller-wide budget during the
+/// event-stream RPC fallback, starving higher-slot workers so HA state quality
+/// depended on worker-slot assignment. This spreads a `budget / num_bindings`
+/// quantum across every live binding per pass, and returns the cursor to resume
+/// from next call so no binding is perpetually starved across successive drains
+/// (a budget < num_bindings still makes progress and the remainder is served
+/// first next time).
+///
+/// Returns `(drained, next_cursor, overflow)`:
+/// - `drained`: the deltas popped (at most `max`), in fair round-robin order.
+/// - `next_cursor`: the binding index to resume from on the next call.
+/// - `overflow`: true when the budget was exhausted AND at least one binding
+///   still holds undrained deltas. The steady-state RPC-fallback caller
+///   (`Coordinator::drain_session_deltas`) uses this to arm loss-of-sync on the
+///   residual bindings so a full owner-RG resync recovers them (never a silent
+///   drop). The bulk owner-RG export caller ignores it — that path IS the
+///   resync, and its completeness is governed by the caller-supplied `max`.
+pub(in crate::afxdp) fn drain_session_deltas_fair(
+    bindings: &[&BindingLiveState],
+    max: usize,
+    start_cursor: usize,
+) -> (Vec<SessionDeltaInfo>, usize, bool) {
+    let n = bindings.len();
+    if n == 0 {
+        return (Vec::new(), start_cursor, false);
+    }
+    let mut budget = max.max(1);
+    // Per-turn quantum: spread the budget across all live bindings so no single
+    // binding drains more than its fair share before the others get a turn. At
+    // least 1 so a budget < n still makes progress (the cursor covers the
+    // remaining bindings on the next call).
+    let quantum = (budget / n).max(1);
+    let mut out = Vec::new();
+    let mut cursor = start_cursor % n;
+    loop {
+        let mut progressed = false;
+        for _ in 0..n {
+            if budget == 0 {
+                break;
+            }
+            let take = quantum.min(budget);
+            let drained = bindings[cursor].drain_session_deltas(take);
+            cursor = (cursor + 1) % n;
+            let got = drained.len();
+            if got > 0 {
+                progressed = true;
+                // got <= take <= budget, so this never underflows.
+                budget = budget.saturating_sub(got);
+                out.extend(drained);
+            }
+        }
+        // Stop once the budget is spent or a full pass drained nothing (every
+        // binding is now empty).
+        if budget == 0 || !progressed {
+            break;
+        }
+    }
+    // Overflow only matters when the budget capped us: if we stopped because a
+    // full pass drained nothing, every binding is empty and no delta was left
+    // behind. The scan re-locks each buffer (cold control path only).
+    let overflow =
+        budget == 0 && bindings.iter().any(|b| b.has_pending_session_deltas());
+    (out, cursor, overflow)
+}
+
 pub(super) fn purge_queued_flows_for_closed_deltas(
     bindings: &mut [BindingWorker],
     binding_lookup: &WorkerBindingLookup,
