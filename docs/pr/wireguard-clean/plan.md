@@ -202,7 +202,16 @@ message and at most one output message. Nothing to "drain".
   peer-initiated rekey blackholed egress until the peer sent data — a
   replayable egress DoS (fable-161 F-019).
 - Replay windows are per-session, tracked by a `ReplayState`
-  (single counter + 64-bit sliding bitmap, RFC 6479) guarded by a
+  (the reference WireGuard RFC 6479 ring: a `[u64; 128]` bitmap =
+  8192 bits giving an **8128-counter window**, `REPLAY_WINDOW`,
+  matching kernel `noise.c` / wireguard-go `replay.go` byte-for-byte;
+  #5168 widened this from the original single-u64 64-wide window,
+  which dropped authentic reordered traffic ~2 orders of magnitude
+  earlier than a reference peer under multi-queue/path-diversity
+  reorder). Width contract: an UNSEEN counter of age ≤ 8128 is
+  accepted (reject test is a STRICT `highest - c > REPLAY_WINDOW`, so
+  age 8128 is the inclusive edge); a genuine replay is rejected at
+  every age. Guarded by a
   `std::sync::Mutex` on the session. Encap is lock-free on the
   replay path — the owning worker is the only producer and bumps a
   separate `AtomicU64` tx counter. Decap takes the per-session
