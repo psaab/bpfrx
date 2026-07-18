@@ -4632,6 +4632,48 @@ pub(super) fn poll_binding_process_descriptor(
                                 .get(&to_zone_id)
                                 .map(|s| s.as_str())
                                 .unwrap_or("");
+                            // #5174: the MissingNeighbor arm never ran NAT64
+                            // classification — that lives in the ForwardCandidate
+                            // session-miss branch (`nat64.allocate_source` ->
+                            // `decision.nat = Nat64State::forward_decision`), gated
+                            // on disposition==ForwardCandidate + Permit. So a NAT64
+                            // flow whose extracted-IPv4 next-hop is UNRESOLVED
+                            // reaches here with `decision.nat` still default
+                            // (rewrite_dst == None, nat64 == false): without this
+                            // its policy would evaluate on the SYNTHETIC IPv6 dst
+                            // and its seed/replay would forward the UNTRANSLATED
+                            // IPv6 frame to the IPv4 gateway. Re-classify the
+                            // destination (a cheap, pure dest-only lookup;
+                            // source-eligibility / RFC 6146 §3.5 hairpin was already
+                            // enforced by the pre-routing classify in the
+                            // session-miss block — which is exactly why the route
+                            // resolved to the IPv4 next-hop). `Some(dst_v4)` marks a
+                            // NAT64 MissingNeighbor flow: policy is matched on the
+                            // extracted IPv4 dst below (the #2358 cross-family
+                            // tuple), and a PERMITTED such flow is handled
+                            // fail-closed (probe + drop, NO seed/buffer) so it
+                            // recovers via the ForwardCandidate path once the
+                            // neighbor resolves. Full buffer-and-translate parity
+                            // (zero cold-start loss) is deferred to a follow-up —
+                            // the cross-family v6->v4 replay the cold-path lacks is
+                            // why this is fail-closed, not buffered.
+                            let nat64_dst_v4 = flow.as_ref().and_then(|f| {
+                                if decision.nat.rewrite_dst.is_some() {
+                                    return None;
+                                }
+                                match f.dst_ip {
+                                    IpAddr::V6(dst_v6) => {
+                                        match worker_ctx.forwarding.nat64.classify_ipv6_dest(dst_v6) {
+                                            crate::nat64::Nat64Match::MatchReady {
+                                                dst_v4,
+                                                ..
+                                            } => Some(dst_v4),
+                                            _ => None,
+                                        }
+                                    }
+                                    IpAddr::V4(_) => None,
+                                }
+                            });
                             // #1913 (Codex r2/r3): evaluate policy for the
                             // MissingNeighbor cold path BEFORE any forwarding
                             // OR neighbor-resolution side-effect. The
@@ -4680,23 +4722,25 @@ pub(super) fn poll_binding_process_descriptor(
                                 //     pre_routing_dnat)`), so the translated
                                 //     internal dst is used; only port-based DNAT
                                 //     also sets `rewrite_dst_port`.
-                                //   - NAT64 classification (`classify_ipv6_dest`)
-                                //     runs ONLY in the ForwardCandidate session-
-                                //     miss block, so `decision.nat.rewrite_dst`
-                                //     is None in this arm and the tuple falls back
-                                //     to `flow.dst_ip` (the synthetic IPv6 dst).
-                                //     #2358 added cross-family (V6 src, V4 dst)
-                                //     policy matching for the NAT64 primary
-                                //     (ForwardCandidate) path; the MissingNeighbor
-                                //     arm does not classify NAT64, so the real
-                                //     IPv4 destination is unavailable here and the
-                                //     synthetic-v6 fallback is retained. A NAT64
-                                //     flow whose v4 next-hop is unresolved is
-                                //     handled by the ForwardCandidate path's own
-                                //     resolution, not this arm.
+                                //   - NAT64 (#5174): `nat64_dst_v4` (computed at
+                                //     the top of this arm via `classify_ipv6_dest`)
+                                //     carries the extracted IPv4 destination when
+                                //     the flow is a NAT64 MissingNeighbor flow, so
+                                //     policy matches the SAME post-translation
+                                //     (V6 src, V4 dst) tuple the ForwardCandidate
+                                //     path matches (#2358) instead of the synthetic
+                                //     IPv6 dst. `decision.nat.rewrite_dst` is still
+                                //     None in this arm (the NAT64 forward decision
+                                //     is built only in the ForwardCandidate branch),
+                                //     which is why the extracted dst is recovered
+                                //     from a fresh classify rather than the merged
+                                //     `decision.nat`.
                                 // Both halves fall back to the original dst/port
                                 // when no inbound destination translation applies.
-                                let policy_dst_ip = decision.nat.rewrite_dst.unwrap_or(flow.dst_ip);
+                                let policy_dst_ip = match nat64_dst_v4 {
+                                    Some(dst_v4) => IpAddr::V4(dst_v4),
+                                    None => decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
+                                };
                                 let policy_dst_port = decision
                                     .nat
                                     .rewrite_dst_port
@@ -5150,6 +5194,30 @@ pub(super) fn poll_binding_process_descriptor(
                                         throttle.insert(throttle_key, now_ns);
                                     }
                                 }
+                            }
+                            // #5174: NAT64 MissingNeighbor fail-closed. The kernel
+                            // ARP/NDP probe above already fired for the extracted
+                            // IPv4 next-hop (so the neighbor will resolve), but the
+                            // cold-path seed + pending_neigh replay is SAME-FAMILY
+                            // only — the replay `rewrite_forwarded_frame_in_place`
+                            // does MAC/VLAN/NAT, NOT the v6->v4 cross-family NAT64
+                            // rebuild. Seeding a plain-forward decision + buffering
+                            // the IPv6 frame here would therefore TX the UNTRANSLATED
+                            // IPv6 frame to the IPv4 gateway AND persist a broken,
+                            // HA-synced `MissingNeighborSeed` session that poisons
+                            // every subsequent packet (session-hit → non-NAT64
+                            // decision). Drop this cold-start packet instead; the
+                            // flow forwards correctly via the ForwardCandidate path
+                            // (which builds the real NAT64 translation) on a later
+                            // packet once the neighbor is resolved. Only a PERMITTED
+                            // flow reaches here — a NAT64 deny already exited above
+                            // with the normal PolicyDenied disposition, so this
+                            // never probe-loops a denied flow. Buffer-and-translate
+                            // parity (zero cold-start loss) is a deferred follow-up.
+                            if nat64_dst_v4.is_some() {
+                                telemetry.dbg.nat64_missing_neigh_drop += 1;
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
                             }
                             // Create the session NOW so the SYN-ACK (reverse
                             // direction) finds the forward NAT match and creates
