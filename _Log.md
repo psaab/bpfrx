@@ -53588,3 +53588,8 @@ top.
   userspace-dp/src/server/tests.rs,
   userspace-dp/src/afxdp/coordinator/README.md,
   userspace-dp/src/server/README.md
+
+## 4960-apply-txn research (fail-closed transactional config-apply)
+- **Timestamp**: 2026-07-18
+- **Action**: Draft plan v1 for #4960 (host netlink) + #4959 (classifier maps) unified fail-closed apply transaction
+- **File(s)**: docs/research/4960-apply-txn/plan.md
