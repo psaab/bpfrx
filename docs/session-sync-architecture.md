@@ -709,6 +709,24 @@ lock scope changes). Event-stream ordering stays governed by `producer_seq_lock`
 inside `push_delta_lossless`, not the `ServerState` lock, so releasing the latter
 does not affect the lossless seq contract (#2874 / #3878).
 
+**The steady-state worker-loop lossless push is time-BOUNDED (#5468).** The
+incremental path — `flush_session_deltas`, which runs directly on the packet
+worker loop — must NOT use the 5 s `LOSSLESS_QUEUE_TIMEOUT`. That timeout equals
+`HEARTBEAT_STALE_AFTER` (5 s), so a connected-but-UNREAD peer (a slow/stalled
+reader whose lossless channel is full) that blocked the worker for the full 5 s
+would stop the loop stamping its per-binding heartbeat; the peer then sees this
+node as stale and triggers a **false failover** — the exact defect #5468
+describes. The worker loop therefore calls `push_delta_lossless_within` with a
+short `WORKER_LOSSLESS_QUEUE_BUDGET` (one fifth of `HEARTBEAT_STALE_AFTER`,
+~1 s), leaving ~5× headroom for the rest of the loop iteration plus the
+heartbeat map write. On the bounded timeout the delta is **not** dropped: the
+same `set_delta_loss` / `take_delta_loss` latch fires and forces a full owner-RG
+resync (deliver-or-resync, the #2874 losslessness contract). Only the
+off-worker-loop exporters — `AllSessionsExport::push` (bulk export on connect,
+above) and `push_purge_close_deltas` (tunnel-remap purge, below) — keep the 5 s
+`LOSSLESS_QUEUE_TIMEOUT` via `push_delta_lossless`; they run off the packet loop
+so a long backpressure wait there does not threaten the worker heartbeat.
+
 ### Delta-ring overflow → loss-of-sync resync (#2442)
 
 Each worker buffers session open/close deltas in an in-worker ring

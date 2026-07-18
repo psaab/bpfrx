@@ -5587,6 +5587,120 @@ fn flush_session_deltas_event_stream_drop_latches_out_of_sync() {
     );
 }
 
+/// #5468 FAIL-ON-REVERT: `flush_session_deltas` runs on the packet worker loop,
+/// so a session-sync delta that cannot be queued to a CONNECTED-but-UNREAD peer
+/// (a slow/stalled reader whose lossless queue is full) must NOT block the loop
+/// for the full 5 s `LOSSLESS_QUEUE_TIMEOUT`. That exceeds `HEARTBEAT_STALE_AFTER`
+/// (5 s), so the loop would stop stamping its heartbeat, the peer would mark this
+/// node stale, and a spurious failover would fire.
+///
+/// This builds a CONNECTED handle whose bounded channel is FILLED to capacity
+/// (the `Receiver` is never drained), so the lossless send exercises the bounded
+/// backpressure retry loop — not the immediate `!connected` early return the
+/// sibling `..._drop_latches_out_of_sync` test uses. The assertions are:
+///   1. the worker-side send returns WELL BELOW `HEARTBEAT_STALE_AFTER` (bounded
+///      to ~`WORKER_LOSSLESS_QUEUE_BUDGET`), and
+///   2. on that bounded timeout it LATCHES loss-of-sync (`flush_session_deltas`
+///      returns `true`) so the worker forces a full owner-RG resync — never a
+///      silent drop (the #2874 losslessness contract).
+///
+/// RED on revert: restoring the worker-loop call to the unbounded
+/// `es.push_delta_lossless(...)` (which waits the full 5 s `LOSSLESS_QUEUE_TIMEOUT`)
+/// makes `elapsed` ≈ 5 s and the bounded-time assertion fails.
+#[test]
+fn flush_session_deltas_full_queue_send_is_bounded_and_latches_out_of_sync() {
+    let key = test_key();
+    let decision = test_decision();
+    let metadata = test_metadata();
+
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+    let recent_session_deltas = Arc::new(Mutex::new(VecDeque::new()));
+    let forwarding = ForwardingState::default();
+
+    // CONNECTED handle with a tiny channel; `_rx` is intentionally never read so
+    // the channel fills and stays full (models an unread peer).
+    let capacity = 4usize;
+    let (handle, _rx) = crate::event_stream::test_worker_handle_connected(
+        capacity,
+        crate::event_stream::DataplaneEventRateLimitConfig::default(),
+    );
+
+    let open = SessionDelta {
+        kind: SessionDeltaKind::Open,
+        key: key.clone(),
+        decision,
+        metadata,
+        origin: SessionOrigin::ForwardFlow,
+        fabric_redirect_sync: false,
+        created_ns: 0,
+        last_seen_ns: 0,
+        counters: crate::session::SessionCounters::default(),
+        observed_tos: 0,
+        observed_tcp_flags: 0,
+        session_id: 0,
+    };
+
+    // Saturate the channel: fill every slot with a best-effort filler push so the
+    // subsequent worker-loop lossless send finds it Full and enters the bounded
+    // retry loop.
+    for _ in 0..capacity {
+        handle.push_delta(&open, &forwarding.zone_name_to_id);
+    }
+
+    let event_stream = Some(handle);
+    let ident = BindingIdentity {
+        slot: 0,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from(""),
+        ifindex: -1,
+    };
+    let dnat_fds = crate::afxdp::checksum::DnatTableFds::default();
+
+    let start = std::time::Instant::now();
+    let out_of_sync = flush_session_deltas(
+        &ident,
+        None,
+        -1,
+        -1,
+        -1,
+        &dnat_fds,
+        &[open],
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &recent_session_deltas,
+        &peer_worker_commands,
+        &event_stream,
+        &forwarding,
+    );
+    let elapsed = start.elapsed();
+
+    assert!(
+        out_of_sync,
+        "a session-sync delta that cannot be queued losslessly to a full/unread peer must latch out-of-sync (force a full owner-RG resync), not be silently dropped (#2874/#5468)"
+    );
+    // The worker-side send must be bounded WELL BELOW the heartbeat-stale
+    // threshold. `WORKER_LOSSLESS_QUEUE_BUDGET` is one fifth of
+    // HEARTBEAT_STALE_AFTER, so a 2x-budget ceiling cleanly separates the fix
+    // (~1x budget) from the reverted 5 s block (~5x budget).
+    assert!(
+        elapsed < WORKER_LOSSLESS_QUEUE_BUDGET * 2,
+        "worker-loop lossless send must be bounded to ~WORKER_LOSSLESS_QUEUE_BUDGET ({:?}), took {:?}; reverting to the unbounded 5 s LOSSLESS_QUEUE_TIMEOUT regresses #5468 (worker stalls past HEARTBEAT_STALE_AFTER -> false liveness loss)",
+        WORKER_LOSSLESS_QUEUE_BUDGET,
+        elapsed
+    );
+    assert!(
+        elapsed < HEARTBEAT_STALE_AFTER,
+        "worker-loop lossless send ({elapsed:?}) must never reach HEARTBEAT_STALE_AFTER ({HEARTBEAT_STALE_AFTER:?}) -> the peer would mark this node stale and fail over (#5468)"
+    );
+}
+
 /// #2979 FAIL-ON-REVERT: a Close delta for an SNAT'd session must delete the
 /// dynamic reverse-NAT `dnat_table` entry that `publish_dnat_table_entry`
 /// inserted at session install. The maps are `BPF_MAP_TYPE_HASH` (non-LRU,

@@ -80,7 +80,10 @@ pub(super) fn flush_session_deltas(
     // further lossless pushes this batch — the full owner-RG resync the caller
     // schedules supersedes the remaining incremental deltas, and this bounds the
     // worst-case producer backpressure to a single lossless wait per drain
-    // cycle even when the consumer is genuinely wedged.
+    // cycle even when the consumer is genuinely wedged. #5468: that single wait
+    // is itself bounded to `WORKER_LOSSLESS_QUEUE_BUDGET` (well below
+    // `HEARTBEAT_STALE_AFTER`), so the worst case is one short worker stall per
+    // drain cycle rather than a full 5 s heartbeat-threatening block.
     let mut event_stream_out_of_sync = false;
     for delta in deltas {
         // #919/#922: emit both the resolved zone NAMES (legacy field,
@@ -195,8 +198,20 @@ pub(super) fn flush_session_deltas(
             // re-derives a complete session view. The RT_FLOW telemetry frames
             // below stay best-effort (`try_send`) — a dropped flow-export record
             // is not a correctness loss and must not force a resync.
+            //
+            // #5468: this runs on the PACKET WORKER LOOP, so the lossless send is
+            // BOUNDED to `WORKER_LOSSLESS_QUEUE_BUDGET` (well below
+            // `HEARTBEAT_STALE_AFTER`) instead of the 5 s `LOSSLESS_QUEUE_TIMEOUT`.
+            // A connected-but-unread peer (full lossless queue) that blocked the
+            // worker for the full 5 s would stop the loop stamping its heartbeat,
+            // the peer would mark this node stale, and a spurious failover would
+            // fire. On the bounded timeout we latch out-of-sync exactly as on any
+            // other lossless failure — deliver-or-resync, never a silent drop, so
+            // the #2874 losslessness contract holds.
             if !event_stream_out_of_sync {
-                if let Err(err) = es.push_delta_lossless(delta, zone_name_to_id) {
+                if let Err(err) =
+                    es.push_delta_lossless_within(delta, zone_name_to_id, WORKER_LOSSLESS_QUEUE_BUDGET)
+                {
                     event_stream_out_of_sync = true;
                     eprintln!(
                         "xpf-event-stream: HA session-sync delta could not be queued losslessly ({err}); latching out-of-sync to force a full owner-RG resync"

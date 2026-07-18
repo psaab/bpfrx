@@ -1,3 +1,41 @@
+## 2026-07-17 — #5468: bound the worker-loop lossless session-delta send below HEARTBEAT_STALE_AFTER
+
+- **Timestamp**: 2026-07-17 (fix/5468-lossless-worker-stall)
+- **Action**: `flush_session_deltas` runs on the packet worker loop and routed
+  correctness-critical HA session open/close deltas through the LOSSLESS
+  event-stream producer `push_delta_lossless` (#2874), which retries a full
+  channel up to `LOSSLESS_QUEUE_TIMEOUT` = 5 s. That equals `HEARTBEAT_STALE_AFTER`
+  (5 s), so a connected-but-UNREAD peer (slow/stalled reader, queue full) could
+  block the worker loop the full 5 s → the loop stops stamping its heartbeat →
+  the peer marks this node stale → false liveness loss / spurious failover.
+  Fix: added `EventStreamWorkerHandle::push_delta_lossless_within(delta, zone,
+  budget)` (parameterizes `send_lossless_encoded`'s deadline) and a new
+  `WORKER_LOSSLESS_QUEUE_BUDGET` const (= `HEARTBEAT_STALE_AFTER / 5`, ~1 s, with
+  a compile-time `assert!` it stays ≤ half the stale threshold). `flush_session_deltas`
+  now uses the bounded variant; on the bounded timeout it latches loss-of-sync
+  exactly as before (`set_delta_loss` → `take_delta_loss` full owner-RG resync),
+  so losslessness is preserved (deliver-or-resync, never a silent drop). The
+  off-worker-loop exporters (`AllSessionsExport::push` bulk export,
+  `push_purge_close_deltas` tunnel-remap purge) keep the 5 s `LOSSLESS_QUEUE_TIMEOUT`
+  via `push_delta_lossless` — they run off the packet loop so the heartbeat is
+  unaffected.
+- **File(s)**: userspace-dp/src/afxdp/mod.rs (WORKER_LOSSLESS_QUEUE_BUDGET +
+  static assert), userspace-dp/src/event_stream/mod.rs (timeout param on
+  send_lossless_encoded, push_delta_lossless_within, test_worker_handle_connected
+  seam), userspace-dp/src/afxdp/session_delta.rs (bounded call at the worker
+  loop), userspace-dp/src/afxdp/session_glue/tests.rs (fail-on-revert test:
+  connected+full queue → bounded return + loss-of-sync latch), event_stream
+  README + docs/session-sync-architecture.md.
+- **Validation**: `cargo build` green; new test
+  `flush_session_deltas_full_queue_send_is_bounded_and_latches_out_of_sync`
+  passes in ~1 s (waits the budget then latches); reverting the worker-loop call
+  to unbounded `push_delta_lossless` makes it take 5.0 s and FAIL the bounded
+  assertion. event_stream/session_delta/ha/session suites green (203 + 172
+  passing); 5× flake check green. Pre-existing env-flaky test
+  `stalled_consumer_does_not_grow_backlog_unbounded_end_to_end` fails at the
+  BASE SHA too (verified via stash) — unrelated to this change. Loss-cluster
+  failover smoke advised (parent to run).
+
 ## 2026-07-17 — #5469: write_state serializes+fsyncs OUTSIDE the ServerState lock
 
 - **Timestamp**: 2026-07-17 (fix/5469-writestate-lock-convoy)

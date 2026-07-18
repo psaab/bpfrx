@@ -487,6 +487,23 @@ pub(crate) fn test_worker_handle(
     (EventStreamWorkerHandle { tx, shared }, rx)
 }
 
+/// #5468 test seam: build a CONNECTED worker handle (connected flag forced
+/// `true`) whose bounded mpsc channel has `capacity` slots. The returned
+/// `Receiver` is never drained by the test, so filling the channel to capacity
+/// models a connected-but-unread peer — exactly the state that drives the
+/// bounded backpressure retry loop in `push_delta_lossless_within` (rather than
+/// the immediate `!connected` early return that `test_worker_handle` exercises).
+/// The `Receiver` must be kept alive so the channel stays connected.
+#[cfg(test)]
+pub(crate) fn test_worker_handle_connected(
+    capacity: usize,
+    config: DataplaneEventRateLimitConfig,
+) -> (EventStreamWorkerHandle, mpsc::Receiver<EventFrame>) {
+    let (handle, rx) = test_worker_handle(capacity, config);
+    handle.shared.connected.store(true, Ordering::Release);
+    (handle, rx)
+}
+
 // ---------------------------------------------------------------------------
 // EventStreamWorkerHandle -- lightweight clone for worker threads
 // ---------------------------------------------------------------------------
@@ -602,14 +619,24 @@ impl EventStreamWorkerHandle {
     /// for frames whose seq came from `next_seq()` (roll it back on a drop,
     /// #3878 F-153) and `None` for control frames that carry a fixed, non-
     /// allocated seq (e.g. `DrainComplete`).
-    fn send_lossless_encoded<F>(&self, mut encode: F) -> Result<(), String>
+    ///
+    /// `timeout` bounds the total backpressure wait before this gives up and
+    /// returns `Err`. Off-worker-loop callers (bulk export on connect, the
+    /// tunnel-remap purge) pass the full `LOSSLESS_QUEUE_TIMEOUT` (5 s). The
+    /// packet-worker-loop caller (`flush_session_deltas` via
+    /// `push_delta_lossless_within`) passes a SHORT budget well below
+    /// `HEARTBEAT_STALE_AFTER` so a connected-but-unread peer cannot stall the
+    /// worker past the heartbeat-stale threshold and self-inflict a spurious
+    /// failover (#5468). Either way the give-up is a genuine `Err` the caller
+    /// latches as loss-of-sync (forcing a full resync) — never a silent drop.
+    fn send_lossless_encoded<F>(&self, timeout: Duration, mut encode: F) -> Result<(), String>
     where
         F: FnMut() -> (EventFrame, Option<u64>),
     {
         if !self.shared.connected.load(Ordering::Acquire) {
             return Err("event stream not connected".to_string());
         }
-        let deadline = Instant::now() + LOSSLESS_QUEUE_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         loop {
             // Raw `tx.try_send` (NOT `try_send_frame`): a `Full` here is a
             // RETRY, not a drop, so it must not bump `frames_dropped` — the
@@ -686,7 +713,7 @@ impl EventStreamWorkerHandle {
     /// `send_lossless_encoded` closure.
     #[cfg_attr(not(test), allow(dead_code))]
     fn send_frame_lossless(&self, frame: EventFrame) -> Result<(), String> {
-        self.send_lossless_encoded(move || (frame.clone(), None))
+        self.send_lossless_encoded(LOSSLESS_QUEUE_TIMEOUT, move || (frame.clone(), None))
     }
 
     fn encode_delta_frame(
@@ -736,7 +763,30 @@ impl EventStreamWorkerHandle {
         delta: &SessionDelta,
         zone_name_to_id: &FxHashMap<String, u16>,
     ) -> Result<(), String> {
-        self.send_lossless_encoded(|| {
+        self.push_delta_lossless_within(delta, zone_name_to_id, LOSSLESS_QUEUE_TIMEOUT)
+    }
+
+    /// #5468: worker-loop variant of [`push_delta_lossless`] that bounds the
+    /// backpressure wait to `budget` instead of the fixed 5 s
+    /// `LOSSLESS_QUEUE_TIMEOUT`.
+    ///
+    /// `flush_session_deltas` runs on the packet worker loop, so a
+    /// connected-but-unread peer (a slow/stalled reader whose channel is full)
+    /// must NOT be able to block the loop for the full `LOSSLESS_QUEUE_TIMEOUT`
+    /// — that exceeds `HEARTBEAT_STALE_AFTER`, so the peer marks this node stale
+    /// and triggers a false failover. The caller passes a `budget` well below
+    /// the heartbeat-stale threshold (`WORKER_LOSSLESS_QUEUE_BUDGET`); on
+    /// timeout this returns `Err` exactly like the 5 s path and the caller
+    /// latches loss-of-sync (a full owner-RG resync). Losslessness is preserved
+    /// — the delta is either delivered or a resync is forced, never a silent
+    /// drop (the #2874 contract).
+    pub(crate) fn push_delta_lossless_within(
+        &self,
+        delta: &SessionDelta,
+        zone_name_to_id: &FxHashMap<String, u16>,
+        budget: Duration,
+    ) -> Result<(), String> {
+        self.send_lossless_encoded(budget, || {
             let seq = self.next_seq();
             (
                 Self::encode_delta_frame(seq, delta, zone_name_to_id),
