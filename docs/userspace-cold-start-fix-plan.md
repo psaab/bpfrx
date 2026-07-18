@@ -56,6 +56,29 @@ The following changes were directionally correct and should be kept:
 4. Go-side proactive neighbor refresh
    - manager periodically reads the kernel neighbor table
    - manager pushes neighbor snapshots to the helper
+   - **#5104 — the status-loop async prewarm scan is now bounded.** The status
+     loop (`process_status.go`) kicks `proactiveNeighborResolveAsyncLocked`
+     every 1s for the first 60s, then every 10s on HA standby. Each scan does
+     route-indexed neighbor dumps and a probe sweep, which can outlast its tick
+     under slow netlink or a large RIB. The prewarm is now:
+     - **singleflight** — a lock-free `neighborPrewarmInFlight` CAS guard
+       (`manager.go`) coalesces overlapping ticks onto the running scan; a
+       second scan never starts while one is in flight. The guard clears when
+       the scan goroutine returns (via `defer`, so a panic also clears it).
+     - **deadline-bounded** — each scan runs under a
+       `neighborPrewarmDeadline` (15s) context and checks it between netlink
+       dumps, so a slow netlink layer cannot pin the guard indefinitely; the
+       next tick spawns a fresh scan. (vishvananda/netlink calls are not
+       context-cancelable mid-syscall, so the deadline bounds the between-dump
+       loop, not a single wedged syscall.)
+     - **bounded probe pool** — `runBoundedNeighborProbes` (`process_napi.go`)
+       fans probes out through a fixed `neighborPrewarmProbeWorkers` (8) pool
+       instead of one goroutine per target, so a large resolve set cannot
+       multiply goroutines every tick.
+     - **one neighbor dump per link per scan** — the scan caches
+       `NeighList(FAMILY_ALL)` per link index, collapsing the old
+       per-route re-dump.
+     Regression: `neighbor_prewarm_singleflight_5104_test.go`.
 
 5. Rust-side dynamic learning paths
    - netlink neighbor monitor
