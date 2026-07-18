@@ -28,6 +28,61 @@
   existing corrupt-header trim tests stay green because a zeroed IHL makes
   `declared_l3_end` return None → metadata fallback).
 
+## 2026-07-18 — #5268 (High, security): RX-VLAN-offload-disable is a fail-closed activation precondition
+
+- **Timestamp**: 2026-07-18 (fix/5268-rxvlan-failclosed)
+- **Action**: The XDP dataplane reads VLAN (security-domain) identity ONLY from
+  the in-frame 802.1Q tag. `ensureRxVlanOff` (pkg/dataplane/compiler.go), called
+  at compiler_iface.go, only WARNED when it could not disable a NIC's RX-VLAN
+  hardware offload and let the compile continue into shim attachment. If the
+  offload persistently stripped the tag into `skb->vlan_tci` (unreadable by XDP),
+  tagged frames parse as `vlan_id=0`, `resolve_ingress_logical_ifindex` falls
+  back to the PHYSICAL parent ifindex → the parent's/first-subinterface's zone →
+  untrusted VLAN traffic classified into a TRUSTED zone (screen/policy bypass),
+  silent after one warning.
+  Fix:
+  1. `ensureRxVlanOff` now RETURNS an error when the offload is ACTIVE and could
+     not be disabled (or the state is unknown and the disable failed). It returns
+     nil when the NIC reports the feature `off`/`off [fixed]` OR ABSENT (a
+     successful query listing no rx-vlan-offload line) — such NICs (e.g. virtio)
+     never strip tags, so `-K` is never attempted (avoids a needless driver
+     reset AND a false fail-closed).
+  2. `rxVlanOffloadActivationError` (new) fails the compile/apply CLOSED on that
+     error ONLY when the parent carries ≥1 configured VLAN subinterface
+     (`parentHasVlanSubinterface`, unit.VlanID>0). A plain parent, or a NIC that
+     legitimately lacks the offload knob when no VLANs are present, is
+     unaffected. The compile path (compiler_iface.go) returns the error → shim
+     attachment never happens.
+  3. LATENT BUG also fixed: the pre-existing off-detection used
+     `strings.Contains(line, "off")`, which matches the feature NAME
+     `rx-vlan-offLOAD` — so EVERY line (on OR off) read as "off" and an ACTIVE
+     offload was never actually disabled. Now parsed by the value after the
+     colon (`HasPrefix(value, "off")`). Without this the whole fail-closed gate
+     would be dead (ensureRxVlanOff always thought the offload was off).
+  4. `runEthtool` func → package var (mockable for the unit tests; behaviour
+     unchanged).
+- **Tests (fail-on-revert; pkg/dataplane, white-box)**: 10 in
+  `compiler_rxvlan_failclosed_5268_test.go`. THE fail-on-revert
+  `TestRxVlanFailClosedOnVlanParent_5268`: a parent WITH a configured VLAN
+  subinterface whose real `ensureRxVlanOff` (mocked ethtool: `-k` "on", `-K`
+  fails) errors → `rxVlanOffloadActivationError` returns non-nil (activation
+  aborts). NEGATIVE SCOPE `TestRxVlanTolerantOnPlainParent_5268`: a plain parent
+  with the SAME failure → nil (still succeeds). Plus ensureRxVlanOff contract
+  (on+fail→err, off/absent/cached→nil, query-fail+disable-ok→nil,
+  query-fail+disable-fail→err) and parentHasVlanSubinterface.
+  Reverting the gate to warn-and-continue turns EXACTLY
+  `TestRxVlanFailClosedOnVlanParent_5268` RED (target-count 1); all others GREEN.
+- **Validation**: firsthand green — `go test ./pkg/dataplane/...` (+
+  runtime/userspace/format consumers) all ok; `go vet ./pkg/dataplane/` clean;
+  `go build ./...` clean.
+- **Smoke**: deploy/activation-path change, NOT HA/session-sync/failover
+  (confirmed — no cluster/VRRP/session code touched). Unit-provable (the whole
+  decision is deterministic given the ethtool result + config); a loss-cluster
+  deploy smoke is NOT required and would need a NIC where rxvlan-offload can't be
+  disabled to exercise the fail-closed leg (the loss VFs already report it off) —
+  flagged, not warranted.
+- **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/compiler_rxvlan_failclosed_5268_test.go, docs/feature-coverage.md
 ## 2026-07-18 — #5139: flow-cache identity must include the logical (VLAN) ingress ifindex
 
 - **Timestamp**: 2026-07-18 (fix/5139-flowcache-logical-ifindex)
