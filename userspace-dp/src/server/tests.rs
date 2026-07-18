@@ -1860,6 +1860,38 @@ fn rebind_failed_reconcile_reports_error_5621() {
 }
 
 #[test]
+fn set_forwarding_state_failed_reconcile_reports_error_6135() {
+    // #6135 (the 4th site of #5621, excluded from the #6134 fix): the
+    // set_forwarding_state handler used to `let _ =
+    // reconcile_status_bindings(guard)`, acking ok=true even when the reconcile
+    // of the ALREADY-ACCEPTED snapshot FAILED (a mandatory-pin preflight fault
+    // or a forwarding-build integrity error). Arm forwarding on a registered
+    // binding so the handler keeps forwarding_armed=true; the stored bad
+    // snapshot (unparseable /33 interface address) makes
+    // reconcile_status_bindings take the armed arm and return Err. Reverting
+    // the matching site to `let _ = reconcile_status_bindings(...)` restores
+    // ok=true and flips this assertion RED (target-count 1).
+    let state = armed_state_with_failing_reconcile(vec![BindingStatus {
+        slot: 0,
+        registered: true,
+        ifindex: 10,
+        ..BindingStatus::default()
+    }]);
+    let mut request = req("set_forwarding_state");
+    request.forwarding = Some(ForwardingControlRequest { armed: true });
+    let response = run_request(state, request);
+    assert!(
+        !response.ok,
+        "#6135: set_forwarding_state must report ok=false when the reconcile fails"
+    );
+    assert!(
+        response.error.contains("forwarding reconcile failed"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
 fn stop_workers_clears_socket_fields_on_all_bindings() {
     // stop_workers must tear down per-binding socket state so the
     // subsequent rebind recreates fresh AF_XDP sockets.
