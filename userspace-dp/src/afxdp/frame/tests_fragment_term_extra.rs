@@ -782,3 +782,198 @@ fn build_tunnel_egress_non_first_fragment_skips_forced_l4_recompute() {
     );
 }
 
+
+// #5568 (security — SCALAR classification from physical slack): the scalar L4
+// inputs (ICMP type/code presence, TCP flags, fragment status, l4_present) MUST
+// derive from the IP-DECLARED datagram end, not the physical frame. Attacker
+// Ethernet padding beyond the declared IP length must NOT manufacture an L4
+// match. #5150 already clamped the flex BYTE SLICES; these guard the residual
+// SCALAR surface. Each test goes RED if the derivation reverts to `frame.len()`
+// (ICMP/TCP presence) or the raw `frame.get(l3..)` slice (fragment walk).
+
+// PRIMARY parent-RED gate (#5568): an Ethernet-minimum IPv4 frame declaring
+// total-length 20 (a bare IP header, NO declared ICMP body) with bytes `8, 0`
+// (echo-request type/code) sitting in the PADDING at the shim-stamped l4_offset
+// must NOT surface l4_present / icmp_type — else a permit constrained to
+// echo-request wrongly matches and a deny false-drops. Reverting the
+// `l4 + 2 <= declared_end` gate to `frame.len() >= l4 + 2` makes l4_present true
+// and icmp_type == 8, and THIS test goes RED (target-count 1 for the ICMP axis).
+#[test]
+fn term_extra_icmp_type_from_ethernet_slack_beyond_declared_end_fails_closed() {
+    // Declared datagram: 20-byte IPv4 header, total-length 20 (frag_v4_packet
+    // with an empty payload), proto ICMP. NO L4 header in the declared datagram.
+    let datagram = frag_v4_packet(PROTO_ICMP, 0x0000, &[]);
+    assert_eq!(datagram.len(), 20, "declared datagram is a bare IP header");
+    let mut frame = vec![0u8; 14]; // ethernet header
+    frame.extend_from_slice(&datagram);
+    // Ethernet SLACK past the declared IP length: `8, 0` = ICMP echo-request
+    // type/code, plus filler so the physical frame reaches l4_offset + 2.
+    frame.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 20, // 34 — points at the slack; the declared end is 34 too
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert!(
+        !extra.l4_present,
+        "type/code lies in Ethernet slack beyond the declared IP length \
+         (total-length 20) → l4_present MUST be false so an echo-request-\
+         constrained permit does not match and a deny does not false-drop; \
+         reverting the declared_end gate to frame.len() makes this true"
+    );
+    assert_eq!(
+        extra.icmp_type, 0,
+        "the `8` (echo-request) in Ethernet slack must NOT be read as icmp_type"
+    );
+    assert_eq!(extra.icmp_code, 0);
+}
+
+
+// #5568 TCP axis (target-count 1): an IPv4 frame declaring total-length 20 (no
+// declared TCP header) whose shim-stamped tcp_flags = SYN was read from padding.
+// The declared datagram does not reach the TCP flags byte, so l4_present MUST be
+// false and tcp_flags MUST be suppressed. Reverting the #5568 TCP declared-length
+// gate (there was no TCP L4-presence gate before) leaves l4_present true and
+// tcp_flags == SYN → RED.
+#[test]
+fn term_extra_tcp_flags_from_ethernet_slack_beyond_declared_end_fails_closed() {
+    let datagram = frag_v4_packet(PROTO_TCP, 0x0000, &[]);
+    assert_eq!(datagram.len(), 20);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&datagram);
+    // Physical slack covering a full pseudo-TCP header (>= 14 bytes so the flags
+    // byte at l4 + 13 is physically present but NOT within the declared datagram).
+    frame.extend_from_slice(&[0u8; 20]);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 20, // 34 — declared end is also 34
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x02, // SYN, as if the shim read it from the slack
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert!(
+        !extra.l4_present,
+        "the declared datagram (total-length 20) contains no TCP flags byte → \
+         l4_present MUST be false so a `tcp-flags syn` term fails closed; \
+         reverting the #5568 TCP declared-length gate leaves l4_present true"
+    );
+    assert_eq!(
+        extra.tcp_flags, 0,
+        "shim-stamped SYN was read from Ethernet slack and must not be exposed"
+    );
+}
+
+
+// #5568 IPv6 fragment axis (target-count 1): an IPv6 fixed header with
+// payload_len 0 (declared datagram = 40 bytes) whose next-header is Hop-by-Hop
+// (0, a walkable extension header). Ethernet SLACK past byte 40 forges a HbH
+// option whose next-header is Fragment (44). The unbounded ext-header walk would
+// chase the slack and set is_fragment = true; bounding the walk to the declared
+// datagram (40 bytes) stops it. Reverting the fragment walker to the raw
+// frame.get(l3..) slice manufactures a fragment → RED.
+#[test]
+fn term_extra_ipv6_fragment_from_ethernet_slack_beyond_declared_end_not_manufactured() {
+    let mut ipv6 = vec![0u8; 40];
+    ipv6[0] = 0x60;
+    ipv6[6] = 0; // next header = Hop-by-Hop (walkable)
+    ipv6[7] = 64; // hop limit
+    ipv6[8..24].copy_from_slice(&[0x20; 16]); // src
+    ipv6[24..40].copy_from_slice(&[0x30; 16]); // dst
+    // payload_len (bytes 4..6) stays 0 → declared datagram end = l3 + 40.
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&ipv6);
+    // Ethernet slack forging an 8-byte HbH option: next-header = 44 (Fragment).
+    frame.extend_from_slice(&[44, 0, 0, 0, 0, 0, 0, 0]);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 40,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP, // irrelevant to is_fragment (addr_family-driven)
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert!(
+        !extra.is_fragment,
+        "the Fragment header lives in Ethernet slack beyond the declared \
+         payload_len (0) → is_fragment MUST stay false; reverting the fragment \
+         walker to the raw frame.get(l3..) slice manufactures a fragment"
+    );
+}
+
+
+// #5568 anti-over-gate: a well-formed TCP packet (declared total-length covers
+// the 20-byte TCP header) keeps l4_present true and the shim-stamped flags —
+// proving the new TCP declared-length gate does not reject legitimate traffic.
+#[test]
+fn term_extra_full_tcp_keeps_l4_present_and_flags() {
+    let mut tcp = vec![0u8; 20];
+    tcp[13] = 0x12; // SYN|ACK
+    let datagram = frag_v4_packet(PROTO_TCP, 0x0000, &tcp);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&datagram);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 20,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x12,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert!(extra.l4_present, "full TCP packet → l4_present true (no over-reject)");
+    assert_eq!(extra.tcp_flags, 0x12, "authoritative shim flags preserved");
+}
+
+
+// #5568 anti-over-gate: a REAL IPv6 fragment (fragment header within the declared
+// payload_len) is still classified is_fragment = true — the declared-end bound
+// excludes slack, never a legitimately-declared fragment header.
+#[test]
+fn term_extra_ipv6_real_fragment_still_detected_no_slack() {
+    let datagram = frag_v6_packet(PROTO_TCP, Some(0x0001), &[0u8; 8]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&datagram);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 40 + 8, // past the fragment header
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert!(
+        extra.is_fragment,
+        "a real (declared) IPv6 fragment is still detected"
+    );
+}
+
+
+// #5568: the ForwardPacketMeta (CoS / TX-selection) twin builder MUST apply the
+// identical declared-end gate — otherwise a CoS-action scalar match on that path
+// reads Ethernet slack. Mirrors the primary ICMP axis on the fwd builder.
+#[test]
+fn term_extra_fwd_icmp_type_from_slack_beyond_declared_end_fails_closed() {
+    let datagram = frag_v4_packet(PROTO_ICMP, 0x0000, &[]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&datagram);
+    frame.extend_from_slice(&[8, 0, 0, 0]);
+    let meta = ForwardPacketMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 20,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..ForwardPacketMeta::default()
+    };
+    let extra = term_match_extra_from_frame_fwd(&frame, meta);
+    assert!(
+        !extra.l4_present,
+        "fwd twin must fail closed on slack icmp type/code (identical to the input builder)"
+    );
+    assert_eq!(extra.icmp_type, 0);
+}
+

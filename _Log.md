@@ -1,3 +1,27 @@
+## 2026-07-18 — #5568 (security): SCALAR L4/fragment classifier bounded to IP-declared datagram end
+
+- **Timestamp**: 2026-07-18 (fix/5568-scalar-l4-declared-bound)
+- **Action**: The scalar L4/fragment inputs in `term_match_extra_from_frame`
+  (+ the `ForwardPacketMeta` twin) derived from the PHYSICAL frame, not the
+  IP-declared datagram end — the residual scalar surface left after #5150
+  clamped the flex byte slices. Attacker Ethernet padding beyond the declared IP
+  length could manufacture ICMP type/code presence, TCP flags, fragment state,
+  and `l4_present` from slack (spurious PERMIT / false DENY / manufactured
+  fragment). Fix = compute `declared_end` (`ip_declared_end` SSOT) FIRST; bound
+  the fragment walkers to `frame.get(l3..declared_end)`; require
+  `l4_offset + 2 <= declared_end` for ICMP type/code and
+  `l4_offset + 14 <= declared_end` (TCP flags byte) for TCP flags, else drop
+  `l4_present` (fail closed). The `parse_embedded_v4`/`parse_embedded_v6` quote
+  parsers bound the inner L4 read/walk to the QUOTED IP's declared length
+  (clamped to the available quote — RFC-minimum truncated quotes NOT rejected).
+  Common no-slack path (`declared_end == frame.len()`) byte-identical. Added
+  fail-on-revert tests (one per axis) + anti-over-gate guards. Full suite 4024
+  passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/tests_fragment_term_extra.rs,
+  userspace-dp/src/afxdp/icmp_embed/parse.rs,
+  userspace-dp/src/filter/README.md
+
 ## 2026-07-18 — #5146 (security/correctness): NAT64 first-fragment association published pre-commit
 
 - **Timestamp**: 2026-07-18 (fix/5146-nat64-frag-rollback)

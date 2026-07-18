@@ -582,67 +582,101 @@ fn ip_declared_end(frame: &[u8], l3_offset: usize, addr_family: u8) -> Option<us
     }
 }
 
+/// #5568: the number of L4 (TCP) header bytes that must lie within the
+/// IP-DECLARED datagram before the shim-stamped `tcp_flags` may be trusted for
+/// a `tcp-flags` match. The TCP flags byte is at TCP header offset 13 (RFC
+/// 9293 §3.1), so the declared datagram must reach `l4_offset + 14`. A shorter
+/// declared length means the shim read the flags out of Ethernet slack /
+/// padding, so the tcp-flags terms must fail closed (`l4_present = false`). A
+/// well-formed TCP packet always declares at least a 20-byte L4 header, so this
+/// bound never rejects legitimate traffic.
+const TCP_FLAGS_DECLARED_MIN: usize = 14;
+
 #[inline]
 pub(in crate::afxdp) fn term_match_extra_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,
 ) -> crate::filter::TermMatchExtra<'_> {
-    use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
-    let l3_packet = frame.get(meta.l3_offset as usize..);
-    let is_fragment = l3_packet.is_some_and(|packet| is_any_fragment(packet, meta.addr_family));
+    use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP};
+    // #5568: derive EVERY scalar L4/fragment input from the IP-DECLARED datagram
+    // end, not the physical frame. The shim stamps `l3_offset`/`l4_offset` from
+    // the raw frame, so attacker-controlled Ethernet padding beyond the declared
+    // IP length would otherwise manufacture fragment status, ICMP type/code, TCP
+    // flags, and `l4_present` out of slack. Compute `declared_end` FIRST (the
+    // #5150 `ip_declared_end` SSOT — also backing the flex slices below), so a
+    // single declared bound governs the whole builder. On the common no-slack
+    // path `declared_end == frame.len()`, so classification is byte-identical.
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    let declared_end = ip_declared_end(frame, l3, meta.addr_family);
+    // The fragment walkers see ONLY the declared datagram (`l3..declared_end`),
+    // so an IPv6 fragment/extension header lurking in padding beyond the declared
+    // `payload_len` — or an IPv4 `frag_off` in slack — cannot manufacture
+    // fragment state. `frame.get(l3..declared_end)` is None when the frame is too
+    // short to even hold the IP length field (`declared_end == None`), which
+    // fails the fragment bits closed (false) — the same posture the L4 gates take.
+    let l3_declared = declared_end.and_then(|end| frame.get(l3..end));
+    let is_fragment = l3_declared.is_some_and(|packet| is_any_fragment(packet, meta.addr_family));
     // A non-first fragment has no L4 header at `l4_offset` (its bytes are
     // payload) — suppress every L4-derived match input so those terms fail
     // closed. The is-fragment bit above stays as-is (L3-only).
     let non_first_fragment =
-        l3_packet.is_some_and(|packet| is_non_first_fragment(packet, meta.addr_family));
-    // #2449: a TRUNCATED (non-fragmented) ICMP/ICMPv6 frame may be shorter than
-    // `l4_offset + 2`, so the type/code bytes are absent. Reading them with
-    // `.unwrap_or(0)` would yield (0, 0) while `l4_present` stayed true — a
-    // crafted short ICMP packet would then spuriously match `icmp-type 0 /
-    // icmp-code 0` (Echo Reply). Detect the truncation and fail closed: force
-    // (0, 0, 0) AND drop `l4_present` so the L4 matcher rejects the term.
-    // `icmp_type_code_truncated` is false for non-ICMP protocols (those never
-    // read the bytes) and for non-first fragments (handled above).
+        l3_declared.is_some_and(|packet| is_non_first_fragment(packet, meta.addr_family));
+    // #2449 + #5568: ICMP/ICMPv6 type+code occupy the first 2 L4 bytes; they are
+    // present ONLY if the DECLARED datagram reaches `l4 + 2`. The pre-#5568 gate
+    // used the physical `frame.len()`, so Ethernet padding beyond a short declared
+    // length (e.g. an IPv4 total-length of 20 with no declared ICMP body) could
+    // read `type/code` — turning a non-match into a spurious `icmp-type 8`
+    // (echo-request) PERMIT or false DENY. `declared_end == None` (frame too short
+    // to hold the IP length field) fails closed.
     let icmp_type_code_present = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
         && !non_first_fragment
-        && (frame.len() >= (meta.l4_offset as usize).saturating_add(2));
-    let l4_truncated = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+        && declared_end.is_some_and(|end| l4.saturating_add(2) <= end);
+    let l4_truncated_icmp = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
         && !non_first_fragment
         && !icmp_type_code_present;
+    // #5568: the shim-stamped `tcp_flags` is trustworthy only if the DECLARED
+    // datagram reaches the TCP flags byte (`l4 + TCP_FLAGS_DECLARED_MIN`). A short
+    // / padded TCP frame whose declared length stops before the flags byte had
+    // those flags read from slack, so the tcp-flags terms must fail closed. A
+    // legitimate TCP packet always declares >= 20 L4 bytes, so this never rejects
+    // real traffic. `declared_end == None` fails closed.
+    let tcp_flags_present = meta.protocol == PROTO_TCP
+        && !non_first_fragment
+        && declared_end.is_some_and(|end| l4.saturating_add(TCP_FLAGS_DECLARED_MIN) <= end);
+    let l4_truncated_tcp =
+        meta.protocol == PROTO_TCP && !non_first_fragment && !tcp_flags_present;
     let (tcp_flags, icmp_type, icmp_code) = if non_first_fragment {
         (0, 0, 0)
     } else if icmp_type_code_present {
-        let l4 = meta.l4_offset as usize;
+        // Safe: `l4 + 2 <= declared_end <= frame.len()`, so both bytes lie in the
+        // frame AND within the declared datagram (never slack).
         (
             meta.tcp_flags,
             frame.get(l4).copied().unwrap_or(0),
             frame.get(l4.wrapping_add(1)).copied().unwrap_or(0),
         )
-    } else if l4_truncated {
-        // Truncated ICMP — no real type/code bytes. Fail closed.
+    } else if l4_truncated_tcp {
+        // TCP flags byte lies beyond the declared datagram — the shim read them
+        // from slack. Fail closed (0 flags; `l4_present` dropped below).
+        (0, 0, 0)
+    } else if l4_truncated_icmp {
+        // Truncated/padded ICMP — no real type/code bytes. Fail closed.
         (0, 0, 0)
     } else {
         (meta.tcp_flags, 0, 0)
     };
-    // #5150: clamp the flexible-match-range byte slices to the IP-DECLARED
-    // datagram end (`l3_offset + IP total length`, clamped to `frame.len()`),
-    // NOT the physical frame end. Slicing to `frame.len()` exposed
-    // attacker-controlled bytes in Ethernet slack (padding beyond the declared
-    // IP length) to a byte-offset filter match — a match-on-padding /
-    // filter-evasion bug. `None` (frame too short to hold the IP length field)
-    // fails both slices closed, like a frame shorter than l3_offset.
-    let l3 = meta.l3_offset as usize;
-    let declared_end = ip_declared_end(frame, l3, meta.addr_family);
     crate::filter::TermMatchExtra {
         tcp_flags,
         is_fragment,
         icmp_type,
         icmp_code,
-        // The L4 header is absent on a non-first fragment OR a truncated ICMP
-        // frame (#2449). The matcher gates tcp-flags / icmp-type / icmp-code on
-        // this (a zeroed icmp byte is otherwise a valid icmp-type 0 / icmp-code
-        // 0 match).
-        l4_present: !non_first_fragment && !l4_truncated,
+        // The L4 header is absent on a non-first fragment, a truncated/padded ICMP
+        // (type/code past the declared end, #2449/#5568), or a truncated/padded
+        // TCP (flags byte past the declared end, #5568). The matcher gates
+        // tcp-flags / icmp-type / icmp-code on this (a zeroed icmp byte is
+        // otherwise a valid icmp-type 0 / icmp-code 0 match).
+        l4_present: !non_first_fragment && !l4_truncated_icmp && !l4_truncated_tcp,
         // #3077: the L3 header slice (match-start layer-3) backs the
         // flexible-match-range byte-offset match. The byte offset is relative to
         // the start of the IP header. #5150: the slice ends at the IP-declared
@@ -651,7 +685,7 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
         // l3_offset (declared_end < l3 → invalid range) OR `declared_end` is
         // None, in which case the matcher's bounds check fails the flex term
         // closed.
-        flex_l3: declared_end.and_then(|end| frame.get(l3..end)),
+        flex_l3: l3_declared,
         // #3232: the L4 header slice (match-start layer-4) backs a layer-4
         // flexible-match-range. The byte offset is relative to the start of the
         // transport header (`meta.l4_offset`). A NON-FIRST fragment carries no
@@ -665,7 +699,7 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
         flex_l4: if non_first_fragment {
             None
         } else {
-            declared_end.and_then(|end| frame.get(meta.l4_offset as usize..end))
+            declared_end.and_then(|end| frame.get(l4..end))
         },
     }
 }
@@ -683,55 +717,65 @@ pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
     frame: &[u8],
     meta: ForwardPacketMeta,
 ) -> crate::filter::TermMatchExtra<'_> {
-    use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
-    let l3_packet = frame.get(meta.l3_offset as usize..);
-    let is_fragment = l3_packet.is_some_and(|packet| is_any_fragment(packet, meta.addr_family));
+    use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP};
+    // #5568: the ForwardPacketMeta builder MUST stay identical to
+    // `term_match_extra_from_frame` — derive every scalar from the IP-declared
+    // datagram end, not the physical frame, so a CoS-action byte/scalar match on
+    // this TX-selection path cannot read Ethernet slack.
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    let declared_end = ip_declared_end(frame, l3, meta.addr_family);
+    let l3_declared = declared_end.and_then(|end| frame.get(l3..end));
+    let is_fragment = l3_declared.is_some_and(|packet| is_any_fragment(packet, meta.addr_family));
     let non_first_fragment =
-        l3_packet.is_some_and(|packet| is_non_first_fragment(packet, meta.addr_family));
-    // #2449: see `term_match_extra_from_frame` — same truncated-ICMP fail-closed
-    // guard. A frame shorter than `l4_offset + 2` has no real type/code bytes.
+        l3_declared.is_some_and(|packet| is_non_first_fragment(packet, meta.addr_family));
+    // #2449 + #5568: see `term_match_extra_from_frame` — declared-end-bounded
+    // ICMP type/code presence and TCP-flags presence. Physical `frame.len()` is
+    // NOT consulted, so padding beyond a short declared length cannot manufacture
+    // an L4 scalar.
     let icmp_type_code_present = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
         && !non_first_fragment
-        && (frame.len() >= (meta.l4_offset as usize).saturating_add(2));
-    let l4_truncated = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+        && declared_end.is_some_and(|end| l4.saturating_add(2) <= end);
+    let l4_truncated_icmp = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
         && !non_first_fragment
         && !icmp_type_code_present;
+    let tcp_flags_present = meta.protocol == PROTO_TCP
+        && !non_first_fragment
+        && declared_end.is_some_and(|end| l4.saturating_add(TCP_FLAGS_DECLARED_MIN) <= end);
+    let l4_truncated_tcp =
+        meta.protocol == PROTO_TCP && !non_first_fragment && !tcp_flags_present;
     let (tcp_flags, icmp_type, icmp_code) = if non_first_fragment {
         (0, 0, 0)
     } else if icmp_type_code_present {
-        let l4 = meta.l4_offset as usize;
         (
             meta.tcp_flags,
             frame.get(l4).copied().unwrap_or(0),
             frame.get(l4.wrapping_add(1)).copied().unwrap_or(0),
         )
-    } else if l4_truncated {
+    } else if l4_truncated_tcp {
+        (0, 0, 0)
+    } else if l4_truncated_icmp {
         (0, 0, 0)
     } else {
         (meta.tcp_flags, 0, 0)
     };
-    // #5150: same IP-declared-end clamp as the input-filter builder above — the
-    // two builders MUST stay identical. Without it a CoS-action byte-match on
-    // this TX-selection path would read Ethernet slack (match-on-padding).
-    let l3 = meta.l3_offset as usize;
-    let declared_end = ip_declared_end(frame, l3, meta.addr_family);
     crate::filter::TermMatchExtra {
         tcp_flags,
         is_fragment,
         icmp_type,
         icmp_code,
-        l4_present: !non_first_fragment && !l4_truncated,
+        l4_present: !non_first_fragment && !l4_truncated_icmp && !l4_truncated_tcp,
         // #3077 / #5150: L3 header slice for flexible-match-range (see the
         // input-filter builder above), clamped to the IP-declared datagram end.
         // Same fail-closed-on-too-short/None bounds check applies.
-        flex_l3: declared_end.and_then(|end| frame.get(l3..end)),
+        flex_l3: l3_declared,
         // #3232 / #5150: L4 header slice for a layer-4 flexible-match-range (see
         // the input-filter builder above), clamped to the IP-declared datagram
         // end. None on a non-first fragment so a layer-4 flex term fails closed.
         flex_l4: if non_first_fragment {
             None
         } else {
-            declared_end.and_then(|end| frame.get(meta.l4_offset as usize..end))
+            declared_end.and_then(|end| frame.get(l4..end))
         },
     }
 }
