@@ -1557,6 +1557,8 @@ mod reap_flow_cache_tests {
             observed_bytes: 0,
             last_used_epoch: 0,
             neighbor_mac_epoch: 0,
+            // #5147: no dynamic-neighbor dependency in this test entry.
+            neighbor_shard: crate::afxdp::flow_cache::NEIGHBOR_SHARD_NONE,
         });
     }
 

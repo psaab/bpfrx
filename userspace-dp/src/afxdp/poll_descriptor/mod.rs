@@ -1033,31 +1033,35 @@ pub(super) fn poll_binding_process_descriptor(
                 let mut pre_routing_dnat_counter: Option<
                     std::sync::Arc<crate::nat::NatRuleCounter>,
                 > = None;
-                // #3918: snapshot the neighbor-MAC-change epoch BEFORE the
-                // neighbor MAC that backs this packet's forwarding decision is
-                // resolved. `resolve_flow_session_decision` (session-hit
-                // resolve) and the session-miss `finalize_new_flow_ha_
-                // resolution` below both consult `dynamic_neighbors`; the
-                // flow-cache entry built further down is stamped with THIS
-                // pre-resolve value (passed into `from_forward_decision`).
-                // Reading the epoch here — not after the resolve at stamp
-                // time — closes a TOCTOU that re-opened the #3048 stale-MAC
-                // blackhole: a kernel ARP/NDP update (a VRRP gateway failover
-                // changing the gateway MAC) landing between the resolve and the
-                // stamp would, on a post-resolve read, stamp the NEW epoch onto
-                // the cached OLD dst_mac — a fresh-looking stale entry that
-                // survives every fast-path hit until it ages out (blackhole).
-                // Reading first guarantees the stamped epoch <= the epoch
+                // #3918/#5147: snapshot EVERY shard's neighbor-MAC-change
+                // epoch BEFORE the neighbor MAC that backs this packet's
+                // forwarding decision is resolved. `resolve_flow_session_
+                // decision` (session-hit resolve) and the session-miss
+                // `finalize_new_flow_ha_resolution` below both consult
+                // `dynamic_neighbors`; the flow-cache entry built further down
+                // stamps the resolved shard's PRE-RESOLVE snapshot value
+                // (extracted just before `from_forward_decision`). The resolved
+                // shard is not known until after the resolve, so the whole
+                // vector is snapshotted first. Reading pre-resolve — not a
+                // fresh post-resolve shard read at stamp time — closes a TOCTOU
+                // that re-opened the #3048 stale-MAC blackhole: a kernel
+                // ARP/NDP update (a VRRP gateway failover changing the gateway
+                // MAC) landing between the resolve and the stamp would, on a
+                // post-resolve read, stamp the NEW shard epoch onto the cached
+                // OLD dst_mac — a fresh-looking stale entry that survives every
+                // fast-path hit until it ages out (blackhole). Snapshotting
+                // first guarantees the stamped shard epoch <= the shard epoch
                 // observed at resolve time, so a subsequent MAC-change bump
                 // makes the entry stale on its next hit -> evicted -> re-
-                // resolved to the new MAC. Mirrors the #2170/#3912 record-
-                // before-use discipline. A Relaxed load suffices: this
+                // resolved to the new MAC. Mirrors the #2170/#3912
+                // record-before-use discipline. Relaxed loads suffice: this
                 // snapshot and the stamp run on this one worker thread (program
                 // order sequences the snapshot before the resolve), and the
-                // neighbor shard Mutex — not this counter — synchronizes the
-                // MAC bytes; the epoch is a monotonic invalidation signal that
-                // only needs eventual cross-thread visibility.
-                let neighbor_mac_epoch_at_resolve = worker_ctx.dynamic_neighbors.mac_change_epoch();
+                // neighbor shard Mutex — not these counters — synchronizes the
+                // MAC bytes; the epochs are monotonic invalidation signals that
+                // only need eventual cross-thread visibility. NUM_SHARDS relaxed
+                // loads, on this cold cache-miss/resolve path only.
+                let neighbor_epoch_snapshot = worker_ctx.dynamic_neighbors.snapshot_shard_epochs();
                 let mut decision = if let Some(flow) = flow.as_ref() {
                     if let Some(resolved) = resolve_flow_session_decision(
                         sessions,
@@ -4356,6 +4360,39 @@ pub(super) fn poll_binding_process_descriptor(
                         // invalidation. "No install required" paths
                         // (DNS fast-path, fabric-return) keep the flag
                         // false and cache as before.
+                        //
+                        // #5147: extract the pre-resolve epoch of THIS flow's
+                        // resolved next-hop shard from the whole-vector
+                        // snapshot taken before the resolve. Computed here,
+                        // while `decision` is still owned (it is moved into
+                        // `from_forward_decision` below), from the neighbor's
+                        // ACTUAL key ifindex — the OUTER transport ifindex for a
+                        // tunnel egress, the `egress_ifindex` for a direct
+                        // resolution — via `outer_neighbor_ifindex`, the same
+                        // ifindex `insert_if_changed` bumps on. `from_forward_decision`
+                        // derives `neighbor_shard` with the IDENTICAL
+                        // `outer_neighbor_ifindex(.., None, ..)` call, so the
+                        // stamped epoch and the hit-path re-read agree on the
+                        // shard (both `None` for the neighbor handle: the outer
+                        // ifindex is route-derived, so `None` yields the same
+                        // ifindex as the live resolve and keeps the two sites
+                        // coupled). Keying on the logical `egress_ifindex` for
+                        // tunnels was the review MAJOR — it stamped a different
+                        // shard than the bump, so a tunnel flow never evicted on
+                        // its outer gateway's MAC change (#3048 blackhole). A
+                        // resolution with no next-hop stamps 0 (paired with a
+                        // `NEIGHBOR_SHARD_NONE` shard → never MAC-stale).
+                        let neighbor_mac_epoch_at_resolve = match decision.resolution.next_hop {
+                            Some(nh) => neighbor_epoch_snapshot.epoch_for(&(
+                                outer_neighbor_ifindex(
+                                    worker_ctx.forwarding,
+                                    None,
+                                    &decision.resolution,
+                                ),
+                                nh,
+                            )),
+                            None => 0,
+                        };
                         if !flow_cache_install_failed
                             && let Some(flow) = flow.as_ref()
                             && let Some(mut entry) = FlowCacheEntry::from_forward_decision(
@@ -4386,18 +4423,21 @@ pub(super) fn poll_binding_process_descriptor(
                                 worker_ctx.ha_state,
                                 apply_nat_on_fabric,
                                 &worker_ctx.rg_epochs,
-                                // #3048/#3918: stamp the neighbor-MAC-change
-                                // epoch SNAPSHOTTED BEFORE the resolve above
-                                // (`neighbor_mac_epoch_at_resolve`), not a
-                                // fresh post-resolve read. A later kernel
-                                // ARP/NDP MAC change for this descriptor's
-                                // next-hop advances the live epoch past this
+                                // #3048/#3918/#5147: stamp the PER-SHARD
+                                // neighbor-MAC-change epoch snapshotted BEFORE
+                                // the resolve above (the resolved shard's slot
+                                // of `neighbor_epoch_snapshot`), not a fresh
+                                // post-resolve read. A later kernel ARP/NDP MAC
+                                // change to THIS descriptor's next-hop neighbor
+                                // advances that shard's live epoch past this
                                 // stamp, evicting the cached stale dst_mac on
                                 // its next fast-path hit
-                                // (`neighbor_mac_epoch_stale`) — and a MAC
-                                // change racing the resolve is caught too,
-                                // because the pre-resolve snapshot cannot
-                                // already reflect it (closes the TOCTOU).
+                                // (`neighbor_mac_epoch_stale`) — while a change
+                                // to an unrelated neighbor (a different shard)
+                                // leaves this flow cached (#5147). A MAC change
+                                // racing the resolve is caught too, because the
+                                // pre-resolve snapshot cannot already reflect it
+                                // (closes the #3918 TOCTOU).
                                 neighbor_mac_epoch_at_resolve,
                             )
                         {
