@@ -609,17 +609,24 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 		// recoverable via a full authoritative bulk snapshot (#5450). Force the
 		// bulk even when already primed so the peer's reconcileStaleSessions
 		// deletes the sessions we already closed.
-		forced := s.forceResync.Load()
-		if coldStart || forced {
-			if forced && !coldStart {
+		// Consume the resync arm with CAS (symmetric with syncSweep) BEFORE the
+		// bulk, so a NEW overflow that arms forceResync DURING this bulk survives
+		// to trigger the next resync instead of being cleared by an unconditional
+		// Store(false) (#5450 MINOR 1). coldStart forces a bulk regardless of the
+		// arm; a consumed arm is re-armed on bulk failure so a later
+		// sweep/reconnect retries.
+		forcedConsumed := s.forceResync.CompareAndSwap(true, false)
+		if coldStart || forcedConsumed {
+			if forcedConsumed && !coldStart {
 				slog.Warn("cluster sync: forcing full bulk resync on reconnect after delete-journal overflow (standby may retain stale sessions)", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
 			} else {
 				slog.Info("cluster sync: starting bulk sync on cold start", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
 			}
 			if err := s.doBulkSync(); err != nil {
 				slog.Warn("cluster sync: bulk sync failed", "err", err, "fabric", fabricIdx)
-			} else {
-				s.forceResync.Store(false)
+				if forcedConsumed {
+					s.forceResync.Store(true)
+				}
 			}
 		} else {
 			slog.Info("cluster sync: skipping bulk sync on reconnect (already primed)", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
