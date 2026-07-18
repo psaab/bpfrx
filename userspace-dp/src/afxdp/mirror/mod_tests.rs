@@ -986,3 +986,222 @@ fn queue_full_drop_counter() {
         1
     );
 }
+
+// =====================================================================
+// #5167: cross-worker mirror clone must SAMPLE before it RESERVES the
+// contended live clone queue. `enqueue_sampled_mirror_clone`'s cross-worker
+// (else) branch previously called `admit_mirror_clone_to_live` (the shared
+// AcqRel CAS on the target's `pending_tx_admitted`) BEFORE `mirror_sample_allows`,
+// so every unsampled packet reserved/reported clone-queue pressure — acknowledged
+// cross-core true-sharing scaled O(PPS) instead of O(PPS/R). The fix runs the
+// sampler first, matching the same-worker branch.
+// =====================================================================
+
+/// Build a CROSS-worker mirror scenario: the ingress binding is on ifindex 11,
+/// the mirror target lives on ifindex 22 and is NOT present in `binding_lookup`,
+/// so `mirror_target_binding_index` returns `None` and
+/// `enqueue_sampled_mirror_clone` takes the cross-worker (to-live) else branch.
+fn cross_worker_mirror_setup(
+    rate: u32,
+) -> (
+    BindingWorker,
+    WorkerBindingLookup,
+    MirrorTargetMap,
+    ForwardingState,
+    Arc<BindingLiveState>,
+) {
+    let ingress = BindingWorker::new_for_mirror_test(0, 0, 11, 0);
+    let target_live = Arc::new(BindingLiveState::new());
+    let mut mirror_targets = MirrorTargetMap::default();
+    mirror_targets.insert(
+        &BindingIdentity {
+            slot: 9,
+            queue_id: 0,
+            worker_id: 1,
+            interface: Arc::<str>::from("mirror-out"),
+            ifindex: 22,
+        },
+        target_live.clone(),
+    );
+    let binding_lookup = WorkerBindingLookup::default(); // empty -> None -> else branch
+    let mut forwarding = ForwardingState::default();
+    forwarding
+        .mirror_configs
+        .insert(11, MirrorRuntimeConfig { output_ifindex: 22, rate });
+    (ingress, binding_lookup, mirror_targets, forwarding, target_live)
+}
+
+/// #5167 FAIL-ON-REVERT: a NON-sampled cross-worker packet must NOT reserve the
+/// (full) live clone queue. With sample-first it returns `None` having touched
+/// nothing shared; the pre-fill is untouched and the sampler advanced once.
+/// Reverting to reserve-before-sample makes the packet call
+/// `admit_mirror_clone_to_live` on the full queue and return
+/// `Some(QueueFullCrossWorker)` (a non-sampled packet reporting clone-queue
+/// pressure) -> RED.
+#[test]
+fn cross_worker_nonsampled_does_not_reserve_full_queue_5167() {
+    let (mut ingress, lookup, mirror_targets, forwarding, target_live) =
+        cross_worker_mirror_setup(2);
+    // Drive the cross-worker clone queue to its admission cap.
+    target_live.set_max_pending_tx(1);
+    assert!(
+        target_live
+            .try_enqueue_tx_owned(test_tx_request(0x33, 22))
+            .is_ok()
+    );
+    // rate=2 + counter=1 -> mirror_sample_allows == false (this packet is NOT
+    // selected).
+    ingress.mirror_sample_counter = 1;
+
+    let mut left: [BindingWorker; 0] = [];
+    let mut right: [BindingWorker; 0] = [];
+    let frame = vec![0x44; 80];
+    let result = enqueue_sampled_mirror_clone(
+        &mut left,
+        0,
+        &mut ingress,
+        &mut right,
+        &lookup,
+        &mirror_targets,
+        &forwarding,
+        11,
+        0,
+        0,
+        &frame,
+        test_meta(),
+        None,
+    );
+
+    assert_eq!(
+        result, None,
+        "a non-sampled cross-worker packet must NOT reserve or report clone-queue \
+         pressure (sample-first)",
+    );
+    // The sampler ran FIRST (advanced by one); admission was never attempted.
+    assert_eq!(
+        ingress.mirror_sample_counter, 2,
+        "the worker-local sampler must run before admission",
+    );
+    // Nothing was cloned: only the pre-fill remains on the target queue.
+    let mut queued = VecDeque::new();
+    target_live.take_pending_tx_into(&mut queued);
+    assert_eq!(
+        queued.len(),
+        1,
+        "the non-sampled packet reserved nothing — only the pre-fill remains",
+    );
+}
+
+/// #5167 control: a SELECTED (sampled) cross-worker packet on a full queue DOES
+/// report clone-queue pressure — the fix bounds pressure reporting to the sample
+/// rate, it does not suppress it for selected packets. Passes both before and
+/// after the reorder (guards against over-suppression).
+#[test]
+fn cross_worker_sampled_reports_queue_full_5167() {
+    let (mut ingress, lookup, mirror_targets, forwarding, target_live) =
+        cross_worker_mirror_setup(2);
+    target_live.set_max_pending_tx(1);
+    assert!(
+        target_live
+            .try_enqueue_tx_owned(test_tx_request(0x33, 22))
+            .is_ok()
+    );
+    // rate=2 + counter=0 -> selected.
+    ingress.mirror_sample_counter = 0;
+
+    let mut left: [BindingWorker; 0] = [];
+    let mut right: [BindingWorker; 0] = [];
+    let frame = vec![0x44; 80];
+    let result = enqueue_sampled_mirror_clone(
+        &mut left,
+        0,
+        &mut ingress,
+        &mut right,
+        &lookup,
+        &mirror_targets,
+        &forwarding,
+        11,
+        0,
+        0,
+        &frame,
+        test_meta(),
+        None,
+    );
+
+    assert_eq!(
+        result,
+        Some(MirrorCloneResult::QueueFullCrossWorker),
+        "a selected packet on a full queue must report cross-worker pressure",
+    );
+    assert_eq!(ingress.mirror_sample_counter, 1, "the selected packet consumed a sample");
+}
+
+/// #5167 positive: a SELECTED cross-worker packet on a non-full queue clones to
+/// the live target (the reorder does not break the happy path).
+#[test]
+fn cross_worker_sampled_enqueues_clone_5167() {
+    let (mut ingress, lookup, mirror_targets, forwarding, target_live) =
+        cross_worker_mirror_setup(2);
+    ingress.mirror_sample_counter = 0; // selected
+
+    let mut left: [BindingWorker; 0] = [];
+    let mut right: [BindingWorker; 0] = [];
+    let frame = vec![0x44; 80];
+    let result = enqueue_sampled_mirror_clone(
+        &mut left,
+        0,
+        &mut ingress,
+        &mut right,
+        &lookup,
+        &mirror_targets,
+        &forwarding,
+        11,
+        0,
+        0,
+        &frame,
+        test_meta(),
+        None,
+    );
+
+    assert_eq!(result, Some(MirrorCloneResult::Enqueued));
+    let mut queued = VecDeque::new();
+    target_live.take_pending_tx_into(&mut queued);
+    let req = queued.pop_front().expect("cross-worker mirror clone");
+    assert!(req.mirror_clone, "cloned request must carry mirror identity");
+    assert_eq!(req.bytes, frame);
+}
+
+/// #5167 sanity: a non-sampled cross-worker packet on a NON-full queue also
+/// clones nothing (returns None). This holds both before and after the reorder —
+/// it documents the sampling behavior but is NOT the fail-on-revert (the full-
+/// queue test above is, because only there does admit's outcome become visible).
+#[test]
+fn cross_worker_nonsampled_no_clone_nonfull_5167() {
+    let (mut ingress, lookup, mirror_targets, forwarding, target_live) =
+        cross_worker_mirror_setup(2);
+    ingress.mirror_sample_counter = 1; // NOT selected
+
+    let mut left: [BindingWorker; 0] = [];
+    let mut right: [BindingWorker; 0] = [];
+    let frame = vec![0x44; 80];
+    let result = enqueue_sampled_mirror_clone(
+        &mut left,
+        0,
+        &mut ingress,
+        &mut right,
+        &lookup,
+        &mirror_targets,
+        &forwarding,
+        11,
+        0,
+        0,
+        &frame,
+        test_meta(),
+        None,
+    );
+
+    assert_eq!(result, None);
+    let mut queued = VecDeque::new();
+    target_live.take_pending_tx_into(&mut queued);
+    assert!(queued.is_empty(), "a non-sampled packet must not clone");
+}

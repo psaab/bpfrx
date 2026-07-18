@@ -1086,6 +1086,38 @@ pub(super) fn neigh_monitor_thread(
         attempt += 1;
     }
     eprintln!("neigh_monitor: listening for kernel neighbor events");
+    neigh_monitor_steady_state(
+        fd,
+        &stop,
+        &dynamic_neighbors,
+        &neighbor_generation,
+        &counters,
+    );
+    unsafe { libc::close(fd) };
+    eprintln!("neigh_monitor: stopped");
+}
+
+/// #5165: the steady-state neighbor-monitor loop, split out of
+/// [`neigh_monitor_thread`] so it can be driven DETERMINISTICALLY over an
+/// AF_UNIX `SOCK_DGRAM` socketpair in tests — no privileged AF_NETLINK socket
+/// and no reliance on real kernel neighbor churn (the team-requested
+/// "factor for deterministic unit-testing" seam). The caller supplies the
+/// already-bound, already-dumped netlink `fd` (with the 500ms `SO_RCVTIMEO`
+/// set) and closes it after this returns.
+///
+/// Each `recv()` batch bumps the neighbor generation (`Release`, before any
+/// mutation) and applies every RTM_{NEW,DEL}NEIGH message to
+/// `dynamic_neighbors`. The #5165 addition is the post-recv `stop` re-check
+/// below: a stop signalled while blocked in recv() retires this thread, so it
+/// must NOT apply the just-received (old-generation) batch to a map that
+/// `stop_inner` is about to clear / a fresh baseline is about to repopulate.
+fn neigh_monitor_steady_state(
+    fd: i32,
+    stop: &AtomicBool,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    neighbor_generation: &AtomicU64,
+    counters: &super::neighbor_resolver::ResolverCounters,
+) {
     let mut buf = vec![0u8; 8192];
     // #1771 §2.5: throttle state for the ENOBUFS-triggered upsert re-dump.
     let mut last_redump_ns: u64 = 0;
@@ -1167,6 +1199,18 @@ pub(super) fn neigh_monitor_thread(
             // EOF on a netlink socket shouldn't happen; treat as a skip.
             continue;
         }
+        // #5165: re-check `stop` AFTER the blocking recv, BEFORE mutating the
+        // shared neighbor map. The top-of-loop check only gates ENTRY to
+        // recv(); a stop signalled while this thread was blocked in recv() (or
+        // arriving with the batch) RETIRES it. Applying this now-stale batch
+        // would let an old-generation consumer mutate a map that `stop_inner`
+        // is about to clear / a fresh baseline is about to repopulate — the
+        // exact no-mutation-after-stop violation #5165 fixes. Break so the
+        // batch is dropped; `stop_inner`'s JOIN is the outer guarantee that
+        // this thread is gone before the map is rebuilt.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         // #1769 epoch-guard ordering: bump the generation with `Release`
         // BEFORE mutating dynamic_neighbors. The socket is bound to
         // RTMGRP_NEIGH only, so every recv carries neighbor events; a
@@ -1229,8 +1273,6 @@ pub(super) fn neigh_monitor_thread(
             offset += (nlmsg_len + 3) & !3; // align to 4
         }
     }
-    unsafe { libc::close(fd) };
-    eprintln!("neigh_monitor: stopped");
 }
 
 /// Enumerate the allowed CPUs described by `is_set` into the caller-provided
@@ -2032,5 +2074,152 @@ mod warmer_tests {
         stop.store(true, Ordering::Relaxed);
         drop(tx);
         handle.join().expect("warmer join");
+    }
+}
+
+#[cfg(test)]
+mod monitor_lifecycle_tests_5165 {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    fn set_rcvtimeo(fd: i32, ms: i64) {
+        let tv = libc::timeval {
+            tv_sec: ms / 1000,
+            tv_usec: (ms % 1000) * 1000,
+        };
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const libc::timeval as *const libc::c_void,
+                core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+    }
+
+    fn write_newneigh(fd: i32, ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
+        let buf = build_newneigh_request(ifindex, ip, mac, NUD_REACHABLE);
+        let n = unsafe {
+            libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0)
+        };
+        assert_eq!(
+            n,
+            buf.len() as isize,
+            "socketpair send must deliver the whole RTM_NEWNEIGH datagram",
+        );
+    }
+
+    /// #5165 FAIL-ON-REVERT (post-recv re-check): the steady-state monitor loop
+    /// applies a kernel neighbor event received BEFORE stop, but MUST NOT apply
+    /// one received AFTER stop is signalled — a retired old-generation consumer
+    /// may not mutate a map that teardown is about to clear / a fresh baseline
+    /// is about to repopulate. Driven over an AF_UNIX SOCK_DGRAM socketpair so
+    /// the loop runs deterministically with no real AF_NETLINK socket.
+    ///
+    /// Sequencing makes the post-recv re-check the gate under test: event 1 is
+    /// applied and confirmed, then a 30ms settle guarantees the loop is BLOCKED
+    /// in recv() (past its top-of-loop stop check); only THEN is stop set and
+    /// event 2 injected to unblock recv(). Reverting the post-recv
+    /// `if stop { break }` makes the loop apply event 2 -> `key2` appears -> RED.
+    #[test]
+    fn steady_state_drops_batch_received_after_stop_5165() {
+        let mut fds = [0i32; 2];
+        let rc =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        let (write_fd, read_fd) = (fds[0], fds[1]);
+        set_rcvtimeo(read_fd, 500);
+
+        let map = Arc::new(ShardedNeighborMap::new());
+        let generation = Arc::new(AtomicU64::new(1));
+        let counters = Arc::new(super::super::neighbor_resolver::ResolverCounters::default());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let handle = {
+            let (m, g, c, s) = (map.clone(), generation.clone(), counters.clone(), stop.clone());
+            std::thread::spawn(move || neigh_monitor_steady_state(read_fd, &s, &m, &g, &c))
+        };
+
+        let if1 = 101;
+        let ip1 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        let key1 = (if1, ip1);
+        write_newneigh(write_fd, if1, ip1, [0x02, 0, 0, 0, 0, 1]);
+
+        let mut applied = false;
+        for _ in 0..400 {
+            if map.get(&key1).is_some() {
+                applied = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(applied, "steady-state loop must apply a pre-stop RTM_NEWNEIGH");
+
+        // The loop has processed event 1, looped back, and is now blocked in
+        // recv() on the empty socket. Signal stop while it is blocked so the
+        // post-recv re-check (not the top-of-loop check) governs event 2.
+        std::thread::sleep(Duration::from_millis(30));
+        stop.store(true, Ordering::Relaxed);
+
+        let if2 = 202;
+        let ip2 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
+        let key2 = (if2, ip2);
+        write_newneigh(write_fd, if2, ip2, [0x02, 0, 0, 0, 0, 2]);
+
+        // The loop's recv() returns event 2, the post-recv re-check observes
+        // stop, and it breaks WITHOUT applying it. join() returns once broken.
+        handle.join().expect("monitor steady-state join");
+
+        assert!(
+            map.get(&key2).is_none(),
+            "a batch received AFTER stop must NOT mutate the map (post-recv re-check)",
+        );
+        assert!(
+            map.get(&key1).is_some(),
+            "the pre-stop entry must remain",
+        );
+
+        unsafe {
+            libc::close(write_fd);
+        }
+    }
+
+    /// #5165: the steady-state loop honors stop and returns promptly so it can
+    /// be joined (bounded by the 500ms SO_RCVTIMEO). With no events pending it
+    /// exits within the timeout window once stop is set — the property that
+    /// makes `stop_inner`'s JOIN latency bounded.
+    #[test]
+    fn steady_state_exits_on_stop_when_idle_5165() {
+        let mut fds = [0i32; 2];
+        let rc =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        let (write_fd, read_fd) = (fds[0], fds[1]);
+        set_rcvtimeo(read_fd, 500);
+
+        let map = Arc::new(ShardedNeighborMap::new());
+        let generation = Arc::new(AtomicU64::new(1));
+        let counters = Arc::new(super::super::neighbor_resolver::ResolverCounters::default());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let handle = {
+            let (m, g, c, s) = (map.clone(), generation.clone(), counters.clone(), stop.clone());
+            std::thread::spawn(move || neigh_monitor_steady_state(read_fd, &s, &m, &g, &c))
+        };
+
+        // Idle (no events); set stop and confirm the loop exits within a couple
+        // of recv-timeout windows.
+        std::thread::sleep(Duration::from_millis(20));
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("idle monitor must exit on stop");
+
+        unsafe {
+            libc::close(write_fd);
+            libc::close(read_fd);
+        }
     }
 }

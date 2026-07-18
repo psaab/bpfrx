@@ -36,6 +36,102 @@
   RED-on-revert (helper→always-ordinal) → FAIL (`id = 3, want ...974634`); full
   pkg/cli suite GREEN. No smoke (observability id; unit-provable).
 
+## 2026-07-18 — #5167: mirror cross-worker clone samples before reserving
+
+- **Timestamp**: 2026-07-18 (fix/5167-mirror-sample-first)
+- **Action**: Reordered the cross-worker (else) branch of
+  `enqueue_sampled_mirror_clone` (`userspace-dp/src/afxdp/mirror/fast_path.rs`)
+  to run the worker-local sampler `mirror_sample_allows` BEFORE
+  `admit_mirror_clone_to_live`, matching the same-worker branch. The old
+  order reserved the contended live clone queue first — a true-shared AcqRel
+  CAS on the target's `pending_tx_admitted` (#4096) — then sampled, so every
+  unsampled packet reserved/copied/reported clone-queue pressure and
+  acknowledged cross-core true-sharing scaled O(PPS) instead of O(PPS/R);
+  sampling could not bound clone cost. A non-sampled packet now returns `None`
+  having touched nothing shared.
+- **Scope (corrected per rev6101)**: #6113 fixes the `enqueue_sampled_mirror_clone`
+  DISPATCH path only — the session-miss / neighbor-resolution-retry callers
+  (`neighbor_dispatch.rs`, `tx/dispatch/mod.rs`). Two other reserve-before-sample
+  sites exist:
+  - `enqueue_sampled_mirror_clone_to_live` (fast_path.rs) is DEAD CODE
+    (`#[cfg_attr(not(test), allow(dead_code))]`, test-only callers) — harmless,
+    not a live regression; NOT the sibling worth chasing.
+  - The REAL remaining LIVE instance is
+    `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs:386-398` — the
+    ESTABLISHED-FLOW HOT PATH (flow-cache HIT), which inlines
+    `admit_mirror_clone_to_live` (:386, the same #5167 shared CAS) BEFORE
+    `mirror_sample_allows` (:398). #6113 does NOT touch it. Sustained high-PPS
+    mirror is dominated by flow-cache HITS, so #5167's O(PPS/R) goal is NOT yet
+    met on the dominant path — #6113 fixed only the session-miss minority path.
+    Tracked as follow-up #6114.
+- **Tests**: 4 new in `mirror/mod_tests.rs` (the target function had ZERO
+  prior tests; the existing queue-full test is for `_to_live`, untouched):
+  - `cross_worker_nonsampled_does_not_reserve_full_queue_5167` (FAIL-ON-
+    REVERT): full clone queue + a NON-sampled packet → `None` (sample-first,
+    no reserve). Revert to reserve-before-sample → admit fails on the full
+    queue → `Some(QueueFullCrossWorker)` → RED.
+  - `cross_worker_sampled_reports_queue_full_5167` (also RED-on-revert via
+    the sample counter): a SELECTED packet on a full queue reports pressure
+    AND consumes a sample; reverted, admit fails before the sampler runs so
+    the counter never advances.
+  - `cross_worker_sampled_enqueues_clone_5167` (happy path) +
+    `cross_worker_nonsampled_no_clone_nonfull_5167` (sanity).
+  - GREEN: `cargo test mirror::` = 25 passed (4 new + 21 existing).
+    RED-on-revert proven: reverting the reorder → `test result: FAILED. 2
+    passed; 2 failed` (the two full-queue tests RED; the happy-path + sanity
+    stayed GREEN). Build clean.
+- **File(s)**: userspace-dp/src/afxdp/mirror/fast_path.rs,
+  userspace-dp/src/afxdp/mirror/mod_tests.rs, docs/userspace-dataplane-gaps.md
+
+## 2026-07-18 — #5165: neighbor-monitor JoinHandle (no mutation after teardown)
+
+- **Timestamp**: 2026-07-18 (fix/5165-neigh-monitor-join)
+- **Action**: Fixed a control-plane thread-lifetime race. The neighbor
+  MONITOR thread was spawned `spawn_supervised_aux(...).ok()`, DISCARDING
+  its JoinHandle; `stop_inner` signalled `monitor_stop` but could not JOIN
+  before a reconcile cleared/rebuilt the shared `Arc<ShardedNeighborMap>`,
+  so a retired old-generation netlink consumer could mutate the fresh
+  baseline. Asymmetric with the sibling resolver (`resolver_join`). Fix
+  mirrors the resolver exactly:
+  1. Added `monitor_join: Option<JoinHandle<()>>` to `NeighborManager` +
+     `stop_and_join_monitor()` (signal `monitor_stop`, then JOIN).
+  2. `bringup.rs`: retain the join handle via `match spawn_supervised_aux`
+     (was `.ok()`), installing `monitor_stop` + `monitor_join` together
+     ONLY on successful spawn (spawn-fail leaves both None → next reconcile
+     retries, unchanged).
+  3. `stop_inner` calls `stop_and_join_monitor()` (was a bare
+     `monitor_stop.take().store(true)`), so the monitor is provably gone
+     before the map is cleared. Join latency bounded by the monitor's
+     existing 500ms `SO_RCVTIMEO` (the wake — mirrors the resolver's 500ms
+     recv-timeout bound; no new fd-sharing protocol invented).
+  4. `neigh_monitor_thread`: extracted the steady-state loop into
+     `neigh_monitor_steady_state(fd, stop, map, gen, counters)` (a
+     deterministic test seam) and added a post-`recv()` `stop` re-check
+     BEFORE mutating — a stop signalled while blocked in recv retires the
+     thread, so the just-received old-generation batch is dropped.
+- **Tests (fail-on-revert, deterministic, no real netlink)**:
+  - `steady_state_drops_batch_received_after_stop_5165`
+    (neighbor.rs): drives the REAL steady-state loop over an AF_UNIX
+    SOCK_DGRAM socketpair, injecting hand-crafted RTM_NEWNEIGH via the
+    existing `build_newneigh_request`. Event 1 (pre-stop) is applied;
+    after the loop is confirmed blocked in recv, stop is set and event 2
+    injected — the post-recv re-check drops it. Revert (remove the
+    re-check) → event 2 applied → RED.
+  - `stop_and_join_monitor_waits_for_thread` (neighbor_manager.rs):
+    a stand-in thread does bounded work AFTER observing stop; the JOIN
+    makes `stop_and_join_monitor` block until `done==true`. Revert (drop
+    the handle without `join()`) → returns early, `done==false` → RED.
+  - Plus `steady_state_exits_on_stop_when_idle_5165` and
+    `stop_and_join_monitor_no_monitor_is_noop` (liveness / no-op).
+  - GREEN: 4 new pass; `neighbor` suite 167 passed, `coordinator::` 133
+    passed. RED-on-revert proven: neutralizing the re-check AND the join
+    turned exactly the two targeted tests RED (the liveness/no-op stayed
+    GREEN, correctly). Build clean.
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs,
+  userspace-dp/src/afxdp/coordinator/neighbor_manager.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/README.md
 ## 2026-07-18 — #6038: deflake TestWireUserspaceEventStreamCallbacks...WiresSessionAndFullResync (2s deadline races the wiring under load)
 
 - **Timestamp**: 2026-07-18 (fix/6038-eventstream-test-flake)
@@ -52742,3 +52838,32 @@ top.
   #6074 flow_cache.rs / poll_descriptor comments + site-(1) test).
 - **File(s)**: userspace-dp/src/afxdp/tests_txn_flow_cache.rs,
   userspace-dp/src/afxdp/tests_support.rs
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5172 — demote slow-path io_uring WriteMode to SyncFallback after a
+  TERMINAL runtime ring failure (mirror state_writer #2958). Previously WriteMode
+  was chosen once at init and the packet-loop Err arm only bumped counters +
+  set_last_error, so every packet kept retrying a broken ring (degrading
+  BGP/OSPF/mgmt/local slow-path traffic); #2477 only added a per-CALL sync
+  fallback without changing the mode. Introduced a structured SlowPathWriteOutcome
+  (packet-transfer certainty vs RING HEALTH), classify_io_uring_write
+  (terminal-vs-transient: an ambiguous/wedged `Transferred` failure is terminal —
+  a partial write cannot occur on an atomic TUN write, so it means the transport,
+  not the packet; a `safe_to_retry` `NothingWritten` failure is transient and the
+  per-call sync fallback rescues it, no demote), write_packet_with_mode, and
+  apply_slowpath_outcome (the runtime-demotion chokepoint). On a terminal failure
+  retire_ring_to_sync drains + drops the ring (fd close cancels outstanding SQEs;
+  the current packet's buffer outlives the drop, so #2297 holds), flips
+  WriteMode=SyncFallback + status mode="sync" ONCE (permanent, no flap; leaves
+  `active` set since it tracks TUN/worker liveness not io_uring). The ambiguous
+  current packet is DROPPED, never sync-resent (no double-transmit). Removed the
+  now-unused write_packet_io_uring_or_sync (folded into write_packet_with_mode);
+  decide_sync_fallback + its #2477 tests unchanged. Added 5 fail-on-revert tests:
+  classify_{terminal,transient,successful}, terminal_ring_failure_demotes_write_
+  mode_to_sync (RED-on-revert anchor), transient_outcome_does_not_demote_write_
+  mode. Documented the WriteMode demotion contract in
+  docs/xdp-io-uring-userspace-dataplane.md. Full suite 3981 passed / 0 failed;
+  fail-on-revert proven (removing `*mode=SyncFallback` -> demotion test RED while
+  the transient + #2477 tests stayed GREEN).
+- **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/slowpath_tests.rs,
+  docs/xdp-io-uring-userspace-dataplane.md

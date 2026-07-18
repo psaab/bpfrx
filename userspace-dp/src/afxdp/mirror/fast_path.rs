@@ -89,6 +89,19 @@ pub(in crate::afxdp) fn enqueue_sampled_mirror_clone(
             cos_queue_id,
         ));
     } else {
+        // #5167: run the worker-local sampler FIRST, mirroring the same-worker
+        // branch above. A non-sampled packet must NOT reserve the contended
+        // cross-worker clone queue: `admit_mirror_clone_to_live` performs the
+        // true-shared AcqRel CAS on the target's `pending_tx_admitted` (#4096).
+        // Reserving BEFORE sampling made acknowledged cross-core true-sharing
+        // scale with the FULL unsampled ingress rate O(PPS) instead of the
+        // sample rate O(PPS/R), so sampling could not bound clone cost. With
+        // sample-first, only a SELECTED packet reserves, copies, or reports
+        // clone-queue pressure; a non-sampled packet returns `None` having
+        // touched nothing shared.
+        if !mirror_sample_allows(config.rate, &mut ingress_binding.mirror_sample_counter) {
+            return None;
+        }
         let admission = match admit_mirror_clone_to_live(
             mirror_targets,
             mirror_tx_ifindex,
@@ -98,9 +111,6 @@ pub(in crate::afxdp) fn enqueue_sampled_mirror_clone(
             Ok(admission) => admission,
             Err(result) => return Some(result),
         };
-        if !mirror_sample_allows(config.rate, &mut ingress_binding.mirror_sample_counter) {
-            return None;
-        }
         return Some(enqueue_admitted_mirror_clone_to_live(
             admission,
             config,
