@@ -85,7 +85,8 @@ fn write_backlog_cap_halts_drain_and_counts_stall() {
 
     // Simulate a wedged consumer: the backlog is already at the cap because
     // prior socket writes returned WouldBlock.
-    let mut write_buf: Vec<u8> = vec![0u8; WRITE_BACKLOG_MAX_BYTES];
+    let mut write_buf = WriteBacklog::with_capacity(WRITE_BACKLOG_MAX_BYTES);
+    write_buf.extend_from_slice(&vec![0u8; WRITE_BACKLOG_MAX_BYTES]);
 
     let outcome = drain_channel_into_write_buf(&rx, &shared, &mut replay_buf, &mut write_buf, false, &mut None);
 
@@ -93,7 +94,7 @@ fn write_backlog_cap_halts_drain_and_counts_stall() {
     assert!(!outcome.disconnected);
     assert!(!outcome.drained_any, "no frame may move into a full backlog");
     assert_eq!(
-        write_buf.len(),
+        write_buf.pending_len(),
         WRITE_BACKLOG_MAX_BYTES,
         "backlog must not grow past the cap"
     );
@@ -121,7 +122,8 @@ fn write_backlog_stall_makes_channel_the_backpressure_surface() {
         shared: shared.clone(),
     };
     let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
-    let mut write_buf: Vec<u8> = vec![0u8; WRITE_BACKLOG_MAX_BYTES];
+    let mut write_buf = WriteBacklog::with_capacity(WRITE_BACKLOG_MAX_BYTES);
+    write_buf.extend_from_slice(&vec![0u8; WRITE_BACKLOG_MAX_BYTES]);
 
     // Fill the channel to capacity.
     for seq in 1..=capacity as u64 {
@@ -155,7 +157,8 @@ fn paused_drain_ignores_backlog_cap_and_never_stalls() {
     let (tx, rx) = mpsc::sync_channel::<EventFrame>(8);
     let shared = Arc::new(EventStreamShared::new());
     let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
-    let mut write_buf: Vec<u8> = vec![0u8; WRITE_BACKLOG_MAX_BYTES];
+    let mut write_buf = WriteBacklog::with_capacity(WRITE_BACKLOG_MAX_BYTES);
+    write_buf.extend_from_slice(&vec![0u8; WRITE_BACKLOG_MAX_BYTES]);
 
     for seq in 1..=3u64 {
         tx.send(EventFrame::encode_drain_complete(seq))
@@ -166,7 +169,7 @@ fn paused_drain_ignores_backlog_cap_and_never_stalls() {
     assert!(!outcome.stalled, "paused drain must not stall on the cap");
     assert!(outcome.drained_any);
     assert_eq!(
-        write_buf.len(),
+        write_buf.pending_len(),
         WRITE_BACKLOG_MAX_BYTES,
         "paused frames must not be added to the write backlog"
     );

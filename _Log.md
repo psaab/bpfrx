@@ -53520,6 +53520,36 @@ top.
   userspace-dp/src/server/tests.rs,
   userspace-dp/src/server/README.md,
   docs/userspace-dataplane-architecture.md
+- **Timestamp**: 2026-07-18
+- **Action**: #4974 — event-stream connected loop: replace the O(n^2)
+  prefix-drain write backlog with a cursor-backed `WriteBacklog`. The old
+  code stored pending socket bytes in a bare `Vec<u8>` and reclaimed each
+  successful short write with `write_buf.drain(..n)`, memmoving the entire
+  remaining suffix to offset 0 every write — O(backlog) per write, so
+  O(backlog^2) total copy work under a slow reader, on the single event
+  I/O thread. New `WriteBacklog` tracks a `start` cursor: `advance(n)`
+  moves it in O(1); the consumed prefix is reclaimed by GEOMETRIC
+  compaction (one copy of the pending suffix once `start >= len/2`), so
+  copy work is amortized O(1)/write and O(total_bytes) overall, and the
+  backing Vec stays within ~2x the pending length. The
+  `WRITE_BACKLOG_MAX_BYTES` cap + pause/backpressure now measure
+  `pending_len()` (unwritten = Vec.len()-start), not the raw Vec length,
+  so the cap does not trip early. Byte order + exactly-once preserved.
+  Added tests: `partial_write_backlog_is_amortized_linear_4974` (asserts
+  compaction copy work <= 3x total bytes; reverting advance to per-write
+  drain(..n) blows the bound RED), `partial_write_backlog_preserves_byte_
+  order_4974`, `pending_len_tracks_unwritten_bytes_not_raw_vec_4974`.
+  Updated the three existing cap tests + two replay_budget drain callers
+  to the WriteBacklog API. Rust suite green; new tests 3x no flake.
+  Parent-RED verified: reverting advance to drain(..n) makes the
+  amortized test RED, target-count 1. NOT HA (local event I/O-thread
+  algorithmics).
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests/write_backlog.rs,
+  userspace-dp/src/event_stream/tests/mod.rs,
+  userspace-dp/src/event_stream/tests/backpressure.rs,
+  userspace-dp/src/event_stream/tests/replay_budget.rs,
+  userspace-dp/src/event_stream/README.md
 
 - **Timestamp**: 2026-07-18
 - **Action**: #4952 — fail closed on POST-teardown worker-spawn failure.
