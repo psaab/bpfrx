@@ -198,7 +198,26 @@ queues. See PR #1243's kill record for why i40e doesn't reshape.
   `ok=false` + "`<site> reconcile failed: {err}`", refresh status, and return
   BEFORE `wait_for_binding_settle` / `persist_state=true`) instead of the old
   `let _ = reconcile_status_bindings(..)` discard that acked `ok=true` after a
-  failed (re)bind; `rebind::handle` took a `response` parameter for this. When
+  failed (re)bind; `rebind::handle` took a `response` parameter for this.
+  #4952: the reconcile `Err` now also carries `ReconcileError::WorkerSpawn`
+  — the one variant raised AFTER teardown (a `bring_up_workers`
+  `spawn_supervised_worker` / `pthread_create` EAGAIN/ENOMEM leaves a queue
+  set with no XSK-bound worker). The already-accepted-snapshot callers
+  (`set_binding_state` / `set_queue_state` / `rebind` / `set_forwarding_state`)
+  already fail closed on ANY `Err`, so they surface it unchanged. The
+  `apply_snapshot` full-apply and same-plan-`needs_reconcile` legs SPECIAL-CASE
+  it: unlike the pre-teardown integrity/map faults (where the prior workers
+  stayed live and restoring `existing_bindings` is truthful), the old workers
+  are GONE here — so they report `ok=false` + "`worker spawn failed after
+  teardown (...)`", refresh status to the REAL post-teardown per-binding state
+  (they do NOT restore `existing_bindings`), roll the in-memory baseline back
+  to the prior good snapshot + status generation, and return BEFORE
+  `persist_state=true` (the broken snapshot must never become the boot
+  baseline). Pre-#4952 `bring_up_workers` returned `()` and swallowed the
+  spawn error (overwriting `last_reconcile_stage` with `spawned:..`), so the
+  handler acked `ok=true` and persisted a dataplane-down snapshot — a silent
+  forwarding outage with no retry (regression-tested by
+  `post_teardown_spawn_failure_fails_closed_no_persist_4952`). When
   `should_run_afxdp` does NOT hold (forwarding disarmed / unsupported) it
   `stop()`s every worker and then routes the per-binding status through
   `refresh_bindings` — which sends each now-workerless slot through
