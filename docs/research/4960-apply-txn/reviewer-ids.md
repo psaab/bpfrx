@@ -2,15 +2,20 @@
 
 | Reviewer | Round | Agent / Task ID | Verdict |
 |---|---|---|---|
-| Codex | r1 | codex task-mrqtahuk-1jlmfe (agent a4c0174a46eb16a9f) | pending (running) |
-| AGY | r1 attempt 1 | aca9b3dd1e809c6ef | MISFIRE (chased unrelated --print-timeout; no review) |
-| AGY | r1 attempt 2 | a2b7608078386fcb0 | INFRA-BLOCK (headless auto-denied `command` perm) |
-| AGY | r1 attempt 3 | a90... (read-only retry) | pending |
-| Claude SMR | r1 | (self) | PLAN-NEEDS-MAJOR |
+| Codex | r1 | codex task-mrqtahuk-1jlmfe | **PLAN-NEEDS-MAJOR** (deep 21m review) |
+| AGY | r1 attempt 1 | aca9b3dd1e809c6ef | MISFIRE (chased unrelated --print-timeout) |
+| AGY | r1 attempt 2 | a2b7608078386fcb0 | INFRA-BLOCK (headless auto-denied `command`) |
+| AGY | r1 attempt 3 | a9bee33e2985cc98e | MISFIRE (cached --print-timeout prompt again) |
+| Claude SMR | r1 | (self) claude-smr-plan-r1.md | **PLAN-NEEDS-MAJOR** |
 
-## Notes
-- AGY attempts 1+2 failed (misfire + headless permission wall). Per
-  feedback_codex_infra_must_retry (symmetric): documented retries. If attempt 3
-  also fails, proceed 2-of-3 (Codex + Claude SMR) — the stronger pair
-  (memory: Codex ~90% real signal, AGY ~98% false). AGY alone never sufficient;
-  it is not being relied on alone here.
+## Convergence r1
+2-of-3 (Codex + Claude SMR) = PLAN-NEEDS-MAJOR. AGY infra-blocked across 3
+documented retries (persistent cached-prompt corruption + headless perm wall);
+proceeding 2-of-3 per feedback_codex_infra_must_retry (AGY never relied on alone;
+Codex+SMR is the higher-signal pair). v2 is a major fence-first redesign
+addressing every r1 finding (see plan.md §12).
+
+## Round 2 (pending)
+| Codex | r2 | (pending) | pending |
+| AGY | r2 | (pending, will attempt) | pending |
+| Claude SMR | r2 | (pending) | pending |

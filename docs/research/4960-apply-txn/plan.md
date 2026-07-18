@@ -1,538 +1,496 @@
-# Plan: Fail-closed transactional config-apply for the userspace dataplane (#4960 + #4959)
+# Plan: Fence-first fail-closed config-apply for the userspace dataplane (#4960 + #4959)
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+**Status:** DRAFT v2 — MAJOR REDESIGN after r1. r1 verdicts: Codex = PLAN-NEEDS-MAJOR,
+Claude SMR = PLAN-NEEDS-MAJOR, AGY = infra-blocked (3 documented retries). v2
+abandons the v1 rollback/journal model for a **fence-first / staged-commit** model
+per both reviewers. See §12 revision log for the point-by-point r1 response.
 
-Research branch: `research/4960-apply-txn`. This is a `/research` deliverable —
-it STOPS at PLAN-READY. No production code changes here; implementation happens
-later under `/engineer 4960`.
+Research branch: `research/4960-apply-txn`. This is a `/research` deliverable — it
+STOPS at PLAN-READY. No production code changes here; implementation happens later
+under `/engineer 4960`.
 
 ---
 
 ## 1. Issue framing
 
 Two open High-severity issues are two facets of the same structural gap: **the
-userspace config-apply path mutates host state and BPF classifier maps BEFORE
-the helper snapshot is published, and on a late failure leaves that partial
-mutation live with `userspace_ctrl.enabled=1` and no rollback.**
+userspace config-apply path mutates host state and BPF classifier maps while
+`userspace_ctrl.enabled=1`, publishes the helper snapshot LAST, and on a late
+failure leaves partial/candidate mutation live with ctrl still enabled and
+nothing fenced.**
 
 ### #4960 — destructive host netlink mutation before later compile phases fail
 
-`pkg/dataplane/userspace/manager_compile.go:185` `Manager.Compile` calls
-`m.bpfShim.CompileUserspaceShim(cfg)` (`pkg/dataplane/loader.go:173`), which runs
-`CompileConfig` (`pkg/dataplane/compiler.go:216`). Phase 2 `compileZones`
-(`compiler_iface.go:249`) performs **destructive host netlink mutation**:
+`Manager.Compile` (`manager_compile.go:185`) → `CompileUserspaceShim`
+(`loader.go:173`) → `CompileConfig` (`compiler.go:216`). Phase 2 `compileZones`
+(`compiler_iface.go:249`) performs destructive host netlink mutation while the
+old dataplane is live and ctrl is enabled:
 
-- `ensureVLANSubInterface` (`compiler_iface.go:105`) — `LinkAdd` + `LinkSetUp` +
-  writes `/proc/sys/.../accept_ra`.
-- `reconcileInterfaceAddresses` (`compiler_iface.go:187`) — `AddrDel` (stale) +
-  `AddrAdd` (missing) on physical and VLAN sub-interfaces.
-- `LinkSetMTU`, `applyEthtool`, `ensureRxVlanOff`, ring-buffer tuning,
-  `LinkSetUp`/`LinkSetDown` (admin state).
+- `ensureVLANSubInterface` (`compiler_iface.go:105`) — `LinkAdd` + **`LinkSetUp`
+  (brings the new child UP before the shim is attached to it)** + `accept_ra` write.
+- `reconcileInterfaceAddresses` (`:187`) — `AddrDel` (stale) + `AddrAdd` (missing).
+- `LinkSetMTU`, `applyEthtool`/speed-duplex, `ensureRxVlanOff`, txqueuelen/rings/
+  RPS/RFS/XPS/RSS tuning (`compiler.go:1387-1653`), `LinkSetUp`/`LinkSetDown`.
 - Unmanaged-interface strip (`compiler_iface.go:1150-1166`): `AddrDel` + `LinkSetDown`.
-- `LinkDel` of stale bond devices (`compiler_iface.go:1135`).
+- `LinkDel` of stale bond devices (`:1135`); `BumpFIBGeneration` (`compiler.go:298`).
 
-These run in Phase 2, **before** Phases 3-11 (address book, applications,
-policies, NAT, static NAT, NAT64, NPTv6, screen, default policy, flow timeouts,
-firewall filters, flow config, port mirroring — `compiler.go:222-296`). Any
-later phase returns on the first error with **no undo**. `CompileUserspaceShim`
-then returns the error before `attachUserspaceShimXDP` (`loader.go:197`), so the
-old XDP shim/Rust snapshot stays published while partial host state (created
-VLANs, reconciled addresses, brought-down interfaces, deleted bonds) is live.
-The `BumpFIBGeneration` error path is not the concern (it is discarded and only
-runs on `isRecompile`, `compiler.go:302`), but the destructive-before-fallible
-ordering is.
-
-**Failure trace:** a config that passed `configstore` compile (`pkg/config`) but
-fails a runtime dataplane phase after `compileZones` — e.g. a screen-profile
-name a zone references that is missing (`compiler_iface.go:301`,
-`buildScreenConfig` path), a NAT counter-key error, or a filter-expansion
-rejection — leaves VLANs created and addresses reconciled while `Compile`
-returns an error, the store has already committed the new config
-(`daemon_apply.go:369` promotes before `applyConfigLocked`), and the Rust helper
-keeps enforcing the previous snapshot. Result: host topology moved to the new
-config, forwarding state pinned to the old — traffic cut on the mutated
-interfaces.
+These run before Phases 3-11 (`compiler.go:222-296`). A later-phase error returns
+with no undo; `CompileUserspaceShim` returns before `attachUserspaceShimXDP`
+(`loader.go:197`); the store already committed the new config
+(`daemon_apply.go:369`); the Rust helper keeps enforcing the previous snapshot.
+Result: host topology moved to the new config, forwarding pinned to the old,
+transit cut on the mutated interfaces — while ctrl stays enabled.
 
 ### #4959 — address-only commit mutates classifier maps in place, then fails open
 
-`pkg/dataplane/userspace/maps_sync.go:1596` `snapshotBindingPlanKey` hashes
-worker/ring/interface-binding + fabric fields but **omits local and
-interface-NAT addresses**. So an address-only commit produces the same plan key
-→ `samePlanRefresh` is true (`manager_compile.go:235-238`) → the apply takes the
-in-place branch (`manager_compile.go:300-303`) calling
-`syncUserspaceClassifierMapsFailClosedLocked` (`maps_sync.go:266`).
+`snapshotBindingPlanKey` (`maps_sync.go:1596`) omits local/interface-NAT addresses,
+so an address-only commit hits `samePlanRefresh` (`manager_compile.go:235`) →
+`syncUserspaceClassifierMapsFailClosedLocked` (`maps_sync.go:266`) mutates the
+ingress/local/interface-NAT BPF maps **in place** (populate-before-clear across
+THREE maps, not an atomic swap) and installs nftables RST-suppression rules
+(`maps_sync.go:1188-1213` → `pkg/nftables/rst_suppress.go`). ctrl stays enabled
+throughout the helper round trip (up to a 67s deadline, `process_control.go:42-56`).
+It disables ctrl only if a map op itself errors. Control then falls through to
+`apply_snapshot` (`manager_compile.go:332`).
 
-That function mutates the ingress/local/interface-NAT BPF maps **in place**
-(`syncUserspaceClassifierMapsLocked` → `syncIngressIfaceMapLocked` /
-`syncLocalAddressMapsLocked` / `syncInterfaceNATAddressMapsLocked`,
-`maps_sync.go:247-254`) using populate-before-clear. It only disables ctrl **if a
-map op itself errors** (`failClosedUserspaceCtrlLocked`, `maps_sync.go:230`).
-Control then falls through to `apply_snapshot` (`manager_compile.go:332`).
-
-**On helper rejection** (`apply_snapshot` returns an error at
-`manager_compile.go:333`): the maps are already on the NEW plan, `ctrl.enabled`
-is still 1, and `publishedSnapshot` / `lastSnapshot` / `lastSnapshotHash` are
-**not advanced** (they are only set at `manager_compile.go:336,343,349`, after a
-successful publish). No restore runs. The enabled XDP shim reads these maps to
-decide kernel-pass vs XSK-redirect and local/interface-NAT ownership while Rust
-still enforces the previous-good snapshot → wrong kernel delivery / wrong XSK
-steering / wrong NAT ownership — a **security-availability mismatch**, the
-opposite of the intended "retain previous-good."
+On helper rejection: maps are on the NEW plan, ctrl is still 1, nft rules on the
+NEW set, and `publishedSnapshot`/`lastSnapshot`/`lastSnapshotHash` are not advanced.
+No restore. The enabled shim classifies kernel-pass vs XSK-redirect and local/NAT
+ownership on the NEW maps while Rust enforces the OLD snapshot →
+security-availability mismatch.
 
 ### The unified root cause
 
-Map mutation, host mutation, and helper-snapshot publication are **not one
-fail-closed transaction**. On helper rejection or a late compile-phase error,
-partial mutation is left live with ctrl enabled and nothing is rolled back or
-fenced.
+Map mutation, host mutation, attachment changes, nft state, and helper-snapshot
+publication are **not one fail-closed transaction**, and **ctrl stays enabled**
+throughout — so on any unproven outcome the dataplane is left in a mixed
+generation instead of fenced.
 
 ---
 
 ## 2. Honest scope / value framing
 
-This is a **correctness + security-availability** fix, not a performance change.
-The win is measured in blast-radius reduction, not cycles or MB:
+Correctness + security-availability, not performance. The win is blast-radius
+reduction: one class of failed commit (config clears configstore but trips a
+runtime dataplane phase, OR the helper rejects a snapshot) today produces a live
+host/forwarding mismatch on a production firewall, and on HA the committed config
+also syncs to the peer (`daemon_apply.go:428`) → both nodes can diverge.
 
-- Today, one class of failed commit (config passes configstore but fails a
-  runtime dataplane phase, OR the helper rejects an address-only snapshot)
-  produces a **live host/forwarding mismatch** on a production firewall:
-  interfaces moved to the new config while the enforced policy/NAT/steering is
-  the old one. On an HA cluster the committed config also syncs to the peer
-  (`applyAndSyncCommitted`, `daemon_apply.go:428`) unless the apply error is a
-  required-protocol-gate error, so both nodes can diverge.
-- Frequency: low (requires a config that clears the parser/compiler but trips a
-  runtime phase, or a helper protocol/integrity rejection), but the impact when
-  it fires is a partial traffic outage that persists until the next successful
-  commit — exactly the fail-open class the #1960 / #2138 / #5680 fail-closed
-  doctrine exists to prevent.
+**The central design tension v1 got wrong (r1):** true atomicity at the
+packet-observable boundary is *impossible* here — you cannot make immediate
+netlink writes invisible to packets, and you cannot atomically swap three BPF
+classifier maps across a multi-ms/multi-s helper round trip while ctrl is enabled.
+So the honest model is not "mutate then roll back" but **"fence, then mutate under
+the fence, then unfence only after a verified-coherent commit."** The cost is a
+brief transit-fenced window on a mutating apply; the benefit is that no failure
+mode leaves a mismatch — every unproven outcome stays fenced (fail-closed).
 
-*If reviewers conclude the transactionality win is too small to justify the
-churn — or that a simpler fail-closed floor (Path C) is the correct ceiling for
-this issue and full rollback (Path A/B) is over-engineering — PLAN-KILL (or
-downscope to Path C) is an acceptable verdict.*
+*If reviewers conclude the fenced-window cost is unacceptable and there is no
+tractable hitless-and-safe design (there is not, per r1), PLAN-KILL — or a
+narrower "fence-on-reject only, accept the transient success-window inconsistency"
+scope — is an acceptable outcome. This plan argues the fence model is both
+tractable and the correct fail-closed contract.*
 
 ---
 
 ## 3. What's already shipped / partially batched (must compose with)
 
-- **#5680 hybrid-ACK fail-closed guard** (`manager_overlay.go:140-235`,
-  `routeOnlyPublishHybrid`): the route-only overlay publish already REFUSES to
-  advance the applied identity when `cfg` carries an unpublished policy delta.
-  This is the canonical "do not ACK a hybrid; retain previous-good; reconverge on
-  next full apply" precedent. Our transaction must extend the same discipline to
-  the full-apply and samePlanRefresh paths.
-- **#2138 / #1960 required-protocol-gate abort** (`manager_compile.go:20-69`,
-  `requiredProtocolGateSentinels`, `IsRequiredProtocolGateError`,
-  `daemon_apply.go:439-455` `applyErrSkipsPeerSync`): a helper-too-old rejection
-  DISARMS the helper (fail-closed) and the daemon suppresses the peer sync. This
-  is the existing model for "surface a failed commit rather than report success
-  against a disarmed dataplane." A helper *content* rejection (integrity
-  preflight) is a sibling class our transaction must also fail closed on.
-- **#4952 post-teardown fail-closed** (merged `64c3c9acc`, Rust side —
-  `userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs`,
-  `server/handlers/snapshot.rs`): the helper now fails closed when a worker spawn
-  fails AFTER the old workers were torn down during a reconcile. This is the
-  in-helper analogue of what we need on the Go side: a reconcile that can't
-  complete must not leave the dataplane half-migrated and forwarding.
-- **#3789 pre-teardown fail-close** (Rust snapshot apply): the helper validates a
-  snapshot BEFORE tearing down the previous good state; an invalid snapshot is
-  rejected with the previous state intact. **This is exactly the `apply_snapshot`
-  rejection our Go path mishandles** — the helper correctly kept previous-good,
-  but Go had already advanced the maps and left ctrl enabled.
+- **#5680 hybrid-ACK guard** (`manager_overlay.go:140-235`): a **refuse-BEFORE-publish
+  + do-not-advance-identity** precedent. r1 correction: it does NOT disable ctrl —
+  it is an identity-retention guard, **not** a ctrl-fence precedent. Do not conflate
+  the two.
+- **#2138 / #1960 required-protocol-gate abort** (`manager_compile.go:20-69`;
+  `daemon_apply.go:439-455`): a helper-too-old rejection DISARMS the helper
+  (`ForwardingArmed=false`) and `applyErrSkipsPeerSync` suppresses the peer sync.
+  Distinct from a ctrl fence (a fence writes `userspace_ctrl.enabled=0`, not the
+  helper Armed flag) — see §4.5.
+- **#4952 post-teardown fail-closed** (merged `64c3c9acc`, Rust): the helper
+  reports the dataplane DOWN when a worker spawn fails after teardown
+  (`server/handlers/snapshot.rs:183-223`). Critically (r1 7.1): **an
+  `apply_snapshot` NACK does not prove the old dataplane is still live** — it can
+  be a post-teardown "down" outcome. The Go publish-outcome model must distinguish
+  pre-teardown-reject (old live) from post-teardown-down.
+- **#3789 pre-teardown fail-close** (Rust snapshot monotonicity gate,
+  `server/handlers/snapshot.rs:83-105`): rejects a snapshot with an older/equal
+  generation. r1 3.1 consequence: a helper-first ordering that fails on host and
+  wants to "republish the old snapshot" is REJECTED by this gate — you cannot
+  compensate with an old-generation snapshot.
 - **#3924 non-authoritative-enumeration guard** (`maps_sync.go:998-1013`): the
-  local-address sync already SKIPS the destructive prune when the netlink dump is
-  incomplete (adds are safe, prunes against a partial set are not). Our map
-  rollback must preserve this — a rollback re-sync against the old snapshot must
-  not itself prune against a partial enumeration.
+  local-address sync skips the destructive prune when the netlink dump is
+  incomplete and returns nil. r1 5.1: this makes an "old-snapshot re-sync = exact
+  rollback" claim false — a partial dump leaves candidate keys and still returns
+  success.
+- **populate-before-clear** map discipline (`maps_sync.go:955-971`, etc.): NOT an
+  atomic 3-map swap (r1 1.1).
 - **#2514 snapshot-build fail-closed** (`manager_compile.go:199-202`): a
-  config-shaped input that fails `buildSnapshot*` already returns an error and
-  `m.lastSnapshot` is NOT advanced. But this runs AFTER
-  `CompileUserspaceShim` (host mutation) at line 185 — so the host is already
-  mutated when the snapshot build fails. Reordering matters here.
-- **populate-before-clear** is already the map-write discipline
-  (`syncIngressIfaceMapLocked:955-971`, `syncLocalAddressMapsLocked`,
-  `compileZones` `DeleteStaleIfaceZone`/`DeleteStaleVlanIface:1169-1170`): new
-  entries written first, stale pruned after. This is what makes a **content-driven
-  re-sync against the old snapshot a valid map rollback**.
+  config-shaped snapshot-build error already retains the previous snapshot — but
+  it runs AFTER host mutation today.
 
----
+## 4. Concrete design — fence-first staged commit
 
-## 4. Concrete design
+### 4.1 The invariant (corrected r1)
 
-### 4.1 The transaction invariant (both facets)
+> Every mutating apply runs **inside a ctrl fence**. The fence
+> (`userspace_ctrl.enabled=0`: shim passes only proven local/control to the
+> kernel, drops transit) is established BEFORE the first packet-observable
+> mutation and lifted (`enabled=1`) ONLY after a verified-coherent commit
+> (host + attachments + all classifier maps + nft + published Rust snapshot all
+> proven consistent). On ANY unproven, ambiguous, or failed outcome the fence is
+> RETAINED — the node forwards nothing it cannot prove the enforced snapshot
+> matches. No path leaves classifier maps, host topology, or attachments on a
+> generation the applied Rust snapshot does not match with ctrl enabled.
 
-> An apply is atomic at the observable boundary: nothing the dataplane enforces
-> or steers on (host interface topology + addresses, BPF classifier maps, the
-> published Rust snapshot) advances unless **all three** succeed. On any failure,
-> the apply fails closed — it either restores the previous-good state or leaves
-> the dataplane fenced (`ctrl.enabled=0`, transit dropped, only proven
-> local/control to kernel) — and never leaves classifier maps or host topology on
-> a newer generation than the applied Rust snapshot with ctrl enabled.
+This replaces v1's "atomic transaction with rollback." It is achievable because
+the fence, not rollback, is what closes the mismatch window.
 
-The two issues live in different layers (host netlink in `pkg/dataplane`
-`compileZones`; classifier maps + helper publish in `pkg/dataplane/userspace`
-`manager_compile`), so the plan proposes **one shared invariant enforced by two
-coordinated mechanisms**, sequenced by a single apply orchestrator in
-`Manager.Compile`.
+### 4.2 The apply state machine (single ordered pipeline)
 
-### 4.2 Facet B (#4959) — transactional classifier-map + helper publish
-
-Root-cause clarification the reviewers must weigh: **`samePlanRefresh` (in-place
-map update, no helper restart) is the DESIRED path for an address-only change.**
-Expanding `snapshotBindingPlanKey` to include local/interface-NAT addresses
-would force address-only commits onto the `!samePlanRefresh` → `programBootstrapMaps`
-→ helper-restart path, which drops all transit for the restart window. That is a
-regression, not a fix. **The defect is not the path selection; it is that the
-in-place path fails OPEN on `apply_snapshot` rejection.** So the fix
-transactionalizes the in-place path; it does not avoid it.
-
-Design (`manager_compile.go:300-334`, `maps_sync.go`):
-
-1. **Capture a rollback anchor before the in-place map mutation.** On the
-   `samePlanRefresh` branch, the previous-good classifier state is exactly
-   `m.lastSnapshot` (still the old snapshot at this point) plus the map-tracking
-   fields (`m.lastIngressIfaces`). Snapshot these before calling
-   `syncUserspaceClassifierMapsLocked(snap)`.
-
-2. **Publish-gated map commit.** Reorder so the observable map state is not
-   "ahead" of the helper on rejection. Two sub-options (reviewer choice):
-   - **B1 (rollback):** keep the current maps-first order, but wrap the
-     `samePlanRefresh` leg + `apply_snapshot` in a transaction: if
-     `apply_snapshot` is rejected, re-run `syncUserspaceClassifierMapsLocked`
-     against the OLD snapshot (`rollbackSnap`) to restore the maps
-     (populate-before-clear makes this a valid content-driven restore), reset
-     `m.lastIngressIfaces` to the old set, and leave ctrl at its prior value.
-     The old Rust snapshot and old maps are then coherent again — true
-     previous-good retention. If the restore itself fails, escalate to B2.
-   - **B2 (fence):** on `apply_snapshot` rejection in the `samePlanRefresh` leg,
-     call `failClosedUserspaceCtrlLocked` (disable `ctrl.enabled`) so the shim
-     stops XSK-redirecting and only passes proven local/control to the kernel.
-     Simpler, but drops transit until the next successful apply — a heavier
-     fail-closed floor.
-   Recommended: **B1 with B2 as the escalation fallback** (matches the existing
-   two-tier `failClosedUserspaceCtrlLocked` → `blindFailClosedUserspaceCtrlLocked`
-   structure at `maps_sync.go:266-335`).
-
-3. **Do not advance `publishedSnapshot`/`lastSnapshot`/`lastSnapshotHash`/
-   `publishedPlanKey`/`markAppliedSnapshotLocked` on the reject path** (already
-   true — they are only set after the successful publish). The new work is
-   the map restore/fence, not the identity guard (which #5680 already models).
-
-4. **`snapshotBindingPlanKey` stays as-is for path selection** but gains a
-   documented contract comment that its omission of local/interface-NAT is
-   INTENTIONAL (address-only changes must stay on the no-restart in-place path)
-   and that the in-place path's transactionality (this fix) is what makes the
-   omission safe. This closes the "is the key wrong?" reviewer question
-   explicitly.
-
-Signatures (illustrative):
-
-```go
-// transactional wrapper around the samePlanRefresh in-place map update.
-// rollbackSnap is m.lastSnapshot captured BEFORE the mutation.
-func (m *Manager) applyClassifierMapsTxLocked(newSnap, rollbackSnap *ConfigSnapshot,
-    publish func() error) error {
-    prevIngress := append([]uint32(nil), m.lastIngressIfaces...)
-    if err := m.syncUserspaceClassifierMapsFailClosedLocked(newSnap); err != nil {
-        return err // map op failed -> already ctrl-disabled by failClosed path
-    }
-    if err := publish(); err != nil {
-        // helper rejected the snapshot: restore maps to previous-good.
-        if rbErr := m.rollbackClassifierMapsLocked(rollbackSnap, prevIngress); rbErr != nil {
-            // restore failed -> escalate to fence (disable ctrl).
-            return errors.Join(err, m.fenceCtrlLocked(newSnap, rbErr))
-        }
-        return err // maps restored, ctrl unchanged, snapshot identity not advanced
-    }
-    return nil
-}
-```
-
-### 4.3 Facet A (#4960) — host netlink actuation ordering + bounded rollback
-
-The cleanest structural fix is **validate-before-first-destructive-op**: move the
-destructive host netlink actuation so it only begins after all fallible
-side-effect-free work has succeeded. The natural cut points:
-
-1. **Pre-validate in a pure planning pass.** Before any `LinkAdd`/`AddrDel`,
-   walk the config and verify: every VLAN parent resolves (`LinkByName`), every
-   configured address parses, every referenced screen profile exists, every
-   zone/interface ref resolves. Most of the "config passed configstore but trips a
-   runtime phase" failures (e.g. the missing-screen-profile error at
-   `compiler_iface.go:301`) can be surfaced here, side-effect-free, so
-   `compileZones` never starts mutating on a config that a later phase will
-   reject.
-
-2. **Order host actuation after the pure compile phases.** The fallible Phases
-   3-11 (address book, apps, policy, NAT, filters, flow) and the wire-snapshot
-   build (`buildSnapshotWithSchedulerState…`, `manager_compile.go:199`) are
-   **pure with respect to host netlink** (they write BPF maps and build structs,
-   no `AddrDel`/`LinkAdd`). Reorder `Manager.Compile` so the host-mutating portion
-   of `compileZones` runs LAST — after Phases 3-11 and the snapshot build have all
-   succeeded. This requires splitting `compileZones` into:
-   - `planZones` (pure): resolve ifindexes, build the desired host-op set +
-     the zone/vlan BPF-map plan + `result.pendingXDP/pendingTC/ManagedInterfaces`.
-     No netlink writes.
-   - `actuateZoneHostState` (impure): execute the VLAN creates, address
-     reconciles, MTU/admin/ethtool, unmanaged strip — run once everything
-     fallible has passed.
-
-   Data-dependency note: `ensureVLANSubInterface` yields a sub-ifindex that feeds
-   the `vlan_iface` map and zone map. The split must plan the VLAN op, then in the
-   actuate step create it and write the dependent map entries together — i.e.
-   the BPF map writes that depend on a created ifindex move into the actuate step
-   alongside the netlink op that produces the ifindex. (Alternatively, resolve
-   already-existing sub-interfaces in the plan pass and only defer the *create*.)
-
-3. **Bounded rollback journal for the reversible host ops.** For the actuate
-   step, record an undo entry before each reversible destructive op:
-   - address reconcile: capture prior address list per interface → undo = restore.
-   - MTU change: capture prior MTU → undo = restore.
-   - admin up/down: capture prior `OperState`/flags → undo = restore.
-   - VLAN create: undo = `LinkDel` (only for VLANs THIS apply created, not
-     pre-existing ones).
-   Irreversible ops (stale-bond `LinkDel`, NIC-resetting ethtool ring changes)
-   are moved as LATE as possible in the actuate order and are documented as
-   non-rolled-back residual; if a failure occurs after them, the fence path
-   (ctrl-disable) is the floor. In practice, once the pure phases + snapshot build
-   pass (step 1+2), the actuate step has a very small failure surface (transient
-   netlink EBUSY), so the rollback journal handles the realistic cases and the
-   fence covers the rest.
-
-4. **`BumpFIBGeneration` error** (`compiler.go:302`) is folded into the
-   transaction result rather than discarded — a failed FIB bump means sessions
-   may keep stale FIB entries, so it should at minimum be logged at WARN and
-   surfaced in the apply result (reviewer question OQ-5).
-
-### 4.4 How the two mechanisms compose in `Manager.Compile`
-
-The apply orchestrator becomes (sketch):
+Phases, with the commit point explicit:
 
 ```
-Compile(cfg):
-  # PURE PLANNING (no host mutation, no helper publish)
-  result = planUserspaceShim(cfg)        # planZones + Phases 3-11 pure compile
-  snap   = buildSnapshot(cfg, result)    # #2514 already fails closed here
-  # -> if either fails: return err, ZERO host mutation, old snapshot live
-
-  lock:
-    rollbackSnap = m.lastSnapshot
-    # HOST ACTUATION (facet A) — journalled
-    host = actuateZoneHostState(result)  # VLANs/addrs/MTU/admin/unmanaged
-    if host.err:
-       host.rollback(); return err       # reversible ops undone; fence residual
-    attachUserspaceShimXDP(result)
-
-    # MAP + HELPER PUBLISH (facet B) — transactional
-    if samePlanRefresh:
-       applyClassifierMapsTxLocked(snap, rollbackSnap, publish)  # B1/B2
-    else:
-       programBootstrapMaps + ensureProcess + publish            # restart path
-    # -> on publish reject: maps restored (B1) or fenced (B2);
-    #    identity not advanced; host already actuated -> see OQ-3
+  P0  config-only validation (PURE — no host/map/helper mutation)
+        resolve every ref (zones, interfaces, screen profiles, addresses parse),
+        run Phases 3-11 that are host-netlink-pure (address-book/apps/policy/NAT/
+        filters/flow — verified host-pure, §4.4), reject config-shaped errors here.
+        On error: return, ZERO observable mutation.
+  ----- FENCE (write userspace_ctrl.enabled=0) if this apply will mutate host,
+        bindings, or (optionally) classifier maps — see §4.6 hitless scoping -----
+  P1  host + attachment actuation (STAGED)
+        new links created DOWN or attached to the ctrl-disabled shim BEFORE going
+        up; obsolete XDP/TC hooks RETAINED (not detached) until commit; run the
+        existing zone host pass (VLAN/addr/MTU/admin/ethtool/unmanaged/bond).
+        Attachments (XDP/TC add) staged; DETACH of obsolete hooks deferred to P6.
+  P2  build the FINAL snapshot from POST-actuation LIVE state
+        buildInterfaceSnapshots reads live child ifindex/MTU/MAC/addrs; connected
+        routes derive from live addresses (routes.go). This build is fallible
+        (RuleList, etc.) — an error here keeps the fence.
+  P3  program candidate classifier maps + nft RST-suppression
+  P4  publish: apply_snapshot with TYPED OUTCOME (§4.3)
+  P5  verify: reconcile helper status/generation; prove the published snapshot
+        generation == the programmed maps + actuated host; prove workers live.
+  ----- COMMIT POINT: only past here may ctrl be re-enabled -----
+  P6  commit-gated removal of obsolete XDP/TC hooks; advance published/last
+        snapshot identity + hash; post-commit fallible work (HA/status/desired-
+        forwarding sync) is POST-COMMIT — its errors do NOT re-fence/rollback
+        (they carry their own retry/debt owners).
+  P7  UNFENCE (userspace_ctrl.enabled=1) — verified-coherent only.
 ```
 
-The **ordering decision** (host-actuate before or after helper publish) is the
-central open question — see §11 OQ-3. Host-first means a helper reject leaves
-host actuated but forwarding fenced/rolled-back; helper-first means a host
-failure leaves the helper on the new snapshot but host on the old. The plan
-recommends **host-first with host rollback + map/helper transaction**, because
-host topology is the more expensive thing to churn and the pure-planning pass
-already de-risks the host actuation.
+On any failure at P1-P5: **stay fenced**, do not advance identity, do not remove
+obsolete hooks, return a typed apply error to the daemon (§4.5).
 
----
+### 4.3 Typed publication outcomes (r1 7.1)
 
-## 5. Public API preservation
+`requestLocked`/`apply_snapshot` today flattens dial/write/read/decode/timeout/
+`OK:false` into one `error` and discards the response on `OK:false`
+(`process_control.go:103-143`; Rust attaches status even on failure,
+`server/handlers/mod.rs:257-264`). The publish must return a typed outcome:
 
-- `Manager.Compile(cfg) (*dataplane.CompileResult, error)` — unchanged signature.
-- `Manager.ApplyConfig`, `LegacyDataPlaneAdapter.{ApplyConfig,Compile}` — unchanged.
-- `Manager.CompileUserspaceShim(cfg) (*CompileResult, error)` — unchanged
-  signature; internally split into plan/actuate but the exported entry point and
-  its error semantics (returns error, leaves old shim attached on failure) are
-  preserved.
-- `snapshotBindingPlanKey` — unchanged behavior (documented, not modified).
-- The daemon commit surface (`commitAndApply`, `applyAndSyncCommitted`,
-  `applyErrSkipsPeerSync`, `compileErrorMustAbortApply`) — unchanged. A rolled-
-  back/fenced apply still returns a non-nil error; `applyErrSkipsPeerSync`
-  behavior for the new fenced class must be decided (OQ-4: should a fenced apply
-  suppress the peer sync like a required-protocol-gate error does?).
+1. **Accepted** — helper ACK, new snapshot live.
+2. **Pre-teardown reject (old live)** — helper NACK with status proving the
+   previous snapshot is still enforced (Rust monotonicity/integrity reject before
+   teardown). → stay fenced; old dataplane is coherent; safe to unfence back to
+   old ONLY if maps/host also reconcile to old (usually simplest to stay fenced
+   and let the operator re-commit, or re-run to old).
+3. **Post-teardown down (#4952)** — NACK/DOWN: workers gone, dataplane not
+   forwarding. → stay fenced; recovery needs a full re-apply.
+4. **Ambiguous / ACK-lost** — write succeeded, response lost/timed out after the
+   helper may have applied live (`process_control.go:47-50`). → stay fenced;
+   reconcile generation on the next status pass before any unfence.
+5. **Accepted-with-post-commit-error** — ACK, but P6 tail work failed. →
+   post-commit; do NOT re-fence; the tail work's existing debt/retry owner handles
+   it.
+
+The publish path must parse and preserve the Rust status on NACK (stop discarding
+it) so outcomes 2 vs 3 are distinguishable.
+
+### 4.4 Host-netlink purity of the middle phases (verified r1 N1)
+
+Destructive host mutation is concentrated in exactly two phases — Phase 2
+`compileZones` (first) and Phase 11 `compilePortMirroring` (last, `compiler.go:1704`,
+netlink at `:1758/:1811`). The fallible MIDDLE phases (`compileAddressBook`,
+`compileApplications`, `compilePolicies`, `compileNAT`/StaticNAT/NAT64/NPTv6,
+`compileFirewallFilters`, `compileScreenProfiles`, `compileFlowConfig`) are
+host-netlink-pure (grep: 0 netlink/`os.WriteFile` refs in `compiler_nat.go`,
+`compiler_filter.go`; the refs in `compiler.go` are all in the tuning helpers used
+by `compileZones`/port-mirroring). This is what makes the P0 config-validation
+pass tractable: run the pure phases + all cross-reference checks BEFORE the fence
+so most "config passed configstore but trips a runtime phase" failures never reach
+P1. **But P0 is not sufficient alone** (r1 1.2/7.7): the FINAL snapshot build (P2)
+and the P1 netlink/attach/map/socket ops remain fallible after P0 — hence the
+fence, not pure-validation, is the protection.
+
+### 4.5 Daemon dispositions — the daemon CANNOT stay unchanged (r1 4.2/7.4)
+
+r1 falsified v1's "daemon surface unchanged." Two INDEPENDENT dispositions are
+needed, and the current `compileErrorMustAbortApply`/`applyErrSkipsPeerSync`
+coupling cannot express them:
+
+- **Local tail disposition**: may the daemon continue the new-config tail
+  (RETH MAC/VIP, route-leak, session-clear, `daemon_apply.go:1220-1469`)? A fenced
+  or unknown-outcome apply must STOP the tail; a verified restored-and-armed
+  outcome may continue.
+- **Peer-sync disposition**: push the committed config to the standby? A
+  **verified restored-and-armed** outcome pushes (#4034, avoid divergence); a
+  **fenced/down/unknown** outcome suppresses (#2138, don't propagate a
+  deterministic outage). These are orthogonal, so `applyErrSkipsPeerSync` must
+  key on the typed outcome, not the error class.
+
+Also (r1 7.4): **`Manager.Compile` is NOT the sole host orchestrator.** The daemon
+reconciles VRF/xfrmi/bond/tunnel/fabric-IPVLAN BEFORE `d.dp.ApplyConfig`
+(`daemon_apply.go:916-959`) and RETH MAC/VIP AFTER. The fence must be a
+DAEMON-level concept spanning the whole apply, or those daemon-owned host mutations
+sit outside it. Simplest: the daemon establishes the fence before its host
+reconcile and lifts it after the Manager reports a verified commit.
+
+And (r1 7.6): **a ctrl fence is invisible to `takeoverReadyLocked`**
+(`manager_ha.go:401-447`) — it inspects helper status/mode/liveness/session-mirror/
+event-stream but NOT the ctrl map. A fenced node can be reported HA-ready. The
+fence must either flip a readiness-visible flag or `takeoverReadyLocked` must
+consult `ctrlWasEnabled`/the ctrl map.
+
+### 4.6 Hitless scoping — do we fence EVERY apply? (the key tradeoff)
+
+Today an address-only commit is hitless (samePlanRefresh in-place). Fencing every
+apply regresses that to a brief outage. Options (reviewer decision, §11 OQ-A):
+
+- **(i) Fence-always**: every mutating apply fences. Simplest, uniformly safe,
+  regresses hitless address-only commits to a ~fence-window outage.
+- **(ii) Fence-on-mutation-class**: fence only when host/binding actuation is
+  required (already disruptive, so ~free); for a pure classifier-map-only change,
+  keep the in-place path hitless on SUCCESS and **fence only on a non-Accepted
+  publish outcome** (§4.3 outcomes 2-4). This preserves hitless address-only
+  commits and still guarantees fail-closed on reject. The residual is a transient
+  new-maps/old-helper window on the SUCCESS path during the round trip — bounded,
+  self-healing on ACK, and no worse than today's steady state for a few ms.
+- Recommended: **(ii)**. It keeps the hitless benefit that `samePlanRefresh`
+  exists to provide while closing the persistent mismatch (#4959) via fence-on-
+  non-accept. It also covers the async `pendingXSKStartup` leg (§4.7).
+
+### 4.7 The three affected publish/mutate sites (r1 7.2, audited)
+
+- `manager_compile.go:301` (samePlanRefresh) — in-place maps then publish →
+  **fence-on-non-accept** (§4.6 ii).
+- `manager_compile.go:264` (pendingXSKStartup) — syncs candidate maps, advances
+  `m.lastSnapshot`, DEFERS publish (returns success at `:298`). The status loop
+  later calls `applyHelperStatusLocked` (which may re-enable ctrl from the new
+  `lastSnapshot`) THEN `syncSnapshotLocked`, whose `apply_snapshot` error has NO
+  fence (`process_status.go:143-165`; `maps_sync.go:779-797`). This is a genuine
+  second #4959. Fix needs **persistent transaction/debt state shared with
+  `syncSnapshotLocked`** so the deferred publish stays fenced until Accepted.
+- `programBootstrapMapsLocked:194` (!samePlanRefresh) — already fail-closed
+  (ctrl pre-disabled + bindings cleared before publish, r1 F1) — leave as-is
+  except add outcome-typed recovery.
+
+The overlay (`manager_overlay.go`) and worker-arm (`manager_worker_arm_5134.go`)
+sites do NOT pre-mutate classifier maps and are already safe — **must not be
+touched.**
+
+### 4.8 What v2 explicitly drops from v1
+
+- The **bounded host rollback journal** and **B1 map re-reconcile** — both unsound
+  (r1 1.1/1.2/5.1/5.2/7.1). A journal cannot make netlink writes invisible; the
+  re-sync synthesizes an `old-config ∪ current-kernel` state and can leave nft on
+  the candidate set. Replaced by fence + stage.
+- The **`planZones`/`actuateZoneHostState` "build snapshot before actuation"**
+  split (r1 6.1): the snapshot MUST be built from POST-actuation live state
+  (buildInterfaceSnapshots reads live child ifindex/MTU/MAC/addrs; the binding plan
+  key includes the live ifindex). P0 stays a pure *validation* pass that builds NO
+  wire snapshot; the wire snapshot is built at P2 after actuation.
+
+## 5. Public API preservation (corrected r1 7.7)
+
+- `Manager.Compile`, `Manager.ApplyConfig`, `LegacyDataPlaneAdapter.*`,
+  `CompileUserspaceShim` — signatures preserved.
+- **NOT preserved / must change** (r1 was wrong to claim otherwise): the daemon
+  apply-error classification (`applyErrSkipsPeerSync`/`compileErrorMustAbortApply`)
+  gains the typed-outcome dimensions (§4.5); `takeoverReadyLocked` gains a
+  fence check (§4.5); the publish path gains typed outcomes (§4.3); `m.mu`/apply
+  serialization scope changes if host actuation moves under the lock (§6).
+- Tolerated behavior: `compileZones` currently WARN-skips missing interfaces /
+  malformed addresses (`compiler_iface.go:197-203,342-357`). P0 validation
+  changing these to hard-fail is a **compatibility decision** that must be made
+  explicitly (r1 6.3) — recommend: keep warn-skip for non-critical, hard-fail only
+  the refs that would otherwise trip a later phase.
 
 ## 6. Hidden invariants the change must preserve
 
-- **applySem serialization**: all of this runs under `d.applySem` +
-  `m.mu` (`manager_compile.go:213`). The rollback/fence must run inside the same
-  lock hold so no concurrent apply observes the mid-transaction state.
-- **populate-before-clear**: preserved — it is what makes the map rollback a
-  valid content-driven restore. Rollback re-syncs against the old snapshot, never
-  raw-deletes.
-- **#3924 non-authoritative enumeration**: the map rollback re-sync must inherit
-  the `enumComplete` skip-prune guard, or a rollback during a partial netlink dump
-  could prune live VRRP VIP/local keys.
-- **Side-effect ordering** (`compiler_iface.go` comments): tx_ports before XDP
-  attach; ring/ethtool tuning BEFORE XDP attach (ethtool -G resets the NIC);
-  `KeepConfiguration=static` on RETH; DHCP/RETH/fabric interfaces SKIP address
-  reconcile. The plan/actuate split must preserve every one of these orderings
-  within the actuate step.
-- **#1922 protected-interface set** (`compiler_iface.go:1077`): the management
-  lifeline must never be brought down or address-stripped — the rollback must not
-  re-introduce a strip on a protected interface.
-- **#1956 device-map leave-alone**: unmapped NICs stay invisible — the plan pass
-  must not enumerate them into the host-op set.
-- **HA sync portability**: the `ConfigSnapshot` wire shape is unchanged (no new
-  wire fields required for either facet — the rollback anchor is in-memory Go
-  state, not on the wire).
-- **ctrl two-tier fail-closed** (`failClosedUserspaceCtrlLocked` →
-  `blindFailClosedUserspaceCtrlLocked`): the new fence path reuses this, it does
-  not introduce a third disable path.
-- **`m.ctrlWasEnabled` / `m.ctrlDisabledAt` bookkeeping**: the fence path must
-  keep these consistent (they gate the #—ctrl-disabled-duration diagnostics).
+- **Locking (r1 7.7):** host compile + `syncInterfaceAttachments` currently run
+  BEFORE `m.mu` (`manager_compile.go:185-213`); direct `userspace.Manager.ApplyConfig`
+  has NO `applySem` (`manager.go:318`). Moving actuation under the fence + lock is a
+  NEW design needing explicit lock/liveness analysis — not a preserved invariant.
+- **Side-effect ordering** within P1 (tx_ports before XDP attach; ring/ethtool
+  before attach — NIC reset; `KeepConfiguration=static` on RETH; DHCP/RETH/fabric
+  SKIP addr reconcile; #1922 protected set never stripped; #1956 device-map
+  leave-alone). The staged actuation must preserve all of these.
+- **#3924 enumComplete** on any local-address sync.
+- **HA state**: `m.clusterHA`/`m.haGroups` set from the candidate before publish
+  (`manager_compile.go:226-227`) — must be part of the fenced transaction's
+  "unproven until commit" set, and the status loop branches on `m.clusterHA`
+  (`process_status.go:180-217`).
+- **nft RST-suppression** (`maps_sync.go:1188-1213`): part of the resource set;
+  its install failure is currently warning-only and must become a fence trigger
+  (or be proven coherent before unfence).
+- **Rust monotonicity gate** (`snapshot.rs:83-105`): no old-generation
+  compensating publish.
+- **ConfigSnapshot wire shape** unchanged (no new wire fields; typed outcomes are
+  derived from the existing status response).
 
 ## 7. Risk assessment
 
 | Risk class | Level | Notes |
 |---|---|---|
-| Behavioral regression | **MED** | `compileZones` is the largest, most invariant-dense function in the tree; the plan/actuate split risks reordering a side-effect. Mitigation: pure-motion split with a golden test asserting the actuate order is byte-identical to today's sequence when no error occurs. |
-| Lifetime / aliasing | **LOW** (Go) | No borrow-checker; the rollback anchor is a captured slice/pointer copy under lock. Risk is aliasing `m.lastSnapshot` — must deep-copy the tracking fields, not the snapshot pointer. |
-| Performance regression | **LOW** | Apply path is control-plane, not per-packet. The pure-planning pass adds one extra config walk per commit (µs-scale). No hot-path change. Reviewer check: the plan pass must not double the netlink `LinkByName`/`AddrList` syscalls — reuse `result.cached*` lookups. |
-| Architectural mismatch | **MED** | The #961/#946 dead-end pattern: a half-built transaction abstraction that later has to be ripped out. Mitigation: Path C (fence-only floor) is a strict subset that ships value even if Path A/B rollback is deferred; the shared invariant (§4.1) is the durable contract, not the specific rollback mechanism. |
+| Behavioral regression | **HIGH** | Touches the largest function in the tree AND the daemon apply pipeline AND the publish/status loop AND HA readiness. Mitigation: land incrementally — (a) fence + typed outcomes for the map path (#4959) first with the async-leg debt; (b) fence-before-host-mutation for #4960 second; each behind tests. |
+| Hitless regression | **MED** | Fence-on-mutation (§4.6 ii) preserves hitless address-only commits; fence-always (i) regresses them. Reviewer decision OQ-A. |
+| Lock / liveness | **MED** | Extending the fence + `m.mu` over host actuation and coordinating with the daemon-level fence needs explicit deadlock analysis (status loop also takes `m.mu`). |
+| Performance | **LOW** | Control-plane only; the fence window is a brief transit outage on a mutating apply, not a per-packet cost. |
+| Architectural mismatch | **MED→LOW** | The fence model is the reviewer-endorsed shape (Codex OQ-7); it composes with #2138/#4952/#3789 rather than fighting them. The v1 journal (the #961 dead-end risk) is dropped. |
 
-## 8. Multiple path options
+## 8. Recommendation
 
-### Path A — split pure-planning from actuation + validate-before-first-destructive-op + rollback journal
-- **Facet A**: `planZones`/`actuateZoneHostState` split; pure phases + snapshot
-  build run before any host mutation; journalled undo for reversible ops; fence
-  for irreversible residual.
-- **Facet B**: B1 transactional map rollback + B2 fence escalation.
-- **Pros**: closest to true atomicity; most failures are pre-actuation; retains
-  previous-good on both facets.
-- **Cons**: largest refactor (touches the biggest function in the tree); some
-  ops irreversible; highest review cost.
+**Ship the fence-first staged-commit model, in two lands:**
 
-### Path B — two-phase prepare/commit with a journalled undo (keep compileZones shape)
-- Keep `compileZones` interleaved, but record an undo entry before each
-  destructive op and replay in reverse on any later error (including helper
-  publish). One `appliedGeneration` advances only after host + maps + helper all
-  succeed.
-- **Pros**: smaller structural change than A; explicit undo log.
-- **Cons**: undo for every op-type is error-prone; undo-of-undo can fail; the
-  failing op's own partial state; doesn't shrink the failure window (host still
-  mutates before the fallible phases). Weaker than A on the "validate first"
-  axis.
+1. **#4959 (map path) — land 1:** fence-on-non-accept for the `samePlanRefresh`
+   in-place site (§4.6 ii), typed publish outcomes (§4.3), and shared
+   transaction/debt state so the async `pendingXSKStartup` deferred publish
+   (§4.7) also stays fenced until Accepted. Include nft RST-suppression in the
+   proven-coherent set. Leave the already-safe overlay/worker-arm/bootstrap sites
+   untouched.
+2. **#4960 (host path) — land 2:** P0 pure-validation pass → fence-before-host-
+   mutation → staged P1 actuation (new links down/shim-first, obsolete hooks
+   retained) → P2 post-actuation snapshot build → publish → verify → P6 commit-
+   gated hook removal → P7 unfence. Daemon-level fence spanning the daemon's own
+   host reconcile (§4.5); daemon typed dispositions; HA-readiness fence check.
 
-### Path C — keep-ctrl-disabled-on-any-apply-failure fail-closed floor (minimal)
-- **Facet B**: on `apply_snapshot` rejection in the `samePlanRefresh` leg,
-  disable ctrl (fence). No map restore.
-- **Facet A**: reorder so the destructive host actuation runs after the pure
-  phases + snapshot build (validate-first), and on any host-actuation failure,
-  fence ctrl. No rollback journal.
-- **Pros**: much smaller; low hot-path cost; directly converts the
-  fail-OPEN mismatch into fail-CLOSED (transit dropped, not mis-steered);
-  matches the existing #2138/#5680 fence doctrine.
-- **Cons**: a fenced apply drops transit until the next successful commit
-  (heavier operator impact than a clean rollback); a mid-host-actuation failure
-  still leaves partial host topology (but forwarding fenced, so no
-  mis-steer — the security-availability mismatch is closed, availability is
-  degraded-safe not mismatched).
+**No host rollback journal** (dropped, r1). The fence is the fail-closed contract:
+a partial host topology under a fenced dataplane forwards no transit, so it cannot
+mis-steer — degraded-safe availability, never a security mismatch. The only
+PLAN-KILL-able scope question is OQ-A (fence-always vs fence-on-mutation) and
+whether the fenced-window outage is acceptable at all.
 
-### Recommendation
-**Ship Path C's validate-first reorder + fence as the floor, plus Path A's Facet-B
-B1 map rollback** (the map rollback is cheap and content-driven — high value, low
-risk), and **defer Path A's full host rollback journal to a follow-up** unless
-reviewers judge the fence-only host floor insufficient. Rationale: the
-security-availability mismatch (#4959's core) is fully closed by B1+fence; the
-host-topology churn (#4960's core) is fully de-risked by validate-first (most
-failures never start host mutation) with fence as the safety net. Full host
-rollback (journal) is the remaining increment and can be a scoped follow-up
-because, post-reorder, the host-actuation failure surface is small. Reviewers
-should explicitly rule on whether the host rollback journal is in-scope-required
-or defer-acceptable (OQ-1).
+## 9. Test plan (r1 item 5 — the controlling distinctions)
 
-## 9. Test plan
-
-- `go build ./...` clean; `go vet ./pkg/dataplane/... ./pkg/daemon/...`.
-- **Go unit tests (new):**
-  - `manager_compile` tx test: `samePlanRefresh` + injected `apply_snapshot`
-    reject → assert maps restored to old snapshot (B1) OR ctrl disabled (B2);
-    assert `publishedSnapshot`/`lastSnapshot`/`lastSnapshotHash` unchanged;
-    assert `m.lastIngressIfaces` restored. Use the existing
-    `lookupUserspaceCtrlForFailClosedHook` + `addrListForLocalSyncHook` seams and
-    a fake control socket.
-  - `compileZones` plan/actuate test: injected late-phase error (e.g.
-    missing screen profile) → assert ZERO host netlink mutation occurred (mock
-    netlink); injected mid-actuate error → assert reversible ops rolled back +
-    ctrl fenced.
-  - Regression: address-only commit still takes the in-place no-restart path
-    (assert `programBootstrapMaps`/`ensureProcess` NOT called) — guards against an
-    accidental "expand the plan key" fix.
-  - #3924 interaction: rollback re-sync during a partial `AddrList` dump does NOT
-    prune live local keys.
-- **Existing suites that must stay green:** `pkg/dataplane` (`compiler_test.go`,
-  `compiler_rxvlan_failclosed_5268_test.go`, `compiler_nat_counter_*`),
-  `pkg/dataplane/userspace` (`maps_sync_*_test.go`, manager tests),
-  `pkg/daemon` apply tests. Named-test 5× flake check on the new tests.
-- **Rust cargo suite** (`make test-rust`): unaffected (no helper wire change) —
-  run to confirm no regression.
-- **Smoke (loss userspace cluster, at `/engineer` time, not `/research`):** v4 +
-  v6, push + reverse, CoS-off + CoS-on; a commit-fail-injection scenario
-  (commit a config that trips a runtime phase) to confirm the DUT retains
-  forwarding on the previous-good config and does NOT half-migrate. Per
-  `feedback_verify_forwarding_with_sustained_iperf` — sustained iperf3 through the
-  real DUT, not curl/200.
-- **Failover** (`make test-failover`): the map/host paths touch
-  cluster-relevant state (RETH VIPs, fabric ifaces) so a failover smoke is
-  required before merge per CLAUDE.md.
+- `go build ./...`; `go vet ./pkg/dataplane/... ./pkg/daemon/...`.
+- **New Go tests (each a distinct outcome the current suite does not cover):**
+  1. samePlanRefresh + publish **Accepted** → maps advanced, ctrl re-enabled, hitless.
+  2. samePlanRefresh + publish **pre-teardown reject** → fenced, identity not
+     advanced, maps NOT declared "rolled back" (fence, not restore).
+  3. samePlanRefresh + **ACK-lost/ambiguous** → fenced, generation reconciled on
+     next status pass before any unfence (r1 7.1).
+  4. samePlanRefresh + **post-teardown down (#4952)** → fenced, recovery = full
+     re-apply.
+  5. **pendingXSKStartup deferred reject** → fenced via shared debt; ctrl not
+     re-enabled by the interleaved `applyHelperStatusLocked` (r1 7.2).
+  6. #4960: late compile phase (missing screen profile) fails in P0 → ZERO host
+     mutation (needs an injected actuator seam / netns, r1 7.7).
+  7. #4960: P1 host-actuation failure → fenced, obsolete hooks retained, new links
+     not left up (r1 1.2/7.3).
+  8. #4960: `attachUserspaceShimXDP`/generic-attach failure after host actuation →
+     fenced (r1 7.3).
+  9. #4960: new-VLAN live materialization — snapshot built at P2 carries the
+     RESOLVED child ifindex/MTU (proves P2-after-actuation, r1 6.1).
+  10. #3924 incomplete enumeration during the fenced apply does not prune live
+      VIP/local keys.
+  11. nft RST-suppression install failure → fence (not warning-only, r1 5.2).
+  12. daemon: fenced outcome suppresses peer sync + stops tail; restored-and-armed
+      outcome pushes + continues (r1 4.2).
+  13. HA: `takeoverReadyLocked` reports NOT-ready for a ctrl-fenced node (r1 7.6).
+- Tests need an **injected actuator/netlink seam** (r1 7.7) — no byte-identical
+  golden test (unsorted map iteration has no stable baseline); use per-interface
+  partial-order assertions.
+- **Rust cargo suite** (`make test-rust`): the typed-outcome parsing may need the
+  helper to attach status on NACK — verify no wire regression.
+- **Smoke (loss userspace cluster, `/engineer` time):** v4+v6, push+reverse,
+  CoS-off+on; inject a runtime-phase-failing commit and confirm the DUT stays on
+  previous-good forwarding (fenced, not half-migrated). Sustained iperf3 through
+  the DUT (`feedback_verify_forwarding_with_sustained_iperf`).
+- **Failover** (`make test-failover`): required — touches ctrl/HA/RETH state.
 
 ## 10. Out of scope (explicitly)
 
-- The config-store-commit-vs-dataplane-apply ordering (`store.Commit` promotes
-  before `applyConfigLocked`, `daemon_apply.go:369`). This plan makes the
-  DATAPLANE apply internally transactional; it does not make the store commit and
-  dataplane apply one two-phase transaction. (The store already retains the old
-  active for rollback; a full store↔dataplane 2PC is a separate, larger issue.)
-- The Rust-side helper transactionality (#4952/#3789 already merged) — no helper
-  wire or handler changes proposed.
+- Config-store-commit-vs-dataplane-apply 2PC (`store.Commit` promotes before
+  `applyConfigLocked`). This makes the DATAPLANE apply fenced/fail-closed; it does
+  not make store+dataplane one distributed transaction. Divergence cost is
+  documented (§4.5), not eliminated.
+- Rust helper transactionality (#4952/#3789 merged) — no helper wire/handler change
+  beyond attaching status on NACK for outcome typing (§4.3).
 - Expanding `snapshotBindingPlanKey` to include local/interface-NAT addresses —
-  explicitly rejected in §4.2 (would force a helper restart on address-only
-  changes).
-- ISSU / rolling-upgrade apply paths beyond the standard commit path.
-- The `!samePlanRefresh` full-restart path's own transactionality — it already
-  restarts the helper (`ensureProcessLocked`) so a reject there stops the new
-  process; only note if reviewers find a fail-open there too (OQ-2).
+  rejected (would force a helper restart on address-only changes; the fix keeps the
+  hitless in-place path and makes it fail-closed).
+- The **reused-process bootstrap teardown** (r1 F2): an iface-binding-only plan-key
+  change reuses the running helper yet `programBootstrapMaps` tears down its live
+  ctrl+bindings — fail-closed but availability-destructive. Separate follow-up (it
+  is already fail-closed).
+- The already-safe overlay/worker-arm publish sites — must not be touched.
+- ISSU / rolling-upgrade apply paths.
 
 ## 11. Open questions for adversarial review (each invitable to PLAN-KILL)
 
-1. **Host rollback scope.** Is the full host-op rollback journal (Path A Facet A)
-   in-scope-REQUIRED for this issue, or is validate-first + fence (Path C Facet A)
-   the correct ceiling and the journal a defer-acceptable follow-up? Argue for
-   PLAN-KILL if you believe fence-only leaves an unacceptable host-topology
-   mismatch.
-2. **Full-restart path fail-open?** On the `!samePlanRefresh` branch,
-   `programBootstrapMapsLocked` runs, then `ensureProcessLocked`, then
-   `apply_snapshot`. If `apply_snapshot` is rejected there but the helper was NOT
-   restarted (already-running, plan changed but process reused), are the bootstrap
-   maps left ahead of the old snapshot with ctrl enabled — a second instance of
-   the #4959 bug on the restart path? If so, the transaction must cover both legs.
-3. **Host-first vs helper-first ordering.** §4.4 recommends host-actuate before
-   helper publish. Is that right? Helper-first would let a host failure leave the
-   helper on the new snapshot with host on the old (a different mismatch). Which
-   ordering minimizes the worst-case blast radius, and does the answer change the
-   rollback design?
-4. **Peer-sync suppression for a fenced apply.** Should a fenced/rolled-back
-   apply be added to `applyErrSkipsPeerSync` (like the required-protocol-gate
-   class) so a partial-apply node does not push the new config to the standby? Or
-   does the committed+active store state mean the peer MUST receive it to avoid
-   divergence (the #4034 rationale)? This is a genuine tension between #2138
-   (don't propagate a disarm) and #4034 (don't diverge nodes).
-5. **`BumpFIBGeneration` handling.** Is folding the discarded FIB-bump error into
-   the apply result (WARN + surface) correct, or does a failed FIB bump warrant a
-   fence (stale FIB entries could mis-forward after an ifindex/MAC change)?
-6. **Rollback re-sync correctness.** Does re-running
-   `syncUserspaceClassifierMapsLocked(oldSnap)` truly restore the maps to
-   previous-good in all cases — including when the old snapshot's local set was
-   itself partially kernel-derived (VRRP VIPs added between the two applies)? Is
-   there a case where the "restore" installs a state that never actually existed?
-7. **Is atomicity even the right frame?** Could a simpler model — never mutate
-   host state on a config that hasn't already been fully validated + snapshot-built
-   (pure validate-first), and accept fence-on-any-failure — dominate the
-   rollback-journal complexity entirely? I.e., is Path C alone the PLAN-READY
-   answer and Path A/B over-engineering?
+A. **Fence-always vs fence-on-mutation (§4.6).** Is regressing hitless
+   address-only commits to a fenced-window outage acceptable (i), or must the
+   hitless path be preserved with fence-only-on-non-accept (ii)? If neither the
+   fenced window NOR the transient success-window inconsistency of (ii) is
+   acceptable, is there a third design — or is this PLAN-KILL?
+B. **Is the fenced window's transit outage acceptable at all** for #4960's host
+   path, given host mutation (address/VLAN reconcile) is already disruptive today?
+   Quantify: what is the realistic fence-window duration (P1 host actuation + P2
+   build + P4 round trip)?
+C. **Daemon-level vs Manager-level fence (§4.5/7.4).** Must the fence be owned by
+   the daemon to span its VRF/xfrmi/RETH host reconcile, or is a Manager-level
+   fence + a documented "daemon host reconcile is outside the fence" residual
+   acceptable for land 2?
+D. **Typed-outcome sufficiency (§4.3).** Are the 5 outcomes the right partition?
+   Specifically, can Go reliably distinguish pre-teardown-reject (old live) from
+   post-teardown-down using the Rust status on NACK, or is the only safe rule
+   "any non-Accept ⇒ stay fenced and reconcile generation next status pass"
+   (collapsing outcomes 2-4)?
+E. **Peer-sync/divergence (§4.5).** Is the "sync only verified-restored-and-armed,
+   suppress fenced/unknown" rule correct, and who owns the reconvergence
+   (reverse-sync-on-reconnect vs a retry debt)? Is the resulting store/peer
+   divergence window acceptable?
+F. **Async leg debt (§4.7).** Is persistent transaction/debt state shared with
+   `syncSnapshotLocked` the right mechanism for the `pendingXSKStartup` deferred
+   publish, or should the deferred-publish path be removed in favor of always
+   fencing until the first Accepted publish?
+G. **Incremental landing.** Is land-1 (#4959 map fence) shippable independently of
+   land-2 (#4960 host fence), or do they share enough fence machinery that they
+   must land together?
+
+## 12. Revision log
+
+### v2 (this revision) — response to r1
+
+**Claude SMR r1 (PLAN-NEEDS-MAJOR):**
+- F1 (OQ-2 restart path fail-closed, not fail-open) → §4.7, OQ-2 deleted as a
+  question; confirmed restart path is fail-closed.
+- F2 (reused-process teardown) → §10 out-of-scope follow-up.
+- F3 (three call sites) → §4.7 audited all sites; async leg gets shared debt.
+- F4/OQ-6 (rollback = re-reconcile, not exact) → dropped the re-reconcile entirely
+  (§4.8); fence instead.
+- F5 (firm up recommendation) → §8 concrete two-land scope.
+- F6 (attach failure) → P1/P6 staging + test 8.
+- N1 (middle phases host-pure) → §4.4 verified.
+- N3 (peer-sync default) → §4.5 typed dispositions.
+
+**Codex r1 (PLAN-NEEDS-MAJOR):**
+- 1.1/1.2 (rollback recreates skew; journal incomplete) → dropped journal + B1;
+  fence-first model (§4.1/4.2).
+- OQ-1 (fence before first mutation; stage new links; retain old hooks) → §4.2 P1/P6.
+- 2.1 (restart path fail-closed; delete false restart claims) → §4.7; §1 corrected.
+- 3.1/OQ-3 (publish-last behind a fence; no old-gen compensating publish) → §4.2,
+  §3 #3789 note.
+- 4.1/4.2/OQ-4 (two daemon dispositions; daemon cannot stay unchanged) → §4.5, §5.
+- 5.1/5.2/OQ-6 (re-sync synthesizes never-existed state; nft omitted) → §4.8 drop
+  re-sync; §4.1/§6 include nft in resource set.
+- 6.1/6.2/6.3 (snapshot must be built after actuation; host.err doesn't exist;
+  smaller two-pass) → §4.2 P2-after-actuation; §5 critical-vs-best-effort + warn-
+  skip compatibility decision; §4.8 drop the pre-actuation split.
+- 7.1 (typed outcomes; ACK-loss ≠ reject) → §4.3.
+- 7.2 (pendingXSKStartup uncovered) → §4.7 shared debt.
+- 7.3 (attachment state in the transaction) → §4.2 P1/P6, resource set §6.
+- 7.4 (Manager not sole host orchestrator; HA fields) → §4.5, §6.
+- 7.5 (post-commit fallible work) → §4.2 P6 (post-commit, no re-fence).
+- 7.6 (fence invisible to HA readiness) → §4.5, test 13.
+- 7.7 (locking/zero-mutation/test claims wrong) → §5/§6 corrected; §9 injected seam,
+  no golden test.
+- 7.8 (#5680 not a fence precedent) → §3 corrected.
