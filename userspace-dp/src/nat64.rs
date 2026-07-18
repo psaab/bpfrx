@@ -248,6 +248,19 @@ pub(crate) struct Nat64State {
     /// Arc is threaded in `from_snapshots_with_previous`). NOT rebuilt from the
     /// snapshot — fragment associations are runtime state, not config.
     pub(crate) frag_assoc: Nat64FragAssoc,
+    /// #5624: the config-snapshot generation THIS state was built under. The
+    /// `frag_assoc` cache is Arc-shared across config reloads (so in-flight
+    /// datagrams keep translating), but each association is a per-flow
+    /// deny/NAT64 verdict resolved under one config generation. A commit that
+    /// changes deny/NAT64 rules bumps `snapshot.generation`, rebuilding this
+    /// `Nat64State` with the new value while the shared cache still holds
+    /// PRIOR-generation associations. Stamping every install and re-checking it
+    /// on lookup (see `Nat64FragAssoc::install`/`lookup`) invalidates a stale
+    /// association whose generation != the current one — mirroring the
+    /// flow-cache `config_generation` guard (afxdp/flow_cache.rs). Lives on
+    /// `Nat64State` (NOT inside the shared Arc) precisely because it must change
+    /// per reload while the cache persists.
+    pub(crate) build_generation: u64,
 }
 
 /// Reverse-direction state stored with NAT64 sessions so IPv4 replies can be
@@ -356,6 +369,12 @@ struct Nat64FragEntry {
     decision: SessionDecision,
     reverse: Option<Nat64ReverseInfo>,
     deadline_ns: u64,
+    /// #5624: the config-snapshot generation the FIRST fragment was admitted +
+    /// resolved under (stamped at `install`). A `lookup` under a DIFFERENT
+    /// current generation treats the entry as a miss and evicts it, so a config
+    /// change (deny/NAT64 rules) invalidates associations minted under the old
+    /// config instead of silently forwarding fragments the new config would drop.
+    generation: u64,
 }
 
 /// Cross-family fragment-association cache (#2562). Cheap to `Clone` (shares the
@@ -437,12 +456,19 @@ impl Nat64FragAssoc {
     /// association to an expired one (#5447). A repeat install of the same key
     /// refreshes the deadline and moves the entry to the back
     /// (most-recently-used).
+    ///
+    /// #5624: `generation` is the current config-snapshot generation the first
+    /// fragment was admitted + resolved under. It is stamped on the entry (and
+    /// re-stamped on a same-key re-install) so `lookup` can reject an
+    /// association left over from a prior config after a commit changed
+    /// deny/NAT64 rules.
     pub(crate) fn install(
         &self,
         key: Nat64FragKey,
         decision: SessionDecision,
         reverse: Option<Nat64ReverseInfo>,
         now_ns: u64,
+        generation: u64,
     ) {
         let deadline_ns = now_ns.saturating_add(NAT64_FRAG_TTL_NS);
         let idx = nat64_frag_shard_index(&key);
@@ -454,6 +480,11 @@ impl Nat64FragAssoc {
             e.decision = decision;
             e.reverse = reverse;
             e.deadline_ns = deadline_ns;
+            // Re-stamp: a fresh first fragment re-admitted under the current
+            // config owns this association now, so it adopts the current
+            // generation. A stale-generation refresh would otherwise resurrect
+            // a prior-config verdict.
+            e.generation = generation;
             shard.push(e);
             return;
         }
@@ -478,6 +509,7 @@ impl Nat64FragAssoc {
             decision,
             reverse,
             deadline_ns,
+            generation,
         });
     }
 
@@ -486,10 +518,19 @@ impl Nat64FragAssoc {
     /// the back (LRU) and returns a copy of the first fragment's decision +
     /// reverse info. A miss (never installed / expired / evicted) returns
     /// `None`, and the caller drops fail-closed (#4617).
+    ///
+    /// #5624: `generation` is the CURRENT config-snapshot generation. An entry
+    /// whose stamped generation differs was resolved under a prior config whose
+    /// deny/NAT64 rules may no longer admit this datagram, so it is treated as a
+    /// MISS and EVICTED (not hit-refreshed) — the non-first fragment then falls
+    /// to the #4617 fail-closed drop, and only a NEW first fragment re-admitted
+    /// under the current config can re-establish the association. Mirrors the
+    /// flow-cache `config_generation` guard (afxdp/flow_cache.rs).
     pub(crate) fn lookup(
         &self,
         key: &Nat64FragKey,
         now_ns: u64,
+        generation: u64,
     ) -> Option<(SessionDecision, Option<Nat64ReverseInfo>)> {
         let idx = nat64_frag_shard_index(key);
         let mut shard = self.shards[idx]
@@ -497,6 +538,14 @@ impl Nat64FragAssoc {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         shard.retain(|e| e.deadline_ns > now_ns);
         let pos = shard.iter().position(|e| e.key == *key)?;
+        // Config-generation guard (#5624): a match minted under a stale config
+        // generation is evicted and reported as a miss, so a commit that
+        // changed deny/NAT64 rules invalidates the association instead of
+        // letting stale fragments keep inheriting the old verdict.
+        if shard[pos].generation != generation {
+            shard.remove(pos);
+            return None;
+        }
         let mut e = shard.remove(pos);
         e.deadline_ns = now_ns.saturating_add(NAT64_FRAG_TTL_NS);
         let value = (e.decision, e.reverse);
@@ -726,7 +775,11 @@ impl Nat64State {
     /// an error and installs a poolless prefix as before: only a pool that was
     /// non-empty on the wire but had an UNPARSEABLE entry drops its rule.
     pub(crate) fn from_snapshots(snaps: &[NAT64RuleSnapshot]) -> Self {
-        Self::from_snapshots_with_previous(snaps, None)
+        // Generation 0: this convenience wrapper is used only by tests and the
+        // no-previous cold path where the frag-association generation guard is
+        // not exercised. The production reconcile path uses
+        // `from_snapshots_with_previous` with the real `snapshot.generation`.
+        Self::from_snapshots_with_previous(snaps, None, 0)
     }
 
     /// #4518: build the NAT64 state, PRESERVING live translated-port
@@ -754,9 +807,16 @@ impl Nat64State {
     /// `Nat64ReverseInfo` and reserving the translated port on the standby so
     /// the reservation survives a cross-node failover — is tracked separately in
     /// #4512; this fix is the same-node reload path only.
+    ///
+    /// #5624: `generation` is the config-snapshot generation this state is built
+    /// under (`snapshot.generation`). It is recorded as `build_generation` and
+    /// stamped onto every fragment association installed while this state is
+    /// live, so associations minted under a prior generation are invalidated on
+    /// lookup after a commit changes deny/NAT64 rules.
     pub(crate) fn from_snapshots_with_previous(
         snaps: &[NAT64RuleSnapshot],
         previous: Option<&Nat64State>,
+        generation: u64,
     ) -> Self {
         let mut prefixes = Vec::with_capacity(snaps.len());
         // The natv6v4 no-v6-frag-header option is global; the Go side stamps it
@@ -879,6 +939,13 @@ impl Nat64State {
             frag_assoc: previous
                 .map(|prev| prev.frag_assoc.clone())
                 .unwrap_or_default(),
+            // #5624: record the generation this state was built under. The
+            // shared `frag_assoc` cache above persists across the reload, but
+            // every association it holds carries the generation it was installed
+            // under; a lookup on this rebuilt state compares against
+            // `build_generation`, so any association from a prior generation is
+            // treated as a miss + evicted.
+            build_generation: generation,
         }
     }
 
