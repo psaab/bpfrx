@@ -1,3 +1,85 @@
+## 2026-07-18 — #5165: neighbor-monitor JoinHandle (no mutation after teardown)
+
+- **Timestamp**: 2026-07-18 (fix/5165-neigh-monitor-join)
+- **Action**: Fixed a control-plane thread-lifetime race. The neighbor
+  MONITOR thread was spawned `spawn_supervised_aux(...).ok()`, DISCARDING
+  its JoinHandle; `stop_inner` signalled `monitor_stop` but could not JOIN
+  before a reconcile cleared/rebuilt the shared `Arc<ShardedNeighborMap>`,
+  so a retired old-generation netlink consumer could mutate the fresh
+  baseline. Asymmetric with the sibling resolver (`resolver_join`). Fix
+  mirrors the resolver exactly:
+  1. Added `monitor_join: Option<JoinHandle<()>>` to `NeighborManager` +
+     `stop_and_join_monitor()` (signal `monitor_stop`, then JOIN).
+  2. `bringup.rs`: retain the join handle via `match spawn_supervised_aux`
+     (was `.ok()`), installing `monitor_stop` + `monitor_join` together
+     ONLY on successful spawn (spawn-fail leaves both None → next reconcile
+     retries, unchanged).
+  3. `stop_inner` calls `stop_and_join_monitor()` (was a bare
+     `monitor_stop.take().store(true)`), so the monitor is provably gone
+     before the map is cleared. Join latency bounded by the monitor's
+     existing 500ms `SO_RCVTIMEO` (the wake — mirrors the resolver's 500ms
+     recv-timeout bound; no new fd-sharing protocol invented).
+  4. `neigh_monitor_thread`: extracted the steady-state loop into
+     `neigh_monitor_steady_state(fd, stop, map, gen, counters)` (a
+     deterministic test seam) and added a post-`recv()` `stop` re-check
+     BEFORE mutating — a stop signalled while blocked in recv retires the
+     thread, so the just-received old-generation batch is dropped.
+- **Tests (fail-on-revert, deterministic, no real netlink)**:
+  - `steady_state_drops_batch_received_after_stop_5165`
+    (neighbor.rs): drives the REAL steady-state loop over an AF_UNIX
+    SOCK_DGRAM socketpair, injecting hand-crafted RTM_NEWNEIGH via the
+    existing `build_newneigh_request`. Event 1 (pre-stop) is applied;
+    after the loop is confirmed blocked in recv, stop is set and event 2
+    injected — the post-recv re-check drops it. Revert (remove the
+    re-check) → event 2 applied → RED.
+  - `stop_and_join_monitor_waits_for_thread` (neighbor_manager.rs):
+    a stand-in thread does bounded work AFTER observing stop; the JOIN
+    makes `stop_and_join_monitor` block until `done==true`. Revert (drop
+    the handle without `join()`) → returns early, `done==false` → RED.
+  - Plus `steady_state_exits_on_stop_when_idle_5165` and
+    `stop_and_join_monitor_no_monitor_is_noop` (liveness / no-op).
+  - GREEN: 4 new pass; `neighbor` suite 167 passed, `coordinator::` 133
+    passed. RED-on-revert proven: neutralizing the re-check AND the join
+    turned exactly the two targeted tests RED (the liveness/no-op stayed
+    GREEN, correctly). Build clean.
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs,
+  userspace-dp/src/afxdp/coordinator/neighbor_manager.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/README.md
+## 2026-07-18 — #6038: deflake TestWireUserspaceEventStreamCallbacks...WiresSessionAndFullResync (2s deadline races the wiring under load)
+
+- **Timestamp**: 2026-07-18 (fix/6038-eventstream-test-flake)
+- **Action**: Fixed the timing-flaky pkg/daemon test. Root cause (firsthand):
+  the wiring's happy path is ~0.2s because each of the two ACKs (session-open
+  seq 1, full-resync seq 2) is flushed by the eventstream `ackLoop`'s 100ms
+  ticker (`eventstream.go:924`), so two ACKs cost ~200ms. The test's ACK wait
+  (`waitForAckSeqForWiringTest`) and the socket dial loop each capped on a
+  FIXED `time.Now().Add(2 * time.Second)` — only ~1.8s of headroom. Under
+  concurrent build/test load the `ackLoop`/`acceptLoop`/`readLoop` goroutines
+  starve; the ACK slips past the 500ms per-read window repeatedly until the 2s
+  overall cap is exhausted (~4×500ms) → a spurious 2.01s timeout, non-monotonic
+  across commits (the issue's bisect FAIL→pass→FAIL). Fix: added
+  `wiringTestDeadline(t)` returning a GENEROUS cap that tracks `t.Deadline()`
+  (`go test -timeout`, default 10m) less a 5s margin, else a 30s fallback; both
+  the ACK wait and the dial loop now use it. The loops STILL gate on the actual
+  completion event (successful connect, then ACK seq >= want) — only the
+  wall-clock backstop was widened, no assertion weakened, no `#[ignore]`. Also
+  now check `es.Start(ctx)`'s previously-discarded error (Start binds the Unix
+  listener synchronously before the accept loop, so a bind failure should
+  surface directly, not as a confusing dial-loop timeout).
+- **File(s)**: pkg/daemon/userspace_sync_test.go, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/daemon/` clean; target
+  test `-count=50` → 50/50 pass; SAME `-count=50` under heavy CPU+build load
+  (GOMAXPROCS=2, 3×nproc busy loops + 3 parallel builds) → 50/50 pass, slowest
+  run 0.22s (no 2s outliers); full `go test ./pkg/daemon/` green. Cap-is-the-
+  lever contrast (per-read forced to 10ms to emulate the load timeout condition,
+  varying ONLY the overall cap): cap=50ms → RED (`read ack frame: i/o timeout`,
+  0.05s); cap=3000ms → GREEN (0.20s) — proving the overall deadline is the sole
+  pass/fail lever the fix widens. The genuine >2s ACK stall is load-dependent /
+  nondeterministic (per the issue's own bisect) and did not reproduce on this
+  box even under extreme oversubscription.
+
 ## 2026-07-18 — #6041: address-only (`port no-translation`) persistent-NAT leases (parity follow-up to #5819)
 
 - **Timestamp**: 2026-07-18 (fix/6041-address-only-persist-nat)
