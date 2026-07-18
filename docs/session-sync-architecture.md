@@ -711,6 +711,48 @@ lock scope changes). Event-stream ordering stays governed by `producer_seq_lock`
 inside `push_delta_lossless`, not the `ServerState` lock, so releasing the latter
 does not affect the lossless seq contract (#2874 / #3878).
 
+**The worker-loop lossless push is time-BOUNDED per drain cycle (#5468).** Every
+lossless send `flush_session_deltas` makes — it runs directly on the packet
+worker loop — must NOT use the 5 s `LOSSLESS_QUEUE_TIMEOUT`. That timeout equals
+`HEARTBEAT_STALE_AFTER` (5 s), so a connected-but-UNREAD peer (a slow/stalled
+reader whose lossless channel is full) that blocked the worker for the full 5 s
+would stop the loop stamping its per-binding heartbeat; the peer then sees this
+node as stale and triggers a **false failover** — the exact defect #5468
+describes. The worker loop therefore calls `push_delta_lossless_within` with a
+short `WORKER_LOSSLESS_QUEUE_BUDGET` (one fifth of `HEARTBEAT_STALE_AFTER`,
+~1 s), leaving ~5× headroom for the rest of the loop iteration plus the
+heartbeat map write. On the bounded timeout the delta is **not** dropped: the
+same `set_delta_loss` / `take_delta_loss` latch fires and forces a full owner-RG
+resync (deliver-or-resync, the #2874 losslessness contract).
+
+The per-call budget alone is **not** sufficient, because the drain region calls
+`flush_session_deltas` many times per iteration: the steady-state drain is one
+call, but the #2442 loss-of-sync resync and the #2653 command export
+(`take_delta_loss` → `chunked_drain_as_you_export!` → `drain_and_flush_all!`,
+`worker/loop_body/mod.rs`) call it ONCE PER 256-delta batch across the entire
+owned-session set. For K owned sessions that is ~K/256 calls, so at one budget
+each an unread peer would still stall the worker ~(K/256) budgets — past K≈1280
+(5 batches) that re-crosses `HEARTBEAT_STALE_AFTER` and re-triggers the same
+spurious failover **via the resync path**. The bound is therefore an AGGREGATE
+one: a per-drain-cycle `worker_lossless_wedged` latch, reset at the top of every
+loop iteration and threaded through every `flush_session_deltas` call, caps the
+whole cycle at ~one budget total. The first wedged batch waits one budget and
+sets the latch; every later call this cycle inherits it and SKIPS the lossless
+wait entirely (it never re-attempts a push), while still draining each delta to
+its other consumers — the per-binding live RPC buffer, the shared
+conntrack/session tables, peer-worker delete replication, and best-effort
+RT_FLOW. Every wedged batch still returns out-of-sync, so the loss-of-sync latch
+stays set and the resync simply RETRIES next cycle until the consumer drains
+(deliver-or-resync, never a silent drop). Net guarantee: the worker loop's total
+lossless WAIT per drain cycle is ~1 budget **regardless of the owned-session
+count K** — for both the incremental push and the resync/export.
+
+Only the off-worker-loop exporters — `AllSessionsExport::push` (bulk export on
+connect, above) and `push_purge_close_deltas` (tunnel-remap purge, below) — keep
+the 5 s `LOSSLESS_QUEUE_TIMEOUT` via `push_delta_lossless`; they run off the
+packet loop so a long backpressure wait there does not threaten the worker
+heartbeat.
+
 ### Delta-ring overflow → loss-of-sync resync (#2442)
 
 Each worker buffers session open/close deltas in an in-worker ring
