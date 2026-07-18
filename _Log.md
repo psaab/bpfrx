@@ -1,3 +1,30 @@
+## 2026-07-18 — #5146 (security/correctness): NAT64 first-fragment association published pre-commit
+
+- **Timestamp**: 2026-07-18 (fix/5146-nat64-frag-rollback)
+- **Action**: `nat64_install_forward_fragment_assoc` (the #2562 cross-family
+  fragment cache) was called at NAT64 source-allocation time — BEFORE the flow
+  commits. The hop-limit ICMP-TE bounce, the `can_admit` admission preflight, and
+  the install-partial arm each `rollback_nat64_allocation` (releases the pool port
+  ONLY), so a pre-published association stayed LIVE ~2s (NAT64_FRAG_TTL_NS) with
+  NO exact-key remove. A non-first fragment of a rolled-back first fragment then
+  inherited a rolled-back verdict AND the now-reusable translation (cross-flow
+  NAT64 fragment ambiguity under port reuse). Fix = Option A: DELAY the install to
+  the single POST-COMMIT site (inside `if forward_installed`, next to the ordinary
+  same-family `nat_install_forward_fragment_assoc`); helper now self-gates on
+  `decision.nat.nat64` so both installs share one commit site and exactly one
+  fires. Every rollback arm (ICMP-TE / admission / install-partial / track-false)
+  now leaves NO live association; the committed success path still publishes
+  (#2562/#6095 preserved). NOT HA — Nat64FragAssoc is per-process, never synced.
+  Added 2 poll-path tests through `poll_binding_process_descriptor`: SUCCESS
+  (committed first fragment publishes 1 assoc, non-first inherits + translates)
+  and FAIL-ON-REVERT (can_admit-refused first fragment leaves 0 assoc; non-first
+  misses — `nat64_translations == 0`, drops fail-closed). Reverting the fix →
+  rollback test RED at the `frag_assoc.len() == 0` assertion (`left: 1`),
+  target-count 1; success test stays green.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_nat64_tunnel.rs,
+  docs/pr/5146-nat64-frag-rollback/plan.md
+
 ## 2026-07-18 — #5268 (High, security): RX-VLAN-offload-disable is a fail-closed activation precondition
 
 - **Timestamp**: 2026-07-18 (fix/5268-rxvlan-failclosed)
