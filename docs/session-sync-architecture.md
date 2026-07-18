@@ -23,8 +23,9 @@ The current implementation has four distinct pieces:
 
 The older mental model of "bulk once, then background sweep" is incomplete.
 Current failover safety depends on sender-side bulk acknowledgement, the
-continuous lossless userspace event stream (with gap → full-resync, see #2874),
-the demotion peer barrier, and filtered userspace delta replication.
+continuous lossless userspace event stream (with gap OR undecodable session
+frame → full-resync, see #2874 / #5483), the demotion peer barrier, and filtered
+userspace delta replication.
 
 ## Session Representation
 
@@ -634,9 +635,65 @@ post-snapshot sessions.
 
 This is **not** triggered by demotion prep. Its only live caller is
 `handleEventStreamFullResync` → `exportUserspaceOwnerRGSessionsWithConfig`: the
-event stream signals a FullResync after a #2874 sequence gap or a #2442
-delta-ring overflow (loss-of-sync), and the export republishes the full owned set
-from table truth. It is not the same thing as the steady-state delta drain.
+event stream signals a FullResync after a #2874 sequence gap, a #2442
+delta-ring overflow (loss-of-sync), or a #5483 **undecodable session frame**
+(a COMPLETE-but-semantically-rejected open/close/update — same severity as a
+gap, because the standby is missing that frame's session state), and the export
+republishes the full owned set from table truth. It is not the same thing as the
+steady-state delta drain.
+
+The #5483 case closes a silent-divergence hole: the reader used to skip an
+undecodable session frame with `DecodeErrors.Add(1); continue`, leaving the
+sequence watermark below the hole. A later lossy telemetry frame would then
+advance the cumulative ACK past the unapplied session seq, the helper's replay
+buffer would trim over it, and no subsequent gap would fire — so the standby
+diverged with no recovery. `handleSessionDecodeFailure` forces a full resync
+from table truth.
+
+**#6130 — how a decode failure terminates (it does NOT mirror the #2874 gap
+self-heal).** The first #5483 fix reused the gap mechanics verbatim: force the
+resync, withhold the ACK, and drop the connection. That WEDGED the stream on a
+persistently-undecodable frame, because a decode failure is fundamentally
+different from a gap:
+
+- A #2874 **gap** self-heals precisely because the frame is **ABSENT**. On
+  reconnect the Rust `replay_buffered` sees `has_gap` (`oldest_buffered >
+  acked+1`) and parks a re-baselining FullResync barrier — the frame cannot be
+  re-sent because it was never buffered.
+- An **undecodable** frame is **PRESENT**. The Rust replay buffer stores encoded
+  frames and re-sends them verbatim; `has_gap` is FALSE for a present seq, so
+  **no** re-baselining barrier is parked. Withholding the ACK therefore makes
+  the helper re-send the identical frame on every reconnect: reconnect → replay
+  N → decode-fail → resync → drop → reconnect — an unbounded busy-loop that
+  hammers the shared control socket and floods the log (worst case on a STANDBY,
+  whose `handleEventStreamFullResync` is a corrective no-op — pure churn). The
+  bulk export (`ExportOwnerRGSessions`) publishes deltas peer-direct and never
+  injects into the local replay buffer, so it cannot evict frame N; only 4096
+  new live frames would — never, under no/low traffic.
+
+#6130 terminates the loop by **advancing the watermark PAST the undecodable
+frame** (unconditionally, on every such frame) and **keeping the connection
+alive** (mirroring the helper-initiated FullResync path #5362, not the gap
+path). The cumulative ACK then moves past seq N, the helper trims it
+(`front.seq <= acked`), and it is never re-sent — so a single bad frame yields
+**exactly one** resync and a persistently-undecodable stream yields at most one
+resync per `decodeFailureResyncInterval` (rate-limited; the rest counted in
+`DecodeResyncSuppressed`).
+
+Advancing past N does **not** reintroduce the #5483 divergence, because we
+advance only under cover of a resync that re-baselines from **table truth**: an
+undecodable OPEN's session is still in the helper table, so the unbounded export
+snapshot is a strict superset of the lost frame's state. An undecodable CLOSE
+degrades to the pre-existing "missed close → idle-GC self-heal" bounded
+staleness (a full owner-RG re-export cannot convey a delete — see #2880 above),
+NOT a permanent divergence. This is unlike the pre-#5483 silent skip, which
+advanced past N with **no** resync at all. **STANDBY:** the export early-returns
+"not primary" (a cheap no-op that never reaches the control socket), and a
+decoded session delta is itself a no-op on a standby (`handleEventStreamDelta`
+drops it for a non-primary), so advancing past the undecodable frame there loses
+nothing and the standby cannot spin. A decode failure on a lossy TELEMETRY frame
+is still tolerated (skipped, watermark advanced) — it carries no HA session
+state.
 
 The `rgIDs` handed to the export are enumerated from the **configured
 redundancy-group set** — `handleEventStreamFullResync` calls
