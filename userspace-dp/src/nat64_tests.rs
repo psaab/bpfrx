@@ -3898,7 +3898,8 @@ fn nat64_4518_allocator_survives_config_reload() {
 
     // Config reload with the SAME pool: the allocator (and its live tuple
     // ownership + monotonic cursor) must carry over.
-    let state2 = Nat64State::from_snapshots_with_previous(&[single_addr_prefix()], Some(&state1));
+    let state2 =
+        Nat64State::from_snapshots_with_previous(&[single_addr_prefix()], Some(&state1), 1);
 
     // No-collision proof FIRST (before any flow-A touch, so a reverted fresh
     // allocator cannot be masked by flow A re-consuming the low port): a NEW
@@ -3943,8 +3944,11 @@ fn nat64_4518_pool_change_resets_allocator() {
         .expect("alloc A");
 
     // Reload with a DIFFERENT pool address: pool differs => fresh allocator.
-    let state3 =
-        Nat64State::from_snapshots_with_previous(&[single_addr_prefix_alt_pool()], Some(&state1));
+    let state3 = Nat64State::from_snapshots_with_previous(
+        &[single_addr_prefix_alt_pool()],
+        Some(&state1),
+        1,
+    );
     let (sb, pb) = state3
         .allocate_source(0, crate::ip_proto::PROTO_TCP, c2, dst_v4, 5000, 443, 2)
         .expect("alloc B on changed pool");
@@ -3974,7 +3978,8 @@ fn nat64_4518_pool_change_resets_allocator() {
 #[test]
 fn nat64_4518_new_rule_has_no_previous_to_reuse() {
     let empty = Nat64State::default();
-    let state = Nat64State::from_snapshots_with_previous(&[single_addr_prefix()], Some(&empty));
+    let state =
+        Nat64State::from_snapshots_with_previous(&[single_addr_prefix()], Some(&empty), 1);
     let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
     let c: Ipv6Addr = "2001:db8::1".parse().unwrap();
     let (snat, port) = state
@@ -4451,9 +4456,9 @@ fn nat64_frag_assoc_v6_to_v4_nonfirst_inherits_and_translates() {
     // Install the first fragment's decision; the non-first fragment inherits it.
     let cache = Nat64FragAssoc::new();
     let decision = frag_test_decision(Nat64State::forward_decision(snat_v4, dst_v4, 5000));
-    cache.install(kf, decision, None, 1_000);
+    cache.install(kf, decision, None, 1_000, 1);
     let (hit, reverse) = cache
-        .lookup(&kn, 1_500)
+        .lookup(&kn, 1_500, 1)
         .expect("non-first inherits association");
     assert!(
         reverse.is_none(),
@@ -4530,9 +4535,9 @@ fn nat64_frag_assoc_v4_to_v6_nonfirst_inherits_and_translates() {
         orig_dst_v6,
     };
     let decision = frag_test_decision(Nat64State::forward_decision(snat_v4, server_v4, 5000));
-    cache.install(kf, decision, Some(reverse), 2_000);
+    cache.install(kf, decision, Some(reverse), 2_000, 1);
     let (_hit, rev) = cache
-        .lookup(&kn, 2_400)
+        .lookup(&kn, 2_400, 1)
         .expect("reverse non-first inherits");
     assert_eq!(
         rev,
@@ -4585,7 +4590,7 @@ fn nat64_frag_assoc_nonfirst_without_first_misses_and_drops() {
     let nonfirst = make_ipv6_frag_udp(src_v6, dst_v6, 0, 0, &[0u8; 16], 100, false, 0x9999);
     let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6).expect("key");
     assert!(
-        cache.lookup(&kn, 10).is_none(),
+        cache.lookup(&kn, 10, 1).is_none(),
         "orphan non-first fragment misses"
     );
     let snat = Ipv4Addr::new(198, 51, 100, 5);
@@ -4618,7 +4623,7 @@ fn nat64_frag_assoc_cache_is_bounded() {
             dst: IpAddr::V6(dst_v6),
             ident: i,
         };
-        cache.install(key, decision, None, 1_000);
+        cache.install(key, decision, None, 1_000, 1);
     }
     assert!(
         cache.len() <= ceiling,
@@ -4645,14 +4650,16 @@ fn nat64_frag_assoc_ttl_evicts() {
         Ipv4Addr::new(8, 8, 8, 8),
         5000,
     ));
-    cache.install(key, decision, None, 1_000);
+    cache.install(key, decision, None, 1_000, 1);
     assert_eq!(cache.len(), 1);
     // Still within the TTL window: hit.
-    assert!(cache.lookup(&key, 1_000 + NAT64_FRAG_TTL_NS - 1).is_some());
+    assert!(cache
+        .lookup(&key, 1_000 + NAT64_FRAG_TTL_NS - 1, 1)
+        .is_some());
     // Past the (refreshed) TTL with no intervening hit: pruned + miss.
-    cache.install(key, decision, None, 1_000);
+    cache.install(key, decision, None, 1_000, 1);
     assert!(
-        cache.lookup(&key, 1_000 + NAT64_FRAG_TTL_NS + 1).is_none(),
+        cache.lookup(&key, 1_000 + NAT64_FRAG_TTL_NS + 1, 1).is_none(),
         "expired association must miss",
     );
     assert_eq!(cache.len(), 0, "expired entry pruned");
@@ -4732,12 +4739,12 @@ fn nat64_frag_assoc_install_prunes_expired_before_evicting_live() {
     // insertion order). Its deadline is FAR in the future.
     let live_key = mk(idents[0]);
     let live_now = 2 * NAT64_FRAG_TTL_NS; // deadline = 4*TTL
-    cache.install(live_key, decision, None, live_now);
+    cache.install(live_key, decision, None, live_now, 1);
 
     // Fill the rest of the shard to cap with EXPIRED entries: installed at
     // now=0 so their deadline is TTL, which the flood/lookup times below exceed.
     for &ident in &idents[1..NAT64_FRAG_CAP_PER_SHARD] {
-        cache.install(mk(ident), decision, None, 0);
+        cache.install(mk(ident), decision, None, 0, 1);
     }
     assert_eq!(
         cache.len(),
@@ -4749,16 +4756,16 @@ fn nat64_frag_assoc_install_prunes_expired_before_evicting_live() {
     // deadlines but well within the LIVE entry's window.
     let flood_now = NAT64_FRAG_TTL_NS + 1; // > TTL (expired) but < 4*TTL (live alive)
     let new_key = mk(idents[NAT64_FRAG_CAP_PER_SHARD]);
-    cache.install(new_key, decision, None, flood_now);
+    cache.install(new_key, decision, None, flood_now, 1);
 
     // The LIVE association survived (expired slots were reclaimed first)...
     assert!(
-        cache.lookup(&live_key, flood_now + 1).is_some(),
+        cache.lookup(&live_key, flood_now + 1, 1).is_some(),
         "#5447: live association must survive a first-fragment flood",
     );
     // ...and the NEW association was installed into a reclaimed slot.
     assert!(
-        cache.lookup(&new_key, flood_now + 1).is_some(),
+        cache.lookup(&new_key, flood_now + 1, 1).is_some(),
         "new association installed into a reclaimed expired slot",
     );
 }
@@ -4789,27 +4796,93 @@ fn nat64_frag_assoc_install_all_live_still_evicts_oldest() {
     let cache = Nat64FragAssoc::new();
     // Fill the shard to cap with entries that are ALL live at the times below.
     for &ident in &idents[..NAT64_FRAG_CAP_PER_SHARD] {
-        cache.install(mk(ident), decision, None, 1_000);
+        cache.install(mk(ident), decision, None, 1_000, 1);
     }
     assert_eq!(cache.len(), NAT64_FRAG_CAP_PER_SHARD, "shard filled to cap");
 
     let oldest_key = mk(idents[0]);
     let new_key = mk(idents[NAT64_FRAG_CAP_PER_SHARD]);
     // Install a NEW key while every existing entry is still live.
-    cache.install(new_key, decision, None, 1_000);
+    cache.install(new_key, decision, None, 1_000, 1);
 
     // The oldest (front) live entry is evicted -- capacity bound preserved.
     assert!(
-        cache.lookup(&oldest_key, 1_000).is_none(),
+        cache.lookup(&oldest_key, 1_000, 1).is_none(),
         "capacity bound: oldest live entry evicted when the shard is all-live",
     );
     assert!(
-        cache.lookup(&new_key, 1_000).is_some(),
+        cache.lookup(&new_key, 1_000, 1).is_some(),
         "new entry installed",
     );
     assert!(
         cache.len() <= NAT64_FRAG_CAP_PER_SHARD,
         "shard never exceeds cap",
+    );
+}
+
+#[test]
+fn nat64_frag_assoc_generation_change_invalidates_stale_association() {
+    // #5624: a fragment association is a per-flow deny/NAT64 verdict resolved
+    // under ONE config-snapshot generation. The Arc-shared cache survives a
+    // config reload (so in-flight datagrams keep translating), but a commit
+    // that changes deny/NAT64 rules bumps the generation, and an association
+    // minted under the PRIOR generation must NOT keep being hit-refreshed and
+    // used to forward fragments the new config might drop. `lookup` REJECTS
+    // (treats as a miss + EVICTS) an entry whose stamped generation != the
+    // current generation, while a same-generation replay still hits.
+    //
+    // RED-on-revert: neutralize the generation guard in `Nat64FragAssoc::lookup`
+    // (e.g. change `if shard[pos].generation != generation` to `if false`) and
+    // the post-commit lookup HITS -> the `is_none()` assertion below fails.
+    let cache = Nat64FragAssoc::new();
+    let key = Nat64FragKey {
+        addr_family: libc::AF_INET6 as u8,
+        src: IpAddr::V6("2001:db8::1".parse().unwrap()),
+        dst: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+        ident: 0x5624,
+    };
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(8, 8, 8, 8),
+        5000,
+    ));
+
+    // A first fragment installs the association under generation 7.
+    let gen0: u64 = 7;
+    cache.install(key, decision, None, 1_000, gen0);
+
+    // A same-generation non-first fragment still inherits it (valid same-config
+    // reassembly is NOT broken by the guard).
+    assert!(
+        cache.lookup(&key, 1_100, gen0).is_some(),
+        "same-generation replay must still hit",
+    );
+
+    // A config commit bumps the generation. The stale association (gen 7) must
+    // MISS under generation 8 -- the fix.
+    let gen1: u64 = 8;
+    assert!(
+        cache.lookup(&key, 1_200, gen1).is_none(),
+        "#5624: association from a prior config generation must miss",
+    );
+    // ...and it was EVICTED, not merely skipped, so it cannot linger to be
+    // refreshed by a later same-old-generation consult.
+    assert_eq!(
+        cache.len(),
+        0,
+        "stale association evicted on the mismatched lookup",
+    );
+    assert!(
+        cache.lookup(&key, 1_300, gen0).is_none(),
+        "stale association was evicted, not merely skipped",
+    );
+
+    // A NEW first fragment re-admitted under the current config re-establishes
+    // the association, and it hits again under the current generation.
+    cache.install(key, decision, None, 1_400, gen1);
+    assert!(
+        cache.lookup(&key, 1_500, gen1).is_some(),
+        "re-established association under the new generation hits",
     );
 }
 
