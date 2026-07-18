@@ -265,6 +265,165 @@ fn forwarded_tcp_may_need_segmentation_uses_declared_len_not_backing() {
     );
 }
 
+/// #5159 RED-on-revert: the admission gate must use the ACTUAL egress MTU. A
+/// valid IPv4 egress MTU of 900 (below the wrongly-applied 1280 IPv6-link-MTU
+/// floor) with a declared 1100-byte datagram (in the (real_mtu, 1280]
+/// blackhole band) MUST be flagged for segmentation. Restoring the `.max(1280)`
+/// floor raises the MTU to 1280, so 1100 <= 1280 and the gate returns false —
+/// the datagram is submitted OVERSIZE to AF_XDP TX. RED.
+#[test]
+fn forwarded_tcp_may_need_segmentation_honors_sub_1280_ipv4_egress_mtu_5159() {
+    let forwarding = test_forwarding_with_egress_mtu(900);
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        ..UserspaceDpMeta::default()
+    };
+    let mut frame = vec![0u8; 14 + 1100];
+    frame[14] = 0x45; // IPv4, ihl=5
+    let total_len: u16 = 1100; // in (900, 1280]
+    frame[16] = (total_len >> 8) as u8;
+    frame[17] = total_len as u8;
+    frame[23] = PROTO_TCP;
+    assert!(
+        forwarded_tcp_may_need_segmentation(&frame, meta, &test_decision(), &forwarding),
+        "a 1100-byte datagram at a 900 egress MTU MUST be admitted for \
+         segmentation — 1280 is the IPv6 link minimum, not an IPv4 floor (#5159)"
+    );
+}
+
+/// #5159: with the floor removed, a decision whose egress interface is unknown
+/// (no egress entry → mtu resolves to 0) must NOT be flagged for segmentation —
+/// the now-live `mtu == 0` guard forwards it unchanged rather than segmenting
+/// on a guessed 1280. Removing that guard makes the gate flag every oversized
+/// frame with an unknown MTU (spurious `seg_needed_but_none`).
+#[test]
+fn forwarded_tcp_may_need_segmentation_unknown_egress_mtu_does_not_flag_5159() {
+    let forwarding = ForwardingState::default(); // no egress entries → mtu 0
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        ..UserspaceDpMeta::default()
+    };
+    let mut frame = vec![0u8; 14 + 1600];
+    frame[14] = 0x45;
+    let total_len: u16 = 1600;
+    frame[16] = (total_len >> 8) as u8;
+    frame[17] = total_len as u8;
+    frame[23] = PROTO_TCP;
+    assert!(
+        !forwarded_tcp_may_need_segmentation(&frame, meta, &test_decision(), &forwarding),
+        "an unknown egress MTU (0) must forward unchanged, not segment on a guessed 1280"
+    );
+}
+
+/// #5159 RED-on-revert for the TX LOCAL-OWNER FAST-PATH builder
+/// (`segment_forwarded_tcp_frames_into_prepared`) — the primary production
+/// segmentation path (dispatch tries it first). It is kept byte-identical to
+/// the copy-path twin, but has no dedicated gate, so a future refactor that
+/// breaks the twin invariant could silently re-floor the COMMON path with zero
+/// test signal. This binds it directly: a non-DF IPv4 TCP datagram of L3 length
+/// ~1100 at a 900-byte egress MTU MUST be chunked into >=2 prepared TX frames,
+/// each whose L3 length is <= 900. Restoring `.max(1280)` in
+/// `tx/tcp_segmentation.rs` floors the MTU to 1280, so the 1100-byte datagram
+/// is `<= mtu` and the builder returns None (no prepared segments) — RED.
+#[test]
+fn segment_forwarded_tcp_frames_into_prepared_honors_sub_1280_ipv4_egress_mtu_5159() {
+    let egress_mtu = 900usize;
+    // 20 (IP) + 20 (TCP, no options) + 1060 payload = 1100-byte L3 datagram,
+    // in the (real_mtu, 1280] blackhole band.
+    let tcp_payload_len = 1060usize;
+    let total_len = (20 + 20 + tcp_payload_len) as u16;
+    let src_port = 47308u16;
+    let dst_port = 5201u16;
+
+    // eth(14) + IPv4(20, NON-DF) + TCP(20, ACK) + payload. The builder recomputes
+    // output checksums, so the input TCP checksum need not be valid.
+    let mut frame = vec![0u8; 14 + total_len as usize];
+    frame[12] = 0x08; // ethertype IPv4
+    frame[13] = 0x00;
+    frame[14] = 0x45; // v4, ihl=5
+    frame[16] = (total_len >> 8) as u8;
+    frame[17] = total_len as u8;
+    frame[18] = 0x00; // id
+    frame[19] = 0x01;
+    frame[20] = 0x00; // flags/frag: NON-DF (0x0000)
+    frame[21] = 0x00;
+    frame[22] = 64; // ttl
+    frame[23] = PROTO_TCP;
+    frame[26..30].copy_from_slice(&[10, 0, 0, 1]); // src ip
+    frame[30..34].copy_from_slice(&[10, 0, 0, 2]); // dst ip
+    frame[34..36].copy_from_slice(&src_port.to_be_bytes());
+    frame[36..38].copy_from_slice(&dst_port.to_be_bytes());
+    frame[46] = 0x50; // TCP data offset = 20 (5 words), no options
+    frame[47] = 0x10; // TCP flags = ACK (NOT SYN/FIN/RST — those are refused)
+    let ip_csum = crate::afxdp::tx::test_support::compute_ipv4_header_checksum(&frame[14..34]);
+    frame[24] = (ip_csum >> 8) as u8;
+    frame[25] = (ip_csum & 0xff) as u8;
+
+    let forwarding = test_forwarding_with_egress_mtu(egress_mtu);
+    // egress_ifindex 80, tx_vlan_id 0 (untagged output → L2 == 14), and — crucial
+    // for the builder — a resolved neighbor_mac / src_mac.
+    let decision = test_forwarding_decision_to_bound_ifindex(11);
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        l4_offset: 34,
+        flow_src_port: src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+
+    let mut target_binding = BindingWorker::new_for_mirror_test(0, 0, 11, 0);
+    let mut post_recycles: Vec<(u32, u64)> = Vec::new();
+    let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
+
+    let (segments, _bytes, max_frame) = segment_forwarded_tcp_frames_into_prepared(
+        &mut target_binding,
+        &frame,
+        meta,
+        &decision,
+        &forwarding,
+        false,
+        Some((src_port, dst_port)),
+        None,
+        None,
+        None,
+        1,
+        &mut post_recycles,
+        0,
+        &worker_commands_by_id,
+    )
+    .expect(
+        "the TX fast-path builder MUST segment a 1100-byte L3 datagram at a \
+         900-byte egress MTU; the 1280 floor is an IPv6-link-MTU value, not an \
+         IPv4 floor (#5159)",
+    );
+
+    assert!(segments >= 2, "must split into >=2 segments, got {segments}");
+    // Untagged output (tx_vlan_id=0): L2 is 14 bytes, so max L3 = max_frame - 14.
+    assert!(
+        (max_frame as usize) <= 14 + egress_mtu,
+        "the largest segment frame must be <= L2(14) + 900 egress MTU, got {max_frame}"
+    );
+    let prepared = &target_binding.tx_pipeline.pending_tx_prepared;
+    assert_eq!(
+        prepared.len() as u32,
+        segments,
+        "every reported segment must land in the prepared-TX scratch"
+    );
+    for req in prepared {
+        let l3_len = (req.len as usize).saturating_sub(14);
+        assert!(
+            l3_len <= egress_mtu,
+            "each prepared TX segment's L3 length must be <= the 900 egress MTU, got {l3_len}"
+        );
+    }
+}
+
 // #5148 RED-on-revert: a FIRST IPv4 fragment (MF=1, offset 0) carries a real
 // TCP header at the post-IP offset, so the pre-#5148 non-first-only gate
 // (`is_non_first_fragment`, mask 0x1FFF over the offset bits only) treated it

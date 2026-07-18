@@ -1510,13 +1510,22 @@ fn forwarded_tcp_may_need_segmentation(
     if meta.protocol != PROTO_TCP || decision.resolution.tunnel_endpoint_id != 0 {
         return false;
     }
+    // #5159: use the ACTUAL egress MTU, in lockstep with both segmentation
+    // builders. The prior `.max(1280)` floored a valid IPv4 MTU of 68-1279 to
+    // the IPv6-minimum LINK MTU (1280 is NOT an IPv4 floor; IPv4 min is 68), so
+    // this gate never admitted a non-DF TCP datagram whose L3 length fell in
+    // (real_mtu, 1280] and it was submitted OVERSIZE to AF_XDP TX. Treat 0 (no
+    // egress entry / unknown MTU) as "don't segment" — forward unchanged,
+    // matching the builders' now-live `mtu == 0` guard.
     let mtu = forwarding
         .egress
         .get(&decision.resolution.egress_ifindex)
         .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))
         .map(|egress| egress.mtu)
-        .unwrap_or_default()
-        .max(1280);
+        .unwrap_or_default();
+    if mtu == 0 {
+        return false;
+    }
     // Prefer the actual Ethernet header in the frame. Metadata can lag
     // behind VLAN normalization; a VLAN frame with 18 bytes of L2 and a
     // 1500-byte L3 payload is 1518 bytes total, and treating stale

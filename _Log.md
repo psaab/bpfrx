@@ -53093,6 +53093,65 @@ top.
   docs/xdp-io-uring-userspace-dataplane.md
 
 - **Timestamp**: 2026-07-18
+- **Action**: #5159 — remove the 1280-byte MTU floor that bypassed TCP
+  segmentation for valid sub-1280 IPv4 egress MTUs. Three plain-forward sites
+  did `.unwrap_or_default().max(1280)`, flooring every plain-interface egress
+  MTU to the IPv6 minimum LINK MTU (1280 is NOT an IPv4 floor; IPv4 min is 68).
+  A valid egress MTU of 68-1279 was raised to 1280, so a non-DF TCP datagram
+  with L3 length in (real_mtu, 1280] was never flagged for segmentation and was
+  submitted OVERSIZE to AF_XDP TX (blackhole); the `if mtu==0` guard was dead
+  code. Fixed all three: (1) the admission gate forwarded_tcp_may_need_
+  segmentation (dispatch/mod.rs:1519) — removed the floor + added the now-live
+  `if mtu==0 return false` guard; (2) the TX local-owner fast-path builder
+  segment_forwarded_tcp_frames_into_prepared (tx/tcp_segmentation.rs:30) —
+  removed the floor (mtu==0 guard already present); (3) the copy-path twin
+  segment_forwarded_tcp_frames_from_frame plain branch (frame/tcp_segmentation.rs)
+  — removed the floor (mtu==0 guard already present; the tunnel branch already
+  had no floor). DF and is_any_fragment handling untouched (segmentation
+  preserves DF per-segment; fragments still never segmented). IPv6-minimum floor
+  belongs at interface config, not the per-packet segmenter. Added 3 fail-on-
+  revert tests: copy-builder (egress MTU 900, ~1100 L3 non-DF TCP -> >=2 segments
+  each <=900) — target-count-1 gate for the frame/ floor; predicate sub-1280
+  admission test; predicate unknown-MTU (mtu==0 -> no flag) guard test. Updated
+  tx/README.md. Full release suite 3999 passed / 0 failed. Fail-on-revert:
+  restoring the copy-builder floor -> only the copy-builder test RED (target-
+  count 1, verified); restoring the predicate floor+guard -> 2 predicate tests
+  RED.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/tx/tcp_segmentation.rs,
+  userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
+  userspace-dp/src/afxdp/frame/tests_segment_tcp.rs,
+  userspace-dp/src/afxdp/tx/dispatch/tests/segmentation.rs,
+  userspace-dp/src/afxdp/tx/README.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5159 follow-up — close the last coverage seam by binding the TX
+  local-owner FAST-PATH builder (segment_forwarded_tcp_frames_into_prepared,
+  tx/tcp_segmentation.rs) with its own fail-on-revert test. Previously only the
+  copy-path twin + predicate were bound; the TX builder (the primary production
+  path) tripped 0 tests on revert, so a future twin-divergence could silently
+  re-floor the common path. Added
+  segment_forwarded_tcp_frames_into_prepared_honors_sub_1280_ipv4_egress_mtu_5159
+  (tx/dispatch/tests/segmentation.rs): drives the builder via a
+  BindingWorker::new_for_mirror_test with a 900-byte egress MTU + a non-DF IPv4
+  TCP datagram of L3 length 1100; asserts >=2 prepared TX segments each with L3
+  <= 900 (via the returned (segments,_,max_frame) tuple + per-req.len check on
+  pending_tx_prepared). Restoring `.max(1280)` at tx/tcp_segmentation.rs ALONE
+  turns ONLY this test RED (target-count 1, verified: 20 passed; 1 failed). All
+  three floor sites now have a target-count-1 gate. Full release suite 4000
+  passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/tests/segmentation.rs
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5159 review nit (rev6101, team-lead-verified) — corrected the
+  PLAIN-branch mtu==0 comment in frame/tcp_segmentation.rs. It said "fails closed
+  via the mtu==0 guard", but for a plain (non-tunnel) forward mtu==0 → builder
+  returns None → the frame is forwarded WHOLE (best-effort / fail-OPEN), NOT
+  dropped. Rewrote to state that accurately and contrast it with the TUNNEL
+  branch's genuine fail-CLOSED (un-encapsulable → drop). Comment-only; the
+  tunnel-branch fail-closed comments (:32/:36/:443) and the tx/dispatch plain
+  comments (already "forward unchanged") are untouched.
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs
 - **Action**: #5164 — rescope the WireGuard NoSession handshake-request and
   rekey worker→control edges from engine-GLOBAL AtomicBools to PER-PEER. The
   engine held global `handshake_request_pending`/`handshake_request_last_ns`/
