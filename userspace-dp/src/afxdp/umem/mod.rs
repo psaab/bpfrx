@@ -1007,6 +1007,17 @@ impl BindingLiveState {
             // invariant holds at `new()` (both 0). #5160: the redirect-sample
             // sequence is a producer-local thread-local (`REDIRECT_SAMPLE_SEQ`),
             // no longer a per-binding atomic, so there is nothing to seed here.
+            // This drops the removed `new_seeded(worker_id)` phase-offset: each
+            // worker thread's TLS starts at 0, so every worker's FIRST redirect
+            // (v=0) is force-sampled. The "early-startup lockstep burst" that seed
+            // mitigated is REINTRODUCED, but moved from per-destination to
+            // per-thread — a one-time ~worker-count burst spread across all
+            // destinations (a thread with v>0 does NOT force-sample its first op
+            // to a new destination), not a chronic per-destination bias. Accepted,
+            // not mitigated: `redirect_acquire_hist` is a latency-DISTRIBUTION
+            // (percentile) histogram, so a bounded one-time startup sample burst
+            // does not skew its quantiles; redirect rate/count use separate pps
+            // counters.
             owner_profile_owner: OwnerProfileOwnerWrites::new(),
             owner_profile_peer: OwnerProfilePeerWrites::new(),
             direct_tx_packets: AtomicU64::new(0),

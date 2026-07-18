@@ -334,6 +334,140 @@ fn flowless_non_first_fragment_transit_permitted_by_any_policy_3291() {
 }
 
 
+/// eth(14) + IPv4(20, proto=UDP) + UDP(8). `frag_off` carries the IPv4
+/// flags+offset word (0x2000 => MF, offset 0 == first fragment; 0x0001 =>
+/// offset 1 == non-first). `id` is the 16-bit IPv4 Identification shared by
+/// every fragment of one datagram. src 10.0.61.100 (lan) -> dst 172.16.80.200
+/// (wan), matching `frag_transit_wan_neighbor`.
+fn udp_frag_frame_5689(frag_off: u16, id: u16) -> Vec<u8> {
+    let mut f = vec![
+        0x02, 0xbf, 0x72, 0x00, 0x80, 0x08, 0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5, 0x08, 0x00,
+    ];
+    // For a first fragment the 8 bytes at l4 are a real UDP header (sport
+    // 33333, dport 443); for a non-first fragment they are payload (never read
+    // as ports — the fragment is flowless per #2344).
+    let udp = [0x82, 0x35, 0x01, 0xbb, 0x00, 0x08, 0x00, 0x00];
+    let mut ip = vec![0u8; 20];
+    ip[0] = 0x45;
+    let total = (20 + udp.len()) as u16;
+    ip[2..4].copy_from_slice(&total.to_be_bytes());
+    ip[4..6].copy_from_slice(&id.to_be_bytes());
+    ip[6..8].copy_from_slice(&frag_off.to_be_bytes());
+    ip[8] = 64; // ttl
+    ip[9] = PROTO_UDP;
+    ip[12..16].copy_from_slice(&[10, 0, 61, 100]); // src (lan)
+    ip[16..20].copy_from_slice(&[172, 16, 80, 200]); // dst (wan)
+    f.extend_from_slice(&ip);
+    f.extend_from_slice(&udp);
+    f
+}
+
+fn udp_frag_meta_5689() -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 24, // reth1.0 (lan)
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        pkt_len: 42,
+        l3_offset: 14,
+        l4_offset: 34,
+        flow_src_port: 33333,
+        flow_dst_port: 443,
+        flow_src_addr: [10, 0, 61, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        flow_dst_addr: [172, 16, 80, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+
+#[test]
+fn flowless_non_first_fragment_inherits_ordinary_snat_translation_5689() {
+    // #5689: a non-first fragment of an ORDINARY-NAT (interface SNAT lan->wan)
+    // flow must inherit the first fragment's translation on the flowless arm
+    // (address-only L3 rewrite) instead of being forwarded UNTRANSLATED. Before
+    // this fix only NAT64 had a fragment association; an ordinary-NAT/NPT
+    // non-first fragment resolved `NatDecision::default()` and leaked out with
+    // the untranslated internal source.
+    //
+    // The FIRST fragment (offset 0, MF=1) runs the full cold path: it is
+    // permitted, interface-SNAT'd to the wan interface IP (172.16.80.8), a
+    // session is installed, AND the ordinary-NAT fragment association is
+    // installed. The NON-first fragment (offset 1, same IPv4 id) is flowless;
+    // the flowless arm consults the association and inherits the SNAT decision.
+    //
+    // RED-on-revert: reverting the install (cold-path) OR the flowless consult
+    // makes the non-first fragment resolve `NatDecision::default()` ->
+    // `nat_applied_none == 1`, `nat_applied_snat == 0` (forwarded untranslated).
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.default_policy = "permit".to_string();
+    snapshot.policies.clear();
+    snapshot.neighbors = vec![frag_transit_wan_neighbor()];
+    snapshot.source_nat_rules = vec![SourceNATRuleSnapshot {
+        name: "snat-lan-wan".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        ..Default::default()
+    }];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    let ha_state = BTreeMap::new();
+
+    // (1) FIRST fragment: MF=1, offset 0, id 0xbeef. Seeds the session, applies
+    //     interface SNAT, and installs the ordinary-NAT fragment association.
+    let first = udp_frag_frame_5689(0x2000, 0xbeef);
+    let (_b1, dbg1) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &first,
+        udp_frag_meta_5689(),
+    );
+    assert_eq!(
+        dbg1.nat_applied_snat, 1,
+        "#5689: the SNAT'd first fragment must translate (source -> wan IP)"
+    );
+    assert_eq!(
+        forwarding.nat64.frag_assoc.len(),
+        1,
+        "#5689: the first fragment must install exactly one ordinary-NAT association"
+    );
+
+    // (2) NON-first fragment: offset 1, SAME id 0xbeef -> flowless -> consult
+    //     the association installed above and inherit the SNAT translation.
+    let non_first = udp_frag_frame_5689(0x0001, 0xbeef);
+    let (_b2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &non_first,
+        udp_frag_meta_5689(),
+    );
+    assert_eq!(
+        dbg2.forward, 1,
+        "#5689: the non-first fragment must forward"
+    );
+    assert_eq!(
+        dbg2.nat_applied_snat, 1,
+        "#5689: the non-first fragment must INHERIT the SNAT translation (RED on revert)"
+    );
+    assert_eq!(
+        dbg2.nat_applied_none, 0,
+        "#5689: the non-first fragment must NOT be forwarded untranslated"
+    );
+}
+
+
 #[test]
 fn flowless_non_first_fragment_dropped_by_is_fragment_input_filter_3291() {
     // Interface input filter `from is-fragment then discard` on the ingress

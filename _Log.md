@@ -38,6 +38,53 @@
   measurable in a line-rate cluster smoke; the issue's suggested 2/4/8-producer
   criterion microbench is a reasonable follow-up but not a merge gate.
 
+## 2026-07-18 — #5689 (dataplane/nat): ordinary NAT/NPTv6 non-first fragment translation
+- **Timestamp**: 2026-07-18 (fix/5689-nat-frag-assoc)
+- **Action**: A flowless non-first fragment of an ORDINARY same-family NAT /
+  NPTv6 flow resolved `NatDecision::default()` on the flowless arm of
+  `afxdp/poll_descriptor/mod.rs` and was forwarded UNTRANSLATED — leaking the
+  internal source (SNAT/NPTv6) or the pre-DNAT destination. Only NAT64 had a
+  fragment association (`Nat64FragAssoc`, #2562). Fix mirrors that precedent
+  for ordinary NAT: the `Nat64FragAssoc` cache is already generic (family-
+  agnostic port-free key + full `SessionDecision` value), so a first fragment
+  of a SNAT/DNAT/static-NAT/NPTv6 flow now installs an association at the cold-
+  path forward-commit point (`nat_install_forward_fragment_assoc`, gated on a
+  same-family address rewrite + ForwardCandidate + resolved neighbor + a
+  first-fragment key), and its non-first fragments consult it on the flowless
+  arm (`nat_consult_forward_fragment_assoc`, chained after the NAT64 consult,
+  for BOTH IPv4 and IPv6). A hit inherits the first fragment's permitted verdict
+  + egress and the existing forward-build path applies an ADDRESS-ONLY L3
+  rewrite (`apply_nat_ipv4`/`apply_nat_ipv6` already skip the L4 checksum + port
+  rewrite for a non-first fragment, #1852). The cached decision's `nat64` flag
+  keeps NAT64 and ordinary entries from aliasing; the shared `build_generation`
+  guard (advances on every `snapshot.generation` commit) invalidates a stale
+  ordinary-NAT association after a SNAT/DNAT rule change. Forward-only, matching
+  the NAT64 forward-first wiring (reverse-reply is a deferred increment). No new
+  cache type, state machinery, or NAT-decision-path changes — it reuses the
+  existing generic cache. IMPORTANT ASYMMETRY (not a "mechanical mirror" on the
+  miss path): a consult MISS (reorder / TTL straddle / eviction / generation bump
+  / first-fragment-didn't-forward) forwards the permitted NAT'd non-first fragment
+  UNTRANSLATED — the leak PERSISTS on those edges, fail-OPEN, the OPPOSITE of the
+  NAT64 sibling's fail-CLOSED no-association drop (#4617). Deliberate: the flowless
+  arm cannot distinguish a NAT'd-miss from a legitimate no-NAT fragmented flow, so
+  a blind drop would blackhole ordinary un-NAT'd fragmented traffic. Strictly
+  narrows the pre-existing leak (not a regression); the flowless miss path still
+  runs policy (a denied flow's fragments still drop — the residual is a
+  permitted-flow source info-leak only). A fail-closed miss (needs a NAT'd-miss
+  discriminator) is a tracked follow-up (#6122; see the
+  `nat_consult_forward_fragment_assoc` doc-comment).
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs (two helpers +
+  flowless consult wiring + cold-path install), userspace-dp/src/afxdp/tests_fragment.rs
+  (fail-on-revert test), userspace-dp/src/FEATURES.md (nat64.rs #5689 note).
+- **Validation**: `cargo build` clean; `cargo test --bin xpf-userspace-dp
+  fragment` (133) + `nat64` (179) GREEN; new
+  `flowless_non_first_fragment_inherits_ordinary_snat_translation_5689` 5x
+  no-flake. Fail-on-revert proven both ways: neutralizing the CONSULT wiring →
+  RED (non-first fragment resolves `nat_applied_none`, not `nat_applied_snat`);
+  neutralizing the INSTALL wiring → RED (`frag_assoc.len() != 1`). Two
+  pre-existing failures on the branch base (`protocol::wire_invariant_default_specimens`
+  = stale fixture missing #5623/#5625 fields; `event_stream backpressure
+  end-to-end`) confirmed present with my changes stashed — not caused by #5689.
 ## 2026-07-18 — #5174: NAT64 MissingNeighbor cold path fail-closed (bounded fix)
 
 - **Timestamp**: 2026-07-18 (fix/5174-nat64-missingneighbor)
