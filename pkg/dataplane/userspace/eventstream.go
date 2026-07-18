@@ -95,25 +95,42 @@ type EventStream struct {
 	FramesWritten atomic.Uint64
 	DecodeErrors  atomic.Uint64
 	SeqGaps       atomic.Uint64
-	// SessionSyncResyncs counts how many times a sequence gap on a
-	// correctness-critical session-sync frame (open/close/update) forced a
-	// full bulk re-export + reconnect (#2874). Distinct from SeqGaps, which
-	// also counts benign gaps on telemetry frames (which do NOT force a
-	// resync). A growing value means the helper's lossy producer is dropping
-	// session deltas under channel backpressure.
-	SessionSyncResyncs  atomic.Uint64
-	PolicyDenyEvents    atomic.Uint64
-	ScreenDropEvents    atomic.Uint64
-	ScreenAlarmEvents   atomic.Uint64 // screen event with action=PERMIT (#2298)
-	FilterLogEvents     atomic.Uint64
-	SessionCloseEvents  atomic.Uint64 // #2460: RT_FLOW SESSION_CLOSE frames
-	SessionCreateEvents atomic.Uint64 // #2508: RT_FLOW SESSION_CREATE frames
-	PolicyDenyDrops     atomic.Uint64
-	ScreenDropDrops     atomic.Uint64
-	FilterLogDrops      atomic.Uint64
-	SessionCloseDrops   atomic.Uint64 // #2460
-	SessionCreateDrops  atomic.Uint64 // #2508
-	UnknownFrameDrops   atomic.Uint64
+	// SessionSyncResyncs counts how many times a full bulk re-export was forced
+	// by a correctness-critical session-sync frame (open/close/update): either a
+	// sequence gap (#2874) or a COMPLETE-but-undecodable frame (#5483/#6130).
+	// Distinct from SeqGaps, which also counts benign gaps on telemetry frames
+	// (which do NOT force a resync). A growing value means the helper's lossy
+	// producer is dropping session deltas under channel backpressure, or its
+	// encoder is emitting frames this daemon cannot decode (a codec bug /
+	// version-skewed helper).
+	SessionSyncResyncs atomic.Uint64
+	// DecodeResyncSuppressed counts undecodable SESSION frames whose watermark
+	// was advanced past (loop-break, #6130) but whose full-resync trigger was
+	// rate-limited (a prior decode-failure resync fired within
+	// decodeFailureResyncInterval). A large value alongside SessionSyncResyncs
+	// staying small is the signature of a PERSISTENTLY-undecodable stream that
+	// the rate-limiter is throttling — the resync/reconnect loop the naive
+	// #5483 fix would have produced, now bounded.
+	DecodeResyncSuppressed atomic.Uint64
+	// lastDecodeResyncNanos is the wall-clock nanosecond timestamp of the last
+	// FIRED decode-failure resync. It rate-limits both the onFullResync trigger
+	// (shared control socket — must not be hammered, per CLAUDE.md) and the WARN
+	// log so a persistently-undecodable stream cannot flood either. The watermark
+	// advance in handleSessionDecodeFailure is NOT gated by it — advancing on
+	// every undecodable frame is what breaks the loop (#6130).
+	lastDecodeResyncNanos atomic.Int64
+	PolicyDenyEvents      atomic.Uint64
+	ScreenDropEvents      atomic.Uint64
+	ScreenAlarmEvents     atomic.Uint64 // screen event with action=PERMIT (#2298)
+	FilterLogEvents       atomic.Uint64
+	SessionCloseEvents    atomic.Uint64 // #2460: RT_FLOW SESSION_CLOSE frames
+	SessionCreateEvents   atomic.Uint64 // #2508: RT_FLOW SESSION_CREATE frames
+	PolicyDenyDrops       atomic.Uint64
+	ScreenDropDrops       atomic.Uint64
+	FilterLogDrops        atomic.Uint64
+	SessionCloseDrops     atomic.Uint64 // #2460
+	SessionCreateDrops    atomic.Uint64 // #2508
+	UnknownFrameDrops     atomic.Uint64
 }
 
 // NewEventStream creates an EventStream for the given Unix socket path.
@@ -395,23 +412,24 @@ func (es *EventStream) LastAckedSequence() uint64 {
 
 func (es *EventStream) Status() EventStreamStatus {
 	return EventStreamStatus{
-		FramesRead:          es.FramesRead.Load(),
-		FramesWritten:       es.FramesWritten.Load(),
-		DecodeErrors:        es.DecodeErrors.Load(),
-		SeqGaps:             es.SeqGaps.Load(),
-		SessionSyncResyncs:  es.SessionSyncResyncs.Load(),
-		PolicyDenyEvents:    es.PolicyDenyEvents.Load(),
-		ScreenDropEvents:    es.ScreenDropEvents.Load(),
-		ScreenAlarmEvents:   es.ScreenAlarmEvents.Load(),
-		FilterLogEvents:     es.FilterLogEvents.Load(),
-		SessionCloseEvents:  es.SessionCloseEvents.Load(),
-		SessionCreateEvents: es.SessionCreateEvents.Load(),
-		PolicyDenyDrops:     es.PolicyDenyDrops.Load(),
-		ScreenDropDrops:     es.ScreenDropDrops.Load(),
-		FilterLogDrops:      es.FilterLogDrops.Load(),
-		SessionCloseDrops:   es.SessionCloseDrops.Load(),
-		SessionCreateDrops:  es.SessionCreateDrops.Load(),
-		UnknownFrameDrops:   es.UnknownFrameDrops.Load(),
+		FramesRead:             es.FramesRead.Load(),
+		FramesWritten:          es.FramesWritten.Load(),
+		DecodeErrors:           es.DecodeErrors.Load(),
+		SeqGaps:                es.SeqGaps.Load(),
+		SessionSyncResyncs:     es.SessionSyncResyncs.Load(),
+		DecodeResyncSuppressed: es.DecodeResyncSuppressed.Load(),
+		PolicyDenyEvents:       es.PolicyDenyEvents.Load(),
+		ScreenDropEvents:       es.ScreenDropEvents.Load(),
+		ScreenAlarmEvents:      es.ScreenAlarmEvents.Load(),
+		FilterLogEvents:        es.FilterLogEvents.Load(),
+		SessionCloseEvents:     es.SessionCloseEvents.Load(),
+		SessionCreateEvents:    es.SessionCreateEvents.Load(),
+		PolicyDenyDrops:        es.PolicyDenyDrops.Load(),
+		ScreenDropDrops:        es.ScreenDropDrops.Load(),
+		FilterLogDrops:         es.FilterLogDrops.Load(),
+		SessionCloseDrops:      es.SessionCloseDrops.Load(),
+		SessionCreateDrops:     es.SessionCreateDrops.Load(),
+		UnknownFrameDrops:      es.UnknownFrameDrops.Load(),
 	}
 }
 
@@ -535,16 +553,14 @@ func (es *EventStream) readLoop(ctx context.Context) {
 		case EventTypeSessionOpen, EventTypeSessionUpdate:
 			delta, ok := decodeSessionEvent(payload)
 			if !ok {
-				// #5483: a COMPLETE but semantically undecodable session-sync
-				// frame is a HARD sync break, exactly like a #2874 sequence gap
-				// — it carries session state the standby needs. Skipping it with
-				// `continue` (the pre-#5483 bug) would let a later telemetry
-				// frame advance the cumulative ACK past this seq, trimming the
-				// helper's replay buffer over the unapplied session state and
-				// silently diverging the standby. Force a full resync instead;
-				// do NOT advance prevSeq/lastAppliedSeq/ACK past the hole.
-				es.handleSessionDecodeFailure(seq)
-				return
+				// #5483/#6130: a COMPLETE but semantically undecodable
+				// session-sync frame carries session state the standby needs,
+				// so it forces a full resync — but UNLIKE a #2874 gap the frame
+				// is PRESENT on the wire, so the watermark is advanced past it
+				// (loop-break) and the connection kept alive. See
+				// handleSessionDecodeFailure.
+				es.handleSessionDecodeFailure(seq, &prevSeq)
+				continue
 			}
 			if typ == EventTypeSessionOpen {
 				delta.Event = "open"
@@ -571,11 +587,11 @@ func (es *EventStream) readLoop(ctx context.Context) {
 		case EventTypeSessionClose:
 			delta, ok := decodeSessionCloseEvent(payload)
 			if !ok {
-				// #5483: see the SessionOpen/Update case — an undecodable
-				// session CLOSE frame forces a resync rather than silently
-				// dropping the close and ACKing past it.
-				es.handleSessionDecodeFailure(seq)
-				return
+				// #5483/#6130: see the SessionOpen/Update case — an undecodable
+				// session CLOSE frame forces a resync and advances the watermark
+				// past the present-but-undecodable frame (loop-break).
+				es.handleSessionDecodeFailure(seq, &prevSeq)
+				continue
 			}
 			delta.Event = "close"
 			// #2874: see the SessionOpen/Update case — a session-sync gap forces
@@ -708,47 +724,107 @@ func (es *EventStream) handleSessionSyncGap(expected, got uint64) {
 	}
 }
 
+// decodeFailureResyncInterval rate-limits BOTH the full-resync trigger and the
+// WARN log emitted for a run of COMPLETE-but-undecodable SESSION frames. Under a
+// persistent codec bug / version-skewed helper EVERY session frame is
+// undecodable, so an un-throttled per-frame onFullResync would hammer the shared
+// control socket (which CLAUDE.md forbids at >1/s) and flood the log. Kept
+// comfortably above 1s. The watermark advance is NOT throttled by this.
+const decodeFailureResyncInterval = 2 * time.Second
+
 // handleSessionDecodeFailure responds to a COMPLETE but semantically
 // undecodable session-sync frame (open/close/update) at seq — the #5483 HA
-// data-loss fix. It reuses the #2874 gap sync-break mechanics for a decode
-// rejection of a PRESENT frame.
+// data-loss fix, corrected for the #6130 resync/reconnect loop.
 //
 // A session frame whose length prefix was read in full but that the typed
 // decoder rejects (short/malformed payload, unknown address family) still
 // carries session state the standby needs. The pre-#5483 code skipped it with
-// `es.DecodeErrors.Add(1); continue`, leaving prevSeq/lastAppliedSeq at the
-// contiguous sequence BELOW the hole. A subsequent lossy TELEMETRY frame at
-// seq+1 would then merely record a benign gap, mark itself applied, and let
-// sendAckIfNeeded advance the cumulative ACK PAST this undecodable session seq.
-// The Rust replay buffer (userspace-dp/src/event_stream/mod.rs) trims through
-// the ACK watermark, discarding the never-applied session frame — and because
-// the telemetry frame already advanced prevSeq, no later session frame trips
-// the gap check, so the standby silently diverges with no path to recovery.
+// `es.DecodeErrors.Add(1); continue`, leaving prevSeq/lastAppliedSeq BELOW the
+// hole; a subsequent lossy TELEMETRY frame then advanced the cumulative ACK
+// PAST the undecodable session seq, the Rust replay buffer trimmed the
+// never-applied frame, and the standby silently diverged.
 //
-// This is exactly the divergence handleSessionSyncGap prevents for a producer-
-// DROPPED delta, so the response is identical: bump SessionSyncResyncs, force a
-// full bulk re-export (onFullResync → handleEventStreamFullResync), and return
-// so the reader drops the connection. prevSeq/lastAppliedSeq are NOT advanced
-// past seq, so the cumulative ACK can never move past the undecodable session
-// frame; on reconnect the helper replays from the last CONTIGUOUS ack and the
-// resync re-derives a complete session snapshot from table truth.
+// #5483 (b9cb3eb34) closed that by forcing a resync and NOT advancing the
+// watermark — but that WEDGED the stream on a PERSISTENTLY-undecodable frame.
+// The frame is PRESENT on the wire, not a #2874 gap: the Rust replay buffer
+// (userspace-dp/src/event_stream/mod.rs) stores encoded frames and re-sends
+// them VERBATIM. `replay_buffered` only parks a re-baselining FullResync barrier
+// when a seq is ABSENT (`has_gap` == oldest_buffered > acked+1); a
+// present-but-undecodable frame has NO such backstop. So withholding the ACK
+// made the helper re-send the same frame on every reconnect: reconnect → replay
+// N → decode fail → resync → drop → reconnect, an unbounded busy-loop hammering
+// the control socket and flooding the log (worst case on a STANDBY, whose
+// onFullResync is a corrective no-op — pure churn).
+//
+// #6130 breaks the loop by ADVANCING the watermark PAST the undecodable frame
+// (markFrameApplied + prevSeq), unconditionally, on every undecodable frame.
+// sendAckIfNeeded then ACKs past seq, the helper trims it (`front.seq <=
+// acked`), and it is NEVER re-sent. The connection is KEPT (the caller
+// `continue`s, mirroring the helper-initiated FullResync path #5362) because
+// there is nothing to replay.
+//
+// Anti-divergence — why advancing past seq does NOT reintroduce the #5483 bug:
+// we advance ONLY as part of triggering a FullResync that re-baselines the peer
+// from TABLE TRUTH (onFullResync → handleEventStreamFullResync →
+// ExportOwnerRGSessions, an UNBOUNDED ground-truth snapshot). For an undecodable
+// OPEN the session is still in the helper's table, so the snapshot re-derives it
+// — a strict superset of the lost frame's state. For an undecodable CLOSE the
+// export cannot convey a delete (docs/session-sync-architecture.md #2880), so it
+// degrades to the pre-existing "missed close → idle-GC self-heal" bounded
+// staleness — NOT a permanent divergence. This is fundamentally unlike the
+// pre-#5483 silent skip, which advanced past seq with NO resync at all.
+//
+// The resync trigger + log are RATE-LIMITED (decodeFailureResyncInterval). A
+// single bad frame fires exactly one resync (the realistic non-catastrophic
+// case). A persistent-skew stream fires at most one resync per interval and
+// counts the rest in DecodeResyncSuppressed; each fired resync is a full
+// snapshot, so the peer is re-baselined at ≤1 interval of staleness. A
+// suppressed frame's session, if still live, is re-derived by the next fired
+// resync (or its own subsequent decodable UPDATE, treated as an open). The fire
+// is best-effort: the watermark advances even if onFullResync returns false or
+// there is no callback, because breaking the loop is the hard guarantee and the
+// periodic sweep reconcile + reconnect bulk sync are independent resync
+// backstops.
+//
+// STANDBY: handleEventStreamFullResync early-returns "not primary" (a cheap
+// no-op — it never reaches the control socket), so a standby that reads an
+// undecodable session frame from its OWN helper still advances + rate-limits
+// here and cannot spin. Advancing is divergence-safe on a standby anyway: a
+// decoded session delta is itself a no-op there (handleEventStreamDelta drops it
+// for a non-primary), so nothing is lost by skipping the undecodable one.
 //
 // Scope: SESSION frames ONLY. A decode failure on a lossy TELEMETRY/stats frame
-// stays tolerable to skip (DecodeErrors + drop-counter + markDroppedFrameApplied,
-// which advances the watermark) — the existing severity model. Telemetry is
-// best-effort and carries no HA session state, so skipping one cannot diverge
-// the standby.
-func (es *EventStream) handleSessionDecodeFailure(seq uint64) {
+// stays tolerable to skip (DecodeErrors + drop-counter + markDroppedFrameApplied)
+// — telemetry carries no HA session state.
+func (es *EventStream) handleSessionDecodeFailure(seq uint64, prevSeq *uint64) {
 	es.DecodeErrors.Add(1)
-	es.SessionSyncResyncs.Add(1)
-	slog.Warn("event stream: undecodable session-sync frame; forcing full resync",
-		"seq", seq, "last_applied", es.lastAppliedSeq.Load())
-	es.callbackMu.RLock()
-	onFullResync := es.onFullResync
-	es.callbackMu.RUnlock()
-	if onFullResync != nil {
-		onFullResync()
+
+	// Rate-limited resync trigger + WARN. Fire BEFORE advancing the watermark so
+	// the table-truth snapshot is triggered while lastAppliedSeq still sits below
+	// the hole — the ACK only moves past seq after this returns.
+	nowNanos := time.Now().UnixNano()
+	last := es.lastDecodeResyncNanos.Load()
+	if last == 0 || nowNanos-last >= int64(decodeFailureResyncInterval) {
+		es.lastDecodeResyncNanos.Store(nowNanos)
+		es.SessionSyncResyncs.Add(1)
+		slog.Warn("event stream: undecodable session-sync frame; forcing rate-limited full resync",
+			"seq", seq, "last_applied", es.lastAppliedSeq.Load())
+		es.callbackMu.RLock()
+		onFullResync := es.onFullResync
+		es.callbackMu.RUnlock()
+		if onFullResync != nil {
+			onFullResync()
+		}
+	} else {
+		es.DecodeResyncSuppressed.Add(1)
 	}
+
+	// Loop-break (#6130): advance PAST the present-but-undecodable frame
+	// unconditionally so the cumulative ACK trims it from the helper's replay
+	// buffer and it is never re-sent.
+	*prevSeq = seq
+	es.lastRecvSeq.Store(seq)
+	es.markFrameApplied(seq)
 }
 
 func (es *EventStream) backoffCallbackNotReady(ctx context.Context) {
