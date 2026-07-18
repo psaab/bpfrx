@@ -52399,3 +52399,31 @@ top.
   bytes change → no cluster smoke required (#5611 exemption).
 - **File(s)**: userspace-dp/src/nptv6.rs, userspace-dp/src/nptv6_tests.rs,
   _Log.md
+
+## 2026-07-18 — #6046 TE/PTB per-zone bucket doc/comment accuracy (doc-only)
+- **Timestamp**: 2026-07-18
+- **Action**: Corrected the #5856 per-zone ICMP TE/PTB bucket docs + comments,
+  which OVERCLAIMED per-VLAN-subinterface granularity. Verified firsthand that
+  the TE/PTB generators key the per-zone bucket on the PHYSICAL ingress bind
+  ifindex (`ingress_ident.ifindex`, the fixed per-binding socket-bind port) via
+  `ifindex_to_zone_id` WITHOUT calling `resolve_ingress_logical_ifindex`, so VLAN
+  sub-interfaces on the same physical port SHARE that port's TE/PTB bucket. Only
+  the Reject path resolves the LOGICAL unit (`logical_ingress_ifindex`) and thus
+  gets per-sub-interface granularity. Kept the correct framing: the per-zone split
+  is still correct and strictly better than the pre-#5856 single global bucket.
+- **Evidence** (all origin/master @ cdd26a5): TE bucket keys physical at
+  `icmp.rs:231-235` (`ifindex_to_zone_id.get(&ingress_ident.ifindex)`, no
+  resolve); PTB bucket keys physical at `tx/dispatch/mod.rs:277-281`;
+  `ingress_ident` = `worker_ctx.ident` = `binding.identity()` = physical
+  socket-bind ifindex (`worker/mod.rs:855-863`, `641`; `lifecycle.rs:170-172`;
+  `bringup.rs:66-72`). Reject resolves logical at
+  `poll_descriptor/reject_reply.rs:272-274` then keys the bucket on it at
+  `:398-402`; reject is invoked with the physical `binding.ifindex`
+  (`poll_descriptor/mod.rs:1280`). `ifindex_to_zone_id` is keyed by the LOGICAL
+  `iface.ifindex`, physical parent inherits only the FIRST sub-if's zone
+  (`forwarding_build/interfaces.rs:81-91`).
+- **Change**: comment/doc-only — NO code logic touched. `cargo build` clean;
+  `git diff` shows only `//` comment hunks in the two .rs files + the .md.
+- **File(s)**: docs/generated-reply-rate-limit.md,
+  userspace-dp/src/afxdp/icmp.rs, userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  _Log.md

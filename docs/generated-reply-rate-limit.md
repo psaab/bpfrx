@@ -54,13 +54,25 @@ key was an API omission, not absence of attribution). All three reasons now use
   validated zone set as `zone_id_to_name`. Cardinality = configured zones (the Go
   control plane caps distinct zones at `MaxUsableZoneID = 65533`), so it is
   config-bounded, never attacker-growable.
-- At each generator call site the ingress **from-zone** is resolved from the
-  LOGICAL ingress unit ifindex via `ifindex_to_zone_id` (the same SSOT the reply
-  build and output classify key off, so a VLAN sub-interface keys its own zone's
-  bucket, and a non-VLAN port resolves identically through the parent mapping):
-  - Reject — `poll_descriptor::reject_reply::enqueue_reject_reply` (`logical_ingress_ifindex`).
-  - TimeExceeded — `icmp::build_local_time_exceeded_request` (`ingress_ident.ifindex`).
-  - PacketTooBig — the TX dispatch PTB path (`ingress_ident.ifindex`).
+- At each generator call site the ingress **from-zone** is resolved via
+  `ifindex_to_zone_id`, but the two paths key that map by DIFFERENT ifindexes, so
+  their per-zone granularity differs:
+  - Reject — `poll_descriptor::reject_reply::enqueue_reject_reply` resolves the
+    LOGICAL ingress unit ifindex first (`resolve_ingress_logical_ifindex` →
+    `logical_ingress_ifindex`, the same SSOT the reply build and output classify
+    key off), so a VLAN sub-interface keys its OWN zone's bucket and a non-VLAN
+    port resolves identically.
+  - TimeExceeded (`icmp::build_local_time_exceeded_request`) and PacketTooBig
+    (the TX dispatch PTB path) key on the PHYSICAL ingress bind ifindex
+    (`ingress_ident.ifindex`, the fixed per-binding socket-bind port) WITHOUT
+    resolving the logical unit. For an untagged port physical == logical, so the
+    zone is exact; but VLAN sub-interfaces on the same physical port all resolve
+    through that port's `ifindex_to_zone_id` entry (the physical parent inherits
+    its FIRST sub-interface's zone — `forwarding_build/interfaces.rs`), so they
+    SHARE the physical port's TE/PTB bucket rather than getting a per-sub-interface
+    one. This is still correct and strictly better than the pre-#5856 single
+    global bucket (distinct physical ingress ports no longer starve each other);
+    it is simply coarser than the Reject path's per-logical-unit granularity.
 - An unzoned (id 0) or otherwise-unknown from-zone falls back to the reason's
   process-global `{REJECT,TIME_EXCEEDED,PACKET_TOO_BIG}_FALLBACK_BUCKET` — a real
   bucket, so the gate is **never fail-open** and never panics on a missing key.

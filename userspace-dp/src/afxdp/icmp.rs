@@ -211,13 +211,21 @@ pub(super) fn build_local_time_exceeded_request(
     // `TimeExceeded` rate-limited counter (inside the gate).
     //
     // #5856: the bucket is now PER INGRESS (from) ZONE, not a single global one
-    // — resolved from the LOGICAL ingress unit ifindex (`ingress_ident.ifindex`,
-    // the same SSOT the v4/v6 reply build + #3026 output-classify key off) via
-    // `ifindex_to_zone_id`, exactly as the #3618 reject path does. Before #5856
-    // one shared global TE bucket let a low-TTL flood ingressing ONE zone drain
-    // it and suppress legitimate traceroute for EVERY other zone. An unzoned /
-    // unknown ingress interface (id 0) falls back to the shared
-    // `TIME_EXCEEDED_FALLBACK_BUCKET` (never fail-open).
+    // — resolved from the PHYSICAL ingress bind ifindex (`ingress_ident.ifindex`,
+    // the fixed per-binding socket-bind port, the same value the v4/v6 reply
+    // build + #3026 output-classify pass) via `ifindex_to_zone_id`. Unlike the
+    // #3618 reject path, this site does NOT call `resolve_ingress_logical_ifindex`:
+    // a VLAN sub-interface resolves through its physical parent's
+    // `ifindex_to_zone_id` entry (the parent inherits its first sub-interface's
+    // zone), so VLAN sub-interfaces on the same physical port SHARE that port's
+    // TE bucket rather than getting a per-sub-interface one. For an untagged port
+    // physical == logical, so the zone is exact. Before #5856 one shared global TE
+    // bucket let a low-TTL flood ingressing ONE physical port drain it and
+    // suppress legitimate traceroute for EVERY other port/zone; the per-zone split
+    // is still correct and strictly better (distinct physical ingress ports no
+    // longer starve each other), just coarser than the reject path's
+    // per-logical-unit granularity. An unzoned / unknown ingress interface (id 0)
+    // falls back to the shared `TIME_EXCEEDED_FALLBACK_BUCKET` (never fail-open).
     //
     // #5567: the token was previously consumed BEFORE the egress lookup + build.
     // A flood of reply-eligible-but-UNBUILDABLE triggers on one interface
