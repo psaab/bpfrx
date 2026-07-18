@@ -9,9 +9,9 @@
 // predicates.
 
 use super::helpers::{
-    bindings_settled, build_synced_session_entry, forwarding_unsupported_error,
-    parse_session_sync_mac, reconcile_status_bindings, set_bindings_forwarding_armed,
-    should_run_afxdp,
+    bindings_settled, build_synced_session_entry, clear_pre_persist_lock_probe,
+    forwarding_unsupported_error, parse_session_sync_mac, reconcile_status_bindings,
+    set_bindings_forwarding_armed, should_run_afxdp, take_pre_persist_lock_free, write_state,
 };
 use super::{handle_stream, ServerState};
 use crate::state_writer::StateWriter;
@@ -2334,6 +2334,29 @@ fn update_fabrics_unchanged_set_does_not_rewrite_state_file() {
     assert_eq!(
         before, after,
         "an unchanged update_fabrics must not rewrite the state file"
+    );
+    let _ = std::fs::remove_file(&state_file);
+}
+
+/// #5469 fail-on-revert: `write_state` must hold the `ServerState` lock ONLY
+/// long enough to refresh status and clone the owned payload — the expensive
+/// serialization and the `persist` fsync must run with the lock RELEASED. The
+/// pre-persist probe records, on `write_state`'s own thread, whether the lock
+/// was free at the persist point (std `Mutex` is non-reentrant, so a same-thread
+/// `try_lock` succeeds only if the guard was dropped). Revert the guard back
+/// across `persist` (the lock-convoy bug) and the probe records `false`, turning
+/// this test RED.
+#[test]
+fn write_state_releases_lock_before_persist() {
+    let state = new_state(ProcessStatus::default());
+    let state_file = unique_state_file("lock-free-persist");
+    clear_pre_persist_lock_probe();
+    write_state(&state_file, &state).expect("write_state must succeed");
+    let lock_free =
+        take_pre_persist_lock_free().expect("write_state must run the pre-persist lock probe");
+    assert!(
+        lock_free,
+        "write_state must drop the ServerState guard before serialization + persist (#5469)"
     );
     let _ = std::fs::remove_file(&state_file);
 }
