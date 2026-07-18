@@ -116,7 +116,7 @@ fn test_replay_gap_at_zero_ack_sends_full_resync() {
     // Drain an empty channel: the parked barrier flushes into the write path in
     // order (it is the current max seq) and reaches the socket.
     let (_tx, rx) = mpsc::sync_channel::<EventFrame>(8);
-    let mut write_buf: Vec<u8> = Vec::new();
+    let mut write_buf = WriteBacklog::with_capacity(4096);
     let outcome = drain_channel_into_write_buf(
         &rx,
         &shared,
@@ -130,7 +130,9 @@ fn test_replay_gap_at_zero_ack_sends_full_resync() {
     (&helper_side)
         .set_nonblocking(false)
         .expect("blocking for the write");
-    (&helper_side).write_all(&write_buf).expect("write barrier");
+    (&helper_side)
+        .write_all(write_buf.pending())
+        .expect("write barrier");
 
     let mut hdr = [0u8; FRAME_HEADER_SIZE];
     daemon_side.read_exact(&mut hdr).expect("full resync frame");
@@ -191,7 +193,7 @@ fn test_full_resync_orders_after_channel_backlog_5267() {
     // Drain the backlog. Under the fix the drain merges the parked barrier LAST,
     // so write_buf holds 11,12,13,14 in order; under a revert the barrier is not
     // parked and write_buf holds only 11,12,13 (14 is already on the socket).
-    let mut write_buf: Vec<u8> = Vec::new();
+    let mut write_buf = WriteBacklog::with_capacity(4096);
     let _ = drain_channel_into_write_buf(
         &rx,
         &shared,
@@ -210,7 +212,9 @@ fn test_full_resync_orders_after_channel_backlog_5267() {
     (&helper_side)
         .set_nonblocking(false)
         .expect("blocking for the write");
-    (&helper_side).write_all(&write_buf).expect("write frames");
+    (&helper_side)
+        .write_all(write_buf.pending())
+        .expect("write frames");
 
     let mut wire: Vec<(u8, u64)> = Vec::new();
     for _ in 0..4 {
