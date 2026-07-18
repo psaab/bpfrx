@@ -395,6 +395,38 @@ re-resolves and re-syncs the fabric MACs within seconds. The persisted
 fabric set is therefore the **observability snapshot** (so `show` reflects
 the resolved truth), not the restore source.
 
+### L5 — the Go control plane persists the resolved set too (#5306)
+
+The Rust-side persistence above (#3773/#3833) closed the *state-file*
+staleness, but the Go control plane had the mirror-image gap.
+`SyncFabricState` (`pkg/dataplane/userspace/manager_ha.go`) resolved the
+peer/local MACs via `buildFabricSnapshots` and shipped them to the helper
+over `update_fabrics`, but it never wrote the resolved set back into Go's
+own `m.lastSnapshot.Fabrics`. The Go snapshot therefore kept the
+apply-time (unresolved-MAC) fabrics.
+
+That mattered because the **partial-rebuild publish paths** —
+`PublishRouteOverlaySnapshot` (ip-monitoring), the policy-scheduler
+republish, and the #5134 worker-arm re-apply — each start from
+`next := *m.lastSnapshot` and rebuild **only** `Routes`, re-publishing every
+other section (Fabrics included) verbatim. With the stale Fabrics still in
+`m.lastSnapshot`, the next such `apply_snapshot` re-shipped the
+unresolved-MAC fabrics and **silently reverted** the helper to the
+unresolved fabric MAC — during the exact HA window fabric cross-chassis
+forwarding exists to preserve.
+
+`SyncFabricState` now writes the resolved set back into
+`m.lastSnapshot.Fabrics` after a successful `update_fabrics`
+(`persistResolvedFabricsLocked`, mirroring `RegenerateNeighborSnapshot`'s
+post-publish writeback): it advances the generation + `publishedSnapshot`
+and refreshes `lastSnapshotHash`, and is a no-op when the fabric set is
+unchanged so the periodic refresh does not churn the generation. A
+subsequent partial rebuild's `next := *m.lastSnapshot` now carries the
+resolved fabrics forward instead of reverting them. The writeback is
+gated on the send succeeding (mutate-after-success), so a transient
+control-socket error leaves `m.lastSnapshot.Fabrics` matching what the
+helper actually has.
+
 ## Same-parent peer replacement must invalidate the stale peer (#5686 M01)
 
 The two fabric-authority paths PRESERVE an already-resolved `FabricLink`

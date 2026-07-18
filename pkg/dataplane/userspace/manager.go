@@ -143,12 +143,19 @@ type Manager struct {
 	// Active-state change (failover/failback — instant) or a periodic backstop
 	// comfortably under the helper's ~10s stale-lease window. Guarded by m.mu.
 	haWatchdogIPCSynced map[int]haWatchdogIPCSyncState
-	lastIngressIfaces   []uint32
-	lastRSTv4           []netip.Addr
-	lastRSTv6           []netip.Addr
-	lastRSTAttempt      time.Time
-	lastRSTInstallOK    bool
-	lastSnapshotHash    [32]byte // content hash of last published snapshot (excludes volatile fields)
+	// fabricSnapshotBuilder resolves the fabric snapshots (with live peer/local
+	// MACs from kernel neighbor + link state) that SyncFabricState pushes to the
+	// helper. Indirected through a field so tests can inject a deterministic
+	// resolved MAC without real netlink neighbor state, mirroring
+	// haWatchdogMapWrite. nil-safe at the call site: it defaults to
+	// buildFabricSnapshots when unset (so bare &Manager{} literals still work).
+	fabricSnapshotBuilder func(*config.Config) []FabricSnapshot
+	lastIngressIfaces     []uint32
+	lastRSTv4             []netip.Addr
+	lastRSTv6             []netip.Addr
+	lastRSTAttempt        time.Time
+	lastRSTInstallOK      bool
+	lastSnapshotHash      [32]byte // content hash of last published snapshot (excludes volatile fields)
 	// #1866 D3: canonical summary of the WG endpoint set in the last
 	// successfully published snapshot, for publish-boundary transition
 	// logging (logWgEndpointSetTransitionLocked).

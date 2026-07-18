@@ -352,22 +352,12 @@ pub(super) fn purge_sessions_for_input_dscp_filter_revalidation(
     });
     let purged = stale.len();
     for (key, decision, metadata, origin) in stale {
-        release_source_nat_allocation(
-            &forwarding.source_nat_rules,
-            &key,
-            decision.nat,
-            metadata.is_reverse,
-            now_ns,
-        );
-        // #4381: also return the purged NAT64 forward flow's translated pool
-        // port (self-gated on the forward NAT64 entry).
-        crate::nat64::release_nat64_allocation(
-            &forwarding.nat64,
-            &key,
-            decision.nat,
-            metadata.is_reverse,
-            now_ns,
-        );
+        // #5622: `delete_terminal_filtered_session` now owns the per-entry
+        // source-NAT / NAT64 release AND the forward<->reverse companion
+        // teardown, so the purge no longer releases separately (that would
+        // double-process the pair). Both halves of a translated flow are in
+        // `stale`; the helper is idempotent, so whichever half is visited first
+        // frees the shared reservation once and the second visit is a no-op.
         delete_terminal_filtered_session(
             sessions,
             session_map_fd,
@@ -378,10 +368,12 @@ pub(super) fn purge_sessions_for_input_dscp_filter_revalidation(
             shared_forward_wire_sessions,
             shared_owner_rg_indexes,
             peer_worker_commands,
+            forwarding,
             &key,
             decision,
             &metadata,
             origin,
+            now_ns,
         );
     }
     purged
@@ -443,6 +435,7 @@ pub(in crate::afxdp::session_glue) fn publish_worker_session_map_entry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn delete_terminal_filtered_session(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
@@ -453,11 +446,120 @@ pub(super) fn delete_terminal_filtered_session(
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    forwarding: &ForwardingState,
     key: &SessionKey,
     decision: SessionDecision,
     metadata: &SessionMetadata,
     origin: SessionOrigin,
+    now_ns: u64,
 ) {
+    // #5622: a translated LocalDelivery terminal hit (host-inbound deny, lo0
+    // input-filter deny, or `to-zone junos-host` deny on the session-HIT path)
+    // can fire on EITHER the forward or the reverse companion entry. The
+    // pre-#5622 body deleted ONLY the supplied key and released NO allocator
+    // state, so the same-worker forward<->reverse COMPANION entry AND the
+    // source-NAT / NAT64 pool RESERVATION were both left behind — a resource
+    // leak the ordinary idle reap (`reap_expired_sessions`) and the DSCP-filter
+    // purge (`purge_sessions_for_input_dscp_filter_revalidation`) already avoid
+    // by releasing per entry. Tear down BOTH halves and release each allocation
+    // exactly as the reap path does per `ExpiredSession`.
+    //
+    // The companion key is recovered with `reverse_session_key(key, nat)` from
+    // the resolved entry's OWN nat decision — the transform is its own inverse
+    // given the reversed decision, so it yields the forward key from a reverse
+    // hit and the reverse key from a forward hit (the same hop
+    // `companion_keeps_alive` / `account_packet` use). The allocation release
+    // self-gates on `is_reverse` and keys on the forward flow, so freeing both
+    // halves returns the reservation EXACTLY ONCE (the reverse call is a no-op)
+    // — no double free. `release_flow` is idempotent (returns false when the
+    // flow was already freed), so a caller that hands both halves in turn (the
+    // DSCP purge) stays correct too.
+    let companion_key = reverse_session_key(key, decision.nat);
+    let companion = if companion_key != *key {
+        sessions.entry_with_origin(&companion_key)
+    } else {
+        None
+    };
+
+    delete_terminal_half(
+        sessions,
+        session_map_fd,
+        conntrack_v4_fd,
+        conntrack_v6_fd,
+        shared_sessions,
+        shared_nat_sessions,
+        shared_forward_wire_sessions,
+        shared_owner_rg_indexes,
+        peer_worker_commands,
+        forwarding,
+        key,
+        decision,
+        metadata,
+        origin,
+        now_ns,
+    );
+
+    if let Some((companion_decision, companion_metadata, companion_origin)) = companion {
+        delete_terminal_half(
+            sessions,
+            session_map_fd,
+            conntrack_v4_fd,
+            conntrack_v6_fd,
+            shared_sessions,
+            shared_nat_sessions,
+            shared_forward_wire_sessions,
+            shared_owner_rg_indexes,
+            peer_worker_commands,
+            forwarding,
+            &companion_key,
+            companion_decision,
+            &companion_metadata,
+            companion_origin,
+            now_ns,
+        );
+    }
+}
+
+/// #5622: tear down ONE direction of a terminal-filtered session — release its
+/// source-NAT / NAT64 pool reservation (self-gated on `is_reverse`, so only the
+/// forward half actually frees), drop its live BPF/session-map + conntrack
+/// aliases, remove it from the worker-local table + the shared HA maps, queue
+/// the cross-worker `DeleteSynced`, and emit its close delta (suppressed for a
+/// reverse entry). Called once per direction by `delete_terminal_filtered_session`
+/// so a translated LocalDelivery terminal hit performs the SAME full-pair
+/// teardown the idle reap and DSCP purge do.
+#[allow(clippy::too_many_arguments)]
+fn delete_terminal_half(
+    sessions: &mut SessionTable,
+    session_map_fd: c_int,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    forwarding: &ForwardingState,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    origin: SessionOrigin,
+    now_ns: u64,
+) {
+    release_source_nat_allocation(
+        &forwarding.source_nat_rules,
+        key,
+        decision.nat,
+        metadata.is_reverse,
+        now_ns,
+    );
+    crate::nat64::release_nat64_allocation(
+        &forwarding.nat64,
+        key,
+        decision.nat,
+        metadata.is_reverse,
+        now_ns,
+    );
     delete_session_map_entry_for_removed_session_with_origin(
         session_map_fd,
         key,
@@ -476,12 +578,7 @@ pub(super) fn delete_terminal_filtered_session(
         key,
     );
     replicate_session_delete(peer_worker_commands, key);
-    sessions.emit_close_delta_with_origin(
-        key.clone(),
-        decision,
-        metadata.clone(),
-        origin,
-    );
+    sessions.emit_close_delta_with_origin(key.clone(), decision, metadata.clone(), origin);
 }
 
 /// #2442: the filter half of `export_forward_sessions_for_owner_rgs`. Walks the
