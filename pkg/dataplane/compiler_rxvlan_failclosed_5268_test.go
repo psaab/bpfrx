@@ -13,6 +13,8 @@ package dataplane
 
 import (
 	"errors"
+	"net"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -219,6 +221,154 @@ func TestRxVlanTolerantOnPlainParent_5268(t *testing.T) {
 	}
 	if err := rxVlanOffloadActivationError(cfgPlainParent(), "ge-0-0-0", "ge-0-0-0", ensureErr); err != nil {
 		t.Fatalf("#5268 negative scope: a plain parent must NOT fail activation on a rxvlan disable failure, got %v", err)
+	}
+}
+
+// ---- COMPILE-LEVEL FAIL-ON-REVERT: call-site wiring (#5268 / #6124) --------
+//
+// TestRxVlanFailClosedOnVlanParent_5268 above binds only the DECISION FUNCTION
+// (rxVlanOffloadActivationError called directly). NOTHING there binds the
+// CALL-SITE WIRING at compiler_iface.go:489 that actually turns the decision
+// into a fail-closed compile abort:
+//
+//	if err := rxVlanOffloadActivationError(
+//		cfg, cfgName, physName, result.ensureRxVlanOff(physName),
+//	); err != nil {
+//		return err
+//	}
+//
+// A revert that drops the `if err != nil { return err }` (back to a bare
+// `result.ensureRxVlanOff(physName)` whose error is discarded) would
+// reintroduce the cross-zone security bypass with every unit test still green.
+// The test below closes that gap by driving the REAL compileZones() path.
+
+// errCompileStopBeforeReconcile is a sentinel returned by the stub's AddTxPort
+// for the SECOND (guard) interface. compileZones cannot be driven to completion
+// in a unit test: its tail enumerates real host interfaces via net.Interfaces()
+// and brings the unmanaged ones DOWN with netlink (compiler_iface.go documents
+// this as "not unit-testable"). On the CORRECT code the #5268 gate returns at
+// line 489 while processing the FIRST interface, so the tail is never reached.
+// On a REVERTED call site the gate no longer returns, execution would fall
+// through toward that dangerous host reconcile — so a second interface whose
+// AddTxPort trips this sentinel halts the compile EARLY and SAFELY, turning the
+// revert into a clean assertion failure instead of a host-mutating run.
+var errCompileStopBeforeReconcile = errors.New(
+	"compile-test guard: AddTxPort tripwire (execution passed the #5268 gate)")
+
+// compileRxVlanTestDP is a netlink-free DataPlane stub. It embeds the DataPlane
+// interface (nil) and overrides only the methods compileZones reaches on the
+// one-time physical-interface setup path (SetZoneConfig, SetZone, AddTxPort).
+// AddTxPort returns errCompileStopBeforeReconcile for stopIfindex so the revert
+// path halts before the host-interface reconcile; any other embedded method is
+// never called on this path and would nil-panic — an intended tripwire.
+type compileRxVlanTestDP struct {
+	DataPlane
+	stopIfindex int
+}
+
+func (compileRxVlanTestDP) SetZoneConfig(uint16, ZoneConfig) error { return nil }
+func (compileRxVlanTestDP) SetZone(int, uint16, uint16, uint32, uint8, uint8, uint32) error {
+	return nil
+}
+func (d compileRxVlanTestDP) AddTxPort(ifindex int) error {
+	if d.stopIfindex != 0 && ifindex == d.stopIfindex {
+		return errCompileStopBeforeReconcile
+	}
+	return nil
+}
+
+// cfgVlanParentInZone builds a two-interface config:
+//   - ge-0-0-0 (ifindex 4242): a physical parent placed directly in a zone via
+//     its unit-0 ref AND carrying a configured 802.1Q subinterface (unit 50).
+//     parentHasVlanSubinterface(ge-0-0-0) is therefore true, so compileZones
+//     reaches the #5268 gate while processing the unit-0 (vlanID==0) ref.
+//     Referencing the VLAN subinterface (ge-0-0-0.50) instead would divert into
+//     ensureVLANSubInterface (a real netlink create) and `continue` before ever
+//     reaching line 489, so the parent's unit-0 ref is the ref that exercises
+//     the call site.
+//   - ge-0-0-1 (ifindex 4243): a plain guard interface listed SECOND in the same
+//     zone's ordered Interfaces slice. It is only reached on the revert path
+//     (the gate no longer short-circuits the first interface); its AddTxPort
+//     trips the sentinel, halting the compile before the host reconcile.
+func cfgVlanParentInZone() *config.Config {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"ge-0-0-0": {
+					Name:        "ge-0-0-0",
+					VlanTagging: true,
+					Units: map[int]*config.InterfaceUnit{
+						0:  {Number: 0, VlanID: 0},
+						50: {Number: 50, VlanID: 50},
+					},
+				},
+				"ge-0-0-1": {
+					Name:  "ge-0-0-1",
+					Units: map[int]*config.InterfaceUnit{0: {Number: 0, VlanID: 0}},
+				},
+			},
+		},
+	}
+	// One zone, ordered slice → ge-0-0-0.0 is ALWAYS processed before the
+	// ge-0-0-1.0 guard (map iteration randomness does not apply within a slice).
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Interfaces: []string{"ge-0-0-0.0", "ge-0-0-1.0"}},
+	}
+	return cfg
+}
+
+// TestRxVlanFailClosedWiredIntoCompile_5268 is the COMPILE-LEVEL fail-on-revert
+// that binds the CALL-SITE wiring at compiler_iface.go:489, not merely the
+// decision function. It drives the real compileZones() over a VLAN-parent
+// config with a mocked ethtool that reports rx-vlan-offload ON and fails
+// `-K rxvlan off`, then asserts compileZones ABORTS with the specific #5268
+// fail-closed error while processing the VLAN parent.
+//
+// RED-on-revert: if the call site is reverted from
+//
+//	if err := rxVlanOffloadActivationError(...); err != nil { return err }
+//
+// back to a bare `result.ensureRxVlanOff(physName)` (error discarded), the gate
+// no longer short-circuits: execution falls through to the ge-0-0-1 guard whose
+// AddTxPort trips errCompileStopBeforeReconcile, so compileZones returns THAT
+// error instead of the fail-closed one — the signature assertion fails and this
+// test goes RED, while TestRxVlanFailClosedOnVlanParent_5268 (decision function
+// only) stays GREEN. Target-count 1: only this test binds the propagation.
+func TestRxVlanFailClosedWiredIntoCompile_5268(t *testing.T) {
+	mockEthtool(t, func(args ...string) ([]byte, error) {
+		switch args[0] {
+		case "-k":
+			return []byte("rx-vlan-offload: on\n"), nil
+		case "-K":
+			return []byte("not supported"), errors.New("exit status 1")
+		}
+		return nil, errors.New("unexpected ethtool " + args[0])
+	})
+
+	result := &CompileResult{
+		ZoneIDs:             map[string]uint16{"trust": 1},
+		ScreenIDs:           make(map[string]uint16),
+		rxVlanOffCache:      make(map[string]bool),
+		ifCache:             make(map[string]*net.Interface),
+		ethtoolApplied:      make(map[string]bool),
+		genericXDPIfindexes: make(map[int]bool),
+	}
+	// Pre-seed the interface cache so cachedInterfaceByName resolves both parents
+	// WITHOUT a syscall (the test host has no ge-0-0-*). The high, otherwise-unused
+	// ifindexes make the one netlink fallback on the revert path
+	// (cachedLinkByIndex → LinkByIndex) miss cleanly (guarded by `nlErr == nil`).
+	result.ifCache["ge-0-0-0"] = &net.Interface{Index: 4242, Name: "ge-0-0-0"}
+	result.ifCache["ge-0-0-1"] = &net.Interface{Index: 4243, Name: "ge-0-0-1"}
+
+	err := compileZones(compileRxVlanTestDP{stopIfindex: 4243}, cfgVlanParentInZone(), result)
+	if err == nil {
+		t.Fatal("#5268/#6124: compileZones MUST abort (fail closed) when a VLAN-parent's " +
+			"rx-vlan offload cannot be disabled — the call-site error propagation at " +
+			"compiler_iface.go:489 was dropped, reopening the cross-zone bypass")
+	}
+	if !strings.Contains(err.Error(), "RX-VLAN hardware offload could not be disabled") {
+		t.Fatalf("compileZones did not abort at the #5268 fail-closed gate — the "+
+			"call-site error propagation at compiler_iface.go:489 was dropped; got: %v", err)
 	}
 }
 
