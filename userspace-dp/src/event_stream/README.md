@@ -55,10 +55,11 @@ periodic ACK from the daemon.
   zero and non-session frames leave [152:160] zero. NOTE (#4915 scope): a
   peer-synced session gets a FRESH node-local id on import — cross-HA-node
   id identity (the same id on both cluster nodes) is a documented follow-up
-  needing a session-sync wire change; and `show security flow session`
-  still surfaces the iteration-index fallback until the conntrack-map
-  publish is unified to the same `SessionEntry.session_id` (also a
-  follow-up).
+  needing a session-sync wire change. `show security flow session` is now
+  UNIFIED (#5213): `publish_conntrack` stamps the conntrack-map `session_id`
+  from the same `SessionEntry.session_id`, so the live-session view shows the
+  SAME id these frames carry (the iteration-index fallback survives only for a
+  `val.SessionID == 0` row).
   Userspace telemetry may also populate the non-session metadata slots
   used by the Go adapter for action, rule ID, term ID, reason, owner RG,
   ingress ifindex, and application ID.

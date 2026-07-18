@@ -91,6 +91,7 @@ pub(super) fn alg_type_for_session(protocol: u8, src_port: u16, dst_port: u16, d
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn publish_v4_session(
     conntrack_v4_fd: c_int,
     key: &SessionKey,
@@ -104,9 +105,13 @@ pub(super) fn publish_v4_session(
     now_secs: u64,
     alg_disable_flags: u8,
     app_id: u16,
+    // #5213: the STABLE dataplane session id (`SessionEntry.session_id`, #4915)
+    // resolved by the caller from the session table. Stamped into the conntrack
+    // value so `show security flow session` reports the SAME id RT_FLOW emits for
+    // the session (SESSION_CREATE/CLOSE). `0` = unknown/absent (the caller had no
+    // live entry), preserving the legacy ordinal fallback on the Go render side.
+    session_id: u64,
 ) {
-    let alg_type =
-        alg_type_for_session(key.protocol, key.src_port, key.dst_port, alg_disable_flags);
     let bpf_key = BpfSessionKeyV4 {
         src_ip: src.octets(),
         dst_ip: dst.octets(),
@@ -116,13 +121,66 @@ pub(super) fn publish_v4_session(
         pad: [0; 3],
     };
 
+    // A cross-family reverse key means the session cannot be mirrored to the v4
+    // conntrack map — skip the write entirely (pre-#5213 behaviour).
+    let Some(value) = build_conntrack_value_v4(
+        key,
+        decision,
+        metadata,
+        flags,
+        ingress_zone_id,
+        egress_zone_id,
+        now_secs,
+        alg_disable_flags,
+        app_id,
+        session_id,
+    ) else {
+        return;
+    };
+
+    let rc = unsafe {
+        libbpf_sys::bpf_map_update_elem(
+            conntrack_v4_fd,
+            (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
+            (&value as *const BpfSessionValueV4).cast::<c_void>(),
+            libbpf_sys::BPF_ANY as u64,
+        )
+    };
+    if rc < 0 {
+        eprintln!(
+            "xpf-ha: conntrack v4 map update failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+/// #5213: build the v4 conntrack `BpfSessionValueV4` mirrored for `show security
+/// flow session`. Pure (no map I/O) so the `session_id` stamping is unit-testable
+/// without a BPF map fd. Returns `None` when the reverse key resolves cross-family
+/// (the session is not v4-mappable), mirroring the pre-refactor early return.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_conntrack_value_v4(
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    flags: u16,
+    ingress_zone_id: u16,
+    egress_zone_id: u16,
+    now_secs: u64,
+    alg_disable_flags: u8,
+    app_id: u16,
+    session_id: u64,
+) -> Option<BpfSessionValueV4> {
+    let alg_type =
+        alg_type_for_session(key.protocol, key.src_port, key.dst_port, alg_disable_flags);
+
     // Build reverse key
     let rev = reverse_session_key(key, decision.nat);
     let rev_key = match rev.src_ip {
         IpAddr::V4(rsrc) => {
             let rdst = match rev.dst_ip {
                 IpAddr::V4(d) => d,
-                _ => return,
+                _ => return None,
             };
             BpfSessionKeyV4 {
                 src_ip: rsrc.octets(),
@@ -133,7 +191,7 @@ pub(super) fn publish_v4_session(
                 pad: [0; 3],
             }
         }
-        _ => return,
+        _ => return None,
     };
 
     // NAT IPs: use native endian u32 (IP bytes already in network order,
@@ -149,13 +207,14 @@ pub(super) fn publish_v4_session(
     let nat_src_port = decision.nat.rewrite_src_port.unwrap_or(0).to_be();
     let nat_dst_port = decision.nat.rewrite_dst_port.unwrap_or(0).to_be();
 
-    let value = BpfSessionValueV4 {
+    Some(BpfSessionValueV4 {
         state: SESS_STATE_ESTABLISHED,
         flags,
         tcp_state: 0,
         is_reverse: if metadata.is_reverse { 1 } else { 0 },
         app_timeout: 0,
-        session_id: 0,
+        // #5213: the stable session id from the session table (was hardcoded 0).
+        session_id,
         created: now_secs,
         last_seen: now_secs,
         timeout: 1800, // default 30min; Go GC is SkipSweep'd, helper owns lifetime (#333)
@@ -185,24 +244,10 @@ pub(super) fn publish_v4_session(
         fib_dmac: [0; 6],
         fib_smac: [0; 6],
         fib_gen: 0,
-    };
-
-    let rc = unsafe {
-        libbpf_sys::bpf_map_update_elem(
-            conntrack_v4_fd,
-            (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
-            (&value as *const BpfSessionValueV4).cast::<c_void>(),
-            libbpf_sys::BPF_ANY as u64,
-        )
-    };
-    if rc < 0 {
-        eprintln!(
-            "xpf-ha: conntrack v4 map update failed: {}",
-            io::Error::last_os_error()
-        );
-    }
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn publish_v6_session(
     conntrack_v6_fd: c_int,
     key: &SessionKey,
@@ -216,9 +261,9 @@ pub(super) fn publish_v6_session(
     now_secs: u64,
     alg_disable_flags: u8,
     app_id: u16,
+    // #5213: stable dataplane session id — see publish_v4_session.
+    session_id: u64,
 ) {
-    let alg_type =
-        alg_type_for_session(key.protocol, key.src_port, key.dst_port, alg_disable_flags);
     let bpf_key = BpfSessionKeyV6 {
         src_ip: src.octets(),
         dst_ip: dst.octets(),
@@ -228,12 +273,62 @@ pub(super) fn publish_v6_session(
         pad: [0; 3],
     };
 
+    let Some(value) = build_conntrack_value_v6(
+        key,
+        decision,
+        metadata,
+        flags,
+        ingress_zone_id,
+        egress_zone_id,
+        now_secs,
+        alg_disable_flags,
+        app_id,
+        session_id,
+    ) else {
+        return;
+    };
+
+    let rc = unsafe {
+        libbpf_sys::bpf_map_update_elem(
+            conntrack_v6_fd,
+            (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
+            (&value as *const BpfSessionValueV6).cast::<c_void>(),
+            libbpf_sys::BPF_ANY as u64,
+        )
+    };
+    if rc < 0 {
+        eprintln!(
+            "xpf-ha: conntrack v6 map update failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+/// #5213: v6 sibling of [`build_conntrack_value_v4`] — pure builder for the v6
+/// conntrack mirror value, stamping the stable `session_id`. Returns `None` on a
+/// cross-family reverse key (not v6-mappable).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_conntrack_value_v6(
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    flags: u16,
+    ingress_zone_id: u16,
+    egress_zone_id: u16,
+    now_secs: u64,
+    alg_disable_flags: u8,
+    app_id: u16,
+    session_id: u64,
+) -> Option<BpfSessionValueV6> {
+    let alg_type =
+        alg_type_for_session(key.protocol, key.src_port, key.dst_port, alg_disable_flags);
+
     let rev = reverse_session_key(key, decision.nat);
     let rev_key = match rev.src_ip {
         IpAddr::V6(rsrc) => {
             let rdst = match rev.dst_ip {
                 IpAddr::V6(d) => d,
-                _ => return,
+                _ => return None,
             };
             BpfSessionKeyV6 {
                 src_ip: rsrc.octets(),
@@ -244,7 +339,7 @@ pub(super) fn publish_v6_session(
                 pad: [0; 3],
             }
         }
-        _ => return,
+        _ => return None,
     };
 
     let nat_src_ip = match decision.nat.rewrite_src {
@@ -258,13 +353,14 @@ pub(super) fn publish_v6_session(
     let nat_src_port = decision.nat.rewrite_src_port.unwrap_or(0).to_be();
     let nat_dst_port = decision.nat.rewrite_dst_port.unwrap_or(0).to_be();
 
-    let value = BpfSessionValueV6 {
+    Some(BpfSessionValueV6 {
         state: SESS_STATE_ESTABLISHED,
         flags,
         tcp_state: 0,
         is_reverse: if metadata.is_reverse { 1 } else { 0 },
         app_timeout: 0,
-        session_id: 0,
+        // #5213: the stable session id from the session table (was hardcoded 0).
+        session_id,
         created: now_secs,
         last_seen: now_secs,
         timeout: 1800,
@@ -290,22 +386,7 @@ pub(super) fn publish_v6_session(
         fib_dmac: [0; 6],
         fib_smac: [0; 6],
         fib_gen: 0,
-    };
-
-    let rc = unsafe {
-        libbpf_sys::bpf_map_update_elem(
-            conntrack_v6_fd,
-            (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
-            (&value as *const BpfSessionValueV6).cast::<c_void>(),
-            libbpf_sys::BPF_ANY as u64,
-        )
-    };
-    if rc < 0 {
-        eprintln!(
-            "xpf-ha: conntrack v6 map update failed: {}",
-            io::Error::last_os_error()
-        );
-    }
+    })
 }
 
 #[cfg(test)]

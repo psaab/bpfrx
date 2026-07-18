@@ -89,6 +89,22 @@ func formatSessionBriefEndpoint(addr string, port uint16) string {
 	return fmt.Sprintf("%s:%d", addr, port)
 }
 
+// flowSessionDisplayID resolves the id shown for a `show security flow session`
+// row. #5213: it renders the STABLE dataplane session id
+// (dataplane.SessionValue.SessionID, which the userspace-dp conntrack mirror now
+// stamps from SessionEntry.session_id, #4915) so the value is IDENTICAL to the
+// id RT_FLOW emits (SESSION_CREATE/CLOSE) for the same session — an operator can
+// correlate a flow across the two surfaces by id. It falls back to the per-row
+// ordinal ONLY when the dataplane id is 0 (absent/unknown: an older helper that
+// never stamped the id, or a synthesized row), preserving the legacy display and
+// never showing a bare 0.
+func flowSessionDisplayID(dpSessionID uint64, ordinalIdx int) uint64 {
+	if dpSessionID != 0 {
+		return dpSessionID
+	}
+	return uint64(ordinalIdx)
+}
+
 func (c *CLI) showStatistics(detail bool) error {
 	if c.dp == nil || !c.dp.IsLoaded() {
 		fmt.Println("Statistics: dataplane not loaded")
@@ -298,10 +314,7 @@ func (c *CLI) showFlowSession(args []string) error {
 			outZone = fmt.Sprintf("%d", val.EgressZone)
 		}
 
-		sid := val.SessionID
-		if sid == 0 {
-			sid = uint64(idx)
-		}
+		sid := flowSessionDisplayID(val.SessionID, idx)
 
 		if f.brief {
 			natFlag := "-"
@@ -428,10 +441,7 @@ func (c *CLI) showFlowSession(args []string) error {
 			outZone = fmt.Sprintf("%d", val.EgressZone)
 		}
 
-		sid := val.SessionID
-		if sid == 0 {
-			sid = uint64(idx)
-		}
+		sid := flowSessionDisplayID(val.SessionID, idx)
 
 		if f.brief {
 			natFlag := "-"

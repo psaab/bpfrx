@@ -1199,6 +1199,10 @@ pub(super) fn poll_binding_process_descriptor(
                                 resolved.metadata.is_reverse,
                                 resolved.decision.nat.rewrite_dst_port,
                             );
+                            // #5213: mirror the STABLE session id from the just-
+                            // installed table entry so `show security flow
+                            // session` reports the SAME id RT_FLOW emits.
+                            let session_id = sessions.session_id_for(&flow.forward_key);
                             publish_bpf_conntrack_entry(
                                 conntrack_v4_fd,
                                 conntrack_v6_fd,
@@ -1208,6 +1212,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 &worker_ctx.forwarding.zone_name_to_id,
                                 worker_ctx.forwarding.alg_disable_flags,
                                 app_id,
+                                session_id,
                             );
                         }
                         // Log first N session hits from WAN (return path)
@@ -2653,6 +2658,11 @@ pub(super) fn poll_binding_process_descriptor(
                                     local_metadata.is_reverse,
                                     decision.nat.rewrite_dst_port,
                                 );
+                                // #5213: stamp the stable id from the installed
+                                // host-local entry so the mirror row matches
+                                // RT_FLOW.
+                                let session_id =
+                                    sessions.session_id_for(&flow.forward_key);
                                 publish_bpf_conntrack_entry(
                                     conntrack_v4_fd,
                                     conntrack_v6_fd,
@@ -2662,6 +2672,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     &worker_ctx.forwarding.zone_name_to_id,
                                     worker_ctx.forwarding.alg_disable_flags,
                                     app_id,
+                                    session_id,
                                 );
                             }
                         }
@@ -5341,6 +5352,11 @@ pub(super) fn poll_binding_process_descriptor(
                                         entry.metadata.is_reverse,
                                         pending_decision.nat.rewrite_dst_port,
                                     );
+                                    // #5213: stable id from the just-installed
+                                    // neighbor-seed entry so the mirror row
+                                    // matches RT_FLOW.
+                                    let session_id =
+                                        sessions.session_id_for(&flow.forward_key);
                                     publish_bpf_conntrack_entry(
                                         conntrack_v4_fd,
                                         conntrack_v6_fd,
@@ -5350,6 +5366,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         &worker_ctx.forwarding.zone_name_to_id,
                                         worker_ctx.forwarding.alg_disable_flags,
                                         app_id,
+                                        session_id,
                                     );
                                     // #2244: count failed reverse-NAT publishes so
                                     // map-pressure loss is operator-visible.
