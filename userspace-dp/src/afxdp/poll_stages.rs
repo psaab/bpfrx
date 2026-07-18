@@ -73,6 +73,8 @@ pub(super) struct FabricIngressOutcome {
 pub(super) fn stage_link_layer_classify(
     raw_frame: &[u8],
     meta: UserspaceDpMeta,
+    now_ns: u64,
+    neigh_limiter: &mut KernelNeighborProgramLimiter,
     worker_ctx: &WorkerContext,
 ) -> StageOutcome<()> {
     // #2370: learn dynamic neighbors under the LOGICAL (L3) ifindex,
@@ -145,13 +147,28 @@ pub(super) fn stage_link_layer_classify(
                 // new MAC, then SHADOW the kernel-monitor RTM_NEWNEIGH that
                 // follows add_kernel_neighbor (the monitor would see
                 // prior == new and not bump), leaving the flow cache stale.
-                let _ = worker_ctx.dynamic_neighbors.insert_if_changed(
+                let changed = worker_ctx.dynamic_neighbors.insert_if_changed(
                     (ifindex, arp.sender_ip),
                     NeighborEntry {
                         mac: arp.sender_mac,
                     },
                 );
-                add_kernel_neighbor(ifindex, arp.sender_ip, arp.sender_mac);
+                // #5288: gate the kernel-neighbor program (a raw netlink
+                // socket()/sendto()/close() + Vec allocations, on this XSK
+                // worker) behind the per-worker limiter. A same-key/same-MAC
+                // repeat (`!changed`) skips the netlink work entirely — the
+                // amplification an ARP-reply flood relied on — and even a
+                // changed-flood is rate-capped, while a genuine MAC change is
+                // still programmed (retried if rate-limited, never silently
+                // lost). See neighbor_program_limiter.
+                if neigh_limiter.should_program(
+                    (ifindex, arp.sender_ip),
+                    arp.sender_mac,
+                    changed,
+                    now_ns,
+                ) {
+                    add_kernel_neighbor(ifindex, arp.sender_ip, arp.sender_mac);
+                }
             }
             return StageOutcome::RecycleAndContinue;
         }
@@ -205,10 +222,14 @@ pub(super) fn stage_link_layer_classify(
         // #3048: same change-detecting learn for NDP NA — a target-MAC
         // change observed on the data path must bump mac_change_epoch and
         // evict stale cached dst_macs (see the ARP-reply arm above).
-        let _ = worker_ctx
+        let changed = worker_ctx
             .dynamic_neighbors
             .insert_if_changed((ifindex, na.target_ip), NeighborEntry { mac });
-        add_kernel_neighbor(ifindex, na.target_ip, mac);
+        // #5288: same bounded kernel-program gate as the ARP arm — an NA flood
+        // for a non-owned unicast target must not storm netlink on the worker.
+        if neigh_limiter.should_program((ifindex, na.target_ip), mac, changed, now_ns) {
+            add_kernel_neighbor(ifindex, na.target_ip, mac);
+        }
     }
     StageOutcome::Continue(())
 }

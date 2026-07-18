@@ -274,6 +274,40 @@ sync.
     solicitations) into the per-worker learn path; it is DEFERRED as a
     follow-up. STALE + the Override honor already remove the
     forced-REACHABLE hijack window, which was the core of #4475.
+  - **Bounded kernel-program rate limit (`#5288`,
+    `neighbor_program_limiter.rs`):** `add_kernel_neighbor` allocates
+    request/IP `Vec`s, opens a raw `AF_NETLINK` socket, `sendto`s an
+    `RTM_NEWNEIGH`, and closes it — ALL ON THE XSK WORKER, per accepted
+    advert. Before #5288 the call fired unconditionally, even for a
+    same-key/same-MAC repeat whose `insert_if_changed` result was
+    discarded, so an attacker streaming valid ARP replies / NAs for a
+    non-owned unicast IP drove a `socket()`/`sendto()`/`close()` +
+    allocations per frame → forwarding starvation on the affected queues.
+    Both `stage_link_layer_classify` learn arms now gate the program
+    through a per-worker `KernelNeighborProgramLimiter`
+    (`BindingWorker::neigh_program_limiter`): a fixed 256-slot,
+    direct-mapped table recording the last `(key -> mac)` the worker
+    programmed and when. It **skips** a repeat the kernel already holds
+    (proved by the slot OR by `insert_if_changed == false`), **rate-caps**
+    a changed-flood to ≤1 program per 50 ms per slot — which also bounds
+    the AGGREGATE per-worker netlink rate to `≤ SLOTS / interval` under a
+    many-distinct-IP flood — and does not lose a genuine SAME-KEY change: a
+    real MAC change after steady state programs immediately (steady-state
+    re-adverts do not consume the slot's rate budget), and a same-key change
+    rate-limited amid a flood is retried on the next advert (the slot keeps
+    the OLD mac, so the binding stays "owed"). CAVEAT (#6129): that "owed"
+    retry is slot-ownership-scoped — under a SUSTAINED adversarial
+    colliding-key flood (a different key occupying a victim's direct-mapped
+    slot) the victim's KERNEL program is starved; the AF_XDP fast path and
+    userspace neighbor map are unaffected (both always correct), only
+    host-path reachability to the one collided neighbor degrades (self-healing
+    under normal traffic via `NUD_STALE` + on-demand kernel ARP). Tracked as
+    #6129. The gate decision (`should_program`) is a pure,
+    allocation-free, syscall-free function pinned by fail-on-revert tests.
+    Neighbor programming is a LOCAL kernel-table op, NOT HA/session-sync
+    state, so the limiter is per-worker with no peer coordination.
+    Persistent-socket + off-worker coalescing of the netlink send itself is
+    a DEFERRED follow-up (out of #5288 scope).
 - `neighbor.rs` — netlink neighbor monitor (`neigh_monitor_thread`),
   startup dump (`initial_neighbor_dump` / `process_dump_batch`), the
   on-demand resolver glue, and `worker::pin_current_thread`. The monitor

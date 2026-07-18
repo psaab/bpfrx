@@ -24,6 +24,66 @@
 - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/tests_nat64_tunnel.rs,
   docs/pr/5146-nat64-frag-rollback/plan.md
+## 2026-07-18 — #5288: bound data-path kernel-neighbor programming on the XSK worker
+
+- **Timestamp**: 2026-07-18 (fix/5288-neighbor-netlink-bounded)
+- **Action**: `stage_link_layer_classify` called `add_kernel_neighbor`
+  UNCONDITIONALLY per accepted ARP reply / NDP NA — a raw `AF_NETLINK`
+  `socket()`/`sendto()`/`close()` + request/IP `Vec` allocations, on the
+  latency-sensitive XSK worker — even for a same-key/same-MAC repeat whose
+  `insert_if_changed` result was discarded. An attacker streaming valid
+  adverts for a non-owned unicast IP could storm netlink per frame →
+  forwarding starvation (perf/DoS). Fix: a new per-worker
+  `KernelNeighborProgramLimiter` (`neighbor_program_limiter.rs`, 256-slot
+  direct-mapped table) gates both learn arms. It skips repeats the kernel
+  already holds (proved by the slot OR `insert_if_changed == false`),
+  rate-caps a changed-flood to ≤1 program per 50 ms per slot (which also
+  bounds the AGGREGATE per-worker netlink rate to ≤ SLOTS/interval under a
+  many-IP flood), and never loses a genuine change — a real MAC change after
+  steady state programs immediately (steady-state re-adverts do not consume
+  the rate budget), and a change rate-limited amid a flood stays "owed" and
+  is retried on the next advert. The `should_program` decision is pure
+  (no alloc, no syscall) with 7 unit tests incl. the #5288 fail-on-revert
+  (an identical-repeat flood must program ONCE, not N times). NOT
+  HA/session-sync — neighbor programming is a LOCAL kernel-table op, so the
+  limiter is per-worker with no peer coordination. Persistent-socket +
+  off-worker coalescing of the send itself is a DEFERRED follow-up. Full
+  userspace-dp suite 4011 passed / 0 failed.
+- **File(s)**: userspace-dp/src/afxdp/neighbor_program_limiter.rs (new),
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_stages_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/afxdp/README.md
+
+## 2026-07-18 — #5149: trim_l3_payload must be IP-declared-length authoritative (tunnel L4 checksum over Ethernet slack)
+
+- **Timestamp**: 2026-07-18 (fix/5149-trim-l3-declared-len)
+- **Action**: `trim_l3_payload` was METADATA-led: when `meta.pkt_len` yielded a
+  length equal to the full backing slice (INCLUDING trailing Ethernet slack —
+  NIC min-frame zero-pad or attacker-appended bytes), it returned the
+  slack-inclusive L3 suffix and never reached the IP-header `total_len` clamp.
+  On the tunnel-forced L4 recompute path (`force_tunnel_l4_recompute`, consumed
+  by `wg::wg_encap_frame` / `encapsulate_native_gre_frame`), the L4 checksum
+  then covered the slack, but GRE/WG encap transmits only the IP-declared inner
+  length → the peer verifies the inner L4 checksum over bytes no longer present
+  → remote DROP. Fix: made the IP-declared datagram length AUTHORITATIVE —
+  `trim_l3_payload` now returns `&raw_payload[..declared_l3_end]` (the same
+  `inspect::declared_l3_end` SSOT the #5141 segmentation clamp and #2361 port
+  bound use; IPv4 `total_len` / IPv6 `40 + payload_len`, clamped to backing).
+  Metadata `pkt_len` is only a FALLBACK for when `declared_l3_end` is
+  unavailable (truncated/malformed L3 header, unknown addr_family). No-slack
+  common path is byte-identical (total_len == metadata L3 length). A declaration
+  too short to cover the L4 header fails closed downstream (recompute helpers
+  return None → drop).
+- **File(s)**: userspace-dp/src/afxdp/frame/mod.rs (trim_l3_payload),
+  userspace-dp/src/afxdp/frame/tests_parse_forward_pbr.rs (RED-on-revert test
+  `trim_l3_payload_excludes_ethernet_slack_beyond_ip_declared_len_5149`),
+  userspace-dp/src/afxdp/frame/README.md.
+- **Validation**: full `cargo test --release --bin xpf-userspace-dp` green;
+  RED-on-revert confirmed target-count 1 (neutralizing the `declared_l3_end`
+  branch fails ONLY the new test at the `trimmed.len() == 40` assertion; the two
+  existing corrupt-header trim tests stay green because a zeroed IHL makes
+  `declared_l3_end` return None → metadata fallback).
 
 ## 2026-07-18 — #5268 (High, security): RX-VLAN-offload-disable is a fail-closed activation precondition
 

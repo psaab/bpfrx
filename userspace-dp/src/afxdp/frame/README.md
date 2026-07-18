@@ -169,6 +169,29 @@ inspect or rewrite a packet sitting in a UMEM frame.
   `meta.l4_offset` but does NOT enforce the IP-declared bound, so the meta
   readers re-derive `declared_end` from the L3 header in the frame before
   reading ports (mirroring #2357's meta-fast-path chokepoint concern).
+- **The forwarded L4 payload is trimmed to the IP-DECLARED length (#5149)**:
+  `trim_l3_payload` (`frame/mod.rs`, called by the `build/mod.rs` orchestrator
+  and the in-place `rewrite_plan_eth_from_parts`) determines both the copied
+  frame length AND the extent the tunnel-forced L4 recompute checksums. It is
+  now **IP-declared-length authoritative**: it returns `&raw_payload[..declared_l3_end]`
+  (the same `inspect::declared_l3_end` SSOT as the #2361 port bound and the
+  #5141 segmentation clamp — IPv4 `total_len` / IPv6 `40 + payload_len`,
+  clamped to the backing). Metadata `pkt_len` is only a FALLBACK, reached when
+  `declared_l3_end` is unavailable (truncated/malformed L3 header — bad
+  version/IHL or a buffer shorter than the declared IHL — or an unknown
+  addr_family). Before #5149 it was metadata-led: when `pkt_len` yielded a
+  length equal to the full backing slice (i.e. it INCLUDED trailing Ethernet
+  slack), it returned the slack-inclusive suffix and never reached the
+  IP-header clamp. On the tunnel-forced recompute path
+  (`force_tunnel_l4_recompute`, `build/ipv4.rs` / `build/ipv6.rs`, consumed by
+  `wg::wg_encap_frame` / `encapsulate_native_gre_frame`), the L4 checksum then
+  covered the slack, but encap transmits only the IP-declared inner length, so
+  the peer verified the checksum over bytes no longer present and DROPPED the
+  packet. A no-slack common frame is unaffected (its `total_len` already equals
+  the metadata-derived L3 length → byte-identical trim). A declaration too
+  short to cover the L4 header fails closed downstream (the recompute helpers
+  return `None` → drop — never a checksum over garbage). RED-on-revert:
+  `trim_l3_payload_excludes_ethernet_slack_beyond_ip_declared_len_5149`.
 - **ICMP pseudo-port is only emitted for identifier-bearing query types
   (#3067)**: in `parse_flow_ports` the 2-byte ICMP/ICMPv6 word at
   `[l4+4, l4+6)` is the protocol Identifier ONLY for the query types — for

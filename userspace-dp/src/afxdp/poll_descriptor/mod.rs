@@ -946,9 +946,13 @@ pub(super) fn poll_binding_process_descriptor(
                 // #946 Phase 1 stage 5: ARP / NDP link-layer
                 // classification. ARP frames recycle without
                 // transiting; NDP NA learns and falls through.
-                if let StageOutcome::RecycleAndContinue =
-                    stage_link_layer_classify(raw_frame, meta, worker_ctx)
-                {
+                if let StageOutcome::RecycleAndContinue = stage_link_layer_classify(
+                    raw_frame,
+                    meta,
+                    now_ns,
+                    &mut binding.neigh_program_limiter,
+                    worker_ctx,
+                ) {
                     binding.scratch.scratch_recycle.push(desc.addr);
                     continue;
                 }

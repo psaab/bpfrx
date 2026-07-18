@@ -901,6 +901,40 @@ pub(super) fn rewrite_forwarded_frame_in_place(
 #[inline(always)]
 fn trim_l3_payload<'a>(raw_payload: &'a [u8], meta: impl Into<ForwardPacketMeta>) -> &'a [u8] {
     let meta = meta.into();
+    // #5149: the IP-DECLARED datagram length is AUTHORITATIVE — NOT the
+    // metadata `pkt_len`. `raw_payload` begins at the L3 header (l3 == 0
+    // relative to this slice), so `declared_l3_end` returns the datagram-end
+    // offset: IPv4 `total_len` / IPv6 `40 + payload_len`, clamped to
+    // `[ihl/40, raw_payload.len()]`. This is the same SSOT the #5141
+    // segmentation clamp and the #2361 fail-closed port bound use.
+    //
+    // The bug this closes: when `pkt_len` yielded a length equal to the full
+    // backing slice (i.e. the metadata length INCLUDED trailing Ethernet
+    // slack — NIC min-frame zero-pad or attacker-appended bytes), the old
+    // metadata-led code returned that slack-inclusive suffix and never reached
+    // the IP-header clamp. On the tunnel-forced L4 recompute path
+    // (`force_tunnel_l4_recompute`, consumed by wg/gre encap), the L4 checksum
+    // then covered the slack, but the encap transmits only the IP-declared
+    // inner length, so the peer verified the checksum over bytes no longer
+    // present and DROPPED the packet. The invariant (also enforced by
+    // `verify_built_frame_checksums`): the L4 checksum must cover ONLY bytes
+    // within IPv4 `total_len` / IPv6 `40 + payload_len`; Ethernet slack is
+    // excluded.
+    //
+    // A declaration too short to cover the L4 header is handled downstream:
+    // `declared_l3_end` clamps up to at least the IP header, and the L4
+    // recompute helpers fail closed (`None` -> drop) when the trimmed segment
+    // cannot hold the L4 header — never a checksum over garbage.
+    //
+    // Metadata is only a FALLBACK, reached when `declared_l3_end` is
+    // unavailable/inconsistent: a truncated or malformed L3 header (bad
+    // version/IHL, buffer shorter than the declared IHL) or an unknown
+    // addr_family. A no-slack common frame is unaffected — its `total_len`
+    // already equals the metadata-derived L3 length, so the trimmed extent is
+    // byte-identical.
+    if let Some(declared_end) = declared_l3_end(raw_payload, 0, meta.addr_family) {
+        return &raw_payload[..declared_end];
+    }
     let meta_len = meta.pkt_len as usize;
     if meta_len >= 20 && meta_len <= raw_payload.len() {
         return &raw_payload[..meta_len];
@@ -915,9 +949,10 @@ fn trim_l3_payload<'a>(raw_payload: &'a [u8], meta: impl Into<ForwardPacketMeta>
     {
         return &raw_payload[..meta_l3_len];
     }
-    // Fall back to parsing the IP header only when metadata does not carry a
-    // usable payload length. This preserves the padding-trim safety net for
-    // synthetic or incomplete metadata while keeping the hot path metadata-led.
+    // Last-resort: parse the IP header directly. Reached only when
+    // `declared_l3_end` returned None (truncated/malformed L3 header) AND
+    // metadata carries no usable payload length. Preserves the padding-trim
+    // safety net for synthetic or incomplete metadata.
     if raw_payload.len() < 4 {
         return raw_payload;
     }
