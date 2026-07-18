@@ -1729,6 +1729,136 @@ fn set_queue_state_toggles_armed_on_known_queue() {
     );
 }
 
+// --- #5621: control-socket handlers must SURFACE a failed reconcile ------
+//
+// binding.rs / queue.rs / rebind.rs used to `let _ =
+// reconcile_status_bindings(guard)` — discarding the `Result`. When the
+// reconcile FAILED (a mandatory-pin preflight fault, or a forwarding-build
+// integrity error on the ALREADY-ACCEPTED snapshot) the handler still acked
+// ok=true, so the control-socket caller believed the AF_XDP sockets were
+// (re)bound when they were not. These tests fault the reconcile with a stored
+// snapshot whose forwarding build fails (an unparseable /33 interface address —
+// the #3789 fixture) and pin ok=false + the surfaced error. Reverting the
+// matching site to `let _ = reconcile_status_bindings(...)` flips the
+// assertion RED (target-count 1 per site): the discard restores ok=true.
+// Distinct from #5143 (that was the apply_snapshot rejected-snapshot leg).
+
+/// A stored snapshot whose forwarding build FAILS (unparseable `/33` address).
+/// With `forwarding_armed` + `forwarding_supported`, `reconcile_status_bindings`
+/// takes the armed arm and `afxdp.reconcile` returns `Err` on this snapshot —
+/// the same fault the #3789 apply-leg tests use.
+fn failing_reconcile_snapshot() -> crate::ConfigSnapshot {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 7,
+        fib_generation: 7,
+        generated_at: chrono::Utc::now(),
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![tunnel_iface_3789("10.0.0.0/33")],
+        ..ConfigSnapshot::default()
+    }
+}
+
+/// Armed + forwarding-supported helper carrying a stored snapshot that will
+/// fault the reconcile. The already-accepted snapshot models the #5621
+/// scenario: a registration toggle / rebind re-runs the reconcile, which
+/// faults, and the handler must NOT report success.
+fn armed_state_with_failing_reconcile(bindings: Vec<BindingStatus>) -> Arc<Mutex<ServerState>> {
+    Arc::new(Mutex::new(ServerState {
+        status: ProcessStatus {
+            forwarding_armed: true,
+            capabilities: forwarding_caps(),
+            bindings,
+            ..ProcessStatus::default()
+        },
+        snapshot: Some(failing_reconcile_snapshot()),
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }))
+}
+
+#[test]
+fn set_binding_state_failed_reconcile_reports_error_5621() {
+    // registered toggles false -> true so `registration_changed` fires the
+    // reconcile; the stored bad snapshot makes that reconcile return Err.
+    let state = armed_state_with_failing_reconcile(vec![BindingStatus {
+        slot: 0,
+        registered: false,
+        ifindex: 10,
+        ..BindingStatus::default()
+    }]);
+    let mut request = req("set_binding_state");
+    request.binding = Some(BindingControlRequest {
+        slot: 0,
+        registered: true,
+        armed: true,
+    });
+    let response = run_request(state, request);
+    assert!(
+        !response.ok,
+        "#5621: set_binding_state must report ok=false when the reconcile fails"
+    );
+    assert!(
+        response.error.contains("binding reconcile failed"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn set_queue_state_failed_reconcile_reports_error_5621() {
+    // registered toggles false -> true so `registration_changed` fires the
+    // reconcile; the stored bad snapshot makes that reconcile return Err.
+    let state = armed_state_with_failing_reconcile(vec![BindingStatus {
+        slot: 0,
+        queue_id: 2,
+        registered: false,
+        ifindex: 10,
+        ..BindingStatus::default()
+    }]);
+    let mut request = req("set_queue_state");
+    request.queue = Some(QueueControlRequest {
+        queue_id: 2,
+        registered: true,
+        armed: true,
+    });
+    let response = run_request(state, request);
+    assert!(
+        !response.ok,
+        "#5621: set_queue_state must report ok=false when the reconcile fails"
+    );
+    assert!(
+        response.error.contains("queue reconcile failed"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn rebind_failed_reconcile_reports_error_5621() {
+    // rebind unconditionally reconciles; the stored bad snapshot makes that
+    // reconcile return Err. Before #5621 rebind::handle took no `response`
+    // and always acked ok=true.
+    let state = armed_state_with_failing_reconcile(vec![BindingStatus {
+        slot: 0,
+        registered: true,
+        ifindex: 10,
+        ..BindingStatus::default()
+    }]);
+    let response = run_request(state, req("rebind"));
+    assert!(
+        !response.ok,
+        "#5621: rebind must report ok=false when the reconcile fails"
+    );
+    assert!(
+        response.error.contains("rebind reconcile failed"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
 #[test]
 fn stop_workers_clears_socket_fields_on_all_bindings() {
     // stop_workers must tear down per-binding socket state so the

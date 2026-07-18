@@ -3,8 +3,13 @@
 
 use super::super::helpers::{reconcile_status_bindings, refresh_status};
 use super::super::ServerState;
+use crate::ControlResponse;
 
-pub(super) fn handle(guard: &mut ServerState, persist_state: &mut bool) {
+pub(super) fn handle(
+    guard: &mut ServerState,
+    response: &mut ControlResponse,
+    persist_state: &mut bool,
+) {
     // After a link DOWN/UP cycle (e.g. RETH MAC programming),
     // the kernel destroys the XSK receive queue.  Clear binding
     // state and reconcile to recreate the AF_XDP sockets from
@@ -46,8 +51,23 @@ pub(super) fn handle(guard: &mut ServerState, persist_state: &mut bool) {
     // #3789: rebind re-creates the AF_XDP sockets for the ALREADY-ACCEPTED
     // stored snapshot after a link DOWN/UP cycle — it does not introduce a
     // new config, so a reconcile reject cannot persist a rejected snapshot
-    // here. Discard the outcome explicitly.
-    let _ = reconcile_status_bindings(guard);
+    // here.
+    //
+    // #5621: the reconcile itself can still FAIL — the mandatory-pin preflight
+    // can fault, or the forwarding build can hit a non-policy integrity error
+    // on the already-accepted snapshot. Discarding that Err made rebind ack
+    // ok=true while the AF_XDP sockets were NOT recreated, so the
+    // control-socket caller believed the rebind succeeded when it did not.
+    // Surface the failure: report ok=false + the error, refresh status so
+    // `show` reflects the real per-binding state, and do NOT persist a success
+    // we didn't achieve.
+    if let Err(err) = reconcile_status_bindings(guard) {
+        response.ok = false;
+        response.error = format!("rebind reconcile failed: {err}");
+        refresh_status(guard);
+        eprintln!("rebind: reconcile failed: {err}");
+        return;
+    }
     refresh_status(guard);
     *persist_state = true;
     eprintln!(

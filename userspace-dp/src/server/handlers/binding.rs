@@ -31,9 +31,23 @@ pub(super) fn set(
         if registration_changed {
             // #3789: re-binds the ALREADY-ACCEPTED stored snapshot (a
             // binding registration toggle, not a new config), so a build
-            // reject cannot introduce a rejected snapshot here — discard
-            // the outcome explicitly.
-            let _ = reconcile_status_bindings(guard);
+            // reject cannot introduce a rejected snapshot here.
+            //
+            // #5621: the reconcile itself can still FAIL — the mandatory-pin
+            // preflight can fault, or the forwarding build can hit a
+            // non-policy integrity error on the already-accepted snapshot.
+            // Discarding that Err made the handler ack ok=true while the
+            // AF_XDP sockets were NOT actually rebound, so the control-socket
+            // caller believed the reconcile succeeded when it did not.
+            // Surface the failure: report ok=false + the error, refresh
+            // status so `show` reflects the real per-binding state, and do
+            // NOT persist a success we didn't achieve.
+            if let Err(err) = reconcile_status_bindings(guard) {
+                response.ok = false;
+                response.error = format!("binding reconcile failed: {err}");
+                refresh_status(guard);
+                return;
+            }
             wait_for_binding_settle(guard, Duration::from_secs(2));
         }
         refresh_status(guard);

@@ -316,11 +316,23 @@ leg also restores `status.bindings`) and the bumped status-reporting
 fields (`last_snapshot_generation` / `last_fib_generation` /
 `last_snapshot_at` / `capabilities`), report `ok=false`, and do NOT set
 `persist_state`. Because the reconcile aborts *before* teardown, the
-restore is a status/bookkeeping rollback — the data plane never moved. The
-sibling control-socket handlers that reconcile the ALREADY-accepted stored
-snapshot (`set_queue_state`, `set_binding_state`, `rebind`,
-`set_forwarding_state`) explicitly discard the outcome: they introduce no
-new snapshot to reject.
+restore is a status/bookkeeping rollback — the data plane never moved.
+
+The sibling control-socket handlers reconcile the ALREADY-accepted stored
+snapshot (a registration toggle / rebind / forwarding-state change, not a
+new config), so there is no rejected snapshot to un-persist. But
+`reconcile_status_bindings` can still return `Err` even for an accepted
+snapshot — the mandatory-pin preflight can fault, or the forwarding build
+can hit a non-policy integrity error. #5621 stops `set_binding_state`,
+`set_queue_state`, and `rebind` from **discarding** that `Err`: on failure
+they report `ok=false` + the surfaced error, refresh status, and do NOT
+`persist_state`, so the control-socket caller no longer mistakes a failed
+(re)bind for success (previously the `let _ = reconcile_status_bindings(..)`
+discard acked `ok=true` regardless). `rebind::handle` gained a `response`
+parameter to carry the error. `set_forwarding_state` still discards the
+outcome (its arm/disarm reconcile takes the disarmed `Ok` path on disarm and
+surfaces a build reject via each binding's `last_error` on arm) — bringing
+it into the same fail-surfacing shape is a scoped follow-up.
 
 Regression coverage: `coordinator/tests.rs`
 (`reconcile_build_failure_returns_integrity_err_and_keeps_prior_generation_3789`,
@@ -334,7 +346,14 @@ makes `ok=false` / prior-snapshot-kept assertions flip). The
 `apply_snapshot_same_plan_clearing_defer_workers_reconcile_abort_fails_closed_3789`
 test (renamed from `…_reconciles_bindings`, which previously codified the
 swallow) now asserts the deferred-binding reconcile is triggered but the
-missing-pin abort fails closed.
+missing-pin abort fails closed. The #5621 sibling-handler coverage lives in
+`server/tests.rs`
+(`set_binding_state_failed_reconcile_reports_error_5621`,
+`set_queue_state_failed_reconcile_reports_error_5621`,
+`rebind_failed_reconcile_reports_error_5621` — each faults the reconcile
+with a stored `/33`-address snapshot and pins `ok=false`; reverting the
+matching handler to `let _ = reconcile_status_bindings(..)` flips exactly
+its assertion RED).
 
 #### Per-Packet Processing Pipeline
 

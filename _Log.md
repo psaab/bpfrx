@@ -53407,3 +53407,31 @@ top.
   userspace-dp/src/afxdp/coordinator/wg_control.rs,
   userspace-dp/src/afxdp/frame/wg.rs, userspace-dp/src/afxdp/wg/tests.rs,
   docs/research/1888-wg-timers/plan.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5621 — control-socket handlers now SURFACE a failed
+  `reconcile_status_bindings` instead of discarding it. binding.rs /
+  queue.rs / rebind.rs did `let _ = reconcile_status_bindings(guard)`, so a
+  handler acked `ok=true` even when the reconcile FAILED (mandatory-pin
+  preflight fault or a forwarding-build integrity error on the
+  already-accepted snapshot) — the control-socket caller believed the
+  (re)bind succeeded when it did not. Now on `Err` each reports `ok=false` +
+  the surfaced error, refreshes status, and does NOT `persist_state`;
+  `rebind::handle` gained a `response` parameter (dispatcher call site
+  updated). Success path unchanged (clean reconcile still `ok=true`).
+  `set_forwarding_state` still discards (out of scope — flagged follow-up).
+  Added 3 fail-on-revert tests
+  (`set_binding_state_failed_reconcile_reports_error_5621`,
+  `set_queue_state_failed_reconcile_reports_error_5621`,
+  `rebind_failed_reconcile_reports_error_5621`) — each faults the reconcile
+  with a stored `/33`-address snapshot; reverting a site to `let _ = ...`
+  flips exactly its assertion RED (verified: all-3-reverted → 3 fail, 0
+  collateral; rebind-only-unfixed → only rebind fails). Full suite 4027
+  passed / 0 failed. NOT HA/session-sync — local control-socket reconcile.
+- **File(s)**: userspace-dp/src/server/handlers/binding.rs,
+  userspace-dp/src/server/handlers/queue.rs,
+  userspace-dp/src/server/handlers/rebind.rs,
+  userspace-dp/src/server/handlers/mod.rs,
+  userspace-dp/src/server/tests.rs,
+  userspace-dp/src/server/README.md,
+  docs/userspace-dataplane-architecture.md
