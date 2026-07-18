@@ -2932,11 +2932,17 @@ fn flow_cache_normal_resolve_caches_and_serves_neighbor_mac() {
 // `outer_neighbor_ifindex(.., None, ..)`, which returns the outer ifindex for a
 // tunnel and `egress_ifindex` for a direct resolution.
 //
-// RED-ON-REVERT: reverting either stamp site to `decision.resolution.egress_ifindex`
-// makes `entry.neighbor_shard` the LOGICAL (362) shard, so (1) the structural
-// assert fails (shard != outer shard) and (2) the behavioral assert fails (a
-// bump on the OUTER shard leaves the logical shard's epoch untouched -> not
-// stale -> no eviction).
+// RED-ON-REVERT: this test pins the flow_cache `neighbor_shard` STAMP site
+// (it sets the resolve-time `neighbor_mac_epoch = 0` directly, so it does not
+// exercise the poll_descriptor pre-resolve epoch-snapshot site). Reverting the
+// flow_cache stamp to `decision.resolution.egress_ifindex` makes
+// `entry.neighbor_shard` the LOGICAL (362) shard, so (1) the structural assert
+// fails (shard != outer shard) and (2) the behavioral assert fails (a bump on
+// the OUTER shard leaves the logical shard's epoch untouched -> not stale -> no
+// eviction). The poll_descriptor epoch-snapshot site is keyed identically by
+// construction (the same `outer_neighbor_ifindex(.., None, ..)` call on the
+// same `&decision.resolution`); an independent fail-on-revert test for that
+// second site is a follow-up (#5147 review nit).
 #[test]
 fn tunnel_flow_cache_keys_mac_change_shard_on_outer_neighbor_not_logical_ifindex() {
     use crate::afxdp::sharded_neighbor::ShardedNeighborMap;
