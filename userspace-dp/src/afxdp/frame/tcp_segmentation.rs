@@ -61,8 +61,14 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
         // valid IPv4 MTU of 68-1279 to the IPv6-minimum LINK MTU (1280, NOT an
         // IPv4 floor — IPv4 min is 68), so a non-DF TCP datagram whose L3 length
         // fell in (real_mtu, 1280] was chunked to 1280 and still oversize. A
-        // 0 result (no egress entry / unknown MTU) fails closed via the
-        // `mtu == 0` guard below (previously dead under the floor).
+        // 0 result (no egress entry / unknown MTU) is NOT chunked to a made-up
+        // size: the now-live `mtu == 0` guard below returns None so the frame is
+        // forwarded WHOLE (best-effort / fail-OPEN) — in contrast to the TUNNEL
+        // branch above, whose 0 budget genuinely fail-CLOSES (an un-encapsulable
+        // frame is dropped). If the whole frame is oversize for the real link it
+        // may be dropped DOWNSTREAM, but `mtu == 0` here means a route to an
+        // unconfigured egress (an inconsistent snapshot), so the practical risk
+        // is low.
         forwarding
             .egress
             .get(&decision.resolution.egress_ifindex)

@@ -53010,3 +53010,14 @@ top.
   three floor sites now have a target-count-1 gate. Full release suite 4000
   passed / 0 failed.
 - **File(s)**: userspace-dp/src/afxdp/tx/dispatch/tests/segmentation.rs
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5159 review nit (rev6101, team-lead-verified) — corrected the
+  PLAIN-branch mtu==0 comment in frame/tcp_segmentation.rs. It said "fails closed
+  via the mtu==0 guard", but for a plain (non-tunnel) forward mtu==0 → builder
+  returns None → the frame is forwarded WHOLE (best-effort / fail-OPEN), NOT
+  dropped. Rewrote to state that accurately and contrast it with the TUNNEL
+  branch's genuine fail-CLOSED (un-encapsulable → drop). Comment-only; the
+  tunnel-branch fail-closed comments (:32/:36/:443) and the tx/dispatch plain
+  comments (already "forward unchanged") are untouched.
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs
