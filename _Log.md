@@ -52256,3 +52256,40 @@ top.
   pkg/config/compiler_uniformgates.go, pkg/config/compiler_peer_effective_snat.go,
   pkg/config/compiler_nat_source_pool_aggregate_5877_test.go,
   docs/config-schema.md, _Log.md
+
+## 2026-07-18 — #5341: deterministic-CGNAT address-only occupancy token
+
+- **Timestamp**: 2026-07-18
+- **Action**: Fixed the un-tokened deterministic-CGNAT (mode 1) address-only
+  sub-branch — follow-up to #5336's round-robin/persistent #5269 fix. A REAL
+  address-only flow (`port no-translation` on a port-bearing protocol, or a
+  port-less protocol) on a deterministic pool now mints the SAME
+  reverse-identity occupancy token via `PortAllocator::reserve_address_only`,
+  so two subscribers sharing one deterministic external address (same preserved
+  source port + remote) can no longer both receive the identical public reverse
+  tuple the 1:N index cannot disambiguate — the second collides and fails
+  closed as exhaustion, mirroring #5336 exactly. The synthetic tuple-unknown
+  wrapper still mints no token (never a framed flow). The token is freed by the
+  SAME teardown path (`release_source_nat_allocation` → `release_flow`) as the
+  round-robin branch — no new release site, no leak, no double-free.
+- **Scope note**: only ONE site needed the fix. `SourceNatRule` carries only
+  `deterministic_v4`; deterministic v6 (mode 2 / NAPT64) is the NAT64 path
+  (`allocate_nat64_pool_port_deterministic_v6`), which is ALWAYS PAT (returns
+  `(Ipv4Addr, u16)`, always sets `rewrite_src_port`) and has no address-only
+  sub-branch — no token gap there.
+- **Docs**: the #5269/#5336 occupancy-token invariant is documented in the
+  `source.rs`/`allocator.rs` code comments, not the FEATURES.md `nat.rs`
+  config-surface row, so the doc contract for this change is the inline
+  comments — updated the deterministic branch lead comment + added the #5341
+  mint block.
+- **Tests**: `deterministic_cgnat_no_translation_collision_denies_second_flow_5341`
+  (fail-on-revert: A mints token, B collides → exhaustion),
+  `deterministic_cgnat_no_translation_token_released_on_teardown_5341`
+  (release-on-close: token freed, B then succeeds),
+  `deterministic_cgnat_no_translation_distinct_remote_both_succeed_5341`
+  (disambiguation: distinct remotes → distinct reverse identities coexist on
+  one deterministic address). Reverting the mint turns all 3 RED (verified).
+- **Validation**: cargo build clean; `cargo test --bin xpf-userspace-dp nat::`
+  253 passed / 0 failed; new tests 5x flake check all green.
+- **File(s)**: userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs, _Log.md
