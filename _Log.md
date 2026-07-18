@@ -1,3 +1,93 @@
+## 2026-07-18 — #5468 (PR #6085 fold): bound the AGGREGATE worker-loop lossless wait (resync/export), not just per-call
+
+- **Timestamp**: 2026-07-18 (fix/5468-lossless-worker-stall, folding rev5468 review finding #2)
+- **Action**: The initial #5468 fix bounded each individual `flush_session_deltas`
+  lossless send to `WORKER_LOSSLESS_QUEUE_BUDGET` (~1 s). But the drain region on
+  the worker loop calls `flush_session_deltas` MANY times per iteration: the
+  steady-state drain is one call, yet the #2442 loss-of-sync resync and the #2653
+  command export (`take_delta_loss` → `chunked_drain_as_you_export!` →
+  `drain_and_flush_all!`, `worker/loop_body/mod.rs`) call it ONCE PER 256-delta
+  batch across the whole owned-session set. For K owned sessions that is ~K/256
+  calls; at ~1 budget each an unread peer would still stall the worker ~(K/256)
+  budgets — past K≈1280 (5 batches) that re-crosses `HEARTBEAT_STALE_AFTER` and
+  re-triggers the SAME spurious failover, now via the resync path. A single
+  dropped incremental delta arms a full-K resync, so the trigger is trivial and
+  the amplification real.
+  Fix: a per-drain-cycle `worker_lossless_wedged: &mut bool` latch, declared
+  before the flush macro, reset at the top of each worker-loop iteration, and
+  threaded through EVERY `flush_session_deltas` call (both `flush_drained_session_
+  deltas!` arms). `flush_session_deltas` seeds `event_stream_out_of_sync` from the
+  latch and writes it back: the first wedged batch waits one budget and sets the
+  latch; every later call this cycle inherits it and SKIPS the lossless wait
+  entirely (never re-attempts a push), while still draining each delta to the
+  per-binding live RPC buffer, the shared conntrack/session tables, peer-worker
+  delete replication, and best-effort RT_FLOW. So the AGGREGATE worker-loop
+  lossless WAIT per drain cycle is ~1 budget regardless of K, for both the
+  incremental push and the resync/export. Every wedged batch still returns
+  out-of-sync, so the loss-of-sync latch stays set and the resync RETRIES next
+  cycle (deliver-or-resync, never a silent drop). This preserves the #2653
+  command export's live-buffer completeness and its `session_export_ack` contract
+  (only the WAIT is skipped, not the drain) — which a literal early-exit of the
+  resync loop would have broken.
+- **File(s)**: userspace-dp/src/afxdp/session_delta.rs (aggregate `worker_lossless_
+  wedged` in/out param + seed/writeback), userspace-dp/src/afxdp/worker/loop_body/
+  mod.rs (per-cycle latch decl + reset + threading through both flush macro arms),
+  userspace-dp/src/afxdp/session_glue/tests.rs (new fail-on-revert aggregate test
+  `resync_export_aggregate_lossless_wait_is_bounded_below_heartbeat` + 6 existing
+  call-site updates), docs/session-sync-architecture.md + event_stream/README.md
+  (corrected the "one lossless wait per drain cycle even on a wedged consumer"
+  overstatement to the true aggregate guarantee).
+- **Validation**: `cargo build` green (no new warnings). New test drives 8 resync
+  batches (>1280 sessions at 256/batch) against a connected-but-unread full
+  channel sharing one wedge latch and asserts the aggregate stays < HEARTBEAT_
+  STALE_AFTER; it completes in ~1.00 s (fix collapses to ~1 budget). Reverting the
+  aggregate inheritance (`= *worker_lossless_wedged` → `= false`) makes it take
+  8.00 s (~8× budget) and FAIL the bounded assertion, while the sibling per-call
+  test still passes — a clean assertion RED, not a build break. event_stream /
+  session / session_glue / worker / ha suites green (worker+ha+session_glue: 158
+  passing); 5× flake check on the new + existing #5468 tests green (~1.00 s each).
+  Pre-existing env-flaky test `stalled_consumer_does_not_grow_backlog_unbounded_
+  end_to_end` fails at the base SHA (ac229897f) too (verified via stash) — it
+  never calls `flush_session_deltas`, unrelated to this change. Loss-cluster
+  failover smoke advised (parent to run).
+
+## 2026-07-17 — #5468: bound the worker-loop lossless session-delta send below HEARTBEAT_STALE_AFTER
+
+- **Timestamp**: 2026-07-17 (fix/5468-lossless-worker-stall)
+- **Action**: `flush_session_deltas` runs on the packet worker loop and routed
+  correctness-critical HA session open/close deltas through the LOSSLESS
+  event-stream producer `push_delta_lossless` (#2874), which retries a full
+  channel up to `LOSSLESS_QUEUE_TIMEOUT` = 5 s. That equals `HEARTBEAT_STALE_AFTER`
+  (5 s), so a connected-but-UNREAD peer (slow/stalled reader, queue full) could
+  block the worker loop the full 5 s → the loop stops stamping its heartbeat →
+  the peer marks this node stale → false liveness loss / spurious failover.
+  Fix: added `EventStreamWorkerHandle::push_delta_lossless_within(delta, zone,
+  budget)` (parameterizes `send_lossless_encoded`'s deadline) and a new
+  `WORKER_LOSSLESS_QUEUE_BUDGET` const (= `HEARTBEAT_STALE_AFTER / 5`, ~1 s, with
+  a compile-time `assert!` it stays ≤ half the stale threshold). `flush_session_deltas`
+  now uses the bounded variant; on the bounded timeout it latches loss-of-sync
+  exactly as before (`set_delta_loss` → `take_delta_loss` full owner-RG resync),
+  so losslessness is preserved (deliver-or-resync, never a silent drop). The
+  off-worker-loop exporters (`AllSessionsExport::push` bulk export,
+  `push_purge_close_deltas` tunnel-remap purge) keep the 5 s `LOSSLESS_QUEUE_TIMEOUT`
+  via `push_delta_lossless` — they run off the packet loop so the heartbeat is
+  unaffected.
+- **File(s)**: userspace-dp/src/afxdp/mod.rs (WORKER_LOSSLESS_QUEUE_BUDGET +
+  static assert), userspace-dp/src/event_stream/mod.rs (timeout param on
+  send_lossless_encoded, push_delta_lossless_within, test_worker_handle_connected
+  seam), userspace-dp/src/afxdp/session_delta.rs (bounded call at the worker
+  loop), userspace-dp/src/afxdp/session_glue/tests.rs (fail-on-revert test:
+  connected+full queue → bounded return + loss-of-sync latch), event_stream
+  README + docs/session-sync-architecture.md.
+- **Validation**: `cargo build` green; new test
+  `flush_session_deltas_full_queue_send_is_bounded_and_latches_out_of_sync`
+  passes in ~1 s (waits the budget then latches); reverting the worker-loop call
+  to unbounded `push_delta_lossless` makes it take 5.0 s and FAIL the bounded
+  assertion. event_stream/session_delta/ha/session suites green (203 + 172
+  passing); 5× flake check green. Pre-existing env-flaky test
+  `stalled_consumer_does_not_grow_backlog_unbounded_end_to_end` fails at the
+  BASE SHA too (verified via stash) — unrelated to this change. Loss-cluster
+  failover smoke advised (parent to run).
 ## 2026-07-17 — #5450: delete-journal overflow must arm a full bulk resync
 
 - **Timestamp**: 2026-07-17 (fix/5450-delete-journal-reconcile)

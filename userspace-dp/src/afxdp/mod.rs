@@ -370,6 +370,29 @@ const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
 const HEARTBEAT_GRACE_PERIOD_NS: u64 = 6_000_000_000; // 6 seconds
 const TX_WAKE_MIN_INTERVAL_NS: u64 = 50_000;
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
+/// #5468: upper bound on the worker-loop lossless session-delta send
+/// (`flush_session_deltas` -> `EventStreamWorkerHandle::push_delta_lossless_within`).
+///
+/// `flush_session_deltas` runs on the packet worker loop, so a connected-but-
+/// unread peer (a slow/stalled reader whose lossless queue is full) must not be
+/// able to block the loop for the full 5 s `LOSSLESS_QUEUE_TIMEOUT`: that
+/// exceeds `HEARTBEAT_STALE_AFTER`, so the loop stops stamping its heartbeat,
+/// the peer marks this node stale, and a spurious failover fires. Bounding the
+/// worker-side wait to one fifth of the stale threshold leaves 5x headroom for
+/// the rest of the loop iteration plus the heartbeat map write, while still
+/// tolerating realistic transient reader pauses (a healthy consumer drains the
+/// channel in microseconds). On timeout the caller latches loss-of-sync (a full
+/// owner-RG resync via `take_delta_loss`), so the #2874 losslessness contract is
+/// preserved (deliver-or-resync, never a silent drop). The off-worker-loop bulk
+/// export/purge paths keep the longer `LOSSLESS_QUEUE_TIMEOUT`.
+const WORKER_LOSSLESS_QUEUE_BUDGET: Duration =
+    Duration::from_nanos((HEARTBEAT_STALE_AFTER.as_nanos() / 5) as u64);
+// Compile-time invariant: the worker-side lossless budget must stay well below
+// the heartbeat-stale threshold, or the fix regresses into the #5468 stall.
+const _: () = assert!(
+    WORKER_LOSSLESS_QUEUE_BUDGET.as_nanos() * 2 <= HEARTBEAT_STALE_AFTER.as_nanos(),
+    "WORKER_LOSSLESS_QUEUE_BUDGET must be well below HEARTBEAT_STALE_AFTER (#5468)"
+);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
 const MAX_RECENT_SESSION_DELTAS: usize = 64;
 const MAX_PENDING_SESSION_DELTAS: usize = 4096;
