@@ -52517,3 +52517,27 @@ top.
 - **File(s)**: docs/generated-reply-rate-limit.md,
   userspace-dp/src/afxdp/icmp.rs, userspace-dp/src/afxdp/tx/dispatch/mod.rs,
   _Log.md
+
+## #6101 — slow-path record_exception alloc + cross-worker exception-ring merge test (2026-07-18)
+
+- **Timestamp**: 2026-07-18
+- **Action**: Item 1 — make the slow-path reinject-failure exception record path
+  alloc-free. Added `ExceptionEvent::reason_suffix: &'static str` and
+  `disposition::record_exception_suffixed()` (base `&'static` reason + `&'static`
+  suffix, no per-event `format!`/`String`). Replaced the four
+  `record_exception_owned(&format!("{reason}_..."))` sites in `slow_path.rs`
+  (`_rate_limited` / `_queue_full` / `_slow_path_mtu_exceeded` /
+  `_enqueue_failed`) with `record_exception_suffixed`. `ExceptionEvent::reason()`
+  now returns `Cow<str>` reconstructing `"{reason}{suffix}"` on the status thread
+  (borrowed for the common no-suffix case). `maybe_reinject_slow_path_from_frame`
+  `reason` param tightened to `&'static str`. Corrected the `record_exception_owned`
+  doc-comment (now genuinely debug-log-only after the slow-path sites moved off it).
+  Item 2 — added `status_tests.rs::exception_ring_merge_6101` covering the
+  cross-worker `recent_exceptions()` merge/sort/cap across 2 per-worker rings +
+  control ring, `last_resolution()` newest-across-slots, and the bringup/teardown
+  `.remove` drop. Added `#[cfg(test)]` `ExceptionEvent::for_test` /
+  `ResolutionEvent::for_test` constructors.
+- **File(s)**: userspace-dp/src/afxdp/disposition.rs,
+  userspace-dp/src/afxdp/tx/dispatch/slow_path.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/status_tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md

@@ -78,6 +78,15 @@ pub(crate) struct ExceptionEvent {
     pub(in crate::afxdp) mono: Instant,
     /// Static reason literal (the hot-path case — Copy, no allocation).
     pub(in crate::afxdp) reason: &'static str,
+    /// Optional `'static` reason SUFFIX (the hot-path variant case — Copy,
+    /// no allocation). When non-empty the effective reason is
+    /// `concat(reason, reason_suffix)`, reconstructed only on the control
+    /// thread. This lets the slow-path reinject-failure sites (which pair a
+    /// `&'static` base reason with one of a fixed set of `&'static` outcome
+    /// suffixes — `_rate_limited` / `_queue_full` / …) record WITHOUT the
+    /// per-event `format!`/`String` alloc the old owned path paid on a
+    /// reinject-failure flood (#6101). `""` on every other path.
+    pub(in crate::afxdp) reason_suffix: &'static str,
     /// Rare cold-path (spawn/tunnel-setup failure) DYNAMIC reason that
     /// cannot be a `'static` literal (`format!("...:{id}:{err}")`). When
     /// present it OVERRIDES `reason` in the rendered status. `None` on the
@@ -108,10 +117,21 @@ pub(crate) struct ExceptionEvent {
 }
 
 impl ExceptionEvent {
-    /// The effective reason string (cold dynamic override wins over the
-    /// static literal). Cheap `&str` view — no allocation.
-    pub(crate) fn reason(&self) -> &str {
-        self.reason_owned.as_deref().unwrap_or(self.reason)
+    /// The effective reason string. Precedence: a cold DYNAMIC
+    /// `reason_owned` override wins; otherwise the `&'static` base `reason`
+    /// with any `&'static` `reason_suffix` concatenated. Borrows (no
+    /// allocation) for the common no-suffix case; allocates ONLY when a
+    /// suffix must be joined, and ONLY on the control/status read path —
+    /// never on the packet record path (#6101).
+    pub(crate) fn reason(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(owned) = self.reason_owned.as_deref() {
+            return std::borrow::Cow::Borrowed(owned);
+        }
+        if self.reason_suffix.is_empty() {
+            std::borrow::Cow::Borrowed(self.reason)
+        } else {
+            std::borrow::Cow::Owned(format!("{}{}", self.reason, self.reason_suffix))
+        }
     }
 
     /// Reconstruct the operator-visible `ExceptionStatus` on the control
@@ -136,7 +156,7 @@ impl ExceptionEvent {
             interface: self.interface.to_string(),
             ifindex: self.ifindex,
             ingress_ifindex: self.ingress_ifindex,
-            reason: self.reason().to_string(),
+            reason: self.reason().into_owned(),
             packet_length: self.packet_length,
             addr_family: self.addr_family,
             protocol: self.protocol,
@@ -303,9 +323,28 @@ fn exception_sample_key(
     meta: Option<UserspaceDpMeta>,
     debug: Option<&ResolutionDebug>,
 ) -> u64 {
+    exception_sample_key_parts(reason, "", meta, debug)
+}
+
+/// Sampler key over (reason ++ suffix, 5-tuple). Hashing the base reason and
+/// the `'static` suffix as two adjacent parts (rather than a joined `String`)
+/// keeps the record path alloc-free while still giving each distinct
+/// `(base, suffix)` its own dedup key — e.g. `slow_path` + `_rate_limited`
+/// and `slow_path` + `_queue_full` sample independently, exactly as the old
+/// `format!`-joined reasons did (#6101). Passing `suffix == ""` reproduces
+/// the plain `exception_sample_key` hash byte-for-byte.
+fn exception_sample_key_parts(
+    reason: &str,
+    suffix: &str,
+    meta: Option<UserspaceDpMeta>,
+    debug: Option<&ResolutionDebug>,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
     reason.hash(&mut h);
+    if !suffix.is_empty() {
+        suffix.hash(&mut h);
+    }
     if let Some(d) = debug {
         match d.src_ip {
             Some(IpAddr::V4(a)) => a.octets().hash(&mut h),
@@ -335,6 +374,7 @@ pub(crate) fn control_notice_event(interface: &str, reason: String) -> Exception
     ExceptionEvent {
         mono: Instant::now(),
         reason: "",
+        reason_suffix: "",
         reason_owned: Some(Arc::from(reason)),
         interface: Arc::from(interface),
         slot: 0,
@@ -370,6 +410,7 @@ fn build_exception_event(
     ExceptionEvent {
         mono: now,
         reason,
+        reason_suffix: "",
         reason_owned: None,
         interface: binding.interface.clone(),
         slot: binding.slot,
@@ -443,11 +484,21 @@ pub(super) fn record_exception(
     }
 }
 
-/// #5289: record a terminal-packet exception with a DYNAMIC (non-`'static`)
-/// reason. Only reached from `cfg!(feature = "debug-log")` forward-tuple
-/// mismatch diagnostics on the worker path; stores the reason as an owned
-/// `Arc<str>` (one small allocation, sampler-gated). The common path uses
-/// [`record_exception`] with a `&'static str` and allocates nothing.
+/// #5289: record a terminal-packet exception whose reason is GENUINELY
+/// DYNAMIC — a runtime-formatted string (`format!("...:{id}:{err}")`) that
+/// cannot be expressed as a `&'static` base plus a fixed `&'static` suffix.
+/// The only such caller is the `cfg!(feature = "debug-log")` forward-tuple
+/// mismatch diagnostic in `tx/dispatch/mod.rs` (compiled in, but the reason
+/// is built and this fn is reached only when that feature is enabled).
+/// The reason is stored as an owned `Arc<str>` (one small allocation,
+/// sampler-gated).
+///
+/// Do NOT use this for a `base + '_static_suffix'` reason: the slow-path
+/// reinject-failure sites (`_rate_limited` / `_queue_full` /
+/// `_slow_path_mtu_exceeded` / `_enqueue_failed`) use
+/// [`record_exception_suffixed`], which records those alloc-free (#6101);
+/// the plain `&'static` reason path uses [`record_exception`] and likewise
+/// allocates nothing.
 pub(super) fn record_exception_owned(
     recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     binding: &BindingIdentity,
@@ -463,6 +514,35 @@ pub(super) fn record_exception_owned(
     {
         let mut event = build_exception_event(now, binding, "", packet_length, meta, debug);
         event.reason_owned = Some(Arc::from(reason));
+        ring.push(event);
+    }
+}
+
+/// #6101: record a terminal-packet exception whose reason is a `&'static`
+/// base joined with one of a fixed set of `&'static` outcome suffixes
+/// (`_rate_limited` / `_queue_full` / `_slow_path_mtu_exceeded` /
+/// `_enqueue_failed`). Both halves are `Copy` `&'static str`, so the record
+/// path stores them WITHOUT the per-event `format!`/`String` allocation the
+/// old `record_exception_owned(&format!("{reason}_rate_limited"))` sites paid
+/// on a slow-path reinject-failure flood. The operator-visible reason text is
+/// reconstructed identically on the control thread by
+/// [`ExceptionEvent::reason`] (`concat(reason, reason_suffix)`).
+pub(super) fn record_exception_suffixed(
+    recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
+    binding: &BindingIdentity,
+    reason: &'static str,
+    suffix: &'static str,
+    packet_length: u32,
+    meta: Option<UserspaceDpMeta>,
+    debug: Option<&ResolutionDebug>,
+) {
+    let now = Instant::now();
+    let key = exception_sample_key_parts(reason, suffix, meta, debug);
+    if let Ok(mut ring) = recent_exceptions.lock()
+        && ring.admit(key, now)
+    {
+        let mut event = build_exception_event(now, binding, reason, packet_length, meta, debug);
+        event.reason_suffix = suffix;
         ring.push(event);
     }
 }
@@ -873,6 +953,67 @@ pub(super) fn update_last_resolution(
 }
 
 #[cfg(test)]
+impl ExceptionEvent {
+    /// Test-only constructor: a minimal POD event with a caller-controlled
+    /// monotonic timestamp, `&'static` reason and interface tag. Used to
+    /// exercise the cross-worker ring merge (`Coordinator::recent_exceptions`)
+    /// deterministically without touching `Instant::now()` ordering. All
+    /// packet/zone fields default; `reason_suffix`/`reason_owned` are empty.
+    pub(in crate::afxdp) fn for_test(mono: Instant, reason: &'static str, interface: &str) -> Self {
+        ExceptionEvent {
+            mono,
+            reason,
+            reason_suffix: "",
+            reason_owned: None,
+            interface: Arc::from(interface),
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            ifindex: 0,
+            ingress_ifindex: 0,
+            packet_length: 0,
+            addr_family: 0,
+            protocol: 0,
+            config_generation: 0,
+            fib_generation: 0,
+            src_ip: None,
+            dst_ip: None,
+            src_port: 0,
+            dst_port: 0,
+            from_zone_id: None,
+            to_zone_id: None,
+            rule_name: None,
+            pool_name: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ResolutionEvent {
+    /// Test-only constructor: a resolution slot with a caller-controlled
+    /// monotonic timestamp and a distinguishing `egress_ifindex` (surfaced in
+    /// the reconstructed `PacketResolution.egress_ifindex`, so a merge test
+    /// can assert which slot's event won the newest-by-`mono` selection).
+    pub(in crate::afxdp) fn for_test(mono: Instant, egress_ifindex: i32) -> Self {
+        ResolutionEvent {
+            mono,
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex,
+                tx_ifindex: egress_ifindex,
+                tunnel_endpoint_id: 0,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            debug: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests_5289_exception_ring {
     //! #5289 fail-on-revert coverage for the per-worker POD exception ring.
     //!
@@ -1029,5 +1170,104 @@ mod tests_5289_exception_ring {
         let status = ev.to_status(MonoWallAnchor::capture(), &forwarding);
         assert_eq!(status.rule_name, "snat-rule-1");
         assert_eq!(status.pool_name, "pool-a");
+    }
+
+    // #6101 (item 1) fail-on-revert: the slow-path reinject-failure sites
+    // record a `&'static` base reason + a `&'static` suffix ALLOC-FREE (no
+    // per-event `format!`/`String`), and the control thread reconstructs the
+    // byte-identical `"{reason}{suffix}"` operator text. Reverting the record
+    // path to `record_exception_owned(&format!("{reason}_rate_limited"))` sets
+    // `reason_owned` (fails the alloc-free `reason_owned.is_none()` assertion)
+    // and empties `reason`/`reason_suffix` (fails the static-part assertions);
+    // dropping the suffix from the joined string fails the reconstruction.
+    #[test]
+    fn record_exception_suffixed_is_alloc_free_and_reconstructs_reason() {
+        let forwarding = ForwardingState::default();
+        let binding = ident();
+
+        // The (base, suffix) pairs the `slow_path.rs` reinject-failure sites
+        // emit (both slow-path bases × the four outcome suffixes), each paired
+        // with the historical `format!` output they MUST stay byte-identical to.
+        let cases = [
+            ("slow_path", "_rate_limited", "slow_path_rate_limited"),
+            ("slow_path", "_queue_full", "slow_path_queue_full"),
+            (
+                "slow_path",
+                "_slow_path_mtu_exceeded",
+                "slow_path_slow_path_mtu_exceeded",
+            ),
+            ("slow_path", "_enqueue_failed", "slow_path_enqueue_failed"),
+            (
+                "forward_build_slow_path",
+                "_rate_limited",
+                "forward_build_slow_path_rate_limited",
+            ),
+        ];
+
+        for (base, suffix, expected) in cases {
+            let ring = Arc::new(Mutex::new(ExceptionEventRing::new()));
+            record_exception_suffixed(&ring, &binding, base, suffix, 128, None, None);
+
+            let g = ring.lock().expect("ring");
+            let ev = g.back().expect("event");
+            // Alloc-free record path: base + suffix are stored as the two
+            // `&'static` parts, NOT joined into an owned String.
+            assert_eq!(ev.reason, base, "base reason stored as the static literal");
+            assert_eq!(
+                ev.reason_suffix, suffix,
+                "suffix stored as the static literal"
+            );
+            assert!(
+                ev.reason_owned.is_none(),
+                "the record path must NOT allocate a per-event String \
+                 (reason_owned stays None) for {expected}"
+            );
+            // Byte-identical operator-visible reconstruction, both via the
+            // `reason()` accessor and the fully rendered `ExceptionStatus`.
+            assert_eq!(
+                ev.reason(),
+                expected,
+                "reconstructed reason == the retired format! output"
+            );
+            let status = ev.to_status(MonoWallAnchor::capture(), &forwarding);
+            assert_eq!(
+                status.reason, expected,
+                "ExceptionStatus.reason byte-identical to the old formatted text"
+            );
+        }
+    }
+
+    // #6101 (item 1): the sampler key folds in the suffix, so an identical
+    // (base,suffix) flood collapses to one entry while a DISTINCT suffix on
+    // the same base is admitted as its own event — matching the pre-fix
+    // `format!`-joined reasons, which the sampler keyed on in full.
+    #[test]
+    fn record_exception_suffixed_samples_flood_but_keys_include_suffix() {
+        let binding = ident();
+        let ring = Arc::new(Mutex::new(ExceptionEventRing::new()));
+
+        // An identical (base,suffix) flood is sampled down to one entry.
+        for _ in 0..5 {
+            record_exception_suffixed(&ring, &binding, "slow_path", "_rate_limited", 64, None, None);
+        }
+        assert_eq!(
+            ring.lock().expect("ring").len(),
+            1,
+            "an identical suffixed flood is sampled to a single ring entry"
+        );
+
+        // A DISTINCT suffix on the same base is a DISTINCT sampler key.
+        record_exception_suffixed(&ring, &binding, "slow_path", "_queue_full", 64, None, None);
+        let g = ring.lock().expect("ring");
+        assert_eq!(
+            g.len(),
+            2,
+            "a distinct suffix is not collapsed into the prior key"
+        );
+        let reasons: Vec<String> = g.iter().map(|e| e.reason().into_owned()).collect();
+        assert_eq!(
+            reasons,
+            vec!["slow_path_rate_limited", "slow_path_queue_full"]
+        );
     }
 }
