@@ -535,8 +535,16 @@ func (es *EventStream) readLoop(ctx context.Context) {
 		case EventTypeSessionOpen, EventTypeSessionUpdate:
 			delta, ok := decodeSessionEvent(payload)
 			if !ok {
-				es.DecodeErrors.Add(1)
-				continue
+				// #5483: a COMPLETE but semantically undecodable session-sync
+				// frame is a HARD sync break, exactly like a #2874 sequence gap
+				// — it carries session state the standby needs. Skipping it with
+				// `continue` (the pre-#5483 bug) would let a later telemetry
+				// frame advance the cumulative ACK past this seq, trimming the
+				// helper's replay buffer over the unapplied session state and
+				// silently diverging the standby. Force a full resync instead;
+				// do NOT advance prevSeq/lastAppliedSeq/ACK past the hole.
+				es.handleSessionDecodeFailure(seq)
+				return
 			}
 			if typ == EventTypeSessionOpen {
 				delta.Event = "open"
@@ -563,8 +571,11 @@ func (es *EventStream) readLoop(ctx context.Context) {
 		case EventTypeSessionClose:
 			delta, ok := decodeSessionCloseEvent(payload)
 			if !ok {
-				es.DecodeErrors.Add(1)
-				continue
+				// #5483: see the SessionOpen/Update case — an undecodable
+				// session CLOSE frame forces a resync rather than silently
+				// dropping the close and ACKing past it.
+				es.handleSessionDecodeFailure(seq)
+				return
 			}
 			delta.Event = "close"
 			// #2874: see the SessionOpen/Update case — a session-sync gap forces
@@ -693,6 +704,49 @@ func (es *EventStream) handleSessionSyncGap(expected, got uint64) {
 		// Best-effort: the reconnect below is the backstop. The helper's own
 		// replay_buffered() also re-issues a FullResync when its window cannot
 		// cover acked+1, so a missed trigger here still self-heals.
+		onFullResync()
+	}
+}
+
+// handleSessionDecodeFailure responds to a COMPLETE but semantically
+// undecodable session-sync frame (open/close/update) at seq — the #5483 HA
+// data-loss fix. It reuses the #2874 gap sync-break mechanics for a decode
+// rejection of a PRESENT frame.
+//
+// A session frame whose length prefix was read in full but that the typed
+// decoder rejects (short/malformed payload, unknown address family) still
+// carries session state the standby needs. The pre-#5483 code skipped it with
+// `es.DecodeErrors.Add(1); continue`, leaving prevSeq/lastAppliedSeq at the
+// contiguous sequence BELOW the hole. A subsequent lossy TELEMETRY frame at
+// seq+1 would then merely record a benign gap, mark itself applied, and let
+// sendAckIfNeeded advance the cumulative ACK PAST this undecodable session seq.
+// The Rust replay buffer (userspace-dp/src/event_stream/mod.rs) trims through
+// the ACK watermark, discarding the never-applied session frame — and because
+// the telemetry frame already advanced prevSeq, no later session frame trips
+// the gap check, so the standby silently diverges with no path to recovery.
+//
+// This is exactly the divergence handleSessionSyncGap prevents for a producer-
+// DROPPED delta, so the response is identical: bump SessionSyncResyncs, force a
+// full bulk re-export (onFullResync → handleEventStreamFullResync), and return
+// so the reader drops the connection. prevSeq/lastAppliedSeq are NOT advanced
+// past seq, so the cumulative ACK can never move past the undecodable session
+// frame; on reconnect the helper replays from the last CONTIGUOUS ack and the
+// resync re-derives a complete session snapshot from table truth.
+//
+// Scope: SESSION frames ONLY. A decode failure on a lossy TELEMETRY/stats frame
+// stays tolerable to skip (DecodeErrors + drop-counter + markDroppedFrameApplied,
+// which advances the watermark) — the existing severity model. Telemetry is
+// best-effort and carries no HA session state, so skipping one cannot diverge
+// the standby.
+func (es *EventStream) handleSessionDecodeFailure(seq uint64) {
+	es.DecodeErrors.Add(1)
+	es.SessionSyncResyncs.Add(1)
+	slog.Warn("event stream: undecodable session-sync frame; forcing full resync",
+		"seq", seq, "last_applied", es.lastAppliedSeq.Load())
+	es.callbackMu.RLock()
+	onFullResync := es.onFullResync
+	es.callbackMu.RUnlock()
+	if onFullResync != nil {
 		onFullResync()
 	}
 }

@@ -23,8 +23,9 @@ The current implementation has four distinct pieces:
 
 The older mental model of "bulk once, then background sweep" is incomplete.
 Current failover safety depends on sender-side bulk acknowledgement, the
-continuous lossless userspace event stream (with gap → full-resync, see #2874),
-the demotion peer barrier, and filtered userspace delta replication.
+continuous lossless userspace event stream (with gap OR undecodable session
+frame → full-resync, see #2874 / #5483), the demotion peer barrier, and filtered
+userspace delta replication.
 
 ## Session Representation
 
@@ -634,9 +635,22 @@ post-snapshot sessions.
 
 This is **not** triggered by demotion prep. Its only live caller is
 `handleEventStreamFullResync` → `exportUserspaceOwnerRGSessionsWithConfig`: the
-event stream signals a FullResync after a #2874 sequence gap or a #2442
-delta-ring overflow (loss-of-sync), and the export republishes the full owned set
-from table truth. It is not the same thing as the steady-state delta drain.
+event stream signals a FullResync after a #2874 sequence gap, a #2442
+delta-ring overflow (loss-of-sync), or a #5483 **undecodable session frame**
+(a COMPLETE-but-semantically-rejected open/close/update — same severity as a
+gap, because the standby is missing that frame's session state), and the export
+republishes the full owned set from table truth. It is not the same thing as the
+steady-state delta drain.
+
+The #5483 case closes a silent-divergence hole: the reader used to skip an
+undecodable session frame with `DecodeErrors.Add(1); continue`, leaving the
+sequence watermark below the hole. A later lossy telemetry frame would then
+advance the cumulative ACK past the unapplied session seq, the helper's replay
+buffer would trim over it, and no subsequent gap would fire — so the standby
+diverged with no recovery. `handleSessionDecodeFailure` now forces the same
+resync + reconnect a gap forces and withholds the ACK past the hole. A decode
+failure on a lossy TELEMETRY frame is still tolerated (skipped, watermark
+advanced) — it carries no HA session state.
 
 The `rgIDs` handed to the export are enumerated from the **configured
 redundancy-group set** — `handleEventStreamFullResync` calls

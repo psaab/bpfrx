@@ -1,3 +1,26 @@
+## 2026-07-18 — #5483: undecodable session-sync frame must force a hard sync-break
+
+- **Timestamp**: 2026-07-18 (fix/5483-eventstream-decode-syncbreak)
+- **Action**: The EventStream reader (`pkg/dataplane/userspace/eventstream.go`)
+  handled a COMPLETE-but-undecodable SESSION frame (open/close/update) with
+  `es.DecodeErrors.Add(1); continue` — a silent skip that left the sequence
+  watermark below the hole. A later lossy TELEMETRY frame at seq+1 then only
+  recorded a benign gap, marked itself applied, and let `sendAckIfNeeded`
+  advance the cumulative ACK PAST the unapplied session seq. The Rust replay
+  buffer trims through the ACK watermark (`seq <= acked`), discarding the
+  never-applied session frame, and no later gap fires — the standby silently
+  diverged with no recovery. Fix: route a session-frame decode failure through
+  new `handleSessionDecodeFailure(seq)`, which reuses the #2874 gap sync-break
+  mechanics (bump `SessionSyncResyncs`, call `onFullResync`, return so the reader
+  drops the connection) WITHOUT advancing prevSeq/lastAppliedSeq/ACK past the
+  hole. Scope: SESSION frames only — a telemetry decode failure still skips
+  (best-effort, no HA state). Go-side only; the Rust ACK-trim is watermark-gated
+  and already correct. Docs: `docs/session-sync-architecture.md` FullResync
+  trigger list updated.
+- **File(s)**: `pkg/dataplane/userspace/eventstream.go`,
+  `pkg/dataplane/userspace/eventstream_decode_syncbreak_5483_test.go`,
+  `docs/session-sync-architecture.md`, `_Log.md`
+
 ## 2026-07-18 — #5149: trim_l3_payload must be IP-declared-length authoritative (tunnel L4 checksum over Ethernet slack)
 
 - **Timestamp**: 2026-07-18 (fix/5149-trim-l3-declared-len)
