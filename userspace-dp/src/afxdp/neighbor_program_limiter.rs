@@ -33,19 +33,33 @@
 //!   `≤ SLOTS / MIN_INTERVAL` programs regardless of how many distinct source
 //!   IPs an attacker cycles.
 //!
-//! ## Not losing a real change
-//! A genuine MAC change is never silently lost:
+//! ## Not losing a real SAME-KEY change
+//! A genuine MAC change to a key that OWNS its slot is not silently lost:
 //! * In steady state, same-binding re-adverts return early WITHOUT touching the
 //!   slot timestamp, so the timestamp reflects only the last ACTUAL program
 //!   (long ago). A real change after steady state is therefore NOT rate-limited
 //!   — it programs on its first advert.
-//! * If a change IS rate-limited (only possible amid a burst of distinct
+//! * If a same-key change IS rate-limited (only possible amid a burst of distinct
 //!   bindings within one interval), the slot keeps the OLD programmed mac, so
 //!   the binding stays "owed": the next advert for that key — even a same-MAC
 //!   one the userspace map already absorbed (`map_changed == false`) — still
 //!   programs it once the interval elapses. The latest desired state is retried,
-//!   not dropped. (The kernel install is `NUD_STALE` and the neigh monitor keeps
-//!   userspace ↔ kernel coupled, so any residual lag self-heals regardless.)
+//!   not dropped. Any residual kernel-table lag self-heals via `NUD_STALE` +
+//!   on-demand kernel ARP on the host path (the neigh monitor couples the
+//!   userspace MAP, not this rate-cap slot, so it does not itself retry an owed
+//!   program).
+//!
+//! CAVEAT (#6129): the "owed" retry is SLOT-OWNERSHIP-scoped — `owes_other`
+//! fires only when the slot holds THIS key. Under a SUSTAINED adversarial
+//! colliding-key flood (a different key A occupying victim B's direct-mapped
+//! slot and keeping it warm), B's KERNEL program is starved: B's later adverts
+//! have `map_changed == false` and `owes_other == false` → skipped. This does
+//! NOT affect the AF_XDP fast path or the userspace neighbor map (both always
+//! correct — `insert_if_changed` runs unconditionally BEFORE the limiter); only
+//! host-path (kernel-table) reachability to the ONE collided neighbor degrades,
+//! and incidental collisions self-heal (kernel FAILED → neigh monitor removes →
+//! re-learn programs). Reconciling kernel-program-under-collision is tracked as
+//! #6129.
 //!
 //! ## Placement
 //! Per-worker, owned by [`super::worker::BindingWorker`] and touched ONLY by the

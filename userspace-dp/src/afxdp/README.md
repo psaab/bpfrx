@@ -291,11 +291,18 @@ sync.
     (proved by the slot OR by `insert_if_changed == false`), **rate-caps**
     a changed-flood to ≤1 program per 50 ms per slot — which also bounds
     the AGGREGATE per-worker netlink rate to `≤ SLOTS / interval` under a
-    many-distinct-IP flood — and never loses a genuine change: a real MAC
-    change after steady state programs immediately (steady-state re-adverts
-    do not consume the slot's rate budget), and a change rate-limited amid a
-    flood is retried on the next advert (the slot keeps the OLD mac, so the
-    binding stays "owed"). The gate decision (`should_program`) is a pure,
+    many-distinct-IP flood — and does not lose a genuine SAME-KEY change: a
+    real MAC change after steady state programs immediately (steady-state
+    re-adverts do not consume the slot's rate budget), and a same-key change
+    rate-limited amid a flood is retried on the next advert (the slot keeps
+    the OLD mac, so the binding stays "owed"). CAVEAT (#6129): that "owed"
+    retry is slot-ownership-scoped — under a SUSTAINED adversarial
+    colliding-key flood (a different key occupying a victim's direct-mapped
+    slot) the victim's KERNEL program is starved; the AF_XDP fast path and
+    userspace neighbor map are unaffected (both always correct), only
+    host-path reachability to the one collided neighbor degrades (self-healing
+    under normal traffic via `NUD_STALE` + on-demand kernel ARP). Tracked as
+    #6129. The gate decision (`should_program`) is a pure,
     allocation-free, syscall-free function pinned by fail-on-revert tests.
     Neighbor programming is a LOCAL kernel-table op, NOT HA/session-sync
     state, so the limiter is per-worker with no peer coordination.
