@@ -54418,6 +54418,21 @@ top.
   docs/config-schema.md, _Log.md
 
 - **Timestamp**: 2026-07-21
+- **Action**: #5881 — propagate authoritative Rust-helper session-delete
+  failures into userspace `Manager.ClearAllSessions` so `clear security flow
+  session all` can no longer report success while the helper keeps forwarding
+  under revoked sessions. `syncSessionRequestsLocked` and
+  `deleteHelperSessionsV4/V6` now return the first helper IPC error (send-all,
+  log-each behaviour preserved); `ClearAllSessions` captures it across chunks
+  and surfaces it (with the mirror's partial v4/v6 counts, matching the #5882
+  non-atomic reporting contract) when the mirror clear itself succeeded. Batch
+  and mirror-upsert callers keep the #5096 best-effort contract (explicit
+  discard). Fail-on-revert test injects a helper-delete IPC failure and asserts
+  a non-nil `ClearAllSessions` error; control path (all deletes succeed) asserts
+  clean success.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/clear_all_helper_error_5881_test.go (new),
+  pkg/dataplane/README.md, _Log.md
 - **Action**: #5871 — route interactive-CLI `request system zeroize` through the
   daemon's coordinated factory-reset transaction. Pre-fix the console called the
   wipe primitive DIRECTLY (`zeroizeFullWipe` -> `grpcapi.PerformZeroizeWipe`),

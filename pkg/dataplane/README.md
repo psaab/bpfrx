@@ -238,7 +238,18 @@ plus a cluster smoke before merge.
   authoritative Rust-helper delete on each bounded chunk instead of building
   a second full-table key snapshot of its own — the two coexisting full-table
   snapshots (wrapper v4+v6 + shim v4+v6 + DNAT lists) were the ~1 GB RSS spike
-  that #5304 removed.
+  that #5304 removed. In userspace mode the Rust helper is AUTHORITATIVE (it
+  owns packet forwarding; the BPF table is a read model), so the wrapper's
+  `ClearAllSessions` propagates a helper-delete IPC failure as a non-nil error
+  rather than losing it in a log line (#5881): a failed authoritative
+  revocation must not report success while the helper keeps forwarding under
+  the "cleared" session. The bpf mirror's partial (v4, v6) counts are still
+  returned alongside that error — the same non-atomic clear-all reporting
+  contract the API handlers honor for a mid-clear mirror failure (#5882). A
+  mirror-side error still takes precedence. The batch delete path
+  (`BatchDeleteSessions{,V6}`) keeps the #5096 best-effort contract — the
+  periodic session sync and GC delta reconcile a transient helper miss — so it
+  discards the helper-delete error; only the operator clear-all propagates it.
 - Session domain adapters: `SessionStoreOf`, `TelemetryOf`, and
   `NewDataPlaneSessionStore`. The generic `DataPlane` adapter preserves the
   batch-iteration fast path and centralizes cluster/GC companion ownership:

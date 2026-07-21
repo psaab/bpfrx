@@ -1077,8 +1077,10 @@ func (m *Manager) mirrorSessionPairV4(key dataplane.SessionKey, val dataplane.Se
 		revVal.FibGen = 0
 		reqs = append(reqs, m.buildSessionSyncRequestV4("upsert", val.ReverseKey, &revVal))
 	}
-	// Snapshot reads are complete; transmit both requests in sequence.
-	m.syncSessionRequestsLocked(reqs...)
+	// Snapshot reads are complete; transmit both requests in sequence. The
+	// mirror upsert is best-effort (the periodic session sync reconciles a
+	// transient miss), so the helper IPC error is intentionally discarded.
+	_ = m.syncSessionRequestsLocked(reqs...)
 }
 
 func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
@@ -1151,8 +1153,10 @@ func (m *Manager) mirrorSessionPairV6(key dataplane.SessionKeyV6, val dataplane.
 		revVal.FibGen = 0
 		reqs = append(reqs, m.buildSessionSyncRequestV6("upsert", val.ReverseKey, &revVal))
 	}
-	// Snapshot reads are complete; transmit both requests in sequence.
-	m.syncSessionRequestsLocked(reqs...)
+	// Snapshot reads are complete; transmit both requests in sequence. The
+	// mirror upsert is best-effort (the periodic session sync reconciles a
+	// transient miss), so the helper IPC error is intentionally discarded.
+	_ = m.syncSessionRequestsLocked(reqs...)
 }
 
 func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
@@ -1246,14 +1250,20 @@ func (m *Manager) BatchDeleteSessions(keys []dataplane.SessionKey) (int, error) 
 	// a batch where a key vanished concurrently returns ErrKeyNotExist with a
 	// partial count, and the helper delete of an already-absent key is a no-op,
 	// so skipping on error would strand the still-present helper sessions.
-	m.deleteHelperSessionsV4(keys)
+	//
+	// The batch path (policy invalidation, cluster-stale sweep) keeps the
+	// #5096 best-effort contract — the periodic session sync and GC delta
+	// reconcile a transient helper miss — so the helper IPC error is
+	// intentionally discarded here. The operator clear-all path propagates it
+	// instead (ClearAllSessions, #5881).
+	_ = m.deleteHelperSessionsV4(keys)
 	return deleted, err
 }
 
 // BatchDeleteSessionsV6 is the IPv6 analogue of BatchDeleteSessions (#5096).
 func (m *Manager) BatchDeleteSessionsV6(keys []dataplane.SessionKeyV6) (int, error) {
 	deleted, err := m.bpfShim.BatchDeleteSessionsV6(keys)
-	m.deleteHelperSessionsV6(keys)
+	_ = m.deleteHelperSessionsV6(keys)
 	return deleted, err
 }
 
@@ -1272,33 +1282,61 @@ func (m *Manager) BatchDeleteSessionsV6(keys []dataplane.SessionKeyV6) (int, err
 // a per-chunk callback: it collects a bounded chunk, deletes it from the mirror,
 // and hands that same bounded chunk here for deletion on the helper, so neither
 // side ever holds more than one chunk of keys. deleteHelperSessions{V4,V6} keeps
-// the #5096 chunked-transmission behaviour (sessionHelperDeleteChunk). Returns
-// the bpf mirror's (v4, v6, err) counts unchanged.
+// the #5096 chunked-transmission behaviour (sessionHelperDeleteChunk).
+//
+// The Rust helper is AUTHORITATIVE in userspace mode — it owns packet
+// lookup/forwarding while the BPF mirror is a read model. A helper-delete IPC
+// failure therefore means a session the operator asked to revoke may still be
+// forwarding, even though the mirror was emptied. Losing that error (as the
+// pre-#5881 void callbacks did) let `clear security flow session all` report
+// success while sessions lived on — a security bug. So the first helper-delete
+// error is captured across chunks and, when the mirror clear itself succeeded,
+// surfaced as ClearAllSessions's returned error. The bpf mirror's partial
+// (v4, v6) counts are still returned alongside the error, matching the #5882
+// non-atomic clear-all reporting contract, so a caller learns what the mirror
+// side revoked while also learning the authoritative revocation is unconfirmed.
+// A mirror-side error still takes precedence and is returned as before.
 func (m *Manager) ClearAllSessions() (int, int, error) {
-	return m.bpfShim.ClearAllSessionsChunked(
-		func(keys []dataplane.SessionKey) { m.deleteHelperSessionsV4(keys) },
-		func(keys []dataplane.SessionKeyV6) { m.deleteHelperSessionsV6(keys) },
+	var helperErr error
+	recordHelperErr := func(err error) {
+		if err != nil && helperErr == nil {
+			helperErr = err
+		}
+	}
+	v4, v6, mirrorErr := m.bpfShim.ClearAllSessionsChunked(
+		func(keys []dataplane.SessionKey) { recordHelperErr(m.deleteHelperSessionsV4(keys)) },
+		func(keys []dataplane.SessionKeyV6) { recordHelperErr(m.deleteHelperSessionsV6(keys)) },
 	)
+	if mirrorErr != nil {
+		return v4, v6, mirrorErr
+	}
+	if helperErr != nil {
+		return v4, v6, fmt.Errorf("clear-all: authoritative helper session revocation failed: %w", helperErr)
+	}
+	return v4, v6, nil
 }
 
 // deleteHelperSessionsV4 tells the Rust helper to delete every key so the batch
 // and clear session paths converge the helper's authoritative session table
 // with the BPF mirror (#5096). Requests are transmitted in bounded chunks (see
 // sessionHelperDeleteChunk) so a large clear does not monopolize the shared
-// control socket. A helper IPC error is logged inside syncSessionRequestsLocked
-// but is not fatal — mirroring the singular DeleteSession path, which likewise
-// treats the helper delete as best-effort (the periodic session sync and GC
-// delta reconcile any transient miss). A "delete" request built with a nil
-// value carries only the 5-tuple, so no snapshot read happens under m.mu.
-func (m *Manager) deleteHelperSessionsV4(keys []dataplane.SessionKey) {
+// control socket. A "delete" request built with a nil value carries only the
+// 5-tuple, so no snapshot read happens under m.mu.
+//
+// It returns the FIRST helper IPC error across all chunks (nil if all
+// succeeded, or if there is no live helper). The best-effort batch callers
+// discard it; ClearAllSessions propagates it so a failed authoritative
+// revocation is reported rather than reported as success (#5881).
+func (m *Manager) deleteHelperSessionsV4(keys []dataplane.SessionKey) error {
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.proc == nil {
-		return
+		return nil
 	}
+	var firstErr error
 	for start := 0; start < len(keys); start += sessionHelperDeleteChunk {
 		end := start + sessionHelperDeleteChunk
 		if end > len(keys) {
@@ -1308,20 +1346,24 @@ func (m *Manager) deleteHelperSessionsV4(keys []dataplane.SessionKey) {
 		for i := start; i < end; i++ {
 			reqs = append(reqs, m.buildSessionSyncRequestV4("delete", keys[i], nil))
 		}
-		m.syncSessionRequestsLocked(reqs...)
+		if err := m.syncSessionRequestsLocked(reqs...); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
+	return firstErr
 }
 
 // deleteHelperSessionsV6 is the IPv6 analogue of deleteHelperSessionsV4 (#5096).
-func (m *Manager) deleteHelperSessionsV6(keys []dataplane.SessionKeyV6) {
+func (m *Manager) deleteHelperSessionsV6(keys []dataplane.SessionKeyV6) error {
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.proc == nil {
-		return
+		return nil
 	}
+	var firstErr error
 	for start := 0; start < len(keys); start += sessionHelperDeleteChunk {
 		end := start + sessionHelperDeleteChunk
 		if end > len(keys) {
@@ -1331,8 +1373,11 @@ func (m *Manager) deleteHelperSessionsV6(keys []dataplane.SessionKeyV6) {
 		for i := start; i < end; i++ {
 			reqs = append(reqs, m.buildSessionSyncRequestV6("delete", keys[i], nil))
 		}
-		m.syncSessionRequestsLocked(reqs...)
+		if err := m.syncSessionRequestsLocked(reqs...); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
+	return firstErr
 }
 
 func (m *Manager) syncSessionV4Locked(op string, key dataplane.SessionKey, val *dataplane.SessionValue) error {
@@ -1551,11 +1596,19 @@ func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
 // uninterrupted prior m.mu hold so a forward/reverse companion pair is
 // resolved against one consistent snapshot (#5007). Sending both requests
 // under a single unlock also keeps the pair's transmit contiguous.
-func (m *Manager) syncSessionRequestsLocked(reqs ...SessionSyncRequest) {
+//
+// It attempts EVERY request even when an earlier one fails (so a bulk
+// revocation drops as many helper sessions as it can) and returns the FIRST
+// helper IPC error encountered, or nil if all succeeded. Best-effort mirror
+// callers (mirrorSessionPair*, batch delete) discard the result; the
+// authoritative clear-all path (#5881) propagates it so a failed helper
+// revocation is reported instead of masquerading as success.
+func (m *Manager) syncSessionRequestsLocked(reqs ...SessionSyncRequest) error {
 	if len(reqs) == 0 {
-		return
+		return nil
 	}
 	m.mu.Unlock()
+	var firstErr error
 	for i := range reqs {
 		ctrlReq := ControlRequest{
 			Type:           "sync_session",
@@ -1564,9 +1617,13 @@ func (m *Manager) syncSessionRequestsLocked(reqs ...SessionSyncRequest) {
 		}
 		if err := m.requestSessionSync(ctrlReq); err != nil {
 			slog.Debug("userspace session sync mirror failed", "operation", reqs[i].Operation, "err", err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	m.mu.Lock()
+	return firstErr
 }
 
 func (m *Manager) zoneNameByID(zoneID uint16) string {
