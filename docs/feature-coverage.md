@@ -168,9 +168,15 @@ the userspace dataplane admission boundary is in
   native dataplane cannot authenticate adverts. Accepting the auth config
   silently would be a false-security posture — an operator would believe
   mastership is protected when a rogue host can still hijack it. The compiler
-  hard-rejects the statement on operator commit and warns (does not brick) on
-  the tolerant load / peer-sync path (`validateVRRPAuthenticationAST`,
-  `pkg/config/compiler_interfaces.go`).
+  hard-rejects the statement on operator commit. On the tolerant load /
+  peer-sync path it FAILS CLOSED (#5834): the auth-carrying vrrp-group is
+  DROPPED from the AST before compilation and a loud warning is recorded, so a
+  persisted or peer-synced legacy config never leaves an unauthenticated group
+  ACTIVE claiming the VIP while the operator required authentication. Only the
+  VRRP VIP claim is dropped — the base interface address survives, and no-brick
+  is preserved (only the one group is dropped, not the whole config). The
+  operator's REQUIRE-auth intent wins over availability
+  (`validateVRRPAuthenticationAST`, `pkg/config/compiler_interfaces.go`).
 - **Redundancy-group IP monitoring** (`chassis cluster redundancy-group N
   ip-monitoring`): each configured target is ICMP-echo probed every poll,
   driving weight-based failover. **`global-threshold` gates `global-weight`
