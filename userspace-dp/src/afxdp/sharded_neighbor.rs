@@ -56,18 +56,32 @@ pub(super) const NUM_SHARDS: usize = 64;
 /// on-demand resolver (`insert_confirmed_if_unchanged`) bypass the cap:
 /// they install real, topology-bounded next-hops, not attacker-driven ones.
 ///
-/// Sizing: the shard hash (`shard_idx`) is Knuth-mixed and uniform even for
-/// adversarial `/24`-style input, so a flood spreads ~evenly and the
-/// aggregate bound is `MAX_DYNAMIC_NEIGHBORS_PER_SHARD * NUM_SHARDS`
-/// (`MAX_DYNAMIC_NEIGHBORS`). 2048/shard → 131072 aggregate, well above any
-/// realistic learned population (a firewall resolves neighbors for its
-/// directly-connected subnets — a /15 of on-link hosts — not the Internet).
+/// Sizing and the shard-concentration residual: the shard hash (`shard_idx`,
+/// FxHash + Knuth mix) is FIXED, PUBLIC and UNKEYED. It spreads a RANDOM flood
+/// ~evenly across shards, but an attacker who PRECOMPUTES source IPs CAN
+/// concentrate them onto one shard — filling that shard's
+/// `MAX_DYNAMIC_NEIGHBORS_PER_SHARD` (2048) while the aggregate stays far below
+/// `MAX_DYNAMIC_NEIGHBORS` (131072). The cap's PRIMARY guarantees still hold
+/// under concentration: bounded memory and no all-shard serialization. The
+/// residual is that opportunistic pre-warm LEARNING of a legit neighbor whose
+/// IP hashes to a victim shard can be denied while that shard is attacker-full
+/// — but forwarding to it is NOT lost: the uncapped on-demand resolver
+/// (`insert_confirmed_if_unchanged`) still installs the real next-hop, at the
+/// cost of extra resolver round-trips. Related minor residual:
+/// `learn_pair_if_changed` refuses the WHOLE pair if EITHER key is new-at-cap,
+/// so a desynced-pair UPDATE could be dropped under concentration (vanishingly
+/// rare; resolver-recovered). A keyed/seeded shard hash would close the
+/// concentration residual if it ever matters. 2048/shard → 131072 aggregate is
+/// well above any realistic learned population (a firewall resolves neighbors
+/// for its directly-connected subnets — a /15 of on-link hosts — not the
+/// Internet).
 pub(super) const MAX_DYNAMIC_NEIGHBORS_PER_SHARD: usize = 2048;
 
 /// #5673: aggregate cap on dynamically learned neighbor entries. Derived
-/// from the per-shard cap and the uniform shard hash (see
-/// `MAX_DYNAMIC_NEIGHBORS_PER_SHARD`). Exposed for tests and any operator
-/// surface that wants to reason about the bound.
+/// from the per-shard cap and the shard count (see
+/// `MAX_DYNAMIC_NEIGHBORS_PER_SHARD`, which also documents the
+/// shard-concentration residual on the fixed/unkeyed shard hash). Exposed
+/// for tests and any operator surface that wants to reason about the bound.
 pub(crate) const MAX_DYNAMIC_NEIGHBORS: usize = MAX_DYNAMIC_NEIGHBORS_PER_SHARD * NUM_SHARDS;
 
 const _: () = assert!(
