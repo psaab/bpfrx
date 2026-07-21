@@ -837,9 +837,16 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// `set_tx_retry_status` INSTEAD of taking the `last_error` mutex —
     /// the TX drain path recurs every pass under ring pressure, so a
     /// mutex acquire there is a hot-path cost. Surfaced as the
-    /// `last_error` fallback in the status snapshot (read side, ~1s
+    /// `last_error` FALLBACK in the status snapshot (read side, ~1s
     /// poll), so operator visibility of the backpressure reason is
     /// preserved without any lock on the send hot path.
+    ///
+    /// #6145 — precedence: this hint is surfaced ONLY when the
+    /// `last_error` mutex string is empty. A non-empty `last_error`
+    /// (an exceptional `TxError::Drop`, bind, or reconcile fault)
+    /// OUTRANKS this hint and masks it until `clear_error()` (rebind)
+    /// resets both. That stale-masking is deliberate — a Drop is rarer
+    /// and more severe than expected backpressure. See `snapshot.rs`.
     pub(super) last_tx_retry_status: AtomicU8,
     /// Cross-worker redirect inbox (#706). N producer workers push
     /// redirected `TxRequest`s; the single owner worker drains. Bounded

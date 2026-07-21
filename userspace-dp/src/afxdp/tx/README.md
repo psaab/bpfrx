@@ -21,6 +21,38 @@ writer to synchronize against.
 | `stats.rs` | Per-frame counters and submit-latency histogram bucketing. The sidecar `&mut [u64]` is non-atomic since it's owner-only. |
 | `tcp_segmentation.rs` | TCP segmentation for forwarded frames (extracted in PR #1199). `#[cold]` — segmentation is the slow path; line-rate flows don't enter it. **#5141:** the local-owner fast-path twin of `frame/tcp_segmentation.rs` — it clamps the segmentable payload to the IP-declared datagram end (`declared_l3_end`, IPv4 `total_len` / IPv6 `40 + payload_len`) instead of the raw `&frame[l3..]` backing, so trailing Ethernet slack / appended bytes are never chunked into fresh checksummed segments. Kept byte-identical to the copy-path twin; the admission gate `forwarded_tcp_may_need_segmentation` in `dispatch/mod.rs` clamps the same way. **#5148:** neither the admission gate NOR the builder segments ANY IP fragment — first or non-first. A fragment (IPv4 MF=1 or offset≠0, or an IPv6 Fragment extension header) still carries the fragment-bearing IP header (Identification / MF / offset), so segmenting it would clone that header into every output while rewriting seq/checksum — overlapping offset-0 pseudo-fragments that break reassembly. The gate uses `is_any_fragment` (was the non-first-only `is_non_first_fragment` before #5148) and the builder repeats the guard (defense in depth); any fragment is routed to the normal forwarding path unchanged, matching the sibling #1852 non-first handling. Segmentation is only for WHOLE (unfragmented) over-MTU TCP datagrams. **#5159:** the egress-MTU lookup now uses the ACTUAL interface MTU — the prior `.unwrap_or_default().max(1280)` floored every plain-interface MTU to 1280, the IPv6 *minimum link* MTU, which is NOT an IPv4 floor (IPv4 min is 68). A valid egress MTU of 68–1279 was raised to 1280, so a non-DF TCP datagram whose L3 length fell in `(real_mtu, 1280]` was never flagged/chunked and was submitted OVERSIZE to AF_XDP TX. All three plain-forward sites drop the floor and treat `0` (no egress entry / unknown MTU) as "don't segment" via the now-live `mtu == 0` guard: the admission gate (`forwarded_tcp_may_need_segmentation`, `dispatch/mod.rs`), this TX builder, and the `frame/tcp_segmentation.rs` copy-path twin — kept byte-identical. Any IPv6-minimum floor belongs at interface config, not the per-packet segmenter. |
 | `transmit/` | XSK TX-ring submit + per-frame recycle. Owns `transmit_batch`, `transmit_prepared_queue`, shared-UMEM-aware prepared recycle helpers, and the `TxError` enum. **#4971:** `TxError::Retry`/`Drop` carry `Copy` reason codes (`TxRetryReason` / `TxDropReason`), NOT heap `String`s — the expected-backpressure retry path recurs every drain pass under ring pressure, so it must be allocation-free. The un-inserted retry tail is restored to `pending` by reverse-popping the staged scratch (`pop()` → new `len()` == popped index), preserving FIFO order with no side `Vec`. |
+
+## TX status precedence: Drop error vs expected-retry hint (#4971 / #6145)
+
+The two TX outcomes reach operator status through **different** channels,
+and the status snapshot has a deliberate precedence between them:
+
+- `TxError::Retry(reason)` — the expected-backpressure path — records its
+  reason lock-free via `BindingLiveState::set_tx_retry_status` (a single
+  `Relaxed` `AtomicU8`). It never takes the `last_error` mutex; the send
+  hot path must stay lock-free / alloc-free.
+- `TxError::Drop(reason)` — the rare exceptional capacity / slice-bounds
+  fault — renders a message into the `last_error` **mutex** via
+  `set_error`.
+
+`BindingLiveState::snapshot()` (`umem/snapshot.rs`, ~1s read side)
+surfaces the retry hint **only as the `last_error` fallback** — i.e. when
+the `last_error` string is empty. A non-empty `last_error` therefore
+**outranks** the live retry hint.
+
+**#6145 — intentional stale-masking.** A latched `TxError::Drop` leaves
+`last_error` non-empty and the ongoing retry path (atomic-only) never
+clears it. So while a Drop is latched, sustained retries afterward keep
+surfacing the **Drop** string, not the current retry reason, until the
+binding rebinds and `clear_error()` wipes both (mutex string + retry
+atomic). This precedence is deliberate: a `TxError::Drop` is rarer and
+more severe than expected backpressure — it flags a real capacity /
+slice fault an operator must see — so it must not be masked by a flood of
+routine retry hints. `clear_error()` (rebind / successful reconcile) is
+the single reset point; a fresh retry recorded after the clear renders
+normally. Pinned by
+`tx_status_drop_error_outranks_retry_hint_until_rebind_6145`
+(`umem/tests/snapshot_propagation.rs`).
 | `test_support.rs` | Test helpers for the per-file unit tests. |
 
 ## Where it sits
