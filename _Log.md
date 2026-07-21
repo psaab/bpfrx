@@ -54265,3 +54265,20 @@ top.
   - `userspace-dp/src/state_writer_tests.rs` (RingWriter construction)
   - `docs/xdp-io-uring-userspace-dataplane.md` (#5800 registry contract)
   - `docs/pr/5800-iouring-inflight-registry/plan.md` (plan + deviations)
+
+## 2026-07-21 — #5563 manual-failover config-generation staleness gate
+- **Timestamp**: 2026-07-21
+- **Action**: Gate manual/planned failover readiness on config-sync
+  generation so a config-stale standby is not promoted onto an older
+  policy set (fail-open after tightening, false-deny after loosening).
+  Added `lastRecvConfigGen` received high-water (recorded in the
+  `syncMsgConfig` handler before apply), carried it plus
+  `lastAppliedConfigGen` into `TransferReadinessSnapshot`
+  (`PeerConfigGen`/`AppliedConfigGen`), added `ConfigStale()` +
+  `ReadyForManualFailover` refusal + `Reason()` text, reset the received
+  mark alongside the applied mark in `resetRecvGen`. Planned/manual path
+  only; unplanned/crash path deliberately not gated.
+- **File(s)**: `pkg/cluster/sync.go`, `pkg/cluster/sync_conn.go`,
+  `pkg/cluster/sync_bulk.go`,
+  `pkg/cluster/sync_failover_config_gen_test.go` (new),
+  `docs/sync-protocol.md`, `docs/ha-failover-status.md`

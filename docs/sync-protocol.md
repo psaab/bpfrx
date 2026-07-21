@@ -415,6 +415,32 @@ monotonic counter restarts lower — is accepted instead of refused as stale
 config after a reconnect is always the peer's *current* config
 (`pushConfigToPeer` sends `ShowActive`), so the newest content still wins.
 
+**Manual-failover config-staleness gate (#5563).** A second high-water mark,
+`lastRecvConfigGen`, records the highest generation this node has *received*
+from the peer (advanced in the `syncMsgConfig` handler at enqueue, BEFORE
+apply, even if the ordered apply queue is full and the payload is dropped). It
+is the receiver's local view of the config *sender's* current committed
+generation. `TransferReadiness` carries both marks (`PeerConfigGen =
+lastRecvConfigGen`, `AppliedConfigGen = lastAppliedConfigGen`), and
+`ReadyForManualFailover` refuses promotion when `PeerConfigGen >
+AppliedConfigGen` — i.e. the standby has received a newer config than it has
+successfully applied. Promoting a config-stale standby runs an OLDER
+policy/zone/application snapshot than the operator committed: **fail-open** after
+a tightening commit (admits traffic the operator denied) and **false-deny** after
+a loosening commit (drops traffic the operator allowed). The gate is scoped to
+this genuine behind-the-primary case: a legitimate same-generation failover
+(`applied == received`) stays ready, and a legacy/fresh peer (both marks 0) is
+never blocked. `resetRecvGen` zeroes `lastRecvConfigGen` alongside
+`lastAppliedConfigGen`, so the `applied <= received` invariant holds across a
+reconnect re-prime. This is a **planned/manual** readiness gate only; the
+UNPLANNED/crash failover path is not gated (a stale-standby crash-takeover is a
+separate availability-vs-security tradeoff — the alternative is a total outage).
+The residual window is narrow: a config committed on the primary but whose
+`syncMsgConfig` frame has not yet reached the standby is not yet reflected in
+`lastRecvConfigGen`, so a promotion in that sub-millisecond window still sees the
+prior generation — a strict improvement over the pre-#5563 behavior, which never
+checked config generation at all.
+
 **Wire compatibility.** #3931 deliberately does NOT bump
 `SessionSyncWireVersion`: the framing is additive and self-detecting via the
 magic, and that gate governs whether SESSIONS sync at all across a mixed-base
