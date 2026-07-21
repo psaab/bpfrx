@@ -341,6 +341,13 @@ func (c *xpfCollector) emitNeighborColdStartCapture(ch chan<- prometheus.Metric,
 		prometheus.CounterValue,
 		float64(status.PendingNeighCapacityDropsTotal),
 	)
+	// #5673: data-path neighbor learns refused by the aggregate
+	// dynamic-neighbor map cap (spoofed-source pre-policy flood bound).
+	ch <- prometheus.MustNewConstMetric(
+		c.dynamicNeighborLearnCapDropsTotal,
+		prometheus.CounterValue,
+		float64(status.DynamicNeighborLearnCapDropsTotal),
+	)
 	for _, key := range status.DynamicNeighborKeys {
 		// Each key is rendered "ifindex ip" by the helper. Split on the
 		// single space into the two gauge labels; skip a malformed entry

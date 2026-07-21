@@ -1578,7 +1578,14 @@ type ProcessStatus struct {
 	// PendingNeighDuplicateDropsTotal (the key was already pending —
 	// normal cold-start coalescing).
 	PendingNeighCapacityDropsTotal uint64   `json:"pending_neigh_capacity_drops_total,omitempty"`
-	DynamicNeighborKeys            []string `json:"dynamic_neighbor_keys,omitempty"`
+	// #5673: cumulative data-path neighbor learns refused because the shared
+	// dynamic-neighbor map's target shard was at MAX_DYNAMIC_NEIGHBORS_PER_SHARD.
+	// Source-address learning runs on RX before screen/policy admission, so a
+	// rising value is the always-on signal that the aggregate cap is bounding a
+	// spoofed-source pre-policy flood (CPU/memory DoS) rather than letting it
+	// inflate the map.
+	DynamicNeighborLearnCapDropsTotal uint64   `json:"dynamic_neighbor_learn_cap_drops_total,omitempty"`
+	DynamicNeighborKeys               []string `json:"dynamic_neighbor_keys,omitempty"`
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes (per-binding
 	// worker-poll sites summed with the shared no-binding sites: HA upsert,
 	// session-glue worker publish, post-reconcile replay, activation/reverse

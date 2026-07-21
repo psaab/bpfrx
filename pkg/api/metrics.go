@@ -533,7 +533,10 @@ type xpfCollector struct {
 	// MAX_PENDING_NEIGH (the scan/upstream-outage failure mode). Kept
 	// separate from pendingNeighDuplicateDropsTotal.
 	pendingNeighCapacityDropsTotal *prometheus.Desc
-	dynamicNeighborPresent         *prometheus.Desc
+	// #5673: data-path neighbor learns refused by the aggregate
+	// dynamic-neighbor map cap (spoofed-source pre-policy flood bound).
+	dynamicNeighborLearnCapDropsTotal *prometheus.Desc
+	dynamicNeighborPresent            *prometheus.Desc
 	// #1769: on-demand neighbor-resolver telemetry — the operator-visible
 	// signal for the MissingNeighbor stuck-state.
 	neighborResolverQueueDepth        *prometheus.Desc
@@ -862,6 +865,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.pendingNeighDuplicateDropsTotal
 	ch <- c.pendingNeighDecapDropsTotal
 	ch <- c.pendingNeighCapacityDropsTotal
+	ch <- c.dynamicNeighborLearnCapDropsTotal
 	ch <- c.dynamicNeighborPresent
 	ch <- c.neighborResolverQueueDepth
 	ch <- c.neighborResolverEnqueueDropsTotal
