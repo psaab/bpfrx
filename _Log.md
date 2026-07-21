@@ -1,3 +1,26 @@
+## 2026-07-21 — #6153: fix stale runtime-chain refs in strict-NAT comment
+
+- **Timestamp**: 2026-07-21 (fix/6153-strict-nat-comment)
+- **Action**: Comment-only doc-accuracy fix in the
+  `validateNATSourceAddressNameReferencesStrict` doc block. Since #4925 the
+  RUNTIME resolution chain is
+  `resolveNATAddressNamePrefixes → expandBookNameRecursive` (the feed-aware
+  recursive expander in `pkg/dataplane/userspace/nat.go`), not
+  `resolveNATAddressNamePrefixes → resolveUserspaceAddressBookEntry`. Updated
+  the two stale runtime-chain refs: (1) the snapshot-build-time chain
+  (`appendNATSourceAddressName → resolveNATAddressNamePrefixes → …`) and
+  (2) the defined-but-unresolvable behavior note (`… returns ok=false` →
+  `expandBookNameRecursive returns an empty prefix list`, matching the new
+  `[]string` signature). Left every STRICT-COMMIT-gate ref intact — the
+  commit gate legitimately uses the static `policyMatchAddressBookResolves`
+  path (unchanged), and the #4925 paragraph that already reads
+  `resolveNATAddressNamePrefixes -> expandBookNameRecursive`. No code/logic
+  change (0 logic delta).
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go
+- **Validation**: `go build ./pkg/config/...` OK, `go vet ./pkg/config/...`
+  OK, `gofmt -l` reports nothing. No parent-RED / test applies to a
+  comment-only change.
+
 ## 2026-07-21 — #6148: de-flake event_stream stalled_consumer liveness under CPU contention
 
 - **Timestamp**: 2026-07-21 (fix/6148-deflake-backpressure-liveness)
