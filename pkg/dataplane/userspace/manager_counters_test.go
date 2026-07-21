@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -581,6 +582,156 @@ func Test_clear_global_counters_resets_userspace_offset_5098(t *testing.T) {
 				"(delta baseline not rebased — #5098 prevBindingCounters revert?)", got)
 		}
 	})
+}
+
+// Test_clear_all_counters_offset_atomic_vs_status_poll_5098 is the #5098
+// review-fold regression gate for the lock-ordering residual. It proves the
+// global-counter offset reset and the delta-baseline rebase inside
+// ClearAllCounters run as ONE userspace-m.mu critical section that a concurrent
+// status poll cannot interleave with.
+//
+// Reproduction of the pre-fold hazard: a status poll (statusLoop) holds the
+// userspace m.mu across its whole cycle and, near the end,
+// syncBPFCountersLocked -> IncrementGlobalCounter accumulates its
+// cur-prevBindingCounters delta into the offset map (under the DATAPLANE m.mu).
+// Before the fold, ClearAllCounters reset the offset via bpfShim.ClearAllCounters
+// OUTSIDE the userspace m.mu, so it could zero the offset AFTER a mid-cycle poll
+// had already computed its delta but BEFORE that poll applied it — the poll then
+// re-added the delta into the just-zeroed offset, and the baseline rebase did
+// not re-zero it, leaving a persistent residual on the cleared totals.
+//
+// The test drives that exact interleaving deterministically via the
+// syncBPFCountersPreIncrementObserver seam: the observer fires while the poll
+// still holds the userspace m.mu and has advanced its baseline but not yet
+// applied the delta. It launches a concurrent ClearAllCounters there. With the
+// fold, that clear parks on the userspace m.mu and only runs (offset reset +
+// baseline rebase, atomically) after the poll releases it, so the offset ends at
+// 0. Reverting the fold — moving bpfShim.ClearAllCounters back outside the lock —
+// lets the residual reappear and fails the final assertion.
+func Test_clear_all_counters_offset_atomic_vs_status_poll_5098(t *testing.T) {
+	const rxIdx = dataplane.GlobalCtrRxPackets
+	m := New()
+
+	mkStatus := func(rx uint64) *ProcessStatus {
+		return &ProcessStatus{Bindings: []BindingStatus{{Slot: 0, RXPackets: rx}}}
+	}
+	// poll runs the REAL syncBPFCountersLocked so the pre-increment seam fires,
+	// exactly like the 1/s status poll.
+	poll := func(rx uint64) {
+		t.Helper()
+		status := mkStatus(rx)
+		m.mu.Lock()
+		m.recordHelperStatusLocked(status)
+		m.syncBPFCountersLocked(status)
+		m.mu.Unlock()
+	}
+
+	// First poll seeds prevBindingCounters=100 and the offset=100.
+	poll(100)
+	if got := m.bpfShim.ReadUserspaceCounterOffset(rxIdx); got != 100 {
+		t.Fatalf("seed rx offset = %d, want 100", got)
+	}
+
+	clearDone := make(chan error, 1)
+	var once sync.Once
+	syncBPFCountersPreIncrementObserver = func() {
+		once.Do(func() {
+			// Launch the clear while THIS poll still holds the userspace m.mu and
+			// is mid-sync (baseline advanced, IncrementGlobalCounter pending).
+			go func() { clearDone <- m.ClearAllCounters() }()
+			// Give the concurrent clear time to reach its offset reset. Pre-fold
+			// that reset lands here (it needs only the dataplane m.mu); post-fold
+			// the clear is parked on the userspace m.mu and this sleep is idle.
+			time.Sleep(100 * time.Millisecond)
+		})
+	}
+	defer func() { syncBPFCountersPreIncrementObserver = nil }()
+
+	// Second poll: cur=150, prev=100 -> delta=+50. Fires the seam (launching the
+	// concurrent clear), then applies IncrementGlobalCounter(rxIdx, 50).
+	poll(150)
+
+	if err := <-clearDone; err != nil &&
+		!strings.Contains(err.Error(), "interface_counters map not found") {
+		t.Fatalf("concurrent ClearAllCounters: unexpected error: %v", err)
+	}
+
+	// Atomic offset-reset + baseline-rebase ran entirely after the poll released
+	// m.mu, so the cleared offset is 0. A residual here means the clear's Phase-1
+	// reset slipped in mid-poll (fold reverted).
+	if got := m.bpfShim.ReadUserspaceCounterOffset(rxIdx); got != 0 {
+		t.Fatalf("rx offset after concurrent clear = %d, want 0 "+
+			"(residual — ClearAllCounters offset/baseline atomicity fold reverted?)", got)
+	}
+}
+
+// Test_clear_all_counters_concurrent_poll_race_5098 hammers ClearAllCounters
+// concurrently with a simulated 1/s status poll under -race. The offset reset
+// (dataplane m.mu) and the poll's IncrementGlobalCounter (dataplane m.mu) share
+// the dataplane lock, so the pre-fold bug was a lock-ORDERING residual, not a
+// data race; this test therefore does not detect the residual on its own (the
+// deterministic sibling above does). Its jobs are (1) prove the fold's
+// userspace->dataplane lock order never inverts into a deadlock — the test
+// completing at all is the proof — and (2) let -race confirm no path touches the
+// offset map unsynchronized. The final quiescent clear pins offset==0.
+func Test_clear_all_counters_concurrent_poll_race_5098(t *testing.T) {
+	const rxIdx = dataplane.GlobalCtrRxPackets
+	m := New()
+
+	mkStatus := func(rx uint64) *ProcessStatus {
+		return &ProcessStatus{Bindings: []BindingStatus{{Slot: 0, RXPackets: rx}}}
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var rx uint64
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			rx += 7
+			status := mkStatus(rx)
+			m.mu.Lock()
+			m.recordHelperStatusLocked(status)
+			m.syncBPFCountersLocked(status)
+			m.mu.Unlock()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := m.ClearAllCounters(); err != nil &&
+				!strings.Contains(err.Error(), "interface_counters map not found") {
+				t.Errorf("ClearAllCounters: %v", err)
+				return
+			}
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	if err := m.ClearAllCounters(); err != nil &&
+		!strings.Contains(err.Error(), "interface_counters map not found") {
+		t.Fatalf("final ClearAllCounters: %v", err)
+	}
+	if got := m.bpfShim.ReadUserspaceCounterOffset(rxIdx); got != 0 {
+		t.Fatalf("rx offset after final clear = %d, want 0", got)
+	}
 }
 
 func TestSafeDelta(t *testing.T) {

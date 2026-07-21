@@ -162,8 +162,15 @@ func (m *Manager) ClearZoneCounterOffsets() {
 // Drop the offset map FIRST, under the same m.mu that guards every
 // IncrementGlobalCounter/ReadGlobalCounter access, so (a) the clear takes
 // effect on the read path even without a loaded BPF map (userspace-only
-// runtime), mirroring ClearZoneCounters/ClearNATRuleCounters, and (b) a
-// concurrent ReadGlobalCounter cannot merge a stale offset with a zeroed array.
+// runtime), mirroring ClearZoneCounters/ClearNATRuleCounters, and (b) in the
+// userspace runtime the per-CPU BPF array is always 0 — the helper forwards
+// packets outside the BPF pipeline and records them ONLY in the offset map,
+// never the array — so once the offset is dropped a concurrent
+// ReadGlobalCounter merges 0 (offset) + 0 (array) = 0. Note the offset reset
+// and the BPF-array zero below are NOT co-locked: the reset happens under m.mu,
+// the array zeroing after it is released. That is safe here ONLY because the
+// array stays 0 in this runtime; were the array ever non-zero, a read racing
+// between the two steps could briefly merge a zeroed offset with a stale array.
 // This method clears every index [0,GlobalCtrMax) — exactly the set the offset
 // map can hold — so the whole map is reset.
 func (m *Manager) ClearGlobalCounters() error {

@@ -53760,3 +53760,36 @@ top.
   pkg/dataplane/userspace/process_napi.go,
   pkg/dataplane/userspace/neighbor_prewarm_singleflight_5104_test.go,
   docs/userspace-cold-start-fix-plan.md
+
+- **Timestamp**: 2026-07-20
+- **Action**: #5098 review fold — make ClearAllCounters offset-reset +
+  baseline-rebase atomic vs the 1/s status poll. Hostile review found a
+  lock-ordering gap that defeated the PR's "epoch atomicity": Phase-1 offset
+  reset (`bpfShim.ClearAllCounters`, DATAPLANE m.mu) ran OUTSIDE the userspace
+  m.mu, while Phase-2 baseline rebase (`prevBindingCounters`) ran under it. A
+  poll mid-cycle (holding userspace m.mu, `syncBPFCountersLocked` ->
+  `IncrementGlobalCounter` pending) could re-add `cur-stale_baseline` into the
+  just-zeroed offset AFTER Phase 1 but BEFORE Phase 2 — the rebase does not
+  re-zero the offset, leaving a small constant residual (~1 poll interval of
+  pre-clear traffic) on cleared global RX/TX/drop/session totals until the next
+  clear. FIX (option a): moved `m.mu.Lock()` to the top so the WHOLE method —
+  `bpfShim.ClearAllCounters` offset reset through the `prevBindingCounters`
+  rebase — is one userspace-m.mu critical section the poll cannot interleave
+  with. Lock order stays userspace->dataplane (matches the poll), deadlock-free;
+  the clearHelper*Locked helpers assume the lock held and never re-lock.
+  Also corrected the oversold `ClearGlobalCounters` comment: point (b) holds
+  because the userspace helper records forwarded packets ONLY in the offset map
+  (BPF array always 0 in this runtime), not because offset-reset and array-zero
+  are co-locked (they are not). Added a test-only `syncBPFCountersPreIncrement
+  Observer` seam. Merge-gate regression `Test_clear_all_counters_offset_atomic
+  _vs_status_poll_5098` drives a concurrent clear through that seam and asserts
+  post-clear offset == 0 (RED-on-revert verified: move the reset back outside
+  the lock -> offset residual = 50, assertion failure not build break). Plus
+  `Test_clear_all_counters_concurrent_poll_race_5098` (-race deadlock/data-race
+  coverage). Existing `Test_clear_global_counters_resets_userspace_offset_5098`
+  + its revert-RED still hold. Validated: `go test -race ./pkg/dataplane/...`
+  full green, named tests 3x, gofmt + go vet clean. NOT HA-smoke — unit-provable.
+- **File(s)**: pkg/dataplane/userspace/policycounters.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_counters_test.go,
+  pkg/dataplane/maps_counters.go

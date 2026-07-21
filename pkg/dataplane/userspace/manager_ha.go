@@ -897,6 +897,16 @@ func sumBindingCounters(status *ProcessStatus) userspaceCounterSnapshot {
 	return s
 }
 
+// syncBPFCountersPreIncrementObserver is a test-only seam: it fires inside
+// syncBPFCountersLocked after the delta baseline has advanced
+// (prevBindingCounters = cur) but BEFORE the IncrementGlobalCounter loop
+// applies those deltas to the offset map. It is nil in production (the only
+// runtime cost is a nil check on the 1/s counter sync). The #5098 review-fold
+// atomicity test uses it to drive a concurrent ClearAllCounters through the
+// exact window a status poll can be interrupted at, proving the clear cannot
+// leave a residual in the just-reset offset.
+var syncBPFCountersPreIncrementObserver func()
+
 // syncBPFCountersLocked computes counter deltas since the last status poll
 // and writes them into the BPF global_counters per-CPU array map.
 // This ensures that packets forwarded by the userspace helper (which bypass
@@ -962,6 +972,10 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 			index: dataplane.ScreenReasonCounters[i].Index,
 			delta: safeDelta(cur.screenReasonDrops[i], prev.screenReasonDrops[i]),
 		})
+	}
+
+	if syncBPFCountersPreIncrementObserver != nil {
+		syncBPFCountersPreIncrementObserver()
 	}
 
 	for _, d := range deltas {
