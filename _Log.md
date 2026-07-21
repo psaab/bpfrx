@@ -54089,3 +54089,7 @@ top.
     `Test_oversized_session_frame_recovers_via_resync_not_replay_loop_6132`,
     `Test_persistent_oversized_session_frames_do_not_replay_loop_6132`)
   - `docs/session-sync-architecture.md` (#6132 recovery paragraph + trigger-list)
+
+- **Timestamp**: 2026-07-21
+  **Action**: Fold #6162 review MINOR — update afxdp/README.md neighbor-limiter section from "256-slot direct-mapped" + open #6129 caveat to the 64-bucket x 4-way set-associative description with the bounded-residual note (stale-doc module-contract fix)
+  **File(s)**: userspace-dp/src/afxdp/README.md
