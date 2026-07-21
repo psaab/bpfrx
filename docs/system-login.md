@@ -275,6 +275,21 @@ too (`zeroizeLoginAccounts`, same error-surfacing discipline):
   if `userdel` fails; on a `userdel` failure the marker is **retained** so a
   retried `zeroize` re-attempts, and the failure is surfaced (the device is not
   reported safe to re-tenant while a live account remains).
+- **All three marker roots are erased (#5841).** The account loop above
+  enumerates only `provisioned-users`, but the #5841 split records
+  password/key ownership in two **sibling** roots
+  (`/var/lib/xpf/provisioned-passwords`, `/var/lib/xpf/provisioned-keys`). A
+  factory reset erases those too (`zeroizeSweepResourceMarkerRoot`): a surviving
+  per-account UID marker is #5869/#5871-class residue, and because
+  `reconcileAbsentLoginUsers` **unions all three roots**, a re-tenant's
+  reused-UID account (useradd hands the first non-system user UID 1000)
+  colliding with a surviving marker would be deprovisioned — its password
+  locked, its `authorized_keys` deleted — despite xpf never provisioning it, the
+  exact overclaim #5841 kills, resurrected on a "factory-reset" box. The sweep
+  removes every marker in the two resource roots (keeping only names **retained**
+  for a fail-closed registry retry, so an account's three markers stay together)
+  and drops the roots, so no marker survives in **any** of the three roots —
+  mirroring the daemon's own `forgetProvenance`.
 - **Ownership uncertainty fails CLOSED (#5496).** Deciding "is this the account
   xpf provisioned?" needs two reads — the live UID (`/etc/passwd`) and the
   recorded UID (the marker). If **either** cannot be resolved — `/etc/passwd`

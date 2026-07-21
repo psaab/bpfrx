@@ -54547,3 +54547,30 @@ top.
   suites green 3x; the two #5841 fail-on-revert tests and the #6181 closeout
   tests all pass.
 - **File(s)**: pkg/daemon/login_password.go, pkg/daemon/daemon_system.go, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5841 MAJOR (from the #6183 hostile review) — the two NEW marker
+  roots survived a factory reset. `zeroizeLoginAccounts` enumerated ONLY
+  `provisioned-users`, so `provisioned-passwords` and `provisioned-keys` (the
+  #5841 split's resource roots) were referenced NOWHERE in pkg/grpcapi and
+  SURVIVED zeroize. Residue (#5869/#5871 class) plus a resurrected overclaim: a
+  re-tenant's reused-UID account colliding with a surviving marker gets
+  deprovisioned by `reconcileAbsentLoginUsers` (which unions all three roots) —
+  password locked, authorized_keys deleted — despite xpf never provisioning it.
+  Fix: added `zeroizeProvisionedPasswordsDir` / `zeroizeProvisionedKeysDir`
+  (siblings of the seam, mirroring the daemon) and, after the account loop,
+  `zeroizeSweepResourceMarkerRoot` erases every marker in the two resource roots
+  (keeping only names retained for a fail-closed registry retry) and drops the
+  roots — so no marker survives in ANY of the three roots, mirroring the daemon's
+  `forgetProvenance`. Split the account loop into `zeroizeTearDownProvisionedUsers`
+  so the registry teardown and the resource-root sweep read as two phases; the
+  users-root ReadDir error no longer early-returns so a key-only orphan's marker
+  is still swept. Fail-on-revert: `zeroize_login_resource_roots_5841_test.go`
+  seeds all three roots for one fully-provisioned account and asserts every marker
+  + root dir is gone; neutralizing the single sweep removal
+  `fail(os.Remove(filepath.Join(dir, name)))` makes EXACTLY that test RED (target
+  count 1 across grpcapi — no other test seeds the resource roots). Unit-provable
+  (factory-reset teardown, no dataplane/forwarding surface), no smoke.
+- **File(s)**: pkg/grpcapi/server_diag_zeroize.go,
+  pkg/grpcapi/zeroize_login_resource_roots_5841_test.go (new),
+  docs/system-login.md, _Log.md
