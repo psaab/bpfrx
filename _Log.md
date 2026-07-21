@@ -54090,6 +54090,34 @@ top.
   - `pkg/config/compiler_validate_strict_nat.go` (strict-vs-runtime
     comment reword in `validateNATSourceAddressNameReferencesStrict`)
 
+## 2026-07-21 — #6129: guarantee genuine neighbor change under colliding-key flood
+
+- **Timestamp**: 2026-07-21 (fix/6129-neigh-limiter-collision)
+- **Action**: Fixed the #6129 slot-collision starvation in the per-worker
+  `KernelNeighborProgramLimiter`. Replaced the fixed 256-slot DIRECT-MAPPED
+  table (keyed on `FxHash((ifindex, ip))`) with a SET-ASSOCIATIVE table of 64
+  buckets × 4 ways (256 slots total — aggregate netlink cap UNCHANGED). Under a
+  sustained colliding-key flood the old design let a foreign key A own victim
+  B's single slot; B's genuine change was rate-limited and — owning no slot —
+  never owed-retried, so B's subsequent `map_changed == false` re-adverts were
+  skipped forever (kernel-neighbor program STARVED). New `should_program`:
+  (1) if a way already OWNS the key, apply the unchanged #5288 per-key decision
+  (exact-present / owes-other / rate cap); (2) if no way owns the key and the
+  advert made no map change, skip (kernel already told); (3) a GENUINE change
+  whose key owns no way CLAIMS a way — a never-fired way if free, else the
+  least-recently-programmed way, still honoring the rate cap so a way inside its
+  interval is never evicted. A single colliding key can no longer starve B (B
+  lands in another way); the aggregate stays bounded to ≤ SLOTS/MIN_INTERVAL, so
+  the #5288 flood-bound is preserved (a no-genuine-change colliding flood still
+  programs O(1)). Updated the module doc: replaced the CAVEAT block with the new
+  bounded-ticks guarantee. Added FAIL-ON-REVERT test
+  `colliding_key_flood_does_not_starve_victim_genuine_change_6129` (RED on the
+  direct-mapped revert: victim starved, b_fired==0) plus a #5288-bound companion
+  `colliding_no_change_flood_stays_bounded_6129`.
+- **File(s)**: userspace-dp/src/afxdp/neighbor_program_limiter.rs
+- **Validation**: cargo test --release (full userspace-dp suite); named test 3x.
+  Not HA (per-worker limiter, unit-provable; no cluster smoke).
+
 ## 2026-07-21 — #6132 eventstream oversized/framing-desync resync recovery
 - **Timestamp**: 2026-07-21
 - **Action**: Fix the EventStream reader's oversized/framing-desync guard
@@ -54144,3 +54172,5 @@ top.
     `TestSetForwardingArmedArmsWhenProtocolMatches`)
   - `docs/userspace-dataplane-gaps.md` (policy-scheduler row + fail-closed
     section: explicit-arm-path enforcement of the required-protocol gate)
+  **Action**: Fold #6162 review MINOR — update afxdp/README.md neighbor-limiter section from "256-slot direct-mapped" + open #6129 caveat to the 64-bucket x 4-way set-associative description with the bounded-residual note (stale-doc module-contract fix)
+  **File(s)**: userspace-dp/src/afxdp/README.md
