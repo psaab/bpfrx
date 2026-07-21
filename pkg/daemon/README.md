@@ -441,8 +441,13 @@ never lock an operator out of a remote box it manages.
 - `commitFn` and `commitConfirmedFn` are passed to `pkg/cli` and
   `pkg/grpcapi`; they hold the apply semaphore across the commit + apply
   pair so concurrent committers serialize.
-- **Factory-reset gate (`factoryReset`, wired as `grpcapi.Config.ZeroizeFn`,
-  #5281).** A gRPC `zeroize` no longer erases state out-of-band. `factoryReset`
+- **Factory-reset gate (`factoryReset`, wired as `grpcapi.Config.ZeroizeFn`
+  AND as the in-process CLI's `cli.SetFactoryResetFn`, #5281/#5871).** Neither
+  a gRPC `zeroize` nor an interactive-console `request system zeroize` erases
+  state out-of-band any more: BOTH route the wipe through this one
+  `factoryReset` transaction (#5871 wired the console — `daemon_run.go`
+  `shell.SetFactoryResetFn(d.factoryReset)` — through the same gate the gRPC
+  server already used). `factoryReset`
   acquires the SAME `applySem` commit/apply/HA-sync serialize on (draining any
   in-flight apply), enters a **terminal reset generation** (`d.resetting`,
   `isResetting`/`enterResetGeneration`/`exitResetGeneration`) BEFORE running the

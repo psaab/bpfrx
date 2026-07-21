@@ -150,11 +150,22 @@ contract.
   the SAME primitive `runZeroize` runs — so both paths erase an IDENTICAL
   single-source-of-truth OWNED-artifact set and cannot diverge again. The
   console keeps its own root resolution (`cli.zeroizeConfigRoot`, #5554/
-  #5684) and daemon stop; it does NOT take the gRPC apply-gate (it runs
-  in-process and stops xpfd itself). The rendered/BPF/networkd leg targets
-  in `performZeroizeWipe` are package vars so the full primitive is
-  hermetically testable end-to-end (no real `/etc`) — production paths
-  unchanged.
+  #5684) and daemon stop. **The console also runs the wipe THROUGH the
+  daemon's coordinated factory-reset transaction (#5871).** It does not dial
+  gRPC (it is in-process); instead the daemon wires the SAME `factoryReset`
+  gate it wires into the gRPC server as `ZeroizeFn` into the CLI via
+  `cli.SetFactoryResetFn(d.factoryReset)`, and `cli.performConsoleZeroize`
+  routes the wipe closure through it. So the console wipe now takes
+  `d.applySem` and enters the terminal reset generation BEFORE erasing —
+  identical fencing to the gRPC path — closing the pre-#5871 window where an
+  ungated console wipe let a concurrent commit / HA-sync / reconcile re-create
+  the just-erased `.configdb` SSOT or re-render the wiped secrets. When the
+  CLI is spawned OUTSIDE the daemon (offline recovery / unit test)
+  `factoryResetFn` is nil and the console falls back to the ungated direct
+  wipe (no reconcile loop is running to race), mirroring `runZeroize`'s
+  `zeroizeFn==nil` fallback. The rendered/BPF/networkd leg targets in
+  `performZeroizeWipe` are package vars so the full primitive is hermetically
+  testable end-to-end (no real `/etc`) — production paths unchanged.
 - **Zeroize erases the CONFIGURED config root, not a hardcoded `/etc/xpf`
   (#5280).** `runZeroize` resolves the config root from
   `configstore.Store.ConfigPath()` — the daemon's `-config` path, the SAME

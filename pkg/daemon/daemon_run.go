@@ -738,6 +738,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// shellCommitConfirmedFn seams so it is fail-on-revert covered
 		// (#5961, configsync_transport_5054_test.go).
 		shell.SetCommitFns(d.shellCommitFn(), d.shellCommitConfirmedFn())
+		// #5871: route the in-process `request system zeroize` through the
+		// daemon's coordinated factory-reset transaction — the SAME function wired
+		// into the gRPC server as grpcapi.Config.ZeroizeFn. factoryReset takes
+		// d.applySem (draining any in-flight apply) and enters the terminal reset
+		// generation BEFORE the wipe, so a console zeroize can no longer erase
+		// state out-of-band while a concurrent commit / HA-sync / reconcile
+		// re-creates the just-erased .configdb SSOT or re-renders the wiped secrets.
+		shell.SetFactoryResetFn(d.factoryReset)
 		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()
