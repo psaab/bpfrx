@@ -65,6 +65,16 @@ This is the package that drives chassis-cluster failover.
   priority/preempt/tracking and re-applies sync-hold suppression, so a
   rebind cannot spuriously preempt or break the sync hold; RG role is
   driven separately by the cluster heartbeat / debounced priority.
+  **Desired-vs-built record (#5641):** each pass recomputes
+  `m.unbuiltDesired` — the desired keys with no live instance — so
+  `RGVRRPReady` can refuse a partially-built RG (see the
+  build-before-teardown invariant below).
+- `RGVRRPReady(rgID int, hasRETH bool) (bool, []string)` — `manager.go`.
+  Returns ready only when EVERY desired RETH key for the RG (VRID
+  `100+rgID`) has a live instance AND at least one instance exists (or the
+  RG has no RETH interfaces). A desired key that failed to build
+  (resolve / socket / family capability) makes it `(false, reasons)`
+  naming the un-built key (#5641).
 - `ReleaseSyncHold()` — `manager.go`. No-arg; releases hold for all
   instances.
 - `ResignRG(rgID int)` — `manager.go`. Forces this node out of master
@@ -682,7 +692,22 @@ dataplane reuses this Go walker, and do NOT try to consolidate them.
   same key (the proof step opens the socket but does NOT start `run()`;
   only the commit step stops the old, swaps, and starts the new). On a
   build failure no placeholder is added to `m.instances`, so
-  `RGVRRPReady` / `States` / `InstanceStates` / `Status` stay truthful.
+  `States` / `InstanceStates` / `Status` stay truthful. **`RGVRRPReady`
+  needs more than that (#5641):** an RG usually has SEVERAL desired RETH
+  keys under one VRID (a VLAN-tagged reth emits one instance per
+  sub-interface — `reth0.50` + `reth0.80` — and reths can share the RG),
+  so "one instance exists for the VRID" does NOT prove the RG is fully
+  built. `UpdateInstances` records every desired key with no live instance
+  in `m.unbuiltDesired` (the `desiredMap`-vs-`m.instances` diff, with the
+  captured resolve/socket reason), and `RGVRRPReady` returns
+  `(false, reasons)` naming any un-built key for the RG. This closes the
+  false-ready hole where a sibling member/VLAN-sub/family key failed to
+  build, its VIP was dark, yet the cluster state machine released the sync
+  hold / preempted / claimed ownership. A build failure that leaves the
+  OLD instance advertising (the case above) keeps its key in `m.instances`
+  and is therefore NOT flagged — the RG is still in election, just on its
+  previous VIP set. `RGVRRPReady` remains a pure readiness READ (no advert
+  timing / socket / datapath change).
   Bounded self-recovery comes from the daemon's 2s
   `reconcileRGStateLoop`, which re-drives `reconcileVRRPInstances` →
   `UpdateInstances` every tick; a deferred restart retries (and succeeds)

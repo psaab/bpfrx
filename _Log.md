@@ -54664,6 +54664,76 @@ top.
   pkg/config/testdata/golden_4406.json, docs/feature-coverage.md, _Log.md
 
 - **Timestamp**: 2026-07-21
+- **Action**: #5641 — RGVRRPReady false-ready on partial RG build. RGVRRPReady
+  returned (true, nil) as soon as ONE VRRP instance existed for the RG's VRID
+  (100+rgID), even when another DESIRED key for that RG failed to build
+  (interface resolve / socket bind / family capability). An RG commonly has
+  several desired RETH keys under one VRID — a VLAN-tagged reth emits one
+  instance per sub-interface (reth0.50 + reth0.80) — so a sibling key's dark
+  VIP was reported healthy and the cluster state machine could release the sync
+  hold / preempt / claim ownership while a VIP never advertised. Fix:
+  UpdateInstances now records m.unbuiltDesired (the desiredMap-vs-m.instances
+  diff, annotated with the captured resolve/socket reason) each pass;
+  RGVRRPReady returns (false, reasons) naming any un-built desired RETH key for
+  the RG. Build-before-teardown (#2156) survivors keep their key in m.instances
+  and are correctly NOT flagged (RG still in election on its old VIP set).
+  RGVRRPReady stays a pure readiness READ — no advert timing / socket / failover
+  datapath change. Fail-on-revert test TestUpdateInstances_PartialBuild_RGNotReady
+  (two keys, one socket-fail) goes RED (clean assertion failure) if the
+  m.unbuiltDesired scan in RGVRRPReady is neutralized. Validated: go build ./...,
+  go vet ./pkg/vrrp/, full pkg/vrrp + pkg/daemon suites pass.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/update_instances_test.go,
+  pkg/vrrp/README.md, _Log.md
+- **Action**: #5295 — HA-NAT reservation leak on transient synced-hit purge.
+  `purge_translated_synced_hit` (session_glue/promote.rs) tears down a
+  transient peer-synced translated FORWARD session (RG not locally active) but
+  released NO allocator state, LEAKING the source-NAT / NAT64 pool port that
+  `handle_upsert_synced` reserved at install (reserve_synced_source_nat /
+  reserve_synced_nat64, #4388 / #4512) → standby pool exhaustion under
+  sustained HA churn. Fix: add release_source_nat_allocation +
+  release_nat64_allocation under the same `metadata.is_reverse` ownership
+  guard, exactly as handle_delete_synced / delete_terminal_filtered_session do
+  (signature gains `forwarding` + `now_ns`; single caller in mod.rs updated).
+  Safe against double-free: purge fires only for the forward translated side
+  (is_translated_forward_session_key rejects reverse/alias keys) and
+  release_flow is a no-op when the flow was never tracked. Distinct from #5178
+  (recycle-queue drain gap) — here there was no release call at all. Tests: 3
+  fail-on-revert in session_glue/tests.rs (source-NAT release, NAT64 release,
+  reverse-entry-releases-nothing guard). Neutralizing either release call
+  reddens the matching owning-leg assertion (used_ports stays 1 / NAT64 probe
+  gets 1025). Full cargo suite green (4159 passed).
+- **File(s)**: userspace-dp/src/afxdp/session_glue/promote.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md, _Log.md
+- **Action**: #5305 — cluster-synced session install made transactional (BPF
+  pre-image rollback on helper mirror failure). `SetClusterSyncedSessionV4/V6`
+  wrote the pinned BPF session mirror FIRST, then mirrored to the Rust helper;
+  on helper failure they recorded the mirror failure and returned but LEFT the
+  BPF entry installed — a split truth the GC / fallback bulk export could
+  propagate as if the install succeeded, producing nondeterministic HA session
+  ownership after takeover. The store's snapshot/rollback machinery
+  (session_store.go) never fired for this path because the installer's
+  `return err` runs before the store appends the forward pre-image to `written`.
+  Fix: for forward entries, snapshot the BPF pre-image (value-or-absence) BEFORE
+  the write and, on mirror failure, RESTORE it (rewrite prior value / delete if
+  absent), joining any compensation error with the mirror error. Snapshot +
+  write + mirror + compensate now run under one `m.mu` hold (was: BPF write
+  outside the lock) so the sequence is atomic w.r.t. other m.mu paths; per-peer
+  apply loop is single-threaded so no same-key race. Reverse entries (never
+  mirrored) just write BPF and return. Health behavior preserved:
+  recordSessionMirrorFailureLocked (#5247 takeover-disarm) and
+  recordSessionMirrorSuccessLocked (sticky-clear on real success) unchanged.
+  New snapshotBPFSessionV4/V6Locked + restoreBPFSessionV4/V6Locked helpers.
+  Tests: synced_session_bpf_rollback_5305_test.go —
+  TestSetClusterSyncedSessionV4/V6RollsBackOrphanOnMirrorFailure (absent→deleted,
+  prior→restored) + TestSetClusterSyncedSessionRollbackSuccessPathUnregressed.
+  Parent-RED: no-op the restore helpers → 2 tests (4 subtests) fail on assertion.
+  Validated: build + vet clean; focused userspace session/mirror suite green;
+  the 6 pre-existing userspace XDP-shim-load failures reproduce on origin/master.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/synced_session_bpf_rollback_5305_test.go,
+  docs/session-sync-architecture.md, _Log.md
 - **Action**: #5870 — REST candidate mutations bypassed the config-session
   holder lock. The REST config endpoints (`pkg/api/config.go`) called the store
   with an empty session ID, which the store treats as its internal/system
@@ -54730,3 +54800,38 @@ top.
   pkg/daemon/daemon_apply.go,
   pkg/daemon/cluster_identity_preflight_6192_test.go (new),
   docs/ha-no-hitless-restart.md, _Log.md
+## 2026-07-21 — #6194 Layer-2 snapshot key-absent predicate parity
+
+- **Timestamp**: 2026-07-21
+- **Action**: Fix Layer-2/Layer-1 consistency nit — the #5305 transactional
+  cluster-synced install snapshot (`snapshotBPFSessionV4Locked` /
+  `snapshotBPFSessionV6Locked` in `pkg/dataplane/userspace/manager_ha.go`)
+  classified "key absent" with `errors.Is(err, ebpf.ErrKeyNotExist)` ONLY,
+  while the sibling Layer-1 `sessionNotFound` predicate
+  (`pkg/dataplane/session_store.go`) accepts BOTH `ebpf.ErrKeyNotExist` AND
+  `unix.ENOENT`. With the production cilium `bpfShim` the two sentinels never
+  diverge (a missing lookup yields `ErrKeyNotExist`, not bare `ENOENT`) and the
+  Layer-2 direction was already fail-safe, so this is a consistency fix, not a
+  live bug — but the two transaction layers now agree on what "key absent"
+  means. Extracted a package-level `bpfSessionReadAbsent(err)` seam that reuses
+  the EXPORTED shared `dataplane.IsKeyNotFound` predicate (the Layer-1-equivalent
+  `ErrKeyNotExist || ENOENT` set), and routed BOTH snapshot functions through it.
+  Fail-safe direction preserved: any NON-absent read error is still surfaced and
+  the install refused (never broadened to swallow real errors). Restore
+  delete-idempotency checks (`!errors.Is(err, ebpf.ErrKeyNotExist)`) left
+  untouched — distinct operation (DeleteSession, not GetSession), real-map
+  delete-absent returns `ErrKeyNotExist`, and #6194 scopes to the snapshot's
+  read-classification. Fail-on-revert test pins the seam directly (no live map /
+  no root): `bpfSessionReadAbsent` must classify `unix.ENOENT` identically to
+  `ebpf.ErrKeyNotExist` (both absent) and must NOT classify a genuine read error
+  (EFAULT / map-not-found) as absent. Neutralize by reverting
+  `bpfSessionReadAbsent` to `errors.Is(err, ebpf.ErrKeyNotExist)` → the
+  `unix.ENOENT` + `wrapped unix.ENOENT` subtests and the identity assertion go
+  RED (clean assertion failure, not a compile break — `ebpf` stays imported via
+  `mergeHAStateFromMaps` + the restore checks). Validation: `go build ./...`,
+  `go vet ./pkg/dataplane/...`, `go test ./pkg/dataplane/...` (non-root + root
+  incl. the #5305 rollback tests) all pass. Control-plane / unit-provable — no
+  smoke.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/snapshot_enoent_consistency_6194_test.go (new),
+  docs/session-sync-architecture.md, _Log.md

@@ -2,6 +2,7 @@ package vrrp
 
 import (
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -307,6 +308,106 @@ func TestUpdateInstances_NewKeyFailureNoPhantom(t *testing.T) {
 	}
 	if ready, _ := m.RGVRRPReady(1, true); !ready {
 		t.Fatal("RGVRRPReady(1) should be true after the retry created the instance")
+	}
+}
+
+// TestUpdateInstances_PartialBuild_RGNotReady is the #5641 fail-on-revert
+// pin. An RG commonly has SEVERAL desired RETH keys under ONE VRID: a
+// VLAN-tagged reth yields one instance per sub-interface (reth0.50 + reth0.80),
+// both GroupID 100+rgID, and reths can share the RG. When ONE key's build
+// fails (resolve / socket / family capability) its VIP is dark even though the
+// sibling instance for the same VRID is live and advertising. RGVRRPReady must
+// report the RG NOT ready and name the un-built key — otherwise the cluster
+// state machine releases the sync hold / preempts / claims ownership while a
+// desired VIP never advertises.
+//
+// REVERT NEUTRALIZATION (firsthand parent-RED): in RGVRRPReady delete the
+// m.unbuiltDesired scan — the `for key, reason := range m.unbuiltDesired { … }`
+// loop through `if len(unready) > 0 { … return false, unready }`. RGVRRPReady
+// then finds the built reth0.50 instance and returns (true, nil), so the
+// `if ready` assertion below fires: a clean assertion failure, not a compile
+// break. (Neutralizing `m.unbuiltDesired = unbuilt` at the end of
+// UpdateInstances produces the identical RED.)
+func TestUpdateInstances_PartialBuild_RGNotReady(t *testing.T) {
+	m, _ := newTestManagerNoNetwork()
+	defer stopManagerForTest(m)
+
+	// Fail the socket for reth0.80 ONLY; reth0.50 builds normally. Both are
+	// RETH keys (empty family) under VRID 101 → RG 1.
+	m.openInstanceSocket = func(vi *vrrpInstance) error {
+		if vi.cfg.Interface == "reth0.80" {
+			return errSocketOpenFailed
+		}
+		return nil
+	}
+
+	desired := []*Instance{
+		{
+			Interface:        "reth0.50",
+			GroupID:          101,
+			Priority:         200,
+			Preempt:          true,
+			VirtualAddresses: []string{"172.16.50.8/24"},
+		},
+		{
+			Interface:        "reth0.80",
+			GroupID:          101,
+			Priority:         200,
+			Preempt:          true,
+			VirtualAddresses: []string{"172.16.80.8/24"},
+		},
+	}
+	if err := m.UpdateInstances(desired); err != nil {
+		t.Fatalf("UpdateInstances: %v", err)
+	}
+
+	// Exactly one sibling built; the other is dark (no phantom placeholder).
+	m.mu.RLock()
+	_, has50 := m.instances[instanceKey{iface: "reth0.50", groupID: 101}]
+	_, has80 := m.instances[instanceKey{iface: "reth0.80", groupID: 101}]
+	n := len(m.instances)
+	m.mu.RUnlock()
+	if !has50 {
+		t.Fatal("reth0.50 should have built")
+	}
+	if has80 {
+		t.Fatal("reth0.80 build was injected to fail but an instance exists")
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly 1 live instance, got %d", n)
+	}
+
+	// THE PIN: a partially-built RG must report NOT ready, naming the un-built
+	// key. Pre-fix this returned (true, nil) off the built reth0.50 sibling.
+	ready, reasons := m.RGVRRPReady(1, true)
+	if ready {
+		t.Fatal("RGVRRPReady(1) must be FALSE while reth0.80's VIP is dark (partial build)")
+	}
+	if len(reasons) == 0 {
+		t.Fatal("RGVRRPReady(1) must return a reason naming the un-built key")
+	}
+	joined := strings.Join(reasons, " ")
+	if !strings.Contains(joined, "reth0.80") {
+		t.Fatalf("readiness reasons must name the un-built key reth0.80, got: %v", reasons)
+	}
+	if strings.Contains(joined, "reth0.50") {
+		t.Fatalf("readiness reasons wrongly named the BUILT sibling reth0.50: %v", reasons)
+	}
+
+	// Recovery: let reth0.80 build too. Every desired key now has a live
+	// instance → the RG is ready with no reasons and the unbuilt record clears.
+	m.openInstanceSocket = func(vi *vrrpInstance) error { return nil }
+	if err := m.UpdateInstances(desired); err != nil {
+		t.Fatalf("UpdateInstances (recovery): %v", err)
+	}
+	m.mu.RLock()
+	n = len(m.instances)
+	m.mu.RUnlock()
+	if n != 2 {
+		t.Fatalf("expected both instances after recovery, got %d", n)
+	}
+	if ready, reasons := m.RGVRRPReady(1, true); !ready || reasons != nil {
+		t.Fatalf("RGVRRPReady(1) must be (true, nil) once every desired key built: ready=%v reasons=%v", ready, reasons)
 	}
 }
 
