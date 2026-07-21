@@ -316,12 +316,99 @@ fn cos_batch_tx_made_progress_requires_real_send_progress() {
 
 #[test]
 fn cos_batch_tx_made_progress_yields_on_retry_and_drop() {
+    // #4971: TxError payloads are copyable reason codes, not Strings.
     assert!(!cos_batch_tx_made_progress(Err(TxError::Retry(
-        "no free TX frame available".to_string()
+        TxRetryReason::NoFreeTxFrame
     ))));
     assert!(!cos_batch_tx_made_progress(Err(TxError::Drop(
-        "tx ring insert failed".to_string()
+        crate::afxdp::tx::TxDropReason::PreparedSliceOutOfRange { offset: 0, len: 0 }
     ))));
+}
+
+// #4971: an expected TX backpressure retry records its reason via the
+// lock-free `last_tx_retry_status` atomic and must NOT take the
+// `last_error` mutex. Driven end-to-end through `submit_local` with an
+// empty free-frame pool (the NoFreeTxFrame retry inside transmit_batch).
+//
+// FAIL-ON-REVERT (assertion, NOT a build break — `last_error` exists in
+// both worlds): reverting the retry arm to `set_error(...)` writes the
+// mutex, so `last_error` is non-empty → assertion RED.
+#[test]
+fn tx_retry_status_lock_free_4971() {
+    let now_ns = 1_000_000_000u64;
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    root.tokens = 100_000;
+    root.queues[0].hot.tokens = 100_000;
+
+    let fast_interfaces = test_cos_fast_interfaces(
+        42,
+        42,
+        0,
+        vec![(0, test_queue_fast_path(false, 0, None, None))],
+        None,
+        None,
+    );
+    let fast_path = fast_interfaces.get(&42).expect("test fast path").clone();
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 0, 42, root, fast_path);
+
+    // Force the NoFreeTxFrame retry inside transmit_batch.
+    binding.tx_pipeline.free_tx_frames.clear();
+    // Premise: last_error starts empty.
+    assert!(
+        binding.live.last_error.lock().unwrap().is_empty(),
+        "test premise: last_error starts empty"
+    );
+
+    let items = VecDeque::from([TxRequest {
+        bytes: vec![0u8; 128],
+        expected_ports: None,
+        expected_addr_family: 0,
+        expected_protocol: 0,
+        flow_key: None,
+        egress_ifindex: 42,
+        cos_queue_id: Some(0),
+        dscp_rewrite: None,
+        mirror_clone: false,
+        enqueue_ns: now_ns,
+    }]);
+    let mut shared_recycles = Vec::new();
+
+    let progress = submit_local(
+        &mut binding,
+        42,
+        0,
+        CoSServicePhase::Surplus,
+        128,
+        items,
+        now_ns,
+        &mut shared_recycles,
+    );
+
+    assert!(!progress, "an expected retry makes no send progress");
+    // THE GATE: the expected-retry path must NOT have written the
+    // last_error mutex. Reverting to `set_error(...)` makes it non-empty.
+    assert!(
+        binding.live.last_error.lock().unwrap().is_empty(),
+        "#4971: an expected TX retry must be lock-free — the last_error \
+         mutex must stay empty (revert to set_error(...) makes it non-empty)"
+    );
 }
 
 #[test]

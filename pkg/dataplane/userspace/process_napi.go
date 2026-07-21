@@ -1,9 +1,11 @@
 package userspace
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -273,14 +275,53 @@ func sendUDPProbeForNAPI(iface string, target net.IP, port uint16) {
 	}
 }
 
+// neighborPrewarmDeadline bounds one async prewarm scan (#5104). It caps how
+// long the singleflight guard can be held: the scan checks the context between
+// netlink dumps and stops issuing more once the deadline passes, so a slow
+// netlink layer or a large RIB cannot pin the guard indefinitely — the next
+// tick spawns a fresh scan.
+const neighborPrewarmDeadline = 15 * time.Second
+
+// neighborPrewarmProbeWorkers caps the concurrent ICMP probe goroutines a
+// single scan spawns (#5104). Before this, a scan launched ONE goroutine per
+// resolve target, so a large neighbor/route set multiplied unbounded goroutines
+// on every tick. A fixed pool keeps cold-path work bounded regardless of RIB
+// size.
+const neighborPrewarmProbeWorkers = 8
+
 // proactiveNeighborResolveAsyncLocked is the non-blocking version that
 // fires probes in background goroutines. Used by the status loop.
+//
+// #5104: at most ONE scan runs at a time. The status loop kicks this every 1s
+// for the first 60s (then every 10s on HA standby); under slow netlink or a
+// large RIB a scan can outlast its tick. Without a guard, overlapping ticks
+// multiplied concurrent scans and probe goroutines — self-amplifying
+// control-plane load that delayed apply/status/recovery. The singleflight CAS
+// coalesces overlapping ticks onto the running scan; the guard is cleared when
+// the scan goroutine returns (via defer, so a panic also clears it).
 func (m *Manager) proactiveNeighborResolveAsyncLocked() {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
 		return
 	}
+	// Singleflight: skip this tick if a scan is already in flight. CAS is
+	// lock-free so the background scan can clear it without taking m.mu.
+	if !m.neighborPrewarmInFlight.CompareAndSwap(false, true) {
+		return
+	}
 	cfg := m.lastSnapshot.Config
-	go proactiveNeighborResolveAsync(cfg)
+	scan := m.neighborPrewarmScan
+	if scan == nil {
+		scan = proactiveNeighborResolveAsync
+	}
+	go func() {
+		defer m.neighborPrewarmInFlight.Store(false)
+		// Deadline-bound the scan so a wedged/slow netlink dump can't hold the
+		// singleflight guard forever; on deadline the scan stops issuing work,
+		// returns, clears the guard, and the next tick retries.
+		ctx, cancel := context.WithTimeout(context.Background(), neighborPrewarmDeadline)
+		defer cancel()
+		scan(ctx, cfg)
+	}()
 }
 
 type neighborProbeTarget struct {
@@ -288,11 +329,65 @@ type neighborProbeTarget struct {
 	ip    string
 }
 
-func proactiveNeighborResolveAsync(cfg *config.Config) {
+// runBoundedNeighborProbes fires one ICMP/NDP probe per target through a
+// fixed-size worker pool (#5104). It replaces the previous unbounded
+// goroutine-per-target fan-out so N resolve targets spawn at most `workers`
+// concurrent probes. It stops early once ctx is cancelled/expired, and waits
+// for the in-flight probes to drain before returning.
+func runBoundedNeighborProbes(ctx context.Context, targets []neighborProbeTarget, workers int, probe func(iface string, target net.IP)) {
+	if workers < 1 {
+		workers = 1
+	}
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		targetIP := net.ParseIP(t.ip)
+		if targetIP == nil {
+			continue
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return
+		}
+		wg.Add(1)
+		go func(iface string, ip net.IP) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			probe(iface, ip)
+		}(t.iface, targetIP)
+	}
+	wg.Wait()
+}
+
+func proactiveNeighborResolveAsync(ctx context.Context, cfg *config.Config) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	seen := make(map[string]bool)
 	targetSet := make(map[string]struct{})
 	var targets []neighborProbeTarget
+	// #5104: cache ONE neighbor dump per link index per scan. The route loop
+	// below previously re-dumped the neighbor table per route (often re-dumping
+	// the same link many times on a large RIB). Caching collapses that to one
+	// NeighList(FAMILY_ALL) per link per scan.
+	linkNeighCache := make(map[int][]netlink.Neigh)
+	neighborsForLink := func(linkIndex int) []netlink.Neigh {
+		if cached, ok := linkNeighCache[linkIndex]; ok {
+			return cached
+		}
+		neighs, _ := netlink.NeighList(linkIndex, netlink.FAMILY_ALL)
+		linkNeighCache[linkIndex] = neighs
+		return neighs
+	}
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
+		if ctx.Err() != nil {
+			return
+		}
 		base := config.LinuxIfName(ifName)
 		seen[base] = true // include base interface for route-GW probing
 		for _, unit := range ifc.Units {
@@ -305,30 +400,30 @@ func proactiveNeighborResolveAsync(cfg *config.Config) {
 			if err != nil || link == nil {
 				continue
 			}
-			for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-				neighs, err := netlink.NeighList(link.Attrs().Index, family)
-				if err != nil {
+			for _, n := range neighborsForLink(link.Attrs().Index) {
+				if n.IP == nil || n.IP.IsLinkLocalUnicast() {
 					continue
 				}
-				for _, n := range neighs {
-					if n.IP == nil || n.IP.IsLinkLocalUnicast() {
+				if n.HardwareAddr == nil || len(n.HardwareAddr) == 0 ||
+					n.State == netlink.NUD_STALE || n.State == netlink.NUD_FAILED {
+					key := linuxName + "|" + n.IP.String()
+					if _, ok := targetSet[key]; ok {
 						continue
 					}
-					if n.HardwareAddr == nil || len(n.HardwareAddr) == 0 ||
-						n.State == netlink.NUD_STALE || n.State == netlink.NUD_FAILED {
-						key := linuxName + "|" + n.IP.String()
-						if _, ok := targetSet[key]; ok {
-							continue
-						}
-						targetSet[key] = struct{}{}
-						targets = append(targets, neighborProbeTarget{iface: linuxName, ip: n.IP.String()})
-					}
+					targetSet[key] = struct{}{}
+					targets = append(targets, neighborProbeTarget{iface: linuxName, ip: n.IP.String()})
 				}
 			}
 		}
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	routes, _ := netlink.RouteList(nil, netlink.FAMILY_ALL)
 	for _, r := range routes {
+		if ctx.Err() != nil {
+			return
+		}
 		if r.Gw == nil || r.Gw.IsLinkLocalUnicast() {
 			continue
 		}
@@ -340,9 +435,8 @@ func proactiveNeighborResolveAsync(cfg *config.Config) {
 		if !seen[ifName] {
 			continue
 		}
-		existing, _ := netlink.NeighList(r.LinkIndex, netlink.FAMILY_ALL)
 		found := false
-		for _, n := range existing {
+		for _, n := range neighborsForLink(r.LinkIndex) {
 			if n.IP.Equal(r.Gw) && n.HardwareAddr != nil && len(n.HardwareAddr) > 0 &&
 				n.State != netlink.NUD_FAILED {
 				found = true
@@ -359,12 +453,5 @@ func proactiveNeighborResolveAsync(cfg *config.Config) {
 		targetSet[key] = struct{}{}
 		targets = append(targets, neighborProbeTarget{iface: ifName, ip: r.Gw.String()})
 	}
-	for _, t := range targets {
-		go func(iface, ip string) {
-			targetIP := net.ParseIP(ip)
-			if targetIP != nil {
-				sendICMPProbeFromManager(iface, targetIP)
-			}
-		}(t.iface, t.ip)
-	}
+	runBoundedNeighborProbes(ctx, targets, neighborPrewarmProbeWorkers, sendICMPProbeFromManager)
 }

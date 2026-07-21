@@ -831,6 +831,16 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// linearizable capacity gate; `pending_tx.len()` remains observational.
     pub(super) pending_tx_admitted: AtomicUsize,
     pub(super) last_error: Mutex<String>,
+    /// #4971: lock-free last expected-TX-backpressure retry reason.
+    /// Stores a `crate::afxdp::tx::TxRetryReason` ordinal (0 = none).
+    /// Written on the expected-congestion retry path via
+    /// `set_tx_retry_status` INSTEAD of taking the `last_error` mutex —
+    /// the TX drain path recurs every pass under ring pressure, so a
+    /// mutex acquire there is a hot-path cost. Surfaced as the
+    /// `last_error` fallback in the status snapshot (read side, ~1s
+    /// poll), so operator visibility of the backpressure reason is
+    /// preserved without any lock on the send hot path.
+    pub(super) last_tx_retry_status: AtomicU8,
     /// Cross-worker redirect inbox (#706). N producer workers push
     /// redirected `TxRequest`s; the single owner worker drains. Bounded
     /// lock-free ring — replaces the pre-#706 `Mutex<VecDeque>` that
@@ -1060,6 +1070,8 @@ impl BindingLiveState {
             max_pending_tx: AtomicU32::new(0),
             pending_tx_admitted: AtomicUsize::new(0),
             last_error: Mutex::new(String::new()),
+            // #4971: 0 = no TX-retry backpressure reason recorded yet.
+            last_tx_retry_status: AtomicU8::new(0),
             pending_tx: MpscInbox::new(PENDING_TX_INBOX_HARD_CAP),
             pending_session_deltas: Mutex::new(VecDeque::new()),
             delta_loss_pending: AtomicBool::new(false),
@@ -1161,12 +1173,26 @@ impl BindingLiveState {
         if let Ok(mut err) = self.last_error.lock() {
             err.clear();
         }
+        // #4971: also reset the lock-free retry status so a rebind /
+        // successful reconcile clears the surfaced backpressure reason.
+        self.last_tx_retry_status.store(0, Ordering::Relaxed);
     }
 
     pub(super) fn set_error(&self, msg: String) {
         if let Ok(mut err) = self.last_error.lock() {
             *err = msg;
         }
+    }
+
+    /// #4971: record an expected-TX-backpressure retry reason without
+    /// touching the `last_error` mutex. A single `Relaxed` atomic store
+    /// (single-writer owner worker) — cheap enough to sit on the send
+    /// hot path, which recurs every drain pass under ring pressure. The
+    /// reason is surfaced to operators as the `last_error` snapshot
+    /// fallback (see `snapshot.rs`), so observability is preserved.
+    pub(super) fn set_tx_retry_status(&self, reason: crate::afxdp::tx::TxRetryReason) {
+        self.last_tx_retry_status
+            .store(reason as u8, Ordering::Relaxed);
     }
 
     pub(super) fn record_slow_path_accept(

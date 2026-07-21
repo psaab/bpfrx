@@ -53651,3 +53651,72 @@ top.
 - **File(s)**: userspace-dp/src/screen/mod.rs,
   userspace-dp/src/screen/tests.rs,
   docs/syn-cookie-flood-protection.md
+- **Action**: #4971 — allocation-free + lock-free expected TX retry path.
+  `TxError::Retry`/`Drop` payloads changed from heap `String` to `Copy`
+  reason codes (`TxRetryReason` #[repr(u8)] + `TxDropReason` C-like enum
+  carrying scalar geometry). The expected-backpressure retry path recurs
+  every drain pass under ring pressure, so allocating a fresh `String`
+  there (and taking the `last_error` mutex) violated the hot-path
+  no-allocation discipline. Fixes: (1) copyable reason enums, each mapping
+  1:1 to a former retry/drop string; `TxRetryReason::as_str()` renders the
+  exact legacy operator text so status/log scraping is unchanged; (2) the
+  retry tail (un-inserted suffix) is now restored to `pending` by
+  reverse-popping the staged scratch (`pop()` → new `len()` == popped
+  index), preserving FIFO order with NO side `Vec` — replaces
+  `retry_tail = Vec::new()` in `transmit/mod.rs` AND `transmit/finalise.rs`;
+  (3) the expected-retry sites record a lock-free
+  `BindingLiveState::last_tx_retry_status` AtomicU8 via `set_tx_retry_status`
+  instead of the `last_error` mutex; the status snapshot surfaces it as the
+  `last_error` fallback (read side, ~1s poll) so operator visibility is
+  preserved. Exceptional `TxError::Drop` (capacity/slice fault) still renders
+  `reason.message()` via `set_error` — rare, off the hot path. Also converted
+  the six identical exact-CoS direct-service `set_error(<literal>.to_string())`
+  backpressure sites in `queue_service/service.rs` to `set_tx_retry_status`.
+  Tests (target-count 3): `tx_retry_tail_is_allocation_free_4971` +
+  `tx_retry_outcome_codes_4971` (counting global allocator, `src/test_alloc.rs`,
+  #[cfg(test)] only — assert ZERO heap allocs per drain pass) and
+  `tx_retry_status_lock_free_4971` (last_error mutex stays empty on retry).
+  Parent-RED verified: reverting to `retry_tail = Vec::new()` /
+  `Retry(String)` / `set_error(...)` makes each test RED as an ASSERTION
+  failure (crate still compiles — not a build break), 3 failed / 0 passed.
+  NOT HA (TX drain path; unit-provable, no cluster smoke).
+- **File(s)**: userspace-dp/src/afxdp/tx/transmit/mod.rs,
+  userspace-dp/src/afxdp/tx/transmit/finalise.rs,
+  userspace-dp/src/afxdp/tx/transmit/stage.rs,
+  userspace-dp/src/afxdp/tx/transmit/rewrite.rs,
+  userspace-dp/src/afxdp/tx/transmit/verify.rs,
+  userspace-dp/src/afxdp/tx/transmit_tests.rs,
+  userspace-dp/src/afxdp/tx/mod.rs,
+  userspace-dp/src/afxdp/tx/drain/phase_backup.rs,
+  userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/service.rs,
+  userspace-dp/src/afxdp/cos/queue_service/submit_local.rs,
+  userspace-dp/src/afxdp/cos/queue_service/submit_prepared.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests/drain.rs,
+  userspace-dp/src/main.rs, userspace-dp/src/test_alloc.rs,
+  userspace-dp/src/afxdp/tx/README.md
+- **Action**: #5104 — singleflight-guard + bound the userspace-dp neighbor
+  prewarm scan. The status loop kicked a FULL async neighbor-resolve scan every
+  1s for the first 60s (then 10s standby) with NO in-flight guard; each scan did
+  route-indexed NeighList dumps and spawned ONE goroutine PER TARGET. Under slow
+  netlink / a large RIB, scans OVERLAPPED, multiplying concurrent scans and
+  unbounded probe goroutines — self-amplifying control-plane load delaying
+  apply/status/recovery. Fix: (1) lock-free `neighborPrewarmInFlight` atomic.Bool
+  CAS singleflight guard in `proactiveNeighborResolveAsyncLocked` (coalesce
+  overlapping ticks; cleared via defer so a panic also clears); (2) each scan
+  runs under a 15s `neighborPrewarmDeadline` context, checked between netlink
+  dumps so slow netlink can't pin the guard; (3) `runBoundedNeighborProbes`
+  fixed 8-worker pool replaces goroutine-per-target; (4) one
+  `NeighList(FAMILY_ALL)` dump per link index per scan (was per-route re-dump).
+  Injectable `neighborPrewarmScan` seam for deterministic tests. Merge-gate
+  regression `TestNeighborPrewarmSingleflightCoalescesOverlappingTicks5104`
+  (RED-on-revert verified: neutralize CAS → peak concurrent scans = 2, want 1;
+  assertion failure not build break, target-count 1) + bounded-pool +
+  ctx-cancel tests. Validated with `go test -race` (full pkg green, named 3x),
+  gofmt + go vet clean. NOT HA-smoke — guard is unit-provable.
+- **File(s)**: pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/process_napi.go,
+  pkg/dataplane/userspace/neighbor_prewarm_singleflight_5104_test.go,
+  docs/userspace-cold-start-fix-plan.md
