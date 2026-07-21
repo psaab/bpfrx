@@ -141,6 +141,9 @@ impl BindingLiveState {
             nat64_ineligible_source: self.nat64_ineligible_source.load(Ordering::Relaxed),
             nat64_exthdr_ineligible: self.nat64_exthdr_ineligible.load(Ordering::Relaxed),
             nat_alloc_fail: self.nat_alloc_fail.load(Ordering::Relaxed),
+            nat_frag_untranslated_dropped: self
+                .nat_frag_untranslated_dropped
+                .load(Ordering::Relaxed),
             slow_path_packets: self.slow_path_packets.load(Ordering::Relaxed),
             slow_path_bytes: self.slow_path_bytes.load(Ordering::Relaxed),
             slow_path_local_delivery_packets: self

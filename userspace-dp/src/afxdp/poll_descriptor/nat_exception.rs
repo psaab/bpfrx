@@ -91,6 +91,52 @@ pub(super) fn source_nat_decision_for_flow(
     }
 }
 
+/// #6122: READ-ONLY "would source NAT translate this fragment?" probe for the
+/// flowless non-first-fragment MISS discriminator. Wraps
+/// [`source_nat_decision_for_flow`] with `non_first_fragment = true` (which
+/// reports a pool-mode match as `Unavailable` BEFORE minting any pool mapping)
+/// and collapses the result to a boolean:
+///   - `Ok` with a concrete address rewrite (interface / static SNAT) → `true`
+///   - `Err` (a pool rule matched but a fragment can't be port-mapped, or an
+///     interface rule with no egress address) → `true` (the flow WOULD be
+///     source-translated, so the miss must fail closed)
+///   - `Ok(NatDecision::default())` (no rule, or an explicit `off` rule) → `false`
+///
+/// Side-effect-free: it NEVER records a source-NAT allocation failure (that is
+/// the job of the two real decision sites the #1377 contract enforces) and
+/// mints no session / pool state. Kept here alongside `source_nat_decision_for_flow`
+/// so the `poll_descriptor/mod.rs` call-site count the #1377 SNAT contract guard
+/// asserts (exactly two fail-closed decision sites) is unaffected.
+#[cold]
+#[inline(never)]
+pub(super) fn source_nat_would_translate_fragment(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    from_zone: &str,
+    to_zone: &str,
+    egress_ifindex: i32,
+    flow: &SessionFlow,
+    now_ns: u64,
+) -> bool {
+    let mut matched_counter = None;
+    match source_nat_decision_for_flow(
+        forwarding,
+        ingress_ifindex,
+        from_zone,
+        to_zone,
+        egress_ifindex,
+        flow,
+        now_ns,
+        // A non-first fragment: pool-mode SNAT reports `Unavailable` before
+        // allocating, so this stays read-only.
+        true,
+        &mut matched_counter,
+    ) {
+        Ok(decision) => decision.rewrite_src.is_some() || decision.rewrite_dst.is_some(),
+        Err(_) => true,
+    }
+}
+
 #[cold]
 #[inline(never)]
 pub(super) fn record_source_nat_failure(

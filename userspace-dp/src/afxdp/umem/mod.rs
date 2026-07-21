@@ -534,6 +534,16 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// The packet is dropped. Bridged into `GlobalCtrNATAllocFail` (Go side) so
     /// the `NAT allocation failures` operator counter is no longer a dead 0.
     pub(super) nat_alloc_fail: AtomicU64,
+    /// #6122: cumulative fail-closed drops of an ordinary same-family NAT'd
+    /// (SNAT / static-NAT / DNAT / NPTv6) NON-FIRST fragment that MISSED the
+    /// fragment-association cache. Forwarding it untranslated would leak the
+    /// internal source (SNAT / NPTv6) or the pre-NAT destination (DNAT), so the
+    /// permitted-but-untranslatable fragment is dropped fail-closed instead.
+    /// Surfaced as the `NAT frag untranslated drops` operator counter; the
+    /// same-family sibling of `nat64_frag_dropped`. A plain (no-NAT) fragment
+    /// matches no rule and is NOT counted here — ordinary fragmented forwarding
+    /// is preserved.
+    pub(super) nat_frag_untranslated_dropped: AtomicU64,
     pub(super) slow_path_packets: AtomicU64,
     pub(super) slow_path_bytes: AtomicU64,
     pub(super) slow_path_local_delivery_packets: AtomicU64,
@@ -980,6 +990,7 @@ impl BindingLiveState {
             nat64_ineligible_source: AtomicU64::new(0),
             nat64_exthdr_ineligible: AtomicU64::new(0),
             nat_alloc_fail: AtomicU64::new(0),
+            nat_frag_untranslated_dropped: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),
             slow_path_local_delivery_packets: AtomicU64::new(0),

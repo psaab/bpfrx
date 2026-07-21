@@ -49,7 +49,9 @@ use super::*;
 use crate::policy::evaluate_policy_result_with_icmp;
 
 use cookie_reply::{SynCookieReply, enqueue_syn_cookie_reply};
-use nat_exception::{record_source_nat_failure, source_nat_decision_for_flow};
+use nat_exception::{
+    record_source_nat_failure, source_nat_decision_for_flow, source_nat_would_translate_fragment,
+};
 use reject_reply::{deny_reply_and_emit, enqueue_deny_reply, enqueue_filter_reject_reply};
 
 use filter::{
@@ -221,24 +223,25 @@ fn nat_install_forward_fragment_assoc(
 /// and IPv6. The reverse-direction (reply) association is a deferred increment,
 /// mirroring the NAT64 forward-only wiring.
 ///
-/// FAIL-OPEN MISS (deliberate asymmetry with NAT64, #5689). On a consult MISS —
+/// FAIL-CLOSED MISS (#6122, closing the #5689 residual). On a consult MISS —
 /// fragment reorder (non-first before first), TTL straddle (> the ~2s
 /// `Nat64FragAssoc` TTL between first and non-first), shard-cap eviction under a
 /// first-fragment flood, a config-generation bump between first and non-first, or
 /// a first fragment that never forwarded (MissingNeighbor/NoRoute → no install) —
-/// the caller's flowless default FORWARDS a permitted same-family NAT'd non-first
-/// fragment UNTRANSLATED, so the #5689 source/pre-DNAT-dst leak PERSISTS on those
-/// edge cases. This is fail-OPEN, the OPPOSITE of the NAT64 sibling, whose
-/// no-association non-first fragment drops fail-CLOSED (#4617). The asymmetry is
-/// intentional: the flowless arm cannot distinguish a NAT'd-flow miss from a
-/// legitimate NO-NAT fragmented flow, so dropping every same-family non-first
-/// fragment on a miss would blackhole ordinary un-NAT'd fragmented traffic. It is
-/// NOT a regression (pre-#5689 forwarded untranslated in ALL cases; #5689 strictly
-/// narrows the leak to these miss edges) and NOT a policy bypass (the flowless
-/// miss path still runs `evaluate_policy_result_l3_aware`, so a DENIED flow's
-/// fragments still drop — the residual is an info-leak of the internal source for
-/// PERMITTED flows only). A fail-closed miss for a NAT'd fragment (needs a
-/// NAT'd-miss vs no-NAT-miss discriminator) is a tracked follow-up (#6122).
+/// the caller does NOT blindly forward the fragment untranslated. Instead the
+/// flowless arm runs [`flowless_fragment_requires_nat_translation`], a read-only
+/// NAT'd-miss vs no-NAT-miss discriminator: if a SNAT / static-NAT / DNAT /
+/// NPTv6 rule WOULD translate the fragment's L3 identity, the
+/// permitted-but-untranslatable fragment is DROPPED fail-closed (counted as
+/// `nat_frag_untranslated_dropped`) rather than leaking the internal source
+/// (SNAT / NPTv6) or the pre-NAT destination (DNAT); if NO rule matches, the
+/// plain fragment forwards exactly as before, so ordinary un-NAT'd fragmented
+/// traffic is never blackholed. This brings the same-family arm into line with
+/// the NAT64 sibling (whose no-association non-first fragment already drops
+/// fail-closed, #4617). The pre-#6122 behavior forwarded the miss UNTRANSLATED
+/// (the deliberate fail-OPEN asymmetry #5689 documented as a tracked follow-up);
+/// the discriminator is what finally makes the miss fail-closed without
+/// over-dropping.
 #[inline]
 fn nat_consult_forward_fragment_assoc(
     forwarding: &ForwardingState,
@@ -260,6 +263,147 @@ fn nat_consult_forward_fragment_assoc(
         return None;
     }
     Some(decision)
+}
+
+/// #6122: fail-closed discriminator for the flowless non-first-fragment MISS
+/// path. Answers "would this fragment's flow have been translated by an
+/// ordinary same-family NAT rule (SNAT / static-NAT / DNAT / NPTv6)?" using
+/// ONLY the fragment's L3 identity — source / destination / protocol / ingress
+/// + egress zones / interface + routing-instance scope — every part of which a
+/// non-first fragment carries in its IP header. When it returns `true` the
+/// caller DROPS the fragment (fail-closed) instead of forwarding it
+/// UNTRANSLATED (the #6122 leak): a permitted-but-untranslatable NAT'd fragment
+/// with no association leaks the internal source (SNAT / NPTv6) or the pre-NAT
+/// destination (DNAT). A plain (no-NAT) fragment matches NO rule here and keeps
+/// forwarding, so ordinary fragmented forwarding is preserved.
+///
+/// This is the SAME-FAMILY analog of the NAT64 sibling's fail-closed
+/// no-association drop (#4617, `nat64_frag_dropped`); NAT64 (cross-family) is
+/// out of scope here — its own consult already drops fail-closed on a miss.
+///
+/// READ-ONLY / side-effect-free — safe on the miss path: source NAT is
+/// consulted with `non_first_fragment = true`, which returns BEFORE minting any
+/// pool mapping (a pool-mode match reports `Unavailable`, an
+/// interface/static-SNAT match reports an address-only `Matched`); the DNAT /
+/// static-DNAT lookups and the NPTv6 boolean probes (run on a scratch copy of
+/// the address) allocate no session, BIB, or pool state.
+///
+/// A non-first fragment carries no L4 ports, so this deliberately matches only
+/// ADDRESS/zone-scoped NAT rules: a strictly PORT-scoped DNAT rule does not
+/// match `dst_port == 0` and is intentionally NOT flagged (that residual is
+/// documented in the `nat64.rs` FEATURES.md row — its common in-order case is
+/// covered by the association HIT path, and forwarding such a fragment reaches
+/// the pre-DNAT public destination, not an internal source).
+#[cold]
+#[inline(never)]
+fn flowless_fragment_requires_nat_translation(
+    forwarding: &ForwardingState,
+    l3_flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    ingress_zone_override: Option<u16>,
+    from_zone_id: u16,
+    to_zone_id: u16,
+    egress_ifindex: i32,
+    now_ns: u64,
+) -> bool {
+    // Fast-out when NO same-family NAT is configured at all — the common case,
+    // and it keeps a NAT-free box's fragment path byte-identical to pre-#6122.
+    if forwarding.source_nat_rules.is_empty()
+        && forwarding.static_nat.is_empty()
+        && forwarding.dnat_table.is_empty()
+        && forwarding.nptv6.is_empty()
+    {
+        return false;
+    }
+    let from_zone: &str = forwarding
+        .zone_id_to_name
+        .get(&from_zone_id)
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let to_zone: &str = forwarding
+        .zone_id_to_name
+        .get(&to_zone_id)
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    // --- Source-based translation (internal-source leak: NPTv6 outbound /
+    //     interface-SNAT / pool-SNAT / static-SNAT). Matched on the source
+    //     address + ingress/egress zones + egress scope, all L3-only. ---
+    if let IpAddr::V6(src_v6) = l3_flow.src_ip {
+        // NPTv6 outbound translates the SOURCE prefix on egress; probe a copy.
+        let mut probe = src_v6;
+        if forwarding.nptv6.translate_outbound(&mut probe, to_zone) {
+            return true;
+        }
+    }
+    // Interface / pool / static SNAT — the read-only probe reports a match
+    // (including a pool-mode match a fragment can't port-map) without minting
+    // any pool mapping or recording a source-NAT allocation failure.
+    if source_nat_would_translate_fragment(
+        forwarding,
+        meta.ingress_ifindex as i32,
+        from_zone,
+        to_zone,
+        egress_ifindex,
+        l3_flow,
+        now_ns,
+    ) {
+        return true;
+    }
+
+    // --- Destination-based translation (pre-NAT dst leak: DNAT / static-DNAT /
+    //     NPTv6 inbound). Matched on the destination address + ingress scope.
+    //     Strictly port-scoped DNAT rules do not match `dst_port == 0` and are
+    //     intentionally not flagged (documented residual). ---
+    let scope = prerouting_ingress_scope(
+        forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+        ingress_zone_override,
+    );
+    if let IpAddr::V6(dst_v6) = l3_flow.dst_ip {
+        // NPTv6 inbound translates the DESTINATION prefix on ingress.
+        let mut probe = dst_v6;
+        if forwarding.nptv6.translate_inbound(&mut probe, scope.zone_name) {
+            return true;
+        }
+    }
+    if !forwarding.dnat_table.is_empty()
+        && forwarding
+            .dnat_table
+            .lookup_with_counter_scoped(
+                meta.protocol,
+                l3_flow.src_ip,
+                l3_flow.dst_ip,
+                // No L4 ports on a non-first fragment → 0. A port-wildcard
+                // (address-only) DNAT rule still matches; a port-specific one
+                // does not (documented residual).
+                0,
+                0,
+                scope.zone_name,
+                scope.ifname,
+                scope.routing_instance,
+                None,
+            )
+            .is_some()
+    {
+        return true;
+    }
+    if forwarding
+        .static_nat
+        .match_dnat_with_counter_scoped(
+            l3_flow.dst_ip,
+            0,
+            Some(l3_flow.src_ip),
+            scope.zone_name,
+            scope.ifname,
+            scope.routing_instance,
+        )
+        .is_some()
+    {
+        return true;
+    }
+    false
 }
 
 #[inline]
@@ -4109,6 +4253,43 @@ pub(super) fn poll_binding_process_descriptor(
                                 now_ns,
                             );
                             telemetry.dbg.policy_deny += 1;
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                        // #6122: fail-closed NAT'd non-first-fragment MISS. The
+                        // fragment passed policy and would be FORWARDED, but it
+                        // reached this flowless arm on a fragment-association
+                        // MISS (reorder / eviction / TTL straddle / config-
+                        // generation bump / a first fragment that never
+                        // forwarded). If its flow WOULD be same-family NAT-
+                        // translated (SNAT / static-NAT / DNAT / NPTv6 — matched
+                        // on the fragment's L3 identity), forwarding it with the
+                        // default (no-NAT) decision below would leak the internal
+                        // source (SNAT / NPTv6) or the pre-NAT destination
+                        // (DNAT). Drop it fail-closed: the sender retransmits, a
+                        // rare reordered fragment ahead of its first is
+                        // recoverable, but the leak is not. Scoped to a GENUINE
+                        // non-first fragment (a first fragment / full-L4 packet
+                        // is NAT-translated on the flow-backed arm and installs
+                        // the association, so it never reaches here); a plain
+                        // (no-NAT) fragment matches no rule and forwards normally,
+                        // preserving ordinary fragmented forwarding.
+                        if crate::afxdp::frame::frame_is_non_first_fragment(packet_frame, meta)
+                            && flowless_fragment_requires_nat_translation(
+                                worker_ctx.forwarding,
+                                l3_flow,
+                                meta,
+                                ingress_zone_override,
+                                from_zone_id,
+                                to_zone_id,
+                                final_resolution.egress_ifindex,
+                                now_ns,
+                            )
+                        {
+                            // Dedicated fail-closed observability (sets `touched`
+                            // + bumps `nat_frag_untranslated_dropped`); NOT a
+                            // policy deny, so `dbg.policy_deny` is left untouched.
+                            telemetry.counters.record_nat_frag_untranslated_dropped();
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }

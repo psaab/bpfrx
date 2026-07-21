@@ -630,6 +630,17 @@ pub(in crate::afxdp) struct BatchCounters {
     // ("NAT allocation failures"), the REST/Prometheus surfaces, and the CLI
     // read — dead-counter fix for the observability lie.
     nat_alloc_fail: u64,
+    // #6122: fail-closed drops of an ordinary same-family NAT'd (SNAT /
+    // static-NAT / DNAT / NPTv6) NON-FIRST fragment that MISSED the
+    // fragment-association cache. Forwarding it untranslated would leak the
+    // internal source (SNAT / NPTv6) or the pre-NAT destination (DNAT); the
+    // flow WOULD be translated (a matching NAT rule exists on its L3 identity)
+    // but no association is present (reorder / eviction / TTL straddle /
+    // config-generation bump / a first fragment that never forwarded), so the
+    // fragment is DROPPED. The same-family sibling of `nat64_frag_dropped`.
+    // Bumped at the flowless miss path (`record_nat_frag_untranslated_dropped`)
+    // and flushed to BindingLiveState.nat_frag_untranslated_dropped.
+    nat_frag_untranslated_dropped: u64,
     // #1187: 8 disposition-path counters added to eliminate per-packet
     // MESI thrash on BindingLiveState atomics during DDoS / config-
     // reload windows. See docs/pr/1187-telemetry-double-buffer/plan.md
@@ -773,6 +784,20 @@ impl BatchCounters {
         self.nat64_frag_dropped += 1;
     }
 
+    /// #6122: record a fail-closed drop of an ordinary same-family NAT'd
+    /// non-first fragment that missed the fragment-association cache. Bumped on
+    /// the flowless miss path when `flowless_fragment_requires_nat_translation`
+    /// confirms a matching SNAT / static-NAT / DNAT / NPTv6 rule for the
+    /// fragment's L3 identity but no association is present, so forwarding it
+    /// untranslated would leak the internal source / pre-NAT destination.
+    /// Batched like the sibling NAT drop counters and flushed to
+    /// `BindingLiveState.nat_frag_untranslated_dropped`.
+    #[inline]
+    pub(in crate::afxdp) fn record_nat_frag_untranslated_dropped(&mut self) {
+        self.touched = true;
+        self.nat_frag_untranslated_dropped += 1;
+    }
+
     /// #5623: record a fail-closed NAT64 SOURCE-ineligibility drop — an incoming
     /// IPv6 packet whose source lies within a configured Pref64 (looping /
     /// synthesized, the RFC 6146 §3.5 mandatory drop). Bumped at the pre-routing
@@ -906,6 +931,13 @@ impl BatchCounters {
             live.nat_alloc_fail
                 .fetch_add(self.nat_alloc_fail, Ordering::Relaxed);
             self.nat_alloc_fail = 0;
+        }
+        // #6122: fail-closed NAT'd non-first-fragment miss-drop tally, batched
+        // like the sibling NAT drop counters above.
+        if self.nat_frag_untranslated_dropped != 0 {
+            live.nat_frag_untranslated_dropped
+                .fetch_add(self.nat_frag_untranslated_dropped, Ordering::Relaxed);
+            self.nat_frag_untranslated_dropped = 0;
         }
         // #1187 disposition-path counters
         if self.screen_drops != 0 {

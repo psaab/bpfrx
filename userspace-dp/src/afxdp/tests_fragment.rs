@@ -469,6 +469,125 @@ fn flowless_non_first_fragment_inherits_ordinary_snat_translation_5689() {
 
 
 #[test]
+fn nat_nonfirst_fragment_assoc_miss_fails_closed_6122() {
+    // #6122: a NON-first fragment of an ORDINARY-NAT (interface SNAT lan->wan)
+    // flow that MISSES the fragment-association cache must be DROPPED
+    // fail-closed, NOT forwarded UNTRANSLATED. The miss is exercised the way it
+    // happens in production on the reorder / eviction / TTL-straddle /
+    // config-generation-bump / never-forwarded-first edges: the non-first
+    // fragment reaches the flowless arm with an EMPTY association cache (no
+    // first fragment installed one). Before #6122 the flowless default forwarded
+    // it with `NatDecision::default()`, leaking the internal source
+    // (10.0.61.100) onto the wan wire. #6122 fails closed: the discriminator
+    // sees the SNAT rule WOULD translate this flow's L3 identity, so the
+    // permitted-but-untranslatable fragment is dropped (the sender retransmits).
+    //
+    // RED-on-revert: reverting the fail-closed drop makes the fragment forward
+    // untranslated -> `dbg.forward == 1`, `dbg.nat_applied_none == 1`,
+    // `batch.nat_frag_untranslated_dropped == 0`, tripping all three asserts.
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.default_policy = "permit".to_string();
+    snapshot.policies.clear();
+    snapshot.neighbors = vec![frag_transit_wan_neighbor()];
+    snapshot.source_nat_rules = vec![SourceNATRuleSnapshot {
+        name: "snat-lan-wan".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        ..Default::default()
+    }];
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    let ha_state = BTreeMap::new();
+
+    // Precondition: the association cache is EMPTY (no first fragment seen), so
+    // the flowless consult below is a genuine MISS.
+    assert_eq!(
+        forwarding.nat64.frag_assoc.len(),
+        0,
+        "#6122 precondition: no fragment association installed (a pure miss)"
+    );
+
+    // NON-first fragment (offset 1, id 0xbeef) arriving WITHOUT its first
+    // fragment -> flowless -> association MISS -> #6122 fail-closed drop.
+    let non_first = udp_frag_frame_5689(0x0001, 0xbeef);
+    let (batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &non_first,
+        udp_frag_meta_5689(),
+    );
+    assert_eq!(
+        dbg.forward, 0,
+        "#6122: a NAT'd non-first fragment that misses the association must NOT forward"
+    );
+    assert_eq!(
+        dbg.nat_applied_none, 0,
+        "#6122: the fragment must NOT be forwarded untranslated (no internal-source leak)"
+    );
+    assert_eq!(
+        batch.nat_frag_untranslated_dropped, 1,
+        "#6122: the fail-closed drop must be counted (RED on revert)"
+    );
+}
+
+
+#[test]
+fn nonnat_nonfirst_fragment_assoc_miss_still_forwards_6122() {
+    // #6122 no-regression: a NON-NAT'd (plain-forwarded) non-first fragment that
+    // misses the association must STILL forward normally. The #6122 fail-closed
+    // drop is scoped to fragments whose flow WOULD be NAT-translated; a plain
+    // fragmented flow needs no translation, so dropping it would break ordinary
+    // fragmented forwarding. Same topology as the SNAT test above but with NO
+    // NAT rule of any kind, so the discriminator finds no matching rule and the
+    // fragment forwards untranslated (the correct disposition for a no-NAT flow).
+    //
+    // Guards against an over-broad fix: reverting the discriminator's NAT-scope
+    // gate (dropping EVERY same-family fragment miss) makes `dbg.forward == 0`
+    // and `batch.nat_frag_untranslated_dropped == 1`, tripping these asserts.
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.default_policy = "permit".to_string();
+    snapshot.policies.clear();
+    snapshot.neighbors = vec![frag_transit_wan_neighbor()];
+    // No source_nat_rules / DNAT / static-NAT / NPTv6 -> a plain (no-NAT) flow.
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    let ha_state = BTreeMap::new();
+
+    let non_first = udp_frag_frame_5689(0x0001, 0xbeef);
+    let (batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &non_first,
+        udp_frag_meta_5689(),
+    );
+    assert_eq!(
+        dbg.forward, 1,
+        "#6122: a plain (no-NAT) non-first fragment must still forward"
+    );
+    assert_eq!(
+        dbg.nat_applied_none, 1,
+        "#6122: a plain fragment forwards untranslated (correct — no NAT applies)"
+    );
+    assert_eq!(
+        batch.nat_frag_untranslated_dropped, 0,
+        "#6122: a plain fragment must NOT be counted as a NAT'd-fragment drop"
+    );
+}
+
+
+#[test]
 fn flowless_non_first_fragment_dropped_by_is_fragment_input_filter_3291() {
     // Interface input filter `from is-fragment then discard` on the ingress
     // interface must DROP a non-first fragment. Default-permit policy ensures

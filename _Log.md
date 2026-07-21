@@ -1,3 +1,61 @@
+## 2026-07-21 — #6122: fail closed on NAT'd non-first-fragment frag-assoc miss
+
+- **Timestamp**: 2026-07-21 (fix/6122-nat-frag-miss-failclosed)
+- **Action**: SECURITY fail-closed fix on the AF_XDP forwarding path. Closes
+  the #5689 miss-path residual: an ordinary same-family NAT'd (SNAT /
+  static-NAT / DNAT / NPTv6) NON-FIRST fragment that MISSES the fragment-
+  association cache was forwarded UNTRANSLATED (fail-OPEN), leaking the
+  internal source (SNAT / NPTv6) or the pre-NAT destination (DNAT). Miss
+  triggers: reorder (non-first before first), >~2s TTL straddle, shard-cap
+  eviction, config-generation bump, a first fragment that never forwarded, or
+  an attacker sending only non-first fragments.
+  - Added `flowless_fragment_requires_nat_translation` (poll_descriptor/mod.rs):
+    a read-only NAT'd-miss vs no-NAT-miss discriminator. On the flowless miss
+    arm, for a genuine non-first fragment (`frame_is_non_first_fragment`) that
+    passed policy and would forward as a ForwardCandidate, it re-checks the
+    fragment's L3 identity (src / dst / protocol / ingress+egress zones /
+    interface + routing-instance scope — all carried in the IP header) against
+    the SNAT / static-NAT / DNAT / NPTv6 rule tables. If a rule WOULD translate
+    the flow → DROP fail-closed + count; if no rule matches → forward as before
+    (plain fragmented forwarding preserved).
+  - Source-NAT probe factored into `source_nat_would_translate_fragment`
+    (nat_exception.rs) so the #1377 SNAT-contract guard's "exactly two
+    fail-closed decision sites in poll_descriptor/mod.rs" count is unaffected
+    (the guard does not scan nat_exception.rs). Read-only: pool SNAT reports
+    `Unavailable` before minting a mapping; DNAT/static/NPTv6 are lookups /
+    boolean probes on a scratch address copy. No session/BIB/pool state minted.
+  - New per-binding counter `nat_frag_untranslated_dropped`, the same-family
+    sibling of `nat64_frag_dropped`, wired through the full #4520 plumbing:
+    BatchCounters field + `record_nat_frag_untranslated_dropped`, flush,
+    BindingLiveState atomic + init, worker snapshot, refresh/reset, Rust wire
+    `BindingStatus`, Go `BindingStatus.NatFragUntranslatedDropped`, and the
+    `NAT frag untranslated drops` row in `format/status_sections.go`.
+  - Port-scoped-DNAT residual (a strictly `match destination-port N` rule does
+    not match a fragment's `dst_port==0`) is intentionally not flagged and
+    documented — the common in-order case is covered by the association HIT
+    path, and such a fragment reaches the pre-DNAT public dst, not an internal
+    source.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs, userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/protocol/binding.rs, userspace-dp/src/afxdp/tests_fragment.rs,
+  userspace-dp/src/FEATURES.md, userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status_sections.go,
+  pkg/dataplane/userspace/format/status_golden_test.go,
+  pkg/dataplane/userspace/format/testdata/status_summary.golden
+- **Validation**: full Rust suite green (4046 passed after wire-fixture regen);
+  named `nat_nonfirst_fragment_assoc_miss_fails_closed_6122` run 3× (no flake);
+  no-regression control `nonnat_nonfirst_fragment_assoc_miss_still_forwards_6122`
+  green; parent-RED verified — neutralizing the drop makes the NAT-miss test
+  RED with an ASSERTION failure ("must NOT forward"), target-count 1, while the
+  no-NAT control STAYS green (proves the fix is scoped, not blanket-drop);
+  `snat_contract_doc_guard` green (2 SNAT decision sites unchanged); Go
+  `pkg/dataplane/userspace/...` green (golden + wire parity).
+
 ## 2026-07-21 — #6153: fix stale runtime-chain refs in strict-NAT comment
 
 - **Timestamp**: 2026-07-21 (fix/6153-strict-nat-comment)
