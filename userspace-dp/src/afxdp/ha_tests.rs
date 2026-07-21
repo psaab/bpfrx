@@ -698,20 +698,30 @@ fn upsert_synced_session_refuses_stale_generation_install() {
 // malicious/compromised peer — could drive this node PAST its own aggregate
 // session ceiling and multiply that state across all workers (the
 // availability/DoS root of #5674). `upsert_synced_session` now bounds the
-// shared synced map at `worker_count * DEFAULT_MAX_SESSIONS` and drop-newest-
-// rejects an over-ceiling NEW key. This test pins BOTH halves of #5674: an
-// over-ceiling import is REJECTED (not admitted past the cap) AND it is never
+// shared synced map at `2 * worker_count * DEFAULT_MAX_SESSIONS` and drop-
+// newest-rejects an over-ceiling NEW FORWARD key. The 2× matters: each
+// admitted forward logical session publishes TWO entries into `sessions.synced`
+// (the forward key + a synthesized reverse companion), so a full symmetric
+// peer holding N logical sessions arrives as 2N entries. Sizing the cap to the
+// LOGICAL ceiling N while counting ENTRIES (the pre-fix bug) rejected ~half of
+// a legitimate full-peer import above ~50% peer load; the entry cap is 2N so a
+// full logical set EXACTLY fits.
+//
+// This test pins: (a) a FULL symmetric-peer logical set (LOGICAL_CEILING
+// forward sessions = 2×LOGICAL_CEILING entries) ALL admit with ZERO drops —
+// the regression the review found (a >50% silent under-sync); (b) the NEXT
+// forward, EXCEEDING the logical ceiling, is drop-newest REJECTED and never
 // fanned out to the worker command queue (the per-worker multiplication is
-// bounded). A within-ceiling import and a REPLACE at the ceiling still apply
-// (the cap is scoped to NEW keys, not a blanket block).
+// bounded); (c) a REPLACE of an admitted key still applies at the ceiling (the
+// cap is scoped to NEW forward keys, not a blanket block).
 //
 // PARENT-RED recipe: neutralize the single reject in the
 // `upsert_synced_session` gate (`ha.rs`, the
 // `if synced_cap != 0 && synced_len >= synced_cap { ...; return; }` — e.g.
-// delete the `return;` so the over-ceiling key falls through and is admitted).
-// The over-ceiling key then lands in the shared map + the worker queue, so the
-// `is_none()` / not-enqueued / counter assertions below fail as clean
-// assertions. Target-count = 1 gate site.
+// delete the `return;` so the over-ceiling forward falls through and is
+// admitted). The over-ceiling key then lands in the shared map + the worker
+// queue, so the `is_none()` / not-enqueued reject assertions below fail as
+// clean assertions. Target-count = 1 gate site.
 fn synced_entry_port(port: u16, generation: u64) -> SyncedSessionEntry {
     SyncedSessionEntry {
         key: SessionKey {
@@ -730,10 +740,15 @@ fn synced_entry_port(port: u16, generation: u64) -> SyncedSessionEntry {
 #[test]
 fn upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out() {
     let mut coordinator = Coordinator::new();
-    // Shrink the aggregate ceiling to 1 so the boundary is reachable without
-    // inserting DEFAULT_MAX_SESSIONS (131072) entries. In production the
-    // ceiling is `worker_count * DEFAULT_MAX_SESSIONS`.
-    coordinator.synced_import_cap_override = 1;
+    // The override expresses a LOGICAL session ceiling; `synced_import_cap()`
+    // doubles it to the ENTRY cap (2×LOGICAL_CEILING) because each admitted
+    // forward logical session publishes a forward AND a synthesized reverse
+    // companion into the shared `synced` map. Choose a small logical ceiling so
+    // the boundary is reachable without inserting DEFAULT_MAX_SESSIONS (131072)
+    // sessions. In production the logical ceiling is
+    // `worker_count * DEFAULT_MAX_SESSIONS` and the entry cap is 2× that.
+    const LOGICAL_CEILING: u16 = 3;
+    coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     coordinator
         .workers
@@ -742,24 +757,45 @@ fn upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out() {
 
     let before = coordinator.synced_import_cap_drops_total();
 
-    // WITHIN the ceiling: the first NEW synced import is admitted (control —
-    // the cap is scoped, not a blanket block).
-    let admitted = synced_entry_port(1000, 0);
-    let admitted_key = admitted.key.clone();
-    coordinator.upsert_synced_session(admitted);
-    assert!(
-        synced_generation(&coordinator, &admitted_key).is_some(),
-        "a synced import within the ceiling must be admitted"
+    // (a) A FULL symmetric-peer logical set — LOGICAL_CEILING forward sessions,
+    // each publishing a forward + synthesized reverse = 2×LOGICAL_CEILING
+    // entries — must ALL admit with ZERO drops. This is the #5674 dual-entry
+    // regression the review found: sizing the cap to the LOGICAL ceiling while
+    // counting ENTRIES silently dropped ~half of a legitimate full-peer import
+    // above ~50% peer load. Every forward here is a NEW key at/below the logical
+    // ceiling, so none may be rejected. Under the pre-fix (non-2×) cap the third
+    // forward would find synced_len == 4 >= cap 3 and be dropped — this loop
+    // REDs it.
+    let mut admitted_keys = Vec::new();
+    for i in 0..LOGICAL_CEILING {
+        let entry = synced_entry_port(1000 + i, 0);
+        let key = entry.key.clone();
+        coordinator.upsert_synced_session(entry);
+        assert!(
+            synced_generation(&coordinator, &key).is_some(),
+            "forward logical session {i} within the ceiling must be admitted — \
+             a full symmetric-peer set of {LOGICAL_CEILING} logical sessions \
+             ({} entries) must all fit the 2× entry cap (#5674)",
+            2 * LOGICAL_CEILING
+        );
+        admitted_keys.push(key);
+    }
+    assert_eq!(
+        coordinator.synced_import_cap_drops_total(),
+        before,
+        "a full symmetric-peer logical set must import with NO cap drop — a \
+         nonzero count here is the #5674 >50% silent under-sync regression"
     );
 
-    // BEYOND the ceiling: a second NEW synced key is drop-newest rejected.
+    // (b) BEYOND the logical ceiling: the next NEW forward key (a peer
+    // exceeding its OWN logical ceiling) is drop-newest rejected.
     let rejected = synced_entry_port(2000, 0);
     let rejected_key = rejected.key.clone();
     coordinator.upsert_synced_session(rejected);
     assert!(
         synced_generation(&coordinator, &rejected_key).is_none(),
-        "an over-ceiling synced import must be REJECTED, not admitted past \
-         the aggregate cap (#5674 admission bound)"
+        "an over-ceiling synced FORWARD import must be REJECTED, not admitted \
+         past the aggregate cap (#5674 admission bound)"
     );
     assert_eq!(
         coordinator.synced_import_cap_drops_total(),
@@ -769,7 +805,7 @@ fn upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out() {
 
     // The rejected import must NOT be fanned out to the worker command queue —
     // the per-worker queue multiplication is bounded (#5674 second half). The
-    // admitted session did fan out (the gate is scoped, not a blanket drop of
+    // admitted sessions did fan out (the gate is scoped, not a blanket drop of
     // all fan-out).
     {
         let pending = commands.lock().expect("commands");
@@ -782,26 +818,27 @@ fn upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out() {
              any worker command queue (#5674 queue-multiplication bound)"
         );
         let admitted_enqueued = pending.iter().any(|cmd| {
-            matches!(cmd, WorkerCommand::UpsertSynced(entry) if entry.key == admitted_key)
+            matches!(cmd, WorkerCommand::UpsertSynced(entry) if entry.key == admitted_keys[0])
         });
         assert!(
             admitted_enqueued,
-            "the admitted within-ceiling session must still fan out to the worker"
+            "the admitted within-ceiling sessions must still fan out to the worker"
         );
     }
 
-    // A REPLACE of an already-admitted key is NOT subject to the cap (it does
-    // not grow the map) — an in-flight synced session keeps refreshing at/above
-    // the ceiling. A newer-generation upsert of the admitted key applies even
-    // though the shared map is at the ceiling, and it is NOT counted as a drop.
+    // (c) A REPLACE of an already-admitted key is NOT subject to the cap (it
+    // does not grow the map) — an in-flight synced session keeps refreshing at
+    // the ceiling. A newer-generation upsert of an admitted key applies even
+    // though the shared map is at the entry cap, and it is NOT counted as a
+    // drop.
     let drops_after_reject = coordinator.synced_import_cap_drops_total();
     coordinator.upsert_synced_session(synced_entry_port(1000, 7));
     assert_eq!(
-        synced_generation(&coordinator, &admitted_key),
+        synced_generation(&coordinator, &admitted_keys[0]),
         Some(7),
         "a REPLACE of an existing synced key must apply at the ceiling (the \
-         cap gates NEW keys, never a refresh) — else a legitimate failover \
-         session-refresh would be dropped"
+         cap gates NEW forward keys, never a refresh) — else a legitimate \
+         failover session-refresh would be dropped"
     );
     assert_eq!(
         coordinator.synced_import_cap_drops_total(),

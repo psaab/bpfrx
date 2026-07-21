@@ -649,27 +649,49 @@ aggregate session ceiling and multiply that state across all workers
 (an availability/DoS the per-worker `install_with_protocol_with_origin`
 cap is meant to prevent). `upsert_synced_session` now bounds the shared
 `synced` map (the single fan-out choke point) at this appliance's OWN
-aggregate ceiling — `worker_count * DEFAULT_MAX_SESSIONS`
+aggregate **ENTRY** ceiling — `2 * worker_count * DEFAULT_MAX_SESSIONS`
 (`synced_import_cap()`) — and **drop-newest**-rejects a NEW over-ceiling
-key: it bumps `SYNCED_IMPORT_CAP_DROPS`
+FORWARD key: it bumps `SYNCED_IMPORT_CAP_DROPS`
 (`Coordinator::synced_import_cap_drops_total()`, Prometheus
 `xpf_userspace_synced_import_cap_drops_total`) and returns BEFORE the
 publish + fan-out, so a rejected import is never enqueued to any worker
-(the queue-multiplication is bounded too). A REPLACE of an existing
+(the queue-multiplication is bounded too).
+
+The 2× is load-bearing, and this is the crux of the cap's correctness.
+Each admitted **forward** logical session publishes TWO keys into the
+`synced` map — the forward key and a **synthesized reverse companion**
+(`synthesized_synced_reverse_entry` returns `Some` for every non-reverse
+import; `upsert_synced_session` publishes both via
+`publish_shared_session`). So `K` admitted forwards occupy `2K` entries.
+With the entry cap at `2N` (`N` = the appliance's logical ceiling), a new
+forward is rejected exactly when `2K >= 2N ⇔ K >= N`: a full
+symmetric-peer set (`N` logical sessions → `2N` entries) EXACTLY fits and
+only a peer EXCEEDING its OWN logical ceiling is rejected. Sizing the cap
+to the LOGICAL ceiling `N` while counting ENTRIES (the pre-#6172-review
+bug) rejected ~half of a legitimate full-peer import above ~50% peer load
+— a 2× shortfall THROUGHOUT normal operation, not the "±1 session-pair
+overshoot on the last admit" the earlier framing claimed; on failover the
+under-synced flows had no state and TCP broke (the session-miss guard
+drops the non-SYN first packet).
+
+The gate keys only on FORWARD new keys (`!entry.metadata.is_reverse`): a
+synthesized reverse always rides with its forward (a rejected forward
+returns BEFORE publishing its reverse, so no half-sync), and a lone
+reverse import off the wire (`is_reverse` set by a peer) is never
+independently rejected at a boundary slot. A REPLACE of an existing
 synced key is always allowed (it does not grow the map) so an in-flight
 synced session keeps refreshing; an existing entry is never evicted to
-make room. Because a symmetric HA pair has an identical ceiling, a
-legitimate full-peer failover import always fits under the bound — only
-a peer EXCEEDING the appliance ceiling is rejected. Two documented
-residuals: (1) the bound is approximate to within one session-pair (a
-forward admit also publishes its synthesized reverse companion, so the
-map can overshoot by one pair on the last admit); (2) on an ASYMMETRIC
-pair (peer has MORE workers than this node — unusual; xpf pairs are
-symmetric) the peer's aggregate ceiling can exceed this node's, so a
-legitimate over-ceiling import would be dropped. The uncapped
+make room. One documented residual: on an ASYMMETRIC pair (peer has MORE
+workers than this node — unusual; xpf pairs are symmetric) the peer's
+aggregate ceiling can exceed this node's `2N`, so a legitimate
+over-ceiling import would be dropped. The uncapped
 `upsert_synced_with_origin` and the local `UpsertLocal` / shared-hit
 materialization paths are unchanged — they are locally bounded and do
-not carry the peer-DoS vector.
+not carry the peer-DoS vector. Pinned by
+`upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out`
+(`afxdp/ha_tests.rs`), which asserts a full symmetric-peer logical set
+all-admits with zero drops (the regression) and that the next
+over-logical-ceiling forward is rejected + not fanned out.
 
 ### HA install-generation guard on SyncedSessionEntry (#2170)
 

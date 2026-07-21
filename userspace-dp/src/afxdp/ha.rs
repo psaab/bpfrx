@@ -274,24 +274,39 @@ impl super::Coordinator {
         self.last_cache_flush_at.load(Ordering::Relaxed)
     }
 
-    /// #5674: this appliance's aggregate synced-session ceiling —
-    /// `worker_count * DEFAULT_MAX_SESSIONS` (each worker table caps
-    /// locally-created sessions at `DEFAULT_MAX_SESSIONS`). Bounds the shared
-    /// synced map so a peer cannot drive this node past its own aggregate
-    /// session ceiling via the uncapped sync-import fan-out. A symmetric HA
-    /// pair has an identical ceiling, so a legitimate full-peer failover import
-    /// always fits. Zero when no workers are registered (early boot / teardown)
-    /// — the caller treats a zero ceiling as "bound disabled" so a transient
-    /// window never rejects legitimate imports.
+    /// #5674: this appliance's aggregate synced-session ENTRY ceiling. The
+    /// LOGICAL ceiling is `worker_count * DEFAULT_MAX_SESSIONS` (each worker
+    /// table caps locally-created sessions at `DEFAULT_MAX_SESSIONS`), but the
+    /// shared `synced` map holds TWO entries per admitted forward logical
+    /// session: the forward key AND a synthesized reverse companion.
+    /// `synthesized_synced_reverse_entry` returns `Some` for EVERY non-reverse
+    /// import, and `upsert_synced_session` publishes both into `sessions.synced`
+    /// via `publish_shared_session`. So the ENTRY cap must be 2× the logical
+    /// ceiling. A symmetric HA pair holds up to `N = worker_count *
+    /// DEFAULT_MAX_SESSIONS` logical sessions, which arrive here as 2N entries
+    /// and EXACTLY fit this 2N cap — a legitimate full-peer failover import
+    /// always fits, and only a peer EXCEEDING its own logical ceiling (a
+    /// malicious/compromised peer) is rejected. Sizing the cap to the LOGICAL
+    /// ceiling (the pre-fix bug) while counting ENTRIES rejected ~half of a
+    /// legitimate symmetric-peer import above ~50% peer load — a 2× shortfall,
+    /// not the "±1 pair overshoot" the old comment claimed. Bounds the shared
+    /// `synced` map so a peer cannot drive this node past its aggregate session
+    /// ceiling via the uncapped sync-import fan-out. Zero when no workers are
+    /// registered (early boot / teardown) — the caller treats a zero ceiling as
+    /// "bound disabled" so a transient window never rejects legitimate imports.
     fn synced_import_cap(&self) -> usize {
         #[cfg(test)]
         if self.synced_import_cap_override != 0 {
-            return self.synced_import_cap_override;
+            // The override expresses a LOGICAL session ceiling; double it to the
+            // ENTRY cap (fwd + synthesized reverse per logical session), matching
+            // the production formula below so tests exercise the real arithmetic.
+            return self.synced_import_cap_override.saturating_mul(2);
         }
         self.workers
             .handles
             .len()
             .saturating_mul(crate::session::default_max_sessions())
+            .saturating_mul(2)
     }
 
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
@@ -325,23 +340,28 @@ impl super::Coordinator {
         // aggregate session ceiling and multiply that state across all workers
         // (the availability/DoS root of #5674). Bound the SHARED synced map
         // (the single fan-out choke point) at this appliance's OWN aggregate
-        // ceiling, `worker_count * DEFAULT_MAX_SESSIONS` (`synced_import_cap`).
-        // On a symmetric HA pair the peer's entire live session set is <= its
-        // identical ceiling, so a legitimate full-peer failover import never
-        // trips this bound — only a peer EXCEEDING the appliance ceiling is
-        // rejected. Drop-NEWEST: reject a NEW key at/above the ceiling (never
-        // enqueue it to any worker), but ALWAYS allow a REPLACE of an existing
-        // synced key (`previous_entry.is_some()` — it does not grow the map) so
-        // an in-flight synced session keeps refreshing. Never evict an existing
-        // synced session to make room; that would drop a legitimate failover
-        // session. The bound is approximate to within one session-pair:
-        // admitting a forward session also publishes its synthesized reverse
-        // companion, so the map can overshoot the ceiling by a single pair on
-        // the last admit — acceptable for a DoS ceiling, not a byte-exact
-        // quota. A zero ceiling (no workers registered yet — early boot /
-        // teardown) disables the bound so a transient window never rejects
-        // legitimate imports.
-        if previous_entry.is_none() {
+        // ENTRY ceiling, `2 * worker_count * DEFAULT_MAX_SESSIONS`
+        // (`synced_import_cap`). The 2× is load-bearing: each admitted forward
+        // logical session publishes TWO keys into `sessions.synced` — the
+        // forward key and a synthesized reverse companion — so K admitted
+        // forwards occupy 2K entries. With the entry cap at 2N (N = the logical
+        // ceiling), a NEW forward is rejected exactly when 2K >= 2N ⇔ K >= N:
+        // a full symmetric-peer set (N logical → 2N entries) EXACTLY fits and
+        // only a peer EXCEEDING its own logical ceiling is rejected. Gate ONLY
+        // FORWARD new keys (`!entry.metadata.is_reverse`): a synthesized reverse
+        // always rides with its forward (a rejected forward `return`s BEFORE
+        // publishing its reverse, so no half-sync), and a lone reverse import
+        // off the wire (`is_reverse` set by a peer) is never independently
+        // rejected at a boundary slot — it inserts one entry that its forward
+        // already accounted for. Drop-NEWEST: reject a NEW forward key at/above
+        // the ceiling (never enqueue it to any worker), but ALWAYS allow a
+        // REPLACE of an existing synced key (`previous_entry.is_some()` — it
+        // does not grow the map) so an in-flight synced session keeps
+        // refreshing. Never evict an existing synced session to make room; that
+        // would drop a legitimate failover session. A zero ceiling (no workers
+        // registered yet — early boot / teardown) disables the bound so a
+        // transient window never rejects legitimate imports.
+        if previous_entry.is_none() && !entry.metadata.is_reverse {
             let synced_cap = self.synced_import_cap();
             let synced_len = self
                 .sessions

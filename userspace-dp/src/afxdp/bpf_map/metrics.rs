@@ -292,14 +292,17 @@ pub(in crate::afxdp) static SESSION_DELETE_STALE_IGNORED: AtomicU64 = AtomicU64:
 /// could drive this node past its own aggregate session ceiling and multiply
 /// that state across all workers (the availability/DoS root of #5674).
 /// `upsert_synced_session` now bounds the shared synced map (the single
-/// fan-out choke point) at this appliance's OWN aggregate ceiling
-/// (`worker_count * DEFAULT_MAX_SESSIONS`) and drop-newest-rejects a NEW
-/// over-ceiling key here (a REPLACE of an existing key never trips the bound —
-/// it does not grow the map). Surfaced via
+/// fan-out choke point) at this appliance's OWN aggregate ENTRY ceiling
+/// (`2 * worker_count * DEFAULT_MAX_SESSIONS` — 2× the logical ceiling because
+/// each admitted forward logical session publishes a forward AND a synthesized
+/// reverse companion into the map) and drop-newest-rejects a NEW over-ceiling
+/// FORWARD key here (a REPLACE of an existing key, and a lone reverse import,
+/// never trip the bound — neither grows the forward-keyed count). Surfaced via
 /// `Coordinator::synced_import_cap_drops_total()` and the Prometheus counter
 /// `xpf_userspace_synced_import_cap_drops_total`. A nonzero value means a peer
-/// exceeded this appliance's session ceiling; a legitimate symmetric-pair
-/// failover (the peer's live set is <= its identical ceiling) never trips it.
+/// exceeded its own LOGICAL session ceiling (a malicious/compromised peer); a
+/// legitimate symmetric-pair failover — the peer's full logical set (N logical
+/// → 2N entries) EXACTLY fits the 2N cap — never trips it, at any peer load.
 pub(in crate::afxdp) static SYNCED_IMPORT_CAP_DROPS: AtomicU64 = AtomicU64::new(0);
 pub(in crate::afxdp) static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "debug-log")]

@@ -1,3 +1,53 @@
+## 2026-07-21 — #5674 fix: size synced-import cap to ENTRIES (2×), gate forward-only
+
+- **Timestamp**: 2026-07-21 (fix/5674-synced-import-cap, #6172 hostile-review MAJOR)
+- **Action**: Corrected a 2× shortfall in the HA synced-import aggregate cap.
+  The #6172 gate counted TOTAL `sessions.synced` entries against a cap sized to
+  the LOGICAL session ceiling (`worker_count * DEFAULT_MAX_SESSIONS`), but each
+  admitted FORWARD logical session publishes TWO keys into that map — the
+  forward key plus an UNCONDITIONALLY-synthesized reverse companion
+  (`synthesized_synced_reverse_entry` → `Some` for any `!is_reverse` entry;
+  both published via `publish_shared_session`). A locally-created session
+  installs exactly ONE `key_to_handle` slot, so a symmetric peer holding up to
+  N logical sessions arrives as ~2N entries → the coordinator drop-newest-
+  rejected ~HALF above ~50% peer load. That is a SILENT under-sync during
+  NORMAL operation, not the "±1 pair overshoot" the comments claimed; on
+  failover the un-synced flows had no state → TCP broke (session-miss guard
+  drops the non-SYN first packet).
+  - `synced_import_cap()` (ha.rs) now returns `2 * worker_count *
+    DEFAULT_MAX_SESSIONS` (ENTRY cap = 2× logical ceiling). The test override
+    is treated as a LOGICAL ceiling and doubled the same way.
+  - Gate now fires only on FORWARD new keys:
+    `if previous_entry.is_none() && !entry.metadata.is_reverse { … }`. A
+    synthesized reverse always rides with its forward (a rejected forward
+    returns before publishing its reverse), and a lone reverse import off the
+    wire (`is_reverse` set by a peer via `SessionSyncRequest.is_reverse`) is
+    never independently rejected at a boundary slot (the review's secondary
+    Low). Arithmetic: total entries 2K vs cap 2N → reject a new forward exactly
+    when 2K ≥ 2N ⇔ K ≥ N (the logical ceiling); a full symmetric peer fits
+    exactly, only a peer past its OWN logical ceiling is rejected.
+  - Rewrote the test `upsert_synced_session_rejects_over_ceiling_import_and_
+    does_not_fan_out`: asserts a FULL symmetric-peer logical set (LOGICAL_CEILING
+    forward sessions = 2× entries) ALL admit with ZERO drops (catches the >50%
+    regression), then the next over-logical-ceiling forward is rejected + not
+    fanned out, and a replace at the ceiling still applies. PARENT-RED anchor
+    preserved: neutralizing the single `return;` (target-count = 1) REDs the
+    reject assertion.
+  - Docs: corrected the "±1 session-pair overshoot" framing in
+    `session/README.md` (#5674 subsection) and the `SYNCED_IMPORT_CAP_DROPS`
+    metric doc (`bpf_map/metrics.rs`) to the ENTRY-cap = 2× logical model; a
+    nonzero drop now means a peer past its OWN LOGICAL ceiling, not a legit
+    >50%-loaded peer.
+  - **Validation**: `cargo build --release` clean; `upsert_synced` /
+    `synced_import` / `delete_synced` / `wire_invariant_default_specimens` all
+    GREEN (wire fixture UNCHANGED — no new field). Target test 3× green.
+    PARENT-RED verified. Go `pkg/api` + `pkg/dataplane/...` all ok. Still needs
+    a loss-cluster failover smoke.
+  - **File(s)**: `userspace-dp/src/afxdp/ha.rs`,
+    `userspace-dp/src/afxdp/ha_tests.rs`,
+    `userspace-dp/src/afxdp/bpf_map/metrics.rs`,
+    `userspace-dp/src/session/README.md`
+
 ## 2026-07-21 — #6122: fail closed on NAT'd non-first-fragment frag-assoc miss
 
 - **Timestamp**: 2026-07-21 (fix/6122-nat-frag-miss-failclosed)
