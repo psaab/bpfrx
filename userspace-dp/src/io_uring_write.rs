@@ -19,46 +19,55 @@
 //!       punted write is still in flight, the kernel reads freed userspace
 //!       memory.
 //!
-//! The fix here keeps the SQE-in-flight invariant the callers always assumed:
-//! under normal operation the function does not return until every SQE it
-//! submitted has been reaped. The sole escape hatch is a hard retry ceiling
-//! (`MAX_WAIT_RETRIES`) that converts a pathological never-ending EINTR storm
-//! into an `Err` so a worker cannot wedge forever; reaching it requires
-//! thousands of consecutive interrupted/failed waits with the CQE still
-//! unreaped, which is astronomically improbable. See the per-`Err` notes on
-//! [`reap_matching`] for what each ceiling return implies for the buffer.
+//! ## #5800 — in-flight registry closes the retry-ceiling UAF
 //!
-//!   * `EINTR` (and any wait error) RETRIES the wait instead of returning. The
-//!     `io-uring` crate's `submit_and_wait` derives `to_submit` from the
-//!     current SQ length, so once the SQE has been consumed by the kernel the
-//!     retry degrades to a wait-only `io_uring_enter(0, 1, GETEVENTS)` — it
-//!     does not double-submit.
-//!   * Each submission carries a distinct, monotonically increasing
-//!     `user_data`. The reap loop matches the CQE by `user_data`; a stale CQE
-//!     left over from a prior interrupted submission can no longer be
-//!     mis-attributed to this write — it is recognised and skipped.
-//!   * Because the function only returns after the matching CQE is reaped, the
-//!     caller's buffer provably outlives every kernel reference to it, closing
-//!     the UAF window.
+//! The #2297 fix kept the SQE-in-flight invariant under normal operation, but
+//! left one hole: the hard retry ceiling (`MAX_WAIT_RETRIES`) returned `Err`
+//! WITHOUT proving the matching CQE was reaped or the SQE cancelled, and the
+//! caller then freed the buffer while the kernel might still dereference it (a
+//! UAF-class disclosure/corruption/crash under sustained signal/error pressure).
+//! The tag also restarted at `1` every call, so an abandoned completion could
+//! alias a later call's CQE.
 //!
-//! Error classification (two further defects, fixed together):
+//! The fix moves ownership instead of weakening lifetime. A ring-owned
+//! [`InflightRegistry`] OWNS the packet bytes and vends a ring-global
+//! monotonically increasing `user_data`. [`write_all`] takes the buffer BY
+//! VALUE; because moving a `Vec` preserves its heap allocation address, the SQE
+//! pointer stays valid when the buffer is moved into the registry. On retry
+//! exhaustion (or a fatal ring error) `write_all` returns
+//! [`WriteResult::Deferred`] only AFTER the buffer has moved into the registry —
+//! it is never freed while an SQE may reference it (invariant 1/5). Deferred
+//! buffers are released only when ONE terminal state is observed:
 //!
-//!   * #2477 — retry safety. On failure [`write_all`] returns a [`WriteError`]
-//!     that tells the caller whether a synchronous retry from offset 0 is safe.
-//!     `NothingWritten` (submit-queue full, a kernel completion error, a
-//!     zero-byte completion) put nothing on the fd → safe to sync-retry.
-//!     `Transferred` (a packet-fd partial write, or an ambiguous submit/wait
-//!     error where the SQE may be in flight) means bytes are — or may be —
-//!     already on the device → the caller MUST drop, never re-send. The TUN slow
-//!     path uses this so its io_uring→sync fallback cannot double-transmit a
-//!     packet; the state writer (a true byte stream, no sync fallback) ignores
-//!     it.
-//!   * #2478 — permanent-error fast-fail. [`reap_matching`] no longer
-//!     re-spins the submit/wait on a PERMANENT OS error (a bad/closed ring fd,
-//!     EINVAL, EFAULT, …) — those return the same error forever and would burn a
-//!     full core through the `MAX_WAIT_RETRIES` ceiling. [`is_permanent`]
-//!     classifies the errno; permanent errors return immediately, transient ones
-//!     (EINTR/EAGAIN) retry after a `yield_now`.
+//!   * the matching write CQE is reaped ([`InflightRegistry::reap_ready`], run
+//!     opportunistically at the top of every write and inside the reap loop), or
+//!   * the ring is torn down and drained ([`InflightRegistry::drain_for_teardown`]
+//!     submits an `AsyncCancel` per live entry and observes BOTH the cancel CQE
+//!     AND the target write's terminal CQE before freeing — cancellation
+//!     SUBMISSION alone is insufficient), or
+//!   * the ring fd is closed: [`RingWriter`]'s field order drops the ring BEFORE
+//!     the registry, so the kernel's ring-exit cancel+wait completes before any
+//!     buffer is freed (invariant 2/4).
+//!
+//! Ring-global ids (never restarting per call, [`InflightRegistry::alloc_id`])
+//! close the stale-CQE aliasing hole; the id space is fail-closed on wrap
+//! (invariant 3) — `alloc_id` returns `None` at exhaustion and `write_all`
+//! refuses to submit rather than reuse a possibly-live id.
+//!
+//! Error classification (two further defects, retained from #2477/#2478):
+//!
+//!   * #2477 — retry safety. On failure [`write_all`] reports whether a
+//!     synchronous retry from offset 0 is safe. [`WriteResult::NothingWritten`]
+//!     (submit-queue full, a kernel completion error, a zero-byte completion,
+//!     id-space exhaustion) put nothing on the fd → safe to sync-retry, and the
+//!     owned buffer is handed back so the caller can retry without re-allocating.
+//!     [`WriteResult::Transferred`] (a packet-fd partial write) means bytes are
+//!     already on the device → the caller MUST drop, never re-send.
+//!   * #2478 — permanent-error fast-fail. [`reap_matching`] does not re-spin the
+//!     submit/wait on a PERMANENT OS error (a bad/closed ring fd, EINVAL,
+//!     EFAULT, …); [`is_permanent`] classifies the errno. A permanent error is
+//!     reported as [`WriteResult::Deferred`] with `fatal_ring = true` (the buffer
+//!     is retained pending teardown), transient ones retry after a `yield_now`.
 
 use io_uring::{IoUring, opcode, types};
 use std::io;
@@ -73,7 +82,7 @@ pub(crate) struct Completion {
 
 /// Abstraction over the ring operations the write loop needs. Implemented for
 /// real `io_uring::IoUring` (see `IoUringPort`) and by test fakes so the
-/// retry/drain logic is exercisable without a live io_uring.
+/// retry/drain/cancel logic is exercisable without a live io_uring.
 pub(crate) trait RingPort {
     /// Push a `Write` SQE for `buf` at file `offset`, tagged with `user_data`.
     /// `offset` is `None` for stream writes (TUN) and `Some(n)` for positioned
@@ -85,6 +94,12 @@ pub(crate) trait RingPort {
         offset: Option<u64>,
     ) -> Result<(), String>;
 
+    /// Push an `AsyncCancel` SQE (tagged `user_data`) targeting the in-flight
+    /// write whose `user_data == target`. Used only by teardown drain: it nudges
+    /// the kernel to complete a still-outstanding write so its terminal CQE
+    /// surfaces and its buffer can be released.
+    fn push_cancel(&mut self, user_data: u64, target: u64) -> Result<(), String>;
+
     /// Submit any queued SQEs and wait for at least one completion. Mirrors
     /// `io_uring::IoUring::submit_and_wait(1)`: it may return
     /// `ErrorKind::Interrupted` (EINTR) with the SQE already in flight.
@@ -95,54 +110,208 @@ pub(crate) trait RingPort {
     fn next_completion(&mut self) -> Option<Completion>;
 }
 
-/// Result of [`write_all`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WriteOutcome {
-    /// All `data.len()` bytes were written.
-    Done,
+/// Result of [`write_all`] / [`RingWriter::write`]. Every variant except
+/// [`WriteResult::Deferred`] is TERMINAL for the buffer — the kernel holds no
+/// further reference, so the owned `Vec<u8>` is handed back for the caller to
+/// reuse or drop. `Deferred` means the op did NOT reach a terminal state: the
+/// buffer has been moved into the ring's [`InflightRegistry`] and stays owned
+/// there until a later reap or a teardown drain releases it.
+#[derive(Debug)]
+pub(crate) enum WriteResult {
+    /// Every `data.len()` byte was written AND the matching CQE was reaped. The
+    /// buffer is safe to drop or reuse.
+    Done(Vec<u8>),
+    /// Nothing reached the fd (submit-queue full, a kernel completion error, a
+    /// zero-byte completion, or id-space exhaustion). A synchronous retry from
+    /// offset 0 is safe; the buffer is handed back so the caller need not
+    /// re-allocate.
+    NothingWritten(Vec<u8>, String),
+    /// Bytes ARE (or may be) on the device: a packet-fd short write placed
+    /// `0 < n < len` bytes on the TUN as a truncated frame. The CQE was reaped
+    /// so the buffer is terminal and handed back, but re-sending the whole
+    /// packet would duplicate it — the caller MUST drop, never sync-retry.
+    Transferred(Vec<u8>, String),
+    /// The op did NOT reach a terminal state (retry-budget exhaustion or a fatal
+    /// ring error). The buffer has been MOVED into the ring's registry (keyed by
+    /// `id`) and stays owned there until its terminal CQE is reaped or the ring
+    /// is torn down and drained. `fatal_ring` = the ring fd itself is dead → the
+    /// caller should tear the ring down. The caller must NOT free the buffer and
+    /// must NOT synchronously retry (the write may be in flight).
+    Deferred {
+        id: u64,
+        message: String,
+        fatal_ring: bool,
+    },
 }
 
-/// Failure of [`write_all`] / [`write_all_to_fd`], carrying enough state for the
-/// caller to decide whether a synchronous retry is safe.
+/// A submitted write whose owned buffer the kernel may still reference. Held by
+/// the ring-owned [`InflightRegistry`] from the moment a write is deferred until
+/// its op reaches a terminal state. Moving this value (e.g. into the registry's
+/// `Vec`) moves only the `Vec<u8>` handle — the heap bytes the SQE points at do
+/// NOT move — so the kernel's pointer stays valid across the move.
+struct InFlightWrite {
+    id: u64,
+    bytes: Vec<u8>,
+}
+
+/// Ring-owned registry of writes whose buffers must outlive every kernel
+/// reference to them, plus the vendor of the ring-global `user_data` id.
 ///
-/// The distinction matters for a packet-oriented fd (the TUN slow path, #2477):
-/// a synchronous fallback must NEVER re-send a packet whose bytes the io_uring
-/// path already placed on the device, or the TUN sees a truncated frame followed
-/// by a duplicate full frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum WriteError {
-    /// Nothing was transferred — the io_uring path failed before (or while)
-    /// putting any bytes on the fd (submit-queue full, the kernel completion
-    /// reported an error, or a zero-byte completion). A synchronous retry from
-    /// offset 0 is safe: no bytes are on the device yet.
-    NothingWritten(String),
-    /// Bytes were (or may have been) transferred and a retry would corrupt the
-    /// stream. Two cases:
-    ///   * a packet-fd short write — `0 < n < len` bytes are already on the TUN
-    ///     as a truncated frame; re-sending the whole packet would duplicate it;
-    ///   * an ambiguous submit/wait error after the SQE was submitted — the
-    ///     write may be in flight, so a retry could double-transmit.
-    /// The caller MUST drop the packet, never fall back to a synchronous write.
-    Transferred(String),
+/// Buffers are moved in ([`Self::defer`]) only when [`write_all`] must return
+/// before its op reached a terminal state. They are released — the owned buffer
+/// dropped — only when ONE terminal state is observed: the matching write CQE is
+/// reaped ([`Self::reap_ready`]) or a teardown drain proves no kernel reference
+/// remains ([`Self::drain_for_teardown`], or the ring fd closing before the
+/// registry drops).
+pub(crate) struct InflightRegistry {
+    /// Next `user_data` to hand out. Monotonic from 1; 0 is the stale/uninit
+    /// sentinel and is never a valid id. Fail-closed on wrap (invariant 3).
+    next_id: u64,
+    /// Owned buffers for writes still considered in flight.
+    inflight: Vec<InFlightWrite>,
 }
 
-impl WriteError {
-    /// True when a synchronous retry from offset 0 is safe (nothing is on the
-    /// fd yet). Only [`WriteError::NothingWritten`] qualifies.
-    pub(crate) fn safe_to_retry(&self) -> bool {
-        matches!(self, WriteError::NothingWritten(_))
-    }
+/// Bound on wait retries so a pathological always-EINTR storm cannot wedge a
+/// worker forever. EINTR under normal signal pressure resolves in one or two
+/// retries; this ceiling is generous.
+const MAX_WAIT_RETRIES: u32 = 4096;
 
-    pub(crate) fn message(&self) -> &str {
-        match self {
-            WriteError::NothingWritten(m) | WriteError::Transferred(m) => m,
+impl InflightRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            next_id: 1,
+            inflight: Vec::new(),
         }
     }
-}
 
-impl std::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.message())
+    /// Hand out the next ring-global `user_data`. Returns `None` when the id
+    /// space is exhausted (would wrap back through 0) — the caller then fails
+    /// closed and does NOT submit, so a possibly-live id is never reused
+    /// (invariant 3). At ~1e9 ids/s this takes ~584 years to reach.
+    fn alloc_id(&mut self) -> Option<u64> {
+        if self.next_id == 0 {
+            // Wrapped past u64::MAX on a prior call — space exhausted.
+            return None;
+        }
+        let id = self.next_id;
+        // Advances to 0 after handing out u64::MAX; the next call fails closed.
+        self.next_id = self.next_id.wrapping_add(1);
+        Some(id)
+    }
+
+    /// Move an owned buffer into the registry (it stays owned until a terminal
+    /// state releases it). Called only on the deferral path.
+    fn defer(&mut self, slot: InFlightWrite) {
+        self.inflight.push(slot);
+    }
+
+    /// Number of buffers still owned (in flight) — a test observability hook for
+    /// asserting the deferral/teardown invariants without a live io_uring.
+    #[cfg(test)]
+    pub(crate) fn inflight_len(&self) -> usize {
+        self.inflight.len()
+    }
+
+    /// Release the registry entry whose write id == `user_data`, dropping its
+    /// owned buffer (the kernel is done with it). Returns true if an entry was
+    /// released. A `user_data` matching no live entry is a true stale/leftover
+    /// (or a cancel CQE) and is not our concern here.
+    fn release_matching(&mut self, user_data: u64) -> bool {
+        if let Some(pos) = self.inflight.iter().position(|e| e.id == user_data) {
+            // swap_remove drops the InFlightWrite -> frees its buffer.
+            self.inflight.swap_remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Non-blocking: reap every completion currently ready, releasing the owned
+    /// buffer of any deferred entry whose terminal CQE has surfaced and
+    /// discarding true stale completions. Bounds registry growth after a
+    /// transient storm and doubles as the pre-submit stale drain: called at the
+    /// top of [`write_all`] and again inside [`reap_matching`] right after a new
+    /// SQE is pushed (before the wait), where no CQE for the current id can yet
+    /// exist so nothing of ours is consumed.
+    fn reap_ready(&mut self, port: &mut dyn RingPort) {
+        while let Some(cqe) = port.next_completion() {
+            self.release_matching(cqe.user_data);
+        }
+    }
+
+    /// Teardown drain (bounded). For every still-live entry, submit an
+    /// `AsyncCancel` targeting its write id, then reap until BOTH the cancel's
+    /// completion AND the target write's terminal CQE are observed — proving the
+    /// kernel holds no further reference — before dropping the buffer. Releasing
+    /// a buffer hinges on the TARGET WRITE's terminal CQE (cancellation
+    /// SUBMISSION or even its own completion is insufficient). Bounded by
+    /// `MAX_WAIT_RETRIES`; if the ceiling is hit, or the ring is fatally dead,
+    /// the still-live entries are RETAINED (never freed early) — their buffers
+    /// are freed only when the registry itself drops, which for [`RingWriter`]
+    /// happens AFTER the ring fd is closed (invariant 4).
+    ///
+    /// Returns the number of entries released by this drain (for tests).
+    fn drain_for_teardown(&mut self, port: &mut dyn RingPort) -> usize {
+        let start = self.inflight.len();
+        if start == 0 {
+            return 0;
+        }
+
+        // Snapshot the live write ids and submit one cancel per entry. Record
+        // the cancel ids so their completions are recognised (and observed)
+        // rather than mistaken for stale. The write ids are monotonic and never
+        // reused, so a cancel can never target a reused id.
+        let targets: Vec<u64> = self.inflight.iter().map(|e| e.id).collect();
+        let mut pending_cancels: Vec<u64> = Vec::with_capacity(targets.len());
+        for target in targets {
+            match self.alloc_id() {
+                Some(cancel_id) => {
+                    if port.push_cancel(cancel_id, target).is_ok() {
+                        pending_cancels.push(cancel_id);
+                    }
+                }
+                // Id space exhausted: cannot cancel. Fall through to a best-
+                // effort reap of any already-ready terminal CQEs.
+                None => break,
+            }
+        }
+
+        let mut waits = 0u32;
+        while !self.inflight.is_empty() {
+            // Reap everything ready: a write id releases its buffer; a cancel id
+            // is marked observed; anything else is stale and discarded.
+            while let Some(cqe) = port.next_completion() {
+                if !self.release_matching(cqe.user_data) {
+                    if let Some(pos) =
+                        pending_cancels.iter().position(|c| *c == cqe.user_data)
+                    {
+                        pending_cancels.swap_remove(pos);
+                    }
+                }
+            }
+            if self.inflight.is_empty() {
+                break;
+            }
+            match port.submit_and_wait_one() {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    if is_permanent(&err) {
+                        // The ring fd is dead: no further CQE can surface. Retain
+                        // the remaining entries; they free when the registry
+                        // drops (after the ring fd closes), which is when the
+                        // kernel can no longer reference them.
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+            waits += 1;
+            if waits >= MAX_WAIT_RETRIES {
+                break;
+            }
+        }
+        start - self.inflight.len()
     }
 }
 
@@ -164,14 +333,27 @@ impl RingPort for IoUringPort<'_> {
             entry = entry.offset(off);
         }
         let entry = entry.build().user_data(user_data);
-        // SAFETY: `buf` outlives the completion. `write_all` does not return
-        // until the matching CQE is reaped (the #2297 invariant), so the kernel
-        // holds no dangling reference once we return to the caller.
+        // SAFETY: `buf` (owned by the caller's `InFlightWrite`) outlives the
+        // completion. `write_all` either reaps the matching CQE before returning
+        // OR moves the owning buffer into the ring's registry (#5800), so the
+        // kernel never holds a dangling reference once we return to the caller.
         unsafe {
             self.ring
                 .submission()
                 .push(&entry)
                 .map_err(|_| "io_uring submit queue full".to_string())
+        }
+    }
+
+    fn push_cancel(&mut self, user_data: u64, target: u64) -> Result<(), String> {
+        let entry = opcode::AsyncCancel::new(target).build().user_data(user_data);
+        // SAFETY: AsyncCancel references only a `user_data` value, not user
+        // memory, so there is no buffer-lifetime obligation for this SQE.
+        unsafe {
+            self.ring
+                .submission()
+                .push(&entry)
+                .map_err(|_| "io_uring submit queue full (cancel)".to_string())
         }
     }
 
@@ -187,121 +369,197 @@ impl RingPort for IoUringPort<'_> {
     }
 }
 
-/// Write all of `data` to `fd` through `ring`, with the #2297 EINTR-retry /
-/// stale-CQE-drain / buffer-lifetime guarantees. `positioned` selects a
-/// file-offset write (regular file) vs. a stream write (TUN device).
+/// A persistent io_uring plus its in-flight owned-buffer registry (#5800). Both
+/// slow-path callers own one of these across their lifetime.
 ///
-/// Returns once every byte is written AND every SQE this call submitted has
-/// been reaped, so `data` may be dropped safely on return.
-///
-/// On failure the [`WriteError`] reports whether a synchronous retry is safe —
-/// see [`WriteError::safe_to_retry`] / #2477. The state writer ignores this
-/// (it has no sync fallback); the TUN slow path uses it to avoid double-sending
-/// a packet whose bytes are already on the device.
-pub(crate) fn write_all_to_fd(
-    ring: &mut IoUring,
-    fd: i32,
-    data: &[u8],
-    positioned: bool,
-    label: &str,
-) -> Result<(), WriteError> {
-    let mut port = IoUringPort { ring, fd };
-    write_all(&mut port, data, positioned, label).map(|_| ())
+/// **Field order is load-bearing (invariant 4).** `ring` (field 0) drops BEFORE
+/// `inflight` (field 1). Dropping `ring` closes the io_uring fd, which makes the
+/// kernel cancel and wait for every in-flight op; only THEN does `inflight` drop
+/// and free the buffers, by which point no kernel reference can remain. Do not
+/// reorder these fields.
+pub(crate) struct RingWriter {
+    ring: IoUring,
+    inflight: InflightRegistry,
+}
+
+impl RingWriter {
+    /// Create a ring with `entries` submission slots plus its registry.
+    pub(crate) fn new(entries: u32) -> io::Result<Self> {
+        Ok(Self {
+            ring: IoUring::new(entries)?,
+            inflight: InflightRegistry::new(),
+        })
+    }
+
+    /// Write all of `data` to `fd`. `positioned` selects a file-offset write
+    /// (regular file / state writer) vs. a stream write (TUN device). See
+    /// [`WriteResult`] for the buffer-ownership contract of each variant.
+    pub(crate) fn write(
+        &mut self,
+        fd: i32,
+        data: Vec<u8>,
+        positioned: bool,
+        label: &str,
+    ) -> WriteResult {
+        let mut port = IoUringPort {
+            ring: &mut self.ring,
+            fd,
+        };
+        write_all(&mut port, &mut self.inflight, data, positioned, label)
+    }
+}
+
+impl Drop for RingWriter {
+    fn drop(&mut self) {
+        // Best-effort bounded drain: submit cancels and observe the target
+        // writes' terminal CQEs so buffers are freed cleanly. Even if the drain
+        // hits its ceiling (or the ring is fatally dead), correctness holds: the
+        // ring fd closes when `self.ring` drops immediately after this returns,
+        // which makes the kernel cancel+wait every in-flight op, and only THEN
+        // does `self.inflight` drop and free any straggler buffers. Disjoint
+        // field borrows let the drain hold `&mut ring` and `&mut inflight` at
+        // once without moving out of `self`.
+        let ring = &mut self.ring;
+        let inflight = &mut self.inflight;
+        let mut port = IoUringPort { ring, fd: -1 };
+        inflight.drain_for_teardown(&mut port);
+    }
+}
+
+/// Terminal error from [`reap_matching`]: the op did not reach a reaped terminal
+/// state within the retry ceiling, or the ring returned a fatal error.
+struct ReapError {
+    message: String,
+    /// The ring fd itself is dead (a permanent OS error) — the caller should
+    /// tear it down. `false` = a transient/interrupt storm hit the ceiling; the
+    /// ring is otherwise healthy.
+    fatal_ring: bool,
 }
 
 /// Drive `port` to write all of `data`, advancing `offset` only by bytes a
 /// completion that MATCHES our own submission reports. `positioned` selects a
 /// file-offset write (state writer) vs. a stream write (TUN slow path).
 ///
-/// Invariants this upholds (the #2297 fix):
-///   * does not return while an SQE we submitted is still in flight — on any
-///     submit/wait error we keep waiting until the matching CQE is reaped. The
-///     one exception is the `MAX_WAIT_RETRIES` ceiling in [`reap_matching`],
-///     which returns `Err` after thousands of consecutive interrupted/failed
-///     waits to avoid wedging a worker forever; in that (astronomically rare)
-///     case the SQE may still be outstanding when the buffer is dropped — the
-///     same residual UAF window the pre-#2297 code always had, now bounded to a
-///     storm that should never occur in practice rather than every EINTR;
-///   * advances `offset` only by a CQE whose `user_data` matches the current
-///     submission, so a stale leftover CQE cannot corrupt the offset;
-///   * the caller's `data` buffer therefore outlives every kernel reference
-///     except in the bounded ceiling case above.
+/// The owned `data` buffer is parked in a local [`InFlightWrite`] so the SQE
+/// references the exact allocation that can be moved — intact — into `reg` if
+/// the op cannot be proven terminal before we must return (#5800). No return
+/// path frees a buffer while an SQE may reference it: a reaped terminal state
+/// hands the buffer back; a non-terminal state moves it into `reg`.
 pub(crate) fn write_all(
     port: &mut dyn RingPort,
-    data: &[u8],
+    reg: &mut InflightRegistry,
+    data: Vec<u8>,
     positioned: bool,
     label: &str,
-) -> Result<WriteOutcome, WriteError> {
+) -> WriteResult {
+    // Reclaim any previously-deferred buffers whose terminal CQE has surfaced.
+    reg.reap_ready(port);
+
     let mut offset = 0usize;
-    // Distinct tag per submission. Start at 1 so a zero `user_data` (the value
-    // an uninitialised / pre-existing CQE would carry) is never a valid match.
-    let mut tag: u64 = 1;
+    // Park the owned buffer so the SQE points at the exact allocation we can
+    // move into `reg` on deferral. A `Vec` move preserves the heap address, so
+    // the SQE pointer stays valid across `reg.defer(slot)`.
+    let mut slot = InFlightWrite {
+        id: 0,
+        bytes: data,
+    };
 
-    while offset < data.len() {
-        let chunk = &data[offset..];
+    while offset < slot.bytes.len() {
+        let id = match reg.alloc_id() {
+            Some(id) => id,
+            None => {
+                // Id space exhausted (invariant 3): fail closed. Nothing was
+                // submitted for this chunk, so nothing is on the fd — safe to
+                // sync-retry, and we hand the buffer back.
+                return WriteResult::NothingWritten(
+                    slot.bytes,
+                    format!("{label} io_uring user_data space exhausted"),
+                );
+            }
+        };
+        slot.id = id;
         let file_offset = if positioned { Some(offset as u64) } else { None };
+
         // A push failure means the SQE was never submitted — nothing is on the
-        // fd, so a synchronous retry from offset 0 is safe (#2477). For a packet
-        // fd this is always the first (only) chunk, so `offset == 0` and a
-        // retry-from-0 is sound.
-        port.push_write(tag, chunk, file_offset)
-            .map_err(WriteError::NothingWritten)?;
+        // fd, so a synchronous retry from offset 0 is safe (#2477).
+        if let Err(e) = port.push_write(id, &slot.bytes[offset..], file_offset) {
+            return WriteResult::NothingWritten(slot.bytes, e);
+        }
 
-        // Submit + reap exactly the completion for THIS submission. The
-        // closure below loops on the wait so an EINTR (or any wait error) does
-        // not leave the SQE outstanding. A reap error is AMBIGUOUS: the SQE was
-        // already submitted, so the write may be in flight and a retry could
-        // double-transmit on a packet fd — classify it as `Transferred` (drop,
-        // never sync-retry).
-        let res = reap_matching(port, tag, label).map_err(WriteError::Transferred)?;
-
-        if res < 0 {
-            // The kernel completion reported a write error: nothing was placed
-            // on the fd, so a synchronous retry from offset 0 is safe.
-            return Err(WriteError::NothingWritten(format!(
-                "{label} io_uring write failed: {}",
-                io::Error::from_raw_os_error(-res)
-            )));
-        }
-        if res == 0 {
-            // Zero bytes transferred — safe to retry synchronously.
-            return Err(WriteError::NothingWritten(format!(
-                "{label} io_uring short write: 0"
-            )));
-        }
-        let n = res as usize;
-        // A non-positioned (stream-mode) write targets a packet-oriented fd:
-        // the TUN slow path (#2407). One submission is one L3 packet. A short
-        // CQE count must NOT resubmit the remainder — re-writing `data[n..]`
-        // would inject the leftover bytes as a SECOND, malformed packet. Treat
-        // a partial as an unsendable packet and drop it (Err) — and because
-        // `0 < n < len` bytes are ALREADY on the TUN, classify it as
-        // `Transferred` so the caller does NOT fall back to a synchronous write
-        // (which would re-send the whole packet → truncated frame + duplicate,
-        // #2477). Positioned writes (a regular file — the state writer) are a
-        // true byte stream and DO resume from `offset + n`.
-        if !positioned && n < data.len() {
-            return Err(WriteError::Transferred(format!(
-                "{label} io_uring short write on packet fd: wrote {n} of {} bytes (packet dropped)",
-                data.len()
-            )));
-        }
-        offset += n;
-        // Advance the tag so the next submission's CQE cannot be confused with
-        // this one's (and a leftover CQE from this one cannot be reused).
-        tag = tag.wrapping_add(1);
-        if tag == 0 {
-            tag = 1;
+        match reap_matching(port, reg, id, label) {
+            Ok(res) => {
+                if res < 0 {
+                    // The kernel completion reported a write error: nothing was
+                    // placed on the fd, so a synchronous retry from 0 is safe.
+                    return WriteResult::NothingWritten(
+                        slot.bytes,
+                        format!(
+                            "{label} io_uring write failed: {}",
+                            io::Error::from_raw_os_error(-res)
+                        ),
+                    );
+                }
+                if res == 0 {
+                    // Zero bytes transferred — safe to retry synchronously.
+                    return WriteResult::NothingWritten(
+                        slot.bytes,
+                        format!("{label} io_uring short write: 0"),
+                    );
+                }
+                let n = res as usize;
+                // A non-positioned (stream-mode) write targets a packet-oriented
+                // fd: the TUN slow path (#2407). One submission is one L3 packet;
+                // a short count must NOT resubmit the remainder (that would inject
+                // `data[n..]` as a SECOND malformed packet). Drop it. Because
+                // `0 < n < len` bytes are ALREADY on the TUN, classify as
+                // `Transferred` (the caller must not sync-retry — that would
+                // re-send the whole packet, #2477). The CQE was reaped, so the
+                // buffer is terminal and handed back. Positioned writes (a
+                // regular file) are a true byte stream and DO resume from
+                // `offset + n`.
+                if !positioned && n < slot.bytes.len() {
+                    let total = slot.bytes.len();
+                    return WriteResult::Transferred(
+                        slot.bytes,
+                        format!(
+                            "{label} io_uring short write on packet fd: wrote {n} of {total} bytes (packet dropped)"
+                        ),
+                    );
+                }
+                offset += n;
+                // Loop for the next chunk (positioned resume). The next chunk
+                // gets a fresh ring-global id, so a leftover CQE from this chunk
+                // cannot be reused.
+            }
+            Err(ReapError {
+                message,
+                fatal_ring,
+            }) => {
+                // The op did NOT reach a reaped terminal state: the SQE may still
+                // be in flight referencing `slot.bytes`. Move the buffer into the
+                // ring's registry so it stays owned until its CQE is reaped or the
+                // ring is torn down and drained. NEVER free it here (invariant
+                // 1/4/5).
+                let id = slot.id;
+                reg.defer(slot);
+                return WriteResult::Deferred {
+                    id,
+                    message,
+                    fatal_ring,
+                };
+            }
         }
     }
-    Ok(WriteOutcome::Done)
+    // All bytes written and reaped: the buffer is terminal, handed back.
+    WriteResult::Done(slot.bytes)
 }
 
 /// True when `err` is a PERMANENT OS failure that a retry cannot recover from
 /// (a bad/closed ring fd, an invalid argument, a faulting buffer). Retrying
 /// these would just re-spin at 100% CPU through the `MAX_WAIT_RETRIES` ceiling
-/// (#2478), so [`reap_matching`] returns immediately on them. EINTR/EAGAIN (and
-/// any unrecognised errno) are treated as TRANSIENT and retried.
+/// (#2478), so [`reap_matching`] returns immediately on them and marks the ring
+/// fatal. EINTR/EAGAIN (and any unrecognised errno) are treated as TRANSIENT and
+/// retried.
 fn is_permanent(err: &io::Error) -> bool {
     match err.raw_os_error() {
         Some(e) => matches!(
@@ -322,64 +580,72 @@ fn is_permanent(err: &io::Error) -> bool {
 }
 
 /// Submit the queued SQE and reap the completion whose `user_data == want`,
-/// retrying the wait on `EINTR`/error so the in-flight SQE is never abandoned.
-/// Stale completions (a different `user_data`, e.g. a leftover from a prior
-/// interrupted call) are drained and discarded rather than mis-attributed.
+/// retrying the wait on `EINTR`/transient error so the in-flight SQE is never
+/// abandoned. A completion whose `user_data` matches a DEFERRED registry entry
+/// releases that entry's buffer; anything else non-matching is a true stale
+/// leftover and is discarded — neither is ever mis-attributed to `want`.
 ///
 /// A PERMANENT submit/wait error (bad ring fd, EINVAL, EFAULT, …) returns
-/// immediately instead of re-spinning through `MAX_WAIT_RETRIES` at 100% CPU
-/// (#2478); a TRANSIENT error yields the core before retrying.
-fn reap_matching(port: &mut dyn RingPort, want: u64, label: &str) -> Result<i32, String> {
-    // First, drain any already-ready stale completions so a leftover CQE from a
-    // previously interrupted submission can never be returned as ours. At this
-    // point the SQE for `want` has been pushed but NOT yet submitted/waited on,
-    // so nothing in the completion queue can carry `want` — everything ready is
-    // necessarily a leftover and safe to discard.
-    drain_stale(port);
+/// immediately with `fatal_ring = true` instead of re-spinning through the
+/// ceiling at 100% CPU (#2478); a TRANSIENT error yields the core before
+/// retrying and, on ceiling exhaustion, returns `fatal_ring = false`. In BOTH
+/// error cases the caller defers the buffer — it is never freed here.
+fn reap_matching(
+    port: &mut dyn RingPort,
+    reg: &mut InflightRegistry,
+    want: u64,
+    label: &str,
+) -> Result<i32, ReapError> {
+    // Pre-submit drain: the SQE for `want` has been pushed but NOT yet submitted/
+    // waited on, so nothing in the completion queue can carry `want`. Release any
+    // deferred entry whose CQE is ready and discard leftovers so a stale CQE can
+    // never be returned as ours. (`want` is a freshly allocated id, never in the
+    // registry, so this cannot touch our own op.)
+    reg.reap_ready(port);
 
-    // Bound the wait retries so a pathological always-EINTR storm cannot wedge
-    // the worker forever. EINTR under normal signal pressure resolves in one or
-    // two retries; this ceiling is generous.
-    const MAX_WAIT_RETRIES: u32 = 4096;
     let mut waits = 0u32;
 
     loop {
         match port.submit_and_wait_one() {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                // EINTR: the SQE is already submitted (the enter syscall
-                // flushed the SQ before sleeping). Retry the WAIT — the io-uring
-                // crate recomputes to_submit from the now-empty SQ, so this is
+                // EINTR: the SQE is already submitted (the enter syscall flushed
+                // the SQ before sleeping). Retry the WAIT — the io-uring crate
+                // recomputes to_submit from the now-empty SQ, so this is
                 // wait-only and does not double-submit.
                 waits += 1;
                 if waits >= MAX_WAIT_RETRIES {
-                    return Err(format!(
-                        "{label} io_uring wait interrupted repeatedly ({waits} EINTR)"
-                    ));
+                    return Err(ReapError {
+                        message: format!(
+                            "{label} io_uring wait interrupted repeatedly ({waits} EINTR)"
+                        ),
+                        fatal_ring: false,
+                    });
                 }
                 continue;
             }
             Err(err) => {
                 // A PERMANENT error (bad/closed ring fd, EINVAL, EFAULT, …)
-                // returns the SAME error on every retry. Looping on it just
-                // burns a full core through the MAX_WAIT_RETRIES ceiling without
-                // making progress (#2478) — fail fast instead. The caller drops
-                // the packet; leaving the ring "desynchronised" is moot when the
-                // ring fd itself is dead.
+                // returns the SAME error on every retry. Looping on it just burns
+                // a full core through the ceiling without making progress (#2478)
+                // — fail fast and mark the ring fatal so the caller tears it down.
                 if is_permanent(&err) {
-                    return Err(format!(
-                        "{label} io_uring permanent submit/wait error: {err}"
-                    ));
+                    return Err(ReapError {
+                        message: format!("{label} io_uring permanent submit/wait error: {err}"),
+                        fatal_ring: true,
+                    });
                 }
                 // A TRANSIENT wait error (e.g. EAGAIN): the SQE may still be in
-                // flight. Keep waiting for it to drain rather than returning and
-                // leaving the ring desynchronised for the next write — but yield
-                // the core first so a burst of transient failures does not
-                // tight-spin at 100% CPU before the ceiling.
+                // flight. Keep waiting rather than abandoning it — but yield the
+                // core first so a burst does not tight-spin at 100% CPU before the
+                // ceiling.
                 std::thread::yield_now();
                 waits += 1;
                 if waits >= MAX_WAIT_RETRIES {
-                    return Err(format!("{label} io_uring submit/wait: {err}"));
+                    return Err(ReapError {
+                        message: format!("{label} io_uring submit/wait: {err}"),
+                        fatal_ring: false,
+                    });
                 }
                 continue;
             }
@@ -390,27 +656,19 @@ fn reap_matching(port: &mut dyn RingPort, want: u64, label: &str) -> Result<i32,
             if cqe.user_data == want {
                 return Ok(cqe.result);
             }
-            // Stale CQE from a prior interrupted submission — discard it.
+            // Not ours: release a deferred registry buffer if it matches, else
+            // discard the leftover. Either way keep looking for `want`.
+            reg.release_matching(cqe.user_data);
         }
         // submit_and_wait(1) returned Ok but our completion was not among the
-        // ready ones (only stale ones were). Wait again for ours.
+        // ready ones (only stale/deferred ones were). Wait again for ours.
         waits += 1;
         if waits >= MAX_WAIT_RETRIES {
-            return Err(format!("{label} io_uring completion never matched"));
+            return Err(ReapError {
+                message: format!("{label} io_uring completion never matched"),
+                fatal_ring: false,
+            });
         }
-    }
-}
-
-/// Discard every completion currently ready. Called by [`reap_matching`] only
-/// at the point right after the current SQE is pushed but BEFORE it is submitted
-/// or waited on, so no completion for the current tag can exist yet — everything
-/// ready is necessarily a leftover from a prior interrupted call and is dropped
-/// unconditionally. This is a full drain, not a keep-one-matching drain: there
-/// is nothing to keep, and [`reap_matching`] re-checks `user_data` on the real
-/// reap anyway, so a wrap-around tag collision is still caught there.
-fn drain_stale(port: &mut dyn RingPort) {
-    while let Some(_cqe) = port.next_completion() {
-        // Drop stale completion.
     }
 }
 

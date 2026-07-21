@@ -1,4 +1,4 @@
-use io_uring::IoUring;
+use crate::io_uring_write::{RingWriter, WriteResult};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -157,7 +157,7 @@ fn instance_is_alive(inst: ProcInstance) -> bool {
 }
 
 enum WriteMode {
-    IoUring(IoUring),
+    IoUring(RingWriter),
     SyncFallback,
 }
 
@@ -194,7 +194,7 @@ impl StateWriter {
         thread::Builder::new()
             .name("xpf-state-writer".to_string())
             .spawn(move || {
-                let mut write_mode = match IoUring::new(8) {
+                let mut write_mode = match RingWriter::new(8) {
                     Ok(ring) => {
                         active_bg.store(true, Ordering::Relaxed);
                         if let Ok(mut m) = mode_bg.lock() {
@@ -224,7 +224,7 @@ impl StateWriter {
                     if swept.insert(req.path.clone()) {
                         sweep_stale_temps(&req.path);
                     }
-                    let outcome = persist_with_mode(&mut write_mode, &req.path, &req.data);
+                    let outcome = persist_with_mode(&mut write_mode, &req.path, req.data);
                     let result = apply_outcome(
                         outcome,
                         &mut write_mode,
@@ -287,20 +287,22 @@ struct PersistOutcome {
     demotion_cause: Option<String>,
 }
 
-fn persist_with_mode(mode: &mut WriteMode, path: &str, data: &[u8]) -> PersistOutcome {
+fn persist_with_mode(mode: &mut WriteMode, path: &str, data: Vec<u8>) -> PersistOutcome {
     match mode {
         WriteMode::IoUring(ring) => match persist_with_io_uring(ring, path, data) {
-            Ok(()) => PersistOutcome {
+            IoUringPersist::Done => PersistOutcome {
                 result: Ok(()),
                 io_uring_failed: false,
                 demotion_cause: None,
             },
-            Err(ring_err) => {
-                // io_uring failed at runtime. Fall back to a sync write for THIS
-                // request, but flag the failure so the writer loop demotes the
-                // mode persistently (status + no future ring attempts).
+            IoUringPersist::Retry(bytes, ring_err) => {
+                // io_uring failed but nothing durable landed AND the buffer was
+                // handed back (a reaped terminal failure). Fall back to a sync
+                // write to a FRESH temp for THIS request from the returned buffer,
+                // and flag the failure so the writer loop demotes the mode
+                // persistently (status + no future ring attempts).
                 let cause = format!("io_uring write failed, demoting to sync: {ring_err}");
-                let result = persist_sync(path, data)
+                let result = persist_sync(path, &bytes)
                     .map_err(|sync_err| format!("{ring_err}; {sync_err}"));
                 PersistOutcome {
                     result,
@@ -308,9 +310,25 @@ fn persist_with_mode(mode: &mut WriteMode, path: &str, data: &[u8]) -> PersistOu
                     demotion_cause: Some(cause),
                 }
             }
+            IoUringPersist::Deferred(ring_err) => {
+                // The write did NOT reach a terminal state: its buffer is RETAINED
+                // in the ring's in-flight registry (never freed while an SQE may
+                // reference it, #5800) and cannot be synchronously retried — the
+                // buffer is no longer ours and the op may be in flight. Fail this
+                // write and demote; dropping the RingWriter on demotion runs the
+                // teardown drain and closes the ring fd, which is what frees the
+                // parked buffer safely.
+                let cause =
+                    format!("io_uring write deferred (buffer retained), demoting to sync: {ring_err}");
+                PersistOutcome {
+                    result: Err(cause.clone()),
+                    io_uring_failed: true,
+                    demotion_cause: Some(cause),
+                }
+            }
         },
         WriteMode::SyncFallback => PersistOutcome {
-            result: persist_sync(path, data),
+            result: persist_sync(path, &data),
             io_uring_failed: false,
             demotion_cause: None,
         },
@@ -369,7 +387,28 @@ fn apply_outcome(
     outcome.result
 }
 
-fn persist_with_io_uring(ring: &mut IoUring, path: &str, data: &[u8]) -> Result<(), String> {
+/// Outcome of one io_uring state-file write attempt (#5800). Distinguishes a
+/// reaped TERMINAL failure whose buffer was handed back (safe to sync-retry to a
+/// FRESH temp) from a DEFERRED write whose buffer the ring RETAINED in its
+/// in-flight registry (must NOT sync-retry — the op may be in flight and the
+/// buffer is no longer ours to re-send).
+enum IoUringPersist {
+    /// The write completed and the temp was durably finalized.
+    Done,
+    /// The io_uring path failed (submit error, kernel completion error, zero-byte
+    /// completion, id-space exhaustion, temp-open failure, or a durable-finalize
+    /// failure) but transferred nothing durable AND handed the owned buffer back.
+    /// The buffer feeds a synchronous rewrite to a fresh temp. Carries
+    /// (buffer, cause).
+    Retry(Vec<u8>, String),
+    /// The write did NOT reach a reaped terminal state: the owned buffer has been
+    /// MOVED into the ring's in-flight registry (retained until its CQE is reaped
+    /// or the ring is torn down and drained). The write FAILS — no sync retry (the
+    /// buffer is gone and the SQE may still be in flight). Carries the cause.
+    Deferred(String),
+}
+
+fn persist_with_io_uring(ring: &mut RingWriter, path: &str, data: Vec<u8>) -> IoUringPersist {
     // Each write gets a PRIVATE temp path (pid + monotonic counter), created
     // with O_EXCL so two concurrent writers — even different helper processes
     // racing the same destination during a restart/upgrade handover — can never
@@ -377,16 +416,59 @@ fn persist_with_io_uring(ring: &mut IoUring, path: &str, data: &[u8]) -> Result<
     // publishes onto `path` (last-writer-wins on the final file is acceptable;
     // crossed bytes under a successful rename are not, #2705).
     let tmp = temporary_path(path);
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp)
-        .map_err(|e| format!("open temp state file {}: {e}", tmp.display()))?;
-    let result = (|| {
-        write_all_with_ring(ring, file.as_raw_fd(), data)?;
-        finalize_durably(&file, &tmp, path)
-    })();
-    cleanup_on_error(&tmp, result)
+    let file = match OpenOptions::new().create_new(true).write(true).open(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            // The temp was never created — nothing is on disk and the buffer is
+            // intact, so hand it back for a synchronous retry.
+            return IoUringPersist::Retry(
+                data,
+                format!("open temp state file {}: {e}", tmp.display()),
+            );
+        }
+    };
+    // The owned buffer MOVES into the ring. A positioned (file-offset) byte-stream
+    // write: a short count legitimately resumes from `offset + n`, so a partial is
+    // never `Transferred` here. On a Deferred outcome the ring RETAINS the buffer
+    // (never freed while an SQE may reference it, #5800).
+    match ring.write(file.as_raw_fd(), data, true, "state") {
+        WriteResult::Done(bytes) => {
+            // The bytes are on the temp file and the write CQE was reaped. Apply
+            // the durability contract (fsync + rename + parent-dir fsync). A
+            // finalize failure hands the buffer back so the sync fallback can
+            // rewrite a fresh temp.
+            match finalize_durably(&file, &tmp, path) {
+                Ok(()) => IoUringPersist::Done,
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    IoUringPersist::Retry(bytes, e)
+                }
+            }
+        }
+        WriteResult::NothingWritten(bytes, msg) => {
+            // Nothing reached the temp — discard it and hand the buffer back.
+            let _ = fs::remove_file(&tmp);
+            IoUringPersist::Retry(bytes, msg)
+        }
+        WriteResult::Transferred(bytes, msg) => {
+            // Unreachable for a positioned write (a short count resumes via the
+            // offset, never `Transferred`). Handle defensively: the CQE was reaped
+            // (buffer terminal), the partial temp is discarded, and a sync rewrite
+            // to a fresh temp is safe.
+            let _ = fs::remove_file(&tmp);
+            IoUringPersist::Retry(bytes, msg)
+        }
+        WriteResult::Deferred { id, message, .. } => {
+            // The write did not reach a terminal state and its buffer is parked in
+            // the ring's registry (retained, not freed); `id` identifies the
+            // parked write for teardown correlation. Discard the partial temp; do
+            // NOT sync-retry (the buffer is gone and the op may be in flight). The
+            // caller demotes to sync, which drops the RingWriter (teardown drain +
+            // ring-fd close) and frees the parked buffer safely.
+            let _ = fs::remove_file(&tmp);
+            IoUringPersist::Deferred(format!("{message} (in-flight id {id}, buffer retained)"))
+        }
+    }
 }
 
 fn persist_sync(path: &str, data: &[u8]) -> Result<(), String> {
@@ -448,19 +530,6 @@ fn sync_parent_dir(dest: &str) -> Result<(), String> {
         File::open(dir).map_err(|e| format!("open parent dir {} for fsync: {e}", dir.display()))?;
     sync_all(&dir_file).map_err(|e| format!("fsync parent dir {}: {e}", dir.display()))?;
     Ok(())
-}
-
-fn write_all_with_ring(ring: &mut IoUring, fd: i32, data: &[u8]) -> Result<(), String> {
-    // Positioned write to the temp state file. The shared loop retries the wait
-    // on EINTR rather than abandoning an in-flight SQE, matches the completion
-    // by user_data so a stale CQE cannot corrupt the file offset, and returns
-    // only after the matching CQE is reaped so `data` outlives every kernel
-    // reference (#2297).
-    // The state writer is a positioned (byte-stream) write with no synchronous
-    // fallback, so it does not consume the `WriteError` retry-safety
-    // classification (#2477) — collapse it to the error message.
-    crate::io_uring_write::write_all_to_fd(ring, fd, data, true, "state")
-        .map_err(|e| e.to_string())
 }
 
 /// Process-global monotonic counter that makes every temp path produced by this
