@@ -38,6 +38,19 @@ drop-in for xdpilone), and tracks frame budgets per binding.
   unit tests can exercise worker-owned drain paths without creating
   kernel AF_XDP sockets; production UMEM construction remains
   `WorkerUmem::new`.
+- **Status-snapshot `last_error` precedence (#4971 / #6145).**
+  `snapshot()` (`snapshot.rs`) renders `last_error` from TWO sources with
+  a fixed precedence: the `last_error` **mutex** string (written by the
+  exceptional `TxError::Drop` / bind / reconcile paths via `set_error`)
+  wins whenever non-empty; only when it is empty does the snapshot fall
+  back to the lock-free `last_tx_retry_status` atomic (the expected-TX
+  backpressure hint from #4971). Consequence: a latched `TxError::Drop`
+  **masks** a live retry hint until the binding rebinds and
+  `clear_error()` resets both. This stale-masking is intentional — a
+  Drop is rarer and more severe than routine backpressure — and is
+  pinned by `tx_status_drop_error_outranks_retry_hint_until_rebind_6145`
+  (`tests/snapshot_propagation.rs`). See `../tx/README.md` for the full
+  rationale.
 - In **zero-copy mode on mlx5**, an `XDP_PASS` action permanently
   consumes a fill-ring frame: the kernel holds the UMEM buffer in
   an SKB and never returns it. Sustained traffic drains all 12K+ RX

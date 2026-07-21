@@ -53720,3 +53720,20 @@ top.
   pkg/dataplane/userspace/process_napi.go,
   pkg/dataplane/userspace/neighbor_prewarm_singleflight_5104_test.go,
   docs/userspace-cold-start-fix-plan.md
+
+## 2026-07-20 — #6145 TX-status Drop-vs-retry precedence
+
+- **Timestamp**: 2026-07-20
+- **Action**: Document + test the `last_error` snapshot precedence
+  (#4971 follow-up). A latched exceptional `TxError::Drop` (mutex
+  `set_error`) OUTRANKS the lock-free `last_tx_retry_status` hint until
+  the binding rebinds (`clear_error`). Chose option (a) — make the
+  stale-masking an intentional, documented, tested invariant (a Drop is
+  rarer + more severe than routine backpressure). No hot-path change.
+- **File(s)**:
+  - `userspace-dp/src/afxdp/umem/snapshot.rs` (expanded precedence comment)
+  - `userspace-dp/src/afxdp/umem/mod.rs` (`last_tx_retry_status` field doc)
+  - `userspace-dp/src/afxdp/umem/tests/snapshot_propagation.rs`
+    (fail-on-revert test `tx_status_drop_error_outranks_retry_hint_until_rebind_6145`)
+  - `userspace-dp/src/afxdp/tx/README.md` (precedence section)
+  - `userspace-dp/src/afxdp/umem/README.md` (snapshot precedence invariant)

@@ -283,11 +283,30 @@ impl BindingLiveState {
                 self.last_heartbeat.load(Ordering::Relaxed),
                 now_mono,
             ),
-            // #4971: prefer a genuine error string (mutex, written by
-            // the exceptional drop / bind / reconcile paths). If empty,
-            // fall back to the lock-free TX-retry status so an expected
-            // backpressure reason stays visible in `show` output —
-            // without the send hot path ever taking the mutex.
+            // #4971 / #6145: `last_error` precedence — a genuine error
+            // STRING (the mutex, written by the exceptional
+            // drop / bind / reconcile paths via `set_error`) OUTRANKS
+            // the lock-free expected-TX-retry hint. Only when the mutex
+            // string is EMPTY do we fall back to the
+            // `last_tx_retry_status` atomic, so an expected backpressure
+            // reason stays visible in `show` output without the send hot
+            // path ever taking the mutex.
+            //
+            // #6145 — intentional stale-masking: a prior exceptional
+            // `TxError::Drop` (capacity / slice fault) leaves `last_error`
+            // non-empty and is NOT cleared by the ongoing expected-retry
+            // path (which only writes the atomic). So while a Drop error
+            // is latched, sustained retries afterward keep surfacing that
+            // Drop string, NOT the current retry reason, until the binding
+            // rebinds and `clear_error()` wipes BOTH. This precedence is
+            // DELIBERATE: a `TxError::Drop` is rarer and more severe than
+            // expected backpressure (it flags a real capacity /
+            // slice-bounds fault an operator must see), so the
+            // more-severe latched error must not be masked by a flood of
+            // routine retry hints. `clear_error()` (rebind / successful
+            // reconcile) is the single reset point; a fresh retry recorded
+            // AFTER the clear then renders normally. Pinned by
+            // `tx_status_drop_error_outranks_retry_hint_until_rebind_6145`.
             last_error: {
                 let err = self
                     .last_error
