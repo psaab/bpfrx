@@ -1,3 +1,53 @@
+## 2026-07-21 — #5674 fix: size synced-import cap to ENTRIES (2×), gate forward-only
+
+- **Timestamp**: 2026-07-21 (fix/5674-synced-import-cap, #6172 hostile-review MAJOR)
+- **Action**: Corrected a 2× shortfall in the HA synced-import aggregate cap.
+  The #6172 gate counted TOTAL `sessions.synced` entries against a cap sized to
+  the LOGICAL session ceiling (`worker_count * DEFAULT_MAX_SESSIONS`), but each
+  admitted FORWARD logical session publishes TWO keys into that map — the
+  forward key plus an UNCONDITIONALLY-synthesized reverse companion
+  (`synthesized_synced_reverse_entry` → `Some` for any `!is_reverse` entry;
+  both published via `publish_shared_session`). A locally-created session
+  installs exactly ONE `key_to_handle` slot, so a symmetric peer holding up to
+  N logical sessions arrives as ~2N entries → the coordinator drop-newest-
+  rejected ~HALF above ~50% peer load. That is a SILENT under-sync during
+  NORMAL operation, not the "±1 pair overshoot" the comments claimed; on
+  failover the un-synced flows had no state → TCP broke (session-miss guard
+  drops the non-SYN first packet).
+  - `synced_import_cap()` (ha.rs) now returns `2 * worker_count *
+    DEFAULT_MAX_SESSIONS` (ENTRY cap = 2× logical ceiling). The test override
+    is treated as a LOGICAL ceiling and doubled the same way.
+  - Gate now fires only on FORWARD new keys:
+    `if previous_entry.is_none() && !entry.metadata.is_reverse { … }`. A
+    synthesized reverse always rides with its forward (a rejected forward
+    returns before publishing its reverse), and a lone reverse import off the
+    wire (`is_reverse` set by a peer via `SessionSyncRequest.is_reverse`) is
+    never independently rejected at a boundary slot (the review's secondary
+    Low). Arithmetic: total entries 2K vs cap 2N → reject a new forward exactly
+    when 2K ≥ 2N ⇔ K ≥ N (the logical ceiling); a full symmetric peer fits
+    exactly, only a peer past its OWN logical ceiling is rejected.
+  - Rewrote the test `upsert_synced_session_rejects_over_ceiling_import_and_
+    does_not_fan_out`: asserts a FULL symmetric-peer logical set (LOGICAL_CEILING
+    forward sessions = 2× entries) ALL admit with ZERO drops (catches the >50%
+    regression), then the next over-logical-ceiling forward is rejected + not
+    fanned out, and a replace at the ceiling still applies. PARENT-RED anchor
+    preserved: neutralizing the single `return;` (target-count = 1) REDs the
+    reject assertion.
+  - Docs: corrected the "±1 session-pair overshoot" framing in
+    `session/README.md` (#5674 subsection) and the `SYNCED_IMPORT_CAP_DROPS`
+    metric doc (`bpf_map/metrics.rs`) to the ENTRY-cap = 2× logical model; a
+    nonzero drop now means a peer past its OWN LOGICAL ceiling, not a legit
+    >50%-loaded peer.
+  - **Validation**: `cargo build --release` clean; `upsert_synced` /
+    `synced_import` / `delete_synced` / `wire_invariant_default_specimens` all
+    GREEN (wire fixture UNCHANGED — no new field). Target test 3× green.
+    PARENT-RED verified. Go `pkg/api` + `pkg/dataplane/...` all ok. Still needs
+    a loss-cluster failover smoke.
+  - **File(s)**: `userspace-dp/src/afxdp/ha.rs`,
+    `userspace-dp/src/afxdp/ha_tests.rs`,
+    `userspace-dp/src/afxdp/bpf_map/metrics.rs`,
+    `userspace-dp/src/session/README.md`
+
 ## 2026-07-21 — #6122: fail closed on NAT'd non-first-fragment frag-assoc miss
 
 - **Timestamp**: 2026-07-21 (fix/6122-nat-frag-miss-failclosed)
@@ -54272,6 +54322,39 @@ top.
   - `docs/xdp-io-uring-userspace-dataplane.md` (#5800 registry contract)
   - `docs/pr/5800-iouring-inflight-registry/plan.md` (plan + deviations)
 
+## 2026-07-21 — #5674 HA synced-import aggregate admission bound (coordinator)
+
+- **Timestamp**: 2026-07-21
+- **Action**: Bound peer-synced session imports at the coordinator's
+  aggregate ceiling (`worker_count * DEFAULT_MAX_SESSIONS`) before the
+  shared-map publish + all-worker fan-out. Fixes the #5674 availability/DoS:
+  peer-synced sessions were imported with NO cap (unlike the per-worker
+  `install_with_protocol_with_origin` cap) and fanned out to every worker
+  queue+table, so a peer under session-table pressure (or a compromised
+  peer) could drive the node past its aggregate ceiling and multiply state
+  across all workers. Drop-newest on a NEW over-ceiling key (bump
+  `SYNCED_IMPORT_CAP_DROPS`, return before publish/fan-out); a REPLACE of an
+  existing synced key is always allowed (never evict). Symmetric-pair
+  failover always fits under the bound. New Prometheus counter
+  `xpf_userspace_synced_import_cap_drops_total`.
+- **File(s)**:
+  - `userspace-dp/src/afxdp/ha.rs` (gate in `upsert_synced_session` +
+    `synced_import_cap()` helper)
+  - `userspace-dp/src/afxdp/bpf_map/metrics.rs` (`SYNCED_IMPORT_CAP_DROPS`)
+  - `userspace-dp/src/afxdp/coordinator/mod.rs` (`#[cfg(test)]`
+    `synced_import_cap_override` seam + init)
+  - `userspace-dp/src/afxdp/coordinator/status.rs`
+    (`synced_import_cap_drops_total()` accessor)
+  - `userspace-dp/src/protocol/control.rs` (Status wire field)
+  - `userspace-dp/src/server/helpers.rs` (status assembly)
+  - `userspace-dp/src/server/lifecycle.rs` (Status default)
+  - `userspace-dp/src/afxdp/ha_tests.rs` (fail-on-revert test +
+    `synced_entry_port` helper)
+  - `userspace-dp/src/session/README.md` (#5674 sync-family ceiling note)
+  - `pkg/dataplane/userspace/protocol.go` (`SyncedImportCapDropsTotal`)
+  - `pkg/api/metrics.go`, `pkg/api/metrics_descriptors.go`,
+    `pkg/api/metrics_userspace.go`, `pkg/api/metrics_test.go` (Prometheus
+    descriptor + emit + test coverage)
 ## 2026-07-21 — #5563 manual-failover config-generation staleness gate
 - **Timestamp**: 2026-07-21
 - **Action**: Gate manual/planned failover readiness on config-sync
@@ -54317,3 +54400,19 @@ top.
   watchClusterEvents), `pkg/daemon/daemon_ha_sync.go` (arm in closures + hook
   wiring), `pkg/cluster/sync_test.go` (new fence-ack tests),
   `docs/session-sync-architecture.md`
+## 2026-07-21 — #5879 canonical per-physical-interface QinQ gate
+- **Timestamp**: 2026-07-21
+- **Action**: Add #5879 canonical QinQ honesty gate. The #2354 gate validated a
+  local `inner-vlan-id` leaf on the committing node's expansion only; QinQ split
+  across the `vlan-tags outer/inner` spelling (incl. two set statements) or living
+  in a peer-only `groups node1` view bypassed commit (verified live: `vlan-tags
+  outer 100 inner 200` and node1-only `inner-vlan-id` both compiled clean). New
+  `validateQinQVLANStackAST` builds each unit's aggregate outer/inner stack across
+  both spellings and rejects any inner tag, evaluated for BOTH node0 and node1
+  effective views (HA-symmetric). Moved QinQ detection out of
+  `validateUnsupportedInterfaceStanzasAST` (H9/H10 stay). New `lenientQinQVLANStack`
+  opt keeps the #1960 warn-on-load posture.
+- **File(s)**: pkg/config/compiler_interfaces_qinq.go (new),
+  pkg/config/compiler_interfaces_unsupported.go, pkg/config/compiler.go,
+  pkg/config/schema_interfaces.go, pkg/config/qinq_canonical_vlan_5879_test.go (new),
+  docs/config-schema.md, _Log.md

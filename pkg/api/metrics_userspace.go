@@ -664,6 +664,16 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.DnatPublishErrorsTotal),
 	)
 
+	// #5674: peer-synced session imports rejected by the coordinator's
+	// aggregate admission bound. Also emitted unconditionally so a 0 is a real
+	// "no over-ceiling synced imports rejected" signal rather than an absent
+	// series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSyncedImportCapDrops,
+		prometheus.CounterValue,
+		float64(status.SyncedImportCapDropsTotal),
+	)
+
 	// #1760 W3': shared-map NAT reverse-key displacement events. Emitted
 	// unconditionally so a 0 is a real "no collisions" signal rather
 	// than an absent series.

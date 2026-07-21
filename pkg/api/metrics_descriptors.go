@@ -1245,6 +1245,22 @@ func newCollector(srv *Server) *xpfCollector {
 				"dnat_table map-capacity pressure (#2244).",
 			nil, nil,
 		),
+		userspaceSyncedImportCapDrops: prometheus.NewDesc(
+			"xpf_userspace_synced_import_cap_drops_total",
+			"Peer-synced session imports rejected by the coordinator's "+
+				"aggregate admission bound. Locally-created sessions are "+
+				"capped per worker at max_sessions; peer-synced imports were "+
+				"uncapped and fanned out to every worker command queue+table, "+
+				"so a peer under session-table pressure (or a compromised "+
+				"peer) could drive this node past its own aggregate session "+
+				"ceiling and multiply that state across all workers. The "+
+				"import path now bounds the shared synced map at this "+
+				"appliance's own ceiling (worker_count * max_sessions) and "+
+				"drop-newest-rejects an over-ceiling import; a rising value "+
+				"means a peer exceeded that ceiling. A legitimate "+
+				"symmetric-pair failover never trips it (#5674).",
+			nil, nil,
+		),
 		userspaceWorkerCommandQueuePoisonRecoveries: prometheus.NewDesc(
 			"xpf_userspace_worker_command_queue_poison_recoveries_total",
 			"Worker command-queue mutex poison recoveries across all "+
