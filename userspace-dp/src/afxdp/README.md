@@ -285,24 +285,27 @@ sync.
     allocations per frame → forwarding starvation on the affected queues.
     Both `stage_link_layer_classify` learn arms now gate the program
     through a per-worker `KernelNeighborProgramLimiter`
-    (`BindingWorker::neigh_program_limiter`): a fixed 256-slot,
-    direct-mapped table recording the last `(key -> mac)` the worker
-    programmed and when. It **skips** a repeat the kernel already holds
-    (proved by the slot OR by `insert_if_changed == false`), **rate-caps**
-    a changed-flood to ≤1 program per 50 ms per slot — which also bounds
-    the AGGREGATE per-worker netlink rate to `≤ SLOTS / interval` under a
-    many-distinct-IP flood — and does not lose a genuine SAME-KEY change: a
-    real MAC change after steady state programs immediately (steady-state
-    re-adverts do not consume the slot's rate budget), and a same-key change
-    rate-limited amid a flood is retried on the next advert (the slot keeps
-    the OLD mac, so the binding stays "owed"). CAVEAT (#6129): that "owed"
-    retry is slot-ownership-scoped — under a SUSTAINED adversarial
-    colliding-key flood (a different key occupying a victim's direct-mapped
-    slot) the victim's KERNEL program is starved; the AF_XDP fast path and
-    userspace neighbor map are unaffected (both always correct), only
-    host-path reachability to the one collided neighbor degrades (self-healing
-    under normal traffic via `NUD_STALE` + on-demand kernel ARP). Tracked as
-    #6129. The gate decision (`should_program`) is a pure,
+    (`BindingWorker::neigh_program_limiter`): a 64-bucket × 4-way
+    set-associative table (256 slots total) recording the last
+    `(key -> mac)` each way programmed and when. It **skips** a repeat the
+    kernel already holds (proved by an owning way OR by
+    `insert_if_changed == false`), **rate-caps** a changed-flood to ≤1
+    program per 50 ms per way — which also bounds the AGGREGATE per-worker
+    netlink rate to `≤ SLOTS / interval` under a many-distinct-IP flood —
+    and does not lose a genuine change: a real MAC change on an owning way
+    programs immediately (steady-state re-adverts do not consume the way's
+    rate budget), and a change rate-limited amid a flood is retried on the
+    next advert (the way keeps the OLD mac, so the binding stays "owed"). A
+    genuine change whose key owns no way CLAIMS one — a never-fired way if
+    free, else the LRU way, still honoring the rate cap (a way inside its
+    interval is never evicted), so a single colliding key can no longer
+    starve a victim (#6129): with 4 ways per bucket the victim lands in a
+    different way. Residual (bounded, self-healing): up to WAYS (4)
+    *churning* colliding keys mapping to one bucket can delay a 5th key's
+    kernel program until a way frees; the AF_XDP fast path and userspace
+    neighbor map stay correct throughout, and host-path reachability
+    self-heals under normal traffic via `NUD_STALE` + on-demand kernel ARP.
+    The gate decision (`should_program`) is a pure,
     allocation-free, syscall-free function pinned by fail-on-revert tests.
     Neighbor programming is a LOCAL kernel-table op, NOT HA/session-sync
     state, so the limiter is per-worker with no peer coordination.
