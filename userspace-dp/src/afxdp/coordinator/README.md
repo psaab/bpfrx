@@ -159,3 +159,34 @@ Differences that matter (#1881):
   drives the regression tests (coordinator-level
   `reconcile_post_teardown_worker_spawn_failure_fails_closed_4952` +
   handler-level `post_teardown_spawn_failure_fails_closed_no_persist_4952`).
+- **A POST-SPAWN in-thread worker bind failure fails closed via the
+  startup readiness barrier (#5143). HEARTBEAT != READINESS.** #4952 above
+  catches only the SPAWN failure — the thread that never starts. But a
+  worker that spawns SUCCESSFULLY can still fail its IN-THREAD XSK/UMEM
+  binds inside `worker_loop_setup` (the private-binding `Err` arm records
+  the failure by leaving the binding out of the worker's `bindings` vec)
+  and then enter its steady loop with an EMPTY/PARTIAL binding set — yet it
+  keeps HEARTBEATING, so the thread-death supervisor is satisfied and
+  (pre-#5143) `bring_up_workers` returned `Ok`, the reconcile committed, and
+  the handler ACKed `ok=true` + PERSISTED the snapshot: a SILENT forwarding
+  outage (a queue set with a live worker but no XSK-bound binding). #4952's
+  spawn-error propagation does NOT catch it (the spawn succeeded). Now each
+  newly-started worker REPORTS its actual bound-slot set (a
+  `WorkerStartupReport` over a per-reconcile `mpsc` channel) after its binds
+  and BEFORE its steady loop; after the spawn loop `bring_up_workers` WAITS
+  (bounded by `WORKER_STARTUP_BARRIER_TIMEOUT_NS` = 10s — a worker that
+  never reports in time is treated as failed, it does NOT block forever) and
+  requires `bound == planned` per worker. On ANY shortfall/timeout it FAILS
+  CLOSED: `stop_inner(false)` STOPS + JOINS the newly-started workers (no
+  leaked live-but-unbound worker), preserves the `worker_bind_incomplete:..`
+  stage, and returns `WorkerBringUpError::BindIncomplete`, which `reconcile`
+  maps to `ReconcileError::WorkerBindIncomplete` — the SECOND post-teardown
+  `ReconcileError` variant (alongside `WorkerSpawn`), handled the same way
+  by the control handler (`ok=false`, do NOT persist). `bring_up_workers`
+  now returns `Result<(), WorkerBringUpError>` (was `Result<(), String>`) so
+  the two post-teardown classes map to distinct variants. A per-instance
+  `#[cfg(test)] force_worker_bind_incomplete` seam (spawns a joinable stub
+  worker that reports a bound set short by one slot, then heartbeats until
+  stopped) drives the regression tests (coordinator-level
+  `post_spawn_inthread_bind_failure_fails_closed_5143` + handler-level
+  `full_apply_post_spawn_inthread_bind_failure_fails_closed_no_persist_5143`).

@@ -222,6 +222,20 @@ queues. See PR #1243's kill record for why i40e doesn't reshape.
   full-apply (plan-change) leg by
   `full_apply_post_teardown_spawn_failure_fails_closed_no_persist_6140`
   (#6140 — the full-apply arm was previously covered only transitively).
+  #5143: `ReconcileError::WorkerBindIncomplete` is the SECOND post-teardown
+  variant — a worker that SPAWNED but whose in-thread XSK/UMEM bind did not
+  bring up its full planned queue set (a live-but-unbound worker whose
+  heartbeat used to satisfy the supervisor), caught by `bring_up_workers`'
+  per-worker startup readiness barrier (HEARTBEAT != READINESS). Both
+  `apply_snapshot` legs handle it IDENTICALLY to `WorkerSpawn` (the shared
+  `WorkerSpawn(stage) | WorkerBindIncomplete(stage)` arm): `ok=false`, roll
+  the in-memory baseline back, refresh status to the REAL post-teardown
+  per-binding state, and return BEFORE `persist_state=true`. Only the error
+  verb differs — "`worker bind incomplete after teardown (...)`" vs "`worker
+  spawn failed after teardown (...)`" — so the #4952/#6140 assertions that
+  pin the "worker spawn failed" wording stay green. Regression-tested (full-
+  apply leg) by
+  `full_apply_post_spawn_inthread_bind_failure_fails_closed_no_persist_5143`.
   When
   `should_run_afxdp` does NOT hold (forwarding disarmed / unsupported) it
   `stop()`s every worker and then routes the per-binding status through

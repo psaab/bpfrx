@@ -275,6 +275,18 @@ pub struct Coordinator {
     /// release builds; per-instance so parallel tests never race.
     #[cfg(test)]
     pub(crate) force_worker_spawn_fail: u32,
+    /// #5143 test seam: force the FIRST `force_worker_bind_incomplete` spawned
+    /// workers to report an INCOMPLETE startup bound-slot set (a spawned
+    /// worker whose in-thread XSK/UMEM bind failed for one or more planned
+    /// bindings but keeps heartbeating). Instead of the real `worker_loop`
+    /// (which cannot bind a real XSK in-process), a joinable STUB thread is
+    /// spawned that reports a bound set MISSING one planned slot, then
+    /// heartbeats until stopped — so the post-spawn readiness barrier's
+    /// fail-close + stop/join is unit-verifiable. Distinct from
+    /// `force_worker_spawn_fail` (which fails the spawn itself, pre-report).
+    /// Always 0 in release builds; per-instance so parallel tests never race.
+    #[cfg(test)]
+    pub(crate) force_worker_bind_incomplete: u32,
     pub(crate) last_reconcile_stage: String,
     pub(crate) poll_mode: crate::PollMode,
     pub(crate) event_stream: Option<crate::event_stream::EventStreamSender>,
@@ -335,6 +347,8 @@ impl Coordinator {
             last_quiesce_ms: 0,
             #[cfg(test)]
             force_worker_spawn_fail: 0,
+            #[cfg(test)]
+            force_worker_bind_incomplete: 0,
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,

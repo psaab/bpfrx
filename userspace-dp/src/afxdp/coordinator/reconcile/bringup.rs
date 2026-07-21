@@ -18,6 +18,39 @@ use super::super::super::*;
 use super::super::supervisor::{spawn_supervised_aux, spawn_supervised_worker};
 use super::super::{Coordinator, WorkerHandle};
 
+/// #5143: how long `bring_up_workers` waits for every newly-started worker to
+/// report its startup readiness (the set of planned bindings whose XSK
+/// actually bound) before it fails the reconcile closed. A worker that never
+/// reports within this bound is treated as failed — the barrier does NOT block
+/// forever. 10s mirrors the HA sync-hold ceiling: comfortably above a healthy
+/// worker's setup cost (per-worker TSC calibration ~10ms + UMEM mmap + XSK
+/// bind, well under a second even for a full 6-queue VF) yet bounded so a hung
+/// worker cannot wedge the control socket indefinitely. The COMMON failure — a
+/// worker that finished setup with a PARTIAL binding set — reports immediately,
+/// so the barrier fails fast without approaching this deadline; only a worker
+/// that dies/hangs inside setup consumes the full budget.
+const WORKER_STARTUP_BARRIER_TIMEOUT_NS: u64 = 10_000_000_000;
+
+/// #5143: the two DISTINCT post-teardown worker-bringup failures, both raised
+/// AFTER `tear_down` has stopped the old workers (so the data plane HAS moved
+/// and there is no prior-state restore — only fail-closed bookkeeping + a
+/// retry/last-good reconcile). `reconcile` maps each to its own
+/// [`ReconcileError`] variant so the control handler can fail closed and NOT
+/// persist the broken snapshot as the boot baseline.
+pub(super) enum WorkerBringUpError {
+    /// #4952: a worker thread failed to SPAWN (`spawn_supervised_worker` ->
+    /// `pthread_create` EAGAIN/ENOMEM). Carries the preserved
+    /// `spawn_worker_failed:<id>:<err>` stage.
+    Spawn(String),
+    /// #5143: a worker SPAWNED successfully but its in-thread XSK/UMEM bind
+    /// did not bring up its FULL planned binding set (a partial/empty bind), or
+    /// it never reported readiness within the bounded deadline. HEARTBEAT !=
+    /// READINESS — a live heartbeat over an incomplete binding set is the
+    /// silent forwarding outage this guards. Carries the
+    /// `worker_bind_incomplete:<id>:..` stage.
+    BindIncomplete(String),
+}
+
 /// Bring up the worker threads for the just-applied snapshot.
 ///
 /// #4952: this runs on the POST-TEARDOWN destructive path — `tear_down`
@@ -30,10 +63,29 @@ use super::super::{Coordinator, WorkerHandle};
 /// XSK-bound workers cannot restore forwarding and only compounds the
 /// pressure), PRESERVES the `spawn_worker_failed:<id>:<err>` stage (it does
 /// NOT overwrite it with `spawned:..`), skips the auxiliary-thread bring-up,
-/// and returns `Err(stage)`. The caller (`reconcile`) maps that to
-/// `ReconcileError::WorkerSpawn` so the control handler fails closed and
-/// does NOT persist the broken snapshot as the boot baseline. On success
-/// returns `Ok(())`.
+/// and returns `Err(WorkerBringUpError::Spawn(stage))`. The caller
+/// (`reconcile`) maps that to `ReconcileError::WorkerSpawn` so the control
+/// handler fails closed and does NOT persist the broken snapshot as the boot
+/// baseline. On success returns `Ok(())`.
+///
+/// #5143: a SPAWN success only proves the thread exists — NOT that its
+/// in-thread XSK/UMEM binds brought up the full planned queue set. A worker
+/// that bound a PARTIAL/EMPTY set still HEARTBEATS, so the thread-death
+/// supervisor is satisfied and (pre-#5143) this returned `Ok`, committing a
+/// silent forwarding outage. #4952's spawn-error propagation does not catch it
+/// (the spawn succeeded). So after the spawn loop this runs a STARTUP READINESS
+/// BARRIER: every spawned worker reports the slot set it actually bound (a
+/// `WorkerStartupReport` over a per-reconcile `mpsc` channel, sent from
+/// `worker_loop` after setup), and the barrier waits — under a bounded deadline
+/// ([`WORKER_STARTUP_BARRIER_TIMEOUT_NS`]; a worker that never reports in time
+/// is treated as failed, NOT blocked forever) — for `bound == planned` per
+/// worker. On ANY shortfall/timeout it FAILS CLOSED: `stop_inner(false)` stops +
+/// joins the newly-started workers (no leaked live-but-unbound worker), preserves
+/// the `worker_bind_incomplete:..` stage, and returns
+/// `Err(WorkerBringUpError::BindIncomplete(stage))`, which `reconcile` maps to
+/// `ReconcileError::WorkerBindIncomplete` (handled the same fail-closed way as
+/// `WorkerSpawn`). HEARTBEAT != READINESS: the reconcile transaction now
+/// requires one READY binding per required plan.
 ///
 /// Full pre-teardown preflight of the spawn is not tractable — a real
 /// `pthread_create` cannot be probed without spawning the thread, and the
@@ -48,7 +100,7 @@ pub(super) fn bring_up_workers(
     fds: ReconcileSnapshotFds,
     ring_entries: usize,
     preserved_synced_sessions: Vec<SyncedSessionEntry>,
-) -> Result<(), String> {
+) -> Result<(), WorkerBringUpError> {
     let ReconcileSnapshotFds {
         map_fd,
         heartbeat_map_fd,
@@ -284,8 +336,25 @@ pub(super) fn bring_up_workers(
     // (abort remaining launches) and the tail returns Err(stage) so the
     // reconcile fails closed instead of persisting a broken snapshot.
     let mut spawn_failure: Option<String> = None;
+    // #5143: per-worker STARTUP READINESS barrier. Each spawned worker reports
+    // (over this channel, after its in-thread binds) the set of planned slots
+    // whose XSK actually bound. `planned_slots_by_worker` records the set the
+    // reconcile DISPATCHED to each worker; `spawned_worker_ids` is the set of
+    // workers whose spawn succeeded (only those are expected to report). After
+    // the spawn loop the barrier waits for every spawned worker's report under
+    // a bounded deadline and checks bound == planned — a heartbeat alone no
+    // longer counts as ready.
+    let (startup_report_tx, startup_report_rx) = mpsc::channel::<WorkerStartupReport>();
+    let mut planned_slots_by_worker: BTreeMap<u32, std::collections::BTreeSet<u32>> =
+        BTreeMap::new();
+    let mut spawned_worker_ids: Vec<u32> = Vec::new();
     for (worker_id, binding_plans) in workers {
         let plan_count = binding_plans.len();
+        // #5143: the slot set this worker is REQUIRED to bind. Captured before
+        // `binding_plans` is moved into the worker body so the barrier can
+        // compare it against the worker's reported bound set.
+        let planned_slots: std::collections::BTreeSet<u32> =
+            binding_plans.iter().map(|plan| plan.status.slot).collect();
         let stop = Arc::new(AtomicBool::new(false));
         let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
         let session_export_ack = Arc::new(AtomicU64::new(0));
@@ -362,6 +431,10 @@ pub(super) fn bring_up_workers(
         // a helper without re-validating the panic-payload contract.
         let panic_slot = Arc::new(Mutex::new(None::<String>));
         coord.worker_panics.insert(worker_id, panic_slot.clone());
+        // #5143: the worker's end of the startup-readiness channel. Moved into
+        // the worker body; `worker_loop` sends the achieved bound-slot set on
+        // it after setup, before entering the steady loop.
+        let startup_report_tx_worker = startup_report_tx.clone();
         let body = move || {
             worker_loop(
                 worker_id,
@@ -401,6 +474,7 @@ pub(super) fn bring_up_workers(
                 cos_status_clone,
                 runtime_atomics_clone,
                 cold_path_atomics_clone,
+                startup_report_tx_worker,
             );
         };
         // #4952 test seam: force the fallible worker spawn to fail so the
@@ -409,8 +483,49 @@ pub(super) fn bring_up_workers(
         // spawn, drops the worker body unspawned, and synthesizes the same
         // `std::io::Error` a resource-exhausted spawn returns. Always 0 in
         // release builds (`force_worker_spawn_fail` is `#[cfg(test)]`).
+        //
+        // #5143 test seam: force a SPAWNED worker to report an INCOMPLETE
+        // startup bound-slot set (a worker whose in-thread XSK/UMEM bind failed
+        // for one or more planned bindings but keeps heartbeating). A real
+        // `worker_loop` cannot bind a real XSK in-process, so instead spawn a
+        // joinable STUB thread that reports a bound set MISSING one planned
+        // slot, then heartbeats until stopped — exercising the readiness
+        // barrier's fail-close + stop/join end to end. Checked BEFORE the
+        // spawn-fail seam so the two are mutually exclusive per worker.
         #[cfg(test)]
-        let join = if coord.force_worker_spawn_fail > 0 {
+        let join = if coord.force_worker_bind_incomplete > 0 {
+            coord.force_worker_bind_incomplete -= 1;
+            drop(body);
+            // Report every planned slot EXCEPT one (`skip(1)`), so with a
+            // single planned binding the reported set is empty and with N it
+            // is short by one — either way bound != planned -> barrier fails
+            // closed.
+            let incomplete_bound: Vec<u32> = planned_slots.iter().copied().skip(1).collect();
+            let stub_stop = stop.clone();
+            let stub_heartbeat = heartbeat.clone();
+            let stub_tx = startup_report_tx.clone();
+            let stub_worker_id = worker_id;
+            spawn_supervised_worker(
+                worker_id,
+                runtime_atomics.clone(),
+                panic_slot,
+                move || {
+                    let _ = stub_tx.send(WorkerStartupReport {
+                        worker_id: stub_worker_id,
+                        bound_slots: incomplete_bound,
+                    });
+                    // Heartbeat while "live-but-unbound" until the barrier
+                    // stops us — bounded so a REVERTED (barrier removed) build
+                    // does not leak a thread forever.
+                    let mut ticks = 0u32;
+                    while !stub_stop.load(std::sync::atomic::Ordering::Relaxed) && ticks < 5_000 {
+                        stub_heartbeat.store(monotonic_nanos(), std::sync::atomic::Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        ticks += 1;
+                    }
+                },
+            )
+        } else if coord.force_worker_spawn_fail > 0 {
             coord.force_worker_spawn_fail -= 1;
             drop(body);
             Err(std::io::Error::new(
@@ -428,6 +543,11 @@ pub(super) fn bring_up_workers(
                     "xpf-userspace-dp: started worker thread worker_id={} planned_bindings={}",
                     worker_id, plan_count
                 );
+                // #5143: this worker spawned, so it is EXPECTED to report its
+                // startup bound-slot set; record its dispatched plan for the
+                // barrier's bound-vs-planned check below.
+                planned_slots_by_worker.insert(worker_id, planned_slots);
+                spawned_worker_ids.push(worker_id);
                 coord.workers.handles.insert(
                     worker_id,
                     WorkerHandle {
@@ -486,7 +606,37 @@ pub(super) fn bring_up_workers(
             "xpf-userspace-dp: worker bring-up FAILED ({stage}); a queue set has no \
              XSK-bound worker after teardown — failing reconcile closed"
         );
-        return Err(stage);
+        return Err(WorkerBringUpError::Spawn(stage));
+    }
+    // #5143: STARTUP READINESS BARRIER. Every worker SPAWNED (the #4952
+    // spawn-failure fast-path above already returned otherwise), but a spawn
+    // only proves the thread exists — NOT that its in-thread XSK/UMEM binds
+    // brought up the full planned queue set. Wait (under a bounded deadline)
+    // for each spawned worker to report the slot set it actually bound, then
+    // require bound == planned. A worker that bound a PARTIAL/EMPTY set (the
+    // #5143 silent forwarding outage: a live-but-unbound worker whose
+    // heartbeat satisfied the supervisor) or never reported in time fails the
+    // reconcile CLOSED — the same post-teardown fail-closed contract #4952
+    // established for spawn failures, extended to the post-spawn bind failure.
+    if let Some(stage) = collect_worker_startup_readiness(
+        &startup_report_rx,
+        &spawned_worker_ids,
+        &planned_slots_by_worker,
+    ) {
+        eprintln!(
+            "xpf-userspace-dp: worker bring-up FAILED ({stage}); a spawned worker did not \
+             bind its full planned queue set after teardown — failing reconcile closed"
+        );
+        // Stop + JOIN the newly-started workers (the teardown path) so no
+        // live-but-unbound worker keeps heartbeating past this fail-closed
+        // reconcile, and clear the coordinator worker state so a retry /
+        // last-good reconcile starts from a coherent baseline. Preserved
+        // synced sessions are kept (`clear_synced_state=false`), matching the
+        // reconcile teardown. `stop_inner` overwrites `last_reconcile_stage`
+        // with "stopped", so restore the diagnostic stage AFTER it.
+        coord.stop_inner(false);
+        coord.last_reconcile_stage = stage.clone();
+        return Err(WorkerBringUpError::BindIncomplete(stage));
     }
     coord.last_reconcile_stage = format!(
         "spawned:workers={}:identities={}:live={}",
@@ -568,6 +718,74 @@ pub(super) fn bring_up_workers(
     coord.reconcile_local_tunnel_sources();
     coord.spawn_wg_control_threads();
     Ok(())
+}
+
+/// #5143: the STARTUP READINESS BARRIER. Wait for every SPAWNED worker to
+/// report the slot set its in-thread XSK/UMEM binds actually brought up, under
+/// a bounded deadline ([`WORKER_STARTUP_BARRIER_TIMEOUT_NS`]), then check
+/// `bound == planned` for each. Returns `None` when every worker bound its full
+/// planned set (the reconcile may proceed), or `Some(stage)` — a
+/// `worker_bind_incomplete:<id>:..` descriptor — on the FIRST worker that bound
+/// a partial/empty set OR never reported in time (fail closed).
+///
+/// The barrier does NOT block forever: it stops waiting at the deadline and
+/// treats any worker with no report as failed. A worker that finished setup
+/// with a partial binding set reports IMMEDIATELY (the common failure), so this
+/// returns fast without approaching the deadline; only a worker that
+/// hangs/dies inside setup consumes the full budget. Reads a moved-value report
+/// off the channel — no shared mutable state, so the channel's send→recv
+/// establishes the happens-before for the reported set.
+fn collect_worker_startup_readiness(
+    startup_report_rx: &mpsc::Receiver<WorkerStartupReport>,
+    spawned_worker_ids: &[u32],
+    planned_slots_by_worker: &BTreeMap<u32, std::collections::BTreeSet<u32>>,
+) -> Option<String> {
+    if spawned_worker_ids.is_empty() {
+        return None;
+    }
+    // Collect one report per spawned worker (last write wins per id) until we
+    // have them all or the deadline elapses.
+    let deadline_ns = monotonic_nanos().saturating_add(WORKER_STARTUP_BARRIER_TIMEOUT_NS);
+    let mut bound_by_worker: BTreeMap<u32, std::collections::BTreeSet<u32>> = BTreeMap::new();
+    while bound_by_worker.len() < spawned_worker_ids.len() {
+        let now = monotonic_nanos();
+        if now >= deadline_ns {
+            break;
+        }
+        match startup_report_rx.recv_timeout(std::time::Duration::from_nanos(deadline_ns - now)) {
+            Ok(report) => {
+                bound_by_worker.insert(report.worker_id, report.bound_slots.into_iter().collect());
+            }
+            // Timed out with reports still outstanding, or every sender was
+            // dropped (a worker panicked in setup before reporting). Either
+            // way the missing worker(s) are treated as failed below.
+            Err(mpsc::RecvTimeoutError::Timeout)
+            | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    for &worker_id in spawned_worker_ids {
+        let planned = planned_slots_by_worker
+            .get(&worker_id)
+            .cloned()
+            .unwrap_or_default();
+        match bound_by_worker.get(&worker_id) {
+            Some(bound) if *bound == planned => {}
+            Some(bound) => {
+                return Some(format!(
+                    "worker_bind_incomplete:{worker_id}:bound={}:planned={}",
+                    bound.len(),
+                    planned.len()
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "worker_bind_incomplete:{worker_id}:timeout:planned={}",
+                    planned.len()
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// #1830 follow-up (Codex review on PR #1841): array length needed to

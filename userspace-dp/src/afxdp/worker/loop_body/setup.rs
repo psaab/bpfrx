@@ -144,6 +144,16 @@ pub(super) fn worker_loop_setup(
         match create_private_binding_from_plan(plan) {
             Ok(binding) => bindings.push(binding),
             Err(err) => {
+                // #5143: an in-thread XSK/UMEM bind failure. Continuing past it
+                // (rather than aborting the whole worker) is intentional — but
+                // the failed binding is NOT pushed into `bindings`, so its slot
+                // is ABSENT from the startup readiness report `worker_loop`
+                // sends to the `bring_up_workers` barrier. That OMISSION is how
+                // the barrier learns this worker came up with a PARTIAL binding
+                // set and fails the reconcile closed (HEARTBEAT != READINESS).
+                // Pre-#5143 this `eprintln!` + `set_error` was the ONLY signal,
+                // and the worker went on heartbeating with an incomplete set —
+                // the silent forwarding outage.
                 eprintln!("xpf-userspace-dp: private binding creation failed: {err}");
                 live.set_error(err.to_string());
             }
