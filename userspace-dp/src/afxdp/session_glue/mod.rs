@@ -1180,6 +1180,8 @@ pub(super) fn resolve_flow_session_decision(
                 decision,
                 metadata,
                 origin,
+                forwarding,
+                now_ns,
             );
         }
         let resolved = if keep_transient {

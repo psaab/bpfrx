@@ -6293,3 +6293,321 @@ fn delete_terminal_filtered_session_releases_companion_and_allocator_5622() {
         );
     }
 }
+
+// #5295 FAIL-ON-REVERT: `purge_translated_synced_hit` drops a transient
+// peer-synced translated FORWARD session (the local node is not the active RG
+// owner, so the hit is torn down and re-resolved). At install
+// `handle_upsert_synced` reserved that session's translated `(pool_addr, port)`
+// in THIS node's LOCAL allocator (`reserve_synced_source_nat_allocation` /
+// `reserve_synced_nat64_allocation`). Before #5295 the purge dropped the session
+// state but released NO allocator reservation, so every alias-owned transient
+// purge LEAKED a pool port -> standby source-NAT / NAT64 exhaustion under
+// sustained HA churn. The fix mirrors `handle_delete_synced` /
+// `delete_terminal_filtered_session`: release under the `metadata.is_reverse`
+// ownership guard.
+//
+// PARENT-RED neutralization: delete the `release_source_nat_allocation(...)`
+// call in `purge_translated_synced_hit` -> this test's `used_ports == 0`
+// assertion goes RED (stays 1). (Deleting `release_nat64_allocation(...)`
+// reddens the NAT64 sibling below.)
+#[test]
+fn purge_translated_synced_hit_releases_source_nat_reservation_5295() {
+    // Single-address pool source-NAT rule so the translated flow holds a real
+    // pool port the purge must return.
+    let mut forwarding = ForwardingState::default();
+    forwarding.source_nat_rules = crate::nat::parse_source_nat_rules(&[crate::SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "p".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..crate::SourceNATRuleSnapshot::default()
+    }]);
+
+    // A source-NAT-translated forward flow. The synced session is keyed on its
+    // post-NAT WIRE tuple (`forward_wire_key`: src == pool addr), which is both
+    // what makes `is_translated_forward_session_key` fire AND the key
+    // `handle_upsert_synced` reserved the port under.
+    let orig_key = test_key();
+    let nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+        rewrite_src_port: Some(40000),
+        ..NatDecision::default()
+    };
+    let wire_key = forward_wire_key(&orig_key, nat);
+    let decision = SessionDecision {
+        resolution: test_local_delivery_decision().resolution,
+        nat,
+    };
+    let metadata = test_metadata(); // is_reverse = false
+
+    // Reserve the pool port for the synced forward flow, mirroring
+    // `handle_upsert_synced`'s `reserve_synced_source_nat_allocation`.
+    crate::nat::reserve_synced_source_nat_allocation(
+        &forwarding.source_nat_rules,
+        &wire_key,
+        nat,
+        false,
+    );
+    assert_eq!(
+        crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports,
+        1,
+        "precondition: the synced translated forward flow holds one pool port",
+    );
+
+    // Install the transient synced session under its wire key.
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol_with_origin(
+        wire_key.clone(),
+        decision,
+        metadata.clone(),
+        SessionOrigin::SyncImport,
+        1_000_000,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+    let _ = sessions.drain_deltas(16);
+
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let shared = SharedSessionRefs {
+        sessions: &shared_sessions,
+        nat_sessions: &shared_nat_sessions,
+        forward_wire_sessions: &shared_forward_wire_sessions,
+        owner_rg_indexes: &shared_owner_rg_indexes,
+    };
+
+    purge_translated_synced_hit(
+        &mut sessions,
+        -1,
+        shared,
+        &wire_key,
+        decision,
+        &metadata,
+        SessionOrigin::SyncImport,
+        &forwarding,
+        1_000_000,
+    );
+
+    // (a) existing behaviour: the transient session entry is gone.
+    assert!(
+        sessions.lookup(&wire_key, 1_000_000, TCP_FLAG_ACK).is_none(),
+        "purged transient synced session must be removed from the table",
+    );
+    // (b) THE #5295 FIX: the pool reservation is returned to the allocator.
+    assert_eq!(
+        crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports,
+        0,
+        "purge must release the synced forward flow's source-NAT pool port \
+         (leak on revert)",
+    );
+}
+
+// #5295 FAIL-ON-REVERT (NAT64 leg): the same purge must return a NAT64 forward
+// flow's reserved translated pool port. PARENT-RED neutralization: delete the
+// `release_nat64_allocation(...)` call in `purge_translated_synced_hit` -> the
+// "freed port re-allocatable" assertion goes RED (a fresh flow gets 1025; the
+// reserved 1024 stays leaked).
+#[test]
+fn purge_translated_synced_hit_releases_nat64_reservation_5295() {
+    // Single-address NAT64 pool: every client maps to the same snat_v4, so only
+    // the translated port disambiguates (sharpest collision case).
+    let mut forwarding = ForwardingState::default();
+    forwarding.nat64 = crate::nat64::Nat64State::from_snapshots(&[crate::NAT64RuleSnapshot {
+        name: "nat64-single".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        ..Default::default()
+    }]);
+
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    // Original v6 flow; the forward NAT64 decision translates to (snat, 1024) —
+    // 1024 is the first sequential NAT64 port, the port a fresh alloc picks first.
+    let orig_key = SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V6("2001:db8::1".parse().unwrap()),
+        dst_ip: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+        src_port: 5000,
+        dst_port: 443,
+    };
+    let nat = crate::nat64::Nat64State::forward_decision(snat, dst_v4, 1024);
+    let wire_key = forward_wire_key(&orig_key, nat); // post-NAT v4 wire tuple
+    let decision = SessionDecision {
+        resolution: test_local_delivery_decision().resolution,
+        nat,
+    };
+    let metadata = test_metadata();
+
+    // Reserve the NAT64 port under the wire key, mirroring `handle_upsert_synced`.
+    crate::nat64::reserve_synced_nat64_allocation(&forwarding.nat64, &wire_key, nat, false);
+
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol_with_origin(
+        wire_key.clone(),
+        decision,
+        metadata.clone(),
+        SessionOrigin::SyncImport,
+        1_000_000,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+    let _ = sessions.drain_deltas(16);
+
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let shared = SharedSessionRefs {
+        sessions: &shared_sessions,
+        nat_sessions: &shared_nat_sessions,
+        forward_wire_sessions: &shared_forward_wire_sessions,
+        owner_rg_indexes: &shared_owner_rg_indexes,
+    };
+
+    purge_translated_synced_hit(
+        &mut sessions,
+        -1,
+        shared,
+        &wire_key,
+        decision,
+        &metadata,
+        SessionOrigin::SyncImport,
+        &forwarding,
+        1_000_000,
+    );
+
+    // After the purge releases the reservation, a fresh local NAT64 flow re-owns
+    // the freed first port 1024. On revert (no release) 1024 stays reserved and
+    // the fresh flow is pushed to 1025.
+    let (snat2, port2) = forwarding
+        .nat64
+        .allocate_source(
+            0,
+            PROTO_TCP,
+            "2001:db8::2".parse().unwrap(),
+            dst_v4,
+            5000,
+            443,
+            1_000_001,
+        )
+        .expect("probe NAT64 flow allocates");
+    assert_eq!(snat2, snat, "single-address pool => same snat_v4");
+    assert_eq!(
+        port2, 1024,
+        "purge must release the synced NAT64 flow's reserved port 1024 so a \
+         fresh flow re-owns it (leak on revert -> 1025)",
+    );
+}
+
+// #5295: a NON-owning (reverse/alias) purge must release NOTHING and tear down
+// NOTHING. The `is_translated_forward_session_key` guard rejects reverse entries
+// up front, and the release path's own `is_reverse` guard is the second line of
+// defense, so a reverse companion can never double-free the forward flow's
+// reservation. Guard-correctness pin (green before and after the fix), per the
+// #5295 no-double-free requirement.
+#[test]
+fn purge_translated_synced_hit_reverse_entry_releases_nothing_5295() {
+    let mut forwarding = ForwardingState::default();
+    forwarding.source_nat_rules = crate::nat::parse_source_nat_rules(&[crate::SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "p".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..crate::SourceNATRuleSnapshot::default()
+    }]);
+
+    let orig_key = test_key();
+    let fwd_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+        rewrite_src_port: Some(40000),
+        ..NatDecision::default()
+    };
+    let wire_key = forward_wire_key(&orig_key, fwd_nat);
+
+    // The forward flow owns the reservation.
+    crate::nat::reserve_synced_source_nat_allocation(
+        &forwarding.source_nat_rules,
+        &wire_key,
+        fwd_nat,
+        false,
+    );
+    assert_eq!(
+        crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports,
+        1,
+        "precondition: the forward flow holds the pool port",
+    );
+
+    // Drive the purge with the REVERSE companion (is_reverse = true): its key is
+    // the reverse tuple carrying the reversed decision. The purge guard must
+    // reject it, freeing nothing and tearing down nothing.
+    let rev_key = reverse_session_key(&wire_key, fwd_nat);
+    let rev_nat = fwd_nat.reverse(
+        wire_key.src_ip,
+        wire_key.dst_ip,
+        wire_key.src_port,
+        wire_key.dst_port,
+    );
+    let rev_decision = SessionDecision {
+        resolution: test_local_delivery_decision().resolution,
+        nat: rev_nat,
+    };
+    let mut rev_metadata = test_metadata();
+    rev_metadata.is_reverse = true;
+
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol_with_origin(
+        rev_key.clone(),
+        rev_decision,
+        rev_metadata.clone(),
+        SessionOrigin::SyncImport,
+        1_000_000,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+    let _ = sessions.drain_deltas(16);
+
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let shared = SharedSessionRefs {
+        sessions: &shared_sessions,
+        nat_sessions: &shared_nat_sessions,
+        forward_wire_sessions: &shared_forward_wire_sessions,
+        owner_rg_indexes: &shared_owner_rg_indexes,
+    };
+
+    purge_translated_synced_hit(
+        &mut sessions,
+        -1,
+        shared,
+        &rev_key,
+        rev_decision,
+        &rev_metadata,
+        SessionOrigin::SyncImport,
+        &forwarding,
+        1_000_000,
+    );
+
+    // The guard rejected the reverse entry: nothing torn down, reservation intact.
+    assert!(
+        sessions.lookup(&rev_key, 1_000_000, TCP_FLAG_ACK).is_some(),
+        "reverse companion must be left intact by the forward-only purge",
+    );
+    assert_eq!(
+        crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports,
+        1,
+        "a reverse/alias purge must NOT release the forward flow's reservation",
+    );
+}
