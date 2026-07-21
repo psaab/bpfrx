@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 )
 
@@ -99,4 +100,71 @@ func clusterTopologyCommitPreflight(runtimeClusterActive bool, newCfg *config.Co
 		"clustered system cannot tear down the HA runtime without a restart. "+
 		"Restart xpfd into the standalone configuration: %w",
 		errClusterTopologyRequiresRestart)
+}
+
+// errClusterIdentityRequiresRestart is the #6192 sibling of
+// errClusterTopologyRequiresRestart: a day-2 commit that CHANGES the running
+// cluster's node-id or cluster-id cannot re-key the boot-constructed HA manager
+// live, so it is rejected with a restart-required diagnostic. Callers surface it
+// verbatim to the operator (CLI/gRPC/REST); tests match it with errors.Is.
+var errClusterIdentityRequiresRestart = errors.New(
+	"chassis cluster node-id / cluster-id change requires a restart into the new identity")
+
+// clusterIdentityCommitPreflight is the #6192 node-id / cluster-id restart
+// boundary — a sibling of clusterTopologyCommitPreflight (#5840) covering the
+// same boot-baked-runtime class the topology gate does NOT.
+//
+// cluster.NewManager(nodeID, clusterID) is called EXACTLY ONCE, at daemon
+// startup (pkg/daemon/daemon_run.go:1868), with the boot config's identity.
+// Manager.UpdateConfig — the only day-2 reconcile path — reconciles ONLY the
+// redundancy groups (pkg/cluster/group_state.go); it never re-reads m.nodeID or
+// m.clusterID. So a day-2 commit that CHANGES `chassis cluster node-id` or
+// `cluster-id` is accepted and promoted, but the running manager keeps its OLD
+// identity — heartbeat NodeID/ClusterID, RETH virtual MAC (02:bf:72:CC:RR:NN),
+// election tie-break, FPC/slot naming — and the new identity takes effect only
+// on restart. That is a silent partial no-op: the same false-success class #5840
+// fixed for the standalone<->cluster topology flip.
+//
+// A live re-key of the write-once-at-boot manager is UNSAFE for the same reason
+// #5840 declined to (de)construct it live: d.cluster is read bare, without a
+// lifecycle lock, from ~129 sites, and its identity feeds the heartbeat writer,
+// VRRP RETH MAC, and election already running under other goroutines. So we
+// REJECT the identity change at commit time — BEFORE store promotion and any
+// dataplane mutation — and direct the operator to restart into the new identity.
+//
+// Scope. This gate fires ONLY when a cluster runtime EXISTS (running != nil)
+// AND the candidate is still clustered. The standalone<->cluster flip in either
+// direction — including the #4179 config-less node (nil runtime, clustered
+// desire) — is owned by clusterTopologyCommitPreflight and handled there; when
+// running is nil or the candidate drops the cluster, this gate is a no-op and
+// the topology gate decides. An intra-identity edit (same node-id AND
+// cluster-id, e.g. a redundancy-group / interface / policy change) passes
+// untouched and reconciles live.
+//
+// No legitimate boot/bootstrap path is falsely rejected, for the same reasons as
+// #5840: the boot config LOAD reaches applyConfigLocked, not commitAndApply, and
+// a bootstrap plain commit is refused earlier by the inBootstrap() gate. In
+// steady state a peer-synced commit also passes — the synced text compiles for
+// the LOCAL node, so node-id resolves to this node's running id and cluster-id
+// is the shared value; the gate rejects only when the operator actually re-keys
+// the identity, which requires a restart on both nodes regardless.
+func clusterIdentityCommitPreflight(running *cluster.Manager, newCfg *config.Config) error {
+	if running == nil || !clusterTopologyConfigured(newCfg) {
+		// No running HA manager, or the candidate is not clustered: the
+		// standalone<->cluster topology gate owns these cases.
+		return nil
+	}
+	cc := newCfg.Chassis.Cluster
+	runNode, runCluster := running.NodeID(), running.ClusterID()
+	if cc.NodeID == runNode && cc.ClusterID == runCluster {
+		// Identity unchanged: an intra-identity edit reconciles live.
+		return nil
+	}
+	return fmt.Errorf("commit rejected: changing chassis cluster identity from "+
+		"node-id %d / cluster-id %d to node-id %d / cluster-id %d cannot re-key the "+
+		"running HA manager — its node/cluster identity (heartbeat, RETH virtual MAC, "+
+		"election tie-break, FPC naming) is constructed only at daemon startup. "+
+		"Restart xpfd into the new cluster identity, or make the change with the "+
+		"system offline: %w",
+		runNode, runCluster, cc.NodeID, cc.ClusterID, errClusterIdentityRequiresRestart)
 }

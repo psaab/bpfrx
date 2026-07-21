@@ -54762,6 +54762,44 @@ top.
   pkg/api/config_session_holder_5870_test.go (new),
   pkg/configstore/README.md, _Log.md
 
+- **Timestamp**: 2026-07-21
+- **Action**: #6192 — reject a day-2 chassis cluster node-id / cluster-id
+  change at commit time (restart boundary). `cluster.NewManager(nodeID,
+  clusterID)` is constructed once at boot (daemon_run.go:1868); the only
+  day-2 reconcile path, `Manager.UpdateConfig` (pkg/cluster/group_state.go),
+  reconciles ONLY redundancy groups and never re-reads m.nodeID/m.clusterID,
+  so a day-2 commit changing node-id or cluster-id was accepted + promoted
+  while the running manager kept its OLD identity (heartbeat NodeID/ClusterID,
+  RETH virtual MAC, election tie-break, FPC naming) — a silent partial no-op
+  (new identity only takes effect on restart), the same false-success class
+  #5840 fixed for the standalone<->cluster flip. Mirrored #6189/#5840's
+  fail-closed restart boundary: added sibling `clusterIdentityCommitPreflight`
+  + `errClusterIdentityRequiresRestart` sentinel in
+  cluster_topology_preflight.go, wired at the SAME 3 sites as the topology
+  gate (commitAndApply, commitConfirmedAndApply, and fail-closed in the
+  peer-sync replay syncAndApply) BEFORE store promotion / any dataplane
+  mutation. Fires only when a cluster runtime EXISTS (d.cluster != nil) AND
+  the candidate is still clustered — the standalone<->cluster flip (incl. the
+  #4179 config-less node) stays owned by clusterTopologyCommitPreflight; an
+  intra-identity edit (same node-id AND cluster-id) passes and reconciles
+  live. No legitimate boot/bootstrap path is falsely rejected (boot LOAD
+  reaches applyConfigLocked not commitAndApply; bootstrap plain commit refused
+  earlier by inBootstrap()); steady-state peer-sync passes (synced text
+  compiles for the local node → node-id resolves to this node's running id,
+  cluster-id is the shared value). Fail-on-revert test
+  TestClusterIdentityDay2ChangeRejected: neutralize by adding `return nil` at
+  the top of clusterIdentityCommitPreflight → 1 RED (assertion at
+  cluster_identity_preflight_6192_test.go:48, "node-id ... must be REJECTED"),
+  clean assertion not a build break. Validation: TMPDIR=/tmp-class
+  GOCACHE=... go build ./..., go vet ./pkg/daemon/, go test -race
+  ./pkg/daemon/... ./pkg/cluster/... all pass (initial run hit a full-/tmp
+  tmpfs — env, not a regression; re-ran on disk-backed /var/tmp, green).
+  Control-plane / unit-provable, rejection before any mutation (per #6189
+  precedent) — NO smoke.
+- **File(s)**: pkg/daemon/cluster_topology_preflight.go,
+  pkg/daemon/daemon_apply.go,
+  pkg/daemon/cluster_identity_preflight_6192_test.go (new),
+  docs/ha-no-hitless-restart.md, _Log.md
 ## 2026-07-21 — #6194 Layer-2 snapshot key-absent predicate parity
 
 - **Timestamp**: 2026-07-21

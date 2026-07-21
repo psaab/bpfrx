@@ -120,3 +120,59 @@ First-class live day-2 construction/teardown of the cluster runtime
   arming the live dataplane.
 - Intra-mode commits (desired mode matches the running runtime) are
   unaffected.
+
+## Node-id / cluster-id changes require a restart (#6192)
+
+Changing `chassis cluster node-id` or `cluster-id` on a **running
+clustered node** is a restart-boundary change of the same class as the
+standalone<->cluster flip above, for the same boot-baked-runtime reason.
+`cluster.NewManager(nodeID, clusterID)` is called **exactly once, at
+process startup** (`pkg/daemon/daemon_run.go:1868`), with the boot
+config's identity. `Manager.UpdateConfig` — the only day-2 reconcile
+path — reconciles **only the redundancy groups**
+(`pkg/cluster/group_state.go`); it never re-reads `m.nodeID` or
+`m.clusterID`. (Fabric / heartbeat-transport / control-interface
+identity *is* reconciled live — `daemon_apply.go`, #87 — so only the
+node-id / cluster-id **identity** is boot-baked.)
+
+So a day-2 commit that changes the node-id or cluster-id used to be
+accepted and promoted, while the running manager kept its **old**
+identity — heartbeat `NodeID`/`ClusterID`, the RETH virtual MAC
+(`02:bf:72:CC:RR:NN`, cluster-id + node-id derived), the election
+tie-break, and FPC/slot naming. The new identity took effect **only on
+restart**: a silent partial no-op, the same false-success the #5840
+topology gate closes for the mode flip.
+
+A live re-key of the write-once-at-boot manager is unsafe for the same
+reason #5840 declined to (de)construct it live: `d.cluster` is read bare,
+without a lifecycle lock, from many sites, and its identity feeds the
+heartbeat writer, the RETH MAC, and the election already running under
+other goroutines. Instead, `clusterIdentityCommitPreflight` **rejects the
+identity change before any store promotion or dataplane mutation** — wired
+into `commitAndApply` / `commitConfirmedAndApply` beside the topology
+gate, and fail-closed in the peer-sync replay path `syncAndApply` — and
+directs the operator to restart `xpfd` into the new cluster identity (or
+make the change with the system offline). The gate fires only when a
+cluster runtime exists (`d.cluster != nil`) **and** the candidate is still
+clustered; the standalone<->cluster flip (either direction, including the
+#4179 config-less node) stays owned by `clusterTopologyCommitPreflight`.
+An **intra-identity** edit (same node-id **and** cluster-id — a
+redundancy-group / interface / policy change) passes untouched and
+reconciles live.
+
+### Acceptance criteria (identity change, #6192)
+
+- A day-2 commit that changes `chassis cluster node-id` or `cluster-id`
+  on a running clustered node (`d.cluster != nil`) is rejected with a
+  restart-required diagnostic before store promotion; the candidate is
+  not promoted.
+- An intra-identity commit (same node-id and cluster-id) is unaffected.
+- The standalone<->cluster transition remains owned by the #5840
+  topology gate; the identity gate is a no-op when there is no running
+  manager or the candidate is standalone.
+- No legitimate boot/bootstrap or steady-state peer-sync path is falsely
+  rejected: the boot LOAD reaches `applyConfigLocked` (not
+  `commitAndApply`), a bootstrap plain commit is refused earlier by
+  `inBootstrap()`, and a synced commit compiles for the local node so
+  node-id resolves to this node's running id and cluster-id is the shared
+  value.
