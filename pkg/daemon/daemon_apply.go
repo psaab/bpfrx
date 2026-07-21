@@ -392,7 +392,20 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 	// the commit conflicts and re-validates. Plain commit has no auto-rollback
 	// target, so the pre-flight passes nil.
 	oldActive, compiled, err := d.commitWithGenBinding(
-		func(cand *config.Config) error { return d.deviceMapCommitPreflight(cand, nil) },
+		func(cand *config.Config) error {
+			// #5840: reject a standalone<->cluster topology change BEFORE store
+			// promotion + any dataplane mutation — the boot-only cluster runtime
+			// cannot be constructed/torn down live. Runs first (no hardware probe)
+			// so a doomed transition fails cheaply. The gate keys on the ACTUAL
+			// HA runtime (d.cluster != nil, boot-only and stable under the held
+			// applySem), not the old config — so a #4179 config-less node (nil
+			// active, nil runtime) adding cluster is REJECTED, not silently
+			// half-applied.
+			if terr := clusterTopologyCommitPreflight(d.cluster != nil, cand); terr != nil {
+				return terr
+			}
+			return d.deviceMapCommitPreflight(cand, nil)
+		},
 		func(gen uint64) (*config.Config, error) { return d.store.CommitWithDescriptionGen(comment, gen) },
 	)
 	if err != nil {
@@ -530,6 +543,30 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		return compiled, nil
 	}
 
+	// #5840: fail closed on a peer-synced standalone<->cluster topology
+	// transition. SyncApply above has already promoted the peer config to
+	// active (the store converges with the peer — no divergence, matching the
+	// device-map passive-admission philosophy below), but the boot-only cluster
+	// runtime cannot be constructed/torn down live (see
+	// clusterTopologyCommitPreflight). Arming the dataplane under the
+	// transitioned config would publish clustered forwarding semantics
+	// (clusterHA=true) with no election/watchdog runtime — a persistent transit
+	// drop — or tear HA down live. Return BEFORE applyConfigLocked so the live
+	// dataplane is never mutated; a restart re-applies the now-active config
+	// correctly through the boot path. armedActive is never set, so no session
+	// invalidation runs. Keyed on the ACTUAL HA runtime (d.cluster != nil): a
+	// node with no HA runtime (nil d.cluster — a divergent/config-less replay
+	// target) receiving a clustered config is rejected, not armed with
+	// clusterHA=true against a nil runtime. (Unreachable in a healthy cluster —
+	// both members are already clustered and a node with no HA runtime has no
+	// session-sync receiver — but a defense-in-depth backstop.)
+	if terr := clusterTopologyCommitPreflight(d.cluster != nil, compiled); terr != nil {
+		slog.Error("cluster: refusing to apply a peer-synced standalone<->cluster "+
+			"topology transition live; a restart is required to (de)construct the "+
+			"HA runtime", "err", terr)
+		return nil, terr
+	}
+
 	// #5564: SyncApply (above) has ALREADY promoted the peer config to active,
 	// and once applyConfigLocked arms the dataplane snapshot this node is
 	// forwarding under it. The three session invalidators
@@ -650,6 +687,14 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 	// only under d.applySem, held here from pre-flight through the commit.
 	oldActive, compiled, err := d.commitWithGenBinding(
 		func(cand *config.Config) error {
+			// #5840: same standalone<->cluster topology guard as commitAndApply,
+			// keyed on the ACTUAL HA runtime (d.cluster != nil), not the old
+			// config. The rollback target on a confirm timeout is the current
+			// active config, so a rejected transition is not confirmable either —
+			// reject it up front while the operator is still connected.
+			if terr := clusterTopologyCommitPreflight(d.cluster != nil, cand); terr != nil {
+				return terr
+			}
 			return d.deviceMapCommitPreflight(cand, d.store.ActiveConfig())
 		},
 		func(gen uint64) (*config.Config, error) { return d.store.CommitConfirmedGen(minutes, gen) },
