@@ -931,6 +931,45 @@ fn forwarding_caps() -> UserspaceCapabilities {
     }
 }
 
+/// A zoned, non-tunnel DATA interface — the binding-plan candidate the
+/// tunnel helper is NOT. `include_userspace_binding_interface` admits it
+/// (non-empty data zone, non-tunnel, `ge-*` name), so `replan_queues`
+/// plans exactly one worker for it (rx_queues=1 -> queue_count=1, ifindex>0
+/// -> registered). Changing `name`/`linux_name`/`ifindex` between two
+/// snapshots therefore CHANGES the binding plan key, selecting the
+/// FULL-APPLY leg (not the address-only same-plan leg the tunnel helper
+/// drives). A valid inet address keeps the pre-teardown forwarding build
+/// green so the reconcile REACHES the post-teardown worker spawn.
+fn data_iface_6140(name: &str, linux_name: &str, ifindex: i32) -> crate::protocol::snapshot::InterfaceSnapshot {
+    crate::protocol::snapshot::InterfaceSnapshot {
+        name: name.to_string(),
+        linux_name: linux_name.to_string(),
+        zone: "trust".to_string(),
+        ifindex,
+        rx_queues: 1,
+        hardware_addr: "02:00:00:00:00:01".to_string(),
+        addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "10.0.1.1/24".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// The `trust` zone the data interface references. The forwarding build
+/// REFUSES an interface whose zone is absent from the zone table (it will
+/// not fail open by collapsing to the unknown zone 0), so the snapshot must
+/// declare it for the pre-teardown build to succeed and the reconcile to
+/// reach the worker spawn.
+fn trust_zone_6140() -> crate::protocol::snapshot::ZoneSnapshot {
+    crate::protocol::snapshot::ZoneSnapshot {
+        name: "trust".to_string(),
+        id: 1,
+        ..Default::default()
+    }
+}
+
 /// A tunnel interface is excluded from the binding plan, so applies that
 /// differ only in this interface's ADDRESS share a plan key. `address`
 /// controls whether the forwarding build succeeds ("10.0.0.1/24") or fails
@@ -1244,6 +1283,192 @@ fn post_teardown_spawn_failure_fails_closed_no_persist_4952() {
             .starts_with("spawn_worker_failed:"),
         "the spawn-failure stage must be preserved (not overwritten with spawned:..), got {:?}",
         guard.afxdp.last_reconcile_stage
+    );
+
+    let _ = std::fs::remove_file(&state_file);
+}
+
+/// #6140 (test-coverage follow-up to #4952): a dedicated regression for the
+/// FULL-APPLY leg (`handlers/snapshot.rs` else branch, ~:341-369), the
+/// PLAN-CHANGE path. The merged #4952 gates cover the coordinator
+/// (`reconcile_post_teardown_worker_spawn_failure_fails_closed_4952`) and the
+/// SAME-PLAN-needs_reconcile handler leg
+/// (`post_teardown_spawn_failure_fails_closed_no_persist_4952`, ~:208). The
+/// full-apply arm's WorkerSpawn handling (~:342-369) was covered only
+/// TRANSITIVELY — verified equivalent to the same-plan arm by inspection, but
+/// with no test asserting the full-apply leg SPECIFICALLY fails closed. This
+/// closes that gap.
+///
+/// The two legs are selected by the binding PLAN KEY: same key -> same-plan
+/// leg; changed key -> full-apply leg. This test installs a prior snapshot
+/// whose sole binding interface (`ge-0/0/1`, ifindex 11) differs from the new
+/// snapshot's (`ge-0/0/2`, ifindex 12), so `snapshot_binding_plan_key` differs
+/// and `same_plan` is FALSE — the else full-apply branch runs `replan_queues`
+/// (installing the NEW interface as the binding set), then
+/// `reconcile_status_bindings` -> `afxdp.reconcile`. All mandatory pins open
+/// and the address parses, so the reconcile clears the pre-teardown integrity
+/// legs, tears down, and REACHES the fallible worker spawn. The
+/// `force_worker_spawn_fail` seam forces that (unprovokable in-process)
+/// EAGAIN/ENOMEM, leaving the queue set with NO XSK-bound worker.
+///
+/// The full-apply WorkerSpawn arm MUST: (a) report ok=false with a descriptive
+/// error, (b) NOT persist the broken snapshot as the boot baseline
+/// (persist_state stays false -> the state file is never written), (c) roll
+/// the in-memory baseline back to the prior good snapshot + status generation
+/// (guard.snapshot gen 1, last_snapshot/fib_generation 1), and (d) preserve the
+/// coordinator's `spawn_worker_failed:..` stage (NOT overwritten with
+/// `spawned:..`).
+///
+/// LEG PROOF: two observables pin this to the full-apply leg, not same-plan.
+/// (1) `same_binding_plan(prior, next)` is asserted FALSE up front — the
+/// handler's `same_plan` gate reads exactly that key, so a false key forces
+/// the else branch. (2) The full-apply leg is the ONLY leg that runs
+/// `replan_queues`, which rewrites `status.bindings` to the NEW snapshot's
+/// interface; the WorkerSpawn arm deliberately does NOT restore
+/// `existing_bindings`, so after the failure the surviving binding carries
+/// `ge-0-0-2`/ifindex 12 (the new plan), which the same-plan leg — never
+/// calling `replan_queues` — could not produce.
+///
+/// Fail-on-revert: neutralize the full-apply WorkerSpawn arm (drop the
+/// ok=false + no-persist + baseline-rollback so it falls through to
+/// refresh_status + persist_state=true with ok=true, exactly as pre-#4952
+/// `bring_up_workers` swallowed the spawn error). Assertions (a)/(b)/(c)/(d)
+/// all flip as ASSERTION failures.
+#[test]
+fn full_apply_post_teardown_spawn_failure_fails_closed_no_persist_6140() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    // Prior snapshot: one binding interface (ge-0/0/1, ifindex 11). NOT
+    // deferred — a normal prior apply. Its only role here is to make
+    // guard.snapshot Some with a DISTINCT plan key.
+    let prior = ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 1,
+        fib_generation: 1,
+        generated_at: chrono::Utc::now(),
+        defer_workers: false,
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![data_iface_6140("ge-0/0/1", "ge-0-0-1", 11)],
+        zones: vec![trust_zone_6140()],
+        ..ConfigSnapshot::default()
+    };
+
+    // New apply: a DIFFERENT binding interface (ge-0/0/2, ifindex 12) -> the
+    // plan key changes -> the full-apply (non-same-plan) leg is taken.
+    let next = ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 2,
+        fib_generation: 2,
+        generated_at: chrono::Utc::now(),
+        defer_workers: false,
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![data_iface_6140("ge-0/0/2", "ge-0-0-2", 12)],
+        zones: vec![trust_zone_6140()],
+        ..ConfigSnapshot::default()
+    };
+
+    // LEG PROOF (1): a differing plan key is precisely what selects the
+    // full-apply leg. `same_plan` in the handler reads this same key.
+    assert!(
+        !super::helpers::same_binding_plan(&prior, &next),
+        "the prior/new binding plan keys MUST differ so the handler takes the \
+         full-apply (non-same-plan) leg"
+    );
+
+    // Armed + supported so `should_run_afxdp` holds and the reconcile takes
+    // the real afxdp.reconcile path (not the disarmed stop arm).
+    let status = ProcessStatus {
+        forwarding_armed: true,
+        capabilities: forwarding_caps(),
+        last_snapshot_generation: 1,
+        last_fib_generation: 1,
+        ..ProcessStatus::default()
+    };
+
+    let state = Arc::new(Mutex::new(ServerState {
+        status,
+        snapshot: Some(prior),
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }));
+
+    // Force the single planned worker's spawn to fail on the post-teardown
+    // path (the destructive step the fix guards).
+    state.lock().expect("state").afxdp.force_worker_spawn_fail = 1;
+
+    let mut request = req("apply_snapshot");
+    request.snapshot = Some(next);
+
+    let state_file = unique_state_file("full_apply_spawn_fail_6140");
+    assert!(
+        !std::path::Path::new(&state_file).exists(),
+        "precondition: state file must not exist before the request"
+    );
+
+    let response = run_request_on_file(state.clone(), request, &state_file);
+
+    // (a) fail closed with a non-empty, descriptive error.
+    assert!(
+        !response.ok,
+        "a post-teardown worker-spawn failure on the full-apply leg must report ok=false"
+    );
+    assert!(
+        !response.error.is_empty() && response.error.contains("worker spawn failed"),
+        "unexpected error: {}",
+        response.error
+    );
+
+    // (b) persist_state was NOT set -> the state file was never written.
+    assert!(
+        !std::path::Path::new(&state_file).exists(),
+        "a full-apply post-teardown spawn failure must NOT persist the broken snapshot"
+    );
+
+    let guard = state.lock().expect("state");
+    // (c) the prior (gen 1) snapshot is still the boot baseline; the reported
+    // generation rolled back.
+    assert_eq!(
+        guard.snapshot.as_ref().map(|s| s.generation),
+        Some(1),
+        "the rejected snapshot must not overwrite the persisted baseline"
+    );
+    assert_eq!(
+        guard.snapshot.as_ref().map(|s| s.interfaces[0].linux_name.as_str()),
+        Some("ge-0-0-1"),
+        "the prior snapshot (ge-0-0-1) must be restored intact as the baseline"
+    );
+    assert_eq!(
+        guard.status.last_snapshot_generation, 1,
+        "rejected full-apply must not bump last_snapshot_generation"
+    );
+    assert_eq!(
+        guard.status.last_fib_generation, 1,
+        "rejected full-apply must not bump last_fib_generation"
+    );
+    // (d) last_reconcile_stage retains the spawn_worker_failed descriptor.
+    assert!(
+        guard
+            .afxdp
+            .last_reconcile_stage
+            .starts_with("spawn_worker_failed:"),
+        "the spawn-failure stage must be preserved (not overwritten with spawned:..), got {:?}",
+        guard.afxdp.last_reconcile_stage
+    );
+    // LEG PROOF (2): only the full-apply leg runs replan_queues, which
+    // rewrites status.bindings to the NEW snapshot's interface. The
+    // WorkerSpawn arm does NOT restore existing_bindings, so the surviving
+    // binding carries the new plan (ge-0-0-2 / ifindex 12) — an outcome the
+    // same-plan leg (never calling replan_queues) cannot produce.
+    assert_eq!(guard.status.bindings.len(), 1, "one worker was planned");
+    assert_eq!(
+        guard.status.bindings[0].interface, "ge-0-0-2",
+        "the full-apply leg must have replanned onto the NEW snapshot's interface"
+    );
+    assert_eq!(
+        guard.status.bindings[0].ifindex, 12,
+        "the replanned binding must carry the new interface's ifindex"
     );
 
     let _ = std::fs::remove_file(&state_file);
