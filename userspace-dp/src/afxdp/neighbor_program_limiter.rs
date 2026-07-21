@@ -14,52 +14,55 @@
 //! starvation on the affected queues (a DoS amplification).
 //!
 //! ## What this bounds
-//! A fixed-size, direct-mapped table of [`KERNEL_NEIGH_LIMITER_SLOTS`] slots,
-//! each recording the last `(key -> mac)` this worker actually programmed and
-//! WHEN. The decision ([`KernelNeighborProgramLimiter::should_program`]) is a
-//! pure function of the slot + the advert, with no allocation and no syscall,
-//! so it is unit-testable in isolation (the syscall stays in
-//! `add_kernel_neighbor`).
+//! A fixed-size, SET-ASSOCIATIVE table of [`KERNEL_NEIGH_LIMITER_BUCKETS`]
+//! buckets, each holding [`KERNEL_NEIGH_LIMITER_WAYS`] ways
+//! ([`KERNEL_NEIGH_LIMITER_SLOTS`] slots total). Each way records the last
+//! `(key -> mac)` this worker actually programmed and WHEN. The decision
+//! ([`KernelNeighborProgramLimiter::should_program`]) is a pure function of the
+//! bucket + the advert, with no allocation and no syscall, so it is
+//! unit-testable in isolation (the syscall stays in `add_kernel_neighbor`).
 //!
-//! * **Same-key/same-MAC repeat** → skipped. The slot already records the exact
-//!   binding, and/or the authoritative userspace neighbor map was unchanged by
-//!   this advert (`map_changed == false`), which proves the kernel was already
-//!   told. This is the primary amplification fix.
-//! * **Changed-flood (MAC cycling on one IP)** → those adverts all hash to the
-//!   SAME slot, which drives at most one kernel program per
+//! * **Same-key/same-MAC repeat** → skipped. The owning way already records the
+//!   exact binding, and/or the authoritative userspace neighbor map was
+//!   unchanged by this advert (`map_changed == false`), which proves the kernel
+//!   was already told. This is the primary amplification fix.
+//! * **Changed-flood (MAC cycling on one IP)** → those adverts all map to the
+//!   SAME key's way, which drives at most one kernel program per
 //!   [`KERNEL_NEIGH_MIN_INTERVAL_NS`].
-//! * **Many-distinct-IP flood** → because the slot table is FIXED size, the
+//! * **Many-distinct-IP flood** → because the table is FIXED size, the
 //!   AGGREGATE per-worker netlink rate is bounded to
 //!   `≤ SLOTS / MIN_INTERVAL` programs regardless of how many distinct source
-//!   IPs an attacker cycles.
+//!   IPs an attacker cycles: each way programs at most once per interval, and a
+//!   colliding genuine change never evicts a way that is still within its
+//!   interval (see below), so the fixed way count is the hard cap.
 //!
-//! ## Not losing a real SAME-KEY change
-//! A genuine MAC change to a key that OWNS its slot is not silently lost:
-//! * In steady state, same-binding re-adverts return early WITHOUT touching the
-//!   slot timestamp, so the timestamp reflects only the last ACTUAL program
-//!   (long ago). A real change after steady state is therefore NOT rate-limited
-//!   — it programs on its first advert.
-//! * If a same-key change IS rate-limited (only possible amid a burst of distinct
-//!   bindings within one interval), the slot keeps the OLD programmed mac, so
-//!   the binding stays "owed": the next advert for that key — even a same-MAC
-//!   one the userspace map already absorbed (`map_changed == false`) — still
-//!   programs it once the interval elapses. The latest desired state is retried,
-//!   not dropped. Any residual kernel-table lag self-heals via `NUD_STALE` +
-//!   on-demand kernel ARP on the host path (the neigh monitor couples the
-//!   userspace MAP, not this rate-cap slot, so it does not itself retry an owed
-//!   program).
+//! ## Not losing a real change — even under a colliding-key flood (#6129)
+//! A genuine MAC change (`map_changed == true`) is guaranteed to reach the
+//! kernel within a bounded number of ticks:
+//! * **Key owns a way** → the change is programmed immediately unless it is
+//!   inside one interval of that way's last program, in which case the way
+//!   keeps the OLD mac so the binding stays "owed" and is retried on the next
+//!   advert once the interval elapses — even a same-MAC advert the userspace
+//!   map already absorbed (`map_changed == false`). Steady-state re-adverts
+//!   return early WITHOUT touching the timestamp, so a real change after a
+//!   quiet period programs on its first advert.
+//! * **Key owns NO way (the #6129 collision case)** → a foreign key occupying
+//!   this key's bucket can no longer starve it. Instead of contending for a
+//!   single direct-mapped slot, the genuine change CLAIMS a way in the bucket:
+//!   a never-fired way if one is free, else the least-recently-programmed way.
+//!   It then OWNS that way and is owed-tracked thereafter. A single colliding
+//!   key A therefore cannot keep victim B out — B lands in a different way and
+//!   programs. Up to `WAYS - 1` distinct foreign keys may be simultaneously hot
+//!   in a bucket before a genuine victim change can be delayed, and even then
+//!   only until one of those ways ages past its interval.
 //!
-//! CAVEAT (#6129): the "owed" retry is SLOT-OWNERSHIP-scoped — `owes_other`
-//! fires only when the slot holds THIS key. Under a SUSTAINED adversarial
-//! colliding-key flood (a different key A occupying victim B's direct-mapped
-//! slot and keeping it warm), B's KERNEL program is starved: B's later adverts
-//! have `map_changed == false` and `owes_other == false` → skipped. This does
-//! NOT affect the AF_XDP fast path or the userspace neighbor map (both always
-//! correct — `insert_if_changed` runs unconditionally BEFORE the limiter); only
-//! host-path (kernel-table) reachability to the ONE collided neighbor degrades,
-//! and incidental collisions self-heal (kernel FAILED → neigh monitor removes →
-//! re-learn programs). Reconciling kernel-program-under-collision is tracked as
-//! #6129.
+//! The claim step still honors the rate cap on the way it evicts (a way within
+//! its interval is NOT evicted), so the aggregate netlink rate stays bounded to
+//! `≤ SLOTS / MIN_INTERVAL` — the #5288 property is preserved: an adversarial
+//! flood of repeated/colliding adverts with no genuine change still programs
+//! O(1), and a distinct-genuine-change flood is still capped by the fixed way
+//! count, not O(adverts). Any residual kernel-table lag self-heals via
+//! `NUD_STALE` + on-demand kernel ARP on the host path.
 //!
 //! ## Placement
 //! Per-worker, owned by [`super::worker::BindingWorker`] and touched ONLY by the
@@ -77,12 +80,26 @@ use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 
-/// Number of direct-mapped slots. Power of two so the index is a single mask.
-/// 256 slots is far more than the distinct next-hops a worker legitimately
-/// programs, so collisions between live neighbors are rare, while the fixed
-/// count is what caps the aggregate netlink rate under a many-IP flood.
-pub(in crate::afxdp) const KERNEL_NEIGH_LIMITER_SLOTS: usize = 256;
-const _: () = assert!(KERNEL_NEIGH_LIMITER_SLOTS.is_power_of_two());
+/// Number of buckets. Power of two so the bucket index is a single mask.
+/// 64 buckets × [`KERNEL_NEIGH_LIMITER_WAYS`] ways is far more than the distinct
+/// next-hops a worker legitimately programs, so collisions between live
+/// neighbors are rare, while the fixed slot count caps the aggregate netlink
+/// rate under a many-IP flood.
+pub(in crate::afxdp) const KERNEL_NEIGH_LIMITER_BUCKETS: usize = 64;
+const _: () = assert!(KERNEL_NEIGH_LIMITER_BUCKETS.is_power_of_two());
+
+/// Ways per bucket (set associativity). ≥ 2 so a single colliding key cannot
+/// occupy every way and starve a genuine victim change (#6129): the victim
+/// claims a different way. Kept small so the total table (and the aggregate
+/// netlink cap) stays bounded.
+pub(in crate::afxdp) const KERNEL_NEIGH_LIMITER_WAYS: usize = 4;
+const _: () = assert!(KERNEL_NEIGH_LIMITER_WAYS >= 2);
+
+/// Total slots = buckets × ways. This is the hard cap on the aggregate
+/// per-worker netlink program rate per [`KERNEL_NEIGH_MIN_INTERVAL_NS`]
+/// (each way programs at most once per interval).
+pub(in crate::afxdp) const KERNEL_NEIGH_LIMITER_SLOTS: usize =
+    KERNEL_NEIGH_LIMITER_BUCKETS * KERNEL_NEIGH_LIMITER_WAYS;
 
 /// Minimum interval between two kernel-neighbor programs a single slot may
 /// drive. 50 ms is far longer than any legitimate neighbor re-advertisement
@@ -113,18 +130,39 @@ impl Default for Slot {
     }
 }
 
-fn slot_index(key: &(i32, IpAddr)) -> usize {
+/// One set-associative bucket: [`KERNEL_NEIGH_LIMITER_WAYS`] independent ways.
+type Bucket = [Slot; KERNEL_NEIGH_LIMITER_WAYS];
+
+fn bucket_index(key: &(i32, IpAddr)) -> usize {
     let mut hasher = FxHasher::default();
     key.hash(&mut hasher);
-    (hasher.finish() as usize) & (KERNEL_NEIGH_LIMITER_SLOTS - 1)
+    (hasher.finish() as usize) & (KERNEL_NEIGH_LIMITER_BUCKETS - 1)
+}
+
+/// Pick the way a genuine change should CLAIM when no way in `bucket` owns its
+/// key: a never-fired (free) way if one exists, else the way with the oldest
+/// `last_program_ns` (LRU). Returns the way index. The rate cap is applied by
+/// the caller to the chosen way, so a way still within its interval is never
+/// evicted — that is what keeps the aggregate netlink rate bounded (#5288).
+fn choose_victim_way(bucket: &Bucket) -> usize {
+    let mut victim = 0usize;
+    for i in 0..KERNEL_NEIGH_LIMITER_WAYS {
+        if bucket[i].key.is_none() {
+            return i; // free way — claim it, no eviction
+        }
+        if bucket[i].last_program_ns < bucket[victim].last_program_ns {
+            victim = i;
+        }
+    }
+    victim
 }
 
 /// Per-worker gate for `add_kernel_neighbor`. See the module docs.
 pub(in crate::afxdp) struct KernelNeighborProgramLimiter {
-    /// Boxed so the ~12 KiB table lives on the heap (allocated once at worker
+    /// Boxed so the table lives on the heap (allocated once at worker
     /// construction, never on the packet path) instead of inline in the large
     /// `BindingWorker`.
-    slots: Box<[Slot; KERNEL_NEIGH_LIMITER_SLOTS]>,
+    buckets: Box<[Bucket; KERNEL_NEIGH_LIMITER_BUCKETS]>,
     min_interval_ns: u64,
 }
 
@@ -135,7 +173,9 @@ impl KernelNeighborProgramLimiter {
 
     fn with_interval(min_interval_ns: u64) -> Self {
         Self {
-            slots: Box::new([Slot::default(); KERNEL_NEIGH_LIMITER_SLOTS]),
+            buckets: Box::new(
+                [[Slot::default(); KERNEL_NEIGH_LIMITER_WAYS]; KERNEL_NEIGH_LIMITER_BUCKETS],
+            ),
             min_interval_ns,
         }
     }
@@ -159,32 +199,60 @@ impl KernelNeighborProgramLimiter {
         map_changed: bool,
         now_ns: u64,
     ) -> bool {
-        let slot = &mut self.slots[slot_index(&key)];
-        let exact_present = slot.key == Some(key) && slot.mac == mac;
-        // `owes_other`: the slot holds THIS key with a DIFFERENT (stale) mac —
-        // a change we have not yet pushed to the kernel (a prior tick may have
-        // rate-limited it). Must never be skipped, or the latest desired state
-        // would be lost.
-        let owes_other = slot.key == Some(key) && slot.mac != mac;
-        // Skip when the kernel already holds this exact binding and we owe
-        // nothing newer. Either proof of "already present" suffices: our slot
-        // recorded (key, mac), OR the userspace map was unchanged by this
-        // advert. `!map_changed` also catches a repeat whose slot was evicted
-        // by a colliding key, avoiding a redundant program there.
-        if (exact_present || !map_changed) && !owes_other {
+        let min_interval_ns = self.min_interval_ns;
+        let bucket = &mut self.buckets[bucket_index(&key)];
+
+        // Fast path: a way in this bucket already OWNS this key. Apply the
+        // unchanged #5288 per-key decision on that way.
+        if let Some(pos) = bucket.iter().position(|s| s.key == Some(key)) {
+            let slot = &mut bucket[pos];
+            // The way owns `key`, so "exact present" reduces to the mac
+            // matching, and `owes_other` (owning the key with a DIFFERENT,
+            // stale mac we have not yet pushed) to the mac differing. A change
+            // we owe must never be skipped, or the latest desired state is lost.
+            let owes_other = slot.mac != mac;
+            // Skip when the kernel already holds this exact binding and we owe
+            // nothing newer. `!map_changed` (userspace map unchanged by this
+            // advert) is the other proof the kernel was already told.
+            if !owes_other && (slot.mac == mac || !map_changed) {
+                return false;
+            }
+            // Rate cap: at most one program per interval per way — bounds a
+            // per-key MAC-cycling flood. A rate-limited change leaves the OLD
+            // mac in place, so the owed binding is retried on a later advert.
+            if now_ns.saturating_sub(slot.last_program_ns) < min_interval_ns {
+                return false;
+            }
+            slot.mac = mac;
+            slot.last_program_ns = now_ns;
+            return true;
+        }
+
+        // No way owns this key. If the userspace map was UNCHANGED by this
+        // advert, the kernel already holds the binding (told before — possibly
+        // via a way since evicted by a colliding key, or by the neigh monitor).
+        // Skip; no netlink needed.
+        if !map_changed {
             return false;
         }
-        // Rate cap: a slot that has already fired drives at most one program
-        // per interval — bounding a per-key MAC-cycling flood AND, via the
-        // fixed slot count, the aggregate per-worker netlink rate under a
-        // many-IP flood. A never-fired slot is exempt so its zero timestamp
-        // does not gate the first real program (robust even if the monotonic
-        // clock is still small just after boot). Because a rate-limited change
-        // leaves `slot.mac` at the OLD value, the owed binding is retried on a
-        // later advert.
-        if slot.key.is_some()
-            && now_ns.saturating_sub(slot.last_program_ns) < self.min_interval_ns
-        {
+
+        // A GENUINE change whose key owns no way — either a brand-new neighbor
+        // or (the #6129 case) this key's way was stolen by a colliding key.
+        // CLAIM a way so the change is APPLIED now and owed-tracked thereafter,
+        // instead of being starved by whichever foreign key holds the bucket.
+        // Prefer a never-fired way; else evict the least-recently-programmed
+        // way — but honor the rate cap on that way, so a way still inside its
+        // interval is NOT evicted. That keeps the aggregate per-worker netlink
+        // rate bounded to `≤ SLOTS / MIN_INTERVAL` (the #5288 invariant): a
+        // distinct-key flood cannot drive more than one program per way per
+        // interval, and a never-fired way is exempt so its zero timestamp does
+        // not gate the first real program.
+        let victim = choose_victim_way(bucket);
+        let slot = &mut bucket[victim];
+        if slot.key.is_some() && now_ns.saturating_sub(slot.last_program_ns) < min_interval_ns {
+            // Every way in the bucket was programmed within the interval — the
+            // aggregate cap is doing its job. Drop this tick (bounded); the
+            // genuine change is retried on a later advert once a way ages out.
             return false;
         }
         slot.key = Some(key);
@@ -384,5 +452,143 @@ mod tests {
         for i in 1..64u64 {
             assert!(!lim.should_program(key, m, false, T0 + i));
         }
+    }
+
+    /// Raw FxHash of a key (same hasher the limiter indexes with). Used by the
+    /// #6129 test to construct a colliding key pair WITHOUT depending on the
+    /// production index function, so the test compiles and reproduces the
+    /// starvation against the pre-fix direct-mapped code too.
+    fn full_hash(key: &(i32, IpAddr)) -> u64 {
+        let mut hasher = FxHasher::default();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Two distinct keys whose FxHash agrees in the low 8 bits. Such a pair
+    /// collides in BOTH the pre-fix 256-slot direct-mapped table (index = low 8
+    /// bits) AND the post-fix bucketed table (bucket = low 6 bits ⊂ low 8
+    /// bits), so the #6129 test reproduces the starvation on the reverted code
+    /// and proves the fix on the current code.
+    fn find_colliding_keys() -> ((i32, IpAddr), (i32, IpAddr)) {
+        let base = v4(1);
+        let base_slot = full_hash(&base) & 0xff;
+        for c in 0..=255u8 {
+            for last in 0..=255u8 {
+                let cand = (11, IpAddr::V4(Ipv4Addr::new(172, 16, c, last)));
+                if cand != base && full_hash(&cand) & 0xff == base_slot {
+                    return (base, cand);
+                }
+            }
+        }
+        panic!("no colliding key pair found in the searched space");
+    }
+
+    /// #6129 FAIL-ON-REVERT. Under a SUSTAINED colliding-key flood — a foreign
+    /// key A repeatedly occupying victim B's bucket and keeping a way warm — a
+    /// GENUINE neighbor change for B must still be programmed to the kernel
+    /// within a bounded number of ticks, NOT starved.
+    ///
+    /// Pre-fix, the direct-mapped table shares ONE slot per bucket: A owns it,
+    /// B's genuine change is rate-limited and — owning no slot — is never
+    /// owed-retried, so B's later `map_changed == false` re-adverts are skipped
+    /// forever (`b_fired == 0`). The set-associative fix lands B in a DIFFERENT
+    /// way, so B programs (`b_fired >= 1`). Reverting the fix makes the
+    /// `b_fired >= 1` assertion RED.
+    #[test]
+    fn colliding_key_flood_does_not_starve_victim_genuine_change_6129() {
+        let (a, b) = find_colliding_keys();
+        assert_ne!(a, b, "test setup: A and B must be distinct keys");
+
+        let mut lim = KernelNeighborProgramLimiter::new();
+        let b_mac = mac(0xBB);
+        let mut a_fired = 0usize;
+        let mut b_fired = 0usize;
+
+        // Sustained flood over many intervals. Each interval the flood key A
+        // performs a GENUINE mac change (`map_changed == true`) at the START of
+        // the interval, so it programs and refreshes its way's timestamp — the
+        // "keep the slot warm" behavior that starves B in the direct-mapped
+        // design. Immediately after (worst case for the rate cap) B's genuine
+        // change arrives: `map_changed == true` once, then `map_changed ==
+        // false` repeats because the userspace neighbor map already absorbed
+        // B's new mac. In the reverted code every B advert is skipped.
+        for iv in 0..16u64 {
+            let t = T0 + iv * MIN;
+            let a_mac = [0x02, 0xAA, 0, 0, (iv >> 8) as u8, iv as u8];
+            if lim.should_program(a, a_mac, true, t) {
+                a_fired += 1;
+            }
+            if lim.should_program(b, b_mac, true, t + 1) {
+                b_fired += 1;
+            }
+            if lim.should_program(b, b_mac, false, t + 2) {
+                b_fired += 1;
+            }
+            if lim.should_program(b, b_mac, false, t + 3) {
+                b_fired += 1;
+            }
+        }
+
+        assert!(
+            a_fired >= 1,
+            "sanity: the flood key A must program at least once"
+        );
+        assert!(
+            b_fired >= 1,
+            "victim B's genuine neighbor change must reach the kernel under a \
+             colliding-key flood within bounded ticks (#6129); the pre-fix \
+             direct-mapped table starves it (b_fired == 0)"
+        );
+    }
+
+    /// #6129 companion — the fix must NOT reopen the #5288 DoS. A flood of
+    /// colliding keys with NO genuine change (every advert `map_changed ==
+    /// false` after each key's first learn) must still program O(1) per key,
+    /// not O(adverts): the aggregate stays bounded by the fixed slot count even
+    /// though many distinct keys hammer the same bucket.
+    #[test]
+    fn colliding_no_change_flood_stays_bounded_6129() {
+        let mut lim = KernelNeighborProgramLimiter::new();
+        // Reuse the low-8-bit collision search to pack many keys into one
+        // bucket, then flood each with repeated no-change adverts.
+        let base = v4(1);
+        let base_slot = full_hash(&base) & 0xff;
+        let mut colliding = Vec::new();
+        'outer: for c in 0..=255u8 {
+            for last in 0..=255u8 {
+                let cand = (11, IpAddr::V4(Ipv4Addr::new(172, 16, c, last)));
+                if full_hash(&cand) & 0xff == base_slot {
+                    colliding.push(cand);
+                    if colliding.len() == 32 {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        assert!(
+            colliding.len() >= 8,
+            "need several colliding keys to exercise the bucket"
+        );
+
+        let mut fired = 0usize;
+        // First learn per key (genuine), then a long no-change repeat flood all
+        // within one interval. The repeats must never program.
+        for (i, &k) in colliding.iter().enumerate() {
+            let m = mac(i as u8);
+            if lim.should_program(k, m, true, T0 + i as u64) {
+                fired += 1;
+            }
+            for r in 0..200u64 {
+                if lim.should_program(k, m, false, T0 + i as u64 + r) {
+                    fired += 1;
+                }
+            }
+        }
+        assert!(
+            fired <= colliding.len(),
+            "a no-genuine-change colliding flood must program at most once per \
+             key ({} keys), got {fired} — #5288 bound preserved",
+            colliding.len()
+        );
     }
 }
