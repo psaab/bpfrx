@@ -1047,33 +1047,140 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 // identifies.
 //
 // The steps mirror applyTailReconciles' step 9.5–13 order exactly. Both nft
-// applies fail closed (#3392/#3333) and their errors are returned; the
-// login/credential reconciles (including applyRootAuth, the SOLE manager of
-// root's /etc/shadow password and /root/.ssh/authorized_keys) are best-effort
-// voids there and stay so here. The whole closeout is bounded (two atomic nft
-// loads + local file reconciles, no FRR/netlink reload), so it is safe to run
-// non-cancellably on the daemon-stop path.
+// applies fail closed (#3392/#3333). #5874: the login/credential reconcilers
+// (applySystemLogin, reconcileSudoers, reconcileAbsentLoginUsers, applySSHConfig
+// and applyRootAuth — the SOLE manager of root's /etc/shadow password and
+// /root/.ssh/authorized_keys) were previously best-effort VOIDS here, so a
+// failure to reconcile a credential to the cancelled/target state was silently
+// DISCARDED and the cancel reported clean. They now return their accumulated
+// failures, this closeout COLLECTS a per-owner outcome and SURFACES every
+// failure, and the "bounded" claim is now an ENFORCED wall-clock budget
+// (hostAuthCloseoutBudget) rather than an unbounded best-effort sequence: a
+// wedged reconciler is reported timed-out instead of hanging the daemon-stop
+// path. Still safe to run non-cancellably — no FRR/netlink reload.
+
+// hostAuthOwner is one security-critical host-authorization reconciler run by
+// the #5643/M35 cancel closeout, paired with a stable name so a failure can be
+// attributed to a specific owner (lo0 filter, host-inbound filter, login,
+// sudoers, absent-user revocation, sshd, root-auth).
+type hostAuthOwner struct {
+	name string
+	fn   func(*config.Config) error
+}
+
+// hostAuthOwnerOutcome is one owner's result from the cancel closeout. A nil
+// err with timedOut=false means the owner reconciled to the committed state; a
+// non-nil err means it reported a reconcile failure; timedOut means the
+// closeout budget was exhausted before or while the owner ran, so its
+// convergence is UNKNOWN. Both err and timedOut are fail-visible — the cancel
+// must not report clean when either is set.
+type hostAuthOwnerOutcome struct {
+	name     string
+	err      error
+	timedOut bool
+}
+
+// hostAuthCloseoutBudget bounds the TOTAL wall-clock time the #5643/M35 cancel
+// closeout may spend reconciling host authorization. It is a backstop against a
+// wedged reconciler hanging the daemon-stop path: each external command already
+// carries its own 15s(+5s) ceiling (externalCommandTimeout), but the closeout
+// fans across two nft loads plus five credential reconcilers, so a per-command
+// timeout does not bound the sum. On the cancel path boundedness beats
+// completeness — an owner that outruns the budget is reported timed-out (its
+// convergence unknown) rather than allowed to block shutdown indefinitely. A
+// package var so tests can shrink it. 30s stays well under the daemon-stop
+// window while giving a healthy box (every reconcile completes in ms) enormous
+// headroom.
+var hostAuthCloseoutBudget = 30 * time.Second
+
+// hostAuthCloseoutOwners is the ORDERED list of host-authorization owners the
+// cancel closeout reconciles, mirroring applyTailReconciles' step 9.5–13 order
+// exactly: the two nft filters first (kernel primary enforcement), then the OS
+// login/sudo/absent-user/sshd/root-auth credential reconcilers. Split out as a
+// method so a test can assert every owner — especially the five credential
+// reconcilers whose failures used to be discarded (#5874) — stays wired in.
+func (d *Daemon) hostAuthCloseoutOwners() []hostAuthOwner {
+	return []hostAuthOwner{
+		{"lo0-filter", d.applyLo0Filter},
+		{"host-inbound-filter", d.applyHostInboundFilter},
+		{"system-login", d.applySystemLogin},
+		{"sudoers", d.reconcileSudoers},
+		{"absent-login-users", d.reconcileAbsentLoginUsers},
+		{"ssh-config", d.applySSHConfig},
+		{"root-auth", d.applyRootAuth},
+	}
+}
+
+// runHostAuthCloseoutOwners runs each owner in order under a shared wall-clock
+// budget and returns a per-owner outcome. Owners run SEQUENTIALLY (the M35
+// order is load-bearing) but each in its own goroutine so a wedged owner can be
+// bounded by the budget instead of hanging the daemon-stop path. It preserves
+// the non-cancellable INTENT — the budget does NOT abort on the first owner
+// ERROR (a failed owner is recorded and the next still runs: collect-all-then-
+// report). It only stops launching owners once the TOTAL budget is exhausted;
+// the remaining owners are then recorded timed-out (never silently skipped).
+//
+// When an owner outruns the budget its goroutine is abandoned (at most one at a
+// time — no further owner is launched concurrently). That is acceptable only on
+// the daemon-stop path this serves: every reconciler step is an individually
+// atomic durable write, so an abandoned owner leaves consistent partial state
+// that is HONESTLY reported timed-out (convergence unknown), the fail-visible
+// outcome M35 requires.
+func runHostAuthCloseoutOwners(cfg *config.Config, budget time.Duration, owners []hostAuthOwner) []hostAuthOwnerOutcome {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	outcomes := make([]hostAuthOwnerOutcome, 0, len(owners))
+	for _, o := range owners {
+		if ctx.Err() != nil {
+			// Budget already exhausted — record timed-out WITHOUT launching the
+			// owner, so it never runs concurrently with an abandoned one.
+			outcomes = append(outcomes, hostAuthOwnerOutcome{name: o.name, timedOut: true})
+			continue
+		}
+		done := make(chan error, 1)
+		go func(fn func(*config.Config) error) { done <- fn(cfg) }(o.fn)
+		select {
+		case err := <-done:
+			outcomes = append(outcomes, hostAuthOwnerOutcome{name: o.name, err: err})
+		case <-ctx.Done():
+			outcomes = append(outcomes, hostAuthOwnerOutcome{name: o.name, timedOut: true})
+		}
+	}
+	return outcomes
+}
+
+// summarizeHostAuthCloseout logs each owner's outcome (fail-visible) and joins
+// every failure — a reconcile error OR a budget timeout — into a single error.
+// A nil return means every host-authorization owner reconciled to the committed
+// config within budget; a non-nil return names WHICH owners did not, and is
+// propagated by closeoutHostAuthOnCancel so the cancel fails visibly instead of
+// reporting clean over a silently-failed credential reconcile (#5874).
+func summarizeHostAuthCloseout(outcomes []hostAuthOwnerOutcome) error {
+	var errs []error
+	for _, o := range outcomes {
+		switch {
+		case o.timedOut:
+			slog.Error("host-authorization cancel closeout: owner did not complete within budget",
+				"owner", o.name, "budget", hostAuthCloseoutBudget)
+			errs = append(errs, fmt.Errorf("host-auth closeout owner %q timed out", o.name))
+		case o.err != nil:
+			slog.Error("host-authorization cancel closeout: owner failed to reconcile",
+				"owner", o.name, "err", o.err)
+			errs = append(errs, fmt.Errorf("host-auth closeout owner %q: %w", o.name, o.err))
+		default:
+			slog.Debug("host-authorization cancel closeout: owner reconciled", "owner", o.name)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (d *Daemon) applyHostAuthorizationCloseout(cfg *config.Config) error {
 	if cfg == nil {
 		return nil
 	}
-	// nft host-authorization: kernel PRIMARY enforcement of lo0 input filter +
-	// zone host-inbound (fail-closed).
-	lo0Err := d.applyLo0Filter(cfg)
-	hostInboundErr := d.applyHostInboundFilter(cfg)
-	// login / credential revocation: OS accounts, stale sudo grants, removed
-	// users' password + authorized_keys, root-login policy, AND root's own
-	// durable credentials. applySSHConfig only writes the sshd PermitRootLogin
-	// drop-in; applyRootAuth (#5276) is the sole manager of root's /etc/shadow
-	// password and /root/.ssh/authorized_keys, so it MUST run here too — else a
-	// committed `delete system root-authentication ssh-keys` leaves the revoked
-	// root key live for the whole stop window (#5643 Gap A).
-	d.applySystemLogin(cfg)
-	d.reconcileSudoers(cfg)
-	d.reconcileAbsentLoginUsers(cfg)
-	d.applySSHConfig(cfg)
-	d.applyRootAuth(cfg)
-	return errors.Join(lo0Err, hostInboundErr)
+	outcomes := runHostAuthCloseoutOwners(cfg, hostAuthCloseoutBudget, d.hostAuthCloseoutOwners())
+	return summarizeHostAuthCloseout(outcomes)
 }
 
 // closeoutHostAuthOnCancel wraps a post-promotion apply-abort error so a #2926
@@ -2375,28 +2482,37 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// 10. Apply system syslog forwarding
 	d.applySystemSyslog(cfg)
 
+	// Steps 11–13 are the login/credential reconcilers. They return their
+	// accumulated failures (#5874) so the cancel closeout can surface them,
+	// but on the NORMAL apply path the returns are intentionally DISCARDED:
+	// the tail is best-effort here because the next boot re-renders login /
+	// sudoers / SSH / root-auth from the active config, so a transient failure
+	// converges (the #2926 next-boot contract). Only the daemon-stop cancel
+	// closeout — where next-boot convergence does NOT happen while the daemon
+	// stays intentionally stopped — collects and fails on these.
+
 	// 11. Apply system login users (create OS accounts, SSH keys)
-	d.applySystemLogin(cfg)
+	_ = d.applySystemLogin(cfg)
 
 	// 11b. Reconcile super-user sudo grants against the CURRENT config so a
 	// class downgrade or user removal REVOKES the stale NOPASSWD grant
 	// (#3889). Runs unconditionally — applySystemLogin returns early when
 	// there are no users, which is exactly the "all users removed" case
 	// that must still sweep stale grants.
-	d.reconcileSudoers(cfg)
+	_ = d.reconcileSudoers(cfg)
 
 	// 11c. Revoke host credentials for any xpf-provisioned login account that
 	// was removed from config (#5128). reconcileSudoers above only revokes the
 	// sudo grant; without this a deprovisioned operator keeps their password
 	// and authorized_keys and can still SSH in. Like reconcileSudoers it MUST
 	// run unconditionally — the "all users removed" case must still revoke.
-	d.reconcileAbsentLoginUsers(cfg)
+	_ = d.reconcileAbsentLoginUsers(cfg)
 
 	// 12. Apply SSH service configuration (root-login)
-	d.applySSHConfig(cfg)
+	_ = d.applySSHConfig(cfg)
 
 	// 13. Apply root authentication (encrypted-password + SSH keys)
-	d.applyRootAuth(cfg)
+	_ = d.applyRootAuth(cfg)
 
 	// 14. Apply syslog file destinations (rsyslog configs)
 	d.applySyslogFiles(cfg)
