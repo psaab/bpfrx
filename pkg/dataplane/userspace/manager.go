@@ -250,6 +250,23 @@ type Manager struct {
 
 	rgTransitionInFlight atomic.Bool // set before syncHAStateLocked, cleared on completion
 
+	// neighborPrewarmInFlight is the #5104 singleflight guard for the async
+	// neighbor-resolve prewarm scan spawned by the status loop. The loop kicks
+	// a full scan every 1s for the first 60s (then every 10s on HA standby); a
+	// scan does route-indexed NeighList dumps and a bounded probe sweep. Under
+	// slow netlink or a large RIB a scan can outlast its tick, so this flag
+	// coalesces overlapping ticks onto the running scan: CAS false->true before
+	// spawning, cleared (via defer) when the scan goroutine returns. Lock-free
+	// (like rgTransitionInFlight) because the clear happens off m.mu in the
+	// background scan goroutine.
+	neighborPrewarmInFlight atomic.Bool
+	// neighborPrewarmScan runs one prewarm scan. Indirected through a field so
+	// tests can inject a deterministic/blocking scan to exercise the #5104
+	// singleflight coalescing without real netlink. nil-safe at the call site:
+	// it defaults to proactiveNeighborResolveAsync when unset, so bare
+	// &Manager{} literals still work.
+	neighborPrewarmScan func(ctx context.Context, cfg *config.Config)
+
 	// Counter delta tracking: previous binding counter totals for computing
 	// deltas to write into BPF counter maps (#332).
 	prevBindingCounters userspaceCounterSnapshot

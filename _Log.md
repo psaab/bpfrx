@@ -53617,3 +53617,28 @@ top.
   userspace-dp/src/server/tests.rs,
   userspace-dp/src/afxdp/coordinator/README.md,
   userspace-dp/src/server/README.md
+
+- **Timestamp**: 2026-07-18
+- **Action**: #5104 — singleflight-guard + bound the userspace-dp neighbor
+  prewarm scan. The status loop kicked a FULL async neighbor-resolve scan every
+  1s for the first 60s (then 10s standby) with NO in-flight guard; each scan did
+  route-indexed NeighList dumps and spawned ONE goroutine PER TARGET. Under slow
+  netlink / a large RIB, scans OVERLAPPED, multiplying concurrent scans and
+  unbounded probe goroutines — self-amplifying control-plane load delaying
+  apply/status/recovery. Fix: (1) lock-free `neighborPrewarmInFlight` atomic.Bool
+  CAS singleflight guard in `proactiveNeighborResolveAsyncLocked` (coalesce
+  overlapping ticks; cleared via defer so a panic also clears); (2) each scan
+  runs under a 15s `neighborPrewarmDeadline` context, checked between netlink
+  dumps so slow netlink can't pin the guard; (3) `runBoundedNeighborProbes`
+  fixed 8-worker pool replaces goroutine-per-target; (4) one
+  `NeighList(FAMILY_ALL)` dump per link index per scan (was per-route re-dump).
+  Injectable `neighborPrewarmScan` seam for deterministic tests. Merge-gate
+  regression `TestNeighborPrewarmSingleflightCoalescesOverlappingTicks5104`
+  (RED-on-revert verified: neutralize CAS → peak concurrent scans = 2, want 1;
+  assertion failure not build break, target-count 1) + bounded-pool +
+  ctx-cancel tests. Validated with `go test -race` (full pkg green, named 3x),
+  gofmt + go vet clean. NOT HA-smoke — guard is unit-provable.
+- **File(s)**: pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/process_napi.go,
+  pkg/dataplane/userspace/neighbor_prewarm_singleflight_5104_test.go,
+  docs/userspace-cold-start-fix-plan.md
