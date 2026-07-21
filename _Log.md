@@ -54503,3 +54503,29 @@ top.
 - **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_system.go,
   pkg/daemon/login_password.go, pkg/daemon/host_auth_closeout_5874_test.go (new),
   pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5840 — reject standalone<->cluster day-2 topology commit (fail-closed
+  restart boundary; Option 2). The chassis-cluster runtime (d.cluster manager, election,
+  heartbeat/watchdog writer, session/config/DHCP sync, event watcher, VRRP sync hold, gRPC
+  fabric listener) is constructed ONCE at boot (daemon_run.go initManagers +
+  startClusterComms) and only when the boot active config has `chassis cluster`. A day-2
+  commit that ADDS/REMOVES `chassis cluster` cannot (de)construct that boot-only runtime:
+  d.cluster is a bare write-once-at-boot pointer read without a lifecycle lock from ~129
+  sites (data race), and the dataplane arms clusterHA=true from the NEW config in the same
+  apply BEFORE any watchdog/election exists (persistent HAInactive transit drop). Silent
+  acceptance was the bug (no HA + outage until restart). Fix: new pure
+  clusterTopologyCommitPreflight(old,new) + errClusterTopologyRequiresRestart sentinel,
+  wired into commitAndApply + commitConfirmedAndApply preflight closures (BEFORE store
+  promotion / dataplane mutation, ahead of the device-map preflight), and fail-closed in
+  the peer-sync replay path syncAndApply (return before applyConfigLocked so the live
+  dataplane is never armed under the transitioned config). Intra-mode edits reconcile live
+  as before. Full day-2 live construction/teardown (Option 1 supervisor) is a separate
+  follow-up. Fail-on-revert: TestClusterTopologyDay2TransitionRejected asserts both
+  transition directions rejected (sentinel + diagnostic) + controls accepted + end-to-end
+  commitAndApply rejection with d.cluster staying nil and candidate not promoted;
+  neutralizing the preflight body makes exactly that one test RED (target-count 1).
+  Unit-provable, NO smoke (reject happens before any dataplane/HA mutation).
+- **File(s)**: pkg/daemon/cluster_topology_preflight.go (new),
+  pkg/daemon/cluster_topology_preflight_5840_test.go (new), pkg/daemon/daemon_apply.go,
+  docs/ha-no-hitless-restart.md, _Log.md
