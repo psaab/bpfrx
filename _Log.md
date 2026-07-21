@@ -1,3 +1,43 @@
+## 2026-07-20 — #5098: reset global counter offsets on clear (epoch semantics)
+
+- **Timestamp**: 2026-07-20 (fix/5098-clear-counter-offset)
+- **Action**: Fixed the userspace-mode snap-back where cleared global
+  RX/TX/drop/session totals immediately reverted to their pre-clear value.
+  `ReadGlobalCounter` merges the per-CPU `global_counters` BPF array sum with an
+  in-memory `userspaceCounterOffsets` entry that `IncrementGlobalCounter` /
+  `syncBPFCountersLocked` ACCUMULATE (not overwrite) for userspace-forwarded
+  packets; `ClearGlobalCounters`/`ClearAllCounters` zeroed only the BPF array, so
+  the offset half survived and the read snapped back. `ClearGlobalCounters` now
+  drops the whole offset map FIRST under `m.mu` (the same lock guarding every
+  offset read/write) — and no longer errors when the BPF map is absent
+  (userspace-only runtime), mirroring `ClearZoneCounters`/`ClearNATRuleCounters`.
+  `ClearAllCounters` inherits it via `ClearGlobalCounters`; the userspace
+  `Manager.ClearAllCounters` additionally rebases `prevBindingCounters` to the
+  last-recorded cumulative so the next 1/s poll's delta measures traffic strictly
+  after the clear (no stale delta re-fold). Corrected the false
+  policycounters.go comment that claimed `bpfShim.ClearAllCounters()` already
+  zeroed the offset map. Fail-on-revert merge gate
+  `Test_clear_global_counters_resets_userspace_offset_5098` (mapless, always
+  runs): seeds an offset via IncrementGlobalCounter AND a helper poll, clears via
+  BOTH `ClearGlobalCounters` and the operator `ClearAllCounters` path, asserts the
+  offset resets to 0 and a post-clear delta restarts from zero. Sibling
+  `Test_clear_global_counters_read_equation_zero_5098` (dataplane pkg, privileged;
+  SKIPs unprivileged) pins the full `ReadGlobalCounter` array+offset==0 equation.
+  Doc: userspace-dataplane-gaps.md gains a "Global counter clear is an epoch"
+  bullet.
+- **Validation**: full `pkg/dataplane/...` suite green under `-race`; named test
+  3x no flake; consumer pkgs (cli/api/grpcapi/daemon) green; gofmt + go vet clean;
+  `go build ./...` clean. Parent-RED: disabling the offset reset makes both
+  subtests RED (offset==100, cleared total snaps back); disabling the
+  prevBindingCounters rebase makes the delta subtest RED (reads 50, want 30) —
+  assertion failures, not build breaks; target-count 1 named test (+1 skipped
+  privileged sibling). NOT HA (counter clear path; unit-provable, no cluster smoke).
+- **File(s)**: pkg/dataplane/maps_counters.go,
+  pkg/dataplane/userspace/policycounters.go,
+  pkg/dataplane/maps_counters_clear_5098_test.go,
+  pkg/dataplane/userspace/manager_counters_test.go,
+  docs/userspace-dataplane-gaps.md
+
 ## 2026-07-18 — #4925: NAT feed-resolves nested address-set members in match address-name
 
 - **Timestamp**: 2026-07-18 (fix/4925-nat-feed-nested-set)

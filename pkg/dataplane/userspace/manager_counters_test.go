@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -448,6 +449,138 @@ func TestSyncBPFCountersMirrorsNATRuleCounters(t *testing.T) {
 	if got != (dataplane.CounterValue{}) {
 		t.Fatalf("counter 1 after clear = %+v, want zero", got)
 	}
+}
+
+// Test_clear_global_counters_resets_userspace_offset_5098 is the #5098
+// fail-on-revert merge gate. ReadGlobalCounter returns the per-CPU BPF array sum
+// PLUS the in-memory userspaceCounterOffsets entry that IncrementGlobalCounter
+// and the 1/s status poll (syncBPFCountersLocked) accrue for userspace-forwarded
+// packets that bypass the BPF pipeline. Before #5098 neither ClearGlobalCounters
+// nor ClearAllCounters reset that offset map, so a cleared global RX/TX/drop/
+// session total snapped straight back to its pre-clear value on the next read.
+//
+// The gate is deliberately mapless (no BPF privileges required): it keys on
+// ReadUserspaceCounterOffset, which is exactly the offset half ReadGlobalCounter
+// merges on top of the (zeroed) BPF array — so the assertion runs everywhere,
+// not only on a privileged host. The full ReadGlobalCounter read equation
+// (array + offset == 0) is pinned by the sibling dataplane-package test
+// Test_clear_global_counters_read_equation_zero_5098.
+//
+// Reverting the offset reset in dataplane.Manager.ClearGlobalCounters fails the
+// post-clear "offset == 0" assertions; reverting the prevBindingCounters rebase
+// in userspace.Manager.ClearAllCounters fails the post-clear delta assertion.
+func Test_clear_global_counters_resets_userspace_offset_5098(t *testing.T) {
+	const rxIdx = dataplane.GlobalCtrRxPackets
+	const txIdx = dataplane.GlobalCtrTxPackets
+
+	t.Run("ClearGlobalCounters_resets_offset_and_restarts_accrual", func(t *testing.T) {
+		m := New()
+
+		// Seed a non-zero offset the way userspace-forwarded accounting does.
+		if err := m.bpfShim.IncrementGlobalCounter(rxIdx, 100); err != nil {
+			t.Fatalf("seed IncrementGlobalCounter: %v", err)
+		}
+		if got := m.bpfShim.ReadUserspaceCounterOffset(rxIdx); got != 100 {
+			t.Fatalf("seed rx offset = %d, want 100", got)
+		}
+
+		// The clear must drop the offset, not just the BPF array. Mapless, so the
+		// BPF-array zero is skipped and the offset reset is the whole clear.
+		if err := m.bpfShim.ClearGlobalCounters(); err != nil {
+			t.Fatalf("ClearGlobalCounters: %v", err)
+		}
+		if got := m.bpfShim.ReadUserspaceCounterOffset(rxIdx); got != 0 {
+			t.Fatalf("rx offset after ClearGlobalCounters = %d, want 0 "+
+				"(cleared total snaps back — #5098 offset reset reverted?)", got)
+		}
+
+		// A NEW delta after the clear accrues from zero, not on top of the stale
+		// pre-clear value.
+		if err := m.bpfShim.IncrementGlobalCounter(rxIdx, 42); err != nil {
+			t.Fatalf("post-clear IncrementGlobalCounter: %v", err)
+		}
+		if got := m.bpfShim.ReadUserspaceCounterOffset(rxIdx); got != 42 {
+			t.Fatalf("rx offset after post-clear accrual = %d, want 42 "+
+				"(offset did not restart from zero)", got)
+		}
+	})
+
+	t.Run("ClearAllCounters_resets_offset_and_rebases_delta_baseline", func(t *testing.T) {
+		m := New()
+
+		mkStatus := func(rx, tx uint64) *ProcessStatus {
+			return &ProcessStatus{Bindings: []BindingStatus{
+				{Slot: 0, RXPackets: rx, TXPackets: tx},
+			}}
+		}
+		// poll advances lastStatus AND accrues the helper delta into the offset
+		// (recording prevBindingCounters), exactly like the 1/s status poll.
+		poll := func(rx, tx uint64) {
+			t.Helper()
+			status := mkStatus(rx, tx)
+			m.mu.Lock()
+			m.recordHelperStatusLocked(status)
+			m.syncBPFCountersLocked(status)
+			m.mu.Unlock()
+		}
+		// record advances lastStatus WITHOUT a counter sync — what a status poll
+		// or a prior domain-scoped clear (e.g. `clear policies counters`) does.
+		record := func(rx, tx uint64) {
+			t.Helper()
+			status := mkStatus(rx, tx)
+			m.mu.Lock()
+			m.recordHelperStatusLocked(status)
+			m.mu.Unlock()
+		}
+
+		// First poll seeds the offset with the full cumulative (prev starts at 0).
+		poll(100, 80)
+		if got := m.bpfShim.ReadUserspaceCounterOffset(rxIdx); got != 100 {
+			t.Fatalf("seed rx offset = %d, want 100", got)
+		}
+		if got := m.bpfShim.ReadUserspaceCounterOffset(txIdx); got != 80 {
+			t.Fatalf("seed tx offset = %d, want 80", got)
+		}
+
+		// A later status refresh advances lastStatus past prevBindingCounters
+		// without a counter sync. This makes the prevBindingCounters rebase
+		// observable: the clear must adopt this fresher cumulative (120/90) as the
+		// new epoch baseline, not the stale poll-time baseline (100/80).
+		record(120, 90)
+
+		// Operator clear-all. Mapless, bpfShim.ClearInterfaceCounters returns a
+		// benign "interface_counters map not found"; the offset/baseline
+		// invariants under test are unaffected, so tolerate only that error.
+		if err := m.ClearAllCounters(); err != nil &&
+			!strings.Contains(err.Error(), "interface_counters map not found") {
+			t.Fatalf("ClearAllCounters: unexpected error: %v", err)
+		}
+		if got := m.bpfShim.ReadUserspaceCounterOffset(rxIdx); got != 0 {
+			t.Fatalf("rx offset after ClearAllCounters = %d, want 0 "+
+				"(cleared total snaps back — #5098 offset reset reverted?)", got)
+		}
+		if got := m.bpfShim.ReadUserspaceCounterOffset(txIdx); got != 0 {
+			t.Fatalf("tx offset after ClearAllCounters = %d, want 0 "+
+				"(cleared total snaps back — #5098 offset reset reverted?)", got)
+		}
+
+		// A subsequent poll with a HIGHER cumulative advances from zero by the
+		// POST-clear delta only. The helper keeps counting from launch, so the
+		// cumulative goes 120 -> 150 (a +30 post-clear delta). With the baseline
+		// rebased to the cumulative-at-clear (120/90), the offset reads 30/20. If
+		// prevBindingCounters were left at the stale poll-time baseline (100/80),
+		// the delta would be 50/30 and the cleared counter would jump past its
+		// pre-clear value.
+		poll(150, 110)
+		if got := m.bpfShim.ReadUserspaceCounterOffset(rxIdx); got != 30 {
+			t.Fatalf("rx offset after post-clear poll = %d, want 30 "+
+				"(delta baseline not rebased — #5098 prevBindingCounters revert?)", got)
+		}
+		if got := m.bpfShim.ReadUserspaceCounterOffset(txIdx); got != 20 {
+			t.Fatalf("tx offset after post-clear poll = %d, want 20 "+
+				"(delta baseline not rebased — #5098 prevBindingCounters revert?)", got)
+		}
+	})
 }
 
 func TestSafeDelta(t *testing.T) {

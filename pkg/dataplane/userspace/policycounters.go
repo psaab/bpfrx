@@ -311,6 +311,13 @@ func (m *Manager) ClearPolicyCounters() error {
 func (m *Manager) ClearAllCounters() error {
 	var errs []error
 	if m.bpfShim != nil {
+		// bpfShim.ClearAllCounters() zeroes the BPF per-CPU counter arrays AND,
+		// via ClearGlobalCounters, the in-memory global counter offset map
+		// (userspaceCounterOffsets) that ReadGlobalCounter merges on top of the
+		// array (#5098). Before #5098 only the array was zeroed, so a cleared
+		// global RX/TX/drop/session total snapped straight back to its pre-clear
+		// value because the accumulated offset half survived. It also drops the
+		// per-zone (#3643) and flood offset maps.
 		if err := m.bpfShim.ClearAllCounters(); err != nil {
 			errs = append(errs, err)
 		}
@@ -318,14 +325,15 @@ func (m *Manager) ClearAllCounters() error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	if err := m.clearHelperPolicyCountersLocked(); err != nil {
 		errs = append(errs, err)
 	}
 	// #2218: a clear-all must also reset the helper NAT translation hit store,
 	// otherwise the per-rule NAT totals snap back on the next status poll (the
 	// helper reports cumulative-since-start and syncBPFCountersLocked overwrites
-	// the offset absolutely). bpfShim.ClearAllCounters() already zeroed the Go
-	// offset map; this sends the clear_nat_counters IPC.
+	// the offset absolutely). This sends the clear_nat_counters IPC so the helper
+	// store resets and the next poll re-mirrors 0 onto the offset.
 	if err := m.clearHelperNATCountersLocked(); err != nil {
 		errs = append(errs, err)
 	}
@@ -333,10 +341,22 @@ func (m *Manager) ClearAllCounters() error {
 	// otherwise the per-zone totals snap back on the next status poll (the
 	// helper reports cumulative-since-start and syncBPFCountersLocked overwrites
 	// the offset absolutely). bpfShim.ClearAllCounters() already zeroed the Go
-	// offset map; this sends the clear_zone_counters IPC.
+	// zone offset map (via ClearZoneCounters); this sends the clear_zone_counters
+	// IPC so the helper store resets too.
 	if err := m.clearHelperZoneCountersLocked(); err != nil {
 		errs = append(errs, err)
 	}
+
+	// #5098: restart the global-counter delta epoch. syncBPFCountersLocked
+	// ACCUMULATES each 1/s helper delta (cur - prevBindingCounters) into the
+	// global offset map that bpfShim.ClearAllCounters() just reset to zero —
+	// unlike the NAT/zone stores above, which overwrite absolutely. Rebase the
+	// baseline to the last-recorded cumulative so the next poll measures traffic
+	// strictly AFTER the clear; leaving prevBindingCounters below the current
+	// cumulative would fold the pre-clear span back in as one large delta on the
+	// next poll. Done last so it captures the freshest helper status, and under
+	// the m.mu held here — the same lock syncBPFCountersLocked mutates it under.
+	m.prevBindingCounters = sumBindingCounters(&m.lastStatus)
 	return errors.Join(errs...)
 }
 
