@@ -1,3 +1,55 @@
+## 2026-07-21 — #4965: atomic (preflight-then-commit) generic in-place frame rewrite
+
+- **Timestamp**: 2026-07-21 (fix/4965-atomic-frame-rewrite)
+- **Action**: Made `rewrite_forwarded_frame_in_place` (the generic in-place
+  frame rewrite — the packet-forwarding hot path) transactional, mirroring the
+  #5466 descriptor fast-path split. ASSESSMENT: #5466 already made the
+  DESCRIPTOR path (`apply_rewrite_descriptor`) atomic — it validates every bail
+  gate against the pristine frame before `rewrite_commit_eth_from_plan`. But the
+  GENERIC path was still `rewrite_prepare_eth` (plan+COMMIT: eth-header write +
+  VLAN-push `copy_within` memmove) THEN `rewrite_apply_v4/v6`, which can still
+  decline (TTL/hop-limit, malformed IHL, IPv6 ext-chain, truncated-L4 NAT
+  checksum) AFTER the commit and after `apply_nat_ipv4/ipv6` wrote IP/port
+  bytes. Both declining callers re-read the SAME UMEM: the flow-cache
+  `apply_rewrite_descriptor(...).or_else(generic)` fallback then
+  `build_live_forward_request_from_frame(packet_frame)`
+  (`poll_descriptor/flow_cache_hit.rs`), and `tx/dispatch/mod.rs` runs
+  `build_forwarded_frame_from_frame(source_frame)` over the same `ingress_area`
+  slice on a generic `None` — so a decline left a scribbled L2 / shifted payload
+  / partial NAT+checksum that got reprocessed as a corrupt packet.
+  FIX: `rewrite_forwarded_frame_in_place` now computes the eth plan
+  (`rewrite_plan_eth_from_parts`, read-only), runs `validate_generic_rewrite_v4`
+  / `validate_generic_rewrite_v6` (read-only preflight covering EVERY `?` in
+  `rewrite_apply_v4/v6` — header length, TTL, `v6_rel_l4_offset` ext-chain, and
+  the L4-checksum-in-bounds gate derived from the SAME
+  `l4_checksum_field_delta_v4/v6` SSOT the mutation half writes at) against the
+  PRISTINE L3 payload at `plan.l3`, and only then commits + applies. The
+  `apply_*` bodies are UNCHANGED, so the success-path output is byte-identical;
+  only failing inputs now decline before any mutation, leaving the frame
+  byte-for-byte unchanged. Split the old `rewrite_prepare_eth` into a read-only
+  `rewrite_eth_params` (deleted the now-dead `rewrite_prepare_eth` /
+  `rewrite_prepare_eth_from_parts`). Re-exported `l4_checksum_field_delta_v4/v6`
+  from `checksum.rs` at `pub(in crate::afxdp::frame)`.
+  VALIDATION: `cargo test --release frame::` 368/368 green (incl. the P-N3
+  `descriptor_generic_differential` byte-parity proptest); new fail-on-revert
+  `declined_rewrite_leaves_umem_byte_identical_4965` passes 3×; parent-RED
+  verified — reverting to commit-before-check makes BOTH the new test AND the
+  updated `pin_ttl_expired_declines_l3_untouched` (now full-frame) fail with
+  `assertion left == right` (not a build break). Full `cargo test --release`
+  suite green.
+- **File(s)**:
+  - `userspace-dp/src/afxdp/frame/mod.rs` (preflight-then-commit restructure of
+    `rewrite_forwarded_frame_in_place`; new `rewrite_eth_params` +
+    `validate_generic_rewrite_v4/v6`; removed `rewrite_prepare_eth`/
+    `rewrite_prepare_eth_from_parts`; import `l4_checksum_field_delta_v4/v6`)
+  - `userspace-dp/src/afxdp/frame/checksum.rs` (re-export the two L4-checksum
+    field-delta SSOT helpers)
+  - `userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs` (new fail-on-revert
+    `declined_rewrite_leaves_umem_byte_identical_4965`; strengthened
+    `pin_ttl_expired_declines_l3_untouched` generic assertion to full-frame)
+  - `userspace-dp/src/afxdp/frame/README.md` (atomicity invariant now covers
+    BOTH in-place rewrites — #5466 descriptor + #4965 generic)
+
 ## 2026-07-20 — #5098: reset global counter offsets on clear (epoch semantics)
 
 - **Timestamp**: 2026-07-20 (fix/5098-clear-counter-offset)

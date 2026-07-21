@@ -45,7 +45,8 @@ use byte_writes::{
 // wider visibility than its own.
 use checksum::{
     ChecksumFamily, adjust_l4_checksum_ipv6_addr_bytes, adjust_zero_checksum_illegal,
-    checksum_family_of, l4_udp_checksum_optional,
+    checksum_family_of, l4_checksum_field_delta_v4, l4_checksum_field_delta_v6,
+    l4_udp_checksum_optional,
 };
 pub(in crate::afxdp) use checksum::{
     adjust_ipv4_header_checksum, adjust_l4_checksum_ipv4, adjust_l4_checksum_ipv4_dst,
@@ -641,26 +642,20 @@ fn rewrite_commit_eth_from_plan(
     Some(())
 }
 
+/// Read-only derivation of the Ethernet rewrite parameters (dst/src MAC,
+/// tx VLAN, ether_type, whether NAT applies) from the forwarding decision.
+///
+/// #4965: split out of the old `rewrite_prepare_eth` so the generic in-place
+/// rewrite can compute the eth plan and run its v4/v6 preflight WITHOUT
+/// mutating UMEM — mirroring the #5466 descriptor fast path. Touches no
+/// frame bytes; a `None` (missing neighbor/src MAC, or an unknown address
+/// family) is a pure decline that leaves the frame byte-identical.
 #[inline]
-fn rewrite_prepare_eth_from_parts(
-    area: &MmapArea,
-    desc: XdpDesc,
-    meta: ForwardPacketMeta,
-    params: RewriteEthParams,
-) -> Option<RewritePrep> {
-    let plan = rewrite_plan_eth_from_parts(area, desc, meta, &params)?;
-    rewrite_commit_eth_from_plan(area, desc, &plan, &params)?;
-    Some(plan.prep)
-}
-
-#[inline]
-fn rewrite_prepare_eth(
-    area: &MmapArea,
-    desc: XdpDesc,
+fn rewrite_eth_params(
     meta: ForwardPacketMeta,
     decision: &SessionDecision,
     apply_nat_on_fabric: bool,
-) -> Option<RewritePrep> {
+) -> Option<RewriteEthParams> {
     let dst_mac = decision.resolution.neighbor_mac?;
     let (src_mac, vlan_id, apply_nat) =
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
@@ -681,18 +676,108 @@ fn rewrite_prepare_eth(
         libc::AF_INET6 => 0x86dd,
         _ => return None,
     };
-    rewrite_prepare_eth_from_parts(
-        area,
-        desc,
-        meta,
-        RewriteEthParams {
-            dst_mac,
-            src_mac,
-            vlan_id,
-            ether_type,
-            apply_nat,
-        },
-    )
+    Some(RewriteEthParams {
+        dst_mac,
+        src_mac,
+        vlan_id,
+        ether_type,
+        apply_nat,
+    })
+}
+
+/// Read-only preflight of the IPv4 generic in-place rewrite (#4965).
+///
+/// Returns `None` for EXACTLY the inputs on which `rewrite_apply_v4` would
+/// return `None` — but here against the PRISTINE L3 payload, BEFORE
+/// `rewrite_commit_eth_from_plan` mutates any UMEM byte. Gates, in the same
+/// order the mutation half checks them:
+///   1. L3 payload shorter than the minimum IPv4 header (20).
+///   2. Malformed IHL (< 20, or longer than the payload).
+///   3. TTL/hop-limit expiry (unless the sender already decremented — fabric
+///      ingress, `skip_ttl`).
+///   4. When NAT folds a change into the L4 checksum, the checksum field at
+///      `ihl + {16 TCP, 6 UDP}` must be in bounds; otherwise the post-commit
+///      `apply_nat_ipv4` adjust would decline. A non-first fragment carries no
+///      L4 header (the bytes are payload) — the NAT leaf skips the L4 fold
+///      there, so no bound is required and none is imposed.
+///
+/// `l3_payload` is `&frame[l3 .. l3 + payload_len]` at the ORIGINAL offset;
+/// because the commit's VLAN-push memmove is a pure relocation, these
+/// byte-for-byte reads decide identically to the post-commit checks they
+/// replace. The success path is therefore unchanged; only the FAILING inputs
+/// now decline before any mutation, leaving the frame byte-identical.
+#[inline]
+fn validate_generic_rewrite_v4(
+    l3_payload: &[u8],
+    meta: ForwardPacketMeta,
+    nat: NatDecision,
+    apply_nat: bool,
+    skip_ttl: bool,
+) -> Option<()> {
+    if l3_payload.len() < 20 {
+        return None;
+    }
+    let ihl = ((l3_payload[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || l3_payload.len() < ihl {
+        return None;
+    }
+    if !skip_ttl && l3_payload[8] <= 1 {
+        return None; // TTL expired
+    }
+    if apply_nat && nat != NatDecision::default() && !ipv4_is_non_first_fragment(l3_payload) {
+        if let Some(delta) = l4_checksum_field_delta_v4(meta.protocol) {
+            // `apply_nat_ipv4` reads/writes the L4 checksum at `ihl + delta`
+            // (address-change fold and/or port rewrite). If the 2-byte field
+            // is truncated the adjust returns None — hoist that decline here.
+            if l3_payload.len() < ihl + delta + 2 {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Read-only preflight of the IPv6 generic in-place rewrite (#4965). Mirror
+/// of `validate_generic_rewrite_v4` for IPv6:
+///   1. L3 payload shorter than the fixed 40-byte IPv6 header.
+///   2. Hop-limit expiry (unless `skip_ttl`).
+///   3. Extension-chain L4 offset unresolvable (malformed/over-limit chain) —
+///      `v6_rel_l4_offset` is the SAME SSOT the mutation half uses.
+///   4. When NAT folds into the L4 checksum at `rel_l4 + {16 TCP, 6 UDP,
+///      2 ICMPv6}`, that field must be in bounds; non-first fragments skip
+///      the fold and impose no bound.
+///
+/// Returns the resolved `rel_l4` on success so the caller can prove the offset
+/// was validated pre-commit; `rewrite_apply_v6` re-derives the identical value
+/// (same bytes, same meta) after the commit.
+#[inline]
+fn validate_generic_rewrite_v6(
+    l3_payload: &[u8],
+    meta: ForwardPacketMeta,
+    nat: NatDecision,
+    apply_nat: bool,
+    skip_ttl: bool,
+) -> Option<usize> {
+    if l3_payload.len() < 40 {
+        return None;
+    }
+    if !skip_ttl && l3_payload[7] <= 1 {
+        return None; // hop limit expired
+    }
+    let rel_l4 = v6_rel_l4_offset(
+        l3_payload,
+        meta.l3_offset,
+        meta.l4_offset,
+        meta.addr_family,
+    )?;
+    if apply_nat && nat != NatDecision::default() && !ipv6_is_non_first_fragment(l3_payload) {
+        if let Some(delta) = l4_checksum_field_delta_v6(meta.protocol) {
+            if l3_payload.len() < rel_l4 + delta + 2 {
+                return None;
+            }
+        }
+    }
+    Some(rel_l4)
 }
 
 #[inline]
@@ -829,7 +914,56 @@ pub(super) fn rewrite_forwarded_frame_in_place(
     expected_ports: Option<(u16, u16)>,
 ) -> Option<InPlaceRewriteResult> {
     let meta = meta.into();
-    let prep = rewrite_prepare_eth(area, desc, meta, decision, apply_nat_on_fabric)?;
+    // #4965: preflight-then-commit, mirroring the #5466 descriptor fast path.
+    // Compute the eth rewrite plan and run EVERY fallible v4/v6 gate against
+    // the PRISTINE frame BEFORE `rewrite_commit_eth_from_plan` mutates any
+    // UMEM byte (eth-header write + VLAN-push `copy_within` memmove). A `None`
+    // from any gate then leaves the frame byte-identical, so the callers that
+    // re-read the SAME UMEM after a decline — the flow-cache
+    // `apply_rewrite_descriptor(...).or_else(generic)` fallback
+    // (`poll_descriptor/flow_cache_hit.rs`) and the tx-dispatch
+    // `build_forwarded_frame_from_frame(source_frame)` reinject
+    // (`tx/dispatch/mod.rs`) — reprocess an un-corrupted packet, honoring the
+    // zero-copy ownership contract.
+    let eth_params = rewrite_eth_params(meta, decision, apply_nat_on_fabric)?;
+    let plan = rewrite_plan_eth_from_parts(area, desc, meta, &eth_params)?;
+    {
+        // Read-only bail gates against the ORIGINAL L3 payload at `plan.l3`.
+        // The commit's memmove is a pure relocation, so these byte reads
+        // decide identically to `rewrite_apply_v4/v6`'s post-commit checks.
+        let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+        let l3_end = plan.l3.checked_add(plan.payload_len)?;
+        let l3_payload = frame.get(plan.l3..l3_end)?;
+        match meta.addr_family as i32 {
+            libc::AF_INET => validate_generic_rewrite_v4(
+                l3_payload,
+                meta,
+                decision.nat,
+                plan.prep.apply_nat,
+                plan.prep.skip_ttl,
+            )?,
+            libc::AF_INET6 => {
+                // Discard the resolved `rel_l4` — `rewrite_apply_v6` re-derives
+                // the identical offset post-commit; the validator call is here
+                // only to run (and possibly decline on) the ext-chain walk.
+                validate_generic_rewrite_v6(
+                    l3_payload,
+                    meta,
+                    decision.nat,
+                    plan.prep.apply_nat,
+                    plan.prep.skip_ttl,
+                )?;
+            }
+            _ => return None,
+        }
+    }
+    // All gates cleared: commit the eth rewrite (first UMEM mutation). From
+    // here NO path returns None — the preflight proved the byte layout, so the
+    // `rewrite_apply_v4/v6` `?` below can no longer fire (every remaining
+    // fallible op — `apply_nat_ipv4/ipv6`, `adjust_ipv4_header_checksum`,
+    // `recompute_l4_checksum_*`, `v6_rel_l4_offset` — was validated above).
+    rewrite_commit_eth_from_plan(area, desc, &plan, &eth_params)?;
+    let prep = plan.prep;
     let packet = unsafe { area.slice_mut_unchecked(prep.tx_offset as usize, prep.frame_len)? };
     match meta.addr_family as i32 {
         libc::AF_INET => rewrite_apply_v4(
