@@ -111,6 +111,22 @@ type CLI struct {
 	commitFn          func(ctx context.Context, comment string) (*config.Config, error)
 	commitConfirmedFn func(ctx context.Context, minutes int) (*config.Config, error)
 
+	// factoryResetFn routes `request system zeroize` through the DAEMON's
+	// coordinated factory-reset transaction (#5871) — the SAME gate the gRPC
+	// zeroize path uses (grpcapi.Config.ZeroizeFn -> daemon.factoryReset). It
+	// acquires the daemon's apply semaphore (draining any in-flight apply,
+	// blocking a concurrent one) and enters the terminal reset generation BEFORE
+	// the wipe closure runs, so no concurrent/subsequent commit / HA-sync /
+	// reconcile re-persists the erased .configdb SSOT or re-renders the wiped
+	// secrets (frr.conf / swanctl PSKs / Kea / login accounts). The wipe closure
+	// it receives is the shared grpcapi.PerformZeroizeWipe primitive (via the
+	// zeroizeFullWipe seam), so the console and gRPC paths run an identical,
+	// single-source-of-truth reset under identical fencing. Nil ONLY when the CLI
+	// is spawned OUTSIDE the daemon (offline recovery / unit test): there is no
+	// running reconcile loop to race, so performConsoleZeroize falls back to an
+	// ungated direct wipe, mirroring grpcapi.runZeroize's zeroizeFn==nil path.
+	factoryResetFn func(ctx context.Context, wipe func() error) error
+
 	// Fabric peer dialing for cluster-wide queries (fab0 + optional fab1).
 	fabricPeerAddrFn func() []string
 	fabricVRFDevice  string
@@ -306,6 +322,19 @@ func (c *CLI) SetCommitFns(
 ) {
 	c.commitFn = commitFn
 	c.commitConfirmedFn = commitConfirmedFn
+}
+
+// SetFactoryResetFn wires the daemon's coordinated factory-reset transaction
+// (#5871) so the in-process `request system zeroize` runs its wipe under the
+// daemon apply gate + terminal reset generation, IDENTICAL to the gRPC zeroize
+// path (grpcapi.Config.ZeroizeFn -> daemon.factoryReset — the same function).
+// Without it a console zeroize erased state out-of-band, so a concurrent commit
+// / HA-sync / reconcile could re-create the just-wiped .configdb SSOT or
+// re-render the erased secrets. Leave unset for a CLI spawned outside the daemon
+// (offline recovery / unit test): performConsoleZeroize then falls back to an
+// ungated direct wipe (no reconcile loop is running to race).
+func (c *CLI) SetFactoryResetFn(fn func(ctx context.Context, wipe func() error) error) {
+	c.factoryResetFn = fn
 }
 
 // SetFabricPeer configures fabric peer dialing for cluster-wide queries.

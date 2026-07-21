@@ -52,6 +52,22 @@ sibling files (same package, so unexported helpers stay reachable):
     reboot into a half-wiped, secret-retaining state). The `#5554`/`#5280`
     configured-root resolution (a non-default `-config` erases its own root,
     not a hardcoded `/etc/xpf`) is preserved inside `zeroizeConfigRoot`.
+  - **`zeroize` runs THROUGH the daemon's coordinated factory-reset
+    transaction (#5871), not out-of-band.** `performConsoleZeroize` routes the
+    wipe through `factoryResetFn` — wired by the daemon to `d.factoryReset`
+    via `SetFactoryResetFn`, the SAME gate the gRPC path uses as
+    `grpcapi.Config.ZeroizeFn`. The transaction acquires the daemon apply
+    semaphore (draining any in-flight apply, blocking a concurrent one) and
+    enters the terminal reset generation BEFORE erasing, so no concurrent /
+    subsequent commit / HA-sync / reconcile re-persists the erased `.configdb`
+    SSOT or re-renders the wiped secrets. The pre-#5871 console called the
+    wipe DIRECTLY (ungated), so a concurrent writer could re-create just-erased
+    state while the console reported a clean reset. `factoryResetFn` is nil
+    only when the CLI is spawned OUTSIDE the daemon (offline recovery / unit
+    test): there is no reconcile loop to race, so the ungated direct wipe is
+    the explicit, reduced-guarantee fallback (mirroring
+    `grpcapi.runZeroize`'s `zeroizeFn==nil` path) — still fail-CLOSED and
+    still stops the daemon only on a fully-successful reset.
 - `cli_request_security.go` — `request security ipsec|policies|wireguard`.
 
 The security-sensitive `--` end-of-options separators in the diagcmd/tcpdump
