@@ -438,34 +438,57 @@ This is where io_uring is a real win.
 
 The slow-path reinjector (`src/slowpath.rs`) writes reinjected local/exception
 frames to a TUN device, preferring io_uring and falling back to a synchronous
-`write()`. Its `WriteMode` (`IoUring` | `SyncFallback`) is governed by three
-linked invariants:
+`write()`. The shared io_uring write loop lives in `src/io_uring_write.rs` and is
+also used by the state writer. Its `WriteMode` (`IoUring(RingWriter)` |
+`SyncFallback`) is governed by these linked invariants:
 
+- **Ring-owned in-flight registry + buffer lifetime (#5800, replaces the #2297
+  ceiling hole).** `write_all` takes the packet buffer BY VALUE. Every submitted
+  write is tagged with a ring-global, monotonically increasing `user_data` id
+  (never restarting per call, so a leftover CQE from an earlier call can never
+  alias a later one; the id space is fail-closed on wrap). A write that cannot be
+  proven terminal before the loop must return — the `MAX_WAIT_RETRIES` retry
+  ceiling was hit, or the ring returned a fatal OS error — is `Deferred`: its
+  owned buffer is MOVED into the ring's `InflightRegistry` (moving a `Vec`
+  preserves the heap address the SQE points at) and stays owned there. It is
+  never freed while an SQE may still reference it. A deferred buffer is released
+  only when ONE terminal state is observed: its matching write CQE is reaped
+  (opportunistically at the top of the next write), a teardown drain cancels the
+  op AND observes both the cancel's completion and the target write's terminal
+  CQE, or the ring fd closes (`RingWriter` field order drops the ring — kernel
+  cancel+wait — before the registry frees buffers). The old code returned at the
+  ceiling and let the caller free the buffer with the SQE possibly still in
+  flight (a UAF-class disclosure/corruption); the fix moves ownership instead of
+  weakening lifetime.
 - **Per-call fallback (#2477).** An io_uring failure that put NOTHING on the TUN
-  (`WriteError::NothingWritten`, `safe_to_retry`) is rescued by a synchronous
-  write of the SAME packet — the frame is still deliverable. An
-  ambiguous/partial failure (`WriteError::Transferred`) is DROPPED, never
-  sync-resent: bytes may be in flight, so re-sending would double-transmit
-  (truncated frame + duplicate to local BGP/OSPF listeners).
+  (`WriteResult::NothingWritten`) hands the owned buffer back and is rescued by a
+  synchronous write of the SAME packet — the frame is still deliverable. A
+  reaped packet-fd partial (`WriteResult::Transferred`) is DROPPED, never
+  sync-resent: bytes are already on the device, so re-sending would
+  double-transmit (truncated frame + duplicate to local BGP/OSPF listeners). A
+  `Deferred` write is also dropped (no sync-resend — the buffer is parked and the
+  op may be in flight).
 - **Runtime demotion (#5172, mirrors state_writer #2958).** A structured
-  per-write outcome separates packet-transfer certainty from RING HEALTH. On a
-  TERMINAL ring failure — an ambiguous submit/reap, i.e. the ring is wedged (a
-  partial write cannot occur on an atomic TUN write, so `Transferred` here means
-  the transport, not the packet) — the worker retires the ring ONCE: it drops
-  the `IoUring` (closing its fd, which the kernel uses to cancel outstanding
-  SQEs) and flips `WriteMode` to `SyncFallback` plus reports `mode = "sync"`.
-  Every later packet then takes the sync branch directly instead of retrying the
-  broken ring (which otherwise degrades BGP/OSPF/mgmt/local traffic). The
-  demotion is PERMANENT (no cooldown re-promotion — avoids flapping).
-- **Transient does NOT demote.** A `safe_to_retry` failure the sync fallback
-  rescued keeps io_uring live — a momentary blip must not abandon the ring.
-- **Buffer lifetime (#2297).** The current packet's buffer outlives the ring
-  drop (the worker loop owns it until after the demotion applies), so no kernel
-  reference can dangle across the retirement.
+  per-write outcome separates packet-transfer certainty from RING HEALTH. A
+  `Deferred { fatal_ring: true }` — the ring fd itself is dead — retires the ring
+  ONCE: dropping the `RingWriter` runs a bounded teardown drain and closes the
+  ring fd (which frees any parked buffer safely), then `WriteMode` flips to
+  `SyncFallback` and reports `mode = "sync"`. Every later packet then takes the
+  sync branch directly instead of retrying the broken ring (which otherwise
+  degrades BGP/OSPF/mgmt/local traffic). The demotion is PERMANENT (no cooldown
+  re-promotion — avoids flapping).
+- **Transient does NOT demote.** A `NothingWritten` the sync fallback rescued, or
+  a bare retry-ceiling `Deferred { fatal_ring: false }` (an EINTR storm), keeps
+  io_uring live — a momentary blip must not abandon the ring; the parked buffer
+  is reclaimed on a later write's opportunistic reap.
 
 Unlike `state_writer`, the slow path's `active` flag tracks TUN/worker liveness,
 not io_uring, so a demotion flips `mode` but leaves `active` set — the path is
-still up, just in sync mode.
+still up, just in sync mode. The state writer applies the SAME registry contract
+for its positioned temp-file writes: a `Deferred` write fails the persist (its
+buffer is parked, not sync-retried) and demotes to sync; a `NothingWritten` or a
+durable-finalize failure hands the buffer back for a synchronous rewrite to a
+fresh temp.
 
 Important:
 

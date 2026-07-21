@@ -54208,3 +54208,60 @@ top.
 - **Timestamp**: 2026-07-21
   **Action**: Fold #6167 review MINOR — correct the heartbeat anti-replay security bound in heartbeat.go (heartbeatReplaySessions comment) + pkg/cluster/README.md "Bound safety" to the honest 65-recording sustained-replay reality (was falsely "requires a genuine peer reboot / cannot be sustained"); no admit()/FIFO code change
   **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/README.md
+  **Action**: #5303 — add a pre-auth admission cap to the session-sync accept
+  loop so a connection flood that stalls before authentication cannot exhaust
+  FDs/goroutines/socket-memory and deny a legitimate peer's reconnect. New
+  `beginSetup`/`finishSetup`/`closeSetupConns`/`notePreAuthRejected` in
+  `sync_admission.go`: bounded pool (`preAuthSetupCap`=8) with a peer-IP-reserved
+  tail (`preAuthPeerReserve`=2) so a non-peer flood can take at most 6 slots and
+  the peer always reconnects. Deferred the 256 KiB socket-buffer sizing
+  (`configureConnFn`) until AFTER `performSyncHandshake` succeeds — pre-auth
+  sockets stay cheap; slot released on handshake-resolve so it never spans bulk
+  sync. `Stop()` now `closeSetupConns()` to unblock stalled pre-auth handshakes
+  (no shutdown hang). Preserves #4370 parallel accept + #4107 HMAC handshake +
+  #3931/#4151 config-gen admission. New `PreAuthRejected` sync stat. Three
+  fail-on-revert tests, each binding one production line (reservation subtraction
+  / configureConnFn placement / closeSetupConns call) — verified RED as clean
+  assertion failures on revert.
+  **File(s)**:
+  - `pkg/cluster/sync_admission.go` (new — admission gate)
+  - `pkg/cluster/sync_conn.go` (acceptLoop admit, handleNewConnection deferral +
+    release, fabricConnectLoop outbound register, Stop close-in-flight)
+  - `pkg/cluster/sync.go` (SessionSync pre-auth fields; `PreAuthRejected` stat +
+    snapshot + Stats())
+  - `pkg/cluster/sync_admission_test.go` (new — 4 fail-on-revert tests)
+  - `docs/session-sync-architecture.md` (Pre-Auth Connection Admission section)
+## 2026-07-21 — #5800 io_uring write in-flight registry (UAF fix)
+- **Timestamp**: 2026-07-21
+- **Action**: Close the retry-ceiling/fatal-ring use-after-free in the shared
+  io_uring write loop. `write_all` now takes the packet buffer BY VALUE, tags
+  every submission with a ring-global monotonic `user_data` (fail-closed on
+  wrap), and on retry-exhaustion / fatal-ring returns `WriteResult::Deferred`
+  only AFTER moving the owned buffer into a ring-owned `InflightRegistry` — the
+  buffer is never freed while an SQE may reference it. Deferred buffers are
+  released only on a reaped terminal CQE, a bounded teardown drain (AsyncCancel +
+  observe BOTH the cancel CQE and the target write's terminal CQE), or ring-fd
+  close (RingWriter field order drops the ring before the registry). Migrated
+  BOTH callers (slow-path TUN writes + positioned state-file writes) to
+  `RingWriter` + `WriteResult`. Added fail-on-revert tests driving the FakeRing
+  seam (ceiling EINTR / transient EAGAIN / permanent EBADF defer-not-free,
+  cancellation race, stale-CQE non-misattribution, id-wrap fail-closed, teardown
+  drain, fatal-ring retain). Parent-RED: neutralizing `reg.defer(slot)` →
+  `drop(slot)` turns 9 registry-invariant tests RED as clean assertion failures.
+  Full userspace-dp suite green (4054 lib tests); primary regression 5/5
+  non-flaky. Retry-exhaustion/error branches only — healthy write path unchanged
+  (Done/short-write/EINTR-then-success paths preserved).
+- **File(s)**:
+  - `userspace-dp/src/io_uring_write.rs` (InflightRegistry, RingWriter,
+    WriteResult, ring-global id, teardown drain, reap_matching ReapError)
+  - `userspace-dp/src/io_uring_write_tests.rs` (FakeRing cancel/drain seam +
+    #5800 defer/teardown/id-wrap tests; realistic pending-cancel modelling)
+  - `userspace-dp/src/slowpath.rs` (WriteMode::IoUring(RingWriter),
+    classify_io_uring_write over WriteResult, retire_ring_to_sync simplified)
+  - `userspace-dp/src/slowpath_tests.rs` (classify tests over WriteResult;
+    new non-fatal-deferral-keeps-iouring test)
+  - `userspace-dp/src/state_writer.rs` (WriteMode::IoUring(RingWriter),
+    IoUringPersist enum, persist_with_io_uring by-value + Deferred handling)
+  - `userspace-dp/src/state_writer_tests.rs` (RingWriter construction)
+  - `docs/xdp-io-uring-userspace-dataplane.md` (#5800 registry contract)
+  - `docs/pr/5800-iouring-inflight-registry/plan.md` (plan + deviations)
