@@ -54935,3 +54935,29 @@ top.
 - **File(s)**: pkg/daemon/daemon_reth.go,
   pkg/daemon/daemon_reth_pciaddr_6199_test.go (new), pkg/daemon/README.md,
   _Log.md
+
+- **Timestamp**: 2026-07-21 16:20
+- **Action**: #5178 — synced deterministic NAT reservations were tagged
+  non-deterministic and leaked into a recycle queue the deterministic
+  allocation path never drains (unbounded standby memory). `reserve_flow`
+  (nat/allocator.rs) had no `deterministic` parameter and hardcoded
+  `deterministic: false` on the LiveAllocation, so on a standby running a
+  deterministic CGNAT (mode 1) / NAPT64 (mode 2) pool every synced session's
+  reserved port released through `free_recycle` (uncapped/undeduped VecDeque)
+  instead of `free_no_recycle` (#4559). Threaded a `deterministic` param
+  through `reserve_flow` and both HA-sync wrappers:
+  `reserve_synced_source_nat_allocation` passes `rule.deterministic_v4.is_some()`
+  and `reserve_synced_nat64_allocation` → `reserve_nat64_pool_port` passes
+  `prefix.deterministic_v6.is_some()`. The stale-tuple re-reserve free now also
+  honors `!existing.deterministic`. The other hardcoded `deterministic: false`
+  sites (round-robin PAT alloc, persistent alloc/reuse, address-only) are
+  genuinely non-deterministic and left unchanged. Added fail-on-revert test
+  `synced_deterministic_reservation_not_recycled_5178` (nat/tests_pool.rs):
+  a synced deterministic reservation released → recycle queue stays EMPTY
+  (RED on revert), a non-deterministic reservation STILL recycles (green,
+  guards over-correction). Build + targeted test pass; full cargo suite run.
+  NAT/dataplane HA path — needs loss-cluster failover smoke (batched).
+- **File(s)**: userspace-dp/src/nat/allocator.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat64.rs,
+  userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/nat64_tests.rs,
+  docs/deterministic-nat-cgnat.md, _Log.md

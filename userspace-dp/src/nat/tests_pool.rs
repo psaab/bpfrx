@@ -4120,6 +4120,112 @@ fn synced_session_reserves_nat_pool_port_4388() {
     );
 }
 
+// #5178 FAIL-ON-REVERT: a peer-synced session reserved on a DETERMINISTIC
+// CGNAT (mode 1) pool must be tagged deterministic in the standby's local
+// allocator, so its RELEASE takes the `free_no_recycle` path (the occupancy bit
+// is the only reuse gate) instead of pushing the freed port onto the per-address
+// recycle `VecDeque`. The deterministic allocation path never drains that queue
+// (#4559), so a mis-tagged reservation leaks one recycle entry per released
+// synced flow → unbounded standby memory under synced-session churn.
+//
+// Before the fix `reserve_flow` hardcoded `deterministic: false`, so the standby
+// stored every synced reservation as non-deterministic and recycled it on
+// release. Reverting the threaded `deterministic` parameter (hardcoding it back
+// to `false`) makes the "deterministic reservation must NOT recycle" assertion
+// RED. The non-deterministic control below proves round-robin pools still
+// recycle (the fix is not an over-correction that suppresses ALL recycling).
+#[test]
+fn synced_deterministic_reservation_not_recycled_5178() {
+    // --- Deterministic (mode 1) pool: released reservation must NOT recycle. ---
+    let det_pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let host_base = u32::from(Ipv4Addr::new(100, 64, 0, 0));
+    let det_rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "cgn-pool".to_string(),
+        from_zone: "subs".to_string(),
+        to_zone: "inet".to_string(),
+        source_addresses: vec!["100.64.0.0/22".to_string()],
+        pool_name: "cgn-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        deterministic_mode: 1,
+        deterministic_block_size: 512,
+        deterministic_blocks_per_ip: 126,
+        deterministic_host_base: host_base,
+        deterministic_host_count: 1024,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert!(
+        det_rules[0].deterministic_v4.is_some(),
+        "mode-1 snapshot must build a deterministic rule (test precondition)"
+    );
+
+    // A peer-synced session the active node translated deterministically:
+    // subscriber 100.64.0.5 -> external 203.0.113.1, block [3584, 4095].
+    let det_key = session_key_from_src("100.64.0.5", 40000, "8.8.8.8", 443);
+    let det_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(det_pool_ip)),
+        rewrite_src_port: Some(3584),
+        ..NatDecision::default()
+    };
+    reserve_synced_source_nat_allocation(&det_rules, &det_key, det_nat, false);
+    assert!(
+        det_rules[0].pool_allocator.debug_is_port_occupied(0, 3584),
+        "synced deterministic reservation must occupy its pool port"
+    );
+
+    // Standard teardown (reap / delete-sync) releases the reservation.
+    release_source_nat_allocation(&det_rules, &det_key, det_nat, false, 2_000);
+    assert!(
+        !det_rules[0].pool_allocator.debug_is_port_occupied(0, 3584),
+        "release must free the deterministic reservation's bit"
+    );
+    // THE FAIL-ON-REVERT ASSERTION: a deterministic reservation must NOT land in
+    // the recycle queue. On revert (hardcoded `deterministic: false`) release
+    // recycles the port and this queue is non-empty.
+    assert!(
+        det_rules[0].pool_allocator.debug_recycled_ports(0).is_empty(),
+        "a released deterministic synced reservation must NOT be recycled \
+         (free_no_recycle); a non-empty recycle queue is the #5178 leak"
+    );
+
+    // --- Non-deterministic (round-robin) pool: release STILL recycles. ---
+    let rr_pool_ip: Ipv4Addr = "203.0.113.9".parse().unwrap();
+    let rr_rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "rr-pool".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "rr-pool".to_string(),
+        pool_addresses: vec!["203.0.113.9/32".to_string()],
+        port_low: 10000,
+        port_high: 10001,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert!(
+        rr_rules[0].deterministic_v4.is_none(),
+        "a plain pool must NOT be deterministic (test precondition)"
+    );
+    let rr_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let rr_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(rr_pool_ip)),
+        rewrite_src_port: Some(10000),
+        ..NatDecision::default()
+    };
+    reserve_synced_source_nat_allocation(&rr_rules, &rr_key, rr_nat, false);
+    release_source_nat_allocation(&rr_rules, &rr_key, rr_nat, false, 2_000);
+    // Unchanged by the fix: a round-robin reservation recycles on release so the
+    // freed port is reused oldest-first (#3011). This must stay GREEN both before
+    // and after #5178 — the fix must not suppress recycling for round-robin pools.
+    assert!(
+        rr_rules[0]
+            .pool_allocator
+            .debug_recycled_ports(0)
+            .contains(&10000),
+        "a non-deterministic synced reservation must STILL recycle on release"
+    );
+}
+
 // #4388: a peer-synced session WITHOUT a source-NAT translation (no
 // rewrite_src / rewrite_src_port — plain forwarding, address-only, or `port
 // no-translation`) reserves nothing. The allocator stays empty and a new flow

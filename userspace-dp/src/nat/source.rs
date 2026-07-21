@@ -889,10 +889,17 @@ pub(crate) fn reserve_synced_source_nat_allocation(
         let Some(addr_index) = addr_index else {
             continue;
         };
-        if rule
-            .pool_allocator
-            .reserve_flow(flow, translated, addr_index)
-        {
+        // #5178: tag the reservation deterministic iff this rule runs a
+        // deterministic CGNAT (mode 1) pool, so its release uses
+        // `free_no_recycle` and the standby's recycle queue does not grow under
+        // synced-session churn — matching the active node's
+        // `allocate_deterministic_v4` release path.
+        if rule.pool_allocator.reserve_flow(
+            flow,
+            translated,
+            addr_index,
+            rule.deterministic_v4.is_some(),
+        ) {
             break;
         }
     }
@@ -1000,18 +1007,25 @@ pub(crate) fn release_nat64_pool_port(
 /// equals the pool position. Returns whether the reservation took (`false` if
 /// the port is already owned by a DIFFERENT live allocation — the caller then
 /// tries the next prefix).
+///
+/// #5178: `deterministic` is `true` when the prefix runs a NAPT64 (mode 2)
+/// deterministic pool (`prefix.deterministic_v6.is_some()`), so the reservation
+/// is tagged deterministic and released via `free_no_recycle` — matching the
+/// active node's `allocate_deterministic_v6` release. A round-robin NAT64 pool
+/// passes `false` and keeps today's recycle behaviour.
 pub(crate) fn reserve_nat64_pool_port(
     allocator: &PortAllocator,
     flow: SourceNatFlowKey,
     snat_v4: Ipv4Addr,
     port: u16,
     addr_index: usize,
+    deterministic: bool,
 ) -> bool {
     let translated = TranslatedTuple {
         ip: IpAddr::V4(snat_v4),
         port,
     };
-    allocator.reserve_flow(flow, translated, addr_index)
+    allocator.reserve_flow(flow, translated, addr_index, deterministic)
 }
 
 pub(crate) fn match_source_nat(
