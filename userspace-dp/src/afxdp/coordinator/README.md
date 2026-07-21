@@ -142,14 +142,15 @@ Differences that matter (#1881):
   `last_reconcile_stage` with `spawned:workers=..` and returned success —
   so `reconcile` returned `Ok(())`, the control handler acked `ok=true`,
   and PERSISTED the broken snapshot as the boot baseline (no retry). Now
-  `bring_up_workers` returns `Result<(), String>`: on the FIRST spawn
+  `bring_up_workers` returns `Result<(), WorkerBringUpError>`: on the FIRST spawn
   failure it ABORTS the remaining launches (the data plane is already
   broken; more XSK-bound workers cannot restore forwarding and only widen
   the resource pressure), PRESERVES the `spawn_worker_failed:<id>:<err>`
   stage (no `spawned:..` overwrite), skips the auxiliary-thread bring-up,
   and returns the stage. `reconcile` maps it to
-  `ReconcileError::WorkerSpawn` — the ONE `ReconcileError` variant raised
-  AFTER teardown (the data plane HAS moved; there is no prior-state restore
+  `ReconcileError::WorkerSpawn` — one of two `ReconcileError` variants
+  raised AFTER teardown (`WorkerBindIncomplete` (#5143) is the other; the
+  data plane HAS moved; there is no prior-state restore
   that brings the torn-down workers back, only fail-closed bookkeeping +
   a retry/last-good reconcile). Full pre-teardown preflight of the spawn is
   not tractable (a real `pthread_create` cannot be probed without spawning,
