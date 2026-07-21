@@ -54916,3 +54916,22 @@ top.
 - **File(s)**: pkg/dataplane/userspace/manager_ha.go,
   pkg/dataplane/userspace/snapshot_enoent_consistency_6194_test.go (new),
   docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-07-21 15:59
+- **Action**: #6199 — pciAddrToEnp now honors the PCI domain. Was
+  `strings.SplitN(pciAddr, ":", 3)` using only parts[1] (bus) + parts[2]
+  (slot.func) and DISCARDING parts[0] (domain). On multi-PCI-domain hardware
+  (domain != 0000, e.g. 10000:01:00.0) systemd's ID_NET_NAME_PATH encodes the
+  domain as a `P<domain>` segment — `en[P<domain>]p<bus>s<slot>[f<func>]` per
+  systemd.net-naming-scheme(7) ("The PCI domain is only prepended when it is
+  not 0") — so two NICs at the same bus/slot in different domains collided
+  onto one name and resolved the wrong RETH member. Fix parses parts[0] as hex
+  and emits `enP<domain>...` for non-zero domain; domain 0000 stays
+  bit-identical to the historical `enp<bus>s<slot>[f<func>]`. All components
+  hex-in / decimal-out to match systemd's `%x` scan / `%u` print. Added
+  fail-on-revert test (domain-0 pinned GREEN, domain-N + collision RED when the
+  domain segment is neutralized). Build + vet + full pkg/daemon suite pass.
+  Unit-provable — no smoke.
+- **File(s)**: pkg/daemon/daemon_reth.go,
+  pkg/daemon/daemon_reth_pciaddr_6199_test.go (new), pkg/daemon/README.md,
+  _Log.md
