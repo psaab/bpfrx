@@ -54176,6 +54176,12 @@ top.
   **File(s)**: userspace-dp/src/afxdp/README.md
 
 - **Timestamp**: 2026-07-21
+  **Action**: #5673 — bound the pre-policy dynamic-neighbor map growth against a spoofed-source DoS. Source-address learning runs on RX before screen/policy admission, so a spoofed-source flood could inflate the shared `dynamic_neighbors` map (memory) and serialize every worker on the 64-shard bulk lock (CPU) with no policy check. Added a per-shard learn cap (`MAX_DYNAMIC_NEIGHBORS_PER_SHARD` = 2048, aggregate `MAX_DYNAMIC_NEIGHBORS` = 131072) enforced on the transit-source arm (`learn_pair_if_changed`) and the ARP/NDP arm (`insert_if_changed`); an UPDATE to an already-learned neighbor and the control-plane/resolver installs are never capped. The RX-learn caller (`learn_dynamic_neighbor`) short-circuits the bulk lock via a capacity-aware pre-check (`get_with_capacity`) once every candidate key is new-and-at-cap, removing the all-shard serialization for a flood. Refusals counted (`learn_cap_drops`) and surfaced as Prometheus `xpf_userspace_dynamic_neighbor_learn_cap_drops_total`.
+  **File(s)**: userspace-dp/src/afxdp/sharded_neighbor.rs, userspace-dp/src/afxdp/sharded_neighbor_tests.rs, userspace-dp/src/afxdp/neighbor_dispatch.rs, userspace-dp/src/afxdp/coordinator/status.rs, userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/tests.rs, userspace-dp/src/server/helpers.rs, userspace-dp/src/server/lifecycle.rs, pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go, pkg/api/metrics_descriptor_coverage_test.go, docs/feature-coverage.md, docs/userspace-dataplane-gaps.md
+
+- **Timestamp**: 2026-07-21
+  **Action**: Fold #6170 review — regenerate protocol_wire_v1.json for the new dynamic_neighbor_learn_cap_drops_total wire field (MERGE-BLOCKER: #1325 wire gate was RED) + soften the sharded_neighbor.rs shard-hash docstring overclaim to admit the shard-concentration residual (fixed/unkeyed hash) + cite the resolver backstop
+  **File(s)**: userspace-dp/tests/fixtures/protocol_wire_v1.json, userspace-dp/src/afxdp/sharded_neighbor.rs
   **Action**: Fix #5477 (security, heartbeat replay) — track RETIRED sender
   sessions in `heartbeatAuthReplay.admit`. The pre-fix tracker held exactly
   ONE `(session, counter)` and re-anchored on ANY session change, so an

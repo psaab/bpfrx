@@ -29,10 +29,65 @@ use super::types::{FastMap, NeighborEntry};
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 pub(super) const NUM_SHARDS: usize = 64;
+
+/// #5673: per-shard cap on the number of dynamically LEARNED neighbor
+/// entries. Bounds the shared `dynamic_neighbors` map against a
+/// spoofed-source pre-policy flood.
+///
+/// Source-address learning runs on RX (`stage_parse_flow_and_learn`, stage
+/// 7+8) BEFORE the screen/policy admission stages, so an attacker on an
+/// untrusted segment can send a stream of packets whose L3 source is a
+/// distinct, otherwise-plausible unicast IP and — without ever passing a
+/// policy check — grow this map by one entry per fake source (codex-review
+/// M02 / #5673). Two harms: unbounded memory growth, and every genuine
+/// first-sighting insert taking the 64-shard `with_all_shards` bulk lock,
+/// serializing all workers (CPU DoS).
+///
+/// The cap makes a NEW data-path learn whose target shard is already at
+/// `MAX_DYNAMIC_NEIGHBORS_PER_SHARD` a no-op (the packet still forwards —
+/// this is a learn-path guard, not a packet filter). An UPDATE to an
+/// already-learned neighbor (a real MAC failover) is not growth and is
+/// never refused, so legitimate established flows keep resolving. The
+/// authoritative control-plane push (`bulk_replace_neighbors`) and the
+/// on-demand resolver (`insert_confirmed_if_unchanged`) bypass the cap:
+/// they install real, topology-bounded next-hops, not attacker-driven ones.
+///
+/// Sizing and the shard-concentration residual: the shard hash (`shard_idx`,
+/// FxHash + Knuth mix) is FIXED, PUBLIC and UNKEYED. It spreads a RANDOM flood
+/// ~evenly across shards, but an attacker who PRECOMPUTES source IPs CAN
+/// concentrate them onto one shard — filling that shard's
+/// `MAX_DYNAMIC_NEIGHBORS_PER_SHARD` (2048) while the aggregate stays far below
+/// `MAX_DYNAMIC_NEIGHBORS` (131072). The cap's PRIMARY guarantees still hold
+/// under concentration: bounded memory and no all-shard serialization. The
+/// residual is that opportunistic pre-warm LEARNING of a legit neighbor whose
+/// IP hashes to a victim shard can be denied while that shard is attacker-full
+/// — but forwarding to it is NOT lost: the uncapped on-demand resolver
+/// (`insert_confirmed_if_unchanged`) still installs the real next-hop, at the
+/// cost of extra resolver round-trips. Related minor residual:
+/// `learn_pair_if_changed` refuses the WHOLE pair if EITHER key is new-at-cap,
+/// so a desynced-pair UPDATE could be dropped under concentration (vanishingly
+/// rare; resolver-recovered). A keyed/seeded shard hash would close the
+/// concentration residual if it ever matters. 2048/shard → 131072 aggregate is
+/// well above any realistic learned population (a firewall resolves neighbors
+/// for its directly-connected subnets — a /15 of on-link hosts — not the
+/// Internet).
+pub(super) const MAX_DYNAMIC_NEIGHBORS_PER_SHARD: usize = 2048;
+
+/// #5673: aggregate cap on dynamically learned neighbor entries. Derived
+/// from the per-shard cap and the shard count (see
+/// `MAX_DYNAMIC_NEIGHBORS_PER_SHARD`, which also documents the
+/// shard-concentration residual on the fixed/unkeyed shard hash). Exposed
+/// for tests and any operator surface that wants to reason about the bound.
+pub(crate) const MAX_DYNAMIC_NEIGHBORS: usize = MAX_DYNAMIC_NEIGHBORS_PER_SHARD * NUM_SHARDS;
+
+const _: () = assert!(
+    MAX_DYNAMIC_NEIGHBORS_PER_SHARD > 0,
+    "per-shard dynamic-neighbor cap must be positive so a genuine learn can land"
+);
 
 /// One mutex-guarded shard, padded to 64 bytes so adjacent shards do
 /// not share cache lines.
@@ -83,6 +138,14 @@ pub(crate) struct ShardedNeighborMap {
     /// (the shard is precomputed at cache-miss time) — allocation-free per
     /// docs/engineering-style.md hot-path rules.
     shard_mac_epochs: [AtomicU32; NUM_SHARDS],
+
+    /// #5673: cumulative count of data-path neighbor LEARNS refused because
+    /// the target shard was already at `MAX_DYNAMIC_NEIGHBORS_PER_SHARD`. A
+    /// nonzero, growing value means the aggregate neighbor-map cap is
+    /// bounding a spoofed-source pre-policy flood (source learning runs on
+    /// RX before screen/policy admission). Relaxed — observability only, and
+    /// off the fast path except on an actual refusal.
+    learn_cap_drops: AtomicU64,
 }
 
 /// Shard index for a key. The Knuth multiplier `0x9E3779B97F4A7C15`
@@ -108,7 +171,41 @@ impl ShardedNeighborMap {
         Self {
             shards: std::array::from_fn(|_| PaddedShard::new()),
             shard_mac_epochs: std::array::from_fn(|_| AtomicU32::new(0)),
+            learn_cap_drops: AtomicU64::new(0),
         }
+    }
+
+    /// #5673: cumulative data-path learns refused by the aggregate
+    /// neighbor-map cap (see `MAX_DYNAMIC_NEIGHBORS_PER_SHARD`). Read by the
+    /// operator status surface; a growing value is the signal that a
+    /// spoofed-source pre-policy flood is being bounded.
+    #[inline]
+    pub(crate) fn learn_cap_drops(&self) -> u64 {
+        self.learn_cap_drops.load(Ordering::Relaxed)
+    }
+
+    /// #5673: account one refused data-path learn. Called from the RX-learn
+    /// caller-side short-circuit (`learn_dynamic_neighbor`), which skips the
+    /// bulk lock for the all-new-at-cap flood fast path, so the refusal it
+    /// makes is still counted exactly like the one `learn_pair_if_changed`
+    /// makes under the bulk lock. Relaxed; off the fast path except on a
+    /// refusal.
+    #[inline]
+    pub(crate) fn note_learn_cap_drop(&self) {
+        self.learn_cap_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// #5673: `get` plus whether the key's shard is at the per-shard learn
+    /// cap, under ONE shard lock (same cost as `get`). The RX-learn
+    /// pre-check (`learn_dynamic_neighbor`) uses this to detect that every
+    /// candidate key is a NEW learn whose shard is full and skip the
+    /// all-shard bulk write — avoiding the 64-shard serialization a
+    /// spoofed-source flood would otherwise inflict on every packet.
+    pub(crate) fn get_with_capacity(&self, key: &(i32, IpAddr)) -> (Option<NeighborEntry>, bool) {
+        let shard = self.lock_shard(shard_idx(key));
+        let entry = shard.get(key).copied();
+        let at_cap = shard.len() >= MAX_DYNAMIC_NEIGHBORS_PER_SHARD;
+        (entry, at_cap)
     }
 
     /// #5147: shard index for a neighbor key. Exposed so the worker flow
@@ -250,6 +347,18 @@ impl ShardedNeighborMap {
         let mut shard = self.lock_shard(idx);
         let prior_mac = shard.get(&key).map(|existing| existing.mac);
         if prior_mac == Some(val.mac) {
+            return false;
+        }
+        // #5673: a NEW learn (no prior entry for this key) that would grow
+        // the shard past the per-shard cap is refused — the spoofed-source
+        // pre-policy flood bound. This arm is the RX ARP-reply / NDP-NA
+        // data-path learn (poll_stages.rs); an attacker can flood distinct
+        // learnable source IPs here just as on the transit-source arm, and
+        // both share this map. An UPDATE to an existing neighbor
+        // (`prior_mac.is_some()`, e.g. a real MAC failover) is not growth and
+        // is never refused, so a legitimate learned neighbor keeps working.
+        if prior_mac.is_none() && shard.len() >= MAX_DYNAMIC_NEIGHBORS_PER_SHARD {
+            self.learn_cap_drops.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         // #3048: a genuine MAC CHANGE (an existing entry whose hwaddr is
@@ -395,6 +504,25 @@ impl ShardedNeighborMap {
         val: NeighborEntry,
     ) {
         self.with_all_shards(|bulk| {
+            // #5673: refuse the WHOLE pair-write if ANY new key's shard is at
+            // the per-shard cap. This is the transit-source RX learn arm
+            // (`learn_dynamic_neighbor`), the primary M02/#5673 vector: an
+            // attacker floods distinct spoofed L3 sources pre-policy. A key
+            // that already exists is an UPDATE (real MAC failover), not
+            // growth, and never counts against the cap. Refusing the whole
+            // pair rather than a partial preserves this method's documented
+            // both-or-neither invariant (a reader sees both keys or neither).
+            // The authoritative check lives here under the bulk lock; the
+            // caller (`learn_dynamic_neighbor`) additionally skips this bulk
+            // acquisition entirely when its pre-check already saw every key
+            // new-and-at-cap, so a steady flood never reaches this lock.
+            let blocked = keys.iter().any(|key| {
+                bulk.get(key).is_none() && bulk.len_for(key) >= MAX_DYNAMIC_NEIGHBORS_PER_SHARD
+            });
+            if blocked {
+                self.learn_cap_drops.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             // #5147: mark the SHARD of each key that genuinely changed MAC.
             // The pair-write can straddle two shards (the physical and the
             // logical VLAN sub-ifindex hash independently), so a change must
@@ -512,6 +640,14 @@ impl<'a> BulkShardGuard<'a> {
     /// Sum of `len()` across all shards.
     pub(crate) fn total_len(&self) -> usize {
         self.guards.iter().map(|g| g.len()).sum()
+    }
+
+    /// #5673: entry count of the shard that holds `key`, while every shard
+    /// is locked. Used by `learn_pair_if_changed` to enforce the per-shard
+    /// learn cap on a NEW key under the same bulk lock as the insert (so the
+    /// cap decision and the insert cannot race).
+    pub(crate) fn len_for(&self, key: &(i32, IpAddr)) -> usize {
+        self.guards[shard_idx(key)].len()
     }
 }
 
