@@ -150,10 +150,40 @@ func (m *Manager) ClearZoneCounterOffsets() {
 }
 
 // ClearGlobalCounters zeroes all global counter entries.
+//
+// A counter clear is an EPOCH operation: every source ReadGlobalCounter merges
+// must move to zero together. ReadGlobalCounter returns the per-CPU BPF array
+// sum PLUS the in-memory userspaceCounterOffsets entry (IncrementGlobalCounter
+// accumulates the helper-forwarded deltas there so userspace-forwarded packets
+// that bypass the BPF pipeline are still reflected). Zeroing only the BPF array
+// therefore let a cleared global RX/TX/drop/session total snap straight back to
+// its pre-clear value on the next read (#5098) — the offset half survived.
+//
+// Drop the offset map FIRST, under the same m.mu that guards every
+// IncrementGlobalCounter/ReadGlobalCounter access, so (a) the clear takes
+// effect on the read path even without a loaded BPF map (userspace-only
+// runtime), mirroring ClearZoneCounters/ClearNATRuleCounters, and (b) in the
+// userspace runtime the per-CPU BPF array is always 0 — the helper forwards
+// packets outside the BPF pipeline and records them ONLY in the offset map,
+// never the array — so once the offset is dropped a concurrent
+// ReadGlobalCounter merges 0 (offset) + 0 (array) = 0. Note the offset reset
+// and the BPF-array zero below are NOT co-locked: the reset happens under m.mu,
+// the array zeroing after it is released. That is safe here ONLY because the
+// array stays 0 in this runtime; were the array ever non-zero, a read racing
+// between the two steps could briefly merge a zeroed offset with a stale array.
+// This method clears every index [0,GlobalCtrMax) — exactly the set the offset
+// map can hold — so the whole map is reset.
 func (m *Manager) ClearGlobalCounters() error {
+	m.mu.Lock()
+	m.userspaceCounterOffsets = nil
+	m.mu.Unlock()
+
 	zm, ok := m.maps["global_counters"]
 	if !ok {
-		return fmt.Errorf("global_counters map not found")
+		// Userspace-only runtime with no BPF map loaded: the offset reset above
+		// is the meaningful clear, so a missing array is not an error (parity
+		// with ClearZoneCounters/ClearNATRuleCounters).
+		return nil
 	}
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]uint64, numCPUs)

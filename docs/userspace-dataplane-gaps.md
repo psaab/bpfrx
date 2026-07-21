@@ -175,6 +175,24 @@ counters (see below).
   different zones cannot be split by logical unit, so DERIVE would mis-attribute
   — worse than the honest hot-path accounting that #3651 now does.
 
+- **Global counter clear is an epoch (#5098).** `ReadGlobalCounter` returns the
+  per-CPU `global_counters` BPF array sum PLUS an in-memory `userspaceCounterOffsets`
+  entry. `IncrementGlobalCounter` — driven by `syncBPFCountersLocked` — ACCUMULATES
+  each 1/s helper delta (`cur - prevBindingCounters`) into that offset so
+  userspace-forwarded packets (RX/TX, aggregate/per-reason drops #4477/#3343/#3326,
+  SYN-cookie, NAT64) that bypass the BPF pipeline are reflected. This is an
+  ACCUMULATE, not an absolute overwrite like the NAT (#2218) and per-zone (#3651)
+  offset stores — so a clear must zero the offset explicitly or the cleared total
+  snaps straight back on the next read. `ClearGlobalCounters` now drops the whole
+  offset map first (under the same `m.mu` that guards every offset read/write, and
+  even without a loaded BPF map — parity with `ClearZoneCounters`/
+  `ClearNATRuleCounters`), and `ClearAllCounters` inherits it; the userspace
+  `ClearAllCounters` also rebases `prevBindingCounters` to the last-recorded
+  cumulative so the next poll's delta measures traffic strictly AFTER the clear.
+  There is no `clear_global_counters` helper IPC: the helper's cumulative binding
+  counters keep climbing from launch, and the rebased delta baseline (not an IPC
+  reset) is what makes the cleared value stick.
+
 ## Retirement History (closed)
 
 The #1373 eBPF retirement is complete. This section is a record of the closed

@@ -1,3 +1,42 @@
+## 2026-07-20 — #5098: reset global counter offsets on clear (epoch semantics)
+
+- **Timestamp**: 2026-07-20 (fix/5098-clear-counter-offset)
+- **Action**: Fixed the userspace-mode snap-back where cleared global
+  RX/TX/drop/session totals immediately reverted to their pre-clear value.
+  `ReadGlobalCounter` merges the per-CPU `global_counters` BPF array sum with an
+  in-memory `userspaceCounterOffsets` entry that `IncrementGlobalCounter` /
+  `syncBPFCountersLocked` ACCUMULATE (not overwrite) for userspace-forwarded
+  packets; `ClearGlobalCounters`/`ClearAllCounters` zeroed only the BPF array, so
+  the offset half survived and the read snapped back. `ClearGlobalCounters` now
+  drops the whole offset map FIRST under `m.mu` (the same lock guarding every
+  offset read/write) — and no longer errors when the BPF map is absent
+  (userspace-only runtime), mirroring `ClearZoneCounters`/`ClearNATRuleCounters`.
+  `ClearAllCounters` inherits it via `ClearGlobalCounters`; the userspace
+  `Manager.ClearAllCounters` additionally rebases `prevBindingCounters` to the
+  last-recorded cumulative so the next 1/s poll's delta measures traffic strictly
+  after the clear (no stale delta re-fold). Corrected the false
+  policycounters.go comment that claimed `bpfShim.ClearAllCounters()` already
+  zeroed the offset map. Fail-on-revert merge gate
+  `Test_clear_global_counters_resets_userspace_offset_5098` (mapless, always
+  runs): seeds an offset via IncrementGlobalCounter AND a helper poll, clears via
+  BOTH `ClearGlobalCounters` and the operator `ClearAllCounters` path, asserts the
+  offset resets to 0 and a post-clear delta restarts from zero. Sibling
+  `Test_clear_global_counters_read_equation_zero_5098` (dataplane pkg, privileged;
+  SKIPs unprivileged) pins the full `ReadGlobalCounter` array+offset==0 equation.
+  Doc: userspace-dataplane-gaps.md gains a "Global counter clear is an epoch"
+  bullet.
+- **Validation**: full `pkg/dataplane/...` suite green under `-race`; named test
+  3x no flake; consumer pkgs (cli/api/grpcapi/daemon) green; gofmt + go vet clean;
+  `go build ./...` clean. Parent-RED: disabling the offset reset makes both
+  subtests RED (offset==100, cleared total snaps back); disabling the
+  prevBindingCounters rebase makes the delta subtest RED (reads 50, want 30) —
+  assertion failures, not build breaks; target-count 1 named test (+1 skipped
+  privileged sibling). NOT HA (counter clear path; unit-provable, no cluster smoke).
+- **File(s)**: pkg/dataplane/maps_counters.go,
+  pkg/dataplane/userspace/policycounters.go,
+  pkg/dataplane/maps_counters_clear_5098_test.go,
+  pkg/dataplane/userspace/manager_counters_test.go,
+  docs/userspace-dataplane-gaps.md
 ## 2026-07-20 — #6140: dedicated full-apply-leg no-persist test for #4952 post-teardown WorkerSpawn
 
 - **Timestamp**: 2026-07-20 (test/6140-full-apply-no-persist)
@@ -53752,6 +53791,38 @@ top.
   pkg/dataplane/userspace/neighbor_prewarm_singleflight_5104_test.go,
   docs/userspace-cold-start-fix-plan.md
 
+- **Timestamp**: 2026-07-20
+- **Action**: #5098 review fold — make ClearAllCounters offset-reset +
+  baseline-rebase atomic vs the 1/s status poll. Hostile review found a
+  lock-ordering gap that defeated the PR's "epoch atomicity": Phase-1 offset
+  reset (`bpfShim.ClearAllCounters`, DATAPLANE m.mu) ran OUTSIDE the userspace
+  m.mu, while Phase-2 baseline rebase (`prevBindingCounters`) ran under it. A
+  poll mid-cycle (holding userspace m.mu, `syncBPFCountersLocked` ->
+  `IncrementGlobalCounter` pending) could re-add `cur-stale_baseline` into the
+  just-zeroed offset AFTER Phase 1 but BEFORE Phase 2 — the rebase does not
+  re-zero the offset, leaving a small constant residual (~1 poll interval of
+  pre-clear traffic) on cleared global RX/TX/drop/session totals until the next
+  clear. FIX (option a): moved `m.mu.Lock()` to the top so the WHOLE method —
+  `bpfShim.ClearAllCounters` offset reset through the `prevBindingCounters`
+  rebase — is one userspace-m.mu critical section the poll cannot interleave
+  with. Lock order stays userspace->dataplane (matches the poll), deadlock-free;
+  the clearHelper*Locked helpers assume the lock held and never re-lock.
+  Also corrected the oversold `ClearGlobalCounters` comment: point (b) holds
+  because the userspace helper records forwarded packets ONLY in the offset map
+  (BPF array always 0 in this runtime), not because offset-reset and array-zero
+  are co-locked (they are not). Added a test-only `syncBPFCountersPreIncrement
+  Observer` seam. Merge-gate regression `Test_clear_all_counters_offset_atomic
+  _vs_status_poll_5098` drives a concurrent clear through that seam and asserts
+  post-clear offset == 0 (RED-on-revert verified: move the reset back outside
+  the lock -> offset residual = 50, assertion failure not build break). Plus
+  `Test_clear_all_counters_concurrent_poll_race_5098` (-race deadlock/data-race
+  coverage). Existing `Test_clear_global_counters_resets_userspace_offset_5098`
+  + its revert-RED still hold. Validated: `go test -race ./pkg/dataplane/...`
+  full green, named tests 3x, gofmt + go vet clean. NOT HA-smoke — unit-provable.
+- **File(s)**: pkg/dataplane/userspace/policycounters.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_counters_test.go,
+  pkg/dataplane/maps_counters.go
 ## 2026-07-20 — #6145 TX-status Drop-vs-retry precedence
 
 - **Timestamp**: 2026-07-20
