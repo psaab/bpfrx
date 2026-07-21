@@ -1,3 +1,47 @@
+## 2026-07-21 — #6148: de-flake event_stream stalled_consumer liveness under CPU contention
+
+- **Timestamp**: 2026-07-21 (fix/6148-deflake-backpressure-liveness)
+- **Action**: De-flaked the LIVENESS assertion in
+  `stalled_consumer_does_not_grow_backlog_unbounded_end_to_end`
+  (backpressure.rs). The failing assert was the wall-clock liveness check
+  `frames_write_stalled > 0` (~:261), NOT the boundedness/shedding safety
+  property. Under full-suite PARALLEL CPU contention the background
+  `run_connected_loop` thread was starved and could not migrate the
+  16 MiB `WRITE_BACKLOG_MAX_BYTES` worth of frames into `write_buf` within
+  the fixed 20s-pump + 5s-stall-wait deadlines, so the cap-trip counter
+  stayed 0 and the liveness assert intermittently failed (passed in
+  isolation 5/5 and on lightly-loaded master 3/3; failed 2/4 full-suite on
+  a branch that only ADDED unrelated tests → more contention).
+  ROOT CAUSE beyond the fixed clock: `try_send` bumps `frames_dropped` on a
+  full channel, so the old producer's `if frames_dropped > 0 { break }`
+  burned through the entire bounded pump doing one try_send per seq (a fast
+  BURST, not a sustained source), then the 5s stall-wait only trickled
+  1 frame/ms — far too weak to grow a starved loop's backlog to the cap.
+  FIX (option b + a): replaced the fixed two-phase pump with a
+  PROGRESS-GATED sustained source. `try_send` succeeds only when the loop
+  frees channel space by draining, and every drained frame lands
+  permanently in `write_buf` (wedged socket never drains it), so `sent_ok`
+  self-paces to the loop's real drain progress and cannot overrun a starved
+  loop — we feed it exactly as fast as it drains and wait. The loop stops
+  as soon as BOTH `frames_write_stalled > 0` AND `frames_dropped > 0` are
+  observed (requiring the drop too prevents a new early-break race at the
+  instant the stall trips, before the now-idle loop lets the channel fill
+  and shed — resolved within <=64 further sends, no wall-clock). Backstop
+  deadline is generous and scales with `available_parallelism`
+  (30s + 3s/hw-thread = 78s on the 16-core CI box); `max_accepted` (~2x
+  cap) bounds a regressed cap-removed build's memory and fails the assert
+  fast. The BOUND/SHEDDING safety asserts (`frames_dropped > 0`;
+  not-every-frame-accepted, now `sent_ok < attempts`) are UNCHANGED in
+  intent. Comment rewritten to document the load-sensitivity and the
+  progress-gated rationale.
+- **Validation**: EMPIRICAL STABILITY (no meaningful fail-on-revert for a
+  de-flake). Target test 5/5 in isolation + 10/10 full-suite
+  (`cargo test --release`, default 16-thread parallel load) with 0 flakes.
+- **File(s)**:
+  - `userspace-dp/src/event_stream/tests/backpressure.rs`
+    (`stalled_consumer_does_not_grow_backlog_unbounded_end_to_end`
+    liveness pump/wait rewrite + comments; safety asserts unchanged)
+
 ## 2026-07-21 — #4965: atomic (preflight-then-commit) generic in-place frame rewrite
 
 - **Timestamp**: 2026-07-21 (fix/4965-atomic-frame-rewrite)
