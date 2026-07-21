@@ -981,43 +981,79 @@ func validateVRRPTrackInterfaceAST(nodes []*Node, prefix string, lenient bool) (
 }
 
 // validateVRRPAuthenticationAST walks every vrrp-group node and rejects
-// (strict) or warns (lenient) a configured authentication-type /
+// (strict) or drops-and-warns (lenient) a configured authentication-type /
 // authentication-key. #4288: the native dataplane is RFC 5798 VRRPv3, which
 // REMOVED authentication (VRRPv2 had it; v3 does not). The compiler parses the
 // auth statements (nodeVal above), stores them on the VRRPGroup, and copies
 // them into the VRRP instance (pkg/vrrp/vrrp.go), but the packet build/receive
 // path never references them — the config is inert. Silently accepting it lets
 // an operator believe adverts are authenticated when they are not: a rogue host
-// on the segment can send higher-priority adverts and hijack mastership. The
-// honest posture is to REJECT the dead-security config at strict commit so the
-// operator is not misled, and warn (not brick) on the tolerant load / peer-sync
-// path. Mirrors validateVRRPTrackInterfaceAST's recursive vrrp-group walk.
+// on the segment can send higher-priority adverts and hijack mastership.
+//
+// Strict (commit / commit-check): REJECT the dead-security config so the
+// operator is not misled into a false-security posture (#4288).
+//
+// Lenient (tolerant load / peer-sync, #5834): a WARN-BUT-STILL-ACTIVATE posture
+// left a persisted or peer-synced auth group COMPILED — parseVRRPGroups below
+// still built the VRRPGroup, pkg/vrrp instantiated it, and the group CLAIMED the
+// VIP and exchanged UNAUTHENTICATED adverts even though the operator explicitly
+// REQUIRED authentication. That is the exact false-security posture #4288 set
+// out to close, only relocated to the load path. Fail-closed instead: DROP the
+// auth-carrying vrrp-group node from the AST here (before parseVRRPGroups reads
+// it) and warn loudly. The base interface address stays; only the VRRP VIP claim
+// is dropped. The operator's intent (require auth) wins over availability (claim
+// the VIP unauthenticated). This mirrors the CoS tolerant-path warn-and-drop for
+// an unsupported-but-persisted entry (compiler_class_of_service.go) and honors
+// #1960 no-brick (drop the one group, not the whole config). Mirrors
+// validateVRRPTrackInterfaceAST's recursive vrrp-group walk; the AST mutation is
+// seen by parseVRRPGroups because the pre-walk runs on the same tree before
+// section compilation.
 func validateVRRPAuthenticationAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
 	var warnings []string
 	for _, n := range nodes {
 		nodePath := joinNodePath(prefix, n.Keys)
-		if n.Name() == "vrrp-group" {
-			if leaf := vrrpAuthLeaf(n); leaf != "" {
-				// SECURITY: build the message path from the group IDENTITY
-				// ONLY (`vrrp-group <id>`), never n.Keys — in the Keys-packed
-				// spelling (`vrrp-group 1 authentication-key <secret>;`) the
-				// node's Keys run carries the authentication-key VALUE, so
-				// joinNodePath(prefix, n.Keys) would ECHO the secret into the
-				// commit error / lenient warning (logs + CLI). vrrpGroupIDKeys
-				// truncates to the value-free identity; `prefix` is composed of
-				// ancestor container keys (interface/unit/family/address) which
-				// carry no secret leaf value.
-				idPath := joinNodePath(prefix, vrrpGroupIDKeys(n))
-				msg := fmt.Sprintf("%s: VRRP %s is configured but NOT enforced — "+
-					"the dataplane is RFC 5798 VRRPv3, which removed authentication; "+
-					"adverts are unauthenticated regardless, so a rogue host can hijack "+
-					"mastership. Remove the authentication statement (#4288)",
-					idPath, leaf)
-				if !lenient {
-					return nil, fmt.Errorf("%s", msg)
+		// Examine n's DIRECT vrrp-group children so a lenient prune can rebuild
+		// n.Children (dropping the offending group). A vrrp-group is always a
+		// child of a family inet/inet6 address node, so detecting it here (as a
+		// child of n) covers every real config and gives us the parent handle
+		// the prune needs.
+		pruned := false
+		kept := make([]*Node, 0, len(n.Children))
+		for _, c := range n.Children {
+			if c.Name() == "vrrp-group" {
+				if leaf := vrrpAuthLeaf(c); leaf != "" {
+					// SECURITY: build the message path from the group IDENTITY
+					// ONLY (`vrrp-group <id>`), never c.Keys — in the Keys-packed
+					// spelling (`vrrp-group 1 authentication-key <secret>;`) the
+					// node's Keys run carries the authentication-key VALUE, so
+					// joinNodePath(nodePath, c.Keys) would ECHO the secret into
+					// the commit error / lenient warning (logs + CLI).
+					// vrrpGroupIDKeys truncates to the value-free identity;
+					// `nodePath` is composed of ancestor container keys
+					// (interface/unit/family/address) which carry no secret leaf
+					// value.
+					idPath := joinNodePath(nodePath, vrrpGroupIDKeys(c))
+					if !lenient {
+						return nil, fmt.Errorf("%s: VRRP %s is configured but NOT enforced — "+
+							"the dataplane is RFC 5798 VRRPv3, which removed authentication; "+
+							"adverts are unauthenticated regardless, so a rogue host can hijack "+
+							"mastership. Remove the authentication statement (#4288)",
+							idPath, leaf)
+					}
+					warnings = append(warnings, fmt.Sprintf("%s: VRRP %s is configured but the "+
+						"dataplane is RFC 5798 VRRPv3, which removed authentication; the group is "+
+						"DROPPED (not activated) rather than claim the VIP with unauthenticated "+
+						"adverts — the operator required authentication that the impl cannot honor. "+
+						"Remove the authentication statement to activate the group (#4288/#5834)",
+						idPath, leaf))
+					pruned = true
+					continue // drop this vrrp-group from the AST (fail-closed)
 				}
-				warnings = append(warnings, msg)
 			}
+			kept = append(kept, c)
+		}
+		if pruned {
+			n.Children = kept
 		}
 		w, err := validateVRRPAuthenticationAST(n.Children, nodePath, lenient)
 		warnings = append(warnings, w...)
