@@ -36,6 +36,7 @@ package daemon
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/sync/semaphore"
@@ -105,9 +106,37 @@ func TestRG0ConfigSyncAuthorityDecision(t *testing.T) {
 // newSyncProbeDaemon builds a bare daemon with a committed baseline and a staged
 // change (so a commit has a real diff), a stubbed apply body, and a
 // syncPeerForTest recorder. The returned pointer counts peer-push attempts.
+//
+// The committed config's topology mode MUST match the runtime HA state
+// (d.cluster): the #5840 topology preflight rejects any commit whose desired
+// mode disagrees with the running HA runtime, so a clustered runtime
+// (cl != nil) is paired with a clustered config and a standalone probe
+// (cl == nil) with a standalone one — mirroring production, where a constructed
+// d.cluster always implies a clustered active config. The host-name OLD->NEW
+// staged diff supplies a real intra-mode change either way, keeping the
+// RG0-ownership peer-sync decision (not the topology mode) the thing under test.
 func newSyncProbeDaemon(t *testing.T, cl *cluster.Manager) (*Daemon, *int) {
 	t.Helper()
-	s := newCommitReadyStore(t, "system host-name OLD", "system host-name NEW")
+	s := newConfigStore(t, filepath.Join(t.TempDir(), "config"))
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	seed := func(step string) {
+		if err := s.SetFromInput(step); err != nil {
+			t.Fatalf("set %q: %v", step, err)
+		}
+	}
+	seed("system host-name OLD")
+	if cl != nil {
+		seed("chassis cluster cluster-id 1")
+		seed("chassis cluster node 0")
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("commit baseline: %v", err)
+	}
+	// Commit() leaves the store in configure mode with the candidate recloned
+	// from active; stage the intra-mode host-name change directly.
+	seed("system host-name NEW")
 	d := &Daemon{applySem: semaphore.NewWeighted(1), store: s, cluster: cl}
 	d.applyBodyForTest = func(_ *config.Config) {}
 	calls := 0

@@ -26,27 +26,33 @@ func clusterCfg() *config.Config {
 // TestClusterTopologyDay2TransitionRejected is the #5840 fail-on-revert gate.
 //
 // The chassis-cluster runtime is constructed only at boot (daemon_run.go
-// initManagers + startClusterComms). A DAY-2 commit that flips a running
-// daemon between standalone and cluster mode cannot (de)construct that
-// boot-only runtime, and silently accepting it publishes clustered dataplane
-// semantics (clusterHA=true) with no election/watchdog runtime — a persistent
-// transit outage until restart, plus a data race on the bare d.cluster pointer.
-// clusterTopologyCommitPreflight must REJECT the transition BEFORE store
-// promotion / any dataplane mutation, in both directions, while leaving an
-// intra-mode edit untouched.
+// initManagers + startClusterComms). A DAY-2 commit that arms a mode the
+// running HA runtime cannot serve cannot (de)construct that boot-only runtime,
+// and silently accepting it publishes clustered dataplane semantics
+// (clusterHA=true) with no election/watchdog runtime — a persistent transit
+// outage until restart, plus a data race on the bare d.cluster pointer.
+// clusterTopologyCommitPreflight keys on DESIRED-vs-ACTUAL-RUNTIME
+// (runtimeClusterActive == d.cluster != nil), so it must REJECT a candidate
+// whose mode disagrees with the running HA runtime BEFORE store promotion / any
+// dataplane mutation, in both directions, while leaving an intra-mode edit
+// untouched.
 //
-// Reverting the fix (clusterTopologyCommitPreflight returns nil) makes the
-// FIRST assertion below RED as an assertion — exactly one test binds the
-// production reject line. The end-to-end commitAndApply leg then proves the
-// preflight is wired into the commit path and that a rejected transition writes
-// NO d.cluster and mutates NO dataplane.
+// Reverting the fix (clusterTopologyCommitPreflight returns nil, or forcing the
+// desired/actual comparison to always match) makes the FIRST assertion below
+// RED as an assertion — exactly one test binds the production reject line. The
+// end-to-end commitAndApply legs then prove the preflight is wired into the
+// commit path and that a rejected transition writes NO d.cluster and mutates NO
+// dataplane — including the #4179 config-less-node case (nil active config, nil
+// runtime) that an old-config proxy used to wrongly PERMIT.
 func TestClusterTopologyDay2TransitionRejected(t *testing.T) {
-	// --- Direct preflight: the precise binding (both transition directions). ---
-	// standalone -> cluster: the #5840 bug.
-	err := clusterTopologyCommitPreflight(standaloneCfg(), clusterCfg())
+	// --- Direct preflight: the precise binding (keyed on runtime state). ---
+	// No HA runtime (d.cluster == nil) + a clustered candidate: the #5840 bug.
+	// This uniformly covers standalone->cluster AND the #4179 config-less node
+	// (both present a nil HA runtime + a clustered desire).
+	err := clusterTopologyCommitPreflight(false /*runtimeClusterActive*/, clusterCfg())
 	if err == nil {
-		t.Fatal("standalone->cluster day-2 transition must be REJECTED (adding " +
-			"chassis cluster cannot form the cluster without a restart)")
+		t.Fatal("adding chassis cluster with no HA runtime must be REJECTED " +
+			"(cannot form the cluster without a restart)")
 	}
 	if !errors.Is(err, errClusterTopologyRequiresRestart) {
 		t.Fatalf("rejection must wrap the restart-required sentinel; got %v", err)
@@ -56,26 +62,35 @@ func TestClusterTopologyDay2TransitionRejected(t *testing.T) {
 		t.Fatalf("rejection must carry an actionable operator diagnostic; got %q", err.Error())
 	}
 
-	// cluster -> standalone: the reverse teardown, also unsafe live.
-	if rerr := clusterTopologyCommitPreflight(clusterCfg(), standaloneCfg()); rerr == nil ||
+	// Running HA runtime (d.cluster != nil) + a standalone candidate: the
+	// reverse teardown, also unsafe live.
+	if rerr := clusterTopologyCommitPreflight(true /*runtimeClusterActive*/, standaloneCfg()); rerr == nil ||
 		!errors.Is(rerr, errClusterTopologyRequiresRestart) {
-		t.Fatalf("cluster->standalone day-2 transition must be REJECTED with the "+
-			"restart-required sentinel; got %v", rerr)
+		t.Fatalf("removing chassis cluster on a running HA runtime must be REJECTED "+
+			"with the restart-required sentinel; got %v", rerr)
 	}
 
-	// --- Controls: an intra-mode edit (no topology change) is ACCEPTED. ---
-	if aerr := clusterTopologyCommitPreflight(standaloneCfg(), standaloneCfg()); aerr != nil {
-		t.Fatalf("standalone->standalone commit must be accepted; got %v", aerr)
-	}
-	if aerr := clusterTopologyCommitPreflight(clusterCfg(), clusterCfg()); aerr != nil {
-		t.Fatalf("cluster->cluster commit must be accepted; got %v", aerr)
-	}
-	// Initial config load (nil old): the boot path owns construction — accepted.
-	if aerr := clusterTopologyCommitPreflight(nil, clusterCfg()); aerr != nil {
-		t.Fatalf("initial (nil-old) config load must be accepted; got %v", aerr)
+	// #4179 config-less HA node: node-id present but a nil active config, so the
+	// boot path never built d.cluster (runtimeClusterActive == false) and
+	// inBootstrap() is false. A day-2 commit adding chassis cluster there was
+	// the case the old `old == nil` proxy wrongly PERMITTED — the runtime
+	// predicate REJECTS it (nil runtime, clustered desire), same as any other
+	// add-cluster-without-a-runtime commit.
+	if cerr := clusterTopologyCommitPreflight(false /*runtimeClusterActive*/, clusterCfg()); cerr == nil ||
+		!errors.Is(cerr, errClusterTopologyRequiresRestart) {
+		t.Fatalf("config-less HA node (nil runtime) adding chassis cluster must be "+
+			"REJECTED with the restart-required sentinel; got %v", cerr)
 	}
 
-	// --- Wiring: commitAndApply rejects the transition with no runtime write. ---
+	// --- Controls: an intra-mode edit (runtime matches desired) is ACCEPTED. ---
+	if aerr := clusterTopologyCommitPreflight(false /*runtimeClusterActive*/, standaloneCfg()); aerr != nil {
+		t.Fatalf("standalone runtime + standalone commit must be accepted; got %v", aerr)
+	}
+	if aerr := clusterTopologyCommitPreflight(true /*runtimeClusterActive*/, clusterCfg()); aerr != nil {
+		t.Fatalf("clustered runtime + clustered commit must be accepted; got %v", aerr)
+	}
+
+	// --- Wiring 1: commitAndApply rejects standalone->cluster, no runtime write. ---
 	store := newConfigStore(t, filepath.Join(t.TempDir(), "config.db"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure (standalone): %v", err)
@@ -108,5 +123,44 @@ func TestClusterTopologyDay2TransitionRejected(t *testing.T) {
 	// The candidate must NOT have been promoted: active is still standalone.
 	if active := store.ActiveConfig(); clusterTopologyConfigured(active) {
 		t.Fatal("a rejected transition must NOT promote the cluster candidate to active")
+	}
+
+	// --- Wiring 2: commitAndApply rejects the #4179 config-less-node commit. ---
+	// A node with NO active config (nil) and NO HA runtime (d.cluster == nil,
+	// inBootstrap() == false) that day-2-commits chassis cluster. The old
+	// old==nil carve-out PERMITTED this (nil active) and armed clusterHA=true
+	// against a nil runtime; the runtime predicate REJECTS it before any store
+	// promotion, and the candidate never becomes active.
+	cfgless := newConfigStore(t, filepath.Join(t.TempDir(), "config.db"))
+	if err := cfgless.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure (config-less): %v", err)
+	}
+	// Seed a well-formed chassis-cluster CANDIDATE without ever committing a
+	// standalone active — ActiveConfig() stays nil, mirroring the config-less
+	// HA node's boot state.
+	if err := cfgless.SetFromInput("system host-name cfgless-node"); err != nil {
+		t.Fatalf("set config-less host-name: %v", err)
+	}
+	if err := cfgless.SetFromInput("chassis cluster cluster-id 1"); err != nil {
+		t.Fatalf("set config-less cluster-id: %v", err)
+	}
+	if err := cfgless.SetFromInput("chassis cluster node 0"); err != nil {
+		t.Fatalf("set config-less node: %v", err)
+	}
+	if active := cfgless.ActiveConfig(); active != nil {
+		t.Fatalf("config-less precondition: active config must be nil before commit; got %+v", active)
+	}
+
+	dcl := &Daemon{store: cfgless, applySem: semaphore.NewWeighted(1)}
+	_, clErr := dcl.commitAndApply(context.Background(), "config-less add chassis cluster", false)
+	if clErr == nil || !errors.Is(clErr, errClusterTopologyRequiresRestart) {
+		t.Fatalf("commitAndApply on a config-less node (nil active, nil runtime) adding "+
+			"chassis cluster must be rejected with the restart-required sentinel; got %v", clErr)
+	}
+	if dcl.cluster != nil {
+		t.Fatal("config-less rejected commit must NOT construct the cluster runtime")
+	}
+	if active := cfgless.ActiveConfig(); clusterTopologyConfigured(active) {
+		t.Fatal("config-less rejected commit must NOT promote the cluster candidate to active")
 	}
 }

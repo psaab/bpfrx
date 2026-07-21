@@ -30,8 +30,8 @@ func clusterTopologyConfigured(cfg *config.Config) bool {
 // contains `chassis cluster` (pkg/daemon/daemon_run.go: initManagers +
 // startClusterComms). A DAY-2 apply reconciles that runtime only inside
 // `if d.cluster != nil` guards (daemon_apply.go steps 19-20); it can neither
-// construct it when the old config was standalone nor tear it down when the new
-// config drops the cluster.
+// construct it when no HA runtime exists nor tear it down when the new config
+// drops the cluster.
 //
 // Constructing/tearing that runtime down live is UNSAFE for two independent
 // reasons (issue #5840):
@@ -55,27 +55,44 @@ func clusterTopologyConfigured(cfg *config.Config) bool {
 // standalone, or both clustered with only redundancy-group/interface/transport
 // changes) is unaffected and still reconciles live.
 //
-// old is the currently-active config being replaced; new is the compiled
-// candidate about to be promoted. A nil old is the initial config load, where
-// there is no running mode to transition and the boot path owns construction —
-// permitted. Full day-2 runtime construction is the separate #5840 follow-up.
-func clusterTopologyCommitPreflight(old, new *config.Config) error {
-	if old == nil {
-		// Initial config load: the boot path constructs the runtime; there is
-		// no running standalone/cluster generation being transitioned.
-		return nil
-	}
-	oldCluster := clusterTopologyConfigured(old)
-	newCluster := clusterTopologyConfigured(new)
-	if oldCluster == newCluster {
+// The gate keys on DESIRED-vs-ACTUAL-RUNTIME, not on the outgoing config.
+// runtimeClusterActive is the actual constructed HA-runtime state — the caller
+// passes `d.cluster != nil`, the single boot-only signal that the cluster
+// runtime exists (daemon_run.go:1868). newCfg is the compiled candidate about
+// to be promoted. Reject when the candidate's desired mode
+// (clusterTopologyConfigured(newCfg)) disagrees with the runtime that is
+// actually running.
+//
+// Keying on the runtime — rather than a proxy such as the old active config —
+// is what closes the #4179 config-less-HA-node hole. That node boots with
+// /etc/xpf/node-id present but a nil active config, so computeBootClass returns
+// bootClassNormal (NOT bootstrap), initManagers SKIPS the `d.cluster` build
+// (its boot-time config was nil), and d.cluster stays nil with inBootstrap()
+// false. A day-2 `commit` adding `chassis cluster` there has no old config to
+// compare against; an old-config proxy that permitted a nil old would let it
+// through and arm clusterHA=true against a nil HA runtime — the exact #5840
+// hybrid state. The runtime predicate uniformly REJECTS it (nil runtime,
+// clustered desire), just like standalone->cluster and cluster->standalone,
+// because that node cannot form the cluster live either: the HA runtime is
+// boot-only-constructed, so the honest fail-closed answer is "restart into the
+// clustered config", never a silent half-apply. The boot config LOAD does not
+// reach this guard (Store.Load -> applyConfigLocked, not commitAndApply), and a
+// bootstrap plain commit is refused earlier by the inBootstrap() gate, so no
+// legitimate boot/bootstrap path is falsely rejected. Full day-2 runtime
+// construction is the separate #5840 follow-up.
+func clusterTopologyCommitPreflight(runtimeClusterActive bool, newCfg *config.Config) error {
+	newCluster := clusterTopologyConfigured(newCfg)
+	if newCluster == runtimeClusterActive {
+		// Desired mode already matches the running HA runtime: an intra-mode
+		// edit (both standalone, or both clustered) reconciles live.
 		return nil
 	}
 	if newCluster {
-		return fmt.Errorf("commit rejected: adding `chassis cluster` on a running "+
-			"standalone system cannot form the cluster without a restart — the HA "+
-			"runtime (election, heartbeat/watchdog, session and config sync, VRRP) "+
-			"is constructed only at daemon startup. Commit this change with the "+
-			"system offline, or restart xpfd into the clustered configuration: %w",
+		return fmt.Errorf("commit rejected: adding `chassis cluster` cannot form the "+
+			"cluster without a restart — the HA runtime (election, heartbeat/watchdog, "+
+			"session and config sync, VRRP) is constructed only at daemon startup, and "+
+			"this daemon has no HA runtime. Commit this change with the system offline, "+
+			"or restart xpfd into the clustered configuration: %w",
 			errClusterTopologyRequiresRestart)
 	}
 	return fmt.Errorf("commit rejected: removing `chassis cluster` on a running "+
