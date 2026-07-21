@@ -54684,3 +54684,80 @@ top.
   go vet ./pkg/vrrp/, full pkg/vrrp + pkg/daemon suites pass.
 - **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/update_instances_test.go,
   pkg/vrrp/README.md, _Log.md
+- **Action**: #5295 — HA-NAT reservation leak on transient synced-hit purge.
+  `purge_translated_synced_hit` (session_glue/promote.rs) tears down a
+  transient peer-synced translated FORWARD session (RG not locally active) but
+  released NO allocator state, LEAKING the source-NAT / NAT64 pool port that
+  `handle_upsert_synced` reserved at install (reserve_synced_source_nat /
+  reserve_synced_nat64, #4388 / #4512) → standby pool exhaustion under
+  sustained HA churn. Fix: add release_source_nat_allocation +
+  release_nat64_allocation under the same `metadata.is_reverse` ownership
+  guard, exactly as handle_delete_synced / delete_terminal_filtered_session do
+  (signature gains `forwarding` + `now_ns`; single caller in mod.rs updated).
+  Safe against double-free: purge fires only for the forward translated side
+  (is_translated_forward_session_key rejects reverse/alias keys) and
+  release_flow is a no-op when the flow was never tracked. Distinct from #5178
+  (recycle-queue drain gap) — here there was no release call at all. Tests: 3
+  fail-on-revert in session_glue/tests.rs (source-NAT release, NAT64 release,
+  reverse-entry-releases-nothing guard). Neutralizing either release call
+  reddens the matching owning-leg assertion (used_ports stays 1 / NAT64 probe
+  gets 1025). Full cargo suite green (4159 passed).
+- **File(s)**: userspace-dp/src/afxdp/session_glue/promote.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md, _Log.md
+- **Action**: #5305 — cluster-synced session install made transactional (BPF
+  pre-image rollback on helper mirror failure). `SetClusterSyncedSessionV4/V6`
+  wrote the pinned BPF session mirror FIRST, then mirrored to the Rust helper;
+  on helper failure they recorded the mirror failure and returned but LEFT the
+  BPF entry installed — a split truth the GC / fallback bulk export could
+  propagate as if the install succeeded, producing nondeterministic HA session
+  ownership after takeover. The store's snapshot/rollback machinery
+  (session_store.go) never fired for this path because the installer's
+  `return err` runs before the store appends the forward pre-image to `written`.
+  Fix: for forward entries, snapshot the BPF pre-image (value-or-absence) BEFORE
+  the write and, on mirror failure, RESTORE it (rewrite prior value / delete if
+  absent), joining any compensation error with the mirror error. Snapshot +
+  write + mirror + compensate now run under one `m.mu` hold (was: BPF write
+  outside the lock) so the sequence is atomic w.r.t. other m.mu paths; per-peer
+  apply loop is single-threaded so no same-key race. Reverse entries (never
+  mirrored) just write BPF and return. Health behavior preserved:
+  recordSessionMirrorFailureLocked (#5247 takeover-disarm) and
+  recordSessionMirrorSuccessLocked (sticky-clear on real success) unchanged.
+  New snapshotBPFSessionV4/V6Locked + restoreBPFSessionV4/V6Locked helpers.
+  Tests: synced_session_bpf_rollback_5305_test.go —
+  TestSetClusterSyncedSessionV4/V6RollsBackOrphanOnMirrorFailure (absent→deleted,
+  prior→restored) + TestSetClusterSyncedSessionRollbackSuccessPathUnregressed.
+  Parent-RED: no-op the restore helpers → 2 tests (4 subtests) fail on assertion.
+  Validated: build + vet clean; focused userspace session/mirror suite green;
+  the 6 pre-existing userspace XDP-shim-load failures reproduce on origin/master.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/synced_session_bpf_rollback_5305_test.go,
+  docs/session-sync-architecture.md, _Log.md
+- **Action**: #5870 — REST candidate mutations bypassed the config-session
+  holder lock. The REST config endpoints (`pkg/api/config.go`) called the store
+  with an empty session ID, which the store treats as its internal/system
+  capability (daemon apply / HA sync) and which BYPASSES the #5059 candidate
+  holder lock. A remote, stateless REST caller could therefore Set/Delete/Load/
+  Rollback/Commit a candidate that a CLI or gRPC configuration session
+  legitimately OWNED — corrupting a peer's candidate or smuggling their staged
+  edits into an applied commit. Fix: route every REST config MUTATION
+  (enter/set/delete/deactivate/activate/load/annotate/rollback/commit/
+  commit-confirmed/confirm) through the session-scoped `*As` variants +
+  `EnsureConfigHolder` commit gate under a fixed non-empty holder identity,
+  `restConfigSessionID` ("rest"). A REST mutation is now rejected with
+  `ErrConfigLockedByOther` → HTTP 409 when another session owns the candidate,
+  and symmetrically CLI/gRPC is rejected while REST holds it; `/config/exit`
+  releases only the REST-held lock (`ExitConfigureSession`) instead of
+  force-clearing any holder. The store's `sessionID == ""` system-bypass
+  semantics are untouched; read-only REST endpoints are unaffected. Session
+  model: fixed shared REST identity (REST is stateless); two concurrent REST
+  clients share "rest" and are not mutually excluded — a per-caller REST token
+  is a separate product follow-up. Tests (fail-on-revert; neutralize by setting
+  `restConfigSessionID = ""` → 3 RED): pkg/api/config_session_holder_5870_test.go.
+  Validation: go build ./..., go vet ./pkg/api/ ./pkg/configstore/, go test
+  ./pkg/api/... ./pkg/configstore/... all pass. Control-plane / unit-provable —
+  no smoke.
+- **File(s)**: pkg/api/config.go,
+  pkg/api/config_session_holder_5870_test.go (new),
+  pkg/configstore/README.md, _Log.md
