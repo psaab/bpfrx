@@ -1090,27 +1090,86 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 	installVal.FibDmac = [6]byte{}
 	installVal.FibSmac = [6]byte{}
 	installVal.FibGen = 0
-	if err := m.bpfShim.SetSessionV4(key, installVal); err != nil {
-		return err
-	}
 	// The helper already synthesizes the correct reverse companion from the
 	// forward cluster-synced entry using local forwarding and HA state. An
 	// explicit reverse cluster update can overwrite that locally-derived
-	// companion with peer NAT/FIB metadata, so only mirror forward entries.
+	// companion with peer NAT/FIB metadata, so only mirror forward entries. A
+	// reverse entry is never mirrored, so there is no mirror failure to
+	// compensate: write the BPF mirror and return.
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
-		return nil
+		return m.bpfShim.SetSessionV4(key, installVal)
 	}
+	// Forward entry: make the install transactional (#5305). Capture the
+	// pre-image of the BPF session entry BEFORE writing it, then mirror to the
+	// helper. On mirror failure RESTORE the pre-image (rewrite the prior value,
+	// or DELETE the key if it was absent) so a failed cluster-synced install
+	// leaves the BPF map exactly as it was. Otherwise the pinned map holds a
+	// session the helper never received — a split truth the GC and fallback
+	// bulk export would propagate as if the install had succeeded, producing
+	// nondeterministic HA session ownership after takeover.
+	//
+	// snapshot + write + mirror + compensate run under m.mu so the sequence is
+	// atomic w.r.t. any other m.mu-holding path; the per-peer receiver apply
+	// loop is single-threaded (pkg/cluster/sync_conn.go installClusterSyncedV4),
+	// so no concurrent install of the SAME key races. syncSessionV4Locked drops
+	// m.mu only for the socket send and reacquires it before returning, so the
+	// compensate that follows still observes our own BPF write.
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	prior, hadPrior, err := m.snapshotBPFSessionV4Locked(key)
+	if err != nil {
+		// The pre-image could not be read; refuse the install rather than write
+		// an entry that could not later be rolled back on a mirror failure.
+		return fmt.Errorf("snapshot synced v4 session pre-image: %w", err)
+	}
+	if err := m.bpfShim.SetSessionV4(key, installVal); err != nil {
+		return err
+	}
 	if err := m.syncSessionV4Locked("upsert", key, &installVal); err != nil {
 		m.recordSessionMirrorFailureLocked(err)
 		slog.Debug("userspace: session mirror failed", "err", err)
-		return fmt.Errorf("mirror synced v4 session to userspace helper: %w", err)
+		compErr := m.restoreBPFSessionV4Locked(key, prior, hadPrior)
+		return errors.Join(
+			fmt.Errorf("mirror synced v4 session to userspace helper: %w", err),
+			compErr,
+		)
 	}
 	// A successful mirror proves the helper session socket is healthy again;
 	// clear any sticky failure so the standby regains takeover-readiness
 	// without waiting for a helper restart (#5247).
 	m.recordSessionMirrorSuccessLocked()
+	return nil
+}
+
+// snapshotBPFSessionV4Locked reads the current BPF-mirror value for key so a
+// failed cluster-synced install can be rolled back to it (#5305). Returns
+// (value, existed, err); a missing key is existed=false with a nil error.
+// Named "Locked" for the m.mu convention of the compensation sequence — it
+// touches only the independently-locked bpfShim map, not m.mu directly.
+func (m *Manager) snapshotBPFSessionV4Locked(key dataplane.SessionKey) (dataplane.SessionValue, bool, error) {
+	val, err := m.bpfShim.GetSessionV4(key)
+	if err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return dataplane.SessionValue{}, false, nil
+		}
+		return dataplane.SessionValue{}, false, err
+	}
+	return val, true, nil
+}
+
+// restoreBPFSessionV4Locked reverts the BPF session entry for key to the
+// pre-install snapshot: rewrite the prior value, or delete the key if it was
+// absent (#5305). Deleting an already-absent key is treated as success.
+func (m *Manager) restoreBPFSessionV4Locked(key dataplane.SessionKey, prior dataplane.SessionValue, hadPrior bool) error {
+	if hadPrior {
+		if err := m.bpfShim.SetSessionV4(key, prior); err != nil {
+			return fmt.Errorf("restore synced v4 session pre-image: %w", err)
+		}
+		return nil
+	}
+	if err := m.bpfShim.DeleteSession(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("remove orphan synced v4 session: %w", err)
+	}
 	return nil
 }
 
@@ -1166,23 +1225,65 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 	installVal.FibDmac = [6]byte{}
 	installVal.FibSmac = [6]byte{}
 	installVal.FibGen = 0
+	// Reverse entries are never mirrored (see SetClusterSyncedSessionV4): write
+	// the BPF mirror and return — no mirror failure to compensate.
+	if !shouldMirrorUserspaceSession(val.IsReverse) {
+		return m.bpfShim.SetSessionV6(key, installVal)
+	}
+	// Forward entry: transactional install (#5305) — the IPv6 analogue of
+	// SetClusterSyncedSessionV4. Snapshot the BPF pre-image, write, mirror, and
+	// restore the pre-image on mirror failure so a failed install never leaves
+	// an orphan split-truth BPF entry the helper never received.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prior, hadPrior, err := m.snapshotBPFSessionV6Locked(key)
+	if err != nil {
+		return fmt.Errorf("snapshot synced v6 session pre-image: %w", err)
+	}
 	if err := m.bpfShim.SetSessionV6(key, installVal); err != nil {
 		return err
 	}
-	if !shouldMirrorUserspaceSession(val.IsReverse) {
-		return nil
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	if err := m.syncSessionV6Locked("upsert", key, &installVal); err != nil {
 		m.recordSessionMirrorFailureLocked(err)
 		slog.Debug("userspace: session mirror failed", "err", err)
-		return fmt.Errorf("mirror synced v6 session to userspace helper: %w", err)
+		compErr := m.restoreBPFSessionV6Locked(key, prior, hadPrior)
+		return errors.Join(
+			fmt.Errorf("mirror synced v6 session to userspace helper: %w", err),
+			compErr,
+		)
 	}
 	// A successful mirror proves the helper session socket is healthy again;
 	// clear any sticky failure so the standby regains takeover-readiness
 	// without waiting for a helper restart (#5247).
 	m.recordSessionMirrorSuccessLocked()
+	return nil
+}
+
+// snapshotBPFSessionV6Locked is the IPv6 sibling of snapshotBPFSessionV4Locked
+// (#5305).
+func (m *Manager) snapshotBPFSessionV6Locked(key dataplane.SessionKeyV6) (dataplane.SessionValueV6, bool, error) {
+	val, err := m.bpfShim.GetSessionV6(key)
+	if err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return dataplane.SessionValueV6{}, false, nil
+		}
+		return dataplane.SessionValueV6{}, false, err
+	}
+	return val, true, nil
+}
+
+// restoreBPFSessionV6Locked is the IPv6 sibling of restoreBPFSessionV4Locked
+// (#5305).
+func (m *Manager) restoreBPFSessionV6Locked(key dataplane.SessionKeyV6, prior dataplane.SessionValueV6, hadPrior bool) error {
+	if hadPrior {
+		if err := m.bpfShim.SetSessionV6(key, prior); err != nil {
+			return fmt.Errorf("restore synced v6 session pre-image: %w", err)
+		}
+		return nil
+	}
+	if err := m.bpfShim.DeleteSessionV6(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("remove orphan synced v6 session: %w", err)
+	}
 	return nil
 }
 
