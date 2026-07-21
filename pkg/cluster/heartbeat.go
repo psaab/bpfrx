@@ -473,34 +473,107 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 	return hmac.Equal(got, mac.Sum(nil))
 }
 
-// heartbeatAuthReplay tracks per-peer anti-replay state for authenticated
-// heartbeats. A sender advertises a random per-process session id and a
-// monotonic per-session counter (MarshalHeartbeatAuth). The receiver accepts a
-// strictly increasing counter within a session and RE-ANCHORS on a new session
-// id — a sender restart/reboot picks a fresh random session, so a genuine
-// reboot (a routine HA event) is never mistaken for a replay and failover is
-// never wedged. Touched only from the single readLoop goroutine.
-type heartbeatAuthReplay struct {
+// heartbeatReplaySessions bounds how many distinct sender sessions the
+// anti-replay tracker remembers a counter watermark for. Each genuine peer
+// reboot picks a fresh random session (randomSessionID) and consumes one slot;
+// the oldest watermark is evicted FIFO once the ring is full.
+//
+// #5477 security bound. The retired-session watermarks must be bounded (a peer
+// that reboots forever cannot grow the ring without limit), but the bound must
+// not open an eviction hole an on-link attacker could exploit with REPLAY
+// ALONE. It does not, and here is why:
+//
+//   - An attacker who records authenticated frames off the wire can only
+//     REPLAY the (few) session incarnations they captured. HMAC-SHA256 over the
+//     nonce blocks fabricating a valid frame for any NEW session id, and it
+//     blocks fabricating a counter beyond the highest the genuine peer ever
+//     signed for a session. So the attacker's replay power is fixed: a bounded
+//     set of (session, counter<=watermark) frames.
+//   - A watermark is evicted ONLY when heartbeatReplaySessions distinct NEWER
+//     sessions have since been recorded — and every one of those requires a
+//     genuine peer reboot (only the real peer holds the PSK to sign a new
+//     session). The attacker cannot mint the distinct sessions needed to push
+//     an entry they still hold a recording of out of the ring.
+//   - By the time genuine reboots HAVE evicted an old watermark, the live peer
+//     is that many incarnations ahead, so a post-eviction replay of the stale
+//     session is a one-shot re-anchor immediately overwritten by the next
+//     genuine heartbeat (one interval), and it CANNOT be sustained: after the
+//     re-anchor, further replays of that session are <= its restored watermark
+//     and rejected. This is the pre-existing, documented cross-session residual
+//     (README "Anti-replay"), NOT the sustained A->B->A loop #5477 closes.
+//
+// 64 slots (64*16 = 1 KiB) is far more genuine reboots than any capture window
+// realistically spans while still bounding memory.
+const heartbeatReplaySessions = 64
+
+// replaySessionMark is one remembered (session, high-water counter) pair.
+type replaySessionMark struct {
 	session uint64
 	counter uint64
-	seen    bool
+}
+
+// heartbeatAuthReplay tracks per-peer anti-replay state for authenticated
+// heartbeats. A sender advertises a random per-process session id and a
+// monotonic per-session counter (MarshalHeartbeatAuth). The receiver keeps a
+// bounded set of per-session high-water counters and:
+//
+//   - accepts a strictly increasing counter within a KNOWN session (the live
+//     session advancing), and
+//   - accepts a genuinely NEW, never-seen session with any counter — a sender
+//     restart/reboot picks a fresh random session, so a real reboot (a routine
+//     HA event) is never mistaken for a replay and failover is never wedged.
+//
+// #5477: it REJECTS a return to a session already at or below its remembered
+// watermark. Before this, the tracker held exactly ONE (session, counter): any
+// session switch reset the watermark, so an on-link attacker who recorded
+// authenticated frames from two incarnations A and B could alternate
+// A->B->A->B forever — each switch re-anchored and re-admitted the SAME
+// recorded A frames, refreshing peer liveness and applying their STALE
+// role/priority (a forged liveness/election drive). Session ids are RANDOM
+// (unordered), so a strictly-newer test like fullSetSeqGuard cannot be used:
+// remembering a bounded per-session watermark is what distinguishes a real
+// reboot (new id) from a replay of a retired incarnation (known id, no counter
+// advance).
+//
+// Touched only from the single readLoop goroutine, so it needs no locking.
+type heartbeatAuthReplay struct {
+	marks [heartbeatReplaySessions]replaySessionMark
+	// count is the number of occupied slots, saturating at len(marks). next is
+	// the FIFO write cursor for eviction once the ring is full. While filling,
+	// next == count and the valid entries are marks[:count]; once full, count
+	// stays at len(marks) and next cycles, so marks[:count] still spans every
+	// live entry for the lookup scan.
+	count int
+	next  int
 }
 
 // admit reports whether (session, counter) is fresh (not a replay) and, when
-// fresh, advances the watermark. Callers must invoke admit only after the MAC
-// has verified — an unauthenticated caller must never mutate replay state.
+// fresh, advances the per-session watermark (or records a new session). Callers
+// must invoke admit only after the MAC has verified — an unauthenticated caller
+// must never mutate replay state.
 func (a *heartbeatAuthReplay) admit(session, counter uint64) bool {
-	if !a.seen || session != a.session {
-		a.session = session
-		a.counter = counter
-		a.seen = true
-		return true
+	// Known session: admit only a strictly-advancing counter. A frame at or
+	// below the watermark is a replay — including a return to a RETIRED session
+	// whose watermark we still remember (#5477: the attacker cannot exceed the
+	// highest counter the genuine peer ever signed for that session).
+	for i := 0; i < a.count; i++ {
+		if a.marks[i].session == session {
+			if counter > a.marks[i].counter {
+				a.marks[i].counter = counter
+				return true
+			}
+			return false
+		}
 	}
-	if counter > a.counter {
-		a.counter = counter
-		return true
+	// Never-seen session: a genuine reboot draws a fresh random session, so
+	// accept and record a new watermark. Bounded FIFO — evict the oldest once
+	// the ring is full (see the heartbeatReplaySessions security bound above).
+	a.marks[a.next] = replaySessionMark{session: session, counter: counter}
+	a.next = (a.next + 1) % len(a.marks)
+	if a.count < len(a.marks) {
+		a.count++
 	}
-	return false
+	return true
 }
 
 // heartbeatAuthDecision applies the #4107 dual-accept policy for one received

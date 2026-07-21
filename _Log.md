@@ -54174,3 +54174,33 @@ top.
     section: explicit-arm-path enforcement of the required-protocol gate)
   **Action**: Fold #6162 review MINOR — update afxdp/README.md neighbor-limiter section from "256-slot direct-mapped" + open #6129 caveat to the 64-bucket x 4-way set-associative description with the bounded-residual note (stale-doc module-contract fix)
   **File(s)**: userspace-dp/src/afxdp/README.md
+
+- **Timestamp**: 2026-07-21
+  **Action**: Fix #5477 (security, heartbeat replay) — track RETIRED sender
+  sessions in `heartbeatAuthReplay.admit`. The pre-fix tracker held exactly
+  ONE `(session, counter)` and re-anchored on ANY session change, so an
+  on-link attacker who recorded authenticated frames from two incarnations
+  A and B could alternate A→B→A→B forever (each switch reset the watermark,
+  re-admitting the SAME recorded A frames → refreshed liveness + stale
+  role/priority before handlePeerHeartbeat). Replaced the single watermark
+  with a BOUNDED per-session high-water map (`heartbeatReplaySessions=64`,
+  FIFO eviction): reject a return to a retired session at/below its
+  remembered counter; still accept a genuinely new session (real reboot).
+  Random (unordered) session ids rule out a strictly-newer fullSetSeqGuard
+  approach. Security bound documented: eviction requires 64 genuine peer
+  reboots (attacker cannot mint valid new sessions — HMAC), post-eviction
+  replay re-anchors once and is overwritten within one interval, never
+  sustained. Added 3 fail-on-revert tests (A→B→A reject, bounded-ring
+  eviction, read-loop liveness-gate consequence); RED-on-revert verified as
+  a clean assertion failure (neutralize `for i := 0; i < a.count; i++` →
+  `i < 0`, target-count 1). Full `pkg/cluster` suite green with -race (3×).
+  Needs loss-cluster failover smoke (touches heartbeat liveness/election).
+  **File(s)**:
+  - `pkg/cluster/heartbeat.go` (heartbeatAuthReplay: bounded per-session
+    watermark map + heartbeatReplaySessions const + replaySessionMark)
+  - `pkg/cluster/heartbeat_auth_test.go` (new tests
+    `TestHeartbeatAuthReplay_RetiredSessionABA`,
+    `TestHeartbeatAuthReplay_BoundedRing`,
+    `TestHeartbeatReplayGatesLivenessRefresh`)
+  - `pkg/cluster/README.md` (Anti-replay bullet: retired-session rejection
+    + bound-safety argument)
