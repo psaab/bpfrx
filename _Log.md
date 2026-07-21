@@ -54664,6 +54664,26 @@ top.
   pkg/config/testdata/golden_4406.json, docs/feature-coverage.md, _Log.md
 
 - **Timestamp**: 2026-07-21
+- **Action**: #5641 — RGVRRPReady false-ready on partial RG build. RGVRRPReady
+  returned (true, nil) as soon as ONE VRRP instance existed for the RG's VRID
+  (100+rgID), even when another DESIRED key for that RG failed to build
+  (interface resolve / socket bind / family capability). An RG commonly has
+  several desired RETH keys under one VRID — a VLAN-tagged reth emits one
+  instance per sub-interface (reth0.50 + reth0.80) — so a sibling key's dark
+  VIP was reported healthy and the cluster state machine could release the sync
+  hold / preempt / claim ownership while a VIP never advertised. Fix:
+  UpdateInstances now records m.unbuiltDesired (the desiredMap-vs-m.instances
+  diff, annotated with the captured resolve/socket reason) each pass;
+  RGVRRPReady returns (false, reasons) naming any un-built desired RETH key for
+  the RG. Build-before-teardown (#2156) survivors keep their key in m.instances
+  and are correctly NOT flagged (RG still in election on its old VIP set).
+  RGVRRPReady stays a pure readiness READ — no advert timing / socket / failover
+  datapath change. Fail-on-revert test TestUpdateInstances_PartialBuild_RGNotReady
+  (two keys, one socket-fail) goes RED (clean assertion failure) if the
+  m.unbuiltDesired scan in RGVRRPReady is neutralized. Validated: go build ./...,
+  go vet ./pkg/vrrp/, full pkg/vrrp + pkg/daemon suites pass.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/update_instances_test.go,
+  pkg/vrrp/README.md, _Log.md
 - **Action**: #5295 — HA-NAT reservation leak on transient synced-hit purge.
   `purge_translated_synced_hit` (session_glue/promote.rs) tears down a
   transient peer-synced translated FORWARD session (RG not locally active) but
