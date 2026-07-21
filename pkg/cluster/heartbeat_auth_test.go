@@ -185,6 +185,178 @@ func TestHeartbeatAuthReplay(t *testing.T) {
 	}
 }
 
+// TestHeartbeatAuthReplay_RetiredSessionABA is the #5477 fail-on-revert gate:
+// an on-link attacker who recorded authenticated frames from two peer
+// incarnations A and B cannot replay them in an A->B->A alternation. Once B
+// becomes the active session, A is RETIRED but its counter watermark is still
+// remembered, so a return to A at (or below) that watermark is rejected — while
+// a genuinely NEW, never-seen session C (a real reboot) is still admitted.
+//
+// RED-on-revert: the fix is the per-session watermark scan in
+// heartbeatAuthReplay.admit (`for i := 0; i < a.count; i++`). Neutralizing that
+// scan bound to `i < 0` reverts to the single-watermark behavior where any
+// session switch re-anchors, so the replayed A(1) below is wrongly re-admitted
+// and this test goes RED as an assertion failure (not a build break).
+func TestHeartbeatAuthReplay_RetiredSessionABA(t *testing.T) {
+	const (
+		sessA = 0xAAAA
+		sessB = 0xBBBB
+		sessC = 0xCCCC
+	)
+	var r heartbeatAuthReplay
+
+	// Genuine incarnation A: the attacker records A(1) and A(2).
+	if !r.admit(sessA, 1) {
+		t.Fatal("A(1): first frame from incarnation A must be admitted")
+	}
+	if !r.admit(sessA, 2) {
+		t.Fatal("A(2): strictly increasing counter within A must be admitted")
+	}
+
+	// Genuine reboot to incarnation B (a routine HA event): fresh random
+	// session, admitted. This RETIRES A.
+	if !r.admit(sessB, 1) {
+		t.Fatal("B(1): a genuinely new session (real reboot) must be admitted")
+	}
+
+	// The #5477 replay: the attacker re-injects the recorded A(1) after the B
+	// switch. Pre-fix this re-anchored A and returned true (refreshing liveness
+	// and applying A's stale role); the retired-session watermark must reject
+	// it now.
+	if r.admit(sessA, 1) {
+		t.Error("#5477: replay of retired session A(1) after switch to B must be REJECTED")
+	}
+	if r.admit(sessA, 2) {
+		t.Error("#5477: replay of retired session A(2) after switch to B must be REJECTED")
+	}
+	// Sustained alternation must stay closed: bouncing back to B replays are
+	// also at/below B's watermark.
+	if r.admit(sessB, 1) {
+		t.Error("#5477: replay of B(1) after it is the active session must be REJECTED")
+	}
+	if r.admit(sessA, 1) {
+		t.Error("#5477: a second A->B->A bounce must remain REJECTED")
+	}
+
+	// A genuinely fresh, never-seen session C (a real second reboot) must still
+	// be admitted — the fix must not break legitimate reboot tolerance.
+	if !r.admit(sessC, 1) {
+		t.Error("a genuinely new session C (legit reboot) must still be admitted")
+	}
+	// And the live session B may still advance its own counter.
+	if !r.admit(sessB, 2) {
+		t.Error("the retired-B watermark must still admit a strictly newer B counter")
+	}
+}
+
+// TestHeartbeatAuthReplay_BoundedRing verifies the retired-session set is
+// bounded (heartbeatReplaySessions) with FIFO eviction, and documents the
+// security consequence: an entry is evicted ONLY after heartbeatReplaySessions
+// distinct NEWER sessions arrive — each of which requires a genuine peer reboot
+// (an attacker cannot mint valid frames for new sessions). A post-eviction
+// replay re-anchors ONCE but cannot be sustained (further replays are <= the
+// restored watermark).
+func TestHeartbeatAuthReplay_BoundedRing(t *testing.T) {
+	var r heartbeatAuthReplay
+
+	// Oldest remembered session.
+	const oldest = 0x1000
+	if !r.admit(oldest, 5) {
+		t.Fatal("oldest session must be admitted")
+	}
+	// While the ring is not yet full, the oldest watermark still rejects a
+	// replay at/below it.
+	if r.admit(oldest, 5) {
+		t.Fatal("replay of the oldest session (still remembered) must be rejected")
+	}
+
+	// Drive exactly heartbeatReplaySessions distinct NEWER sessions through the
+	// ring. That is one full ring of fresh sessions, evicting `oldest`.
+	for i := 0; i < heartbeatReplaySessions; i++ {
+		s := uint64(0x2000 + i)
+		if !r.admit(s, 1) {
+			t.Fatalf("new session %#x must be admitted", s)
+		}
+	}
+	if r.count != heartbeatReplaySessions {
+		t.Fatalf("ring count = %d, want saturated at %d", r.count, heartbeatReplaySessions)
+	}
+
+	// `oldest` has now been evicted (FIFO). A replay is treated as a fresh
+	// never-seen session and re-anchors ONCE — the accepted residual after
+	// enough genuine reboots. This requires heartbeatReplaySessions genuine
+	// reboots to reach, which an attacker cannot manufacture (HMAC blocks
+	// minting new valid sessions).
+	if !r.admit(oldest, 5) {
+		t.Error("post-eviction replay re-anchors once (documented residual)")
+	}
+	// But it cannot be SUSTAINED: the re-anchor restored oldest's watermark, so
+	// a further replay at/below it is rejected again.
+	if r.admit(oldest, 5) {
+		t.Error("post-eviction re-anchor must restore the watermark; a sustained replay must be rejected")
+	}
+}
+
+// TestHeartbeatReplayGatesLivenessRefresh binds the read-loop consequence
+// (heartbeat.go readLoop): a heartbeat is only allowed to refresh peer liveness
+// (r.lastSeen) and drive election (handlePeerHeartbeat) when the auth gate
+// ACCEPTS. It reconstructs the exact readLoop gate —
+//
+//	macOK      := present && len(key) > 0 && verifyHeartbeatMAC(frame, key)
+//	nonceFresh := macOK && r.authReplay.admit(session, counter)
+//	accept, _  := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, peerAuthSeen)
+//
+// over real signed frames, and asserts that a #5477 A->B->A replay yields
+// accept==false, so the readLoop `continue`s and liveness is NOT refreshed and
+// the stale role is NOT applied. RED-on-revert: reverting admit re-admits the
+// replay, nonceFresh becomes true, accept flips true, and a replayed frame
+// would refresh liveness / drive a bogus election.
+func TestHeartbeatReplayGatesLivenessRefresh(t *testing.T) {
+	key := []byte("cluster-shared-secret")
+	r := &heartbeatReceiver{}
+
+	const (
+		sessA = 0xA11CE
+		sessB = 0xB0B
+	)
+	// gate mirrors the readLoop auth gate and returns whether the frame would
+	// refresh liveness. It mutates the receiver's real authReplay/peerAuthSeen
+	// state exactly as the readLoop does.
+	gate := func(frame []byte) bool {
+		session, counter, present := heartbeatAuthTrailer(frame)
+		macOK := present && len(key) > 0 && verifyHeartbeatMAC(frame, key)
+		nonceFresh := macOK && r.authReplay.admit(session, counter)
+		accept, _ := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthSeen.Load())
+		if macOK {
+			r.peerAuthSeen.Store(true)
+		}
+		return accept
+	}
+
+	// A simulated liveness clock that only advances when the gate accepts —
+	// standing in for r.lastSeen.Store(MonotonicNanos()) in the readLoop.
+	var liveness int64
+	feed := func(frame []byte) {
+		if gate(frame) {
+			liveness++
+		}
+	}
+
+	aOne := MarshalHeartbeatAuth(samplePkt(), key, sessA, 1)
+	bOne := MarshalHeartbeatAuth(samplePkt(), key, sessB, 1)
+
+	feed(aOne) // genuine A(1)
+	feed(bOne) // genuine reboot to B(1) — retires A
+	after := liveness
+	feed(aOne) // #5477 replay of retired A(1)
+	if liveness != after {
+		t.Errorf("replayed retired heartbeat refreshed liveness: liveness advanced %d -> %d (must NOT)", after, liveness)
+	}
+	if gate(aOne) {
+		t.Error("#5477: replayed retired frame must fail the readLoop auth gate (accept==false)")
+	}
+}
+
 // TestHeartbeatAuthDecision is the RED-on-revert core: it pins the accept/reject
 // truth table of the dual-accept policy. Reverting the enforcement (e.g. always
 // returning accept, or dropping the macOK/peerAuthSeen checks) turns one of

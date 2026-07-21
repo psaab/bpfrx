@@ -160,7 +160,15 @@ type SyncStats struct {
 	// a generation map to its cap; the map is never cleared, so existing live
 	// keys retain their stored generation and the guard stays correct for
 	// them.
-	GenMapOverflow     atomic.Uint64
+	GenMapOverflow atomic.Uint64
+	// PreAuthRejected counts inbound sync connections dropped by the #5303
+	// pre-auth admission cap: a connection accepted while the pre-auth setup
+	// pool was saturated (a flood of connections that stall before
+	// authentication). Excess connections are closed immediately and never
+	// allocate the large session-sync socket buffers. A nonzero value means the
+	// cap absorbed a connection flood on the sync/control network; the reserved
+	// tail (preAuthPeerReserve) still admits the legitimate peer's reconnect.
+	PreAuthRejected    atomic.Uint64
 	Connected          atomic.Bool
 	BulkSyncStartTime  atomic.Int64
 	BulkSyncEndTime    atomic.Int64
@@ -198,6 +206,7 @@ type SyncStatsSnapshot struct {
 	DeletesStaleIgnored    uint64
 	InstallsStaleIgnored   uint64
 	GenMapOverflow         uint64
+	PreAuthRejected        uint64
 	Connected              bool
 	ActiveFabric           int
 	BulkSyncStartTime      int64
@@ -261,13 +270,28 @@ type SessionSync struct {
 	// syncAuthedEver is the sticky sync-channel downgrade-guard: once any sync
 	// connection authenticates, a later unauthenticated connection is rejected.
 	syncAuthedEver atomic.Bool
-	listener       net.Listener
-	localAddr1     string
-	peerAddr1      string
-	listener1      net.Listener
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
-	sendCh         chan []byte // buffered channel for outgoing messages
+
+	// #5303 pre-auth admission gate. Bounds the inbound sync connections that
+	// are in setup (pre-handshake) at once so a flood of connections that stall
+	// before authentication cannot exhaust FDs/goroutines/socket-memory and deny
+	// a legitimate peer's reconnect. preAuthInFlight counts admitted-but-not-yet-
+	// resolved inbound setups; setupConns tracks EVERY connection currently in
+	// its pre-wire setup window (inbound AND outbound) so Stop() can close them
+	// and unblock a stalled handshake — the bool value records whether the entry
+	// holds a counted inbound admission slot. preAuthLogMono rate-limits the
+	// rejection warning to ~1/sec. All three are guarded by preAuthMu.
+	preAuthMu       sync.Mutex
+	preAuthInFlight int
+	setupConns      map[net.Conn]bool
+	preAuthLogMono  atomic.Int64
+
+	listener   net.Listener
+	localAddr1 string
+	peerAddr1  string
+	listener1  net.Listener
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	sendCh     chan []byte // buffered channel for outgoing messages
 
 	// incrementalPauseDepth temporarily pauses background incremental producers
 	// during ordered handoff operations.
@@ -775,7 +799,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.

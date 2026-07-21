@@ -256,6 +256,42 @@ On disconnect:
 - the readiness timeout is invalidated with a generation guard so a stale timer
   callback cannot flip readiness back to true after disconnect
 
+### Pre-Auth Connection Admission (#5303)
+
+The accept loop admits every inbound connection into a small **pre-auth setup
+pool** (`beginSetup` in `sync_admission.go`) *before* spawning its setup
+goroutine. This closes the residual of the #4370 parallel-accept fix: a host on
+the sync/control network could otherwise open connections at rate R and stall
+each before authentication, and — because socket buffers were sized and a
+goroutine spawned *before* the handshake — steadily pin FDs, goroutines, and
+256 KiB-buffered sockets until a legitimate peer could no longer reconnect.
+
+Three properties, all preserving #4370's parallel accept and the #4107 HMAC
+handshake:
+
+- **Bounded, with a reserved peer tail.** At most `preAuthSetupCap` (8)
+  connections are in pre-auth setup at once. A flood from any address other
+  than the configured peer can consume at most `preAuthSetupCap -
+  preAuthPeerReserve` (6) slots; the reserved tail (2, one per fabric) is
+  usable only by connections whose remote IP matches a configured peer fabric
+  address, so a flood can never deny the legitimate peer a reconnect slot.
+  Excess connections are closed immediately and bump `PreAuthRejected`
+  (rate-limited warning). The reservation matches on peer **IP** only (the peer
+  dials from an ephemeral port); an attacker able to source-spoof the exact
+  peer IP could reach the reserved tail but still cannot pass the HMAC
+  handshake, and the general-pool cap already bounds the total resource cost.
+- **Cheap pre-auth sockets.** The large (256 KiB) read/write socket buffers
+  (`configureSessionSyncConn`) are sized only **after** the handshake succeeds,
+  not at accept — so a pre-auth connection costs a bare FD until it proves
+  possession of the PSK. The admission slot is released the moment the
+  handshake resolves (`finishSetup`), so it covers only the brief pre-auth
+  window, never the subsequent bulk sync.
+- **Clean shutdown.** Every in-flight setup connection (inbound *and* our own
+  outbound dials) is tracked so `Stop()` closes them (`closeSetupConns`),
+  unblocking a stalled handshake read instead of waiting out the 5s shutdown
+  budget. Outbound dials bypass the cap (they are our own, bounded to one per
+  fabric) but are still tracked for this shutdown close.
+
 ### Bulk-Prime Retry Loop
 
 After reconnect, the daemon retries `BulkSync()` if the peer never acknowledges

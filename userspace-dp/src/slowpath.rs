@@ -1,4 +1,4 @@
-use io_uring::IoUring;
+use crate::io_uring_write::WriteResult;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -162,7 +162,7 @@ impl RateLimiter {
 }
 
 enum WriteMode {
-    IoUring(IoUring),
+    IoUring(crate::io_uring_write::RingWriter),
     SyncFallback,
 }
 
@@ -496,7 +496,7 @@ fn slow_path_worker(name: &str, mtu: i32, rx: Receiver<PacketRequest>, status: A
     status.set_device_name(&actual_name);
     status.active.store(true, Ordering::Relaxed);
 
-    let mut mode = match IoUring::new(256) {
+    let mut mode = match crate::io_uring_write::RingWriter::new(256) {
         Ok(ring) => {
             status.set_mode("io_uring");
             WriteMode::IoUring(ring)
@@ -510,13 +510,15 @@ fn slow_path_worker(name: &str, mtu: i32, rx: Receiver<PacketRequest>, status: A
 
     while let Ok(req) = rx.recv() {
         status.queued_packets.fetch_sub(1, Ordering::Relaxed);
-        // `req` (and `req.bytes`) stays owned by this loop iteration until the
-        // end of the body — AFTER `apply_slowpath_outcome` may drop the ring on
-        // a terminal demotion. That ordering is what upholds the #2297
-        // buffer-lifetime invariant across a demotion: closing the ring fd
-        // cancels any still-outstanding SQE while its buffer is still alive.
-        let outcome = write_packet_with_mode(&mut mode, tun.as_raw_fd(), &req.bytes);
-        apply_slowpath_outcome(outcome, &mut mode, req.bytes.len(), &status);
+        // The owned packet buffer MOVES into the write path. In io_uring mode a
+        // Deferred outcome moves it into the ring's in-flight registry (retained
+        // until its CQE is reaped or the ring is torn down and drained) rather
+        // than freeing it here — the #5800 buffer-lifetime invariant. A reaped
+        // terminal outcome (Done / NothingWritten / Transferred) hands the buffer
+        // back, and it is dropped when this iteration ends.
+        let bytes_len = req.bytes.len();
+        let outcome = write_packet_with_mode(&mut mode, tun.as_raw_fd(), req.bytes);
+        apply_slowpath_outcome(outcome, &mut mode, bytes_len, &status);
     }
     status.active.store(false, Ordering::Relaxed);
 }
@@ -553,56 +555,99 @@ struct SlowPathWriteOutcome {
 fn write_packet_with_mode(
     mode: &mut WriteMode,
     fd: i32,
-    bytes: &[u8],
+    bytes: Vec<u8>,
 ) -> SlowPathWriteOutcome {
     match mode {
         WriteMode::IoUring(ring) => {
-            classify_io_uring_write(write_packet_io_uring(ring, fd, bytes), || {
-                write_packet_sync(fd, bytes)
-            })
+            // Move the owned buffer into the ring. A stream write to the packet
+            // TUN (no file offset). On a Deferred outcome the ring KEEPS the
+            // buffer in its in-flight registry (never freed while an SQE may
+            // reference it, #5800); a NothingWritten hands it back for the
+            // synchronous fallback.
+            let result = ring.write(fd, bytes, false, "slow-path");
+            classify_io_uring_write(result, |b| write_packet_sync(fd, &b))
         }
         WriteMode::SyncFallback => SlowPathWriteOutcome {
-            result: write_packet_sync(fd, bytes),
+            result: write_packet_sync(fd, &bytes),
             ring_terminal: false,
             demotion_cause: None,
         },
     }
 }
 
-/// Classify a single io_uring write attempt into a [`SlowPathWriteOutcome`]
-/// (#5172). Separates packet-transfer certainty (delegated to the #2477
-/// [`decide_sync_fallback`] decision) from ring health:
+/// Classify a single io_uring [`WriteResult`] into a [`SlowPathWriteOutcome`]
+/// (#5172 + #5800). Separates packet-transfer certainty (the #2477 sync-fallback
+/// decision) from ring health, and distinguishes the four outcomes the acceptance
+/// criteria require: successful completion, deferred in-flight ownership,
+/// cancellation/partial transfer, and fatal ring teardown.
 ///
-///   * `Ok` — delivered via io_uring; ring healthy.
-///   * `Err(NothingWritten)` (`safe_to_retry`) — nothing reached the TUN, so a
-///     synchronous retry from offset 0 rescues THIS packet. TRANSIENT: the ring
-///     may be momentarily full or hit a per-packet completion error; keep
-///     io_uring mode (do not demote).
-///   * `Err(Transferred)` (not `safe_to_retry`) — the submit/reap was ambiguous,
-///     so bytes may be in flight on the ring; the packet is DROPPED (no-retry —
-///     re-sending could double-transmit). On a packet-oriented TUN a partial
-///     write cannot occur (the kernel writes a whole packet or fails), so this
-///     variant means the io_uring transport itself is wedged: TERMINAL — demote.
+///   * `Done` — delivered via io_uring; ring healthy. No sync fallback.
+///   * `NothingWritten` — nothing reached the TUN (submit-queue full, a per-packet
+///     completion error, a zero-byte completion, or id-space exhaustion). The
+///     returned buffer feeds a synchronous retry that rescues THIS packet.
+///     TRANSIENT: keep io_uring mode (do not demote on a momentary blip, #2477).
+///   * `Transferred` — a packet-fd partial write: `0 < n < len` bytes are already
+///     on the TUN and the CQE was REAPED (terminal, buffer safe). Re-sending the
+///     whole packet would duplicate it → DROP, no sync retry. The ring reaped
+///     cleanly, so it is NOT demoted.
+///   * `Deferred` — the op did NOT reach a reaped terminal state, so the buffer
+///     has been MOVED into the ring's in-flight registry (retained, not freed) and
+///     the packet did not reliably reach the TUN → DROP (no sync retry; the write
+///     may be in flight). A FATAL ring (dead fd, `fatal_ring = true`) is TERMINAL
+///     — demote to sync so later packets stop hitting a dead ring. A bare
+///     retry-ceiling storm (`fatal_ring = false`) keeps io_uring: the ring is
+///     otherwise healthy and the parked buffer is reclaimed on a later write's
+///     reap.
 ///
-/// Factored so the classification is unit-testable without a live ring or TUN.
+/// The `sync_fallback` thunk receives the handed-back buffer (only the
+/// `NothingWritten` arm invokes it). Factored so the classification is
+/// unit-testable without a live ring or TUN.
 fn classify_io_uring_write<F>(
-    io_result: Result<(), crate::io_uring_write::WriteError>,
+    result: WriteResult,
     sync_fallback: F,
 ) -> SlowPathWriteOutcome
 where
-    F: FnOnce() -> Result<(), String>,
+    F: FnOnce(Vec<u8>) -> Result<(), String>,
 {
-    let ring_terminal = matches!(&io_result, Err(err) if !err.safe_to_retry());
-    let demotion_cause = match &io_result {
-        Err(err) if !err.safe_to_retry() => Some(format!(
-            "slow-path io_uring ring failure, demoting to sync: {err}"
-        )),
-        _ => None,
-    };
-    SlowPathWriteOutcome {
-        result: decide_sync_fallback(io_result, sync_fallback),
-        ring_terminal,
-        demotion_cause,
+    match result {
+        WriteResult::Done(_bytes) => SlowPathWriteOutcome {
+            result: Ok(()),
+            ring_terminal: false,
+            demotion_cause: None,
+        },
+        WriteResult::NothingWritten(bytes, _msg) => SlowPathWriteOutcome {
+            // Nothing on the fd — the sync fallback rescues this packet from the
+            // returned buffer. The ring stays live (transient, not a demotion).
+            result: sync_fallback(bytes),
+            ring_terminal: false,
+            demotion_cause: None,
+        },
+        WriteResult::Transferred(_bytes, msg) => SlowPathWriteOutcome {
+            // Bytes already on the TUN (reaped, terminal). Drop, never re-send.
+            // The ring is healthy — not a demotion.
+            result: Err(msg),
+            ring_terminal: false,
+            demotion_cause: None,
+        },
+        WriteResult::Deferred {
+            id,
+            message,
+            fatal_ring,
+        } => {
+            // The buffer is parked in the ring's registry (retained, not freed);
+            // `id` identifies the parked in-flight write so an operator can
+            // correlate it with the teardown drain. Only a FATAL ring demotes; a
+            // retry-ceiling storm keeps io_uring.
+            let message = format!("{message} (in-flight id {id}, buffer retained)");
+            let demotion_cause = fatal_ring.then(|| {
+                format!("slow-path io_uring ring failure, demoting to sync: {message}")
+            });
+            SlowPathWriteOutcome {
+                result: Err(message),
+                ring_terminal: fatal_ring,
+                demotion_cause,
+            }
+        }
     }
 }
 
@@ -657,25 +702,17 @@ fn apply_slowpath_outcome(
     }
 }
 
-/// Retire the io_uring ring to [`WriteMode::SyncFallback`] (#5172).
+/// Retire the io_uring ring to [`WriteMode::SyncFallback`] (#5172 + #5800).
 ///
-/// Best-effort drains any completions already posted, then overwrites `*mode`,
-/// which DROPS the ring and closes its fd. The fd close is the authoritative
-/// retirement: the kernel cancels any SQE still outstanding when the ring fd
-/// closes. The current packet's buffer is still owned by the caller at this
-/// point (the worker loop drops `req` only after `apply_slowpath_outcome`
-/// returns), so no kernel reference can outlive the buffer — the #2297
-/// buffer-lifetime invariant holds across the demotion. No re-promotion.
+/// Overwriting `*mode` DROPS the [`RingWriter`], whose `Drop` runs a bounded
+/// teardown drain (submit an AsyncCancel per still-in-flight entry, observe each
+/// target write's terminal CQE) and then closes the ring fd. The fd close makes
+/// the kernel cancel and wait for every outstanding op, and the in-flight
+/// registry — dropped AFTER the ring by field order — frees any straggler buffer
+/// only then, so no kernel reference can outlive a buffer across the demotion
+/// (the #5800 buffer-lifetime invariant, now covering the parked-buffer case the
+/// pre-#5800 code could not). No re-promotion (avoids flapping).
 fn retire_ring_to_sync(mode: &mut WriteMode) {
-    if let WriteMode::IoUring(ring) = mode {
-        // Bounded best-effort CQE drain (the ring holds at most its 256 entries,
-        // and the slow path keeps a single write in flight). Mirrors the
-        // `ring.completion().next()` idiom used by `io_uring_write`.
-        let mut drained = 0;
-        while drained < 4096 && ring.completion().next().is_some() {
-            drained += 1;
-        }
-    }
     *mode = WriteMode::SyncFallback;
 }
 
@@ -846,42 +883,6 @@ pub(crate) fn write_packet_nonblocking(fd: i32, bytes: &[u8]) -> io::Result<()> 
         // write is one packet, never a partial-offset resubmit.
         unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), buf_len) }
     })
-}
-
-fn write_packet_io_uring(
-    ring: &mut IoUring,
-    fd: i32,
-    bytes: &[u8],
-) -> Result<(), crate::io_uring_write::WriteError> {
-    // Stream write to the TUN device (no file offset). The shared loop retries
-    // the wait on EINTR rather than abandoning an in-flight SQE, matches the
-    // completion by user_data so a stale CQE cannot corrupt the offset, and
-    // returns only after the matching CQE is reaped so `bytes` outlives every
-    // kernel reference (#2297).
-    crate::io_uring_write::write_all_to_fd(ring, fd, bytes, false, "slow-path")
-}
-
-/// The #2477 fallback DECISION, factored out so it is unit-testable without a
-/// live io_uring ring or TUN fd. Given the io_uring write `result` and a
-/// `sync_fallback` thunk, only invokes the synchronous fallback when the
-/// io_uring failure transferred NOTHING (`safe_to_retry`). A partial transfer —
-/// or an ambiguous in-flight error — drops the packet so the whole frame is
-/// never re-sent on top of bytes already on the TUN.
-fn decide_sync_fallback<F>(
-    result: Result<(), crate::io_uring_write::WriteError>,
-    sync_fallback: F,
-) -> Result<(), String>
-where
-    F: FnOnce() -> Result<(), String>,
-{
-    match result {
-        Ok(()) => Ok(()),
-        Err(err) if err.safe_to_retry() => sync_fallback(),
-        // Bytes are (or may be) already on the TUN — re-sending would
-        // double-transmit / corrupt the device. Drop the packet (the caller
-        // counts it as a write error + drop).
-        Err(err) => Err(err.to_string()),
-    }
 }
 
 pub(crate) fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {
