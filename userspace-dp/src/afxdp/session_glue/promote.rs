@@ -136,13 +136,29 @@ pub(in crate::afxdp::session_glue) fn maybe_promote_synced_session(
 }
 
 /// Purge a translated peer-synced hit: drop the entry from the shared
-/// maps, delete the kernel session-map entry, and remove the local
-/// session-table entry. Used when the local node is not the active
-/// owner of a translated forward session — leaving the hit live would
-/// route traffic to the wrong node.
+/// maps, delete the kernel session-map entry, remove the local
+/// session-table entry, AND return the source-NAT / NAT64 pool
+/// reservation this forward session reserved at install. Used when the
+/// local node is not the active owner of a translated forward session —
+/// leaving the hit live would route traffic to the wrong node.
 ///
-/// Behavior unchanged from the pre-#1346 free function; only the
-/// signature changed (10 → 7 params via `SharedSessionRefs`).
+/// #5295: the purged entry is a peer-synced FORWARD translated session
+/// (the guard below rejects reverse/non-translated keys), so at install
+/// `handle_upsert_synced` reserved its translated `(pool_addr, port)` in
+/// THIS node's local allocator via `reserve_synced_source_nat_allocation`
+/// / `reserve_synced_nat64_allocation`. Tearing the session down without
+/// the matching release LEAKED that reservation — every alias-owned
+/// transient purge burned a pool port, exhausting the standby's source-NAT
+/// / NAT64 pool under sustained HA churn. Mirror the `handle_delete_synced`
+/// (and `delete_terminal_filtered_session`) teardown: release under the
+/// same `metadata.is_reverse` ownership guard so a reverse/alias entry (or
+/// a non-pool / non-reserved session) frees nothing and a double-free is
+/// impossible — `release_flow` is a no-op when the flow was never tracked.
+///
+/// Behavior otherwise unchanged from the pre-#1346 free function; the
+/// signature carries `forwarding` + `now_ns` for the reservation release
+/// (was 7 params, now 9 after the #5295 additions).
+#[allow(clippy::too_many_arguments)]
 pub(in crate::afxdp::session_glue) fn purge_translated_synced_hit(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
@@ -151,6 +167,8 @@ pub(in crate::afxdp::session_glue) fn purge_translated_synced_hit(
     decision: SessionDecision,
     metadata: &SessionMetadata,
     origin: SessionOrigin,
+    forwarding: &ForwardingState,
+    now_ns: u64,
 ) {
     if !origin.is_peer_synced() || !is_translated_forward_session_key(key, decision, metadata) {
         return;
@@ -164,4 +182,22 @@ pub(in crate::afxdp::session_glue) fn purge_translated_synced_hit(
     );
     delete_session_map_entry_for_removed_session(session_map_fd, key, decision, metadata);
     sessions.delete(key);
+    // #5295: return the pool reservation to the local allocator, exactly as
+    // `handle_delete_synced` does on the delete-sync teardown. `is_reverse` is
+    // the ownership guard (a reverse entry owns no source-NAT/NAT64 reservation);
+    // both calls are a no-op for a non-pool / non-reserved session.
+    release_source_nat_allocation(
+        &forwarding.source_nat_rules,
+        key,
+        decision.nat,
+        metadata.is_reverse,
+        now_ns,
+    );
+    crate::nat64::release_nat64_allocation(
+        &forwarding.nat64,
+        key,
+        decision.nat,
+        metadata.is_reverse,
+        now_ns,
+    );
 }

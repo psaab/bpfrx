@@ -54523,3 +54523,27 @@ top.
 - **File(s)**: pkg/config/compiler_interfaces.go,
   pkg/config/compiler_prewalk.go, pkg/config/vrrp_authentication_4288_test.go,
   pkg/config/testdata/golden_4406.json, docs/feature-coverage.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5295 — HA-NAT reservation leak on transient synced-hit purge.
+  `purge_translated_synced_hit` (session_glue/promote.rs) tears down a
+  transient peer-synced translated FORWARD session (RG not locally active) but
+  released NO allocator state, LEAKING the source-NAT / NAT64 pool port that
+  `handle_upsert_synced` reserved at install (reserve_synced_source_nat /
+  reserve_synced_nat64, #4388 / #4512) → standby pool exhaustion under
+  sustained HA churn. Fix: add release_source_nat_allocation +
+  release_nat64_allocation under the same `metadata.is_reverse` ownership
+  guard, exactly as handle_delete_synced / delete_terminal_filtered_session do
+  (signature gains `forwarding` + `now_ns`; single caller in mod.rs updated).
+  Safe against double-free: purge fires only for the forward translated side
+  (is_translated_forward_session_key rejects reverse/alias keys) and
+  release_flow is a no-op when the flow was never tracked. Distinct from #5178
+  (recycle-queue drain gap) — here there was no release call at all. Tests: 3
+  fail-on-revert in session_glue/tests.rs (source-NAT release, NAT64 release,
+  reverse-entry-releases-nothing guard). Neutralizing either release call
+  reddens the matching owning-leg assertion (used_ports stays 1 / NAT64 probe
+  gets 1025). Full cargo suite green (4159 passed).
+- **File(s)**: userspace-dp/src/afxdp/session_glue/promote.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md, _Log.md
