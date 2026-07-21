@@ -3590,6 +3590,90 @@ fn reconcile_post_teardown_worker_spawn_failure_fails_closed_4952() {
     );
 }
 
+/// #5143: a worker that SPAWNS successfully on the POST-TEARDOWN path but whose
+/// IN-THREAD XSK/UMEM bind does NOT bring up its full planned binding set (a
+/// partial/empty bind) must FAIL CLOSED — `reconcile` returns
+/// `Err(ReconcileError::WorkerBindIncomplete(_))`, the newly-started workers
+/// are STOPPED + JOINED (no leaked live-but-unbound worker heartbeating past a
+/// fail-closed reconcile), and `last_reconcile_stage` carries the
+/// `worker_bind_incomplete:..` descriptor (NOT `spawned:workers=..`).
+///
+/// This is DISTINCT from #4952: #4952 propagates a worker-thread SPAWN failure
+/// (`pthread_create` EAGAIN/ENOMEM) — the thread never runs. #5143 is the
+/// POST-SPAWN, in-thread bind failure — the spawn SUCCEEDED and the worker
+/// heartbeats, but it bound an incomplete queue set. #4952's spawn-error
+/// propagation does not catch it; the per-worker startup readiness barrier
+/// (HEARTBEAT != READINESS) does.
+///
+/// The per-instance `force_worker_bind_incomplete` seam spawns a joinable STUB
+/// worker that reports a bound set MISSING one planned slot (a real
+/// `worker_loop` cannot bind a real XSK in-process), then heartbeats until the
+/// barrier stops it — so the fail-close + stop/join is unit-verifiable.
+///
+/// Fail-on-revert: remove the readiness barrier (the worker binds partially but
+/// `bring_up_workers` returns Ok and the reconcile commits) and BOTH the
+/// `Err(WorkerBindIncomplete)` match and the stop/join assertions flip
+/// (`reconcile` returns Ok, the stub worker leaks in `workers.handles`, and the
+/// stage becomes `spawned:workers=..`).
+#[test]
+fn post_spawn_inthread_bind_failure_fails_closed_5143() {
+    let mut coordinator = Coordinator::new();
+    // One registered binding => exactly one planned worker to bring up.
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        worker_id: 0,
+        queue_id: 0,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        ..BindingStatus::default()
+    }];
+    // Force the (only) planned worker to SPAWN but report an INCOMPLETE bound
+    // set — the post-spawn in-thread bind failure the fix guards.
+    coordinator.force_worker_bind_incomplete = 1;
+
+    // All mandatory pins open so the reconcile clears the pre-teardown
+    // integrity legs, tears down, applies the snapshot, and REACHES the worker
+    // bring-up + readiness barrier.
+    let snap = mandatory_ok_snapshot(5);
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    // (a) fail closed with the typed post-spawn-bind error.
+    assert!(
+        matches!(result, Err(ReconcileError::WorkerBindIncomplete(ref stage)) if !stage.is_empty()),
+        "a post-spawn in-thread bind failure must surface as \
+         Err(WorkerBindIncomplete) with a non-empty stage, got {result:?}"
+    );
+    // The stage identifies the barrier verdict (not a spawn success).
+    assert!(
+        coordinator
+            .last_reconcile_stage
+            .starts_with("worker_bind_incomplete:"),
+        "the bind-incomplete stage must be recorded, got {:?}",
+        coordinator.last_reconcile_stage
+    );
+    assert!(
+        !coordinator.last_reconcile_stage.starts_with("spawned:"),
+        "the reconcile must NOT report a successful spawn after a partial bind, got {:?}",
+        coordinator.last_reconcile_stage
+    );
+    // (c) the newly-started worker was STOPPED + JOINED and its coordinator
+    // state cleared — no leaked live-but-unbound worker.
+    assert!(
+        coordinator.workers.handles.is_empty(),
+        "the partially-bound worker must be stopped/joined (no leaked handle)"
+    );
+    assert!(
+        coordinator.workers.live.is_empty(),
+        "the partially-bound worker's live state must be cleared on fail-close"
+    );
+    // The seam consumed its single forced incomplete report (no over-fire).
+    assert_eq!(
+        coordinator.force_worker_bind_incomplete, 0,
+        "exactly one forced bind-incomplete report should have been consumed"
+    );
+}
+
 /// #5171: the side-effect-free `validate_snapshot_buildable` gate (used by
 /// the deferred-activation apply path, which never reaches `reconcile`) and
 /// the worker-spawning `reconcile` MUST reject the IDENTICAL non-buildable

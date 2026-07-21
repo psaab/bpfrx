@@ -149,6 +149,27 @@ pub(in crate::afxdp) struct BindingPlan {
     pub(in crate::afxdp) shared_umem: SharedUmemBindingPlan,
 }
 
+/// #5143: a newly-started worker's one-shot STARTUP READINESS report,
+/// sent once — after the worker finishes its in-thread XSK/UMEM binds in
+/// `worker_loop_setup` and BEFORE it enters its steady poll loop — back to
+/// `bring_up_workers` over the per-reconcile startup channel.
+///
+/// `bound_slots` is the set of planned binding slots whose XSK actually bound
+/// (derived from the bindings the worker successfully constructed). A worker
+/// whose in-thread bind failed for one or more planned bindings reports a set
+/// SMALLER than its planned set — the setup Err arm records the failure by
+/// OMISSION (the failed binding never enters the worker's `bindings` vec, so
+/// its slot is absent here). The `bring_up_workers` readiness barrier compares
+/// this against the slot set it dispatched to the worker; any shortfall (or a
+/// worker that never reports within the bounded deadline) fails the reconcile
+/// closed. HEARTBEAT != READINESS: a live heartbeat alone no longer satisfies
+/// the reconcile transaction — one READY binding must exist per required plan.
+#[derive(Clone, Debug)]
+pub(in crate::afxdp) struct WorkerStartupReport {
+    pub(in crate::afxdp) worker_id: u32,
+    pub(in crate::afxdp) bound_slots: Vec<u32>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::afxdp) enum SharedUmemMode {
     #[default]

@@ -1474,6 +1474,144 @@ fn full_apply_post_teardown_spawn_failure_fails_closed_no_persist_6140() {
     let _ = std::fs::remove_file(&state_file);
 }
 
+/// #5143: the FULL-APPLY handler leg must fail closed on a POST-SPAWN in-thread
+/// worker BIND failure — distinct from the #4952/#6140 SPAWN failure. A worker
+/// that spawns but binds an INCOMPLETE queue set (a live-but-unbound worker
+/// heartbeating past a broken bring-up) surfaces as
+/// `ReconcileError::WorkerBindIncomplete`, which the handler special-cases the
+/// SAME way as `WorkerSpawn`: report ok=false + "worker bring-up failed after
+/// teardown", NOT persist the broken snapshot as the boot baseline, and roll
+/// the in-memory baseline back to the prior good snapshot + generation. The
+/// `force_worker_bind_incomplete` seam spawns a joinable stub worker that
+/// reports a bound set missing one planned slot (a real XSK cannot bind
+/// in-process), which the readiness barrier catches and fails closed.
+///
+/// Fail-on-revert: neutralize the barrier (the worker binds partially but the
+/// reconcile commits Ok) OR drop the handler's `WorkerBindIncomplete` arm (so
+/// it falls through to refresh_status + persist_state=true with ok=true).
+/// Assertions (a)/(b)/(c)/(d) all flip as ASSERTION failures.
+#[test]
+fn full_apply_post_spawn_inthread_bind_failure_fails_closed_no_persist_5143() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    // Prior snapshot: one binding interface (ge-0/0/1, ifindex 11). Its only
+    // role is to make guard.snapshot Some with a DISTINCT plan key so the new
+    // apply takes the full-apply (non-same-plan) leg.
+    let prior = ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 1,
+        fib_generation: 1,
+        generated_at: chrono::Utc::now(),
+        defer_workers: false,
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![data_iface_6140("ge-0/0/1", "ge-0-0-1", 11)],
+        zones: vec![trust_zone_6140()],
+        ..ConfigSnapshot::default()
+    };
+
+    // New apply: a DIFFERENT binding interface (ge-0/0/2, ifindex 12) -> the
+    // plan key changes -> the full-apply leg runs.
+    let next = ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 2,
+        fib_generation: 2,
+        generated_at: chrono::Utc::now(),
+        defer_workers: false,
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![data_iface_6140("ge-0/0/2", "ge-0-0-2", 12)],
+        zones: vec![trust_zone_6140()],
+        ..ConfigSnapshot::default()
+    };
+
+    assert!(
+        !super::helpers::same_binding_plan(&prior, &next),
+        "the prior/new binding plan keys MUST differ so the handler takes the \
+         full-apply (non-same-plan) leg"
+    );
+
+    let status = ProcessStatus {
+        forwarding_armed: true,
+        capabilities: forwarding_caps(),
+        last_snapshot_generation: 1,
+        last_fib_generation: 1,
+        ..ProcessStatus::default()
+    };
+
+    let state = Arc::new(Mutex::new(ServerState {
+        status,
+        snapshot: Some(prior),
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }));
+
+    // Force the single planned worker to SPAWN but report an INCOMPLETE bound
+    // set (the post-spawn in-thread bind failure the fix guards).
+    state
+        .lock()
+        .expect("state")
+        .afxdp
+        .force_worker_bind_incomplete = 1;
+
+    let mut request = req("apply_snapshot");
+    request.snapshot = Some(next);
+
+    let state_file = unique_state_file("full_apply_bind_incomplete_5143");
+    assert!(
+        !std::path::Path::new(&state_file).exists(),
+        "precondition: state file must not exist before the request"
+    );
+
+    let response = run_request_on_file(state.clone(), request, &state_file);
+
+    // (a) fail closed with a descriptive post-teardown bring-up error.
+    assert!(
+        !response.ok,
+        "a post-spawn in-thread bind failure on the full-apply leg must report ok=false"
+    );
+    assert!(
+        response.error.contains("worker bind incomplete"),
+        "unexpected error: {}",
+        response.error
+    );
+
+    // (b) persist_state was NOT set -> the state file was never written.
+    assert!(
+        !std::path::Path::new(&state_file).exists(),
+        "a full-apply post-spawn bind failure must NOT persist the broken snapshot"
+    );
+
+    let guard = state.lock().expect("state");
+    // (d) the prior (gen 1) snapshot is still the boot baseline; the reported
+    // generation rolled back.
+    assert_eq!(
+        guard.snapshot.as_ref().map(|s| s.generation),
+        Some(1),
+        "the rejected snapshot must not overwrite the persisted baseline"
+    );
+    assert_eq!(
+        guard.status.last_snapshot_generation, 1,
+        "rejected full-apply must not bump last_snapshot_generation"
+    );
+    assert_eq!(
+        guard.status.last_fib_generation, 1,
+        "rejected full-apply must not bump last_fib_generation"
+    );
+    // (c) the coordinator recorded the bind-incomplete verdict (not a spawn
+    // success) and stopped/joined the partially-bound worker.
+    assert!(
+        guard
+            .afxdp
+            .last_reconcile_stage
+            .starts_with("worker_bind_incomplete:"),
+        "the bind-incomplete stage must be preserved (not overwritten with spawned:..), got {:?}",
+        guard.afxdp.last_reconcile_stage
+    );
+
+    let _ = std::fs::remove_file(&state_file);
+}
+
 // --- apply_snapshot deferred-activation integrity build (#5171) ---------
 
 /// #5171 fail-closed DEFERRED apply — MISSING MANDATORY MAP PIN: a

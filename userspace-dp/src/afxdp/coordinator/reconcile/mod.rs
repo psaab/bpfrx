@@ -66,6 +66,17 @@ pub(crate) enum ReconcileError {
     /// does NOT persist the broken snapshot as the boot baseline. Carries
     /// the preserved `spawn_worker_failed:<id>:<err>` stage.
     WorkerSpawn(String),
+    /// #5143: a worker SPAWNED successfully on the POST-TEARDOWN path but its
+    /// IN-THREAD XSK/UMEM bind did not bring up its full planned binding set
+    /// (a partial/empty bind), or it never reported startup readiness within
+    /// the bounded barrier deadline. #4952's spawn-error propagation does NOT
+    /// catch this — the spawn SUCCEEDED; the failure is inside the worker
+    /// thread's setup, where a live heartbeat over an incomplete binding set
+    /// used to satisfy the supervisor (the #5143 silent forwarding outage).
+    /// Like `WorkerSpawn` this is raised AFTER teardown (the queue set has no
+    /// XSK-bound worker), so the handler fails closed and does NOT persist the
+    /// broken snapshot. Carries the `worker_bind_incomplete:<id>:..` stage.
+    WorkerBindIncomplete(String),
 }
 
 impl std::fmt::Display for ReconcileError {
@@ -74,6 +85,9 @@ impl std::fmt::Display for ReconcileError {
             ReconcileError::Integrity(err) => write!(f, "{err}"),
             ReconcileError::MapSetup(stage) => write!(f, "map setup failed ({stage})"),
             ReconcileError::WorkerSpawn(stage) => write!(f, "worker spawn failed ({stage})"),
+            ReconcileError::WorkerBindIncomplete(stage) => {
+                write!(f, "worker bind incomplete ({stage})")
+            }
         }
     }
 }
@@ -377,13 +391,20 @@ impl Coordinator {
         // (some workers up, then a spawn aborted the rest) still needs the
         // refresh so status shows which slots came up and which did not.
         self.refresh_bindings(bindings);
-        // #4952: a POST-TEARDOWN worker-spawn failure fails the reconcile
-        // closed. `bring_up_workers` preserved the `spawn_worker_failed:..`
-        // stage and returned it; surface it as `ReconcileError::WorkerSpawn`
-        // so the control handler reports ok=false and does NOT persist this
-        // broken snapshot as the boot baseline (the old workers are already
-        // torn down — there is no forwarding to restore, only fail-closed
-        // bookkeeping + a retry/last-good path).
-        bringup_result.map_err(ReconcileError::WorkerSpawn)
+        // #4952 / #5143: a POST-TEARDOWN worker-bringup failure fails the
+        // reconcile closed. `bring_up_workers` returned the specific failure —
+        // a worker thread that failed to SPAWN (#4952) or a worker that
+        // spawned but bound an INCOMPLETE queue set / never reported readiness
+        // (#5143). Surface each as its own `ReconcileError` variant so the
+        // control handler reports ok=false and does NOT persist this broken
+        // snapshot as the boot baseline (the old workers are already torn down
+        // — there is no forwarding to restore, only fail-closed bookkeeping +
+        // a retry/last-good path).
+        bringup_result.map_err(|err| match err {
+            bringup::WorkerBringUpError::Spawn(stage) => ReconcileError::WorkerSpawn(stage),
+            bringup::WorkerBringUpError::BindIncomplete(stage) => {
+                ReconcileError::WorkerBindIncomplete(stage)
+            }
+        })
     }
 }
