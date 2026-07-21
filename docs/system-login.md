@@ -316,7 +316,17 @@ too (`zeroizeLoginAccounts`, same error-surfacing discipline):
   marker) and its keys live at `/root/.ssh`, so this sweep never touches a
   `/home/root` key file — root is revoked in place by `zeroizeRootLoginAccount`.
   An **operator's own** (unmarked) `authorized_keys` is never touched — only what
-  xpf wrote.
+  xpf wrote. On a **real key-removal error** (an immutable file, an
+  `ENOTDIR`/`ENOTEMPTY` path shape, an I/O error) the key **file survives**, so
+  the keys marker is **retained** and the error surfaced (`reset incomplete`), so
+  a retried reset re-enumerates the account and re-attempts — mirroring the day-2
+  `deprovisionLoginUser` contract, which keeps the markers and retries on a real
+  `authorized_keys` removal error (#6201). The account-registry teardown may drop
+  its marker after a key-removal error only because `userdel -r` backstops the
+  removal by deleting the whole home tree; this key-only sweep has **no** such
+  backstop, so dropping the marker while the key survives would strand the prior
+  tenant's SSH key with no retry evidence (`zeroizeRemoveKeyFileThenMarker` gates
+  both the proven-owned and genuinely-absent branches).
 - **Ownership uncertainty fails CLOSED (#5496).** Deciding "is this the account
   xpf provisioned?" needs two reads — the live UID (`/etc/passwd`) and the
   recorded UID (the marker). If **either** cannot be resolved — `/etc/passwd`

@@ -54733,3 +54733,44 @@ top.
 - **File(s)**: pkg/grpcapi/server_diag_zeroize.go,
   pkg/grpcapi/zeroize_login_keyonly_authkeys_6190_test.go (new),
   docs/system-login.md, _Log.md
+
+## 2026-07-21 — #6201 fold: retain keys marker on a real key-removal error (PR #6201 / Closes #6190)
+- **Timestamp**: 2026-07-21
+- **Action**: Fold a hostile-reviewer fail-closed-parity finding into PR #6201.
+  `zeroizeSweepProvisionedKeys` (pkg/grpcapi/server_diag_zeroize.go) dropped the
+  keys MARKER even when `os.Remove(keysFile)` returned a REAL (non-ErrNotExist)
+  error — an immutable `chattr +i` file, an ENOTDIR/ENOTEMPTY path shape, an I/O
+  error. On such a failure the xpf-written authorized_keys SURVIVES but the marker
+  was removed anyway, so a retried factory reset no longer re-enumerates the
+  account (marker gone) → the prior tenant's SSH key persists with no retry
+  evidence. This DIVERGED from the day-2 `deprovisionLoginUser`
+  (pkg/daemon/login_password.go ~:548-556), which KEEPS the provenance markers and
+  retries on a real key-removal error. The registry teardown's identical shape is
+  safe only because `userdel -r` backstops key removal by deleting the whole home
+  tree; this key-only sweep has NO such backstop, so it must RETAIN the marker on a
+  real key-removal error. Fix: extracted `zeroizeRemoveKeyFileThenMarker`
+  (one-source-of-truth per engineering-style "helpers over duplication") that
+  removes the key file, surfaces any error via fail(), and drops the marker ONLY
+  when the removal SUCCEEDED or returned os.ErrNotExist. Wired into BOTH the
+  proven-owned (`default`, curUID==recordedUID) and genuinely-absent (`!curFound`)
+  branches. lookupErr / markerErr / UID-mismatch branches unchanged (already
+  retain correctly). Tests (fail-on-revert), extend
+  pkg/grpcapi/zeroize_login_keyonly_authkeys_6190_test.go:
+  TestZeroizeKeyOnlyRetainsMarkerOnKeyRemovalError (proven-owned/default branch) +
+  TestZeroizeKeyOnlyOrphanRetainsMarkerOnKeyRemovalError (orphan/!curFound branch)
+  — each seeds a proven/absent key-only account, makes authorized_keys a NON-EMPTY
+  DIRECTORY so os.Remove fails ENOTEMPTY (real error, root-free), runs the sweep,
+  and asserts the MARKER is RETAINED + the error is surfaced. RED-on-revert
+  (new retain binding): revert the helper's gated marker removal to unconditional
+  `fail(os.Remove(markerFile))` → exactly those 2 tests go RED; the #6190
+  happy-path test is UNAFFECTED (verified — the gate only diverges on the failure
+  path). The existing happy-path
+  TestZeroizeRemovesKeyOnlyAccountAuthorizedKeys and
+  TestZeroizeKeyOnlyRetainedAndMismatchPreserveKeys still pass; their RED-on-revert
+  doc was updated for the helper refactor. Validation: TMPDIR=/tmp
+  GOCACHE=/tmp/gc6201fix GOTMPDIR=/tmp go build ./... ; go vet ./pkg/grpcapi/ ;
+  go test ./pkg/grpcapi/... ./pkg/daemon/... — all pass (exit 0). Control-plane /
+  unit-provable — NO smoke.
+- **File(s)**: pkg/grpcapi/server_diag_zeroize.go,
+  pkg/grpcapi/zeroize_login_keyonly_authkeys_6190_test.go,
+  docs/system-login.md, _Log.md

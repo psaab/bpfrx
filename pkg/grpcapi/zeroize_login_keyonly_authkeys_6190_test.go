@@ -32,25 +32,29 @@ import (
 // key file (no marker) is left untouched. No userdel fires — xpf only added a
 // key, it did not create the account.
 //
-// RED on revert (two equivalent neutralizations, both clean assertion failures,
-// neither a compile break):
+// RED on revert of the #6190 key-file-removal binding (clean assertion failures,
+// no compile break). The key removal now lives in the shared
+// zeroizeRemoveKeyFileThenMarker helper (#6201):
 //
-//   - Surgical (target count 1): comment out the single
-//     `fail(os.Remove(keysFile))` in zeroizeSweepProvisionedKeys' `default`
-//     (UID-match) branch — the exact key-file removal this account exercises.
-//     `keysFile` stays used by the genuinely-absent branch, so it still compiles;
-//     the keyonly marker is still swept, but the xpf-written authorized_keys FILE
-//     SURVIVES, so `assertAbsent(keyonlyKeys)` here goes RED. Exactly this test
-//     fails — target count 1.
-//   - Broad (target count 2): revert the phase-(C) keys-root sweep call in
-//     zeroizeLoginAccounts from `zeroizeSweepProvisionedKeys(...)` back to
+//   - Surgical: make the helper's `os.Remove(keysFile)` a no-op (e.g. replace it
+//     with `keyErr := error(nil)`). It still compiles; the keyonly marker is
+//     still swept, but the xpf-written authorized_keys FILE SURVIVES, so
+//     `assertAbsent(keyonlyKeys)` here goes RED (the canonical #6190 pin). The
+//     #6201 retain tests also trip, since a no-op removal leaves keyErr nil and
+//     the marker is dropped on the failing-key accounts they seed.
+//   - Broad: revert the phase-(C) keys-root sweep call in zeroizeLoginAccounts
+//     from `zeroizeSweepProvisionedKeys(...)` back to
 //     `zeroizeSweepResourceMarkerRoot(zeroizeProvisionedKeysDir(), retained,
-//     fail)` (the marker-only sweep). That also drops the UID-gated fail-closed
-//     retention, so BOTH this test (key file survives) AND
-//     TestZeroizeKeyOnlyRetainedAndMismatchPreserveKeys (the UID-mismatch marker
-//     is erased instead of retained) go RED — target count 2.
+//     fail)` (the marker-only sweep). The key file is never touched (survives)
+//     AND the UID-gated fail-closed retention is dropped, so this test,
+//     TestZeroizeKeyOnlyRetainedAndMismatchPreserveKeys, and the #6201 retain
+//     tests all go RED.
 //
-// No other test seeds a key-only account and asserts its key-file removal.
+// The #6201 retain-on-error binding (the marker is RETAINED on a real key-removal
+// error) has its own tests below — TestZeroizeKeyOnlyRetainsMarkerOnKeyRemovalError
+// and TestZeroizeKeyOnlyOrphanRetainsMarkerOnKeyRemovalError — whose neutralization
+// (revert the helper's marker gate to an unconditional `fail(os.Remove(markerFile))`)
+// leaves this happy-path test unaffected.
 func TestZeroizeRemovesKeyOnlyAccountAuthorizedKeys(t *testing.T) {
 	root := t.TempDir()
 	provDir := filepath.Join(root, "provisioned-users")
@@ -167,4 +171,107 @@ func TestZeroizeKeyOnlyRetainedAndMismatchPreserveKeys(t *testing.T) {
 	// left intact (never delete an operator's keys).
 	assertPresent(t, stalekeyKeys)
 	assertPresent(t, stalekeyMarker)
+}
+
+// TestZeroizeKeyOnlyRetainsMarkerOnKeyRemovalError pins the #6201 retain-on-error
+// gap in the proven-owned (default) branch of zeroizeSweepProvisionedKeys. A
+// key-only account is PROVEN-OWNED (live /etc/passwd UID == keys-marker UID), so
+// the sweep tries to remove its xpf-written authorized_keys and then drop the
+// keys marker. If the key removal hits a REAL error (an immutable file, an
+// ENOTDIR/ENOTEMPTY path shape, an I/O error) the key SURVIVES. The marker must
+// then be RETAINED — mirroring the day-2 deprovisionLoginUser contract, which
+// KEEPS the provenance markers and retries on a real authorized_keys removal
+// error — so a retried factory reset re-enumerates the account (the keys marker
+// is what makes a key-only account discoverable) and re-attempts the removal.
+// Dropping the marker while the key file survives would strand the prior tenant's
+// SSH key with no retry evidence, and unlike the account-registry teardown there
+// is no `userdel -r` backstop that would delete the whole home tree.
+//
+// The removal error is constructed WITHOUT root by making the authorized_keys
+// PATH a non-empty DIRECTORY: os.Remove on a non-empty directory returns
+// ENOTEMPTY, a real (non-ErrNotExist) error, so the retain-on-error gate fires.
+//
+// RED on revert: change zeroizeRemoveKeyFileThenMarker's gated marker removal
+// back to the unconditional `fail(os.Remove(markerFile))`. The key removal still
+// fails (surfaced), but the marker is then dropped anyway, so
+// `assertPresent(keyonlyMarker)` here goes RED. The #6190 happy-path test
+// (successful key removal, keyErr == nil) is UNAFFECTED — the gate only diverges
+// on the key-removal failure path.
+func TestZeroizeKeyOnlyRetainsMarkerOnKeyRemovalError(t *testing.T) {
+	root := t.TempDir()
+	provDir := filepath.Join(root, "provisioned-users")
+	keyDir := filepath.Join(root, "provisioned-keys")
+	sudoersDir := filepath.Join(root, "sudoers.d")
+	homeBase := filepath.Join(root, "home")
+	passwdPath := filepath.Join(root, "passwd")
+
+	// Proven-owned key-only account: live at UID 1500, keys marker records 1500,
+	// NO registry / password marker → the default (UID-match) branch of the sweep.
+	mustWriteFile(t, passwdPath, []byte(
+		"keyonly:x:1500:1500:keyonly:/home/keyonly:/bin/bash\n"))
+	keyonlyMarker := filepath.Join(keyDir, "keyonly")
+	mustWriteFile(t, keyonlyMarker, []byte("1500"))
+
+	// Make authorized_keys a NON-EMPTY DIRECTORY so os.Remove(keysFile) fails with
+	// ENOTEMPTY — a real, non-ErrNotExist key-removal error, no root required.
+	keyonlyKeys := filepath.Join(homeBase, "keyonly", ".ssh", "authorized_keys")
+	mustWriteFile(t, filepath.Join(keyonlyKeys, "sentinel"), []byte("blocks os.Remove\n"))
+
+	_ = setZeroizeLoginPaths(t, provDir, sudoersDir, homeBase, passwdPath)
+
+	// The reset is reported INCOMPLETE: the key-removal error is surfaced.
+	if err := zeroizeLoginAccounts(); err == nil {
+		t.Fatalf("zeroizeLoginAccounts returned nil despite an unremovable key file; want the key-removal error surfaced")
+	}
+
+	// The #6201 fix: the key marker is RETAINED (still present) so a retried reset
+	// re-enumerates this account. Before the fix the marker was dropped even though
+	// the key file survived, losing the retry evidence.
+	assertPresent(t, keyonlyMarker) // RED on revert of the retain-on-error gate
+	assertPresent(t, keyonlyKeys)   // the surviving (unremovable) key dir
+}
+
+// TestZeroizeKeyOnlyOrphanRetainsMarkerOnKeyRemovalError pins the SAME
+// retain-on-error contract in the genuinely-absent (!curFound) branch of
+// zeroizeSweepProvisionedKeys. Here the account is gone from /etc/passwd (an
+// out-of-band userdel) but an xpf-written authorized_keys residue and its keys
+// marker remain. The sweep removes the orphaned residue and drops the stale
+// marker — but ONLY when the residue removal succeeded. On a real removal error
+// the residue SURVIVES (a prior-tenant key still on disk), so the marker is
+// RETAINED so a retried reset re-attempts, exactly as in the proven-owned branch.
+//
+// RED on revert: same neutralization as the proven-owned test — revert
+// zeroizeRemoveKeyFileThenMarker's gated marker removal to unconditional. The
+// orphan residue removal fails (surfaced), the marker is dropped anyway, and
+// `assertPresent(orphanMarker)` goes RED.
+func TestZeroizeKeyOnlyOrphanRetainsMarkerOnKeyRemovalError(t *testing.T) {
+	root := t.TempDir()
+	provDir := filepath.Join(root, "provisioned-users")
+	keyDir := filepath.Join(root, "provisioned-keys")
+	sudoersDir := filepath.Join(root, "sudoers.d")
+	homeBase := filepath.Join(root, "home")
+	passwdPath := filepath.Join(root, "passwd")
+
+	// /etc/passwd is READABLE but does NOT contain "orphan": the account is
+	// genuinely absent (curFound=false, lookupErr=nil) → the !curFound branch.
+	mustWriteFile(t, passwdPath, []byte(
+		"someoneelse:x:1000:1000:someoneelse:/home/someoneelse:/bin/bash\n"))
+
+	// Orphaned keys marker + xpf-written key residue for the absent account.
+	orphanMarker := filepath.Join(keyDir, "orphan")
+	mustWriteFile(t, orphanMarker, []byte("1600"))
+
+	// Residue authorized_keys as a NON-EMPTY DIRECTORY → os.Remove fails ENOTEMPTY.
+	orphanKeys := filepath.Join(homeBase, "orphan", ".ssh", "authorized_keys")
+	mustWriteFile(t, filepath.Join(orphanKeys, "sentinel"), []byte("blocks os.Remove\n"))
+
+	_ = setZeroizeLoginPaths(t, provDir, sudoersDir, homeBase, passwdPath)
+
+	if err := zeroizeLoginAccounts(); err == nil {
+		t.Fatalf("zeroizeLoginAccounts returned nil despite an unremovable orphan key residue; want the removal error surfaced")
+	}
+
+	// The marker is RETAINED so the surviving orphan residue is re-attempted.
+	assertPresent(t, orphanMarker) // RED on revert of the retain-on-error gate
+	assertPresent(t, orphanKeys)   // the surviving (unremovable) residue dir
 }

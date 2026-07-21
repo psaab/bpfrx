@@ -861,6 +861,16 @@ func zeroizeSweepResourceMarkerRoot(dir string, retained map[string]struct{}, fa
 //     orphaned xpf key residue (the marker proves xpf wrote it) and drop the
 //     stale marker.
 //
+// In BOTH the proven-owned (default) and genuinely-absent (!curFound) branches
+// the keys marker is dropped ONLY when the authorized_keys removal SUCCEEDED (or
+// the file was already absent). On a REAL key-removal error the key SURVIVES, so
+// the marker is RETAINED and the error surfaced so a retried reset re-enumerates
+// the account — the retain-on-error contract lives in
+// zeroizeRemoveKeyFileThenMarker (#6201, day-2 deprovisionLoginUser parity;
+// unlike the account-registry teardown there is no userdel -r key-removal
+// backstop, so dropping the marker on a surviving key would strand the prior
+// tenant's SSH key with no retry evidence).
+//
 // os.ErrNotExist is never an error; removal is best-effort past a single failure
 // but the FIRST real error is surfaced via fail so a silently-incomplete sweep
 // is not reported as a clean reset. Discipline mirrors zeroizeConfigDir /
@@ -916,9 +926,12 @@ func zeroizeSweepProvisionedKeys(dir string, retained map[string]struct{}, fail 
 		case !curFound:
 			// passwd READ OK and the account is genuinely ABSENT — an out-of-band
 			// userdel. Remove any orphaned xpf-written key residue (the marker
-			// proves xpf wrote it) and drop the stale marker.
-			fail(os.Remove(keysFile))
-			fail(os.Remove(markerFile))
+			// proves xpf wrote it), then drop the stale marker — but ONLY when the
+			// key removal SUCCEEDED (or the file was already absent). On a real
+			// key-removal error the residue SURVIVES, so RETAIN the marker so a
+			// retried reset re-enumerates this account instead of forgetting the
+			// still-present key (zeroizeRemoveKeyFileThenMarker, #6201).
+			zeroizeRemoveKeyFileThenMarker(name, keysFile, markerFile, fail)
 		case curUID != recordedUID:
 			// Proven UID-mismatch: the live account under this name has a DIFFERENT
 			// UID than the one xpf wrote the key for — an out-of-band
@@ -930,14 +943,55 @@ func zeroizeSweepProvisionedKeys(dir string, retained map[string]struct{}, fail 
 			fail(fmt.Errorf("zeroize: key-only account %q live UID %d != provisioned-keys marker UID %d (out-of-band recreate); left untouched", name, curUID, recordedUID))
 		default:
 			// curUID == recordedUID → the exact account xpf wrote the key for.
-			// Remove the xpf-written authorized_keys, then drop the marker.
-			fail(os.Remove(keysFile))
-			fail(os.Remove(markerFile))
+			// Remove the xpf-written authorized_keys, then drop the marker — but
+			// ONLY when the key removal SUCCEEDED (or the file was already absent).
+			// On a real key-removal error (an immutable file, an ENOTDIR/ENOTEMPTY
+			// path shape, an I/O error) the key SURVIVES, so RETAIN the marker so a
+			// retried reset re-enumerates and re-attempts the removal
+			// (zeroizeRemoveKeyFileThenMarker, #6201).
+			zeroizeRemoveKeyFileThenMarker(name, keysFile, markerFile, fail)
 		}
 	}
 	// Drop the now-(hopefully-)empty root; a retained marker leaves it non-empty,
 	// which is fine and must not gate the factory reset.
 	_ = os.Remove(dir)
+}
+
+// zeroizeRemoveKeyFileThenMarker removes an xpf-written authorized_keys file for
+// a provisioned-keys account and drops its keys marker ONLY when that removal
+// SUCCEEDED or the file was already absent (os.ErrNotExist). On a REAL
+// key-removal error (an immutable `chattr +i` file, an ENOTDIR/ENOTEMPTY path
+// shape, an I/O error) the key SURVIVES, so the marker is RETAINED and the error
+// surfaced via fail — a retried factory reset then re-enumerates the account
+// (the keys marker is what makes it discoverable) and re-attempts the removal
+// (#6201).
+//
+// This mirrors the day-2 deprovisionLoginUser contract
+// (pkg/daemon/login_password.go): on a real os.Remove(authorized_keys) error it
+// KEEPS the provenance markers and returns to retry next apply, rather than
+// forgetting the account with a live key on disk. Dropping the keys marker while
+// the key file survives would strand the prior tenant's SSH key with no retry
+// evidence. The account-registry teardown (zeroizeTearDownProvisionedUsers) can
+// drop its marker unconditionally after a key-removal error only because its
+// `userdel -r` backstops the removal by deleting the whole home tree; this
+// key-only sweep has NO such backstop, so the retain-on-error gate is
+// load-bearing.
+//
+// os.ErrNotExist is not an error (an already-absent key/marker is the goal) — it
+// is excluded by fail() and, treated as success here, does not block the marker
+// removal.
+func zeroizeRemoveKeyFileThenMarker(name, keysFile, markerFile string, fail func(error)) {
+	keyErr := os.Remove(keysFile)
+	fail(keyErr)
+	if keyErr == nil || errors.Is(keyErr, os.ErrNotExist) {
+		// Key removed (or already absent): safe to forget the account.
+		fail(os.Remove(markerFile))
+		return
+	}
+	// Real key-removal error: the key file SURVIVES. Retain the marker so a
+	// retried reset re-enumerates this account (fail-closed, day-2 parity).
+	slog.Error("zeroize: failed to remove key-only account authorized_keys; retaining key marker, reset incomplete",
+		"user", name, "file", keysFile, "err", keyErr)
 }
 
 // readProvisionedMarkerUID reads a provenance marker file and returns the UID
