@@ -471,6 +471,54 @@ func (s *Store) SetArchiveConfig(dir string, max int) {
 	s.archiveMax = max
 }
 
+// QuiesceArchival fences and drains the async auto-archive writers so a
+// factory-reset caller can guarantee the archive directory it is about to erase
+// is not recreated by a resumed writer (#5869). Auto-archive launches a
+// fire-and-forget writer goroutine per commit (commitWithDescriptionLocked);
+// the #5281 terminal reset generation gates the daemon's config writers but NOT
+// this configstore-owned goroutine, so a writer that resumes after
+// FactoryResetArchiveDir removed /var/lib/xpf/archive would MkdirAll it again
+// and drop a config-<ts>.<seq>.conf snapshot of the PRIOR tenant's full config
+// text (cleartext IKE PSKs, WireGuard keys, SNMP communities) — zeroize secret
+// residue on a re-tenanted device. QuiesceArchival closes that window in two
+// steps:
+//
+//  1. Set the archive fence under s.mu, so no NEW writer is launched by a later
+//     commit (the launch guard reads it under the same lock) and an
+//     already-launched writer that has not yet written no-ops.
+//  2. Wait for every in-flight writer that has already passed the fence check
+//     (a mid-write writer executing writeArchive's MkdirAll + atomic write) to
+//     finish, so none is still running when the caller erases the archive
+//     directory. This JOIN is what defeats the write-after-wipe race the fence
+//     alone cannot: a writer already past the fence check would otherwise
+//     recreate the archive concurrently with, or after, the wipe.
+//
+// The Add/Wait ordering is race-free: every archiveWG.Add(1) runs under s.mu
+// guarded by !archiveFenced, and this method sets archiveFenced under s.mu
+// before Wait, so the WaitGroup counter can never rise from zero concurrently
+// with Wait. It is idempotent and a no-op when no writer is outstanding. The
+// daemon's factory-reset transaction (daemon.factoryReset) calls it AFTER
+// entering the terminal reset generation (which blocks new commits) and BEFORE
+// the wipe, so once it returns the archive directory can be erased with no
+// writer left to recreate it.
+func (s *Store) QuiesceArchival() {
+	s.mu.Lock()
+	s.archiveFenced.Store(true)
+	s.mu.Unlock()
+	s.archiveWG.Wait()
+}
+
+// ResumeArchival clears the archive fence set by QuiesceArchival (#5869). It is
+// called ONLY on the fail-closed recoverable-wipe path: daemon.factoryReset
+// exits the terminal reset generation on a wipe error so the box stays up and
+// normal config work resumes, and without re-enabling archival a failed zeroize
+// would permanently disable config archival on a still-running daemon. On a
+// SUCCESSFUL wipe the daemon is stopped, so the fence is deliberately left
+// latched and this is never called.
+func (s *Store) ResumeArchival() {
+	s.archiveFenced.Store(false)
+}
+
 // ArchiveConfig saves a timestamped copy of the active config. The active
 // text and the timestamp are captured together under the lock so the
 // written archive matches the config that was active at the call (#3441 H4),
