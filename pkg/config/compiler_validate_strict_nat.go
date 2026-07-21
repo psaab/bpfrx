@@ -987,9 +987,20 @@ func validateSourceNATPoolAddressScopeStrict(cfg *Config) error {
 // binding is ACCEPTED — the static book expansion is empty but
 // resolveNATAddressNamePrefixes unions the live feed overlay at runtime, so the
 // rule does carry prefixes. Mirrors validatePolicyMatchAddressesStrict's
-// AddressBindings carve-out; deliberately scoped to the DIRECT reference (a
-// feed member NESTED in an address-set is still poisoned by the static
-// resolver — the anti-Option-C guardrail, identical to the policy path).
+// AddressBindings carve-out; deliberately scoped to the DIRECT reference. At
+// THIS strict commit gate a feed member NESTED in an address-set is NOT covered
+// by the carve-out: nested membership is judged by the static
+// policyMatchAddressBookResolves check (which never consults the feed overlay),
+// so a set whose only resolvable content is a feed member is still rejected at
+// commit — the anti-Option-C guardrail, identical to the policy path.
+//
+// This paragraph describes the STRICT-COMMIT gate behavior ONLY. Since #4925 the
+// LENIENT runtime resolver (resolveNATAddressNamePrefixes ->
+// expandBookNameRecursive, pkg/dataplane/userspace/nat.go) DOES feed-resolve
+// nested set members via the policy SSOT expander, so at RUNTIME a mixed
+// static+feed set partially resolves (it carries the resolvable members'
+// prefixes) instead of being poisoned whole. The commit gate is intentionally
+// stricter than the runtime path; this comment does not change that behavior.
 //
 // On the tolerant load / peer-sync paths the call site downgrades to a warning
 // (opts.lenientFirewallRefs) so an already-persisted or peer-synced config

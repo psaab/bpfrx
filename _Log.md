@@ -53839,3 +53839,26 @@ top.
     (fail-on-revert test `tx_status_drop_error_outranks_retry_hint_until_rebind_6145`)
   - `userspace-dp/src/afxdp/tx/README.md` (precedence section)
   - `userspace-dp/src/afxdp/umem/README.md` (snapshot precedence invariant)
+
+- **Timestamp**: 2026-07-20
+- **Action**: #6143 — two non-blocking follow-ups from the #6142/#4925
+  NAT feed-nested-set review. (1) Test-coverage: add a fail-on-revert
+  pin that a NAT `match {source,destination}-address-name` referencing a
+  mixed address-SET `{resolvable-static-member, unresolvable-non-feed
+  token}` PARTIALLY resolves on the lenient/peer-sync runtime path — it
+  carries the static member's prefixes and stays NON-EMPTY (fail-closed,
+  no match-any widening), matching the security-policy runtime path. The
+  #4925 SSOT expander (expandBookNameRecursive) drops the unresolvable
+  member instead of the old static resolver's poison-the-whole-set.
+  Verified RED on a static-resolver revert (whole set poisons → raw
+  set-name token / dropped DNAT row). (2) Doc: reword the stale
+  strict-NAT comment so it is clear it describes the STRICT-COMMIT gate
+  behavior ONLY and that the LENIENT runtime path now feed-resolves
+  nested set members (#4925). Test + comment only; no production logic
+  change. Not HA (no cluster smoke).
+- **File(s)**:
+  - `pkg/dataplane/userspace/nat_mixed_static_unresolvable_set_6143_test.go`
+    (new fail-on-revert test
+    `Test_nat_mixed_static_and_unresolvable_set_partial_resolves_6143`)
+  - `pkg/config/compiler_validate_strict_nat.go` (strict-vs-runtime
+    comment reword in `validateNATSourceAddressNameReferencesStrict`)
