@@ -344,6 +344,25 @@ through that single shared primitive so they wipe the same archive.
 - **Error surfacing.** A deletion or final directory-fsync failure is surfaced
   (folded into the wipe result / returned by the CLI), so a `zeroize` that could
   not fully erase the archive is never reported as a clean factory reset.
+- **In-flight archive-writer fence + join (#5869).** Erasing the directory is not
+  enough: auto-archive launches a **fire-and-forget writer goroutine** per commit
+  (`commitWithDescriptionLocked`), and `writeArchive` starts with
+  `os.MkdirAll(archiveDir)`. The #5281 terminal reset generation gates the
+  daemon's config writers but **not** that configstore-owned goroutine, so a
+  writer scheduled just before a `zeroize` could resume **after**
+  `FactoryResetArchiveDir` removed the directory and **recreate** a
+  `config-<ts>.<seq>.conf` snapshot of the **prior tenant's** full config text —
+  re-tenant secret residue, a zeroize that did not actually erase everything. The
+  daemon's factory-reset transaction (`daemon.factoryReset`) now calls
+  `store.QuiesceArchival()` **after** entering the reset generation and **before**
+  the wipe: it sets a one-way **archive fence** (a new/not-yet-written writer
+  no-ops instead of recreating the archive) and **joins** every in-flight writer
+  (`archiveWG.Wait()`) that has already begun, so once it returns no writer can
+  recreate the directory the wipe is about to erase. The join is the load-bearing
+  half — it closes the write-after-wipe window a fence alone cannot. On a
+  **fail-closed recoverable wipe** the daemon stays up and resumes normal work, so
+  it also `ResumeArchival()`s (clears the fence); on a **successful** wipe the
+  daemon is stopped and the fence stays latched.
 
 **Privileged-subcommand exception — `monitor traffic` (#4067).** Almost
 every command is gated on the top-level word alone, but `monitor traffic`

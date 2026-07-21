@@ -37,6 +37,15 @@ var (
 	rbRemove           = os.Remove
 )
 
+// archiveWriteBarrier is a test-only seam (#5869) invoked by the async
+// auto-archive goroutine AFTER the archive fence check and BEFORE the actual
+// write. Production is a no-op. A test overrides it to hold a writer
+// MID-FLIGHT — deliberately PAST the fence check, so the fence cannot mask it —
+// to prove QuiesceArchival JOINS an in-flight writer (not merely fences future
+// ones) before a factory reset erases the archive directory. Never mutated by
+// production code.
+var archiveWriteBarrier = func() {}
+
 // maxCommitDescriptionBytes bounds the operator-supplied commit description
 // (the `commit comment` text) that is recorded verbatim in the in-memory
 // history entry and the durable JSONL audit journal.
@@ -255,7 +264,15 @@ func (s *Store) commitWithDescriptionLocked(description string) (*config.Config,
 	// same-second commits wrote the same path (later overwrote earlier).
 	// The nanosecond timestamp makes the filename unique per commit (no
 	// overwrite) and correctly labels the captured tree.
-	if s.archiveDir != "" {
+	//
+	// #5869: skip launching a writer once the archive fence is set (a factory
+	// reset is erasing the archive directory) and TRACK every writer we do
+	// launch in s.archiveWG so QuiesceArchival can JOIN it before the wipe. The
+	// launch guard and the Add(1) run under s.mu (held across
+	// commitWithDescriptionLocked), and QuiesceArchival sets the fence under the
+	// same lock before it Wait()s — so no Add can start after the fence, and the
+	// WaitGroup counter never rises from zero concurrently with Wait.
+	if s.archiveDir != "" && !s.archiveFenced.Load() {
 		dir := s.archiveDir
 		max := s.archiveMax
 		if max <= 0 {
@@ -264,7 +281,18 @@ func (s *Store) commitWithDescriptionLocked(description string) (*config.Config,
 		data := s.active.Format()
 		ts := time.Now()
 		seq := s.archiveSeq.Add(1)
+		s.archiveWG.Add(1)
 		go func() {
+			defer s.archiveWG.Done()
+			// #5869: re-check the fence inside the goroutine. A writer that
+			// observes it (a factory reset began after this commit launched the
+			// writer, before it reached the write) MUST NOT recreate the archive
+			// directory the wipe is about to erase — that would resurrect the
+			// prior tenant's config secrets on a re-tenanted device.
+			if s.archiveFenced.Load() {
+				return
+			}
+			archiveWriteBarrier()
 			if err := writeArchive(dir, max, data, ts, seq); err != nil {
 				slog.Warn("auto-archive failed", "err", err)
 			}

@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -292,11 +293,15 @@ func removeProvenanceMarker(dir, name string) error {
 // forgetProvenance drops name's markers across ALL three ownership roots — the
 // account registry and both resource roots — once every xpf-owned resource for
 // the account has been revoked (deprovision) or the account is proven gone.
-// #5841.
-func forgetProvenance(name string) {
-	_ = removeProvenanceMarker(provisionedUsersDir, name)
-	_ = removeProvenanceMarker(provisionedPasswordsDir(), name)
-	_ = removeProvenanceMarker(provisionedKeysDir(), name)
+// It joins any per-root removal error (ENOENT excluded by removeProvenanceMarker)
+// so a caller that must know whether the reconcile fully converged (the #5874
+// cancel closeout) can observe a marker that could not be cleaned. #5841.
+func forgetProvenance(name string) error {
+	return errors.Join(
+		removeProvenanceMarker(provisionedUsersDir, name),
+		removeProvenanceMarker(provisionedPasswordsDir(), name),
+		removeProvenanceMarker(provisionedKeysDir(), name),
+	)
 }
 
 // --- account/enumeration registry (which accounts xpf manages) -------------
@@ -419,12 +424,18 @@ func managedAuthorizedKeysPath(name string) string {
 // (provisionedNames) — every account xpf provisioned any resource for — and
 // deprovisions each name that no longer appears in the config. An out-of-band
 // account (no marker in any root) is never enumerated and never touched. #5841.
-func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) {
+//
+// It stays best-effort per account but ACCUMULATES each deprovision failure
+// into the returned error so the #5874 cancel closeout can see that a removed
+// user's credentials were NOT actually revoked (a monotonic-revocation gap).
+// The normal apply path ignores the return — the next boot retries deprovision
+// from the active config.
+func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
 	names := provisionedNames()
 	if len(names) == 0 {
 		// No markers yet (fresh install) or unreadable — nothing xpf
 		// provisioned, so nothing to revoke.
-		return
+		return nil
 	}
 
 	// The set of usernames still declared in config; these are kept.
@@ -445,8 +456,9 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) {
 		if _, keep := desired[name]; keep {
 			continue // still configured — leave it alone
 		}
-		d.deprovisionLoginUser(name)
+		retErr = errors.Join(retErr, d.deprovisionLoginUser(name))
 	}
+	return retErr
 }
 
 // deprovisionLoginUser revokes one removed account's xpf-owned credentials,
@@ -456,7 +468,13 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) {
 // resource is revoked it drops all provenance markers so xpf forgets the
 // account. It is fail-closed toward retry: any step that cannot be completed
 // safely leaves the markers in place so the next apply retries. #5128.
-func (d *Daemon) deprovisionLoginUser(name string) {
+//
+// It stays best-effort but ACCUMULATES each failure into the returned error so
+// the #5874 cancel closeout can observe that a removed account's credentials
+// were NOT actually revoked; a naked return yields the accumulated retErr, not
+// a block-local err. The normal apply path ignores the return.
+func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
+	fail := func(e error) { retErr = errors.Join(retErr, e) }
 	curUID, found, err := lookupUIDErr(name)
 	if err != nil {
 		// /etc/passwd could not be READ (transient mount/permission/I/O
@@ -471,14 +489,19 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 		// uncertainty is "unknown → retry", never "absent → abandon".
 		slog.Warn("skipping removed-user deprovision: cannot read passwd",
 			"user", name, "err", err)
+		// Fail-visible: an unread identity DB means the removed account's
+		// credential may still be live and was NOT revoked. The naked return
+		// yields the accumulated retErr, not the block-local err above.
+		fail(fmt.Errorf("read passwd for removed user %s: %w", name, err))
 		return // keep markers; retry next apply
 	}
 	if !found {
 		// passwd READ OK and name genuinely ABSENT — a real out-of-band
 		// userdel. There is nothing to revoke; drop the stale markers so we
-		// stop revisiting the account every apply.
-		forgetProvenance(name)
-		return
+		// stop revisiting the account every apply. Genuine absence is a clean
+		// success, so the best-effort marker cleanup error is not accumulated.
+		_ = forgetProvenance(name)
+		return nil
 	}
 
 	// Resolve per-resource ownership for the account CURRENTLY at curUID. Each
@@ -491,7 +514,7 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 		// Nothing xpf-owned for the current account (markers absent, or a UID
 		// mismatch already cleaned inline). NEVER touch a non-xpf / out-of-band
 		// account.
-		return
+		return nil
 	}
 
 	// Lock the password ONLY if xpf set it (password marker). Fail-CLOSED on a
@@ -503,6 +526,7 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 		if !ok {
 			slog.Warn("skipping removed-user deprovision: cannot read shadow",
 				"user", name)
+			fail(fmt.Errorf("read shadow for removed user %s", name))
 			return // keep markers; retry next apply
 		}
 		if !isLockedShadow(cur) {
@@ -510,6 +534,7 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 			if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
 				slog.Warn("failed to lock password for removed login user",
 					"user", name, "err", err, "output", strings.TrimSpace(string(out)))
+				fail(fmt.Errorf("lock password for removed user %s: %w", name, err))
 				return // keep markers; retry
 			}
 			slog.Info("locked password for removed login user", "user", name)
@@ -525,14 +550,19 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 		if err := os.Remove(keysFile); err != nil && !os.IsNotExist(err) {
 			slog.Warn("failed to remove authorized_keys for removed login user",
 				"user", name, "file", keysFile, "err", err)
+			fail(fmt.Errorf("remove authorized_keys for removed user %s: %w", name, err))
 			return // keep markers; retry
 		}
 	}
 
 	// Fully revoked — drop every provenance marker so xpf no longer manages this
 	// account. If the same user is later re-added to config, applySystemLogin
-	// recreates it and re-records the markers.
-	forgetProvenance(name)
+	// recreates it and re-records the markers. A marker-cleanup failure is
+	// accumulated (fail-visible for the #5874 closeout) even though the
+	// credential is already revoked — the surviving marker only means the next
+	// apply re-enumerates and idempotently re-runs deprovision.
+	fail(forgetProvenance(name))
 	slog.Info("deprovisioned removed login user",
 		"user", name, "password_locked", ownsPassword, "keys_removed", ownsKey)
+	return retErr
 }

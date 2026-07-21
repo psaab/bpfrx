@@ -3,6 +3,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -984,9 +985,20 @@ func reconcileSyslogDropins(confDir, prefix string, desired map[string]string) b
 
 // applySystemLogin creates OS user accounts and SSH authorized_keys from
 // system { login { user ... } } configuration.
-func (d *Daemon) applySystemLogin(cfg *config.Config) {
+// applySystemLogin reconciles OS login accounts (create/password/SSH keys)
+// from config. It stays best-effort — a per-user failure is logged and the
+// loop continues to the next user — but it now also ACCUMULATES those
+// failures into the returned error so a caller that needs to know whether the
+// reconcile actually converged (the #5874 cancel closeout) can see them. On
+// the normal apply path the return is intentionally ignored: the next boot
+// re-renders login from the active config, so a transient failure converges
+// (the #2926 next-boot contract). Pure defensive skips (an invalid username
+// refused before any mutation) are NOT accumulated — they are the safe
+// outcome, not an incomplete reconcile.
+func (d *Daemon) applySystemLogin(cfg *config.Config) (err error) {
+	fail := func(e error) { err = errors.Join(err, e) }
 	if cfg.System.Login == nil || len(cfg.System.Login.Users) == 0 {
-		return
+		return nil
 	}
 
 	for _, user := range cfg.System.Login.Users {
@@ -1026,6 +1038,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 			if out, err := runCommandTimeout("useradd", args...); err != nil {
 				slog.Warn("failed to create user",
 					"user", user.Name, "err", err, "output", string(out))
+				fail(fmt.Errorf("create user %s: %w", user.Name, err))
 				continue
 			}
 			slog.Info("created system user", "user", user.Name, "uid", user.UID)
@@ -1037,6 +1050,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				if err := markProvisioned(user.Name, uid); err != nil {
 					slog.Warn("failed to write provisioned-user marker",
 						"user", user.Name, "err", err)
+					fail(fmt.Errorf("mark provisioned %s: %w", user.Name, err))
 				}
 			}
 		}
@@ -1045,7 +1059,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 		// `chpasswd -e` idiom; idempotent via a direct /etc/shadow read;
 		// D2-locks the account when the directive is removed but ONLY for
 		// the exact xpf-provisioned account (UID-keyed marker).
-		d.reconcileUserPassword(user)
+		fail(d.reconcileUserPassword(user))
 
 		// Super-user sudo grants are reconciled separately by
 		// reconcileSudoers so that a class DOWNGRADE or full user removal
@@ -1074,6 +1088,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 			if !ok {
 				slog.Warn("could not resolve uid/gid for authorized_keys owner; skipping to avoid a root-owned-keys lockout window",
 					"user", user.Name)
+				fail(fmt.Errorf("resolve uid/gid for authorized_keys owner %s", user.Name))
 				continue
 			}
 
@@ -1090,6 +1105,9 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 			if err := markKeyProvisioned(user.Name, uid); err != nil {
 				slog.Warn("skipping authorized_keys apply: cannot record key ownership marker",
 					"user", user.Name, "err", err)
+				// Fail-visible for the #5874 closeout: the key write was skipped,
+				// so this user's SSH keys did NOT converge to the desired state.
+				fail(fmt.Errorf("mark key provisioned %s: %w", user.Name, err))
 				continue
 			}
 
@@ -1100,6 +1118,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 			// just-created .ssh directory (Codex r1, fsatomic README).
 			if err := fsatomic.MkdirAllDurable(sshDir, 0700); err != nil {
 				slog.Warn("failed to create .ssh dir", "user", user.Name, "dir", sshDir, "err", err)
+				fail(fmt.Errorf("create .ssh dir for %s: %w", user.Name, err))
 				continue
 			}
 			// Chown the .ssh DIR to the user UNCONDITIONALLY (idempotent),
@@ -1115,6 +1134,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				slog.Warn("failed to chown ssh dir",
 					"user", user.Name, "dir", sshDir,
 					"err", err, "output", strings.TrimSpace(string(out)))
+				fail(fmt.Errorf("chown .ssh dir for %s: %w", user.Name, err))
 			}
 
 			keysContent := strings.Join(user.SSHKeys, "\n") + "\n"
@@ -1130,6 +1150,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				if err := fsatomic.WriteFileDurable(keysFile, []byte(keysContent), 0600, fsatomic.WithOwner(uid, gid)); err != nil {
 					slog.Warn("failed to write authorized_keys",
 						"user", user.Name, "err", err)
+					fail(fmt.Errorf("write authorized_keys for %s: %w", user.Name, err))
 					continue
 				}
 				slog.Info("SSH keys updated", "user", user.Name, "keys", len(user.SSHKeys))
@@ -1164,10 +1185,12 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				default:
 					slog.Warn("failed to remove authorized_keys after key list emptied",
 						"user", user.Name, "file", keysFile, "err", err)
+					fail(fmt.Errorf("revoke authorized_keys for %s: %w", user.Name, err))
 				}
 			}
 		}
 	}
+	return err
 }
 
 // sudoersDir is the directory that holds xpf-managed NOPASSWD sudo grants
@@ -1218,7 +1241,8 @@ func defaultValidateSudoersFile(path string) error {
 // sudoersPrefix files are touched. It MUST be called on every apply,
 // independent of applySystemLogin's early return, so the "all users
 // removed" case still revokes stale grants.
-func (d *Daemon) reconcileSudoers(cfg *config.Config) {
+func (d *Daemon) reconcileSudoers(cfg *config.Config) (err error) {
+	fail := func(e error) { err = errors.Join(err, e) }
 	// Desired: an xpf-<user> drop-in for each current super-user account.
 	desired := make(map[string]struct{})
 	if cfg.System.Login != nil {
@@ -1244,6 +1268,7 @@ func (d *Daemon) reconcileSudoers(cfg *config.Config) {
 			if err := writeSudoersGrant(user.Name); err != nil {
 				slog.Warn("failed to write sudoers file",
 					"user", user.Name, "err", err)
+				fail(fmt.Errorf("write sudoers grant for %s: %w", user.Name, err))
 			}
 		}
 	}
@@ -1262,10 +1287,12 @@ func (d *Daemon) reconcileSudoers(cfg *config.Config) {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			slog.Warn("failed to revoke stale sudoers grant",
 				"file", name, "err", err)
+			fail(fmt.Errorf("revoke stale sudoers grant %s: %w", name, err))
 		} else if err == nil {
 			slog.Info("revoked stale super-user sudo grant", "file", name)
 		}
 	}
+	return err
 }
 
 // writeSudoersGrant writes (idempotently) the NOPASSWD grant for one
@@ -1320,7 +1347,8 @@ func writeSudoersGrant(user string) error {
 //     the directive disables password login instead of orphaning a live
 //     credential — but only for the exact xpf-provisioned account (marker
 //     UID matches the current UID) and never on a shadow read error.
-func (d *Daemon) reconcileUserPassword(user *config.LoginUser) {
+func (d *Daemon) reconcileUserPassword(user *config.LoginUser) (err error) {
+	fail := func(e error) { err = errors.Join(err, e) }
 	desired := user.EncryptedPassword.Reveal()
 	curUID, uidOK := lookupUID(user.Name)
 	cur, ok := currentShadowHash(user.Name)
@@ -1359,11 +1387,15 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) {
 			if err := markPasswordProvisioned(user.Name, curUID); err != nil {
 				slog.Warn("skipping password apply: cannot record password ownership marker",
 					"user", user.Name, "err", err)
+				// Fail-visible for the #5874 closeout: chpasswd was skipped, so
+				// the password did NOT converge to the desired state.
+				fail(fmt.Errorf("mark password provisioned %s: %w", user.Name, err))
 				break
 			}
 			if err := markProvisioned(user.Name, curUID); err != nil {
 				slog.Warn("skipping password apply: cannot record account marker",
 					"user", user.Name, "err", err)
+				fail(fmt.Errorf("mark provisioned %s: %w", user.Name, err))
 				break
 			}
 		}
@@ -1371,7 +1403,11 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) {
 		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
 			slog.Warn("failed to set user password",
 				"user", user.Name, "err", err, "output", strings.TrimSpace(string(out)))
+			fail(fmt.Errorf("set password for %s: %w", user.Name, err))
 		} else {
+			// The password + account markers were already recorded marker-first
+			// above (#5841), before chpasswd ran, so nothing is written here on
+			// success — only the confirmation is logged.
 			slog.Info("user encrypted-password applied", "user", user.Name)
 		}
 	case pwLock:
@@ -1384,11 +1420,13 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) {
 		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
 			slog.Warn("failed to lock user password",
 				"user", user.Name, "err", err, "output", strings.TrimSpace(string(out)))
+			fail(fmt.Errorf("lock password for %s: %w", user.Name, err))
 		} else {
 			slog.Info("user password locked (no encrypted-password in config)",
 				"user", user.Name)
 		}
 	}
+	return err
 }
 
 // sshdConfPath is the xpf-managed sshd drop-in. Overridable in tests so the
@@ -1434,7 +1472,8 @@ var (
 // its prior content (or removed if there was none, the prior was unreadable,
 // or the restore write itself fails) so a bad config never persists to break
 // the next sshd restart.
-func (d *Daemon) applySSHConfig(cfg *config.Config) {
+func (d *Daemon) applySSHConfig(cfg *config.Config) (retErr error) {
+	fail := func(e error) { retErr = errors.Join(retErr, e) }
 	var ssh *config.SSHServiceConfig
 	if cfg.System.Services != nil {
 		ssh = cfg.System.Services.SSH
@@ -1463,23 +1502,27 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 		// No xpf-managed ssh settings. Remove any existing drop-in and reload
 		// so sshd reverts to base-image defaults. No-op when absent.
 		if !hadDropIn {
-			return
+			return nil
 		}
 		if err := sshdRemoveFile(sshdConfPath); err != nil && !os.IsNotExist(err) {
 			slog.Warn("failed to remove sshd config drop-in", "err", err)
+			// naked return: yields the accumulated named result, not the
+			// block-shadowed err from the `if err := ...` binding above.
+			fail(fmt.Errorf("remove sshd config drop-in: %w", err))
 			return
 		}
 		if out, err := sshdReloadCmd(); err != nil {
 			slog.Error("failed to reload sshd after removing drop-in",
 				"err", err, "output", strings.TrimSpace(string(out)))
+			fail(fmt.Errorf("reload sshd after removing drop-in: %w", err))
 			return
 		}
 		slog.Info("SSH config drop-in removed (reverted to defaults)")
-		return
+		return nil
 	}
 
 	if priorReadable && string(prior) == content {
-		return // no change
+		return nil // no change
 	}
 
 	// Best-effort create the drop-in directory before writing. If this fails
@@ -1488,6 +1531,7 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 	// error.
 	if err := sshdMkdirAll("/etc/ssh/sshd_config.d", 0755); err != nil {
 		slog.Warn("failed to create sshd config drop-in directory", "err", err)
+		fail(fmt.Errorf("create sshd config drop-in directory: %w", err))
 	}
 	// AtomicGeneratedConfig (D2): regenerated each apply and reloaded
 	// immediately. A power-cut loss reverts PermitRootLogin to the base
@@ -1495,6 +1539,7 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 	// FAILS SAFE (more restrictive, never more permissive), so no fsync.
 	if err := sshdWriteFile(sshdConfPath, []byte(content), 0644); err != nil {
 		slog.Warn("failed to write sshd config", "err", err)
+		fail(fmt.Errorf("write sshd config: %w", err))
 		return
 	}
 
@@ -1533,6 +1578,7 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 		slog.Error("sshd config validation failed; SSH drop-in not applied",
 			"err", err, "output", strings.TrimSpace(string(out)))
 		revertDropIn("validation-failed")
+		fail(fmt.Errorf("validate sshd config: %w", err))
 		return
 	}
 
@@ -1543,6 +1589,7 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 		slog.Error("failed to reload sshd",
 			"err", err, "output", strings.TrimSpace(string(out)))
 		revertDropIn("reload-failed")
+		fail(fmt.Errorf("reload sshd: %w", err))
 		// Best-effort reload of the restored content so the running sshd is
 		// not left referencing a drop-in we just rewrote/removed underneath
 		// it. The original reload already failed; a second failure here is
@@ -1556,6 +1603,7 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 	slog.Info("SSH config applied",
 		"root_login", ssh.RootLogin,
 		"key_exchange", strings.Join(ssh.KeyExchange, ","))
+	return nil
 }
 
 // buildSSHDConfig renders the xpf-managed sshd drop-in body from the SSH
@@ -1668,7 +1716,8 @@ func buildSSHDConfig(ssh *config.SSHServiceConfig) string {
 // (no encrypted-password) is still revocable. Idempotent: re-applying with the
 // stanza still absent re-locks nothing (the shadow field is already "!") and
 // removes nothing (the key file is already gone).
-func (d *Daemon) applyRootAuth(cfg *config.Config) {
+func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
+	fail := func(e error) { retErr = errors.Join(retErr, e) }
 	ra := cfg.System.RootAuthentication
 
 	// A nil stanza means "root-authentication not configured": the desired
@@ -1686,7 +1735,7 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 	// It applies a configured hash (with apply-boundary revalidation + marker)
 	// and, when the password is absent, D2-locks root ONLY if the marker shows
 	// xpf provisioned it — never on a read error, never an already-locked field.
-	d.reconcileUserPassword(&config.LoginUser{Name: "root", EncryptedPassword: password})
+	fail(d.reconcileUserPassword(&config.LoginUser{Name: "root", EncryptedPassword: password}))
 
 	// Keys: write the configured set wholesale, else revoke the xpf-managed file.
 	if len(keys) > 0 {
@@ -1699,10 +1748,15 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 		// durable marker cannot be recorded, retry next apply.
 		if err := markKeyProvisioned("root", 0); err != nil {
 			slog.Warn("skipping root authorized_keys apply: cannot record key ownership marker", "err", err)
+			// Fail-visible for the #5874 closeout: root's key write was skipped,
+			// so root SSH keys did NOT converge. The naked return yields the
+			// accumulated retErr, not a block-shadowed err.
+			fail(fmt.Errorf("mark root key provisioned: %w", err))
 			return
 		}
 		if err := markProvisioned("root", 0); err != nil {
 			slog.Warn("skipping root authorized_keys apply: cannot record account marker", "err", err)
+			fail(fmt.Errorf("mark root provisioned: %w", err))
 			return
 		}
 		// MkdirAllDurable: root authorized_keys is DurableState written into
@@ -1710,6 +1764,9 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 		// (Codex r1).
 		if err := fsatomic.MkdirAllDurable(rootSSHDir, 0700); err != nil {
 			slog.Warn("failed to create /root/.ssh dir", "err", err)
+			// naked return: yields the accumulated named result, not the
+			// block-shadowed err from the `if err := ...` binding.
+			fail(fmt.Errorf("create /root/.ssh dir: %w", err))
 			return
 		}
 		keysContent := strings.Join(keys, "\n") + "\n"
@@ -1721,6 +1778,7 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 			// uid 0) and keeps the install correctly-owned at rename.
 			if err := fsatomic.WriteFileDurable(keysFile, []byte(keysContent), 0600, fsatomic.WithOwner(0, 0)); err != nil {
 				slog.Warn("failed to write root authorized_keys", "err", err)
+				fail(fmt.Errorf("write root authorized_keys: %w", err))
 				return
 			}
 			slog.Info("root SSH keys applied", "keys", len(keys))
@@ -1743,6 +1801,8 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 		default:
 			slog.Warn("failed to remove root authorized_keys after key list emptied",
 				"file", keysFile, "err", err)
+			fail(fmt.Errorf("revoke root authorized_keys: %w", err))
 		}
 	}
+	return retErr
 }

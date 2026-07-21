@@ -223,6 +223,27 @@ type Store struct {
 	// sort/prune order (it dominates the lexical compare).
 	archiveSeq atomic.Uint64
 
+	// archiveWG tracks the in-flight async auto-archive writer goroutines
+	// (#5869). Each archiving commit Add(1)s before it launches the
+	// fire-and-forget writer; QuiesceArchival Wait()s on it so a factory reset
+	// can JOIN every writer that has already started before it erases the
+	// archive directory. Without the join an untracked writer could resume
+	// AFTER FactoryResetArchiveDir removed /var/lib/xpf/archive and recreate a
+	// config-<ts>.<seq>.conf snapshot of the PRIOR tenant's full config text
+	// (cleartext IKE PSKs, WireGuard keys, SNMP communities) — zeroize secret
+	// residue on a re-tenanted device.
+	archiveWG sync.WaitGroup
+
+	// archiveFenced is set true by QuiesceArchival at the start of a factory
+	// reset (#5869). Once set, no NEW archive writer is launched (the commit
+	// launch guard reads it under s.mu, so the Add/Wait ordering is race-free)
+	// and an already-launched writer that has not yet written no-ops instead of
+	// recreating the archive the zeroize is about to erase. It is a one-way
+	// latch for the terminal reset path; ResumeArchival clears it only on the
+	// fail-closed recoverable-wipe path so a daemon that stays up keeps
+	// archiving normally.
+	archiveFenced atomic.Bool
+
 	// rollbackPersistDegraded records that the most recent
 	// saveRollbackFiles() failed to durably write a rollback slot or sync
 	// the directory (#3441 L1). The commit itself still succeeds — the
