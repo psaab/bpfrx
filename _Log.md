@@ -54530,6 +54530,74 @@ top.
   pkg/daemon/README.md, _Log.md
 
 - **Timestamp**: 2026-07-21
+- **Action**: #5840 — reject standalone<->cluster day-2 topology commit (fail-closed
+  restart boundary; Option 2). The chassis-cluster runtime (d.cluster manager, election,
+  heartbeat/watchdog writer, session/config/DHCP sync, event watcher, VRRP sync hold, gRPC
+  fabric listener) is constructed ONCE at boot (daemon_run.go initManagers +
+  startClusterComms) and only when the boot active config has `chassis cluster`. A day-2
+  commit that ADDS/REMOVES `chassis cluster` cannot (de)construct that boot-only runtime:
+  d.cluster is a bare write-once-at-boot pointer read without a lifecycle lock from ~129
+  sites (data race), and the dataplane arms clusterHA=true from the NEW config in the same
+  apply BEFORE any watchdog/election exists (persistent HAInactive transit drop). Silent
+  acceptance was the bug (no HA + outage until restart). Fix: new pure
+  clusterTopologyCommitPreflight(old,new) + errClusterTopologyRequiresRestart sentinel,
+  wired into commitAndApply + commitConfirmedAndApply preflight closures (BEFORE store
+  promotion / dataplane mutation, ahead of the device-map preflight), and fail-closed in
+  the peer-sync replay path syncAndApply (return before applyConfigLocked so the live
+  dataplane is never armed under the transitioned config). Intra-mode edits reconcile live
+  as before. Full day-2 live construction/teardown (Option 1 supervisor) is a separate
+  follow-up. Fail-on-revert: TestClusterTopologyDay2TransitionRejected asserts both
+  transition directions rejected (sentinel + diagnostic) + controls accepted + end-to-end
+  commitAndApply rejection with d.cluster staying nil and candidate not promoted;
+  neutralizing the preflight body makes exactly that one test RED (target-count 1).
+  Unit-provable, NO smoke (reject happens before any dataplane/HA mutation).
+- **File(s)**: pkg/daemon/cluster_topology_preflight.go (new),
+  pkg/daemon/cluster_topology_preflight_5840_test.go (new), pkg/daemon/daemon_apply.go,
+  docs/ha-no-hitless-restart.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5840 review fold — re-key the topology preflight on DESIRED-vs-ACTUAL-
+  RUNTIME, closing the #4179 config-less-HA-node hole a hostile reviewer found. The
+  original gate keyed on `clusterTopologyConfigured(old)` (an old-CONFIG proxy) and
+  PERMITTED `old==nil`. That carve-out is wrong for the config-less HA node: it boots with
+  /etc/xpf/node-id present but ActiveConfig()==nil → computeBootClass returns
+  bootClassNormal (NOT bootstrap) → initManagers SKIPS d.cluster construction (boot config
+  nil) → d.cluster stays nil, inBootstrap()==false. A day-2 plain `commit` adding `chassis
+  cluster` then reached commitAndApply, the preflight saw old==nil → PERMITTED → armed
+  clusterHA=true (manager_compile.go) against a nil HA runtime = the exact #5840 hybrid
+  state (persistent transit blackhole until restart). Fix: changed
+  clusterTopologyCommitPreflight(old,new) → clusterTopologyCommitPreflight(runtimeClusterActive
+  bool, newCfg) and reject when clusterTopologyConfigured(newCfg) != runtimeClusterActive;
+  all THREE wire sites (commitAndApply :401, syncAndApply :557, commitConfirmedAndApply
+  :688) now pass `d.cluster != nil` (the true boot-only runtime signal, stable under the
+  held applySem). The runtime predicate uniformly REJECTS standalone→cluster,
+  cluster→standalone, AND config-less→cluster; intra-mode edits (runtime matches desired)
+  permitted. Reject is correct for the config-less node too: it cannot form the cluster
+  live (HA runtime boot-only), so "restart into the clustered config" is the honest
+  answer. Verified NO legitimate boot/bootstrap path is falsely rejected — boot config
+  LOAD is Store.Load→applyConfigLocked (never the preflight), and commitAndApply refuses
+  ALL commits while inBootstrap() (bootstrap exits only via a CONFIRMED commit; d.cluster
+  still never constructed day-2). Test: extended TestClusterTopologyDay2TransitionRejected
+  with the config-less case (runtimeClusterActive=false + clustered candidate → REJECTED,
+  the case old==nil wrongly permitted) as a direct-preflight assertion AND an end-to-end
+  commitAndApply leg (nil active, nil runtime → rejected, d.cluster stays nil, candidate
+  not promoted); kept both transition directions + intra-mode permits. Also fixed the
+  #5054/#5961 newSyncProbeDaemon fixture: it set d.cluster!=nil with a STANDALONE config
+  (an artificial mismatch the old config-keyed predicate tolerated) — now seeds a `chassis
+  cluster` stanza when cl!=nil so the fixture matches production and the RG0-ownership
+  peer-sync intent is preserved. Parent-RED: insert `runtimeClusterActive = newCluster`
+  after `newCluster := clusterTopologyConfigured(newCfg)` (force desired==actual so it
+  never rejects) — compiles clean (all params/imports used), makes EXACTLY
+  TestClusterTopologyDay2TransitionRejected RED at its first assertion (target-count 1;
+  pkg/cluster green). Validation: go build ./..., go vet ./pkg/daemon, `go test -race
+  ./pkg/daemon/... ./pkg/cluster/...` all green (TMPDIR=/tmp for socket tests).
+  Unit-provable, NO smoke (reject happens before any store promotion / dataplane / HA
+  mutation).
+- **File(s)**: pkg/daemon/cluster_topology_preflight.go,
+  pkg/daemon/cluster_topology_preflight_5840_test.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/configsync_transport_5054_test.go, docs/ha-no-hitless-restart.md, _Log.md
+
+- **Timestamp**: 2026-07-21
 - **Action**: #5841 — merge origin/master (#6181 host-auth closeout error budget
   + #6182 archival zeroize fence) into fix/5841-login-resource-ownership and
   COMPOSE the two overlapping login-auth changes. The conflict is that #6181 gave
