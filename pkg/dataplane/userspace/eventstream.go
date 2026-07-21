@@ -528,11 +528,18 @@ func (es *EventStream) readLoop(ctx context.Context) {
 		typ := hdr[4]
 		seq := binary.LittleEndian.Uint64(hdr[8:16])
 
-		// Sanity check payload length (max 256 bytes for session events).
+		// Sanity check payload length (max 256 bytes for session events). An
+		// oversized declared length is a corrupt / framing-desynced frame. Do NOT
+		// drop the connection forever (the pre-#6132 bare `return`): the helper's
+		// Rust replay buffer re-sends a PRESENT frame verbatim on reconnect with no
+		// gap self-heal barrier, so a persistently-oversized frame produced the same
+		// drop -> reconnect -> replay storm #6130 fixed for the undecodable-decode
+		// path. handleOversizedFrame recovers via a rate-limited resync instead.
 		if length > 1024 {
-			slog.Warn("event stream: oversized frame", "length", length, "type", typ)
-			es.DecodeErrors.Add(1)
-			return
+			if !es.handleOversizedFrame(conn, length, typ, seq, &prevSeq) {
+				return
+			}
+			continue
 		}
 
 		// Read payload.
@@ -802,12 +809,33 @@ func (es *EventStream) handleSessionDecodeFailure(seq uint64, prevSeq *uint64) {
 	// Rate-limited resync trigger + WARN. Fire BEFORE advancing the watermark so
 	// the table-truth snapshot is triggered while lastAppliedSeq still sits below
 	// the hole — the ACK only moves past seq after this returns.
+	es.triggerRateLimitedResync("undecodable session-sync frame", seq)
+
+	// Loop-break (#6130): advance PAST the present-but-undecodable frame
+	// unconditionally so the cumulative ACK trims it from the helper's replay
+	// buffer and it is never re-sent.
+	*prevSeq = seq
+	es.lastRecvSeq.Store(seq)
+	es.markFrameApplied(seq)
+}
+
+// triggerRateLimitedResync fires a full resync (onFullResync) plus a WARN for a
+// REFUSED correctness-critical session-sync frame — an undecodable frame
+// (#6130) or an oversized/framing-desynced frame (#6132). The trigger and log
+// are rate-limited by decodeFailureResyncInterval off the shared
+// lastDecodeResyncNanos timestamp so a persistently-bad stream cannot hammer the
+// shared control socket (CLAUDE.md forbids >1/s) or flood the log: a fired call
+// bumps SessionSyncResyncs and re-baselines the peer from table truth; a
+// suppressed call bumps DecodeResyncSuppressed. The caller is responsible for
+// the loop-break (advancing the watermark past the refused frame) — this only
+// performs the shared, rate-limited resync side.
+func (es *EventStream) triggerRateLimitedResync(reason string, seq uint64) {
 	nowNanos := time.Now().UnixNano()
 	last := es.lastDecodeResyncNanos.Load()
 	if last == 0 || nowNanos-last >= int64(decodeFailureResyncInterval) {
 		es.lastDecodeResyncNanos.Store(nowNanos)
 		es.SessionSyncResyncs.Add(1)
-		slog.Warn("event stream: undecodable session-sync frame; forcing rate-limited full resync",
+		slog.Warn("event stream: "+reason+"; forcing rate-limited full resync",
 			"seq", seq, "last_applied", es.lastAppliedSeq.Load())
 		es.callbackMu.RLock()
 		onFullResync := es.onFullResync
@@ -818,13 +846,84 @@ func (es *EventStream) handleSessionDecodeFailure(seq uint64, prevSeq *uint64) {
 	} else {
 		es.DecodeResyncSuppressed.Add(1)
 	}
+}
 
-	// Loop-break (#6130): advance PAST the present-but-undecodable frame
-	// unconditionally so the cumulative ACK trims it from the helper's replay
-	// buffer and it is never re-sent.
+// maxDiscardableOversizedFrameBytes bounds how many payload bytes the reader will
+// read-and-discard to skip past an oversized-but-well-framed frame and re-align
+// on the next header (#6132). The helper writes atomic, correctly-length-
+// prefixed frames whose largest legitimate payload is a session event (<=256B),
+// so the 1024 guard already flags anything larger as corrupt / over-max. A
+// declared length still within this ceiling is trusted as a real frame boundary
+// (a version-skewed / buggy encoder emitting an over-max but correctly-prefixed
+// frame): the reader discards exactly that many bytes on the live connection.
+// A declared length ABOVE this ceiling is NOT trusted to re-align the byte stream
+// (draining it could block the reader on a desynced / pathologically-large
+// length), so the reader drops the connection to re-establish framing on
+// reconnect rather than discarding blindly.
+const maxDiscardableOversizedFrameBytes = 64 * 1024
+
+// handleOversizedFrame recovers from an oversized / framing-desynced frame
+// (declared length > the 1024 sanity bound) WITHOUT the pre-#6132
+// drop-the-connection-forever replay loop — the framing-path analog of the
+// #6130 undecodable-decode fix.
+//
+// The pre-#6132 guard did a bare `return`, dropping the connection on any
+// declared length > 1024. Because the helper's Rust replay buffer re-sends a
+// PRESENT frame verbatim on reconnect (no `has_gap` self-heal barrier for a
+// present-but-corrupt frame — the exact pathology #6130 fixed for the
+// undecodable path), a persistently-oversized / framing-corrupt frame at seq N
+// produced a deterministic drop -> reconnect -> replay -> drop storm that
+// hammered the shared control socket and flooded the log.
+//
+// The helper writes whole `[header|payload]` frames and the reader consumes
+// exactly `length` payload bytes per frame, so the header (and thus this frame's
+// `seq`/`typ`) stays aligned frame-to-frame and is trustworthy; only the payload
+// SIZE is anomalous. Recovery mirrors #6130 and preserves the security posture —
+// the corrupt frame is NEVER decoded or applied, it is REFUSED and superseded by
+// a resync:
+//   - Trigger a rate-limited full resync so the peer is re-baselined from table
+//     truth (onFullResync -> ExportOwnerRGSessions, an unbounded ground-truth
+//     snapshot), superseding whatever the refused frame carried.
+//   - Advance the sequence watermark PAST this frame so the helper's cumulative
+//     ACK trims it and it is NOT re-sent verbatim — the loop-break.
+//
+// The byte-stream re-alignment differs by trust in the LENGTH:
+//   - length <= maxDiscardableOversizedFrameBytes: the frame boundary is trusted;
+//     discard exactly `length` bytes to land on the next header and KEEP the
+//     connection (returns true -> caller `continue`s). No drop.
+//   - length above the ceiling, or a failed drain (short / desynced stream): the
+//     length is not trusted to re-align the byte stream, so flush the advanced
+//     ACK (so the helper trims the frame) and drop the connection (returns false
+//     -> caller returns) to re-establish framing cleanly on reconnect. The
+//     advance + flushed ACK make the drop bounded — the frame is trimmed, not
+//     replayed into another drop.
+func (es *EventStream) handleOversizedFrame(conn net.Conn, length uint32, typ uint8, seq uint64, prevSeq *uint64) bool {
+	slog.Warn("event stream: oversized frame", "length", length, "type", typ, "seq", seq)
+	es.DecodeErrors.Add(1)
+	es.triggerRateLimitedResync("oversized/framing-desync frame", seq)
+
+	// Loop-break: advance the watermark PAST this frame (its aligned-header seq is
+	// trustworthy) so the helper trims it and never re-sends it verbatim.
 	*prevSeq = seq
 	es.lastRecvSeq.Store(seq)
 	es.markFrameApplied(seq)
+
+	// Oversized-but-well-framed: the declared length is a trusted frame boundary
+	// (within the discard ceiling). Drain exactly that many bytes to re-align on
+	// the next header and KEEP the connection.
+	if length <= maxDiscardableOversizedFrameBytes {
+		if _, err := io.CopyN(io.Discard, conn, int64(length)); err == nil {
+			return true
+		}
+		// Drain failed (short / desynced stream) — fall through to the drop path
+		// below to re-establish framing on reconnect.
+	}
+
+	// Genuine framing desync (untrusted length, or a failed drain): re-establish
+	// framing by dropping the connection. Flush the advanced ACK first so the
+	// helper trims the frame — the drop is bounded, not a replay loop.
+	es.sendAckIfNeeded()
+	return false
 }
 
 func (es *EventStream) backoffCallbackNotReady(ctx context.Context) {
