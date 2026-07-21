@@ -216,8 +216,13 @@ queues. See PR #1243's kill record for why i40e doesn't reshape.
   baseline). Pre-#4952 `bring_up_workers` returned `()` and swallowed the
   spawn error (overwriting `last_reconcile_stage` with `spawned:..`), so the
   handler acked `ok=true` and persisted a dataplane-down snapshot — a silent
-  forwarding outage with no retry (regression-tested by
-  `post_teardown_spawn_failure_fails_closed_no_persist_4952`). When
+  forwarding outage with no retry. Regression-tested per leg: the
+  same-plan-`needs_reconcile` leg by
+  `post_teardown_spawn_failure_fails_closed_no_persist_4952`, and the
+  full-apply (plan-change) leg by
+  `full_apply_post_teardown_spawn_failure_fails_closed_no_persist_6140`
+  (#6140 — the full-apply arm was previously covered only transitively).
+  When
   `should_run_afxdp` does NOT hold (forwarding disarmed / unsupported) it
   `stop()`s every worker and then routes the per-binding status through
   `refresh_bindings` — which sends each now-workerless slot through

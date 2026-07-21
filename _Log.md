@@ -1,3 +1,34 @@
+## 2026-07-20 — #6140: dedicated full-apply-leg no-persist test for #4952 post-teardown WorkerSpawn
+
+- **Timestamp**: 2026-07-20 (test/6140-full-apply-no-persist)
+- **Action**: Closed the transitive-only coverage gap for the #4952
+  full-apply leg of `apply_snapshot`. The merged #4952 gates cover the
+  coordinator (`reconcile_post_teardown_worker_spawn_failure_fails_closed_4952`)
+  and the SAME-PLAN-needs_reconcile handler leg
+  (`post_teardown_spawn_failure_fails_closed_no_persist_4952`); the FULL-APPLY
+  WorkerSpawn arm (handlers/snapshot.rs ~:342-369) was covered only
+  transitively. Added
+  `full_apply_post_teardown_spawn_failure_fails_closed_no_persist_6140`: a
+  prior/new snapshot pair whose binding PLAN KEY differs (ge-0/0/1 ifindex 11
+  -> ge-0/0/2 ifindex 12) forces `same_plan=false` -> the full-apply else
+  branch (`replan_queues` + reconcile). All mandatory pins open + valid zoned
+  address so the pre-teardown build succeeds and the reconcile reaches the
+  fallible worker spawn; the `force_worker_spawn_fail` seam forces the
+  post-teardown spawn to fail. Asserts ok=false + descriptive error, state
+  file NOT written, baseline rolled back to gen 1 (ge-0-0-1), stage retains
+  `spawn_worker_failed:`. Two leg-proof observables: `same_binding_plan` is
+  asserted FALSE up front, and the surviving binding carries the NEW
+  interface (ge-0-0-2/ifindex 12) that only `replan_queues` (full-apply-only)
+  installs. Added `data_iface_6140` / `trust_zone_6140` test helpers.
+- **Validation**: full Rust suite green (4039 passed + 2 ignored main binary,
+  60/8/22/1 other binaries, 0 failed); named test run 3x (no flake);
+  revert-RED verified — neutralizing the full-apply WorkerSpawn fail-close
+  (swallow -> ok=true + persist) makes the test RED as an ASSERTION
+  (`must report ok=false`), target-count 1, not a build break. NOT HA —
+  unit-provable, no cluster smoke.
+- **File(s)**: userspace-dp/src/server/tests.rs,
+  userspace-dp/src/server/README.md
+
 ## 2026-07-18 — #4925: NAT feed-resolves nested address-set members in match address-name
 
 - **Timestamp**: 2026-07-18 (fix/4925-nat-feed-nested-set)
