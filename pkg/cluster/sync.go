@@ -220,6 +220,16 @@ type SyncStatsSnapshot struct {
 
 // TransferReadinessSnapshot captures session-sync state that determines whether
 // manual failover can proceed without depending on bootstrap timing.
+//
+// #5563: it also carries the config-sync generations so a planned/manual
+// failover refuses to promote a config-stale standby. PeerConfigGen is the
+// highest config generation this node has RECEIVED from the peer (the config
+// sender's current committed generation as observed by the receiver);
+// AppliedConfigGen is the highest generation this node has SUCCESSFULLY
+// applied. When PeerConfigGen > AppliedConfigGen the standby is running an
+// older policy/zone/application snapshot than the primary committed —
+// promoting it fail-opens after a tightening commit and false-denies after a
+// loosening commit.
 type TransferReadinessSnapshot struct {
 	Connected             bool
 	PendingBulkAckEpoch   uint64
@@ -227,12 +237,29 @@ type TransferReadinessSnapshot struct {
 	BulkReceiveInProgress bool
 	BulkReceiveEpoch      uint64
 	BulkReceiveSessions   int
+	PeerConfigGen         uint64
+	AppliedConfigGen      uint64
+}
+
+// ConfigStale reports whether this node has received a newer config generation
+// from the peer than it has successfully applied — i.e. it is behind the
+// primary's committed config. A legacy peer (or a fresh node that has neither
+// received nor applied any generation) reports both generations as 0, which is
+// NOT stale, so the gate stays scoped to the genuine behind-the-primary case
+// and never blanket-blocks (#5563).
+func (s TransferReadinessSnapshot) ConfigStale() bool {
+	return s.PeerConfigGen > s.AppliedConfigGen
 }
 
 // ReadyForManualFailover reports whether the sync path is settled enough to
 // use as a manual-failover transport without waiting for bootstrap work.
+//
+// #5563: a standby that has received a newer config generation than it has
+// applied is refused — a planned/manual promotion must not run a stale
+// security policy. The unplanned/crash failover path is a separate
+// availability-vs-security tradeoff and is NOT gated here.
 func (s TransferReadinessSnapshot) ReadyForManualFailover() bool {
-	return s.PendingBulkAckEpoch == 0 && !s.BulkReceiveInProgress
+	return s.PendingBulkAckEpoch == 0 && !s.BulkReceiveInProgress && !s.ConfigStale()
 }
 
 // Reason explains the current transfer-readiness blocker, if any.
@@ -246,6 +273,8 @@ func (s TransferReadinessSnapshot) Reason() string {
 		return fmt.Sprintf("peer still receiving outbound bulk epoch=%d age=%s", s.PendingBulkAckEpoch, age.Round(100*time.Millisecond))
 	case s.BulkReceiveInProgress:
 		return fmt.Sprintf("local bulk receive still in progress epoch=%d sessions=%d", s.BulkReceiveEpoch, s.BulkReceiveSessions)
+	case s.ConfigStale():
+		return fmt.Sprintf("standby config stale: applied gen=%d behind peer committed gen=%d", s.AppliedConfigGen, s.PeerConfigGen)
 	default:
 		return ""
 	}
@@ -495,7 +524,16 @@ type SessionSync struct {
 	// config).
 	configGenCounter     atomic.Uint64
 	lastAppliedConfigGen atomic.Uint64
-	configApplyCh        chan configApplyItem
+	// lastRecvConfigGen is the highest config generation this node has RECEIVED
+	// from the peer (recorded at enqueue in the syncMsgConfig handler, BEFORE
+	// apply). It is the receiver's local view of the config sender's current
+	// committed generation and is the high-water the manual-failover readiness
+	// gate compares against lastAppliedConfigGen (#5563). Reset to 0 alongside
+	// lastAppliedConfigGen on a peer bulk re-prime (resetRecvGen) so the
+	// applied<=received invariant holds after a reboot restarts the sender's
+	// monotonic counter lower.
+	lastRecvConfigGen atomic.Uint64
+	configApplyCh     chan configApplyItem
 
 	// #5706 full-set state-sync ordering guard (IPsec SA + DHCP leases).
 	//
@@ -698,6 +736,7 @@ func (s *SessionSync) initGenState() {
 	// next commit/reconnect re-push (see the syncMsgConfig handler).
 	s.configGenCounter.Store(seed)
 	s.lastAppliedConfigGen.Store(0)
+	s.lastRecvConfigGen.Store(0)
 	s.configApplyCh = make(chan configApplyItem, 64)
 	// #5706: the full-set (IPsec/DHCP) ordering incarnation is this process's
 	// construction seed — constant for the process lifetime and, within a boot,
