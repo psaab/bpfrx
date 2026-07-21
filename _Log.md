@@ -1,3 +1,54 @@
+## 2026-07-21 — #5143: fail closed on post-spawn in-thread worker bind failure
+
+- **Timestamp**: 2026-07-21 (fix/5143-worker-readiness-barrier)
+- **Action**: Added a per-worker STARTUP READINESS BARRIER to
+  `bring_up_workers` so a worker that SPAWNS successfully but whose in-thread
+  XSK/UMEM bind fails for one or more planned bindings (setup.rs
+  `create_private_binding_from_plan` Err arm — leaves the binding out of the
+  worker's `bindings` vec) can no longer masquerade as ready on the strength
+  of a live heartbeat alone (the #5143 silent forwarding outage: a queue set
+  with a live worker but no XSK-bound binding, acked ok=true + persisted).
+  HEARTBEAT != READINESS. Each spawned worker now reports its achieved
+  bound-slot set (`WorkerStartupReport` over a per-reconcile `mpsc` channel,
+  sent from `worker_loop` after setup, before the steady loop). After the
+  spawn loop `bring_up_workers` waits under a bounded deadline
+  (`WORKER_STARTUP_BARRIER_TIMEOUT_NS` = 10s; a non-reporting worker is
+  treated as failed, never blocks forever) and requires bound == planned per
+  worker. On any shortfall/timeout it fails CLOSED: `stop_inner(false)` stops
+  + joins the newly-started workers (no leaked live-but-unbound worker),
+  preserves the `worker_bind_incomplete:..` stage, and returns
+  `WorkerBringUpError::BindIncomplete`. `bring_up_workers` return type changed
+  `Result<(), String>` -> `Result<(), WorkerBringUpError>` (new enum: `Spawn`
+  | `BindIncomplete`) so `reconcile` maps each post-teardown class to its own
+  `ReconcileError` variant — new `WorkerBindIncomplete(String)` alongside
+  #4952's `WorkerSpawn`. Composes with #4952 (does NOT replace it): the
+  spawn-failure fast-path still returns before the barrier. The
+  `apply_snapshot` handler's two post-teardown arms (same-plan + full-apply)
+  now fail closed on `WorkerSpawn | WorkerBindIncomplete` identically
+  (ok=false, roll baseline back, refresh status, do NOT persist); only the
+  error verb differs ("worker bind incomplete" vs "worker spawn failed") so
+  the #4952/#6140 wording assertions stay green.
+- **Tests**: `#[cfg(test)] force_worker_bind_incomplete` seam spawns a
+  joinable stub worker that reports a bound set short by one slot, then
+  heartbeats until stopped. Fail-on-revert merge gates:
+  `post_spawn_inthread_bind_failure_fails_closed_5143` (coordinator: asserts
+  Err(WorkerBindIncomplete), stopped/joined workers, stage) and
+  `full_apply_post_spawn_inthread_bind_failure_fails_closed_no_persist_5143`
+  (handler: ok=false, no persist, baseline not advanced). Verified RED-on-
+  revert is an ASSERTION failure (barrier neutralized -> both go RED with
+  "got Ok(())", not a build break), target-count 2. #4952/#6140 tests stay
+  GREEN. Full Rust suite green (4133 passed, 0 failed).
+- **File(s)**: afxdp/types/runtime.rs (WorkerStartupReport),
+  afxdp/worker/loop_body/mod.rs (worker_loop param + send),
+  afxdp/worker/loop_body/setup.rs (Err-arm readiness comment),
+  afxdp/coordinator/mod.rs (force_worker_bind_incomplete seam),
+  afxdp/coordinator/reconcile/bringup.rs (barrier + WorkerBringUpError +
+  collect_worker_startup_readiness), afxdp/coordinator/reconcile/mod.rs
+  (ReconcileError::WorkerBindIncomplete + mapping),
+  server/handlers/snapshot.rs (both post-teardown arms),
+  afxdp/coordinator/tests.rs, server/tests.rs,
+  afxdp/coordinator/README.md, server/README.md.
+
 ## 2026-07-20 — #5098: reset global counter offsets on clear (epoch semantics)
 
 - **Timestamp**: 2026-07-20 (fix/5098-clear-counter-offset)

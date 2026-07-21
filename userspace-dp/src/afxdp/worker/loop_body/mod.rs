@@ -77,6 +77,12 @@ pub(crate) fn worker_loop(
     // runtime_atomics.publish(). Coordinator status path reads via
     // snapshot() at each /metrics scrape.
     cold_path_atomics: Arc<crate::afxdp::cold_path_hist::WorkerColdPathAtomics>,
+    // #5143: one-shot STARTUP READINESS channel. After the setup phase below
+    // finishes its in-thread XSK/UMEM binds, the worker reports its actual
+    // bound-slot set back to `bring_up_workers` (which waits on this channel
+    // under a bounded deadline before it accepts the generation). Sent ONCE,
+    // before the steady loop — never touched on the hot path.
+    startup_report_tx: std::sync::mpsc::Sender<WorkerStartupReport>,
 ) {
     // #1776: one-shot setup moved verbatim to setup.rs. The returned
     // WorkerLoopSetup is destructured into the same-named locals so
@@ -118,6 +124,23 @@ pub(crate) fn worker_loop(
         &runtime_atomics,
         &cold_path_atomics,
     );
+    // #5143: STARTUP READINESS report. The in-thread XSK/UMEM binds are now
+    // done — `bindings` holds ONLY the planned bindings that actually bound
+    // (setup's Err arm records a bind failure by leaving the failed binding
+    // out of this vec). Report the achieved bound-slot set to the
+    // `bring_up_workers` readiness barrier BEFORE entering the steady loop, so
+    // a worker that came up with an EMPTY/PARTIAL binding set can no longer
+    // masquerade as ready on the strength of a live heartbeat alone (the #5143
+    // silent forwarding outage). Send-failure is harmless: it means the
+    // barrier already gave up on this generation (deadline elapsed) and
+    // dropped the receiver — the worker is about to be stopped/joined anyway.
+    {
+        let bound_slots: Vec<u32> = bindings.iter().map(|binding| binding.slot).collect();
+        let _ = startup_report_tx.send(WorkerStartupReport {
+            worker_id,
+            bound_slots,
+        });
+    }
     const COS_STATUS_INTERVAL_NS: u64 = 100_000_000;
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;

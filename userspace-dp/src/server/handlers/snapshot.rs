@@ -200,18 +200,32 @@ pub(super) fn apply(
                 guard.status.last_snapshot_at = prev_last_snapshot_at;
                 guard.status.capabilities = prev_capabilities;
                 response.ok = false;
-                // #4952: distinguish the POST-TEARDOWN worker-spawn failure
-                // (old workers gone, dataplane down — refresh status to the
-                // real per-binding state) from the pre-teardown integrity
-                // faults (prior workers still live). Both fail closed and do
-                // NOT persist; only the message + status refresh differ.
-                if let crate::afxdp::ReconcileError::WorkerSpawn(stage) = &err {
+                // #4952 / #5143: distinguish the POST-TEARDOWN worker-bringup
+                // failures (old workers gone, dataplane down — refresh status
+                // to the real per-binding state) from the pre-teardown
+                // integrity faults (prior workers still live). Both
+                // post-teardown classes — a worker that failed to SPAWN
+                // (#4952) and a worker that spawned but bound an INCOMPLETE
+                // queue set / never reported readiness (#5143) — fail closed
+                // the SAME way: refresh status, do NOT persist. Only the
+                // message differs from the pre-teardown integrity faults.
+                if let crate::afxdp::ReconcileError::WorkerSpawn(stage)
+                | crate::afxdp::ReconcileError::WorkerBindIncomplete(stage) = &err
+                {
+                    // Distinct verb per class (the #4952 tests pin "worker
+                    // spawn failed"); both fail closed identically.
+                    let verb = if matches!(err, crate::afxdp::ReconcileError::WorkerBindIncomplete(_))
+                    {
+                        "worker bind incomplete"
+                    } else {
+                        "worker spawn failed"
+                    };
                     response.error = format!(
-                        "worker spawn failed after teardown ({stage}); dataplane down — snapshot not persisted"
+                        "{verb} after teardown ({stage}); dataplane down — snapshot not persisted"
                     );
                     refresh_status(guard);
                     eprintln!(
-                        "CTRL_REQ: same-plan apply_snapshot rejected (post-teardown worker spawn failure): {stage} — dataplane down, NOT persisting"
+                        "CTRL_REQ: same-plan apply_snapshot rejected (post-teardown worker bring-up failure): {stage} — dataplane down, NOT persisting"
                     );
                 } else {
                     response.error = format!("snapshot integrity error: {}", err);
@@ -339,32 +353,44 @@ pub(super) fn apply(
                 "CTRL_REQ: apply_snapshot defer_workers=true — skipping worker spawn (RETH MAC pending)"
             );
         } else if let Err(err) = reconcile_status_bindings(guard) {
-            if let crate::afxdp::ReconcileError::WorkerSpawn(stage) = &err {
-                // #4952: POST-TEARDOWN worker-spawn failure. Unlike the
-                // pre-teardown integrity/map faults below — where the old
-                // workers + forwarding stayed live and restoring the prior
-                // bindings is truthful — here tear_down already stopped the
-                // old workers and one or more new workers failed to spawn, so
-                // this queue set has NO XSK-bound worker: the data plane is
-                // DOWN. Fail closed so the broken snapshot is NOT persisted as
-                // the boot baseline. Roll the in-memory baseline back to the
-                // prior good snapshot + status generation (a retry / forwarding
-                // toggle then reconciles last-good), but DO NOT restore
-                // existing_bindings — refresh_status must report the REAL
-                // post-teardown per-binding state, not the pre-teardown
-                // workers that no longer exist.
+            if let crate::afxdp::ReconcileError::WorkerSpawn(stage)
+            | crate::afxdp::ReconcileError::WorkerBindIncomplete(stage) = &err
+            {
+                // #4952 / #5143: POST-TEARDOWN worker-bringup failure — a
+                // worker that failed to SPAWN (#4952) or one that spawned but
+                // bound an INCOMPLETE queue set / never reported readiness
+                // (#5143). Unlike the pre-teardown integrity/map faults below
+                // — where the old workers + forwarding stayed live and
+                // restoring the prior bindings is truthful — here tear_down
+                // already stopped the old workers and the new bring-up did not
+                // produce a full XSK-bound worker set, so this queue set has NO
+                // XSK-bound worker: the data plane is DOWN. Fail closed so the
+                // broken snapshot is NOT persisted as the boot baseline. Roll
+                // the in-memory baseline back to the prior good snapshot +
+                // status generation (a retry / forwarding toggle then
+                // reconciles last-good), but DO NOT restore existing_bindings —
+                // refresh_status must report the REAL post-teardown per-binding
+                // state, not the pre-teardown workers that no longer exist.
                 guard.snapshot = prev_snapshot;
                 guard.status.last_snapshot_generation = prev_last_snapshot_generation;
                 guard.status.last_fib_generation = prev_last_fib_generation;
                 guard.status.last_snapshot_at = prev_last_snapshot_at;
                 guard.status.capabilities = prev_capabilities;
                 response.ok = false;
+                // Distinct verb per class (the #4952/#6140 tests pin "worker
+                // spawn failed"); both fail closed identically.
+                let verb =
+                    if matches!(err, crate::afxdp::ReconcileError::WorkerBindIncomplete(_)) {
+                        "worker bind incomplete"
+                    } else {
+                        "worker spawn failed"
+                    };
                 response.error = format!(
-                    "worker spawn failed after teardown ({stage}); dataplane down — snapshot not persisted"
+                    "{verb} after teardown ({stage}); dataplane down — snapshot not persisted"
                 );
                 refresh_status(guard);
                 eprintln!(
-                    "CTRL_REQ: apply_snapshot rejected (post-teardown worker spawn failure): {stage} — dataplane down, NOT persisting"
+                    "CTRL_REQ: apply_snapshot rejected (post-teardown worker bring-up failure): {stage} — dataplane down, NOT persisting"
                 );
                 return;
             }
