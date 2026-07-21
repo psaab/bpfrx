@@ -54204,3 +54204,7 @@ top.
     `TestHeartbeatReplayGatesLivenessRefresh`)
   - `pkg/cluster/README.md` (Anti-replay bullet: retired-session rejection
     + bound-safety argument)
+
+- **Timestamp**: 2026-07-21
+  **Action**: Fold #6167 review MINOR — correct the heartbeat anti-replay security bound in heartbeat.go (heartbeatReplaySessions comment) + pkg/cluster/README.md "Bound safety" to the honest 65-recording sustained-replay reality (was falsely "requires a genuine peer reboot / cannot be sustained"); no admit()/FIFO code change
+  **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/README.md

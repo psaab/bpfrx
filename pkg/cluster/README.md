@@ -227,14 +227,21 @@ peer liveness (`lastSeen`) or drive election.
   (unordered), so a strictly-newer test like `fullSetSeqGuard` cannot be
   used — a bounded per-session watermark is the mechanism that separates a
   real reboot (new id) from a replay of a retired incarnation (known id,
-  no counter advance). **Bound safety:** a watermark is evicted only after
-  `heartbeatReplaySessions` distinct NEWER sessions arrive, and each
-  requires a genuine peer reboot (an attacker cannot mint valid frames for
-  new sessions). The only remaining residual is a captured old frame whose
-  session was never seen by a FRESH receiver process (or was evicted after
-  that many genuine reboots): it re-anchors ONCE and the next genuine
-  heartbeat overwrites the stale state within one interval — it cannot be
-  sustained.
+  no counter advance). **Bound safety and its honest limit:** the ring
+  RAISES the on-link replay attacker's cost — from 2 recorded incarnations
+  (the pre-#5477 A→B→A loop) to `heartbeatReplaySessions`+1 — but is NOT an
+  absolute bar. Eviction is FIFO and is triggered by ANY never-seen session,
+  INCLUDING a REPLAYED old frame whose session is not currently in the ring:
+  admit() treats it as never-seen, re-records it, and evicts the oldest.
+  FIFO always leaves exactly one just-evicted session to replay back in as
+  never-seen, so an attacker who captured `heartbeatReplaySessions`+1 (= 65)
+  or more distinct incarnations can churn the ring by REPLAY ALONE (no
+  reboot, no minting) and SUSTAIN the replay indefinitely; with fewer than
+  65 recordings every retired-session replay is rejected. A complete fix
+  needs a boot-epoch / monotonic-across-reboot counter carried in the frame
+  (a wire change) — tracked as a follow-up. The map still causes NO
+  genuine-peer lockout (an evicted live watermark just makes the peer's next
+  frame never-seen → admitted) and cannot grow memory (fixed 64 slots).
 - **Dual-accept (rolling upgrade), `heartbeatAuthDecision`.** Mirrors
   the #4126 VRRP-checksum dual-accept migration:
   - No local key → accept everything (this node cannot verify; may be

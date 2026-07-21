@@ -478,32 +478,38 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 // reboot picks a fresh random session (randomSessionID) and consumes one slot;
 // the oldest watermark is evicted FIFO once the ring is full.
 //
-// #5477 security bound. The retired-session watermarks must be bounded (a peer
-// that reboots forever cannot grow the ring without limit), but the bound must
-// not open an eviction hole an on-link attacker could exploit with REPLAY
-// ALONE. It does not, and here is why:
+// #5477 security bound — and its honest limit. The retired-session watermarks
+// must be bounded (a peer that reboots forever cannot grow the ring without
+// limit). This map RAISES the on-link REPLAY attacker's cost — from the
+// pre-#5477 single-watermark A->B->A loop (only 2 recorded incarnations) to
+// heartbeatReplaySessions+1 distinct recorded incarnations — but it is NOT an
+// absolute bar:
 //
-//   - An attacker who records authenticated frames off the wire can only
-//     REPLAY the (few) session incarnations they captured. HMAC-SHA256 over the
-//     nonce blocks fabricating a valid frame for any NEW session id, and it
-//     blocks fabricating a counter beyond the highest the genuine peer ever
-//     signed for a session. So the attacker's replay power is fixed: a bounded
-//     set of (session, counter<=watermark) frames.
-//   - A watermark is evicted ONLY when heartbeatReplaySessions distinct NEWER
-//     sessions have since been recorded — and every one of those requires a
-//     genuine peer reboot (only the real peer holds the PSK to sign a new
-//     session). The attacker cannot mint the distinct sessions needed to push
-//     an entry they still hold a recording of out of the ring.
-//   - By the time genuine reboots HAVE evicted an old watermark, the live peer
-//     is that many incarnations ahead, so a post-eviction replay of the stale
-//     session is a one-shot re-anchor immediately overwritten by the next
-//     genuine heartbeat (one interval), and it CANNOT be sustained: after the
-//     re-anchor, further replays of that session are <= its restored watermark
-//     and rejected. This is the pre-existing, documented cross-session residual
-//     (README "Anti-replay"), NOT the sustained A->B->A loop #5477 closes.
+//   - HMAC-SHA256 over the nonce blocks fabricating a valid frame for any NEW
+//     session id, and blocks fabricating a counter beyond the highest the
+//     genuine peer ever signed for a session. So the attacker can only REPLAY
+//     the session incarnations they captured off the wire.
+//   - With FEWER than heartbeatReplaySessions+1 recorded incarnations, every
+//     replay of a retired session is at/below its remembered watermark and is
+//     rejected — the sustained A->B->A loop #5477 targets is fully closed.
+//   - With heartbeatReplaySessions+1 OR MORE recorded incarnations the bound is
+//     defeatable by REPLAY ALONE (no reboot, no minting): a replayed frame
+//     whose session is not currently in the ring is "never-seen" from the
+//     ring's view, so admit() re-records it and evicts the oldest FIFO entry.
+//     FIFO always leaves exactly one just-evicted session to replay back in as
+//     never-seen, so an attacker holding >= heartbeatReplaySessions+1
+//     incarnations can churn the ring and SUSTAIN the replay indefinitely.
+//     (Confirmed empirically: M == heartbeatReplaySessions recordings -> all
+//     replays rejected; M == heartbeatReplaySessions+1 -> sustained admits.)
 //
-// 64 slots (64*16 = 1 KiB) is far more genuine reboots than any capture window
-// realistically spans while still bounding memory.
+// This receiver-only map cannot close that residual completely: a full fix
+// needs a boot-epoch / monotonic-across-reboot counter carried in the frame (a
+// wire change), tracked as a follow-up. It does NOT cause a genuine-peer
+// lockout (an evicted live-peer watermark just makes the peer's next frame
+// never-seen -> admitted) and cannot grow memory (fixed 64-slot array).
+//
+// 64 slots (64*16 = 1 KiB) bounds memory while forcing an attacker to have
+// captured 65+ distinct daemon incarnations before any replay is sustainable.
 const heartbeatReplaySessions = 64
 
 // replaySessionMark is one remembered (session, high-water counter) pair.
