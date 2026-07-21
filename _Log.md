@@ -1,3 +1,32 @@
+## 2026-07-18 — #4925: NAT feed-resolves nested address-set members in match address-name
+
+- **Timestamp**: 2026-07-18 (fix/4925-nat-feed-nested-set)
+- **Action**: Closed the fail-closed parity gap where a NAT `match
+  {source,destination}-address-name` reference to an address-SET whose MEMBER
+  is a dynamic-address feed resolved to NO feed prefixes (static
+  `resolveUserspaceAddressBookEntry` never consulted feedOverlay for nested
+  members and poisoned the whole set on the unresolvable feed member;
+  feedOverlay is keyed by the direct feed name, not the containing set). Rewired
+  `resolveNATAddressNamePrefixes` to reuse the SAME feed-aware recursive
+  `expandBookNameRecursive` the security-policy path uses (#3294 SSOT), sorting +
+  deduping the union to keep the static resolver's output shape (the #2416
+  exact-slice pins stay byte-identical). Fail-closed preserved: an empty set /
+  a set whose only member is a genuinely unresolvable non-feed token still
+  yields no match (raw book-name token, unmatchable), never widening to
+  match-any. Added fail-on-revert tests
+  `Test_nat_source_address_name_set_with_feed_member_resolved_4925` /
+  `Test_nat_dest_address_name_set_with_feed_member_resolved_4925` (SNAT+DNAT,
+  source+destination, feed-only AND mixed static+feed sets) plus a fail-closed
+  pin `Test_nat_address_name_set_unresolvable_nonfeed_member_fails_closed_4925`.
+  Validation: full pkg/dataplane/userspace suite green; 4925 tests 3x no flake;
+  gofmt + go vet clean. Parent-RED: reverting the resolver to the static
+  expander makes exactly the two "resolved" tests RED (target-count 2, 0
+  collateral) while the fail-closed pin + all pre-existing #3303/#3425/#2416
+  tests stay green. NOT HA (config compilation; unit-provable, no cluster smoke).
+- **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_feed_nested_set_4925_test.go,
+  docs/feature-gaps.md
+
 ## 2026-07-18 — #6137 fold: scheduler fail-closed honest docs + gauge SSOT wiring + gauge test (#5669)
 
 - **Timestamp**: 2026-07-18 (fix/5669-scheduler-failopen-bound)
@@ -53520,6 +53549,36 @@ top.
   userspace-dp/src/server/tests.rs,
   userspace-dp/src/server/README.md,
   docs/userspace-dataplane-architecture.md
+- **Timestamp**: 2026-07-18
+- **Action**: #4974 — event-stream connected loop: replace the O(n^2)
+  prefix-drain write backlog with a cursor-backed `WriteBacklog`. The old
+  code stored pending socket bytes in a bare `Vec<u8>` and reclaimed each
+  successful short write with `write_buf.drain(..n)`, memmoving the entire
+  remaining suffix to offset 0 every write — O(backlog) per write, so
+  O(backlog^2) total copy work under a slow reader, on the single event
+  I/O thread. New `WriteBacklog` tracks a `start` cursor: `advance(n)`
+  moves it in O(1); the consumed prefix is reclaimed by GEOMETRIC
+  compaction (one copy of the pending suffix once `start >= len/2`), so
+  copy work is amortized O(1)/write and O(total_bytes) overall, and the
+  backing Vec stays within ~2x the pending length. The
+  `WRITE_BACKLOG_MAX_BYTES` cap + pause/backpressure now measure
+  `pending_len()` (unwritten = Vec.len()-start), not the raw Vec length,
+  so the cap does not trip early. Byte order + exactly-once preserved.
+  Added tests: `partial_write_backlog_is_amortized_linear_4974` (asserts
+  compaction copy work <= 3x total bytes; reverting advance to per-write
+  drain(..n) blows the bound RED), `partial_write_backlog_preserves_byte_
+  order_4974`, `pending_len_tracks_unwritten_bytes_not_raw_vec_4974`.
+  Updated the three existing cap tests + two replay_budget drain callers
+  to the WriteBacklog API. Rust suite green; new tests 3x no flake.
+  Parent-RED verified: reverting advance to drain(..n) makes the
+  amortized test RED, target-count 1. NOT HA (local event I/O-thread
+  algorithmics).
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests/write_backlog.rs,
+  userspace-dp/src/event_stream/tests/mod.rs,
+  userspace-dp/src/event_stream/tests/backpressure.rs,
+  userspace-dp/src/event_stream/tests/replay_budget.rs,
+  userspace-dp/src/event_stream/README.md
 
 - **Timestamp**: 2026-07-18
 - **Action**: #4952 — fail closed on POST-teardown worker-spawn failure.
@@ -53606,3 +53665,26 @@ top.
   userspace-dp/src/afxdp/cos/queue_service/tests/drain.rs,
   userspace-dp/src/main.rs, userspace-dp/src/test_alloc.rs,
   userspace-dp/src/afxdp/tx/README.md
+- **Action**: #5104 — singleflight-guard + bound the userspace-dp neighbor
+  prewarm scan. The status loop kicked a FULL async neighbor-resolve scan every
+  1s for the first 60s (then 10s standby) with NO in-flight guard; each scan did
+  route-indexed NeighList dumps and spawned ONE goroutine PER TARGET. Under slow
+  netlink / a large RIB, scans OVERLAPPED, multiplying concurrent scans and
+  unbounded probe goroutines — self-amplifying control-plane load delaying
+  apply/status/recovery. Fix: (1) lock-free `neighborPrewarmInFlight` atomic.Bool
+  CAS singleflight guard in `proactiveNeighborResolveAsyncLocked` (coalesce
+  overlapping ticks; cleared via defer so a panic also clears); (2) each scan
+  runs under a 15s `neighborPrewarmDeadline` context, checked between netlink
+  dumps so slow netlink can't pin the guard; (3) `runBoundedNeighborProbes`
+  fixed 8-worker pool replaces goroutine-per-target; (4) one
+  `NeighList(FAMILY_ALL)` dump per link index per scan (was per-route re-dump).
+  Injectable `neighborPrewarmScan` seam for deterministic tests. Merge-gate
+  regression `TestNeighborPrewarmSingleflightCoalescesOverlappingTicks5104`
+  (RED-on-revert verified: neutralize CAS → peak concurrent scans = 2, want 1;
+  assertion failure not build break, target-count 1) + bounded-pool +
+  ctx-cancel tests. Validated with `go test -race` (full pkg green, named 3x),
+  gofmt + go vet clean. NOT HA-smoke — guard is unit-provable.
+- **File(s)**: pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/process_napi.go,
+  pkg/dataplane/userspace/neighbor_prewarm_singleflight_5104_test.go,
+  docs/userspace-cold-start-fix-plan.md

@@ -396,7 +396,7 @@ cluster-scoped.
   channel) in `drain_channel_into_write_buf()`. The cap is checked at the
   top of the drain loop, so the effective bound is `cap + one max
   EventFrame` (≤ 256 B) — the in-flight frame already pulled may carry
-  `write_buf` just past 16 MiB before the drain halts. A wedged daemon
+  the backlog just past 16 MiB before the drain halts. A wedged daemon
   (socket open but not
   reading → `write_buf` writes return `WouldBlock`) would otherwise let
   the I/O thread migrate the whole channel into the heap-backed
@@ -414,6 +414,29 @@ cluster-scoped.
   already-bounded replay buffer, never to `write_buf`. **Invariant: the
   data plane never stalls because a telemetry consumer is slow; a stuck
   consumer degrades telemetry (counted drops), nothing else.**
+- **Cursor-backed write backlog — amortized-linear drain (#4974).** The
+  pending backlog is a `WriteBacklog` (cursor over a `Vec<u8>`), not a
+  bare `Vec`. Each successful short socket write advances a `start`
+  cursor in O(1) (`write_buf.advance(n)`) instead of memmoving the whole
+  remaining suffix to offset 0 (`write_buf.drain(..n)`). Under a slow
+  reader that accepts only a few bytes per write, the old `drain(..n)`
+  was O(backlog) per write → O(backlog²) total copy work on the single
+  event I/O thread during exactly the slow-consumer condition. The
+  consumed prefix is reclaimed by GEOMETRIC compaction — one copy of the
+  (smaller) pending suffix once `start ≥ len/2` — so total compaction
+  work is O(total bytes) and per-write cost is amortized O(1), while the
+  backing `Vec` stays within ~2× the pending length (bounded, distinct
+  from the #2381 unbounded-growth failure). **The `WRITE_BACKLOG_MAX_BYTES`
+  cap and every pause/backpressure decision now measure the UNWRITTEN
+  length (`write_buf.pending_len()` = `Vec.len() − start`), not the raw
+  `Vec` length** — measuring the raw length would trip the cap early and
+  drift the pause/resume accounting because it also counts the
+  reclaimable written prefix. Byte order and exactly-once delivery are
+  unchanged: appends only ever go to the tail and compaction never
+  reorders the pending suffix. Regression gate:
+  `partial_write_backlog_is_amortized_linear_4974` asserts total
+  compaction copy work stays within a linear (3×) bound; reverting
+  `advance` to a per-write `drain(..n)` memmove blows it.
 - **Lossless-demotion fence for session deltas (#2875). RESERVED/DORMANT —
   not wired to the live demotion path; see the codec note above.** A paused
   drain is the stable window the future owner reads before demotion completes

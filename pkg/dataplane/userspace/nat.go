@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,56 +25,64 @@ func natCounterID(ids map[string]uint32, natType, ruleSet, rule string) uint32 {
 }
 
 // resolveNATAddressNamePrefixes resolves a NAT `match {source,destination}-
-// address-name` reference into concrete prefixes, unioning the static global
-// address-book expansion (resolveUserspaceAddressBookEntry) with the live
-// dynamic-address feed overlay (#2049 / #3303). feedOverlay maps a
+// address-name` reference into concrete prefixes using the SAME feed-aware
+// recursive address-book expander the security-policy path uses
+// (expandBookNameRecursive, policies_addrbook.go). feedOverlay maps a
 // `security dynamic-address address-name ... profile <feed>` binding to its
 // live feed-backed CIDR strings (resolved by the daemon from
 // feeds.Manager.SnapshotForBindings).
 //
-// Before #3303 the NAT snapshot builders never received feedOverlay, so a NAT
-// rule scoped to a feed-backed address-name resolved STATIC-ONLY and matched
-// nothing on live feed content — contradicting the docs claim that feeds are
-// enforced via "policy/NAT address-name bindings". This brings NAT into line
-// with the policy path (buildAddressBookTableWithFeeds), which also merges
-// feedOverlay[name] into a name's content.
+// The expander merges feedOverlay at the top level AND at every nested
+// address-set MEMBER, so one operator-authored address object resolves to the
+// same prefixes across NAT and policy:
+//   - a DIRECT `match ...-address-name <feed-name>` reference resolves its live
+//     feed prefixes (the #3303 NAT-side gap),
+//   - a reference to an address-SET whose member is feed-backed now resolves the
+//     nested member's feed prefixes too (#4925) — feed-only members AND mixed
+//     static+feed sets,
+//   - a name that is BOTH a static address and a feed binding accumulates both.
 //
-// It is NOT a byte-for-byte mirror of that path: the policy builder
-// family-splits the feed CIDRs and re-sorts/dedups across the static+feed union
-// (it must, to assign a content-hash ID), whereas this helper appends the feed
-// strings to the prefix list directly. That difference is functionally inert —
-// feeds.Manager.SnapshotForBindings already returns the overlay CIDRs sorted
-// and deduped, and the NAT consumer treats the list as an unordered prefix set
-// (duplicates contribute no extra table entry, ordering is irrelevant) — so no
-// re-dedup or family-split is needed here.
+// Before #4925 this helper called the STATIC resolveUserspaceAddressBookEntry
+// expander, which never consulted feedOverlay for nested members and POISONED
+// the whole set on an unresolvable feed member (feedOverlay is keyed by the
+// direct feed name, e.g. "bad-feed", NOT by the containing set "bad-set"). A NAT
+// rule scoped to a set with a feed member therefore resolved to no prefixes and
+// silently matched nothing — diverging from the feed-aware security-policy path
+// (#3294 closed the nested-member case there via expandBookNameRecursive; the
+// NAT path was left as a tracked residual). #4925 reuses that same SSOT expander
+// so the divergence is gone.
 //
-// The recursive case — an address-SET whose member is feed-backed — is NOT
-// resolved here (the static resolveUserspaceAddressBookEntry expander poisons
-// the whole set on an unresolvable feed member and never consults the overlay).
-// #3294 closed this for the SECURITY-POLICY path (the feed-aware
-// expandBookNameRecursive now merges nested feed members into the policy
-// address-book row), but the NAT path was deliberately left out of #3294 scope
-// (the converged plan, constraint 5 / open-question 4) and remains a tracked
-// residual. A DIRECT `match ...-address-name <feed-name>` reference is fully
-// resolved here, which was the #3303 NAT-side gap.
+// Fail-closed is preserved. A set with NO resolvable member (an empty set, or a
+// set whose only member is a genuinely unresolvable NON-feed token) yields NO
+// prefixes here; the append helpers then keep the constraint non-empty with the
+// raw book-name token so the rule matches NOTHING — it never widens to match-any.
+//
+// The output is sorted + deduped to match the static resolver's shape (so the
+// already-green #2416 exact-slice pins stay byte-identical); the NAT consumer
+// treats the list as an unordered prefix set (duplicates contribute no extra
+// table entry, ordering is irrelevant), so this canonicalization is inert.
 func resolveNATAddressNamePrefixes(cfg *config.Config, feedOverlay map[string][]string, name string) []string {
-	var out []string
-	if values, ok := resolveUserspaceAddressBookEntry(cfg, name); ok {
-		out = append(out, values...)
+	if cfg == nil || name == "" {
+		return nil
 	}
-	if feeds := feedOverlay[name]; len(feeds) > 0 {
-		out = append(out, feeds...)
+	visited := make(map[string]bool)
+	out := expandBookNameRecursive(cfg.Security.AddressBook, feedOverlay, name, visited, 0)
+	if len(out) == 0 {
+		return nil
 	}
-	return out
+	sort.Strings(out)
+	return slices.Compact(out)
 }
 
 // appendNATSourceAddressName resolves a NAT rule's `match source-address-name
 // <book-entry>` into concrete source prefixes and appends them to the rule's
 // source list (#2416). It reuses resolveNATAddressNamePrefixes — the same
-// static-book expander the security-policy snapshot path uses, now unioned with
-// the dynamic-address feed overlay (#3303) — so a name-scoped NAT rule carries
-// the entry's prefixes (static AND feed-backed) into the #2394 source
-// constraint instead of publishing an empty (match-any) source list.
+// feed-aware recursive expander the security-policy snapshot path uses
+// (expandBookNameRecursive), which unions the static address book with the
+// dynamic-address feed overlay at the top level AND at nested address-set
+// members (#3303 direct feed, #4925 nested-set feed member) — so a name-scoped
+// NAT rule carries the entry's prefixes (static AND feed-backed) into the #2394
+// source constraint instead of publishing an empty (match-any) source list.
 //
 // Fail-closed on an unknown / unresolvable name: the raw token is appended so
 // the source list stays NON-EMPTY (source_constrained stays true on the Rust
@@ -98,9 +107,11 @@ func appendNATSourceAddressName(cfg *config.Config, feedOverlay map[string][]str
 // appends them to the rule's destination list (#3229). It is the destination
 // twin of appendNATSourceAddressName and shares the same expander
 // (resolveNATAddressNamePrefixes) the security-policy and source-address-name
-// paths use — static address book unioned with the dynamic-address feed overlay
-// (#3303) — so a name-scoped destination matches the same prefixes a literal
-// `match destination-address` would, including feed-backed members.
+// paths use — the feed-aware recursive expandBookNameRecursive, static address
+// book unioned with the dynamic-address feed overlay at the top level and at
+// nested address-set members (#3303 direct feed, #4925 nested-set feed member) —
+// so a name-scoped destination matches the same prefixes a literal `match
+// destination-address` would, including feed-backed members nested in a set.
 //
 // Fail-closed on an unknown / unresolvable name: the raw token is appended so
 // the destination list stays NON-EMPTY (the rule does not collapse to no
