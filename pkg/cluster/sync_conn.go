@@ -348,6 +348,11 @@ func (s *SessionSync) resetRecvGen() {
 	// CURRENT config (pushConfigToPeer sends ShowActive), so the newest
 	// content still wins.
 	s.lastAppliedConfigGen.Store(0)
+	// #5563: reset the received-config high-water alongside the applied mark so
+	// the manual-failover readiness gate's applied<=received invariant holds
+	// across the reset window. The reconnect re-push then re-establishes both
+	// (received on receive, applied on successful apply).
+	s.lastRecvConfigGen.Store(0)
 	// #5706: reset the full-set (IPsec/DHCP) ordering high-water marks for the
 	// same reason. A reconnecting peer that OS-rebooted restarts its monotonic
 	// incarnation LOWER; without this reset the guard would refuse its fresh
@@ -1730,6 +1735,17 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		configText, gen := decodeConfigPayload(payload)
 		s.stats.LastConfigSyncSize.Store(uint64(len(configText)))
 		slog.Info("cluster sync: config received from peer", "size", len(configText), "gen", gen)
+		// #5563: advance the received-config high-water BEFORE enqueue. This is
+		// the receiver's view of the peer's current committed generation and
+		// gates manual-failover readiness against lastAppliedConfigGen. Record it
+		// even if the enqueue below drops the payload (queue full) so the standby
+		// stays flagged config-stale until the apply actually lands on a re-push.
+		// The receiveLoop is single-threaded per connection, so the load/store
+		// pair needs no CAS; guard on gen>current to keep it a monotonic max
+		// against a reordered older frame.
+		if gen > s.lastRecvConfigGen.Load() {
+			s.lastRecvConfigGen.Store(gen)
+		}
 		// #3931: enqueue onto the single-consumer ordered apply queue instead
 		// of spawning a racing `go OnConfigReceived`. The receiveLoop is
 		// single-threaded per connection, so this preserves receive order;
