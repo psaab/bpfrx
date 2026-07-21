@@ -105,9 +105,10 @@ pub(super) fn service_exact_local_queue_direct(
     }
     if binding.scratch.scratch_exact_local_tx.is_empty() {
         maybe_wake_tx(binding, true, now_ns);
+        // #4971: expected TX backpressure — lock-free status, no mutex.
         binding
             .live
-            .set_error("no free TX frame available".to_string());
+            .set_tx_retry_status(TxRetryReason::NoFreeTxFrame);
         return false;
     }
 
@@ -162,7 +163,10 @@ pub(super) fn service_exact_local_queue_direct(
             &mut binding.scratch.scratch_exact_local_tx,
         );
         refresh_cos_interface_activity(binding, root_ifindex);
-        binding.live.set_error("tx ring insert failed".to_string());
+        // #4971: expected TX backpressure — lock-free status, no mutex.
+        binding
+            .live
+            .set_tx_retry_status(TxRetryReason::TxRingInsertFailed);
         return false;
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
@@ -279,9 +283,10 @@ fn service_exact_local_queue_direct_flow_fair(
     }
     if binding.scratch.scratch_local_tx.is_empty() {
         maybe_wake_tx(binding, true, now_ns);
+        // #4971: expected TX backpressure — lock-free status, no mutex.
         binding
             .live
-            .set_error("no free TX frame available".to_string());
+            .set_tx_retry_status(TxRetryReason::NoFreeTxFrame);
         return false;
     }
 
@@ -334,7 +339,10 @@ fn service_exact_local_queue_direct_flow_fair(
             &mut binding.scratch.scratch_local_tx,
         );
         refresh_cos_interface_activity(binding, root_ifindex);
-        binding.live.set_error("tx ring insert failed".to_string());
+        // #4971: expected TX backpressure — lock-free status, no mutex.
+        binding
+            .live
+            .set_tx_retry_status(TxRetryReason::TxRingInsertFailed);
         return false;
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
@@ -511,9 +519,10 @@ pub(super) fn service_exact_prepared_queue_direct(
         maybe_wake_tx(binding, true, now_ns);
         release_exact_prepared_scratch(&mut binding.scratch.scratch_exact_prepared_tx);
         refresh_cos_interface_activity(binding, root_ifindex);
+        // #4971: expected TX backpressure — lock-free status, no mutex.
         binding
             .live
-            .set_error("prepared tx ring insert failed".to_string());
+            .set_tx_retry_status(TxRetryReason::PreparedTxRingInsertFailed);
         return false;
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
@@ -682,9 +691,10 @@ fn service_exact_prepared_queue_direct_flow_fair(
             &mut binding.scratch.scratch_prepared_tx,
         );
         refresh_cos_interface_activity(binding, root_ifindex);
+        // #4971: expected TX backpressure — lock-free status, no mutex.
         binding
             .live
-            .set_error("prepared tx ring insert failed".to_string());
+            .set_tx_retry_status(TxRetryReason::PreparedTxRingInsertFailed);
         return false;
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;

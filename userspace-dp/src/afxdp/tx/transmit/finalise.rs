@@ -13,7 +13,7 @@ use crate::afxdp::types::PreparedTxRequest;
 use crate::afxdp::worker::BindingWorker;
 
 use super::super::rings::maybe_wake_tx;
-use super::{remember_prepared_recycle, TxError};
+use super::{remember_prepared_recycle, TxError, TxRetryReason};
 
 #[inline]
 pub(super) fn finalise_prepared(
@@ -28,7 +28,7 @@ pub(super) fn finalise_prepared(
         while let Some(req) = binding.scratch.scratch_prepared_tx.pop() {
             pending.push_front(req);
         }
-        return Err(TxError::Retry("prepared tx ring insert failed".to_string()));
+        return Err(TxError::Retry(TxRetryReason::PreparedTxRingInsertFailed));
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
     binding.tx_pipeline.outstanding_tx =
@@ -36,18 +36,23 @@ pub(super) fn finalise_prepared(
 
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
-    let mut retry_tail = Vec::new();
-    for (idx, req) in binding.scratch.scratch_prepared_tx.drain(..).enumerate() {
+    // #4971: reverse-pop the staged scratch instead of collecting the
+    // un-inserted tail into a fresh `Vec` per drain pass. After each
+    // `pop()` the scratch's new `len()` equals the popped item's index,
+    // so the sent-prefix / retry-tail split needs no side buffer.
+    // Pushing the tail with `push_front` in this reverse order restores
+    // the ORIGINAL front-to-back FIFO at the head of `pending` —
+    // identical ordering to the prior `retry_tail` + `.rev()`, now
+    // allocation-free.
+    while let Some(req) = binding.scratch.scratch_prepared_tx.pop() {
+        let idx = binding.scratch.scratch_prepared_tx.len();
         if idx < inserted as usize {
             remember_prepared_recycle(&mut binding.tx_pipeline.in_flight_prepared_recycles, &req);
             sent_packets += 1;
             sent_bytes += req.len as u64;
         } else {
-            retry_tail.push(req);
+            pending.push_front(req);
         }
-    }
-    for req in retry_tail.into_iter().rev() {
-        pending.push_front(req);
     }
 
     // Prepared cross-binding forwards need the same explicit TX kick.

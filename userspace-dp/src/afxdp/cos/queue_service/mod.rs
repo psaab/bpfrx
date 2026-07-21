@@ -72,7 +72,7 @@ use super::tx_completion::{
 // state and are hosted there for that reason.
 use crate::afxdp::tx::{
     COS_GUARANTEE_QUANTUM_MAX_BYTES, COS_GUARANTEE_QUANTUM_MIN_BYTES, COS_GUARANTEE_VISIT_NS,
-    COS_SURPLUS_ROUND_QUANTUM_BYTES, TxError, cos_queue_dscp_rewrite, maybe_wake_tx,
+    COS_SURPLUS_ROUND_QUANTUM_BYTES, TxError, TxRetryReason, cos_queue_dscp_rewrite, maybe_wake_tx,
     reap_tx_completions, recycle_cancelled_prepared_offset_with_shared, remember_prepared_recycle,
     stamp_submits, transmit_batch, transmit_prepared_queue,
 };

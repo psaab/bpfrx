@@ -17,7 +17,7 @@ use crate::afxdp::types::PreparedTxRequest;
 use crate::afxdp::worker::BindingWorker;
 use crate::afxdp::TX_BATCH_SIZE;
 
-use super::{recycle_prepared_immediately_with_shared, TxError};
+use super::{recycle_prepared_immediately_with_shared, TxDropReason, TxError};
 
 #[inline]
 pub(super) fn stage_batch_into_scratch(
@@ -52,11 +52,10 @@ pub(super) fn stage_batch_into_scratch(
                     .tx_errors
                     .fetch_add(orphaned.len() as u64, Ordering::Relaxed);
             }
-            return Err(TxError::Drop(format!(
-                "prepared tx frame exceeds UMEM frame capacity: len={} cap={}",
-                req.len,
-                tx_frame_capacity()
-            )));
+            return Err(TxError::Drop(TxDropReason::PreparedFrameExceedsCapacity {
+                len: req.len,
+                cap: tx_frame_capacity(),
+            }));
         }
         binding.scratch.scratch_prepared_tx.push(req);
     }

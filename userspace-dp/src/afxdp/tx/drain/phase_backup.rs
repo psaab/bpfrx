@@ -99,11 +99,13 @@ fn backup_drain_prepared(
                     .post_drain_backup_bytes
                     .fetch_add(bytes, Ordering::Relaxed);
             }
-            Err(TxError::Retry(err)) => {
-                binding.live.set_error(err);
+            Err(TxError::Retry(reason)) => {
+                // #4971: expected TX backpressure — record the reason
+                // lock-free instead of taking the `last_error` mutex.
+                binding.live.set_tx_retry_status(reason);
                 return Some(BackupOutcome::EarlyReturnRetry);
             }
-            Err(TxError::Drop(err)) => {
+            Err(TxError::Drop(reason)) => {
                 binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
                 // #710: frame-level submit error (capacity / slice /
                 // other `TxError::Drop`). Subset of tx_errors.
@@ -111,7 +113,9 @@ fn backup_drain_prepared(
                     .live
                     .tx_submit_error_drops
                     .fetch_add(1, Ordering::Relaxed);
-                binding.live.set_error(err);
+                // #4971: exceptional drop path (rare) may still render
+                // the diagnostic message via the mutex-backed set_error.
+                binding.live.set_error(reason.message());
             }
         }
     }
@@ -183,18 +187,21 @@ fn backup_drain_local(
                             .fetch_add(bytes, Ordering::Relaxed);
                     }
                 }
-                Err(TxError::Retry(err)) => {
-                    binding.live.set_error(err);
+                Err(TxError::Retry(reason)) => {
+                    // #4971: expected TX backpressure — lock-free status,
+                    // no `last_error` mutex on the send hot path.
+                    binding.live.set_tx_retry_status(reason);
                     retry.append(&mut pending);
                     break;
                 }
-                Err(TxError::Drop(err)) => {
+                Err(TxError::Drop(reason)) => {
                     binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
                     binding
                         .live
                         .tx_submit_error_drops
                         .fetch_add(1, Ordering::Relaxed);
-                    binding.live.set_error(err);
+                    // #4971: exceptional drop path may still set_error.
+                    binding.live.set_error(reason.message());
                 }
             }
         }
