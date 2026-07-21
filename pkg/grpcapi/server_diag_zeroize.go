@@ -583,10 +583,22 @@ func zeroizeLookupUIDErr(name string) (uid int, found bool, err error) {
 // residue, and because reconcileAbsentLoginUsers unions all three roots, a
 // re-tenant's reused-UID account colliding with a surviving marker would be
 // deprovisioned despite xpf never provisioning it. After the registry loop,
-// zeroizeSweepResourceMarkerRoot erases every marker in the two resource roots
-// (keeping only names retained for a fail-closed registry retry) and drops the
-// roots, so no marker survives in ANY of the three roots. This mirrors the
-// daemon's own forgetProvenance, which already drops all three per account.
+// zeroizeSweepResourceMarkerRoot (passwords) and zeroizeSweepProvisionedKeys
+// (keys) erase every marker in the two resource roots (keeping only names
+// retained for a fail-closed registry retry) and drop the roots, so no marker
+// survives in ANY of the three roots. This mirrors the daemon's own
+// forgetProvenance, which already drops all three per account.
+//
+// #6190 key-only accounts. The registry loop removes authorized_keys only for
+// accounts in provisioned-users, so a KEY-ONLY account — a pre-existing
+// operator/prior-tenant account xpf only added an SSH key to (a provisioned-keys
+// marker, NO registry marker) — keeps its xpf-written authorized_keys after the
+// reset, leaving the prior tenant SSH login (the #4598 leak class, asymmetric
+// with the day-2 deprovisionLoginUser that enumerates the UNION and DOES remove
+// that file). zeroizeSweepProvisionedKeys therefore removes the xpf-written
+// /home/<name>/.ssh/authorized_keys FILE (UID-gated, fail-closed) alongside the
+// keys marker — never an operator's own key file, and never a key file whose
+// account's teardown was retained.
 //
 // Discipline mirrors zeroizeConfigDir / zeroizeRenderedConfigs: os.ErrNotExist
 // is never an error (an already-absent artifact is the goal), removal is
@@ -640,9 +652,17 @@ func zeroizeLoginAccounts() error {
 	// (C) #5841: erase the two resource-specific ownership roots
 	// (provisioned-passwords, provisioned-keys) too, so a factory reset leaves NO
 	// per-account marker in ANY of the three roots — no residue for a re-tenant's
-	// reused-UID account to collide with.
+	// reused-UID account to collide with. The KEYS root additionally removes the
+	// xpf-written authorized_keys FILE itself, not just the marker (#6190): a
+	// KEY-ONLY account (a pre-existing operator/prior-tenant account xpf only
+	// added an SSH key to — a provisioned-keys marker but NO provisioned-users
+	// registry entry) is never iterated by the registry loop above, so its
+	// xpf-written key file would otherwise survive the reset and leave the prior
+	// tenant SSH login — the #4598 credential-leak class, asymmetric with the
+	// day-2 deprovisionLoginUser which enumerates the UNION and DOES remove that
+	// file.
 	zeroizeSweepResourceMarkerRoot(zeroizeProvisionedPasswordsDir(), retained, fail)
-	zeroizeSweepResourceMarkerRoot(zeroizeProvisionedKeysDir(), retained, fail)
+	zeroizeSweepProvisionedKeys(zeroizeProvisionedKeysDir(), retained, fail)
 	return firstErr
 }
 
@@ -755,14 +775,16 @@ func zeroizeTearDownProvisionedUsers(entries []os.DirEntry, retained map[string]
 }
 
 // zeroizeSweepResourceMarkerRoot erases the resource-specific ownership markers
-// (#5841) in dir — provisioned-passwords or provisioned-keys — as part of a
-// factory reset, then drops the now-empty root. Without this the two resource
-// roots the #5841 split introduced SURVIVE a zeroize: each per-account UID
-// marker is #5869/#5871-class residue, and because reconcileAbsentLoginUsers
-// unions all three roots, a re-tenant's reused-UID account colliding with a
-// surviving marker would be deprovisioned (its password locked, its
-// authorized_keys deleted) despite xpf never provisioning it — the exact
-// overclaim #5841 exists to kill, resurrected on a "factory-reset" box.
+// (#5841) in dir — the provisioned-passwords root — as part of a factory reset,
+// then drops the now-empty root. (The provisioned-keys root has its own sweep,
+// zeroizeSweepProvisionedKeys, which additionally removes the xpf-written
+// authorized_keys FILE — #6190.) Without this the resource root the #5841 split
+// introduced SURVIVES a zeroize: each per-account UID marker is
+// #5869/#5871-class residue, and because reconcileAbsentLoginUsers unions all
+// three roots, a re-tenant's reused-UID account colliding with a surviving
+// marker would be deprovisioned (its password locked) despite xpf never
+// provisioning it — the exact overclaim #5841 exists to kill, resurrected on a
+// "factory-reset" box.
 //
 // A marker whose name is in retained (its account-registry teardown was KEPT
 // for a fail-closed retry) is LEFT so the account's three markers stay together
@@ -790,6 +812,186 @@ func zeroizeSweepResourceMarkerRoot(dir string, retained map[string]struct{}, fa
 	// Drop the now-(hopefully-)empty root; a retained marker leaves it non-empty,
 	// which is fine and must not gate the factory reset.
 	_ = os.Remove(dir)
+}
+
+// zeroizeSweepProvisionedKeys is the KEYS-root counterpart of
+// zeroizeSweepResourceMarkerRoot (#6190). In ADDITION to erasing each
+// provisioned-keys marker, it removes the xpf-written
+// /home/<name>/.ssh/authorized_keys the marker proves xpf installed — the FILE
+// itself, not just the ownership marker.
+//
+// Why a distinct sweep. The account-registry teardown
+// (zeroizeTearDownProvisionedUsers) already removes authorized_keys for every
+// account in the provisioned-users REGISTRY, but a KEY-ONLY account — a
+// pre-existing operator/prior-tenant account xpf only added an SSH key to
+// (`system login user <name> authentication ssh-*` with NO encrypted-password)
+// — gets a provisioned-keys marker and NO registry marker (applySystemLogin
+// writes markProvisioned only in the useradd branch; reconcileUserPassword only
+// on a password apply). Such an account is never iterated by the registry loop,
+// so before #6190 its xpf-written authorized_keys SURVIVED a factory reset and
+// the prior tenant kept SSH login on that account — the #4598 credential-leak
+// class, asymmetric with the day-2 path (reconcileAbsentLoginUsers enumerates
+// the UNION provisionedNames() and deprovisionLoginUser DOES remove that key
+// file, gated on keyProvisioned). This sweep closes the asymmetry: it enumerates
+// the keys root (the union delta the registry loop misses) and removes the file,
+// mirroring deprovisionLoginUser's keyProvisioned-gated
+// os.Remove(managedAuthorizedKeysPath(name)).
+//
+// Ownership discipline — remove ONLY what xpf wrote, mirroring the registry
+// teardown's UID-gated fail-closed rules (#5496):
+//   - retained: an account whose registry teardown was KEPT for a fail-closed
+//     retry keeps ALL its state consistent — its key marker AND key file are
+//     left untouched (#6190 retained-set preservation). It is skipped entirely.
+//   - root: root's authorized_keys is at /root/.ssh, NOT /home/root, and is
+//     revoked by zeroizeRootLoginAccount in the registry phase (#5520); this
+//     sweep NEVER touches a /home/root key file. The root keys marker itself is
+//     still erased here (residue) when root's revocation succeeded (root not in
+//     retained). Root is never a key-only account (applyRootAuth writes the
+//     registry marker alongside the key marker), so it is always torn down by
+//     the registry phase.
+//   - UID gate: the key file is removed only when the live /etc/passwd UID for
+//     name equals the keys marker's recorded UID — the account xpf actually
+//     wrote the key for. A proven UID-MISMATCH is an out-of-band userdel+recreate
+//     (the current authorized_keys belongs to SOMEONE ELSE), so it is left
+//     intact, the anomaly surfaced, and the marker RETAINED — never delete an
+//     operator's keys.
+//   - Uncertainty (passwd unreadable / marker unparseable) FAILS CLOSED: surface
+//     the error, retain the marker, remove nothing.
+//   - Genuinely absent (passwd read OK, name gone out of band): remove any
+//     orphaned xpf key residue (the marker proves xpf wrote it) and drop the
+//     stale marker.
+//
+// In BOTH the proven-owned (default) and genuinely-absent (!curFound) branches
+// the keys marker is dropped ONLY when the authorized_keys removal SUCCEEDED (or
+// the file was already absent). On a REAL key-removal error the key SURVIVES, so
+// the marker is RETAINED and the error surfaced so a retried reset re-enumerates
+// the account — the retain-on-error contract lives in
+// zeroizeRemoveKeyFileThenMarker (#6201, day-2 deprovisionLoginUser parity;
+// unlike the account-registry teardown there is no userdel -r key-removal
+// backstop, so dropping the marker on a surviving key would strand the prior
+// tenant's SSH key with no retry evidence).
+//
+// os.ErrNotExist is never an error; removal is best-effort past a single failure
+// but the FIRST real error is surfaced via fail so a silently-incomplete sweep
+// is not reported as a clean reset. Discipline mirrors zeroizeConfigDir /
+// zeroizeTearDownProvisionedUsers.
+func zeroizeSweepProvisionedKeys(dir string, retained map[string]struct{}, fail func(error)) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fail(err) // absent root → ErrNotExist, excluded by fail()
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if _, keep := retained[name]; keep {
+			// Registry teardown retained this account (fail-closed): keep ALL its
+			// state consistent — leave its key marker AND its key file untouched
+			// so a retried zeroize re-attempts with the account's markers intact.
+			continue
+		}
+		markerFile := filepath.Join(dir, name)
+
+		if name == "root" {
+			// Root's key file lives at /root/.ssh and is revoked by
+			// zeroizeRootLoginAccount in the registry phase (#5520), never at
+			// /home/root. Only erase root's keys marker here (residue); never
+			// touch a /home/root key file.
+			fail(os.Remove(markerFile))
+			continue
+		}
+
+		keysFile := filepath.Join(zeroizeHomeBase, name, ".ssh", "authorized_keys")
+		recordedUID, markerErr := readProvisionedMarkerUID(markerFile)
+		curUID, curFound, lookupErr := zeroizeLookupUIDErr(name)
+
+		switch {
+		case lookupErr != nil:
+			// /etc/passwd unreadable, OR its UID field for this account is
+			// malformed: the identity database is UNKNOWN. FAIL CLOSED (#5496) —
+			// surface the error, remove nothing, and RETAIN the key marker so a
+			// retry re-attempts once passwd is readable again.
+			slog.Error("zeroize: cannot resolve key-only account UID from passwd; retaining key marker, reset incomplete",
+				"user", name, "err", lookupErr)
+			fail(lookupErr)
+		case markerErr != nil:
+			// The keys marker itself is unreadable/unparseable: we cannot resolve
+			// OUR recorded UID, so we cannot prove the live authorized_keys is the
+			// one xpf wrote. FAIL CLOSED — surface, retain the marker, remove nothing.
+			slog.Error("zeroize: cannot read provisioned-keys marker; retaining key marker, reset incomplete",
+				"user", name, "err", markerErr)
+			fail(markerErr)
+		case !curFound:
+			// passwd READ OK and the account is genuinely ABSENT — an out-of-band
+			// userdel. Remove any orphaned xpf-written key residue (the marker
+			// proves xpf wrote it), then drop the stale marker — but ONLY when the
+			// key removal SUCCEEDED (or the file was already absent). On a real
+			// key-removal error the residue SURVIVES, so RETAIN the marker so a
+			// retried reset re-enumerates this account instead of forgetting the
+			// still-present key (zeroizeRemoveKeyFileThenMarker, #6201).
+			zeroizeRemoveKeyFileThenMarker(name, keysFile, markerFile, fail)
+		case curUID != recordedUID:
+			// Proven UID-mismatch: the live account under this name has a DIFFERENT
+			// UID than the one xpf wrote the key for — an out-of-band
+			// userdel+recreate. The current authorized_keys belongs to SOMEONE
+			// ELSE, so NEVER remove it. Surface the unresolved condition and RETAIN
+			// the marker (mirrors the registry teardown's mismatch branch, #5496).
+			slog.Warn("zeroize: provisioned-keys marker UID mismatch (account recreated out of band); authorized_keys left untouched, reset incomplete",
+				"user", name, "markerUID", recordedUID, "liveUID", curUID)
+			fail(fmt.Errorf("zeroize: key-only account %q live UID %d != provisioned-keys marker UID %d (out-of-band recreate); left untouched", name, curUID, recordedUID))
+		default:
+			// curUID == recordedUID → the exact account xpf wrote the key for.
+			// Remove the xpf-written authorized_keys, then drop the marker — but
+			// ONLY when the key removal SUCCEEDED (or the file was already absent).
+			// On a real key-removal error (an immutable file, an ENOTDIR/ENOTEMPTY
+			// path shape, an I/O error) the key SURVIVES, so RETAIN the marker so a
+			// retried reset re-enumerates and re-attempts the removal
+			// (zeroizeRemoveKeyFileThenMarker, #6201).
+			zeroizeRemoveKeyFileThenMarker(name, keysFile, markerFile, fail)
+		}
+	}
+	// Drop the now-(hopefully-)empty root; a retained marker leaves it non-empty,
+	// which is fine and must not gate the factory reset.
+	_ = os.Remove(dir)
+}
+
+// zeroizeRemoveKeyFileThenMarker removes an xpf-written authorized_keys file for
+// a provisioned-keys account and drops its keys marker ONLY when that removal
+// SUCCEEDED or the file was already absent (os.ErrNotExist). On a REAL
+// key-removal error (an immutable `chattr +i` file, an ENOTDIR/ENOTEMPTY path
+// shape, an I/O error) the key SURVIVES, so the marker is RETAINED and the error
+// surfaced via fail — a retried factory reset then re-enumerates the account
+// (the keys marker is what makes it discoverable) and re-attempts the removal
+// (#6201).
+//
+// This mirrors the day-2 deprovisionLoginUser contract
+// (pkg/daemon/login_password.go): on a real os.Remove(authorized_keys) error it
+// KEEPS the provenance markers and returns to retry next apply, rather than
+// forgetting the account with a live key on disk. Dropping the keys marker while
+// the key file survives would strand the prior tenant's SSH key with no retry
+// evidence. The account-registry teardown (zeroizeTearDownProvisionedUsers) can
+// drop its marker unconditionally after a key-removal error only because its
+// `userdel -r` backstops the removal by deleting the whole home tree; this
+// key-only sweep has NO such backstop, so the retain-on-error gate is
+// load-bearing.
+//
+// os.ErrNotExist is not an error (an already-absent key/marker is the goal) — it
+// is excluded by fail() and, treated as success here, does not block the marker
+// removal.
+func zeroizeRemoveKeyFileThenMarker(name, keysFile, markerFile string, fail func(error)) {
+	keyErr := os.Remove(keysFile)
+	fail(keyErr)
+	if keyErr == nil || errors.Is(keyErr, os.ErrNotExist) {
+		// Key removed (or already absent): safe to forget the account.
+		fail(os.Remove(markerFile))
+		return
+	}
+	// Real key-removal error: the key file SURVIVES. Retain the marker so a
+	// retried reset re-enumerates this account (fail-closed, day-2 parity).
+	slog.Error("zeroize: failed to remove key-only account authorized_keys; retaining key marker, reset incomplete",
+		"user", name, "file", keysFile, "err", keyErr)
 }
 
 // readProvisionedMarkerUID reads a provenance marker file and returns the UID
