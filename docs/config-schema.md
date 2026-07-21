@@ -3741,6 +3741,49 @@ reserved for whole-dataplane selection where a rewrite shim
   no-op knob, not a false dataplane/identity promise — and its real
   implementation is split to /research. Regression coverage:
   `pkg/config/compiler_interfaces_unsupported_test.go`.
+- **#2354 / #5879 (canonical per-physical-interface QinQ reject):** the
+  AF_XDP shim's `parse_l2` unwinds exactly ONE VLAN tag, so xpf cannot
+  represent a double-tagged (802.1ad S-tag + 802.1Q C-tag) frame — an inner
+  / second tag is XDP_PASSed to the kernel forwarding path and never
+  firewalled. #2354 rejected the one obvious spelling (a per-unit
+  `inner-vlan-id` leaf) inside `validateUnsupportedInterfaceStanzasAST`, but
+  that validated a LOCAL statement shape on the committing node's own
+  expansion, so two classes of unsupported QinQ bypassed it:
+    - a DIFFERENT inner-tag spelling — `vlan-tags outer <x> inner <y>` (the
+      modern Junos stacked-VLAN syntax) is not in `setSchema` and has no
+      compiler consumer, so it parse-accepted and was silently dropped; the
+      inner half can even be SPLIT across two `set` statements
+      (`vlan-tags outer 100` + `vlan-tags inner 200`), so no single leaf is
+      the recognizable `inner-vlan-id`;
+    - a PEER-ONLY node view — an `inner-vlan-id`/`vlan-tags inner` under
+      `groups node1` + `apply-groups "${node}"` never materializes when the
+      candidate is compiled for node0, so a commit ON node0 accepted a stack
+      that renders unsupported QinQ on node1 (an active/standby posture
+      split — the standby silently PASSes to the kernel what the primary
+      firewalls).
+  #5879 replaces the local `inner-vlan-id` check with a canonical
+  per-physical-interface gate (`validateQinQVLANStackAST`,
+  `compiler_interfaces_qinq.go`): it builds each unit's aggregate outer/inner
+  tag stack across BOTH spellings (`vlan-id`/`inner-vlan-id` AND
+  `vlan-tags outer/inner`, combined onto one statement or split across
+  several) and rejects any unit whose stack carries an inner (second) tag.
+  It runs PRE-expansion beside the tunnel/zone/table-id/unit-alias union
+  gates and evaluates the effective view for EVERY cluster node (the node0
+  AND node1 `${node}`/apply-groups + interface-range expansions), so the
+  accept/reject verdict is HA-symmetric no matter which node commits and a
+  peer-only-group inner tag is caught. Only the two per-node EFFECTIVE views
+  are unioned — deliberately NOT the pre-expansion all-groups "View 1" the
+  sibling collision gates (`#5878`, `#3075`) fold in, because QinQ trips on a
+  SINGLE inner tag and a View-1 union would additionally reject a QinQ stanza
+  staged in a group that NO `apply-groups` references (inert dead config
+  outside any node's effective view). Single 802.1Q tagging via `vlan-id`
+  (with or without `flexible-vlan-tagging`) stays fully supported. Strict on
+  commit / commit-check; downgraded to a warning on the tolerant load /
+  peer-sync paths (`lenientQinQVLANStack`, #1960) so an older-binary-persisted
+  or peer-synced config that silently accepted the inner tag still boots.
+  Because rejection is a compile error, the candidate is never promoted — no
+  partial outer/inner state survives. Regression coverage:
+  `pkg/config/qinq_canonical_vlan_5879_test.go`.
 - **#4027 (interface-range expansion):** `interfaces interface-range
   <name> { member <if>; [member-range <a> to <b>;] <shared cfg> }` is a
   Junos construct that applies a shared configuration block to a SET of
@@ -3801,7 +3844,8 @@ reserved for whole-dataplane selection where a rewrite shim
   roots). **#5744 (the two remaining interface AST pre-walks):** the
   unit-alias collision gate (`validateInterfaceUnitAliasCollisionsAST`,
   `#5631`) and the unsupported-stanza gate
-  (`validateUnsupportedInterfaceStanzasAST`, `#2008`/`#2354`) were the last
+  (`validateUnsupportedInterfaceStanzasAST`, `#2008`; the `#2354` QinQ half
+  has since moved to the `#5879` canonical both-node gate) were the last
   sibling pre-walks still `break`-ing on the first `interfaces` root, so a
   unit-alias collision or an unsupported/silently-dropped stanza placed in a
   SECOND `interfaces` root bypassed them. Both now flatten every

@@ -54288,3 +54288,20 @@ top.
   `pkg/cluster/sync_bulk.go`,
   `pkg/cluster/sync_failover_config_gen_test.go` (new),
   `docs/sync-protocol.md`, `docs/ha-failover-status.md`
+
+## 2026-07-21 — #5879 canonical per-physical-interface QinQ gate
+- **Timestamp**: 2026-07-21
+- **Action**: Add #5879 canonical QinQ honesty gate. The #2354 gate validated a
+  local `inner-vlan-id` leaf on the committing node's expansion only; QinQ split
+  across the `vlan-tags outer/inner` spelling (incl. two set statements) or living
+  in a peer-only `groups node1` view bypassed commit (verified live: `vlan-tags
+  outer 100 inner 200` and node1-only `inner-vlan-id` both compiled clean). New
+  `validateQinQVLANStackAST` builds each unit's aggregate outer/inner stack across
+  both spellings and rejects any inner tag, evaluated for BOTH node0 and node1
+  effective views (HA-symmetric). Moved QinQ detection out of
+  `validateUnsupportedInterfaceStanzasAST` (H9/H10 stay). New `lenientQinQVLANStack`
+  opt keeps the #1960 warn-on-load posture.
+- **File(s)**: pkg/config/compiler_interfaces_qinq.go (new),
+  pkg/config/compiler_interfaces_unsupported.go, pkg/config/compiler.go,
+  pkg/config/schema_interfaces.go, pkg/config/qinq_canonical_vlan_5879_test.go (new),
+  docs/config-schema.md, _Log.md
