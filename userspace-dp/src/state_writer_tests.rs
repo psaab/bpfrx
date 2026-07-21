@@ -622,7 +622,7 @@ fn runtime_io_uring_failure_demotes_to_sync_permanently() {
     // ring (older CI), the demotion path is unreachable, so skip rather than
     // give a false pass — production always starts in io_uring when a ring
     // is available, which is the scenario this regression guards.
-    let ring = match IoUring::new(8) {
+    let ring = match crate::io_uring_write::RingWriter::new(8) {
         Ok(r) => r,
         Err(_) => {
             eprintln!("io_uring unavailable on this kernel; skipping demotion test");
@@ -673,7 +673,7 @@ fn runtime_io_uring_failure_demotes_to_sync_permanently() {
     // the sync branch (io_uring_failed=false) and actually persists. With
     // the demotion reverted, `mode` would still be IoUring here and this
     // write would route through the ring.
-    let next = persist_with_mode(&mut mode, &dest_str, b"after demotion");
+    let next = persist_with_mode(&mut mode, &dest_str, b"after demotion".to_vec());
     assert!(next.result.is_ok(), "post-demotion write must succeed");
     assert!(
         !next.io_uring_failed,
