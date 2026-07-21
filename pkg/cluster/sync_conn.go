@@ -533,7 +533,11 @@ func configureSessionSyncConn(conn net.Conn) {
 }
 
 func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, conn net.Conn) {
-	configureSessionSyncConn(conn)
+	// #5303: the caller (acceptLoop / fabricConnectLoop) already admitted this
+	// connection into its pre-auth setup window via beginSetup. NOTE: the large
+	// 256 KiB socket buffers are NOT sized here — configureConnFn is deferred
+	// until AFTER the handshake succeeds so a connection flood cannot pin socket
+	// memory before proving possession of the PSK.
 
 	// #4107 F23: authenticate the stream at connection setup before any session
 	// frame flows. A dropped handshake (bad PSK proof / downgrade attempt / I/O)
@@ -541,12 +545,21 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	// bricks a keyed↔keyed reconnect during failover (both nodes are up and
 	// keyed → the handshake completes in milliseconds).
 	mode, frameKey, pending, err := s.performSyncHandshake(conn)
+	// #5303: release the pre-auth admission slot (and the setup-tracking entry)
+	// the moment the handshake resolves — an admitted slot must cover only the
+	// brief pre-auth window, never the subsequent bulk sync. Post-auth the
+	// connection is tracked for shutdown by conn0/conn1 instead.
+	s.finishSetup(conn)
 	if err != nil {
 		slog.Warn("cluster sync: auth handshake failed, dropping connection",
 			"fabric", fabricIdx, "remote", connRemoteAddrString(conn), "err", err)
 		conn.Close()
 		return
 	}
+	// #5303: only NOW, after auth succeeds, size the large (256 KiB) socket
+	// buffers on the raw TCP connection (before it is wrapped in *authConn, which
+	// would defeat the *net.TCPConn type assertion inside configureConnFn).
+	configureConnFn(conn)
 	// Wrap so writeFull seals and receiveLoop verifies per-frame auth when the
 	// connection authenticated; an unauthenticated wrapper is a pass-through.
 	conn = s.wrapSyncConn(fabricIdx, conn, mode, frameKey)
@@ -715,6 +728,11 @@ func (s *SessionSync) Stop() {
 		s.conn1.Close()
 	}
 	s.mu.Unlock()
+	// #5303: close every connection still in its pre-auth setup window so a
+	// stalled handshake read unblocks and its setup goroutine exits — otherwise a
+	// flooder's abandoned pre-auth connections would hold setup goroutines until
+	// their handshake deadlines and make Stop wait out the full 5s budget.
+	s.closeSetupConns()
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -1316,6 +1334,18 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener, fabricIdx
 			}
 		}
 		slog.Info("cluster sync: peer connected", "remote", conn.RemoteAddr(), "fabric", fabricIdx)
+		// #5303: admit the connection into the bounded pre-auth setup pool BEFORE
+		// spawning a setup goroutine, so a connection flood that stalls before
+		// authentication cannot exhaust FDs/goroutines/socket-memory. Excess
+		// connections (pool saturated) are closed immediately without allocating
+		// the large socket buffers; a reserved tail keeps the legitimate peer
+		// able to reconnect (see beginSetup). This does NOT revert #4370 — an
+		// admitted connection still runs its handshake in its own goroutine.
+		if !s.beginSetup(conn, true) {
+			s.notePreAuthRejected(conn)
+			conn.Close()
+			continue
+		}
 		// #4370: run connection setup (the auth handshake + wire-up + cold-start
 		// bulk sync inside handleNewConnection) in a per-connection goroutine so
 		// a slow or hung handshake on ONE connection cannot stall accepting the
@@ -1373,6 +1403,12 @@ func (s *SessionSync) fabricConnectLoop(ctx context.Context, fabricIdx int, peer
 			continue
 		}
 		slog.Info("cluster sync: connected to peer", "addr", peerAddr, "fabric", fabricIdx)
+		// #5303: register our own outbound dial for shutdown cleanup (so Stop()
+		// closes it if it stalls in the handshake). Outbound dials are bounded to
+		// one per fabric and initiated by us, so they are NOT subject to the
+		// inbound admission cap — beginSetup(inbound=false) never rejects and does
+		// not consume a counted slot.
+		s.beginSetup(conn, false)
 		s.handleNewConnection(ctx, fabricIdx, conn)
 	}
 }

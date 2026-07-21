@@ -54151,3 +54151,28 @@ top.
 - **Timestamp**: 2026-07-21
   **Action**: Fold #6162 review MINOR — update afxdp/README.md neighbor-limiter section from "256-slot direct-mapped" + open #6129 caveat to the 64-bucket x 4-way set-associative description with the bounded-residual note (stale-doc module-contract fix)
   **File(s)**: userspace-dp/src/afxdp/README.md
+
+- **Timestamp**: 2026-07-21
+  **Action**: #5303 — add a pre-auth admission cap to the session-sync accept
+  loop so a connection flood that stalls before authentication cannot exhaust
+  FDs/goroutines/socket-memory and deny a legitimate peer's reconnect. New
+  `beginSetup`/`finishSetup`/`closeSetupConns`/`notePreAuthRejected` in
+  `sync_admission.go`: bounded pool (`preAuthSetupCap`=8) with a peer-IP-reserved
+  tail (`preAuthPeerReserve`=2) so a non-peer flood can take at most 6 slots and
+  the peer always reconnects. Deferred the 256 KiB socket-buffer sizing
+  (`configureConnFn`) until AFTER `performSyncHandshake` succeeds — pre-auth
+  sockets stay cheap; slot released on handshake-resolve so it never spans bulk
+  sync. `Stop()` now `closeSetupConns()` to unblock stalled pre-auth handshakes
+  (no shutdown hang). Preserves #4370 parallel accept + #4107 HMAC handshake +
+  #3931/#4151 config-gen admission. New `PreAuthRejected` sync stat. Three
+  fail-on-revert tests, each binding one production line (reservation subtraction
+  / configureConnFn placement / closeSetupConns call) — verified RED as clean
+  assertion failures on revert.
+  **File(s)**:
+  - `pkg/cluster/sync_admission.go` (new — admission gate)
+  - `pkg/cluster/sync_conn.go` (acceptLoop admit, handleNewConnection deferral +
+    release, fabricConnectLoop outbound register, Stop close-in-flight)
+  - `pkg/cluster/sync.go` (SessionSync pre-auth fields; `PreAuthRejected` stat +
+    snapshot + Stats())
+  - `pkg/cluster/sync_admission_test.go` (new — 4 fail-on-revert tests)
+  - `docs/session-sync-architecture.md` (Pre-Auth Connection Admission section)
