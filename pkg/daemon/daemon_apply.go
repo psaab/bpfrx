@@ -216,6 +216,11 @@ func (d *Daemon) exitResetGeneration() { d.resetting.Store(false) }
 //  2. Enter the terminal reset generation BEFORE the wipe, so a writer that
 //     acquires applySem AFTER this returns (a periodic reconciler, a late
 //     commit, a shutdown-time apply) short-circuits on errDaemonResetting.
+//  2a. Quiesce config archival (#5869): the reset generation gates the daemon's
+//     config writers but NOT the configstore-owned fire-and-forget archive
+//     goroutine, so fence + JOIN it here before the wipe erases the archive
+//     directory — otherwise a resumed writer would recreate a prior-tenant
+//     config archive after FactoryResetArchiveDir removed it.
 //  3. Run the wipe while holding applySem.
 //     - On FAILURE: exit the reset generation and release applySem (deferred)
 //     so the half-reset box is recoverable and a retry can run, and return
@@ -230,7 +235,27 @@ func (d *Daemon) factoryReset(ctx context.Context, wipe func() error) error {
 	}
 	defer d.applySem.Release(1)
 	d.enterResetGeneration()
+	// #5869: fence + drain the async config-archive writers BEFORE the wipe
+	// erases /var/lib/xpf/archive. Auto-archive launches a fire-and-forget
+	// configstore goroutine per commit that the #5281 reset generation does NOT
+	// cover: a commit's writer that resumes after FactoryResetArchiveDir removed
+	// the archive dir would MkdirAll it again and drop a config-<ts>.<seq>.conf
+	// snapshot of the PRIOR tenant's full config text (cleartext IKE PSKs,
+	// WireGuard keys, SNMP communities) — zeroize secret residue on a
+	// re-tenanted device. QuiesceArchival sets the archive fence (new /
+	// not-yet-written writers no-op) and JOINS any in-flight writer, so once it
+	// returns no writer can recreate the archive the wipe is about to erase.
+	// (Nil-store guard: unit tests drive factoryReset on a bare Daemon.)
+	if d.store != nil {
+		d.store.QuiesceArchival()
+	}
 	if err := wipe(); err != nil {
+		// Fail-closed recoverable path: the daemon stays up and resumes normal
+		// config work, so re-enable archival too (a SUCCESSFUL wipe instead
+		// stops the daemon, leaving the fence latched). #5869.
+		if d.store != nil {
+			d.store.ResumeArchival()
+		}
 		d.exitResetGeneration()
 		return err
 	}

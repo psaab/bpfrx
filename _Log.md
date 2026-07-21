@@ -54456,3 +54456,27 @@ top.
 - **File(s)**: pkg/cli/cli.go, pkg/cli/cli_request_system.go,
   pkg/daemon/daemon_run.go, pkg/cli/console_zeroize_transaction_5871_test.go (new),
   pkg/cli/README.md, pkg/grpcapi/README.md, pkg/daemon/README.md, _Log.md
+
+## 2026-07-21 — #5869 archival zeroize-race fence (security)
+
+- **Timestamp**: 2026-07-21
+- **Action**: Fence + join the fire-and-forget config-archive writer against
+  factory-reset (zeroize). Auto-archive launches an UNTRACKED goroutine per
+  commit (`commitWithDescriptionLocked`) that `os.MkdirAll`s the archive dir;
+  the #5281 reset generation gated the daemon's config writers but not this
+  configstore goroutine, so a writer resuming AFTER `FactoryResetArchiveDir`
+  removed `/var/lib/xpf/archive` could recreate a `config-<ts>.<seq>.conf`
+  snapshot of the PRIOR tenant's full config text (cleartext IKE PSK / WG keys /
+  SNMP communities) — re-tenant secret residue. Added `Store.archiveWG` +
+  `archiveFenced`, tracked the writer, gated its launch and its write on the
+  fence, and added `Store.QuiesceArchival()` (set fence under s.mu, then
+  `archiveWG.Wait()`) + `Store.ResumeArchival()`. `daemon.factoryReset` now
+  quiesces archival after entering the reset generation and before the wipe, and
+  resumes it on the fail-closed recoverable path. Fail-on-revert test pins the
+  JOIN (`archiveWG.Wait()`); neutralizing that single line → RED (writer
+  resurrects the archive after the wipe). Control proves normal archival still
+  writes. Unit-provable (in-package barrier seam), no smoke.
+- **File(s)**: pkg/configstore/store.go, pkg/configstore/store_commit.go,
+  pkg/configstore/store_persist.go, pkg/daemon/daemon_apply.go,
+  pkg/configstore/factory_reset_archival_fence_5869_test.go (new),
+  docs/system-login.md, _Log.md
