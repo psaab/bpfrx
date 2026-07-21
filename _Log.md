@@ -54691,3 +54691,45 @@ top.
 - **File(s)**: pkg/api/config.go,
   pkg/api/config_session_holder_5870_test.go (new),
   pkg/configstore/README.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: Fix #6190 — remove a key-only account's xpf-written
+  authorized_keys at factory reset (zeroize)
+- **Details**: `zeroizeTearDownProvisionedUsers` removed
+  `/home/<name>/.ssh/authorized_keys` ONLY for accounts in the
+  `provisioned-users` REGISTRY. A pre-existing (operator / prior-tenant)
+  account configured with `system login user <name> authentication ssh-*` and
+  NO encrypted-password gets a `provisioned-keys` marker but NO registry marker
+  (`applySystemLogin` writes `markProvisioned` only in the useradd branch;
+  `reconcileUserPassword` only on a password apply). Such a KEY-ONLY account is
+  never iterated by the registry loop, so the #6183 fix correctly swept its keys
+  MARKER but the actual xpf-written authorized_keys FILE was never removed — the
+  prior tenant retained SSH login on that account after a "factory reset" (the
+  #4598 credential-leak class). This is ASYMMETRIC with the day-2 path:
+  `reconcileAbsentLoginUsers` enumerates the UNION `provisionedNames()` and
+  `deprovisionLoginUser` DOES remove that key file, gated on `keyProvisioned`.
+  Fix: phase (C) of `zeroizeLoginAccounts` now sweeps the keys root via a new
+  `zeroizeSweepProvisionedKeys` (replacing the marker-only
+  `zeroizeSweepResourceMarkerRoot` on that root) which, in addition to erasing
+  each `provisioned-keys` marker, removes the xpf-written
+  `/home/<name>/.ssh/authorized_keys` FILE — mirroring `deprovisionLoginUser`'s
+  `keyProvisioned`-gated `os.Remove(managedAuthorizedKeysPath(name))`. It is
+  UID-gated and fail-closed (mirrors the registry teardown / #5496): the file is
+  removed only when the live `/etc/passwd` UID equals the keys marker's recorded
+  UID; a proven UID-mismatch (out-of-band recreate whose authorized_keys belongs
+  to someone else) is left intact with the marker RETAINED; an unreadable passwd
+  / unparseable marker fails closed (retain + surface); an account whose registry
+  teardown was RETAINED (#6183) is skipped entirely so its marker AND key file
+  stay consistent; `root` is skipped (its keys live at /root/.ssh, revoked in
+  place by `zeroizeRootLoginAccount`). An operator's own (unmarked)
+  authorized_keys is never touched — only what xpf wrote. Tests (fail-on-revert):
+  pkg/grpcapi/zeroize_login_keyonly_authkeys_6190_test.go —
+  TestZeroizeRemovesKeyOnlyAccountAuthorizedKeys (RED count 1 when the
+  default-branch `fail(os.Remove(keysFile))` is neutralized) +
+  TestZeroizeKeyOnlyRetainedAndMismatchPreserveKeys (retained-set +
+  UID-mismatch operator-key preservation). Validation: go build ./..., go vet
+  ./pkg/grpcapi/, go test ./pkg/grpcapi/... ./pkg/daemon/... all pass.
+  Control-plane / unit-provable — NO smoke.
+- **File(s)**: pkg/grpcapi/server_diag_zeroize.go,
+  pkg/grpcapi/zeroize_login_keyonly_authkeys_6190_test.go (new),
+  docs/system-login.md, _Log.md

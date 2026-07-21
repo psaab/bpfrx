@@ -290,6 +290,33 @@ too (`zeroizeLoginAccounts`, same error-surfacing discipline):
   for a fail-closed registry retry, so an account's three markers stay together)
   and drops the roots, so no marker survives in **any** of the three roots —
   mirroring the daemon's own `forgetProvenance`.
+- **Key-only accounts' `authorized_keys` is removed too (#6190).** The account
+  loop removes `authorized_keys` only for accounts in the `provisioned-users`
+  registry, but a **key-only** account — a pre-existing operator/prior-tenant
+  account xpf only added an SSH key to (`system login user <name> authentication
+  ssh-*` with **no** `encrypted-password`) — gets a `provisioned-keys` marker and
+  **no** registry marker (`applySystemLogin` writes `markProvisioned` only in the
+  useradd branch; `reconcileUserPassword` only on a password apply). The registry
+  loop never iterates it, so before #6190 the marker was swept (#5841/#6183) but
+  the xpf-written `/home/<name>/.ssh/authorized_keys` **file** was not — the prior
+  tenant kept SSH login on that account after a "factory reset", the #4598
+  credential-leak class, **asymmetric** with the day-2 path
+  (`reconcileAbsentLoginUsers` enumerates the **union** `provisionedNames()` and
+  `deprovisionLoginUser` **does** remove that key file, gated on
+  `keyProvisioned`). `zeroizeSweepProvisionedKeys` closes the asymmetry: it
+  removes the xpf-written key **file** for every account with a `provisioned-keys`
+  marker (the union delta the registry loop misses), **UID-gated and
+  fail-closed** — the file is removed only when the live `/etc/passwd` UID equals
+  the keys marker's recorded UID (a proven **UID-mismatch** is an out-of-band
+  recreate whose `authorized_keys` belongs to someone else → left intact, marker
+  retained), an unreadable passwd / unparseable marker **fails closed** (retain,
+  surface the error), and an account whose registry teardown was **retained** is
+  skipped entirely so its marker and key file stay consistent. `root` is never a
+  key-only account (`applyRootAuth` writes the registry marker alongside the key
+  marker) and its keys live at `/root/.ssh`, so this sweep never touches a
+  `/home/root` key file — root is revoked in place by `zeroizeRootLoginAccount`.
+  An **operator's own** (unmarked) `authorized_keys` is never touched — only what
+  xpf wrote.
 - **Ownership uncertainty fails CLOSED (#5496).** Deciding "is this the account
   xpf provisioned?" needs two reads — the live UID (`/etc/passwd`) and the
   recorded UID (the marker). If **either** cannot be resolved — `/etc/passwd`
