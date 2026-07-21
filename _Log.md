@@ -54059,3 +54059,33 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/neighbor_program_limiter.rs
 - **Validation**: cargo test --release (full userspace-dp suite); named test 3x.
   Not HA (per-worker limiter, unit-provable; no cluster smoke).
+
+## 2026-07-21 — #6132 eventstream oversized/framing-desync resync recovery
+- **Timestamp**: 2026-07-21
+- **Action**: Fix the EventStream reader's oversized/framing-desync guard
+  (`length > 1024`) so a persistently-oversized/corrupt session frame recovers
+  via a rate-limited full resync instead of the pre-#6132 bare `return` that
+  dropped the connection forever. That bare return had the SAME replay-loop
+  pathology #6130 fixed for the undecodable-decode path: the frame is PRESENT on
+  the wire, the Rust replay buffer re-sends it verbatim (no `has_gap` barrier),
+  so drop -> reconnect -> replay -> drop stormed the shared control socket.
+  New `handleOversizedFrame` reuses the #6130 machinery: extracted
+  `triggerRateLimitedResync` (shared onFullResync + `decodeFailureResyncInterval`
+  rate-limiter + `SessionSyncResyncs`/`DecodeResyncSuppressed`), advances the
+  watermark PAST the (aligned-header) seq (loop-break), and re-aligns the byte
+  stream by trust in the LENGTH — discard within `maxDiscardableOversizedFrameBytes`
+  and KEEP the connection, else flush the advanced ACK and drop to re-establish
+  framing on reconnect (bounded). Security posture preserved: the corrupt frame
+  is REFUSED (never decoded/applied), superseded by the table-truth resync.
+  Fail-on-revert tests (target-count: the single guard call site) go RED as an
+  assertion failure when the bare `return` is restored. Not HA (event-stream
+  reader; unit-provable, no cluster smoke).
+- **File(s)**:
+  - `pkg/dataplane/userspace/eventstream.go` (oversized guard call site;
+    new `handleOversizedFrame` + `maxDiscardableOversizedFrameBytes`; extracted
+    `triggerRateLimitedResync`; `handleSessionDecodeFailure` now calls it)
+  - `pkg/dataplane/userspace/eventstream_oversized_framing_resync_6132_test.go`
+    (new fail-on-revert tests
+    `Test_oversized_session_frame_recovers_via_resync_not_replay_loop_6132`,
+    `Test_persistent_oversized_session_frames_do_not_replay_loop_6132`)
+  - `docs/session-sync-architecture.md` (#6132 recovery paragraph + trigger-list)

@@ -636,10 +636,12 @@ post-snapshot sessions.
 This is **not** triggered by demotion prep. Its only live caller is
 `handleEventStreamFullResync` → `exportUserspaceOwnerRGSessionsWithConfig`: the
 event stream signals a FullResync after a #2874 sequence gap, a #2442
-delta-ring overflow (loss-of-sync), or a #5483 **undecodable session frame**
+delta-ring overflow (loss-of-sync), a #5483 **undecodable session frame**
 (a COMPLETE-but-semantically-rejected open/close/update — same severity as a
-gap, because the standby is missing that frame's session state), and the export
-republishes the full owned set from table truth. It is not the same thing as the
+gap, because the standby is missing that frame's session state), or a #6132
+**oversized / framing-desynced frame** (a refused frame whose declared length
+exceeds the sanity bound), and the export republishes the full owned set from
+table truth. It is not the same thing as the
 steady-state delta drain.
 
 The #5483 case closes a silent-divergence hole: the reader used to skip an
@@ -694,6 +696,31 @@ drops it for a non-primary), so advancing past the undecodable frame there loses
 nothing and the standby cannot spin. A decode failure on a lossy TELEMETRY frame
 is still tolerated (skipped, watermark advanced) — it carries no HA session
 state.
+
+**#6132 — the oversized / framing-desync guard has the SAME replay loop, fixed
+the same way.** The reader's length sanity check (`length > 1024`; the helper's
+largest legitimate frame is a <=256B session event) used to do a bare `return`,
+dropping the connection on any oversized declared length. That is the identical
+pathology: the frame is **PRESENT** on the wire, the Rust replay buffer re-sends
+it verbatim with no `has_gap` barrier, so a persistently-oversized / framing-
+corrupt frame at seq N produced the same drop → reconnect → replay → drop storm
+`#6130` eliminated for the undecodable-decode path. `handleOversizedFrame` now
+recovers via the shared `triggerRateLimitedResync` machinery (same
+`onFullResync`, same `decodeFailureResyncInterval` rate-limiter, same
+`SessionSyncResyncs` / `DecodeResyncSuppressed` accounting) instead of an
+unbounded reconnect loop. The header is written atomically and the reader
+consumes exactly `length` payload bytes per frame, so the header stays aligned
+and this frame's `seq` is trustworthy; the watermark is advanced PAST it (the
+loop-break — the helper trims it and never re-sends it) and the payload is
+handled by trust in the LENGTH: a length within
+`maxDiscardableOversizedFrameBytes` is a trusted frame boundary, so the reader
+discards exactly that many bytes to re-align on the next header and KEEPS the
+connection (no drop); a length above the ceiling (or a failed drain) is not
+trusted to re-align the byte stream, so the reader flushes the advanced ACK and
+drops the connection to re-establish framing on reconnect — bounded, because the
+ACK moved past the frame so it is trimmed, not replayed. The **security posture
+is preserved**: the corrupt frame is REFUSED — never decoded or applied as valid
+session state — it is superseded by the table-truth resync.
 
 The `rgIDs` handed to the export are enumerated from the **configured
 redundancy-group set** — `handleEventStreamFullResync` calls
