@@ -624,30 +624,56 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 		// Re-read the resync arm AFTER flushDeleteJournal: a rejournalTail
 		// eviction during that flush (or a journalDelete drop while we were
 		// disconnected) arms forceResync, and dropped deletes are only
-		// recoverable via a full authoritative bulk snapshot (#5450). Force the
-		// bulk even when already primed so the peer's reconcileStaleSessions
-		// deletes the sessions we already closed.
+		// recoverable via a full authoritative bulk snapshot (#5450).
 		// Consume the resync arm with CAS (symmetric with syncSweep) BEFORE the
 		// bulk, so a NEW overflow that arms forceResync DURING this bulk survives
 		// to trigger the next resync instead of being cleared by an unconditional
-		// Store(false) (#5450 MINOR 1). coldStart forces a bulk regardless of the
-		// arm; a consumed arm is re-armed on bulk failure so a later
-		// sweep/reconnect retries.
+		// Store(false) (#5450 MINOR 1); a consumed arm is re-armed on bulk
+		// failure so a later sweep/reconnect retries.
 		forcedConsumed := s.forceResync.CompareAndSwap(true, false)
-		if coldStart || forcedConsumed {
-			if forcedConsumed && !coldStart {
-				slog.Warn("cluster sync: forcing full bulk resync on reconnect after delete-journal overflow (standby may retain stale sessions)", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
-			} else {
-				slog.Info("cluster sync: starting bulk sync on cold start", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
+		// #5480: ALWAYS re-push our authoritative session table on a fresh
+		// connection after a full (both-fabric) disconnect — not only on a
+		// first-ever cold start (bulkEverCompleted false) or a #5450
+		// delete-journal-overflow forced resync. bulkEverCompleted is a sticky,
+		// process-local flag: once the survivor completes one bulk it stays true
+		// forever, so the old `coldStart || forcedConsumed` reconnect gate wrongly
+		// SKIPPED the re-push when the PEER rebooted and lost its session table
+		// (the peer's own flag reset to false, but ours stayed true). The rebooted
+		// peer then sends only its own empty bulk and OnPeerConnected re-pushes
+		// non-session state, so the standby ends up with NO synced sessions — and
+		// blackholes every established flow on the next failover to it.
+		//
+		// The survivor cannot locally tell a rebooted peer (empty table, needs
+		// priming) from a pure fabric flap (peer kept its table): the sync
+		// handshake carries no peer-cold / boot-incarnation / table-count signal,
+		// and an unkeyed dual-accept peer sends no HELLO at all. So it re-primes
+		// unconditionally. Re-priming is safe and idempotent — the receiver
+		// upserts every session and reconcileStaleSessions on the peer prunes what
+		// we no longer own — and a both-fabric disconnect means incremental deltas
+		// may have been missed during the outage, so the "already primed"
+		// assumption no longer holds even for a peer that never rebooted.
+		//
+		// Cost: one redundant full bulk on a genuine both-fabric flap. It is
+		// bounded — this arm fires ONLY on a both-fabric down->up transition, never
+		// on a routine single-fabric flip (those hit the becameActive/else branches
+		// below and still do NOT re-bulk). The blackhole it prevents is far worse
+		// than the redundant transfer (correctness over the optimization). A more
+		// surgical fix that keeps the #466 flap-suppression optimization needs a
+		// peer boot-incarnation field in the sync handshake — a wire change tracked
+		// on #5480 and deferred here.
+		switch {
+		case forcedConsumed && !coldStart:
+			slog.Warn("cluster sync: forcing full bulk resync on reconnect after delete-journal overflow (standby may retain stale sessions)", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
+		case coldStart:
+			slog.Info("cluster sync: starting bulk sync on cold start", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
+		default:
+			slog.Info("cluster sync: re-priming bulk sync on reconnect (peer may have rebooted and lost its session table, #5480)", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
+		}
+		if err := s.doBulkSync(); err != nil {
+			slog.Warn("cluster sync: bulk sync failed", "err", err, "fabric", fabricIdx)
+			if forcedConsumed {
+				s.forceResync.Store(true)
 			}
-			if err := s.doBulkSync(); err != nil {
-				slog.Warn("cluster sync: bulk sync failed", "err", err, "fabric", fabricIdx)
-				if forcedConsumed {
-					s.forceResync.Store(true)
-				}
-			}
-		} else {
-			slog.Info("cluster sync: skipping bulk sync on reconnect (already primed)", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
 		}
 	} else if becameActive {
 		slog.Info("cluster sync: active fabric changed, resuming incremental sync", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "active_before", activeBefore, "active_after", activeAfter)
