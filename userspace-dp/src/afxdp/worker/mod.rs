@@ -1448,6 +1448,11 @@ pub(crate) struct BindingLiveSnapshot {
     /// #4477: cumulative source-NAT allocation failures snapshotted from
     /// BindingLiveState. Bridged into `GlobalCtrNATAllocFail` (Go side).
     pub(crate) nat_alloc_fail: u64,
+    /// #6122: cumulative fail-closed drops of an ordinary same-family NAT'd
+    /// non-first fragment that missed the fragment-association cache
+    /// (SNAT / static-NAT / DNAT / NPTv6), snapshotted from BindingLiveState.
+    /// The same-family sibling of `nat64_frag_dropped`.
+    pub(crate) nat_frag_untranslated_dropped: u64,
     pub(crate) slow_path_packets: u64,
     pub(crate) slow_path_bytes: u64,
     pub(crate) slow_path_local_delivery_packets: u64,

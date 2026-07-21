@@ -2635,7 +2635,17 @@ type BindingStatus struct {
 	// (nat_alloc_fails / drops), and Prometheus (xpf_nat_alloc_fails_total /
 	// xpf_drops_total) stop reading a permanent 0. omitempty + the Rust serde
 	// `default` keep cross-version wire safety (an older helper omits it → 0).
-	NatAllocFail                   uint64 `json:"nat_alloc_fail,omitempty"`
+	NatAllocFail uint64 `json:"nat_alloc_fail,omitempty"`
+	// #6122: fail-closed drops of an ordinary same-family NAT'd (SNAT /
+	// static-NAT / DNAT / NPTv6) NON-FIRST fragment that MISSED the
+	// fragment-association cache. Forwarding it untranslated would leak the
+	// internal source (SNAT / NPTv6) or the pre-NAT destination (DNAT), so the
+	// permitted-but-untranslatable fragment is dropped fail-closed. The
+	// same-family sibling of Nat64FragDropped; a plain (no-NAT) fragment matches
+	// no rule and is NOT counted here, so ordinary fragmented forwarding is
+	// preserved. omitempty + the Rust serde `default` keep cross-version wire
+	// safety (an older helper omits it → 0).
+	NatFragUntranslatedDropped     uint64 `json:"nat_frag_untranslated_dropped,omitempty"`
 	SlowPathPackets                uint64 `json:"slow_path_packets,omitempty"`
 	SlowPathBytes                  uint64 `json:"slow_path_bytes,omitempty"`
 	SlowPathLocalDeliveryPackets   uint64 `json:"slow_path_local_delivery_packets,omitempty"`

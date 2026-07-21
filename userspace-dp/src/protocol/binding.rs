@@ -574,6 +574,17 @@ pub(crate) struct BindingStatus {
     /// with the other enforcement drops, into `GlobalCtrDrops`.
     #[serde(rename = "nat_alloc_fail", default)]
     pub nat_alloc_fail: u64,
+    /// #6122: fail-closed drops of an ordinary same-family NAT'd (SNAT /
+    /// static-NAT / DNAT / NPTv6) NON-FIRST fragment that MISSED the
+    /// fragment-association cache. Forwarding it untranslated would leak the
+    /// internal source (SNAT / NPTv6) or the pre-NAT destination (DNAT), so the
+    /// permitted-but-untranslatable fragment is dropped fail-closed instead of
+    /// leaked. The same-family sibling of `nat64_frag_dropped`; a plain (no-NAT)
+    /// fragment matches no rule and is NOT counted here. `default` keeps the same
+    /// cross-version wire safety as the siblings above (an older helper omits it
+    /// and Go/Rust read 0).
+    #[serde(rename = "nat_frag_untranslated_dropped", default)]
+    pub nat_frag_untranslated_dropped: u64,
     #[serde(rename = "slow_path_packets", default)]
     pub slow_path_packets: u64,
     #[serde(rename = "slow_path_bytes", default)]
