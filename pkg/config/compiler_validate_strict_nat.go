@@ -965,15 +965,16 @@ func validateSourceNATPoolAddressScopeStrict(cfg *Config) error {
 //
 // The name is resolved to concrete prefixes at snapshot-build time
 // (appendNATSourceAddressName → resolveNATAddressNamePrefixes →
-// resolveUserspaceAddressBookEntry). Two distinct failures both translate to a
-// rule that matches NOTHING (fail-closed but SILENT):
+// expandBookNameRecursive, the feed-aware recursive expander since #4925). Two
+// distinct failures both translate to a rule that matches NOTHING (fail-closed
+// but SILENT):
 //
 //   - a wholly UNDEFINED name (a typo) — neither an address-book entry nor a
 //     dynamic-address feed binding; and
 //   - a DEFINED-but-UNRESOLVABLE name (#3425) — a defined `address` with no
 //     prefix (empty Value), a defined-but-EMPTY `address-set`, or a set with a
-//     dangling / member-less expansion. resolveUserspaceAddressBookEntry
-//     returns ok=false for these, so the builder appends the raw (unparseable)
+//     dangling / member-less expansion. expandBookNameRecursive returns an
+//     empty prefix list for these, so the builder appends the raw (unparseable)
 //     token to keep the constraint non-empty and the rule translates no
 //     traffic — exactly the policy-address fail-open class #3149 closes for
 //     security policies, here for NAT.
