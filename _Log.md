@@ -54225,6 +54225,68 @@ top.
   **Action**: Fold #6162 review MINOR — update afxdp/README.md neighbor-limiter section from "256-slot direct-mapped" + open #6129 caveat to the 64-bucket x 4-way set-associative description with the bounded-residual note (stale-doc module-contract fix)
   **File(s)**: userspace-dp/src/afxdp/README.md
 
+- **Timestamp**: 2026-07-21
+  **Action**: #5673 — bound the pre-policy dynamic-neighbor map growth against a spoofed-source DoS. Source-address learning runs on RX before screen/policy admission, so a spoofed-source flood could inflate the shared `dynamic_neighbors` map (memory) and serialize every worker on the 64-shard bulk lock (CPU) with no policy check. Added a per-shard learn cap (`MAX_DYNAMIC_NEIGHBORS_PER_SHARD` = 2048, aggregate `MAX_DYNAMIC_NEIGHBORS` = 131072) enforced on the transit-source arm (`learn_pair_if_changed`) and the ARP/NDP arm (`insert_if_changed`); an UPDATE to an already-learned neighbor and the control-plane/resolver installs are never capped. The RX-learn caller (`learn_dynamic_neighbor`) short-circuits the bulk lock via a capacity-aware pre-check (`get_with_capacity`) once every candidate key is new-and-at-cap, removing the all-shard serialization for a flood. Refusals counted (`learn_cap_drops`) and surfaced as Prometheus `xpf_userspace_dynamic_neighbor_learn_cap_drops_total`.
+  **File(s)**: userspace-dp/src/afxdp/sharded_neighbor.rs, userspace-dp/src/afxdp/sharded_neighbor_tests.rs, userspace-dp/src/afxdp/neighbor_dispatch.rs, userspace-dp/src/afxdp/coordinator/status.rs, userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/tests.rs, userspace-dp/src/server/helpers.rs, userspace-dp/src/server/lifecycle.rs, pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go, pkg/api/metrics_descriptor_coverage_test.go, docs/feature-coverage.md, docs/userspace-dataplane-gaps.md
+
+- **Timestamp**: 2026-07-21
+  **Action**: Fold #6170 review — regenerate protocol_wire_v1.json for the new dynamic_neighbor_learn_cap_drops_total wire field (MERGE-BLOCKER: #1325 wire gate was RED) + soften the sharded_neighbor.rs shard-hash docstring overclaim to admit the shard-concentration residual (fixed/unkeyed hash) + cite the resolver backstop
+  **File(s)**: userspace-dp/tests/fixtures/protocol_wire_v1.json, userspace-dp/src/afxdp/sharded_neighbor.rs
+  **Action**: Fix #5477 (security, heartbeat replay) — track RETIRED sender
+  sessions in `heartbeatAuthReplay.admit`. The pre-fix tracker held exactly
+  ONE `(session, counter)` and re-anchored on ANY session change, so an
+  on-link attacker who recorded authenticated frames from two incarnations
+  A and B could alternate A→B→A→B forever (each switch reset the watermark,
+  re-admitting the SAME recorded A frames → refreshed liveness + stale
+  role/priority before handlePeerHeartbeat). Replaced the single watermark
+  with a BOUNDED per-session high-water map (`heartbeatReplaySessions=64`,
+  FIFO eviction): reject a return to a retired session at/below its
+  remembered counter; still accept a genuinely new session (real reboot).
+  Random (unordered) session ids rule out a strictly-newer fullSetSeqGuard
+  approach. Security bound documented: eviction requires 64 genuine peer
+  reboots (attacker cannot mint valid new sessions — HMAC), post-eviction
+  replay re-anchors once and is overwritten within one interval, never
+  sustained. Added 3 fail-on-revert tests (A→B→A reject, bounded-ring
+  eviction, read-loop liveness-gate consequence); RED-on-revert verified as
+  a clean assertion failure (neutralize `for i := 0; i < a.count; i++` →
+  `i < 0`, target-count 1). Full `pkg/cluster` suite green with -race (3×).
+  Needs loss-cluster failover smoke (touches heartbeat liveness/election).
+  **File(s)**:
+  - `pkg/cluster/heartbeat.go` (heartbeatAuthReplay: bounded per-session
+    watermark map + heartbeatReplaySessions const + replaySessionMark)
+  - `pkg/cluster/heartbeat_auth_test.go` (new tests
+    `TestHeartbeatAuthReplay_RetiredSessionABA`,
+    `TestHeartbeatAuthReplay_BoundedRing`,
+    `TestHeartbeatReplayGatesLivenessRefresh`)
+  - `pkg/cluster/README.md` (Anti-replay bullet: retired-session rejection
+    + bound-safety argument)
+
+- **Timestamp**: 2026-07-21
+  **Action**: Fold #6167 review MINOR — correct the heartbeat anti-replay security bound in heartbeat.go (heartbeatReplaySessions comment) + pkg/cluster/README.md "Bound safety" to the honest 65-recording sustained-replay reality (was falsely "requires a genuine peer reboot / cannot be sustained"); no admit()/FIFO code change
+  **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/README.md
+  **Action**: #5303 — add a pre-auth admission cap to the session-sync accept
+  loop so a connection flood that stalls before authentication cannot exhaust
+  FDs/goroutines/socket-memory and deny a legitimate peer's reconnect. New
+  `beginSetup`/`finishSetup`/`closeSetupConns`/`notePreAuthRejected` in
+  `sync_admission.go`: bounded pool (`preAuthSetupCap`=8) with a peer-IP-reserved
+  tail (`preAuthPeerReserve`=2) so a non-peer flood can take at most 6 slots and
+  the peer always reconnects. Deferred the 256 KiB socket-buffer sizing
+  (`configureConnFn`) until AFTER `performSyncHandshake` succeeds — pre-auth
+  sockets stay cheap; slot released on handshake-resolve so it never spans bulk
+  sync. `Stop()` now `closeSetupConns()` to unblock stalled pre-auth handshakes
+  (no shutdown hang). Preserves #4370 parallel accept + #4107 HMAC handshake +
+  #3931/#4151 config-gen admission. New `PreAuthRejected` sync stat. Three
+  fail-on-revert tests, each binding one production line (reservation subtraction
+  / configureConnFn placement / closeSetupConns call) — verified RED as clean
+  assertion failures on revert.
+  **File(s)**:
+  - `pkg/cluster/sync_admission.go` (new — admission gate)
+  - `pkg/cluster/sync_conn.go` (acceptLoop admit, handleNewConnection deferral +
+    release, fabricConnectLoop outbound register, Stop close-in-flight)
+  - `pkg/cluster/sync.go` (SessionSync pre-auth fields; `PreAuthRejected` stat +
+    snapshot + Stats())
+  - `pkg/cluster/sync_admission_test.go` (new — 4 fail-on-revert tests)
+  - `docs/session-sync-architecture.md` (Pre-Auth Connection Admission section)
 ## 2026-07-21 — #5800 io_uring write in-flight registry (UAF fix)
 - **Timestamp**: 2026-07-21
 - **Action**: Close the retry-ceiling/fatal-ring use-after-free in the shared
@@ -54293,3 +54355,36 @@ top.
   - `pkg/api/metrics.go`, `pkg/api/metrics_descriptors.go`,
     `pkg/api/metrics_userspace.go`, `pkg/api/metrics_test.go` (Prometheus
     descriptor + emit + test coverage)
+## 2026-07-21 — #5563 manual-failover config-generation staleness gate
+- **Timestamp**: 2026-07-21
+- **Action**: Gate manual/planned failover readiness on config-sync
+  generation so a config-stale standby is not promoted onto an older
+  policy set (fail-open after tightening, false-deny after loosening).
+  Added `lastRecvConfigGen` received high-water (recorded in the
+  `syncMsgConfig` handler before apply), carried it plus
+  `lastAppliedConfigGen` into `TransferReadinessSnapshot`
+  (`PeerConfigGen`/`AppliedConfigGen`), added `ConfigStale()` +
+  `ReadyForManualFailover` refusal + `Reason()` text, reset the received
+  mark alongside the applied mark in `resetRecvGen`. Planned/manual path
+  only; unplanned/crash path deliberately not gated.
+- **File(s)**: `pkg/cluster/sync.go`, `pkg/cluster/sync_conn.go`,
+  `pkg/cluster/sync_bulk.go`,
+  `pkg/cluster/sync_failover_config_gen_test.go` (new),
+  `docs/sync-protocol.md`, `docs/ha-failover-status.md`
+
+## 2026-07-21 — #5879 canonical per-physical-interface QinQ gate
+- **Timestamp**: 2026-07-21
+- **Action**: Add #5879 canonical QinQ honesty gate. The #2354 gate validated a
+  local `inner-vlan-id` leaf on the committing node's expansion only; QinQ split
+  across the `vlan-tags outer/inner` spelling (incl. two set statements) or living
+  in a peer-only `groups node1` view bypassed commit (verified live: `vlan-tags
+  outer 100 inner 200` and node1-only `inner-vlan-id` both compiled clean). New
+  `validateQinQVLANStackAST` builds each unit's aggregate outer/inner stack across
+  both spellings and rejects any inner tag, evaluated for BOTH node0 and node1
+  effective views (HA-symmetric). Moved QinQ detection out of
+  `validateUnsupportedInterfaceStanzasAST` (H9/H10 stay). New `lenientQinQVLANStack`
+  opt keeps the #1960 warn-on-load posture.
+- **File(s)**: pkg/config/compiler_interfaces_qinq.go (new),
+  pkg/config/compiler_interfaces_unsupported.go, pkg/config/compiler.go,
+  pkg/config/schema_interfaces.go, pkg/config/qinq_canonical_vlan_5879_test.go (new),
+  docs/config-schema.md, _Log.md

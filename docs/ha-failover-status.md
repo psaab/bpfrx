@@ -54,6 +54,16 @@ yet. Here is what is true today:
 - Planned failover decoupled from bulk sync (PR #407) — barrier ack
   proves peer is current, no bulk-sync gate
 - Transfer readiness surfaced separately from takeover readiness (PR #402)
+- Manual/planned failover refuses a config-stale standby (#5563): transfer
+  readiness now also gates on the config-sync generation. A standby that has
+  received a newer config generation from the primary than it has successfully
+  applied (`PeerConfigGen > AppliedConfigGen` in `TransferReadinessSnapshot`) is
+  reported not transfer-ready, so `request chassis cluster failover` will not
+  promote it onto a stale policy set (fail-open after a tightening commit,
+  false-deny after a loosening one). A legitimate same-generation failover still
+  proceeds; the unplanned/crash path is not gated. Surfaced in
+  `show chassis cluster status` transfer-readiness reason as "standby config
+  stale: applied gen=N behind peer committed gen=M"
 - HA configs that use per-pool source NAT `persistent-nat` are not admitted to
   userspace forwarding because persistent-NAT leases are helper-local allocator
   state and are not HA-synchronized (#1449)

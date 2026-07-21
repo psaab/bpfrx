@@ -246,6 +246,37 @@ fn process_status_pending_neigh_capacity_drops_roundtrip() {
     assert_eq!(legacy.pending_neigh_capacity_drops_total, 0);
 }
 
+// #5673: round-trip + backward-compat pin for the aggregate
+// dynamic-neighbor learn-cap drop counter. The wire key feeds
+// pkg/dataplane/userspace/protocol.go and the Prometheus counter
+// `xpf_userspace_dynamic_neighbor_learn_cap_drops_total`. A rename or a
+// one-sided add fails here instead of silently decoding zero on the Go side.
+#[test]
+fn process_status_dynamic_neighbor_learn_cap_drops_roundtrip() {
+    let status = ProcessStatus {
+        dynamic_neighbor_learn_cap_drops_total: 12,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["dynamic_neighbor_learn_cap_drops_total"], 12);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.dynamic_neighbor_learn_cap_drops_total, 12);
+
+    // Pre-#5673 payload (key absent) must decode with a zero default
+    // (#[serde(default)] backward-compat with an older daemon).
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("dynamic_neighbor_learn_cap_drops_total")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#5673 payload decodes");
+    assert_eq!(legacy.dynamic_neighbor_learn_cap_drops_total, 0);
+}
+
 // #1807: round-trip + backward-compat pin for the worker-command-queue
 // poison-recovery counter. The wire key feeds
 // pkg/dataplane/userspace/protocol.go and the Prometheus counter

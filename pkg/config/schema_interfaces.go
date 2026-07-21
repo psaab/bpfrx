@@ -116,11 +116,15 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 		},
 		// inner-vlan-id stays typed (range-validated) so a malformed value
 		// still reports a clean error, but a well-formed inner tag is
-		// HARD-REJECTED at commit by the #2354 honest-posture gate
-		// (validateUnsupportedInterfaceStanzasAST): the AF_XDP dataplane does
-		// not enforce QinQ / stacked-VLAN transit, so committing an inner tag
-		// would be a false promise. Single 802.1Q tagging via vlan-id is
-		// supported.
+		// HARD-REJECTED at commit by the #5879 canonical per-physical-
+		// interface QinQ gate (validateQinQVLANStackAST, compiler_interfaces_
+		// qinq.go — the #2354 honest-posture gate, generalized to the
+		// aggregate stack across every spelling and both cluster-node views):
+		// the AF_XDP dataplane does not enforce QinQ / stacked-VLAN transit,
+		// so committing an inner tag would be a false promise. The modern
+		// `vlan-tags outer/inner` spelling is intentionally NOT a setSchema
+		// leaf (advertising an unsupported feature would mislead) — the same
+		// gate rejects it. Single 802.1Q tagging via vlan-id is supported.
 		"inner-vlan-id": {
 			desc:          "Inner VLAN ID (QinQ; NOT enforced — rejected at commit, #2354)",
 			args:          1,

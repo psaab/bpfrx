@@ -478,6 +478,22 @@ type compileOpts struct {
 	// lenientVRRPTrackDuplicates / lenientLogProfileStreamRef.
 	lenientUnsupportedInterfaceStanzas bool
 
+	// lenientQinQVLANStack (#5879) downgrades the canonical per-physical-
+	// interface QinQ / stacked-VLAN honesty gate (validateQinQVLANStackAST:
+	// an aggregate inner/second VLAN tag spelled `inner-vlan-id` OR
+	// `vlan-tags inner`, possibly split across statements or contributed by
+	// a peer-only group) from a hard error to a warning on the tolerant load
+	// / peer-sync paths. The AF_XDP dataplane unwinds a single VLAN tag, so
+	// an inner tag was already silently dropped on every binary up to this
+	// gate; an already-persisted or peer-synced config may carry one, and an
+	// upgrading / receiving node must still boot through it (warn) rather
+	// than fail-closed-on-load (#1960 class). Commit / commit-check stay
+	// strict — a new operator edit whose stacked-VLAN stack the dataplane
+	// cannot honour is rejected loudly. Same doctrine as
+	// lenientUnsupportedInterfaceStanzas (#2008 H9/H10), whose QinQ half this
+	// gate subsumes.
+	lenientQinQVLANStack bool
+
 	// lenientRoutingExportRef (#2144) downgrades the routing-export
 	// cross-reference gate (validateRoutingExportReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. Set ONLY on the tolerant
@@ -1984,6 +2000,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATPoolAlarmThreshold:           true,
 		lenientNATHostMask:                     true,
 		lenientUnsupportedInterfaceStanzas:     true,
+		lenientQinQVLANStack:                   true,
 		lenientRoutingExportRef:                true,
 		lenientFRRAuthValues:                   true,
 		lenientRouteFilterMatchTypes:           true,
@@ -2277,6 +2294,18 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		return nil, unitAliasErr
 	}
 
+	// #5879: canonical per-physical-interface QinQ / stacked-VLAN honesty
+	// gate — see compiler_interfaces_qinq.go. Runs PRE-expansion beside the
+	// tunnel/zone/table-id/unit-alias union gates: it expands the candidate
+	// once per cluster node itself (node0 AND node1) so the accept/reject
+	// verdict is identical on both nodes and a peer-only-group or
+	// `vlan-tags`-spelled inner tag is caught. Strict hard-rejects an
+	// unsupported inner tag; lenient warns (#1960).
+	qinqWarnings, qinqErr := validateQinQVLANStackAST(tree, opts.lenientQinQVLANStack)
+	if qinqErr != nil {
+		return nil, qinqErr
+	}
+
 	usedNodeFallback := false
 
 	// Expand groups before compilation — resolve all apply-groups references.
@@ -2304,6 +2333,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
+	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
 	return cfg, nil
 }
 
@@ -2356,6 +2386,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATPoolAlarmThreshold:           true,
 		lenientNATHostMask:                     true,
 		lenientUnsupportedInterfaceStanzas:     true,
+		lenientQinQVLANStack:                   true,
 		lenientRoutingExportRef:                true,
 		lenientFRRAuthValues:                   true,
 		lenientRouteFilterMatchTypes:           true,
@@ -2508,6 +2539,17 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, unitAliasErr
 	}
 
+	// #5879: canonical per-physical-interface QinQ / stacked-VLAN honesty
+	// gate — see compileConfigWithOpts / compiler_interfaces_qinq.go. Runs
+	// PRE-expansion: it expands the candidate once per cluster node itself
+	// (node0 AND node1) so a peer-only-group or `vlan-tags`-spelled inner tag
+	// is rejected here even when THIS commit compiles nodeID alone. Strict
+	// rejects; lenient warns (#1960).
+	qinqWarnings, qinqErr := validateQinQVLANStackAST(tree, opts.lenientQinQVLANStack)
+	if qinqErr != nil {
+		return nil, qinqErr
+	}
+
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 	if err := tree.ExpandGroupsWithVars(vars); err != nil {
 		return nil, fmt.Errorf("apply-groups: %w", err)
@@ -2531,6 +2573,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
+	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
 	return cfg, nil
 }
 

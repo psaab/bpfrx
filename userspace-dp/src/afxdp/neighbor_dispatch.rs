@@ -554,10 +554,33 @@ pub(super) fn learn_dynamic_neighbor(
     // (poll_stages.rs), and the #1769 resolver probe on forwarding
     // miss.
     let mut current: [Option<[u8; 6]>; 2] = [None, None];
+    // #5673: track whether EVERY candidate key is a NEW learn whose shard is
+    // already at the per-shard cap. `get_with_capacity` reads the MAC and the
+    // shard fullness under ONE shard lock (same cost as the former `get`), so
+    // the pre-check pays no extra lock. Starts true and is cleared the moment
+    // any key is already present (an update, not growth) OR any key's shard
+    // still has room (a learnable new key).
+    let mut all_new_at_cap = n > 0;
     for (slot, key) in current.iter_mut().zip(keys[..n].iter()) {
-        *slot = dynamic_neighbors.get(key).map(|entry| entry.mac);
+        let (entry, shard_full) = dynamic_neighbors.get_with_capacity(key);
+        *slot = entry.map(|e| e.mac);
+        if entry.is_some() || !shard_full {
+            all_new_at_cap = false;
+        }
     }
     if !pair_write_needed(&current[..n], src_mac) {
+        return;
+    }
+    // #5673: pure spoofed-source flood — every candidate key is a NEW learn
+    // whose shard is at the per-shard cap, so `learn_pair_if_changed` would
+    // refuse the pair wholesale. Skip the 64-shard `with_all_shards`
+    // acquisition entirely: taking that bulk lock on every flood packet is
+    // the all-shard serialization the M02/#5673 DoS relied on. Account the
+    // refusal so it is observable, exactly like the authoritative refusal in
+    // `learn_pair_if_changed` (which still covers the mixed-key and TOCTOU
+    // cases where a shard fills between this pre-check and the bulk lock).
+    if all_new_at_cap {
+        dynamic_neighbors.note_learn_cap_drop();
         return;
     }
     // #949: multi-ifindex insert atomically vs readers — both

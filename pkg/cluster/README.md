@@ -208,13 +208,40 @@ peer liveness (`lastSeen`) or drive election.
   LOUD (`slog.Error`) rather than emitting cleartext.
 - **Anti-replay.** `session` is a random per-sender-process id and
   `counter` a monotonic per-session counter. `heartbeatAuthReplay.admit`
-  accepts a strictly increasing counter within a session and RE-ANCHORS
-  on a new session id, so a sender restart/reboot (a routine HA event —
-  `make test-failover` reboots a node) is never mistaken for a replay.
-  Intra-session replays are rejected. Cross-session stale replay is a
-  bounded residual (a captured old frame carries stale state that the
-  next genuine heartbeat overwrites within one interval); tightening it
-  belongs to the follow-up channels.
+  remembers a BOUNDED SET of per-session high-water counters
+  (`heartbeatReplaySessions` slots, FIFO eviction). It accepts a strictly
+  increasing counter within any KNOWN session and accepts a genuinely
+  NEW, never-seen session id, so a sender restart/reboot (a routine HA
+  event — `make test-failover` reboots a node) is never mistaken for a
+  replay. Intra-session replays are rejected.
+  **Retired-session replays are rejected (#5477).** The pre-#5477 tracker
+  held exactly ONE `(session, counter)` and RE-ANCHORED on ANY session
+  change, so an on-link attacker who recorded authenticated frames from
+  two incarnations A and B could alternate A→B→A→B indefinitely — each
+  switch reset the single watermark and re-admitted the SAME recorded A
+  frames, refreshing peer liveness and applying their stale role/priority
+  before `handlePeerHeartbeat`. HMAC blocks forging a NEW session but not
+  replaying an already-valid byte sequence. Remembering each retired
+  session's watermark rejects the return to A (its counter cannot exceed
+  the highest the genuine peer ever signed). Session ids are RANDOM
+  (unordered), so a strictly-newer test like `fullSetSeqGuard` cannot be
+  used — a bounded per-session watermark is the mechanism that separates a
+  real reboot (new id) from a replay of a retired incarnation (known id,
+  no counter advance). **Bound safety and its honest limit:** the ring
+  RAISES the on-link replay attacker's cost — from 2 recorded incarnations
+  (the pre-#5477 A→B→A loop) to `heartbeatReplaySessions`+1 — but is NOT an
+  absolute bar. Eviction is FIFO and is triggered by ANY never-seen session,
+  INCLUDING a REPLAYED old frame whose session is not currently in the ring:
+  admit() treats it as never-seen, re-records it, and evicts the oldest.
+  FIFO always leaves exactly one just-evicted session to replay back in as
+  never-seen, so an attacker who captured `heartbeatReplaySessions`+1 (= 65)
+  or more distinct incarnations can churn the ring by REPLAY ALONE (no
+  reboot, no minting) and SUSTAIN the replay indefinitely; with fewer than
+  65 recordings every retired-session replay is rejected. A complete fix
+  needs a boot-epoch / monotonic-across-reboot counter carried in the frame
+  (a wire change) — tracked as a follow-up. The map still causes NO
+  genuine-peer lockout (an evicted live watermark just makes the peer's next
+  frame never-seen → admitted) and cannot grow memory (fixed 64 slots).
 - **Dual-accept (rolling upgrade), `heartbeatAuthDecision`.** Mirrors
   the #4126 VRRP-checksum dual-accept migration:
   - No local key → accept everything (this node cannot verify; may be

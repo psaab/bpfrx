@@ -216,7 +216,9 @@ func (s *SessionSync) PendingBulkAck() (epoch uint64, age time.Duration, ok bool
 }
 
 // TransferReadiness snapshots the sync state that makes manual failover
-// timing-sensitive: an unacked outbound bulk or an in-progress inbound bulk.
+// timing-sensitive: an unacked outbound bulk, an in-progress inbound bulk, or
+// (#5563) a config-stale standby that has received a newer config generation
+// from the peer than it has successfully applied.
 func (s *SessionSync) TransferReadiness() TransferReadinessSnapshot {
 	snap := TransferReadinessSnapshot{
 		Connected: s.stats.Connected.Load(),
@@ -230,6 +232,13 @@ func (s *SessionSync) TransferReadiness() TransferReadinessSnapshot {
 	snap.BulkReceiveEpoch = s.bulkRecvEpoch
 	snap.BulkReceiveSessions = len(s.bulkRecvV4) + len(s.bulkRecvV6)
 	s.bulkMu.Unlock()
+	// #5563: config-sync generations for the planned-failover staleness gate.
+	// PeerConfigGen is the highest generation received from the peer (its
+	// current committed config as observed here); AppliedConfigGen is the
+	// highest generation successfully applied. A receiver behind the primary
+	// (PeerConfigGen > AppliedConfigGen) is refused promotion.
+	snap.PeerConfigGen = s.lastRecvConfigGen.Load()
+	snap.AppliedConfigGen = s.lastAppliedConfigGen.Load()
 	return snap
 }
 

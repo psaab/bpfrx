@@ -1,0 +1,197 @@
+package cluster
+
+// Pre-auth connection admission for the session-sync accept path (#5303).
+//
+// #4370 made the accept loop spawn a per-connection setup goroutine so a slow
+// handshake on ONE connection can no longer stall accepting the NEXT. That fix
+// is preserved. Its residual, closed here, is that there was NO aggregate cap
+// on how many connections could be in pre-auth setup at once: a host reachable
+// on the sync/control network could open connections at rate R and stall each
+// before authentication. Each stalled connection held a tracked goroutine, a
+// 256 KiB read+write buffered socket (configureSessionSyncConn ran BEFORE the
+// handshake), and an FD until its handshake deadline — steady-state ~3*R
+// in-flight until FDs/goroutines/socket-memory exhausted and a LEGITIMATE peer
+// could no longer reconnect (and Stop waited on every stalled setup goroutine).
+// The HMAC handshake (sync_auth.go) stops a flooder from becoming the active
+// peer, but it runs AFTER the buffers are sized, so it does not bound the
+// resource cost of the flood.
+//
+// The gate has three parts, all cheap and all preserving the #4107 handshake
+// and the #4370 parallel accept:
+//
+//  1. A small admission cap on inbound pre-auth setups (preAuthSetupCap), with
+//     a reserved tail (preAuthPeerReserve) that only the configured peer's
+//     address may consume — so a flood from any other source can never deny the
+//     peer a reconnect slot (the DoS-denies-reconnect property). Excess
+//     connections are closed immediately and bump a rate-limited counter.
+//  2. Deferral of the large socket-buffer sizing until AFTER the handshake
+//     succeeds (handleNewConnection), so pre-auth sockets stay cheap.
+//  3. Tracking of every in-flight setup connection so Stop() can close them and
+//     unblock a stalled handshake instead of hanging on the shutdown budget.
+
+import (
+	"log/slog"
+	"net"
+	"net/netip"
+	"time"
+)
+
+const (
+	// preAuthSetupCap bounds the total inbound sync connections in pre-auth
+	// setup at once. The cluster has at most one real peer opening at most two
+	// fabric connections, so this is generous headroom for legitimate traffic
+	// while capping a flood far below FD/goroutine/socket-memory exhaustion.
+	preAuthSetupCap = 8
+	// preAuthPeerReserve is the tail of preAuthSetupCap reserved for connections
+	// arriving from the configured peer address. A flood from any OTHER source
+	// can consume at most preAuthSetupCap-preAuthPeerReserve slots, so the
+	// legitimate peer always retains capacity to reconnect. Sized for the peer's
+	// two fabric connections.
+	preAuthPeerReserve = 2
+)
+
+// configureConnFn is indirected so tests can bind the #5303 buffer-deferral:
+// the large (256 KiB) session-sync socket buffers must not be sized until AFTER
+// the auth handshake succeeds. Production points it at configureSessionSyncConn.
+var configureConnFn = configureSessionSyncConn
+
+// beginSetup admits a connection into its pre-auth setup window and registers
+// it for shutdown cleanup. For an inbound connection it enforces the #5303
+// admission cap — reserving preAuthPeerReserve slots for the configured peer —
+// and returns false when the applicable limit is reached, so the caller closes
+// the excess connection immediately (before any large buffer is allocated). An
+// outbound connection (our own dial, bounded to one per fabric) is never capped;
+// it is only registered so Stop() can close it if it stalls in the handshake.
+// finishSetup releases the slot/registration once the handshake resolves.
+func (s *SessionSync) beginSetup(conn net.Conn, inbound bool) bool {
+	s.preAuthMu.Lock()
+	defer s.preAuthMu.Unlock()
+	if inbound {
+		limit := preAuthSetupCap
+		if !s.isPeerRemote(conn) {
+			limit = preAuthSetupCap - preAuthPeerReserve
+		}
+		if s.preAuthInFlight >= limit {
+			return false
+		}
+		s.preAuthInFlight++
+	}
+	if s.setupConns == nil {
+		s.setupConns = make(map[net.Conn]bool)
+	}
+	s.setupConns[conn] = inbound // value == holds-a-counted-inbound-slot
+	return true
+}
+
+// finishSetup ends a connection's pre-auth setup window: it unregisters the
+// connection and, if it held a counted inbound admission slot, frees it. It is
+// called exactly once per connection right after the handshake returns (success
+// or failure), so an admitted slot is held only for the brief pre-auth window,
+// never through the subsequent (potentially slow) bulk sync. Idempotent: a
+// second call (e.g. after closeSetupConns already dropped the entry) is a no-op.
+func (s *SessionSync) finishSetup(conn net.Conn) {
+	s.preAuthMu.Lock()
+	defer s.preAuthMu.Unlock()
+	counted, ok := s.setupConns[conn]
+	if !ok {
+		return
+	}
+	delete(s.setupConns, conn)
+	if counted && s.preAuthInFlight > 0 {
+		s.preAuthInFlight--
+	}
+}
+
+// closeSetupConns closes every connection currently in its pre-auth setup
+// window so a stalled handshake read unblocks and its setup goroutine exits.
+// Called from Stop() before waiting on the goroutine group so shutdown never
+// hangs on a pre-auth connection a flooder opened and abandoned (#5303). It does
+// not mutate preAuthInFlight/setupConns — each goroutine's own finishSetup does
+// that as it unwinds — so the close is idempotent with a racing finishSetup.
+func (s *SessionSync) closeSetupConns() {
+	s.preAuthMu.Lock()
+	conns := make([]net.Conn, 0, len(s.setupConns))
+	for c := range s.setupConns {
+		conns = append(conns, c)
+	}
+	s.preAuthMu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
+// notePreAuthRejected records a #5303 pre-auth admission rejection and logs at
+// most ~1/sec so a sustained flood cannot itself become a log flood. The
+// rate-independent observable is the PreAuthRejected counter (surfaced in sync
+// stats), not this log line.
+func (s *SessionSync) notePreAuthRejected(conn net.Conn) {
+	s.stats.PreAuthRejected.Add(1)
+	now := MonotonicNanos()
+	last := s.preAuthLogMono.Load()
+	if now-last >= int64(time.Second) && s.preAuthLogMono.CompareAndSwap(last, now) {
+		slog.Warn("cluster sync: pre-auth admission cap reached, dropping connection",
+			"remote", connRemoteAddrString(conn), "cap", preAuthSetupCap,
+			"reserve", preAuthPeerReserve, "rejected_total", s.stats.PreAuthRejected.Load())
+	}
+}
+
+// isPeerRemote reports whether conn's remote IP matches a configured peer fabric
+// address. The reservation matches on IP only — the peer dials from an ephemeral
+// source port — so a flood from any other host cannot consume the peer's
+// reserved admission slots. An attacker who can source-spoof the exact peer IP
+// could reach the reserved tail, but that is a strictly harder attack and still
+// cannot pass the HMAC handshake; the general-pool cap already bounds the total
+// resource cost. Reads immutable construction-time config; the caller holds
+// preAuthMu for lock-discipline uniformity, not because the read needs it.
+func (s *SessionSync) isPeerRemote(conn net.Conn) bool {
+	ip := remoteIPOf(conn)
+	if !ip.IsValid() {
+		return false
+	}
+	if peer := peerIPOf(s.peerAddr); peer.IsValid() && peer == ip {
+		return true
+	}
+	if s.peerAddr1 != "" {
+		if peer := peerIPOf(s.peerAddr1); peer.IsValid() && peer == ip {
+			return true
+		}
+	}
+	return false
+}
+
+// remoteIPOf extracts the remote IP from a connection, tolerating a nil conn/
+// addr and non-"ip:port" address string forms. Returns the zero Addr on failure.
+func remoteIPOf(conn net.Conn) netip.Addr {
+	if conn == nil {
+		return netip.Addr{}
+	}
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return netip.Addr{}
+	}
+	return parseAddrIP(addr.String())
+}
+
+// peerIPOf extracts the IP from a configured "host:port" peer address string.
+func peerIPOf(addr string) netip.Addr {
+	if addr == "" {
+		return netip.Addr{}
+	}
+	return parseAddrIP(addr)
+}
+
+// parseAddrIP parses an IP from an "ip:port" or bare "ip" string, returning the
+// unmapped IP (so a v4-in-v6 form compares equal to the plain v4 config).
+func parseAddrIP(s string) netip.Addr {
+	if ap, err := netip.ParseAddrPort(s); err == nil {
+		return ap.Addr().Unmap()
+	}
+	host := s
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		host = h
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.Unmap()
+	}
+	return netip.Addr{}
+}

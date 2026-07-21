@@ -223,6 +223,7 @@ pub(crate) fn run() -> Result<(), String> {
             pending_neigh_duplicate_drops_total: 0,
             pending_neigh_decap_drops_total: 0,
             pending_neigh_capacity_drops_total: 0,
+            dynamic_neighbor_learn_cap_drops_total: 0,
             session_publish_errors_total: 0,
             dnat_publish_errors_total: 0,
             synced_import_cap_drops_total: 0,

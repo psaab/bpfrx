@@ -57,6 +57,21 @@ the userspace dataplane admission boundary is in
   `syn-cookie` is ON, the alarm-threshold measurement, and the #3315 sketch
   deliberately stay on the count-all sliding-window `RateCounter` (there
   "admitted" means "skip the cookie / alarm / per-IP cap").
+- **Dynamic-neighbor map cap (#5673, pre-policy DoS bound)**: source-address
+  learning runs on RX (`stage_parse_flow_and_learn`) BEFORE screen/policy
+  admission, so a spoofed-source flood on an untrusted segment could otherwise
+  grow the shared `dynamic_neighbors` map by one entry per distinct fake
+  source (memory) and serialize every worker on the 64-shard `with_all_shards`
+  bulk lock (CPU) WITHOUT passing any policy check. The map now enforces a
+  per-shard cap (`MAX_DYNAMIC_NEIGHBORS_PER_SHARD`, aggregate
+  `MAX_DYNAMIC_NEIGHBORS`, `afxdp/sharded_neighbor.rs`): a NEW data-path learn
+  whose target shard is full is refused (the packet still forwards — a
+  learn-path guard, not a packet filter), while an UPDATE to an already-learned
+  neighbor (a real MAC failover) and the authoritative control-plane /
+  on-demand-resolver installs are never capped. The RX-learn caller
+  short-circuits the bulk lock once its pre-check sees every candidate key
+  new-and-at-cap, so a steady flood no longer serializes the shards. Refusals
+  are surfaced as `xpf_userspace_dynamic_neighbor_learn_cap_drops_total`.
 - **Firewall filters**: policer (token bucket + three-color), lo0 filter,
   flexible match, port ranges, hit counters, logging, forwarding-class
   DSCP rewrite.

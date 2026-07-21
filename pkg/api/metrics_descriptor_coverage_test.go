@@ -551,6 +551,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_pending_neigh_duplicate_drops_total",                // #1782 cold-start H5
 		"xpf_userspace_pending_neigh_decap_drops_total",                    // #1902 decap-refusal gate
 		"xpf_userspace_pending_neigh_capacity_drops_total",                 // #2375 distinct-hop exhaustion
+		"xpf_userspace_dynamic_neighbor_learn_cap_drops_total",             // #5673 neighbor-map cap (pre-policy flood bound)
 		"xpf_userspace_dynamic_neighbor_present",                           // #1782 cold-start H2 dump
 		"xpf_userspace_session_publish_errors_total",                       // #1789 publish failures
 		"xpf_userspace_dnat_publish_errors_total",                          // #2244 dnat_table reverse-NAT publish failures
