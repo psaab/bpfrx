@@ -546,15 +546,18 @@ SSH in by password or key. `reconcileAbsentLoginUsers`
 `reconcileSudoers`, runs **unconditionally** on every apply (including
 the "all users removed" case):
 
-1. Enumerate `/var/lib/xpf/provisioned-users/` — the accounts xpf
-   actually provisioned (the UID-keyed provenance markers, #1944 §5.4).
-2. For each marked username **no longer present** in
-   `system login { user ... }`, and **only** while the marker's recorded
-   UID still equals the account's current `/etc/passwd` UID
-   (`xpfProvisioned`): **lock** the password (`<user>:!` via
-   `chpasswd -e`, idempotent — skipped if already locked) and **remove**
-   the xpf-managed `/home/<user>/.ssh/authorized_keys`, then drop the
-   provenance marker so xpf forgets the account.
+1. Enumerate the **union** of the three ownership roots (`provisionedNames`,
+   #5841) — every account xpf provisioned any resource for (registry,
+   password, or key marker).
+2. For each such username **no longer present** in
+   `system login { user ... }`, and **only** while a marker's recorded UID
+   still equals the account's current `/etc/passwd` UID: **lock** the
+   password (`<user>:!` via `chpasswd -e`, idempotent — skipped if already
+   locked) **iff** xpf set it (`passwordProvisioned`) and **remove** the
+   xpf-managed `/home/<user>/.ssh/authorized_keys` **iff** xpf wrote it
+   (`keyProvisioned`), then drop all provenance markers so xpf forgets the
+   account. An operator-managed credential xpf did not provision is left
+   intact (#5841).
 
 The path is scoped and fail-closed:
 
@@ -601,13 +604,14 @@ revoked key still permitted login. `applySystemLogin` now reconciles the
 empty-key-list case in the matching `else` branch: when a configured user
 has no keys, it removes the xpf-managed
 `/home/<user>/.ssh/authorized_keys` so key-based login is revoked. The
-removal is gated on the same UID-keyed provenance marker
-(`xpfProvisioned`) as the removal path above — xpf only deletes a key file
-it wrote wholesale, never a pre-existing / out-of-band user's
-operator-installed keys — and is idempotent (an already-absent file is a
-no-op). The password directive and the SSH keys remain independent: this
-branch touches only `authorized_keys`, and removing the
-`encrypted-password` directive still only locks the password.
+removal is gated on the **SSH-key** provenance marker (`keyProvisioned`,
+#5841) — xpf only deletes a key file **it wrote** wholesale, never a
+pre-existing / out-of-band user's operator-installed keys, and **not** merely
+because xpf set the account's password — and is idempotent (an already-absent
+file is a no-op; the key marker is dropped once the file is gone). The password
+directive and the SSH keys remain independent: this branch touches only
+`authorized_keys`, and removing the `encrypted-password` directive still only
+locks the password.
 
 ### Scope — only xpf-managed accounts
 
@@ -615,11 +619,12 @@ The per-user lock-on-removal applies **only to the exact account xpf
 provisioned**, and never to accounts absent from config (xpf does not
 deprovision/`userdel` accounts). `root` is handled by its own
 `applyRootAuth` reconcile (see "Root credentials are revoked on removal
-(#5276)"), not this per-user path. Provenance is tracked by
-a per-user marker file under `/var/lib/xpf/provisioned-users/<name>`
-whose content is the account's numeric **UID** at the time xpf wrote
-its password (written on both `useradd` and a successful
-`encrypted-password` apply).
+(#5276)"), not this per-user path. Provenance is tracked by UID-keyed marker
+files whose content is the account's numeric **UID**: an account **registry**
+entry under `/var/lib/xpf/provisioned-users/<name>` (written on `useradd` and a
+successful password apply), plus **resource-specific** password- and
+SSH-key-ownership markers that gate the respective revocations (#5841, see
+"Resource-specific, atomic credential ownership" above).
 
 - **Leave then rejoin the same account**: the UID is unchanged, so the
   marker matches and the lock fires — the old password is revoked.
@@ -666,14 +671,16 @@ machinery keyed on the account name `root` / **UID 0**:
   never wrote is left untouched (provenance-scoped removal, never a
   hand-placed key).
 
-Provenance uses the **same** UID-keyed marker as the per-user path — a
-single `/var/lib/xpf/provisioned-users/root` file (`markProvisioned` /
-`xpfProvisioned` with UID 0) — recorded on **either** a root password
-apply **or** a root key apply, so a **keys-only** `root-authentication`
-(no `encrypted-password`) is still revocable. The one marker gates both
-revocations, mirroring the one-marker-per-principal scheme the login-user
-reconcilers use. The non-root `reconcileAbsentLoginUsers` /
-`applySystemLogin` loops still **skip** `root` entirely — root is
+Provenance uses the **same resource-specific** UID-keyed markers as the
+per-user path, with UID 0 (#5841): a root **password** marker
+(`passwordProvisioned("root", 0)`) gates the password lock, a root **key**
+marker (`keyProvisioned("root", 0)`) gates the key removal, and the account
+**registry** entry (`markProvisioned("root", 0)`) keeps root enumerated by the
+factory-reset teardown. A **keys-only** `root-authentication` (no
+`encrypted-password`) writes only the key + registry markers, so it is
+revocable **and** can never lock an out-of-band root password. The non-root
+`reconcileAbsentLoginUsers` / `applySystemLogin` loops still **skip** `root`
+entirely — root is
 governed solely by this dedicated `applyRootAuth` path.
 
 **Safety.** The marker gate is the fresh-boot lifeline: an appliance that
@@ -682,16 +689,69 @@ governed solely by this dedicated `applyRootAuth` path.
 `_never revoke what xpf did not provision_` invariant the per-user path
 enforces. On typical images root's shadow field is already `!`
 (distro-locked), so `isLockedShadow` makes the lock a no-op there.
-Re-adding `root-authentication` restores the password/keys. The one
-residual edge — a keys-only root-authentication whose root password was
-set **out-of-band** (outside xpf, not a Junos concept), then the stanza
-removed — will lock that out-of-band password; this fails **safe** (more
-restrictive, recovery mode still works) and matches the declarative
-intent of removing root-authentication.
+Re-adding `root-authentication` restores the password/keys. Since #5841 the
+prior residual edge is closed: a **keys-only** root-authentication writes no
+password marker, so removing it revokes only the keys and **never** locks an
+out-of-band root password xpf did not set (the password lock is gated on the
+password marker, not the account/key marker).
 
 **Idempotent.** Re-applying with the stanza still absent re-locks nothing
 (the shadow field is already `!` → `pwNoop`) and removes nothing (the key
 file is already gone → `os.Remove` `NotExist` no-op).
+
+## Resource-specific, atomic credential ownership (#5841)
+
+Before #5841 a **single** per-account provenance marker
+(`/var/lib/xpf/provisioned-users/<name>`) carried the whole ownership
+contract, which was wrong in two security-relevant ways:
+
+- **Coarse (overclaim).** The one marker was treated as proof that xpf
+  owned **both** the password and the SSH key. So if xpf provisioned only
+  a user's **password** (marker present) while the operator kept their own
+  `authorized_keys`, emptying that user's key list — or removing the user —
+  let the emptied-key / deprovision reconcilers **delete an operator key
+  file xpf never wrote**. For `root`, a keys-only `root-authentication`
+  could likewise lock an out-of-band root **password**.
+- **Best-effort (underclaim).** The marker was written **after** a
+  successful credential mutation, and a marker-write failure was **logged
+  and swallowed**. That left a live credential xpf had set but could no
+  longer identify — so a later directive removal could **not** lock/clean
+  it, and it survived a factory reset un-rediscoverable.
+
+Ownership is now tracked **per resource**, in sibling marker roots that use
+the **same UID-file format** as the account registry:
+
+| Root | Meaning | Gates |
+|---|---|---|
+| `/var/lib/xpf/provisioned-users/<name>` | account/enumeration **registry** — which accounts xpf manages | `reconcileAbsentLoginUsers` + factory-reset teardown enumeration |
+| `/var/lib/xpf/provisioned-passwords/<name>` | xpf set the `/etc/shadow` **password** | the declarative D2 password **lock** (`passwordProvisioned`) |
+| `/var/lib/xpf/provisioned-keys/<name>` | xpf wrote the **`authorized_keys`** | the key-file **removal** (`keyProvisioned`) |
+
+- **Resource-specific revocation.** The password lock consults **only** the
+  password marker; the key removal consults **only** the key marker. Setting
+  a password never claims the key file, so an operator-installed
+  `authorized_keys` is left untouched. This holds for `root` too — a
+  keys-only stanza writes only the key (and registry) marker, never the
+  password marker, so it can never lock an out-of-band root password.
+- **Marker-first atomicity (fail-visible).** Each resource marker is written
+  **before** its credential mutation. If the durable marker cannot be
+  written, the mutation is **skipped** (logged, retried next apply) rather
+  than performed and swallowed — so xpf never leaves a mutated-but-unmarked
+  credential. Because the applies are idempotent (`chpasswd` reads
+  `/etc/shadow`; the key write compares content), a transient marker failure
+  simply defers to the next commit.
+- **Union enumeration.** `reconcileAbsentLoginUsers` deprovisions the
+  **union** of all three roots (`provisionedNames`), so a pre-existing
+  account xpf only added an SSH key to (key marker, no registry entry) is
+  still revoked when removed from config — while its password (which xpf
+  never set) is left alone.
+- **Registry format unchanged.** The account registry
+  (`/var/lib/xpf/provisioned-users`) keeps its exact location and UID-file
+  format, so the factory-reset teardown (`pkg/grpcapi` `zeroize`, #4598/#5520)
+  that enumerates it and `userdel`s xpf-provisioned accounts is untouched.
+- **Marker override seam.** The two resource roots are computed as siblings
+  of `provisionedUsersDir`, so pointing that one package var at a throwaway
+  tree relocates all three roots together in tests.
 
 ## Idempotency
 
@@ -720,5 +780,8 @@ leave root-owned `0600` keys that sshd refuses (EACCES → lockout). If the
 owner cannot be resolved the write is SKIPPED (retried next apply) rather
 than degrading to that unsafe root-owned path. The enclosing `.ssh`
 directory is created with `fsatomic.MkdirAllDurable` so the directory
-entry itself also survives a power cut. The provisioned-users marker
-(`markProvisioned`) is likewise DurableState.
+entry itself also survives a power cut. All three provenance markers — the
+account registry and the #5841 password/key resource markers — are likewise
+DurableState (`writeProvenanceMarker`), and each is written **before** its
+credential mutation (marker-first) so a marker-write failure skips the
+mutation rather than leaving it unmarked.
