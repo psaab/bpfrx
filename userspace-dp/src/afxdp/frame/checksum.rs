@@ -40,8 +40,13 @@ pub(in crate::afxdp::frame) enum ChecksumFamily {
 /// never carry ICMPv6, and the IPv4 NAT adjust paths call the v4 helpers
 /// without protocol filtering, so a stray ICMPv6 arm would adjust at
 /// `ihl + 2` for protocol 58 instead of no-op'ing — a live behavior change.
+// #4965: re-exported to `frame::mod` so the generic-rewrite preflight
+// validator (`validate_generic_rewrite_v4`) derives the L4-checksum-field
+// bound from the SAME per-protocol SSOT the mutation half uses — the
+// preflight's "is the L4 checksum in bounds" gate can never drift from
+// where the checksum adjust actually writes.
 #[inline(always)]
-fn l4_checksum_field_delta_v4(protocol: u8) -> Option<usize> {
+pub(in crate::afxdp::frame) fn l4_checksum_field_delta_v4(protocol: u8) -> Option<usize> {
     match protocol {
         PROTO_TCP => Some(16),
         PROTO_UDP => Some(6),
@@ -52,8 +57,10 @@ fn l4_checksum_field_delta_v4(protocol: u8) -> Option<usize> {
 /// Per-protocol delta of the L4 checksum field from the start of the IPv6
 /// L4 header (add the fixed 40-byte IPv6 header to get the packet offset).
 /// `None` => no adjusted L4 checksum field (unknown) → caller no-ops.
+// #4965: re-exported alongside the v4 helper (same SSOT rationale) for the
+// generic-rewrite preflight's v6 L4-checksum bound.
 #[inline(always)]
-fn l4_checksum_field_delta_v6(protocol: u8) -> Option<usize> {
+pub(in crate::afxdp::frame) fn l4_checksum_field_delta_v6(protocol: u8) -> Option<usize> {
     match protocol {
         PROTO_TCP => Some(16),
         PROTO_UDP => Some(6),

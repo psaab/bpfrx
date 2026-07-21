@@ -388,21 +388,23 @@ fn pin_packet(v6: bool, protocol: u8, ttl: u8, ext: Vec<ExtHdr>) -> ValidPacket 
     })
 }
 
-/// (a) TTL/hop-limit ≤ 1 → both paths decline.
+/// (a) TTL/hop-limit ≤ 1 → both paths decline, BOTH transactionally.
 ///
-/// The GENERIC path (`rewrite_forwarded_frame_in_place`) is the TERMINAL
-/// fallback: it writes the Ethernet header during `rewrite_prepare_eth`
-/// BEFORE its TTL validation, so its L2 header IS scribbled on decline —
-/// harmless because nothing reprocesses the frame after the terminal
-/// `None`. Hence the generic assertion checks L3+ only.
-///
-/// The DESCRIPTOR path is now TRANSACTIONAL (#5466): its bail gates run
+/// BOTH in-place rewrites are now TRANSACTIONAL: their bail gates run
 /// against the pristine frame BEFORE `rewrite_commit_eth_from_plan`
 /// mutates anything, so a `None` return leaves the ENTIRE frame (L2
-/// included) byte-identical — required because the caller chains
-/// `apply_rewrite_descriptor(...).or_else(generic)` and a scribbled L2 /
-/// shifted payload would corrupt the generic reprocessing. The descriptor
-/// assertion therefore checks the full frame (FAIL-ON-REVERT for #5466).
+/// included) byte-identical — required because the callers re-read the
+/// SAME UMEM after a decline (the flow cache chains
+/// `apply_rewrite_descriptor(...).or_else(generic)` then reprocesses via
+/// `build_live_forward_request_from_frame`; `tx/dispatch` reprocesses via
+/// `build_forwarded_frame_from_frame(source_frame)`), and a scribbled L2 /
+/// shifted payload would corrupt that reprocessing.
+///   - DESCRIPTOR path (`apply_rewrite_descriptor`): #5466.
+///   - GENERIC path (`rewrite_forwarded_frame_in_place`): #4965 — the
+///     `validate_generic_rewrite_v4/v6` preflight now runs the TTL gate
+///     before the eth commit, so its L2 is NO LONGER scribbled on decline.
+/// Both assertions therefore check the FULL frame (FAIL-ON-REVERT for
+/// #5466 descriptor + #4965 generic).
 #[test]
 fn pin_ttl_expired_declines_l3_untouched() {
     for v6 in [false, true] {
@@ -426,9 +428,10 @@ fn pin_ttl_expired_declines_l3_untouched() {
         );
         let after = area.slice(DIFF_ADDR, pkt.frame.len()).unwrap();
         assert_eq!(
-            &after[pkt.l3..],
-            &pkt.frame[pkt.l3..],
-            "generic decline must leave L3+ untouched (v6={v6})"
+            after,
+            &pkt.frame[..],
+            "#4965: generic TTL decline must be transactional — full frame \
+             byte-identical, incl. L2 (v6={v6})"
         );
 
         let area = area_with_frame(&pkt.frame);
@@ -443,6 +446,185 @@ fn pin_ttl_expired_declines_l3_untouched() {
             &pkt.frame[..],
             "descriptor TTL decline must be transactional (#5466): \
              full frame byte-identical, incl. L2 (v6={v6})"
+        );
+    }
+}
+
+/// #4965 FAIL-ON-REVERT: the generic in-place rewrite
+/// (`rewrite_forwarded_frame_in_place`) is transactional — for EVERY decline
+/// reason the full UMEM frame AND a sentinel region around it stay
+/// byte-identical. Before #4965 `rewrite_prepare_eth` committed the eth header
+/// (and, on the no-headroom VLAN push, the payload `copy_within` memmove) and
+/// `apply_nat_ipv4/v6` wrote IP/port bytes BEFORE their fallible checks, so a
+/// decline left a scribbled L2 / shifted payload / partial NAT+checksum — which
+/// the flow-cache `.or_else(generic)` fallback and the tx-dispatch
+/// `build_forwarded_frame_from_frame(source_frame)` reinject then re-read as a
+/// corrupt packet. Reverting the preflight (commit-before-check) makes an
+/// assertion FAIL: the mutated bytes differ from the input.
+///
+/// Covers: TTL/hop-limit expiry (v4/v6), malformed IHL, truncated L4 checksum
+/// with an ADDRESS NAT (old code writes the IP address then declines at the L4
+/// checksum adjust — the "partially-adjusted NAT+checksum" corruption, v4/v6),
+/// the VLAN-push-no-headroom memmove path (the worst manifestation — a pre-check
+/// memmove shifts the payload), and the descriptor-declines-then-`.or_else`
+/// chain. (Unknown-address-family declines in `rewrite_eth_params` before any
+/// byte is touched, so it was already atomic and is not a revert-sensitive
+/// case.)
+#[test]
+fn declined_rewrite_leaves_umem_byte_identical_4965() {
+    const SENTINEL: u8 = 0xA5;
+    const AREA: usize = 4096;
+
+    // A SENTINEL-filled area with the frame at DIFF_ADDR; returns the area and
+    // a whole-area snapshot so a decline can be checked against the ENTIRE area
+    // (frame region unchanged + the surrounding sentinel intact — catches any
+    // OOB write leaked past the frame).
+    fn sentinel_area(frame: &[u8]) -> (MmapArea, Vec<u8>) {
+        let mut area = MmapArea::new(AREA).expect("mmap");
+        for b in area.slice_mut(0, AREA).unwrap().iter_mut() {
+            *b = SENTINEL;
+        }
+        area.slice_mut(DIFF_ADDR, frame.len())
+            .unwrap()
+            .copy_from_slice(frame);
+        let snapshot = area.slice(0, AREA).unwrap().to_vec();
+        (area, snapshot)
+    }
+
+    fn assert_generic_declines_untouched(pkt: &ValidPacket, nat: NatDecision, label: &str) {
+        let (area, snapshot) = sentinel_area(&pkt.frame);
+        let desc = XdpDesc {
+            addr: DIFF_ADDR as u64,
+            len: pkt.frame.len() as u32,
+            options: 0,
+        };
+        let decision = make_decision(pkt, nat, 0);
+        assert!(
+            rewrite_forwarded_frame_in_place(&area, desc, pkt.meta, &decision, false, None)
+                .is_none(),
+            "generic must decline: {label}"
+        );
+        assert_eq!(
+            area.slice(0, AREA).unwrap(),
+            &snapshot[..],
+            "#4965: declined generic rewrite must leave UMEM byte-identical (frame + sentinel): {label}"
+        );
+    }
+
+    // (1) TTL / hop-limit ≤ 1 — v4 + v6, with a port NAT decision present.
+    for v6 in [false, true] {
+        let pkt = pin_packet(v6, PROTO_TCP, 1, Vec::new());
+        let nat = NatDecision {
+            rewrite_src_port: Some(0x3333),
+            ..NatDecision::default()
+        };
+        assert_generic_declines_untouched(&pkt, nat, if v6 { "ttl v6" } else { "ttl v4" });
+    }
+
+    // (2) Malformed IHL (v4): drop the IHL nibble below 5 (< 20 bytes).
+    {
+        let mut pkt = pin_packet(false, PROTO_TCP, 64, Vec::new());
+        pkt.frame[pkt.l3] = 0x44; // version 4, IHL 4 → 16 bytes < 20
+        assert_generic_declines_untouched(&pkt, NatDecision::default(), "malformed ihl");
+    }
+
+    // (3) Truncated L4 checksum field with an ADDRESS NAT. Under the reverted
+    //     (commit-before-check) code the eth header is committed and
+    //     `apply_nat_ipv4/v6` WRITES the new IP source, THEN declines at the L4
+    //     checksum adjust (`packet.get(csum_off..csum_off+2)` OOB) — leaving a
+    //     scribbled L2 + partially-rewritten IP. The preflight declines first.
+    {
+        // v4: keep the full IPv4 header (20) but only 16 L4 bytes → the TCP
+        // checksum at ihl+16 (=36) needs 38 bytes of L3 payload; we give 36.
+        let mut pkt = pin_packet(false, PROTO_TCP, 64, Vec::new());
+        pkt.frame.truncate(pkt.l3 + 36);
+        let nat = NatDecision {
+            rewrite_src: Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7))),
+            ..NatDecision::default()
+        };
+        assert_generic_declines_untouched(&pkt, nat, "v4 truncated l4 csum + addr nat");
+    }
+    {
+        // v6: keep the fixed 40-byte header but only 16 L4 bytes → the TCP
+        // checksum at rel_l4+16 (=56) needs 58 bytes of L3 payload; give 56.
+        let mut pkt = pin_packet(true, PROTO_TCP, 64, Vec::new());
+        pkt.frame.truncate(pkt.l3 + 56);
+        let nat = NatDecision {
+            rewrite_src: Some(IpAddr::V6("2001:db8::7".parse().unwrap())),
+            ..NatDecision::default()
+        };
+        assert_generic_declines_untouched(&pkt, nat, "v6 truncated l4 csum + addr nat");
+    }
+
+    // (4) VLAN-push-no-headroom memmove path + a TTL decline — the worst
+    //     manifestation. Under the reverted code the commit `copy_within`
+    //     SHIFTS the L3 payload by 4 (and writes the new eth header) BEFORE the
+    //     TTL gate declines, so the fallback reprocesses a doubly-shifted frame.
+    {
+        const FRAME_BASE: usize = 4096; // == UMEM_FRAME_SIZE
+        const BIG: usize = 8192;
+        let pkt = pin_packet(false, PROTO_TCP, 1, Vec::new()); // no VLAN → l3 = 14, TTL=1
+        let mut area = MmapArea::new(BIG).expect("mmap");
+        for b in area.slice_mut(0, BIG).unwrap().iter_mut() {
+            *b = SENTINEL;
+        }
+        area.slice_mut(FRAME_BASE, pkt.frame.len())
+            .unwrap()
+            .copy_from_slice(&pkt.frame);
+        let snapshot = area.slice(0, BIG).unwrap().to_vec();
+        let desc = XdpDesc {
+            addr: FRAME_BASE as u64,
+            len: pkt.frame.len() as u32,
+            options: 0,
+        };
+        // tx_vlan_id = 100 → target eth_len 18 → VLAN push; rx-4 leaves the
+        // UMEM chunk → VlanPushMemmoveNoHeadroom (the memmove path).
+        let decision = make_decision(&pkt, NatDecision::default(), 100);
+        assert!(
+            rewrite_forwarded_frame_in_place(&area, desc, pkt.meta, &decision, false, None)
+                .is_none(),
+            "generic must decline TTL≤1 on the vlan-push memmove path"
+        );
+        assert_eq!(
+            area.slice(0, BIG).unwrap(),
+            &snapshot[..],
+            "#4965: memmove-path decline must NOT shift the payload or scribble L2"
+        );
+    }
+
+    // (5) The descriptor-declines-then-`.or_else(generic)` chain (exactly the
+    //     flow-cache composition). A non-first fragment makes the descriptor
+    //     path decline (transactional per #5466); TTL≤1 makes the generic
+    //     fallback decline. Both must be atomic so the chained `None` leaves
+    //     the frame pristine for the caller's subsequent reprocessing.
+    {
+        let mut pkt = pin_packet(false, PROTO_TCP, 1, Vec::new()); // TTL = 1
+        let l3 = pkt.l3;
+        pkt.frame[l3 + 6] = 0x00;
+        pkt.frame[l3 + 7] = 0x10; // fragment-offset nonzero → non-first fragment
+        let (area, snapshot) = sentinel_area(&pkt.frame);
+        let desc = XdpDesc {
+            addr: DIFF_ADDR as u64,
+            len: pkt.frame.len() as u32,
+            options: 0,
+        };
+        let nat = NatDecision {
+            rewrite_src_port: Some(0x3333),
+            ..NatDecision::default()
+        };
+        let rd = make_descriptor(&pkt, nat, 0);
+        let decision = make_decision(&pkt, nat, 0);
+        let result = apply_rewrite_descriptor(&area, desc, pkt.meta, &rd, None).or_else(|| {
+            rewrite_forwarded_frame_in_place(&area, desc, pkt.meta, &decision, false, None)
+        });
+        assert!(
+            result.is_none(),
+            "descriptor (fragment) then generic (TTL) must both decline"
+        );
+        assert_eq!(
+            area.slice(0, AREA).unwrap(),
+            &snapshot[..],
+            "#4965: descriptor-decline → or_else(generic)-decline must leave UMEM byte-identical"
         );
     }
 }
