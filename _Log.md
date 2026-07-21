@@ -54761,3 +54761,39 @@ top.
 - **File(s)**: pkg/api/config.go,
   pkg/api/config_session_holder_5870_test.go (new),
   pkg/configstore/README.md, _Log.md
+
+## 2026-07-21 — #6194 Layer-2 snapshot key-absent predicate parity
+
+- **Timestamp**: 2026-07-21
+- **Action**: Fix Layer-2/Layer-1 consistency nit — the #5305 transactional
+  cluster-synced install snapshot (`snapshotBPFSessionV4Locked` /
+  `snapshotBPFSessionV6Locked` in `pkg/dataplane/userspace/manager_ha.go`)
+  classified "key absent" with `errors.Is(err, ebpf.ErrKeyNotExist)` ONLY,
+  while the sibling Layer-1 `sessionNotFound` predicate
+  (`pkg/dataplane/session_store.go`) accepts BOTH `ebpf.ErrKeyNotExist` AND
+  `unix.ENOENT`. With the production cilium `bpfShim` the two sentinels never
+  diverge (a missing lookup yields `ErrKeyNotExist`, not bare `ENOENT`) and the
+  Layer-2 direction was already fail-safe, so this is a consistency fix, not a
+  live bug — but the two transaction layers now agree on what "key absent"
+  means. Extracted a package-level `bpfSessionReadAbsent(err)` seam that reuses
+  the EXPORTED shared `dataplane.IsKeyNotFound` predicate (the Layer-1-equivalent
+  `ErrKeyNotExist || ENOENT` set), and routed BOTH snapshot functions through it.
+  Fail-safe direction preserved: any NON-absent read error is still surfaced and
+  the install refused (never broadened to swallow real errors). Restore
+  delete-idempotency checks (`!errors.Is(err, ebpf.ErrKeyNotExist)`) left
+  untouched — distinct operation (DeleteSession, not GetSession), real-map
+  delete-absent returns `ErrKeyNotExist`, and #6194 scopes to the snapshot's
+  read-classification. Fail-on-revert test pins the seam directly (no live map /
+  no root): `bpfSessionReadAbsent` must classify `unix.ENOENT` identically to
+  `ebpf.ErrKeyNotExist` (both absent) and must NOT classify a genuine read error
+  (EFAULT / map-not-found) as absent. Neutralize by reverting
+  `bpfSessionReadAbsent` to `errors.Is(err, ebpf.ErrKeyNotExist)` → the
+  `unix.ENOENT` + `wrapped unix.ENOENT` subtests and the identity assertion go
+  RED (clean assertion failure, not a compile break — `ebpf` stays imported via
+  `mergeHAStateFromMaps` + the restore checks). Validation: `go build ./...`,
+  `go vet ./pkg/dataplane/...`, `go test ./pkg/dataplane/...` (non-root + root
+  incl. the #5305 rollback tests) all pass. Control-plane / unit-provable — no
+  smoke.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/snapshot_enoent_consistency_6194_test.go (new),
+  docs/session-sync-architecture.md, _Log.md
