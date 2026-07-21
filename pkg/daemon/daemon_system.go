@@ -1092,6 +1092,25 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) (err error) {
 				continue
 			}
 
+			// #5841 marker-first: record SSH-KEY ownership BEFORE writing
+			// authorized_keys. This is a DISTINCT marker from the
+			// password/account markers, so setting only a password never claims
+			// the key file — the emptied-key / deprovision reconcilers only
+			// remove a key file this marker proves xpf wrote. Written
+			// unconditionally (idempotent) so an upgrade that already has
+			// xpf-written keys but no key marker gains one on the next apply.
+			// Fail VISIBLE: if the durable marker cannot be written, skip the
+			// key write and retry next apply rather than leave a
+			// written-but-unmarked key grant (the underclaim).
+			if err := markKeyProvisioned(user.Name, uid); err != nil {
+				slog.Warn("skipping authorized_keys apply: cannot record key ownership marker",
+					"user", user.Name, "err", err)
+				// Fail-visible for the #5874 closeout: the key write was skipped,
+				// so this user's SSH keys did NOT converge to the desired state.
+				fail(fmt.Errorf("mark key provisioned %s: %w", user.Name, err))
+				continue
+			}
+
 			// MkdirAllDurable (not plain MkdirAll): authorized_keys is a
 			// DurableState file written into this dir; WriteFileDurable
 			// persists the file's entry in .ssh, not .ssh's own entry in
@@ -1147,14 +1166,23 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) (err error) {
 			// authorized_keys file xpf itself wrote — never a pre-existing /
 			// out-of-band user's operator-installed keys. The whole file is
 			// xpf-owned when the marker matches (applySystemLogin writes it
-			// wholesale), so removing it is safe.
-			if uid, ok := lookupUID(user.Name); ok && xpfProvisioned(user.Name, uid) {
+			// wholesale), so removing it is safe. Gated on the KEY marker
+			// (#5841): a user whose PASSWORD xpf set but whose keys it never
+			// wrote has no key marker, so an operator-installed authorized_keys
+			// is left untouched (the overclaim this closes).
+			if uid, ok := lookupUID(user.Name); ok && keyProvisioned(user.Name, uid) {
 				keysFile := managedAuthorizedKeysPath(user.Name)
 				switch err := os.Remove(keysFile); {
 				case err == nil:
 					slog.Info("revoked SSH keys (last key removed from config)",
 						"user", user.Name)
-				case !os.IsNotExist(err):
+					// Key file gone → drop the key marker; xpf no longer owns a
+					// key file for this user.
+					_ = removeProvenanceMarker(provisionedKeysDir(), user.Name)
+				case os.IsNotExist(err):
+					// Already absent (idempotent) — drop the stale key marker.
+					_ = removeProvenanceMarker(provisionedKeysDir(), user.Name)
+				default:
 					slog.Warn("failed to remove authorized_keys after key list emptied",
 						"user", user.Name, "file", keysFile, "err", err)
 					fail(fmt.Errorf("revoke authorized_keys for %s: %w", user.Name, err))
@@ -1345,27 +1373,47 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) (err error) {
 				"user", user.Name, "err", err)
 			break
 		}
+		// #5841 marker-first atomicity: record password ownership (and the
+		// account registry entry) BEFORE mutating /etc/shadow. If the durable
+		// marker cannot be written we must NOT run chpasswd — a
+		// mutated-but-unmarked password is the underclaim this closes (xpf
+		// could no longer lock a password it set). Fail VISIBLE: log and skip,
+		// and the idempotent apply retries next commit. Only when the account's
+		// UID resolves (uidOK) can a UID-keyed marker be written; a pwApply for
+		// an unresolved account (the fail-open missing-entry case) still runs
+		// chpasswd, which fails for a nonexistent user, so no live credential is
+		// ever left unmarked.
+		if uidOK {
+			if err := markPasswordProvisioned(user.Name, curUID); err != nil {
+				slog.Warn("skipping password apply: cannot record password ownership marker",
+					"user", user.Name, "err", err)
+				// Fail-visible for the #5874 closeout: chpasswd was skipped, so
+				// the password did NOT converge to the desired state.
+				fail(fmt.Errorf("mark password provisioned %s: %w", user.Name, err))
+				break
+			}
+			if err := markProvisioned(user.Name, curUID); err != nil {
+				slog.Warn("skipping password apply: cannot record account marker",
+					"user", user.Name, "err", err)
+				fail(fmt.Errorf("mark provisioned %s: %w", user.Name, err))
+				break
+			}
+		}
 		stdin := strings.NewReader(user.Name + ":" + desired + "\n")
 		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
 			slog.Warn("failed to set user password",
 				"user", user.Name, "err", err, "output", strings.TrimSpace(string(out)))
 			fail(fmt.Errorf("set password for %s: %w", user.Name, err))
 		} else {
-			// xpf now manages this exact account's password — mark it so a
-			// later directive removal locks it (covers a pre-existing or
-			// marker-wiped account, #1944 §5.4).
-			if uidOK {
-				if err := markProvisioned(user.Name, curUID); err != nil {
-					slog.Warn("failed to write provisioned-user marker",
-						"user", user.Name, "err", err)
-					fail(fmt.Errorf("mark provisioned %s: %w", user.Name, err))
-				}
-			}
+			// The password + account markers were already recorded marker-first
+			// above (#5841), before chpasswd ran, so nothing is written here on
+			// success — only the confirmation is logged.
 			slog.Info("user encrypted-password applied", "user", user.Name)
 		}
 	case pwLock:
-		// Only lock the exact account xpf provisioned (UID-keyed marker).
-		if !uidOK || !xpfProvisioned(user.Name, curUID) {
+		// Only lock the exact account whose PASSWORD xpf provisioned (password
+		// marker) — never an account xpf touched solely for its SSH key (#5841).
+		if !uidOK || !passwordProvisioned(user.Name, curUID) {
 			break
 		}
 		stdin := strings.NewReader(user.Name + ":!\n")
@@ -1691,6 +1739,26 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 
 	// Keys: write the configured set wholesale, else revoke the xpf-managed file.
 	if len(keys) > 0 {
+		// #5841 marker-first: record root KEY ownership AND the account registry
+		// entry BEFORE writing root's authorized_keys. The key marker gates the
+		// key REMOVAL below (resource-specific — so a keys-only stanza never
+		// touches root's out-of-band password); the account registry keeps root
+		// enumerated by the factory-reset teardown (#5520) for a keys-only
+		// root-authentication. Fail VISIBLE: skip the key write if either
+		// durable marker cannot be recorded, retry next apply.
+		if err := markKeyProvisioned("root", 0); err != nil {
+			slog.Warn("skipping root authorized_keys apply: cannot record key ownership marker", "err", err)
+			// Fail-visible for the #5874 closeout: root's key write was skipped,
+			// so root SSH keys did NOT converge. The naked return yields the
+			// accumulated retErr, not a block-shadowed err.
+			fail(fmt.Errorf("mark root key provisioned: %w", err))
+			return
+		}
+		if err := markProvisioned("root", 0); err != nil {
+			slog.Warn("skipping root authorized_keys apply: cannot record account marker", "err", err)
+			fail(fmt.Errorf("mark root provisioned: %w", err))
+			return
+		}
 		// MkdirAllDurable: root authorized_keys is DurableState written into
 		// this dir, so the dir's own entry must survive a power cut too
 		// (Codex r1).
@@ -1715,26 +1783,22 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 			}
 			slog.Info("root SSH keys applied", "keys", len(keys))
 		}
-		// Record provenance keyed by name "root" / UID 0 (the same marker
-		// reconcileUserPassword writes on a root password apply) so a later
-		// stanza/leaf removal can revoke THIS xpf-written key file. Written on
-		// the key apply too so a keys-only root-authentication is revocable.
-		if err := markProvisioned("root", 0); err != nil {
-			slog.Warn("failed to write root provisioned marker", "err", err)
-			fail(fmt.Errorf("mark root provisioned: %w", err))
-		}
-	} else if xpfProvisioned("root", 0) {
-		// Empty/absent key list AND xpf provisioned root: revoke the xpf-managed
+	} else if keyProvisioned("root", 0) {
+		// Empty/absent key list AND xpf wrote root's keys: revoke the xpf-managed
 		// root authorized_keys so removing the keys from config actually disables
-		// key-based root login. The marker gate leaves an operator-installed key
-		// file xpf never wrote untouched — provenance-scoped removal, mirroring
-		// applySystemLogin's emptied-key-list branch + deprovisionLoginUser
-		// (the whole file is xpf-owned when the marker matches). #5276.
+		// key-based root login. The KEY marker gate leaves an operator-installed
+		// key file xpf never wrote untouched — provenance-scoped removal,
+		// mirroring applySystemLogin's emptied-key-list branch +
+		// deprovisionLoginUser (the whole file is xpf-owned when the marker
+		// matches). #5276/#5841.
 		keysFile := rootAuthorizedKeysPath()
 		switch err := os.Remove(keysFile); {
 		case err == nil:
 			slog.Info("revoked root SSH keys (root-authentication keys removed from config)")
-		case !os.IsNotExist(err):
+			_ = removeProvenanceMarker(provisionedKeysDir(), "root")
+		case os.IsNotExist(err):
+			_ = removeProvenanceMarker(provisionedKeysDir(), "root")
+		default:
 			slog.Warn("failed to remove root authorized_keys after key list emptied",
 				"file", keysFile, "err", err)
 			fail(fmt.Errorf("revoke root authorized_keys: %w", err))

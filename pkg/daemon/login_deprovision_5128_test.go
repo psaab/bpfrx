@@ -61,8 +61,17 @@ func TestReconcileAbsentLoginUsersRevokesCredentials(t *testing.T) {
 		"root:$6$r$h:19000:0:99999:7:::\nalice:$6$salt$activehash:19000:0:99999:7:::\n",
 	)
 
-	// alice was provisioned at UID 1001 (matches passwd) and has managed keys.
+	// alice was provisioned at UID 1001 (matches passwd): xpf set her password
+	// AND wrote her managed keys, so both resource markers are present (#5841:
+	// the lock is gated on the password marker, the key removal on the key
+	// marker).
 	if err := markProvisioned("alice", 1001); err != nil {
+		t.Fatal(err)
+	}
+	if err := markPasswordProvisioned("alice", 1001); err != nil {
+		t.Fatal(err)
+	}
+	if err := markKeyProvisioned("alice", 1001); err != nil {
 		t.Fatal(err)
 	}
 	keysFile := managedAuthorizedKeysPath("alice")

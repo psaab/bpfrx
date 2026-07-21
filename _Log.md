@@ -54457,6 +54457,31 @@ top.
   pkg/daemon/daemon_run.go, pkg/cli/console_zeroize_transaction_5871_test.go (new),
   pkg/cli/README.md, pkg/grpcapi/README.md, pkg/daemon/README.md, _Log.md
 
+- **Timestamp**: 2026-07-21
+- **Action**: #5841 — resource-specific + atomic login credential ownership.
+  Split the single per-account provenance marker into three UID-file roots:
+  the account/enumeration registry (`provisioned-users`, unchanged format for
+  the zeroize teardown) plus resource-specific `provisioned-passwords` and
+  `provisioned-keys` markers (siblings of the registry, one test seam). The
+  password lock now consults `passwordProvisioned`, the key-file removal
+  `keyProvisioned` — so provisioning only a password never clobbers an
+  operator-installed authorized_keys (overclaim fix), and a keys-only
+  root-authentication never locks an out-of-band root password. Each resource
+  marker is written marker-first (before chpasswd / the key write); a
+  marker-write failure now SKIPS the mutation (fail-visible) instead of being
+  logged-and-swallowed, so xpf never leaves a mutated-but-unmarked credential
+  (underclaim fix). `reconcileAbsentLoginUsers` enumerates the union of the
+  three roots. Added two fail-on-revert tests; updated the #5106/#5128/#5276/
+  #5493 tests to seed the resource markers. Docs: system-login.md new
+  "Resource-specific, atomic credential ownership (#5841)" section + corrected
+  the stale one-marker claims; engineering-style.md persistence table.
+- **File(s)**: pkg/daemon/login_password.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/login_resource_ownership_5841_test.go (new),
+  pkg/daemon/login_emptied_keys_5106_test.go,
+  pkg/daemon/login_deprovision_5128_test.go,
+  pkg/daemon/root_auth_revoke_5276_test.go,
+  pkg/daemon/login_passwd_failclosed_5493_test.go,
+  docs/system-login.md, docs/engineering-style.md, _Log.md
 ## 2026-07-21 — #5869 archival zeroize-race fence (security)
 
 - **Timestamp**: 2026-07-21
@@ -54505,6 +54530,120 @@ top.
   pkg/daemon/README.md, _Log.md
 
 - **Timestamp**: 2026-07-21
+- **Action**: #5840 — reject standalone<->cluster day-2 topology commit (fail-closed
+  restart boundary; Option 2). The chassis-cluster runtime (d.cluster manager, election,
+  heartbeat/watchdog writer, session/config/DHCP sync, event watcher, VRRP sync hold, gRPC
+  fabric listener) is constructed ONCE at boot (daemon_run.go initManagers +
+  startClusterComms) and only when the boot active config has `chassis cluster`. A day-2
+  commit that ADDS/REMOVES `chassis cluster` cannot (de)construct that boot-only runtime:
+  d.cluster is a bare write-once-at-boot pointer read without a lifecycle lock from ~129
+  sites (data race), and the dataplane arms clusterHA=true from the NEW config in the same
+  apply BEFORE any watchdog/election exists (persistent HAInactive transit drop). Silent
+  acceptance was the bug (no HA + outage until restart). Fix: new pure
+  clusterTopologyCommitPreflight(old,new) + errClusterTopologyRequiresRestart sentinel,
+  wired into commitAndApply + commitConfirmedAndApply preflight closures (BEFORE store
+  promotion / dataplane mutation, ahead of the device-map preflight), and fail-closed in
+  the peer-sync replay path syncAndApply (return before applyConfigLocked so the live
+  dataplane is never armed under the transitioned config). Intra-mode edits reconcile live
+  as before. Full day-2 live construction/teardown (Option 1 supervisor) is a separate
+  follow-up. Fail-on-revert: TestClusterTopologyDay2TransitionRejected asserts both
+  transition directions rejected (sentinel + diagnostic) + controls accepted + end-to-end
+  commitAndApply rejection with d.cluster staying nil and candidate not promoted;
+  neutralizing the preflight body makes exactly that one test RED (target-count 1).
+  Unit-provable, NO smoke (reject happens before any dataplane/HA mutation).
+- **File(s)**: pkg/daemon/cluster_topology_preflight.go (new),
+  pkg/daemon/cluster_topology_preflight_5840_test.go (new), pkg/daemon/daemon_apply.go,
+  docs/ha-no-hitless-restart.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5840 review fold — re-key the topology preflight on DESIRED-vs-ACTUAL-
+  RUNTIME, closing the #4179 config-less-HA-node hole a hostile reviewer found. The
+  original gate keyed on `clusterTopologyConfigured(old)` (an old-CONFIG proxy) and
+  PERMITTED `old==nil`. That carve-out is wrong for the config-less HA node: it boots with
+  /etc/xpf/node-id present but ActiveConfig()==nil → computeBootClass returns
+  bootClassNormal (NOT bootstrap) → initManagers SKIPS d.cluster construction (boot config
+  nil) → d.cluster stays nil, inBootstrap()==false. A day-2 plain `commit` adding `chassis
+  cluster` then reached commitAndApply, the preflight saw old==nil → PERMITTED → armed
+  clusterHA=true (manager_compile.go) against a nil HA runtime = the exact #5840 hybrid
+  state (persistent transit blackhole until restart). Fix: changed
+  clusterTopologyCommitPreflight(old,new) → clusterTopologyCommitPreflight(runtimeClusterActive
+  bool, newCfg) and reject when clusterTopologyConfigured(newCfg) != runtimeClusterActive;
+  all THREE wire sites (commitAndApply :401, syncAndApply :557, commitConfirmedAndApply
+  :688) now pass `d.cluster != nil` (the true boot-only runtime signal, stable under the
+  held applySem). The runtime predicate uniformly REJECTS standalone→cluster,
+  cluster→standalone, AND config-less→cluster; intra-mode edits (runtime matches desired)
+  permitted. Reject is correct for the config-less node too: it cannot form the cluster
+  live (HA runtime boot-only), so "restart into the clustered config" is the honest
+  answer. Verified NO legitimate boot/bootstrap path is falsely rejected — boot config
+  LOAD is Store.Load→applyConfigLocked (never the preflight), and commitAndApply refuses
+  ALL commits while inBootstrap() (bootstrap exits only via a CONFIRMED commit; d.cluster
+  still never constructed day-2). Test: extended TestClusterTopologyDay2TransitionRejected
+  with the config-less case (runtimeClusterActive=false + clustered candidate → REJECTED,
+  the case old==nil wrongly permitted) as a direct-preflight assertion AND an end-to-end
+  commitAndApply leg (nil active, nil runtime → rejected, d.cluster stays nil, candidate
+  not promoted); kept both transition directions + intra-mode permits. Also fixed the
+  #5054/#5961 newSyncProbeDaemon fixture: it set d.cluster!=nil with a STANDALONE config
+  (an artificial mismatch the old config-keyed predicate tolerated) — now seeds a `chassis
+  cluster` stanza when cl!=nil so the fixture matches production and the RG0-ownership
+  peer-sync intent is preserved. Parent-RED: insert `runtimeClusterActive = newCluster`
+  after `newCluster := clusterTopologyConfigured(newCfg)` (force desired==actual so it
+  never rejects) — compiles clean (all params/imports used), makes EXACTLY
+  TestClusterTopologyDay2TransitionRejected RED at its first assertion (target-count 1;
+  pkg/cluster green). Validation: go build ./..., go vet ./pkg/daemon, `go test -race
+  ./pkg/daemon/... ./pkg/cluster/...` all green (TMPDIR=/tmp for socket tests).
+  Unit-provable, NO smoke (reject happens before any store promotion / dataplane / HA
+  mutation).
+- **File(s)**: pkg/daemon/cluster_topology_preflight.go,
+  pkg/daemon/cluster_topology_preflight_5840_test.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/configsync_transport_5054_test.go, docs/ha-no-hitless-restart.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5841 — merge origin/master (#6181 host-auth closeout error budget
+  + #6182 archival zeroize fence) into fix/5841-login-resource-ownership and
+  COMPOSE the two overlapping login-auth changes. The conflict is that #6181 gave
+  `reconcileAbsentLoginUsers` / `deprovisionLoginUser` / `applySystemLogin` /
+  `reconcileUserPassword` / `applyRootAuth` error returns (accumulate every
+  per-item failure via a `fail()`/`errors.Join` closure so the cancel closeout
+  can see non-convergence), while #6183 gave them resource-specific marker-first
+  ownership (password vs key markers, union enumeration via `provisionedNames`,
+  `forgetProvenance` dropping all three roots). Resolved by KEEPING BOTH: the
+  reconcilers now return accumulated errors AND do marker-first resource-specific
+  ownership. Every #6183 marker-first SKIP path (markPassword/markKey/markProvisioned
+  failure → break/continue/return) now also `fail()`s so a skipped credential
+  apply is surfaced to the #5874 closeout, and `forgetProvenance` returns a joined
+  error the success-path accumulates. Build + `go vet` clean; daemon + grpcapi
+  suites green 3x; the two #5841 fail-on-revert tests and the #6181 closeout
+  tests all pass.
+- **File(s)**: pkg/daemon/login_password.go, pkg/daemon/daemon_system.go, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5841 MAJOR (from the #6183 hostile review) — the two NEW marker
+  roots survived a factory reset. `zeroizeLoginAccounts` enumerated ONLY
+  `provisioned-users`, so `provisioned-passwords` and `provisioned-keys` (the
+  #5841 split's resource roots) were referenced NOWHERE in pkg/grpcapi and
+  SURVIVED zeroize. Residue (#5869/#5871 class) plus a resurrected overclaim: a
+  re-tenant's reused-UID account colliding with a surviving marker gets
+  deprovisioned by `reconcileAbsentLoginUsers` (which unions all three roots) —
+  password locked, authorized_keys deleted — despite xpf never provisioning it.
+  Fix: added `zeroizeProvisionedPasswordsDir` / `zeroizeProvisionedKeysDir`
+  (siblings of the seam, mirroring the daemon) and, after the account loop,
+  `zeroizeSweepResourceMarkerRoot` erases every marker in the two resource roots
+  (keeping only names retained for a fail-closed registry retry) and drops the
+  roots — so no marker survives in ANY of the three roots, mirroring the daemon's
+  `forgetProvenance`. Split the account loop into `zeroizeTearDownProvisionedUsers`
+  so the registry teardown and the resource-root sweep read as two phases; the
+  users-root ReadDir error no longer early-returns so a key-only orphan's marker
+  is still swept. Fail-on-revert: `zeroize_login_resource_roots_5841_test.go`
+  seeds all three roots for one fully-provisioned account and asserts every marker
+  + root dir is gone; neutralizing the single sweep removal
+  `fail(os.Remove(filepath.Join(dir, name)))` makes EXACTLY that test RED (target
+  count 1 across grpcapi — no other test seeds the resource roots). Unit-provable
+  (factory-reset teardown, no dataplane/forwarding surface), no smoke.
+- **File(s)**: pkg/grpcapi/server_diag_zeroize.go,
+  pkg/grpcapi/zeroize_login_resource_roots_5841_test.go (new),
+  docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-07-21
 - **Action**: #5834 — VRRP auth tolerant-load fail-closed. #4288 strict-rejects
   VRRP authentication (native impl is RFC 5798 VRRPv3, no auth), but the
   tolerant load / peer-sync path only WARNED and still COMPILED the
@@ -54547,3 +54686,58 @@ top.
   userspace-dp/src/afxdp/session_glue/mod.rs,
   userspace-dp/src/afxdp/session_glue/tests.rs,
   userspace-dp/src/afxdp/session_glue/README.md, _Log.md
+- **Action**: #5305 — cluster-synced session install made transactional (BPF
+  pre-image rollback on helper mirror failure). `SetClusterSyncedSessionV4/V6`
+  wrote the pinned BPF session mirror FIRST, then mirrored to the Rust helper;
+  on helper failure they recorded the mirror failure and returned but LEFT the
+  BPF entry installed — a split truth the GC / fallback bulk export could
+  propagate as if the install succeeded, producing nondeterministic HA session
+  ownership after takeover. The store's snapshot/rollback machinery
+  (session_store.go) never fired for this path because the installer's
+  `return err` runs before the store appends the forward pre-image to `written`.
+  Fix: for forward entries, snapshot the BPF pre-image (value-or-absence) BEFORE
+  the write and, on mirror failure, RESTORE it (rewrite prior value / delete if
+  absent), joining any compensation error with the mirror error. Snapshot +
+  write + mirror + compensate now run under one `m.mu` hold (was: BPF write
+  outside the lock) so the sequence is atomic w.r.t. other m.mu paths; per-peer
+  apply loop is single-threaded so no same-key race. Reverse entries (never
+  mirrored) just write BPF and return. Health behavior preserved:
+  recordSessionMirrorFailureLocked (#5247 takeover-disarm) and
+  recordSessionMirrorSuccessLocked (sticky-clear on real success) unchanged.
+  New snapshotBPFSessionV4/V6Locked + restoreBPFSessionV4/V6Locked helpers.
+  Tests: synced_session_bpf_rollback_5305_test.go —
+  TestSetClusterSyncedSessionV4/V6RollsBackOrphanOnMirrorFailure (absent→deleted,
+  prior→restored) + TestSetClusterSyncedSessionRollbackSuccessPathUnregressed.
+  Parent-RED: no-op the restore helpers → 2 tests (4 subtests) fail on assertion.
+  Validated: build + vet clean; focused userspace session/mirror suite green;
+  the 6 pre-existing userspace XDP-shim-load failures reproduce on origin/master.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/synced_session_bpf_rollback_5305_test.go,
+  docs/session-sync-architecture.md, _Log.md
+- **Action**: #5870 — REST candidate mutations bypassed the config-session
+  holder lock. The REST config endpoints (`pkg/api/config.go`) called the store
+  with an empty session ID, which the store treats as its internal/system
+  capability (daemon apply / HA sync) and which BYPASSES the #5059 candidate
+  holder lock. A remote, stateless REST caller could therefore Set/Delete/Load/
+  Rollback/Commit a candidate that a CLI or gRPC configuration session
+  legitimately OWNED — corrupting a peer's candidate or smuggling their staged
+  edits into an applied commit. Fix: route every REST config MUTATION
+  (enter/set/delete/deactivate/activate/load/annotate/rollback/commit/
+  commit-confirmed/confirm) through the session-scoped `*As` variants +
+  `EnsureConfigHolder` commit gate under a fixed non-empty holder identity,
+  `restConfigSessionID` ("rest"). A REST mutation is now rejected with
+  `ErrConfigLockedByOther` → HTTP 409 when another session owns the candidate,
+  and symmetrically CLI/gRPC is rejected while REST holds it; `/config/exit`
+  releases only the REST-held lock (`ExitConfigureSession`) instead of
+  force-clearing any holder. The store's `sessionID == ""` system-bypass
+  semantics are untouched; read-only REST endpoints are unaffected. Session
+  model: fixed shared REST identity (REST is stateless); two concurrent REST
+  clients share "rest" and are not mutually excluded — a per-caller REST token
+  is a separate product follow-up. Tests (fail-on-revert; neutralize by setting
+  `restConfigSessionID = ""` → 3 RED): pkg/api/config_session_holder_5870_test.go.
+  Validation: go build ./..., go vet ./pkg/api/ ./pkg/configstore/, go test
+  ./pkg/api/... ./pkg/configstore/... all pass. Control-plane / unit-provable —
+  no smoke.
+- **File(s)**: pkg/api/config.go,
+  pkg/api/config_session_holder_5870_test.go (new),
+  pkg/configstore/README.md, _Log.md
