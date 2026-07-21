@@ -216,43 +216,82 @@ fn stalled_consumer_does_not_grow_backlog_unbounded_end_to_end() {
         )
     });
 
-    // Encode-only frame size; pump >> WRITE_BACKLOG_MAX_BYTES worth of frames.
+    // Encode-only frame size. The wedged socket absorbs only ~130 KiB before
+    // WouldBlock, so every frame the loop drains past that point accumulates
+    // permanently in `write_buf` (it is never written out) until the drain
+    // reaches WRITE_BACKLOG_MAX_BYTES and trips the cap.
     let frame_bytes = EventFrame::encode_drain_complete(1).as_bytes().len();
-    let frames_to_pump = (WRITE_BACKLOG_MAX_BYTES / frame_bytes) * 3 + 4096;
+    // Accepted sends that must accumulate before the loop's unwritten backlog
+    // reaches the 16 MiB cap (~1x cap worth of frames).
+    let cap_frames = (WRITE_BACKLOG_MAX_BYTES / frame_bytes) as u64;
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // #6148: the liveness wait is PROGRESS-GATED, not a fixed wall-clock. We
+    // feed a SUSTAINED source and stop as soon as the loop thread has actually
+    // migrated WRITE_BACKLOG_MAX_BYTES of unwritten frames into its backlog
+    // (frames_write_stalled > 0) AND shed at the bounded channel
+    // (frames_dropped > 0) — the two safety conditions the asserts below check.
+    //
+    // Why this is robust under CPU contention: `try_send` succeeds ONLY when
+    // the loop thread has freed channel space by draining, and every drained
+    // frame lands permanently in `write_buf` (the wedged socket never drains
+    // it). So `sent_ok` self-paces to the loop's real drain progress and tracks
+    // the write_buf frame count to within the 64-slot channel depth — we cannot
+    // overrun a starved loop, we simply feed it exactly as fast as it drains
+    // and wait longer. The old fixed 20s-pump + 5s-stall-wait intermittently
+    // failed on a loaded full-suite runner (#6148) because a starved background
+    // thread had not accumulated the 16 MiB cap before the clock expired, and
+    // the producer had already burned through its bounded pump (one try_send
+    // per seq once frames_dropped>0) leaving no sustained source for the
+    // 1-per-ms stall-wait to lean on — a load-sensitive timing flake, not a
+    // product bug. The bound/shedding safety asserts are unchanged.
+    //
+    // `max_accepted` bounds a *regressed* (cap-removed) build: a working cap
+    // trips the stall at ~1x cap worth of accepted frames, so reaching 2x cap
+    // accepted with frames_write_stalled still 0 can only mean the safety cap
+    // is gone — stop feeding (capping write_buf at ~2x cap of memory) and let
+    // the assert fail fast instead of growing the backlog without bound.
+    let max_accepted = cap_frames * 2 + 4096;
+    // Generous, parallelism-aware backstop: it fires only if the loop is
+    // catastrophically starved. More hardware threads => more concurrent tests
+    // in the default parallel `cargo test` run => a smaller CPU share for this
+    // background thread, so scale the deadline up with parallelism. This is a
+    // should-eventually-happen liveness check; a generous deadline is correct.
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1) as u32;
+    let deadline =
+        Instant::now() + Duration::from_secs(30) + Duration::from_secs(3) * parallelism;
+
     let mut sent_ok = 0u64;
-    for seq in 0..frames_to_pump as u64 {
-        // Non-blocking producer: retry on transient full but never block the
-        // "worker" forever. A persistently full channel is the expected
-        // backpressure once the backlog caps.
-        loop {
-            if handle.try_send(EventFrame::encode_drain_complete(seq + 1)) {
-                sent_ok += 1;
-                break;
-            }
-            // Channel full → backpressure engaged; that is the intended state.
-            if shared.frames_dropped.load(Ordering::Relaxed) > 0 {
-                break;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            thread::yield_now();
+    let mut attempts = 0u64;
+    loop {
+        // Stop the moment BOTH states the safety asserts require are observed.
+        // Requiring the drop too avoids an early break at the instant the stall
+        // trips (before the now-idle loop lets the channel fill and shed) — the
+        // channel fills and drops within <= 64 further sends, no wall-clock.
+        let stalled = shared.frames_write_stalled.load(Ordering::Relaxed) > 0;
+        let shed = shared.frames_dropped.load(Ordering::Relaxed) > 0;
+        if stalled && shed {
+            break;
+        }
+        // Fed 2x the cap and still no stall => the cap regressed; fail fast.
+        if sent_ok >= max_accepted {
+            break;
         }
         if Instant::now() >= deadline {
             break;
         }
-    }
-
-    // The defining proof: with a wedged reader and a sustained source far
-    // exceeding the cap, the loop must have stalled and shed at the channel.
-    let deadline2 = Instant::now() + Duration::from_secs(5);
-    while shared.frames_write_stalled.load(Ordering::Relaxed) == 0
-        && Instant::now() < deadline2
-    {
-        let _ = handle.try_send(EventFrame::encode_drain_complete(0));
-        thread::sleep(Duration::from_millis(1));
+        // Sustained, non-blocking source. A full channel is the intended
+        // backpressure once the backlog caps; try_send counts the drop in
+        // frames_dropped. Retry (loop) rather than give up so the loop always
+        // has frames to migrate into write_buf.
+        attempts += 1;
+        if handle.try_send(EventFrame::encode_drain_complete(sent_ok + 1)) {
+            sent_ok += 1;
+        }
+        // Yield so the (possibly starved) background loop thread gets CPU to
+        // drain the channel into write_buf.
+        thread::yield_now();
     }
 
     shared.stop.store(true, Ordering::Release);
@@ -268,10 +307,11 @@ fn stalled_consumer_does_not_grow_backlog_unbounded_end_to_end() {
          unbounded write_buf growth"
     );
     // The channel is bounded, so accepted frames are bounded by capacity +
-    // whatever the (capped) backlog/replay absorbed — never the full source.
+    // whatever the (capped) backlog/replay absorbed — never every frame we
+    // offered once backpressure engaged.
     assert!(
-        sent_ok < frames_to_pump as u64,
-        "not every pumped frame can be accepted once backpressure engages"
+        sent_ok < attempts,
+        "not every offered frame can be accepted once backpressure engages"
     );
     drop(daemon_side);
 }
