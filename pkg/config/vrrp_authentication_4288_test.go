@@ -11,8 +11,12 @@ import (
 // the native dataplane is RFC 5798 VRRPv3, which REMOVED authentication.
 // Silently accepting the config lets an operator believe adverts are
 // authenticated when they are not (a rogue host can hijack mastership). The
-// honest posture is to REJECT the dead-security statement at strict commit and
-// WARN (not brick) on the tolerant load / peer-sync path.
+// honest posture is to REJECT the dead-security statement at strict commit and,
+// on the tolerant load / peer-sync path, DROP the auth-carrying vrrp-group
+// (fail-closed) + warn loudly — never leave it ACTIVE claiming the VIP with
+// unauthenticated adverts while the operator REQUIRED auth (#5834). No-brick is
+// preserved: only the one group is dropped, the base address and the rest of the
+// config still boot (#1960).
 
 // Strict commit rejects authentication-type (flat-set shape). RED-on-revert:
 // dropping the #4288 gate makes CompileConfig return nil (the inert auth config
@@ -62,7 +66,13 @@ func TestVRRPAuthenticationRejectedHierarchical(t *testing.T) {
 
 // Lenient (load / peer-sync): the reject downgrades to a warning so an
 // already-persisted or peer-synced config an older binary silently accepted
-// still boots. RED-on-revert: without the gate there is no warning.
+// still boots (no-brick). RED-on-revert: without the gate there is no warning.
+//
+// #5834: the group must NOT be left ACTIVE. A warn-but-activate posture
+// compiled the authenticated vrrp-group into unit.VRRPGroups, so pkg/vrrp
+// instantiated it and it CLAIMED the VIP + exchanged UNAUTHENTICATED adverts
+// while the operator REQUIRED auth — a false-security, unauthenticated group
+// left running. Fail-closed: the group is DROPPED (not compiled), warned loudly.
 func TestVRRPAuthenticationLenientWarns(t *testing.T) {
 	cfg, err := CompileConfigLenient(parseHier(t, vrrpAuthHier))
 	if err != nil {
@@ -78,10 +88,76 @@ func TestVRRPAuthenticationLenientWarns(t *testing.T) {
 	if !found {
 		t.Fatalf("expected a #4288 VRRP authentication warning on the lenient path, got: %v", cfg.Warnings)
 	}
-	// The config still boots — the vrrp-group is compiled (auth is simply inert).
-	vg := firstVRRPGroupWithVIP(t, cfg, "10.0.61.1/24")
-	if vg == nil {
-		t.Fatal("lenient path: vrrp-group must still compile (boot, do not brick)")
+	// #5834 fail-closed: the auth-carrying group must NOT be compiled as an
+	// active VRRP instance — it must be dropped, not left claiming the VIP with
+	// unauthenticated adverts.
+	if vg := firstVRRPGroupWithVIP(t, cfg, "10.0.61.1/24"); vg != nil {
+		t.Fatalf("lenient path left an auth-required vrrp-group ACTIVE (claims VIP with "+
+			"unauthenticated adverts) — it must be dropped fail-closed; got: %+v", vg)
+	}
+}
+
+// #5834 (fail-on-revert, flat-set shape): a tolerant load of a config whose
+// vrrp-group carries authentication must DROP the group — not compile it into an
+// active instance that claims the VIP and exchanges unauthenticated adverts. The
+// operator's REQUIRE-auth intent wins over availability. This binds the
+// validateVRRPAuthenticationAST lenient prune (compiler_interfaces.go): reverting
+// it to warn-but-keep re-adds the group to unit.VRRPGroups and makes this RED.
+func TestVRRPAuthenticationLenientDropsGroup_FlatSet(t *testing.T) {
+	tree := replaySetLines(t, []string{
+		"set interfaces reth0 unit 0 family inet address 10.0.61.10/24 vrrp-group 1 virtual-address 10.0.61.1/24",
+		"set interfaces reth0 unit 0 family inet address 10.0.61.10/24 vrrp-group 1 authentication-type md5",
+		"set interfaces reth0 unit 0 family inet address 10.0.61.10/24 vrrp-group 1 authentication-key secret123",
+	})
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: auth vrrp-group must not brick the load, got: %v", err)
+	}
+	// The group is dropped fail-closed — no active VRRP instance claims the VIP.
+	if vg := firstVRRPGroupWithVIP(t, cfg, "10.0.61.1/24"); vg != nil {
+		t.Fatalf("flat-set lenient load left an auth-required vrrp-group ACTIVE: %+v", vg)
+	}
+	// Belt-and-suspenders: the whole unit must carry no compiled VRRP group.
+	if ifc := cfg.Interfaces.Interfaces["reth0"]; ifc != nil {
+		if unit := ifc.Units[0]; unit != nil && len(unit.VRRPGroups) != 0 {
+			t.Fatalf("expected 0 compiled VRRP groups on the tolerant path, got %d: %+v",
+				len(unit.VRRPGroups), unit.VRRPGroups)
+		}
+	}
+	// And it must be a loud, value-free warning, not a silent drop.
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#5834") && strings.Contains(w, "vrrp-group 1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a loud #5834 drop warning naming the group, got: %v", cfg.Warnings)
+	}
+}
+
+// #5834 control: the base interface ADDRESS survives the group drop — only the
+// VRRP VIP claim is failed-closed, the real address stays configured. A tolerant
+// prune that nuked the whole address (or interface) would be an availability
+// regression beyond the security intent.
+func TestVRRPAuthenticationLenientKeepsBaseAddress(t *testing.T) {
+	cfg, err := CompileConfigLenient(parseHier(t, vrrpAuthHier))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["reth0"]
+	if ifc == nil || ifc.Units[0] == nil {
+		t.Fatal("reth0 unit 0 must still compile — only the vrrp-group is dropped")
+	}
+	found := false
+	for _, a := range ifc.Units[0].Addresses {
+		if strings.HasPrefix(a, "10.0.61.10") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("base address 10.0.61.10/24 must survive the vrrp-group drop, got: %+v",
+			ifc.Units[0].Addresses)
 	}
 }
 

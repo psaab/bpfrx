@@ -66,9 +66,12 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	// mastership. Runs on the group-expanded, inactive-pruned tree so an
 	// apply-groups-inherited auth statement is covered. Strict (commit /
 	// commit-check): hard-reject so the operator is not misled into a
-	// false-security posture. Lenient (load / peer-sync): warn so an
-	// already-persisted or peer-synced config an older binary silently
-	// accepted still boots (#1960).
+	// false-security posture. Lenient (load / peer-sync, #5834): DROP the
+	// auth-carrying vrrp-group from the AST + warn loudly — a warn-but-activate
+	// posture left the group CLAIMING the VIP and exchanging UNAUTHENTICATED
+	// adverts while the operator REQUIRED auth (the same false-security posture,
+	// relocated to the load path). Fail-closed: the base address survives, only
+	// the VRRP VIP claim is dropped (still no-brick, #1960).
 	vrrpAuthWarnings, err := validateVRRPAuthenticationAST(tree.Children, "", opts.lenientVRRPAuthentication)
 	if err != nil {
 		return nil, err
