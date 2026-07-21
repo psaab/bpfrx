@@ -53619,6 +53619,38 @@ top.
   userspace-dp/src/server/README.md
 
 - **Timestamp**: 2026-07-18
+- **Action**: #4969 — consolidate the screen module's ~13 PARALLEL per-zone
+  `FxHashMap<String, _>` tables (profiles, icmp/udp/syn counters,
+  syn_off_attack buckets, icmp/udp/syn dst+src sketches, syn_cookie
+  active-until / standby / profile-gen, syn_alarm cadence) into ONE
+  `FxHashMap<String, ZoneScreenState>` (`ScreenState::zones`). A
+  `ZoneScreenState` is built by `from_profile`, which allocates every
+  threshold-gated sub-state together (`Some ⟺ configured` for the flood
+  sketches), so a configured limiter can NEVER be silently missing on the
+  screened path (the pre-#4969 fail-open where a missed prepopulation step left
+  a map entry absent and the hot-path `if let Some(sketch)` fell through to
+  Pass; the removed SYN-cookie active-until `debug_assert!(false, ...)` is now a
+  compile-time impossibility). Perf: the ICMP/UDP/initial-SYN hot paths do ONE
+  `zones` lookup instead of re-hashing the zone name into several tables. Global
+  SYN-cookie machinery (codec/validated-cache/epoch), per-IP scan/sweep
+  trackers, and #3082 missing-profile bookkeeping stay separate `ScreenState`
+  fields (disjoint borrows; the only whole-`self` hot-path call,
+  `current_syn_cookie_full_epoch`, is reached only on the mint RETURN path after
+  `zstate`'s last use, so NLL releases the borrow). `update_profiles` rebuilds
+  `zones` per reconfigure via `reconcile_substate`, preserving the EXACT
+  pre-#4969 retention/reset behaviour (carry over in-flight counters; allocate
+  on enable / free on disable / preserve across unrelated edit; alarm cadence
+  reset to u64::MAX on disable; profile-gen bump on SYN-cookie-relevant change;
+  new-zone gen 0→1). Behaviour-preserving refactor: full cargo suite green
+  (240/240 screen tests; the new invariant test
+  `zone_screen_state_construction_has_no_fail_open_gap_4969` passes 3× no
+  flake), Go cross-package screen contract tests (`pkg/logging`, `pkg/grpcapi`,
+  `pkg/dataplane` `-run Screen|RawEventContract`) green. String zone-name keys
+  retained; numeric zone-id keying deferred to #4421. Docs updated (screen
+  module `//!` header + docs/syn-cookie-flood-protection.md).
+- **File(s)**: userspace-dp/src/screen/mod.rs,
+  userspace-dp/src/screen/tests.rs,
+  docs/syn-cookie-flood-protection.md
 - **Action**: #4971 — allocation-free + lock-free expected TX retry path.
   `TxError::Retry`/`Drop` payloads changed from heap `String` to `Copy`
   reason codes (`TxRetryReason` #[repr(u8)] + `TxDropReason` C-like enum

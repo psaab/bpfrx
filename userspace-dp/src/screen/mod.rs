@@ -66,6 +66,43 @@
 //! - `session_limit` — per-IP session-count tracker.
 //! - `extract`       — allocation-free IP/TCP header parser.
 //! - `tests`         — relocated screen_tests.rs (loaded via #[path]).
+//!
+//! ## Per-zone state consolidation (#4969)
+//!
+//! All HOT, mutable per-zone screen state — the resolved `ScreenProfile` plus
+//! the flood aggregates, per-destination/per-source flood sketches, and
+//! SYN-cookie fields — lives in a single [`ZoneScreenState`] value stored in one
+//! `FxHashMap<String, ZoneScreenState>` (`ScreenState::zones`, keyed by zone
+//! name). Before #4969 these were ~13 PARALLEL `FxHashMap<String, _>` tables
+//! synchronised only by manual prepopulation/retention discipline in
+//! `update_profiles`. The consolidation buys two things:
+//!
+//! 1. **No fail-open by construction.** [`ZoneScreenState::from_profile`] builds
+//!    the profile and ALL of its threshold-gated sub-state together, so
+//!    `Some ⟺ configured` for every per-destination/per-source sketch. A
+//!    configured limiter can NEVER be silently absent on the screened path
+//!    (the pre-#4969 "missed a prepopulation step → missing map entry →
+//!    `if let Some(..)` falls through to Pass" class). The removed
+//!    `debug_assert!` guarding a missing SYN-cookie active-until entry is now a
+//!    compile-time impossibility.
+//! 2. **One lookup per screened packet.** The ICMP/UDP/initial-SYN hot paths do
+//!    a single `zones.get_mut(zone)` and touch fields on the returned
+//!    `&mut ZoneScreenState`, instead of re-hashing the zone name into several
+//!    tables. The global SYN-cookie machinery (codec, validated cache, epoch
+//!    cache) and the per-worker diagnostic counters stay DISJOINT `ScreenState`
+//!    fields, so a `zstate` borrow coexists with them; the sole whole-`self`
+//!    method used on the hot path (`current_syn_cookie_full_epoch`) is reached
+//!    only on the SYN-cookie mint RETURN path, after `zstate`'s last use.
+//!
+//! Non-hot bookkeeping that is NOT keyed on a resolved-profile zone —
+//! `missing_profile_refs` / `missing_profile_warn_counters` (#3082, keyed by
+//! zones that have NO resolved profile) and the per-IP scan/sweep trackers —
+//! stays separate; folding it in would muddy the "one value per configured
+//! zone" invariant. `update_profiles` rebuilds `zones` per reconfigure,
+//! carrying over each persisting zone's in-flight state and reconciling its
+//! threshold-gated sub-state (see `ZoneScreenState::reconcile_substate`),
+//! preserving the exact pre-#4969 retention/reset behaviour. String keys are
+//! retained for now; numeric zone-id keying is deferred to #4421.
 
 use rustc_hash::FxHashMap;
 use std::net::IpAddr;
@@ -158,69 +195,86 @@ use syn_rate::SynRateSketch;
 use syncookie::SynCookieValidatedCache;
 use syncookie::SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC;
 
-/// Per-zone screen state with mutable rate counters and advanced trackers.
+/// #4969: consolidated per-zone screen state — the profile plus every HOT,
+/// mutable per-packet flood/cookie datum for one zone, in a SINGLE value.
+///
+/// Before #4969 these lived in ~13 parallel `FxHashMap<String, _>` tables on
+/// `ScreenState`, synchronised only by manual prepopulation/retention
+/// discipline in `update_profiles`. That was fail-open by construction: a
+/// missed prepopulation step silently turned a configured limiter into a
+/// missing-entry default (`false`/`0`/Pass) on the screened path, and every
+/// screened packet re-hashed the same zone name into several tables.
+///
+/// A `ZoneScreenState` is built by [`ZoneScreenState::from_profile`], which
+/// initialises the profile AND all of its threshold-gated sub-state together,
+/// so a configured zone can NEVER present a missing (fail-open) sub-state on
+/// the screened path — refresh drift is impossible by construction, not by
+/// discipline. A screened packet does ONE `zones` lookup and then touches
+/// these fields directly.
+///
+/// Threshold-gated sketches are `Option`: `Some` iff the corresponding
+/// threshold is configured (`> 0`). This preserves the "allocate only when
+/// configured; memory tracks live config" behaviour while making
+/// `Some ⟺ configured` a construction-time invariant.
+pub(crate) struct ZoneScreenState {
+    /// Resolved screen profile for the zone (typed thresholds/flags).
+    profile: ScreenProfile,
+    /// #4112 SECONDARY per-zone ICMP flood ceiling (checked at
+    /// `SECONDARY_FLOOD_CEILING_MULT × threshold`). #3607: a monotonic-ns
+    /// `TokenBucket` shaper so a sustained-at-ceiling zone is admitted.
+    icmp_counter: TokenBucket,
+    /// #4112 SECONDARY per-zone UDP flood ceiling (`TokenBucket` shaper).
+    udp_counter: TokenBucket,
+    /// #3315 per-zone SYN aggregate — count-all `RateCounter`; its admission
+    /// activates SYN cookies / drives the alarm (the deliberate
+    /// sustained-at-threshold over-throttle, see rate.rs).
+    syn_counter: RateCounter,
+    /// #3607 per-zone SYN-flood aggregate DROP shaper, the SOLE drop gate when
+    /// `syn-cookie` is OFF (capacity = refill = `syn_flood_threshold`). Unused
+    /// while `syn-cookie` is ON.
+    syn_off_attack_bucket: TokenBucket,
+    /// #4112/#5805 per-DESTINATION-IP ICMP flood sketch (PRIMARY cap). `Some`
+    /// iff `icmp_flood_threshold > 0`. Monotonic-ns `TokenBucket` cells.
+    icmp_dst_sketch: Option<SynRateSketch<TokenBucket>>,
+    /// #4112/#5805 per-DESTINATION (IP+PORT) UDP flood sketch (PRIMARY cap).
+    /// `Some` iff `udp_flood_threshold > 0`. `TokenBucket` cells.
+    udp_dst_sketch: Option<SynRateSketch<TokenBucket>>,
+    /// #3315 per-DESTINATION SYN-flood rate sketch (PRIMARY, spoof-resistant).
+    /// `Some` iff `syn_flood_dst_threshold > 0`; runs even when cookie-active.
+    syn_dst_sketch: Option<SynRateSketch>,
+    /// #3315 per-SOURCE SYN-flood rate sketch (SECONDARY/best-effort). `Some`
+    /// iff `syn_flood_src_threshold > 0`; SKIPPED while the zone is
+    /// SYN-cookie active.
+    syn_src_sketch: Option<SynRateSketch>,
+    /// Monotonic seconds until which the zone is SYN-cookie active (0 = never).
+    syn_cookie_active_until_secs: u64,
+    /// #3607 standby SYN-cookie ACK validation budget (`TokenBucket`).
+    syn_cookie_standby_ack_counter: TokenBucket,
+    /// #2446 per-zone SYN-cookie profile generation. Bumped by `update_profiles`
+    /// whenever a zone's SYN-cookie-relevant profile fields (`syn_cookie`,
+    /// `syn_flood_threshold`) change (including gaining/losing a profile). The
+    /// current generation is stamped into a validated-cache entry on insert and
+    /// compared on consume, so a tuple validated under an old profile is a cache
+    /// miss after the profile changes and is re-validated under the new one.
+    syn_cookie_profile_gen: u64,
+    /// #3315 last second a SYN-flood alarm was raised for the zone, enforcing
+    /// the ≤1/sec/zone cadence. `u64::MAX` = never emitted; only consulted when
+    /// `syn_flood_alarm_threshold > 0`.
+    syn_alarm_last_emit_sec: u64,
+}
+
+/// Global screen state: one consolidated per-zone map plus the cross-zone
+/// SYN-cookie machinery, per-IP scan/sweep trackers, missing-profile
+/// bookkeeping, and per-worker diagnostic counters.
 pub(crate) struct ScreenState {
-    profiles: FxHashMap<String, ScreenProfile>, // zone_name -> profile
-    // Per-zone AGGREGATE rate counters. #4112: for ICMP/UDP these are now the
-    // SECONDARY zone-saturation ceiling (checked at `SECONDARY_FLOOD_CEILING_MULT
-    // × threshold`) above the PRIMARY per-destination sketches below; Junos
-    // measures the ICMP/UDP flood rate per destination, not per zone.
-    // #3607: the ICMP/UDP per-zone flood aggregates are SHAPERS ("admitted"
-    // just means "not dropped"), so they use a monotonic-ns `TokenBucket` that
-    // admits a sustained-at-threshold stream correctly. The `syn_counters`
-    // aggregate below stays a `RateCounter`: it is count-all and its
-    // "admission" activates SYN cookies / drives the alarm, where the
-    // sustained-at-threshold over-throttle is deliberate (see rate.rs).
-    icmp_counters: FxHashMap<String, TokenBucket>,
-    udp_counters: FxHashMap<String, TokenBucket>,
-    syn_counters: FxHashMap<String, RateCounter>,
-    /// #3607: per-zone SYN-flood aggregate DROP shaper used ONLY when
-    /// `syn-cookie` is OFF. With no cookie to bypass, a sustained-at-threshold
-    /// legitimate SYN stream must be admitted, so the drop authority is this
-    /// token bucket (capacity = refill = `syn_flood_threshold`) rather than the
-    /// count-all `syn_counters`. It is the SOLE drop gate on every initial SYN
-    /// in the cookie-OFF case, so there is no double-quota with the aggregate
-    /// (which still counts, but only to drive the alarm). Unused while
-    /// `syn-cookie` is ON.
-    syn_off_attack_buckets: FxHashMap<String, TokenBucket>,
-    /// #4112: per-zone per-DESTINATION-IP ICMP flood sketch (Junos `icmp flood
-    /// threshold` is per destination). Present (Some) only for zones whose
-    /// `icmp_flood_threshold > 0`; reuses the #3315 count-min `SynRateSketch`
-    /// substrate. PRIMARY cap — checked before the per-zone aggregate ceiling.
-    /// #5805: the sketch cells are monotonic-ns `TokenBucket`s, not
-    /// `RateCounter`s, so a destination parked at exactly `icmp_flood_threshold`
-    /// pps stays admitted STEADILY (the count-all `RateCounter` collapsed it to
-    /// ~0 after the first second) while an over-threshold destination is still
-    /// limited down to the configured rate.
-    icmp_dst_sketch: FxHashMap<String, SynRateSketch<TokenBucket>>,
-    /// #4112: per-zone per-DESTINATION (IP + PORT) UDP flood sketch (Junos `udp
-    /// flood threshold` is per destination IP AND port). Present only for zones
-    /// whose `udp_flood_threshold > 0`; reuses the #3315 sketch via
-    /// `increment_ip_port`. PRIMARY cap — checked before the per-zone aggregate.
-    /// #5805: `TokenBucket` cells (see `icmp_dst_sketch`).
-    udp_dst_sketch: FxHashMap<String, SynRateSketch<TokenBucket>>,
-    syn_cookie_active_until_secs: FxHashMap<String, u64>,
-    /// #3607: the standby SYN-cookie ACK validation budget is a validate-budget
-    /// shaper ("admitted" = "spend a SipHash on a plausible returning ACK"; a
-    /// bogus ACK still fails the crypto check), so it uses a `TokenBucket` and
-    /// no longer suppresses legitimate returning clients parked at the budget
-    /// rate after a failover.
-    syn_cookie_standby_ack_counters: FxHashMap<String, TokenBucket>,
+    /// zone_name -> consolidated per-zone screen state (#4969). Single source
+    /// of truth for a zone's screen configuration AND its hot flood/cookie
+    /// state, so a screened packet does one lookup and a configured limiter can
+    /// never be silently absent. `has_profiles`/enumeration read `.profile`.
+    zones: FxHashMap<String, ZoneScreenState>,
+    // --- Global SYN-cookie machinery (NOT per-zone) ---
     syn_cookie_codec: Option<SynCookieCodec>,
     syn_cookie_validated: SynCookieValidatedCache,
-    /// #2446: per-zone SYN-cookie profile generation. Bumped in
-    /// `update_profiles` whenever a zone's SYN-cookie-relevant profile fields
-    /// (`syn_cookie` enable, `syn_flood_threshold`) change — including the
-    /// zone gaining or losing a profile, which is how a zone→profile
-    /// rebinding manifests. The current generation is stamped into a
-    /// validated-cache entry on insert and compared on consume, so a tuple
-    /// validated under an old profile is treated as a cache miss after the
-    /// profile changes and is re-validated under the new profile (its
-    /// SYN-flood counter then sees the connection). Keyed by zone name to
-    /// match `profiles`; the cache is keyed by `zone_id`, but both the insert
-    /// and consume sites carry the zone name, so the name→gen lookup happens
-    /// there.
-    syn_cookie_profile_gen: FxHashMap<String, u64>,
     syn_cookie_last_full_epoch: u64,
     /// #3032: Unix wall-clock seconds cached for SYN-cookie epoch math,
     /// refreshed at most once per monotonic second (see
@@ -239,10 +293,13 @@ pub(crate) struct ScreenState {
     last_cleanup_secs: u64,
     /// #3082: zone → name of a screen profile the zone REFERENCES but that was
     /// undefined when the snapshot was built (lenient/HA-sync path). A zone in
-    /// this map but absent from `profiles` is failing OPEN at the dataplane —
-    /// the `None` branch of `check_packet_with_zone_id` distinguishes it from a
+    /// this map but absent from `zones` is failing OPEN at the dataplane — the
+    /// `None` branch of `check_packet_with_zone_id` distinguishes it from a
     /// zone with no screen configured and emits a rate-limited runtime WARN
-    /// (the verdict still stays Pass; fail-closed posture is deferred).
+    /// (the verdict still stays Pass; fail-closed posture is deferred). Kept
+    /// SEPARATE from `zones` (#4969): its keys are zones that have NO resolved
+    /// profile, so they never appear in `zones` and folding them in would muddy
+    /// the "one value per configured zone" invariant.
     missing_profile_refs: FxHashMap<String, String>,
     /// #3082: per-zone rate counter that bounds the missing-profile WARN to
     /// `MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC` per zone so a flood of packets
@@ -251,24 +308,6 @@ pub(crate) struct ScreenState {
     /// #3082: count of WARNs actually emitted (post rate-limit). Test seam so a
     /// unit test can assert the WARN path was taken without scraping stderr.
     missing_profile_warn_count: u64,
-    /// #3315: per-zone per-DESTINATION SYN-flood rate sketch. Present (Some) only
-    /// for zones whose `destination-threshold` is configured; `get_mut(zone)`
-    /// returning Some both enables and supplies the limiter (no separate enable
-    /// bool needed). The per-dest control is PRIMARY and spoof-resistant (all
-    /// SYNs to a victim hit the same `d` CMS cells) and runs even when the zone
-    /// is SYN-cookie active.
-    syn_dst_sketch: FxHashMap<String, SynRateSketch>,
-    /// #3315: per-zone per-SOURCE SYN-flood rate sketch. Present only for zones
-    /// whose `source-threshold` is configured. SECONDARY/best-effort: it is
-    /// SKIPPED while the zone is SYN-cookie active (the cookie governs the
-    /// high-cardinality spoofed-flood regime and per-source is spoof-defeated
-    /// there anyway), which confines the sketch to the accurate sub-aggregate
-    /// regime.
-    syn_src_sketch: FxHashMap<String, SynRateSketch>,
-    /// #3315: per-zone last second a SYN-flood alarm event was raised, for the
-    /// ≤1/sec/zone cadence. Populated in `update_profiles` for alarm-enabled
-    /// zones so the hot path never allocates. `u64::MAX` = never emitted.
-    syn_alarm_last_emit_sec: FxHashMap<String, u64>,
     /// #3315: set when the just-checked packet crossed `alarm-threshold` (below
     /// attack-threshold) and the per-zone cadence admits a new alarm. Drained by
     /// `take_syn_alarm_event()` at the poll stage (which has the packet/zone in
@@ -292,6 +331,134 @@ pub(crate) struct ScreenState {
     /// screen ALARM event; surfacing it on `show security screen` is a tracked
     /// follow-up.
     alarm_without_drop_events: u64,
+}
+
+impl ZoneScreenState {
+    /// #4969: construct a zone's screen state from its profile, allocating ALL
+    /// threshold-gated sub-state (per-destination / per-source flood sketches)
+    /// up front, so a configured limiter can NEVER be silently absent on the
+    /// screened path. Aggregate counters and cookie fields start at their cold
+    /// defaults (`TokenBucket`/`RateCounter::default`, active-until 0, gen 0,
+    /// alarm-last `u64::MAX`). `Some ⟺ threshold configured` is the invariant.
+    fn from_profile(profile: ScreenProfile) -> Self {
+        let icmp_dst_sketch =
+            (profile.icmp_flood_threshold > 0).then(SynRateSketch::for_flood_dst);
+        let udp_dst_sketch =
+            (profile.udp_flood_threshold > 0).then(SynRateSketch::for_flood_dst);
+        let syn_dst_sketch = (profile.syn_flood_dst_threshold > 0).then(SynRateSketch::for_dst);
+        let syn_src_sketch = (profile.syn_flood_src_threshold > 0).then(SynRateSketch::for_src);
+        Self {
+            profile,
+            icmp_counter: TokenBucket::default(),
+            udp_counter: TokenBucket::default(),
+            syn_counter: RateCounter::default(),
+            syn_off_attack_bucket: TokenBucket::default(),
+            icmp_dst_sketch,
+            udp_dst_sketch,
+            syn_dst_sketch,
+            syn_src_sketch,
+            syn_cookie_active_until_secs: 0,
+            syn_cookie_standby_ack_counter: TokenBucket::default(),
+            syn_cookie_profile_gen: 0,
+            syn_alarm_last_emit_sec: u64::MAX,
+        }
+    }
+
+    /// #4969: reconcile a persisting zone's threshold-gated sub-state against
+    /// its (already-updated) `profile`, preserving in-flight counters exactly
+    /// where the pre-#4969 parallel-map `retain` + `or_insert_with` did. A
+    /// limiter newly enabled allocates its sketch; a disabled one drops it; a
+    /// still-configured one keeps its live sketch. The SYN-flood alarm cadence
+    /// is reset to `u64::MAX` when the alarm is disabled (mirroring the old
+    /// remove-on-disable so a later re-enable starts fresh) and otherwise
+    /// preserved. Aggregate counters, cookie active-until, standby budget, and
+    /// profile generation are inherited untouched from the retained value.
+    fn reconcile_substate(&mut self) {
+        reconcile_flood_sketch(
+            &mut self.icmp_dst_sketch,
+            self.profile.icmp_flood_threshold > 0,
+            SynRateSketch::for_flood_dst,
+        );
+        reconcile_flood_sketch(
+            &mut self.udp_dst_sketch,
+            self.profile.udp_flood_threshold > 0,
+            SynRateSketch::for_flood_dst,
+        );
+        reconcile_flood_sketch(
+            &mut self.syn_dst_sketch,
+            self.profile.syn_flood_dst_threshold > 0,
+            SynRateSketch::for_dst,
+        );
+        reconcile_flood_sketch(
+            &mut self.syn_src_sketch,
+            self.profile.syn_flood_src_threshold > 0,
+            SynRateSketch::for_src,
+        );
+        if self.profile.syn_flood_alarm_threshold == 0 {
+            self.syn_alarm_last_emit_sec = u64::MAX;
+        }
+    }
+
+    /// #4112 F18: ICMP flood admission. (1) the per-DESTINATION count-min
+    /// sketch is the PRIMARY cap at `threshold`; (2) the per-zone aggregate is a
+    /// coarse SECONDARY zone-saturation ceiling at `SECONDARY_FLOOD_CEILING_MULT
+    /// × threshold`. The per-destination check short-circuits, so the aggregate
+    /// counts only per-destination-admitted packets. Returns true when the
+    /// packet must be dropped as an ICMP flood. #5805: monotonic-ns
+    /// `TokenBucket` cells keep a destination parked at `threshold` admitted
+    /// steadily while limiting an over-threshold destination.
+    fn icmp_flood_drop(&mut self, dst_ip: &IpAddr, threshold: u32, now_ns: u64) -> bool {
+        if let Some(sketch) = self.icmp_dst_sketch.as_mut()
+            && sketch.increment(dst_ip, now_ns, threshold)
+        {
+            return true;
+        }
+        self.icmp_counter
+            .admit_is_over(now_ns, threshold.saturating_mul(SECONDARY_FLOOD_CEILING_MULT))
+    }
+
+    /// #4112 F18: UDP flood admission — like `icmp_flood_drop`, but the PRIMARY
+    /// per-destination cap keys on `(dst_ip, dst_port)` (Junos `udp flood
+    /// threshold` caps per destination IP AND port). #4567: a flowless non-first
+    /// fragment carries `dst_port == 0`, so it folds into the per-destination-IP
+    /// `increment(dst_ip)` cell (the same abstraction `icmp_flood_drop` uses),
+    /// not a stray `(ip, 0)` cell; a first/atomic fragment or normal datagram
+    /// always carries its real port and counts at `(dst_ip, dst_port)`.
+    fn udp_flood_drop(
+        &mut self,
+        dst_ip: &IpAddr,
+        dst_port: u16,
+        threshold: u32,
+        now_ns: u64,
+    ) -> bool {
+        if let Some(sketch) = self.udp_dst_sketch.as_mut() {
+            let over = if dst_port == 0 {
+                sketch.increment(dst_ip, now_ns, threshold)
+            } else {
+                sketch.increment_ip_port(dst_ip, dst_port, now_ns, threshold)
+            };
+            if over {
+                return true;
+            }
+        }
+        self.udp_counter
+            .admit_is_over(now_ns, threshold.saturating_mul(SECONDARY_FLOOD_CEILING_MULT))
+    }
+}
+
+/// #4969: reconcile one threshold-gated flood sketch against its enable state,
+/// mirroring the pre-#4969 `retain(threshold>0)` + `or_insert_with(make)`
+/// semantics: allocate a FRESH sketch when a limiter is newly enabled, drop the
+/// sketch (and its in-flight counters) when disabled, and PRESERVE the live
+/// sketch across an unrelated profile edit. `Some ⟺ want` after this returns.
+fn reconcile_flood_sketch<S>(slot: &mut Option<S>, want: bool, make: fn() -> S) {
+    if want {
+        if slot.is_none() {
+            *slot = Some(make());
+        }
+    } else {
+        *slot = None;
+    }
 }
 
 /// #3082: at most one missing-screen-profile WARN per zone per second.
@@ -323,18 +490,9 @@ const NANOS_PER_SEC: u64 = 1_000_000_000;
 impl ScreenState {
     pub fn new() -> Self {
         Self {
-            profiles: FxHashMap::default(),
-            icmp_counters: FxHashMap::default(),
-            udp_counters: FxHashMap::default(),
-            syn_counters: FxHashMap::default(),
-            syn_off_attack_buckets: FxHashMap::default(),
-            icmp_dst_sketch: FxHashMap::default(),
-            udp_dst_sketch: FxHashMap::default(),
-            syn_cookie_active_until_secs: FxHashMap::default(),
-            syn_cookie_standby_ack_counters: FxHashMap::default(),
+            zones: FxHashMap::default(),
             syn_cookie_codec: None,
             syn_cookie_validated: SynCookieValidatedCache::default(),
-            syn_cookie_profile_gen: FxHashMap::default(),
             syn_cookie_last_full_epoch: 0,
             syn_cookie_epoch_wall_secs: 0,
             syn_cookie_epoch_clock_mono_secs: u64::MAX,
@@ -346,9 +504,6 @@ impl ScreenState {
             missing_profile_refs: FxHashMap::default(),
             missing_profile_warn_counters: FxHashMap::default(),
             missing_profile_warn_count: 0,
-            syn_dst_sketch: FxHashMap::default(),
-            syn_src_sketch: FxHashMap::default(),
-            syn_alarm_last_emit_sec: FxHashMap::default(),
             syn_alarm_pending: false,
             syn_flood_dst_drops: 0,
             syn_flood_src_drops: 0,
@@ -403,102 +558,54 @@ impl ScreenState {
     }
 
     /// Replace all screen profiles (called on config update).
+    ///
+    /// #4969: rebuild the consolidated `zones` map from the incoming profiles.
+    /// A zone present in BOTH the old and new config carries over its in-flight
+    /// mutable flood/cookie state (aggregate counters, cookie active-until,
+    /// standby budget, profile generation, alarm cadence, and any
+    /// still-configured per-destination/per-source sketch) via
+    /// `ZoneScreenState::reconcile_substate`; a zone removed from the config is
+    /// dropped entirely (memory tracks live config). This preserves the exact
+    /// pre-#4969 retention/reset behaviour — previously ~13 parallel `retain` +
+    /// `or_insert` passes — as a single per-zone rebuild, and makes the
+    /// "configured limiter always has its sub-state" property hold by
+    /// construction rather than by prepopulation discipline.
     pub fn update_profiles(&mut self, profiles: FxHashMap<String, ScreenProfile>) {
-        // Clear rate counters for zones that no longer have profiles
-        self.icmp_counters.retain(|k, _| profiles.contains_key(k));
-        self.udp_counters.retain(|k, _| profiles.contains_key(k));
-        self.syn_counters.retain(|k, _| profiles.contains_key(k));
-        self.syn_off_attack_buckets
-            .retain(|k, _| profiles.contains_key(k));
-        // #4112: drop the per-destination ICMP/UDP flood sketches for zones that
-        // lost the corresponding threshold (memory tracks live config), mirroring
-        // the #3315 SYN sketches below.
-        self.icmp_dst_sketch
-            .retain(|k, _| profiles.get(k).is_some_and(|p| p.icmp_flood_threshold > 0));
-        self.udp_dst_sketch
-            .retain(|k, _| profiles.get(k).is_some_and(|p| p.udp_flood_threshold > 0));
-        self.syn_cookie_active_until_secs
-            .retain(|k, _| profiles.contains_key(k));
-        self.syn_cookie_standby_ack_counters
-            .retain(|k, _| profiles.contains_key(k));
-        // #2446: drop generation tracking for zones that lost their profile.
-        // If such a zone is reconfigured later, the absence (gen 0 vs. a
-        // freshly bumped gen) makes the next change a bump as well — but the
-        // master-key clear plus the per-entry TTL already bound any window,
-        // and a removed zone has no live cache consumers of its old gen.
-        self.syn_cookie_profile_gen
-            .retain(|k, _| profiles.contains_key(k));
-        for zone in profiles.keys() {
-            self.icmp_counters.entry(zone.clone()).or_default();
-            self.udp_counters.entry(zone.clone()).or_default();
-            self.syn_counters.entry(zone.clone()).or_default();
-            self.syn_off_attack_buckets.entry(zone.clone()).or_default();
-            // #4112: allocate the per-destination ICMP/UDP flood sketches ONCE
-            // per zone that configures the threshold (`or_insert_with` preserves
-            // in-flight counters across an unrelated profile edit; the
-            // per-increment threshold means a threshold change needs no realloc).
-            if profiles[zone].icmp_flood_threshold > 0 {
-                self.icmp_dst_sketch
-                    .entry(zone.clone())
-                    .or_insert_with(SynRateSketch::for_flood_dst);
-            }
-            if profiles[zone].udp_flood_threshold > 0 {
-                self.udp_dst_sketch
-                    .entry(zone.clone())
-                    .or_insert_with(SynRateSketch::for_flood_dst);
-            }
-            self.syn_cookie_active_until_secs
-                .entry(zone.clone())
-                .or_insert(0);
-            self.syn_cookie_standby_ack_counters
-                .entry(zone.clone())
-                .or_default();
-            // #2446: bump the per-zone SYN-cookie profile generation when a
-            // SYN-cookie-relevant field changes (or the zone newly gains a
-            // profile). Only `syn_cookie` (enable/disable) and
-            // `syn_flood_threshold` (the gate that consumes a validated-cache
-            // entry) affect whether a cached validation may legitimately
-            // bypass the SYN-flood counter, so unrelated profile edits
-            // (e.g. teardrop, port-scan) do NOT churn the validated cache.
-            let new_sig = Self::syn_cookie_profile_signature(&profiles[zone]);
-            let old_sig = self.profiles.get(zone).map(Self::syn_cookie_profile_signature);
-            if old_sig != Some(new_sig) {
-                let zone_gen = self.syn_cookie_profile_gen.entry(zone.clone()).or_insert(0);
-                *zone_gen = zone_gen.wrapping_add(1);
-            }
+        let mut old_zones = std::mem::take(&mut self.zones);
+        let mut new_zones = FxHashMap::default();
+        new_zones.reserve(profiles.len());
+        for (zone, profile) in profiles {
+            let new_sig = Self::syn_cookie_profile_signature(&profile);
+            let zstate = match old_zones.remove(&zone) {
+                Some(mut old) => {
+                    // Zone persists: carry over live mutable state, reconciling
+                    // the threshold-gated sub-state against the new profile.
+                    // #2446: bump the SYN-cookie profile generation when a
+                    // SYN-cookie-relevant field changes — only `syn_cookie` and
+                    // `syn_flood_threshold` gate the validated cache, so
+                    // unrelated edits (teardrop, port-scan, …) do NOT churn it.
+                    let old_sig = Self::syn_cookie_profile_signature(&old.profile);
+                    if old_sig != new_sig {
+                        old.syn_cookie_profile_gen = old.syn_cookie_profile_gen.wrapping_add(1);
+                    }
+                    old.profile = profile;
+                    old.reconcile_substate();
+                    old
+                }
+                None => {
+                    // New zone: fresh state from the profile. The pre-#4969
+                    // parallel maps bumped a brand-new zone's generation from 0
+                    // to 1 (`old_sig` None != `Some(new_sig)`); match that so a
+                    // cookie validated before a same-name zone is (re-)created
+                    // is treated as a miss under the new generation.
+                    let mut z = ZoneScreenState::from_profile(profile);
+                    z.syn_cookie_profile_gen = z.syn_cookie_profile_gen.wrapping_add(1);
+                    z
+                }
+            };
+            new_zones.insert(zone, zstate);
         }
-        // #3315: maintain the per-source / per-destination SYN-rate sketches and
-        // the alarm cadence map. Allocate ONLY for zones whose threshold is
-        // configured (192 KiB/zone for both); drop the table when the threshold
-        // is removed so memory tracks live config. The sketch is allocated ONCE
-        // per zone (not on every reload) — `entry(..).or_insert_with` preserves
-        // an existing sketch's in-flight counters across an unrelated profile
-        // edit; the per-increment threshold means a threshold change needs no
-        // realloc.
-        self.syn_dst_sketch
-            .retain(|k, _| profiles.get(k).is_some_and(|p| p.syn_flood_dst_threshold > 0));
-        self.syn_src_sketch
-            .retain(|k, _| profiles.get(k).is_some_and(|p| p.syn_flood_src_threshold > 0));
-        self.syn_alarm_last_emit_sec
-            .retain(|k, _| profiles.get(k).is_some_and(|p| p.syn_flood_alarm_threshold > 0));
-        for (zone, profile) in &profiles {
-            if profile.syn_flood_dst_threshold > 0 {
-                self.syn_dst_sketch
-                    .entry(zone.clone())
-                    .or_insert_with(SynRateSketch::for_dst);
-            }
-            if profile.syn_flood_src_threshold > 0 {
-                self.syn_src_sketch
-                    .entry(zone.clone())
-                    .or_insert_with(SynRateSketch::for_src);
-            }
-            if profile.syn_flood_alarm_threshold > 0 {
-                self.syn_alarm_last_emit_sec
-                    .entry(zone.clone())
-                    .or_insert(u64::MAX);
-            }
-        }
-        self.profiles = profiles;
+        self.zones = new_zones;
     }
 
     /// #3315: drain a pending SYN-flood alarm. Returns true at most once per
@@ -521,9 +628,9 @@ impl ScreenState {
     /// never produces a drop verdict in the first place.
     #[inline]
     pub(crate) fn alarm_without_drop(&self, zone: &str) -> bool {
-        self.profiles
+        self.zones
             .get(zone)
-            .is_some_and(|p| p.alarm_without_drop)
+            .is_some_and(|z| z.profile.alarm_without_drop)
     }
 
     /// Record one screen drop SUPPRESSED by `alarm-without-drop` mode (the
@@ -571,7 +678,7 @@ impl ScreenState {
     /// has no profile or has never been configured). Stamped into validated-
     /// cache entries on insert and compared on consume.
     fn syn_cookie_profile_gen(&self, zone: &str) -> u64 {
-        self.syn_cookie_profile_gen.get(zone).copied().unwrap_or(0)
+        self.zones.get(zone).map_or(0, |z| z.syn_cookie_profile_gen)
     }
 
     /// Publish the cluster-wide SYN-cookie master key into this worker's screen
@@ -633,110 +740,22 @@ impl ScreenState {
         self.syn_cookie_full_epoch_override = Some(full_epoch);
     }
 
+    /// #4969: standby SYN-cookie ACK validation budget check — the per-zone
+    /// `TokenBucket` now lives on `ZoneScreenState`. An absent zone (no profile)
+    /// returns `true` (limited), preserving the pre-#4969 `unwrap_or(true)`.
     fn standby_syn_cookie_ack_validation_limited(&mut self, zone: &str, now_ns: u64) -> bool {
-        self.syn_cookie_standby_ack_counters
+        self.zones
             .get_mut(zone)
-            .map(|bucket| {
-                bucket.admit_is_over(now_ns, SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC)
+            .map(|z| {
+                z.syn_cookie_standby_ack_counter
+                    .admit_is_over(now_ns, SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC)
             })
             .unwrap_or(true)
     }
 
-    /// #4112 F18: ICMP flood admission. Junos measures the ICMP flood rate PER
-    /// DESTINATION IP, not per zone. (1) the per-destination count-min sketch is
-    /// the PRIMARY cap at the configured `threshold`; (2) the per-zone aggregate
-    /// counter is a coarse SECONDARY zone-saturation ceiling at
-    /// `SECONDARY_FLOOD_CEILING_MULT × threshold`. The per-destination check
-    /// short-circuits, so the aggregate counts only per-destination-admitted
-    /// packets (it bounds the admitted zone-wide rate). Returns true when the
-    /// packet must be dropped as an ICMP flood. Shared by the flow-present and
-    /// flowless (`check_flowless_screens`) paths so both enforce identically.
-    fn icmp_flood_drop(
-        &mut self,
-        zone: &str,
-        dst_ip: &IpAddr,
-        threshold: u32,
-        now_ns: u64,
-    ) -> bool {
-        // (1) per-DESTINATION cap — PRIMARY (Junos parity). #5805: the count-min
-        // sketch now carries monotonic-ns `TokenBucket` cells (keyed on `now_ns`,
-        // the batch-cached `loop_now_ns`), so a destination parked at exactly
-        // `threshold` pps is admitted STEADILY instead of collapsing to ~0 after
-        // the first second (the count-all `RateCounter` defect). An
-        // over-threshold destination is still limited down to `threshold`.
-        if let Some(sketch) = self.icmp_dst_sketch.get_mut(zone)
-            && sketch.increment(dst_ip, now_ns, threshold)
-        {
-            return true;
-        }
-        // (2) per-zone aggregate — SECONDARY ceiling. #3607: a `TokenBucket`
-        // shaper (`now_ns`) so a sustained-at-ceiling zone is admitted rather
-        // than throttled to ~0 after the first second.
-        if let Some(bucket) = self.icmp_counters.get_mut(zone) {
-            return bucket.admit_is_over(
-                now_ns,
-                threshold.saturating_mul(SECONDARY_FLOOD_CEILING_MULT),
-            );
-        }
-        false
-    }
-
-    /// #4112 F18: UDP flood admission — like `icmp_flood_drop`, but the PRIMARY
-    /// per-destination cap keys on `(dst_ip, dst_port)` (Junos `udp flood
-    /// threshold` caps the rate to a destination IP AND port). On the flowless
-    /// path a non-first fragment carries no L4 port, so `dst_port` is 0 there and
-    /// the cap folds to the per-destination-IP `increment(dst_ip)` bucket — the
-    /// same abstraction `icmp_flood_drop` uses (#4567; see the body note).
-    fn udp_flood_drop(
-        &mut self,
-        zone: &str,
-        dst_ip: &IpAddr,
-        dst_port: u16,
-        threshold: u32,
-        now_ns: u64,
-    ) -> bool {
-        // (1) per-DESTINATION cap — PRIMARY (Junos parity). #5805: `TokenBucket`
-        // sketch cells keyed on `now_ns` (see `icmp_flood_drop`), so a
-        // (dst_ip, dst_port) parked at exactly `threshold` pps stays admitted.
-        //
-        // #4567: a non-first IP fragment carries no L4 header, so the flowless
-        // caller passes `dst_port == 0`. Counting it via `increment_ip_port(ip,
-        // 0)` splinters a fragmented UDP flood into its own `(ip, 0)` cell — a
-        // SENTINEL port, not a real one — distinct from BOTH the datagram's real
-        // `(ip, port)` cell (first/atomic fragments, flow path) AND the
-        // per-destination-IP abstraction the ICMP flood path already uses. Fold
-        // the port-less fragment into the SAME per-destination-IP
-        // `increment(dst_ip)` bucket as `icmp_flood_drop`, so trailing fragments
-        // accumulate in one consistent per-IP cell instead of a stray `(ip, 0)`
-        // cell. A first/atomic fragment or a normal datagram always carries its
-        // real port here (`dst_port != 0`) and still counts at `(dst_ip,
-        // dst_port)`, unchanged. Converging a trailing fragment onto its
-        // datagram's real `(ip, port)` cell would need reassembly context xpf
-        // lacks, so the per-IP fold is the bounded, honest abstraction.
-        if let Some(sketch) = self.udp_dst_sketch.get_mut(zone) {
-            let over = if dst_port == 0 {
-                sketch.increment(dst_ip, now_ns, threshold)
-            } else {
-                sketch.increment_ip_port(dst_ip, dst_port, now_ns, threshold)
-            };
-            if over {
-                return true;
-            }
-        }
-        // (2) per-zone aggregate — SECONDARY ceiling. #3607: `TokenBucket`
-        // shaper (`now_ns`).
-        if let Some(bucket) = self.udp_counters.get_mut(zone) {
-            return bucket.admit_is_over(
-                now_ns,
-                threshold.saturating_mul(SECONDARY_FLOOD_CEILING_MULT),
-            );
-        }
-        false
-    }
-
     /// Returns true if any zone has a screen profile configured.
     pub fn has_profiles(&self) -> bool {
-        !self.profiles.is_empty()
+        !self.zones.is_empty()
     }
 
     /// Run all screen checks for a packet arriving on the given zone.
@@ -803,7 +822,18 @@ impl ScreenState {
         // that need `&mut self` (SYN-cookie codec/epoch/validated-cache)
         // copy the small fields they need out of `*profile` first so the
         // immutable `profiles` borrow is not held across them.
-        let Some(profile) = self.profiles.get(zone) else {
+        // #4969: ONE lookup for the whole screened packet. `zstate` holds the
+        // profile AND every mutable per-zone flood/cookie counter, so the
+        // stateless checks read `&zstate.profile` and the rate checks below
+        // mutate disjoint sub-fields of the SAME value — no re-hashing the zone
+        // name per check. The global SYN-cookie machinery (`syn_cookie_codec`,
+        // `syn_cookie_validated`, the epoch cache) and the diagnostic counters
+        // are DISJOINT `self` fields, so a `zstate` borrow coexists with a
+        // `self.syn_cookie_validated`/`self.syn_flood_*` access; the only
+        // whole-`self` method used below (`current_syn_cookie_full_epoch`) is
+        // reached solely on the SYN-cookie mint RETURN path, after `zstate`'s
+        // last use, so NLL releases the borrow first.
+        let Some(zstate) = self.zones.get_mut(zone) else {
             // #3082: no resolved profile for this zone. Distinguish the two
             // None cases: a zone that references a MISSING screen profile
             // (lenient/HA-sync fail-open) gets a rate-limited runtime WARN; a
@@ -814,22 +844,22 @@ impl ScreenState {
         };
 
         // --- Stateless checks (side-effect-free) ---
-        if let Some(reason) = stateless::check_land(profile, pkt) {
+        if let Some(reason) = stateless::check_land(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_tcp_flag_screens(profile, pkt) {
+        if let Some(reason) = stateless::check_tcp_flag_screens(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_ping_of_death(profile, pkt) {
+        if let Some(reason) = stateless::check_ping_of_death(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_teardrop(profile, pkt) {
+        if let Some(reason) = stateless::check_teardrop(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_icmp_fragment(profile, pkt) {
+        if let Some(reason) = stateless::check_icmp_fragment(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_source_route(profile, pkt) {
+        if let Some(reason) = stateless::check_source_route(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
 
@@ -853,32 +883,27 @@ impl ScreenState {
         }
 
         // --- Rate-based flood checks ---
-        // Copy the small scalar thresholds/flags out of the profile so the
-        // immutable `self.profiles` borrow is released before the SYN-cookie
-        // path needs `&mut self` (`current_syn_cookie_full_epoch`,
-        // `syn_cookie_validated`). The flood counters below are disjoint
-        // fields so they could borrow alongside `profile`, but pulling the
-        // scalars up front keeps the SYN-cookie borrow story trivial.
-        let icmp_flood_threshold = profile.icmp_flood_threshold;
-        let udp_flood_threshold = profile.udp_flood_threshold;
-        let syn_flood_threshold = profile.syn_flood_threshold;
-        let syn_cookie = profile.syn_cookie;
-        // Profile-wide `alarm-without-drop` audit mode. Copied up front with the
-        // other scalars (the immutable `profile` borrow is released before the
-        // SYN-cookie sub-state needs `&mut self`). Used to gate the cookie-active
-        // marking below so audit mode does not arm the returning-ACK drop.
-        let alarm_without_drop = profile.alarm_without_drop;
-        // #3315: SYN-flood sub-thresholds (0 = disabled). Pulled up front with
-        // the other scalars so the immutable `self.profiles` borrow is released
-        // before the per-source/per-destination sketches and the alarm map need
-        // `&mut self`.
-        let syn_alarm_threshold = profile.syn_flood_alarm_threshold;
-        let syn_dst_threshold = profile.syn_flood_dst_threshold;
-        let syn_src_threshold = profile.syn_flood_src_threshold;
-        // `profile` borrow ends here (NLL): no further reads of
-        // `self.profiles` in this method. Scan/sweep moved to the new-flow
-        // hook (`scan_sweep_drop_on_new_flow`), so the advanced trackers are
-        // not touched on this per-packet path anymore (#2210).
+        // Copy the small scalar thresholds/flags out of the profile up front so
+        // the shared `&zstate.profile` borrow is released before the mutable
+        // per-zone sub-field accesses below (and the whole-`self` SYN-cookie
+        // epoch call on the mint path). #4969: `zstate.profile` and the mutable
+        // sub-fields are disjoint, but pulling the scalars up front keeps the
+        // borrow story trivial.
+        let icmp_flood_threshold = zstate.profile.icmp_flood_threshold;
+        let udp_flood_threshold = zstate.profile.udp_flood_threshold;
+        let syn_flood_threshold = zstate.profile.syn_flood_threshold;
+        let syn_cookie = zstate.profile.syn_cookie;
+        // Profile-wide `alarm-without-drop` audit mode. Used to gate the
+        // cookie-active marking below so audit mode does not arm the
+        // returning-ACK drop.
+        let alarm_without_drop = zstate.profile.alarm_without_drop;
+        // #3315: SYN-flood sub-thresholds (0 = disabled).
+        let syn_alarm_threshold = zstate.profile.syn_flood_alarm_threshold;
+        let syn_dst_threshold = zstate.profile.syn_flood_dst_threshold;
+        let syn_src_threshold = zstate.profile.syn_flood_src_threshold;
+        // Scan/sweep moved to the new-flow hook (`scan_sweep_drop_on_new_flow`),
+        // so the advanced trackers are not touched on this per-packet path
+        // anymore (#2210).
 
         let mut syn_cookie_bypassed = false;
 
@@ -886,7 +911,7 @@ impl ScreenState {
         // (SECONDARY). Junos measures this rate per destination IP (#4112 F18).
         if icmp_flood_threshold > 0
             && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
-            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_ns)
+            && zstate.icmp_flood_drop(&pkt.dst_ip, icmp_flood_threshold, now_ns)
         {
             return ScreenVerdict::Drop("icmp-flood");
         }
@@ -896,7 +921,7 @@ impl ScreenState {
         // (#4112 F18).
         if udp_flood_threshold > 0
             && pkt.protocol == PROTO_UDP
-            && self.udp_flood_drop(zone, &pkt.dst_ip, pkt.dst_port, udp_flood_threshold, now_ns)
+            && zstate.udp_flood_drop(&pkt.dst_ip, pkt.dst_port, udp_flood_threshold, now_ns)
         {
             return ScreenVerdict::Drop("udp-flood");
         }
@@ -923,7 +948,13 @@ impl ScreenState {
         if syn_flood_threshold > 0 && pkt.protocol == PROTO_TCP {
             let tf = pkt.tcp_flags;
             if is_initial_syn(tf) {
-                let profile_gen = self.syn_cookie_profile_gen(zone);
+                // #4969: read the profile generation from the held `zstate`
+                // (not `self.syn_cookie_profile_gen(zone)`, which would borrow
+                // all of `self` and conflict with the live `zstate`). The
+                // validated cache is a DISJOINT `self` field, so
+                // `self.syn_cookie_validated.take_valid(..)` coexists with the
+                // `zstate` borrow.
+                let profile_gen = zstate.syn_cookie_profile_gen;
                 let syn_cookie_validated = syn_cookie
                     && self.syn_cookie_validated.take_valid(
                         zone_id,
@@ -944,17 +975,11 @@ impl ScreenState {
                     } else {
                         u32::MAX
                     };
-                    let (over_attack, over_alarm) = self
-                        .syn_counters
-                        .get_mut(zone)
-                        .map(|counter| {
-                            counter.increment_and_classify(
-                                now_secs,
-                                syn_flood_threshold,
-                                alarm_arg,
-                            )
-                        })
-                        .unwrap_or((false, false));
+                    let (over_attack, over_alarm) = zstate.syn_counter.increment_and_classify(
+                        now_secs,
+                        syn_flood_threshold,
+                        alarm_arg,
+                    );
                     // (2) per-DESTINATION cap — PRIMARY. Evaluated BEFORE the
                     // aggregate over-attack early-return (#4112 F19) so a
                     // per-destination trip HARD-DROPS the flooded victim even
@@ -969,7 +994,7 @@ impl ScreenState {
                     // is never skipped); a per-dst trip never flips zone cookie
                     // state. Runs even when the zone is cookie-active.
                     if syn_dst_threshold > 0
-                        && let Some(sketch) = self.syn_dst_sketch.get_mut(zone)
+                        && let Some(sketch) = zstate.syn_dst_sketch.as_mut()
                         && sketch.increment(&pkt.dst_ip, now_secs, syn_dst_threshold)
                     {
                         self.syn_flood_dst_drops = self.syn_flood_dst_drops.wrapping_add(1);
@@ -1007,17 +1032,17 @@ impl ScreenState {
                             // skipped in audit mode, which is correct: the check
                             // should still run and alarm.
                             if !alarm_without_drop {
-                                if let Some(active_until) =
-                                    self.syn_cookie_active_until_secs.get_mut(zone)
-                                {
-                                    *active_until =
-                                        now_secs.saturating_add(SynCookieCodec::EPOCH_SECS);
-                                } else {
-                                    debug_assert!(
-                                        false,
-                                        "screen profile update prepopulates SYN-cookie active state"
-                                    );
-                                }
+                                // #4969: active-until is a field on the zone's
+                                // consolidated state, present by construction —
+                                // the pre-#4969 `debug_assert!` guarding a
+                                // missing prepopulated entry is now a
+                                // compile-time impossibility. This is the last
+                                // use of `zstate` on the mint RETURN path, so
+                                // NLL releases the `self.zones` borrow before the
+                                // whole-`self` `current_syn_cookie_full_epoch`
+                                // call below.
+                                zstate.syn_cookie_active_until_secs =
+                                    now_secs.saturating_add(SynCookieCodec::EPOCH_SECS);
                             }
                             let Some(codec) = self.syn_cookie_codec else {
                                 return ScreenVerdict::Drop("syn-cookie-unavailable");
@@ -1034,8 +1059,9 @@ impl ScreenState {
                                 peer_mss: pkt.tcp_mss,
                             });
                         }
-                    } else if let Some(bucket) = self.syn_off_attack_buckets.get_mut(zone)
-                        && bucket.admit_is_over(now_ns, syn_flood_threshold)
+                    } else if zstate
+                        .syn_off_attack_bucket
+                        .admit_is_over(now_ns, syn_flood_threshold)
                     {
                         return ScreenVerdict::Drop("syn-flood");
                     }
@@ -1051,10 +1077,9 @@ impl ScreenState {
                     if syn_alarm_threshold > 0
                         && over_alarm
                         && !over_attack
-                        && let Some(last) = self.syn_alarm_last_emit_sec.get_mut(zone)
-                        && *last != now_secs
+                        && zstate.syn_alarm_last_emit_sec != now_secs
                     {
-                        *last = now_secs;
+                        zstate.syn_alarm_last_emit_sec = now_secs;
                         self.syn_alarm_pending = true;
                         self.syn_flood_alarm_events = self.syn_flood_alarm_events.wrapping_add(1);
                     }
@@ -1062,14 +1087,11 @@ impl ScreenState {
                     // SYN-cookie active (D3). The cookie-active window is the
                     // high-cardinality spoofed-flood regime where per-source is
                     // both spoof-defeated and prone to sketch over-throttling.
-                    let cookie_active = syn_cookie
-                        && self
-                            .syn_cookie_active_until_secs
-                            .get(zone)
-                            .is_some_and(|&until| until > now_secs);
+                    let cookie_active =
+                        syn_cookie && zstate.syn_cookie_active_until_secs > now_secs;
                     if syn_src_threshold > 0
                         && !cookie_active
-                        && let Some(sketch) = self.syn_src_sketch.get_mut(zone)
+                        && let Some(sketch) = zstate.syn_src_sketch.as_mut()
                         && sketch.increment(&pkt.src_ip, now_secs, syn_src_threshold)
                     {
                         self.syn_flood_src_drops = self.syn_flood_src_drops.wrapping_add(1);
@@ -1177,7 +1199,10 @@ impl ScreenState {
         now_secs: u64,
         skip_rate_flood: bool,
     ) -> ScreenVerdict {
-        let Some(profile) = self.profiles.get(zone) else {
+        // #4969: ONE lookup — `zstate` supplies the profile for the stateless
+        // screens and the per-zone flood counters (via `icmp_flood_drop` /
+        // `udp_flood_drop`) for the rate screens.
+        let Some(zstate) = self.zones.get_mut(zone) else {
             // #3908: mirror the flow-present `check_packet_with_zone_id` None
             // branch so the flowless path is as observable as the flow path.
             // A zone that REFERENCES a screen profile undefined at
@@ -1194,19 +1219,19 @@ impl ScreenState {
         // --- Stateless, source-independent checks (side-effect-free) ---
         // LAND is address-dependent: only evaluate it when the caller
         // supplied the real L3 addresses (`addrs_known`).
-        if addrs_known && let Some(reason) = stateless::check_land(profile, pkt) {
+        if addrs_known && let Some(reason) = stateless::check_land(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_ping_of_death(profile, pkt) {
+        if let Some(reason) = stateless::check_ping_of_death(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_teardrop(profile, pkt) {
+        if let Some(reason) = stateless::check_teardrop(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_icmp_fragment(profile, pkt) {
+        if let Some(reason) = stateless::check_icmp_fragment(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_source_route(profile, pkt) {
+        if let Some(reason) = stateless::check_source_route(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
         // #4155: fabric-redirected flowless traffic was already rate-screened
@@ -1217,19 +1242,15 @@ impl ScreenState {
             return ScreenVerdict::Pass;
         }
         // --- Rate-based flood checks (source-independent, per-zone) ---
-        // Copy the scalar thresholds out so the immutable `self.profiles`
-        // borrow is released before the `&mut self` per-zone counter maps
-        // (mirrors `check_packet_with_zone_id`).
-        let icmp_flood_threshold = profile.icmp_flood_threshold;
-        let udp_flood_threshold = profile.udp_flood_threshold;
-        // `profile` borrow ends here (NLL): no further reads of `self.profiles`.
+        let icmp_flood_threshold = zstate.profile.icmp_flood_threshold;
+        let udp_flood_threshold = zstate.profile.udp_flood_threshold;
 
         // ICMP flood — per-DESTINATION cap (PRIMARY) + per-zone aggregate ceiling
         // (SECONDARY), same as the flow-present path (#4112 F18). Keeps a
         // fragment-based flood from evading the per-destination cap.
         if icmp_flood_threshold > 0
             && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
-            && self.icmp_flood_drop(zone, &pkt.dst_ip, icmp_flood_threshold, now_ns)
+            && zstate.icmp_flood_drop(&pkt.dst_ip, icmp_flood_threshold, now_ns)
         {
             return ScreenVerdict::Drop("icmp-flood");
         }
@@ -1241,7 +1262,7 @@ impl ScreenState {
         // stray `(ip, 0)` cell (#4112 F18, #4567).
         if udp_flood_threshold > 0
             && pkt.protocol == PROTO_UDP
-            && self.udp_flood_drop(zone, &pkt.dst_ip, pkt.dst_port, udp_flood_threshold, now_ns)
+            && zstate.udp_flood_drop(&pkt.dst_ip, pkt.dst_port, udp_flood_threshold, now_ns)
         {
             return ScreenVerdict::Drop("udp-flood");
         }
@@ -1272,16 +1293,17 @@ impl ScreenState {
         pkt: &ScreenPacketInfo,
         now_micros: u64,
     ) -> Option<&'static str> {
-        let Some(profile) = self.profiles.get(zone) else {
+        let Some(zstate) = self.zones.get(zone) else {
             return None;
         };
         // #4114: the Junos `threshold` is a MICROSECOND detection WINDOW (not a
         // count). The detection COUNT is the fixed `SCAN_DETECT_COUNT` in
         // `scan.rs`. `port_scan_threshold`/`ip_sweep_threshold` carry that
         // per-zone window (u32 us); 0 = the check is disabled.
-        let port_scan_window = u64::from(profile.port_scan_threshold);
-        let ip_sweep_window = u64::from(profile.ip_sweep_threshold);
-        // `profile` borrow ends here (NLL).
+        let port_scan_window = u64::from(zstate.profile.port_scan_threshold);
+        let ip_sweep_window = u64::from(zstate.profile.ip_sweep_threshold);
+        // `zstate` borrow ends here (NLL): the per-IP scan/sweep trackers are
+        // global `&mut self` fields, reached below only after this point.
         if port_scan_window == 0 && ip_sweep_window == 0 {
             // Still tick the cleanup so a config with the feature briefly
             // enabled-then-disabled cannot strand tracker state.
@@ -1367,9 +1389,9 @@ impl ScreenState {
     fn scan_cleanup_floors(&self) -> (u64, u64) {
         let mut port_scan_floor = 0u64;
         let mut ip_sweep_floor = 0u64;
-        for profile in self.profiles.values() {
-            port_scan_floor = port_scan_floor.max(u64::from(profile.port_scan_threshold));
-            ip_sweep_floor = ip_sweep_floor.max(u64::from(profile.ip_sweep_threshold));
+        for zstate in self.zones.values() {
+            port_scan_floor = port_scan_floor.max(u64::from(zstate.profile.port_scan_threshold));
+            ip_sweep_floor = ip_sweep_floor.max(u64::from(zstate.profile.ip_sweep_threshold));
         }
         (port_scan_floor, ip_sweep_floor)
     }
@@ -1418,21 +1440,25 @@ impl ScreenState {
         now_ns: u64,
         now_secs: u64,
     ) -> SynCookieAckVerdict {
-        let Some(profile) = self.profiles.get(zone) else {
+        // #4969: one shared `zones` lookup for the profile applicability gate
+        // AND the cookie active-until read. The borrow ends at `locally_active`
+        // (a copied bool), before the whole-`self` epoch call below; the standby
+        // budget and profile-gen reads later go through their own helpers (this
+        // is the cold session-miss ACK path, not the per-packet hot path).
+        let Some(zstate) = self.zones.get(zone) else {
             return SynCookieAckVerdict::NotApplicable;
         };
-        if !profile.syn_cookie || profile.syn_flood_threshold == 0 || pkt.protocol != PROTO_TCP {
+        if !zstate.profile.syn_cookie
+            || zstate.profile.syn_flood_threshold == 0
+            || pkt.protocol != PROTO_TCP
+        {
             return SynCookieAckVerdict::NotApplicable;
         }
         let flags = pkt.tcp_flags;
         if (flags & TCP_ACK) == 0 || (flags & TCP_SYN) != 0 {
             return SynCookieAckVerdict::NotApplicable;
         }
-        let locally_active = self
-            .syn_cookie_active_until_secs
-            .get(zone)
-            .copied()
-            .is_some_and(|until| until > now_secs);
+        let locally_active = zstate.syn_cookie_active_until_secs > now_secs;
         if is_closing(flags) {
             return if locally_active {
                 SynCookieAckVerdict::Invalid
@@ -1480,7 +1506,11 @@ impl ScreenState {
 
     #[cfg(test)]
     fn syn_cookie_active_zone_count(&self) -> usize {
-        self.syn_cookie_active_until_secs.len()
+        // #4969: every configured zone carries a `syn_cookie_active_until_secs`
+        // field by construction, so the configured-zone count IS the number of
+        // zones (matching the pre-#4969 `syn_cookie_active_until_secs.len()`,
+        // which had one prepopulated entry per profile zone).
+        self.zones.len()
     }
 
     /// #3607: whole tokens still available in a zone's standby SYN-cookie ACK
@@ -1488,9 +1518,9 @@ impl ScreenState {
     /// accessor: `0` means the budget is fully spent for this instant.
     #[cfg(test)]
     fn syn_cookie_standby_ack_available(&self, zone: &str) -> u64 {
-        self.syn_cookie_standby_ack_counters
+        self.zones
             .get(zone)
-            .map(|bucket| bucket.available_tokens())
+            .map(|z| z.syn_cookie_standby_ack_counter.available_tokens())
             .unwrap_or(0)
     }
 
@@ -1499,20 +1529,52 @@ impl ScreenState {
     /// the standby limiter, so no SipHash budget was spent. Test seam.
     #[cfg(test)]
     fn syn_cookie_standby_ack_untouched(&self, zone: &str) -> bool {
-        self.syn_cookie_standby_ack_counters
+        self.zones
             .get(zone)
-            .map(|bucket| bucket.is_cold())
+            .map(|z| z.syn_cookie_standby_ack_counter.is_cold())
             .unwrap_or(true)
+    }
+
+    /// #4969: test seam — force a zone SYN-cookie-active until `until_secs`
+    /// (replaces the pre-#4969 direct `syn_cookie_active_until_secs.insert`).
+    #[cfg(test)]
+    fn force_syn_cookie_active_for_test(&mut self, zone: &str, until_secs: u64) {
+        if let Some(z) = self.zones.get_mut(zone) {
+            z.syn_cookie_active_until_secs = until_secs;
+        }
+    }
+
+    /// #4969: test seam — true iff a zone's per-DESTINATION / per-SOURCE
+    /// SYN-flood sketch is allocated (present). Mirrors the pre-#4969
+    /// `syn_dst_sketch.contains_key` / `syn_src_sketch.contains_key`.
+    #[cfg(test)]
+    fn syn_dst_sketch_present(&self, zone: &str) -> bool {
+        self.zones.get(zone).is_some_and(|z| z.syn_dst_sketch.is_some())
+    }
+    #[cfg(test)]
+    fn syn_src_sketch_present(&self, zone: &str) -> bool {
+        self.zones.get(zone).is_some_and(|z| z.syn_src_sketch.is_some())
+    }
+
+    /// #4969: test seam — mutable access to a zone's per-DESTINATION UDP flood
+    /// sketch (for the #4567 cell-saturation discriminator test). Panics if the
+    /// zone or sketch is absent, matching the pre-#4969 `.get(...).unwrap()`.
+    #[cfg(test)]
+    fn udp_dst_sketch_mut_for_test(&mut self, zone: &str) -> &mut SynRateSketch<TokenBucket> {
+        self.zones
+            .get_mut(zone)
+            .and_then(|z| z.udp_dst_sketch.as_mut())
+            .expect("udp_dst_sketch present for a zone with udp_flood_threshold > 0")
     }
 
     /// Returns true if any zone has session limits, port scan, or IP sweep enabled.
     #[allow(dead_code)]
     pub fn has_advanced_features(&self) -> bool {
-        self.profiles.values().any(|p| {
-            p.session_limit_src > 0
-                || p.session_limit_dst > 0
-                || p.port_scan_threshold > 0
-                || p.ip_sweep_threshold > 0
+        self.zones.values().any(|z| {
+            z.profile.session_limit_src > 0
+                || z.profile.session_limit_dst > 0
+                || z.profile.port_scan_threshold > 0
+                || z.profile.ip_sweep_threshold > 0
         })
     }
 
@@ -1523,9 +1585,9 @@ impl ScreenState {
     /// `has_advanced_features` (which also covers port-scan / ip-sweep,
     /// neither of which touches the SessionTable count).
     pub fn any_session_limit_configured(&self) -> bool {
-        self.profiles
+        self.zones
             .values()
-            .any(|p| p.session_limit_src > 0 || p.session_limit_dst > 0)
+            .any(|z| z.profile.session_limit_src > 0 || z.profile.session_limit_dst > 0)
     }
 }
 

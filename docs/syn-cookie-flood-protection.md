@@ -92,8 +92,10 @@ via `SynRateSketch::increment` (ICMP, keyed on `dst_ip`) and `increment_ip_port`
   allocated per zone that configures the threshold (`icmp_dst_sketch` /
   `udp_dst_sketch`, `ROWS*DST_COLS*16 = 64 KiB` each, mirroring the #3315 per-dest
   sizing) and freed when the threshold is removed.
-- **SECONDARY per-zone ceiling** — the existing `icmp_counters` / `udp_counters`
-  aggregate is retained as a coarse zone-saturation backstop at
+- **SECONDARY per-zone ceiling** — the per-zone ICMP/UDP flood aggregate
+  (the `icmp_counter` / `udp_counter` `TokenBucket` fields on `ZoneScreenState`
+  since #4969; the former standalone `icmp_counters` / `udp_counters` maps) is
+  retained as a coarse zone-saturation backstop at
   `SECONDARY_FLOOD_CEILING_MULT × threshold` (currently 8×). It counts only
   per-destination-ADMITTED packets (the per-destination check short-circuits
   first), so it bounds the admitted zone-wide rate and still caps a flood spread
@@ -213,12 +215,34 @@ window — counting behaviour, thresholds, and detection are unchanged) and is
 node-local (never wire/HA-synced; each node reseeds independently).
 
 Each sketch is allocated PER
-THRESHOLD, not per zone: the per-destination sketch only when
+THRESHOLD, not unconditionally: the per-destination sketch only when
 `destination-threshold > 0`, the per-source sketch only when
-`source-threshold > 0` (`update_profiles`, `screen/mod.rs` ~333/345), and each
-is freed when its threshold is removed. An **alarm-only** profile
-(`alarm-threshold` set, no source/destination cap) allocates NEITHER sketch —
-only the tiny per-zone `syn_alarm_last_emit_sec` cadence timestamp (~350).
+`source-threshold > 0`, and each is freed when its threshold is removed. An
+**alarm-only** profile (`alarm-threshold` set, no source/destination cap)
+allocates NEITHER sketch — only the tiny per-zone `syn_alarm_last_emit_sec`
+cadence timestamp.
+
+**Per-zone state consolidation (#4969).** These sketches, the SYN aggregate
+counter, the SYN-cookie active-until / standby-budget / profile-generation
+fields, and the ICMP/UDP flood aggregates + per-destination sketches ALL live in
+one `ZoneScreenState` value per zone, stored in a single
+`FxHashMap<String, ZoneScreenState>` (`ScreenState::zones` in
+`userspace-dp/src/screen/mod.rs`) — not the ~13 parallel `FxHashMap<String, _>`
+tables that preceded #4969. A `ZoneScreenState` is built by
+`ZoneScreenState::from_profile`, which allocates every threshold-gated sub-state
+together (`Some ⟺ configured` for the sketches). The two consequences: a
+configured limiter can NEVER be silently missing on the screened path (the
+pre-#4969 fail-open where a missed prepopulation step left a table entry absent
+and the `if let Some(sketch)` check fell through to Pass), and a screened packet
+does ONE `zones` lookup instead of re-hashing the zone name into each table.
+`update_profiles` rebuilds `zones` on reconfigure, carrying over each persisting
+zone's in-flight counters and reconciling its threshold-gated sub-state
+(`ZoneScreenState::reconcile_substate`) — the same allocate-on-enable /
+free-on-disable / preserve-across-unrelated-edit behaviour as before. The
+global SYN-cookie codec, validated cache, and epoch cache stay separate
+`ScreenState` fields (they are cross-zone, keyed by `zone_id`), as do the per-IP
+scan/sweep trackers and the `missing_profile_*` bookkeeping. String zone-name
+keys are retained; numeric zone-id keying is deferred to #4421.
 
 Memory (per worker): `RateCounter` ≈ 16 B. The per-destination sketch costs
 `ROWS*DST_COLS*16 = 64 KiB` and is allocated only when `destination-threshold`
