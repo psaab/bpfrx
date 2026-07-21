@@ -62,6 +62,38 @@ installed into both places:
 install, they clear the cached FIB result so the receiving node recomputes
 node-local forwarding.
 
+**#5305 — the forward install is transactional.** A forward cluster-synced
+install writes the pinned BPF session mirror FIRST, then mirrors the entry to
+the Rust helper. If the helper mirror fails (connect/write/decode), the install
+RESTORES the BPF pre-image before returning — it rewrites the prior value, or
+DELETES the key if it was absent — so a failed install leaves the BPF map
+exactly as it was. Without this, the pinned map would hold a session the helper
+never received: a split truth the GC and the fallback bulk export
+(`ExportOwnerRGSessions`) would propagate as if the install had succeeded,
+producing nondeterministic HA session ownership after takeover. The pre-image
+snapshot, the BPF write, the helper mirror, and the compensating restore all run
+under `m.mu`, so the sequence is atomic against any other `m.mu`-holding path;
+the per-peer receiver apply loop is single-threaded (`installClusterSyncedV4` in
+`pkg/cluster/sync_conn.go`), so no concurrent install of the same key races. The
+existing health behavior is preserved: `recordSessionMirrorFailureLocked` still
+fires on the failure (takeover stays disarmed until the socket is proven healthy
+again), and `recordSessionMirrorSuccessLocked` still clears the sticky #5247 flag
+only on a genuine success. This is distinct from #5247/#5255, which self-heal the
+sticky mirror-failed flag but do NOT restore the BPF pre-image. Reverse entries
+are never mirrored to the helper (it synthesizes the reverse companion locally),
+so they take no compensation — they only write the BPF mirror.
+
+The pre-image snapshot's *absent* classification (`snapshotBPFSessionV4Locked` /
+`snapshotBPFSessionV6Locked` → `bpfSessionReadAbsent`) accepts the SAME
+key-not-found error set as the Layer-1 `dataplane.sessionNotFound` predicate —
+`ebpf.ErrKeyNotExist` OR `unix.ENOENT`, via the shared `dataplane.IsKeyNotFound`
+helper (#6194) — so both transaction layers agree on what "key absent" means.
+Any OTHER read error is surfaced and the install is refused (the fail-safe
+direction): the snapshot never guesses a pre-image it could not read. With the
+production cilium `bpfShim` the two sentinels never diverge (a missing lookup
+yields `ErrKeyNotExist`, not bare `ENOENT`), so this is a consistency fix rather
+than a live-bug fix.
+
 Locally-created forward sessions take a parallel path: `SetSessionV4()` /
 `SetSessionV6()` install into the kernel/BPF maps, then mirror the forward
 entry **and a pre-installed reverse companion** (#310 — so the helper holds the

@@ -404,6 +404,14 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 			if terr := clusterTopologyCommitPreflight(d.cluster != nil, cand); terr != nil {
 				return terr
 			}
+			// #6192: reject a day-2 node-id / cluster-id change on a running
+			// clustered node BEFORE promotion — the boot-constructed HA manager
+			// cannot be re-keyed live (its identity feeds heartbeat, RETH MAC,
+			// election). The topology gate above already handled the
+			// standalone<->cluster flip; this covers the same-mode identity edit.
+			if ierr := clusterIdentityCommitPreflight(d.cluster, cand); ierr != nil {
+				return ierr
+			}
 			return d.deviceMapCommitPreflight(cand, nil)
 		},
 		func(gen uint64) (*config.Config, error) { return d.store.CommitWithDescriptionGen(comment, gen) },
@@ -567,6 +575,23 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		return nil, terr
 	}
 
+	// #6192: fail closed on a peer-synced node-id / cluster-id identity change,
+	// mirroring the topology backstop above. SyncApply has already promoted the
+	// peer config to active, but the boot-constructed HA manager cannot be
+	// re-keyed live (heartbeat/RETH-MAC/election identity is boot-only). Return
+	// BEFORE applyConfigLocked so the live dataplane is never armed under a
+	// mismatched identity; a restart re-applies the now-active config through the
+	// boot path. In a healthy cluster this is unreachable — the synced text
+	// compiles for the LOCAL node, so node-id resolves to this node's running id
+	// and cluster-id is the shared value — but it is a defense-in-depth backstop
+	// against a divergent replay.
+	if ierr := clusterIdentityCommitPreflight(d.cluster, compiled); ierr != nil {
+		slog.Error("cluster: refusing to apply a peer-synced node-id/cluster-id "+
+			"identity change live; a restart is required to re-key the HA manager",
+			"err", ierr)
+		return nil, ierr
+	}
+
 	// #5564: SyncApply (above) has ALREADY promoted the peer config to active,
 	// and once applyConfigLocked arms the dataplane snapshot this node is
 	// forwarding under it. The three session invalidators
@@ -694,6 +719,13 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 			// reject it up front while the operator is still connected.
 			if terr := clusterTopologyCommitPreflight(d.cluster != nil, cand); terr != nil {
 				return terr
+			}
+			// #6192: same node-id / cluster-id restart boundary as commitAndApply.
+			// The rollback target on a confirm timeout is the current active
+			// config, so a rejected identity change is not confirmable either —
+			// reject it up front while the operator is still connected.
+			if ierr := clusterIdentityCommitPreflight(d.cluster, cand); ierr != nil {
+				return ierr
 			}
 			return d.deviceMapCommitPreflight(cand, d.store.ActiveConfig())
 		},

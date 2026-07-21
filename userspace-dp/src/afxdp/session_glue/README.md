@@ -14,7 +14,9 @@ sees the same sessions the userspace path is processing.
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | Cache-validation helpers (`cached_session_resolution`, `resolution_target_for_session`), plus the BPF session-map mirror writers. |
+| `mod.rs` | Cache-validation helpers (`cached_session_resolution`, `resolution_target_for_session`), `resolve_flow_session_decision`, `delete_terminal_filtered_session`, plus the BPF session-map mirror writers. |
+| `promote.rs` | Synced-session hit handling: `maybe_promote_synced_session` (promote a peer-synced hit to locally-owned) and `purge_translated_synced_hit` (drop + NAT-release a transient alias-owned hit). |
+| `commands/` | Worker-command handlers (`handle_upsert_synced`, `handle_delete_synced`, owner-RG refresh/demote/export). |
 | `tests.rs` | Co-located unit tests for cache validation + mirror semantics. |
 
 ## Where it sits
@@ -60,3 +62,30 @@ owns that now; `release_flow` is idempotent, so a caller that visits both
 halves in turn stays correct. Before #5622 the helper deleted only the
 supplied key and released nothing, leaking the same-worker companion
 entry and the pool port on every translated LocalDelivery terminal deny.
+
+## Transient synced-hit purge (`purge_translated_synced_hit`, #5295)
+
+When a packet hits a peer-synced translated FORWARD session whose RG is
+NOT locally active (`should_keep_synced_hit_transient` in `promote.rs`),
+the hit is kept *transient*: the entry is purged from the worker table,
+the shared HA maps, and the kernel session-map so the local node
+re-resolves instead of forwarding to the wrong node. That purged entry is
+a forward, peer-synced session, so at install `handle_upsert_synced`
+RESERVED its translated `(pool_addr, port)` in this node's LOCAL
+source-NAT / NAT64 allocator (`reserve_synced_source_nat_allocation` /
+`reserve_synced_nat64_allocation`, #4388 / #4512) so a post-failover local
+allocation cannot re-hand the same tuple.
+
+`purge_translated_synced_hit` therefore ALSO releases that reservation —
+`release_source_nat_allocation` + `release_nat64_allocation`, under the
+same `metadata.is_reverse` ownership guard used everywhere the reservation
+is freed (reap, delete-sync, terminal-filtered teardown). The guard and
+`release_flow`'s track-then-free contract make this safe against a
+double-free: the purge fires only for the forward translated side
+(`is_translated_forward_session_key` rejects reverse/alias keys), and
+`release_flow` is a no-op when the flow was never tracked. Before #5295
+the purge dropped the session state but released NOTHING, LEAKING the
+reserved port on every alias-owned transient purge → standby source-NAT /
+NAT64 pool exhaustion under sustained HA churn. Distinct from #5178 (a
+reservation released into a recycle queue the deterministic allocator
+never drains) — here there was simply no release call at all.
