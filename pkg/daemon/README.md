@@ -278,6 +278,16 @@ based on PCI bus order plus the cluster node ID. RETH members match by
 between physical and virtual at boot, and `ensureRethLinkOriginalName()`
 auto-fixes stale `.link` files.
 
+`deriveKernelName()` synthesizes that predictable kernel name from a NIC's
+sysfs PCI address via `pciAddrToEnp()`, which mirrors systemd's
+`ID_NET_NAME_PATH` scheme (`systemd.net-naming-scheme(7)`):
+`en[P<domain>]p<bus>s<slot>[f<func>]`. The `P<domain>` segment is present
+ONLY when the PCI domain is non-zero, so single-domain systems (domain 0000
+— the test VM and loss cluster) keep the bare `enp<bus>s<slot>[f<func>]`
+form, while multi-PCI-domain hardware gets the domain prefix that stops two
+NICs at the same bus/slot in different domains from resolving to the same
+name (#6199). All fields are parsed hex / rendered decimal to match systemd.
+
 Any interface not declared in the active config is brought down and given
 `ActivationPolicy=always-down` in networkd — EXCEPT the #1922 protected set
 (see below).

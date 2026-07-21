@@ -109,9 +109,26 @@ func pciAddrFromPath(path string) string {
 
 // pciAddrToEnp converts a PCI address like "0000:08:00.0" to a predictable
 // network name like "enp8s0".
+//
+// The result must match the kernel's systemd-predictable interface name so it
+// can be compared against the live NIC (deriveKernelName feeds it into the
+// RETH-member OriginalName= lookup). systemd's ID_NET_NAME_PATH scheme
+// (systemd.net-naming-scheme(7)) is en[P<domain>]p<bus>s<slot>[f<func>]: the
+// "P<domain>" segment is prepended ONLY when the PCI domain is non-zero. For
+// the common single-domain case (domain 0000) the domain is omitted, so the
+// name is the bare enp<bus>s<slot>[f<func>]. On multi-PCI-domain hardware
+// (domain != 0, e.g. 10000:01:00.0) the domain disambiguates two NICs that sit
+// at the same bus/slot in different domains; dropping it here would collide
+// them onto one name and resolve the wrong RETH member. systemd scans the
+// sysfs address fields as hex and prints them decimal, so parse hex / render
+// decimal for every component (domain, bus, slot, func) to match.
 func pciAddrToEnp(pciAddr string) string {
 	parts := strings.SplitN(pciAddr, ":", 3)
 	if len(parts) != 3 {
+		return ""
+	}
+	domain, err := strconv.ParseUint(parts[0], 16, 32)
+	if err != nil {
 		return ""
 	}
 	bus, err := strconv.ParseUint(parts[1], 16, 16)
@@ -130,10 +147,15 @@ func pciAddrToEnp(pciAddr string) string {
 	if err != nil {
 		return ""
 	}
-	if fn > 0 {
-		return fmt.Sprintf("enp%ds%df%d", bus, slot, fn)
+	name := "en"
+	if domain > 0 {
+		name += fmt.Sprintf("P%d", domain)
 	}
-	return fmt.Sprintf("enp%ds%d", bus, slot)
+	name += fmt.Sprintf("p%ds%d", bus, slot)
+	if fn > 0 {
+		name += fmt.Sprintf("f%d", fn)
+	}
+	return name
 }
 
 // rethLinkOps groups the netlink primitives that renameRethMember and
