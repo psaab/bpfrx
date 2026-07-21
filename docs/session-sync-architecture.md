@@ -339,6 +339,41 @@ Important current behavior:
 This exists because failover admission now depends on the standby having both
 sides of the current-generation baseline, not just having received one bulk.
 
+### Reconnect Re-Prime (#5480)
+
+On the **first connection after a full (both-fabric) disconnect**
+(`handleNewConnection`, `wasDisconnected == true`), the survivor **always**
+re-pushes its authoritative session table (`doBulkSync`) — it no longer gates
+that bulk on the sticky, process-local `bulkEverCompleted` flag.
+
+The old gate (`coldStart := !bulkEverCompleted.Load()`) skipped the bulk on any
+reconnect once the survivor had completed one bulk. But `bulkEverCompleted` is
+sticky and per-process: when the **peer** daemon rebooted, its session table AND
+its own flag reset, yet the survivor's flag stayed true — so the survivor logged
+"skipping bulk sync on reconnect (already primed)" and never re-primed the peer.
+The rebooted standby then held **no** synced sessions and blackholed every
+established flow on the next failover to it.
+
+The survivor cannot locally tell a rebooted peer (empty table, needs priming)
+from a pure fabric flap (peer kept its table): the sync handshake
+(`performSyncHandshake`) carries no peer-cold / boot-incarnation / session-count
+signal, and an unkeyed dual-accept peer sends no HELLO at all. So it re-primes
+unconditionally. Re-priming is safe and idempotent — the receiver upserts every
+session and `reconcileStaleSessions` (run at `BulkEnd`) prunes anything the
+survivor no longer owns — and a both-fabric outage may have dropped incremental
+deltas anyway, so the "already primed" assumption does not hold even for a peer
+that never rebooted.
+
+Cost and scope: this fires **only** on a both-fabric down→up transition. A
+routine single-fabric flip does NOT reach this arm (it hits the
+`becameActive`/`else` branches, which still do not re-bulk), so the redundant
+transfer is bounded to genuine full-reconnect events. This intentionally
+reverses the pre-#5480 #466 "skip bulk on reconnect" optimization for the
+`wasDisconnected` case: correctness (a rebooted standby must not blackhole) beats
+one redundant bulk on a full-reconnect flap. A more surgical fix that keeps the
+#466 flap-suppression would need a peer boot-incarnation field in the sync
+handshake — a wire change tracked on #5480 and deferred.
+
 ## Incremental Sweep and Delete Journal
 
 ### Background Sweep
@@ -1279,7 +1314,11 @@ whichever runs first:
   so an eviction during that flush is caught) even when the node is already
   primed (`bulkEverCompleted`),
 
-and it sends a full authoritative `doBulkSync`/`BulkSync` snapshot. The peer's
+and it sends a full authoritative `doBulkSync`/`BulkSync` snapshot. (Since #5480
+the reconnect leg **always** re-primes regardless of `forceResync`, so the CAS
+consume there is retained only to clear the arm, pick the log line, and re-arm on
+bulk failure; the **connected-sweep** leg remains the load-bearing `forceResync`
+path — it is the only way an overflow self-heals without a disconnect.) The peer's
 `reconcileStaleSessions` (run at `BulkEnd`) then DELETES any session absent from
 the snapshot — precisely the sessions the evicted deletes would have torn down.
 On a failed bulk the arm is restored so a later sweep/reconnect retries. Before

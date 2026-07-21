@@ -1,3 +1,36 @@
+## 2026-07-21 — #5480 fix: re-prime outbound bulk on every both-fabric reconnect
+
+- **Timestamp**: 2026-07-21 (fix/5480-reconnect-reprime)
+- **Action**: A survivor skipped re-pushing its authoritative session table when
+  a rebooted peer reconnected, so the standby ended with NO synced sessions and
+  blackholed established flows on the next failover to it. The reconnect bulk was
+  gated on `coldStart := !bulkEverCompleted.Load()` — a sticky, process-local
+  atomic that stays true forever on the survivor even though the peer's table AND
+  the peer's own flag reset on reboot. The handshake carries no peer-cold /
+  boot-incarnation / session-count signal (and an unkeyed dual-accept peer sends
+  no HELLO), so the survivor cannot locally distinguish a rebooted peer from a
+  fabric flap. Fix: on `wasDisconnected` (first connection after a both-fabric
+  disconnect) ALWAYS `doBulkSync`, unconditionally. Re-priming is idempotent
+  (receiver upserts; peer `reconcileStaleSessions` prunes) and a both-fabric
+  outage may have dropped deltas anyway. Bounded — fires only on a both-fabric
+  down→up transition, never a routine single-fabric flip (those still don't
+  re-bulk). Preserves #5450 `forceResync` consume + re-arm-on-failure and the
+  #4360/#4090 `outboundBulkAcked` re-drive (untouched). Tradeoff: reverses the
+  #466 reconnect-skip optimization for the full-reconnect case (correctness over
+  the redundant bulk); the surgical alternative needs a peer boot-incarnation
+  wire field (deferred, tracked on #5480).
+- **Fail-on-revert**: `TestHandleNewConnectionReconnectRePrimesBulkSync`
+  (pkg/cluster) — bulkEverCompleted=true, forceResync=false, drive
+  `handleNewConnection` on a fresh conn, assert `PendingBulkAck()` ok (bulk
+  pushed). Neutralize by re-gating `doBulkSync` on `coldStart || forcedConsumed`
+  → RED (bulk skipped). Verified: exactly 1 test fails on neutralization; cold-
+  start + active-fabric-flip + non-active-redundant siblings stay green.
+- **Validation**: `go build ./...`, `go vet ./pkg/cluster/`, `go test -race
+  ./pkg/cluster/...` all pass. Cluster session-sync → needs a loss-cluster
+  failover smoke (lab-bound, batched by lead).
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
+  docs/session-sync-architecture.md, _Log.md
+
 ## 2026-07-21 — #5674 fix: size synced-import cap to ENTRIES (2×), gate forward-only
 
 - **Timestamp**: 2026-07-21 (fix/5674-synced-import-cap, #6172 hostile-review MAJOR)

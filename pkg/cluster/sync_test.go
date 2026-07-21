@@ -4168,9 +4168,24 @@ func TestHandleNewConnectionColdStartTriggersBulkSync(t *testing.T) {
 	}
 }
 
-// TestHandleNewConnectionReconnectSkipsBulkSync verifies that a reconnect
-// after a prior bulk exchange does NOT trigger bulk sync (#466).
-func TestHandleNewConnectionReconnectSkipsBulkSync(t *testing.T) {
+// TestHandleNewConnectionReconnectRePrimesBulkSync is the #5480 RED-on-revert
+// test. A survivor that has already completed one bulk (bulkEverCompleted
+// sticky-true) must STILL re-push its authoritative session table on a fresh
+// both-fabric reconnect, because the peer may have rebooted and lost its table.
+// The survivor cannot locally distinguish a rebooted peer from a fabric flap
+// (the handshake carries no boot-incarnation), so it re-primes unconditionally.
+//
+// This intentionally REVERSES the pre-#5480 #466 optimization (which suppressed
+// the bulk on a routine reconnect): correctness — a rebooted standby must not
+// end up with an empty session table and blackhole on the next failover — beats
+// the one redundant bulk on a genuine both-fabric flap.
+//
+// Neutralization (restores the #5480 bug → this test goes RED): re-gate the
+// doBulkSync in handleNewConnection's wasDisconnected branch back on the sticky
+// flag, i.e. `if coldStart || forcedConsumed { doBulkSync } else { skip }`. With
+// bulkEverCompleted=true and forceResync=false, both are false, so the bulk is
+// skipped and PendingBulkAck() reports no pending epoch.
+func TestHandleNewConnectionReconnectRePrimesBulkSync(t *testing.T) {
 	dp := &mockSweepDP{
 		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
 			{SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2}, SrcPort: 1234, DstPort: 80, Protocol: 6}: {
@@ -4181,8 +4196,14 @@ func TestHandleNewConnectionReconnectSkipsBulkSync(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
 	ss.IsPrimaryFn = func() bool { return true }
 
-	// Simulate a prior bulk exchange completing.
+	// Survivor state: it has completed a prior bulk (sticky flag true) AND the
+	// #5450 delete-journal-overflow arm is NOT set. So the ONLY thing that can
+	// drive a bulk here is the #5480 unconditional reconnect re-prime — not the
+	// cold-start path and not the forced-resync path.
 	ss.bulkEverCompleted.Store(true)
+	if ss.forceResync.Load() {
+		t.Fatal("precondition: forceResync must be unset so the re-prime is driven by #5480, not #5450")
+	}
 
 	local, peer := net.Pipe()
 	defer peer.Close()
@@ -4203,13 +4224,16 @@ func TestHandleNewConnectionReconnectSkipsBulkSync(t *testing.T) {
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	// wasDisconnected=true (no existing connections), but bulkEverCompleted
-	// is true so bulk should be skipped.
+	// wasDisconnected=true (no existing connections). Even though
+	// bulkEverCompleted is sticky-true, the survivor must re-prime the peer.
 	ss.handleNewConnection(ctx, 0, local)
 
-	_, _, ok := ss.PendingBulkAck()
-	if ok {
-		t.Fatal("reconnect after prior bulk exchange should NOT trigger bulk sync (#466)")
+	epoch, _, ok := ss.PendingBulkAck()
+	if !ok {
+		t.Fatal("reconnect after a full disconnect must RE-PUSH the authoritative bulk so a rebooted peer is re-primed (#5480); bulk was wrongly skipped")
+	}
+	if epoch != 1 {
+		t.Fatalf("pending bulk epoch = %d, want 1 (one re-prime bulk sent)", epoch)
 	}
 
 	cancel()
