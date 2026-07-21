@@ -513,6 +513,30 @@ never lock an operator out of a remote box it manages.
     window. `runShutdownSequence` drains `applySem` (bounded by
     `applyCloseoutDrainTimeout`) after `applyCancel()` so that closeout completes
     before teardown/exit.
+    - **Collect-and-budget the closeout (#5874).** The five credential
+      reconcilers were best-effort **voids** whose failures the closeout
+      discarded — it returned only the two nft errors, so a cancel could report
+      clean while a login / sudoers / absent-user / SSH / root-auth reconcile
+      silently failed and the committed host-auth state never actually
+      converged. They now **return** their accumulated failures
+      (`reconcileUserPassword` and `deprovisionLoginUser` too, so a
+      password-write / revocation failure is not re-swallowed); the closeout
+      runs each owner as a named `hostAuthOwner`, records a per-owner
+      `hostAuthOwnerOutcome`, and `summarizeHostAuthCloseout` joins every
+      **failing OR timed-out** owner into the returned error — naming which
+      owner did not reconcile — so `closeoutHostAuthOnCancel` propagates a
+      fail-visible cancel instead of a false-clean one. The "bounded" claim is
+      now an **enforced** wall-clock budget (`hostAuthCloseoutBudget`, 30s):
+      `runHostAuthCloseoutOwners` runs each owner under a shared deadline in its
+      own goroutine (sequentially — the M35 order is load-bearing — but bounded),
+      so a wedged reconciler is reported timed-out (convergence unknown) rather
+      than hanging the daemon-stop path, and owners queued after the budget is
+      exhausted are reported timed-out too, never silently skipped and never
+      launched concurrently with the abandoned owner. On the **normal** apply
+      path (`applyTailReconciles`) the same reconcilers' returns are
+      intentionally discarded (`_ =`) — next-boot convergence still covers a
+      transient failure there; only the daemon-stop cancel, where next-boot
+      convergence does not happen, collects and fails on them.
   - **Early signal capture — startup is abortable (#5807).** The shutdown
     signal context is captured at the **TOP of `Run`** (`startupSignalContext`),
     BEFORE the mutating startup phases (config load + bootstrap → interface

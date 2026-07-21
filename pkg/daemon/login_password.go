@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -293,12 +294,18 @@ func managedAuthorizedKeysPath(name string) string {
 // xpf actually provisioned — and deprovisions each marker whose username no
 // longer appears in the config. An out-of-band account (no marker) is never
 // enumerated and never touched.
-func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) {
+// reconcileAbsentLoginUsers revokes credentials for xpf-provisioned accounts
+// no longer in config. It stays best-effort per account but ACCUMULATES each
+// deprovision failure into the returned error so the #5874 cancel closeout can
+// see that a removed user's credentials were NOT actually revoked (a
+// monotonic-revocation gap). The normal apply path ignores the return — the
+// next boot retries deprovision from the active config.
+func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
 	entries, err := os.ReadDir(provisionedUsersDir)
 	if err != nil {
 		// No markers yet (fresh install) or unreadable — nothing xpf
 		// provisioned, so nothing to revoke.
-		return
+		return nil
 	}
 
 	// The set of usernames still declared in config; these are kept.
@@ -323,8 +330,9 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) {
 		if _, keep := desired[name]; keep {
 			continue // still configured — leave it alone
 		}
-		d.deprovisionLoginUser(name)
+		retErr = errors.Join(retErr, d.deprovisionLoginUser(name))
 	}
+	return retErr
 }
 
 // deprovisionLoginUser revokes one removed account's password and managed
@@ -334,7 +342,8 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) {
 // that cannot be completed safely leaves the marker in place so the next apply
 // retries, and it never removes a credential it did not first verify as
 // xpf-owned. #5128.
-func (d *Daemon) deprovisionLoginUser(name string) {
+func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
+	fail := func(e error) { retErr = errors.Join(retErr, e) }
 	curUID, found, err := lookupUIDErr(name)
 	if err != nil {
 		// /etc/passwd could not be READ (transient mount/permission/I/O
@@ -349,6 +358,10 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 		// uncertainty is "unknown → retry", never "absent → abandon".
 		slog.Warn("skipping removed-user deprovision: cannot read passwd",
 			"user", name, "err", err)
+		// Fail-visible: an unread identity DB means the removed account's
+		// credential may still be live and was NOT revoked. naked return
+		// yields the accumulated retErr, not the block-local err above.
+		fail(fmt.Errorf("read passwd for removed user %s: %w", name, err))
 		return // keep marker; retry next apply
 	}
 	if !found {
@@ -356,13 +369,13 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 		// userdel. There is nothing to revoke; drop the stale marker so we
 		// stop revisiting it every apply.
 		_ = os.Remove(markerPath(name))
-		return
+		return nil
 	}
 	if !xpfProvisioned(name, curUID) {
 		// Marker missing or its UID no longer matches (the account was
 		// deleted+recreated out of band with a different UID). xpfProvisioned
 		// already cleaned a stale marker inline. NEVER touch a non-xpf account.
-		return
+		return nil
 	}
 
 	// Lock the password (idempotent). Fail-CLOSED on a shadow read error: we
@@ -374,6 +387,7 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 	if !ok {
 		slog.Warn("skipping removed-user deprovision: cannot read shadow",
 			"user", name)
+		fail(fmt.Errorf("read shadow for removed user %s", name))
 		return // keep marker; retry next apply
 	}
 	if !isLockedShadow(cur) {
@@ -381,6 +395,7 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
 			slog.Warn("failed to lock password for removed login user",
 				"user", name, "err", err, "output", strings.TrimSpace(string(out)))
+			fail(fmt.Errorf("lock password for removed user %s: %w", name, err))
 			return // keep marker; retry
 		}
 		slog.Info("locked password for removed login user", "user", name)
@@ -392,6 +407,7 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 	if err := os.Remove(keysFile); err != nil && !os.IsNotExist(err) {
 		slog.Warn("failed to remove authorized_keys for removed login user",
 			"user", name, "file", keysFile, "err", err)
+		fail(fmt.Errorf("remove authorized_keys for removed user %s: %w", name, err))
 		return // keep marker; retry
 	}
 
@@ -401,7 +417,9 @@ func (d *Daemon) deprovisionLoginUser(name string) {
 	if err := os.Remove(markerPath(name)); err != nil && !os.IsNotExist(err) {
 		slog.Warn("failed to remove provenance marker after deprovision",
 			"user", name, "err", err)
+		fail(fmt.Errorf("remove provenance marker for %s: %w", name, err))
 	}
 	slog.Info("deprovisioned removed login user (password locked, keys removed)",
 		"user", name)
+	return retErr
 }

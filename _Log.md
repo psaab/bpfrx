@@ -54480,3 +54480,26 @@ top.
   pkg/configstore/store_persist.go, pkg/daemon/daemon_apply.go,
   pkg/configstore/factory_reset_archival_fence_5869_test.go (new),
   docs/system-login.md, _Log.md
+- **Timestamp**: 2026-07-21
+- **Action**: #5874 — surface cancelled-apply host-auth closeout failures + enforce a budget.
+  The post-promotion cancel closeout (`applyHostAuthorizationCloseout`) ran the five
+  credential reconcilers (login/sudoers/absent-user/SSH/root-auth) as best-effort VOIDS
+  and returned only the two nft errors, so a credential-reconcile failure was silently
+  DISCARDED and the cancel reported clean over a host-auth state that never converged;
+  the "bounded" sequence also had no enforced deadline. Fix: the reconcilers (and their
+  helpers `reconcileUserPassword` / `deprovisionLoginUser`) now RETURN their accumulated
+  failures; the closeout runs each owner as a named `hostAuthOwner`, collects a per-owner
+  `hostAuthOwnerOutcome`, and `summarizeHostAuthCloseout` joins every failing OR timed-out
+  owner into the returned error (naming which owner). Added an ENFORCED wall-clock budget
+  (`hostAuthCloseoutBudget`, 30s): `runHostAuthCloseoutOwners` runs each owner under a
+  shared deadline in its own goroutine (sequential, M35 order preserved) so a wedged
+  reconciler is reported timed-out instead of hanging daemon-stop; post-budget owners are
+  reported, never silently skipped. Normal apply path (`applyTailReconciles`) discards the
+  returns (`_ =`) — next-boot convergence covers transient failures there. Fail-on-revert:
+  `TestHostAuthCloseoutSurfacesReconcilerFailure` drives the real reconcileSudoers (unwritable
+  dir) through the closeout and asserts the failure is surfaced+attributed; neutralizing the
+  `case o.err != nil` append in `summarizeHostAuthCloseout` makes exactly that test RED.
+  Plus budget-timeout, owner-wiring, and reconciler-return tests. Unit-provable, no smoke.
+- **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/login_password.go, pkg/daemon/host_auth_closeout_5874_test.go (new),
+  pkg/daemon/README.md, _Log.md
