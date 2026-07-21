@@ -1278,7 +1278,20 @@ pub(crate) fn reserve_synced_nat64_allocation(
         let Some(addr_index) = prefix.pool_v4.iter().position(|a| *a == snat_v4) else {
             continue;
         };
-        if reserve_nat64_pool_port(&prefix.port_allocator, flow, snat_v4, port, addr_index) {
+        // #5178: a NAPT64 (mode 2) deterministic prefix must tag its synced
+        // reservation deterministic so the standby releases it via
+        // `free_no_recycle`, mirroring the active node's
+        // `allocate_deterministic_v6` — otherwise a deterministic pool's synced
+        // churn leaks ports into a recycle queue the deterministic path never
+        // drains (unbounded standby memory).
+        if reserve_nat64_pool_port(
+            &prefix.port_allocator,
+            flow,
+            snat_v4,
+            port,
+            addr_index,
+            prefix.deterministic_v6.is_some(),
+        ) {
             break;
         }
     }

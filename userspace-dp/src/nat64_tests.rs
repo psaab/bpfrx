@@ -3814,11 +3814,11 @@ fn nat64_4512_reserve_release_wrapper_symmetry() {
         ..flow1
     };
     assert!(
-        reserve_nat64_pool_port(alloc, flow1, snat, 1024, 0),
+        reserve_nat64_pool_port(alloc, flow1, snat, 1024, 0, false),
         "first reserve of an unowned port must take"
     );
     assert!(
-        !reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0),
+        !reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0, false),
         "a second flow must NOT steal a port owned by a live reservation"
     );
     assert!(
@@ -3826,7 +3826,7 @@ fn nat64_4512_reserve_release_wrapper_symmetry() {
         "release must free the reservation for the owning flow"
     );
     assert!(
-        reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0),
+        reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0, false),
         "after release the port is free and a later flow can re-own it"
     );
 }

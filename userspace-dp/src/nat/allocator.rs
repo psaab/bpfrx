@@ -1638,11 +1638,25 @@ impl PortAllocator {
     /// incumbent untouched if the port is already owned by a DIFFERENT live
     /// allocation (the bit is set — a local flow raced ahead of the sync on the
     /// standby); the caller then tries the next pool rule.
+    ///
+    /// #5178: `deterministic` mirrors the ACTIVE node's allocation mode for this
+    /// synced flow — `true` when the reservation belongs to a deterministic
+    /// CGNAT (mode 1) / NAPT64 (mode 2) pool, `false` for round-robin PAT. It is
+    /// stored on the `LiveAllocation` so the SAME `release_flow`/`rollback_flow`
+    /// teardown frees a deterministic reservation via `free_no_recycle` (the bit
+    /// is the only reuse gate) instead of pushing it onto the per-address recycle
+    /// `VecDeque`. Before #5178 this was hardcoded `false`, so a standby running
+    /// a deterministic pool tagged every synced reservation non-deterministic and
+    /// leaked each released port into a recycle queue the deterministic
+    /// allocation path never drains — unbounded standby memory growth under
+    /// synced-session churn. Matches the non-HA deterministic release contract
+    /// (#4559): a deterministic-only pool never grows the recycle queue.
     pub(super) fn reserve_flow(
         &self,
         flow: SourceNatFlowKey,
         translated: TranslatedTuple,
         addr_index: usize,
+        deterministic: bool,
     ) -> bool {
         if addr_index >= self.shared.occupancy.len() {
             return false;
@@ -1651,13 +1665,19 @@ impl PortAllocator {
         // A refresh of the same synced flow: if it already holds this exact
         // translated tuple, it is reserved — nothing to do. If the tuple
         // changed (should not happen on a stable sync), drop the stale
-        // reservation first so we do not leak the old port's bit.
+        // reservation first so we do not leak the old port's bit. Honour the
+        // stale reservation's own mode (#5178): a deterministic reservation is
+        // freed WITHOUT recycling, matching its release path.
         if let Some(existing) = live.live_by_flow.get(&flow).copied() {
             if existing.translated == translated {
                 return true;
             }
             live.live_by_flow.remove(&flow);
-            self.free_translated_port(existing.addr_index, existing.translated.port, true);
+            self.free_translated_port(
+                existing.addr_index,
+                existing.translated.port,
+                !existing.deterministic,
+            );
         }
         // Never steal a port owned by a DIFFERENT live allocation: the bit CAS
         // fails when the port is already occupied, so `reserve` returns false
@@ -1674,7 +1694,7 @@ impl PortAllocator {
                 translated,
                 persistent_key: None,
                 addr_index,
-                deterministic: false,
+                deterministic,
                 address_only: false,
             },
         );
