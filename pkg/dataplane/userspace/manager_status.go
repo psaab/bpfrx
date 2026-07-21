@@ -91,6 +91,28 @@ func (m *Manager) SetForwardingArmed(armed bool) (ProcessStatus, error) {
 			strings.Join(m.lastStatus.Capabilities.UnsupportedReasons, "; "),
 		)
 	}
+	// #5648 (M43b): fail closed on a required-generation protocol mismatch.
+	// The compile/publish paths (Compile, syncSnapshotLocked,
+	// UpdatePolicyScheduleState) disarm the helper when its accepted config
+	// snapshot protocol version is too old to honor a config that REQUIRES a
+	// newer one (policy schedulers, persistent source NAT) —
+	// ensureRequiredSnapshotProtocolLocked / disarmSnapshotProtocolFailureLocked.
+	// An explicit arm request (operator `request`/gRPC, cli_request_chassis.go /
+	// server_diag_system_action.go) must honor the SAME gate: arming here
+	// without re-checking it would re-arm the STALE accepted image and forward
+	// on a config the helper cannot represent — the fail-OPEN this closes.
+	//
+	// The gate is scoped, not a blanket refuse: ensureRequiredSnapshotProtocolLocked
+	// is a no-op unless the last-applied config requires the protocol, and it
+	// re-polls the helper first so a helper that has since upgraded (accepted a
+	// current image) still arms normally. Only armed==true is gated — the
+	// disarm paths (shutdown, disarmSnapshotProtocolFailureLocked) must never be
+	// blocked, and this mirrors the ForwardingSupported guard above.
+	if armed && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
+		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot.Config); err != nil {
+			return m.lastStatus, err
+		}
+	}
 	var status ProcessStatus
 	req := ControlRequest{
 		Type: "set_forwarding_state",

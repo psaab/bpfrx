@@ -784,25 +784,26 @@ fn ifreq_carries_mtu_value() {
     assert_eq!(ifr.name_string(), "xpf-usp0");
 }
 
-use crate::io_uring_write::WriteError;
+use crate::io_uring_write::WriteResult;
 use std::cell::Cell;
 
-/// #2477 fail-on-revert: a PARTIAL io_uring write (`WriteError::Transferred`)
-/// already placed bytes on the packet-oriented TUN. The fallback decision
-/// MUST NOT invoke the synchronous write — doing so re-sends the whole frame
-/// on top of the truncated one (truncated + duplicate delivery).
+/// #2477 fail-on-revert: a PARTIAL io_uring write (`WriteResult::Transferred`)
+/// already placed bytes on the packet-oriented TUN. Classification MUST NOT
+/// invoke the synchronous write — doing so re-sends the whole frame on top of
+/// the truncated one (truncated + duplicate delivery).
 ///
 /// The sync-fallback thunk records whether it ran. With the old behaviour
-/// (`io_uring().or_else(|_| sync)` — i.e. sync on ANY error), the thunk would
-/// fire for this partial and the assertions below fail.
+/// (sync on ANY error), the thunk would fire for this partial and the assertions
+/// below fail.
 #[test]
 fn partial_iouring_write_does_not_sync_fallback() {
     let sync_ran = Cell::new(false);
-    let res = decide_sync_fallback(
-        Err(WriteError::Transferred(
+    let outcome = classify_io_uring_write(
+        WriteResult::Transferred(
+            vec![0u8; 1400],
             "slow-path io_uring short write on packet fd: wrote 40 of 1400 bytes".to_string(),
-        )),
-        || {
+        ),
+        |_b| {
             sync_ran.set(true);
             Ok(())
         },
@@ -813,44 +814,54 @@ fn partial_iouring_write_does_not_sync_fallback() {
              packet on top of the bytes already on the TUN double-transmits (#2477)"
     );
     assert!(
-        res.is_err(),
+        outcome.result.is_err(),
         "the partial packet must be DROPPED (Err), not silently succeeded"
+    );
+    assert!(
+        !outcome.ring_terminal,
+        "a reaped partial is a packet anomaly, not a ring death — keep io_uring"
     );
 }
 
-/// #2477 fail-on-revert: an ambiguous reap error where the SQE may be in
-/// flight is also `Transferred` — never sync-retry (could double-transmit).
+/// #5800: an ambiguous reap where the SQE may still be in flight is now a
+/// `Deferred` (the owned buffer is parked in the ring's registry, not handed
+/// back) — never sync-retry (the buffer is no longer ours and a re-send could
+/// double-transmit).
 #[test]
 fn ambiguous_reap_error_does_not_sync_fallback() {
     let sync_ran = Cell::new(false);
-    let res = decide_sync_fallback(
-        Err(WriteError::Transferred(
-            "slow-path io_uring submit/wait: some wait error".to_string(),
-        )),
-        || {
+    let outcome = classify_io_uring_write(
+        WriteResult::Deferred {
+            id: 7,
+            message: "slow-path io_uring wait interrupted repeatedly (4096 EINTR)".to_string(),
+            fatal_ring: false,
+        },
+        |_b| {
             sync_ran.set(true);
             Ok(())
         },
     );
     assert!(
         !sync_ran.get(),
-        "an in-flight-ambiguous error must not sync-retry"
+        "an in-flight-ambiguous (deferred) error must not sync-retry"
     );
-    assert!(res.is_err());
+    assert!(outcome.result.is_err());
 }
 
-/// Complement: a ZERO-byte io_uring failure (`WriteError::NothingWritten`)
-/// put nothing on the TUN, so the synchronous fallback MUST run — the packet
-/// is still deliverable and dropping it would be a regression.
+/// Complement: a ZERO-byte io_uring failure (`WriteResult::NothingWritten`) put
+/// nothing on the TUN, so the synchronous fallback MUST run from the handed-back
+/// buffer — the packet is still deliverable and dropping it would be a regression.
 #[test]
 fn zero_byte_iouring_failure_does_sync_fallback() {
     let sync_ran = Cell::new(false);
-    let res = decide_sync_fallback(
-        Err(WriteError::NothingWritten(
+    let outcome = classify_io_uring_write(
+        WriteResult::NothingWritten(
+            vec![0u8; 64],
             "slow-path io_uring write failed: Input/output error".to_string(),
-        )),
-        || {
+        ),
+        |b| {
             sync_ran.set(true);
+            assert_eq!(b.len(), 64, "the handed-back buffer feeds the sync retry");
             Ok(())
         },
     );
@@ -859,7 +870,7 @@ fn zero_byte_iouring_failure_does_sync_fallback() {
         "a zero-byte io_uring failure transferred nothing — sync-retry MUST run"
     );
     assert!(
-        res.is_ok(),
+        outcome.result.is_ok(),
         "the sync fallback succeeded, so the result is Ok"
     );
 }
@@ -868,7 +879,7 @@ fn zero_byte_iouring_failure_does_sync_fallback() {
 #[test]
 fn successful_iouring_write_skips_sync_fallback() {
     let sync_ran = Cell::new(false);
-    let res = decide_sync_fallback(Ok(()), || {
+    let outcome = classify_io_uring_write(WriteResult::Done(vec![0u8; 4]), |_b| {
         sync_ran.set(true);
         Ok(())
     });
@@ -876,7 +887,7 @@ fn successful_iouring_write_skips_sync_fallback() {
         !sync_ran.get(),
         "a successful io_uring write must not sync-retry"
     );
-    assert!(res.is_ok());
+    assert!(outcome.result.is_ok());
 }
 
 // ── #5172: io_uring WriteMode must DEMOTE to SyncFallback after a TERMINAL
@@ -884,35 +895,38 @@ fn successful_iouring_write_skips_sync_fallback() {
 // broken ring (which degrades BGP/OSPF/mgmt/local traffic). Mirrors the
 // state_writer #2958 runtime-demotion, adding a terminal-vs-transient split. ──
 
-/// #5172: `classify_io_uring_write` separates packet-transfer certainty from
-/// ring health. A TERMINAL (ambiguous / wedged) io_uring failure — `Transferred`,
-/// NOT `safe_to_retry` — must (a) flag `ring_terminal` so the loop demotes, and
-/// (b) DROP the packet WITHOUT invoking the sync fallback (the current ambiguous
-/// packet may be in flight; re-sending it would double-transmit — NO-RETRY).
+/// #5172 + #5800: `classify_io_uring_write` separates packet-transfer certainty
+/// from ring health. A FATAL ring — `WriteResult::Deferred { fatal_ring: true }`,
+/// the owned buffer parked in the registry pending teardown — must (a) flag
+/// `ring_terminal` so the loop demotes, and (b) DROP the packet WITHOUT invoking
+/// the sync fallback (the deferred write may be in flight and the buffer is
+/// retained by the ring — re-sending would double-transmit, NO-RETRY).
 #[test]
 fn classify_terminal_ring_failure_flags_demote_and_does_not_resend() {
     let sync_ran = Cell::new(false);
     let outcome = classify_io_uring_write(
-        Err(WriteError::Transferred(
-            "slow-path io_uring submit/wait: ring wedged".to_string(),
-        )),
-        || {
+        WriteResult::Deferred {
+            id: 3,
+            message: "slow-path io_uring permanent submit/wait error: EBADF".to_string(),
+            fatal_ring: true,
+        },
+        |_b| {
             sync_ran.set(true);
             Ok(())
         },
     );
     assert!(
         outcome.ring_terminal,
-        "an ambiguous/wedged io_uring failure must be classified TERMINAL so the \
-         worker demotes to sync (#5172)"
+        "a fatal io_uring ring failure must be classified TERMINAL so the worker \
+         demotes to sync (#5172)"
     );
     assert!(
         !sync_ran.get(),
-        "the current ambiguous packet must NOT be sync-resent (no double-transmit)"
+        "the deferred (in-flight) packet must NOT be sync-resent (no double-transmit)"
     );
     assert!(
         outcome.result.is_err(),
-        "the ambiguous packet is dropped (no-retry), so the result is Err"
+        "the deferred packet is dropped (no-retry), so the result is Err"
     );
     assert!(
         outcome.demotion_cause.is_some(),
@@ -921,24 +935,25 @@ fn classify_terminal_ring_failure_flags_demote_and_does_not_resend() {
 }
 
 /// #5172 (complement / #2477 preserved): a TRANSIENT io_uring failure —
-/// `NothingWritten`, `safe_to_retry` — put nothing on the TUN, so the per-call
-/// sync fallback rescues THIS packet and the ring is NOT demoted (do not abandon
-/// io_uring on a momentary blip). `ring_terminal` must be false.
+/// `NothingWritten` — put nothing on the TUN, so the per-call sync fallback
+/// rescues THIS packet and the ring is NOT demoted (do not abandon io_uring on a
+/// momentary blip). `ring_terminal` must be false.
 #[test]
 fn classify_transient_ring_failure_keeps_iouring_and_rescues_packet() {
     let sync_ran = Cell::new(false);
     let outcome = classify_io_uring_write(
-        Err(WriteError::NothingWritten(
+        WriteResult::NothingWritten(
+            vec![0u8; 128],
             "slow-path io_uring write failed: Input/output error".to_string(),
-        )),
-        || {
+        ),
+        |_b| {
             sync_ran.set(true);
             Ok(())
         },
     );
     assert!(
         !outcome.ring_terminal,
-        "a safe-to-retry io_uring failure is TRANSIENT — keep io_uring, do not demote"
+        "a nothing-written io_uring failure is TRANSIENT — keep io_uring, do not demote"
     );
     assert!(
         sync_ran.get(),
@@ -948,10 +963,42 @@ fn classify_transient_ring_failure_keeps_iouring_and_rescues_packet() {
     assert!(outcome.demotion_cause.is_none());
 }
 
+/// #5800 fail-on-revert: a NON-fatal retry-ceiling deferral drops the packet but
+/// KEEPS io_uring — the ring is otherwise healthy and the parked buffer is
+/// reclaimed on a later write's reap. `ring_terminal` must be false, the sync
+/// fallback must NOT run, and no demotion cause is recorded. Neutralising the
+/// `ring_terminal: fatal_ring` line in `classify_io_uring_write` (e.g. hardcoding
+/// `true`) would demote on every EINTR storm, turning this RED.
+#[test]
+fn classify_nonfatal_deferral_keeps_iouring_and_drops_packet() {
+    let sync_ran = Cell::new(false);
+    let outcome = classify_io_uring_write(
+        WriteResult::Deferred {
+            id: 9,
+            message: "slow-path io_uring wait interrupted repeatedly (4096 EINTR)".to_string(),
+            fatal_ring: false,
+        },
+        |_b| {
+            sync_ran.set(true);
+            Ok(())
+        },
+    );
+    assert!(
+        !outcome.ring_terminal,
+        "a bare EINTR-ceiling storm is not a fatal ring — keep io_uring (#5800)"
+    );
+    assert!(!sync_ran.get(), "a deferred packet is not sync-resent");
+    assert!(outcome.result.is_err(), "the deferred packet is dropped");
+    assert!(
+        outcome.demotion_cause.is_none(),
+        "no demotion on a non-fatal deferral"
+    );
+}
+
 /// #5172: a successful io_uring write is healthy — no demotion, no cause.
 #[test]
 fn classify_successful_write_is_healthy() {
-    let outcome = classify_io_uring_write(Ok(()), || Ok(()));
+    let outcome = classify_io_uring_write(WriteResult::Done(vec![0u8; 4]), |_b| Ok(()));
     assert!(!outcome.ring_terminal);
     assert!(outcome.result.is_ok());
     assert!(outcome.demotion_cause.is_none());
@@ -970,7 +1017,7 @@ fn terminal_ring_failure_demotes_write_mode_to_sync() {
     // that state. If the kernel cannot provide a ring (older CI), the demotion
     // path is unreachable — skip rather than give a false pass (mirrors the
     // state_writer #2958 demotion test).
-    let ring = match IoUring::new(256) {
+    let ring = match crate::io_uring_write::RingWriter::new(256) {
         Ok(r) => r,
         Err(_) => {
             eprintln!("io_uring unavailable on this kernel; skipping demotion test");
@@ -1030,7 +1077,7 @@ fn terminal_ring_failure_demotes_write_mode_to_sync() {
 /// momentary blip, which this catches (mode must stay IoUring).
 #[test]
 fn transient_outcome_does_not_demote_write_mode() {
-    let ring = match IoUring::new(256) {
+    let ring = match crate::io_uring_write::RingWriter::new(256) {
         Ok(r) => r,
         Err(_) => {
             eprintln!("io_uring unavailable on this kernel; skipping no-demote test");

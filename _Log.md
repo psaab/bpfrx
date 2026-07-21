@@ -54149,6 +54149,29 @@ top.
   - `docs/session-sync-architecture.md` (#6132 recovery paragraph + trigger-list)
 
 - **Timestamp**: 2026-07-21
+- **Action**: #5648 (M43b) — SetForwardingArmed fail-closed on required-generation
+  protocol mismatch. On master `SetForwardingArmed(true)` only rejected when
+  `!ForwardingSupported`; it did NOT re-check the required config-snapshot
+  protocol gate that the compile/publish paths use to disarm a too-old helper.
+  So after a required-generation protocol disarm (policy schedulers / persistent
+  source NAT vs an old accepted image), an explicit operator/gRPC arm re-armed
+  the STALE accepted image and forwarded on a config the helper cannot represent
+  (fail-OPEN). Fix: SetForwardingArmed now re-runs
+  `ensureRequiredSnapshotProtocolLocked(m.lastSnapshot.Config)` before arming and
+  refuses (returns the required-protocol sentinel) on a mismatch. Scoped — no-op
+  unless the config requires the protocol, re-polls the helper first, only gates
+  `armed==true` (disarm never blocked). Rust helper unchanged: the required
+  generation is a control-plane concept the helper cannot independently derive.
+  Fail-on-revert test + scoped control test; RED-on-revert verified as a clean
+  assertion failure (neutralize `if armed &&` → `if false &&`, target-count 1).
+  Unit-provable, no cluster smoke.
+- **File(s)**:
+  - `pkg/dataplane/userspace/manager_status.go` (SetForwardingArmed guard)
+  - `pkg/dataplane/userspace/set_forwarding_armed_generation_5648_test.go`
+    (new tests `TestSetForwardingArmedRefusesStaleProtocolMismatch`,
+    `TestSetForwardingArmedArmsWhenProtocolMatches`)
+  - `docs/userspace-dataplane-gaps.md` (policy-scheduler row + fail-closed
+    section: explicit-arm-path enforcement of the required-protocol gate)
   **Action**: Fold #6162 review MINOR — update afxdp/README.md neighbor-limiter section from "256-slot direct-mapped" + open #6129 caveat to the 64-bucket x 4-way set-associative description with the bounded-residual note (stale-doc module-contract fix)
   **File(s)**: userspace-dp/src/afxdp/README.md
 
@@ -54176,3 +54199,37 @@ top.
     snapshot + Stats())
   - `pkg/cluster/sync_admission_test.go` (new — 4 fail-on-revert tests)
   - `docs/session-sync-architecture.md` (Pre-Auth Connection Admission section)
+## 2026-07-21 — #5800 io_uring write in-flight registry (UAF fix)
+- **Timestamp**: 2026-07-21
+- **Action**: Close the retry-ceiling/fatal-ring use-after-free in the shared
+  io_uring write loop. `write_all` now takes the packet buffer BY VALUE, tags
+  every submission with a ring-global monotonic `user_data` (fail-closed on
+  wrap), and on retry-exhaustion / fatal-ring returns `WriteResult::Deferred`
+  only AFTER moving the owned buffer into a ring-owned `InflightRegistry` — the
+  buffer is never freed while an SQE may reference it. Deferred buffers are
+  released only on a reaped terminal CQE, a bounded teardown drain (AsyncCancel +
+  observe BOTH the cancel CQE and the target write's terminal CQE), or ring-fd
+  close (RingWriter field order drops the ring before the registry). Migrated
+  BOTH callers (slow-path TUN writes + positioned state-file writes) to
+  `RingWriter` + `WriteResult`. Added fail-on-revert tests driving the FakeRing
+  seam (ceiling EINTR / transient EAGAIN / permanent EBADF defer-not-free,
+  cancellation race, stale-CQE non-misattribution, id-wrap fail-closed, teardown
+  drain, fatal-ring retain). Parent-RED: neutralizing `reg.defer(slot)` →
+  `drop(slot)` turns 9 registry-invariant tests RED as clean assertion failures.
+  Full userspace-dp suite green (4054 lib tests); primary regression 5/5
+  non-flaky. Retry-exhaustion/error branches only — healthy write path unchanged
+  (Done/short-write/EINTR-then-success paths preserved).
+- **File(s)**:
+  - `userspace-dp/src/io_uring_write.rs` (InflightRegistry, RingWriter,
+    WriteResult, ring-global id, teardown drain, reap_matching ReapError)
+  - `userspace-dp/src/io_uring_write_tests.rs` (FakeRing cancel/drain seam +
+    #5800 defer/teardown/id-wrap tests; realistic pending-cancel modelling)
+  - `userspace-dp/src/slowpath.rs` (WriteMode::IoUring(RingWriter),
+    classify_io_uring_write over WriteResult, retire_ring_to_sync simplified)
+  - `userspace-dp/src/slowpath_tests.rs` (classify tests over WriteResult;
+    new non-fatal-deferral-keeps-iouring test)
+  - `userspace-dp/src/state_writer.rs` (WriteMode::IoUring(RingWriter),
+    IoUringPersist enum, persist_with_io_uring by-value + Deferred handling)
+  - `userspace-dp/src/state_writer_tests.rs` (RingWriter construction)
+  - `docs/xdp-io-uring-userspace-dataplane.md` (#5800 registry contract)
+  - `docs/pr/5800-iouring-inflight-registry/plan.md` (plan + deviations)
