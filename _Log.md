@@ -54574,3 +54574,23 @@ top.
 - **File(s)**: pkg/grpcapi/server_diag_zeroize.go,
   pkg/grpcapi/zeroize_login_resource_roots_5841_test.go (new),
   docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5834 — VRRP auth tolerant-load fail-closed. #4288 strict-rejects
+  VRRP authentication (native impl is RFC 5798 VRRPv3, no auth), but the
+  tolerant load / peer-sync path only WARNED and still COMPILED the
+  authenticated vrrp-group as an ACTIVE instance — a persisted/mixed-version
+  peer config could boot CLAIMING the VIP and exchanging UNAUTHENTICATED adverts
+  while the operator REQUIRED auth (false-secure). Fix: on the lenient path
+  `validateVRRPAuthenticationAST` now DROPS the auth-carrying vrrp-group node
+  from the AST (before parseVRRPGroups reads it) + warns loudly, mirroring the
+  CoS tolerant warn-and-drop precedent. Operator REQUIRE-auth intent wins over
+  availability; base address survives; no-brick preserved (only the one group
+  drops). Strict reject unchanged; #4288 secret-leak identity-only guard
+  preserved. Golden baseline (#4406) regenerated for the intended warning-text
+  change (6 lines, address-less fixture — no structural drift). Tests: 3 new in
+  vrrp_authentication_4288_test.go (LenientDropsGroup_FlatSet,
+  LenientKeepsBaseAddress; LenientWarns updated to assert DROP).
+- **File(s)**: pkg/config/compiler_interfaces.go,
+  pkg/config/compiler_prewalk.go, pkg/config/vrrp_authentication_4288_test.go,
+  pkg/config/testdata/golden_4406.json, docs/feature-coverage.md, _Log.md
