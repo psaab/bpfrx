@@ -1080,6 +1080,46 @@ Manual failover uses the same demotion-prep path via
 peer not quiescent, barrier ack timeout). The cluster state machine can retry
 admission on retryable errors instead of proceeding unsafely.
 
+### Remote-failover applied-ack is fenced on local demotion actuation (#5640)
+
+When the peer requests this node to transfer an RG out of primary, the receiver
+runs `OnRemoteFailover` → `cluster.ManualFailover`, which sets the RG to
+`StateSecondaryHold` and **enqueues** an async demotion event onto the manager
+event channel (`sendEvent`) before returning. The actual fence — `ResignRG`
+(VRRP priority-0 advert + VIP removal) and `rg_active` clear — is actuated later
+by the daemon's `watchClusterEvents` consumer, not synchronously inside
+`ManualFailover`.
+
+`handleRemoteFailover` (`pkg/cluster/sync_failover.go`) therefore must **not**
+reply `failoverAckApplied` the instant `OnRemoteFailover` returns: the sender
+treats that ack as authorization to run `commitRequestedPeerFailover` and become
+primary. Acking before the local event consumer has run left a window where the
+peer promoted (adds VIPs, sends GARP) while the old owner still advertised as
+MASTER and owned the VIPs — two external owners of the RG (duplicate GARP / VIP
+ownership / traffic).
+
+The fix gates the applied-ack on a fence-completion barrier:
+
+1. The daemon `OnRemoteFailover`/`OnRemoteFailoverBatch` closures call
+   `armFailoverActuation(rgID)` — registering a per-RG channel — **before**
+   `ManualFailover` enqueues the demotion event, so the actuation signal can
+   never be missed. A `ManualFailover` error disarms the barrier.
+2. `handleRemoteFailover` calls the `WaitFailoverApplied` hook (wired to
+   `waitFailoverActuated`) after `OnRemoteFailover` succeeds and before sending
+   `failoverAckApplied`. It blocks on the barrier channel.
+3. `watchClusterEvents`, at the end of the demotion (non-primary) branch — after
+   `ResignRG` / direct-VIP reconcile / `rg_active` clear — calls
+   `signalFailoverActuated(rgID)`, closing the channel and releasing the ack.
+4. The wait is bounded by `failoverActuateTimeout` (3s default). A demotion that
+   never actuates (superseded reset, event-channel drop) downgrades the ack to
+   `failoverAckFailed` so the peer **holds** rather than promoting into the
+   two-owner window — safety over latency in the race. On the normal path the
+   barrier releases as soon as the local resign completes, so failover latency is
+   unchanged.
+
+The batch path (`handleRemoteFailoverBatch` / `WaitFailoverAppliedBatch`) applies
+the same per-RG barrier across the whole set.
+
 Once the RG is marked standby, each worker processes a
 `WorkerCommand::DemoteOwnerRGS` on its packet thread
 (`afxdp/session_glue/commands/demote_owner_rgs.rs`, `handle_demote_owner_rgs`):

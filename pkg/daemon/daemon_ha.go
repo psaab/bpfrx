@@ -139,6 +139,87 @@ func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
 	}
 }
 
+// armFailoverActuation registers a fence-completion barrier for rgID before a
+// remote-requested transfer-out enqueues its async demotion event. It MUST be
+// called before cluster.ManualFailover so the demotion actuation
+// (watchClusterEvents → signalFailoverActuated) cannot close-and-forget the
+// barrier before waitFailoverActuated observes it. Concurrent same-RG remote
+// failovers are excluded upstream (cluster.failoverInProgress + the sync-layer
+// failover waiters), so a single channel per RG is sufficient (#5640).
+func (d *Daemon) armFailoverActuation(rgID int) {
+	d.failoverActuateMu.Lock()
+	if d.failoverActuateWait == nil {
+		d.failoverActuateWait = make(map[int]chan struct{})
+	}
+	d.failoverActuateWait[rgID] = make(chan struct{})
+	d.failoverActuateMu.Unlock()
+}
+
+// disarmFailoverActuation drops a barrier that will never be actuated — used
+// when ManualFailover fails to enqueue the demotion (no event will ever fire).
+// It does NOT close the channel: no waiter can be blocked on it because the
+// applied-ack path is not reached on a ManualFailover error.
+func (d *Daemon) disarmFailoverActuation(rgID int) {
+	d.failoverActuateMu.Lock()
+	delete(d.failoverActuateWait, rgID)
+	d.failoverActuateMu.Unlock()
+}
+
+// signalFailoverActuated marks rgID's demotion as actuated (VRRP resigned /
+// rg_active cleared) and releases any waiter. It is idempotent: the channel is
+// deleted under the lock, so a second demotion event for the same RG is a
+// no-op and never double-closes. Safe to call for every non-primary cluster
+// event — an unarmed RG simply has no channel to close.
+func (d *Daemon) signalFailoverActuated(rgID int) {
+	d.failoverActuateMu.Lock()
+	ch := d.failoverActuateWait[rgID]
+	delete(d.failoverActuateWait, rgID)
+	d.failoverActuateMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+// waitFailoverActuated blocks until the local demotion for rgID has been
+// actuated (barrier closed by signalFailoverActuated) or the bounded timeout
+// elapses. A nil barrier means the actuation already completed (or was never
+// armed) — return immediately. This gates the remote-failover applied-ack so
+// the peer never promotes into a two-owner window (#5640).
+func (d *Daemon) waitFailoverActuated(rgID int) error {
+	d.failoverActuateMu.Lock()
+	ch := d.failoverActuateWait[rgID]
+	d.failoverActuateMu.Unlock()
+	if ch == nil {
+		return nil
+	}
+	timeout := d.failoverActuateTimeout
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return nil
+	case <-timer.C:
+		// Drop the stranded barrier so a later actuation event does not
+		// close an orphaned channel that no one reads.
+		d.disarmFailoverActuation(rgID)
+		return fmt.Errorf("timed out waiting for local fence actuation of redundancy group %d", rgID)
+	}
+}
+
+// waitFailoverActuatedBatch blocks until every RG in the batch has been fenced,
+// or returns the first RG's timeout (#5640).
+func (d *Daemon) waitFailoverActuatedBatch(rgIDs []int) error {
+	for _, rgID := range rgIDs {
+		if err := d.waitFailoverActuated(rgID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // isRethMasterState returns true when ALL VRRP instances for rgID are MASTER.
 // Returns false if no instances exist for the RG.
 func (d *Daemon) isRethMasterState(rgID int) bool {
@@ -298,6 +379,14 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				if noRethVRRP {
 					d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-secondary")
 				}
+
+				// #5640: the local demotion is now actuated — VRRP has
+				// resigned to priority-0 (or direct VIP ownership was
+				// reconciled away) and rg_active is cleared. Release any
+				// remote-failover applied-ack that is holding for this fence
+				// so the peer only promotes AFTER this node stopped owning
+				// the RG. Fires for every non-primary edge; unarmed RGs no-op.
+				d.signalFailoverActuated(ev.GroupID)
 			}
 
 			// Strict VIP ownership: suppress GARP on secondary, allow on primary.

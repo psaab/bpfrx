@@ -775,6 +775,20 @@ type Daemon struct {
 	// readiness bit flips so the VRRP/direct-ownership side effects that set
 	// the bit have a chance to propagate before the peer finalizes demotion.
 	localFailoverCommitDelay time.Duration
+	// failoverActuateMu guards failoverActuateWait. The map holds, per RG, a
+	// channel that watchClusterEvents closes once it has ACTUATED a demotion
+	// (VRRP resign to priority-0 / rg_active clear). armFailoverActuation
+	// registers a fresh channel BEFORE ManualFailover enqueues the demotion
+	// event, so the close can never be missed; waitFailoverActuated blocks the
+	// remote-failover applied-ack on that close. This closes the #5640
+	// two-owner window where the peer promoted off an ack sent before this
+	// (old-owner) node had actually resigned.
+	failoverActuateMu   sync.Mutex
+	failoverActuateWait map[int]chan struct{}
+	// failoverActuateTimeout bounds waitFailoverActuated so a demotion event
+	// that is never actuated (superseded reset, event-channel drop) downgrades
+	// the ack to failed instead of hanging the peer's failover request.
+	failoverActuateTimeout time.Duration
 	// Test hooks for direct-mode VIP ownership reconciliation.
 	directAddVIPsFn        func(int) int
 	directRemoveVIPsFn     func(int) int
@@ -1038,6 +1052,8 @@ func New(opts Options) (*Daemon, error) {
 		localFailoverCommitReady:   make(map[int]bool),
 		localFailoverCommitTimeout: 3 * time.Second,
 		localFailoverCommitDelay:   200 * time.Millisecond,
+		failoverActuateWait:        make(map[int]chan struct{}),
+		failoverActuateTimeout:     3 * time.Second,
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 		applySem:                   semaphore.NewWeighted(1),
 	}, nil

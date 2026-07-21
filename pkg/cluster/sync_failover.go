@@ -433,6 +433,20 @@ func (s *SessionSync) handleRemoteFailover(conn net.Conn, rgID int, reqID uint64
 		s.sendFailoverResult(conn, syncMsgFailoverAck, rgID, reqID, status, err.Error())
 		return
 	}
+	// #5640: OnRemoteFailover only ENQUEUES the async demotion event; the old
+	// owner is not fenced (VRRP resigned / VIPs removed) until the daemon's
+	// event consumer actuates it. Acking applied here let the peer promote
+	// while this node still owned the RG → a two-owner window. Gate the
+	// applied-ack on the fence-completion barrier; if the fence does not
+	// actuate within the bounded timeout, downgrade to failed so the peer
+	// holds rather than joining a split-brain.
+	if s.WaitFailoverApplied != nil {
+		if err := s.WaitFailoverApplied(rgID); err != nil {
+			slog.Warn("cluster sync: remote failover fence barrier failed", "rg", rgID, "req_id", reqID, "err", err)
+			s.sendFailoverResult(conn, syncMsgFailoverAck, rgID, reqID, failoverAckFailed, err.Error())
+			return
+		}
+	}
 	s.sendFailoverResult(conn, syncMsgFailoverAck, rgID, reqID, failoverAckApplied, "")
 }
 func (s *SessionSync) handleRemoteFailoverBatch(conn net.Conn, rgIDs []int, reqID uint64) {
@@ -447,6 +461,16 @@ func (s *SessionSync) handleRemoteFailoverBatch(conn net.Conn, rgIDs []int, reqI
 		}
 		s.sendFailoverBatchResult(conn, syncMsgFailoverBatchAck, rgIDs, reqID, status, err.Error())
 		return
+	}
+	// #5640: gate the batch applied-ack on every RG being fenced. See
+	// handleRemoteFailover for the two-owner rationale — a batch handoff that
+	// acks before actuation opens the same window across the whole set.
+	if s.WaitFailoverAppliedBatch != nil {
+		if err := s.WaitFailoverAppliedBatch(rgIDs); err != nil {
+			slog.Warn("cluster sync: remote batch failover fence barrier failed", "rgs", rgIDs, "req_id", reqID, "err", err)
+			s.sendFailoverBatchResult(conn, syncMsgFailoverBatchAck, rgIDs, reqID, failoverAckFailed, err.Error())
+			return
+		}
 	}
 	s.sendFailoverBatchResult(conn, syncMsgFailoverBatchAck, rgIDs, reqID, failoverAckApplied, "")
 }
