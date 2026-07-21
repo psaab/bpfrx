@@ -54456,3 +54456,29 @@ top.
 - **File(s)**: pkg/cli/cli.go, pkg/cli/cli_request_system.go,
   pkg/daemon/daemon_run.go, pkg/cli/console_zeroize_transaction_5871_test.go (new),
   pkg/cli/README.md, pkg/grpcapi/README.md, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5841 — resource-specific + atomic login credential ownership.
+  Split the single per-account provenance marker into three UID-file roots:
+  the account/enumeration registry (`provisioned-users`, unchanged format for
+  the zeroize teardown) plus resource-specific `provisioned-passwords` and
+  `provisioned-keys` markers (siblings of the registry, one test seam). The
+  password lock now consults `passwordProvisioned`, the key-file removal
+  `keyProvisioned` — so provisioning only a password never clobbers an
+  operator-installed authorized_keys (overclaim fix), and a keys-only
+  root-authentication never locks an out-of-band root password. Each resource
+  marker is written marker-first (before chpasswd / the key write); a
+  marker-write failure now SKIPS the mutation (fail-visible) instead of being
+  logged-and-swallowed, so xpf never leaves a mutated-but-unmarked credential
+  (underclaim fix). `reconcileAbsentLoginUsers` enumerates the union of the
+  three roots. Added two fail-on-revert tests; updated the #5106/#5128/#5276/
+  #5493 tests to seed the resource markers. Docs: system-login.md new
+  "Resource-specific, atomic credential ownership (#5841)" section + corrected
+  the stale one-marker claims; engineering-style.md persistence table.
+- **File(s)**: pkg/daemon/login_password.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/login_resource_ownership_5841_test.go (new),
+  pkg/daemon/login_emptied_keys_5106_test.go,
+  pkg/daemon/login_deprovision_5128_test.go,
+  pkg/daemon/root_auth_revoke_5276_test.go,
+  pkg/daemon/login_passwd_failclosed_5493_test.go,
+  docs/system-login.md, docs/engineering-style.md, _Log.md

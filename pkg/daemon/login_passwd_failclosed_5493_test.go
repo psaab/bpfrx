@@ -120,7 +120,16 @@ func TestDeprovisionShadowReadErrorFailsClosed(t *testing.T) {
 		"root:$6$r$h:19000:0:99999:7:::\nheidi:$6$salt$hash:19000:0:99999:7:::\n",
 	)
 
+	// heidi is fully provisioned — xpf set her password AND wrote her keys — so
+	// the deprovision actually reaches the password-lock step (gated on the
+	// password marker) where the shadow read error must fail closed (#5841).
 	if err := markProvisioned("heidi", 1001); err != nil {
+		t.Fatal(err)
+	}
+	if err := markPasswordProvisioned("heidi", 1001); err != nil {
+		t.Fatal(err)
+	}
+	if err := markKeyProvisioned("heidi", 1001); err != nil {
 		t.Fatal(err)
 	}
 	keysFile := managedAuthorizedKeysPath("heidi")
