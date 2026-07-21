@@ -277,11 +277,13 @@ itself — the #1956 device-map management-lockout gate, which resolves the
 proposed config against LIVE hardware while the operator is still connected.
 Candidate mutations (`Set`/`Delete`/`LoadOverride`/`LoadMerge`/`LoadSet`/
 `Deactivate`/`Activate`/`Copy`/`Rename`/`Insert`/`Annotate`/`Rollback`) do
-NOT take the daemon apply semaphore, and REST/internal callers pass
-`sessionID == ""` which bypasses config-lock holder enforcement. So a
-concurrent edit could land between the daemon's pre-flight of candidate C1 and
-`Commit`'s promotion, and the daemon would persist+apply an unexamined C2 — a
-management-lockout-gate bypass (examined generation != promoted generation).
+NOT take the daemon apply semaphore, and internal callers pass
+`sessionID == ""` which bypasses config-lock holder enforcement (REST now
+carries the fixed `restConfigSessionID` holder identity instead, #5870, but
+same-session and internal concurrency remain). So a concurrent edit could land
+between the daemon's pre-flight of candidate C1 and `Commit`'s promotion, and
+the daemon would persist+apply an unexamined C2 — a management-lockout-gate
+bypass (examined generation != promoted generation).
 
 The fix is a monotonic **candidate generation token** (`candidateGen`, bumped
 via `bumpCandidateGenLocked` under `s.mu.Lock` at EVERY candidate change:
@@ -311,7 +313,9 @@ commit-confirmed (the active config) is stable across the transaction because
 every path that mutates `active` runs under the daemon apply semaphore the
 commit path holds from pre-flight through promotion.
 
-Scope: REST configuration-session identity / ETag semantics remain a separate
+Scope: REST config mutations now carry a fixed holder identity that
+participates in the config-lock gate (#5870, see "Config-lock ownership gate"),
+but a per-REST-caller session token / ETag semantics remain a separate
 follow-up; generation binding is the invariant required even for
 same-session/internal concurrent callers.
 
@@ -827,17 +831,36 @@ of these, so a second remote session is rejected with `ErrConfigLockedByOther`
 
 Two deliberate bypasses keep the internal paths working:
 
-- **`sessionID == ""` is the internal/system capability** — the in-process
-  CLI, the stateless REST config-enter path (no per-session holder, #4476),
-  HA sync, and tests all call the plain (non-`As`) methods, which delegate
-  with an empty session and skip the ownership check. This is why the local
-  CLI and REST behavior is bit-identical to before #5059.
+- **`sessionID == ""` is the internal/system capability** — daemon apply, HA
+  sync, the in-process CLI, and tests all call the plain (non-`As`) methods,
+  which delegate with an empty session and skip the ownership check.
 - **A lock with no recorded holder** (`effectiveHolderLocked() == ""`, i.e.
   the internal/local `EnterConfigure()` path) is not owned by any session, so
   a user session is not blocked from it. A remote gRPC caller always carries a
   non-empty `connSessionID` (its connection-scoped id, #5849) and records it on
   `EnterConfigureSession`, so it cannot manufacture an empty-holder state to
   slip through.
+
+**REST config mutations no longer use the empty-session bypass (#5870).**
+Originally the stateless REST config endpoints (`pkg/api/config.go`) called the
+plain methods with `sessionID == ""`, so a remote REST caller silently wielded
+the internal/system bypass and could Set/Delete/Load/Rollback/Commit a candidate
+that a CLI or gRPC session legitimately held. Every REST config
+enter/set/delete/deactivate/activate/load/annotate/rollback/commit/
+commit-confirmed/confirm now runs under a fixed non-empty holder identity,
+`restConfigSessionID` (`"rest"`), routed through the `*As` variants and the
+`EnsureConfigHolder` commit gate. A REST mutation is therefore rejected with
+`ErrConfigLockedByOther` (mapped to HTTP 409 Conflict) when another session owns
+the candidate, and symmetrically a CLI/gRPC mutation is rejected while REST
+holds it; `/config/exit` releases only the REST-held lock via
+`ExitConfigureSession` instead of force-clearing any holder. The store's
+`sessionID == ""` semantics are unchanged — only the REST layer stopped using
+them; read-only REST endpoints are unaffected. Because REST is stateless and
+carries no per-request token, two concurrent REST clients share this single
+`"rest"` identity and are not mutually excluded from each other (only from
+CLI/gRPC) — a distinct per-caller REST session token is the separate follow-up
+noted in "Generation-bound commit transaction" above. A wedged REST lock is
+still reclaimed by the #4476 idle-lease reaper.
 
 Like `ErrClusterReadOnly`, `ErrConfigLockedByOther` is `errors.Is`-matchable;
 it is transient (the holder commits or exits). The internal `SyncApply` /

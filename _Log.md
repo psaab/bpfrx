@@ -54662,3 +54662,32 @@ top.
 - **File(s)**: pkg/config/compiler_interfaces.go,
   pkg/config/compiler_prewalk.go, pkg/config/vrrp_authentication_4288_test.go,
   pkg/config/testdata/golden_4406.json, docs/feature-coverage.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5870 — REST candidate mutations bypassed the config-session
+  holder lock. The REST config endpoints (`pkg/api/config.go`) called the store
+  with an empty session ID, which the store treats as its internal/system
+  capability (daemon apply / HA sync) and which BYPASSES the #5059 candidate
+  holder lock. A remote, stateless REST caller could therefore Set/Delete/Load/
+  Rollback/Commit a candidate that a CLI or gRPC configuration session
+  legitimately OWNED — corrupting a peer's candidate or smuggling their staged
+  edits into an applied commit. Fix: route every REST config MUTATION
+  (enter/set/delete/deactivate/activate/load/annotate/rollback/commit/
+  commit-confirmed/confirm) through the session-scoped `*As` variants +
+  `EnsureConfigHolder` commit gate under a fixed non-empty holder identity,
+  `restConfigSessionID` ("rest"). A REST mutation is now rejected with
+  `ErrConfigLockedByOther` → HTTP 409 when another session owns the candidate,
+  and symmetrically CLI/gRPC is rejected while REST holds it; `/config/exit`
+  releases only the REST-held lock (`ExitConfigureSession`) instead of
+  force-clearing any holder. The store's `sessionID == ""` system-bypass
+  semantics are untouched; read-only REST endpoints are unaffected. Session
+  model: fixed shared REST identity (REST is stateless); two concurrent REST
+  clients share "rest" and are not mutually excluded — a per-caller REST token
+  is a separate product follow-up. Tests (fail-on-revert; neutralize by setting
+  `restConfigSessionID = ""` → 3 RED): pkg/api/config_session_holder_5870_test.go.
+  Validation: go build ./..., go vet ./pkg/api/ ./pkg/configstore/, go test
+  ./pkg/api/... ./pkg/configstore/... all pass. Control-plane / unit-provable —
+  no smoke.
+- **File(s)**: pkg/api/config.go,
+  pkg/api/config_session_holder_5870_test.go (new),
+  pkg/configstore/README.md, _Log.md
