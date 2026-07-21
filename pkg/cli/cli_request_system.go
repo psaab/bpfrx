@@ -161,12 +161,37 @@ var zeroizeStopDaemon = func() error {
 // (zeroizeConfigRoot, #5554/#5684), failing CLOSED if it cannot be determined,
 // so a non-default `-config` erases the right directory (never a hardcoded
 // /etc/xpf). It then stops the daemon.
+//
+// #5871: the wipe runs THROUGH the daemon's coordinated factory-reset
+// transaction (factoryResetFn -> daemon.factoryReset, the SAME gate the gRPC
+// ZeroizeFn path uses) so the console gets IDENTICAL fencing: the transaction
+// acquires the daemon apply semaphore (draining any in-flight apply, blocking a
+// concurrent one) and enters the terminal reset generation BEFORE erasing, so no
+// commit / HA-sync / reconcile re-persists the erased .configdb SSOT or
+// re-renders the wiped secrets. The pre-#5871 console called zeroizeFullWipe
+// DIRECTLY (ungated), so a concurrent writer could re-create just-erased state
+// while the console reported a clean reset — the security bug this closes.
 func (c *CLI) performConsoleZeroize() error {
 	configDir, configBase, err := c.zeroizeConfigRoot()
 	if err != nil {
 		return err
 	}
-	if err := zeroizeFullWipe(configDir, configBase); err != nil {
+	// The shared full factory-reset wipe primitive (config state + tls/ +
+	// rendered service configs [frr/swanctl/kea] + provisioned login accounts +
+	// config archive + BPF pins + networkd), #5890.
+	wipe := func() error { return zeroizeFullWipe(configDir, configBase) }
+
+	// Route through the daemon's coordinated transaction when wired. When it is
+	// nil the CLI is spawned OUTSIDE the daemon (offline recovery / unit test) —
+	// no reconcile loop is running to race, so the ungated direct wipe is the
+	// honest fallback, mirroring grpcapi.runZeroize's zeroizeFn==nil path. Either
+	// way the wipe/transaction error is surfaced fail-CLOSED (never discarded) and
+	// the daemon is stopped ONLY on a fully-successful reset.
+	run := wipe
+	if c.factoryResetFn != nil {
+		run = func() error { return c.factoryResetFn(context.Background(), wipe) }
+	}
+	if err := run(); err != nil {
 		return fmt.Errorf("zeroize: factory reset did not fully complete: %w", err)
 	}
 	_ = zeroizeStopDaemon()

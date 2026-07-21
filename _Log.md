@@ -54416,3 +54416,28 @@ top.
   pkg/config/compiler_interfaces_unsupported.go, pkg/config/compiler.go,
   pkg/config/schema_interfaces.go, pkg/config/qinq_canonical_vlan_5879_test.go (new),
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5871 — route interactive-CLI `request system zeroize` through the
+  daemon's coordinated factory-reset transaction. Pre-fix the console called the
+  wipe primitive DIRECTLY (`zeroizeFullWipe` -> `grpcapi.PerformZeroizeWipe`),
+  bypassing the daemon apply-gate + terminal reset generation the gRPC path uses
+  (`SystemAction{zeroize}` -> `runZeroize` -> `ZeroizeFn` -> `d.factoryReset`).
+  So a console zeroize erased state out-of-band: a concurrent commit / HA-sync /
+  reconcile could re-persist the just-erased `.configdb` SSOT or re-render the
+  wiped secrets while the console reported a clean reset (#5890 had already
+  unified the WIPE file-set; this closes the TRANSACTION/fencing gap). Fix: added
+  `CLI.factoryResetFn` + `SetFactoryResetFn`, wired by the daemon to
+  `d.factoryReset` (the SAME function as gRPC `ZeroizeFn`); `performConsoleZeroize`
+  now runs the wipe THROUGH it (acquires `d.applySem`, enters the reset
+  generation BEFORE erasing). Nil hook = CLI spawned outside the daemon (offline
+  recovery / unit test) -> explicit ungated direct-wipe fallback (no reconcile
+  loop to race), mirroring `runZeroize`'s `zeroizeFn==nil` path; still
+  fail-CLOSED, still stops the daemon only on full success. Fail-on-revert test
+  `TestConsoleZeroizeRoutesThroughDaemonTransaction_5871` binds
+  `performConsoleZeroize`'s `factoryResetFn` route; two more pin
+  transaction/removal-failure surfacing fail-CLOSED. Unit-provable (no smoke —
+  in-process wiring + seam spies).
+- **File(s)**: pkg/cli/cli.go, pkg/cli/cli_request_system.go,
+  pkg/daemon/daemon_run.go, pkg/cli/console_zeroize_transaction_5871_test.go (new),
+  pkg/cli/README.md, pkg/grpcapi/README.md, pkg/daemon/README.md, _Log.md
