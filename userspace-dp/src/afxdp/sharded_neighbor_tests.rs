@@ -579,3 +579,204 @@ fn mac_change_epoch_rx_learn_pair_bumps_each_key_shard() {
     assert!(map.mac_change_epoch_for(&phys) >= 1);
     assert!(map.mac_change_epoch_for(&logical) >= 1);
 }
+
+// ---------------------------------------------------------------------------
+// #5673 (codex-review M02): aggregate cap on dynamically learned neighbors.
+//
+// Source-address learning runs on RX (`stage_parse_flow_and_learn`, stage
+// 7+8) BEFORE the screen/policy admission stages, so an attacker on an
+// untrusted segment can stream packets carrying distinct spoofed L3 sources
+// and — without passing any policy check — grow this shared map with one
+// entry per fake source (unbounded memory) while every genuine first-sighting
+// insert takes the 64-shard `with_all_shards` bulk lock (all-shard CPU DoS).
+// The per-shard cap (`MAX_DYNAMIC_NEIGHBORS_PER_SHARD`) bounds the aggregate
+// to `MAX_DYNAMIC_NEIGHBORS`; the uniform Knuth-mixed shard hash keeps a
+// spoofed `/8`/`/24` flood spread ~evenly so the per-shard bound is the
+// aggregate bound. These tests overflow ONE shard (many distinct spoofed
+// sources hashing to it) — the cheap, exact way to exercise the cap gate.
+// ---------------------------------------------------------------------------
+
+/// `count` distinct, learnable unicast v4 keys that all hash to
+/// `target_shard`. `10.0.0.0/8` is a unicast block that
+/// `neighbor_ip_is_learnable` accepts, and filtering by `shard_index` lets a
+/// test overflow a single shard cheaply instead of flooding all 64.
+fn keys_in_shard(target_shard: usize, count: usize) -> Vec<(i32, IpAddr)> {
+    let mut out = Vec::with_capacity(count);
+    let mut i: u32 = 0;
+    while out.len() < count {
+        let k = (7, IpAddr::V4(Ipv4Addr::from(0x0A00_0000u32.wrapping_add(i))));
+        if ShardedNeighborMap::shard_index(&k) == target_shard {
+            out.push(k);
+        }
+        i = i
+            .checked_add(1)
+            .expect("exhausted the v4 space searching for shard keys");
+    }
+    out
+}
+
+/// #5673 fail-on-revert (transit-source arm). Flood the map through
+/// `learn_pair_if_changed` — the arm the RX transit-source learn
+/// (`learn_dynamic_neighbor`) uses — with more distinct spoofed sources than
+/// one shard's cap allows. The shard (and thus the map, since every key hashes
+/// here) must stay bounded at `MAX_DYNAMIC_NEIGHBORS_PER_SHARD`.
+///
+/// PARENT-RED: neutralize the cap gate in `learn_pair_if_changed` — the
+/// `bulk.len_for(key) >= MAX_DYNAMIC_NEIGHBORS_PER_SHARD` comparison (make it
+/// never true, e.g. `>= usize::MAX`, which still compiles). Then `blocked` is
+/// always false, every distinct source is inserted, and
+/// `map.len() <= MAX_DYNAMIC_NEIGHBORS_PER_SHARD` fails RED as a clean
+/// assertion (the shard grows to the full flood). Target-count for that exact
+/// comparison: 1.
+#[test]
+fn spoofed_source_flood_via_learn_pair_bounded_by_cap() {
+    let map = ShardedNeighborMap::new();
+    let over = MAX_DYNAMIC_NEIGHBORS_PER_SHARD + 64;
+    let keys = keys_in_shard(0, over);
+    for k in &keys {
+        map.learn_pair_if_changed(&[*k], entry(0x11));
+    }
+    // All keys hash to shard 0, so the whole map lives there: len == shard len.
+    assert!(
+        map.len() <= MAX_DYNAMIC_NEIGHBORS_PER_SHARD,
+        "spoofed-source flood grew the shard to {} entries, past the {}-per-shard \
+         cap (the #5673 pre-policy neighbor-map DoS)",
+        map.len(),
+        MAX_DYNAMIC_NEIGHBORS_PER_SHARD,
+    );
+    // Non-vacuous: every distinct-key call either inserted (len) or was
+    // refused (drop) — nothing is a same-MAC no-op — so the two partition the
+    // flood exactly. Proves the cap actually fired on this run.
+    assert!(
+        map.learn_cap_drops() > 0,
+        "cap refused nothing — the flood never reached the bound",
+    );
+    assert_eq!(
+        map.learn_cap_drops() as usize + map.len(),
+        over,
+        "every spoofed learn must be exactly one of inserted-or-refused",
+    );
+}
+
+/// #5673 fail-on-revert (ARP/NDP arm). The RX ARP-reply / NDP-NA data-path
+/// learn (`stage_link_layer_classify`) inserts through `insert_if_changed`;
+/// an attacker can flood distinct learnable source IPs there too, and both
+/// arms share this map. The per-shard cap bounds that arm as well.
+///
+/// PARENT-RED: neutralize the cap gate in `insert_if_changed` — the
+/// `shard.len() >= MAX_DYNAMIC_NEIGHBORS_PER_SHARD` comparison (make it never
+/// true). Then every new key inserts and
+/// `map.len() <= MAX_DYNAMIC_NEIGHBORS_PER_SHARD` fails RED. Target-count for
+/// that exact comparison: 1.
+#[test]
+fn spoofed_source_flood_via_insert_if_changed_bounded_by_cap() {
+    let map = ShardedNeighborMap::new();
+    let over = MAX_DYNAMIC_NEIGHBORS_PER_SHARD + 64;
+    let keys = keys_in_shard(0, over);
+    for k in &keys {
+        map.insert_if_changed(*k, entry(0x22));
+    }
+    assert!(
+        map.len() <= MAX_DYNAMIC_NEIGHBORS_PER_SHARD,
+        "ARP/NDP-arm flood grew the shard to {} entries, past the {}-per-shard cap",
+        map.len(),
+        MAX_DYNAMIC_NEIGHBORS_PER_SHARD,
+    );
+    assert!(
+        map.learn_cap_drops() > 0,
+        "cap refused nothing on the ARP/NDP arm",
+    );
+}
+
+/// #5673 control: the cap is scoped to GROWTH, not a blanket block. A
+/// legitimate source learned on a fresh map is admitted and resolvable, and —
+/// critically — an UPDATE (a real MAC failover) to an already-learned
+/// neighbor is NEVER refused even when its shard is completely full of spoofed
+/// entries. Without this scoping the cap would regress legitimate learning and
+/// silently drop a gateway MAC failover.
+#[test]
+fn learned_source_admitted_and_update_survives_full_shard() {
+    let map = ShardedNeighborMap::new();
+    let over = MAX_DYNAMIC_NEIGHBORS_PER_SHARD + 64;
+    let keys = keys_in_shard(0, over);
+
+    // The first key is a legitimate learn; it lands and is resolvable.
+    let legit = keys[0];
+    map.learn_pair_if_changed(&[legit], entry(0xAA));
+    assert_eq!(map.get(&legit), Some(entry(0xAA)), "legit learn must be admitted");
+
+    // Fill the rest of the shard with a spoofed flood until it caps.
+    for k in &keys[1..] {
+        map.learn_pair_if_changed(&[*k], entry(0x11));
+    }
+    assert!(
+        map.len() <= MAX_DYNAMIC_NEIGHBORS_PER_SHARD,
+        "shard must be bounded",
+    );
+    assert!(map.learn_cap_drops() > 0, "flood must have hit the cap");
+    assert_eq!(
+        map.get(&legit),
+        Some(entry(0xAA)),
+        "the legit neighbor learned first must survive the flood (never evicted)",
+    );
+
+    // Its gateway MAC now changes (VRRP failover). This is an UPDATE to an
+    // existing key, not growth, so the full shard must NOT refuse it.
+    let drops_before = map.learn_cap_drops();
+    map.learn_pair_if_changed(&[legit], entry(0xBB));
+    assert_eq!(
+        map.get(&legit),
+        Some(entry(0xBB)),
+        "MAC failover on an already-learned neighbor must survive a full shard",
+    );
+    assert_eq!(
+        map.learn_cap_drops(),
+        drops_before,
+        "an update to an existing neighbor must not count as a cap refusal",
+    );
+}
+
+/// #5673: the per-shard cap only refuses a NEW key when the target shard is
+/// actually at `MAX_DYNAMIC_NEIGHBORS_PER_SHARD` — a single learn on an empty
+/// map is never refused, and `get_with_capacity` reports "room" for it. Guards
+/// against an off-by-one that would make the cap reject from the first packet.
+#[test]
+fn get_with_capacity_reports_room_on_empty_shard() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 123);
+    let (entry_before, at_cap) = map.get_with_capacity(&k);
+    assert_eq!(entry_before, None, "key absent on a fresh map");
+    assert!(!at_cap, "an empty shard must report room, not at-capacity");
+    assert!(
+        map.insert_if_changed(k, entry(0x33)),
+        "a single learn on an empty map must be admitted, not cap-refused",
+    );
+    assert_eq!(map.learn_cap_drops(), 0, "no refusal for a below-cap learn");
+}
+
+/// #5673: `get_with_capacity` is the signal the RX-learn caller
+/// (`learn_dynamic_neighbor`) uses to skip the 64-shard bulk lock for a
+/// spoofed-source flood — it must report `(absent, at_cap=true)` for a NEW key
+/// once its shard is full, and keep reporting an EXISTING key's entry so the
+/// caller still treats a MAC update as an update (not growth). Fill the shard
+/// with the plain `insert` (which does not enforce the cap) so this exercises
+/// the reporting path, not the insert gate.
+#[test]
+fn get_with_capacity_reports_at_cap_on_full_shard() {
+    let map = ShardedNeighborMap::new();
+    let keys = keys_in_shard(0, MAX_DYNAMIC_NEIGHBORS_PER_SHARD + 1);
+    for k in &keys[..MAX_DYNAMIC_NEIGHBORS_PER_SHARD] {
+        map.insert(*k, entry(0x44));
+    }
+    // A NEW key in the now-full shard: (absent, at_cap) — the caller reads this
+    // as "all-new-at-cap" and skips the bulk lock.
+    let fresh = keys[MAX_DYNAMIC_NEIGHBORS_PER_SHARD];
+    let (fresh_entry, fresh_at_cap) = map.get_with_capacity(&fresh);
+    assert_eq!(fresh_entry, None, "the fresh key is not yet learned");
+    assert!(fresh_at_cap, "a full shard must report at-capacity for a new key");
+    // An EXISTING key in the same full shard still reports its entry, so the
+    // caller does NOT treat it as all-new (an update is not growth).
+    let (existing_entry, existing_at_cap) = map.get_with_capacity(&keys[0]);
+    assert_eq!(existing_entry, Some(entry(0x44)), "existing key still readable at cap");
+    assert!(existing_at_cap, "shard is full regardless of the probed key's presence");
+}

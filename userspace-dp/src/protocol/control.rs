@@ -260,6 +260,16 @@ pub(crate) struct ProcessStatus {
     /// backward compatibility with older daemons.
     #[serde(rename = "pending_neigh_capacity_drops_total", default)]
     pub pending_neigh_capacity_drops_total: u64,
+    /// #5673: cumulative data-path neighbor LEARNS refused because the
+    /// dynamic-neighbor map's target shard was at
+    /// `MAX_DYNAMIC_NEIGHBORS_PER_SHARD`. Source-address learning runs on RX
+    /// BEFORE screen/policy admission, so an attacker on an untrusted segment
+    /// can otherwise inflate the shared map with one entry per spoofed source
+    /// (a pre-policy CPU/memory DoS). A rising value is the always-on signal
+    /// that the aggregate cap is bounding such a flood. Additive / defaulted
+    /// for backward compatibility with older daemons.
+    #[serde(rename = "dynamic_neighbor_learn_cap_drops_total", default)]
+    pub dynamic_neighbor_learn_cap_drops_total: u64,
     /// #1789: total failed USERSPACE_SESSIONS BPF-map publishes
     /// (per-binding worker-poll sites summed with the shared no-binding
     /// sites: HA upsert, session-glue worker publish, post-reconcile

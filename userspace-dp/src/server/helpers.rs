@@ -70,6 +70,12 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // separate from the duplicate-drop counter.
     state.status.pending_neigh_capacity_drops_total =
         state.afxdp.pending_neigh_capacity_drops_total();
+    // #5673: data-path neighbor learns refused by the aggregate
+    // dynamic-neighbor map cap. A rising value means a spoofed-source
+    // pre-policy flood (source learning runs on RX before screen/policy) is
+    // being bounded rather than inflating the shared map.
+    state.status.dynamic_neighbor_learn_cap_drops_total =
+        state.afxdp.dynamic_neighbor_learn_cap_drops_total();
     // #1789: total failed USERSPACE_SESSIONS BPF-map publishes
     // (per-binding worker-poll sites + shared no-binding sites). The
     // cause-side signal for rising XDP-shim NO_SESSION fallbacks.

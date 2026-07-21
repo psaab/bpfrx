@@ -19,6 +19,16 @@ impl super::Coordinator {
         (entries, generation)
     }
 
+    /// #5673: cumulative data-path neighbor learns refused by the aggregate
+    /// dynamic-neighbor map cap (`MAX_DYNAMIC_NEIGHBORS_PER_SHARD`). The
+    /// counter is a single map-wide atomic (the map is shared across all
+    /// workers via `Arc`), so this reads it directly rather than summing
+    /// per-binding like the `pending_neigh_*` counters. Surfaced as
+    /// `xpf_userspace_dynamic_neighbor_learn_cap_drops_total`.
+    pub fn dynamic_neighbor_learn_cap_drops_total(&self) -> u64 {
+        self.neighbors.dynamic.learn_cap_drops()
+    }
+
     /// #3773 (M13): cumulative count of fabric links skipped for a MALFORMED
     /// value (invalid parent ifindex / unparseable peer address / a NON-EMPTY
     /// unparseable local|peer MAC). Surfaced as
