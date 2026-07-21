@@ -91,8 +91,16 @@ const rootKeyContent = "ssh-ed25519 AAAAROOT root@host\n"
 func TestApplyRootAuthRevokesOnStanzaRemoval(t *testing.T) {
 	sentinel, rootKeys := stageRootAuthEnv(t, "$6$rootsalt$roothash") // active (unlocked) hash
 
-	// xpf provisioned root's credentials (marker) and a prior apply wrote keys.
+	// xpf provisioned root's credentials — password AND keys — so both resource
+	// markers are present (#5841: the lock is gated on the password marker, the
+	// key removal on the key marker).
 	if err := markProvisioned("root", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := markPasswordProvisioned("root", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := markKeyProvisioned("root", 0); err != nil {
 		t.Fatal(err)
 	}
 	writeRootKeys(t, rootKeys, rootKeyContent)
@@ -122,7 +130,13 @@ func TestApplyRootAuthRevokesOnStanzaRemoval(t *testing.T) {
 func TestApplyRootAuthPasswordLeafRemovedKeepsKey(t *testing.T) {
 	sentinel, rootKeys := stageRootAuthEnv(t, "$6$rootsalt$roothash")
 
+	// xpf set root's password (marker present → the password-leaf removal
+	// locks it, #5841). The key marker is (re)written by the positive key
+	// branch below since a key is still configured.
 	if err := markProvisioned("root", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := markPasswordProvisioned("root", 0); err != nil {
 		t.Fatal(err)
 	}
 	// The staged key file already equals the configured key content, so the
@@ -156,7 +170,13 @@ func TestApplyRootAuthKeyLeafRemovedKeepsPassword(t *testing.T) {
 	const hash = "$6$rootsalt$roothash"
 	sentinel, rootKeys := stageRootAuthEnv(t, hash)
 
+	// xpf wrote root's keys (key marker present → the emptied key list revokes
+	// them, #5841). No password marker: the password is left exactly as
+	// configured (pwNoop), proving key removal does not touch the password.
 	if err := markProvisioned("root", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := markKeyProvisioned("root", 0); err != nil {
 		t.Fatal(err)
 	}
 	writeRootKeys(t, rootKeys, rootKeyContent)

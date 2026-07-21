@@ -392,6 +392,27 @@ var (
 	}
 )
 
+// zeroizeProvisionedPasswordsDir and zeroizeProvisionedKeysDir are the two
+// RESOURCE-SPECIFIC ownership marker roots the #5841 split added alongside the
+// account registry (pkg/daemon.provisionedPasswordsDir / provisionedKeysDir):
+// provisioned-passwords records "xpf set this account's /etc/shadow password"
+// and provisioned-keys records "xpf wrote this account's authorized_keys". Like
+// their daemon counterparts they are computed as SIBLINGS of the account
+// registry, so overriding the single zeroizeProvisionedUsersDir seam in a test
+// relocates all three roots together. A factory reset must erase these two
+// roots too: a surviving per-account UID marker is the #5869/#5871 residue
+// class, and because reconcileAbsentLoginUsers unions all three roots, a
+// re-tenant's reused-UID account colliding with a surviving marker would be
+// deprovisioned (password locked / authorized_keys deleted) despite xpf never
+// provisioning it — the exact overclaim #5841 exists to kill.
+func zeroizeProvisionedPasswordsDir() string {
+	return filepath.Join(filepath.Dir(zeroizeProvisionedUsersDir), "provisioned-passwords")
+}
+
+func zeroizeProvisionedKeysDir() string {
+	return filepath.Join(filepath.Dir(zeroizeProvisionedUsersDir), "provisioned-keys")
+}
+
 // zeroizeRootAuthorizedKeysPath returns the xpf-managed ROOT authorized_keys
 // file — /root/.ssh/authorized_keys, NOT /home/root/.ssh (#5520). applyRootAuth
 // (pkg/daemon) writes root's SSH keys there wholesale, so the whole file is
@@ -555,6 +576,18 @@ func zeroizeLookupUIDErr(name string) (uid int, found bool, err error) {
 // retried zeroize re-attempts the removal (and the failure is surfaced, so the
 // device is not reported safe to re-tenant while a live account remains).
 //
+// #5841 resource roots. The account-registry teardown above enumerates only
+// provisioned-users, but the #5841 split records password/key ownership in two
+// SIBLING roots (provisioned-passwords, provisioned-keys). A factory reset must
+// erase those too — a surviving per-account UID marker is #5869/#5871-class
+// residue, and because reconcileAbsentLoginUsers unions all three roots, a
+// re-tenant's reused-UID account colliding with a surviving marker would be
+// deprovisioned despite xpf never provisioning it. After the registry loop,
+// zeroizeSweepResourceMarkerRoot erases every marker in the two resource roots
+// (keeping only names retained for a fail-closed registry retry) and drops the
+// roots, so no marker survives in ANY of the three roots. This mirrors the
+// daemon's own forgetProvenance, which already drops all three per account.
+//
 // Discipline mirrors zeroizeConfigDir / zeroizeRenderedConfigs: os.ErrNotExist
 // is never an error (an already-absent artifact is the goal), removal is
 // best-effort past a single failure, but the FIRST real error is returned so a
@@ -583,13 +616,44 @@ func zeroizeLoginAccounts() error {
 	}
 
 	// (B) Tear down each xpf-provisioned OS user, gated on the UID-keyed marker.
+	// retained collects the names whose account-registry teardown was KEPT for a
+	// fail-closed retry (userdel failed, ownership unresolved, out-of-band
+	// recreate); the resource-root sweep (C) leaves those names' password/key
+	// markers in place too, so an account's three markers stay together for the
+	// retry. Every other resource marker is erased. #5841.
+	retained := make(map[string]struct{})
 	entries, err := os.ReadDir(zeroizeProvisionedUsersDir)
 	if err != nil {
-		// Absent dir = xpf never provisioned a login account: nothing to do.
-		// Any other read error is surfaced (we cannot prove the accounts gone).
+		// Absent dir = xpf never provisioned an ACCOUNT-registry entry; a real
+		// read error is surfaced. Either way, fall through to sweep the two
+		// resource roots (C): a pre-existing account xpf only added an SSH key to
+		// has a provisioned-keys marker but NO registry entry, so its marker must
+		// still be erased even when the registry root is absent/unreadable.
 		fail(err)
-		return firstErr
+	} else {
+		zeroizeTearDownProvisionedUsers(entries, retained, fail)
 	}
+	// Drop the now-empty registry directory (best-effort; ENOTEMPTY after a
+	// retained marker is fine and must not gate the factory reset).
+	_ = os.Remove(zeroizeProvisionedUsersDir)
+
+	// (C) #5841: erase the two resource-specific ownership roots
+	// (provisioned-passwords, provisioned-keys) too, so a factory reset leaves NO
+	// per-account marker in ANY of the three roots — no residue for a re-tenant's
+	// reused-UID account to collide with.
+	zeroizeSweepResourceMarkerRoot(zeroizeProvisionedPasswordsDir(), retained, fail)
+	zeroizeSweepResourceMarkerRoot(zeroizeProvisionedKeysDir(), retained, fail)
+	return firstErr
+}
+
+// zeroizeTearDownProvisionedUsers runs the per-account registry teardown for
+// each marker in the account-registry directory (#4598). It is split out of
+// zeroizeLoginAccounts so the account loop and the #5841 resource-root sweep
+// read as two distinct phases. Every account whose teardown is RETAINED for a
+// fail-closed retry (userdel failure, ownership uncertainty, out-of-band
+// recreate) is recorded in retained so the resource-root sweep keeps its
+// password/key markers alongside the retained registry marker.
+func zeroizeTearDownProvisionedUsers(entries []os.DirEntry, retained map[string]struct{}, fail func(error)) {
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -608,6 +672,11 @@ func zeroizeLoginAccounts() error {
 			// marker only when the revocation fully succeeded (fail-closed).
 			if zeroizeRootLoginAccount(fail) {
 				fail(os.Remove(markerFile))
+			} else {
+				// Revocation failed (fail-closed): retain root's registry marker
+				// AND, via retained, its password/key markers so all three stay
+				// together for a retry (#5841).
+				retained[name] = struct{}{}
 			}
 			continue
 		}
@@ -677,12 +746,50 @@ func zeroizeLoginAccounts() error {
 		}
 		if removeMarker {
 			fail(os.Remove(markerFile))
+		} else {
+			// Fail-closed retry: keep the registry marker AND (via retained) this
+			// account's password/key markers together for the next attempt (#5841).
+			retained[name] = struct{}{}
 		}
 	}
-	// Drop the now-empty marker directory (best-effort; ENOTEMPTY after a
-	// retained marker is fine and must not gate the factory reset).
-	_ = os.Remove(zeroizeProvisionedUsersDir)
-	return firstErr
+}
+
+// zeroizeSweepResourceMarkerRoot erases the resource-specific ownership markers
+// (#5841) in dir — provisioned-passwords or provisioned-keys — as part of a
+// factory reset, then drops the now-empty root. Without this the two resource
+// roots the #5841 split introduced SURVIVE a zeroize: each per-account UID
+// marker is #5869/#5871-class residue, and because reconcileAbsentLoginUsers
+// unions all three roots, a re-tenant's reused-UID account colliding with a
+// surviving marker would be deprovisioned (its password locked, its
+// authorized_keys deleted) despite xpf never provisioning it — the exact
+// overclaim #5841 exists to kill, resurrected on a "factory-reset" box.
+//
+// A marker whose name is in retained (its account-registry teardown was KEPT
+// for a fail-closed retry) is LEFT so the account's three markers stay together
+// for that retry; every other marker is removed. The root-dir removal is
+// best-effort (ENOTEMPTY after a retained marker is fine, mirroring the
+// registry root) and must not gate the factory reset. os.ErrNotExist is not an
+// error (an already-absent root is the goal); a real ReadDir error IS surfaced
+// via fail so a silently-incomplete sweep is not reported as a clean reset.
+func zeroizeSweepResourceMarkerRoot(dir string, retained map[string]struct{}, fail func(error)) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fail(err) // absent root → ErrNotExist, excluded by fail()
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if _, keep := retained[name]; keep {
+			continue // this account's registry teardown was retained (fail-closed)
+		}
+		fail(os.Remove(filepath.Join(dir, name)))
+	}
+	// Drop the now-(hopefully-)empty root; a retained marker leaves it non-empty,
+	// which is fine and must not gate the factory reset.
+	_ = os.Remove(dir)
 }
 
 // readProvisionedMarkerUID reads a provenance marker file and returns the UID

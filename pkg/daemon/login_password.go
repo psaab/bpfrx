@@ -36,15 +36,46 @@ const (
 	pwLock                  // lock the account via chpasswd -e (<user>:!)
 )
 
-// provisionedUsersDir holds one marker file per xpf-provisioned account.
-// The marker's CONTENT is the numeric UID of the account at the time xpf
-// last wrote its password (or created it). Keying provenance by UID (not
-// name alone) lets removing the encrypted-password directive lock the SAME
-// account (leave-then-rejoin: UID unchanged → lock fires) while leaving an
-// out-of-band userdel+recreate alone (new UID → marker mismatch → skip),
-// with no separate garbage-collection pass. /var/lib/xpf is persistent (it
-// holds the config DB + archive). #1944 §5.4.
+// provisionedUsersDir holds one marker file per xpf-provisioned account — the
+// account/enumeration REGISTRY: which OS accounts xpf manages at all. The
+// marker's CONTENT is the numeric UID of the account at the time xpf created
+// it or set its password. Keying provenance by UID (not name alone) lets
+// removing a directive act on the SAME account (leave-then-rejoin: UID
+// unchanged → fires) while leaving an out-of-band userdel+recreate alone (new
+// UID → marker mismatch → skip), with no separate garbage-collection pass.
+// /var/lib/xpf is persistent (it holds the config DB + archive). #1944 §5.4.
+//
+// #5841 — resource-specific ownership. A single account marker conflated
+// password ownership with SSH-key ownership, so setting only a user's password
+// could cause the emptied-key / deprovision reconcilers to clobber an
+// operator-installed authorized_keys xpf never wrote (overclaim), while a
+// best-effort marker write that failed AFTER a successful credential mutation
+// left a credential xpf could no longer lock/clean (underclaim). Ownership is
+// now tracked per RESOURCE in sibling directories, each holding a UID marker
+// with the SAME format as the account registry:
+//
+//   - provisionedPasswordsDir()  "xpf set this account's /etc/shadow password"
+//   - provisionedKeysDir()       "xpf wrote this account's authorized_keys"
+//
+// The resource markers are written BEFORE their credential mutation
+// (marker-first atomicity, fail-visible) and gate the corresponding REVOCATION;
+// the account registry is unchanged in format and location so the factory-reset
+// teardown (pkg/grpcapi zeroize) that enumerates it is untouched.
 var provisionedUsersDir = "/var/lib/xpf/provisioned-users"
+
+// provisionedPasswordsDir and provisionedKeysDir are the resource-specific
+// ownership marker roots, kept as SIBLINGS of provisionedUsersDir so overriding
+// provisionedUsersDir in a test relocates all three marker roots together
+// (there is exactly one seam to point at a throwaway tree). In production they
+// are /var/lib/xpf/provisioned-passwords and /var/lib/xpf/provisioned-keys.
+// #5841.
+func provisionedPasswordsDir() string {
+	return filepath.Join(filepath.Dir(provisionedUsersDir), "provisioned-passwords")
+}
+
+func provisionedKeysDir() string {
+	return filepath.Join(filepath.Dir(provisionedUsersDir), "provisioned-keys")
+}
 
 // shadowPath and passwdPath are the OS account databases the password
 // reconciler reads directly. They are package vars only so tests can
@@ -196,53 +227,152 @@ func lookupUIDErr(name string) (uid int, found bool, err error) {
 	return u, found, err
 }
 
-// markerPath returns the provenance marker file path for name. names are
-// validated OS usernames here (created via useradd), but Clean+Base the
-// name defensively so a marker can never escape the directory.
-func markerPath(name string) string {
-	return filepath.Join(provisionedUsersDir, filepath.Base(filepath.Clean(name)))
+// markerPathIn returns the provenance marker file path for name inside dir.
+// names are validated OS usernames here (created via useradd), but Clean+Base
+// the name defensively so a marker can never escape the directory.
+func markerPathIn(dir, name string) string {
+	return filepath.Join(dir, filepath.Base(filepath.Clean(name)))
 }
 
-// markProvisioned records that xpf manages this exact account's password by
-// writing the account's current UID into the per-user marker file. Called
-// on a successful useradd AND on a successful pwApply, so that once xpf has
-// written a password (even to a pre-existing or marker-wiped account),
-// removing the directive will lock it. Best-effort: a marker write failure
-// is logged by the caller, not fatal. #1944 §5.4.
-func markProvisioned(name string, uid int) error {
+// markerPath is markerPathIn for the account/enumeration registry. Kept as the
+// name existing callers (and the zeroize-parity doc) reference.
+func markerPath(name string) string {
+	return markerPathIn(provisionedUsersDir, name)
+}
+
+// writeProvenanceMarker is the atomic primitive behind every ownership marker:
+// it records name's current UID in dir durably. Callers write the marker
+// BEFORE mutating the corresponding credential (marker-first) so a marker-write
+// failure can never leave a mutated-but-unmarked credential — the #5841
+// underclaim. A failure is RETURNED (fail-visible), never swallowed.
+func writeProvenanceMarker(dir, name string, uid int) error {
 	// DurableState: the marker must survive a power cut so a post-reboot
-	// declarative lock can still identify the account xpf provisioned
-	// (#1944 §5.4). MkdirAllDurable persists the directory entry itself,
-	// not just the file's entry within it.
-	if err := fsatomic.MkdirAllDurable(provisionedUsersDir, 0o700); err != nil {
+	// declarative lock/revoke can still identify what xpf provisioned
+	// (#1944 §5.4). MkdirAllDurable persists the directory entry itself, not
+	// just the file's entry within it.
+	if err := fsatomic.MkdirAllDurable(dir, 0o700); err != nil {
 		return err
 	}
-	return fsatomic.WriteFileDurable(markerPath(name), []byte(strconv.Itoa(uid)), 0o600)
+	return fsatomic.WriteFileDurable(markerPathIn(dir, name), []byte(strconv.Itoa(uid)), 0o600)
 }
 
-// xpfProvisioned reports whether xpf manages name's password for the
+// hasProvenanceMarker reports whether dir records name as xpf-owned for the
 // account that currently has UID curUID. It returns true ONLY if the marker
 // exists AND its recorded UID equals curUID. A marker whose UID no longer
-// matches (account deleted/recreated out of band with a different UID) is
-// opportunistically removed — no separate GC pass — and reports false, so a
-// pwLock decision never touches an out-of-band account. #1944 §5.4.
-func xpfProvisioned(name string, curUID int) bool {
-	data, err := os.ReadFile(markerPath(name))
+// matches (account deleted/recreated out of band with a different UID) or is
+// corrupt is opportunistically removed — no separate GC pass — and reports
+// false, so a revoke decision never touches an out-of-band account. #1944 §5.4.
+func hasProvenanceMarker(dir, name string, curUID int) bool {
+	path := markerPathIn(dir, name)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
 	recorded, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
 		// Corrupt marker — treat as not-ours and clean it up.
-		_ = os.Remove(markerPath(name))
+		_ = os.Remove(path)
 		return false
 	}
 	if recorded != curUID {
 		// Stale marker for a different (recreated) account: clean inline.
-		_ = os.Remove(markerPath(name))
+		_ = os.Remove(path)
 		return false
 	}
 	return true
+}
+
+// removeProvenanceMarker drops name's marker in dir (ENOENT is not an error).
+func removeProvenanceMarker(dir, name string) error {
+	if err := os.Remove(markerPathIn(dir, name)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// forgetProvenance drops name's markers across ALL three ownership roots — the
+// account registry and both resource roots — once every xpf-owned resource for
+// the account has been revoked (deprovision) or the account is proven gone.
+// It joins any per-root removal error (ENOENT excluded by removeProvenanceMarker)
+// so a caller that must know whether the reconcile fully converged (the #5874
+// cancel closeout) can observe a marker that could not be cleaned. #5841.
+func forgetProvenance(name string) error {
+	return errors.Join(
+		removeProvenanceMarker(provisionedUsersDir, name),
+		removeProvenanceMarker(provisionedPasswordsDir(), name),
+		removeProvenanceMarker(provisionedKeysDir(), name),
+	)
+}
+
+// --- account/enumeration registry (which accounts xpf manages) -------------
+
+// markProvisioned records that xpf manages this account by writing the
+// account's current UID into the per-user registry marker. Called on a
+// successful useradd AND on a successful pwApply / root key apply, so the
+// account is enumerated by reconcileAbsentLoginUsers and the factory-reset
+// teardown. #1944 §5.4.
+func markProvisioned(name string, uid int) error {
+	return writeProvenanceMarker(provisionedUsersDir, name, uid)
+}
+
+// xpfProvisioned reports whether the account registry records name for UID
+// curUID (marker present AND UID matches; a mismatch/corrupt marker is cleaned
+// inline). #1944 §5.4.
+func xpfProvisioned(name string, curUID int) bool {
+	return hasProvenanceMarker(provisionedUsersDir, name, curUID)
+}
+
+// --- password-ownership marker (xpf set the /etc/shadow password) ----------
+
+// markPasswordProvisioned records that xpf set name's /etc/shadow password.
+// Written marker-first, before `chpasswd -e`. Gates the declarative D2
+// password lock. #5841.
+func markPasswordProvisioned(name string, uid int) error {
+	return writeProvenanceMarker(provisionedPasswordsDir(), name, uid)
+}
+
+// passwordProvisioned reports whether xpf set name's password for UID curUID.
+// #5841.
+func passwordProvisioned(name string, curUID int) bool {
+	return hasProvenanceMarker(provisionedPasswordsDir(), name, curUID)
+}
+
+// --- SSH-key-ownership marker (xpf wrote authorized_keys) ------------------
+
+// markKeyProvisioned records that xpf wrote name's authorized_keys. Written
+// marker-first, before the authorized_keys write. Gates the key-file removal
+// on directive/user removal so an operator-installed key file xpf never wrote
+// is left untouched. #5841.
+func markKeyProvisioned(name string, uid int) error {
+	return writeProvenanceMarker(provisionedKeysDir(), name, uid)
+}
+
+// keyProvisioned reports whether xpf wrote name's authorized_keys for UID
+// curUID. #5841.
+func keyProvisioned(name string, curUID int) bool {
+	return hasProvenanceMarker(provisionedKeysDir(), name, curUID)
+}
+
+// provisionedNames returns the UNION of account names that appear in any of the
+// three ownership roots — the set of accounts xpf provisioned some resource
+// for. reconcileAbsentLoginUsers deprovisions each name in this set that is no
+// longer in config, so a pre-existing account xpf only added an SSH key to
+// (key marker, no account registry entry) is still revoked when removed. #5841.
+func provisionedNames() map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, dir := range []string{provisionedUsersDir, provisionedPasswordsDir(), provisionedKeysDir()} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue // absent/unreadable root contributes no names
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			out[e.Name()] = struct{}{}
+		}
+	}
+	return out
 }
 
 // homeBaseDir is the parent directory of per-user home directories. It is a
@@ -290,19 +420,19 @@ func managedAuthorizedKeysPath(name string) string {
 // It is the removal half of the #1944 UID-keyed provenance lifecycle and the
 // mirror of reconcileSudoers: it MUST run unconditionally on every apply
 // (independent of applySystemLogin's early return) so the "all users removed"
-// case still revokes. It enumerates provisionedUsersDir — the set of accounts
-// xpf actually provisioned — and deprovisions each marker whose username no
-// longer appears in the config. An out-of-band account (no marker) is never
-// enumerated and never touched.
-// reconcileAbsentLoginUsers revokes credentials for xpf-provisioned accounts
-// no longer in config. It stays best-effort per account but ACCUMULATES each
-// deprovision failure into the returned error so the #5874 cancel closeout can
-// see that a removed user's credentials were NOT actually revoked (a
-// monotonic-revocation gap). The normal apply path ignores the return — the
-// next boot retries deprovision from the active config.
+// case still revokes. It enumerates the UNION of the three ownership roots
+// (provisionedNames) — every account xpf provisioned any resource for — and
+// deprovisions each name that no longer appears in the config. An out-of-band
+// account (no marker in any root) is never enumerated and never touched. #5841.
+//
+// It stays best-effort per account but ACCUMULATES each deprovision failure
+// into the returned error so the #5874 cancel closeout can see that a removed
+// user's credentials were NOT actually revoked (a monotonic-revocation gap).
+// The normal apply path ignores the return — the next boot retries deprovision
+// from the active config.
 func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
-	entries, err := os.ReadDir(provisionedUsersDir)
-	if err != nil {
+	names := provisionedNames()
+	if len(names) == 0 {
 		// No markers yet (fresh install) or unreadable — nothing xpf
 		// provisioned, so nothing to revoke.
 		return nil
@@ -319,11 +449,7 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
 		}
 	}
 
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
+	for name := range names {
 		if name == "root" {
 			continue // root is never provisioned/deprovisioned via config
 		}
@@ -335,21 +461,26 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
 	return retErr
 }
 
-// deprovisionLoginUser revokes one removed account's password and managed
-// authorized_keys, but ONLY when the UID-keyed provenance marker still matches
-// the account's current UID (never an out-of-band account), then drops the
-// marker so xpf forgets the account. It is fail-closed toward retry: any step
-// that cannot be completed safely leaves the marker in place so the next apply
-// retries, and it never removes a credential it did not first verify as
-// xpf-owned. #5128.
+// deprovisionLoginUser revokes one removed account's xpf-owned credentials,
+// each gated on its OWN resource marker so xpf only ever locks a password it
+// set and only ever removes an authorized_keys it wrote — never an
+// operator-managed credential it did not provision (#5841). Once every owned
+// resource is revoked it drops all provenance markers so xpf forgets the
+// account. It is fail-closed toward retry: any step that cannot be completed
+// safely leaves the markers in place so the next apply retries. #5128.
+//
+// It stays best-effort but ACCUMULATES each failure into the returned error so
+// the #5874 cancel closeout can observe that a removed account's credentials
+// were NOT actually revoked; a naked return yields the accumulated retErr, not
+// a block-local err. The normal apply path ignores the return.
 func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 	fail := func(e error) { retErr = errors.Join(retErr, e) }
 	curUID, found, err := lookupUIDErr(name)
 	if err != nil {
 		// /etc/passwd could not be READ (transient mount/permission/I/O
 		// error) — the identity database is UNKNOWN, NOT proof the account is
-		// gone. Fail CLOSED: keep the provenance marker and revocation intent,
-		// retry next apply. Dropping the marker here — as the old lookupUID
+		// gone. Fail CLOSED: keep the provenance markers and revocation intent,
+		// retry next apply. Dropping a marker here — as the old lookupUID
 		// bool contract silently did on any read error — would PERMANENTLY
 		// abandon revocation: once passwd is readable again the account is no
 		// longer enumerated (marker gone), so the removed user's password and
@@ -359,67 +490,79 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 		slog.Warn("skipping removed-user deprovision: cannot read passwd",
 			"user", name, "err", err)
 		// Fail-visible: an unread identity DB means the removed account's
-		// credential may still be live and was NOT revoked. naked return
+		// credential may still be live and was NOT revoked. The naked return
 		// yields the accumulated retErr, not the block-local err above.
 		fail(fmt.Errorf("read passwd for removed user %s: %w", name, err))
-		return // keep marker; retry next apply
+		return // keep markers; retry next apply
 	}
 	if !found {
 		// passwd READ OK and name genuinely ABSENT — a real out-of-band
-		// userdel. There is nothing to revoke; drop the stale marker so we
-		// stop revisiting it every apply.
-		_ = os.Remove(markerPath(name))
-		return nil
-	}
-	if !xpfProvisioned(name, curUID) {
-		// Marker missing or its UID no longer matches (the account was
-		// deleted+recreated out of band with a different UID). xpfProvisioned
-		// already cleaned a stale marker inline. NEVER touch a non-xpf account.
+		// userdel. There is nothing to revoke; drop the stale markers so we
+		// stop revisiting the account every apply. Genuine absence is a clean
+		// success, so the best-effort marker cleanup error is not accumulated.
+		_ = forgetProvenance(name)
 		return nil
 	}
 
-	// Lock the password (idempotent). Fail-CLOSED on a shadow read error: we
-	// must not forget the account (drop the marker) while a live credential may
-	// still be active — retry next apply instead. Mirrors the #1944 pwLock
-	// discipline (never lock on a read error, but here that also means never
-	// prematurely stop managing the account).
-	cur, ok := currentShadowHash(name)
-	if !ok {
-		slog.Warn("skipping removed-user deprovision: cannot read shadow",
-			"user", name)
-		fail(fmt.Errorf("read shadow for removed user %s", name))
-		return // keep marker; retry next apply
+	// Resolve per-resource ownership for the account CURRENTLY at curUID. Each
+	// check cleans a UID-mismatched/corrupt marker inline (out-of-band
+	// recreate), so a false here also means "not ours".
+	ownsPassword := passwordProvisioned(name, curUID)
+	ownsKey := keyProvisioned(name, curUID)
+	ownsAccount := xpfProvisioned(name, curUID)
+	if !ownsPassword && !ownsKey && !ownsAccount {
+		// Nothing xpf-owned for the current account (markers absent, or a UID
+		// mismatch already cleaned inline). NEVER touch a non-xpf / out-of-band
+		// account.
+		return nil
 	}
-	if !isLockedShadow(cur) {
-		stdin := strings.NewReader(name + ":!\n")
-		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
-			slog.Warn("failed to lock password for removed login user",
-				"user", name, "err", err, "output", strings.TrimSpace(string(out)))
-			fail(fmt.Errorf("lock password for removed user %s: %w", name, err))
-			return // keep marker; retry
+
+	// Lock the password ONLY if xpf set it (password marker). Fail-CLOSED on a
+	// shadow read error: never forget the account (drop markers) while a live
+	// credential may still be active — retry next apply. Mirrors the #1944
+	// pwLock discipline (never lock on a read error).
+	if ownsPassword {
+		cur, ok := currentShadowHash(name)
+		if !ok {
+			slog.Warn("skipping removed-user deprovision: cannot read shadow",
+				"user", name)
+			fail(fmt.Errorf("read shadow for removed user %s", name))
+			return // keep markers; retry next apply
 		}
-		slog.Info("locked password for removed login user", "user", name)
+		if !isLockedShadow(cur) {
+			stdin := strings.NewReader(name + ":!\n")
+			if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
+				slog.Warn("failed to lock password for removed login user",
+					"user", name, "err", err, "output", strings.TrimSpace(string(out)))
+				fail(fmt.Errorf("lock password for removed user %s: %w", name, err))
+				return // keep markers; retry
+			}
+			slog.Info("locked password for removed login user", "user", name)
+		}
 	}
 
-	// Remove the xpf-managed authorized_keys so key-based login is revoked too
-	// (the whole file is xpf-owned — applySystemLogin writes it wholesale).
-	keysFile := managedAuthorizedKeysPath(name)
-	if err := os.Remove(keysFile); err != nil && !os.IsNotExist(err) {
-		slog.Warn("failed to remove authorized_keys for removed login user",
-			"user", name, "file", keysFile, "err", err)
-		fail(fmt.Errorf("remove authorized_keys for removed user %s: %w", name, err))
-		return // keep marker; retry
+	// Remove the xpf-managed authorized_keys ONLY if xpf wrote it (key marker).
+	// The whole file is xpf-owned when the marker matches (applySystemLogin
+	// writes it wholesale). An operator's own key file (no key marker) is never
+	// touched — the #5841 overclaim this closes.
+	if ownsKey {
+		keysFile := managedAuthorizedKeysPath(name)
+		if err := os.Remove(keysFile); err != nil && !os.IsNotExist(err) {
+			slog.Warn("failed to remove authorized_keys for removed login user",
+				"user", name, "file", keysFile, "err", err)
+			fail(fmt.Errorf("remove authorized_keys for removed user %s: %w", name, err))
+			return // keep markers; retry
+		}
 	}
 
-	// Fully revoked — drop the provenance marker so xpf no longer manages this
+	// Fully revoked — drop every provenance marker so xpf no longer manages this
 	// account. If the same user is later re-added to config, applySystemLogin
-	// recreates it and re-records the marker.
-	if err := os.Remove(markerPath(name)); err != nil && !os.IsNotExist(err) {
-		slog.Warn("failed to remove provenance marker after deprovision",
-			"user", name, "err", err)
-		fail(fmt.Errorf("remove provenance marker for %s: %w", name, err))
-	}
-	slog.Info("deprovisioned removed login user (password locked, keys removed)",
-		"user", name)
+	// recreates it and re-records the markers. A marker-cleanup failure is
+	// accumulated (fail-visible for the #5874 closeout) even though the
+	// credential is already revoked — the surviving marker only means the next
+	// apply re-enumerates and idempotently re-runs deprovision.
+	fail(forgetProvenance(name))
+	slog.Info("deprovisioned removed login user",
+		"user", name, "password_locked", ownsPassword, "keys_removed", ownsKey)
 	return retErr
 }

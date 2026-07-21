@@ -64,8 +64,12 @@ func TestApplySystemLoginRevokesEmptiedKeys(t *testing.T) {
 	keysFile := stageEmptiedKeysEnv(t, "alice", 1001)
 
 	// alice was provisioned by xpf (marker UID matches) and a prior apply wrote
-	// her managed authorized_keys.
+	// her managed authorized_keys — so the KEY-ownership marker is present
+	// (#5841: the emptied-key removal is gated on the key marker).
 	if err := markProvisioned("alice", 1001); err != nil {
+		t.Fatal(err)
+	}
+	if err := markKeyProvisioned("alice", 1001); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Dir(keysFile), 0o700); err != nil {
