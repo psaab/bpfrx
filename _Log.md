@@ -54149,5 +54149,28 @@ top.
   - `docs/session-sync-architecture.md` (#6132 recovery paragraph + trigger-list)
 
 - **Timestamp**: 2026-07-21
+- **Action**: #5648 (M43b) — SetForwardingArmed fail-closed on required-generation
+  protocol mismatch. On master `SetForwardingArmed(true)` only rejected when
+  `!ForwardingSupported`; it did NOT re-check the required config-snapshot
+  protocol gate that the compile/publish paths use to disarm a too-old helper.
+  So after a required-generation protocol disarm (policy schedulers / persistent
+  source NAT vs an old accepted image), an explicit operator/gRPC arm re-armed
+  the STALE accepted image and forwarded on a config the helper cannot represent
+  (fail-OPEN). Fix: SetForwardingArmed now re-runs
+  `ensureRequiredSnapshotProtocolLocked(m.lastSnapshot.Config)` before arming and
+  refuses (returns the required-protocol sentinel) on a mismatch. Scoped — no-op
+  unless the config requires the protocol, re-polls the helper first, only gates
+  `armed==true` (disarm never blocked). Rust helper unchanged: the required
+  generation is a control-plane concept the helper cannot independently derive.
+  Fail-on-revert test + scoped control test; RED-on-revert verified as a clean
+  assertion failure (neutralize `if armed &&` → `if false &&`, target-count 1).
+  Unit-provable, no cluster smoke.
+- **File(s)**:
+  - `pkg/dataplane/userspace/manager_status.go` (SetForwardingArmed guard)
+  - `pkg/dataplane/userspace/set_forwarding_armed_generation_5648_test.go`
+    (new tests `TestSetForwardingArmedRefusesStaleProtocolMismatch`,
+    `TestSetForwardingArmedArmsWhenProtocolMatches`)
+  - `docs/userspace-dataplane-gaps.md` (policy-scheduler row + fail-closed
+    section: explicit-arm-path enforcement of the required-protocol gate)
   **Action**: Fold #6162 review MINOR — update afxdp/README.md neighbor-limiter section from "256-slot direct-mapped" + open #6129 caveat to the 64-bucket x 4-way set-associative description with the bounded-residual note (stale-doc module-contract fix)
   **File(s)**: userspace-dp/src/afxdp/README.md
