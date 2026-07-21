@@ -54594,3 +54594,33 @@ top.
 - **File(s)**: pkg/config/compiler_interfaces.go,
   pkg/config/compiler_prewalk.go, pkg/config/vrrp_authentication_4288_test.go,
   pkg/config/testdata/golden_4406.json, docs/feature-coverage.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5305 — cluster-synced session install made transactional (BPF
+  pre-image rollback on helper mirror failure). `SetClusterSyncedSessionV4/V6`
+  wrote the pinned BPF session mirror FIRST, then mirrored to the Rust helper;
+  on helper failure they recorded the mirror failure and returned but LEFT the
+  BPF entry installed — a split truth the GC / fallback bulk export could
+  propagate as if the install succeeded, producing nondeterministic HA session
+  ownership after takeover. The store's snapshot/rollback machinery
+  (session_store.go) never fired for this path because the installer's
+  `return err` runs before the store appends the forward pre-image to `written`.
+  Fix: for forward entries, snapshot the BPF pre-image (value-or-absence) BEFORE
+  the write and, on mirror failure, RESTORE it (rewrite prior value / delete if
+  absent), joining any compensation error with the mirror error. Snapshot +
+  write + mirror + compensate now run under one `m.mu` hold (was: BPF write
+  outside the lock) so the sequence is atomic w.r.t. other m.mu paths; per-peer
+  apply loop is single-threaded so no same-key race. Reverse entries (never
+  mirrored) just write BPF and return. Health behavior preserved:
+  recordSessionMirrorFailureLocked (#5247 takeover-disarm) and
+  recordSessionMirrorSuccessLocked (sticky-clear on real success) unchanged.
+  New snapshotBPFSessionV4/V6Locked + restoreBPFSessionV4/V6Locked helpers.
+  Tests: synced_session_bpf_rollback_5305_test.go —
+  TestSetClusterSyncedSessionV4/V6RollsBackOrphanOnMirrorFailure (absent→deleted,
+  prior→restored) + TestSetClusterSyncedSessionRollbackSuccessPathUnregressed.
+  Parent-RED: no-op the restore helpers → 2 tests (4 subtests) fail on assertion.
+  Validated: build + vet clean; focused userspace session/mirror suite green;
+  the 6 pre-existing userspace XDP-shim-load failures reproduce on origin/master.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/synced_session_bpf_rollback_5305_test.go,
+  docs/session-sync-architecture.md, _Log.md
