@@ -103,6 +103,83 @@ fn owner_profile_telemetry_is_cacheline_isolated_from_binding_live_state() {
 }
 
 #[test]
+fn tx_status_drop_error_outranks_retry_hint_until_rebind_6145() {
+    // #6145: pin the `last_error` snapshot precedence introduced by
+    // #4971's lock-free TX-retry status. The snapshot renders the
+    // `last_error` mutex string when non-empty, and ONLY falls back to
+    // the `last_tx_retry_status` atomic when that string is empty.
+    //
+    // The property under test: an exceptional `TxError::Drop` error
+    // (written to `last_error` via `set_error`) OUTRANKS the live
+    // expected-retry hint and keeps masking it until the binding
+    // rebinds (`clear_error`). This is deliberate — a Drop flags a real
+    // capacity / slice-bounds fault and is rarer + more severe than
+    // routine backpressure, so it must not be masked by a flood of
+    // retry hints.
+    //
+    // FAIL-ON-REVERT (assertion, NOT a build break — every symbol used
+    // here exists regardless of the precedence branch): inverting the
+    // precedence so the retry atomic wins over a non-empty `last_error`
+    // makes the Phase-3 assertion RED (it would surface the retry
+    // reason instead of the latched Drop message). Removing the
+    // empty-`last_error` fallback entirely makes Phase 2 / Phase 5 RED.
+    use crate::afxdp::tx::{TxDropReason, TxRetryReason};
+
+    let live = BindingLiveState::new();
+
+    // Phase 1 — clean slate: no error, no retry hint → empty.
+    assert!(
+        live.snapshot().last_error.is_empty(),
+        "phase 1: a fresh binding has no last_error and no retry hint"
+    );
+
+    // Phase 2 — an expected retry with an EMPTY last_error renders the
+    // retry reason (the #4971 fallback works).
+    live.set_tx_retry_status(TxRetryReason::NoFreeTxFrame);
+    assert_eq!(
+        live.snapshot().last_error,
+        TxRetryReason::NoFreeTxFrame.as_str(),
+        "phase 2: with last_error empty, the retry hint is the fallback"
+    );
+
+    // Phase 3 — an exceptional Drop latches last_error. Even with the
+    // retry hint still set, the Drop message OUTRANKS the retry reason.
+    let drop_msg =
+        TxDropReason::PreparedSliceOutOfRange { offset: 4096, len: 128 }.message();
+    live.set_error(drop_msg.clone());
+    // Sustained retries keep firing AFTER the Drop latched — they only
+    // touch the lock-free atomic, never clearing last_error.
+    live.set_tx_retry_status(TxRetryReason::TxRingInsertFailed);
+    let snap = live.snapshot();
+    assert_eq!(
+        snap.last_error, drop_msg,
+        "phase 3: a latched Drop error must outrank the live retry hint"
+    );
+    assert_ne!(
+        snap.last_error,
+        TxRetryReason::TxRingInsertFailed.as_str(),
+        "phase 3: the current retry reason must NOT surface while a Drop is latched"
+    );
+
+    // Phase 4 — rebind: clear_error wipes BOTH the mutex string and the
+    // retry atomic (#4971). Snapshot returns to empty.
+    live.clear_error();
+    assert!(
+        live.snapshot().last_error.is_empty(),
+        "phase 4: clear_error (rebind) resets both last_error and the retry hint"
+    );
+
+    // Phase 5 — post-rebind: a fresh retry recorded after the clear now
+    // renders again (last_error empty → fallback live).
+    live.set_tx_retry_status(TxRetryReason::NoPreparedTxFrame);
+    assert_eq!(
+        live.snapshot().last_error,
+        TxRetryReason::NoPreparedTxFrame.as_str(),
+        "phase 5: after rebind, a fresh retry reason surfaces normally"
+    );
+}
+
+#[test]
 fn binding_live_snapshot_propagates_710_drop_counters() {
     // #710: `refresh_bindings` in the coordinator copies
     // `snap.redirect_inbox_overflow_drops`, `pending_tx_local_overflow_drops`,
