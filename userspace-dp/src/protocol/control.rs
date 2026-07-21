@@ -291,6 +291,19 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "dnat_publish_errors_total", default)]
     pub dnat_publish_errors_total: u64,
+    /// #5674: peer-synced session imports rejected by the coordinator's
+    /// aggregate admission bound (`upsert_synced_session`). Locally-created
+    /// sessions are capped per worker at `max_sessions`; peer-synced imports
+    /// were previously uncapped and fanned out to every worker, so a peer under
+    /// session-table pressure (or a compromised peer) could drive this node
+    /// past its own aggregate session ceiling and multiply that state across
+    /// all workers. A rising value means a peer exceeded this appliance's own
+    /// ceiling (`worker_count * max_sessions`); it never trips on a legitimate
+    /// symmetric-pair failover. Surfaced as the Prometheus counter
+    /// `xpf_userspace_synced_import_cap_drops_total`. Additive / defaulted for
+    /// backward compatibility.
+    #[serde(rename = "synced_import_cap_drops_total", default)]
+    pub synced_import_cap_drops_total: u64,
     /// #1760 W3': shared-map NAT reverse-key displacement events — a
     /// `publish_shared_session` insert into `shared_nat_sessions`
     /// displaced a DIFFERENT forward session's entry at the same reverse

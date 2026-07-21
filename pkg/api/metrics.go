@@ -374,6 +374,13 @@ type xpfCollector struct {
 	// breaks embedded-ICMP NAT reversal (PMTUD / traceroute).
 	userspaceDnatPublishErrors *prometheus.Desc
 
+	// #5674: peer-synced session imports rejected by the coordinator's
+	// aggregate admission bound — the availability/DoS ceiling that keeps a
+	// peer under session-table pressure (or a compromised peer) from driving
+	// this node past its own aggregate session ceiling and multiplying that
+	// state across every worker.
+	userspaceSyncedImportCapDrops *prometheus.Desc
+
 	// #1760 W3': shared-map NAT reverse-key displacement events (the
 	// authoritative collision watch; covers seed installs the per-worker
 	// counter cannot see).
@@ -780,6 +787,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceNatReverseKeyCollisions
 	ch <- c.userspaceSessionPublishErrors
 	ch <- c.userspaceDnatPublishErrors
+	ch <- c.userspaceSyncedImportCapDrops
 	ch <- c.userspaceNatReverseKeySharedDisplacements
 	ch <- c.userspaceWorkerCommandQueuePoisonRecoveries
 	ch <- c.userspaceGreDecapEcnIllegalDrops
