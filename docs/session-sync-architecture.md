@@ -83,6 +83,17 @@ sticky mirror-failed flag but do NOT restore the BPF pre-image. Reverse entries
 are never mirrored to the helper (it synthesizes the reverse companion locally),
 so they take no compensation — they only write the BPF mirror.
 
+The pre-image snapshot's *absent* classification (`snapshotBPFSessionV4Locked` /
+`snapshotBPFSessionV6Locked` → `bpfSessionReadAbsent`) accepts the SAME
+key-not-found error set as the Layer-1 `dataplane.sessionNotFound` predicate —
+`ebpf.ErrKeyNotExist` OR `unix.ENOENT`, via the shared `dataplane.IsKeyNotFound`
+helper (#6194) — so both transaction layers agree on what "key absent" means.
+Any OTHER read error is surfaced and the install is refused (the fail-safe
+direction): the snapshot never guesses a pre-image it could not read. With the
+production cilium `bpfShim` the two sentinels never diverge (a missing lookup
+yields `ErrKeyNotExist`, not bare `ENOENT`), so this is a consistency fix rather
+than a live-bug fix.
+
 Locally-created forward sessions take a parallel path: `SetSessionV4()` /
 `SetSessionV6()` install into the kernel/BPF maps, then mirror the forward
 entry **and a pre-installed reverse companion** (#310 — so the helper holds the

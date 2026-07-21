@@ -1141,6 +1141,24 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 	return nil
 }
 
+// bpfSessionReadAbsent reports whether a bpfShim session GET error means the
+// key is ABSENT rather than a hard read failure. The transactional snapshot
+// (#5305) treats an absent pre-image as existed=false with a nil error so a
+// later mirror-failure rollback DELETES the freshly-installed key; any OTHER
+// read error is surfaced so the install is refused rather than leaving an
+// entry that could not be rolled back (the fail-safe direction).
+//
+// It accepts the SAME key-absent error set as the Layer-1
+// dataplane.sessionNotFound predicate — ebpf.ErrKeyNotExist OR unix.ENOENT,
+// via the shared dataplane.IsKeyNotFound helper — so the two transaction
+// layers agree on what "key absent" means (#6194). With the production cilium
+// bpfShim the two sentinels never diverge (a missing lookup yields
+// ErrKeyNotExist, not bare ENOENT), so this is a consistency fix, not a live
+// bug; sharing one predicate removes the latent skew.
+func bpfSessionReadAbsent(err error) bool {
+	return dataplane.IsKeyNotFound(err)
+}
+
 // snapshotBPFSessionV4Locked reads the current BPF-mirror value for key so a
 // failed cluster-synced install can be rolled back to it (#5305). Returns
 // (value, existed, err); a missing key is existed=false with a nil error.
@@ -1149,7 +1167,7 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 func (m *Manager) snapshotBPFSessionV4Locked(key dataplane.SessionKey) (dataplane.SessionValue, bool, error) {
 	val, err := m.bpfShim.GetSessionV4(key)
 	if err != nil {
-		if errors.Is(err, ebpf.ErrKeyNotExist) {
+		if bpfSessionReadAbsent(err) {
 			return dataplane.SessionValue{}, false, nil
 		}
 		return dataplane.SessionValue{}, false, err
@@ -1264,7 +1282,7 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 func (m *Manager) snapshotBPFSessionV6Locked(key dataplane.SessionKeyV6) (dataplane.SessionValueV6, bool, error) {
 	val, err := m.bpfShim.GetSessionV6(key)
 	if err != nil {
-		if errors.Is(err, ebpf.ErrKeyNotExist) {
+		if bpfSessionReadAbsent(err) {
 			return dataplane.SessionValueV6{}, false, nil
 		}
 		return dataplane.SessionValueV6{}, false, err
