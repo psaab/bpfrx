@@ -54372,6 +54372,34 @@ top.
   `pkg/cluster/sync_failover_config_gen_test.go` (new),
   `docs/sync-protocol.md`, `docs/ha-failover-status.md`
 
+## 2026-07-21 — #5640: fence remote-failover applied-ack on local demotion actuation
+
+- **Timestamp**: 2026-07-21 (fix/5640-failover-ack-after-fence)
+- **Action**: SECURITY (HA two-owner window). `handleRemoteFailover` replied
+  `failoverAckApplied` the instant `OnRemoteFailover` (→ `cluster.ManualFailover`)
+  returned. `ManualFailover` sets `StateSecondaryHold` and only ENQUEUES an async
+  demotion event (`sendEvent`); the fence (`ResignRG` priority-0 advert + VIP
+  removal + `rg_active` clear) is actuated later by the daemon's
+  `watchClusterEvents` consumer. The premature ack let the sender run
+  `commitRequestedPeerFailover` and become primary (adds VIPs, GARP) while the
+  old owner still advertised MASTER — two external RG owners (duplicate GARP /
+  VIP ownership / traffic). Fix gates the applied-ack on a fence-completion
+  barrier: daemon `OnRemoteFailover`/`OnRemoteFailoverBatch` `armFailoverActuation`
+  BEFORE `ManualFailover` enqueues (so the signal can't be missed);
+  `handleRemoteFailover` calls the new `WaitFailoverApplied` hook
+  (`waitFailoverActuated`) before acking; `watchClusterEvents` calls
+  `signalFailoverActuated` at the end of the demotion branch (after resign /
+  rg_active clear). Bounded by `failoverActuateTimeout` (3s) → downgrade to
+  `failoverAckFailed` so the peer HOLDS rather than joins split-brain. Batch path
+  covered symmetrically. Normal-path latency unchanged (barrier releases on
+  local resign). Fail-on-revert tests bind the two ack-gate lines.
+- **File(s)**: `pkg/cluster/sync.go` (WaitFailoverApplied/Batch hooks),
+  `pkg/cluster/sync_failover.go` (ack gate in handleRemoteFailover[Batch]),
+  `pkg/daemon/daemon.go` (barrier fields + init),
+  `pkg/daemon/daemon_ha.go` (arm/disarm/signal/wait helpers + signal in
+  watchClusterEvents), `pkg/daemon/daemon_ha_sync.go` (arm in closures + hook
+  wiring), `pkg/cluster/sync_test.go` (new fence-ack tests),
+  `docs/session-sync-architecture.md`
 ## 2026-07-21 — #5879 canonical per-physical-interface QinQ gate
 - **Timestamp**: 2026-07-21
 - **Action**: Add #5879 canonical QinQ honesty gate. The #2354 gate validated a

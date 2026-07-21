@@ -854,7 +854,13 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					return fmt.Errorf("%w: redundancy group %d", cluster.ErrRemoteFailoverRejected, rgID)
 				}
 				slog.Info("cluster: remote failover request from peer", "rg", rgID)
+				// #5640: arm the fence-completion barrier BEFORE ManualFailover
+				// enqueues the async demotion event, so watchClusterEvents
+				// cannot actuate-and-forget before WaitFailoverApplied observes
+				// it. The applied-ack (sync layer) then waits on this barrier.
+				d.armFailoverActuation(rgID)
 				if err := d.cluster.ManualFailover(rgID); err != nil {
+					d.disarmFailoverActuation(rgID)
 					slog.Warn("cluster: remote failover failed", "rg", rgID, "err", err)
 					return err
 				}
@@ -867,7 +873,15 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					}
 				}
 				slog.Info("cluster: remote batch failover request from peer", "rgs", rgIDs)
+				// #5640: arm every member's fence barrier before the batch
+				// demotion enqueues its per-RG events.
+				for _, rgID := range rgIDs {
+					d.armFailoverActuation(rgID)
+				}
 				if err := d.cluster.ManualFailoverBatch(rgIDs); err != nil {
+					for _, rgID := range rgIDs {
+						d.disarmFailoverActuation(rgID)
+					}
 					slog.Warn("cluster: remote batch failover failed", "rgs", rgIDs, "err", err)
 					return err
 				}
@@ -879,6 +893,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.sessionSync.OnRemoteFailoverCommitBatch = func(rgIDs []int) error {
 				return d.cluster.FinalizePeerTransferOutBatch(rgIDs)
 			}
+			// #5640: gate the transfer-out applied-ack on the local demotion
+			// actually being actuated (VRRP resigned / rg_active cleared),
+			// closing the two-owner window where the peer promoted off an ack
+			// sent before this node had resigned.
+			d.sessionSync.WaitFailoverApplied = d.waitFailoverActuated
+			d.sessionSync.WaitFailoverAppliedBatch = d.waitFailoverActuatedBatch
 
 			// Wire peer failover sender so cluster Manager can send remote
 			// failover requests via the fabric sync connection.

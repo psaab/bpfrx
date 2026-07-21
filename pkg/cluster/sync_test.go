@@ -3412,6 +3412,180 @@ func TestHandleMessageFailoverDoesNotBlockReceiveLoop(t *testing.T) {
 	close(release)
 }
 
+// readFramesInto spawns a goroutine that reads whole sync frames from conn and
+// pushes them to out until the connection errors. Unlike readSyncMessage it
+// never t.Fatal's on a (deliberate) read stall, so a test can assert the
+// ABSENCE of a frame within a window.
+func readFramesInto(conn net.Conn, out chan<- syncFrame) {
+	go func() {
+		for {
+			var hdr [syncHeaderSize]byte
+			if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+				return
+			}
+			plen := binary.LittleEndian.Uint32(hdr[8:12])
+			pl := make([]byte, plen)
+			if _, err := io.ReadFull(conn, pl); err != nil {
+				return
+			}
+			out <- syncFrame{typ: hdr[4], payload: pl}
+		}
+	}()
+}
+
+type syncFrame struct {
+	typ     uint8
+	payload []byte
+}
+
+// TestHandleRemoteFailoverWithholdsAckUntilFenced pins the #5640 fix: the
+// receiver of a remote failover request (the OLD owner) must NOT reply
+// failoverAckApplied until its local demotion has been ACTUATED (VRRP resigned
+// / rg_active cleared). OnRemoteFailover only enqueues the async demotion
+// event; acking before the fence let the peer promote while this node still
+// owned the RG — a two-owner window (duplicate GARP / VIP ownership).
+//
+// Fail-on-revert: delete the `s.WaitFailoverApplied` gate in
+// handleRemoteFailover and the applied-ack is sent immediately after
+// OnRemoteFailover returns — the first select below then observes the ack
+// while the fence is still blocked and fails RED as a clean assertion.
+func TestHandleRemoteFailoverWithholdsAckUntilFenced(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.mu.Unlock()
+	ss.stats.Connected.Store(true)
+
+	// OnRemoteFailover models ManualFailover: it enqueues the async demotion
+	// and returns immediately (the node is NOT yet fenced here).
+	ss.OnRemoteFailover = func(rgID int) error { return nil }
+
+	// WaitFailoverApplied models the daemon barrier that blocks until
+	// watchClusterEvents actuates the demotion.
+	fenced := make(chan struct{})
+	waitEntered := make(chan struct{}, 1)
+	ss.WaitFailoverApplied = func(rgID int) error {
+		if rgID != 7 {
+			return fmt.Errorf("unexpected rg %d", rgID)
+		}
+		select {
+		case waitEntered <- struct{}{}:
+		default:
+		}
+		<-fenced
+		return nil
+	}
+
+	frames := make(chan syncFrame, 4)
+	readFramesInto(peer, frames)
+
+	go ss.handleRemoteFailover(local, 7, 42)
+
+	// The applied-ack must be WITHHELD while the fence has not actuated. On a
+	// reverted build the ack is sent immediately and this fails RED.
+	select {
+	case f := <-frames:
+		status := uint8(255)
+		if len(f.payload) >= 2 {
+			status = f.payload[1]
+		}
+		t.Fatalf("failover ack (type=%d status=%d) sent before fence actuated: two-owner window (#5640)", f.typ, status)
+	case <-time.After(200 * time.Millisecond):
+		// good — ack withheld pending fence
+	}
+
+	// Positive control: the handler is blocked in the fence barrier.
+	select {
+	case <-waitEntered:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not enter WaitFailoverApplied barrier")
+	}
+
+	// Actuate the fence; the applied-ack must now be delivered.
+	close(fenced)
+	select {
+	case f := <-frames:
+		if f.typ != syncMsgFailoverAck {
+			t.Fatalf("frame type = %d, want failover ack %d", f.typ, syncMsgFailoverAck)
+		}
+		if len(f.payload) < 2 || f.payload[0] != 7 {
+			t.Fatalf("ack payload = %v, want rg=7", f.payload)
+		}
+		if f.payload[1] != failoverAckApplied {
+			t.Fatalf("ack status = %d, want applied %d", f.payload[1], failoverAckApplied)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("applied-ack not delivered after fence actuated")
+	}
+}
+
+// TestHandleRemoteFailoverBatchWithholdsAckUntilFenced is the batch counterpart
+// of the #5640 fix, pinning the WaitFailoverAppliedBatch gate in
+// handleRemoteFailoverBatch.
+func TestHandleRemoteFailoverBatchWithholdsAckUntilFenced(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.mu.Unlock()
+	ss.stats.Connected.Store(true)
+
+	rgIDs := []int{1, 2}
+	ss.OnRemoteFailoverBatch = func([]int) error { return nil }
+
+	fenced := make(chan struct{})
+	waitEntered := make(chan struct{}, 1)
+	ss.WaitFailoverAppliedBatch = func([]int) error {
+		select {
+		case waitEntered <- struct{}{}:
+		default:
+		}
+		<-fenced
+		return nil
+	}
+
+	frames := make(chan syncFrame, 4)
+	readFramesInto(peer, frames)
+
+	go ss.handleRemoteFailoverBatch(local, rgIDs, 43)
+
+	select {
+	case f := <-frames:
+		t.Fatalf("batch failover ack (type=%d) sent before fence actuated: two-owner window (#5640)", f.typ)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	select {
+	case <-waitEntered:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not enter WaitFailoverAppliedBatch barrier")
+	}
+
+	close(fenced)
+	select {
+	case f := <-frames:
+		if f.typ != syncMsgFailoverBatchAck {
+			t.Fatalf("frame type = %d, want batch failover ack %d", f.typ, syncMsgFailoverBatchAck)
+		}
+		_, status, _, _, err := decodeFailoverBatchAckPayload(f.payload)
+		if err != nil {
+			t.Fatalf("decode batch ack: %v", err)
+		}
+		if status != failoverAckApplied {
+			t.Fatalf("batch ack status = %d, want applied %d", status, failoverAckApplied)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("batch applied-ack not delivered after fence actuated")
+	}
+}
+
 func TestSendFailoverWaitsForAck(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	local, peer := net.Pipe()

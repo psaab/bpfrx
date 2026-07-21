@@ -349,6 +349,22 @@ type SessionSync struct {
 	OnRemoteFailoverBatch func(rgIDs []int) error
 	// OnRemoteFailoverCommitBatch finalizes a previously acknowledged multi-RG handoff.
 	OnRemoteFailoverCommitBatch func(rgIDs []int) error
+	// WaitFailoverApplied, if set, blocks until the local node has ACTUATED
+	// the transfer-out just requested via OnRemoteFailover for one RG — i.e.
+	// the async demotion event has been consumed and the old owner fenced
+	// (VRRP resigned to priority-0 / VIPs removed / rg_active cleared). It
+	// gates the failoverAckApplied reply so the peer cannot promote while this
+	// node still externally owns the RG. OnRemoteFailover only ENQUEUES the
+	// demotion event and returns; acking before this barrier opened a
+	// two-owner window (duplicate GARP / VIP ownership / traffic) — #5640. A
+	// non-nil error (fence not actuated within the daemon's bounded timeout)
+	// downgrades the ack to failoverAckFailed so the peer holds instead of
+	// promoting into the two-owner window.
+	WaitFailoverApplied func(rgID int) error
+	// WaitFailoverAppliedBatch is the multi-RG counterpart of
+	// WaitFailoverApplied: it blocks until every RG in the batch has been
+	// fenced before the batch failoverAckApplied reply is sent (#5640).
+	WaitFailoverAppliedBatch func(rgIDs []int) error
 	// OnFenceReceived requests this node to disable all RGs.
 	OnFenceReceived func()
 	// OnPrepareActivation asks the peer to pre-warm neighbors for the given RG.
