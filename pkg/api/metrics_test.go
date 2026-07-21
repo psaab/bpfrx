@@ -834,6 +834,13 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		// #5674: synced-import aggregate admission-bound drops.
+		userspaceSyncedImportCapDrops: prometheus.NewDesc(
+			"xpf_userspace_synced_import_cap_drops_total",
+			"synced import cap drops",
+			nil,
+			nil,
+		),
 		// #1861 install-refusal trio.
 		userspaceSessionCreateDrops: prometheus.NewDesc(
 			"xpf_userspace_session_create_drops_total",
@@ -958,6 +965,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		// #2244: dnat_table reverse-NAT publish-error counter emitted
 		// unconditionally.
 		DnatPublishErrorsTotal: 7,
+		// #5674: synced-import aggregate admission-bound drop counter emitted
+		// unconditionally.
+		SyncedImportCapDropsTotal: 11,
 		// #1760 W3': shared-map displacement counter emitted unconditionally.
 		NatReverseKeySharedDisplacementsTotal: 4,
 		// #1807: poison-recovery counter emitted unconditionally.
@@ -1045,9 +1055,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// per-reason generated-error rate-limit trio (time_exceeded /
 	// packet_too_big / reject) = 21 + the #3657 source-split reject trio
 	// (sent / reply-budget / output-filter) × 2 sources = 27 + the #3661
-	// source-split reject rate-limit drop leg × 2 sources = 29.
-	if len(got) != 29 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 29 metrics, got %d", len(got))
+	// source-split reject rate-limit drop leg × 2 sources = 29 + the #5674
+	// synced_import_cap_drops_total counter (= 30).
+	if len(got) != 30 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 30 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1060,6 +1071,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// #2244: dnat_table reverse-NAT publish-error counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceDnatPublishErrors, nil, 7)
+	// #5674: synced-import aggregate admission-bound drop counter emitted
+	// unconditionally (a 0 is a real "no over-ceiling imports rejected" signal).
+	assertCounterClose(t, got, c.userspaceSyncedImportCapDrops, nil, 11)
 	// #1760 W3': shared-map displacement counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceNatReverseKeySharedDisplacements, nil, 4)
 	// #1807: poison-recovery counter emitted unconditionally.

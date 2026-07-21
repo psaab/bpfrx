@@ -1600,6 +1600,18 @@ type ProcessStatus struct {
 	// xpf_userspace_dnat_publish_errors_total. Omitempty for wire compat
 	// with older helpers.
 	DnatPublishErrorsTotal uint64 `json:"dnat_publish_errors_total,omitempty"`
+	// SyncedImportCapDropsTotal counts peer-synced session imports rejected by
+	// the coordinator's aggregate admission bound (#5674). Locally-created
+	// sessions are capped per worker at max_sessions; peer-synced imports were
+	// previously uncapped and fanned out to every worker command queue+table, so
+	// a peer under session-table pressure (or a compromised peer) could drive
+	// this node past its own aggregate session ceiling and multiply that state
+	// across all workers — an availability/DoS the local admission bound is meant
+	// to prevent. A rising value means a peer exceeded this appliance's own
+	// ceiling (worker_count * max_sessions); a legitimate symmetric-pair failover
+	// never trips it. Surfaced as xpf_userspace_synced_import_cap_drops_total.
+	// Omitempty for wire compat with older helpers.
+	SyncedImportCapDropsTotal uint64 `json:"synced_import_cap_drops_total,omitempty"`
 	// #1760 W3': shared-map NAT reverse-key displacement events — a
 	// publish_shared_session insert into shared_nat_sessions displaced a
 	// DIFFERENT forward session's entry at the same reverse key (two live

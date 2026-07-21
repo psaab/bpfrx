@@ -192,6 +192,19 @@ impl super::Coordinator {
         SESSION_DELETE_STALE_IGNORED.load(Ordering::Relaxed)
     }
 
+    /// #5674: total peer-synced session imports rejected by the coordinator's
+    /// aggregate admission bound (`upsert_synced_session`). Locally-created
+    /// sessions are capped per worker at `DEFAULT_MAX_SESSIONS`; peer-synced
+    /// imports were previously uncapped and fanned out to every worker, so a
+    /// peer under session-table pressure (or a compromised peer) could drive
+    /// this node past its own aggregate session ceiling. A rising value means a
+    /// peer exceeded this appliance's ceiling (`worker_count *
+    /// DEFAULT_MAX_SESSIONS`); a legitimate symmetric-pair failover never trips
+    /// it. Surfaced as `xpf_userspace_synced_import_cap_drops_total`.
+    pub fn synced_import_cap_drops_total(&self) -> u64 {
+        SYNCED_IMPORT_CAP_DROPS.load(Ordering::Relaxed)
+    }
+
     /// #1760 W3': shared-map NAT reverse-key displacement events — a
     /// `publish_shared_session` insert into `shared_nat_sessions`
     /// displaced a DIFFERENT forward session's entry at the same reverse

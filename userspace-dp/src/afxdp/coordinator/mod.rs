@@ -287,6 +287,14 @@ pub struct Coordinator {
     /// Always 0 in release builds; per-instance so parallel tests never race.
     #[cfg(test)]
     pub(crate) force_worker_bind_incomplete: u32,
+    /// #5674 test seam (per-instance, NOT a process-global): when nonzero,
+    /// `synced_import_cap()` returns this value INSTEAD of the real
+    /// `worker_count * DEFAULT_MAX_SESSIONS` aggregate ceiling. Lets a test
+    /// exercise the synced-import admission boundary without inserting
+    /// `DEFAULT_MAX_SESSIONS` (131072) entries. Always 0 in release builds
+    /// (the field does not exist); per-instance so parallel tests never race.
+    #[cfg(test)]
+    pub(crate) synced_import_cap_override: usize,
     pub(crate) last_reconcile_stage: String,
     pub(crate) poll_mode: crate::PollMode,
     pub(crate) event_stream: Option<crate::event_stream::EventStreamSender>,
@@ -349,6 +357,8 @@ impl Coordinator {
             force_worker_spawn_fail: 0,
             #[cfg(test)]
             force_worker_bind_incomplete: 0,
+            #[cfg(test)]
+            synced_import_cap_override: 0,
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,

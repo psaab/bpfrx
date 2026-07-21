@@ -225,6 +225,7 @@ pub(crate) fn run() -> Result<(), String> {
             pending_neigh_capacity_drops_total: 0,
             session_publish_errors_total: 0,
             dnat_publish_errors_total: 0,
+            synced_import_cap_drops_total: 0,
             nat_reverse_key_shared_displacements_total: 0,
             worker_command_queue_poison_recoveries: 0,
             gre_decap_ecn_illegal_drops_total: 0,

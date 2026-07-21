@@ -274,6 +274,26 @@ impl super::Coordinator {
         self.last_cache_flush_at.load(Ordering::Relaxed)
     }
 
+    /// #5674: this appliance's aggregate synced-session ceiling —
+    /// `worker_count * DEFAULT_MAX_SESSIONS` (each worker table caps
+    /// locally-created sessions at `DEFAULT_MAX_SESSIONS`). Bounds the shared
+    /// synced map so a peer cannot drive this node past its own aggregate
+    /// session ceiling via the uncapped sync-import fan-out. A symmetric HA
+    /// pair has an identical ceiling, so a legitimate full-peer failover import
+    /// always fits. Zero when no workers are registered (early boot / teardown)
+    /// — the caller treats a zero ceiling as "bound disabled" so a transient
+    /// window never rejects legitimate imports.
+    fn synced_import_cap(&self) -> usize {
+        #[cfg(test)]
+        if self.synced_import_cap_override != 0 {
+            return self.synced_import_cap_override;
+        }
+        self.workers
+            .handles
+            .len()
+            .saturating_mul(crate::session::default_max_sessions())
+    }
+
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = self.ha.rg_runtime.load();
@@ -295,6 +315,44 @@ impl super::Coordinator {
         {
             SESSION_INSTALL_STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
             return;
+        }
+        // #5674: aggregate synced-import admission bound. Locally-created
+        // sessions are capped per worker at `DEFAULT_MAX_SESSIONS`
+        // (`install_with_protocol_with_origin`), but peer-synced sessions were
+        // imported with NO cap and fanned out to EVERY worker command queue +
+        // table below, so a peer under session-table pressure — or a
+        // malicious/compromised peer — could drive this node past its own
+        // aggregate session ceiling and multiply that state across all workers
+        // (the availability/DoS root of #5674). Bound the SHARED synced map
+        // (the single fan-out choke point) at this appliance's OWN aggregate
+        // ceiling, `worker_count * DEFAULT_MAX_SESSIONS` (`synced_import_cap`).
+        // On a symmetric HA pair the peer's entire live session set is <= its
+        // identical ceiling, so a legitimate full-peer failover import never
+        // trips this bound — only a peer EXCEEDING the appliance ceiling is
+        // rejected. Drop-NEWEST: reject a NEW key at/above the ceiling (never
+        // enqueue it to any worker), but ALWAYS allow a REPLACE of an existing
+        // synced key (`previous_entry.is_some()` — it does not grow the map) so
+        // an in-flight synced session keeps refreshing. Never evict an existing
+        // synced session to make room; that would drop a legitimate failover
+        // session. The bound is approximate to within one session-pair:
+        // admitting a forward session also publishes its synthesized reverse
+        // companion, so the map can overshoot the ceiling by a single pair on
+        // the last admit — acceptable for a DoS ceiling, not a byte-exact
+        // quota. A zero ceiling (no workers registered yet — early boot /
+        // teardown) disables the bound so a transient window never rejects
+        // legitimate imports.
+        if previous_entry.is_none() {
+            let synced_cap = self.synced_import_cap();
+            let synced_len = self
+                .sessions
+                .synced
+                .lock()
+                .map(|sessions| sessions.len())
+                .unwrap_or(0);
+            if synced_cap != 0 && synced_len >= synced_cap {
+                SYNCED_IMPORT_CAP_DROPS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
         let reverse_entry = if !entry.metadata.is_reverse {
             synthesized_synced_reverse_entry(

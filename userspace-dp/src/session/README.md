@@ -635,6 +635,42 @@ installs — they cannot fail. The future cap arbitration for the sync
 family (row I11) now covers `UpsertLocal` automatically. Decision
 record: `docs/research/1870-local-tunnel-pair/plan.md`.
 
+### Sync-family aggregate ceiling at the coordinator (#5674)
+
+`upsert_synced_with_origin` stays uncapped (the infallibility contract
+above), but the sync family is no longer *unbounded*: the row-I11 cap
+arbitration is now enforced ONE level up, at the coordinator's
+peer-sync entry point (`Coordinator::upsert_synced_session`,
+`afxdp/ha.rs`). Before #5674 a peer-synced session was published to the
+shared `synced` map and fanned out to EVERY worker command queue+table
+with no cap, so a peer under session-table pressure — or a
+malicious/compromised peer — could drive this node past its own
+aggregate session ceiling and multiply that state across all workers
+(an availability/DoS the per-worker `install_with_protocol_with_origin`
+cap is meant to prevent). `upsert_synced_session` now bounds the shared
+`synced` map (the single fan-out choke point) at this appliance's OWN
+aggregate ceiling — `worker_count * DEFAULT_MAX_SESSIONS`
+(`synced_import_cap()`) — and **drop-newest**-rejects a NEW over-ceiling
+key: it bumps `SYNCED_IMPORT_CAP_DROPS`
+(`Coordinator::synced_import_cap_drops_total()`, Prometheus
+`xpf_userspace_synced_import_cap_drops_total`) and returns BEFORE the
+publish + fan-out, so a rejected import is never enqueued to any worker
+(the queue-multiplication is bounded too). A REPLACE of an existing
+synced key is always allowed (it does not grow the map) so an in-flight
+synced session keeps refreshing; an existing entry is never evicted to
+make room. Because a symmetric HA pair has an identical ceiling, a
+legitimate full-peer failover import always fits under the bound — only
+a peer EXCEEDING the appliance ceiling is rejected. Two documented
+residuals: (1) the bound is approximate to within one session-pair (a
+forward admit also publishes its synthesized reverse companion, so the
+map can overshoot by one pair on the last admit); (2) on an ASYMMETRIC
+pair (peer has MORE workers than this node — unusual; xpf pairs are
+symmetric) the peer's aggregate ceiling can exceed this node's, so a
+legitimate over-ceiling import would be dropped. The uncapped
+`upsert_synced_with_origin` and the local `UpsertLocal` / shared-hit
+materialization paths are unchanged — they are locally bounded and do
+not carry the peer-DoS vector.
+
 ### HA install-generation guard on SyncedSessionEntry (#2170)
 
 `SyncedSessionEntry` (`afxdp/worker/mod.rs`) carries a `generation: u64`

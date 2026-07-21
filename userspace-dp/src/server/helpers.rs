@@ -78,6 +78,12 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // cause-side signal for dnat_table capacity pressure that silently
     // breaks embedded-ICMP NAT reversal (PMTUD / traceroute).
     state.status.dnat_publish_errors_total = state.afxdp.dnat_publish_errors_total();
+    // #5674: peer-synced session imports rejected by the coordinator's
+    // aggregate admission bound — the availability/DoS ceiling that keeps a
+    // peer under session-table pressure (or a compromised peer) from driving
+    // this node past its own aggregate session ceiling and multiplying that
+    // state across every worker.
+    state.status.synced_import_cap_drops_total = state.afxdp.synced_import_cap_drops_total();
     // #1760 W3': shared-map NAT reverse-key displacement events — the
     // authoritative collision watch (covers MissingNeighborSeed installs
     // the per-worker counter cannot see).

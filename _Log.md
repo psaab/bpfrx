@@ -54209,3 +54209,37 @@ top.
   - `userspace-dp/src/state_writer_tests.rs` (RingWriter construction)
   - `docs/xdp-io-uring-userspace-dataplane.md` (#5800 registry contract)
   - `docs/pr/5800-iouring-inflight-registry/plan.md` (plan + deviations)
+
+## 2026-07-21 — #5674 HA synced-import aggregate admission bound (coordinator)
+
+- **Timestamp**: 2026-07-21
+- **Action**: Bound peer-synced session imports at the coordinator's
+  aggregate ceiling (`worker_count * DEFAULT_MAX_SESSIONS`) before the
+  shared-map publish + all-worker fan-out. Fixes the #5674 availability/DoS:
+  peer-synced sessions were imported with NO cap (unlike the per-worker
+  `install_with_protocol_with_origin` cap) and fanned out to every worker
+  queue+table, so a peer under session-table pressure (or a compromised
+  peer) could drive the node past its aggregate ceiling and multiply state
+  across all workers. Drop-newest on a NEW over-ceiling key (bump
+  `SYNCED_IMPORT_CAP_DROPS`, return before publish/fan-out); a REPLACE of an
+  existing synced key is always allowed (never evict). Symmetric-pair
+  failover always fits under the bound. New Prometheus counter
+  `xpf_userspace_synced_import_cap_drops_total`.
+- **File(s)**:
+  - `userspace-dp/src/afxdp/ha.rs` (gate in `upsert_synced_session` +
+    `synced_import_cap()` helper)
+  - `userspace-dp/src/afxdp/bpf_map/metrics.rs` (`SYNCED_IMPORT_CAP_DROPS`)
+  - `userspace-dp/src/afxdp/coordinator/mod.rs` (`#[cfg(test)]`
+    `synced_import_cap_override` seam + init)
+  - `userspace-dp/src/afxdp/coordinator/status.rs`
+    (`synced_import_cap_drops_total()` accessor)
+  - `userspace-dp/src/protocol/control.rs` (Status wire field)
+  - `userspace-dp/src/server/helpers.rs` (status assembly)
+  - `userspace-dp/src/server/lifecycle.rs` (Status default)
+  - `userspace-dp/src/afxdp/ha_tests.rs` (fail-on-revert test +
+    `synced_entry_port` helper)
+  - `userspace-dp/src/session/README.md` (#5674 sync-family ceiling note)
+  - `pkg/dataplane/userspace/protocol.go` (`SyncedImportCapDropsTotal`)
+  - `pkg/api/metrics.go`, `pkg/api/metrics_descriptors.go`,
+    `pkg/api/metrics_userspace.go`, `pkg/api/metrics_test.go` (Prometheus
+    descriptor + emit + test coverage)

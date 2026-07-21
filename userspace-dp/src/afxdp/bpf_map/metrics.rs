@@ -283,6 +283,24 @@ pub(in crate::afxdp) static DNAT_PUBLISH_ERRORS_SHARED: AtomicU64 = AtomicU64::n
 /// `session_delete_stale_ignored_total()`.
 pub(in crate::afxdp) static SESSION_INSTALL_STALE_IGNORED: AtomicU64 = AtomicU64::new(0);
 pub(in crate::afxdp) static SESSION_DELETE_STALE_IGNORED: AtomicU64 = AtomicU64::new(0);
+/// #5674: peer-synced session imports REJECTED by the coordinator's aggregate
+/// admission bound (`upsert_synced_session`). Locally-created sessions are
+/// capped per worker at `DEFAULT_MAX_SESSIONS`
+/// (`install_with_protocol_with_origin`), but peer-synced sessions were
+/// imported with NO cap and fanned out to EVERY worker command queue + table,
+/// so a peer under session-table pressure — or a malicious/compromised peer —
+/// could drive this node past its own aggregate session ceiling and multiply
+/// that state across all workers (the availability/DoS root of #5674).
+/// `upsert_synced_session` now bounds the shared synced map (the single
+/// fan-out choke point) at this appliance's OWN aggregate ceiling
+/// (`worker_count * DEFAULT_MAX_SESSIONS`) and drop-newest-rejects a NEW
+/// over-ceiling key here (a REPLACE of an existing key never trips the bound —
+/// it does not grow the map). Surfaced via
+/// `Coordinator::synced_import_cap_drops_total()` and the Prometheus counter
+/// `xpf_userspace_synced_import_cap_drops_total`. A nonzero value means a peer
+/// exceeded this appliance's session ceiling; a legitimate symmetric-pair
+/// failover (the peer's live set is <= its identical ceiling) never trips it.
+pub(in crate::afxdp) static SYNCED_IMPORT_CAP_DROPS: AtomicU64 = AtomicU64::new(0);
 pub(in crate::afxdp) static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "debug-log")]
 pub(in crate::afxdp) static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
