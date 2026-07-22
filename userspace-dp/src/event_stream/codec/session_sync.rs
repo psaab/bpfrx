@@ -21,6 +21,7 @@ impl EventFrame {
         metadata: &SessionMetadata,
         _zone_name_to_id: &FxHashMap<String, u16>,
         fabric_redirect_sync: bool,
+        session_id: u64,
     ) -> Self {
         let mut buf = [0u8; 256];
         let mut pos = FRAME_HEADER_SIZE; // skip header, fill later
@@ -181,6 +182,19 @@ impl EventFrame {
         };
         buf[pos..pos + 4].copy_from_slice(&snat_v4);
         pos += 4;
+
+        // #5212: [+16:+24] the ORIGINATING node's stable RT_FLOW session id (u64
+        // LE), trailing/length-gated after the #4565 snat_v4 like every field
+        // since #3301. Carried so a peer-synced session ADOPTS this id on import
+        // (Go decodes it into SessionDeltaInfo.RTFlowSessionID ->
+        // SessionValue{,V6}.RTFlowSessionID -> SessionSyncRequest.session_id ->
+        // build_synced_session_entry), making its SESSION_CREATE (origin node)
+        // and SESSION_CLOSE (possibly the peer, post-failover) share one
+        // correlatable id. 0 = "no id" (a synthesized/no-entry emit, or a bulk
+        // export of an entry that vanished); an old Go decoder length-skips
+        // these 8 bytes and the standby allocs a fresh local id.
+        buf[pos..pos + 8].copy_from_slice(&session_id.to_le_bytes());
+        pos += 8;
 
         // Write header
         let payload_len = (pos - FRAME_HEADER_SIZE) as u32;

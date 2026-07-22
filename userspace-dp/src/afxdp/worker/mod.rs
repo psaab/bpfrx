@@ -376,6 +376,18 @@ pub(crate) struct SyncedSessionEntry {
     /// when BOTH the stored and incoming generations are non-zero, so
     /// local-origin entries fall back to today's unconditional behavior.
     pub(crate) generation: u64,
+    /// #5212: the originating node's STABLE RT_FLOW session id (`alloc_session_id`
+    /// namespace) carried across the HA session-sync wire. Populated (non-zero)
+    /// only on a peer-synced FORWARD import off the wire (`build_synced_session_entry`),
+    /// where it is threaded onto the imported entry so the standby ADOPTS the
+    /// peer's id instead of minting a fresh local one — the standby's
+    /// SESSION_CLOSE RT_FLOW then correlates with the primary's SESSION_CREATE
+    /// across HA nodes. Local-origin publishes (forwarding learn, tunnel,
+    /// promote) and synthesized reverse companions leave this 0: the incremental
+    /// Open delta carries the real id straight off the live entry
+    /// (`install_with_protocol_with_origin`), and a 0 here on any import path
+    /// falls back to `alloc_session_id()` (rolling-upgrade safe).
+    pub(crate) session_id: u64,
 }
 
 impl BindingWorker {

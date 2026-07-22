@@ -279,6 +279,10 @@ impl SessionTable {
                 now_ns,
                 protocol,
                 tcp_flags,
+                // #5212: this legacy convenience wrapper carries no wire id, so
+                // the receiver allocs a fresh node-local one (the real HA path
+                // threads the peer's id via `handle_upsert_synced`).
+                session_id: 0,
             },
             allow_replace_local,
         )
@@ -298,6 +302,7 @@ impl SessionTable {
             now_ns,
             protocol,
             tcp_flags,
+            session_id: wire_session_id,
         } = req;
         // Reject peer data that would clobber a locally-owned session
         // unless explicitly allowed (e.g. during HA activation).
@@ -313,14 +318,24 @@ impl SessionTable {
         // key_to_handle mapping internally before returning None.
         let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
-        // #4915: a peer-synced import gets a FRESH node-local session id. The
-        // peer's original id is not carried on the HA session-sync wire, so a
-        // session that opens on the primary and closes on the standby after a
-        // failover carries different ids on the two nodes — a documented
-        // follow-up (cross-node id identity needs a session-sync wire change).
-        // A node-local id still fixes same-node create/close correlation and
-        // matches this node's own live-session view.
-        let session_id = self.alloc_session_id();
+        // #5212 (completes the #4915 follow-up): ADOPT the originating node's
+        // session id when it rides the HA session-sync wire, so a session that
+        // opens on the primary and closes on the standby after a failover
+        // carries the SAME RT_FLOW id on both nodes (cross-node log/event
+        // correlation). The id is namespaced by the originating worker's high
+        // 16 bits, so importing it verbatim keeps it unique across this node's
+        // shared-nothing worker tables too (the peer's worker id occupies a
+        // disjoint slice of the id space from any locally-alloc'd id). A zero
+        // wire id (a legacy peer that predates the field, or a locally-generated
+        // upsert such as a tunnel replica) falls back to a FRESH node-local id
+        // via `alloc_session_id()` — the pre-#5212 behavior (rolling-upgrade
+        // safe). 0 is never a real id (the allocator starts its counter at 1),
+        // so the sentinel is unambiguous.
+        let session_id = if wire_session_id != 0 {
+            wire_session_id
+        } else {
+            self.alloc_session_id()
+        };
         let record = SessionRecord {
             key: key.clone(),
             entry: SessionEntry {
@@ -435,6 +450,15 @@ impl SessionTable {
         if metadata.is_reverse {
             return;
         }
+        // #5212: this is the owner-RG bulk/cold-sync export path (a live local
+        // session re-announced as an Open delta so a freshly-connected or
+        // failed-back peer picks it up). Unlike the #2465 timestamps/counters,
+        // the STABLE session id IS recoverable — the entry is still live in this
+        // table — so look it up by key and carry it on the wire, letting the
+        // peer adopt the same id it will emit its own RT_FLOW records under
+        // (`session_id_for` returns 0 if the key is somehow absent, the safe
+        // fallback-to-local-alloc sentinel).
+        let session_id = self.session_id_for(&key);
         self.push_delta(SessionDelta {
             kind: SessionDeltaKind::Open,
             key,
@@ -451,9 +475,9 @@ impl SessionTable {
             // #2749: explicit Open-delta emit, no entry in hand.
             observed_tos: 0,
             observed_tcp_flags: 0,
-            // #4915: no backing entry in hand on this explicit-emit path, so no
-            // stable id is available — 0 keeps the "unknown" wire sentinel.
-            session_id: 0,
+            // #5212: the stable id of the exported entry (0 if absent), so the
+            // peer adopts it rather than minting a fresh node-local id.
+            session_id,
         });
     }
 

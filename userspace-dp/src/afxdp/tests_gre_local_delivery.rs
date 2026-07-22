@@ -782,6 +782,7 @@ fn poll_descriptor_junos_host_deny_drops_local_delivery_session_hit() {
         protocol: PROTO_TCP,
         tcp_flags: TCP_FLAG_SYN,
         generation: 0,
+        session_id: 0,
     };
     publish_shared_session(
         &shared_sessions,
