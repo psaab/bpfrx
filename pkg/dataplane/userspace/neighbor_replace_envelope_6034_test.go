@@ -1,13 +1,12 @@
 package userspace
 
 import (
-	"encoding/json"
-	"net"
+	"context"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -36,41 +35,21 @@ import (
 // a config with no interfaces makes buildNeighborSnapshots return nil, so a
 // seeded non-empty lastSnapshot.Neighbors always diffs and triggers the replace.
 func TestNeighborReplaceEnvelopeCarriesGenerationAndRetainsRetryDebt(t *testing.T) {
-	dir := t.TempDir()
-	controlSock := filepath.Join(dir, "control.sock")
-	ln, err := net.Listen("unix", controlSock)
-	if err != nil {
-		t.Fatalf("listen control socket: %v", err)
-	}
-	defer ln.Close()
-
 	var (
 		mu       sync.Mutex
 		requests []ControlRequest
 		ackGen   uint64 // ManagerNeighborGeneration the fake helper reports
 	)
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			var req ControlRequest
-			if err := json.NewDecoder(conn).Decode(&req); err != nil {
-				conn.Close()
-				continue
-			}
-			mu.Lock()
-			requests = append(requests, req)
-			reply := ackGen
-			mu.Unlock()
-			_ = json.NewEncoder(conn).Encode(ControlResponse{
-				OK:     true,
-				Status: &ProcessStatus{PID: 4321, ManagerNeighborGeneration: reply},
-			})
-			conn.Close()
+	requestHook := func(req ControlRequest, status *ProcessStatus) error {
+		mu.Lock()
+		requests = append(requests, req)
+		reply := ackGen
+		mu.Unlock()
+		if status != nil {
+			*status = ProcessStatus{PID: 4321, ManagerNeighborGeneration: reply}
 		}
-	}()
+		return nil
+	}
 
 	proc, err := os.FindProcess(os.Getpid())
 	if err != nil {
@@ -88,7 +67,7 @@ func TestNeighborReplaceEnvelopeCarriesGenerationAndRetainsRetryDebt(t *testing.
 	newManager := func(ack uint64) *Manager {
 		m := New()
 		m.proc = &exec.Cmd{Process: proc}
-		m.cfg.ControlSocket = controlSock
+		m.controlRequestHook = requestHook
 		// Empty config -> buildNeighborSnapshots returns nil, so the seeded
 		// (publishable) neighbor always diffs and triggers the replace.
 		m.lastSnapshot = &ConfigSnapshot{
@@ -146,5 +125,120 @@ func TestNeighborReplaceEnvelopeCarriesGenerationAndRetainsRetryDebt(t *testing.
 	if len(okNeighbors) != 0 {
 		t.Fatalf("acknowledged replace (ACK 5 >= sent 5) must advance the cached neighbor view to empty, "+
 			"got %+v", okNeighbors)
+	}
+}
+
+// TestNeighborReplaceGenerationSeedsFromFirstStatus is the restart guard for
+// #6034. A new Manager starts its in-memory replace counter at zero, while a
+// surviving helper can retain a much higher applied-generation fence. The
+// first status poll must seed the manager from that fence before the next
+// replace is allocated, so the helper accepts generation 101 rather than
+// fencing generation 1.
+func TestNeighborReplaceGenerationSeedsFromFirstStatus(t *testing.T) {
+	var (
+		helperMu   sync.Mutex
+		appliedGen uint64 = 100
+	)
+	statusSeen := make(chan struct{}, 1)
+	neighborReq := make(chan ControlRequest, 1)
+	requestHook := func(req ControlRequest, status *ProcessStatus) error {
+		helperMu.Lock()
+		switch req.Type {
+		case "status":
+			select {
+			case statusSeen <- struct{}{}:
+			default:
+			}
+		case "update_neighbors":
+			// Model the helper's strict fence: only a generation above the
+			// persisted high-water mark is applied.
+			if req.NeighborGeneration > appliedGen {
+				appliedGen = req.NeighborGeneration
+			}
+			select {
+			case neighborReq <- req:
+			default:
+			}
+		}
+		reply := appliedGen
+		helperMu.Unlock()
+		if status != nil {
+			*status = ProcessStatus{PID: 4321, ManagerNeighborGeneration: reply}
+		}
+		return nil
+	}
+
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess: %v", err)
+	}
+	m := New()
+	m.proc = &exec.Cmd{Process: proc}
+	m.controlRequestHook = requestHook
+	if m.neighborReplaceGen != 0 {
+		t.Fatalf("new manager neighborReplaceGen = %d, want reset value 0", m.neighborReplaceGen)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		m.statusLoop(ctx)
+		close(loopDone)
+	}()
+	select {
+	case <-statusSeen:
+	case <-time.After(3 * time.Second):
+		cancel()
+		<-loopDone
+		t.Fatal("timed out waiting for first helper status poll")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.mu.Lock()
+		seededGen := m.neighborReplaceGen
+		m.mu.Unlock()
+		if seededGen == 100 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-loopDone
+			t.Fatalf("neighborReplaceGen after first status = %d, want seeded helper generation 100", seededGen)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-loopDone
+
+	seededNeighbor := NeighborSnapshot{
+		Ifindex: 13,
+		Family:  "inet",
+		IP:      "172.16.80.200",
+		MAC:     "02:aa:bb:cc:dd:ee",
+		State:   "reachable",
+	}
+	m.lastSnapshot = &ConfigSnapshot{
+		Version:    ProtocolVersion,
+		Generation: 1,
+		Config:     &config.Config{},
+		Neighbors:  []NeighborSnapshot{seededNeighbor},
+	}
+	m.generation = 1
+	m.RegenerateNeighborSnapshot()
+
+	select {
+	case req := <-neighborReq:
+		if req.NeighborGeneration != 101 {
+			t.Fatalf("first neighbor replace generation = %d, want 101 (helper fence 100 + 1)", req.NeighborGeneration)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for neighbor replace")
+	}
+	helperMu.Lock()
+	gotApplied := appliedGen
+	helperMu.Unlock()
+	if gotApplied != 101 {
+		t.Fatalf("helper applied generation = %d, want 101", gotApplied)
 	}
 }

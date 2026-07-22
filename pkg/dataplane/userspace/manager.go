@@ -247,6 +247,9 @@ type Manager struct {
 	// readback faults without a privileged BPF map (#5486). Production leaves
 	// it nil.
 	disableCtrlMapHook ctrlMapUpdater
+	// controlRequestHook replaces requestLocked in unit tests that exercise
+	// manager state transitions without opening a Unix control socket.
+	controlRequestHook func(ControlRequest, *ProcessStatus) error
 
 	// addrListForLocalSyncHook, when non-nil, replaces netlink.AddrList in
 	// buildDesiredLocalAddressSets so tests can inject a transient
