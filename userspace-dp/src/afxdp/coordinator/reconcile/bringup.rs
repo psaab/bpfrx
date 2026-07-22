@@ -698,7 +698,18 @@ pub(super) fn bring_up_workers(
         let last_probed = coord.neighbors.last_probed_at.clone();
         let warm_generation = coord.neighbors.warm_generation.clone();
         let rg_runtime = coord.ha.rg_runtime.clone();
-        spawn_supervised_aux("neigh-warmer", move || {
+        // #6314: RETAIN the warmer's join handle (was discarded via `.ok()`,
+        // the pre-#5165 pattern the monitor + resolver siblings already left
+        // behind). Install `warm_queue` + `warm_stop` + `warm_join` together
+        // ONLY when the thread actually spawned, so `stop_inner` can JOIN the
+        // warmer after signalling stop and dropping the producer and enforce
+        // no-mutation-after-stop. On spawn failure (EAGAIN/ENOMEM) log it —
+        // previously `.ok()` SWALLOWED the error, silently never running the
+        // warmer — and leave ALL THREE `None` so the `warm_queue.is_none()`
+        // guard above lets the NEXT reconcile retry. Warming is best-effort
+        // (the neighbor cache still fills from the workers' RX-learned path and
+        // the on-demand resolver), so there is no availability regression.
+        match spawn_supervised_aux("neigh-warmer", move || {
             neighbor_warmer_loop(
                 rx,
                 last_probed,
@@ -706,10 +717,19 @@ pub(super) fn bring_up_workers(
                 rg_runtime,
                 warm_stop_clone,
             )
-        })
-        .ok();
-        coord.neighbors.warm_queue = Some(tx);
-        coord.neighbors.warm_stop = Some(warm_stop);
+        }) {
+            Ok(join) => {
+                coord.neighbors.warm_queue = Some(tx);
+                coord.neighbors.warm_stop = Some(warm_stop);
+                coord.neighbors.warm_join = Some(join);
+            }
+            Err(err) => {
+                eprintln!(
+                    "xpf-userspace-dp: neighbor warmer thread spawn failed: {err}; \
+                     proactive neighbor warming disabled this reconcile (will retry)"
+                );
+            }
+        }
     }
     // #1881: three-pass reconcile (degenerates to pure spawn here —
     // stop_inner cleared the entry map before this bring-up, and the
