@@ -118,6 +118,11 @@ func (m *Manager) ManualFailover(rgID int) error {
 		return nil
 	}
 	oldState := rg.State
+	// A fresh manual failover supersedes any prior remote transfer-out lease on
+	// this RG. The remote path re-arms via ArmRemoteTransferOutLease after this
+	// returns; a local operator failover leaves it cleared so its deliberate
+	// hold is never auto-restored (#5079).
+	m.clearRemoteTransferOutLeaseLocked(rgID)
 	rg.ManualFailover = true
 	rg.ManualFailoverAt = time.Now()
 	rg.State = StateSecondaryHold
@@ -145,6 +150,9 @@ func (m *Manager) ForceSecondary() error {
 			continue
 		}
 		oldState := rg.State
+		// ISSU force-secondary is a deliberate drain; drop any remote
+		// transfer-out lease so it is never auto-restored (#5079).
+		m.clearRemoteTransferOutLeaseLocked(rg.GroupID)
 		rg.Weight = 0
 		rg.ManualFailover = true
 		rg.ManualFailoverAt = time.Now()
@@ -361,6 +369,96 @@ func (m *Manager) notePeerTransferCommitted(rgID int) {
 	m.peerGroups[rgID] = peerGroup
 }
 
+// =============================================================================
+// Owner-side transfer-out lease (#5079).
+//
+// A peer-requested transfer-out demotes this node to secondary-hold BEFORE the
+// requester runs its own post-ACK commit checks. If a requester-side step fails
+// after the ACK, the requester rolls back only its LOCAL override
+// (abortRequestedPeerFailover) and sends no abort frame — and if the requester
+// crashes or the fabric drops, no commit ever arrives either. Without a bound
+// the demoted owner sits in secondary-hold forever while its peer is a healthy
+// secondary, stranding the cluster with no primary (both nodes secondary). The
+// existing dual-resign guard in electRG does NOT rescue this case: it only
+// clears ManualFailover when the peer itself is resigned (weight 0) or in
+// secondary-hold, not when the requester aborted back to a healthy secondary.
+//
+// The lease is armed when a REMOTE failover request demotes the RG and is
+// cleared on the matching commit (reqID-bound). If it expires with no commit,
+// electRG restores the owner. A local operator ManualFailover / ISSU
+// ForceSecondary clears any stale lease so their deliberate holds are never
+// auto-restored.
+// =============================================================================
+
+// SetRemoteTransferOutLeaseDuration overrides how long an armed remote
+// transfer-out lease survives without a commit before electRG restores the
+// owner. The daemon sizes this above its configured local commit-ready settle
+// window plus the commit round-trip so the lease never fires on an in-flight
+// commit. Values below minRemoteTransferOutLease are floored.
+func (m *Manager) SetRemoteTransferOutLeaseDuration(d time.Duration) {
+	if d < minRemoteTransferOutLease {
+		d = minRemoteTransferOutLease
+	}
+	m.mu.Lock()
+	m.remoteTransferOutLease = d
+	m.mu.Unlock()
+}
+
+// ArmRemoteTransferOutLease binds an auto-restore lease to each RG that a peer
+// request has just demoted, so a requester-side post-ACK abort/crash cannot
+// strand the owner secondary (#5079). Only RGs actually holding ManualFailover
+// are armed — a demotion superseded by a concurrent reset (which cleared the
+// hold) leaves no lease, so the owner is never spuriously restored.
+func (m *Manager) ArmRemoteTransferOutLease(rgIDs []int, reqID uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	until := time.Now().Add(m.remoteTransferOutLease)
+	for _, rgID := range rgIDs {
+		rg, ok := m.groups[rgID]
+		if !ok || !rg.ManualFailover {
+			continue
+		}
+		m.remoteTransferOutLeaseUntil[rgID] = until
+		m.remoteTransferOutLeaseReqID[rgID] = reqID
+		slog.Info("cluster: armed remote transfer-out lease",
+			"rg", rgID, "req_id", reqID, "expires_in", m.remoteTransferOutLease.String())
+	}
+}
+
+// ClearRemoteTransferOutLease disarms the lease for an RG once the transfer-out
+// is committed. It is reqID-bound: a stale/duplicate commit carrying an older
+// request ID must not clear a newer request's lease. A commit for the current
+// lease's reqID always clears it.
+func (m *Manager) ClearRemoteTransferOutLease(rgID int, reqID uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cur, ok := m.remoteTransferOutLeaseReqID[rgID]; ok && cur != reqID {
+		return
+	}
+	m.clearRemoteTransferOutLeaseLocked(rgID)
+}
+
+func (m *Manager) clearRemoteTransferOutLeaseLocked(rgID int) {
+	delete(m.remoteTransferOutLeaseUntil, rgID)
+	delete(m.remoteTransferOutLeaseReqID, rgID)
+}
+
+// manualFailoverRestoreWeightLocked recomputes an RG's monitor-derived weight
+// after ManualFailover is cleared. It is used by BOTH the dual-resign guard and
+// the transfer-out lease expiry in electRG; it deliberately does NOT run
+// election (recalcWeight would recurse back into electRG). Caller holds m.mu.
+func (m *Manager) manualFailoverRestoreWeightLocked(rg *RedundancyGroupState) {
+	totalLost := 0
+	for _, iface := range rg.MonitorFails {
+		key := monitorKey{rgID: rg.GroupID, iface: iface}
+		totalLost += m.monitorWeights[key]
+	}
+	rg.Weight = 255 - totalLost
+	if rg.Weight < 0 {
+		rg.Weight = 0
+	}
+}
+
 // FinalizePeerTransferOut completes a previously acknowledged transfer-out
 // after the peer commits ownership on the sync channel.
 func (m *Manager) FinalizePeerTransferOut(rgID int) error {
@@ -541,6 +639,9 @@ func (m *Manager) ManualFailoverBatch(rgIDs []int) error {
 			continue
 		}
 		oldState := rg.State
+		// Fresh batch failover supersedes any prior remote transfer-out lease;
+		// the remote path re-arms after this returns (#5079).
+		m.clearRemoteTransferOutLeaseLocked(rgID)
 		rg.ManualFailover = true
 		rg.ManualFailoverAt = now
 		rg.State = StateSecondaryHold

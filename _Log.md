@@ -56044,3 +56044,42 @@ top.
   **File(s)**: pkg/dataplane/userspace/process_status.go,
   pkg/dataplane/userspace/addr_only_commit_failclosed_4959_test.go,
   docs/userspace-dataplane-architecture.md
+  **Action**: #5079 — owner-side transfer-out lease so a requester-side
+  post-ACK failover abort/crash cannot strand the demoted owner secondary.
+  `RequestPeerFailover` demotes the remote owner (ManualFailover, VRRP resign)
+  on the ACK, before the requester's own commit checks; `abortRequestedPeerFailover`
+  rolled back only the requester locally — no abort frame reached the owner and no
+  lease auto-restored it, so an abort/crash/fabric-loss left both nodes secondary
+  (electRG's dual-resign guard never fires against a healthy-secondary peer).
+  Fix: reqID-bound auto-restore lease armed on the owner when a REMOTE request
+  demotes an RG (ArmRemoteTransferOutLease), cleared reqID-bound on the matching
+  commit (ClearRemoteTransferOutLease); electRG restores the owner on lease expiry.
+  Receiver-only self-heal (reqID already on the wire — no new frame, no mixed-base
+  risk). reqID threaded into OnRemoteFailover*/Commit* callbacks. ManualFailover/
+  Batch/ForceSecondary clear any stale lease so operator/ISSU holds are never
+  auto-restored. Fail-on-revert test firsthand-verified RED
+  (TestRemoteTransferOutLeaseRestoresOwnerWhenNoCommitArrives + batch).
+  Full pkg/cluster + pkg/daemon suites green; go vet clean.
+  **File(s)**: pkg/cluster/failover.go, pkg/cluster/election.go,
+  pkg/cluster/manager.go, pkg/cluster/sync.go, pkg/cluster/sync_failover.go,
+  pkg/cluster/failover_lease_5079_test.go, pkg/cluster/sync_test.go,
+  pkg/cluster/README.md, pkg/daemon/daemon_ha_sync.go
+- **Timestamp**: 2026-07-22 (#5087)
+  **Action**: Apply day-2 `reth-advertise-interval` and `gratuitous-arp-count`
+  changes to running VRRP instances. The `UpdateInstances` no-change gate now
+  compares `AdvertiseInterval` and `GARPCount`, so a commit changing only
+  either field breaks the `continue // No change` shortcut and takes the
+  in-place `updateConfig` arm; `updateConfig` copies both into the running
+  instance's `cfg`. No explicit timer poke is needed — the MASTER advert timer
+  re-arms via `advertTimer.Reset(vi.advertInterval())` on its next fire, the
+  BACKUP master-down horizon re-reads `cfg.AdvertiseInterval` through
+  `masterDownInterval()`, and the next failover's `sendGARP` re-reads
+  `cfg.GARPCount`. Before this fix the stale advert timer / wire value and GARP
+  burst count persisted until an unrelated restart while config reported
+  success. Added fail-on-revert tests
+  `TestUpdateInstances_AdvertiseIntervalOnlyAppliedInPlace` and
+  `TestUpdateInstances_GARPCountOnlyAppliedInPlace` (firsthand-verified RED
+  when either the gate comparison or the updateConfig copy is reverted). Full
+  pkg/vrrp suite green (incl. -race).
+  **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/update_instances_test.go, pkg/vrrp/README.md

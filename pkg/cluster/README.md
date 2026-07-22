@@ -33,7 +33,13 @@ locating any symbol below is now a matter of opening the named file.
   `abortRequestedPeerFailover`, `notePeerTransferCommitted`,
   `FinalizePeerTransferOut`, `FenceStatus`), the batch variants
   (`ManualFailoverBatch`, `RequestPeerFailoverBatch`,
-  `FinalizePeerTransferOutBatch`, etc.), and all transfer-commit
+  `FinalizePeerTransferOutBatch`, etc.), the owner-side
+  transfer-out lease (`ArmRemoteTransferOutLease`,
+  `ClearRemoteTransferOutLease`,
+  `SetRemoteTransferOutLeaseDuration`,
+  `clearRemoteTransferOutLeaseLocked`,
+  `manualFailoverRestoreWeightLocked`; see "Owner-side
+  transfer-out lease" below), and all transfer-commit
   state machine `*Locked` helpers
   (`applyPeerTransferOutOverrideLocked`,
   `clearPeerTransferOutOverrideLocked`,
@@ -676,6 +682,34 @@ outside the monitor loop:
   write (single-RG returns nil; batch skips that member) if it changed. Keep
   `failoverInProgress` cleaned up on every exit path so a superseded failover
   cannot wedge the next one.
+- **Owner-side transfer-out lease — a requester-side abort must not strand the
+  demoted owner (#5079).** `RequestPeerFailover` drives the remote owner through
+  `ManualFailover` (SecondaryHold, VRRP resigned) on the ACK, BEFORE the
+  requester runs its own post-ACK readiness/commit checks. If a requester-side
+  step fails after the ACK, `abortRequestedPeerFailover` rolls back only the
+  requester's LOCAL override — it sends no abort frame to the owner, and the
+  requester may roll back to a HEALTHY secondary. The pre-existing dual-resign
+  guard in `electRG` never rescues this: it clears `ManualFailover` only when the
+  PEER is itself resigned (weight 0) or in secondary-hold, not when the requester
+  is a healthy secondary — so the owner would sit in secondary-hold forever and
+  the cluster is left with NO primary (both secondary). Fix: the owner arms a
+  **reqID-bound auto-restore lease** (`ArmRemoteTransferOutLease`) when a REMOTE
+  request demotes it; the matching commit clears it (`ClearRemoteTransferOutLease`,
+  reqID-bound so a stale commit cannot clear a newer request's lease). If the
+  lease expires with no commit — abort, requester crash, or fabric loss — `electRG`
+  restores the owner (clears `ManualFailover`, restores monitor-derived weight,
+  re-elects). This is receiver-only self-healing: NO new wire frame (the reqID
+  already rides the failover request/commit payloads), so no mixed-base
+  compatibility concern, and it defends against requester death/partition that an
+  abort frame could not. Only a REMOTE transfer-out arms a lease; `ManualFailover`
+  / `ManualFailoverBatch` / `ForceSecondary` clear any stale entry at the demotion
+  site so a deliberate operator or ISSU hold is never auto-restored. The lease
+  duration (`SetRemoteTransferOutLeaseDuration`, default
+  `DefaultRemoteTransferOutLease` = 30s, floored at 15s) is sized above the
+  requester's worst-case post-ACK commit latency (local commit-ready settle +
+  commit round-trip) so a legitimate slow commit never trips it. reqID is threaded
+  into `OnRemoteFailover`/`OnRemoteFailoverBatch`/`OnRemoteFailoverCommit`/
+  `OnRemoteFailoverCommitBatch` (`sync.go`) to arm/clear it.
 - HA delete-sync callbacks fire from the GC loop. They must not block, and
   must log at `slog.Debug` — earlier `slog.Info` flooded at 15 req/s and
   drowned out real diagnostics (per CLAUDE.md logging rules).
