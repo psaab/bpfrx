@@ -1,3 +1,50 @@
+## 2026-07-22 — #6114: mirror flow-cache HOT path samples before reserving
+
+- **Timestamp**: 2026-07-22 (fix/6114-mirror-sample-before-cas)
+- **Action**: Reordered the ESTABLISHED-FLOW HOT PATH mirror admission
+  (`poll_descriptor/flow_cache_hit.rs`) — the real remaining #5167 site
+  surfaced by #6113 — to run the worker-local sampler BEFORE the shared
+  `admit_mirror_clone_to_live` reservation, matching the #6113 fix on the
+  dispatch path. Reserving first hit a true-shared AcqRel CAS on the target's
+  `pending_tx_admitted` (#4096) for EVERY established-flow packet (and a
+  second AcqRel RMW to release the unused reservation for a non-sampled
+  packet), so acknowledged cross-core true-sharing scaled O(PPS) instead of
+  the sample rate O(PPS/R) on the path that dominates sustained high-PPS
+  mirror. Extracted the ordering into ONE shared
+  `sample_then_admit_mirror_clone` (`mirror/resolver.rs`, returning
+  `MirrorSampleAdmission::{NotSampled, Sampled(Result<...>)}`) that BOTH the
+  hot path and `enqueue_sampled_mirror_clone_to_live` call — a single tested
+  home for the invariant so it cannot silently diverge again.
+- **Intent resolution (#6114 question)**: the prior admit-first behavior
+  (documented by `sampled_live_mirror_queue_full_does_not_advance_sampler`:
+  "a full-queue packet must not consume a mirror sample") was adjudicated a
+  SECOND instance of the #5167 bug, not a real requirement. Budget
+  preservation only has effect during a pressure event where clones are
+  already being dropped, is statistically irrelevant to a 1-in-N decimation
+  of an inherently lossy clone stream, and #5167/#6113 already chose
+  sample-first for the identical shared-CAS tradeoff on the dispatch path. So
+  the ordering is flipped to sample-first and the test re-asserts it.
+- **Tests** (`mirror/mod_tests.rs`):
+  - `flow_cache_nonsampled_does_not_reserve_full_queue_6114` (FAIL-ON-REVERT,
+    the #6113-shape analog): full clone queue + a NON-sampled packet → `None`
+    with `mirror_drops_queue_full == 0` and the pre-fill untouched (nothing
+    shared reserved). Revert to reserve-before-sample → admit fails on the
+    full queue → `Some(QueueFullCrossWorker)` + drop counter bumped → RED.
+  - `sampled_live_mirror_queue_full_advances_sampler_for_selected_6114`
+    (flipped from `..._does_not_advance_sampler`): a SELECTED packet on a full
+    queue advances the sampler (counter 0→1) THEN reports the queue-full
+    pressure. Revert leaves the counter at 0 → RED.
+  - GREEN: `cargo test --release mirror::` = 26 passed. RED-on-revert proven
+    firsthand: reverting `sample_then_admit_mirror_clone` to CAS-before-sample
+    → both tests FAILED (counter left=0 want 1; result left=Some(QueueFull)
+    want None), restored → GREEN.
+- **File(s)**: userspace-dp/src/afxdp/mirror/resolver.rs,
+  userspace-dp/src/afxdp/mirror/mod.rs,
+  userspace-dp/src/afxdp/mirror/fast_path.rs,
+  userspace-dp/src/afxdp/mirror/mod_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  docs/userspace-dataplane-gaps.md
+
 ## 2026-07-22 — #5287: budget + resume the conntrack last_seen refresh
 
 - **Timestamp**: 2026-07-22 (fix/5287-conntrack-refresh-budget)

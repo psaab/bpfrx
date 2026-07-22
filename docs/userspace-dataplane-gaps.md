@@ -78,22 +78,31 @@ Port mirroring now has snapshot/wire plumbing plus a bounded runtime slice
 that samples and queues discardable full-L2 mirror clones with drop counters.
 Runtime coverage includes the pending-forward path, self-target flow-cache
 mirror surface, deferred neighbor-resolution retry path, CoS-bound reserve
-handling, and mirror-specific counter attribution. **#5167 (PARTIAL — dispatch
-path only, #6113): both branches of `enqueue_sampled_mirror_clone`
-(`mirror/fast_path.rs`) now run the worker-local sampler (`mirror_sample_allows`)
-BEFORE reserving the target clone queue. That function is the DISPATCH path
-(session-miss / neighbor-resolution-retry); its cross-worker (to-live) branch
-previously reserved first (`admit_mirror_clone_to_live`, a true-shared AcqRel CAS
-on the target's `pending_tx_admitted`, #4096) and sampled second, so acknowledged
-cross-core true-sharing scaled with the FULL unsampled ingress rate O(PPS)
-instead of the sample rate O(PPS/R). Sample-first means a non-sampled packet no
-longer reserves, copies, or reports clone-queue pressure for a clone it will not
-send. NOT YET FIXED: the ESTABLISHED-FLOW HOT PATH
-(`poll_descriptor/flow_cache_hit.rs:386-398`) still inlines the same
-reserve-before-sample ordering, and sustained high-PPS mirror is dominated by
-flow-cache HITS — so the O(PPS/R) scaling goal is NOT yet met on the dominant
-path (tracked #6114). The dead-code `enqueue_sampled_mirror_clone_to_live`
-sibling shares the anti-pattern but has no live caller.** The
+handling, and mirror-specific counter attribution. **#5167 sample-before-reserve
+(COMPLETE across dispatch + hot path). Ordering invariant: on every mirror
+surface the worker-local sampler (`mirror_sample_allows`) runs BEFORE reserving
+the cross-worker clone queue (`admit_mirror_clone_to_live`, a true-shared AcqRel
+CAS on the target's `pending_tx_admitted`, #4096 — an unused reservation costs a
+second AcqRel RMW on its `PendingTxAdmission` Drop). Reserve-before-sample made
+acknowledged cross-core true-sharing scale with the FULL unsampled ingress rate
+O(PPS) instead of the sample rate O(PPS/R); sample-first means a non-sampled
+packet touches nothing shared — no reserve, no copy, no clone-queue pressure
+report. #6113 (#5167) fixed the DISPATCH path (both branches of
+`enqueue_sampled_mirror_clone`, `mirror/fast_path.rs` — session-miss /
+neighbor-resolution-retry). #6114 (#5167) fixes the remaining LIVE site, the
+ESTABLISHED-FLOW HOT PATH (`poll_descriptor/flow_cache_hit.rs`), which dominates
+sustained high-PPS mirror, plus the `enqueue_sampled_mirror_clone_to_live` sibling
+that shares it. Both now route the ordering through one shared
+`sample_then_admit_mirror_clone` (`mirror/resolver.rs`) so the invariant has a
+single tested home and cannot silently diverge again. Intent note: the earlier
+"admit-first preserves sample budget on a full queue" behavior (documented by
+`sampled_live_mirror_queue_full_does_not_advance_sampler`) was adjudicated a
+SECOND instance of the #5167 bug, not a real requirement — budget preservation
+only matters during a pressure event where clones are already dropped, is
+statistically irrelevant to a 1-in-N decimation of a lossy clone stream, and cost
+an O(PPS) shared-CAS hit on the dominant path; the test is flipped to assert
+sample-first (a SELECTED packet advances the sampler, then reports the full-queue
+pressure).** The
 `deriveUserspaceCapabilities()` gate has been removed; #1376 is closed for the
 feature-gap audit, and the #1477 final-validation artifact set is closed.
 Any further mirror-fidelity and pressure-survival work is production hardening,

@@ -45,6 +45,51 @@ pub(in crate::afxdp) fn admit_mirror_clone_to_live(
         .map_err(|_| MirrorCloneResult::QueueFullCrossWorker)
 }
 
+/// Outcome of the mirror sample-then-admit decision (#6114). Splitting the
+/// worker-local sampler from the cross-worker reservation lets a caller run the
+/// cheap sampler FIRST and only touch the contended clone queue for a packet
+/// that is actually selected.
+pub(in crate::afxdp) enum MirrorSampleAdmission {
+    /// The worker-local sampler declined this packet. Nothing shared was
+    /// touched: no reservation, no copy, no clone-queue pressure report.
+    NotSampled,
+    /// The packet was selected. Carries the reservation outcome: `Ok` holds a
+    /// reserved live clone-queue slot, `Err` reports why admission failed
+    /// (e.g. `QueueFullCrossWorker`).
+    Sampled(Result<PendingTxAdmission, MirrorCloneResult>),
+}
+
+// #6114 / #5167: run the worker-local sampler BEFORE reserving the contended
+// cross-worker clone queue. `admit_mirror_clone_to_live` performs a true-shared
+// AcqRel CAS on the target's `pending_tx_admitted` (#4096), and dropping an
+// unused reservation costs a second AcqRel RMW (the `PendingTxAdmission` Drop
+// release). Reserving BEFORE sampling made acknowledged cross-core true-sharing
+// scale with the FULL unsampled ingress rate O(PPS) instead of the sample rate
+// O(PPS/R), so sampling could not bound clone cost. Sample-first: a non-sampled
+// packet advances only the worker-local `sample_counter` and returns
+// `NotSampled` having touched nothing shared. This is the single home for the
+// ordering invariant shared by the established-flow HOT path
+// (`poll_descriptor/flow_cache_hit.rs`) and `enqueue_sampled_mirror_clone_to_live`.
+#[inline]
+pub(in crate::afxdp) fn sample_then_admit_mirror_clone(
+    rate: u32,
+    sample_counter: &mut u64,
+    mirror_targets: &MirrorTargetMap,
+    mirror_tx_ifindex: i32,
+    ingress_queue_id: u32,
+    frame_len: usize,
+) -> MirrorSampleAdmission {
+    if !mirror_sample_allows(rate, sample_counter) {
+        return MirrorSampleAdmission::NotSampled;
+    }
+    MirrorSampleAdmission::Sampled(admit_mirror_clone_to_live(
+        mirror_targets,
+        mirror_tx_ifindex,
+        ingress_queue_id,
+        frame_len,
+    ))
+}
+
 #[inline]
 pub(in crate::afxdp) fn mirror_cos_queue_id(
     forwarding: &ForwardingState,
