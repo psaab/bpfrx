@@ -1465,8 +1465,16 @@ func (m *Manager) deleteHelperSessionsV4(keys []dataplane.SessionKey) error {
 		for i := start; i < end; i++ {
 			reqs = append(reqs, m.buildSessionSyncRequestV4("delete", keys[i], nil))
 		}
-		if err := m.syncSessionRequestsLocked(reqs...); err != nil && firstErr == nil {
-			firstErr = err
+		if err := m.syncSessionRequestsLocked(reqs...); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			// Helper unreachable/hung: stop chunking. Every remaining chunk
+			// would fast-fail identically, so a large clear (10M keys ≈ 40K
+			// chunks) does not spend one round-trip deadline PER chunk (#5380).
+			if errors.Is(err, errSessionHelperUnreachable) {
+				break
+			}
 		}
 	}
 	return firstErr
@@ -1492,8 +1500,14 @@ func (m *Manager) deleteHelperSessionsV6(keys []dataplane.SessionKeyV6) error {
 		for i := start; i < end; i++ {
 			reqs = append(reqs, m.buildSessionSyncRequestV6("delete", keys[i], nil))
 		}
-		if err := m.syncSessionRequestsLocked(reqs...); err != nil && firstErr == nil {
-			firstErr = err
+		if err := m.syncSessionRequestsLocked(reqs...); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			// Helper unreachable/hung: stop chunking (see deleteHelperSessionsV4).
+			if errors.Is(err, errSessionHelperUnreachable) {
+				break
+			}
 		}
 	}
 	return firstErr
@@ -1716,12 +1730,23 @@ func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
 // resolved against one consistent snapshot (#5007). Sending both requests
 // under a single unlock also keeps the pair's transmit contiguous.
 //
-// It attempts EVERY request even when an earlier one fails (so a bulk
-// revocation drops as many helper sessions as it can) and returns the FIRST
-// helper IPC error encountered, or nil if all succeeded. Best-effort mirror
-// callers (mirrorSessionPair*, batch delete) discard the result; the
-// authoritative clear-all path (#5881) propagates it so a failed helper
-// revocation is reported instead of masquerading as success.
+// It attempts every request as long as the helper keeps answering — an
+// APPLICATION-level rejection of one request (helper alive, resp.OK=false) does
+// not stop the loop, so a bulk revocation drops as many helper sessions as it
+// can. It returns the FIRST helper IPC error encountered, or nil if all
+// succeeded. Best-effort mirror callers (mirrorSessionPair*, batch delete)
+// discard the result; the authoritative clear-all path (#5881) propagates it so
+// a failed helper revocation is reported instead of masquerading as success.
+//
+// #5380: if a request fails at the TRANSPORT layer (dial/write/read wrapped
+// with errSessionHelperUnreachable), the helper is down or hung and every
+// remaining request in this batch would pay the full per-request deadline too.
+// A bulk delete chunk is up to sessionHelperDeleteChunk (256) requests, so
+// looping on would stall bulk session ops — and repeatedly hold sessionMu,
+// starving live session installs — for ~256 * sessionSyncRoundtripDeadline
+// (~13 min). So the batch fast-fails: it stops after the first transport
+// failure and returns it. The mirror is best-effort — the periodic sweep
+// retries once the helper is healthy again.
 func (m *Manager) syncSessionRequestsLocked(reqs ...SessionSyncRequest) error {
 	if len(reqs) == 0 {
 		return nil
@@ -1738,6 +1763,11 @@ func (m *Manager) syncSessionRequestsLocked(reqs ...SessionSyncRequest) error {
 			slog.Debug("userspace session sync mirror failed", "operation", reqs[i].Operation, "err", err)
 			if firstErr == nil {
 				firstErr = err
+			}
+			// Helper unreachable/hung: abort the batch instead of paying the
+			// per-request deadline once per remaining request (#5380).
+			if errors.Is(err, errSessionHelperUnreachable) {
+				break
 			}
 		}
 	}

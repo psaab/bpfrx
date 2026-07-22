@@ -55117,3 +55117,39 @@ top.
   contract in `docs/session-sync-architecture.md`.
 - **File(s)**: userspace-dp/src/nat/source.rs,
   userspace-dp/src/nat/tests_pool.rs, docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-07-21 18:52
+- **Action**: #5380 — fast-fail bulk session-sync mirror on a hung/unreachable
+  helper. The per-request dial timeout (2s) + round-trip deadline (3s) already
+  existed on the dedicated session socket (`requestSessionSync`,
+  `process_control.go`), so ONE request already fails in bounded time. The
+  residual bug was the BATCH multiplication: `syncSessionRequestsLocked` loops
+  over up to `sessionHelperDeleteChunk` (256) requests, and under a hung helper
+  (accepts but never replies) each paid the FULL 3s deadline — 256 × 3s ≈ 13 min
+  per chunk while repeatedly holding `sessionMu`, starving live session installs
+  (the CLAUDE.md control-socket-contention concern). Fix: wrap the three
+  transport-layer failures (dial/write/read) with a new
+  `errSessionHelperUnreachable` sentinel; `syncSessionRequestsLocked` and the
+  `deleteHelperSessionsV4/V6` chunk loops abort on the first such error so the
+  whole batch (and a full clear-all) costs ~one round-trip deadline, not one per
+  request/chunk. Application-level rejections (helper alive, `resp.OK=false`) are
+  NOT wrapped, so the #5881 best-effort "drop as many as we can" + error-report
+  contract is preserved. Confirmed the session socket is one-request-per-
+  connection (`handle_stream`), so connection reuse would break framing — noted
+  as a non-fix. Named the dial/round-trip bounds as package vars
+  (`sessionSyncDialTimeout` / `sessionSyncRoundtripDeadline`) so the regression
+  test can shrink them. Fail-on-revert test
+  `TestSyncSessionRequestsLockedFastFailsOnHungHelper5380`
+  (`sync_socket_fastfail_5380_test.go`): a hung listener accepts but never
+  replies; a 10-request batch must return within 500ms (~one shrunk 150ms
+  deadline) AND carry `errSessionHelperUnreachable`. RED on revert (drop the
+  `errors.Is(err, errSessionHelperUnreachable) { break }`): batch takes 1.505s
+  (10 × 150ms) and blows the bound — a clean elapsed assertion, not a compile
+  break. Validated on disk: `go build ./...`, `go vet`, full
+  `pkg/dataplane/userspace` suite green. HA session-sync path — needs a
+  loss-cluster failover smoke (batched). Documented the Go-side batch fast-fail
+  contract in `userspace-dp/src/server/README.md`.
+- **File(s)**: pkg/dataplane/userspace/process_control.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/sync_socket_fastfail_5380_test.go,
+  userspace-dp/src/server/README.md, _Log.md

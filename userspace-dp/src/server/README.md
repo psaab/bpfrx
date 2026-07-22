@@ -300,3 +300,16 @@ queues. See PR #1243's kill record for why i40e doesn't reshape.
   snapshot sync, and forwarding sync. The control channel is still
   shared by those other callers; adding a new caller there at >1 Hz
   can still starve the other low-frequency control operations.
+  - Each session round-trip is one-request-per-connection: the Go side
+    dials this socket, sends one newline-framed request, reads one
+    response, and closes. If this thread is hung (accepts but never
+    replies), the Go side bounds a single round-trip with a dial timeout
+    plus a read/write deadline (`sessionSyncDialTimeout` /
+    `sessionSyncRoundtripDeadline`, `pkg/dataplane/userspace`). A **bulk**
+    Go caller (batch/clear session delete, up to 256 requests per chunk)
+    additionally fast-fails the whole batch on the first transport failure
+    (`errSessionHelperUnreachable`) instead of paying that deadline once
+    per request, so a hung helper cannot stall bulk session ops — nor
+    repeatedly hold the Go-side `sessionMu` and starve live installs — for
+    minutes (#5380). The session mirror is best-effort; the periodic sweep
+    retries once this thread is healthy again.
