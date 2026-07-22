@@ -322,7 +322,10 @@ never rejects on it. The path is: the Rust dataplane harvests the id onto
 `SessionDelta.session_id` and writes it as the trailing field of the
 `MSG_SESSION_OPEN` event-stream frame; the daemon decodes it into
 `SessionDeltaInfo.RTFlowSessionID` and stamps `SessionValue{,V6}.RTFlowSessionID`
-(distinct from the node-local BPF-ABI `SessionID`, which stays `now<<16|Slot`);
+(distinct from the node-local BPF-ABI `SessionID`, composed `now<<32|Slot` —
+the slot fills the low 32 bits, up from the old `now<<16|slot&0xffff`, which
+truncated any slot past 65535 and collided sessions whose slots differed only
+above bit 16 given the 10M-slot table, #6198);
 `SessionSync` carries it as the trailing wire field; the peer daemon forwards it
 on `SessionSyncRequest.session_id`; and the peer helper's
 `upsert_synced_with_origin` ADOPTS it (stamping the imported `SessionEntry`)

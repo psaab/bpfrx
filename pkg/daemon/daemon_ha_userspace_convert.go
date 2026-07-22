@@ -34,6 +34,26 @@ func daemonMonotonicSeconds() uint64 {
 	return uint64(ts.Sec)
 }
 
+// userspaceSyncedSessionID composes the node-local BPF-ABI conntrack id stamped
+// onto a peer-synced session from the daemon monotonic clock and the
+// originating helper's session-table slot.
+//
+// The slot occupies the full low 32 bits and the monotonic-seconds timestamp
+// the high 32 bits. SessionDeltaInfo.Slot is a uint32 index into the
+// MAX_SESSIONS = 10,000,000 (bpf/headers/xpf_common.h) conntrack table, so a
+// live slot needs up to 24 bits. The previous `slot & 0xffff` composition kept
+// only the low 16 bits, so two distinct sessions whose slots differed solely
+// above bit 16 (e.g. 5 and 0x10005) collided on one SessionID when imported in
+// the same monotonic second (#6198). Reserving the full low 32 bits for the
+// slot removes the truncation for any uint32 slot while preserving the id's
+// rough monotonicity and node-local uniqueness. This is NOT the cross-node
+// RT_FLOW correlation id — that is carried separately in RTFlowSessionID
+// (#5212); SessionID here is a node-local identifier surfaced in
+// `show flow`/`show session` and the gRPC/REST session views.
+func userspaceSyncedSessionID(now uint64, slot uint32) uint64 {
+	return now<<32 | uint64(slot)
+}
+
 func userspaceSessionTimeout(proto uint8) uint32 {
 	switch proto {
 	case 6:
@@ -183,8 +203,10 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	now := daemonMonotonicSeconds()
 	val := dataplane.SessionValue{
 		State: 4, // SESS_STATE_ESTABLISHED
-		// SessionID is the BPF-ABI conntrack id (node-local now<<16|Slot).
-		SessionID: uint64(now)<<16 | uint64(delta.Slot&0xffff),
+		// SessionID is the node-local BPF-ABI conntrack id (now<<32|Slot; the
+		// slot fills the low 32 bits so a >16-bit slot no longer truncates and
+		// collides, #6198).
+		SessionID: userspaceSyncedSessionID(now, delta.Slot),
 		// #5212: the ORIGINATING node's stable RT_FLOW session id (distinct from
 		// SessionID above). Carried across the cluster sync wire so a peer-synced
 		// session adopts it and its SESSION_CREATE/CLOSE records correlate across
@@ -284,8 +306,10 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	now := daemonMonotonicSeconds()
 	val := dataplane.SessionValueV6{
 		State: 4, // SESS_STATE_ESTABLISHED
-		// SessionID is the BPF-ABI conntrack id (node-local now<<16|Slot).
-		SessionID: uint64(now)<<16 | uint64(delta.Slot&0xffff),
+		// SessionID is the node-local BPF-ABI conntrack id (now<<32|Slot; the
+		// slot fills the low 32 bits so a >16-bit slot no longer truncates and
+		// collides, #6198).
+		SessionID: userspaceSyncedSessionID(now, delta.Slot),
 		// #5212: the ORIGINATING node's stable RT_FLOW session id (see V4) —
 		// adopted by a peer-synced session so its RT_FLOW records correlate
 		// across HA nodes; 0 on a legacy helper => fresh local id on import.

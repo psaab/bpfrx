@@ -425,6 +425,91 @@ func TestUserspaceHAProtocolMismatchReason(t *testing.T) {
 	}
 }
 
+// TestUserspaceSyncedSessionIDNoSlotTruncation guards #6198: a peer-synced
+// session's node-local SessionID must not truncate the originating helper's
+// session-table slot to 16 bits. SessionDeltaInfo.Slot is a uint32 index into
+// the MAX_SESSIONS = 10,000,000 conntrack table, so two live slots routinely
+// differ only above bit 16. The old `now<<16 | slot&0xffff` composition
+// collapsed those onto one SessionID. Reverting to that mask makes the collide
+// assertion RED.
+func TestUserspaceSyncedSessionIDNoSlotTruncation(t *testing.T) {
+	const now = uint64(0x1234_5678) // fixed monotonic seconds — occupies high 32 bits
+	const (
+		slotLow  = uint32(5)       // 0x00005
+		slotHigh = uint32(0x10005) // differs from slotLow only above bit 16
+	)
+
+	idLow := userspaceSyncedSessionID(now, slotLow)
+	idHigh := userspaceSyncedSessionID(now, slotHigh)
+
+	if idLow == idHigh {
+		t.Fatalf("slots %#x and %#x collided on SessionID %#x — 16-bit truncation regressed",
+			slotLow, slotHigh, idLow)
+	}
+	// The full uint32 slot must survive in the low 32 bits, independent of now.
+	if got := uint32(idHigh); got != slotHigh {
+		t.Fatalf("slot not preserved in low 32 bits: got %#x want %#x (id %#x)", got, slotHigh, idHigh)
+	}
+	if got := uint32(idLow); got != slotLow {
+		t.Fatalf("slot not preserved in low 32 bits: got %#x want %#x (id %#x)", got, slotLow, idLow)
+	}
+	// A slot near the 10M capacity ceiling (needs 24 bits) must round-trip.
+	const slotNearMax = uint32(9_999_999)
+	if got := uint32(userspaceSyncedSessionID(now, slotNearMax)); got != slotNearMax {
+		t.Fatalf("near-capacity slot truncated: got %#x want %#x", got, slotNearMax)
+	}
+	// The timestamp must land above the slot so distinct seconds stay distinct.
+	if idLow>>32 != now {
+		t.Fatalf("timestamp not in high 32 bits: got %#x want %#x", idLow>>32, now)
+	}
+}
+
+// TestUserspaceSessionFromDeltaPreservesFullSlot asserts BOTH convert paths
+// (v4 + v6) route the SessionID through userspaceSyncedSessionID so a >16-bit
+// slot survives end to end. Under the fixed composition the full uint32 slot is
+// always the low 32 bits regardless of the monotonic clock; the old mask put
+// now's low bits there instead (#6198), so this is RED on revert.
+func TestUserspaceSessionFromDeltaPreservesFullSlot(t *testing.T) {
+	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
+	const slot = uint32(0x10005) // needs > 16 bits; masked to 5 by the old bug
+
+	deltaV4 := dpuserspace.SessionDeltaInfo{
+		Event:       "open",
+		AddrFamily:  dataplane.AFInet,
+		Protocol:    6,
+		Slot:        slot,
+		SrcIP:       "10.0.61.102",
+		DstIP:       "172.16.80.200",
+		SrcPort:     12345,
+		DstPort:     5201,
+		IngressZone: "lan",
+		EgressZone:  "wan",
+	}
+	if _, val, ok := userspaceSessionFromDeltaV4(deltaV4, zoneIDs); !ok {
+		t.Fatal("expected v4 delta to convert")
+	} else if got := uint32(val.SessionID); got != slot {
+		t.Fatalf("v4 SessionID low 32 bits = %#x, want full slot %#x (id %#x)", got, slot, val.SessionID)
+	}
+
+	deltaV6 := dpuserspace.SessionDeltaInfo{
+		Event:       "open",
+		AddrFamily:  dataplane.AFInet6,
+		Protocol:    6,
+		Slot:        slot,
+		SrcIP:       "2001:559:8585:bf01::102",
+		DstIP:       "2001:559:8585:80::200",
+		SrcPort:     12345,
+		DstPort:     5201,
+		IngressZone: "lan",
+		EgressZone:  "wan",
+	}
+	if _, val, ok := userspaceSessionFromDeltaV6(deltaV6, zoneIDs); !ok {
+		t.Fatal("expected v6 delta to convert")
+	} else if got := uint32(val.SessionID); got != slot {
+		t.Fatalf("v6 SessionID low 32 bits = %#x, want full slot %#x (id %#x)", got, slot, val.SessionID)
+	}
+}
+
 func TestUserspaceSessionFromDeltaV4CarriesTunnelEndpointMetadata(t *testing.T) {
 	zoneIDs := map[string]uint16{"lan": 1, "sfmix": 2}
 	delta := dpuserspace.SessionDeltaInfo{

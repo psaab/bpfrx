@@ -56390,3 +56390,19 @@ top.
   userspace-dp/src/afxdp/worker/{cos_state,mod}.rs,
   userspace-dp/src/afxdp/cos/queue_service/tests/{refund,wakeup}.rs,
   userspace-dp/src/afxdp/cos/README.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: Fix #6198 — HA synced-session SessionID slot truncation. The
+  node-local BPF-ABI conntrack id in daemon_ha_userspace_convert.go composed
+  the id as `now<<16 | slot&0xffff`, masking a uint32 session-table slot to 16
+  bits. With MAX_SESSIONS=10M (needs 24 bits), two sessions whose slots differ
+  only above bit 16 collided on one SessionID (surfaced in show flow / show
+  session / gRPC / REST). Extracted a pure SSOT helper userspaceSyncedSessionID
+  that puts the full uint32 slot in the low 32 bits and the monotonic-seconds
+  timestamp in the high 32 bits (no mask). Updated both V4 and V6 sites.
+  Added a deterministic fail-on-revert test (slot 5 vs 0x10005 must not
+  collide; slot preserved in low 32 bits; near-10M slot round-trips) plus an
+  end-to-end convert-path assertion for V4 and V6. Verified both go RED with
+  the old mask restored. Updated docs/session-sync-architecture.md.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/userspace_sync_test.go, docs/session-sync-architecture.md
