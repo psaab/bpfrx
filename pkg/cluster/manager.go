@@ -152,7 +152,25 @@ type Manager struct {
 	// immediately re-promote the old primary.
 	localTransferOutHoldUntil map[int]time.Time
 	peerTransferOutPrevious   map[int]peerGroupSnapshot
-	peerMonitors              []InterfaceMonitorInfo
+	// remoteTransferOutLeaseUntil bounds how long a peer-REQUESTED transfer-out
+	// keeps this node parked in secondary-hold without a commit. It is armed
+	// (ArmRemoteTransferOutLease) when a remote failover request demotes an RG
+	// via ManualFailover, and cleared on the matching commit
+	// (ClearRemoteTransferOutLease, reqID-bound). If the lease expires with no
+	// commit — a requester-side post-ACK abort/crash/partition that never sent
+	// (or could not send) the commit — electRG auto-restores this node so a
+	// failed coordinated failover cannot strand the cluster with both nodes
+	// secondary (#5079). Only a REMOTE transfer-out arms a lease; a local
+	// operator ManualFailover / ISSU ForceSecondary clears any stale entry so
+	// their deliberate holds are never auto-restored. Read/written under m.mu.
+	remoteTransferOutLeaseUntil map[int]time.Time
+	remoteTransferOutLeaseReqID map[int]uint64
+	// remoteTransferOutLease is how long an armed lease survives without a
+	// commit before electRG restores the owner. Sized above the requester's
+	// worst-case post-ACK commit latency; see DefaultRemoteTransferOutLease and
+	// SetRemoteTransferOutLeaseDuration.
+	remoteTransferOutLease time.Duration
+	peerMonitors           []InterfaceMonitorInfo
 
 	// lastDupNodeIDWarn rate-limits the duplicate-node-id warning (#4549 F11).
 	// A peer advertising the local node's own node-id is an invalid cluster
@@ -315,6 +333,21 @@ const DefaultPreManualFailoverRetryInterval = 500 * time.Millisecond
 const minTransferCommitGracePeriod = 10 * time.Second
 const transferCommitHeartbeatSlack = 5 * time.Second
 
+// DefaultRemoteTransferOutLease bounds how long a peer-requested transfer-out
+// keeps a demoted owner in secondary-hold without a commit before electRG
+// auto-restores it (#5079). The requester commits within its local
+// commit-ready settle window (localFailoverCommitTimeout, default 3s) plus the
+// commit round-trip, so 30s leaves ~10x headroom for a legitimate slow commit
+// while bounding a stranded-secondary outage to tens of seconds instead of
+// forever. The daemon raises this via SetRemoteTransferOutLeaseDuration when a
+// larger commit timeout is configured so the lease never fires on an in-flight
+// commit.
+const DefaultRemoteTransferOutLease = 30 * time.Second
+
+// minRemoteTransferOutLease floors SetRemoteTransferOutLeaseDuration so a
+// misconfigured tiny value cannot abort a legitimate in-flight commit.
+const minRemoteTransferOutLease = 15 * time.Second
+
 // NewManager creates a new cluster manager.
 func NewManager(nodeID, clusterID int) *Manager {
 	return &Manager{
@@ -329,6 +362,9 @@ func NewManager(nodeID, clusterID int) *Manager {
 		peerTransferCommitGraceUntil:   make(map[int]time.Time),
 		localTransferOutHoldUntil:      make(map[int]time.Time),
 		peerTransferOutPrevious:        make(map[int]peerGroupSnapshot),
+		remoteTransferOutLeaseUntil:    make(map[int]time.Time),
+		remoteTransferOutLeaseReqID:    make(map[int]uint64),
+		remoteTransferOutLease:         DefaultRemoteTransferOutLease,
 		localHAProtocolVersion:         CurrentHAProtocolVersion,
 		hbInterval:                     DefaultHeartbeatInterval,
 		hbThreshold:                    DefaultHeartbeatThreshold,

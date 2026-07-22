@@ -55990,3 +55990,25 @@ top.
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs,
   userspace-dp/src/afxdp/coordinator/README.md
+
+- **Timestamp**: 2026-07-22
+  **Action**: #5079 — owner-side transfer-out lease so a requester-side
+  post-ACK failover abort/crash cannot strand the demoted owner secondary.
+  `RequestPeerFailover` demotes the remote owner (ManualFailover, VRRP resign)
+  on the ACK, before the requester's own commit checks; `abortRequestedPeerFailover`
+  rolled back only the requester locally — no abort frame reached the owner and no
+  lease auto-restored it, so an abort/crash/fabric-loss left both nodes secondary
+  (electRG's dual-resign guard never fires against a healthy-secondary peer).
+  Fix: reqID-bound auto-restore lease armed on the owner when a REMOTE request
+  demotes an RG (ArmRemoteTransferOutLease), cleared reqID-bound on the matching
+  commit (ClearRemoteTransferOutLease); electRG restores the owner on lease expiry.
+  Receiver-only self-heal (reqID already on the wire — no new frame, no mixed-base
+  risk). reqID threaded into OnRemoteFailover*/Commit* callbacks. ManualFailover/
+  Batch/ForceSecondary clear any stale lease so operator/ISSU holds are never
+  auto-restored. Fail-on-revert test firsthand-verified RED
+  (TestRemoteTransferOutLeaseRestoresOwnerWhenNoCommitArrives + batch).
+  Full pkg/cluster + pkg/daemon suites green; go vet clean.
+  **File(s)**: pkg/cluster/failover.go, pkg/cluster/election.go,
+  pkg/cluster/manager.go, pkg/cluster/sync.go, pkg/cluster/sync_failover.go,
+  pkg/cluster/failover_lease_5079_test.go, pkg/cluster/sync_test.go,
+  pkg/cluster/README.md, pkg/daemon/daemon_ha_sync.go

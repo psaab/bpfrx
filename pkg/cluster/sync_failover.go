@@ -425,7 +425,7 @@ func (s *SessionSync) handleRemoteFailover(conn net.Conn, rgID int, reqID uint64
 		s.sendFailoverResult(conn, syncMsgFailoverAck, rgID, reqID, failoverAckFailed, "no remote failover handler")
 		return
 	}
-	if err := s.OnRemoteFailover(rgID); err != nil {
+	if err := s.OnRemoteFailover(rgID, reqID); err != nil {
 		status := failoverAckFailed
 		if errors.Is(err, ErrRemoteFailoverRejected) {
 			status = failoverAckRejected
@@ -454,7 +454,7 @@ func (s *SessionSync) handleRemoteFailoverBatch(conn net.Conn, rgIDs []int, reqI
 		s.sendFailoverBatchResult(conn, syncMsgFailoverBatchAck, rgIDs, reqID, failoverAckFailed, "no remote batch failover handler")
 		return
 	}
-	if err := s.OnRemoteFailoverBatch(rgIDs); err != nil {
+	if err := s.OnRemoteFailoverBatch(rgIDs, reqID); err != nil {
 		status := failoverAckFailed
 		if errors.Is(err, ErrRemoteFailoverRejected) {
 			status = failoverAckRejected
@@ -479,7 +479,7 @@ func (s *SessionSync) handleRemoteFailoverCommit(conn net.Conn, rgID int, reqID 
 		s.sendFailoverResult(conn, syncMsgFailoverCommitAck, rgID, reqID, failoverAckFailed, "no remote failover commit handler")
 		return
 	}
-	if err := s.OnRemoteFailoverCommit(rgID); err != nil {
+	if err := s.OnRemoteFailoverCommit(rgID, reqID); err != nil {
 		status := failoverAckFailed
 		if errors.Is(err, ErrRemoteFailoverRejected) {
 			status = failoverAckRejected
@@ -494,7 +494,7 @@ func (s *SessionSync) handleRemoteFailoverCommitBatch(conn net.Conn, rgIDs []int
 		s.sendFailoverBatchResult(conn, syncMsgFailoverBatchCommitAck, rgIDs, reqID, failoverAckFailed, "no remote batch failover commit handler")
 		return
 	}
-	if err := s.OnRemoteFailoverCommitBatch(rgIDs); err != nil {
+	if err := s.OnRemoteFailoverCommitBatch(rgIDs, reqID); err != nil {
 		status := failoverAckFailed
 		if errors.Is(err, ErrRemoteFailoverRejected) {
 			status = failoverAckRejected

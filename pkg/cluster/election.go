@@ -65,34 +65,46 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 	// transfer-out or weight=0 state and immediately re-elects itself as
 	// primary, defeating the handoff.
 	if rg.ManualFailover {
-		peerResigned := peerGroup != nil && peerGroup.Weight <= 0
-		peerTransferOut := peerGroup != nil && peerGroup.State == StateSecondaryHold
-		if !peerResigned && !peerTransferOut {
-			return electNoChange, ""
+		// Owner-side transfer-out lease (#5079). A peer-requested transfer-out
+		// demoted us BEFORE the requester ran its own post-ACK commit checks. If
+		// the requester aborted after the ACK — or crashed / lost the fabric — it
+		// sent no commit AND no abort, and it may have rolled back to a HEALTHY
+		// secondary, a state the dual-resign guard below never rescues (that guard
+		// needs the peer resigned or itself in secondary-hold). Once the lease
+		// expires with no commit, restore ourselves so a failed coordinated
+		// failover cannot leave both nodes secondary. A committed transfer clears
+		// the lease first (reqID-bound), so this never fires on a real handoff.
+		if until, leased := m.remoteTransferOutLeaseUntil[rg.GroupID]; leased && !time.Now().Before(until) {
+			slog.Warn("cluster: remote transfer-out lease expired without commit, restoring",
+				"rg", rg.GroupID, "req_id", m.remoteTransferOutLeaseReqID[rg.GroupID])
+			m.clearRemoteTransferOutLeaseLocked(rg.GroupID)
+			rg.ManualFailover = false
+			rg.ManualFailoverAt = time.Time{}
+			m.manualFailoverRestoreWeightLocked(rg)
+			clearedManualFailover = true
+			// Fall through to normal priority/tie-break election below.
+		} else {
+			peerResigned := peerGroup != nil && peerGroup.Weight <= 0
+			peerTransferOut := peerGroup != nil && peerGroup.State == StateSecondaryHold
+			if !peerResigned && !peerTransferOut {
+				return electNoChange, ""
+			}
+			if time.Since(rg.ManualFailoverAt) < 2*time.Second {
+				return electNoChange, ""
+			}
+			// The peer has also yielded for >2s. Clear manual failover and
+			// restore weight so normal election can promote one node.
+			slog.Info("cluster: clearing manual failover (peer also yielded)",
+				"rg", rg.GroupID,
+				"peer_state", peerGroup.State.String(),
+				"peer_weight", peerGroup.Weight)
+			rg.ManualFailover = false
+			rg.ManualFailoverAt = time.Time{}
+			// Recalculate weight (recalcWeight calls runElection which would
+			// recurse back to electRG).
+			m.manualFailoverRestoreWeightLocked(rg)
+			clearedManualFailover = true
 		}
-		if time.Since(rg.ManualFailoverAt) < 2*time.Second {
-			return electNoChange, ""
-		}
-		// The peer has also yielded for >2s. Clear manual failover and
-		// restore weight so normal election can promote one node.
-		slog.Info("cluster: clearing manual failover (peer also yielded)",
-			"rg", rg.GroupID,
-			"peer_state", peerGroup.State.String(),
-			"peer_weight", peerGroup.Weight)
-		rg.ManualFailover = false
-		rg.ManualFailoverAt = time.Time{}
-		// Recalculate weight inline (recalcWeight calls runElection
-		// which would recurse back to electRG).
-		totalLost := 0
-		for _, iface := range rg.MonitorFails {
-			key := monitorKey{rgID: rg.GroupID, iface: iface}
-			totalLost += m.monitorWeights[key]
-		}
-		rg.Weight = 255 - totalLost
-		if rg.Weight < 0 {
-			rg.Weight = 0
-		}
-		clearedManualFailover = true
 	}
 
 	localWeight := rg.Weight
