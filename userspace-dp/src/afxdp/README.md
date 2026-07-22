@@ -883,6 +883,38 @@ sync.
 - `types/` — shared structs: `BindingPlan`, `BindingStatus`,
   `WorkerRuntimeAtomics`, `SharedCoSQueueLease`, `BatchCounters`, …
 
+## Manager-neighbor replace generation envelope (#5864 → #6034)
+
+The Go control plane pushes an authoritative manager-neighbor table to the
+helper over the `update_neighbors` control message (handler
+`server/handlers/neighbors.rs`, applied by
+`Coordinator::apply_manager_neighbors`). This is the "Go-snapshot" neighbor
+write path (the fourth MAC→IP write path — the in-process monitor, the
+data-path learn, and the on-demand resolver are the others).
+
+- **#5864 clear-on-empty:** an authoritative `neighbor_replace = true` with an
+  empty publishable set must CLEAR the table. The Go side dropped `omitempty`
+  on `Neighbors`, and the handler applies a clear on absent/`null`/`[]` under
+  replace instead of early-returning.
+- **#6034 replace-generation envelope + ACK/retry:** each authoritative replace
+  carries a monotonically increasing `neighbor_generation`
+  (`Manager.neighborReplaceGen`, Go). `apply_manager_neighbors(replace,
+  generation, ..)` REJECTS a replace whose `generation <= last applied`
+  (`NeighborManager::applied_manager_generation`) — a stale / reordered
+  delivery must not clobber a newer table — and returns `false` without
+  touching the table. This is defense-in-depth: the single synchronous control
+  socket does not itself reorder. The applied generation is ACK'd back in
+  `ProcessStatus.manager_neighbor_generation` (distinct from
+  `neighbor_generation`, the dynamic ARP/NDP resolver epoch); the Go send path
+  advances its cached neighbor view only when the ACK confirms the replace
+  landed (`>=` the sent generation), otherwise it RETAINS retry debt and the
+  next event-driven / 60s-safety regeneration re-diffs and retries with a
+  strictly higher generation. **Backward-compatible:** a `generation == 0`
+  (unversioned / pre-#6034) push bypasses the fence and never advances it, and
+  an older helper that omits the ACK field decodes 0 on the Go side → "no ACK
+  support, assume applied" (pre-#6034 behavior). The retry piggybacks the
+  existing regeneration cadence — it adds NO new control-socket caller.
+
 ## Worker command-queue poison policy (#1790 → #1807)
 
 Coordinator↔worker commands flow through per-worker

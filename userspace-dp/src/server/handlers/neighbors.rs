@@ -8,6 +8,7 @@ use crate::{afxdp, NeighborSnapshot};
 pub(super) fn update(
     guard: &mut ServerState,
     neighbors: Option<&Vec<NeighborSnapshot>>,
+    generation: u64,
     replace: bool,
 ) {
     // #5864: an authoritative replace with zero entries must CLEAR the
@@ -38,6 +39,20 @@ pub(super) fn update(
         }
         resolved.push((neigh.ifindex, ip, afxdp::NeighborEntry { mac }));
     }
-    guard.afxdp.apply_manager_neighbors(replace, &resolved);
+    // #6034: carry the replace-generation envelope. `apply_manager_neighbors`
+    // fences a stale / reordered replace (generation <= last applied) and
+    // returns false without touching the table; `refresh_status` still runs so
+    // the ACK (ProcessStatus.manager_neighbor_generation) reflects the current
+    // applied generation and the Go manager can retain retry debt.
+    let applied = guard
+        .afxdp
+        .apply_manager_neighbors(replace, generation, &resolved);
+    if !applied {
+        eprintln!(
+            "update_neighbors: fenced stale replace generation {} (last applied {})",
+            generation,
+            guard.afxdp.last_applied_manager_neighbor_generation()
+        );
+    }
     refresh_status(guard);
 }

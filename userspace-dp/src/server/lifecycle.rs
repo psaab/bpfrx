@@ -213,6 +213,7 @@ pub(crate) fn run() -> Result<(), String> {
             flow_cache_capacity: 0,
             neighbor_cache_capacity: 0,
             neighbor_generation: 0,
+            manager_neighbor_generation: 0,
             route_entries: 0,
             worker_heartbeats: Vec::new(),
             worker_runtime: Vec::new(),

@@ -165,6 +165,11 @@ func (m *Manager) statusLoop(ctx context.Context) {
 			prevActiveSig := activeHAGroupSignature(m.haGroups)
 			var status ProcessStatus
 			if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
+				// #6034: the helper's replace-generation fence can outlive this
+				// Manager (for example across a future reconnect/ISSU). Resume from
+				// its applied generation before any reconciliation on this tick can
+				// publish another neighbor replace. m.mu is held for the whole poll.
+				m.seedNeighborReplaceGenerationLocked(status.ManagerNeighborGeneration)
 				if err := m.applyHelperStatusLocked(&status); err != nil {
 					slog.Warn("userspace dataplane status sync failed", "err", err)
 				} else {

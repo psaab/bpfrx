@@ -435,11 +435,35 @@ impl Coordinator {
         &self.forwarding.zone_name_to_id
     }
 
+    /// Apply an authoritative manager-neighbor push from the Go control
+    /// plane. Returns `true` if the push was applied, `false` if it was
+    /// FENCED as a stale / reordered replace (#6034).
+    ///
+    /// `generation` is the monotonically increasing replace generation the
+    /// Go manager stamps on each `update_neighbors` message. When non-zero,
+    /// a replace whose generation is <= the last applied one is rejected
+    /// WITHOUT touching the table — this guards against an out-of-order or
+    /// duplicated delivery clobbering a newer table (defense-in-depth; the
+    /// synchronous single control socket does not itself reorder). A
+    /// generation of 0 means an unversioned (pre-#6034) sender and is always
+    /// applied without advancing the fence, for backward compatibility.
     pub fn apply_manager_neighbors(
         &mut self,
         replace: bool,
+        generation: u64,
         neighbors: &[(i32, IpAddr, NeighborEntry)],
-    ) {
+    ) -> bool {
+        // #6034: replace-generation fence. Reject a stale / reordered
+        // authoritative replace before mutating any neighbor state.
+        if generation != 0
+            && generation
+                <= self
+                    .neighbors
+                    .applied_manager_generation
+                    .load(Ordering::Acquire)
+        {
+            return false;
+        }
         let old_manager_keys = if replace {
             self.neighbors
                 .manager_keys
@@ -487,6 +511,14 @@ impl Coordinator {
             self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
         }
         self.neighbors.generation.fetch_add(1, Ordering::Relaxed);
+        // #6034: advance the applied replace generation so a later stale /
+        // reordered replace is fenced. Only versioned pushes move it.
+        if generation != 0 {
+            self.neighbors
+                .applied_manager_generation
+                .store(generation, Ordering::Release);
+        }
+        true
     }
 
     pub(crate) fn stop_inner(&mut self, clear_synced_state: bool) {

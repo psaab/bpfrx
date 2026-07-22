@@ -790,8 +790,9 @@ fn timer_wheel_wakes_short_parked_queue() {
 }
 
 // #1782 Step-1 (i): the advance return value is the per-call tick
-// catch-up instrument — `now_tick - current_tick` at entry, the exact
-// iteration count of the O(lag) loop.
+// catch-up instrument — `now_tick - current_tick` at entry. It remains
+// the true elapsed lag even when an over-horizon advance skips the
+// per-tick loop.
 #[test]
 fn advance_cos_timer_wheel_returns_ticks_advanced() {
     let mut root = test_cos_interface_runtime(0);
@@ -824,7 +825,7 @@ fn advance_cos_timer_wheel_returns_ticks_advanced() {
 // #1782 Step-2 (i) test 1: lag exactly EQUAL to the wheel horizon
 // with a parked queue takes the existing per-tick loop and wakes the
 // due park exactly as before. NOTE (Codex r1 Low): because this test
-// parks a queue, it exercises the parked-refusal path, NOT the `>`
+// parks a queue, it exercises the strict >-horizon fast-forward boundary, NOT the `>`
 // vs `>=` gate boundary — with no parked queue, snap and loop are
 // state-indistinguishable at exactly-horizon lag (both empty every
 // slot and land on the same tick; AGY r1 confirmed `>=` would also
@@ -915,17 +916,10 @@ fn timer_wheel_over_horizon_snap_clears_stale_entries_and_reports_true_lag() {
     assert_eq!(root.runnable_queues, 1);
 }
 
-// #1782 Step-2 (i) test 3: a parked queue + over-horizon lag refuses
-// the snap and falls back to the existing O(lag) loop, which wakes
-// the due park correctly. This state is LEGITIMATE in production
-// (Codex PR #1854 r1): park wake ticks are uncapped `deficit/rate`
-// refill times, so pathologically low configured rates (the schema
-// accepts 1 B/s) can park a queue far beyond the wheel horizon while
-// the worker idles — the accepted residual documented at
-// `snap_cos_timer_wheel_over_horizon`. This test pins that the
-// fallback stays correct when it arises.
+// #5803: a parked queue that became due during an over-horizon idle
+// gap must wake as part of the snap, without per-tick replay.
 #[test]
-fn timer_wheel_over_horizon_parked_queue_falls_back_to_per_tick_loop() {
+fn timer_wheel_over_horizon_snap_wakes_due_parked_queue() {
     let mut root = test_cos_interface_runtime(0);
     root.queues[0].hot.items.push_back(test_cos_item(1500));
     root.queues[0].hot.queued_bytes = 1500;
@@ -935,18 +929,78 @@ fn timer_wheel_over_horizon_parked_queue_falls_back_to_per_tick_loop() {
     park_cos_queue(&mut root, 0, 5);
 
     let lag_ticks = COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS + 1_000;
-    assert_eq!(
-        advance_cos_timer_wheel(&mut root, lag_ticks * COS_TIMER_WHEEL_TICK_NS),
-        lag_ticks,
-        "fallback path tick accounting unchanged"
-    );
+    let (ticks_advanced, iterations) =
+        advance_cos_timer_wheel_counting_iterations(&mut root, lag_ticks * COS_TIMER_WHEEL_TICK_NS);
+    assert_eq!(ticks_advanced, lag_ticks);
+    assert_eq!(iterations, 0, "over-horizon advance must snap");
     assert_eq!(root.timer_wheel.current_tick, lag_ticks);
-    // The due park was woken by the loop, not dropped by a snap.
+    // The due park was woken by the snap, not dropped during rebuild.
     assert!(!root.queues[0].hot.parked);
     assert!(root.queues[0].hot.runnable);
     assert_eq!(root.runnable_queues, 1);
     assert!(root.timer_wheel.level0.iter().all(|slot| slot.is_empty()));
     assert!(root.timer_wheel.level1.iter().all(|slot| slot.is_empty()));
+}
+
+// #5803 fail-on-revert: a 1 B/s queue can park tens of millions of
+// 50 us ticks ahead. If its worker idles with that queue parked, an
+// over-horizon advance must remain bounded and must re-derive the
+// future wake slot against the snapped tick. Restoring the old
+// parked-queue refusal makes `iterations == elapsed_ticks` and turns
+// the bounded-work assertion red.
+#[test]
+fn timer_wheel_advance_parked_far_future_queue_is_bounded_and_wakes_on_time() {
+    let mut root = test_cos_interface_runtime(0);
+    root.queues[0].hot.items.push_back(test_cos_item(1500));
+    root.queues[0].hot.queued_bytes = 1500;
+    root.queues[0].hot.runnable = true;
+    root.nonempty_queues = 1;
+    root.runnable_queues = 1;
+
+    let wake_tick = 30_000_000u64;
+    park_cos_queue(&mut root, 0, wake_tick);
+    let elapsed_ticks = 2_226_212u64;
+    assert!(elapsed_ticks > COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS);
+    assert!(wake_tick > elapsed_ticks + COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS);
+
+    let (ticks_advanced, iterations) = advance_cos_timer_wheel_counting_iterations(
+        &mut root,
+        elapsed_ticks * COS_TIMER_WHEEL_TICK_NS,
+    );
+    assert_eq!(ticks_advanced, elapsed_ticks);
+    assert!(
+        iterations < elapsed_ticks / 1_000,
+        "catch-up work must be bounded: {iterations} iterations for {elapsed_ticks} elapsed ticks"
+    );
+    assert!(root.queues[0].hot.parked);
+    assert!(!root.queues[0].hot.runnable);
+    assert_eq!(root.queues[0].hot.next_wakeup_tick, wake_tick);
+    let (level, slot) = cos_timer_wheel_level_and_slot(elapsed_ticks, wake_tick);
+    assert_eq!(root.queues[0].hot.wheel_level, level);
+    assert_eq!(root.queues[0].hot.wheel_slot, slot);
+    assert_eq!(root.timer_wheel.level1[slot], vec![0]);
+
+    let (_, iterations) = advance_cos_timer_wheel_counting_iterations(
+        &mut root,
+        (wake_tick - 1) * COS_TIMER_WHEEL_TICK_NS,
+    );
+    assert_eq!(iterations, 0, "second over-horizon advance must also snap");
+    assert!(root.queues[0].hot.parked, "queue must not wake early");
+    assert_eq!(root.queues[0].hot.wheel_level, 0);
+    assert_eq!(
+        root.queues[0].hot.wheel_slot,
+        (wake_tick % COS_TIMER_WHEEL_L0_SLOTS as u64) as usize
+    );
+
+    let (_, iterations) =
+        advance_cos_timer_wheel_counting_iterations(&mut root, wake_tick * COS_TIMER_WHEEL_TICK_NS);
+    assert_eq!(iterations, 1);
+    assert!(
+        !root.queues[0].hot.parked,
+        "queue must wake at its due tick"
+    );
+    assert!(root.queues[0].hot.runnable);
+    assert_eq!(root.runnable_queues, 1);
 }
 
 #[test]

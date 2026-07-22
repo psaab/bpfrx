@@ -511,6 +511,7 @@ fn manager_neighbor_replace_preserves_packet_learned_entries() {
 
     coordinator.apply_manager_neighbors(
         true,
+        0,
         &[(
             13,
             IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
@@ -560,6 +561,7 @@ fn manager_neighbor_replace_overrides_snapshot_neighbor_entry() {
 
     coordinator.apply_manager_neighbors(
         true,
+        0,
         &[(
             13,
             target,
@@ -597,7 +599,7 @@ fn manager_neighbor_replace_removes_snapshot_seeded_neighbor_entry() {
         })
         .expect("refresh_runtime_snapshot must succeed");
 
-    coordinator.apply_manager_neighbors(true, &[]);
+    coordinator.apply_manager_neighbors(true, 0, &[]);
 
     assert!(
         lookup_neighbor_entry(
@@ -616,6 +618,7 @@ fn refresh_runtime_snapshot_clears_old_manager_neighbor_cache_entries() {
     let target = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
     coordinator.apply_manager_neighbors(
         true,
+        0,
         &[(
             13,
             target,
@@ -646,6 +649,95 @@ fn refresh_runtime_snapshot_clears_old_manager_neighbor_cache_entries() {
         )
         .is_none()
     );
+}
+
+// #6034 fail-on-revert guard: the replace-generation fence must REJECT a stale
+// or reordered authoritative replace (generation <= last applied) without
+// clobbering the newer table, ACCEPT a strictly higher generation, and expose
+// the applied generation for the manager ACK. Reverting the fence in
+// apply_manager_neighbors lets the stale replace overwrite the table and fails
+// the "must not clobber" assertions.
+#[test]
+fn manager_neighbor_replace_generation_fences_stale_and_reordered() {
+    let mut coordinator = Coordinator::new();
+    let target = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+    let mac_a = NeighborEntry {
+        mac: [0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa],
+    };
+    let mac_b = NeighborEntry {
+        mac: [0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb],
+    };
+
+    let lookup_mac = |coordinator: &Coordinator| {
+        lookup_neighbor_entry(
+            &coordinator.forwarding,
+            Some(coordinator.dynamic_neighbors_ref()),
+            13,
+            target,
+        )
+        .expect("manager neighbor entry present")
+        .mac
+    };
+
+    // Generation 5 applies and advances the ACK.
+    assert!(coordinator.apply_manager_neighbors(true, 5, &[(13, target, mac_a)]));
+    assert_eq!(coordinator.last_applied_manager_neighbor_generation(), 5);
+    assert_eq!(lookup_mac(&coordinator), mac_a.mac);
+
+    // A reordered / stale replace at generation 4 is REJECTED; table unchanged.
+    assert!(!coordinator.apply_manager_neighbors(true, 4, &[(13, target, mac_b)]));
+    assert_eq!(coordinator.last_applied_manager_neighbor_generation(), 5);
+    assert_eq!(
+        lookup_mac(&coordinator),
+        mac_a.mac,
+        "a stale replace must not clobber the newer table"
+    );
+
+    // A duplicate at the SAME generation 5 is also rejected (fence is `<=`).
+    assert!(!coordinator.apply_manager_neighbors(true, 5, &[(13, target, mac_b)]));
+    assert_eq!(lookup_mac(&coordinator), mac_a.mac);
+
+    // A strictly higher generation 6 applies and advances the ACK.
+    assert!(coordinator.apply_manager_neighbors(true, 6, &[(13, target, mac_b)]));
+    assert_eq!(coordinator.last_applied_manager_neighbor_generation(), 6);
+    assert_eq!(lookup_mac(&coordinator), mac_b.mac);
+}
+
+// #6034: a generation-0 (unversioned / pre-#6034) push bypasses the fence and
+// is always applied, and it does NOT disturb the applied-generation ACK — so a
+// mixed-version older manager keeps working unchanged.
+#[test]
+fn manager_neighbor_unversioned_generation_bypasses_fence() {
+    let mut coordinator = Coordinator::new();
+    let target = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+    let mac_a = NeighborEntry {
+        mac: [0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa],
+    };
+    let mac_b = NeighborEntry {
+        mac: [0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb],
+    };
+    let lookup_mac = |coordinator: &Coordinator| {
+        lookup_neighbor_entry(
+            &coordinator.forwarding,
+            Some(coordinator.dynamic_neighbors_ref()),
+            13,
+            target,
+        )
+        .expect("manager neighbor entry present")
+        .mac
+    };
+
+    assert!(coordinator.apply_manager_neighbors(true, 9, &[(13, target, mac_a)]));
+    assert_eq!(coordinator.last_applied_manager_neighbor_generation(), 9);
+
+    // Unversioned push (generation 0) applies regardless and leaves the fence.
+    assert!(coordinator.apply_manager_neighbors(true, 0, &[(13, target, mac_b)]));
+    assert_eq!(
+        coordinator.last_applied_manager_neighbor_generation(),
+        9,
+        "an unversioned push must not advance the applied-generation ACK"
+    );
+    assert_eq!(lookup_mac(&coordinator), mac_b.mac);
 }
 
 #[test]
