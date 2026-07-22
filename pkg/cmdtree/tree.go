@@ -136,6 +136,19 @@ type Candidate struct {
 // daemon's own validators and route builder already tolerate. cmdtree is the
 // completion SSOT for the local CLI, remote CLI, and gRPC, so a read-only
 // completion request must never panic on that shape (#4866).
+// sourceNATPoolNames returns the configured source-NAT pool names for
+// completion (session pool filter, deterministic-NAT lookup pool filter).
+func sourceNATPoolNames(cfg *config.Config) []string {
+	if cfg == nil || cfg.Security.NAT.SourcePools == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Security.NAT.SourcePools))
+	for name := range cfg.Security.NAT.SourcePools {
+		names = append(names, name)
+	}
+	return names
+}
+
 func routingInstanceNames(cfg *config.Config) []string {
 	if cfg == nil {
 		return nil
@@ -452,17 +465,8 @@ var OperationalTree = map[string]*Node{
 						}
 						return names
 					}},
-					"nat-only": {Desc: "Show only sessions with NAT translation"},
-					"source-nat-pool": {Desc: "Filter sessions by source NAT pool", DynamicFn: func(cfg *config.Config) []string {
-						if cfg == nil || cfg.Security.NAT.SourcePools == nil {
-							return nil
-						}
-						names := make([]string, 0, len(cfg.Security.NAT.SourcePools))
-						for name := range cfg.Security.NAT.SourcePools {
-							names = append(names, name)
-						}
-						return names
-					}},
+					"nat-only":        {Desc: "Show only sessions with NAT translation"},
+					"source-nat-pool": {Desc: "Filter sessions by source NAT pool", DynamicFn: sourceNATPoolNames},
 					"sort-by": {Desc: "Sort sessions for top-talkers", Children: map[string]*Node{
 						"bytes":   {Desc: "Sort by total bytes (descending)"},
 						"packets": {Desc: "Sort by total packets (descending)"},
@@ -482,8 +486,21 @@ var OperationalTree = map[string]*Node{
 						"detail": {Desc: "Show detailed source NAT rules"},
 					}},
 					"rule-set": {Desc: "Show source NAT rule sets"},
-					"deterministic-nat": {Desc: "Show deterministic NAT information", Children: map[string]*Node{
-						"nat-table": {Desc: "Show deterministic NAT mapping table"},
+					"deterministic-nat": {Desc: "Resolve deterministic CGNAT/NAPT64 mappings (applied generation)", Children: map[string]*Node{
+						"internal-host": {Desc: "Forward: map an internal subscriber to its translated IP + port block", Children: map[string]*Node{
+							"<address>": {Desc: "Internal subscriber IP (IPv4 mode 1, or IPv6 mode 2 NAPT64)", Children: map[string]*Node{
+								"pool": {Desc: "Restrict lookup to a source NAT pool", DynamicFn: sourceNATPoolNames},
+							}},
+						}},
+						"nat-ip": {Desc: "Reverse: map a translated IP + port back to the internal subscriber", Children: map[string]*Node{
+							"<address>": {Desc: "Translated external IPv4 address", Children: map[string]*Node{
+								"nat-port": {Desc: "Translated port", Children: map[string]*Node{
+									"<port>": {Desc: "Translated port number (1-65535)", Children: map[string]*Node{
+										"pool": {Desc: "Restrict lookup to a source NAT pool", DynamicFn: sourceNATPoolNames},
+									}},
+								}},
+							}},
+						}},
 					}},
 				}},
 				"destination": {Desc: "Show destination NAT", Children: map[string]*Node{

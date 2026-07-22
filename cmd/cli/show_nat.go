@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/nat"
 )
 
 func (c *ctl) handleShowNAT(args []string) error {
@@ -40,6 +43,9 @@ func (c *ctl) handleShowNAT(args []string) error {
 		}
 		if len(args) >= 2 && args[1] == "rule-set" {
 			return c.showNATRuleStats("")
+		}
+		if len(args) >= 2 && args[1] == "deterministic-nat" {
+			return c.showNATDeterministic(args[2:])
 		}
 		resp, err := c.client.GetNATSource(c.ctx(), &pb.GetNATSourceRequest{})
 		if err != nil {
@@ -92,6 +98,97 @@ func (c *ctl) handleShowNAT(args []string) error {
 		return c.showText("nat64")
 	default:
 		return fmt.Errorf("unknown show security nat target: %s", args[0])
+	}
+}
+
+// showNATDeterministic resolves a deterministic source-NAT mapping via the
+// GetNATDeterministic RPC (#5794). args are the tokens AFTER
+// "deterministic-nat":
+//
+//	internal-host <ip> [pool <name>]           (forward)
+//	nat-ip <ip> nat-port <port> [pool <name>]  (reverse)
+func (c *ctl) showNATDeterministic(args []string) error {
+	usage := "usage: show security nat source deterministic-nat (internal-host <ip> | nat-ip <ip> nat-port <port>) [pool <name>]"
+	if len(args) == 0 {
+		return fmt.Errorf("%s", usage)
+	}
+	req := &pb.GetNATDeterministicRequest{}
+	reverse := false
+	switch args[0] {
+	case "internal-host":
+		if len(args) < 2 {
+			return fmt.Errorf("%s", usage)
+		}
+		req.Direction = pb.NATDeterministicDirection_NAT_DETERMINISTIC_DIRECTION_FORWARD
+		req.InternalHost = args[1]
+		req.Pool = natPoolArg(args[2:])
+	case "nat-ip":
+		if len(args) < 4 || args[2] != "nat-port" {
+			return fmt.Errorf("%s", usage)
+		}
+		port, err := strconv.Atoi(args[3])
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("nat-port must be 1-65535")
+		}
+		reverse = true
+		req.Direction = pb.NATDeterministicDirection_NAT_DETERMINISTIC_DIRECTION_REVERSE
+		req.NatIp = args[1]
+		req.NatPort = uint32(port)
+		req.Pool = natPoolArg(args[4:])
+	default:
+		return fmt.Errorf("unknown deterministic-nat query %q (want internal-host or nat-ip)", args[0])
+	}
+
+	resp, err := c.client.GetNATDeterministic(c.ctx(), req)
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	if !resp.Found {
+		fmt.Printf("No deterministic mapping (%s): %s\n", resp.ErrorCode, resp.ErrorDetail)
+		return nil
+	}
+	if reverse {
+		reverseResultFromPB(resp).Render(os.Stdout)
+	} else {
+		forwardResultFromPB(resp).Render(os.Stdout)
+	}
+	return nil
+}
+
+// natPoolArg extracts an optional trailing `pool <name>` filter.
+func natPoolArg(rest []string) string {
+	if len(rest) >= 2 && rest[0] == "pool" {
+		return rest[1]
+	}
+	return ""
+}
+
+func forwardResultFromPB(resp *pb.GetNATDeterministicResponse) *nat.ForwardResult {
+	return &nat.ForwardResult{
+		Pool:              resp.Pool,
+		Mode:              nat.Mode(resp.Mode),
+		InternalHost:      resp.InternalHost,
+		ExternalIP:        resp.ExternalIp,
+		PortLow:           uint16(resp.PortLow),
+		PortHigh:          uint16(resp.PortHigh),
+		BlockSize:         uint16(resp.BlockSize),
+		BlockIndex:        resp.BlockIndex,
+		AppliedGeneration: resp.AppliedGeneration,
+	}
+}
+
+func reverseResultFromPB(resp *pb.GetNATDeterministicResponse) *nat.ReverseResult {
+	return &nat.ReverseResult{
+		Pool:              resp.Pool,
+		Mode:              nat.Mode(resp.Mode),
+		ExternalIP:        resp.ExternalIp,
+		NATPort:           uint16(resp.NatPort),
+		InternalHost:      resp.InternalHost,
+		PortLow:           uint16(resp.PortLow),
+		PortHigh:          uint16(resp.PortHigh),
+		BlockSize:         uint16(resp.BlockSize),
+		BlockIndex:        resp.BlockIndex,
+		AppliedGeneration: resp.AppliedGeneration,
 	}
 }
 

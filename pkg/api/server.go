@@ -472,6 +472,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("GET /api/v1/security/sessions/summary", s.sessionSummaryHandler)
 	mux.HandleFunc("GET /api/v1/security/nat/source", s.natSourceHandler)
 	mux.HandleFunc("GET /api/v1/security/nat/destination", s.natDestHandler)
+	mux.HandleFunc("GET /api/v1/security/nat/deterministic", s.natDeterministicHandler)
 	mux.HandleFunc("GET /api/v1/security/screen", s.screenHandler)
 	mux.HandleFunc("GET /api/v1/security/events", s.eventsHandler)
 	mux.HandleFunc("GET /api/v1/interfaces", s.interfacesHandler)

@@ -259,6 +259,57 @@ func (HostInboundAdmissionStatus) EnumDescriptor() ([]byte, []int) {
 	return file_xpf_proto_rawDescGZIP(), []int{3}
 }
 
+type NATDeterministicDirection int32
+
+const (
+	NATDeterministicDirection_NAT_DETERMINISTIC_DIRECTION_UNSPECIFIED NATDeterministicDirection = 0
+	// FORWARD: internal_host -> external IPv4 + assigned port block.
+	NATDeterministicDirection_NAT_DETERMINISTIC_DIRECTION_FORWARD NATDeterministicDirection = 1
+	// REVERSE: (nat_ip, nat_port) -> internal subscriber.
+	NATDeterministicDirection_NAT_DETERMINISTIC_DIRECTION_REVERSE NATDeterministicDirection = 2
+)
+
+// Enum value maps for NATDeterministicDirection.
+var (
+	NATDeterministicDirection_name = map[int32]string{
+		0: "NAT_DETERMINISTIC_DIRECTION_UNSPECIFIED",
+		1: "NAT_DETERMINISTIC_DIRECTION_FORWARD",
+		2: "NAT_DETERMINISTIC_DIRECTION_REVERSE",
+	}
+	NATDeterministicDirection_value = map[string]int32{
+		"NAT_DETERMINISTIC_DIRECTION_UNSPECIFIED": 0,
+		"NAT_DETERMINISTIC_DIRECTION_FORWARD":     1,
+		"NAT_DETERMINISTIC_DIRECTION_REVERSE":     2,
+	}
+)
+
+func (x NATDeterministicDirection) Enum() *NATDeterministicDirection {
+	p := new(NATDeterministicDirection)
+	*p = x
+	return p
+}
+
+func (x NATDeterministicDirection) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (NATDeterministicDirection) Descriptor() protoreflect.EnumDescriptor {
+	return file_xpf_proto_enumTypes[4].Descriptor()
+}
+
+func (NATDeterministicDirection) Type() protoreflect.EnumType {
+	return &file_xpf_proto_enumTypes[4]
+}
+
+func (x NATDeterministicDirection) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use NATDeterministicDirection.Descriptor instead.
+func (NATDeterministicDirection) EnumDescriptor() ([]byte, []int) {
+	return file_xpf_proto_rawDescGZIP(), []int{4}
+}
+
 // PeerFetchStatus classifies whether a summary response's cluster-peer leg was
 // successfully included, so a machine consumer can distinguish a genuine
 // standalone / no-peer-requested view (NOT_APPLICABLE) from a cluster peer that
@@ -303,11 +354,11 @@ func (x PeerFetchStatus) String() string {
 }
 
 func (PeerFetchStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_xpf_proto_enumTypes[4].Descriptor()
+	return file_xpf_proto_enumTypes[5].Descriptor()
 }
 
 func (PeerFetchStatus) Type() protoreflect.EnumType {
-	return &file_xpf_proto_enumTypes[4]
+	return &file_xpf_proto_enumTypes[5]
 }
 
 func (x PeerFetchStatus) Number() protoreflect.EnumNumber {
@@ -316,7 +367,7 @@ func (x PeerFetchStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PeerFetchStatus.Descriptor instead.
 func (PeerFetchStatus) EnumDescriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{4}
+	return file_xpf_proto_rawDescGZIP(), []int{5}
 }
 
 type EnterConfigureRequest struct {
@@ -7369,6 +7420,225 @@ func (x *NATRuleStats) GetHitBytes() uint64 {
 	return 0
 }
 
+type GetNATDeterministicRequest struct {
+	state         protoimpl.MessageState    `protogen:"open.v1"`
+	Direction     NATDeterministicDirection `protobuf:"varint,1,opt,name=direction,proto3,enum=xpf.v1.NATDeterministicDirection" json:"direction,omitempty"`
+	Pool          string                    `protobuf:"bytes,2,opt,name=pool,proto3" json:"pool,omitempty"`                                     // optional source NAT pool filter
+	InternalHost  string                    `protobuf:"bytes,3,opt,name=internal_host,json=internalHost,proto3" json:"internal_host,omitempty"` // FORWARD: subscriber IP (IPv4 mode 1 / IPv6 mode 2)
+	NatIp         string                    `protobuf:"bytes,4,opt,name=nat_ip,json=natIp,proto3" json:"nat_ip,omitempty"`                      // REVERSE: translated external IPv4
+	NatPort       uint32                    `protobuf:"varint,5,opt,name=nat_port,json=natPort,proto3" json:"nat_port,omitempty"`               // REVERSE: translated port (1-65535)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetNATDeterministicRequest) Reset() {
+	*x = GetNATDeterministicRequest{}
+	mi := &file_xpf_proto_msgTypes[108]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetNATDeterministicRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetNATDeterministicRequest) ProtoMessage() {}
+
+func (x *GetNATDeterministicRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_xpf_proto_msgTypes[108]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetNATDeterministicRequest.ProtoReflect.Descriptor instead.
+func (*GetNATDeterministicRequest) Descriptor() ([]byte, []int) {
+	return file_xpf_proto_rawDescGZIP(), []int{108}
+}
+
+func (x *GetNATDeterministicRequest) GetDirection() NATDeterministicDirection {
+	if x != nil {
+		return x.Direction
+	}
+	return NATDeterministicDirection_NAT_DETERMINISTIC_DIRECTION_UNSPECIFIED
+}
+
+func (x *GetNATDeterministicRequest) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
+}
+
+func (x *GetNATDeterministicRequest) GetInternalHost() string {
+	if x != nil {
+		return x.InternalHost
+	}
+	return ""
+}
+
+func (x *GetNATDeterministicRequest) GetNatIp() string {
+	if x != nil {
+		return x.NatIp
+	}
+	return ""
+}
+
+func (x *GetNATDeterministicRequest) GetNatPort() uint32 {
+	if x != nil {
+		return x.NatPort
+	}
+	return 0
+}
+
+type GetNATDeterministicResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Found bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
+	// error_code is a stable machine-readable token when found=false
+	// (no-applied-view, unknown-pool, not-deterministic, malformed-input,
+	// out-of-range, ambiguous-pool, not-found). Empty when found=true.
+	ErrorCode         string `protobuf:"bytes,2,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorDetail       string `protobuf:"bytes,3,opt,name=error_detail,json=errorDetail,proto3" json:"error_detail,omitempty"`
+	AppliedGeneration uint64 `protobuf:"varint,4,opt,name=applied_generation,json=appliedGeneration,proto3" json:"applied_generation,omitempty"`
+	Pool              string `protobuf:"bytes,5,opt,name=pool,proto3" json:"pool,omitempty"`
+	Mode              uint32 `protobuf:"varint,6,opt,name=mode,proto3" json:"mode,omitempty"`                                    // 1 = IPv4 source NAT, 2 = IPv6 NAPT64
+	InternalHost      string `protobuf:"bytes,7,opt,name=internal_host,json=internalHost,proto3" json:"internal_host,omitempty"` // subscriber (input for forward, recovered for reverse)
+	ExternalIp        string `protobuf:"bytes,8,opt,name=external_ip,json=externalIp,proto3" json:"external_ip,omitempty"`       // translated external IPv4
+	NatPort           uint32 `protobuf:"varint,9,opt,name=nat_port,json=natPort,proto3" json:"nat_port,omitempty"`               // reverse: echoed translated port (0 for forward)
+	PortLow           uint32 `protobuf:"varint,10,opt,name=port_low,json=portLow,proto3" json:"port_low,omitempty"`              // inclusive port-block low
+	PortHigh          uint32 `protobuf:"varint,11,opt,name=port_high,json=portHigh,proto3" json:"port_high,omitempty"`           // inclusive port-block high
+	BlockSize         uint32 `protobuf:"varint,12,opt,name=block_size,json=blockSize,proto3" json:"block_size,omitempty"`
+	BlockIndex        uint32 `protobuf:"varint,13,opt,name=block_index,json=blockIndex,proto3" json:"block_index,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *GetNATDeterministicResponse) Reset() {
+	*x = GetNATDeterministicResponse{}
+	mi := &file_xpf_proto_msgTypes[109]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetNATDeterministicResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetNATDeterministicResponse) ProtoMessage() {}
+
+func (x *GetNATDeterministicResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_xpf_proto_msgTypes[109]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetNATDeterministicResponse.ProtoReflect.Descriptor instead.
+func (*GetNATDeterministicResponse) Descriptor() ([]byte, []int) {
+	return file_xpf_proto_rawDescGZIP(), []int{109}
+}
+
+func (x *GetNATDeterministicResponse) GetFound() bool {
+	if x != nil {
+		return x.Found
+	}
+	return false
+}
+
+func (x *GetNATDeterministicResponse) GetErrorCode() string {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return ""
+}
+
+func (x *GetNATDeterministicResponse) GetErrorDetail() string {
+	if x != nil {
+		return x.ErrorDetail
+	}
+	return ""
+}
+
+func (x *GetNATDeterministicResponse) GetAppliedGeneration() uint64 {
+	if x != nil {
+		return x.AppliedGeneration
+	}
+	return 0
+}
+
+func (x *GetNATDeterministicResponse) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
+}
+
+func (x *GetNATDeterministicResponse) GetMode() uint32 {
+	if x != nil {
+		return x.Mode
+	}
+	return 0
+}
+
+func (x *GetNATDeterministicResponse) GetInternalHost() string {
+	if x != nil {
+		return x.InternalHost
+	}
+	return ""
+}
+
+func (x *GetNATDeterministicResponse) GetExternalIp() string {
+	if x != nil {
+		return x.ExternalIp
+	}
+	return ""
+}
+
+func (x *GetNATDeterministicResponse) GetNatPort() uint32 {
+	if x != nil {
+		return x.NatPort
+	}
+	return 0
+}
+
+func (x *GetNATDeterministicResponse) GetPortLow() uint32 {
+	if x != nil {
+		return x.PortLow
+	}
+	return 0
+}
+
+func (x *GetNATDeterministicResponse) GetPortHigh() uint32 {
+	if x != nil {
+		return x.PortHigh
+	}
+	return 0
+}
+
+func (x *GetNATDeterministicResponse) GetBlockSize() uint32 {
+	if x != nil {
+		return x.BlockSize
+	}
+	return 0
+}
+
+func (x *GetNATDeterministicResponse) GetBlockIndex() uint32 {
+	if x != nil {
+		return x.BlockIndex
+	}
+	return 0
+}
+
 type CompleteRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Line  string                 `protobuf:"bytes,1,opt,name=line,proto3" json:"line,omitempty"`
@@ -7386,7 +7656,7 @@ type CompleteRequest struct {
 
 func (x *CompleteRequest) Reset() {
 	*x = CompleteRequest{}
-	mi := &file_xpf_proto_msgTypes[108]
+	mi := &file_xpf_proto_msgTypes[110]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7398,7 +7668,7 @@ func (x *CompleteRequest) String() string {
 func (*CompleteRequest) ProtoMessage() {}
 
 func (x *CompleteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[108]
+	mi := &file_xpf_proto_msgTypes[110]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7411,7 +7681,7 @@ func (x *CompleteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompleteRequest.ProtoReflect.Descriptor instead.
 func (*CompleteRequest) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{108}
+	return file_xpf_proto_rawDescGZIP(), []int{110}
 }
 
 func (x *CompleteRequest) GetLine() string {
@@ -7445,7 +7715,7 @@ type CompleteResponse struct {
 
 func (x *CompleteResponse) Reset() {
 	*x = CompleteResponse{}
-	mi := &file_xpf_proto_msgTypes[109]
+	mi := &file_xpf_proto_msgTypes[111]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7457,7 +7727,7 @@ func (x *CompleteResponse) String() string {
 func (*CompleteResponse) ProtoMessage() {}
 
 func (x *CompleteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[109]
+	mi := &file_xpf_proto_msgTypes[111]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7470,7 +7740,7 @@ func (x *CompleteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompleteResponse.ProtoReflect.Descriptor instead.
 func (*CompleteResponse) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{109}
+	return file_xpf_proto_rawDescGZIP(), []int{111}
 }
 
 func (x *CompleteResponse) GetCandidates() []string {
@@ -7499,7 +7769,7 @@ type ShowTextRequest struct {
 
 func (x *ShowTextRequest) Reset() {
 	*x = ShowTextRequest{}
-	mi := &file_xpf_proto_msgTypes[110]
+	mi := &file_xpf_proto_msgTypes[112]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7511,7 +7781,7 @@ func (x *ShowTextRequest) String() string {
 func (*ShowTextRequest) ProtoMessage() {}
 
 func (x *ShowTextRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[110]
+	mi := &file_xpf_proto_msgTypes[112]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7524,7 +7794,7 @@ func (x *ShowTextRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShowTextRequest.ProtoReflect.Descriptor instead.
 func (*ShowTextRequest) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{110}
+	return file_xpf_proto_rawDescGZIP(), []int{112}
 }
 
 func (x *ShowTextRequest) GetTopic() string {
@@ -7550,7 +7820,7 @@ type ShowTextResponse struct {
 
 func (x *ShowTextResponse) Reset() {
 	*x = ShowTextResponse{}
-	mi := &file_xpf_proto_msgTypes[111]
+	mi := &file_xpf_proto_msgTypes[113]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7562,7 +7832,7 @@ func (x *ShowTextResponse) String() string {
 func (*ShowTextResponse) ProtoMessage() {}
 
 func (x *ShowTextResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[111]
+	mi := &file_xpf_proto_msgTypes[113]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7575,7 +7845,7 @@ func (x *ShowTextResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShowTextResponse.ProtoReflect.Descriptor instead.
 func (*ShowTextResponse) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{111}
+	return file_xpf_proto_rawDescGZIP(), []int{113}
 }
 
 func (x *ShowTextResponse) GetOutput() string {
@@ -7594,7 +7864,7 @@ type GetSystemInfoRequest struct {
 
 func (x *GetSystemInfoRequest) Reset() {
 	*x = GetSystemInfoRequest{}
-	mi := &file_xpf_proto_msgTypes[112]
+	mi := &file_xpf_proto_msgTypes[114]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7606,7 +7876,7 @@ func (x *GetSystemInfoRequest) String() string {
 func (*GetSystemInfoRequest) ProtoMessage() {}
 
 func (x *GetSystemInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[112]
+	mi := &file_xpf_proto_msgTypes[114]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7619,7 +7889,7 @@ func (x *GetSystemInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSystemInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetSystemInfoRequest) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{112}
+	return file_xpf_proto_rawDescGZIP(), []int{114}
 }
 
 func (x *GetSystemInfoRequest) GetType() string {
@@ -7638,7 +7908,7 @@ type GetSystemInfoResponse struct {
 
 func (x *GetSystemInfoResponse) Reset() {
 	*x = GetSystemInfoResponse{}
-	mi := &file_xpf_proto_msgTypes[113]
+	mi := &file_xpf_proto_msgTypes[115]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7650,7 +7920,7 @@ func (x *GetSystemInfoResponse) String() string {
 func (*GetSystemInfoResponse) ProtoMessage() {}
 
 func (x *GetSystemInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[113]
+	mi := &file_xpf_proto_msgTypes[115]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7663,7 +7933,7 @@ func (x *GetSystemInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSystemInfoResponse.ProtoReflect.Descriptor instead.
 func (*GetSystemInfoResponse) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{113}
+	return file_xpf_proto_rawDescGZIP(), []int{115}
 }
 
 func (x *GetSystemInfoResponse) GetOutput() string {
@@ -7683,7 +7953,7 @@ type SystemActionRequest struct {
 
 func (x *SystemActionRequest) Reset() {
 	*x = SystemActionRequest{}
-	mi := &file_xpf_proto_msgTypes[114]
+	mi := &file_xpf_proto_msgTypes[116]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7695,7 +7965,7 @@ func (x *SystemActionRequest) String() string {
 func (*SystemActionRequest) ProtoMessage() {}
 
 func (x *SystemActionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[114]
+	mi := &file_xpf_proto_msgTypes[116]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7708,7 +7978,7 @@ func (x *SystemActionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SystemActionRequest.ProtoReflect.Descriptor instead.
 func (*SystemActionRequest) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{114}
+	return file_xpf_proto_rawDescGZIP(), []int{116}
 }
 
 func (x *SystemActionRequest) GetAction() string {
@@ -7734,7 +8004,7 @@ type SystemActionResponse struct {
 
 func (x *SystemActionResponse) Reset() {
 	*x = SystemActionResponse{}
-	mi := &file_xpf_proto_msgTypes[115]
+	mi := &file_xpf_proto_msgTypes[117]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7746,7 +8016,7 @@ func (x *SystemActionResponse) String() string {
 func (*SystemActionResponse) ProtoMessage() {}
 
 func (x *SystemActionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[115]
+	mi := &file_xpf_proto_msgTypes[117]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7759,7 +8029,7 @@ func (x *SystemActionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SystemActionResponse.ProtoReflect.Descriptor instead.
 func (*SystemActionResponse) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{115}
+	return file_xpf_proto_rawDescGZIP(), []int{117}
 }
 
 func (x *SystemActionResponse) GetMessage() string {
@@ -7786,7 +8056,7 @@ type MonitorPacketDropRequest struct {
 
 func (x *MonitorPacketDropRequest) Reset() {
 	*x = MonitorPacketDropRequest{}
-	mi := &file_xpf_proto_msgTypes[116]
+	mi := &file_xpf_proto_msgTypes[118]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7798,7 +8068,7 @@ func (x *MonitorPacketDropRequest) String() string {
 func (*MonitorPacketDropRequest) ProtoMessage() {}
 
 func (x *MonitorPacketDropRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[116]
+	mi := &file_xpf_proto_msgTypes[118]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7811,7 +8081,7 @@ func (x *MonitorPacketDropRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MonitorPacketDropRequest.ProtoReflect.Descriptor instead.
 func (*MonitorPacketDropRequest) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{116}
+	return file_xpf_proto_rawDescGZIP(), []int{118}
 }
 
 func (x *MonitorPacketDropRequest) GetSourcePrefix() string {
@@ -7886,7 +8156,7 @@ type MonitorPacketDropResponse struct {
 
 func (x *MonitorPacketDropResponse) Reset() {
 	*x = MonitorPacketDropResponse{}
-	mi := &file_xpf_proto_msgTypes[117]
+	mi := &file_xpf_proto_msgTypes[119]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7898,7 +8168,7 @@ func (x *MonitorPacketDropResponse) String() string {
 func (*MonitorPacketDropResponse) ProtoMessage() {}
 
 func (x *MonitorPacketDropResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[117]
+	mi := &file_xpf_proto_msgTypes[119]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7911,7 +8181,7 @@ func (x *MonitorPacketDropResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MonitorPacketDropResponse.ProtoReflect.Descriptor instead.
 func (*MonitorPacketDropResponse) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{117}
+	return file_xpf_proto_rawDescGZIP(), []int{119}
 }
 
 func (x *MonitorPacketDropResponse) GetLine() string {
@@ -7931,7 +8201,7 @@ type MonitorInterfaceRequest struct {
 
 func (x *MonitorInterfaceRequest) Reset() {
 	*x = MonitorInterfaceRequest{}
-	mi := &file_xpf_proto_msgTypes[118]
+	mi := &file_xpf_proto_msgTypes[120]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7943,7 +8213,7 @@ func (x *MonitorInterfaceRequest) String() string {
 func (*MonitorInterfaceRequest) ProtoMessage() {}
 
 func (x *MonitorInterfaceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[118]
+	mi := &file_xpf_proto_msgTypes[120]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7956,7 +8226,7 @@ func (x *MonitorInterfaceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MonitorInterfaceRequest.ProtoReflect.Descriptor instead.
 func (*MonitorInterfaceRequest) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{118}
+	return file_xpf_proto_rawDescGZIP(), []int{120}
 }
 
 func (x *MonitorInterfaceRequest) GetInterfaceName() string {
@@ -7982,7 +8252,7 @@ type MonitorInterfaceResponse struct {
 
 func (x *MonitorInterfaceResponse) Reset() {
 	*x = MonitorInterfaceResponse{}
-	mi := &file_xpf_proto_msgTypes[119]
+	mi := &file_xpf_proto_msgTypes[121]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7994,7 +8264,7 @@ func (x *MonitorInterfaceResponse) String() string {
 func (*MonitorInterfaceResponse) ProtoMessage() {}
 
 func (x *MonitorInterfaceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[119]
+	mi := &file_xpf_proto_msgTypes[121]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8007,7 +8277,7 @@ func (x *MonitorInterfaceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MonitorInterfaceResponse.ProtoReflect.Descriptor instead.
 func (*MonitorInterfaceResponse) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{119}
+	return file_xpf_proto_rawDescGZIP(), []int{121}
 }
 
 func (x *MonitorInterfaceResponse) GetFrame() string {
@@ -8034,7 +8304,7 @@ type GetZonePairSummaryRequest struct {
 
 func (x *GetZonePairSummaryRequest) Reset() {
 	*x = GetZonePairSummaryRequest{}
-	mi := &file_xpf_proto_msgTypes[120]
+	mi := &file_xpf_proto_msgTypes[122]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8046,7 +8316,7 @@ func (x *GetZonePairSummaryRequest) String() string {
 func (*GetZonePairSummaryRequest) ProtoMessage() {}
 
 func (x *GetZonePairSummaryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[120]
+	mi := &file_xpf_proto_msgTypes[122]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8059,7 +8329,7 @@ func (x *GetZonePairSummaryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetZonePairSummaryRequest.ProtoReflect.Descriptor instead.
 func (*GetZonePairSummaryRequest) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{120}
+	return file_xpf_proto_rawDescGZIP(), []int{122}
 }
 
 func (x *GetZonePairSummaryRequest) GetIncludePeer() bool {
@@ -8084,7 +8354,7 @@ type ZonePairSessionSummary struct {
 
 func (x *ZonePairSessionSummary) Reset() {
 	*x = ZonePairSessionSummary{}
-	mi := &file_xpf_proto_msgTypes[121]
+	mi := &file_xpf_proto_msgTypes[123]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8096,7 +8366,7 @@ func (x *ZonePairSessionSummary) String() string {
 func (*ZonePairSessionSummary) ProtoMessage() {}
 
 func (x *ZonePairSessionSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[121]
+	mi := &file_xpf_proto_msgTypes[123]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8109,7 +8379,7 @@ func (x *ZonePairSessionSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ZonePairSessionSummary.ProtoReflect.Descriptor instead.
 func (*ZonePairSessionSummary) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{121}
+	return file_xpf_proto_rawDescGZIP(), []int{123}
 }
 
 func (x *ZonePairSessionSummary) GetFromZone() string {
@@ -8177,7 +8447,7 @@ type GetZonePairSummaryResponse struct {
 
 func (x *GetZonePairSummaryResponse) Reset() {
 	*x = GetZonePairSummaryResponse{}
-	mi := &file_xpf_proto_msgTypes[122]
+	mi := &file_xpf_proto_msgTypes[124]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8189,7 +8459,7 @@ func (x *GetZonePairSummaryResponse) String() string {
 func (*GetZonePairSummaryResponse) ProtoMessage() {}
 
 func (x *GetZonePairSummaryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_xpf_proto_msgTypes[122]
+	mi := &file_xpf_proto_msgTypes[124]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8202,7 +8472,7 @@ func (x *GetZonePairSummaryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetZonePairSummaryResponse.ProtoReflect.Descriptor instead.
 func (*GetZonePairSummaryResponse) Descriptor() ([]byte, []int) {
-	return file_xpf_proto_rawDescGZIP(), []int{122}
+	return file_xpf_proto_rawDescGZIP(), []int{124}
 }
 
 func (x *GetZonePairSummaryResponse) GetZonePairs() []*ZonePairSessionSummary {
@@ -8782,7 +9052,32 @@ const file_xpf_proto_rawDesc = "" +
 	"\x11destination_match\x18\a \x01(\tR\x10destinationMatch\x12\x1f\n" +
 	"\vhit_packets\x18\b \x01(\x04R\n" +
 	"hitPackets\x12\x1b\n" +
-	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\"X\n" +
+	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\"\xc8\x01\n" +
+	"\x1aGetNATDeterministicRequest\x12?\n" +
+	"\tdirection\x18\x01 \x01(\x0e2!.xpf.v1.NATDeterministicDirectionR\tdirection\x12\x12\n" +
+	"\x04pool\x18\x02 \x01(\tR\x04pool\x12#\n" +
+	"\rinternal_host\x18\x03 \x01(\tR\finternalHost\x12\x15\n" +
+	"\x06nat_ip\x18\x04 \x01(\tR\x05natIp\x12\x19\n" +
+	"\bnat_port\x18\x05 \x01(\rR\anatPort\"\xa5\x03\n" +
+	"\x1bGetNATDeterministicResponse\x12\x14\n" +
+	"\x05found\x18\x01 \x01(\bR\x05found\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\x02 \x01(\tR\terrorCode\x12!\n" +
+	"\ferror_detail\x18\x03 \x01(\tR\verrorDetail\x12-\n" +
+	"\x12applied_generation\x18\x04 \x01(\x04R\x11appliedGeneration\x12\x12\n" +
+	"\x04pool\x18\x05 \x01(\tR\x04pool\x12\x12\n" +
+	"\x04mode\x18\x06 \x01(\rR\x04mode\x12#\n" +
+	"\rinternal_host\x18\a \x01(\tR\finternalHost\x12\x1f\n" +
+	"\vexternal_ip\x18\b \x01(\tR\n" +
+	"externalIp\x12\x19\n" +
+	"\bnat_port\x18\t \x01(\rR\anatPort\x12\x19\n" +
+	"\bport_low\x18\n" +
+	" \x01(\rR\aportLow\x12\x1b\n" +
+	"\tport_high\x18\v \x01(\rR\bportHigh\x12\x1d\n" +
+	"\n" +
+	"block_size\x18\f \x01(\rR\tblockSize\x12\x1f\n" +
+	"\vblock_index\x18\r \x01(\rR\n" +
+	"blockIndex\"X\n" +
 	"\x0fCompleteRequest\x12\x12\n" +
 	"\x04line\x18\x01 \x01(\tR\x04line\x12\x10\n" +
 	"\x03pos\x18\x02 \x01(\x05R\x03pos\x12\x1f\n" +
@@ -8866,12 +9161,16 @@ const file_xpf_proto_rawDesc = "" +
 	"+HOST_INBOUND_ADMISSION_STATUS_GLOBAL_ACCEPT\x10\x02\x12-\n" +
 	")HOST_INBOUND_ADMISSION_STATUS_TOKEN_ADMIT\x10\x03\x12(\n" +
 	"$HOST_INBOUND_ADMISSION_STATUS_DENIED\x10\x04\x12+\n" +
-	"'HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS\x10\x05*\x97\x01\n" +
+	"'HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS\x10\x05*\x9a\x01\n" +
+	"\x19NATDeterministicDirection\x12+\n" +
+	"'NAT_DETERMINISTIC_DIRECTION_UNSPECIFIED\x10\x00\x12'\n" +
+	"#NAT_DETERMINISTIC_DIRECTION_FORWARD\x10\x01\x12'\n" +
+	"#NAT_DETERMINISTIC_DIRECTION_REVERSE\x10\x02*\x97\x01\n" +
 	"\x0fPeerFetchStatus\x12!\n" +
 	"\x1dPEER_FETCH_STATUS_UNSPECIFIED\x10\x00\x12$\n" +
 	" PEER_FETCH_STATUS_NOT_APPLICABLE\x10\x01\x12\x18\n" +
 	"\x14PEER_FETCH_STATUS_OK\x10\x02\x12!\n" +
-	"\x1dPEER_FETCH_STATUS_UNREACHABLE\x10\x032\xae\x1e\n" +
+	"\x1dPEER_FETCH_STATUS_UNREACHABLE\x10\x032\x8e\x1f\n" +
 	"\fBpfrxService\x12O\n" +
 	"\x0eEnterConfigure\x12\x1d.xpf.v1.EnterConfigureRequest\x1a\x1e.xpf.v1.EnterConfigureResponse\x12L\n" +
 	"\rExitConfigure\x12\x1c.xpf.v1.ExitConfigureRequest\x1a\x1d.xpf.v1.ExitConfigureResponse\x12^\n" +
@@ -8912,7 +9211,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"GetIPsecSA\x12\x19.xpf.v1.GetIPsecSARequest\x1a\x1a.xpf.v1.GetIPsecSAResponse\x12R\n" +
 	"\x0fGetNATPoolStats\x12\x1e.xpf.v1.GetNATPoolStatsRequest\x1a\x1f.xpf.v1.GetNATPoolStatsResponse\x12R\n" +
-	"\x0fGetNATRuleStats\x12\x1e.xpf.v1.GetNATRuleStatsRequest\x1a\x1f.xpf.v1.GetNATRuleStatsResponse\x12L\n" +
+	"\x0fGetNATRuleStats\x12\x1e.xpf.v1.GetNATRuleStatsRequest\x1a\x1f.xpf.v1.GetNATRuleStatsResponse\x12^\n" +
+	"\x13GetNATDeterministic\x12\".xpf.v1.GetNATDeterministicRequest\x1a#.xpf.v1.GetNATDeterministicResponse\x12L\n" +
 	"\rGetVRRPStatus\x12\x1c.xpf.v1.GetVRRPStatusRequest\x1a\x1d.xpf.v1.GetVRRPStatusResponse\x12L\n" +
 	"\rMatchPolicies\x12\x1c.xpf.v1.MatchPoliciesRequest\x1a\x1d.xpf.v1.MatchPoliciesResponse\x123\n" +
 	"\x04Ping\x12\x13.xpf.v1.PingRequest\x1a\x14.xpf.v1.PingResponse0\x01\x12E\n" +
@@ -8940,282 +9240,288 @@ func file_xpf_proto_rawDescGZIP() []byte {
 	return file_xpf_proto_rawDescData
 }
 
-var file_xpf_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_xpf_proto_msgTypes = make([]protoimpl.MessageInfo, 125)
+var file_xpf_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
+var file_xpf_proto_msgTypes = make([]protoimpl.MessageInfo, 127)
 var file_xpf_proto_goTypes = []any{
 	(ConfigFormat)(0),                         // 0: xpf.v1.ConfigFormat
 	(ConfigTarget)(0),                         // 1: xpf.v1.ConfigTarget
 	(MonitorInterfaceSummaryMode)(0),          // 2: xpf.v1.MonitorInterfaceSummaryMode
 	(HostInboundAdmissionStatus)(0),           // 3: xpf.v1.HostInboundAdmissionStatus
-	(PeerFetchStatus)(0),                      // 4: xpf.v1.PeerFetchStatus
-	(*EnterConfigureRequest)(nil),             // 5: xpf.v1.EnterConfigureRequest
-	(*EnterConfigureResponse)(nil),            // 6: xpf.v1.EnterConfigureResponse
-	(*ExitConfigureRequest)(nil),              // 7: xpf.v1.ExitConfigureRequest
-	(*ExitConfigureResponse)(nil),             // 8: xpf.v1.ExitConfigureResponse
-	(*GetConfigModeStatusRequest)(nil),        // 9: xpf.v1.GetConfigModeStatusRequest
-	(*GetConfigModeStatusResponse)(nil),       // 10: xpf.v1.GetConfigModeStatusResponse
-	(*SetRequest)(nil),                        // 11: xpf.v1.SetRequest
-	(*SetResponse)(nil),                       // 12: xpf.v1.SetResponse
-	(*DeleteRequest)(nil),                     // 13: xpf.v1.DeleteRequest
-	(*DeleteResponse)(nil),                    // 14: xpf.v1.DeleteResponse
-	(*LoadRequest)(nil),                       // 15: xpf.v1.LoadRequest
-	(*LoadResponse)(nil),                      // 16: xpf.v1.LoadResponse
-	(*CommitRequest)(nil),                     // 17: xpf.v1.CommitRequest
-	(*CommitResponse)(nil),                    // 18: xpf.v1.CommitResponse
-	(*CommitCheckRequest)(nil),                // 19: xpf.v1.CommitCheckRequest
-	(*CommitCheckResponse)(nil),               // 20: xpf.v1.CommitCheckResponse
-	(*CommitConfirmedRequest)(nil),            // 21: xpf.v1.CommitConfirmedRequest
-	(*CommitConfirmedResponse)(nil),           // 22: xpf.v1.CommitConfirmedResponse
-	(*ConfirmCommitRequest)(nil),              // 23: xpf.v1.ConfirmCommitRequest
-	(*ConfirmCommitResponse)(nil),             // 24: xpf.v1.ConfirmCommitResponse
-	(*RollbackRequest)(nil),                   // 25: xpf.v1.RollbackRequest
-	(*RollbackResponse)(nil),                  // 26: xpf.v1.RollbackResponse
-	(*ShowConfigRequest)(nil),                 // 27: xpf.v1.ShowConfigRequest
-	(*ShowConfigResponse)(nil),                // 28: xpf.v1.ShowConfigResponse
-	(*ShowCompareRequest)(nil),                // 29: xpf.v1.ShowCompareRequest
-	(*ShowCompareResponse)(nil),               // 30: xpf.v1.ShowCompareResponse
-	(*ShowRollbackRequest)(nil),               // 31: xpf.v1.ShowRollbackRequest
-	(*ShowRollbackResponse)(nil),              // 32: xpf.v1.ShowRollbackResponse
-	(*ListHistoryRequest)(nil),                // 33: xpf.v1.ListHistoryRequest
-	(*ListHistoryResponse)(nil),               // 34: xpf.v1.ListHistoryResponse
-	(*HistoryEntry)(nil),                      // 35: xpf.v1.HistoryEntry
-	(*GetStatusRequest)(nil),                  // 36: xpf.v1.GetStatusRequest
-	(*GetStatusResponse)(nil),                 // 37: xpf.v1.GetStatusResponse
-	(*GetGlobalStatsRequest)(nil),             // 38: xpf.v1.GetGlobalStatsRequest
-	(*GetGlobalStatsResponse)(nil),            // 39: xpf.v1.GetGlobalStatsResponse
-	(*GetZonesRequest)(nil),                   // 40: xpf.v1.GetZonesRequest
-	(*GetZonesResponse)(nil),                  // 41: xpf.v1.GetZonesResponse
-	(*ZoneInfo)(nil),                          // 42: xpf.v1.ZoneInfo
-	(*InterfaceHostInbound)(nil),              // 43: xpf.v1.InterfaceHostInbound
-	(*GetPoliciesRequest)(nil),                // 44: xpf.v1.GetPoliciesRequest
-	(*GetPoliciesResponse)(nil),               // 45: xpf.v1.GetPoliciesResponse
-	(*PolicyInfo)(nil),                        // 46: xpf.v1.PolicyInfo
-	(*PolicyRule)(nil),                        // 47: xpf.v1.PolicyRule
-	(*GetSessionsRequest)(nil),                // 48: xpf.v1.GetSessionsRequest
-	(*GetSessionsResponse)(nil),               // 49: xpf.v1.GetSessionsResponse
-	(*SessionEntry)(nil),                      // 50: xpf.v1.SessionEntry
-	(*GetSessionSummaryRequest)(nil),          // 51: xpf.v1.GetSessionSummaryRequest
-	(*GetSessionSummaryResponse)(nil),         // 52: xpf.v1.GetSessionSummaryResponse
-	(*GetNATSourceRequest)(nil),               // 53: xpf.v1.GetNATSourceRequest
-	(*GetNATSourceResponse)(nil),              // 54: xpf.v1.GetNATSourceResponse
-	(*NATSourceInfo)(nil),                     // 55: xpf.v1.NATSourceInfo
-	(*GetNATDestinationRequest)(nil),          // 56: xpf.v1.GetNATDestinationRequest
-	(*GetNATDestinationResponse)(nil),         // 57: xpf.v1.GetNATDestinationResponse
-	(*NATDestInfo)(nil),                       // 58: xpf.v1.NATDestInfo
-	(*GetScreenRequest)(nil),                  // 59: xpf.v1.GetScreenRequest
-	(*GetScreenResponse)(nil),                 // 60: xpf.v1.GetScreenResponse
-	(*ScreenInfo)(nil),                        // 61: xpf.v1.ScreenInfo
-	(*GetEventsRequest)(nil),                  // 62: xpf.v1.GetEventsRequest
-	(*GetEventsResponse)(nil),                 // 63: xpf.v1.GetEventsResponse
-	(*EventEntry)(nil),                        // 64: xpf.v1.EventEntry
-	(*GetInterfacesRequest)(nil),              // 65: xpf.v1.GetInterfacesRequest
-	(*GetInterfacesResponse)(nil),             // 66: xpf.v1.GetInterfacesResponse
-	(*InterfaceInfo)(nil),                     // 67: xpf.v1.InterfaceInfo
-	(*ShowInterfacesDetailRequest)(nil),       // 68: xpf.v1.ShowInterfacesDetailRequest
-	(*ShowInterfacesDetailResponse)(nil),      // 69: xpf.v1.ShowInterfacesDetailResponse
-	(*GetDHCPLeasesRequest)(nil),              // 70: xpf.v1.GetDHCPLeasesRequest
-	(*GetDHCPLeasesResponse)(nil),             // 71: xpf.v1.GetDHCPLeasesResponse
-	(*DHCPLeaseInfo)(nil),                     // 72: xpf.v1.DHCPLeaseInfo
-	(*DHCPDelegatedPrefix)(nil),               // 73: xpf.v1.DHCPDelegatedPrefix
-	(*GetDHCPClientIdentifiersRequest)(nil),   // 74: xpf.v1.GetDHCPClientIdentifiersRequest
-	(*GetDHCPClientIdentifiersResponse)(nil),  // 75: xpf.v1.GetDHCPClientIdentifiersResponse
-	(*DHCPClientIdentifierInfo)(nil),          // 76: xpf.v1.DHCPClientIdentifierInfo
-	(*ClearDHCPClientIdentifierRequest)(nil),  // 77: xpf.v1.ClearDHCPClientIdentifierRequest
-	(*ClearDHCPClientIdentifierResponse)(nil), // 78: xpf.v1.ClearDHCPClientIdentifierResponse
-	(*GetRoutesRequest)(nil),                  // 79: xpf.v1.GetRoutesRequest
-	(*GetRoutesResponse)(nil),                 // 80: xpf.v1.GetRoutesResponse
-	(*RouteInfo)(nil),                         // 81: xpf.v1.RouteInfo
-	(*GetOSPFStatusRequest)(nil),              // 82: xpf.v1.GetOSPFStatusRequest
-	(*GetOSPFStatusResponse)(nil),             // 83: xpf.v1.GetOSPFStatusResponse
-	(*GetBGPStatusRequest)(nil),               // 84: xpf.v1.GetBGPStatusRequest
-	(*GetBGPStatusResponse)(nil),              // 85: xpf.v1.GetBGPStatusResponse
-	(*GetRIPStatusRequest)(nil),               // 86: xpf.v1.GetRIPStatusRequest
-	(*GetRIPStatusResponse)(nil),              // 87: xpf.v1.GetRIPStatusResponse
-	(*GetISISStatusRequest)(nil),              // 88: xpf.v1.GetISISStatusRequest
-	(*GetISISStatusResponse)(nil),             // 89: xpf.v1.GetISISStatusResponse
-	(*GetIPsecSARequest)(nil),                 // 90: xpf.v1.GetIPsecSARequest
-	(*GetIPsecSAResponse)(nil),                // 91: xpf.v1.GetIPsecSAResponse
-	(*PingRequest)(nil),                       // 92: xpf.v1.PingRequest
-	(*PingResponse)(nil),                      // 93: xpf.v1.PingResponse
-	(*TracerouteRequest)(nil),                 // 94: xpf.v1.TracerouteRequest
-	(*TracerouteResponse)(nil),                // 95: xpf.v1.TracerouteResponse
-	(*ClearSessionsRequest)(nil),              // 96: xpf.v1.ClearSessionsRequest
-	(*ClearSessionsResponse)(nil),             // 97: xpf.v1.ClearSessionsResponse
-	(*ClearCountersRequest)(nil),              // 98: xpf.v1.ClearCountersRequest
-	(*ClearCountersResponse)(nil),             // 99: xpf.v1.ClearCountersResponse
-	(*GetNATPoolStatsRequest)(nil),            // 100: xpf.v1.GetNATPoolStatsRequest
-	(*GetNATPoolStatsResponse)(nil),           // 101: xpf.v1.GetNATPoolStatsResponse
-	(*NATPoolStats)(nil),                      // 102: xpf.v1.NATPoolStats
-	(*NATRuleSetSessions)(nil),                // 103: xpf.v1.NATRuleSetSessions
-	(*GetVRRPStatusRequest)(nil),              // 104: xpf.v1.GetVRRPStatusRequest
-	(*GetVRRPStatusResponse)(nil),             // 105: xpf.v1.GetVRRPStatusResponse
-	(*VRRPInstanceInfo)(nil),                  // 106: xpf.v1.VRRPInstanceInfo
-	(*MatchPoliciesRequest)(nil),              // 107: xpf.v1.MatchPoliciesRequest
-	(*MatchPoliciesResponse)(nil),             // 108: xpf.v1.MatchPoliciesResponse
-	(*HostInboundAdmission)(nil),              // 109: xpf.v1.HostInboundAdmission
-	(*GetNATRuleStatsRequest)(nil),            // 110: xpf.v1.GetNATRuleStatsRequest
-	(*GetNATRuleStatsResponse)(nil),           // 111: xpf.v1.GetNATRuleStatsResponse
-	(*NATRuleStats)(nil),                      // 112: xpf.v1.NATRuleStats
-	(*CompleteRequest)(nil),                   // 113: xpf.v1.CompleteRequest
-	(*CompleteResponse)(nil),                  // 114: xpf.v1.CompleteResponse
-	(*ShowTextRequest)(nil),                   // 115: xpf.v1.ShowTextRequest
-	(*ShowTextResponse)(nil),                  // 116: xpf.v1.ShowTextResponse
-	(*GetSystemInfoRequest)(nil),              // 117: xpf.v1.GetSystemInfoRequest
-	(*GetSystemInfoResponse)(nil),             // 118: xpf.v1.GetSystemInfoResponse
-	(*SystemActionRequest)(nil),               // 119: xpf.v1.SystemActionRequest
-	(*SystemActionResponse)(nil),              // 120: xpf.v1.SystemActionResponse
-	(*MonitorPacketDropRequest)(nil),          // 121: xpf.v1.MonitorPacketDropRequest
-	(*MonitorPacketDropResponse)(nil),         // 122: xpf.v1.MonitorPacketDropResponse
-	(*MonitorInterfaceRequest)(nil),           // 123: xpf.v1.MonitorInterfaceRequest
-	(*MonitorInterfaceResponse)(nil),          // 124: xpf.v1.MonitorInterfaceResponse
-	(*GetZonePairSummaryRequest)(nil),         // 125: xpf.v1.GetZonePairSummaryRequest
-	(*ZonePairSessionSummary)(nil),            // 126: xpf.v1.ZonePairSessionSummary
-	(*GetZonePairSummaryResponse)(nil),        // 127: xpf.v1.GetZonePairSummaryResponse
-	nil,                                       // 128: xpf.v1.GetGlobalStatsResponse.ScreenDropDetailsEntry
-	nil,                                       // 129: xpf.v1.ScreenInfo.ThresholdsEntry
+	(NATDeterministicDirection)(0),            // 4: xpf.v1.NATDeterministicDirection
+	(PeerFetchStatus)(0),                      // 5: xpf.v1.PeerFetchStatus
+	(*EnterConfigureRequest)(nil),             // 6: xpf.v1.EnterConfigureRequest
+	(*EnterConfigureResponse)(nil),            // 7: xpf.v1.EnterConfigureResponse
+	(*ExitConfigureRequest)(nil),              // 8: xpf.v1.ExitConfigureRequest
+	(*ExitConfigureResponse)(nil),             // 9: xpf.v1.ExitConfigureResponse
+	(*GetConfigModeStatusRequest)(nil),        // 10: xpf.v1.GetConfigModeStatusRequest
+	(*GetConfigModeStatusResponse)(nil),       // 11: xpf.v1.GetConfigModeStatusResponse
+	(*SetRequest)(nil),                        // 12: xpf.v1.SetRequest
+	(*SetResponse)(nil),                       // 13: xpf.v1.SetResponse
+	(*DeleteRequest)(nil),                     // 14: xpf.v1.DeleteRequest
+	(*DeleteResponse)(nil),                    // 15: xpf.v1.DeleteResponse
+	(*LoadRequest)(nil),                       // 16: xpf.v1.LoadRequest
+	(*LoadResponse)(nil),                      // 17: xpf.v1.LoadResponse
+	(*CommitRequest)(nil),                     // 18: xpf.v1.CommitRequest
+	(*CommitResponse)(nil),                    // 19: xpf.v1.CommitResponse
+	(*CommitCheckRequest)(nil),                // 20: xpf.v1.CommitCheckRequest
+	(*CommitCheckResponse)(nil),               // 21: xpf.v1.CommitCheckResponse
+	(*CommitConfirmedRequest)(nil),            // 22: xpf.v1.CommitConfirmedRequest
+	(*CommitConfirmedResponse)(nil),           // 23: xpf.v1.CommitConfirmedResponse
+	(*ConfirmCommitRequest)(nil),              // 24: xpf.v1.ConfirmCommitRequest
+	(*ConfirmCommitResponse)(nil),             // 25: xpf.v1.ConfirmCommitResponse
+	(*RollbackRequest)(nil),                   // 26: xpf.v1.RollbackRequest
+	(*RollbackResponse)(nil),                  // 27: xpf.v1.RollbackResponse
+	(*ShowConfigRequest)(nil),                 // 28: xpf.v1.ShowConfigRequest
+	(*ShowConfigResponse)(nil),                // 29: xpf.v1.ShowConfigResponse
+	(*ShowCompareRequest)(nil),                // 30: xpf.v1.ShowCompareRequest
+	(*ShowCompareResponse)(nil),               // 31: xpf.v1.ShowCompareResponse
+	(*ShowRollbackRequest)(nil),               // 32: xpf.v1.ShowRollbackRequest
+	(*ShowRollbackResponse)(nil),              // 33: xpf.v1.ShowRollbackResponse
+	(*ListHistoryRequest)(nil),                // 34: xpf.v1.ListHistoryRequest
+	(*ListHistoryResponse)(nil),               // 35: xpf.v1.ListHistoryResponse
+	(*HistoryEntry)(nil),                      // 36: xpf.v1.HistoryEntry
+	(*GetStatusRequest)(nil),                  // 37: xpf.v1.GetStatusRequest
+	(*GetStatusResponse)(nil),                 // 38: xpf.v1.GetStatusResponse
+	(*GetGlobalStatsRequest)(nil),             // 39: xpf.v1.GetGlobalStatsRequest
+	(*GetGlobalStatsResponse)(nil),            // 40: xpf.v1.GetGlobalStatsResponse
+	(*GetZonesRequest)(nil),                   // 41: xpf.v1.GetZonesRequest
+	(*GetZonesResponse)(nil),                  // 42: xpf.v1.GetZonesResponse
+	(*ZoneInfo)(nil),                          // 43: xpf.v1.ZoneInfo
+	(*InterfaceHostInbound)(nil),              // 44: xpf.v1.InterfaceHostInbound
+	(*GetPoliciesRequest)(nil),                // 45: xpf.v1.GetPoliciesRequest
+	(*GetPoliciesResponse)(nil),               // 46: xpf.v1.GetPoliciesResponse
+	(*PolicyInfo)(nil),                        // 47: xpf.v1.PolicyInfo
+	(*PolicyRule)(nil),                        // 48: xpf.v1.PolicyRule
+	(*GetSessionsRequest)(nil),                // 49: xpf.v1.GetSessionsRequest
+	(*GetSessionsResponse)(nil),               // 50: xpf.v1.GetSessionsResponse
+	(*SessionEntry)(nil),                      // 51: xpf.v1.SessionEntry
+	(*GetSessionSummaryRequest)(nil),          // 52: xpf.v1.GetSessionSummaryRequest
+	(*GetSessionSummaryResponse)(nil),         // 53: xpf.v1.GetSessionSummaryResponse
+	(*GetNATSourceRequest)(nil),               // 54: xpf.v1.GetNATSourceRequest
+	(*GetNATSourceResponse)(nil),              // 55: xpf.v1.GetNATSourceResponse
+	(*NATSourceInfo)(nil),                     // 56: xpf.v1.NATSourceInfo
+	(*GetNATDestinationRequest)(nil),          // 57: xpf.v1.GetNATDestinationRequest
+	(*GetNATDestinationResponse)(nil),         // 58: xpf.v1.GetNATDestinationResponse
+	(*NATDestInfo)(nil),                       // 59: xpf.v1.NATDestInfo
+	(*GetScreenRequest)(nil),                  // 60: xpf.v1.GetScreenRequest
+	(*GetScreenResponse)(nil),                 // 61: xpf.v1.GetScreenResponse
+	(*ScreenInfo)(nil),                        // 62: xpf.v1.ScreenInfo
+	(*GetEventsRequest)(nil),                  // 63: xpf.v1.GetEventsRequest
+	(*GetEventsResponse)(nil),                 // 64: xpf.v1.GetEventsResponse
+	(*EventEntry)(nil),                        // 65: xpf.v1.EventEntry
+	(*GetInterfacesRequest)(nil),              // 66: xpf.v1.GetInterfacesRequest
+	(*GetInterfacesResponse)(nil),             // 67: xpf.v1.GetInterfacesResponse
+	(*InterfaceInfo)(nil),                     // 68: xpf.v1.InterfaceInfo
+	(*ShowInterfacesDetailRequest)(nil),       // 69: xpf.v1.ShowInterfacesDetailRequest
+	(*ShowInterfacesDetailResponse)(nil),      // 70: xpf.v1.ShowInterfacesDetailResponse
+	(*GetDHCPLeasesRequest)(nil),              // 71: xpf.v1.GetDHCPLeasesRequest
+	(*GetDHCPLeasesResponse)(nil),             // 72: xpf.v1.GetDHCPLeasesResponse
+	(*DHCPLeaseInfo)(nil),                     // 73: xpf.v1.DHCPLeaseInfo
+	(*DHCPDelegatedPrefix)(nil),               // 74: xpf.v1.DHCPDelegatedPrefix
+	(*GetDHCPClientIdentifiersRequest)(nil),   // 75: xpf.v1.GetDHCPClientIdentifiersRequest
+	(*GetDHCPClientIdentifiersResponse)(nil),  // 76: xpf.v1.GetDHCPClientIdentifiersResponse
+	(*DHCPClientIdentifierInfo)(nil),          // 77: xpf.v1.DHCPClientIdentifierInfo
+	(*ClearDHCPClientIdentifierRequest)(nil),  // 78: xpf.v1.ClearDHCPClientIdentifierRequest
+	(*ClearDHCPClientIdentifierResponse)(nil), // 79: xpf.v1.ClearDHCPClientIdentifierResponse
+	(*GetRoutesRequest)(nil),                  // 80: xpf.v1.GetRoutesRequest
+	(*GetRoutesResponse)(nil),                 // 81: xpf.v1.GetRoutesResponse
+	(*RouteInfo)(nil),                         // 82: xpf.v1.RouteInfo
+	(*GetOSPFStatusRequest)(nil),              // 83: xpf.v1.GetOSPFStatusRequest
+	(*GetOSPFStatusResponse)(nil),             // 84: xpf.v1.GetOSPFStatusResponse
+	(*GetBGPStatusRequest)(nil),               // 85: xpf.v1.GetBGPStatusRequest
+	(*GetBGPStatusResponse)(nil),              // 86: xpf.v1.GetBGPStatusResponse
+	(*GetRIPStatusRequest)(nil),               // 87: xpf.v1.GetRIPStatusRequest
+	(*GetRIPStatusResponse)(nil),              // 88: xpf.v1.GetRIPStatusResponse
+	(*GetISISStatusRequest)(nil),              // 89: xpf.v1.GetISISStatusRequest
+	(*GetISISStatusResponse)(nil),             // 90: xpf.v1.GetISISStatusResponse
+	(*GetIPsecSARequest)(nil),                 // 91: xpf.v1.GetIPsecSARequest
+	(*GetIPsecSAResponse)(nil),                // 92: xpf.v1.GetIPsecSAResponse
+	(*PingRequest)(nil),                       // 93: xpf.v1.PingRequest
+	(*PingResponse)(nil),                      // 94: xpf.v1.PingResponse
+	(*TracerouteRequest)(nil),                 // 95: xpf.v1.TracerouteRequest
+	(*TracerouteResponse)(nil),                // 96: xpf.v1.TracerouteResponse
+	(*ClearSessionsRequest)(nil),              // 97: xpf.v1.ClearSessionsRequest
+	(*ClearSessionsResponse)(nil),             // 98: xpf.v1.ClearSessionsResponse
+	(*ClearCountersRequest)(nil),              // 99: xpf.v1.ClearCountersRequest
+	(*ClearCountersResponse)(nil),             // 100: xpf.v1.ClearCountersResponse
+	(*GetNATPoolStatsRequest)(nil),            // 101: xpf.v1.GetNATPoolStatsRequest
+	(*GetNATPoolStatsResponse)(nil),           // 102: xpf.v1.GetNATPoolStatsResponse
+	(*NATPoolStats)(nil),                      // 103: xpf.v1.NATPoolStats
+	(*NATRuleSetSessions)(nil),                // 104: xpf.v1.NATRuleSetSessions
+	(*GetVRRPStatusRequest)(nil),              // 105: xpf.v1.GetVRRPStatusRequest
+	(*GetVRRPStatusResponse)(nil),             // 106: xpf.v1.GetVRRPStatusResponse
+	(*VRRPInstanceInfo)(nil),                  // 107: xpf.v1.VRRPInstanceInfo
+	(*MatchPoliciesRequest)(nil),              // 108: xpf.v1.MatchPoliciesRequest
+	(*MatchPoliciesResponse)(nil),             // 109: xpf.v1.MatchPoliciesResponse
+	(*HostInboundAdmission)(nil),              // 110: xpf.v1.HostInboundAdmission
+	(*GetNATRuleStatsRequest)(nil),            // 111: xpf.v1.GetNATRuleStatsRequest
+	(*GetNATRuleStatsResponse)(nil),           // 112: xpf.v1.GetNATRuleStatsResponse
+	(*NATRuleStats)(nil),                      // 113: xpf.v1.NATRuleStats
+	(*GetNATDeterministicRequest)(nil),        // 114: xpf.v1.GetNATDeterministicRequest
+	(*GetNATDeterministicResponse)(nil),       // 115: xpf.v1.GetNATDeterministicResponse
+	(*CompleteRequest)(nil),                   // 116: xpf.v1.CompleteRequest
+	(*CompleteResponse)(nil),                  // 117: xpf.v1.CompleteResponse
+	(*ShowTextRequest)(nil),                   // 118: xpf.v1.ShowTextRequest
+	(*ShowTextResponse)(nil),                  // 119: xpf.v1.ShowTextResponse
+	(*GetSystemInfoRequest)(nil),              // 120: xpf.v1.GetSystemInfoRequest
+	(*GetSystemInfoResponse)(nil),             // 121: xpf.v1.GetSystemInfoResponse
+	(*SystemActionRequest)(nil),               // 122: xpf.v1.SystemActionRequest
+	(*SystemActionResponse)(nil),              // 123: xpf.v1.SystemActionResponse
+	(*MonitorPacketDropRequest)(nil),          // 124: xpf.v1.MonitorPacketDropRequest
+	(*MonitorPacketDropResponse)(nil),         // 125: xpf.v1.MonitorPacketDropResponse
+	(*MonitorInterfaceRequest)(nil),           // 126: xpf.v1.MonitorInterfaceRequest
+	(*MonitorInterfaceResponse)(nil),          // 127: xpf.v1.MonitorInterfaceResponse
+	(*GetZonePairSummaryRequest)(nil),         // 128: xpf.v1.GetZonePairSummaryRequest
+	(*ZonePairSessionSummary)(nil),            // 129: xpf.v1.ZonePairSessionSummary
+	(*GetZonePairSummaryResponse)(nil),        // 130: xpf.v1.GetZonePairSummaryResponse
+	nil,                                       // 131: xpf.v1.GetGlobalStatsResponse.ScreenDropDetailsEntry
+	nil,                                       // 132: xpf.v1.ScreenInfo.ThresholdsEntry
 }
 var file_xpf_proto_depIdxs = []int32{
 	0,   // 0: xpf.v1.ShowConfigRequest.format:type_name -> xpf.v1.ConfigFormat
 	1,   // 1: xpf.v1.ShowConfigRequest.target:type_name -> xpf.v1.ConfigTarget
 	0,   // 2: xpf.v1.ShowRollbackRequest.format:type_name -> xpf.v1.ConfigFormat
-	35,  // 3: xpf.v1.ListHistoryResponse.entries:type_name -> xpf.v1.HistoryEntry
-	128, // 4: xpf.v1.GetGlobalStatsResponse.screen_drop_details:type_name -> xpf.v1.GetGlobalStatsResponse.ScreenDropDetailsEntry
-	42,  // 5: xpf.v1.GetZonesResponse.zones:type_name -> xpf.v1.ZoneInfo
-	43,  // 6: xpf.v1.ZoneInfo.interface_host_inbound:type_name -> xpf.v1.InterfaceHostInbound
-	46,  // 7: xpf.v1.GetPoliciesResponse.policies:type_name -> xpf.v1.PolicyInfo
-	47,  // 8: xpf.v1.PolicyInfo.rules:type_name -> xpf.v1.PolicyRule
-	50,  // 9: xpf.v1.GetSessionsResponse.sessions:type_name -> xpf.v1.SessionEntry
-	49,  // 10: xpf.v1.GetSessionsResponse.peer:type_name -> xpf.v1.GetSessionsResponse
-	52,  // 11: xpf.v1.GetSessionSummaryResponse.peer:type_name -> xpf.v1.GetSessionSummaryResponse
-	4,   // 12: xpf.v1.GetSessionSummaryResponse.peer_status:type_name -> xpf.v1.PeerFetchStatus
-	55,  // 13: xpf.v1.GetNATSourceResponse.rules:type_name -> xpf.v1.NATSourceInfo
-	58,  // 14: xpf.v1.GetNATDestinationResponse.rules:type_name -> xpf.v1.NATDestInfo
-	103, // 15: xpf.v1.GetNATDestinationResponse.rule_set_sessions:type_name -> xpf.v1.NATRuleSetSessions
-	61,  // 16: xpf.v1.GetScreenResponse.screens:type_name -> xpf.v1.ScreenInfo
-	129, // 17: xpf.v1.ScreenInfo.thresholds:type_name -> xpf.v1.ScreenInfo.ThresholdsEntry
-	64,  // 18: xpf.v1.GetEventsResponse.events:type_name -> xpf.v1.EventEntry
-	67,  // 19: xpf.v1.GetInterfacesResponse.interfaces:type_name -> xpf.v1.InterfaceInfo
-	72,  // 20: xpf.v1.GetDHCPLeasesResponse.leases:type_name -> xpf.v1.DHCPLeaseInfo
-	73,  // 21: xpf.v1.DHCPLeaseInfo.delegated_prefixes:type_name -> xpf.v1.DHCPDelegatedPrefix
-	76,  // 22: xpf.v1.GetDHCPClientIdentifiersResponse.identifiers:type_name -> xpf.v1.DHCPClientIdentifierInfo
-	81,  // 23: xpf.v1.GetRoutesResponse.routes:type_name -> xpf.v1.RouteInfo
-	102, // 24: xpf.v1.GetNATPoolStatsResponse.pools:type_name -> xpf.v1.NATPoolStats
-	103, // 25: xpf.v1.GetNATPoolStatsResponse.rule_set_sessions:type_name -> xpf.v1.NATRuleSetSessions
-	106, // 26: xpf.v1.GetVRRPStatusResponse.instances:type_name -> xpf.v1.VRRPInstanceInfo
-	109, // 27: xpf.v1.MatchPoliciesResponse.host_inbound:type_name -> xpf.v1.HostInboundAdmission
+	36,  // 3: xpf.v1.ListHistoryResponse.entries:type_name -> xpf.v1.HistoryEntry
+	131, // 4: xpf.v1.GetGlobalStatsResponse.screen_drop_details:type_name -> xpf.v1.GetGlobalStatsResponse.ScreenDropDetailsEntry
+	43,  // 5: xpf.v1.GetZonesResponse.zones:type_name -> xpf.v1.ZoneInfo
+	44,  // 6: xpf.v1.ZoneInfo.interface_host_inbound:type_name -> xpf.v1.InterfaceHostInbound
+	47,  // 7: xpf.v1.GetPoliciesResponse.policies:type_name -> xpf.v1.PolicyInfo
+	48,  // 8: xpf.v1.PolicyInfo.rules:type_name -> xpf.v1.PolicyRule
+	51,  // 9: xpf.v1.GetSessionsResponse.sessions:type_name -> xpf.v1.SessionEntry
+	50,  // 10: xpf.v1.GetSessionsResponse.peer:type_name -> xpf.v1.GetSessionsResponse
+	53,  // 11: xpf.v1.GetSessionSummaryResponse.peer:type_name -> xpf.v1.GetSessionSummaryResponse
+	5,   // 12: xpf.v1.GetSessionSummaryResponse.peer_status:type_name -> xpf.v1.PeerFetchStatus
+	56,  // 13: xpf.v1.GetNATSourceResponse.rules:type_name -> xpf.v1.NATSourceInfo
+	59,  // 14: xpf.v1.GetNATDestinationResponse.rules:type_name -> xpf.v1.NATDestInfo
+	104, // 15: xpf.v1.GetNATDestinationResponse.rule_set_sessions:type_name -> xpf.v1.NATRuleSetSessions
+	62,  // 16: xpf.v1.GetScreenResponse.screens:type_name -> xpf.v1.ScreenInfo
+	132, // 17: xpf.v1.ScreenInfo.thresholds:type_name -> xpf.v1.ScreenInfo.ThresholdsEntry
+	65,  // 18: xpf.v1.GetEventsResponse.events:type_name -> xpf.v1.EventEntry
+	68,  // 19: xpf.v1.GetInterfacesResponse.interfaces:type_name -> xpf.v1.InterfaceInfo
+	73,  // 20: xpf.v1.GetDHCPLeasesResponse.leases:type_name -> xpf.v1.DHCPLeaseInfo
+	74,  // 21: xpf.v1.DHCPLeaseInfo.delegated_prefixes:type_name -> xpf.v1.DHCPDelegatedPrefix
+	77,  // 22: xpf.v1.GetDHCPClientIdentifiersResponse.identifiers:type_name -> xpf.v1.DHCPClientIdentifierInfo
+	82,  // 23: xpf.v1.GetRoutesResponse.routes:type_name -> xpf.v1.RouteInfo
+	103, // 24: xpf.v1.GetNATPoolStatsResponse.pools:type_name -> xpf.v1.NATPoolStats
+	104, // 25: xpf.v1.GetNATPoolStatsResponse.rule_set_sessions:type_name -> xpf.v1.NATRuleSetSessions
+	107, // 26: xpf.v1.GetVRRPStatusResponse.instances:type_name -> xpf.v1.VRRPInstanceInfo
+	110, // 27: xpf.v1.MatchPoliciesResponse.host_inbound:type_name -> xpf.v1.HostInboundAdmission
 	3,   // 28: xpf.v1.HostInboundAdmission.status:type_name -> xpf.v1.HostInboundAdmissionStatus
-	112, // 29: xpf.v1.GetNATRuleStatsResponse.rules:type_name -> xpf.v1.NATRuleStats
-	2,   // 30: xpf.v1.MonitorInterfaceRequest.summary_mode:type_name -> xpf.v1.MonitorInterfaceSummaryMode
-	126, // 31: xpf.v1.GetZonePairSummaryResponse.zone_pairs:type_name -> xpf.v1.ZonePairSessionSummary
-	127, // 32: xpf.v1.GetZonePairSummaryResponse.peer:type_name -> xpf.v1.GetZonePairSummaryResponse
-	4,   // 33: xpf.v1.GetZonePairSummaryResponse.peer_status:type_name -> xpf.v1.PeerFetchStatus
-	5,   // 34: xpf.v1.BpfrxService.EnterConfigure:input_type -> xpf.v1.EnterConfigureRequest
-	7,   // 35: xpf.v1.BpfrxService.ExitConfigure:input_type -> xpf.v1.ExitConfigureRequest
-	9,   // 36: xpf.v1.BpfrxService.GetConfigModeStatus:input_type -> xpf.v1.GetConfigModeStatusRequest
-	11,  // 37: xpf.v1.BpfrxService.Set:input_type -> xpf.v1.SetRequest
-	13,  // 38: xpf.v1.BpfrxService.Delete:input_type -> xpf.v1.DeleteRequest
-	15,  // 39: xpf.v1.BpfrxService.Load:input_type -> xpf.v1.LoadRequest
-	17,  // 40: xpf.v1.BpfrxService.Commit:input_type -> xpf.v1.CommitRequest
-	19,  // 41: xpf.v1.BpfrxService.CommitCheck:input_type -> xpf.v1.CommitCheckRequest
-	21,  // 42: xpf.v1.BpfrxService.CommitConfirmed:input_type -> xpf.v1.CommitConfirmedRequest
-	23,  // 43: xpf.v1.BpfrxService.ConfirmCommit:input_type -> xpf.v1.ConfirmCommitRequest
-	25,  // 44: xpf.v1.BpfrxService.Rollback:input_type -> xpf.v1.RollbackRequest
-	27,  // 45: xpf.v1.BpfrxService.ShowConfig:input_type -> xpf.v1.ShowConfigRequest
-	29,  // 46: xpf.v1.BpfrxService.ShowCompare:input_type -> xpf.v1.ShowCompareRequest
-	31,  // 47: xpf.v1.BpfrxService.ShowRollback:input_type -> xpf.v1.ShowRollbackRequest
-	33,  // 48: xpf.v1.BpfrxService.ListHistory:input_type -> xpf.v1.ListHistoryRequest
-	36,  // 49: xpf.v1.BpfrxService.GetStatus:input_type -> xpf.v1.GetStatusRequest
-	38,  // 50: xpf.v1.BpfrxService.GetGlobalStats:input_type -> xpf.v1.GetGlobalStatsRequest
-	40,  // 51: xpf.v1.BpfrxService.GetZones:input_type -> xpf.v1.GetZonesRequest
-	44,  // 52: xpf.v1.BpfrxService.GetPolicies:input_type -> xpf.v1.GetPoliciesRequest
-	48,  // 53: xpf.v1.BpfrxService.GetSessions:input_type -> xpf.v1.GetSessionsRequest
-	51,  // 54: xpf.v1.BpfrxService.GetSessionSummary:input_type -> xpf.v1.GetSessionSummaryRequest
-	125, // 55: xpf.v1.BpfrxService.GetZonePairSummary:input_type -> xpf.v1.GetZonePairSummaryRequest
-	53,  // 56: xpf.v1.BpfrxService.GetNATSource:input_type -> xpf.v1.GetNATSourceRequest
-	56,  // 57: xpf.v1.BpfrxService.GetNATDestination:input_type -> xpf.v1.GetNATDestinationRequest
-	59,  // 58: xpf.v1.BpfrxService.GetScreen:input_type -> xpf.v1.GetScreenRequest
-	62,  // 59: xpf.v1.BpfrxService.GetEvents:input_type -> xpf.v1.GetEventsRequest
-	65,  // 60: xpf.v1.BpfrxService.GetInterfaces:input_type -> xpf.v1.GetInterfacesRequest
-	68,  // 61: xpf.v1.BpfrxService.ShowInterfacesDetail:input_type -> xpf.v1.ShowInterfacesDetailRequest
-	70,  // 62: xpf.v1.BpfrxService.GetDHCPLeases:input_type -> xpf.v1.GetDHCPLeasesRequest
-	74,  // 63: xpf.v1.BpfrxService.GetDHCPClientIdentifiers:input_type -> xpf.v1.GetDHCPClientIdentifiersRequest
-	79,  // 64: xpf.v1.BpfrxService.GetRoutes:input_type -> xpf.v1.GetRoutesRequest
-	82,  // 65: xpf.v1.BpfrxService.GetOSPFStatus:input_type -> xpf.v1.GetOSPFStatusRequest
-	84,  // 66: xpf.v1.BpfrxService.GetBGPStatus:input_type -> xpf.v1.GetBGPStatusRequest
-	86,  // 67: xpf.v1.BpfrxService.GetRIPStatus:input_type -> xpf.v1.GetRIPStatusRequest
-	88,  // 68: xpf.v1.BpfrxService.GetISISStatus:input_type -> xpf.v1.GetISISStatusRequest
-	90,  // 69: xpf.v1.BpfrxService.GetIPsecSA:input_type -> xpf.v1.GetIPsecSARequest
-	100, // 70: xpf.v1.BpfrxService.GetNATPoolStats:input_type -> xpf.v1.GetNATPoolStatsRequest
-	110, // 71: xpf.v1.BpfrxService.GetNATRuleStats:input_type -> xpf.v1.GetNATRuleStatsRequest
-	104, // 72: xpf.v1.BpfrxService.GetVRRPStatus:input_type -> xpf.v1.GetVRRPStatusRequest
-	107, // 73: xpf.v1.BpfrxService.MatchPolicies:input_type -> xpf.v1.MatchPoliciesRequest
-	92,  // 74: xpf.v1.BpfrxService.Ping:input_type -> xpf.v1.PingRequest
-	94,  // 75: xpf.v1.BpfrxService.Traceroute:input_type -> xpf.v1.TracerouteRequest
-	121, // 76: xpf.v1.BpfrxService.MonitorPacketDrop:input_type -> xpf.v1.MonitorPacketDropRequest
-	123, // 77: xpf.v1.BpfrxService.MonitorInterface:input_type -> xpf.v1.MonitorInterfaceRequest
-	96,  // 78: xpf.v1.BpfrxService.ClearSessions:input_type -> xpf.v1.ClearSessionsRequest
-	98,  // 79: xpf.v1.BpfrxService.ClearCounters:input_type -> xpf.v1.ClearCountersRequest
-	77,  // 80: xpf.v1.BpfrxService.ClearDHCPClientIdentifier:input_type -> xpf.v1.ClearDHCPClientIdentifierRequest
-	115, // 81: xpf.v1.BpfrxService.ShowText:input_type -> xpf.v1.ShowTextRequest
-	117, // 82: xpf.v1.BpfrxService.GetSystemInfo:input_type -> xpf.v1.GetSystemInfoRequest
-	119, // 83: xpf.v1.BpfrxService.SystemAction:input_type -> xpf.v1.SystemActionRequest
-	113, // 84: xpf.v1.BpfrxService.Complete:input_type -> xpf.v1.CompleteRequest
-	6,   // 85: xpf.v1.BpfrxService.EnterConfigure:output_type -> xpf.v1.EnterConfigureResponse
-	8,   // 86: xpf.v1.BpfrxService.ExitConfigure:output_type -> xpf.v1.ExitConfigureResponse
-	10,  // 87: xpf.v1.BpfrxService.GetConfigModeStatus:output_type -> xpf.v1.GetConfigModeStatusResponse
-	12,  // 88: xpf.v1.BpfrxService.Set:output_type -> xpf.v1.SetResponse
-	14,  // 89: xpf.v1.BpfrxService.Delete:output_type -> xpf.v1.DeleteResponse
-	16,  // 90: xpf.v1.BpfrxService.Load:output_type -> xpf.v1.LoadResponse
-	18,  // 91: xpf.v1.BpfrxService.Commit:output_type -> xpf.v1.CommitResponse
-	20,  // 92: xpf.v1.BpfrxService.CommitCheck:output_type -> xpf.v1.CommitCheckResponse
-	22,  // 93: xpf.v1.BpfrxService.CommitConfirmed:output_type -> xpf.v1.CommitConfirmedResponse
-	24,  // 94: xpf.v1.BpfrxService.ConfirmCommit:output_type -> xpf.v1.ConfirmCommitResponse
-	26,  // 95: xpf.v1.BpfrxService.Rollback:output_type -> xpf.v1.RollbackResponse
-	28,  // 96: xpf.v1.BpfrxService.ShowConfig:output_type -> xpf.v1.ShowConfigResponse
-	30,  // 97: xpf.v1.BpfrxService.ShowCompare:output_type -> xpf.v1.ShowCompareResponse
-	32,  // 98: xpf.v1.BpfrxService.ShowRollback:output_type -> xpf.v1.ShowRollbackResponse
-	34,  // 99: xpf.v1.BpfrxService.ListHistory:output_type -> xpf.v1.ListHistoryResponse
-	37,  // 100: xpf.v1.BpfrxService.GetStatus:output_type -> xpf.v1.GetStatusResponse
-	39,  // 101: xpf.v1.BpfrxService.GetGlobalStats:output_type -> xpf.v1.GetGlobalStatsResponse
-	41,  // 102: xpf.v1.BpfrxService.GetZones:output_type -> xpf.v1.GetZonesResponse
-	45,  // 103: xpf.v1.BpfrxService.GetPolicies:output_type -> xpf.v1.GetPoliciesResponse
-	49,  // 104: xpf.v1.BpfrxService.GetSessions:output_type -> xpf.v1.GetSessionsResponse
-	52,  // 105: xpf.v1.BpfrxService.GetSessionSummary:output_type -> xpf.v1.GetSessionSummaryResponse
-	127, // 106: xpf.v1.BpfrxService.GetZonePairSummary:output_type -> xpf.v1.GetZonePairSummaryResponse
-	54,  // 107: xpf.v1.BpfrxService.GetNATSource:output_type -> xpf.v1.GetNATSourceResponse
-	57,  // 108: xpf.v1.BpfrxService.GetNATDestination:output_type -> xpf.v1.GetNATDestinationResponse
-	60,  // 109: xpf.v1.BpfrxService.GetScreen:output_type -> xpf.v1.GetScreenResponse
-	63,  // 110: xpf.v1.BpfrxService.GetEvents:output_type -> xpf.v1.GetEventsResponse
-	66,  // 111: xpf.v1.BpfrxService.GetInterfaces:output_type -> xpf.v1.GetInterfacesResponse
-	69,  // 112: xpf.v1.BpfrxService.ShowInterfacesDetail:output_type -> xpf.v1.ShowInterfacesDetailResponse
-	71,  // 113: xpf.v1.BpfrxService.GetDHCPLeases:output_type -> xpf.v1.GetDHCPLeasesResponse
-	75,  // 114: xpf.v1.BpfrxService.GetDHCPClientIdentifiers:output_type -> xpf.v1.GetDHCPClientIdentifiersResponse
-	80,  // 115: xpf.v1.BpfrxService.GetRoutes:output_type -> xpf.v1.GetRoutesResponse
-	83,  // 116: xpf.v1.BpfrxService.GetOSPFStatus:output_type -> xpf.v1.GetOSPFStatusResponse
-	85,  // 117: xpf.v1.BpfrxService.GetBGPStatus:output_type -> xpf.v1.GetBGPStatusResponse
-	87,  // 118: xpf.v1.BpfrxService.GetRIPStatus:output_type -> xpf.v1.GetRIPStatusResponse
-	89,  // 119: xpf.v1.BpfrxService.GetISISStatus:output_type -> xpf.v1.GetISISStatusResponse
-	91,  // 120: xpf.v1.BpfrxService.GetIPsecSA:output_type -> xpf.v1.GetIPsecSAResponse
-	101, // 121: xpf.v1.BpfrxService.GetNATPoolStats:output_type -> xpf.v1.GetNATPoolStatsResponse
-	111, // 122: xpf.v1.BpfrxService.GetNATRuleStats:output_type -> xpf.v1.GetNATRuleStatsResponse
-	105, // 123: xpf.v1.BpfrxService.GetVRRPStatus:output_type -> xpf.v1.GetVRRPStatusResponse
-	108, // 124: xpf.v1.BpfrxService.MatchPolicies:output_type -> xpf.v1.MatchPoliciesResponse
-	93,  // 125: xpf.v1.BpfrxService.Ping:output_type -> xpf.v1.PingResponse
-	95,  // 126: xpf.v1.BpfrxService.Traceroute:output_type -> xpf.v1.TracerouteResponse
-	122, // 127: xpf.v1.BpfrxService.MonitorPacketDrop:output_type -> xpf.v1.MonitorPacketDropResponse
-	124, // 128: xpf.v1.BpfrxService.MonitorInterface:output_type -> xpf.v1.MonitorInterfaceResponse
-	97,  // 129: xpf.v1.BpfrxService.ClearSessions:output_type -> xpf.v1.ClearSessionsResponse
-	99,  // 130: xpf.v1.BpfrxService.ClearCounters:output_type -> xpf.v1.ClearCountersResponse
-	78,  // 131: xpf.v1.BpfrxService.ClearDHCPClientIdentifier:output_type -> xpf.v1.ClearDHCPClientIdentifierResponse
-	116, // 132: xpf.v1.BpfrxService.ShowText:output_type -> xpf.v1.ShowTextResponse
-	118, // 133: xpf.v1.BpfrxService.GetSystemInfo:output_type -> xpf.v1.GetSystemInfoResponse
-	120, // 134: xpf.v1.BpfrxService.SystemAction:output_type -> xpf.v1.SystemActionResponse
-	114, // 135: xpf.v1.BpfrxService.Complete:output_type -> xpf.v1.CompleteResponse
-	85,  // [85:136] is the sub-list for method output_type
-	34,  // [34:85] is the sub-list for method input_type
-	34,  // [34:34] is the sub-list for extension type_name
-	34,  // [34:34] is the sub-list for extension extendee
-	0,   // [0:34] is the sub-list for field type_name
+	113, // 29: xpf.v1.GetNATRuleStatsResponse.rules:type_name -> xpf.v1.NATRuleStats
+	4,   // 30: xpf.v1.GetNATDeterministicRequest.direction:type_name -> xpf.v1.NATDeterministicDirection
+	2,   // 31: xpf.v1.MonitorInterfaceRequest.summary_mode:type_name -> xpf.v1.MonitorInterfaceSummaryMode
+	129, // 32: xpf.v1.GetZonePairSummaryResponse.zone_pairs:type_name -> xpf.v1.ZonePairSessionSummary
+	130, // 33: xpf.v1.GetZonePairSummaryResponse.peer:type_name -> xpf.v1.GetZonePairSummaryResponse
+	5,   // 34: xpf.v1.GetZonePairSummaryResponse.peer_status:type_name -> xpf.v1.PeerFetchStatus
+	6,   // 35: xpf.v1.BpfrxService.EnterConfigure:input_type -> xpf.v1.EnterConfigureRequest
+	8,   // 36: xpf.v1.BpfrxService.ExitConfigure:input_type -> xpf.v1.ExitConfigureRequest
+	10,  // 37: xpf.v1.BpfrxService.GetConfigModeStatus:input_type -> xpf.v1.GetConfigModeStatusRequest
+	12,  // 38: xpf.v1.BpfrxService.Set:input_type -> xpf.v1.SetRequest
+	14,  // 39: xpf.v1.BpfrxService.Delete:input_type -> xpf.v1.DeleteRequest
+	16,  // 40: xpf.v1.BpfrxService.Load:input_type -> xpf.v1.LoadRequest
+	18,  // 41: xpf.v1.BpfrxService.Commit:input_type -> xpf.v1.CommitRequest
+	20,  // 42: xpf.v1.BpfrxService.CommitCheck:input_type -> xpf.v1.CommitCheckRequest
+	22,  // 43: xpf.v1.BpfrxService.CommitConfirmed:input_type -> xpf.v1.CommitConfirmedRequest
+	24,  // 44: xpf.v1.BpfrxService.ConfirmCommit:input_type -> xpf.v1.ConfirmCommitRequest
+	26,  // 45: xpf.v1.BpfrxService.Rollback:input_type -> xpf.v1.RollbackRequest
+	28,  // 46: xpf.v1.BpfrxService.ShowConfig:input_type -> xpf.v1.ShowConfigRequest
+	30,  // 47: xpf.v1.BpfrxService.ShowCompare:input_type -> xpf.v1.ShowCompareRequest
+	32,  // 48: xpf.v1.BpfrxService.ShowRollback:input_type -> xpf.v1.ShowRollbackRequest
+	34,  // 49: xpf.v1.BpfrxService.ListHistory:input_type -> xpf.v1.ListHistoryRequest
+	37,  // 50: xpf.v1.BpfrxService.GetStatus:input_type -> xpf.v1.GetStatusRequest
+	39,  // 51: xpf.v1.BpfrxService.GetGlobalStats:input_type -> xpf.v1.GetGlobalStatsRequest
+	41,  // 52: xpf.v1.BpfrxService.GetZones:input_type -> xpf.v1.GetZonesRequest
+	45,  // 53: xpf.v1.BpfrxService.GetPolicies:input_type -> xpf.v1.GetPoliciesRequest
+	49,  // 54: xpf.v1.BpfrxService.GetSessions:input_type -> xpf.v1.GetSessionsRequest
+	52,  // 55: xpf.v1.BpfrxService.GetSessionSummary:input_type -> xpf.v1.GetSessionSummaryRequest
+	128, // 56: xpf.v1.BpfrxService.GetZonePairSummary:input_type -> xpf.v1.GetZonePairSummaryRequest
+	54,  // 57: xpf.v1.BpfrxService.GetNATSource:input_type -> xpf.v1.GetNATSourceRequest
+	57,  // 58: xpf.v1.BpfrxService.GetNATDestination:input_type -> xpf.v1.GetNATDestinationRequest
+	60,  // 59: xpf.v1.BpfrxService.GetScreen:input_type -> xpf.v1.GetScreenRequest
+	63,  // 60: xpf.v1.BpfrxService.GetEvents:input_type -> xpf.v1.GetEventsRequest
+	66,  // 61: xpf.v1.BpfrxService.GetInterfaces:input_type -> xpf.v1.GetInterfacesRequest
+	69,  // 62: xpf.v1.BpfrxService.ShowInterfacesDetail:input_type -> xpf.v1.ShowInterfacesDetailRequest
+	71,  // 63: xpf.v1.BpfrxService.GetDHCPLeases:input_type -> xpf.v1.GetDHCPLeasesRequest
+	75,  // 64: xpf.v1.BpfrxService.GetDHCPClientIdentifiers:input_type -> xpf.v1.GetDHCPClientIdentifiersRequest
+	80,  // 65: xpf.v1.BpfrxService.GetRoutes:input_type -> xpf.v1.GetRoutesRequest
+	83,  // 66: xpf.v1.BpfrxService.GetOSPFStatus:input_type -> xpf.v1.GetOSPFStatusRequest
+	85,  // 67: xpf.v1.BpfrxService.GetBGPStatus:input_type -> xpf.v1.GetBGPStatusRequest
+	87,  // 68: xpf.v1.BpfrxService.GetRIPStatus:input_type -> xpf.v1.GetRIPStatusRequest
+	89,  // 69: xpf.v1.BpfrxService.GetISISStatus:input_type -> xpf.v1.GetISISStatusRequest
+	91,  // 70: xpf.v1.BpfrxService.GetIPsecSA:input_type -> xpf.v1.GetIPsecSARequest
+	101, // 71: xpf.v1.BpfrxService.GetNATPoolStats:input_type -> xpf.v1.GetNATPoolStatsRequest
+	111, // 72: xpf.v1.BpfrxService.GetNATRuleStats:input_type -> xpf.v1.GetNATRuleStatsRequest
+	114, // 73: xpf.v1.BpfrxService.GetNATDeterministic:input_type -> xpf.v1.GetNATDeterministicRequest
+	105, // 74: xpf.v1.BpfrxService.GetVRRPStatus:input_type -> xpf.v1.GetVRRPStatusRequest
+	108, // 75: xpf.v1.BpfrxService.MatchPolicies:input_type -> xpf.v1.MatchPoliciesRequest
+	93,  // 76: xpf.v1.BpfrxService.Ping:input_type -> xpf.v1.PingRequest
+	95,  // 77: xpf.v1.BpfrxService.Traceroute:input_type -> xpf.v1.TracerouteRequest
+	124, // 78: xpf.v1.BpfrxService.MonitorPacketDrop:input_type -> xpf.v1.MonitorPacketDropRequest
+	126, // 79: xpf.v1.BpfrxService.MonitorInterface:input_type -> xpf.v1.MonitorInterfaceRequest
+	97,  // 80: xpf.v1.BpfrxService.ClearSessions:input_type -> xpf.v1.ClearSessionsRequest
+	99,  // 81: xpf.v1.BpfrxService.ClearCounters:input_type -> xpf.v1.ClearCountersRequest
+	78,  // 82: xpf.v1.BpfrxService.ClearDHCPClientIdentifier:input_type -> xpf.v1.ClearDHCPClientIdentifierRequest
+	118, // 83: xpf.v1.BpfrxService.ShowText:input_type -> xpf.v1.ShowTextRequest
+	120, // 84: xpf.v1.BpfrxService.GetSystemInfo:input_type -> xpf.v1.GetSystemInfoRequest
+	122, // 85: xpf.v1.BpfrxService.SystemAction:input_type -> xpf.v1.SystemActionRequest
+	116, // 86: xpf.v1.BpfrxService.Complete:input_type -> xpf.v1.CompleteRequest
+	7,   // 87: xpf.v1.BpfrxService.EnterConfigure:output_type -> xpf.v1.EnterConfigureResponse
+	9,   // 88: xpf.v1.BpfrxService.ExitConfigure:output_type -> xpf.v1.ExitConfigureResponse
+	11,  // 89: xpf.v1.BpfrxService.GetConfigModeStatus:output_type -> xpf.v1.GetConfigModeStatusResponse
+	13,  // 90: xpf.v1.BpfrxService.Set:output_type -> xpf.v1.SetResponse
+	15,  // 91: xpf.v1.BpfrxService.Delete:output_type -> xpf.v1.DeleteResponse
+	17,  // 92: xpf.v1.BpfrxService.Load:output_type -> xpf.v1.LoadResponse
+	19,  // 93: xpf.v1.BpfrxService.Commit:output_type -> xpf.v1.CommitResponse
+	21,  // 94: xpf.v1.BpfrxService.CommitCheck:output_type -> xpf.v1.CommitCheckResponse
+	23,  // 95: xpf.v1.BpfrxService.CommitConfirmed:output_type -> xpf.v1.CommitConfirmedResponse
+	25,  // 96: xpf.v1.BpfrxService.ConfirmCommit:output_type -> xpf.v1.ConfirmCommitResponse
+	27,  // 97: xpf.v1.BpfrxService.Rollback:output_type -> xpf.v1.RollbackResponse
+	29,  // 98: xpf.v1.BpfrxService.ShowConfig:output_type -> xpf.v1.ShowConfigResponse
+	31,  // 99: xpf.v1.BpfrxService.ShowCompare:output_type -> xpf.v1.ShowCompareResponse
+	33,  // 100: xpf.v1.BpfrxService.ShowRollback:output_type -> xpf.v1.ShowRollbackResponse
+	35,  // 101: xpf.v1.BpfrxService.ListHistory:output_type -> xpf.v1.ListHistoryResponse
+	38,  // 102: xpf.v1.BpfrxService.GetStatus:output_type -> xpf.v1.GetStatusResponse
+	40,  // 103: xpf.v1.BpfrxService.GetGlobalStats:output_type -> xpf.v1.GetGlobalStatsResponse
+	42,  // 104: xpf.v1.BpfrxService.GetZones:output_type -> xpf.v1.GetZonesResponse
+	46,  // 105: xpf.v1.BpfrxService.GetPolicies:output_type -> xpf.v1.GetPoliciesResponse
+	50,  // 106: xpf.v1.BpfrxService.GetSessions:output_type -> xpf.v1.GetSessionsResponse
+	53,  // 107: xpf.v1.BpfrxService.GetSessionSummary:output_type -> xpf.v1.GetSessionSummaryResponse
+	130, // 108: xpf.v1.BpfrxService.GetZonePairSummary:output_type -> xpf.v1.GetZonePairSummaryResponse
+	55,  // 109: xpf.v1.BpfrxService.GetNATSource:output_type -> xpf.v1.GetNATSourceResponse
+	58,  // 110: xpf.v1.BpfrxService.GetNATDestination:output_type -> xpf.v1.GetNATDestinationResponse
+	61,  // 111: xpf.v1.BpfrxService.GetScreen:output_type -> xpf.v1.GetScreenResponse
+	64,  // 112: xpf.v1.BpfrxService.GetEvents:output_type -> xpf.v1.GetEventsResponse
+	67,  // 113: xpf.v1.BpfrxService.GetInterfaces:output_type -> xpf.v1.GetInterfacesResponse
+	70,  // 114: xpf.v1.BpfrxService.ShowInterfacesDetail:output_type -> xpf.v1.ShowInterfacesDetailResponse
+	72,  // 115: xpf.v1.BpfrxService.GetDHCPLeases:output_type -> xpf.v1.GetDHCPLeasesResponse
+	76,  // 116: xpf.v1.BpfrxService.GetDHCPClientIdentifiers:output_type -> xpf.v1.GetDHCPClientIdentifiersResponse
+	81,  // 117: xpf.v1.BpfrxService.GetRoutes:output_type -> xpf.v1.GetRoutesResponse
+	84,  // 118: xpf.v1.BpfrxService.GetOSPFStatus:output_type -> xpf.v1.GetOSPFStatusResponse
+	86,  // 119: xpf.v1.BpfrxService.GetBGPStatus:output_type -> xpf.v1.GetBGPStatusResponse
+	88,  // 120: xpf.v1.BpfrxService.GetRIPStatus:output_type -> xpf.v1.GetRIPStatusResponse
+	90,  // 121: xpf.v1.BpfrxService.GetISISStatus:output_type -> xpf.v1.GetISISStatusResponse
+	92,  // 122: xpf.v1.BpfrxService.GetIPsecSA:output_type -> xpf.v1.GetIPsecSAResponse
+	102, // 123: xpf.v1.BpfrxService.GetNATPoolStats:output_type -> xpf.v1.GetNATPoolStatsResponse
+	112, // 124: xpf.v1.BpfrxService.GetNATRuleStats:output_type -> xpf.v1.GetNATRuleStatsResponse
+	115, // 125: xpf.v1.BpfrxService.GetNATDeterministic:output_type -> xpf.v1.GetNATDeterministicResponse
+	106, // 126: xpf.v1.BpfrxService.GetVRRPStatus:output_type -> xpf.v1.GetVRRPStatusResponse
+	109, // 127: xpf.v1.BpfrxService.MatchPolicies:output_type -> xpf.v1.MatchPoliciesResponse
+	94,  // 128: xpf.v1.BpfrxService.Ping:output_type -> xpf.v1.PingResponse
+	96,  // 129: xpf.v1.BpfrxService.Traceroute:output_type -> xpf.v1.TracerouteResponse
+	125, // 130: xpf.v1.BpfrxService.MonitorPacketDrop:output_type -> xpf.v1.MonitorPacketDropResponse
+	127, // 131: xpf.v1.BpfrxService.MonitorInterface:output_type -> xpf.v1.MonitorInterfaceResponse
+	98,  // 132: xpf.v1.BpfrxService.ClearSessions:output_type -> xpf.v1.ClearSessionsResponse
+	100, // 133: xpf.v1.BpfrxService.ClearCounters:output_type -> xpf.v1.ClearCountersResponse
+	79,  // 134: xpf.v1.BpfrxService.ClearDHCPClientIdentifier:output_type -> xpf.v1.ClearDHCPClientIdentifierResponse
+	119, // 135: xpf.v1.BpfrxService.ShowText:output_type -> xpf.v1.ShowTextResponse
+	121, // 136: xpf.v1.BpfrxService.GetSystemInfo:output_type -> xpf.v1.GetSystemInfoResponse
+	123, // 137: xpf.v1.BpfrxService.SystemAction:output_type -> xpf.v1.SystemActionResponse
+	117, // 138: xpf.v1.BpfrxService.Complete:output_type -> xpf.v1.CompleteResponse
+	87,  // [87:139] is the sub-list for method output_type
+	35,  // [35:87] is the sub-list for method input_type
+	35,  // [35:35] is the sub-list for extension type_name
+	35,  // [35:35] is the sub-list for extension extendee
+	0,   // [0:35] is the sub-list for field type_name
 }
 
 func init() { file_xpf_proto_init() }
@@ -9231,8 +9537,8 @@ func file_xpf_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_xpf_proto_rawDesc), len(file_xpf_proto_rawDesc)),
-			NumEnums:      5,
-			NumMessages:   125,
+			NumEnums:      6,
+			NumMessages:   127,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

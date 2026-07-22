@@ -48,6 +48,18 @@ func natCIDRIPPart(cidr string) string {
 	return cidr
 }
 
+// NATAddrFamily exposes natAddrFamily to the shared control-plane NAT query
+// package (pkg/nat), so the forensic deterministic-NAT forward/reverse lookup
+// classifies pool and prefix addresses with the SAME colon-strict Go/Rust
+// parity rule the commit gate uses — never Go's net.IP.To4(), which folds an
+// IPv4-mapped literal and diverges from the Rust dataplane parsers. See
+// natAddrFamily.
+func NATAddrFamily(ipPart string) string { return natAddrFamily(ipPart) }
+
+// NATCIDRIPPart exposes natCIDRIPPart so the same shared package can strip a
+// CIDR mask before the textual family classification. See natCIDRIPPart.
+func NATCIDRIPPart(cidr string) string { return natCIDRIPPart(cidr) }
+
 // isHostMaskAddress reports whether addr is a host route the static-NAT
 // dataplane can install: a bare IP (no mask) or the canonical host mask
 // (/32 for IPv4, /128 for IPv6). It mirrors EXACTLY the Rust host-mask gate

@@ -3,10 +3,12 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/nat"
 )
 
 // runtimeSourceNATPools returns the userspace helper's live source-NAT pool
@@ -57,6 +59,117 @@ func (s *Server) runtimeSourceNATPools() (map[string]dpuserspace.SourceNATPoolSt
 		pools[p.PoolName] = p
 	}
 	return pools, nil
+}
+
+// appliedNATView projects the userspace manager's last-applied NAT snapshot
+// into a nat.AppliedView for the deterministic-mapping lookup. Reads only
+// cached in-memory state; returns an unavailable view when the dataplane is
+// not the userspace manager, is not running, or has applied nothing (#5794).
+func (s *Server) appliedNATView() nat.AppliedView {
+	if s.dp == nil {
+		return nat.AppliedView{Available: false}
+	}
+	provider, ok := s.dp.(interface {
+		AppliedNATView() dpuserspace.AppliedNATView
+	})
+	if !ok {
+		return nat.AppliedView{Available: false}
+	}
+	v := provider.AppliedNATView()
+	if !v.Available || v.Config == nil {
+		return nat.AppliedView{Available: false}
+	}
+	return nat.AppliedView{Config: v.Config, Generation: v.AppliedGeneration, Available: true}
+}
+
+// natDeterministicHandler resolves a deterministic source-NAT mapping
+// (#5794). Forward:  GET .../deterministic?internal-host=<ip>[&pool=<name>].
+// Reverse:  GET .../deterministic?nat-ip=<ip>&nat-port=<n>[&pool=<name>].
+// Every outcome (including a lookup failure) is returned as a 200 typed
+// NATDeterministicInfo body so the REST answer is identical to the gRPC and
+// CLI answer; the stable ErrorCode drives machine consumers.
+func (s *Server) natDeterministicHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	pool := q.Get("pool")
+	internal := q.Get("internal-host")
+	natIP := q.Get("nat-ip")
+	natPortStr := q.Get("nat-port")
+	view := s.appliedNATView()
+
+	switch {
+	case internal != "":
+		res, lerr := nat.LookupForward(view, pool, internal)
+		if lerr != nil {
+			writeOK(w, natDeterministicErrInfo("forward", lerr))
+			return
+		}
+		writeOK(w, natForwardInfo(res))
+	case natIP != "":
+		port, err := strconv.Atoi(natPortStr)
+		if err != nil || port < 1 || port > 65535 {
+			writeOK(w, NATDeterministicInfo{
+				Found:       false,
+				Direction:   "reverse",
+				ErrorCode:   nat.ErrCodeMalformedInput,
+				ErrorDetail: "nat-port must be 1-65535",
+			})
+			return
+		}
+		res, lerr := nat.LookupReverse(view, pool, natIP, uint16(port))
+		if lerr != nil {
+			writeOK(w, natDeterministicErrInfo("reverse", lerr))
+			return
+		}
+		writeOK(w, natReverseInfo(res))
+	default:
+		writeOK(w, NATDeterministicInfo{
+			Found:       false,
+			ErrorCode:   nat.ErrCodeMalformedInput,
+			ErrorDetail: "specify internal-host=<ip> (forward) or nat-ip=<ip>&nat-port=<n> (reverse)",
+		})
+	}
+}
+
+func natForwardInfo(r *nat.ForwardResult) NATDeterministicInfo {
+	return NATDeterministicInfo{
+		Found:             true,
+		Direction:         "forward",
+		Pool:              r.Pool,
+		Mode:              uint8(r.Mode),
+		InternalHost:      r.InternalHost,
+		ExternalIP:        r.ExternalIP,
+		PortLow:           r.PortLow,
+		PortHigh:          r.PortHigh,
+		BlockSize:         r.BlockSize,
+		BlockIndex:        r.BlockIndex,
+		AppliedGeneration: r.AppliedGeneration,
+	}
+}
+
+func natReverseInfo(r *nat.ReverseResult) NATDeterministicInfo {
+	return NATDeterministicInfo{
+		Found:             true,
+		Direction:         "reverse",
+		Pool:              r.Pool,
+		Mode:              uint8(r.Mode),
+		InternalHost:      r.InternalHost,
+		ExternalIP:        r.ExternalIP,
+		NATPort:           r.NATPort,
+		PortLow:           r.PortLow,
+		PortHigh:          r.PortHigh,
+		BlockSize:         r.BlockSize,
+		BlockIndex:        r.BlockIndex,
+		AppliedGeneration: r.AppliedGeneration,
+	}
+}
+
+func natDeterministicErrInfo(direction string, lerr *nat.LookupError) NATDeterministicInfo {
+	return NATDeterministicInfo{
+		Found:       false,
+		Direction:   direction,
+		ErrorCode:   lerr.Code,
+		ErrorDetail: lerr.Detail,
+	}
 }
 
 func (s *Server) natSourceHandler(w http.ResponseWriter, _ *http.Request) {

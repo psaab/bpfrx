@@ -3,10 +3,13 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/nat"
 	"github.com/psaab/xpf/pkg/natshow"
 )
 
@@ -81,6 +84,8 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 				return c.showNATSourceRuleSet(cfg, args[1])
 			}
 			return fmt.Errorf("usage: show security nat source rule-set <name>")
+		case "deterministic-nat":
+			return c.showNATDeterministic(args[1:])
 		}
 	}
 
@@ -894,4 +899,78 @@ func (c *CLI) showNPTv6(cfg *config.Config) error {
 	// #1687: shared with the gRPC ShowText path via pkg/natshow.
 	natshow.RenderNPTv6(os.Stdout, cfg)
 	return nil
+}
+
+// appliedNATView projects the userspace manager's last-applied NAT snapshot
+// into a nat.AppliedView for the deterministic-mapping lookup (#5794). Reads
+// only cached in-memory state; returns an unavailable view when the
+// dataplane is not the userspace manager, is not running, or has applied
+// nothing.
+func (c *CLI) appliedNATView() nat.AppliedView {
+	if c.dp == nil {
+		return nat.AppliedView{Available: false}
+	}
+	provider, ok := c.dp.(interface {
+		AppliedNATView() dpuserspace.AppliedNATView
+	})
+	if !ok {
+		return nat.AppliedView{Available: false}
+	}
+	v := provider.AppliedNATView()
+	if !v.Available || v.Config == nil {
+		return nat.AppliedView{Available: false}
+	}
+	return nat.AppliedView{Config: v.Config, Generation: v.AppliedGeneration, Available: true}
+}
+
+// showNATDeterministic resolves a deterministic source-NAT mapping against
+// the last-applied NAT generation (#5794). args are the tokens AFTER
+// "deterministic-nat":
+//
+//	internal-host <ip> [pool <name>]           (forward)
+//	nat-ip <ip> nat-port <port> [pool <name>]  (reverse)
+func (c *CLI) showNATDeterministic(args []string) error {
+	usage := "usage: show security nat source deterministic-nat (internal-host <ip> | nat-ip <ip> nat-port <port>) [pool <name>]"
+	if len(args) == 0 {
+		return fmt.Errorf("%s", usage)
+	}
+	view := c.appliedNATView()
+	switch args[0] {
+	case "internal-host":
+		if len(args) < 2 {
+			return fmt.Errorf("%s", usage)
+		}
+		res, lerr := nat.LookupForward(view, natPoolArg(args[2:]), args[1])
+		if lerr != nil {
+			fmt.Printf("No deterministic mapping (%s): %s\n", lerr.Code, lerr.Detail)
+			return nil
+		}
+		res.Render(os.Stdout)
+		return nil
+	case "nat-ip":
+		if len(args) < 4 || args[2] != "nat-port" {
+			return fmt.Errorf("%s", usage)
+		}
+		port, err := strconv.Atoi(args[3])
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("nat-port must be 1-65535")
+		}
+		res, lerr := nat.LookupReverse(view, natPoolArg(args[4:]), args[1], uint16(port))
+		if lerr != nil {
+			fmt.Printf("No deterministic mapping (%s): %s\n", lerr.Code, lerr.Detail)
+			return nil
+		}
+		res.Render(os.Stdout)
+		return nil
+	default:
+		return fmt.Errorf("unknown deterministic-nat query %q (want internal-host or nat-ip)", args[0])
+	}
+}
+
+// natPoolArg extracts an optional trailing `pool <name>` filter.
+func natPoolArg(rest []string) string {
+	if len(rest) >= 2 && rest[0] == "pool" {
+		return rest[1]
+	}
+	return ""
 }
