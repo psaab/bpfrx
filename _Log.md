@@ -55748,5 +55748,61 @@ top.
   userspace-dp/src/filter/README.md, _Log.md
 
 - **Timestamp**: 2026-07-22
+- **Action**: Fix #6279 — wg-interop.sh P1 config commit failed on WireGuard
+  peer schema drift. The harness committed `set ... tunnel wireguard peer
+  public-key <hex>` / `peer allowed-ips <cidr>`, a pre-#1434 grammar. Under the
+  current multi-peer schema (pkg/config/schema_interfaces.go) the peer is a
+  NAMED INSTANCE keyed by its public key — `peer <64-hex-pubkey> { allowed-ips;
+  endpoint; ... }` with NO `public-key` child leaf. The old form created a bogus
+  peer literally named "public-key", and the commit check rejected it with
+  `peer 0 has an invalid public key (got "public-key")`. Rewrote the peer
+  set-commands (P1 create + P6 re-commit + the P1 endpoint line) to use the
+  pubkey as the peer instance arg, and fixed the P3 endpoint-removal delete
+  (`delete ... peer <hex> endpoint`, was `peer endpoint` — deleted a nonexistent
+  peer named "endpoint" leaving xpf an initiator). Added a fail-fast assert in
+  xpf_wg_commit that PEER_PUB_HEX and XPF_PRIV_HEX are each 64 hex chars before
+  committing, so an empty/unsubstituted capture fails with a clear message
+  instead of a cryptic commit-check rejection. Added a `with_predelete` param to
+  xpf_wg_commit: configure_p1 already runs a standalone wg_stanza_delete before
+  the fresh P1 create, so it now passes predelete=0 — eliminating the benign but
+  confusing `path not found: no node matching "wg0"` on every clean run; the P6
+  re-commit keeps predelete=1 (inline replace of the existing stanza), so its
+  behavior is unchanged. Validated locally: base64->hex conversion (base64 -d |
+  od -An -tx1) yields 64 hex chars and round-trips to the original base64; the
+  assert accepts a real key and rejects both "public-key" and empty; bash -n +
+  shellcheck clean (only a pre-existing SC2034). The live `wg-interop.sh all`
+  cluster run (P1+ traffic) is the parent's gate.
+- **File(s)**: test/incus/wg-interop.sh, docs/wg-interop-runbook.md, _Log.md
+
+- **Timestamp**: 2026-07-22 (session 01Be82z)
+- **Action**: Fix wg-interop P2 host-inbound bit-rot — zone wg0 for peer-initiated inner traffic
+- **File(s)**: test/incus/wg-interop.sh, docs/wg-interop-runbook.md, _Log.md
+  - **Verdict**: HARNESS CONFIG GAP (not a dataplane bug). P2 `peer->xpf inner v4
+    ping failed` while `xpf->peer` passed. Root cause: a decap'd WireGuard inner
+    packet is written to the wg0 TUN and firewalled by the KERNEL nftables
+    `xpf_hostinbound` chain (#3070, `applyHostInboundFilter` / `BuildZoneHost
+    InboundViews`). The harness left wg0 in NO security zone, so its inner address
+    (10.78.0.1 / fd00:78::1) fell into the #4420 HI-2 addressed-but-unzoned
+    catch-all DROP. `xpf->peer` survived on the chain's leading
+    `ct state established,related accept`, making the drop look one-directional.
+  - **Timeline**: harness added 2026-06-10 (c5580e0ac #1736); #3070 host-inbound
+    enforcement landed 2026-06-25 (69409ecba), merged 2026-06-26 (#3092) — the
+    unzoned-wg0 config predates enforcement by 15 days (same bit-rot class as the
+    P1 schema drift).
+  - **Fix**: xpf_wg_commit now commits, in the same node0-scoped transaction, a
+    dedicated `security zones security-zone wg interfaces wg0.0` +
+    `host-inbound-traffic system-services ping` (mirrors the base config's
+    gr-0/0/0.0 GRE tunnel in the sfmix zone). wg_stanza_delete + teardown delete
+    the zone WITH wg0 in the same commit — a zone naming an undefined interface is
+    a strict commit reject (#5248), so the two are always created/deleted as a pair.
+  - **Validation**: firsthand offline compile test (throwaway, removed) through the
+    real parser + CompileConfigForNode(node0) + BuildZoneHostInboundViews /
+    BuildUnzonedHostInboundAddrs proved: BEFORE — 10.78.0.1 & fd00:78::1 in the
+    unzoned DROP set; AFTER — the group-scoped `wg` zone MERGES (unions with the
+    top-level `lan` zone, no replace), both inner addrs LEAVE the unzoned set and
+    land in the `wg` view with the `ping` service (kernel emits icmp/icmpv6
+    echo-request accept for v4+v6). bash -n OK; shellcheck introduces no new
+    findings (3 pre-existing SC1091/SC2034 on the source/lock preamble). The live
+    `wg-interop.sh all` cluster run is the parent's gate.
   **Action**: #6125 — document the deliberate DF-set transit TCP re-segment (not PTB) contract (delivery-over-strict-PMTUD). Docs-only adjudication (path (a)); no code change.
   **File(s)**: docs/feature-coverage.md, userspace-dp/src/afxdp/tx/README.md

@@ -23,8 +23,10 @@
 # Shared-cluster discipline: EVERY incus command runs under
 # flock /tmp/xpf-cluster.lock + sg incus-admin. Long-running traffic is
 # detached INSIDE the instances so the lock is never held across a
-# multi-minute phase. The xpf config change is additive (a single
-# `groups node0 interfaces wg0` stanza) and removed at teardown.
+# multi-minute phase. The xpf config change is additive (a node0-scoped
+# `groups node0 interfaces wg0` stanza PLUS a node0-scoped
+# `security zones security-zone wg` that grants host-inbound ping to the
+# wg0 inner address — see xpf_wg_commit) and both are removed at teardown.
 #
 # MANDATORY secondary suppression (plan §4): the wg0 stanza is scoped
 # under `groups node0` so fw1 (which ALSO holds 10.0.61.1/24) never
@@ -423,6 +425,7 @@ peer_wg_setup() { # peer_wg_setup [endpoint_spec] [allowed_ips] [mtu]
 wg_stanza_delete() {
     fw0_cli > "${EVID}/wg-stanza-delete.txt" 2>&1 <<EOF
 configure
+delete groups node0 security zones security-zone wg
 delete groups node0 interfaces wg0
 commit
 exit
@@ -434,20 +437,65 @@ EOF
 }
 
 # xpf config commit. with_endpoint=1 → initiator role (endpoint set).
-xpf_wg_commit() { # xpf_wg_commit <with_endpoint>
-    local ep_line=""
-    [ "$1" = 1 ] && ep_line="set groups node0 interfaces wg0 tunnel wireguard peer endpoint ${WG_PEER_LAN4%%/*}:${WG_LISTEN_PORT}"
+#
+# The WireGuard peer is a NAMED-INSTANCE keyed by its public key (#1434
+# multi-peer schema, pkg/config/schema_interfaces.go): the config shape
+# is `peer <public-key-hex> { allowed-ips; endpoint; ... }`. There is NO
+# `public-key` child leaf — the pubkey IS the peer's instance arg. The
+# old `peer public-key <hex>` / `peer allowed-ips <cidr>` form drifted
+# from this schema: it created a bogus peer literally named "public-key"
+# (and another named "allowed-ips"), and the commit check rejected it
+# with `peer 0 has an invalid public key (got "public-key")` (#6279).
+#
+# with_predelete=1 (default) emits the belt `delete groups node0
+# interfaces wg0` INSIDE the same commit so an already-present stanza is
+# replaced in place (the P6 re-commit path — wg0 exists there).
+# configure_p1 runs a standalone wg_stanza_delete before the fresh P1
+# create, so it passes with_predelete=0: without the stanza present, the
+# inline delete of an absent wg0 emitted a benign but confusing
+# `path not found: no node matching "wg0"` on every clean run (#6279).
+#
+# HOST-INBOUND (#6279 P2 bit-rot): the same commit also puts wg0.0 in a
+# node0-scoped `security zones security-zone wg` with
+# `host-inbound-traffic system-services ping`. #3070 (2026-06-25, 15 days
+# AFTER this harness was written) made zone host-inbound-traffic ENFORCED:
+# a decap'd WireGuard inner packet is written to the wg0 TUN and firewalled
+# by the KERNEL nftables `xpf_hostinbound` chain (dst-address keyed, grouped
+# by zone). With wg0 in NO zone its inner address falls into the #4420 HI-2
+# addressed-but-unzoned catch-all DROP, so a PEER-initiated inner ping to
+# the xpf wg0 address is dropped (xpf->peer still works — the reply rides
+# the chain's leading `ct state established,related accept`). The dedicated
+# `wg` zone moves the inner v4+v6 addrs into a zoned `icmp/icmpv6 type
+# echo-request accept` (mirrors the base config's gr-0/0/0.0 tunnel in the
+# sfmix zone). The zone MUST be node0-scoped and torn down WITH wg0 in the
+# same commit — a zone referencing an undefined interface is a strict commit
+# reject (#5248), so the zone and interface are always created/deleted as a
+# pair (xpf_wg_commit adds both; wg_stanza_delete + teardown delete both).
+xpf_wg_commit() { # xpf_wg_commit <with_endpoint> [with_predelete=1]
+    local ep_line="" del_line="delete groups node0 interfaces wg0"
+    [ "$1" = 1 ] && ep_line="set groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} endpoint ${WG_PEER_LAN4%%/*}:${WG_LISTEN_PORT}"
+    [ "${2:-1}" = 0 ] && del_line=""
+    # Fail fast rather than committing a placeholder: the peer pubkey and
+    # xpf privkey MUST each be exactly 64 hex chars (32-byte X25519) or
+    # the commit check rejects the tunnel. This catches an empty or
+    # unsubstituted capture (#6279) with a clear message at the point of
+    # use, instead of a cryptic commit-check rejection downstream.
+    [[ "${PEER_PUB_HEX}" =~ ^[0-9a-fA-F]{64}$ ]] \
+        || fail "xpf commit: PEER_PUB_HEX is not a 64-hex key: '${PEER_PUB_HEX}'"
+    [[ "${XPF_PRIV_HEX}" =~ ^[0-9a-fA-F]{64}$ ]] \
+        || fail "xpf commit: XPF_PRIV_HEX is not a 64-hex key: '${XPF_PRIV_HEX}'"
     fw0_cli > "${EVID}/xpf-commit-$1.txt" 2>&1 <<EOF
 configure
-delete groups node0 interfaces wg0
+${del_line}
 set groups node0 interfaces wg0 unit 0 family inet address ${WG_INNER4_XPF}/24
 set groups node0 interfaces wg0 unit 0 family inet6 address ${WG_INNER6_XPF}/64
 set groups node0 interfaces wg0 tunnel mode wireguard
 set groups node0 interfaces wg0 tunnel wireguard listen-port ${WG_LISTEN_PORT}
 set groups node0 interfaces wg0 tunnel wireguard private-key ${XPF_PRIV_HEX}
-set groups node0 interfaces wg0 tunnel wireguard peer public-key ${PEER_PUB_HEX}
-set groups node0 interfaces wg0 tunnel wireguard peer allowed-ips ${WG_INNER4_CIDR}
-set groups node0 interfaces wg0 tunnel wireguard peer allowed-ips ${WG_INNER6_CIDR}
+set groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} allowed-ips ${WG_INNER4_CIDR}
+set groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} allowed-ips ${WG_INNER6_CIDR}
+set groups node0 security zones security-zone wg interfaces wg0.0
+set groups node0 security zones security-zone wg host-inbound-traffic system-services ping
 ${ep_line}
 commit
 exit
@@ -529,7 +577,10 @@ configure_p1() {
         ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P1: xpfd restart failed"
         ensure_wg_mastership "p1-leak" || fail "P1: WG VIP not restored after leak-recovery restart + failback"
     fi
-    xpf_wg_commit 1
+    # wg_stanza_delete above already removed any prior wg0 stanza, so the
+    # fresh create needs no inline predelete (with_predelete=0) — avoids a
+    # benign `no node matching "wg0"` on every clean P1 run (#6279).
+    xpf_wg_commit 1 0
     # The apply pipeline (tunnels -> dataplane -> FRR) is asynchronous
     # relative to the CLI commit returning; poll for the TUN + bind
     # rather than asserting at a fixed offset.
@@ -657,7 +708,7 @@ test_p3() {
     log "P3: remove xpf endpoint (responder role); peer becomes initiator"
     fw0_cli > "${EVID}/p3-commit.txt" 2>&1 <<EOF
 configure
-delete groups node0 interfaces wg0 tunnel wireguard peer endpoint
+delete groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} endpoint
 commit
 exit
 quit
@@ -816,6 +867,7 @@ teardown() {
     ensure_wg_mastership "teardown" || fail "teardown: WG VIP/mastership not restorable — cannot commit the stanza removal"
     fw0_cli > "${EVID}/teardown-commit.txt" 2>&1 <<EOF
 configure
+delete groups node0 security zones security-zone wg
 delete groups node0 interfaces wg0
 commit
 exit

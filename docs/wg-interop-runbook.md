@@ -104,6 +104,64 @@ replay-rejection of fw0's own re-handshakes). The harness asserts at P1
 that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
 ("BLOCKING finding") if scoping ever stops compiling.
 
+## wg0 peer config shape (harness commit path)
+
+The harness commits the xpf side as an apply-group (`groups node0`) so
+the stanza is node0-scoped (see above). Under the #1434 multi-peer
+schema the WireGuard **peer is a named instance keyed by its public
+key** — the pubkey IS the instance arg, there is no `public-key` child
+leaf:
+
+```
+set groups node0 interfaces wg0 tunnel wireguard private-key <64-hex>
+set groups node0 interfaces wg0 tunnel wireguard peer <64-hex-pubkey> allowed-ips 10.78.0.0/24
+set groups node0 interfaces wg0 tunnel wireguard peer <64-hex-pubkey> allowed-ips fd78::/64
+set groups node0 interfaces wg0 tunnel wireguard peer <64-hex-pubkey> endpoint <ip>:51820
+```
+
+Keys are **hex** in the xpf config but `wg genkey`/`wg pubkey` emit
+**base64**, so the harness converts base64→hex (`base64 -d | od -An
+-tx1`) before the commit and asserts a 64-hex length. An earlier
+`peer public-key <hex>` form (a pre-#1434 grammar) drifted from this
+schema: it committed a bogus peer literally named `public-key`, which
+the commit check rejected with `peer 0 has an invalid public key (got
+"public-key")` — the #6279 harness bit-rot. `test/incus/wg-interop.sh`
+fails fast if the captured key is not 64 hex chars before it commits.
+
+### wg0 host-inbound zone — REQUIRED for peer-initiated inner traffic (#6279 P2)
+
+The same commit ALSO puts `wg0.0` in a node0-scoped security zone that
+permits host-inbound ping:
+
+```
+set groups node0 security zones security-zone wg interfaces wg0.0
+set groups node0 security zones security-zone wg host-inbound-traffic system-services ping
+```
+
+Why it is mandatory: a decap'd WireGuard **inner** packet is written to
+the `wg0` TUN and firewalled by the **kernel** nftables `xpf_hostinbound`
+chain (the #3070 host-inbound-traffic enforcement — dst-address keyed,
+grouped by zone; the AF_XDP inner-src AllowedIPs gate in `try_decap` is a
+separate check). #3070 landed 2026-06-25, 15 days AFTER this harness was
+first written, so the original config left `wg0` in NO zone. Under
+enforcement an addressed-but-unzoned interface's firewall-local address
+falls into the #4420 HI-2 catch-all DROP, so a **peer-initiated** inner
+ping to the xpf `wg0` address (`10.78.0.1` / `fd00:78::1`) is dropped —
+this was the #6279 P2 failure (`peer->xpf inner v4 ping failed`).
+`xpf->peer` still worked because the reply rides the chain's leading
+`ct state established,related accept`, which is what made the drop look
+one-directional.
+
+The dedicated `wg` zone moves the inner v4+v6 addresses into a zoned
+`icmp/icmpv6 type echo-request accept`, mirroring how the base cluster
+config already zones the `gr-0/0/0.0` GRE tunnel in `security-zone sfmix`
+with `host-inbound-traffic system-services ping`. The zone is
+node0-scoped (fw1 never compiles it — same secondary-suppression
+discipline as the wg0 stanza) and is created/deleted **as a pair** with
+`wg0` in the same commit: a zone naming an undefined interface is a
+strict commit reject (#5248), so `xpf_wg_commit` adds both and
+`wg_stanza_delete` + `teardown` delete both.
+
 ## Known S-step limitations the operator will observe
 
 | Observation | Cause | Owner |
@@ -191,6 +249,14 @@ that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
    wireguard exemption); confirm the deployed build includes it.
 3. Handshake but no transport: AllowedIPs mismatch (xpf decap gates
    inner SOURCE against the peer's allowed-ips in the xpf config).
+3a. `peer->xpf` inner ping fails while `xpf->peer` inner ping SUCCEEDS
+   (the #6279 P2 signature): `wg0` is not in a host-inbound zone. The
+   decap'd inner packet is dropped by the kernel `xpf_hostinbound` chain
+   (#3070) because the wg0 inner address is addressed-but-unzoned (#4420
+   HI-2 catch-all DROP); `xpf->peer` survives on the chain's leading
+   `ct state established,related accept`. Fix: `wg0.0` needs a security
+   zone with `host-inbound-traffic system-services ping` (the harness
+   commits one — see "wg0 host-inbound zone" above).
 4. P4a blackout after ~180 s: should self-heal within ~15 s since the
    #1888 S5 timers (T7 no-reply reinit / expiry-driven rekey) — a
    PERMANENT blackout is now a regression; capture
