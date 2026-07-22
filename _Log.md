@@ -1,3 +1,28 @@
+## 2026-07-21 — #6230: RLock cfg.AdvertiseInterval read in advertInterval()
+
+- **Timestamp**: 2026-07-21 (fix/6230-advertinterval-rlock)
+- **Action**: `advertInterval()` (`pkg/vrrp/instance.go`) read
+  `vi.cfg.AdvertiseInterval` with NO lock while the run loop reset the advert
+  timer, but every sibling cfg accessor (`getState`, `masterDownInterval`,
+  `preemptHoldDuration`) snapshots `vi.cfg` under `vi.mu`, and cfg writers
+  (`updateConfig`) mutate it under `vi.mu.Lock()`. Unsynchronized read = a data
+  race `go test -race` flags. Fixed by snapshotting under `vi.mu.RLock()`,
+  releasing before the Duration math (matching the `masterDownInterval` idiom).
+  DEADLOCK FORK handled: `recordMasterAdvert` calls `masterAdverFloor()` →
+  `advertInterval()` while HOLDING `vi.mu.Lock()` (write) — a naive RLock there
+  self-deadlocks. Resolved with the canonical locked-variant split: added
+  `advertIntervalLocked()` (lock-free, caller-holds-vi.mu) + shared
+  `advertIntervalFromMS()` helper; `masterAdverFloor` now calls the Locked
+  variant. The other 6 callers (run-loop, lock free) use the RLock wrapper.
+  Added `pkg/vrrp/instance_advert_interval_race_test.go`:
+  `TestAdvertIntervalNoRace6230` (locked cfg write vs advertInterval reads —
+  fail-on-revert: race fires on the unlocked read) +
+  `TestAdvertIntervalMasterAdverFloorNoDeadlock6230` (guards the
+  recordMasterAdvert-under-Lock path against the deadlock regression). Full
+  `pkg/vrrp` suite green under `-race`.
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/instance_advert_interval_race_test.go,
+  pkg/vrrp/README.md, _Log.md
+
 ## 2026-07-21 — #5152: gate RefreshOwnerRGS liveness re-stamp on forwarding disposition
 
 - **Timestamp**: 2026-07-21 (fix/5152-refresh-owner-rgs-hainactive-guard)

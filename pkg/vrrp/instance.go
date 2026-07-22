@@ -730,9 +730,34 @@ func (vi *vrrpInstance) setState(s VRRPState) {
 }
 
 // advertInterval returns the advertisement interval as a Duration.
-// AdvertiseInterval is in milliseconds.
+// AdvertiseInterval is in milliseconds. The cfg field is snapshotted under
+// vi.mu.RLock() — mirroring the other config accessors (masterDownInterval,
+// preemptHoldDuration) — so a concurrent locked config update cannot race the
+// read that go test -race would otherwise flag (#6230). The lock is released
+// before the Duration math, matching the masterDownInterval idiom.
+//
+// Callers that ALREADY hold vi.mu (masterAdverFloor, reached from
+// recordMasterAdvert under vi.mu.Lock) MUST use advertIntervalLocked instead:
+// re-taking the RLock while the write lock is held would deadlock.
 func (vi *vrrpInstance) advertInterval() time.Duration {
+	vi.mu.RLock()
 	ms := vi.cfg.AdvertiseInterval
+	vi.mu.RUnlock()
+	return advertIntervalFromMS(ms)
+}
+
+// advertIntervalLocked returns the advertisement interval as a Duration for
+// callers that already hold vi.mu (read or write). It performs the same read as
+// advertInterval WITHOUT taking the lock, for paths that run under vi.mu.Lock
+// (recordMasterAdvert → masterAdverFloor); calling advertInterval there would
+// deadlock on the RLock (#6230).
+func (vi *vrrpInstance) advertIntervalLocked() time.Duration {
+	return advertIntervalFromMS(vi.cfg.AdvertiseInterval)
+}
+
+// advertIntervalFromMS converts a configured advertise interval in
+// milliseconds (0 or negative → the 1000 ms default) to a Duration.
+func advertIntervalFromMS(ms int) time.Duration {
 	if ms <= 0 {
 		ms = 1000
 	}
@@ -1762,10 +1787,12 @@ func (vi *vrrpInstance) recordMasterAdvert(pkt *VRRPPacket) {
 // masterAdverFloor is the minimum interval a learned Master_Adver_Interval may
 // take (#4548). It is the node's own configured advertise interval
 // (cfg.AdvertiseInterval, defaulting to 1000 ms when unset — see advertInterval)
-// with an absolute minLearnedMasterAdverInterval backstop. Reads cfg, which is
-// immutable after construction, so it is safe to call while holding vi.mu.
+// with an absolute minLearnedMasterAdverInterval backstop. Its sole caller,
+// recordMasterAdvert, already holds vi.mu.Lock, so it reads the interval via
+// advertIntervalLocked — calling the RLock-taking advertInterval here would
+// self-deadlock against the held write lock (#6230).
 func (vi *vrrpInstance) masterAdverFloor() time.Duration {
-	floor := vi.advertInterval()
+	floor := vi.advertIntervalLocked()
 	if floor < minLearnedMasterAdverInterval {
 		floor = minLearnedMasterAdverInterval
 	}
