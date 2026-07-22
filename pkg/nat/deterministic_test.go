@@ -1,6 +1,7 @@
 package nat
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -45,6 +46,11 @@ func v6View(gen uint64) AppliedView {
 	}
 	cfg := &config.Config{}
 	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{"napt64-pool": pool}
+	cfg.Security.NAT.NAT64 = []*config.NAT64RuleSet{{
+		Name:       "v6-to-v4",
+		Prefix:     "64:ff9b::/96",
+		SourcePool: "napt64-pool",
+	}}
 	return AppliedView{Config: cfg, Generation: gen, Available: true}
 }
 
@@ -154,6 +160,11 @@ func TestDeterministicV6Prefix64(t *testing.T) {
 	}
 	cfg := &config.Config{}
 	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{"p64": pool}
+	cfg.Security.NAT.NAT64 = []*config.NAT64RuleSet{{
+		Name:       "v6-to-v4",
+		Prefix:     "64:ff9b::/96",
+		SourcePool: "p64",
+	}}
 	view := AppliedView{Config: cfg, Generation: 1, Available: true}
 
 	// word 7 -> sub_idx 7, ip_idx 0, block_idx 7, block [1024+7*512, ..+511]
@@ -178,20 +189,39 @@ func TestDeterministicV6Prefix64(t *testing.T) {
 // range maps forward to a block, and any port in that block reverses back to
 // the same subscriber.
 func TestRoundTripV4(t *testing.T) {
-	view := v4View(1)
-	// Sample a spread of servable subscribers. The /22 host CIDR (1024 hosts)
-	// is over-provisioned relative to the 4-address pool * 126 blocks = 504
-	// servable subscribers, so stay within sub_idx < 504 (see
-	// TestForwardBeyondPoolCapacity for the boundary).
-	for _, host := range []string{"100.64.0.0", "100.64.0.1", "100.64.0.125", "100.64.0.126", "100.64.1.0", "100.64.1.247"} {
-		fwd, err := LookupForward(view, "cgn-pool", host)
+	pool := &config.NATPool{
+		Name:      "small",
+		Addresses: []string{"203.0.113.1", "203.0.113.2"},
+		PortLow:   1024,
+		PortHigh:  1039,
+		Deterministic: &config.DeterministicNATConfig{
+			BlockSize:   4,
+			HostAddress: "100.64.0.0/29",
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{"small": pool}
+	view := AppliedView{Config: cfg, Generation: 1, Available: true}
+
+	// Two addresses * four blocks/address exactly serves every subscriber in
+	// the /29. Cover all eight, and assert no two subscribers receive the same
+	// external address + block before checking reverse lookup at three ports.
+	seen := make(map[string]string)
+	for i := 0; i < 8; i++ {
+		host := fmt.Sprintf("100.64.0.%d", i)
+		fwd, err := LookupForward(view, "small", host)
 		if err != nil {
 			t.Fatalf("forward %s: %v", host, err)
 		}
+		mapping := fmt.Sprintf("%s:%d-%d", fwd.ExternalIP, fwd.PortLow, fwd.PortHigh)
+		if prior, exists := seen[mapping]; exists {
+			t.Fatalf("non-injective mapping: subscribers %s and %s both map to %s", prior, host, mapping)
+		}
+		seen[mapping] = host
 		// First, middle, and last port of the block must all reverse back.
 		// (Compute the midpoint without overflowing uint16.)
 		for _, port := range []uint16{fwd.PortLow, fwd.PortLow + (fwd.PortHigh-fwd.PortLow)/2, fwd.PortHigh} {
-			rev, rerr := LookupReverse(view, "cgn-pool", fwd.ExternalIP, port)
+			rev, rerr := LookupReverse(view, "small", fwd.ExternalIP, port)
 			if rerr != nil {
 				t.Fatalf("reverse %s:%d: %v", fwd.ExternalIP, port, rerr)
 			}
@@ -199,6 +229,122 @@ func TestRoundTripV4(t *testing.T) {
 				t.Fatalf("round-trip mismatch: %s -> %s:%d -> %s", host, fwd.ExternalIP, port, rev.InternalHost)
 			}
 		}
+	}
+}
+
+// TestReverseRejectsDuplicatePoolAddress pins the forensic exactness rule:
+// the same translated tuple denotes different subscribers when an external
+// address occupies multiple pool positions, so reverse lookup must reject it.
+func TestReverseRejectsDuplicatePoolAddress(t *testing.T) {
+	pool := &config.NATPool{
+		Name:      "duplicate",
+		Addresses: []string{"203.0.113.1", "203.0.113.1"},
+		PortLow:   1024,
+		PortHigh:  1031,
+		Deterministic: &config.DeterministicNATConfig{
+			BlockSize:   4,
+			HostAddress: "100.64.0.0/29",
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{"duplicate": pool}
+	view := AppliedView{Config: cfg, Generation: 1, Available: true}
+
+	// sub_idx 2 selects pool position 1 and block 0. A first-match reverse
+	// would incorrectly claim the position-0 subscriber (100.64.0.0).
+	fwd, err := LookupForward(view, "duplicate", "100.64.0.2")
+	if err != nil {
+		t.Fatalf("position-1 forward: %v", err)
+	}
+	if fwd.ExternalIP != "203.0.113.1" || fwd.PortLow != 1024 {
+		t.Fatalf("position-1 forward mismatch: %+v", fwd)
+	}
+	if _, e := LookupReverse(view, "duplicate", fwd.ExternalIP, fwd.PortLow); e == nil ||
+		e.Code != ErrCodeAmbiguousPool ||
+		e.Detail != "translated address is ambiguous: appears at multiple pool positions" {
+		t.Fatalf("duplicate-address reverse must be ambiguous, got %v", e)
+	}
+}
+
+func TestUnreferencedDeterministicV6PoolIsNotDeterministic(t *testing.T) {
+	view := v6View(1)
+	view.Config.Security.NAT.NAT64 = nil
+	wantDetail := "pool is not referenced by a NAT64 rule; translations are round-robin, not deterministic"
+
+	if _, e := LookupForward(view, "napt64-pool", "2001:db8:0:5::"); e == nil ||
+		e.Code != ErrCodeNotDeterministic || e.Detail != wantDetail {
+		t.Fatalf("unreferenced v6 forward must be not-deterministic, got %v", e)
+	}
+	if _, e := LookupReverse(view, "napt64-pool", "198.51.100.1", 3584); e == nil ||
+		e.Code != ErrCodeNotDeterministic || e.Detail != wantDetail {
+		t.Fatalf("unreferenced v6 reverse must be not-deterministic, got %v", e)
+	}
+}
+
+// TestDeterministicV6RejectsSubnetPoolAddress covers the mode-2 distinction
+// from source NAT: Rust NAT64 parse_pool_v4 filters a non-/32 entry instead
+// of expanding it, so the forensic lookup must never invent those addresses.
+func TestDeterministicV6RejectsSubnetPoolAddress(t *testing.T) {
+	view := v6View(1)
+	view.Config.Security.NAT.SourcePools["napt64-pool"].Addresses = []string{"203.0.113.0/28"}
+	wantDetail := "NAT64 deterministic pool requires host (/32) external addresses; subnet \"203.0.113.0/28\" is not enforced deterministically"
+
+	if _, e := LookupForward(view, "napt64-pool", "2001:db8::"); e == nil ||
+		e.Code != ErrCodeNotDeterministic || e.Detail != wantDetail {
+		t.Fatalf("NAT64 subnet-pool forward must be not-deterministic, got %v", e)
+	}
+	if _, e := LookupReverse(view, "napt64-pool", "203.0.113.0", 1024); e == nil ||
+		e.Code != ErrCodeNotDeterministic || e.Detail != wantDetail {
+		t.Fatalf("NAT64 subnet-pool reverse must be not-deterministic, got %v", e)
+	}
+}
+
+func TestDeterministicV4SubnetPoolStillExpands(t *testing.T) {
+	pool := &config.NATPool{
+		Addresses: []string{"203.0.113.0/28"},
+		PortLow:   1024,
+		PortHigh:  65535,
+		Deterministic: &config.DeterministicNATConfig{
+			BlockSize:   512,
+			HostAddress: "100.64.0.0/24",
+		},
+	}
+	p, err := poolParams(pool, false)
+	if err != nil {
+		t.Fatalf("mode-1 subnet pool: %v", err)
+	}
+	if len(p.poolV4) != 16 || p.poolV4[0].String() != "203.0.113.0" || p.poolV4[15].String() != "203.0.113.15" {
+		t.Fatalf("mode-1 /28 expansion changed: %v", p.poolV4)
+	}
+}
+
+// TestDeterministicV6PoolV4MatchesNAT64Allocator is the pool-vector parity
+// golden for mode 2. Unlike scalar wire-field parity, this pins the exact
+// ordered members accepted by Rust parse_pool_v4 (bare hosts and /32s) and
+// the pool-bounded host_count derived from that vector.
+func TestDeterministicV6PoolV4MatchesNAT64Allocator(t *testing.T) {
+	pool := &config.NATPool{
+		Address:   "198.51.100.9/32",
+		Addresses: []string{"198.51.100.10", "198.51.100.11/32"},
+		Deterministic: &config.DeterministicNATConfig{
+			BlockSize:   512,
+			HostAddress: "2001:db8::/32",
+		},
+	}
+	p, err := poolParams(pool, true)
+	if err != nil {
+		t.Fatalf("mode-2 params: %v", err)
+	}
+	gotPool := make([]string, len(p.poolV4))
+	for i, ip := range p.poolV4 {
+		gotPool[i] = ip.String()
+	}
+	wantPool := []string{"198.51.100.9", "198.51.100.10", "198.51.100.11"}
+	if fmt.Sprint(gotPool) != fmt.Sprint(wantPool) {
+		t.Fatalf("mode-2 pool_v4 drift: got %v want NAT64 allocator %v", gotPool, wantPool)
+	}
+	if p.mode != ModeV6 || p.blocksPerIP != 126 || p.hostCount != uint32(len(wantPool))*126 {
+		t.Fatalf("mode-2 capacity drift: mode=%d blocks-per-ip=%d host-count=%d", p.mode, p.blocksPerIP, p.hostCount)
 	}
 }
 

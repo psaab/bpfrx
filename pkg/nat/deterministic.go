@@ -189,13 +189,14 @@ func LookupForward(view AppliedView, poolName, host string) (*ForwardResult, *Lo
 	if ip == nil {
 		return nil, lerrf(ErrCodeMalformedInput, "unparseable subscriber address %q", host)
 	}
+	nat64Refs := nat64ReferencedPools(cfg)
 
 	if poolName != "" {
 		pool, ok := cfg.Security.NAT.SourcePools[poolName]
 		if !ok || pool == nil {
 			return nil, lerrf(ErrCodeUnknownPool, "no source NAT pool named %q in the applied configuration", poolName)
 		}
-		p, perr := poolParams(pool)
+		p, perr := poolParams(pool, nat64Refs[poolName])
 		if perr != nil {
 			return nil, perr
 		}
@@ -206,7 +207,7 @@ func LookupForward(view AppliedView, poolName, host string) (*ForwardResult, *Lo
 	var matched []string
 	var lastNonMatch *LookupError
 	for _, name := range sortedDeterministicPoolNames(cfg) {
-		p, perr := poolParams(cfg.Security.NAT.SourcePools[name])
+		p, perr := poolParams(cfg.Security.NAT.SourcePools[name], nat64Refs[name])
 		if perr != nil {
 			continue
 		}
@@ -248,13 +249,14 @@ func LookupReverse(view AppliedView, poolName, natIP string, natPort uint16) (*R
 	if natPort == 0 {
 		return nil, lerrf(ErrCodeMalformedInput, "translated port must be 1-65535")
 	}
+	nat64Refs := nat64ReferencedPools(cfg)
 
 	if poolName != "" {
 		pool, ok := cfg.Security.NAT.SourcePools[poolName]
 		if !ok || pool == nil {
 			return nil, lerrf(ErrCodeUnknownPool, "no source NAT pool named %q in the applied configuration", poolName)
 		}
-		p, perr := poolParams(pool)
+		p, perr := poolParams(pool, nat64Refs[poolName])
 		if perr != nil {
 			return nil, perr
 		}
@@ -264,12 +266,18 @@ func LookupReverse(view AppliedView, poolName, natIP string, natPort uint16) (*R
 	var results []*ReverseResult
 	var matched []string
 	for _, name := range sortedDeterministicPoolNames(cfg) {
-		p, perr := poolParams(cfg.Security.NAT.SourcePools[name])
+		p, perr := poolParams(cfg.Security.NAT.SourcePools[name], nat64Refs[name])
 		if perr != nil {
 			continue
 		}
 		r, rerr := lookupReverseInPool(p, name, ip, natPort, gen)
 		if rerr != nil {
+			// Ambiguity inside one pool cannot be resolved by considering other
+			// pools. Never discard it and risk returning a different pool's
+			// apparently unique (but still non-exact) answer.
+			if rerr.Code == ErrCodeAmbiguousPool {
+				return nil, rerr
+			}
 			continue
 		}
 		results = append(results, r)
@@ -305,12 +313,30 @@ func sortedDeterministicPoolNames(cfg *config.Config) []string {
 	return names
 }
 
+// nat64ReferencedPools records the source pools whose deterministic IPv6
+// subscriber mappings are actually activated by the applied NAT64 rules.
+// An IPv6 deterministic stanza on an unreferenced source pool remains a
+// round-robin pool in the dataplane and must not be exposed as deterministic
+// by this forensic readback API.
+func nat64ReferencedPools(cfg *config.Config) map[string]bool {
+	refs := make(map[string]bool)
+	if cfg == nil {
+		return refs
+	}
+	for _, rs := range cfg.Security.NAT.NAT64 {
+		if rs != nil && rs.SourcePool != "" {
+			refs[rs.SourcePool] = true
+		}
+	}
+	return refs
+}
+
 // poolParams resolves a source pool's deterministic block-allocation
 // parameters. It mirrors deterministicSourceNATFields (mode 1) and
 // deterministicNAT64V6Fields (mode 2) in pkg/dataplane/userspace, and the
 // Rust allocator's DeterministicV4 / DeterministicV6, so the lookup and the
 // enforced dataplane mapping stay identical.
-func poolParams(pool *config.NATPool) (detParams, *LookupError) {
+func poolParams(pool *config.NATPool, nat64Referenced bool) (detParams, *LookupError) {
 	var p detParams
 	if pool == nil || pool.Deterministic == nil {
 		return p, lerrf(ErrCodeNotDeterministic, "pool has no deterministic port allocation configured")
@@ -323,7 +349,19 @@ func poolParams(pool *config.NATPool) (detParams, *LookupError) {
 	if err != nil {
 		return p, lerrf(ErrCodeNotDeterministic, "unparseable subscriber CIDR %q", det.HostAddress)
 	}
-	poolV4, perr := expandPoolV4(pool)
+	ones, bits := hostNet.Mask.Size()
+	var mode Mode
+	switch {
+	case bits == 32 && ip.To4() != nil:
+		mode = ModeV4
+	case bits == 128 && ip.To4() == nil && (ones == 32 || ones == 64):
+		mode = ModeV6
+	default:
+		return p, lerrf(ErrCodeNotDeterministic,
+			"unsupported subscriber prefix %q (need an IPv4 CIDR, or an IPv6 /32 or /64)", det.HostAddress)
+	}
+
+	poolV4, perr := expandPoolV4(pool, mode)
 	if perr != nil {
 		return p, perr
 	}
@@ -333,9 +371,8 @@ func poolParams(pool *config.NATPool) (detParams, *LookupError) {
 	p.poolV4 = poolV4
 	p.blockSize = uint16(det.BlockSize)
 
-	ones, bits := hostNet.Mask.Size()
-	switch {
-	case bits == 32 && ip.To4() != nil:
+	switch mode {
+	case ModeV4:
 		// Mode 1: IPv4 subscriber. Uses the pool's own port range.
 		portLow, portHigh, ok := poolPortRangeV4(pool)
 		if !ok {
@@ -364,10 +401,14 @@ func poolParams(pool *config.NATPool) (detParams, *LookupError) {
 		p.hostCount = uint32(1) << hostBits
 		return p, nil
 
-	case bits == 128 && ip.To4() == nil && (ones == 32 || ones == 64):
+	case ModeV6:
 		// Mode 2: IPv6 subscriber (NAPT64). Fixed NAT64 port range; the
 		// subscriber count is pool-bounded (len(pool) * blocks_per_ip),
 		// matching the Rust Nat64Prefix build.
+		if !nat64Referenced {
+			return p, lerrf(ErrCodeNotDeterministic,
+				"pool is not referenced by a NAT64 rule; translations are round-robin, not deterministic")
+		}
 		const portRange = nat64PortHigh - nat64PortLow + 1
 		if det.BlockSize > portRange {
 			return p, lerrf(ErrCodeNotDeterministic, "block-size %d exceeds the NAT64 port range (%d ports)", det.BlockSize, portRange)
@@ -390,11 +431,8 @@ func poolParams(pool *config.NATPool) (detParams, *LookupError) {
 		}
 		p.hostCount = uint32(len(poolV4)) * uint32(bpi)
 		return p, nil
-
-	default:
-		return p, lerrf(ErrCodeNotDeterministic,
-			"unsupported subscriber prefix %q (need an IPv4 CIDR, or an IPv6 /32 or /64)", det.HostAddress)
 	}
+	return p, lerrf(ErrCodeNotDeterministic, "unsupported deterministic NAT mode %d", mode)
 }
 
 // poolPortRangeV4 mirrors sourceNATPoolPortRange (pkg/dataplane/userspace):
@@ -417,14 +455,16 @@ func poolPortRangeV4(pool *config.NATPool) (uint16, uint16, bool) {
 	return uint16(low), uint16(high), true
 }
 
-// expandPoolV4 enumerates the pool's ordered external IPv4 addresses,
-// mirroring Rust expand_pool_address: a CIDR entry enumerates every host in
-// the prefix (capped at maxPoolPrefixHosts), a bare IP is one host, and IPv6
-// pool entries are skipped (they never back a deterministic v4-external
-// mapping and, per the Rust split into pool_addresses_v4 / _v6, do not shift
-// the v4 index space). pool.Address is prepended exactly as the wire
+// expandPoolV4 resolves the pool's ordered external IPv4 addresses using the
+// dataplane semantics for the selected deterministic mode. Mode 1 mirrors
+// Rust expand_pool_address: a CIDR enumerates every host (subject to the
+// safety cap). Mode 2 instead mirrors NAT64 parse_pool_v4: only a bare IPv4
+// address or explicit /32 is an allocator member; compiler-expanded "a to b"
+// ranges arrive as ordered /32 entries. An IPv4 subnet is rejected because
+// the NAT64 dataplane filters it rather than expanding it. IPv6 entries are
+// skipped in both modes and pool.Address is prepended exactly as the wire
 // builders do.
-func expandPoolV4(pool *config.NATPool) ([]net.IP, *LookupError) {
+func expandPoolV4(pool *config.NATPool, mode Mode) ([]net.IP, *LookupError) {
 	addrs := make([]string, 0, len(pool.Addresses)+1)
 	if pool.Address != "" {
 		addrs = append(addrs, pool.Address)
@@ -445,6 +485,10 @@ func expandPoolV4(pool *config.NATPool) ([]net.IP, *LookupError) {
 			ones, bits := ipnet.Mask.Size()
 			if bits != 32 {
 				continue
+			}
+			if mode == ModeV6 && ones != 32 {
+				return nil, lerrf(ErrCodeNotDeterministic,
+					"NAT64 deterministic pool requires host (/32) external addresses; subnet %q is not enforced deterministically", a)
 			}
 			count := uint64(1) << uint(bits-ones)
 			if count > maxPoolPrefixHosts {
@@ -559,8 +603,11 @@ func lookupReverseInPool(p detParams, poolName string, natIP net.IP, natPort uin
 	ipIdx := -1
 	for i, a := range p.poolV4 {
 		if a.Equal(ip4) {
+			if ipIdx >= 0 {
+				return nil, lerrf(ErrCodeAmbiguousPool,
+					"translated address is ambiguous: appears at multiple pool positions")
+			}
 			ipIdx = i
-			break
 		}
 	}
 	if ipIdx < 0 {
@@ -619,7 +666,7 @@ func lookupReverseInPool(p detParams, poolName string, natIP net.IP, natPort uin
 // single-canonical-implementation guarantee, invariant 8). mode is 0 when
 // the pool is not a valid mode-1 deterministic pool.
 func DerivedV4Params(pool *config.NATPool) (mode uint8, blockSize, blocksPerIP uint16, hostBase, hostCount uint32) {
-	p, err := poolParams(pool)
+	p, err := poolParams(pool, false)
 	if err != nil || p.mode != ModeV4 {
 		return 0, 0, 0, 0, 0
 	}
@@ -632,7 +679,9 @@ func DerivedV4Params(pool *config.NATPool) (mode uint8, blockSize, blocksPerIP u
 // returned (the wire builder omits it — the Rust side derives it from the
 // pool size). ok is false when the pool is not a valid mode-2 pool.
 func DerivedV6Params(pool *config.NATPool) (blockSize, blocksPerIP uint16, prefixLen uint8, baseStr string, ok bool) {
-	p, err := poolParams(pool)
+	// This helper derives the fields for a pool already selected by a NAT64
+	// wire builder; the applied-view reference gate belongs to lookup callers.
+	p, err := poolParams(pool, true)
 	if err != nil || p.mode != ModeV6 {
 		return 0, 0, 0, "", false
 	}
