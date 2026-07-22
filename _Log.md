@@ -56609,3 +56609,13 @@ top.
   green.
 - **File(s)**: userspace-dp/src/event_stream/clock.rs (new),
   userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract WriteBacklog + WRITE_BACKLOG_MAX_BYTES into
+  event_stream/backlog.rs (verbatim, cursor-backed geometric-compaction backlog,
+  #[inline] preserved on pending_len/is_empty/pending/compact_if_needed). Struct,
+  methods, and compacted_bytes test field widened private->pub(super) so callers
+  (mod.rs connected loop/drain, write_backlog tests) resolve unchanged. mod.rs
+  re-imports both names. Build green.
+- **File(s)**: userspace-dp/src/event_stream/backlog.rs (new),
+  userspace-dp/src/event_stream/mod.rs
