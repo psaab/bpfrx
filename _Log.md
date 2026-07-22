@@ -1,3 +1,53 @@
+## 2026-07-22 — #5274: HA session-sync config-epoch guard (stale permit across the HA boundary)
+
+- **Timestamp**: 2026-07-22 (fix/5274-ha-session-config-epoch)
+- **Action**: Added a config epoch to the HA session-sync envelope so the
+  standby refuses a session admitted under a config the receiver has since
+  superseded (immediate policy invalidation across the HA boundary). The
+  primary admits a session under config A, commits config B (which DENIES it),
+  and config B is applied on the standby — but a delayed config-A session
+  install landing after the standby's `clearSessionsForDeletedPolicies` sweep
+  installed a STALE PERMIT the standby forwarded under after failover.
+  - **Wire**: new length-gated trailing `ConfigEpoch uint64` on the peer↔peer
+    session payload (`encode/decodeSessionV4Payload`/`V6`), appended after the
+    #3301 (V4) / #4565 (V6) trailing fields. Old decoders read 0 (legacy /
+    check disabled) — additive, no version bump.
+  - **Field**: `SessionValue.ConfigEpoch` / `SessionValueV6.ConfigEpoch`
+    (userspace-sync-only HA metadata, NOT in the BPF/C conntrack ABI).
+  - **Stamp (sender)**: `stampInstallGenV4/V6` sets `ConfigEpoch =
+    configGenCounter.Load()` — the #3931 config-sync generation held at queue
+    time. All send paths (incremental, sweep, bulk) route through these.
+  - **Guard (receiver)**: `installClusterSyncedV4/V6` → new `configEpochStale`
+    refuses an install whose epoch is strictly older than `lastAppliedConfigGen`
+    and bumps a new `SessionsStaleConfigIgnored` counter, BEFORE forwarding to
+    the helper. Both stamp and compare live in the same #3931 sender→receiver
+    namespace, so the cross-node comparison is meaningful.
+  - **Design decision (Go-cluster-authoritative, Rust untouched)**: the config
+    epoch's only cross-node-comparable namespace is the #3931 config-sync
+    generation, which lives entirely in `pkg/cluster`. The userspace helper's
+    `config_generation` is a *local* commit counter (`Manager.bumpGeneration`),
+    independent per node and NOT comparable — so the helper cannot host this
+    guard. The receiver rejects the stale install before it reaches the helper;
+    no `config_epoch` field/guard is added to `SessionSyncRequest` or `ha.rs`
+    (that would be a dead field, or a per-key guard provably redundant with the
+    #2170 generation guard). This deviates from the issue's cited `protocol.go`/
+    `ha.rs` locations, which conflated the Go→Rust helper envelope with the
+    cross-node peer wire.
+  - **Tests** (`pkg/cluster/sync_config_epoch_5274_test.go`):
+    `TestStaleConfigEpochSessionRejected5274{,V6}` (guard reject/accept +
+    counter, fail-on-revert verified RED), `TestSessionWireRoundTripConfigEpoch5274{V4,V6}`
+    (wire round-trip + legacy truncation), `TestConfigEpochStampedAtQueueTime5274`,
+    `TestConfigEpochNoRejectAgainstZeroBaseline5274`. Updated the #3301/#4565/
+    cross-version legacy-truncation offsets in `sync_gen_guard_test.go` (+8 for
+    the new trailing field).
+  - **Docs**: `docs/session-sync-architecture.md` (Config-Epoch Guard section +
+    Session Value note), `pkg/cluster/README.md` (guard bullet),
+    `docs/sync-protocol.md` (Config-Epoch Guard section + stats-table counter).
+- **File(s)**: pkg/dataplane/types.go, pkg/cluster/sync_protocol.go,
+  pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_config_epoch_5274_test.go, pkg/cluster/sync_gen_guard_test.go,
+  docs/session-sync-architecture.md, pkg/cluster/README.md, docs/sync-protocol.md
+
 ## 2026-07-22 — #5615: direct GRE-decap fail-on-revert tests for the #5140 inner-read sites
 
 - **Timestamp**: 2026-07-22 (test/5615-gre-decap-inner-read-coverage)

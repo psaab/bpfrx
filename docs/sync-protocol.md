@@ -310,6 +310,53 @@ V6}` (drives the real sender enqueue + receiver apply in wire order),
 `TestDeleteGenerationStrictlyGreaterThanInstall{V4,V6}` in
 `pkg/cluster/sync_gen_guard_test.go`.
 
+## Config-Epoch Guard (#5274)
+
+Distinct from the per-key install generation (#2170), every **session** message
+carries a length-gated trailing `ConfigEpoch uint64` (LE), appended after the
+#3301 `AppTimeout`/`PolicyCounterIdx` block on V4 and after the #4565
+`Nat64SnatV4` on V6. An old decoder stops before it and reads `ConfigEpoch == 0`
+(`if off+8 <= len(payload)` block in `decodeSession*Payload`); a new decoder
+reading an old, shorter payload also sees 0 — rolling-upgrade safe, no version
+bump (the same additive-trailing-field discipline as #2170/#3301/#4565).
+
+**Purpose.** It closes the immediate-policy-invalidation gap across the HA
+boundary. The primary admits a session under config A, then commits config B
+(which DENIES it). Config B is config-synced and applied on the standby (which
+runs `clearSessionsForDeletedPolicies`), but a delayed config-A session install
+that arrives **after** that sweep would otherwise install a stale permit that
+the standby forwards under after failover.
+
+**Semantics (sender, `pkg/cluster`).** `stampInstallGen*` stamps every queued
+session with `ConfigEpoch = configGenCounter.Load()` — the #3931 config-sync
+generation this node currently holds. A session still present in the local table
+when it is queued has survived this node's own config-apply sweep, so it is
+legitimately admitted under the current config.
+
+**Semantics (receiver, `pkg/cluster`).** `installClusterSynced*` refuses an
+install whose `ConfigEpoch` is **strictly older** than `lastAppliedConfigGen`
+(`SessionsStaleConfigIgnored++`) and drops it BEFORE forwarding to the helper.
+Both stamp and compare are in the SAME sender→receiver #3931 namespace (the
+sender's monotonic counter, which the receiver applies via the config-sync path
+and records as `lastAppliedConfigGen`), so the cross-node comparison is
+meaningful. `ConfigEpoch == 0` (legacy peer / local-origin) disables the check;
+the `resetRecvGen` bulk barrier zeroes `lastAppliedConfigGen`, so a rebooted-peer
+cold re-prime is never falsely rejected.
+
+**Authority is the Go cluster layer, NOT the userspace helper.** Unlike #2170's
+`Generation` — which the helper mirrors and re-enforces per key — the config
+epoch is a GLOBAL check against the receiver's current applied config, and the
+only cross-node-comparable namespace is the #3931 config-sync generation, which
+lives entirely in `SessionSync`. The helper's own `config_generation` is a
+*local* commit counter (`Manager.bumpGeneration`) that is independent per node
+and therefore cannot host this guard, so no `config_epoch` field is added to
+`SessionSyncRequest` or `ha.rs`. Regression coverage:
+`TestStaleConfigEpochSessionRejected5274{,V6}`,
+`TestSessionWireRoundTripConfigEpoch5274{V4,V6}`,
+`TestConfigEpochStampedAtQueueTime5274`, and
+`TestConfigEpochNoRejectAgainstZeroBaseline5274` in
+`pkg/cluster/sync_config_epoch_5274_test.go`.
+
 ## Config Payload (Variable)
 
 UTF-8 text of the full Junos-format configuration followed by a trailing
@@ -828,6 +875,7 @@ All counters are `atomic.Uint64` / `atomic.Bool`, lock-free:
 | SessionsSent | Sessions queued to sendCh |
 | SessionsReceived | Session messages received from peer |
 | SessionsInstalled | Sessions successfully written to BPF map |
+| SessionsStaleConfigIgnored | Session installs refused by the #5274 config-epoch guard: the peer stamped a config epoch (#3931 `configGenCounter`) strictly older than this node's `lastAppliedConfigGen`, so a newer config that may deny the session is already applied here (a stale permit across the HA boundary) |
 | DeletesSent | Delete messages queued |
 | DeletesReceived | Delete messages received |
 | BulkSyncs | Completed bulk sync operations |

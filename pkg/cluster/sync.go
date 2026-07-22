@@ -153,6 +153,15 @@ type SyncStats struct {
 	// the per-key stored generation monotonic so a later stale delete can
 	// still be matched and refused.
 	InstallsStaleIgnored atomic.Uint64
+	// SessionsStaleConfigIgnored counts session installs refused by the #5274
+	// config-epoch guard: the peer stamped the session with the config-sync
+	// generation (#3931) it held at admit time, and that epoch was strictly
+	// OLDER than this node's lastAppliedConfigGen — i.e. the peer has since
+	// committed (and this node applied) a newer config that may DENY the
+	// session. Refusing the install prevents a stale PERMIT from landing after
+	// this node's clearSessionsForDeletedPolicies sweep for the newer config
+	// (the immediate-policy-invalidation gap across the HA boundary).
+	SessionsStaleConfigIgnored atomic.Uint64
 	// GenMapOverflow counts how many times a #2170 generation map (sender
 	// echo or receiver stored) was at genGuardMapCap and a NEW key therefore
 	// could not be recorded (#2198 F1). The key degrades to gen-0 (safe,
@@ -182,40 +191,41 @@ type SyncStats struct {
 // SyncStatsSnapshot is a point-in-time copy of SyncStats with plain
 // non-atomic fields, safe to copy by value and pass across API boundaries.
 type SyncStatsSnapshot struct {
-	SessionsSent           uint64
-	SessionsReceived       uint64
-	SessionsInstalled      uint64
-	DeletesSent            uint64
-	DeletesReceived        uint64
-	BulkSyncs              uint64
-	ConfigsSent            uint64
-	ConfigsReceived        uint64
-	ConfigsStaleIgnored    uint64
-	ConfigsApplyFailed     uint64
-	IPsecSASent            uint64
-	IPsecSAReceived        uint64
-	IPsecSAStaleIgnored    uint64
-	DHCPLeasesSent         uint64
-	DHCPLeasesReceived     uint64
-	DHCPLeasesStaleIgnored uint64
-	DHCPLeasesSeeded       uint64
-	FencesSent             uint64
-	FencesReceived         uint64
-	Errors                 uint64
-	DeletesDropped         uint64
-	DeletesStaleIgnored    uint64
-	InstallsStaleIgnored   uint64
-	GenMapOverflow         uint64
-	PreAuthRejected        uint64
-	Connected              bool
-	ActiveFabric           int
-	BulkSyncStartTime      int64
-	BulkSyncEndTime        int64
-	BulkSyncSessions       uint64
-	LastConfigSyncTime     int64
-	LastConfigSyncSize     uint64
-	LastFenceSeq           uint64
-	LastFenceAckAt         int64
+	SessionsSent               uint64
+	SessionsReceived           uint64
+	SessionsInstalled          uint64
+	DeletesSent                uint64
+	DeletesReceived            uint64
+	BulkSyncs                  uint64
+	ConfigsSent                uint64
+	ConfigsReceived            uint64
+	ConfigsStaleIgnored        uint64
+	ConfigsApplyFailed         uint64
+	IPsecSASent                uint64
+	IPsecSAReceived            uint64
+	IPsecSAStaleIgnored        uint64
+	DHCPLeasesSent             uint64
+	DHCPLeasesReceived         uint64
+	DHCPLeasesStaleIgnored     uint64
+	DHCPLeasesSeeded           uint64
+	FencesSent                 uint64
+	FencesReceived             uint64
+	Errors                     uint64
+	DeletesDropped             uint64
+	DeletesStaleIgnored        uint64
+	InstallsStaleIgnored       uint64
+	SessionsStaleConfigIgnored uint64
+	GenMapOverflow             uint64
+	PreAuthRejected            uint64
+	Connected                  bool
+	ActiveFabric               int
+	BulkSyncStartTime          int64
+	BulkSyncEndTime            int64
+	BulkSyncSessions           uint64
+	LastConfigSyncTime         int64
+	LastConfigSyncSize         uint64
+	LastFenceSeq               uint64
+	LastFenceAckAt             int64
 }
 
 // TransferReadinessSnapshot captures session-sync state that determines whether
@@ -872,7 +882,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), SessionsStaleConfigIgnored: s.stats.SessionsStaleConfigIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.

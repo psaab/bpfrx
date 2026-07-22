@@ -96,9 +96,10 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	keySize := 16
 	valSize := 160
 	// +8 for the #2170 install Generation, +8 for the #3301 trailing
-	// AppTimeout(u32)+PolicyCounterIdx(u32). All length-gated: an old decoder
-	// stops after the field it knows and ignores the rest.
-	buf := make([]byte, keySize+valSize+8+8)
+	// AppTimeout(u32)+PolicyCounterIdx(u32), +8 for the #5274 ConfigEpoch. All
+	// length-gated: an old decoder stops after the field it knows and ignores
+	// the rest.
+	buf := make([]byte, keySize+valSize+8+8+8)
 	off := 0
 	copy(buf[off:], key.SrcIP[:])
 	off += 4
@@ -188,6 +189,13 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	off += 4
 	binary.LittleEndian.PutUint32(buf[off:], val.PolicyCounterIdx)
 	off += 4
+	// #5274: admitting config epoch (length-gated trailing field). The cluster
+	// receiver refuses an install whose epoch is strictly older than its
+	// lastAppliedConfigGen (a stale permit across a config that now denies the
+	// session). Old decoders stop after PolicyCounterIdx and ignore it; absent
+	// => 0 (legacy peer / check disabled).
+	binary.LittleEndian.PutUint64(buf[off:], val.ConfigEpoch)
+	off += 8
 	return buf[:off]
 }
 func encodeSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) []byte {
@@ -295,6 +303,11 @@ func encodeSessionV6Payload(key dataplane.SessionKeyV6, val dataplane.SessionVal
 	// An old decoder stops after PolicyCounterIdx and ignores it (=> not NAT64).
 	copy(buf[off:off+4], val.Nat64SnatV4[:])
 	off += 4
+	// #5274: admitting config epoch (length-gated trailing field; see
+	// encodeSessionV4Payload). Old decoders stop after Nat64SnatV4 and ignore
+	// it; absent => 0 (legacy peer / check disabled).
+	binary.LittleEndian.PutUint64(buf[off:], val.ConfigEpoch)
+	off += 8
 	return buf[:off]
 }
 
@@ -457,6 +470,12 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 		val.PolicyCounterIdx = binary.LittleEndian.Uint32(payload[off:])
 		off += 4
 	}
+	// #5274: admitting config epoch (length-gated; absent → 0 = legacy peer /
+	// config-epoch check disabled).
+	if off+8 <= len(payload) {
+		val.ConfigEpoch = binary.LittleEndian.Uint64(payload[off:])
+		off += 8
+	}
 	return key, val, true
 }
 
@@ -581,6 +600,12 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 	if off+4 <= len(payload) {
 		copy(val.Nat64SnatV4[:], payload[off:off+4])
 		off += 4
+	}
+	// #5274: admitting config epoch (length-gated; absent → 0 = legacy peer /
+	// config-epoch check disabled).
+	if off+8 <= len(payload) {
+		val.ConfigEpoch = binary.LittleEndian.Uint64(payload[off:])
+		off += 8
 	}
 	return key, val, true
 }

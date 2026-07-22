@@ -746,6 +746,26 @@ outside the monitor loop:
   check→Put→record apply sequence is not held under one `recvGenMu` acquisition;
   it is safe because the per-peer receive path is single-threaded over the single
   active fabric (#2198 F3).
+- **Config-epoch guard (#5274)**: distinct from the per-key install generation,
+  every session install carries a `ConfigEpoch` — the #3931 config-sync
+  generation (`configGenCounter`) the sender held when it queued the session
+  (`stampInstallGen*`), as a length-gated trailing `uint64` on the session wire
+  (`sync_protocol.go`). The receiver (`installClusterSynced*`) refuses an install
+  whose epoch is **strictly older** than its `lastAppliedConfigGen`
+  (`SessionsStaleConfigIgnored`), because the peer has since committed — and this
+  node has applied — a newer config that may DENY the session. This closes the
+  immediate-policy-invalidation gap: a session admitted under config A that lands
+  after config B's `clearSessionsForDeletedPolicies` sweep is a stale permit the
+  standby would otherwise forward under after failover. Both the stamp
+  (`configGenCounter`) and the compare (`lastAppliedConfigGen`) are in the SAME
+  sender→receiver #3931 namespace, so the comparison is meaningful across nodes.
+  `epoch == 0` (legacy peer / local-origin) disables the check (rolling-upgrade
+  safe); the reconnect `resetRecvGen` zeroes `lastAppliedConfigGen` so a
+  rebooted-peer bulk re-prime is never falsely rejected. **The guard is
+  Go-cluster-authoritative** — the userspace helper's `config_generation` is a
+  *local* commit counter (`Manager.bumpGeneration`) that is not cross-node
+  comparable, so the receiver rejects the stale install BEFORE forwarding it to
+  the helper, and no config-epoch field or guard is added on the Rust side.
 - Dual-active overlap is intentional: primary sets `rg_active=true`
   immediately on becoming master; secondary defers `rg_active=false` until
   it sees the VRRP BACKUP event. Brief overlap, never both inactive.
