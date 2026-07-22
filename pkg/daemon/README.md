@@ -41,6 +41,36 @@ the primary compile/apply gate.
 - `CompileHealth` — `daemon.go`. Snapshot of the most recent compile
   outcome; `pkg/api` consumes it for the `/health` endpoint.
 
+### Config-apply file layout (#5661)
+
+The config-apply path was carved out of the former ~3095-line
+`daemon_apply.go` monolith into responsibility-scoped siblings (pure code
+motion, no behavior/ordering/locking change — apply step and side-effect
+sequence are load-bearing and unchanged). `daemon_apply.go` now retains
+only the apply entrypoints and core orchestrator:
+
+- `daemon_apply.go` — apply entrypoints (`applyConfig`,
+  `applyConfigResult`, `applyCancelCtx`), the core `applyConfigLocked`
+  orchestrator, the procfs knob helpers (`setRethIPv6Knobs`,
+  `setVLANSubAddrGenMode`), and `compileErrorMustAbortApply`.
+- `daemon_apply_commit.go` — commit/sync/rollback drivers
+  (`commitAndApply`, `syncAndApply`, `commitConfirmedAndApply`,
+  `executeConfirmedRollback`, peer config push) plus first-boot
+  `bootstrapFromFile`.
+- `daemon_apply_reset.go` — factory-reset (zeroize) generation guard and
+  `factoryReset` (#5281).
+- `daemon_apply_hostauth.go` — host-authorization closeout owners and
+  their bounded runner (#5874).
+- `daemon_apply_dataplane.go` — dataplane/HA core apply
+  (`applyDataplaneAndHACore`) and deferred-worker-arm bookkeeping.
+- `daemon_apply_routing.go` — services (ip-monitoring), routing-rule, and
+  route-leak snapshot reconcile.
+- `daemon_apply_interfaces.go` — fabric IPVLAN, VRF, management-VRF
+  rebind, and interface reconcile.
+- `daemon_apply_tail.go` — the `applyTailReconciles` orchestrator and its
+  LLDP / DHCP-relay / event-engine / initial policy-scheduler reconcile
+  helpers.
+
 ### Struct decomposition (#4407, in progress)
 
 The `Daemon` struct historically fused 150+ flat fields spanning ~15
