@@ -383,6 +383,27 @@ func TestDeterministicV4ExcludesMappedIPv6PoolMember(t *testing.T) {
 	}
 }
 
+// TestDeterministicRejectsMappedQueryFamily covers round-4: a QUERY address's
+// family must be classified with the colon-strict SSOT, not net.IP.To4(). An
+// IPv4-mapped literal (::ffff:...) is "v6" — it must NOT map in a mode-1 (IPv4)
+// pool (Rust mode 1 only handles IpAddr::V4; To4() would fabricate a mapping)
+// and must NOT reverse as a translated IPv4 address.
+func TestDeterministicRejectsMappedQueryFamily(t *testing.T) {
+	if r, e := LookupForward(v4View(7), "cgn-pool", "::ffff:100.64.0.5"); e == nil || e.Code != ErrCodeMalformedInput {
+		t.Fatalf("mapped mode-1 subscriber must be malformed-input, got r=%+v e=%v", r, e)
+	}
+	if r, e := LookupReverse(v4View(7), "cgn-pool", "::ffff:203.0.113.1", 3584); e == nil || e.Code != ErrCodeMalformedInput {
+		t.Fatalf("mapped reverse natIP must be malformed-input, got r=%+v e=%v", r, e)
+	}
+	// Control: the ordinary dotted-quad still maps and reverses.
+	if _, e := LookupForward(v4View(7), "cgn-pool", "100.64.0.5"); e != nil {
+		t.Fatalf("ordinary v4 subscriber must still map, got %v", e)
+	}
+	if _, e := LookupReverse(v4View(7), "cgn-pool", "203.0.113.1", 3584); e != nil {
+		t.Fatalf("ordinary v4 translated addr must still reverse, got %v", e)
+	}
+}
+
 func TestDeterministicV4SubnetPoolStillExpands(t *testing.T) {
 	pool := &config.NATPool{
 		Addresses: []string{"203.0.113.0/28"},

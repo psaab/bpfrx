@@ -30,6 +30,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -186,10 +187,17 @@ func LookupForward(view AppliedView, poolName, host string) (*ForwardResult, *Lo
 	if lerr != nil {
 		return nil, lerr
 	}
-	ip := net.ParseIP(strings.TrimSpace(host))
-	if ip == nil {
+	trimmed := strings.TrimSpace(host)
+	// Classify the query family with the colon-strict Go/Rust-parity SSOT, NOT
+	// net.IP.To4() — Go folds an IPv4-mapped literal (::ffff:100.64.0.5) to a
+	// 4-byte form, so a To4() gate would accept it into a mode-1 (IPv4) pool and
+	// fabricate a subscriber the Rust dataplane (which only maps IpAddr::V4 in
+	// mode 1 and passes an Ipv6Addr to mode 2) never translates.
+	fam := config.NATAddrFamily(trimmed)
+	if fam == "" {
 		return nil, lerrf(ErrCodeMalformedInput, "unparseable subscriber address %q", host)
 	}
+	ip := net.ParseIP(trimmed)
 	nat64Refs := nat64ReferencedPools(cfg)
 
 	if poolName != "" {
@@ -201,7 +209,7 @@ func LookupForward(view AppliedView, poolName, host string) (*ForwardResult, *Lo
 		if perr != nil {
 			return nil, perr
 		}
-		return lookupForwardInPool(p, poolName, ip, gen)
+		return lookupForwardInPool(p, poolName, ip, fam, gen)
 	}
 
 	var results []*ForwardResult
@@ -212,7 +220,7 @@ func LookupForward(view AppliedView, poolName, host string) (*ForwardResult, *Lo
 		if perr != nil {
 			continue
 		}
-		r, rerr := lookupForwardInPool(p, name, ip, gen)
+		r, rerr := lookupForwardInPool(p, name, ip, fam, gen)
 		if rerr != nil {
 			lastNonMatch = rerr
 			continue
@@ -243,10 +251,15 @@ func LookupReverse(view AppliedView, poolName, natIP string, natPort uint16) (*R
 	if lerr != nil {
 		return nil, lerr
 	}
-	ip := net.ParseIP(strings.TrimSpace(natIP))
-	if ip == nil || ip.To4() == nil {
+	trimmed := strings.TrimSpace(natIP)
+	// A translated (external) address is IPv4 for both modes. Classify with the
+	// colon-strict SSOT so an IPv4-mapped literal (::ffff:203.0.113.1) is
+	// rejected exactly as the Rust dataplane rejects it — To4() would fold it
+	// and reverse it to a fabricated subscriber.
+	if config.NATAddrFamily(trimmed) != "v4" {
 		return nil, lerrf(ErrCodeMalformedInput, "translated address %q must be an IPv4 address", natIP)
 	}
+	ip := net.ParseIP(trimmed)
 	if natPort == 0 {
 		return nil, lerrf(ErrCodeMalformedInput, "translated port must be 1-65535")
 	}
@@ -556,13 +569,27 @@ func expandPoolV4(pool *config.NATPool, mode Mode) ([]net.IP, *LookupError) {
 	return out, nil
 }
 
-func lookupForwardInPool(p detParams, poolName string, host net.IP, gen uint64) (*ForwardResult, *LookupError) {
+// formatV6 renders 16 bytes in IPv6 notation without net.IP.String()'s
+// IPv4-mapped folding — net.IP(::ffff:1.2.3.4).String() returns the dotted
+// quad "1.2.3.4", which would report a NAPT64 IPv6 subscriber as an IPv4
+// address. netip.Addr preserves the ::ffff: form (verified), so a mode-2
+// result always echoes the subscriber as the IPv6 the operator queried.
+func formatV6(b []byte) string {
+	var a [16]byte
+	copy(a[:], b)
+	return netip.AddrFrom16(a).String()
+}
+
+func lookupForwardInPool(p detParams, poolName string, host net.IP, fam string, gen uint64) (*ForwardResult, *LookupError) {
 	switch p.mode {
 	case ModeV4:
-		ip4 := host.To4()
-		if ip4 == nil {
+		// fam is the colon-strict Go/Rust family of the query text: a mapped
+		// literal is "v6" and must NOT map in a mode-1 pool (Rust mode 1 only
+		// handles IpAddr::V4).
+		if fam != "v4" {
 			return nil, lerrf(ErrCodeMalformedInput, "pool %q is IPv4 deterministic; the subscriber must be an IPv4 address", poolName)
 		}
+		ip4 := host.To4()
 		srcH := binary.BigEndian.Uint32(ip4)
 		if srcH < p.hostBaseV4 {
 			return nil, lerrf(ErrCodeOutOfRange, "subscriber %s is below the pool subscriber range", ip4)
@@ -590,7 +617,10 @@ func lookupForwardInPool(p detParams, poolName string, host net.IP, gen uint64) 
 		}, nil
 
 	case ModeV6:
-		if host.To4() != nil || host.To16() == nil {
+		// Rust passes an Ipv6Addr straight into deterministic_indices_v6, so an
+		// IPv4-mapped literal (fam "v6") is a valid subscriber notation here —
+		// a To4()-based reject would diverge (false malformed-input).
+		if fam != "v6" || host.To16() == nil {
 			return nil, lerrf(ErrCodeMalformedInput, "pool %q is IPv6 NAPT64 deterministic; the subscriber must be an IPv6 address", poolName)
 		}
 		var octets [16]byte
@@ -621,7 +651,7 @@ func lookupForwardInPool(p detParams, poolName string, host net.IP, gen uint64) 
 		return &ForwardResult{
 			Pool:              poolName,
 			Mode:              ModeV6,
-			InternalHost:      host.String(),
+			InternalHost:      formatV6(host.To16()),
 			ExternalIP:        p.poolV4[ipIdx].String(),
 			PortLow:           low,
 			PortHigh:          high,
@@ -685,7 +715,7 @@ func lookupReverseInPool(p detParams, poolName string, natIP net.IP, natPort uin
 		}
 		octets := p.hostBaseV6
 		binary.BigEndian.PutUint32(octets[off:off+4], baseWord+subIdx)
-		subscriber = net.IP(octets[:]).String()
+		subscriber = formatV6(octets[:])
 	}
 
 	return &ReverseResult{
