@@ -56542,6 +56542,49 @@ top.
   manifest via cmd/shim-manifest. Verified: fsatomic+dataplane green;
   editing xpf_common.h now trips the freshness test; src-edit coverage intact.
 
+## 2026-07-22 — #6234 server/helpers split (audit-183 cohort)
+- **Action**: Convert `server/helpers.rs` (1.4k-line cold-path grab-bag) into a
+  `server/helpers/` directory module; extract HA session-sync reconstruction
+  into `session_sync.rs`. Pure code-motion, bodies byte-for-byte identical;
+  `mod.rs` re-exports so all `server::helpers::<name>` call sites are unchanged.
+- **File(s)**: server/helpers.rs -> server/helpers/mod.rs (git mv);
+  server/helpers/session_sync.rs (new). Build: userspace-dp cargo build green.
+
+- **Action**: #6234 increment 2 — extract binding/queue planning into
+  `server/helpers/planning.rs` (settle predicates, canonical plan-key hashing,
+  RX-queue/binding replanner kept as one correctness unit per server/README).
+  Pure code-motion; explicit imports replace the crate-root glob. mod.rs
+  re-exports `planning::*`; dropped now-unused sha2/std::io imports from mod.rs.
+- **File(s)**: server/helpers/planning.rs (new), server/helpers/mod.rs.
+  Build: userspace-dp cargo build green, no new warnings in helpers/.
+
+- **Action**: #6234 increment 3 — extract state-file persistence into
+  `server/helpers/persistence.rs` (OwnedStatePayload, build_state_payload,
+  lock-free write_state, and the #5469 pre-persist lock probe). Pure
+  code-motion; explicit imports; mod.rs re-exports `persistence::*`.
+- **File(s)**: server/helpers/persistence.rs (new), server/helpers/mod.rs.
+  Build: userspace-dp cargo build green, no new warnings in helpers/.
+
+- **Action**: #6234 increment 4 (final) — extract status projection into
+  `server/helpers/status.rs` (refresh_status + should_run_afxdp,
+  reconcile_status_bindings, set_bindings_forwarding_armed,
+  forwarding_unsupported_error); reduce `helpers/mod.rs` to a 30-line
+  re-export facade. Replacing the crate-root glob exposed 3 now-dead
+  feeder imports in main.rs (SyncedSessionEntry, Serialize, Instant) —
+  removed — and one BTreeMap import consumed only by main_tests.rs via
+  `use super::*` — relocated into main_tests.rs. Updated server/README.md
+  to describe the helpers/ submodule layout.
+- **File(s)**: server/helpers/status.rs (new), server/helpers/mod.rs,
+  main.rs, main_tests.rs, server/README.md.
+- **Validation**: PURE CODE-MOTION (Class A). Full bin cargo test suite
+  green run serially: 4121 passed, 0 failed. Targeted: server:: 89 passed
+  (incl. write_state_releases_lock_before_persist #5469); the tests::
+  superset 3487 passed (incl. binding_plan/planning + session-sync);
+  3 integration binaries 31 passed. Build green, warnings 176->175 (net
+  cleanup, 0 new in helpers/). The full PARALLEL run starves a
+  pre-existing WG concurrency test (afxdp::wg::engine::engine_internal_tests,
+  skb_wait_for_more_packet); it passes in isolation (24/0) and my diff
+  adds no test/socket/WG code — unrelated known flake (#6157/#6294/#6279).
 ## 2026-07-22 — #5650 forwarding/mod.rs hot-path-preserving split (PR)
 - **Timestamp**: 2026-07-22
 - **Action**: Pure code-motion split of userspace-dp forwarding/mod.rs
