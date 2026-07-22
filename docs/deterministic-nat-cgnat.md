@@ -263,6 +263,69 @@ non-contiguous ordered list — `ip_idx` is a POSITION in that list, so a direct
 `public_ip - pool_base` subtraction would be wrong; the index maps each pool
 address to the same position the forward path selects with `pool_v4[ip_idx]`.
 
+## Operator lookup surface (#5794)
+
+The deterministic mapping is exposed for the CGN compliance / forensics
+workflow through a single canonical domain query (`pkg/nat`,
+`LookupForward` / `LookupReverse`) that the CLI, gRPC, and REST surfaces all
+consume, so a CLI answer can never drift from an API answer. The math is the
+Algorithm above, mirrored in Go and pinned to the Rust allocator by
+cross-language golden vectors plus a Go-side parity test that cross-checks the
+parameter derivation against the shipped wire-field builders
+(`deterministicSourceNATFields` / `deterministicNAT64V6Fields`).
+
+**Algorithmic mapping vs live session state.** This surface reports the
+*algorithmic* subscriber↔translation attribution — the stateless, reversible
+function of the applied pool configuration. It is NOT a live session lookup:
+it does not consult the conntrack table and does not report whether a specific
+port is currently in use. Use `show security nat source pool` and the session
+commands for live occupancy; use this for "which subscriber owns
+`(public IP, port)`" and "which block is subscriber X assigned", which hold
+regardless of live traffic.
+
+**Applied generation, not candidate config.** The query runs against the
+LAST-APPLIED NAT generation (the configuration the dataplane is actually
+enforcing), read from the userspace manager's cached `AppliedNATView` with no
+control-socket I/O and no packet-path index. A candidate change that has been
+committed but not yet applied does NOT move the answer until it lands; when the
+dataplane has applied nothing yet, the query fails closed with
+`no-applied-view`. The applied generation is echoed in every result.
+
+### CLI (vSRX parity: `show security nat source deterministic-nat`)
+
+```
+# Forward — subscriber -> translated external IP + assigned port block
+show security nat source deterministic-nat internal-host 100.64.0.5 [pool CGNAT-POOL]
+
+# Reverse — translated (external IP, port) -> internal subscriber
+show security nat source deterministic-nat nat-ip 203.0.113.1 nat-port 3900 [pool CGNAT-POOL]
+```
+
+The optional `pool` filter scopes the lookup to one source NAT pool. When it is
+omitted and more than one deterministic pool contains the queried tuple, the
+query is rejected as `ambiguous-pool` (it never returns a first-iteration
+match); select a pool to disambiguate. Reordering a pool's addresses changes
+`ip_idx` and therefore the attribution — the applied snapshot's pool order is
+authoritative.
+
+### gRPC / REST
+
+- gRPC: `GetNATDeterministic(GetNATDeterministicRequest)` — `direction`
+  FORWARD/REVERSE, optional `pool`, `internal_host` (forward) or
+  `nat_ip` + `nat_port` (reverse). Failures return `found=false` with a stable
+  `error_code` in the response body (not a gRPC status error).
+- REST: `GET /api/v1/security/nat/deterministic?internal-host=<ip>[&pool=<name>]`
+  (forward) and `?nat-ip=<ip>&nat-port=<n>[&pool=<name>]` (reverse), returning a
+  `NATDeterministicInfo` JSON body.
+
+**Stable machine-readable error codes** (identical across CLI/gRPC/REST):
+`no-applied-view`, `unknown-pool`, `not-deterministic`, `malformed-input`,
+`out-of-range` (subscriber outside the pool's servable range), `ambiguous-pool`,
+and `not-found` (a reverse tuple that maps to no subscriber). A subscriber that
+is inside the host CIDR but beyond the pool's servable capacity
+(`ip_idx >= len(pool)`) returns `out-of-range`, matching the allocator's
+fail-closed behavior.
+
 ## Userspace Dataplane Implementation (#4559)
 
 Both the IPv4 (mode 1) and the IPv6/NAPT64 (mode 2) paths are implemented in the

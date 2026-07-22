@@ -56390,3 +56390,23 @@ top.
   userspace-dp/src/afxdp/worker/{cos_state,mod}.rs,
   userspace-dp/src/afxdp/cos/queue_service/tests/{refund,wakeup}.rs,
   userspace-dp/src/afxdp/cos/README.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5794 — expose deterministic source-NAT (CGNAT/NAPT64)
+  forward/reverse mapping lookup via CLI/gRPC/REST. New canonical `pkg/nat`
+  domain query (LookupForward/LookupReverse) against the last-applied NAT
+  generation (AppliedNATView), mirroring the Rust allocator and pinned by
+  cross-language golden vectors + a userspace parity test. New
+  GetNATDeterministic gRPC RPC, REST /security/nat/deterministic endpoint,
+  and `show security nat source deterministic-nat internal-host|nat-ip`
+  CLI command (local + remote). Docs updated.
+- **File(s)**: pkg/nat/deterministic.go, pkg/nat/deterministic_test.go,
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/userspace/nat_deterministic_parity_test.go,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/xpfv1/xpf_grpc.pb.go, pkg/grpcapi/server_nat_deterministic.go,
+  pkg/grpcapi/server_nat_deterministic_test.go, pkg/api/nat.go,
+  pkg/api/types.go, pkg/api/server.go, pkg/api/nat_deterministic_test.go,
+  pkg/cmdtree/tree.go, cmd/cli/show_nat.go, pkg/cli/cli_show_nat.go,
+  pkg/cli/cli_show_nat_deterministic_test.go,
+  docs/deterministic-nat-cgnat.md, docs/feature-gaps.md, docs/vsrx-gaps.md
