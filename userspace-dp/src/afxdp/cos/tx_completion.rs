@@ -827,6 +827,13 @@ pub(in crate::afxdp) fn refresh_cos_interface_activity(
     binding.cos.released_queue_leases_scratch = released_queue_leases;
 }
 
+// #4973: returns the drained (now-empty) `retry` deque so the CoSBatch submit
+// handler can store it back into the per-worker Local batch scratch, reusing the
+// ring-buffer allocation. On the queue-torn-down early return the deque is
+// returned undrained (its items are dropped by the next `build_cos_batch_from_queue`
+// `clear()`, exactly as the previous by-value drop dropped them — the queue is
+// gone, so those items were already unrecoverable). Behavior is otherwise
+// identical; only the deque's ownership is threaded back out.
 #[inline]
 pub(in crate::afxdp) fn apply_cos_send_result(
     binding: &mut BindingWorker,
@@ -835,8 +842,8 @@ pub(in crate::afxdp) fn apply_cos_send_result(
     phase: CoSServicePhase,
     batch_bytes: u64,
     sent_bytes: u64,
-    retry: VecDeque<TxRequest>,
-) {
+    mut retry: VecDeque<TxRequest>,
+) -> VecDeque<TxRequest> {
     // #4265 (R-2): the serviced queue's shared lease is debited in the
     // Guarantee phase regardless of `exact` — a non-exact guaranteed
     // sharded queue now carries a legacy lease that meters its class-wide
@@ -866,7 +873,7 @@ pub(in crate::afxdp) fn apply_cos_send_result(
     let peer_exact_demand_mask = peer_exact_demand_queue_mask(binding, root_ifindex);
     {
         let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
-            return;
+            return retry;
         };
         let exact_demand_mask = exact_backlog_queue_mask(root) | peer_exact_demand_mask;
         let exact_demand_rate =
@@ -884,7 +891,7 @@ pub(in crate::afxdp) fn apply_cos_send_result(
                 && !queue.config.exact
                 && matches!(phase, CoSServicePhase::Surplus)
                 && exact_demand_rate > 0;
-            let retry_bytes = restore_cos_local_items_inner(queue, retry);
+            let retry_bytes = restore_cos_local_items_inner(queue, &mut retry);
             queue.hot.queued_bytes = queue
                 .hot
                 .queued_bytes
@@ -944,8 +951,13 @@ pub(in crate::afxdp) fn apply_cos_send_result(
         maybe_consume_exact_queue_lease(shared_queue_lease, phase, sent_bytes);
     }
     refresh_cos_interface_activity(binding, root_ifindex);
+    // #4973: hand the drained deque back for batch-scratch reuse.
+    retry
 }
 
+// #4973: prepared variant of `apply_cos_send_result` — returns the drained
+// deque so the submit handler can reuse it as the per-worker Prepared batch
+// scratch. See `apply_cos_send_result` for the ownership rationale.
 #[inline]
 pub(in crate::afxdp) fn apply_cos_prepared_result(
     binding: &mut BindingWorker,
@@ -954,8 +966,8 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
     phase: CoSServicePhase,
     batch_bytes: u64,
     sent_bytes: u64,
-    retry: VecDeque<PreparedTxRequest>,
-) {
+    mut retry: VecDeque<PreparedTxRequest>,
+) -> VecDeque<PreparedTxRequest> {
     // #4265 (R-2): the serviced queue's shared lease is debited in the
     // Guarantee phase regardless of `exact` — a non-exact guaranteed
     // sharded queue now carries a legacy lease that meters its class-wide
@@ -983,7 +995,7 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
     let peer_exact_demand_mask = peer_exact_demand_queue_mask(binding, root_ifindex);
     {
         let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
-            return;
+            return retry;
         };
         let exact_demand_mask = exact_backlog_queue_mask(root) | peer_exact_demand_mask;
         let exact_demand_rate =
@@ -1001,7 +1013,7 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
                 && !queue.config.exact
                 && matches!(phase, CoSServicePhase::Surplus)
                 && exact_demand_rate > 0;
-            let retry_bytes = restore_cos_prepared_items_inner(queue, retry);
+            let retry_bytes = restore_cos_prepared_items_inner(queue, &mut retry);
             queue.hot.queued_bytes = queue
                 .hot
                 .queued_bytes
@@ -1063,12 +1075,19 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
         maybe_consume_exact_queue_lease(shared_queue_lease, phase, sent_bytes);
     }
     refresh_cos_interface_activity(binding, root_ifindex);
+    // #4973: hand the drained deque back for batch-scratch reuse.
+    retry
 }
 
+// #4973: `retry` is drained in place (`&mut`) rather than consumed by value, so
+// the caller (`apply_cos_send_result` / the submit-side restore wrapper) keeps
+// ownership of the now-empty deque and can hand it back to the per-worker batch
+// scratch, retaining its ring-buffer allocation. `pop_back` still empties it, so
+// behavior is identical; only the ownership transfer moved to the caller.
 #[inline]
 pub(in crate::afxdp) fn restore_cos_local_items_inner(
     queue: &mut CoSQueueRuntime,
-    mut retry: VecDeque<TxRequest>,
+    retry: &mut VecDeque<TxRequest>,
 ) -> u64 {
     let mut retry_bytes = 0u64;
     while let Some(req) = retry.pop_back() {
@@ -1084,7 +1103,7 @@ pub(in crate::afxdp) fn restore_cos_local_items_inner(
 #[inline]
 pub(in crate::afxdp) fn restore_cos_prepared_items_inner(
     queue: &mut CoSQueueRuntime,
-    mut retry: VecDeque<PreparedTxRequest>,
+    retry: &mut VecDeque<PreparedTxRequest>,
 ) -> u64 {
     let mut retry_bytes = 0u64;
     while let Some(req) = retry.pop_back() {

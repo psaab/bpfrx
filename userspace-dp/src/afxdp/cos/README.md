@@ -99,6 +99,19 @@ mod.rs for further file-level breakdown.
   binding is the same worker that owns the queue's
   `FlowFairState`; therefore `observed_bps` updates and reads do not
   need atomic synchronization.
+- **Per-worker batch deques (#4973).** The non-exact shaped-TX path
+  (`build_cos_batch_from_queue`, driven by `drain_shaped_tx` →
+  `select_nonexact_cos_guarantee_batch_into` /
+  `select_cos_surplus_batch_filtered`) no longer `VecDeque::new()`s a batch
+  deque per selected batch. Two reusable deques (`cos_local_batch_scratch` /
+  `cos_prepared_batch_scratch` on `WorkerCos`) are `mem::take`n into the built
+  `CoSBatch`, then drained empty and stored back by the submit handler
+  (`submit_local` / `submit_prepared`, via the now-returning
+  `apply_cos_*_result` / `restore_cos_*_items`), retaining the ring-buffer
+  allocation across drains — allocation-free after warmup. Each arm `clear()`s
+  its scratch at entry so a store-back that left residue (a queue-torn-down
+  early return returns the deque undrained) cannot leak into the next batch.
+  Mirrors the #4972 `released_queue_leases_scratch` reuse pattern.
 - **V_min cadence persists across drain calls (#2624).** The
   cross-worker V_min sync (`cos_queue_v_min_continue` → the expensive
   `participating_v_min_snapshot` Acquire-load scan of every peer

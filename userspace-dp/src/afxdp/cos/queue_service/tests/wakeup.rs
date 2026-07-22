@@ -130,7 +130,7 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
         },
         queue_lease_v8: None,
     };
-    let retry = VecDeque::from([TxRequest {
+    let mut retry = VecDeque::from([TxRequest {
         bytes: vec![0; 1500],
         expected_ports: None,
         expected_addr_family: libc::AF_INET as u8,
@@ -143,7 +143,7 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
         enqueue_ns: 0,
     }]);
 
-    let retry_bytes = restore_cos_local_items_inner(&mut queue, retry);
+    let retry_bytes = restore_cos_local_items_inner(&mut queue, &mut retry);
 
     assert_eq!(queue.hot.items.len(), 1);
     assert_eq!(retry_bytes, 1500);
@@ -203,7 +203,7 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
         },
         queue_lease_v8: None,
     };
-    let retry = VecDeque::from([PreparedTxRequest {
+    let mut retry = VecDeque::from([PreparedTxRequest {
         offset: 64,
         len: 1500,
         recycle: PreparedTxRecycle::FreeTxFrame,
@@ -218,7 +218,7 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
         enqueue_ns: 0,
     }]);
 
-    let retry_bytes = restore_cos_prepared_items_inner(&mut queue, retry);
+    let retry_bytes = restore_cos_prepared_items_inner(&mut queue, &mut retry);
 
     assert_eq!(queue.hot.items.len(), 1);
     assert_eq!(retry_bytes, 1500);
