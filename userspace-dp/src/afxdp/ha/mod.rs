@@ -1030,6 +1030,6 @@ fn drain_session_deltas_from_live(
 }
 
 #[cfg(test)]
-#[path = "ha_tests.rs"]
+#[path = "../ha_tests.rs"]
 mod tests;
 

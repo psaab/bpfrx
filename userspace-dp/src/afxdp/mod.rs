@@ -76,7 +76,6 @@ mod forwarding_build;
 mod frame;
 #[path = "gre.rs"]
 mod gre;
-#[path = "ha.rs"]
 mod ha;
 #[path = "icmp.rs"]
 mod icmp;
