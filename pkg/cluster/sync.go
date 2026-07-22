@@ -463,7 +463,7 @@ type SessionSync struct {
 	// debounced goroutine to re-run doBulkSync over the survivor; this CAS
 	// flag bounds it to a single in-flight re-drive so a survivor that ALSO
 	// flaps cannot cause a re-drive storm.
-	bulkRedriveInFlight        atomic.Bool
+	bulkRedriveInFlight atomic.Bool
 	// needColdPrime latches the outstanding cold-prime obligation across the
 	// per-accept goroutines (#4962). It is armed under s.mu on a full
 	// disconnect -> connect transition (both fabric slots were empty) and
