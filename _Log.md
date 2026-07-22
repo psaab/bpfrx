@@ -1,3 +1,43 @@
+## 2026-07-22 — #6157/#6294: make parallel-sensitive WireGuard tests parallel-safe
+
+- **Timestamp**: 2026-07-22 (fix/6157-wg-test-parallel-serial)
+- **Action**: Made two WG tests safe under a default-parallel
+  `cargo test --release` (a full-suite parallel run had deadlocked >100min on
+  the WG engine test). #6294: converted the test-only
+  `OUTER_ROUTE_RESOLVE_COUNT` from a process-global `AtomicUsize` to a
+  `thread_local!` `Cell<usize>` (`afxdp/frame/wg.rs`) with reset/read/bump
+  accessors, so each test thread's outer-route-resolve count is isolated — a
+  parallel sibling `wg_encap_frame`/`outer_*` test can no longer corrupt
+  `wg_encap_frame_resolves_outer_route_once_v4`'s exact `== 1` assertion.
+  Needs no guard threaded through the ~14 outer-resolution tests. #6157: added
+  a poison-tolerant module-local serialization guard `wg_engine_test_serial()`
+  (`afxdp/wg/engine_tests.rs`, mirrors `icmp_ratelimit::global_bucket_test_lock`)
+  and hold it for the whole body of the two heavy busy-spin engine tests
+  (`install_session_serializes_with_reconcile_removal`,
+  `reconcile_peers_snapshot_is_atomic_under_concurrent_load`) so at most one
+  runs at a time — the blocked one PARKS on the mutex (futex wait) instead of
+  compounding scheduler oversubscription.
+- **Fail-on-revert (deterministic)**:
+  - `outer_route_resolve_count_is_thread_local_isolated` (`wg_tests.rs`): two
+    barrier-synced threads each reset+bump 50k times+read; each must observe
+    exactly its own 50k. Reverting to a shared atomic leaks the sibling's
+    bumps → assertion fails.
+  - `wg_engine_test_serial_grants_exclusive_access` (`engine_tests.rs`): two
+    barrier-synced threads take the guard and enter an `IN_CRITICAL` region;
+    a swap-true-on-entry asserts no concurrent occupant. Removing the guard
+    acquisition lets both enter → panic → join fails.
+- **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs,
+  userspace-dp/src/afxdp/wg/engine_tests.rs, docs/engineering-style.md,
+  _Log.md
+- **Docs**: added a "Rust tests must be parallel-safe" reminder to
+  docs/engineering-style.md (thread-local isolation vs poison-tolerant serial
+  guard, deterministic fail-on-revert). No operator/design/state doc surface —
+  test-only change, no production behavior.
+- **Validation**: `cargo build --release` clean; repeated parallel targeted
+  runs of the affected + fail-on-revert tests; full suite `--test-threads=1`
+  green (see PR body).
+
 ## 2026-07-22 — #6114: mirror flow-cache HOT path samples before reserving
 
 - **Timestamp**: 2026-07-22 (fix/6114-mirror-sample-before-cas)
