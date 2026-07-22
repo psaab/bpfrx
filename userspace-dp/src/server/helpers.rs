@@ -44,6 +44,10 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     let (neighbor_entries, neighbor_generation) = state.afxdp.dynamic_neighbor_status();
     state.status.neighbor_entries = neighbor_entries;
     state.status.neighbor_generation = neighbor_generation;
+    // #6034: ACK the highest applied authoritative manager-neighbor replace
+    // generation so the Go manager can confirm a clear/replace landed.
+    state.status.manager_neighbor_generation =
+        state.afxdp.last_applied_manager_neighbor_generation();
     // #710: cluster-wide aggregate of cross-worker CoS no-owner-binding
     // drops. The per-binding increment site is mechanical; this is the
     // only operator-facing surface for the counter.

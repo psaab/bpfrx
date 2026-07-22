@@ -56344,3 +56344,28 @@ top.
   #6312 (JSON resync id-drop), #6313 (reverse-materialize test).
 - **File(s)**: docs/sync-protocol.md, userspace-dp/src/session/README.md,
   userspace-dp/src/session/install.rs, userspace-dp/src/session/tests.rs
+
+## 2026-07-22 — #6034 manager-neighbor replace-generation envelope + ACK/retry
+- **Action**: Follow-up to #5864 (clear-on-empty). Added defense-in-depth to the
+  manager→helper `update_neighbors` push: each authoritative replace now carries
+  a monotonic `neighbor_generation` (Go `Manager.neighborReplaceGen`); the Rust
+  `apply_manager_neighbors(replace, generation, ..)` FENCES a stale/reordered
+  replace (`generation <= applied_manager_generation`) without touching the
+  table and ACKs the applied generation in
+  `ProcessStatus.manager_neighbor_generation`. Both Go senders
+  (RegenerateNeighborSnapshot, BumpFIBGeneration) advance their cached neighbor
+  view only when the ACK confirms the replace landed, otherwise retain retry
+  debt (next regeneration re-diffs). Additive/backward-safe: generation 0
+  bypasses the fence; a missing ACK field decodes 0 → "assume applied". No new
+  control-socket caller; retry piggybacks the existing regeneration cadence.
+  Regenerated the wire golden fixture (one new `process_status` key). Added a Go
+  fail-on-revert test (envelope carry + retry-debt) and Rust fence unit tests.
+- **File(s)**: pkg/dataplane/userspace/{manager,manager_neighbor,manager_generation,protocol}.go,
+  pkg/dataplane/userspace/neighbor_replace_envelope_6034_test.go,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/afxdp/coordinator/{mod,neighbor_manager,status}.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/server/{helpers,lifecycle}.rs,
+  userspace-dp/src/server/handlers/{mod,neighbors}.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/src/afxdp/README.md

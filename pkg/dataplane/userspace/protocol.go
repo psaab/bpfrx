@@ -1427,14 +1427,26 @@ type ProcessStatus struct {
 	// boundary), and post-preflight partial-install residuals (expected
 	// 0 forever; nonzero = preflight/install pairing bug). omitempty for
 	// mixed Rust/Go daemon back-compat (older helpers omit the keys).
-	SessionCreateDrops             uint64      `json:"session_create_drops,omitempty"`
-	SessionInstallAdmissionRefused uint64      `json:"session_install_admission_refused,omitempty"`
-	SessionInstallPartial          uint64      `json:"session_install_partial,omitempty"`
-	FlowCacheCapacity              uint64      `json:"flow_cache_capacity,omitempty"`
-	NeighborCacheCapacity          uint64      `json:"neighbor_cache_capacity,omitempty"`
-	NeighborGeneration             uint64      `json:"neighbor_generation,omitempty"`
-	RouteEntries                   int         `json:"route_entries,omitempty"`
-	WorkerHeartbeats               []time.Time `json:"worker_heartbeats,omitempty"`
+	SessionCreateDrops             uint64 `json:"session_create_drops,omitempty"`
+	SessionInstallAdmissionRefused uint64 `json:"session_install_admission_refused,omitempty"`
+	SessionInstallPartial          uint64 `json:"session_install_partial,omitempty"`
+	FlowCacheCapacity              uint64 `json:"flow_cache_capacity,omitempty"`
+	NeighborCacheCapacity          uint64 `json:"neighbor_cache_capacity,omitempty"`
+	NeighborGeneration             uint64 `json:"neighbor_generation,omitempty"`
+	// ManagerNeighborGeneration is the helper's ACK (#6034) of the highest
+	// authoritative manager-neighbor REPLACE generation it has applied. It
+	// echoes the NeighborGeneration the manager stamps on each
+	// update_neighbors replace (distinct from NeighborGeneration above, which
+	// is the dynamic ARP/NDP resolver epoch). The send path advances its
+	// cached neighbor view only when this ACK confirms the replace landed
+	// (>= the sent generation); a lower value means the helper fenced the
+	// replace as stale, so the manager retains retry debt and re-diffs on the
+	// next regeneration. omitempty for mixed Rust/Go back-compat: an older
+	// helper omits it (decodes 0), which the send path treats as "no ACK
+	// support, assume applied" to preserve pre-#6034 behavior.
+	ManagerNeighborGeneration uint64      `json:"manager_neighbor_generation,omitempty"`
+	RouteEntries              int         `json:"route_entries,omitempty"`
+	WorkerHeartbeats          []time.Time `json:"worker_heartbeats,omitempty"`
 	// #869: per-worker busy/idle runtime telemetry.
 	WorkerRuntime []WorkerRuntimeStatus `json:"worker_runtime,omitempty"`
 	HAGroups      []HAGroupStatus       `json:"ha_groups,omitempty"`
@@ -1577,7 +1589,7 @@ type ProcessStatus struct {
 	// scan/upstream-outage failure mode). Separate from
 	// PendingNeighDuplicateDropsTotal (the key was already pending —
 	// normal cold-start coalescing).
-	PendingNeighCapacityDropsTotal uint64   `json:"pending_neigh_capacity_drops_total,omitempty"`
+	PendingNeighCapacityDropsTotal uint64 `json:"pending_neigh_capacity_drops_total,omitempty"`
 	// #5673: cumulative data-path neighbor learns refused because the shared
 	// dynamic-neighbor map's target shard was at MAX_DYNAMIC_NEIGHBORS_PER_SHARD.
 	// Source-address learning runs on RX before screen/policy admission, so a
