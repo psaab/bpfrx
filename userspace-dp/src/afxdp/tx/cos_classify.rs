@@ -104,6 +104,42 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
     meta: UserspaceDpMeta,
     flow_key: Option<&SessionKey>,
 ) -> CachedTxSelectionDescriptor {
+    // Non-NAT / single-key callers: the ingress input-filter re-walk uses the
+    // same tuple as the output filter (there is no post-NAT/pre-NAT split).
+    resolve_cached_cos_tx_selection_impl(forwarding, egress_ifindex, meta, flow_key, flow_key)
+}
+
+/// #5158: cached-seed TX-selection variant for the POST-NAT transit forward
+/// path. `egress_wire_key` (the post-NAT on-wire tuple, #3642) drives the
+/// egress OUTPUT filter + CoS queue selection; `ingress_flow_key` (the PRE-NAT
+/// ingress tuple the input filter originally matched) drives the ingress INPUT
+/// filter re-walk. The flow-cache seed (`flow_cache.rs`) builds the post-NAT
+/// wire key with `forward_wire_key` and passes the pre-NAT session
+/// `forward_key` as `ingress_flow_key`, so NAT'd traffic still picks up an
+/// ingress `then forwarding-class` / dscp-rewrite / three-color policer.
+pub(in crate::afxdp) fn resolve_cached_cos_tx_selection_prenat(
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    meta: UserspaceDpMeta,
+    egress_wire_key: Option<&SessionKey>,
+    ingress_flow_key: Option<&SessionKey>,
+) -> CachedTxSelectionDescriptor {
+    resolve_cached_cos_tx_selection_impl(
+        forwarding,
+        egress_ifindex,
+        meta,
+        egress_wire_key,
+        ingress_flow_key,
+    )
+}
+
+fn resolve_cached_cos_tx_selection_impl(
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    meta: UserspaceDpMeta,
+    flow_key: Option<&SessionKey>,
+    ingress_flow_key: Option<&SessionKey>,
+) -> CachedTxSelectionDescriptor {
     let iface = forwarding.cos.interfaces.get(&egress_ifindex);
     let Some(flow_key) = flow_key else {
         // #hb166 T-6(m): fragments / flowless packets carry no 5-tuple but
@@ -228,15 +264,25 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
     // differs from the ingress meta family; `flow_key` is already unwrapped to
     // the egress wire key here, so its `addr_family` is the correct egress one.
     let is_v6 = flow_key.addr_family as i32 == libc::AF_INET6;
+    // #5158: the ingress INPUT filter matched the packet on its PRE-NAT ingress
+    // tuple (Junos applies input filters BEFORE NAT), so its re-walk below runs
+    // on the pre-NAT `ingress_flow_key` and the ingress-side family, NOT the
+    // post-NAT egress wire key `flow_key`/`is_v6` (#3642, correct only for the
+    // OUTPUT filter). For a non-NAT flow both keys — and both families — match.
+    let ingress_key = ingress_flow_key.unwrap_or(flow_key);
+    let ingress_is_v6 = ingress_key.addr_family as i32 == libc::AF_INET6;
     let has_output_tx_eval = crate::filter::interface_output_filter_needs_tx_eval(
         &forwarding.filter_state,
         egress_ifindex,
         is_v6,
     );
     let has_input_tx_selection =
-        crate::filter::filter_state_has_input_tx_selection(&forwarding.filter_state, is_v6);
+        crate::filter::filter_state_has_input_tx_selection(&forwarding.filter_state, ingress_is_v6);
     let has_input_three_color_policer =
-        crate::filter::filter_state_has_input_three_color_policer(&forwarding.filter_state, is_v6);
+        crate::filter::filter_state_has_input_three_color_policer(
+            &forwarding.filter_state,
+            ingress_is_v6,
+        );
     if iface.is_none()
         && !has_output_tx_eval
         && !has_input_tx_selection
@@ -305,7 +351,7 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
             meta.ingress_vlan_id,
         )
         .unwrap_or(meta.ingress_ifindex as i32);
-        let ingress_filter = if is_v6 {
+        let ingress_filter = if ingress_is_v6 {
             forwarding
                 .filter_state
                 .iface_filter_v6_fast
@@ -321,13 +367,15 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
         if let Some(ingress_filter) = ingress_filter.filter(|filter| {
             filter.affects_tx_selection || filter.has_three_color_policer_terms
         }) {
+            // #5158: re-walk on the PRE-NAT ingress tuple, not `flow_key` (the
+            // post-NAT egress wire key the output filter used above).
             let ingress_result = crate::filter::evaluate_filter_ref_tx_selection_cached(
                 ingress_filter,
-                flow_key.src_ip,
-                flow_key.dst_ip,
-                flow_key.protocol,
-                flow_key.src_port,
-                flow_key.dst_port,
+                ingress_key.src_ip,
+                ingress_key.dst_ip,
+                ingress_key.protocol,
+                ingress_key.src_port,
+                ingress_key.dst_port,
                 meta.dscp,
             );
             effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
@@ -454,7 +502,16 @@ pub(in crate::afxdp) fn resolve_cos_tx_selection(
     flow_key: Option<&SessionKey>,
     extra: crate::filter::TermMatchExtra,
 ) -> CoSTxSelection {
-    resolve_cos_tx_selection_internal(forwarding, egress_ifindex, meta, flow_key, extra, None)
+    // Non-NAT / single-key callers: ingress input re-walk shares the output tuple.
+    resolve_cos_tx_selection_internal(
+        forwarding,
+        egress_ifindex,
+        meta,
+        flow_key,
+        flow_key,
+        extra,
+        None,
+    )
 }
 
 pub(in crate::afxdp) fn resolve_cos_tx_selection_at(
@@ -470,6 +527,37 @@ pub(in crate::afxdp) fn resolve_cos_tx_selection_at(
         egress_ifindex,
         meta,
         flow_key,
+        flow_key,
+        extra,
+        Some(now_ns),
+    )
+}
+
+/// #5158: TX-selection variant for the POST-NAT transit forward path. The
+/// egress OUTPUT filter and CoS queue selection run on `egress_wire_key` (the
+/// post-NAT on-wire tuple, #3642); the ingress INPUT filter re-walk runs on
+/// `ingress_flow_key` (the PRE-NAT ingress tuple the input filter originally
+/// matched). Callers that build a post-NAT `forward_wire_key` for TX selection
+/// (`forward_request`, `neighbor_dispatch` buffered-frame retransmit) pass the
+/// pre-NAT session `forward_key` as `ingress_flow_key` so NAT'd traffic still
+/// picks up an ingress `then forwarding-class` / dscp-rewrite / three-color
+/// policer. `None`/`None` degrades to the flowless path exactly as the single-
+/// key entry points do.
+pub(in crate::afxdp) fn resolve_cos_tx_selection_at_prenat(
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    meta: impl Into<ForwardPacketMeta>,
+    egress_wire_key: Option<&SessionKey>,
+    ingress_flow_key: Option<&SessionKey>,
+    extra: crate::filter::TermMatchExtra,
+    now_ns: u64,
+) -> CoSTxSelection {
+    resolve_cos_tx_selection_internal(
+        forwarding,
+        egress_ifindex,
+        meta,
+        egress_wire_key,
+        ingress_flow_key,
         extra,
         Some(now_ns),
     )
@@ -480,6 +568,7 @@ fn resolve_cos_tx_selection_internal(
     egress_ifindex: i32,
     meta: impl Into<ForwardPacketMeta>,
     flow_key: Option<&SessionKey>,
+    ingress_flow_key: Option<&SessionKey>,
     extra: crate::filter::TermMatchExtra,
     now_ns: Option<u64>,
 ) -> CoSTxSelection {
@@ -634,15 +723,25 @@ fn resolve_cos_tx_selection_internal(
         };
     };
     // `is_v6` derived above from the (post-NAT) egress key, not `meta` (#3642).
+    // #5158: the ingress INPUT filter matched the packet on its PRE-NAT ingress
+    // tuple (Junos applies input filters BEFORE NAT), so its re-walk below runs
+    // on the pre-NAT `ingress_flow_key` and the ingress-side family, NOT the
+    // post-NAT egress wire key `flow_key`/`is_v6`. For a non-NAT flow both keys —
+    // and both families — match, so this is a no-op there.
+    let ingress_key = ingress_flow_key.unwrap_or(flow_key);
+    let ingress_is_v6 = ingress_key.addr_family as i32 == libc::AF_INET6;
     let has_output_tx_eval = crate::filter::interface_output_filter_needs_tx_eval(
         &forwarding.filter_state,
         egress_ifindex,
         is_v6,
     );
     let has_input_tx_selection =
-        crate::filter::filter_state_has_input_tx_selection(&forwarding.filter_state, is_v6);
+        crate::filter::filter_state_has_input_tx_selection(&forwarding.filter_state, ingress_is_v6);
     let has_input_three_color_policer =
-        crate::filter::filter_state_has_input_three_color_policer(&forwarding.filter_state, is_v6);
+        crate::filter::filter_state_has_input_three_color_policer(
+            &forwarding.filter_state,
+            ingress_is_v6,
+        );
     if iface.is_none()
         && !has_output_tx_eval
         && !has_input_tx_selection
@@ -695,7 +794,7 @@ fn resolve_cos_tx_selection_internal(
         0
     };
     let ingress_filter = if need_ingress_eval {
-        if is_v6 {
+        if ingress_is_v6 {
             forwarding
                 .filter_state
                 .iface_filter_v6_fast
@@ -770,14 +869,16 @@ fn resolve_cos_tx_selection_internal(
         // METER the ingress three-color policer, so it MUST NOT re-record the
         // count — use the counter-suppressed variant (the policer meter still
         // runs via the threaded now_ns).
+        // #5158: re-walk on the PRE-NAT ingress tuple, not `flow_key` (the
+        // post-NAT egress wire key the output filter used above).
         let ingress_result = if let Some(now_ns) = now_ns {
             crate::filter::evaluate_filter_ref_tx_selection_runtime_uncounted(
                 ingress_filter,
-                flow_key.src_ip,
-                flow_key.dst_ip,
-                flow_key.protocol,
-                flow_key.src_port,
-                flow_key.dst_port,
+                ingress_key.src_ip,
+                ingress_key.dst_ip,
+                ingress_key.protocol,
+                ingress_key.src_port,
+                ingress_key.dst_port,
                 meta.dscp,
                 extra,
                 meta.pkt_len as u64,
@@ -786,11 +887,11 @@ fn resolve_cos_tx_selection_internal(
         } else {
             crate::filter::evaluate_filter_ref_tx_selection_uncounted(
                 ingress_filter,
-                flow_key.src_ip,
-                flow_key.dst_ip,
-                flow_key.protocol,
-                flow_key.src_port,
-                flow_key.dst_port,
+                ingress_key.src_ip,
+                ingress_key.dst_ip,
+                ingress_key.protocol,
+                ingress_key.src_port,
+                ingress_key.dst_port,
                 meta.dscp,
                 extra,
                 meta.pkt_len as u64,
