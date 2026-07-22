@@ -137,13 +137,25 @@ pub(in crate::afxdp) fn filter_replayed_synced_sessions(
     if purge_ids.is_empty() || entries.is_empty() {
         return;
     }
-    let mut drop_keys: Vec<crate::session::SessionKey> = Vec::new();
+    // #4975: index the drop set in a HashSet rather than a Vec. The
+    // retain phase tests membership once per surviving entry, so a
+    // `Vec::contains` scan made the dominant phase O(entries × drop_keys)
+    // — quadratic when an HA-recovery tunnel remap coincides with a large
+    // synced-session set (entries bounded by the 131,072 worker ceiling).
+    // A HashSet makes the retain step O(entries) amortized. Membership
+    // testing is the only thing that changes: `entries.retain` still
+    // walks the vector in place, so survivor order is preserved. Pre-size
+    // to entries.len() (each purged entry contributes at most 2 keys —
+    // itself plus its derived reverse companion — so this covers the
+    // common case without reallocation).
+    let mut drop_keys: std::collections::HashSet<crate::session::SessionKey> =
+        std::collections::HashSet::with_capacity(entries.len());
     for entry in entries.iter() {
         let id = entry.decision.resolution.tunnel_endpoint_id;
         if id != 0 && purge_ids.contains(&id) {
-            drop_keys.push(entry.key.clone());
+            drop_keys.insert(entry.key.clone());
             if !entry.metadata.is_reverse {
-                drop_keys.push(crate::session::reverse_session_key(
+                drop_keys.insert(crate::session::reverse_session_key(
                     &entry.key,
                     entry.decision.nat,
                 ));
