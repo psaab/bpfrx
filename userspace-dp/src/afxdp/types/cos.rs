@@ -295,6 +295,39 @@ pub(in crate::afxdp) struct CoSQueueConfig {
     pub(in crate::afxdp) codel_target_ns: u64,
 }
 
+impl CoSQueueConfig {
+    /// A non-exact GUARANTEED queue whose configured rate trips
+    /// `COS_SHARED_EXACT_MIN_RATE_BYTES` runs the sharded `shared_exact`
+    /// execution policy: it drains locally on EVERY worker rather than
+    /// being funnelled to one owner. The coordinator therefore attaches a
+    /// shared legacy `SharedCoSQueueLease` so the class-wide guarantee
+    /// admission is metered to the configured rate instead of admitting at
+    /// `N_workers × rate` (#4265).
+    ///
+    /// This predicate is the SINGLE source of truth for "is this non-exact
+    /// queue lease-metered?". Two sites must agree on it, and they used to
+    /// diverge (the #5156 asymmetry): the coordinator uses it to decide
+    /// whether to build the lease
+    /// (`build_shared_cos_queue_leases_reusing_existing`), and the runtime
+    /// builder uses it to start such a queue's token bucket at 0 (metered
+    /// via the lease at runtime) instead of pre-filling `buffer_bytes`
+    /// un-metered. Keeping both sites on one predicate is what makes the
+    /// lease's init charge and teardown give-back symmetric: every byte the
+    /// queue's `hot.tokens` ever holds is acquired through — and returned
+    /// to — the shared lease.
+    ///
+    /// Returns false for exact queues (their lease is a v8 lease built on
+    /// a separate branch and their bucket already starts at 0) and for
+    /// single-owner low-rate non-exact queues (no lease; a private
+    /// per-worker bucket is correct and must keep pre-filling its burst).
+    pub(in crate::afxdp) fn is_shared_lease_metered(&self) -> bool {
+        !self.exact
+            && self.guarantee_enabled
+            && self.transmit_rate_bytes
+                >= crate::afxdp::worker::COS_SHARED_EXACT_MIN_RATE_BYTES
+    }
+}
+
 pub(in crate::afxdp) const COS_FAST_QUEUE_INDEX_MISS: u16 = u16::MAX;
 
 /// Number of SFQ flow buckets per flow-fair CoS queue.

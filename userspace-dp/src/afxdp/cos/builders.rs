@@ -200,9 +200,23 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
                     // no parent shaping rate). Pre-fill tokens to the
                     // buffer cap; otherwise an exact queue starts at 0
                     // and waits forever for a top-up that never arrives.
+                    //
+                    // #5156 (init half): a non-exact LEASE-METERED queue
+                    // (`is_shared_lease_metered`) also starts at 0, exactly
+                    // like exact. Its buffer_bytes are then acquired through
+                    // the shared queue lease at runtime
+                    // (`maybe_top_up_cos_queue_lease` -> `acquire_via_lease`),
+                    // charging the lease's `outstanding` word. Pre-filling
+                    // it un-metered (the old `else` arm) put buffer_bytes ×
+                    // N_workers into circulation with no matching shared
+                    // charge, defeating the #4265 metering at startup and
+                    // leaving the teardown give-back nothing consistent to
+                    // return. Only a truly un-leased non-exact queue
+                    // (single-owner low-rate: a private per-worker bucket,
+                    // no shared lease) keeps pre-filling its burst.
                     tokens: if queue.transmit_rate_bytes == 0 {
                         queue.buffer_bytes.max(COS_MIN_BURST_BYTES)
-                    } else if queue.exact {
+                    } else if queue.exact || queue.is_shared_lease_metered() {
                         0
                     } else {
                         queue.buffer_bytes.max(COS_MIN_BURST_BYTES)

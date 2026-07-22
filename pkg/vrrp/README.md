@@ -566,6 +566,17 @@ pointer means unresolved). The lazy-resolve semantics are preserved —
 the address still becomes available once it is resolvable — and the
 packet hot path stays lock-free, mirroring the `lastDropWarn` atomic.
 
+`advertInterval()` is a third cross-goroutine hazard (#6230). The
+run-loop goroutine calls it on every advert-timer reset to read
+`cfg.AdvertiseInterval`, while cfg writers (`updateConfig`) mutate `cfg`
+under `vi.mu.Lock()`. The read was unlocked — a data race `go test
+-race` flags — where every sibling accessor (`getState`,
+`masterDownInterval`, `preemptHoldDuration`) already snapshots `cfg`
+under `vi.mu`. It now RLocks like they do. The one caller that already
+holds the write lock, `recordMasterAdvert` → `masterAdverFloor`, reads
+via the lock-free `advertIntervalLocked` variant instead — re-taking the
+RLock under the held `Lock()` would self-deadlock.
+
 #### Source re-resolution on address change (#2528)
 
 The lazy-resolve above only fires when the cached source is **nil**
