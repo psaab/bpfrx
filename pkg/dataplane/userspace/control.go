@@ -35,6 +35,28 @@ func parseBindingSlot(arg string) (uint32, error) {
 	return uint32(n), nil
 }
 
+// parseQueueID parses a CLI/gRPC queue-id argument and rejects negatives
+// and values >= dataplane.BindingQueuesPerIface. A valid queue id lives in
+// [0, BindingQueuesPerIface), the queue dimension of the flat binding index
+// formula `idx = ifindex * BindingQueuesPerIface + queue`. This mirrors the
+// #5449-hardened parseBindingSlot and the #4894 queue-dimension guard in
+// maps_sync.go: without the bounds check a "-1" queue passes strconv.Atoi
+// and wraps to 4294967295 on the uint32 cast, and any queue-id >= the stride
+// (16) aliases the adjacent ifindex's queue-0 slot — steering a queue
+// register/arm op to a wrong worker binding. The bound is compared in int
+// space so a value larger than uint32 max cannot alias a valid queue id via
+// truncation.
+func parseQueueID(arg string) (uint32, error) {
+	n, err := strconv.Atoi(arg)
+	if err != nil {
+		return 0, fmt.Errorf("invalid queue: %s", arg)
+	}
+	if n < 0 || n >= int(dataplane.BindingQueuesPerIface) {
+		return 0, fmt.Errorf("queue %d out of range [0, %d)", n, dataplane.BindingQueuesPerIface)
+	}
+	return uint32(n), nil
+}
+
 func ParseForwardingCommand(args []string) (bool, error) {
 	if len(args) != 2 || args[0] != "forwarding" {
 		return false, fmt.Errorf("usage: %s", ForwardingUsage)
@@ -53,15 +75,15 @@ func ParseQueueCommand(args []string) (queueID uint32, registered, armed bool, e
 	if len(args) != 3 || args[0] != "queue" {
 		return 0, false, false, fmt.Errorf("usage: %s", QueueUsage)
 	}
-	queueNum, err := strconv.Atoi(args[1])
+	queueID, err = parseQueueID(args[1])
 	if err != nil {
-		return 0, false, false, fmt.Errorf("invalid queue: %s", args[1])
+		return 0, false, false, err
 	}
 	registered, armed, err = ParseRegistrationOperation(args[2])
 	if err != nil {
 		return 0, false, false, fmt.Errorf("usage: %s", QueueUsage)
 	}
-	return uint32(queueNum), registered, armed, nil
+	return queueID, registered, armed, nil
 }
 
 func ParseBindingCommand(args []string) (slot uint32, registered, armed bool, err error) {

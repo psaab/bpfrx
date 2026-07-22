@@ -1,3 +1,25 @@
+## 2026-07-21 — #6215: ParseQueueCommand queue-id bounds check
+
+- **Timestamp**: 2026-07-21 (fix/6215-parsequeuecommand-bounds)
+- **Action**: `ParseQueueCommand` parsed the queue id with a raw
+  `strconv.Atoi` and cast straight to `uint32` with no bounds check, so a
+  negative (`-1` → `4294967295`) or oversized value (`5000000000` →
+  truncated `705032704`) wrapped into an out-of-range queue id that steers a
+  queue register/arm op to a wrong/out-of-range worker binding. Added a
+  `parseQueueID` helper mirroring the #5449-hardened `parseBindingSlot`,
+  rejecting negatives and values `>= dataplane.BindingQueuesPerIface` (16, the
+  queue-dimension stride of `idx = ifindex*BindingQueuesPerIface + queue`) —
+  the same cap the #4894 `maps_sync.go` guard already enforces on this exact
+  field. Routed `ParseQueueCommand` through the helper; left the signature and
+  valid-input contract unchanged. Did NOT touch `ParseBindingCommand` /
+  `parseBindingSlot`.
+- **File(s)**: pkg/dataplane/userspace/control.go,
+  pkg/dataplane/userspace/queue_id_bounds_6215_test.go
+- **Validation**: `go build ./...` clean; new
+  `TestParseQueueCommandRejectsOutOfRange6215` passes with the fix and
+  FAILS on revert (raw `Atoi`+`uint32` accepts `-1`/`5000000000`/`16`/`9999`);
+  full `pkg/dataplane/userspace` suite green (TMPDIR=/tmp).
+
 ## 2026-07-21 — #5482 follow-up: two review MAJORs on the BACKUP VIP-verify machinery
 
 - **Timestamp**: 2026-07-21 (fix/5482-vrrp-vip-verify)
