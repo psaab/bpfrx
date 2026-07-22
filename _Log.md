@@ -55754,3 +55754,5 @@ top.
     echo-request accept for v4+v6). bash -n OK; shellcheck introduces no new
     findings (3 pre-existing SC1091/SC2034 on the source/lock preamble). The live
     `wg-interop.sh all` cluster run is the parent's gate.
+  **Action**: #6125 — document the deliberate DF-set transit TCP re-segment (not PTB) contract (delivery-over-strict-PMTUD). Docs-only adjudication (path (a)); no code change.
+  **File(s)**: docs/feature-coverage.md, userspace-dp/src/afxdp/tx/README.md
