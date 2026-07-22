@@ -265,21 +265,37 @@ func (m *Manager) lookupUserspaceCtrlForFailClosed(ctrlMap *ebpf.Map, key uint32
 
 func (m *Manager) syncUserspaceClassifierMapsFailClosedLocked(snapshot *ConfigSnapshot) error {
 	if err := m.syncUserspaceClassifierMapsLocked(snapshot); err != nil {
-		ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
-		if ctrlMap == nil {
-			return err
-		}
-		var ctrl userspaceCtrlValue
-		zero := uint32(0)
-		if lookupErr := m.lookupUserspaceCtrlForFailClosed(ctrlMap, zero, &ctrl); lookupErr != nil {
-			if errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
-				return err
-			}
-			return m.blindFailClosedUserspaceCtrlLocked(ctrlMap, snapshot, err, lookupErr)
-		}
-		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
+		return m.failClosedUserspaceCtrlMapLocked(snapshot, err)
 	}
 	return nil
+}
+
+// failClosedUserspaceCtrlMapLocked drives the userspace_ctrl shim to the
+// fail-closed state (Enabled=0) so the XDP shim stops redirecting transit to
+// XSK and only passes proven local/control traffic to the kernel. It is the
+// shared fail-closed action for any error that leaves the ingress/local/
+// interface-NAT classifier BPF maps mutated to a plan the running Rust snapshot
+// has NOT accepted: a classifier-map write failure
+// (syncUserspaceClassifierMapsFailClosedLocked) OR a rejected apply_snapshot
+// after an in-place same-plan refresh (#4959). cause is returned, wrapped with
+// any secondary lookup/update error. When the ctrl row is unreadable the blind
+// path reconstructs a disabled row from the snapshot; a genuinely-absent row
+// (fresh boot, never enabled) is already fail-closed and returns cause
+// unchanged.
+func (m *Manager) failClosedUserspaceCtrlMapLocked(snapshot *ConfigSnapshot, cause error) error {
+	ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
+	if ctrlMap == nil {
+		return cause
+	}
+	var ctrl userspaceCtrlValue
+	zero := uint32(0)
+	if lookupErr := m.lookupUserspaceCtrlForFailClosed(ctrlMap, zero, &ctrl); lookupErr != nil {
+		if errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+			return cause
+		}
+		return m.blindFailClosedUserspaceCtrlLocked(ctrlMap, snapshot, cause, lookupErr)
+	}
+	return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, cause)
 }
 
 func (m *Manager) blindFailClosedUserspaceCtrlLocked(

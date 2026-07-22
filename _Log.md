@@ -55990,3 +55990,24 @@ top.
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs,
   userspace-dp/src/afxdp/coordinator/README.md
+
+- **Timestamp**: 2026-07-22
+  **Action**: #4959 — address-only commit fail-closed on rejected apply_snapshot.
+  The samePlanRefresh path mutates ingress/local/interface-NAT classifier BPF
+  maps IN PLACE with ctrl enabled, then publishes apply_snapshot; a helper
+  rejection previously left the maps a generation ahead of the applied Rust
+  snapshot with ctrl still enabled (fail-open). Extracted
+  `failClosedUserspaceCtrlMapLocked` (shared classifier fail-closed) and added
+  `publishSnapshotFailClosedLocked`; Compile now routes its publish through it
+  with the samePlanRefresh flag, disabling ctrl (Enabled=0) on a same-plan
+  publish rejection. Chose option (b) — keep the lightweight same-plan fast
+  path — over adding addresses to snapshotBindingPlanKey (option a), which would
+  force every address edit through the bootstrap path (ctrl=0 + binding-row
+  clear = transit blip on every successful commit). Added fail-on-revert test
+  (firsthand-verified RED: ctrl stays Enabled=1 under revert) + a source-guard
+  on the Compile publish site. `go build ./...` + `go test ./pkg/dataplane/...`
+  green; privileged run of the new test passes.
+  **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/addr_only_commit_failclosed_4959_test.go,
+  docs/userspace-dataplane-architecture.md
