@@ -290,9 +290,29 @@ pub(crate) fn handle_stream(
         }
     }
 
-    if persist_state {
-        write_state(state_file, &state)?;
-    }
+    // #5294: the state-file persist must NOT gate delivery of the response.
+    // `drain_session_deltas` (session_deltas::drain) and the owner-RG export
+    // mirror (export::owner_rg_collect) DESTRUCTIVELY drain deltas out of the
+    // per-binding fallback buffers / workers into `response.session_deltas`
+    // before this point and set `persist_state`. The old order ran the FALLIBLE
+    // `write_state` with `?` BEFORE encoding the response, so a local state-file
+    // error short-circuited the send: the deltas were already popped off the
+    // queue yet never reached the peer AND were not persisted — a permanent HA
+    // session divergence (the standby never learns those open/close events and
+    // the local copy is gone), with no loss-of-sync latch armed for a write_state
+    // failure. The state file is best-effort observability, not a restore source
+    // (the Go control plane re-applies the full snapshot on restart) and
+    // self-corrects on the next periodic write_state, so it must never strand an
+    // already-drained delta batch. Attempt the persist first (unchanged
+    // ordering), but ALWAYS encode+flush the response so the drained deltas reach
+    // the peer, then surface any persist error to the accept loop (logged) only
+    // AFTER the response is on the wire. Delta order is preserved end-to-end:
+    // the response carries the batch exactly as drained.
+    let persist_result = if persist_state {
+        write_state(state_file, &state)
+    } else {
+        Ok(())
+    };
 
     let mut writer = BufWriter::new(stream);
     serde_json::to_writer(&mut writer, &response).map_err(|e| format!("encode response: {e}"))?;
@@ -300,5 +320,9 @@ pub(crate) fn handle_stream(
         .write_all(b"\n")
         .map_err(|e| format!("write response newline: {e}"))?;
     writer.flush().map_err(|e| format!("flush response: {e}"))?;
+
+    // #5294: surface a persist failure ONLY after the response — carrying the
+    // drained session deltas — has been flushed to the peer.
+    persist_result?;
     Ok(())
 }

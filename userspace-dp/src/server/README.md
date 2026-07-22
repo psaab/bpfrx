@@ -42,6 +42,26 @@ this surface over a Unix socket using a newline-delimited text protocol.
   `handle_stream` dispatcher). One per-verb file per request kind
   (`apply_snapshot`, `set_forwarding_state`, `set_queue_state`,
   `inject_packet`, `stop_workers`, `rebind`, …).
+  - **The state-file persist never gates response delivery (#5294).**
+    `drain_session_deltas` (`handlers/session_deltas.rs`) and the owner-RG
+    export mirror (`handlers/export.rs` → `owner_rg_collect`)
+    DESTRUCTIVELY drain deltas out of the per-binding RPC-fallback buffers /
+    workers into `response.session_deltas` and set `persist_state`. The
+    dispatcher tail used to run the FALLIBLE `write_state(...)?` BEFORE
+    encoding the response, so a local state-file error short-circuited the
+    send: the batch was already popped off the queue yet never reached the
+    peer AND was not persisted — a permanent HA session divergence (the
+    standby never learns those open/close events, the local copy is gone, and
+    no loss-of-sync latch is armed for a `write_state` failure, unlike the
+    #5290 budget-overflow path). The tail now ALWAYS encodes+flushes the
+    response (delta order preserved end-to-end) and only THEN surfaces a
+    persist error to the accept loop (logged). That is sound because the state
+    file is best-effort observability, not a restore source (the Go control
+    plane re-applies the full snapshot on restart) and self-corrects on the
+    next periodic `write_state`. Pinned by
+    `drain_session_deltas_survive_write_state_failure_5294` (a rigged
+    `write_state` failure must still deliver every drained delta; reverting to
+    pop-then-fallible-write drops the batch → EOF on the client read → RED).
 - `helpers.rs` — shared daemon-loop utilities (`replan_queues`,
   `replan_bindings_from_candidates`, `summarize_queues`, capability
   checks).
