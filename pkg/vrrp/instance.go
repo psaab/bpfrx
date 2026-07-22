@@ -2379,6 +2379,21 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 
 	dstIP := net.ParseIP("ff02::12")
 
+	// RFC 5798 §5.2.9 / §6.1: an IPv6 VRRP advertisement lists ALL of the
+	// virtual router's addresses, and the FIRST IPvX address in the payload
+	// MUST be the virtual router's link-local. srcIP is exactly that
+	// link-local (it is also the outer source and the pseudo-header checksum
+	// source below, #2644), so prepend it ahead of the configured global
+	// VIPs the caller placed in pkt.IPAddresses. Marshal derives the
+	// "Count IPvX Addr" wire field from len(IPAddresses) (packet.go), so
+	// prepending here bumps the count in lockstep — no separate count math.
+	// Build a fresh slice rather than mutating the caller's v6Addrs so a
+	// retried send does not prepend twice.
+	llFirst := make([]net.IP, 0, len(pkt.IPAddresses)+1)
+	llFirst = append(llFirst, srcIP)
+	llFirst = append(llFirst, pkt.IPAddresses...)
+	pkt.IPAddresses = llFirst
+
 	// The pseudo-header checksum inside data is computed over srcIP. The
 	// outer IPv6 source MUST equal srcIP or the receiver's checksum (which
 	// is validated against the actual outer source) mismatches and the
