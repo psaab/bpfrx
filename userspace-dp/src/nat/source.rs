@@ -1512,8 +1512,21 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             now_ns,
                         )
                     } else {
-                        rule.pool_allocator
-                            .reserve_address_only(flow, IpAddr::V4(pool_addr))
+                        // #6226: probe the WHOLE pool from the round-robin start
+                        // (`addr_idx`) so a colliding reverse identity on the
+                        // chosen address rotates to a FREE sibling instead of
+                        // falsely exhausting. `addr_idx` already advanced the
+                        // round-robin counter above; the loop does not advance it
+                        // again. `pool_addr` (= pool_addresses_v4[addr_idx]) is
+                        // the loop's first probe — identical to the old single
+                        // probe when it is free.
+                        rule.pool_allocator.reserve_address_only_roundrobin(
+                            flow,
+                            PoolAddressFamily::V4(&rule.pool_addresses_v4),
+                            0,
+                            addr_idx,
+                            rule.address_persistent,
+                        )
                     };
                     match reserved {
                         Ok(translated) => {
@@ -1610,8 +1623,19 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             now_ns,
                         )
                     } else {
-                        rule.pool_allocator
-                            .reserve_address_only(flow, IpAddr::V6(pool_addr))
+                        // #6226: probe the WHOLE pool from the round-robin start
+                        // (`addr_idx`, absolute over the combined v4+v6 index
+                        // space) so a colliding reverse identity on the chosen
+                        // address rotates to a FREE sibling instead of falsely
+                        // exhausting. `addr_idx` already advanced the round-robin
+                        // counter above; the loop does not advance it again.
+                        rule.pool_allocator.reserve_address_only_roundrobin(
+                            flow,
+                            PoolAddressFamily::V6(&rule.pool_addresses_v6),
+                            v6_offset,
+                            addr_idx,
+                            rule.address_persistent,
+                        )
                     };
                     match reserved {
                         Ok(translated) => {

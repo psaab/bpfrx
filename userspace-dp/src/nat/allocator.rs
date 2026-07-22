@@ -1783,6 +1783,114 @@ impl PortAllocator {
         Ok(translated)
     }
 
+    /// #6226: reserve a non-deterministic, non-persistent ADDRESS-ONLY token
+    /// probing the WHOLE pool from the round-robin start, mirroring the
+    /// port-translating [`allocate_translation`] loop.
+    ///
+    /// The pre-#6226 caller picked ONE round-robin address via [`address_index`]
+    /// and called [`reserve_address_only`] on it — a single probe that returned
+    /// `AllocatorExhausted` (→ drop) the moment that one address's reverse
+    /// identity collided for this remote, even though a SIBLING pool address was
+    /// free for the same remote. The shared round-robin counter is oblivious to
+    /// per-remote occupancy, so an unrelated flow advancing it trivially lands a
+    /// later flow on an already-owned address. This loops from the caller's
+    /// round-robin start (`start_abs`, already resolved via [`address_index`] so
+    /// the counter is advanced EXACTLY ONCE per flow — same as the old single
+    /// probe) across every pool address and mints the token on the FIRST address
+    /// whose reverse identity is free; it fails as exhaustion ONLY when EVERY
+    /// pool address collides for this remote.
+    ///
+    /// `address_persistent` keeps the single-probe contract for sticky-by-source
+    /// pools (`address_attempts == 1`): the sticky address is intentional, not
+    /// round-robin, so it is not rotated away from on a collision. The
+    /// deterministic-CGNAT (#5341) and address-only persistent-NAT (#6041)
+    /// branches are untouched — they correctly single-probe their chosen address.
+    ///
+    /// The minted token is byte-identical to [`reserve_address_only`]'s
+    /// (`translated = (chosen address, preserved source port)`, `address_only =
+    /// true`, `persistent_key = None`, `addr_index = 0`), so the SAME
+    /// `release_flow`/`rollback_flow` teardown frees it — no new leak, no new
+    /// delete site. Idempotent re-entry (a racing second packet of the same
+    /// flow) returns the existing translation regardless of the round-robin
+    /// start.
+    pub(super) fn reserve_address_only_roundrobin(
+        &self,
+        flow: SourceNatFlowKey,
+        family_addresses: PoolAddressFamily<'_>,
+        family_offset: usize,
+        start_abs: usize,
+        address_persistent: bool,
+    ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
+        let family_len = family_addresses.len();
+        if family_len == 0 {
+            return Err(super::source::SourceNatFailureReason::WrongAddressFamily);
+        }
+        let start_rel = start_abs.saturating_sub(family_offset) % family_len;
+        // Sticky-by-source pools single-probe their chosen address; round-robin
+        // pools rotate through the whole pool (mirrors `allocate_translation`).
+        let address_attempts = if address_persistent { 1 } else { family_len };
+
+        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        // Idempotent re-entry: a second packet of the same flow (racing session
+        // install) reuses its first decision rather than re-keying.
+        if let Some(existing) = live.live_by_flow.get(&flow) {
+            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+            return Ok(existing.translated);
+        }
+        // Global flow-table cap (the address-only token lives in `live_by_flow`);
+        // one successful probe inserts exactly one entry, so check it once here.
+        if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
+        }
+        // Probe each pool address from the round-robin start; the FIRST whose
+        // reverse identity is free for this remote wins.
+        for offset in 0..address_attempts {
+            let rel = (start_rel + offset) % family_len;
+            let translated_ip = family_addresses.ip_at(rel);
+            let rkey = AddressOnlyReverseKey {
+                protocol: flow.protocol,
+                translated_ip,
+                translated_port: flow.src_port,
+                dst_ip: flow.dst_ip,
+                dst_port: flow.dst_port,
+            };
+            if live.address_only_owners.contains_key(&rkey) {
+                // This address's reverse identity is owned by a DIFFERENT flow
+                // for this remote — try the next sibling instead of dropping.
+                continue;
+            }
+            let translated = TranslatedTuple {
+                ip: translated_ip,
+                // Port-bearing protocols preserve their source port; a port-less
+                // protocol carries 0. NOT written to the wire (the caller leaves
+                // `rewrite_src_port` unset); it keys the reverse identity and lets
+                // the SAME `release_flow` free the token.
+                port: flow.src_port,
+            };
+            live.address_only_owners.insert(rkey, flow);
+            live.live_by_flow.insert(
+                flow,
+                LiveAllocation {
+                    translated,
+                    persistent_key: None,
+                    // No pool-port bit is claimed for an address-only token.
+                    addr_index: 0,
+                    deterministic: false,
+                    address_only: true,
+                },
+            );
+            self.shared
+                .allocations_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(translated);
+        }
+        // Every pool address's reverse identity is already owned by a different
+        // flow for this remote — genuine address-only exhaustion.
+        self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+        Err(super::source::SourceNatFailureReason::AllocatorExhausted)
+    }
+
     /// #6041: reserve an ADDRESS-ONLY PERSISTENT-NAT lease for a `port
     /// no-translation` (or port-less) flow whose pool also configures
     /// `persistent-nat`. Unlike [`reserve_address_only`] (the per-flow #5269
