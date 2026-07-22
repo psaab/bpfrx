@@ -1,3 +1,36 @@
+## 2026-07-21 — #5152: gate RefreshOwnerRGS liveness re-stamp on forwarding disposition
+
+- **Timestamp**: 2026-07-21 (fix/5152-refresh-owner-rgs-hainactive-guard)
+- **Action**: `handle_refresh_owner_rgs`
+  (`userspace-dp/src/afxdp/session_glue/commands/refresh_owner_rgs.rs`) called
+  `sessions.refresh_for_ha_transition(...)` UNCONDITIONALLY for every item in
+  the wider activation scan. `refresh_for_ha_transition` zeroes
+  `first_held_ns` / `seen_rg_epoch` and re-stamps `last_seen_ns` (the #2120
+  §6.4 promotion write-site), so activating one RG reset the standby
+  bounded-leak HOLD clock of UNRELATED split-RG sessions that this node does
+  not own (their refreshed disposition is `HAInactive`), defeating the leak
+  ceiling for every still-inactive RG. Fixed by gating the liveness re-stamp
+  on `refreshed_decision.resolution.disposition != ForwardingDisposition::HAInactive`,
+  mirroring the demote path (`handle_demote_owner_rgs`, `demote_owner_rgs.rs`):
+  only a genuinely-forwarding session is re-stamped, while every scanned
+  session is still republished (the documented purpose of the wider scan —
+  landing split-RG local-forward<->fabric-redirect transitions in the session
+  map). Added a `#[cfg(test)] first_held_ns_for` read accessor
+  (`session/lookup.rs`) so the test observes the HOLD clock without reaching
+  into the private `SessionEntry`.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/commands/refresh_owner_rgs.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/session/README.md,
+  docs/session-sync-architecture.md, _Log.md
+- **Validation**: `cargo build` clean (pre-existing warnings only); new
+  `refresh_owner_rgs_skips_hainactive_hold_clock_5152` PASS. Fail-on-revert
+  confirmed — Case A (unrelated HAInactive session keeps its armed HOLD clock)
+  FAILS when the guard is neutralized (`disposition != HAInactive` -> `true`,
+  unconditional refresh zeroes `first_held_ns`). Case B (the session's own RG
+  activates -> ForwardCandidate) still clears the clock, proving the legitimate
+  promotion refresh is not over-suppressed.
+
 ## 2026-07-21 — #5153: reverse companion inherits forward application inactivity_timeout_ns
 
 - **Timestamp**: 2026-07-21 (fix/5153-reverse-companion-inactivity-timeout)

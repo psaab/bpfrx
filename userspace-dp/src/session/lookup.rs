@@ -362,6 +362,16 @@ impl SessionTable {
             .map(|entry| (entry.decision, entry.metadata.clone(), entry.origin))
     }
 
+    /// #5152: test-only read of an entry's `first_held_ns` — the standby
+    /// bounded-leak HOLD clock (§6.4). Lets the session_glue activation-scan
+    /// test assert the clock is PRESERVED for a session that re-resolves to
+    /// `HAInactive` (skipped) and CLEARED for one that genuinely forwards
+    /// (refreshed) without reaching into the private `SessionEntry` layout.
+    #[cfg(test)]
+    pub(crate) fn first_held_ns_for(&self, key: &SessionKey) -> Option<u64> {
+        self.entry_by_key(key).map(|entry| entry.first_held_ns)
+    }
+
     /// #2442: every owner-RG id that currently indexes at least one session in
     /// this worker's table. Used by the loss-of-sync resync path to export ALL
     /// owned forward sessions (the same RG set

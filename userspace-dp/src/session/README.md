@@ -506,6 +506,15 @@ before failover; ABS-capped to bound the pathological `MaxDurationSeconds`
 config; `first_held_ns`-based so self-heal re-stamps on a flapping RG
 cannot reset the clock.
 
+The command-landed `RefreshOwnerRGS` activation scan
+(`afxdp/session_glue/commands/refresh_owner_rgs.rs::handle_refresh_owner_rgs`)
+enforces the same invariant from the write side: `refresh_for_ha_transition`
+(which clears `first_held_ns` / `seen_rg_epoch` and re-stamps `last_seen_ns`)
+runs ONLY for a session whose refreshed disposition is forwarding
+(`!= HAInactive`), mirroring the demote path. Activating one RG therefore never
+resets the HOLD clock of an unrelated split-RG session that re-resolves to
+`HAInactive` (#5152).
+
 The HA-forwarding predicate (`HAGroupRuntime::is_forwarding_active`, which
 includes the watchdog lease and so fails CLOSED — a node that lost cluster
 state reads inactive → holds) lives on the `afxdp` side and is handed in

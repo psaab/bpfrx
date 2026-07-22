@@ -644,6 +644,22 @@ enforcement. Pinned by
 `refresh_owner_rgs_standby_local_delivery_forces_live_redirect_4805` and
 `refresh_owner_rgs_active_owner_local_delivery_publishes_kernel_local_4805`.
 
+The wider scan **republishes** every touched session's forwarding decision, but
+it must NOT re-stamp the standby *liveness* of a session it does not own.
+`refresh_for_ha_transition` zeroes `first_held_ns` / `seen_rg_epoch` and
+re-stamps `last_seen_ns` (the #2120 §6.4 promotion write-site) — correct for a
+session this node now forwards, but WRONG for one that re-resolves to
+`HAInactive`: it would reset that session's bounded-leak HOLD clock and defeat
+the standby leak ceiling for a redundancy group that never activated here. So
+`handle_refresh_owner_rgs` gates the `refresh_for_ha_transition` call on
+`refreshed_decision.resolution.disposition != HAInactive`, exactly as the
+demote path (`handle_demote_owner_rgs`) does, while still publishing the
+refreshed forwarding decision for every scanned session. Activating one RG
+therefore never resets the HOLD clock of an unrelated split-RG session (the
+pre-#5152 bug — the leak ceiling of every still-inactive RG's synced sessions
+was reset on any activation elsewhere in the cluster). Pinned by
+`refresh_owner_rgs_skips_hainactive_hold_clock_5152`.
+
 ### Event Stream (Primary Path)
 
 The Rust helper pushes session events over a persistent binary-framed Unix
