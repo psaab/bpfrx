@@ -694,6 +694,33 @@ type Daemon struct {
 	// detect changes that require a comms restart (#87).
 	activeClusterTransport clusterTransportKey
 
+	// clusterCommsMu guards the cluster-comms epoch state that is published
+	// asynchronously by the startClusterComms constructor goroutine and torn
+	// down by stopClusterComms: sessionSync, fabricRefreshCh/fabricRefreshCh1,
+	// clusterCommsCtx/clusterCommsCancel, and clusterCommsGen (#4958). Before
+	// #4958 the constructor wrote sessionSync (and re-dereferenced it) and the
+	// fabric channels from an untracked goroutine with no lock, so a
+	// stop→start restart could nil-deref (stop nils sessionSync between the
+	// goroutine's write and its next read) or let a stale constructor overwrite
+	// a newer epoch's session/endpoints. The mutex makes every read/write of
+	// these fields race-free; clusterCommsGen provides publish-if-current.
+	clusterCommsMu sync.Mutex
+
+	// clusterCommsGen is the cluster-comms epoch counter (#4958). Both
+	// startClusterComms and stopClusterComms bump it under clusterCommsMu;
+	// startClusterComms captures the post-bump value and hands it to its
+	// constructor goroutine, which publishes sessionSync/fabric channels ONLY
+	// while the counter still matches (publishSessionSyncIfCurrent). A late
+	// constructor whose epoch was superseded by a restart drops its publish
+	// instead of clobbering the live epoch's state.
+	clusterCommsGen uint64
+
+	// clusterCommsWG tracks the in-flight startClusterComms constructor
+	// goroutine(s) so stopClusterComms can join them before nilling the shared
+	// comms state (#4958). Without the join a cancelled constructor could still
+	// be mid-publish while stop tore the epoch down.
+	clusterCommsWG sync.WaitGroup
+
 	// startupGoodbyeRA tracks whether the one-shot goodbye RA has been
 	// sent for each inactive RG on startup. Prevents stale RA routes
 	// from a previous primary run keeping hosts dual-pathing traffic.

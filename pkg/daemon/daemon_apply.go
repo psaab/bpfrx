@@ -1483,8 +1483,8 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	}
 
 	// 2.2. Build zone→RG map for per-RG session sync.
-	if d.sessionSync != nil && applyResult != nil {
-		d.sessionSync.SetZoneRGMap(buildZoneRGMap(cfg, applyResult.ZoneIDs))
+	if ss := d.getSessionSync(); ss != nil && applyResult != nil {
+		ss.SetZoneRGMap(buildZoneRGMap(cfg, applyResult.ZoneIDs))
 	}
 
 	// 2.45. #1956 V-4: managed->unmapped teardown MUST run BEFORE

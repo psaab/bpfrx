@@ -203,6 +203,50 @@ Detected by the presence of `/etc/xpf/node-id` (contents `0` or `1`).
 Absent → standalone. Cluster mode triggers the bondless-RETH naming
 convention (`fxp0`, `em0`, `ge-{0,7}-0-X`).
 
+### Cluster-comms epoch lifecycle (`startClusterComms` / `stopClusterComms`, #4958)
+
+`startClusterComms` (`daemon_ha_sync.go`) launches an **asynchronous
+constructor goroutine** that resolves the sync interface address (a retry loop
+of up to ~60s during the networkd race) before it can build the session-sync
+object. A transport-field change (`clusterTransportKey`) restarts comms
+mid-flight: the apply path calls `stopClusterComms` then `startClusterComms`
+while the *prior* epoch's constructor may still be resolving. That created two
+data-race failure modes:
+
+- **Nil-deref panic** — `stopClusterComms` set `d.sessionSync = nil` between the
+  constructor's write and its next dereference (`SetAuthProvider`).
+- **Stale overwrite** — a superseded epoch's constructor finished late and wrote
+  its `d.sessionSync` / `d.fabricRefreshCh{,1}` over the new epoch's state.
+
+The lifecycle is now **epoch-guarded** by `clusterCommsMu` + a `clusterCommsGen`
+generation counter (all comms-epoch fields — `sessionSync`,
+`fabricRefreshCh{,1}`, `clusterCommsCtx`/`Cancel` — are read/written only under
+that lock; every reader goes through `getSessionSync()` /
+`snapshotFabricRefreshChans()` / `getClusterCommsCtx()`, capturing the pointer
+once):
+
+- `beginClusterCommsEpoch` bumps the generation and installs the fresh
+  sub-context; `startClusterComms` hands the post-bump generation to the
+  constructor.
+- The constructor builds the session-sync object in a **local `ss`** and wires
+  every callback / cluster reference against it (never re-reading the shared
+  field), then calls **`publishSessionSyncIfCurrent(gen, ss)`** — a
+  publish-if-current: it stores `d.sessionSync = ss` only while `gen` still
+  matches `clusterCommsGen`, otherwise it **drops** the publish (`slog.Debug`)
+  and the goroutine returns before touching cluster state. The fabric channels
+  publish the same way (`publishFabricRefreshChansIfCurrent`); each
+  `populateFabricFwd{,1}` loop receives its channel **by value** at launch, so a
+  restart's field swap cannot race the receive.
+- `stopClusterComms` bumps the generation (superseding any in-flight
+  constructor), cancels the context, **joins the constructor** via
+  `clusterCommsWG`, then nils the shared state and `Stop()`s the old session
+  sync. The join runs outside the lock (the constructor's publish path also
+  takes it), so there is no deadlock.
+
+`make test-failover` is the required smoke for this path. The guard is covered
+by `daemon_ha_comms_race_test.go` (deterministic drop-of-stale-publish +
+`-race` concurrency).
+
 ### Per-RG Router-Advertisement reconcile (#5861)
 
 In cluster mode RA senders run ONLY on the RG that is the current active
