@@ -1131,6 +1131,88 @@ mod mode_aware_segmentation_tests {
         }
     }
 
+    /// Length in bytes of the single hop-by-hop extension header that
+    /// [`ipv6_tcp_frame_with_ext_and_slack`] inserts (#5608). One 8-byte
+    /// HbH block: 2 header bytes (next-header, hdr-ext-len=0) + a 6-byte
+    /// PadN option, so `frame_l4_offset` skips exactly 8 bytes.
+    const V6_EXT_LEN: usize = 8;
+
+    /// IPv6-with-extension-header counterpart to
+    /// [`ipv6_tcp_frame_with_slack`] (#5608). Inserts one hop-by-hop
+    /// extension header (8 bytes) between the fixed IPv6 header and the TCP
+    /// header, declares `declared_data` TCP payload bytes via `payload_len`
+    /// (= ext-header + tcp-header + declared_data, per RFC 8200 — the field
+    /// counts every byte after the 40-byte fixed header), then appends
+    /// `slack` SLACK_MARKER bytes past the declared datagram end. The TCP
+    /// offset therefore sits at l3 + 40 + 8, so the ext-chain walk in
+    /// `frame_l4_offset` must be honored for the clamp math to be correct.
+    fn ipv6_tcp_frame_with_ext_and_slack(declared_data: usize, slack: usize) -> Vec<u8> {
+        let tcp_header_len = 20usize;
+        // payload_len counts the ext chain + TCP header + declared data.
+        let payload_len = (V6_EXT_LEN + tcp_header_len + declared_data) as u16;
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [0x02, 0xbf, 0x72, 0x00, 0x50, 0x08],
+            0,
+            0x86dd,
+        );
+        // IPv6 fixed header (40 bytes) — next header 0 (hop-by-hop options).
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]); // ver/tc/flow
+        frame.extend_from_slice(&payload_len.to_be_bytes()); // payload_len
+        frame.push(0); // next header = Hop-by-Hop Options
+        frame.push(64); // hop limit
+        let mut src = [0u8; 16];
+        src[0] = 0x20;
+        src[1] = 0x01;
+        src[2] = 0x0d;
+        src[3] = 0xb8;
+        src[15] = 0x05;
+        let mut dst = src;
+        dst[15] = 0x09;
+        frame.extend_from_slice(&src);
+        frame.extend_from_slice(&dst);
+        // Hop-by-Hop Options header (8 bytes): next-header = TCP,
+        // hdr-ext-len = 0 (=> 8 bytes total), then a PadN option
+        // (type 1, len 4) filling the remaining 6 bytes.
+        frame.extend_from_slice(&[PROTO_TCP, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00]);
+        // TCP header (20 bytes): ports, seq, ack, data-offset(5<<4), flags ACK.
+        frame.extend_from_slice(&40000u16.to_be_bytes());
+        frame.extend_from_slice(&5201u16.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10, 0x00, 0x3f, 0x00, 0x00,
+            0x00, 0x00,
+        ]);
+        frame.extend(std::iter::repeat(DATA_FILL).take(declared_data));
+        frame.extend(std::iter::repeat(SLACK_MARKER).take(slack));
+        frame
+    }
+
+    /// Meta for an IPv6 frame carrying one 8-byte extension header: TCP sits
+    /// at l3(14) + 40 + `V6_EXT_LEN`, so the meta-stamped L4 offset must skip
+    /// the ext chain (#5608).
+    fn meta_v6_ext() -> ForwardPacketMeta {
+        ForwardPacketMeta {
+            l3_offset: 14,
+            l4_offset: (14 + 40 + V6_EXT_LEN) as u16,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            ..ForwardPacketMeta::default()
+        }
+    }
+
+    /// Slice the TCP payload out of an emitted IPv6 segment whose L3 header is
+    /// `ip_header_len` bytes (fixed 40 + extension chain). Mirrors
+    /// [`segment_tcp_payload`] but does not assume a 40-byte IPv6 header.
+    fn segment_tcp_payload_v6_ext(seg: &[u8], ip_header_len: usize) -> &[u8] {
+        let eth = 14usize;
+        let tcp_off = eth + ip_header_len;
+        let tcp_hdr = ((seg[tcp_off + 12] >> 4) as usize) * 4;
+        &seg[tcp_off + tcp_hdr..]
+    }
+
     /// Slice the TCP payload out of a plain (eth+IP+TCP, no VLAN, no tunnel)
     /// emitted segment for either family. `frame_out` is sized exactly to the
     /// datagram, so the payload runs to the end of the segment.
@@ -1255,6 +1337,113 @@ mod mode_aware_segmentation_tests {
         assert!(
             out.is_none(),
             "a declaration shorter than the IP+TCP headers must fail closed (not segment)"
+        );
+    }
+
+    #[test]
+    fn ipv6_segmentation_with_ext_header_ignores_trailing_slack_5608() {
+        // #5608: the IPv6-with-extension-header analogue of
+        // `ipv6_segmentation_ignores_trailing_slack_beyond_payload_len`.
+        // Declared datagram: 40 (fixed IP) + 8 (hop-by-hop) + 20 (TCP) +
+        // 1400 (data) = 1468 > MTU 1280, so it MUST segment — but only the
+        // 1400 declared bytes. 600 trailing SLACK_MARKER bytes past
+        // payload_len must drop, AND the hop-by-hop ext chain must be
+        // preserved verbatim in every emitted segment. The clamp math
+        // depends on the ext-chain walk (`frame_l4_offset`) resolving the
+        // TCP offset to l3 + 40 + 8, and on `ipv6_declared_l3_end` clamping
+        // to l3 + 40 + payload_len (which includes the 8 ext bytes).
+        let mtu = 1280usize;
+        let declared_data = 1400usize;
+        let slack = 600usize;
+        let mut state = ForwardingState::default();
+        state.egress.insert(EGRESS_IFINDEX, egress_iface(mtu));
+        let decision = SessionDecision {
+            resolution: plain_resolution(),
+            nat: NatDecision::default(),
+        };
+        let frame = ipv6_tcp_frame_with_ext_and_slack(declared_data, slack);
+        let segments = segment_forwarded_tcp_frames_from_frame(
+            &frame,
+            meta_v6_ext(),
+            &decision,
+            &state,
+            false,
+            None,
+        )
+        .expect("declared 1468 > 1280 MTU must segment");
+        assert!(segments.len() >= 2, "1468 over 1280 MTU splits");
+        // The IP header of every segment is fixed(40) + hop-by-hop(8).
+        let ip_header_len = 40 + V6_EXT_LEN;
+        let mut total_payload = 0usize;
+        for (idx, seg) in segments.iter().enumerate() {
+            // Ext chain preserved: fixed-header next-header stays 0 (HbH),
+            // and the HbH block still points at TCP with hdr-ext-len 0.
+            let eth = 14usize;
+            assert_eq!(
+                seg[eth + 6],
+                0,
+                "v6+ext segment {idx} lost the hop-by-hop next-header in the fixed header"
+            );
+            assert_eq!(
+                seg[eth + 40],
+                PROTO_TCP,
+                "v6+ext segment {idx} corrupted the ext-chain next-header (should point at TCP)"
+            );
+            assert_eq!(
+                seg[eth + 41],
+                0,
+                "v6+ext segment {idx} corrupted the ext-chain hdr-ext-len"
+            );
+            let payload = segment_tcp_payload_v6_ext(seg, ip_header_len);
+            total_payload += payload.len();
+            assert!(
+                !payload.contains(&SLACK_MARKER),
+                "v6+ext segment {idx} promoted trailing slack (0xEE) into TCP payload"
+            );
+        }
+        assert_eq!(
+            total_payload, declared_data,
+            "v6+ext emitted TCP payload must equal the IP-declared data, not backing slack"
+        );
+    }
+
+    #[test]
+    fn ipv6_segmentation_rejects_declaration_shorter_than_headers_5608() {
+        // #5608: the IPv6 twin of
+        // `ipv4_segmentation_rejects_declaration_shorter_than_headers`. A
+        // large backing buffer (1400 data bytes past L3, well over the MTU)
+        // but a lying-short payload_len that declares only 10 bytes — fewer
+        // than the 20 required for the TCP header (so the declared datagram,
+        // 40 + 10 = 50 bytes, cannot even hold the fixed IP + TCP headers).
+        // The datagram is a runt; it must NOT be segmented (fail closed), so
+        // none of the 1400 backing bytes are promoted into fresh checksummed
+        // segments. On a revert of the `ipv6_declared_l3_end` clamp the
+        // builder would slice the full backing buffer (1460 bytes > MTU) and
+        // chunk it, so `out` would be `Some`.
+        let mtu = 1280usize;
+        let mut state = ForwardingState::default();
+        state.egress.insert(EGRESS_IFINDEX, egress_iface(mtu));
+        let decision = SessionDecision {
+            resolution: plain_resolution(),
+            nat: NatDecision::default(),
+        };
+        // 1400 backing data bytes, but overwrite payload_len to a runt 10.
+        let mut frame = ipv6_tcp_frame_with_slack(1400, 0);
+        let runt_payload_len: u16 = 10;
+        // IPv6 payload_len lives at frame bytes [l3 + 4 .. l3 + 6] = [18..20].
+        frame[18] = (runt_payload_len >> 8) as u8;
+        frame[19] = runt_payload_len as u8;
+        let out = segment_forwarded_tcp_frames_from_frame(
+            &frame,
+            meta_v6(),
+            &decision,
+            &state,
+            false,
+            None,
+        );
+        assert!(
+            out.is_none(),
+            "a v6 declaration shorter than the IP+TCP headers must fail closed (not segment)"
         );
     }
 

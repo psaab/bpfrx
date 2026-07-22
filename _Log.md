@@ -1,3 +1,32 @@
+## 2026-07-22 — #5608: IPv6 TCP-segmentation clamp coverage (test-only)
+
+- **Timestamp**: 2026-07-22 (test/5608-ipv6-segmentation-coverage)
+- **Action**: Added two unit tests for the #5141 IP-declared-length clamp
+  (`ipv6_declared_l3_end` + ext-chain-aware `frame_l4_offset`), closing the
+  coverage gap flagged by the PR #5607 hostile review. `ipv6_segmentation_
+  with_ext_header_ignores_trailing_slack_5608` builds an IPv6 frame carrying a
+  hop-by-hop extension header (next-header 0, 8-byte HbH block) + 1400 declared
+  data bytes + 600 trailing SLACK_MARKER (0xEE) bytes past `payload_len`, then
+  asserts the frame segments (1468 > 1280 MTU), no slack byte is promoted into
+  any segment's TCP payload, the emitted payload equals the declared data, AND
+  the HbH ext chain is preserved verbatim in every segment (fixed-header
+  next-header stays 0; the HbH next-header still points at TCP with
+  hdr-ext-len 0). `ipv6_segmentation_rejects_declaration_shorter_than_
+  headers_5608` is the IPv6 twin of the existing IPv4 runt test: a large
+  backing buffer (1400 data bytes) with `payload_len` overwritten to a runt 10
+  (declared datagram 50 < 60 = fixed IP + TCP headers) must fail closed
+  (`None`, not segmented). Added the `ipv6_tcp_frame_with_ext_and_slack`
+  builder, `meta_v6_ext` (l4_offset = l3+40+8), and `segment_tcp_payload_v6_ext`
+  helpers alongside the existing #5141 fixtures.
+- **Validation**: both tests PASS on origin/master (`2 passed`). RED-on-revert
+  verified — temporarily unclamping `ipv6_declared_l3_end` (return
+  `frame.len()`) makes BOTH tests fail with the expected assertions
+  ("promoted trailing slack (0xEE) into TCP payload" and "must fail closed (not
+  segment)"); restoring the clamp returns both to green. No production code
+  changed — no docs update needed (behavior is unchanged; these tests pin
+  existing #5141 semantics for the two previously-untested IPv6 cases).
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs, _Log.md
+
 ## 2026-07-21 — #6226: round-robin address-only SNAT probes the whole pool
 
 - **Timestamp**: 2026-07-21 (fix/6226-address-only-roundrobin)
