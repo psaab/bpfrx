@@ -122,6 +122,19 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// context — byte-identical to the pre-#2926 behavior.
 	if err := d.applyConfigLocked(context.Background(), cfg); err != nil {
 		slog.Warn("apply config failed", "err", err)
+		return
+	}
+	// #4957: the active config completed a full apply through the boot /
+	// background (DHCP callback, feed, config-poll, in-process CLI commit,
+	// rollback) path. Stamp it applied so a peer config-sync of the same text
+	// takes handleConfigSync's converged shortcut instead of pointlessly
+	// re-applying an already-live config on every reconnect (the config
+	// high-water resets on reconnect, so the primary re-pushes the current
+	// generation even when nothing changed). A FAILED apply above returns
+	// early and leaves the prior digest, so a config that never converged is
+	// never marked applied — the same #4957 invariant handleConfigSync relies on.
+	if d.store != nil {
+		d.store.MarkActiveApplied()
 	}
 }
 
@@ -474,7 +487,17 @@ func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncP
 	if syncPeer {
 		d.pushCommittedConfigToPeer()
 	}
-	return compiled, errors.Join(applyErr, clearErr)
+	joined := errors.Join(applyErr, clearErr)
+	// #4957: a fully-successful commit apply (no fatal apply error, no partial
+	// session-invalidation) means the committed active config has converged on the
+	// dataplane. Stamp it applied so that if THIS node later becomes secondary and
+	// the new primary syncs this same config back, handleConfigSync's converged
+	// shortcut recognizes it without a redundant re-apply. A non-nil joined error
+	// leaves the prior digest — the config did not fully converge.
+	if joined == nil && d.store != nil {
+		d.store.MarkActiveApplied()
+	}
+	return compiled, joined
 }
 
 // applyErrSkipsPeerSync reports whether an applyConfigLocked error means the

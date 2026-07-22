@@ -30,6 +30,56 @@
   userspace-dp/src/afxdp/worker/loop_body/mod.rs,
   userspace-dp/src/session/tests.rs,
   userspace-dp/src/afxdp/bpf_map_tests.rs,
+## 2026-07-22 — #4957: HA config-sync — do not treat a promoted-but-unapplied config as converged
+
+- **Timestamp**: 2026-07-22 (fix/4957-ha-configsync-unapplied-converged)
+- **Action**: `handleConfigSync`'s active-text convergence shortcut treated a
+  config that `SyncApply` promoted to `s.active` but whose `applyConfigLocked`
+  FAILED (non-fatal networkd/nft/IPsec tail error, never rolled back under the
+  #1799 degrade-not-fail doctrine) as converged: the primary's same-generation
+  re-push took the fast path, returned nil, advanced the config high-water, and
+  the reconcile retry never ran — a standby that acks a generation it never
+  finished applying. Fix (option c, least-invasive, respects degrade-not-fail):
+  added a `configstore` applied-config digest (`MarkActiveApplied`/`ActiveApplied`)
+  stamped ONLY after a fully-successful apply (boot `applyConfig`, commit
+  `applyAndSyncCommitted`, sync `handleConfigSync`), and ANDed the shortcut with
+  `ActiveApplied()`. A promoted-but-unapplied config now falls through and
+  RE-ATTEMPTS the apply; an already-applied config still shortcuts on reconnect
+  (no redundant re-apply). Text-keyed marker → stale value is fail-safe (at most
+  one idempotent re-apply, never a false convergence). Did not roll back
+  `s.active` (option a) — that fights the degrade-not-fail store-converges-to-peer
+  design and the #5564 armedActive invalidator that reads `s.active`.
+- **File(s)**: `pkg/configstore/store.go` (field + `MarkActiveApplied`/
+  `ActiveApplied`/`configTextDigest`), `pkg/daemon/daemon_ha_sync.go` (shortcut
+  gate + stamp on nil), `pkg/daemon/daemon_apply.go` (`applyConfig` +
+  `applyAndSyncCommitted` stamp on success), `pkg/configstore/applied_marker_4957_test.go`
+  (store contract test), `pkg/daemon/configsync_unapplied_4957_test.go`
+  (fail-on-revert), `pkg/daemon/config_sync_test.go` (updated to the
+  applied-not-just-active contract), `docs/sync-protocol.md`,
+  `pkg/configstore/README.md`.
+- **Validation**: `go build ./...`; `go test ./pkg/configstore/... ./pkg/daemon/...
+  ./pkg/cluster/...` green; `go vet` clean; fail-on-revert confirmed firsthand
+  (drop the `ActiveApplied()` gate → `TestHandleConfigSync_PromotedButUnappliedIsNotConverged`
+  RED at "applyConfigLocked calls = 1, want 2").
+## 2026-07-22 — #6224: correct stale "peer-seeded import" comment on the local-origin GRE session-seed path
+
+- **Timestamp**: 2026-07-22 (fix/6224-tunnel-syncimport-timeout)
+- **Action**: verify-then-fix-or-close. Adversarially confirmed that
+  `build_local_origin_tunnel_tx_request` (tunnel.rs:583) is the LOCAL-ORIGIN
+  (host-outbound) GRE encapsulation path, not a peer HA-sync import: it runs
+  no security policy / application match (`resolve_tunnel_forwarding_resolution`
+  is route/next-hop/neighbor only; `policy_id: 0` hardcoded), so there is NO
+  admitting application to source a per-app `inactivity_timeout_ns` from. The
+  `None` (global per-protocol timeout) is functionally and Junos-correct. The
+  defect is only the misleading comment block (copy-pasted the
+  #2508/#3056/#3227/#3073 "peer-seeded import ... does not cross the HA wire
+  yet" rationale onto a path that is not a wire path at all). Rewrote the
+  comment to state the real reason; added a contract-pinning test
+  (`local_origin_tunnel_session_uses_global_timeout_no_policy_match_6224`) that
+  goes RED if a future change stamps a bogus per-app timeout / non-zero policy
+  attribution on this path. No code-behavior change; no wire change.
+- **File(s)**: userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/frame/tests_native_gre_ecn.rs,
   userspace-dp/src/session/README.md
 
 ## 2026-07-22 — #5274: HA session-sync config-epoch guard (stale permit across the HA boundary)

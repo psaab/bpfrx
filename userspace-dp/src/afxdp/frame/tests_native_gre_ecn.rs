@@ -264,6 +264,67 @@ fn local_origin_tunnel_tx_request_encapsulates_raw_ip_for_active_owner() {
 }
 
 
+// #6224: the LOCAL-ORIGIN (host-outbound) GRE encapsulation path runs no
+// security policy / application match — `resolve_tunnel_forwarding_resolution`
+// is route/next-hop/neighbor resolution only, and Junos runs no security
+// policy on firewall-self-originated traffic. There is therefore no admitting
+// application to source a per-application `inactivity_timeout_ns` from (nor an
+// admitting policy for `policy_id` / the hit-counter handle). The correct value
+// is `None`, so `session_timeout_ns` ages the session on the GLOBAL
+// per-protocol timeout. This pins that contract: it goes RED if a future change
+// stamps a bogus per-app timeout (or a non-zero policy attribution) onto this
+// path — the exact mis-"fix" the #6224 stale comment invited. The reverse
+// companion is checked for consistency: it inherits the forward's `None`
+// (#5153/#6223 builder), so both halves stay on the global timeout — this is
+// NOT the #5153 forward-has-value / reverse-hardcoded-None inconsistency.
+#[test]
+fn local_origin_tunnel_session_uses_global_timeout_no_policy_match_6224() {
+    let state = build_forwarding_state(&native_gre_snapshot(true));
+    let ha_state = BTreeMap::from([(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let packet = build_icmp_echo_frame_v4(
+        Ipv4Addr::new(10, 255, 192, 42),
+        Ipv4Addr::new(10, 255, 192, 41),
+        64,
+    );
+    let plan = build_local_origin_tunnel_tx_request(
+        &packet[14..],
+        1,
+        &state,
+        &ha_state,
+        &dynamic_neighbors,
+    )
+    .expect("local-origin tunnel tx request");
+
+    // Forward half: no admitting application/policy on the local-origin path.
+    assert_eq!(
+        plan.session_entry.metadata.inactivity_timeout_ns, None,
+        "local-origin GRE session must age on the global per-protocol timeout \
+         (no admitting application to source a per-app idle timeout)"
+    );
+    assert_eq!(
+        plan.session_entry.metadata.policy_id, 0,
+        "local-origin GRE session runs no policy match (no admitting policy ID)"
+    );
+    assert!(
+        plan.session_entry.metadata.policy_counter.is_none(),
+        "local-origin GRE session runs no policy match (no hit-counter handle)"
+    );
+
+    // Reverse companion: consistent with the forward half (both None). NOT the
+    // #5153 shape (forward real value / reverse hardcoded None).
+    let reverse = plan
+        .reverse_session_entry
+        .as_ref()
+        .expect("active owner synthesizes a reverse companion");
+    assert!(reverse.metadata.is_reverse);
+    assert_eq!(
+        reverse.metadata.inactivity_timeout_ns, None,
+        "reverse companion inherits the forward half's global timeout"
+    );
+}
+
+
 #[test]
 fn local_origin_tunnel_tx_request_rejects_inactive_owner() {
     let state = build_forwarding_state(&native_gre_snapshot(true));

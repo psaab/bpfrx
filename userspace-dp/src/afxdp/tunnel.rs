@@ -570,20 +570,33 @@ pub(super) fn build_local_origin_tunnel_tx_request(
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
-            // #2508: tunnel sync-import sessions carry no local per-policy
-            // `then log` selection (see server/helpers.rs note).
+            // #6224: this is the LOCAL-ORIGIN (host-outbound) GRE encapsulation
+            // path — the firewall's own kernel-routed traffic read off the TUN
+            // device (`local_tunnel_source_loop`), NOT a peer HA-sync import.
+            // `resolve_tunnel_forwarding_resolution` does route/next-hop/neighbor
+            // resolution ONLY; no security policy or application term is matched
+            // here (Junos runs no security policy on firewall-self-originated
+            // traffic). There is therefore no admitting policy/application to
+            // source the per-policy `then log` selection, the policy ID, the
+            // per-application idle timeout, or the hit-counter handle from.
+            // Zeroed policy fields and the global per-protocol idle timeout
+            // (`inactivity_timeout_ns: None` -> `session_timeout_ns` falls back
+            // to the per-protocol default) are the correct values for
+            // self-originated traffic; a per-app timeout would only differ if an
+            // admitting application existed, which it does not. The
+            // `origin: SessionOrigin::SyncImport` tag below is an install-path
+            // plumbing artifact (it reaches the uncapped coordinator-authoritative
+            // install path, see session_glue/mod.rs), NOT a peer wire import.
+            //
+            // (The earlier #2508/#3056/#3227/#3073 comments here mis-described
+            // this path as "peer-seeded import ... does not cross the HA wire
+            // yet". The real peer-import path — server/helpers.rs — DOES stamp
+            // all of these from `SessionSyncRequest` post-#3301; this path is
+            // simply not a wire path, so nothing crosses to read.)
             log_session_init: false,
             log_session_close: false,
-            // #3056: tunnel sync-import sessions are seeded from the peer, which
-            // ran the admitting policy; the local policy ID is unknown here.
             policy_id: 0,
-            // #3227: peer-seeded import; the per-app idle timeout does not
-            // cross the HA wire yet, so age on the global timeout until a
-            // real-traffic refresh re-stamps it.
             inactivity_timeout_ns: None,
-            // #3073: peer-seeded import; the hit-counter handle does not cross
-            // the HA wire yet, so this flow counts nothing locally until a
-            // real-traffic re-evaluation re-stamps a handle.
             policy_counter_idx: 0,
             policy_counter: None,
         },
