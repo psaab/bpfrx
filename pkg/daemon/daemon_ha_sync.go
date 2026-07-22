@@ -985,11 +985,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// already transitioned to secondary — blindly calling
 			// ManualFailover would cause dual-resign (both nodes secondary)
 			// and a 30-second traffic blackhole.
-			ss.OnRemoteFailover = func(rgID int) error {
+			ss.OnRemoteFailover = func(rgID int, reqID uint64) error {
 				if !d.cluster.IsLocalPrimary(rgID) {
 					return fmt.Errorf("%w: redundancy group %d", cluster.ErrRemoteFailoverRejected, rgID)
 				}
-				slog.Info("cluster: remote failover request from peer", "rg", rgID)
+				slog.Info("cluster: remote failover request from peer", "rg", rgID, "req_id", reqID)
 				// #5640: arm the fence-completion barrier BEFORE ManualFailover
 				// enqueues the async demotion event, so watchClusterEvents
 				// cannot actuate-and-forget before WaitFailoverApplied observes
@@ -1000,15 +1000,21 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					slog.Warn("cluster: remote failover failed", "rg", rgID, "err", err)
 					return err
 				}
+				// #5079: bind an auto-restore lease to this request. If the
+				// requester aborts after this ACK (or crashes / loses the fabric)
+				// and never sends a commit, electRG restores us when the lease
+				// expires so a failed coordinated failover cannot strand us
+				// secondary. The matching commit clears the lease.
+				d.cluster.ArmRemoteTransferOutLease([]int{rgID}, reqID)
 				return nil
 			}
-			ss.OnRemoteFailoverBatch = func(rgIDs []int) error {
+			ss.OnRemoteFailoverBatch = func(rgIDs []int, reqID uint64) error {
 				for _, rgID := range rgIDs {
 					if !d.cluster.IsLocalPrimary(rgID) {
 						return fmt.Errorf("%w: redundancy group %d", cluster.ErrRemoteFailoverRejected, rgID)
 					}
 				}
-				slog.Info("cluster: remote batch failover request from peer", "rgs", rgIDs)
+				slog.Info("cluster: remote batch failover request from peer", "rgs", rgIDs, "req_id", reqID)
 				// #5640: arm every member's fence barrier before the batch
 				// demotion enqueues its per-RG events.
 				for _, rgID := range rgIDs {
@@ -1021,13 +1027,27 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					slog.Warn("cluster: remote batch failover failed", "rgs", rgIDs, "err", err)
 					return err
 				}
+				// #5079: bind auto-restore leases to this request across the set.
+				d.cluster.ArmRemoteTransferOutLease(rgIDs, reqID)
 				return nil
 			}
-			ss.OnRemoteFailoverCommit = func(rgID int) error {
-				return d.cluster.FinalizePeerTransferOut(rgID)
+			ss.OnRemoteFailoverCommit = func(rgID int, reqID uint64) error {
+				if err := d.cluster.FinalizePeerTransferOut(rgID); err != nil {
+					return err
+				}
+				// #5079: the transfer committed — drop the auto-restore lease so
+				// it can never fire on a legitimately completed handoff.
+				d.cluster.ClearRemoteTransferOutLease(rgID, reqID)
+				return nil
 			}
-			ss.OnRemoteFailoverCommitBatch = func(rgIDs []int) error {
-				return d.cluster.FinalizePeerTransferOutBatch(rgIDs)
+			ss.OnRemoteFailoverCommitBatch = func(rgIDs []int, reqID uint64) error {
+				if err := d.cluster.FinalizePeerTransferOutBatch(rgIDs); err != nil {
+					return err
+				}
+				for _, rgID := range rgIDs {
+					d.cluster.ClearRemoteTransferOutLease(rgID, reqID)
+				}
+				return nil
 			}
 			// #5640: gate the transfer-out applied-ack on the local demotion
 			// actually being actuated (VRRP resigned / rg_active cleared),
@@ -1044,6 +1064,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.cluster.SetPeerFailoverCommitBatchFunc(ss.SendFailoverCommitBatch)
 			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceManualFailover)
 			d.cluster.SetLocalTransferCommitReadyHook(d.waitLocalFailoverCommitReady)
+			// #5079: size the owner-side transfer-out lease above the requester's
+			// worst-case post-ACK commit latency — the local commit-ready settle
+			// window (localFailoverCommitTimeout) plus the commit round-trip — so
+			// a legitimate slow commit never trips it. The cluster floors it.
+			d.cluster.SetRemoteTransferOutLeaseDuration(2*d.localFailoverCommitTimeout + 20*time.Second)
 			d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
 			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)
 			// #1792: while our heartbeat sockets restart (VRF rebind),

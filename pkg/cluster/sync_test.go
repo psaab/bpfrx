@@ -3640,7 +3640,7 @@ func TestHandleMessageFailoverDoesNotBlockReceiveLoop(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	started := make(chan int, 1)
 	release := make(chan struct{})
-	ss.OnRemoteFailover = func(rgID int) error {
+	ss.OnRemoteFailover = func(rgID int, reqID uint64) error {
 		started <- rgID
 		<-release
 		return nil
@@ -3723,7 +3723,7 @@ func TestHandleRemoteFailoverWithholdsAckUntilFenced(t *testing.T) {
 
 	// OnRemoteFailover models ManualFailover: it enqueues the async demotion
 	// and returns immediately (the node is NOT yet fenced here).
-	ss.OnRemoteFailover = func(rgID int) error { return nil }
+	ss.OnRemoteFailover = func(rgID int, reqID uint64) error { return nil }
 
 	// WaitFailoverApplied models the daemon barrier that blocks until
 	// watchClusterEvents actuates the demotion.
@@ -3799,7 +3799,7 @@ func TestHandleRemoteFailoverBatchWithholdsAckUntilFenced(t *testing.T) {
 	ss.stats.Connected.Store(true)
 
 	rgIDs := []int{1, 2}
-	ss.OnRemoteFailoverBatch = func([]int) error { return nil }
+	ss.OnRemoteFailoverBatch = func([]int, uint64) error { return nil }
 
 	fenced := make(chan struct{})
 	waitEntered := make(chan struct{}, 1)
@@ -4195,8 +4195,10 @@ func TestSendFailoverCommitWaitsForAck(t *testing.T) {
 func TestHandleRemoteFailoverCommitInvokesCallback(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	done := make(chan int, 1)
-	ss.OnRemoteFailoverCommit = func(rgID int) error {
+	gotReqID := make(chan uint64, 1)
+	ss.OnRemoteFailoverCommit = func(rgID int, reqID uint64) error {
 		done <- rgID
+		gotReqID <- reqID
 		return nil
 	}
 
@@ -4213,12 +4215,17 @@ func TestHandleRemoteFailoverCommitInvokesCallback(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("remote failover commit callback did not run")
 	}
+	// #5079: the commit's request ID must reach the callback so the owner can
+	// clear the matching auto-restore lease.
+	if got := <-gotReqID; got != 99 {
+		t.Fatalf("callback reqID = %d, want 99", got)
+	}
 }
 
 func TestHandleRemoteFailoverBatchInvokesCallback(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	done := make(chan []int, 1)
-	ss.OnRemoteFailoverBatch = func(rgIDs []int) error {
+	ss.OnRemoteFailoverBatch = func(rgIDs []int, reqID uint64) error {
 		done <- append([]int(nil), rgIDs...)
 		return nil
 	}

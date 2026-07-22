@@ -352,13 +352,18 @@ type SessionSync struct {
 	// seed Kea on takeover. Fires after the peer*DHCPLeases store is updated.
 	OnDHCPLeasesReceived func(family int, leases []dhcpserver.SyncLease)
 	// OnRemoteFailover is called when the peer requests a transfer-out for one RG.
-	OnRemoteFailover func(rgID int) error
+	// reqID is the request-scoped identifier carried on the wire; the demoted
+	// owner binds its auto-restore lease to it so a stale commit cannot clear a
+	// newer request's lease (#5079).
+	OnRemoteFailover func(rgID int, reqID uint64) error
 	// OnRemoteFailoverCommit finalizes the demoted side of an acknowledged handoff.
-	OnRemoteFailoverCommit func(rgID int) error
+	// reqID identifies the request being committed so the owner can clear the
+	// matching auto-restore lease (#5079).
+	OnRemoteFailoverCommit func(rgID int, reqID uint64) error
 	// OnRemoteFailoverBatch is called when the peer requests a multi-RG transfer-out.
-	OnRemoteFailoverBatch func(rgIDs []int) error
+	OnRemoteFailoverBatch func(rgIDs []int, reqID uint64) error
 	// OnRemoteFailoverCommitBatch finalizes a previously acknowledged multi-RG handoff.
-	OnRemoteFailoverCommitBatch func(rgIDs []int) error
+	OnRemoteFailoverCommitBatch func(rgIDs []int, reqID uint64) error
 	// WaitFailoverApplied, if set, blocks until the local node has ACTUATED
 	// the transfer-out just requested via OnRemoteFailover for one RG — i.e.
 	// the async demotion event has been consumed and the old owner fenced
