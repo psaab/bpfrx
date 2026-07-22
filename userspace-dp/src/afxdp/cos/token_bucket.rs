@@ -427,7 +427,21 @@ pub(in crate::afxdp) fn release_all_cos_queue_leases(binding: &mut BindingWorker
             root.queues
                 .iter()
                 .enumerate()
-                .filter(|(_, queue)| queue.config.exact && queue.hot.tokens > 0)
+                // #5156 (teardown half): give back EVERY queue that holds
+                // banked tokens, not just exact ones. A non-exact
+                // lease-metered queue (#4265) acquires its buffer_bytes
+                // through the shared lease at runtime, so its outstanding
+                // credit must be returned here on worker exit / binding
+                // reset / lease-set swap — otherwise the (often reused)
+                // lease Arc stays permanently over-charged and under-
+                // provisions the class. The actual give-back below is still
+                // gated on `shared_queue_lease.is_some()`, so a truly
+                // un-leased queue (single-owner exact OR single-owner
+                // non-exact) just has its now-defunct bucket zeroed with
+                // nothing to credit — mirroring the runtime empty give-back
+                // in `refresh_cos_interface_activity`, which already keys on
+                // lease presence rather than `exact`.
+                .filter(|(_, queue)| queue.hot.tokens > 0)
                 .map(move |(queue_idx, _)| (root_ifindex, queue_idx))
         })
         .collect::<Vec<_>>();

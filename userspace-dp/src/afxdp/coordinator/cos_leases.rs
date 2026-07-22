@@ -667,10 +667,12 @@ pub(super) fn build_shared_cos_queue_leases_reusing_existing(
                 // accounting hole. `active_shards` sizing means a worker
                 // join/leave rebuilds the lease via `matches_config`, the
                 // same discipline the exact v8 lease uses.
-                if !queue.guarantee_enabled
-                    || queue.transmit_rate_bytes
-                        < crate::afxdp::worker::COS_SHARED_EXACT_MIN_RATE_BYTES
-                {
+                // #5156: single source of truth for "non-exact queue is
+                // lease-metered" — the runtime builder gates its 0-token
+                // init on the SAME predicate, so the lease's init charge and
+                // teardown give-back stay symmetric. `transmit_rate_bytes ==
+                // 0` was already excluded by the guard above.
+                if !queue.is_shared_lease_metered() {
                     continue;
                 }
                 if let Some(lease) = existing.get(&key).filter(|lease| {

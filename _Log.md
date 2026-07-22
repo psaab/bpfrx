@@ -1,3 +1,42 @@
+## 2026-07-21 — #5156: conserve the shared non-exact CoS queue lease at init AND teardown
+
+- **Timestamp**: 2026-07-21 (fix/5156-cos-nonexact-lease-conservation)
+- **Action**: Fixed a two-sided lease-conservation asymmetry for non-exact
+  lease-metered CoS queues (the sharded `shared_exact` non-exact guaranteed
+  queue that draws from a shared legacy `SharedCoSQueueLease`, #4265). Init
+  half: `build_cos_interface_runtime` (`cos/builders.rs`) pre-filled each
+  non-exact worker replica's token bucket with full `buffer_bytes`,
+  UN-metered by the shared lease — so `buffer_bytes × N_workers` entered
+  circulation with no matching `outstanding` charge, defeating the #4265
+  metering at startup. Teardown half: `release_all_cos_queue_leases`
+  (`cos/token_bucket.rs`) filtered `queue.config.exact && queue.hot.tokens
+  > 0`, so a non-exact queue's leased tokens were NEVER returned to the
+  lease at worker exit / binding reset / lease-set swap — the (often
+  reused) lease Arc stayed permanently over-charged and under-provisioned
+  the class. Made the two symmetric: a non-exact lease-metered queue now
+  starts at 0 local tokens (metered via the lease at runtime, exactly like
+  exact) and its residual bank is returned at teardown. Both sites now gate
+  on the SINGLE new predicate `CoSQueueConfig::is_shared_lease_metered()`
+  (`types/cos.rs`), which the coordinator's lease-build condition
+  (`coordinator/cos_leases.rs`) was refactored to use too — eliminating the
+  drift between the two encodings of "is this non-exact queue lease-metered"
+  that caused the bug. The teardown filter drops the `exact` gate and relies
+  on the existing lease-presence check in the release body (mirroring the
+  runtime empty give-back in `refresh_cos_interface_activity`, #4265, which
+  already keys on lease presence not `exact`). Conservation invariant
+  restored: every byte a non-exact lease-metered queue's `hot.tokens` holds
+  is acquired through — and returned to — the shared lease.
+- **File(s)**: userspace-dp/src/afxdp/types/cos.rs (new
+  `is_shared_lease_metered` predicate), userspace-dp/src/afxdp/cos/builders.rs
+  (init: 0 tokens for lease-metered non-exact), userspace-dp/src/afxdp/cos/token_bucket.rs
+  (teardown: widen give-back filter), userspace-dp/src/afxdp/coordinator/cos_leases.rs
+  (use shared predicate), userspace-dp/src/afxdp/cos/token_bucket_tests.rs
+  (fail-on-revert test `nonexact_queue_lease_conserved_across_teardown_5156`),
+  userspace-dp/src/afxdp/cos/README.md (lease-conservation contract).
+- **Validation**: `cargo test --bin xpf-userspace-dp` — 4079 passed, 0 failed.
+  New test verified fail-on-revert for BOTH halves independently: reverting
+  the teardown filter to exact-only FAILS the conservation assertion;
+  reverting the init to exact-only-zero FAILS the 0-token init assertion.
 ## 2026-07-21 — #6230: RLock cfg.AdvertiseInterval read in advertInterval()
 
 - **Timestamp**: 2026-07-21 (fix/6230-advertinterval-rlock)

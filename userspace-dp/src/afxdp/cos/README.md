@@ -181,6 +181,30 @@ mod.rs for further file-level breakdown.
   per-root residual bucket. Exact queues that explicitly enable
   `surplus-sharing` remain eligible for surplus service outside the
   non-exact residual budget.
+- **Shared queue-lease conservation for non-exact lease-metered queues
+  (#4265 / #5156).** A non-exact GUARANTEED queue whose configured rate
+  trips `COS_SHARED_EXACT_MIN_RATE_BYTES` runs the sharded `shared_exact`
+  execution policy: it drains locally on EVERY worker, so the coordinator
+  attaches a shared legacy `SharedCoSQueueLease` and its class-wide
+  admission is metered through that lease instead of a private per-worker
+  bucket. `CoSQueueConfig::is_shared_lease_metered()` (in `types/cos.rs`)
+  is the SINGLE source of truth for "this non-exact queue is
+  lease-metered" — the coordinator
+  (`build_shared_cos_queue_leases_reusing_existing`) and the runtime
+  builder (`build_cos_interface_runtime`) both gate on it, so the lease's
+  init charge and teardown give-back stay symmetric. The conservation
+  invariant: every byte the queue's `hot.tokens` ever holds is acquired
+  through — and returned to — the shared lease's `outstanding` word.
+  Concretely such a queue starts at 0 local tokens (like an exact queue,
+  NOT pre-filled `buffer_bytes`), acquires its bank through
+  `maybe_top_up_cos_queue_lease` → `acquire_via_lease`, gives an emptied
+  bank back at runtime in `refresh_cos_interface_activity`, and gives its
+  residual bank back at worker exit / binding reset / lease-set swap in
+  `release_all_cos_queue_leases`. Both give-back sites key on lease
+  presence (`shared_queue_lease.is_some()`), NOT on `queue.config.exact`,
+  so a truly un-leased single-owner queue (exact or non-exact) keeps its
+  private per-worker burst. `release_unused_v8` reduces to the legacy
+  `release_unused` for a legacy (v8=None) lease.
 - `COS_MIN_BURST_BYTES` (64 × MTU) is canonically owned by
   `token_bucket.rs`; siblings import it via the `cos/mod.rs`
   re-export.

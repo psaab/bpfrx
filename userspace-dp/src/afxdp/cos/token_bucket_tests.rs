@@ -616,3 +616,160 @@ fn cos_refill_ns_until_covers_all_branches() {
     assert_eq!(cos_refill_ns_until(0, 1, 3), Some(333_333_334));
     assert_eq!(cos_refill_ns_until(0, 2, 3), Some(666_666_667));
 }
+
+// #5156: the shared non-exact queue lease must be conserved across a
+// worker init -> top-up -> teardown cycle. A non-exact GUARANTEED queue
+// whose rate trips COS_SHARED_EXACT_MIN_RATE_BYTES is lease-metered
+// (`is_shared_lease_metered`): the coordinator attaches a shared legacy
+// `SharedCoSQueueLease` so its class-wide admission is metered, exactly
+// like exact queues. Two halves of the asymmetry are exercised here:
+//
+//   Init half   — `build_cos_interface_runtime` must start such a queue's
+//                 token bucket at 0 (metered via the lease at runtime),
+//                 NOT pre-fill `buffer_bytes` un-metered. On revert to the
+//                 old `else` arm the queue starts at `buffer_bytes` and the
+//                 first assertion fails.
+//
+//   Teardown half — `release_all_cos_queue_leases` must give the queue's
+//                 outstanding leased tokens back to the shared lease. On
+//                 revert to the `queue.config.exact && ...` filter the
+//                 non-exact queue is skipped, the lease stays permanently
+//                 over-charged, and its post-teardown drainable capacity is
+//                 short by the outstanding grant — the conservation
+//                 assertion fails.
+#[test]
+fn nonexact_queue_lease_conserved_across_teardown_5156() {
+    use crate::afxdp::cos::builders::build_cos_interface_runtime;
+    use crate::afxdp::types::{CoSInterfaceConfig, CoSOversubscriptionPolicy, FastMap};
+    use crate::afxdp::worker::{BindingWorker, COS_SHARED_EXACT_MIN_RATE_BYTES};
+
+    const IFINDEX: i32 = 42;
+    const QUEUE_ID: u8 = 5;
+    const BUFFER_BYTES: u64 = 128 * 1024;
+    // 3 Gbps > COS_SHARED_EXACT_MIN_RATE_BYTES (2.5 Gbps) — a lease-metered
+    // non-exact guaranteed queue.
+    const RATE_BYTES: u64 = 3_000_000_000 / 8;
+    const SHARDS: usize = 6;
+    const NOW_NS: u64 = 1_000_000_000;
+
+    assert!(
+        RATE_BYTES >= COS_SHARED_EXACT_MIN_RATE_BYTES,
+        "test queue must be lease-metered"
+    );
+
+    let make_cfg = || CoSInterfaceConfig {
+        shaping_rate_bytes: 25_000_000_000 / 8,
+        burst_bytes: 256 * 1024,
+        default_queue: QUEUE_ID,
+        dscp_classifier: String::new(),
+        ieee8021_classifier: String::new(),
+        dscp_queue_by_dscp: [u8::MAX; 64],
+        ieee8021_queue_by_pcp: [u8::MAX; 8],
+        queue_by_forwarding_class: FastMap::default(),
+        queues: vec![CoSQueueConfig {
+            queue_id: QUEUE_ID,
+            forwarding_class: "iperf-b".into(),
+            priority: 5,
+            transmit_rate_bytes: RATE_BYTES,
+            guarantee_enabled: true,
+            exact: false,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: BUFFER_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
+    };
+
+    // Drain a lease's full outstanding-credit capacity at a fixed clock.
+    fn drain_capacity(lease: &SharedCoSQueueLease, now_ns: u64) -> u64 {
+        let mut total = 0u64;
+        loop {
+            let granted = lease.acquire(now_ns, u64::MAX);
+            if granted == 0 {
+                break;
+            }
+            total = total.saturating_add(granted);
+        }
+        total
+    }
+
+    // --- Init half: the lease-metered non-exact queue starts at 0. ---
+    let mut root = build_cos_interface_runtime(&make_cfg(), NOW_NS);
+    assert_eq!(
+        root.queues[0].hot.tokens, 0,
+        "#5156 init: a lease-metered non-exact queue must start with 0 local \
+         tokens (metered via the shared lease), not a pre-filled buffer_bytes bank"
+    );
+
+    // Baseline capacity of a pristine, never-charged lease.
+    let baseline_lease = Arc::new(SharedCoSQueueLease::new(RATE_BYTES, BUFFER_BYTES, SHARDS));
+    let baseline_capacity = drain_capacity(&baseline_lease, NOW_NS);
+    assert!(baseline_capacity > 0, "baseline lease must hand out credit");
+
+    // Control: a lease charged but NOT torn down loses exactly the grant —
+    // proves the conservation assertion below is non-vacuous. The charge is
+    // whatever the runtime top-up moved into the queue's local bucket.
+    let leaked_lease = Arc::new(SharedCoSQueueLease::new(RATE_BYTES, BUFFER_BYTES, SHARDS));
+    let _ = maybe_top_up_cos_queue_lease(&mut root.queues[0], Some(&leaked_lease), NOW_NS);
+    let charged = root.queues[0].hot.tokens;
+    assert!(
+        charged > 0,
+        "runtime top-up must acquire leased tokens for the non-exact queue"
+    );
+    let leaked_capacity = drain_capacity(&leaked_lease, NOW_NS);
+    assert_eq!(
+        leaked_capacity,
+        baseline_capacity - charged,
+        "a charged-but-not-released lease must be short by the outstanding grant"
+    );
+
+    // --- Teardown half: release_all_cos_queue_leases returns the grant. ---
+    let test_lease = Arc::new(SharedCoSQueueLease::new(RATE_BYTES, BUFFER_BYTES, SHARDS));
+    // Re-run the top-up against the lease that IS attached to the fast path,
+    // so the queue's outstanding charge lives on `test_lease`.
+    root.queues[0].hot.tokens = 0;
+    let charged2 = {
+        let _ = maybe_top_up_cos_queue_lease(&mut root.queues[0], Some(&test_lease), NOW_NS);
+        root.queues[0].hot.tokens
+    };
+    assert!(charged2 > 0, "second top-up must also charge the lease");
+
+    let fast_interfaces = test_cos_fast_interfaces(
+        IFINDEX,
+        IFINDEX,
+        QUEUE_ID,
+        vec![(
+            QUEUE_ID,
+            test_queue_fast_path(false, 0, None, Some(test_lease.clone())),
+        )],
+        None,
+        None,
+    );
+    let fast_path = fast_interfaces.get(&IFINDEX).expect("test fast path").clone();
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 0, IFINDEX, root, fast_path);
+
+    release_all_cos_queue_leases(&mut binding);
+
+    assert_eq!(
+        binding.cos.cos_interfaces.get(&IFINDEX).unwrap().queues[0]
+            .hot
+            .tokens,
+        0,
+        "teardown must drain the queue's local token bucket"
+    );
+
+    let conserved_capacity = drain_capacity(&test_lease, NOW_NS);
+    assert_eq!(
+        conserved_capacity, baseline_capacity,
+        "#5156 teardown: after release_all_cos_queue_leases the shared lease's \
+         drainable capacity must fully recover to the pristine baseline — the \
+         non-exact queue's outstanding grant was returned. The exact-only \
+         filter leaves it short by the grant."
+    );
+}
