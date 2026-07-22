@@ -1,3 +1,108 @@
+## 2026-07-22 — #6297: cap budgeted conntrack refresh walk to the live high-watermark
+
+- **Timestamp**: 2026-07-22 (fix/6297-conntrack-refresh-watermark)
+- **Action**: `SessionTable::iter_with_idle_budgeted` bounded its round-robin
+  refresh walk to `entries.capacity()`. The slab is monotonic (no
+  `shrink_to_fit`), so after a session-count high-watermark drains, each 10s
+  cycle re-walked the full doubled capacity — mostly-vacant slots (#5287 M1
+  follow-up). Added a monotonic `slot_high_watermark` field (`1 + the highest
+  slot the slab ever handed out`), bumped on every insert via a new
+  `insert_record` choke point (fresh install, synced import, restore_entry),
+  never shrunk on removal. The walk now bounds to
+  `min(slot_high_watermark, capacity())`, wrapping at the peak live extent
+  instead of the doubled capacity. INVARIANT (documented on the field + walk):
+  the watermark is always `>= 1 + every occupied slot index`, so the shorter
+  walk can never skip a live session's `last_seen` refresh (which would look
+  idle → premature expiry). Added two fail-on-revert tests: (1) fill 100 /
+  drain to 3, assert a full budgeted sweep examines exactly the watermark and
+  `< capacity()` (reverting to `capacity()` reddens it — verified RED); (2) a
+  sole live session pinned at the top slot far above `len()` is still refreshed
+  by a full sweep (guards the never-below-a-live-slot invariant).
+- **Validation**: `cargo build --release` clean; `iter_with_idle` (5) +
+  `refresh` (38) + full `session::tests` (168) all green; both new tests 5/5
+  stable; temp-revert of the bound to `capacity()` confirmed the drain test
+  goes RED at the `examined < capacity` assertion.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/install.rs, userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md
+## 2026-07-22 — #6157/#6294: make parallel-sensitive WireGuard tests parallel-safe
+
+- **Timestamp**: 2026-07-22 (fix/6157-wg-test-parallel-serial)
+- **Action**: Made two WG tests safe under a default-parallel
+  `cargo test --release` (a full-suite parallel run had deadlocked >100min on
+  the WG engine test). #6294: converted the test-only
+  `OUTER_ROUTE_RESOLVE_COUNT` from a process-global `AtomicUsize` to a
+  `thread_local!` `Cell<usize>` (`afxdp/frame/wg.rs`) with reset/read/bump
+  accessors, so each test thread's outer-route-resolve count is isolated — a
+  parallel sibling `wg_encap_frame`/`outer_*` test can no longer corrupt
+  `wg_encap_frame_resolves_outer_route_once_v4`'s exact `== 1` assertion.
+  Needs no guard threaded through the ~14 outer-resolution tests. #6157: added
+  a poison-tolerant module-local serialization guard `wg_engine_test_serial()`
+  (`afxdp/wg/engine_tests.rs`, mirrors `icmp_ratelimit::global_bucket_test_lock`)
+  and hold it for the whole body of the two heavy busy-spin engine tests
+  (`install_session_serializes_with_reconcile_removal`,
+  `reconcile_peers_snapshot_is_atomic_under_concurrent_load`) so at most one
+  runs at a time — the blocked one PARKS on the mutex (futex wait) instead of
+  compounding scheduler oversubscription.
+- **Fail-on-revert (deterministic)**:
+  - `outer_route_resolve_count_is_thread_local_isolated` (`wg_tests.rs`): two
+    barrier-synced threads each reset+bump 50k times+read; each must observe
+    exactly its own 50k. Reverting to a shared atomic leaks the sibling's
+    bumps → assertion fails.
+  - `wg_engine_test_serial_grants_exclusive_access` (`engine_tests.rs`): two
+    barrier-synced threads take the guard and enter an `IN_CRITICAL` region;
+    a swap-true-on-entry asserts no concurrent occupant. Removing the guard
+    acquisition lets both enter → panic → join fails.
+- **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs,
+  userspace-dp/src/afxdp/wg/engine_tests.rs, docs/engineering-style.md,
+  _Log.md
+- **Docs**: added a "Rust tests must be parallel-safe" reminder to
+  docs/engineering-style.md (thread-local isolation vs poison-tolerant serial
+  guard, deterministic fail-on-revert). No operator/design/state doc surface —
+  test-only change, no production behavior.
+- **Validation**: `cargo build --release` clean; repeated parallel targeted
+  runs of the affected + fail-on-revert tests; full suite `--test-threads=1`
+  green (see PR body).
+## 2026-07-22 — #6185: fence synchronous ArchiveConfig against the zeroize fence
+
+- **Timestamp**: 2026-07-22 (fix/6185-archiveconfig-fence)
+- **Action**: Fenced the SYNCHRONOUS archive path (`Store.ArchiveConfig`,
+  `pkg/configstore/store_persist.go`) against the #5869/#6182 zeroize archive
+  fence. #6182 fenced + joined the ASYNC fire-and-forget `writeArchive`
+  goroutine (`archiveFenced` + `archiveWG`), but `ArchiveConfig` did NOT consult
+  the fence and was NOT tracked by the WaitGroup. It has zero production callers
+  today, but if it were ever wired to an operator command (e.g. `request system
+  configuration archive`) a fenced-window call would `os.MkdirAll` + rewrite the
+  archive dir after `FactoryResetArchiveDir` erased it — recreating a
+  `config-<ts>.<seq>.conf` snapshot of the PRIOR tenant's full config text
+  (cleartext IKE PSKs, WireGuard keys, SNMP communities) — reopening the #5869
+  re-tenant residue for that path. `ArchiveConfig` now (1) no-ops when the fence
+  is set (checked under `s.mu`, mirroring the async launch guard) and (2)
+  `archiveWG.Add(1)`s under the lock guarded by `!archiveFenced` and `Done()`s
+  after the off-lock write, so a concurrent `QuiesceArchival` JOINS an in-flight
+  synchronous write before the wipe. Lock discipline matches the async path: the
+  fence read + Add run under the RLock (mutually exclusive with QuiesceArchival's
+  write-Lock fence-set), so the Add/Wait ordering stays race-free and no deadlock
+  (writeArchive never touches `s.mu`). Routed the sync path through the existing
+  `archiveWriteBarrier` seam so the JOIN is deterministically testable.
+- **Tests**: `pkg/configstore/archiveconfig_fence_6185_test.go` (new) —
+  `TestArchiveConfigFencedDoesNotRecreateArchiveDir` (MANDATORY fail-on-revert:
+  QuiesceArchival sets fence → ArchiveConfig must NOT recreate the dir;
+  neutralizing the fence guard → RED, dir reappears with the snapshot),
+  `TestArchiveConfigUnfencedArchivesNormally` (control: un-fenced sync path still
+  writes one snapshot carrying the config text),
+  `TestQuiesceArchivalJoinsInflightSyncArchiveConfig` (JOIN fail-on-revert:
+  removing the `archiveWG.Add(1)` → QuiesceArchival returns before joining → RED),
+  and `TestResumeArchivalReenablesCommitArchival` (#6185 note 2: fence → prove a
+  fenced commit does NOT archive → ResumeArchival clears the fence → a subsequent
+  commit archives normally; WaitGroup reusable, no corrupt state). Verified RED on
+  revert for both fences; `go build ./...`, `go vet`, `go test -race
+  ./pkg/configstore/...` full suite pass, 5x non-flake.
+- **File(s)**: pkg/configstore/store_persist.go, pkg/configstore/store_commit.go,
+  pkg/configstore/archiveconfig_fence_6185_test.go (new),
+  docs/system-login.md, pkg/configstore/README.md, _Log.md
+
 ## 2026-07-22 — #6114: mirror flow-cache HOT path samples before reserving
 
 - **Timestamp**: 2026-07-22 (fix/6114-mirror-sample-before-cas)
@@ -56186,6 +56291,15 @@ top.
   when the Mutex is re-added).
 - **File(s)**: userspace-dp/src/filter/policer.rs,
   userspace-dp/src/filter/mod.rs, userspace-dp/src/filter/README.md
+
+## 2026-07-22 — #6315 review fold: honest serial-guard fail-on-revert wording
+- **Action**: Folded the Codex MERGE-NEEDS-MINOR + rev6315 nit — corrected the
+  "deterministic red on revert" claim for the scheduler-dependent mutex GUARD
+  test (engine_tests.rs) to "scheduler-dependent but effectively certain", and
+  noted it pins the guard PRIMITIVE not its application at the two heavy tests
+  (verified by inspection; a deterministic test reduces to the flake). Mirrored
+  in docs/engineering-style.md, distinguishing the deterministic ISOLATION test.
+- **File(s)**: userspace-dp/src/afxdp/wg/engine_tests.rs, docs/engineering-style.md
 - **Timestamp**: 2026-07-22 (#5212)
 - **Action**: Carry the RT_FLOW stable session id across the HA session-sync
   wire so a peer-synced session ADOPTS the originating node's id instead of

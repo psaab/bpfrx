@@ -492,6 +492,18 @@ It is now an **incremental, budgeted slice** driven by
   `CT_REFRESH_WINDOW_NS` (10s). A small or idle table is walked in one short
   slice per 10s — the steady-state syscall rate is unchanged from the old 10s
   full-table cadence, so the common case is not regressed.
+- **Live-extent bound (#6297).** A cycle ends at the slab's live-extent
+  high-watermark (`SessionTable::slot_high_watermark` = `1 + the highest slot
+  index ever handed out`), NOT `entries.capacity()`. The slab never shrinks, so
+  after a session-count spike drains, `capacity()` stays at the doubled peak and
+  a capacity-bound walk would re-scan tens of thousands of now-vacant slots
+  every cycle. The watermark is bumped on every insert (`insert_record`) and is
+  never shrunk on removal. INVARIANT: it is always `>= 1 + every currently-
+  occupied slot index`, so bounding the walk to it can never skip a live
+  session's `last_seen` refresh (which would look idle and expire early). A
+  slightly-high watermark after a drain only costs a few skipped vacant visits;
+  a stale-LOW one would be a premature-expiry correctness bug, so the watermark
+  only ever grows.
 
 **Freshness/latency tradeoff.** At the 131072 default cap and 100ms cadence a
 full cycle spans ~64 slices (~6.4s ≤ the 10s freshness window), so the whole
