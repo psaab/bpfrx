@@ -55847,3 +55847,13 @@ top.
 - **Timestamp**: 2026-07-22 (session)
   **Action**: #4906 — fix test/xsk-repro AF_XDP reproducer safety + false-result cohort (HC-025/069/081/090/091/095/101; HC-001 already fixed on master aaf977435). Embedded XDP object loaded via bpf_object__open_mem (no /tmp path); attach UPDATE_IF_NOEXIST + detach REPLACE+old_prog_fd (Rust RAII guard); checked shell-free link cycle w/ INCONCLUSIVE skip; Rust UMEM munmap after owners drop; rx1/rx2 init before goto (strict -Werror -Wjump-misses-init fail-on-revert gate + selftest leg); HC-069 RX-desc read-before-release + chunk-base recycle (C) and recv.release()+actual-consumed recycle (Rust); HC-095 secondary socket primed/polled/recycled + folded into PASS. Refreshed stale xdp_pass_redirect.o (elfutils 0.195 rejected the 6346B vintage; rebuilt 6432B from unchanged source). Added Makefile (+regen-obj, implicit-rule guard), selftest-compile.sh (wired into run-selftests.sh). Verified: strict build; fail-on-revert end-to-end; HC-101 kernel primitives on dummy0 (attach#2 EBUSY, foreign-fd detach refused); open_mem load reaches EPERM non-root.
   **File(s)**: test/xsk-repro/{libbpf_xsk_test.c,libbpf_xsk_shared_test.c,main.rs,xdp_pass_redirect.c,xdp_pass_redirect.o,Makefile,selftest-compile.sh,README.md}, scripts/run-selftests.sh, .gitignore
+- **Timestamp**: 2026-07-22 (#6081)
+  **Action**: Add delete-journal-overflow forceResync CONSUME-path integration
+  tests (test-only, #5450/#6078 follow-up). `TestForceResyncConsumeSweep
+  ReconcilesStandby` drives arm→syncSweep-consume→doBulkSync→standby
+  reconcileStaleSessions reaping the journal-dropped ghost; `TestForceResync
+  ConsumeReconnectSurvivesRearmDuringBulk` guards the #6078 MINOR-1 reconnect
+  CAS symmetry (re-arm during the in-flight bulk survives the consume). Both
+  firsthand-verified RED on neutralizing their respective consume wiring.
+  Added a coverage note to the #5450 recovery section of the session-sync doc.
+  **File(s)**: pkg/cluster/sync_test.go, docs/session-sync-architecture.md
