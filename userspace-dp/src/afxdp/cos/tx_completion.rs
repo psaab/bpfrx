@@ -227,8 +227,8 @@ pub(in crate::afxdp) fn normalize_cos_queue_state(queue: &mut CoSQueueRuntime) {
     mark_cos_queue_runnable(queue);
 }
 
-/// Advance the interface timer wheel to `now_ns`, one 50 µs tick per
-/// loop iteration. Returns the number of ticks advanced by THIS call
+/// Advance the interface timer wheel to `now_ns`. Returns the number
+/// of ticks advanced by THIS call
 /// (`now_tick - current_tick` at entry) — the #1782 Step-1 §4(i)
 /// catch-up instrument. The return value is computed once before the
 /// loop (O(1), no extra clock reads) and reports the TRUE lag even
@@ -241,8 +241,10 @@ pub(in crate::afxdp) fn normalize_cos_queue_state(queue: &mut CoSQueueRuntime) {
 /// wheel horizon — the first shaped drain after a long per-worker
 /// idle period — the per-tick loop is pure O(lag) catch-up (~111 s of
 /// 50 µs ticks replayed for one cold connect in the Step-1 evidence).
-/// `snap_cos_timer_wheel_over_horizon` replaces it with an O(slots)
-/// snap when no queue is parked. In-horizon lag
+/// `snap_cos_timer_wheel_over_horizon` replaces it with an
+/// O(slots + queues) snap. Parked queues that are already due
+/// are woken, while future parks are reinserted from their absolute
+/// wake ticks against the snapped current tick. In-horizon lag
 /// (`<= COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS`) always takes the
 /// existing per-tick loop unchanged.
 #[inline]
@@ -250,27 +252,37 @@ pub(in crate::afxdp) fn advance_cos_timer_wheel(
     root: &mut CoSInterfaceRuntime,
     now_ns: u64,
 ) -> u64 {
+    advance_cos_timer_wheel_counting_iterations(root, now_ns).0
+}
+
+/// Implementation split out so regression tests can distinguish the
+/// true elapsed-tick telemetry from the amount of synchronous per-tick
+/// work. The second tuple field is optimized away in production callers.
+#[inline]
+fn advance_cos_timer_wheel_counting_iterations(
+    root: &mut CoSInterfaceRuntime,
+    now_ns: u64,
+) -> (u64, u64) {
     let now_tick = cos_tick_for_ns(now_ns);
     let ticks_advanced = now_tick.saturating_sub(root.timer_wheel.current_tick);
-    if ticks_advanced > COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS
-        && snap_cos_timer_wheel_over_horizon(root, now_tick)
-    {
-        return ticks_advanced;
+    if ticks_advanced > COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS {
+        snap_cos_timer_wheel_over_horizon(root, now_tick);
+        return (ticks_advanced, 0);
     }
+    let mut iterations = 0;
     while root.timer_wheel.current_tick < now_tick {
+        iterations += 1;
         root.timer_wheel.current_tick = root.timer_wheel.current_tick.saturating_add(1);
         if root.timer_wheel.current_tick % COS_TIMER_WHEEL_L0_SLOTS as u64 == 0 {
             cascade_cos_timer_wheel_level1(root);
         }
         wake_due_cos_timer_slot(root);
     }
-    ticks_advanced
+    (ticks_advanced, iterations)
 }
 
-/// #1782 Step-2 (§5.2 mechanism (i)): O(slots) wheel catch-up for an
-/// over-horizon lag. Returns `true` if the wheel was snapped to
-/// `now_tick` (caller skips the per-tick loop), `false` to fall back
-/// to the existing O(lag) loop.
+/// #1782 Step-2 (§5.2 mechanism (i)), extended by #5803: bounded wheel
+/// catch-up for an over-horizon lag.
 ///
 /// Correctness (plan Codex F1 + AGY F1 fold): the "wheel is empty at
 /// idle" shortcut is FALSE — `park_cos_queue` pushes queue indices
@@ -278,46 +290,20 @@ pub(in crate::afxdp) fn advance_cos_timer_wheel(
 /// queue flags, never the slot vectors; stale entries are filtered
 /// lazily by the `parked`/`wheel_level`/`wheel_slot` checks in
 /// `wake_due_cos_timer_slot` / `cascade_cos_timer_wheel_level1`. So
-/// the snap (option (a)) first verifies NO queue is parked: with no
-/// parked queue, EVERY wheel entry is stale (`!parked` fails the lazy
-/// filter), so the per-tick loop's only effects over an over-horizon
-/// lag are (1) emptying every slot vector — the loop visits all L0
-/// slots and cascades all L1 slots, see
-/// `COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS` — and (2) setting
-/// `current_tick = now_tick`. The snap performs exactly those two
-/// effects, touching no queue state, so it is behavior-identical by
-/// construction.
-///
-/// Scope of the `false` fallback (Codex PR #1854 r1 — the original
-/// "naturally bounded" claim was FALSE and is retracted): park wake
-/// ticks are NOT statically bounded by the wheel horizon. The wake
-/// tick is `now + deficit/rate` with an uncapped refill time
-/// (`queue_service/mod.rs` park site, `token_bucket.rs` refill), and
-/// the config accepts rates as low as 1 B/s (`transmit-rate 8`),
-/// where a 1500-byte head parks ~30,000,000 ticks (~25 min) out. A
-/// worker that goes fully idle while such a queue is parked CAN
-/// therefore re-enter the O(lag) per-tick loop on its next drain —
-/// the snap deliberately does not cover that state, because re-arming
-/// parked entries against the snapped tick requires the absolute
-/// wake-tick bookkeeping of plan option (b), reviewed as
-/// not-worth-the-risk for a pathological-config-only residual. What
-/// the snap DOES cover is the proven production mechanism (#1782
-/// Step-1 evidence): a fully idle worker has no backlog, hence no
-/// parked queue, and snaps in O(slots). For ordinary configured rates
-/// a parked queue's wake is near-term and the owner's drain priming
-/// (`cos_root_can_service_after_prime`) keeps the wheel advancing, so
-/// the fallback loop stays short in practice. No debug assertion: the
-/// parked+huge-lag state is legitimate (low-rate configs), and the
-/// fallback test constructs it deliberately.
+/// The snap clears all old slot entries and sets `current_tick =
+/// now_tick`. It then rebuilds every valid parked entry from the
+/// queue's absolute `next_wakeup_tick`: due queues wake immediately,
+/// and future queues are re-parked through `park_cos_queue`, which
+/// re-derives their level and slot relative to the new tick. This is
+/// the same final state as visiting every elapsed tick, including for
+/// wake ticks far beyond the wheel horizon, but costs O(slots + queue
+/// count) rather than O(elapsed ticks).
 ///
 /// Cold-path-only: reached only when lag > ~3.28 s, i.e. the first
 /// shaped drain after idle. `Vec::clear` frees nothing (capacity
 /// retained) — no allocation either way.
 #[cold]
-fn snap_cos_timer_wheel_over_horizon(root: &mut CoSInterfaceRuntime, now_tick: u64) -> bool {
-    if root.queues.iter().any(|queue| queue.hot.parked) {
-        return false;
-    }
+fn snap_cos_timer_wheel_over_horizon(root: &mut CoSInterfaceRuntime, now_tick: u64) {
     for slot in root.timer_wheel.level0.iter_mut() {
         slot.clear();
     }
@@ -325,7 +311,31 @@ fn snap_cos_timer_wheel_over_horizon(root: &mut CoSInterfaceRuntime, now_tick: u
         slot.clear();
     }
     root.timer_wheel.current_tick = now_tick;
-    true
+
+    let mut rearm = core::mem::take(&mut root.timer_wheel.scratch.rearm);
+    let mut wake = core::mem::take(&mut root.timer_wheel.scratch.wake);
+    rearm.clear();
+    wake.clear();
+    for (queue_idx, queue) in root.queues.iter().enumerate() {
+        if !queue.hot.parked {
+            continue;
+        }
+        if queue.hot.next_wakeup_tick <= now_tick {
+            wake.push(queue_idx);
+        } else {
+            rearm.push((queue_idx, queue.hot.next_wakeup_tick));
+        }
+    }
+    for queue_idx in wake.iter().copied() {
+        wake_cos_queue(root, queue_idx);
+    }
+    for (queue_idx, wake_tick) in rearm.iter().copied() {
+        park_cos_queue(root, queue_idx, wake_tick);
+    }
+    rearm.clear();
+    wake.clear();
+    root.timer_wheel.scratch.rearm = rearm;
+    root.timer_wheel.scratch.wake = wake;
 }
 
 fn cascade_cos_timer_wheel_level1(root: &mut CoSInterfaceRuntime) {
