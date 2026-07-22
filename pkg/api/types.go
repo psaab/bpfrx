@@ -457,6 +457,28 @@ type NATDestInfo struct {
 	TranslatePort uint16 `json:"translate_port,omitempty"`
 }
 
+// NATDeterministicInfo is a deterministic source-NAT (CGNAT / NAPT64)
+// forward or reverse mapping lookup result, resolved against the
+// last-applied NAT generation (#5794). On failure Found is false and
+// ErrorCode carries a stable machine-readable token identical to the gRPC
+// and CLI surfaces.
+type NATDeterministicInfo struct {
+	Found             bool   `json:"found"`
+	ErrorCode         string `json:"error_code,omitempty"`
+	ErrorDetail       string `json:"error_detail,omitempty"`
+	Direction         string `json:"direction"`
+	Pool              string `json:"pool,omitempty"`
+	Mode              uint8  `json:"mode,omitempty"`
+	InternalHost      string `json:"internal_host,omitempty"`
+	ExternalIP        string `json:"external_ip,omitempty"`
+	NATPort           uint16 `json:"nat_port,omitempty"`
+	PortLow           uint16 `json:"port_low,omitempty"`
+	PortHigh          uint16 `json:"port_high,omitempty"`
+	BlockSize         uint16 `json:"block_size,omitempty"`
+	BlockIndex        uint32 `json:"block_index,omitempty"`
+	AppliedGeneration uint64 `json:"applied_generation,omitempty"`
+}
+
 // DHCPLeaseInfo holds DHCP lease information.
 type DHCPLeaseInfo struct {
 	Interface string   `json:"interface"`
