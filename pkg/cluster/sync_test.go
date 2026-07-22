@@ -2784,6 +2784,267 @@ func TestDeleteJournalOverflowArmsForceResync(t *testing.T) {
 	})
 }
 
+// bulkCaptureConn is a net.Conn stub for the #6081 forceResync consume-path
+// integration tests. Write appends every framed sync message into an in-memory
+// buffer (so a real BulkSync/doBulkSync can run to completion with no reader
+// goroutine and no net.Pipe backpressure), and Read BLOCKS until Close instead
+// of returning EOF. The blocking Read matters for the handleNewConnection path:
+// that function spawns a receiveLoop on the same conn, and an immediate EOF
+// would let receiveLoop tear the connection down (handleDisconnect) mid-bulk and
+// re-arm forceResync, corrupting the scenario. The captured BulkStart -> session
+// -> BulkEnd window is replayed into a standby SessionSync (replayBulkFrames) in
+// the SAME goroutine, so the mock session store is never touched concurrently —
+// the test is deterministic and race-free.
+type bulkCaptureConn struct {
+	mu     sync.Mutex
+	buf    []byte
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newBulkCaptureConn() *bulkCaptureConn {
+	return &bulkCaptureConn{closed: make(chan struct{})}
+}
+
+func (c *bulkCaptureConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	c.buf = append(c.buf, b...)
+	c.mu.Unlock()
+	return len(b), nil
+}
+
+func (c *bulkCaptureConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *bulkCaptureConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *bulkCaptureConn) LocalAddr() net.Addr              { return preAuthTestAddr("127.0.0.1:0") }
+func (c *bulkCaptureConn) RemoteAddr() net.Addr             { return preAuthTestAddr("10.0.0.2:4785") }
+func (c *bulkCaptureConn) SetDeadline(time.Time) error      { return nil }
+func (c *bulkCaptureConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *bulkCaptureConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *bulkCaptureConn) bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]byte, len(c.buf))
+	copy(out, c.buf)
+	return out
+}
+
+// replayBulkFrames decodes the framed sync messages a primary wrote into a
+// bulkCaptureConn and feeds each one into the standby's handleMessage, exactly
+// as the standby's receiveLoop would — driving the BulkStart -> session ->
+// BulkEnd window through to reconcileStaleSessions synchronously. It returns the
+// count of BulkStart / BulkEnd markers seen so a caller can assert an
+// authoritative bulk window was actually delivered.
+func replayBulkFrames(t *testing.T, standby *SessionSync, buf []byte) (starts, ends int) {
+	t.Helper()
+	for len(buf) > 0 {
+		if len(buf) < syncHeaderSize {
+			t.Fatalf("truncated frame header: %d bytes left", len(buf))
+		}
+		if string(buf[0:4]) != "BPSY" {
+			t.Fatalf("bad sync magic: %q", buf[0:4])
+		}
+		typ := buf[4]
+		n := binary.LittleEndian.Uint32(buf[8:12])
+		buf = buf[syncHeaderSize:]
+		if uint32(len(buf)) < n {
+			t.Fatalf("truncated payload: want %d, have %d", n, len(buf))
+		}
+		payload := buf[:n]
+		buf = buf[n:]
+		switch typ {
+		case syncMsgBulkStart:
+			starts++
+		case syncMsgBulkEnd:
+			ends++
+		}
+		standby.handleMessage(nil, typ, payload)
+	}
+	return starts, ends
+}
+
+// TestForceResyncConsumeSweepReconcilesStandby is the #6081 fail-on-revert guard
+// for the CONSUME side of the #5450/#6078 delete-journal-overflow forceResync
+// recovery, exercised end-to-end through syncSweep.
+//
+// TestDeleteJournalOverflowArmsForceResync already guards the ARMING (both drop
+// sites). This test guards the wiring the arming exists to drive: forceResync
+// (CAS true->false in syncSweep) -> doBulkSync -> the standby's
+// reconcileStaleSessions actually DELETES a peer-owned session whose delete was
+// journal-dropped.
+//
+// Scenario: the primary owns zone 2 and closed session B (its delete overflowed
+// the journal and was dropped, arming forceResync); only the still-live session
+// A remains in the primary's table. The standby is secondary for zone 2 and
+// still holds both A and the ghost B. A single connected syncSweep tick must
+// consume the arm, send an authoritative bulk (A only), and — after the standby
+// replays that window — leave the standby with A but NOT B.
+//
+// RED on revert: neutralizing the consume in syncSweep (e.g. disabling the
+// `if s.forceResync.CompareAndSwap(true, false) { doBulkSync() }` block) sends no
+// bulk, so BulkSyncs stays 0, forceResync stays armed, and the ghost session B
+// survives on the standby — every assertion below fails. syncSweep's incremental
+// path uses queueMessage (sendCh), never a BulkStart/BulkEnd window, so the
+// forced resync is the ONLY thing that can drive the standby's reconcile here.
+func TestForceResyncConsumeSweepReconcilesStandby(t *testing.T) {
+	const zone = uint16(2)
+	liveKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 3, 1}, DstIP: [4]byte{10, 0, 4, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}
+	// ghostKey: closed on the primary, its delete journal-dropped, still stale on
+	// the standby. Only the authoritative bulk resync can reap it.
+	ghostKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 3, 2}, DstIP: [4]byte{10, 0, 4, 2}, Protocol: 6, SrcPort: 2000, DstPort: 443}
+
+	// Primary owns zone 2 and holds only the still-live session.
+	primDP := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			liveKey: {IsReverse: 0, IngressZone: zone},
+		},
+		sessionCounter: 1,
+	}
+	prim := NewSessionSync(":0", "10.0.0.2:4785", primDP)
+	prim.IsPrimaryFn = func() bool { return true } // owns every zone -> syncs zone 2
+
+	// Standby is secondary for zone 2 (peer owns its RG) and still holds the
+	// live session plus the ghost whose delete was dropped.
+	standbyDP := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			liveKey:  {IsReverse: 0, IngressZone: zone},
+			ghostKey: {IsReverse: 0, IngressZone: zone},
+		},
+		sessionCounter: 1,
+	}
+	standby := NewSessionSync(":0", "10.0.0.1:4785", standbyDP)
+	standby.IsPrimaryFn = func() bool { return false }
+	standby.IsPrimaryForRGFn = func(rgID int) bool { return false } // peer owns zone 2's RG
+	standby.SetZoneRGMap(map[uint16]int{zone: 2})
+
+	cap := newBulkCaptureConn()
+	prim.mu.Lock()
+	prim.conn0 = cap
+	prim.mu.Unlock()
+	prim.stats.Connected.Store(true)
+
+	// Arm forceResync exactly as a real delete-journal overflow would: drive a
+	// rejournalTail past cap so records are DROPPED (both drop sites call
+	// armDeleteResync). This is the genuine precondition the consume path exists
+	// to service.
+	mk := func(n int) []byte { return encodeDeleteV4(deleteKeyN(n), 0) }
+	prim.deleteJournalCap = 2
+	prim.deleteJournal = [][]byte{mk(1), mk(2), mk(3)}
+	prim.rejournalTail([][]byte{mk(4), mk(5), mk(6)})
+	if prim.stats.DeletesDropped.Load() == 0 {
+		t.Fatal("precondition: expected the overflow to drop records")
+	}
+	if !prim.forceResync.Load() {
+		t.Fatal("precondition: delete-journal overflow did not arm forceResync")
+	}
+
+	// One connected sweep tick consumes the arm and sends the authoritative bulk
+	// directly onto the capture conn (the residual journal flush + incremental
+	// sweep both go to sendCh, not the conn, so the capture holds ONLY the bulk).
+	prim.syncSweep()
+
+	if prim.forceResync.Load() {
+		t.Fatal("forceResync not consumed by syncSweep (#6081: consume-side CAS reverted)")
+	}
+	if got := prim.stats.BulkSyncs.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 authoritative bulk from the forced resync, got %d", got)
+	}
+
+	starts, ends := replayBulkFrames(t, standby, cap.bytes())
+	if starts != 1 || ends != 1 {
+		t.Fatalf("expected exactly one BulkStart/BulkEnd window on the wire, got starts=%d ends=%d", starts, ends)
+	}
+
+	if _, ok := standbyDP.v4sessions[liveKey]; !ok {
+		t.Fatal("live session must survive the forced resync (it was in the authoritative bulk)")
+	}
+	if _, ok := standbyDP.v4sessions[ghostKey]; ok {
+		t.Fatal("#6081: ghost session whose delete was journal-dropped must be reconciled away by the forced resync")
+	}
+}
+
+// TestForceResyncConsumeReconnectSurvivesRearmDuringBulk is the #6081/#6078
+// MINOR-1 fail-on-revert guard for the handleNewConnection reconnect consume.
+//
+// The reconnect cold-prime consumes forceResync with a CAS (true->false) BEFORE
+// doBulkSync and, on SUCCESS, does NOT clear it again. That asymmetry is
+// deliberate (#6078 MINOR-1): a NEW delete-journal overflow that arms forceResync
+// DURING the in-flight bulk must SURVIVE the consume so a later sweep/reconnect
+// runs a fresh authoritative resync. The pre-fix shape cleared the flag
+// unconditionally after the bulk (a trailing Store(false)), which clobbered that
+// re-arm and silently lost the follow-up resync.
+//
+// This drives the real handleNewConnection (unkeyed, so performSyncHandshake is
+// a no-op and needs no cooperating peer) with forceResync pre-armed, and injects
+// a re-arm mid-bulk via BulkSyncOverride (which doBulkSync invokes before
+// BulkSync). After the reconnect completes, forceResync MUST still be armed.
+//
+// RED on revert: restoring an unconditional `s.forceResync.Store(false)` on the
+// doBulkSync-success branch clears the mid-bulk re-arm and this goes RED.
+func TestForceResyncConsumeReconnectSurvivesRearmDuringBulk(t *testing.T) {
+	const zone = uint16(2)
+	liveKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 5, 1}, DstIP: [4]byte{10, 0, 6, 1}, Protocol: 6, SrcPort: 1100, DstPort: 80}
+
+	primDP := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			liveKey: {IsReverse: 0, IngressZone: zone},
+		},
+		sessionCounter: 1,
+	}
+	prim := NewSessionSync(":0", "10.0.0.2:4785", primDP) // unkeyed: handshake is a no-op
+	prim.IsPrimaryFn = func() bool { return true }
+
+	// The earlier overflow armed forceResync; the reconnect's CAS will consume it.
+	prim.forceResync.Store(true)
+
+	// Simulate a NEW overflow arming forceResync WHILE the reconnect bulk is in
+	// flight: doBulkSync calls BulkSyncOverride before its authoritative BulkSync,
+	// and by then handleNewConnection has already CAS-consumed the earlier arm, so
+	// this re-arm's CAS(false->true) succeeds. It must survive to the end.
+	// BulkSyncOverride runs synchronously inside doBulkSync on this same
+	// goroutine (handleNewConnection is called synchronously below), so a plain
+	// bool is race-free — the spawned receiveLoop never touches it.
+	rearmed := false
+	prim.BulkSyncOverride = func() error {
+		if prim.armDeleteResync() {
+			rearmed = true
+		}
+		return nil
+	}
+
+	cap := newBulkCaptureConn()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		cap.Close() // unblock the spawned receiveLoop's Read so it exits
+	}()
+
+	// Drive the real reconnect path. This is the first connection on this
+	// SessionSync, so installConn arms the cold-prime obligation and the
+	// shouldColdPrime branch runs doBulkSync. handleNewConnection returns once the
+	// synchronous bulk completes; the receiveLoop it spawns blocks on the capture
+	// conn's Read until Close.
+	prim.handleNewConnection(ctx, 0, cap)
+
+	if !rearmed {
+		t.Fatal("precondition: BulkSyncOverride did not re-arm forceResync during the bulk")
+	}
+	if got := prim.stats.BulkSyncs.Load(); got != 1 {
+		t.Fatalf("expected the reconnect to run exactly 1 authoritative bulk, got %d", got)
+	}
+	if !prim.forceResync.Load() {
+		t.Fatal("#6078 MINOR-1: a forceResync re-armed during the reconnect bulk was cleared by the consume (trailing Store(false) reverted) — the follow-up resync would be lost")
+	}
+}
+
 // TestDeleteJournalFlushAllFit: with room in the send queue, every
 // journaled delete is enqueued and the journal empties.
 func TestDeleteJournalFlushAllFit(t *testing.T) {
