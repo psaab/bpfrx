@@ -473,13 +473,23 @@ func parseSrcPort(addr string) uint16 {
 	// Find last colon
 	for i := len(addr) - 1; i >= 0; i-- {
 		if addr[i] == ':' {
-			var port uint16
+			// Accumulate into a wider integer so an out-of-range port
+			// string does not silently wrap the uint16 accumulator mod
+			// 65536 (e.g. "70000" -> 4464, #6214), which would corrupt
+			// the source/destination port carried in NetFlow v9 / IPFIX
+			// flow records. A real port never exceeds 65535, so treat
+			// anything larger as unparseable and return the 0 "no port"
+			// sentinel (the same value the no-colon path returns).
+			var port uint32
 			for _, c := range addr[i+1:] {
 				if c >= '0' && c <= '9' {
-					port = port*10 + uint16(c-'0')
+					port = port*10 + uint32(c-'0')
+					if port > 65535 {
+						return 0
+					}
 				}
 			}
-			return port
+			return uint16(port)
 		}
 	}
 	return 0

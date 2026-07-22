@@ -114,7 +114,22 @@ Route metadata crosses the Go→Rust snapshot boundary as `RouteSnapshot`
   (`RouteEntryV4::next_hops: Vec<RouteNextHopV4>`). `select_route_next_hop`
   prefers a candidate with a resolved neighbor (so a dead first next-hop
   no longer blackholes a route with a healthy alternate), then distributes
-  across the live candidates by a spread hash. **#2734: the spread key is
+  across the live candidates by a spread hash. **#5161: liveness is
+  next-hop-shape-aware.** A member with an EXPLICIT gateway (`next_hop ==
+  Some`) is live once that gateway's neighbor resolves — the coordinator
+  warmer (`queue_warm_pass`) proactively ARP/ND-probes every explicit
+  next-hop, so a genuinely-dead gateway never resolves and stays correctly
+  skipped. An INTERFACE-ONLY member (`next_hop == None`, a "via <if>"
+  candidate) resolves its neighbor from the PER-FLOW destination itself,
+  which the warmer cannot pre-resolve (the on-link destination is a whole
+  prefix, unknown at route-sweep time — so interface-only members are NOT
+  warmed). Gating such a member on an already-present destination neighbor
+  starved it out of the live set the moment any explicit member resolved,
+  collapsing ECMP to width-1; instead it is live whenever its interface is
+  up (`ifindex > 0`), and the MissingNeighbor cold path resolves each
+  destination lazily per flow (mirroring the single-member interface-only
+  path). Tunnel members use their own type-aware liveness (#2923). **#2734:
+  the spread key is
   per-FLOW.** The session resolution path
   (`lookup_forwarding_resolution_with_dynamic_for_flow`) hashes the forward
   5-tuple with `ecmp_hash_flow` — the SAME per-boot seeded `FxHasher` the

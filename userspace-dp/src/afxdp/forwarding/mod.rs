@@ -2175,6 +2175,22 @@ fn lookup_forwarding_resolution_v4_inner(
                         depth,
                     );
                 }
+                // #5161: an interface-only member (`next_hop == None` — a
+                // directly-connected / point-to-point "via <if>" candidate)
+                // resolves its neighbor from the PER-FLOW destination `ip`, not
+                // a stable gateway. The coordinator warmer cannot pre-resolve
+                // that address (the on-link destination is a whole prefix,
+                // unknown at route-sweep time), so gating liveness on an
+                // already-present destination neighbor drops the member out of
+                // the live set the moment any explicit-next_hop member resolves
+                // — ECMP collapses to width-1. Treat an up interface-only
+                // member as LIVE and let the MissingNeighbor cold path resolve
+                // the destination lazily per flow, mirroring the single-member
+                // resolution path (which forwards a missing-neighbor direct hop
+                // as MissingNeighbor, never a drop).
+                if nh.next_hop.is_none() {
+                    return nh.ifindex > 0;
+                }
                 let target = nh.next_hop.unwrap_or(ip);
                 nh.ifindex > 0
                     && lookup_neighbor_entry(state, dynamic_neighbors, nh.ifindex, IpAddr::V4(target))
@@ -2382,6 +2398,18 @@ fn lookup_forwarding_resolution_v6_inner(
                         nh.tunnel_endpoint_id,
                         depth,
                     );
+                }
+                // #5161: an interface-only member (`next_hop == None`) resolves
+                // its neighbor from the PER-FLOW destination `ip`, which the
+                // warmer cannot pre-resolve (a whole prefix, unknown at
+                // route-sweep time). Gating on an already-present destination
+                // neighbor starves it out of the live set once any
+                // explicit-next_hop member resolves — ECMP collapses to
+                // width-1. Treat an up interface-only member as LIVE; the
+                // MissingNeighbor cold path resolves the destination lazily per
+                // flow. See the v4 twin for the full rationale.
+                if nh.next_hop.is_none() {
+                    return nh.ifindex > 0;
                 }
                 let target = nh.next_hop.unwrap_or(ip);
                 nh.ifindex > 0

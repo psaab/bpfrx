@@ -19,6 +19,20 @@
   `TestParseQueueCommandRejectsOutOfRange6215` passes with the fix and
   FAILS on revert (raw `Atoi`+`uint32` accepts `-1`/`5000000000`/`16`/`9999`);
   full `pkg/dataplane/userspace` suite green (TMPDIR=/tmp).
+## 2026-07-21 — #6214 fix: parseSrcPort uint16 accumulator overflow
+
+- **Timestamp**: 2026-07-21 (fix/6214-parsesrcport-overflow)
+- **Action**: `parseSrcPort` in `pkg/daemon/daemon_flow.go` accumulated port
+  digits directly into a `uint16` (`port = port*10 + uint16(c-'0')`), so a port
+  string above 65535 (e.g. "70000") wrapped mod 65536 to 4464 — silently
+  corrupting the source/destination port carried in NetFlow v9 / IPFIX flow
+  records (callers in `daemon_flowexport.go`: SrcPort/DstPort/NATSrcPort/
+  NATDstPort). Fix: accumulate into a `uint32` and reject any value > 65535,
+  returning the existing `0` "no port" sentinel (same value the no-colon path
+  returns). Valid ports 0..65535 parse unchanged. Added fail-on-revert test
+  `TestParseSrcPortRejectsOverflow6214`.
+- **File(s)**: `pkg/daemon/daemon_flow.go` (Edit),
+  `pkg/daemon/parse_srcport_overflow_6214_test.go` (Write)
 
 ## 2026-07-21 — #5482 follow-up: two review MAJORs on the BACKUP VIP-verify machinery
 
@@ -55211,3 +55225,38 @@ top.
 - **File(s)**: pkg/dataplane/userspace/manager_ha.go,
   pkg/dataplane/userspace/clear_all_multichunk_fastfail_5380_test.go,
   userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5161 fix — interface-only ECMP members no longer starve to
+  width-1. In `select_route_next_hop`'s per-flow `is_live` closure (both the v4
+  and v6 selection sites in `userspace-dp/src/afxdp/forwarding/mod.rs`), a
+  member with `next_hop == None` (a directly-connected / point-to-point "via
+  <if>" candidate) was marked LIVE only if a neighbor for the PER-FLOW
+  destination already existed. The coordinator warmer (`queue_warm_pass`)
+  proactively probes only members with an EXPLICIT `next_hop`, so interface-only
+  members were never warmed; once any explicit-next_hop member resolved, the
+  live set was non-empty and the unresolved interface-only member was
+  permanently excluded → every flow pinned to the explicit member and ECMP
+  collapsed to width-1 (lost multipath). Fix: an up interface-only member
+  (`ifindex > 0`) is LIVE regardless of a pre-existing destination neighbor; the
+  existing MissingNeighbor cold path then resolves each destination lazily per
+  flow (mirroring the single-member interface-only resolution path). WARM-TARGET
+  FORK: the warmer is NOT changed for interface-only members — their warm target
+  is the per-flow destination, a whole prefix unknown at route-sweep time;
+  warming a synthetic address would pollute the neighbor table or never resolve,
+  so lazy per-flow resolution is the only correct mechanism. One added branch on
+  the O(members) per-flow selection path (a cheap early return, no hot-path
+  regression). Fail-on-revert test
+  `ecmp_interface_only_member_is_live_alongside_gateway`
+  (`forwarding/tests.rs`): a MIXED ECMP route (resolved gateway member via
+  ge-0/0/1 ifindex 11 + interface-only member via ge-0/0/2 ifindex 22, no dest
+  neighbor); sweeping 64 per-flow hashes must reach BOTH egress interfaces
+  (width 2) and the interface-only member must forward as MissingNeighbor. RED
+  on revert (neutralize the `if nh.next_hop.is_none() { return nh.ifindex > 0 }`
+  v4 branch): `egress_seen` never contains 22 → width-1 assertion fails. Full
+  release cargo suite validation on disk. Updated the forwarding README ECMP
+  bullet (#2389/#2734) with the shape-aware liveness rule. ECMP/forwarding path
+  — needs a loss-cluster forwarding smoke with a multipath ECMP config (batched).
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md, _Log.md
