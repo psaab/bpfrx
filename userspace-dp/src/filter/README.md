@@ -319,14 +319,32 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   `input_filter_counters` set at seed, #3777), so miss (action-eval) + hits
   (cached replay) still total exactly one per packet.
 - `policer.rs` — the #1375 RFC 2697/2698 three-color meter core. Token
-  math is integer-only (byte/sec rates refilling a scaled `u128` bucket
-  from monotonic nanosecond timestamps). #4514 removed the standalone
-  single-rate `PolicerState` token bucket (its `consume` had zero
-  non-test call sites, so `then policer X` was silently unenforced);
-  legacy single-rate `firewall policer`s are now lowered at compile into
-  this same srTCM core (see `compiler.rs::build_single_rate_policer_state`)
-  so they share the metering, drop-on-exceed, flow-cache handle+replay,
-  and status export path.
+  math is integer-only, byte-granular, and **lock-free** (#5390): the
+  shape (`ThreeColorPolicerConfig`: mode, byte/sec rates, bursts,
+  treatments) is immutable and set at compile; the hot state
+  (`ThreeColorPolicerHot`) is a `#[repr(align(64))]` struct of atomics —
+  both token buckets packed into ONE `AtomicU64` (committed high 32 bits,
+  peak/excess low 32) plus per-rate `last_refill_ns` `AtomicU64`s.
+  `meter(&self)` refills through a win-the-window timestamp CAS and
+  consumes through a bounded `compare_exchange_weak` loop, so the RSS-
+  spread flow aggregate (6 workers on the mlx5 VF) no longer serializes on
+  a per-packet `Mutex` futex. Packing both buckets in one word makes a
+  green consume (which debits committed AND peak in trTCM) atomic; the
+  `afxdp/types/shared_cos_lease` v8 lease is the precedent. The aggregate
+  CIR/PIR/CBS/PBS contract is preserved EXACTLY — all workers meter one
+  shared bucket, only the primitive changed from Mutex to CAS. The sub-
+  byte fractional refill credit the pre-#5390 scaled-`u128` bucket kept in
+  the token count is now carried across refills by rewinding
+  `last_refill_ns` (the #4261 conservation rewind, as
+  `afxdp::cos::token_bucket::refill_cos_tokens` does); bursts clamp to the
+  packed u32 byte range (a Junos burst-size is far below 4 GiB). #4514
+  removed the standalone single-rate `PolicerState` token bucket (its
+  `consume` had zero non-test call sites, so `then policer X` was silently
+  unenforced); legacy single-rate `firewall policer`s are now lowered at
+  compile into this same srTCM core (see
+  `compiler.rs::build_single_rate_policer_state`) so they share the
+  metering, drop-on-exceed, flow-cache handle+replay, and status export
+  path.
 - `tests.rs` — co-located unit tests covering matching ports, prefix
   vectors, TCP flags.
 
@@ -389,11 +407,25 @@ Implemented here:
   (drop all). A non-discard single-rate policer is metered but its marking
   action is inert (same limitation as three-color `then loss-priority`).
 
+Concurrency model (#5390):
+
+- Runtime token state is a **lock-free packed-atomic** token bucket per
+  logical policer — NOT a per-packet `Mutex` (removed in #5390) and NOT a
+  per-worker shard. All workers still meter one SHARED aggregate bucket,
+  so the observable policing rate is the exact configured aggregate
+  CIR/PIR (no per-worker rate division, no RSS-distribution dependence).
+  The metered hot path takes no lock: both buckets live in one `AtomicU64`
+  (`ThreeColorPolicerHot`, `#[repr(align(64))]` to isolate the CAS word
+  from the Relaxed per-color counters) and are refilled/consumed through
+  bounded `compare_exchange_weak` loops. Removing the lock also removed
+  the poison failure mode; the only fail-closed path is the
+  `Unsupported`-mode Red/drop. A per-worker-shard design was rejected
+  because it would divide the observable rate by the worker count and make
+  enforcement depend on RSS flow spread — the CAS approach keeps the exact
+  aggregate contract while eliminating the futex convoy.
+
 Remaining limitations:
 
-- Runtime token state is one `Mutex` per logical policer, not a sharded
-  or packed atomic implementation. This preserves correctness and
-  stable identity but is not the final high-throughput contention model.
 - Equivalent snapshot replacements preserve token buckets and per-color
   counters by reusing the same runtime handle when the name-derived runtime ID
   and shape are unchanged. Shape changes intentionally create a fresh runtime
