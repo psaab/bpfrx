@@ -702,7 +702,23 @@ the NAT module applies it:
   only the in-code "is this unknown?" test moved out-of-band. `port
   no-translation` preserves the
   id just as it preserves a TCP/UDP source port. By default, pool address
-  selection is round-robin within the packet address family. With global source
+  selection is round-robin within the packet address family. For an
+  address-only flow (`port no-translation` / a port-less protocol) the
+  round-robin selection **probes the whole pool from its round-robin start**
+  (`reserve_address_only_roundrobin`), mirroring the port-translating
+  `allocate_translation` loop: if the chosen address's reverse identity
+  `(protocol, pool_addr, preserved id, remote)` is already owned by a different
+  flow for this remote, it rotates to the next pool address and mints the token
+  on the FIRST free sibling, failing as exhaustion **only** when every pool
+  address collides. Before #6226 the address-only branch single-probed one
+  round-robin address and falsely returned exhaustion (→ drop) the moment that
+  one address collided, even though a sibling address was free for the same
+  remote — the shared round-robin counter is oblivious to per-remote occupancy,
+  so any unrelated flow advancing it could land a later flow on an owned
+  address. An `address-persistent` pool keeps its single-probe contract (the
+  sticky address is intentional, not round-robin); the deterministic-CGNAT
+  (#5341) and address-only persistent-NAT (#6041) branches likewise single-probe
+  their chosen address. With global source
   NAT `address-persistent`, the userspace dataplane hashes a domain-tag seed,
   address family, and canonical source IP bytes with a seeded non-cryptographic
   FxHash (`rustc_hash`) to choose a stable pool index (userspace-v2; #2349

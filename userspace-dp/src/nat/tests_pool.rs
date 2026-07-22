@@ -1021,6 +1021,82 @@ fn pool_snat_no_translation_two_address_pool_both_succeed_5269() {
     );
 }
 
+// #6226 FAIL-ON-REVERT: the round-robin (non-deterministic, non-persistent)
+// address-only branch must probe the WHOLE pool, not single-probe one
+// round-robin-chosen address. A 2-address pool [A1,A2], port-less GRE
+// (address-only), non-persistent. F1 (S1->R) takes A1 and owns the reverse
+// identity (GRE,A1,-,R). F2 (S2->R2, a DIFFERENT remote) advances the SHARED
+// round-robin counter so F3 rolls back onto A1. F3 (S3->R, the SAME remote as
+// F1) would COLLIDE on A1's reverse identity — but A2 is FREE for remote R, so
+// the round-robin loop must place F3 on the free sibling A2 rather than dropping
+// it. The shared counter is oblivious to per-remote occupancy, so an unrelated
+// flow (F2) advancing it trivially lands F3 on an already-owned address — the
+// #6226 false-exhaustion.
+//
+// Reverting to the single-probe `reserve_address_only(flow, pool_addr)` makes F3
+// return `Unavailable(AllocatorExhausted)` -> `expect_snat_decision` panics ->
+// RED. This is adjacent to but distinct from the deterministic-CGNAT (#5341) and
+// address-only persistent-NAT (#6041) branches, which correctly single-probe.
+#[test]
+fn address_only_roundrobin_probes_free_sibling_5341adjacent_6226() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-rr".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string(), "203.0.113.2/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    let a1: IpAddr = "203.0.113.1".parse().unwrap();
+    let a2: IpAddr = "203.0.113.2".parse().unwrap();
+
+    // F1: GRE S1 (10.0.1.100) -> R (8.8.8.8). Round-robin counter 0 -> A1; owns
+    // the reverse identity (GRE, A1, port-less, 8.8.8.8).
+    let d1 = expect_snat_decision(addr_only_lookup(
+        &rules, "10.0.1.100", 0, "8.8.8.8", 0, PROTO_GRE,
+    ));
+    assert_eq!(d1.rewrite_src, Some(a1), "F1 takes the first pool address A1");
+    assert_eq!(d1.rewrite_src_port, None, "port-less GRE preserves the wire port");
+
+    // F2: GRE S2 (10.0.1.101) -> R2 (9.9.9.9), a DIFFERENT remote. Its sole job is
+    // to advance the SHARED round-robin counter (1 -> 2) so F3 rolls back onto A1.
+    // Distinct remote -> distinct identity -> admitted on A2 without colliding.
+    let d2 = expect_snat_decision(addr_only_lookup(
+        &rules, "10.0.1.101", 0, "9.9.9.9", 0, PROTO_GRE,
+    ));
+    assert_eq!(d2.rewrite_src, Some(a2), "F2 advances the counter onto A2");
+
+    // F3: GRE S3 (10.0.1.102) -> R (8.8.8.8), the SAME remote + port-less identity
+    // as F1. The round-robin counter (now 2, 2 % 2 == 0) points back at A1, whose
+    // reverse identity F1 already owns. The pre-#6226 single probe returns
+    // AllocatorExhausted here even though A2 is FREE for remote R; the fix probes
+    // the whole pool and maps F3 to the free sibling A2.
+    let d3 = expect_snat_decision(addr_only_lookup(
+        &rules, "10.0.1.102", 0, "8.8.8.8", 0, PROTO_GRE,
+    ));
+    assert_eq!(
+        d3.rewrite_src,
+        Some(a2),
+        "F3 must map to the FREE sibling A2, not exhaust on the owned A1",
+    );
+    assert_ne!(
+        d3.rewrite_src, d1.rewrite_src,
+        "F3 must not collide onto F1's address A1",
+    );
+    assert_eq!(d3.rewrite_src_port, None, "port-less GRE preserves the wire port");
+
+    // Three distinct live reverse identities, no false exhaustion, no pool port
+    // consumed (address-only tokens are off the port bitmap).
+    let owners = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(owners.len(), 3, "F1, F2, F3 each own a distinct reverse identity");
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 0);
+    assert_eq!(source_nat_pool_statuses(&rules)[0].live_flows, 3);
+}
+
 // ---------------------------------------------------------------------------
 // #6041: address-only ("port no-translation") PERSISTENT-NAT leases.
 //

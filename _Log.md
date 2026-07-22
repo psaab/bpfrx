@@ -1,3 +1,37 @@
+## 2026-07-21 — #6226: round-robin address-only SNAT probes the whole pool
+
+- **Timestamp**: 2026-07-21 (fix/6226-address-only-roundrobin)
+- **Action**: The non-deterministic, non-persistent address-only source-NAT
+  branch (`port no-translation` / port-less protocols) SINGLE-PROBED one
+  round-robin-chosen pool address and falsely returned `AllocatorExhausted`
+  (→ drop) on a reverse-tuple collision while sibling pool IPs were FREE for
+  that remote. The port-translating path (`allocate_translation`) already loops
+  over the whole pool; the address-only path lacked that loop. Added
+  `reserve_address_only_roundrobin` (allocator.rs, co-located with
+  `reserve_address_only`): loops `for offset in 0..(if address_persistent {1}
+  else {family_len})` from the round-robin start (`start_abs`, already resolved
+  via `address_index` so the shared counter advances exactly once per flow —
+  same as the old single probe), mints the reverse-identity token on the FIRST
+  address whose identity is free, and returns exhaustion ONLY when every pool
+  address collides. Swapped in at the two non-persistent address-only call sites
+  in source.rs (v4 + v6). The minted token is byte-identical to
+  `reserve_address_only`'s (`address_only = true`, `persistent_key = None`,
+  `addr_index = 0`, `translated = (chosen address, preserved id)`), so the SAME
+  `release_flow`/`rollback_flow` teardown frees it — no new leak, no new delete
+  site. Kept single-probe for `address-persistent` (sticky-by-source is
+  intended). Deterministic-CGNAT (#5341) and address-only persistent-NAT (#6041)
+  branches untouched.
+- **File(s)**: `userspace-dp/src/nat/allocator.rs`,
+  `userspace-dp/src/nat/source.rs`, `userspace-dp/src/nat/tests_pool.rs`,
+  `docs/userspace-dataplane-architecture.md`
+- **Validation**: `cargo build` clean; new fail-on-revert test
+  `address_only_roundrobin_probes_free_sibling_5341adjacent_6226` (2-address
+  pool [A1,A2], port-less GRE; F2 to a different remote advances the shared
+  round-robin counter so F3 rolls back onto the F1-owned A1; F3 must map to the
+  free sibling A2) PASSES with the fix and FAILS (`expect_snat_decision` panics
+  on `AllocatorExhausted`) when reverted to single-probe. Full `nat::` suite
+  green (265 tests), including all #5341 / #6041 / #5269 / address-persistent
+  tests.
 ## 2026-07-21 — #5156: conserve the shared non-exact CoS queue lease at init AND teardown
 
 - **Timestamp**: 2026-07-21 (fix/5156-cos-nonexact-lease-conservation)
