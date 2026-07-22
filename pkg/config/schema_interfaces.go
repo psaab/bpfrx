@@ -125,6 +125,13 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 		// `vlan-tags outer/inner` spelling is intentionally NOT a setSchema
 		// leaf (advertising an unsupported feature would mislead) — the same
 		// gate rejects it. Single 802.1Q tagging via vlan-id is supported.
+		//
+		// input-vlan-map / output-vlan-map (per-unit VLAN push/pop/swap
+		// rewrite) are likewise intentionally NOT setSchema leaves: xpf has
+		// no vlan-map consumer, so the rewrite never happens. They are
+		// HARD-REJECTED at commit by the #6178 honesty gate
+		// (validateVLANMapAST, compiler_interfaces_vlanmap.go) rather than
+		// advertised and silently dropped.
 		"inner-vlan-id": {
 			desc:          "Inner VLAN ID (QinQ; NOT enforced — rejected at commit, #2354)",
 			args:          1,

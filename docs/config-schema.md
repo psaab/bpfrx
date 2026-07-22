@@ -3784,6 +3784,29 @@ reserved for whole-dataplane selection where a rewrite shim
   Because rejection is a compile error, the candidate is never promoted — no
   partial outer/inner state survives. Regression coverage:
   `pkg/config/qinq_canonical_vlan_5879_test.go`.
+- **#6178 (input-vlan-map / output-vlan-map reject):** Junos
+  `input-vlan-map` / `output-vlan-map` under a logical unit request a VLAN
+  tag rewrite on ingress / egress — push a tag, pop a tag, or swap the tag
+  id (`push`, `pop`, `swap`, `push-push`, `swap-swap`, and the tag arguments
+  `vlan-id` / `tag-protocol-id` / `inner-vlan-id`). Neither spelling is in
+  the unit `setSchema` and neither has a compiler consumer, so the stanza
+  parse-accepted and was SILENTLY DROPPED: the AF_XDP dataplane performs no
+  rewrite and forwards the frame with its tags unchanged. Unlike the #5879
+  receive-side QinQ case this is NOT a firewall bypass (a single-tagged frame
+  still arrives single-tagged and IS firewalled — only the configured
+  push/pop/swap never happens), but a strict commit ACCEPTED a rewrite the
+  dataplane cannot perform, so the operator believed tags were being pushed /
+  swapped when they were not — a config-honesty gap. `validateVLANMapAST`
+  (`compiler_interfaces_vlanmap.go`) mirrors the #5879 doctrine exactly: it
+  runs PRE-expansion beside the QinQ gate, evaluates the effective view for
+  BOTH cluster nodes (node0 AND node1 `${node}`/apply-groups + interface-range
+  expansions) so a peer-only-group vlan-map is caught and the verdict is
+  HA-symmetric, and detects the stanza in both AST shapes. Strict on commit /
+  commit-check; downgraded to a warning on the tolerant load / peer-sync
+  paths (`lenientVLANMap`, #1960) so an older-binary-persisted or peer-synced
+  config that silently accepted the vlan-map still boots. Single 802.1Q
+  tagging via `vlan-id` stays fully supported. Regression coverage:
+  `pkg/config/vlanmap_honesty_6178_test.go`.
 - **#4027 (interface-range expansion):** `interfaces interface-range
   <name> { member <if>; [member-range <a> to <b>;] <shared cfg> }` is a
   Junos construct that applies a shared configuration block to a SET of

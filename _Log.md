@@ -1,3 +1,33 @@
+## 2026-07-21 — #6178: input-vlan-map / output-vlan-map honesty gate
+
+- **Timestamp**: 2026-07-21 (fix/6178-vlan-map-honesty-gate)
+- **Action**: `input-vlan-map` / `output-vlan-map` (per-unit VLAN tag
+  push/pop/swap rewrite) is not in the unit `setSchema` and has no compiler
+  consumer, so the stanza parse-accepted and was SILENTLY DROPPED — the
+  AF_XDP dataplane performs no rewrite and forwards the frame with its tags
+  unchanged. Not a firewall bypass (a single-tagged frame still arrives
+  single-tagged and IS firewalled, unlike the #5879 receive-side QinQ case),
+  but a config-honesty gap: a strict commit accepted a rewrite the dataplane
+  cannot perform. Added `validateVLANMapAST` (`compiler_interfaces_vlanmap.go`)
+  mirroring the #5879 `validateQinQVLANStackAST` doctrine exactly — runs
+  PRE-expansion beside the QinQ gate, evaluates BOTH cluster-node effective
+  views (node0 + node1 `${node}`/apply-groups + interface-range expansions) so
+  a peer-only-group vlan-map is caught and the verdict is HA-symmetric, detects
+  the stanza in both AST shapes via `unitVLANMapStmts`, reuses `renderVLANStmt`.
+  Strict (commit / commit-check) hard-rejects naming interface+unit+statement;
+  lenient (`lenientVLANMap`, tolerant load / peer-sync) warns (#1960 no-brick).
+  Wired both compile entrypoints (call + warning-append), added the
+  `lenientVLANMap` opt (set true in both tolerant-load option blocks).
+- **File(s)**: `pkg/config/compiler_interfaces_vlanmap.go` (new),
+  `pkg/config/compiler.go` (opt + 2 call sites + 2 warning appends),
+  `pkg/config/schema_interfaces.go` (schema note),
+  `pkg/config/vlanmap_honesty_6178_test.go` (new),
+  `docs/config-schema.md`, `docs/feature-gaps.md`
+- **Validation**: `go build ./...` clean; `go test ./pkg/config/ -run
+  TestVLANMap -v` 3/3 pass; full `pkg/config` + `pkg/configstore` suites green.
+  Fail-on-revert verified: neutralizing `validateVLANMapAST` turns all three
+  tests RED as clean assertion failures (strict reject → nil error, lenient
+  warn → empty).
 ## 2026-07-22 — #5608: IPv6 TCP-segmentation clamp coverage (test-only)
 
 - **Timestamp**: 2026-07-22 (test/5608-ipv6-segmentation-coverage)
