@@ -56147,3 +56147,19 @@ top.
   green.
   **File(s)**: pkg/vrrp/instance.go,
   pkg/vrrp/instance_v6_lladdr_advert_5089_test.go, pkg/vrrp/README.md
+
+### 2026-07-22 — #5390 three-color policer lock-free meter
+- **Timestamp**: 2026-07-22
+- **Action**: Eliminated the per-packet cross-worker `Mutex` in the three-color
+  policer meter. `ThreeColorPolicerState` split into an immutable
+  `ThreeColorPolicerConfig` + a `#[repr(align(64))]` `ThreeColorPolicerHot`
+  (both token buckets packed in one `AtomicU64`, per-rate `last_refill_ns`
+  atomics). `meter(&self)` refills via win-the-window timestamp CAS and consumes
+  via bounded `compare_exchange_weak` — no futex. Runtime wrapper drops its
+  `Mutex`; shape reads (`reusable_for`/`status`) are now lock-free. Exact
+  aggregate CIR/PIR/CBS/PBS preserved (shared bucket, byte-granular, sub-byte
+  dust carried by timestamp rewind). Fail-on-revert: source-guard +
+  concurrency test (firsthand RED-on-revert verified: source-guard asserts
+  when the Mutex is re-added).
+- **File(s)**: userspace-dp/src/filter/policer.rs,
+  userspace-dp/src/filter/mod.rs, userspace-dp/src/filter/README.md
