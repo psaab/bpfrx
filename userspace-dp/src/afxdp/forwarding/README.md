@@ -14,9 +14,26 @@ slow-path-injected.
 
 ## Files
 
+The forwarding stage was split from a single ~2800-LOC `mod.rs` into
+cohesive submodules by fused responsibility (#5650). The split is pure
+code-motion — functions moved verbatim, visibility preserved
+(`pub(in crate::afxdp)`), `#[inline]` attributes kept exactly — and
+`mod.rs` glob-re-exports every submodule (`pub(in crate::afxdp) use
+<m>::*`), so every external call site (`crate::afxdp::forwarding::…`,
+`use self::forwarding::*`) resolves unchanged.
+
 | File | Purpose |
 |------|---------|
-| `mod.rs` | `classify_metadata` + the FIB / next-hop traversal entry points. |
+| `mod.rs` | Submodule wiring + re-exports, and the small zone-pair / DNS-reply / ICMP-echo / ingress-logical-ifindex helpers (`zone_pair_for_flow*`, `zone_pair_ids_for_flow*`, `allow_unsolicited_dns_reply`, `is_icmp_echo_request`, `resolve_ingress_logical_ifindex`). |
+| `fib.rs` | Core FIB resolution hot path: `classify_metadata`, `canonical_route_table`, packet-destination parse, the `lookup_forwarding_resolution*` table / next-table walk, per-family v4/v6 resolution + `_inner` helpers, ECMP hashing (`ecmp_hash_*`), route choice (`choose_v4_route`/`choose_v6_route`, `ResolvedRouteV4/V6`), `select_route_next_hop`, `tunnel_next_hop_live`, `no_route_resolution`, and the `DEFAULT_V4_TABLE`/`DEFAULT_V6_TABLE`/`MAX_NEXT_TABLE_DEPTH` constants. |
+| `fabric.rs` | Fabric cross-chassis forwarding: link resolution/skip classification (`build_fabric_link_or_skip`, `resolve_fabric_links_from_snapshots`, the skip counters), fabric-redirect selection (`resolve_fabric_redirect*`, zone-encoded variants), `redirect_via_fabric_if_needed`, `prefer_local_forward_candidate_for_fabric_ingress`, the HA `cluster_peer_return_fast_path`, and the shared kernel-neighbor-state classifier (`classify_neighbor_state`, `neighbor_state_usable`, `NeighborStateClass`). |
+| `nat.rs` | Source-NAT flow matching (`nat_scope_ctx_for_flow`, `match_source_nat_for_flow*`) and interface-NAT local resolution (`interface_nat_local_resolution*`, `should_block_tunnel_interface_nat_session_miss`). |
+| `ha.rs` | HA redundancy-group resolution enforcement (`enforce_ha_resolution*`, `cached_flow_decision_valid`, `finalize_new_flow_ha_resolution`), owner-RG attribution (`owner_rg_for_flow`, `owner_rg_for_resolution`), and demoted/activated owner-RG set diffs. |
+| `mss.rs` | TCP MSS clamp + tunnel/GRE outer-MTU derivation (`effective_tcp_mss`, `native_gre_*`, `tunnel_outer_mtu`, `tunnel_tcp_mss`, `select_tcp_mss`). |
+| `ipsec.rs` | IPsec traffic classification + inbound admission (`is_ipsec_traffic` (`#[inline]`), `IpsecAdmissionClass`, `classify_ipsec_admission`). |
+| `pbr.rs` | Policy-based routing: `ingress_route_table_override` and its `PbrRejectSink` / `RouteOverride` support types. |
+| `local_delivery.rs` | Host-local delivery session caching on session-miss (`should_cache_local_delivery_session_on_miss`, `install_helper_local_session_on_miss`, `ingress_interface_local_resolution*`, the `LOCAL_DELIVERY_IFINDEX0` counter). |
+| `tunnel.rs` | Tunnel outer-header forwarding resolution (`resolve_tunnel_outer`, `resolve_tunnel_forwarding_resolution`, `outer_neighbor_ifindex`) and neighbor-entry lookup/parse (`lookup_neighbor_entry`, `parse_neighbor_entries`). |
 | `host_inbound.rs` | #3070 host-inbound-traffic admission: classifies a zone's Junos `system-services` / `protocols` tokens into a `ZoneHostInbound` set and provides `host_inbound_admits` for the local-delivery path. |
 | `tests.rs` | Co-located unit tests covering classify, FIB lookup, multi-table next-table leaking. |
 
