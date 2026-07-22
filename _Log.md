@@ -56686,3 +56686,114 @@ top.
   pkg/cluster/sync_conn_sweep.go, pkg/cluster/sync_conn_write.go,
   pkg/cluster/sync_conn_config.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/README.md
+## 2026-07-22 — #6247 afxdp/ha.rs ownership split (pure code-motion)
+- **Timestamp**: 2026-07-22
+- **Action**: Split the 1035-line `userspace-dp/src/afxdp/ha.rs` HA control
+  module into a `ha/` directory with four cohesive owner submodules
+  (byte-exact code motion, no logic/signature/ordering change). Preserves
+  the ordered-import invariant, export/tunnel-purge lock phasing, and the
+  RG-epoch-before-runtime publication ordering. 5 incremental commits, each
+  builds; branch `refactor/6247-afxdp-ha-split`.
+    - `ha/state.rs`   — update_ha_state, handle_activated_rgs, ha_groups,
+      last_cache_flush_at
+    - `ha/export.rs`  — kick_owner_rg_export, snapshot_all_sessions_export,
+      AllSessionsExport / OwnerRgExportWait handle types,
+      drain_session_deltas_from_live (widened private->pub(crate) so the
+      relocated characterization test can name it via the ha re-export)
+    - `ha/session_import.rs` — synced_import_cap, upsert_synced_session,
+      delete_synced_session[_gen], test_install_local_forward_session
+    - `ha/tunnel_purge.rs`   — purge_remapped_tunnel_sessions,
+      push_purge_close_deltas
+    - `ha/mod.rs` — narrow facade: submodule decls, pub(crate) re-exports of
+      the export handle types (afxdp/mod.rs `self::ha::OwnerRgExportWait` /
+      `AllSessionsExport` resolve unchanged), cfg(test) drain re-export, and
+      the `#[path="../ha_tests.rs"]` test include. Retains a documented
+      `#[allow(unused_imports)] use super::*` so the ha_tests child module's
+      `use super::*` resolves the afxdp namespace exactly as before.
+  Verbatim verified: non-blank code-line multiset identical to the original
+  (0 missing; only 4 extra structural `}` for the 4 new impl blocks).
+  #[inline]/#[cold]: 0 in original, 0 lost. mod.rs prod-LOC 1035 -> 21.
+- **File(s)**: userspace-dp/src/afxdp/ha/{mod,state,export,session_import,
+  tunnel_purge}.rs (new), userspace-dp/src/afxdp/ha.rs (removed),
+  userspace-dp/src/afxdp/mod.rs (drop stale #[path]),
+  docs/fabric-cross-chassis-fwd.md, docs/session-sync-architecture.md
+  (live-doc path references afxdp/ha.rs -> new submodule paths).
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 pure code-motion split of event_stream/mod.rs — extract
+  wall-clock conversion into event_stream/clock.rs (NS_PER_SEC +
+  read_mono_and_wall_clocks + monotonic_ns_to_unix_ns/_secs/_secs_subnanos +
+  mono_ns_to_wall_clock_unix_ns, verbatim). mod.rs re-exports the pub(crate)
+  clock fns so callers (afxdp/event_emit.rs, tests) resolve unchanged. Build
+  green.
+- **File(s)**: userspace-dp/src/event_stream/clock.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract WriteBacklog + WRITE_BACKLOG_MAX_BYTES into
+  event_stream/backlog.rs (verbatim, cursor-backed geometric-compaction backlog,
+  #[inline] preserved on pending_len/is_empty/pending/compact_if_needed). Struct,
+  methods, and compacted_bytes test field widened private->pub(super) so callers
+  (mod.rs connected loop/drain, write_backlog tests) resolve unchanged. mod.rs
+  re-imports both names. Build green.
+- **File(s)**: userspace-dp/src/event_stream/backlog.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract release_dataplane_event_queue_budget into
+  event_stream/budget.rs (verbatim; the I/O-thread queue-budget RETIREMENT side,
+  paired with producer.rs admission). Widened private->pub(super); mod.rs
+  re-imports it. Build green.
+- **File(s)**: userspace-dp/src/event_stream/budget.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract replay-buffer admission/eviction/retirement
+  (push_replay_frame, evict_replay_frame, pop_replay_frame,
+  release_replay_dataplane_event_queue_budget) into event_stream/replay.rs
+  (verbatim). Widened the three cross-module fns to pub(super); evict stays
+  private (only push calls it). Build green.
+- **File(s)**: userspace-dp/src/event_stream/replay.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract channel-drain mechanics (DrainOutcome,
+  drain_channel_into_write_buf, flush_pending_resync, drain_remaining) into
+  event_stream/drain.rs (verbatim, WRITE_BACKLOG_MAX_BYTES cap enforced there).
+  Widened to pub(super) incl DrainOutcome fields (tests assert them).
+  Consolidated mod.rs internal re-exports under #[allow(unused_imports)] (many
+  now serve only siblings/tests via `use super::*`). Build green.
+- **File(s)**: userspace-dp/src/event_stream/drain.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract control-frame decode + drain/resync state
+  machine (process_control_frames, handle_drain_request) into
+  event_stream/control.rs (verbatim; ACK-window #2959, Pause/Resume, DrainRequest
+  #2876/#2882/#2875). Widened to pub(super); MSG_*/FRAME_HEADER_SIZE codec
+  re-imports annotated (now serve siblings/tests). Build green.
+- **File(s)**: userspace-dp/src/event_stream/control.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract the I/O thread (io_thread_main, try_connect,
+  replay_buffered, write_all_backpressured, run_connected_loop) into
+  event_stream/connection.rs (verbatim; reconnect + replay + backpressured
+  connected loop). Widened cross-module fns to pub(super); try_connect stays
+  private. Removed orphaned I/O-thread section comment; annotated the now
+  submodule-only std imports (VecDeque/io/UnixStream/TryRecvError). Build green.
+- **File(s)**: userspace-dp/src/event_stream/connection.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract RT_FLOW SESSION_CLOSE/CREATE projection
+  methods (emit_session_close_rt_flow, emit_session_create_rt_flow) into
+  event_stream/rt_flow.rs as a second impl EventStreamWorkerHandle block
+  (verbatim, pub(crate) methods unchanged). Made NS_PER_SEC pub(super) +
+  re-imported (rt_flow tests consume it via super::*). Removed orphan section
+  comment. Updated event_stream/README.md Files section for the new submodule
+  layout. Full cargo test --release: 4214 passed, 0 failed, 2 ignored. mod.rs
+  down to 733 lines (from 2001); all 4 #[inline] preserved, 0 #[cold].
+- **File(s)**: userspace-dp/src/event_stream/rt_flow.rs (new),
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/clock.rs,
+  userspace-dp/src/event_stream/README.md
