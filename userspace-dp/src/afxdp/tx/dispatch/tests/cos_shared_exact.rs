@@ -166,3 +166,53 @@ fn shared_exact_policy_handles_unknown_queue() {
         "an unknown egress_ifindex must not be reported as shared_exact policy"
     );
 }
+
+#[test]
+fn cos_owner_live_for_request_borrows_map_owned_arc() {
+    // #4972: `cos_owner_live_for_request` now returns a *borrow* of the
+    // map-owned owner `Arc` rather than a per-eligible-packet clone. Both
+    // callers only need a reference — `enqueue_local_request_to_target_or_
+    // owner` for an `Arc::ptr_eq` + `enqueue_tx_owned(&self)`, and the
+    // in-place-rewrite `owner_matches_target` gate for a bare `Arc::ptr_eq`.
+    // The borrow-vs-clone distinction is a compile-time guarantee (the
+    // return type is `Option<&Arc<..>>`); this test pins the *contract*
+    // those callers depend on: the returned reference identifies the exact
+    // `Arc` stored in the fast-path table (ptr-eq true), so the routing
+    // decision is byte-identical to the pre-#4972 owned-clone behavior.
+    use crate::afxdp::tx::test_support::{test_cos_fast_interfaces, test_queue_fast_path};
+
+    let owner_live = Arc::new(BindingLiveState::new());
+    let other_live = Arc::new(BindingLiveState::new());
+    let ifaces = test_cos_fast_interfaces(
+        80,
+        11,
+        4,
+        vec![
+            (
+                4,
+                test_queue_fast_path(false, 7, Some(owner_live.clone()), None),
+            ),
+            (5, test_queue_fast_path(false, 7, None, None)),
+        ],
+        None,
+        None,
+    );
+
+    // Queue 4 has an owner: the returned reference is ptr-eq to the exact
+    // Arc held in the map (same allocation), not a distinct one.
+    let got = cos_owner_live_for_request(&ifaces, 80, Some(4)).expect("owner present");
+    assert!(
+        Arc::ptr_eq(got, &owner_live),
+        "must reference the map-owned owner Arc"
+    );
+    assert!(
+        !Arc::ptr_eq(got, &other_live),
+        "must not reference an unrelated Arc"
+    );
+
+    // Queue 5 has no owner: None (request funnels / stays local).
+    assert!(cos_owner_live_for_request(&ifaces, 80, Some(5)).is_none());
+    // Unknown queue id and unknown egress ifindex: None.
+    assert!(cos_owner_live_for_request(&ifaces, 80, Some(42)).is_none());
+    assert!(cos_owner_live_for_request(&ifaces, 999, Some(4)).is_none());
+}

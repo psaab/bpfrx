@@ -742,7 +742,6 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                     request.decision.resolution.egress_ifindex,
                     request.cos_queue_id,
                 )
-                .as_ref()
                 .is_none_or(|live| Arc::ptr_eq(live, &target_binding.live));
 
                 /*
