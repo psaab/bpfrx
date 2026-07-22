@@ -56636,3 +56636,13 @@ top.
   private (only push calls it). Build green.
 - **File(s)**: userspace-dp/src/event_stream/replay.rs (new),
   userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract channel-drain mechanics (DrainOutcome,
+  drain_channel_into_write_buf, flush_pending_resync, drain_remaining) into
+  event_stream/drain.rs (verbatim, WRITE_BACKLOG_MAX_BYTES cap enforced there).
+  Widened to pub(super) incl DrainOutcome fields (tests assert them).
+  Consolidated mod.rs internal re-exports under #[allow(unused_imports)] (many
+  now serve only siblings/tests via `use super::*`). Build green.
+- **File(s)**: userspace-dp/src/event_stream/drain.rs (new),
+  userspace-dp/src/event_stream/mod.rs
