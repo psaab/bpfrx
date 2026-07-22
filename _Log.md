@@ -56148,6 +56148,29 @@ top.
   **File(s)**: pkg/vrrp/instance.go,
   pkg/vrrp/instance_v6_lladdr_advert_5089_test.go, pkg/vrrp/README.md
 
+- **Timestamp**: 2026-07-22
+  **Action**: #5292 — WG transit-egress: resolve outer L2/VLAN against the
+  SELECTED peer, not the zeroed endpoint. `wg_encap_frame` took the outer dst
+  MAC / src MAC / VLAN from `decision.resolution`, which is resolved against the
+  WG endpoint's ZEROED destination (`0.0.0.0`/`::`) BEFORE the AllowedIPs peer
+  selection — so the L2/VLAN was either NoRoute (no neighbor/src/VLAN → the
+  encap `?`-drops → blackhole) or the WRONG default route's adjacency, while the
+  outer IP source already correctly followed the peer (#2701). Fix: derive the
+  outer L2 (dst MAC / src MAC / VLAN) from the SAME single physical-egress
+  resolution used for the MTU + source (`outer_physical_egress_resolution`,
+  factored out of `outer_physical_egress_ifindex` so #3992's one-FIB-LPM-per-
+  packet invariant holds). `src_mac`/VLAN come from the resolved physical egress
+  row; the outer neighbor MAC comes from the peer route's resolution, falling
+  back to `decision.resolution.neighbor_mac` only when the underlay hop is not
+  yet statically resolved (common single-underlay case). The non-route/connected
+  WG paths are unchanged. Corrected 4 existing tests that encoded the buggy
+  UNTAGGED outer (the frame now correctly carries reth0.80's VLAN 80). Added
+  RED-on-revert tests `wg_encap_outer_l2_vlan_follows_selected_peer_not_zeroed_decision`
+  and `wg_encap_builds_when_zeroed_decision_has_no_l2` (firsthand-verified RED).
+  Full `cargo test --release` green (4098 + 60 + 22 + 8 + 1).
+  **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs,
+  userspace-dp/src/afxdp/frame/README.md, docs/wireguard-interop.md
 ### 2026-07-22 — #5390 three-color policer lock-free meter
 - **Timestamp**: 2026-07-22
 - **Action**: Eliminated the per-packet cross-worker `Mutex` in the three-color

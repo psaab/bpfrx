@@ -557,11 +557,21 @@ fn wg_encap_frame_sources_outer_from_physical_wan_primary_v4() {
     let out = wg_encap_frame(&frame, inner_v4_meta(), &decision, &state)
         .expect("wg_encap_frame must build (established session, routed peer)");
 
-    // Outer layout: eth(14) + IPv4(20). The IPv4 source is at bytes
-    // 14+12 ..= 14+15. The fix sources it from the PHYSICAL WAN primary
-    // (172.16.80.8). Reverting the call-site source lookup to the LOGICAL
-    // egress_ifindex (400) would write the tunnel address 10.123.0.1 → red.
-    let outer_src = &out[26..30];
+    // #5292: the outer now correctly carries reth0.80's VLAN 80 tag (the
+    // physical egress the peer routes out of), so the layout is
+    // eth(18, 802.1Q) + IPv4(20). Pre-#5292 the frame was emitted UNTAGGED
+    // (VLAN read from the zeroed-endpoint `decision.resolution`, VID 0) — that
+    // was the bug. The IPv4 source is at bytes 18+12 ..= 18+15 and is sourced
+    // from the PHYSICAL WAN primary (172.16.80.8). Reverting the call-site
+    // source lookup to the LOGICAL egress_ifindex (400) would write the tunnel
+    // address 10.123.0.1 → red.
+    assert_eq!(&out[12..14], &[0x81, 0x00], "outer must carry reth0.80's 802.1Q tag");
+    assert_eq!(
+        u16::from_be_bytes([out[14], out[15]]) & 0x0fff,
+        80,
+        "outer VLAN must be reth0.80's VID 80 (the peer's physical egress)"
+    );
+    let outer_src = &out[30..34];
     assert_eq!(
         outer_src,
         &[172, 16, 80, 8],
@@ -571,7 +581,7 @@ fn wg_encap_frame_sources_outer_from_physical_wan_primary_v4() {
     // Sanity: it is NOT the logical tunnel address.
     assert_ne!(outer_src, &[10, 123, 0, 1], "outer source must not be the tunnel addr");
     // And the destination is the peer endpoint (203.0.113.7).
-    assert_eq!(&out[30..34], &[203, 0, 113, 7], "outer dst is the peer endpoint");
+    assert_eq!(&out[34..38], &[203, 0, 113, 7], "outer dst is the peer endpoint");
 }
 
 #[test]
@@ -606,21 +616,146 @@ fn wg_encap_frame_resolves_outer_route_once_v4() {
 
     // Byte-identity of the outer header: the single-lookup dedup does NOT
     // change WHICH route is chosen, so the emitted outer L2/L3 header is
-    // unchanged. Layout: eth(14) + IPv4(20); dst/src MAC in the eth header,
-    // outer src @ 26..30, outer dst @ 30..34, outer UDP dst port @ 36..38.
+    // stable. #5292: the outer now carries reth0.80's VLAN 80 tag, so the
+    // layout is eth(18, 802.1Q) + IPv4(20); dst/src MAC in the eth header,
+    // TPID @ 12..14, TCI @ 14..16, ethertype @ 16..18, outer src @ 30..34,
+    // outer dst @ 34..38, outer UDP dst port @ 40..42.
     assert_eq!(&out[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55], "outer dst MAC unchanged");
     assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08], "outer src MAC unchanged");
-    assert_eq!(&out[12..14], &[0x08, 0x00], "outer ethertype IPv4 unchanged");
+    assert_eq!(&out[12..14], &[0x81, 0x00], "outer 802.1Q TPID");
     assert_eq!(
-        &out[26..30],
+        u16::from_be_bytes([out[14], out[15]]) & 0x0fff,
+        80,
+        "outer VLAN = reth0.80 VID 80"
+    );
+    assert_eq!(&out[16..18], &[0x08, 0x00], "outer ethertype IPv4");
+    assert_eq!(
+        &out[30..34],
         &[172, 16, 80, 8],
         "outer IPv4 source = PHYSICAL WAN primary (unchanged by the dedup)"
     );
-    assert_eq!(&out[30..34], &[203, 0, 113, 7], "outer IPv4 dst = peer endpoint (unchanged)");
+    assert_eq!(&out[34..38], &[203, 0, 113, 7], "outer IPv4 dst = peer endpoint (unchanged)");
     assert_eq!(
-        &out[36..38],
+        &out[40..42],
         &51820u16.to_be_bytes(),
         "outer UDP dst port = peer endpoint port (unchanged)"
+    );
+}
+
+// === #5292: the outer L2/VLAN must follow the SELECTED peer's physical
+// egress, NOT `decision.resolution` (resolved against the zeroed WG endpoint
+// destination `0.0.0.0`/`::`, which NoRoutes → blackhole, or matches the WRONG
+// default route's adjacency). The outer IP SOURCE already follows the peer
+// (#2701); before #5292 the L2 (dst/src MAC) and VLAN were taken from
+// `decision.resolution`, so a peer reached via a different underlay than the
+// default emitted an internally inconsistent frame (peer source IP on the
+// default route's L2/VLAN) or blackholed. ===
+
+/// A tunnel-resolved decision whose stored resolution carries the WRONG
+/// adjacency — mimicking the zeroed-endpoint admission resolving against a
+/// default route on a DIFFERENT interface/VLAN: a bogus neighbor MAC, a bogus
+/// source MAC, and VLAN 50 (not reth0.80's VID 80), plus the LOGICAL wg
+/// egress_ifindex the resolver actually stores.
+fn wg_decision_with_wrong_default_adjacency() -> SessionDecision {
+    let mut d = wg_tunnel_decision(400, 1);
+    d.resolution.disposition = ForwardingDisposition::ForwardCandidate;
+    d.resolution.neighbor_mac = Some([0xde, 0xad, 0xde, 0xad, 0xde, 0xad]);
+    d.resolution.src_mac = Some([0xba, 0xd0, 0xba, 0xd0, 0xba, 0xd0]);
+    d.resolution.tx_vlan_id = 50;
+    d
+}
+
+#[test]
+fn wg_encap_outer_l2_vlan_follows_selected_peer_not_zeroed_decision() {
+    // #5292 RED-on-revert: the emitted outer dst MAC, src MAC, and VLAN must
+    // come from the SELECTED peer's physical egress (reth0.80, ifindex 12: src
+    // MAC 02:bf:72:00:50:08, VLAN 80, next-hop 172.16.80.1), NOT the wrong
+    // default-route adjacency stored on `decision.resolution`. Reverting any of
+    // dst_mac/src_mac/vlan back to `decision.resolution` fails this red.
+    let mut state = build_forwarding_state(&wg_outer_mtu_snapshot());
+    let peer_ep: std::net::SocketAddr = "203.0.113.7:51820".parse().unwrap();
+    state
+        .wg_engines
+        .insert(1, Arc::new(established_initiator_engine(peer_ep, "10.123.0.0/24")));
+    // Static neighbor for the peer's outer next-hop so the outer route resolves
+    // a real dst MAC (distinct from the wrong decision.resolution neighbor).
+    const PEER_NEXTHOP_MAC: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    state.neighbors.insert(
+        (12, IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 80, 1))),
+        crate::afxdp::types::NeighborEntry { mac: PEER_NEXTHOP_MAC },
+    );
+
+    let decision = wg_decision_with_wrong_default_adjacency();
+    let out = wg_encap_frame(&inner_v4_frame(), inner_v4_meta(), &decision, &state)
+        .expect("wg_encap_frame must build against the SELECTED peer's underlay");
+
+    // Outer eth (802.1Q): dst[0..6], src[6..12], TPID[12..14]=0x8100,
+    // TCI[14..16] (VID low 12 bits), ethertype[16..18].
+    assert_eq!(
+        &out[0..6], &PEER_NEXTHOP_MAC,
+        "outer dst MAC must be the SELECTED peer's outer next-hop neighbor, \
+         not the zeroed-endpoint decision's default neighbor (de:ad:..)"
+    );
+    assert_eq!(
+        &out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08],
+        "outer src MAC must be the peer's physical egress reth0.80, not the \
+         decision's default-route src MAC (ba:d0:..)"
+    );
+    assert_eq!(&out[12..14], &[0x81, 0x00], "outer must be 802.1Q VLAN-tagged");
+    assert_eq!(
+        u16::from_be_bytes([out[14], out[15]]) & 0x0fff,
+        80,
+        "outer VLAN must be the peer's physical egress VID 80 (reth0.80), not \
+         the decision's wrong VLAN 50"
+    );
+    assert_eq!(&out[16..18], &[0x08, 0x00], "outer ethertype IPv4");
+    // The outer IP source + dst prove the L2/VLAN and L3 are now consistent:
+    // same physical egress (172.16.80.8) toward the same peer (203.0.113.7).
+    assert_eq!(&out[30..34], &[172, 16, 80, 8], "outer IPv4 source = physical WAN primary");
+    assert_eq!(&out[34..38], &[203, 0, 113, 7], "outer IPv4 dst = peer endpoint");
+}
+
+#[test]
+fn wg_encap_builds_when_zeroed_decision_has_no_l2() {
+    // #5292 RED-on-revert (the NoRoute-blackhole leg): even when the stored
+    // `decision.resolution` carries NO usable L2 (neighbor_mac = None,
+    // src_mac = None, VLAN 0 — exactly what the zeroed-endpoint admission
+    // produces when 0.0.0.0/:: has no default route), the builder must still
+    // resolve the peer's underlay and emit a valid frame — NOT drop. Pre-#5292
+    // `decision.resolution.neighbor_mac?` / `src_mac?` short-circuited to None
+    // (drop) — the blackhole. Reverting reintroduces the drop → `.expect()`
+    // panics → red.
+    let mut state = build_forwarding_state(&wg_outer_mtu_snapshot());
+    let peer_ep: std::net::SocketAddr = "203.0.113.7:51820".parse().unwrap();
+    state
+        .wg_engines
+        .insert(1, Arc::new(established_initiator_engine(peer_ep, "10.123.0.0/24")));
+    const PEER_NEXTHOP_MAC: [u8; 6] = [0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f];
+    state.neighbors.insert(
+        (12, IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 80, 1))),
+        crate::afxdp::types::NeighborEntry { mac: PEER_NEXTHOP_MAC },
+    );
+
+    // The blackhole shape: the admit-time resolution NoRoute'd the zeroed
+    // endpoint, so it carries no L2 and the logical wg egress_ifindex.
+    let mut decision = wg_tunnel_decision(400, 1);
+    decision.resolution.disposition = ForwardingDisposition::ForwardCandidate;
+    decision.resolution.neighbor_mac = None;
+    decision.resolution.src_mac = None;
+    decision.resolution.tx_vlan_id = 0;
+
+    let out = wg_encap_frame(&inner_v4_frame(), inner_v4_meta(), &decision, &state)
+        .expect("wg_encap_frame must build against the peer even when the \
+                 zeroed-endpoint decision.resolution has no L2 (no blackhole)");
+
+    // The emitted L2/VLAN is the peer's physical egress, recovered entirely
+    // from the peer route (decision.resolution contributed nothing usable).
+    assert_eq!(&out[0..6], &PEER_NEXTHOP_MAC, "dst MAC recovered from the peer route");
+    assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08], "src MAC = reth0.80");
+    assert_eq!(
+        u16::from_be_bytes([out[14], out[15]]) & 0x0fff,
+        80,
+        "VLAN recovered from the peer's physical egress (VID 80)"
     );
 }
 
@@ -709,21 +844,29 @@ fn wg_encap_frame_sources_outer_from_physical_wan_primary_v6() {
     let out = wg_encap_frame(&frame, inner_v6_meta(), &decision, &state)
         .expect("wg_encap_frame must build a v6 outer (established session, routed peer)");
 
-    // Outer layout: eth(14) + IPv6(40). The IPv6 source is at bytes
-    // 14+8 ..= 14+23, i.e. out[22..38]. It must be the PHYSICAL WAN v6
-    // primary. Reverting the call-site lookup to the LOGICAL ifindex (400)
-    // would write the tunnel v6 address (fd00:dead::1) → red.
+    // #5292: the outer now carries reth0.80's VLAN 80 tag, so the layout is
+    // eth(18, 802.1Q) + IPv6(40). The IPv6 source is at bytes 18+8 ..= 18+23,
+    // i.e. out[26..42]. It must be the PHYSICAL WAN v6 primary. Reverting the
+    // call-site lookup to the LOGICAL ifindex (400) would write the tunnel v6
+    // address (fd00:dead::1) → red.
+    assert_eq!(&out[12..14], &[0x81, 0x00], "outer must carry reth0.80's 802.1Q tag");
+    assert_eq!(
+        u16::from_be_bytes([out[14], out[15]]) & 0x0fff,
+        80,
+        "outer VLAN must be reth0.80's VID 80"
+    );
+    assert_eq!(&out[16..18], &[0x86, 0xdd], "outer ethertype IPv6");
     let expected: std::net::Ipv6Addr = "2001:559:8585:80::8".parse().unwrap();
     let tunnel_addr: std::net::Ipv6Addr = "fd00:dead::1".parse().unwrap();
     assert_eq!(
-        &out[22..38],
+        &out[26..42],
         &expected.octets(),
         "outer IPv6 source must be the PHYSICAL WAN v6 primary, not the tunnel-logical address"
     );
-    assert_ne!(&out[22..38], &tunnel_addr.octets());
+    assert_ne!(&out[26..42], &tunnel_addr.octets());
     // Destination is the v6 peer endpoint.
     let dst: std::net::Ipv6Addr = "2001:db8:113::7".parse().unwrap();
-    assert_eq!(&out[38..54], &dst.octets(), "outer v6 dst is the peer endpoint");
+    assert_eq!(&out[42..58], &dst.octets(), "outer v6 dst is the peer endpoint");
 }
 
 #[test]
@@ -754,8 +897,9 @@ fn wg_encap_in_place_matches_separate_buffer() {
     let out = wg_encap_frame(&frame, inner_v4_meta(), &decision, &state)
         .expect("wg_encap_frame must build (established session, routed peer)");
 
-    // Outer framing: eth(14) + IPv4(20) + UDP(8) = 42-byte payload offset.
-    let payload_start = 14 + 20 + 8;
+    // Outer framing: #5292 tags reth0.80's VLAN 80, so eth(18, 802.1Q) +
+    // IPv4(20) + UDP(8) = 46-byte payload offset.
+    let payload_start = 18 + 20 + 8;
     // The WG record is the remainder of the frame. Its length must be the
     // exact pad-aware record size (header + pad_to_16(inner) + tag).
     let expected_record_len =
@@ -783,9 +927,11 @@ fn wg_encap_in_place_matches_separate_buffer() {
 
     // Outer total-length fields must agree with the truncated frame size
     // (the truncation math, not the max-sized scratch, drives the wire).
-    let ip_total = u16::from_be_bytes([out[16], out[17]]) as usize;
+    // IPv4 total-length @ 18+2..18+4 (eth 18 incl. VLAN tag); UDP length @
+    // 18+20+4..18+20+6.
+    let ip_total = u16::from_be_bytes([out[20], out[21]]) as usize;
     assert_eq!(ip_total, 20 + 8 + expected_record_len, "IPv4 total length tracks the real record");
-    let udp_len = u16::from_be_bytes([out[38], out[39]]) as usize;
+    let udp_len = u16::from_be_bytes([out[42], out[43]]) as usize;
     assert_eq!(udp_len, 8 + expected_record_len, "UDP length tracks the real record");
     assert_eq!(out.len(), payload_start + expected_record_len, "frame truncated to the real size");
 }

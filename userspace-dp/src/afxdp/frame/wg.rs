@@ -125,34 +125,65 @@ fn outer_physical_egress_ifindex(
     endpoint: &TunnelEndpoint,
     outer_dst: IpAddr,
 ) -> i32 {
-    // #3992: instrument the per-packet FIB-LPM count. `wg_encap_frame` must
-    // enter this helper exactly ONCE per encapped packet (the MTU guard and
-    // the outer-source lookup share the single resolution); a second entry per
-    // packet is the redundant lookup this fix removed.
+    // #3992: the outer underlay route is resolved ONCE per encapped packet
+    // (shared by the MTU guard, the outer source, AND — since #5292 — the
+    // outer L2/VLAN). `outer_physical_egress_resolution` performs the single
+    // FIB LPM and bumps the per-packet count; a second resolution per packet
+    // is the redundant lookup #3992 removed.
+    let outer = outer_physical_egress_resolution(forwarding, endpoint, outer_dst);
+    outer_egress_ifindex_or_fallback(decision, forwarding, &outer)
+}
+
+/// #5292: resolve the FULL outer underlay `ForwardingResolution` for a WG
+/// encap decision against its SELECTED peer endpoint. The WG endpoint-level
+/// `destination` is zeroed (`0.0.0.0`/`::`) at build time — the peer carries
+/// the real outer hop — so the outer egress, next-hop neighbor MAC, source,
+/// and VLAN MUST all follow the peer route, NOT the placeholder (which
+/// NoRoutes → blackhole, or matches the wrong default route). Returns the
+/// resolution verbatim; callers derive the egress ifindex via
+/// `outer_egress_ifindex_or_fallback` and read `neighbor_mac`/the egress row
+/// (`src_mac`/`vlan_id`) from the SAME snapshot, so the outer L2/VLAN, source,
+/// and MTU are all consistent with one physical egress.
+///
+/// Bumps `OUTER_ROUTE_RESOLVE_COUNT` exactly once — the #3992 single-FIB-LPM-
+/// per-packet invariant. `dynamic_neighbors` is `None`: the egress ifindex is
+/// ROUTE-derived (a missing underlay neighbor resolves to `MissingNeighbor`
+/// with the physical egress still populated), so the static forwarding state
+/// suffices to pick the egress; the neighbor MAC read by the encap path falls
+/// back to the session's stored neighbor when the underlay next-hop is not
+/// statically known (see `wg_encap_frame`).
+#[inline]
+fn outer_physical_egress_resolution(
+    forwarding: &ForwardingState,
+    endpoint: &TunnelEndpoint,
+    outer_dst: IpAddr,
+) -> ForwardingResolution {
     #[cfg(test)]
     OUTER_ROUTE_RESOLVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // #2734: WG outer underlay resolution is per-tunnel-endpoint, not
     // per-inner-flow — pass None (per-destination ECMP spread).
-    let outer = match outer_dst {
-        IpAddr::V4(ip) => lookup_forwarding_resolution_v4(
-            forwarding,
-            None,
-            ip,
-            &endpoint.transport_table,
-            1,
-            false,
-            None,
-        ),
-        IpAddr::V6(ip) => lookup_forwarding_resolution_v6(
-            forwarding,
-            None,
-            ip,
-            &endpoint.transport_table,
-            1,
-            false,
-            None,
-        ),
-    };
+    match outer_dst {
+        IpAddr::V4(ip) => {
+            lookup_forwarding_resolution_v4(forwarding, None, ip, &endpoint.transport_table, 1, false, None)
+        }
+        IpAddr::V6(ip) => {
+            lookup_forwarding_resolution_v6(forwarding, None, ip, &endpoint.transport_table, 1, false, None)
+        }
+    }
+}
+
+/// The physical underlay egress ifindex from a resolved outer resolution,
+/// with the conservative fallback to the decision's own `egress_ifindex` (the
+/// tunnel LOGICAL ifindex) when the peer endpoint is genuinely unrouted /
+/// non-positive / resolves onto a tunnel interface. See
+/// `outer_physical_egress_ifindex`'s doc for the full #2837 analysis of why
+/// the route-derived egress survives an unresolved (dynamic-learned) neighbor.
+#[inline]
+fn outer_egress_ifindex_or_fallback(
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    outer: &ForwardingResolution,
+) -> i32 {
     if outer.egress_ifindex > 0
         && outer.disposition != ForwardingDisposition::NoRoute
         && !forwarding.tunnel_interfaces.contains(&outer.egress_ifindex)
@@ -322,10 +353,6 @@ pub(super) fn wg_encap_frame(
         return None;
     }
     let engine = forwarding.wg_engines.get(&id)?;
-    let dst_mac = decision.resolution.neighbor_mac?;
-    let src_mac = decision.resolution.src_mac?;
-    let vlan_id = decision.resolution.tx_vlan_id;
-    let outer_eth_len = if vlan_id > 0 { 18 } else { 14 };
 
     // Extract the inner IP packet (strip L2).
     let inner_l3 = match frame_l3_offset(inner_frame) {
@@ -360,28 +387,54 @@ pub(super) fn wg_encap_frame(
     // outer frame adds eth + outer IP + UDP(8). Drop oversize rather than
     // letting the kernel fragment the outer datagram.
     //
-    // #2680/#2701/#3992: resolve the PHYSICAL underlay egress ONCE per packet
-    // (a single FIB LPM to the SELECTED peer endpoint — the real outer hop for
-    // WG) and reuse the result for BOTH the outer-MTU guard AND the outer IP
-    // SOURCE lookup below. The OUTER datagram must fit the PHYSICAL underlay
-    // egress MTU, NOT `decision.resolution.egress_ifindex` (the tunnel LOGICAL
-    // ifindex, MTU ~1420); the logical/inner MTU is a separate concern handled
-    // by the inner-MTU clamp.
+    // #2680/#2701/#3992/#5292: resolve the PHYSICAL underlay egress ONCE per
+    // packet (a single FIB LPM to the SELECTED peer endpoint — the real outer
+    // hop for WG) and derive the FULL outer identity from that ONE snapshot:
+    // the outer-MTU guard, the outer IP SOURCE, AND (since #5292) the outer L2
+    // header (dst MAC / src MAC / VLAN). The WG endpoint destination is zeroed
+    // (`0.0.0.0`/`::`) at build time, so `decision.resolution` — resolved
+    // against that placeholder BEFORE the AllowedIPs peer selection above — is
+    // either NoRoute (no L2 → blackhole) or the WRONG default route's adjacency
+    // (its neighbor MAC / src MAC / VLAN describe a different egress than the
+    // selected peer needs). The OUTER datagram must fit the PHYSICAL underlay
+    // MTU and carry the PHYSICAL egress L2/VLAN, NOT
+    // `decision.resolution.egress_ifindex` (the tunnel LOGICAL ifindex, MTU
+    // ~1420, tunnel-address L2); the logical/inner MTU is a separate concern
+    // handled by the inner-MTU clamp.
     //
-    // Pre-#3992 the identical route was resolved TWICE: once via
-    // `outer_physical_egress_mtu` here (for the MTU) and again via
-    // `outer_physical_egress_ifindex` at the source-write site below — same
-    // `peer_endpoint.ip()`, same `endpoint.transport_table`, so the two FIB
-    // LPMs always returned the same ifindex. The second lookup was pure
-    // redundant per-packet work on the encrypt hot path. Resolve once, thread
-    // the ifindex + egress row through. `outer_physical_egress_mtu` is still
-    // the SSOT used by the PTB path (`wg_endpoint_physical_outer_mtu`); here we
-    // inline its body against the single shared `egress` row so the guard MTU
-    // is byte-identical to what that helper would return for this ifindex.
+    // #3992: `outer_physical_egress_resolution` performs the single FIB LPM
+    // (pre-#3992 the identical route was resolved twice — MTU guard + source).
+    // `outer_physical_egress_mtu` remains the SSOT used by the PTB path
+    // (`wg_endpoint_physical_outer_mtu`); here we read the MTU straight off the
+    // single shared `egress` row so the guard MTU is byte-identical.
+    let outer_resolution =
+        outer_physical_egress_resolution(forwarding, endpoint, peer_endpoint.ip());
     let physical_egress_ifindex =
-        outer_physical_egress_ifindex(decision, forwarding, endpoint, peer_endpoint.ip());
+        outer_egress_ifindex_or_fallback(decision, forwarding, &outer_resolution);
     let egress = forwarding.egress.get(&physical_egress_ifindex);
     let outer_mtu = egress.map(|e| e.mtu).filter(|m| *m > 0).unwrap_or(1500);
+
+    // #5292: the outer L2 header follows the resolved PHYSICAL egress —
+    // internally consistent with the outer IP source (#2701) — NOT
+    // `decision.resolution`. `src_mac` + VLAN come straight from the physical
+    // egress row; the outer next-hop neighbor MAC comes from the peer route's
+    // resolution, falling back to the session's stored neighbor ONLY when the
+    // underlay next-hop is not yet statically resolved (e.g. a dynamic-learned
+    // hop shared with the default route — the common single-underlay case).
+    // Reverting any of these three to `decision.resolution` reintroduces the
+    // zeroed-endpoint blackhole / wrong-adjacency bug.
+    let src_mac = match egress {
+        Some(e) => e.src_mac,
+        None => decision.resolution.src_mac?,
+    };
+    let vlan_id = match egress {
+        Some(e) => e.vlan_id,
+        None => decision.resolution.tx_vlan_id,
+    };
+    let dst_mac = outer_resolution
+        .neighbor_mac
+        .or(decision.resolution.neighbor_mac)?;
+    let outer_eth_len = if vlan_id > 0 { 18 } else { 14 };
     let wg_record_len = WG_DATA_HEADER_LEN + pad_to_16(inner_packet.len()) + POLY1305_TAG_LEN;
     if wg_encapped_size(inner_packet.len(), outer_v6) > outer_mtu {
         // #1865: the promised "follow-up" counter store — same
