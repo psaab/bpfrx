@@ -86,10 +86,29 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   ingress `meta.addr_family` — a v6→v4 flow evaluates the v4 output
   filter against the v4 tuple. The pre-NAT `flow_key` is still stored on
   the pending request for CoS flow-bucket hashing / session glue, so the
-  hash bucketing is unchanged. (An input-filter forwarding-class /
-  three-color policer carried to the TX leg when NO output filter exists
-  is likewise evaluated on the wire key; this is a rare corner and the
-  policer meters the on-wire egress volume.)
+  hash bucketing is unchanged.
+
+  **The ingress INPUT filter re-walk keeps the PRE-NAT tuple (#5158).**
+  The post-NAT wire key above is correct ONLY for the egress OUTPUT
+  filter. The same `resolve_cos_tx_selection_*` call ALSO re-walks the
+  ingress interface input filter to pick up an input-filter
+  `then forwarding-class` / dscp-rewrite / three-color policer (the
+  `#hb166 T-3` leg, folded with `.or()` so an output-filter class still
+  wins). Junos applies input filters BEFORE NAT, so that re-walk must
+  match the ORIGINAL ingress tuple — feeding it the post-NAT wire key
+  made a NAT'd flow miss its ingress classification/policer entirely. The
+  transit callers that build a post-NAT `forward_wire_key`
+  (`afxdp/forward_request.rs`, `afxdp/neighbor_dispatch.rs`, the
+  `afxdp/flow_cache.rs` seed) therefore call the split entry points
+  `resolve_cos_tx_selection_at_prenat` /
+  `resolve_cached_cos_tx_selection_prenat`, passing the post-NAT wire key
+  as the egress/output key and the pre-NAT session `forward_key` as the
+  `ingress_flow_key`. The resolver evaluates the ingress input filter
+  (its family gate, interface-filter lookup, and 5-tuple) on the pre-NAT
+  key and the output filter + BA/queue selection on the post-NAT key. For
+  a non-NAT flow both keys are identical, so the single-key entry points
+  (`resolve_cos_tx_selection` / `_at`, `resolve_cached_cos_tx_selection`)
+  pass the same key for both stages — behaviour-preserving.
 
   **Fall-through terms (`then next term` / modifier-only) (#2544).**
   "First-match-wins" applies only to TERMINATING terms. A term whose

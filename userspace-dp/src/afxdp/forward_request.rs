@@ -203,8 +203,16 @@ pub(super) fn build_live_forward_request_from_frame(
     // The stored `PendingForwardRequest.flow_key` below stays the PRE-NAT key
     // (CoS flow-bucket hashing / session glue key it consistently with the
     // in-place fast path).
+    //
+    // #5158: the post-NAT wire key is CORRECT for the egress OUTPUT filter, but
+    // the ingress INPUT filter matched this packet on its PRE-NAT ingress tuple
+    // (Junos applies input filters BEFORE NAT). Pass the post-NAT wire key for
+    // TX selection and the pre-NAT session `forward_key` as the ingress re-walk
+    // key so a NAT'd flow still picks up an ingress `then forwarding-class` /
+    // dscp-rewrite / three-color policer (`resolve_cos_tx_selection_at_prenat`).
     let tx_selection_wire_key =
         tx_selection_flow.map(|flow| forward_wire_key(&flow.forward_key, decision.nat));
+    let ingress_flow_key = tx_selection_flow.map(|flow| &flow.forward_key);
     let cos = precomputed_tx_selection
         .map(|selection| CoSTxSelection {
             queue_id: selection.queue_id,
@@ -217,11 +225,12 @@ pub(super) fn build_live_forward_request_from_frame(
             filter_log: selection.filter_log,
         })
         .unwrap_or_else(|| {
-            resolve_cos_tx_selection_at(
+            resolve_cos_tx_selection_at_prenat(
                 forwarding,
                 decision.resolution.egress_ifindex,
                 meta,
                 tx_selection_wire_key.as_ref(),
+                ingress_flow_key,
                 // #2362 fold B: build the fragment-safe per-packet match inputs
                 // from the live frame so a `from { tcp-flags ... } then
                 // forwarding-class X` (or is-fragment / icmp-type) output filter
