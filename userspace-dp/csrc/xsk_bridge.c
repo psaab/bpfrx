@@ -14,6 +14,42 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <unistd.h>
+#include <stddef.h>
+
+/*
+ * ── Build-time ABI coupling (#4976) ───────────────────────────────────
+ *
+ * The Rust side (src/xsk_ffi.rs) hand-mirrors these libxdp ring structs as
+ * `XskRingProd`/`XskRingCons` and hands zeroed boxes of them to the creation
+ * functions below for libxdp to populate in place as native
+ * `struct xsk_ring_{prod,cons}`. Nothing else couples the *installed* libxdp
+ * layout (this translation unit compiles against /usr/include/xdp/xsk.h) to
+ * that independent Rust copy. A libxdp/header package upgrade that reorders
+ * or resizes the ring struct would otherwise silently turn a clean rebuild
+ * into out-of-bounds writes / misread indices at runtime.
+ *
+ * These assertions pin the installed `struct xsk_ring_{prod,cons}` to a fixed
+ * 64-bit ABI contract; src/xsk_ffi.rs pins its Rust mirror to the SAME
+ * numbers. If a libxdp upgrade changes the ring layout, this file fails to
+ * compile (via build.rs's cc invocation) and the build stops here. Keep these
+ * numbers in lockstep with the `const _` assertions in src/xsk_ffi.rs.
+ */
+_Static_assert(sizeof(void *) == 8, "xsk ring ABI assumes 64-bit pointers");
+
+#define XSK_RING_ABI_ASSERT(T)                                                 \
+    _Static_assert(sizeof(struct T) == 48, #T " size drift vs Rust mirror");   \
+    _Static_assert(_Alignof(struct T) == 8, #T " align drift vs Rust mirror"); \
+    _Static_assert(offsetof(struct T, cached_prod) == 0, #T " cached_prod");   \
+    _Static_assert(offsetof(struct T, cached_cons) == 4, #T " cached_cons");   \
+    _Static_assert(offsetof(struct T, mask) == 8, #T " mask");                 \
+    _Static_assert(offsetof(struct T, size) == 12, #T " size");                \
+    _Static_assert(offsetof(struct T, producer) == 16, #T " producer");        \
+    _Static_assert(offsetof(struct T, consumer) == 24, #T " consumer");        \
+    _Static_assert(offsetof(struct T, ring) == 32, #T " ring");                \
+    _Static_assert(offsetof(struct T, flags) == 40, #T " flags")
+
+XSK_RING_ABI_ASSERT(xsk_ring_prod);
+XSK_RING_ABI_ASSERT(xsk_ring_cons);
 
 /* ── UMEM creation / destruction ──────────────────────────────────── */
 
