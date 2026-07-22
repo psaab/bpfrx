@@ -6,6 +6,14 @@
   },
   "inputs": [
     {
+      "path": ".cargo/config.toml",
+      "sha256": "61e88aadeaed0c3a130163ea75a56227b09a1e53ef93e87a332ea46267cd0b0c"
+    },
+    {
+      "path": "bpf/headers/xpf_common.h",
+      "sha256": "c3ca68c10c2c585edf9675f40422e2b60a2d2d6a334b09dc9b92c9405f3f4030"
+    },
+    {
       "path": "pkg/dataplane/build-userspace-xdp.sh",
       "sha256": "2948dfc9c7acca808a1fb6f952729f37fa6a6e9e61d91d7403c6f17dcda5466a"
     },

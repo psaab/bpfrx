@@ -34,6 +34,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 const (
@@ -60,19 +62,26 @@ const (
 
 // userspaceXDPFixedFreshnessInputs are the non-.rs build inputs that
 // determine the shim object's bytes: the Cargo manifest + locked
-// dependency graph, the pinned Rust toolchain, the cargo linker config,
-// and the build recipe itself (build-userspace-xdp.sh embeds the
-// bpf-linker version pin and threads MAX_INTERFACES). Paths are
-// repo-relative POSIX.
+// dependency graph, the pinned Rust toolchain, BOTH the crate-local and
+// the repo-root cargo config (cargo loads ancestor configs too, so a
+// root-level BPF-target rustflags edit could change the .o — currently
+// inert x86_64, hashed for completeness), the build recipe itself
+// (build-userspace-xdp.sh embeds the bpf-linker version pin and threads
+// MAX_INTERFACES), and bpf/headers/xpf_common.h (whose MAX_INTERFACES
+// #define is awk-extracted by the recipe and sizes the shim's binding
+// array + maps). Paths are repo-relative POSIX.
 //
-// Deliberately EXCLUDED: userspace-xdp/.gitignore (not a build input),
-// cargo's target/ tree (build artifacts, untracked), and
-// bpf/headers/xpf_common.h — MAX_INTERFACES is the only header value
-// threaded into the build and its object binding is already covered by
-// the max_entries parity check in validateUserspaceShimSpec, so hashing
-// the whole shared header here would only add false-positive churn on
-// unrelated header edits.
+// xpf_common.h is hashed directly here so the freshness gate is
+// self-sufficient: the header->Go max_entries parity canary
+// (TestMaxInterfacesMatchesCHeader) t.Skips when the header is absent, so
+// leaning on it alone left a fail-open hole. Whole-file hashing trades a
+// little churn on unrelated header edits for a fail-closed gate.
+//
+// Deliberately EXCLUDED: userspace-xdp/.gitignore (not a build input) and
+// cargo's target/ tree (build artifacts, untracked).
 var userspaceXDPFixedFreshnessInputs = []string{
+	".cargo/config.toml",
+	"bpf/headers/xpf_common.h",
 	"pkg/dataplane/build-userspace-xdp.sh",
 	"userspace-xdp/.cargo/config.toml",
 	"userspace-xdp/Cargo.lock",
@@ -205,5 +214,10 @@ func WriteUserspaceXDPManifest(repoRoot string) error {
 		return err
 	}
 	out := filepath.Join(repoRoot, filepath.FromSlash(UserspaceXDPManifestRelPath))
-	return os.WriteFile(out, b, 0o644)
+	// Atomic write (pkg/fsatomic) rather than os.WriteFile: the project's
+	// TestNoDirectOsWriteFile canary forbids raw os.WriteFile in pkg/, and a
+	// torn manifest (partial write on a crash mid-generate) would fail the
+	// freshness test with a corrupt-file error rather than a clean stale
+	// signal. temp-then-rename keeps the committed manifest always intact.
+	return fsatomic.WriteFileAtomic(out, b, 0o644)
 }

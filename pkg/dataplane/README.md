@@ -185,14 +185,17 @@ Guard layers (`build-userspace-xdp.sh`):
    - `pkg/dataplane/userspace_xdp_manifest.json` records a SHA-256 of the
      tracked object AND of every freshness-relevant build input — every
      `userspace-xdp/src/**/*.rs`, `Cargo.toml`, `Cargo.lock`,
-     `rust-toolchain.toml`, `.cargo/config.toml`, and the
-     `build-userspace-xdp.sh` recipe itself (it embeds the bpf-linker
-     pin). It deliberately EXCLUDES cargo's `target/` and
-     `bpf/headers/xpf_common.h` — `MAX_INTERFACES` is the only header
-     value threaded into the build and its object binding is already
-     covered by the `validateUserspaceShimSpec` max_entries parity check,
-     so hashing the whole shared header would only add false-positive
-     churn.
+     `rust-toolchain.toml`, BOTH the crate-local `userspace-xdp/.cargo/
+     config.toml` and the repo-root `.cargo/config.toml` (cargo loads
+     ancestor configs, so a root-level BPF-target rustflags edit could
+     change the object), `bpf/headers/xpf_common.h` (its `MAX_INTERFACES`
+     `#define` is awk-extracted by the recipe and sizes the shim binding
+     array + maps), and the `build-userspace-xdp.sh` recipe itself (it
+     embeds the bpf-linker pin). The header is hashed directly so the gate
+     is fail-CLOSED: the header->Go max_entries parity canary
+     (`TestMaxInterfacesMatchesCHeader`) `t.Skip`s when the header is
+     absent, so leaning on it alone left a hole. It deliberately EXCLUDES
+     only cargo's `target/` (build artifacts) and `.gitignore`.
    - `build-userspace-xdp.sh` regenerates the manifest (via
      `cmd/shim-manifest` → `dataplane.WriteUserspaceXDPManifest`)
      immediately after the verifier-gated install, so the manifest stays

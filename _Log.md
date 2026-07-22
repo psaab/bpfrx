@@ -56530,3 +56530,14 @@ top.
   pkg/dataplane/retirement_boundary_canary_test.go,
   docs/pr/1373-retire-ebpf-dataplane/README.md,
   pkg/dataplane/README.md
+
+## 2026-07-22 — #4977 fold: Codex MERGE-NEEDS-MINOR (3 findings)
+- **Action**: Fold 3 Codex review findings on the shim freshness gate.
+- **File(s)**: pkg/dataplane/userspace_xdp_manifest.go, userspace_xdp_manifest.json, pkg/dataplane/README.md
+- (1) BLOCKING: WriteUserspaceXDPManifest used os.WriteFile (rejected by
+  TestNoDirectOsWriteFile canary → make test FAIL) → fsatomic.WriteFileAtomic.
+- (2) Added repo-root .cargo/config.toml to hashed inputs (cargo ancestor config).
+- (3) Added bpf/headers/xpf_common.h to hashed inputs (fail-closed: the
+  header->Go parity canary t.Skips when the header is absent). Regenerated
+  manifest via cmd/shim-manifest. Verified: fsatomic+dataplane green;
+  editing xpf_common.h now trips the freshness test; src-edit coverage intact.
