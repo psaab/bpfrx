@@ -56218,3 +56218,15 @@ top.
   pkg/dataplane/types.go, pkg/dataplane/userspace/{protocol,eventstream,manager_ha,*_test}.go,
   pkg/cluster/{sync_protocol,README,sync_*_test}.go, pkg/daemon/{daemon_ha_userspace_convert,userspace_sync_test}.go,
   docs/{sync-protocol,session-sync-architecture}.md
+
+## 2026-07-22 — #6309 (#5212) review fold: honest session-id caveat
+- **Action**: Folded rev6309 MERGE-NEEDS-MINOR findings — corrected the FALSE
+  "disjoint id slice" claim in docs/sync-protocol.md, session/README.md, and the
+  install.rs adopt comment to state the honest metadata-only, not-globally-unique
+  caveat (worker<<48|counter has no node discriminator; adopted id can collide
+  with a local same-worker id in active/active — observability-only). Tightened
+  the adopt test (worker 7→3, honest comment). Added the JSON-leg caveat to
+  emit_open_delta_with_origin. Filed follow-ups #6311 (node-bit namespace fix),
+  #6312 (JSON resync id-drop), #6313 (reverse-materialize test).
+- **File(s)**: docs/sync-protocol.md, userspace-dp/src/session/README.md,
+  userspace-dp/src/session/install.rs, userspace-dp/src/session/tests.rs

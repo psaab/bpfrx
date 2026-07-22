@@ -386,7 +386,10 @@ fn session_id_namespaces_worker_in_high_bits() {
 // zero wire id (a legacy peer that predates the field) falls back to a fresh
 // local alloc. Reverting the stamp in `upsert_synced_with_origin` (back to an
 // unconditional `alloc_session_id()`) flips the first assertion RED: the adopted
-// id would be a local worker-2 id, not the peer's worker-7 id.
+// id would be a local worker-2 id, not the peer's worker-3 id. A distinct worker
+// only keeps that revert assertion unambiguous — the id space is NOT partitioned
+// by node, so a peer id in the SAME worker index collides with a local id in
+// active/active (an accepted observability-only limitation, #6311).
 #[test]
 fn synced_import_adopts_peer_session_id_5212() {
     let mut table = SessionTable::new();
@@ -394,9 +397,11 @@ fn synced_import_adopts_peer_session_id_5212() {
     table.set_worker_id(2);
     let now = 1_000_000_000u64;
 
-    // A peer-originated id in worker 7's namespace — a slice of the id space
-    // this node's own allocator never mints.
-    let peer_id: u64 = (7u64 << 48) | 42;
+    // A peer-originated id, adopted verbatim. Worker 3 (distinct from this
+    // node's local worker 2) only keeps the revert assertion unambiguous — the
+    // namespace has no node discriminator, so a same-worker peer id would
+    // collide with a local id (#6311).
+    let peer_id: u64 = (3u64 << 48) | 42;
     let key = key_v4();
     assert!(table.upsert_synced_with_origin(
         SessionInstall {

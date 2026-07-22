@@ -322,10 +322,13 @@ impl SessionTable {
         // session id when it rides the HA session-sync wire, so a session that
         // opens on the primary and closes on the standby after a failover
         // carries the SAME RT_FLOW id on both nodes (cross-node log/event
-        // correlation). The id is namespaced by the originating worker's high
-        // 16 bits, so importing it verbatim keeps it unique across this node's
-        // shared-nothing worker tables too (the peer's worker id occupies a
-        // disjoint slice of the id space from any locally-alloc'd id). A zero
+        // correlation). The id is a metadata-only stamp (RT_FLOW correlation +
+        // the show-session mirror id) — NEVER a lookup key or slab handle — so
+        // adopting it verbatim cannot affect forwarding/security/memory. It is
+        // NOT globally unique: the worker_id<<48|counter namespace has no node
+        // discriminator and both nodes run the same worker set, so in
+        // active/active an adopted id can collide with a local same-worker id
+        // (observability-only; a node-discriminator bit is tracked as #6311). A zero
         // wire id (a legacy peer that predates the field, or a locally-generated
         // upsert such as a tunnel replica) falls back to a FRESH node-local id
         // via `alloc_session_id()` — the pre-#5212 behavior (rolling-upgrade
@@ -457,7 +460,9 @@ impl SessionTable {
         // table — so look it up by key and carry it on the wire, letting the
         // peer adopt the same id it will emit its own RT_FLOW records under
         // (`session_id_for` returns 0 if the key is somehow absent, the safe
-        // fallback-to-local-alloc sentinel).
+        // fallback-to-local-alloc sentinel). NB: only the event-stream leg of
+        // this owner-RG export carries the id; the JSON resync leg still drops
+        // it (#6312).
         let session_id = self.session_id_for(&key);
         self.push_delta(SessionDelta {
             kind: SessionDeltaKind::Open,

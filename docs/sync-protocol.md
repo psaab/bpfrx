@@ -384,9 +384,17 @@ length-gated trailing wire field (`encode/decodeSessionV{4,6}Payload`) → the p
 Go `SessionSyncRequest.session_id` (`buildSessionSyncRequest*`) → the Rust helper
 `build_synced_session_entry` → `SessionInstall::session_id`. On import,
 `upsert_synced_with_origin` ADOPTS the wire id when non-zero and only falls back
-to `alloc_session_id()` for a legacy peer (id 0). The id is worker-namespaced, so
-adopting the peer's id verbatim keeps it unique across the importing node's tables
-(the peer's worker occupies a disjoint slice of the id space).
+to `alloc_session_id()` for a legacy peer (id 0). The id is adopted verbatim so
+the same logical session carries the SAME id on both nodes — that cross-node
+correlation is the entire point. It is a **metadata-only** stamp (RT_FLOW
+correlation and the `show security flow session` mirror id), NEVER a lookup key
+or slab handle, so adoption cannot affect forwarding, security, or memory
+safety. It is **not globally unique**: the `worker_id<<48 | counter` namespace
+carries no node discriminator and both nodes run the same worker set, so in an
+active/active cluster an adopted id can collide with a local same-worker id (a
+duplicate correlation stamp — observability-only, bounded). A node-discriminator
+bit that makes adoption globally collision-free is tracked as a follow-up
+(#6311).
 
 **Additive, not a guard.** Unlike #5274's `ConfigEpoch`, this field is pure
 identity carriage — no receiver rejects on it. `RTFlowSessionID == 0` (legacy

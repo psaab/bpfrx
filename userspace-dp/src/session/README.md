@@ -1037,9 +1037,12 @@ trailing u64 in `encodeSessionV{4,6}Payload`, after the #5274 `ConfigEpoch`) →
 `upsert_synced_with_origin` ADOPTS the wire id (`SessionInstall::session_id`) when
 it is non-zero, and only falls back to `alloc_session_id()` for a legacy peer
 (wire id 0). The standby's SESSION_CLOSE RT_FLOW then carries the SAME id the
-primary's SESSION_CREATE did. The id is worker-namespaced, so importing the
-peer's id verbatim keeps it unique across this node's tables (the peer's worker
-occupies a disjoint id slice). Pinned by
+primary's SESSION_CREATE did. The id is a metadata-only correlation stamp (never
+a lookup key), adopted verbatim for that cross-node correlation. It is NOT
+globally unique — the `worker_id<<48 | counter` namespace has no node
+discriminator and both nodes run the same worker set, so in active/active an
+adopted id can collide with a local same-worker id (observability-only, bounded;
+a node-discriminator bit is tracked as #6311). Pinned by
 `session::tests::synced_import_adopts_peer_session_id_5212`,
 `test_encode_session_open_carries_session_id_5212`, and the Go
 `TestSessionWireRoundTripRTFlowSessionID5212{V4,V6}` /
