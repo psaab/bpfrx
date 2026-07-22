@@ -11,6 +11,77 @@ use super::*;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 
+/// #6157: shared serialization guard for the parallel-sensitive WG engine
+/// tests that spawn busy-spinning worker threads
+/// (`install_session_serializes_with_reconcile_removal`,
+/// `reconcile_peers_snapshot_is_atomic_under_concurrent_load`). Each of those
+/// tests runs an installer/writer thread against a reconciler/reader thread
+/// that spins on `thread::yield_now()` until the finite side finishes. Running
+/// two such tests at once under the default parallel `cargo test` oversubscribes
+/// the scheduler; combined with leaked neighbor-monitor threads from sibling
+/// suites it wedged a full-suite run in a futex deadlock for >100min (#6157).
+///
+/// Holding this guard for the WHOLE test body serializes the heavy engine
+/// tests: while one runs (and busy-spins), the other PARKS on the mutex (futex
+/// wait, no CPU burn) instead of compounding the oversubscription. Poison-
+/// tolerant (`into_inner`) so a panicking guarded test cannot deadlock the
+/// rest of the suite. Mirrors the `icmp_ratelimit::global_bucket_test_lock`
+/// precedent. `make test-rust` already forces `--test-threads=1`; this guard
+/// makes a plain parallel `cargo test --release` safe too.
+fn wg_engine_test_serial() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// #6157 fail-on-revert: `wg_engine_test_serial` must grant EXCLUSIVE access —
+/// two threads holding it must never be inside the guarded region at once.
+/// That exclusivity is what lets the second heavy engine test PARK on the
+/// mutex while the first busy-spins, instead of both oversubscribing the
+/// scheduler into the >100min futex deadlock (#6157).
+///
+/// Two threads, released together from a barrier, repeatedly take the guard
+/// and enter a region protected by `IN_CRITICAL`: each swaps it true on entry
+/// and asserts it was false (nobody else inside), yields to widen the window,
+/// then clears it. With the guard held the swap never observes a concurrent
+/// occupant. Removing the `wg_engine_test_serial()` acquisition (reverting the
+/// fix) lets both threads enter concurrently, the swap observes `true`, the
+/// worker panics, and the join below fails — deterministic red on revert.
+#[test]
+fn wg_engine_test_serial_grants_exclusive_access() {
+    use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    static IN_CRITICAL: AtomicBool = AtomicBool::new(false);
+    IN_CRITICAL.store(false, AOrd::SeqCst);
+    const ITERS: u32 = 2_000;
+    let start = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let start = start.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            for _ in 0..ITERS {
+                let _serial = wg_engine_test_serial();
+                let already_inside = IN_CRITICAL.swap(true, AOrd::SeqCst);
+                assert!(
+                    !already_inside,
+                    "two threads entered the guarded region at once — \
+                     wg_engine_test_serial did not serialize"
+                );
+                // Widen the critical window so a missing guard reliably
+                // interleaves rather than racing past unobserved.
+                thread::yield_now();
+                IN_CRITICAL.store(false, AOrd::SeqCst);
+            }
+        }));
+    }
+    for h in handles {
+        h.join()
+            .expect("guarded worker panicked — serialization guard failed");
+    }
+}
+
 fn keypair() -> ([u8; 32], [u8; 32]) {
     let kp = Builder::new(WG_NOISE_PATTERN.parse().unwrap())
         .generate_keypair()
@@ -559,6 +630,10 @@ fn reconcile_peers_drains_dropped_peer_cookie_gen() {
 fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
     use std::sync::atomic::{AtomicBool, Ordering as AOrd};
     use std::thread;
+    // #6157: serialize the heavy busy-spin engine tests (held for the whole
+    // body) so a parallel `cargo test` cannot run two at once and wedge the
+    // scheduler. See `wg_engine_test_serial`.
+    let _serial = wg_engine_test_serial();
     let (init_priv, _init_pub) = keypair();
     let (peer_a_priv, peer_a_pub) = keypair();
     let (peer_b_priv, peer_b_pub) = keypair();
@@ -692,6 +767,10 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
 fn install_session_serializes_with_reconcile_removal() {
     use std::sync::atomic::{AtomicBool, Ordering as AOrd};
     use std::thread;
+    // #6157: serialize the heavy busy-spin engine tests (held for the whole
+    // body) so a parallel `cargo test` cannot run two at once and wedge the
+    // scheduler. See `wg_engine_test_serial`.
+    let _serial = wg_engine_test_serial();
     let (init_priv, _init_pub) = keypair();
     let (peer_priv, peer_pub) = keypair();
     let engine = Arc::new(WgEngine::new(WgEngineConfig {
