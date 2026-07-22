@@ -28,6 +28,60 @@
   Fail-on-revert verified: neutralizing `validateVLANMapAST` turns all three
   tests RED as clean assertion failures (strict reject → nil error, lenient
   warn → empty).
+## 2026-07-22 — #5608: IPv6 TCP-segmentation clamp coverage (test-only)
+
+- **Timestamp**: 2026-07-22 (test/5608-ipv6-segmentation-coverage)
+- **Action**: Added two unit tests for the #5141 IP-declared-length clamp
+  (`ipv6_declared_l3_end` + ext-chain-aware `frame_l4_offset`), closing the
+  coverage gap flagged by the PR #5607 hostile review. `ipv6_segmentation_
+  with_ext_header_ignores_trailing_slack_5608` builds an IPv6 frame carrying a
+  hop-by-hop extension header (next-header 0, 8-byte HbH block) + 1400 declared
+  data bytes + 600 trailing SLACK_MARKER (0xEE) bytes past `payload_len`, then
+  asserts the frame segments (1468 > 1280 MTU), no slack byte is promoted into
+  any segment's TCP payload, the emitted payload equals the declared data, AND
+  the HbH ext chain is preserved verbatim in every segment (fixed-header
+  next-header stays 0; the HbH next-header still points at TCP with
+  hdr-ext-len 0). `ipv6_segmentation_rejects_declaration_shorter_than_
+  headers_5608` is the IPv6 twin of the existing IPv4 runt test: a large
+  backing buffer (1400 data bytes) with `payload_len` overwritten to a runt 10
+  (declared datagram 50 < 60 = fixed IP + TCP headers) must fail closed
+  (`None`, not segmented). Added the `ipv6_tcp_frame_with_ext_and_slack`
+  builder, `meta_v6_ext` (l4_offset = l3+40+8), and `segment_tcp_payload_v6_ext`
+  helpers alongside the existing #5141 fixtures.
+- **Validation**: both tests PASS on origin/master (`2 passed`). RED-on-revert
+  verified — temporarily unclamping `ipv6_declared_l3_end` (return
+  `frame.len()`) makes BOTH tests fail with the expected assertions
+  ("promoted trailing slack (0xEE) into TCP payload" and "must fail closed (not
+  segment)"); restoring the clamp returns both to green. No production code
+  changed — no docs update needed (behavior is unchanged; these tests pin
+  existing #5141 semantics for the two previously-untested IPv6 cases).
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs, _Log.md
+## 2026-07-21 — #6272: teardown mem::take must be lease-gated
+
+- **Timestamp**: 2026-07-21 (fix/6272-teardown-memtake-lease-gate)
+- **Action**: `release_all_cos_queue_leases` (the #5156/#6270 teardown
+  give-back) did an UNCONDITIONAL `core::mem::take(&mut queue.hot.tokens)`
+  for every queue with `hot.tokens > 0`, gating only the CREDIT on
+  `shared_queue_lease.is_some()`. The runtime give-back
+  `refresh_cos_interface_activity` (cos/tx_completion.rs, #4246 R-5(a))
+  instead gates the take ITSELF on `has_lease`, so an un-leased queue keeps
+  its banked burst. Consequence: on a lease-set swap (loop_body persists
+  `cos_interfaces` while rebuilding `cos_fast_interfaces`) a single-owner
+  NON-EXACT UN-LEASED queue's private per-worker burst was zeroed with
+  nothing credited — contradicting the #6270 README/comment. Fix: gate the
+  teardown `mem::take` on lease presence (probe the disjoint
+  `cos_fast_interfaces` field, early-`continue` when un-leased), mirroring
+  the runtime R-5(a) path exactly. Leased queues still drain + credit
+  (`release_unused_v8`) — the #5156 conservation invariant is unchanged.
+- **File(s)**: `userspace-dp/src/afxdp/cos/token_bucket.rs`,
+  `userspace-dp/src/afxdp/cos/token_bucket_tests.rs`,
+  `userspace-dp/src/afxdp/cos/README.md`, `_Log.md`
+- **Validation**: `cargo build` clean; new fail-on-revert test
+  `unleased_nonexact_burst_survives_lease_swap_6272` (un-leased burst
+  survives, leased queue drains + lease recovers to baseline) passes with
+  the fix and FAILS when reverted to the unconditional take (`left: 0,
+  right: 98304`); existing `nonexact_queue_lease_conserved_across_teardown_5156`
+  still passes in both states; full `afxdp::cos::` suite 304 passed.
 
 ## 2026-07-21 — #6226: round-robin address-only SNAT probes the whole pool
 

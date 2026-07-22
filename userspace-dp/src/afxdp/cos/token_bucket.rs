@@ -434,18 +434,38 @@ pub(in crate::afxdp) fn release_all_cos_queue_leases(binding: &mut BindingWorker
                 // credit must be returned here on worker exit / binding
                 // reset / lease-set swap — otherwise the (often reused)
                 // lease Arc stays permanently over-charged and under-
-                // provisions the class. The actual give-back below is still
-                // gated on `shared_queue_lease.is_some()`, so a truly
-                // un-leased queue (single-owner exact OR single-owner
-                // non-exact) just has its now-defunct bucket zeroed with
-                // nothing to credit — mirroring the runtime empty give-back
-                // in `refresh_cos_interface_activity`, which already keys on
-                // lease presence rather than `exact`.
+                // provisions the class. The per-queue loop below gates BOTH
+                // the `mem::take` AND the credit on `shared_queue_lease
+                // .is_some()` (#6272), so a truly un-leased queue (single-
+                // owner exact OR single-owner non-exact) KEEPS its private
+                // per-worker burst — there is nowhere to give it back —
+                // exactly mirroring the runtime empty give-back in
+                // `refresh_cos_interface_activity` (R-5(a)), which already
+                // keys the take on lease presence rather than `exact`.
                 .filter(|(_, queue)| queue.hot.tokens > 0)
                 .map(move |(queue_idx, _)| (root_ifindex, queue_idx))
         })
         .collect::<Vec<_>>();
     for (root_ifindex, queue_idx) in queue_keys {
+        // #6272: gate the `mem::take` ITSELF on lease presence, mirroring the
+        // runtime give-back `refresh_cos_interface_activity` (R-5(a)). An
+        // un-leased queue (single-owner exact OR single-owner non-exact) has
+        // nowhere to return its banked burst, so leave `hot.tokens` intact —
+        // zeroing it would destroy the private per-worker burst on a mere
+        // lease-set swap (loop_body persists `cos_interfaces` while it rebuilds
+        // `cos_fast_interfaces`), contradicting the #6270 contract. The probe
+        // reads the disjoint `cos_fast_interfaces` field, so it coexists with
+        // the `cos_interfaces` mutable borrow below.
+        let has_lease = binding
+            .cos
+            .cos_fast_interfaces
+            .get(&root_ifindex)
+            .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
+            .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
+            .is_some();
+        if !has_lease {
+            continue;
+        }
         // Capture the worker id alongside the take — the v8 give-back needs
         // it to re-credit the right per-worker grant slot (#4246 T-1).
         let taken = binding
