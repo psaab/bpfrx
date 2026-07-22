@@ -55153,3 +55153,39 @@ top.
   pkg/dataplane/userspace/manager_ha.go,
   pkg/dataplane/userspace/sync_socket_fastfail_5380_test.go,
   userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-07-21 (PR #6212 fold)
+- **Action**: Fold a hostile-review finding into PR #6212 (#5380): the fast-fail
+  `break` added earlier only aborted the 256-request loop INSIDE a single
+  `deleteHelperSessionsV4/V6` call. `ClearAllSessions` drives the helper delete
+  through `m.bpfShim.ClearAllSessionsChunked`, which invokes the two delete
+  callbacks ONCE PER 4096-key mirror chunk (v4 chunks, then v6). The callbacks
+  return void, so the inner abort did not propagate: a full clear-all under a
+  hung helper still paid ~one round-trip deadline PER chunk (~10M/4096 ≈ 2440
+  chunks/family ≈ ~2 h/family), not "one deadline total" as the PR claimed.
+  Guarded both closures with `helperDown()` (`errors.Is(helperErr,
+  errSessionHelperUnreachable)`): once a TRANSPORT failure is recorded the
+  remaining chunks skip the helper delete, bringing clear-all to ~one deadline
+  total. The BPF mirror still clears fully (the shim deletes each chunk BEFORE
+  invoking the callback); `helperErr` stays set so the #5881 error-propagation
+  and #5882 partial-count contracts are intact. Only the wrapped sentinel trips
+  the skip — an app-level `!resp.OK` rejection is NOT wrapped, so a live helper
+  that refuses one delete keeps clearing the batch (#5881). Fail-on-revert test
+  `TestClearAllSessionsFastFailsAcrossChunksOnHungHelper5380`
+  (`clear_all_multichunk_fastfail_5380_test.go`): one v4 + one v6 mirror session
+  → two delete callbacks against a counting hung helper; guarded pays ~one
+  shrunk 400ms deadline and dials the helper ONCE (v6 chunk skipped), unguarded
+  pays ~two deadlines and dials twice. RED on revert (neutralize `helperDown`):
+  elapsed 801ms > 650ms bound AND acceptCount 2 ≠ 1. Verified under sudo (BPF
+  memlock): the new test + #5380 + #5881 all GREEN; neutralizing `helperDown`
+  reddens the new test; neutralizing the original inner `break` reddens
+  `TestSyncSessionRequestsLockedFastFailsOnHungHelper5380` (1.505s) while the
+  new test stays GREEN (independent bindings). 6 XDP-shim tests
+  (TestApplyHelperStatus*/TestUserspaceXDP*/TestXSKLiveness*) fail identically
+  at the pristine PR head — pre-existing, need real XDP program load, unrelated.
+  Updated the `ClearAllSessions` doc comment + `userspace-dp/src/server/README.md`
+  so the documented clear-all contract matches (~one deadline total). HA
+  session-sync path — needs a loss-cluster failover smoke (batched).
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/clear_all_multichunk_fastfail_5380_test.go,
+  userspace-dp/src/server/README.md, _Log.md

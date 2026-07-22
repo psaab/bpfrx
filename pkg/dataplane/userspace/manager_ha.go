@@ -1415,6 +1415,11 @@ func (m *Manager) BatchDeleteSessionsV6(keys []dataplane.SessionKeyV6) (int, err
 // non-atomic clear-all reporting contract, so a caller learns what the mirror
 // side revoked while also learning the authoritative revocation is unconfirmed.
 // A mirror-side error still takes precedence and is returned as before.
+//
+// #5380 residual: the per-chunk callbacks skip the helper delete once a
+// transport failure is recorded, so a full clear-all under a hung helper pays
+// ~one round-trip deadline total rather than one per 4096-key mirror chunk.
+// See the helperDown guard below.
 func (m *Manager) ClearAllSessions() (int, int, error) {
 	var helperErr error
 	recordHelperErr := func(err error) {
@@ -1422,9 +1427,38 @@ func (m *Manager) ClearAllSessions() (int, int, error) {
 			helperErr = err
 		}
 	}
+	// Fast-fail the WHOLE clear-all once the helper transport is down, not just
+	// the 256-request loop inside a single deleteHelperSessions call (#5380
+	// only aborted that inner loop). ClearAllSessionsChunked invokes these
+	// callbacks ONCE PER sessionClearSnapshotChunk (4096-key) mirror chunk, and
+	// the callbacks return void, so an inner abort does not propagate up: the
+	// shim keeps handing every remaining chunk to a hung helper. A max table is
+	// ~10M keys / 4096 ≈ 2440 chunks per family, so without this guard a
+	// clear-all under a hung helper still pays ~one round-trip deadline PER
+	// chunk (~2 h/family) even though each chunk's own delete already
+	// fast-fails. Once a TRANSPORT failure has been recorded, skip the helper
+	// delete for the remaining chunks so the clear-all pays ~one deadline
+	// total. Only errSessionHelperUnreachable (a hung/unreachable helper) trips
+	// the skip; an application-level rejection (helper alive, resp.OK=false) is
+	// NOT wrapped as the sentinel, so a live helper that refuses one delete
+	// keeps clearing the rest of the batch (#5881). The BPF mirror still clears
+	// fully — the shim deletes each chunk BEFORE invoking the callback — and
+	// helperErr stays set, so the #5881 error-propagation and #5882
+	// partial-count contracts are unchanged.
+	helperDown := func() bool { return errors.Is(helperErr, errSessionHelperUnreachable) }
 	v4, v6, mirrorErr := m.bpfShim.ClearAllSessionsChunked(
-		func(keys []dataplane.SessionKey) { recordHelperErr(m.deleteHelperSessionsV4(keys)) },
-		func(keys []dataplane.SessionKeyV6) { recordHelperErr(m.deleteHelperSessionsV6(keys)) },
+		func(keys []dataplane.SessionKey) {
+			if helperDown() {
+				return
+			}
+			recordHelperErr(m.deleteHelperSessionsV4(keys))
+		},
+		func(keys []dataplane.SessionKeyV6) {
+			if helperDown() {
+				return
+			}
+			recordHelperErr(m.deleteHelperSessionsV6(keys))
+		},
 	)
 	if mirrorErr != nil {
 		return v4, v6, mirrorErr

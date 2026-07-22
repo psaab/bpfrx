@@ -311,5 +311,11 @@ queues. See PR #1243's kill record for why i40e doesn't reshape.
     (`errSessionHelperUnreachable`) instead of paying that deadline once
     per request, so a hung helper cannot stall bulk session ops — nor
     repeatedly hold the Go-side `sessionMu` and starve live installs — for
-    minutes (#5380). The session mirror is best-effort; the periodic sweep
-    retries once this thread is healthy again.
+    minutes (#5380). Clear-all (`ClearAllSessions`) walks the mirror one
+    4096-key chunk at a time and issues a helper delete per chunk, so it
+    additionally guards the per-chunk delete on the same sentinel: once a
+    transport failure is recorded the remaining chunks skip the helper delete
+    (the BPF mirror still clears fully), bringing a full clear-all under a hung
+    helper to ~one round-trip deadline total rather than one per chunk
+    (~2440 chunks/family on a max table). The session mirror is best-effort;
+    the periodic sweep retries once this thread is healthy again.
