@@ -29,6 +29,26 @@
   ./pkg/cluster/...` green; `go vet` clean; fail-on-revert confirmed firsthand
   (drop the `ActiveApplied()` gate → `TestHandleConfigSync_PromotedButUnappliedIsNotConverged`
   RED at "applyConfigLocked calls = 1, want 2").
+## 2026-07-22 — #6224: correct stale "peer-seeded import" comment on the local-origin GRE session-seed path
+
+- **Timestamp**: 2026-07-22 (fix/6224-tunnel-syncimport-timeout)
+- **Action**: verify-then-fix-or-close. Adversarially confirmed that
+  `build_local_origin_tunnel_tx_request` (tunnel.rs:583) is the LOCAL-ORIGIN
+  (host-outbound) GRE encapsulation path, not a peer HA-sync import: it runs
+  no security policy / application match (`resolve_tunnel_forwarding_resolution`
+  is route/next-hop/neighbor only; `policy_id: 0` hardcoded), so there is NO
+  admitting application to source a per-app `inactivity_timeout_ns` from. The
+  `None` (global per-protocol timeout) is functionally and Junos-correct. The
+  defect is only the misleading comment block (copy-pasted the
+  #2508/#3056/#3227/#3073 "peer-seeded import ... does not cross the HA wire
+  yet" rationale onto a path that is not a wire path at all). Rewrote the
+  comment to state the real reason; added a contract-pinning test
+  (`local_origin_tunnel_session_uses_global_timeout_no_policy_match_6224`) that
+  goes RED if a future change stamps a bogus per-app timeout / non-zero policy
+  attribution on this path. No code-behavior change; no wire change.
+- **File(s)**: userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/frame/tests_native_gre_ecn.rs,
+  userspace-dp/src/session/README.md
 
 ## 2026-07-22 — #5274: HA session-sync config-epoch guard (stale permit across the HA boundary)
 
