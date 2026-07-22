@@ -57,6 +57,7 @@ const (
 	BpfrxService_GetIPsecSA_FullMethodName                = "/xpf.v1.BpfrxService/GetIPsecSA"
 	BpfrxService_GetNATPoolStats_FullMethodName           = "/xpf.v1.BpfrxService/GetNATPoolStats"
 	BpfrxService_GetNATRuleStats_FullMethodName           = "/xpf.v1.BpfrxService/GetNATRuleStats"
+	BpfrxService_GetNATDeterministic_FullMethodName       = "/xpf.v1.BpfrxService/GetNATDeterministic"
 	BpfrxService_GetVRRPStatus_FullMethodName             = "/xpf.v1.BpfrxService/GetVRRPStatus"
 	BpfrxService_MatchPolicies_FullMethodName             = "/xpf.v1.BpfrxService/MatchPolicies"
 	BpfrxService_Ping_FullMethodName                      = "/xpf.v1.BpfrxService/Ping"
@@ -118,6 +119,7 @@ type BpfrxServiceClient interface {
 	GetIPsecSA(ctx context.Context, in *GetIPsecSARequest, opts ...grpc.CallOption) (*GetIPsecSAResponse, error)
 	GetNATPoolStats(ctx context.Context, in *GetNATPoolStatsRequest, opts ...grpc.CallOption) (*GetNATPoolStatsResponse, error)
 	GetNATRuleStats(ctx context.Context, in *GetNATRuleStatsRequest, opts ...grpc.CallOption) (*GetNATRuleStatsResponse, error)
+	GetNATDeterministic(ctx context.Context, in *GetNATDeterministicRequest, opts ...grpc.CallOption) (*GetNATDeterministicResponse, error)
 	GetVRRPStatus(ctx context.Context, in *GetVRRPStatusRequest, opts ...grpc.CallOption) (*GetVRRPStatusResponse, error)
 	MatchPolicies(ctx context.Context, in *MatchPoliciesRequest, opts ...grpc.CallOption) (*MatchPoliciesResponse, error)
 	// Diagnostics (server-streaming for real-time output)
@@ -528,6 +530,16 @@ func (c *bpfrxServiceClient) GetNATRuleStats(ctx context.Context, in *GetNATRule
 	return out, nil
 }
 
+func (c *bpfrxServiceClient) GetNATDeterministic(ctx context.Context, in *GetNATDeterministicRequest, opts ...grpc.CallOption) (*GetNATDeterministicResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNATDeterministicResponse)
+	err := c.cc.Invoke(ctx, BpfrxService_GetNATDeterministic_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *bpfrxServiceClient) GetVRRPStatus(ctx context.Context, in *GetVRRPStatusRequest, opts ...grpc.CallOption) (*GetVRRPStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetVRRPStatusResponse)
@@ -740,6 +752,7 @@ type BpfrxServiceServer interface {
 	GetIPsecSA(context.Context, *GetIPsecSARequest) (*GetIPsecSAResponse, error)
 	GetNATPoolStats(context.Context, *GetNATPoolStatsRequest) (*GetNATPoolStatsResponse, error)
 	GetNATRuleStats(context.Context, *GetNATRuleStatsRequest) (*GetNATRuleStatsResponse, error)
+	GetNATDeterministic(context.Context, *GetNATDeterministicRequest) (*GetNATDeterministicResponse, error)
 	GetVRRPStatus(context.Context, *GetVRRPStatusRequest) (*GetVRRPStatusResponse, error)
 	MatchPolicies(context.Context, *MatchPoliciesRequest) (*MatchPoliciesResponse, error)
 	// Diagnostics (server-streaming for real-time output)
@@ -883,6 +896,9 @@ func (UnimplementedBpfrxServiceServer) GetNATPoolStats(context.Context, *GetNATP
 }
 func (UnimplementedBpfrxServiceServer) GetNATRuleStats(context.Context, *GetNATRuleStatsRequest) (*GetNATRuleStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetNATRuleStats not implemented")
+}
+func (UnimplementedBpfrxServiceServer) GetNATDeterministic(context.Context, *GetNATDeterministicRequest) (*GetNATDeterministicResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNATDeterministic not implemented")
 }
 func (UnimplementedBpfrxServiceServer) GetVRRPStatus(context.Context, *GetVRRPStatusRequest) (*GetVRRPStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetVRRPStatus not implemented")
@@ -1628,6 +1644,24 @@ func _BpfrxService_GetNATRuleStats_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BpfrxService_GetNATDeterministic_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNATDeterministicRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BpfrxServiceServer).GetNATDeterministic(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BpfrxService_GetNATDeterministic_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BpfrxServiceServer).GetNATDeterministic(ctx, req.(*GetNATDeterministicRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _BpfrxService_GetVRRPStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetVRRPStatusRequest)
 	if err := dec(in); err != nil {
@@ -1992,6 +2026,10 @@ var BpfrxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetNATRuleStats",
 			Handler:    _BpfrxService_GetNATRuleStats_Handler,
+		},
+		{
+			MethodName: "GetNATDeterministic",
+			Handler:    _BpfrxService_GetNATDeterministic_Handler,
 		},
 		{
 			MethodName: "GetVRRPStatus",

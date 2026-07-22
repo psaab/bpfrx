@@ -47,6 +47,7 @@ service BpfrxService {
   rpc GetIPsecSA(GetIPsecSARequest) returns (GetIPsecSAResponse);
   rpc GetNATPoolStats(GetNATPoolStatsRequest) returns (GetNATPoolStatsResponse);
   rpc GetNATRuleStats(GetNATRuleStatsRequest) returns (GetNATRuleStatsResponse);
+  rpc GetNATDeterministic(GetNATDeterministicRequest) returns (GetNATDeterministicResponse);
   rpc GetVRRPStatus(GetVRRPStatusRequest) returns (GetVRRPStatusResponse);
   rpc MatchPolicies(MatchPoliciesRequest) returns (MatchPoliciesResponse);
 
@@ -997,6 +998,49 @@ message NATRuleStats {
   string destination_match = 7;
   uint64 hit_packets = 8;
   uint64 hit_bytes = 9;
+}
+
+// --- Deterministic source-NAT (CGNAT / NAPT64) mapping lookup ---
+//
+// Forward (subscriber -> translated) and reverse (translated -> subscriber)
+// deterministic mapping resolution against the LAST-APPLIED NAT generation
+// (#5794). direction selects the query; pool is optional (an ambiguous
+// tuple across multiple deterministic pools is rejected, never first-match).
+
+enum NATDeterministicDirection {
+  NAT_DETERMINISTIC_DIRECTION_UNSPECIFIED = 0;
+  // FORWARD: internal_host -> external IPv4 + assigned port block.
+  NAT_DETERMINISTIC_DIRECTION_FORWARD = 1;
+  // REVERSE: (nat_ip, nat_port) -> internal subscriber.
+  NAT_DETERMINISTIC_DIRECTION_REVERSE = 2;
+}
+
+message GetNATDeterministicRequest {
+  NATDeterministicDirection direction = 1;
+  string pool = 2;           // optional source NAT pool filter
+  string internal_host = 3;  // FORWARD: subscriber IP (IPv4 mode 1 / IPv6 mode 2)
+  string nat_ip = 4;         // REVERSE: translated external IPv4
+  uint32 nat_port = 5;       // REVERSE: translated port (1-65535)
+}
+
+message GetNATDeterministicResponse {
+  bool found = 1;
+  // error_code is a stable machine-readable token when found=false
+  // (no-applied-view, unknown-pool, not-deterministic, malformed-input,
+  // out-of-range, ambiguous-pool, not-found). Empty when found=true.
+  string error_code = 2;
+  string error_detail = 3;
+
+  uint64 applied_generation = 4;
+  string pool = 5;
+  uint32 mode = 6;            // 1 = IPv4 source NAT, 2 = IPv6 NAPT64
+  string internal_host = 7;   // subscriber (input for forward, recovered for reverse)
+  string external_ip = 8;     // translated external IPv4
+  uint32 nat_port = 9;        // reverse: echoed translated port (0 for forward)
+  uint32 port_low = 10;       // inclusive port-block low
+  uint32 port_high = 11;      // inclusive port-block high
+  uint32 block_size = 12;
+  uint32 block_index = 13;
 }
 
 // --- Completion messages ---
