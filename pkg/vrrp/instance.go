@@ -3,6 +3,7 @@ package vrrp
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -2087,6 +2088,38 @@ func (vi *vrrpInstance) surfaceStaleVIP(err error, where string) {
 	vi.scheduleVIPRemoveReconcile()
 }
 
+// errReconcileSuperseded signals that the stale-VIP reconcile observed a
+// re-promotion — state != BACKUP or the ownership generation advanced past the
+// tenure that scheduled it — while holding vipMu, so it aborted the delete
+// rather than stripping a VIP a concurrent becomeMaster just re-added (#5482
+// re-promotion TOCTOU). It is a control signal, not a failure: the goroutine
+// returns and does NOT bump vipRemoveFailures.
+var errReconcileSuperseded = errors.New("vrrp: stale-VIP reconcile superseded by re-promotion")
+
+// removeVIPsIfBackup atomically re-validates, UNDER vipMu, that this instance is
+// still the same BACKUP tenure identified by wantGen before removing the VIP set
+// (#5482 re-promotion TOCTOU fix). It mirrors reconcileVIP's capture+recheck-
+// under-lock: becomeMaster runs setState(MASTER) — which bumps ownerGen — BEFORE
+// it takes vipMu to add the VIP, so a state+generation recheck under the SAME
+// vipMu hold that would perform the delete reliably detects a racing re-promotion.
+// Without it the reconcile's bare removeVIPs (state checked OUTSIDE the lock)
+// could interleave between the check and the lock acquisition and delete the VIP
+// becomeMaster just added — a MASTER self-blackhole until the next ReconcileVIPs.
+//
+// Returns errReconcileSuperseded (no delete performed) when state != BACKUP or
+// ownerGen advanced past wantGen; otherwise returns the removeVIPsLocked outcome.
+func (vi *vrrpInstance) removeVIPsIfBackup(wantGen uint64) error {
+	vi.vipMu.Lock()
+	defer vi.vipMu.Unlock()
+	// Recheck under the lock: setState bumps ownerGen independently of vipMu, so
+	// a demotion/re-promotion that raced in is observed here even though it
+	// happened while we held vipMu (identical to reconcileVIP's revalidation).
+	if vi.getState() != StateBackup || vi.ownerGen.Load() != wantGen {
+		return errReconcileSuperseded
+	}
+	return vi.removeVIPsLocked(nil)
+}
+
 // scheduleVIPRemoveReconcile launches a bounded background retry that re-attempts
 // the VIP removal that failed during a BACKUP transition (#5482). The BACKUP role
 // is already published (we ARE a backup); this goroutine drives the kernel VIP
@@ -2095,11 +2128,20 @@ func (vi *vrrpInstance) surfaceStaleVIP(err error, where string) {
 // MASTER (it then WANTS the VIP) or the instance shuts down. Per-attempt failures
 // are logged but do NOT bump vipRemoveFailures — that counter stays a clean count
 // of BACKUP transitions whose synchronous removal failed.
+//
+// Re-promotion TOCTOU (#5482): the removal runs through removeVIPsIfBackup, which
+// re-validates state + ownerGen UNDER vipMu before deleting. Capturing the tenure
+// generation here (right after the failing BACKUP transition, which already ran
+// setState(StateBackup)) lets the retry abort if a later becomeMaster re-owns the
+// VIP — otherwise the reconcile could strip a re-promoted MASTER's VIP.
 func (vi *vrrpInstance) scheduleVIPRemoveReconcile() {
 	backoff := vi.vipReconcileBackoff
 	if backoff <= 0 {
 		backoff = defaultVIPReconcileBackoff
 	}
+	// Identity of the BACKUP tenure that failed its synchronous removal. The
+	// reconcile deletes VIPs on behalf of THIS tenure only.
+	gen := vi.ownerGen.Load()
 	go func() {
 		for attempt := 1; attempt <= vipRemoveReconcileMax; attempt++ {
 			select {
@@ -2107,11 +2149,17 @@ func (vi *vrrpInstance) scheduleVIPRemoveReconcile() {
 				return
 			case <-time.After(backoff):
 			}
-			// Re-promoted to MASTER mid-retry → we now WANT the VIP; stop.
-			if vi.getState() != StateBackup {
+			// The state/gen recheck and the delete are atomic under vipMu inside
+			// removeVIPsIfBackup, so a concurrent becomeMaster (setState(MASTER)
+			// → vipMu → addVIPsLocked) cannot interleave between the recheck and
+			// the delete and lose the re-added VIP.
+			err := vi.removeVIPsIfBackup(gen)
+			if errors.Is(err, errReconcileSuperseded) {
+				// Re-promoted to MASTER (or a newer tenure began) → we now WANT
+				// the VIP; the new tenure owns the divergence decision. Stop.
 				return
 			}
-			if err := vi.removeVIPs(); err != nil {
+			if err != nil {
 				slog.Warn("vrrp: stale-VIP remove reconcile attempt failed",
 					"key", vi.key(), "attempt", attempt, "err", err)
 				continue
@@ -2446,9 +2494,12 @@ func (vi *vrrpInstance) removeVIPs() error {
 // It returns the first genuine removal failure so becomeBackup can detect a VIP
 // that is still on the wire (#5482). A benign case is NOT an error: an
 // unresolvable interface means the address is gone with the link (best-effort
-// teardown cleanup), and a "not found"/"no such" AddrDel means the address is
-// already absent — neither leaves a stale VIP answering ARP. Only an AddrDel that
-// fails against a resolvable interface is a real divergence.
+// teardown cleanup), and an already-absent AddrDel — ENODEV/ENOENT
+// ("not found"/"no such") OR EADDRNOTAVAIL ("cannot assign requested address",
+// the common already-absent errno on a clean boot) — means the address was never
+// on the interface. Neither leaves a stale VIP answering ARP, so neither is a
+// divergence. Only an AddrDel that fails for another reason against a resolvable
+// interface is a real divergence.
 func (vi *vrrpInstance) removeVIPsLocked(vips []string) error {
 	if vips == nil {
 		vips = vi.cfg.VirtualAddresses
@@ -2471,8 +2522,25 @@ func (vi *vrrpInstance) removeVIPsLocked(vips []string) error {
 			continue
 		}
 		if err := vi.nlAddrDel(link, addr); err != nil {
-			// Ignore "not found" — may have been removed already.
-			if strings.Contains(err.Error(), "not found") ||
+			// Benign already-absent cases: the address is not on the interface,
+			// so there is no stale VIP left answering ARP. The kernel signals an
+			// absent address several ways on AddrDel:
+			//   - ENODEV/ENOENT → "not found"/"no such" (the original checks)
+			//   - EADDRNOTAVAIL → "cannot assign requested address" — the MOST
+			//     common already-absent errno. A fresh boot / restart-as-backup
+			//     runs the run-startup BACKUP removal (and becomeBackup) against
+			//     VIPs that were NEVER on the interface, so every AddrDel returns
+			//     EADDRNOTAVAIL. Treating that as a real failure would flag
+			//     vipDiverged on EVERY clean boot and the reconcile would retry
+			//     the still-absent address to exhaustion, leaving the operator-
+			//     facing divergence flag stuck TRUE for the daemon's life —
+			//     cry-wolfing the exact diagnostic #5482 exists to provide.
+			// errors.Is unwraps the netlink errno even when it is annotated with
+			// NLMSGERR_ATTR TLV text; the string check is a belt-and-suspenders
+			// match for wrappers that only expose Error().
+			if errors.Is(err, unix.EADDRNOTAVAIL) ||
+				strings.Contains(err.Error(), "cannot assign requested address") ||
+				strings.Contains(err.Error(), "not found") ||
 				strings.Contains(err.Error(), "no such") {
 				continue
 			}

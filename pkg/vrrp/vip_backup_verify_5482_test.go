@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // #5482 — the BACKUP-side symmetry of the #5082 fail-closed MASTER path.
@@ -188,5 +189,125 @@ func TestBackupStaleVIPReconcileSelfHeals_5482(t *testing.T) {
 	if got := vi.vipRemoveFailures.Load(); got != 1 {
 		t.Fatalf("vipRemoveFailures = %d, want 1 — retry attempts must not bump the "+
 			"transition-failure counter", got)
+	}
+}
+
+// TestBackupRemoveAbsentVIPNoDivergence_5482 is the fail-on-revert guard for the
+// EADDRNOTAVAIL false-divergence bug. The kernel returns EADDRNOTAVAIL ("cannot
+// assign requested address") when AddrDel targets an address that is NOT present
+// — the most common already-absent errno. On a fresh boot / restart-as-backup the
+// run-startup BACKUP removal (and becomeBackup) run against VIPs that were never
+// on the interface, so every AddrDel returns EADDRNOTAVAIL. That is a benign
+// already-absent case, NOT a divergence: it must NOT bump vipRemoveFailures or set
+// vipDiverged.
+//
+// RED on revert: dropping `errors.Is(err, unix.EADDRNOTAVAIL)` (and the "cannot
+// assign requested address" string) from the benign already-absent set in
+// removeVIPsLocked makes EADDRNOTAVAIL a real failure → surfaceStaleVIP bumps
+// vipRemoveFailures to 1 and sets vipDiverged → both sub-cases fail. This
+// cry-wolfs the divergence flag on EVERY clean boot.
+func TestBackupRemoveAbsentVIPNoDivergence_5482(t *testing.T) {
+	// Both detection arms: the raw errno (realistic netlink path) and the
+	// Error()-string form (a wrapper that only exposes the message).
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"eaddrnotavail-errno", unix.EADDRNOTAVAIL},
+		{"cannot-assign-string", errors.New("cannot assign requested address")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			absent := tc.err
+			vi, eventCh := newBackupTestInstance(t, "xpf-5482-"+tc.name, func(*netlink.Addr) error {
+				return absent
+			})
+
+			mdt := time.NewTimer(time.Hour)
+			defer mdt.Stop()
+			adv := time.NewTimer(time.Hour)
+			defer adv.Stop()
+
+			vi.becomeBackup(mdt, adv)
+
+			// The honest BACKUP role is still published.
+			if got := vi.getState(); got != StateBackup {
+				t.Fatalf("state = %v, want StateBackup", got)
+			}
+			if !drainForBackupEvent(t, eventCh) {
+				t.Fatal("becomeBackup did not emit a BACKUP event")
+			}
+			// Removing an ABSENT VIP is not a divergence.
+			if got := vi.vipRemoveFailures.Load(); got != 0 {
+				t.Fatalf("removing an absent VIP (%v) flagged a bogus remove failure: "+
+					"vipRemoveFailures = %d, want 0 — an already-absent AddrDel "+
+					"(EADDRNOTAVAIL) must be benign, else every clean boot cry-wolfs "+
+					"the divergence flag (#5482)", absent, got)
+			}
+			if vi.vipDiverged.Load() {
+				t.Fatalf("removing an absent VIP (%v) set vipDiverged — a fresh boot / "+
+					"restart-as-backup must not report a stuck divergence", absent)
+			}
+		})
+	}
+}
+
+// TestBackupVIPReconcileAbortsOnRepromotion_5482 is the fail-on-revert guard for
+// the re-promotion TOCTOU. The stale-VIP reconcile runs on a background goroutine
+// while becomeMaster runs on the run-loop. becomeMaster does setState(MASTER)
+// (bumping ownerGen) BEFORE it takes vipMu to re-add the VIP, so the reconcile's
+// remove MUST re-validate state + ownerGen under vipMu and abort if the node was
+// re-promoted — otherwise it strips the VIP becomeMaster just added (MASTER
+// self-blackhole). removeVIPsIfBackup is that atomic gate.
+//
+// The test drives the gate directly for determinism (racing the async goroutine
+// would be flaky). It covers BOTH revalidation arms:
+//   - state flipped to MASTER (the direct re-promotion)
+//   - state is BACKUP again but ownerGen advanced (a MASTER tenure intervened:
+//     BACKUP→MASTER→BACKUP — the new tenure owns the divergence decision)
+//
+// RED on revert: removing the `state != BACKUP || ownerGen != wantGen` recheck in
+// removeVIPsIfBackup makes it call removeVIPsLocked unconditionally → AddrDel
+// fires on the re-owned VIP → delCalls > 0 and the returned error is not
+// errReconcileSuperseded → both sub-cases fail.
+func TestBackupVIPReconcileAbortsOnRepromotion_5482(t *testing.T) {
+	var delCalls atomic.Int32
+	vi, _ := newBackupTestInstance(t, "xpf-5482-repromo", func(*netlink.Addr) error {
+		delCalls.Add(1)
+		return nil
+	})
+
+	// Identity of the BACKUP tenure that scheduled the reconcile.
+	vi.setState(StateBackup)
+	gen := vi.ownerGen.Load()
+
+	// Scenario 1: re-promotion to MASTER. becomeMaster ran setState(MASTER)
+	// (ownerGen bumped) and re-added the VIP under vipMu; the stale reconcile from
+	// the old BACKUP tenure must abort rather than strip that VIP.
+	vi.setState(StateMaster)
+	if err := vi.removeVIPsIfBackup(gen); !errors.Is(err, errReconcileSuperseded) {
+		t.Fatalf("removeVIPsIfBackup must abort on re-promotion to MASTER: err = %v, "+
+			"want errReconcileSuperseded", err)
+	}
+	if got := delCalls.Load(); got != 0 {
+		t.Fatalf("reconcile stripped a re-owned MASTER's VIP: AddrDel called %d times, "+
+			"want 0 — re-promotion TOCTOU self-blackhole (#5482)", got)
+	}
+
+	// Scenario 2: state is BACKUP again but ownerGen advanced past the captured
+	// tenure (BACKUP→MASTER→BACKUP). The stale reconcile must still abort — the new
+	// BACKUP tenure ran its own surfaceStaleVIP and owns the divergence decision.
+	vi.setState(StateBackup)
+	if vi.ownerGen.Load() == gen {
+		t.Fatalf("test setup: ownerGen did not advance across the intervening MASTER "+
+			"tenure (gen still %d) — the ownerGen arm would not be exercised", gen)
+	}
+	if err := vi.removeVIPsIfBackup(gen); !errors.Is(err, errReconcileSuperseded) {
+		t.Fatalf("removeVIPsIfBackup must abort when ownerGen advanced past the "+
+			"scheduling tenure: err = %v, want errReconcileSuperseded", err)
+	}
+	if got := delCalls.Load(); got != 0 {
+		t.Fatalf("stale-tenure reconcile deleted a VIP after ownerGen advanced: "+
+			"AddrDel called %d times, want 0", got)
 	}
 }

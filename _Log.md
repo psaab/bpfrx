@@ -1,3 +1,40 @@
+## 2026-07-21 — #5482 follow-up: two review MAJORs on the BACKUP VIP-verify machinery
+
+- **Timestamp**: 2026-07-21 (fix/5482-vrrp-vip-verify)
+- **Action**: A hostile review of PR #6208 found two compounding MAJOR bugs on
+  the new #5482 BACKUP-side VIP-remove-verification machinery. (1) **False
+  divergence on absent VIP:** `removeVIPsLocked` treated only ENODEV/ENOENT
+  ("not found"/"no such") as benign-already-absent, but the kernel returns
+  **EADDRNOTAVAIL** ("cannot assign requested address") when AddrDel targets an
+  absent address — the common case. On a fresh boot / restart-as-backup the
+  run-startup BACKUP removal runs against VIPs that were never present → every
+  AddrDel returned EADDRNOTAVAIL → `vipDiverged` set + reconcile scheduled that
+  retried the still-absent addr to exhaustion → the divergence flag stuck TRUE
+  for the daemon's life, cry-wolfing the diagnostic. Fixed by adding
+  `errors.Is(err, unix.EADDRNOTAVAIL)` (+ string fallback) to the benign set.
+  (2) **Re-promotion TOCTOU:** the reconcile guarded with
+  `if getState() != StateBackup` OUTSIDE `vipMu`, and `removeVIPs` did no
+  state/gen recheck under the lock, so a `becomeMaster` (which does
+  `setState(MASTER)`→`vipMu`→`addVIPsLocked`) could interleave between the
+  reconcile's check and its lock acquisition and the reconcile would strip the
+  VIP the new MASTER just added (self-blackhole). Fixed by routing the reconcile
+  through a new `removeVIPsIfBackup(gen)` that re-validates
+  `state == BACKUP && ownerGen == gen` UNDER `vipMu` before deleting (mirrors
+  `reconcileVIP`'s #5082 capture+recheck), aborting with `errReconcileSuperseded`
+  on a racing re-promotion; the reconcile captures the tenure `gen` at schedule
+  time. No deadlock — `vipMu`→`vi.mu` order matches `reconcileVIP`; `becomeMaster`
+  never holds both. Added two fail-on-revert tests:
+  `TestBackupRemoveAbsentVIPNoDivergence_5482` (table: EADDRNOTAVAIL errno +
+  "cannot assign requested address" string — RED: vipRemoveFailures=1/vipDiverged
+  when EADDRNOTAVAIL dropped from benign set) and
+  `TestBackupVIPReconcileAbortsOnRepromotion_5482` (state→MASTER and
+  BACKUP→MASTER→BACKUP gen-advance arms — RED: AddrDel fires / err=nil when the
+  under-`vipMu` recheck removed). Original 3 #5482 tests stay green. Build +
+  `go vet` + `go test -race ./pkg/vrrp/...` pass. VRRP/HA — needs a loss-cluster
+  failover smoke (batched).
+- **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/vip_backup_verify_5482_test.go, pkg/vrrp/README.md, _Log.md
+
 ## 2026-07-21 — #5480 fix: re-prime outbound bulk on every both-fabric reconnect
 
 - **Timestamp**: 2026-07-21 (fix/5480-reconnect-reprime)
