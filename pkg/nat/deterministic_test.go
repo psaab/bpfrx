@@ -299,6 +299,54 @@ func TestDeterministicV6RejectsSubnetPoolAddress(t *testing.T) {
 	}
 }
 
+// TestNAT64UninstallablePrefixRuleIsNotDeterministic covers the finding that a
+// NAT64 rule whose prefix the dataplane refuses to install (empty, non-/96,
+// extra-slash, or unparseable — userspace-dp/src/nat64.rs skips the whole rule)
+// must NOT expose its source pool as deterministic. Before the fix
+// nat64ReferencedPools counted any bare reference, so an empty-prefix rule
+// reported a confident mapping that no installed rule actually performs.
+func TestNAT64UninstallablePrefixRuleIsNotDeterministic(t *testing.T) {
+	wantDetail := "pool is not referenced by a NAT64 rule; translations are round-robin, not deterministic"
+	for _, prefix := range []string{"", "64:ff9b::", "64:ff9b::/64", "64:ff9b::/96/x", "not-an-ip/96"} {
+		view := v6View(1)
+		view.Config.Security.NAT.NAT64[0].Prefix = prefix
+		if _, e := LookupForward(view, "napt64-pool", "2001:db8:0:5::"); e == nil ||
+			e.Code != ErrCodeNotDeterministic || e.Detail != wantDetail {
+			t.Fatalf("prefix %q forward must be not-deterministic, got %v", prefix, e)
+		}
+		if _, e := LookupReverse(view, "napt64-pool", "198.51.100.1", 3584); e == nil ||
+			e.Code != ErrCodeNotDeterministic || e.Detail != wantDetail {
+			t.Fatalf("prefix %q reverse must be not-deterministic, got %v", prefix, e)
+		}
+	}
+	// Control: the canonical <ipv6>/96 rule stays deterministic.
+	if _, e := LookupForward(v6View(1), "napt64-pool", "2001:db8:0:5::"); e != nil {
+		t.Fatalf("valid /96 rule must stay deterministic, got %v", e)
+	}
+}
+
+// TestDeterministicV6RejectsIPv6PoolMember covers the finding that a mode-2
+// pool containing a non-IPv4 member must reject the WHOLE pool, mirroring Rust
+// parse_pool_v4 (`continue 'rules`, #3888 all-or-nothing). Before the fix the
+// v6 member was silently skipped and a mapping was invented from the surviving
+// v4 members.
+func TestDeterministicV6RejectsIPv6PoolMember(t *testing.T) {
+	for _, member := range []string{"2001:db8:aaaa::1", "2001:db8:aaaa::/64"} {
+		view := v6View(1)
+		p := view.Config.Security.NAT.SourcePools["napt64-pool"]
+		p.Addresses = []string{"198.51.100.1", member, "198.51.100.2"}
+		wantDetail := "NAT64 deterministic pool member \"" + member + "\" is not an IPv4 host; the dataplane skips the whole rule"
+		if _, e := LookupForward(view, "napt64-pool", "2001:db8:0:5::"); e == nil ||
+			e.Code != ErrCodeNotDeterministic || e.Detail != wantDetail {
+			t.Fatalf("mixed pool member %q forward must reject whole pool, got %v", member, e)
+		}
+		if _, e := LookupReverse(view, "napt64-pool", "198.51.100.1", 3584); e == nil ||
+			e.Code != ErrCodeNotDeterministic || e.Detail != wantDetail {
+			t.Fatalf("mixed pool member %q reverse must reject whole pool, got %v", member, e)
+		}
+	}
+}
+
 func TestDeterministicV4SubnetPoolStillExpands(t *testing.T) {
 	pool := &config.NATPool{
 		Addresses: []string{"203.0.113.0/28"},

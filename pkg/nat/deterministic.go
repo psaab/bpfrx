@@ -31,6 +31,7 @@ import (
 	"math"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -324,11 +325,39 @@ func nat64ReferencedPools(cfg *config.Config) map[string]bool {
 		return refs
 	}
 	for _, rs := range cfg.Security.NAT.NAT64 {
-		if rs != nil && rs.SourcePool != "" {
+		// Count a pool as deterministically enforced only when the referencing
+		// rule is one the dataplane actually installs. buildNAT64Snapshots
+		// (pkg/dataplane/userspace/nat64.go) drops a rule with an empty prefix,
+		// and userspace-dp/src/nat64.rs skips any rule whose prefix is not
+		// EXACTLY `<ipv6>/96` (the RFC 6052 well-known/network-specific prefix
+		// this build supports). A rule with an empty, non-/96, or unparseable
+		// prefix installs nothing, so its source pool's IPv6 subscribers are
+		// never mapped — exposing them as deterministic would confidently
+		// report a translation the dataplane does not perform (#5794 forensic
+		// accuracy). A bare reference (pre-fold) over-reported these.
+		if rs != nil && rs.SourcePool != "" && nat64PrefixInstallable(rs.Prefix) {
 			refs[rs.SourcePool] = true
 		}
 	}
 	return refs
+}
+
+// nat64PrefixInstallable mirrors the NAT64 rule-prefix gate in
+// userspace-dp/src/nat64.rs: a rule installs only when its prefix splits on
+// '/' into EXACTLY two parts, the mask parses as 96, and the address parses as
+// an IPv6 (not IPv4-mapped) address. An empty prefix, a missing/extra slash, a
+// non-/96 mask, or an unparseable address makes the dataplane skip the whole
+// rule, so the referenced pool is not deterministically enforced.
+func nat64PrefixInstallable(prefix string) bool {
+	parts := strings.Split(prefix, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	if n, err := strconv.Atoi(parts[1]); err != nil || n != 96 {
+		return false
+	}
+	ip := net.ParseIP(parts[0])
+	return ip != nil && ip.To4() == nil && ip.To16() != nil
 }
 
 // poolParams resolves a source pool's deterministic block-allocation
@@ -480,6 +509,14 @@ func expandPoolV4(pool *config.NATPool, mode Mode) ([]net.IP, *LookupError) {
 			}
 			ip4 := ipnet.IP.To4()
 			if ip4 == nil {
+				if mode == ModeV6 {
+					// NAT64 parse_pool_v4 (userspace-dp/src/nat64.rs) rejects any
+					// member that is not a bare IPv4 or IPv4/32 and skips the WHOLE
+					// rule (#3888 all-or-nothing), so an IPv6 member means the pool
+					// installs nothing — never a partial v4-only mapping.
+					return nil, lerrf(ErrCodeNotDeterministic,
+						"NAT64 deterministic pool member %q is not an IPv4 host; the dataplane skips the whole rule", a)
+				}
 				continue // IPv6 external — not part of the v4 index space
 			}
 			ones, bits := ipnet.Mask.Size()
@@ -506,6 +543,13 @@ func expandPoolV4(pool *config.NATPool, mode Mode) ([]net.IP, *LookupError) {
 		}
 		ip4 := ip.To4()
 		if ip4 == nil {
+			if mode == ModeV6 {
+				// See the CIDR branch above: NAT64 parse_pool_v4 rejects a
+				// non-IPv4 member and skips the whole rule, so a bare IPv6
+				// member yields no deterministic mapping at all.
+				return nil, lerrf(ErrCodeNotDeterministic,
+					"NAT64 deterministic pool member %q is not an IPv4 host; the dataplane skips the whole rule", a)
+			}
 			continue // IPv6 external — skip
 		}
 		out = append(out, ip4)
