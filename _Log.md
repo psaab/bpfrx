@@ -55992,6 +55992,58 @@ top.
   userspace-dp/src/afxdp/coordinator/README.md
 
 - **Timestamp**: 2026-07-22
+  **Action**: #4959 — address-only commit fail-closed on rejected apply_snapshot.
+  The samePlanRefresh path mutates ingress/local/interface-NAT classifier BPF
+  maps IN PLACE with ctrl enabled, then publishes apply_snapshot; a helper
+  rejection previously left the maps a generation ahead of the applied Rust
+  snapshot with ctrl still enabled (fail-open). Extracted
+  `failClosedUserspaceCtrlMapLocked` (shared classifier fail-closed) and added
+  `publishSnapshotFailClosedLocked`; Compile now routes its publish through it
+  with the samePlanRefresh flag, disabling ctrl (Enabled=0) on a same-plan
+  publish rejection. Chose option (b) — keep the lightweight same-plan fast
+  path — over adding addresses to snapshotBindingPlanKey (option a), which would
+  force every address edit through the bootstrap path (ctrl=0 + binding-row
+  clear = transit blip on every successful commit). Added fail-on-revert test
+  (firsthand-verified RED: ctrl stays Enabled=1 under revert) + a source-guard
+  on the Compile publish site. `go build ./...` + `go test ./pkg/dataplane/...`
+  green; privileged run of the new test passes.
+  **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/addr_only_commit_failclosed_4959_test.go,
+  docs/userspace-dataplane-architecture.md
+
+- **Timestamp**: 2026-07-22
+  **Action**: #4959 (folded hostile-review finding) — close the residual
+  fail-open at the SECOND apply_snapshot site. `syncSnapshotLocked` (the
+  status-loop deferred-publish resume path) published `apply_snapshot` with a
+  bare `requestLocked`; a rejection returned the error but left `ctrl`
+  Enabled=1. Trigger: an address-only commit landing during the XSK-startup
+  liveness-probe window — `Compile`'s `pendingXSKStartup` branch mutates the
+  classifier maps IN PLACE (`syncUserspaceClassifierMapsFailClosedLocked`) then
+  DEFERS the publish, so when the status loop finishes it via
+  `syncSnapshotLocked` a rejection strands the maps a generation ahead of the
+  applied snapshot (identical #4959 fail-open). Routed that publish through
+  `publishSnapshotFailClosedLocked(&publishSnap, &status, true)`. Verified
+  firsthand that `mapsMutatedInPlace=true` is UNCONDITIONALLY correct there:
+  the `pendingXSKStartup` branch is the sole producer of an unpublished
+  `m.lastSnapshot` ahead of `m.publishedSnapshot` (every other publish site —
+  Compile steady state, route-overlay, policy-scheduler, deferred-worker-arm —
+  advances `publishedSnapshot` only after a successful publish), so no
+  genuinely-fresh publish can reach this site. Added FAIL-ON-REVERT test
+  `TestDeferredPublishRejectedFailsClosed4959` (real seeded userspace_ctrl map
+  + rejecting control server; rejected deferred publish → ctrl Enabled=0;
+  companion success subtest asserts the publish lands and the wrap is
+  transparent) + source-guard `TestSyncSnapshotRoutesPublishThroughFailClosed
+  Helper4959` binding the syncSnapshotLocked publish site. Firsthand-verified
+  privileged: RED on revert (ctrl stays Enabled=1 when the wrap is dropped),
+  GREEN with it; success subtest stays GREEN under both. Pre-existing
+  environment-dependent FAILs in the package (`userspace_ingress_ifaces map not
+  loaded`, XDP-program-execution stat tests) reproduce identically at the
+  committed HEAD without this change. `gofmt` clean; `go build ./...` +
+  `go vet` green.
+  **File(s)**: pkg/dataplane/userspace/process_status.go,
+  pkg/dataplane/userspace/addr_only_commit_failclosed_4959_test.go,
+  docs/userspace-dataplane-architecture.md
   **Action**: #5079 — owner-side transfer-out lease so a requester-side
   post-ACK failover abort/crash cannot strand the demoted owner secondary.
   `RequestPeerFailover` demotes the remote owner (ManualFailover, VRRP resign)

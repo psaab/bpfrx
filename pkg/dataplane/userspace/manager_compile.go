@@ -329,8 +329,14 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// and Go can't track removal of those entries via the index.
 	publishSnap := *snap
 	publishSnap.Neighbors = filterPublishableNeighbors(snap.Neighbors)
-	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
-		return result, fmt.Errorf("publish userspace snapshot: %w", err)
+	// #4959: on the samePlanRefresh path the classifier BPF maps were already
+	// mutated IN PLACE above (syncUserspaceClassifierMapsFailClosedLocked) with
+	// ctrl still enabled; publishSnapshotFailClosedLocked disables ctrl if this
+	// publish is rejected so the maps can never run a generation ahead of the
+	// applied Rust snapshot (fail-open). The bootstrap path already set
+	// ctrl.Enabled=0, so it needs no extra fail-closed.
+	if err := m.publishSnapshotFailClosedLocked(&publishSnap, &status, samePlanRefresh); err != nil {
+		return result, err
 	}
 	m.logWgEndpointSetTransitionLocked(&publishSnap, "apply")
 	m.lastSnapshot = snap
@@ -394,6 +400,37 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	m.cfg = ucfg
 	m.recordApplyResultLocked(dataplane.ApplyResultFromCompileResult(result), caps, snap.Generation)
 	return result, nil
+}
+
+// publishSnapshotFailClosedLocked sends apply_snapshot to the running helper and
+// makes an in-place classifier-map refresh + helper publish one fail-closed
+// transaction (#4959).
+//
+// When mapsMutatedInPlace is true the caller took the samePlanRefresh path: the
+// ingress/local/interface-NAT classifier BPF maps were mutated IN PLACE to the
+// new plan while the XDP shim's ctrl gate is still enabled. If the helper then
+// REJECTS the snapshot (helper-side validation failure, or any transport error)
+// it keeps enforcing the previous-good snapshot, so returning the error while
+// leaving ctrl enabled would run the shim against classifier maps a generation
+// ahead of the applied Rust snapshot — wrong kernel-pass vs XSK-redirect and
+// wrong local-vs-interface-NAT ownership, a fail-OPEN security/availability
+// mismatch instead of the intended previous-good retention. On that path a
+// publish error disables ctrl (failClosedUserspaceCtrlMapLocked) so transit
+// drops to the kernel-only fail-closed posture until a subsequent good commit
+// re-publishes and re-enables it.
+//
+// When mapsMutatedInPlace is false the caller took the full bootstrap path,
+// which already programmed ctrl.Enabled=0 before this publish, so a publish
+// error is already fail-closed and the error is returned unchanged.
+func (m *Manager) publishSnapshotFailClosedLocked(publishSnap *ConfigSnapshot, status *ProcessStatus, mapsMutatedInPlace bool) error {
+	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: publishSnap}, status); err != nil {
+		publishErr := fmt.Errorf("publish userspace snapshot: %w", err)
+		if mapsMutatedInPlace {
+			return m.failClosedUserspaceCtrlMapLocked(publishSnap, publishErr)
+		}
+		return publishErr
+	}
+	return nil
 }
 
 // UpdatePolicyScheduleState republishes the userspace policy snapshot with one

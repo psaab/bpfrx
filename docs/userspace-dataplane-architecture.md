@@ -1235,6 +1235,55 @@ case and an explicit operator `hold-interval` drop (an empty book matches
 nothing — fail-closed for an allowlist, the operator-opted fail-open for a
 denylist).
 
+**Classifier-map publish is a fail-closed transaction (#4959).** The manager
+keeps a `snapshotBindingPlanKey` (`maps_sync.go`) over the worker/ring/
+interface-binding/fabric plan. When a commit does NOT change that key — the
+common **address-only** commit that edits a local address or an interface-NAT
+address — `Compile` takes the lightweight `samePlanRefresh` path: it rewrites
+the ingress / local-address / interface-NAT classifier BPF maps **in place**
+(`syncUserspaceClassifierMapsFailClosedLocked`) rather than re-bootstrapping the
+helper, then publishes the new `apply_snapshot`. The XDP shim reads those
+classifier maps live (kernel-pass vs XSK-redirect, local-vs-interface-NAT
+ownership) while `ctrl.Enabled == 1`. If the helper then **rejects** the
+snapshot (a helper-side validation failure, or any transport error) it keeps
+enforcing the previous-good snapshot — so the freshly-mutated maps would be a
+generation *ahead* of the applied Rust snapshot with the shim still enabled: a
+fail-**open** classifier/snapshot mismatch (wrong kernel delivery / wrong XSK
+steering). The publish therefore routes through `publishSnapshotFailClosedLocked`
+with the `samePlanRefresh` flag: on a same-plan publish error it disables
+`ctrl` (`failClosedUserspaceCtrlMapLocked` → `Enabled=0`) so transit drops to
+the kernel-only fail-closed posture until a subsequent good commit re-publishes
+and re-enables it (`applyHelperStatusLocked`). The full **bootstrap** path
+(binding plan changed) already programs `ctrl.Enabled=0` in
+`programBootstrapMapsLocked` before the publish, so it is fail-closed without
+extra work — which is why the fix keeps the same-plan fast path instead of
+forcing every address edit through a bootstrap (that would clear binding rows
+and blip transit on every successful commit). Distinct from the Rust-side
+reconcile-ordering invariant (#2440/#2444/#3789) above: that one keeps the Rust
+process fail-closed across teardown; this one keeps the **Go-owned classifier
+BPF maps** consistent with the applied snapshot.
+
+The **same fail-closed transaction covers the deferred-publish resume path.**
+There are two `apply_snapshot` publish sites for a same-plan refresh. `Compile`
+publishes synchronously in the steady state, but during **XSK startup** (the
+liveness-probe window after the initial publish, before liveness is proven or
+failed) it takes the `pendingXSKStartup` branch: it still mutates the classifier
+maps **in place** (`syncUserspaceClassifierMapsFailClosedLocked`) with `ctrl`
+already flipped to `Enabled=1` to probe, but **defers** the publish and returns
+success. The status loop then completes the publish via `syncSnapshotLocked`
+(`process_status.go`). An address-only commit landing inside that window is
+exactly this case: the maps are already a generation ahead, so a rejected
+deferred publish is the identical fail-open. `syncSnapshotLocked` therefore
+routes its publish through `publishSnapshotFailClosedLocked` with
+`mapsMutatedInPlace=true`. That flag is unconditional there because the
+`pendingXSKStartup` branch is the **sole producer** of an unpublished
+`m.lastSnapshot` ahead of `m.publishedSnapshot` — every other publish site
+(`Compile` steady state, route-overlay, policy-scheduler, deferred-worker-arm)
+advances `publishedSnapshot` only *after* a successful publish, so none can
+strand a not-yet-mutated snapshot for the status loop to pick up. On a rejection
+`ctrl` drops to `Enabled=0`; a successful deferred publish is transparent and
+leaves the enable side to `applyHelperStatusLocked`.
+
 #### Capability Check
 
 The manager evaluates the active config to determine whether the userspace
