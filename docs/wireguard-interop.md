@@ -383,6 +383,47 @@ traffic to the wgN device and the WG control thread owns egress — is the
 primary path; this AF_XDP transit-egress builder is the secondary path (see the
 `frame/wg.rs` module header).
 
+**#6308 (transit-egress TX DISPATCH — physical egress binding, the other half of
+#5292).** #5292 fixed the outer FRAME bytes; the egress-NIC DISPATCH is the
+other half of the same zeroed-endpoint problem. The TX dispatcher picks the
+egress XSK binding from `decision.resolution.tx_ifindex` (the physical bind
+ifindex) or, when that is 0, from `resolve_tx_binding_ifindex(egress_ifindex)`
+(`forward_request::resolve_forward_target_ifindex`). Because
+`resolve_tunnel_forwarding_resolution` resolves the ZEROED WG endpoint
+destination (#2837), a WG transit-egress flow stores `egress_ifindex =` the
+LOGICAL wgN ifindex and:
+
+- **WG transport table HAS a default route** — the `0.0.0.0`/`::` lookup matches
+  it, so `tx_ifindex =` the default egress bind ifindex (the physical WAN
+  parent, the same NIC carrying the VLAN-tagged reth0.80 path). Dispatch already
+  egresses the correct port; the peer-route resolution is NOT consulted (the
+  `tx_ifindex > 0` fast path). **Common case, unchanged.**
+- **ONLY a specific peer route, NO default** — `0.0.0.0`/`::` NoRoutes →
+  `tx_ifindex = 0` → the fallback `resolve_tx_binding_ifindex(logical wgN)`
+  returns the logical ifindex, which has **no XSK binding**, so the TX
+  dispatcher `NO_EGRESS_BINDING`-DROPS a frame #5292 built correctly (the bytes
+  were right; the packet never egressed). This was the #6308 bug.
+
+The fix resolves the physical underlay egress against the SAME selected-peer
+route #5292 uses for the bytes — `wg::wg_transit_egress_physical_egress_ifindex`
+(re-exported from `frame`) runs `wg_peer_outer_dst` → `engine.peer_for_dest`
+(the inner-destination AllowedIPs LPM) →
+`outer_physical_egress_resolution` → `outer_egress_ifindex_or_fallback`, and
+`resolve_forward_target_ifindex` feeds that physical egress into
+`resolve_tx_binding_ifindex`. So the dispatch SSOT and the frame-bytes SSOT
+agree on ONE physical NIC. Non-WG flows and unresolvable-peer flows keep the
+pre-#6308 logical fallback (fail-closed identical to before), and the extra FIB
+LPM runs ONLY on the `tx_ifindex == 0` (previously-dropped) path — default-route
+WG traffic and every non-WG forward pay nothing. Like #5292, this changes only
+the secondary AF_XDP transit-egress path (not the canonical wgN-TUN topology
+where the WG control thread owns egress); the upstream resolution SSOT
+(`resolve_tunnel_forwarding_resolution`) is deliberately left storing the
+logical `egress_ifindex` + `tx_ifindex = 0` (#2837). RED-on-revert:
+`wg_transit_egress_dispatch_specific_peer_no_default_6308` (a specific-peer-route
++ no-default WG flow dispatches to reth0.80's physical parent NIC, not the
+logical wgN 400 → `NO_EGRESS_BINDING`; a default-route flow with `tx_ifindex >
+0` still dispatches to the default egress verbatim).
+
 **#2703 (outer TTL default).** A tunnel TTL of `0` is the "use the default
 64" sentinel in the Go config (`schema_interfaces.go`, `types_routing.go`),
 and the netlink GRE path applies it (`pkg/routing/tunnel.go: if ttl == 0 {

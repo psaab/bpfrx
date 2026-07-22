@@ -56599,3 +56599,31 @@ top.
 - **File(s)**: pkg/routing/tunnel.go, pkg/routing/tunnel_wireguard.go,
   pkg/routing/tunnel_keepalive_runner.go, pkg/snmp/agent.go,
   pkg/snmp/agent_ber.go, pkg/routing/README.md, pkg/snmp/README.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6308 (WG transit-egress TX DISPATCH SSOT — follow-up to
+  #5292/#6306) — the AF_XDP WireGuard transit-egress DISPATCH selected the
+  egress NIC from the zeroed-endpoint resolution's tx_ifindex/egress_ifindex
+  (#2837 stores tx_ifindex=0 / egress=logical wgN). With a default route in
+  the WG transport table tx_ifindex>0 resolves to the physical WAN parent and
+  dispatch works (common case). With ONLY a specific peer route and NO default,
+  tx_ifindex=0 → resolve_tx_binding_ifindex(logical wgN) returned the logical
+  ifindex (no XSK binding) → the TX dispatcher NO_EGRESS_BINDING-DROPPED a frame
+  #5292 built correctly. Fix: resolve the physical underlay egress against the
+  SAME selected-peer route #5292 uses for the frame bytes
+  (wg_transit_egress_physical_egress_ifindex → wg_peer_outer_dst →
+  outer_physical_egress_resolution → outer_egress_ifindex_or_fallback), fed
+  through resolve_forward_target_ifindex → resolve_tx_binding_ifindex — so
+  dispatch and bytes agree on one physical NIC. The peer-route resolution runs
+  ONLY on the tx_ifindex==0 (previously-dropped) path; default-route WG traffic
+  and every non-WG forward keep the zero-extra-work tx_ifindex>0 fast path.
+  RED-on-revert (assertion, target-count 1): reverting the WG dispatch
+  resolution to resolve_tx_binding_ifindex(logical) makes
+  wg_transit_egress_dispatch_specific_peer_no_default_6308 fail with left=400
+  (logical wgN) vs right=6 (reth0.80 physical parent). Full cargo suite green:
+  4124 + 60 + 8 + 22 + 1, 0 failed; named test 3x clean.
+- **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/forward_request.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs,
+  userspace-dp/src/afxdp/frame/README.md, docs/wireguard-interop.md

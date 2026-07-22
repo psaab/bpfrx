@@ -809,6 +809,130 @@ fn wg_encap_builds_when_zeroed_decision_has_no_l2() {
     );
 }
 
+// === #6308: the WG transit-egress TX DISPATCH must target the SELECTED peer's
+// PHYSICAL egress NIC — the SAME physical egress #5292 resolved the frame BYTES
+// against — even when the WG transport table carries ONLY a specific peer route
+// and NO default route. The zeroed WG endpoint destination (#2837) resolves to
+// tx_ifindex = 0 / egress_ifindex = the LOGICAL wgN ifindex, so the pre-#6308
+// dispatch fallback `resolve_tx_binding_ifindex(logical wgN)` returned the
+// logical ifindex (no XSK binding) and the TX dispatcher NO_EGRESS_BINDING-
+// dropped a correctly-built frame. ===
+
+#[test]
+fn wg_transit_egress_dispatch_specific_peer_no_default_6308() {
+    // The shared #2680 fixture is EXACTLY the #6308 scenario: the WG transport
+    // table (inet.0) has ONLY the specific peer route 203.0.113.0/24 → reth0.80
+    // (ifindex 12) and NO default route. Sanity-assert the no-default
+    // precondition so the test can't silently stop exercising it.
+    let state = build_forwarding_state(&wg_outer_mtu_snapshot());
+    assert!(
+        state
+            .routes_v4
+            .values()
+            .flatten()
+            .all(|r| r.prefix.prefix_len() != 0),
+        "fixture must carry NO default route (the #6308 specific-peer-route + \
+         no-default-route case)"
+    );
+
+    // The resolution the SSOT actually stores for this flow (zeroed WG endpoint
+    // destination → NoRoute for 0.0.0.0): tx_ifindex = 0, egress_ifindex = the
+    // logical wgN ifindex (400).
+    let decision = wg_tunnel_decision(400, 1);
+    assert_eq!(
+        decision.resolution.tx_ifindex, 0,
+        "no-default-route WG resolution stores tx_ifindex 0"
+    );
+    assert_eq!(
+        decision.resolution.egress_ifindex, 400,
+        "WG resolution stores the LOGICAL wgN egress ifindex"
+    );
+
+    let frame = inner_v4_frame(); // dst 10.123.0.9 ∈ AllowedIPs 10.123.0.0/24
+    let meta = inner_v4_meta();
+
+    // The peer-route physical-egress SSOT resolves reth0.80 (ifindex 12) — the
+    // SAME physical egress #5292 resolves the frame bytes against — NOT the
+    // logical wgN ifindex (400).
+    assert_eq!(
+        wg_transit_egress_physical_egress_ifindex(
+            &decision,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        Some(12),
+        "WG dispatch must resolve the SELECTED peer's physical egress \
+         (reth0.80 ifindex 12), not the logical wgN ifindex (400)"
+    );
+
+    // The DISPATCH target the TX dispatcher looks up an XSK binding for: the
+    // physical PARENT NIC of reth0.80 (bind_ifindex, which HAS a binding), NOT
+    // the logical wgN 400 (which does not → NO_EGRESS_BINDING drop).
+    let expected_physical_bind = state
+        .egress
+        .get(&12)
+        .map(|e| e.bind_ifindex)
+        .expect("reth0.80 egress row present");
+    let target = crate::afxdp::forward_request::resolve_forward_target_ifindex(
+        &decision,
+        &state,
+        &frame,
+        meta.addr_family,
+        meta.l3_offset,
+    );
+    assert_eq!(
+        target, expected_physical_bind,
+        "dispatch must target reth0.80's physical parent NIC \
+         (bind_ifindex {expected_physical_bind})"
+    );
+    assert_ne!(
+        target, 400,
+        "dispatch must NOT target the logical wgN ifindex (400) — the pre-#6308 \
+         fallback that has no XSK binding and NO_EGRESS_BINDING-drops the frame"
+    );
+
+    // Common case (no regression): a WG transport table WITH a default route
+    // resolves tx_ifindex > 0 (the default egress bind ifindex = the physical
+    // WAN parent). The dispatcher takes that verbatim and never consults the
+    // peer-route resolution. Simulate the resolved decision and assert dispatch
+    // returns it unchanged.
+    let mut default_route_decision = decision;
+    default_route_decision.resolution.tx_ifindex = expected_physical_bind;
+    assert_eq!(
+        crate::afxdp::forward_request::resolve_forward_target_ifindex(
+            &default_route_decision,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        expected_physical_bind,
+        "default-route WG flow (tx_ifindex > 0) must dispatch to the default \
+         egress verbatim — the common case is unchanged"
+    );
+
+    // A non-WG (plain-forward) decision must NOT trigger the WG dispatch
+    // resolution: the helper returns None so the caller keeps the pre-#6308
+    // logical fallback for every non-tunnel flow.
+    let mut plain = decision;
+    plain.resolution.tunnel_endpoint_id = 0;
+    plain.resolution.egress_ifindex = 12;
+    plain.resolution.tx_ifindex = 0;
+    assert_eq!(
+        wg_transit_egress_physical_egress_ifindex(
+            &plain,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        None,
+        "a non-WG decision must not trigger the WG dispatch resolution"
+    );
+}
+
 /// Minimal L2/IPv6/UDP inner frame with dst in `fd00:123::/64` so
 /// `peer_for_dest` selects the v6-endpoint peer.
 fn inner_v6_frame() -> Vec<u8> {
