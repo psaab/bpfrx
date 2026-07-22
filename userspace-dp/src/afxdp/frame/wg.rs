@@ -42,14 +42,49 @@ fn wg_encapped_size(inner_len: usize, outer_v6: bool) -> usize {
     wg_record_len + outer_ip_len + 8
 }
 
-/// Test-only seam: counts every entry into `outer_physical_egress_ifindex`
+/// Test-only seam: counts every entry into `outer_physical_egress_resolution`
 /// (each one performs exactly one outer-underlay FIB LPM). `wg_encap_frame`
 /// resolves the outer route ONCE per packet (#3992); a test resets this to 0,
 /// builds one frame, and asserts the count is exactly 1 (it was 2 before the
-/// dedup). Relies on serial test execution (the suite runs `--test-threads=1`).
+/// dedup).
+///
+/// #6294: this counter is THREAD-LOCAL, not a process-global atomic. The
+/// default `cargo test` runs the suite in parallel, and every sibling
+/// `wg_encap_frame` / `outer_*` test bumps this same counter. A process-global
+/// value let a sibling's bump land between #6294's reset and read, corrupting
+/// the exact `== 1` assertion (a load-sensitive flake, not a product bug). A
+/// thread-local counter isolates each test thread's count: a test resets,
+/// bumps, and reads entirely on its own thread, so no parallel sibling can
+/// interfere — strictly stronger than serializing every bumper behind a lock,
+/// and it needs no guard threaded through the ~14 outer-resolution tests. The
+/// single-threaded test flow (reset -> one `wg_encap_frame` -> read) is
+/// bit-identical to the former atomic. See `wg_tests.rs`'s
+/// `outer_route_resolve_count_is_thread_local_isolated` for the fail-on-revert.
 #[cfg(test)]
-pub(super) static OUTER_ROUTE_RESOLVE_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static OUTER_ROUTE_RESOLVE_COUNT: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+/// Reset THIS thread's `OUTER_ROUTE_RESOLVE_COUNT` (see the counter doc). A
+/// test calls this immediately before the single `wg_encap_frame` it measures.
+#[cfg(test)]
+pub(super) fn outer_route_resolve_count_reset() {
+    OUTER_ROUTE_RESOLVE_COUNT.with(|c| c.set(0));
+}
+
+/// Read THIS thread's `OUTER_ROUTE_RESOLVE_COUNT` (see the counter doc).
+#[cfg(test)]
+pub(super) fn outer_route_resolve_count() -> usize {
+    OUTER_ROUTE_RESOLVE_COUNT.with(std::cell::Cell::get)
+}
+
+/// Bump THIS thread's `OUTER_ROUTE_RESOLVE_COUNT` by one. Called from the
+/// single outer-underlay FIB LPM site (`outer_physical_egress_resolution`)
+/// and, directly, by the #6294 thread-local-isolation fail-on-revert test.
+#[cfg(test)]
+pub(super) fn outer_route_resolve_count_bump() {
+    OUTER_ROUTE_RESOLVE_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
+}
 
 /// Resolve the PHYSICAL underlay egress ifindex the OUTER (WG/UDP) datagram
 /// actually leaves on, for a tunnel-resolved encap decision (#2680/#2701).
@@ -159,7 +194,7 @@ fn outer_physical_egress_resolution(
     outer_dst: IpAddr,
 ) -> ForwardingResolution {
     #[cfg(test)]
-    OUTER_ROUTE_RESOLVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    outer_route_resolve_count_bump();
     // #2734: WG outer underlay resolution is per-tunnel-endpoint, not
     // per-inner-flow — pass None (per-destination ECMP spread).
     match outer_dst {
