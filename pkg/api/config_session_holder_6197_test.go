@@ -60,8 +60,8 @@ func exitRESTConfigSession(t *testing.T, s *Server, sessionID string) {
 // TestRESTConfigSessionsAreMutuallyExcluded is the fail-on-revert guard for
 // #6197. It obtains two independently issued REST identities, lets session A
 // hold and edit the candidate, then proves session B cannot set or commit it.
-// Replacing the request token with the old shared holder identity "rest" makes
-// both B operations succeed and turns this test RED.
+// Reverting to a single shared valid holder identity (so A and B are no longer
+// distinguished) makes both B operations succeed and turns this test RED.
 func TestRESTConfigSessionsAreMutuallyExcluded(t *testing.T) {
 	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	commitCalled := false

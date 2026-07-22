@@ -36,8 +36,7 @@ func (s *Store) ensureWritableLocked() error {
 // MUST hold s.mu.
 //
 // Two deliberate bypasses:
-//   - sessionID == "" is the internal/system capability (daemon apply, the
-//     stateless REST config-enter path, HA sync, in-process CLI, tests). These
+//   - sessionID == "" is the internal/system capability (daemon apply, HA sync, in-process CLI, tests). These
 //     do not carry a peer session and must not be blocked.
 //   - a lock with no recorded holder (effectiveHolderLocked() == "", i.e. the
 //     internal/local EnterConfigure() path) is not owned by any session, so a

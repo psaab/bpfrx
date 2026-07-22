@@ -750,7 +750,7 @@ ends (`configLockStatsHandler`'s `ConnEnd` in `pkg/grpcapi`, #5849, calls
 never on per-RPC cancellation, so a cancelled unary no longer discards the
 connection's candidate). The **REST** config
 path has no such hook: `POST /api/v1/config/enter`
-(`configEnterHandler`) takes the global lock with an empty holder, and a
+(`configEnterHandler`) takes the global lock with a per-session holder token (#6197; historically an empty holder, which #6196/#6197 replaced), and a
 stateless HTTP client that never calls `/config/exit` leaves it held. On
 its own that wedged every CLI/gRPC/REST config edit with `ErrConfigLocked`
 until `clear system config-lock` or a daemon restart — a management-plane
