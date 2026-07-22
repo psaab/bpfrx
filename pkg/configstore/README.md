@@ -586,6 +586,25 @@ per-path:
   (`DefaultArchiveDir` = `/var/lib/xpf/archive`); a custom / remote /
   compliance archive destination is not provably xpf-owned, so it is
   SKIPPED with a warning rather than blindly deleted.
+- **Archive-writer fence + join (#5869 / #6182, extended in #6185).**
+  Erasing the directory is not enough — an archive writer can recreate it
+  AFTER the wipe. Auto-archive launches a fire-and-forget writer goroutine
+  per commit (`commitWithDescriptionLocked`) and `writeArchive` starts with
+  `os.MkdirAll(archiveDir)`, so a writer scheduled just before a `zeroize`
+  could resume after `FactoryResetArchiveDir` removed the archive dir and
+  drop a `config-<ts>.<seq>.conf` snapshot of the PRIOR tenant's full config
+  text back on disk — re-tenant secret residue. `Store` gains `archiveWG`
+  (tracks in-flight writers) and `archiveFenced` (a one-way latch).
+  `QuiesceArchival()` sets the fence under `s.mu` (no NEW writer launches;
+  the `Add`/`Wait` ordering is race-free) then `archiveWG.Wait()` JOINS every
+  in-flight writer — the load-bearing half, since a fence alone cannot close
+  the write-after-wipe window. `ResumeArchival()` clears the fence only on the
+  fail-closed recoverable path. **#6185:** the SYNCHRONOUS `Store.ArchiveConfig`
+  path (zero production callers today) now honors the SAME fence — it no-ops
+  when fenced and registers in `archiveWG` when not, so a future operator
+  wiring (`request system configuration archive`) cannot bypass the zeroize
+  fence. `daemon.factoryReset` calls `QuiesceArchival()` after entering the
+  reset generation and before the wipe.
 - **`CommitConfirmed` ordering.** Confirm state is only touched after
   the persist succeeds: on failure the rollback timer is NOT armed and
   an existing pending confirm (timer + rollback target) is left fully

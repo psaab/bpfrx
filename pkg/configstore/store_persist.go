@@ -523,18 +523,54 @@ func (s *Store) ResumeArchival() {
 // text and the timestamp are captured together under the lock so the
 // written archive matches the config that was active at the call (#3441 H4),
 // then the actual write happens off-lock via writeArchive.
+//
+// #6185: this SYNCHRONOUS archive path honors the #5869/#6182 archive fence
+// exactly like the async auto-archive launch guard. It has zero production
+// callers today, but if it is ever wired to an operator command (e.g.
+// `request system configuration archive`) an unfenced call could run AFTER a
+// factory reset (zeroize) has set the fence and erased the archive directory —
+// writeArchive would MkdirAll it back and drop a config-<ts>.<seq>.conf
+// snapshot of the PRIOR tenant's full config text (cleartext IKE PSKs,
+// WireGuard keys, SNMP communities) on a re-tenanted device, reopening the
+// exact residue #5869 closed for the async path. So it (1) no-ops when the
+// fence is set and (2) registers itself in archiveWG when it is not, so a
+// concurrent QuiesceArchival JOINs an in-flight synchronous write before the
+// wipe — the fence alone cannot close the write-after-wipe window.
 func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
-	// Capture the text, timestamp AND the monotonic seq together under the
-	// lock (#3441 H4, Codex MAJOR): the previous code called time.Now()
-	// AFTER releasing the lock, an ordering race that could mislabel the
-	// archive relative to a concurrent commit. Capturing all three under
-	// the lock matches the commit path and keeps (ts,seq) consistent with
-	// the actual active-config snapshot.
+	// Capture the fence check, the text, timestamp, the monotonic seq AND the
+	// writer registration (archiveWG.Add) together under the lock. The seq/ts
+	// capture matches the commit path (#3441 H4, Codex MAJOR): the previous
+	// code called time.Now() AFTER releasing the lock, an ordering race that
+	// could mislabel the archive relative to a concurrent commit.
+	//
+	// #6185: the fence read and the Add(1) run under s.mu guarded by
+	// !archiveFenced, exactly like the async launch guard, so the Add/Wait
+	// ordering stays race-free: QuiesceArchival sets archiveFenced under s.mu
+	// (write lock) before it Wait()s, and that write lock is mutually exclusive
+	// with this RLock — so a concurrent QuiesceArchival either observes this
+	// writer in archiveWG and JOINs it (we Added before it took the write lock)
+	// or sets the fence first and we no-op (we read fenced=true and never Add).
+	// The counter can never rise from zero concurrently with Wait.
 	s.mu.RLock()
+	if s.archiveFenced.Load() {
+		// A factory reset is erasing the archive directory; do not recreate it.
+		s.mu.RUnlock()
+		return nil
+	}
 	data := s.active.Format()
 	ts := time.Now()
 	seq := s.archiveSeq.Add(1)
+	s.archiveWG.Add(1)
 	s.mu.RUnlock()
+	// The write happens off-lock (writeArchive never touches s.mu, so a
+	// concurrent QuiesceArchival Wait()ing on archiveWG cannot deadlock on the
+	// store lock), and Done fires only after it completes so the JOIN covers
+	// the whole MkdirAll + atomic write.
+	defer s.archiveWG.Done()
+	// #6185: the same test-only seam the async writer uses, letting a test hold
+	// this synchronous writer MID-FLIGHT (past the fence check) to prove
+	// QuiesceArchival JOINS it before a wipe. Production is a no-op.
+	archiveWriteBarrier()
 	return writeArchive(archiveDir, maxArchives, data, ts, seq)
 }
 

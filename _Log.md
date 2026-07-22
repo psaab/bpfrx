@@ -1,3 +1,42 @@
+## 2026-07-22 — #6185: fence synchronous ArchiveConfig against the zeroize fence
+
+- **Timestamp**: 2026-07-22 (fix/6185-archiveconfig-fence)
+- **Action**: Fenced the SYNCHRONOUS archive path (`Store.ArchiveConfig`,
+  `pkg/configstore/store_persist.go`) against the #5869/#6182 zeroize archive
+  fence. #6182 fenced + joined the ASYNC fire-and-forget `writeArchive`
+  goroutine (`archiveFenced` + `archiveWG`), but `ArchiveConfig` did NOT consult
+  the fence and was NOT tracked by the WaitGroup. It has zero production callers
+  today, but if it were ever wired to an operator command (e.g. `request system
+  configuration archive`) a fenced-window call would `os.MkdirAll` + rewrite the
+  archive dir after `FactoryResetArchiveDir` erased it — recreating a
+  `config-<ts>.<seq>.conf` snapshot of the PRIOR tenant's full config text
+  (cleartext IKE PSKs, WireGuard keys, SNMP communities) — reopening the #5869
+  re-tenant residue for that path. `ArchiveConfig` now (1) no-ops when the fence
+  is set (checked under `s.mu`, mirroring the async launch guard) and (2)
+  `archiveWG.Add(1)`s under the lock guarded by `!archiveFenced` and `Done()`s
+  after the off-lock write, so a concurrent `QuiesceArchival` JOINS an in-flight
+  synchronous write before the wipe. Lock discipline matches the async path: the
+  fence read + Add run under the RLock (mutually exclusive with QuiesceArchival's
+  write-Lock fence-set), so the Add/Wait ordering stays race-free and no deadlock
+  (writeArchive never touches `s.mu`). Routed the sync path through the existing
+  `archiveWriteBarrier` seam so the JOIN is deterministically testable.
+- **Tests**: `pkg/configstore/archiveconfig_fence_6185_test.go` (new) —
+  `TestArchiveConfigFencedDoesNotRecreateArchiveDir` (MANDATORY fail-on-revert:
+  QuiesceArchival sets fence → ArchiveConfig must NOT recreate the dir;
+  neutralizing the fence guard → RED, dir reappears with the snapshot),
+  `TestArchiveConfigUnfencedArchivesNormally` (control: un-fenced sync path still
+  writes one snapshot carrying the config text),
+  `TestQuiesceArchivalJoinsInflightSyncArchiveConfig` (JOIN fail-on-revert:
+  removing the `archiveWG.Add(1)` → QuiesceArchival returns before joining → RED),
+  and `TestResumeArchivalReenablesCommitArchival` (#6185 note 2: fence → prove a
+  fenced commit does NOT archive → ResumeArchival clears the fence → a subsequent
+  commit archives normally; WaitGroup reusable, no corrupt state). Verified RED on
+  revert for both fences; `go build ./...`, `go vet`, `go test -race
+  ./pkg/configstore/...` full suite pass, 5x non-flake.
+- **File(s)**: pkg/configstore/store_persist.go, pkg/configstore/store_commit.go,
+  pkg/configstore/archiveconfig_fence_6185_test.go (new),
+  docs/system-login.md, pkg/configstore/README.md, _Log.md
+
 ## 2026-07-22 — #6114: mirror flow-cache HOT path samples before reserving
 
 - **Timestamp**: 2026-07-22 (fix/6114-mirror-sample-before-cas)
