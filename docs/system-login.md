@@ -415,6 +415,15 @@ through that single shared primitive so they wipe the same archive.
   **fail-closed recoverable wipe** the daemon stays up and resumes normal work, so
   it also `ResumeArchival()`s (clears the fence); on a **successful** wipe the
   daemon is stopped and the fence stays latched.
+  - **Synchronous `Store.ArchiveConfig` is fenced too (#6185).** The same fence
+    now also gates the **synchronous** archive path. `Store.ArchiveConfig` has
+    **zero** production callers today, but if it were ever wired to an operator
+    command (e.g. `request system configuration archive`) an unfenced call could
+    run **after** the fence was set and the archive dir erased, `os.MkdirAll` it
+    back, and drop a prior-tenant snapshot — reopening the residue for that path.
+    It now (1) **no-ops** when the fence is set and (2) registers itself in
+    `archiveWG` when it is not, so a concurrent `QuiesceArchival` **joins** an
+    in-flight synchronous write before the wipe, exactly like the async writer.
 
 **Privileged-subcommand exception — `monitor traffic` (#4067).** Almost
 every command is gated on the top-level word alone, but `monitor traffic`

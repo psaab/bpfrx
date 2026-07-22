@@ -71,12 +71,25 @@
 //!   screen event (see `take_pressure_event`) so the operator is told the
 //!   detector is saturated — never a per-flow log.
 //!
-//! - **Budgeted, window-aware cleanup (#4353/#4379).** The periodic sweep
-//!   walks the source table (`HashMap::retain`, O(sources)) but removes at
-//!   most `CLEANUP_BUDGET` expired entries per call, so the per-tick MUTATION
-//!   cost is bounded even though the scan is not. The real ceiling on the walk
-//!   is the `MAX_SOURCES_PER_ZONE` per-zone source cap, which bounds the table
-//!   size itself; the budget just spreads reclamation across ticks. The reap
+//! - **Bounded-EXAMINATION, window-aware cleanup (#4353/#4379/#6239).** The
+//!   periodic sweep EXAMINES at most `CLEANUP_BUDGET` candidates per call and
+//!   removes only those found expired — the per-call cost is O(`CLEANUP_BUDGET`)
+//!   regardless of the table size. #6239 replaced the pre-existing
+//!   `HashMap::retain` walk, which WALKED every entry (O(sources)) and budgeted
+//!   only the REMOVALS: once the removal budget was spent, `retain` still
+//!   visited every remaining bucket on ONE packet worker — an attacker who
+//!   populated sources across many zones re-created the exact per-packet
+//!   full-table-scan latency spike #2209 forbade. The bounded form keeps a
+//!   dense `key_ring` of live source keys and a PERSISTENT round-robin
+//!   `cleanup_cursor`: each call examines the next `CLEANUP_BUDGET` ring slots
+//!   and advances, so every source is eventually visited across calls WITHOUT
+//!   any single call walking the whole table. Removal is an O(1) swap-remove of
+//!   the ring slot routed — like eviction — through the SINGLE `remove_src`
+//!   primitive, which drops the key from `per_src`, `per_zone_srcs`, AND the
+//!   `key_ring` in lock-step (a removal touching only one index would corrupt
+//!   the O(1) zone cap count or the cursor domain). Table size is still
+//!   independently bounded by the `MAX_SOURCES_PER_ZONE` per-zone source cap;
+//!   the cursor just spreads reclamation across ticks. The reap
 //!   floor is WINDOW-AWARE: #4353 made the `threshold` a configurable
 //!   MICROSECOND detection window that the compiler PRESERVES even above the
 //!   Junos 1s max, so cleanup is passed the LONGEST configured window across
@@ -130,9 +143,13 @@ const MAX_SOURCES_PER_ZONE: usize = 4096;
 /// configurable `threshold` is the detection WINDOW in microseconds instead.
 const MAX_UNIQUE_PER_SOURCE: usize = 1024;
 
-/// Maximum expired entries removed per `cleanup` call. Bounds the
-/// worst-case per-tick cleanup cost so a large source table cannot stall
-/// a single poll tick.
+/// Maximum candidates a single `cleanup` call EXAMINES — and therefore the
+/// most it can remove — per tick (#6239). Bounds the worst-case per-tick
+/// cleanup cost to O(`CLEANUP_BUDGET`) so a large source table cannot stall a
+/// single packet worker. Pre-#6239 this bounded only the REMOVALS while the
+/// `HashMap::retain` walk still examined every entry (O(sources)); the cursor
+/// sweep now bounds the EXAMINED work too, and eventual coverage of the whole
+/// table is preserved by advancing a persistent cursor across calls.
 const CLEANUP_BUDGET: usize = 256;
 
 /// Hard upper bound on the number of SAME-ZONE sources examined while looking
@@ -223,6 +240,24 @@ pub(super) fn evict_scan_limit_for_test() -> usize {
 /// Per-zone scan/sweep tracker key: `(zone_id, src_ip)`.
 type ScanKey = (u16, IpAddr);
 
+/// Per-source tracker record held in `per_src`. Carries the window state plus
+/// the source key's dense position in `key_ring` (`slot`) so the #6239 cursor
+/// cleanup can swap-remove an expired source in O(1) without an O(sources)
+/// search. `slot` is an internal back-pointer maintained in lock-step by
+/// [`ScanCore::insert_src`] / [`ScanCore::remove_src`]; nothing outside those
+/// primitives may mutate it.
+#[derive(Debug, Clone)]
+struct SrcEntry<T> {
+    /// Window open time (monotonic microseconds). The distinct-entry set is
+    /// cleared and this is reset once the configured window elapses.
+    window_start: u64,
+    /// Distinct destinations (dst ports for port-scan, dst IPs for IP-sweep)
+    /// seen within the current window; bounded to `MAX_UNIQUE_PER_SOURCE`.
+    entries: FxHashSet<T>,
+    /// This key's position in `key_ring` — the O(1) swap-remove index.
+    slot: usize,
+}
+
 /// Shared bounded windowed-unique tracker core (#2209/#2227/#2234). Both
 /// the port-scan (`T = u16`) and IP-sweep (`T = IpAddr`) trackers are thin
 /// `T`-specialised wrappers over this single implementation so the bound /
@@ -231,7 +266,7 @@ type ScanKey = (u16, IpAddr);
 /// formula across the two trackers).
 #[derive(Debug, Clone)]
 struct ScanCore<T: std::hash::Hash + Eq> {
-    per_src: FxHashMap<ScanKey, (u64, FxHashSet<T>)>, // (window_start_secs, unique entries)
+    per_src: FxHashMap<ScanKey, SrcEntry<T>>,
     /// Per-zone index of the distinct source IPs tracked in `per_src`
     /// (`zone_id -> {src_ip}`). Serves TWO purposes, both O(1)/bounded:
     ///
@@ -253,6 +288,26 @@ struct ScanCore<T: std::hash::Hash + Eq> {
     /// `per_src` (at most `MAX_SOURCES_PER_ZONE` IPs per zone), so it adds no
     /// unbounded growth.
     per_zone_srcs: FxHashMap<u16, FxHashSet<IpAddr>>,
+    /// Dense list of every live source key — the DOMAIN of the bounded #6239
+    /// cleanup cursor. Each key's index is mirrored in `SrcEntry.slot`, so a
+    /// removal is an O(1) swap-remove instead of an O(sources) search, and
+    /// `key_ring.len() == per_src.len()` always. Bounded by the same
+    /// per-zone/source caps as `per_src` (at most `MAX_SOURCES_PER_ZONE` keys
+    /// per zone); after warmup it stops growing (worker-local, no steady-state
+    /// alloc). Maintained ONLY by `insert_src` / `remove_src`.
+    key_ring: Vec<ScanKey>,
+    /// Persistent round-robin cursor into `key_ring` (#6239). Each `cleanup`
+    /// call examines at most `CLEANUP_BUDGET` keys starting here and advances,
+    /// so the whole table is eventually visited across calls WITHOUT any single
+    /// call walking all of it. Survives across calls; wraps at the ring end and
+    /// is re-clamped if the ring shrank since the last call.
+    cleanup_cursor: usize,
+    /// Test-only log of the source keys examined by the most recent `cleanup`
+    /// pass(es), used by the bounded-examination and eventual-coverage tests to
+    /// observe exactly which ring slots the cursor visited. Not compiled into
+    /// release builds — zero production cost.
+    #[cfg(test)]
+    examined_log: Vec<ScanKey>,
     /// Count of records skipped because a per-source unique-entry cap was
     /// hit, or because eviction could not free a same-zone slot within the
     /// bounded per-zone sample (rare). Pure observability — exposed for the
@@ -275,6 +330,10 @@ impl<T: std::hash::Hash + Eq> Default for ScanCore<T> {
         Self {
             per_src: FxHashMap::default(),
             per_zone_srcs: FxHashMap::default(),
+            key_ring: Vec::new(),
+            cleanup_cursor: 0,
+            #[cfg(test)]
+            examined_log: Vec::new(),
             skipped_pressure: 0,
             evicted_pressure: 0,
             // First eviction surfaces an event; thereafter the bar doubles.
@@ -339,32 +398,83 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
                 return false;
             }
         }
-        let newly_inserted = !exists;
+        if !exists {
+            // Brand-new source: wire it into `per_src`, the per-zone index, AND
+            // the cleanup `key_ring` in lock-step (the sole insertion path).
+            self.insert_src(key, now_micros);
+        }
         let entry = self
             .per_src
-            .entry(key)
-            .or_insert_with(|| (now_micros, FxHashSet::default()));
-        if newly_inserted {
-            self.per_zone_srcs.entry(zone_id).or_default().insert(src_ip);
-        }
+            .get_mut(&key)
+            .expect("entry inserted above or pre-existing");
         // Reset the window if the configured microsecond window has elapsed
         // since it opened.
-        if now_micros.saturating_sub(entry.0) >= window_micros {
-            entry.0 = now_micros;
-            entry.1.clear();
+        if now_micros.saturating_sub(entry.window_start) >= window_micros {
+            entry.window_start = now_micros;
+            entry.entries.clear();
         }
         // Per-source unique-entry bound: once the set is full, skip new
         // entries (counting pressure) but still evaluate the detection count.
-        if entry.1.len() >= MAX_UNIQUE_PER_SOURCE {
-            if !entry.1.contains(&entry_val) {
+        if entry.entries.len() >= MAX_UNIQUE_PER_SOURCE {
+            if !entry.entries.contains(&entry_val) {
                 self.skipped_pressure += 1;
             }
         } else {
-            entry.1.insert(entry_val);
+            entry.entries.insert(entry_val);
         }
         // Junos verdict: fire once the source has touched SCAN_DETECT_COUNT
         // distinct destinations within the window.
-        entry.1.len() >= SCAN_DETECT_COUNT
+        entry.entries.len() >= SCAN_DETECT_COUNT
+    }
+
+    /// Insert a brand-new source key, wiring `per_src`, the per-zone source
+    /// index, AND the cleanup `key_ring` in lock-step. The key's `key_ring`
+    /// position is stamped into `SrcEntry.slot` so [`ScanCore::remove_src`] can
+    /// swap-remove it in O(1). This is the SOLE insertion path; callers MUST
+    /// have confirmed the key is not already present.
+    #[inline]
+    fn insert_src(&mut self, key: ScanKey, now_micros: u64) {
+        let slot = self.key_ring.len();
+        self.key_ring.push(key);
+        self.per_src.insert(
+            key,
+            SrcEntry {
+                window_start: now_micros,
+                entries: FxHashSet::default(),
+                slot,
+            },
+        );
+        self.per_zone_srcs.entry(key.0).or_default().insert(key.1);
+    }
+
+    /// The SINGLE source-removal primitive (#6239). Drops `key` from `per_src`,
+    /// the per-zone source index, AND the dense `key_ring` in lock-step, so the
+    /// three structures never drift — a removal that updated only one would
+    /// corrupt either the O(1) per-zone cap count or the cursor domain. The
+    /// ring drop is an O(1) `swap_remove`: the tail key is moved into the
+    /// vacated slot and its `SrcEntry.slot` back-pointer is repaired so every
+    /// entry's slot stays exact. Both eviction and cleanup route their removals
+    /// through here. Returns `true` if the key was present and removed.
+    #[inline]
+    fn remove_src(&mut self, key: &ScanKey) -> bool {
+        let Some(entry) = self.per_src.remove(key) else {
+            return false;
+        };
+        let slot = entry.slot;
+        let last = self.key_ring.len() - 1;
+        self.key_ring.swap_remove(slot);
+        // If the removed slot was not the tail, the former tail now sits at
+        // `slot` — fix its back-pointer so `slot == key_ring index` holds.
+        if slot != last {
+            let moved = self.key_ring[slot];
+            if let Some(m) = self.per_src.get_mut(&moved) {
+                m.slot = slot;
+            }
+        }
+        if let Some(s) = self.per_zone_srcs.get_mut(&key.0) {
+            s.remove(&key.1);
+        }
+        true
     }
 
     /// O(1) per-zone source count — the size of the per-zone source index.
@@ -420,33 +530,36 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
             // source index, so every examined entry is a same-zone candidate
             // (the `EVICT_SCAN_LIMIT` budget is never spent on other zones).
             for src in srcs.iter().take(EVICT_SCAN_LIMIT) {
-                let (start, set) = match self.per_src.get(&(zone_id, *src)) {
+                let e = match self.per_src.get(&(zone_id, *src)) {
                     Some(entry) => entry,
                     // Index/table skew (should not happen — they are kept in
                     // lock-step); ignore defensively without consuming the bug.
                     None => continue,
                 };
                 // An expired-or-empty window is dead weight — evict it first.
-                if now_micros.saturating_sub(*start) >= window_micros || set.is_empty() {
+                if now_micros.saturating_sub(e.window_start) >= window_micros
+                    || e.entries.is_empty()
+                {
                     expired_victim = Some(*src);
                     break;
                 }
                 // Least-suspicious first: fewest distinct destinations, then
                 // the stalest window on a tie (#4418 / #2234).
-                let count = set.len();
-                if count < victim_count || (count == victim_count && *start < victim_start) {
+                let count = e.entries.len();
+                if count < victim_count
+                    || (count == victim_count && e.window_start < victim_start)
+                {
                     victim_count = count;
-                    victim_start = *start;
+                    victim_start = e.window_start;
                     victim_src = Some(*src);
                 }
             }
         }
         let victim = expired_victim.or(victim_src);
         if let Some(src) = victim {
-            if self.per_src.remove(&(zone_id, src)).is_some() {
-                if let Some(s) = self.per_zone_srcs.get_mut(&zone_id) {
-                    s.remove(&src);
-                }
+            // Route through the single removal primitive so `per_src`,
+            // `per_zone_srcs`, and the cleanup `key_ring` stay in lock-step.
+            if self.remove_src(&(zone_id, src)) {
                 self.evicted_pressure += 1;
                 return true;
             }
@@ -454,14 +567,25 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
         false
     }
 
-    /// Remove up to `CLEANUP_BUDGET` expired or empty entries.
-    /// `HashMap::retain` still WALKS every entry (O(sources)), but the number
-    /// REMOVED per call is budgeted — so the per-tick mutation/rehash cost is
-    /// bounded, and stale entries that survive a tick are reclaimed on
-    /// subsequent ticks. The walk itself is bounded only by the
-    /// `MAX_SOURCES_PER_ZONE` cap on the table. Each removed key is also
-    /// pulled from the per-zone source index (`per_zone_srcs`) so the O(1) cap
-    /// test and the eviction victim-search domain stay exact.
+    /// Bounded-EXAMINATION periodic cleanup (#6239). EXAMINES at most
+    /// `CLEANUP_BUDGET` source keys per call — starting from the persistent
+    /// `cleanup_cursor` into the dense `key_ring` — and removes those found
+    /// expired-or-empty. The per-call cost is O(`CLEANUP_BUDGET`) regardless of
+    /// how many sources the table holds. Returns the number of candidates
+    /// examined (used by the bounded-examination test; ignored in production).
+    ///
+    /// This replaced the pre-#6239 `HashMap::retain` sweep, which budgeted only
+    /// the REMOVALS: once `CLEANUP_BUDGET` expired entries were removed the
+    /// `retain` closure still ran for EVERY remaining bucket on that ONE packet
+    /// worker (O(sources)). An attacker populating sources across many zones
+    /// exhausted the removal budget and then paid the full-table walk on a
+    /// single unlucky packet — the exact per-packet latency spike #2209
+    /// forbade. The cursor advances across calls so every source is eventually
+    /// visited without any single call walking the whole table; a live (not yet
+    /// expired) entry is stepped over and revisited on a later sweep. Each
+    /// removal goes through [`ScanCore::remove_src`], keeping `per_src`,
+    /// `per_zone_srcs`, and `key_ring` in lock-step so the O(1) cap test and the
+    /// eviction victim-search domain stay exact.
     ///
     /// `now_micros` is the monotonic microsecond clock. This periodic sweep is
     /// zone-agnostic (it has no single per-zone `window_micros`), so the caller
@@ -478,25 +602,53 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
     /// per-zone window still governs the inline reset/verdict in
     /// [`ScanCore::check`]; cleanup only reclaims memory.
     #[inline]
-    fn cleanup(&mut self, now_micros: u64, reap_floor_micros: u64) {
+    fn cleanup(&mut self, now_micros: u64, reap_floor_micros: u64) -> usize {
         let floor = reap_floor_micros.min(MAX_CLEANUP_WINDOW_MICROS);
-        let mut removed = 0usize;
-        let per_zone_srcs = &mut self.per_zone_srcs;
-        self.per_src.retain(|key, (start, set)| {
-            if removed >= CLEANUP_BUDGET {
-                return true; // budget exhausted — keep the rest for next tick
+        let start_len = self.key_ring.len();
+        if start_len == 0 {
+            self.cleanup_cursor = 0;
+            return 0;
+        }
+        // Clamp a cursor left dangling past the ring end by removals since the
+        // last call (eviction shrinks the ring between cleanups).
+        if self.cleanup_cursor >= start_len {
+            self.cleanup_cursor = 0;
+        }
+        let budget = CLEANUP_BUDGET.min(start_len);
+        let mut examined = 0usize;
+        let mut i = self.cleanup_cursor;
+        while examined < budget {
+            let len = self.key_ring.len();
+            if len == 0 {
+                i = 0;
+                break;
             }
-            let expired = now_micros.saturating_sub(*start) >= floor || set.is_empty();
-            if expired {
-                removed += 1;
-                if let Some(s) = per_zone_srcs.get_mut(&key.0) {
-                    s.remove(&key.1);
+            if i >= len {
+                i = 0;
+            }
+            let key = self.key_ring[i];
+            #[cfg(test)]
+            self.examined_log.push(key);
+            examined += 1;
+            let expired = match self.per_src.get(&key) {
+                Some(e) => {
+                    now_micros.saturating_sub(e.window_start) >= floor || e.entries.is_empty()
                 }
-                false
+                // Ring/table skew (should not happen — lock-step maintained);
+                // reclaim the dangling ring slot defensively.
+                None => true,
+            };
+            if expired {
+                // Swap-removes `key_ring[i]`, moving the tail key into slot `i`;
+                // do NOT advance so that swapped-in key is examined next.
+                self.remove_src(&key);
             } else {
-                true
+                i += 1;
             }
-        });
+        }
+        let len = self.key_ring.len();
+        self.cleanup_cursor = if len == 0 { 0 } else { i % len };
+        examined
     }
 
     /// Returns `true` once each time the cumulative eviction count crosses a
@@ -526,17 +678,72 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
         }
     }
 
-    /// Test-only: rebuild `per_zone_srcs` from the current `per_src` contents.
-    /// Tests that populate `per_src` DIRECTLY (bypassing [`ScanCore::check`],
-    /// to keep the setup O(few) rather than filling the 4096-entry cap) must
-    /// call this so the per-zone index — the eviction victim-search domain and
-    /// the O(1) cap count — matches the table (#4890).
+    /// Test-only: rebuild `per_zone_srcs` AND the cleanup `key_ring` (with fresh
+    /// `SrcEntry.slot` back-pointers) from the current `per_src` contents. Tests
+    /// that populate `per_src` DIRECTLY (bypassing [`ScanCore::check`], to keep
+    /// the setup O(few) rather than filling the 4096-entry cap) must call this
+    /// so the per-zone index — the eviction victim-search domain and the O(1)
+    /// cap count (#4890) — AND the ring / slot indices (#6239) match the table.
     #[cfg(test)]
     fn rebuild_zone_index_for_test(&mut self) {
         self.per_zone_srcs.clear();
+        self.key_ring.clear();
+        self.cleanup_cursor = 0;
         let keys: Vec<ScanKey> = self.per_src.keys().copied().collect();
-        for (zone, src) in keys {
-            self.per_zone_srcs.entry(zone).or_default().insert(src);
+        for (idx, key) in keys.into_iter().enumerate() {
+            self.per_zone_srcs.entry(key.0).or_default().insert(key.1);
+            self.key_ring.push(key);
+            if let Some(e) = self.per_src.get_mut(&key) {
+                e.slot = idx;
+            }
+        }
+    }
+
+    /// Test-only invariant checker (#6239): `per_src`, `per_zone_srcs`, and the
+    /// cleanup `key_ring` must stay in perfect lock-step after any sequence of
+    /// inserts / evictions / bounded cleanups.
+    #[cfg(test)]
+    fn assert_consistent(&self) {
+        // Ring length mirrors the table size, and every slot back-pointer is
+        // exact (`key_ring[e.slot] == key`).
+        assert_eq!(
+            self.key_ring.len(),
+            self.per_src.len(),
+            "key_ring and per_src must have equal length"
+        );
+        for (i, key) in self.key_ring.iter().enumerate() {
+            let e = self
+                .per_src
+                .get(key)
+                .expect("every key_ring entry must exist in per_src");
+            assert_eq!(e.slot, i, "SrcEntry.slot must equal its key_ring index");
+        }
+        // Per-zone index and per_src are mutual: every zone entry maps to a live
+        // table key, and the zone index sizes sum to the table size.
+        let mut zone_total = 0usize;
+        for (zone, srcs) in &self.per_zone_srcs {
+            zone_total += srcs.len();
+            for src in srcs {
+                assert!(
+                    self.per_src.contains_key(&(*zone, *src)),
+                    "per_zone_srcs entry ({zone}, {src}) missing from per_src"
+                );
+            }
+        }
+        assert_eq!(
+            zone_total,
+            self.per_src.len(),
+            "per_zone_srcs sizes must sum to per_src length"
+        );
+        for key in self.per_src.keys() {
+            assert!(
+                self.per_zone_srcs
+                    .get(&key.0)
+                    .is_some_and(|s| s.contains(&key.1)),
+                "per_src key ({}, {}) missing from per_zone_srcs",
+                key.0,
+                key.1
+            );
         }
     }
 }
@@ -658,6 +865,18 @@ mod scan_tests {
 
     fn v4(a: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, a))
+    }
+
+    /// Build a `SrcEntry` for tests that seed `per_src` DIRECTLY (bypassing
+    /// [`ScanCore::check`]). The `slot` back-pointer is a placeholder; every
+    /// such test then calls [`ScanCore::rebuild_zone_index_for_test`], which
+    /// rebuilds the ring and stamps the correct slot indices (#6239).
+    fn seed_entry<T>(window_start: u64, entries: FxHashSet<T>) -> SrcEntry<T> {
+        SrcEntry {
+            window_start,
+            entries,
+            slot: 0,
+        }
     }
 
     /// Junos default window (microseconds) used across the windowing tests.
@@ -905,11 +1124,11 @@ mod scan_tests {
             s
         };
         let stale_src = IpAddr::V4(Ipv4Addr::new(10, 9, 0, 1));
-        core.per_src.insert((9, stale_src), (100, nonempty(1)));
+        core.per_src.insert((9, stale_src), seed_entry(100, nonempty(1)));
         for i in 2..=8u32 {
             let s = IpAddr::V4(Ipv4Addr::from(0x0a09_0000u32 + i));
             core.per_src
-                .insert((9, s), (200 + i as u64, nonempty(i as u16)));
+                .insert((9, s), seed_entry(200 + i as u64, nonempty(i as u16)));
         }
         core.rebuild_zone_index_for_test();
         let before = core.per_src.len();
@@ -937,12 +1156,12 @@ mod scan_tests {
         let expired_src = IpAddr::V4(Ipv4Addr::new(10, 9, 0, 50));
         // One expired entry plus several fresh ones.
         core.per_src
-            .insert((9, expired_src), (0, FxHashSet::default()));
+            .insert((9, expired_src), seed_entry(0, FxHashSet::default()));
         for i in 1..=5u32 {
             let s = IpAddr::V4(Ipv4Addr::from(0x0a09_1000u32 + i));
             let mut set = FxHashSet::default();
             set.insert(i as u16);
-            core.per_src.insert((9, s), (1_000, set));
+            core.per_src.insert((9, s), seed_entry(1_000, set));
         }
         core.rebuild_zone_index_for_test();
         // now far past the expired entry's window but inside the fresh
@@ -977,14 +1196,15 @@ mod scan_tests {
         for p in 0..(SCAN_DETECT_COUNT as u16 - 1) {
             scanner_set.insert(8000 + p);
         }
-        core.per_src.insert((zone, scanner), (100, scanner_set));
+        core.per_src.insert((zone, scanner), seed_entry(100, scanner_set));
         // Fill the rest of a full bounded sample with FRESHER decoys at count 1
         // (a high-cardinality spoofed flood: one probe each, later windows).
         for i in 1..EVICT_SCAN_LIMIT as u64 {
             let d = IpAddr::V4(Ipv4Addr::from(0x0a09_0000u32 + i as u32));
             let mut s = FxHashSet::default();
             s.insert(1u16);
-            core.per_src.insert((zone, d), (100 + i, s)); // fresher than scanner
+            // fresher than scanner
+            core.per_src.insert((zone, d), seed_entry(100 + i, s));
         }
         core.rebuild_zone_index_for_test();
         // `now` after every start but well within the 1s window → nothing is
@@ -1052,7 +1272,7 @@ mod scan_tests {
             let s = IpAddr::V4(Ipv4Addr::from(0x0b00_0000u32 + i));
             let mut set = FxHashSet::default();
             set.insert((i & 0xffff) as u16);
-            core.per_src.insert((other_zone, s), (start, set));
+            core.per_src.insert((other_zone, s), seed_entry(start, set));
         }
 
         // Exactly three LIVE target-zone sources with DISTINCT accumulated
@@ -1064,7 +1284,7 @@ mod scan_tests {
             for p in 0..count {
                 set.insert(9000 + p);
             }
-            core.per_src.insert((target_zone, src), (start, set));
+            core.per_src.insert((target_zone, src), seed_entry(start, set));
             src
         };
         let victim = seed(1, 2); // fewest distinct dsts → the eviction victim
@@ -1375,5 +1595,170 @@ mod scan_tests {
             "the per-source set stays capped even under a wide window: {}",
             t.skipped_pressure()
         );
+    }
+
+    /// #6239 fail-on-revert (the crux): one `cleanup` call must EXAMINE at most
+    /// `CLEANUP_BUDGET` candidates, independent of how many sources the table
+    /// holds. This is the bound the pre-#6239 `HashMap::retain` sweep violated:
+    /// it budgeted only the REMOVALS, so with every entry LIVE (nothing
+    /// removable) the closure still ran for EVERY bucket on one packet worker —
+    /// an O(sources) full-table scan. Here an attacker populates far more than
+    /// the budget of LIVE sources spread across several zones; a single sweep at
+    /// a clock inside every window removes nothing yet must still touch at most
+    /// `CLEANUP_BUDGET` of them. Reverting `cleanup` to the retain full-walk
+    /// makes `examined == per_src.len()` (> the budget) and this goes RED.
+    #[test]
+    fn cleanup_examines_at_most_budget_per_call() {
+        let mut core: ScanCore<u16> = ScanCore::default();
+        let total = CLEANUP_BUDGET + 100;
+        // Spread the sources across several zones (the "attacker populates
+        // sources across many zones" shape from the issue) — all LIVE.
+        for i in 0..total {
+            let zone = (i % 4) as u16;
+            let src = IpAddr::V4(Ipv4Addr::from(0x0a00_0000u32 + i as u32));
+            core.check(zone, src, (i & 0xffff) as u16, 1_000, 1_000_000);
+        }
+        assert_eq!(core.per_src.len(), total);
+        core.examined_log.clear();
+        // Wide floor + a clock barely past insertion → NOTHING is expired: a
+        // retain walk would examine all `total` entries; the cursor examines at
+        // most the budget.
+        let examined = core.cleanup(1_500, 1_000_000);
+        assert!(
+            examined <= CLEANUP_BUDGET,
+            "cleanup examined {examined} candidates, must be <= CLEANUP_BUDGET \
+             ({CLEANUP_BUDGET}) regardless of table size"
+        );
+        assert_eq!(
+            core.examined_log.len(),
+            examined,
+            "the examination counter and the per-call examined log must agree"
+        );
+        // Nothing was expired, so nothing was removed — the table is intact and
+        // the indexes stay in lock-step.
+        assert_eq!(core.per_src.len(), total, "no live entry may be reclaimed");
+        core.assert_consistent();
+    }
+
+    /// #6239: the persistent cursor eventually visits EVERY source across
+    /// enough calls, even when every entry stays LIVE (so no entry is ever
+    /// removed and the cursor must genuinely ADVANCE past live entries rather
+    /// than re-examining the same prefix). A stuck / non-advancing cursor would
+    /// visit only the first `CLEANUP_BUDGET` slots forever and this fails.
+    #[test]
+    fn cleanup_cursor_eventually_covers_all_live_sources() {
+        let mut core: ScanCore<u16> = ScanCore::default();
+        let total = CLEANUP_BUDGET * 2 + 5;
+        let mut expected: FxHashSet<ScanKey> = FxHashSet::default();
+        for i in 0..total {
+            let zone = (i % 4) as u16;
+            let src = IpAddr::V4(Ipv4Addr::from(0x0a10_0000u32 + i as u32));
+            core.check(zone, src, (i & 0xffff) as u16, 1_000, 1_000_000);
+            expected.insert((zone, src));
+        }
+        assert_eq!(core.per_src.len(), total);
+        // A wide floor keeps every entry LIVE, so cleanup removes nothing and
+        // the cursor must sweep the whole ring to cover it. Run enough calls to
+        // wrap the ring at least once.
+        let mut seen: FxHashSet<ScanKey> = FxHashSet::default();
+        let calls = total.div_ceil(CLEANUP_BUDGET) + 1;
+        for _ in 0..calls {
+            core.examined_log.clear();
+            let examined = core.cleanup(2_000, 1_000_000);
+            assert!(examined <= CLEANUP_BUDGET, "still bounded per call");
+            for k in &core.examined_log {
+                seen.insert(*k);
+            }
+        }
+        assert_eq!(
+            core.per_src.len(),
+            total,
+            "nothing expired, so nothing was reclaimed"
+        );
+        assert_eq!(
+            seen, expected,
+            "the cursor must eventually examine EVERY live source across calls"
+        );
+    }
+
+    /// #6239: `per_src`, `per_zone_srcs`, and `key_ring` stay in perfect
+    /// lock-step after a run of bounded cleanups that reclaim only part of the
+    /// table (interleaved expired + live sources across zones). The single
+    /// `remove_src` primitive must update all three indexes together — the
+    /// expired half is fully reclaimed, the live half survives, and the O(1)
+    /// zone counts + slot back-pointers remain exact.
+    #[test]
+    fn indexes_stay_consistent_after_bounded_cleanup() {
+        let mut core: ScanCore<u16> = ScanCore::default();
+        let total = CLEANUP_BUDGET + 128;
+        let mut live_keys: FxHashSet<ScanKey> = FxHashSet::default();
+        for i in 0..total {
+            let zone = (i % 3) as u16;
+            let src = IpAddr::V4(Ipv4Addr::from(0x0a20_0000u32 + i as u32));
+            // Even entries open OLD windows (will be reaped); odd entries open
+            // RECENT windows (stay live under the floor below).
+            let start = if i % 2 == 0 { 0 } else { 5_000_000 };
+            core.check(zone, src, (i & 0xffff) as u16, start, 1_000_000);
+            if i % 2 != 0 {
+                live_keys.insert((zone, src));
+            }
+        }
+        assert_eq!(core.per_src.len(), total);
+        // Clock 5.5s: entries opened at t=0 are expired (>= 1s floor), entries
+        // opened at t=5s are still live. Several sweeps reclaim the expired half
+        // (each sweep must advance the cursor past the interleaved live ones).
+        let now = 5_500_000u64;
+        let floor = 1_000_000u64;
+        for _ in 0..8 {
+            core.cleanup(now, floor);
+            core.assert_consistent();
+        }
+        // The live (odd) half survives; the expired (even) half is fully gone.
+        assert_eq!(
+            core.per_src.len(),
+            live_keys.len(),
+            "exactly the live half must remain after cleanup drains the expired"
+        );
+        for k in &live_keys {
+            assert!(
+                core.per_src.contains_key(k),
+                "a live source must not be reclaimed by cleanup"
+            );
+        }
+        core.assert_consistent();
+    }
+
+    /// #6239: the bounded cursor still fully drains an all-expired table across
+    /// `ceil(N / CLEANUP_BUDGET)` calls (each call removes at most the budget).
+    /// This guards the removal path: a source can only be reclaimed if the
+    /// cursor examined it, so reaching an empty table proves every slot was
+    /// eventually visited, and the per-zone index drains in lock-step.
+    #[test]
+    fn cleanup_drains_all_expired_within_ceil_calls() {
+        let mut core: ScanCore<u16> = ScanCore::default();
+        let total = CLEANUP_BUDGET * 3 + 7;
+        for i in 0..total {
+            let zone = (i % 8) as u16;
+            let src = IpAddr::V4(Ipv4Addr::from(0x0a30_0000u32 + i as u32));
+            core.check(zone, src, (i & 0xffff) as u16, 0, 1_000_000);
+        }
+        assert_eq!(core.per_src.len(), total);
+        let now = 10_000_000u64; // far past the floor — everything is expired
+        let floor = 1_000_000u64;
+        let calls = total.div_ceil(CLEANUP_BUDGET);
+        for _ in 0..calls {
+            let examined = core.cleanup(now, floor);
+            assert!(examined <= CLEANUP_BUDGET, "each call stays bounded");
+        }
+        assert_eq!(
+            core.per_src.len(),
+            0,
+            "ceil(N / CLEANUP_BUDGET) calls must reclaim every expired source"
+        );
+        assert!(
+            core.per_zone_srcs.values().all(|s| s.is_empty()),
+            "the per-zone index must drain in lock-step with per_src"
+        );
+        core.assert_consistent();
     }
 }

@@ -281,6 +281,42 @@ func TestBuildSessionSyncRequestV6CarriesNat64SnatV4_4565(t *testing.T) {
 	}
 }
 
+// TestBuildSessionSyncRequestCarriesRTFlowSessionID5212 verifies the manager
+// forwards the originating node's stable RT_FLOW session id (SessionValue{,V6}.
+// RTFlowSessionID) onto the SessionSyncRequest (JSON session_id) for both
+// families so the peer helper adopts it on import. Reverting the copy leaves the
+// field 0 (omitted) and this fails RED.
+func TestBuildSessionSyncRequestCarriesRTFlowSessionID5212(t *testing.T) {
+	m := &Manager{bpfShim: dataplane.New()}
+	wantID := uint64(7)<<48 | 0x1234_5678
+
+	key := dataplane.SessionKey{Protocol: 6}
+	val := &dataplane.SessionValue{IngressZone: 1, EgressZone: 2, RTFlowSessionID: wantID}
+	req := m.buildSessionSyncRequestV4("upsert", key, val)
+	if req.RTFlowSessionID != wantID {
+		t.Fatalf("v4 req.RTFlowSessionID = %#x, want %#x", req.RTFlowSessionID, wantID)
+	}
+	if js, _ := json.Marshal(req); !strings.Contains(string(js), `"session_id":`) {
+		t.Fatalf("v4 wire JSON missing session_id: %s", js)
+	}
+
+	keyV6 := dataplane.SessionKeyV6{Protocol: 6}
+	valV6 := &dataplane.SessionValueV6{IngressZone: 1, EgressZone: 2, RTFlowSessionID: wantID}
+	reqV6 := m.buildSessionSyncRequestV6("upsert", keyV6, valV6)
+	if reqV6.RTFlowSessionID != wantID {
+		t.Fatalf("v6 req.RTFlowSessionID = %#x, want %#x", reqV6.RTFlowSessionID, wantID)
+	}
+
+	// A session with no id (0) omits the key from the wire (rolling-upgrade safe).
+	reqPlain := m.buildSessionSyncRequestV4("upsert", key, &dataplane.SessionValue{IngressZone: 1, EgressZone: 2})
+	if reqPlain.RTFlowSessionID != 0 {
+		t.Fatalf("plain req.RTFlowSessionID = %#x, want 0", reqPlain.RTFlowSessionID)
+	}
+	if js, _ := json.Marshal(reqPlain); strings.Contains(string(js), "session_id") {
+		t.Fatalf("zero-id wire JSON must omit session_id: %s", js)
+	}
+}
+
 func TestBuildSessionSyncRequestV4PreservesBothNatLegs(t *testing.T) {
 	m := &Manager{bpfShim: dataplane.New()}
 	key := dataplane.SessionKey{

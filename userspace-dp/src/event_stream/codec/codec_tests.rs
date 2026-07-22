@@ -647,6 +647,7 @@ fn test_encode_session_open_v4() {
         &test_metadata(),
         &zones,
         false,
+        0,
     );
 
     // Check header
@@ -689,7 +690,7 @@ fn test_encode_session_open_zone_id_above_255() {
     md.ingress_zone = 300;
     md.egress_zone = 1000;
     let frame =
-        EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false);
+        EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false, 0);
     let p = &frame.data[FRAME_HEADER_SIZE..];
     assert_eq!(u16::from_le_bytes([p[27], p[28]]), 300); // IngressZoneID u16
     assert_eq!(u16::from_le_bytes([p[29], p[30]]), 1000); // EgressZoneID u16
@@ -717,7 +718,7 @@ fn test_encode_session_open_carries_log_flags() {
     md.log_session_init = true;
     md.log_session_close = true;
     let frame =
-        EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false);
+        EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false, 0);
     let p = &frame.data[FRAME_HEADER_SIZE..];
     assert_eq!(
         p[26] & FLAG_LOG_SESSION_INIT,
@@ -740,6 +741,7 @@ fn test_encode_session_open_carries_log_flags() {
         &md_close,
         &zones,
         false,
+        0,
     );
     let pc = &frame_close.data[FRAME_HEADER_SIZE..];
     assert_eq!(pc[26] & FLAG_LOG_SESSION_INIT, 0);
@@ -753,6 +755,7 @@ fn test_encode_session_open_carries_log_flags() {
         &test_metadata(),
         &zones,
         false,
+        0,
     );
     let pn = &frame_none.data[FRAME_HEADER_SIZE..];
     assert_eq!(pn[26] & (FLAG_LOG_SESSION_INIT | FLAG_LOG_SESSION_CLOSE), 0);
@@ -781,28 +784,87 @@ fn test_encode_session_open_carries_nat64_flag_and_snat_v4() {
         src_port: 5001,
         dst_port: 80,
     };
-    let frame = EventFrame::encode_session_open(1, &key, &decision, &md, &zones, false);
+    let frame = EventFrame::encode_session_open(1, &key, &decision, &md, &zones, false, 0);
     let payload = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(
         payload[26] & FLAG_NAT64,
         FLAG_NAT64,
         "nat64 decision must set flags bit 1<<5"
     );
-    // Trailing 4 bytes are the pool source (appended last).
+    // snat_v4 sits at [n-12 .. n-8]: #5212 appended an 8-byte session_id after
+    // the 4-byte snat_v4, so snat_v4 is no longer the last field.
     let n = payload.len();
     assert_eq!(
-        &payload[n - 4..n],
+        &payload[n - 12..n - 8],
         &[203, 0, 113, 5],
-        "trailing snat_v4 must be the translated pool source"
+        "snat_v4 must be the translated pool source (before the trailing id)"
     );
 
-    // A non-NAT64 v4 session: flag clear, trailing snat_v4 all-zero.
+    // A non-NAT64 v4 session: flag clear, snat_v4 all-zero.
     let frame_plain =
-        EventFrame::encode_session_open(2, &test_key_v4(), &test_decision(), &md, &zones, false);
+        EventFrame::encode_session_open(2, &test_key_v4(), &test_decision(), &md, &zones, false, 0);
     let pp = &frame_plain.data[FRAME_HEADER_SIZE..frame_plain.len as usize];
     assert_eq!(pp[26] & FLAG_NAT64, 0, "non-nat64 must leave the flag clear");
     let m = pp.len();
-    assert_eq!(&pp[m - 4..m], &[0, 0, 0, 0], "non-nat64 trailing snat is zero");
+    assert_eq!(&pp[m - 12..m - 8], &[0, 0, 0, 0], "non-nat64 snat is zero");
+}
+
+// #5212 RED-on-revert: the originating node's stable RT_FLOW session id rides the
+// open frame as the LAST trailing field (u64 LE, appended after the #4565
+// snat_v4) so a peer-synced session ADOPTS it and its RT_FLOW SESSION_CREATE /
+// SESSION_CLOSE records correlate across HA nodes. Reverting the encode (or
+// dropping the `session_id` argument threading) leaves the id off the wire and
+// this fails RED.
+#[test]
+fn test_encode_session_open_carries_session_id_5212() {
+    let zones = test_zone_map();
+    let md = test_metadata();
+
+    // A peer-namespaced id (worker 7 high bits) on a plain v4 session.
+    let session_id: u64 = (7u64 << 48) | 0x1234_5678;
+    let frame = EventFrame::encode_session_open(
+        1,
+        &test_key_v4(),
+        &test_decision(),
+        &md,
+        &zones,
+        false,
+        session_id,
+    );
+    let payload = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+    let n = payload.len();
+    // The LAST 8 bytes are the session id (LE); the 4 bytes before it are the
+    // #4565 snat_v4 (all-zero for this non-NAT64 v4 session), which must be
+    // undisturbed by the appended id.
+    assert_eq!(
+        u64::from_le_bytes(payload[n - 8..n].try_into().unwrap()),
+        session_id,
+        "the trailing u64 must carry the stable session id"
+    );
+    assert_eq!(
+        &payload[n - 12..n - 8],
+        &[0, 0, 0, 0],
+        "the snat_v4 field must still precede the session id, unchanged"
+    );
+
+    // A zero id (a synthesized/no-entry emit) writes zero — the Go decoder then
+    // length-reads 0 and the standby allocs a fresh local id.
+    let frame0 = EventFrame::encode_session_open(
+        2,
+        &test_key_v4(),
+        &test_decision(),
+        &md,
+        &zones,
+        false,
+        0,
+    );
+    let p0 = &frame0.data[FRAME_HEADER_SIZE..frame0.len as usize];
+    let n0 = p0.len();
+    assert_eq!(
+        u64::from_le_bytes(p0[n0 - 8..n0].try_into().unwrap()),
+        0,
+        "a zero session id writes zero on the wire"
+    );
 }
 
 // #3301: the admitting policy's firewall metadata (policy_id,
@@ -818,15 +880,16 @@ fn test_encode_session_open_carries_policy_fields_3301() {
     md.policy_counter_idx = 7;
     md.inactivity_timeout_ns = Some(30 * 1_000_000_000);
     let frame =
-        EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false);
+        EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false, 0);
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     // #3301 trailing block: policy_id, policy_counter_idx, inactivity_timeout
-    // (seconds), each u32 LE. #4565 appended a further 4-byte snat_v4 AFTER this
-    // block, so the policy fields are now at [n-16 .. n-4] (snat_v4 = last 4).
+    // (seconds), each u32 LE. #4565 appended a 4-byte snat_v4 AFTER this block
+    // and #5212 appended a further 8-byte session_id AFTER that, so the policy
+    // fields are now at [n-24 .. n-12] (snat_v4 = [n-12 .. n-8], id = last 8).
     let n = p.len();
-    let policy_id = u32::from_le_bytes(p[n - 16..n - 12].try_into().unwrap());
-    let counter_idx = u32::from_le_bytes(p[n - 12..n - 8].try_into().unwrap());
-    let inact_secs = u32::from_le_bytes(p[n - 8..n - 4].try_into().unwrap());
+    let policy_id = u32::from_le_bytes(p[n - 24..n - 20].try_into().unwrap());
+    let counter_idx = u32::from_le_bytes(p[n - 20..n - 16].try_into().unwrap());
+    let inact_secs = u32::from_le_bytes(p[n - 16..n - 12].try_into().unwrap());
     assert_eq!(policy_id, 42, "policy_id must ride the open frame");
     assert_eq!(counter_idx, 7, "policy_counter_idx must ride the open frame");
     assert_eq!(inact_secs, 30, "inactivity_timeout (ns->s) must ride the open frame");
@@ -839,12 +902,14 @@ fn test_encode_session_open_carries_policy_fields_3301() {
         &test_metadata(),
         &zones,
         false,
+        0,
     );
     let pn = &frame_none.data[FRAME_HEADER_SIZE..frame_none.len as usize];
     let m = pn.len();
+    // Shifted by the #4565 snat_v4 (4) + #5212 session_id (8) trailing fields.
+    assert_eq!(u32::from_le_bytes(pn[m - 24..m - 20].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(pn[m - 20..m - 16].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(pn[m - 16..m - 12].try_into().unwrap()), 0);
-    assert_eq!(u32::from_le_bytes(pn[m - 12..m - 8].try_into().unwrap()), 0);
-    assert_eq!(u32::from_le_bytes(pn[m - 8..m - 4].try_into().unwrap()), 0);
 }
 
 #[test]
@@ -857,6 +922,7 @@ fn test_encode_session_open_v6() {
         &test_metadata(),
         &zones,
         false,
+        0,
     );
 
     let p = &frame.data[FRAME_HEADER_SIZE..];
@@ -915,7 +981,7 @@ fn test_encode_session_open_high_ifindex_v4() {
     metadata.owner_rg_id = 40000; // > i16::MAX
 
     let frame =
-        EventFrame::encode_session_open(1, &test_key_v4(), &decision, &metadata, &zones, false);
+        EventFrame::encode_session_open(1, &test_key_v4(), &decision, &metadata, &zones, false, 0);
     let p = &frame.data[FRAME_HEADER_SIZE..];
 
     // i32 LE reads recover the exact values; an i16 encode could not.

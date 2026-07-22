@@ -1616,6 +1616,9 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		req.PolicyID = val.PolicyID
 		req.PolicyCounterIdx = val.PolicyCounterIdx
 		req.InactivityTimeout = val.AppTimeout
+		// #5212: carry the originating node's stable RT_FLOW session id so the
+		// peer helper adopts it on import instead of minting a fresh local id.
+		req.RTFlowSessionID = val.RTFlowSessionID
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
 			req.NATSrcPort = 0
@@ -1699,6 +1702,8 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		if val.Nat64SnatV4 != ([4]byte{}) {
 			req.Nat64SnatV4 = net.IP(val.Nat64SnatV4[:]).String()
 		}
+		// #5212: carry the originating node's stable RT_FLOW session id (see V4).
+		req.RTFlowSessionID = val.RTFlowSessionID
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
 			req.NATSrcPort = 0

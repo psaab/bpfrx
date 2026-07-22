@@ -37,12 +37,13 @@ var (
 	rbRemove           = os.Remove
 )
 
-// archiveWriteBarrier is a test-only seam (#5869) invoked by the async
-// auto-archive goroutine AFTER the archive fence check and BEFORE the actual
-// write. Production is a no-op. A test overrides it to hold a writer
-// MID-FLIGHT — deliberately PAST the fence check, so the fence cannot mask it —
-// to prove QuiesceArchival JOINS an in-flight writer (not merely fences future
-// ones) before a factory reset erases the archive directory. Never mutated by
+// archiveWriteBarrier is a test-only seam (#5869) invoked AFTER the archive
+// fence check and BEFORE the actual write by BOTH archive writers: the async
+// auto-archive goroutine and the synchronous Store.ArchiveConfig path (#6185).
+// Production is a no-op. A test overrides it to hold a writer MID-FLIGHT —
+// deliberately PAST the fence check, so the fence cannot mask it — to prove
+// QuiesceArchival JOINS an in-flight writer (not merely fences future ones)
+// before a factory reset erases the archive directory. Never mutated by
 // production code.
 var archiveWriteBarrier = func() {}
 

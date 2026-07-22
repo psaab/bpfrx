@@ -800,6 +800,20 @@ outside the monitor loop:
   *local* commit counter (`Manager.bumpGeneration`) that is not cross-node
   comparable, so the receiver rejects the stale install BEFORE forwarding it to
   the helper, and no config-epoch field or guard is added on the Rust side.
+- **RT_FLOW session id (#5212)**: distinct from BOTH the synthesized BPF-ABI
+  `SessionID` (`now<<16|slot`, node-local) AND the per-key install generation,
+  every session install carries the ORIGINATING node's stable RT_FLOW session id
+  (`SessionValue{,V6}.RTFlowSessionID`, the dataplane's
+  `SessionTable::alloc_session_id` value) as a length-gated trailing `uint64` on
+  the session wire (`sync_protocol.go`, appended after the #5274 `ConfigEpoch`).
+  Unlike the guards above this is pure identity carriage — the receiver never
+  rejects on it. The peer helper's `upsert_synced_with_origin` ADOPTS the id on
+  import (via `SessionSyncRequest.session_id` → `build_synced_session_entry`)
+  instead of minting a fresh node-local one, so a session's RT_FLOW
+  SESSION_CREATE (origin node) and SESSION_CLOSE (peer, after failover) share one
+  correlatable id across HA nodes. `id == 0` (legacy peer / synthesized delta)
+  falls back to a fresh local id (rolling-upgrade safe). Full path:
+  `docs/sync-protocol.md` "RT_FLOW Session Id (#5212)".
 - Dual-active overlap is intentional: primary sets `rg_active=true`
   immediately on becoming master; secondary defers `rg_active=false` until
   it sees the VRRP BACKUP event. Brief overlap, never both inactive.

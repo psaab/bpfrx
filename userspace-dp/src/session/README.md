@@ -997,12 +997,13 @@ to put on the wire.
 
 - **Generation** — `SessionTable::alloc_session_id` (called once per fresh
   install in `install_with_protocol_with_origin`, and once per peer-synced
-  import in `upsert_synced_with_origin`) returns `(worker_id << 48) | counter`,
-  the per-worker counter starting at 1. The worker id (set at worker setup via
-  `set_worker_id`) namespaces the id so it is unique across the node's
-  shared-nothing per-worker `SessionTable`s; the counter is monotonic, so a
-  reused 5-tuple (same worker) gets a DISTINCT id. `0` is reserved as the wire
-  "unknown" sentinel — a real id is never 0.
+  import in `upsert_synced_with_origin` **only when no wire id was carried** —
+  see #5212 below) returns `(worker_id << 48) | counter`, the per-worker counter
+  starting at 1. The worker id (set at worker setup via `set_worker_id`)
+  namespaces the id so it is unique across the node's shared-nothing per-worker
+  `SessionTable`s; the counter is monotonic, so a reused 5-tuple (same worker)
+  gets a DISTINCT id. `0` is reserved as the wire "unknown" sentinel — a real id
+  is never 0.
 - **Storage** — write-once on `SessionEntry.session_id`, never re-stamped, so a
   session's create and close read the same value.
 - **Wire** — harvested onto the Open/Close `SessionDelta.session_id` and encoded
@@ -1022,19 +1023,39 @@ to put on the wire.
 still accepts an old helper's 144/152-byte frames (id absent → ordinal
 fallback), and an old daemon ignores the trailing 8 bytes.
 
-**Scope — two documented follow-ups.** (1) Cross-HA-node id IDENTITY: a
-peer-synced session is assigned a FRESH node-local id on import, so a session
-that opens on the primary and closes on the standby after a failover carries
-different ids on the two nodes. Making them identical needs the id on the
-session-sync wire (a second additive wire growth), like the #3395 P2
-policy-id-on-wire deferral above. (2) RESOLVED in #5213: `show security flow
-session` now shows the SAME id the RT_FLOW frames carry. `publish_conntrack`
-(`build_conntrack_value_v4`/`_v6`) stamps the conntrack-map `session_id` from
-`SessionTable::session_id_for(&forward_key)` at each live-session-create publish
-site, and `cli_show_flow.go` renders `val.SessionID` (via `flowSessionDisplayID`),
-keeping the `cli_show_flow.go` iteration-index fallback ONLY when
-`val.SessionID == 0` (an absent/legacy id). Additive and node-local-safe.
-Follow-up (1) above (cross-HA-node id IDENTITY) is still open.
+**Scope — both documented follow-ups now RESOLVED.** (1) Cross-HA-node id
+IDENTITY — **RESOLVED in #5212.** Before #5212 a peer-synced session was assigned
+a FRESH node-local id on import, so a session that opened on the primary and
+closed on the standby after a failover carried different ids on the two nodes.
+#5212 carries the originating node's id on the HA session-sync wire as a
+length-gated trailing field (both sides, mirroring the #4565/#5274 discipline):
+`SessionDelta.session_id` → the MSG_SESSION_OPEN frame's trailing `session_id`
+u64 (`encode_session_open`) → Go `SessionDeltaInfo.RTFlowSessionID` →
+`SessionValue{,V6}.RTFlowSessionID` → the cluster sync wire (a length-gated
+trailing u64 in `encodeSessionV{4,6}Payload`, after the #5274 `ConfigEpoch`) →
+`SessionSyncRequest.session_id` → `build_synced_session_entry`. On import,
+`upsert_synced_with_origin` ADOPTS the wire id (`SessionInstall::session_id`) when
+it is non-zero, and only falls back to `alloc_session_id()` for a legacy peer
+(wire id 0). The standby's SESSION_CLOSE RT_FLOW then carries the SAME id the
+primary's SESSION_CREATE did. The id is a metadata-only correlation stamp (never
+a lookup key), adopted verbatim for that cross-node correlation. It is NOT
+globally unique — the `worker_id<<48 | counter` namespace has no node
+discriminator and both nodes run the same worker set, so in active/active an
+adopted id can collide with a local same-worker id (observability-only, bounded;
+a node-discriminator bit is tracked as #6311). Pinned by
+`session::tests::synced_import_adopts_peer_session_id_5212`,
+`test_encode_session_open_carries_session_id_5212`, and the Go
+`TestSessionWireRoundTripRTFlowSessionID5212{V4,V6}` /
+`TestDecodeSessionEventRTFlowSessionID5212` /
+`TestBuildSessionSyncRequestCarriesRTFlowSessionID5212` /
+`TestUserspaceSessionFromDeltaCarriesRTFlowSessionID5212`. (2) RESOLVED in #5213:
+`show security flow session` now shows the SAME id the RT_FLOW frames carry.
+`publish_conntrack` (`build_conntrack_value_v4`/`_v6`) stamps the conntrack-map
+`session_id` from `SessionTable::session_id_for(&forward_key)` at each
+live-session-create publish site, and `cli_show_flow.go` renders `val.SessionID`
+(via `flowSessionDisplayID`), keeping the `cli_show_flow.go` iteration-index
+fallback ONLY when `val.SessionID == 0` (an absent/legacy id). Additive and
+node-local-safe.
 
 ## Per-IP session-limit lifecycle (#2134; #3122 peer-synced fix; #2128 leak-fix preserved)
 

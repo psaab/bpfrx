@@ -37,6 +37,44 @@
 - **Validation**: `cargo build --release` clean; repeated parallel targeted
   runs of the affected + fail-on-revert tests; full suite `--test-threads=1`
   green (see PR body).
+## 2026-07-22 — #6185: fence synchronous ArchiveConfig against the zeroize fence
+
+- **Timestamp**: 2026-07-22 (fix/6185-archiveconfig-fence)
+- **Action**: Fenced the SYNCHRONOUS archive path (`Store.ArchiveConfig`,
+  `pkg/configstore/store_persist.go`) against the #5869/#6182 zeroize archive
+  fence. #6182 fenced + joined the ASYNC fire-and-forget `writeArchive`
+  goroutine (`archiveFenced` + `archiveWG`), but `ArchiveConfig` did NOT consult
+  the fence and was NOT tracked by the WaitGroup. It has zero production callers
+  today, but if it were ever wired to an operator command (e.g. `request system
+  configuration archive`) a fenced-window call would `os.MkdirAll` + rewrite the
+  archive dir after `FactoryResetArchiveDir` erased it — recreating a
+  `config-<ts>.<seq>.conf` snapshot of the PRIOR tenant's full config text
+  (cleartext IKE PSKs, WireGuard keys, SNMP communities) — reopening the #5869
+  re-tenant residue for that path. `ArchiveConfig` now (1) no-ops when the fence
+  is set (checked under `s.mu`, mirroring the async launch guard) and (2)
+  `archiveWG.Add(1)`s under the lock guarded by `!archiveFenced` and `Done()`s
+  after the off-lock write, so a concurrent `QuiesceArchival` JOINS an in-flight
+  synchronous write before the wipe. Lock discipline matches the async path: the
+  fence read + Add run under the RLock (mutually exclusive with QuiesceArchival's
+  write-Lock fence-set), so the Add/Wait ordering stays race-free and no deadlock
+  (writeArchive never touches `s.mu`). Routed the sync path through the existing
+  `archiveWriteBarrier` seam so the JOIN is deterministically testable.
+- **Tests**: `pkg/configstore/archiveconfig_fence_6185_test.go` (new) —
+  `TestArchiveConfigFencedDoesNotRecreateArchiveDir` (MANDATORY fail-on-revert:
+  QuiesceArchival sets fence → ArchiveConfig must NOT recreate the dir;
+  neutralizing the fence guard → RED, dir reappears with the snapshot),
+  `TestArchiveConfigUnfencedArchivesNormally` (control: un-fenced sync path still
+  writes one snapshot carrying the config text),
+  `TestQuiesceArchivalJoinsInflightSyncArchiveConfig` (JOIN fail-on-revert:
+  removing the `archiveWG.Add(1)` → QuiesceArchival returns before joining → RED),
+  and `TestResumeArchivalReenablesCommitArchival` (#6185 note 2: fence → prove a
+  fenced commit does NOT archive → ResumeArchival clears the fence → a subsequent
+  commit archives normally; WaitGroup reusable, no corrupt state). Verified RED on
+  revert for both fences; `go build ./...`, `go vet`, `go test -race
+  ./pkg/configstore/...` full suite pass, 5x non-flake.
+- **File(s)**: pkg/configstore/store_persist.go, pkg/configstore/store_commit.go,
+  pkg/configstore/archiveconfig_fence_6185_test.go (new),
+  docs/system-login.md, pkg/configstore/README.md, _Log.md
 
 ## 2026-07-22 — #6114: mirror flow-cache HOT path samples before reserving
 
@@ -56235,3 +56273,47 @@ top.
   (verified by inspection; a deterministic test reduces to the flake). Mirrored
   in docs/engineering-style.md, distinguishing the deterministic ISOLATION test.
 - **File(s)**: userspace-dp/src/afxdp/wg/engine_tests.rs, docs/engineering-style.md
+- **Timestamp**: 2026-07-22 (#5212)
+- **Action**: Carry the RT_FLOW stable session id across the HA session-sync
+  wire so a peer-synced session ADOPTS the originating node's id instead of
+  minting a fresh node-local one on import (completes the #4915 cross-node
+  follow-up). BOTH-SIDES additive length-gated trailing field (mirrors the
+  #4565 snat_v4 / #5274 config-epoch discipline). Rust: `SessionInstall.session_id`
+  + `SyncedSessionEntry.session_id`; `upsert_synced_with_origin` stamps the wire
+  id when non-zero else `alloc_session_id()`; `encode_session_open` appends the
+  trailing u64 (threaded from `SessionDelta.session_id`); `emit_open_delta_with_origin`
+  looks the id up off the live table for the owner-RG cold-sync export;
+  `build_synced_session_entry` reads `SessionSyncRequest.session_id`. Go: added
+  `RTFlowSessionID` to `SessionValue`/`SessionValueV6` (distinct from the BPF-ABI
+  `SessionID`) + `SessionDeltaInfo` + `SessionSyncRequest`; wire encode/decode in
+  `sync_protocol.go` (V4+V6, appended after ConfigEpoch); `decodeSessionEvent`
+  decode; `buildSessionSyncRequestV4/V6` + `userspaceSessionFromDeltaV4/V6` stamp.
+  Regenerated `protocol_wire_v1.json`; fixed the six pre-existing
+  legacy-truncation tests whose `-N` byte counts shifted by the new trailing
+  field. Fail-on-revert tests (all firsthand RED-verified):
+  `synced_import_adopts_peer_session_id_5212`,
+  `test_encode_session_open_carries_session_id_5212`,
+  `TestSessionWireRoundTripRTFlowSessionID5212{V4,V6}`,
+  `TestDecodeSessionEventRTFlowSessionID5212`,
+  `TestBuildSessionSyncRequestCarriesRTFlowSessionID5212`,
+  `TestUserspaceSessionFromDeltaCarriesRTFlowSessionID5212`.
+  **File(s)**: userspace-dp/src/session/{ctx,install,tests,README}.rs/md,
+  userspace-dp/src/afxdp/{worker/mod,session_glue/*,shared_ops,tunnel,forwarding/mod,poll_descriptor/mod,ha}.rs,
+  userspace-dp/src/event_stream/{mod,codec/session_sync,codec/codec_tests}.rs,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/server/helpers.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/types.go, pkg/dataplane/userspace/{protocol,eventstream,manager_ha,*_test}.go,
+  pkg/cluster/{sync_protocol,README,sync_*_test}.go, pkg/daemon/{daemon_ha_userspace_convert,userspace_sync_test}.go,
+  docs/{sync-protocol,session-sync-architecture}.md
+
+## 2026-07-22 — #6309 (#5212) review fold: honest session-id caveat
+- **Action**: Folded rev6309 MERGE-NEEDS-MINOR findings — corrected the FALSE
+  "disjoint id slice" claim in docs/sync-protocol.md, session/README.md, and the
+  install.rs adopt comment to state the honest metadata-only, not-globally-unique
+  caveat (worker<<48|counter has no node discriminator; adopted id can collide
+  with a local same-worker id in active/active — observability-only). Tightened
+  the adopt test (worker 7→3, honest comment). Added the JSON-leg caveat to
+  emit_open_delta_with_origin. Filed follow-ups #6311 (node-bit namespace fix),
+  #6312 (JSON resync id-drop), #6313 (reverse-materialize test).
+- **File(s)**: docs/sync-protocol.md, userspace-dp/src/session/README.md,
+  userspace-dp/src/session/install.rs, userspace-dp/src/session/tests.rs

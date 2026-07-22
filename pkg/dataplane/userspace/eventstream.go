@@ -1398,6 +1398,14 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		}
 		off += 4
 	}
+	// #5212: trailing stable RT_FLOW session id (u64 LE), length-gated. Carried so
+	// a peer-synced session adopts the originating node's id, making its
+	// SESSION_CREATE/CLOSE RT_FLOW records correlatable across HA nodes. An old
+	// helper omits it (=> 0, the standby allocs a fresh local id — pre-#5212).
+	if off+8 <= len(payload) {
+		d.RTFlowSessionID = binary.LittleEndian.Uint64(payload[off : off+8])
+		off += 8
+	}
 
 	return d, true
 }

@@ -1174,6 +1174,7 @@ fn synced_replica_entry_keeps_peer_synced_entries_promotable() {
         tcp_flags: 0,
         // #2170 test fixture: no peer install generation.
         generation: 0,
+        session_id: 0,
     };
     let replica = synced_replica_entry(&entry);
     assert!(replica.origin.is_peer_synced());
@@ -1223,6 +1224,7 @@ fn synced_replica_entry_marks_local_entries_worker_local() {
         tcp_flags: 0,
         // #2170 test fixture: no peer install generation.
         generation: 0,
+        session_id: 0,
     };
     let replica = synced_replica_entry(&entry);
     assert_eq!(replica.origin, SessionOrigin::WorkerLocalImport);
@@ -1274,6 +1276,7 @@ fn reconcile_stop_preserves_shared_synced_sessions() {
         tcp_flags: 0,
         // #2170 test fixture: no peer install generation.
         generation: 0,
+        session_id: 0,
     };
     publish_shared_session(
         &coordinator.sessions.synced,
@@ -1336,6 +1339,7 @@ fn replay_synced_sessions_requeues_preserved_entries_for_new_workers() {
         tcp_flags: 0,
         // #2170 test fixture: no peer install generation.
         generation: 0,
+        session_id: 0,
     };
     let worker_command_queues = BTreeMap::from([
         (0u32, Arc::new(Mutex::new(VecDeque::new()))),

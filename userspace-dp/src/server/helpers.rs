@@ -621,6 +621,14 @@ pub(crate) fn build_synced_session_entry(
         origin: crate::session::SessionOrigin::SyncImport,
         // #2170: carry the peer's install generation onto the helper entry.
         generation: req.generation,
+        // #5212: carry the ORIGINATING node's stable RT_FLOW session id off the
+        // wire so this peer-synced session ADOPTS the peer's id instead of
+        // minting a fresh node-local one on import (`upsert_synced_with_origin`).
+        // A session that opens on the primary and closes here after a failover
+        // therefore emits SESSION_CREATE/CLOSE RT_FLOW records under ONE id
+        // across both nodes. An old peer omits the field => serde(default) 0,
+        // which falls back to `alloc_session_id()` (rolling-upgrade safe).
+        session_id: req.session_id,
     })
 }
 

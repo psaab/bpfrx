@@ -182,14 +182,20 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 
 	now := daemonMonotonicSeconds()
 	val := dataplane.SessionValue{
-		State:       4, // SESS_STATE_ESTABLISHED
-		SessionID:   uint64(now)<<16 | uint64(delta.Slot&0xffff),
-		Created:     now,
-		LastSeen:    now,
-		Timeout:     userspaceSessionTimeout(delta.Protocol),
-		IngressZone: ingressZone,
-		EgressZone:  egressZone,
-		ReverseKey:  userspaceReverseKeyV4(key, delta),
+		State: 4, // SESS_STATE_ESTABLISHED
+		// SessionID is the BPF-ABI conntrack id (node-local now<<16|Slot).
+		SessionID: uint64(now)<<16 | uint64(delta.Slot&0xffff),
+		// #5212: the ORIGINATING node's stable RT_FLOW session id (distinct from
+		// SessionID above). Carried across the cluster sync wire so a peer-synced
+		// session adopts it and its SESSION_CREATE/CLOSE records correlate across
+		// nodes. 0 on a legacy helper => a fresh local id is allocated on import.
+		RTFlowSessionID: delta.RTFlowSessionID,
+		Created:         now,
+		LastSeen:        now,
+		Timeout:         userspaceSessionTimeout(delta.Protocol),
+		IngressZone:     ingressZone,
+		EgressZone:      egressZone,
+		ReverseKey:      userspaceReverseKeyV4(key, delta),
 	}
 	if delta.TunnelEndpointID != 0 {
 		val.LogFlags |= dataplane.LogFlagUserspaceTunnelEndpoint
@@ -277,14 +283,19 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 
 	now := daemonMonotonicSeconds()
 	val := dataplane.SessionValueV6{
-		State:       4, // SESS_STATE_ESTABLISHED
-		SessionID:   uint64(now)<<16 | uint64(delta.Slot&0xffff),
-		Created:     now,
-		LastSeen:    now,
-		Timeout:     userspaceSessionTimeout(delta.Protocol),
-		IngressZone: ingressZone,
-		EgressZone:  egressZone,
-		ReverseKey:  userspaceReverseKeyV6(key, delta),
+		State: 4, // SESS_STATE_ESTABLISHED
+		// SessionID is the BPF-ABI conntrack id (node-local now<<16|Slot).
+		SessionID: uint64(now)<<16 | uint64(delta.Slot&0xffff),
+		// #5212: the ORIGINATING node's stable RT_FLOW session id (see V4) —
+		// adopted by a peer-synced session so its RT_FLOW records correlate
+		// across HA nodes; 0 on a legacy helper => fresh local id on import.
+		RTFlowSessionID: delta.RTFlowSessionID,
+		Created:         now,
+		LastSeen:        now,
+		Timeout:         userspaceSessionTimeout(delta.Protocol),
+		IngressZone:     ingressZone,
+		EgressZone:      egressZone,
+		ReverseKey:      userspaceReverseKeyV6(key, delta),
 	}
 	if delta.TunnelEndpointID != 0 {
 		val.LogFlags |= dataplane.LogFlagUserspaceTunnelEndpoint
