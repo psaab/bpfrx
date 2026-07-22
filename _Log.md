@@ -56646,3 +56646,12 @@ top.
   now serve only siblings/tests via `use super::*`). Build green.
 - **File(s)**: userspace-dp/src/event_stream/drain.rs (new),
   userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract control-frame decode + drain/resync state
+  machine (process_control_frames, handle_drain_request) into
+  event_stream/control.rs (verbatim; ACK-window #2959, Pause/Resume, DrainRequest
+  #2876/#2882/#2875). Widened to pub(super); MSG_*/FRAME_HEADER_SIZE codec
+  re-imports annotated (now serve siblings/tests). Build green.
+- **File(s)**: userspace-dp/src/event_stream/control.rs (new),
+  userspace-dp/src/event_stream/mod.rs
