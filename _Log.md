@@ -1,3 +1,27 @@
+## 2026-07-21 — #5153: reverse companion inherits forward application inactivity_timeout_ns
+
+- **Timestamp**: 2026-07-21 (fix/5153-reverse-companion-inactivity-timeout)
+- **Action**: `build_reverse_session_from_forward_match`
+  (`userspace-dp/src/afxdp/shared_ops.rs`) hardcoded
+  `inactivity_timeout_ns: None` while inheriting every other forward-match
+  metadatum (log/policy/NAT64). `companion_keeps_alive` (expire.rs) keeps an
+  idle-crossed half alive using the companion's OWN `expires_after_ns` — derived
+  from `inactivity_timeout_ns` via `session_timeout_ns` — so the reverse
+  companion of a 30s per-application flow fell back to the global timeout (e.g.
+  300s) and extended stale-state retention beyond the app's configured idle
+  window (residual of #3227/#3301/#4380). Changed the field to inherit
+  `forward_match.metadata.inactivity_timeout_ns`, matching the surrounding
+  field-inheritance idiom; `companion_keeps_alive` semantics unchanged.
+- **File(s)**: userspace-dp/src/afxdp/shared_ops.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/session/README.md, _Log.md
+- **Validation**: `cargo build` clean (pre-existing warnings only); new
+  `reverse_companion_inherits_forward_inactivity_timeout_5153` +
+  `build_reverse_session_carries_inactivity_timeout_5153` PASS. Fail-on-revert
+  confirmed — both FAIL when the field is reverted to hardcoded `None`. A
+  forward match with no per-app override still yields `None` (global timeout),
+  bit-identical to prior behavior.
+
 ## 2026-07-21 — #6216: bound natPoolStatsHandler session walk via sessionWalkLimiter
 
 - **Timestamp**: 2026-07-21 (fix/6216-natpoolstats-limiter)

@@ -3368,6 +3368,104 @@ fn synthesized_synced_reverse_entry_inherits_nat64_reverse_4565() {
     assert_eq!(reverse.key.dst_ip, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
 }
 
+// #5153: the synthesized/failover reverse companion must inherit the forward
+// session's per-application `inactivity_timeout_ns`. Both halves of one
+// stateful flow share the admitting application, so the app's idle window
+// governs either direction. `companion_keeps_alive` (expire.rs) keeps an
+// idle-crossed half alive using the companion's OWN `expires_after_ns`
+// (derived from this field); dropping it to `None` let the reverse companion
+// fall back to the global timeout and extended a short app timeout (e.g. 30s)
+// toward the global one (e.g. 300s) — stale-state retention beyond the
+// configured window. RED-on-revert: restoring `inactivity_timeout_ns: None` in
+// build_reverse_session_from_forward_match makes the inheritance assertion
+// fail.
+#[test]
+fn reverse_companion_inherits_forward_inactivity_timeout_5153() {
+    let forwarding = test_forwarding_state();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+
+    // 30s per-application idle timeout stamped on the forward session (the
+    // value `session_timeout_ns` would use for `expires_after_ns`).
+    const APP_TIMEOUT_NS: u64 = 30_000_000_000;
+    let mut metadata = test_metadata();
+    metadata.inactivity_timeout_ns = Some(APP_TIMEOUT_NS);
+
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata,
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+    };
+
+    let reverse =
+        synthesized_synced_reverse_entry(&forwarding, &BTreeMap::new(), &dynamic_neighbors, &entry, 1)
+            .expect("reverse companion");
+
+    assert!(reverse.metadata.is_reverse);
+    assert_eq!(
+        reverse.metadata.inactivity_timeout_ns,
+        Some(APP_TIMEOUT_NS),
+        "reverse companion must inherit the forward session's per-app idle \
+         timeout, not fall back to the global timeout"
+    );
+}
+
+// #5153: the direct `build_reverse_session_from_forward_match` builder must
+// also carry the forward match's `inactivity_timeout_ns` through (the
+// synthesized-sync path above and the live reverse-install path share this
+// builder). A forward match with NO per-app override still yields `None`
+// (global timeout), the common bit-identical case.
+#[test]
+fn build_reverse_session_carries_inactivity_timeout_5153() {
+    let forwarding = test_forwarding_state();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+
+    const APP_TIMEOUT_NS: u64 = 30_000_000_000;
+    let mut metadata = test_metadata();
+    metadata.inactivity_timeout_ns = Some(APP_TIMEOUT_NS);
+
+    let reverse = build_reverse_session_from_forward_match(
+        &forwarding,
+        &BTreeMap::new(),
+        &dynamic_neighbors,
+        ForwardSessionMatch {
+            key: test_key(),
+            decision: test_decision(),
+            metadata,
+        },
+        1,
+        0,
+    );
+    assert_eq!(
+        reverse.metadata.inactivity_timeout_ns,
+        Some(APP_TIMEOUT_NS),
+        "builder must inherit the forward match's per-app idle timeout"
+    );
+
+    // No per-app override on the forward match → reverse companion stays global
+    // (`None`), bit-identical to the pre-#5153 behavior.
+    let reverse_global = build_reverse_session_from_forward_match(
+        &forwarding,
+        &BTreeMap::new(),
+        &dynamic_neighbors,
+        ForwardSessionMatch {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: test_metadata(),
+        },
+        1,
+        0,
+    );
+    assert_eq!(
+        reverse_global.metadata.inactivity_timeout_ns, None,
+        "a forward match with no per-app override keeps the reverse companion \
+         on the global timeout"
+    );
+}
+
 #[test]
 fn synthesized_synced_reverse_entry_tracks_local_client_when_owner_rg_active() {
     let forwarding = test_forwarding_state();
