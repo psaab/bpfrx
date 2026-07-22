@@ -1,9 +1,15 @@
 // #1331: Local-variant submit handler extracted verbatim from the
 // CoSBatch::Local arm of submit_cos_batch (mod.rs pre-refactor
-// L1192-L1297). Pure code motion. The mirror_clone sidecar
-// prefix-attribution defect on transmit_batch (transmit.rs:96-109)
-// is preserved verbatim — fixing it is out of scope for this PR
-// (carry-over follow-up tracked separately).
+// L1192-L1297). Pure code motion.
+//
+// #5157: the mirror_clone sidecar prefix-attribution defect is now
+// FIXED. `transmit_batch` can drop a `mirror_clone` request mid-batch
+// via `continue` (mirror-reserve back-pressure) — a NON-prefix /
+// interior removal — so the committed set is no longer a prefix of the
+// input `items`. It reports the ORIGINAL-input positions it actually
+// committed in `binding.scratch.scratch_committed_orig_idx`, and the Ok
+// arm below charges flow-bucket / sojourn accounting through THOSE
+// indices instead of the old `sidecar[..packets]` prefix.
 use super::*;
 
 #[inline]
@@ -21,11 +27,14 @@ pub(super) fn submit_local(
         &mut items,
         cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx),
     );
-    // #1229 v7: pre-transmit sidecar — record (bucket, bytes)
-    // for each item in submit order. transmit_batch consumes
-    // the successful prefix in-place; we slice the sidecar by
-    // returned `packets` to account only the bytes actually
-    // shipped (not retries).
+    // #1229 v7: pre-transmit sidecar — record (bucket, bytes) for each
+    // item in submit (== original input) order. #5157: transmit_batch
+    // reports which ORIGINAL positions it actually committed (in
+    // `scratch.scratch_committed_orig_idx`); the Ok arm indexes THIS
+    // sidecar by those positions to account only the bytes actually
+    // shipped. A mid-batch mirror drop makes the committed set a
+    // non-prefix, so the old `sidecar[..packets]` slice would charge the
+    // dropped mirror's flow and miss the shifted real packet.
     //
     // Stack-allocated array (TX_BATCH_SIZE × 10 bytes = 640 B)
     // avoids per-batch heap allocation on the hot path. The
@@ -60,10 +69,12 @@ pub(super) fn submit_local(
     // prefix in-place and the retry suffix is push_fronted back WITH
     // its original enqueue_ns, so sampling at pop/batch-build time
     // would count a rolled-back item once per attempt. Recording only
-    // sidecar[..packets] after the TX insert settles counts each
+    // the COMMITTED entries after the TX insert settles counts each
     // packet exactly once, on the attempt that ships it. 512 B stack,
-    // one u64 store per item, no allocation. Shares the mirror_clone
-    // prefix-attribution caveat documented on the #1229 sidecar above.
+    // one u64 store per item, no allocation. #5157: sampled by
+    // committed original-position identity (see the #1229 sidecar
+    // above), not a `[..packets]` prefix, so a mid-batch mirror drop
+    // no longer shifts a packet's sojourn onto the wrong item.
     let mut enq_sidecar = [0u64; TX_BATCH_SIZE];
     let enq_len = {
         let mut n = 0usize;
@@ -75,6 +86,23 @@ pub(super) fn submit_local(
     };
     match transmit_batch(binding, &mut items, now_ns, shared_recycles) {
         Ok((packets, bytes)) => {
+            // #5157: snapshot the committed identities (ORIGINAL-input
+            // positions transmit_batch actually shipped) into a local
+            // fixed array BEFORE the mutable `binding` borrows below.
+            // These indices — not a `[..packets]` prefix — drive both
+            // accounting passes, so a mid-batch mirror drop charges the
+            // real transmitted flows, never the dropped mirror's flow.
+            let mut committed = [0u16; TX_BATCH_SIZE];
+            let committed_len = {
+                let src = &binding.scratch.scratch_committed_orig_idx;
+                let n = src.len().min(TX_BATCH_SIZE);
+                committed[..n].copy_from_slice(&src[..n]);
+                n
+            };
+            debug_assert_eq!(
+                committed_len, packets as usize,
+                "committed identity count must equal the transmitted packet count",
+            );
             apply_cos_send_result(
                 binding,
                 root_ifindex,
@@ -84,9 +112,13 @@ pub(super) fn submit_local(
                 bytes,
                 items,
             );
-            // #1229 v7: account per-bucket bytes for the sent
-            // prefix. sidecar_len > 0 ↔ flow_fair is active.
-            if packets > 0 && sidecar_len > 0 {
+            // #1229 v7 + #5157: account per-bucket bytes for the
+            // committed items by identity. sidecar_len > 0 ↔ flow_fair
+            // is active. Every committed index < items.len() <=
+            // sidecar_len (build_cos_batch_from_queue caps items at
+            // TX_BATCH_SIZE), so `oi < sidecar_len` always holds; the
+            // guard is defensive.
+            if committed_len > 0 && sidecar_len > 0 {
                 if let Some(ff) = binding
                     .cos
                     .cos_interfaces
@@ -94,23 +126,30 @@ pub(super) fn submit_local(
                     .and_then(|root| root.queues.get_mut(queue_idx))
                     .and_then(|q| q.flow_fair_state.as_mut())
                 {
-                    for &(bucket, bytes) in &sidecar[..packets as usize] {
-                        account_flow_bucket_tx(ff, bucket, bytes, now_ns);
+                    for &oi in &committed[..committed_len] {
+                        let oi = oi as usize;
+                        if oi < sidecar_len {
+                            let (bucket, bytes) = sidecar[oi];
+                            account_flow_bucket_tx(ff, bucket, bytes, now_ns);
+                        }
                     }
                 }
             }
-            // #1829: committed-prefix-only sojourn samples (see the
-            // enq_sidecar comment above). Same pass now_ns as the
-            // bucket accounting; record() skips enqueue_ns == 0.
-            if packets > 0 {
+            // #1829 + #5157: committed-only sojourn samples by identity
+            // (see the enq_sidecar comment above). Same pass now_ns as
+            // the bucket accounting; record() skips enqueue_ns == 0.
+            if committed_len > 0 {
                 if let Some(queue) = binding
                     .cos
                     .cos_interfaces
                     .get_mut(&root_ifindex)
                     .and_then(|root| root.queues.get_mut(queue_idx))
                 {
-                    for &enqueue_ns in &enq_sidecar[..(packets as usize).min(enq_len)] {
-                        queue.telemetry.sojourn.record(enqueue_ns, now_ns);
+                    for &oi in &committed[..committed_len] {
+                        let oi = oi as usize;
+                        if oi < enq_len {
+                            queue.telemetry.sojourn.record(enq_sidecar[oi], now_ns);
+                        }
                     }
                 }
             }

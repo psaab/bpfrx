@@ -1,3 +1,36 @@
+## 2026-07-21 — #5157: mirror-reserve mid-batch drop breaks submit_local sidecar prefix accounting
+
+- **Timestamp**: 2026-07-21 (fix/5157-mirror-drop-sidecar-accounting)
+- **Action**: `submit_local` (`userspace-dp/src/afxdp/cos/queue_service/submit_local.rs`)
+  built its per-item `(bucket, bytes)` / `enqueue_ns` sidecars in ORIGINAL
+  input order but charged `sidecar[..packets]` — a PREFIX — from a
+  count-only `transmit_batch` return. `transmit_batch`
+  (`userspace-dp/src/afxdp/tx/transmit/mod.rs`) drops a `mirror_clone`
+  request mid-batch via `continue` when
+  `free_tx_frames.len() <= MIRROR_TX_FRAME_RESERVE` (a NON-prefix / interior
+  removal), so after a front/interior mirror drop the committed set is no
+  longer a prefix of the sidecar: the dropped mirror's flow bucket was
+  charged bytes it never sent and the shifted real packet's bucket was
+  missed, corrupting per-bucket `flow_bucket_tx_bytes` / observed-rate EWMA
+  and the sojourn EWMA of the wrong flow. Fix: `transmit_batch` records the
+  ORIGINAL-input positions it actually committed into a per-binding scratch
+  buffer (`scratch.scratch_committed_orig_idx`, filled in the settle loop
+  from a stage→original index map); `submit_local` accounts both sidecars by
+  those identities (set-sum, order-independent) instead of a prefix. The
+  mirror-reserve back-pressure is preserved (still drop when free frames
+  `<=` reserve); only the accounting attribution is corrected.
+- **File(s)**: userspace-dp/src/afxdp/tx/transmit/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/submit_local.rs,
+  userspace-dp/src/afxdp/worker/scratch.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests/submit.rs,
+  docs/fairness-regimes.md, _Log.md
+- **Validation**: `cargo build` clean (pre-existing warnings only); full
+  bin test suite 4076 passed / 0 failed / 2 ignored. New
+  `mirror_interior_drop_preserves_sidecar_attribution_5157` PASSES; fail-on-revert
+  confirmed — restoring the `sidecar[..packets]` prefix loop makes it RED
+  (flow B charged 0 not 150; the dropped mirror's bucket charged 200 not 0).
+
 ## 2026-07-21 — #5153: reverse companion inherits forward application inactivity_timeout_ns
 
 - **Timestamp**: 2026-07-21 (fix/5153-reverse-companion-inactivity-timeout)
