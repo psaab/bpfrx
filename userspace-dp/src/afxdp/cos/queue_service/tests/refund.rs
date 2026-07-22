@@ -66,6 +66,12 @@ fn build_cos_batch_clears_pop_snapshot_stack_across_batches() {
         cos_queue_push_back(queue, test_flow_cos_item(src_port, 100));
     }
 
+    // #4973: this test drives build_cos_batch_from_queue directly (no submit),
+    // so it passes throwaway batch scratch deques instead of the per-worker
+    // WorkerCos scratch the production drain threads.
+    let mut local_scratch = VecDeque::new();
+    let mut prepared_scratch = VecDeque::new();
+
     // Batch 1: build_cos_batch_from_queue pops TX_BATCH_SIZE items,
     // pushing one rollback snapshot per pop. Budgets = u64::MAX so
     // nothing caps the batch below the frame-count bound.
@@ -75,6 +81,8 @@ fn build_cos_batch_clears_pop_snapshot_stack_across_batches() {
         u64::MAX,
         u64::MAX,
         CoSServicePhase::Guarantee,
+        &mut local_scratch,
+        &mut prepared_scratch,
     )
     .expect("first batch built");
     let batch1_len = match &batch1 {
@@ -108,6 +116,8 @@ fn build_cos_batch_clears_pop_snapshot_stack_across_batches() {
         u64::MAX,
         u64::MAX,
         CoSServicePhase::Guarantee,
+        &mut local_scratch,
+        &mut prepared_scratch,
     )
     .expect("second batch built");
     let batch2_len = match &batch2 {
@@ -132,6 +142,162 @@ fn build_cos_batch_clears_pop_snapshot_stack_across_batches() {
             .capacity(),
         pre_cap,
         "#3968: stack must not realloc past TX_BATCH_SIZE",
+    );
+}
+
+/// #4973: `build_cos_batch_from_queue` reuses a per-worker scratch deque
+/// (`mem::take`n from `WorkerCos` at build, drained and stored back by the
+/// submit handler). It MUST `clear()` that scratch at batch entry: a stale
+/// element left resident — e.g. from a queue-torn-down submit early return that
+/// stores the deque back undrained — would otherwise be emitted as the FIRST
+/// item of the NEXT batch, corrupting its contents while `batch_bytes` counts
+/// only the freshly popped items.
+///
+/// RED-on-revert: drop the `local_scratch.clear()` in the Local arm and the
+/// built batch carries the pre-seeded 9999-byte stale request ahead of the ten
+/// real items (len 11, first item = the marker); both assertions fail.
+#[test]
+fn build_cos_batch_local_clears_reused_scratch_between_batches() {
+    let mut root = test_cos_runtime_with_queues(
+        25_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "best-effort".into(),
+            priority: 5,
+            transmit_rate_bytes: 1_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: false,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: 8 * 1024 * 1024,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    enable_test_flow_fair(&mut root.queues[0]);
+
+    // Ten real 100-byte Local items across two flows (well under TX_BATCH_SIZE
+    // so the queue drains fully into one batch).
+    let real_items = 10usize;
+    for i in 0..real_items {
+        let src_port = if i % 2 == 0 { 9001u16 } else { 9002u16 };
+        cos_queue_push_back(&mut root.queues[0], test_flow_cos_item(src_port, 100));
+    }
+
+    // Pre-seed the reusable Local scratch with a STALE 9999-byte request,
+    // modelling a store-back that left residue behind.
+    let mut local_scratch = VecDeque::new();
+    let mut prepared_scratch = VecDeque::new();
+    match test_flow_cos_item(7777, 9999) {
+        CoSPendingTxItem::Local(stale) => local_scratch.push_back(stale),
+        CoSPendingTxItem::Prepared(_) => unreachable!("test_flow_cos_item yields Local"),
+    }
+
+    let batch = build_cos_batch_from_queue(
+        &mut root.queues[0],
+        0,
+        u64::MAX,
+        u64::MAX,
+        CoSServicePhase::Guarantee,
+        &mut local_scratch,
+        &mut prepared_scratch,
+    )
+    .expect("local batch built");
+
+    let items = match &batch {
+        CoSBatch::Local { items, .. } => items,
+        CoSBatch::Prepared { .. } => panic!("expected a Local batch"),
+    };
+    assert_eq!(
+        items.len(),
+        real_items,
+        "the reused scratch must be cleared: only freshly popped queue items \
+         appear, never the pre-seeded stale request",
+    );
+    assert!(
+        items.iter().all(|req| req.bytes.len() == 100),
+        "no batch item may carry the 9999-byte stale marker",
+    );
+    // The taken scratch is left empty in the field (mem::take), and the built
+    // deque owns the ten real items.
+    assert!(
+        local_scratch.is_empty(),
+        "the scratch is mem::taken into the batch, leaving the field empty",
+    );
+}
+
+/// #4973: the Prepared arm of `build_cos_batch_from_queue` shares the same
+/// clear-at-entry contract as the Local arm above; pin it independently so a
+/// revert of only `prepared_scratch.clear()` is still caught RED.
+#[test]
+fn build_cos_batch_prepared_clears_reused_scratch_between_batches() {
+    let mut root = test_cos_runtime_with_queues(
+        25_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "best-effort".into(),
+            priority: 5,
+            transmit_rate_bytes: 1_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: false,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: 8 * 1024 * 1024,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    enable_test_flow_fair(&mut root.queues[0]);
+
+    // Ten real 100-byte Prepared items across two flows.
+    let real_items = 10usize;
+    for i in 0..real_items {
+        let src_port = if i % 2 == 0 { 9001u16 } else { 9002u16 };
+        cos_queue_push_back(
+            &mut root.queues[0],
+            test_flow_prepared_cos_item(src_port, 100, 4096 + i as u64 * 4096),
+        );
+    }
+
+    let mut local_scratch = VecDeque::new();
+    let mut prepared_scratch = VecDeque::new();
+    match test_flow_prepared_cos_item(7777, 9999, 512) {
+        CoSPendingTxItem::Prepared(stale) => prepared_scratch.push_back(stale),
+        CoSPendingTxItem::Local(_) => unreachable!("test_flow_prepared_cos_item yields Prepared"),
+    }
+
+    let batch = build_cos_batch_from_queue(
+        &mut root.queues[0],
+        0,
+        u64::MAX,
+        u64::MAX,
+        CoSServicePhase::Guarantee,
+        &mut local_scratch,
+        &mut prepared_scratch,
+    )
+    .expect("prepared batch built");
+
+    let items = match &batch {
+        CoSBatch::Prepared { items, .. } => items,
+        CoSBatch::Local { .. } => panic!("expected a Prepared batch"),
+    };
+    assert_eq!(
+        items.len(),
+        real_items,
+        "the reused prepared scratch must be cleared: only freshly popped \
+         queue items appear, never the pre-seeded stale request",
+    );
+    assert!(
+        items.iter().all(|req| req.len == 100),
+        "no batch item may carry the 9999-byte stale marker",
+    );
+    assert!(
+        prepared_scratch.is_empty(),
+        "the scratch is mem::taken into the batch, leaving the field empty",
     );
 }
 

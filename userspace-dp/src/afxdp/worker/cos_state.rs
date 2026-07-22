@@ -54,4 +54,15 @@ pub(crate) struct WorkerCos {
     /// heap-allocate per settle — it is `mem::take`n out, filled, drained by
     /// reference, and stored back to retain capacity across calls.
     pub(crate) released_queue_leases_scratch: Vec<(usize, usize, u64)>,
+    /// #4973: reusable per-worker Local/Prepared batch deques for the shaped-TX
+    /// path. `build_cos_batch_from_queue` used to `VecDeque::new()` a fresh
+    /// deque per selected batch, so `drain_shaped_tx` heap-allocated on every
+    /// non-exact drain. These two scratch deques are `mem::take`n out at batch
+    /// build (cleared, filled with the selected items, moved into the
+    /// `CoSBatch`), then drained empty by the submit handler and stored back so
+    /// the ring-buffer allocation is retained across drains. Only ONE of the
+    /// two is consumed per batch (the head item's variant decides), so the
+    /// other keeps its capacity untouched. Allocation-free after warmup.
+    pub(crate) cos_local_batch_scratch: std::collections::VecDeque<TxRequest>,
+    pub(crate) cos_prepared_batch_scratch: std::collections::VecDeque<PreparedTxRequest>,
 }

@@ -56369,3 +56369,24 @@ top.
   userspace-dp/src/server/handlers/{mod,neighbors}.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json,
   userspace-dp/src/afxdp/README.md
+## 2026-07-22 — #4973 CoS shaped-TX batch deque reuse (allocation-free)
+- **Action**: `build_cos_batch_from_queue` no longer `VecDeque::new()`s a batch
+  deque per selected batch on the non-exact shaped-TX path. Added two per-worker
+  reusable deques (`cos_local_batch_scratch` / `cos_prepared_batch_scratch` on
+  `WorkerCos`) that are `mem::take`n into the built `CoSBatch` (arm-specific
+  `clear()` at entry) and drained + stored back by the submit handler —
+  `apply_cos_*_result` / `restore_cos_*_items` now return the emptied deque,
+  `restore_cos_*_items_inner` drain via `&mut`, and `submit_local` /
+  `submit_prepared` store it into the scratch field. Threaded the scratch through
+  `build_nonexact_cos_batch` (disjoint-field split-borrow) →
+  `select_nonexact_cos_guarantee_batch_into` / `select_cos_surplus_batch_filtered`;
+  the old public selectors kept their allocating signatures as test wrappers.
+  Mirrors the #4972 `released_queue_leases_scratch` pattern. Added two
+  RED-on-revert tests pinning that each arm clears the reused scratch; verified
+  both go RED with the `clear()` neutralized. Full cos suite green (587 lib
+  tests + doc-drift).
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/{mod,submit_local,
+  submit_prepared}.rs, userspace-dp/src/afxdp/cos/tx_completion.rs,
+  userspace-dp/src/afxdp/worker/{cos_state,mod}.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests/{refund,wakeup}.rs,
+  userspace-dp/src/afxdp/cos/README.md

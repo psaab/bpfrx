@@ -52,6 +52,7 @@ func TestConfigLoadHandlerAcceptsNormalBody(t *testing.T) {
 	body := `{"mode":"set","content":"set system host-name fw"}`
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/config/load", strings.NewReader(body))
+	withRESTConfigSession(req, testRESTConfigSessionID)
 	s.configLoadHandler(rr, req)
 	if rr.Code != 200 {
 		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())

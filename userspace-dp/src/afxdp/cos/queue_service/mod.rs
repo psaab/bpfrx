@@ -289,25 +289,56 @@ fn build_nonexact_cos_batch(
         .get(&root_ifindex)
         .map(|iface_fast| iface_fast.queue_fast_path.as_slice())
         .unwrap_or(&[]);
+    // #4973: split-borrow the per-worker reusable Local/Prepared batch deques
+    // from their disjoint `WorkerCos` fields alongside the `cos_interfaces`
+    // mutable borrow (the same disjoint-field borrow-split `queue_fast_path` /
+    // `shared_exact_backlog` above already rely on). The selected batch build
+    // `mem::take`s the matching deque into the `CoSBatch`; the submit handler
+    // drains it empty and stores it back, so the shaped-TX drain reuses the
+    // ring-buffer allocation instead of `VecDeque::new()`ing per batch.
+    // Borrow the fields directly (not through an intermediate `&mut
+    // binding.cos`, which would conflict with the still-live shared borrow of
+    // `binding.cos.cos_fast_interfaces` held by `queue_fast_path`). An explicit
+    // `match` (not `.or_else`) keeps the surplus fallback out of a closure that
+    // would try to re-capture the scratch references.
     let selected = {
+        let local_scratch = &mut binding.cos.cos_local_batch_scratch;
+        let prepared_scratch = &mut binding.cos.cos_prepared_batch_scratch;
         let root = binding.cos.cos_interfaces.get_mut(&root_ifindex)?;
-        select_nonexact_cos_guarantee_batch(root, queue_fast_path, now_ns).or_else(|| {
-            // Strict priority applies to surplus service only. Non-exact
-            // queues with explicit transmit-rate guarantees keep their
-            // guarantee pass. Residual/best-effort surplus remains
-            // work-conserving, but while exact queues are backlogged it may
-            // consume only the residual root rate after backlogged exact
-            // guarantee rates are reserved.
-            let exact_demand_mask = root_exact_demand_queue_mask(root) | peer_exact_demand_mask;
-            let exact_demand_rate = exact_demand_rate_bytes_for_mask(root, exact_demand_mask);
-            let nonexact_budget = nonexact_surplus_budget_under_exact_demand(
-                root,
-                now_ns,
-                exact_demand_rate,
-                shared_exact_backlog.map(|backlog| &**backlog),
-            );
-            select_cos_surplus_batch_filtered(root, now_ns, true, nonexact_budget)
-        })
+        match select_nonexact_cos_guarantee_batch_into(
+            root,
+            queue_fast_path,
+            now_ns,
+            local_scratch,
+            prepared_scratch,
+        ) {
+            Some(batch) => Some(batch),
+            None => {
+                // Strict priority applies to surplus service only. Non-exact
+                // queues with explicit transmit-rate guarantees keep their
+                // guarantee pass. Residual/best-effort surplus remains
+                // work-conserving, but while exact queues are backlogged it may
+                // consume only the residual root rate after backlogged exact
+                // guarantee rates are reserved.
+                let exact_demand_mask =
+                    root_exact_demand_queue_mask(root) | peer_exact_demand_mask;
+                let exact_demand_rate = exact_demand_rate_bytes_for_mask(root, exact_demand_mask);
+                let nonexact_budget = nonexact_surplus_budget_under_exact_demand(
+                    root,
+                    now_ns,
+                    exact_demand_rate,
+                    shared_exact_backlog.map(|backlog| &**backlog),
+                );
+                select_cos_surplus_batch_filtered(
+                    root,
+                    now_ns,
+                    true,
+                    nonexact_budget,
+                    local_scratch,
+                    prepared_scratch,
+                )
+            }
+        }
     };
     if selected.is_some() {
         refresh_cos_interface_activity(binding, root_ifindex);
@@ -609,6 +640,11 @@ pub(in crate::afxdp) fn select_cos_guarantee_batch_with_fast_path(
         return None;
     }
     let start = root.legacy_guarantee_rr % queue_count;
+    // #4973: this legacy test-only selector does not thread worker scratch, so
+    // it uses throwaway batch deques. Production reuse lives on the
+    // `_into` / `_filtered` selectors driven by `build_nonexact_cos_batch`.
+    let mut local_scratch = VecDeque::new();
+    let mut prepared_scratch = VecDeque::new();
     for offset in 0..queue_count {
         let queue_idx = (start + offset) % queue_count;
         let queue = &mut root.queues[queue_idx];
@@ -684,6 +720,8 @@ pub(in crate::afxdp) fn select_cos_guarantee_batch_with_fast_path(
             root.tokens,
             guarantee_budget,
             CoSServicePhase::Guarantee,
+            &mut local_scratch,
+            &mut prepared_scratch,
         ) {
             return Some(batch);
         }
@@ -1364,11 +1402,37 @@ fn select_exact_cos_guarantee_queue_waterfill(
 // independently of the exact pass via `nonexact_guarantee_rr` — a service
 // event on an exact queue does not advance this cursor, so non-exact RR
 // order is stable across bursts of exact-queue activity.
+//
+// #4973: the production drain (`build_nonexact_cos_batch`) calls
+// `select_nonexact_cos_guarantee_batch_into` with the per-worker reusable batch
+// deques so `build_cos_batch_from_queue` does not `VecDeque::new()` per batch.
+// This thin wrapper preserves the original allocating signature for unit tests
+// that do not thread worker scratch.
+#[cfg(test)]
 #[inline]
 pub(in crate::afxdp) fn select_nonexact_cos_guarantee_batch(
     root: &mut CoSInterfaceRuntime,
     queue_fast_path: &[WorkerCoSQueueFastPath],
     now_ns: u64,
+) -> Option<CoSBatch> {
+    let mut local_scratch = VecDeque::new();
+    let mut prepared_scratch = VecDeque::new();
+    select_nonexact_cos_guarantee_batch_into(
+        root,
+        queue_fast_path,
+        now_ns,
+        &mut local_scratch,
+        &mut prepared_scratch,
+    )
+}
+
+#[inline]
+pub(in crate::afxdp) fn select_nonexact_cos_guarantee_batch_into(
+    root: &mut CoSInterfaceRuntime,
+    queue_fast_path: &[WorkerCoSQueueFastPath],
+    now_ns: u64,
+    local_scratch: &mut VecDeque<TxRequest>,
+    prepared_scratch: &mut VecDeque<PreparedTxRequest>,
 ) -> Option<CoSBatch> {
     let queue_count = root.queues.len();
     if queue_count == 0 {
@@ -1439,6 +1503,8 @@ pub(in crate::afxdp) fn select_nonexact_cos_guarantee_batch(
             root.tokens,
             guarantee_budget,
             CoSServicePhase::Guarantee,
+            local_scratch,
+            prepared_scratch,
         ) {
             return Some(batch);
         }
@@ -1446,12 +1512,26 @@ pub(in crate::afxdp) fn select_nonexact_cos_guarantee_batch(
     None
 }
 
+// #4973: unit-test-facing surplus selector. The production drain calls
+// `select_cos_surplus_batch_filtered` directly with the per-worker reusable
+// batch deques; this wrapper allocates throwaway deques so tests keep the
+// original allocating signature.
+#[cfg(test)]
 #[inline]
 pub(in crate::afxdp) fn select_cos_surplus_batch(
     root: &mut CoSInterfaceRuntime,
     now_ns: u64,
 ) -> Option<CoSBatch> {
-    select_cos_surplus_batch_filtered(root, now_ns, true, None)
+    let mut local_scratch = VecDeque::new();
+    let mut prepared_scratch = VecDeque::new();
+    select_cos_surplus_batch_filtered(
+        root,
+        now_ns,
+        true,
+        None,
+        &mut local_scratch,
+        &mut prepared_scratch,
+    )
 }
 
 #[inline]
@@ -1460,6 +1540,8 @@ fn select_cos_surplus_batch_filtered(
     now_ns: u64,
     allow_nonexact: bool,
     nonexact_surplus_budget: Option<u64>,
+    local_scratch: &mut VecDeque<TxRequest>,
+    prepared_scratch: &mut VecDeque<PreparedTxRequest>,
 ) -> Option<CoSBatch> {
     for priority in 0..COS_PRIORITY_LEVELS {
         let indices_len = root.queue_indices_by_priority[priority].len();
@@ -1535,6 +1617,8 @@ fn select_cos_surplus_batch_filtered(
                 root.tokens,
                 secondary_budget,
                 CoSServicePhase::Surplus,
+                local_scratch,
+                prepared_scratch,
             ) {
                 return Some(batch);
             }
@@ -1776,12 +1860,22 @@ fn subtract_direct_cos_queue_bytes(
 }
 
 #[inline]
+// #4973: `local_scratch` / `prepared_scratch` are the per-worker reusable
+// batch deques (WorkerCos state). The selected arm `clear()`s its scratch at
+// entry (defensive — a submit-side store-back leaves it empty, but a stale
+// element from a torn-down-queue early-return would otherwise corrupt this
+// batch), fills it, and `mem::take`s it into the `CoSBatch`. The submit
+// handler drains it empty and stores it back, so the ring-buffer allocation is
+// retained across drains instead of a `VecDeque::new()` per selected batch. The
+// non-selected arm's scratch is left untouched (keeps its capacity).
 fn build_cos_batch_from_queue(
     queue: &mut CoSQueueRuntime,
     queue_idx: usize,
     root_budget: u64,
     secondary_budget: u64,
     phase: CoSServicePhase,
+    local_scratch: &mut VecDeque<TxRequest>,
+    prepared_scratch: &mut VecDeque<PreparedTxRequest>,
 ) -> Option<CoSBatch> {
     // #3968: clear the pop-snapshot stack at batch start — the
     // non-exact analog of the clear `drain_exact_local_items_to_scratch_flow_fair`
@@ -1808,11 +1902,11 @@ fn build_cos_batch_from_queue(
     let head = cos_queue_front(queue)?;
     match head {
         CoSPendingTxItem::Local(_) => {
-            let mut items = VecDeque::new();
+            local_scratch.clear();
             let mut remaining_root = root_budget;
             let mut remaining_secondary = secondary_budget;
             let mut batch_bytes = 0u64;
-            while items.len() < TX_BATCH_SIZE {
+            while local_scratch.len() < TX_BATCH_SIZE {
                 // #1763 Lever A — fused select+pop. Peek returns the
                 // min-finish bucket id; if we commit to popping, reuse
                 // that exact bucket (no re-scan). No queue mutation
@@ -1833,7 +1927,7 @@ fn build_cos_batch_from_queue(
                 match cos_queue_pop_known_bucket(queue, bucket, u64::MAX) {
                     Some(CoSPendingTxItem::Local(req)) => {
                         batch_bytes = batch_bytes.saturating_add(len);
-                        items.push_back(req);
+                        local_scratch.push_back(req);
                     }
                     Some(other) => {
                         cos_queue_push_front(queue, other);
@@ -1842,23 +1936,23 @@ fn build_cos_batch_from_queue(
                     None => break,
                 }
             }
-            if items.is_empty() {
+            if local_scratch.is_empty() {
                 None
             } else {
                 Some(CoSBatch::Local {
                     queue_idx,
                     phase,
                     batch_bytes,
-                    items,
+                    items: core::mem::take(local_scratch),
                 })
             }
         }
         CoSPendingTxItem::Prepared(_) => {
-            let mut items = VecDeque::new();
+            prepared_scratch.clear();
             let mut remaining_root = root_budget;
             let mut remaining_secondary = secondary_budget;
             let mut batch_bytes = 0u64;
-            while items.len() < TX_BATCH_SIZE {
+            while prepared_scratch.len() < TX_BATCH_SIZE {
                 // #1763 Lever A — fused select+pop (Prepared arm). See
                 // the Local arm above for the no-mutation invariant.
                 let Some((bucket, front)) = cos_queue_peek_min_bucket(queue, u64::MAX) else {
@@ -1876,7 +1970,7 @@ fn build_cos_batch_from_queue(
                 match cos_queue_pop_known_bucket(queue, bucket, u64::MAX) {
                     Some(CoSPendingTxItem::Prepared(req)) => {
                         batch_bytes = batch_bytes.saturating_add(len);
-                        items.push_back(req);
+                        prepared_scratch.push_back(req);
                     }
                     Some(other) => {
                         cos_queue_push_front(queue, other);
@@ -1885,14 +1979,14 @@ fn build_cos_batch_from_queue(
                     None => break,
                 }
             }
-            if items.is_empty() {
+            if prepared_scratch.is_empty() {
                 None
             } else {
                 Some(CoSBatch::Prepared {
                     queue_idx,
                     phase,
                     batch_bytes,
-                    items,
+                    items: core::mem::take(prepared_scratch),
                 })
             }
         }

@@ -544,6 +544,8 @@ impl BindingWorker {
                 cos_wheel_ticks_advanced_max: 0,
                 cos_queue_lease_undergrants: CoSQueueLeaseUndergrantCounters::default(),
                 released_queue_leases_scratch: Vec::new(),
+                cos_local_batch_scratch: VecDeque::new(),
+                cos_prepared_batch_scratch: VecDeque::new(),
             },
             scratch: WorkerScratch {
                 scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
@@ -693,6 +695,8 @@ impl BindingWorker {
                 cos_wheel_ticks_advanced_max: 0,
                 cos_queue_lease_undergrants: CoSQueueLeaseUndergrantCounters::default(),
                 released_queue_leases_scratch: Vec::new(),
+                cos_local_batch_scratch: VecDeque::new(),
+                cos_prepared_batch_scratch: VecDeque::new(),
             },
             scratch: WorkerScratch {
                 scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
@@ -815,6 +819,8 @@ impl BindingWorker {
                 cos_wheel_ticks_advanced_max: 0,
                 cos_queue_lease_undergrants: CoSQueueLeaseUndergrantCounters::default(),
                 released_queue_leases_scratch: Vec::new(),
+                cos_local_batch_scratch: VecDeque::new(),
+                cos_prepared_batch_scratch: VecDeque::new(),
             },
             scratch: WorkerScratch {
                 scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),

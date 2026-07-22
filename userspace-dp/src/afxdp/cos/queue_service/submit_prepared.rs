@@ -55,9 +55,12 @@ pub(super) fn submit_prepared(
         }
         n
     };
-    match transmit_prepared_queue(binding, &mut items, now_ns, shared_recycles) {
+    // #4973: capture the batch outcome so the drained `items` deque can be
+    // stored back into the per-worker Prepared batch scratch after the match,
+    // retaining the ring-buffer allocation `build_cos_batch_from_queue` reused.
+    let made_progress = match transmit_prepared_queue(binding, &mut items, now_ns, shared_recycles) {
         Ok((packets, bytes)) => {
-            apply_cos_prepared_result(
+            items = apply_cos_prepared_result(
                 binding,
                 root_ifindex,
                 queue_idx,
@@ -125,7 +128,7 @@ pub(super) fn submit_prepared(
             // #4971: expected TX backpressure — lock-free status, no
             // `last_error` mutex on the send hot path.
             binding.live.set_tx_retry_status(reason);
-            restore_cos_prepared_items(
+            items = restore_cos_prepared_items(
                 binding,
                 root_ifindex,
                 queue_idx,
@@ -143,7 +146,7 @@ pub(super) fn submit_prepared(
             // #4971: exceptional drop path (rare) still renders the
             // diagnostic message via the mutex-backed set_error.
             binding.live.set_error(reason.message());
-            restore_cos_prepared_items(
+            items = restore_cos_prepared_items(
                 binding,
                 root_ifindex,
                 queue_idx,
@@ -152,24 +155,35 @@ pub(super) fn submit_prepared(
             );
             cos_batch_tx_made_progress(Err(TxError::Drop(reason)))
         }
-    }
+    };
+    // #4973: return the drained batch deque to the per-worker Prepared batch
+    // scratch so the next shaped-TX drain reuses its capacity instead of
+    // allocating a fresh `VecDeque`.
+    binding.cos.cos_prepared_batch_scratch = items;
+    made_progress
 }
 
 // Moved from queue_service/mod.rs (pre-refactor L1511-L1532). Sole
 // caller is submit_prepared's Err arms above.
+//
+// #4973: returns the drained (now-empty) `retry` deque so the submit handler
+// can reclaim it as the per-worker Prepared batch scratch. On the
+// queue-torn-down early return the deque is returned undrained (its items are
+// dropped by the next `build_cos_batch_from_queue` `clear()`, exactly as the
+// previous by-value drop dropped them — the queue is gone).
 fn restore_cos_prepared_items(
     binding: &mut BindingWorker,
     root_ifindex: i32,
     queue_idx: usize,
     batch_bytes: u64,
-    retry: VecDeque<PreparedTxRequest>,
-) {
+    mut retry: VecDeque<PreparedTxRequest>,
+) -> VecDeque<PreparedTxRequest> {
     {
         let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
-            return;
+            return retry;
         };
         if let Some(queue) = root.queues.get_mut(queue_idx) {
-            let retry_bytes = restore_cos_prepared_items_inner(queue, retry);
+            let retry_bytes = restore_cos_prepared_items_inner(queue, &mut retry);
             queue.hot.queued_bytes = queue
                 .hot
                 .queued_bytes
@@ -178,4 +192,5 @@ fn restore_cos_prepared_items(
         }
     }
     refresh_cos_interface_activity(binding, root_ifindex);
+    retry
 }
