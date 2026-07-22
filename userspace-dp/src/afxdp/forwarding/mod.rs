@@ -2,6 +2,8 @@ use super::*;
 use std::borrow::Cow;
 
 mod host_inbound;
+mod nat;
+pub(in crate::afxdp) use nat::*;
 mod fabric;
 pub(in crate::afxdp) use fabric::*;
 // #3070: re-export into the afxdp scope so the local-delivery admit path
@@ -129,137 +131,6 @@ pub(super) fn resolve_forwarding(
         };
     };
     lookup_forwarding_resolution_with_dynamic(state, dynamic_neighbors, dst)
-}
-
-/// #3096: resolve the (ingress, egress) ifindex pair to the interface /
-/// routing-instance identity the NAT scope match needs. Borrows the
-/// forwarding maps for the lifetime of the match — no per-flow allocation. An
-/// ifindex absent from a map yields "" (unscoped / default VRF), so a
-/// zone-only or global rule-set is unaffected.
-pub(super) fn nat_scope_ctx_for_flow(
-    forwarding: &ForwardingState,
-    ingress_ifindex: i32,
-    egress_ifindex: i32,
-) -> crate::nat::NatScopeCtx<'_> {
-    let name = |ifindex: i32| -> &str {
-        forwarding
-            .ifindex_to_config_name
-            .get(&ifindex)
-            .map(String::as_str)
-            .unwrap_or("")
-    };
-    let ri = |ifindex: i32| -> &str {
-        forwarding
-            .ifindex_to_routing_instance
-            .get(&ifindex)
-            .map(String::as_str)
-            .unwrap_or("")
-    };
-    crate::nat::NatScopeCtx {
-        ingress_ifname: name(ingress_ifindex),
-        egress_ifname: name(egress_ifindex),
-        ingress_routing_instance: ri(ingress_ifindex),
-        egress_routing_instance: ri(egress_ifindex),
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn match_source_nat_for_flow(
-    forwarding: &ForwardingState,
-    ingress_ifindex: i32,
-    from_zone: &str,
-    to_zone: &str,
-    egress_ifindex: i32,
-    flow: &SessionFlow,
-) -> Option<NatDecision> {
-    let egress = forwarding.egress.get(&egress_ifindex)?;
-    let scope = nat_scope_ctx_for_flow(forwarding, ingress_ifindex, egress_ifindex);
-    match_source_nat(
-        &forwarding.source_nat_rules,
-        &scope,
-        from_zone,
-        to_zone,
-        flow.src_ip,
-        flow.dst_ip,
-        egress.primary_v4,
-        egress.primary_v6,
-    )
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[allow(clippy::too_many_arguments)]
-pub(super) fn match_source_nat_for_flow_result(
-    forwarding: &ForwardingState,
-    ingress_ifindex: i32,
-    from_zone: &str,
-    to_zone: &str,
-    egress_ifindex: i32,
-    flow: &SessionFlow,
-) -> SourceNatLookup {
-    let mut counter = None;
-    match_source_nat_for_flow_result_at(
-        forwarding,
-        ingress_ifindex,
-        from_zone,
-        to_zone,
-        egress_ifindex,
-        flow,
-        0,
-        false,
-        &mut counter,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn match_source_nat_for_flow_result_at(
-    forwarding: &ForwardingState,
-    ingress_ifindex: i32,
-    from_zone: &str,
-    to_zone: &str,
-    egress_ifindex: i32,
-    flow: &SessionFlow,
-    now_ns: u64,
-    // #1852: gate pool-mode SNAT allocation for non-first fragments.
-    non_first_fragment: bool,
-    // #2218: out-param — the matched SNAT rule's per-rule hit counter.
-    matched_counter: &mut Option<std::sync::Arc<crate::nat::NatRuleCounter>>,
-) -> SourceNatLookup {
-    let Some(egress) = forwarding.egress.get(&egress_ifindex) else {
-        return SourceNatLookup::NoMatch;
-    };
-    // #3096: resolve the interface / routing-instance scope for this flow.
-    let scope = nat_scope_ctx_for_flow(forwarding, ingress_ifindex, egress_ifindex);
-    crate::nat::match_source_nat_result_for_tuple(
-        &forwarding.source_nat_rules,
-        &scope,
-        from_zone,
-        to_zone,
-        flow.src_ip,
-        flow.dst_ip,
-        // #5687: a real packet always carries a concrete L4 protocol — including
-        // IPv4 protocol 0 (HOPOPT) as `Some(0)`, distinct from the address-only
-        // wrapper's `None` (tuple unknown). This is what lets a genuine
-        // protocol-0 SNAT flow take the real address-only path and its reverse
-        // tuple be matched.
-        Some(flow.forward_key.protocol),
-        flow.forward_key.src_port,
-        flow.forward_key.dst_port,
-        egress.primary_v4,
-        egress.primary_v6,
-        now_ns,
-        non_first_fragment,
-        // #4088 (RFC 5508 §3.1): a `SessionFlow` is only built for an
-        // ICMP/ICMPv6 protocol when the frame parser matched an
-        // identifier-bearing query type (`icmp_identifier_bearing`), so its
-        // `src_port` holds a real Query Identifier — even when that id is 0.
-        // Signal that authoritatively so pool SNAT translates the id instead
-        // of dropping an id==0 query onto the address-only path.
-        matches!(
-            flow.forward_key.protocol,
-            crate::ip_proto::PROTO_ICMP | crate::ip_proto::PROTO_ICMPV6
-        ),
-        matched_counter,
-    )
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1289,60 +1160,6 @@ pub(super) fn ingress_route_table_override(
     })
 }
 
-pub(super) fn interface_nat_local_resolution(
-    state: &ForwardingState,
-    dst: IpAddr,
-) -> Option<ForwardingResolution> {
-    match dst {
-        IpAddr::V4(ip) => state
-            .interface_nat_v4
-            .get(&ip)
-            .copied()
-            .map(|local_ifindex| ForwardingResolution {
-                disposition: ForwardingDisposition::LocalDelivery,
-                local_ifindex,
-                egress_ifindex: local_ifindex,
-                tx_ifindex: local_ifindex,
-                tunnel_endpoint_id: state
-                    .tunnel_endpoint_by_ifindex
-                    .get(&local_ifindex)
-                    .copied()
-                    .unwrap_or_default(),
-                next_hop: None,
-                neighbor_mac: None,
-                src_mac: None,
-                tx_vlan_id: 0,
-            }),
-        IpAddr::V6(ip) => state
-            .interface_nat_v6
-            .get(&ip)
-            .copied()
-            .map(|local_ifindex| ForwardingResolution {
-                disposition: ForwardingDisposition::LocalDelivery,
-                local_ifindex,
-                egress_ifindex: local_ifindex,
-                tx_ifindex: local_ifindex,
-                tunnel_endpoint_id: state
-                    .tunnel_endpoint_by_ifindex
-                    .get(&local_ifindex)
-                    .copied()
-                    .unwrap_or_default(),
-                next_hop: None,
-                neighbor_mac: None,
-                src_mac: None,
-                tx_vlan_id: 0,
-            }),
-    }
-}
-
-pub(super) fn interface_nat_local_resolution_on_session_miss(
-    state: &ForwardingState,
-    dst: IpAddr,
-    _protocol: u8,
-) -> Option<ForwardingResolution> {
-    interface_nat_local_resolution(state, dst)
-}
-
 pub(super) fn should_cache_local_delivery_session_on_miss(
     state: &ForwardingState,
     resolution_target: IpAddr,
@@ -1464,18 +1281,6 @@ pub(super) fn install_helper_local_session_on_miss(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     true
-}
-
-pub(super) fn should_block_tunnel_interface_nat_session_miss(
-    state: &ForwardingState,
-    dst: IpAddr,
-    protocol: u8,
-) -> bool {
-    matches!(protocol, PROTO_TCP | PROTO_UDP | PROTO_ICMP | PROTO_ICMPV6)
-        && matches!(
-            interface_nat_local_resolution(state, dst),
-            Some(local) if local.tunnel_endpoint_id != 0
-        )
 }
 
 pub(super) fn ingress_interface_local_resolution(
