@@ -56366,3 +56366,37 @@ top.
   userspace-dp/src/afxdp/worker/{cos_state,mod}.rs,
   userspace-dp/src/afxdp/cos/queue_service/tests/{refund,wakeup}.rs,
   userspace-dp/src/afxdp/cos/README.md
+
+## 2026-07-22 — #6102 generated-ICMP TE/PTB logical-ingress keying
+- **Timestamp**: 2026-07-22
+- **Action**: Fixed the #3026/#3035-adjacent gap where the generated ICMP
+  Time-Exceeded (`icmp::build_local_time_exceeded_request`) and egress-MTU
+  Packet-Too-Big (`tx/dispatch/mod.rs` `compute_forwarded_egress_ptb` build +
+  `enqueue_pending_forwards` classify) paths keyed the `forwarding.egress`
+  feasibility lookup, the reply BUILDERS, and `classify_generated_reply` on the
+  PHYSICAL AF_XDP bind ifindex (`ingress_ident.ifindex`) — all three maps are
+  keyed by the LOGICAL unit ifindex (#6046 established `ingress_ident.ifindex`
+  is physical). On a tagged VLAN sub-if with no untagged parent unit the egress
+  lookup missed → builder `?`-dropped → generated ICMP never produced
+  (traceroute `* * *` / PMTUD blackhole); with a parent it was mis-sourced +
+  mis-classified on the parent's CoS/DSCP/output-filter (fail-closed §6.2
+  boundary gap). Fix mirrors the shipped reject (#3976) / SYN-cookie (#3035)
+  precedent: resolve the logical unit ONCE via `resolve_ingress_logical_ifindex(
+  forwarding, ingress_ident.ifindex, meta.ingress_vlan_id).unwrap_or(physical)`
+  and feed THAT to egress-lookup + build + classify, keeping the PHYSICAL index
+  for the XSK transmit (`target_ifindex`/`tx_ifindex`/`egress_ifindex`) and the
+  #5856 per-zone rate-limit bucket. Rebuilt the vacuous #3026 TE test (it
+  hardcoded `ingress_ident.ifindex = 12` = the logical value, a
+  production-unreachable premise) into a production-reachable fail-on-revert
+  test (physical bind 11, `ingress_logical_ifindex (11,80)→12`, double assertion
+  `is_none()` + `time_exceeded_output_filter_drops == 1`); added a PTB analogue
+  (`ptb_resolves_logical_ingress_for_build_and_classify_6102`) with the same
+  double-assertion shape. Corrected the stale comments/docs (icmp.rs #3026 +
+  #5856 blocks, reject_reply.rs false "TE already passes logical" claim,
+  afxdp/README.md #3026/#3976 entries, generated-reply-rate-limit.md).
+- **File(s)**: userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
+  userspace-dp/src/afxdp/tests_icmp_te.rs,
+  userspace-dp/src/afxdp/tx/dispatch/tests/ptb.rs,
+  userspace-dp/src/afxdp/README.md, docs/generated-reply-rate-limit.md

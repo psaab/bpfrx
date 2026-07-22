@@ -377,16 +377,31 @@ fn build_local_time_exceeded_request_ignores_trigger_matching_output_filter() {
 
 
 /// #3026 LITERAL fail-on-revert. Drives the real
-/// `build_local_time_exceeded_request` with a VLAN egress where the LOGICAL
-/// unit (ifindex 12) carries an output `then discard protocol icmp` filter
-/// but the PHYSICAL parent (bind_ifindex 11) does NOT. The fix classifies the
-/// generated ICMP reply on the LOGICAL egress ifindex (`ingress_ident.ifindex`
-/// = 12), so the filter fires and the reply is dropped. If the production site
-/// is reverted to classify on `target_ifindex` (= egress.bind_ifindex = the
-/// physical parent 11, which has no filter), the reply is NOT dropped, the
-/// builder returns `Some`, and the `request.is_none()` assert fails RED.
+/// #6102 fail-on-revert (production-reachable rebuild of the vacuous #3026
+/// test): `build_local_time_exceeded_request` on a real VLAN sub-interface.
+/// The ingress AF_XDP binding is the PHYSICAL parent port (ifindex 11) — the
+/// value `ingress_ident.ifindex` genuinely holds in production (#6046) — while
+/// the tagged unit reth0.80 is the LOGICAL unit (ifindex 12) that keys
+/// `forwarding.egress` and the output filter. The daemon's
+/// `ingress_logical_ifindex` map resolves `(physical 11, vlan 80) -> logical
+/// 12`. The unit (12) carries an output `then discard protocol icmp` filter;
+/// the physical parent (11) carries NONE and has NO egress entry.
+///
+/// The fix resolves the logical unit ONCE (`resolve_ingress_logical_ifindex`)
+/// and feeds it to the egress lookup, the reply builders, and
+/// `classify_generated_reply`. The double assertion catches every partial and
+/// full revert to the physical `ingress_ident.ifindex`:
+///   - revert the CLASSIFY only  -> build on 12 (Some), classify on physical 11
+///     (no filter) -> reply ADMITTED -> `request.is_none()` FAILS RED.
+///   - revert the EGRESS LOOKUP or a BUILDER only -> `egress.get(11)` = None ->
+///     builder `?`-drops -> `request` is None but the drop is a BUILD-fail, not
+///     a filter drop -> `time_exceeded_output_filter_drops == 0` FAILS RED.
+///   - full revert to physical -> same build-fail drop -> counter 0 FAILS RED.
+/// The counter assertion is what distinguishes a filter drop (fix working) from
+/// a build-fail drop (a reverted egress/builder), so `is_none()` alone can
+/// never pass vacuously.
 #[test]
-fn build_local_time_exceeded_request_classifies_on_logical_egress_3026() {
+fn build_local_time_exceeded_request_resolves_logical_ingress_for_classify_6102() {
     // #5567: the reply must be built + pass the token before the output-filter
     // classify runs, so this drop-attribution test needs a non-empty bucket.
     let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
@@ -394,10 +409,13 @@ fn build_local_time_exceeded_request_classifies_on_logical_egress_3026() {
     let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
     // TRIGGER is a UDP flow; the generated reply is ICMP (proven elsewhere).
     let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client_ip, dst_ip, 1);
+    // PHYSICAL ingress bind port 11, tagged VLAN 80 — exactly what the shim
+    // reports for a frame arriving on reth0.80 (`ingress_vlan_id` = 80).
     let meta = UserspaceDpMeta {
         l3_offset: 14,
         l4_offset: 34,
-        ingress_ifindex: 5,
+        ingress_ifindex: 11,
+        ingress_vlan_id: 80,
         addr_family: libc::AF_INET as u8,
         protocol: PROTO_UDP,
         pkt_len: 128,
@@ -408,14 +426,15 @@ fn build_local_time_exceeded_request_classifies_on_logical_egress_3026() {
         len: frame.len() as u32,
         options: 0,
     };
-    // The egress is resolved on the LOGICAL unit ifindex 12 (reth0.80) — the
-    // value the builder uses as ingress_ident.ifindex to key forwarding.egress.
+    // The AF_XDP binding is the PHYSICAL parent (ifindex 11) — the fixed
+    // per-binding socket-bind port. The logical unit (12) is NOT this value;
+    // the fix must resolve it from `(11, 80)` before keying egress/classify.
     let ingress_ident = BindingIdentity {
         slot: 0,
         queue_id: 7,
         worker_id: 0,
-        interface: Arc::<str>::from("reth0.80"),
-        ifindex: 12,
+        interface: Arc::<str>::from("reth0"),
+        ifindex: 11,
     };
     let flow = icmp_suppress_flow_v4(client_ip, dst_ip);
     // OUTPUT filter on the LOGICAL VLAN unit (ifindex 12) with a terminal
@@ -450,8 +469,10 @@ fn build_local_time_exceeded_request_classifies_on_logical_egress_3026() {
         tx_selection_enabled_v4: true,
         ..ForwardingState::default()
     };
-    // Egress keyed by the LOGICAL ifindex 12; bind_ifindex 11 is the physical
-    // parent (= target_ifindex, the pre-fix classification key).
+    // Egress keyed by the LOGICAL ifindex 12 ONLY; bind_ifindex 11 is the
+    // physical parent (= target_ifindex, the XSK transmit device). There is NO
+    // egress entry for the physical parent 11, so a physical-keyed egress
+    // lookup (a reverted fix) misses and the builder `?`-drops.
     forwarding.egress.insert(
         12,
         EgressInterface {
@@ -465,6 +486,9 @@ fn build_local_time_exceeded_request_classifies_on_logical_egress_3026() {
             primary_v6: None,
         },
     );
+    // The daemon-built `(physical bind, vlan) -> logical unit` map
+    // (interfaces.rs:291-301). This is the SSOT the fix resolves through.
+    forwarding.ingress_logical_ifindex.insert((11, 80), 12);
 
     let mut counters = BatchCounters::default();
     let request = build_local_time_exceeded_request(
@@ -483,12 +507,15 @@ fn build_local_time_exceeded_request_classifies_on_logical_egress_3026() {
     assert!(
         request.is_none(),
         "the VLAN unit's OWN output filter (on logical ifindex 12) must drop \
-         the generated ICMP reply (#3026); classifying on the physical parent \
-         (bind_ifindex 11, no filter) would wrongly admit it"
+         the generated ICMP reply (#6102); classifying on the physical parent \
+         (ingress_ident.ifindex 11, no filter) would wrongly admit it"
     );
     assert_eq!(
         counters.time_exceeded_output_filter_drops, 1,
-        "the logical-egress output-filter drop must land on the TE counter"
+        "the logical-egress output-filter drop must land on the TE counter — a \
+         value of 0 means the egress lookup/builder was keyed on the physical \
+         parent 11 (no egress entry) and the reply was BUILD-dropped, not \
+         filter-dropped (a reverted #6102 fix)"
     );
     assert_eq!(counters.generated_reply_classify_parse_errors, 0);
 }

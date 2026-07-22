@@ -91,6 +91,22 @@ fn run_ptb_dispatch_with_forwarding(
     BatchCounters,
     Vec<String>,
 ) {
+    run_ptb_dispatch_with_forwarding_and_vlan(forwarding, 0)
+}
+
+/// #6102: PTB e2e harness variant that stamps the ingress frame's meta with a
+/// VLAN id, so a test can drive a tagged sub-interface through the physical
+/// bind port (ifindex 11) and exercise `resolve_ingress_logical_ifindex` in
+/// both the PTB build and classify sites.
+fn run_ptb_dispatch_with_forwarding_and_vlan(
+    forwarding: ForwardingState,
+    ingress_vlan_id: u16,
+) -> (
+    Vec<BindingWorker>,
+    DebugPollCounters,
+    BatchCounters,
+    Vec<String>,
+) {
     let mut bindings = vec![
         BindingWorker::new_for_mirror_test(0, 0, 11, 0),
         BindingWorker::new_for_mirror_test(1, 0, 22, 0),
@@ -114,6 +130,7 @@ fn run_ptb_dispatch_with_forwarding(
     req.meta.l3_offset = 14;
     req.meta.l4_offset = 34;
     req.meta.pkt_len = (frame.len() - 14) as u16;
+    req.meta.ingress_vlan_id = ingress_vlan_id;
     let mut pending = vec![req];
     let mut post_recycles = Vec::new();
     let ingress_ident = bindings[0].identity();
@@ -315,6 +332,107 @@ fn ptb_dropped_by_egress_output_filter_discard() {
     // recycled exactly once — no leak past the fail-closed drop.
     assert_eq!(bindings[1].tx_pipeline.pending_tx_local.len(), 0);
     assert_eq!(bindings[1].tx_pipeline.pending_tx_prepared.len(), 0);
+    assert_eq!(ingress_recycled_count(&bindings[0]), 1);
+    assert!(reasons.iter().any(|r| r == "egress_mtu_exceeded"));
+}
+
+/// #6102 forwarding state: a tagged VLAN sub-interface. The ingress AF_XDP
+/// binding is the PHYSICAL parent (ifindex 11); the reflected-reply egress and
+/// its output filter live on the LOGICAL unit (ifindex 12, reth0.80). There is
+/// NO egress entry for the physical parent 11 — so a physical-keyed build (a
+/// reverted #6102 fix) misses and the PTB is silently build-dropped. The
+/// daemon's `ingress_logical_ifindex` map resolves `(11, 80) -> 12`.
+fn forwarding_for_ptb_vlan_subif_6102(mtu: usize) -> ForwardingState {
+    // Base carries the FORWARD egress (ifindex 80, small MTU) that triggers the
+    // PTB; it does NOT add an egress for the physical ingress parent 11.
+    let mut forwarding = test_forwarding_with_egress_mtu(mtu);
+    // The reflected reply's egress, keyed by the LOGICAL unit 12 ONLY.
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 0,
+            primary_v4: Some(std::net::Ipv4Addr::new(172, 16, 80, 8)),
+            primary_v6: None,
+        },
+    );
+    // Daemon-built `(physical bind, vlan) -> logical unit` map (the SSOT the fix
+    // resolves through, interfaces.rs:291-301).
+    forwarding.ingress_logical_ifindex.insert((11, 80), 12);
+    // OUTPUT `then discard protocol icmp` on the LOGICAL unit 12 ONLY; the
+    // physical parent 11 carries no filter and no egress.
+    forwarding.filter_state = crate::filter::parse_filter_state(
+        &[crate::FirewallFilterSnapshot {
+            name: "ptb-out".into(),
+            family: "inet".into(),
+            terms: vec![crate::FirewallTermSnapshot {
+                name: "drop-icmp".into(),
+                action: "discard".into(),
+                protocols: vec!["icmp".into()],
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[crate::InterfaceSnapshot {
+            name: "reth0.80".into(),
+            ifindex: 12,
+            parent_ifindex: 11,
+            vlan_id: 80,
+            filter_output_v4: "ptb-out".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+    forwarding.tx_selection_enabled_v4 = true;
+    forwarding
+}
+
+/// #6102 fail-on-revert (PTB analogue of the Time Exceeded test): the generated
+/// egress-MTU PTB on a tagged VLAN sub-interface must be BUILT from and
+/// CLASSIFIED on the LOGICAL unit (ifindex 12), resolved from the physical bind
+/// port (ifindex 11) + `ingress_vlan_id` 80 — not the physical
+/// `ingress_ident.ifindex`. The unit's OWN output `then discard protocol icmp`
+/// filter drops the PTB. The double assertion (`len == 0` AND
+/// `ptb_output_filter_drops == 1`) fails RED on every revert to the physical
+/// index:
+///   - revert the BUILD to physical 11 -> `egress.get(11)` = None -> PTB never
+///     built -> nothing enqueued but `ptb_output_filter_drops == 0` FAILS RED
+///     (this is the primary silent-drop bug the fix closes).
+///   - revert the CLASSIFY to physical 11 -> PTB built on 12 but classified on
+///     11 (no filter) -> PTB ENQUEUED -> `len == 0` FAILS RED.
+#[test]
+fn ptb_resolves_logical_ingress_for_build_and_classify_6102() {
+    // #5567: the PTB must be built + pass the token before the output-filter
+    // classify runs, so this drop-attribution test needs a non-empty bucket.
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+    let (bindings, _dbg, counters, reasons) =
+        run_ptb_dispatch_with_forwarding_and_vlan(forwarding_for_ptb_vlan_subif_6102(1400), 80);
+    // Built on logical unit 12 (egress miss on physical 11 would have dropped
+    // it) and dropped by unit 12's OWN output `discard` (a physical-keyed
+    // classify on parent 11 would have wrongly admitted it).
+    assert_eq!(
+        bindings[0].tx_pipeline.pending_tx_local.len(),
+        0,
+        "the VLAN unit's output `then discard protocol icmp` (logical ifindex 12) \
+         must drop the generated PTB (#6102); classifying on the physical parent \
+         11 (no filter) would wrongly enqueue it"
+    );
+    assert_eq!(
+        counters.ptb_output_filter_drops, 1,
+        "the logical-egress output-filter drop must land on ptb_output_filter_drops \
+         — a value of 0 means the PTB build was keyed on the physical parent 11 \
+         (no egress entry) and was BUILD-dropped, not filter-dropped (a reverted \
+         #6102 fix)"
+    );
+    assert_eq!(counters.generated_reply_classify_parse_errors, 0);
+    // The oversized original is still dropped (PMTUD) and recycled once.
+    assert_eq!(bindings[1].tx_pipeline.pending_tx_local.len(), 0);
     assert_eq!(ingress_recycled_count(&bindings[0]), 1);
     assert!(reasons.iter().any(|r| r == "egress_mtu_exceeded"));
 }
