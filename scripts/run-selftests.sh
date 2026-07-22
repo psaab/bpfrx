@@ -144,6 +144,10 @@ done
 hdr "shell self-tests"
 run_shell scripts/image/test-grow-root.sh
 run_shell scripts/dist/selftest.sh
+# AF_XDP reproducer strict-warning build — fail-on-revert gate for #4906
+# (HC-081 uninitialized-counter false PASS). SKIPs on a host without a C
+# toolchain / libbpf-dev / libxdp-dev / xxd.
+run_shell test/xsk-repro/selftest-compile.sh
 
 # ── summary ──
 printf '\n\033[1m== selftest summary ==\033[0m\n'
