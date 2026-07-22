@@ -2998,6 +2998,16 @@ type SessionSyncRequest struct {
 	// decodes it via serde(default) to "" (not NAT64), bit-identical to
 	// pre-#4565 (rolling-upgrade safe).
 	Nat64SnatV4 string `json:"nat64_snat_v4,omitempty"`
+	// #5212: the ORIGINATING node's stable RT_FLOW session id (the dataplane's
+	// alloc_session_id value). Carried so a peer-PROMOTED session ADOPTS the
+	// originating node's id rather than minting a fresh node-local one on import
+	// — its RT_FLOW SESSION_CREATE (origin node) and SESSION_CLOSE (possibly the
+	// peer, after failover) then share one correlatable id. The helper stamps it
+	// onto the imported entry (build_synced_session_entry). omitempty is safe —
+	// an old helper without the key decodes it via serde(default) to 0, the "no
+	// id carried" sentinel that falls back to a fresh local id (rolling-upgrade
+	// safe). The Rust side declares `#[serde(rename = "session_id", default)]`.
+	RTFlowSessionID uint64 `json:"session_id,omitempty"`
 }
 
 type SessionDeltaInfo struct {
@@ -3065,6 +3075,14 @@ type SessionDeltaInfo struct {
 	// forward v6 key (the orig v6 src/dst ARE the key; dst_v4 is the /96 low 32).
 	Nat64       bool   `json:"nat64,omitempty"`
 	Nat64SnatV4 string `json:"nat64_snat_v4,omitempty"`
+	// #5212: the ORIGINATING node's stable RT_FLOW session id, decoded from the
+	// trailing u64 of the binary open frame (after the #4565 snat_v4). Stamped
+	// onto the synced SessionValue{,V6}.RTFlowSessionID by daemon_ha_userspace.go
+	// so the cluster sync wire and the peer helper carry it, letting a
+	// peer-synced session adopt the originating node's id (SESSION_CREATE/CLOSE
+	// correlate across HA nodes). Absent on an old helper => 0, the standby
+	// allocs a fresh local id (pre-#5212 behavior, rolling-upgrade safe).
+	RTFlowSessionID uint64 `json:"rt_flow_session_id,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

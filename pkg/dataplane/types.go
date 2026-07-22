@@ -103,6 +103,27 @@ type SessionValue struct {
 	// which is authoritative in the Go cluster layer — see
 	// SessionSync.installClusterSyncedV4 for the guard.
 	ConfigEpoch uint64
+
+	// RTFlowSessionID is the #5212 ORIGINATING node's stable RT_FLOW session id
+	// (the Rust dataplane's SessionTable.alloc_session_id value: the assigning
+	// worker's id in the high 16 bits + a per-worker monotonic counter). The
+	// dataplane assigns it at install and stamps it on every RT_FLOW
+	// SESSION_CREATE/CLOSE record (#4915); this field carries it across the HA
+	// session-sync wire so a PEER-SYNCED session ADOPTS the originating node's id
+	// instead of minting a fresh node-local one on import. A session that opens
+	// on the primary and closes on the peer after a failover then emits its
+	// SESSION_CREATE and SESSION_CLOSE records under ONE correlatable id across
+	// both nodes. Distinct from the BPF-ABI SessionID above (that is the Go
+	// dataplane's own conntrack id, now<<16|Slot in userspace mode — node-local
+	// by construction). Like Generation/ConfigEpoch this is userspace-sync-only
+	// HA metadata carried as a length-gated trailing field in the encode*Payload
+	// functions; it is NOT part of the BPF/C conntrack ABI and MUST NOT be added
+	// to it. 0 = "no id carried" (a legacy peer that omits the field, or a
+	// synthesized delta with no live entry): the receiver falls back to a fresh
+	// locally-allocated id, bit-identical to the pre-#5212 import
+	// (rolling-upgrade safe). A real id is never 0 (the allocator counter starts
+	// at 1), so the sentinel is unambiguous.
+	RTFlowSessionID uint64
 }
 
 // SessionKeyV6 mirrors the C struct session_key_v6 (5-tuple with 128-bit IPs).
@@ -189,6 +210,27 @@ type SessionValueV6 struct {
 	// (bpfSessionValueV6) and MUST NOT be added to it. 0 = unknown/legacy peer
 	// (check disabled), the rolling-upgrade-safe default.
 	ConfigEpoch uint64
+
+	// RTFlowSessionID is the #5212 ORIGINATING node's stable RT_FLOW session id
+	// (the Rust dataplane's SessionTable.alloc_session_id value: the assigning
+	// worker's id in the high 16 bits + a per-worker monotonic counter). The
+	// dataplane assigns it at install and stamps it on every RT_FLOW
+	// SESSION_CREATE/CLOSE record (#4915); this field carries it across the HA
+	// session-sync wire so a PEER-SYNCED session ADOPTS the originating node's id
+	// instead of minting a fresh node-local one on import. A session that opens
+	// on the primary and closes on the peer after a failover then emits its
+	// SESSION_CREATE and SESSION_CLOSE records under ONE correlatable id across
+	// both nodes. Distinct from the BPF-ABI SessionID above (that is the Go
+	// dataplane's own conntrack id, now<<16|Slot in userspace mode — node-local
+	// by construction). Like Generation/ConfigEpoch this is userspace-sync-only
+	// HA metadata carried as a length-gated trailing field in the encode*Payload
+	// functions; it is NOT part of the BPF/C conntrack ABI and MUST NOT be added
+	// to it. 0 = "no id carried" (a legacy peer that omits the field, or a
+	// synthesized delta with no live entry): the receiver falls back to a fresh
+	// locally-allocated id, bit-identical to the pre-#5212 import
+	// (rolling-upgrade safe). A real id is never 0 (the allocator counter starts
+	// at 1), so the sentinel is unambiguous.
+	RTFlowSessionID uint64
 }
 
 // ZoneConfig mirrors the C struct zone_config.
