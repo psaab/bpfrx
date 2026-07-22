@@ -56499,3 +56499,34 @@ top.
   userspace-dp/src/afxdp/tests_icmp_te.rs,
   userspace-dp/src/afxdp/tx/dispatch/tests/ptb.rs,
   userspace-dp/src/afxdp/README.md, docs/generated-reply-rate-limit.md
+
+- **Timestamp**: 2026-07-22 14:20 UTC
+- **Action**: #4977 — add source→object freshness gate for the
+  git-tracked userspace_xdp_bpfel.o. `make build` never runs `make
+  generate` and `make test` never rebuilds the shim, so a logic-only
+  edit to userspace-xdp/** not followed by `make generate` shipped the
+  STALE embedded object silently (source review + `make test` stayed
+  green). New `userspace_xdp_manifest.json` records a SHA-256 of the
+  tracked object plus every freshness-relevant build input (src/**/*.rs,
+  Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/config.toml, and
+  the build-userspace-xdp.sh recipe — excludes cargo target/ and the
+  shared C header, whose only build-relevant value MAX_INTERFACES is
+  already covered by the validateUserspaceShimSpec max_entries parity
+  check). build-userspace-xdp.sh regenerates the manifest via
+  cmd/shim-manifest right after the verifier-gated install so it stays in
+  lockstep with the object. TestUserspaceXDPShimObjectMatchesSourceManifest
+  recomputes it and fails (pointing at `make generate`) on any drift;
+  TestUserspaceXDPManifestCoversTrackedShimInputs guards the input set.
+  Fail-injection verified: editing src/lib.rs → RED; adding a new
+  src/*.rs → RED; restore → GREEN. Added cmd/shim-manifest to the #1451
+  legacy-import allowlist + retirement README table (build-time tool, no
+  production load path). Documented as guard layer 5 in
+  pkg/dataplane/README.md.
+- **File(s)**: pkg/dataplane/userspace_xdp_manifest.go,
+  pkg/dataplane/userspace_xdp_manifest_test.go,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  cmd/shim-manifest/main.go,
+  pkg/dataplane/build-userspace-xdp.sh,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/pr/1373-retire-ebpf-dataplane/README.md,
+  pkg/dataplane/README.md

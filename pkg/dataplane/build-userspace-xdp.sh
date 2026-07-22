@@ -160,3 +160,19 @@ fi
 
 install -m 0644 "${CANDIDATE}" "${OUT_FILE}"
 echo "build-userspace-xdp.sh: verifier PASS — installed ${OUT_FILE} (toolchain ${TOOLCHAIN}, bpf-linker ${BPF_LINKER_VERSION})"
+
+# --- Refresh the source→object freshness manifest (#4977). ---
+# `make build` never runs `make generate`, and `make test` never
+# rebuilds the shim, so a logic-only edit to userspace-xdp/** that is
+# not regenerated would ship this now-stale object silently. Immediately
+# after the verified install (so it stays in LOCKSTEP with the object it
+# describes), re-hash every freshness-relevant build input plus the
+# tracked object into pkg/dataplane/userspace_xdp_manifest.json;
+# TestUserspaceXDPShimObjectMatchesSourceManifest fails when the working
+# tree drifts from this manifest, directing the operator back to
+# `make generate`.
+(
+	cd "${REPO_ROOT}"
+	"${GO_BIN}" run ./cmd/shim-manifest -repo-root .
+) || fail "failed to refresh the shim freshness manifest (cmd/shim-manifest)"
+echo "build-userspace-xdp.sh: refreshed pkg/dataplane/userspace_xdp_manifest.json (#4977)"

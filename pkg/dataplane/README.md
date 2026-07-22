@@ -173,6 +173,38 @@ Guard layers (`build-userspace-xdp.sh`):
    (a genuine cpumap ValueSize break is still rejected), and
    `TestNonCPUMapMaxEntriesStillStrict` (no other map's MaxEntries check is
    weakened).
+5. **Source→object freshness gate (#4977)** — the four layers above bind
+   the *toolchain* and the object's *verifier behavior*, but none proves
+   the git-tracked `.o` corresponds to CURRENT `userspace-xdp/**` source.
+   Because `make build` never runs `make generate` and `make test` never
+   rebuilds the shim, a logic-only edit to the Rust source (a
+   packet-steering or security fix) that is not followed by `make
+   generate` + committing the regenerated `.o` would ship the STALE
+   object while source review and `make test` stay green. The gate closes
+   that gap:
+   - `pkg/dataplane/userspace_xdp_manifest.json` records a SHA-256 of the
+     tracked object AND of every freshness-relevant build input — every
+     `userspace-xdp/src/**/*.rs`, `Cargo.toml`, `Cargo.lock`,
+     `rust-toolchain.toml`, `.cargo/config.toml`, and the
+     `build-userspace-xdp.sh` recipe itself (it embeds the bpf-linker
+     pin). It deliberately EXCLUDES cargo's `target/` and
+     `bpf/headers/xpf_common.h` — `MAX_INTERFACES` is the only header
+     value threaded into the build and its object binding is already
+     covered by the `validateUserspaceShimSpec` max_entries parity check,
+     so hashing the whole shared header would only add false-positive
+     churn.
+   - `build-userspace-xdp.sh` regenerates the manifest (via
+     `cmd/shim-manifest` → `dataplane.WriteUserspaceXDPManifest`)
+     immediately after the verifier-gated install, so the manifest stays
+     in LOCKSTEP with the object it describes and can never record a
+     source hash newer than the object that source produced.
+   - `TestUserspaceXDPShimObjectMatchesSourceManifest` (a plain, non-root
+     `make test` test) recomputes the manifest from the working tree and
+     fails when it drifts — editing a shim source, adding a new `.rs`
+     module, or swapping the `.o` without `make generate` all go RED with
+     a message pointing back to `make generate`.
+     `TestUserspaceXDPManifestCoversTrackedShimInputs` additionally guards
+     the input SET so a manifest hand-edit cannot drop or invent entries.
 
 **Recovery runbook** (symptom: `load Rust xdp_userspace collection:
 ... BPF program is too large. Processed 1000001 insn`, daemon in
@@ -190,7 +222,11 @@ linker), run `make generate` (the verifier gate must PASS), commit the
 regenerated `.o` together with the pin change, and require a clean
 `git diff --exit-code pkg/dataplane/userspace_xdp_bpfel.o` after a
 pinned re-run (builds are bit-for-bit reproducible for a given pin)
-plus a cluster smoke before merge.
+plus a cluster smoke before merge. `make generate` also refreshes
+`userspace_xdp_manifest.json` in the same step (the recipe is a hashed
+input, so a linker-pin bump moves the manifest too), so commit the
+regenerated object and manifest together — the #4977 freshness gate
+then stays green.
 
 ## Entry points
 
