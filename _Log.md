@@ -1,3 +1,27 @@
+## 2026-07-22 — #4976: build-time ABI check for the libxdp ring mirror
+
+- **Timestamp**: 2026-07-22 14:00 PDT (fix/4976-build-abi-check)
+- **Action**: Add a two-sided, build-time ABI check coupling the Rust
+  `XskRingProd`/`XskRingCons` mirror (`userspace-dp/src/xsk_ffi.rs`) to the
+  installed libxdp `struct xsk_ring_{prod,cons}` layout. The Rust side gained
+  a `const _: () = { … }` block asserting `size_of` (48), `align_of` (8) and
+  every field offset (0/4/8/12/16/24/32/40, 64-bit) via `core::mem::offset_of!`.
+  The C bridge (`userspace-dp/csrc/xsk_bridge.c`) gained `_Static_assert`s
+  (`sizeof`/`_Alignof`/`offsetof`) pinning the *installed* libxdp structs to
+  the same numeric contract; these compile under build.rs's `cc` invocation,
+  so a libxdp/header upgrade that reorders or resizes the ring struct now
+  fails the build instead of silently corrupting AF_XDP memory at runtime.
+  Added a named runtime test `xsk_ring_abi_matches_libxdp_contract`
+  (`userspace-dp/src/xsk_ffi_tests.rs`) restating the contract for a
+  human-readable failure. No runtime dataplane behavior change.
+- **Validation**: `cargo build` + `cargo test xsk_` green (9/9). Fail-injected
+  both halves: adding a `u32` field to `XskRingProd` → Rust const block
+  `E0080: xsk ring size drift` (build fails); changing the C `producer` offset
+  assert from 16→999 → `cc` `static assertion failed: "xsk_ring_prod producer"`
+  (build fails). Both reverted; rebuild green.
+- **File(s)**: userspace-dp/src/xsk_ffi.rs, userspace-dp/csrc/xsk_bridge.c,
+  userspace-dp/src/xsk_ffi_tests.rs
+
 ## 2026-07-22 — #4975: index replay-filter drop set in a HashSet
 
 - **Timestamp**: 2026-07-22 13:30 PDT (fix/4975-replay-purge-index)

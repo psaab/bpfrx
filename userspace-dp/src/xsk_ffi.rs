@@ -52,6 +52,60 @@ pub(crate) struct XskSocketOpaque {
 unsafe impl Send for XskRingProd {}
 unsafe impl Send for XskRingCons {}
 
+// ── Build-time ABI coupling to libxdp's ring structs (#4976) ──────────
+//
+// `XskRingProd`/`XskRingCons` above hand-mirror libxdp's
+// `struct xsk_ring_prod`/`xsk_ring_cons` (the `DEFINE_XSK_RING` macro in
+// `/usr/include/xdp/xsk.h`). Rust allocates zeroed boxes of these
+// (see `Umem::new` / `Socket::create`) and hands them to libxdp's C
+// creation functions via `csrc/xsk_bridge.c`, which populates them in
+// place as native libxdp structs. Nothing otherwise couples the installed
+// libxdp layout to this independent Rust copy: a libxdp/header package
+// upgrade that reorders or resizes the ring struct — a routine ops event
+// given the project's image-baking + kernel/OS upgrades (#1930) — would
+// turn a clean rebuild into out-of-bounds writes / misread indices in the
+// AF_XDP ownership core (silent memory corruption, not a bind error).
+//
+// This const block pins the Rust mirror to a fixed 64-bit ABI contract.
+// `csrc/xsk_bridge.c` pins the *installed libxdp* structs to the SAME
+// numbers with `_Static_assert`. The two halves couple all three copies
+// (installed header ↔ C bridge ↔ Rust mirror) through one shared numeric
+// contract: any layout drift on either side fails the build here instead
+// of corrupting memory at runtime. Keep these numbers in lockstep with the
+// `_Static_assert`s in `csrc/xsk_bridge.c`.
+const _: () = {
+    // The fixed pointer-field offsets below assume 64-bit pointers, which
+    // is the only target the AF_XDP dataplane builds for.
+    assert!(
+        core::mem::size_of::<*const u32>() == 8,
+        "xsk ring ABI assumes 64-bit pointers"
+    );
+
+    macro_rules! assert_xsk_ring_layout {
+        ($t:ty) => {
+            assert!(
+                core::mem::size_of::<$t>() == 48,
+                "xsk ring size drift vs libxdp DEFINE_XSK_RING"
+            );
+            assert!(
+                core::mem::align_of::<$t>() == 8,
+                "xsk ring align drift vs libxdp DEFINE_XSK_RING"
+            );
+            assert!(core::mem::offset_of!($t, cached_prod) == 0, "cached_prod offset drift");
+            assert!(core::mem::offset_of!($t, cached_cons) == 4, "cached_cons offset drift");
+            assert!(core::mem::offset_of!($t, mask) == 8, "mask offset drift");
+            assert!(core::mem::offset_of!($t, size) == 12, "size offset drift");
+            assert!(core::mem::offset_of!($t, producer) == 16, "producer offset drift");
+            assert!(core::mem::offset_of!($t, consumer) == 24, "consumer offset drift");
+            assert!(core::mem::offset_of!($t, ring) == 32, "ring offset drift");
+            assert!(core::mem::offset_of!($t, flags) == 40, "flags offset drift");
+        };
+    }
+
+    assert_xsk_ring_layout!(XskRingProd);
+    assert_xsk_ring_layout!(XskRingCons);
+};
+
 unsafe extern "C" {
     fn bridge_xsk_umem_create(
         umem_out: *mut *mut XskUmemOpaque,

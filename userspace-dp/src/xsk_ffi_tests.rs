@@ -218,3 +218,48 @@ fn read_rx_release_advances_consumer_through_mut_ref() {
     // consumer pointer advanced by the two released descriptors.
     assert_eq!(unsafe { *rx.ring.consumer }, 2);
 }
+
+// ── libxdp ring ABI contract (#4976) ─────────────────────────────
+//
+// The authoritative guard is the `const _` block in `xsk_ffi.rs` (fails
+// the build on drift) plus the `_Static_assert`s in `csrc/xsk_bridge.c`
+// (fail the build if the *installed* libxdp layout drifts). This runtime
+// test restates the same contract as a named, discoverable check: if the
+// Rust mirror is ever re-laid-out without updating the contract, the const
+// block already refuses to compile this crate — but this test also gives a
+// human-readable failure naming the exact field that moved.
+#[test]
+fn xsk_ring_abi_matches_libxdp_contract() {
+    use core::mem::{align_of, offset_of, size_of};
+
+    // 64-bit pointer width underpins the fixed pointer-field offsets.
+    assert_eq!(size_of::<*const u32>(), 8, "AF_XDP dataplane is 64-bit only");
+
+    for (name, sz, al) in [
+        ("XskRingProd", size_of::<XskRingProd>(), align_of::<XskRingProd>()),
+        ("XskRingCons", size_of::<XskRingCons>(), align_of::<XskRingCons>()),
+    ] {
+        assert_eq!(sz, 48, "{name} size drift vs libxdp DEFINE_XSK_RING");
+        assert_eq!(al, 8, "{name} align drift vs libxdp DEFINE_XSK_RING");
+    }
+
+    // Field offsets — must match libxdp's `DEFINE_XSK_RING` in xsk.h and
+    // the `_Static_assert`s in csrc/xsk_bridge.c.
+    assert_eq!(offset_of!(XskRingProd, cached_prod), 0, "prod.cached_prod");
+    assert_eq!(offset_of!(XskRingProd, cached_cons), 4, "prod.cached_cons");
+    assert_eq!(offset_of!(XskRingProd, mask), 8, "prod.mask");
+    assert_eq!(offset_of!(XskRingProd, size), 12, "prod.size");
+    assert_eq!(offset_of!(XskRingProd, producer), 16, "prod.producer");
+    assert_eq!(offset_of!(XskRingProd, consumer), 24, "prod.consumer");
+    assert_eq!(offset_of!(XskRingProd, ring), 32, "prod.ring");
+    assert_eq!(offset_of!(XskRingProd, flags), 40, "prod.flags");
+
+    assert_eq!(offset_of!(XskRingCons, cached_prod), 0, "cons.cached_prod");
+    assert_eq!(offset_of!(XskRingCons, cached_cons), 4, "cons.cached_cons");
+    assert_eq!(offset_of!(XskRingCons, mask), 8, "cons.mask");
+    assert_eq!(offset_of!(XskRingCons, size), 12, "cons.size");
+    assert_eq!(offset_of!(XskRingCons, producer), 16, "cons.producer");
+    assert_eq!(offset_of!(XskRingCons, consumer), 24, "cons.consumer");
+    assert_eq!(offset_of!(XskRingCons, ring), 32, "cons.ring");
+    assert_eq!(offset_of!(XskRingCons, flags), 40, "cons.flags");
+}
