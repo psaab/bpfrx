@@ -56549,3 +56549,11 @@ top.
   `mod.rs` re-exports so all `server::helpers::<name>` call sites are unchanged.
 - **File(s)**: server/helpers.rs -> server/helpers/mod.rs (git mv);
   server/helpers/session_sync.rs (new). Build: userspace-dp cargo build green.
+
+- **Action**: #6234 increment 2 — extract binding/queue planning into
+  `server/helpers/planning.rs` (settle predicates, canonical plan-key hashing,
+  RX-queue/binding replanner kept as one correctness unit per server/README).
+  Pure code-motion; explicit imports replace the crate-root glob. mod.rs
+  re-exports `planning::*`; dropped now-unused sha2/std::io imports from mod.rs.
+- **File(s)**: server/helpers/planning.rs (new), server/helpers/mod.rs.
+  Build: userspace-dp cargo build green, no new warnings in helpers/.
