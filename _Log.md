@@ -56619,3 +56619,11 @@ top.
   re-imports both names. Build green.
 - **File(s)**: userspace-dp/src/event_stream/backlog.rs (new),
   userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract release_dataplane_event_queue_budget into
+  event_stream/budget.rs (verbatim; the I/O-thread queue-budget RETIREMENT side,
+  paired with producer.rs admission). Widened private->pub(super); mod.rs
+  re-imports it. Build green.
+- **File(s)**: userspace-dp/src/event_stream/budget.rs (new),
+  userspace-dp/src/event_stream/mod.rs

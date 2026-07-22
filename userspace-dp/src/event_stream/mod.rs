@@ -10,11 +10,13 @@
 //!   Payload: type-specific binary (see codec module)
 
 mod backlog;
+mod budget;
 pub(crate) mod codec;
 mod clock;
 mod producer;
 
 use backlog::{WRITE_BACKLOG_MAX_BYTES, WriteBacklog};
+use budget::release_dataplane_event_queue_budget;
 
 #[allow(unused_imports)] // monotonic_ns_to_unix_secs is consumed only by the rt_flow tests
 pub(crate) use clock::{
@@ -1546,12 +1548,6 @@ fn drain_remaining(rx: &mpsc::Receiver<EventFrame>, shared: &Arc<EventStreamShar
             Ok(frame) => release_dataplane_event_queue_budget(shared, &frame),
             Err(_) => break,
         }
-    }
-}
-
-fn release_dataplane_event_queue_budget(shared: &Arc<EventStreamShared>, frame: &EventFrame) {
-    if let Some(kind) = frame.dataplane_event_kind() {
-        shared.dataplane_event_queue.release(kind);
     }
 }
 
