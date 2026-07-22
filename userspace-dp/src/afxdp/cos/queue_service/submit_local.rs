@@ -84,7 +84,11 @@ pub(super) fn submit_local(
         }
         n
     };
-    match transmit_batch(binding, &mut items, now_ns, shared_recycles) {
+    // #4973: capture the batch outcome so the drained `items` deque can be
+    // stored back into the per-worker Local batch scratch after the match. The
+    // transmit/apply/restore path empties `items` and returns it, retaining the
+    // ring-buffer allocation `build_cos_batch_from_queue` reused.
+    let made_progress = match transmit_batch(binding, &mut items, now_ns, shared_recycles) {
         Ok((packets, bytes)) => {
             // #5157: snapshot the committed identities (ORIGINAL-input
             // positions transmit_batch actually shipped) into a local
@@ -103,7 +107,7 @@ pub(super) fn submit_local(
                 committed_len, packets as usize,
                 "committed identity count must equal the transmitted packet count",
             );
-            apply_cos_send_result(
+            items = apply_cos_send_result(
                 binding,
                 root_ifindex,
                 queue_idx,
@@ -188,7 +192,7 @@ pub(super) fn submit_local(
             // #4971: expected TX backpressure — record the reason
             // lock-free instead of taking the `last_error` mutex.
             binding.live.set_tx_retry_status(reason);
-            restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
+            items = restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
             cos_batch_tx_made_progress(Err(TxError::Retry(reason)))
         }
         Err(TxError::Drop(reason)) => {
@@ -204,28 +208,39 @@ pub(super) fn submit_local(
             // #4971: exceptional drop path (rare) still renders the
             // diagnostic message via the mutex-backed set_error.
             binding.live.set_error(reason.message());
-            restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
+            items = restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
             cos_batch_tx_made_progress(Err(TxError::Drop(reason)))
         }
-    }
+    };
+    // #4973: return the drained batch deque to the per-worker Local batch
+    // scratch so the next shaped-TX drain reuses its capacity instead of
+    // allocating a fresh `VecDeque`.
+    binding.cos.cos_local_batch_scratch = items;
+    made_progress
 }
 
 // Moved from queue_service/mod.rs (pre-refactor L1488-L1509). Sole
 // caller is submit_local's Err arms above; the *_inner variant lives
 // in tx_completion and is still reached via super::.
+//
+// #4973: returns the drained (now-empty) `retry` deque so the submit handler
+// can reclaim it as the per-worker Local batch scratch. On the queue-torn-down
+// early return the deque is returned undrained (its items are dropped by the
+// next `build_cos_batch_from_queue` `clear()`, exactly as the previous by-value
+// drop dropped them — the queue is gone).
 fn restore_cos_local_items(
     binding: &mut BindingWorker,
     root_ifindex: i32,
     queue_idx: usize,
     batch_bytes: u64,
-    retry: VecDeque<TxRequest>,
-) {
+    mut retry: VecDeque<TxRequest>,
+) -> VecDeque<TxRequest> {
     {
         let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
-            return;
+            return retry;
         };
         if let Some(queue) = root.queues.get_mut(queue_idx) {
-            let retry_bytes = restore_cos_local_items_inner(queue, retry);
+            let retry_bytes = restore_cos_local_items_inner(queue, &mut retry);
             queue.hot.queued_bytes = queue
                 .hot
                 .queued_bytes
@@ -234,4 +249,5 @@ fn restore_cos_local_items(
         }
     }
     refresh_cos_interface_activity(binding, root_ifindex);
+    retry
 }
