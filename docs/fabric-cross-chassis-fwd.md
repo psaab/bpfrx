@@ -310,7 +310,7 @@ the fabric-redirect path trusts), self-heals it on promotion via the
 `rg_epochs` edge (including the node-level `rg_epochs[0]` for
 `owner_rg_id == 0` fabric/reverse entries), and reaps it at a bounded
 `min(3 × timeout, ~7 d)` ceiling if a primary delete is lost. The epoch
-bump moved BEFORE `rg_runtime.store` in `afxdp/ha.rs::update_ha_state` so
+bump moved BEFORE `rg_runtime.store` in `afxdp/ha/state.rs::update_ha_state` so
 a worker that sees the active RG always sees the bumped epoch (airtight
 self-heal). The control-plane sync sweep is unchanged — retention is the
 wheel's job, not the sweep's (see `pkg/cluster/README.md` and

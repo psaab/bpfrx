@@ -56599,3 +56599,36 @@ top.
 - **File(s)**: pkg/routing/tunnel.go, pkg/routing/tunnel_wireguard.go,
   pkg/routing/tunnel_keepalive_runner.go, pkg/snmp/agent.go,
   pkg/snmp/agent_ber.go, pkg/routing/README.md, pkg/snmp/README.md
+
+## 2026-07-22 — #6247 afxdp/ha.rs ownership split (pure code-motion)
+- **Timestamp**: 2026-07-22
+- **Action**: Split the 1035-line `userspace-dp/src/afxdp/ha.rs` HA control
+  module into a `ha/` directory with four cohesive owner submodules
+  (byte-exact code motion, no logic/signature/ordering change). Preserves
+  the ordered-import invariant, export/tunnel-purge lock phasing, and the
+  RG-epoch-before-runtime publication ordering. 5 incremental commits, each
+  builds; branch `refactor/6247-afxdp-ha-split`.
+    - `ha/state.rs`   — update_ha_state, handle_activated_rgs, ha_groups,
+      last_cache_flush_at
+    - `ha/export.rs`  — kick_owner_rg_export, snapshot_all_sessions_export,
+      AllSessionsExport / OwnerRgExportWait handle types,
+      drain_session_deltas_from_live (widened private->pub(crate) so the
+      relocated characterization test can name it via the ha re-export)
+    - `ha/session_import.rs` — synced_import_cap, upsert_synced_session,
+      delete_synced_session[_gen], test_install_local_forward_session
+    - `ha/tunnel_purge.rs`   — purge_remapped_tunnel_sessions,
+      push_purge_close_deltas
+    - `ha/mod.rs` — narrow facade: submodule decls, pub(crate) re-exports of
+      the export handle types (afxdp/mod.rs `self::ha::OwnerRgExportWait` /
+      `AllSessionsExport` resolve unchanged), cfg(test) drain re-export, and
+      the `#[path="../ha_tests.rs"]` test include. Retains a documented
+      `#[allow(unused_imports)] use super::*` so the ha_tests child module's
+      `use super::*` resolves the afxdp namespace exactly as before.
+  Verbatim verified: non-blank code-line multiset identical to the original
+  (0 missing; only 4 extra structural `}` for the 4 new impl blocks).
+  #[inline]/#[cold]: 0 in original, 0 lost. mod.rs prod-LOC 1035 -> 21.
+- **File(s)**: userspace-dp/src/afxdp/ha/{mod,state,export,session_import,
+  tunnel_purge}.rs (new), userspace-dp/src/afxdp/ha.rs (removed),
+  userspace-dp/src/afxdp/mod.rs (drop stale #[path]),
+  docs/fabric-cross-chassis-fwd.md, docs/session-sync-architecture.md
+  (live-doc path references afxdp/ha.rs -> new submodule paths).
