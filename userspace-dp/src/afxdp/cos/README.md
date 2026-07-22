@@ -200,11 +200,17 @@ mod.rs for further file-level breakdown.
   `maybe_top_up_cos_queue_lease` → `acquire_via_lease`, gives an emptied
   bank back at runtime in `refresh_cos_interface_activity`, and gives its
   residual bank back at worker exit / binding reset / lease-set swap in
-  `release_all_cos_queue_leases`. Both give-back sites key on lease
-  presence (`shared_queue_lease.is_some()`), NOT on `queue.config.exact`,
-  so a truly un-leased single-owner queue (exact or non-exact) keeps its
-  private per-worker burst. `release_unused_v8` reduces to the legacy
-  `release_unused` for a legacy (v8=None) lease.
+  `release_all_cos_queue_leases`. Both give-back sites gate the
+  `core::mem::take(&mut queue.hot.tokens)` ITSELF on lease presence
+  (`shared_queue_lease.is_some()`), NOT on `queue.config.exact`, so a
+  truly un-leased single-owner queue (exact or non-exact) keeps its
+  private per-worker burst — there is nowhere to give it back. (#6272:
+  the teardown site's take was originally unconditional — only its credit
+  was lease-gated — so an un-leased non-exact queue's banked burst was
+  wrongly zeroed on a lease-set swap; the take is now lease-gated to
+  mirror the runtime `refresh_cos_interface_activity` R-5(a) path.)
+  `release_unused_v8` reduces to the legacy `release_unused` for a legacy
+  (v8=None) lease.
 - `COS_MIN_BURST_BYTES` (64 × MTU) is canonically owned by
   `token_bucket.rs`; siblings import it via the `cos/mod.rs`
   re-export.

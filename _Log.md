@@ -1,3 +1,30 @@
+## 2026-07-21 — #6272: teardown mem::take must be lease-gated
+
+- **Timestamp**: 2026-07-21 (fix/6272-teardown-memtake-lease-gate)
+- **Action**: `release_all_cos_queue_leases` (the #5156/#6270 teardown
+  give-back) did an UNCONDITIONAL `core::mem::take(&mut queue.hot.tokens)`
+  for every queue with `hot.tokens > 0`, gating only the CREDIT on
+  `shared_queue_lease.is_some()`. The runtime give-back
+  `refresh_cos_interface_activity` (cos/tx_completion.rs, #4246 R-5(a))
+  instead gates the take ITSELF on `has_lease`, so an un-leased queue keeps
+  its banked burst. Consequence: on a lease-set swap (loop_body persists
+  `cos_interfaces` while rebuilding `cos_fast_interfaces`) a single-owner
+  NON-EXACT UN-LEASED queue's private per-worker burst was zeroed with
+  nothing credited — contradicting the #6270 README/comment. Fix: gate the
+  teardown `mem::take` on lease presence (probe the disjoint
+  `cos_fast_interfaces` field, early-`continue` when un-leased), mirroring
+  the runtime R-5(a) path exactly. Leased queues still drain + credit
+  (`release_unused_v8`) — the #5156 conservation invariant is unchanged.
+- **File(s)**: `userspace-dp/src/afxdp/cos/token_bucket.rs`,
+  `userspace-dp/src/afxdp/cos/token_bucket_tests.rs`,
+  `userspace-dp/src/afxdp/cos/README.md`, `_Log.md`
+- **Validation**: `cargo build` clean; new fail-on-revert test
+  `unleased_nonexact_burst_survives_lease_swap_6272` (un-leased burst
+  survives, leased queue drains + lease recovers to baseline) passes with
+  the fix and FAILS when reverted to the unconditional take (`left: 0,
+  right: 98304`); existing `nonexact_queue_lease_conserved_across_teardown_5156`
+  still passes in both states; full `afxdp::cos::` suite 304 passed.
+
 ## 2026-07-21 — #6226: round-robin address-only SNAT probes the whole pool
 
 - **Timestamp**: 2026-07-21 (fix/6226-address-only-roundrobin)
