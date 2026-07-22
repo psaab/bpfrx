@@ -33,6 +33,53 @@ mod setup;
 #[cfg(feature = "debug-log")]
 mod debug_report;
 
+/// #6291: refresh the worker's per-tick forwarding + validation view in the
+/// publish-safe order — forwarding acquire-load FIRST, validation SECOND.
+///
+/// The coordinator (`snapshot_refresh.rs`) commits a same-plan refresh by
+/// storing `shared_validation` BEFORE `ha.forwarding` (both release-ordered
+/// ArcSwap stores, with the CoS maps stored even earlier per #5166). For a
+/// producer/consumer pair the acquire/release message-passing must run in the
+/// OPPOSITE order on the two sides: because the producer stores validation
+/// (A) then forwarding (B), the consumer must load forwarding (B) then
+/// validation (A). Then observing the NEW forwarding Arc implies — by
+/// ArcSwap acquire/release ordering — also observing the NEW (or newer)
+/// validation. The torn `(old-validation, new-forwarding)` state, in which a
+/// packet stamped at the old generation passes `classify_metadata`
+/// (`forwarding/mod.rs`) and is then classified/forwarded under the new
+/// forwarding state, becomes impossible. The only residual torn state,
+/// `(new-validation, old-forwarding)`, is benign: the generation guard errs
+/// toward a one-tick `ConfigGenerationMismatch` drop rather than forwarding a
+/// stale-stamped packet under new state.
+///
+/// This preserves both the #1188 short-circuit (forwarding is loaded via
+/// `load_arc_if_changed`, returning `None` when the Arc did not rotate) and
+/// the #5166 CoS-then-forwarding publish (the caller still reads forwarding
+/// before the CoS map Arcs). `#[inline]` + a no-op `between` collapse to the
+/// original two loads in release builds — no per-tick call boundary or cost
+/// (the loop deliberately stays inline; see the module header).
+///
+/// `between` is a deterministic test seam fired BETWEEN the two acquire-loads
+/// so a controlled-interleaving test can inject a concurrent coordinator
+/// publish and assert the invariant without a flaky thread race; production
+/// passes `|| {}`.
+#[inline]
+fn refresh_forwarding_then_validation(
+    forwarding: &Arc<ForwardingState>,
+    shared_forwarding: &ArcSwap<ForwardingState>,
+    shared_validation: &ArcSwap<ValidationState>,
+    between: impl FnOnce(),
+) -> (Option<Arc<ForwardingState>>, ValidationState) {
+    // Forwarding FIRST (acquire) — the gate. Its rotation is the signal that
+    // publishes the validation store that preceded it on the coordinator.
+    let new_forwarding = load_arc_if_changed(forwarding, shared_forwarding);
+    between();
+    // Validation SECOND (acquire) — sequenced after the forwarding load, so a
+    // NEW forwarding observation carries a NEW-or-newer validation.
+    let validation = **shared_validation.load();
+    (new_forwarding, validation)
+}
+
 pub(crate) fn worker_loop(
     worker_id: u32,
     binding_plans: Vec<BindingPlan>,
@@ -430,15 +477,25 @@ pub(crate) fn worker_loop(
             }
         }
         let loop_now_secs = loop_now_ns / 1_000_000_000;
-        let live_validation = shared_validation.load();
-        if **live_validation != validation {
-            validation = **live_validation;
-        }
         let mut rebuild_cos_fast_interfaces = false;
-        // #1188: per-tick Arc refresh — `.load() + Arc::ptr_eq`
-        // short-circuits the unconditional `.load_full()` clone
-        // when the coordinator hasn't rotated the Arc.
-        if let Some(new_forwarding) = load_arc_if_changed(&forwarding, &shared_forwarding) {
+        // #6291: read forwarding FIRST, then validation — the publish-safe
+        // order. The coordinator stores `shared_validation` BEFORE
+        // `ha.forwarding`, so acquiring forwarding first here guarantees a
+        // worker that observes the NEW forwarding Arc also observes the NEW
+        // (or newer) validation; the torn (old-validation, new-forwarding)
+        // window is impossible. This still loads forwarding before the CoS
+        // map Arcs below (#5166) and keeps the #1188 short-circuit — see
+        // `refresh_forwarding_then_validation`.
+        let (new_forwarding_opt, live_validation) = refresh_forwarding_then_validation(
+            &forwarding,
+            &shared_forwarding,
+            &shared_validation,
+            || {},
+        );
+        if live_validation != validation {
+            validation = live_validation;
+        }
+        if let Some(new_forwarding) = new_forwarding_opt {
             // Compare BEFORE assignment — needs both old and new.
             let cos_changed =
                 cos_runtime_config_changed(forwarding.as_ref(), new_forwarding.as_ref());
@@ -1890,5 +1947,92 @@ mod expiry_count_tests {
         assert_eq!(all.len(), 8, "SessionOrigin taxonomy is 8 variants");
         // Exactly the four create-counted locals are counted.
         assert_eq!(count_local_session_expiries(all.into_iter()), 4);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_refresh_ordering_tests {
+    use super::*;
+
+    /// #6291 ordering regression (deterministic fail-on-revert). A worker
+    /// refreshing its per-tick view must acquire-load `shared_forwarding`
+    /// BEFORE `shared_validation`, because the coordinator publishes a
+    /// same-plan refresh by storing validation BEFORE forwarding
+    /// (`refresh_runtime_snapshot_inner`). If the worker reads in the SAME
+    /// order as the stores (validation, then forwarding), a coordinator
+    /// publish landing between the two loads leaves the worker holding NEW
+    /// forwarding + OLD validation — the torn window in which a packet stamped
+    /// at the old generation passes `classify_metadata` (validation still
+    /// old) and is then classified/forwarded under the new forwarding state.
+    ///
+    /// The test drives `refresh_forwarding_then_validation` with the
+    /// coordinator publish (store validation gen N, then store a fresh
+    /// forwarding Arc) injected through the `between` seam — deterministically
+    /// reproducing the ≤1-tick interleaving with NO thread race. With the fix
+    /// (forwarding loaded first) the forwarding load returns `None` (the Arc
+    /// had not rotated at load time), so the worker keeps its old forwarding
+    /// and pairs it with the freshly-loaded new validation → the benign
+    /// `(new-validation, old-forwarding)` residual. Swapping the two loads
+    /// back (validation first) makes the worker adopt the NEW forwarding Arc
+    /// while still reading the OLD validation → both assertions fire RED.
+    #[test]
+    fn snapshot_refresh_no_torn_validation_forwarding_6291() {
+        const OLD_GEN: u64 = 1;
+        const NEW_GEN: u64 = 2;
+
+        let shared_forwarding = ArcSwap::from_pointee(ForwardingState::default());
+        let shared_validation = ArcSwap::from_pointee(ValidationState {
+            snapshot_installed: true,
+            config_generation: OLD_GEN,
+            fib_generation: 1,
+        });
+
+        // The worker's cached forwarding Arc is the currently-published one,
+        // so an unchanged `shared_forwarding` short-circuits to None (#1188).
+        let cached_forwarding = shared_forwarding.load_full();
+
+        // Injected coordinator publish: validation FIRST, then forwarding —
+        // exactly the store order in refresh_runtime_snapshot_inner. Fires
+        // between the worker's two acquire-loads.
+        let publish = || {
+            shared_validation.store(Arc::new(ValidationState {
+                snapshot_installed: true,
+                config_generation: NEW_GEN,
+                fib_generation: 2,
+            }));
+            shared_forwarding.store(Arc::new(ForwardingState::default()));
+        };
+
+        let (new_forwarding_opt, observed_validation) = refresh_forwarding_then_validation(
+            &cached_forwarding,
+            &shared_forwarding,
+            &shared_validation,
+            publish,
+        );
+
+        // Not vacuous: with forwarding read first, validation is loaded AFTER
+        // the injected publish, so the worker always observes the new
+        // generation here. (Reverting to validation-first observes OLD_GEN and
+        // trips this assert too.)
+        assert_eq!(
+            observed_validation.config_generation, NEW_GEN,
+            "the injected coordinator publish must be observed (validation is \
+             loaded after it when forwarding is read first)"
+        );
+
+        // THE INVARIANT: the worker must never adopt the NEW forwarding Arc
+        // while still holding OLD validation. Forwarding-first makes the load
+        // return None here (Arc not yet rotated), so nothing is adopted;
+        // validation-first returns Some(new Arc) while observed_validation is
+        // still OLD_GEN — the torn (old-validation, new-forwarding) state.
+        let adopted_new_forwarding = new_forwarding_opt.is_some();
+        let torn = adopted_new_forwarding && observed_validation.config_generation < NEW_GEN;
+        assert!(
+            !torn,
+            "#6291: worker adopted NEW forwarding with OLD validation \
+             (config_generation={}) — the torn (old-validation, new-forwarding) \
+             window must be impossible",
+            observed_validation.config_generation,
+        );
     }
 }

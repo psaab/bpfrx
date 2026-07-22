@@ -56541,3 +56541,25 @@ top.
   header->Go parity canary t.Skips when the header is absent). Regenerated
   manifest via cmd/shim-manifest. Verified: fsatomic+dataplane green;
   editing xpf_common.h now trips the freshness test; src-edit coverage intact.
+
+## 2026-07-22 — #6291 torn validation/forwarding publish ordering (userspace-dp)
+- **Action**: Fix the sibling of #5166 — worker could transiently observe
+  OLD validation + NEW forwarding in the same-plan snapshot refresh.
+- **File(s)**: userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs,
+  userspace-dp/src/afxdp/coordinator/README.md
+- Root cause: coordinator stores `shared_validation` BEFORE `ha.forwarding`
+  and the worker READ validation before forwarding — store order matched
+  read order, so a publish between the two worker loads paired new-forwarding
+  with old-validation. classify_metadata() would then let a packet stamped at
+  the old generation pass and be forwarded under new state.
+- Fix (option b — forwarding must stay stored last for #5166 CoS): reorder
+  the WORKER reads to forwarding-FIRST, validation-SECOND via a new inlined
+  `refresh_forwarding_then_validation` helper (keeps #1188 short-circuit).
+  Now observing new forwarding implies new-or-newer validation; residual
+  (new-validation, old-forwarding) is benign. Coordinator store order
+  unchanged (already correct); added a load-bearing comment + module doc.
+- Test: `snapshot_refresh_no_torn_validation_forwarding_6291` (deterministic,
+  publish injected between the two acquire-loads via the `between` seam).
+  RED-on-revert verified (swap the two loads → RED). Full cargo suite green
+  (4153+ passed, exit 0); named test 3x ok.

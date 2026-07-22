@@ -160,6 +160,31 @@ Differences that matter (#1881):
   owner map at the forwarding-publish instant so the ordering regression
   test (`refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding`)
   goes RED if the reorder is reverted.
+- **Validation is published BEFORE forwarding becomes worker-visible
+  (#6291).** The sibling of the #5166 CoS pair. The same-plan refresh
+  stores `shared_validation` BEFORE `ha.forwarding` (both already in this
+  order pre-#6291 — the bug was the WORKER read order), and the worker now
+  acquire-loads forwarding FIRST, then validation
+  (`refresh_forwarding_then_validation`, worker/loop_body). For a
+  producer/consumer pair the acquire/release message-passing must run in
+  OPPOSITE orders: producer stores validation-then-forwarding, consumer
+  reads forwarding-then-validation, so observing the new forwarding Arc
+  implies observing new-or-newer validation. This closes the ≤1-tick window
+  where a worker saw OLD validation with NEW forwarding — a packet stamped
+  at the old `config_generation`/`fib_generation` would pass
+  `classify_metadata` (validation still at the old generation) and then be
+  classified/forwarded under the new forwarding state. Pre-#6291 the store
+  order (validation-then-forwarding) MATCHED the read order
+  (validation-then-forwarding), so new-forwarding could pair with
+  old-validation. The residual `(new-validation, old-forwarding)` window is
+  benign: the generation guard errs toward a one-tick
+  `ConfigGenerationMismatch` drop, never a stale forward. The deterministic
+  regression test
+  (`snapshot_refresh_no_torn_validation_forwarding_6291`, worker/loop_body)
+  drives `refresh_forwarding_then_validation` with a coordinator publish
+  injected between the two acquire-loads and asserts the worker never
+  adopts new forwarding with old validation; swapping the two loads back
+  makes it RED.
 - **A POST-teardown worker-spawn failure fails closed (#4952).** The
   #2440/#2484/#3789 fail-closed legs above all abort BEFORE `tear_down`,
   so the prior workers stay live. `bring_up_workers` runs AFTER teardown:

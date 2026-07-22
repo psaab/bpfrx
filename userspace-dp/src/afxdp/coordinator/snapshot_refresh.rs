@@ -11,6 +11,29 @@
 //! calls (`tunnel_remap_purge_ids`, `log_wg_endpoint_set_transition`)
 //! stay in mod.rs: `reconcile/snapshot.rs` and tests outside this
 //! module reference them at coordinator scope.
+//!
+//! # Publish ordering — `ha.forwarding` is the single worker-visible gate
+//! The forwarding Arc is stored LAST so it acts as the one release-store
+//! that publishes everything committed before it. Two producer/consumer
+//! pairs ride this gate, each requiring the worker to consume in the
+//! OPPOSITE order to the store order:
+//! - **CoS maps ↔ forwarding (#5166).** CoS owner/live/lease/backlog/vtime
+//!   maps + `ha.fabrics` are stored BEFORE forwarding; the worker reads
+//!   forwarding FIRST, then the CoS maps. Observing new forwarding implies
+//!   observing the matching CoS maps.
+//! - **validation ↔ forwarding (#6291).** `shared_validation` is stored
+//!   BEFORE forwarding; the worker acquire-loads forwarding FIRST, then
+//!   validation (`refresh_forwarding_then_validation`). Observing new
+//!   forwarding implies observing new-or-newer validation, so a worker can
+//!   NEVER see old-validation + new-forwarding — which would let a packet
+//!   stamped at the old generation pass `classify_metadata` and then be
+//!   forwarded under the new state. The residual `(new-validation,
+//!   old-forwarding)` window is benign (the generation guard errs toward a
+//!   one-tick `ConfigGenerationMismatch` drop, not a stale forward).
+//!
+//! Both invariants are load-bearing: do NOT reorder the `shared_validation`
+//! / CoS stores to AFTER the `ha.forwarding` store, and do NOT move the
+//! worker's forwarding load to after its validation / CoS loads.
 use super::*;
 
 impl super::Coordinator {
@@ -394,6 +417,19 @@ impl super::Coordinator {
             self.cos_owner_at_forwarding_publish =
                 Some(self.cos.owner_worker_by_queue.load().as_ref().clone());
         }
+        // #6291: `shared_validation` MUST be stored BEFORE `ha.forwarding`.
+        // The worker acquire-loads forwarding FIRST, validation SECOND
+        // (`refresh_forwarding_then_validation`, worker/loop_body/mod.rs), so
+        // this validation-then-forwarding release order is the OPPOSITE-order
+        // half of the message-passing pair: a worker that observes the NEW
+        // forwarding Arc is guaranteed to also observe the NEW (or newer)
+        // validation, and can never see old-validation + new-forwarding (a
+        // packet stamped at the old generation would otherwise pass
+        // `classify_metadata` and then be forwarded under the new state). Do
+        // NOT swap these two stores or move the validation store after
+        // forwarding — that reintroduces the torn window. This also composes
+        // with the #5166 CoS-then-forwarding order above (CoS + validation are
+        // both published before forwarding, the single worker-visible gate).
         self.shared_validation.store(Arc::new(self.validation));
         self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
         // #1432 S2a (Copilot C1): reconcile WG control threads on every
