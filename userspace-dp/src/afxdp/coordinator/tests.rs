@@ -2927,6 +2927,132 @@ fn wg2921_unchanged_outer_mtu_keeps_control_thread() {
     );
 }
 
+/// #5291 fail-on-revert (resolver half): `resolve_wg_per_peer_outer_mtus`
+/// must resolve the underlay egress MTU PER PEER — keyed by public key —
+/// not one first-peer scalar for the whole interface. Two peers whose
+/// endpoints route over SEPARATE underlays (peer A via ge5291a @1500,
+/// peer B via ge5291b @1400) must yield DISTINCT per-peer MTUs; a revert
+/// to the first-peer scalar collapses both to peer A's 1500. This is the
+/// data half of the #5291 fix — the TUN-origin egress guard consumes this
+/// map (see `wg_tun_origin_egress_uses_per_peer_outer_mtu_5291`).
+#[test]
+fn wg5291_per_peer_outer_mtu_resolves_distinct_underlays() {
+    use crate::protocol::snapshot::{
+        InterfaceAddressSnapshot, InterfaceSnapshot, TunnelEndpointSnapshot, TunnelWgPeerSnapshot,
+    };
+    // A second peer pubkey distinct from WG1866_PUBKEY (arbitrary 32-byte
+    // key — the compiler hex-decodes it without curve validation).
+    const WG5291_PUBKEY_B: &str =
+        "d04040404040404040404040404040404040404040404040404040404040404d";
+
+    let mut coordinator = Coordinator::new();
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "wgt5291".to_string(),
+                linux_name: "wgt5291".to_string(),
+                ifindex: 4291,
+                tunnel: true,
+                ..Default::default()
+            },
+            // Peer A underlay @1500 (connected route in inet.0).
+            InterfaceSnapshot {
+                name: "ge5291a".to_string(),
+                linux_name: "ge5291a".to_string(),
+                ifindex: 5291,
+                mtu: 1500,
+                hardware_addr: "02:00:00:52:91:0a".to_string(),
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.50.0.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            // Peer B underlay @1400 (a DIFFERENT egress interface).
+            InterfaceSnapshot {
+                name: "ge5291b".to_string(),
+                linux_name: "ge5291b".to_string(),
+                ifindex: 5292,
+                mtu: 1400,
+                hardware_addr: "02:00:00:52:91:0b".to_string(),
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.60.0.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        tunnel_endpoints: vec![TunnelEndpointSnapshot {
+            id: 1,
+            interface: "wgt5291".to_string(),
+            linux_name: "wgt5291".to_string(),
+            ifindex: 4291,
+            mode: "wireguard".to_string(),
+            wg_listen_port: 51892,
+            wg_local_privkey_hex: WG1866_PRIVKEY_A.to_string(),
+            wg_peers: vec![
+                TunnelWgPeerSnapshot {
+                    wg_peer_pubkey_hex: WG1866_PUBKEY.to_string(),
+                    wg_allowed_ips: vec!["10.71.0.0/24".to_string()],
+                    wg_endpoint: "10.50.0.9:9".to_string(),
+                    ..Default::default()
+                },
+                TunnelWgPeerSnapshot {
+                    wg_peer_pubkey_hex: WG5291_PUBKEY_B.to_string(),
+                    wg_allowed_ips: vec!["10.72.0.0/24".to_string()],
+                    wg_endpoint: "10.60.0.9:9".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    coordinator
+        .refresh_runtime_snapshot(&snapshot)
+        .expect("refresh_runtime_snapshot must succeed");
+
+    // The per-peer map captured at spawn (the output of
+    // `resolve_wg_per_peer_outer_mtus`, handed by value into the control
+    // thread) is retained on the entry — assert on it directly, mirroring
+    // the wg2921 `spawned_outer_mtu` pattern.
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry");
+    let per_peer = &entry.spawned_per_peer_outer_mtu;
+    assert_eq!(
+        per_peer.len(),
+        2,
+        "both endpoint-bearing peers must resolve a per-peer underlay MTU"
+    );
+    let mut values: Vec<usize> = per_peer.values().copied().collect();
+    values.sort_unstable();
+    assert_eq!(
+        values,
+        vec![1400, 1500],
+        "each peer must resolve its OWN underlay MTU; a first-peer-scalar \
+         revert collapses both to 1500"
+    );
+
+    // Precise key association: peer B (over the 1400 underlay) must map to
+    // 1400 — proving the lookup is not borrowing peer A's scalar.
+    let mut pk_b = [0u8; 32];
+    for (i, byte) in pk_b.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&WG5291_PUBKEY_B[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    assert_eq!(
+        per_peer.get(&pk_b).copied(),
+        Some(1400),
+        "peer B must resolve its own 1400 underlay, not peer A's 1500"
+    );
+    // The interface-level scalar remains peer A's 1500 — the fallback for
+    // a peer absent from the per-peer map (learned/roamed endpoint).
+    assert_eq!(
+        entry.spawned_outer_mtu, 1500,
+        "the scalar fallback stays the first endpoint-bearing peer's MTU"
+    );
+}
+
 // ---------------------------------------------------------------------
 // #1881 — GRE local-origin thread lifecycle regression suite.
 //

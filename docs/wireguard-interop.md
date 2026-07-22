@@ -141,6 +141,33 @@ re-resolution is cheap and runs ONLY at apply time per endpoint (the same
 cadence the engine-Arc/attachment prune already runs at), never
 per-packet; the unchanged common case is byte-identical (no thread churn).
 
+**#5291 (TUN-origin egress is per-peer — the #2845 analog on the local
+path).** #2921 captured ONE `outer_mtu` scalar at spawn (the first
+endpoint-bearing peer's underlay, `resolve_wg_outer_mtu`) and the
+TUN-origin egress guard (`coordinator/wg_control.rs::encap_and_send`)
+applied it to EVERY peer. But the TUN egress path LPM-selects the peer by
+inner destination (`engine.peer_for_dest`, cryptokey routing) exactly like
+the transit path, so on a wg interface whose peers ride DIFFERENT underlay
+paths a TUN inner packet to peer B was size-checked against peer A's MTU —
+fragmentation/underlay drop if A>B, over-conservative `encap_mtu_drops` if
+A<B; reordering the peers flipped the behaviour. This is the SAME defect
+#2845 fixed for the transit/PTB path (`wg_endpoint_physical_outer_mtu` /
+`wg_peer_outer_dst`), left open on the TUN-origin path because #2921 kept
+the first-peer scalar. The fix resolves the underlay MTU PER PEER at spawn
+(`Coordinator::resolve_wg_per_peer_outer_mtus`, keyed by public key, using
+the same `resolve_underlay_egress_mtu` SSOT the scalar uses), hands the map
+by value into the control thread alongside the scalar
+(`WgControlEntry.spawned_per_peer_outer_mtu`), and the guard sizes the
+SELECTED peer's encap against `per_peer.get(pk).unwrap_or(scalar)`. A peer
+absent from the map (learned/roamed endpoint, unresolvable while
+`forwarding` is reachable only at spawn) falls back to the interface-level
+scalar — the exact pre-#5291 behaviour for that peer. The map is kept
+fresh across underlay-MTU changes by the #2921 restart gate, extended to
+compare the whole per-peer map (a NON-first peer's MTU change moves no
+scalar). Single-peer / homogeneous-underlay tunnels are byte-identical:
+every peer resolves to the same MTU the scalar would, so the per-peer
+lookup returns the scalar's value.
+
 **#2517 (GRE inner-MTU shares the same fallback).** The native-GRE
 inner-MTU resolver `native_gre_inner_mtu` now resolves its outer/transport
 MTU through the SAME `tunnel_outer_mtu` SSOT helper the WG MSS clamp uses,
