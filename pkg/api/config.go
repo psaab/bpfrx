@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,33 +14,59 @@ import (
 	"github.com/psaab/xpf/pkg/configstore"
 )
 
-// restConfigSessionID is the fixed config-lock holder identity every REST
-// config MUTATION runs under (#5870). REST is stateless across calls, so all
-// REST config edits share ONE logical operator identity that PARTICIPATES in
-// the shared-candidate holder lock, rather than passing the empty session ID
-// that the store treats as its internal/system capability (daemon apply, HA
-// sync, in-process CLI) and which BYPASSES the holder lock entirely.
-//
-// Consequences of routing every REST mutation through this non-empty identity:
-//   - a REST set/delete/commit is REJECTED (ErrConfigLockedByOther) when a CLI
-//     or gRPC configuration session owns the candidate, and symmetrically a
-//     CLI/gRPC mutation is rejected while REST holds it — closing the exact
-//     cross-session candidate-corruption / commit-smuggling hole in #5870.
-//   - the store's sessionID=="" system-bypass semantics are untouched; only the
-//     REST layer stops USING that bypass. Read-only REST endpoints are
-//     unaffected.
-//
-// It is deliberately non-empty and constant. A gRPC config session is keyed by
-// a random per-connection token / peer address (pkg/grpcapi connSessionID), so
-// this literal never collides with a real peer session identity.
-//
-// Statelessness caveat: because REST carries no per-request session token, two
-// concurrent REST clients share this one identity and are NOT mutually
-// excluded from each other (only from CLI/gRPC). Giving each REST caller a
-// distinct token is a REST API contract change (a product decision) tracked
-// separately; this fix closes the cross-transport bypass without expanding
-// scope.
-const restConfigSessionID = "rest"
+// restConfigSessionHeader carries the server-generated identity of a REST
+// configuration session (#6197). POST /config/enter allocates a distinct,
+// unguessable token for each session and returns it as session_id; subsequent
+// holder-scoped requests must echo it in this header. Keeping the identity in
+// a header gives bodyless operations (commit/confirm/exit) and JSON-body
+// operations one uniform contract.
+const restConfigSessionHeader = "X-Config-Session"
+
+const (
+	restConfigSessionPrefix     = "rest-"
+	restConfigSessionTokenBytes = 16
+)
+
+// newRESTConfigSessionID creates a holder identity in a namespace that cannot
+// collide with gRPC's conn-* identities. crypto/rand makes accidental sharing
+// between independent REST clients negligible and prevents one client from
+// guessing another client's holder token.
+func newRESTConfigSessionID() (string, error) {
+	var token [restConfigSessionTokenBytes]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generate REST config session: %w", err)
+	}
+	return restConfigSessionPrefix + hex.EncodeToString(token[:]), nil
+}
+
+func validRESTConfigSessionID(sessionID string) bool {
+	if !strings.HasPrefix(sessionID, restConfigSessionPrefix) {
+		return false
+	}
+	raw := strings.TrimPrefix(sessionID, restConfigSessionPrefix)
+	if len(raw) != restConfigSessionTokenBytes*2 {
+		return false
+	}
+	_, err := hex.DecodeString(raw)
+	return err == nil
+}
+
+// restConfigSessionID reads and validates the holder identity supplied by a
+// follow-up REST config request. Missing/malformed identities fail closed
+// before the store is called, so they can never reach its sessionID==""
+// internal/system bypass.
+func restConfigSessionID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	sessionID := strings.TrimSpace(r.Header.Get(restConfigSessionHeader))
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, "missing "+restConfigSessionHeader+" header")
+		return "", false
+	}
+	if !validRESTConfigSessionID(sessionID) {
+		writeError(w, http.StatusBadRequest, "invalid "+restConfigSessionHeader+" header")
+		return "", false
+	}
+	return sessionID, true
+}
 
 // writeConfigMutationError maps a config-store mutation error to an HTTP
 // status. A holder-lock conflict (ErrConfigLockedByOther) — a REST mutation
@@ -62,25 +90,38 @@ func (s *Server) configHandler(w http.ResponseWriter, _ *http.Request) {
 	writeOK(w, cfg)
 }
 
-func (s *Server) configEnterHandler(w http.ResponseWriter, _ *http.Request) {
-	// #5870: acquire the candidate lock under the fixed REST identity so a REST
-	// config session participates in holder enforcement (a concurrent CLI/gRPC
-	// session that owns the candidate makes this return ErrConfigLocked → 409),
-	// instead of the empty-session internal acquire that recorded no holder.
-	if err := s.store.EnterConfigureSession(restConfigSessionID); err != nil {
+func (s *Server) configEnterHandler(w http.ResponseWriter, r *http.Request) {
+	// An absent header starts a new session. Supplying the token returned by an
+	// earlier successful enter re-enters that same session and refreshes its
+	// idle lease; a different token remains a conflicting entrant.
+	sessionID := strings.TrimSpace(r.Header.Get(restConfigSessionHeader))
+	if sessionID == "" {
+		var err error
+		sessionID, err = newRESTConfigSessionID()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	} else if !validRESTConfigSessionID(sessionID) {
+		writeError(w, http.StatusBadRequest, "invalid "+restConfigSessionHeader+" header")
+		return
+	}
+
+	if err := s.store.EnterConfigureSession(sessionID); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
-	writeOK(w, map[string]string{"status": "ok"})
+	writeOK(w, map[string]string{"status": "ok", "session_id": sessionID})
 }
 
-func (s *Server) configExitHandler(w http.ResponseWriter, _ *http.Request) {
-	// #5870: release ONLY the REST-held lock. Session-scoped exit is a no-op
-	// when a CLI/gRPC session owns the candidate, so a REST /config/exit can no
-	// longer force-clear another session's in-progress candidate (the previous
-	// unconditional ExitConfigure was itself a facet of the bypass). A wedged
-	// REST lock is still reclaimed by the #4476 idle-lease reaper.
-	s.store.ExitConfigureSession(restConfigSessionID)
+func (s *Server) configExitHandler(w http.ResponseWriter, r *http.Request) {
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
+	// Release only the candidate held by this REST session. A stale or foreign
+	// token cannot clear another client's work.
+	s.store.ExitConfigureSession(sessionID)
 	writeOK(w, map[string]string{"status": "ok"})
 }
 
@@ -101,7 +142,11 @@ func (s *Server) configSetHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "input required")
 		return
 	}
-	if err := s.store.SetFromInputAs(restConfigSessionID, req.Input); err != nil {
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.store.SetFromInputAs(sessionID, req.Input); err != nil {
 		writeConfigMutationError(w, err)
 		return
 	}
@@ -117,7 +162,11 @@ func (s *Server) configDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "input required")
 		return
 	}
-	if err := s.store.DeleteFromInputAs(restConfigSessionID, req.Input); err != nil {
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.store.DeleteFromInputAs(sessionID, req.Input); err != nil {
 		writeConfigMutationError(w, err)
 		return
 	}
@@ -138,7 +187,11 @@ func (s *Server) configDeactivateHandler(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "input required")
 		return
 	}
-	if err := s.store.DeactivateFromInputAs(restConfigSessionID, req.Input); err != nil {
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.store.DeactivateFromInputAs(sessionID, req.Input); err != nil {
 		writeConfigMutationError(w, err)
 		return
 	}
@@ -156,7 +209,11 @@ func (s *Server) configActivateHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "input required")
 		return
 	}
-	if err := s.store.ActivateFromInputAs(restConfigSessionID, req.Input); err != nil {
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.store.ActivateFromInputAs(sessionID, req.Input); err != nil {
 		writeConfigMutationError(w, err)
 		return
 	}
@@ -164,12 +221,16 @@ func (s *Server) configActivateHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) configCommitHandler(w http.ResponseWriter, r *http.Request) {
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
 	// #5870: only the config-lock holder may commit the shared candidate. Reject
 	// a REST commit before it can confirm/apply another (CLI/gRPC) session's
 	// pending work — the empty-session commit path previously let a stateless
 	// REST caller smuggle another operator's staged edits into an applied
 	// commit. Mirrors the gRPC Commit gate (pkg/grpcapi/server_config.go).
-	if err := s.store.EnsureConfigHolder(restConfigSessionID); err != nil {
+	if err := s.store.EnsureConfigHolder(sessionID); err != nil {
 		writeConfigMutationError(w, err)
 		return
 	}
@@ -180,7 +241,7 @@ func (s *Server) configCommitHandler(w http.ResponseWriter, r *http.Request) {
 	// them AND clears the timer (#3861), so they are committed rather than
 	// silently dropped.
 	if s.store.IsConfirmPending() && !s.store.IsDirty() {
-		if err := s.store.ConfirmCommitAs(restConfigSessionID); err != nil {
+		if err := s.store.ConfirmCommitAs(sessionID); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -227,9 +288,13 @@ func (s *Server) configRollbackHandler(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("invalid n %d: rollback index must be non-negative (0 = revert to active)", req.N))
 		return
 	}
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
 	// #5870: rollback replaces the candidate, so it runs under the REST holder
 	// identity and is rejected when a CLI/gRPC session owns the candidate.
-	if err := s.store.RollbackAs(restConfigSessionID, req.N); err != nil {
+	if err := s.store.RollbackAs(sessionID, req.N); err != nil {
 		writeConfigMutationError(w, err)
 		return
 	}
@@ -353,17 +418,21 @@ func (s *Server) configLoadHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "content required")
 		return
 	}
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
 
 	// #5870: load* is a candidate mutation, so it runs under the REST holder
 	// identity and is rejected when a CLI/gRPC session owns the candidate.
 	switch req.Mode {
 	case "override":
-		if err := s.store.LoadOverrideAs(restConfigSessionID, req.Content); err != nil {
+		if err := s.store.LoadOverrideAs(sessionID, req.Content); err != nil {
 			writeConfigMutationError(w, err)
 			return
 		}
 	case "merge", "":
-		if err := s.store.LoadMergeAs(restConfigSessionID, req.Content); err != nil {
+		if err := s.store.LoadMergeAs(sessionID, req.Content); err != nil {
 			writeConfigMutationError(w, err)
 			return
 		}
@@ -372,7 +441,7 @@ func (s *Server) configLoadHandler(w http.ResponseWriter, r *http.Request) {
 		// replays flat lines through applyEditLine so a body with
 		// `deactivate <path>` lines round-trips to inactive nodes (#2008 H1).
 		// Applied-count is log-only to keep the response shape stable.
-		count, err := s.store.LoadSetAs(restConfigSessionID, req.Content)
+		count, err := s.store.LoadSetAs(sessionID, req.Content)
 		if err != nil {
 			writeConfigMutationError(w, err)
 			return
@@ -390,9 +459,13 @@ func (s *Server) configCommitConfirmedHandler(w http.ResponseWriter, r *http.Req
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
 	// #5870: only the config-lock holder may commit the shared candidate.
 	// Mirrors the gRPC CommitConfirmed gate.
-	if err := s.store.EnsureConfigHolder(restConfigSessionID); err != nil {
+	if err := s.store.EnsureConfigHolder(sessionID); err != nil {
 		writeConfigMutationError(w, err)
 		return
 	}
@@ -413,11 +486,15 @@ func (s *Server) configCommitConfirmedHandler(w http.ResponseWriter, r *http.Req
 	writeOK(w, commitResponseFromConfig(compiled))
 }
 
-func (s *Server) configConfirmHandler(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) configConfirmHandler(w http.ResponseWriter, r *http.Request) {
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
 	// #5870: confirming a pending commit-confirmed is a holder-scoped op — only
 	// the REST-held candidate may be confirmed from REST; a CLI/gRPC holder's
 	// pending window is rejected (ErrConfigLockedByOther → 409).
-	if err := s.store.ConfirmCommitAs(restConfigSessionID); err != nil {
+	if err := s.store.ConfirmCommitAs(sessionID); err != nil {
 		writeConfigMutationError(w, err)
 		return
 	}
@@ -469,11 +546,15 @@ func (s *Server) configAnnotateHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, Response{Error: "path and comment are required"})
 		return
 	}
+	sessionID, ok := restConfigSessionID(w, r)
+	if !ok {
+		return
+	}
 	pathParts := strings.Fields(req.Path)
 	// #5870: annotate mutates the candidate, so it runs under the REST holder
 	// identity and is rejected when a CLI/gRPC session owns the candidate. A
 	// holder conflict maps to 409 Conflict; other errors stay 400.
-	if err := s.store.AnnotateAs(restConfigSessionID, pathParts, req.Comment); err != nil {
+	if err := s.store.AnnotateAs(sessionID, pathParts, req.Comment); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, configstore.ErrConfigLockedByOther) {
 			status = http.StatusConflict

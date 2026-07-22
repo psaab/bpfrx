@@ -111,6 +111,7 @@ func TestConfigMutationNormalBodySucceedsM7(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/config/set",
 		strings.NewReader(`{"input":"system host-name capped-ok"}`))
+	withRESTConfigSession(req, testRESTConfigSessionID)
 	s.configSetHandler(rr, req)
 
 	if rr.Code != 200 {
