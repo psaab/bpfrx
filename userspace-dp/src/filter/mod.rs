@@ -20,7 +20,7 @@ use ipnet::IpNet;
 use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::ip_proto::proto_number;
 use crate::policy::SnapshotIntegrityError;
@@ -440,7 +440,12 @@ pub(crate) struct ThreeColorPolicerCounters {
 pub(crate) struct ThreeColorPolicerRuntime {
     pub(crate) id: u32,
     pub(crate) name: Arc<str>,
-    state: Mutex<ThreeColorPolicerState>,
+    // #5390: NO `Mutex`. The token-bucket state meters lock-free through CAS
+    // over its own atomics (`filter/policer.rs`), so the RSS-spread flow
+    // aggregate no longer serializes on a per-packet futex. Removing the lock
+    // also removes the poison failure mode entirely; the only fail-closed path
+    // is the `Unsupported`-mode Red/drop inside `meter`.
+    state: ThreeColorPolicerState,
     counters: ThreeColorPolicerCounters,
 }
 
@@ -582,7 +587,7 @@ impl ThreeColorPolicerRuntime {
         Self {
             id,
             name: Arc::<str>::from(name),
-            state: Mutex::new(state),
+            state,
             counters: ThreeColorPolicerCounters::default(),
         }
     }
@@ -593,15 +598,8 @@ impl ThreeColorPolicerRuntime {
         packet_bytes: u64,
         incoming_color: PacketColor,
     ) -> ThreeColorDecision {
-        let decision = self
-            .state
-            .lock()
-            .map(|mut state| state.meter(now_ns, packet_bytes, incoming_color))
-            .unwrap_or_else(|_| ThreeColorDecision {
-                color: PacketColor::Red,
-                dscp_rewrite: None,
-                drop: true,
-            });
+        // #5390: lock-free meter — `&self` CAS over the atomic token bucket.
+        let decision = self.state.meter(now_ns, packet_bytes, incoming_color);
         match decision.color {
             PacketColor::Green => self.counters.green.record(packet_bytes),
             PacketColor::Yellow => self.counters.yellow.record(packet_bytes),
@@ -617,32 +615,22 @@ impl ThreeColorPolicerRuntime {
         if self.id != id {
             return false;
         }
-        self.state
-            .lock()
-            .ok()
-            .is_some_and(|state| state.same_runtime_shape(next_shape))
+        // #5390: shape lives in the immutable `config`; no lock needed.
+        self.state.same_runtime_shape(next_shape)
     }
 
     pub(crate) fn same_runtime_shape_as(&self, other: &Self) -> bool {
         if self.id != other.id || self.name != other.name {
             return false;
         }
-        let Ok(state) = self.state.lock() else {
-            return false;
-        };
-        other
-            .state
-            .lock()
-            .ok()
-            .is_some_and(|other| state.same_runtime_shape(&other))
+        self.state.same_runtime_shape(&other.state)
     }
 
     pub(crate) fn status(&self) -> crate::protocol::ThreeColorPolicerStatus {
-        let (mode, color_blind) = self
-            .state
-            .lock()
-            .map(|state| (state.mode_name().to_string(), state.color_blind()))
-            .unwrap_or_else(|_| ("unknown".to_string(), false));
+        // #5390: shape reads are lock-free (immutable `config`); counters are
+        // Relaxed atomics as before.
+        let mode = self.state.mode_name().to_string();
+        let color_blind = self.state.color_blind();
         crate::protocol::ThreeColorPolicerStatus {
             id: self.id,
             name: self.name.to_string(),
