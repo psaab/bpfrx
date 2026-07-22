@@ -56655,3 +56655,13 @@ top.
   re-imports annotated (now serve siblings/tests). Build green.
 - **File(s)**: userspace-dp/src/event_stream/control.rs (new),
   userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract the I/O thread (io_thread_main, try_connect,
+  replay_buffered, write_all_backpressured, run_connected_loop) into
+  event_stream/connection.rs (verbatim; reconnect + replay + backpressured
+  connected loop). Widened cross-module fns to pub(super); try_connect stays
+  private. Removed orphaned I/O-thread section comment; annotated the now
+  submodule-only std imports (VecDeque/io/UnixStream/TryRecvError). Build green.
+- **File(s)**: userspace-dp/src/event_stream/connection.rs (new),
+  userspace-dp/src/event_stream/mod.rs
