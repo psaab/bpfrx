@@ -55844,6 +55844,37 @@ top.
   **Action**: #6125 — document the deliberate DF-set transit TCP re-segment (not PTB) contract (delivery-over-strict-PMTUD). Docs-only adjudication (path (a)); no code change.
   **File(s)**: docs/feature-coverage.md, userspace-dp/src/afxdp/tx/README.md
 
+- **Timestamp**: 2026-07-22
+  **Action**: #4958 — guard startClusterComms session-sync publish against the
+  comms-restart race (High: nil-deref panic + stale overwrite). The async
+  constructor goroutine published `d.sessionSync` (and re-dereferenced it for
+  `SetAuthProvider`) and replaced `d.fabricRefreshCh{,1}` from an untracked
+  goroutine with no lock and no epoch check, so a stop→start restart could
+  nil-deref (stop nilled the field mid-construction) or let a superseded epoch's
+  late constructor clobber the live epoch. Fix: `clusterCommsMu` + a
+  `clusterCommsGen` generation counter guard every comms-epoch field; the
+  constructor closes over a local `ss` and calls `publishSessionSyncIfCurrent`
+  (publish-if-current, drops stale with slog.Debug); fabric channels publish the
+  same way and each populateFabricFwd loop receives its channel by value;
+  `stopClusterComms` bumps the generation, cancels, JOINS the constructor
+  (`clusterCommsWG`), then nils shared state + Stop()s. All readers route through
+  `getSessionSync()` / `snapshotFabricRefreshChans()` / `getClusterCommsCtx()`.
+  Validation: fail-on-revert `daemon_ha_comms_race_test.go` (asserts stale publish
+  dropped — RED when the generation guard is neutralized, verified firsthand);
+  `go test -race ./pkg/daemon` clean (26s) with the fix, and DATA RACE reported on
+  `d.sessionSync` when the mutex is stripped (verified firsthand); pkg/daemon +
+  pkg/cluster suites green; `go build ./...` OK. HA session-sync change → parent
+  runs `make test-failover` before merge.
+  **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_ha_fabric.go, pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_ha_userspace_readiness.go, pkg/daemon/daemon_ha.go,
+  pkg/daemon/daemon_dhcp_lease_sync.go, pkg/daemon/daemon_policy_invalidate.go,
+  pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/userspace_sync_test.go, pkg/daemon/daemon_ha_comms_race_test.go,
+  pkg/daemon/README.md
+- **Timestamp**: 2026-07-22 (session)
+  **Action**: #4906 — fix test/xsk-repro AF_XDP reproducer safety + false-result cohort (HC-025/069/081/090/091/095/101; HC-001 already fixed on master aaf977435). Embedded XDP object loaded via bpf_object__open_mem (no /tmp path); attach UPDATE_IF_NOEXIST + detach REPLACE+old_prog_fd (Rust RAII guard); checked shell-free link cycle w/ INCONCLUSIVE skip; Rust UMEM munmap after owners drop; rx1/rx2 init before goto (strict -Werror -Wjump-misses-init fail-on-revert gate + selftest leg); HC-069 RX-desc read-before-release + chunk-base recycle (C) and recv.release()+actual-consumed recycle (Rust); HC-095 secondary socket primed/polled/recycled + folded into PASS. Refreshed stale xdp_pass_redirect.o (elfutils 0.195 rejected the 6346B vintage; rebuilt 6432B from unchanged source). Added Makefile (+regen-obj, implicit-rule guard), selftest-compile.sh (wired into run-selftests.sh). Verified: strict build; fail-on-revert end-to-end; HC-101 kernel primitives on dummy0 (attach#2 EBUSY, foreign-fd detach refused); open_mem load reaches EPERM non-root.
+  **File(s)**: test/xsk-repro/{libbpf_xsk_test.c,libbpf_xsk_shared_test.c,main.rs,xdp_pass_redirect.c,xdp_pass_redirect.o,Makefile,selftest-compile.sh,README.md}, scripts/run-selftests.sh, .gitignore
 - **Timestamp**: 2026-07-22 (#6081)
   **Action**: Add delete-journal-overflow forceResync CONSUME-path integration
   tests (test-only, #5450/#6078 follow-up). `TestForceResyncConsumeSweep

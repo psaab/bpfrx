@@ -116,10 +116,11 @@ func (d *Daemon) userspaceTransferReadiness(rgID int) (bool, []string) {
 			return false, reasons
 		}
 	}
-	if d.sessionSync == nil {
+	ss := d.getSessionSync()
+	if ss == nil {
 		return false, []string{"session sync disconnected"}
 	}
-	return computeUserspaceTransferReadiness(d.sessionSync, d.syncPeerConnected.Load())
+	return computeUserspaceTransferReadiness(ss, d.syncPeerConnected.Load())
 }
 
 func (d *Daemon) prepareUserspaceManualFailover(rgID int) error {
@@ -139,7 +140,12 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 			d.releaseUserspaceRGDemotionPrep(rgID)
 		}
 	}()
-	if d.sessionSync == nil || !d.sessionSync.IsConnected() {
+	// Snapshot the session-sync object once for this demotion attempt (#4958)
+	// so the nil/connection checks, the retry-restart defer, and the barrier
+	// wait all operate on the same instance instead of re-reading the field a
+	// concurrent stopClusterComms could nil mid-flight.
+	ss := d.getSessionSync()
+	if ss == nil || !ss.IsConnected() {
 		// Release suppression window so a reconnect + retry can re-run
 		// the barrier check before the actual demotion proceeds.
 		d.releaseUserspaceRGDemotionPrep(rgID)
@@ -166,7 +172,6 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		if d.syncPeerBulkPrimed.Load() {
 			return // peer already primed, no retry needed
 		}
-		ss := d.sessionSync
 		if ss == nil || !ss.IsConnected() {
 			return // peer disconnected, retry would be pointless
 		}
@@ -180,7 +185,7 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 
 	// Single barrier — peer ack means it has processed all queued deltas.
 	// The actual demotion happens atomically in UpdateRGActive(false).
-	if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
+	if err := ss.WaitForPeerBarrier(barrierTimeout); err != nil {
 		return fmt.Errorf("demotion peer barrier failed: %w", err)
 	}
 

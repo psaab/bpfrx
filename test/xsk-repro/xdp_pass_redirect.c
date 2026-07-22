@@ -1,5 +1,8 @@
 // Minimal XDP program: redirect all packets to xskmap slot = rx_queue_index.
-// Compile: clang -O2 -g -target bpf -c xdp_pass_redirect.c -o xdp_pass_redirect.o
+// Compile (the arch include dir is needed for <asm/types.h>):
+//   clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu \
+//         -c xdp_pass_redirect.c -o xdp_pass_redirect.o
+// Or run `make regen-obj` in this directory.
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>

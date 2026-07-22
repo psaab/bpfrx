@@ -145,10 +145,11 @@ func (d *Daemon) ensureDHCPLeaseSyncLoop(enabled bool) {
 	// not ready yet (e.g. the apply path runs before the peer connects), skip
 	// here — the connect-time launch calls this again once sessionSync is
 	// established, so the knob-ON state is not lost.
-	if d.dhcpServer == nil || d.sessionSync == nil || d.clusterCommsCtx == nil {
+	commsCtx := d.getClusterCommsCtx()
+	if d.dhcpServer == nil || d.getSessionSync() == nil || commsCtx == nil {
 		return
 	}
-	loopCtx, cancel := context.WithCancel(d.clusterCommsCtx)
+	loopCtx, cancel := context.WithCancel(commsCtx)
 	d.dhcpLeaseSync.loopCancel = cancel
 	go d.runDHCPLeaseSyncLoop(loopCtx)
 	slog.Info("cluster: DHCP lease-sync push loop started")
@@ -170,7 +171,7 @@ func (d *Daemon) resetDHCPLeaseSyncLoop() {
 // exits on ctx cancellation. It is (re)launched idempotently by
 // ensureDHCPLeaseSyncLoop in cluster mode with the knob enabled.
 func (d *Daemon) runDHCPLeaseSyncLoop(ctx context.Context) {
-	if d.dhcpServer == nil || d.sessionSync == nil {
+	if d.dhcpServer == nil || d.getSessionSync() == nil {
 		return
 	}
 	heartbeat := time.NewTicker(dhcpLeaseSyncHeartbeat)
@@ -273,7 +274,9 @@ func (d *Daemon) maybePushFamily(family int, leases []dhcpserver.SyncLease, forc
 	if !force && !changed {
 		return
 	}
-	d.sessionSync.QueueDHCPLeases(family, leases)
+	if ss := d.getSessionSync(); ss != nil {
+		ss.QueueDHCPLeases(family, leases)
+	}
 }
 
 // dhcpLeaseSetFingerprint computes a stable, order-independent fingerprint of a
@@ -323,7 +326,8 @@ func (d *Daemon) nudgeDHCPLeaseSync() {
 //
 // Called from the MASTER-takeover path BEFORE dhcpServer.ApplyAsync(start).
 func (d *Daemon) preSeedDHCPLeaseMemfile() {
-	if d.sessionSync == nil || d.dhcpServer == nil {
+	ss := d.getSessionSync()
+	if ss == nil || d.dhcpServer == nil {
 		return
 	}
 	cc := d.clusterConfig()
@@ -333,14 +337,14 @@ func (d *Daemon) preSeedDHCPLeaseMemfile() {
 	ctx, cancel := context.WithTimeout(context.Background(), dhcpLeaseReadTimeout)
 	defer cancel()
 	now := time.Now()
-	if leases := d.sessionSync.PeerDHCPLeases4(); len(leases) > 0 {
+	if leases := ss.PeerDHCPLeases4(); len(leases) > 0 {
 		if err := d.dhcpServer.PreSeedMemfileMerged4(ctx, leases, now); err != nil {
 			slog.Warn("cluster: DHCP v4 lease memfile pre-seed failed (post-start lease-add is backstop)", "err", err)
 		} else {
 			slog.Info("cluster: DHCP v4 leases pre-seeded into memfile before Kea start", "count", len(leases))
 		}
 	}
-	if leases := d.sessionSync.PeerDHCPLeases6(); len(leases) > 0 {
+	if leases := ss.PeerDHCPLeases6(); len(leases) > 0 {
 		if err := d.dhcpServer.PreSeedMemfileMerged6(ctx, leases, now); err != nil {
 			slog.Warn("cluster: DHCP v6 lease memfile pre-seed failed (post-start lease-add is backstop)", "err", err)
 		} else {
@@ -358,15 +362,16 @@ func (d *Daemon) preSeedDHCPLeaseMemfile() {
 // lease already present (from the memfile pre-seed or this node's own persisted
 // state) degrades to lease-update. Fail-open throughout.
 func (d *Daemon) seedDHCPLeasesFromPeer(ctx context.Context) {
-	if d.sessionSync == nil || d.dhcpServer == nil {
+	ss := d.getSessionSync()
+	if ss == nil || d.dhcpServer == nil {
 		return
 	}
 	cc := d.clusterConfig()
 	if cc == nil || !cc.DHCPLeaseSync {
 		return
 	}
-	leases4 := d.sessionSync.PeerDHCPLeases4()
-	leases6 := d.sessionSync.PeerDHCPLeases6()
+	leases4 := ss.PeerDHCPLeases4()
+	leases6 := ss.PeerDHCPLeases6()
 	if len(leases4) == 0 && len(leases6) == 0 {
 		return
 	}
@@ -378,7 +383,7 @@ func (d *Daemon) seedDHCPLeasesFromPeer(ctx context.Context) {
 	if want4 {
 		if d.dhcpServer.WaitControlSocket4(ctx, dhcpLeaseSeedSocketWait) {
 			n, err := d.dhcpServer.SeedSyncLeases4(ctx, leases4, now)
-			d.sessionSync.RecordDHCPLeasesSeeded(n)
+			ss.RecordDHCPLeasesSeeded(n)
 			if err != nil {
 				slog.Warn("cluster: DHCP v4 lease seed had errors (fail-open)", "seeded", n, "err", err)
 			} else {
@@ -391,7 +396,7 @@ func (d *Daemon) seedDHCPLeasesFromPeer(ctx context.Context) {
 	if want6 {
 		if d.dhcpServer.WaitControlSocket6(ctx, dhcpLeaseSeedSocketWait) {
 			n, err := d.dhcpServer.SeedSyncLeases6(ctx, leases6, now)
-			d.sessionSync.RecordDHCPLeasesSeeded(n)
+			ss.RecordDHCPLeasesSeeded(n)
 			if err != nil {
 				slog.Warn("cluster: DHCP v6 lease seed had errors (fail-open)", "seeded", n, "err", err)
 			} else {

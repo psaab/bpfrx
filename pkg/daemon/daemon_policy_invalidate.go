@@ -295,7 +295,8 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 	// delete callback (daemon_run.go): only a node that is primary for some RG
 	// owns the authoritative session and syncs its deletes; the peer ignores
 	// deletes for sessions it does not hold.
-	syncPeer := d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil
+	ss := d.getSessionSync()
+	syncPeer := d.cluster != nil && d.cluster.IsLocalPrimaryAny() && ss != nil
 
 	// Collect forward entries only; DeleteBatchKnownV4/V6 expands each to its
 	// reverse + DNAT companions. A reverse entry carries the SAME policy_id as
@@ -364,7 +365,7 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 		}
 		if syncPeer {
 			for _, e := range v4Entries {
-				d.sessionSync.QueueDeleteV4(e.Key)
+				ss.QueueDeleteV4(e.Key)
 			}
 		}
 	}
@@ -380,7 +381,7 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 		}
 		if syncPeer {
 			for _, e := range v6Entries {
-				d.sessionSync.QueueDeleteV6(e.Key)
+				ss.QueueDeleteV6(e.Key)
 			}
 		}
 	}

@@ -2,15 +2,19 @@
  * Minimal libbpf-based AF_XDP test.
  * Uses xsk_socket__create from libbpf — the reference AF_XDP implementation.
  *
- * Build:
- *   cc -O2 -o libbpf-xsk-test libbpf_xsk_test.c -lbpf -lxdp -lelf -lz
- *   OR (if no libxdp):
- *   cc -O2 -o libbpf-xsk-test libbpf_xsk_test.c -lbpf -lelf -lz
+ * Build (embeds the XDP object, so run via the Makefile which generates the
+ * xdp_pass_redirect_obj.h include from the tracked xdp_pass_redirect.o):
+ *   make libbpf-xsk-test
  *
  * Usage:
  *   ./libbpf-xsk-test <interface> <queue> [copy|zerocopy]
  *
- * Must run as root. Loads xdp_pass_redirect.o XDP program.
+ * Must run as root. The XDP program (xdp_pass_redirect.o) is compiled into the
+ * binary and loaded from memory (bpf_object__open_mem) — it is NOT read from a
+ * predictable /tmp path (#4906 HC-025). The program is attached with
+ * XDP_FLAGS_UPDATE_IF_NOEXIST so it never clobbers an XDP program already on
+ * the interface (e.g. the firewall dataplane), and detached only if it is still
+ * ours (#4906 HC-101).
  */
 
 #define _GNU_SOURCE
@@ -29,6 +33,10 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <xdp/xsk.h>
+
+/* Embedded xdp_pass_redirect.o (generated from the tracked object by the
+ * Makefile via `xxd -i`). Provides xdp_pass_redirect_o[] + _len. */
+#include "xdp_pass_redirect_obj.h"
 
 #define FRAME_SIZE     4096
 #define NUM_FRAMES     4096
@@ -52,9 +60,15 @@ static int load_xdp_prog(const char *iface, int ifindex, int *map_fd_out)
     struct bpf_map *map;
     int prog_fd, err;
 
-    obj = bpf_object__open("/tmp/xdp_pass_redirect.o");
+    (void)iface; /* interface identified by ifindex; kept for signature parity */
+
+    /* #4906 HC-025: load the object from the compiled-in bytes instead of a
+     * predictable, attacker-writable /tmp path. No filesystem read, so there
+     * is no symlink/TOCTOU window and no chance of loading a substituted
+     * object as root. */
+    obj = bpf_object__open_mem(xdp_pass_redirect_o, xdp_pass_redirect_o_len, NULL);
     if (!obj) {
-        fprintf(stderr, "bpf_object__open failed\n");
+        fprintf(stderr, "bpf_object__open_mem failed\n");
         return -1;
     }
     err = bpf_object__load(obj);
@@ -76,9 +90,20 @@ static int load_xdp_prog(const char *iface, int ifindex, int *map_fd_out)
     }
     *map_fd_out = bpf_map__fd(map);
 
-    err = bpf_xdp_attach(ifindex, prog_fd, 0, NULL);
+    /* #4906 HC-101: attach with XDP_FLAGS_UPDATE_IF_NOEXIST so we never replace
+     * an XDP program already on the interface (the firewall dataplane runs one
+     * on the live NIC). If one is present the attach returns -EBUSY and we
+     * refuse to run — clobbering it, then detaching to none on exit, would
+     * strip the interface of its dataplane. */
+    err = bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_UPDATE_IF_NOEXIST, NULL);
     if (err) {
-        fprintf(stderr, "bpf_xdp_attach failed: %s\n", strerror(-err));
+        if (err == -EBUSY)
+            fprintf(stderr,
+                    "bpf_xdp_attach: interface already has an XDP program; "
+                    "refusing to replace it (would clobber the firewall "
+                    "dataplane). Detach it first if this is intended.\n");
+        else
+            fprintf(stderr, "bpf_xdp_attach failed: %s\n", strerror(-err));
         return -1;
     }
     printf("  XDP attached prog_fd=%d map_fd=%d\n", prog_fd, *map_fd_out);
@@ -176,14 +201,23 @@ static unsigned long receive_loop(struct xsk_info *info, int seconds)
         __u32 idx_rx = 0;
         unsigned int rcvd = xsk_ring_cons__peek(&info->rx, BATCH_SIZE, &idx_rx);
         if (rcvd > 0) {
+            /* #4906 HC-069: read the RX descriptor addresses BEFORE releasing
+             * them, and use the RX-descriptor accessor (not comp_addr, which is
+             * the completion-ring layout). The previous code released first and
+             * then read a completion address off the RX ring — recycling stale
+             * or wrong offsets into the fill ring (fill-ring starvation /
+             * duplicate ownership). rcvd is bounded by BATCH_SIZE. */
+            __u64 addrs[BATCH_SIZE];
+            for (unsigned int i = 0; i < rcvd; i++)
+                addrs[i] = xsk_ring_cons__rx_desc(&info->rx, idx_rx + i)->addr;
             total += rcvd;
             xsk_ring_cons__release(&info->rx, rcvd);
-            /* Return frames to fill ring */
+            /* Return the chunk-aligned frame bases to the fill ring. */
             __u32 idx_fq;
             if (xsk_ring_prod__reserve(&info->fq, rcvd, &idx_fq) == rcvd) {
                 for (unsigned int i = 0; i < rcvd; i++) {
                     *xsk_ring_prod__fill_addr(&info->fq, idx_fq + i) =
-                        *xsk_ring_cons__comp_addr(&info->rx, idx_rx + i);
+                        addrs[i] & ~((__u64)FRAME_SIZE - 1);
                 }
                 xsk_ring_prod__submit(&info->fq, rcvd);
             }
@@ -206,6 +240,38 @@ static void destroy_xsk(struct xsk_info *info, int map_fd, int queue)
     if (info->umem) xsk_umem__delete(info->umem);
     free(info->umem_area);
     memset(info, 0, sizeof(*info));
+}
+
+/*
+ * #4906 HC-090: run "ip link set <iface> <state>" without a shell and report
+ * whether it actually succeeded. The previous code used system() with an
+ * interpolated interface name (shell-injection surface) and ignored the exit
+ * status, so phase 2 (rebind) ran even when the link cycle never happened —
+ * turning a no-op into a misleading PASS/FAIL. execlp() takes the interface as
+ * a bare argv element, so it is never interpreted by a shell.
+ */
+static int run_ip_link(const char *iface, const char *state)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork (ip link)");
+        return -1;
+    }
+    if (pid == 0) {
+        execlp("ip", "ip", "link", "set", iface, state, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid (ip link)");
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "ip link set %s %s failed (status=0x%x)\n",
+                iface, state, status);
+        return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -249,23 +315,38 @@ int main(int argc, char **argv)
     }
 
     struct xsk_info info = {};
+    /* #4906 HC-081: rx1/rx2 must be initialized before any `goto cleanup`.
+     * They were previously declared past the gotos, so an early failure jumped
+     * over their initialization and the cleanup block read indeterminate values
+     * — which could print RESULT: PASS on a test that never ran a phase. */
+    unsigned long rx1 = 0, rx2 = 0;
+    int link_cycled = 0;
 
     printf("\n=== Phase 1: Initial bind (%s) on %s queue %d ===\n", mode, iface, queue);
     if (create_xsk(iface, queue, map_fd, use_copy, &info) < 0) {
         printf("RESULT: FAIL (cannot create XSK)\n");
         goto cleanup;
     }
-    unsigned long rx1 = receive_loop(&info, 3);
+    rx1 = receive_loop(&info, 3);
     printf("Phase 1 rx: %lu\n", rx1);
     destroy_xsk(&info, map_fd, queue);
 
     printf("\n=== Link DOWN/UP on %s ===\n", iface);
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ip link set %s down", iface);
-    system(cmd);
-    usleep(200000);
-    snprintf(cmd, sizeof(cmd), "ip link set %s up", iface);
-    system(cmd);
+    /* #4906 HC-090: only proceed to the rebind phase if the link actually
+     * cycled. If `ip` is missing, lacks capability, or the interface refuses
+     * the state change, phase 2 is meaningless and must not masquerade as a
+     * pass/fail of the rebind path. */
+    if (run_ip_link(iface, "down") == 0) {
+        usleep(200000);
+        if (run_ip_link(iface, "up") == 0)
+            link_cycled = 1;
+    }
+    if (!link_cycled) {
+        fprintf(stderr,
+                "Link DOWN/UP cycle did not complete — skipping phase 2 "
+                "(rebind); result is INCONCLUSIVE.\n");
+        goto cleanup;
+    }
     printf("  waiting 500ms for NIC reinit...\n");
     usleep(500000);
 
@@ -274,7 +355,7 @@ int main(int argc, char **argv)
         printf("RESULT: FAIL (cannot rebind XSK)\n");
         goto cleanup;
     }
-    unsigned long rx2 = receive_loop(&info, 3);
+    rx2 = receive_loop(&info, 3);
     printf("Phase 2 rx: %lu\n", rx2);
     destroy_xsk(&info, map_fd, queue);
 
@@ -286,11 +367,27 @@ cleanup:
         kill(child, 9);
         waitpid(child, NULL, 0);
     }
-    bpf_xdp_attach(ifindex, -1, 0, NULL);
-    printf("  XDP detached\n");
+    /* #4906 HC-101: detach only the program we attached, and only if it is
+     * still the one on the interface. XDP_FLAGS_REPLACE + old_prog_fd makes the
+     * kernel refuse the detach if something else now owns the hook — so we can
+     * never strip an unrelated (firewall) XDP program off the NIC. Because we
+     * attached with UPDATE_IF_NOEXIST, prog_fd is only >= 0 here when the attach
+     * succeeded on a previously-empty hook. */
+    if (prog_fd >= 0) {
+        LIBBPF_OPTS(bpf_xdp_attach_opts, dopts, .old_prog_fd = prog_fd);
+        int derr = bpf_xdp_detach(ifindex, XDP_FLAGS_REPLACE, &dopts);
+        if (derr)
+            fprintf(stderr,
+                    "XDP detach skipped/failed (%s) — hook not ours anymore\n",
+                    strerror(-derr));
+        else
+            printf("  XDP detached\n");
+    }
 
     printf("\n");
-    if (rx1 > 0 && rx2 > 0)
+    if (!link_cycled)
+        printf("RESULT: INCONCLUSIVE  (link DOWN/UP did not run)  phase1_rx=%lu\n", rx1);
+    else if (rx1 > 0 && rx2 > 0)
         printf("RESULT: PASS  phase1_rx=%lu phase2_rx=%lu\n", rx1, rx2);
     else if (rx1 > 0 && rx2 == 0)
         printf("RESULT: FAIL  (broken after link cycle)  phase1_rx=%lu phase2_rx=0\n", rx1);
@@ -299,5 +396,7 @@ cleanup:
     else
         printf("RESULT: UNEXPECTED  phase1_rx=%lu phase2_rx=%lu\n", rx1, rx2);
 
+    if (!link_cycled)
+        return 2; /* inconclusive: distinct from a real pass (0) or fail (1) */
     return (rx1 > 0 && rx2 > 0) ? 0 : 1;
 }

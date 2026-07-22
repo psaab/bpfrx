@@ -655,10 +655,10 @@ func TestShouldSyncUserspaceDeltaPrefersOwnerRG(t *testing.T) {
 			IsPrimaryForRGFn: func(rgID int) bool { return rgID == 2 },
 		},
 	}
-	if !d.shouldSyncUserspaceDelta(dpuserspace.SessionDeltaInfo{OwnerRGID: 2}, 1) {
+	if !d.shouldSyncUserspaceDelta(d.sessionSync, dpuserspace.SessionDeltaInfo{OwnerRGID: 2}, 1) {
 		t.Fatal("expected owner RG primary to allow sync")
 	}
-	if d.shouldSyncUserspaceDelta(dpuserspace.SessionDeltaInfo{OwnerRGID: 1}, 1) {
+	if d.shouldSyncUserspaceDelta(d.sessionSync, dpuserspace.SessionDeltaInfo{OwnerRGID: 1}, 1) {
 		t.Fatal("expected non-primary owner RG to block sync")
 	}
 }
@@ -670,11 +670,11 @@ func TestShouldSyncUserspaceDeltaFallsBackToZone(t *testing.T) {
 	}
 	ss.SetZoneRGMap(map[uint16]int{1: 1})
 	d := &Daemon{sessionSync: ss}
-	if d.shouldSyncUserspaceDelta(dpuserspace.SessionDeltaInfo{}, 1) {
+	if d.shouldSyncUserspaceDelta(d.sessionSync, dpuserspace.SessionDeltaInfo{}, 1) {
 		t.Fatal("expected fallback zone sync to be false when RG 1 is not local primary")
 	}
 	ss.IsPrimaryForRGFn = func(rgID int) bool { return rgID == 1 }
-	if !d.shouldSyncUserspaceDelta(dpuserspace.SessionDeltaInfo{}, 1) {
+	if !d.shouldSyncUserspaceDelta(d.sessionSync, dpuserspace.SessionDeltaInfo{}, 1) {
 		t.Fatal("expected fallback zone sync to use ShouldSyncZone")
 	}
 }
@@ -686,7 +686,7 @@ func TestShouldSyncUserspaceDeltaSkipsLocalDelivery(t *testing.T) {
 			IsPrimaryForRGFn: func(rgID int) bool { return true },
 		},
 	}
-	if d.shouldSyncUserspaceDelta(dpuserspace.SessionDeltaInfo{Disposition: "local_delivery"}, 1) {
+	if d.shouldSyncUserspaceDelta(d.sessionSync, dpuserspace.SessionDeltaInfo{Disposition: "local_delivery"}, 1) {
 		t.Fatal("expected helper local-delivery deltas to stay out of session sync")
 	}
 }
@@ -698,7 +698,7 @@ func TestShouldSyncUserspaceDeltaSkipsMissingNeighborSeed(t *testing.T) {
 			IsPrimaryForRGFn: func(rgID int) bool { return true },
 		},
 	}
-	if d.shouldSyncUserspaceDelta(dpuserspace.SessionDeltaInfo{Origin: "missing_neighbor_seed"}, 1) {
+	if d.shouldSyncUserspaceDelta(d.sessionSync, dpuserspace.SessionDeltaInfo{Origin: "missing_neighbor_seed"}, 1) {
 		t.Fatal("expected transient missing-neighbor seed deltas to stay out of session sync")
 	}
 }
@@ -721,7 +721,7 @@ func TestShouldSyncUserspaceDeltaAllowsStaleOwnerFabricRedirect(t *testing.T) {
 		NeighborMAC:    "aa:bb:cc:dd:ee:ff",
 		SrcMAC:         "02:bf:72:aa:00:01",
 	}
-	if !d.shouldSyncUserspaceDelta(delta, 1) {
+	if !d.shouldSyncUserspaceDelta(d.sessionSync, delta, 1) {
 		t.Fatal("expected stale-owner fabric redirect delta to be synced")
 	}
 }
@@ -738,7 +738,7 @@ func TestShouldSyncUserspaceDeltaDoesNotBypassFabricIngress(t *testing.T) {
 		FabricRedirect: true,
 		FabricIngress:  true,
 	}
-	if d.shouldSyncUserspaceDelta(delta, 1) {
+	if d.shouldSyncUserspaceDelta(d.sessionSync, delta, 1) {
 		t.Fatal("expected fabric-ingress delta to remain blocked on standby")
 	}
 }

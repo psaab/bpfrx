@@ -62,7 +62,8 @@ func (d *Daemon) onSessionSyncPeerConnected() {
 	// daemon's lifetime — the peer (or we) genuinely started from scratch.
 	// On a routine reconnect after a brief network blip, the sessions are
 	// already synced; preserve the primed state and sync readiness (#466).
-	coldStart := d.sessionSync == nil || !d.sessionSync.BulkEverCompleted()
+	ss := d.getSessionSync()
+	coldStart := ss == nil || !ss.BulkEverCompleted()
 
 	if coldStart {
 		d.syncBulkPrimed.Store(false)
@@ -113,7 +114,8 @@ func (d *Daemon) onSessionSyncPeerDisconnected() {
 	// and sync readiness. The sessions are still in the BPF maps — a
 	// subsequent reconnect will resume incremental sync without needing a
 	// full bulk transfer (#466).
-	wasEverPrimed := d.sessionSync != nil && d.sessionSync.BulkEverCompleted()
+	ss := d.getSessionSync()
+	wasEverPrimed := ss != nil && ss.BulkEverCompleted()
 	if !wasEverPrimed {
 		d.syncBulkPrimed.Store(false)
 		d.syncPeerBulkPrimed.Store(false)
@@ -135,7 +137,7 @@ func (d *Daemon) onSessionSyncPeerDisconnected() {
 }
 
 func (d *Daemon) shouldSuppressPeerHeartbeatTimeout() (bool, string) {
-	ss := d.sessionSync
+	ss := d.getSessionSync()
 	if ss == nil || !ss.IsConnected() {
 		d.hbSuppressStart.Store(0) // reset when sync disconnected
 		return false, ""
@@ -187,7 +189,7 @@ func syncPrimeProgressObserved(current, baseline cluster.SyncStatsSnapshot) bool
 }
 
 func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
-	ss := d.sessionSync
+	ss := d.getSessionSync()
 	if ss == nil || d.dp == nil {
 		return
 	}
@@ -218,9 +220,9 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 					"reason", "peer bulk ack received")
 				return
 			}
-			if d.sessionSync != ss || !ss.IsConnected() {
+			if cur := d.getSessionSync(); cur != ss || !ss.IsConnected() {
 				reason := "session sync replaced"
-				if d.sessionSync == ss && !ss.IsConnected() {
+				if cur == ss && !ss.IsConnected() {
 					reason = "session sync disconnected"
 				}
 				slog.Info("cluster: stopping session sync bulk-prime retry loop",
@@ -334,7 +336,7 @@ func rg0ConfigSyncAuthority(cl *cluster.Manager) bool {
 // syncConfigToPeer sends the active config to the cluster peer if this node is
 // the RG0 config-sync authority and config sync is enabled.
 func (d *Daemon) syncConfigToPeer() {
-	if d.sessionSync == nil {
+	if d.getSessionSync() == nil {
 		return
 	}
 	// Only sync if this node is the RG0 (config ownership group) primary — the
@@ -351,7 +353,8 @@ func (d *Daemon) syncConfigToPeer() {
 // and by the peer-reconnect path where the stable node pushes its config
 // regardless of whether it was preempted.
 func (d *Daemon) pushConfigToPeer() {
-	if d.sessionSync == nil {
+	ss := d.getSessionSync()
+	if ss == nil {
 		return
 	}
 	// Check if config sync is enabled.
@@ -364,7 +367,7 @@ func (d *Daemon) pushConfigToPeer() {
 	if configText == "" {
 		return
 	}
-	d.sessionSync.QueueConfig(configText)
+	ss.QueueConfig(configText)
 	// #5863: record the reconcile marker so the level-triggered reconciler
 	// treats this generation as already pushed on the current connection
 	// epoch and does not redundantly re-push it. Only mark when a peer
@@ -435,7 +438,8 @@ func (d *Daemon) markConfigSyncPushed(configText string) {
 // the old connect edge, so a reconnecting SECONDARY never overwrites the
 // authoritative primary's config (#2239/#4385).
 func (d *Daemon) reconcileConfigSyncToPeer(reason string) {
-	if d.sessionSync == nil && d.configSyncPushForTest == nil {
+	ss := d.getSessionSync()
+	if ss == nil && d.configSyncPushForTest == nil {
 		return
 	}
 	// Desired-state gates, re-read fresh on every call (persistent state, not
@@ -490,7 +494,7 @@ func (d *Daemon) reconcileConfigSyncToPeer(reason string) {
 		d.configSyncPushForTest()
 		return
 	}
-	d.sessionSync.QueueConfig(configText)
+	ss.QueueConfig(configText)
 }
 
 // configSyncReconcileLoop is the low-frequency level-triggered safety net for
@@ -568,6 +572,99 @@ func (d *Daemon) handleConfigSync(configText string) error {
 	return nil
 }
 
+// getSessionSync returns the currently-published cluster session-sync object
+// under clusterCommsMu (#4958). It is nil when cluster comms are stopped or
+// still constructing. Every reader outside the constructor MUST go through this
+// accessor rather than touching d.sessionSync directly: the field is published
+// asynchronously by the startClusterComms constructor goroutine and nilled by
+// stopClusterComms, so a bare field read races the write (and a bare
+// `d.sessionSync != nil && d.sessionSync.X()` can nil-deref if stop nils
+// between the two loads). Callers capture the returned pointer once and operate
+// on it — the lock is never held across a call into SessionSync.
+func (d *Daemon) getSessionSync() *cluster.SessionSync {
+	d.clusterCommsMu.Lock()
+	ss := d.sessionSync
+	d.clusterCommsMu.Unlock()
+	return ss
+}
+
+// getClusterCommsCtx returns the live cluster-comms sub-context under
+// clusterCommsMu (#4958). Nil when comms are stopped. Comms-scoped loops that
+// (re)launch from the apply path (e.g. the DHCP lease-sync loop) read it here
+// so a concurrent stopClusterComms nilling the field does not race them.
+func (d *Daemon) getClusterCommsCtx() context.Context {
+	d.clusterCommsMu.Lock()
+	ctx := d.clusterCommsCtx
+	d.clusterCommsMu.Unlock()
+	return ctx
+}
+
+// snapshotFabricRefreshChans returns the current fabric refresh channels under
+// clusterCommsMu (#4958). The populateFabricFwd loops receive their channel by
+// value at launch; only the sender (triggerFabricRefresh) reads the live fields,
+// so this snapshot is the single synchronized read point.
+func (d *Daemon) snapshotFabricRefreshChans() (chan struct{}, chan struct{}) {
+	d.clusterCommsMu.Lock()
+	ch0, ch1 := d.fabricRefreshCh, d.fabricRefreshCh1
+	d.clusterCommsMu.Unlock()
+	return ch0, ch1
+}
+
+// beginClusterCommsEpoch opens a new cluster-comms epoch (#4958): it bumps
+// clusterCommsGen, installs a fresh independently-cancellable sub-context, and
+// returns the context plus the epoch generation the constructor goroutine must
+// present at publish time. Bumping the counter here means a constructor from a
+// prior epoch (still resolving addresses) is already superseded before this
+// call returns, so its later publish is dropped.
+func (d *Daemon) beginClusterCommsEpoch(parent context.Context) (context.Context, uint64) {
+	commsCtx, commsCancel := context.WithCancel(parent)
+	d.clusterCommsMu.Lock()
+	d.clusterCommsGen++
+	gen := d.clusterCommsGen
+	d.clusterCommsCancel = commsCancel
+	d.clusterCommsCtx = commsCtx
+	d.clusterCommsMu.Unlock()
+	return commsCtx, gen
+}
+
+// publishSessionSyncIfCurrent installs ss as the live session-sync object iff
+// gen still matches the current cluster-comms epoch (#4958). It returns false —
+// dropping the publish — when a restart (stopClusterComms / a newer
+// startClusterComms) has advanced the generation since this constructor started,
+// so a late constructor from a superseded epoch never overwrites the newer
+// epoch's session/endpoints (the stale-overwrite failure) and never resurrects a
+// session that stop is tearing down (the nil-deref failure). The generation
+// check and the store happen under the same lock so they cannot interleave with
+// a concurrent stop.
+func (d *Daemon) publishSessionSyncIfCurrent(gen uint64, ss *cluster.SessionSync) bool {
+	d.clusterCommsMu.Lock()
+	defer d.clusterCommsMu.Unlock()
+	if gen != d.clusterCommsGen {
+		slog.Debug("cluster: dropping stale session-sync publish (comms epoch superseded)",
+			"publish_gen", gen, "current_gen", d.clusterCommsGen)
+		return false
+	}
+	d.sessionSync = ss
+	return true
+}
+
+// publishFabricRefreshChansIfCurrent installs the fabric refresh channels iff
+// gen still matches the current epoch (#4958), mirroring
+// publishSessionSyncIfCurrent so a superseded constructor does not replace a
+// newer epoch's channels.
+func (d *Daemon) publishFabricRefreshChansIfCurrent(gen uint64, ch0, ch1 chan struct{}) bool {
+	d.clusterCommsMu.Lock()
+	defer d.clusterCommsMu.Unlock()
+	if gen != d.clusterCommsGen {
+		slog.Debug("cluster: dropping stale fabric-refresh channel publish (comms epoch superseded)",
+			"publish_gen", gen, "current_gen", d.clusterCommsGen)
+		return false
+	}
+	d.fabricRefreshCh = ch0
+	d.fabricRefreshCh1 = ch1
+	return true
+}
+
 // watchClusterEvents monitors cluster state transitions and toggles
 // config store read-only mode based on primary/secondary state.
 // startClusterComms starts heartbeat and session sync after VRFs are created.
@@ -582,9 +679,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 	// Create an independently-cancellable sub-context so cluster comms can
 	// be restarted on config change (#87) without cancelling the daemon ctx.
-	commsCtx, commsCancel := context.WithCancel(ctx)
-	d.clusterCommsCancel = commsCancel
-	d.clusterCommsCtx = commsCtx
+	// beginClusterCommsEpoch bumps the epoch generation under clusterCommsMu so
+	// a constructor goroutine from a superseded epoch (still resolving its sync
+	// address) drops its publish instead of clobbering this epoch's state
+	// (#4958).
+	commsCtx, commsGen := d.beginClusterCommsEpoch(ctx)
 	d.activeClusterTransport = clusterTransportFromConfig(cfg)
 
 	// Determine VRF device if control/fabric interfaces are in mgmt VRF.
@@ -666,7 +765,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 		syncTransport = "fabric"
 	}
 	if syncIface != "" && syncPeerAddr != "" {
+		// Track the constructor goroutine so stopClusterComms can join it
+		// before tearing the epoch down (#4958): a cancelled constructor must
+		// finish (or drop its publish) before stop nils the shared state.
+		d.clusterCommsWG.Add(1)
 		go func() {
+			defer d.clusterCommsWG.Done()
 			var syncIP string
 			for i := 0; i < 30; i++ {
 				syncIP = resolveClusterInterfaceAddr(syncIface, syncPeerAddr, "")
@@ -725,17 +829,30 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				}
 			}
 
+			// Build the session-sync object in a LOCAL variable and publish it
+			// only if this constructor still owns the current comms epoch
+			// (#4958). Everything below wires callbacks and cluster references
+			// against this local `ss` — never re-reading d.sessionSync — so a
+			// concurrent stopClusterComms that nils the field cannot turn a
+			// re-dereference into a nil-deref panic, and a superseded epoch's
+			// late publish is dropped rather than clobbering the live epoch.
+			var ss *cluster.SessionSync
 			if syncLocal1 != "" {
-				d.sessionSync = cluster.NewDualSessionSync(syncLocal, syncPeer, syncLocal1, syncPeer1, nil)
+				ss = cluster.NewDualSessionSync(syncLocal, syncPeer, syncLocal1, syncPeer1, nil)
 			} else {
-				d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
+				ss = cluster.NewSessionSync(syncLocal, syncPeer, nil)
+			}
+			if !d.publishSessionSyncIfCurrent(commsGen, ss) {
+				// A restart superseded this epoch while we were resolving the
+				// sync address; abort before wiring cluster state or binding.
+				return
 			}
 			// #4107 F23: authenticate the session-sync stream with the same
 			// control-link PSK the heartbeat + fabric-gRPC use (#4357). The
 			// cluster Manager supplies both the key and the heartbeat
 			// downgrade-guard signal (HeartbeatPeerAuthSeen). With no key
 			// configured the stream stays legacy unauthenticated (dual-accept).
-			d.sessionSync.SetAuthProvider(d.cluster)
+			ss.SetAuthProvider(d.cluster)
 
 			d.cluster.SetSyncTransport(syncTransport)
 
@@ -768,10 +885,10 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			}()
 
 			// Wire sync stats into cluster manager for CLI display.
-			d.cluster.SetSyncStats(d.sessionSync)
+			d.cluster.SetSyncStats(ss)
 
 			// Wire config sync callback: when secondary receives config from primary.
-			d.sessionSync.OnConfigReceived = func(configText string) error {
+			ss.OnConfigReceived = func(configText string) error {
 				d.cluster.RecordEvent(cluster.EventConfigSync, -1, fmt.Sprintf("Config received (%d bytes)", len(configText)))
 				return d.handleConfigSync(configText)
 			}
@@ -784,7 +901,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// at connect time correctly skips here, and a LATER promotion or
 			// stability crossing re-pushes via the promotion hook / reconcile
 			// loop, instead of leaving the peer indefinitely divergent.
-			d.sessionSync.OnPeerConnected = func() {
+			ss.OnPeerConnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer connected")
 				d.onSessionSyncPeerConnected()
 				// #2239 Q7: a peer that just (re)connected (e.g. a restarted
@@ -809,18 +926,18 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				d.reconcileConfigSyncToPeer("peer-connect")
 			}
 
-			d.sessionSync.OnBulkSyncReceived = func() {
+			ss.OnBulkSyncReceived = func() {
 				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync completed")
 				slog.Info("cluster: session sync complete, releasing VRRP hold")
 				d.onSessionSyncBulkReceived()
 			}
 
-			d.sessionSync.OnBulkSyncAckReceived = func() {
+			ss.OnBulkSyncAckReceived = func() {
 				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync acknowledged by peer")
 				d.onSessionSyncBulkAckReceived()
 			}
 
-			d.sessionSync.OnForwardSessionInstalled = func() {
+			ss.OnForwardSessionInstalled = func() {
 				d.scheduleStandbyNeighborRefresh()
 			}
 
@@ -837,7 +954,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// (eliminating the BulkSync mirror-map drift residual) is tracked as
 			// a follow-up.
 
-			d.sessionSync.OnPeerDisconnected = func() {
+			ss.OnPeerDisconnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer disconnected (all fabrics)")
 				d.onSessionSyncPeerDisconnected()
 			}
@@ -849,7 +966,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// already transitioned to secondary — blindly calling
 			// ManualFailover would cause dual-resign (both nodes secondary)
 			// and a 30-second traffic blackhole.
-			d.sessionSync.OnRemoteFailover = func(rgID int) error {
+			ss.OnRemoteFailover = func(rgID int) error {
 				if !d.cluster.IsLocalPrimary(rgID) {
 					return fmt.Errorf("%w: redundancy group %d", cluster.ErrRemoteFailoverRejected, rgID)
 				}
@@ -866,7 +983,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				}
 				return nil
 			}
-			d.sessionSync.OnRemoteFailoverBatch = func(rgIDs []int) error {
+			ss.OnRemoteFailoverBatch = func(rgIDs []int) error {
 				for _, rgID := range rgIDs {
 					if !d.cluster.IsLocalPrimary(rgID) {
 						return fmt.Errorf("%w: redundancy group %d", cluster.ErrRemoteFailoverRejected, rgID)
@@ -887,25 +1004,25 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				}
 				return nil
 			}
-			d.sessionSync.OnRemoteFailoverCommit = func(rgID int) error {
+			ss.OnRemoteFailoverCommit = func(rgID int) error {
 				return d.cluster.FinalizePeerTransferOut(rgID)
 			}
-			d.sessionSync.OnRemoteFailoverCommitBatch = func(rgIDs []int) error {
+			ss.OnRemoteFailoverCommitBatch = func(rgIDs []int) error {
 				return d.cluster.FinalizePeerTransferOutBatch(rgIDs)
 			}
 			// #5640: gate the transfer-out applied-ack on the local demotion
 			// actually being actuated (VRRP resigned / rg_active cleared),
 			// closing the two-owner window where the peer promoted off an ack
 			// sent before this node had resigned.
-			d.sessionSync.WaitFailoverApplied = d.waitFailoverActuated
-			d.sessionSync.WaitFailoverAppliedBatch = d.waitFailoverActuatedBatch
+			ss.WaitFailoverApplied = d.waitFailoverActuated
+			ss.WaitFailoverAppliedBatch = d.waitFailoverActuatedBatch
 
 			// Wire peer failover sender so cluster Manager can send remote
 			// failover requests via the fabric sync connection.
-			d.cluster.SetPeerFailoverFunc(d.sessionSync.SendFailover)
-			d.cluster.SetPeerFailoverCommitFunc(d.sessionSync.SendFailoverCommit)
-			d.cluster.SetPeerFailoverBatchFunc(d.sessionSync.SendFailoverBatch)
-			d.cluster.SetPeerFailoverCommitBatchFunc(d.sessionSync.SendFailoverCommitBatch)
+			d.cluster.SetPeerFailoverFunc(ss.SendFailover)
+			d.cluster.SetPeerFailoverCommitFunc(ss.SendFailoverCommit)
+			d.cluster.SetPeerFailoverBatchFunc(ss.SendFailoverBatch)
+			d.cluster.SetPeerFailoverCommitBatchFunc(ss.SendFailoverCommitBatch)
 			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceManualFailover)
 			d.cluster.SetLocalTransferCommitReadyHook(d.waitLocalFailoverCommitReady)
 			d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
@@ -915,12 +1032,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// traffic so a >500ms restart does not fire a false
 			// peer-timeout/fence on the peer. Bounded by the peer's
 			// 5s continuous-suppression cap.
-			d.cluster.SetHeartbeatRestartNotifyFunc(d.sessionSync.SendLivenessKeepalive)
+			d.cluster.SetHeartbeatRestartNotifyFunc(ss.SendLivenessKeepalive)
 
 			// Wire peer fencing: on heartbeat timeout, cluster sends
 			// fence via sync; on receive, disable all local RGs.
-			d.cluster.SetPeerFenceFunc(d.sessionSync.SendFence)
-			d.sessionSync.OnFenceReceived = func() {
+			d.cluster.SetPeerFenceFunc(ss.SendFence)
+			ss.OnFenceReceived = func() {
 				slog.Warn("cluster: fence received from peer")
 				// #3917: fence the CURRENT redundancy-group set, not the
 				// `cfg` snapshot captured in this closure at
@@ -935,7 +1052,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				d.fenceAllRedundancyGroups(commsCtx)
 			}
 
-			d.sessionSync.SetVRFDevice(vrfDevice)
+			ss.SetVRFDevice(vrfDevice)
 			var streamProvider userspaceEventStreamProvider
 			streamCallbacksWired := false
 			if d.dp != nil {
@@ -959,7 +1076,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Retry sync start: the VRF device and address binding may not
 			// be ready during daemon startup (networkd race).
 			for i := 0; i < 30; i++ {
-				if err := d.sessionSync.Start(commsCtx); err != nil {
+				if err := ss.Start(commsCtx); err != nil {
 					if i < 5 {
 						slog.Info("cluster: sync bind not ready, retrying",
 							"err", err, "attempt", i+1)
@@ -978,22 +1095,22 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					"local", syncLocal, "peer", syncPeer, "vrf", vrfDevice)
 
 				// Wire dataplane into session sync and start the sweep.
-				// Must happen here (not in Run) because d.sessionSync is
-				// created asynchronously in this goroutine. d.dp is a
-				// dataplane.RuntimeDataPlane; both the legacy *Manager and
+				// Must happen here (not in Run) because the session-sync
+				// object `ss` is created asynchronously in this goroutine. d.dp
+				// is a dataplane.RuntimeDataPlane; both the legacy *Manager and
 				// the userspace LegacyDataPlaneAdapter implement
 				// Sessions()/Telemetry() so they satisfy the cluster
 				// package's narrow clusterRuntime contract directly
 				// (#1518).
 				if d.dp != nil {
-					d.sessionSync.SetRuntime(d.dp)
-					d.sessionSync.IsPrimaryFn = func() bool {
+					ss.SetRuntime(d.dp)
+					ss.IsPrimaryFn = func() bool {
 						return d.cluster != nil && d.cluster.IsLocalPrimary(0)
 					}
-					d.sessionSync.IsPrimaryForRGFn = func(rgID int) bool {
+					ss.IsPrimaryForRGFn = func(rgID int) bool {
 						return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
 					}
-					d.sessionSync.StartSyncSweep(commsCtx)
+					ss.StartSyncSweep(commsCtx)
 					if streamCallbacksWired {
 						go d.eventStreamFallbackLoop(commsCtx, streamProvider)
 					} else {
@@ -1031,9 +1148,18 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// updates (#124). Each fabric owns its own channel so a
 			// single netlink-triggered refresh wakes both the fab0 and
 			// fab1 loops rather than only whichever won a shared-channel
-			// receive (#4038).
-			d.fabricRefreshCh = make(chan struct{}, 1)
-			d.fabricRefreshCh1 = make(chan struct{}, 1)
+			// receive (#4038). #4958: build them locally, hand each loop its
+			// OWN channel by value, and publish the shared fields only if this
+			// epoch is still current — so a superseded constructor neither
+			// replaces a newer epoch's channels nor lets its loops receive on
+			// a stale field. The loops read the value they were launched with,
+			// never d.fabricRefreshCh, so the sender-side field swap on restart
+			// cannot race them.
+			fabRefreshCh := make(chan struct{}, 1)
+			fabRefreshCh1 := make(chan struct{}, 1)
+			if !d.publishFabricRefreshChansIfCurrent(commsGen, fabRefreshCh, fabRefreshCh1) {
+				return
+			}
 
 			// Populate fabric_fwd BPF map for cross-chassis redirect,
 			// then periodically refresh to correct neighbor drift.
@@ -1045,7 +1171,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			if fabOverlay == fabParent {
 				fabOverlay = "" // no overlay — legacy mode
 			}
-			go d.populateFabricFwd(commsCtx, fabParent, fabOverlay, cc.FabricPeerAddress)
+			go d.populateFabricFwd(commsCtx, fabParent, fabOverlay, cc.FabricPeerAddress, fabRefreshCh)
 
 			// Populate secondary fabric_fwd entry (key=1) if fab1 configured.
 			if cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
@@ -1054,7 +1180,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				if fab1Overlay == fab1Parent {
 					fab1Overlay = "" // no overlay
 				}
-				go d.populateFabricFwd1(commsCtx, fab1Parent, fab1Overlay, cc.Fabric1PeerAddress)
+				go d.populateFabricFwd1(commsCtx, fab1Parent, fab1Overlay, cc.Fabric1PeerAddress, fabRefreshCh1)
 			}
 
 			// Monitor fabric link/neighbor state via netlink (#124).
@@ -1181,12 +1307,34 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // restarted with new transport settings (#87). Cancels the comms sub-context
 // (which stops retry loops, fabric_fwd refresh, IPsec SA sync, sync sweep)
 // and explicitly stops heartbeat + session sync listeners/connections.
+//
+// #4958: the teardown is epoch-safe. Under clusterCommsMu it first bumps
+// clusterCommsGen — superseding any in-flight startClusterComms constructor so
+// that constructor's publish is dropped (publishSessionSyncIfCurrent) — and
+// captures/clears the cancel handle and comms context. It then cancels the
+// context and JOINS the constructor goroutine (clusterCommsWG.Wait) so a
+// cancelled-but-still-running constructor finishes (or drops) before the shared
+// session-sync/fabric state is nilled. Only after the join does it clear
+// sessionSync and the fabric refresh channels and Stop() the session sync. The
+// join runs OUTSIDE the lock (the constructor's publish path also takes the
+// lock), so there is no deadlock.
 func (d *Daemon) stopClusterComms() {
-	if d.clusterCommsCancel != nil {
-		d.clusterCommsCancel()
-		d.clusterCommsCancel = nil
-	}
+	d.clusterCommsMu.Lock()
+	d.clusterCommsGen++
+	cancel := d.clusterCommsCancel
+	d.clusterCommsCancel = nil
 	d.clusterCommsCtx = nil
+	d.clusterCommsMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	// Join the constructor goroutine before nilling shared state so its
+	// publish (if it still owned the just-superseded epoch it will drop; if it
+	// published before the generation bump it finishes wiring) cannot race the
+	// teardown below.
+	d.clusterCommsWG.Wait()
+
 	// #4647: the lease-sync loop is scoped to the comms context just
 	// cancelled, so it is already stopping; clear the cancel handle so the
 	// next comms session's connect-time launch starts a fresh loop.
@@ -1194,10 +1342,17 @@ func (d *Daemon) stopClusterComms() {
 	if d.cluster != nil {
 		d.cluster.StopHeartbeat()
 	}
-	if d.sessionSync != nil {
+
+	d.clusterCommsMu.Lock()
+	ss := d.sessionSync
+	d.sessionSync = nil
+	d.fabricRefreshCh = nil
+	d.fabricRefreshCh1 = nil
+	d.clusterCommsMu.Unlock()
+
+	if ss != nil {
 		d.stopSyncReadyTimer()
-		d.sessionSync.Stop()
-		d.sessionSync = nil
+		ss.Stop()
 	}
 }
 
