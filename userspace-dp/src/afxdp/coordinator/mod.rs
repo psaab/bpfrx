@@ -225,11 +225,15 @@ pub struct Coordinator {
     /// and is removed only when the endpoint leaves the desired set.
     pub(crate) wg_control_threads: BTreeMap<u16, WgControlEntry>,
     pub(crate) last_slow_path_status: SlowPathStatus,
-    /// #2408: the last snapshot slow-path MTU we warned about when it differed
-    /// from the live (preserved) reinjector's creation MTU. Rate-limits the
-    /// "TUN MTU won't change until slow-path recreate" warning to once per
-    /// distinct value so a steady-state reconcile loop does not flood.
-    pub(crate) last_slow_path_mtu_warned: i32,
+    /// #2408/#5801/#6097: the last snapshot slow-path MTU the day-2 reconcile
+    /// ATTEMPTED on the live (preserved) reinjector. Since #5801 the reconcile
+    /// reprograms the running TUN via `SIOCSIFMTU` rather than only warning, so
+    /// this records reconcile ATTEMPTS, not warnings (renamed from
+    /// `last_slow_path_mtu_warned`). It dedups the attempt to once per distinct
+    /// desired value so a steady-state reconcile loop — or a persistently
+    /// degraded TUN whose `live_mtu` never converges — does not re-issue the
+    /// ioctl every tick; the next DISTINCT desired value retries.
+    pub(crate) last_slow_path_mtu_reconciled: i32,
     pub(in crate::afxdp) ha: HaState,
     pub(crate) cos: SharedCoSState,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
@@ -332,7 +336,7 @@ impl Coordinator {
             tunnel_sources: BTreeMap::new(),
             wg_control_threads: BTreeMap::new(),
             last_slow_path_status: SlowPathStatus::default(),
-            last_slow_path_mtu_warned: 0,
+            last_slow_path_mtu_reconciled: 0,
             ha: HaState::new(),
             cos: SharedCoSState::new(),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),

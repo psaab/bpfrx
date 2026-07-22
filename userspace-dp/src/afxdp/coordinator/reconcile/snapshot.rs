@@ -409,15 +409,28 @@ fn open_optional_map(
 /// change committed after startup must reprogram the RUNNING TUN — otherwise
 /// the accepted snapshot advertises a jumbo MTU while the live TUN stays at its
 /// startup ceiling and reinjected frames above it drop persistently until xpfd
-/// restart. When `desired_mtu` differs from the reinjector's current MTU this
+/// restart. When `desired_mtu` differs from the reinjector's LIVE MTU this
 /// calls [`SlowPathReinjector::reconcile_mtu`] to reprogram the live device and
 /// converge `mtu()`/`live_mtu`/enqueue admission.
 ///
+/// #6097: the trigger compares `desired_mtu` against `slow_path.status().live_mtu`
+/// — the MTU the TUN is ACTUALLY programmed with — NOT `slow_path.mtu()` (the
+/// creation-desired value). The two diverge after a STARTUP `SIOCSIFMTU` failure:
+/// the worker records `mtu()` at the creation-desired jumbo value (e.g. 9000)
+/// while `live_mtu` falls back to 1500 and `degraded` is set. Comparing against
+/// `mtu()` there would see `desired == mtu()` and SKIP forever, so the transient
+/// startup failure would never self-heal via reconcile (only on a config CHANGE
+/// or an xpfd restart). Comparing against `live_mtu` makes a degraded live TUN
+/// retry the program on the next reconcile whose desired still equals the
+/// creation MTU.
+///
 /// `last_acted` dedups the attempt to once per distinct desired value (as the
-/// old warn-only path did) so a steady-state reconcile loop over an unchanged
-/// snapshot does not re-issue `SIOCSIFMTU` every tick — important when a
-/// program persistently fails (the reinjector's MTU stays at the old value, so
-/// the raw `desired != mtu()` guard alone would retry on every reconcile).
+/// old warn-only path did) so a steady-state reconcile loop does not re-issue
+/// `SIOCSIFMTU` every tick — critical now that the trigger reads `live_mtu`:
+/// when a program PERSISTENTLY fails, `live_mtu` never converges to `desired`,
+/// so the `desired != live_mtu` guard alone would retry on every reconcile. The
+/// `desired == *last_acted` short-circuit is what bounds a degraded interface to
+/// one attempt per distinct desired value; the next DISTINCT desired retries.
 /// `programmer` is the `SIOCSIFMTU` seam (`set_if_mtu` in production; injectable
 /// in tests). Returns true when a reprogram was attempted this call.
 pub(super) fn reconcile_preserved_slow_path_mtu(
@@ -426,7 +439,7 @@ pub(super) fn reconcile_preserved_slow_path_mtu(
     last_acted: &mut i32,
     programmer: impl FnOnce(&str, i32) -> Result<(), String>,
 ) -> bool {
-    if desired_mtu == slow_path.mtu() || desired_mtu == *last_acted {
+    if desired_mtu == slow_path.status().live_mtu || desired_mtu == *last_acted {
         return false;
     }
     let live = slow_path.reconcile_mtu(desired_mtu, programmer);
@@ -445,6 +458,14 @@ pub(super) fn reconcile_preserved_slow_path_mtu(
     true
 }
 
+/// `mtu_programmer` is the `SIOCSIFMTU` seam used by the day-2 preserved-TUN MTU
+/// reconcile (#5801). Production passes `crate::slowpath::set_if_mtu`; the #6097
+/// wiring test injects a deterministic closure so it can assert the preserved
+/// reinjector actually reprograms on an MTU delta (a real ioctl is
+/// privilege-gated and non-deterministic under `cargo test`). Elevating the
+/// previously-hardcoded seam to a parameter is what lets a thin harness bind the
+/// `apply_snapshot` CALL SITE — reverting the seam call to the old warn-only
+/// block turns that test red.
 pub(super) fn apply_snapshot(
     coord: &mut Coordinator,
     snapshot: &ConfigSnapshot,
@@ -453,6 +474,7 @@ pub(super) fn apply_snapshot(
     snapshot_was_installed: bool,
     preserved_synced_sessions: &mut Vec<SyncedSessionEntry>,
     fds: ReconcileSnapshotFds,
+    mtu_programmer: impl FnOnce(&str, i32) -> Result<(), String>,
 ) -> Option<ReconcileSnapshotFds> {
     // #2484: the forwarding state was already built in the pre-teardown
     // preflight (`build_reconcile_forwarding`) and stashed on
@@ -533,8 +555,8 @@ pub(super) fn apply_snapshot(
         reconcile_preserved_slow_path_mtu(
             &slow_path,
             snapshot.slow_path_mtu(),
-            &mut coord.last_slow_path_mtu_warned,
-            crate::slowpath::set_if_mtu,
+            &mut coord.last_slow_path_mtu_reconciled,
+            mtu_programmer,
         );
         coord.last_slow_path_status = slow_path.status();
         Some(slow_path)
@@ -573,8 +595,17 @@ pub(super) fn apply_snapshot(
 
 #[cfg(test)]
 mod slow_path_mtu_tests {
-    use super::reconcile_preserved_slow_path_mtu;
+    use super::*;
+    use crate::protocol::snapshot::{ConfigSnapshot, InterfaceSnapshot};
     use crate::slowpath::SlowPathReinjector;
+
+    /// A device name ≥ `IFNAMSIZ` (16) so the reinjector worker's `open_tun`
+    /// fails at `IfReq::new` BEFORE any TUN/ioctl syscall and early-returns
+    /// WITHOUT writing `live_mtu`/`degraded`. That makes the reinjector's MTU
+    /// state driven solely by `force_mtu_state_for_test` / `reconcile_mtu` on the
+    /// test thread — no privilege dependence and no race with a worker that (as
+    /// root) would otherwise program the real device and clobber the fixture.
+    const OVERSIZE_TUN_NAME: &str = "xpf-usp-6097-oversize-name";
 
     /// #5801 fail-on-revert (WIRING): a day-2 snapshot MTU increase over a
     /// PRESERVED reinjector must reprogram the live TUN through
@@ -622,5 +653,174 @@ mod slow_path_mtu_tests {
                 panic!("must not reprogram when the desired MTU is unchanged");
             });
         assert!(!acted_again, "an unchanged MTU must not reconcile again");
+    }
+
+    /// #6097 fail-on-revert (item 1, SELF-HEAL): a reinjector left DEGRADED by a
+    /// STARTUP `SIOCSIFMTU` failure — `mtu()` at the creation jumbo value (9000)
+    /// while the live TUN is stuck at 1500 — must self-heal on the next day-2
+    /// reconcile whose desired STILL equals the creation MTU. The trigger
+    /// therefore has to compare `desired` against `status().live_mtu` (1500), NOT
+    /// `mtu()` (9000): the old `desired == mtu()` guard would short-circuit
+    /// forever and the transient startup failure would never retry via reconcile.
+    /// A succeeding programmer is injected (no privileged ioctl). Reverting the
+    /// trigger to `slow_path.mtu()` makes `desired == mtu()` skip and the heal
+    /// assertions below go red.
+    #[test]
+    fn startup_degraded_tun_self_heals_on_reconcile() {
+        let reinjector =
+            SlowPathReinjector::new(OVERSIZE_TUN_NAME, 9000).expect("construct reinjector");
+        // Reproduce the startup-SIOCSIFMTU-failure divergence deterministically:
+        // mtu() records the creation-desired 9000, but the live TUN fell back to
+        // 1500 and the path is degraded. (A real worker only reaches this via a
+        // failing ioctl, which needs CAP_NET_ADMIN to provoke.)
+        reinjector.force_mtu_state_for_test(9000, 1500, true);
+        assert_eq!(reinjector.mtu(), 9000, "mtu() holds the creation-desired jumbo value");
+        assert_eq!(
+            reinjector.status().live_mtu,
+            1500,
+            "but the live TUN is stuck at the 1500 startup fallback"
+        );
+
+        let mut last_acted = 0i32;
+        // Desired STILL equals the creation MTU (9000) — the config did not change,
+        // this is a plain day-2 reconcile. The trigger must fire off live_mtu.
+        let acted =
+            reconcile_preserved_slow_path_mtu(&reinjector, 9000, &mut last_acted, |_n, _m| Ok(()));
+        assert!(acted, "a degraded live TUN must retry the program on reconcile");
+        assert_eq!(reinjector.status().live_mtu, 9000, "the live TUN heals to 9000");
+        assert!(!reinjector.status().degraded, "a successful heal clears degraded");
+        assert_eq!(last_acted, 9000, "the attempted value is recorded for dedup");
+
+        // Converged: a steady-state reconcile at the same desired must NOT re-issue
+        // the ioctl (now `desired == live_mtu` short-circuits).
+        let again =
+            reconcile_preserved_slow_path_mtu(&reinjector, 9000, &mut last_acted, |_n, _m| {
+                panic!("must not reprogram once live_mtu has converged");
+            });
+        assert!(!again, "a converged live TUN must not reconcile again");
+    }
+
+    /// #6097 (item 1, DEDUP): with the `live_mtu` trigger a PERSISTENTLY failing
+    /// program must still be deduped to ONE attempt per distinct desired value —
+    /// otherwise a degraded TUN whose `live_mtu` never converges to `desired`
+    /// would re-issue `SIOCSIFMTU` on every reconcile tick (an ioctl storm). The
+    /// `last_acted` guard is what bounds it; this proves the dedup survives the
+    /// item-1 trigger change from `mtu()` to `live_mtu`.
+    #[test]
+    fn persistently_degraded_tun_is_deduped_no_ioctl_storm() {
+        let reinjector =
+            SlowPathReinjector::new(OVERSIZE_TUN_NAME, 9000).expect("construct reinjector");
+        reinjector.force_mtu_state_for_test(9000, 1500, true);
+
+        let mut last_acted = 0i32;
+        // First reconcile at desired 9000: the program FAILS, so live_mtu stays
+        // 1500 and degraded stays set (reprogram_mtu_status keeps the live MTU on
+        // failure). The attempt is recorded in last_acted.
+        let acted =
+            reconcile_preserved_slow_path_mtu(&reinjector, 9000, &mut last_acted, |_n, _m| {
+                Err("SIOCSIFMTU: simulated persistent failure".to_string())
+            });
+        assert!(acted, "the first attempt at a distinct desired value runs");
+        assert_eq!(
+            reinjector.status().live_mtu,
+            1500,
+            "a failed program keeps the live MTU (never converges)"
+        );
+        assert!(reinjector.status().degraded, "a failed program stays degraded");
+        assert_eq!(last_acted, 9000, "the attempted value is recorded");
+
+        // Second reconcile at the SAME desired: live_mtu is still 1500 (!= 9000),
+        // so ONLY the `desired == last_acted` guard prevents a re-attempt. The
+        // programmer panics if invoked — proving no per-tick ioctl storm.
+        let again =
+            reconcile_preserved_slow_path_mtu(&reinjector, 9000, &mut last_acted, |_n, _m| {
+                panic!("must not re-issue SIOCSIFMTU for an unchanged desired value");
+            });
+        assert!(!again, "a persistently degraded TUN is deduped by last_acted");
+    }
+
+    /// #6097 fail-on-revert (item 2, WIRING — primary deliverable): drive the
+    /// ACTUAL `apply_snapshot` CALL SITE and assert it reprograms a PRESERVED
+    /// reinjector on a day-2 MTU delta. `reconcile_preserved_slow_path_mtu` is
+    /// unit-tested above, but reverting `apply_snapshot`'s CALL of it back to the
+    /// old warn-only block turned no test red — this binds that call. A
+    /// succeeding programmer is injected through the `apply_snapshot` seam so the
+    /// reprogram is deterministic without a privileged `SIOCSIFMTU`. The hard
+    /// gate is `mtu()`, which only `reconcile_mtu` writes (the worker never
+    /// touches it) — so it goes red iff the seam call is removed/neutralized,
+    /// independent of the worker thread.
+    #[test]
+    fn apply_snapshot_wires_day2_preserved_mtu_reconcile() {
+        let mut coord = Coordinator::new();
+        // Oversize name so the preserved reinjector's worker cannot program the
+        // real device and race the assertions; its live_mtu stays at the 1500
+        // default until reconcile moves it.
+        let preserved = Arc::new(
+            SlowPathReinjector::new(OVERSIZE_TUN_NAME, 1500).expect("construct reinjector"),
+        );
+        assert_eq!(preserved.mtu(), 1500, "preserved reinjector starts at 1500");
+
+        // A snapshot whose largest interface MTU is 9000 -> slow_path_mtu() == 9000.
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                mtu: 9000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot.slow_path_mtu(),
+            9000,
+            "snapshot desires a 9000 slow-path MTU"
+        );
+
+        // apply_snapshot only threads these FDs through to the bring-up phase; a
+        // dummy fd (-1) never names a real map and Drop's close(-1) is a harmless
+        // EBADF no-op.
+        let fds = ReconcileSnapshotFds {
+            map_fd: OwnedFd { fd: -1 },
+            heartbeat_map_fd: OwnedFd { fd: -1 },
+            session_map_fd: OwnedFd { fd: -1 },
+            conntrack_v4_fd: None,
+            conntrack_v6_fd: None,
+            dnat_table_fd: None,
+            dnat_table_v6_fd: None,
+            dnat_fds: DnatTableFds::default(),
+            forwarding: ForwardingState::default(),
+        };
+
+        let out = apply_snapshot(
+            &mut coord,
+            &snapshot,
+            Some(preserved.clone()),
+            &[],
+            true,
+            &mut Vec::new(),
+            fds,
+            // Injected succeeding SIOCSIFMTU seam (a real ioctl is privilege-gated
+            // and non-deterministic under `cargo test`).
+            |_name, _mtu| Ok(()),
+        );
+        assert!(out.is_some(), "apply_snapshot returns the secured fds");
+
+        let sp = coord
+            .slow_path
+            .as_ref()
+            .expect("apply_snapshot preserved the reinjector");
+        assert_eq!(
+            sp.mtu(),
+            9000,
+            "apply_snapshot must reprogram the preserved live TUN to 9000 on the \
+             MTU delta (warn-only revert leaves it at 1500)"
+        );
+        assert_eq!(sp.status().live_mtu, 9000, "enqueue-admission live_mtu converged");
+        assert_eq!(
+            coord.last_slow_path_status.live_mtu, 9000,
+            "the published status snapshot reflects the reconciled MTU"
+        );
+        assert_eq!(
+            coord.last_slow_path_mtu_reconciled, 9000,
+            "the dedup field records the reconcile attempt"
+        );
     }
 }

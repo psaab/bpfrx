@@ -371,8 +371,31 @@ impl SlowPathReinjector {
     /// The MTU the live slow-path TUN is currently programmed with. Equals the
     /// creation MTU (#2408) until a day-2 [`Self::reconcile_mtu`] reprograms it
     /// (#5801).
+    ///
+    /// #6097: the day-2 reconcile TRIGGER no longer reads this — it compares the
+    /// desired MTU against `status().live_mtu` (the value the TUN is actually
+    /// programmed with) so a startup-`SIOCSIFMTU`-failure divergence self-heals.
+    /// `mtu()` is retained as the reinjector's "installed MTU" accessor (updated
+    /// by `reconcile_mtu`) and is exercised by the #5801/#6097 tests, so it is
+    /// no longer read on the production path; keep it compiled without warning.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn mtu(&self) -> i32 {
         self.mtu.load(Ordering::Relaxed) as i32
+    }
+
+    /// Test-only seam: force the reinjector into a specific
+    /// `(mtu(), live_mtu, degraded)` triple so a test can reproduce the
+    /// STARTUP-`SIOCSIFMTU`-failure divergence (#6097) — `mtu()` at the
+    /// creation-desired value (e.g. 9000) while the live TUN is stuck at the
+    /// 1500 kernel default and the path is marked `degraded`. That state is
+    /// otherwise reachable only by a real ioctl failure inside the worker
+    /// thread, which needs CAP_NET_ADMIN to provoke deterministically. Compiled
+    /// out of release builds.
+    #[cfg(test)]
+    pub(crate) fn force_mtu_state_for_test(&self, mtu: i32, live_mtu: i32, degraded: bool) {
+        self.mtu.store(mtu as i64, Ordering::Relaxed);
+        self.status.live_mtu.store(live_mtu as i64, Ordering::Relaxed);
+        self.status.degraded.store(degraded, Ordering::Relaxed);
     }
 
     /// Reprogram the live slow-path TUN to `desired_mtu` on a day-2 config MTU

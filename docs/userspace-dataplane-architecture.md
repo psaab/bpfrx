@@ -1061,20 +1061,40 @@ A TUN device (`xpf-usp0`) for packets that need kernel processing:
     above the old ceiling drop persistently (`MtuExceeded`) until restart.
     The reconcile path now CONVERGES the live TUN instead of only warning:
     when `snapshot.slow_path_mtu()` differs from the preserved reinjector's
-    current `mtu()`, `apply_snapshot` calls
-    `reconcile_preserved_slow_path_mtu`, which invokes
-    `SlowPathReinjector::reconcile_mtu` to reprogram the live device via
-    `SIOCSIFMTU` and update the reinjector's `mtu()`, `live_mtu`, and enqueue
-    admission together. First-boot jumbo configs remain covered by the
-    creation branch. The reconcile is deduped per distinct desired value
-    (`last_slow_path_mtu_warned`) so a steady-state reconcile loop over an
-    unchanged snapshot does not re-issue the ioctl every tick. A failed
-    `SIOCSIFMTU` on reconcile is non-fatal and, unlike the creation path,
-    KEEPS the current live MTU (`SharedStatus::reprogram_mtu_status`; the
-    running TUN retains whatever it was last programmed with rather than
-    resetting to 1500), marks the path DEGRADED, records the error, and lets
-    the next distinct desired value retry — so `mtu()`, `live_mtu`, degraded
-    state, and admission stay in agreement after every reconcile.
+    live MTU, `apply_snapshot` calls `reconcile_preserved_slow_path_mtu`,
+    which invokes `SlowPathReinjector::reconcile_mtu` to reprogram the live
+    device via `SIOCSIFMTU` and update the reinjector's `mtu()`, `live_mtu`,
+    and enqueue admission together. First-boot jumbo configs remain covered by
+    the creation branch. The `SIOCSIFMTU` seam is injected into
+    `apply_snapshot` (production passes `set_if_mtu`) so the wiring — that the
+    apply CALL SITE actually reprograms a preserved reinjector on an MTU delta
+    — is unit-testable without a privileged ioctl (#6097).
+    - **Trigger compares `live_mtu`, not `mtu()` (#6097):** the reconcile fires
+      on `desired_mtu != slow_path.status().live_mtu`, i.e. against the MTU the
+      TUN is ACTUALLY programmed with. Using `mtu()` (the creation-desired
+      value) instead would miss a STARTUP-`SIOCSIFMTU`-failure state, where the
+      worker records `mtu()` at the creation jumbo value (e.g. 9000) while
+      `live_mtu` fell back to 1500 and `degraded` is set: a day-2 reconcile
+      whose desired still equals the creation MTU would then see
+      `desired == mtu()` and SKIP forever, so a transient startup failure would
+      never self-heal via reconcile (only on a config CHANGE or an xpfd
+      restart). Comparing against `live_mtu` makes such a degraded live TUN
+      retry the program on the next reconcile.
+    - **Dedup / no ioctl storm:** the reconcile is deduped per distinct desired
+      value (`last_slow_path_mtu_reconciled`; renamed from
+      `last_slow_path_mtu_warned` since it now records reconcile ATTEMPTS, not
+      warnings) so a steady-state reconcile loop over an unchanged snapshot does
+      not re-issue the ioctl every tick. This dedup is what bounds the
+      `live_mtu` trigger: when a program PERSISTENTLY fails, `live_mtu` never
+      converges to `desired`, so the `desired != live_mtu` guard alone would
+      retry every reconcile — the `desired == last_slow_path_mtu_reconciled`
+      short-circuit holds the attempt to once per distinct desired value; the
+      next DISTINCT desired retries. A failed `SIOCSIFMTU` on reconcile is
+      non-fatal and, unlike the creation path, KEEPS the current live MTU
+      (`SharedStatus::reprogram_mtu_status`; the running TUN retains whatever it
+      was last programmed with rather than resetting to 1500), marks the path
+      DEGRADED, and records the error — so `mtu()`, `live_mtu`, degraded state,
+      and admission stay in agreement after every reconcile.
 - **Reverse-path filter (#2378):** reinjected IPv4 replies arrive on the
   TUN but their reverse route still points at the real egress interface,
   so `open_tun` writes `conf/<dev>/rp_filter=0`. The kernel, however, uses
