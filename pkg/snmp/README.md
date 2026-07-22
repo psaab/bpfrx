@@ -428,6 +428,13 @@ double-count when summing the class columns.
 
 ## ASN.1 specifics
 
+The BER wire codec — every `berEncode*` / `berDecode*` helper, the OID
+comparison helpers (`oidHasPrefix`, `oidEqual`, `oidCompare`), and
+`decodePDUFields` — lives in `agent_ber.go` (#5661 code-motion split of
+the over-threshold `agent.go`). They are pure, `Agent`-independent
+package-level functions; `agent.go` retains the agent state machine,
+packet handlers, and MIB view that call into them.
+
 - Tag constants used: Counter32 (0x41), Gauge32 (0x42), TimeTicks (0x43),
   Counter64 (0x46).
 - **Unsigned application integers prepend a leading `0x00` when the top content

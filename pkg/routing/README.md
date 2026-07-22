@@ -25,7 +25,10 @@ which makes each domain unit-testable with a fake (see `rules_test.go`'s
 | `vrf.go` | `vrfManager` | VRF lifecycle + `BindInterfaceToVRF`; own `mu` + tracked set |
 | `routes.go` | `routeReader` | kernel routing-table reads (`routeLister`) |
 | `routeformat.go` | free fns | Junos `show route` formatters |
-| `tunnel.go` | `tunnelManager` | GRE/IPIP tunnels + keepalive goroutines; own `mu` |
+| `tunnel.go` | `tunnelManager` | GRE/IPIP + AnchorOnly TUN reconcile, VRF-claim, address, `Clear`/`GetStatus`; own `mu`. WireGuard and the keepalive runner are split into siblings below (#5661) |
+| `tunnel_wireguard.go` | (part of `tunnelManager`) | WireGuard persistent-TUN lifecycle: `applyWireguardTunLocked`, inner-MTU cap (`wgTunMTUForEndpoint`, WG overhead consts), `errWGIncompatibleLinkRetained` sentinel, `closeTuntapFiles` |
+| `tunnel_keepalive.go` | free fns | keepalive **prober** primitives (#1918): `tunnelProber`/`icmpProber`, `ProbeResult`, `UnsupportedKind`, ICMP-echo probe + errno classification |
+| `tunnel_keepalive_runner.go` | (part of `tunnelManager`) | keepalive **runner** half (#5661): `KeepaliveState`/`keepaliveRunner`, `startKeepalive`/`stopAll`, `keepaliveLoop`/`keepaliveTick`, `GetKeepaliveState` |
 | `xfrm.go` | `xfrmManager` | XFRM/IPsec interface lifecycle; own `mu` + tracked `name→if_id` set. `Apply` reconciles **differentially** against the tracked set (keep unchanged / create new / delete removed / recreate on `if_id` change) — it does NOT clear-all-then-rebuild, so an unrelated config commit leaves active xfrmi interfaces untouched (#2546). Refuses to create either of two distinct devices that derive the same `if_id` — fail-closed collision guard (#2909) |
 | `rules.go` | `nextTableManager` / `ribGroupManager` / `pbrManager` | policy-routing ip-rule reconcilers (`ruleOps`, stateless) |
 | `probe_pin.go` | `probePinManager` | RPM probe next-hop pin reconciler (#1827): fwmark rules in band 50-99 + pinned host routes in reserved tables 7000-7049 (`probePinOps`, stateless). `Apply` returns per-test install failures (keyed by TestKey) and rolls back the fwmark rule when the pinned route fails (best-effort — a failed rollback is swept by the next band clear; the pin reports failed either way); callers thread the failed map into `pkg/rpm` so affected tests hold state instead of probing unpinned (#1895) |
@@ -202,7 +205,7 @@ delegate to the owning domain. Exported types:
 
 - `Manager` — `routing.go` (façade).
 - `VRFSpec` — `vrf.go`.
-- `KeepaliveState` — `tunnel.go`. Per-tunnel probe status.
+- `KeepaliveState` — `tunnel_keepalive_runner.go`. Per-tunnel probe status.
 - `TunnelStatus` — `tunnel.go`.
 - `RouteEntry`, `NextHop`, `TableRoutes` — `routes.go`. `RouteEntry.NextHops`
   lists every leg of a kernel ECMP route (see "Multipath / ECMP routes" below).

@@ -56568,3 +56568,20 @@ top.
   pkg/dataplane/userspace/protocol_events.go,
   pkg/dataplane/retirement_boundary_canary_test.go,
   docs/userspace-dataplane-architecture.md, docs/config-schema.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5661 (Go control-plane modularity cohort) — pure
+  code-motion split of the two over-threshold low-risk files. On current
+  origin/master the four candidate low-risk files measure: rules.go 1534,
+  tunnel.go 2048, agent.go 2143, cli_show_flow.go 1272 prod LOC. Only
+  tunnel.go and agent.go exceed the ~2000-prod-LOC threshold, so only
+  those two were split (rules.go and cli_show_flow.go left untouched).
+  tunnel.go 2048 -> 1362: WireGuard TUN lifecycle to
+  tunnel_wireguard.go, keepalive runner to tunnel_keepalive_runner.go.
+  agent.go 2143 -> 1737: ASN.1 BER codec + OID helpers to agent_ber.go.
+  Byte-identical moves, no renames, no logic change; go build ./... +
+  go test ./pkg/routing/... ./pkg/snmp/... green, gofmt clean. HA files
+  (daemon/vrrp/cluster) explicitly NOT touched — tracked separately.
+- **File(s)**: pkg/routing/tunnel.go, pkg/routing/tunnel_wireguard.go,
+  pkg/routing/tunnel_keepalive_runner.go, pkg/snmp/agent.go,
+  pkg/snmp/agent_ber.go, pkg/routing/README.md, pkg/snmp/README.md
