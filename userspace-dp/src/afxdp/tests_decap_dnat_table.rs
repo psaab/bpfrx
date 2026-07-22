@@ -260,10 +260,16 @@ fn replay_filter_drops_purged_forward_and_derived_reverse_companion() {
 ///     forward key and differs ONLY in src_port MUST survive — a
 ///     projection keyed on anything less than the whole SessionKey would
 ///     wrongly drop it;
-///   * every purged forward's derived reverse companion is dropped, and a
+///   * a derived reverse companion entry (present in the fixture with
+///     tunnel-id 0, so NOT purged on its own) is swept because its parent
+///     forward's purge inserts the derived reverse key, and a
 ///     reverse-marked purged entry drops standalone (asymmetry preserved).
-/// FAIL-ON-REVERT: if the retain over-drops (survivor collides in a lossy
-/// index) or reorders, the ordered-survivor assertion fails.
+/// INVARIANT PIN (not a diff-revert failure — Vec<->HashSet is
+/// behavior-identical, so reverting THIS commit leaves the test green): a
+/// lossy membership projection that collapses distinct keys, or a retain
+/// that reorders, fails the ordered-survivor assertion. Validated against
+/// the real optimization by manual fail-injection into the retain
+/// predicate (see _Log.md), which goes RED here.
 #[test]
 fn replay_filter_preserves_order_and_survivors_across_many_drops() {
     use crate::afxdp::coordinator::filter_replayed_synced_sessions;
@@ -322,11 +328,17 @@ fn replay_filter_preserves_order_and_survivors_across_many_drops() {
     };
 
     // Purge ids 100..=131 (a large drop set). Build many purged forward
-    // entries whose derived reverse companions must also drop, interleaved
-    // with survivors. One survivor (`survivor_shares_ip`) shares every
-    // field of a purged forward except src_port — a lossy index would
-    // wrongly sweep it.
+    // entries interleaved with survivors. One survivor (`survivor_shares_ip`)
+    // shares every field of a purged forward except src_port — a lossy index
+    // would wrongly sweep it. A derived reverse companion entry (below) that
+    // is NOT itself purged must still drop, swept by its forward's purge.
     let purge_ids: Vec<u16> = (100u16..=131).collect();
+    // The derived reverse companion of the FIRST purged forward
+    // (src_port 40000). It carries tunnel-id 0, so it is never purged on its
+    // own — it must drop ONLY because the forward's purge inserts this
+    // reverse key into the drop set (the companion-derivation semantic the
+    // sibling test pins at unit scale; here it must hold amid many drops).
+    let derived_companion = crate::session::reverse_session_key(&key_at(40000), nat);
     let survivor_shares_ip = key_at(20000); // distinct src_port, not purged
     let survivor_other = SessionKey {
         src_port: 30000,
@@ -346,6 +358,12 @@ fn replay_filter_preserves_order_and_survivors_across_many_drops() {
         // reverse companion is unique too.
         let fk = key_at(40000 + i as u16);
         entries.push(make(&fk, tunnel_resolution(id), false));
+        // Interleave the derived reverse companion of the first purged
+        // forward early. tunnel-id 0 → not purged on its own; it must drop
+        // solely via the forward's inserted reverse key. NOT a survivor.
+        if i == 1 {
+            entries.push(make(&derived_companion, tunnel_resolution(0), true));
+        }
         // Interleave the shared-IP survivor exactly once, mid-stream.
         if i == purge_ids.len() / 2 {
             entries.push(make(&survivor_shares_ip, tunnel_resolution(0), false));
@@ -380,6 +398,13 @@ fn replay_filter_preserves_order_and_survivors_across_many_drops() {
     assert!(
         got.contains(&survivor_shares_ip),
         "survivor sharing src_ip/dst_ip/proto with purged keys must not be swept"
+    );
+    // The derived reverse companion (tunnel-id 0, never purged on its own)
+    // must be swept by its forward's purge — the companion-derivation
+    // semantic, exercised amid many drops.
+    assert!(
+        !got.contains(&derived_companion),
+        "derived reverse companion of a purged forward must be dropped"
     );
 }
 
