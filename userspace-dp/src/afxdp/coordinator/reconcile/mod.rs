@@ -371,6 +371,7 @@ impl Coordinator {
             preserved.snapshot_was_installed,
             &mut preserved.synced_sessions,
             fds,
+            crate::slowpath::set_if_mtu,
         ) else {
             // #2484: defensively unreachable — the build already succeeded
             // in the pre-teardown preflight and apply_snapshot reuses it.

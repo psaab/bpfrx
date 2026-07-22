@@ -55746,6 +55746,43 @@ top.
   userspace-dp/src/afxdp/neighbor_dispatch.rs,
   userspace-dp/src/afxdp/flow_cache.rs,
   userspace-dp/src/filter/README.md, _Log.md
+- **Timestamp**: 2026-07-22
+- **Action**: #6097 — slowpath MTU reconcile hardening (#5801/#6096 follow-up,
+  all in userspace-dp). Three bundled items. (1) Startup-`SIOCSIFMTU`-failure
+  self-heal: `reconcile_preserved_slow_path_mtu` (reconcile/snapshot.rs) now
+  triggers on `desired_mtu != slow_path.status().live_mtu` instead of
+  `slow_path.mtu()`. After a transient startup MTU-program failure the worker
+  records `mtu()` at the creation jumbo value (e.g. 9000) while `live_mtu` fell
+  back to 1500 and `degraded` is set; the old `desired == mtu()` guard then
+  SKIPPED forever, so the failure only self-healed on a config CHANGE or xpfd
+  restart. Comparing against `live_mtu` makes a degraded live TUN retry on the
+  next reconcile. Dedup is preserved: `last_acted` still bounds a PERSISTENTLY
+  failing program to one attempt per distinct desired value (live_mtu never
+  converges, so the guard alone would storm the ioctl). (2) Wiring test (primary
+  deliverable): elevated the hardcoded `set_if_mtu` seam to an injectable
+  `mtu_programmer` param on `apply_snapshot` (one production caller passes
+  `crate::slowpath::set_if_mtu`); new fail-on-revert test
+  `apply_snapshot_wires_day2_preserved_mtu_reconcile` drives the ACTUAL
+  `apply_snapshot` call site with an injected succeeding programmer + dummy FDs
+  and asserts the preserved reinjector reprograms to 9000. Reverting the seam
+  call to warn-only leaves `mtu()` at 1500 → test RED (verified firsthand). (3)
+  Renamed `Coordinator::last_slow_path_mtu_warned` →
+  `last_slow_path_mtu_reconciled` (it records reconcile ATTEMPTS since #5801,
+  not warnings) in decl+doc+refs. Added `#[cfg(test)]`
+  `SlowPathReinjector::force_mtu_state_for_test` to reproduce the startup-failure
+  divergence deterministically, and `#[cfg_attr(not(test), allow(dead_code))]`
+  on `mtu()` (no longer read on the production path after item 1). Two more
+  fail-on-revert tests: `startup_degraded_tun_self_heals_on_reconcile` (RED if
+  the trigger reverts to `mtu()`) and
+  `persistently_degraded_tun_is_deduped_no_ioctl_storm`. Updated
+  docs/userspace-dataplane-architecture.md (Day-2 reconcile section: live_mtu
+  trigger, self-heal, field rename, injected seam). Build green; full cargo
+  suite green (pending confirm); the 4 slow_path_mtu_tests pass.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/slowpath.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
 
 - **Timestamp**: 2026-07-22
 - **Action**: Fix #6279 — wg-interop.sh P1 config commit failed on WireGuard
