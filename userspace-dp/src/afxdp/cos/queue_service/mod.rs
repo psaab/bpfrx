@@ -264,13 +264,17 @@ fn build_nonexact_cos_batch(
     root_ifindex: i32,
     now_ns: u64,
 ) -> Option<CoSBatch> {
+    // #4972: borrow the shared exact-backlog `Arc` from the disjoint
+    // `cos_fast_interfaces` field rather than cloning it per non-exact
+    // batch build. It coexists with the `cos_interfaces` mutable borrow
+    // below — the same borrow-split `queue_fast_path` (a few lines down)
+    // already relies on.
     let shared_exact_backlog = binding
         .cos
         .cos_fast_interfaces
         .get(&root_ifindex)
-        .and_then(|iface_fast| iface_fast.shared_exact_backlog.clone());
+        .and_then(|iface_fast| iface_fast.shared_exact_backlog.as_ref());
     let peer_exact_demand_mask = shared_exact_backlog
-        .as_ref()
         .map(|backlog| backlog.peer_exact_demand_queue_mask(binding.slot))
         .unwrap_or(0);
     // #4265 (R-2): the non-exact guarantee refill now routes through the
@@ -300,7 +304,7 @@ fn build_nonexact_cos_batch(
                 root,
                 now_ns,
                 exact_demand_rate,
-                shared_exact_backlog.as_deref(),
+                shared_exact_backlog.map(|backlog| &**backlog),
             );
             select_cos_surplus_batch_filtered(root, now_ns, true, nonexact_budget)
         })

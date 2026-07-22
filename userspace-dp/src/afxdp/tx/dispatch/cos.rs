@@ -27,13 +27,18 @@ pub(super) fn cos_queue_fast_path_for_request<'a>(
 }
 
 #[inline]
-pub(super) fn cos_owner_live_for_request(
-    cos_fast_interfaces: &FastMap<i32, WorkerCoSInterfaceFastPath>,
+pub(super) fn cos_owner_live_for_request<'a>(
+    cos_fast_interfaces: &'a FastMap<i32, WorkerCoSInterfaceFastPath>,
     egress_ifindex: i32,
     requested_queue_id: Option<u8>,
-) -> Option<Arc<BindingLiveState>> {
+) -> Option<&'a Arc<BindingLiveState>> {
+    // #4972: return a borrow of the map-owned owner `Arc`, not a
+    // per-request clone. Both callers only need a reference — a
+    // pointer-eq (`Arc::ptr_eq`) and `enqueue_tx_owned(&self)` — so an
+    // owned `Arc` was a needless per-eligible-packet refcount bump on a
+    // cross-worker-shared atomic.
     cos_queue_fast_path_for_request(cos_fast_interfaces, egress_ifindex, requested_queue_id)
-        .and_then(|queue_fast| queue_fast.owner_live.clone())
+        .and_then(|queue_fast| queue_fast.owner_live.as_ref())
 }
 
 /// #1598 (secondary fix): does this request target a queue that runs
@@ -123,7 +128,7 @@ pub(super) fn enqueue_local_request_to_target_or_owner(
         req.cos_queue_id,
     );
     if let Some(owner_live) = owner_live {
-        if !Arc::ptr_eq(&owner_live, &target_binding.live) {
+        if !Arc::ptr_eq(owner_live, &target_binding.live) {
             return owner_live.enqueue_tx_owned(req);
         }
     }
