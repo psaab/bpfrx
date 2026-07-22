@@ -16,4 +16,11 @@ fn main() {
     println!("cargo:rustc-link-lib=static=z");
     println!("cargo:rustc-link-lib=static=zstd");
     println!("cargo:rerun-if-changed=csrc/xsk_bridge.c");
+    // #4976: an in-place libxdp header upgrade that reorders/resizes the ring
+    // structs must re-run the C `_Static_assert`s in xsk_bridge.c. Cargo would
+    // otherwise reuse the cached bridge object (the .c file is unchanged) and
+    // silently skip the ABI check on an incremental build — exactly the drift
+    // this gate exists to catch. Track the installed header so a package
+    // upgrade forces a recompile.
+    println!("cargo:rerun-if-changed=/usr/include/xdp/xsk.h");
 }
