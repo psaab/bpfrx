@@ -55990,3 +55990,23 @@ top.
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs,
   userspace-dp/src/afxdp/coordinator/README.md
+
+- **Timestamp**: 2026-07-22 (#5087)
+  **Action**: Apply day-2 `reth-advertise-interval` and `gratuitous-arp-count`
+  changes to running VRRP instances. The `UpdateInstances` no-change gate now
+  compares `AdvertiseInterval` and `GARPCount`, so a commit changing only
+  either field breaks the `continue // No change` shortcut and takes the
+  in-place `updateConfig` arm; `updateConfig` copies both into the running
+  instance's `cfg`. No explicit timer poke is needed — the MASTER advert timer
+  re-arms via `advertTimer.Reset(vi.advertInterval())` on its next fire, the
+  BACKUP master-down horizon re-reads `cfg.AdvertiseInterval` through
+  `masterDownInterval()`, and the next failover's `sendGARP` re-reads
+  `cfg.GARPCount`. Before this fix the stale advert timer / wire value and GARP
+  burst count persisted until an unrelated restart while config reported
+  success. Added fail-on-revert tests
+  `TestUpdateInstances_AdvertiseIntervalOnlyAppliedInPlace` and
+  `TestUpdateInstances_GARPCountOnlyAppliedInPlace` (firsthand-verified RED
+  when either the gate comparison or the updateConfig copy is reverted). Full
+  pkg/vrrp suite green (incl. -race).
+  **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/update_instances_test.go, pkg/vrrp/README.md
