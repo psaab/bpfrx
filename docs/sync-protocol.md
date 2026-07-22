@@ -357,6 +357,49 @@ and therefore cannot host this guard, so no `config_epoch` field is added to
 `TestConfigEpochNoRejectAgainstZeroBaseline5274` in
 `pkg/cluster/sync_config_epoch_5274_test.go`.
 
+## RT_FLOW Session Id (#5212)
+
+Every **session** message carries a length-gated trailing `RTFlowSessionID
+uint64` (LE), appended **after** the #5274 `ConfigEpoch` on BOTH V4 and V6. An
+old decoder stops before it and reads `RTFlowSessionID == 0` (`if off+8 <=
+len(payload)` block in `decodeSession*Payload`); a new decoder reading an old,
+shorter payload also sees 0 — rolling-upgrade safe, no version bump (the same
+additive-trailing-field discipline as #2170/#3301/#4565/#5274).
+
+**Purpose.** The dataplane assigns each session a STABLE id
+(`SessionTable::alloc_session_id`, `(worker_id << 48) | counter`) and stamps it on
+its RT_FLOW SESSION_CREATE/SESSION_CLOSE records (#4915). That id is NODE-LOCAL:
+before #5212 a peer-synced session was assigned a FRESH id on import, so a session
+that opened on the primary and closed on the standby after a failover carried
+DIFFERENT ids on the two nodes and cross-node log/event correlation broke. #5212
+carries the originating node's id across the sync wire so the importing node
+ADOPTS it — the two nodes emit RT_FLOW records for the same session under one id.
+
+**End-to-end path (both sides).** Rust `SessionDelta.session_id` → the
+`MSG_SESSION_OPEN` event-stream frame's trailing `session_id` u64
+(`encode_session_open`) → Go `SessionDeltaInfo.RTFlowSessionID`
+(`decodeSessionEvent`) → `SessionValue{,V6}.RTFlowSessionID`
+(`userspaceSessionFromDelta*`, distinct from the BPF-ABI `SessionID`) → this
+length-gated trailing wire field (`encode/decodeSessionV{4,6}Payload`) → the peer
+Go `SessionSyncRequest.session_id` (`buildSessionSyncRequest*`) → the Rust helper
+`build_synced_session_entry` → `SessionInstall::session_id`. On import,
+`upsert_synced_with_origin` ADOPTS the wire id when non-zero and only falls back
+to `alloc_session_id()` for a legacy peer (id 0). The id is worker-namespaced, so
+adopting the peer's id verbatim keeps it unique across the importing node's tables
+(the peer's worker occupies a disjoint slice of the id space).
+
+**Additive, not a guard.** Unlike #5274's `ConfigEpoch`, this field is pure
+identity carriage — no receiver rejects on it. `RTFlowSessionID == 0` (legacy
+peer, or a synthesized delta with no live entry) simply falls back to a fresh
+local id. Regression coverage:
+`TestSessionWireRoundTripRTFlowSessionID5212{V4,V6}` in
+`pkg/cluster/sync_rtflow_session_id_5212_test.go`,
+`TestDecodeSessionEventRTFlowSessionID5212` /
+`TestBuildSessionSyncRequestCarriesRTFlowSessionID5212` in
+`pkg/dataplane/userspace`, `TestUserspaceSessionFromDeltaCarriesRTFlowSessionID5212`
+in `pkg/daemon`, and the Rust `synced_import_adopts_peer_session_id_5212` /
+`test_encode_session_open_carries_session_id_5212`.
+
 ## Config Payload (Variable)
 
 UTF-8 text of the full Junos-format configuration followed by a trailing
