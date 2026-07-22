@@ -56627,3 +56627,12 @@ top.
   re-imports it. Build green.
 - **File(s)**: userspace-dp/src/event_stream/budget.rs (new),
   userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract replay-buffer admission/eviction/retirement
+  (push_replay_frame, evict_replay_frame, pop_replay_frame,
+  release_replay_dataplane_event_queue_budget) into event_stream/replay.rs
+  (verbatim). Widened the three cross-module fns to pub(super); evict stays
+  private (only push calls it). Build green.
+- **File(s)**: userspace-dp/src/event_stream/replay.rs (new),
+  userspace-dp/src/event_stream/mod.rs

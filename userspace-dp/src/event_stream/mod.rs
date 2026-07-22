@@ -14,9 +14,13 @@ mod budget;
 pub(crate) mod codec;
 mod clock;
 mod producer;
+mod replay;
 
 use backlog::{WRITE_BACKLOG_MAX_BYTES, WriteBacklog};
 use budget::release_dataplane_event_queue_budget;
+use replay::{
+    pop_replay_frame, push_replay_frame, release_replay_dataplane_event_queue_budget,
+};
 
 #[allow(unused_imports)] // monotonic_ns_to_unix_secs is consumed only by the rt_flow tests
 pub(crate) use clock::{
@@ -1685,74 +1689,6 @@ fn flush_pending_resync(
     } else {
         false
     }
-}
-
-fn push_replay_frame(
-    shared: &Arc<EventStreamShared>,
-    replay_buf: &mut VecDeque<EventFrame>,
-    frame: EventFrame,
-) {
-    if replay_buf.len() >= REPLAY_BUFFER_CAPACITY {
-        // Buffer-full eviction: the oldest accepted-and-enqueued frame is
-        // dropped before the daemon ACKed it. It was already counted in
-        // `frames_sent`, so it must be counted as a telemetry loss here
-        // (#2382). This is distinct from ACK-trim / shutdown drain, which
-        // remove frames via `pop_replay_frame` WITHOUT bumping the eviction
-        // counter (an ACKed frame is delivered, not lost).
-        evict_replay_frame(shared, replay_buf);
-    }
-    replay_buf.push_back(frame);
-}
-
-/// Evict the oldest replay frame because the buffer wrapped at capacity. This
-/// is the ONLY telemetry-loss removal path: it increments
-/// `frames_replay_evicted` (#2382) in addition to releasing the queue budget.
-fn evict_replay_frame(
-    shared: &Arc<EventStreamShared>,
-    replay_buf: &mut VecDeque<EventFrame>,
-) -> Option<EventFrame> {
-    let frame = pop_replay_frame(shared, replay_buf);
-    if let Some(evicted) = frame.as_ref() {
-        shared
-            .frames_replay_evicted
-            .fetch_add(1, Ordering::Relaxed);
-        // #2875: evicting a SESSION-SYNC delta WHILE PAUSED loses a session
-        // mutation the future owner needs to take over cleanly. Poison the
-        // pending demotion drain so `handle_drain_request` withholds
-        // DrainComplete and forces a FullResync instead of silently
-        // completing demotion. Telemetry eviction is a tolerated loss and
-        // must NOT poison (no spurious resync). Read `paused` here so the
-        // poison fires for evictions both in the connected-loop paused drain
-        // and in the drain-request drain loop (both run while paused).
-        if evicted.is_session_sync() && shared.paused.load(Ordering::Acquire) {
-            shared
-                .session_evicted_while_paused
-                .store(true, Ordering::Release);
-        }
-    }
-    frame
-}
-
-/// Remove the oldest replay frame and release its queue budget WITHOUT
-/// counting it as an eviction. Used by ACK-trim (the frame was acknowledged —
-/// delivered, not lost) and shutdown drain. The buffer-full loss path is
-/// `evict_replay_frame`.
-fn pop_replay_frame(
-    shared: &Arc<EventStreamShared>,
-    replay_buf: &mut VecDeque<EventFrame>,
-) -> Option<EventFrame> {
-    let frame = replay_buf.pop_front();
-    if let Some(frame) = frame.as_ref() {
-        release_dataplane_event_queue_budget(shared, frame);
-    }
-    frame
-}
-
-fn release_replay_dataplane_event_queue_budget(
-    shared: &Arc<EventStreamShared>,
-    replay_buf: &mut VecDeque<EventFrame>,
-) {
-    while pop_replay_frame(shared, replay_buf).is_some() {}
 }
 
 // ---------------------------------------------------------------------------
