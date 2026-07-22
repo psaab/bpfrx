@@ -1,3 +1,35 @@
+## 2026-07-22 — #4957: HA config-sync — do not treat a promoted-but-unapplied config as converged
+
+- **Timestamp**: 2026-07-22 (fix/4957-ha-configsync-unapplied-converged)
+- **Action**: `handleConfigSync`'s active-text convergence shortcut treated a
+  config that `SyncApply` promoted to `s.active` but whose `applyConfigLocked`
+  FAILED (non-fatal networkd/nft/IPsec tail error, never rolled back under the
+  #1799 degrade-not-fail doctrine) as converged: the primary's same-generation
+  re-push took the fast path, returned nil, advanced the config high-water, and
+  the reconcile retry never ran — a standby that acks a generation it never
+  finished applying. Fix (option c, least-invasive, respects degrade-not-fail):
+  added a `configstore` applied-config digest (`MarkActiveApplied`/`ActiveApplied`)
+  stamped ONLY after a fully-successful apply (boot `applyConfig`, commit
+  `applyAndSyncCommitted`, sync `handleConfigSync`), and ANDed the shortcut with
+  `ActiveApplied()`. A promoted-but-unapplied config now falls through and
+  RE-ATTEMPTS the apply; an already-applied config still shortcuts on reconnect
+  (no redundant re-apply). Text-keyed marker → stale value is fail-safe (at most
+  one idempotent re-apply, never a false convergence). Did not roll back
+  `s.active` (option a) — that fights the degrade-not-fail store-converges-to-peer
+  design and the #5564 armedActive invalidator that reads `s.active`.
+- **File(s)**: `pkg/configstore/store.go` (field + `MarkActiveApplied`/
+  `ActiveApplied`/`configTextDigest`), `pkg/daemon/daemon_ha_sync.go` (shortcut
+  gate + stamp on nil), `pkg/daemon/daemon_apply.go` (`applyConfig` +
+  `applyAndSyncCommitted` stamp on success), `pkg/configstore/applied_marker_4957_test.go`
+  (store contract test), `pkg/daemon/configsync_unapplied_4957_test.go`
+  (fail-on-revert), `pkg/daemon/config_sync_test.go` (updated to the
+  applied-not-just-active contract), `docs/sync-protocol.md`,
+  `pkg/configstore/README.md`.
+- **Validation**: `go build ./...`; `go test ./pkg/configstore/... ./pkg/daemon/...
+  ./pkg/cluster/...` green; `go vet` clean; fail-on-revert confirmed firsthand
+  (drop the `ActiveApplied()` gate → `TestHandleConfigSync_PromotedButUnappliedIsNotConverged`
+  RED at "applyConfigLocked calls = 1, want 2").
+
 ## 2026-07-22 — #5274: HA session-sync config-epoch guard (stale permit across the HA boundary)
 
 - **Timestamp**: 2026-07-22 (fix/5274-ha-session-config-epoch)
