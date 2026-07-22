@@ -99,6 +99,19 @@ failover without waiting for a real-traffic refresh. An old peer omits the
 field (`serde(default)` 0 → `None` → the global timeout), bit-identical to
 pre-#3301 (rolling-upgrade safe).
 
+**Not every `SyncImport` entry is a wire import (#6224).** The local-origin
+GRE encapsulation path (`build_local_origin_tunnel_tx_request`, tunnel.rs)
+seeds a session for the firewall's OWN kernel-routed traffic read off a TUN
+device and tags it `SessionOrigin::SyncImport` purely to reach the uncapped
+coordinator-authoritative install path — it is not a peer wire import and has
+no `SessionSyncRequest`. That path runs no security policy / application match
+(forwarding-only resolution; `policy_id: 0`), so there is no admitting
+application to source a per-app `inactivity_timeout_ns` from: it correctly
+stamps `None` (the global per-protocol timeout) rather than reading the wire
+override, and its synthesized reverse companion inherits that `None`. This is
+the correct value for self-originated traffic, not the #5153 forward-has-value
+/ reverse-hardcoded-`None` inconsistency.
+
 **TCP opening / half-open state (#3152).** A TCP session created by a
 bare SYN (SYN set, ACK clear) starts in the OPENING (half-open) state
 (`SessionEntry.established == false`) and is reaped on the short
