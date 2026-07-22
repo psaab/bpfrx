@@ -56666,3 +56666,23 @@ top.
 - **File(s)**: pkg/routing/tunnel.go, pkg/routing/tunnel_wireguard.go,
   pkg/routing/tunnel_keepalive_runner.go, pkg/snmp/agent.go,
   pkg/snmp/agent_ber.go, pkg/routing/README.md, pkg/snmp/README.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5661 (Go control-plane modularity cohort) — pure
+  code-motion split of pkg/cluster/sync_conn.go (2228 lines, ~1595 prod
+  LOC, over the ~2000 threshold). Extracted five cohesive sibling files
+  in the same package pkg/cluster, verbatim (no rename, no logic/timing
+  change, no goroutine/defer/lock reordering — critical for HA session
+  sync): sync_conn_gen.go (session generation guards + synced-session
+  apply), sync_conn_sweep.go (incremental sync sweep), sync_conn_write.go
+  (send/queue/delete-journal), sync_conn_config.go (config replication),
+  sync_conn_read.go (receive/dispatch). sync_conn.go now 617 lines
+  (connection lifecycle: dial/accept/install/start/stop/disconnect).
+  Verified all 63 declaration bodies byte-identical vs origin/master.
+  go build ./... + go test ./pkg/cluster/... green, go vet clean, gofmt
+  clean. HA session-sync code — parent runs loss-cluster test-failover
+  before merge.
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_conn_gen.go,
+  pkg/cluster/sync_conn_sweep.go, pkg/cluster/sync_conn_write.go,
+  pkg/cluster/sync_conn_config.go, pkg/cluster/sync_conn_read.go,
+  pkg/cluster/README.md
