@@ -261,11 +261,13 @@ fn enqueue_reject_reply(
     // fallback were the parent's, not this unit's → wrong-source / untagged
     // reply dropped on the tagged link. Keying the build off the logical unit
     // ifindex sources the ICMP reply from the sub-if's own primary address and
-    // its own `vlan_id`, mirroring the Time Exceeded builder
-    // (`build_local_time_exceeded_request`), which already passes
-    // `ingress_ident.ifindex` (the logical unit). The TCP RST builder is
-    // self-contained (it reflects the inbound frame, no egress lookup), so it
-    // is unaffected. The physical `ingress_ifindex` is still used for the
+    // its own `vlan_id`, mirroring the Time Exceeded / Packet-Too-Big builders,
+    // which resolve the same logical unit before their egress lookup
+    // (`build_local_time_exceeded_request` / `compute_forwarded_egress_ptb`,
+    // #6102 — before that fix they wrongly passed the PHYSICAL
+    // `ingress_ident.ifindex`). The TCP RST builder is self-contained (it
+    // reflects the inbound frame, no egress lookup), so it is unaffected. The
+    // physical `ingress_ifindex` is still used for the
     // `TxRequest.egress_ifindex` (the XSK transmit device) below. For a
     // non-VLAN port the logical and physical indexes coincide, so this is a
     // no-op there.
