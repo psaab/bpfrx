@@ -56556,3 +56556,29 @@ top.
   userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/afxdp/coordinator/README.md
+## 2026-07-22 — #4839 protocol.go wire-protocol god-file split
+- **Action**: Pure code-motion split of the 3,156-line
+  pkg/dataplane/userspace/protocol.go wire-protocol monolith into 11
+  cohesive per-domain sibling files in the same userspace package. No
+  rename, no logic change, all json tags preserved byte-identical
+  (verified: sorted non-blank code-line multiset identical to
+  origin/master). protocol.go reduced 3,156 -> 368 lines. One commit
+  per extracted file; each builds. Updated the ProcessStatus
+  source-AST canary (retirement_boundary_canary_test.go) to follow
+  ProcessStatus into protocol_status.go, and two living module docs
+  (userspace-dataplane-architecture.md SlowPathStatus,
+  config-schema.md FirewallTermSnapshot) to point at the new files.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/protocol_nat.go,
+  pkg/dataplane/userspace/protocol_cos.go,
+  pkg/dataplane/userspace/protocol_zones.go,
+  pkg/dataplane/userspace/protocol_tunnels.go,
+  pkg/dataplane/userspace/protocol_routes.go,
+  pkg/dataplane/userspace/protocol_policies.go,
+  pkg/dataplane/userspace/protocol_status.go,
+  pkg/dataplane/userspace/protocol_counters.go,
+  pkg/dataplane/userspace/protocol_binding.go,
+  pkg/dataplane/userspace/protocol_ha.go,
+  pkg/dataplane/userspace/protocol_events.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/userspace-dataplane-architecture.md, docs/config-schema.md

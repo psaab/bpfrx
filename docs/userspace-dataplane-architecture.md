@@ -1049,7 +1049,7 @@ A TUN device (`xpf-usp0`) for packets that need kernel processing:
     <=1500 frames, so this is degraded — not unusable — capacity. All three
     fields (`degraded`, `live_mtu`, `mtu_dropped_packets`) cross the control
     socket (Rust `protocol/control.rs` SlowPathStatus → Go
-    `pkg/dataplane/userspace/protocol.go` SlowPathStatus, tag-matched) and
+    `pkg/dataplane/userspace/protocol_status.go` SlowPathStatus, tag-matched) and
     surface in `show ... slow path` output: a `Slow path DEGRADED: true` line,
     the live MTU, and the MTU-exceeded drop counter.
   - **Day-2 reconcile (#5801):** the MTU is programmed when the worker opens
