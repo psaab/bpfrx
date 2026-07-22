@@ -56,6 +56,32 @@ const (
 	controlMaxDeadline = 120 * time.Second
 )
 
+// errSessionHelperUnreachable classifies a session-socket round-trip that
+// failed at the TRANSPORT layer (dial, write, or read) rather than being
+// rejected by the helper's handler. syncSessionRequestsLocked uses it to abort
+// a bulk batch early (#5380): if one request cannot complete a round-trip, the
+// helper is down or hung and every remaining request in the same batch would
+// pay the full per-request deadline too. A bulk delete chunk is up to
+// sessionHelperDeleteChunk (256) requests, so without the early abort a single
+// hung helper stalls the whole batch for ~256 * sessionSyncRoundtripDeadline
+// (~13 min) while repeatedly holding sessionMu — starving live session
+// installs. An APPLICATION-level rejection (the helper answered but set
+// resp.OK=false for this one request) is NOT wrapped with this sentinel, so the
+// batch keeps going: the helper is alive and only this request was refused.
+var errSessionHelperUnreachable = errors.New("session helper unreachable")
+
+// sessionSyncDialTimeout and sessionSyncRoundtripDeadline bound a single
+// session-socket round-trip so a hung helper fails one mirror request in a few
+// seconds instead of the OS default (which can be minutes). They match the
+// per-session control-socket convention (2s dial, controlBaseDeadline 3s
+// round-trip). They are package vars, not consts, ONLY so the #5380 hung-helper
+// regression test can shrink them to keep its bulk-batch timing fast; nothing
+// in production mutates them.
+var (
+	sessionSyncDialTimeout       = 2 * time.Second
+	sessionSyncRoundtripDeadline = controlBaseDeadline
+)
+
 // controlRoundtripDeadline sizes the control-socket read/write deadline to the
 // serialized request length so a large apply_snapshot is not falsely timed out
 // (#4036). It is a pure function of the body length: a sub-1-MiB request keeps
@@ -162,18 +188,24 @@ func (m *Manager) requestSessionSync(req ControlRequest) error {
 	}
 	m.sessionMu.Lock()
 	defer m.sessionMu.Unlock()
-	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+	// A bounded dial + round-trip deadline so a hung helper (accepts the
+	// connection but never reads/replies) fails THIS request in a few seconds
+	// instead of the OS default. Transport failures (dial/write/read) are
+	// wrapped with errSessionHelperUnreachable so a bulk caller can abort the
+	// rest of the batch instead of paying this deadline once per request
+	// (#5380).
+	conn, err := net.DialTimeout("unix", sockPath, sessionSyncDialTimeout)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: dial session socket: %w", errSessionHelperUnreachable, err)
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(sessionSyncRoundtripDeadline))
 	if err := json.NewEncoder(conn).Encode(&req); err != nil {
-		return err
+		return fmt.Errorf("%w: write session request: %w", errSessionHelperUnreachable, err)
 	}
 	var resp ControlResponse
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
-		return err
+		return fmt.Errorf("%w: read session response: %w", errSessionHelperUnreachable, err)
 	}
 	if !resp.OK {
 		if resp.Error == "" {

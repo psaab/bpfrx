@@ -55117,3 +55117,75 @@ top.
   contract in `docs/session-sync-architecture.md`.
 - **File(s)**: userspace-dp/src/nat/source.rs,
   userspace-dp/src/nat/tests_pool.rs, docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-07-21 18:52
+- **Action**: #5380 — fast-fail bulk session-sync mirror on a hung/unreachable
+  helper. The per-request dial timeout (2s) + round-trip deadline (3s) already
+  existed on the dedicated session socket (`requestSessionSync`,
+  `process_control.go`), so ONE request already fails in bounded time. The
+  residual bug was the BATCH multiplication: `syncSessionRequestsLocked` loops
+  over up to `sessionHelperDeleteChunk` (256) requests, and under a hung helper
+  (accepts but never replies) each paid the FULL 3s deadline — 256 × 3s ≈ 13 min
+  per chunk while repeatedly holding `sessionMu`, starving live session installs
+  (the CLAUDE.md control-socket-contention concern). Fix: wrap the three
+  transport-layer failures (dial/write/read) with a new
+  `errSessionHelperUnreachable` sentinel; `syncSessionRequestsLocked` and the
+  `deleteHelperSessionsV4/V6` chunk loops abort on the first such error so the
+  whole batch (and a full clear-all) costs ~one round-trip deadline, not one per
+  request/chunk. Application-level rejections (helper alive, `resp.OK=false`) are
+  NOT wrapped, so the #5881 best-effort "drop as many as we can" + error-report
+  contract is preserved. Confirmed the session socket is one-request-per-
+  connection (`handle_stream`), so connection reuse would break framing — noted
+  as a non-fix. Named the dial/round-trip bounds as package vars
+  (`sessionSyncDialTimeout` / `sessionSyncRoundtripDeadline`) so the regression
+  test can shrink them. Fail-on-revert test
+  `TestSyncSessionRequestsLockedFastFailsOnHungHelper5380`
+  (`sync_socket_fastfail_5380_test.go`): a hung listener accepts but never
+  replies; a 10-request batch must return within 500ms (~one shrunk 150ms
+  deadline) AND carry `errSessionHelperUnreachable`. RED on revert (drop the
+  `errors.Is(err, errSessionHelperUnreachable) { break }`): batch takes 1.505s
+  (10 × 150ms) and blows the bound — a clean elapsed assertion, not a compile
+  break. Validated on disk: `go build ./...`, `go vet`, full
+  `pkg/dataplane/userspace` suite green. HA session-sync path — needs a
+  loss-cluster failover smoke (batched). Documented the Go-side batch fast-fail
+  contract in `userspace-dp/src/server/README.md`.
+- **File(s)**: pkg/dataplane/userspace/process_control.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/sync_socket_fastfail_5380_test.go,
+  userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-07-21 (PR #6212 fold)
+- **Action**: Fold a hostile-review finding into PR #6212 (#5380): the fast-fail
+  `break` added earlier only aborted the 256-request loop INSIDE a single
+  `deleteHelperSessionsV4/V6` call. `ClearAllSessions` drives the helper delete
+  through `m.bpfShim.ClearAllSessionsChunked`, which invokes the two delete
+  callbacks ONCE PER 4096-key mirror chunk (v4 chunks, then v6). The callbacks
+  return void, so the inner abort did not propagate: a full clear-all under a
+  hung helper still paid ~one round-trip deadline PER chunk (~10M/4096 ≈ 2440
+  chunks/family ≈ ~2 h/family), not "one deadline total" as the PR claimed.
+  Guarded both closures with `helperDown()` (`errors.Is(helperErr,
+  errSessionHelperUnreachable)`): once a TRANSPORT failure is recorded the
+  remaining chunks skip the helper delete, bringing clear-all to ~one deadline
+  total. The BPF mirror still clears fully (the shim deletes each chunk BEFORE
+  invoking the callback); `helperErr` stays set so the #5881 error-propagation
+  and #5882 partial-count contracts are intact. Only the wrapped sentinel trips
+  the skip — an app-level `!resp.OK` rejection is NOT wrapped, so a live helper
+  that refuses one delete keeps clearing the batch (#5881). Fail-on-revert test
+  `TestClearAllSessionsFastFailsAcrossChunksOnHungHelper5380`
+  (`clear_all_multichunk_fastfail_5380_test.go`): one v4 + one v6 mirror session
+  → two delete callbacks against a counting hung helper; guarded pays ~one
+  shrunk 400ms deadline and dials the helper ONCE (v6 chunk skipped), unguarded
+  pays ~two deadlines and dials twice. RED on revert (neutralize `helperDown`):
+  elapsed 801ms > 650ms bound AND acceptCount 2 ≠ 1. Verified under sudo (BPF
+  memlock): the new test + #5380 + #5881 all GREEN; neutralizing `helperDown`
+  reddens the new test; neutralizing the original inner `break` reddens
+  `TestSyncSessionRequestsLockedFastFailsOnHungHelper5380` (1.505s) while the
+  new test stays GREEN (independent bindings). 6 XDP-shim tests
+  (TestApplyHelperStatus*/TestUserspaceXDP*/TestXSKLiveness*) fail identically
+  at the pristine PR head — pre-existing, need real XDP program load, unrelated.
+  Updated the `ClearAllSessions` doc comment + `userspace-dp/src/server/README.md`
+  so the documented clear-all contract matches (~one deadline total). HA
+  session-sync path — needs a loss-cluster failover smoke (batched).
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/clear_all_multichunk_fastfail_5380_test.go,
+  userspace-dp/src/server/README.md, _Log.md
