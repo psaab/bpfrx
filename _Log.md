@@ -55843,3 +55843,32 @@ top.
     `wg-interop.sh all` cluster run is the parent's gate.
   **Action**: #6125 — document the deliberate DF-set transit TCP re-segment (not PTB) contract (delivery-over-strict-PMTUD). Docs-only adjudication (path (a)); no code change.
   **File(s)**: docs/feature-coverage.md, userspace-dp/src/afxdp/tx/README.md
+
+- **Timestamp**: 2026-07-22
+  **Action**: #4958 — guard startClusterComms session-sync publish against the
+  comms-restart race (High: nil-deref panic + stale overwrite). The async
+  constructor goroutine published `d.sessionSync` (and re-dereferenced it for
+  `SetAuthProvider`) and replaced `d.fabricRefreshCh{,1}` from an untracked
+  goroutine with no lock and no epoch check, so a stop→start restart could
+  nil-deref (stop nilled the field mid-construction) or let a superseded epoch's
+  late constructor clobber the live epoch. Fix: `clusterCommsMu` + a
+  `clusterCommsGen` generation counter guard every comms-epoch field; the
+  constructor closes over a local `ss` and calls `publishSessionSyncIfCurrent`
+  (publish-if-current, drops stale with slog.Debug); fabric channels publish the
+  same way and each populateFabricFwd loop receives its channel by value;
+  `stopClusterComms` bumps the generation, cancels, JOINS the constructor
+  (`clusterCommsWG`), then nils shared state + Stop()s. All readers route through
+  `getSessionSync()` / `snapshotFabricRefreshChans()` / `getClusterCommsCtx()`.
+  Validation: fail-on-revert `daemon_ha_comms_race_test.go` (asserts stale publish
+  dropped — RED when the generation guard is neutralized, verified firsthand);
+  `go test -race ./pkg/daemon` clean (26s) with the fix, and DATA RACE reported on
+  `d.sessionSync` when the mutex is stripped (verified firsthand); pkg/daemon +
+  pkg/cluster suites green; `go build ./...` OK. HA session-sync change → parent
+  runs `make test-failover` before merge.
+  **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_ha_fabric.go, pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_ha_userspace_readiness.go, pkg/daemon/daemon_ha.go,
+  pkg/daemon/daemon_dhcp_lease_sync.go, pkg/daemon/daemon_policy_invalidate.go,
+  pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/userspace_sync_test.go, pkg/daemon/daemon_ha_comms_race_test.go,
+  pkg/daemon/README.md

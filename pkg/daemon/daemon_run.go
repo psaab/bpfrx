@@ -365,13 +365,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		gc.OnDeleteV4 = func(key dataplane.SessionKey) {
 			// Always sync deletes. Dropping deletes leaves stale sessions
 			// on the peer indefinitely.
-			if d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil {
-				d.sessionSync.QueueDeleteV4(key)
+			if ss := d.getSessionSync(); d.cluster != nil && d.cluster.IsLocalPrimaryAny() && ss != nil {
+				ss.QueueDeleteV4(key)
 			}
 		}
 		gc.OnDeleteV6 = func(key dataplane.SessionKeyV6) {
-			if d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil {
-				d.sessionSync.QueueDeleteV6(key)
+			if ss := d.getSessionSync(); d.cluster != nil && d.cluster.IsLocalPrimaryAny() && ss != nil {
+				ss.QueueDeleteV6(key)
 			}
 		}
 
@@ -395,7 +395,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}()
 
 			// Wire ring buffer callback for near-real-time session sync.
-			if d.sessionSync != nil {
+			if d.getSessionSync() != nil {
 				er.AddCallback(func(rec logging.EventRecord, raw []byte) {
 					if rec.Type != "SESSION_OPEN" {
 						return
@@ -403,7 +403,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 					if d.cluster == nil || !d.cluster.IsLocalPrimaryAny() {
 						return
 					}
-					if !d.sessionSync.IsConnected() {
+					// Snapshot the session-sync object once per event (#4958)
+					// so the connection check and both queue calls operate on
+					// the same instance a concurrent comms restart cannot nil
+					// between reads.
+					ss := d.getSessionSync()
+					if ss == nil || !ss.IsConnected() {
 						return
 					}
 					if len(raw) < 56 {
@@ -419,8 +424,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
 						key.Protocol = proto
 						if val, err := d.dp.Sessions().GetV6(key); err == nil && val.IsReverse == 0 {
-							if d.sessionSync.ShouldSyncZone(val.IngressZone) {
-								d.sessionSync.QueueSessionV6(key, val)
+							if ss.ShouldSyncZone(val.IngressZone) {
+								ss.QueueSessionV6(key, val)
 							}
 						}
 					} else {
@@ -431,8 +436,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
 						key.Protocol = proto
 						if val, err := d.dp.Sessions().GetV4(key); err == nil && val.IsReverse == 0 {
-							if d.sessionSync.ShouldSyncZone(val.IngressZone) {
-								d.sessionSync.QueueSessionV4(key, val)
+							if ss.ShouldSyncZone(val.IngressZone) {
+								ss.QueueSessionV4(key, val)
 							}
 						}
 					}
@@ -1142,9 +1147,9 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 	}
 
 	// Stop session sync (5s timeout to avoid blocking teardown).
-	if d.sessionSync != nil {
+	if ss := d.getSessionSync(); ss != nil {
 		d.stopSyncReadyTimer()
-		d.sessionSync.Stop()
+		ss.Stop()
 	}
 
 	if d.dp != nil {

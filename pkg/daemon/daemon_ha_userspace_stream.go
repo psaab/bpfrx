@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
@@ -20,7 +21,11 @@ type userspaceEventStreamProvider interface {
 	EventStream() *dpuserspace.EventStream
 }
 
-func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, ingressZone uint16) bool {
+// shouldSyncUserspaceDelta decides whether a userspace session delta should be
+// synced to the peer. ss is the caller's captured session-sync object (#4958):
+// the per-delta hot path takes the snapshot once in queueUserspaceSessionDeltas
+// rather than re-reading the shared field under lock for every delta.
+func (d *Daemon) shouldSyncUserspaceDelta(ss *cluster.SessionSync, delta dpuserspace.SessionDeltaInfo, ingressZone uint16) bool {
 	// Local-delivery sessions are traffic destined TO the firewall itself
 	// (management SSH, BGP peering, DHCP, NDP, ICMP echo, etc.).  These are
 	// intentionally excluded from HA session sync because:
@@ -42,16 +47,16 @@ func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, in
 		return false
 	}
 	if delta.FabricRedirect && !delta.FabricIngress {
-		return d.sessionSync != nil
+		return ss != nil
 	}
-	if delta.OwnerRGID > 0 && d.sessionSync != nil && d.sessionSync.IsPrimaryForRGFn != nil {
-		ok := d.sessionSync.IsPrimaryForRGFn(delta.OwnerRGID)
+	if delta.OwnerRGID > 0 && ss != nil && ss.IsPrimaryForRGFn != nil {
+		ok := ss.IsPrimaryForRGFn(delta.OwnerRGID)
 		if !ok {
 			slog.Debug("userspace delta: filtered (not primary for owner RG)", "rg", delta.OwnerRGID, "src", delta.SrcIP, "dst", delta.DstIP)
 		}
 		return ok
 	}
-	ok := d.sessionSync != nil && d.sessionSync.ShouldSyncZone(ingressZone)
+	ok := ss != nil && ss.ShouldSyncZone(ingressZone)
 	if !ok {
 		slog.Debug("userspace delta: filtered (zone not synced)", "zone", ingressZone, "src", delta.SrcIP, "dst", delta.DstIP)
 	}
@@ -60,7 +65,7 @@ func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, in
 
 func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 	drainer, ok := d.dp.(userspaceSessionDeltaDrainer)
-	if !ok || d.cluster == nil || d.sessionSync == nil {
+	if !ok || d.cluster == nil || d.getSessionSync() == nil {
 		return
 	}
 
@@ -90,10 +95,11 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 			}
 		}
 
-		if d.cluster == nil || d.sessionSync == nil {
+		ss := d.getSessionSync()
+		if d.cluster == nil || ss == nil {
 			return
 		}
-		if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
+		if !d.cluster.IsLocalPrimaryAny() || !ss.IsConnected() {
 			continue
 		}
 		cfg := d.store.ActiveConfig()
@@ -122,7 +128,7 @@ func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
 	if !d.wireUserspaceEventStreamCallbacks(ctx, provider) {
 		return
 	}
-	if d.cluster == nil || d.sessionSync == nil {
+	if d.cluster == nil || d.getSessionSync() == nil {
 		return
 	}
 
@@ -177,7 +183,8 @@ func (d *Daemon) wireUserspaceEventStreamCallbacks(ctx context.Context, provider
 // non-owner no-op handling on HA backups. It returns false only for transient
 // readiness gaps where EventStream should withhold ACK so the helper can replay.
 func (d *Daemon) handleEventStreamDelta(eventType uint8, delta dpuserspace.SessionDeltaInfo) bool {
-	if d.cluster == nil || d.sessionSync == nil {
+	ss := d.getSessionSync()
+	if d.cluster == nil || ss == nil {
 		slog.Debug("userspace delta: ignored (no cluster/sync)", "type", eventType)
 		return true
 	}
@@ -185,7 +192,7 @@ func (d *Daemon) handleEventStreamDelta(eventType uint8, delta dpuserspace.Sessi
 		slog.Debug("userspace delta: ignored (not primary for any RG)", "type", eventType)
 		return true
 	}
-	if !d.sessionSync.IsConnected() {
+	if !ss.IsConnected() {
 		slog.Debug("userspace delta: dropped (sync not connected)", "type", eventType)
 		return false
 	}
@@ -212,7 +219,8 @@ func (d *Daemon) handleEventStreamDelta(eventType uint8, delta dpuserspace.Sessi
 // a one-shot bulk export to catch up.
 func (d *Daemon) handleEventStreamFullResync() bool {
 	slog.Warn("userspace event stream: full resync requested, triggering bulk export")
-	if d.cluster == nil || d.sessionSync == nil {
+	ss := d.getSessionSync()
+	if d.cluster == nil || ss == nil {
 		slog.Debug("userspace event stream: full resync ignored (no cluster/sync)")
 		return true
 	}
@@ -220,7 +228,7 @@ func (d *Daemon) handleEventStreamFullResync() bool {
 		slog.Debug("userspace event stream: full resync ignored (not primary for any RG)")
 		return true
 	}
-	if !d.sessionSync.IsConnected() {
+	if !ss.IsConnected() {
 		slog.Debug("userspace event stream: full resync deferred (sync not connected)")
 		return false
 	}
@@ -249,7 +257,7 @@ func (d *Daemon) handleEventStreamFullResync() bool {
 // when disconnected, it runs at 100ms to compensate for the lost stream.
 func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspaceEventStreamProvider) {
 	drainer, hasDrainer := d.dp.(userspaceSessionDeltaDrainer)
-	if d.cluster == nil || d.sessionSync == nil {
+	if d.cluster == nil || d.getSessionSync() == nil {
 		return
 	}
 
@@ -292,10 +300,11 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 			if !hasDrainer {
 				continue
 			}
-			if d.cluster == nil || d.sessionSync == nil {
+			ss := d.getSessionSync()
+			if d.cluster == nil || ss == nil {
 				return
 			}
-			if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
+			if !d.cluster.IsLocalPrimaryAny() || !ss.IsConnected() {
 				continue
 			}
 			cfg := d.store.ActiveConfig()
@@ -315,10 +324,11 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 		if !hasDrainer {
 			continue
 		}
-		if d.cluster == nil || d.sessionSync == nil {
+		ss := d.getSessionSync()
+		if d.cluster == nil || ss == nil {
 			return
 		}
-		if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
+		if !d.cluster.IsLocalPrimaryAny() || !ss.IsConnected() {
 			continue
 		}
 		cfg := d.store.ActiveConfig()
@@ -335,7 +345,12 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 	zoneIDs map[string]uint16,
 	deltas []dpuserspace.SessionDeltaInfo,
 ) int {
-	if d.sessionSync == nil {
+	// Snapshot the live session-sync object once for the whole batch (#4958):
+	// the per-delta filter and queue calls all operate on this pointer instead
+	// of re-reading the shared field, so the hot path never locks per delta and
+	// a concurrent stopClusterComms cannot nil the field mid-batch.
+	ss := d.getSessionSync()
+	if ss == nil {
 		return 0
 	}
 	queued := 0
@@ -349,28 +364,28 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 					slog.Debug("userspace delta: V4 conversion failed", "src", delta.SrcIP, "dst", delta.DstIP, "disposition", delta.Disposition)
 					continue
 				}
-				if !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+				if !d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
 					continue
 				}
-				d.sessionSync.QueueSessionV4(key, val)
+				ss.QueueSessionV4(key, val)
 				slog.Debug("userspace delta: queued V4", "src", delta.SrcIP, "dst", delta.DstIP, "ownerRG", delta.OwnerRGID)
 				queued++
 				if delta.FabricRedirect && !delta.FabricIngress {
 					if wireKey, wireVal, ok := userspaceForwardWireAliasFromDeltaV4(delta, zoneIDs); ok {
-						d.sessionSync.QueueSessionV4(wireKey, wireVal)
+						ss.QueueSessionV4(wireKey, wireVal)
 						queued++
 					}
 				}
 			case dataplane.AFInet6:
 				key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
-				if !ok || !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+				if !ok || !d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
 					continue
 				}
-				d.sessionSync.QueueSessionV6(key, val)
+				ss.QueueSessionV6(key, val)
 				queued++
 				if delta.FabricRedirect && !delta.FabricIngress {
 					if wireKey, wireVal, ok := userspaceForwardWireAliasFromDeltaV6(delta, zoneIDs); ok {
-						d.sessionSync.QueueSessionV6(wireKey, wireVal)
+						ss.QueueSessionV6(wireKey, wireVal)
 						queued++
 					}
 				}
@@ -379,26 +394,26 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 			switch delta.AddrFamily {
 			case dataplane.AFInet:
 				key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
-				if ok && d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
-					d.sessionSync.QueueDeleteV4(key)
+				if ok && d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
+					ss.QueueDeleteV4(key)
 					queued++
 					if delta.FabricRedirect && !delta.FabricIngress {
 						wireKey := userspaceForwardWireKeyV4(key, delta)
 						if wireKey != key {
-							d.sessionSync.QueueDeleteV4(wireKey)
+							ss.QueueDeleteV4(wireKey)
 							queued++
 						}
 					}
 				}
 			case dataplane.AFInet6:
 				key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
-				if ok && d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
-					d.sessionSync.QueueDeleteV6(key)
+				if ok && d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
+					ss.QueueDeleteV6(key)
 					queued++
 					if delta.FabricRedirect && !delta.FabricIngress {
 						wireKey := userspaceForwardWireKeyV6(key, delta)
 						if wireKey != key {
-							d.sessionSync.QueueDeleteV6(wireKey)
+							ss.QueueDeleteV6(wireKey)
 							queued++
 						}
 					}

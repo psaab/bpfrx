@@ -181,7 +181,12 @@ func (d *Daemon) resolveFabricParent(fabName string) string {
 // If overlay is empty, fabIface is used for both (legacy/no-IPVLAN mode).
 // Attempts immediately on startup with fast 500ms retries (10 attempts),
 // then falls back to 30s periodic refresh.
-func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, overlay, peerAddr string) {
+// refreshCh is this loop's OWN event-driven refresh channel, handed in by value
+// at launch (#4958). The loop reads it directly rather than d.fabricRefreshCh so
+// a comms restart that swaps the shared field cannot race this receive; the
+// sender (triggerFabricRefresh) targets whatever channel the live epoch
+// published.
+func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, overlay, peerAddr string, refreshCh chan struct{}) {
 	peerIP := net.ParseIP(peerAddr)
 	if peerIP == nil {
 		slog.Warn("cluster: invalid fabric peer address", "addr", peerAddr)
@@ -230,7 +235,7 @@ func (d *Daemon) populateFabricFwd(ctx context.Context, fabIface, overlay, peerA
 			return
 		case <-ticker.C:
 			d.refreshFabricFwd(ctx, fabIface, overlay, peerIP, false)
-		case <-d.fabricRefreshCh:
+		case <-refreshCh:
 			d.refreshFabricFwd(ctx, fabIface, overlay, peerIP, false)
 		}
 	}
@@ -575,7 +580,9 @@ func (d *Daemon) clearFabricFwd0(ctx context.Context) {
 // populateFabricFwd1 resolves the secondary fabric interface MACs and populates
 // the fabric_fwd BPF map entry at key=1 for cross-chassis packet redirect.
 // Mirrors populateFabricFwd but writes to key=1 via UpdateFabricFwd1.
-func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, overlay, peerAddr string) {
+// refreshCh is fab1's OWN event-driven refresh channel, handed in by value at
+// launch (#4958) — see populateFabricFwd for the rationale.
+func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, overlay, peerAddr string, refreshCh chan struct{}) {
 	peerIP := net.ParseIP(peerAddr)
 	if peerIP == nil {
 		slog.Warn("cluster: invalid fabric1 peer address", "addr", peerAddr)
@@ -627,7 +634,7 @@ func (d *Daemon) populateFabricFwd1(ctx context.Context, fabIface, overlay, peer
 			return
 		case <-ticker.C:
 			d.refreshFabricFwd1(ctx, fabIface, overlay, peerIP, false)
-		case <-d.fabricRefreshCh1:
+		case <-refreshCh:
 			d.refreshFabricFwd1(ctx, fabIface, overlay, peerIP, false)
 		}
 	}
@@ -950,13 +957,19 @@ func (d *Daemon) runFabricStateSubscription(ctx context.Context) bool {
 // event was lost until the 30s safety-net tick. Signaling both channels
 // guarantees every configured fabric acts on the event immediately.
 func (d *Daemon) triggerFabricRefresh() {
+	// Snapshot the live epoch's channels under clusterCommsMu (#4958): the
+	// constructor publishes them and stopClusterComms nils them, so a bare
+	// field read here would race the swap. A nil channel (comms stopped or
+	// fab1 not configured) falls through the default arm — a nil-channel send
+	// never fires.
+	ch0, ch1 := d.snapshotFabricRefreshChans()
 	select {
-	case d.fabricRefreshCh <- struct{}{}:
+	case ch0 <- struct{}{}:
 	default:
 		// fab0 already has a refresh pending — no need to queue another.
 	}
 	select {
-	case d.fabricRefreshCh1 <- struct{}{}:
+	case ch1 <- struct{}{}:
 	default:
 		// fab1 already has a refresh pending (or fab1 is not configured
 		// and its channel is nil — a nil-channel send never fires, so

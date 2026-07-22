@@ -450,7 +450,7 @@ func (d *Daemon) applyRG0OwnershipTransition(newState cluster.NodeState) {
 		d.reconcileConfigSyncToPeer("rg0-promotion")
 
 		// On failover to primary: re-initiate synced IPsec SAs.
-		if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync && d.ipsec != nil && d.sessionSync != nil {
+		if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync && d.ipsec != nil && d.getSessionSync() != nil {
 			go d.reinitiateIPsecSAs()
 		}
 
@@ -459,7 +459,7 @@ func (d *Daemon) applyRG0OwnershipTransition(newState cluster.NodeState) {
 		// Kea pre-seed + post-start lease-add seed are tied to the per-RG Kea
 		// start in applyRethServicesForRG (where Kea is restarted on the VRRP
 		// MASTER transition).
-		if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync && d.dhcpServer != nil && d.sessionSync != nil {
+		if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync && d.dhcpServer != nil && d.getSessionSync() != nil {
 			d.nudgeDHCPLeaseSync()
 		}
 
@@ -1222,7 +1222,7 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 			// the memfile pre-seed (lease-add → lease-update on
 			// collision). Nudge the push loop so this node replicates
 			// its now-owned set.
-			if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync && d.sessionSync != nil {
+			if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync && d.getSessionSync() != nil {
 				go d.seedDHCPLeasesFromPeer(context.Background())
 				d.nudgeDHCPLeaseSync()
 			}
@@ -1701,8 +1701,8 @@ func (d *Daemon) advertiseIPsecSAOnce(lastFP string, force bool) string {
 	}
 	push, fp := ipsecSASyncAdvertise(names, lastFP, force)
 	sendConfirmed := false
-	if push && d.sessionSync != nil {
-		sendConfirmed = d.sessionSync.QueueIPsecSA(names)
+	if ss := d.getSessionSync(); push && ss != nil {
+		sendConfirmed = ss.QueueIPsecSA(names)
 	}
 	return ipsecSANextFP(push, sendConfirmed, fp, lastFP)
 }
@@ -1754,7 +1754,11 @@ func (d *Daemon) syncIPsecSAPeriodic(ctx context.Context) {
 // reinitiateIPsecSAs re-initiates all IPsec connections that were synced from the
 // previous primary. Called when this node becomes primary after failover.
 func (d *Daemon) reinitiateIPsecSAs() {
-	names := d.sessionSync.PeerIPsecSAs()
+	ss := d.getSessionSync()
+	if ss == nil {
+		return
+	}
+	names := ss.PeerIPsecSAs()
 	if len(names) == 0 {
 		return
 	}
