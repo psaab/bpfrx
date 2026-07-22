@@ -323,6 +323,14 @@ func TestNAT64UninstallablePrefixRuleIsNotDeterministic(t *testing.T) {
 	if _, e := LookupForward(v6View(1), "napt64-pool", "2001:db8:0:5::"); e != nil {
 		t.Fatalf("valid /96 rule must stay deterministic, got %v", e)
 	}
+	// Control: an IPv4-mapped IPv6 prefix (::ffff:.../96) IS installable —
+	// Rust Ipv6Addr::from_str accepts it, so the reference gate must not reject
+	// it via a To4()-based family test (the round-3 false-negative divergence).
+	mapped := v6View(1)
+	mapped.Config.Security.NAT.NAT64[0].Prefix = "::ffff:192.0.2.1/96"
+	if _, e := LookupForward(mapped, "napt64-pool", "2001:db8:0:5::"); e != nil {
+		t.Fatalf("IPv4-mapped /96 prefix must stay deterministic (Rust accepts it), got %v", e)
+	}
 }
 
 // TestDeterministicV6RejectsIPv6PoolMember covers the finding that a mode-2
@@ -331,7 +339,11 @@ func TestNAT64UninstallablePrefixRuleIsNotDeterministic(t *testing.T) {
 // v6 member was silently skipped and a mapping was invented from the surviving
 // v4 members.
 func TestDeterministicV6RejectsIPv6PoolMember(t *testing.T) {
-	for _, member := range []string{"2001:db8:aaaa::1", "2001:db8:aaaa::/64"} {
+	// Includes IPv4-mapped forms (bare + CIDR): Go net.IP.To4() folds them to a
+	// 4-byte v4 address, but Rust parse_pool_v4 rejects every colon-bearing form
+	// and skips the whole rule — so they must reject the whole pool, not be
+	// silently accepted as a v4 member (the round-3 fabricated-mapping case).
+	for _, member := range []string{"2001:db8:aaaa::1", "2001:db8:aaaa::/64", "::ffff:198.51.100.9", "::ffff:198.51.100.0/120"} {
 		view := v6View(1)
 		p := view.Config.Security.NAT.SourcePools["napt64-pool"]
 		p.Addresses = []string{"198.51.100.1", member, "198.51.100.2"}
@@ -344,6 +356,30 @@ func TestDeterministicV6RejectsIPv6PoolMember(t *testing.T) {
 			e.Code != ErrCodeNotDeterministic || e.Detail != wantDetail {
 			t.Fatalf("mixed pool member %q reverse must reject whole pool, got %v", member, e)
 		}
+	}
+}
+
+// TestDeterministicV4ExcludesMappedIPv6PoolMember covers round-3 finding #3:
+// a mode-1 (IPv4 source-NAT) pool with a bare IPv4-mapped IPv6 member must
+// EXCLUDE it from poolV4 — Rust IpAddr classifies it V6 and the v4 allocator
+// skips it, but Go net.IP.To4() would fold it in and expose an extra pool
+// position the allocator does not have. poolParams keys on config.NATAddrFamily.
+func TestDeterministicV4ExcludesMappedIPv6PoolMember(t *testing.T) {
+	pool := &config.NATPool{
+		Addresses: []string{"203.0.113.1", "::ffff:203.0.113.9", "203.0.113.2"},
+		PortLow:   1024,
+		PortHigh:  65535,
+		Deterministic: &config.DeterministicNATConfig{
+			BlockSize:   512,
+			HostAddress: "100.64.0.0/24",
+		},
+	}
+	p, err := poolParams(pool, false)
+	if err != nil {
+		t.Fatalf("mode-1 mapped-member pool: %v", err)
+	}
+	if len(p.poolV4) != 2 || p.poolV4[0].String() != "203.0.113.1" || p.poolV4[1].String() != "203.0.113.2" {
+		t.Fatalf("mode-1 must exclude the IPv4-mapped member, got %v", p.poolV4)
 	}
 }
 

@@ -356,8 +356,12 @@ func nat64PrefixInstallable(prefix string) bool {
 	if n, err := strconv.Atoi(parts[1]); err != nil || n != 96 {
 		return false
 	}
-	ip := net.ParseIP(parts[0])
-	return ip != nil && ip.To4() == nil && ip.To16() != nil
+	// Colon-strict Go/Rust-parity classification (never To4()): Rust
+	// Ipv6Addr::from_str accepts an IPv4-mapped literal such as
+	// ::ffff:192.0.2.1/96, so the reference gate must too — To4() would
+	// wrongly reject it and report the pool unreferenced while the dataplane
+	// installs the rule (a false-negative divergence).
+	return config.NATAddrFamily(parts[0]) == "v6"
 }
 
 // poolParams resolves a source pool's deterministic block-allocation
@@ -502,28 +506,38 @@ func expandPoolV4(pool *config.NATPool, mode Mode) ([]net.IP, *LookupError) {
 
 	var out []net.IP
 	for _, a := range addrs {
+		// Classify the family with the colon-strict Go/Rust-parity SSOT
+		// (config.NATAddrFamily on the mask-stripped text) — NEVER net.IP.To4().
+		// Go folds an IPv4-mapped literal (::ffff:1.2.3.4) into a 4-byte form
+		// whose .To4() is non-nil, but Rust Ipv4Addr::from_str / parse_pool_v4
+		// REJECT every colon-bearing form and IpAddr classifies it V6. Keying on
+		// the un-parsed text reproduces the dataplane's classification exactly
+		// (compiler_nat_helpers.go natAddrFamily), so a mapped member is never
+		// folded into the v4 index space the allocator does not have.
+		fam := config.NATAddrFamily(config.NATCIDRIPPart(a))
+		if fam == "" {
+			return nil, lerrf(ErrCodeNotDeterministic, "unparseable pool address %q", a)
+		}
+		if fam == "v6" {
+			// A colon-bearing member (including IPv4-mapped) is not a v4 pool
+			// address: NAT64 parse_pool_v4 rejects it and skips the WHOLE rule
+			// (#3888 all-or-nothing), and the mode-1 v4 allocator excludes it.
+			if mode == ModeV6 {
+				return nil, lerrf(ErrCodeNotDeterministic,
+					"NAT64 deterministic pool member %q is not an IPv4 host; the dataplane skips the whole rule", a)
+			}
+			continue // mode-1: excluded from the v4 index space
+		}
+		// fam == "v4": a dotted-quad host, optionally with a CIDR mask.
 		if strings.Contains(a, "/") {
 			_, ipnet, err := net.ParseCIDR(a)
 			if err != nil {
 				return nil, lerrf(ErrCodeNotDeterministic, "unparseable pool address %q", a)
 			}
-			ip4 := ipnet.IP.To4()
-			if ip4 == nil {
-				if mode == ModeV6 {
-					// NAT64 parse_pool_v4 (userspace-dp/src/nat64.rs) rejects any
-					// member that is not a bare IPv4 or IPv4/32 and skips the WHOLE
-					// rule (#3888 all-or-nothing), so an IPv6 member means the pool
-					// installs nothing — never a partial v4-only mapping.
-					return nil, lerrf(ErrCodeNotDeterministic,
-						"NAT64 deterministic pool member %q is not an IPv4 host; the dataplane skips the whole rule", a)
-				}
-				continue // IPv6 external — not part of the v4 index space
-			}
 			ones, bits := ipnet.Mask.Size()
-			if bits != 32 {
-				continue
-			}
 			if mode == ModeV6 && ones != 32 {
+				// NAT64 parse_pool_v4 accepts only a bare host or /32; a subnet
+				// external pool skips the whole rule rather than expanding.
 				return nil, lerrf(ErrCodeNotDeterministic,
 					"NAT64 deterministic pool requires host (/32) external addresses; subnet %q is not enforced deterministically", a)
 			}
@@ -531,28 +545,13 @@ func expandPoolV4(pool *config.NATPool, mode Mode) ([]net.IP, *LookupError) {
 			if count > maxPoolPrefixHosts {
 				return nil, lerrf(ErrCodeNotDeterministic, "pool prefix %q enumerates more than %d addresses", a, maxPoolPrefixHosts)
 			}
-			base := binary.BigEndian.Uint32(ip4)
+			base := binary.BigEndian.Uint32(ipnet.IP.To4())
 			for i := uint64(0); i < count; i++ {
 				out = append(out, uint32ToIP(base+uint32(i)))
 			}
 			continue
 		}
-		ip := net.ParseIP(a)
-		if ip == nil {
-			return nil, lerrf(ErrCodeNotDeterministic, "unparseable pool address %q", a)
-		}
-		ip4 := ip.To4()
-		if ip4 == nil {
-			if mode == ModeV6 {
-				// See the CIDR branch above: NAT64 parse_pool_v4 rejects a
-				// non-IPv4 member and skips the whole rule, so a bare IPv6
-				// member yields no deterministic mapping at all.
-				return nil, lerrf(ErrCodeNotDeterministic,
-					"NAT64 deterministic pool member %q is not an IPv4 host; the dataplane skips the whole rule", a)
-			}
-			continue // IPv6 external — skip
-		}
-		out = append(out, ip4)
+		out = append(out, net.ParseIP(a).To4())
 	}
 	return out, nil
 }
