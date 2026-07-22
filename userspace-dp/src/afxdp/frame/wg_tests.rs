@@ -591,8 +591,12 @@ fn wg_encap_frame_resolves_outer_route_once_v4() {
     // per encapped packet. Pre-#3992 the outer-MTU guard and the outer IP
     // SOURCE lookup each ran the IDENTICAL resolution (same peer endpoint,
     // same transport table) → 2 FIB LPMs per packet on the encrypt hot
-    // path. Reverting the dedup makes this count 2 → red. Relies on serial
-    // test execution (the suite runs `--test-threads=1`).
+    // path. Reverting the dedup makes this count 2 → red.
+    //
+    // #6294: `OUTER_ROUTE_RESOLVE_COUNT` is thread-local, so the reset/read
+    // window is isolated to THIS test thread — a parallel sibling bumping the
+    // counter can no longer corrupt the exact `== 1` assertion (this test no
+    // longer relies on `--test-threads=1`). See the counter's doc in `wg.rs`.
     let mut state = build_forwarding_state(&wg_outer_mtu_snapshot());
     let peer_ep: std::net::SocketAddr = "203.0.113.7:51820".parse().unwrap();
     state
@@ -603,10 +607,10 @@ fn wg_encap_frame_resolves_outer_route_once_v4() {
 
     // Count only the resolutions performed INSIDE wg_encap_frame: reset
     // immediately before the single call, read immediately after.
-    OUTER_ROUTE_RESOLVE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    outer_route_resolve_count_reset();
     let out = wg_encap_frame(&frame, inner_v4_meta(), &decision, &state)
         .expect("wg_encap_frame must build (established session, routed peer)");
-    let resolves = OUTER_ROUTE_RESOLVE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let resolves = outer_route_resolve_count();
     assert_eq!(
         resolves, 1,
         "wg_encap_frame must resolve the outer underlay route ONCE per \
@@ -640,6 +644,52 @@ fn wg_encap_frame_resolves_outer_route_once_v4() {
         &51820u16.to_be_bytes(),
         "outer UDP dst port = peer endpoint port (unchanged)"
     );
+}
+
+/// #6294 fail-on-revert: `OUTER_ROUTE_RESOLVE_COUNT` must be THREAD-LOCAL so
+/// that two tests resolving outer routes in parallel cannot corrupt each
+/// other's count. Before #6294 the counter was a process-global `AtomicUsize`;
+/// under the default parallel `cargo test` a sibling `wg_encap_frame` /
+/// `outer_*` test bumping it between `wg_encap_frame_resolves_outer_route_once_v4`'s
+/// reset and read made the `== 1` assertion flake.
+///
+/// This test hammers the counter from two threads that each reset, bump
+/// `ITERS` times, then read — concurrently, released from a barrier so their
+/// bumps genuinely interleave. A thread-local counter makes each thread
+/// observe EXACTLY its own `ITERS` bumps. Reverting the counter to a shared
+/// atomic lets the sibling thread's bumps (and its racing reset) leak in, so
+/// the per-thread `== ITERS` assertion fails — deterministic red on revert.
+#[test]
+fn outer_route_resolve_count_is_thread_local_isolated() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    const ITERS: usize = 50_000;
+    let start = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let start = start.clone();
+        handles.push(thread::spawn(move || {
+            // Reset THIS thread's counter, then bump it ITERS times while the
+            // sibling thread does the same — synchronized on the barrier so a
+            // shared (reverted) counter reliably interleaves.
+            outer_route_resolve_count_reset();
+            start.wait();
+            for _ in 0..ITERS {
+                outer_route_resolve_count_bump();
+            }
+            outer_route_resolve_count()
+        }));
+    }
+    for h in handles {
+        let observed = h.join().expect("counter worker panicked");
+        assert_eq!(
+            observed, ITERS,
+            "OUTER_ROUTE_RESOLVE_COUNT must be thread-local: each thread must \
+             observe exactly its own {ITERS} bumps (got {observed}); a shared \
+             process-global counter leaks the sibling thread's increments and \
+             reintroduces the #6294 flake"
+        );
+    }
 }
 
 // === #5292: the outer L2/VLAN must follow the SELECTED peer's physical
