@@ -104,6 +104,30 @@ replay-rejection of fw0's own re-handshakes). The harness asserts at P1
 that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
 ("BLOCKING finding") if scoping ever stops compiling.
 
+## wg0 peer config shape (harness commit path)
+
+The harness commits the xpf side as an apply-group (`groups node0`) so
+the stanza is node0-scoped (see above). Under the #1434 multi-peer
+schema the WireGuard **peer is a named instance keyed by its public
+key** — the pubkey IS the instance arg, there is no `public-key` child
+leaf:
+
+```
+set groups node0 interfaces wg0 tunnel wireguard private-key <64-hex>
+set groups node0 interfaces wg0 tunnel wireguard peer <64-hex-pubkey> allowed-ips 10.78.0.0/24
+set groups node0 interfaces wg0 tunnel wireguard peer <64-hex-pubkey> allowed-ips fd78::/64
+set groups node0 interfaces wg0 tunnel wireguard peer <64-hex-pubkey> endpoint <ip>:51820
+```
+
+Keys are **hex** in the xpf config but `wg genkey`/`wg pubkey` emit
+**base64**, so the harness converts base64→hex (`base64 -d | od -An
+-tx1`) before the commit and asserts a 64-hex length. An earlier
+`peer public-key <hex>` form (a pre-#1434 grammar) drifted from this
+schema: it committed a bogus peer literally named `public-key`, which
+the commit check rejected with `peer 0 has an invalid public key (got
+"public-key")` — the #6279 harness bit-rot. `test/incus/wg-interop.sh`
+fails fast if the captured key is not 64 hex chars before it commits.
+
 ## Known S-step limitations the operator will observe
 
 | Observation | Cause | Owner |

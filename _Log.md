@@ -55696,3 +55696,30 @@ top.
   userspace-dp/src/afxdp/neighbor_dispatch.rs,
   userspace-dp/src/afxdp/flow_cache.rs,
   userspace-dp/src/filter/README.md, _Log.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: Fix #6279 — wg-interop.sh P1 config commit failed on WireGuard
+  peer schema drift. The harness committed `set ... tunnel wireguard peer
+  public-key <hex>` / `peer allowed-ips <cidr>`, a pre-#1434 grammar. Under the
+  current multi-peer schema (pkg/config/schema_interfaces.go) the peer is a
+  NAMED INSTANCE keyed by its public key — `peer <64-hex-pubkey> { allowed-ips;
+  endpoint; ... }` with NO `public-key` child leaf. The old form created a bogus
+  peer literally named "public-key", and the commit check rejected it with
+  `peer 0 has an invalid public key (got "public-key")`. Rewrote the peer
+  set-commands (P1 create + P6 re-commit + the P1 endpoint line) to use the
+  pubkey as the peer instance arg, and fixed the P3 endpoint-removal delete
+  (`delete ... peer <hex> endpoint`, was `peer endpoint` — deleted a nonexistent
+  peer named "endpoint" leaving xpf an initiator). Added a fail-fast assert in
+  xpf_wg_commit that PEER_PUB_HEX and XPF_PRIV_HEX are each 64 hex chars before
+  committing, so an empty/unsubstituted capture fails with a clear message
+  instead of a cryptic commit-check rejection. Added a `with_predelete` param to
+  xpf_wg_commit: configure_p1 already runs a standalone wg_stanza_delete before
+  the fresh P1 create, so it now passes predelete=0 — eliminating the benign but
+  confusing `path not found: no node matching "wg0"` on every clean run; the P6
+  re-commit keeps predelete=1 (inline replace of the existing stanza), so its
+  behavior is unchanged. Validated locally: base64->hex conversion (base64 -d |
+  od -An -tx1) yields 64 hex chars and round-trips to the original base64; the
+  assert accepts a real key and rejects both "public-key" and empty; bash -n +
+  shellcheck clean (only a pre-existing SC2034). The live `wg-interop.sh all`
+  cluster run (P1+ traffic) is the parent's gate.
+- **File(s)**: test/incus/wg-interop.sh, docs/wg-interop-runbook.md, _Log.md

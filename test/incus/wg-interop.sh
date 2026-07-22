@@ -434,20 +434,46 @@ EOF
 }
 
 # xpf config commit. with_endpoint=1 → initiator role (endpoint set).
-xpf_wg_commit() { # xpf_wg_commit <with_endpoint>
-    local ep_line=""
-    [ "$1" = 1 ] && ep_line="set groups node0 interfaces wg0 tunnel wireguard peer endpoint ${WG_PEER_LAN4%%/*}:${WG_LISTEN_PORT}"
+#
+# The WireGuard peer is a NAMED-INSTANCE keyed by its public key (#1434
+# multi-peer schema, pkg/config/schema_interfaces.go): the config shape
+# is `peer <public-key-hex> { allowed-ips; endpoint; ... }`. There is NO
+# `public-key` child leaf — the pubkey IS the peer's instance arg. The
+# old `peer public-key <hex>` / `peer allowed-ips <cidr>` form drifted
+# from this schema: it created a bogus peer literally named "public-key"
+# (and another named "allowed-ips"), and the commit check rejected it
+# with `peer 0 has an invalid public key (got "public-key")` (#6279).
+#
+# with_predelete=1 (default) emits the belt `delete groups node0
+# interfaces wg0` INSIDE the same commit so an already-present stanza is
+# replaced in place (the P6 re-commit path — wg0 exists there).
+# configure_p1 runs a standalone wg_stanza_delete before the fresh P1
+# create, so it passes with_predelete=0: without the stanza present, the
+# inline delete of an absent wg0 emitted a benign but confusing
+# `path not found: no node matching "wg0"` on every clean run (#6279).
+xpf_wg_commit() { # xpf_wg_commit <with_endpoint> [with_predelete=1]
+    local ep_line="" del_line="delete groups node0 interfaces wg0"
+    [ "$1" = 1 ] && ep_line="set groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} endpoint ${WG_PEER_LAN4%%/*}:${WG_LISTEN_PORT}"
+    [ "${2:-1}" = 0 ] && del_line=""
+    # Fail fast rather than committing a placeholder: the peer pubkey and
+    # xpf privkey MUST each be exactly 64 hex chars (32-byte X25519) or
+    # the commit check rejects the tunnel. This catches an empty or
+    # unsubstituted capture (#6279) with a clear message at the point of
+    # use, instead of a cryptic commit-check rejection downstream.
+    [[ "${PEER_PUB_HEX}" =~ ^[0-9a-fA-F]{64}$ ]] \
+        || fail "xpf commit: PEER_PUB_HEX is not a 64-hex key: '${PEER_PUB_HEX}'"
+    [[ "${XPF_PRIV_HEX}" =~ ^[0-9a-fA-F]{64}$ ]] \
+        || fail "xpf commit: XPF_PRIV_HEX is not a 64-hex key: '${XPF_PRIV_HEX}'"
     fw0_cli > "${EVID}/xpf-commit-$1.txt" 2>&1 <<EOF
 configure
-delete groups node0 interfaces wg0
+${del_line}
 set groups node0 interfaces wg0 unit 0 family inet address ${WG_INNER4_XPF}/24
 set groups node0 interfaces wg0 unit 0 family inet6 address ${WG_INNER6_XPF}/64
 set groups node0 interfaces wg0 tunnel mode wireguard
 set groups node0 interfaces wg0 tunnel wireguard listen-port ${WG_LISTEN_PORT}
 set groups node0 interfaces wg0 tunnel wireguard private-key ${XPF_PRIV_HEX}
-set groups node0 interfaces wg0 tunnel wireguard peer public-key ${PEER_PUB_HEX}
-set groups node0 interfaces wg0 tunnel wireguard peer allowed-ips ${WG_INNER4_CIDR}
-set groups node0 interfaces wg0 tunnel wireguard peer allowed-ips ${WG_INNER6_CIDR}
+set groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} allowed-ips ${WG_INNER4_CIDR}
+set groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} allowed-ips ${WG_INNER6_CIDR}
 ${ep_line}
 commit
 exit
@@ -529,7 +555,10 @@ configure_p1() {
         ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P1: xpfd restart failed"
         ensure_wg_mastership "p1-leak" || fail "P1: WG VIP not restored after leak-recovery restart + failback"
     fi
-    xpf_wg_commit 1
+    # wg_stanza_delete above already removed any prior wg0 stanza, so the
+    # fresh create needs no inline predelete (with_predelete=0) — avoids a
+    # benign `no node matching "wg0"` on every clean P1 run (#6279).
+    xpf_wg_commit 1 0
     # The apply pipeline (tunnels -> dataplane -> FRR) is asynchronous
     # relative to the CLI commit returning; poll for the TUN + bind
     # rather than asserting at a fixed offset.
@@ -657,7 +686,7 @@ test_p3() {
     log "P3: remove xpf endpoint (responder role); peer becomes initiator"
     fw0_cli > "${EVID}/p3-commit.txt" 2>&1 <<EOF
 configure
-delete groups node0 interfaces wg0 tunnel wireguard peer endpoint
+delete groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} endpoint
 commit
 exit
 quit
