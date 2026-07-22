@@ -21,9 +21,8 @@ import (
 // configuration session legitimately OWNED, corrupting or smuggling changes into
 // another operator's session.
 //
-// These tests go RED (assertion failure, not compile break) when the fix is
-// neutralized by reverting restConfigSessionID to "" in config.go: the empty
-// identity re-enables the store's system bypass, so the rejected mutations
+// These tests go RED if the REST handlers pass an empty identity: the empty
+// value re-enables the store's system bypass, so the rejected mutations
 // wrongly succeed and stomp / smuggle the held candidate.
 
 // TestRESTConfigSetDeleteRejectedWhenOtherSessionHoldsCandidate simulates a
@@ -49,6 +48,7 @@ func TestRESTConfigSetDeleteRejectedWhenOtherSessionHoldsCandidate(t *testing.T)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/config/set",
 		strings.NewReader(`{"input":"system host-name stomped-by-rest"}`))
+	withRESTConfigSession(req, testRESTConfigSessionID)
 	s.configSetHandler(rr, req)
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("REST set while CLI holds candidate: status = %d, want 409; body: %s",
@@ -59,6 +59,7 @@ func TestRESTConfigSetDeleteRejectedWhenOtherSessionHoldsCandidate(t *testing.T)
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest("POST", "/api/v1/config/delete",
 		strings.NewReader(`{"input":"system host-name"}`))
+	withRESTConfigSession(req, testRESTConfigSessionID)
 	s.configDeleteHandler(rr, req)
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("REST delete while CLI holds candidate: status = %d, want 409; body: %s",
@@ -104,7 +105,9 @@ func TestRESTConfigCommitRejectedWhenOtherSessionHoldsCandidate(t *testing.T) {
 	}
 
 	rr := httptest.NewRecorder()
-	s.configCommitHandler(rr, httptest.NewRequest("POST", "/api/v1/config/commit", nil))
+	req := withRESTConfigSession(
+		httptest.NewRequest("POST", "/api/v1/config/commit", nil), testRESTConfigSessionID)
+	s.configCommitHandler(rr, req)
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("REST commit while CLI holds candidate: status = %d, want 409; body: %s",
 			rr.Code, rr.Body.String())
@@ -124,17 +127,14 @@ func TestRESTConfigMutationAllowedAndHoldsLock(t *testing.T) {
 	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	s := &Server{store: store}
 
-	// REST enters config mode under its own fixed identity.
-	rr := httptest.NewRecorder()
-	s.configEnterHandler(rr, httptest.NewRequest("POST", "/api/v1/config/enter", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("REST enter: status = %d, want 200; body: %s", rr.Code, rr.Body.String())
-	}
+	// REST enters config mode under its own server-generated identity.
+	sessionID := enterRESTConfigSession(t, s, "")
 
 	// REST set succeeds — REST is the holder.
-	rr = httptest.NewRecorder()
+	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/config/set",
 		strings.NewReader(`{"input":"system host-name rest-owned"}`))
+	withRESTConfigSession(req, sessionID)
 	s.configSetHandler(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("REST set as holder: status = %d, want 200; body: %s", rr.Code, rr.Body.String())

@@ -69,6 +69,7 @@ func TestConfigCommitHandlerRejectsRetiredEBPF(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/config/commit", nil)
+	withRESTConfigSession(req, testRESTConfigSessionID)
 	s.configCommitHandler(rr, req)
 
 	body := rr.Body.String()
@@ -92,6 +93,7 @@ func TestConfigCommitConfirmedHandlerRejectsRetiredEBPF(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/config/commit-confirmed",
 		strings.NewReader(`{"minutes":10}`))
+	withRESTConfigSession(req, testRESTConfigSessionID)
 	s.configCommitConfirmedHandler(rr, req)
 
 	body := rr.Body.String()

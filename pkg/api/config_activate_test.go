@@ -38,6 +38,7 @@ func TestConfigDeactivateHandlerMarksInactive(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/config/deactivate",
 		strings.NewReader(`{"input":"system name-server 9.9.9.9"}`))
+	withRESTConfigSession(req, testRESTConfigSessionID)
 	s.configDeactivateHandler(rr, req)
 	if rr.Code != 200 {
 		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
@@ -62,6 +63,7 @@ func TestConfigActivateHandlerClearsInactive(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/config/activate",
 		strings.NewReader(`{"input":"system name-server 9.9.9.9"}`))
+	withRESTConfigSession(req, testRESTConfigSessionID)
 	s.configActivateHandler(rr, req)
 	if rr.Code != 200 {
 		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
@@ -84,6 +86,7 @@ func TestConfigLoadHandlerModeSet(t *testing.T) {
 	body := `{"mode":"set","content":"set system host-name keep\nset system name-server 9.9.9.9\ndeactivate system name-server 9.9.9.9"}`
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/config/load", strings.NewReader(body))
+	withRESTConfigSession(req, testRESTConfigSessionID)
 	s.configLoadHandler(rr, req)
 	if rr.Code != 200 {
 		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
