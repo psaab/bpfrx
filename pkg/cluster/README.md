@@ -380,6 +380,19 @@ connection is authenticated, then seals every subsequent frame.
   sub-millisecond, so the bound only covers a hung/absent peer, and a
   shorter bound keeps a stalled handshake goroutine within the 5s `Stop`
   budget.
+- **Atomic install + cold-prime decision (#4962).** Because #4370 made
+  `handleNewConnection` per-accept, two same-fabric accepts can race: the
+  loser observes the winner's just-installed connection, closes it
+  (aborting its in-flight cold-prime bulk), and — under the pre-#4962
+  after-unlock `wasDisconnected` read — skipped cold-prime, leaving the
+  **surviving** connection un-primed (peer blackholes on the next
+  failover). `installConn` now wires the connection into `conn0`/`conn1`
+  and computes the cold-prime decision under the **same** `s.mu`
+  acquisition, gated on a `needColdPrime` latch (armed on a
+  full-disconnect→connect edge, consumed only when a bulk succeeds) so the
+  surviving accept **inherits** the outstanding obligation and re-drives
+  the bulk. See `docs/session-sync-architecture.md` → "Atomic Install +
+  Cold-Prime Decision (#4962)".
 
 ## IPsec SA sync
 

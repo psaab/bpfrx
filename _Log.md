@@ -1,3 +1,37 @@
+## 2026-07-22 — #4962: atomic install + cold-prime decision in handleNewConnection
+
+- **Timestamp**: 2026-07-22 (fix/4962-handlenewconnection-race)
+- **Action**: Fixed the async `handleNewConnection` race where two
+  concurrent same-fabric accepts (per-accept goroutine, post-#4370) could
+  DROP the cold-prime bulk. The pre-fix code read `wasDisconnected` under
+  `s.mu` but used it AFTER unlock: accept A installs `connA` from an empty
+  registry and cold-primes it; accept B locks after A, observes `connA`
+  (non-empty registry → `wasDisconnected=false`), closes `connA` (aborting
+  A's in-flight bulk), installs `connB` as the survivor, and hit the
+  `becameActive` branch → NO cold-prime. The surviving `connB` never
+  re-pushed the authoritative session table, so the peer blackholed
+  established flows on the next failover. #4090's survivor re-drive does
+  NOT cover it: A's write failure calls `handleDisconnect(connA)`, a stale
+  disconnect (`conn0==connB`) that is ignored. Fix: extracted `installConn`
+  which wires `conn0`/`conn1` AND computes the `connColdPrimeDecision`
+  under the SAME `s.mu` acquisition, backed by a new `needColdPrime` latch
+  — armed on a full-disconnect→connect edge, consumed only when a bulk
+  SUCCEEDS. `shouldColdPrime = becameActive && needColdPrime`, so a
+  superseding accept INHERITS the outstanding obligation and re-drives the
+  bulk on the survivor. Both attempts serialize on `bulkSendMu` and target
+  `getActiveConn` → idempotent (same correctness-over-optimization tradeoff
+  as #5480). Steady state unchanged: routine single-fabric flips (latch
+  discharged) do not re-bulk.
+- **File(s)**: `pkg/cluster/sync.go` (needColdPrime field),
+  `pkg/cluster/sync_conn.go` (installConn + connColdPrimeDecision + gate),
+  `pkg/cluster/sync_conn_race_4962_test.go` (new, 3 tests incl. -race),
+  `docs/session-sync-architecture.md`, `pkg/cluster/README.md`.
+- **Validation**: `go build ./...` clean; `go vet ./pkg/cluster/` clean;
+  new tests pass under `-race`; full `pkg/cluster` suite green;
+  fail-on-revert confirmed (reverting the decision to
+  `becameActive && wasDisconnected` fails
+  `TestHandleNewConnectionRaceDoesNotAbortWinnerBulk4962`).
+
 ## 2026-07-21 — #6178: input-vlan-map / output-vlan-map honesty gate
 
 - **Timestamp**: 2026-07-21 (fix/6178-vlan-map-honesty-gate)
