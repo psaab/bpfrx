@@ -5702,7 +5702,7 @@ positive port slices, both AST shapes).
 
 **Wire + dataplane.** Two additive wire fields on `FirewallTermSnapshot` —
 `source_ports_except` / `destination_ports_except` (Go
-`pkg/dataplane/userspace/protocol.go`, Rust `protocol/security.rs`,
+`pkg/dataplane/userspace/protocol_policies.go`, Rust `protocol/security.rs`,
 `serde(default)` for #1961 mixed-version parity). The Rust compiler
 (`filter/compiler.rs`) selects ONE port spec list per direction — the
 positive list if it carries real entries, otherwise the `-except` list — and

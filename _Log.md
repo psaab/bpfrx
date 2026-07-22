@@ -56566,3 +56566,60 @@ top.
   unchanged from baseline). Diff touches ONLY forwarding/*.rs. fn count
   81→81; #[inline] 2→2. Full cargo test --release suite green (parent
   runs the loss-cluster iperf smoke before merge).
+## 2026-07-22 — #6314: join the neighbor warmer aux thread at teardown
+- **Action**: Make the #1636 neighbor WARMER consistent with its two
+  #5165-hardened siblings (monitor + resolver). Retain the warmer's
+  JoinHandle (`warm_join`, no longer `.ok()`-discarded), log spawn
+  failures instead of swallowing them, and deterministically JOIN the
+  warmer at teardown via `stop_and_join_warmer` (signal `warm_stop` +
+  drop the producer + join). Fail-on-revert test
+  `neighbor_warmer_joined_at_teardown_6314` (target-count 1, RED by
+  assertion under the drop-only teardown). Full Rust suite green; named
+  test 3x no-flake.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/neighbor_manager.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/README.md
+## 2026-07-22 — #4839 protocol.go wire-protocol god-file split
+- **Action**: Pure code-motion split of the 3,156-line
+  pkg/dataplane/userspace/protocol.go wire-protocol monolith into 11
+  cohesive per-domain sibling files in the same userspace package. No
+  rename, no logic change, all json tags preserved byte-identical
+  (verified: sorted non-blank code-line multiset identical to
+  origin/master). protocol.go reduced 3,156 -> 368 lines. One commit
+  per extracted file; each builds. Updated the ProcessStatus
+  source-AST canary (retirement_boundary_canary_test.go) to follow
+  ProcessStatus into protocol_status.go, and two living module docs
+  (userspace-dataplane-architecture.md SlowPathStatus,
+  config-schema.md FirewallTermSnapshot) to point at the new files.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/protocol_nat.go,
+  pkg/dataplane/userspace/protocol_cos.go,
+  pkg/dataplane/userspace/protocol_zones.go,
+  pkg/dataplane/userspace/protocol_tunnels.go,
+  pkg/dataplane/userspace/protocol_routes.go,
+  pkg/dataplane/userspace/protocol_policies.go,
+  pkg/dataplane/userspace/protocol_status.go,
+  pkg/dataplane/userspace/protocol_counters.go,
+  pkg/dataplane/userspace/protocol_binding.go,
+  pkg/dataplane/userspace/protocol_ha.go,
+  pkg/dataplane/userspace/protocol_events.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/userspace-dataplane-architecture.md, docs/config-schema.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5661 (Go control-plane modularity cohort) — pure
+  code-motion split of the two over-threshold low-risk files. On current
+  origin/master the four candidate low-risk files measure: rules.go 1534,
+  tunnel.go 2048, agent.go 2143, cli_show_flow.go 1272 prod LOC. Only
+  tunnel.go and agent.go exceed the ~2000-prod-LOC threshold, so only
+  those two were split (rules.go and cli_show_flow.go left untouched).
+  tunnel.go 2048 -> 1362: WireGuard TUN lifecycle to
+  tunnel_wireguard.go, keepalive runner to tunnel_keepalive_runner.go.
+  agent.go 2143 -> 1737: ASN.1 BER codec + OID helpers to agent_ber.go.
+  Byte-identical moves, no renames, no logic change; go build ./... +
+  go test ./pkg/routing/... ./pkg/snmp/... green, gofmt clean. HA files
+  (daemon/vrrp/cluster) explicitly NOT touched — tracked separately.
+- **File(s)**: pkg/routing/tunnel.go, pkg/routing/tunnel_wireguard.go,
+  pkg/routing/tunnel_keepalive_runner.go, pkg/snmp/agent.go,
+  pkg/snmp/agent_ber.go, pkg/routing/README.md, pkg/snmp/README.md

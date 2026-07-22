@@ -2633,7 +2633,7 @@ func lineWindowContains(lines []string, idx int, needle string) bool {
 func processStatusJSONTags(t *testing.T) map[string]bool {
 	t.Helper()
 
-	path := filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace", "protocol.go")
+	path := filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace", "protocol_status.go")
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, nil, 0)
 	if err != nil {
