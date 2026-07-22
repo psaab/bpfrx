@@ -479,10 +479,18 @@ impl SessionTable {
     /// packet-loop ticks.
     ///
     /// Returns the next cursor to resume from. It returns 0 once the walk
-    /// reaches the end of the slab's index space, i.e. a full-table cycle just
+    /// reaches the end of the LIVE EXTENT, i.e. a full-table cycle just
     /// completed — the caller uses that edge to pace the next cycle. A `cursor`
-    /// past the current end (the table/slab shrank since the last slice)
+    /// past the current end (the live extent shrank since the last slice)
     /// restarts the cycle from 0.
+    ///
+    /// #6297: the cycle end is `slot_high_watermark` (`1 + the highest slot
+    /// index the slab has ever handed out`), NOT `entries.capacity()`. The slab
+    /// never shrinks, so after a session-count spike drains, `capacity()` stays
+    /// at the doubled peak; walking to `capacity()` would re-scan tens of
+    /// thousands of now-vacant slots every cycle. The watermark tracks the true
+    /// live extent (always <= `capacity()`) and is >= 1 + every occupied slot
+    /// index, so a shorter walk still visits every live session.
     ///
     /// The budget counts examined slab SLOTS (occupied or vacant), not just
     /// forward entries, so both the index scan and the per-entry callback cost
@@ -497,14 +505,27 @@ impl SessionTable {
         now_ns: u64,
         mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, u64, SessionCounters),
     ) -> usize {
-        let cap = self.entries.capacity();
-        // Empty slab or a degenerate zero budget: no progress, restart at 0 so
-        // the caller never gets wedged at a stale non-zero cursor.
+        // #6297: bound the round-robin walk to the live-extent
+        // high-watermark, NOT the monotonic `entries.capacity()`. The slab
+        // never shrinks, so after a session-count spike drains, `capacity()`
+        // stays at the doubled peak and this walk would re-visit tens of
+        // thousands of now-vacant slots every 10s cycle. `slot_high_watermark`
+        // is `1 + the highest slot the slab has ever handed out` (bumped on
+        // every insert via `insert_record`, never shrunk on removal) and is
+        // always <= `capacity()`, so the `min` is defensive. Because the
+        // watermark is >= 1 + every OCCUPIED slot index, no live session is
+        // ever above `cap` — a shorter walk can never skip an entry's
+        // last_seen refresh (which would look idle and expire early).
+        let cap = self.slot_high_watermark.min(self.entries.capacity());
+        // Empty slab (no slot ever handed out) or a degenerate zero budget: no
+        // progress, restart at 0 so the caller never gets wedged at a stale
+        // non-zero cursor.
         if cap == 0 || budget == 0 {
             return 0;
         }
-        // A cursor past the end (slab capacity shrank, or a stale save)
-        // restarts the cycle from the top rather than skipping the whole table.
+        // A cursor past the end (the live extent shrank below a saved cursor,
+        // or a stale save) restarts the cycle from the top rather than
+        // skipping the whole table.
         let start = if cursor >= cap { 0 } else { cursor };
         let end = start.saturating_add(budget).min(cap);
         for idx in start..end {

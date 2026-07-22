@@ -3471,6 +3471,181 @@ fn iter_with_idle_budgeted_bounds_and_resumes_full_coverage() {
     assert_eq!(seen, installed, "one cycle must cover every forward entry");
 }
 
+/// #6297: drive `iter_with_idle_budgeted` a full cycle at budget=1 and return
+/// the number of slab SLOTS examined (occupied + vacant) over that cycle — i.e.
+/// the walk's effective bound. Budget=1 examines exactly slot `cursor` per call
+/// and returns `cursor + 1` (or 0 when that reaches the bound), so the call
+/// count equals the examined-slot count. Precondition: a non-empty walk extent
+/// (the empty-slab fast path returns 0 immediately, which this helper cannot
+/// distinguish from a 1-slot cycle).
+fn count_full_budgeted_sweep(table: &SessionTable, now_ns: u64) -> usize {
+    let mut cursor = 0usize;
+    let mut examined = 0usize;
+    // The extent can never exceed capacity(); cap the loop generously above it
+    // so a non-advancing cursor panics instead of spinning forever.
+    let guard = table.entries_capacity_for_test() + 8;
+    for _ in 0..guard {
+        let next = table.iter_with_idle_budgeted(cursor, 1, now_ns, |_, _, _, _, _| {});
+        examined += 1;
+        if next == 0 {
+            return examined;
+        }
+        cursor = next;
+    }
+    panic!("budgeted sweep did not complete within {guard} slices");
+}
+
+#[test]
+fn iter_with_idle_budgeted_bounds_to_high_watermark_after_drain() {
+    // #6297: the budgeted refresh walk must bound its round-robin sweep to the
+    // LIVE-EXTENT high-watermark (1 + the highest slot ever handed out), NOT the
+    // monotonic slab `capacity()`. The slab never shrinks, so after a
+    // session-count spike drains, `capacity()` overshoots the peak extent (the
+    // backing Vec doubles past it) and a capacity-bound walk re-scans vacant
+    // slots every cycle. Reverting the bound to `entries.capacity()` reddens the
+    // `examined < capacity` assertion below.
+    let mut table = SessionTable::new();
+
+    // Fill to a NON-power-of-two session count so the backing Vec's doubling
+    // leaves capacity() STRICTLY above the watermark (the peak extent).
+    const N: usize = 100;
+    let install_time = 1_000_000_000u64;
+    let mut keys = Vec::with_capacity(N);
+    for i in 0..N {
+        let mut key = key_v4();
+        key.src_port = 10_000 + i as u16; // distinct 5-tuples -> distinct entries
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_time,
+            PROTO_TCP,
+            0x10,
+        ));
+        // Fresh slab, no prior vacancies -> installs land at contiguous slots
+        // 0..N in call order.
+        assert_eq!(
+            table.handle_for_key(&key),
+            Some(i as u32),
+            "install {i} expected to land at slot {i}",
+        );
+        keys.push(key);
+    }
+
+    let watermark = table.slot_high_watermark_for_test();
+    let capacity = table.entries_capacity_for_test();
+    assert_eq!(watermark, N, "watermark must be 1 + the top occupied slot");
+    assert!(
+        capacity > watermark,
+        "test needs a doubling gap: capacity {capacity} must exceed watermark \
+         {watermark} (choose a non-power-of-two N)",
+    );
+
+    // Drain almost everything. capacity() AND the watermark are both monotonic,
+    // so they stay put; only len() collapses -> the mostly-vacant slab the issue
+    // describes.
+    for key in keys.iter().take(N - 3) {
+        table.delete(key);
+    }
+    assert_eq!(table.len(), 3, "drained to a near-empty table");
+    assert_eq!(
+        table.entries_capacity_for_test(),
+        capacity,
+        "slab capacity is monotonic — it never shrinks on drain",
+    );
+    assert_eq!(
+        table.slot_high_watermark_for_test(),
+        watermark,
+        "watermark is monotonic — not shrunk on removal (see the invariant)",
+    );
+
+    // Count the slots EXAMINED over one full cycle.
+    let now = install_time + 5_000_000_000;
+    let examined = count_full_budgeted_sweep(&table, now);
+
+    // THE fail-on-revert assertions: the walk stops at the live extent, not the
+    // doubled capacity.
+    assert_eq!(
+        examined, watermark,
+        "walk must examine exactly the high-watermark extent ({watermark}), got {examined}",
+    );
+    assert!(
+        examined < capacity,
+        "walk examined {examined} slots — must be < the monotonic capacity \
+         {capacity} (reverting the bound to capacity() breaks this)",
+    );
+}
+
+#[test]
+fn iter_with_idle_budgeted_never_skips_a_live_session_above_the_len() {
+    // #6297 correctness guard: the high-watermark bound must NEVER drop below a
+    // live slot, or that session's last_seen would stop being mirrored into the
+    // BPF conntrack map and the entry would look idle and expire early. Engineer
+    // a table whose SOLE live session sits at a high slot far above len(), then
+    // assert a full budgeted sweep still refreshes it. A bound that under-shot
+    // (e.g. to len()) would skip it.
+    let mut table = SessionTable::new();
+    const N: usize = 64;
+    let install_time = 1_000_000_000u64;
+    let mut keys = Vec::with_capacity(N);
+    for i in 0..N {
+        let mut key = key_v4();
+        key.src_port = 20_000 + i as u16;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_time,
+            PROTO_TCP,
+            0x10,
+        ));
+        assert_eq!(table.handle_for_key(&key), Some(i as u32));
+        keys.push(key);
+    }
+    let watermark = table.slot_high_watermark_for_test();
+    assert_eq!(watermark, N);
+
+    // Remove every session EXCEPT the one at the top slot (N-1). len() collapses
+    // to 1 while the live session stays at slot N-1, far above len().
+    let survivor = keys[N - 1].clone();
+    for key in keys.iter().take(N - 1) {
+        table.delete(key);
+    }
+    assert_eq!(table.len(), 1);
+    assert_eq!(
+        table.handle_for_key(&survivor),
+        Some((N - 1) as u32),
+        "survivor must still occupy the top slot",
+    );
+    // Watermark unchanged (monotonic) and strictly above the survivor's slot.
+    assert_eq!(table.slot_high_watermark_for_test(), watermark);
+    assert!(watermark > (N - 1));
+
+    // A full budgeted sweep MUST refresh the survivor.
+    let now = install_time + 5_000_000_000;
+    let mut cursor = 0usize;
+    let mut refreshed = false;
+    for _ in 0..(table.entries_capacity_for_test() + 8) {
+        let next = table.iter_with_idle_budgeted(cursor, 8, now, |k, _d, _m, _idle, _c| {
+            if k == &survivor {
+                refreshed = true;
+            }
+        });
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    assert!(
+        refreshed,
+        "the live session at slot {} (len={}, watermark={}) must be refreshed — \
+         the bound must never drop below a live slot",
+        N - 1,
+        table.len(),
+        watermark,
+    );
+}
+
 #[test]
 fn refresh_local_skips_peer_synced_entries() {
     let mut table = SessionTable::new();

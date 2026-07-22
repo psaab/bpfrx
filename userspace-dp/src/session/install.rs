@@ -203,7 +203,10 @@ impl SessionTable {
                 session_id,
             },
         };
-        let raw = self.entries.insert(record);
+        // #6297: route every slab insert through `insert_record` so the
+        // live-extent high-watermark (the budgeted refresh walk's bound) is
+        // advanced to cover this new slot.
+        let raw = self.insert_record(record);
         let handle: u32 = raw.try_into().expect("slab handle exceeds u32");
         self.key_to_handle.insert(key.clone(), handle);
         self.index_forward_nat_key(&key, handle, decision, &metadata);
@@ -418,7 +421,10 @@ impl SessionTable {
                 session_id,
             },
         };
-        let raw = self.entries.insert(record);
+        // #6297: route every slab insert through `insert_record` so the
+        // live-extent high-watermark (the budgeted refresh walk's bound) is
+        // advanced to cover this new slot.
+        let raw = self.insert_record(record);
         let handle: u32 = raw.try_into().expect("slab handle exceeds u32");
         let index_key = key.clone();
         self.key_to_handle.insert(key, handle);
