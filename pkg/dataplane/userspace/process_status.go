@@ -169,9 +169,7 @@ func (m *Manager) statusLoop(ctx context.Context) {
 				// Manager (for example across a future reconnect/ISSU). Resume from
 				// its applied generation before any reconciliation on this tick can
 				// publish another neighbor replace. m.mu is held for the whole poll.
-				if status.ManagerNeighborGeneration > m.neighborReplaceGen {
-					m.neighborReplaceGen = status.ManagerNeighborGeneration
-				}
+				m.seedNeighborReplaceGenerationLocked(status.ManagerNeighborGeneration)
 				if err := m.applyHelperStatusLocked(&status); err != nil {
 					slog.Warn("userspace dataplane status sync failed", "err", err)
 				} else {

@@ -128,6 +128,97 @@ func TestNeighborReplaceEnvelopeCarriesGenerationAndRetainsRetryDebt(t *testing.
 	}
 }
 
+// TestNeighborReplaceGenerationSeedsFromStartupResponseBeforeFirstPush guards
+// the pre-status-tick startup window from #6034. Compile's successful initial
+// apply_snapshot response already carries the surviving helper's replace fence;
+// publishSnapshotFailClosedLocked must consume it before Compile exposes
+// m.lastSnapshot and a neighbor event can trigger the first replace.
+//
+// No status loop is started here. Reverting the startup-response seed makes the
+// first update_neighbors carry generation 1, which the modeled helper fences at
+// 100 while ACKing 100 (the false-success case that prompted this regression).
+func TestNeighborReplaceGenerationSeedsFromStartupResponseBeforeFirstPush(t *testing.T) {
+	const helperFence uint64 = 100
+
+	var (
+		helperMu   sync.Mutex
+		appliedGen uint64 = helperFence
+		requests   []ControlRequest
+	)
+	requestHook := func(req ControlRequest, status *ProcessStatus) error {
+		helperMu.Lock()
+		requests = append(requests, req)
+		if req.Type == "update_neighbors" && req.NeighborGeneration > appliedGen {
+			appliedGen = req.NeighborGeneration
+		}
+		reply := appliedGen
+		helperMu.Unlock()
+		if status != nil {
+			*status = ProcessStatus{PID: 4321, ManagerNeighborGeneration: reply}
+		}
+		return nil
+	}
+
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess: %v", err)
+	}
+	m := New()
+	m.proc = &exec.Cmd{Process: proc}
+	m.controlRequestHook = requestHook
+	if m.neighborReplaceGen != 0 {
+		t.Fatalf("new manager neighborReplaceGen = %d, want reset value 0", m.neighborReplaceGen)
+	}
+
+	seededNeighbor := NeighborSnapshot{
+		Ifindex: 13,
+		Family:  "inet",
+		IP:      "172.16.80.200",
+		MAC:     "02:aa:bb:cc:dd:ee",
+		State:   "reachable",
+	}
+	startupSnapshot := &ConfigSnapshot{
+		Version:    ProtocolVersion,
+		Generation: 1,
+		Config:     &config.Config{},
+		Neighbors:  []NeighborSnapshot{seededNeighbor},
+	}
+
+	// Mirror Compile's startup ordering under m.mu: consume the successful
+	// apply_snapshot response first, then expose lastSnapshot. There is
+	// deliberately no statusLoop tick between exposure and regeneration.
+	m.mu.Lock()
+	var startupStatus ProcessStatus
+	if err := m.publishSnapshotFailClosedLocked(startupSnapshot, &startupStatus, false); err != nil {
+		m.mu.Unlock()
+		t.Fatalf("startup apply_snapshot: %v", err)
+	}
+	m.lastSnapshot = startupSnapshot
+	m.generation = startupSnapshot.Generation
+	m.mu.Unlock()
+
+	m.RegenerateNeighborSnapshot()
+
+	helperMu.Lock()
+	gotRequests := append([]ControlRequest(nil), requests...)
+	gotApplied := appliedGen
+	helperMu.Unlock()
+	if len(gotRequests) != 2 {
+		t.Fatalf("control requests = %d, want apply_snapshot then update_neighbors: %+v", len(gotRequests), gotRequests)
+	}
+	if gotRequests[0].Type != "apply_snapshot" || gotRequests[1].Type != "update_neighbors" {
+		t.Fatalf("control request order = %q, %q; want apply_snapshot, update_neighbors",
+			gotRequests[0].Type, gotRequests[1].Type)
+	}
+	if got := gotRequests[1].NeighborGeneration; got != helperFence+1 {
+		t.Fatalf("pre-status-tick first neighbor replace generation = %d, want %d (startup fence %d + 1)",
+			got, helperFence+1, helperFence)
+	}
+	if gotApplied != helperFence+1 {
+		t.Fatalf("helper applied generation = %d, want %d", gotApplied, helperFence+1)
+	}
+}
+
 // TestNeighborReplaceGenerationSeedsFromFirstStatus is the restart guard for
 // #6034. A new Manager starts its in-memory replace counter at zero, while a
 // surviving helper can retain a much higher applied-generation fence. The

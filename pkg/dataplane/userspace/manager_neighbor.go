@@ -28,6 +28,15 @@ func filterPublishableNeighbors(neighbors []NeighborSnapshot) []NeighborSnapshot
 	return out
 }
 
+// seedNeighborReplaceGenerationLocked advances the manager's replace counter
+// to the helper's applied-generation fence without ever moving it backwards.
+// Caller must hold m.mu.
+func (m *Manager) seedNeighborReplaceGenerationLocked(appliedGeneration uint64) {
+	if appliedGeneration > m.neighborReplaceGen {
+		m.neighborReplaceGen = appliedGeneration
+	}
+}
+
 // rebuildNeighborIndex updates m.neighborIndex from the current
 // m.lastSnapshot.Neighbors slice. Caller MUST hold m.mu. Called
 // after every assignment to lastSnapshot.Neighbors.
