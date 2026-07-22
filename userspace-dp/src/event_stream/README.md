@@ -7,8 +7,40 @@ periodic ACK from the daemon.
 
 ## Files
 
-- `mod.rs` — `EventStreamSender` owns its own I/O thread, connects to
-  the daemon's listener, sends frames, handles reconnect on EPIPE.
+- `mod.rs` — the module facade: `EventStreamSender` (owns the I/O thread),
+  the shared `EventStreamShared` atomics/state, `EventStreamStats`, the
+  `EventStreamWorkerHandle` producer core (sequence reservation/rollback,
+  bounded/lossless channel admission, `push_delta`/`push_delta_lossless`),
+  config constants, and the I/O-thread bootstrap. The transport/producer
+  state machine was split into the cohesive submodules below (#6235, pure
+  code motion); `mod.rs` re-exports the moved helpers so callers and the
+  test tree resolve unchanged.
+- `clock.rs` — monotonic-to-wall-clock conversion for the flow-export wire
+  fields (`read_mono_and_wall_clocks`, `monotonic_ns_to_unix_ns/_secs/
+  _secs_subnanos`, `mono_ns_to_wall_clock_unix_ns`; #2465/#2853/#2470).
+- `backlog.rs` — the cursor-backed `WriteBacklog` (geometric compaction,
+  #4974) and the `WRITE_BACKLOG_MAX_BYTES` cap (#2381).
+- `producer.rs` — non-blocking helper-side producer API for RT_FLOW
+  telemetry: per-kind/per-zone rate limiter, queue-budget ADMISSION and
+  counters, and `try_emit_dataplane_frame` (see below).
+- `rt_flow.rs` — the RT_FLOW SESSION_CLOSE/SESSION_CREATE projection
+  emitters (`emit_session_close_rt_flow`, `emit_session_create_rt_flow`).
+- `connection.rs` — the I/O thread: reconnect loop (`io_thread_main`,
+  `try_connect`), un-ACKed replay (`replay_buffered`), the stop-aware
+  backpressured writer (`write_all_backpressured`, #2877), and the
+  steady-state `run_connected_loop`.
+- `control.rs` — daemon->helper control-frame decode (`process_control_frames`:
+  ACK-window #2959, Pause/Resume) and the DORMANT seq-fenced drain
+  (`handle_drain_request`, #2876/#2882/#2875).
+- `drain.rs` — channel-drain mechanics: `drain_channel_into_write_buf` (the
+  `WRITE_BACKLOG_MAX_BYTES` cap + ordered FullResync merge #5267),
+  `flush_pending_resync`, `DrainOutcome`, and the shutdown `drain_remaining`.
+- `replay.rs` — replay-buffer admission/eviction/retirement
+  (`push_replay_frame`, `evict_replay_frame`, `pop_replay_frame`,
+  `release_replay_dataplane_event_queue_budget`; #2382/#2875).
+- `budget.rs` — the I/O-thread queue-budget RETIREMENT side
+  (`release_dataplane_event_queue_budget`), paired with `producer.rs`
+  admission.
 - `codec.rs` — frame layout: 16-byte header
   `[length:u32 LE][type:u8][reserved:3][seq:u64 LE]` followed by the
   payload. Message types: `MSG_SESSION_OPEN`, `MSG_SESSION_CLOSE`,

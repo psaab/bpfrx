@@ -436,7 +436,7 @@ the specific shard(s) it mutates:
   #949 pair-write. Its `pair_write_needed` gate fires on a genuine MAC change
   (`current != Some(src_mac)`), not just a first sighting, so it really does
   mutate an existing neighbor's MAC — and `lookup_neighbor_entry`
-  (`forwarding/mod.rs`) falls back to `dynamic_neighbors` for a next-hop
+  (`forwarding/fib.rs`) falls back to `dynamic_neighbors` for a next-hop
   absent from the manager set, the common AF_XDP fast-path case where the
   kernel never ARP-resolves the next-hop because zero-copy bypasses the
   stack. Without a bump an RX-learned MAC change would leave the cached

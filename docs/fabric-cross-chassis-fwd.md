@@ -87,7 +87,7 @@ the absent fabric.
 **Dual-fabric egress selection by parent up-state (#4082):** the
 cross-chassis redirect egresses over a fabric parent ifindex, but the
 Rust selection (`resolve_fabric_redirect_from_list`,
-`userspace-dp/src/afxdp/forwarding/mod.rs`) historically picked the FIRST
+`userspace-dp/src/afxdp/forwarding/fabric.rs`) historically picked the FIRST
 fabric with a valid parent ifindex — functionally `fab0` (the list is
 Go-sorted by name). A DOWN `fab0` still has a nonzero parent ifindex (and
 a stale/permanent neighbor entry can keep its peer MAC resolved), so the
@@ -242,7 +242,7 @@ forwarding changes. LAN connectivity (ping 10.0.60.1) works correctly.
 ## Userspace dataplane: FabricRedirect unsendable fail-closed (#1946)
 
 The Rust AF_XDP helper resolves a `FabricRedirect` disposition
-(`resolve_fabric_redirect`, `userspace-dp/src/afxdp/forwarding/mod.rs`)
+(`resolve_fabric_redirect`, `userspace-dp/src/afxdp/forwarding/fabric.rs`)
 into an L2 redirect: re-header the original packet with the fabric
 peer/local MACs and TX it out the fabric parent so the **peer** runs it
 through its full pipeline. A FabricRedirect frame is therefore a
@@ -327,7 +327,7 @@ the parent interface. Two resolution passes build them:
   (`userspace-dp/src/afxdp/forwarding_build/fib.rs`), run for every
   `build_forwarding_state` (config apply + route-churn `bump_fib`).
 - **runtime refresh** — `resolve_fabric_links_from_snapshots`
-  (`userspace-dp/src/afxdp/forwarding/mod.rs`), driven by the Go daemon's
+  (`userspace-dp/src/afxdp/forwarding/fabric.rs`), driven by the Go daemon's
   `SyncFabricState`/`refreshFabricFwd` (`update_fabrics` control verb) once
   ARP/NDP resolves the peer MAC that was unresolved at initial build.
 
@@ -342,7 +342,7 @@ operator had no way to see an unresolved fabric.
 
 Both passes now route the skip-vs-install decision through the shared
 `build_fabric_link_or_skip` classifier, which partitions skips into two
-cumulative diagnostic atomics (`forwarding/mod.rs`):
+cumulative diagnostic atomics (`forwarding/fabric.rs`):
 
 - **`FABRIC_LINK_SKIPPED_MALFORMED`** — an invalid parent ifindex, an
   unparseable peer address, or a **non-empty** local/peer MAC string that
@@ -457,7 +457,7 @@ until `P_new`'s neighbor MAC resolves. Throughout that window the old link
 **Fix — invalidate-before-accept, keyed on peer identity.** A preserved link
 is SUPERSEDED when the incoming snapshots configure its parent but name a
 different, parseable peer address
-(`fabric_link_superseded_by_snapshots`, `afxdp/forwarding/mod.rs`). A
+(`fabric_link_superseded_by_snapshots`, `afxdp/forwarding/fabric.rs`). A
 superseded link is dropped from the preserved/merged set *before* it can be
 kept, in both paths. Consequences:
 
@@ -538,7 +538,7 @@ scope guards) and `afxdp/poll_stages.rs`
 
 ## The cluster-peer return fast path must not adopt NEW UDP flows (#4439)
 
-`cluster_peer_return_fast_path` (`userspace-dp/src/afxdp/forwarding/mod.rs`,
+`cluster_peer_return_fast_path` (`userspace-dp/src/afxdp/forwarding/fabric.rs`,
 called from the session-MISS decision in `poll_descriptor/mod.rs`) exists for
 the sync-race sub-window: a packet the active RG owner already
 policy/NAT-validated is fabric-redirected to the peer, arrives before the

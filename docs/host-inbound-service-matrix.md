@@ -937,7 +937,7 @@ config. The warning names the policy and points here.
 The XSK `LocalDelivery` arm may CACHE a firewall-local session on a session
 miss so subsequent established packets bypass userspace and return straight to
 the kernel (`should_cache_local_delivery_session_on_miss` →
-`install_helper_local_session_on_miss`, `userspace-dp/src/afxdp/forwarding/mod.rs`).
+`install_helper_local_session_on_miss`, `userspace-dp/src/afxdp/forwarding/local_delivery.rs`).
 That install is gated so a **TCP** session is seeded only off the handshake — a
 first packet that carries **SYN** (an initial SYN, or the SYN|ACK inbound leg of
 a firewall-originated flow). The gate is a **single positive predicate**:
