@@ -1,3 +1,35 @@
+## 2026-07-22 — #4975: index replay-filter drop set in a HashSet
+
+- **Timestamp**: 2026-07-22 13:30 PDT (fix/4975-replay-purge-index)
+- **Action**: `filter_replayed_synced_sessions`
+  (`userspace-dp/src/afxdp/coordinator/mod.rs`) collected purge drop keys
+  into a `Vec<SessionKey>` then ran
+  `entries.retain(|e| !drop_keys.contains(&e.key))`. `Vec::contains` per
+  surviving entry made the dominant retain phase O(entries × drop_keys) —
+  quadratic during HA-recovery reconcile when a tunnel remap coincides with
+  a large synced-session set (`entries` bounded by the 131,072 worker
+  ceiling; `drop_keys` grows with purged tunnel sessions). Replaced the
+  `Vec` membership structure with `std::collections::HashSet<SessionKey>`,
+  pre-sized `with_capacity(entries.len())`, so the retain step is O(entries)
+  amortized. `SessionKey` already derives `Hash + Eq`, so no derive change
+  was needed. Behavior is identical: survivor order is preserved (retain
+  still walks the vector in place — a HashSet only changes membership
+  testing, not iteration order), and the asymmetric NAT-companion semantics
+  are unchanged (a purged FORWARD entry still drops its derived
+  `reverse_session_key` companion; a reverse-marked entry adds no companion).
+  The early-return guards and the public signature are untouched.
+- **Validation**: `cargo build` clean; `cargo test --release replay_filter`
+  → 2/2 green (existing companion-semantics pin + new order/membership pin).
+  Added fail-on-revert test
+  `replay_filter_preserves_order_and_survivors_across_many_drops`: a
+  many-drop-keys set (purge ids 100..=131) interleaved with survivors,
+  including a survivor that shares src_ip/dst_ip/proto with purged forwards
+  and differs only in src_port — asserts exact survivor list AND original
+  order. Temp-mutating the retain to over-drop that survivor confirmed the
+  test goes RED at the ordered-survivor assertion; restored to green.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/tests_decap_dnat_table.rs
+
 ## 2026-07-22 — #6297: cap budgeted conntrack refresh walk to the live high-watermark
 
 - **Timestamp**: 2026-07-22 (fix/6297-conntrack-refresh-watermark)

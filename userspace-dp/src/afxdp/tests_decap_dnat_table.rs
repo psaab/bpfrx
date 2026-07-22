@@ -249,6 +249,140 @@ fn replay_filter_drops_purged_forward_and_derived_reverse_companion() {
     assert_eq!(entries.len(), 1);
 }
 
+/// #4975 membership-index pin: the drop set is a HashSet, but the retain
+/// must stay behavior-identical to the prior `Vec::contains` scan — it
+/// tests membership only, never reorders or over-drops. This exercises a
+/// many-drop-keys set interleaved with survivors so a broken membership
+/// index (wrong key type, a collision-prone hashable projection that
+/// collapses distinct keys, or a survivor accidentally swept) is caught:
+///   * survivors are returned in ORIGINAL order (retain is in-place);
+///   * a survivor that shares src_ip/dst_ip/proto/family with a dropped
+///     forward key and differs ONLY in src_port MUST survive — a
+///     projection keyed on anything less than the whole SessionKey would
+///     wrongly drop it;
+///   * every purged forward's derived reverse companion is dropped, and a
+///     reverse-marked purged entry drops standalone (asymmetry preserved).
+/// FAIL-ON-REVERT: if the retain over-drops (survivor collides in a lossy
+/// index) or reorders, the ordered-survivor assertion fails.
+#[test]
+fn replay_filter_preserves_order_and_survivors_across_many_drops() {
+    use crate::afxdp::coordinator::filter_replayed_synced_sessions;
+
+    let nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+        ..NatDecision::default()
+    };
+    let base = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 10000,
+        dst_port: 5201,
+    };
+    let key_at = |src_port: u16| SessionKey {
+        src_port,
+        ..base.clone()
+    };
+    let tunnel_resolution = |id: u16| ForwardingResolution {
+        disposition: ForwardingDisposition::ForwardCandidate,
+        local_ifindex: 0,
+        egress_ifindex: 41,
+        tx_ifindex: 3,
+        tunnel_endpoint_id: id,
+        next_hop: None,
+        neighbor_mac: Some([2, 0, 0, 0, 0, 9]),
+        src_mac: Some([2, 0, 0, 0, 0, 1]),
+        tx_vlan_id: 0,
+    };
+    let make = |key: &SessionKey, resolution: ForwardingResolution, is_reverse: bool| {
+        SyncedSessionEntry {
+            key: key.clone(),
+            decision: SessionDecision { resolution, nat },
+            metadata: SessionMetadata {
+                ingress_zone: 1,
+                egress_zone: 2,
+                owner_rg_id: 1,
+                fabric_ingress: false,
+                is_reverse,
+                nat64_reverse: None,
+                log_session_init: false,
+                log_session_close: false,
+                policy_id: 0,
+                inactivity_timeout_ns: None,
+                policy_counter_idx: 0,
+                policy_counter: None,
+            },
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+            generation: 0,
+            session_id: 0,
+        }
+    };
+
+    // Purge ids 100..=131 (a large drop set). Build many purged forward
+    // entries whose derived reverse companions must also drop, interleaved
+    // with survivors. One survivor (`survivor_shares_ip`) shares every
+    // field of a purged forward except src_port — a lossy index would
+    // wrongly sweep it.
+    let purge_ids: Vec<u16> = (100u16..=131).collect();
+    let survivor_shares_ip = key_at(20000); // distinct src_port, not purged
+    let survivor_other = SessionKey {
+        src_port: 30000,
+        dst_port: 443,
+        ..base.clone()
+    };
+
+    let mut entries: Vec<SyncedSessionEntry> = Vec::new();
+    let mut expected_survivors: Vec<SessionKey> = Vec::new();
+
+    // A leading survivor to pin that position 0 is retained.
+    entries.push(make(&survivor_other, tunnel_resolution(0), false));
+    expected_survivors.push(survivor_other.clone());
+
+    for (i, &id) in purge_ids.iter().enumerate() {
+        // Each purged forward uses a unique src_port so its derived
+        // reverse companion is unique too.
+        let fk = key_at(40000 + i as u16);
+        entries.push(make(&fk, tunnel_resolution(id), false));
+        // Interleave the shared-IP survivor exactly once, mid-stream.
+        if i == purge_ids.len() / 2 {
+            entries.push(make(&survivor_shares_ip, tunnel_resolution(0), false));
+            expected_survivors.push(survivor_shares_ip.clone());
+        }
+    }
+
+    // A reverse-marked purged entry (drops standalone; no companion added).
+    let reverse_only = SessionKey {
+        src_port: 55000,
+        ..base.clone()
+    };
+    entries.push(make(&reverse_only, tunnel_resolution(131), true));
+
+    // A trailing survivor to pin the last position is retained.
+    let survivor_tail = SessionKey {
+        src_port: 60000,
+        ..base.clone()
+    };
+    entries.push(make(&survivor_tail, tunnel_resolution(0), false));
+    expected_survivors.push(survivor_tail.clone());
+
+    filter_replayed_synced_sessions(&mut entries, &purge_ids);
+
+    let got: Vec<SessionKey> = entries.iter().map(|e| e.key.clone()).collect();
+    assert_eq!(
+        got, expected_survivors,
+        "survivors must be exactly the non-purged entries, in original order"
+    );
+    // The shared-IP survivor differs from purged forwards only in src_port
+    // — an index keyed on less than the whole SessionKey would drop it.
+    assert!(
+        got.contains(&survivor_shares_ip),
+        "survivor sharing src_ip/dst_ip/proto with purged keys must not be swept"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #2244: publish_dnat_table_entry must surface bpf_map_update_elem failures.
 //
