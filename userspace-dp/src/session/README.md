@@ -304,6 +304,21 @@ per idle-crossed entry, in the GC pass only — the per-packet forwarding path i
 unchanged (the alternative, refreshing the companion on every reverse packet,
 would add a hot-path re-bucket).
 
+**Reverse companion honors the app idle window (#5153).** Because the probe
+compares the companion against `companion.expires_after_ns`, the reverse
+companion built by `build_reverse_session_from_forward_match`
+(`afxdp/shared_ops.rs`, the synthesized/failover and live reverse-install
+path) inherits the forward session's per-application `inactivity_timeout_ns`
+alongside the other metadata (log/policy/NAT64). Both halves of one flow share
+the admitting application, so `session_timeout_ns` derives the SAME
+`expires_after_ns` for either direction. Before #5153 the reverse companion
+hardcoded `inactivity_timeout_ns: None`, so its window fell back to the global
+per-protocol timeout; `companion_keeps_alive` then kept a short-timeout forward
+half alive on the companion's longer global window — stale-state retention
+beyond the app's configured idle timeout (residual of #3227/#3301/#4380). A
+forward session with no per-app override still yields `None` on the reverse
+companion (global timeout), bit-identical to the prior behavior.
+
 **Seconds→nanoseconds bound (#2441).** Configured TCP/UDP/ICMP timeouts
 arrive in the snapshot as `u64` seconds and are converted in
 `SessionTimeouts::from_seconds`. The conversion uses `checked_mul` and

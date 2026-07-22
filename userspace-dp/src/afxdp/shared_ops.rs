@@ -713,7 +713,20 @@ pub(super) fn build_reverse_session_from_forward_match(
         // materialized reverse companion attributes the same policy in its
         // BPF-compat conntrack row.
         policy_id: forward_match.metadata.policy_id,
-        inactivity_timeout_ns: None,
+        // #5153: inherit the forward session's per-application idle timeout so
+        // the reverse companion ages on the admitting app's window, not the
+        // global timeout. Both halves of one stateful flow share the same
+        // application, so the app's `inactivity-timeout` governs either
+        // direction. `companion_keeps_alive` (expire.rs) uses the companion's
+        // OWN `expires_after_ns` — derived from this field via
+        // `session_timeout_ns` — to decide whether to keep the idle-crossed
+        // forward half alive; hardcoding `None` here made the reverse
+        // companion's window fall back to the global timeout (e.g. 300s),
+        // extending a 30s app timeout toward the global one. `None` for every
+        // forward session with no per-app override (the forward metadata
+        // carries `None`), bit-identical to the prior behavior. Residual of
+        // #3227/#3301/#4380.
+        inactivity_timeout_ns: forward_match.metadata.inactivity_timeout_ns,
         // #3073: inherit the admitting rule's hit-counter handle from the
         // forward session so a materialized reverse companion's reply traffic
         // counts against the same policy. #3322: inherit the reorder-stable
