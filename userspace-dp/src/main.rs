@@ -45,11 +45,8 @@ mod server;
 pub(crate) use server::{handle_stream, Args, PollMode, ServerState};
 use server::helpers::*;
 
-use afxdp::SyncedSessionEntry;
 use chrono::Utc;
 use protocol::*;
-use serde::Serialize;
-use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::os::unix::net::UnixListener;
@@ -57,7 +54,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use state_writer::StateWriter;
 
