@@ -55885,3 +55885,24 @@ top.
   firsthand-verified RED on neutralizing their respective consume wiring.
   Added a coverage note to the #5450 recovery section of the session-sync doc.
   **File(s)**: pkg/cluster/sync_test.go, docs/session-sync-architecture.md
+
+- **Timestamp**: 2026-07-22 (#5166)
+  **Action**: Publish the derived CoS owner/live/lease/backlog/vtime maps +
+  `ha.fabrics` BEFORE the `ha.forwarding` worker-visible store in the in-place
+  `refresh_runtime_snapshot` path. A live worker (loop_body) loads
+  `shared_forwarding` first then the CoS map Arcs in one tick and rebuilds
+  `cos_fast_interfaces` from both — the pre-#5166 order (forwarding published
+  first, CoS refreshed after) let a worker see new queue config with a
+  stale/empty CoS owner map for a tick (transient class blackhole for a new
+  queue, stale-rate meter, N-worker lease over-admission). Pure reorder of the
+  coordinator-side stores — no new per-tick worker cost, no worker lock;
+  ArcSwap acquire/release guarantees a worker seeing new forwarding also sees
+  the matching CoS maps. WG/GRE reconcile still runs after the forwarding store.
+  Added fail-on-revert test `refresh_runtime_snapshot_publishes_cos_owner_map_
+  before_forwarding` via a `#[cfg(test)] cos_owner_at_forwarding_publish` seam
+  (firsthand-verified RED when the reorder is reverted). Full cargo suite green
+  (4183 passed / 0 failed).
+  **File(s)**: userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md

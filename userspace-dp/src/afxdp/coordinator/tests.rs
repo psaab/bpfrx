@@ -578,6 +578,99 @@ fn refresh_runtime_snapshot_rebuilds_cos_owner_worker_map_from_identities() {
     assert_eq!(shared.get(&(80, 0)), Some(&2));
 }
 
+/// #5166 ordering regression: the in-place `refresh_runtime_snapshot` must
+/// publish the derived CoS owner/live/lease/backlog/vtime maps BEFORE it
+/// makes the new `ForwardingState` worker-visible (`ha.forwarding` store).
+/// A live worker loads `shared_forwarding` first and the CoS maps second
+/// within one tick, then rebuilds `cos_fast_interfaces` from both — so if
+/// forwarding were published first, a worker could see the new queue config
+/// with a stale/empty CoS owner map (transient class blackhole / old-rate /
+/// N-worker over-admission).
+///
+/// The coordinator records `cos_owner_at_forwarding_publish` (a `cfg(test)`
+/// seam) at the exact instant just before the forwarding store. With the fix
+/// the CoS owner map is already populated with the new queue there; reverting
+/// the reorder (moving `refresh_cos_owner_worker_map_from_identities` back
+/// after `ha.forwarding.store`) captures the stale empty map and this test
+/// goes RED.
+#[test]
+fn refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding() {
+    let mut coordinator = Coordinator::new();
+    coordinator.workers.identities.insert(
+        1,
+        BindingIdentity {
+            slot: 1,
+            queue_id: 0,
+            worker_id: 2,
+            interface: "ge-0-0-2".into(),
+            ifindex: 12,
+        },
+    );
+
+    // Sanity: a fresh coordinator has published nothing yet.
+    assert!(
+        coordinator.cos_owner_at_forwarding_publish.is_none(),
+        "no snapshot applied yet",
+    );
+    assert!(
+        coordinator.cos.owner_worker_by_queue.load().is_empty(),
+        "the CoS owner map starts empty (old generation)",
+    );
+
+    let mut snapshot = ConfigSnapshot::default();
+    snapshot.interfaces.push(InterfaceSnapshot {
+        name: "reth0.80".into(),
+        ifindex: 80,
+        parent_ifindex: 12,
+        hardware_addr: "02:00:00:00:00:80".into(),
+        cos_shaping_rate_bytes_per_sec: 1_000_000,
+        cos_scheduler_map: "wan-map".into(),
+        ..Default::default()
+    });
+    snapshot.class_of_service = Some(ClassOfServiceSnapshot {
+        forwarding_classes: vec![CoSForwardingClassSnapshot {
+            name: "best-effort".into(),
+            queue: 0,
+        }],
+        schedulers: vec![],
+        scheduler_maps: vec![CoSSchedulerMapSnapshot {
+            name: "wan-map".into(),
+            entries: vec![CoSSchedulerMapEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                scheduler: String::new(),
+            }],
+        }],
+        dscp_classifiers: vec![],
+        ieee8021_classifiers: vec![],
+        dscp_rewrite_rules: vec![],
+    });
+
+    coordinator
+        .refresh_runtime_snapshot(&snapshot)
+        .expect("refresh_runtime_snapshot must succeed");
+
+    // The forwarding state gained a new CoS queue (80, 0). The invariant:
+    // at the instant forwarding became worker-visible, the CoS owner map
+    // already owned that queue — otherwise a worker sees new forwarding with
+    // no owner for the new queue.
+    let captured = coordinator
+        .cos_owner_at_forwarding_publish
+        .as_ref()
+        .expect("refresh must record the CoS owner map at the forwarding-publish point");
+    assert_eq!(
+        captured.get(&(80, 0)),
+        Some(&2),
+        "CoS owner for the new queue (80,0) must be published BEFORE forwarding \
+         becomes worker-visible (#5166 ordering)",
+    );
+
+    // Post-refresh sanity: the fixture really did create queue (80,0).
+    assert_eq!(
+        coordinator.cos.owner_worker_by_queue.load().get(&(80, 0)),
+        Some(&2),
+    );
+}
+
 #[test]
 fn build_shared_cos_root_leases_uses_active_workers_per_interface() {
     let mut forwarding = ForwardingState::default();
