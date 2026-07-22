@@ -148,6 +148,47 @@ This is the package that drives chassis-cluster failover.
 - Async GARP: first pair <1 ms; remaining sent at 50 ms intervals in a
   background goroutine. Critical path stays addVIPs → sendAdvert →
   emitEvent (sync), then `go sendGARP(false)` (async).
+- Verified role publication (#5082 MASTER, #5482 BACKUP): a role is
+  published via `emitEvent` only after the kernel VIP set agrees with it.
+  The daemon consumes the event to flip `rg_active`, drop/inject
+  blackholes, and start/stop per-RG services, so a role that diverges
+  from the on-wire VIP state blackholes traffic. On the **MASTER** side
+  `becomeMaster` is fail-closed: `addVIPsLocked` returns a structured
+  `vipActuationResult`, and if any required VIP fails to actuate (or a
+  concurrent demotion bumped `ownerGen`) it rolls back the partial adds,
+  reverts to `StateBackup`, emits **BACKUP**, and returns `false` — it
+  never advertises or emits MASTER for an ownership it cannot back. On
+  the **BACKUP** side `becomeBackup` still emits BACKUP (we ARE stepping
+  down — withholding it risks split-brain), but `removeVIPs` now returns
+  its netlink failure and `surfaceStaleVIP` records it (a
+  `vipRemoveFailures` counter + `vipDiverged` flag + Error log) and
+  schedules a bounded async reconcile — so a swallowed removal no longer
+  silently leaves this BACKUP still answering ARP for a VIP it lost
+  (duplicate-address hazard vs the new master). Neither path adds latency
+  on the clean case (the `vipMu` lock is uncontended), so the ~60 ms
+  failover timing is unchanged.
+  - **Already-absent AddrDel is NOT a divergence.** `removeVIPsLocked`
+    treats ENODEV/ENOENT ("not found"/"no such") **and EADDRNOTAVAIL**
+    ("cannot assign requested address", the common already-absent errno)
+    as benign — the VIP was never on the interface. Without EADDRNOTAVAIL
+    a fresh boot / restart-as-backup (whose run-startup BACKUP removal runs
+    against VIPs that are not present) would set `vipDiverged` on EVERY
+    clean boot and the reconcile would retry the still-absent address to
+    exhaustion, leaving the operator-facing flag stuck TRUE — cry-wolfing
+    the exact diagnostic this machinery provides. Detection is
+    `errors.Is(err, unix.EADDRNOTAVAIL)` plus a belt-and-suspenders string
+    match.
+  - **The reconcile is re-promotion safe.** The stale-VIP reconcile runs on
+    a background goroutine; `becomeMaster` runs `setState(MASTER)` (bumping
+    `ownerGen`) BEFORE it takes `vipMu` to re-add the VIP. The reconcile
+    therefore removes VIPs through `removeVIPsIfBackup(gen)`, which
+    re-validates `state == BACKUP && ownerGen == gen` **UNDER `vipMu`**
+    (mirroring `reconcileVIP`'s capture+recheck) and aborts
+    (`errReconcileSuperseded`, no delete) on a racing re-promotion —
+    otherwise the reconcile could strip the VIP a re-promoted MASTER just
+    added (a MASTER self-blackhole). The old bare `removeVIPs` checked state
+    OUTSIDE the lock, leaving a TOCTOU window between the check and the lock
+    acquisition.
 - GARP suppression gates: `sendGARP(force)` has two gates — a per-epoch
   dedup (`garpEpoch`/`lastGARPEpoch`, one burst per transition) and a
   500 ms time dampener (`lastGARPTime`/`garpDampened`, storm control for
