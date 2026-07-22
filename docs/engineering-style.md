@@ -422,6 +422,36 @@ they repeatedly bite:
 - **Deploy wipes CoS config.** After `cluster-setup.sh deploy`, re-run
   `./test/incus/apply-cos-config.sh <target>` before running iperf3
   for any #706 / #707 / #708 / #709 / #718 validation.
+- **Rust tests must be parallel-safe — `make test-rust` forces
+  `--test-threads=1`, but a plain `cargo test --release` does not.** A
+  test that silently assumed serial execution (a shared process-global
+  counter, or heavy busy-spin threads) flaked or deadlocked the moment
+  someone ran the suite in parallel (#6148 progress-gated liveness;
+  #6157/#6294 the WG engine/frame tests wedged a full-suite run for
+  >100min). Two settled patterns:
+  - **A test-only global counter/state → make it `thread_local!`**, not
+    a `static AtomicUsize`. Each test thread then resets/mutates/reads
+    its own copy, so no parallel sibling can corrupt the assertion
+    (`OUTER_ROUTE_RESOLVE_COUNT` in `afxdp/frame/wg.rs`, #6294). Strictly
+    stronger than serializing every mutator behind a lock.
+  - **A test that MUST touch a genuinely shared global, or that spawns
+    busy-spinning worker threads → serialize it behind a poison-tolerant
+    module-local guard** held for the whole body:
+    `LOCK.lock().unwrap_or_else(|e| e.into_inner())`
+    (`icmp_ratelimit::global_bucket_test_lock`,
+    `wg::engine_tests::wg_engine_test_serial` #6157). The blocked sibling
+    PARKS on the mutex (futex wait) instead of compounding scheduler
+    oversubscription. Every test sharing a given global must take the
+    SAME lock.
+  - Prove the ISOLATION variant with a **deterministic fail-on-revert**
+    (two barrier-synced threads whose per-thread counter assertion is
+    mathematically impossible under a shared global). The mutex GUARD
+    variant's fail-on-revert is **scheduler-dependent** (barrier + many
+    iterations + a widened critical window make it effectively certain)
+    and pins the guard PRIMITIVE's exclusivity, not that each heavy test
+    TAKES it — verify that application by inspection, since a deterministic
+    test for it reduces to the underlying flake. Back both with repeated
+    parallel runs of the previously-flaky test.
 - **Shared-cluster lock protocol (#1875).** The loss userspace cluster
   is shared by concurrent agents; ownership is serialized by the
   advisory flock on `/tmp/xpf-cluster.lock` with holder metadata in
