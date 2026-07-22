@@ -304,15 +304,19 @@ pub(super) fn retry_pending_neigh(
         // frame — the egress output filter must match the POST-NAT on-wire tuple.
         // Derive the egress wire key from the pre-NAT buffered key + this frame's
         // NAT decision (apply-to-this-packet form, correct for both directions).
+        // #5158: pass the POST-NAT wire key for the egress output filter but the
+        // pre-NAT buffered `flow_key` as the ingress re-walk key — the ingress
+        // INPUT filter matched this packet on its pre-NAT tuple.
         let tx_selection_wire_key = pkt
             .flow_key
             .as_ref()
             .map(|key| crate::session::forward_wire_key(key, decision.nat));
-        let cos = resolve_cos_tx_selection_at(
+        let cos = resolve_cos_tx_selection_at_prenat(
             forwarding,
             decision.resolution.egress_ifindex,
             pkt.meta,
             tx_selection_wire_key.as_ref(),
+            pkt.flow_key.as_ref(),
             cos_extra,
             now_ns,
         );

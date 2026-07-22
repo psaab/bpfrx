@@ -169,6 +169,12 @@ pub(in crate::afxdp) fn transmit_batch(
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) -> Result<(u64, u64), TxError> {
+    // #5157: this batch's committed identity is rebuilt from scratch on
+    // every call. Cleared HERE (before any early return) so an
+    // `Ok((0, 0))` short-circuit — empty `pending`, or an all-dropped
+    // mirror batch below — leaves the committed set empty rather than
+    // stale, and `submit_local` never charges a prior batch's flows.
+    binding.scratch.scratch_committed_orig_idx.clear();
     if pending.is_empty() {
         return Ok((0, 0));
     }
@@ -186,6 +192,15 @@ pub(in crate::afxdp) fn transmit_batch(
 
     binding.scratch.scratch_local_tx.clear();
     let mut dropped_mirror_reserve = false;
+    // #5157: original-`pending` position of each STAGED entry, indexed
+    // by its stage position in `scratch_local_tx`. `orig_idx` counts
+    // EVERY pop (staged AND mirror-dropped), so it stays aligned with
+    // the caller's per-item sidecar, which is built in unfiltered input
+    // order. Only staged entries record into `staged_orig_idx`; a
+    // mid-batch mirror drop just advances the counter, breaking the
+    // prefix relationship the old count-only accounting assumed.
+    let mut staged_orig_idx = [0u16; TX_BATCH_SIZE];
+    let mut orig_idx: u16 = 0;
     while binding.scratch.scratch_local_tx.len() < batch_size {
         let Some(mut req) = pending.pop_front() else {
             break;
@@ -196,6 +211,7 @@ pub(in crate::afxdp) fn transmit_batch(
                 .mirror_drops_tx_frame_reserve
                 .fetch_add(1, Ordering::Relaxed);
             dropped_mirror_reserve = true;
+            orig_idx = orig_idx.saturating_add(1);
             continue;
         }
         if let Some(dscp_rewrite) = req.dscp_rewrite {
@@ -273,6 +289,14 @@ pub(in crate::afxdp) fn transmit_batch(
                 });
             }
         }
+        // #5157: this entry's stage position is the pre-push length;
+        // record its original-input position so the settle loop below
+        // can report the committed identities to `submit_local`.
+        let stage_pos = binding.scratch.scratch_local_tx.len();
+        if stage_pos < TX_BATCH_SIZE {
+            staged_orig_idx[stage_pos] = orig_idx;
+        }
+        orig_idx = orig_idx.saturating_add(1);
         binding.scratch.scratch_local_tx.push((offset, req));
     }
 
@@ -353,6 +377,14 @@ pub(in crate::afxdp) fn transmit_batch(
         if idx < inserted as usize {
             sent_packets += 1;
             sent_bytes += req.bytes.len() as u64;
+            // #5157: record the committed item's ORIGINAL-input position
+            // (identity), not just a count. Reverse-pop order does not
+            // matter — the caller's per-flow accounting is a set-sum over
+            // these indices.
+            binding
+                .scratch
+                .scratch_committed_orig_idx
+                .push(staged_orig_idx[idx]);
         } else {
             binding.tx_pipeline.free_tx_frames.push_front(offset);
             pending.push_front(req);

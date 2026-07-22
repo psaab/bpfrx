@@ -30,6 +30,38 @@
   unconditional refresh zeroes `first_held_ns`). Case B (the session's own RG
   activates -> ForwardCandidate) still clears the clock, proving the legitimate
   promotion refresh is not over-suppressed.
+## 2026-07-21 — #5157: mirror-reserve mid-batch drop breaks submit_local sidecar prefix accounting
+
+- **Timestamp**: 2026-07-21 (fix/5157-mirror-drop-sidecar-accounting)
+- **Action**: `submit_local` (`userspace-dp/src/afxdp/cos/queue_service/submit_local.rs`)
+  built its per-item `(bucket, bytes)` / `enqueue_ns` sidecars in ORIGINAL
+  input order but charged `sidecar[..packets]` — a PREFIX — from a
+  count-only `transmit_batch` return. `transmit_batch`
+  (`userspace-dp/src/afxdp/tx/transmit/mod.rs`) drops a `mirror_clone`
+  request mid-batch via `continue` when
+  `free_tx_frames.len() <= MIRROR_TX_FRAME_RESERVE` (a NON-prefix / interior
+  removal), so after a front/interior mirror drop the committed set is no
+  longer a prefix of the sidecar: the dropped mirror's flow bucket was
+  charged bytes it never sent and the shifted real packet's bucket was
+  missed, corrupting per-bucket `flow_bucket_tx_bytes` / observed-rate EWMA
+  and the sojourn EWMA of the wrong flow. Fix: `transmit_batch` records the
+  ORIGINAL-input positions it actually committed into a per-binding scratch
+  buffer (`scratch.scratch_committed_orig_idx`, filled in the settle loop
+  from a stage→original index map); `submit_local` accounts both sidecars by
+  those identities (set-sum, order-independent) instead of a prefix. The
+  mirror-reserve back-pressure is preserved (still drop when free frames
+  `<=` reserve); only the accounting attribution is corrected.
+- **File(s)**: userspace-dp/src/afxdp/tx/transmit/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/submit_local.rs,
+  userspace-dp/src/afxdp/worker/scratch.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests/submit.rs,
+  docs/fairness-regimes.md, _Log.md
+- **Validation**: `cargo build` clean (pre-existing warnings only); full
+  bin test suite 4076 passed / 0 failed / 2 ignored. New
+  `mirror_interior_drop_preserves_sidecar_attribution_5157` PASSES; fail-on-revert
+  confirmed — restoring the `sidecar[..packets]` prefix loop makes it RED
+  (flow B charged 0 not 150; the dropped mirror's bucket charged 200 not 0).
 
 ## 2026-07-21 — #5153: reverse companion inherits forward application inactivity_timeout_ns
 
@@ -55337,3 +55369,35 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
   userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/src/afxdp/forwarding/README.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5158 — ingress input-filter re-walk was using the POST-NAT wire
+  key. `forward_request` / `neighbor_dispatch` / the `flow_cache` seed build
+  `tx_selection_wire_key = forward_wire_key(forward_key, decision.nat)` (post-NAT,
+  correct for the egress OUTPUT filter per #3642) and passed it as the SOLE
+  flow_key into the CoS resolver — which reuses it for the ingress INPUT-filter
+  re-walk (`#hb166 T-3`, cached + runtime). Junos applies input filters BEFORE
+  NAT, so a NAT'd flow re-evaluated the ingress term against post-NAT
+  addresses/ports and MISSED its ingress forwarding-class / dscp-rewrite /
+  three-color policer. Split the resolver contract: `resolve_cos_tx_selection_at`
+  / `resolve_cached_cos_tx_selection` now delegate to internal impls taking BOTH
+  a post-NAT egress key (output filter + BA/queue) and a pre-NAT ingress key
+  (input re-walk: family gate, iface-filter lookup, 5-tuple). Existing single-key
+  entry points pass the same key for both (behaviour-preserving; ~46 callers/
+  tests untouched). New `resolve_cos_tx_selection_at_prenat` /
+  `resolve_cached_cos_tx_selection_prenat` route the three post-NAT callers to
+  the pre-NAT `forward_key` for the ingress leg. Fail-on-revert test
+  `ingress_input_filter_rewalk_uses_prenat_key_5158` (colocated): ingress term
+  matches dst-port 443; DNAT'd egress wire key carries dst-port 8443 — pre-NAT
+  key hits EF queue 1, post-NAT key misses → default queue 0. Verified RED under
+  a simulated revert (`ingress_key = flow_key`): runtime returns Some(0) ≠
+  Some(1). Full userspace-dp cargo suite green (4076 passed). Updated
+  filter/README.md with the pre-NAT ingress-key contract. CoS×NAT hot path —
+  parent runs a CoS smoke before merge.
+- **File(s)**: userspace-dp/src/afxdp/tx/cos_classify.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/tx/mod.rs,
+  userspace-dp/src/afxdp/forward_request.rs,
+  userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/filter/README.md, _Log.md

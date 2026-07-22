@@ -1744,15 +1744,39 @@ Each carries a RED-on-revert unit test.
   is 5-tuple-independent; the fix runs the DSCP→802.1p→default lookup from
   `meta` in both None branches.
 
+- **T-6(f) — submit_local sidecar desync on a mid-batch mirror drop
+  (#5157).** `submit_local` (`queue_service/submit_local.rs`) builds its
+  per-item `(bucket, bytes)` / `enqueue_ns` sidecars in ORIGINAL input
+  order, then charged `sidecar[..packets]` — a PREFIX — after
+  `transmit_batch` returned only a committed *count*. But `transmit_batch`
+  (`tx/transmit/mod.rs`) drops a `mirror_clone` request mid-batch via
+  `continue` when `free_tx_frames.len() <= MIRROR_TX_FRAME_RESERVE` — a
+  NON-prefix / interior removal — so after a front/interior mirror drop
+  the committed set is no longer a prefix of the sidecar: entry K stopped
+  matching the K-th shipped packet. The dropped mirror's bucket was
+  charged bytes it never sent, and the shifted real packet's bucket was
+  missed, corrupting the per-bucket `flow_bucket_tx_bytes` / observed-rate
+  EWMA (R-1's mechanism) and the sojourn EWMA of the wrong flow. Fix:
+  `transmit_batch` now reports the ORIGINAL-input positions it actually
+  committed in a per-binding scratch buffer
+  (`scratch.scratch_committed_orig_idx`, filled in the settle loop from a
+  stage→original index map), and `submit_local` accounts both sidecars by
+  those identities instead of a prefix — set-sum, order-independent. The
+  mirror-reserve back-pressure itself is unchanged (still drop when free
+  frames `<=` reserve); only the ACCOUNTING attribution is corrected.
+  RED-on-revert unit test
+  `mirror_interior_drop_preserves_sidecar_attribution_5157`.
+
 **Deferred T-6 sub-items (recorded in #4267):** (k) coordinator-side
 scrub on binding unregister — overlaps R-7's reseed + the existing
 worker-side `vacate_all_shared_exact_slots_for_binding`; a safe scrub that
 distinguishes membership-change from legit Arc-reuse (without clobbering
 the deliberate additive `rehydrate_worker_active_count` or scrubbing live
 vtime slots) needs its own analysis + failover smoke. (c) ECN aggregate
-arm, (f) sidecar desync, (h) inbox-overflow fallbacks, (i)
-`max_total_leased` bank floor, (j) equal-flow divisor, (l) truncating-zip
-/ FIFO-settle sojourn — each needs its own design decision or repro.
+arm, (h) inbox-overflow fallbacks, (i) `max_total_leased` bank floor, (j)
+equal-flow divisor, (l) truncating-zip / FIFO-settle sojourn — each needs
+its own design decision or repro. ((f) sidecar desync is FIXED above,
+#5157.)
 
 ### Non-exact guaranteed classes are metered class-wide (#4265, R-2)
 

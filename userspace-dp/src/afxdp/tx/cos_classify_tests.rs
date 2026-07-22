@@ -1469,6 +1469,200 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
     assert!(!cached.filter_counters.is_empty());
 }
 
+// #5158: the ingress INPUT filter matched the packet on its PRE-NAT ingress
+// tuple (Junos applies input filters BEFORE NAT). The transit forward path
+// (`forward_request` / `neighbor_dispatch` / the `flow_cache` seed) builds a
+// POST-NAT `forward_wire_key` for the egress OUTPUT filter + TX selection
+// (#3642), then hands it to the CoS resolver. Before this fix that SAME post-NAT
+// key was reused for the ingress input-filter re-walk, so a NAT'd flow's ingress
+// `then forwarding-class` / dscp-rewrite / three-color policer was evaluated
+// against the post-NAT addresses/ports and MISSED. The split entry points
+// (`resolve_cos_tx_selection_at_prenat` / `resolve_cached_cos_tx_selection_prenat`)
+// re-walk the ingress filter on the pre-NAT `ingress_flow_key` while keeping the
+// output filter on the post-NAT egress wire key.
+//
+// FAIL-ON-REVERT: the ingress term matches destination-port 443; the modelled
+// DNAT rewrote the egress wire key's destination port to 8443. Feeding the
+// pre-NAT key (dst 443) to the re-walk hits the EF forwarding-class (queue 1);
+// reusing the post-NAT egress key (dst 8443) misses the term and falls back to
+// the default queue (0). Reverting the fix (re-walk on the post-NAT key) flips
+// the `Some(1)` assertions to `Some(0)`.
+#[test]
+fn ingress_input_filter_rewalk_uses_prenat_key_5158() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "reth1.0".into(),
+                ifindex: 101,
+                parent_ifindex: 5,
+                vlan_id: 0,
+                hardware_addr: "02:bf:72:00:61:01".into(),
+                filter_input_v4: "cos-classify".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "reth0.0".into(),
+                ifindex: 202,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_shaping_burst_bytes: 256_000,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            },
+        ],
+        filters: vec![FirewallFilterSnapshot {
+            name: "cos-classify".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "voice".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "accept".into(),
+                forwarding_class: "expedited-forwarding".into(),
+                ..Default::default()
+            }],
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "expedited-forwarding".into(),
+                    queue: 1,
+                },
+            ],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+            schedulers: vec![
+                CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+                CoSSchedulerSnapshot {
+                    name: "ef-sched".into(),
+                    transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
+                    transmit_rate_exact: false,
+                    priority: "strict-high".into(),
+                    buffer_size_bytes: 64_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+            ],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "expedited-forwarding".into(),
+                        scheduler: "ef-sched".into(),
+                    },
+                ],
+            }],
+        }),
+        ..Default::default()
+    };
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let meta = UserspaceDpMeta {
+        ingress_ifindex: 5,
+        ingress_vlan_id: 0,
+        addr_family: libc::AF_INET as u8,
+        dscp: 0,
+        ..Default::default()
+    };
+    // PRE-NAT ingress tuple — destination-port 443, matches the ingress term.
+    let ingress_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 12345,
+        dst_port: 443,
+    };
+    // POST-NAT egress wire tuple — DNAT rewrote the destination port to 8443, so
+    // it no longer matches the ingress term's destination-port 443.
+    let egress_wire_key = SessionKey {
+        dst_port: 8443,
+        ..ingress_key.clone()
+    };
+    let now_ns = 1_000_000u64;
+
+    // Runtime path: the ingress re-walk MUST use the pre-NAT key -> EF queue 1.
+    let runtime = resolve_cos_tx_selection_at_prenat(
+        &forwarding,
+        202,
+        meta,
+        Some(&egress_wire_key),
+        Some(&ingress_key),
+        TermMatchExtra::default(),
+        now_ns,
+    );
+    assert_eq!(
+        runtime.queue_id,
+        Some(1),
+        "runtime ingress input-filter re-walk must match the PRE-NAT tuple (dst 443)",
+    );
+
+    // Cached-seed path: same contract.
+    let cached = resolve_cached_cos_tx_selection_prenat(
+        &forwarding,
+        202,
+        meta,
+        Some(&egress_wire_key),
+        Some(&ingress_key),
+    );
+    assert_eq!(
+        cached.queue_id,
+        Some(1),
+        "cached ingress input-filter re-walk must match the PRE-NAT tuple (dst 443)",
+    );
+
+    // Positive control: reusing the POST-NAT egress key for the ingress re-walk
+    // (the pre-#5158 behaviour) misses the term (dst 8443) and falls back to the
+    // default queue. Proves the assertions above bind to the pre-NAT tuple.
+    let reverted_runtime = resolve_cos_tx_selection_at_prenat(
+        &forwarding,
+        202,
+        meta,
+        Some(&egress_wire_key),
+        Some(&egress_wire_key),
+        TermMatchExtra::default(),
+        now_ns,
+    );
+    assert_eq!(
+        reverted_runtime.queue_id,
+        Some(0),
+        "post-NAT key misses the ingress term -> default queue (documents the bug)",
+    );
+    let reverted_cached = resolve_cached_cos_tx_selection_prenat(
+        &forwarding,
+        202,
+        meta,
+        Some(&egress_wire_key),
+        Some(&egress_wire_key),
+    );
+    assert_eq!(reverted_cached.queue_id, Some(0));
+}
+
 #[test]
 fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
     let snapshot = ConfigSnapshot {

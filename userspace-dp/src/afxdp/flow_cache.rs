@@ -522,12 +522,20 @@ impl FlowCacheEntry {
         // is never cached (`should_cache` excludes it), so this only rewrites
         // the SNAT/DNAT address/port fields; the cache LOOKUP `key` below stays
         // the pre-NAT tuple (matched against the parsed ingress flow).
+        // #5158: the post-NAT wire key is correct for the egress OUTPUT filter,
+        // but the ingress INPUT filter matched this packet on its PRE-NAT ingress
+        // tuple (Junos applies input filters BEFORE NAT). Seed the cached
+        // descriptor with the post-NAT wire key for TX selection and the pre-NAT
+        // `forward_key` as the ingress re-walk key so a NAT'd flow's cached
+        // descriptor still carries the ingress `then forwarding-class` /
+        // dscp-rewrite / three-color policer.
         let tx_selection_wire_key = forward_wire_key(&flow.forward_key, decision.nat);
-        let tx_selection = resolve_cached_cos_tx_selection(
+        let tx_selection = resolve_cached_cos_tx_selection_prenat(
             forwarding,
             decision.resolution.egress_ifindex,
             meta,
             Some(&tx_selection_wire_key),
+            Some(&flow.forward_key),
         );
         // #3777: the cos TX-selection rebuild folds an interface INPUT filter's
         // `then count` handles into `tx_selection.filter_counters` when the
