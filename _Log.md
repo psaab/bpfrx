@@ -55733,3 +55733,7 @@ top.
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/slowpath.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-07-22
+  **Action**: #6125 — document the deliberate DF-set transit TCP re-segment (not PTB) contract (delivery-over-strict-PMTUD). Docs-only adjudication (path (a)); no code change.
+  **File(s)**: docs/feature-coverage.md, userspace-dp/src/afxdp/tx/README.md

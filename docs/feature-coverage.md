@@ -124,6 +124,24 @@ the userspace dataplane admission boundary is in
   rewrite keyed on the generated ICMP fires, and a parse failure of the
   built bytes fails CLOSED (drop + `generated_reply_classify_parse_errors`).
   Output-filter drops of the PTB land on `ptb_output_filter_drops`.
+- **Forwarded TCP over egress MTU is re-segmented, not PTB'd — including
+  DF-set (#1199, #6125).** An oversize *whole* (unfragmented) transit TCP
+  datagram whose L3 length exceeds the egress interface MTU is transparently
+  re-segmented into within-MTU TCP segments
+  (`forwarded_tcp_may_need_segmentation` → `tx/tcp_segmentation.rs`),
+  regardless of the IPv4 Don't-Fragment bit. This is a **deliberate
+  delivery-over-strict-PMTUD choice**: each output is an independent whole IP
+  datagram ≤ MTU (no IP fragmentation, so it is DF-compliant on the wire) and
+  it guarantees delivery even where ICMP Frag-Needed is filtered (a common
+  PMTUD black-hole). The tradeoff is that a DF sender's PMTUD is not driven by
+  re-segmentation — it never learns the real path MTU the way it would from a
+  Frag-Needed reply. The PTB path (the bullet above) fires only for the
+  datagram classes that are NOT transparently TCP-segmented (UDP, ICMP, ESP,
+  GRE, and the TCP seg-miss cases: any IP fragment, or an unknown egress MTU).
+  #5159 made this uniform — master previously PTB'd DF TCP only in the
+  sub-1280 MTU gap, an artifact of the removed `.max(1280)` floor, not a
+  design choice. Adjudicated in #6125: the delivery posture is retained;
+  strict PMTUD (DF → PTB) would require an explicit operator config knob.
 - **ALG control**, allow-dns-reply, allow-embedded-icmp.
 - **Configurable timeouts** (per-application inactivity).
 - **Session management**: filtered clearing, idle time tracking, brief
