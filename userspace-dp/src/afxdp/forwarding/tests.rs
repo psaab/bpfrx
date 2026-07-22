@@ -3838,6 +3838,153 @@ fn ecmp_static_route_retains_all_next_hops_and_skips_dead() {
     );
 }
 
+/// #5161: a MIXED ECMP group of a GATEWAY member (explicit next-hop, already
+/// resolved) plus an INTERFACE-ONLY member (`next_hop == None`, a "via <if>"
+/// candidate whose neighbor is the PER-FLOW destination) must select BOTH
+/// members — ECMP width 2, not collapsed to width-1.
+///
+/// The interface-only member's neighbor is the destination itself, which the
+/// coordinator warmer cannot pre-resolve (it is a whole prefix, unknown at
+/// route-sweep time). The pre-#5161 `is_live` closure gated EVERY direct
+/// member on `neighbor-resolved-on-that-ifindex`, evaluating the target as the
+/// destination for an interface-only member. With the gateway member already
+/// resolved the live set was non-empty, so the unresolved interface-only
+/// member was permanently excluded → every flow pinned to the gateway member
+/// → ECMP starved to width-1.
+///
+/// The fix marks an up interface-only member LIVE (`ifindex > 0`) so it joins
+/// the live set; the MissingNeighbor cold path then resolves the destination
+/// lazily per flow (mirroring the single-member interface-only path). Here the
+/// gateway member (192.0.2.2 via ge-0/0/1, ifindex 11) is resolved and the
+/// interface-only member (via ge-0/0/2, ifindex 22) has NO destination
+/// neighbor. Sweeping distinct per-flow hashes must reach BOTH egress
+/// interfaces, and the interface-only member must forward as MissingNeighbor.
+///
+/// FAIL-ON-REVERT: revert the `if nh.next_hop.is_none() { return nh.ifindex >
+/// 0 }` branch in the v4 selection closure and the interface-only member is
+/// dead again; with the gateway member live, selection collapses to ifindex 11
+/// only, so `egress_seen` never contains 22 (width 1) and the disposition
+/// probe stays None → both interface-only assertions go RED.
+#[test]
+fn ecmp_interface_only_member_is_live_alongside_gateway() {
+    let snapshot = crate::ConfigSnapshot {
+        zones: vec![crate::ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+            ..Default::default()
+        }],
+        interfaces: vec![
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/1".to_string(),
+                zone: "wan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: 11,
+                hardware_addr: "02:00:00:00:00:11".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "192.0.2.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/2".to_string(),
+                zone: "wan".to_string(),
+                linux_name: "ge-0-0-2".to_string(),
+                ifindex: 22,
+                hardware_addr: "02:00:00:00:00:22".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "192.0.3.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        routes: vec![crate::RouteSnapshot {
+            table: "inet.0".to_string(),
+            family: "inet".to_string(),
+            destination: "203.0.113.0/24".to_string(),
+            // Member 0: explicit gateway via ge-0/0/1. Member 1: INTERFACE-ONLY
+            // (empty IP part before '@') via ge-0/0/2 — `next_hop == None`.
+            next_hops: vec![
+                "192.0.2.2@ge-0/0/1".to_string(),
+                "@ge-0/0/2".to_string(),
+            ],
+            discard: false,
+            next_table: String::new(),
+            preference: 5,
+        }],
+        // ONLY the gateway member's neighbor is resolved. The interface-only
+        // member's neighbor (the per-flow destination) is deliberately absent —
+        // it can only resolve lazily once the member is actually selected.
+        neighbors: vec![crate::NeighborSnapshot {
+            interface: "ge-0-0-1".to_string(),
+            ifindex: 11,
+            family: "inet".to_string(),
+            ip: "192.0.2.2".to_string(),
+            mac: "00:11:22:33:44:55".to_string(),
+            state: "reachable".to_string(),
+            router: true,
+            link_local: false,
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+
+    // Sanity: the FIB built member 1 as a genuine interface-only candidate
+    // (`next_hop == None`, ifindex 22). Guards against a future next-hop
+    // string-format change silently turning this into a gateway member (which
+    // would make the test pass trivially).
+    let route = &state.routes_v4.get("inet.0").expect("table")[0];
+    assert_eq!(route.next_hops.len(), 2, "ECMP route must retain both members");
+    assert!(
+        route.next_hops[1].next_hop.is_none() && route.next_hops[1].ifindex == 22,
+        "member 1 must be an interface-only candidate (next_hop==None, ifindex 22)",
+    );
+
+    // Sweep distinct per-flow hashes and collect the set of selected egress
+    // interfaces plus the interface-only member's disposition.
+    let mut egress_seen: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+    let mut interface_only_disposition: Option<ForwardingDisposition> = None;
+    for h in 0u64..64 {
+        let r = lookup_forwarding_resolution_v4(
+            &state,
+            None,
+            Ipv4Addr::new(203, 0, 113, 5),
+            "inet.0",
+            0,
+            true,
+            Some(h),
+        );
+        egress_seen.insert(r.egress_ifindex);
+        if r.egress_ifindex == 22 {
+            interface_only_disposition = Some(r.disposition);
+        }
+    }
+
+    assert!(
+        egress_seen.contains(&11),
+        "gateway member (ifindex 11) must remain selectable",
+    );
+    assert!(
+        egress_seen.contains(&22),
+        "#5161: interface-only member (ifindex 22, next_hop==None) must join the \
+         live ECMP set — not starve to width-1 behind the resolved gateway member",
+    );
+    assert_eq!(
+        egress_seen.len(),
+        2,
+        "ECMP must spread across BOTH members (width 2), not collapse to width-1",
+    );
+    assert_eq!(
+        interface_only_disposition,
+        Some(ForwardingDisposition::MissingNeighbor),
+        "interface-only member forwards via the MissingNeighbor cold path so its \
+         destination resolves lazily per flow",
+    );
+}
+
 /// #2923: a MIXED direct+tunnel ECMP group must select BOTH paths. The
 /// pre-fix liveness closure gated EVERY candidate on `ifindex > 0 &&
 /// neighbor-resolved-on-that-ifindex`. A tunnel next-hop is the logical
