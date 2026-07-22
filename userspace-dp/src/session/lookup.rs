@@ -437,15 +437,15 @@ impl SessionTable {
         }
     }
 
-    /// Iterate over all session entries with idle time (in nanoseconds) and,
-    /// since #2501, the per-direction byte/packet counters.
+    /// Iterate over ALL session entries in one pass with idle time (in
+    /// nanoseconds) and, since #2501, the per-direction byte/packet counters.
     ///
-    /// `refresh_bpf_conntrack_last_seen` (afxdp/bpf_map) is the sole
-    /// production caller: it mirrors `idle_ns` (→ `last_seen`) and the
-    /// `SessionCounters` (→ fwd/rev packet+byte fields) into the BPF
-    /// conntrack map on the ~1s GC cadence so `show security flow session`
-    /// surfaces live idle time AND volume. Cold path: a `Copy` of the
-    /// four-`u64` counter snapshot per session on top of the idle-time walk.
+    /// #5287: the production `refresh_bpf_conntrack_last_seen` no longer uses
+    /// this unbounded full-table walk — it drives `iter_with_idle_budgeted`
+    /// (below) so no single packet-loop tick scans the whole table. This method
+    /// is retained as the simple full-walk primitive used by the idle-time unit
+    /// tests; hence it is test-only in non-`test` builds.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn iter_with_idle(
         &self,
         now_ns: u64,
@@ -458,5 +458,64 @@ impl SessionTable {
                 f(key, entry.decision, &entry.metadata, idle_ns, entry.counters);
             }
         }
+    }
+
+    /// #5287: budgeted, resumable variant of `iter_with_idle`.
+    ///
+    /// `iter_with_idle` walks the ENTIRE table in one uninterrupted pass. Its
+    /// sole caller `refresh_bpf_conntrack_last_seen` does a BPF lookup + update
+    /// per forward entry, so near the 131072-entry cap that pass is tens of
+    /// thousands of synchronous kernel crossings executed between two RX/TX
+    /// polls — a deterministic per-interval latency spike on a low-latency core
+    /// (issue #5287).
+    ///
+    /// This variant bounds the work per call. It walks the `entries` slab by
+    /// its STABLE integer handle (the slab index is stable across
+    /// insert/remove — a removed slot goes vacant and is reused, it does not
+    /// renumber live handles), starting at `cursor` and examining at most
+    /// `budget` slots. `cursor` is therefore a persistent iterator position:
+    /// the caller passes back the returned value on the next slice and the walk
+    /// resumes exactly where it stopped, spreading a full-table pass across many
+    /// packet-loop ticks.
+    ///
+    /// Returns the next cursor to resume from. It returns 0 once the walk
+    /// reaches the end of the slab's index space, i.e. a full-table cycle just
+    /// completed — the caller uses that edge to pace the next cycle. A `cursor`
+    /// past the current end (the table/slab shrank since the last slice)
+    /// restarts the cycle from 0.
+    ///
+    /// The budget counts examined slab SLOTS (occupied or vacant), not just
+    /// forward entries, so both the index scan and the per-entry callback cost
+    /// are hard-bounded by `budget` regardless of the occupied/vacant mix.
+    /// `f` is invoked only for occupied slots (at most `budget` times). No
+    /// allocation, no atomics — a bounded index walk plus one `saturating_sub`
+    /// per occupied slot.
+    pub fn iter_with_idle_budgeted(
+        &self,
+        cursor: usize,
+        budget: usize,
+        now_ns: u64,
+        mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, u64, SessionCounters),
+    ) -> usize {
+        let cap = self.entries.capacity();
+        // Empty slab or a degenerate zero budget: no progress, restart at 0 so
+        // the caller never gets wedged at a stale non-zero cursor.
+        if cap == 0 || budget == 0 {
+            return 0;
+        }
+        // A cursor past the end (slab capacity shrank, or a stale save)
+        // restarts the cycle from the top rather than skipping the whole table.
+        let start = if cursor >= cap { 0 } else { cursor };
+        let end = start.saturating_add(budget).min(cap);
+        for idx in start..end {
+            if let Some(record) = self.entries.get(idx) {
+                let entry = &record.entry;
+                let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
+                f(&record.key, entry.decision, &entry.metadata, idle_ns, entry.counters);
+            }
+        }
+        // Wrap to 0 on cycle completion so the caller can detect "table fully
+        // walked" and pace the next cycle to the freshness window.
+        if end >= cap { 0 } else { end }
     }
 }

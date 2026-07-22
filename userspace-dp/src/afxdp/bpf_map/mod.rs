@@ -372,7 +372,14 @@ pub(super) fn delete_bpf_conntrack_entry(
 /// `last_seen` will NOT cause premature expiry. This refresh is purely for
 /// diagnostic accuracy.
 ///
-/// Called from the worker loop piggy-backing on the session GC interval (~1s).
+/// #5287: this is an INCREMENTAL, budgeted slice — NOT a full-table pass. It
+/// refreshes at most `budget` slab slots starting at `cursor` and returns the
+/// next cursor for the following slice (0 once a full-table cycle completes).
+/// The worker loop drives one slice per ~100ms and paces successive cycles to
+/// the ~10s freshness window, so the whole table still gets refreshed within
+/// that window but the per-tick cost is hard-bounded instead of the old
+/// tens-of-thousands-of-syscalls single burst that stalled the low-latency
+/// core. See `SessionTable::iter_with_idle_budgeted` and the worker loop.
 ///
 /// #3395: `policy` is the CURRENT snapshot's `PolicyState`. For every refreshed
 /// forward entry the live-row `policy_id` is RE-RESOLVED from the session's
@@ -390,10 +397,12 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
     sessions: &crate::session::SessionTable,
     policy: &crate::policy::PolicyState,
     now_ns: u64,
-) {
+    cursor: usize,
+    budget: usize,
+) -> usize {
     let now_secs = now_ns / 1_000_000_000;
 
-    sessions.iter_with_idle(now_ns, |key, _decision, metadata, idle_ns, counters| {
+    sessions.iter_with_idle_budgeted(cursor, budget, now_ns, |key, _decision, metadata, idle_ns, counters| {
         // Only refresh forward entries — reverse entries mirror the forward.
         // #2501: the forward SessionEntry carries BOTH directions' counters
         // (the reverse entry shares them via the canonical forward key the
@@ -489,7 +498,7 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
             }
             _ => {}
         }
-    });
+    })
 }
 
 pub(super) fn publish_session_map_entry_for_session(

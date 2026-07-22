@@ -438,16 +438,58 @@ reverse→forward. No allocation, no atomic, no cross-core traffic.
 
 Surfacing (no new wire field):
 
-- `refresh_bpf_conntrack_last_seen` (afxdp/bpf_map, ~1s GC cadence) writes
-  the counters into the BPF conntrack map value, so `show security flow
-  session` reports live volume (Go reads `FwdBytes`/`FwdPackets`/… from
-  that map today);
+- `refresh_bpf_conntrack_last_seen` (afxdp/bpf_map, budgeted slice — see
+  "Budgeted last_seen refresh" below) writes the counters into the BPF
+  conntrack map value, so `show security flow session` reports live volume
+  (Go reads `FwdBytes`/`FwdPackets`/… from that map today);
 - the close `SessionDelta` snapshots the entry's counters at expiry, and
   `emit_session_close_rt_flow` writes them into the SESSION_CLOSE RT_FLOW
   frame's already-reserved `[56:64]`/`[64:72]` (forward) and
   `[112:120]`/`[120:128]` (reverse) wire slots — the slots the Go
   `logging.DecodeRawEventRecord` already parses (previously hard-zeroed),
   so NetFlow/IPFIX close records carry real volume.
+
+## Budgeted last_seen refresh (#5287)
+
+`refresh_bpf_conntrack_last_seen` mirrors each forward session's `last_seen`,
+`policy_id` and byte/packet counters into the BPF conntrack map so the Go
+`IterateSessions` surfaces (CLI, gRPC, Prometheus) read accurate idle time and
+volume. It does one BPF `lookup + update` per forward entry.
+
+The refresh used to walk the WHOLE table in one uninterrupted pass. Near the
+`DEFAULT_MAX_SESSIONS` (131072) cap that is tens of thousands of synchronous
+kernel crossings executed between two RX/TX polls — a deterministic
+per-interval latency spike on the low-latency worker core, exactly under the
+high-session load where service and heartbeat stability matter (issue #5287).
+
+It is now an **incremental, budgeted slice** driven by
+`SessionTable::iter_with_idle_budgeted`:
+
+- **Persistent cursor.** The cursor is a stable `entries` slab index (slab
+  handles do not renumber across insert/remove — a removed slot goes vacant and
+  is reused). The worker loop keeps it in `ct_refresh_cursor` and passes it back
+  each slice, so the walk resumes exactly where it stopped.
+- **Hard per-slice budget.** Each slice examines at most `CT_REFRESH_SLICE_BUDGET`
+  (2048) slab slots — bounding BOTH the index scan and the per-entry syscalls,
+  regardless of the occupied/vacant/forward/reverse mix. No allocation; the
+  per-tick added cost is one integer compare plus one `saturating_sub` in the
+  common between-cycles idle case.
+- **Window-paced cycles.** The worker drives one slice per `CT_SLICE_INTERVAL_NS`
+  (100ms) while a cycle is in flight, and paces successive full-table CYCLES to
+  `CT_REFRESH_WINDOW_NS` (10s). A small or idle table is walked in one short
+  slice per 10s — the steady-state syscall rate is unchanged from the old 10s
+  full-table cadence, so the common case is not regressed.
+
+**Freshness/latency tradeoff.** At the 131072 default cap and 100ms cadence a
+full cycle spans ~64 slices (~6.4s ≤ the 10s freshness window), so the whole
+table is still refreshed within the window. If `max_sessions` is raised far
+above the default a cycle stretches past 10s (freshness degrades gracefully),
+but the per-slice cost stays hard-bounded at `CT_REFRESH_SLICE_BUDGET` — no
+single loop tick ever walks the whole table again. Because a session installed
+into an already-passed slot mid-cycle isn't re-visited until the next cycle,
+freshness is best-effort diagnostic (the entry already gets `last_seen` stamped
+at install via `publish_bpf_conntrack_entry`; the Go GC has `SkipSweep` set, so
+a stale `last_seen` never causes premature expiry).
 
 ## Standby retention (#2120)
 
@@ -825,10 +867,11 @@ maps that `rule_id` to its CURRENT positional id via an O(1) per-snapshot
 `rule_id → policy_id` map and is called at the two LOCAL publish surfaces where
 the value is otherwise frozen:
 
-1. **Live-session rows** — `refresh_bpf_conntrack_last_seen` (~1s GC cadence)
-   re-stamps the BPF conntrack value's `policy_id` from the bound handle against
-   the current `PolicyState`. (SESSION_CREATE is emitted at install, where the
-   positional id is already correct — no re-resolution needed.)
+1. **Live-session rows** — `refresh_bpf_conntrack_last_seen` (budgeted slice —
+   see "Budgeted last_seen refresh" below) re-stamps the BPF conntrack value's
+   `policy_id` from the bound handle against the current `PolicyState`.
+   (SESSION_CREATE is emitted at install, where the positional id is already
+   correct — no re-resolution needed.)
 2. **RT_FLOW SESSION_CLOSE** — `flush_session_deltas` re-resolves and passes the
    id to `emit_session_close_rt_flow` (the close path already holds
    `forwarding.policy`, so this needs no new plumbing). The frozen
