@@ -36,6 +36,17 @@ pub(crate) struct WorkerScratch {
     pub(crate) scratch_fill: Vec<u64>,
     pub(crate) scratch_prepared_tx: Vec<PreparedTxRequest>,
     pub(crate) scratch_local_tx: Vec<(u64, TxRequest)>,
+    /// #5157: identity of the local-TX items that `transmit_batch`
+    /// actually committed, as ORIGINAL-`pending` positions (0-based, in
+    /// the order the caller built its per-item sidecars). Filled fresh
+    /// on every `transmit_batch` call (cleared at entry). Needed because
+    /// the mirror-reserve back-pressure drops a `mirror_clone` request
+    /// mid-batch via `continue` — a NON-prefix / interior removal — so
+    /// the committed set is no longer a prefix of the input. Only
+    /// `submit_local` reads it (to charge flow-bucket / sojourn
+    /// accounting to the correct flow); other `transmit_batch` callers
+    /// ignore it.
+    pub(crate) scratch_committed_orig_idx: Vec<u16>,
     pub(crate) scratch_exact_prepared_tx: Vec<ExactPreparedScratchTxRequest>,
     pub(crate) scratch_exact_local_tx: Vec<ExactLocalScratchTxRequest>,
     pub(crate) scratch_completed_offsets: Vec<u64>,
