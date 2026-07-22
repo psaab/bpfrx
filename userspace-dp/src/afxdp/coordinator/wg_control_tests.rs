@@ -211,6 +211,9 @@ fn spawn_poll_loop(
             false,
             tun,
             WG_DEFAULT_OUTER_MTU,
+            // #5291: no per-peer overrides in the idle poll-loop tests —
+            // every peer falls back to the scalar (WG_DEFAULT_OUTER_MTU).
+            &std::collections::HashMap::new(),
             &exceptions,
             &stop,
         );
@@ -284,6 +287,123 @@ fn poll_loop_exits_on_tun_teardown() {
         started.elapsed()
     );
     assert!(!stop.load(Ordering::Relaxed));
+}
+
+/// #5291 fail-on-revert: TUN-origin egress to a NON-first peer must
+/// size the encap MTU guard against THAT peer's underlay, not the
+/// first-peer scalar. This mirrors the AF_XDP transit path, which
+/// already resolves the outer MTU per peer (#2845/#3219,
+/// `wg_endpoint_physical_outer_mtu`/`wg_peer_outer_dst`); before this
+/// fix the control thread captured ONE first-peer scalar at spawn and
+/// applied it to every peer.
+///
+/// Scenario: a multi-peer WG tunnel with asymmetric underlays — peer A
+/// @1500 (the first-peer scalar), peer B @1400. An inner packet
+/// destined into peer B's AllowedIPs (`10.72.0.5`), sized so its
+/// WG-encapped wire size (1468B: pad_to_16(1400)=1408 + 16 data-hdr +
+/// 16 tag + 20 outer-IP + 8 UDP) FITS 1500 but EXCEEDS 1400, must be
+/// dropped by the per-peer guard (`encap_mtu_drops` bumps). Reverting
+/// the TUN-origin path to the first-peer 1500 scalar would ADMIT it
+/// (`encap_mtu_drops` stays 0, and it falls through to the NoSession
+/// handshake request), so the per-peer lookup is load-bearing here.
+#[test]
+fn wg_tun_origin_egress_uses_per_peer_outer_mtu_5291() {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    // Two peers, distinct AllowedIPs + configured v4 endpoints. Peer A
+    // is the first endpoint-bearing peer (its underlay 1500 becomes the
+    // scalar passed below); peer B rides a smaller 1400 underlay.
+    let pk_a = [0xA1u8; 32];
+    let pk_b = [0xB2u8; 32];
+    let ep_a: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+    let ep_b: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+    let engine = std::sync::Arc::new(crate::afxdp::wg::WgEngine::new(
+        crate::afxdp::wg::WgEngineConfig {
+            local_private_key: [7u8; 32].into(),
+            listen_port: 0,
+            peers: vec![
+                crate::afxdp::wg::WgPeerConfig {
+                    pubkey: pk_a,
+                    endpoint: Some(ep_a),
+                    persistent_keepalive: 0,
+                    allowed_ips: vec!["10.71.0.0/24".parse().unwrap()],
+                    preshared_key: [0u8; 32].into(),
+                },
+                crate::afxdp::wg::WgPeerConfig {
+                    pubkey: pk_b,
+                    endpoint: Some(ep_b),
+                    persistent_keepalive: 0,
+                    allowed_ips: vec!["10.72.0.0/24".parse().unwrap()],
+                    preshared_key: [0u8; 32].into(),
+                },
+            ],
+        },
+    ));
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    socket.set_nonblocking(true).unwrap();
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    set_fd_nonblocking(read_fd).unwrap();
+    let tun = unsafe { std::fs::File::from_raw_fd(read_fd) };
+    let mut pipe_w = unsafe { std::fs::File::from_raw_fd(write_fd) };
+    let exceptions = std::sync::Arc::new(Mutex::new(ExceptionEventRing::new()));
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+
+    // First-peer scalar = peer A's underlay (1500) — what a revert would
+    // apply to EVERY peer. The per-peer map carries ONLY peer B's smaller
+    // underlay (1400); a peer absent from the map falls back to the
+    // scalar (the pre-#5291 behaviour for that peer).
+    let outer_mtu = 1500usize;
+    let mut per_peer: std::collections::HashMap<[u8; 32], usize> =
+        std::collections::HashMap::new();
+    per_peer.insert(pk_b, 1400);
+
+    let counters_engine = engine.clone();
+    let stop_thread = stop.clone();
+    let handle = std::thread::spawn(move || {
+        run_wg_control_loop(
+            "wg-test-5291",
+            &engine,
+            &socket,
+            false,
+            tun,
+            outer_mtu,
+            &per_peer,
+            &exceptions,
+            &stop_thread,
+        );
+    });
+    std::thread::sleep(Duration::from_millis(120)); // reach the idle poll
+
+    // Inner IPv4 packet destined into peer B's AllowedIPs. Byte 0 = 0x45
+    // (IPv4, IHL 5); dst octets 16..20 = 10.72.0.5. 1400 payload bytes.
+    let mut inner = vec![0u8; 1400];
+    inner[0] = 0x45;
+    inner[16..20].copy_from_slice(&[10, 72, 0, 5]);
+    pipe_w.write_all(&inner).expect("write inner packet to TUN pipe");
+
+    let mut dropped = 0u64;
+    for _ in 0..50 {
+        dropped = counters_engine
+            .counters()
+            .encap_mtu_drops
+            .load(AtomicOrdering::Relaxed);
+        if dropped >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, AtomicOrdering::Relaxed);
+    handle.join().expect("join");
+    assert_eq!(
+        dropped, 1,
+        "TUN-origin egress to peer B must size against peer B's 1400 \
+         underlay MTU and DROP the 1468B encap; reverting to the \
+         first-peer 1500 scalar would admit it (encap_mtu_drops == 0)"
+    );
 }
 
 /// Codex code-r1 BLOCKER regression: a T5 give-up must NOT
