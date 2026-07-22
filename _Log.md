@@ -55843,3 +55843,14 @@ top.
     `wg-interop.sh all` cluster run is the parent's gate.
   **Action**: #6125 — document the deliberate DF-set transit TCP re-segment (not PTB) contract (delivery-over-strict-PMTUD). Docs-only adjudication (path (a)); no code change.
   **File(s)**: docs/feature-coverage.md, userspace-dp/src/afxdp/tx/README.md
+
+- **Timestamp**: 2026-07-22 (#6081)
+  **Action**: Add delete-journal-overflow forceResync CONSUME-path integration
+  tests (test-only, #5450/#6078 follow-up). `TestForceResyncConsumeSweep
+  ReconcilesStandby` drives arm→syncSweep-consume→doBulkSync→standby
+  reconcileStaleSessions reaping the journal-dropped ghost; `TestForceResync
+  ConsumeReconnectSurvivesRearmDuringBulk` guards the #6078 MINOR-1 reconnect
+  CAS symmetry (re-arm during the in-flight bulk survives the consume). Both
+  firsthand-verified RED on neutralizing their respective consume wiring.
+  Added a coverage note to the #5450 recovery section of the session-sync doc.
+  **File(s)**: pkg/cluster/sync_test.go, docs/session-sync-architecture.md

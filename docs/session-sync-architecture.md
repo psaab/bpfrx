@@ -1459,6 +1459,16 @@ which could be far away, so the standby carried ghost sessions (wrong forwarding
 distinct from `bulkEverCompleted` (which the daemon reads for VRRP sync-hold
 gating) and from `syncBackfillNeeded` (which only re-drives INSTALLS).
 
+Test coverage: `TestDeleteJournalOverflowArmsForceResync` guards the ARMING at
+both drop sites; `TestForceResyncConsumeSweepReconcilesStandby` (#6081) guards
+the CONSUME wiring end-to-end — an armed `forceResync` drives one connected
+`syncSweep` tick through `doBulkSync` and the replayed bulk window makes the
+standby's `reconcileStaleSessions` reap the ghost whose delete was dropped;
+`TestForceResyncConsumeReconnectSurvivesRearmDuringBulk` (#6078 MINOR-1) guards
+the reconnect CAS symmetry — a re-arm that fires DURING the in-flight cold-prime
+bulk survives the consume (the success branch must not clear it) so a later
+sweep/reconnect runs the follow-up resync.
+
 ### Counter Divergence
 
 Counters are not kept perfectly current by incremental sync. Session state is
