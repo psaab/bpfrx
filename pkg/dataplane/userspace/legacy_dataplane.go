@@ -71,6 +71,18 @@ func (a *LegacyDataPlaneAdapter) Manager() *Manager {
 	return a.manager
 }
 
+// AppliedNATView exposes the manager's last-applied NAT view through the
+// adapter so the gRPC/REST/CLI deterministic-mapping lookup (#5794) can
+// reach it via a single narrow interface (no packet-path I/O). Returns an
+// unavailable view when the adapter has no manager.
+func (a *LegacyDataPlaneAdapter) AppliedNATView() AppliedNATView {
+	m := a.Manager()
+	if m == nil {
+		return AppliedNATView{Available: false}
+	}
+	return m.AppliedNATView()
+}
+
 func (a *LegacyDataPlaneAdapter) IsLoaded() bool {
 	m, err := a.managerOrErr()
 	if err != nil || m.bpfShim == nil {

@@ -1,0 +1,321 @@
+package nat
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
+)
+
+// v4View builds an applied view with a single mode-1 (IPv4) deterministic
+// pool matching the Rust golden vectors in
+// userspace-dp/src/nat/tests_pool.rs
+// (deterministic_cgnat_v4_fixed_block_per_subscriber_reversible):
+// pool 203.0.113.1-4, port range 1024-65535, block-size 512 (=> 126
+// blocks/addr), subscriber CIDR 100.64.0.0/22 (=> host_count 1024).
+func v4View(gen uint64) AppliedView {
+	pool := &config.NATPool{
+		Name:      "cgn-pool",
+		Addresses: []string{"203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4"},
+		PortLow:   1024,
+		PortHigh:  65535,
+		Deterministic: &config.DeterministicNATConfig{
+			BlockSize:   512,
+			HostAddress: "100.64.0.0/22",
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{"cgn-pool": pool}
+	return AppliedView{Config: cfg, Generation: gen, Available: true}
+}
+
+// v6View builds an applied view with a single mode-2 (IPv6/NAPT64)
+// deterministic pool matching the Rust golden vectors
+// (deterministic_napt64_v6_fixed_block_per_subscriber_reversible):
+// external pool 198.51.100.1-4, NAT64 port range 1024-65535, block-size 512
+// (=> 126 blocks/addr), subscriber prefix 2001:db8::/32 (=> host_count 504).
+func v6View(gen uint64) AppliedView {
+	pool := &config.NATPool{
+		Name:      "napt64-pool",
+		Addresses: []string{"198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4"},
+		Deterministic: &config.DeterministicNATConfig{
+			BlockSize:   512,
+			HostAddress: "2001:db8::/32",
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{"napt64-pool": pool}
+	return AppliedView{Config: cfg, Generation: gen, Available: true}
+}
+
+// TestDeterministicV4GoldenVectors pins the mode-1 forward + reverse mapping
+// to the exact values the Rust allocator test asserts. If the Go arithmetic
+// drifts from the enforced dataplane mapping, these fail.
+func TestDeterministicV4GoldenVectors(t *testing.T) {
+	view := v4View(7)
+
+	// Subscriber A = 100.64.0.5 -> sub_idx 5, ip_idx 0, block_idx 5,
+	// block [3584, 4095], external pool[0] = 203.0.113.1.
+	fwd, err := LookupForward(view, "cgn-pool", "100.64.0.5")
+	if err != nil {
+		t.Fatalf("forward A: unexpected error %v", err)
+	}
+	if fwd.ExternalIP != "203.0.113.1" || fwd.PortLow != 3584 || fwd.PortHigh != 4095 ||
+		fwd.BlockIndex != 5 || fwd.BlockSize != 512 || fwd.Mode != ModeV4 || fwd.AppliedGeneration != 7 {
+		t.Fatalf("forward A mismatch: %+v", fwd)
+	}
+
+	// Subscriber B = 100.64.1.0 -> sub_idx 256, ip_idx 2, block_idx 4,
+	// block [3072, 3583], external pool[2] = 203.0.113.3.
+	fwd, err = LookupForward(view, "cgn-pool", "100.64.1.0")
+	if err != nil {
+		t.Fatalf("forward B: unexpected error %v", err)
+	}
+	if fwd.ExternalIP != "203.0.113.3" || fwd.PortLow != 3072 || fwd.PortHigh != 3583 || fwd.BlockIndex != 4 {
+		t.Fatalf("forward B mismatch: %+v", fwd)
+	}
+
+	// Reverse the two golden tuples back to their subscribers.
+	rev, err := LookupReverse(view, "cgn-pool", "203.0.113.1", 3584)
+	if err != nil {
+		t.Fatalf("reverse A: unexpected error %v", err)
+	}
+	if rev.InternalHost != "100.64.0.5" || rev.PortLow != 3584 || rev.PortHigh != 4095 || rev.AppliedGeneration != 7 {
+		t.Fatalf("reverse A mismatch: %+v", rev)
+	}
+	rev, err = LookupReverse(view, "cgn-pool", "203.0.113.3", 3072)
+	if err != nil {
+		t.Fatalf("reverse B: unexpected error %v", err)
+	}
+	if rev.InternalHost != "100.64.1.0" {
+		t.Fatalf("reverse B mismatch: %+v", rev)
+	}
+}
+
+// TestDeterministicV6GoldenVectors pins the mode-2 (NAPT64) forward +
+// reverse mapping to the Rust golden vectors.
+func TestDeterministicV6GoldenVectors(t *testing.T) {
+	view := v6View(3)
+
+	// Subscriber A = 2001:db8:0:5:: -> word 5 -> sub_idx 5, ip_idx 0,
+	// block_idx 5, block [3584, 4095], external pool[0] = 198.51.100.1.
+	fwd, err := LookupForward(view, "napt64-pool", "2001:db8:0:5::")
+	if err != nil {
+		t.Fatalf("forward A: unexpected error %v", err)
+	}
+	if fwd.ExternalIP != "198.51.100.1" || fwd.PortLow != 3584 || fwd.PortHigh != 4095 ||
+		fwd.BlockIndex != 5 || fwd.Mode != ModeV6 {
+		t.Fatalf("forward A mismatch: %+v", fwd)
+	}
+
+	// Subscriber B = 2001:db8:0:100:: -> word 256 -> sub_idx 256, ip_idx 2,
+	// block_idx 4, block [3072, 3583], external pool[2] = 198.51.100.3.
+	fwd, err = LookupForward(view, "napt64-pool", "2001:db8:0:100::")
+	if err != nil {
+		t.Fatalf("forward B: unexpected error %v", err)
+	}
+	if fwd.ExternalIP != "198.51.100.3" || fwd.PortLow != 3072 || fwd.PortHigh != 3583 || fwd.BlockIndex != 4 {
+		t.Fatalf("forward B mismatch: %+v", fwd)
+	}
+
+	// Reverse recovers the subscriber PREFIX (network base + word).
+	rev, err := LookupReverse(view, "napt64-pool", "198.51.100.1", 3584)
+	if err != nil {
+		t.Fatalf("reverse A: unexpected error %v", err)
+	}
+	if rev.InternalHost != "2001:db8:0:5::" {
+		t.Fatalf("reverse A mismatch: got %q want 2001:db8:0:5::", rev.InternalHost)
+	}
+	rev, err = LookupReverse(view, "napt64-pool", "198.51.100.3", 3072)
+	if err != nil {
+		t.Fatalf("reverse B: unexpected error %v", err)
+	}
+	if rev.InternalHost != "2001:db8:0:100::" {
+		t.Fatalf("reverse B mismatch: got %q", rev.InternalHost)
+	}
+
+	// A subscriber beyond the pool-bounded host_count (504) fails closed.
+	// sub_idx 504 is word 0x1f8 -> 2001:db8:0:1f8::.
+	if _, e := LookupForward(view, "napt64-pool", "2001:db8:0:1f8::"); e == nil || e.Code != ErrCodeOutOfRange {
+		t.Fatalf("beyond-capacity subscriber must be out-of-range, got %v", e)
+	}
+}
+
+// TestDeterministicV6Prefix64 checks the /64 subscriber-word offset (octet
+// 8) golden value from the Rust test: 2001:db8::7:0:0 -> sub_idx 7.
+func TestDeterministicV6Prefix64(t *testing.T) {
+	pool := &config.NATPool{
+		Name:      "p64",
+		Addresses: []string{"198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4"},
+		Deterministic: &config.DeterministicNATConfig{
+			BlockSize:   512,
+			HostAddress: "2001:db8::/64",
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{"p64": pool}
+	view := AppliedView{Config: cfg, Generation: 1, Available: true}
+
+	// word 7 -> sub_idx 7, ip_idx 0, block_idx 7, block [1024+7*512, ..+511]
+	// = [4608, 5119], external pool[0].
+	fwd, err := LookupForward(view, "p64", "2001:db8::7:0:0")
+	if err != nil {
+		t.Fatalf("forward /64: %v", err)
+	}
+	if fwd.BlockIndex != 7 || fwd.ExternalIP != "198.51.100.1" || fwd.PortLow != 4608 || fwd.PortHigh != 5119 {
+		t.Fatalf("/64 forward mismatch: %+v", fwd)
+	}
+	rev, err := LookupReverse(view, "p64", "198.51.100.1", 4700)
+	if err != nil {
+		t.Fatalf("reverse /64: %v", err)
+	}
+	if rev.InternalHost != "2001:db8::7:0:0" {
+		t.Fatalf("/64 reverse mismatch: got %q", rev.InternalHost)
+	}
+}
+
+// TestRoundTripV4 is a bounded property test: every subscriber in the pool's
+// range maps forward to a block, and any port in that block reverses back to
+// the same subscriber.
+func TestRoundTripV4(t *testing.T) {
+	view := v4View(1)
+	// Sample a spread of servable subscribers. The /22 host CIDR (1024 hosts)
+	// is over-provisioned relative to the 4-address pool * 126 blocks = 504
+	// servable subscribers, so stay within sub_idx < 504 (see
+	// TestForwardBeyondPoolCapacity for the boundary).
+	for _, host := range []string{"100.64.0.0", "100.64.0.1", "100.64.0.125", "100.64.0.126", "100.64.1.0", "100.64.1.247"} {
+		fwd, err := LookupForward(view, "cgn-pool", host)
+		if err != nil {
+			t.Fatalf("forward %s: %v", host, err)
+		}
+		// First, middle, and last port of the block must all reverse back.
+		// (Compute the midpoint without overflowing uint16.)
+		for _, port := range []uint16{fwd.PortLow, fwd.PortLow + (fwd.PortHigh-fwd.PortLow)/2, fwd.PortHigh} {
+			rev, rerr := LookupReverse(view, "cgn-pool", fwd.ExternalIP, port)
+			if rerr != nil {
+				t.Fatalf("reverse %s:%d: %v", fwd.ExternalIP, port, rerr)
+			}
+			if rev.InternalHost != host {
+				t.Fatalf("round-trip mismatch: %s -> %s:%d -> %s", host, fwd.ExternalIP, port, rev.InternalHost)
+			}
+		}
+	}
+}
+
+// TestForwardBeyondPoolCapacity documents that a subscriber inside the host
+// CIDR but past the pool's servable capacity (ip_idx >= len(pool)) fails
+// closed, matching the Rust allocator's ip_idx bound. 100.64.1.248 is
+// sub_idx 504, whose ip_idx (504/126 = 4) exceeds the 4-address pool.
+func TestForwardBeyondPoolCapacity(t *testing.T) {
+	view := v4View(1)
+	if _, e := LookupForward(view, "cgn-pool", "100.64.1.248"); e == nil || e.Code != ErrCodeOutOfRange {
+		t.Fatalf("expected out-of-range for beyond-capacity subscriber, got %v", e)
+	}
+}
+
+func TestErrorCases(t *testing.T) {
+	view := v4View(1)
+
+	// No applied view.
+	if _, e := LookupForward(AppliedView{Available: false}, "cgn-pool", "100.64.0.5"); e == nil || e.Code != ErrCodeNoAppliedView {
+		t.Fatalf("expected no-applied-view, got %v", e)
+	}
+	// Unknown pool.
+	if _, e := LookupForward(view, "nope", "100.64.0.5"); e == nil || e.Code != ErrCodeUnknownPool {
+		t.Fatalf("expected unknown-pool, got %v", e)
+	}
+	// Malformed subscriber.
+	if _, e := LookupForward(view, "cgn-pool", "not-an-ip"); e == nil || e.Code != ErrCodeMalformedInput {
+		t.Fatalf("expected malformed-input, got %v", e)
+	}
+	// Out-of-range subscriber (100.64.4.0 is past the /22).
+	if _, e := LookupForward(view, "cgn-pool", "100.64.4.0"); e == nil || e.Code != ErrCodeOutOfRange {
+		t.Fatalf("expected out-of-range, got %v", e)
+	}
+	// Wrong family for a mode-1 pool.
+	if _, e := LookupForward(view, "cgn-pool", "2001:db8::1"); e == nil || e.Code != ErrCodeMalformedInput {
+		t.Fatalf("expected malformed-input for v6 subscriber on v4 pool, got %v", e)
+	}
+	// Reverse: translated IP not in pool.
+	if _, e := LookupReverse(view, "cgn-pool", "192.0.2.99", 3584); e == nil || e.Code != ErrCodeNotFound {
+		t.Fatalf("expected not-found, got %v", e)
+	}
+	// Reverse: malformed port.
+	if _, e := LookupReverse(view, "cgn-pool", "203.0.113.1", 0); e == nil || e.Code != ErrCodeMalformedInput {
+		t.Fatalf("expected malformed-input for port 0, got %v", e)
+	}
+
+	// Non-deterministic pool.
+	plain := &config.NATPool{Name: "plain", Addresses: []string{"203.0.113.9"}, PortLow: 1024, PortHigh: 65535}
+	cfg := &config.Config{}
+	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{"plain": plain}
+	pv := AppliedView{Config: cfg, Generation: 1, Available: true}
+	if _, e := LookupForward(pv, "plain", "100.64.0.5"); e == nil || e.Code != ErrCodeNotDeterministic {
+		t.Fatalf("expected not-deterministic, got %v", e)
+	}
+}
+
+// TestAmbiguousReverse verifies that when no pool is selected and two
+// deterministic pools share the same external tuple, the reverse query is
+// rejected as ambiguous rather than returning a first-match (invariant 6).
+func TestAmbiguousReverse(t *testing.T) {
+	poolA := &config.NATPool{
+		Name: "a", Addresses: []string{"203.0.113.1"}, PortLow: 1024, PortHigh: 65535,
+		Deterministic: &config.DeterministicNATConfig{BlockSize: 512, HostAddress: "100.64.0.0/24"},
+	}
+	poolB := &config.NATPool{
+		Name: "b", Addresses: []string{"203.0.113.1"}, PortLow: 1024, PortHigh: 65535,
+		Deterministic: &config.DeterministicNATConfig{BlockSize: 512, HostAddress: "100.65.0.0/24"},
+	}
+	cfg := &config.Config{}
+	cfg.Security.NAT.SourcePools = map[string]*config.NATPool{"a": poolA, "b": poolB}
+	view := AppliedView{Config: cfg, Generation: 1, Available: true}
+
+	// The external tuple 203.0.113.1:1024 (block 0) exists in both pools.
+	if _, e := LookupReverse(view, "", "203.0.113.1", 1024); e == nil || e.Code != ErrCodeAmbiguousPool {
+		t.Fatalf("expected ambiguous-pool, got %v", e)
+	}
+	// Selecting a pool disambiguates.
+	rev, err := LookupReverse(view, "a", "203.0.113.1", 1024)
+	if err != nil {
+		t.Fatalf("pool-scoped reverse: %v", err)
+	}
+	if rev.InternalHost != "100.64.0.0" {
+		t.Fatalf("pool a reverse mismatch: %+v", rev)
+	}
+	// A pool-less forward for a subscriber only in pool "a" resolves.
+	fwd, ferr := LookupForward(view, "", "100.64.0.5")
+	if ferr != nil {
+		t.Fatalf("pool-less forward: %v", ferr)
+	}
+	if fwd.Pool != "a" {
+		t.Fatalf("expected pool a, got %q", fwd.Pool)
+	}
+}
+
+// TestAppliedGenerationEchoed confirms the applied generation is reported
+// (invariant 3 / 4: N+1 desired must return N's mapping — the caller passes
+// the APPLIED generation, and it is surfaced verbatim).
+func TestAppliedGenerationEchoed(t *testing.T) {
+	view := v4View(42)
+	fwd, err := LookupForward(view, "cgn-pool", "100.64.0.5")
+	if err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	if fwd.AppliedGeneration != 42 {
+		t.Fatalf("expected applied generation 42, got %d", fwd.AppliedGeneration)
+	}
+}
+
+func TestRenderContainsKeyFields(t *testing.T) {
+	view := v4View(9)
+	fwd, _ := LookupForward(view, "cgn-pool", "100.64.0.5")
+	var sb strings.Builder
+	fwd.Render(&sb)
+	out := sb.String()
+	for _, want := range []string{"203.0.113.1", "3584-4095", "generation: 9"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("forward render missing %q:\n%s", want, out)
+		}
+	}
+}
