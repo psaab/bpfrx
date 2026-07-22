@@ -6709,3 +6709,121 @@ fn purge_translated_synced_hit_reverse_entry_releases_nothing_5295() {
         "a reverse/alias purge must NOT release the forward flow's reservation",
     );
 }
+
+
+// #5152 FAIL-ON-REVERT: activating one redundancy group must NOT reset the
+// standby bounded-leak HOLD clock (`first_held_ns`, #2120 §6.4) of an UNRELATED
+// split-RG session this node does not own. `handle_refresh_owner_rgs` walks
+// EVERY HA-managed session on any activation; before the fix it called
+// `refresh_for_ha_transition` UNCONDITIONALLY per item, which zeroes
+// `first_held_ns`/`seen_rg_epoch` and re-stamps `last_seen_ns`. The fix mirrors
+// the demote path (`handle_demote_owner_rgs`) and only re-stamps a session whose
+// refreshed disposition is forwarding (`!= HAInactive`).
+//
+// The test drives the real `handle_refresh_owner_rgs` loop with `session_map_fd
+// = -1` (publish is a no-op) and asserts, via `first_held_ns_for`:
+//   * Case A — a session that re-resolves to HAInactive (owner RG1 still
+//     inactive while an unrelated RG2 activates) keeps its armed HOLD clock.
+//     Reverting the guard resets it to 0 -> this assertion FAILS.
+//   * Case B — a session that re-resolves to ForwardCandidate (owner RG1 itself
+//     activates) has its HOLD clock cleared, proving the legitimate promotion
+//     refresh still fires and the guard did not over-suppress.
+//
+// `test_forwarding_state()` has NO fabric, so an inactive-owner resolution stays
+// `HAInactive` instead of being converted to `FabricRedirect` (verified against
+// the resolution machinery: no-fabric + RG1 inactive -> HAInactive; RG1 active
+// -> ForwardCandidate).
+fn arm_standby_hold_clock_5152(table: &mut SessionTable, now_ns: u64) {
+    // A single HOLD expire pass with this node forwarding NOTHING arms
+    // `first_held_ns` on the idle-crossed peer-synced entry. On a fresh table
+    // `last_gc_ns == 0`, so the GC-interval gate is bypassed and the pass runs.
+    let node_active = false;
+    let forwards = |_rg: i32| -> bool { false };
+    let epoch = |_rg: i32| -> u32 { 0 };
+    let ctx = crate::session::ExpireHaContext {
+        node_active,
+        forwards_rg: &forwards,
+        epoch_of: &epoch,
+        ceiling_mult: crate::session::STALE_SYNCED_CEILING_MULT,
+        ceiling_abs_ns: crate::session::STALE_SYNCED_CEILING_ABS_NS,
+    };
+    let expired = table.expire_stale_entries_ha(now_ns, Some(&ctx));
+    assert!(expired.is_empty(), "arming HOLD pass must hold, not reap");
+}
+
+fn install_synced_forward_5152(table: &mut SessionTable, key: &SessionKey, now_ns: u64) {
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        test_decision(),   // ForwardCandidate, egress 12 -> owner RG1
+        test_metadata(),   // owner_rg_id = 1, not fabric_ingress, not reverse
+        SessionOrigin::SyncImport,
+        now_ns,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+    let _ = table.drain_deltas(8);
+}
+
+#[test]
+fn refresh_owner_rgs_skips_hainactive_hold_clock_5152() {
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    let forwarding = test_forwarding_state(); // NO fabric -> HAInactive survives
+    let key = test_key();
+    let then = 1_000_000_000u64;
+    let armed_ns = then + 302_000_000_000; // past the 300s TCP established timeout
+    let act_ns = armed_ns + 1_000_000;
+    let act_secs = act_ns / 1_000_000_000;
+
+    // ---- Case A: unrelated RG2 activates; owner RG1 stays inactive.
+    let mut sessions_a = SessionTable::new();
+    install_synced_forward_5152(&mut sessions_a, &key, then);
+    arm_standby_hold_clock_5152(&mut sessions_a, armed_ns);
+    assert_eq!(
+        sessions_a.first_held_ns_for(&key),
+        Some(armed_ns),
+        "precondition: standby HOLD clock armed at armed_ns"
+    );
+    let ha_state_a = BTreeMap::from([
+        (1, inactive_ha_runtime(act_secs)),
+        (2, active_ha_runtime(act_secs)),
+    ]);
+    super::commands::handle_refresh_owner_rgs(
+        &mut sessions_a,
+        -1,
+        &forwarding,
+        &ha_state_a,
+        &neighbors,
+        vec![2],
+        act_ns,
+        act_secs,
+    );
+    assert_eq!(
+        sessions_a.first_held_ns_for(&key),
+        Some(armed_ns),
+        "activating RG2 must NOT reset the HOLD clock of an unrelated \
+         HAInactive RG1 session (#5152 — reverting the guard zeroes it)"
+    );
+
+    // ---- Case B: the session's OWN RG1 activates -> ForwardCandidate -> refreshed.
+    let mut sessions_b = SessionTable::new();
+    install_synced_forward_5152(&mut sessions_b, &key, then);
+    arm_standby_hold_clock_5152(&mut sessions_b, armed_ns);
+    assert_eq!(sessions_b.first_held_ns_for(&key), Some(armed_ns));
+    let ha_state_b = BTreeMap::from([(1, active_ha_runtime(act_secs))]);
+    super::commands::handle_refresh_owner_rgs(
+        &mut sessions_b,
+        -1,
+        &forwarding,
+        &ha_state_b,
+        &neighbors,
+        vec![1],
+        act_ns,
+        act_secs,
+    );
+    assert_eq!(
+        sessions_b.first_held_ns_for(&key),
+        Some(0),
+        "activating the session's own RG1 (ForwardCandidate) must clear the \
+         HOLD clock — the legitimate promotion refresh still fires"
+    );
+}
