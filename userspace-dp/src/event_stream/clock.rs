@@ -7,7 +7,7 @@
 //! the Go side cannot skew the logged event time to consumption time. Pure code
 //! motion out of `mod.rs` (#6235); no logic change.
 
-const NS_PER_SEC: u64 = 1_000_000_000;
+pub(super) const NS_PER_SEC: u64 = 1_000_000_000;
 
 /// #2465: read CLOCK_MONOTONIC (ns) and the wall clock (ns since the Unix
 /// epoch) in one pair so the two are anchored to the same instant. Used to
