@@ -560,21 +560,31 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 			}
 
 			// Check if config changed (and the live ifindex is unchanged).
+			// AdvertiseInterval (advert timer / masterDown / wire Max-Adver-Int)
+			// and GARPCount (per-VIP gratuitous-ARP burst on failover) are wire/
+			// timer/burst fields the run loop re-reads from cfg, so a day-2 change
+			// to EITHER must break the no-change shortcut and take the in-place
+			// updateConfig arm below — otherwise a commit changing only
+			// reth-advertise-interval or gratuitous-arp-count is silently dropped
+			// until an unrelated restart (#5087).
 			if !ifindexChanged &&
 				existing.cfg.Priority == inst.Priority &&
 				existing.cfg.Preempt == inst.Preempt &&
 				existing.cfg.PreemptHoldTime == inst.PreemptHoldTime &&
+				existing.cfg.AdvertiseInterval == inst.AdvertiseInterval &&
+				existing.cfg.GARPCount == inst.GARPCount &&
 				existing.cfg.TrackInterface == inst.TrackInterface &&
 				existing.cfg.TrackPriorityCost == inst.TrackPriorityCost &&
 				vipsEqual(existing.cfg.VirtualAddresses, inst.VirtualAddresses) {
 				continue // No change.
 			}
-			// If only priority/preempt/tracking changed (and the ifindex is
-			// unchanged), update in-place without stopping. Restarting would
-			// cause a 3s master-down gap where the node falsely becomes
-			// MASTER before hearing the peer. An ifindex change is NOT
-			// in-place-updatable — it requires a fresh socket — so it skips
-			// this arm and falls through to the build-before-teardown path.
+			// If only priority/preempt/tracking/advertise-interval/GARP-count
+			// changed (and the ifindex is unchanged), update in-place without
+			// stopping. Restarting would cause a 3s master-down gap where the
+			// node falsely becomes MASTER before hearing the peer. An ifindex
+			// change is NOT in-place-updatable — it requires a fresh socket — so
+			// it skips this arm and falls through to the build-before-teardown
+			// path.
 			if !ifindexChanged && vipsEqual(existing.cfg.VirtualAddresses, inst.VirtualAddresses) {
 				slog.Info("vrrp: priority update", "key", existing.key(),
 					"old_pri", existing.cfg.Priority, "new_pri", inst.Priority)

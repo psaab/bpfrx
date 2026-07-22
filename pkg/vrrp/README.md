@@ -47,7 +47,18 @@ This is the package that drives chassis-cluster failover.
   transient member-link failure (carrier flap, mid-rename by networkd)
   therefore leaves the old instance running and advertising its old VIPs
   rather than orphaning the RG out of election. Priority/preempt/track
-  changes still update in-place (no restart, no master-down gap).
+  and the wire/timer/burst fields **advertise-interval** and
+  **gratuitous-arp-count** update in-place (no restart, no master-down
+  gap): the no-change gate compares `AdvertiseInterval` and `GARPCount`
+  so a day-2 commit changing only `reth-advertise-interval` or
+  `gratuitous-arp-count` is detected (not shortcut as no-change), and
+  `updateConfig` copies both into the running instance's `cfg` (#5087).
+  Neither needs an explicit timer poke — the MASTER advert timer
+  re-arms via `advertTimer.Reset(vi.advertInterval())` on its next
+  fire, the BACKUP master-down horizon re-reads `cfg.AdvertiseInterval`
+  through `masterDownInterval()`, and the next failover's `sendGARP`
+  re-reads `cfg.GARPCount`. Before #5087 the stale value persisted
+  until an unrelated restart.
   **Ifindex drift (#2294):** before the no-change / in-place branch, a
   cheap tolerant `name→ifindex` probe compares the live kernel ifindex
   against the one the instance's sockets are bound to. A member netdev

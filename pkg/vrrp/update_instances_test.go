@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/vishvananda/netlink"
 )
@@ -596,6 +597,145 @@ func TestUpdateInstances_IfindexUnchanged_PriorityOnlyStaysInPlace(t *testing.T)
 	}
 	if got.cfg.Priority != 150 {
 		t.Fatalf("in-place update did not apply priority: got %d, want 150", got.cfg.Priority)
+	}
+}
+
+// TestUpdateInstances_AdvertiseIntervalOnlyAppliedInPlace is the #5087
+// fail-on-revert pin for reth-advertise-interval. A commit that changes ONLY
+// the advertise-interval (VIPs + ifindex + priority + preempt + tracking all
+// unchanged) must NOT hit the no-change shortcut: the running instance's
+// cfg.AdvertiseInterval must be updated in place so the advert timer re-arms to
+// the new interval on its next fire.
+//
+// REVERT NEUTRALIZATION (firsthand-verified RED both ways):
+//   - Drop `existing.cfg.AdvertiseInterval == inst.AdvertiseInterval` from the
+//     no-change gate in UpdateInstances → an interval-only delta matches the
+//     shortcut, `continue // No change` runs, updateConfig is never called, and
+//     cfg.AdvertiseInterval stays 1000 → the assertions below fire.
+//   - Drop `vi.cfg.AdvertiseInterval = cfg.AdvertiseInterval` from updateConfig
+//     → the gate detects the change and takes the in-place arm, but the field
+//     is never copied, so cfg.AdvertiseInterval stays 1000 → same RED.
+//
+// The advertInterval() assertion pins the run loop's actual timer source: the
+// MASTER select re-arms via advertTimer.Reset(vi.advertInterval()), so proving
+// advertInterval() now yields the new Duration proves the timer re-arms to the
+// new interval — not merely that a struct field was written.
+func TestUpdateInstances_AdvertiseIntervalOnlyAppliedInPlace(t *testing.T) {
+	m, rec := newTestManagerNoNetwork()
+	defer stopManagerForTest(m)
+
+	m.resolveIface = func(name string) (*net.Interface, error) {
+		return &net.Interface{Name: name, Index: 5}, nil
+	}
+
+	key := instanceKey{iface: "reth0.50", groupID: 101}
+	orig := seedRunningInstance(m, key, Instance{
+		Interface:         "reth0.50",
+		GroupID:           101,
+		Priority:          200,
+		Preempt:           true,
+		AdvertiseInterval: 1000, // day-1 interval (1s)
+		GARPCount:         3,
+		VirtualAddresses:  []string{"172.16.50.1/24"},
+	}, 5)
+
+	// Day-2 change: only reth-advertise-interval moves 1000ms → 30ms.
+	desired := []*Instance{{
+		Interface:         "reth0.50",
+		GroupID:           101,
+		Priority:          200,
+		Preempt:           true,
+		AdvertiseInterval: 30,
+		GARPCount:         3,
+		VirtualAddresses:  []string{"172.16.50.1/24"},
+	}}
+	if err := m.UpdateInstances(desired); err != nil {
+		t.Fatalf("UpdateInstances: %v", err)
+	}
+
+	// The delta must take the cheap in-place path, not a socket-churning restart.
+	open, run, stop := rec.snapshot()
+	if open != 0 || run != 0 || stop != 0 {
+		t.Fatalf("advertise-interval-only delta must stay in-place: open=%d run=%d stop=%d, want 0/0/0", open, run, stop)
+	}
+	m.mu.RLock()
+	got := m.instances[key]
+	m.mu.RUnlock()
+	if got != orig {
+		t.Fatal("advertise-interval-only delta replaced the instance (should be in-place)")
+	}
+
+	// THE PIN: the running instance picked up the new interval. RED if either
+	// the no-change gate or the updateConfig copy is reverted.
+	if got.cfg.AdvertiseInterval != 30 {
+		t.Fatalf("in-place update did not apply advertise-interval: got %d, want 30", got.cfg.AdvertiseInterval)
+	}
+	// The advert timer re-arms to this Duration on its next fire (the run loop's
+	// advertTimer.Reset(vi.advertInterval()) source).
+	if iv := got.advertInterval(); iv != 30*time.Millisecond {
+		t.Fatalf("advertInterval() = %v, want 30ms — advert timer would not re-arm to the new interval", iv)
+	}
+}
+
+// TestUpdateInstances_GARPCountOnlyAppliedInPlace is the #5087 fail-on-revert
+// pin for gratuitous-arp-count. A commit changing ONLY gratuitous-arp-count
+// (everything else unchanged) must update the running instance's cfg.GARPCount
+// in place so the NEXT failover's sendGARP burst uses the new count — sendGARP
+// re-reads vi.cfg.GARPCount on every call.
+//
+// REVERT NEUTRALIZATION: identical to the advertise-interval pin — dropping
+// `existing.cfg.GARPCount == inst.GARPCount` from the no-change gate makes a
+// count-only delta hit the `continue // No change` shortcut, and dropping
+// `vi.cfg.GARPCount = cfg.GARPCount` from updateConfig leaves the field stale
+// after the in-place arm runs. Either way cfg.GARPCount stays 3 → RED.
+func TestUpdateInstances_GARPCountOnlyAppliedInPlace(t *testing.T) {
+	m, rec := newTestManagerNoNetwork()
+	defer stopManagerForTest(m)
+
+	m.resolveIface = func(name string) (*net.Interface, error) {
+		return &net.Interface{Name: name, Index: 5}, nil
+	}
+
+	key := instanceKey{iface: "reth0.50", groupID: 101}
+	orig := seedRunningInstance(m, key, Instance{
+		Interface:         "reth0.50",
+		GroupID:           101,
+		Priority:          200,
+		Preempt:           true,
+		AdvertiseInterval: 30,
+		GARPCount:         3, // day-1 default burst
+		VirtualAddresses:  []string{"172.16.50.1/24"},
+	}, 5)
+
+	// Day-2 change: only gratuitous-arp-count moves 3 → 5.
+	desired := []*Instance{{
+		Interface:         "reth0.50",
+		GroupID:           101,
+		Priority:          200,
+		Preempt:           true,
+		AdvertiseInterval: 30,
+		GARPCount:         5,
+		VirtualAddresses:  []string{"172.16.50.1/24"},
+	}}
+	if err := m.UpdateInstances(desired); err != nil {
+		t.Fatalf("UpdateInstances: %v", err)
+	}
+
+	open, run, stop := rec.snapshot()
+	if open != 0 || run != 0 || stop != 0 {
+		t.Fatalf("gratuitous-arp-count-only delta must stay in-place: open=%d run=%d stop=%d, want 0/0/0", open, run, stop)
+	}
+	m.mu.RLock()
+	got := m.instances[key]
+	m.mu.RUnlock()
+	if got != orig {
+		t.Fatal("gratuitous-arp-count-only delta replaced the instance (should be in-place)")
+	}
+
+	// THE PIN: the running instance picked up the new burst count. RED if either
+	// the no-change gate or the updateConfig copy is reverted.
+	if got.cfg.GARPCount != 5 {
+		t.Fatalf("in-place update did not apply gratuitous-arp-count: got %d, want 5", got.cfg.GARPCount)
 	}
 }
 

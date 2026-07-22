@@ -533,8 +533,9 @@ func (vi *vrrpInstance) key() string {
 	return StateKey(vi.cfg.Interface, vi.cfg.GroupID, vi.cfg.Family)
 }
 
-// updateConfig updates priority, preempt, and interface-tracking config
-// in-place without restarting.
+// updateConfig updates priority, preempt, interface-tracking,
+// advertise-interval, and gratuitous-ARP-count config in-place without
+// restarting.
 //
 // It runs on the manager goroutine, NOT the run-loop goroutine that owns the
 // preemptHoldTimer (#2900). It therefore mutates cfg under mu and then signals
@@ -542,11 +543,23 @@ func (vi *vrrpInstance) key() string {
 // the run loop tears down an in-flight hold whose premise the new config has
 // invalidated (preempt disabled, priority demoted, or hold-time changed). This
 // keeps all preemptHoldTimer Stop/Reset calls on the single run-loop goroutine.
+//
+// AdvertiseInterval and GARPCount are copied so a day-2 change reaches the
+// running instance (#5087). Both are re-read from cfg by the run loop and the
+// failover path, so no explicit timer poke is needed: the MASTER advert timer
+// re-arms via advertTimer.Reset(vi.advertInterval()) on its next fire, the
+// BACKUP master-down horizon re-reads cfg.AdvertiseInterval via
+// masterDownInterval(), and the next failover's sendGARP re-reads
+// cfg.GARPCount. Before this copy a commit changing only
+// reth-advertise-interval or gratuitous-arp-count left the running instance at
+// its stale value until an unrelated restart.
 func (vi *vrrpInstance) updateConfig(cfg Instance) {
 	vi.mu.Lock()
 	vi.cfg.Priority = cfg.Priority
 	vi.cfg.Preempt = cfg.Preempt
 	vi.cfg.PreemptHoldTime = cfg.PreemptHoldTime
+	vi.cfg.AdvertiseInterval = cfg.AdvertiseInterval
+	vi.cfg.GARPCount = cfg.GARPCount
 	vi.cfg.TrackInterface = cfg.TrackInterface
 	vi.cfg.TrackPriorityCost = cfg.TrackPriorityCost
 	vi.desiredPreempt = cfg.Preempt
