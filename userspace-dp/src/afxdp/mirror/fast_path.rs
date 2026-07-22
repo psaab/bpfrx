@@ -253,22 +253,26 @@ pub(in crate::afxdp) fn enqueue_sampled_mirror_clone_to_live(
     flow_key: Option<&SessionKey>,
 ) -> Option<MirrorCloneResult> {
     let config = resolve_mirror_config(forwarding, ingress_ifindex, ingress_vlan_id)?;
-    let cos_queue_id = mirror_cos_queue_id(forwarding, config.output_ifindex, meta, flow_key);
-    let admission = match admit_mirror_clone_to_live(
+    // #6114: sample BEFORE reserving the contended cross-worker clone queue
+    // (see `sample_then_admit_mirror_clone`). A non-sampled packet returns
+    // `None` having touched nothing shared — no reservation, no copy, no
+    // clone-queue pressure report.
+    let admission = match sample_then_admit_mirror_clone(
+        config.rate,
+        sample_counter,
         mirror_targets,
         resolve_tx_binding_ifindex(forwarding, config.output_ifindex),
         ingress_queue_id,
         frame.len(),
     ) {
-        Ok(admission) => admission,
-        Err(result) => {
+        MirrorSampleAdmission::NotSampled => return None,
+        MirrorSampleAdmission::Sampled(Ok(admission)) => admission,
+        MirrorSampleAdmission::Sampled(Err(result)) => {
             record_mirror_clone_result(live, result, frame.len());
             return Some(result);
         }
     };
-    if !mirror_sample_allows(config.rate, sample_counter) {
-        return None;
-    }
+    let cos_queue_id = mirror_cos_queue_id(forwarding, config.output_ifindex, meta, flow_key);
     let result = enqueue_admitted_mirror_clone_to_live(
         admission,
         config,

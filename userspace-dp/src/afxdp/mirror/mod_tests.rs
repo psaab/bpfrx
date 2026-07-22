@@ -564,8 +564,22 @@ fn sampled_live_mirror_sampler_denial_does_not_enqueue() {
     assert!(queued.is_empty());
 }
 
+// #6114 intent resolution: this test previously asserted admit-FIRST ordering
+// (`..._queue_full_does_not_advance_sampler`) as intended — a full-queue packet
+// must not "consume a mirror sample". #6114 determined that is a SECOND instance
+// of the #5167 bug, not a real requirement: the flow-cache surface reserves the
+// contended cross-worker clone queue (`admit_mirror_clone_to_live`, a true-shared
+// AcqRel CAS on `pending_tx_admitted`, #4096) for EVERY established-flow packet,
+// so acknowledged cross-core true-sharing scaled O(PPS) instead of O(PPS/R) on
+// the dominant path. "Preserving sample budget on a full queue" only matters
+// during a pressure event where clones are already being dropped, is
+// statistically irrelevant to a 1-in-N decimation of a lossy clone stream, and
+// #5167 already chose sample-first for the identical shared-CAS tradeoff in
+// `enqueue_sampled_mirror_clone`. So the ordering is flipped to sample-first
+// (via `sample_then_admit_mirror_clone`): a SELECTED packet advances the sampler
+// and THEN reports the full-queue pressure.
 #[test]
-fn sampled_live_mirror_queue_full_does_not_advance_sampler() {
+fn sampled_live_mirror_queue_full_advances_sampler_for_selected_6114() {
     let ingress_live = BindingLiveState::new();
     let target_live = Arc::new(BindingLiveState::new());
     target_live.set_max_pending_tx(1);
@@ -593,6 +607,9 @@ fn sampled_live_mirror_queue_full_does_not_advance_sampler() {
             rate: 4,
         },
     );
+    // rate=4 + counter=0 -> mirror_sample_allows == true (this packet IS
+    // selected). Sample-first advances the sampler BEFORE it discovers the
+    // full queue.
     let mut sample_counter = 0;
 
     let result = enqueue_sampled_mirror_clone_to_live(
@@ -610,8 +627,9 @@ fn sampled_live_mirror_queue_full_does_not_advance_sampler() {
 
     assert_eq!(result, Some(MirrorCloneResult::QueueFullCrossWorker));
     assert_eq!(
-        sample_counter, 0,
-        "full live target must fail before consuming a mirror sample"
+        sample_counter, 1,
+        "#6114: a SELECTED packet advances the sampler before the full-queue \
+         admit fails (sample-first); reverting to admit-first leaves it at 0"
     );
     assert_eq!(
         ingress_live.mirror_drops_queue_full.load(Ordering::Relaxed),
@@ -630,6 +648,100 @@ fn sampled_live_mirror_queue_full_does_not_advance_sampler() {
         0,
         "mirror backpressure must not pollute target redirect overflow counters"
     );
+    let mut queued = VecDeque::new();
+    target_live.take_pending_tx_into(&mut queued);
+    assert_eq!(
+        queued.pop_front().expect("original request").bytes,
+        vec![0x33; 64]
+    );
+    assert!(queued.is_empty());
+}
+
+/// #6114 FAIL-ON-REVERT: a NON-sampled packet on the flow-cache mirror surface
+/// must NOT reserve the (full) cross-worker clone queue. This is the flow-cache
+/// analog of #6113's `cross_worker_nonsampled_does_not_reserve_full_queue_5167`,
+/// and it guards the ordering used by BOTH `enqueue_sampled_mirror_clone_to_live`
+/// and the established-flow HOT path (`poll_descriptor/flow_cache_hit.rs`), which
+/// share `sample_then_admit_mirror_clone`.
+///
+/// With sample-first, a non-sampled packet returns `None` having touched nothing
+/// shared: no `admit_mirror_clone_to_live` reservation, no clone-queue pressure
+/// counter, the pre-fill untouched, and only the worker-local sampler advanced.
+/// Reverting to reserve-before-sample makes the packet call
+/// `admit_mirror_clone_to_live` on the full queue and return
+/// `Some(QueueFullCrossWorker)` while bumping `mirror_drops_queue_full` — a
+/// non-sampled packet reporting clone-queue pressure it should never touch -> RED.
+#[test]
+fn flow_cache_nonsampled_does_not_reserve_full_queue_6114() {
+    let ingress_live = BindingLiveState::new();
+    let target_live = Arc::new(BindingLiveState::new());
+    // Drive the cross-worker clone queue to its admission cap.
+    target_live.set_max_pending_tx(1);
+    assert!(
+        target_live
+            .try_enqueue_tx_owned(test_tx_request(0x33, 22))
+            .is_ok()
+    );
+    let mut mirror_targets = MirrorTargetMap::default();
+    mirror_targets.insert(
+        &BindingIdentity {
+            slot: 9,
+            queue_id: 0,
+            worker_id: 1,
+            interface: Arc::<str>::from("mirror-out"),
+            ifindex: 22,
+        },
+        target_live.clone(),
+    );
+    let mut forwarding = ForwardingState::default();
+    forwarding.mirror_configs.insert(
+        11,
+        MirrorRuntimeConfig {
+            output_ifindex: 22,
+            rate: 2,
+        },
+    );
+    // rate=2 + counter=1 -> mirror_sample_allows == false (this packet is NOT
+    // selected).
+    let mut sample_counter = 1;
+
+    let result = enqueue_sampled_mirror_clone_to_live(
+        &ingress_live,
+        &mirror_targets,
+        &forwarding,
+        11,
+        0,
+        0,
+        &mut sample_counter,
+        &[0x44; 80],
+        test_meta(),
+        None,
+    );
+
+    assert_eq!(
+        result, None,
+        "#6114: a non-sampled packet must NOT reserve the full clone queue \
+         (sample-first); reverting to admit-first returns \
+         Some(QueueFullCrossWorker)"
+    );
+    assert_eq!(
+        sample_counter, 2,
+        "the worker-local sampler still advances for the declined packet"
+    );
+    assert_eq!(
+        ingress_live.mirror_drops_queue_full.load(Ordering::Relaxed),
+        0,
+        "#6114: a non-sampled packet must not report clone-queue pressure"
+    );
+    assert_eq!(
+        ingress_live
+            .mirror_drops_queue_full_cross_worker
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(ingress_live.mirrored_packets.load(Ordering::Relaxed), 0);
+    // The pre-fill is the only queued request; the non-sampled packet reserved
+    // nothing.
     let mut queued = VecDeque::new();
     target_live.take_pending_tx_into(&mut queued);
     assert_eq!(

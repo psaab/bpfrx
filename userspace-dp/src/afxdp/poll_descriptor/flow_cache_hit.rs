@@ -386,7 +386,22 @@ pub(super) fn stage_flow_cache_hit(
                 );
                 let mut mirror_next_counter = None;
                 let mut mirror_admission = mirror_config.and_then(|config| {
-                    let admission = admit_mirror_clone_to_live(
+                    // #6114: sample BEFORE reserving the contended cross-worker
+                    // clone queue on this established-flow HOT path. Reserving
+                    // first (`admit_mirror_clone_to_live`, a true-shared AcqRel
+                    // CAS on the target's `pending_tx_admitted`, #4096) made
+                    // every established-flow packet hit the shared cacheline
+                    // even when it would not be sampled — O(PPS) cross-core
+                    // true-sharing instead of the sample rate O(PPS/R). A LOCAL
+                    // counter copy defers the commit: `mirror_next_counter` is
+                    // applied to `*mirror_sample_counter` only if the in-place
+                    // rewrite below succeeds (the fallback path re-runs mirror
+                    // selection), preserving today's "no fast-path advance on
+                    // rewrite miss" behavior.
+                    let mut next_counter = *mirror_sample_counter;
+                    let admission = sample_then_admit_mirror_clone(
+                        config.rate,
+                        &mut next_counter,
                         worker_ctx.mirror_targets,
                         resolve_tx_binding_ifindex(
                             worker_ctx.forwarding,
@@ -395,18 +410,10 @@ pub(super) fn stage_flow_cache_hit(
                         worker_ctx.ident.queue_id,
                         packet_frame.len(),
                     );
+                    mirror_next_counter = Some(next_counter);
                     match admission {
-                        Ok(admission) => {
-                            let mut next_counter = *mirror_sample_counter;
-                            if mirror_sample_allows(config.rate, &mut next_counter) {
-                                mirror_next_counter = Some(next_counter);
-                                Some((config, Ok(admission)))
-                            } else {
-                                mirror_next_counter = Some(next_counter);
-                                None
-                            }
-                        }
-                        Err(result) => Some((config, Err(result))),
+                        MirrorSampleAdmission::NotSampled => None,
+                        MirrorSampleAdmission::Sampled(result) => Some((config, result)),
                     }
                 });
                 let mirror_frame_len = packet_frame.len();
