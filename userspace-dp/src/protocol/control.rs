@@ -205,6 +205,16 @@ pub(crate) struct ProcessStatus {
     pub neighbor_cache_capacity: usize,
     #[serde(rename = "neighbor_generation", default)]
     pub neighbor_generation: u64,
+    /// #6034: ACK of the highest authoritative manager-neighbor REPLACE
+    /// generation the helper has applied. Distinct from
+    /// `neighbor_generation` (the dynamic ARP/NDP resolver epoch): this
+    /// echoes the `neighbor_generation` field the Go manager stamps on an
+    /// `update_neighbors` replace so the manager can confirm the clear /
+    /// replace landed and retain retry debt otherwise. Additive / defaulted:
+    /// an older helper omits it (Go decodes 0 → treats as "no ACK support,
+    /// assume applied", preserving pre-#6034 behavior).
+    #[serde(rename = "manager_neighbor_generation", default)]
+    pub manager_neighbor_generation: u64,
     #[serde(rename = "route_entries", default)]
     pub route_entries: usize,
     #[serde(rename = "worker_heartbeats", default)]

@@ -430,6 +430,14 @@ func (m *Manager) publishSnapshotFailClosedLocked(publishSnap *ConfigSnapshot, s
 		}
 		return publishErr
 	}
+	// #6034: apply_snapshot returns the helper's current neighbor-replace
+	// generation. Seed from that response before returning to Compile, which
+	// exposes m.lastSnapshot (and therefore enables RegenerateNeighborSnapshot)
+	// immediately afterward. Waiting for statusLoop's first 1s tick leaves a
+	// window where a surviving helper can fence this manager's generation 1.
+	if status != nil {
+		m.seedNeighborReplaceGenerationLocked(status.ManagerNeighborGeneration)
+	}
 	return nil
 }
 

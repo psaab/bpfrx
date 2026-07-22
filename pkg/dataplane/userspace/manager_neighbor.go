@@ -28,6 +28,15 @@ func filterPublishableNeighbors(neighbors []NeighborSnapshot) []NeighborSnapshot
 	return out
 }
 
+// seedNeighborReplaceGenerationLocked advances the manager's replace counter
+// to the helper's applied-generation fence without ever moving it backwards.
+// Caller must hold m.mu.
+func (m *Manager) seedNeighborReplaceGenerationLocked(appliedGeneration uint64) {
+	if appliedGeneration > m.neighborReplaceGen {
+		m.neighborReplaceGen = appliedGeneration
+	}
+}
+
 // rebuildNeighborIndex updates m.neighborIndex from the current
 // m.lastSnapshot.Neighbors slice. Caller MUST hold m.mu. Called
 // after every assignment to lastSnapshot.Neighbors.
@@ -90,13 +99,31 @@ func (m *Manager) RegenerateNeighborSnapshot() {
 		return
 	}
 	publishable := filterPublishableNeighbors(newNeighbors)
+	// #6034: stamp a fresh monotonic replace generation so the helper can
+	// fence a stale/reordered replace and ACK the applied generation.
+	m.neighborReplaceGen++
+	gen := m.neighborReplaceGen
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{
-		Type:            "update_neighbors",
-		Neighbors:       publishable,
-		NeighborReplace: true,
+		Type:               "update_neighbors",
+		Neighbors:          publishable,
+		NeighborReplace:    true,
+		NeighborGeneration: gen,
 	}, &status); err != nil {
 		slog.Warn("userspace: failed to publish neighbor regeneration", "err", err)
+		return
+	}
+	// #6034: retain retry debt if the helper did not acknowledge applying
+	// this replace generation. A helper that supports the ACK echoes the
+	// applied generation; a value below `gen` means it fenced the replace
+	// as stale, so we leave the cached neighbor view untouched and the next
+	// regeneration re-diffs and retries with a strictly higher generation.
+	// An ACK of 0 means an older helper without ACK support — assume applied
+	// (preserves pre-#6034 behavior).
+	if status.ManagerNeighborGeneration != 0 && status.ManagerNeighborGeneration < gen {
+		slog.Warn("userspace: neighbor regeneration not acknowledged; retaining retry debt",
+			"sent_generation", gen,
+			"applied_generation", status.ManagerNeighborGeneration)
 		return
 	}
 	m.lastSnapshot.Neighbors = newNeighbors

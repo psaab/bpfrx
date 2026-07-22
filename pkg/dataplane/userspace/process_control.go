@@ -217,6 +217,9 @@ func (m *Manager) requestSessionSync(req ControlRequest) error {
 }
 
 func (m *Manager) requestLocked(req ControlRequest, status *ProcessStatus) error {
+	if m.controlRequestHook != nil {
+		return m.controlRequestHook(req, status)
+	}
 	resp, err := m.requestDetailedLocked(req)
 	if err != nil {
 		return err

@@ -85,16 +85,26 @@ func Boot() dataplane.RuntimeDataPlane {
 type Manager struct {
 	bpfShim *dataplane.Manager
 
-	mu           sync.Mutex
-	sessionMu    sync.Mutex // separate lock for session sync requests (Phase 3)
-	proc         *exec.Cmd
-	cfg          config.UserspaceConfig
-	clusterHA    bool
-	generation   uint64
-	syncCancel   context.CancelFunc
-	lastStatus   ProcessStatus
-	lastSnapshot *ConfigSnapshot
-	lastApply    *dataplane.ApplyResult
+	mu         sync.Mutex
+	sessionMu  sync.Mutex // separate lock for session sync requests (Phase 3)
+	proc       *exec.Cmd
+	cfg        config.UserspaceConfig
+	clusterHA  bool
+	generation uint64
+	// neighborReplaceGen is a dedicated monotonic counter for the #6034
+	// manager-neighbor replace-generation envelope. Every authoritative
+	// update_neighbors replace (RegenerateNeighborSnapshot, BumpFIBGeneration)
+	// allocates the next value and stamps it on the ControlRequest so the
+	// helper can fence a stale/reordered replace and ACK the applied
+	// generation. Distinct from `generation` (the config-snapshot counter):
+	// this only advances on a neighbor push and is never reused, so a retry
+	// always carries a strictly higher generation. Guarded by m.mu (both
+	// senders hold it across the send).
+	neighborReplaceGen uint64
+	syncCancel         context.CancelFunc
+	lastStatus         ProcessStatus
+	lastSnapshot       *ConfigSnapshot
+	lastApply          *dataplane.ApplyResult
 	// lastSnapshotRejectReasons holds the #3261 diagnostic: the reasons the
 	// most recently built snapshot carries unrepresentable policy content that
 	// the helper integrity preflight rejects (previous-good retained, or
@@ -237,6 +247,9 @@ type Manager struct {
 	// readback faults without a privileged BPF map (#5486). Production leaves
 	// it nil.
 	disableCtrlMapHook ctrlMapUpdater
+	// controlRequestHook replaces requestLocked in unit tests that exercise
+	// manager state transitions without opening a Unix control socket.
+	controlRequestHook func(ControlRequest, *ProcessStatus) error
 
 	// addrListForLocalSyncHook, when non-nil, replaces netlink.AddrList in
 	// buildDesiredLocalAddressSets so tests can inject a transient

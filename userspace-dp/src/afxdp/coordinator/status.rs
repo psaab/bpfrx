@@ -19,6 +19,18 @@ impl super::Coordinator {
         (entries, generation)
     }
 
+    /// #6034: the highest authoritative manager-neighbor REPLACE generation
+    /// applied so far (ACK'd back to the Go manager in `ProcessStatus`).
+    /// Distinct from `dynamic_neighbor_status`'s resolver epoch — this only
+    /// advances on an accepted versioned `update_neighbors` replace and lets
+    /// the manager confirm a clear/replace landed (retaining retry debt on a
+    /// non-advanced ACK).
+    pub fn last_applied_manager_neighbor_generation(&self) -> u64 {
+        self.neighbors
+            .applied_manager_generation
+            .load(Ordering::Relaxed)
+    }
+
     /// #5673: cumulative data-path neighbor learns refused by the aggregate
     /// dynamic-neighbor map cap (`MAX_DYNAMIC_NEIGHBORS_PER_SHARD`). The
     /// counter is a single map-wide atomic (the map is shared across all

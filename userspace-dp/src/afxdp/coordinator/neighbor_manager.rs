@@ -38,6 +38,15 @@ pub(in crate::afxdp) const WARM_GC_MAX_AGE_NS: u64 = 300_000_000_000;
 pub(crate) struct NeighborManager {
     pub(crate) dynamic: Arc<ShardedNeighborMap>,
     pub(crate) generation: Arc<AtomicU64>,
+    /// #6034: highest authoritative manager-neighbor REPLACE generation
+    /// applied so far. The Go manager stamps a monotonically increasing
+    /// `neighbor_generation` on every `update_neighbors` replace;
+    /// `apply_manager_neighbors` REJECTS a replace whose generation is
+    /// <= this value (stale / reordered delivery must not clobber a newer
+    /// table) and advances it on accept. 0 = no versioned replace applied
+    /// yet; a generation-0 (unversioned / pre-#6034) push bypasses the
+    /// fence and never advances it.
+    pub(crate) applied_manager_generation: Arc<AtomicU64>,
     pub(crate) manager_keys: Arc<Mutex<FastSet<(i32, IpAddr)>>>,
     pub(crate) monitor_stop: Option<Arc<AtomicBool>>,
     /// #5165: join handle for the neighbor-monitor thread. Retained (like the
@@ -115,6 +124,7 @@ impl NeighborManager {
         Self {
             dynamic: Arc::new(ShardedNeighborMap::new()),
             generation: Arc::new(AtomicU64::new(0)),
+            applied_manager_generation: Arc::new(AtomicU64::new(0)),
             manager_keys: Arc::new(Mutex::new(FastSet::default())),
             monitor_stop: None,
             monitor_join: None,

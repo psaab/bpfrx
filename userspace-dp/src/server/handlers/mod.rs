@@ -174,9 +174,12 @@ pub(crate) fn handle_stream(
                     refresh_status(&mut guard);
                 }
             }
-            "update_neighbors" => {
-                neighbors::update(&mut guard, request.neighbors.as_ref(), neighbor_replace)
-            }
+            "update_neighbors" => neighbors::update(
+                &mut guard,
+                request.neighbors.as_ref(),
+                request.neighbor_generation,
+                neighbor_replace,
+            ),
             "bump_fib_generation" => snapshot::bump_fib(
                 &mut guard,
                 request.snapshot.as_ref(),

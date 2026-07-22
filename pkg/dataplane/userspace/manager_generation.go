@@ -85,13 +85,26 @@ func (m *Manager) BumpFIBGeneration() (uint32, error) {
 	newNeighbors := buildNeighborSnapshots(m.lastSnapshot.Config)
 	if !neighborsEqualForwarding(m.lastSnapshot.Neighbors, newNeighbors) {
 		publishable := filterPublishableNeighbors(newNeighbors)
+		// #6034: stamp a fresh monotonic replace generation (see
+		// RegenerateNeighborSnapshot / Manager.neighborReplaceGen).
+		m.neighborReplaceGen++
+		gen := m.neighborReplaceGen
 		var status ProcessStatus
 		if err := m.requestLocked(ControlRequest{
-			Type:            "update_neighbors",
-			Neighbors:       publishable,
-			NeighborReplace: true,
+			Type:               "update_neighbors",
+			Neighbors:          publishable,
+			NeighborReplace:    true,
+			NeighborGeneration: gen,
 		}, &status); err != nil {
 			slog.Warn("userspace: failed to publish neighbor update", "err", err)
+		} else if status.ManagerNeighborGeneration != 0 && status.ManagerNeighborGeneration < gen {
+			// #6034: the helper fenced this replace as stale. Retain the
+			// cached neighbor view so the next bump re-diffs and retries
+			// with a strictly higher generation. An ACK of 0 = older helper
+			// without ACK support, treated as applied.
+			slog.Warn("userspace: neighbor update not acknowledged; retaining retry debt",
+				"sent_generation", gen,
+				"applied_generation", status.ManagerNeighborGeneration)
 		} else {
 			// Only update cached neighbors after successful publish so
 			// a transient failure doesn't suppress future retries.
