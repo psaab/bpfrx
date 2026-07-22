@@ -543,6 +543,36 @@ load/peer-sync compile paths.
   read raw VRRP frames). The OR-into-type form avoids the fork race a separate
   `fcntl(FD_CLOEXEC)` would open.
 
+### IPv6 advert address list — link-local first (#5089)
+
+RFC 5798 §5.2.9 defines an advertisement's payload as the list of IPvX
+address(es) "associated with the virtual router", and §5.1.1.2 requires an
+IPv6 advert to be **sourced from the virtual router's link-local address**.
+For IPv6 the conformant wire format places that link-local as **address[0]**,
+followed by the configured global VIPs — a strict vSRX/keepalived-v3 peer can
+reject an advert whose first address is a global VIP.
+
+`sendPacketIPv6` (`instance.go`) resolves that link-local as `srcIP`
+(`getLocalIPv6()`, with the #2258 lazy-resolve fallback), uses it as the outer
+IPv6 source and the pseudo-header checksum source (#2644), **and now prepends
+it to `pkt.IPAddresses` ahead of the configured VIPs** before `Marshal`. Three
+invariants hold by construction:
+
+- **address[0] == outer/checksum source.** The prepend reuses the exact `srcIP`
+  fed to the checksum, so the first advertised address is guaranteed identical
+  to the pinned outer source (`IPV6_PKTINFO`) — no independent resolution that
+  could drift.
+- **Count stays consistent.** `Marshal` derives the "Count IPvX Addr" wire byte
+  from `len(IPAddresses)` (`packet.go`), so prepending bumps the count in
+  lockstep with the payload length; the `MinAdvertAddrCount..MaxAdvertAddrCount`
+  guard still applies (a 255-VIP config would push to 256 and be rejected).
+- **IPv4 is untouched.** The prepend lives only in the IPv6 send path; the
+  IPv4 `sendPacket` builder advertises the configured VIPs verbatim.
+
+Guarded by `TestSendPacketIPv6PrependsVirtualRouterLinkLocal` /
+`TestSendPacketIPv6LinkLocalFirstWithMultipleVIPs`, which re-parse the captured
+advert and assert address[0] is the link-local and the Count field includes it.
+
 ### Receiver goroutine model
 
 When AF_PACKET opens (`afPacketFD >= 0`), a single `receiverAfPacket()`

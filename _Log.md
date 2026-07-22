@@ -56130,3 +56130,20 @@ top.
   pkg/vrrp suite green (incl. -race).
   **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
   pkg/vrrp/update_instances_test.go, pkg/vrrp/README.md
+
+- **Timestamp**: 2026-07-22 (fix/5089-vrrp-v6-linklocal-advert)
+  **Action**: #5089 — Prepend the virtual-router link-local as the FIRST IPvX
+  address in every IPv6 VRRP advertisement per RFC 5798 §5.2.9/§5.1.1.2. Before
+  this, `sendPacketIPv6` serialized only the configured global VIPs; the
+  link-local was used solely as the outer/checksum source and never appeared in
+  the payload, so address[0] was a global VIP — non-conformant and rejectable by
+  strict vSRX/keepalived-v3 peers. The prepend reuses the exact `srcIP`
+  (getLocalIPv6) fed to the pseudo-header checksum, so address[0] == outer
+  source (#2644) by construction; Marshal derives Count IPvX Addr from
+  len(IPAddresses), so the count bumps in lockstep. IPv4 path untouched. Added
+  fail-on-revert tests `TestSendPacketIPv6PrependsVirtualRouterLinkLocal` and
+  `TestSendPacketIPv6LinkLocalFirstWithMultipleVIPs` (firsthand-verified RED —
+  Count 1 vs 2 / 2 vs 3 — when the prepend is neutralized). Full pkg/vrrp suite
+  green.
+  **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_v6_lladdr_advert_5089_test.go, pkg/vrrp/README.md
