@@ -56557,3 +56557,10 @@ top.
   re-exports `planning::*`; dropped now-unused sha2/std::io imports from mod.rs.
 - **File(s)**: server/helpers/planning.rs (new), server/helpers/mod.rs.
   Build: userspace-dp cargo build green, no new warnings in helpers/.
+
+- **Action**: #6234 increment 3 — extract state-file persistence into
+  `server/helpers/persistence.rs` (OwnedStatePayload, build_state_payload,
+  lock-free write_state, and the #5469 pre-persist lock probe). Pure
+  code-motion; explicit imports; mod.rs re-exports `persistence::*`.
+- **File(s)**: server/helpers/persistence.rs (new), server/helpers/mod.rs.
+  Build: userspace-dp cargo build green, no new warnings in helpers/.
