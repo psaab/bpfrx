@@ -55723,3 +55723,34 @@ top.
   shellcheck clean (only a pre-existing SC2034). The live `wg-interop.sh all`
   cluster run (P1+ traffic) is the parent's gate.
 - **File(s)**: test/incus/wg-interop.sh, docs/wg-interop-runbook.md, _Log.md
+
+- **Timestamp**: 2026-07-22 (session 01Be82z)
+- **Action**: Fix wg-interop P2 host-inbound bit-rot — zone wg0 for peer-initiated inner traffic
+- **File(s)**: test/incus/wg-interop.sh, docs/wg-interop-runbook.md, _Log.md
+  - **Verdict**: HARNESS CONFIG GAP (not a dataplane bug). P2 `peer->xpf inner v4
+    ping failed` while `xpf->peer` passed. Root cause: a decap'd WireGuard inner
+    packet is written to the wg0 TUN and firewalled by the KERNEL nftables
+    `xpf_hostinbound` chain (#3070, `applyHostInboundFilter` / `BuildZoneHost
+    InboundViews`). The harness left wg0 in NO security zone, so its inner address
+    (10.78.0.1 / fd00:78::1) fell into the #4420 HI-2 addressed-but-unzoned
+    catch-all DROP. `xpf->peer` survived on the chain's leading
+    `ct state established,related accept`, making the drop look one-directional.
+  - **Timeline**: harness added 2026-06-10 (c5580e0ac #1736); #3070 host-inbound
+    enforcement landed 2026-06-25 (69409ecba), merged 2026-06-26 (#3092) — the
+    unzoned-wg0 config predates enforcement by 15 days (same bit-rot class as the
+    P1 schema drift).
+  - **Fix**: xpf_wg_commit now commits, in the same node0-scoped transaction, a
+    dedicated `security zones security-zone wg interfaces wg0.0` +
+    `host-inbound-traffic system-services ping` (mirrors the base config's
+    gr-0/0/0.0 GRE tunnel in the sfmix zone). wg_stanza_delete + teardown delete
+    the zone WITH wg0 in the same commit — a zone naming an undefined interface is
+    a strict commit reject (#5248), so the two are always created/deleted as a pair.
+  - **Validation**: firsthand offline compile test (throwaway, removed) through the
+    real parser + CompileConfigForNode(node0) + BuildZoneHostInboundViews /
+    BuildUnzonedHostInboundAddrs proved: BEFORE — 10.78.0.1 & fd00:78::1 in the
+    unzoned DROP set; AFTER — the group-scoped `wg` zone MERGES (unions with the
+    top-level `lan` zone, no replace), both inner addrs LEAVE the unzoned set and
+    land in the `wg` view with the `ping` service (kernel emits icmp/icmpv6
+    echo-request accept for v4+v6). bash -n OK; shellcheck introduces no new
+    findings (3 pre-existing SC1091/SC2034 on the source/lock preamble). The live
+    `wg-interop.sh all` cluster run is the parent's gate.

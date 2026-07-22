@@ -23,8 +23,10 @@
 # Shared-cluster discipline: EVERY incus command runs under
 # flock /tmp/xpf-cluster.lock + sg incus-admin. Long-running traffic is
 # detached INSIDE the instances so the lock is never held across a
-# multi-minute phase. The xpf config change is additive (a single
-# `groups node0 interfaces wg0` stanza) and removed at teardown.
+# multi-minute phase. The xpf config change is additive (a node0-scoped
+# `groups node0 interfaces wg0` stanza PLUS a node0-scoped
+# `security zones security-zone wg` that grants host-inbound ping to the
+# wg0 inner address — see xpf_wg_commit) and both are removed at teardown.
 #
 # MANDATORY secondary suppression (plan §4): the wg0 stanza is scoped
 # under `groups node0` so fw1 (which ALSO holds 10.0.61.1/24) never
@@ -423,6 +425,7 @@ peer_wg_setup() { # peer_wg_setup [endpoint_spec] [allowed_ips] [mtu]
 wg_stanza_delete() {
     fw0_cli > "${EVID}/wg-stanza-delete.txt" 2>&1 <<EOF
 configure
+delete groups node0 security zones security-zone wg
 delete groups node0 interfaces wg0
 commit
 exit
@@ -451,6 +454,23 @@ EOF
 # create, so it passes with_predelete=0: without the stanza present, the
 # inline delete of an absent wg0 emitted a benign but confusing
 # `path not found: no node matching "wg0"` on every clean run (#6279).
+#
+# HOST-INBOUND (#6279 P2 bit-rot): the same commit also puts wg0.0 in a
+# node0-scoped `security zones security-zone wg` with
+# `host-inbound-traffic system-services ping`. #3070 (2026-06-25, 15 days
+# AFTER this harness was written) made zone host-inbound-traffic ENFORCED:
+# a decap'd WireGuard inner packet is written to the wg0 TUN and firewalled
+# by the KERNEL nftables `xpf_hostinbound` chain (dst-address keyed, grouped
+# by zone). With wg0 in NO zone its inner address falls into the #4420 HI-2
+# addressed-but-unzoned catch-all DROP, so a PEER-initiated inner ping to
+# the xpf wg0 address is dropped (xpf->peer still works — the reply rides
+# the chain's leading `ct state established,related accept`). The dedicated
+# `wg` zone moves the inner v4+v6 addrs into a zoned `icmp/icmpv6 type
+# echo-request accept` (mirrors the base config's gr-0/0/0.0 tunnel in the
+# sfmix zone). The zone MUST be node0-scoped and torn down WITH wg0 in the
+# same commit — a zone referencing an undefined interface is a strict commit
+# reject (#5248), so the zone and interface are always created/deleted as a
+# pair (xpf_wg_commit adds both; wg_stanza_delete + teardown delete both).
 xpf_wg_commit() { # xpf_wg_commit <with_endpoint> [with_predelete=1]
     local ep_line="" del_line="delete groups node0 interfaces wg0"
     [ "$1" = 1 ] && ep_line="set groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} endpoint ${WG_PEER_LAN4%%/*}:${WG_LISTEN_PORT}"
@@ -474,6 +494,8 @@ set groups node0 interfaces wg0 tunnel wireguard listen-port ${WG_LISTEN_PORT}
 set groups node0 interfaces wg0 tunnel wireguard private-key ${XPF_PRIV_HEX}
 set groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} allowed-ips ${WG_INNER4_CIDR}
 set groups node0 interfaces wg0 tunnel wireguard peer ${PEER_PUB_HEX} allowed-ips ${WG_INNER6_CIDR}
+set groups node0 security zones security-zone wg interfaces wg0.0
+set groups node0 security zones security-zone wg host-inbound-traffic system-services ping
 ${ep_line}
 commit
 exit
@@ -845,6 +867,7 @@ teardown() {
     ensure_wg_mastership "teardown" || fail "teardown: WG VIP/mastership not restorable — cannot commit the stanza removal"
     fw0_cli > "${EVID}/teardown-commit.txt" 2>&1 <<EOF
 configure
+delete groups node0 security zones security-zone wg
 delete groups node0 interfaces wg0
 commit
 exit
