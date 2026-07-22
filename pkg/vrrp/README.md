@@ -148,6 +148,25 @@ This is the package that drives chassis-cluster failover.
 - Async GARP: first pair <1 ms; remaining sent at 50 ms intervals in a
   background goroutine. Critical path stays addVIPs → sendAdvert →
   emitEvent (sync), then `go sendGARP(false)` (async).
+- Verified role publication (#5082 MASTER, #5482 BACKUP): a role is
+  published via `emitEvent` only after the kernel VIP set agrees with it.
+  The daemon consumes the event to flip `rg_active`, drop/inject
+  blackholes, and start/stop per-RG services, so a role that diverges
+  from the on-wire VIP state blackholes traffic. On the **MASTER** side
+  `becomeMaster` is fail-closed: `addVIPsLocked` returns a structured
+  `vipActuationResult`, and if any required VIP fails to actuate (or a
+  concurrent demotion bumped `ownerGen`) it rolls back the partial adds,
+  reverts to `StateBackup`, emits **BACKUP**, and returns `false` — it
+  never advertises or emits MASTER for an ownership it cannot back. On
+  the **BACKUP** side `becomeBackup` still emits BACKUP (we ARE stepping
+  down — withholding it risks split-brain), but `removeVIPs` now returns
+  its netlink failure and `surfaceStaleVIP` records it (a
+  `vipRemoveFailures` counter + `vipDiverged` flag + Error log) and
+  schedules a bounded async reconcile — so a swallowed removal no longer
+  silently leaves this BACKUP still answering ARP for a VIP it lost
+  (duplicate-address hazard vs the new master). Neither path adds latency
+  on the clean case (the `vipMu` lock is uncontended), so the ~60 ms
+  failover timing is unchanged.
 - GARP suppression gates: `sendGARP(force)` has two gates — a per-epoch
   dedup (`garpEpoch`/`lastGARPEpoch`, one burst per transition) and a
   500 ms time dampener (`lastGARPTime`/`garpDampened`, storm control for

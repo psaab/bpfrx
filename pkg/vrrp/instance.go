@@ -240,6 +240,27 @@ type vrrpInstance struct {
 	// post-programRethMAC reconcile), so it adds no latency to ~60ms failover.
 	vipMu sync.Mutex
 
+	// VIP/role divergence accounting for the BACKUP side (#5482). becomeMaster
+	// is already fail-closed (#5082): it refuses to publish MASTER when the VIP
+	// add fails. The symmetric BACKUP hazard remained: becomeBackup published the
+	// BACKUP role via emitEvent even when removeVIPs failed, so a swallowed
+	// netlink error left this now-BACKUP node still answering ARP for a VIP it no
+	// longer owns (duplicate-address hazard against the new master). We must still
+	// publish BACKUP (we ARE stepping down — refusing to emit risks split-brain),
+	// so instead of hiding the failure we surface it: vipRemoveFailures is a
+	// monotonic count of BACKUP transitions whose synchronous VIP removal failed,
+	// and vipDiverged flags that a stale VIP may still be on the wire (cleared once
+	// an async reconcile removes it). Atomic so log/test readers stay lock-free.
+	vipRemoveFailures atomic.Uint64
+	vipDiverged       atomic.Bool
+
+	// vipReconcileBackoff overrides the spacing between stale-VIP remove-reconcile
+	// retries (#5482). Zero ⇒ defaultVIPReconcileBackoff. A per-instance field
+	// (not a package var) so unit tests shorten it without a shared-global data
+	// race against another instance's still-running reconcile goroutine. Set once
+	// before the reconcile goroutine starts; the goroutine only reads it.
+	vipReconcileBackoff time.Duration
+
 	// netlink seams for VIP actuation. Production leaves them nil and the
 	// helpers call netlink live; unit tests inject them to drive addVIPs down
 	// a chosen success/failure path without a real kernel interface (#5082).
@@ -1118,8 +1139,12 @@ func (vi *vrrpInstance) run() {
 	// Transition to Backup state.
 	// Remove any stale VIPs that may be on the interface from a previous
 	// daemon run or config apply. This ensures BACKUP nodes don't have VIPs.
-	vi.removeVIPs()
+	// setState precedes surfaceStaleVIP so the async reconcile's state guard sees
+	// BACKUP; a swallowed removal failure here would start us as a BACKUP still
+	// answering ARP for a stale VIP (#5482).
+	staleErr := vi.removeVIPs()
 	vi.setState(StateBackup)
+	vi.surfaceStaleVIP(staleErr, "run-startup")
 	vi.emitEvent()
 
 	// Use an extended initial masterDown timer when preempt is disabled
@@ -1167,7 +1192,12 @@ func (vi *vrrpInstance) run() {
 				for i := 0; i < 3; i++ {
 					vi.sendAdvert(0)
 				}
-				vi.removeVIPs()
+				// Best-effort at process exit: log a removal failure but do not
+				// schedule a reconcile (stopCh is closed, the run-loop is ending).
+				if err := vi.removeVIPs(); err != nil {
+					slog.Warn("vrrp: VIP removal failed during resignation shutdown",
+						"key", vi.key(), "err", err)
+				}
 				return
 			case pkt := <-vi.rxCh:
 				vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
@@ -1960,7 +1990,10 @@ func (vi *vrrpInstance) becomeMaster() bool {
 		// with the run-loop's masterDownTimer retry — no parallel state system.
 		// (superseded is captured before the setState bump below so the log
 		// reflects the true reason, not the revert's own generation bump.)
-		vi.removeVIPsLocked(res.applied)
+		// Rollback is best-effort — a failure is reported by the fail-closed Error
+		// log below (applied/failed lists) and we are already reverting to BACKUP,
+		// so there is no control-flow decision to make on it.
+		_ = vi.removeVIPsLocked(res.applied)
 		vi.setState(StateBackup)
 		vi.vipMu.Unlock()
 		slog.Error("vrrp: VIP actuation failed, not claiming ownership (fail-closed)",
@@ -1998,11 +2031,21 @@ func (vi *vrrpInstance) rearmForRetry(masterDownTimer *time.Timer) {
 }
 
 // becomeBackup transitions to Backup state: remove VIPs, reset timers.
+//
+// Verified BACKUP ownership (#5482): the BACKUP-side symmetry of the #5082
+// fail-closed MASTER path. We ARE stepping down (a superior/equal master is
+// taking over), so publishing BACKUP is the honest role — refusing to emit would
+// risk split-brain. But the pre-#5482 code called the VOID removeVIPs and emitted
+// BACKUP unconditionally, so a swallowed netlink removal failure left this
+// now-BACKUP node still answering ARP for the VIP (duplicate-address hazard vs
+// the new master). surfaceStaleVIP records the divergence loudly and schedules an
+// async reconcile so the stale VIP clears without a silent hazard, while
+// emitEvent still publishes the true BACKUP state.
 func (vi *vrrpInstance) becomeBackup(masterDownTimer, advertTimer *time.Timer) {
 	slog.Info("vrrp: transitioning to BACKUP",
 		"key", vi.key())
 	vi.setState(StateBackup)
-	vi.removeVIPs()
+	vi.surfaceStaleVIP(vi.removeVIPs(), "becomeBackup")
 	advertTimer.Stop()
 	masterDownTimer.Reset(vi.masterDownInterval())
 	// A MASTER stepping down to a worthy higher/tie-break master begins a
@@ -2013,6 +2056,75 @@ func (vi *vrrpInstance) becomeBackup(masterDownTimer, advertTimer *time.Timer) {
 	vi.skipNextPreemptHold = false
 	vi.mu.Unlock()
 	vi.emitEvent()
+}
+
+// vipRemoveReconcileMax bounds the async retry that clears a stale VIP left on a
+// now-BACKUP node when the synchronous removeVIPs failed (#5482).
+const vipRemoveReconcileMax = 5
+
+// defaultVIPReconcileBackoff spaces the stale-VIP remove retries in production:
+// a transient netlink failure clears within ~1s without hammering the kernel.
+// Per-instance override via vipReconcileBackoff (tests shorten it).
+const defaultVIPReconcileBackoff = 200 * time.Millisecond
+
+// surfaceStaleVIP records and self-heals a failed VIP removal on a BACKUP-side
+// transition (#5482). It is a no-op on nil err (a clean removal clears the
+// divergence flag). On a real failure it bumps the monotonic vipRemoveFailures
+// counter, sets vipDiverged, logs at Error, and launches a bounded async retry so
+// the stale VIP is cleared without leaving a silent duplicate-address hazard. The
+// caller MUST have already published the BACKUP state (setState) so the retry's
+// state guard sees BACKUP. `where` identifies the call site in logs.
+func (vi *vrrpInstance) surfaceStaleVIP(err error, where string) {
+	if err == nil {
+		vi.vipDiverged.Store(false)
+		return
+	}
+	vi.vipRemoveFailures.Add(1)
+	vi.vipDiverged.Store(true)
+	slog.Error("vrrp: VIP remove failed on BACKUP transition; a stale VIP may "+
+		"remain on this now-BACKUP node — scheduling reconcile",
+		"key", vi.key(), "where", where, "err", err)
+	vi.scheduleVIPRemoveReconcile()
+}
+
+// scheduleVIPRemoveReconcile launches a bounded background retry that re-attempts
+// the VIP removal that failed during a BACKUP transition (#5482). The BACKUP role
+// is already published (we ARE a backup); this goroutine drives the kernel VIP
+// state back into agreement with that role WITHOUT blocking the run-loop, and
+// clears vipDiverged on success. It stops early if the node is re-promoted to
+// MASTER (it then WANTS the VIP) or the instance shuts down. Per-attempt failures
+// are logged but do NOT bump vipRemoveFailures — that counter stays a clean count
+// of BACKUP transitions whose synchronous removal failed.
+func (vi *vrrpInstance) scheduleVIPRemoveReconcile() {
+	backoff := vi.vipReconcileBackoff
+	if backoff <= 0 {
+		backoff = defaultVIPReconcileBackoff
+	}
+	go func() {
+		for attempt := 1; attempt <= vipRemoveReconcileMax; attempt++ {
+			select {
+			case <-vi.stopCh:
+				return
+			case <-time.After(backoff):
+			}
+			// Re-promoted to MASTER mid-retry → we now WANT the VIP; stop.
+			if vi.getState() != StateBackup {
+				return
+			}
+			if err := vi.removeVIPs(); err != nil {
+				slog.Warn("vrrp: stale-VIP remove reconcile attempt failed",
+					"key", vi.key(), "attempt", attempt, "err", err)
+				continue
+			}
+			vi.vipDiverged.Store(false)
+			slog.Info("vrrp: stale-VIP remove reconcile succeeded",
+				"key", vi.key(), "attempt", attempt)
+			return
+		}
+		slog.Error("vrrp: stale-VIP remove reconcile exhausted retries; a VIP may "+
+			"remain on this BACKUP node until the next transition",
+			"key", vi.key())
+	}()
 }
 
 // emitEvent sends a state change event to the manager's event channel.
@@ -2318,43 +2430,60 @@ func (vi *vrrpInstance) addVIPsLocked() vipActuationResult {
 // removeVIPs removes ALL configured virtual IP addresses from the interface.
 // It acquires vipMu so it is safe to call from the run-loop (becomeBackup, run
 // startup/shutdown) without interleaving a concurrent ReconcileVIPs add (#5082).
-func (vi *vrrpInstance) removeVIPs() {
+// It returns the first genuine netlink removal failure (nil on success) so a
+// BACKUP-side caller can surface a stale VIP instead of swallowing it (#5482).
+func (vi *vrrpInstance) removeVIPs() error {
 	vi.vipMu.Lock()
-	vi.removeVIPsLocked(nil)
-	vi.vipMu.Unlock()
+	defer vi.vipMu.Unlock()
+	return vi.removeVIPsLocked(nil)
 }
 
 // removeVIPsLocked removes the given VIPs (nil ⇒ all configured VirtualAddresses)
 // from the interface via netlink. The caller MUST hold vipMu. Passing a subset
 // (res.applied) lets a failed/superseded actuation roll back exactly the
 // addresses it added.
-func (vi *vrrpInstance) removeVIPsLocked(vips []string) {
+//
+// It returns the first genuine removal failure so becomeBackup can detect a VIP
+// that is still on the wire (#5482). A benign case is NOT an error: an
+// unresolvable interface means the address is gone with the link (best-effort
+// teardown cleanup), and a "not found"/"no such" AddrDel means the address is
+// already absent — neither leaves a stale VIP answering ARP. Only an AddrDel that
+// fails against a resolvable interface is a real divergence.
+func (vi *vrrpInstance) removeVIPsLocked(vips []string) error {
 	if vips == nil {
 		vips = vi.cfg.VirtualAddresses
 	}
 	if len(vips) == 0 {
-		return
+		return nil
 	}
 	link, err := vi.nlLinkByName(vi.cfg.Interface)
 	if err != nil {
+		// Interface gone/mid-rename → no live address to strand; best-effort.
 		slog.Debug("vrrp: failed to find interface for VIP remove",
 			"key", vi.key(), "err", err)
-		return
+		return nil
 	}
+	var firstErr error
 	for _, vip := range vips {
 		addr, err := netlink.ParseAddr(vip)
 		if err != nil {
+			// A malformed VIP was never actuated, so it is not on the wire.
 			continue
 		}
 		if err := vi.nlAddrDel(link, addr); err != nil {
 			// Ignore "not found" — may have been removed already.
-			if !strings.Contains(err.Error(), "not found") &&
-				!strings.Contains(err.Error(), "no such") {
-				slog.Debug("vrrp: failed to remove VIP",
-					"key", vi.key(), "vip", vip, "err", err)
+			if strings.Contains(err.Error(), "not found") ||
+				strings.Contains(err.Error(), "no such") {
+				continue
+			}
+			slog.Debug("vrrp: failed to remove VIP",
+				"key", vi.key(), "vip", vip, "err", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("del vip %q: %w", vip, err)
 			}
 		}
 	}
+	return firstErr
 }
 
 // minGARPInterval is the minimum spacing between GARP bursts (dampening).

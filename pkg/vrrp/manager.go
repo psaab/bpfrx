@@ -808,7 +808,8 @@ func (vi *vrrpInstance) reconcileVIP() {
 	// flipped state). If superseded, undo the re-added VIPs and do NOT GARP —
 	// announcing a VIP we no longer own is the split-routing hazard this closes.
 	if vi.getState() != StateMaster || vi.ownerGen.Load() != gen {
-		vi.removeVIPsLocked(res.applied)
+		// Best-effort rollback; the Warn below reports the rolled-back set.
+		_ = vi.removeVIPsLocked(res.applied)
 		vi.vipMu.Unlock()
 		slog.Warn("vrrp: ReconcileVIPs superseded by demotion; rolled back re-added VIPs, GARP suppressed",
 			"key", vi.key(), "rolled_back", res.applied)

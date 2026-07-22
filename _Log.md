@@ -54994,3 +54994,31 @@ top.
   userspace-dp/src/nat/source.rs, userspace-dp/src/nat64.rs,
   userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/nat64_tests.rs,
   docs/deterministic-nat-cgnat.md, _Log.md
+- **Timestamp**: 2026-07-21 17:10
+- **Action**: #5482 — BACKUP-side symmetry of the #5082 fail-closed MASTER
+  path. `becomeMaster` was already fail-closed (rolls back + reverts to
+  BACKUP + returns false when the VIP add fails), but `becomeBackup` (and
+  the run-startup BACKUP entry) still called the VOID `removeVIPs` and then
+  `emitEvent` UNCONDITIONALLY. The daemon consumes the BACKUP event to inject
+  blackholes + clear `rg_active`, so a swallowed netlink removal failure left
+  this now-BACKUP node still answering ARP for a VIP it no longer owns —
+  duplicate-address hazard against the new master, and a silent role/VIP
+  divergence. Made `removeVIPs`/`removeVIPsLocked` return the first genuine
+  AddrDel failure (an unresolvable link or "not found"/"already gone" stays a
+  non-error — no live address to strand). `becomeBackup` and the run-startup
+  entry now route the result through `surfaceStaleVIP`: on failure bump a
+  monotonic `vipRemoveFailures` counter, set `vipDiverged`, log at Error, and
+  `scheduleVIPRemoveReconcile` — a bounded async retry (5×, per-instance
+  backoff, stops on re-promotion to MASTER or shutdown) that clears the stale
+  VIP and resets `vipDiverged`. BACKUP is STILL emitted (we ARE stepping down;
+  withholding it risks split-brain) and the clean path is unchanged, so the
+  ~60 ms failover / no-master semantics are preserved. Shutdown/rollback
+  removeVIPs sites handle the new error (Warn / explicit best-effort discard).
+  Added fail-on-revert test file `vip_backup_verify_5482_test.go`:
+  `TestBecomeBackupSurfacesVIPRemoveFailure_5482` (primary — RED on revert:
+  vipRemoveFailures=0 vs want 1 when the surfacing is reverted to void
+  removeVIPs), plus a clean-path control and an async self-heal test. Build +
+  `go vet` + `go test -race ./pkg/vrrp/...` pass. VRRP/HA path — needs a
+  loss-cluster failover smoke (batched).
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/manager.go,
+  pkg/vrrp/vip_backup_verify_5482_test.go, pkg/vrrp/README.md, _Log.md
