@@ -549,8 +549,19 @@ func (d *Daemon) handleConfigSync(configText string) error {
 	if d.store != nil {
 		activeText := strings.TrimSpace(d.store.ShowActive())
 		incomingText := strings.TrimSpace(configText)
-		if activeText == incomingText {
-			slog.Info("cluster: skipping config sync apply (config already matches active)",
+		// #4957: the shortcut requires BOTH that the incoming config is the active
+		// tree AND that the active tree actually completed its apply. SyncApply
+		// promotes s.active BEFORE applyConfigLocked and (per the #1799
+		// degrade-not-fail doctrine) does NOT roll it back on a non-fatal apply
+		// failure, so active-text equality alone would treat a promoted-but-
+		// UNAPPLIED config as converged: the primary's same-generation re-push
+		// would take this fast path, return nil, and advance the config high-water
+		// past a config whose dataplane never converged (a stale/disarmed standby
+		// that reports the generation applied — visible at failover). Gating on
+		// ActiveApplied() lets a re-push of a config whose prior apply failed fall
+		// through to syncAndApply and RE-ATTEMPT the apply instead.
+		if activeText == incomingText && d.store.ActiveApplied() {
+			slog.Info("cluster: skipping config sync apply (config already matches active and is applied)",
 				"size", len(configText))
 			// Already converged to this config — a nil return lets the
 			// high-water advance so a duplicate re-push is correctly skipped.
@@ -567,6 +578,14 @@ func (d *Daemon) handleConfigSync(configText string) error {
 	if _, err := d.syncAndApply(context.Background(), configText, nil); err != nil {
 		slog.Error("cluster: config sync apply failed", "err", err)
 		return err
+	}
+	// #4957: the sync applied to completion (syncAndApply returned nil, so both
+	// the dataplane apply and the session invalidation succeeded). Record the
+	// active config as applied so a duplicate re-push takes the converged
+	// shortcut above — and, conversely, so a config that only PROMOTED active but
+	// failed to apply does NOT, keeping the high-water pinned until a retry lands.
+	if d.store != nil {
+		d.store.MarkActiveApplied()
 	}
 	slog.Info("cluster: config sync applied successfully")
 	return nil

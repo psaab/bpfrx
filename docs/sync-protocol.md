@@ -455,6 +455,32 @@ reintroduced on the *receiver* by the #3931 ordering guard). This preserves the
 (nil = store promoted + applied; error = not applied) is exactly what gates the
 mark, so the high-water always reflects the config actually in effect.
 
+**Applied-not-just-active convergence shortcut (#4957).** `handleConfigSync`
+short-circuits a re-push whose text already matches the active config so a
+duplicate does not re-run the whole reconcile. That shortcut is gated on
+**both** `activeText == incomingText` **and** `store.ActiveApplied()`, not on
+active-text equality alone. `configstore.SyncApply` promotes `s.active` to the
+peer config BEFORE `applyConfigLocked` runs and — under the #1799
+degrade-not-fail doctrine — does NOT roll `s.active` back when the apply fails.
+So active-text equality alone would treat a config that was PROMOTED but never
+finished applying (a transient networkd/nft/IPsec tail error) as converged: the
+primary's same-generation re-push would take the fast path, return `nil`, and
+advance the high-water past a config whose dataplane never converged — a standby
+that acks a generation it never applied and can expose stale/disarmed forwarding
+at failover. `ActiveApplied()` is a config-text digest the daemon stamps
+(`MarkActiveApplied`) ONLY after a fully-successful apply — the boot apply
+(`applyConfig`), a committed config (`applyAndSyncCommitted`), and a peer
+config-sync (`handleConfigSync` after `syncAndApply` returns nil). It is FALSE in
+the window between promotion and a successful apply, so a re-push of a
+promoted-but-unapplied config falls through to `syncAndApply` and RE-ATTEMPTS the
+apply (reconcile retry) instead of being swallowed as converged. Because the
+marker is keyed on the config text, a stale value can only make the shortcut MORE
+conservative (one idempotent re-apply), never falsely converged; and because the
+boot/commit/sync apply paths all stamp it, an already-applied config still takes
+the shortcut on a reconnect (which zeroes the generation high-water, so the
+primary re-pushes the current generation even when nothing changed) rather than
+pointlessly re-applying a live config.
+
 The last-applied high-water mark is reset to 0 on a peer bulk re-prime
 (`resetRecvGen`, fired on `BulkStart`) so a **rebooted primary** — whose
 monotonic counter restarts lower — is accepted instead of refused as stale
@@ -526,8 +552,14 @@ FATAL classes — a required-protocol-gate error (dataplane DISARMED, #2138) and
 daemon-stop context abort (#2926) — where the config is not live-forwarding and
 the invalidators are correctly skipped; on those `syncAndApply` returns a nil
 config plus the error. Any other tail error is surfaced (joined with any partial
-#5578 invalidation error) AFTER the invalidators run, so the high-water mark still
-does not advance and the primary's re-push re-converges the mark on the fast path.
+#5578 invalidation error) AFTER the invalidators run, so the high-water mark does
+not advance. On such a non-fatal tail error the daemon does NOT stamp
+`MarkActiveApplied` (that runs only when `syncAndApply` returns nil), so
+`ActiveApplied()` stays false and the primary's re-push does NOT take the
+active-text fast path (#4957): it re-enters `syncAndApply` and RE-ATTEMPTS the
+apply and the invalidators, completing the reconcile/finalization the tail error
+left unfinished — rather than the pre-#4957 behavior where the fast path returned
+nil and advanced the mark over a config the dataplane never finished applying.
 
 ## Full-set state-sync ordering (#5706)
 

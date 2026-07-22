@@ -109,9 +109,22 @@ inline archive-site passwords).
   `ShowActive`, `ActiveConfig`, `ActiveTree`, `Commit`,
   `CommitCheck`, `CommitConfirmed`, `Rollback`, `ListHistory`,
   `EnterConfigure`, `EnterConfigureSession`,
-  `EnterConfigureExclusive`, `ExitConfigure`, `SyncApply`. (See
+  `EnterConfigureExclusive`, `ExitConfigure`, `SyncApply`,
+  `MarkActiveApplied`, `ActiveApplied`. (See
   `store.go` for the full surface — there's no shorthand
   `Candidate()` or `History()`; use the `Show*` / `List*` forms.)
+- `MarkActiveApplied` / `ActiveApplied` — the #4957 applied-config marker.
+  `SyncApply` (and `Commit`/`Load`) promote `s.active` BEFORE the daemon runs
+  the apply and, under the #1799 degrade-not-fail doctrine, do NOT roll it back
+  on an apply failure — so a config can be the active tree yet never have
+  converged on the dataplane. The daemon calls `MarkActiveApplied` after a
+  fully-successful `applyConfigLocked` (boot, commit, config-sync); `ActiveApplied`
+  reports whether the CURRENT active text matches that last-applied digest.
+  `pkg/daemon` `handleConfigSync` ANDs its active-text convergence shortcut with
+  `ActiveApplied()` so a promoted-but-unapplied synced config is not treated as
+  converged (the HA config high-water then stays pinned until a retry lands). The
+  marker is keyed on config text, so a stale value can only cause an idempotent
+  re-apply, never a false convergence.
 - `MaxConfigSize` (16 MiB) + `checkConfigSize` — `store.go`. The
   transport-independent input-size ceiling checked at the head of every
   parse entry point: `LoadOverride`, `LoadMerge`, `LoadSet`, the HA

@@ -18,6 +18,8 @@
 package configstore
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -253,6 +255,23 @@ type Store struct {
 	// and a journal entry so the loss is visible instead of warning-only.
 	// Cleared by the next fully-successful saveRollbackFiles().
 	rollbackPersistDegraded bool
+
+	// appliedDigest is the digest of the active config TEXT that most recently
+	// completed a full apply to the dataplane/kernel (#4957). It is written by
+	// the daemon (MarkActiveApplied) ONLY after applyConfigLocked returns success
+	// for the current active config — at boot, on a committed config, and after a
+	// peer config-sync. It is INTENTIONALLY not reset by a bare promotion: SyncApply
+	// (and Commit/Load) promote s.active BEFORE the apply runs and, under the #1799
+	// degrade-not-fail doctrine, do NOT roll s.active back when the subsequent apply
+	// FAILS. So a config can be the active tree yet never have converged on the
+	// dataplane. handleConfigSync's active-text convergence shortcut therefore ANDs
+	// ActiveApplied() with its active==incoming check: a promoted-but-unapplied
+	// synced config is NOT treated as converged, so the config high-water does not
+	// advance past it and the primary's same-generation re-push re-attempts the
+	// apply instead of being swallowed as a duplicate (the #4957 fail-open). Because
+	// the marker is keyed on the config text, a stale value can only make the
+	// shortcut MORE conservative (one idempotent re-apply), never falsely converged.
+	appliedDigest string
 }
 
 // New creates a new config store. It fails closed when the .configdb
@@ -729,4 +748,44 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 
 	s.saveRollbackFiles()
 	return compiled, nil
+}
+
+// configTextDigest returns a stable hex digest of a rendered config's text,
+// whitespace-normalized so it matches the ShowActive()/incoming-text comparison
+// handleConfigSync already performs (both sides are the canonical hierarchical
+// render a primary pushes via ShowActive).
+func configTextDigest(text string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(text)))
+	return hex.EncodeToString(sum[:])
+}
+
+// MarkActiveApplied records that the CURRENT active config has completed a full
+// apply to the dataplane/kernel (#4957). The daemon calls it after a successful
+// applyConfigLocked for the active config — the boot apply, a committed config,
+// and a peer config-sync. It stamps the digest of the active text so a later
+// ActiveApplied() can tell whether the tree that is active NOW is the one that
+// converged. A no-op is safe if active is nil (nothing to have applied).
+func (s *Store) MarkActiveApplied() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active == nil {
+		s.appliedDigest = ""
+		return
+	}
+	s.appliedDigest = configTextDigest(s.active.Format())
+}
+
+// ActiveApplied reports whether the CURRENT active config is the one that most
+// recently completed a full apply (#4957). It is FALSE in the window after active
+// has been promoted (SyncApply/Commit/Load) but before the subsequent apply
+// succeeds — including the #4957 case where a peer-synced config was promoted to
+// active but its apply FAILED and was never rolled back (degrade-not-fail). A nil
+// active, or a never-applied store, reads as not-applied.
+func (s *Store) ActiveApplied() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.active == nil || s.appliedDigest == "" {
+		return false
+	}
+	return s.appliedDigest == configTextDigest(s.active.Format())
 }

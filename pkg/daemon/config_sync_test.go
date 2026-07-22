@@ -84,6 +84,12 @@ func TestHandleConfigSync_SkipsWhenConfigAlreadyMatchesActive(t *testing.T) {
 	if _, err := store.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
+	// #4957: the converged shortcut now requires the active config to have been
+	// APPLIED, not merely to match by text (a promoted-but-unapplied synced config
+	// must NOT read as converged). This test commits directly through the store,
+	// bypassing the daemon apply path that stamps the marker, so establish it
+	// explicitly to represent an already-applied active config.
+	store.MarkActiveApplied()
 	active := store.ShowActive()
 	historyLen := len(store.ListHistory())
 
