@@ -1,3 +1,44 @@
+## 2026-07-22 — #5615: direct GRE-decap fail-on-revert tests for the #5140 inner-read sites
+
+- **Timestamp**: 2026-07-22 (test/5615-gre-decap-inner-read-coverage)
+- **Action**: Added 4 direct GRE-decap fail-on-revert tests covering 5 of the 6
+  #5140 post-decap `raw_frame`→`packet_frame` inner-read sites that lacked a
+  dedicated test (only the session-MISS host-inbound ICMP-type read had one).
+  Each drives a REAL GRE-tunnelled frame through
+  `poll_binding_process_descriptor` and makes the INNER field differ from the
+  OUTER byte at the same inner-relative `meta` offset, so a revert to
+  `raw_frame` flips the observable:
+    - `gre_decap_session_hit_host_inbound_reads_inner_icmp_type_5615` —
+      session-HIT host-inbound ICMP-type (mod.rs ~1622). Two-pass: admit +
+      cache, tighten to ping-less, session-HIT re-check DENIES on inner echo
+      type 8 (raw_frame reads outer GRE flags 0x0B=11=error → admits).
+    - `gre_decap_session_miss_ttl_expiry_reads_inner_ttl_5615` — session-MISS
+      TTL (mod.rs ~3239). Inner TTL 1 / outer TTL 64 → inner read generates
+      one prebuilt ICMP Time Exceeded before session install.
+    - `gre_decap_session_hit_ttl_expiry_reads_inner_ttl_5615` — session-HIT
+      TTL (mod.rs ~1803). Same, on the two-pass session-hit path (ICMP is
+      never flow-cache eligible → session slow path).
+    - `gre_decap_flow_cache_hit_ttl_expiry_reads_inner_ttl_5615` — flow-cache
+      HIT would_expire (flow_cache_hit.rs ~158) AND TE-build (~167). UDP inner
+      seeds the cache; TTL=1 hit reads inner TTL. Binds to BOTH reads.
+  TTL tests pin the shared generated-error token bucket FULL under
+  `global_bucket_test_lock` so the buildable Time Exceeded is deterministic,
+  and bind on ifindex 12 (reth0.80) so the reply resolves a real egress.
+  Per-site revert verification (each temporarily reverted to `raw_frame`,
+  confirmed RED, restored): site1→testA RED, site2→session-hit-TTL RED,
+  site3→session-miss-TTL RED, site4→flow-cache RED, site5→flow-cache RED.
+  FORK: the 6th site (`is_embedded_icmp_error` inner-type read, mod.rs ~4005)
+  is NOT cleanly isolatable as a GRE-decap fail-on-revert test — the read only
+  gates whether `try_reverse_embedded_icmp_error` is attempted, and that helper
+  reads the OUTER `raw_frame`, so it is inert for a genuine GRE-tunnelled inner
+  (no NAT match at inner offsets → NotHandled → identical flowless L3
+  enforcement whether the bool is true or false). This matches the issue's own
+  N1 caveat. Documented, not force-tested.
+  TEST-ONLY: production `mod.rs`/`flow_cache_hit.rs` are byte-identical to
+  origin/master (verified via `git diff --stat`); only the colocated test file
+  changes. No docs update needed (no behavior/contract change).
+- **File(s)**: userspace-dp/src/afxdp/tests_gre_local_delivery.rs, _Log.md
+
 ## 2026-07-21 — #6178: input-vlan-map / output-vlan-map honesty gate
 
 - **Timestamp**: 2026-07-21 (fix/6178-vlan-map-honesty-gate)

@@ -1356,3 +1356,391 @@ fn gre_decap_inner_icmp_echo_denied_by_host_inbound_reads_inner_type() {
     );
 }
 
+
+// ── #5615: direct GRE-decap fail-on-revert coverage for the other 6 #5140
+// post-decap inner-read sites. #5140/PR #5613 swapped 7 `raw_frame`→
+// `packet_frame` inner reads but shipped a direct fail-on-revert test for only
+// ONE (session-MISS host-inbound ICMP type, above). Each test below drives a
+// REAL GRE-tunnelled frame through `poll_binding_process_descriptor` and
+// constructs the fixture so the INNER field the site reads differs from the
+// OUTER byte at the same inner-relative `meta` offset — so a revert of that
+// site to `raw_frame` (reading the outer) flips the observable. See the issue
+// #5615 body for the 7-site map. ─────────────────────────────────────────────
+
+
+/// #5615 fail-on-revert (session-HIT host-inbound ICMP type,
+/// `poll_descriptor/mod.rs` ~1622). Sibling of the covered session-MISS test
+/// `gre_decap_inner_icmp_echo_denied_by_host_inbound_reads_inner_type`.
+///
+/// Two passes on ONE (binding, sessions) pair. Pass 1 admits the inner echo
+/// (fixture zones carry `system-services all`) and CACHES the host-local
+/// session. Pass 2 runs after the host-inbound set is tightened to ping-less
+/// (present-but-empty), so the #3070/#3485 session-HIT re-check runs the
+/// host-inbound gate again — reading the INNER ICMP type from `packet_frame`.
+///
+/// - FIXED (`packet_frame[34]` = inner type 8 = echo): NOT globally accepted →
+///   empty zone set → DENY on the hit → `host_inbound_denied_packets == 1`,
+///   the cached session is torn down.
+/// - REVERTED (`raw_frame[34]` = outer GRE flags `0x0B` = 11 = time-exceeded):
+///   the #3171 `is_icmp_host_inbound_global_accept` exemption ADMITS the echo →
+///   `host_inbound_denied_packets == 0` and the session survives.
+///
+/// Swap `packet_frame` → `raw_frame` at the session-HIT
+/// `host_inbound_gated_lo0_action` icmp_type argument and this goes RED.
+#[test]
+fn gre_decap_session_hit_host_inbound_reads_inner_icmp_type_5615() {
+    let mut forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 11, 0);
+    binding.interface = Arc::<str>::from("ge-0-0-0");
+    let mut sessions = SessionTable::new();
+
+    // Inner: ICMP echo request (type 8) 10.255.0.2 -> 10.255.0.1 (gr-local).
+    let inner = build_gre_inner_icmp_packet_v4();
+    assert_eq!(inner[20], 8, "inner must be an ICMP echo request (type 8)");
+    // Untagged GRE-to-self outer frame; plant an ICMP-error type value in the
+    // outer GRE flags byte (frame[34], the byte the buggy read indexes). 0x0B
+    // sets only Recur/reserved low bits (no C/R/K/S) so decap is unaffected.
+    let mut frame = build_gre_to_self_outer_frame_with_inner(0x0800, &inner);
+    assert_eq!(
+        frame[34], 0x00,
+        "untagged frame[34] is the GRE flags byte (eth14 + outerIP20)"
+    );
+    frame[34] = 0x0B; // ICMPv4 time-exceeded (11) — an error type in the #3171 set
+    let meta = gre_to_self_outer_meta(0, frame.len());
+
+    // Pass 1 — admit-all host-inbound: the inner echo is admitted on the
+    // session-MISS local-delivery arm and caches a host-local session.
+    let (batch1, dbg1) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(dbg1.local, 1, "pass 1 inner echo must take LocalDelivery");
+    assert_eq!(
+        batch1.host_inbound_denied_packets, 0,
+        "pass 1 admit-all host-inbound must not deny"
+    );
+    assert_eq!(
+        sessions.len(),
+        1,
+        "pass 1 must cache the host-local session (arms the session-HIT re-check)"
+    );
+
+    // Tighten to a ping-less (present-but-EMPTY) host-inbound set on every zone.
+    let zone_ids: Vec<u16> = forwarding.zone_id_to_name.keys().copied().collect();
+    assert!(!zone_ids.is_empty(), "fixture must define at least one zone");
+    for id in zone_ids {
+        forwarding
+            .zone_host_inbound
+            .insert(id, crate::afxdp::types::ZoneHostInbound::default());
+    }
+
+    // Pass 2 — session-HIT: the host-inbound re-check reads the INNER ICMP type.
+    let (batch2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(
+        dbg2.local, 1,
+        "pass 2 must take the session-HIT local-delivery arm"
+    );
+    assert_eq!(
+        batch2.host_inbound_denied_packets, 1,
+        "#5615: the session-HIT host-inbound re-check must read the INNER ICMP \
+         type (8 = echo) from packet_frame and DENY on the ping-less zone; the \
+         buggy raw_frame read sees the outer GRE flags byte (0x0B = 11 = \
+         time-exceeded) and admits the echo as an exempt error"
+    );
+    assert_eq!(
+        dbg2.host_inbound_deny, 1,
+        "the session-HIT host-inbound deny bumps dbg.host_inbound_deny"
+    );
+    assert_eq!(
+        sessions.len(),
+        0,
+        "the session-HIT host-inbound deny must tear down the cached session"
+    );
+}
+
+
+/// #5615 helper: an untagged GRE-to-self OUTER frame (outer TTL 64) wrapping an
+/// inner IPv4 ICMP echo request 10.255.0.2 -> `dst` with the given inner TTL.
+/// The outer TTL (frame[22]) is fixed at 64 by the builder while the inner TTL
+/// (synthetic[22] after decap) is `inner_ttl` — so a TTL read reverted to the
+/// outer `raw_frame` tests the wrong (non-expiring 64) byte.
+fn gre_frame_inner_icmp_echo_v4(dst: Ipv4Addr, inner_ttl: u8) -> Vec<u8> {
+    let mut inner = build_gre_inner_icmp_packet_v4();
+    inner[8] = inner_ttl;
+    inner[16..20].copy_from_slice(&dst.octets());
+    inner[10] = 0;
+    inner[11] = 0;
+    let sum = checksum16(&inner[0..20]);
+    inner[10] = (sum >> 8) as u8;
+    inner[11] = sum as u8;
+    build_gre_to_self_outer_frame_with_inner(0x0800, &inner)
+}
+
+/// #5615 helper: an untagged GRE-to-self OUTER frame (outer TTL 64) wrapping an
+/// inner IPv4 UDP datagram 10.255.0.2 -> `dst` with the given inner TTL. UDP is
+/// flow-cache eligible, so a seed pass (inner TTL 64) followed by a TTL=1 pass
+/// exercises the flow-cache-HIT TTL path.
+fn gre_frame_inner_udp_v4(dst: Ipv4Addr, inner_ttl: u8, sport: u16, dport: u16) -> Vec<u8> {
+    let d = dst.octets();
+    let total: u16 = 28; // 20 IPv4 + 8 UDP
+    let mut inner = vec![
+        0x45,
+        0x00,
+        (total >> 8) as u8,
+        total as u8,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        inner_ttl,
+        PROTO_UDP,
+        0x00,
+        0x00,
+        10,
+        255,
+        0,
+        2,
+        d[0],
+        d[1],
+        d[2],
+        d[3],
+    ];
+    let sum = checksum16(&inner[0..20]);
+    inner[10] = (sum >> 8) as u8;
+    inner[11] = sum as u8;
+    inner.extend_from_slice(&sport.to_be_bytes());
+    inner.extend_from_slice(&dport.to_be_bytes());
+    inner.extend_from_slice(&8u16.to_be_bytes()); // UDP length
+    inner.extend_from_slice(&0u16.to_be_bytes()); // UDP checksum 0 (optional, IPv4)
+    build_gre_to_self_outer_frame_with_inner(0x0800, &inner)
+}
+
+/// #5615 helper: count the prebuilt ICMP Time Exceeded replies queued in the
+/// binding's `scratch_forwards`. The TTL-expiry path pushes a
+/// `PendingForwardFrame::Prebuilt` and consumes the trigger; a non-expiring
+/// forward never touches `scratch_forwards`, so this is 1 when the inner TTL
+/// read fired and 0 when it did not.
+fn prebuilt_te_count(binding: &BindingWorker) -> usize {
+    binding
+        .scratch
+        .scratch_forwards
+        .iter()
+        .filter(|r| matches!(r.frame, PendingForwardFrame::Prebuilt(_)))
+        .count()
+}
+
+/// #5615 GRE-to-self outer meta for a WAN-ingress binding (ifindex 12,
+/// reth0.80). Same shape as `gre_to_self_outer_meta` but with the ingress
+/// ifindex the TTL tests bind on so the locally-generated Time Exceeded resolves
+/// a real egress object (`forwarding.egress[12]`) and builds deterministically.
+fn gre_to_self_outer_meta_wan(frame_len: usize) -> UserspaceDpMeta {
+    let mut meta = gre_to_self_outer_meta(0, frame_len);
+    meta.ingress_ifindex = 12;
+    meta
+}
+
+
+/// #5615 fail-on-revert (session-MISS TTL, `poll_descriptor/mod.rs` ~3240).
+/// A GRE-tunnelled inner ICMP echo to a TRANSIT destination (8.8.8.8) whose
+/// INNER TTL is 1 must generate an ICMP Time Exceeded on the session-MISS
+/// forward path — the TTL byte read from the decapped inner `packet_frame`
+/// (synthetic[22] = 1), NOT the outer `raw_frame` (frame[22] = outer TTL 64).
+///
+/// - FIXED (`packet_frame`): `packet_ttl_would_expire` sees inner TTL 1 →
+///   `build_local_time_exceeded_request` builds a prebuilt TE and CONSUMES the
+///   trigger before session install → one prebuilt TE queued, no session cached.
+/// - REVERTED (`raw_frame`): the read sees outer TTL 64 → not expiring → the
+///   echo is forwarded and a transit session is installed → zero prebuilt TEs.
+///
+/// The generated-error token bucket is pinned FULL under the global test lock so
+/// the buildable reply is deterministic (the bucket is a shared static).
+#[test]
+fn gre_decap_session_miss_ttl_expiry_reads_inner_ttl_5615() {
+    use crate::afxdp::icmp_ratelimit::{
+        GeneratedErrorReason, global_bucket_test_lock, reset_bucket_for_test,
+    };
+    let _guard = global_bucket_test_lock();
+    reset_bucket_for_test(GeneratedErrorReason::TimeExceeded, 0);
+
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    // Inner ICMP echo to transit 8.8.8.8, inner TTL = 1 (would expire).
+    let frame = gre_frame_inner_icmp_echo_v4(Ipv4Addr::new(8, 8, 8, 8), 1);
+    assert_eq!(frame[22], 64, "outer IPv4 TTL byte must be 64 (differs from inner 1)");
+    let meta = gre_to_self_outer_meta_wan(frame.len());
+
+    let (_batch, _dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert_eq!(
+        prebuilt_te_count(&binding),
+        1,
+        "#5615: the session-MISS TTL check must read the INNER TTL (1) from \
+         packet_frame and generate one ICMP Time Exceeded; the buggy raw_frame \
+         read sees the outer TTL (64), forwards the echo, and queues no TE"
+    );
+    assert_eq!(
+        sessions.len(),
+        0,
+        "a TTL-expired session-MISS echo is consumed as a Time Exceeded before \
+         session install; the raw_frame revert would forward it and cache a session"
+    );
+}
+
+
+/// #5615 fail-on-revert (session-HIT TTL, `poll_descriptor/mod.rs` ~1803).
+/// Two passes on one (binding, sessions) pair. Pass 1 (inner TTL 64) forwards
+/// the inner ICMP echo to a TRANSIT destination and installs a transit session.
+/// Pass 2 (inner TTL 1) is a session-HIT (ICMP is never flow-cache eligible, so
+/// it takes the session slow path): the session-HIT TTL check must read the
+/// INNER TTL from `packet_frame`.
+///
+/// - FIXED (`packet_frame`): pass 2 sees inner TTL 1 → one prebuilt TE queued,
+///   the trigger consumed.
+/// - REVERTED (`raw_frame`): pass 2 sees outer TTL 64 → forwarded, no TE.
+#[test]
+fn gre_decap_session_hit_ttl_expiry_reads_inner_ttl_5615() {
+    use crate::afxdp::icmp_ratelimit::{
+        GeneratedErrorReason, global_bucket_test_lock, reset_bucket_for_test,
+    };
+    let _guard = global_bucket_test_lock();
+    reset_bucket_for_test(GeneratedErrorReason::TimeExceeded, 0);
+
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    // Pass 1: inner TTL 64 — forwards + installs the transit session.
+    let frame_seed = gre_frame_inner_icmp_echo_v4(Ipv4Addr::new(8, 8, 8, 8), 64);
+    let meta_seed = gre_to_self_outer_meta_wan(frame_seed.len());
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame_seed,
+        meta_seed,
+    );
+    assert!(
+        sessions.len() >= 1,
+        "pass 1 (inner TTL 64) must install a transit session (arms the session-HIT read)"
+    );
+
+    // Pass 2: same 5-tuple, inner TTL 1 — session-HIT TTL check.
+    let frame_hit = gre_frame_inner_icmp_echo_v4(Ipv4Addr::new(8, 8, 8, 8), 1);
+    assert_eq!(frame_hit[22], 64, "outer IPv4 TTL byte must be 64 (differs from inner 1)");
+    let meta_hit = gre_to_self_outer_meta_wan(frame_hit.len());
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame_hit,
+        meta_hit,
+    );
+
+    assert_eq!(
+        prebuilt_te_count(&binding),
+        1,
+        "#5615: the session-HIT TTL check must read the INNER TTL (1) from \
+         packet_frame and generate one ICMP Time Exceeded; the buggy raw_frame \
+         read sees the outer TTL (64) and forwards the echo with no TE"
+    );
+}
+
+
+/// #5615 fail-on-revert (flow-cache-HIT TTL, `poll_descriptor/flow_cache_hit.rs`
+/// ~158 `packet_ttl_would_expire` + ~167 `build_local_time_exceeded_request`).
+/// A GRE-tunnelled inner UDP flow (flow-cache eligible) seeds the flow cache on
+/// pass 1 (inner TTL 64); pass 2 (inner TTL 1) HITS the flow cache, where the
+/// TTL-expiry check + the generated Time Exceeded must read the decapped inner
+/// `packet_frame` TTL (1), not the outer `raw_frame` TTL (64).
+///
+/// - FIXED (`packet_frame`): pass 2 sees inner TTL 1 → one prebuilt TE queued.
+/// - REVERTED at the `packet_ttl_would_expire` arg (`raw_frame`): sees outer TTL
+///   64 → not expiring → forwarded, no TE.
+/// - REVERTED at the `build_local_time_exceeded_request` arg (`raw_frame`): the
+///   would-expire branch is entered (inner TTL 1) but the builder's own internal
+///   TTL check sees the outer 64 → returns None → the packet is dropped with no
+///   TE queued.
+///
+/// Either revert drops the prebuilt-TE count to 0, so this single test binds to
+/// both flow-cache-hit inner reads.
+#[test]
+fn gre_decap_flow_cache_hit_ttl_expiry_reads_inner_ttl_5615() {
+    use crate::afxdp::icmp_ratelimit::{
+        GeneratedErrorReason, global_bucket_test_lock, reset_bucket_for_test,
+    };
+    let _guard = global_bucket_test_lock();
+    reset_bucket_for_test(GeneratedErrorReason::TimeExceeded, 0);
+
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    // Pass 1: inner UDP TTL 64 to transit 8.8.8.8 — seeds the flow cache.
+    let frame_seed = gre_frame_inner_udp_v4(Ipv4Addr::new(8, 8, 8, 8), 64, 12345, 53);
+    let meta_seed = gre_to_self_outer_meta_wan(frame_seed.len());
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame_seed,
+        meta_seed,
+    );
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        1,
+        "pass 1 (inner UDP TTL 64) must seed one flow-cache entry (arms the \
+         flow-cache-HIT TTL read on pass 2)"
+    );
+
+    // Pass 2: same 5-tuple, inner UDP TTL 1 — flow-cache HIT TTL check.
+    let frame_hit = gre_frame_inner_udp_v4(Ipv4Addr::new(8, 8, 8, 8), 1, 12345, 53);
+    assert_eq!(frame_hit[22], 64, "outer IPv4 TTL byte must be 64 (differs from inner 1)");
+    let meta_hit = gre_to_self_outer_meta_wan(frame_hit.len());
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame_hit,
+        meta_hit,
+    );
+
+    assert_eq!(
+        prebuilt_te_count(&binding),
+        1,
+        "#5615: the flow-cache-HIT TTL check + Time Exceeded build must read the \
+         INNER TTL (1) from packet_frame and generate one prebuilt TE; either \
+         raw_frame revert (would-expire arg or builder arg) drops this to 0"
+    );
+}
+
