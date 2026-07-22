@@ -56542,6 +56542,30 @@ top.
   manifest via cmd/shim-manifest. Verified: fsatomic+dataplane green;
   editing xpf_common.h now trips the freshness test; src-edit coverage intact.
 
+## 2026-07-22 — #5650 forwarding/mod.rs hot-path-preserving split (PR)
+- **Timestamp**: 2026-07-22
+- **Action**: Pure code-motion split of userspace-dp forwarding/mod.rs
+  (2868 LOC / 81 free fns) into 9 cohesive submodules under forwarding/.
+  Functions moved VERBATIM; no logic/signature/hot-path change; #[inline]
+  preserved exactly (2 total: is_ipsec_traffic→ipsec.rs, zone_pair_ids_*
+  stays in mod.rs). pub(super) → pub(in crate::afxdp) with mod.rs glob
+  re-exports so all external call sites resolve unchanged. Two private
+  helpers (select_route_next_hop, ecmp_hash_flow_seeded) promoted to
+  pub(in crate::afxdp) because forwarding/tests.rs (a sibling of fib)
+  calls them. PbrRejectSink struct fields also promoted so the external
+  poll_descriptor constructor still compiles. mod.rs 2868 → 143 LOC.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/{mod.rs, fib.rs,
+  fabric.rs, nat.rs, ha.rs, mss.rs, ipsec.rs, pbr.rs, local_delivery.rs,
+  tunnel.rs}; forwarding/README.md; docs/fabric-cross-chassis-fwd.md;
+  docs/userspace-native-gre-plan.md; docs/host-inbound-service-matrix.md;
+  docs/flow-cache-simplification.md; CLAUDE.md (fabric path pointer).
+- **Layout**: fib.rs 1021 (FIB resolve/ECMP/next-hop), fabric.rs 492,
+  ha.rs 235, mss.rs 203, nat.rs 201, local_delivery.rs 192, tunnel.rs
+  174, pbr.rs 163, ipsec.rs 112.
+- **Validation**: cargo build clean (0 errors; 175 pre-existing warnings,
+  unchanged from baseline). Diff touches ONLY forwarding/*.rs. fn count
+  81→81; #[inline] 2→2. Full cargo test --release suite green (parent
+  runs the loss-cluster iperf smoke before merge).
 ## 2026-07-22 — #6314: join the neighbor warmer aux thread at teardown
 - **Action**: Make the #1636 neighbor WARMER consistent with its two
   #5165-hardened siblings (monitor + resolver). Retain the warmer's
