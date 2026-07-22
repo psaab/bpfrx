@@ -56599,3 +56599,13 @@ top.
 - **File(s)**: pkg/routing/tunnel.go, pkg/routing/tunnel_wireguard.go,
   pkg/routing/tunnel_keepalive_runner.go, pkg/snmp/agent.go,
   pkg/snmp/agent_ber.go, pkg/routing/README.md, pkg/snmp/README.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 pure code-motion split of event_stream/mod.rs — extract
+  wall-clock conversion into event_stream/clock.rs (NS_PER_SEC +
+  read_mono_and_wall_clocks + monotonic_ns_to_unix_ns/_secs/_secs_subnanos +
+  mono_ns_to_wall_clock_unix_ns, verbatim). mod.rs re-exports the pub(crate)
+  clock fns so callers (afxdp/event_emit.rs, tests) resolve unchanged. Build
+  green.
+- **File(s)**: userspace-dp/src/event_stream/clock.rs (new),
+  userspace-dp/src/event_stream/mod.rs
