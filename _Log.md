@@ -55086,3 +55086,34 @@ top.
   loss-cluster failover smoke (batched).
 - **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/manager.go,
   pkg/vrrp/vip_backup_verify_5482_test.go, pkg/vrrp/README.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: #5338 — standby reserves ADDRESS-ONLY source-NAT occupancy tokens
+  for synced sessions. `reserve_synced_source_nat_allocation` (userspace-dp,
+  `nat/source.rs`) previously EARLY-RETURNED when the synced decision carried no
+  `rewrite_src_port` (address-only: `port no-translation` / port-less / GRE), so
+  the standby minted NO reverse-identity token. On failover its reverse (1:N)
+  index could not disambiguate the promoted address-only session, and a fresh
+  local address-only flow could claim the same public identity. Added an
+  address-only arm that mirrors the ACTIVE node's #5336/#5341 minting: for a
+  synced decision with `rewrite_src = Some(pool_addr)` and `rewrite_src_port =
+  None`, claim the SAME token via `PortAllocator::reserve_address_only` on the
+  rule whose pool owns `rewrite_src` (no pool-port bit consumed). Composed WITH
+  the just-merged #6207 `deterministic` threading — that flag applies only to the
+  port-bearing `reserve_flow` arm, which is unchanged; an address-only token
+  carries no port bit, so (like #5341) it mints via plain `reserve_address_only`
+  regardless of pool mode. The token is freed by the SAME teardown path
+  (`release_source_nat_allocation` -> `release_flow`, clears `address_only_owners`)
+  — no new delete site. Fail-on-revert test
+  `synced_address_only_session_reserves_reverse_identity_token_5338`
+  (`nat/tests_pool.rs`): reserves a synced address-only session, asserts the
+  standby mints exactly one occupancy token AND a colliding local address-only
+  flow is denied as exhaustion; releasing the synced session frees the token.
+  RED on revert (restore the `rewrite_src_port` skip) with a clean assertion
+  ("standby must mint one address-only occupancy token"), not a compile break.
+  Validated on disk: `cargo build` OK; full `cargo test --release` green (4071
+  lib + 8 + 22 + 1 + 60, 0 failed) across two runs. NAT/dataplane HA path —
+  needs a loss-cluster failover smoke (batched). Updated the synced-reserve
+  contract in `docs/session-sync-architecture.md`.
+- **File(s)**: userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs, docs/session-sync-architecture.md, _Log.md
