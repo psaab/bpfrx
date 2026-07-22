@@ -1,3 +1,30 @@
+## 2026-07-22 — #6297: cap budgeted conntrack refresh walk to the live high-watermark
+
+- **Timestamp**: 2026-07-22 (fix/6297-conntrack-refresh-watermark)
+- **Action**: `SessionTable::iter_with_idle_budgeted` bounded its round-robin
+  refresh walk to `entries.capacity()`. The slab is monotonic (no
+  `shrink_to_fit`), so after a session-count high-watermark drains, each 10s
+  cycle re-walked the full doubled capacity — mostly-vacant slots (#5287 M1
+  follow-up). Added a monotonic `slot_high_watermark` field (`1 + the highest
+  slot the slab ever handed out`), bumped on every insert via a new
+  `insert_record` choke point (fresh install, synced import, restore_entry),
+  never shrunk on removal. The walk now bounds to
+  `min(slot_high_watermark, capacity())`, wrapping at the peak live extent
+  instead of the doubled capacity. INVARIANT (documented on the field + walk):
+  the watermark is always `>= 1 + every occupied slot index`, so the shorter
+  walk can never skip a live session's `last_seen` refresh (which would look
+  idle → premature expiry). Added two fail-on-revert tests: (1) fill 100 /
+  drain to 3, assert a full budgeted sweep examines exactly the watermark and
+  `< capacity()` (reverting to `capacity()` reddens it — verified RED); (2) a
+  sole live session pinned at the top slot far above `len()` is still refreshed
+  by a full sweep (guards the never-below-a-live-slot invariant).
+- **Validation**: `cargo build --release` clean; `iter_with_idle` (5) +
+  `refresh` (38) + full `session::tests` (168) all green; both new tests 5/5
+  stable; temp-revert of the bound to `capacity()` confirmed the drain test
+  goes RED at the `examined < capacity` assertion.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/install.rs, userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md
 ## 2026-07-22 — #6157/#6294: make parallel-sensitive WireGuard tests parallel-safe
 
 - **Timestamp**: 2026-07-22 (fix/6157-wg-test-parallel-serial)

@@ -514,6 +514,26 @@ pub(crate) struct SessionTable {
     /// #964 Step 1: slab-allocated session storage. Indexed by u32
     /// handle. Replaces the prior `sessions: FxHashMap<Key, Entry>`.
     entries: slab::Slab<SessionRecord>,
+    /// #6297: high-watermark of the live slot extent — `1 + the highest
+    /// slot index this slab has ever handed out`. The budgeted conntrack
+    /// refresh (`iter_with_idle_budgeted`) bounds its round-robin walk to
+    /// this instead of `entries.capacity()`. The slab NEVER shrinks
+    /// (`capacity()` is monotonic, no `shrink_to_fit`), so after a
+    /// session-count spike drains, `capacity()` stays at the doubled peak
+    /// and the walk re-visits tens of thousands of now-vacant slots every
+    /// 10s cycle. The watermark tracks the true peak extent instead, which
+    /// is <= `capacity()` (the Vec doubles past the peak), so the walk
+    /// wraps at the live extent.
+    ///
+    /// INVARIANT: `slot_high_watermark >= 1 + every currently-occupied slot
+    /// index` at all times. Maintained by bumping it on every insert
+    /// (`insert_record`); it is NEVER shrunk on removal. A slightly-high
+    /// watermark only costs a few skipped vacant visits (safe), but if it
+    /// EVER dropped below a live slot, that session's `last_seen` would
+    /// stop being mirrored into the BPF conntrack map and the entry would
+    /// look idle — a premature-expiry correctness bug. So: only grow it,
+    /// never let it fall below an occupied slot.
+    slot_high_watermark: usize,
     /// #964 Step 1: forward-key → handle. Replaces the
     /// `sessions` HashMap's key-to-entry mapping.
     key_to_handle: SeededKeyMap<u32>,
@@ -690,6 +710,10 @@ impl SessionTable {
             // review finding) — the prior FxHashMap grew on demand,
             // so match that to keep baseline RSS unchanged.
             entries: slab::Slab::new(),
+            // #6297: no slots handed out yet — an empty slab has a live
+            // extent of 0, so the budgeted refresh walk is a no-op until
+            // the first install bumps this via `insert_record`.
+            slot_high_watermark: 0,
             // #2364: SessionKey-keyed indices use the per-boot secret seed
             // so attacker-chosen 5-tuples cannot construct collision chains.
             // `state` is the shared `FxSeededState` (carries the seed; a
@@ -941,6 +965,22 @@ impl SessionTable {
         self.max_sessions
     }
 
+    /// #6297 test helper: the monotonic backing-slab capacity. The budgeted
+    /// refresh walk deliberately does NOT bound to this after a drain — it
+    /// bounds to `slot_high_watermark` instead. Used by the fail-on-revert
+    /// test to assert the walk visits < `capacity()` slots.
+    #[cfg(test)]
+    pub(crate) fn entries_capacity_for_test(&self) -> usize {
+        self.entries.capacity()
+    }
+
+    /// #6297 test helper: the live-extent high-watermark the budgeted refresh
+    /// walk bounds to (`1 + the highest slot index ever handed out`).
+    #[cfg(test)]
+    pub(crate) fn slot_high_watermark_for_test(&self) -> usize {
+        self.slot_high_watermark
+    }
+
     /// #1760: cumulative NAT reverse-key displacement events on
     /// `nat_reverse_index` (see the field doc). Published per-worker on
     /// the ~1 Hz runtime cadence and aggregated into
@@ -955,6 +995,29 @@ impl SessionTable {
     // of the impl uses these short forms instead of repeating
     // `self.key_to_handle.get(key).and_then(|h| self.entries.get(*h as usize))`
     // throughout 30+ call sites.
+
+    /// #6297: insert a record into the session slab and advance the
+    /// live-extent high-watermark. This is the SOLE slab-insert choke
+    /// point so the `slot_high_watermark` invariant holds for every insert
+    /// path (fresh install, synced import, and the test-only
+    /// `restore_entry`). The slab hands back the slot index it used —
+    /// reusing a vacant slot from its free list when one exists, extending
+    /// the backing Vec otherwise — so `raw + 1` is the extent this record
+    /// occupies. Bumping the watermark to at least that guarantees
+    /// `slot_high_watermark >= 1 + every occupied slot index`, which the
+    /// budgeted refresh walk relies on to never skip a live session. Just a
+    /// compare-and-maybe-store on the hot install path; no allocation.
+    #[inline]
+    fn insert_record(&mut self, record: SessionRecord) -> usize {
+        let raw = self.entries.insert(record);
+        // Only grows, never shrinks — see the `slot_high_watermark` field
+        // doc for why a stale-low watermark would be a correctness bug but
+        // a slightly-high one is merely a few wasted vacant visits.
+        if raw + 1 > self.slot_high_watermark {
+            self.slot_high_watermark = raw + 1;
+        }
+        raw
+    }
 
     /// Resolve the slab handle for a forward-key direct lookup.
     /// Returns None if the key isn't installed.
@@ -1774,7 +1837,10 @@ impl SessionTable {
             key: key.clone(),
             entry,
         };
-        let raw = self.entries.insert(record);
+        // #6297: same slab-insert choke point as the production installs —
+        // keep the live-extent high-watermark correct even on this
+        // test-only restore path.
+        let raw = self.insert_record(record);
         let handle: u32 = raw.try_into().expect("slab handle exceeds u32");
         self.key_to_handle.insert(key.clone(), handle);
         // Clone metadata + decision out of the slab record for
