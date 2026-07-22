@@ -56011,3 +56011,36 @@ top.
   pkg/dataplane/userspace/manager_compile.go,
   pkg/dataplane/userspace/addr_only_commit_failclosed_4959_test.go,
   docs/userspace-dataplane-architecture.md
+
+- **Timestamp**: 2026-07-22
+  **Action**: #4959 (folded hostile-review finding) — close the residual
+  fail-open at the SECOND apply_snapshot site. `syncSnapshotLocked` (the
+  status-loop deferred-publish resume path) published `apply_snapshot` with a
+  bare `requestLocked`; a rejection returned the error but left `ctrl`
+  Enabled=1. Trigger: an address-only commit landing during the XSK-startup
+  liveness-probe window — `Compile`'s `pendingXSKStartup` branch mutates the
+  classifier maps IN PLACE (`syncUserspaceClassifierMapsFailClosedLocked`) then
+  DEFERS the publish, so when the status loop finishes it via
+  `syncSnapshotLocked` a rejection strands the maps a generation ahead of the
+  applied snapshot (identical #4959 fail-open). Routed that publish through
+  `publishSnapshotFailClosedLocked(&publishSnap, &status, true)`. Verified
+  firsthand that `mapsMutatedInPlace=true` is UNCONDITIONALLY correct there:
+  the `pendingXSKStartup` branch is the sole producer of an unpublished
+  `m.lastSnapshot` ahead of `m.publishedSnapshot` (every other publish site —
+  Compile steady state, route-overlay, policy-scheduler, deferred-worker-arm —
+  advances `publishedSnapshot` only after a successful publish), so no
+  genuinely-fresh publish can reach this site. Added FAIL-ON-REVERT test
+  `TestDeferredPublishRejectedFailsClosed4959` (real seeded userspace_ctrl map
+  + rejecting control server; rejected deferred publish → ctrl Enabled=0;
+  companion success subtest asserts the publish lands and the wrap is
+  transparent) + source-guard `TestSyncSnapshotRoutesPublishThroughFailClosed
+  Helper4959` binding the syncSnapshotLocked publish site. Firsthand-verified
+  privileged: RED on revert (ctrl stays Enabled=1 when the wrap is dropped),
+  GREEN with it; success subtest stays GREEN under both. Pre-existing
+  environment-dependent FAILs in the package (`userspace_ingress_ifaces map not
+  loaded`, XDP-program-execution stat tests) reproduce identically at the
+  committed HEAD without this change. `gofmt` clean; `go build ./...` +
+  `go vet` green.
+  **File(s)**: pkg/dataplane/userspace/process_status.go,
+  pkg/dataplane/userspace/addr_only_commit_failclosed_4959_test.go,
+  docs/userspace-dataplane-architecture.md

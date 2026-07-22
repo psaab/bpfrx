@@ -1263,6 +1263,27 @@ reconcile-ordering invariant (#2440/#2444/#3789) above: that one keeps the Rust
 process fail-closed across teardown; this one keeps the **Go-owned classifier
 BPF maps** consistent with the applied snapshot.
 
+The **same fail-closed transaction covers the deferred-publish resume path.**
+There are two `apply_snapshot` publish sites for a same-plan refresh. `Compile`
+publishes synchronously in the steady state, but during **XSK startup** (the
+liveness-probe window after the initial publish, before liveness is proven or
+failed) it takes the `pendingXSKStartup` branch: it still mutates the classifier
+maps **in place** (`syncUserspaceClassifierMapsFailClosedLocked`) with `ctrl`
+already flipped to `Enabled=1` to probe, but **defers** the publish and returns
+success. The status loop then completes the publish via `syncSnapshotLocked`
+(`process_status.go`). An address-only commit landing inside that window is
+exactly this case: the maps are already a generation ahead, so a rejected
+deferred publish is the identical fail-open. `syncSnapshotLocked` therefore
+routes its publish through `publishSnapshotFailClosedLocked` with
+`mapsMutatedInPlace=true`. That flag is unconditional there because the
+`pendingXSKStartup` branch is the **sole producer** of an unpublished
+`m.lastSnapshot` ahead of `m.publishedSnapshot` — every other publish site
+(`Compile` steady state, route-overlay, policy-scheduler, deferred-worker-arm)
+advances `publishedSnapshot` only *after* a successful publish, so none can
+strand a not-yet-mutated snapshot for the status loop to pick up. On a rejection
+`ctrl` drops to `Enabled=0`; a successful deferred publish is transparent and
+leaves the enable side to `applyHelperStatusLocked`.
+
 #### Capability Check
 
 The manager evaluates the active config to determine whether the userspace

@@ -99,8 +99,24 @@ func (m *Manager) syncSnapshotLocked() error {
 		return err
 	}
 	var status ProcessStatus
-	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
-		return fmt.Errorf("publish userspace snapshot: %w", err)
+	// #4959: this deferred-publish resume path only ever publishes an
+	// m.lastSnapshot that the pendingXSKStartup branch of Compile left ahead of
+	// m.publishedSnapshot — and that branch ALWAYS mutated the ingress/local/
+	// interface-NAT classifier BPF maps IN PLACE first
+	// (syncUserspaceClassifierMapsFailClosedLocked(snap)) with ctrl still
+	// enabled. It is the sole producer of an unpublished lastSnapshot: every
+	// other publish site (Compile normal path, route-overlay, policy-scheduler,
+	// deferred-worker-arm) advances m.publishedSnapshot only AFTER a successful
+	// publish, so none can strand a same-plan refresh here. An address-only
+	// commit landing during the XSK-startup liveness-probe window (ctrl flipped
+	// to Enabled=1 to probe) is exactly that case. Therefore mapsMutatedInPlace
+	// is unconditionally true here: if the helper REJECTS this publish it keeps
+	// enforcing the previous-good snapshot, so leaving ctrl enabled would run
+	// the shim against classifier maps a generation ahead of the applied Rust
+	// snapshot (fail OPEN). publishSnapshotFailClosedLocked disables ctrl on a
+	// rejection so transit drops to the kernel-only fail-closed posture.
+	if err := m.publishSnapshotFailClosedLocked(&publishSnap, &status, true); err != nil {
+		return err
 	}
 	// #1197 v5 (Codex code-review v4 #1): rebuild listener
 	// caches AFTER successful publish on the deferred-publish
