@@ -1,3 +1,18 @@
+## 2026-07-21 — #6214 fix: parseSrcPort uint16 accumulator overflow
+
+- **Timestamp**: 2026-07-21 (fix/6214-parsesrcport-overflow)
+- **Action**: `parseSrcPort` in `pkg/daemon/daemon_flow.go` accumulated port
+  digits directly into a `uint16` (`port = port*10 + uint16(c-'0')`), so a port
+  string above 65535 (e.g. "70000") wrapped mod 65536 to 4464 — silently
+  corrupting the source/destination port carried in NetFlow v9 / IPFIX flow
+  records (callers in `daemon_flowexport.go`: SrcPort/DstPort/NATSrcPort/
+  NATDstPort). Fix: accumulate into a `uint32` and reject any value > 65535,
+  returning the existing `0` "no port" sentinel (same value the no-colon path
+  returns). Valid ports 0..65535 parse unchanged. Added fail-on-revert test
+  `TestParseSrcPortRejectsOverflow6214`.
+- **File(s)**: `pkg/daemon/daemon_flow.go` (Edit),
+  `pkg/daemon/parse_srcport_overflow_6214_test.go` (Write)
+
 ## 2026-07-21 — #5482 follow-up: two review MAJORs on the BACKUP VIP-verify machinery
 
 - **Timestamp**: 2026-07-21 (fix/5482-vrrp-vip-verify)
