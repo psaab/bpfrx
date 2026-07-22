@@ -183,7 +183,7 @@ fragmented in-path either. So once the full outer datagram is sized —
 `outer IP + GRE header (incl. the optional 4-byte key) + inner packet`
 (the `gre_encapped_outer_len` helper; the L2 eth/VLAN header is NOT part
 of the MTU budget) — the builder compares it against the resolved
-transport/egress MTU via `tunnel_outer_mtu` (forwarding/mod.rs, the
+transport/egress MTU via `tunnel_outer_mtu` (forwarding/mss.rs, the
 #2300 SSOT used by the inner MSS clamp and `native_gre_inner_mtu`: real
 transport ifindex → stored-resolution egress → endpoint logical ifindex,
 `unwrap_or(1500)`). If the outer exceeds that MTU the frame is **not
