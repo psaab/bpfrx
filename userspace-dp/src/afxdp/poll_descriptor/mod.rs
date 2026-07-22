@@ -3506,6 +3506,10 @@ pub(super) fn poll_binding_process_descriptor(
                                             tcp_flags: meta.tcp_flags,
                                             // Local forward-flow learn (#2170): no peer gen.
                                             generation: 0,
+                                            // #5212: local-origin shared publish; the id
+                                            // rides the wire off the live entry via the
+                                            // Open delta, not this replica (0 here).
+                                            session_id: 0,
                                         };
                                         // #1789: count failed publishes so
                                         // map-at-capacity / stale-fd
@@ -3839,6 +3843,10 @@ pub(super) fn poll_binding_process_descriptor(
                                             tcp_flags: meta.tcp_flags,
                                             // Local reverse-flow learn (#2170): no peer gen.
                                             generation: 0,
+                                            // #5212: a reverse companion never emits
+                                            // RT_FLOW (is_reverse skip) and gets its own
+                                            // fresh id at install — no carried id.
+                                            session_id: 0,
                                         };
                                         publish_shared_session(
                                             worker_ctx.shared_sessions,
@@ -5749,6 +5757,8 @@ pub(super) fn poll_binding_process_descriptor(
                                         tcp_flags: meta.tcp_flags,
                                         // Local missing-neighbor seed (#2170): no peer gen.
                                         generation: 0,
+                                        // #5212: local-origin seed; no carried id (0).
+                                        session_id: 0,
                                     };
                                     publish_shared_session(
                                         worker_ctx.shared_sessions,

@@ -792,6 +792,9 @@ pub(super) fn apply_worker_commands(
                         now_ns,
                         protocol: entry.protocol,
                         tcp_flags: entry.tcp_flags,
+                        // #5212: preserve the entry's id (a local-tunnel replica
+                        // carries 0 => fresh local alloc, the pre-#5212 behavior).
+                        session_id: entry.session_id,
                     },
                     /* allow_replace_local = */ true,
                 );
@@ -1103,6 +1106,10 @@ fn materialize_shared_session_hit(
                 now_ns,
                 protocol: replica.protocol,
                 tcp_flags,
+                // #5212: a reactive materialize of a shared-map hit inherits the
+                // shared entry's id — the peer's id for a synced session (so the
+                // eventual close correlates), 0 for a local entry (fresh alloc).
+                session_id: replica.session_id,
             },
             false,
         );

@@ -226,6 +226,43 @@ func TestDecodeSessionEventNat64_4565(t *testing.T) {
 	}
 }
 
+// TestDecodeSessionEventRTFlowSessionID5212 verifies the trailing u64 RT_FLOW
+// session id (the LAST open-frame field, after the #4565 snat_v4) decodes into
+// SessionDeltaInfo.RTFlowSessionID, and a legacy frame that omits it decodes to
+// 0 (the standby then allocs a fresh local id). Reverting the eventstream.go
+// decode drops the id and this fails RED.
+func TestDecodeSessionEventRTFlowSessionID5212(t *testing.T) {
+	// v6 SESSION_OPEN layout (see TestDecodeSessionEventNat64_4565): off reaches
+	// 140 after the #4565 snat_v4; the #5212 session id occupies [140:148].
+	payload := make([]byte, 148)
+	payload[0] = 6 // AddrFamily = v6
+	payload[1] = 6 // Protocol = TCP
+	// Originating node's stable id: worker 7 high bits + counter 0x2a.
+	wantID := uint64(7)<<48 | 0x2a
+	binary.LittleEndian.PutUint64(payload[140:148], wantID)
+
+	d, ok := decodeSessionEvent(payload)
+	if !ok {
+		t.Fatal("decodeSessionEvent returned false")
+	}
+	if d.RTFlowSessionID != wantID {
+		t.Fatalf("d.RTFlowSessionID = %#x, want %#x", d.RTFlowSessionID, wantID)
+	}
+
+	// A legacy frame that omits the trailing id (stops after snat_v4) decodes to
+	// 0 — the standby falls back to a fresh local id (rolling-upgrade safe).
+	legacy := make([]byte, 140)
+	legacy[0] = 6
+	legacy[1] = 6
+	dl, ok := decodeSessionEvent(legacy)
+	if !ok {
+		t.Fatal("decodeSessionEvent returned false for legacy frame")
+	}
+	if dl.RTFlowSessionID != 0 {
+		t.Fatalf("legacy frame RTFlowSessionID = %#x, want 0", dl.RTFlowSessionID)
+	}
+}
+
 func TestDecodeSessionEventV4(t *testing.T) {
 	payload := buildSessionOpenV4Payload(
 		6,          // TCP

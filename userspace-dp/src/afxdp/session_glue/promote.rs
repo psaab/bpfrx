@@ -122,6 +122,11 @@ pub(in crate::afxdp::session_glue) fn maybe_promote_synced_session(
             tcp_flags,
             // Local shared-promote: no peer install generation (#2170).
             generation: 0,
+            // #5212: promote re-publishes an entry already live in the table;
+            // its stable id is preserved on the entry itself (the promote Open
+            // delta reads it via `entry_by_key`), so this shared replica needs
+            // no id (0 = "alloc a fresh local id" on any re-import).
+            session_id: 0,
         };
         publish_shared_session(
             shared.sessions,

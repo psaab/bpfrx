@@ -71,6 +71,9 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
             now_ns,
             protocol: entry.protocol,
             tcp_flags: entry.tcp_flags,
+            // #5212: carry the peer's stable RT_FLOW id from the synced entry so
+            // the standby ADOPTS it (non-zero on a wire import; 0 => local alloc).
+            session_id: entry.session_id,
         },
         allow_replace_local,
     ) {

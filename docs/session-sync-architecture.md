@@ -50,9 +50,15 @@ The session value includes state, policy, timestamps, counters, NAT fields,
 reverse key, and a cached forwarding result (`FibIfindex`, MACs, VLAN,
 generation). It also carries a `ConfigEpoch` (#5274) — the config-sync
 generation (#3931) the sender held when it queued the session — used by the
-receive-side config-epoch guard (see "Config-Epoch Guard" below). Both
-`Generation` and `ConfigEpoch` are userspace-sync-only metadata; neither is part
-of the on-map BPF conntrack ABI (`bpfSessionValue`).
+receive-side config-epoch guard (see "Config-Epoch Guard" below), and a
+`RTFlowSessionID` (#5212) — the ORIGINATING node's stable RT_FLOW session id
+(`SessionTable::alloc_session_id`, distinct from the node-local BPF-ABI
+`SessionID`) — which the importing node ADOPTS so a session's RT_FLOW
+SESSION_CREATE (origin node) and SESSION_CLOSE (peer, after failover) share one
+correlatable id across HA nodes (see "RT_FLOW Session Id" below). All three of
+`Generation`, `ConfigEpoch`, and `RTFlowSessionID` are userspace-sync-only
+metadata carried as length-gated trailing wire fields; none is part of the on-map
+BPF conntrack ABI (`bpfSessionValue`).
 
 ### Userspace Mirror
 
@@ -299,6 +305,32 @@ the primary that admits the session is also the RG0 config-sync authority); a
 non-authority's sessions carry the authority-independent seed epoch and the
 guard is inert for them (no false reject), which is acceptable because config
 changes originate on the authority.
+
+### RT_FLOW Session Id (#5212)
+
+The dataplane assigns each session a STABLE id (`SessionTable::alloc_session_id`)
+that it stamps on its RT_FLOW SESSION_CREATE/SESSION_CLOSE records (#4915). That
+id is node-local: before #5212 a peer-synced session was assigned a FRESH id on
+import, so a session that opened on the primary and closed on the standby after a
+failover carried DIFFERENT ids on the two nodes, breaking cross-node log/event
+correlation. #5212 carries the originating node's id on the session-sync wire as
+a length-gated trailing `RTFlowSessionID uint64` (appended after the #5274
+`ConfigEpoch`), and the importing node ADOPTS it.
+
+Unlike the config-epoch guard, this is pure identity carriage — the receiver
+never rejects on it. The path is: the Rust dataplane harvests the id onto
+`SessionDelta.session_id` and writes it as the trailing field of the
+`MSG_SESSION_OPEN` event-stream frame; the daemon decodes it into
+`SessionDeltaInfo.RTFlowSessionID` and stamps `SessionValue{,V6}.RTFlowSessionID`
+(distinct from the node-local BPF-ABI `SessionID`, which stays `now<<16|Slot`);
+`SessionSync` carries it as the trailing wire field; the peer daemon forwards it
+on `SessionSyncRequest.session_id`; and the peer helper's
+`upsert_synced_with_origin` ADOPTS it (stamping the imported `SessionEntry`)
+instead of allocating a fresh local id. A zero id (legacy peer / no live entry)
+falls back to `alloc_session_id()` — rolling-upgrade safe. Because the id is
+worker-namespaced, adopting the peer's id verbatim keeps it unique across the
+importing node's shared-nothing worker tables. The standby's SESSION_CLOSE
+RT_FLOW then correlates with the primary's SESSION_CREATE.
 
 ## Sync Readiness and Bulk Priming
 

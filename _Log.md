@@ -56186,3 +56186,47 @@ top.
   when the Mutex is re-added).
 - **File(s)**: userspace-dp/src/filter/policer.rs,
   userspace-dp/src/filter/mod.rs, userspace-dp/src/filter/README.md
+- **Timestamp**: 2026-07-22 (#5212)
+- **Action**: Carry the RT_FLOW stable session id across the HA session-sync
+  wire so a peer-synced session ADOPTS the originating node's id instead of
+  minting a fresh node-local one on import (completes the #4915 cross-node
+  follow-up). BOTH-SIDES additive length-gated trailing field (mirrors the
+  #4565 snat_v4 / #5274 config-epoch discipline). Rust: `SessionInstall.session_id`
+  + `SyncedSessionEntry.session_id`; `upsert_synced_with_origin` stamps the wire
+  id when non-zero else `alloc_session_id()`; `encode_session_open` appends the
+  trailing u64 (threaded from `SessionDelta.session_id`); `emit_open_delta_with_origin`
+  looks the id up off the live table for the owner-RG cold-sync export;
+  `build_synced_session_entry` reads `SessionSyncRequest.session_id`. Go: added
+  `RTFlowSessionID` to `SessionValue`/`SessionValueV6` (distinct from the BPF-ABI
+  `SessionID`) + `SessionDeltaInfo` + `SessionSyncRequest`; wire encode/decode in
+  `sync_protocol.go` (V4+V6, appended after ConfigEpoch); `decodeSessionEvent`
+  decode; `buildSessionSyncRequestV4/V6` + `userspaceSessionFromDeltaV4/V6` stamp.
+  Regenerated `protocol_wire_v1.json`; fixed the six pre-existing
+  legacy-truncation tests whose `-N` byte counts shifted by the new trailing
+  field. Fail-on-revert tests (all firsthand RED-verified):
+  `synced_import_adopts_peer_session_id_5212`,
+  `test_encode_session_open_carries_session_id_5212`,
+  `TestSessionWireRoundTripRTFlowSessionID5212{V4,V6}`,
+  `TestDecodeSessionEventRTFlowSessionID5212`,
+  `TestBuildSessionSyncRequestCarriesRTFlowSessionID5212`,
+  `TestUserspaceSessionFromDeltaCarriesRTFlowSessionID5212`.
+  **File(s)**: userspace-dp/src/session/{ctx,install,tests,README}.rs/md,
+  userspace-dp/src/afxdp/{worker/mod,session_glue/*,shared_ops,tunnel,forwarding/mod,poll_descriptor/mod,ha}.rs,
+  userspace-dp/src/event_stream/{mod,codec/session_sync,codec/codec_tests}.rs,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/server/helpers.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/types.go, pkg/dataplane/userspace/{protocol,eventstream,manager_ha,*_test}.go,
+  pkg/cluster/{sync_protocol,README,sync_*_test}.go, pkg/daemon/{daemon_ha_userspace_convert,userspace_sync_test}.go,
+  docs/{sync-protocol,session-sync-architecture}.md
+
+## 2026-07-22 — #6309 (#5212) review fold: honest session-id caveat
+- **Action**: Folded rev6309 MERGE-NEEDS-MINOR findings — corrected the FALSE
+  "disjoint id slice" claim in docs/sync-protocol.md, session/README.md, and the
+  install.rs adopt comment to state the honest metadata-only, not-globally-unique
+  caveat (worker<<48|counter has no node discriminator; adopted id can collide
+  with a local same-worker id in active/active — observability-only). Tightened
+  the adopt test (worker 7→3, honest comment). Added the JSON-leg caveat to
+  emit_open_delta_with_origin. Filed follow-ups #6311 (node-bit namespace fix),
+  #6312 (JSON resync id-drop), #6313 (reverse-materialize test).
+- **File(s)**: docs/sync-protocol.md, userspace-dp/src/session/README.md,
+  userspace-dp/src/session/install.rs, userspace-dp/src/session/tests.rs

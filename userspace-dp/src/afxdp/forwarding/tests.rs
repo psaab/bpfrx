@@ -2320,6 +2320,7 @@ fn helper_local_session_on_miss_clears_stale_shared_aliases() {
         tcp_flags: 0x10,
         // #2170 test fixture: no peer install generation.
         generation: 0,
+        session_id: 0,
     };
 
     // Install with SyncImport origin so take_synced_local recognizes

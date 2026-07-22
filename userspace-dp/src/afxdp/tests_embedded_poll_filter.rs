@@ -134,6 +134,7 @@ fn embedded_icmp_nat_match_uses_shared_nat_session_for_ipv4() {
         tcp_flags: 0,
         // #2170 test fixture: no peer install generation.
         generation: 0,
+        session_id: 0,
     };
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
@@ -1841,6 +1842,7 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
         tcp_flags: TCP_FLAG_SYN,
         // #2170 test fixture: no peer install generation.
         generation: 0,
+        session_id: 0,
     };
     publish_shared_session(
         &shared_sessions,

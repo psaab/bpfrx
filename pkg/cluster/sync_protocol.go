@@ -96,10 +96,10 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	keySize := 16
 	valSize := 160
 	// +8 for the #2170 install Generation, +8 for the #3301 trailing
-	// AppTimeout(u32)+PolicyCounterIdx(u32), +8 for the #5274 ConfigEpoch. All
-	// length-gated: an old decoder stops after the field it knows and ignores
-	// the rest.
-	buf := make([]byte, keySize+valSize+8+8+8)
+	// AppTimeout(u32)+PolicyCounterIdx(u32), +8 for the #5274 ConfigEpoch, +8 for
+	// the #5212 RTFlowSessionID. All length-gated: an old decoder stops after the
+	// field it knows and ignores the rest.
+	buf := make([]byte, keySize+valSize+8+8+8+8)
 	off := 0
 	copy(buf[off:], key.SrcIP[:])
 	off += 4
@@ -195,6 +195,13 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	// session). Old decoders stop after PolicyCounterIdx and ignore it; absent
 	// => 0 (legacy peer / check disabled).
 	binary.LittleEndian.PutUint64(buf[off:], val.ConfigEpoch)
+	off += 8
+	// #5212: the originating node's stable RT_FLOW session id (length-gated
+	// trailing field). A peer-synced session ADOPTS this id on import instead of
+	// minting a fresh node-local one, so its RT_FLOW SESSION_CREATE/CLOSE records
+	// correlate across HA nodes. Old decoders stop after ConfigEpoch and ignore
+	// it; absent => 0 (legacy peer / fresh-local-id fallback).
+	binary.LittleEndian.PutUint64(buf[off:], val.RTFlowSessionID)
 	off += 8
 	return buf[:off]
 }
@@ -307,6 +314,11 @@ func encodeSessionV6Payload(key dataplane.SessionKeyV6, val dataplane.SessionVal
 	// encodeSessionV4Payload). Old decoders stop after Nat64SnatV4 and ignore
 	// it; absent => 0 (legacy peer / check disabled).
 	binary.LittleEndian.PutUint64(buf[off:], val.ConfigEpoch)
+	off += 8
+	// #5212: originating node's stable RT_FLOW session id (length-gated trailing
+	// field; see encodeSessionV4Payload). Old decoders stop after ConfigEpoch;
+	// absent => 0 (legacy peer / fresh-local-id fallback on import).
+	binary.LittleEndian.PutUint64(buf[off:], val.RTFlowSessionID)
 	off += 8
 	return buf[:off]
 }
@@ -476,6 +488,12 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 		val.ConfigEpoch = binary.LittleEndian.Uint64(payload[off:])
 		off += 8
 	}
+	// #5212: originating node's stable RT_FLOW session id (length-gated; absent →
+	// 0 = legacy peer, receiver allocs a fresh local id on import).
+	if off+8 <= len(payload) {
+		val.RTFlowSessionID = binary.LittleEndian.Uint64(payload[off:])
+		off += 8
+	}
 	return key, val, true
 }
 
@@ -605,6 +623,12 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 	// config-epoch check disabled).
 	if off+8 <= len(payload) {
 		val.ConfigEpoch = binary.LittleEndian.Uint64(payload[off:])
+		off += 8
+	}
+	// #5212: originating node's stable RT_FLOW session id (length-gated; absent →
+	// 0 = legacy peer, receiver allocs a fresh local id on import).
+	if off+8 <= len(payload) {
+		val.RTFlowSessionID = binary.LittleEndian.Uint64(payload[off:])
 		off += 8
 	}
 	return key, val, true

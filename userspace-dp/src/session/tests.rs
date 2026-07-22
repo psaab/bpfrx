@@ -379,6 +379,76 @@ fn session_id_namespaces_worker_in_high_bits() {
     );
 }
 
+// #5212 RED-on-revert: a peer-synced import ADOPTS the originating node's stable
+// session id carried on the HA session-sync wire (SessionInstall.session_id)
+// instead of minting a fresh node-local one, so the standby's SESSION_CLOSE
+// RT_FLOW record correlates with the primary's SESSION_CREATE across HA nodes. A
+// zero wire id (a legacy peer that predates the field) falls back to a fresh
+// local alloc. Reverting the stamp in `upsert_synced_with_origin` (back to an
+// unconditional `alloc_session_id()`) flips the first assertion RED: the adopted
+// id would be a local worker-2 id, not the peer's worker-3 id. A distinct worker
+// only keeps that revert assertion unambiguous — the id space is NOT partitioned
+// by node, so a peer id in the SAME worker index collides with a local id in
+// active/active (an accepted observability-only limitation, #6311).
+#[test]
+fn synced_import_adopts_peer_session_id_5212() {
+    let mut table = SessionTable::new();
+    // Local allocations would land in this node's worker-2 id namespace.
+    table.set_worker_id(2);
+    let now = 1_000_000_000u64;
+
+    // A peer-originated id, adopted verbatim. Worker 3 (distinct from this
+    // node's local worker 2) only keeps the revert assertion unambiguous — the
+    // namespace has no node discriminator, so a same-worker peer id would
+    // collide with a local id (#6311).
+    let peer_id: u64 = (3u64 << 48) | 42;
+    let key = key_v4();
+    assert!(table.upsert_synced_with_origin(
+        SessionInstall {
+            key: key.clone(),
+            decision: decision(),
+            metadata: metadata(),
+            origin: SessionOrigin::SyncImport,
+            now_ns: now,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+            session_id: peer_id,
+        },
+        false,
+    ));
+    assert_eq!(
+        table.session_id_for(&key),
+        peer_id,
+        "a peer-synced session must ADOPT the wire session id, not alloc a fresh local one"
+    );
+
+    // A second synced session carrying NO wire id (a legacy peer) falls back to a
+    // FRESH LOCAL id: non-zero, in this node's (worker-2) namespace, and never
+    // the peer's id.
+    let key2 = key_v6();
+    assert!(table.upsert_synced_with_origin(
+        SessionInstall {
+            key: key2.clone(),
+            decision: decision(),
+            metadata: metadata(),
+            origin: SessionOrigin::SyncImport,
+            now_ns: now,
+            protocol: PROTO_UDP,
+            tcp_flags: 0,
+            session_id: 0,
+        },
+        false,
+    ));
+    let local_id = table.session_id_for(&key2);
+    assert_ne!(local_id, 0, "a zero wire id must fall back to a fresh non-zero local id");
+    assert_ne!(local_id, peer_id, "the fallback must be a fresh LOCAL id, not the peer's");
+    assert_eq!(
+        local_id >> 48,
+        2,
+        "the fallback id must be namespaced to this node's worker (2)"
+    );
+}
+
 // === #4380 symmetric idle-timer (forward↔reverse companion) tests =========
 //
 // A flow is TWO independent entries that age independently. Junos measures a
@@ -5735,6 +5805,7 @@ fn session_limit_ha_import_promote_demote_count() {
             now_ns: now,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
+            session_id: 0,
         },
         false,
     ));
@@ -5816,6 +5887,7 @@ fn session_limit_synced_sessions_enforced_after_failover() {
                 now_ns: now,
                 protocol: PROTO_TCP,
                 tcp_flags: 0x10,
+                session_id: 0,
             },
             false,
         ));
@@ -5863,6 +5935,7 @@ fn session_limit_synced_reimport_nets_to_one() {
                 now_ns: now + t * 1_000_000,
                 protocol: PROTO_TCP,
                 tcp_flags: 0x10,
+                session_id: 0,
             },
             true,
         ));
@@ -5899,6 +5972,7 @@ fn session_limit_synced_reverse_import_excluded() {
             now_ns: now,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
+            session_id: 0,
         },
         false,
     ));
@@ -6070,6 +6144,7 @@ fn session_limit_counts_match_live_counted_entries_invariant() {
             now_ns: now,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
+            session_id: 0,
         },
         false,
     );
@@ -6275,6 +6350,7 @@ fn session_limit_backcount_on_enable_covers_preexisting_sessions() {
             now_ns: now,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
+            session_id: 0,
         },
         false,
     );

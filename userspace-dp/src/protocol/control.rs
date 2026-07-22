@@ -1094,6 +1094,22 @@ pub(crate) struct SessionSyncRequest {
     /// old peer that omits it, decoding to "not NAT64" (rolling-upgrade safe).
     #[serde(rename = "nat64_snat_v4", default)]
     pub nat64_snat_v4: String,
+    /// #5212: the ORIGINATING node's stable RT_FLOW session id
+    /// (`SessionTable::alloc_session_id` namespace: worker id in the high 16
+    /// bits + a per-worker monotonic counter). Carried across the cross-node HA
+    /// wire so a peer-synced session ADOPTS the originating node's id rather than
+    /// minting a fresh node-local one on import — the standby's SESSION_CLOSE
+    /// RT_FLOW record then correlates with the primary's SESSION_CREATE across
+    /// both HA nodes (an operator or a collector merging both streams sees one
+    /// id per logical session). The receiver stamps this onto the imported entry
+    /// (`build_synced_session_entry` -> `SessionInstall::session_id` ->
+    /// `upsert_synced_with_origin`) when non-zero, else falls back to a fresh
+    /// local id. `serde(default)` => 0 on an old peer that omits the field,
+    /// which is the "no id carried" sentinel (a real id is never 0 — the
+    /// allocator's counter starts at 1), bit-identical to the pre-#5212
+    /// fresh-local-id import (rolling-upgrade safe).
+    #[serde(rename = "session_id", default)]
+    pub session_id: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

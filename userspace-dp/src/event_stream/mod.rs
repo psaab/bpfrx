@@ -850,6 +850,9 @@ impl EventStreamWorkerHandle {
                 &delta.metadata,
                 zone_name_to_id,
                 delta.fabric_redirect_sync,
+                // #5212: the delta's stable RT_FLOW session id, carried on the
+                // HA session-sync open frame so the peer adopts it on import.
+                delta.session_id,
             ),
             SessionDeltaKind::Close => EventFrame::encode_session_close(
                 seq,

@@ -894,6 +894,7 @@ impl super::Coordinator {
             protocol: PROTO_TCP,
             tcp_flags: 0,
             generation: 0,
+            session_id: 0,
         });
     }
 }

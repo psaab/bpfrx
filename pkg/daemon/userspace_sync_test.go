@@ -175,6 +175,48 @@ func (f *fakeUserspaceSessionExporter) ExportOwnerRGSessions(rgIDs []int, max ui
 	return append([]dpuserspace.SessionDeltaInfo(nil), f.deltas...), dpuserspace.ProcessStatus{}, nil
 }
 
+// TestUserspaceSessionFromDeltaCarriesRTFlowSessionID5212 verifies the delta ->
+// SessionValue conversion stamps the originating node's stable RT_FLOW session
+// id (delta.RTFlowSessionID) onto SessionValue{,V6}.RTFlowSessionID (distinct
+// from the BPF-ABI SessionID) so it rides the cluster sync wire and the peer
+// adopts it. Reverting the stamp leaves it 0 and this fails RED.
+func TestUserspaceSessionFromDeltaCarriesRTFlowSessionID5212(t *testing.T) {
+	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
+	wantID := uint64(7)<<48 | 0x1234_5678
+
+	deltaV4 := dpuserspace.SessionDeltaInfo{
+		Event: "open", AddrFamily: 2, Protocol: 6,
+		SrcIP: "10.0.61.102", DstIP: "172.16.80.200", SrcPort: 12345, DstPort: 5201,
+		IngressZone: "lan", EgressZone: "wan", EgressIfindex: 12,
+		RTFlowSessionID: wantID,
+	}
+	_, valV4, ok := userspaceSessionFromDeltaV4(deltaV4, zoneIDs)
+	if !ok {
+		t.Fatal("expected v4 delta to convert")
+	}
+	if valV4.RTFlowSessionID != wantID {
+		t.Fatalf("v4 RTFlowSessionID = %#x, want %#x", valV4.RTFlowSessionID, wantID)
+	}
+	// The BPF-ABI SessionID stays a distinct node-local now<<16|Slot value.
+	if valV4.SessionID == wantID {
+		t.Fatal("RTFlowSessionID must be distinct from the BPF-ABI SessionID")
+	}
+
+	deltaV6 := dpuserspace.SessionDeltaInfo{
+		Event: "open", AddrFamily: 10, Protocol: 6,
+		SrcIP: "2001:db8::1", DstIP: "2001:db8::2", SrcPort: 12345, DstPort: 5201,
+		IngressZone: "lan", EgressZone: "wan", EgressIfindex: 12,
+		RTFlowSessionID: wantID,
+	}
+	_, valV6, ok := userspaceSessionFromDeltaV6(deltaV6, zoneIDs)
+	if !ok {
+		t.Fatal("expected v6 delta to convert")
+	}
+	if valV6.RTFlowSessionID != wantID {
+		t.Fatalf("v6 RTFlowSessionID = %#x, want %#x", valV6.RTFlowSessionID, wantID)
+	}
+}
+
 func TestUserspaceSessionFromDeltaV4(t *testing.T) {
 	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
 	delta := dpuserspace.SessionDeltaInfo{

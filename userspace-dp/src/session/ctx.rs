@@ -36,6 +36,16 @@ pub(crate) struct SessionInstall {
     pub(crate) now_ns: u64,
     pub(crate) protocol: u8,
     pub(crate) tcp_flags: u8,
+    /// #5212: the ORIGINATING node's stable RT_FLOW session id, carried across
+    /// the HA session-sync wire so a peer-synced session ADOPTS the peer's id
+    /// rather than minting a fresh node-local one — making the SESSION_CREATE
+    /// (emitted on the origin node) and the SESSION_CLOSE (which may be emitted
+    /// on the peer after a failover) share one correlatable id across both
+    /// nodes. 0 means "no id carried" (a legacy peer that predates the wire
+    /// field, or a locally-generated upsert such as a tunnel replica): the
+    /// receiver falls back to `alloc_session_id()` (pre-#5212 behavior,
+    /// rolling-upgrade safe). Only `upsert_synced_with_origin` consults it.
+    pub(crate) session_id: u64,
 }
 
 /// In-place update or promotion of an existing session. Carries a

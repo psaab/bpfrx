@@ -267,6 +267,7 @@ fn update_ha_state_prewarms_split_rg_reverse_sessions_on_activation() {
         tcp_flags: 0x10,
         // #2170 test fixture: no peer install generation.
         generation: 0,
+        session_id: 0,
     };
     publish_shared_session(
         &coordinator.sessions.synced,
@@ -375,6 +376,7 @@ fn update_ha_state_demotion_recovers_from_poisoned_worker_command_mutex() {
         tcp_flags: 0x10,
         // #2170 test fixture: no peer install generation.
         generation: 0,
+        session_id: 0,
     };
     publish_shared_session(
         &coordinator.sessions.synced,
@@ -493,6 +495,7 @@ fn prewarm_recovers_from_poisoned_shared_session_mutex() {
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
         generation: 0,
+        session_id: 0,
     };
     publish_shared_session(
         &coordinator.sessions.synced,
@@ -652,6 +655,7 @@ fn synced_entry_with_generation(generation: u64) -> SyncedSessionEntry {
         protocol: PROTO_TCP,
         tcp_flags: 0,
         generation,
+        session_id: 0,
     }
 }
 
@@ -734,6 +738,7 @@ fn synced_entry_port(port: u16, generation: u64) -> SyncedSessionEntry {
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
         generation,
+        session_id: 0,
     }
 }
 
@@ -937,6 +942,7 @@ fn synced_snat_entry() -> SyncedSessionEntry {
         protocol: PROTO_TCP,
         tcp_flags: 0,
         generation: 0,
+        session_id: 0,
     }
 }
 
@@ -1098,6 +1104,7 @@ fn coordinator_with_tunnel_session(tunnel_endpoint_id: u16) -> (Coordinator, Ses
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
         generation: 0,
+        session_id: 0,
     };
     publish_shared_session(
         &coordinator.sessions.synced,
