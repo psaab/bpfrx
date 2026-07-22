@@ -494,6 +494,19 @@ type compileOpts struct {
 	// gate subsumes.
 	lenientQinQVLANStack bool
 
+	// lenientVLANMap (#6178) downgrades the input-vlan-map / output-vlan-map
+	// (per-unit VLAN rewrite) honesty gate (validateVLANMapAST) from a hard
+	// error to a warning on the tolerant load / peer-sync paths. Neither
+	// spelling is in the unit setSchema and neither has a compiler consumer,
+	// so a configured VLAN tag push/pop/swap was already silently dropped on
+	// every binary up to this gate; an already-persisted or peer-synced
+	// config may carry one, and an upgrading / receiving node must still boot
+	// through it (warn) rather than fail-closed-on-load (#1960 class). Commit
+	// / commit-check stay strict — a new operator edit requesting a rewrite
+	// the AF_XDP dataplane cannot perform is rejected loudly rather than
+	// silently ignored. Same doctrine as lenientQinQVLANStack (#5879).
+	lenientVLANMap bool
+
 	// lenientRoutingExportRef (#2144) downgrades the routing-export
 	// cross-reference gate (validateRoutingExportReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. Set ONLY on the tolerant
@@ -2001,6 +2014,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATHostMask:                     true,
 		lenientUnsupportedInterfaceStanzas:     true,
 		lenientQinQVLANStack:                   true,
+		lenientVLANMap:                         true,
 		lenientRoutingExportRef:                true,
 		lenientFRRAuthValues:                   true,
 		lenientRouteFilterMatchTypes:           true,
@@ -2306,6 +2320,17 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		return nil, qinqErr
 	}
 
+	// #6178: input-vlan-map / output-vlan-map (per-unit VLAN rewrite) honesty
+	// gate — see compiler_interfaces_vlanmap.go. Runs PRE-expansion beside
+	// the QinQ gate, expanding the candidate once per cluster node (node0 AND
+	// node1) so a peer-only-group vlan-map is caught and the verdict is
+	// HA-symmetric. Strict hard-rejects an unsupported push/pop/swap; lenient
+	// warns (#1960).
+	vlanMapWarnings, vlanMapErr := validateVLANMapAST(tree, opts.lenientVLANMap)
+	if vlanMapErr != nil {
+		return nil, vlanMapErr
+	}
+
 	usedNodeFallback := false
 
 	// Expand groups before compilation — resolve all apply-groups references.
@@ -2334,6 +2359,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
+	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)
 	return cfg, nil
 }
 
@@ -2387,6 +2413,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATHostMask:                     true,
 		lenientUnsupportedInterfaceStanzas:     true,
 		lenientQinQVLANStack:                   true,
+		lenientVLANMap:                         true,
 		lenientRoutingExportRef:                true,
 		lenientFRRAuthValues:                   true,
 		lenientRouteFilterMatchTypes:           true,
@@ -2550,6 +2577,16 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, qinqErr
 	}
 
+	// #6178: input-vlan-map / output-vlan-map (per-unit VLAN rewrite) honesty
+	// gate — see compileConfigWithOpts / compiler_interfaces_vlanmap.go. Runs
+	// PRE-expansion per cluster node (node0 AND node1) so a peer-only-group
+	// vlan-map is rejected here even when THIS commit compiles nodeID alone.
+	// Strict rejects; lenient warns (#1960).
+	vlanMapWarnings, vlanMapErr := validateVLANMapAST(tree, opts.lenientVLANMap)
+	if vlanMapErr != nil {
+		return nil, vlanMapErr
+	}
+
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 	if err := tree.ExpandGroupsWithVars(vars); err != nil {
 		return nil, fmt.Errorf("apply-groups: %w", err)
@@ -2574,6 +2611,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
+	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)
 	return cfg, nil
 }
 
