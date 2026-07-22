@@ -344,6 +344,44 @@ PTB path (`wg_endpoint_physical_outer_mtu`), which is a separate call site.
 RED-on-revert: `wg_encap_frame_resolves_outer_route_once_v4` counts entries to
 `outer_physical_egress_ifindex` per encap (test-only `OUTER_ROUTE_RESOLVE_COUNT`
 seam) and asserts exactly 1 (2 before the fix) plus outer-header byte-identity.
+(Post-#5292 the single resolution is `outer_physical_egress_resolution`; the
+`outer_physical_egress_ifindex` wrapper is retained for the PTB path and the
+helper tests.)
+
+**#5292 (transit-egress OUTER L2/VLAN — peer before route/connected admission).**
+#2680/#2701/#3992 made the outer MTU + IP SOURCE follow the selected peer's
+physical underlay egress, but `wg_encap_frame` still read the outer Ethernet
+header — the dst MAC (`neighbor_mac`), the src MAC, and the VLAN — from
+`decision.resolution`. That resolution was produced BEFORE the AllowedIPs peer
+selection, by admitting the route/connected entry that carries the WG endpoint
+id: `resolve_tunnel_forwarding_resolution` resolves the endpoint-level
+`destination`, which the build zeroes to `0.0.0.0`/`::` for WireGuard (the peer
+carries the real outer hop). So the stored L2/VLAN is either NoRoute (no
+neighbor/src/VLAN → the encap `?`-drops → blackhole) or, when a default route
+matches `0.0.0.0`, the DEFAULT route's adjacency — a neighbor MAC / src MAC /
+VLAN describing a different egress than the actually-selected peer needs. The
+outer IP source already followed the peer (#2701), so the emitted frame was
+internally inconsistent (peer source IP carried on the default route's L2/VLAN,
+often the wrong 802.1Q tag). The fix derives the outer L2/VLAN from the SAME
+single physical-egress resolution snapshot used for the MTU + source: `src_mac`
++ VLAN come straight from the resolved physical egress row, and the outer
+next-hop `neighbor_mac` comes from the peer route's resolution (falling back to
+`decision.resolution.neighbor_mac` only when the underlay next-hop is not yet
+statically resolved — a dynamic-learned hop shared with the default route, the
+common single-underlay case). The non-route/connected admission paths that
+already worked are unaffected. RED-on-revert:
+`wg_encap_outer_l2_vlan_follows_selected_peer_not_zeroed_decision` (a peer
+reached via a different VLAN/adjacency than the stored decision emits the
+peer's L2/VLAN, not the decision's) and
+`wg_encap_builds_when_zeroed_decision_has_no_l2` (the frame builds against the
+peer even when the stored decision carries no usable L2 — the no-blackhole
+leg). NOTE: this fixes the outer FRAME identity for a decision that reaches the
+builder; the upstream tunnel-resolution SSOT (`resolve_tunnel_forwarding_resolution`)
+still stores the LOGICAL `egress_ifindex` + `tx_ifindex = 0` for a WG endpoint
+(see #2837), so the canonical wgN-TUN topology — where the kernel routes inner
+traffic to the wgN device and the WG control thread owns egress — is the
+primary path; this AF_XDP transit-egress builder is the secondary path (see the
+`frame/wg.rs` module header).
 
 **#2703 (outer TTL default).** A tunnel TTL of `0` is the "use the default
 64" sentinel in the Go config (`schema_interfaces.go`, `types_routing.go`),
