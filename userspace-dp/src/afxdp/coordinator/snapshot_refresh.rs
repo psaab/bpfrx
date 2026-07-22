@@ -2,9 +2,11 @@
 //! (pure code motion). Owns the armed/disarmed snapshot-apply legs
 //! (`refresh_runtime_snapshot{,_disarmed,_inner}`) — preflight policy
 //! validation, manager-neighbor key rotation, the #1873 tunnel-remap
-//! purge, the forwarding-state swap + worker-visible stores, the WG/GRE
-//! aux-thread reconcile or disarmed stop, and the post-apply CoS
-//! owner-map + neighbor-warm passes — plus `refresh_fabric_links`
+//! purge, the forwarding-state swap, the CoS owner/lease-map + fabric
+//! publish (#5166: BEFORE the `ha.forwarding` worker-visible store, so a
+//! live worker never sees new queue config without its CoS owners), the
+//! WG/GRE aux-thread reconcile or disarmed stop (after the forwarding
+//! store), and the neighbor-warm pass — plus `refresh_fabric_links`
 //! (the SyncFabricState path). The shared purge/log free helpers it
 //! calls (`tunnel_remap_purge_ids`, `log_wg_endpoint_set_transition`)
 //! stay in mod.rs: `reconcile/snapshot.rs` and tests outside this
@@ -351,6 +353,47 @@ impl super::Coordinator {
             &old_fabric_skips,
             &self.forwarding.fabric_skips,
         );
+        // #5166: publish the derived CoS owner/live/lease/backlog/vtime
+        // maps AND the fabric-link set BEFORE making the new
+        // ForwardingState worker-visible. A live worker refreshes its
+        // per-tick view in a FIXED order — it loads `shared_forwarding`
+        // first, then the CoS map Arcs (worker/loop_body/mod.rs), and
+        // rebuilds `cos_fast_interfaces` from whichever CoS maps it holds.
+        // With the pre-#5166 order (forwarding published first, CoS maps
+        // refreshed after), a worker could observe the new queue config
+        // while the CoS owner/lease maps still reflect the OLD generation
+        // for a tick: a newly added queue would have NO owner (transient
+        // class blackhole), an unchanged queue would meter at the stale
+        // rate, and per-worker leases could over-admit across N workers.
+        // `refresh_cos_owner_worker_map_from_identities` builds the maps
+        // off `self.forwarding` — already the new state since the swap
+        // above — so storing them first makes the invariant hold: because
+        // the worker loads forwarding then CoS in the same tick and the
+        // coordinator now stores CoS then forwarding, any worker that
+        // observes the new forwarding is guaranteed by ArcSwap acquire/
+        // release ordering to also observe the matching CoS maps. The
+        // reverse window (new CoS maps visible while a worker still reads
+        // the old forwarding) is benign: added queues are not classified
+        // to until forwarding rotates, and a removed queue merely loses a
+        // dying CoS entry for one tick. Pure reordering of coordinator-side
+        // stores — no new hot-path cost, no worker-side lock. The full
+        // reconcile path (reconcile/bringup.rs) already refreshes the CoS
+        // maps before spawning workers, so this brings the in-place refresh
+        // in line with that atomic-publish discipline.
+        self.refresh_cos_owner_worker_map_from_identities();
+        self.ha
+            .fabrics
+            .store(Arc::new(self.forwarding.fabrics.clone()));
+        // #5166 test seam: capture the CoS owner map at the instant just
+        // before forwarding becomes worker-visible. With the
+        // CoS-before-forwarding order above it already reflects the new
+        // generation; reverting the order captures the stale map, so the
+        // ordering regression test goes RED. Absent from release builds.
+        #[cfg(test)]
+        {
+            self.cos_owner_at_forwarding_publish =
+                Some(self.cos.owner_worker_by_queue.load().as_ref().clone());
+        }
         self.shared_validation.store(Arc::new(self.validation));
         self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
         // #1432 S2a (Copilot C1): reconcile WG control threads on every
@@ -360,17 +403,17 @@ impl super::Coordinator {
         // #1866 (Codex code-r2): NEVER on a disarmed helper — not even
         // transiently (the control loop binds + may emit an initiation
         // before its first stop check); stop anything present instead.
+        //
+        // #5166: still runs AFTER the forwarding store above — a fresh
+        // WG/GRE control thread's first `load_full()` must see the new
+        // forwarding state (the store-to-join window is covered by the
+        // thread-side rotation gate, tunnel.rs endpoint_attachment_valid).
         if spawn_wg {
             self.spawn_wg_control_threads();
             // #1881: reconcile GRE local-origin threads on every armed
             // runtime-snapshot refresh — tunnel interfaces are excluded
             // from the binding plan, so tunnel add/remove/reattach
-            // commits reach ONLY this path. Runs AFTER the forwarding
-            // swap + ha.forwarding.store above (same position as the WG
-            // reconcile): pass decisions and a fresh thread's first
-            // load_full() see the new state, and the store-to-join
-            // window is covered by the thread-side rotation gate
-            // (tunnel.rs endpoint_attachment_valid, plan D.1b).
+            // commits reach ONLY this path.
             self.reconcile_local_tunnel_sources();
         } else {
             self.stop_all_wg_control_threads("disarmed");
@@ -379,10 +422,6 @@ impl super::Coordinator {
             // reconcile_status_bindings → stop() already cleared them).
             self.stop_all_local_tunnel_sources("disarmed");
         }
-        self.refresh_cos_owner_worker_map_from_identities();
-        self.ha
-            .fabrics
-            .store(Arc::new(self.forwarding.fabrics.clone()));
         // #1636 option C: proactively warm configured next-hops so the
         // neighbor cache is hot before the first user flow. Non-forced:
         // the 1s snapshot-level rate-limit coalesces config storms.

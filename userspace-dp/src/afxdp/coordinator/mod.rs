@@ -299,6 +299,17 @@ pub struct Coordinator {
     /// (the field does not exist); per-instance so parallel tests never race.
     #[cfg(test)]
     pub(crate) synced_import_cap_override: usize,
+    /// #5166 test seam (per-instance, NOT a process-global): under
+    /// `cfg(test)`, `refresh_runtime_snapshot_inner` records a clone of the
+    /// `cos.owner_worker_by_queue` map here at the exact instant just before
+    /// it makes the new `ForwardingState` worker-visible (`ha.forwarding`
+    /// store). The ordering-regression test asserts this snapshot already
+    /// reflects the new generation's queues — i.e. the CoS maps are published
+    /// BEFORE forwarding. Reverting the #5166 reorder captures the stale map
+    /// and the test goes RED. Absent from release builds; per-instance so
+    /// parallel tests never race.
+    #[cfg(test)]
+    pub(crate) cos_owner_at_forwarding_publish: Option<BTreeMap<(i32, u8), u32>>,
     pub(crate) last_reconcile_stage: String,
     pub(crate) poll_mode: crate::PollMode,
     pub(crate) event_stream: Option<crate::event_stream::EventStreamSender>,
@@ -363,6 +374,8 @@ impl Coordinator {
             force_worker_bind_incomplete: 0,
             #[cfg(test)]
             synced_import_cap_override: 0,
+            #[cfg(test)]
+            cos_owner_at_forwarding_publish: None,
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
