@@ -181,12 +181,32 @@ pub(super) fn build_local_time_exceeded_request(
     if !can_generate_icmp_error_reply(frame, meta, forwarding) {
         return None;
     }
+    // #6102: resolve the LOGICAL ingress unit ONCE. `forwarding.egress`, the
+    // v4/v6 reply builders (each does `forwarding.egress.get(&ingress_ifindex)`),
+    // and `classify_generated_reply` are ALL keyed by the logical unit ifindex;
+    // `ingress_ident.ifindex` is the PHYSICAL AF_XDP bind port (#6046), which
+    // for a VLAN sub-interface is the physical PARENT — not this unit. Keying
+    // the build/classify on the physical index silently dropped the generated
+    // ICMP on a tagged sub-if with no untagged parent unit (egress miss →
+    // `?`-drop → traceroute `* * *` / PMTUD blackhole) and mis-classified it on
+    // one with a parent (parent's CoS / DSCP-rewrite / output filter). This
+    // mirrors the shipped reject (#3976) / SYN-cookie (#3035) precedent:
+    // resolve logical for build+classify, keep the PHYSICAL index for the XSK
+    // transmit (`target_ifindex`/`tx_ifindex`) and the #5856 per-zone rate-limit
+    // bucket below. For an untagged port logical == physical, so this is a
+    // literal no-op there.
+    let logical_ingress = resolve_ingress_logical_ifindex(
+        forwarding,
+        ingress_ident.ifindex,
+        meta.ingress_vlan_id,
+    )
+    .unwrap_or(ingress_ident.ifindex);
     // #5567: prove the reply FEASIBLE before touching the rate-limit token.
     // The egress lookup below and the v4/v6 builder each return None (a drop)
     // when the reply CANNOT be produced — no egress object for the ingress
-    // ifindex, no primary address of the inbound family, or an unparseable
+    // unit, no primary address of the inbound family, or an unparseable
     // trigger. Building first makes the build itself the feasibility proof.
-    let egress = forwarding.egress.get(&ingress_ident.ifindex)?;
+    let egress = forwarding.egress.get(&logical_ingress)?;
     let target_ifindex = if egress.bind_ifindex > 0 {
         egress.bind_ifindex
     } else {
@@ -194,10 +214,10 @@ pub(super) fn build_local_time_exceeded_request(
     };
     let prebuilt_frame = match meta.addr_family as i32 {
         libc::AF_INET => {
-            build_local_time_exceeded_v4(frame, meta, ingress_ident.ifindex, forwarding)
+            build_local_time_exceeded_v4(frame, meta, logical_ingress, forwarding)
         }
         libc::AF_INET6 => {
-            build_local_time_exceeded_v6(frame, meta, ingress_ident.ifindex, forwarding)
+            build_local_time_exceeded_v6(frame, meta, logical_ingress, forwarding)
         }
         _ => return None,
     }?;
@@ -212,9 +232,11 @@ pub(super) fn build_local_time_exceeded_request(
     //
     // #5856: the bucket is now PER INGRESS (from) ZONE, not a single global one
     // — resolved from the PHYSICAL ingress bind ifindex (`ingress_ident.ifindex`,
-    // the fixed per-binding socket-bind port, the same value the v4/v6 reply
-    // build + #3026 output-classify pass) via `ifindex_to_zone_id`. Unlike the
-    // #3618 reject path, this site does NOT call `resolve_ingress_logical_ifindex`:
+    // the fixed per-binding socket-bind port) via `ifindex_to_zone_id`. This is
+    // deliberately DISTINCT from the #6102 `logical_ingress` that keys the v4/v6
+    // reply build + #3026 output-classify: the rate-limit bucket stays PHYSICAL
+    // (per-physical-port), while build/classify resolve the logical unit. Unlike
+    // the #3618 reject path, this site does NOT call `resolve_ingress_logical_ifindex`:
     // a VLAN sub-interface resolves through its physical parent's
     // `ifindex_to_zone_id` entry (the parent inherits its first sub-interface's
     // zone), so VLAN sub-interfaces on the same physical port SHARE that port's
@@ -255,17 +277,21 @@ pub(super) fn build_local_time_exceeded_request(
     // flow could wrongly drop the ICMP error. A parse failure of our own
     // built bytes fails CLOSED (drop + dedicated counter, §6.2).
     //
-    // #3026: classify on the LOGICAL egress ifindex (`ingress_ident.ifindex`,
-    // the unit ifindex that keys `forwarding.egress`), NOT `target_ifindex`.
-    // CoS interfaces (forwarding_build/cos.rs) and output filters
-    // (filter/compiler.rs) are keyed by the logical unit ifindex; on a VLAN
-    // subinterface `bind_ifindex` (hence `target_ifindex`) is the physical
-    // parent index, so classifying by it missed the subinterface's CoS
-    // queue / DSCP rewrite / output filter. `target_ifindex` (physical) is
-    // still used for the XSK transmit below. For a non-VLAN port the logical
-    // and physical indexes coincide, so this is a no-op there.
+    // #3026/#6102: classify on the LOGICAL egress ifindex (`logical_ingress`,
+    // resolved above via `resolve_ingress_logical_ifindex`), NOT the physical
+    // `ingress_ident.ifindex` and NOT `target_ifindex`. CoS interfaces
+    // (forwarding_build/cos.rs) and output filters (filter/compiler.rs) are
+    // keyed by the logical unit ifindex; on a VLAN subinterface both the
+    // physical bind port (`ingress_ident.ifindex`) and `target_ifindex`
+    // (`egress.bind_ifindex`) are the physical parent, so classifying by
+    // either missed the subinterface's CoS queue / DSCP rewrite / output
+    // filter (#6102: pre-fix this passed the physical `ingress_ident.ifindex`,
+    // which the #3026 comment wrongly called "the LOGICAL egress ifindex").
+    // `target_ifindex` (physical) is still used for the XSK transmit below. For
+    // a non-VLAN port the logical and physical indexes coincide, so this is a
+    // no-op there.
     let verdict =
-        classify_generated_reply(forwarding, ingress_ident.ifindex, &prebuilt_frame, now_ns);
+        classify_generated_reply(forwarding, logical_ingress, &prebuilt_frame, now_ns);
     if verdict.drop {
         counters.touched = true;
         if verdict.parse_error {

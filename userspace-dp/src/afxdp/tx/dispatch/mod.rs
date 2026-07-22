@@ -255,18 +255,35 @@ fn compute_forwarded_egress_ptb(
                 // false-deny DoS). Mirrors the reject path's #3656 H11
                 // build-before-consume ordering; the suppression gate above
                 // still runs first, so no token is spent on a suppressed PTB.
+                // #6102: resolve the LOGICAL ingress unit for the reply BUILD.
+                // `build_frag_needed_v4`/`build_packet_too_big_v6` each do
+                // `forwarding.egress.get(&ingress_ifindex)` — egress is keyed by
+                // the logical unit ifindex, while `ingress_ident.ifindex` is the
+                // PHYSICAL bind port (#6046, a VLAN sub-if's physical parent).
+                // Passing the physical index silently dropped the PTB on a
+                // tagged sub-if with no untagged parent unit (egress miss →
+                // `?`-drop → PMTUD blackhole). Mirrors the reject (#3976) /
+                // cookie (#3035) precedent; the PHYSICAL index stays for the XSK
+                // transmit and the #5856 per-zone bucket below. Untagged: logical
+                // == physical (no-op).
+                let logical_ingress = resolve_ingress_logical_ifindex(
+                    forwarding,
+                    ingress_ident.ifindex,
+                    ptb_meta.ingress_vlan_id,
+                )
+                .unwrap_or(ingress_ident.ifindex);
                 let built = match meta.addr_family as i32 {
                     libc::AF_INET => build_frag_needed_v4(
                         source_frame,
                         ptb_meta,
-                        ingress_ident.ifindex,
+                        logical_ingress,
                         forwarding,
                         next_hop_mtu,
                     ),
                     libc::AF_INET6 => build_packet_too_big_v6(
                         source_frame,
                         ptb_meta,
-                        ingress_ident.ifindex,
+                        logical_ingress,
                         forwarding,
                         next_hop_mtu as u32,
                     ),
@@ -1298,16 +1315,29 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
             // by its OWN egress 5-tuple + egress interface, exactly like the
             // ICMP/ICMPv6 Time Exceeded (#2238), policy-`reject`, and
             // SYN-cookie generators. The PTB is L2-reflected back out the
-            // ingress interface, so `ingress_ident.ifindex` IS the egress (the
-            // same interface used for the enqueue below). Pre-#2328 the PTB
-            // enqueued an UNCLASSIFIED TxRequest (`cos_queue_id: None,
-            // dscp_rewrite: None`), so an output firewall filter terminal
-            // `discard`/`reject` keyed on the generated ICMP tuple never fired
-            // and CoS forwarding-class / DSCP rewrite were skipped. A parse
-            // failure of our own built bytes fails CLOSED (drop + dedicated
-            // parse-error counter, §6.2) rather than leaking past the filter.
+            // ingress interface. Pre-#2328 the PTB enqueued an UNCLASSIFIED
+            // TxRequest (`cos_queue_id: None, dscp_rewrite: None`), so an output
+            // firewall filter terminal `discard`/`reject` keyed on the generated
+            // ICMP tuple never fired and CoS forwarding-class / DSCP rewrite were
+            // skipped. A parse failure of our own built bytes fails CLOSED (drop
+            // + dedicated parse-error counter, §6.2) rather than leaking past the
+            // filter.
+            //
+            // #6102: `classify_generated_reply` is keyed by the LOGICAL unit
+            // ifindex, but `ingress_ident.ifindex` is the PHYSICAL bind port
+            // (#6046, a VLAN sub-if's physical parent). Resolve the logical unit
+            // so a tagged sub-if's OWN output filter / CoS is enforced (pre-fix
+            // the parent's — or first sub-if's — filter was applied). The
+            // enqueue below stays on the PHYSICAL `ingress_ident.ifindex` (the
+            // XSK transmit device). Untagged: logical == physical (no-op).
+            let logical_ingress = resolve_ingress_logical_ifindex(
+                forwarding,
+                ingress_ident.ifindex,
+                request.meta.ingress_vlan_id,
+            )
+            .unwrap_or(ingress_ident.ifindex);
             let verdict =
-                classify_generated_reply(forwarding, ingress_ident.ifindex, &ptb_bytes, now_ns);
+                classify_generated_reply(forwarding, logical_ingress, &ptb_bytes, now_ns);
             if verdict.drop {
                 counters.touched = true;
                 if verdict.parse_error {

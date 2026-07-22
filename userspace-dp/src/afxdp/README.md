@@ -94,12 +94,23 @@ sync.
         ifindex before the `ifindex_to_zone_id` lookup, so the correct
         screen profile applies (a parent-zone miss would otherwise SKIP
         screening entirely, or apply the wrong profile).
-      - **#3026 — generated ICMP error:** `icmp.rs` classifies the
-        generated reply (CoS queue / DSCP rewrite / output filter) on the
-        LOGICAL egress unit ifindex (`ingress_ident.ifindex`, the key for
-        `forwarding.egress`), NOT the physical `target_ifindex` /
-        `bind_ifindex`. `target_ifindex` (physical) is still used for the
-        XSK transmit.
+      - **#3026 / #6102 — generated ICMP error (Time Exceeded + egress-MTU
+        Packet-Too-Big):** `icmp.rs`
+        (`build_local_time_exceeded_request`) and the TX dispatch PTB path
+        (`compute_forwarded_egress_ptb` build + `enqueue_pending_forwards`
+        classify) resolve the LOGICAL egress unit ifindex once via the SSOT
+        (`resolve_ingress_logical_ifindex`, from the physical
+        `ingress_ident.ifindex` + `meta.ingress_vlan_id`) and key the egress
+        lookup, the reply BUILD, and the output-filter/CoS classify off THAT,
+        NOT the physical `ingress_ident.ifindex` / `target_ifindex` /
+        `bind_ifindex`. #6102 fixed the pre-existing gap where both keyed on
+        the physical index (the #3026 comment even mislabelled it "the LOGICAL
+        egress ifindex"): on a tagged sub-if with no untagged parent the egress
+        lookup missed and the generated ICMP was silently dropped (traceroute
+        `* * *` / PMTUD blackhole); with a parent it was mis-classified on the
+        parent's filter/CoS. `target_ifindex` (physical) is still used for the
+        XSK transmit, and the #5856 per-zone rate-limit bucket deliberately
+        stays keyed on the PHYSICAL `ingress_ident.ifindex`.
       - **#3035 — generated SYN-cookie / reject reply:**
         `poll_descriptor/cookie_reply.rs` (SYN-cookie SYN-ACK / ACK-RST)
         and `poll_descriptor/reject_reply.rs` (policy/filter `reject` TCP
@@ -122,7 +133,9 @@ sync.
         entry, the ICMP source and the VLAN tag were the parent's, not the
         sub-if's. The TCP RST build is self-contained (it reflects the
         inbound frame, no egress lookup) and is unaffected; this mirrors
-        the Time Exceeded builder, which already passed the logical unit.
+        the Time Exceeded / Packet-Too-Big builders, which resolve the same
+        logical unit (#6102 — before that fix they wrongly keyed the physical
+        index).
       - **#3609 — per-interface host-inbound override:** the local-delivery
         host-inbound gate (`poll_descriptor/filter.rs::host_inbound_gated_lo0_action`
         → `forwarding::host_inbound_admits_iface`) looks up

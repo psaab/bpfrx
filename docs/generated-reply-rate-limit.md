@@ -63,16 +63,21 @@ key was an API omission, not absence of attribution). All three reasons now use
     key off), so a VLAN sub-interface keys its OWN zone's bucket and a non-VLAN
     port resolves identically.
   - TimeExceeded (`icmp::build_local_time_exceeded_request`) and PacketTooBig
-    (the TX dispatch PTB path) key on the PHYSICAL ingress bind ifindex
-    (`ingress_ident.ifindex`, the fixed per-binding socket-bind port) WITHOUT
-    resolving the logical unit. For an untagged port physical == logical, so the
-    zone is exact; but VLAN sub-interfaces on the same physical port all resolve
-    through that port's `ifindex_to_zone_id` entry (the physical parent inherits
-    its FIRST sub-interface's zone — `forwarding_build/interfaces.rs`), so they
-    SHARE the physical port's TE/PTB bucket rather than getting a per-sub-interface
-    one. This is still correct and strictly better than the pre-#5856 single
-    global bucket (distinct physical ingress ports no longer starve each other);
-    it is simply coarser than the Reject path's per-logical-unit granularity.
+    (the TX dispatch PTB path) key the RATE-LIMIT BUCKET on the PHYSICAL ingress
+    bind ifindex (`ingress_ident.ifindex`, the fixed per-binding socket-bind
+    port) WITHOUT resolving the logical unit. For an untagged port physical ==
+    logical, so the zone is exact; but VLAN sub-interfaces on the same physical
+    port all resolve through that port's `ifindex_to_zone_id` entry (the physical
+    parent inherits its FIRST sub-interface's zone — `forwarding_build/interfaces.rs`),
+    so they SHARE the physical port's TE/PTB bucket rather than getting a
+    per-sub-interface one. This is still correct and strictly better than the
+    pre-#5856 single global bucket (distinct physical ingress ports no longer
+    starve each other); it is simply coarser than the Reject path's
+    per-logical-unit granularity. **This physical bucket keying is deliberate and
+    distinct from the reply BUILD + output CLASSIFY, which (post-#6102) DO resolve
+    the logical unit** via `resolve_ingress_logical_ifindex` — so a tagged sub-if
+    sources its reply from its own address/VLAN and enforces its own output
+    filter / CoS, while the per-zone amplification bound stays per-physical-port.
 - An unzoned (id 0) or otherwise-unknown from-zone falls back to the reason's
   process-global `{REJECT,TIME_EXCEEDED,PACKET_TOO_BIG}_FALLBACK_BUCKET` — a real
   bucket, so the gate is **never fail-open** and never panics on a missing key.
