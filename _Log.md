@@ -38,6 +38,77 @@
   origin/master (verified via `git diff --stat`); only the colocated test file
   changes. No docs update needed (no behavior/contract change).
 - **File(s)**: userspace-dp/src/afxdp/tests_gre_local_delivery.rs, _Log.md
+## 2026-07-22 — #5291: WG TUN-origin egress uses per-peer outer MTU
+
+- **Timestamp**: 2026-07-22 (fix/5291-wg-per-peer-outer-mtu)
+- **Action**: Fixed the TUN-origin WireGuard egress guard applying ONE
+  first-peer `outer_mtu` scalar to every peer. `resolve_wg_outer_mtu`
+  picks the first endpoint-bearing peer's underlay MTU into a scalar
+  captured at spawn (#2921); `encap_and_send` used that scalar for the
+  peer LPM-selected by inner destination (`engine.peer_for_dest`), so a
+  multi-peer tunnel with asymmetric underlays size-checked non-first-peer
+  egress against the wrong underlay (frag/drop). #2845/#3219 fixed only
+  the AF_XDP transit/PTB path. New `Coordinator::resolve_wg_per_peer_
+  outer_mtus` resolves the underlay MTU per peer (keyed by pubkey) via a
+  shared `resolve_underlay_egress_mtu` SSOT, handed by value into the
+  control thread (`WgControlEntry.spawned_per_peer_outer_mtu` +
+  `wg_control_loop`/`run_wg_control_loop` new param). The TUN egress site
+  sizes the SELECTED peer against `per_peer.get(pk).unwrap_or(scalar)` —
+  a peer absent from the map (learned/roamed endpoint) falls back to the
+  scalar (pre-#5291 behaviour). The #2921 restart gate now compares the
+  whole per-peer map so a NON-first peer's MTU change (which moves no
+  scalar) still refreshes the thread. Single-peer/homogeneous tunnels are
+  byte-identical.
+- **Validation**: `cargo build` clean; new tests + `wg`/`tunnel` suites
+  pass (264 + 100). Two fail-on-revert tests: `wg_tun_origin_egress_uses_
+  per_peer_outer_mtu_5291` (wg_control_tests.rs) drives `run_wg_control_
+  loop` with a pipe-as-TUN, 2-peer engine, per-peer map {peerB:1400} +
+  scalar 1500; a 1400B inner to peer B's AllowedIPs (encapped 1468B)
+  DROPS at peer B's 1400 guard (`encap_mtu_drops==1`) — reverting the
+  call-site to the 1500 scalar makes it 0 (verified RED). `wg5291_per_
+  peer_outer_mtu_resolves_distinct_underlays` (tests.rs) resolves two
+  peers over separate underlays (1500/1400) and asserts the captured map
+  is {A:1500,B:1400} — collapsing the resolver to the first-peer scalar
+  yields {1500,1500} (verified RED).
+- **File(s)**: userspace-dp/src/afxdp/coordinator/tunnel_supervision.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control_tests.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/types/runtime.rs, docs/wireguard-interop.md,
+  _Log.md
+## 2026-07-22 — #4962: atomic install + cold-prime decision in handleNewConnection
+
+- **Timestamp**: 2026-07-22 (fix/4962-handlenewconnection-race)
+- **Action**: Fixed the async `handleNewConnection` race where two
+  concurrent same-fabric accepts (per-accept goroutine, post-#4370) could
+  DROP the cold-prime bulk. The pre-fix code read `wasDisconnected` under
+  `s.mu` but used it AFTER unlock: accept A installs `connA` from an empty
+  registry and cold-primes it; accept B locks after A, observes `connA`
+  (non-empty registry → `wasDisconnected=false`), closes `connA` (aborting
+  A's in-flight bulk), installs `connB` as the survivor, and hit the
+  `becameActive` branch → NO cold-prime. The surviving `connB` never
+  re-pushed the authoritative session table, so the peer blackholed
+  established flows on the next failover. #4090's survivor re-drive does
+  NOT cover it: A's write failure calls `handleDisconnect(connA)`, a stale
+  disconnect (`conn0==connB`) that is ignored. Fix: extracted `installConn`
+  which wires `conn0`/`conn1` AND computes the `connColdPrimeDecision`
+  under the SAME `s.mu` acquisition, backed by a new `needColdPrime` latch
+  — armed on a full-disconnect→connect edge, consumed only when a bulk
+  SUCCEEDS. `shouldColdPrime = becameActive && needColdPrime`, so a
+  superseding accept INHERITS the outstanding obligation and re-drives the
+  bulk on the survivor. Both attempts serialize on `bulkSendMu` and target
+  `getActiveConn` → idempotent (same correctness-over-optimization tradeoff
+  as #5480). Steady state unchanged: routine single-fabric flips (latch
+  discharged) do not re-bulk.
+- **File(s)**: `pkg/cluster/sync.go` (needColdPrime field),
+  `pkg/cluster/sync_conn.go` (installConn + connColdPrimeDecision + gate),
+  `pkg/cluster/sync_conn_race_4962_test.go` (new, 3 tests incl. -race),
+  `docs/session-sync-architecture.md`, `pkg/cluster/README.md`.
+- **Validation**: `go build ./...` clean; `go vet ./pkg/cluster/` clean;
+  new tests pass under `-race`; full `pkg/cluster` suite green;
+  fail-on-revert confirmed (reverting the decision to
+  `becameActive && wasDisconnected` fails
+  `TestHandleNewConnectionRaceDoesNotAbortWinnerBulk4962`).
 
 ## 2026-07-21 — #6178: input-vlan-map / output-vlan-map honesty gate
 

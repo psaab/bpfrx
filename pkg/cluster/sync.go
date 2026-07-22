@@ -463,7 +463,25 @@ type SessionSync struct {
 	// debounced goroutine to re-run doBulkSync over the survivor; this CAS
 	// flag bounds it to a single in-flight re-drive so a survivor that ALSO
 	// flaps cannot cause a re-drive storm.
-	bulkRedriveInFlight        atomic.Bool
+	bulkRedriveInFlight atomic.Bool
+	// needColdPrime latches the outstanding cold-prime obligation across the
+	// per-accept goroutines (#4962). It is armed under s.mu on a full
+	// disconnect -> connect transition (both fabric slots were empty) and
+	// consumed (cleared) only when a cold-prime bulk actually SUCCEEDS. Because
+	// handleNewConnection now runs per-accept (post-#4370), two same-fabric
+	// accepts can race: the first observes the empty registry and installs, the
+	// second observes the first's connection and supersedes it — closing it and
+	// aborting the first's in-flight cold-prime bulk. The pre-#4962 gate
+	// recomputed wasDisconnected from the post-supersession registry, so the
+	// surviving (second) connection saw a non-empty registry and SKIPPED
+	// cold-prime: the peer never received the authoritative session table and
+	// blackholed established flows on the next failover. The latch lets the
+	// surviving connection INHERIT the obligation and re-drive the bulk. Like
+	// forceResync it is a plain atomic.Bool; the narrow window where a newer
+	// full-disconnect epoch's arm is cleared by an older epoch's success
+	// self-heals via forceResync / the #4090 survivor re-drive / the next
+	// reconnect.
+	needColdPrime              atomic.Bool
 	bulkMu                     sync.Mutex
 	bulkInProgress             bool
 	bulkRecvEpoch              uint64

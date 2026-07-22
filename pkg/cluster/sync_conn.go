@@ -574,39 +574,13 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 		s.handleMessage(conn, pending.typ, pending.payload)
 	}
 
-	s.mu.Lock()
-	wasDisconnected := s.conn0 == nil && s.conn1 == nil
-	activeBefore := -1
-	if s.conn0 != nil {
-		activeBefore = 0
-	} else if s.conn1 != nil {
-		activeBefore = 1
-	}
-	hadConn0 := s.conn0 != nil
-	hadConn1 := s.conn1 != nil
-	switch fabricIdx {
-	case 0:
-		if s.conn0 != nil {
-			s.conn0.Close()
-		}
-		s.conn0 = conn
-	case 1:
-		if s.conn1 != nil {
-			s.conn1.Close()
-		}
-		s.conn1 = conn
-	}
-	activeAfter := -1
-	if s.conn0 != nil {
-		activeAfter = 0
-	} else if s.conn1 != nil {
-		activeAfter = 1
-	}
-	s.stats.Connected.Store(true)
-	s.lastPeerRxMono.Store(MonotonicNanos())
-	s.mu.Unlock()
-	becameActive := activeAfter == fabricIdx
-	slog.Info("cluster sync: handling new connection", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "was_disconnected", wasDisconnected, "active_before", activeBefore, "active_after", activeAfter, "became_active", becameActive, "had_conn0", hadConn0, "had_conn1", hadConn1)
+	// #4962: install the connection and DECIDE cold-prime atomically under
+	// s.mu. Computing the decision after unlock (the pre-#4962 shape) let a
+	// racing same-fabric accept supersede this connection between the unlock and
+	// the decision's use, so the surviving connection could DROP cold-prime (see
+	// installConn / the needColdPrime doc in sync.go).
+	d := s.installConn(fabricIdx, conn)
+	slog.Info("cluster sync: handling new connection", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "was_disconnected", d.wasDisconnected, "active_before", d.activeBefore, "active_after", d.activeAfter, "became_active", d.becameActive, "should_cold_prime", d.shouldColdPrime, "had_conn0", d.hadConn0, "had_conn1", d.hadConn1)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -614,8 +588,8 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	}()
 	s.sendClockSync(conn)
 	coldStart := !s.bulkEverCompleted.Load()
-	if wasDisconnected {
-		slog.Info("cluster sync: first connection after disconnect", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "cold_start", coldStart)
+	if d.shouldColdPrime {
+		slog.Info("cluster sync: driving authoritative cold-prime bulk on active connection", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "cold_start", coldStart, "was_disconnected", d.wasDisconnected)
 		s.flushDeleteJournal()
 		if s.OnPeerConnected != nil {
 			slog.Info("cluster sync: scheduling OnPeerConnected callback", "fabric", fabricIdx)
@@ -674,12 +648,95 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 			if forcedConsumed {
 				s.forceResync.Store(true)
 			}
+		} else {
+			// #4962: the authoritative cold-prime landed on the (surviving)
+			// active connection, discharging the outstanding obligation. Consume
+			// the needColdPrime latch so routine single-fabric flips do NOT
+			// re-bulk; a later full-disconnect epoch re-arms it via installConn.
+			// On FAILURE the latch stays armed, so the next accept that becomes
+			// active re-drives the bulk instead of dropping it.
+			s.needColdPrime.Store(false)
 		}
-	} else if becameActive {
-		slog.Info("cluster sync: active fabric changed, resuming incremental sync", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "active_before", activeBefore, "active_after", activeAfter)
+	} else if d.becameActive {
+		slog.Info("cluster sync: active fabric changed, resuming incremental sync", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "active_before", d.activeBefore, "active_after", d.activeAfter)
 	} else {
 		slog.Info("cluster sync: connection added without bulk sync", "fabric", fabricIdx, "remote", connRemoteAddrString(conn))
 	}
+}
+
+// connColdPrimeDecision is the atomically-computed outcome of installing a sync
+// connection into a fabric slot (#4962): which fabric was active before/after,
+// whether this connection became the active fabric, and whether it must drive
+// the authoritative cold-prime bulk. All fields are derived under s.mu together
+// with the conn0/conn1 install so the decision is consistent with the registry
+// state it was computed from — a racing supersession cannot invalidate it.
+type connColdPrimeDecision struct {
+	wasDisconnected bool
+	becameActive    bool
+	shouldColdPrime bool
+	activeBefore    int
+	activeAfter     int
+	hadConn0        bool
+	hadConn1        bool
+}
+
+// installConn wires conn into the fabric slot (superseding and closing any
+// existing same-fabric connection) and returns the cold-prime decision computed
+// ATOMICALLY with that install under s.mu (#4962).
+//
+// The needColdPrime latch is armed here on a full disconnect -> connect edge
+// (both slots were empty) and consumed by handleNewConnection only when a
+// cold-prime bulk SUCCEEDS. shouldColdPrime is therefore true whenever THIS
+// connection is the active fabric AND a cold-prime is still owed for the current
+// connected epoch — so a second same-fabric accept that supersedes an in-flight
+// cold-prime INHERITS the obligation rather than dropping it. Computing the
+// decision under the same lock that installs the connection is the fix's core:
+// the pre-#4962 code read wasDisconnected under the lock but USED it after
+// unlock, where a concurrent accept could already have changed the registry.
+func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDecision {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := connColdPrimeDecision{activeBefore: -1, activeAfter: -1}
+	d.wasDisconnected = s.conn0 == nil && s.conn1 == nil
+	if s.conn0 != nil {
+		d.activeBefore = 0
+	} else if s.conn1 != nil {
+		d.activeBefore = 1
+	}
+	d.hadConn0 = s.conn0 != nil
+	d.hadConn1 = s.conn1 != nil
+	switch fabricIdx {
+	case 0:
+		if s.conn0 != nil {
+			s.conn0.Close()
+		}
+		s.conn0 = conn
+	case 1:
+		if s.conn1 != nil {
+			s.conn1.Close()
+		}
+		s.conn1 = conn
+	}
+	if s.conn0 != nil {
+		d.activeAfter = 0
+	} else if s.conn1 != nil {
+		d.activeAfter = 1
+	}
+	s.stats.Connected.Store(true)
+	s.lastPeerRxMono.Store(MonotonicNanos())
+	// #4962: arm the cold-prime obligation on a full-disconnect -> connect edge.
+	// The latch outlives this goroutine so a superseding same-fabric accept
+	// still sees the obligation even though it observes a non-empty registry.
+	if d.wasDisconnected {
+		s.needColdPrime.Store(true)
+	}
+	d.becameActive = d.activeAfter == fabricIdx
+	// #4962: commit the decision under the lock. becameActive means this
+	// connection is now the active fabric; needColdPrime means the cold-prime
+	// for this connected epoch has not yet succeeded. Both are read here, atomic
+	// with the install above.
+	d.shouldColdPrime = d.becameActive && s.needColdPrime.Load()
+	return d
 }
 
 func (s *SessionSync) Start(ctx context.Context) error {

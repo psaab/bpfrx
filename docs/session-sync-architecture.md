@@ -374,6 +374,53 @@ one redundant bulk on a full-reconnect flap. A more surgical fix that keeps the
 #466 flap-suppression would need a peer boot-incarnation field in the sync
 handshake — a wire change tracked on #5480 and deferred.
 
+### Atomic Install + Cold-Prime Decision (#4962)
+
+Post-#4370 `handleNewConnection` runs **per-accept in its own goroutine**, so two
+same-fabric accepts can race. The pre-#4962 code read `wasDisconnected` under
+`s.mu` but **used it after unlock** to gate `OnPeerConnected` + `doBulkSync`.
+From a fully-disconnected registry the two accepts interleave:
+
+- **Accept A** observes the empty registry (`wasDisconnected`), installs `connA`,
+  and starts cold-priming it.
+- **Accept B** locks *after* A, observes `connA` (a **non-empty** registry),
+  closes `connA` (aborting A's in-flight bulk), and installs `connB` as the
+  surviving active connection.
+
+Because B recomputed `wasDisconnected` from the post-supersession registry it saw
+`false`, so B skipped cold-prime and hit the `becameActive` "resume incremental"
+branch. The surviving connection `connB` therefore **never re-pushed the
+authoritative session table** — the peer stayed un-primed and blackholed every
+established flow on the next failover to it. (This is distinct from the #4090
+survivor re-drive: when B closes `connA`, A's write failure calls
+`handleDisconnect(connA)`, which is a **stale** disconnect — `conn0` is already
+`connB` — so it is ignored and #4090 never fires.)
+
+The fix makes the install and the cold-prime decision **atomic** under `s.mu`
+(`installConn`, returning a `connColdPrimeDecision`), backed by a `needColdPrime`
+latch:
+
+- `needColdPrime` is armed under `s.mu` on a full-disconnect→connect edge (both
+  fabric slots were empty) and **consumed only when a cold-prime bulk actually
+  succeeds** (`doBulkSync() == nil`). On failure it stays armed.
+- `shouldColdPrime = becameActive && needColdPrime`, both read under the same
+  lock that installs the connection. A superseding same-fabric accept therefore
+  **inherits** the outstanding obligation instead of dropping it, even though it
+  observes a non-empty registry.
+
+So in the race B now cold-primes `connB`. Both A and B may call `doBulkSync`;
+they serialize on `bulkSendMu` and each targets `getActiveConn` (the survivor),
+so the redundant attempt is idempotent — the same correctness-over-optimization
+tradeoff as #5480. The latch also generalizes the #4090 intent into the accept
+path: if a cold-prime never succeeded, the next connection that becomes the
+active fabric re-drives it. Steady state is unchanged: once a cold-prime
+succeeds the latch clears, and routine single-fabric flips (obligation
+discharged) do not re-bulk.
+
+`needColdPrime` is a plain `atomic.Bool` like `forceResync`; the narrow window
+where a newer full-disconnect epoch's arm is cleared by an older epoch's success
+self-heals via `forceResync` / the #4090 survivor re-drive / the next reconnect.
+
 ## Incremental Sweep and Delete Journal
 
 ### Background Sweep

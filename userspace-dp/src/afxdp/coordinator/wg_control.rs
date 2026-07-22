@@ -124,6 +124,7 @@ pub(super) fn wg_control_loop(
     engine: Arc<crate::afxdp::wg::WgEngine>,
     listen_port: u16,
     outer_mtu: usize,
+    per_peer_outer_mtu: std::collections::HashMap<[u8; 32], usize>,
     recent_exceptions: Arc<Mutex<ExceptionEventRing>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -193,6 +194,7 @@ pub(super) fn wg_control_loop(
         socket_is_v6,
         tun,
         outer_mtu,
+        &per_peer_outer_mtu,
         &recent_exceptions,
         &stop,
     );
@@ -336,6 +338,7 @@ fn run_wg_control_loop(
     socket_is_v6: bool,
     mut tun: std::fs::File,
     outer_mtu: usize,
+    per_peer_outer_mtu: &std::collections::HashMap<[u8; 32], usize>,
     recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     stop: &AtomicBool,
 ) {
@@ -535,6 +538,15 @@ fn run_wg_control_loop(
                         WgCounters::bump(&engine.counters().tun_rx_drops_no_endpoint);
                         continue;
                     };
+                    // #5291: size THIS peer's encap against ITS OWN
+                    // underlay MTU (cryptokey routing picked `pk`/`ep`
+                    // for the inner dst), mirroring the AF_XDP transit
+                    // path's per-peer resolution (#2845/#3219). A peer
+                    // whose per-peer MTU was unresolvable at spawn
+                    // (learned/roamed endpoint) falls back to the
+                    // interface-level scalar — the pre-#5291 behaviour.
+                    let peer_outer_mtu =
+                        per_peer_outer_mtu.get(&pk).copied().unwrap_or(outer_mtu);
                     encap_and_send(
                         engine,
                         socket,
@@ -543,7 +555,7 @@ fn run_wg_control_loop(
                         ep,
                         inner,
                         &mut encap_buf,
-                        outer_mtu,
+                        peer_outer_mtu,
                         tunnel_name,
                         recent_exceptions,
                     );
@@ -1539,8 +1551,12 @@ fn encap_and_send(
 ) {
     // Exact pad-aware MTU guard (plan §4.3 / AGY H1) — symmetric with the
     // transit-egress guard in frame/wg.rs, AND against the SAME MTU model
-    // (#2300): `outer_mtu` is the real underlay-egress MTU resolved at
-    // spawn, not the old `WG_OUTER_MTU = 1500` hardcode. Drop oversize
+    // (#2300): `outer_mtu` is the real underlay-egress MTU, not the old
+    // `WG_OUTER_MTU = 1500` hardcode. #5291: the caller resolves this
+    // PER PEER (the SELECTED peer's underlay, via `per_peer_outer_mtu`),
+    // so a multi-peer tunnel with asymmetric underlays sizes each peer's
+    // encap against its own path — matching the transit path's per-peer
+    // resolution (#2845/#3219). Drop oversize
     // inner rather than emitting an outer datagram the kernel must
     // fragment. The wgN TUN MTU (Go-side) is the first line; this is
     // defense-in-depth for a mis-set MTU or a jumbo inner read off the TUN.

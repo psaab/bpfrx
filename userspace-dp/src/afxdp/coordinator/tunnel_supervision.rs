@@ -561,7 +561,10 @@ impl super::Coordinator {
                         });
                     if !attach_ok {
                         Some("attachment_changed")
-                    } else if self.resolve_wg_outer_mtu(*id) != entry.spawned_outer_mtu {
+                    } else if self.resolve_wg_outer_mtu(*id) != entry.spawned_outer_mtu
+                        || self.resolve_wg_per_peer_outer_mtus(*id)
+                            != entry.spawned_per_peer_outer_mtu
+                    {
                         // #2921: the WG identity tuple ignores the underlay
                         // route/table/egress MTU, so a same-engine refresh
                         // reuses the Arc and keeps the spawn-time
@@ -571,7 +574,10 @@ impl super::Coordinator {
                         // changed, restart the thread so the local TUN path
                         // enforces the SAME current outer MTU as the
                         // transit/forwarded path (which re-resolves per
-                        // snapshot).
+                        // snapshot). #5291: the same staleness applies to the
+                        // PER-PEER map — a non-first peer's underlay MTU
+                        // change moves no scalar, so compare the whole map so
+                        // every peer's TUN-origin guard stays current.
                         Some("outer_mtu_changed")
                     } else {
                         None
@@ -708,10 +714,27 @@ impl super::Coordinator {
         // declares an endpoint gives the underlay-MTU egress route. A
         // tunnel with no configured endpoint (responder-only /
         // learn-only) uses the default; the transit-egress guard applies
-        // the real egress MTU for routed WG.
+        // the real egress MTU for routed WG. This scalar is the
+        // interface-level FALLBACK the TUN-origin guard uses for a peer
+        // whose per-peer MTU is unresolvable at spawn (learned/roamed
+        // endpoint) — see `resolve_wg_per_peer_outer_mtus` (#5291).
         let Some(peer) = endpoint.wg_peers.iter().find_map(|p| p.endpoint) else {
             return crate::afxdp::coordinator::wg_control::WG_DEFAULT_OUTER_MTU;
         };
+        self.resolve_underlay_egress_mtu(endpoint, peer.ip())
+    }
+
+    /// The resolved OUTER (underlay) egress MTU for one peer endpoint IP
+    /// on the given tunnel endpoint's transport table. Shared by the
+    /// interface-level scalar (`resolve_wg_outer_mtu`) and the per-peer
+    /// map (`resolve_wg_per_peer_outer_mtus`, #5291) so both sample the
+    /// SAME underlay-MTU SSOT the transit-egress guard (frame/wg.rs)
+    /// uses. Falls back to `WG_DEFAULT_OUTER_MTU` when no route resolves.
+    fn resolve_underlay_egress_mtu(
+        &self,
+        endpoint: &crate::afxdp::TunnelEndpoint,
+        peer_ip: std::net::IpAddr,
+    ) -> usize {
         let table = if endpoint.transport_table.is_empty() {
             None
         } else {
@@ -720,7 +743,7 @@ impl super::Coordinator {
         let resolution = lookup_forwarding_resolution_in_table_with_dynamic(
             &self.forwarding,
             self.dynamic_neighbors_ref(),
-            peer.ip(),
+            peer_ip,
             table,
         );
         self.forwarding
@@ -731,8 +754,55 @@ impl super::Coordinator {
             .unwrap_or(crate::afxdp::coordinator::wg_control::WG_DEFAULT_OUTER_MTU)
     }
 
+    /// #5291: resolve the OUTER (underlay) egress MTU PER PEER for a WG
+    /// endpoint, keyed by peer public key. The TUN-origin egress guard
+    /// selects the peer that owns the inner destination's AllowedIPs
+    /// (`peer_for_dest`, cryptokey routing) and encaps toward THAT peer's
+    /// endpoint, so its MTU guard must size against THAT peer's underlay
+    /// — mirroring how the AF_XDP transit path already resolves per-peer
+    /// (`wg_endpoint_physical_outer_mtu` / `wg_peer_outer_dst`, #2845/
+    /// #3219). Before this the control thread captured ONE first-peer
+    /// scalar (`resolve_wg_outer_mtu`) at spawn and applied it to every
+    /// peer, so multi-peer tunnels with asymmetric underlay MTUs sized
+    /// non-first-peer egress against the wrong underlay (frag or
+    /// over-conservative drop; #2921 kept the first-peer capture).
+    ///
+    /// Only peers with a CONFIGURED endpoint (known at spawn) are
+    /// resolved here — the coordinator's `forwarding` state is not
+    /// reachable from the spawned control thread, so a learned/roamed
+    /// endpoint cannot be route-looked-up per packet there. A peer absent
+    /// from this map falls back to the interface-level scalar
+    /// (`resolve_wg_outer_mtu`), i.e. the exact pre-#5291 behaviour for
+    /// that peer. The map stays fresh across underlay-MTU changes via the
+    /// #2921 spawn-time-capture restart (extended to compare this map).
+    ///
+    /// Bit-identical in the single-peer / homogeneous-underlay case: each
+    /// endpoint-bearing peer resolves to the same underlay MTU the scalar
+    /// would, so a per-peer lookup returns the same value the scalar did.
+    fn resolve_wg_per_peer_outer_mtus(
+        &self,
+        id: u16,
+    ) -> std::collections::HashMap<[u8; 32], usize> {
+        let mut per_peer = std::collections::HashMap::new();
+        let Some(endpoint) = self.forwarding.tunnel_endpoints.get(&id) else {
+            return per_peer;
+        };
+        for peer in &endpoint.wg_peers {
+            if let Some(ep) = peer.endpoint {
+                per_peer.insert(peer.pubkey, self.resolve_underlay_egress_mtu(endpoint, ep.ip()));
+            }
+        }
+        per_peer
+    }
+
     fn spawn_one_wg_control_thread(&mut self, id: u16) {
         let outer_mtu = self.resolve_wg_outer_mtu(id);
+        // #5291: per-peer underlay MTU snapshot handed into the control
+        // thread alongside the scalar fallback, so the TUN-origin egress
+        // guard sizes each peer against its OWN underlay (matching the
+        // AF_XDP transit path). Resolved at spawn while `forwarding` is
+        // reachable; kept fresh by the #2921 restart-on-MTU-change gate.
+        let per_peer_outer_mtu = self.resolve_wg_per_peer_outer_mtus(id);
         let Some(endpoint) = self.forwarding.tunnel_endpoints.get(&id) else {
             return;
         };
@@ -757,6 +827,7 @@ impl super::Coordinator {
         let stop_clone = stop.clone();
         let recent_exceptions = self.recent_exceptions.clone();
         let thread_tunnel_name = tunnel_name.clone();
+        let thread_per_peer_outer_mtu = per_peer_outer_mtu.clone();
         eprintln!(
             "xpf-userspace-dp: spawning WG control thread endpoint={id} tun={tunnel_name} port={listen_port}"
         );
@@ -769,6 +840,7 @@ impl super::Coordinator {
                     engine,
                     listen_port,
                     outer_mtu,
+                    thread_per_peer_outer_mtu,
                     recent_exceptions,
                     stop_clone,
                 );
@@ -803,6 +875,7 @@ impl super::Coordinator {
                 spawned_ifindex,
                 spawned_tunnel_name: tunnel_name,
                 spawned_outer_mtu: outer_mtu,
+                spawned_per_peer_outer_mtu: per_peer_outer_mtu,
                 last_spawn_attempt_ns: monotonic_nanos(),
             },
         );
