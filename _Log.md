@@ -56541,3 +56541,11 @@ top.
   header->Go parity canary t.Skips when the header is absent). Regenerated
   manifest via cmd/shim-manifest. Verified: fsatomic+dataplane green;
   editing xpf_common.h now trips the freshness test; src-edit coverage intact.
+
+## 2026-07-22 — #6234 server/helpers split (audit-183 cohort)
+- **Action**: Convert `server/helpers.rs` (1.4k-line cold-path grab-bag) into a
+  `server/helpers/` directory module; extract HA session-sync reconstruction
+  into `session_sync.rs`. Pure code-motion, bodies byte-for-byte identical;
+  `mod.rs` re-exports so all `server::helpers::<name>` call sites are unchanged.
+- **File(s)**: server/helpers.rs -> server/helpers/mod.rs (git mv);
+  server/helpers/session_sync.rs (new). Build: userspace-dp cargo build green.
