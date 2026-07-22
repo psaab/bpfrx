@@ -832,6 +832,20 @@ under the daemon's errgroup. Nothing else imports this package.
     longer issue unbounded full-table scans; over-cap gRPC scans return
     `codes.ResourceExhausted`. A mix of REST + gRPC scrapers cannot collectively
     exceed `diagcmd.MaxConcurrentSessionWalks`.
+    **#6216 extends the SAME gate to `natPoolStatsHandler`
+    (`GET /security/nat/source/pools`)**, whose interface-mode `UsedPorts`
+    accounting (#3417 above) drives the identical full conntrack walk via
+    `IterateSessions` and previously bypassed the aggregate bound entirely — a
+    scrape flood of the NAT-pool-stats endpoint could each drive a concurrent
+    unbounded walk, contending with session installs on the shared control
+    socket. The handler now `AcquireCtx`es a slot BEFORE the walk (429 on
+    over-cap: `nat pool stats concurrency limit reached; retry shortly`),
+    honors the returned admission-lease context inside the `IterateSessions`
+    callback (stops early on client disconnect), and releases on every exit
+    path. Pinned by `nat_pool_stats_walk_limiter_6216_test.go` (RED-on-revert).
+    Note: only the interface-mode session-walk arm is gated; the pool-mode rows
+    read the helper's live `SourceNATPoolStatus` (no table walk) and need no
+    admission slot.
     **#5880 makes the shared limiter request-graph-aware to fix a reentrant
     double-acquire.** A REST list/summary/zone-pair handler acquires a slot and
     then delegates IN-PROCESS to the gRPC session service for `include_peer`
