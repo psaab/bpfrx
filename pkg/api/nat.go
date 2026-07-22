@@ -114,7 +114,7 @@ func (s *Server) natDestHandler(w http.ResponseWriter, _ *http.Request) {
 	writeOK(w, result)
 }
 
-func (s *Server) natPoolStatsHandler(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
 		writeOK(w, []NATPoolStatsInfo{})
@@ -227,6 +227,21 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, _ *http.Request) {
 	}
 	ruleSetUsed := map[[2]string]int{}
 	if hasInterfaceRule && s.dp != nil && s.dp.IsLoaded() {
+		// #6216: this full-table session walk must draw from the shared
+		// sessionWalkLimiter (#5708/#5433) like every other REST scan
+		// endpoint, so a burst of NAT-pool-stats requests cannot each drive
+		// an unbounded IterateSessions concurrently and starve session
+		// installs / the periodic sweep on the shared control socket. Acquire
+		// once at this external trust boundary and honor the returned
+		// admission-lease context for early cancellation on client disconnect.
+		release, walkCtx, err := sessionWalkLimiter.AcquireCtx(r.Context())
+		if err != nil {
+			writeError(w, http.StatusTooManyRequests,
+				"nat pool stats concurrency limit reached; retry shortly")
+			return
+		}
+		defer release()
+
 		// Map zone ID -> name so the per-session ingress/egress zone IDs can
 		// be attributed to the configured from/to zone pair. Without the zone
 		// map (no apply result yet) attribution is impossible, so rows report
@@ -239,6 +254,9 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 		if err := s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if walkCtx.Err() != nil {
+				return false // client gone / lease cancelled — stop the walk
+			}
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 && zoneByID != nil {
 				ruleSetUsed[[2]string{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
 			}

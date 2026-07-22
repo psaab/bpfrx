@@ -1,3 +1,23 @@
+## 2026-07-21 — #6216: bound natPoolStatsHandler session walk via sessionWalkLimiter
+
+- **Timestamp**: 2026-07-21 (fix/6216-natpoolstats-limiter)
+- **Action**: `natPoolStatsHandler`'s interface-mode `UsedPorts` accounting
+  (#3417) drove an unbounded `IterateSessions` full-table walk with no
+  admission gate and no context-cancel — unlike every other REST scan endpoint,
+  which draws from the shared `sessionWalkLimiter` (#5708/#5433). A scrape flood
+  of `GET /security/nat/source/pools` could each drive a concurrent unbounded
+  walk, contending with session installs on the shared control socket. Named the
+  ignored `*http.Request`, `AcquireCtx`ed a slot before the walk (429 on
+  over-cap), honored the admission-lease context inside the iterate callback
+  (early-stop on disconnect), and released on every exit path.
+- **File(s)**: pkg/api/nat.go, pkg/api/nat_pool_stats_walk_limiter_6216_test.go,
+  pkg/api/README.md
+- **Validation**: `go build ./...` clean; new
+  `TestNatPoolStatsRespectsWalkLimiter6216` PASSES (429 when the shared slot is
+  held) + existing natPoolStats tests green; firsthand parent-RED confirmed
+  target-count 1. Scoped to the limiter/ctx bound; v6-table counting for
+  interface-mode rows is a separate behavior change, deferred.
+
 ## 2026-07-21 — #6215: ParseQueueCommand queue-id bounds check
 
 - **Timestamp**: 2026-07-21 (fix/6215-parsequeuecommand-bounds)
