@@ -56541,3 +56541,18 @@ top.
   header->Go parity canary t.Skips when the header is absent). Regenerated
   manifest via cmd/shim-manifest. Verified: fsatomic+dataplane green;
   editing xpf_common.h now trips the freshness test; src-edit coverage intact.
+
+## 2026-07-22 — #6314: join the neighbor warmer aux thread at teardown
+- **Action**: Make the #1636 neighbor WARMER consistent with its two
+  #5165-hardened siblings (monitor + resolver). Retain the warmer's
+  JoinHandle (`warm_join`, no longer `.ok()`-discarded), log spawn
+  failures instead of swallowing them, and deterministically JOIN the
+  warmer at teardown via `stop_and_join_warmer` (signal `warm_stop` +
+  drop the producer + join). Fail-on-revert test
+  `neighbor_warmer_joined_at_teardown_6314` (target-count 1, RED by
+  assertion under the drop-only teardown). Full Rust suite green; named
+  test 3x no-flake.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/neighbor_manager.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/README.md

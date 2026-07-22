@@ -542,13 +542,15 @@ impl Coordinator {
         // the monitor's 500ms SO_RCVTIMEO) is the real no-mutation-after-stop
         // guard, mirroring the resolver join below.
         self.neighbors.stop_and_join_monitor();
-        // #1636: stop the neighbor warmer and drop the producer handle so
-        // the worker's recv side disconnects and it exits cleanly. The
-        // 500ms recv timeout bounds the join latency.
-        if let Some(warm_stop) = self.neighbors.warm_stop.take() {
-            warm_stop.store(true, Ordering::Relaxed);
-        }
-        self.neighbors.warm_queue = None;
+        // #1636 / #6314: stop the neighbor warmer, drop the producer handle so
+        // the worker's recv side disconnects, and JOIN it — mirroring the
+        // monitor (above) and resolver (below) siblings. Signalling + dropping
+        // the queue alone left the warmer detached (the pre-#5165 odd-one-out):
+        // a warmer blocked in recv_timeout could fire one stray ARP/NDP solicit
+        // or mutate `last_probed_at` after this teardown cleared the dataplane.
+        // Joining (bounded by the warmer's 500ms recv timeout) is the real
+        // no-mutation-after-stop guard.
+        self.neighbors.stop_and_join_warmer();
         // #1769: stop the on-demand resolver. Signal stop, drop the
         // producer handle so the recv side disconnects promptly, then
         // JOIN the worker before returning. Joining (not just signalling)
