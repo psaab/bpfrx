@@ -13,7 +13,6 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
@@ -23,6 +22,63 @@ const FRAME_SIZE: u32 = 4096;
 const FRAME_COUNT: u32 = 4096;
 const HEADROOM: u32 = 256;
 const XDP_OBJ: &[u8] = include_bytes!("xdp_pass_redirect.o");
+
+// UAPI XDP attach flags (linux/if_link.h).
+const XDP_FLAGS_UPDATE_IF_NOEXIST: u32 = 1 << 0;
+const XDP_FLAGS_REPLACE: u32 = 1 << 4;
+
+/// #4906 HC-101: RAII guard around the XDP attach so the program is (a) never
+/// attached over an existing one and (b) always detached — but only if it is
+/// still ours — even if a later step panics. The previous code attached with
+/// flags=0 (silently replacing whatever was on the interface, e.g. the firewall
+/// dataplane) and detached to prog=-1 unconditionally; a panic after attach also
+/// skipped the manual detach entirely, potentially stripping the NIC of its XDP
+/// program.
+struct XdpAttachment {
+    ifindex: i32,
+    prog_fd: i32,
+}
+
+impl XdpAttachment {
+    fn attach(ifindex: u32, prog_fd: i32) -> io::Result<Self> {
+        // UPDATE_IF_NOEXIST => -EBUSY if a program is already attached, so we
+        // never clobber the firewall's redirect program.
+        let rc = unsafe {
+            libbpf_sys::bpf_xdp_attach(
+                ifindex as i32,
+                prog_fd,
+                XDP_FLAGS_UPDATE_IF_NOEXIST,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(-rc));
+        }
+        Ok(XdpAttachment { ifindex: ifindex as i32, prog_fd })
+    }
+}
+
+impl Drop for XdpAttachment {
+    fn drop(&mut self) {
+        // XDP_FLAGS_REPLACE + old_prog_fd => the kernel only detaches if the
+        // hook still holds OUR program; if something else took it over, the
+        // detach is refused and their program is left intact.
+        let mut opts: libbpf_sys::bpf_xdp_attach_opts = unsafe { std::mem::zeroed() };
+        opts.sz = std::mem::size_of::<libbpf_sys::bpf_xdp_attach_opts>() as _;
+        opts.old_prog_fd = self.prog_fd;
+        let rc = unsafe {
+            libbpf_sys::bpf_xdp_detach(self.ifindex, XDP_FLAGS_REPLACE, &opts)
+        };
+        if rc != 0 {
+            eprintln!(
+                "  XDP detach skipped/failed ({}) — hook not ours anymore",
+                io::Error::from_raw_os_error(-rc)
+            );
+        } else {
+            eprintln!("  XDP detached");
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -44,8 +100,25 @@ fn main() {
     let (prog_fd, map_fd) = load_xdp_prog();
     eprintln!("  prog_fd={} xsk_map_fd={}", prog_fd, map_fd);
 
-    // Attach XDP
-    attach_xdp(ifindex, prog_fd);
+    // Attach XDP (RAII: refuses to replace an existing program; detaches — only
+    // if still ours — on drop, including on panic unwind). #4906 HC-101.
+    let xdp = match XdpAttachment::attach(ifindex, prog_fd) {
+        Ok(x) => x,
+        Err(e) => {
+            if e.raw_os_error() == Some(libc::EBUSY) {
+                eprintln!(
+                    "  interface already has an XDP program; refusing to replace \
+                     it (would clobber the firewall dataplane). Detach it first \
+                     if this is intended."
+                );
+            } else {
+                eprintln!("  bpf_xdp_attach failed: {}", e);
+            }
+            unsafe { libc::close(prog_fd) };
+            unsafe { libc::close(map_fd) };
+            std::process::exit(1);
+        }
+    };
     eprintln!("  XDP attached");
 
     // Start background traffic generator (sends UDP to self)
@@ -60,42 +133,74 @@ fn main() {
     let rx1 = run_xsk_phase(iface, queue, map_fd, use_copy, Duration::from_secs(3));
     eprintln!("Phase 1 rx: {}", rx1);
 
+    // #4906 HC-090: only run the rebind phase if the link actually cycled. The
+    // previous code ignored `ip link` failures (missing binary, no capability,
+    // interface refusal) and proceeded to phase 2 regardless — turning a no-op
+    // into a misleading PASS/FAIL. Command::new does not use a shell, so the
+    // interface name is never interpreted; here we additionally check status.
     eprintln!("\n=== Link DOWN/UP on {} ===", iface);
     eprintln!("  ip link set {} down", iface);
-    std::process::Command::new("ip").args(["link", "set", iface, "down"]).status().ok();
-    std::thread::sleep(Duration::from_millis(200));
-    eprintln!("  ip link set {} up", iface);
-    std::process::Command::new("ip").args(["link", "set", iface, "up"]).status().ok();
-    eprintln!("  waiting 500ms for NIC reinit...");
-    std::thread::sleep(Duration::from_millis(500));
+    let down_ok = std::process::Command::new("ip")
+        .args(["link", "set", iface, "down"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let link_cycled = if down_ok {
+        std::thread::sleep(Duration::from_millis(200));
+        eprintln!("  ip link set {} up", iface);
+        std::process::Command::new("ip")
+            .args(["link", "set", iface, "up"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
 
-    // XDP program survives link cycle (it's attached to the netdev)
-    eprintln!("\n=== Phase 2: Rebind ({}) on {} queue {} ===", mode_str, iface, queue);
-    let rx2 = run_xsk_phase(iface, queue, map_fd, use_copy, Duration::from_secs(3));
-    eprintln!("Phase 2 rx: {}", rx2);
+    let mut rx2 = 0u64;
+    if link_cycled {
+        eprintln!("  waiting 500ms for NIC reinit...");
+        std::thread::sleep(Duration::from_millis(500));
+        // XDP program survives link cycle (it's attached to the netdev)
+        eprintln!("\n=== Phase 2: Rebind ({}) on {} queue {} ===", mode_str, iface, queue);
+        rx2 = run_xsk_phase(iface, queue, map_fd, use_copy, Duration::from_secs(3));
+        eprintln!("Phase 2 rx: {}", rx2);
+    } else {
+        eprintln!(
+            "Link DOWN/UP cycle did not complete — skipping phase 2 (rebind); \
+             result is INCONCLUSIVE."
+        );
+    }
 
     // Stop traffic
     traffic_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = traffic_handle.join();
 
-    // Detach XDP
-    detach_xdp(ifindex);
-    eprintln!("  XDP detached");
-
+    // Detach XDP explicitly (drop runs the REPLACE-guarded detach) BEFORE we
+    // close prog_fd — the detach's old_prog_fd check needs a valid fd — and
+    // before process::exit, which would otherwise skip the Drop.
+    drop(xdp);
     unsafe { libc::close(prog_fd) };
     unsafe { libc::close(map_fd) };
 
     eprintln!();
-    if rx1 > 0 && rx2 > 0 {
+    let code = if !link_cycled {
+        eprintln!("RESULT: INCONCLUSIVE  (link DOWN/UP did not run)  phase1_rx={}", rx1);
+        2
+    } else if rx1 > 0 && rx2 > 0 {
         eprintln!("RESULT: PASS  phase1_rx={} phase2_rx={}", rx1, rx2);
+        0
     } else if rx1 > 0 && rx2 == 0 {
         eprintln!("RESULT: FAIL  (broken after link cycle)  phase1_rx={} phase2_rx=0", rx1);
+        1
     } else if rx1 == 0 {
         eprintln!("RESULT: FAIL  (no rx even on initial bind)  phase1_rx=0 phase2_rx={}", rx2);
+        1
     } else {
         eprintln!("RESULT: UNEXPECTED  phase1_rx={} phase2_rx={}", rx1, rx2);
-    }
-    std::process::exit(if rx1 > 0 && rx2 > 0 { 0 } else { 1 });
+        1
+    };
+    std::process::exit(code);
 }
 
 fn run_xsk_phase(iface: &str, queue: u32, xsk_map_fd: i32, use_copy: bool, duration: Duration) -> u64 {
@@ -112,92 +217,117 @@ fn run_xsk_phase(iface: &str, queue: u32, xsk_map_fd: i32, use_copy: bool, durat
         &mut *std::ptr::slice_from_raw_parts_mut(area_ptr.cast::<u8>(), area_size)
     });
 
-    let cfg = UmemConfig {
-        fill_size: FRAME_COUNT,
-        complete_size: FRAME_COUNT,
-        frame_size: FRAME_SIZE,
-        headroom: HEADROOM,
-        flags: 0,
-    };
-    let umem = unsafe { Umem::new(cfg, area_slice) }.expect("create umem");
+    // #4906 HC-091: keep every xdpilone owner (umem / socket / device / rx /
+    // user) inside this block so they are all dropped BEFORE we munmap the
+    // backing memory below. The previous code munmap'd `area_ptr` while these
+    // owners were still in scope, so their Drop ran against memory that had
+    // already been unmapped (teardown fault / race).
+    let total_rx = {
+        let cfg = UmemConfig {
+            fill_size: FRAME_COUNT,
+            complete_size: FRAME_COUNT,
+            frame_size: FRAME_SIZE,
+            headroom: HEADROOM,
+            flags: 0,
+        };
+        let umem = unsafe { Umem::new(cfg, area_slice) }.expect("create umem");
 
-    let mut info = IfInfo::invalid();
-    info.from_ifindex(if_nametoindex(iface)).expect("ifindex lookup");
-    info.set_queue(queue);
+        let mut info = IfInfo::invalid();
+        info.from_ifindex(if_nametoindex(iface)).expect("ifindex lookup");
+        info.set_queue(queue);
 
-    let sock = Socket::with_shared(&info, &umem).expect("create socket");
-    let mut device = umem.fq_cq(&sock).expect("create fq/cq");
+        let sock = Socket::with_shared(&info, &umem).expect("create socket");
+        let mut device = umem.fq_cq(&sock).expect("create fq/cq");
 
-    let mut offsets = Vec::with_capacity(FRAME_COUNT as usize);
-    for idx in 0..FRAME_COUNT {
-        if let Some(frame) = umem.frame(BufIdx(idx)) {
-            offsets.push(frame.offset);
-        }
-    }
-
-    // Prime fill ring BEFORE bind
-    {
-        let mut fill = device.fill(offsets.len() as u32);
-        let inserted = fill.insert(offsets.iter().copied());
-        fill.commit();
-        eprintln!("  fill ring primed: {}/{}", inserted, offsets.len());
-    }
-
-    let bind_flags = if use_copy {
-        SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_COPY
-    } else {
-        SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY
-    };
-    let sock_cfg = SocketConfig {
-        rx_size: std::num::NonZeroU32::new(FRAME_COUNT),
-        tx_size: std::num::NonZeroU32::new(256),
-        bind_flags,
-    };
-    let user = umem.rx_tx(&sock, &sock_cfg).expect("bind rx/tx");
-    let mut rx = user.map_rx().expect("map rx ring");
-    let user_fd = user.as_raw_fd();
-    let mode = if use_copy { "copy" } else { "zero-copy" };
-    eprintln!("  bound fd={} {}", user_fd, mode);
-
-    // Register in xskmap
-    xskmap_update(xsk_map_fd, queue, user_fd as u32);
-    eprintln!("  xskmap[{}] = fd {}", queue, user_fd);
-
-    // Trigger NAPI
-    for _ in 0..20 {
-        let fd = device.as_raw_fd();
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        unsafe { libc::poll(&mut pfd, 1, 1) };
-        unsafe { libc::sendto(fd, std::ptr::null(), 0, libc::MSG_DONTWAIT, std::ptr::null(), 0) };
-        std::thread::yield_now();
-    }
-
-    // Receive loop
-    let start = Instant::now();
-    let mut total_rx = 0u64;
-    let mut poll_count = 0u64;
-    while start.elapsed() < duration {
-        let available = rx.available();
-        if available > 0 {
-            let mut recv = rx.receive(available);
-            while recv.read().is_some() {
-                total_rx += 1;
+        let mut offsets = Vec::with_capacity(FRAME_COUNT as usize);
+        for idx in 0..FRAME_COUNT {
+            if let Some(frame) = umem.frame(BufIdx(idx)) {
+                offsets.push(frame.offset);
             }
-            let needed = available.min(offsets.len() as u32);
-            let mut fill = device.fill(needed);
-            fill.insert(offsets.iter().take(needed as usize).copied());
+        }
+
+        // Prime fill ring BEFORE bind
+        {
+            let mut fill = device.fill(offsets.len() as u32);
+            let inserted = fill.insert(offsets.iter().copied());
             fill.commit();
+            eprintln!("  fill ring primed: {}/{}", inserted, offsets.len());
+        }
+
+        let bind_flags = if use_copy {
+            SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_COPY
         } else {
-            poll_count += 1;
+            SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY
+        };
+        let sock_cfg = SocketConfig {
+            rx_size: std::num::NonZeroU32::new(FRAME_COUNT),
+            tx_size: std::num::NonZeroU32::new(256),
+            bind_flags,
+        };
+        let user = umem.rx_tx(&sock, &sock_cfg).expect("bind rx/tx");
+        let mut rx = user.map_rx().expect("map rx ring");
+        let user_fd = user.as_raw_fd();
+        let mode = if use_copy { "copy" } else { "zero-copy" };
+        eprintln!("  bound fd={} {}", user_fd, mode);
+
+        // Register in xskmap
+        xskmap_update(xsk_map_fd, queue, user_fd as u32);
+        eprintln!("  xskmap[{}] = fd {}", queue, user_fd);
+
+        // Trigger NAPI
+        for _ in 0..20 {
             let fd = device.as_raw_fd();
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            unsafe { libc::poll(&mut pfd, 1, 10) };
+            unsafe { libc::poll(&mut pfd, 1, 1) };
+            unsafe { libc::sendto(fd, std::ptr::null(), 0, libc::MSG_DONTWAIT, std::ptr::null(), 0) };
+            std::thread::yield_now();
         }
-    }
-    eprintln!("  rx={} empty_polls={}", total_rx, poll_count);
 
-    // Cleanup
-    xskmap_delete(xsk_map_fd, queue);
+        // Receive loop
+        let start = Instant::now();
+        let mut total_rx = 0u64;
+        let mut poll_count = 0u64;
+        while start.elapsed() < duration {
+            let available = rx.available();
+            if available > 0 {
+                // #4906 HC-069: capture the address of every descriptor we
+                // actually consume, then release the RX reads and hand exactly
+                // those frames (chunk-aligned base) back to the fill ring.
+                //
+                // The previous loop (a) never called recv.release(), so the
+                // #[must_use] ReadRx cancelled the peek on Drop and the same
+                // descriptors were re-read every iteration — inflating total_rx
+                // — and (b) re-inserted the first `needed` ORIGINAL offsets
+                // regardless of what was consumed, double-owning frames on the
+                // fill ring.
+                let mut recv = rx.receive(available);
+                let mut recycle: Vec<u64> = Vec::with_capacity(recv.capacity() as usize);
+                while let Some(desc) = recv.read() {
+                    total_rx += 1;
+                    recycle.push(desc.addr & !((FRAME_SIZE as u64) - 1));
+                }
+                recv.release();
+                drop(recv);
+                if !recycle.is_empty() {
+                    let mut fill = device.fill(recycle.len() as u32);
+                    fill.insert(recycle.iter().copied());
+                    fill.commit();
+                }
+            } else {
+                poll_count += 1;
+                let fd = device.as_raw_fd();
+                let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                unsafe { libc::poll(&mut pfd, 1, 10) };
+            }
+        }
+        eprintln!("  rx={} empty_polls={}", total_rx, poll_count);
+
+        // Deregister before the sockets/umem drop at the end of this block.
+        xskmap_delete(xsk_map_fd, queue);
+        total_rx
+    };
+
+    // Safe now: all UMEM/socket owners have been dropped above.
     unsafe { libc::munmap(area_ptr, area_size) };
     total_rx
 }
@@ -248,16 +378,21 @@ fn get_interface_ip(iface: &str) -> Option<[u8; 4]> {
 // --- BPF helpers ---
 
 fn load_xdp_prog() -> (i32, i32) {
-    // Write XDP object to temp file
-    let obj_path = "/tmp/xdp_pass_redirect.o";
-    std::fs::write(obj_path, XDP_OBJ).expect("write XDP obj");
-
-    // Use libbpf to load
-    let cpath = CString::new(obj_path).unwrap();
-
-    // Open object
-    let obj = unsafe { libbpf_sys::bpf_object__open(cpath.as_ptr()) };
-    assert!(!obj.is_null(), "bpf_object__open failed");
+    // #4906 HC-025: load the object straight from the compiled-in bytes with
+    // bpf_object__open_mem instead of writing/reading a predictable
+    // /tmp/xdp_pass_redirect.o. The old code did `std::fs::write("/tmp/...")`
+    // as root, which a pre-planted symlink could redirect to clobber an
+    // arbitrary file, and then loaded from that world-writable-namespace path.
+    // Loading from memory removes the filesystem path entirely (no symlink /
+    // TOCTOU window, no chance of loading a substituted object).
+    let obj = unsafe {
+        libbpf_sys::bpf_object__open_mem(
+            XDP_OBJ.as_ptr() as *const _,
+            XDP_OBJ.len() as u64,
+            std::ptr::null(),
+        )
+    };
+    assert!(!obj.is_null(), "bpf_object__open_mem failed");
 
     // Load programs
     let rc = unsafe { libbpf_sys::bpf_object__load(obj) };
@@ -280,15 +415,6 @@ fn load_xdp_prog() -> (i32, i32) {
     // Don't close obj — keep fds alive
     // Leak intentionally: the fds must survive until we detach
     (prog_fd, map_fd)
-}
-
-fn attach_xdp(ifindex: u32, prog_fd: i32) {
-    let rc = unsafe { libbpf_sys::bpf_xdp_attach(ifindex as i32, prog_fd, 0, std::ptr::null()) };
-    assert_eq!(rc, 0, "bpf_xdp_attach failed: {}", io::Error::last_os_error());
-}
-
-fn detach_xdp(ifindex: u32) {
-    unsafe { libbpf_sys::bpf_xdp_attach(ifindex as i32, -1, 0, std::ptr::null()) };
 }
 
 fn xskmap_update(map_fd: i32, key: u32, value: u32) {
