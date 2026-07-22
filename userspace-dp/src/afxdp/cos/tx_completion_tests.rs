@@ -825,7 +825,7 @@ fn advance_cos_timer_wheel_returns_ticks_advanced() {
 // #1782 Step-2 (i) test 1: lag exactly EQUAL to the wheel horizon
 // with a parked queue takes the existing per-tick loop and wakes the
 // due park exactly as before. NOTE (Codex r1 Low): because this test
-// parks a queue, it exercises the parked-refusal path, NOT the `>`
+// parks a queue, it exercises the strict >-horizon fast-forward boundary, NOT the `>`
 // vs `>=` gate boundary — with no parked queue, snap and loop are
 // state-indistinguishable at exactly-horizon lag (both empty every
 // slot and land on the same tick; AGY r1 confirmed `>=` would also
