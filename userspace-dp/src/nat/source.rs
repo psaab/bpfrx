@@ -839,11 +839,32 @@ fn release_source_nat_allocation_with_mode(
 /// (`release_source_nat_allocation`, already called for every reaped or
 /// delete-synced session) frees the reservation — no new delete site.
 ///
-/// A synced session WITHOUT a translated source port (no source NAT, or
-/// address-only / `port no-translation`) reserves nothing. If the synced pool
-/// address is not a member of ANY local pool (config drift between nodes), the
-/// reserve is skipped gracefully — it never panics and never fabricates a
-/// reservation on the wrong pool.
+/// A synced session with NO source NAT at all (`rewrite_src` unset — plain
+/// forwarding) reserves nothing. If the synced pool address is not a member of
+/// ANY local pool (config drift between nodes), the reserve is skipped
+/// gracefully — it never panics and never fabricates a reservation on the wrong
+/// pool.
+///
+/// #5338: an ADDRESS-ONLY source-NAT decision (`port no-translation` on a
+/// port-bearing protocol, or a port-less protocol such as GRE/ESP) carries a
+/// pool `rewrite_src` but NO `rewrite_src_port` — the wire keeps the packet's
+/// own source port. The ACTIVE node (#5336 round-robin/persistent, #5341
+/// deterministic-CGNAT) still MINTS a reverse-identity occupancy token for such
+/// a flow via [`PortAllocator::reserve_address_only`], keyed on the translated
+/// reverse identity (protocol, pool address, PRESERVED source port, remote), so
+/// the reverse (1:N) index can disambiguate which internal flow owns a given
+/// public tuple. The standby must mint the SAME token for a synced address-only
+/// session; otherwise, after failover to it, its reverse index cannot
+/// disambiguate the promoted session (and a fresh local address-only flow could
+/// claim the same public identity the reverse index cannot tell apart). This
+/// mirrors the active-node mint here; NO pool PORT bit is consumed. The token is
+/// freed by the SAME teardown path as a PAT port
+/// (`release_source_nat_allocation` -> `PortAllocator::release_flow`, already
+/// called for every reaped or delete-synced session) — no new delete site. The
+/// #6207 `deterministic` threading applies ONLY to the port-bearing
+/// [`PortAllocator::reserve_flow`] arm; an address-only token carries no port
+/// bit, so — exactly like the active node's #5341 path — it mints via the plain
+/// `reserve_address_only` regardless of the pool's allocation mode.
 pub(crate) fn reserve_synced_source_nat_allocation(
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
@@ -856,19 +877,46 @@ pub(crate) fn reserve_synced_source_nat_allocation(
     let Some(rewrite_src) = nat.rewrite_src else {
         return;
     };
-    let Some(rewrite_src_port) = nat.rewrite_src_port else {
-        return;
-    };
-    let translated = TranslatedTuple {
-        ip: rewrite_src,
-        port: rewrite_src_port,
-    };
     let flow = SourceNatFlowKey {
         protocol: key.protocol,
         src_ip: key.src_ip,
         dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
         src_port: key.src_port,
         dst_port: key.dst_port,
+    };
+    // #5338: address-only synced decision (pool address chosen, source port
+    // PRESERVED on the wire). Mint the reverse-identity occupancy token on the
+    // rule whose pool owns `rewrite_src`, mirroring the active node's #5336/#5341
+    // mint so the reverse 1:N index disambiguates identically. A collision on the
+    // standby (`Err` — a local flow already owns the identity) or a foreign pool
+    // address (no pool member) leaves the rule untouched and tries the next,
+    // matching the port-bearing arm's per-rule fall-through and the config-drift
+    // skip.
+    let Some(rewrite_src_port) = nat.rewrite_src_port else {
+        for rule in rules {
+            if !rule.pool_mode {
+                continue;
+            }
+            let in_pool = match rewrite_src {
+                IpAddr::V4(v4) => rule.pool_addresses_v4.iter().any(|a| *a == v4),
+                IpAddr::V6(v6) => rule.pool_addresses_v6.iter().any(|a| *a == v6),
+            };
+            if !in_pool {
+                continue;
+            }
+            if rule
+                .pool_allocator
+                .reserve_address_only(flow, rewrite_src)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        return;
+    };
+    let translated = TranslatedTuple {
+        ip: rewrite_src,
+        port: rewrite_src_port,
     };
     for rule in rules {
         if !rule.pool_mode {

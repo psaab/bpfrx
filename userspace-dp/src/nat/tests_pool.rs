@@ -4226,10 +4226,12 @@ fn synced_deterministic_reservation_not_recycled_5178() {
     );
 }
 
-// #4388: a peer-synced session WITHOUT a source-NAT translation (no
-// rewrite_src / rewrite_src_port — plain forwarding, address-only, or `port
-// no-translation`) reserves nothing. The allocator stays empty and a new flow
-// gets the first pool port.
+// #4388: a peer-synced session WITHOUT any source-NAT translation (no
+// `rewrite_src` at all — plain forwarding) reserves nothing. The allocator stays
+// empty and a new flow gets the first pool port. (An ADDRESS-ONLY decision —
+// `rewrite_src` set, `rewrite_src_port` None — now DOES mint a reverse-identity
+// token per #5338; that case is exercised by
+// `synced_address_only_session_reserves_reverse_identity_token_5338`.)
 #[test]
 fn synced_session_without_nat_reserves_nothing_4388() {
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
@@ -4319,6 +4321,106 @@ fn synced_reverse_entry_reserves_nothing_4388() {
         rules[0].pool_allocator.debug_occupied_count(),
         0,
         "a reverse synced entry must not reserve a pool source port"
+    );
+}
+
+// #5338 FAIL-ON-REVERT: a peer-synced ADDRESS-ONLY source-NAT session (`port
+// no-translation` — a pool ADDRESS is chosen but the source port is PRESERVED on
+// the wire, so the decision carries `rewrite_src = Some(pool_addr)` but NO
+// `rewrite_src_port`) must mint the SAME reverse-identity occupancy token on the
+// STANDBY that the active node minted (#5336 round-robin / #5341 deterministic),
+// so the reverse (1:N) index can disambiguate the promoted session after
+// failover.
+//
+// Before the fix `reserve_synced_source_nat_allocation` early-returned when
+// `rewrite_src_port` was None, so the standby minted NO token: its
+// `address_only_owners` map stayed empty and a fresh local address-only flow to
+// the SAME public identity was admitted as an UNOWNED duplicate the reverse
+// index could not tell apart from the synced session — the exact #5269
+// collision class the active node closes. Reverting the address-only arm
+// (restoring the `let Some(rewrite_src_port) = nat.rewrite_src_port else {
+// return; };` skip) makes the "token minted" + "colliding local flow denied"
+// assertions RED.
+#[test]
+fn synced_address_only_session_reserves_reverse_identity_token_5338() {
+    // One-address `port no-translation` pool: address-only, source port preserved.
+    let rules = one_address_notrans_rule();
+
+    // A peer-synced ADDRESS-ONLY session: the active node chose pool address
+    // 203.0.113.1 and PRESERVED the source port (`rewrite_src_port` None).
+    let synced_key = session_key_from_src("10.0.1.100", 12345, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.1".parse().unwrap()),
+        rewrite_src_port: None,
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false);
+
+    // THE FAIL-ON-REVERT ASSERTION (mint): the standby minted the reverse-
+    // identity token for the synced flow. On revert the map is empty.
+    let synced_flow = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "10.0.1.100".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 12345,
+        dst_port: 443,
+    };
+    let owners = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(
+        owners.len(),
+        1,
+        "standby must mint one address-only occupancy token for the synced session"
+    );
+    assert_eq!(
+        owners[0].1, synced_flow,
+        "reverse index must resolve to the synced flow"
+    );
+    assert_eq!(
+        owners[0].0.translated_ip,
+        "203.0.113.1".parse::<IpAddr>().unwrap()
+    );
+    // The PRESERVED source port keys the reverse identity.
+    assert_eq!(owners[0].0.translated_port, 12345);
+
+    // No pool PORT bit is consumed (address-only tokens are off the port bitmap).
+    assert_eq!(
+        rules[0].pool_allocator.debug_occupied_count(),
+        0,
+        "an address-only reservation must not claim a pool-port bit"
+    );
+
+    // THE FAIL-ON-REVERT ASSERTION (disambiguation): a fresh LOCAL address-only
+    // flow to the SAME public identity (one-address pool forces 203.0.113.1;
+    // SAME preserved port + remote) must now be DENIED as exhaustion — the
+    // standby already owns that reverse identity from the synced session. On
+    // revert it is `Matched` with `rewrite_src_port: None`, an unowned duplicate
+    // the reverse index cannot disambiguate from the synced session.
+    match addr_only_lookup(&rules, "10.0.1.200", 12345, "8.8.8.8", 443, PROTO_TCP) {
+        SourceNatLookup::Unavailable(f) => assert_eq!(
+            f.reason,
+            SourceNatFailureReason::AllocatorExhausted,
+            "a local flow colliding with the synced reverse identity must fail closed",
+        ),
+        other => panic!("colliding local flow must be denied (exhaustion), got {other:?}"),
+    }
+    // The synced session STILL owns the identity uniquely — the denied local flow
+    // minted nothing.
+    let owners_after = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(
+        owners_after.len(),
+        1,
+        "denied local flow must not add a token"
+    );
+    assert_eq!(owners_after[0].1, synced_flow);
+
+    // Teardown of the synced session (standby reap / delete-sync) frees the token
+    // via the SAME `release_source_nat_allocation` path — no new delete site.
+    release_source_nat_allocation(&rules, &synced_key, synced_nat, false, 1_000);
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        0,
+        "releasing the synced session must free its address-only token (no leak)"
     );
 }
 

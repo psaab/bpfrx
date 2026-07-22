@@ -459,13 +459,30 @@ source tuple (reply mis-delivery / a session-hijack surface).
   `owner_by_translated` / `addr_index_by_translated` / `live_by_flow` state a
   normal allocation writes, keyed by the synced session's flow. The sequential
   port cursor (`claim_free_port_locked`) then skips the reserved port, exactly
-  as it already skips a live local allocation (#3047 forward-probe).
+  as it already skips a live local allocation (#3047 forward-probe). The #5178
+  `deterministic` flag mirrors the active node's allocation mode so the standby's
+  release takes `free_no_recycle` for a deterministic-CGNAT reservation.
+- **Address-only reserve (#5338):** an ADDRESS-ONLY decision (`port
+  no-translation` on a port-bearing protocol, or a port-less protocol such as
+  GRE/ESP) carries `rewrite_src` (the pool address) but NO `rewrite_src_port` —
+  the wire keeps the packet's own source port. The active node (#5269/#5336
+  round-robin/persistent, #5341 deterministic) mints a reverse-identity
+  occupancy token for such a flow via `PortAllocator::reserve_address_only`
+  (keyed on protocol, pool address, PRESERVED source port, remote) so its
+  reverse (1:N) index can disambiguate the public tuple. The synced reserve now
+  mirrors that mint on the standby: the address-only arm claims the SAME token on
+  the rule whose pool owns `rewrite_src`, consuming NO pool-port bit. Without it,
+  a promoted standby could not disambiguate the synced address-only session's
+  replies and a fresh local address-only flow could claim the same public
+  identity. Like the port-bearing arm, a collision (a local flow already owns the
+  identity) or a foreign pool address is skipped gracefully.
 - **Release site:** the reservation uses the synced flow key, so the standard
   teardown — `release_source_nat_allocation`, already called on GC reap
   (`reap_expired_sessions`), on a peer delete-sync (`handle_delete_synced`), and
-  on DSCP-filter purge — frees it with no new delete path. A reverse synced
-  entry, an address-only / `port no-translation` decision, or a session with no
-  source NAT reserves nothing.
+  on DSCP-filter purge — frees it with no new delete path (the address-only token
+  is cleared from `address_only_owners` by the same `release_flow`). A reverse
+  synced entry, or a session with no source NAT at all (`rewrite_src` unset),
+  reserves nothing.
 - **Config-drift edge:** if the synced pool address is not a member of any local
   pool (the two nodes' pool config diverged), the reserve is skipped gracefully
   — never a panic, never a reservation on the wrong pool.
