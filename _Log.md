@@ -56344,3 +56344,17 @@ top.
   #6312 (JSON resync id-drop), #6313 (reverse-materialize test).
 - **File(s)**: docs/sync-protocol.md, userspace-dp/src/session/README.md,
   userspace-dp/src/session/install.rs, userspace-dp/src/session/tests.rs
+
+## 2026-07-22 — #6204: pciAddrToEnp parses PCI function as decimal
+- **Action**: Fixed `pciAddrToEnp` (pkg/daemon/daemon_reth.go) to parse the PCI
+  FUNCTION field base-10 instead of base-16. systemd's ID_NET_NAME_PATH builtin
+  scans the sysfs address with `sscanf("%x:%x:%x.%u")` — domain/bus/slot HEX,
+  function DECIMAL — matching the kernel's `"%04x:%02x:%02x.%d"` sysfs naming
+  (verified against systemd source + kernel uapi/linux/pci.h). The prior hex
+  parse matched only for single-digit funcs 0-9; a func >= 10 (ARI / SR-IOV
+  multi-function, e.g. `0000:65:00.10`) was misread as 0x10=16 → enp101s0f16
+  instead of enp101s0f10, resolving the wrong RETH member. Corrected the
+  function's doc comment (it wrongly claimed all four fields were hex). Added a
+  fail-on-revert table test asserting func>=10 decimal names; reverting to
+  base-16 goes RED while func<10 rows stay green.
+- **File(s)**: pkg/daemon/daemon_reth.go, pkg/daemon/pci_enp_name_6204_test.go
