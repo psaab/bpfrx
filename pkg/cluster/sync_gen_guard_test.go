@@ -356,10 +356,11 @@ func TestSessionWireRoundTripPolicyFields3301V4(t *testing.T) {
 		t.Fatalf("Generation round-trip = %#x, want %#x", dVal.Generation, val.Generation)
 	}
 
-	// Mixed-version: truncate the trailing 8-byte #3301 block (an old peer
-	// stops after Generation). Decode must still succeed with the new fields
-	// at 0 and Generation preserved.
-	legacy := payload[:len(payload)-8]
+	// Mixed-version: truncate the trailing #3301 block (8 bytes) AND the #5274
+	// ConfigEpoch (8 bytes) so the frame ends after Generation (an old peer
+	// that stops there). Decode must still succeed with the new fields at 0 and
+	// Generation preserved.
+	legacy := payload[:len(payload)-16]
 	_, lVal, ok := decodeSessionV4Payload(legacy)
 	if !ok {
 		t.Fatal("legacy (truncated) decode failed")
@@ -401,10 +402,10 @@ func TestSessionWireRoundTripPolicyFields3301V6(t *testing.T) {
 		t.Fatalf("Generation round-trip = %#x, want %#x", dVal.Generation, val.Generation)
 	}
 
-	// Drop the #3301 AppTimeout+PolicyCounterIdx (8 bytes) AND the #4565
-	// trailing Nat64SnatV4 (4 bytes) to simulate a pre-#3301 peer that omits all
-	// three additive trailing fields.
-	legacy := payload[:len(payload)-12]
+	// Drop the #3301 AppTimeout+PolicyCounterIdx (8 bytes), the #4565 trailing
+	// Nat64SnatV4 (4 bytes), AND the #5274 ConfigEpoch (8 bytes) to simulate a
+	// pre-#3301 peer that omits all of the additive trailing fields.
+	legacy := payload[:len(payload)-20]
 	_, lVal, ok := decodeSessionV6Payload(legacy)
 	if !ok {
 		t.Fatal("legacy (truncated) decode failed")
@@ -436,8 +437,10 @@ func TestSessionWireRoundTripNat64SnatV4_4565(t *testing.T) {
 		t.Fatalf("Nat64SnatV4 round-trip = %v, want [203 0 113 5]", dVal.Nat64SnatV4)
 	}
 
-	// Legacy (pre-#4565) peer omits the trailing 4 bytes -> all-zero (not NAT64).
-	legacy := payload[:len(payload)-4]
+	// Legacy (pre-#4565) peer omits the trailing Nat64SnatV4 (4 bytes) — and,
+	// being older, the #5274 ConfigEpoch (8 bytes) too — so truncate both to
+	// reach an after-#3301 frame -> Nat64SnatV4 all-zero (not NAT64).
+	legacy := payload[:len(payload)-12]
 	_, lVal, ok := decodeSessionV6Payload(legacy)
 	if !ok {
 		t.Fatal("legacy (truncated) decode failed")
@@ -479,10 +482,10 @@ func TestCrossVersionShortPayloadDecode(t *testing.T) {
 	key := gen2170KeyV4()
 	val := dataplane.SessionValue{State: dataplane.SessStateEstablished, IngressZone: 1, EgressZone: 2, Generation: 42}
 	full := encodeSessionV4Payload(key, val)
-	// Simulate a pre-#2170 OLD encoder: drop the trailing 16 bytes (the
-	// #2170 generation u64 + the #3301 AppTimeout/PolicyCounterIdx block) so
-	// the payload ends at FibGen.
-	short := full[:len(full)-16]
+	// Simulate a pre-#2170 OLD encoder: drop the trailing 24 bytes (the
+	// #2170 generation u64 + the #3301 AppTimeout/PolicyCounterIdx block + the
+	// #5274 ConfigEpoch u64) so the payload ends at FibGen.
+	short := full[:len(full)-24]
 	_, dVal, ok := decodeSessionV4Payload(short)
 	if !ok {
 		t.Fatal("short (legacy) payload should still decode")

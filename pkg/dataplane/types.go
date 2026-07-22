@@ -85,6 +85,24 @@ type SessionValue struct {
 	// (default policy / non-policy-forwarded), the rolling-upgrade-safe
 	// default for an old peer that omits it.
 	PolicyCounterIdx uint32
+
+	// ConfigEpoch is the #5274 admitting config epoch: the value of the HA
+	// config-sync generation (#3931 configGenCounter) the SENDER held when it
+	// queued this session for sync. The cluster receiver rejects an install
+	// whose ConfigEpoch is STRICTLY OLDER than its own lastAppliedConfigGen —
+	// the peer has since committed (and this node has applied) a newer config
+	// that may DENY the session, so a delayed stale-permit install that lands
+	// after the receiver's clearSessionsForDeletedPolicies scan is refused
+	// (SessionsStaleConfigIgnored). Like Generation/PolicyCounterIdx it is
+	// userspace-sync-only HA metadata carried as a length-gated trailing field
+	// in encodeSessionV4Payload; it is NOT part of the BPF/C conntrack ABI
+	// (bpfSessionValue) and MUST NOT be added to it. A value of 0 means
+	// "unknown / legacy peer" and disables the config-epoch check (the
+	// rolling-upgrade-safe default an old peer omits). The epoch is only
+	// cross-node comparable in the #3931 config-sync-generation namespace,
+	// which is authoritative in the Go cluster layer — see
+	// SessionSync.installClusterSyncedV4 for the guard.
+	ConfigEpoch uint64
 }
 
 // SessionKeyV6 mirrors the C struct session_key_v6 (5-tuple with 128-bit IPs).
@@ -161,6 +179,16 @@ type SessionValueV6 struct {
 	// (bpfSessionValueV6) and MUST NOT be added to it. All-zero => not NAT64
 	// (the rolling-upgrade-safe default an old peer omits).
 	Nat64SnatV4 [4]byte
+
+	// ConfigEpoch: see SessionValue.ConfigEpoch (#5274). The #3931 config-sync
+	// generation the sender held when it queued this session; the cluster
+	// receiver refuses an install whose epoch is strictly older than its
+	// lastAppliedConfigGen (a stale permit across a config that now denies it).
+	// Userspace-sync-only HA metadata carried as a length-gated trailing field
+	// in encodeSessionV6Payload; NOT part of the BPF/C conntrack ABI
+	// (bpfSessionValueV6) and MUST NOT be added to it. 0 = unknown/legacy peer
+	// (check disabled), the rolling-upgrade-safe default.
+	ConfigEpoch uint64
 }
 
 // ZoneConfig mirrors the C struct zone_config.

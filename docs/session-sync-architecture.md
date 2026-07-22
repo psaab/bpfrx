@@ -48,7 +48,11 @@ entry locally.
 
 The session value includes state, policy, timestamps, counters, NAT fields,
 reverse key, and a cached forwarding result (`FibIfindex`, MACs, VLAN,
-generation).
+generation). It also carries a `ConfigEpoch` (#5274) — the config-sync
+generation (#3931) the sender held when it queued the session — used by the
+receive-side config-epoch guard (see "Config-Epoch Guard" below). Both
+`Generation` and `ConfigEpoch` are userspace-sync-only metadata; neither is part
+of the on-map BPF conntrack ABI (`bpfSessionValue`).
 
 ### Userspace Mirror
 
@@ -248,6 +252,53 @@ says are peer-owned.
 
 Important detail: zones missing from the frozen snapshot are conservatively kept
 instead of deleted.
+
+### Config-Epoch Guard (#5274)
+
+The receiver applies a synced session install (bulk or incremental) through
+`installClusterSyncedV4`/`V6`. Before it forwards the install to the dataplane
+it runs two independent admission checks:
+
+1. **Install-generation guard (#2170)** — per-key: refuse a strictly-older
+   `Generation` for the same 5-tuple so the per-key stored generation never
+   regresses (`InstallsStaleIgnored`).
+2. **Config-epoch guard (#5274)** — global: refuse a session whose
+   `ConfigEpoch` is strictly older than the receiver's `lastAppliedConfigGen`
+   (`SessionsStaleConfigIgnored`).
+
+The config-epoch guard closes the immediate-policy-invalidation gap across the
+HA boundary. Without it, the primary could admit a session under config A, then
+commit config B (which DENIES that session); config B is config-synced and
+applied on the standby (running `clearSessionsForDeletedPolicies`), but a
+delayed config-A session install that arrives **after** that sweep is installed
+anyway — a stale permit. The standby would then forward under the revoked
+config-A decision after failover.
+
+The epoch is stamped by the SENDER at queue time (`stampInstallGen*` sets
+`ConfigEpoch = configGenCounter.Load()`), and compared by the RECEIVER against
+`lastAppliedConfigGen`. Both live in the **same** #3931 config-sync-generation
+namespace (the sender's monotonic counter, which the receiver applies and
+records), so the comparison is meaningful across nodes. A session still present
+in the sender's table when it is queued has survived the sender's own
+config-apply sweep, so it is legitimately admitted under the current config; the
+receiver refuses it only once IT has applied a **strictly newer** config that
+supersedes the stamped epoch. `ConfigEpoch == 0` (a pre-#5274 peer, or a
+local-origin entry) disables the check — rolling-upgrade safe. On reconnect the
+receiver resets `lastAppliedConfigGen` to 0 (`resetRecvGen`), so bulk re-sync
+after a peer reboot is never falsely rejected (the reset makes the compare
+baseline 0 until the peer re-pushes its current config).
+
+**Enforcement is authoritative in the Go cluster layer, not the userspace
+helper.** The #3931 config-sync-generation namespace lives entirely in
+`SessionSync`; the helper's own `config_generation` is a *local* commit counter
+(`Manager.bumpGeneration`) whose value is independent per node and therefore not
+cross-node comparable. The receiver rejects a stale-epoch install BEFORE it ever
+reaches the helper, so the helper needs no config-epoch field or guard. This
+guard covers the config-authority → peer direction (the issue's scenario, where
+the primary that admits the session is also the RG0 config-sync authority); a
+non-authority's sessions carry the authority-independent seed epoch and the
+guard is inert for them (no false reject), which is acceptable because config
+changes originate on the authority.
 
 ## Sync Readiness and Bulk Priming
 

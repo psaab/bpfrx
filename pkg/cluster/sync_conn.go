@@ -126,6 +126,15 @@ func (g *fullSetSeqGuard) reset() {
 func (s *SessionSync) stampInstallGenV4(key dataplane.SessionKey, val *dataplane.SessionValue) {
 	g := s.nextInstallGen()
 	val.Generation = g
+	// #5274: stamp the admitting config epoch = the config-sync generation
+	// (#3931) this node currently holds. A session still present in the local
+	// table when it is queued has survived this node's own config-apply
+	// clearSessionsForDeletedPolicies sweep, so it is admitted under the
+	// current config; the receiver refuses it only once IT applies a strictly
+	// newer config (lastAppliedConfigGen advances past this epoch). configGen
+	// and lastAppliedConfigGen are the SAME sender→receiver namespace, so the
+	// comparison is meaningful across the HA boundary.
+	val.ConfigEpoch = s.configGenCounter.Load()
 	s.genSentMu.Lock()
 	if s.genSentV4 == nil {
 		s.genSentV4 = make(map[dataplane.SessionKey]uint64)
@@ -139,6 +148,8 @@ func (s *SessionSync) stampInstallGenV4(key dataplane.SessionKey, val *dataplane
 func (s *SessionSync) stampInstallGenV6(key dataplane.SessionKeyV6, val *dataplane.SessionValueV6) {
 	g := s.nextInstallGen()
 	val.Generation = g
+	// #5274: stamp the admitting config epoch (see stampInstallGenV4).
+	val.ConfigEpoch = s.configGenCounter.Load()
 	s.genSentMu.Lock()
 	if s.genSentV6 == nil {
 		s.genSentV6 = make(map[dataplane.SessionKeyV6]uint64)
@@ -383,6 +394,24 @@ func (s *SessionSync) resetRecvGen() {
 // also serialize unrelated keys and block on dataplane I/O under the lock,
 // which is not worth it for a race that the single-active-fabric invariant
 // already precludes.
+// configEpochStale reports whether a synced session admitted under config
+// epoch `epoch` must be REFUSED because this node has since applied a STRICTLY
+// newer config (#5274). The peer stamps the session with the #3931 config-sync
+// generation it held when it queued the session (stampInstallGen*);
+// lastAppliedConfigGen is the highest config generation THIS node has applied
+// from that same peer, so the two are directly comparable in one
+// sender→receiver namespace. A newer config the peer committed AND this node
+// applied may DENY the session, and this node's clearSessionsForDeletedPolicies
+// sweep for that config already ran — so installing the delayed session would
+// revive a stale PERMIT the config invalidated. epoch==0 (a legacy/pre-#5274
+// peer, or a local-origin entry) disables the check, unconditionally admitting
+// as before (rolling-upgrade safe). The check is authoritative here in the Go
+// cluster layer: the #3931 namespace lives entirely in SessionSync, and the
+// receiver refuses BEFORE forwarding the install to the userspace helper.
+func (s *SessionSync) configEpochStale(epoch uint64) bool {
+	return epoch != 0 && epoch < s.lastAppliedConfigGen.Load()
+}
+
 func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val dataplane.SessionValue) {
 	if s.sessions == nil {
 		return
@@ -392,6 +421,12 @@ func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val datap
 		s.stats.InstallsStaleIgnored.Add(1)
 		slog.Debug("cluster sync: ignored stale-generation v4 install",
 			"incoming_gen", val.Generation)
+		return
+	}
+	if s.configEpochStale(val.ConfigEpoch) {
+		s.stats.SessionsStaleConfigIgnored.Add(1)
+		slog.Debug("cluster sync: ignored stale-config-epoch v4 install (peer moved to a newer config that may deny this session)",
+			"session_config_epoch", val.ConfigEpoch, "applied_config_gen", s.lastAppliedConfigGen.Load())
 		return
 	}
 	if err := s.sessions.PutClusterSyncedV4(key, val); err == nil {
@@ -415,6 +450,12 @@ func (s *SessionSync) installClusterSyncedV6(key dataplane.SessionKeyV6, val dat
 		s.stats.InstallsStaleIgnored.Add(1)
 		slog.Debug("cluster sync: ignored stale-generation v6 install",
 			"incoming_gen", val.Generation)
+		return
+	}
+	if s.configEpochStale(val.ConfigEpoch) {
+		s.stats.SessionsStaleConfigIgnored.Add(1)
+		slog.Debug("cluster sync: ignored stale-config-epoch v6 install (peer moved to a newer config that may deny this session)",
+			"session_config_epoch", val.ConfigEpoch, "applied_config_gen", s.lastAppliedConfigGen.Load())
 		return
 	}
 	if err := s.sessions.PutClusterSyncedV6(key, val); err == nil {
