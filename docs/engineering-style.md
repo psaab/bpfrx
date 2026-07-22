@@ -443,9 +443,15 @@ they repeatedly bite:
     PARKS on the mutex (futex wait) instead of compounding scheduler
     oversubscription. Every test sharing a given global must take the
     SAME lock.
-  - Prove it with a **deterministic fail-on-revert** (two barrier-synced
-    threads whose assertion only holds with the isolation/guard in
-    place), plus repeated parallel runs of the previously-flaky test.
+  - Prove the ISOLATION variant with a **deterministic fail-on-revert**
+    (two barrier-synced threads whose per-thread counter assertion is
+    mathematically impossible under a shared global). The mutex GUARD
+    variant's fail-on-revert is **scheduler-dependent** (barrier + many
+    iterations + a widened critical window make it effectively certain)
+    and pins the guard PRIMITIVE's exclusivity, not that each heavy test
+    TAKES it — verify that application by inspection, since a deterministic
+    test for it reduces to the underlying flake. Back both with repeated
+    parallel runs of the previously-flaky test.
 - **Shared-cluster lock protocol (#1875).** The loss userspace cluster
   is shared by concurrent agents; ownership is serialized by the
   advisory flock on `/tmp/xpf-cluster.lock` with holder metadata in

@@ -56226,3 +56226,12 @@ top.
   when the Mutex is re-added).
 - **File(s)**: userspace-dp/src/filter/policer.rs,
   userspace-dp/src/filter/mod.rs, userspace-dp/src/filter/README.md
+
+## 2026-07-22 — #6315 review fold: honest serial-guard fail-on-revert wording
+- **Action**: Folded the Codex MERGE-NEEDS-MINOR + rev6315 nit — corrected the
+  "deterministic red on revert" claim for the scheduler-dependent mutex GUARD
+  test (engine_tests.rs) to "scheduler-dependent but effectively certain", and
+  noted it pins the guard PRIMITIVE not its application at the two heavy tests
+  (verified by inspection; a deterministic test reduces to the flake). Mirrored
+  in docs/engineering-style.md, distinguishing the deterministic ISOLATION test.
+- **File(s)**: userspace-dp/src/afxdp/wg/engine_tests.rs, docs/engineering-style.md

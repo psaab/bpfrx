@@ -46,7 +46,14 @@ fn wg_engine_test_serial() -> std::sync::MutexGuard<'static, ()> {
 /// then clears it. With the guard held the swap never observes a concurrent
 /// occupant. Removing the `wg_engine_test_serial()` acquisition (reverting the
 /// fix) lets both threads enter concurrently, the swap observes `true`, the
-/// worker panics, and the join below fails — deterministic red on revert.
+/// worker panics, and the join below fails. That revert-red is
+/// scheduler-dependent (a degenerate fully-serial schedule could miss the
+/// overlap), but the barrier + 2000 iterations + the `yield_now()`-widened
+/// window make a collision effectively certain. NOTE: this pins the guard
+/// PRIMITIVE's exclusivity, not that the two heavy engine tests actually TAKE
+/// it — that application is verified by inspection (both call
+/// `wg_engine_test_serial()` at entry), since a deterministic test for the
+/// application would reduce to the underlying flake itself.
 #[test]
 fn wg_engine_test_serial_grants_exclusive_access() {
     use std::sync::atomic::{AtomicBool, Ordering as AOrd};
