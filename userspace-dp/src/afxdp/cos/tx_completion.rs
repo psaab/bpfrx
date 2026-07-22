@@ -434,18 +434,22 @@ pub(in crate::afxdp) fn prime_cos_root_for_service(
     root_ifindex: i32,
     now_ns: u64,
 ) -> bool {
+    // #4972: borrow the root lease from the disjoint `cos_fast_interfaces`
+    // field rather than cloning the `Arc` per prime call. The mutable
+    // borrow below is of the separate `cos_interfaces` field, so the
+    // read-borrow coexists (same borrow-split the exact paths use).
     let shared_root_lease = binding
         .cos
         .cos_fast_interfaces
         .get(&root_ifindex)
-        .and_then(|iface_fast| iface_fast.shared_root_lease.clone());
+        .and_then(|iface_fast| iface_fast.shared_root_lease.as_ref());
     let ticks_advanced;
     {
         let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
             return false;
         };
         ticks_advanced = advance_cos_timer_wheel(root, now_ns);
-        if let Some(shared_root_lease) = shared_root_lease.as_ref() {
+        if let Some(shared_root_lease) = shared_root_lease {
             maybe_top_up_cos_root_lease(root, shared_root_lease, now_ns);
         }
     }
@@ -736,8 +740,15 @@ pub(in crate::afxdp) fn refresh_cos_interface_activity(
 ) {
     let mut new_nonempty = 0usize;
     let mut new_runnable = 0usize;
-    // (queue_idx, worker_id, released_bytes)
-    let mut released_queue_leases = Vec::<(usize, usize, u64)>::new();
+    // (queue_idx, worker_id, released_bytes). #4972: reuse the per-binding
+    // scratch Vec instead of heap-allocating one per settle. `mem::take`
+    // swaps in an empty Vec (no alloc) and hands us the retained-capacity
+    // buffer; it is stored back at the end of the function. The deferred-
+    // return structure (lease re-credits run after the `cos_interfaces`
+    // mutable borrow ends) is preserved EXACTLY — only the allocation is
+    // removed.
+    let mut released_queue_leases = core::mem::take(&mut binding.cos.released_queue_leases_scratch);
+    released_queue_leases.clear();
     let old_nonempty = binding
         .cos
         .cos_interfaces
@@ -799,7 +810,7 @@ pub(in crate::afxdp) fn refresh_cos_interface_activity(
         release_cos_root_lease(binding, root_ifindex);
     }
     if let Some(iface_fast) = binding.cos.cos_fast_interfaces.get(&root_ifindex) {
-        for (queue_idx, worker_id, released) in released_queue_leases {
+        for &(queue_idx, worker_id, released) in &released_queue_leases {
             if let Some(shared_queue_lease) = iface_fast
                 .queue_fast_path
                 .get(queue_idx)
@@ -811,6 +822,9 @@ pub(in crate::afxdp) fn refresh_cos_interface_activity(
             }
         }
     }
+    // #4972: return the scratch buffer (with its retained capacity) so the
+    // next settle reuses the allocation instead of making a fresh one.
+    binding.cos.released_queue_leases_scratch = released_queue_leases;
 }
 
 #[inline]
@@ -833,11 +847,16 @@ pub(in crate::afxdp) fn apply_cos_send_result(
     // the #915 rationale).
     let mut lease_consume_queue_idx = None;
     let binding_slot = binding.slot;
+    // #4972: borrow the shared exact-backlog `Arc` from the disjoint
+    // `cos_fast_interfaces` field instead of cloning it per settlement.
+    // The mutable borrow below is of `cos_interfaces` (a separate field),
+    // and `peer_exact_demand_queue_mask` takes `&BindingWorker`, so the
+    // read-borrow held across both is sound.
     let shared_exact_backlog = binding
         .cos
         .cos_fast_interfaces
         .get(&root_ifindex)
-        .and_then(|iface_fast| iface_fast.shared_exact_backlog.clone());
+        .and_then(|iface_fast| iface_fast.shared_exact_backlog.as_ref());
     let peer_exact_backlogged = binding
         .cos
         .cos_fast_interfaces
@@ -894,7 +913,7 @@ pub(in crate::afxdp) fn apply_cos_send_result(
             maybe_demote_drained_best_effort(queue);
         }
         if debit_nonexact_surplus_budget {
-            if let Some(backlog) = shared_exact_backlog.as_ref() {
+            if let Some(backlog) = shared_exact_backlog {
                 backlog.consume_residual_surplus_budget(sent_bytes);
             } else {
                 root.nonexact_surplus_under_exact_tokens = root
@@ -947,11 +966,14 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
     // the #915 rationale).
     let mut lease_consume_queue_idx = None;
     let binding_slot = binding.slot;
+    // #4972: borrow the shared exact-backlog `Arc` from the disjoint
+    // `cos_fast_interfaces` field instead of cloning it per settlement
+    // (see `apply_cos_send_result` for the borrow-split rationale).
     let shared_exact_backlog = binding
         .cos
         .cos_fast_interfaces
         .get(&root_ifindex)
-        .and_then(|iface_fast| iface_fast.shared_exact_backlog.clone());
+        .and_then(|iface_fast| iface_fast.shared_exact_backlog.as_ref());
     let peer_exact_backlogged = binding
         .cos
         .cos_fast_interfaces
@@ -1010,7 +1032,7 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
             maybe_demote_drained_best_effort(queue);
         }
         if debit_nonexact_surplus_budget {
-            if let Some(backlog) = shared_exact_backlog.as_ref() {
+            if let Some(backlog) = shared_exact_backlog {
                 backlog.consume_residual_surplus_budget(sent_bytes);
             } else {
                 root.nonexact_surplus_under_exact_tokens = root

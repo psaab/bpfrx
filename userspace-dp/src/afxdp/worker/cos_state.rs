@@ -47,4 +47,11 @@ pub(crate) struct WorkerCos {
     /// under-grant attribution flushed from the guarantee-selector
     /// telemetry (`record_cos_queue_lease_acquire`).
     pub(crate) cos_queue_lease_undergrants: CoSQueueLeaseUndergrantCounters,
+    /// #4972: reusable scratch buffer for `refresh_cos_interface_activity`
+    /// deferred queue-lease returns `(queue_idx, worker_id, released_bytes)`.
+    /// The deferral is a borrow-order requirement (the returns run after the
+    /// `cos_interfaces` mutable borrow ends), but the buffer itself must not
+    /// heap-allocate per settle — it is `mem::take`n out, filled, drained by
+    /// reference, and stored back to retain capacity across calls.
+    pub(crate) released_queue_leases_scratch: Vec<(usize, usize, u64)>,
 }
