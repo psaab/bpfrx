@@ -3340,6 +3340,68 @@ fn iter_with_idle_reflects_last_seen_update() {
 }
 
 #[test]
+fn iter_with_idle_budgeted_bounds_and_resumes_full_coverage() {
+    // #5287: the budgeted refresh walk must (1) examine AT MOST `budget` slab
+    // slots per slice, (2) RESUME from the returned cursor, and (3) cover EVERY
+    // forward entry within one full cycle. Reverting the walk to the unbounded
+    // single-pass scan reddens the per-slice bound assertion (a single call
+    // would then examine all N > BUDGET entries).
+    let mut table = SessionTable::new();
+    const N: usize = 25;
+    const BUDGET: usize = 8;
+    assert!(N > BUDGET, "test only meaningful when the table exceeds one slice");
+
+    let install_time = 1_000_000_000u64;
+    let mut installed = std::collections::HashSet::new();
+    for i in 0..N {
+        let mut key = key_v4();
+        key.src_port = 10_000 + i as u16; // distinct 5-tuples -> distinct forward entries
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_time,
+            PROTO_TCP,
+            0x10,
+        ));
+        installed.insert(key);
+    }
+
+    let now = install_time + 5_000_000_000;
+    let mut cursor = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    let mut slices = 0usize;
+    // Bounded loop guards against a non-advancing cursor hanging the test.
+    for _ in 0..1024 {
+        let mut this_slice = 0usize;
+        let next = table.iter_with_idle_budgeted(cursor, BUDGET, now, |k, _d, meta, _idle, _c| {
+            this_slice += 1;
+            if !meta.is_reverse {
+                seen.insert(k.clone());
+            }
+        });
+        // (1) Hard per-slice bound — THE fail-on-revert assertion. An unbounded
+        // single pass processes all N (> BUDGET) entries in one call.
+        assert!(
+            this_slice <= BUDGET,
+            "slice examined {this_slice} slots, exceeds budget {BUDGET}",
+        );
+        slices += 1;
+        cursor = next;
+        if cursor == 0 {
+            break; // returned-to-top => a full-table cycle completed
+        }
+    }
+    // (2) The full table spanned MORE THAN ONE slice (resumed across ticks).
+    assert!(
+        slices > 1,
+        "full table must span >1 slice at N={N} budget={BUDGET}, got {slices}",
+    );
+    // (3) One cycle refreshed EVERY installed forward entry exactly once.
+    assert_eq!(seen, installed, "one cycle must cover every forward entry");
+}
+
+#[test]
 fn refresh_local_skips_peer_synced_entries() {
     let mut table = SessionTable::new();
     let key = key_v4();

@@ -1,3 +1,35 @@
+## 2026-07-22 — #5287: budget + resume the conntrack last_seen refresh
+
+- **Timestamp**: 2026-07-22 (fix/5287-conntrack-refresh-budget)
+- **Action**: Converted `refresh_bpf_conntrack_last_seen` from a full-table
+  single pass (2 syscalls per forward entry, up to 131072 entries in one
+  uninterrupted burst between RX/TX polls — a periodic latency spike on the
+  low-latency worker core) into an incremental, budgeted, resumable slice.
+  - **Primitive**: added `SessionTable::iter_with_idle_budgeted(cursor, budget,
+    now, f) -> next_cursor` — walks the `entries` slab by STABLE integer
+    handle, examines at most `budget` slots from `cursor`, returns the next
+    cursor (0 on cycle completion). No allocation, no atomics.
+  - **Refresh**: `refresh_bpf_conntrack_last_seen` now takes `(cursor, budget)`
+    and returns the next cursor; closure body unchanged.
+  - **Driver**: the worker loop keeps a persistent `ct_refresh_cursor`, drives
+    one slice per `CT_SLICE_INTERVAL_NS` (100ms) with budget
+    `CT_REFRESH_SLICE_BUDGET` (2048), and paces successive full-table CYCLES to
+    `CT_REFRESH_WINDOW_NS` (10s) so small/idle tables are not over-refreshed
+    (steady-state syscall rate unchanged from the old 10s cadence). At the
+    131072 cap a full cycle spans ~64 slices (~6.4s ≤ 10s window).
+  - **Tests (FAIL-ON-REVERT, assertion-based)**:
+    `session::tests::iter_with_idle_budgeted_bounds_and_resumes_full_coverage`
+    (≤budget per slice, resumes >1 slice, full coverage in one cycle) and
+    `afxdp::bpf_map::tests::refresh_bpf_conntrack_last_seen_is_budgeted_across_slices`
+    (production function: first slice returns cursor==budget, cycle spans >1
+    slice). Verified firsthand: neutralizing the budget to a single pass
+    reddens both via assertion (not build break); restored.
+  - **Validation**: `cargo build` green; full `cargo test --release` green.
+  **File(s)**: userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/session/tests.rs,
+  userspace-dp/src/afxdp/bpf_map_tests.rs,
 ## 2026-07-22 — #4957: HA config-sync — do not treat a promoted-but-unapplied config as converged
 
 - **Timestamp**: 2026-07-22 (fix/4957-ha-configsync-unapplied-converged)

@@ -415,3 +415,103 @@ fn build_conntrack_value_stamps_stable_session_id_v6() {
         "v6 conntrack mirror must carry the stable session id, not 0"
     );
 }
+
+// #5287 FAIL-ON-REVERT: `refresh_bpf_conntrack_last_seen` is an INCREMENTAL,
+// budgeted slice — NOT a full-table pass. It must advance a persistent cursor
+// by at most `budget` slab slots per call and resume across calls, so no single
+// packet-loop tick walks the whole table (the old behaviour did tens of
+// thousands of synchronous BPF syscalls between two RX/TX polls, spiking
+// latency near the 131072-entry cap).
+//
+// With fd=-1 no BPF syscalls run, but the walk still advances the cursor, so
+// the budget/continuation contract is observable directly: the first slice from
+// the top returns a cursor advanced by EXACTLY the budget (it does not wrap to 0
+// while the table still has unwalked slots), and draining a full cycle takes
+// MORE THAN ONE slice. Reverting the refresh to the unbounded single-pass scan
+// makes the first call walk the whole table and wrap to 0 -> the `== BUDGET`
+// assertion reddens.
+#[test]
+fn refresh_bpf_conntrack_last_seen_is_budgeted_across_slices() {
+    use crate::session::SessionTable;
+    let mut table = SessionTable::new();
+    const N: usize = 40;
+    const BUDGET: usize = 8;
+    assert!(N > BUDGET, "test only meaningful when the table exceeds one slice");
+
+    let install_time = 1_000_000_000u64;
+    for i in 0..N {
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            src_port: 10_000 + i as u16, // distinct 5-tuples -> distinct forward entries
+            dst_port: 443,
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+                neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+        let metadata = SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        };
+        assert!(table.install_with_protocol(key, decision, metadata, install_time, 6, 0x10));
+    }
+
+    let policy = crate::policy::PolicyState::default();
+    let now = install_time + 5_000_000_000;
+
+    // First slice from the top: cursor advances by EXACTLY the budget and does
+    // NOT wrap (the table still has N - BUDGET unwalked slots). fd=-1 => no BPF
+    // I/O, but the cursor bookkeeping is exercised.
+    let c1 = refresh_bpf_conntrack_last_seen(-1, -1, &table, &policy, now, 0, BUDGET);
+    assert_eq!(
+        c1, BUDGET,
+        "first slice must be bounded to the budget, not a full single-pass scan"
+    );
+
+    // Draining a full cycle takes >1 slice; each returned cursor advances by at
+    // most BUDGET until it wraps to 0.
+    let mut cursor = c1;
+    let mut slices = 1usize;
+    for _ in 0..1024 {
+        let next = refresh_bpf_conntrack_last_seen(-1, -1, &table, &policy, now, cursor, BUDGET);
+        slices += 1;
+        if next != 0 {
+            assert!(
+                next.saturating_sub(cursor) <= BUDGET,
+                "slice advanced {} past budget {BUDGET}",
+                next.saturating_sub(cursor),
+            );
+        }
+        cursor = next;
+        if cursor == 0 {
+            break; // full-table cycle completed
+        }
+    }
+    assert!(
+        slices > 1,
+        "full table must span more than one budgeted slice, got {slices}"
+    );
+}

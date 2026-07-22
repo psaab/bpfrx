@@ -254,11 +254,33 @@ pub(crate) fn worker_loop(
     #[cfg(feature = "debug-log")]
     let mut stall_reported = false;
     const DBG_REPORT_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
-    // Throttle for BPF conntrack last_seen refresh (~10s).
-    // Keeps `show security flow session` idle times accurate without
-    // per-second syscall overhead per session.  See issue #333.
-    const CT_REFRESH_INTERVAL_NS: u64 = 10_000_000_000;
-    let mut last_ct_refresh_ns: u64 = 0;
+    // BPF conntrack last_seen refresh (#333, made incremental in #5287).
+    // Keeps `show security flow session` idle times / volume accurate without
+    // per-second syscall overhead per session.
+    //
+    // #5287: the refresh is now a budgeted, resumable slice instead of one
+    // full-table pass. Near the 131072-entry cap the old single pass did a BPF
+    // lookup + update per forward entry (tens of thousands of synchronous
+    // kernel crossings) between two RX/TX polls — a deterministic per-interval
+    // latency spike on this low-latency core. Now each slice refreshes at most
+    // CT_REFRESH_SLICE_BUDGET slab slots from a persistent cursor
+    // (`ct_refresh_cursor`) and resumes on the next slice, at CT_SLICE_INTERVAL_NS
+    // cadence, with RX/TX/heartbeat interleaved between slices. Successive
+    // full-table CYCLES are paced to CT_REFRESH_WINDOW_NS so a small or idle
+    // table is not over-refreshed (steady-state syscall rate is unchanged from
+    // the old 10s full-table cadence). Freshness/latency tradeoff: at the
+    // 131072 default cap and 100ms cadence a full cycle spans ~64 slices
+    // (~6.4s <= the 10s window); if `max_sessions` is raised far above the
+    // default a cycle stretches past the window (freshness degrades gracefully),
+    // but the per-slice cost stays hard-bounded at CT_REFRESH_SLICE_BUDGET — no
+    // single tick ever stalls the core again.
+    const CT_REFRESH_WINDOW_NS: u64 = 10_000_000_000; // full-table freshness target
+    const CT_SLICE_INTERVAL_NS: u64 = 100_000_000; // 100ms between slices
+    const CT_REFRESH_SLICE_BUDGET: usize = 2048; // max slab slots per slice
+    let mut last_ct_slice_ns: u64 = 0;
+    let mut ct_cycle_start_ns: u64 = 0;
+    // Persistent slab-index cursor: 0 means "between cycles / at the top".
+    let mut ct_refresh_cursor: usize = 0;
     // #869: worker-runtime telemetry.  Local counters, published to
     // `runtime_atomics` on the ~1s cadence below.
     use crate::afxdp::worker_runtime::{
@@ -788,12 +810,29 @@ pub(crate) fn worker_loop(
                     .fetch_add(local_expired, Ordering::Relaxed);
             }
         }
-        // Periodically refresh last_seen in BPF conntrack entries so Go-side
+        // Incrementally refresh last_seen in BPF conntrack entries so Go-side
         // callers of IterateSessions (CLI, gRPC, Prometheus) see accurate
-        // session idle times.  Issue #333.
-        if loop_now_ns.saturating_sub(last_ct_refresh_ns) >= CT_REFRESH_INTERVAL_NS {
-            last_ct_refresh_ns = loop_now_ns;
-            refresh_bpf_conntrack_last_seen(
+        // session idle times.  Issue #333; budgeted/resumable per #5287.
+        //
+        // #5287: drive at most one budgeted slice per CT_SLICE_INTERVAL_NS.
+        // `should_slice` is true while a cycle is in flight (cursor != 0, keep
+        // draining the table) OR once the freshness window has elapsed since the
+        // last cycle started (time to begin a fresh cycle). The `&&` short-
+        // circuits on the cheap cursor compare in the common between-cycles idle
+        // case, so the per-tick cost stays one integer compare plus one u64
+        // subtract — no allocation, no regression to the empty/idle table.
+        let should_slice = ct_refresh_cursor != 0
+            || loop_now_ns.saturating_sub(ct_cycle_start_ns) >= CT_REFRESH_WINDOW_NS;
+        if should_slice
+            && loop_now_ns.saturating_sub(last_ct_slice_ns) >= CT_SLICE_INTERVAL_NS
+        {
+            last_ct_slice_ns = loop_now_ns;
+            // Stamp the cycle start on the FIRST slice of a cycle (cursor at the
+            // top) so successive cycles are paced to the freshness window.
+            if ct_refresh_cursor == 0 {
+                ct_cycle_start_ns = loop_now_ns;
+            }
+            ct_refresh_cursor = refresh_bpf_conntrack_last_seen(
                 conntrack_v4_fd,
                 conntrack_v6_fd,
                 &sessions,
@@ -801,6 +840,8 @@ pub(crate) fn worker_loop(
                 // current rule table from the session's bound rule handle.
                 &forwarding.policy,
                 loop_now_ns,
+                ct_refresh_cursor,
+                CT_REFRESH_SLICE_BUDGET,
             );
         }
         // Check if fabric links were updated by the coordinator (e.g. after
