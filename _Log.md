@@ -54994,3 +54994,30 @@ top.
   userspace-dp/src/nat/source.rs, userspace-dp/src/nat64.rs,
   userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/nat64_tests.rs,
   docs/deterministic-nat-cgnat.md, _Log.md
+
+- **Timestamp**: 2026-07-21
+- **Action**: Fix #5294 — pop-then-fallible-write permanently loses a
+  session-delta batch on a state-file error. `drain_session_deltas`
+  (server/handlers/session_deltas.rs) and the owner-RG export mirror
+  (server/handlers/export.rs → owner_rg_collect) DESTRUCTIVELY drain deltas
+  into `response.session_deltas` and set `persist_state`; the dispatcher tail
+  (server/handlers/mod.rs) ran the FALLIBLE `write_state(...)?` BEFORE encoding
+  the response, so a local state-file error short-circuited the send: the batch
+  was popped off the queue yet neither persisted NOR delivered to the peer →
+  permanent HA session divergence (no loss-of-sync latch armed for a write_state
+  failure, unlike the #5290 overflow path). Fix: the dispatcher now ALWAYS
+  encodes+flushes the response (delta order preserved) and only THEN surfaces a
+  persist error to the accept loop — sound because the state file is best-effort
+  observability, not a restore source, and self-corrects on the next periodic
+  write. Single dispatcher-tail change covers BOTH the drain path and the
+  owner-RG export mirror (shared tail). Added a `#[cfg(test)]` Coordinator seam
+  (seed_pending_session_deltas_for_test) + fail-on-revert test
+  `drain_session_deltas_survive_write_state_failure_5294`: rigs write_state to
+  fail (state_file in a nonexistent dir), drains a 5-delta batch through the real
+  handle_stream, and asserts all 5 deltas still reach the peer. RED on revert to
+  pop-then-fallible-write (client read hits EOF — "EOF while parsing a value").
+  Build + targeted test pass; full cargo suite green (4070 lib tests, 0 failed).
+  HA session-sync path — needs loss-cluster failover smoke (batched).
+- **File(s)**: userspace-dp/src/server/handlers/mod.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/server/tests.rs, userspace-dp/src/server/README.md, _Log.md

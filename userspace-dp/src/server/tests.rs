@@ -3235,3 +3235,88 @@ fn update_neighbors_none_without_replace_is_noop_5864() {
         "non-replace update with no neighbors must not clear the table"
     );
 }
+
+// -------------------------------------------------------------
+// #5294: a state-file write failure must NOT lose a drained
+// session-delta batch (pop-then-fallible-write transactionality).
+// -------------------------------------------------------------
+
+/// #5294 fail-on-revert: `drain_session_deltas` DESTRUCTIVELY pops deltas out of
+/// the per-binding RPC-fallback buffers into `response.session_deltas` and marks
+/// `persist_state`. With the pre-#5294 pop-then-fallible-write order — the
+/// dispatcher ran `write_state(...)?` BEFORE encoding the response — a local
+/// state-file write error short-circuited the send via `?`: the deltas were
+/// already gone from the queue yet never reached the peer AND were not persisted,
+/// a PERMANENT HA session divergence (the standby never learns those open/close
+/// events, the local copy is lost, and no loss-of-sync latch is armed for a
+/// write_state failure). The fix always encodes+flushes the response (carrying
+/// the drained deltas) BEFORE surfacing a persist error, so the peer still
+/// receives every drained delta.
+///
+/// The owner-RG export mirror (`export_owner_rg_sessions` → `owner_rg_collect`)
+/// populates `response.session_deltas` + `persist_state` and flows through the
+/// SAME dispatcher tail, so this single test pins both paths.
+///
+/// Reverting the dispatcher to `write_state(state_file, &state)?` before the send
+/// makes the handler return Err with NOTHING written, so the client read below
+/// hits EOF and the decode `expect` panics — the RED signal.
+#[test]
+fn drain_session_deltas_survive_write_state_failure_5294() {
+    let mut coord = afxdp::Coordinator::new();
+    coord.seed_pending_session_deltas_for_test(0, 5);
+    let state = Arc::new(Mutex::new(ServerState {
+        status: ProcessStatus::default(),
+        snapshot: None,
+        afxdp: coord,
+        state_writer: Arc::new(StateWriter::new()),
+    }));
+
+    // A state_file inside a directory that does not exist makes write_state's
+    // temp-file open fail => write_state returns Err (the local state-file
+    // problem the bug is about), while the ServerState stays otherwise healthy.
+    let bad_state_file = format!(
+        "/nonexistent-xpf-5294-dir-{}/state.json",
+        std::process::id()
+    );
+
+    let mut request = req("drain_session_deltas");
+    request.session_deltas = Some(crate::SessionDeltaDrainRequest { max: 256 });
+
+    let (mut client, server) =
+        std::os::unix::net::UnixStream::pair().expect("control socket pair");
+    let running = Arc::new(AtomicBool::new(true));
+    let handle = {
+        let bad = bad_state_file.clone();
+        std::thread::spawn(move || handle_stream(server, &bad, state, running))
+    };
+
+    serde_json::to_writer(&mut client, &request).expect("write request");
+    std::io::Write::write_all(&mut client, b"\n").expect("newline");
+
+    // The response MUST be delivered even though the persist will fail. On the
+    // pre-#5294 pop-then-fallible-write order the handler returns Err before
+    // writing anything, so this read hits EOF and the decode fails — the RED
+    // signal that a drained delta batch was silently lost.
+    let response: ControlResponse = serde_json::from_reader(std::io::BufReader::new(&client))
+        .expect("drained deltas must reach the peer despite the write_state failure (#5294)");
+
+    let handler_result = handle.join().expect("handler thread");
+
+    // Test premise: write_state actually failed (else we would not be exercising
+    // the failure path at all). The error is surfaced to the accept loop, but
+    // only AFTER the response was flushed.
+    let err = handler_result.expect_err("write_state must fail on a missing state dir");
+    assert!(
+        err.contains("write state file"),
+        "expected a state-file persist error, got: {err}"
+    );
+
+    // The deltas were NOT lost: every drained delta reached the peer.
+    assert!(response.ok, "drained-batch response must report ok");
+    assert_eq!(
+        response.session_deltas.len(),
+        5,
+        "all 5 drained deltas must reach the peer even though the persist failed \
+         — the pre-#5294 pop-then-fallible-write order dropped the whole batch"
+    );
+}

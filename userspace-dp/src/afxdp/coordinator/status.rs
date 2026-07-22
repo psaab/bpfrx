@@ -672,6 +672,19 @@ impl super::Coordinator {
         out
     }
 
+    /// #5294 test seam: insert a live binding at `slot` pre-loaded with `count`
+    /// pending RPC-fallback session deltas, so a server-level test can drive the
+    /// `drain_session_deltas` control verb through the real `handle_stream`
+    /// dispatcher with deltas actually queued. Compiled out of production builds.
+    #[cfg(test)]
+    pub(crate) fn seed_pending_session_deltas_for_test(&mut self, slot: u32, count: usize) {
+        let live = std::sync::Arc::new(crate::afxdp::umem::BindingLiveState::new());
+        for _ in 0..count {
+            live.push_session_delta(crate::protocol::SessionDeltaInfo::default());
+        }
+        self.workers.live.insert(slot, live);
+    }
+
     pub fn worker_heartbeats(&self) -> Vec<chrono::DateTime<Utc>> {
         let now_wall = Utc::now();
         let now_mono = monotonic_nanos();
