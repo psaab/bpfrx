@@ -57428,3 +57428,22 @@ top.
     userspace-dp/src/afxdp/forwarding_build/mod.rs,
     userspace-dp/src/afxdp/tx/cos_classify.rs, userspace-dp/src/filter/tests.rs,
     userspace-dp/src/afxdp/forwarding_build/tests.rs, userspace-dp/src/filter/README.md
+
+## 2026-07-22 — #6360 (#6236 PR-2A): flowless counter-only needs_tx_eval canaries
+- **Timestamp**: 2026-07-22
+- **Action**: Close the parent-RED coverage gap Codex flagged on PR-2A. Dropping
+    `has_counter_terms` from `Filter::needs_tx_eval()` only reddened the two
+    FLOW-KEYED cos_classify sites (:305/:796, bound by the counter-only tests at
+    cos_classify_tests.rs:1667/1750); the two FLOWLESS sites — cached predicate
+    at cos_classify.rs:225 and runtime predicate at :655 — stayed GREEN because
+    the existing flowless canaries use terminal/log filters (has_terminal_action
+    /has_log keep needs_tx_eval true without has_counter_terms). Added two
+    TEST-ONLY canaries driving the flowless path with a COUNTER-ONLY L3-match
+    output filter: `resolve_cached_cos_tx_selection_flowless_captures_counter_only_output_filter`
+    (site :225, asserts filter_counters captured) and
+    `resolve_cos_tx_selection_flowless_counts_counter_only_output_filter`
+    (site :655, asserts the `then count` fires 1 pkt / pkt_len bytes).
+- **Tests**: fail-on-revert verified — dropping `has_counter_terms` from
+    `Filter::needs_tx_eval()` turns BOTH new flowless canaries RED; restored ->
+    GREEN. Full `cargo test --release -- --test-threads=1` GREEN.
+- **File(s)**: userspace-dp/src/afxdp/tx/cos_classify_tests.rs
