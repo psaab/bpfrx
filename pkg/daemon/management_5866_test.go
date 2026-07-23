@@ -3,8 +3,9 @@
 // instead of leaving the boot-time server enforcing the old policy until a
 // restart. These tests drive reconcileTo/startTo with a FAKE listener factory
 // (no real ports) and cover: a bind/port change (new active, old closed),
-// make-before-break coexistence, a TLS-material change (new cert served),
-// a same-endpoint auth swap (no rebind), and a failed new-bind (old listener
+// make-before-break coexistence, a TLS-material change (listener rebound,
+// durable cert reloaded), a same-endpoint auth swap (no rebind), and a failed
+// new-bind (old listener
 // RETAINED, error surfaced — fail-closed to the previous working state).
 //
 // FAIL-ON-REVERT: revert reconcileTo to close-old-before-binding-new and the
@@ -150,7 +151,23 @@ func TestMgmtReconcileBindChange_5866(t *testing.T) {
 	waitClosed(t, old)
 }
 
-// Bar 2: a TLS-material change replaces the listener and serves a FRESH cert.
+// Bar 2: a TLS-material change make-before-break rebinds the HTTPS listener and
+// serves the DURABLE self-signed cert (#5866 + #1916 D6). Enabling TLS and then
+// moving the HTTPS bind rebinds the HTTPS leg (new socket bound while the old is
+// still serving, then the old retired), but the on-disk self-signed pair is
+// LOADED AS-IS on the rebind — re-minting would churn remote clients' TOFU pins
+// (#5719 / PR #6378), so the served leaf bytes are IDENTICAL across the rebind.
+//
+// #6381: the OLD assertion required DIFFERENT leaf bytes ("a fresh cert per
+// rebind"), the OPPOSITE of the shipping durable-cert contract. It passed only
+// as a CI artifact — the production certGen writes /etc/xpf/tls, which is
+// unwritable in CI, so LoadX509KeyPair found no pair, persistence failed
+// silently, and every reconcile minted a fresh in-memory cert whose leaf bytes
+// differed. In production (writable /etc/xpf/tls) the second reconcile RELOADS
+// the same pair -> identical bytes -> the old assertion would have FAILED. This
+// test redirects certGen to a writable temp dir (SetTLSCertDirForTest) so the
+// shipping durable-reload path is actually exercised, and asserts the intended
+// invariant: the listener rebinds, but the durable cert is reloaded AS-IS.
 func TestMgmtReconcileTLSChange_5866(t *testing.T) {
 	reg := newFakeReg()
 	m := newTestMgmt(reg)
@@ -161,11 +178,17 @@ func TestMgmtReconcileTLSChange_5866(t *testing.T) {
 	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err != nil {
 		t.Fatalf("initial start: %v", err)
 	}
+	// Redirect HTTPS cert generation to a WRITABLE temp dir so the durable-reload
+	// path (#1916 D6) genuinely persists — otherwise the write fails and every
+	// reconcile re-mints a fresh in-memory cert, masking the real invariant
+	// (#6381). Set before any TLS is enabled: startTo is HTTP-only, so certGen is
+	// untouched until the first enable-TLS reconcile below.
+	m.srv.SetTLSCertDirForTest(t.TempDir())
 	if m.srv.HTTPSCertForTest() != nil {
 		t.Fatal("HTTP-only server must not serve a TLS cert")
 	}
 
-	// Enable HTTPS -> endpoint changes -> rebuild with a cert.
+	// Enable HTTPS -> the HTTPS leg binds and mints+persists the durable cert.
 	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
 		t.Fatalf("enable-TLS reconcile: %v", err)
 	}
@@ -173,11 +196,12 @@ func TestMgmtReconcileTLSChange_5866(t *testing.T) {
 	if cert1 == nil {
 		t.Fatal("HTTPS-enabled server must serve a TLS cert after the reconcile")
 	}
-	if reg.get("10.0.0.1:8443") == nil || !reg.get("10.0.0.1:8443").isOpen() {
+	oldHTTPS := reg.get("10.0.0.1:8443")
+	if oldHTTPS == nil || !oldHTTPS.isOpen() {
 		t.Fatal("HTTPS listener not active after enabling TLS")
 	}
 
-	// Change the HTTPS bind -> rebuild -> a NEW self-signed cert is served.
+	// Change the HTTPS bind -> make-before-break rebind of the HTTPS leg.
 	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.2:8443", nil)); err != nil {
 		t.Fatalf("https-rebind reconcile: %v", err)
 	}
@@ -185,11 +209,31 @@ func TestMgmtReconcileTLSChange_5866(t *testing.T) {
 	if cert2 == nil {
 		t.Fatal("HTTPS cert missing after the https rebind")
 	}
+
+	// The listener WAS rebound: the new HTTPS socket is active, it bound while the
+	// old was still open (make-before-break, no unreachable window), and the old
+	// HTTPS socket is retired. This is the real #5866 TLS-material invariant.
+	newHTTPS := reg.get("10.0.0.2:8443")
+	if newHTTPS == nil || !newHTTPS.isOpen() {
+		t.Fatal("HTTPS listener not rebound to the new address after the TLS-material change (#5866)")
+	}
+	if !reg.priorsOpenAtNew["10.0.0.2:8443"] {
+		t.Fatal("new HTTPS bound only AFTER the old closed — not make-before-break (#5866): " +
+			"there was a window with no HTTPS listener")
+	}
+	waitClosed(t, oldHTTPS)
+
+	// The served cert is the DURABLE self-signed pair, LOADED AS-IS across the
+	// rebind (#1916 D6): re-minting on a rebind would churn remote clients' TOFU
+	// pins (#5719 / #6378), so the leaf bytes must be IDENTICAL. (The old test
+	// wrongly required them to DIFFER — a CI-only artifact of an unwritable
+	// /etc/xpf/tls, #6381.)
 	if len(cert1.Certificate) == 0 || len(cert2.Certificate) == 0 {
 		t.Fatal("served TLS cert has no leaf certificate")
 	}
-	if bytesEqual(cert1.Certificate[0], cert2.Certificate[0]) {
-		t.Fatal("a TLS-material change must serve a NEW certificate, got the same leaf cert bytes (#5866)")
+	if !bytesEqual(cert1.Certificate[0], cert2.Certificate[0]) {
+		t.Fatal("the durable self-signed cert must be RELOADED AS-IS on an HTTPS rebind, got different leaf " +
+			"bytes — a rebind must not re-mint (that churns remote clients' TOFU pins, #1916 D6 / #6381)")
 	}
 }
 
