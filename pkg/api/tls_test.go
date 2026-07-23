@@ -26,6 +26,7 @@ func resetTLSSeams(t *testing.T) {
 		tlsRemove = os.Remove
 		tlsSyncDir = fsatomic.SyncDir
 		tlsWriteFileDurable = fsatomic.WriteFileDurable
+		tlsHostname = os.Hostname
 	})
 }
 

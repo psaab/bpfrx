@@ -812,13 +812,43 @@ const (
 )
 
 // TLS persistence test seams (#1916 injected-failure tests). Production
-// code must never mutate these.
+// code must never mutate these. tlsHostname is the SAN-source seam (#5719):
+// tests drive the non-ASCII / IP-shaped hostname branches deterministically
+// without mutating the machine's real hostname.
 var (
 	tlsMkdirAllDurable  = fsatomic.MkdirAllDurable
 	tlsRemove           = os.Remove
 	tlsSyncDir          = fsatomic.SyncDir
 	tlsWriteFileDurable = fsatomic.WriteFileDurable
+	tlsHostname         = os.Hostname
 )
+
+// isDNSSANSafeHostname reports whether h is safe to place in a certificate DNS
+// SAN. It must be non-empty, contain only ASCII letters, digits, hyphen, and
+// dot (the characters x509 can encode as an IA5String and that make a
+// well-formed DNS name), and not be an IP literal (an IP-shaped hostname
+// belongs in IPAddresses, not DNSNames). A hostname that fails this check is
+// dropped from the SAN set rather than fed to x509.CreateCertificate, which
+// HARD-FAILS on a non-ASCII DNS name and — under the #5058 all-or-nothing
+// management-server lifecycle — would abort cert generation and tear down the
+// entire HTTP+HTTPS server.
+func isDNSSANSafeHostname(h string) bool {
+	if h == "" {
+		return false
+	}
+	if net.ParseIP(h) != nil {
+		return false // IP literal → belongs in IPAddresses
+	}
+	for _, r := range h {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9', r == '-', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // generateSelfSignedCert creates or loads a self-signed TLS certificate
 // using the production /etc/xpf/tls paths. See generateSelfSignedCertAt.
@@ -865,18 +895,50 @@ func generateSelfSignedCertAt(dir, certPath, keyPath string) (tls.Certificate, e
 		return tls.Certificate{}, err
 	}
 
-	hostname, _ := os.Hostname()
-	if hostname == "" {
-		hostname = "xpf"
+	hostname, _ := tlsHostname()
+	cn := hostname
+	if cn == "" {
+		cn = "xpf"
+	}
+
+	// Subject Alternative Names. A cert that carries only a CommonName and no
+	// SANs is rejected for hostname verification by every modern TLS client
+	// (Go's own client since 1.15, browsers, curl) — "x509: certificate is
+	// not valid for any names". Always include the loopback names/addresses:
+	// the HTTPS API binds loopback (127.0.0.1/::1) by default and these can
+	// never fail to encode (codex-review-182 C-API TLS hygiene). This covers
+	// a loopback-bound API and local hostname/localhost verification; it does
+	// NOT add the configured management-interface IP (remote-verification-by-
+	// mgmt-IP) — that is a tracked #5719 C001 residual.
+	dnsNames := []string{"localhost"}
+	ipSANs := []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
+
+	// Add the kernel hostname as a SAN only when it is safe to encode. A valid
+	// ASCII DNS hostname goes in DNSNames; an IP-literal hostname goes in
+	// IPAddresses (a DNS SAN of an IP never verifies as an IP). A non-ASCII or
+	// otherwise malformed hostname is DROPPED, not appended: x509.Create-
+	// Certificate marshals DNSNames as an IA5String and HARD-FAILS on a
+	// non-ASCII name (e.g. a "café" kernel hostname). Under the #5058 all-or-
+	// nothing management-server lifecycle that abort would tear down the whole
+	// HTTP+HTTPS server, so degrade to loopback-only SANs instead of failing
+	// cert generation.
+	if ip := net.ParseIP(hostname); ip != nil {
+		if !ip.IsLoopback() { // loopback IPs already present above
+			ipSANs = append(ipSANs, ip)
+		}
+	} else if hostname != "localhost" && isDNSSANSafeHostname(hostname) {
+		dnsNames = append(dnsNames, hostname)
 	}
 
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: hostname, Organization: []string{"xpf"}},
+		Subject:      pkix.Name{CommonName: cn, Organization: []string{"xpf"}},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     dnsNames,
+		IPAddresses:  ipSANs,
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)

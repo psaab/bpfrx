@@ -213,6 +213,20 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 }
 
 func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsRequest) (*pb.GetNATRuleStatsResponse, error) {
+	// Reject an unknown nat_type selector rather than silently returning an
+	// empty result. Only "" (default = source), "source", and "destination"
+	// select a NAT-rule family below; any other value (a typo like "src" or
+	// "static") would fall through BOTH branches and render as "no NAT rules"
+	// — a false-empty diagnostic indistinguishable from a firewall that
+	// genuinely has no rules. Surface the bad selector as InvalidArgument so
+	// the operator sees the typo (codex-review-182 C-API selector hardening,
+	// same discipline as the show routing/zones/firewall unknown-selector
+	// diagnostics #4589/#4814/#3696).
+	if req.NatType != "" && req.NatType != "source" && req.NatType != "destination" {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"unknown NAT stats selector nat_type=%q (want \"source\" or \"destination\")", req.NatType)
+	}
+
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
 		return &pb.GetNATRuleStatsResponse{}, nil
