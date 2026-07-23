@@ -16,8 +16,35 @@ import (
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/rpm"
+	"github.com/psaab/xpf/pkg/sysservices"
 	"github.com/psaab/xpf/pkg/webmgmt"
 )
+
+// effectiveListeners builds the daemon-owned snapshot of the EFFECTIVE
+// (post-clamp, post-bind) management-listener addresses `show system services`
+// reports (#6385). BOTH renderers — the remote gRPC path (Config.ListenersFn)
+// and the local console CLI (SetListenersFn) — read this ONE method, so the two
+// surfaces can never disagree (the divergence that dropped the #6384 A10-b2-F5
+// attempt).
+//
+//   - gRPC: the effective serving address recorded by the gRPC server after its
+//     #5035 loopback clamp and net.Listen; falls back to the requested
+//     --grpc-addr in the brief pre-bind window (or if the server is not yet
+//     constructed).
+//   - HTTP REST: the converged bind address from the management reconciler, or
+//     "" (rendered "disabled") when the reconciler is absent — an empty
+//     --api-addr, where Daemon.Run never started the HTTP listener.
+func (d *Daemon) effectiveListeners() sysservices.Listeners {
+	var ls sysservices.Listeners
+	if d.grpcSrv != nil {
+		ls.GRPC = d.grpcSrv.EffectiveAddr()
+	}
+	if ls.GRPC == "" {
+		ls.GRPC = d.opts.GRPCAddr
+	}
+	ls.HTTP = d.mgmt.effectiveHTTPAddr()
+	return ls
+}
 
 // #5054/#5961: transport commit-wiring seams.
 //
@@ -195,6 +222,11 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			return ""
 		}(),
 		FwdSampler: fwdSampler,
+		// #6385: the remote gRPC `show system services` renderer reports the
+		// EFFECTIVE post-bind listener addresses from this daemon-owned snapshot,
+		// the SAME source the local console CLI reads (shell.SetListenersFn), so
+		// the two surfaces can never diverge.
+		ListenersFn: d.effectiveListeners,
 	})
 	d.grpcSrv = grpcSrv
 	wg.Add(1)

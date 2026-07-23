@@ -31,6 +31,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
+	"github.com/psaab/xpf/pkg/sysservices"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -164,6 +165,19 @@ func (s *Server) showChassisEnvironment(buf *strings.Builder) {
 // showSystemServices renders gRPC/HTTP/SSH/WebManagement/DNS/NTP and
 // derived service-state summaries (security log, syslog, NetFlow,
 // IPFIX, AppID, RPM).
+
+// effectiveListeners returns the shared management-listener snapshot for
+// `show system services` (#6385): the daemon-owned effective addresses when
+// wired (Config.ListenersFn -> Daemon.effectiveListeners), else the documented
+// loopback defaults for a no-daemon unit-test build. The defaults preserve the
+// pre-#6385 output shape when there is no live bind to read.
+func (s *Server) effectiveListeners() sysservices.Listeners {
+	if s.listenersFn != nil {
+		return s.listenersFn()
+	}
+	return sysservices.Listeners{GRPC: "127.0.0.1:50051", HTTP: "127.0.0.1:8080"}
+}
+
 func (s *Server) showSystemServices(buf *strings.Builder) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
@@ -171,8 +185,17 @@ func (s *Server) showSystemServices(buf *strings.Builder) {
 		return
 	}
 	fmt.Fprintln(buf, "System services:")
-	fmt.Fprintln(buf, "  gRPC:           127.0.0.1:50051 (always on)")
-	fmt.Fprintln(buf, "  HTTP REST:      127.0.0.1:8080 (always on)")
+	// #6385: report the EFFECTIVE (post-clamp, post-bind) listener addresses
+	// from the shared daemon-owned snapshot, not the hardcoded requested
+	// defaults. listenersFn is nil only in a no-daemon unit-test build, where we
+	// fall back to the documented loopback defaults. This is the SAME snapshot
+	// and the SAME renderer (Listeners.Lines) the local CLI uses, so the remote
+	// gRPC path (the common operator path) and the local console can never
+	// disagree — the divergence that dropped the #6384 A10-b2-F5 attempt.
+	ls := s.effectiveListeners()
+	for _, line := range ls.Lines() {
+		fmt.Fprintln(buf, line)
+	}
 	if cfg.System.Services != nil {
 		if cfg.System.Services.SSH != nil {
 			rootLogin := cfg.System.Services.SSH.RootLogin

@@ -257,6 +257,23 @@ credential revocation is enforced even on an apply that returns early
   serialized by its mutex and the apply semaphore, so a newer generation never
   completes behind an older one.
 
+#### Effective-listener snapshot for `show system services` (#6385)
+
+`show system services` reports the EFFECTIVE (post-clamp, post-bind) management
+listeners, not the requested/config-declared addresses. `Daemon.effectiveListeners`
+(`daemon_run_servers.go`) builds one `sysservices.Listeners` snapshot — gRPC from
+`grpcSrv.EffectiveAddr()` (the address recorded after the #5035 loopback clamp and
+`net.Listen`; falls back to `--grpc-addr` in the pre-bind window), HTTP REST from
+`d.mgmt.effectiveHTTPAddr()` (the converged `m.cur.addr`, `""` → rendered
+`disabled` when `--api-addr` is empty and the listener was never started). BOTH
+render surfaces read this ONE snapshot: the remote gRPC renderer via
+`grpcapi.Config.ListenersFn` and the local console CLI via `cli.SetListenersFn`,
+both formatting through `sysservices.Listeners.Lines`, so the two surfaces can
+never disagree. Before #6385 both renderers hardcoded
+`127.0.0.1:50051 / 127.0.0.1:8080 (always on)`, so a relocated, clamped, or
+disabled listener was reported wrong; the remote gRPC path (the common operator
+path) was the one a local-only fix left unfixed (the dropped #6384 A10-b2-F5).
+
 ## Cluster mode
 
 Detected by the presence of `/etc/xpf/node-id` (contents `0` or `1`).

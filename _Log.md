@@ -58845,3 +58845,40 @@ top.
   - **File(s)**: pkg/daemon/daemon_ipsec_rebind.go,
     pkg/daemon/daemon_ipsec_rebind_flush_bound_6397_test.go,
     pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385 — `show system services` reports EFFECTIVE post-bind
+    management-listener addresses on BOTH surfaces (re-file of fix-5 dropped
+    from #6384). Root cause: the remote gRPC renderer
+    (`pkg/grpcapi/server_show_system.go`) AND the local CLI renderer
+    (`pkg/cli/cli_show_system.go`) each hardcoded
+    `127.0.0.1:50051 / 127.0.0.1:8080 (always on)`, reporting the
+    requested/config-declared listeners, not the addresses the daemon
+    actually bound (post-#5035 gRPC loopback clamp / post-#4047/#5127 REST
+    clamp / disabled listener). A local-only patch left the remote path — the
+    common operator path — wrong. Fix: new leaf pkg `pkg/sysservices`
+    (`Listeners` + shared `Lines()` renderer, stdlib-only). Daemon aggregator
+    `Daemon.effectiveListeners()` builds ONE snapshot — gRPC from a new
+    `grpcapi.Server.EffectiveAddr()` recorded after `net.Listen`, HTTP REST
+    from a new `managementReconciler.effectiveHTTPAddr()` (converged
+    `m.cur.addr`; `""` -> rendered `disabled` when `--api-addr` empty). BOTH
+    renderers read that ONE snapshot: gRPC via `Config.ListenersFn`, local CLI
+    via `SetListenersFn`, both formatting through `Listeners.Lines`, so local
+    and remote can never diverge. Surface enumeration: only two `System
+    services:` emitters exist (local CLI + remote gRPC) — both fixed; no HTTP
+    REST / JSON / display-xml variant renders the listener block. Fail-on-
+    revert nets: `TestShowSystemServicesEffectiveListenersGRPC` (primary,
+    remote path) + `TestShowSystemServicesEffectiveListenersLocal` +
+    `sysservices.TestListenersLines`; each RED verified FIRSTHAND by
+    neutralizing the render substitution (clean ASSERTION failure, nil-
+    fallback test stays GREEN), restored -> GREEN. build+vet+gofmt clean;
+    `go test ./pkg/sysservices/ ./pkg/grpcapi/ ./pkg/cli/ ./pkg/daemon/`
+    GREEN. Unit-testable show-render class — no loss-cluster smoke needed.
+  - **File(s)**: pkg/sysservices/listeners.go,
+    pkg/sysservices/listeners_test.go, pkg/grpcapi/server.go,
+    pkg/grpcapi/server_show_system.go,
+    pkg/grpcapi/server_show_system_listeners_6385_test.go,
+    pkg/cli/cli.go, pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_listeners_6385_test.go,
+    pkg/daemon/management.go, pkg/daemon/daemon_run_servers.go,
+    pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md

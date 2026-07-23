@@ -40,6 +40,7 @@ import (
 	"github.com/psaab/xpf/pkg/ra"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
+	"github.com/psaab/xpf/pkg/sysservices"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
@@ -121,6 +122,13 @@ type Config struct {
 	FabricPeerAddrFn func() []string    // returns peer fabric IPs (fab0, fab1; empty if standalone)
 	FabricVRFDevice  string             // VRF for fabric interface (e.g. "vrf-mgmt")
 	FwdSampler       *fwdstatus.Sampler // #881: 5s/1m/5m CPU windows for `show chassis forwarding`
+	// ListenersFn returns the EFFECTIVE (post-clamp, post-bind) management
+	// listener addresses `show system services` reports (#6385). The daemon
+	// wires it to Daemon.effectiveListeners so the remote gRPC renderer and the
+	// local CLI read ONE daemon-owned snapshot and can never disagree. nil in a
+	// unit-test / no-daemon build, where showSystemServices falls back to the
+	// documented loopback defaults.
+	ListenersFn func() sysservices.Listeners
 }
 
 // Server implements the BpfrxService gRPC service.
@@ -157,9 +165,20 @@ type Server struct {
 	startTime             time.Time
 	addr                  string
 	version               string
-	fabricPeerAddrFn      func() []string
-	fabricVRFDevice       string
-	peerSystemActionFn    func(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error)
+	// listenersFn returns the effective management-listener snapshot for
+	// `show system services` (#6385). Wired from Config.ListenersFn; nil in a
+	// no-daemon unit-test build.
+	listenersFn func() sysservices.Listeners
+	// effAddrMu guards effAddr, the effective (post-#5035 clamp, post-net.Listen)
+	// primary gRPC bind address recorded by Run once the listener binds. The
+	// daemon reads it (EffectiveAddr) to build the shared listener snapshot, so
+	// `show system services` reports the address the gRPC listener is actually
+	// serving, not the requested --grpc-addr.
+	effAddrMu          sync.Mutex
+	effAddr            string
+	fabricPeerAddrFn   func() []string
+	fabricVRFDevice    string
+	peerSystemActionFn func(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error)
 	// peerZonePairSummaryFn is a test seam for the GetZonePairSummary peer
 	// fan-out leg (#3592). Production leaves it nil and proxyPeerZonePairSummary
 	// dials the real peer; a unit test wires it to observe the forwarded
@@ -265,7 +284,24 @@ func NewServer(addr string, cfg Config) *Server {
 		version:               cfg.Version,
 		fabricPeerAddrFn:      cfg.FabricPeerAddrFn,
 		fabricVRFDevice:       cfg.FabricVRFDevice,
+		listenersFn:           cfg.ListenersFn,
 	}
+}
+
+// EffectiveAddr returns the effective (post-#5035 loopback clamp,
+// post-net.Listen) primary gRPC bind address, or "" before the listener has
+// bound. The daemon reads it to build the shared `show system services`
+// listener snapshot (#6385).
+func (s *Server) EffectiveAddr() string {
+	s.effAddrMu.Lock()
+	defer s.effAddrMu.Unlock()
+	return s.effAddr
+}
+
+func (s *Server) setEffectiveAddr(addr string) {
+	s.effAddrMu.Lock()
+	s.effAddr = addr
+	s.effAddrMu.Unlock()
 }
 
 // Run starts the gRPC server and blocks until ctx is cancelled.
@@ -363,6 +399,11 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("gRPC listen: %w", err)
 	}
+	// Record the effective serving address (post-clamp, post-bind) so
+	// `show system services` reports what the primary gRPC listener actually
+	// bound, not the requested --grpc-addr (#6385). lis.Addr() is authoritative
+	// (e.g. a ":50051" wildcard clamp resolves to a concrete host:port).
+	s.setEffectiveAddr(lis.Addr().String())
 
 	srv := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),

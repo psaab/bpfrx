@@ -12,6 +12,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
+	"github.com/psaab/xpf/pkg/sysservices"
 	"golang.org/x/sys/unix"
 )
 
@@ -256,6 +257,18 @@ func (c *CLI) showSystemNTP() error {
 
 // printChronyTracking parses chronyc tracking output and prints key fields.
 
+// effectiveListeners returns the shared management-listener snapshot for
+// `show system services` (#6385): the daemon-owned effective addresses when
+// wired (SetListenersFn -> Daemon.effectiveListeners), else the documented
+// loopback defaults for an offline / no-daemon CLI. The defaults preserve the
+// pre-#6385 output shape when there is no live bind to read.
+func (c *CLI) effectiveListeners() sysservices.Listeners {
+	if c.listenersFn != nil {
+		return c.listenersFn()
+	}
+	return sysservices.Listeners{GRPC: "127.0.0.1:50051", HTTP: "127.0.0.1:8080"}
+}
+
 func (c *CLI) showSystemServices() error {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil {
@@ -265,10 +278,16 @@ func (c *CLI) showSystemServices() error {
 
 	fmt.Println("System services:")
 
-	// gRPC
-	fmt.Println("  gRPC:           127.0.0.1:50051 (always on)")
-	// HTTP REST
-	fmt.Println("  HTTP REST:      127.0.0.1:8080 (always on)")
+	// #6385: report the EFFECTIVE (post-clamp, post-bind) listener addresses
+	// from the shared daemon-owned snapshot, not hardcoded requested defaults.
+	// This is the SAME snapshot and the SAME renderer (Listeners.Lines) the
+	// remote gRPC path uses, so the local console and the remote `cli` can never
+	// disagree. listenersFn is nil only when the CLI is spawned outside the
+	// daemon (offline recovery / unit test), where we fall back to the documented
+	// loopback defaults.
+	for _, line := range c.effectiveListeners().Lines() {
+		fmt.Println(line)
+	}
 
 	// SSH
 	if cfg.System.Services != nil && cfg.System.Services.SSH != nil {

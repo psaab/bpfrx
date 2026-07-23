@@ -130,6 +130,25 @@ func (m *managementReconciler) startTo(ctx context.Context, next api.Config) err
 	return nil
 }
 
+// effectiveHTTPAddr returns the effective (last-CONVERGED, actually-serving)
+// HTTP REST bind address for `show system services` (#6385). It reads the
+// converged per-leg fingerprint (m.cur.addr) — which advances only on a
+// successful (re)bind and is RETAINED on a failed rebind — so the reported
+// address is the one the listener is truly serving, not the requested config.
+// Empty when the listener never converged (boot bind failure); a nil reconciler
+// (empty --api-addr, HTTP disabled) is handled by the caller.
+func (m *managementReconciler) effectiveHTTPAddr() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.curSet {
+		return ""
+	}
+	return m.cur.addr
+}
+
 // reconcile matches the live listener + auth snapshot to cfg. It returns a
 // non-nil error ONLY when an endpoint replacement could not bind — in that case
 // the OLD listener is retained (fail-safe) and the next commit retries. An
