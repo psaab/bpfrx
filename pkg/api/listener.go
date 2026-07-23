@@ -123,6 +123,22 @@ func (s *Server) Wait() {
 	s.wg.Wait()
 }
 
+// EffectiveHTTPAddr returns the ACTUAL bound address of the live HTTP leg, or ""
+// when no HTTP leg is serving. It reads the listener's own Addr, so an ephemeral
+// `:0` request resolves to its concrete port and a wildcard/hostname bind is
+// normalized — the address the socket is truly on, not the requested one. The
+// #6385/#6401 `show system services` effective-listener snapshot reads it (via
+// managementReconciler.effectiveHTTPListener), mirroring the grpcapi.Server
+// EffectiveListener pattern.
+func (s *Server) EffectiveHTTPAddr() string {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	if s.httpLeg == nil || s.httpLeg.ln == nil {
+		return ""
+	}
+	return s.httpLeg.ln.Addr().String()
+}
+
 // ReconcileHTTP make-before-break rebinds ONLY the HTTP listener to addr (#5866),
 // leaving the HTTPS leg untouched. A same-addr call is a no-op. The new listener
 // is bound and serving BEFORE the old is retired (no unreachable HTTP window). A

@@ -257,22 +257,43 @@ credential revocation is enforced even on an apply that returns early
   serialized by its mutex and the apply semaphore, so a newer generation never
   completes behind an older one.
 
-#### Effective-listener snapshot for `show system services` (#6385)
+#### Effective-listener snapshot for `show system services` (#6385/#6401)
 
-`show system services` reports the EFFECTIVE (post-clamp, post-bind) management
-listeners, not the requested/config-declared addresses. `Daemon.effectiveListeners`
-(`daemon_run_servers.go`) builds one `sysservices.Listeners` snapshot — gRPC from
-`grpcSrv.EffectiveAddr()` (the address recorded after the #5035 loopback clamp and
-`net.Listen`; falls back to `--grpc-addr` in the pre-bind window), HTTP REST from
-`d.mgmt.effectiveHTTPAddr()` (the converged `m.cur.addr`, `""` → rendered
-`disabled` when `--api-addr` is empty and the listener was never started). BOTH
-render surfaces read this ONE snapshot: the remote gRPC renderer via
+`show system services` reports the EFFECTIVE STATE of each management listener,
+not the requested/config-declared addresses. `Daemon.effectiveListeners`
+(`daemon_run_servers.go`) builds one `sysservices.Listeners` snapshot. Each row
+is a `sysservices.Listener{Addr, State}` where `State` ∈ {`Listening`, `Failed`,
+`Disabled`} (#6401) — so a CONFIGURED-but-FAILED bind is reported as
+`addr (bind failed)`, distinct from a genuinely-off listener's `disabled` and
+from a serving listener's bare address:
+
+- **gRPC** — `grpcSrv.EffectiveListener()`. The gRPC server records its own
+  lifecycle (`grpcListenState`): `Listening` with the actual bound address
+  (`lis.Addr()`, post-#5035 loopback clamp), `Failed` on a `net.Listen` error or
+  once the serve loop exits (the bound address is CLEARED so a dead server never
+  reports a stale bind), and — in the brief pre-bind startup window — `Listening`
+  on the requested `--grpc-addr`. gRPC is always configured, so it is never
+  `Disabled`. Before the server is even constructed, `effectiveListeners`
+  synthesizes pre-bind `Listening` on `--grpc-addr`.
+- **HTTP REST** — `d.mgmt.effectiveHTTPListener()`. `Disabled` when the
+  reconciler is absent (empty `--api-addr`, listener never started); `Failed`
+  (reporting the attempted `lastHTTPAttempt`) when it was configured but the boot
+  bind never converged (`curSet` false); else `Listening` on the ACTUAL bound
+  address read from the live server (`api.Server.EffectiveHTTPAddr()` →
+  `httpLeg.ln.Addr()`, so an ephemeral `:0` resolves to its concrete port and a
+  wildcard/hostname bind is normalized), falling back to the converged
+  `m.cur.addr`. A day-2 rebind failure RETAINS the old serving leg (`curSet`
+  stays true), so this reports the address still serving, not the failed new
+  bind.
+
+BOTH render surfaces read this ONE snapshot: the remote gRPC renderer via
 `grpcapi.Config.ListenersFn` and the local console CLI via `cli.SetListenersFn`,
 both formatting through `sysservices.Listeners.Lines`, so the two surfaces can
 never disagree. Before #6385 both renderers hardcoded
-`127.0.0.1:50051 / 127.0.0.1:8080 (always on)`, so a relocated, clamped, or
-disabled listener was reported wrong; the remote gRPC path (the common operator
-path) was the one a local-only fix left unfixed (the dropped #6384 A10-b2-F5).
+`127.0.0.1:50051 / 127.0.0.1:8080 (always on)`, so a relocated, clamped, failed,
+or disabled listener was reported wrong; the remote gRPC path (the common
+operator path) was the one a local-only fix left unfixed (the dropped #6384
+A10-b2-F5).
 
 ## Cluster mode
 

@@ -175,7 +175,10 @@ func (s *Server) effectiveListeners() sysservices.Listeners {
 	if s.listenersFn != nil {
 		return s.listenersFn()
 	}
-	return sysservices.Listeners{GRPC: "127.0.0.1:50051", HTTP: "127.0.0.1:8080"}
+	return sysservices.Listeners{
+		GRPC: sysservices.Listener{Addr: "127.0.0.1:50051", State: sysservices.StateListening},
+		HTTP: sysservices.Listener{Addr: "127.0.0.1:8080", State: sysservices.StateListening},
+	}
 }
 
 func (s *Server) showSystemServices(buf *strings.Builder) {

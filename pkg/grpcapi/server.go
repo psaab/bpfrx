@@ -169,13 +169,19 @@ type Server struct {
 	// `show system services` (#6385). Wired from Config.ListenersFn; nil in a
 	// no-daemon unit-test build.
 	listenersFn func() sysservices.Listeners
-	// effAddrMu guards effAddr, the effective (post-#5035 clamp, post-net.Listen)
-	// primary gRPC bind address recorded by Run once the listener binds. The
-	// daemon reads it (EffectiveAddr) to build the shared listener snapshot, so
-	// `show system services` reports the address the gRPC listener is actually
-	// serving, not the requested --grpc-addr.
-	effAddrMu          sync.Mutex
+	// requestedAddr is the primary gRPC bind requested at construction
+	// (--grpc-addr). Immutable, so it is read without effMu; it is the fallback
+	// address reported while pre-bind and on a bind failure (#6385/#6401).
+	requestedAddr string
+	// effMu guards the primary gRPC listener state Run records for the
+	// `show system services` effective-listener snapshot (#6385/#6401): effAddr
+	// is the actual bound address (post-#5035 clamp, post-net.Listen), effState
+	// tracks pre-bind → serving → failed. The daemon reads them via
+	// EffectiveListener so the CLI reports what the listener is truly doing, not
+	// the requested --grpc-addr.
+	effMu              sync.Mutex
 	effAddr            string
+	effState           grpcListenState
 	fabricPeerAddrFn   func() []string
 	fabricVRFDevice    string
 	peerSystemActionFn func(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error)
@@ -281,6 +287,7 @@ func NewServer(addr string, cfg Config) *Server {
 		fwdSampler:            cfg.FwdSampler,
 		startTime:             time.Now(),
 		addr:                  addr,
+		requestedAddr:         addr,
 		version:               cfg.Version,
 		fabricPeerAddrFn:      cfg.FabricPeerAddrFn,
 		fabricVRFDevice:       cfg.FabricVRFDevice,
@@ -288,20 +295,51 @@ func NewServer(addr string, cfg Config) *Server {
 	}
 }
 
-// EffectiveAddr returns the effective (post-#5035 loopback clamp,
-// post-net.Listen) primary gRPC bind address, or "" before the listener has
-// bound. The daemon reads it to build the shared `show system services`
-// listener snapshot (#6385).
-func (s *Server) EffectiveAddr() string {
-	s.effAddrMu.Lock()
-	defer s.effAddrMu.Unlock()
-	return s.effAddr
+// grpcListenState tracks the primary gRPC listener lifecycle for the
+// `show system services` effective-listener snapshot (#6385/#6401).
+type grpcListenState int
+
+const (
+	// grpcPreBind: constructed, Run has not yet bound the listener (the brief
+	// startup window). gRPC is loopback and essentially always binds, so this
+	// renders as Listening on the requested address rather than flagging a
+	// transient failure.
+	grpcPreBind grpcListenState = iota
+	// grpcListening: net.Listen succeeded and the serve loop is active.
+	grpcListening
+	// grpcFailed: net.Listen failed or the serve loop exited (Run returned) —
+	// the control plane is no longer serving on this listener.
+	grpcFailed
+)
+
+// EffectiveListener returns the effective state of the primary gRPC listener
+// for the shared `show system services` snapshot (#6385/#6401): Listening with
+// the actual bound address while serving, Failed on a bind failure / serve exit
+// (with the requested/last-known address), or — in the brief pre-bind startup
+// window — Listening on the requested address. gRPC is always configured, so it
+// is never reported Disabled.
+func (s *Server) EffectiveListener() sysservices.Listener {
+	s.effMu.Lock()
+	defer s.effMu.Unlock()
+	switch s.effState {
+	case grpcListening:
+		return sysservices.Listener{Addr: s.effAddr, State: sysservices.StateListening}
+	case grpcFailed:
+		addr := s.effAddr
+		if addr == "" {
+			addr = s.requestedAddr
+		}
+		return sysservices.Listener{Addr: addr, State: sysservices.StateFailed}
+	default: // grpcPreBind
+		return sysservices.Listener{Addr: s.requestedAddr, State: sysservices.StateListening}
+	}
 }
 
-func (s *Server) setEffectiveAddr(addr string) {
-	s.effAddrMu.Lock()
+func (s *Server) setListenState(addr string, state grpcListenState) {
+	s.effMu.Lock()
 	s.effAddr = addr
-	s.effAddrMu.Unlock()
+	s.effState = state
+	s.effMu.Unlock()
 }
 
 // Run starts the gRPC server and blocks until ctx is cancelled.
@@ -397,13 +435,17 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	lis, err := net.Listen("tcp", s.addr)
 	if err != nil {
+		// The bind failed — record Failed so `show system services` reports the
+		// requested address as (bind failed), not as if it were serving
+		// (#6385/#6401). The daemon logs the returned error non-fatally.
+		s.setListenState("", grpcFailed)
 		return fmt.Errorf("gRPC listen: %w", err)
 	}
 	// Record the effective serving address (post-clamp, post-bind) so
 	// `show system services` reports what the primary gRPC listener actually
 	// bound, not the requested --grpc-addr (#6385). lis.Addr() is authoritative
 	// (e.g. a ":50051" wildcard clamp resolves to a concrete host:port).
-	s.setEffectiveAddr(lis.Addr().String())
+	s.setListenState(lis.Addr().String(), grpcListening)
 
 	srv := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
@@ -413,7 +455,15 @@ func (s *Server) Run(ctx context.Context) error {
 		grpc.StatsHandler(&configLockStatsHandler{s: s}),
 	)
 	slog.Info("gRPC server listening", "addr", s.addr)
-	return s.serveUntilDone(ctx, srv, lis)
+	// serveUntilDone returns when the serve loop exits (ctx cancel on a clean
+	// shutdown, or a Serve error). Either way the listener is no longer serving,
+	// so clear the bound address to Failed — a later local-console `show system
+	// services` must not report a stale bound address for a dead server
+	// (#6401). serveUntilDone is shared with the fabric listener, so the clear
+	// lives HERE (Run) and never in the shared helper.
+	runErr := s.serveUntilDone(ctx, srv, lis)
+	s.setListenState("", grpcFailed)
+	return runErr
 }
 
 // serveUntilDone registers the service on srv, serves lis, and on ctx

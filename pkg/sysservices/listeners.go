@@ -4,55 +4,93 @@
 // local interactive CLI (pkg/cli), and the remote gRPC renderer (pkg/grpcapi)
 // can all depend on it without an import cycle.
 //
-// The point of this package (#6385): both `show system services` renderers —
-// the local CLI (pkg/cli/cli_show_system.go) AND the remote gRPC renderer
-// (pkg/grpcapi/server_show_system.go, the path the remote `cli` binary reaches)
-// — read ONE daemon-owned snapshot of the addresses the listeners ACTUALLY
-// bound, not the requested/config-declared values. Before #6385 both renderers
+// The point of this package (#6385/#6401): both `show system services`
+// renderers — the local CLI (pkg/cli/cli_show_system.go) AND the remote gRPC
+// renderer (pkg/grpcapi/server_show_system.go, the path the remote `cli` binary
+// reaches) — read ONE daemon-owned snapshot of what each listener is ACTUALLY
+// doing, not the requested/config-declared values. Before #6385 both renderers
 // hardcoded `127.0.0.1:50051 (always on)` / `127.0.0.1:8080 (always on)`, so a
 // relocated, loopback-clamped (#5035/#5127), or disabled listener was reported
 // wrong, and a dropped local-only patch (the #6384 A10-b2-F5 attempt) left the
 // local and remote surfaces disagreeing. Sourcing both from Lines() guarantees
 // they can never diverge again.
+//
+// #6401 fold: each listener carries a STATE (not just an address) so a
+// CONFIGURED-but-FAILED bind is reported as such rather than misread as either
+// serving (the old requested-addr fallback) or off ("disabled").
 package sysservices
 
 import "fmt"
 
-// Listeners is the EFFECTIVE (post-clamp, post-bind) address of each management
-// listener `show system services` reports. The daemon builds it after the
-// listeners bind (Daemon.effectiveListeners); a nil snapshot source in a
-// renderer means the CLI was spawned outside a running daemon (offline
-// recovery / unit test), where there is no live bind to read.
+// State is the operational state of a management listener.
+type State int
+
+const (
+	// StateDisabled: the listener is not configured / off (e.g. an empty
+	// --api-addr, where the daemon never started the HTTP REST listener). Zero
+	// value so a zero Listener renders "disabled".
+	StateDisabled State = iota
+	// StateListening: the listener is bound and serving at Addr.
+	StateListening
+	// StateFailed: the listener is CONFIGURED but not currently serving — its
+	// bind failed (net.Listen error) or its serve loop exited. Addr is the
+	// address it tried to bind (may be empty when unknown). Distinct from
+	// StateDisabled so an operator can tell a genuinely-off listener from one
+	// that failed to come up.
+	StateFailed
+)
+
+// Listener is the effective state of one management listener.
+type Listener struct {
+	// Addr is the bind address. For StateListening it is the ACTUAL bound
+	// address (post-clamp, post-bind — an ephemeral :0 request resolves to its
+	// concrete port); for StateFailed it is the address that failed to bind (or
+	// "" when unknown); for StateDisabled it is ignored.
+	Addr string
+	// State is the listener's operational state.
+	State State
+}
+
+// render formats one listener cell: the address when serving, an
+// address-tagged "(bind failed)" (or bare "bind failed") when failed,
+// "disabled" when off.
+func (l Listener) render() string {
+	switch l.State {
+	case StateListening:
+		return l.Addr
+	case StateFailed:
+		if l.Addr != "" {
+			return l.Addr + " (bind failed)"
+		}
+		return "bind failed"
+	default: // StateDisabled
+		return "disabled"
+	}
+}
+
+// Listeners is the EFFECTIVE state of each management listener `show system
+// services` reports. The daemon builds it after the listeners bind
+// (Daemon.effectiveListeners); a nil snapshot source in a renderer means the
+// CLI was spawned outside a running daemon (offline recovery / unit test), where
+// there is no live listener to read.
 type Listeners struct {
-	// GRPC is the effective gRPC bind address AFTER the #5035 loopback clamp
-	// and net.Listen (the address the listener is actually serving). It is
-	// empty only in the brief window before the primary gRPC listener has
-	// bound; the daemon falls back to the requested --grpc-addr there so the
-	// field is effectively always populated at render time.
-	GRPC string
-	// HTTP is the effective HTTP REST bind address. An EMPTY value means the
-	// REST listener is DISABLED — the operator passed an empty --api-addr, so
-	// the daemon never started it (Daemon.Run guards startHTTPServer on a
-	// non-empty APIAddr). Rendered as "disabled" rather than a fixed
-	// `127.0.0.1:8080 (always on)`.
-	HTTP string
+	// GRPC is the primary (loopback, unauthenticated) gRPC control listener. It
+	// is always configured, so it is never StateDisabled — StateListening while
+	// serving, StateFailed if net.Listen failed or the serve loop exited.
+	GRPC Listener
+	// HTTP is the HTTP REST listener. StateDisabled when --api-addr is empty (the
+	// daemon never started it), StateFailed on a boot bind failure, else
+	// StateListening.
+	HTTP Listener
 }
 
 // Lines renders the gRPC / HTTP REST listener rows for `show system services`,
-// in render order, driven by the effective addresses. It is the SINGLE
-// formatter both the local CLI and remote gRPC renderers call, so the two
-// surfaces are byte-identical by construction. An empty address renders
-// "disabled".
+// in render order, driven by the effective state. It is the SINGLE formatter
+// both the local CLI and remote gRPC renderers call, so the two surfaces are
+// byte-identical by construction.
 func (l Listeners) Lines() []string {
 	return []string{
-		fmt.Sprintf("  gRPC:           %s", orDisabled(l.GRPC)),
-		fmt.Sprintf("  HTTP REST:      %s", orDisabled(l.HTTP)),
+		fmt.Sprintf("  gRPC:           %s", l.GRPC.render()),
+		fmt.Sprintf("  HTTP REST:      %s", l.HTTP.render()),
 	}
-}
-
-func orDisabled(addr string) string {
-	if addr == "" {
-		return "disabled"
-	}
-	return addr
 }

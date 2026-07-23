@@ -326,6 +326,11 @@ under the daemon's errgroup. Nothing else imports this package.
     re-enable, HTTPS-bind-only change, HTTP-change-keeps-HTTPS, auth swap,
     bind-failure retain-old). `Run`/`serveBound` remain the single-lifecycle test
     entry point.
+  - `EffectiveHTTPAddr()` (#6385/#6401) returns the live HTTP leg's ACTUAL bound
+    address (`httpLeg.ln.Addr()`) — an ephemeral `:0` request resolves to its
+    concrete port, a wildcard/hostname bind is normalized — or `""` when no HTTP
+    leg is serving. The daemon's `show system services` effective-listener
+    snapshot reads it (`managementReconciler.effectiveHTTPListener`).
   - The auto-generated HTTPS cert (`generateSelfSignedCertAt`, used when no
     operator cert is provisioned) carries Subject Alternative Names, not just a
     CommonName (#5719, codex-review-182 C-API TLS hygiene). Every modern TLS

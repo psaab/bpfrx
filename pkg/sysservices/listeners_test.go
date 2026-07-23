@@ -6,10 +6,11 @@ import (
 )
 
 // TestListenersLines pins the shared `show system services` listener renderer
-// (#6385): effective addresses render verbatim, an empty address renders
-// "disabled", and the two rows come out in render order. Both the local CLI and
-// remote gRPC renderers call Lines, so this is where the shared format contract
-// lives.
+// (#6385/#6401): a Listening address renders verbatim, a Failed listener renders
+// "addr (bind failed)" (or bare "bind failed" when the address is unknown), a
+// Disabled listener renders "disabled", and the two rows come out in render
+// order. Both the local CLI and remote gRPC renderers call Lines, so this is
+// where the shared format contract lives.
 func TestListenersLines(t *testing.T) {
 	cases := []struct {
 		name string
@@ -17,8 +18,11 @@ func TestListenersLines(t *testing.T) {
 		want []string
 	}{
 		{
-			name: "both bound",
-			in:   Listeners{GRPC: "127.0.0.1:50051", HTTP: "127.0.0.1:8080"},
+			name: "both listening",
+			in: Listeners{
+				GRPC: Listener{Addr: "127.0.0.1:50051", State: StateListening},
+				HTTP: Listener{Addr: "127.0.0.1:8080", State: StateListening},
+			},
 			want: []string{
 				"  gRPC:           127.0.0.1:50051",
 				"  HTTP REST:      127.0.0.1:8080",
@@ -26,14 +30,39 @@ func TestListenersLines(t *testing.T) {
 		},
 		{
 			name: "relocated grpc, http disabled",
-			in:   Listeners{GRPC: "127.0.0.1:50055"},
+			in: Listeners{
+				GRPC: Listener{Addr: "127.0.0.1:50055", State: StateListening},
+				HTTP: Listener{State: StateDisabled},
+			},
 			want: []string{
 				"  gRPC:           127.0.0.1:50055",
 				"  HTTP REST:      disabled",
 			},
 		},
 		{
-			name: "both disabled",
+			name: "http bind failed with address",
+			in: Listeners{
+				GRPC: Listener{Addr: "127.0.0.1:50051", State: StateListening},
+				HTTP: Listener{Addr: "192.0.2.1:8080", State: StateFailed},
+			},
+			want: []string{
+				"  gRPC:           127.0.0.1:50051",
+				"  HTTP REST:      192.0.2.1:8080 (bind failed)",
+			},
+		},
+		{
+			name: "grpc bind failed no address",
+			in: Listeners{
+				GRPC: Listener{State: StateFailed},
+				HTTP: Listener{Addr: "127.0.0.1:8080", State: StateListening},
+			},
+			want: []string{
+				"  gRPC:           bind failed",
+				"  HTTP REST:      127.0.0.1:8080",
+			},
+		},
+		{
+			name: "zero value renders disabled",
 			in:   Listeners{},
 			want: []string{
 				"  gRPC:           disabled",

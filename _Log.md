@@ -58882,3 +58882,42 @@ top.
     pkg/cli/cli_show_system_listeners_6385_test.go,
     pkg/daemon/management.go, pkg/daemon/daemon_run_servers.go,
     pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385/#6401 fold — model listener STATE, not just an address
+    (Codex MERGE-NEEDS-MAJOR completeness gap adjudicated real by team-lead).
+    `sysservices.Listener` now carries `{Addr, State}` with State ∈
+    {StateListening, StateFailed, StateDisabled}; `Lines()` renders Listening →
+    "addr", Failed → "addr (bind failed)" / "bind failed", Disabled →
+    "disabled". gRPC state: `grpcapi.Server` records a `grpcListenState`
+    (pre-bind → listening → failed); `EffectiveListener()` replaces
+    `EffectiveAddr()` — net.Listen error → Failed(requested addr); serve-loop
+    exit CLEARS the bound addr → Failed (no stale bind for a dead server);
+    pre-bind → Listening(requested). HTTP state:
+    `managementReconciler.effectiveHTTPListener()` — nil reconciler (empty
+    --api-addr) → Disabled; configured-but-boot-bind-failed (curSet false) →
+    Failed(lastHTTPAttempt, recorded pre-bind in startTo); converged →
+    Listening. #4 fold: HTTP Listening addr sourced from the ACTUAL bound
+    listener via new `api.Server.EffectiveHTTPAddr()` (httpLeg.ln.Addr()), so
+    --api-addr=127.0.0.1:0 reports the concrete ephemeral port, not ":0".
+    Daemon aggregator `effectiveListeners()` maps both into one
+    `sysservices.Listeners`. New fail-on-revert nets (each RED verified
+    firsthand, clean ASSERTION failure, restored GREEN): grpcapi
+    TestGRPCEffectiveListenerBindFailure (real Run against an in-use addr →
+    Failed) + TestGRPCEffectiveListenerLifecycle (pre-bind→bound-concrete-port
+    →serve-exit-clears) + TestShowSystemServicesFailedHTTPGRPC (remote render
+    "(bind failed)"); daemon TestEffectiveHTTPListenerStatesDistinct
+    (Disabled≠Failed≠Listening) + TestEffectiveHTTPListenerEphemeralPort (:0 →
+    concrete); sysservices Lines() Failed/Disabled cases. gofmt/vet clean;
+    `go test ./pkg/sysservices/ ./pkg/api/ ./pkg/grpcapi/ ./pkg/cli/
+    ./pkg/daemon/` GREEN, `-race` GREEN on the listener tests. docs:
+    pkg/daemon/README.md effective-listener section rewritten for the state
+    model; pkg/api/README.md notes EffectiveHTTPAddr.
+  - **File(s)**: pkg/sysservices/listeners.go,
+    pkg/sysservices/listeners_test.go, pkg/api/listener.go, pkg/api/README.md,
+    pkg/grpcapi/server.go, pkg/grpcapi/server_show_system.go,
+    pkg/grpcapi/server_show_system_listeners_6385_test.go, pkg/cli/cli.go,
+    pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_listeners_6385_test.go,
+    pkg/daemon/management.go, pkg/daemon/daemon_run_servers.go,
+    pkg/daemon/effective_listeners_6401_test.go, pkg/daemon/README.md, _Log.md

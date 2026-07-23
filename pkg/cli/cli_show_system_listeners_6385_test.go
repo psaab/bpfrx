@@ -42,7 +42,10 @@ func newCLIActiveConfigStore(t *testing.T) *CLI {
 func TestShowSystemServicesEffectiveListenersLocal(t *testing.T) {
 	c := newCLIActiveConfigStore(t)
 	c.listenersFn = func() sysservices.Listeners {
-		return sysservices.Listeners{GRPC: "127.0.0.1:50055"} // HTTP empty => disabled
+		return sysservices.Listeners{
+			GRPC: sysservices.Listener{Addr: "127.0.0.1:50055", State: sysservices.StateListening},
+			HTTP: sysservices.Listener{State: sysservices.StateDisabled},
+		}
 	}
 
 	out := captureStdout(t, func() {

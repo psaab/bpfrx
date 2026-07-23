@@ -21,28 +21,29 @@ import (
 )
 
 // effectiveListeners builds the daemon-owned snapshot of the EFFECTIVE
-// (post-clamp, post-bind) management-listener addresses `show system services`
-// reports (#6385). BOTH renderers — the remote gRPC path (Config.ListenersFn)
-// and the local console CLI (SetListenersFn) — read this ONE method, so the two
-// surfaces can never disagree (the divergence that dropped the #6384 A10-b2-F5
-// attempt).
+// management-listener STATE `show system services` reports (#6385/#6401). BOTH
+// renderers — the remote gRPC path (Config.ListenersFn) and the local console
+// CLI (SetListenersFn) — read this ONE method, so the two surfaces can never
+// disagree (the divergence that dropped the #6384 A10-b2-F5 attempt).
 //
-//   - gRPC: the effective serving address recorded by the gRPC server after its
-//     #5035 loopback clamp and net.Listen; falls back to the requested
-//     --grpc-addr in the brief pre-bind window (or if the server is not yet
-//     constructed).
-//   - HTTP REST: the converged bind address from the management reconciler, or
-//     "" (rendered "disabled") when the reconciler is absent — an empty
-//     --api-addr, where Daemon.Run never started the HTTP listener.
+//   - gRPC: the primary gRPC listener's state (EffectiveListener) — Listening
+//     with the actual bound address, Failed on a bind failure / serve exit, or
+//     Listening on the requested --grpc-addr in the brief pre-bind window.
+//     Before the server is even constructed, report the requested address as
+//     Listening (pre-bind).
+//   - HTTP REST: the reconciler's state (effectiveHTTPListener) — Listening with
+//     the actual bound address, Failed on a boot bind failure, or Disabled when
+//     the reconciler is absent (empty --api-addr, listener never started).
 func (d *Daemon) effectiveListeners() sysservices.Listeners {
 	var ls sysservices.Listeners
 	if d.grpcSrv != nil {
-		ls.GRPC = d.grpcSrv.EffectiveAddr()
+		ls.GRPC = d.grpcSrv.EffectiveListener()
+	} else {
+		// Server not yet constructed — the pre-bind startup window. gRPC always
+		// binds on loopback, so report the requested address as Listening.
+		ls.GRPC = sysservices.Listener{Addr: d.opts.GRPCAddr, State: sysservices.StateListening}
 	}
-	if ls.GRPC == "" {
-		ls.GRPC = d.opts.GRPCAddr
-	}
-	ls.HTTP = d.mgmt.effectiveHTTPAddr()
+	ls.HTTP = d.mgmt.effectiveHTTPListener()
 	return ls
 }
 
