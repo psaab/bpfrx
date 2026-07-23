@@ -57707,3 +57707,21 @@ top.
     README notes this bound.
   **File(s)**: pkg/cluster/failover.go, pkg/cluster/README.md,
     pkg/cluster/failover_lease_5079_test.go, pkg/daemon/daemon_ha_sync.go
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6177 — close the RETH VIP-removal sub-ms two-owner residual
+    left by #5640 (#6174). Added a per-instance VRRP resign-completion
+    barrier (`armResignBarrier`/`markVIPsHeld`/`markVIPsRemoved`,
+    `Manager.ResignRGWait`) closed only when VIPs are PHYSICALLY removed
+    (becomeBackup success or #5482 reconcile); daemon
+    `releaseFailoverActuationAfterResign` defers `signalFailoverActuated`
+    on the RETH path until the barriers close. Hardened
+    `disarmFailoverActuation` to an identity (channel) check so an older
+    timed-out waiter cannot drop a newer same-RG waiter's entry
+    (residual #2). Added daemon-barrier + resign-barrier unit tests
+    (residual #3). Docs: session-sync-architecture.md, pkg/vrrp/README.md.
+  **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/instance_vip.go,
+    pkg/vrrp/manager.go, pkg/vrrp/resign_barrier_6177_test.go,
+    pkg/daemon/daemon_ha.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/daemon/failover_actuation_barrier_6177_test.go,
+    docs/session-sync-architecture.md, pkg/vrrp/README.md

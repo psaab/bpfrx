@@ -255,6 +255,27 @@ type vrrpInstance struct {
 	// before the reconcile goroutine starts; the goroutine only reads it.
 	vipReconcileBackoff time.Duration
 
+	// resignBarrierMu guards vipsHeld and resignBarrierCh — the resign-completion
+	// barrier the daemon's #5640 fence-completion actuation barrier waits on so the
+	// peer's remote-failover applied-ack is not released until this node's RETH VIPs
+	// are PHYSICALLY removed, not merely resign-signaled (#6177). ResignRG signals
+	// resignCh and sets priority-0 synchronously, but the actual VIP removal
+	// (becomeBackup → removeVIPs) runs async on the run-loop; releasing the ack on
+	// resign-signaled alone left a sub-ms two-owner window where the peer promoted
+	// while this node still owned the VIPs. armResignBarrier registers a waiter
+	// BEFORE triggerResign; markVIPsRemoved closes it once the VIPs actually clear.
+	//
+	// vipsHeld is the barrier's ownership fact: true once a successful becomeMaster
+	// has actuated the VIP set, false once becomeBackup (or the #5482 stale-VIP
+	// reconcile) has removed it. armResignBarrier short-circuits to an already-
+	// closed channel when vipsHeld is false — the demotion has already actuated (or
+	// this node never owned the VIPs), so there is nothing to wait for. Guarded by a
+	// dedicated mutex, kept off the vipMu TOCTOU path (#5082/#5482) so the barrier
+	// bookkeeping never perturbs the VIP-actuation revalidation.
+	resignBarrierMu sync.Mutex
+	vipsHeld        bool
+	resignBarrierCh chan struct{}
+
 	// netlink seams for VIP actuation. Production leaves them nil and the
 	// helpers call netlink live; unit tests inject them to drive addVIPs down
 	// a chosen success/failure path without a real kernel interface (#5082).
@@ -376,6 +397,62 @@ func (vi *vrrpInstance) triggerResign() {
 	select {
 	case vi.resignCh <- struct{}{}:
 	default:
+	}
+}
+
+// armResignBarrier registers (or returns the existing) resign-completion barrier
+// for this instance (#6177). If the instance does not currently own the VIP set —
+// vipsHeld is false because it is already BACKUP or never promoted — the demotion
+// has already actuated, so an already-closed channel is returned and the caller
+// does not wait. Otherwise the returned channel closes once markVIPsRemoved fires
+// (becomeBackup removed the VIPs, or the #5482 stale-VIP reconcile finally
+// cleared them). The manager MUST call this BEFORE triggerResign: registering
+// under resignBarrierMu while vipsHeld is still true, before the run-loop can run
+// becomeBackup, guarantees the barrier is observed and cannot be closed-and-
+// forgotten. If becomeBackup already ran (vipsHeld now false), the short-circuit
+// returns closed — no lost wakeup either way because the fact flip and the close
+// in markVIPsRemoved happen under the same lock.
+func (vi *vrrpInstance) armResignBarrier() <-chan struct{} {
+	vi.resignBarrierMu.Lock()
+	defer vi.resignBarrierMu.Unlock()
+	if !vi.vipsHeld {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	if vi.resignBarrierCh == nil {
+		vi.resignBarrierCh = make(chan struct{})
+	}
+	return vi.resignBarrierCh
+}
+
+// markVIPsHeld records that this instance now owns the VIP set — a successful
+// becomeMaster has actuated it (#6177). A resign barrier armed afterward waits
+// for the matching markVIPsRemoved. Kept separate from the vipMu-guarded actuation
+// so the barrier bookkeeping never perturbs the #5082/#5482 VIP TOCTOU logic.
+func (vi *vrrpInstance) markVIPsHeld() {
+	vi.resignBarrierMu.Lock()
+	vi.vipsHeld = true
+	vi.resignBarrierMu.Unlock()
+}
+
+// markVIPsRemoved records that this instance no longer owns the VIP set and
+// releases any resign-completion barrier armed for it (#6177). Called from the
+// becomeBackup demotion path once removeVIPs SUCCEEDS, and from the #5482 stale-
+// VIP reconcile once a deferred removal finally clears — so the barrier is a true
+// "VIPs physically removed" gate, never merely "resign signaled". A removal that
+// keeps failing leaves the barrier open on purpose: the daemon's actuation wait
+// times out and the peer HOLDS rather than promotes over a stale VIP (safe-
+// direction). Idempotent: the channel is nil-ed under the lock so a second call
+// never double-closes.
+func (vi *vrrpInstance) markVIPsRemoved() {
+	vi.resignBarrierMu.Lock()
+	vi.vipsHeld = false
+	ch := vi.resignBarrierCh
+	vi.resignBarrierCh = nil
+	vi.resignBarrierMu.Unlock()
+	if ch != nil {
+		close(ch)
 	}
 }
 
@@ -1327,6 +1404,10 @@ func (vi *vrrpInstance) becomeMaster() bool {
 	}
 	vi.vipMu.Unlock()
 
+	// VIPs actuated — record ownership so a later resign barrier waits for the
+	// matching removal before the daemon releases the peer's applied-ack (#6177).
+	vi.markVIPsHeld()
+
 	vi.sendAdvert(pri)
 	vi.emitEvent()
 	vi.garpEpoch.Add(1)
@@ -1366,7 +1447,16 @@ func (vi *vrrpInstance) becomeBackup(masterDownTimer, advertTimer *time.Timer) {
 	slog.Info("vrrp: transitioning to BACKUP",
 		"key", vi.key())
 	vi.setState(StateBackup)
-	vi.surfaceStaleVIP(vi.removeVIPs(), "becomeBackup")
+	removeErr := vi.removeVIPs()
+	if removeErr == nil {
+		// VIPs are physically gone — release any #6177 resign barrier so the
+		// daemon's actuation wait (and thus the peer's applied-ack) only fires
+		// after this node stopped owning the RG. On a removal FAILURE the barrier
+		// stays armed: the async #5482 reconcile below closes it once the stale
+		// VIP finally clears, and until then the peer HOLDS (safe-direction).
+		vi.markVIPsRemoved()
+	}
+	vi.surfaceStaleVIP(removeErr, "becomeBackup")
 	advertTimer.Stop()
 	masterDownTimer.Reset(vi.masterDownInterval())
 	// A MASTER stepping down to a worthy higher/tie-break master begins a

@@ -146,22 +146,32 @@ func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
 // barrier before waitFailoverActuated observes it. Concurrent same-RG remote
 // failovers are excluded upstream (cluster.failoverInProgress + the sync-layer
 // failover waiters), so a single channel per RG is sufficient (#5640).
-func (d *Daemon) armFailoverActuation(rgID int) {
+func (d *Daemon) armFailoverActuation(rgID int) chan struct{} {
 	d.failoverActuateMu.Lock()
 	if d.failoverActuateWait == nil {
 		d.failoverActuateWait = make(map[int]chan struct{})
 	}
-	d.failoverActuateWait[rgID] = make(chan struct{})
+	ch := make(chan struct{})
+	d.failoverActuateWait[rgID] = ch
 	d.failoverActuateMu.Unlock()
+	return ch
 }
 
 // disarmFailoverActuation drops a barrier that will never be actuated — used
-// when ManualFailover fails to enqueue the demotion (no event will ever fire).
-// It does NOT close the channel: no waiter can be blocked on it because the
-// applied-ack path is not reached on a ManualFailover error.
-func (d *Daemon) disarmFailoverActuation(rgID int) {
+// when ManualFailover fails to enqueue the demotion (no event will ever fire),
+// and by waitFailoverActuated's timeout path. It removes the map entry ONLY when
+// it still holds the exact channel the caller armed/waited on (identity check),
+// so an older, timed-out waiter for the same RG can never nuke a NEWER waiter's
+// entry and spuriously fail its ack (#6177 delete-by-key hardening). A nil ch
+// deletes unconditionally (legacy key-only callers). It does NOT close the
+// channel: no waiter can be blocked on a channel dropped on the error path
+// because the applied-ack path is not reached on a ManualFailover error, and the
+// timeout path has already stopped waiting.
+func (d *Daemon) disarmFailoverActuation(rgID int, ch chan struct{}) {
 	d.failoverActuateMu.Lock()
-	delete(d.failoverActuateWait, rgID)
+	if cur, ok := d.failoverActuateWait[rgID]; ok && (ch == nil || cur == ch) {
+		delete(d.failoverActuateWait, rgID)
+	}
 	d.failoverActuateMu.Unlock()
 }
 
@@ -203,8 +213,10 @@ func (d *Daemon) waitFailoverActuated(rgID int) error {
 		return nil
 	case <-timer.C:
 		// Drop the stranded barrier so a later actuation event does not
-		// close an orphaned channel that no one reads.
-		d.disarmFailoverActuation(rgID)
+		// close an orphaned channel that no one reads. Pass the channel we
+		// waited on so a concurrent newer arm for the same RG is not dropped
+		// (#6177 delete-by-key hardening).
+		d.disarmFailoverActuation(rgID, ch)
 		return fmt.Errorf("timed out waiting for local fence actuation of redundancy group %d", rgID)
 	}
 }
@@ -218,6 +230,46 @@ func (d *Daemon) waitFailoverActuatedBatch(rgIDs []int) error {
 		}
 	}
 	return nil
+}
+
+// releaseFailoverActuationAfterResign releases the #5640 fence-completion barrier
+// for rgID once the RETH resign has PHYSICALLY removed the VIPs (#6177). It runs
+// on its own goroutine so watchClusterEvents never blocks on the VRRP run-loop's
+// async VIP removal. Each barrier in resignBarriers closes when its instance's
+// VIPs are gone (becomeBackup succeeded, or the #5482 stale-VIP reconcile finally
+// cleared a failed removal); an already-closed barrier is an instance that did
+// not own the VIPs. All must close before the applied-ack is released, so the
+// peer only promotes after every RETH VIP for the RG is off this node.
+//
+// If a removal never confirms within the bounded budget — a persistent netlink
+// failure whose async reconcile keeps failing — this returns WITHOUT signaling.
+// The peer-side waitFailoverActuated then times out on its own and the peer HOLDS
+// rather than promotes over a still-present VIP (safe-direction), and its timeout
+// path disarms the barrier, so nothing leaks. The budget is set above the peer's
+// actuation timeout so on a stuck resign the ack side reliably times out first,
+// leaving this purely a cleanup/leak guard. ctx cancellation (daemon shutdown)
+// exits without signaling.
+func (d *Daemon) releaseFailoverActuationAfterResign(ctx context.Context, rgID int, resignBarriers []<-chan struct{}) {
+	budget := d.failoverActuateTimeout
+	if budget <= 0 {
+		budget = 3 * time.Second
+	}
+	budget *= 2
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	for _, ch := range resignBarriers {
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			slog.Warn("cluster: RETH resign VIP-removal did not confirm within the "+
+				"actuation budget; leaving the applied-ack to the peer-side timeout "+
+				"(safe HOLD — peer will not promote over a stale VIP)", "rg", rgID)
+			return
+		}
+	}
+	d.signalFailoverActuated(rgID)
 }
 
 // isRethMasterState returns true when ALL VRRP instances for rgID are MASTER.
@@ -348,10 +400,18 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				if clusterDemotionEdge && d.dp != nil {
 					d.tryPrepareUserspaceRGDemotion(ev.GroupID)
 				}
+				// #6177: on the RETH-VRRP path the actual VIP removal
+				// (becomeBackup) runs async on the VRRP run-loop, so ResignRG
+				// returns after resign is only SIGNALED. Capture the per-instance
+				// resign-completion barriers so the applied-ack release below waits
+				// for the VIPs to be PHYSICALLY removed, closing the sub-ms two-
+				// owner window. Priority-0 is still set synchronously, so the peer
+				// sees the resignation immediately regardless of the wait.
+				var resignBarriers []<-chan struct{}
 				if !noRethVRRP {
 					if ev.OldState == cluster.StatePrimary &&
 						(ev.NewState == cluster.StateSecondary || ev.NewState == cluster.StateSecondaryHold) {
-						d.vrrpMgr.ResignRG(ev.GroupID)
+						resignBarriers = d.vrrpMgr.ResignRGWait(ev.GroupID)
 					}
 				}
 				// Deactivation: blackhole routes first (if transitioning
@@ -380,13 +440,20 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 					d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-secondary")
 				}
 
-				// #5640: the local demotion is now actuated — VRRP has
-				// resigned to priority-0 (or direct VIP ownership was
-				// reconciled away) and rg_active is cleared. Release any
-				// remote-failover applied-ack that is holding for this fence
-				// so the peer only promotes AFTER this node stopped owning
-				// the RG. Fires for every non-primary edge; unarmed RGs no-op.
-				d.signalFailoverActuated(ev.GroupID)
+				// #5640/#6177: the local demotion is now actuated — release any
+				// remote-failover applied-ack holding for this fence so the peer
+				// only promotes AFTER this node stopped owning the RG. On the
+				// direct-VIP path reconcileDirectVIPOwnership above removed the
+				// VIPs synchronously, so signal now. On the RETH path the VIP
+				// removal runs async on the VRRP run-loop; defer the signal to a
+				// goroutine that waits on the resign-completion barriers so the ack
+				// only releases after the RETH VIPs are PHYSICALLY gone (#6177).
+				// Fires for every non-primary edge; unarmed RGs no-op.
+				if len(resignBarriers) == 0 {
+					d.signalFailoverActuated(ev.GroupID)
+				} else {
+					go d.releaseFailoverActuationAfterResign(ctx, ev.GroupID, resignBarriers)
+				}
 			}
 
 			// Strict VIP ownership: suppress GARP on secondary, allow on primary.

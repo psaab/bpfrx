@@ -719,9 +719,34 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 // Used when cluster state transitions from Primary to Secondary
 // (manual failover, weight drop, etc.) in non-preempt mode.
 func (m *Manager) ResignRG(rgID int) {
+	m.resignRGInstances(rgID, false)
+}
+
+// ResignRGWait resigns every RETH instance for the redundancy group exactly like
+// ResignRG, and additionally returns one resign-completion barrier per instance
+// (#6177). Each barrier closes when that instance's VIPs are PHYSICALLY removed
+// (becomeBackup succeeded, or the #5482 stale-VIP reconcile finally cleared a
+// failed removal), or is already closed when the instance did not own the VIPs.
+// The caller waits on the returned barriers before releasing the peer's remote-
+// failover applied-ack so the peer never promotes into a two-owner window while
+// this node still owns the RETH VIPs. Priority-0 is still set and adverts still
+// go out synchronously, so peers see the resignation immediately regardless of
+// how long the VIP removal takes.
+func (m *Manager) ResignRGWait(rgID int) []<-chan struct{} {
+	return m.resignRGInstances(rgID, true)
+}
+
+// resignRGInstances sets priority 0 and triggers resign on every RETH instance
+// for rgID. When arm is true it registers a resign-completion barrier on each
+// instance BEFORE triggering the resign and returns the barriers; when false it
+// returns nil (the reconcile-driven ResignRG path needs no completion signal).
+// Arming before triggerResign is load-bearing: the barrier must be observable to
+// the run-loop's becomeBackup so the VIP-removal completion cannot be lost.
+func (m *Manager) resignRGInstances(rgID int, arm bool) []<-chan struct{} {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	vrid := 100 + rgID
+	var barriers []<-chan struct{}
 	for _, vi := range m.instances {
 		if isRethInstance(vi.cfg) && vi.cfg.GroupID == vrid {
 			// Set priority to 0 BEFORE triggering resign. Without this,
@@ -731,9 +756,15 @@ func (m *Manager) ResignRG(rgID int) {
 			vi.mu.Lock()
 			vi.cfg.Priority = 0
 			vi.mu.Unlock()
+			// Arm the completion barrier BEFORE triggerResign so the run-loop's
+			// becomeBackup cannot close-and-forget it before it is registered.
+			if arm {
+				barriers = append(barriers, vi.armResignBarrier())
+			}
 			vi.triggerResign()
 		}
 	}
+	return barriers
 }
 
 // UpdateRGPriority immediately sets the VRRP priority for all instances

@@ -118,6 +118,10 @@ func (vi *vrrpInstance) scheduleVIPRemoveReconcile() {
 				continue
 			}
 			vi.vipDiverged.Store(false)
+			// The deferred VIP removal finally cleared — release any #6177 resign
+			// barrier that becomeBackup left armed when its synchronous removal
+			// failed, so the peer's applied-ack now fires (the VIPs are truly gone).
+			vi.markVIPsRemoved()
 			slog.Info("vrrp: stale-VIP remove reconcile succeeded",
 				"key", vi.key(), "attempt", attempt)
 			return

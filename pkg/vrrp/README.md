@@ -90,6 +90,19 @@ This is the package that drives chassis-cluster failover.
   instances.
 - `ResignRG(rgID int)` — `manager.go`. Forces this node out of master
   for the given redundancy group ID.
+- `ResignRGWait(rgID int) []<-chan struct{}` — `manager.go`. Same resign
+  as `ResignRG` (priority-0 + `triggerResign`, both synchronous) but
+  arms a per-instance resign-completion barrier BEFORE `triggerResign`
+  and returns one channel per RETH instance. Each closes once that
+  instance's VIPs are PHYSICALLY removed (`becomeBackup` succeeded, or
+  the #5482 stale-VIP reconcile finally cleared a failed removal); a
+  non-owner yields an already-closed channel. The daemon waits on these
+  before releasing the peer's remote-failover applied-ack so the peer
+  never promotes into a two-owner window while this node still owns the
+  RETH VIPs (#6177 — closes the sub-ms residual left by #5640; the async
+  VIP removal on the run-loop meant `ResignRG` returned after resign was
+  only *signaled*). `markVIPsHeld`/`markVIPsRemoved` maintain the
+  barrier's ownership fact off the `vipMu` TOCTOU path.
 
 ## File layout
 

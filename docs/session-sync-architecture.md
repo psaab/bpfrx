@@ -1338,8 +1338,11 @@ The fix gates the applied-ack on a fence-completion barrier:
    `waitFailoverActuated`) after `OnRemoteFailover` succeeds and before sending
    `failoverAckApplied`. It blocks on the barrier channel.
 3. `watchClusterEvents`, at the end of the demotion (non-primary) branch — after
-   `ResignRG` / direct-VIP reconcile / `rg_active` clear — calls
-   `signalFailoverActuated(rgID)`, closing the channel and releasing the ack.
+   the resign is initiated, the direct-VIP reconcile runs, and `rg_active` is
+   cleared — releases the barrier via `signalFailoverActuated(rgID)`. On the
+   direct-VIP path (`reconcileDirectVIPOwnership`) the VIP removal is synchronous,
+   so it signals inline. On the RETH path the release is deferred until the VIPs
+   are physically removed — see the #6177 refinement below.
 4. The wait is bounded by `failoverActuateTimeout` (3s default). A demotion that
    never actuates (superseded reset, event-channel drop) downgrades the ack to
    `failoverAckFailed` so the peer **holds** rather than promoting into the
@@ -1349,6 +1352,48 @@ The fix gates the applied-ack on a fence-completion barrier:
 
 The batch path (`handleRemoteFailoverBatch` / `WaitFailoverAppliedBatch`) applies
 the same per-RG barrier across the whole set.
+
+#### RETH VIP-removal gate + delete-by-key hardening (#6177)
+
+The #5640 hostile review flagged that on the **RETH-VRRP** path (the loss-cluster
+topology) `ResignRG` is non-blocking: it sets VRRP priority to 0 and signals
+`resignCh` **synchronously** (so peers see the resignation immediately), but the
+actual VIP removal (`becomeBackup` → `removeVIPs`) runs **async** on the VRRP
+run-loop. Releasing the applied-ack on resign-*signaled* alone left a sub-ms
+residual two-owner window where the peer promoted while this node still had the
+RETH VIPs on the wire. (Direct-VIP mode has no residual — `reconcileDirectVIPOwnership`
+removes the VIPs synchronously before the signal.)
+
+#6177 closes the window by gating the release on the VIPs being **physically
+removed**:
+
+- Each `vrrpInstance` carries a resign-completion barrier. `becomeMaster` records
+  ownership (`markVIPsHeld`) once a successful VIP add lands; `becomeBackup`
+  releases it (`markVIPsRemoved`) once `removeVIPs` **succeeds**. A removal that
+  fails leaves the barrier armed on purpose — the #5482 stale-VIP reconcile closes
+  it when the deferred removal finally clears, and until then the barrier stays
+  open so the peer holds rather than promoting over a stale VIP (safe-direction).
+- `Manager.ResignRGWait(rgID)` sets priority-0 + triggers resign exactly like
+  `ResignRG`, but arms a barrier on each RETH instance **before** `triggerResign`
+  (so the run-loop's `becomeBackup` cannot close-and-forget it) and returns the
+  per-instance barriers. An instance that does not own the VIPs yields an
+  already-closed barrier (nothing to wait for).
+- `watchClusterEvents` captures those barriers on the Primary→Secondary edge and,
+  instead of signalling inline, hands them to `releaseFailoverActuationAfterResign`
+  on a goroutine (so the event loop never blocks on the run-loop). That goroutine
+  waits for every barrier to close, then calls `signalFailoverActuated`. Its bound
+  is set above the peer-side `failoverActuateTimeout`, so on a stuck removal the
+  peer-side wait times out first and holds — the goroutine never prematurely
+  releases the ack.
+
+The review also flagged a latent **delete-by-key** hazard: `disarmFailoverActuation`
+and the wait's timeout path deleted `failoverActuateWait[rgID]` by key without
+checking channel identity, so an older timed-out waiter could nuke a newer
+same-RG waiter's entry and spuriously fail its ack (unreachable today — the
+initiator serializes per-RG — but latent). `disarmFailoverActuation(rgID, ch)`
+now deletes only when the stored channel is still the exact one the caller
+armed/waited on; `armFailoverActuation` returns that channel so the error and
+timeout paths can pass their own.
 
 Once the RG is marked standby, each worker processes a
 `WorkerCommand::DemoteOwnerRGS` on its packet thread
