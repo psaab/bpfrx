@@ -606,6 +606,32 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	if m.lastStatus.ForwardingArmed == desired {
 		return nil
 	}
+	// #6165: the ~1s desired-state reconcile must honor the SAME
+	// required-generation protocol gate that #6163/#5648 added to
+	// SetForwardingArmed. A compile- or scheduler-path disarm
+	// (disarmSnapshotProtocolFailureLocked, fired by
+	// ensureRequiredSnapshotProtocolLocked when the running helper's accepted
+	// snapshot protocol version is too old to honor a config that REQUIRES a
+	// newer one — policy schedulers, persistent source NAT) leaves the helper
+	// disarmed while desiredForwardingArmedLocked() still returns true (it only
+	// checks ForwardingSupported, never the snapshot protocol). Without this
+	// gate the next reconcile tick re-arms the protocol-stale image and
+	// forwards a config the helper cannot represent — the fail-OPEN #6163
+	// closed on the explicit operator-arm path, reachable here from the
+	// UpdatePolicyScheduleState scheduler-tick disarm (which, unlike an
+	// operator commit, does not revert the active config, so m.lastSnapshot
+	// keeps requiring the protocol). Scoped exactly like SetForwardingArmed:
+	// only the ARM direction is gated; a disarm (desired==false — shutdown,
+	// demotion, disarmSnapshotProtocolFailureLocked) must NEVER be blocked. The
+	// gate is a no-op unless the last-applied config requires the protocol, and
+	// it re-polls the helper first so a helper that has since upgraded still
+	// arms normally. Fail closed: leave the helper disarmed and surface the
+	// error to the poll caller (logged), rather than re-arm a stale image.
+	if desired && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
+		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot.Config); err != nil {
+			return err
+		}
+	}
 	if m.clusterHA {
 		slog.Info(
 			"userspace: forwarding arm state change",
