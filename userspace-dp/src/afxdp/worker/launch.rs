@@ -228,21 +228,19 @@ impl WorkerCoSState {
 /// Worker-written status / telemetry publish slots. The worker writes
 /// each on a ~1s cadence; the coordinator's status thread reads them.
 pub(crate) struct WorkerPublishedTelemetry {
-    // #6242 LIFECYCLE CONTRACT (documentation only — do NOT integrate
-    // here): `recent_exceptions` and `last_resolution` are the SAME Arcs
-    // that #6242's future per-worker `WorkerRuntimeRecord` will own. They
-    // are allocated once per worker in `bring_up_workers`
-    // (`recent_exceptions` / `last_resolution` locals): the original Arc is
-    // cloned ONCE into the coordinator-side maps
-    // (`coord.worker_exception_rings` / `coord.worker_last_resolution`) and
-    // the original binding is MOVED into this worker-facing bundle. End
-    // state: one allocation, strong_count 2 — bit-identical to master.
-    // #6241 lands FIRST and allocates
-    // them EXACTLY as today. Whichever of #6241/#6242 lands second MUST
-    // integrate with the pending runtime record rather than re-allocate
-    // these Arcs — #6242 owns the coordinator-side storage record, #6241
-    // owns this worker-facing argument bundle; they share the Arc, not a
-    // type.
+    // #6242 LIFECYCLE CONTRACT (INTEGRATED): `recent_exceptions` and
+    // `last_resolution` are the SAME `Arc`s the worker's per-worker
+    // `WorkerRuntimeRecord` (`worker_manager.rs`) owns. `bring_up_workers`
+    // allocates each ONCE, RETAINS one clone for the record
+    // (`record_exception_ring` / `record_last_resolution`) and MOVES the
+    // original into this worker-facing bundle. End state: one allocation
+    // shared by the record and the live worker (strong_count 2 while both own
+    // it — it drops to 1 when the worker exits and to 0 when the record is
+    // removed); no re-allocation. #6241 owns this worker-facing argument
+    // bundle; #6242 owns the coordinator-side runtime record — they share the
+    // `Arc`, not a type. The record is registered as ONE `records.insert`
+    // AFTER the spawn succeeds, so a failed worker never publishes a record
+    // (the #4952 differential is structural).
     pub(in crate::afxdp) recent_exceptions: Arc<Mutex<ExceptionEventRing>>,
     pub(in crate::afxdp) recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     // #6242 LIFECYCLE CONTRACT — see `recent_exceptions` above.

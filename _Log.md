@@ -1,3 +1,81 @@
+## 2026-07-22 — #6242: consolidate a worker's 4 horizontal owners into one transactional WorkerRuntimeRecord
+
+- **Timestamp**: 2026-07-22 (refactor/6242-worker-runtime-record)
+- **Action**: Correctness/maintainability refactor (FAILOVER-CRITICAL —
+  post-teardown worker bring-up transaction). A worker's runtime was
+  horizontally owned by FOUR maps keyed by the same `worker_id`:
+  `WorkerManager.handles` plus three sibling `Coordinator` maps
+  (`worker_panics` #925, `worker_exception_rings` / `worker_last_resolution`
+  #5289), none registered or rolled back as one unit. Consolidated them into a
+  new `WorkerRuntimeRecord { handle, panic, exception_ring, last_resolution }`
+  stored in `WorkerManager.records: BTreeMap<u32, WorkerRuntimeRecord>` (the
+  wrapper-record design Codex chose over the minimal fold — it gives #6240 an
+  explicit transaction-output type and makes "registered ⇒ spawn succeeded and
+  all four owners exist" a type-level invariant). `runtime_atomics` /
+  `cold_path_atomics` stay INSIDE `WorkerHandle`; `live` / `identities` stay
+  slot-keyed and separate.
+  - **Registration is ONE `records.insert` POST-spawn-success** (was: three
+    observability-slot inserts BEFORE spawn + the handle insert after). This
+    makes the #4952 DIFFERENTIAL ROLLBACK structural: a worker that fails to
+    spawn never had a record, so the spawn-Err arm has NOTHING to unwind — the
+    three manual `.remove(&worker_id)` calls VANISH and launched workers'
+    records are never touched. Bind-incomplete (#5143) still `stop_inner(false)`
+    → `stop_and_clear` signal-ALL/join-ALL/delete-XSK-slots/`records.clear()`
+    (two-pass order preserved).
+  - **Deleted the #5289 double-clear dead code**: `stop_inner` cleared the two
+    maps then looped over the now-empty maps to content-clear them (dead since
+    #5289). `records.clear()` in `stop_and_clear` drops all four owners of every
+    worker in one step; the dead loops are removed, not duplicated.
+  - **#6241 Arc integration (share, don't reallocate):** each telemetry `Arc`
+    (`recent_exceptions` / `last_resolution`) is allocated once, one clone
+    RETAINED for the record and the original MOVED into
+    `WorkerPublishedTelemetry`; `panic` retains one clone + passes a clone into
+    `spawn_supervised_worker`. Same allocation + live-worker ownership topology
+    as master.
+  - **Migrated 22 production sites across 6 files** — `mod.rs`,
+    `worker_manager.rs`, `reconcile/bringup.rs`, `status.rs`,
+    `reconcile/teardown.rs`, `tunnel_supervision.rs` — PLUS the 3
+    FAILOVER-CRITICAL HA control modules Codex flagged: `ha/session_import.rs`
+    (synced upsert/delete fanout + cap), `ha/state.rs` (demote/activate
+    fanout), `ha/export.rs` (owner-RG export kick + ack collect). Each
+    `.handles.get()/.values()` → `.records...map(|r| &r.handle)` and each
+    observability read → `r.exception_ring` / `r.last_resolution` / `r.panic`.
+    Packet path unchanged (workers hold direct `Arc` clones via
+    `WorkerContext`; the record is cold-only — status ~1Hz, teardown, HA
+    fanout).
+  - **Tests**: added the `force_worker_spawn_fail_skip` (fail the Kth spawn,
+    not the 1st) + `force_worker_healthy_stub` seams and three tests —
+    `reconcile_partial_spawn_failure_preserves_launched_records_6242` (the
+    differential crux: 3 workers, fail worker 2 → records {0,1} survive, 2
+    absent, no stop_inner), `reconcile_bind_incomplete_clears_all_records_6242`
+    (symmetric: stop_inner clears ALL), and
+    `stop_inner_drops_worker_record_owners_exactly_once_6242` (teardown
+    atomicity via Arc strong_count 2→1). Migrated the #6101 exception-ring
+    merge tests + the ha_tests / gre1881 / export-worker seeds to `records`.
+  - **Validation**: `cargo build` + test binary compile clean (pre-existing
+    `mut_from_ref` in untouched `umem/mmap.rs:150` is not mine); the 3 new
+    tests + #4952/#5143/#6101/#6245 regressions GREEN in `--release
+    --test-threads=1`. Fail-on-revert PROVEN: adding `records.clear()` to the
+    spawn-Err arm turns the fail-at-K test RED on the
+    "launched workers 0 and 1 keep their records (differential rollback)"
+    assertion (`left == right` 0 vs 2); restored → GREEN.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/worker_manager.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/teardown.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/coordinator/tunnel_supervision.rs,
+  userspace-dp/src/afxdp/coordinator/status_tests.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha/state.rs, userspace-dp/src/afxdp/ha/export.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/worker/launch.rs,
+  userspace-dp/src/server/handlers/rebind.rs,
+  userspace-dp/src/server/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/afxdp/worker/README.md, _Log.md
+
 ## 2026-07-22 — #6184: host-auth cancel closeout — per-owner panic recover + log actual budget
 
 - **Timestamp**: 2026-07-22 (fix/6184-host-auth-closeout-recover)

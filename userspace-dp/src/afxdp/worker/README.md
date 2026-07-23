@@ -94,8 +94,14 @@ each cluster has a clear ownership boundary.
   10K–100K-tick/s loop (the #1776 no-inline-boundary constraint). Do not
   add a per-tick `self.shared.*` field access; keep the entry-destructure
   shape. `WorkerPublishedTelemetry.recent_exceptions` and `.last_resolution`
-  carry a documented #6242 lifecycle contract (they are the Arcs #6242's
-  future per-worker runtime record will own — integrate, don't re-allocate).
+  carry a #6242 lifecycle contract that is now INTEGRATED: they are the SAME
+  `Arc`s the worker's per-worker `WorkerRuntimeRecord`
+  (`coordinator/worker_manager.rs`, keyed by `worker_id` in `workers.records`)
+  owns. `bring_up_workers` allocates each once, retains one clone for the
+  record and moves the original into this bundle — one shared allocation, no
+  re-allocation. The record is registered as ONE `records.insert` AFTER the
+  spawn succeeds, so the live worker and the record share the alloc for the
+  worker's lifetime.
 - `BindingWorker::new_for_cos_drain_test` is test-only scaffolding for
   hermetic CoS service-path tests. It uses in-memory AF_XDP ring fixtures
   and must not become a production construction path; production workers

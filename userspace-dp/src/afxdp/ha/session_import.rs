@@ -30,7 +30,7 @@ impl crate::afxdp::Coordinator {
             return self.synced_import_cap_override.saturating_mul(2);
         }
         self.workers
-            .handles
+            .records
             .len()
             .saturating_mul(crate::session::default_max_sessions())
             .saturating_mul(2)
@@ -212,10 +212,11 @@ impl crate::afxdp::Coordinator {
                 }
             }
         }
-        for handle in self.workers.handles.values() {
+        // #6242: fan out to each worker's command queue via its runtime record.
+        for rec in self.workers.records.values() {
             // #1790/#1807: recover-and-push instead of silently skipping a
             // poisoned queue (same policy as update_ha_state).
-            let mut pending = worker_queue::lock_recover(&handle.commands);
+            let mut pending = worker_queue::lock_recover(&rec.handle.commands);
             pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
             if let Some(reverse) = &reverse_entry {
                 pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
@@ -309,10 +310,11 @@ impl crate::afxdp::Coordinator {
                 reverse_key,
             );
         }
-        for handle in self.workers.handles.values() {
+        // #6242: fan out to each worker's command queue via its runtime record.
+        for rec in self.workers.records.values() {
             // #1790/#1807: recover-and-push instead of silently skipping a
             // poisoned queue (same policy as update_ha_state).
-            let mut pending = worker_queue::lock_recover(&handle.commands);
+            let mut pending = worker_queue::lock_recover(&rec.handle.commands);
             pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
             if let Some(reverse_key) = &reverse_key {
                 pending.push_back(WorkerCommand::DeleteSynced(reverse_key.clone()));
