@@ -161,8 +161,10 @@ func TestMgmtReconcileBindChange_5866(t *testing.T) {
 // #6381: the OLD assertion required DIFFERENT leaf bytes ("a fresh cert per
 // rebind"), the OPPOSITE of the shipping durable-cert contract. It passed only
 // as a CI artifact — the production certGen writes /etc/xpf/tls, which is
-// unwritable in CI, so LoadX509KeyPair found no pair, persistence failed
-// silently, and every reconcile minted a fresh in-memory cert whose leaf bytes
+// unwritable in CI, so LoadX509KeyPair found no pair and the persist write
+// failed NON-FATALLY (generateSelfSignedCertAt LOGS the error but returns the
+// fresh in-memory cert with a nil error, so HTTPS still installs), and every
+// reconcile therefore re-minted a fresh in-memory cert whose leaf bytes
 // differed. In production (writable /etc/xpf/tls) the second reconcile RELOADS
 // the same pair -> identical bytes -> the old assertion would have FAILED. This
 // test redirects certGen to a writable temp dir (SetTLSCertDirForTest) so the
