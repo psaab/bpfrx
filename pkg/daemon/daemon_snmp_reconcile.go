@@ -82,11 +82,15 @@ func snmpConfigHash(cfg *config.Config) uint64 {
 			// equal, or reconcile takes the idempotent no-op path and the
 			// running agent keeps the stale (possibly allow-all) source policy
 			// while the commit reports success. Hash the allowlist in DOCUMENT
-			// order (not sorted): AllowsSource resolves ties among equal-length
-			// prefixes by first-match (strict `>` on prefix bits), so element
-			// order is authorization-significant and must participate in the
-			// fingerprint. Identical config text yields identical order, so an
-			// unchanged stanza still hashes equal (no spurious reconcile).
+			// order (not sorted): AllowsSource resolves an equal-length prefix
+			// tie as deny-wins (order-independent, #5523 C179-049), so element
+			// order is NOT authorization-significant. Hashing in document order
+			// is nonetheless retained as a CONSERVATIVE superset: it may
+			// spuriously reconcile on an order-only reshuffle of two
+			// contradictory equal-length prefixes, but it never MISSES a real
+			// authorization change. Identical config text yields identical
+			// order, so an unchanged stanza still hashes equal (no spurious
+			// reconcile).
 			write("clients")
 			for _, cl := range c.Clients {
 				write(cl.Prefix)

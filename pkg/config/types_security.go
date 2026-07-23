@@ -275,7 +275,7 @@ type SyslogStream struct {
 	Name          string
 	Host          string
 	Port          int    // default 514
-	Severity      string // "error", "warning", "info", or "" (no filter)
+	Severity      string // any|emergency|alert|critical|error|warning|notice|info|debug|none, or "" (no filter) — full logging.ParseSeverity domain (#5523 C179-046)
 	Facility      string // "local0".."local7", "user", "daemon", or "" (default: local0)
 	Format        string // per-stream format override
 	Category      string // "all", or specific category

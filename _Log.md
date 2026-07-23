@@ -58596,3 +58596,13 @@ top.
     003/006/010/013/014/017/018/019/020/030/047.
   - **File(s)**: cmd/cli/show_flow.go, cmd/cli/show_flow_limit_int32_5523_test.go,
     _Log.md
+
+- **Timestamp**: 2026-07-23 (rev6390/Codex6390 review-fold)
+  - **Action**: Fold the two doc-comment staleness findings on #6390 (#5523):
+    SyslogStream.Severity comment (3→10 severities per the C179-046 SSOT alias)
+    and the daemon_snmp_reconcile.go clientsAllowlistHash order-significance
+    rationale (now deny-wins/order-independent per C179-049; document-order hash
+    retained as a conservative superset). Comment-only; no behavior change.
+    C179-021 (over-int32 flow-session limit) was added to the branch after the
+    reviewers ran and was parent-RED-verified firsthand.
+  - **File(s)**: pkg/config/types_security.go, pkg/daemon/daemon_snmp_reconcile.go
