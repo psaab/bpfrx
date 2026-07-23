@@ -182,19 +182,22 @@ func (t *ConfigTree) FormatPathSet(path []string) string {
 	if len(path) == 0 {
 		return t.FormatSet()
 	}
-	matches := navigatePath(t.Children, path)
+	matches, width := navigatePathWidth(t.Children, path)
 	if len(matches) == 0 {
 		return ""
 	}
-	// Compute parent prefix: path elements before the matched node's first key.
-	var parentPrefix []string
-	firstKey := matches[0].Keys[0]
-	for _, p := range path {
-		if p == firstKey {
-			break
-		}
-		parentPrefix = append(parentPrefix, p)
-	}
+	// Compute the parent prefix: the path elements BEFORE the matched terminal
+	// node. navigatePath consumed exactly `width` trailing `path` tokens into the
+	// terminal node's keys, so the prefix is the leading part of `path` with that
+	// width stripped from the RIGHT. Using the TRUE consumed width — rather than
+	// the node's first key from the LEFT (pre-#5717) or a suffix match of the
+	// node's whole keys (the first #5717 cut) — is the only reconstruction that
+	// stays correct when an ancestor value repeats the terminal node's keys: a
+	// zone NAMED "interfaces" holding an `interfaces` stanza (single-key terminal,
+	// width 1) and a filter NAMED `term` holding a term NAMED `term` (`... filter
+	// term term term`, width 1) both broke the earlier heuristics
+	// (codex-182 A3-b00-C001, #5717).
+	parentPrefix := append([]string(nil), path[:len(path)-width]...)
 	var b strings.Builder
 	for _, n := range matches {
 		prefix := append(append([]string{}, parentPrefix...), n.Keys...)

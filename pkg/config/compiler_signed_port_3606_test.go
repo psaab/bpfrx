@@ -38,6 +38,15 @@ func TestSignedPortRejectedAtCommit_3606(t *testing.T) {
 	cases := []struct {
 		name string
 		cmds []string
+		// wantSub, when set, asserts the SPECIFIC signed-port diagnostic (strict
+		// error AND lenient warning) rather than merely "some error". #5717 /
+		// codex-182 C2: the NAT match fixture below was actionless, so #5628's
+		// missing-terminal-action gate rejected it regardless of the signed-port
+		// gate — a NAT call site regressing from parseCanonicalPort to a
+		// permissive strconv.Atoi would still be "rejected" and the test would
+		// stay green for the wrong reason. Giving the rule a valid terminal
+		// action and asserting the port-specific diagnostic closes that mask.
+		wantSub string
 	}{
 		{
 			name: "application-destination-port-plus",
@@ -69,7 +78,13 @@ func TestSignedPortRejectedAtCommit_3606(t *testing.T) {
 		},
 		{
 			name: "nat-match-destination-port-plus",
-			cmds: []string{"set security nat destination rule-set RS rule R1 match destination-port +80"},
+			cmds: []string{
+				"set security nat destination rule-set RS rule R1 match destination-port +80",
+				// #5717 / codex-182 C2: a VALID terminal action so the ONLY reason
+				// to reject is the signed-port gate (not #5628 missing-action).
+				"set security nat destination rule-set RS rule R1 then destination-nat off",
+			},
+			wantSub: `match destination-port "+80" is not a numeric port`,
 		},
 		{
 			name: "dnat-pool-port-plus",
@@ -77,18 +92,44 @@ func TestSignedPortRejectedAtCommit_3606(t *testing.T) {
 				"set security nat destination pool p1 address 192.168.1.10",
 				"set security nat destination pool p1 port +80",
 			},
+			wantSub: `port "+80" is not a numeric port`,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tree := buildTreeFromSet(t, tc.cmds)
-			if _, err := CompileConfig(tree); err == nil {
+			_, serr := CompileConfig(tree)
+			if serr == nil {
 				t.Fatalf("CompileConfig accepted signed port for %q (want reject at commit)", tc.name)
+			}
+			// #5717 / codex-182 C2: when the fixture is otherwise well-formed,
+			// assert the strict reject names the SIGNED-PORT diagnostic
+			// specifically. Otherwise an unrelated gate (e.g. #5628
+			// missing-terminal-action) could mask a regression in the port
+			// parser/gate and leave this test green for the wrong reason.
+			if tc.wantSub != "" && !strings.Contains(serr.Error(), tc.wantSub) {
+				t.Fatalf("strict reject for %q named the wrong diagnostic:\n got:  %v\n want substring: %q", tc.name, serr, tc.wantSub)
 			}
 			// The tolerant load / peer-sync path must NOT brick: it downgrades
 			// to a warning and still compiles (#1960 no-brick doctrine).
-			if _, err := CompileConfigLenient(tree); err != nil {
-				t.Fatalf("CompileConfigLenient rejected %q (want warn-and-compile): %v", tc.name, err)
+			cfg, lerr := CompileConfigLenient(tree)
+			if lerr != nil {
+				t.Fatalf("CompileConfigLenient rejected %q (want warn-and-compile): %v", tc.name, lerr)
+			}
+			// #5717 / codex-182 C2: the signed port must produce a WARNING on the
+			// lenient path, not merely a successful compile — a silently-accepted
+			// signed port is exactly the regression this suite guards.
+			if tc.wantSub != "" {
+				var found bool
+				for _, w := range cfg.Warnings {
+					if strings.Contains(w, tc.wantSub) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatalf("lenient path for %q dropped the signed-port warning; want substring %q; warnings: %v", tc.name, tc.wantSub, cfg.Warnings)
+				}
 			}
 		})
 	}

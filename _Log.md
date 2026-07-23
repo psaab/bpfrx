@@ -57846,3 +57846,47 @@ top.
     pkg/cluster/sync_conn_gen.go,
     pkg/cluster/sync_config_epoch_sweep_race_6284_test.go,
     docs/session-sync-architecture.md, pkg/cluster/README.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #5717 C-CONFIG cohort (codex-182) — fixed 3 real+driveable
+    survivors. (1) FormatPathSet scoped display-set dropped an ancestor token
+    when an ancestor argument equaled the terminal node's first key (A3-b00-C001
+    display half; copy half already fixed by #5822): strip terminal keys from
+    the RIGHT (suffix-aligned) instead of first-key search from the LEFT.
+    (2) C2 signed-port NAT test masking: added a terminal action + specific
+    diagnostic assertion so a NAT-match port-parse regression is no longer
+    masked by the #5628 missing-action gate. (3) C3 stale feed diagnostics:
+    rewrote the undefined-feed-name / endpoint-less / malformed-url errors and
+    sibling comments to the #5645 fail-closed sequence (omitted ->
+    __unsupported_address__ -> whole-snapshot preflight reject ->
+    previous-good/default-deny) + an error-message assertion. Deferred C1
+    (lenient contradictory-NAT migration contract — design-heavy, HA-coupled)
+    and C4 (strongSwan swanctl integration — needs charon container absent from
+    env). All three fixes verified RED-on-revert.
+  **File(s)**: pkg/config/ast_format.go,
+    pkg/config/ast_format_pathset_ancestor_5717_test.go,
+    pkg/config/compiler_signed_port_3606_test.go,
+    pkg/config/compiler_validate_strict_observability.go,
+    pkg/config/compiler_uniformgates.go,
+    pkg/config/compiler_feed_diag_failclosed_5717_test.go,
+    docs/config-schema.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #5717 PR #6372 Codex review-fold (MERGE-NEEDS-MINOR ×2).
+    MINOR-1: FormatPathSet suffix-align was a heuristic that over-strips when a
+    multi-key terminal is matched by only its first key AND the path tail equals
+    its full keys (filter NAMED `term` holding a term NAMED `term`,
+    `... filter term term term`). Replaced the inference with navigatePath's TRUE
+    consumed width: added navigatePathWidth (returns (matches, width)),
+    navigatePath now a thin wrapper; FormatPathSet uses path[:len(path)-width].
+    RED-on-revert: restoring suffix-align drops a `term` on the
+    `... filter term term` scope. MINOR-2: added a malformed-feed-url subtest
+    (http://%) to the shared fail-closed assertion (the :226 rewording had no
+    regression binding) and corrected the stale #5183 malformed-url fail-open
+    comment (:195) to the #5645 fail-closed sequence. RED-on-revert: reverting
+    the malformed-url wording to fail-open fails the new subtest.
+  **File(s)**: pkg/config/ast.go, pkg/config/ast_format.go,
+    pkg/config/ast_format_pathset_ancestor_5717_test.go,
+    pkg/config/compiler_validate_strict_observability.go,
+    pkg/config/compiler_feed_diag_failclosed_5717_test.go,
+    docs/config-schema.md

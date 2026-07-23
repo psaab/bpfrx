@@ -188,6 +188,24 @@ func cloneNodes(nodes []*Node) []*Node {
 // matching both ["from-zone","untrust","to-zone","trust"] and
 // ["from-zone","untrust","to-zone","dmz"]), all matches are returned.
 func navigatePath(nodes []*Node, path []string) []*Node {
+	matches, _ := navigatePathWidth(nodes, path)
+	return matches
+}
+
+// navigatePathWidth is navigatePath plus the number of trailing `path` tokens
+// the terminal match consumed into matches[0]'s keys (0 when nothing matched).
+// FormatPathSet needs the EXACT consumed width to rebuild the parent prefix:
+// a terminal node can be matched by only its FIRST key — the single-key
+// bare-keyword terminal returns every same-keyword sibling and consumes ONE
+// token even when the node's full Keys are longer — so inferring the width by
+// suffix-matching the node's keys against the path over-strips when an ancestor
+// value repeats the node's keys. A firewall filter NAMED `term` holding a term
+// NAMED `term` (`... filter term term term then accept`) scoped to `... filter
+// term term` matched the `term term` node by its first key (width 1), but a
+// suffix match found the node's whole `["term","term"]` at the path tail and
+// dropped an ancestor `term` (#5717 codex-182 A3-b00-C001 fold). Returning the
+// true consumed width removes the inference.
+func navigatePathWidth(nodes []*Node, path []string) ([]*Node, int) {
 	current := nodes
 	i := 0
 	for i < len(path) {
@@ -223,7 +241,7 @@ func navigatePath(nodes []*Node, path []string) []*Node {
 				}
 				i += consumed
 				if i >= len(path) {
-					return matched
+					return matched, consumed
 				}
 				// Intermediate descent: continue against the UNION of
 				// every same-prefix sibling's children, not just
@@ -263,9 +281,9 @@ func navigatePath(nodes []*Node, path []string) []*Node {
 				}
 			}
 			if len(all) == 0 {
-				return nil
+				return nil, 0
 			}
-			return all
+			return all, 1
 		}
 		// Intermediate single-key descent: continue against the UNION of
 		// every same-keyword sibling's children, not just the first, so a
@@ -280,12 +298,12 @@ func navigatePath(nodes []*Node, path []string) []*Node {
 			}
 		}
 		if len(sibs) == 0 {
-			return nil
+			return nil, 0
 		}
 		i++
 		current = unionChildren(sibs)
 	}
-	return nil
+	return nil, 0
 }
 
 // unionChildren concatenates the children of every node in sibling order.
