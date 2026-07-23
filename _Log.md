@@ -58667,3 +58667,35 @@ top.
     pkg/daemon/daemon_run_shutdown.go, pkg/daemon/daemon_run.go,
     pkg/daemon/daemon_goroutine_shutdown_5523_test.go, pkg/daemon/README.md,
     pkg/snmp/README.md, pkg/configstore/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23 (fold on fix/5523-c179-material, PR #6394)
+  - **Action**: Add the missing #5523 C179-093 WIRING test. The existing
+    #5523 coverage (daemon_goroutine_shutdown_5523_test.go) calls
+    d.stopAggregator()/d.stopIPsecRebindLoop() DIRECTLY, binding the helper
+    MECHANICS but NOT the call sites — deleting the wiring (the two stop
+    calls in runShutdownSequence + the matching Run() defers) left the daemon
+    suite GREEN while fully reintroducing the leaked aggregator + skipped
+    #5313 final flush + leaked IPsec rebind loop. The new test DRIVES
+    runShutdownSequence itself (never the stop helpers) with an armed
+    aggregator (applyAggregator, Security.Log.Report=true) + an actively
+    ticking IPsec DHCP-rebind loop (reapplyIPsecForLeaseChange with a failing
+    injected swanctl seam), then asserts the OBSERVABLE post-shutdown state
+    only the wiring produces: aggCancel==nil, aggregatorPtr==nil,
+    ipsecRebindRetryActive==false, and ZERO swanctl reapplies after the
+    sequence returns (joined, not merely flagged). A real (empty) configstore
+    backs d.store so runShutdownSequence's ActiveConfig() does not nil-panic
+    (fresh store => nil active cfg => hitless/non-HA teardown with d.dp==nil).
+    The 4 production fixes were NOT changed. Ordering assertion (aggregator
+    flush BEFORE log/event teardown) skipped: it is already structurally
+    guaranteed by stopAggregator's position (line 92, before teardownSNMP/
+    stopFlowExporter/eventEngine.Close), and the minimal harness wires no
+    eventEngine/syslog to observe a teardown-vs-flush race cleanly.
+    Firsthand RED/GREEN: GREEN with the fix intact; neutralizing BOTH the
+    runShutdownSequence stop calls AND the Run() defers turned the new test
+    RED on all four observables (aggCancel non-nil / aggregatorPtr non-nil /
+    ipsecRebindRetryActive true / 20 late reapplies) with clean messages;
+    restoring the wiring => GREEN. Production files verified diff-clean vs
+    HEAD after restore. The pre-existing direct-method #5523 tests pass
+    throughout. Gates: go build ./... OK, go vet ./pkg/daemon OK, new file
+    gofmt-clean, full `go test ./pkg/daemon/` GREEN (10.4s).
+  - **File(s)**: pkg/daemon/daemon_shutdown_wiring_5523_test.go, _Log.md
