@@ -263,9 +263,18 @@ type ProcessStatus struct {
 	// a peer under session-table pressure (or a compromised peer) could drive
 	// this node past its own aggregate session ceiling and multiply that state
 	// across all workers — an availability/DoS the local admission bound is meant
-	// to prevent. A rising value means a peer exceeded this appliance's own
-	// ceiling (worker_count * max_sessions); a legitimate symmetric-pair failover
-	// never trips it. Surfaced as xpf_userspace_synced_import_cap_drops_total.
+	// to prevent. The bound is this appliance's own aggregate ENTRY ceiling
+	// (2 * worker_count * max_sessions — 2x the logical session ceiling, because
+	// each admitted forward publishes a forward plus a synthesized reverse
+	// companion). 2N is the FORWARD-key admission threshold, not an absolute map
+	// maximum — a lone reverse import bypasses the gate, so occupancy can
+	// momentarily reach 2N+1. A rising value means a peer's import would push
+	// THIS appliance past its own aggregate entry ceiling — receiver-local, so a
+	// larger asymmetric peer (more workers/max_sessions than this receiver) can
+	// legitimately trip a smaller receiver's cap without exceeding its own
+	// ceiling. A symmetric-pair failover (N logical sessions = 2N entries)
+	// exactly fits and never trips it. Surfaced as
+	// xpf_userspace_synced_import_cap_drops_total.
 	// Omitempty for wire compat with older helpers.
 	SyncedImportCapDropsTotal uint64 `json:"synced_import_cap_drops_total,omitempty"`
 	// #1760 W3': shared-map NAT reverse-key displacement events — a

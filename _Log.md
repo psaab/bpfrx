@@ -1,3 +1,52 @@
+## 2026-07-23 — #6387 PR-3: host-inbound/lo0/fence install via netlink (cutover)
+
+- **Timestamp**: 2026-07-23 (fix/6387-p3-cutover)
+- **Action**: Cut the daemon's host-inbound / lo0 / cold-boot-fence /
+  gap-fence install AND table teardown over from `exec nft -f -` to the
+  PR-2 `pkg/nftables` netlink `Installer`, completing #6387. A node now needs
+  only the kernel `nf_tables` MODULE, never the `nft` BINARY — restoring fw1's
+  config-sync apply (its trap was `nft`-not-found). New `daemon_nft_netlink.go`
+  holds the `nftInstaller` package-var seam (default `NewNetlinkInstaller()`),
+  the `nftProbeAvailable` seam, the `toNft*` converters PROMOTED from the PR-2
+  parity test to production, and `tagNftInstallErr` (the §12.5 nf_tables-
+  unavailable classifier: one-time distinct operator log + `ErrNFTablesUnavailable`
+  tag so the CF monitor-failure reason names the true cause, never downgrading
+  fail-closed). Rewired all 9 call sites in `daemon_nft.go` (lo0 apply/teardown,
+  host-inbound real apply, teardown of main+gap, post-success gap delete, gap
+  fence, cold-boot fence). Every fail-closed invariant preserved (H1-H9): a
+  netlink install failure still returns into the `errors.Join` tail (H7); a
+  failed teardown still keeps `hostInboundEnforced` (#5790); cold-boot/gap
+  fences still install fail-closed (#5644/#5789); single-`Flush` atomicity keeps
+  the #5789 retained-generation logic correct (H4). The `build*Payload` text
+  builders and the `nftApplyPayload`/`nftDeleteTable` vars are RETAINED as the
+  T1 parity-CI ORACLE (production no longer calls them).
+- **Tests**: Ported the 17 fail-closed regression tests
+  (#3333/#3392/#5644/#5789/#5790 + the 2 commit-level `errors.Join` wiring
+  tests + the 3 #5643 host-authorization-tail call-count tests) from the
+  `nftApplyPayload`/`nftDeleteTable` stub seam onto the single `fakeNftInstaller`
+  injection seam (`daemon_nft_netlink_testhelper_test.go`: `noopNftInstaller`
+  default via `init()`, `fakeNftInstaller`, `countingNftInstaller`, spec-field
+  assertion helpers). Payload-string matches became structural spec assertions;
+  the per-drop-rule text correctness is now the PR-2 netlink builder + parity
+  CI's job. Added `daemon_nft_netlink_capability_test.go` (the §12.5 distinct-
+  reason + fail-closed proof, and the healthy-subsystem no-mis-tag counterpart).
+  Parent-RED verified: neutralizing the host-inbound final return → 8 host-inbound
+  tests RED; the catastrophic/lo0/teardown returns → 5 RED; the tail `errors.Join`
+  (drop hostInboundErr+lo0Err) → 2 integration tests RED; the nf_tables tag →
+  the distinct-reason test RED. `go build ./...`, `go vet`, and
+  `go test ./pkg/{daemon,nftables,cluster,dataplane}/...` all clean. The T1
+  ruleset-parity CI SKIPs here (no `nft` binary — it runs in CI/on the cluster).
+  `make test-failover` is owned by the parent (deploy to both nodes restores fw1).
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/daemon_nft_netlink.go (new),
+  pkg/daemon/daemon_nft_netlink_testhelper_test.go (new),
+  pkg/daemon/daemon_nft_netlink_capability_test.go (new),
+  pkg/daemon/daemon_nft_netlink_parity_test.go, pkg/daemon/host_inbound_nft_test.go,
+  pkg/daemon/lo0_filter_test.go, pkg/daemon/host_inbound_coldboot_fence_5644_test.go,
+  pkg/daemon/host_inbound_coverage_gap_5789_test.go,
+  pkg/daemon/host_inbound_teardown_enforced_5790_test.go,
+  pkg/daemon/daemon_apply_runtime_test.go, pkg/daemon/postpromo_ctx_skew_5643_test.go,
+  pkg/daemon/README.md, pkg/nftables/README.md.
+
 ## 2026-07-23 — #6396 codex-179 review residuals (3 low-risk hardenings)
 
 - **Timestamp**: 2026-07-23 (fix/6396-hardening-residuals)
@@ -59648,3 +59697,63 @@ top.
   - **File(s)**: pkg/config/compiler_validate_strict_nat.go,
     pkg/config/compiler_nat_pool_overlap_5144_test.go,
     docs/config-schema.md, _Log.md
+  - **Action**: #6176 metric-HELP precision (Go half only — area-partition
+    split; the userspace-dp Rust doc-comment half is split to #6413 for the
+    userspace-dp owner). DOC/string-only, no behavior change (verified
+    firsthand against the code). The `synced_import_cap_drops_total` metric
+    HELP said the bound was the LOGICAL ceiling `worker_count * max_sessions`;
+    the shared `synced` map is bounded at 2× that in ENTRIES (each admitted
+    forward publishes a forward AND a synthesized reverse companion per
+    logical session). Aligned the two Go formula sites to
+    `2 * worker_count * max_sessions` entries, keeping the correct firing
+    semantics (a drop = a peer past its OWN logical session ceiling; a full
+    symmetric-peer set of N logical → 2N entries EXACTLY fits and never trips
+    it). Correctness cited against the userspace-dp coordinator
+    (`upsert_synced_session` gate + `synced_import_cap` = `2 * worker_count *
+    DEFAULT_MAX_SESSIONS`, which `bpf_map/metrics.rs` already documents at
+    2N). Not a metric-code change (name/labels/direction/firing all unchanged
+    and correct) — a pure HELP/doc-string correction, so no fail-on-revert
+    test; no existing test binds the HELP prose (metrics_test.go asserts the
+    counter VALUE, unaffected). Reverted the 4 userspace-dp files (README +
+    session_import.rs/control.rs/coordinator/status.rs comments) OUT of this
+    PR — handed off in #6413. Codex re-review fold (MERGE-NEEDS-MINOR): the
+    "a peer exceeded its OWN ceiling" clause was a receiver-local claim
+    mis-attributed to the peer — the gate (session_import.rs:91) only
+    observes THIS appliance's occupancy vs the RECEIVER-derived cap, so a
+    larger asymmetric peer can legitimately trip a smaller receiver's cap
+    (session/README.md:775). Reworded both Go sites to "a peer's import
+    would push THIS appliance past its own aggregate entry ceiling (2N)"
+    (receiver-local), and noted in the internal status doc that 2N is the
+    FORWARD-admission threshold (a lone reverse bypasses the gate, so
+    occupancy can momentarily reach 2N+1).
+  - **File(s)**: pkg/api/metrics_descriptors.go,
+    pkg/dataplane/userspace/protocol_status.go, _Log.md
+  - **Action**: #6355 fix — test/xsk-repro/selftest-compile.sh's SKIP probes
+    word-split $CC like the Makefile's $(CC). The tool-gate `command -v "$CC"`
+    and the trial-link `"$CC" -x c -` both QUOTED $CC, so a multi-token wrapper
+    compiler (`ccache gcc`, `env cc`, `gcc -flag`) that `make check` accepts
+    false-SKIPped (over-skip, never a hidden failure — hence LOW; #6353 Codex
+    M2 follow-up). Fix: extract the first word for the existence check
+    (`CC_BIN=${CC%% *}`) and leave $CC unquoted (word-split) for the trial link,
+    matching $(CC). Fail-on-revert gate `selftest-multitoken-cc_6355.sh`
+    (hermetic — `env <fakecc>` models a working toolchain) asserts the wrapper
+    CC reaches PASS (exit 0); re-quoting EITHER probe as "$CC" makes the wrapper
+    unfindable/unexecutable → SKIP (exit 77) → RED. Verified RED→GREEN on both
+    revert directions firsthand. Registered under `make selftest`. Documented
+    in test/xsk-repro/README.md (#6355 follow-up to the M2 note).
+  - **File(s)**: test/xsk-repro/selftest-compile.sh,
+    test/xsk-repro/selftest-multitoken-cc_6355.sh, scripts/run-selftests.sh,
+    test/xsk-repro/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+- **Action**: Fix #6381 — TestMgmtReconcileTLSChange_5866 asserted a false
+    "fresh leaf per rebind" invariant that only passed as a CI artifact
+    (unwritable /etc/xpf/tls). Redirected certGen to a writable temp dir via a
+    new test-only api.Server.SetTLSCertDirForTest hook and re-encoded the
+    intended invariant: an HTTPS bind change make-before-break rebinds the HTTPS
+    leg but the DURABLE self-signed cert (#1916 D6) is reloaded AS-IS (identical
+    leaf bytes) — a rebind must not re-mint (TOFU-pin churn). Parent-RED:
+    neutralizing the durable-reload path (forced re-mint) turns the corrected
+    assertion RED, proving it now binds (the old assertion PASSED under exactly
+    that re-mint condition). Test-only; no production behavior change.
+- **File(s)**: pkg/api/server.go, pkg/daemon/management_5866_test.go, _Log.md
