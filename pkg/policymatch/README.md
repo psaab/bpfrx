@@ -525,6 +525,24 @@ same convention the host-inbound `ipFamily` helper uses. The fail-on-revert
 artifact is `mixed_family_tuple_5720_test.go`: dropping the gate makes the
 (V4 src, V6 dst) query fall through to a fabricated default verdict.
 
+The `Match`-side gate is transport-agnostic (every surface funnels through the
+one entry point), but rendering the *dedicated verdict* to an operator is
+per-surface: the REST (`pkg/api`) and gRPC `MatchPolicies`
+(`server_cluster.go`) paths already emit `res.DisplayAction()`, so they surface
+`UnsupportedTupleFamilyActionString` for free. The three hand-rolled text
+renders — `cli_request_testcmd.go` (`test security policy-match`),
+`cli_show_security.go` (`show security match-policies`), and
+`server_show_firewall.go` (gRPC show-firewall `test policy` bridge) — each
+format the verdict fields by hand, so #5720 gives them an explicit
+`if res.UnsupportedTupleFamily` branch (mirroring their `ContentRejected` /
+`HostInboundUnmatched` arms) that prints `DisplayAction()`. Without it an
+operator on those surfaces would read an ordinary `Default deny (no matching
+policy)` for an *impossible* tuple and be tempted to add a permit that can
+never take effect. The render-side fail-on-revert artifact is
+`server_show_testpolicy_unsupported_tuple_5720_test.go`: dropping the
+gRPC-text arm makes the (V4 src, V6 dst) topic fall back to the fabricated
+`no matching policy` line.
+
 ## Not modeled
 
 Scheduler-driven policy `inactive` state is not applied — a scheduled policy is

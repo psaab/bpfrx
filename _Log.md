@@ -57951,3 +57951,24 @@ top.
     scripts/image/validate.py, scripts/image/test_validate_ownership.py,
     docs/image-validation.md,
     docs/pr/812-tx-latency-histogram/evidence/vdso_probe2.c
+
+- **Timestamp**: 2026-07-23 (rev6375 review-fold)
+  - **Action**: Fold rev6375 MINOR (#6375 / Advances #5720): surface the
+    `UnsupportedTupleFamily` verdict on all render surfaces, not just REST +
+    gRPC `MatchPolicies`. The #5720 `Match`-side gate is transport-agnostic, but
+    only the two `DisplayAction()` callers rendered the dedicated verdict; the
+    three hand-rolled text renders (`test security policy-match`,
+    `show security match-policies`, gRPC show-firewall `test policy` bridge) fell
+    through to a fabricated `Default deny (no matching policy)` for the
+    *impossible* (V4 src, V6 dst) tuple — misleading an operator toward a NAT46
+    permit that can never take effect. Added an `if res.UnsupportedTupleFamily`
+    branch to each (mirroring their `ContentRejected` / `HostInboundUnmatched`
+    arms) that prints `res.DisplayAction()`. Render-side fail-on-revert:
+    `server_show_testpolicy_unsupported_tuple_5720_test.go` (drop the gRPC-text
+    arm → the tuple falls back to `no matching policy`, RED-verified). Pure
+    diagnostic-display consistency; fail-closed safety was already correct on
+    every surface (all deny). README render-coverage note added.
+  - **File(s)**: pkg/cli/cli_request_testcmd.go, pkg/cli/cli_show_security.go,
+    pkg/grpcapi/server_show_firewall.go,
+    pkg/grpcapi/server_show_testpolicy_unsupported_tuple_5720_test.go,
+    pkg/policymatch/README.md
