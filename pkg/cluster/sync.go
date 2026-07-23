@@ -346,16 +346,22 @@ type SessionSync struct {
 	// stranded on the prior config (M-2/#4151).
 	OnConfigReceived func(configText string) error
 	// OnConfigApplyHealth reports the config-sync APPLY health edge (#6387).
-	// configApplyLoop fires failing=true (once) when a received config
-	// generation has stayed un-applied — apply hard-failing, high-water pinned
-	// per M-2/#4151 — for longer than the stale-duration grace
-	// (configApplyFailGrace), and failing=false (once) the first time an apply
-	// succeeds after such a raise. reason is the raw apply error on a raise (the
-	// Manager sanitizes/bounds it before storage) and empty on a clear. The
-	// daemon wires this to Manager.SetConfigSyncHealth so a persistently
-	// stranded standby surfaces as a CF monitor-failure / degraded health
-	// instead of only the terse `Transfer ready: no` string. Diagnostic only —
-	// it NEVER gates failover.
+	// failing=true fires (once per streak) when a received config generation
+	// has stayed un-applied — apply hard-failing, high-water pinned per
+	// M-2/#4151 — for longer than the stale-duration grace
+	// (configApplyFailGrace); the raise is driven by an independent grace-expiry
+	// timer so a STABLE connection with one persistent apply failure surfaces CF
+	// without a second delivery. failing=false fires on EVERY successful apply
+	// (an idempotent clear), NOT only the first success after a local raise:
+	// a comms transport change tears down this SessionSync but keeps the cluster
+	// Manager, so the replacement instance must be able to clear a CF the OLD
+	// instance raised — gating the clear on this instance's own local raised
+	// flag would leave the manager annotation stuck forever. reason is the raw
+	// apply error on a raise (the Manager sanitizes/bounds it before storage)
+	// and empty on a clear. The daemon wires this to Manager.SetConfigSyncHealth
+	// so a persistently stranded standby surfaces as a CF monitor-failure /
+	// degraded health instead of only the terse `Transfer ready: no` string.
+	// Diagnostic only — it NEVER gates failover.
 	OnConfigApplyHealth func(failing bool, reason string)
 	// OnIPsecSAReceived is called when an IPsec SA list arrives from the peer.
 	OnIPsecSAReceived func(connectionNames []string)
@@ -610,21 +616,41 @@ type SessionSync struct {
 	configApplyCh     chan configApplyItem
 
 	// Config-sync APPLY health tracking (#6387). These drive the time-based CF
-	// monitor-failure edge and are touched ONLY by the single-consumer
-	// configApplyLoop goroutine, so they need no lock/atomic (same ownership as
-	// the loop-local high-water logic).
+	// monitor-failure edge. Unlike the loop-local high-water logic they are NOT
+	// single-goroutine-owned: an independent grace-expiry timer
+	// (configApplyFailTimer, armed on the first failure of a streak) fires its
+	// callback on its OWN goroutine while the single-consumer configApplyLoop
+	// touches the same fields, so every access is guarded by configApplyMu.
 	//
 	// firstUnappliedFailNano is MonotonicNanos of the FIRST apply failure in the
 	// current un-applied streak (0 = no active streak). configApplyHealthRaised
 	// records whether OnConfigApplyHealth(true) has already fired for this
 	// streak, so the raise fires at most once and the matching clear fires on
-	// the first subsequent success. nowMonoFn/configApplyFailGrace are injection
-	// seams (nil / 0 = production defaults) that let a test drive the
-	// stale-duration clock and threshold deterministically.
+	// the first subsequent success. configApplyFailReason holds the latest
+	// apply error so the timer callback can raise CF with a meaningful reason
+	// even without a fresh delivery edge.
+	//
+	// configApplyFailTimer is the independent grace-expiry timer: the config
+	// sender pushes a generation at most once per connection/generation, so a
+	// STABLE connection with one persistent apply failure gets no second
+	// delivery — the timer, not a re-delivery edge, guarantees CF surfaces once
+	// the grace elapses. configApplyFailEpoch is bumped on every arm/cancel;
+	// the timer callback captures its epoch and no-ops on a mismatch, so a
+	// success (or re-arm) that cancels a timer already past its Stop() cannot
+	// raise a stale CF (the cancelled-but-already-firing race).
+	//
+	// nowMonoFn/configApplyFailGrace/afterFuncFn are injection seams (nil / 0 =
+	// production defaults) that let a test drive the stale-duration clock, the
+	// threshold, and the timer deterministically.
+	configApplyMu           sync.Mutex
 	firstUnappliedFailNano  int64
 	configApplyHealthRaised bool
+	configApplyFailReason   string
+	configApplyFailTimer    *time.Timer
+	configApplyFailEpoch    uint64
 	nowMonoFn               func() int64
 	configApplyFailGrace    time.Duration
+	afterFuncFn             func(d time.Duration, f func()) *time.Timer
 
 	// #5706 full-set state-sync ordering guard (IPsec SA + DHCP leases).
 	//

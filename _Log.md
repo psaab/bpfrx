@@ -58775,3 +58775,20 @@ top.
     pkg/cluster/sync.go, pkg/cluster/sync_conn_config.go, pkg/cluster/status.go,
     pkg/cluster/sync_config_health_6387_test.go, pkg/daemon/daemon_ha_sync.go,
     docs/sync-protocol.md, docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6387 PR-1 (PR #6398) MERGE-NEEDS-MAJOR fixes — config-sync
+    apply-failure CF monitor-failure. BUG 1: raise now driven by an independent
+    grace-expiry timer armed on the first failure (armConfigApplyGraceTimerLocked
+    → time.AfterFunc, afterFuncFn test seam) so a stable connection with one
+    persistent apply failure raises CF with no second delivery; on-edge check
+    fixed to strictly-greater (> grace); epoch-guard + configApplyMu protect the
+    cancelled-but-already-firing race; timer stopped on Stop(). BUG 2:
+    noteConfigApplySuccess clears CF UNCONDITIONALLY (idempotent) so a fresh
+    SessionSync after a comms restart clears a CF the prior instance raised on
+    the shared Manager. Rewrote raise test (timer-driven, no 2nd delivery), added
+    comms-restart clear test + timer-cancel/no-flap+goroutine-leak assertions;
+    parent-RED verified for both fixes.
+  **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
+    pkg/cluster/sync_conn_config.go, pkg/cluster/sync_config_health_6387_test.go,
+    docs/sync-protocol.md, _Log.md

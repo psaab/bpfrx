@@ -512,15 +512,34 @@ made the failure *invisible*: a standby whose apply hard-fails every time (e.g.
 the host-inbound enforcement step cannot install because a dependency is
 missing) is stuck `Transfer ready: no`, `applied gen=0` forever, yet reports as
 "healthy" in `show chassis cluster status`. `configApplyLoop` now drives a
-**time-based** config-sync monitor-failure (`CF`) off that same failure edge.
-On the FIRST apply failure it stamps a monotonic timestamp; once the received
-generation has stayed un-applied past a stale-duration grace
-(`DefaultConfigApplyFailGrace`, 30s — because the loop only runs on a RECEIVED
-config and the primary re-pushes the same generation on reconnect / on later
-commits rather than continuously, an "N consecutive failures" count could never
-fire, and 30s is comfortably longer than a transient RG0-primary rejection so it
-never flaps) it fires `OnConfigApplyHealth(true)`, which the daemon translates
-into `cluster.Manager.SetConfigSyncHealth`. The first successful apply clears it.
+**time-based** config-sync monitor-failure (`CF`) off that failure edge. On the
+FIRST apply failure of an un-applied streak it stamps a monotonic timestamp
+**and arms an independent grace-expiry timer** (`armConfigApplyGraceTimerLocked`
+→ `time.AfterFunc`, overridable in tests via `SessionSync.afterFuncFn`). The
+timer is the primary trigger because the loop only runs on a RECEIVED config and
+the config sender pushes a generation **at most once per connection/generation**
+(the daemon's level-triggered `reconcileConfigSyncToPeer` is idempotent after
+the first push) — so a *stable* connection with one persistent apply failure
+receives **no second delivery**, and any gate keyed on a re-delivery edge (an "N
+consecutive failures" count, or the original elapsed-check that only re-ran on
+another failure) could never fire and would strand the standby silently forever.
+When the timer fires — grace elapsed, `DefaultConfigApplyFailGrace` 30s,
+comfortably longer than a transient RG0-primary rejection so it never flaps — it
+fires `OnConfigApplyHealth(true)` regardless of whether any further config
+arrived. If a re-delivery *does* arrive after the streak has persisted
+**strictly** longer than the grace (`>`, not `>=`), an on-edge fast path raises
+immediately; both paths are idempotent and **epoch-guarded** so CF raises at
+most once per streak and a success that cancels a timer already past its
+`Stop()` cannot raise a stale CF (the cancelled-but-already-firing race). The
+daemon translates `OnConfigApplyHealth` into `cluster.Manager.SetConfigSyncHealth`.
+A successful apply cancels the timer, resets the streak, and clears CF
+**unconditionally** — not gated on the instance's own local raised flag —
+because a comms transport change tears down the `SessionSync` but **keeps the
+`cluster.Manager`**: the replacement instance must be able to clear a CF the
+prior instance raised, so an idempotent clear on the first success of *any*
+instance re-converges the annotation (gating it on a local flag left the manager
+CF stuck raised forever across a comms restart). The timer is also stopped on
+`SessionSync.Stop()` so none leaks across reconnects.
 The manager stores this as a **dedicated node-global field**
 (`configSyncFailing` / bounded `configSyncFailReason`), NOT an
 `rg.MonitorFails` sentinel — `reconcileMonitorDebtsLocked` would wipe any

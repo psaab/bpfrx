@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,17 @@ import (
 // node is stuck `Transfer ready: no`, `applied gen=0`, but looks "healthy" in
 // the summary. These tests prove the time-based CF signal makes that stranded
 // standby operator-visible without perturbing election.
+//
+// The two defects these tests pin (PR #6398 MERGE-NEEDS-MAJOR):
+//   - the raise must not depend on a SECOND delivery: the sender pushes a
+//     generation at most once per connection/generation, so a STABLE connection
+//     with one persistent apply failure gets no re-delivery edge — an
+//     independent grace-expiry TIMER, armed on the first failure, must raise CF
+//     on its own; and
+//   - the CLEAR must be manager-driven and idempotent: a comms transport change
+//     tears down the SessionSync but keeps the cluster Manager, so a CF raised by
+//     the OLD instance must be cleared by the REPLACEMENT instance's first
+//     successful apply (not gated on the old instance's local raised flag).
 
 // healthClk is a deterministic monotonic clock for driving the stale-duration
 // grace without wall-clock sleeps.
@@ -26,6 +38,47 @@ type healthClk struct{ nanos atomic.Int64 }
 func (c *healthClk) now() int64              { return c.nanos.Load() }
 func (c *healthClk) set(ns int64)            { c.nanos.Store(ns) }
 func (c *healthClk) advance(d time.Duration) { c.nanos.Add(int64(d)) }
+
+// fakeAfterFunc is a deterministic stand-in for time.AfterFunc that captures the
+// armed callback and the requested delay instead of scheduling on the wall
+// clock, so a test can assert the grace-expiry timer was armed and fire it on
+// demand. It spawns NO goroutine and returns an already-stopped real timer, so
+// the SessionSync's Stop() calls on the handle are safe no-ops.
+type fakeAfterFunc struct {
+	mu    sync.Mutex
+	calls int
+	lastD time.Duration
+	last  func()
+}
+
+func (f *fakeAfterFunc) schedule(d time.Duration, fn func()) *time.Timer {
+	f.mu.Lock()
+	f.calls++
+	f.lastD = d
+	f.last = fn
+	f.mu.Unlock()
+	tm := time.NewTimer(time.Hour)
+	tm.Stop()
+	return tm
+}
+
+func (f *fakeAfterFunc) armed() (int, time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls, f.lastD
+}
+
+// fire invokes the most recently armed callback, simulating the grace-expiry
+// timer firing. A no-op if nothing was ever armed (so a neutralized arm leaves
+// this inert and the raise assertion fails RED).
+func (f *fakeAfterFunc) fire() {
+	f.mu.Lock()
+	fn := f.last
+	f.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
 
 func mgrConfigSyncFailing(m *Manager) bool {
 	m.mu.RLock()
@@ -45,22 +98,28 @@ func flushClusterEvents(m *Manager) {
 	}
 }
 
-// TestConfigSyncHealthRaisesAfterGraceAndClearsOnSuccess is the primary
-// RED-on-revert test. It wires OnConfigReceived to hard-fail, drives
-// configApplyLoop, advances the stale-duration clock past the grace, and
-// asserts:
+// TestConfigSyncHealthTimerRaisesWithoutSecondDelivery is the primary
+// RED-on-revert test for BUG 1. It wires OnConfigReceived to hard-fail, delivers
+// the config exactly ONCE (a STABLE connection — the sender does not re-push),
+// advances the stale-duration clock past the grace, fires the armed grace-expiry
+// timer, and asserts:
 //   - lastAppliedConfigGen stays pinned at 0 (existing #4151 behavior),
 //   - ConfigsApplyFailed increments,
-//   - configSyncFailing raises once the grace elapses → FormatStatus renders CF
-//     and FormatInformation renders "Node health: degraded" + "Config sync:
-//     failing",
+//   - the grace-expiry timer was ARMED on the first failure (with the grace),
+//   - configSyncFailing raises when that timer fires — NO second delivery →
+//     FormatStatus renders CF and FormatInformation renders degraded health +
+//     "Config sync: failing",
 //   - the flag SURVIVES an intervening UpdateConfig (the reconcileMonitorDebts
 //     hazard — the key regression), and
 //   - one successful apply CLEARS it.
-func TestConfigSyncHealthRaisesAfterGraceAndClearsOnSuccess(t *testing.T) {
+//
+// Neutralizing armConfigApplyGraceTimerLocked (the timer arm) leaves fakeAfterFunc
+// uncalled → fire() is inert → CF never raises → this test goes RED.
+func TestConfigSyncHealthTimerRaisesWithoutSecondDelivery(t *testing.T) {
 	const grace = 5 * time.Second
 	clk := &healthClk{}
 	clk.set(1_000_000_000) // arbitrary non-zero monotonic base
+	af := &fakeAfterFunc{}
 
 	m := NewManager(0, 22)
 	// Two configured RGs so the CF column render is exercised on multiple rows.
@@ -74,9 +133,10 @@ func TestConfigSyncHealthRaisesAfterGraceAndClearsOnSuccess(t *testing.T) {
 	s := NewSessionSync("127.0.0.1:0", "127.0.0.1:0", nil)
 	s.nowMonoFn = clk.now
 	s.configApplyFailGrace = grace
-	// Fail the first two applies (the initial push + the post-grace re-push),
-	// then succeed — mirroring the primary re-pushing the same generation.
-	rec := &configRecorder{failN: 2}
+	s.afterFuncFn = af.schedule
+	// Fail only the first apply; the eventual clear-path apply succeeds. Crucially
+	// the SAME generation is NOT re-delivered — the raise must come from the timer.
+	rec := &configRecorder{failN: 1}
 	s.OnConfigReceived = rec.record
 	s.OnConfigApplyHealth = func(failing bool, reason string) {
 		m.SetConfigSyncHealth(failing, reason)
@@ -86,8 +146,8 @@ func TestConfigSyncHealthRaisesAfterGraceAndClearsOnSuccess(t *testing.T) {
 	defer cancel()
 	go s.configApplyLoop(ctx)
 
-	// (1) First push of gen 7 fails. The streak starts but the grace has not
-	// elapsed, so CF must NOT raise yet.
+	// (1) Single push of gen 7 fails. The streak starts and the grace-expiry
+	// timer is armed, but the timer has not fired, so CF must NOT raise yet.
 	s.configApplyCh <- configApplyItem{gen: 7, text: "config-C7"}
 	drainConfigApply(t, s)
 	if got := s.lastAppliedConfigGen.Load(); got != 0 {
@@ -96,24 +156,23 @@ func TestConfigSyncHealthRaisesAfterGraceAndClearsOnSuccess(t *testing.T) {
 	if got := s.stats.ConfigsApplyFailed.Load(); got != 1 {
 		t.Fatalf("ConfigsApplyFailed should be 1 after first failure, got %d", got)
 	}
+	if calls, d := af.armed(); calls != 1 || d != grace {
+		t.Fatalf("grace-expiry timer must be armed exactly once with the grace on the first failure, got calls=%d d=%s", calls, d)
+	}
 	if mgrConfigSyncFailing(m) {
-		t.Fatal("CF must NOT raise before the stale-duration grace elapses")
+		t.Fatal("CF must NOT raise before the grace-expiry timer fires")
 	}
 
-	// (2) Advance past the grace and re-push the SAME generation (re-admitted
-	// because the high-water never advanced). This failure edge crosses the
-	// grace → CF raises.
+	// (2) Advance past the grace and fire the ARMED timer — no second delivery.
+	// This is the stranded-standby scenario: a stable connection, one persistent
+	// apply failure, and only the timer to surface it.
 	clk.advance(grace + time.Second)
-	s.configApplyCh <- configApplyItem{gen: 7, text: "config-C7"}
-	drainConfigApply(t, s)
+	af.fire()
 	if got := s.lastAppliedConfigGen.Load(); got != 0 {
 		t.Fatalf("high-water must still be pinned at 0, got %d", got)
 	}
-	if got := s.stats.ConfigsApplyFailed.Load(); got != 2 {
-		t.Fatalf("ConfigsApplyFailed should be 2, got %d", got)
-	}
 	if !mgrConfigSyncFailing(m) {
-		t.Fatal("CF must raise once the un-applied streak persists past the grace")
+		t.Fatal("the armed grace-expiry timer must raise CF with no second delivery")
 	}
 
 	// Rendering: FormatStatus folds CF into the Monitor-failures column (the
@@ -157,13 +216,87 @@ func TestConfigSyncHealthRaisesAfterGraceAndClearsOnSuccess(t *testing.T) {
 	}
 }
 
+// TestConfigSyncHealthClearsAcrossCommsRestart is the RED-on-revert test for
+// BUG 2. A comms transport change tears down the SessionSync (daemon
+// stopClusterComms) but KEEPS the cluster Manager, so the "clear-required"
+// state cannot live only in the SessionSync: instance A raises CF on the shared
+// Manager, A is torn down, and a fresh instance B — whose local raised flag was
+// never set — must clear the Manager CF on its first successful apply.
+//
+// Reverting the UNCONDITIONAL clear (gating it back on the instance's own
+// configApplyHealthRaised) leaves B unable to clear the Manager → CF stuck →
+// this test goes RED.
+func TestConfigSyncHealthClearsAcrossCommsRestart(t *testing.T) {
+	const grace = 5 * time.Second
+
+	m := NewManager(0, 22)
+	m.UpdateConfig(makeConfig(makeRG(0, false, map[int]int{0: 200, 1: 100})))
+	flushClusterEvents(m)
+
+	// --- instance A: raises CF via its grace-expiry timer, then is torn down ---
+	clkA := &healthClk{}
+	clkA.set(1_000_000_000)
+	afA := &fakeAfterFunc{}
+	a := NewSessionSync("127.0.0.1:0", "127.0.0.1:0", nil)
+	a.nowMonoFn = clkA.now
+	a.configApplyFailGrace = grace
+	a.afterFuncFn = afA.schedule
+	recA := &configRecorder{failN: 1}
+	a.OnConfigReceived = recA.record
+	a.OnConfigApplyHealth = func(failing bool, reason string) {
+		m.SetConfigSyncHealth(failing, reason)
+	}
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	go a.configApplyLoop(ctxA)
+	a.configApplyCh <- configApplyItem{gen: 5, text: "config-A5"}
+	drainConfigApply(t, a)
+	clkA.advance(grace + time.Second)
+	afA.fire()
+	if !mgrConfigSyncFailing(m) {
+		t.Fatal("precondition: instance A must raise CF on the shared manager")
+	}
+
+	// Tear down A the way stopClusterComms does: stop its loop and Stop() the
+	// instance. Teardown alone must NOT clear the manager CF — the whole point
+	// of the bug is that the CF outlives the SessionSync.
+	cancelA()
+	a.Stop()
+	if !mgrConfigSyncFailing(m) {
+		t.Fatal("tearing down instance A must not clear the manager CF (it outlives the SessionSync)")
+	}
+
+	// --- instance B: a fresh SessionSync on the SAME manager; its first
+	// successful apply must clear the stale CF even though B never raised it. ---
+	b := NewSessionSync("127.0.0.1:0", "127.0.0.1:0", nil)
+	b.OnConfigReceived = (&configRecorder{}).record // succeeds
+	b.OnConfigApplyHealth = func(failing bool, reason string) {
+		m.SetConfigSyncHealth(failing, reason)
+	}
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	go b.configApplyLoop(ctxB)
+
+	b.configApplyCh <- configApplyItem{gen: 6, text: "config-B6"}
+	drainConfigApply(t, b)
+	if got := b.lastAppliedConfigGen.Load(); got != 6 {
+		t.Fatalf("instance B's apply must advance its high-water to 6, got %d", got)
+	}
+	if mgrConfigSyncFailing(m) {
+		t.Fatal("instance B's first successful apply must clear the manager CF raised by instance A")
+	}
+}
+
 // TestConfigSyncHealthTransientFailureWithinGraceNoFlap proves a transient apply
 // failure that resolves WITHIN the grace never raises CF — a transient
-// RG0-primary rejection must not flap the flag.
+// RG0-primary rejection must not flap the flag — AND that the grace-expiry timer
+// is cancelled on the intervening success so a late fire cannot raise a stale CF
+// (the cancelled-but-already-firing race) and no timer is leaked.
 func TestConfigSyncHealthTransientFailureWithinGraceNoFlap(t *testing.T) {
 	const grace = 30 * time.Second
 	clk := &healthClk{}
 	clk.set(5_000_000_000)
+	af := &fakeAfterFunc{}
 
 	var mu sync.Mutex
 	var raisedTrue int
@@ -171,9 +304,12 @@ func TestConfigSyncHealthTransientFailureWithinGraceNoFlap(t *testing.T) {
 	m.UpdateConfig(makeConfig(makeRG(0, false, map[int]int{0: 200, 1: 100})))
 	flushClusterEvents(m)
 
+	goroutinesBefore := runtime.NumGoroutine()
+
 	s := NewSessionSync("127.0.0.1:0", "127.0.0.1:0", nil)
 	s.nowMonoFn = clk.now
 	s.configApplyFailGrace = grace
+	s.afterFuncFn = af.schedule
 	rec := &configRecorder{failN: 1} // one transient failure, then success
 	s.OnConfigReceived = rec.record
 	s.OnConfigApplyHealth = func(failing bool, reason string) {
@@ -189,10 +325,14 @@ func TestConfigSyncHealthTransientFailureWithinGraceNoFlap(t *testing.T) {
 	defer cancel()
 	go s.configApplyLoop(ctx)
 
-	// Failure at t0 (streak starts, grace not elapsed).
+	// Failure at t0 (streak starts, timer armed, grace not elapsed).
 	s.configApplyCh <- configApplyItem{gen: 3, text: "config-A"}
 	drainConfigApply(t, s)
-	// A short time later (well within the grace) the re-push succeeds.
+	if calls, _ := af.armed(); calls != 1 {
+		t.Fatalf("timer must be armed on the transient failure, got calls=%d", calls)
+	}
+	// A short time later (well within the grace) the re-push succeeds — this
+	// cancels the timer.
 	clk.advance(2 * time.Second)
 	s.configApplyCh <- configApplyItem{gen: 3, text: "config-A"}
 	drainConfigApply(t, s)
@@ -203,10 +343,40 @@ func TestConfigSyncHealthTransientFailureWithinGraceNoFlap(t *testing.T) {
 	if mgrConfigSyncFailing(m) {
 		t.Fatal("a failure resolving within the grace must NOT leave CF raised")
 	}
+
+	// The success must have cancelled the timer (no dangling handle) and bumped
+	// the epoch. Simulate a late fire of the already-cancelled timer: the epoch
+	// guard must make it a no-op, so CF stays clear (no flap).
+	s.configApplyMu.Lock()
+	timerNil := s.configApplyFailTimer == nil
+	s.configApplyMu.Unlock()
+	if !timerNil {
+		t.Fatal("the grace-expiry timer must be cancelled (handle dropped) on the intervening success")
+	}
+	af.fire() // stale late fire — must be swallowed by the epoch guard
+	if mgrConfigSyncFailing(m) {
+		t.Fatal("a stale late timer fire after a success must NOT raise CF (epoch guard)")
+	}
+
 	mu.Lock()
-	defer mu.Unlock()
 	if raisedTrue != 0 {
+		mu.Unlock()
 		t.Fatalf("CF must never have flapped to failing within the grace, raised=%d", raisedTrue)
+	}
+	mu.Unlock()
+
+	// No leaked timer goroutine: fakeAfterFunc spawns none and the real path is
+	// stopped, so the goroutine count returns to its baseline once the loop exits.
+	cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= goroutinesBefore {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if after := runtime.NumGoroutine(); after > goroutinesBefore {
+		t.Fatalf("goroutine leak: before=%d after=%d", goroutinesBefore, after)
 	}
 }
 
