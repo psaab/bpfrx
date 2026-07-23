@@ -809,6 +809,259 @@ fn wg_encap_builds_when_zeroed_decision_has_no_l2() {
     );
 }
 
+// === #6308: the WG transit-egress TX DISPATCH must target the SELECTED peer's
+// PHYSICAL egress NIC — the SAME physical egress #5292 resolved the frame BYTES
+// against — even when the WG transport table carries ONLY a specific peer route
+// and NO default route. The zeroed WG endpoint destination (#2837) resolves to
+// tx_ifindex = 0 / egress_ifindex = the LOGICAL wgN ifindex, so the pre-#6308
+// dispatch fallback `resolve_tx_binding_ifindex(logical wgN)` returned the
+// logical ifindex (no XSK binding) and the TX dispatcher NO_EGRESS_BINDING-
+// dropped a correctly-built frame. ===
+
+#[test]
+fn wg_transit_egress_dispatch_specific_peer_no_default_6308() {
+    // The shared #2680 fixture is EXACTLY the #6308 scenario: the WG transport
+    // table (inet.0) has ONLY the specific peer route 203.0.113.0/24 → reth0.80
+    // (ifindex 12) and NO default route. Sanity-assert the no-default
+    // precondition so the test can't silently stop exercising it.
+    let state = build_forwarding_state(&wg_outer_mtu_snapshot());
+    assert!(
+        state
+            .routes_v4
+            .values()
+            .flatten()
+            .all(|r| r.prefix.prefix_len() != 0),
+        "fixture must carry NO default route (the #6308 specific-peer-route + \
+         no-default-route case)"
+    );
+
+    // The resolution the SSOT actually stores for this flow (zeroed WG endpoint
+    // destination → NoRoute for 0.0.0.0): tx_ifindex = 0, egress_ifindex = the
+    // logical wgN ifindex (400).
+    let decision = wg_tunnel_decision(400, 1);
+    assert_eq!(
+        decision.resolution.tx_ifindex, 0,
+        "no-default-route WG resolution stores tx_ifindex 0"
+    );
+    assert_eq!(
+        decision.resolution.egress_ifindex, 400,
+        "WG resolution stores the LOGICAL wgN egress ifindex"
+    );
+
+    let frame = inner_v4_frame(); // dst 10.123.0.9 ∈ AllowedIPs 10.123.0.0/24
+    let meta = inner_v4_meta();
+
+    // The peer-route physical-egress SSOT resolves reth0.80 (ifindex 12) — the
+    // SAME physical egress #5292 resolves the frame bytes against — NOT the
+    // logical wgN ifindex (400).
+    assert_eq!(
+        wg_transit_egress_physical_egress_ifindex(
+            &decision,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        Some(12),
+        "WG dispatch must resolve the SELECTED peer's physical egress \
+         (reth0.80 ifindex 12), not the logical wgN ifindex (400)"
+    );
+
+    // The DISPATCH target the TX dispatcher looks up an XSK binding for: the
+    // physical PARENT NIC of reth0.80 (bind_ifindex, which HAS a binding), NOT
+    // the logical wgN 400 (which does not → NO_EGRESS_BINDING drop).
+    let expected_physical_bind = state
+        .egress
+        .get(&12)
+        .map(|e| e.bind_ifindex)
+        .expect("reth0.80 egress row present");
+    let target = crate::afxdp::forward_request::resolve_forward_target_ifindex(
+        &decision,
+        &state,
+        &frame,
+        meta.addr_family,
+        meta.l3_offset,
+    );
+    assert_eq!(
+        target, expected_physical_bind,
+        "dispatch must target reth0.80's physical parent NIC \
+         (bind_ifindex {expected_physical_bind})"
+    );
+    assert_ne!(
+        target, 400,
+        "dispatch must NOT target the logical wgN ifindex (400) — the pre-#6308 \
+         fallback that has no XSK binding and NO_EGRESS_BINDING-drops the frame"
+    );
+
+    // Common case (no regression): a WG transport table WITH a default route
+    // resolves tx_ifindex > 0 (the default egress bind ifindex = the physical
+    // WAN parent). The dispatcher takes that verbatim and never consults the
+    // peer-route resolution. Simulate the resolved decision and assert dispatch
+    // returns it unchanged.
+    let mut default_route_decision = decision;
+    default_route_decision.resolution.tx_ifindex = expected_physical_bind;
+    assert_eq!(
+        crate::afxdp::forward_request::resolve_forward_target_ifindex(
+            &default_route_decision,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        expected_physical_bind,
+        "default-route WG flow (tx_ifindex > 0) must dispatch to the default \
+         egress verbatim — the common case is unchanged"
+    );
+
+    // A non-WG (plain-forward) decision must NOT trigger the WG dispatch
+    // resolution: the helper returns None so the caller keeps the pre-#6308
+    // logical fallback for every non-tunnel flow.
+    let mut plain = decision;
+    plain.resolution.tunnel_endpoint_id = 0;
+    plain.resolution.egress_ifindex = 12;
+    plain.resolution.tx_ifindex = 0;
+    assert_eq!(
+        wg_transit_egress_physical_egress_ifindex(
+            &plain,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        None,
+        "a non-WG decision must not trigger the WG dispatch resolution"
+    );
+}
+
+/// #6340: an engine with TWO cryptokey-routed peers on ONE wg interface, each
+/// covering a DISTINCT AllowedIPs prefix that routes to a DISTINCT physical
+/// underlay egress. `peer_for_dest` (the encap + dispatch peer selector) reads
+/// the AllowedIPs trie + per-peer endpoint from config alone — no transport
+/// session is required to resolve WHICH physical NIC a dst egresses — so this
+/// builds the two peers without driving a handshake (the function under test
+/// routes, it does not encrypt). Peer A: 10.123.0.0/24 → 203.0.113.7 (reth0.80);
+/// peer B: 10.200.0.0/24 → 198.51.100.7 (reth0.50).
+fn two_peer_config_engine() -> WgEngine {
+    let (local_priv, _local_pub) = wg_keypair();
+    let (_a_priv, a_pub) = wg_keypair();
+    let (_b_priv, b_pub) = wg_keypair();
+    WgEngine::new(WgEngineConfig {
+        local_private_key: local_priv.into(),
+        listen_port: 51820,
+        peers: vec![
+            WgPeerConfig {
+                pubkey: a_pub,
+                endpoint: Some("203.0.113.7:51820".parse().unwrap()),
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.123.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32].into(),
+            },
+            WgPeerConfig {
+                pubkey: b_pub,
+                endpoint: Some("198.51.100.7:51820".parse().unwrap()),
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.200.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32].into(),
+            },
+        ],
+    })
+}
+
+#[test]
+fn wg_transit_egress_dispatch_follows_post_nat_peer_6308() {
+    // #6340: the #6308 DNAT SSOT hole. A WG transit-egress flow where DNAT
+    // rewrites the inner dst ACROSS two AllowedIPs peers that live on DISTINCT
+    // physical underlay egresses. The encap builder applies DNAT into `out`
+    // BEFORE `wg_encap_frame` selects the peer from the POST-NAT dst
+    // (`inner_dst_ip(&out)`); DISPATCH must resolve the SAME (post-NAT) peer's
+    // physical NIC, not the PRE-NAT peer's — otherwise dispatch targets one
+    // NIC while the bytes carry the other peer's L2 (a wire mismatch).
+    let mut state = build_forwarding_state(&wg_two_peer_dnat_snapshot());
+    state
+        .wg_engines
+        .insert(1, Arc::new(two_peer_config_engine()));
+
+    // The two peers really do resolve to DISTINCT physical egresses / binds.
+    let peer_a_egress = 12; // reth0.80
+    let peer_b_egress = 13; // reth0.50
+    let bind_a = state
+        .egress
+        .get(&peer_a_egress)
+        .map(|e| e.bind_ifindex)
+        .expect("reth0.80 egress row present");
+    let bind_b = state
+        .egress
+        .get(&peer_b_egress)
+        .map(|e| e.bind_ifindex)
+        .expect("reth0.50 egress row present");
+    assert_ne!(
+        bind_a, bind_b,
+        "the two peers must live on DISTINCT physical NICs for this test to \
+         distinguish pre- vs post-NAT dispatch"
+    );
+
+    // Ingress (PRE-NAT) frame: inner dst 10.123.0.9 ∈ peer A's AllowedIPs
+    // (10.123.0.0/24). DNAT rewrites it to 10.200.0.9 ∈ peer B's AllowedIPs
+    // (10.200.0.0/24) — a DIFFERENT physical underlay.
+    let frame = inner_v4_frame(); // dst 10.123.0.9 (peer A)
+    let meta = inner_v4_meta();
+    let mut decision = wg_tunnel_decision(400, 1);
+    decision.nat.rewrite_dst = Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 200, 0, 9)));
+
+    // Baseline (no DNAT): the un-rewritten frame egresses peer A (reth0.80,
+    // ifindex 12). Proves the fixture selects A on the pre-NAT dst so the
+    // post-NAT assertion below is meaningful (not a fixture that always
+    // resolves B).
+    let mut no_nat = decision;
+    no_nat.nat.rewrite_dst = None;
+    assert_eq!(
+        wg_transit_egress_physical_egress_ifindex(
+            &no_nat,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        Some(peer_a_egress),
+        "without DNAT the frame egresses peer A (reth0.80 ifindex 12)"
+    );
+
+    // The fix: DISPATCH follows the POST-NAT dst → peer B's physical egress
+    // (reth0.50, ifindex 13) — the SAME NIC `wg_encap_frame` emits bytes for
+    // (it reads `inner_dst_ip(&out)` on the DNAT'd `out`). Reverting the fold
+    // (select from the pre-NAT frame dst) resolves peer A (12) → RED.
+    assert_eq!(
+        wg_transit_egress_physical_egress_ifindex(
+            &decision,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        Some(peer_b_egress),
+        "DNAT-across-peers: dispatch must follow the POST-NAT dst to peer B's \
+         physical egress (reth0.50 ifindex 13), NOT the pre-NAT peer A (12)"
+    );
+
+    // And the full dispatch target (the XSK bind ifindex the TX dispatcher
+    // looks up) is peer B's physical bind, not peer A's.
+    let target = crate::afxdp::forward_request::resolve_forward_target_ifindex(
+        &decision,
+        &state,
+        &frame,
+        meta.addr_family,
+        meta.l3_offset,
+    );
+    assert_eq!(
+        target, bind_b,
+        "dispatch must target peer B's physical bind ({bind_b})"
+    );
+    assert_ne!(
+        target, bind_a,
+        "dispatch must NOT target the pre-NAT peer A's physical bind ({bind_a})"
+    );
+}
+
 /// Minimal L2/IPv6/UDP inner frame with dst in `fd00:123::/64` so
 /// `peer_for_dest` selects the v6-endpoint peer.
 fn inner_v6_frame() -> Vec<u8> {

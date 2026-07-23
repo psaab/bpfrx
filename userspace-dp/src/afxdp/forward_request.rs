@@ -38,6 +38,47 @@ pub(super) fn should_install_local_reverse_session(
         || (fabric_ingress && !fabric_wire_placeholder)
 }
 
+/// Select the PHYSICAL egress ifindex a forwarded frame is DISPATCHED to (the
+/// XSK-bound NIC the TX dispatcher looks up via
+/// `resolve_pending_forward_target_binding`).
+///
+/// For a normal flow the resolution's `tx_ifindex` (the physical bind ifindex)
+/// is authoritative and taken verbatim — the common fast path, unchanged.
+///
+/// #6308: a WG transit-egress flow whose WG transport table has ONLY a specific
+/// peer route (no default) resolves against the endpoint's ZEROED destination
+/// (#2837) to `tx_ifindex = 0` / `egress_ifindex =` the logical wgN ifindex.
+/// The pre-#6308 fallback `resolve_tx_binding_ifindex(logical wgN)` returned the
+/// logical ifindex, which has no XSK binding → the TX dispatcher
+/// NO_EGRESS_BINDING-drops a frame #5292 built correctly. Resolve the physical
+/// underlay egress against the SAME selected-peer route #5292 uses for the frame
+/// bytes so dispatch and bytes agree on the physical NIC; non-WG /
+/// unresolvable-peer paths keep the logical fallback (fail-closed identical to
+/// before). The peer-route resolution runs ONLY on the `tx_ifindex == 0` path
+/// (the previously-dropped case), so default-route WG traffic and every non-WG
+/// forward keep the zero-extra-work fast path above.
+#[inline]
+pub(in crate::afxdp) fn resolve_forward_target_ifindex(
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    frame: &[u8],
+    frame_addr_family: u8,
+    frame_l3_offset_hint: u16,
+) -> i32 {
+    if decision.resolution.tx_ifindex > 0 {
+        return decision.resolution.tx_ifindex;
+    }
+    let egress_ifindex = crate::afxdp::frame::wg_transit_egress_physical_egress_ifindex(
+        decision,
+        forwarding,
+        frame,
+        frame_addr_family,
+        frame_l3_offset_hint,
+    )
+    .unwrap_or(decision.resolution.egress_ifindex);
+    resolve_tx_binding_ifindex(forwarding, egress_ifindex)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn build_live_forward_request(
     area: &MmapArea,
@@ -106,11 +147,18 @@ pub(super) fn build_live_forward_request_from_frame(
     nat64_reverse: Option<Nat64ReverseInfo>,
 ) -> Option<PendingForwardRequest> {
     let hints = hints.unwrap_or_default();
-    let target_ifindex = if decision.resolution.tx_ifindex > 0 {
-        decision.resolution.tx_ifindex
-    } else {
-        resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
-    };
+    // #6308: `resolve_forward_target_ifindex` keeps the `tx_ifindex > 0` fast
+    // path for every normal / default-route flow, and for a WG transit-egress
+    // flow with a specific peer route + NO default route resolves the physical
+    // underlay egress against the selected peer route (matching #5292's frame
+    // bytes) instead of the logical wgN fallback that has no XSK binding.
+    let target_ifindex = resolve_forward_target_ifindex(
+        decision,
+        forwarding,
+        frame,
+        meta.addr_family,
+        meta.l3_offset,
+    );
     // #2357: a forwarded non-first IP fragment carries no L4 header — its
     // post-IP-header bytes are payload, not ports. #2344 already made it
     // flowless on the policy/session path (`flow` is `None` here), but the

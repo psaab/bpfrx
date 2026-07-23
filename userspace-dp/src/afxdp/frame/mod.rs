@@ -19,6 +19,14 @@ pub(in crate::afxdp) use generated::generated_reply_session_key;
 // against (the `mod wg` submodule itself is private to `frame`).
 pub(in crate::afxdp) use wg::wg_endpoint_physical_outer_mtu;
 
+// #6308: the WG transit-egress DISPATCH physical-egress SSOT, re-exported so
+// the forward-request builder (`forward_request.rs`) selects the same physical
+// underlay NIC (the peer route) for the egress binding that #5292 selects for
+// the frame bytes — otherwise a specific-peer-route + no-default-route WG flow
+// resolves the egress binding to the logical wgN ifindex (no XSK binding) and
+// the TX dispatcher NO_EGRESS_BINDING-drops it.
+pub(in crate::afxdp) use wg::wg_transit_egress_physical_egress_ifindex;
+
 // #1440 consolidated outer-header serializers. Re-exported at
 // `frame::write_eth_header`, `frame::write_eth_header_slice`, and
 // `frame::headers::*` to keep existing call sites in icmp.rs,

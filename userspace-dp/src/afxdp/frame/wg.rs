@@ -368,6 +368,114 @@ pub(in crate::afxdp) fn wg_endpoint_physical_outer_mtu(
     }
 }
 
+/// #6308: the PHYSICAL underlay egress ifindex a WG transit-egress frame must
+/// be DISPATCHED to — resolved against the SAME selected-peer route #5292 uses
+/// for the frame BYTES, so the dispatch SSOT and the frame-bytes SSOT agree on
+/// one physical NIC.
+///
+/// The TX dispatcher picks the egress binding from `decision.resolution`'s
+/// `tx_ifindex` (the physical bind ifindex) or, when that is 0, from
+/// `resolve_tx_binding_ifindex(egress_ifindex)`. For a WG transit-egress
+/// decision the resolution SSOT (`resolve_tunnel_forwarding_resolution`) is
+/// built against the endpoint's ZEROED destination (`0.0.0.0`/`::` — the peer
+/// carries the real outer hop, #2837), so it stores `egress_ifindex =` the
+/// tunnel LOGICAL wgN ifindex and:
+///   * WG transport table HAS a default route → `tx_ifindex =` the default
+///     egress bind ifindex (= the physical WAN parent). Dispatch already
+///     egresses the correct NIC; this helper is not consulted (the caller
+///     keeps the `tx_ifindex > 0` fast path — common case, UNCHANGED).
+///   * WG transport table has ONLY a specific peer route, NO default →
+///     `0.0.0.0`/`::` NoRoutes → `tx_ifindex = 0`; the fallback
+///     `resolve_tx_binding_ifindex(logical wgN)` returns the logical ifindex
+///     (which has no XSK binding) → the TX dispatcher NO_EGRESS_BINDING-DROPS a
+///     frame #5292 built correctly. This is the #6308 bug.
+///
+/// This helper resolves the physical underlay egress the SAME way #5292 does
+/// for the frame bytes: select the egress peer by the inner destination's
+/// AllowedIPs LPM (`wg_peer_outer_dst` → `engine.peer_for_dest`) and resolve
+/// that peer's endpoint through the endpoint transport table
+/// (`outer_physical_egress_resolution` → `outer_egress_ifindex_or_fallback`).
+/// The caller feeds the result to `resolve_tx_binding_ifindex`, so a specific
+/// peer route egresses its physical NIC (which has a binding) instead of the
+/// logical wgN fallback.
+///
+/// #6340: the peer selection is keyed on the POST-NAT inner dst
+/// (`decision.nat.rewrite_dst` when a same-family DNAT applies, else the frame
+/// dst) so DISPATCH resolves the SAME peer `wg_encap_frame` emits bytes for —
+/// the encap builder applies DNAT into the outgoing frame before its own peer
+/// LPM (`inner_dst_ip(&out)`), so a DNAT-across-AllowedIPs-peers flow on
+/// distinct underlays must not split the dispatch NIC from the byte NIC. NAT64
+/// is excluded (address-family change → returns `None`, the logical fallback).
+///
+/// Returns `None` — the caller keeps the pre-#6308 logical fallback — when the
+/// decision is not a WG transit-egress (no tunnel id / a GRE or unknown mode),
+/// or no covering peer with an endpoint exists. `Some(logical egress_ifindex)`
+/// on a genuine NoRoute to the selected peer (via
+/// `outer_egress_ifindex_or_fallback`'s conservative fallback): the packet is
+/// undeliverable regardless, so dispatch still fails closed exactly as before.
+///
+/// #3992: this resolves the outer route once for DISPATCH; `wg_encap_frame`
+/// resolves it once more for the BYTES. Both firings happen ONLY on the
+/// tx_ifindex == 0 (no-default-route) path — the previously-DROPPED case — so
+/// no working (default-route) traffic pays a second FIB LPM.
+pub(in crate::afxdp) fn wg_transit_egress_physical_egress_ifindex(
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    inner_frame: &[u8],
+    inner_addr_family: u8,
+    inner_l3_offset: u16,
+) -> Option<i32> {
+    let id = decision.resolution.tunnel_endpoint_id;
+    if id == 0 {
+        return None;
+    }
+    let endpoint = forwarding.tunnel_endpoints.get(&id)?;
+    if !matches!(tunnel_mode_kind(&endpoint.mode), TunnelKind::WireGuard) {
+        return None;
+    }
+    // #6340: DISPATCH must select the SAME peer `wg_encap_frame` emits bytes
+    // for. The encap builder applies DNAT into the outgoing frame BEFORE
+    // `wg_encap_frame` LPMs the AllowedIPs trie on the POST-NAT inner dst
+    // (`build_forwarded_frame_into_from_frame` writes `nat.rewrite_dst` into
+    // `out` via `apply_nat_ipv4/6`, then wg.rs reads `inner_dst_ip(&out)`).
+    // Under a DNAT that rewrites the inner dst ACROSS AllowedIPs peers on
+    // DISTINCT physical underlays, selecting the peer from the PRE-NAT frame dst
+    // here would dispatch to the wrong peer's NIC while the encap bytes carry
+    // the OTHER peer's L2 — a wire mismatch. Resolve the peer from the POST-NAT
+    // dst so dispatch and bytes agree on ONE physical NIC.
+    //
+    // NAT64 (`nat.nat64`) is deliberately excluded: it changes the address
+    // family, so `rewrite_dst` is a DIFFERENT-family address and the pre-NAT
+    // frame dst is the pre-translation family — NEITHER is a valid same-family
+    // AllowedIPs key for this WG endpoint's (same-family) peers, so reusing
+    // either would mis-select. Fail closed to the caller's logical-ifindex
+    // fallback (the pre-#6308 drop) rather than dispatch to a mis-selected NIC;
+    // a NAT64→WG transit flow is undeliverable on this path regardless (the
+    // pre-NAT frame parse already returned `None` here for that family
+    // mismatch).
+    if decision.nat.nat64 {
+        return None;
+    }
+    // Same inner-destination peer selection the encap builder / PTB path use,
+    // but keyed on the POST-DNAT dst (`nat.rewrite_dst`) when a same-family DNAT
+    // applies, else the frame's parsed inner dst (with the `meta.l3_offset`
+    // fallback) — which for a non-DNAT flow is byte-identical to the frame the
+    // encap path reads. Then LPM the AllowedIPs trie to the covering peer's
+    // endpoint.
+    let inner_dst = decision.nat.rewrite_dst.or_else(|| {
+        frame_l3_offset(inner_frame)
+            .or_else(|| match inner_l3_offset {
+                14 | 18 => Some(inner_l3_offset as usize),
+                _ => None,
+            })
+            .and_then(|l3| inner_frame.get(l3..))
+            .and_then(|pkt| crate::afxdp::gre::inner_dst_ip(pkt, inner_addr_family))
+    });
+    let outer_dst = wg_peer_outer_dst(forwarding, endpoint, inner_dst)?;
+    let outer = outer_physical_egress_resolution(forwarding, endpoint, outer_dst);
+    Some(outer_egress_ifindex_or_fallback(decision, forwarding, &outer))
+}
+
 pub(super) fn wg_encap_frame(
     inner_frame: &[u8],
     inner_meta: impl Into<ForwardPacketMeta>,
