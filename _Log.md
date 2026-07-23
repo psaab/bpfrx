@@ -1,3 +1,46 @@
+## 2026-07-22 — #6232: scope-complete Rust heatmap classifier + enforced drift gate
+
+- **Timestamp**: 2026-07-22 (fix/6232-heatmap-audit)
+- **Action**: The committed modularity heatmap
+  (`docs/refactoring-audit-current.txt`) was stale AND scope-inaccurate —
+  `make audit-check` exited non-zero on master, and the generator counted
+  whole-file Rust test modules (`tests_pool.rs`, `tests_support.rs`,
+  `tests_destination.rs`, `tests_bind_forward.rs`, ...) as production,
+  producing false `[REFACTOR]`/`[WATCH]` rows. Root cause: `SKIP_RE`
+  excluded `tests.rs` / `*_tests.rs` / three hand-listed `test_*.rs`
+  files, but not the generic `tests_*.rs` / `test_*.rs` sibling
+  `#[path] mod` test modules introduced by the #4840/#4409 test splits.
+  Fix: (1) moved the exclusion regex + LOC measurement into a shared
+  single-source-of-truth library `scripts/refactoring-audit-lib.sh`
+  (`$AUDIT_SKIP_RE`, `audit_loc`), adding anchored patterns for all four
+  Rust test filename shapes; the generator now sources it. (2) Added a
+  thin CLI `scripts/refactoring-audit-classify.sh` (`classify`/`loc`) so
+  a Go test can exercise the same classifier. (3) Regenerated the
+  heatmap — 8 test files dropped, 48 production-only rows remain
+  (verified all test-named `.rs` in the tree are `#[cfg(test)]`-gated).
+  (4) Added the `pkg/refactoraudit` enforcement canary
+  (`TestHeatmapNotStale` byte-diffs the regenerated heatmap;
+  `TestClassifierFilenameShapes` pins positive/negative/anchoring cases;
+  `TestProductionSentinelVisible` keeps the >=2000 LOC
+  `poll_descriptor/mod.rs` visible and asserts no test file leaks;
+  `TestInlineTestBlockNotStripped` pins the raw-LOC / no-inline-strip
+  invariant). Because it is an ordinary Go test it runs under
+  `go test ./...` inside the required `make test` aggregate, so the
+  artifact can no longer silently drift on master. Updated
+  `docs/refactoring-audit.md` and the `Makefile` audit-check comment.
+- **Validation**: `make audit-check` green; `go test ./pkg/refactoraudit`
+  4/4 PASS; gofmt clean; `go vet ./pkg/refactoraudit` clean; shellcheck
+  clean on the three scripts. FAIL-ON-REVERT demonstrated: perturbing a
+  LOC number (7168→9999) in the committed heatmap turns BOTH
+  `make audit-check` (exit 2) and `TestHeatmapNotStale` (FAIL) RED;
+  restoring returns GREEN. Class A tooling/docs — no dataplane or codegen
+  change, no cluster smoke needed.
+- **File(s)**: scripts/refactoring-audit-lib.sh (new),
+  scripts/refactoring-audit-classify.sh (new), scripts/refactoring-audit.sh,
+  docs/refactoring-audit-current.txt, docs/refactoring-audit.md, Makefile,
+  pkg/refactoraudit/doc.go (new),
+  pkg/refactoraudit/audit_canary_test.go (new)
+
 ## 2026-07-22 — #4976: build-time ABI check for the libxdp ring mirror
 
 - **Timestamp**: 2026-07-22 14:00 PDT (fix/4976-build-abi-check)
@@ -56542,6 +56585,73 @@ top.
   manifest via cmd/shim-manifest. Verified: fsatomic+dataplane green;
   editing xpf_common.h now trips the freshness test; src-edit coverage intact.
 
+## 2026-07-22 — #6234 server/helpers split (audit-183 cohort)
+- **Action**: Convert `server/helpers.rs` (1.4k-line cold-path grab-bag) into a
+  `server/helpers/` directory module; extract HA session-sync reconstruction
+  into `session_sync.rs`. Pure code-motion, bodies byte-for-byte identical;
+  `mod.rs` re-exports so all `server::helpers::<name>` call sites are unchanged.
+- **File(s)**: server/helpers.rs -> server/helpers/mod.rs (git mv);
+  server/helpers/session_sync.rs (new). Build: userspace-dp cargo build green.
+
+- **Action**: #6234 increment 2 — extract binding/queue planning into
+  `server/helpers/planning.rs` (settle predicates, canonical plan-key hashing,
+  RX-queue/binding replanner kept as one correctness unit per server/README).
+  Pure code-motion; explicit imports replace the crate-root glob. mod.rs
+  re-exports `planning::*`; dropped now-unused sha2/std::io imports from mod.rs.
+- **File(s)**: server/helpers/planning.rs (new), server/helpers/mod.rs.
+  Build: userspace-dp cargo build green, no new warnings in helpers/.
+
+- **Action**: #6234 increment 3 — extract state-file persistence into
+  `server/helpers/persistence.rs` (OwnedStatePayload, build_state_payload,
+  lock-free write_state, and the #5469 pre-persist lock probe). Pure
+  code-motion; explicit imports; mod.rs re-exports `persistence::*`.
+- **File(s)**: server/helpers/persistence.rs (new), server/helpers/mod.rs.
+  Build: userspace-dp cargo build green, no new warnings in helpers/.
+
+- **Action**: #6234 increment 4 (final) — extract status projection into
+  `server/helpers/status.rs` (refresh_status + should_run_afxdp,
+  reconcile_status_bindings, set_bindings_forwarding_armed,
+  forwarding_unsupported_error); reduce `helpers/mod.rs` to a 30-line
+  re-export facade. Replacing the crate-root glob exposed 3 now-dead
+  feeder imports in main.rs (SyncedSessionEntry, Serialize, Instant) —
+  removed — and one BTreeMap import consumed only by main_tests.rs via
+  `use super::*` — relocated into main_tests.rs. Updated server/README.md
+  to describe the helpers/ submodule layout.
+- **File(s)**: server/helpers/status.rs (new), server/helpers/mod.rs,
+  main.rs, main_tests.rs, server/README.md.
+- **Validation**: PURE CODE-MOTION (Class A). Full bin cargo test suite
+  green run serially: 4121 passed, 0 failed. Targeted: server:: 89 passed
+  (incl. write_state_releases_lock_before_persist #5469); the tests::
+  superset 3487 passed (incl. binding_plan/planning + session-sync);
+  3 integration binaries 31 passed. Build green, warnings 176->175 (net
+  cleanup, 0 new in helpers/). The full PARALLEL run starves a
+  pre-existing WG concurrency test (afxdp::wg::engine::engine_internal_tests,
+  skb_wait_for_more_packet); it passes in isolation (24/0) and my diff
+  adds no test/socket/WG code — unrelated known flake (#6157/#6294/#6279).
+## 2026-07-22 — #5650 forwarding/mod.rs hot-path-preserving split (PR)
+- **Timestamp**: 2026-07-22
+- **Action**: Pure code-motion split of userspace-dp forwarding/mod.rs
+  (2868 LOC / 81 free fns) into 9 cohesive submodules under forwarding/.
+  Functions moved VERBATIM; no logic/signature/hot-path change; #[inline]
+  preserved exactly (2 total: is_ipsec_traffic→ipsec.rs, zone_pair_ids_*
+  stays in mod.rs). pub(super) → pub(in crate::afxdp) with mod.rs glob
+  re-exports so all external call sites resolve unchanged. Two private
+  helpers (select_route_next_hop, ecmp_hash_flow_seeded) promoted to
+  pub(in crate::afxdp) because forwarding/tests.rs (a sibling of fib)
+  calls them. PbrRejectSink struct fields also promoted so the external
+  poll_descriptor constructor still compiles. mod.rs 2868 → 143 LOC.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/{mod.rs, fib.rs,
+  fabric.rs, nat.rs, ha.rs, mss.rs, ipsec.rs, pbr.rs, local_delivery.rs,
+  tunnel.rs}; forwarding/README.md; docs/fabric-cross-chassis-fwd.md;
+  docs/userspace-native-gre-plan.md; docs/host-inbound-service-matrix.md;
+  docs/flow-cache-simplification.md; CLAUDE.md (fabric path pointer).
+- **Layout**: fib.rs 1021 (FIB resolve/ECMP/next-hop), fabric.rs 492,
+  ha.rs 235, mss.rs 203, nat.rs 201, local_delivery.rs 192, tunnel.rs
+  174, pbr.rs 163, ipsec.rs 112.
+- **Validation**: cargo build clean (0 errors; 175 pre-existing warnings,
+  unchanged from baseline). Diff touches ONLY forwarding/*.rs. fn count
+  81→81; #[inline] 2→2. Full cargo test --release suite green (parent
+  runs the loss-cluster iperf smoke before merge).
 ## 2026-07-22 — #6314: join the neighbor warmer aux thread at teardown
 - **Action**: Make the #1636 neighbor WARMER consistent with its two
   #5165-hardened siblings (monitor + resolver). Retain the warmer's
@@ -56663,3 +56773,198 @@ top.
   userspace-dp/src/afxdp/frame/wg_tests.rs,
   userspace-dp/src/afxdp/test_fixtures.rs,
   userspace-dp/src/afxdp/frame/README.md, docs/wireguard-interop.md
+- **Action**: #5661 (Go control-plane modularity cohort) — pure
+  code-motion split of pkg/cluster/sync_conn.go (2228 lines, ~1595 prod
+  LOC, over the ~2000 threshold). Extracted five cohesive sibling files
+  in the same package pkg/cluster, verbatim (no rename, no logic/timing
+  change, no goroutine/defer/lock reordering — critical for HA session
+  sync): sync_conn_gen.go (session generation guards + synced-session
+  apply), sync_conn_sweep.go (incremental sync sweep), sync_conn_write.go
+  (send/queue/delete-journal), sync_conn_config.go (config replication),
+  sync_conn_read.go (receive/dispatch). sync_conn.go now 617 lines
+  (connection lifecycle: dial/accept/install/start/stop/disconnect).
+  Verified all 63 declaration bodies byte-identical vs origin/master.
+  go build ./... + go test ./pkg/cluster/... green, go vet clean, gofmt
+  clean. HA session-sync code — parent runs loss-cluster test-failover
+  before merge.
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_conn_gen.go,
+  pkg/cluster/sync_conn_sweep.go, pkg/cluster/sync_conn_write.go,
+  pkg/cluster/sync_conn_config.go, pkg/cluster/sync_conn_read.go,
+  pkg/cluster/README.md
+## 2026-07-22 — #6247 afxdp/ha.rs ownership split (pure code-motion)
+- **Timestamp**: 2026-07-22
+- **Action**: Split the 1035-line `userspace-dp/src/afxdp/ha.rs` HA control
+  module into a `ha/` directory with four cohesive owner submodules
+  (byte-exact code motion, no logic/signature/ordering change). Preserves
+  the ordered-import invariant, export/tunnel-purge lock phasing, and the
+  RG-epoch-before-runtime publication ordering. 5 incremental commits, each
+  builds; branch `refactor/6247-afxdp-ha-split`.
+    - `ha/state.rs`   — update_ha_state, handle_activated_rgs, ha_groups,
+      last_cache_flush_at
+    - `ha/export.rs`  — kick_owner_rg_export, snapshot_all_sessions_export,
+      AllSessionsExport / OwnerRgExportWait handle types,
+      drain_session_deltas_from_live (widened private->pub(crate) so the
+      relocated characterization test can name it via the ha re-export)
+    - `ha/session_import.rs` — synced_import_cap, upsert_synced_session,
+      delete_synced_session[_gen], test_install_local_forward_session
+    - `ha/tunnel_purge.rs`   — purge_remapped_tunnel_sessions,
+      push_purge_close_deltas
+    - `ha/mod.rs` — narrow facade: submodule decls, pub(crate) re-exports of
+      the export handle types (afxdp/mod.rs `self::ha::OwnerRgExportWait` /
+      `AllSessionsExport` resolve unchanged), cfg(test) drain re-export, and
+      the `#[path="../ha_tests.rs"]` test include. Retains a documented
+      `#[allow(unused_imports)] use super::*` so the ha_tests child module's
+      `use super::*` resolves the afxdp namespace exactly as before.
+  Verbatim verified: non-blank code-line multiset identical to the original
+  (0 missing; only 4 extra structural `}` for the 4 new impl blocks).
+  #[inline]/#[cold]: 0 in original, 0 lost. mod.rs prod-LOC 1035 -> 21.
+- **File(s)**: userspace-dp/src/afxdp/ha/{mod,state,export,session_import,
+  tunnel_purge}.rs (new), userspace-dp/src/afxdp/ha.rs (removed),
+  userspace-dp/src/afxdp/mod.rs (drop stale #[path]),
+  docs/fabric-cross-chassis-fwd.md, docs/session-sync-architecture.md
+  (live-doc path references afxdp/ha.rs -> new submodule paths).
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 pure code-motion split of event_stream/mod.rs — extract
+  wall-clock conversion into event_stream/clock.rs (NS_PER_SEC +
+  read_mono_and_wall_clocks + monotonic_ns_to_unix_ns/_secs/_secs_subnanos +
+  mono_ns_to_wall_clock_unix_ns, verbatim). mod.rs re-exports the pub(crate)
+  clock fns so callers (afxdp/event_emit.rs, tests) resolve unchanged. Build
+  green.
+- **File(s)**: userspace-dp/src/event_stream/clock.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract WriteBacklog + WRITE_BACKLOG_MAX_BYTES into
+  event_stream/backlog.rs (verbatim, cursor-backed geometric-compaction backlog,
+  #[inline] preserved on pending_len/is_empty/pending/compact_if_needed). Struct,
+  methods, and compacted_bytes test field widened private->pub(super) so callers
+  (mod.rs connected loop/drain, write_backlog tests) resolve unchanged. mod.rs
+  re-imports both names. Build green.
+- **File(s)**: userspace-dp/src/event_stream/backlog.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract release_dataplane_event_queue_budget into
+  event_stream/budget.rs (verbatim; the I/O-thread queue-budget RETIREMENT side,
+  paired with producer.rs admission). Widened private->pub(super); mod.rs
+  re-imports it. Build green.
+- **File(s)**: userspace-dp/src/event_stream/budget.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract replay-buffer admission/eviction/retirement
+  (push_replay_frame, evict_replay_frame, pop_replay_frame,
+  release_replay_dataplane_event_queue_budget) into event_stream/replay.rs
+  (verbatim). Widened the three cross-module fns to pub(super); evict stays
+  private (only push calls it). Build green.
+- **File(s)**: userspace-dp/src/event_stream/replay.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract channel-drain mechanics (DrainOutcome,
+  drain_channel_into_write_buf, flush_pending_resync, drain_remaining) into
+  event_stream/drain.rs (verbatim, WRITE_BACKLOG_MAX_BYTES cap enforced there).
+  Widened to pub(super) incl DrainOutcome fields (tests assert them).
+  Consolidated mod.rs internal re-exports under #[allow(unused_imports)] (many
+  now serve only siblings/tests via `use super::*`). Build green.
+- **File(s)**: userspace-dp/src/event_stream/drain.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract control-frame decode + drain/resync state
+  machine (process_control_frames, handle_drain_request) into
+  event_stream/control.rs (verbatim; ACK-window #2959, Pause/Resume, DrainRequest
+  #2876/#2882/#2875). Widened to pub(super); MSG_*/FRAME_HEADER_SIZE codec
+  re-imports annotated (now serve siblings/tests). Build green.
+- **File(s)**: userspace-dp/src/event_stream/control.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract the I/O thread (io_thread_main, try_connect,
+  replay_buffered, write_all_backpressured, run_connected_loop) into
+  event_stream/connection.rs (verbatim; reconnect + replay + backpressured
+  connected loop). Widened cross-module fns to pub(super); try_connect stays
+  private. Removed orphaned I/O-thread section comment; annotated the now
+  submodule-only std imports (VecDeque/io/UnixStream/TryRecvError). Build green.
+- **File(s)**: userspace-dp/src/event_stream/connection.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract RT_FLOW SESSION_CLOSE/CREATE projection
+  methods (emit_session_close_rt_flow, emit_session_create_rt_flow) into
+  event_stream/rt_flow.rs as a second impl EventStreamWorkerHandle block
+  (verbatim, pub(crate) methods unchanged). Made NS_PER_SEC pub(super) +
+  re-imported (rt_flow tests consume it via super::*). Removed orphan section
+  comment. Updated event_stream/README.md Files section for the new submodule
+  layout. Full cargo test --release: 4214 passed, 0 failed, 2 ignored. mod.rs
+  down to 733 lines (from 2001); all 4 #[inline] preserved, 0 #[cold].
+- **File(s)**: userspace-dp/src/event_stream/rt_flow.rs (new),
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/clock.rs,
+  userspace-dp/src/event_stream/README.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5661 split — pure code-motion of pkg/vrrp/instance.go (2925
+  prod LOC, over the 2000 threshold) into six cohesive sibling files in
+  package vrrp. Extracted, in six build-green increments (one commit each):
+  instance_addr.go (local IPv4/IPv6 + VIP-set resolution), instance_socket.go
+  (raw-socket lifecycle), instance_receive.go (RX receivers + AF_PACKET/IPv6
+  parse/enqueue), instance_send.go (advert/event send), instance_garp.go
+  (gratuitous-ARP/NA burst + gateway probe), instance_vip.go (netlink VIP
+  actuation + stale-VIP reconcile). Declarations moved VERBATIM — no exported
+  symbol renamed, no logic/timing/const change, no goroutine/defer/channel/
+  mutex reorder (whole functions moved intact). Verified pure motion: 94 decls
+  on origin/master == 94 decls across the 7 files, identical decl set, zero
+  bodies differ. Imports pruned by goimports; gofmt -l clean; go build ./...
+  green; go test ./pkg/vrrp/... green; instance.go now 1392 LOC. Updated
+  pkg/vrrp/README.md File-layout section + four inline symbol->file pointers
+  (receiverIPv6, sendPacketIPv6, parseAfPacket, netlink.AddrAdd). NOTE: the
+  full-suite canary TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports
+  fails PRE-EXISTING on the base commit (edf62745e, the #6338 sync_conn split)
+  — drift is entirely in pkg/cluster/sync_conn*.go allowlist entries, no vrrp
+  file imports pkg/dataplane; orthogonal to this change.
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/instance_addr.go (new),
+  pkg/vrrp/instance_socket.go (new), pkg/vrrp/instance_receive.go (new),
+  pkg/vrrp/instance_send.go (new), pkg/vrrp/instance_garp.go (new),
+  pkg/vrrp/instance_vip.go (new), pkg/vrrp/README.md
+## #5661 — daemon_apply.go pure code-motion split
+- **Timestamp**: 2026-07-22
+- **Action**: Split ~3095-line pkg/daemon/daemon_apply.go into 7 cohesive
+  sibling files (pure code motion; behavior/ordering/locking unchanged).
+  daemon_apply.go dropped to 412 lines. All moved declaration bodies are
+  byte-identical to origin/master (line-multiset diff = 0 except one
+  gofmt-mandated comment-indent normalization that master itself was not
+  clean on). Full build ./... green; go test ./pkg/daemon/... green;
+  gofmt -l empty.
+- **File(s)**: pkg/daemon/daemon_apply.go (edit),
+  pkg/daemon/daemon_apply_reset.go (new),
+  pkg/daemon/daemon_apply_commit.go (new),
+  pkg/daemon/daemon_apply_hostauth.go (new),
+  pkg/daemon/daemon_apply_dataplane.go (new),
+  pkg/daemon/daemon_apply_routing.go (new),
+  pkg/daemon/daemon_apply_interfaces.go (new),
+  pkg/daemon/daemon_apply_tail.go (new),
+  pkg/daemon/README.md (edit — config-apply file-layout note)
+- **Timestamp**: 2026-07-22
+- **Action**: #5661 split — pure code-motion split of pkg/daemon/daemon_run.go
+  (~2820 prod LOC → 836) into five cohesive sibling files in package daemon:
+  daemon_run_routehelpers.go (riMemberLinuxName, collectAppliedTunnels,
+  linkLocalV6Net, inferIPv6StaticNextHopInterfaces), daemon_run_shutdown.go
+  (applyCloseoutDrainTimeout, runShutdownSequence, runHAShutdownUpdate),
+  daemon_run_servers.go (six *CommitFn/*CommitConfirmedFn seams +
+  #5054/#5961 section comment, startGRPCServer, startHTTPServer,
+  resolveAPIBinds), daemon_run_bringup.go (initManagers,
+  loadAndBootstrapConfig, setupDataplaneAndInitialConfig, enableForwarding),
+  daemon_run_naming.go (setupInterfaceNaming, namingParamsFromConfig,
+  applyStartupNamingForConfig, maybeReapplyConfigArrivalNaming,
+  runBootstrapExitStartup). Declarations moved verbatim — no rename, reorder,
+  or logic change; startup-phase / shutdown ordering untouched.
+  buildRuntimeDataPlane deliberately KEPT in daemon_run.go (retirement-boundary
+  canary TestDaemonRuntimeEntryPointUsesRuntimeDataPlane requires the
+  dataplane.NewRuntimeDataPlane call there). Per-decl byte-identity check:
+  all 32 top-level decls unchanged. go build ./..., go test ./pkg/daemon/...,
+  and the pkg/dataplane canary all green; gofmt clean.
+- **File(s)**: pkg/daemon/daemon_run.go, pkg/daemon/daemon_run_routehelpers.go
+  (new), pkg/daemon/daemon_run_shutdown.go (new),
+  pkg/daemon/daemon_run_servers.go (new), pkg/daemon/daemon_run_bringup.go
+  (new), pkg/daemon/daemon_run_naming.go (new), pkg/daemon/README.md

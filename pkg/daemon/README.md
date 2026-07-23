@@ -41,6 +41,66 @@ the primary compile/apply gate.
 - `CompileHealth` — `daemon.go`. Snapshot of the most recent compile
   outcome; `pkg/api` consumes it for the `/health` endpoint.
 
+### Config-apply file layout (#5661)
+
+The config-apply path was carved out of the former ~3095-line
+`daemon_apply.go` monolith into responsibility-scoped siblings (pure code
+motion, no behavior/ordering/locking change — apply step and side-effect
+sequence are load-bearing and unchanged). `daemon_apply.go` now retains
+only the apply entrypoints and core orchestrator:
+
+- `daemon_apply.go` — apply entrypoints (`applyConfig`,
+  `applyConfigResult`, `applyCancelCtx`), the core `applyConfigLocked`
+  orchestrator, the procfs knob helpers (`setRethIPv6Knobs`,
+  `setVLANSubAddrGenMode`), and `compileErrorMustAbortApply`.
+- `daemon_apply_commit.go` — commit/sync/rollback drivers
+  (`commitAndApply`, `syncAndApply`, `commitConfirmedAndApply`,
+  `executeConfirmedRollback`, peer config push) plus first-boot
+  `bootstrapFromFile`.
+- `daemon_apply_reset.go` — factory-reset (zeroize) generation guard and
+  `factoryReset` (#5281).
+- `daemon_apply_hostauth.go` — host-authorization closeout owners and
+  their bounded runner (#5874).
+- `daemon_apply_dataplane.go` — dataplane/HA core apply
+  (`applyDataplaneAndHACore`) and deferred-worker-arm bookkeeping.
+- `daemon_apply_routing.go` — services (ip-monitoring), routing-rule, and
+  route-leak snapshot reconcile.
+- `daemon_apply_interfaces.go` — fabric IPVLAN, VRF, management-VRF
+  rebind, and interface reconcile.
+- `daemon_apply_tail.go` — the `applyTailReconciles` orchestrator and its
+  LLDP / DHCP-relay / event-engine / initial policy-scheduler reconcile
+  helpers.
+### `daemon_run.go` file layout (#5661)
+
+`Run` and its startup/shutdown machinery were split out of a single
+~2820-LOC `daemon_run.go` into cohesive sibling files in `package daemon`
+— pure code motion, no rename/reorder/logic change, so the load-bearing
+startup-phase and shutdown ordering is untouched:
+
+- `daemon_run.go` — the core lifecycle: `buildRuntimeDataPlane`, `Run`,
+  and the startup-phase orchestration (`startupSignalContext`,
+  `startupPhase`, `runStartupPhases`, `runStartupOrAbort`,
+  `startReconcileRGStateLoop`). `buildRuntimeDataPlane` **must stay here**:
+  the retirement-boundary canary
+  (`TestDaemonRuntimeEntryPointUsesRuntimeDataPlane`,
+  `pkg/dataplane/retirement_boundary_canary_test.go`) parses this file and
+  requires a `dataplane.NewRuntimeDataPlane` call in it.
+- `daemon_run_bringup.go` — startup bring-up phases: `initManagers`,
+  `loadAndBootstrapConfig`, `setupDataplaneAndInitialConfig`,
+  `enableForwarding`.
+- `daemon_run_naming.go` — startup interface naming/enumeration:
+  `setupInterfaceNaming`, `namingParamsFromConfig`,
+  `applyStartupNamingForConfig`, `maybeReapplyConfigArrivalNaming`,
+  `runBootstrapExitStartup`.
+- `daemon_run_servers.go` — API-surface bring-up and the #5054/#5961
+  per-transport commit-wiring seams: the six `*CommitFn`/`*CommitConfirmedFn`
+  methods, `startGRPCServer`, `startHTTPServer`, `resolveAPIBinds`.
+- `daemon_run_shutdown.go` — ordered teardown: `applyCloseoutDrainTimeout`,
+  `runShutdownSequence`, `runHAShutdownUpdate`.
+- `daemon_run_routehelpers.go` — route/tunnel inference helpers:
+  `riMemberLinuxName`, `collectAppliedTunnels`, `linkLocalV6Net`,
+  `inferIPv6StaticNextHopInterfaces`.
+
 ### Struct decomposition (#4407, in progress)
 
 The `Daemon` struct historically fused 150+ flat fields spanning ~15

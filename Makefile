@@ -115,13 +115,20 @@ test-rust:
 	$(CARGO) test --manifest-path userspace-dp/Cargo.toml --release \
 		--bins --tests -- --test-threads=1
 
-# Drift guard for the committed refactoring heatmap (#1661 item 8).
-# Regenerates scripts/refactoring-audit.sh output to a temp file and
-# diffs it against the committed docs/refactoring-audit-current.txt.
-# Fails if they differ OR if the generator itself fails. Standalone by
-# design — deliberately NOT a dependency of `test`/`all`, so a PR that
-# legitimately grows a large file is not blocked until someone
-# regenerates the artifact (run this target, then commit the result).
+# Standalone convenience view of the refactoring-heatmap drift (#1661
+# item 8). Regenerates scripts/refactoring-audit.sh output to a temp
+# file and diffs it against the committed
+# docs/refactoring-audit-current.txt, printing the exact drift and the
+# one-line regenerate command. Fails if they differ OR if the generator
+# itself fails.
+#
+# The AUTHORITATIVE enforcement is the pkg/refactoraudit canary
+# (TestHeatmapNotStale), which runs under `go test ./...` inside the
+# required `make test` aggregate (#6232). Before #6232 nothing in a
+# required target ran this check, so the artifact drifted to 62 rows vs
+# 16 committed on master. Run THIS target while iterating to see and fix
+# the drift before `make test` fails, then commit the regenerated
+# artifact.
 #
 # Recipe notes: Make runs the recipe in one shell without `set -e`, so
 # the generator is `&&`-chained to `diff` to make a generator failure
