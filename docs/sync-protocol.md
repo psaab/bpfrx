@@ -518,11 +518,16 @@ finished applying (a transient networkd/nft/IPsec tail error) as converged: the
 primary's same-generation re-push would take the fast path, return `nil`, and
 advance the high-water past a config whose dataplane never converged — a standby
 that acks a generation it never applied and can expose stale/disarmed forwarding
-at failover. `ActiveApplied()` is a config-text digest the daemon stamps
-(`MarkActiveApplied`) ONLY after a fully-successful apply — the boot apply
-(`applyConfig`), a committed config (`applyAndSyncCommitted`), and a peer
-config-sync (`handleConfigSync` after `syncAndApply` returns nil). It is FALSE in
-the window between promotion and a successful apply, so a re-push of a
+at failover. `ActiveApplied()` is a config-text digest the daemon stamps ONLY
+after a fully-successful apply — the boot apply (`applyConfig`) and a committed
+config (`applyAndSyncCommitted`) stamp `MarkActiveApplied` while holding the
+apply semaphore, and a peer config-sync stamps it from INSIDE `syncAndApply`
+(#6296): it captures the digest of the tree `SyncApply` promoted via
+`ActiveDigest` and replays it via `MarkAppliedDigest` on full success, both under
+the apply semaphore, rather than re-reading `s.active` after the semaphore is
+released (where a concurrent secondary-side promoter could have mutated it into a
+different, never-applied tree). It is FALSE in the window between promotion and a
+successful apply, so a re-push of a
 promoted-but-unapplied config falls through to `syncAndApply` and RE-ATTEMPTS the
 apply (reconcile retry) instead of being swallowed as converged. Because the
 marker is keyed on the config text, a stale value can only make the shortcut MORE
@@ -604,8 +609,9 @@ daemon-stop context abort (#2926) — where the config is not live-forwarding an
 the invalidators are correctly skipped; on those `syncAndApply` returns a nil
 config plus the error. Any other tail error is surfaced (joined with any partial
 #5578 invalidation error) AFTER the invalidators run, so the high-water mark does
-not advance. On such a non-fatal tail error the daemon does NOT stamp
-`MarkActiveApplied` (that runs only when `syncAndApply` returns nil), so
+not advance. On such a non-fatal tail error `syncAndApply` does NOT stamp the
+applied marker (`MarkAppliedDigest` runs only when its deferred sees `retErr ==
+nil` — no fatal or non-fatal apply error and no partial invalidation; #6296), so
 `ActiveApplied()` stays false and the primary's re-push does NOT take the
 active-text fast path (#4957): it re-enters `syncAndApply` and RE-ATTEMPTS the
 apply and the invalidators, completing the reconcile/finalization the tail error

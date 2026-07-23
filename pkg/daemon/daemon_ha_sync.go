@@ -579,14 +579,14 @@ func (d *Daemon) handleConfigSync(configText string) error {
 		slog.Error("cluster: config sync apply failed", "err", err)
 		return err
 	}
-	// #4957: the sync applied to completion (syncAndApply returned nil, so both
-	// the dataplane apply and the session invalidation succeeded). Record the
-	// active config as applied so a duplicate re-push takes the converged
-	// shortcut above — and, conversely, so a config that only PROMOTED active but
-	// failed to apply does NOT, keeping the high-water pinned until a retry lands.
-	if d.store != nil {
-		d.store.MarkActiveApplied()
-	}
+	// #4957/#6296: on full success syncAndApply itself stamps the applied marker
+	// — from a digest captured for the config it applied, while still holding
+	// applySem — so a duplicate re-push takes the converged shortcut above, and a
+	// config that only PROMOTED active but failed to apply does NOT (keeping the
+	// high-water pinned until a retry lands). The stamp moved INTO syncAndApply
+	// (from a post-applySem-release MarkActiveApplied here) so a concurrent
+	// secondary-side promoter mutating s.active in the release window can no
+	// longer make the marker key the wrong, unapplied active digest (#6296).
 	slog.Info("cluster: config sync applied successfully")
 	return nil
 }
