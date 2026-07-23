@@ -44,6 +44,14 @@ type fakeLinkOps struct {
 	// #5310 fail-closed create-failure tests.
 	addFail map[string]error
 
+	// substituteAfterAdd[name], when set, replaces the link stored under name
+	// in the add→readback window: LinkAdd still records the intended link
+	// (addCount++), then this foreign link overwrites it so the post-create
+	// LinkByName readback returns the substitute — models the #6396 create-path
+	// TOCTOU where a concurrent external actor swaps a same-name link between
+	// LinkAdd and the readback.
+	substituteAfterAdd map[string]netlink.Link
+
 	// upFail[name] makes LinkSetUp fail for that link name (#5310 bring-up
 	// fail-closed tests).
 	upFail map[string]error
@@ -86,18 +94,19 @@ type fakeLinkOps struct {
 
 func newFakeLinkOps() *fakeLinkOps {
 	return &fakeLinkOps{
-		links:         map[string]netlink.Link{},
-		byNameCount:   map[string]int{},
-		hiddenUntil:   map[string]int{},
-		delFail:       map[string]error{},
-		addFail:       map[string]error{},
-		upFail:        map[string]error{},
-		addrDelFail:   map[string]error{},
-		addrListFail:  map[string]error{},
-		byNameHardErr: map[string]error{},
-		addrs:         map[string][]netlink.Addr{},
-		mtuSet:        map[string][]int{},
-		addrDels:      map[string][]string{},
+		links:              map[string]netlink.Link{},
+		byNameCount:        map[string]int{},
+		hiddenUntil:        map[string]int{},
+		delFail:            map[string]error{},
+		addFail:            map[string]error{},
+		substituteAfterAdd: map[string]netlink.Link{},
+		upFail:             map[string]error{},
+		addrDelFail:        map[string]error{},
+		addrListFail:       map[string]error{},
+		byNameHardErr:      map[string]error{},
+		addrs:              map[string][]netlink.Addr{},
+		mtuSet:             map[string][]int{},
+		addrDels:           map[string][]string{},
 	}
 }
 
@@ -130,6 +139,11 @@ func (f *fakeLinkOps) LinkAdd(l netlink.Link) error {
 	}
 	f.links[l.Attrs().Name] = l
 	f.addCount++
+	if sub, ok := f.substituteAfterAdd[l.Attrs().Name]; ok {
+		// The intended link was created (addCount bumped above), but a foreign
+		// link now wears the name by the time the readback runs (#6396 TOCTOU).
+		f.links[l.Attrs().Name] = sub
+	}
 	return nil
 }
 

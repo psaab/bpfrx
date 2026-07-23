@@ -474,17 +474,44 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 // high-seq archive from the PRIOR process outrank — and evict — the fresh
 // low-seq archives of the NEW process. Seeding to max(existing seq) keeps the
 // newest commit's seq strictly highest so retention order is correct across
-// restarts. The scan runs only while archiveSeq is still 0 (process start,
-// before any archive is written); once the process has written one archive the
-// counter is already ahead of disk and the scan is skipped.
+// restarts. The scan runs whenever the target dir differs from the one last
+// successfully seeded (archiveSeedDir) — process start (archiveSeedDir=="") and
+// a runtime dir switch both qualify (#6396: a switch to a previously-used dir
+// must re-seed from that dir's existing max, else this process's lower counter
+// would let the pre-existing archives outrank the new ones). A scan that fails
+// to READ the dir leaves archiveSeedDir unchanged so the next call retries,
+// rather than pinning the counter below the on-disk max (#6396 Codex MINOR 4).
 func (s *Store) SetArchiveConfig(dir string, max int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.archiveDir = dir
 	s.archiveMax = max
-	if dir != "" && s.archiveSeq.Load() == 0 {
-		if seed := maxArchiveSeq(dir); seed > 0 {
-			s.archiveSeq.Store(seed)
+	// Seed the monotonic archive seq from the highest seq already on disk in
+	// the target dir. Scan whenever the dir differs from the one last
+	// SUCCESSFULLY seeded (archiveSeedDir) — that covers both process start
+	// (archiveSeedDir=="") and a runtime archive-dir switch: switching to a
+	// previously-used directory whose existing archives carry HIGHER seqs than
+	// this process's counter would otherwise let those pre-existing archives
+	// outrank — and evict — the archives this process is about to write, the
+	// same across-restart hazard #5523 C179-060 closed but reached via a live
+	// dir switch (#6396). The seed is monotonic-up only (max of the current
+	// counter and the on-disk max), so switching to an empty or lower-seq dir
+	// never rewinds the counter.
+	if dir != "" && s.archiveSeedDir != dir {
+		seed, err := maxArchiveSeq(dir)
+		if err != nil {
+			// #6396 Codex MINOR 4: a transient scan failure (mount/permission)
+			// must NOT reseed the counter to 0 and must NOT record the dir as
+			// seeded — leaving archiveSeedDir unchanged so the next call retries.
+			// Regressing the counter here would prune every fresh archive as stale
+			// until a restart re-scanned.
+			slog.Warn("archive seq reseed scan failed; leaving counter unchanged, will retry",
+				"dir", dir, "err", err)
+		} else {
+			if seed > s.archiveSeq.Load() {
+				s.archiveSeq.Store(seed)
+			}
+			s.archiveSeedDir = dir
 		}
 	}
 }
@@ -503,6 +530,19 @@ func parseArchiveSeq(name string) (uint64, bool) {
 	if dot < 0 {
 		return 0, false
 	}
+	// #6396: a current-format archive is config-<ts>.<seq>.conf where <ts>
+	// itself embeds a dot (seconds.nanoseconds), so core has TWO dots and the
+	// portion before the seq dot still contains one. A legacy pre-#3441
+	// config-<ts>.conf name has only the ts's single dot, whose trailing
+	// nanoseconds ("20240101-120000.123456789") would otherwise be mis-read as
+	// a huge sequence — corrupting the seq-ordered retention of a MIXED
+	// legacy+current archive dir. Require the ts dot to be present so a legacy
+	// name is treated as unparseable (oldest, pruned first, lexical-by-ts among
+	// its peers), matching a config-<ts>.conf with no subsecond ts (which has
+	// no dot in core and already returns false).
+	if strings.IndexByte(core[:dot], '.') < 0 {
+		return 0, false
+	}
 	seq, err := strconv.ParseUint(core[dot+1:], 10, 64)
 	if err != nil {
 		return 0, false
@@ -510,13 +550,23 @@ func parseArchiveSeq(name string) (uint64, bool) {
 	return seq, true
 }
 
+// archiveDirReader reads an archive directory. It is a package-level seam
+// (defaulting to os.ReadDir) so a test can drive the reseed scan-failure path
+// deterministically (#6396 Codex MINOR 4) — a live os.ReadDir cannot be
+// reliably forced to fail from a unit test, least of all when tests run as root.
+var archiveDirReader = os.ReadDir
+
 // maxArchiveSeq returns the highest config-<ts>.<seq>.conf sequence number
-// present in dir, or 0 when the directory is unreadable or holds no well-formed
-// archive. Used by SetArchiveConfig to seed archiveSeq across restarts.
-func maxArchiveSeq(dir string) uint64 {
-	entries, err := os.ReadDir(dir)
+// present in dir. It returns a non-nil error when the directory is UNREADABLE,
+// distinct from a readable directory that holds no well-formed archive (which
+// returns 0, nil). The caller MUST NOT treat a scan error as an empty
+// directory: seeding the monotonic counter to 0 on a transient failure would
+// pin it below the on-disk max and prune every fresh archive as stale
+// (#6396 Codex MINOR 4). Used by SetArchiveConfig to seed archiveSeq.
+func maxArchiveSeq(dir string) (uint64, error) {
+	entries, err := archiveDirReader(dir)
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	var maxSeq uint64
 	for _, e := range entries {
@@ -527,7 +577,7 @@ func maxArchiveSeq(dir string) uint64 {
 			maxSeq = seq
 		}
 	}
-	return maxSeq
+	return maxSeq, nil
 }
 
 // QuiesceArchival fences and drains the async auto-archive writers so a

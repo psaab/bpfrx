@@ -16,8 +16,36 @@ import (
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/rpm"
+	"github.com/psaab/xpf/pkg/sysservices"
 	"github.com/psaab/xpf/pkg/webmgmt"
 )
+
+// effectiveListeners builds the daemon-owned snapshot of the EFFECTIVE
+// management-listener STATE `show system services` reports (#6385/#6401). BOTH
+// renderers — the remote gRPC path (Config.ListenersFn) and the local console
+// CLI (SetListenersFn) — read this ONE method, so the two surfaces can never
+// disagree (the divergence that dropped the #6384 A10-b2-F5 attempt).
+//
+//   - gRPC: the primary gRPC listener's state (EffectiveListener) — Listening
+//     with the actual bound address, Failed on a bind failure / serve exit, or
+//     Listening on the requested --grpc-addr in the brief pre-bind window.
+//     Before the server is even constructed, report the requested address as
+//     Listening (pre-bind).
+//   - HTTP REST: the reconciler's state (effectiveHTTPListener) — Listening with
+//     the actual bound address, Failed on a boot bind failure, or Disabled when
+//     the reconciler is absent (empty --api-addr, listener never started).
+func (d *Daemon) effectiveListeners() sysservices.Listeners {
+	var ls sysservices.Listeners
+	if d.grpcSrv != nil {
+		ls.GRPC = d.grpcSrv.EffectiveListener()
+	} else {
+		// Server not yet constructed — the pre-bind startup window. gRPC always
+		// binds on loopback, so report the requested address as Listening.
+		ls.GRPC = sysservices.Listener{Addr: d.opts.GRPCAddr, State: sysservices.StateListening}
+	}
+	ls.HTTP = d.mgmt.effectiveHTTPListener()
+	return ls
+}
 
 // #5054/#5961: transport commit-wiring seams.
 //
@@ -195,6 +223,11 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			return ""
 		}(),
 		FwdSampler: fwdSampler,
+		// #6385: the remote gRPC `show system services` renderer reports the
+		// EFFECTIVE post-bind listener addresses from this daemon-owned snapshot,
+		// the SAME source the local console CLI reads (shell.SetListenersFn), so
+		// the two surfaces can never diverge.
+		ListenersFn: d.effectiveListeners,
 	})
 	d.grpcSrv = grpcSrv
 	wg.Add(1)

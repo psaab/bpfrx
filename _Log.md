@@ -1,3 +1,148 @@
+## 2026-07-23 — #6396 codex-179 review residuals (3 low-risk hardenings)
+
+- **Timestamp**: 2026-07-23 (fix/6396-hardening-residuals)
+- **Action**: Implemented the three in-Go-scope #6396 residuals from the
+  codex-179 #6394 review, each with a firsthand-verified fail-on-revert test.
+  (1) SNMP ifTable warn flood — `buildSNMPIfData` (`pkg/daemon/
+  daemon_snmp_reconcile.go`) now rate-limits its netlink-failure `slog.Warn`
+  via a reusable `warnThrottle` (once per minute; first failure logs, later
+  ones in the window are counted + reported with the next line; a successful
+  read logs a one-time recovery). buildSNMPIfData runs once per SNMP poll, so a
+  persistent failure previously wrote one line per poll. (2) xfrm post-create
+  readback TOCTOU (`pkg/routing/xfrm.go`) — the `LinkByName` right after
+  `LinkAdd` now re-asserts the link is an `*netlink.Xfrmi` with the desired
+  `if_id` before bring-up/track, matching the adopt-path guard (#5523
+  C179-104); a same-name foreign or wrong-if_id link substituted in the
+  add→readback window is rejected (commit fails closed, next reconcile
+  reclaims). Both substitution shapes covered. (3) archive rotation edges
+  (`pkg/configstore/store_persist.go`) — `parseArchiveSeq` now requires the
+  two-dot current `config-<ts>.<seq>.conf` shape so a legacy pre-#3441
+  `config-<ts>.conf` (trailing nanoseconds) is no longer mis-read as a huge
+  seq in a mixed dir; `SetArchiveConfig` re-seeds the monotonic counter on ANY
+  archive-dir change (monotonic-up only), not just at process start, so a
+  runtime switch to a previously-used dir cannot let its higher-seq archives
+  outrank the ones this process writes. Scoped OUT: the SetIfDataFn error-
+  channel contract change and the best-effort RETH-MAC / CLI-display LinkList
+  swallows (issue defers as "remain"); the synchronous `ArchiveConfig` mirror's
+  target-dir seeding (zero production callers, shared-counter design).
+- **File(s)**: pkg/daemon/daemon_snmp_reconcile.go,
+  pkg/daemon/daemon_snmp_ifdata_throttle_6396_test.go,
+  pkg/daemon/daemon_snmp_ifdata_netlink_5523_test.go, pkg/routing/xfrm.go,
+  pkg/routing/iface_reuse_test.go, pkg/routing/xfrm_nonxfrmi_reject_5523_test.go,
+  pkg/configstore/store_persist.go, pkg/configstore/archive_6396_test.go,
+  pkg/configstore/archive_rotate_seq_5523_test.go, pkg/snmp/README.md,
+  pkg/configstore/README.md, pkg/routing/README.md
+- **Validation**: gofmt/build/vet clean on the three touched pkgs; full
+  `go test ./pkg/daemon ./pkg/routing ./pkg/configstore` GREEN; fail-on-revert
+  confirmed firsthand for all four fixes (SNMP throttle → 20 warns for 20
+  polls; xfrm readback → Apply returns nil + adopts foreign link; parseArchive
+  legacy → nanoseconds parsed as seq + legacy retained over current; dir-switch
+  reseed → counter stuck at old dir's max), then restored GREEN.
+
+- **Timestamp**: 2026-07-23 (fold on PR #6399, review MERGE-NEEDS-MINOR)
+- **Action**: Folded the Claude-hostile-review completeness MINOR: the xfrm
+  post-create readback guard had structurally-identical UNGUARDED siblings in
+  the same package. (a) createLinkedVRF (pkg/routing/vrf.go) now re-asserts the
+  post-LinkAdd readback is an netlink.Vrf carrying the desired table before
+  bring-up; on mismatch it returns (added=true, err) so the caller keeps
+  ownership and the reconcile adopt path (vrfTable → recreate on table
+  mismatch) reclaims a substitute next cycle. (b) createBond
+  (pkg/routing/bond.go) now re-asserts the readback is an netlink.Bond before
+  enslaving/bring-up: enslaveMembers only surfaces a foreign substitute via a
+  real-netlink LinkSetMaster failure when a member is enslavable, so a bond
+  whose configured members are all absent (the #4823 soft-error case) would
+  otherwise adopt a foreign link — the type check closes that for every member
+  state. Added substituteAfterAdd seams to fakeVRFOps + fakeBondLinkOps and
+  three VRF + one bond fail-on-revert tests (RED→GREEN confirmed firsthand:
+  VRF non-Vrf + wrong-table → Apply nil + brought up; bond foreign readback →
+  tracked + created). Routing README identity-re-assertion invariant
+  generalized to cover xfrm + VRF + bond (correcting the prior xfrm-only
+  scope-out).
+- **File(s)**: pkg/routing/vrf.go, pkg/routing/bond.go,
+  pkg/routing/routing_test.go, pkg/routing/bond_test.go,
+  pkg/routing/readback_guard_6396_test.go, pkg/routing/README.md
+
+- **Timestamp**: 2026-07-23 (re-gate fold on PR #6399, Codex MERGE-NEEDS-MAJOR)
+- **Action**: Folded the adjudicated Codex6399 findings (all complete the 4
+  stated fixes; not new scope). MAJOR 1 — xfrm ParentIndex identity: xpf
+  creates every xfrmi PARENTLESS, so a same-name/same-if_id xfrmi bound to a
+  NONZERO parent (IFLA_XFRM_LINK, selects egress) passed both the #5523 adopt
+  guard and the #6396 post-create guard and would egress SA traffic out the
+  wrong device. Extended BOTH guards to also assert
+  xi.Attrs().ParentIndex==0. MINOR 3 — xfrm stale-ownership: on a rejected
+  post-create readback, delete(x.xfrmis, ifName) so a pre-tracked name cannot
+  leave a later reconcile acting on a foreign substitute. MINOR 4 — archive
+  reseed scan-error: maxArchiveSeq now returns (uint64, error) via an
+  archiveDirReader seam; SetArchiveConfig keys the reseed off a new
+  archiveSeedDir (last successfully-scanned dir) and, on a ReadDir error,
+  leaves the counter unchanged AND the dir un-seeded so the next call retries
+  — a transient scan failure no longer pins the counter below the on-disk max
+  forever. MINOR 6 — SNMP recovery bound: added a fail-on-revert test
+  (attrCapturingHandler) asserting the recovery slog.Info fires once with the
+  correct suppressed_failures count after a failing→succeeding transition.
+  Test quality (item 5) — dir-switch test now proves a real archive SURVIVES
+  rotation (reseeded seq outranks pre-existing; oldest pruned) instead of
+  asserting the private counter. README (MAJOR 2) — bond scope-out made
+  explicit: create-path gated here, ADOPT path deferred to #6402 (HA-touching,
+  must validate mode/MTU not just type; loss-cluster smoke). Added a mode/MTU
+  note to #6402. DEFERRED — ArchiveConfig ordering race (Codex MINOR 5): zero
+  production callers; holding s.mu across the off-lock write reintroduces the
+  #6185 QuiesceArchival deadlock, so NOT trivial — reported for a follow-up,
+  not folded.
+- **File(s)**: pkg/routing/xfrm.go,
+  pkg/routing/xfrm_nonxfrmi_reject_5523_test.go, pkg/configstore/store.go,
+  pkg/configstore/store_persist.go, pkg/configstore/archive_6396_test.go,
+  pkg/daemon/daemon_snmp_reconcile.go,
+  pkg/daemon/daemon_snmp_ifdata_throttle_6396_test.go,
+  pkg/routing/README.md, pkg/configstore/README.md
+- **Validation**: gofmt/build/vet clean on the three touched pkgs; full
+  `go test ./pkg/routing ./pkg/configstore ./pkg/daemon` GREEN; fail-on-revert
+  confirmed firsthand for every new fold (ParentIndex adopt+create → adopted
+  not recreated / Apply nil; stale-ownership → xfrmis[name] persists;
+  scan-error → counter stuck at 5 not caught up to 202; SNMP recovery → 0
+  recovery logs; strengthened dir-switch → reseed neutralized fails the
+  rotation-survival assertion), then restored GREEN.
+
+- **Timestamp**: 2026-07-23 (convergence round on PR #6399, Codex 3rd MAJOR)
+- **Action**: Converged #6399 — kept the Codex-verified core, honestly
+  deferred the bond validation rabbit-hole. FOLDED (Codex MINOR 4): xfrm
+  LinkAdd-FAILURE stale ownership — the genuine create-failure exit
+  (xfrm.go:259) now also `delete(x.xfrmis, ifName)` so a pre-tracked name
+  whose recreate fails does not leave the removal pass able to delete a
+  foreign link that later wears the name; test
+  TestXfrmCreateLinkAddFailureDropsStaleTracking (PRE-TRACKED manager +
+  addFail), fail-on-revert firsthand RED (xfrmis=map[st0.1:2] persists) →
+  restored GREEN. DEFERRED to #6402 (HA-touching, NOT folded): bond identity
+  residuals — README (pkg/routing/README.md) now honestly enumerates all
+  three (create-path mode/MTU, adopt-path type+mode+MTU, KEEP-path identity
+  bond.go:181) as deferred; kept the create-path `*netlink.Bond` type guard
+  (net improvement). Updated #6402 to cover all three. DEFERRED to NEW #6404
+  (NOT folded): archive reseed edges (Codex MINOR 2 commit-interval race at
+  store_commit.go:284 + MINOR 3 disable/re-enable A→""→A skip); corrected the
+  configstore README's "ANY archive-dir change" wording to what is actually
+  guaranteed (re-seeds on a dir DIFFERENT from the last successfully-seeded
+  one) and cited #6404.
+- **File(s)**: pkg/routing/xfrm.go,
+  pkg/routing/xfrm_nonxfrmi_reject_5523_test.go, pkg/routing/README.md,
+  pkg/configstore/README.md
+- **Validation**: gofmt/build/vet clean; full
+  `go test ./pkg/routing ./pkg/configstore ./pkg/daemon` GREEN; new
+  LinkAdd-failure fold fail-on-revert verified firsthand this round; the
+  ParentIndex/readback/scan-error/SNMP guards (unchanged this round) verified
+  in the prior fold round.
+
+- **Timestamp**: 2026-07-23 (doc-honesty round on PR #6399, Codex MINOR)
+- **Action**: Two doc-summary honesty qualifications, NO code/test change.
+  (1) pkg/routing/README.md — the "Identity re-assertion" summary claimed all
+  three managers reject right-type/wrong-discriminator readbacks; qualified to
+  match the honest per-manager detail below it (xfrm type+Ifid+ParentIndex==0,
+  VRF type+table, bond TYPE ONLY — mode/MTU + adopt/KEEP-path deferred to
+  #6402). (2) pkg/configstore/README.md — the seq monotonicity / no-overwrite
+  summary retained unconditional guarantees its own #6404 exceptions
+  contradict; qualified to "after a successful reseed scan and outside the two
+  #6404-deferred windows". Production .go byte-identical to f36c2c814.
+- **File(s)**: pkg/routing/README.md, pkg/configstore/README.md
+
 ## 2026-07-23 — #5583 C180: fold two Codex MAJOR findings into #6383
 
 - **Timestamp**: 2026-07-23 (fix/5583-codex180, fold on PR #6383)
@@ -58958,3 +59103,341 @@ top.
 - **File(s)**: pkg/nftables/netlink_lo0.go,
   pkg/nftables/netlink_lo0_ports_test.go, pkg/nftables/README.md,
   pkg/daemon/daemon_nft_netlink_parity_test.go; _Log.md
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385 — `show system services` reports EFFECTIVE post-bind
+    management-listener addresses on BOTH surfaces (re-file of fix-5 dropped
+    from #6384). Root cause: the remote gRPC renderer
+    (`pkg/grpcapi/server_show_system.go`) AND the local CLI renderer
+    (`pkg/cli/cli_show_system.go`) each hardcoded
+    `127.0.0.1:50051 / 127.0.0.1:8080 (always on)`, reporting the
+    requested/config-declared listeners, not the addresses the daemon
+    actually bound (post-#5035 gRPC loopback clamp / post-#4047/#5127 REST
+    clamp / disabled listener). A local-only patch left the remote path — the
+    common operator path — wrong. Fix: new leaf pkg `pkg/sysservices`
+    (`Listeners` + shared `Lines()` renderer, stdlib-only). Daemon aggregator
+    `Daemon.effectiveListeners()` builds ONE snapshot — gRPC from a new
+    `grpcapi.Server.EffectiveAddr()` recorded after `net.Listen`, HTTP REST
+    from a new `managementReconciler.effectiveHTTPAddr()` (converged
+    `m.cur.addr`; `""` -> rendered `disabled` when `--api-addr` empty). BOTH
+    renderers read that ONE snapshot: gRPC via `Config.ListenersFn`, local CLI
+    via `SetListenersFn`, both formatting through `Listeners.Lines`, so local
+    and remote can never diverge. Surface enumeration: only two `System
+    services:` emitters exist (local CLI + remote gRPC) — both fixed; no HTTP
+    REST / JSON / display-xml variant renders the listener block. Fail-on-
+    revert nets: `TestShowSystemServicesEffectiveListenersGRPC` (primary,
+    remote path) + `TestShowSystemServicesEffectiveListenersLocal` +
+    `sysservices.TestListenersLines`; each RED verified FIRSTHAND by
+    neutralizing the render substitution (clean ASSERTION failure, nil-
+    fallback test stays GREEN), restored -> GREEN. build+vet+gofmt clean;
+    `go test ./pkg/sysservices/ ./pkg/grpcapi/ ./pkg/cli/ ./pkg/daemon/`
+    GREEN. Unit-testable show-render class — no loss-cluster smoke needed.
+  - **File(s)**: pkg/sysservices/listeners.go,
+    pkg/sysservices/listeners_test.go, pkg/grpcapi/server.go,
+    pkg/grpcapi/server_show_system.go,
+    pkg/grpcapi/server_show_system_listeners_6385_test.go,
+    pkg/cli/cli.go, pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_listeners_6385_test.go,
+    pkg/daemon/management.go, pkg/daemon/daemon_run_servers.go,
+    pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385/#6401 fold — model listener STATE, not just an address
+    (Codex MERGE-NEEDS-MAJOR completeness gap adjudicated real by team-lead).
+    `sysservices.Listener` now carries `{Addr, State}` with State ∈
+    {StateListening, StateFailed, StateDisabled}; `Lines()` renders Listening →
+    "addr", Failed → "addr (bind failed)" / "bind failed", Disabled →
+    "disabled". gRPC state: `grpcapi.Server` records a `grpcListenState`
+    (pre-bind → listening → failed); `EffectiveListener()` replaces
+    `EffectiveAddr()` — net.Listen error → Failed(requested addr); serve-loop
+    exit CLEARS the bound addr → Failed (no stale bind for a dead server);
+    pre-bind → Listening(requested). HTTP state:
+    `managementReconciler.effectiveHTTPListener()` — nil reconciler (empty
+    --api-addr) → Disabled; configured-but-boot-bind-failed (curSet false) →
+    Failed(lastHTTPAttempt, recorded pre-bind in startTo); converged →
+    Listening. #4 fold: HTTP Listening addr sourced from the ACTUAL bound
+    listener via new `api.Server.EffectiveHTTPAddr()` (httpLeg.ln.Addr()), so
+    --api-addr=127.0.0.1:0 reports the concrete ephemeral port, not ":0".
+    Daemon aggregator `effectiveListeners()` maps both into one
+    `sysservices.Listeners`. New fail-on-revert nets (each RED verified
+    firsthand, clean ASSERTION failure, restored GREEN): grpcapi
+    TestGRPCEffectiveListenerBindFailure (real Run against an in-use addr →
+    Failed) + TestGRPCEffectiveListenerLifecycle (pre-bind→bound-concrete-port
+    →serve-exit-clears) + TestShowSystemServicesFailedHTTPGRPC (remote render
+    "(bind failed)"); daemon TestEffectiveHTTPListenerStatesDistinct
+    (Disabled≠Failed≠Listening) + TestEffectiveHTTPListenerEphemeralPort (:0 →
+    concrete); sysservices Lines() Failed/Disabled cases. gofmt/vet clean;
+    `go test ./pkg/sysservices/ ./pkg/api/ ./pkg/grpcapi/ ./pkg/cli/
+    ./pkg/daemon/` GREEN, `-race` GREEN on the listener tests. docs:
+    pkg/daemon/README.md effective-listener section rewritten for the state
+    model; pkg/api/README.md notes EffectiveHTTPAddr.
+  - **File(s)**: pkg/sysservices/listeners.go,
+    pkg/sysservices/listeners_test.go, pkg/api/listener.go, pkg/api/README.md,
+    pkg/grpcapi/server.go, pkg/grpcapi/server_show_system.go,
+    pkg/grpcapi/server_show_system_listeners_6385_test.go, pkg/cli/cli.go,
+    pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_listeners_6385_test.go,
+    pkg/daemon/management.go, pkg/daemon/daemon_run_servers.go,
+    pkg/daemon/effective_listeners_6401_test.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385/#6401 fold round 2 — HTTP↔gRPC serve-exit SYMMETRY
+    (Codex MAJOR, adjudicated real) + gRPC-lifecycle test tightening (Codex
+    MINOR). MAJOR: an UNEXPECTED HTTP `Serve` exit in `serveLegLocked`
+    (pkg/api/listener.go) only logged+returned, leaving `httpLeg.ln` live, so
+    `EffectiveHTTPAddr()` still returned the dead listener's addr and
+    `effectiveHTTPListener()` reported StateListening on a DEAD leg — asymmetric
+    with the gRPC serve-exit clear. Fix: added `listenerLeg.dead`, marked true
+    under `lifeMu` on the unexpected-exit branch ONLY (requested shutdown via
+    stopCh/rootCtx unaffected); `EffectiveHTTPAddr()` returns "" for a dead leg;
+    `effectiveHTTPListener()` maps converged-but-EffectiveHTTPAddr=="" →
+    StateFailed (day-2 rebind failure RETAINS the old live leg → non-empty →
+    stays Listening, unaffected). MINOR: tightened
+    TestGRPCEffectiveListenerLifecycle to assert (a) pre-bind state before Run
+    (Listening on requested addr) and (b) post-serve-exit addr is CLEARED (==
+    requested, != the stale concrete bound port) — the old test asserted only
+    State==Failed and would miss a retain-stale-effAddr regression. New test
+    TestEffectiveHTTPListenerServeExitFails drives the serve-exit via an
+    in-memory erroring listener (NO real socket — review sandbox blocks
+    sockets): Accept errors on a signal → Serve exits → leg dead → reconciler
+    reports Failed. Both RED verified FIRSTHAND (neutralize leg.dead → Listening
+    on dead leg RED; neutralize the gRPC clear to retain stale addr → stale-port
+    RED), restored GREEN. gofmt/vet clean; `go test ./pkg/sysservices/
+    ./pkg/api/ ./pkg/grpcapi/ ./pkg/cli/ ./pkg/daemon/` GREEN; `-race` GREEN
+    (full pkg/api + listener tests + mgmt reconcile). docs: pkg/daemon/README.md
+    HTTP bullet + pkg/api/README.md EffectiveHTTPAddr note updated for the
+    dead-leg/serve-exit symmetry.
+  - **File(s)**: pkg/api/listener.go, pkg/api/README.md,
+    pkg/daemon/management.go, pkg/daemon/effective_listeners_6401_test.go,
+    pkg/daemon/README.md, pkg/grpcapi/server.go,
+    pkg/grpcapi/server_show_system_listeners_6385_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385/#6401 fold round 3 — FIX a shutdown DEADLOCK my round-2
+    serve-exit fold introduced (Codex MAJOR, reproduced firsthand). Lock-order
+    cycle: the HTTP leg's serve goroutine still holds its `wg` count when the
+    round-2 code acquired `lifeMu` to set `leg.dead` on an unexpected serve
+    exit; `Server.Wait()` holds `lifeMu` ACROSS `wg.Wait()` — so a serve-exit
+    racing a shutdown Wait hung permanently (Wait holds lifeMu waiting on the
+    goroutine's wg.Done; the goroutine waits on lifeMu before it can
+    return->Done). PATH TAKEN: atomic fix (bounded, low-risk) — `listenerLeg.dead`
+    is now an `atomic.Bool`; the serve goroutine `leg.dead.Store(true)` WITHOUT
+    lifeMu (breaks the cycle); `EffectiveHTTPAddr()` reads `httpLeg`/`ln` under
+    lifeMu (swapped only under lifeMu) but the dead flag via `dead.Load()`.
+    Requested-shutdown paths (stopCh/rootCtx) unchanged. NEW test
+    (pkg/api/serve_exit_wait_deadlock_6401_test.go)
+    TestServeExitDoesNotDeadlockConcurrentWait_6401: launches Wait() concurrently
+    (holds lifeMu in wg.Wait while the leg is parked at Accept via an in-memory
+    erroring listener — NO real socket), then triggers the unexpected serve-exit;
+    asserts Wait returns within 3s (no deadlock) AND the leg ends dead
+    (EffectiveHTTPAddr==""). RED verified FIRSTHAND: reintroducing the
+    lifeMu-guarded marking hangs Wait -> clean t.Fatal at 3s (bounded, not a
+    suite hang); restored -> GREEN at 0.10s. gofmt/vet clean; `go test
+    ./pkg/sysservices/ ./pkg/api/ ./pkg/grpcapi/ ./pkg/cli/ ./pkg/daemon/`
+    GREEN; `-race` GREEN on the FULL pkg/api suite + listener/deadlock tests +
+    mgmt reconcile. docs: pkg/api/README.md EffectiveHTTPAddr note explains the
+    atomic (lock-free) marking + the lock-ordering rationale.
+  - **File(s)**: pkg/api/listener.go, pkg/api/README.md,
+    pkg/api/serve_exit_wait_deadlock_6401_test.go, _Log.md
+  - **Action**: #6391 host-inbound sibling-isolation regression guard +
+    doc. STEP-0 firsthand finding: the host-inbound sibling LEAK the issue
+    describes is NOT present on current master (a00aa3cd9). PR #6389 (the
+    `zoneInterfaceMembers` fanout that leaked) was CLOSED unmerged;
+    `compileZones` keys the per-interface override strictly on `iface.Name()`
+    (the direct child the stanza is written under), so a bracket sibling never
+    inherits it. Verified across 6 shapes (flat-set first/later member,
+    3-member, multi-service ssh+ping, hierarchical nested-child, hierarchical
+    bracket-with-body): only the named interface carries the override in every
+    case. Since master is already fail-safe, this ships the missing REGRESSION
+    GUARD rather than a behavior fix. Added
+    `compiler_zone_iface_hostinbound_sibling_6391_test.go` (7 tests) pinning
+    sibling isolation across all 5 symmetric surfaces the issue enumerates plus
+    a no-shared-backing-store aliasing guard. Fail-on-revert demonstrated
+    FIRSTHAND: re-applying the exact #6389 fanout turns 5 of the cases RED with
+    clean ASSERTION failures (sibling `ge-0/0/1`/`ge-0/0/2` wrongly gets
+    `[ssh]`/`[ping ssh]`); restoring master -> all GREEN, compiler byte-identical
+    to master. Documented the sibling-isolation invariant + why the #6389 fanout
+    is unsound (flat-set single-scoped and hierarchical multi-member compile to
+    the same AST) in docs/config-schema.md. build + vet + gofmt clean; full
+    `go test ./pkg/config/` GREEN.
+  - **File(s)**: pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6400 review-fold — folded 3 Codex MINORs on the #6391
+    host-inbound sibling-isolation guard (production still byte-identical to
+    master; test/doc quality only). (1) Assertion completeness: the guard
+    helper compared only sorted SystemServices, dropping Protocols — a fanout
+    leaking host-inbound `protocols` (ospf/bgp) to a sibling would slip past.
+    Reworked `compileHostInbound6391` to return the FULL per-interface map keyed
+    on a `hib6391{SystemServices,Protocols}` view (both dimensions, every key),
+    so cardinality + protocols are asserted; extended the aliasing test with a
+    whole-map cardinality assertion; added
+    `TestHostInbound6391ProtocolsNoSiblingLeak` (ssh + ospf under the first
+    member) so the Protocols dimension is exercised by fail-on-revert. (2)
+    Prose overclaim: reworded the test-header + docs "every case goes RED" to the
+    accurate split — the six container-sharing cases (first-member, three-member,
+    multi-service, protocols, hierarchical nested-child, hierarchical
+    bracket-body) go RED, later-member + no-shared-backing-store stay GREEN
+    controls. (3) Doc self-contradiction: qualified config-schema.md that a
+    bracketed member cannot carry host-inbound in FLAT-SET / canonical `set`
+    syntax — the `[ a b ] { host-inbound }` shape is reachable only via a
+    raw-hierarchical `load override` parse. Re-verified: #6389 fanout →
+    6 RED / 2 GREEN controls; full `go test ./pkg/config/` GREEN; vet + gofmt
+    clean; compiler_security_zones.go byte-identical to master. Kept "Advances
+    #6391" (no close keyword).
+  - **File(s)**: pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 — policymatch unsupported-tuple gate folded an
+    IPv4-mapped IPv6 source. The #5720 (V4 src, V6 dst) gate in
+    `pkg/policymatch/policymatch.go` `Match` classified family with
+    `net.IP.To4()`, which folds `::ffff:1.2.3.4` (To4 non-nil), so a source
+    authored as `::ffff:192.0.2.1` against a v6 destination was FALSELY reported
+    `UnsupportedTupleFamily` — diverging from the colon-strict runtime matcher
+    (userspace-dp/src/policy.rs) that sees a same-family V6/V6 tuple. Fail-safe
+    (a spurious advisory, never a hidden/fabricated permit) but off the
+    documented Go/Rust family-parity convention. Fix: threaded the colon-strict
+    text family from every caller. Added optional `Query.SrcFamily`/`DstFamily`
+    ("v4"/"v6"/"") hints; all four builders (cli_request_testcmd.go,
+    cli_show_security.go, server_show_firewall.go, server_cluster.go) populate
+    them via `config.NATAddrFamily` on the RAW operator string (the SSOT
+    colon-strict classifier, keyed on the ':' net.ParseIP discards). New
+    `queryTupleFamily` prefers the hint and falls back to `To4()` only when a
+    caller supplies none, preserving pre-#6377 behavior for net.IP-only callers.
+    Fail-on-revert `mapped_ipv4_tuple_6377_test.go`
+    (`TestMatchMappedIPv6SourceNotGated`) — verified RED (clean assertion,
+    UnsupportedTupleFamily:true) when the gate is reverted to To4()-only,
+    restored GREEN. Covers all three directions (genuine v4, genuine v6, mapped
+    v6) + the deliberate no-hint fold fallback. Not HA/cluster/dataplane —
+    diagnostic surface only, no failover smoke required. build+vet+gofmt clean;
+    full go test on pkg/policymatch + pkg/cli + pkg/grpcapi GREEN.
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/policymatch/mapped_ipv4_tuple_6377_test.go,
+    pkg/policymatch/README.md, pkg/cli/cli_request_testcmd.go,
+    pkg/cli/cli_show_security.go, pkg/grpcapi/server_show_firewall.go,
+    pkg/grpcapi/server_cluster.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 fold — the REST caller (the FIFTH builder) was missed
+    in the first pass. The hostile Claude review found MERGE-NEEDS-MAJOR: the
+    fix threaded the colon-strict family through FOUR `policymatch.Query{}`
+    builders but there are FIVE — `pkg/api/security.go` `matchPoliciesHandler`
+    (GET /api/v1/security/match) passed SrcIP/DstIP with NO SrcFamily/DstFamily,
+    so `::ffff:192.0.2.1 -> 2001:db8::1` was still falsely reported
+    `UnsupportedTupleFamily` on REST. Folded: added
+    `SrcFamily: config.NATAddrFamily(srcIPStr)` /
+    `DstFamily: config.NATAddrFamily(dstIPStr)` at security.go (classifying the
+    RAW query strings srcIPStr/dstIPStr, NOT the folded net.ParseIP results).
+    Added the REST fail-on-revert `security_matchpolicies_mapped_ipv4_6377_test.go`
+    (`TestMatchPoliciesRESTMappedIPv6SourceNotGated6377`) — drives the real
+    handler with src_ip=::ffff:192.0.2.1 & dst_ip=2001:db8::1 and asserts a
+    permit-through (NOT the unsupported verdict), plus a genuine 10.0.0.1 -> v6
+    control that MUST still be gated. Verified RED firsthand (drop the two
+    Family fields → REST response Action = the unsupported-tuple string,
+    Matched:false), restored GREEN. This was the one #6377 surface with no
+    binding test, which is why the miss slipped through. Corrected the "all
+    four builders" claims to FIVE and enumerated api/security.go in the
+    policymatch.go gate comment, pkg/policymatch/README.md, and this log. All
+    five builders: cli_request_testcmd.go, cli_show_security.go,
+    server_show_firewall.go, server_cluster.go, api/security.go.
+  - **File(s)**: pkg/api/security.go,
+    pkg/api/security_matchpolicies_mapped_ipv4_6377_test.go,
+    pkg/policymatch/policymatch.go, pkg/policymatch/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 fold #2 (Codex MAJOR, security-relevant) — the gate
+    fix alone was UNSAFE. `matchAddr` (the policy address evaluator) classified
+    the packet family with `isV4 := ip.To4() != nil`, which FOLDS a mapped-v6
+    source. After the gate fix let a mapped-v6 source fall through (correctly),
+    matchAddr folded it to v4 and matched it against the V4 address rules — so a
+    `::ffff:192.0.2.1` source against a V4-only permit rule (192.0.2.0/24 folds
+    to contain 192.0.2.1) would FABRICATE A PERMIT (fail-OPEN), worse than the
+    original spurious-advisory bug. The colon-strict Rust matcher sees V6 →
+    evaluates against V6 rules → default-deny. Fix: threaded the per-side family
+    into matchAddr — `isV4 := queryTupleFamily(ip, family) == "v4"` (hint first,
+    To4() fallback only when family==""); src passes q.SrcFamily, dst passes
+    q.DstFamily at all four call sites (ruleMatches x2, isSkippedFragDeny x2).
+    The v4Empty/v6Empty gates key on the ADDRESS SETS not the packet family, so
+    the #3023 cross-family + #2008 excluded fail-closed semantics are unchanged
+    (full pkg/policymatch suite GREEN confirms). Also threaded the family into
+    the test-only SelectorArgs.Query() helper (defensive; no production caller).
+    New eval-correctness fail-on-revert tests (Codex's point — the gate tests
+    only proved fall-through): TestMatchMappedIPv6SourceNotEvaluatedAsV4
+    (matcher) + TestMatchPoliciesRESTMappedIPv6SourceNotEvaluatedAsV4_6377
+    (REST) — mapped-v6 src against a V4-only permit rule must NOT permit
+    (matches v6 → default-deny); genuine v4 control still permits. BOTH verified
+    RED firsthand on `isV4 := ip.To4()` revert (Matched:true PolicyName:permit-v4
+    Action:permit), restored GREEN. Documented in matchAddr doc comment +
+    pkg/policymatch/README.md resolved section. SelectorArgs.Query() at
+    policymatch.go is test-only (grep: only fragment_5572_test.go +
+    selector_args_3696_test.go reference it).
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/policymatch/mapped_ipv4_tuple_6377_test.go,
+    pkg/api/security_matchpolicies_mapped_ipv4_6377_test.go,
+    pkg/policymatch/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 fold #3 (Codex round-2 MERGE-NEEDS-MINOR, 3 MINORs).
+    (1) hostInboundAdmission was a THIRD To4()-fold site: it computed the family
+    via ipFamily(q.DstIP)/ipFamily(q.SrcIP), folding a mapped-v6 host-bound
+    destination to ip. A family-scoped host-inbound token (dhcpv6=ip6, dhcp=ip;
+    ping ICMP vs ICMPv6) would then be mis-admitted in the simulator. Added
+    ipFamilyStrict(ip, fam) — maps the colon-strict hint to the nft ip/ip6 token,
+    To4() fallback when fam=="" — and threaded q.DstFamily/q.SrcFamily.
+    Fail-on-revert host_inbound_mapped_family_6377_test.go
+    (TestHostInboundMappedIPv6DstClassifiedAsV6): a mapped-v6 dst on udp/547 must
+    admit via the ip6-scoped dhcpv6 token; genuine v4 (dhcp/udp67) + genuine v6
+    controls prove both paths intact. VERIFIED RED firsthand on the ipFamily()
+    revert (mapped case flips TokenAdmit(dhcpv6)->Denied while controls stay
+    green), restored GREEN. (2) Corrected the Query.SrcFamily/DstFamily doc
+    comment: it falsely claimed the hints "never affect address matching" — they
+    now drive the gate, matchAddr's isV4, AND host-inbound family; reworded to
+    enumerate all three consumers and clarify the hint selects which family's
+    rules a side is tested against (address CONTAINMENT still uses the IP bytes).
+    (3) Strengthened the eval REST test
+    (TestMatchPoliciesRESTMappedIPv6SourceNotEvaluatedAsV4_6377) to assert the
+    EXACT default-deny result (action=="deny (default)" + default_used==true +
+    policy_name=="" + matched==false), not merely "not permit". Documented the
+    host-inbound consumer in pkg/policymatch/README.md resolved section. Gate +
+    matcher-eval + REST fail-on-reverts all still green.
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/policymatch/host_inbound_mapped_family_6377_test.go,
+    pkg/api/security_matchpolicies_mapped_ipv4_6377_test.go,
+    pkg/policymatch/README.md, _Log.md
+  - **Action**: #6382 — clamp local console CLI ping `-s` payload to
+    `diagcmd.MaxPingSize` (the third control surface). REST
+    (`pkg/api/system.go`) and gRPC (`pkg/grpcapi/server_diag_ping.go`)
+    `buildPingArgv` already clamped (#5250 A8-b1 F4); the console
+    `buildPingArgv` in `pkg/cli/cli_request_ping.go` passed the operator
+    `size` token through unclamped. Now `strconv.Atoi` + `min(size,
+    MaxPingSize)`; non-numeric tokens left for the ping child to reject.
+    Added `TestBuildPingArgvClampsSize_6382` (fail-on-revert) +
+    `TestBuildPingArgvKeepsInBoundSize_6382` (in-bound + non-numeric pass
+    through). Updated `MaxPingSize` doc comment (now all three surfaces
+    clamp) and `pkg/cli/README.md`. Parent-RED verified: neutralizing the
+    clamp fails `TestBuildPingArgvClampsSize_6382` with a clean assertion
+    (`ping -s = "1048576", want clamped "65507"`).
+  - **File(s)**: pkg/cli/cli_request_ping.go, pkg/cli/cli_request_argv_test.go,
+    pkg/diagcmd/diagcmd.go, pkg/cli/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6382 review fold — (1) MINOR 1 (overflow bypass): the
+    `strconv.Atoi` guard returned `ErrRange` for a digit token above the
+    platform int, skipping the clamp and letting `ping -s <huge>` run
+    unbounded. Reworked `buildPingArgv` to `strconv.ParseInt(..,10,64)`;
+    clamp when the value parses and `> MaxPingSize`, OR when it overflows
+    int64 (`errors.Is ErrRange`) on a non-negative literal. A leading '-'
+    overflow stays a huge negative the ping child rejects. Added
+    `TestBuildPingArgvClampsOverflowSize_6382` (fail-on-revert:
+    "99999999999999999999" → capped 65507). (2) MINOR 2 (≤0 divergence):
+    documented — NOT changed — that the console preserves an explicit
+    `-s 0`/`-s -1`/non-numeric token (raw operator input model) while the
+    structured-int REST/gRPC surfaces omit a non-positive size; only the
+    upper ceiling is shared. Locked with
+    `TestBuildPingArgvPreservesNonPositiveSize_6382`. Updated the fn doc
+    comment + `pkg/cli/README.md`. Parent-RED re-verified on the new head:
+    neutralizing the clamp fails BOTH ClampsSize + ClampsOverflowSize with
+    clean assertions; restored green.
+  - **File(s)**: pkg/cli/cli_request_ping.go, pkg/cli/cli_request_argv_test.go,
+    pkg/cli/README.md, _Log.md
