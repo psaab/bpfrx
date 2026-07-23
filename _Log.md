@@ -58760,3 +58760,10 @@ top.
     pkg/natshow/scan_error_5557_test.go, pkg/dataplane/userspace/interfaces.go,
     pkg/dataplane/userspace/synthetic_ifindex_exhaust_5557_test.go,
     pkg/configstore/rollback_size_cap_5557_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: Draft research PLAN for #6387 — host-inbound nftables install via
+    netlink (removes exec-`nft` single point of failure that strands the HA
+    standby at `Transfer ready: no`) + config-sync apply-failure as a `CF`
+    monitor-failure / degraded health. Research only; no production code.
+  **File(s)**: docs/pr/6387-hostinbound-netlink/plan.md, _Log.md
