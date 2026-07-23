@@ -34,56 +34,77 @@ mod setup;
 mod debug_report;
 
 pub(crate) fn worker_loop(
-    worker_id: u32,
-    binding_plans: Vec<BindingPlan>,
-    shared_validation: Arc<ArcSwap<ValidationState>>,
-    shared_forwarding: Arc<ArcSwap<ForwardingState>>,
-    ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
-    dynamic_neighbors: Arc<ShardedNeighborMap>,
-    neighbor_resolver: Option<Arc<NeighborResolver>>,
-    shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    shared_owner_rg_indexes: SharedSessionOwnerRgIndexes,
-    slow_path: Option<Arc<SlowPathReinjector>>,
-    local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
-    recent_exceptions: Arc<Mutex<ExceptionEventRing>>,
-    recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
-    last_resolution: Arc<Mutex<Option<ResolutionEvent>>>,
-    commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
-    peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    worker_commands_by_id: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>>,
-    stop: Arc<AtomicBool>,
-    heartbeat: Arc<AtomicU64>,
-    session_export_ack: Arc<AtomicU64>,
-    poll_mode: crate::PollMode,
-    dnat_fds: DnatTableFds,
-    shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
-    event_stream: Option<crate::event_stream::EventStreamWorkerHandle>,
-    rg_epochs: Arc<[AtomicU32; MAX_RG_EPOCHS]>,
-    shared_cos_owner_worker_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), u32>>>,
-    shared_cos_owner_live_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>>,
-    shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
-    shared_cos_exact_backlogs: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSExactBacklog>>>>,
-    shared_cos_queue_leases: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>>>,
-    shared_cos_queue_vtime_floors: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>>>,
-    shared_mirror_targets: Arc<ArcSwap<MirrorTargetMap>>,
-    cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
-    // #869: worker-runtime telemetry publish slot.  Worker writes its
-    // local counters here on a ~1s cadence; coordinator reads for status.
-    runtime_atomics: Arc<crate::afxdp::worker_runtime::WorkerRuntimeAtomics>,
-    // #1621: sibling per-worker cold-path histogram publish slot.
-    // Worker calls publish_from_local() each ~1s tick alongside the
-    // runtime_atomics.publish(). Coordinator status path reads via
-    // snapshot() at each /metrics scrape.
-    cold_path_atomics: Arc<crate::afxdp::cold_path_hist::WorkerColdPathAtomics>,
-    // #5143: one-shot STARTUP READINESS channel. After the setup phase below
-    // finishes its in-thread XSK/UMEM binds, the worker reports its actual
-    // bound-slot set back to `bring_up_workers` (which waits on this channel
-    // under a bounded deadline before it accepts the generation). Sent ONCE,
-    // before the steady loop — never touched on the hot path.
-    startup_report_tx: std::sync::mpsc::Sender<WorkerStartupReport>,
+    plan: WorkerLaunchPlan,
+    shared: WorkerSharedDataplane,
+    control: WorkerControlChannels,
+    cos_state: WorkerCoSState,
+    telemetry: WorkerPublishedTelemetry,
 ) {
+    // #6241: destructure each typed launch bundle back into the EXACT
+    // same local variable names the loop body uses today, BEFORE the
+    // one-shot setup call below runs. From here down, the setup call and
+    // the steady per-tick loop body are TEXTUALLY UNCHANGED — the bundles
+    // are MOVED in and consumed here with zero added clone / alloc /
+    // reference-indirection, and nothing bundle-shaped survives into the
+    // hot 10K–100K-tick/s loop (the #1776 no-inline-boundary constraint).
+    // The `runtime_atomics` (#869) / `cold_path_atomics` (#1621) publish
+    // slots, the `startup_report_tx` (#5143) one-shot readiness channel,
+    // and the #6242 telemetry lifecycle contract are documented on the
+    // bundle fields in worker/launch.rs.
+    let WorkerLaunchPlan {
+        worker_id,
+        binding_plans,
+        poll_mode,
+        dnat_fds,
+    } = plan;
+    let WorkerSharedDataplane {
+        validation: shared_validation,
+        forwarding: shared_forwarding,
+        ha_state,
+        local_tunnel_deliveries,
+        fabrics: shared_fabrics,
+        mirror_targets: shared_mirror_targets,
+        rg_epochs,
+        slow_path,
+        neighbors:
+            WorkerNeighbors {
+                dynamic: dynamic_neighbors,
+                resolver: neighbor_resolver,
+            },
+        sessions:
+            WorkerSharedSessions {
+                synced: shared_sessions,
+                nat: shared_nat_sessions,
+                forward_wire: shared_forward_wire_sessions,
+                owner_rg_indexes: shared_owner_rg_indexes,
+            },
+    } = shared;
+    let WorkerControlChannels {
+        commands,
+        peer_worker_commands,
+        worker_commands_by_id,
+        stop,
+        heartbeat,
+        session_export_ack,
+        event_stream,
+        startup_report_tx,
+    } = control;
+    let WorkerCoSState {
+        cos_owner_worker_by_queue: shared_cos_owner_worker_by_queue,
+        cos_owner_live_by_queue: shared_cos_owner_live_by_queue,
+        cos_root_leases: shared_cos_root_leases,
+        cos_exact_backlogs: shared_cos_exact_backlogs,
+        cos_queue_leases: shared_cos_queue_leases,
+        cos_queue_vtime_floors: shared_cos_queue_vtime_floors,
+    } = cos_state;
+    let WorkerPublishedTelemetry {
+        recent_exceptions,
+        recent_session_deltas,
+        last_resolution,
+        cos_status,
+        runtime_atomics,
+        cold_path_atomics,
+    } = telemetry;
     // #1776: one-shot setup moved verbatim to setup.rs. The returned
     // WorkerLoopSetup is destructured into the same-named locals so
     // the loop body below is textually unchanged.

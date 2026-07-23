@@ -378,14 +378,6 @@ pub(super) fn bring_up_workers(
             .worker_last_resolution
             .insert(worker_id, last_resolution.clone());
         let recent_session_deltas = coord.recent_session_deltas.clone();
-        let slow_path = coord.slow_path.clone();
-        let local_tunnel_deliveries = coord.local_tunnel_deliveries.clone();
-        let shared_forwarding = coord.ha.forwarding.clone();
-        let shared_validation = coord.shared_validation.clone();
-        let shared_sessions = coord.sessions.synced.clone();
-        let shared_nat_sessions = coord.sessions.nat.clone();
-        let shared_forward_wire_sessions = coord.sessions.forward_wire.clone();
-        let shared_owner_rg_indexes = coord.sessions.owner_rg_indexes.clone();
         let stop_clone = stop.clone();
         let heartbeat_clone = heartbeat.clone();
         let session_export_ack_clone = session_export_ack.clone();
@@ -396,21 +388,9 @@ pub(super) fn bring_up_workers(
             .map(|(_, queue)| queue.clone())
             .collect::<Vec<_>>();
         let worker_commands_by_id = worker_command_queues.clone();
-        let ha_state = coord.ha.rg_runtime.clone();
-        let dynamic_neighbors = coord.neighbors.dynamic.clone();
-        let neighbor_resolver = coord.neighbors.resolver.clone();
         let worker_poll_mode = coord.poll_mode;
-        let shared_fabrics = coord.ha.fabrics.clone();
-        let rg_epochs = coord.rg_epochs.clone();
         let event_stream_handle = coord.event_stream_worker_handle();
         let cos_status_clone = cos_status.clone();
-        let shared_cos_owner_worker_by_queue = coord.cos.owner_worker_by_queue.clone();
-        let shared_cos_owner_live_by_queue = coord.cos.owner_live_by_queue.clone();
-        let shared_cos_root_leases = coord.cos.root_leases.clone();
-        let shared_cos_exact_backlogs = coord.cos.exact_backlogs.clone();
-        let shared_cos_queue_leases = coord.cos.queue_leases.clone();
-        let shared_cos_queue_vtime_floors = coord.cos.queue_vtime_floors.clone();
-        let shared_mirror_targets = coord.mirror_targets.clone();
         let runtime_atomics =
             std::sync::Arc::new(crate::afxdp::worker_runtime::WorkerRuntimeAtomics::new());
         let runtime_atomics_clone = runtime_atomics.clone();
@@ -433,46 +413,44 @@ pub(super) fn bring_up_workers(
         // the worker body; `worker_loop` sends the achieved bound-slot set on
         // it after setup, before entering the steady loop.
         let startup_report_tx_worker = startup_report_tx.clone();
+        // #6241: assemble the typed worker-launch bundles via their
+        // `from_coord` / `new` builders (NOT inline struct literals), so a
+        // same-typed source swap is caught by the `Arc::ptr_eq` wiring
+        // tests in worker/launch.rs. `WorkerSharedDataplane::from_coord`
+        // and `WorkerCoSState::from_coord` perform exactly the
+        // `coord.*.clone()` calls this closure used to inline — one
+        // `Arc::clone` per field, no extra allocation. The bundles borrow
+        // `coord` HERE and are then MOVED into the worker body, which
+        // never touches `coord` (it must be 'static for the spawn).
+        let launch_plan =
+            WorkerLaunchPlan::new(worker_id, binding_plans, worker_poll_mode, dnat_fds);
+        let shared_dataplane = WorkerSharedDataplane::from_coord(coord);
+        let control_channels = WorkerControlChannels::new(
+            commands_clone,
+            peer_commands_clone,
+            worker_commands_by_id,
+            stop_clone,
+            heartbeat_clone,
+            session_export_ack_clone,
+            event_stream_handle,
+            startup_report_tx_worker,
+        );
+        let cos_state = WorkerCoSState::from_coord(coord);
+        let published_telemetry = WorkerPublishedTelemetry::new(
+            recent_exceptions,
+            recent_session_deltas,
+            last_resolution,
+            cos_status_clone,
+            runtime_atomics_clone,
+            cold_path_atomics_clone,
+        );
         let body = move || {
             worker_loop(
-                worker_id,
-                binding_plans,
-                shared_validation,
-                shared_forwarding,
-                ha_state,
-                dynamic_neighbors,
-                neighbor_resolver,
-                shared_sessions,
-                shared_nat_sessions,
-                shared_forward_wire_sessions,
-                shared_owner_rg_indexes,
-                slow_path,
-                local_tunnel_deliveries,
-                recent_exceptions,
-                recent_session_deltas,
-                last_resolution,
-                commands_clone,
-                peer_commands_clone,
-                worker_commands_by_id,
-                stop_clone,
-                heartbeat_clone,
-                session_export_ack_clone,
-                worker_poll_mode,
-                dnat_fds,
-                shared_fabrics,
-                event_stream_handle,
-                rg_epochs,
-                shared_cos_owner_worker_by_queue,
-                shared_cos_owner_live_by_queue,
-                shared_cos_root_leases,
-                shared_cos_exact_backlogs,
-                shared_cos_queue_leases,
-                shared_cos_queue_vtime_floors,
-                shared_mirror_targets,
-                cos_status_clone,
-                runtime_atomics_clone,
-                cold_path_atomics_clone,
-                startup_report_tx_worker,
+                launch_plan,
+                shared_dataplane,
+                control_channels,
+                cos_state,
+                published_telemetry,
             );
         };
         // #4952 test seam: force the fallible worker spawn to fail so the
