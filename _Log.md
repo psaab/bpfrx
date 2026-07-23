@@ -58762,6 +58762,59 @@ top.
     pkg/configstore/rollback_size_cap_5557_test.go, _Log.md
 
 - **Timestamp**: 2026-07-23
+  **Action**: #6387 PR-1 — surface persistent config-sync APPLY failure as a
+    node-global `CF` config-sync monitor-failure / degraded health (time-based,
+    election-neutral, survives reconcileMonitorDebtsLocked). configApplyLoop
+    fires `OnConfigApplyHealth` off the failure/success edges past a 30s
+    stale-duration grace; daemon translates to `Manager.SetConfigSyncHealth`;
+    FormatStatus folds `CF`, FormatInformation degrades node health + adds a
+    `Config sync: failing (<reason>)` line. Diagnostic only — not a failover
+    gate. Parent-RED verified (raise + reconcile-survival). Does NOT touch the
+    netlink migration (PR-2/PR-3).
+  **File(s)**: pkg/cluster/manager.go, pkg/cluster/readiness.go,
+    pkg/cluster/sync.go, pkg/cluster/sync_conn_config.go, pkg/cluster/status.go,
+    pkg/cluster/sync_config_health_6387_test.go, pkg/daemon/daemon_ha_sync.go,
+    docs/sync-protocol.md, docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6387 PR-1 (PR #6398) MERGE-NEEDS-MAJOR fixes — config-sync
+    apply-failure CF monitor-failure. BUG 1: raise now driven by an independent
+    grace-expiry timer armed on the first failure (armConfigApplyGraceTimerLocked
+    → time.AfterFunc, afterFuncFn test seam) so a stable connection with one
+    persistent apply failure raises CF with no second delivery; on-edge check
+    fixed to strictly-greater (> grace); epoch-guard + configApplyMu protect the
+    cancelled-but-already-firing race; timer stopped on Stop(). BUG 2:
+    noteConfigApplySuccess clears CF UNCONDITIONALLY (idempotent) so a fresh
+    SessionSync after a comms restart clears a CF the prior instance raised on
+    the shared Manager. Rewrote raise test (timer-driven, no 2nd delivery), added
+    comms-restart clear test + timer-cancel/no-flap+goroutine-leak assertions;
+    parent-RED verified for both fixes.
+  **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
+    pkg/cluster/sync_conn_config.go, pkg/cluster/sync_config_health_6387_test.go,
+    docs/sync-protocol.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6387 PR-1 (PR #6398) review fix — callback-reorder race in the
+    config-sync CF monitor-failure signal. Both hostile reviewers (Codex +
+    independent) converged on the same defect: OnConfigApplyHealth was delivered
+    OUTSIDE configApplyMu in the timer-raise (fireConfigApplyGraceExpiry) and the
+    success-clear (noteConfigApplySuccess) paths, so a timer raise callback
+    preempted between deciding-to-raise and delivering could land AFTER a
+    concurrent success cleared CF — leaving the Manager stuck
+    configSyncFailing=true after a successful apply (the epoch guard only covers
+    decision-time staleness, not the two out-of-lock deliveries). Fix: deliver
+    every OnConfigApplyHealth publish (timer raise, on-edge raise, success clear)
+    WHILE STILL HOLDING configApplyMu, serializing raise vs clear. Verified the
+    fixed lock order configApplyMu → m.mu (SetConfigSyncHealth is a cheap
+    two-field setter, no callback) has no inverse — nothing takes m.mu then a
+    configApplyMu path. Added TestConfigSyncHealthRaiseClearReorderSerialized
+    (forces the hostile interleave deterministically via the callback as the
+    seam); parent-RED verified (reverting to out-of-lock delivery → RED with the
+    stuck-CF assertion). pkg/cluster/... -race clean, pkg/daemon clean.
+    pkg/dataplane/userspace event-stream failures are PRE-EXISTING on
+    origin/master (verified in a detached worktree), unrelated to this change.
+  **File(s)**: pkg/cluster/sync_conn_config.go,
+    pkg/cluster/sync_config_health_6387_test.go, docs/sync-protocol.md, _Log.md
   **Action**: #6395 — bound the shutdown session-aggregation final-flush join so
     a stalled syslog sink cannot delay the HA takeover fence. `stopAggregator`
     (pkg/daemon/daemon_system.go) previously did `cancel(); d.aggWg.Wait()` — an
