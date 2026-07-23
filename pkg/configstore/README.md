@@ -110,19 +110,32 @@ inline archive-site passwords).
   `CommitCheck`, `CommitConfirmed`, `Rollback`, `ListHistory`,
   `EnterConfigure`, `EnterConfigureSession`,
   `EnterConfigureExclusive`, `ExitConfigure`, `SyncApply`,
-  `MarkActiveApplied`, `ActiveApplied`. (See
+  `MarkActiveApplied`, `ActiveApplied`, `ActiveDigest`,
+  `MarkAppliedDigest`. (See
   `store.go` for the full surface — there's no shorthand
   `Candidate()` or `History()`; use the `Show*` / `List*` forms.)
-- `MarkActiveApplied` / `ActiveApplied` — the #4957 applied-config marker.
+- `MarkActiveApplied` / `MarkAppliedDigest` / `ActiveApplied` / `ActiveDigest` —
+  the #4957 applied-config marker (+ the #6296 capture/replay pair).
   `SyncApply` (and `Commit`/`Load`) promote `s.active` BEFORE the daemon runs
   the apply and, under the #1799 degrade-not-fail doctrine, do NOT roll it back
   on an apply failure — so a config can be the active tree yet never have
-  converged on the dataplane. The daemon calls `MarkActiveApplied` after a
+  converged on the dataplane. The daemon stamps the marker after a
   fully-successful `applyConfigLocked` (boot, commit, config-sync); `ActiveApplied`
   reports whether the CURRENT active text matches that last-applied digest.
   `pkg/daemon` `handleConfigSync` ANDs its active-text convergence shortcut with
   `ActiveApplied()` so a promoted-but-unapplied synced config is not treated as
-  converged (the HA config high-water then stays pinned until a retry lands). The
+  converged (the HA config high-water then stays pinned until a retry lands).
+  Two ways to stamp: `MarkActiveApplied` re-reads `s.active` at call time (the
+  boot/commit paths use it while holding the apply semaphore, when active is
+  stable); `MarkAppliedDigest` stamps a digest the caller CAPTURED earlier via
+  `ActiveDigest`, for the exact config it applied. The config-sync receive path
+  (`daemon.syncAndApply`) uses the capture/replay pair (#6296): it captures the
+  digest right after `SyncApply` promotes the peer config and replays it on full
+  success, both under the apply semaphore — so a concurrent secondary-side
+  promoter (a local commit / commit-confirmed rollback) mutating `s.active` in
+  what used to be a post-semaphore-release window can no longer make the marker
+  key a different, never-applied tree. `ActiveDigest` returns exactly the value
+  `ActiveApplied` compares against (`configTextDigest(s.active.Format())`). The
   marker is keyed on config text, so a stale value can only cause an idempotent
   re-apply, never a false convergence.
 - `MaxConfigSize` (16 MiB) + `checkConfigSize` — `store.go`. The

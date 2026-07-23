@@ -57547,3 +57547,26 @@ top.
 - **File(s)**: pkg/daemon/daemon_reth.go,
     pkg/daemon/daemon_apply_dataplane.go,
     pkg/daemon/reth_unit_vlanid_5107_test.go
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6296 — stamp the config-sync applied marker INSIDE syncAndApply
+    under applySem, keyed to a digest captured for the config it applied, rather
+    than in handleConfigSync AFTER applySem release keyed to a re-read of
+    s.active. Closes the MINOR TOCTOU where a concurrent secondary-side promoter
+    (local commit / commit-confirmed rollback) mutating s.active in the release
+    window could make the marker key the wrong, never-applied active digest ->
+    false convergence on a later re-push. Added configstore.ActiveDigest (returns
+    configTextDigest(s.active.Format()), the ActiveApplied space) + MarkAppliedDigest
+    (stamps a caller-captured digest; empty = no-op). syncAndApply captures the
+    digest right after SyncApply and replays it in the armedActive deferred only
+    on retErr==nil (preserving the prior full-success gate). Removed the
+    post-release MarkActiveApplied in handleConfigSync. Fail-on-revert: daemon
+    test drives handleConfigSync with an injected promoter mutating s.active->cfgB
+    inside applyBodyForTest and asserts the marker keys the applied cfgA (RED when
+    reverted to post-release s.active stamp); store test binds the capture/replay
+    pair + empty no-op. Docs updated (configstore README, sync-protocol.md).
+- **File(s)**: pkg/configstore/store.go,
+    pkg/configstore/applied_digest_6296_test.go,
+    pkg/daemon/daemon_apply_commit.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/daemon/configsync_markapplied_6296_test.go,
+    pkg/configstore/README.md, docs/sync-protocol.md
