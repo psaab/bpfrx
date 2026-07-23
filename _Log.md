@@ -58293,3 +58293,117 @@ top.
     pkg/grpcapi/server_sessions.go,
     pkg/grpcapi/pagination_canonical_5649_test.go, cmd/cli/main.go,
     cmd/cli/confirm_pending_bounded_5649_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Triage cohort #5328 (codex-178 low-materiality + test-coverage
+    survivors). Verified all 15 sub-items firsthand against origin/master
+    (f5a3da609); fixed the real+independent+low-risk Go-scope survivors in one
+    PR, each with a fail-on-revert test (neutralize → clean assertion RED,
+    verified). FIXED:
+    - **A7-b2-F10** (pkg/daemon/rss_indirection.go): indirectionTableMatches
+      accepted a SUBSET-of-active-queues table (e.g. pinned to queue 0 with 4
+      workers) as converged, so applyRSSIndirectionOne skipped the ethtool -X
+      weight reprogram and left workers 1..3 idle. Now require full active-queue
+      coverage (every 0..active-1 must appear).
+    - **A8-b1-F6** (pkg/api/nat.go): REST interface-mode source-NAT usage counted
+      only IPv4 sessions (IterateSessions); added the IPv6 pass
+      (IterateSessionsV6) reusing the same admission lease + zone map, restoring
+      gRPC/CLI dual-stack parity.
+    - **A8-b2-F6** (pkg/grpcapi/server_show_dhcp_lldp_snmp.go): the DHCPv6 lease
+      table header said "DUID" while rendering l.HWAddress (link-layer addr, not
+      the client DUID) in BOTH showDHCPServer and showDHCPServerDetail. Relabeled
+      to "HWAddress", matching the pkg/cli #4908 fix the remote renderer missed.
+      (The error-swallow half of this finding was already fixed by #5938's
+      GetLeasesWithSource4/6 + degraded banners.)
+    - **A10-b1-F4** (cmd/cli/show_security.go): `show security statistics detail`
+      read the supplemental buffers ShowText error only inside the success
+      predicate and returned nil, silently omitting the buffer section on a
+      degraded read. Now propagate the error (parity with the base
+      GetGlobalStats error).
+    - **A10-b2-F5** (pkg/cli/cli.go, cli_show_system.go, pkg/daemon/daemon_run.go):
+      `show system services` printed hardcoded 127.0.0.1:50051 / :8080
+      "(always on)" regardless of --api-addr/--grpc-addr or an HTTP-disabled
+      daemon. Added SetServiceListeners (daemon-wired at bring-up) so the show
+      reports the effective listener state / "disabled"; an unwired CLI keeps
+      the legacy display (bit-identical).
+    - **A6-b3-F3** (pkg/dataplane/watchdog_test.go, test-hygiene): replaced the
+      vacuous `var dp DataPlane; _ = dp` compliance test with a real
+      through-interface behavioral assertion (map-not-found via a DataPlane
+      value). Interface membership is additionally compile-enforced by the real
+      consumer apply.go:311.
+    DISPOSITIONED (no code change):
+    - **A3-b1-F2** (pkg/appid/runtime.go resolveTupleFallback O(M×N)):
+      efficiency-only, off the packet path, no correctness/parity impact and no
+      clean behavioral fail-on-revert test — left as a known low-value
+      optimization.
+    - **A5-b1-F7** (pkg/vrrp/manager.go Status data race): ALREADY-FIXED by #5718
+      — Status now snapshots vi.cfg.Priority/Preempt/AdvertiseInterval/VIPs under
+      vi.mu.RLock (manager.go:1030-1035). HA-touching but already resolved (no
+      smoke needed).
+    - **A6-b1-F4** (pkg/dataplane/userspace/control.go negative selectors):
+      ALREADY-FIXED by #5449/#4894 — ParseQueueCommand/ParseBindingCommand route
+      through parseQueueID/parseBindingSlot which bounds-check.
+    - **A6-b2-F4** (pkg/dataplane/userspace/manager_overlay.go scheduler
+      co-publish): REAL but dataplane-publish-coupled and NOT low-risk (fail-
+      closed hybrid-ACK snapshot semantics) → DEFER to dataplane owner.
+    - Rust/dataplane items A1-b2-F3, A1-b5-F1, A1-b6-F2, A1-b6-F3, A10-b5-F1
+      (xsk-repro) → DEFER to dataplane owner (out of Go scope).
+    No HA/cluster/vrrp/failover code touched (A5-b1-F7 was already-fixed).
+    build+vet+gofmt clean; full go test ./pkg/daemon ./pkg/api ./pkg/grpcapi
+    ./cmd/cli ./pkg/cli ./pkg/dataplane GREEN.
+  - **File(s)**: pkg/daemon/rss_indirection.go,
+    pkg/daemon/rss_indirection_test.go, pkg/api/nat.go, pkg/api/nat_stats_test.go,
+    pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+    pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go,
+    cmd/cli/show_security.go, cmd/cli/show_security_buffers_error_5328_test.go,
+    pkg/cli/cli.go, pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_services_listeners_5328_test.go,
+    pkg/daemon/daemon_run.go, pkg/dataplane/watchdog_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Revise PR #6384 (fix/5328-codex178) per hostile review — DROP
+    the materially-incomplete A10-b2-F5 fix + re-file it, and fold three minor
+    findings. Left the other five fixes (A7-b2-F10 RSS coverage, A8-b1-F6 v6
+    SNAT count, A8-b2-F6 DHCP HWAddress label, A10-b1-F4 buffers-error
+    propagation, A6-b3-F3 watchdog test) INTACT.
+    DROPPED (reverted to origin/master, no residue):
+    - **A10-b2-F5** (`show system services` effective listeners): the fix
+      reported the REQUESTED d.opts.APIAddr/GRPCAddr, not the EFFECTIVE
+      post-bind address (HTTP is resolved/clamped/rebound/can-fail-to-bind via
+      resolveAPIBinds + the #4047/#5127 loopback clamp; gRPC can be clamped),
+      AND it patched only the LOCAL pkg/cli renderer while the remote `cli`
+      routes `show system services` through the HARDCODED gRPC renderer at
+      pkg/grpcapi/server_show_system.go:174 (50051/8080 always on), which the
+      fix did NOT touch — so it made local and remote disagree while still
+      being wrong. Reverted pkg/cli/cli.go (removed SetServiceListeners +
+      serviceListenersSet/apiAddr/grpcAddr fields), pkg/cli/cli_show_system.go
+      (restored the plain hardcoded legacy display), pkg/daemon/daemon_run.go
+      (removed the SetServiceListeners call); deleted
+      pkg/cli/cli_show_system_services_listeners_5328_test.go. Re-filed the
+      proper implementation (daemon-owned effective-listener snapshot routed
+      through BOTH renderers, `disabled` when off, end-to-end-wired test) as
+      #6385.
+    FOLDED (3 minors):
+    - **cmd/cli/show_security.go**: removed a DUPLICATED "#5328 (A10-b1-F4)"
+      comment block (the paragraph appeared twice); changed
+      `return fmt.Errorf("%v", err)` → `return err` to preserve the error
+      chain. Buffers-error test still GREEN (asserts err != nil).
+    - **pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go**: added
+      TestShowDHCPServerDetail_V6ColumnLabeledHWAddress_5328 covering the
+      DETAIL renderer (showDHCPServerDetail) — the prior test only exercised
+      the non-detail path, leaving the detail label change untested. Factored
+      the lease-manager setup into writeV6LeaseManager. Fail-on-revert
+      verified: reverting the detail DHCPv6 header to "DUID" → the new case
+      goes RED.
+    - **pkg/dataplane/watchdog_test.go**: renamed
+      TestUpdateHAWatchdog_InterfaceCompliance →
+      TestUpdateHAWatchdog_InterfaceCompliance_5328 for cohort traceability
+      (behavioral assertion unchanged).
+    build + go vet + gofmt -l clean; full go test ./pkg/daemon ./pkg/api
+    ./pkg/grpcapi ./cmd/cli ./pkg/cli ./pkg/dataplane GREEN.
+  - **File(s)**: cmd/cli/show_security.go, pkg/cli/cli.go,
+    pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_services_listeners_5328_test.go (deleted),
+    pkg/daemon/daemon_run.go,
+    pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go,
+    pkg/dataplane/watchdog_test.go, _Log.md
