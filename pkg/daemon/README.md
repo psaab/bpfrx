@@ -835,23 +835,40 @@ never lock an operator out of a remote box it manages.
   runtime HA controller under one daemon-owned deadline. Controller
   implementations may have their own RPC deadlines, but daemon shutdown does
   not wait past the outer deadline for those calls to return.
-  **Netlink installer migration (#6387, in progress).** PR-2 added an
-  ADDITIVE `pkg/nftables` netlink `Installer` (no `nft` binary) that renders
-  the host-inbound / lo0 / fence rulesets bit-for-bit equivalent to the
-  `build*Payload` text these functions emit, plus a non-skippable kernel
-  ruleset-parity CI (`daemon_nft_netlink_parity_test.go`) that diffs the
-  oracle `nft -f -` dump vs the netlink dump in a private netns. The daemon
-  still shells to `nft` here — the `build*Payload` builders are retained as
-  the parity ORACLE. PR-3 will replace the `nftApplyPayload` / `nftDeleteTable`
-  seams with the netlink `Installer` and port the 14 fail-closed tests onto
-  it. Do not delete the `build*Payload` builders while the parity CI depends
-  on them.
+  **Netlink installer migration (#6387, COMPLETE).** PR-2 added an ADDITIVE
+  `pkg/nftables` netlink `Installer` (no `nft` binary) that renders the
+  host-inbound / lo0 / fence rulesets bit-for-bit equivalent to the
+  `build*Payload` text, plus a non-skippable kernel ruleset-parity CI
+  (`daemon_nft_netlink_parity_test.go`) that diffs the oracle `nft -f -` dump
+  vs the netlink dump in a private netns. **PR-3 (the CUTOVER) is done:**
+  production now installs and tears down every host-inbound / lo0 /
+  cold-boot-fence / gap-fence table through the netlink `nftInstaller` seam
+  (`daemon_nft_netlink.go`), so a node needs only the kernel `nf_tables`
+  MODULE — never the `nft` BINARY (the #6387 fw1 config-sync trap). The
+  daemon dpuserspace views / junos-host programs / lo0 terms are copied into
+  the `pkg/nftables` input specs by the promoted converters (`toNft*` in
+  `daemon_nft_netlink.go`). The 14+ fail-closed regression tests inject an
+  install/teardown failure through the single `fakeNftInstaller` seam
+  (replacing the pre-PR-3 `nftApplyPayload` / `nftDeleteTable` stubs); a
+  netlink install failure still returns its error into the `errors.Join`
+  fail-closed tail (invariant H7), a failed teardown still keeps
+  `hostInboundEnforced` (#5790), and the cold-boot / coverage-gap fences still
+  install fail-closed (#5644/#5789). When the netlink install fails because the
+  kernel `nf_tables` subsystem is UNAVAILABLE, the returned error is tagged
+  `xnft.ErrNFTablesUnavailable` (a one-time distinct operator log +
+  Config-Sync `CF` monitor-failure reason, §12.5) without ever downgrading
+  fail-closed. The `nftApplyPayload` / `nftDeleteTable` package vars and the
+  `build*Payload` text builders are RETAINED as the parity-CI ORACLE (and the
+  `TestNftDeleteTable*IdempotentAddDelete` payload-shape tests) — do NOT delete
+  them while the parity CI depends on them; production no longer calls them.
 
 - lo0 input filters (`interfaces lo0 unit 0 family inet[6] filter input
   <name>`) lock down host-bound/control-plane traffic via an nftables table
-  `inet xpf_lo0`. `daemon_nft.go:applyLo0Filter` builds the table with
-  `buildLo0FilterPayload` and feeds it to `nft -f -` (via the `nftApplyPayload`
-  seam). nft parses an `-f -` payload **atomically** — a syntax error on any
+  `inet xpf_lo0`. `daemon_nft.go:applyLo0Filter` installs the table via the
+  netlink `nftInstaller` (`toNftLo0Spec` → `InstallLo0`) since #6387 PR-3; the
+  `buildLo0FilterPayload` text below is now the parity-CI ORACLE (the netlink
+  build is proven bit-equivalent to it), not the production path. nft parses an
+  `-f -` payload **atomically** — a syntax error on any
   line rejects the ENTIRE payload (the kernel keeps the PREVIOUS table
   untouched, not a half-applied ruleset). The payload MUST therefore reset the
   prior table with the valid atomic idiom: `table inet xpf_lo0`
@@ -882,10 +899,10 @@ never lock an operator out of a remote box it manages.
   `applyConfigLocked` joins it (`lo0Err`) into the commit result alongside
   `networkdErr`/`dhcpServerErr`/`hostInboundErr`, so a committed lo0 filter that
   did not reach the kernel reports commit FAILURE rather than silent success.
-  The teardown (no filter bound) uses the idempotent `add table; delete table`
-  payload via `nftDeleteTable` (universal verbs — NOT the unpinned `nft
-  destroy`), so the benign absent-table case is a no-op while a genuine teardown
-  failure (stale filter left in the kernel) still surfaces. Boot / DHCP
+  The teardown (no filter bound) calls the netlink `nftInstaller.DeleteTable`
+  (#6387 PR-3), which lists-then-deletes: the benign absent-table case is a
+  no-op (nil), while a genuine teardown failure (stale filter left in the
+  kernel) still surfaces fail-closed. Boot / DHCP
   re-applies go through `applyConfig`, which only LOGS the error, so a transient
   nft failure cannot brick startup; the next clean commit re-renders. Tests:
   `lo0_filter_test.go` (apply/teardown failure-surfaced fail-on-revert,

@@ -2,10 +2,10 @@ package daemon
 
 import (
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 )
 
 // #5790: a SUCCESSFUL no-enforcement teardown of the xpf_hostinbound table must
@@ -27,15 +27,14 @@ import (
 // assertion goes RED, AND the failed reinstall skips the fence (fencePayload stays
 // empty) — a second RED that pins the fail-open the issue describes.
 func TestHostInboundTeardownClearsEnforcedThenFailedReinstallFences_5790(t *testing.T) {
-	origApply := nftApplyPayload
-	origDelete := nftDeleteTable
-	defer func() { nftApplyPayload = origApply; nftDeleteTable = origDelete }()
+	orig := nftInstaller
+	defer func() { nftInstaller = orig }()
 
 	enforceable := hostInboundTestConfig()
 	d := &Daemon{}
 
 	// --- Step 1: enforceable config, real install succeeds -> flag TRUE. ---
-	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftInstaller = &fakeNftInstaller{} // all succeed
 	if err := d.applyHostInboundFilter(enforceable); err != nil {
 		t.Fatalf("step 1 (install) apply: %v", err)
 	}
@@ -45,23 +44,25 @@ func TestHostInboundTeardownClearsEnforcedThenFailedReinstallFences_5790(t *test
 
 	// --- Step 2: non-enforceable config -> table teardown succeeds -> flag FALSE. ---
 	// The teardown deletes BOTH the main and the additive gap table (#5789), so
-	// accept either target and record which were removed.
+	// accept either target and record which were removed. No install op may run.
 	deleted := map[string]bool{}
-	nftDeleteTable = func(family, name string) ([]byte, error) {
-		if family != "inet" || (name != "xpf_hostinbound" && name != "xpf_hostinbound_gap") {
-			t.Fatalf("step 2: unexpected delete target %q %q", family, name)
-		}
-		deleted[name] = true
-		return nil, nil // teardown succeeds
-	}
-	nftApplyPayload = func(payload string) ([]byte, error) {
-		t.Fatalf("step 2: the no-enforcement teardown path must not apply an nft payload:\n%s", payload)
-		return nil, nil
+	nftInstaller = &fakeNftInstaller{
+		del: func(name string) error {
+			if name != xnft.HostInboundTableName && name != xnft.HostInboundGapTableName {
+				t.Fatalf("step 2: unexpected delete target %q", name)
+			}
+			deleted[name] = true
+			return nil // teardown succeeds
+		},
+		hostInbound: func(xnft.HostInboundSpec) error {
+			t.Fatal("step 2: the no-enforcement teardown path must not install a host-inbound table")
+			return nil
+		},
 	}
 	if err := d.applyHostInboundFilter(&config.Config{}); err != nil {
 		t.Fatalf("step 2 (teardown) apply: %v", err)
 	}
-	if !deleted["xpf_hostinbound"] {
+	if !deleted[xnft.HostInboundTableName] {
 		t.Fatalf("step 2: teardown must delete the main xpf_hostinbound table, deleted=%v", deleted)
 	}
 	if d.hostInboundEnforced.Load() {
@@ -70,47 +71,41 @@ func TestHostInboundTeardownClearsEnforcedThenFailedReinstallFences_5790(t *test
 	}
 
 	// --- Step 3: enforceable again, real install FAILS -> cold-boot fence path. ---
-	injected := errors.New("nft: reinstall real load failed")
-	var payloads []string
-	var fencePayload string
-	nftApplyPayload = func(payload string) ([]byte, error) {
-		payloads = append(payloads, payload)
-		if realHostInboundPayload(payload) {
-			return []byte("Error: could not process rule\n"), injected
-		}
-		fencePayload = payload // the fence loads
-		return nil, nil
-	}
-	nftDeleteTable = func(string, string) ([]byte, error) {
-		t.Fatal("step 3: an enforceable generation must not tear down the table")
-		return nil, nil
+	injected := errors.New("nftables: reinstall real load failed")
+	var realCalls, fenceCalls int
+	var fenceSpec xnft.FenceSpec
+	nftInstaller = &fakeNftInstaller{
+		hostInbound: func(xnft.HostInboundSpec) error { realCalls++; return injected },
+		coldBootFence: func(spec xnft.FenceSpec) error {
+			fenceCalls++
+			fenceSpec = spec // the fence loads
+			return nil
+		},
+		del: func(string) error {
+			t.Fatal("step 3: an enforceable generation must not tear down the table")
+			return nil
+		},
 	}
 
 	err := d.applyHostInboundFilter(enforceable)
 	if err == nil || !errors.Is(err, injected) {
-		t.Fatalf("step 3: the failed reinstall must surface the nft error, got %v", err)
+		t.Fatalf("step 3: the failed reinstall must surface the netlink error, got %v", err)
 	}
-	if fencePayload == "" {
+	if fenceCalls != 1 {
 		t.Fatalf("step 3 (THE #5790 FAIL-OPEN): after the teardown cleared the flag, a failed real "+
-			"reinstall MUST take the cold-boot fence path; no fence was installed — the stale-true "+
-			"flag took the day-2 retention branch over a table that no longer exists. payloads:\n%v", payloads)
+			"reinstall MUST take the cold-boot fence path; installed %d fences — a stale-true flag "+
+			"would take the day-2 retention branch over a table that no longer exists", fenceCalls)
 	}
-	if len(payloads) != 2 {
-		t.Errorf("step 3: expected real + fence (2 nft applies), got %d:\n%v", len(payloads), payloads)
+	if realCalls != 1 {
+		t.Errorf("step 3: expected exactly one real install attempt, got %d", realCalls)
 	}
 	// The fence must DENY the enforced wan addresses (both families) — fail-closed.
-	for _, want := range []string{
-		"table inet xpf_hostinbound",
-		"ip daddr 172.16.50.8 drop",
-		"ip6 daddr 2001:db8:50::8 drop",
-	} {
-		if !strings.Contains(fencePayload, want) {
-			t.Errorf("step 3 fence missing %q\n---\n%s", want, fencePayload)
-		}
+	// A FenceSpec structurally carries no host-service accept.
+	if !sliceContains(fenceViewAddrs(fenceSpec, false), "172.16.50.8") {
+		t.Errorf("step 3 fence must fence the enforced wan v4 address 172.16.50.8:\n%+v", fenceSpec)
 	}
-	// The fence must NOT accept any host service (that would re-open the exposure).
-	if strings.Contains(fencePayload, "tcp dport 22 accept") {
-		t.Errorf("step 3 fence must not accept a host service (fail-open):\n%s", fencePayload)
+	if !sliceContains(fenceViewAddrs(fenceSpec, true), "2001:db8:50::8") {
+		t.Errorf("step 3 fence must fence the enforced wan v6 address 2001:db8:50::8:\n%+v", fenceSpec)
 	}
 	// The fence established enforcement (address-scoped DROP) -> flag true again.
 	if !d.hostInboundEnforced.Load() {
@@ -125,12 +120,11 @@ func TestHostInboundTeardownClearsEnforcedThenFailedReinstallFences_5790(t *test
 // over (or fail-open relative to) a live table. Moving the Store(false) out of the
 // success-only path makes this RED.
 func TestHostInboundTeardownFailureKeepsEnforced_5790(t *testing.T) {
-	origApply := nftApplyPayload
-	origDelete := nftDeleteTable
-	defer func() { nftApplyPayload = origApply; nftDeleteTable = origDelete }()
+	orig := nftInstaller
+	defer func() { nftInstaller = orig }()
 
 	// Establish enforcement (flag true).
-	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftInstaller = &fakeNftInstaller{} // all succeed
 	d := &Daemon{}
 	if err := d.applyHostInboundFilter(hostInboundTestConfig()); err != nil {
 		t.Fatalf("setup install: %v", err)
@@ -140,9 +134,9 @@ func TestHostInboundTeardownFailureKeepsEnforced_5790(t *testing.T) {
 	}
 
 	// Non-enforceable config, but the teardown FAILS.
-	injected := errors.New("nft: delete table failed")
-	nftDeleteTable = func(string, string) ([]byte, error) {
-		return []byte("Error: table busy\n"), injected
+	injected := errors.New("nftables: delete table failed")
+	nftInstaller = &fakeNftInstaller{
+		del: func(string) error { return injected },
 	}
 	err := d.applyHostInboundFilter(&config.Config{})
 	if err == nil || !errors.Is(err, injected) {

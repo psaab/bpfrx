@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 )
 
 // nftRule renders a term to its single nft rule line, asserting the term lowers
@@ -163,30 +164,32 @@ func TestLo0FilterPayloadNftParses(t *testing.T) {
 func TestLo0FilterApplyFailureSurfaced(t *testing.T) {
 	cfg := lo0FilterTestConfig()
 
-	injected := errors.New("nft: lo0 rule load failed")
+	injected := errors.New("nftables: lo0 rule load failed")
 	var called bool
-	orig := nftApplyPayload
-	nftApplyPayload = func(payload string) ([]byte, error) {
-		called = true
-		// Sanity: the payload fed to nft must be the lo0 filter ruleset, so a
-		// failure here is a real filter-not-installed event.
-		if !strings.Contains(payload, "table inet xpf_lo0") {
-			t.Errorf("apply seam got unexpected payload:\n%s", payload)
-		}
-		return []byte("Error: could not process rule\n"), injected
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{
+		lo0: func(spec xnft.Lo0FilterSpec) error {
+			called = true
+			// Sanity: the spec fed to the installer must carry the configured lo0
+			// terms, so a failure here is a real filter-not-installed event.
+			if len(spec.V4Terms) == 0 && len(spec.V6Terms) == 0 {
+				t.Errorf("lo0 install seam got a spec with no terms: %+v", spec)
+			}
+			return injected
+		},
 	}
-	defer func() { nftApplyPayload = orig }()
+	defer func() { nftInstaller = orig }()
 
 	d := &Daemon{}
 	err := d.applyLo0Filter(cfg)
 	if !called {
-		t.Fatal("expected nft apply seam to be invoked for a configured lo0 filter")
+		t.Fatal("expected the netlink install seam to be invoked for a configured lo0 filter")
 	}
 	if err == nil {
 		t.Fatal("apply failure must be surfaced as an error (fail-closed), got nil")
 	}
 	if !errors.Is(err, injected) {
-		t.Errorf("returned error must wrap the nft failure, got %v", err)
+		t.Errorf("returned error must wrap the netlink failure, got %v", err)
 	}
 }
 
@@ -201,25 +204,27 @@ func TestLo0FilterDeleteFailureSurfaced(t *testing.T) {
 	// A config with NO lo0 filter bound drives the teardown branch.
 	cfg := &config.Config{}
 
-	injected := errors.New("nft: device or resource busy")
-	var gotFamily, gotName string
-	orig := nftDeleteTable
-	nftDeleteTable = func(family, name string) ([]byte, error) {
-		gotFamily, gotName = family, name
-		return []byte("Error: Could not process rule\n"), injected
+	injected := errors.New("nftables: device or resource busy")
+	var gotName string
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{
+		del: func(name string) error {
+			gotName = name
+			return injected
+		},
 	}
-	defer func() { nftDeleteTable = orig }()
+	defer func() { nftInstaller = orig }()
 
 	d := &Daemon{}
 	err := d.applyLo0Filter(cfg)
-	if gotName != "xpf_lo0" || gotFamily != "inet" {
-		t.Errorf("teardown must target inet xpf_lo0, got %s %s", gotFamily, gotName)
+	if gotName != xnft.Lo0TableName {
+		t.Errorf("teardown must target inet xpf_lo0, got %s", gotName)
 	}
 	if err == nil {
 		t.Fatal("teardown failure must be surfaced as an error (fail-closed), got nil")
 	}
 	if !errors.Is(err, injected) {
-		t.Errorf("returned error must wrap the nft teardown failure, got %v", err)
+		t.Errorf("returned error must wrap the netlink teardown failure, got %v", err)
 	}
 }
 
@@ -227,10 +232,9 @@ func TestLo0FilterDeleteFailureSurfaced(t *testing.T) {
 // successful apply (configured filter) and a successful/benign teardown (no
 // filter bound) must NOT report a commit failure.
 func TestLo0FilterApplySuccessNoError(t *testing.T) {
-	origApply, origDelete := nftApplyPayload, nftDeleteTable
-	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
-	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
-	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{} // every op succeeds
+	defer func() { nftInstaller = orig }()
 
 	d := &Daemon{}
 	if err := d.applyLo0Filter(lo0FilterTestConfig()); err != nil {
