@@ -58953,3 +58953,31 @@ top.
     pkg/daemon/management.go, pkg/daemon/effective_listeners_6401_test.go,
     pkg/daemon/README.md, pkg/grpcapi/server.go,
     pkg/grpcapi/server_show_system_listeners_6385_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385/#6401 fold round 3 — FIX a shutdown DEADLOCK my round-2
+    serve-exit fold introduced (Codex MAJOR, reproduced firsthand). Lock-order
+    cycle: the HTTP leg's serve goroutine still holds its `wg` count when the
+    round-2 code acquired `lifeMu` to set `leg.dead` on an unexpected serve
+    exit; `Server.Wait()` holds `lifeMu` ACROSS `wg.Wait()` — so a serve-exit
+    racing a shutdown Wait hung permanently (Wait holds lifeMu waiting on the
+    goroutine's wg.Done; the goroutine waits on lifeMu before it can
+    return->Done). PATH TAKEN: atomic fix (bounded, low-risk) — `listenerLeg.dead`
+    is now an `atomic.Bool`; the serve goroutine `leg.dead.Store(true)` WITHOUT
+    lifeMu (breaks the cycle); `EffectiveHTTPAddr()` reads `httpLeg`/`ln` under
+    lifeMu (swapped only under lifeMu) but the dead flag via `dead.Load()`.
+    Requested-shutdown paths (stopCh/rootCtx) unchanged. NEW test
+    (pkg/api/serve_exit_wait_deadlock_6401_test.go)
+    TestServeExitDoesNotDeadlockConcurrentWait_6401: launches Wait() concurrently
+    (holds lifeMu in wg.Wait while the leg is parked at Accept via an in-memory
+    erroring listener — NO real socket), then triggers the unexpected serve-exit;
+    asserts Wait returns within 3s (no deadlock) AND the leg ends dead
+    (EffectiveHTTPAddr==""). RED verified FIRSTHAND: reintroducing the
+    lifeMu-guarded marking hangs Wait -> clean t.Fatal at 3s (bounded, not a
+    suite hang); restored -> GREEN at 0.10s. gofmt/vet clean; `go test
+    ./pkg/sysservices/ ./pkg/api/ ./pkg/grpcapi/ ./pkg/cli/ ./pkg/daemon/`
+    GREEN; `-race` GREEN on the FULL pkg/api suite + listener/deadlock tests +
+    mgmt reconcile. docs: pkg/api/README.md EffectiveHTTPAddr note explains the
+    atomic (lock-free) marking + the lock-ordering rationale.
+  - **File(s)**: pkg/api/listener.go, pkg/api/README.md,
+    pkg/api/serve_exit_wait_deadlock_6401_test.go, _Log.md

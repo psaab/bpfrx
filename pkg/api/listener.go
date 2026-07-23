@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,13 +22,19 @@ type listenerLeg struct {
 	ln       net.Listener
 	stopCh   chan struct{}
 	stopOnce sync.Once
-	// dead is set (under lifeMu) when the leg's serve loop exits UNEXPECTEDLY —
-	// the listener terminated on its own, not via a requested shutdown
-	// (stopLegLocked / rootCtx). EffectiveHTTPAddr treats a dead leg as
-	// not-serving so `show system services` reports the HTTP listener Failed
-	// rather than Listening on a dead socket, symmetric with the gRPC serve-exit
-	// clear (#6401).
-	dead bool
+	// dead is set when the leg's serve loop exits UNEXPECTEDLY — the listener
+	// terminated on its own, not via a requested shutdown (stopLegLocked /
+	// rootCtx). EffectiveHTTPAddr treats a dead leg as not-serving so `show
+	// system services` reports the HTTP listener Failed rather than Listening on
+	// a dead socket, symmetric with the gRPC serve-exit clear (#6401).
+	//
+	// It is an atomic (NOT lifeMu-guarded): the serve goroutine still holds its
+	// wg count when it sets this on exit, and Server.Wait holds lifeMu ACROSS
+	// wg.Wait — so if the marker needed lifeMu, an exit racing a shutdown Wait
+	// would deadlock (Wait holds lifeMu waiting on the goroutine's wg.Done; the
+	// goroutine waits on lifeMu before it can return -> Done). Storing atomically
+	// with no lock breaks that lock-ordering cycle (#6401 round-3 fix).
+	dead atomic.Bool
 }
 
 // serveLegLocked launches srv on ln in a background goroutine registered on the
@@ -66,16 +73,16 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool) *
 				slog.Error("API listener terminated unexpectedly", "addr", srv.Addr, "tls", isTLS, "err", err)
 			}
 			// #6401: an UNEXPECTED serve exit means this leg is no longer
-			// serving. Mark it dead (under lifeMu, freshly acquired — this
-			// runs AFTER serveLegLocked returned and released the caller's
-			// lock, so no nesting) so EffectiveHTTPAddr stops reporting the
-			// dead listener's address and `show system services` renders the
-			// HTTP listener Failed, mirroring the gRPC serve-exit clear. A leg
-			// already retired/replaced by a reconcile takes the stopCh path
-			// below instead, so this only fires on a genuine self-termination.
-			s.lifeMu.Lock()
-			leg.dead = true
-			s.lifeMu.Unlock()
+			// serving. Mark it dead ATOMICALLY — NOT under lifeMu: the goroutine
+			// still holds its wg count here, and Server.Wait holds lifeMu across
+			// wg.Wait, so acquiring lifeMu here would deadlock a shutdown that
+			// raced this exit (round-3 fix). EffectiveHTTPAddr then stops
+			// reporting the dead listener's address and `show system services`
+			// renders the HTTP listener Failed, mirroring the gRPC serve-exit
+			// clear. A leg already retired/replaced by a reconcile takes the
+			// stopCh path below instead, so this only fires on a genuine
+			// self-termination.
+			leg.dead.Store(true)
 			return
 		case <-leg.stopCh:
 		case <-rootDone:
@@ -151,7 +158,10 @@ func (s *Server) Wait() {
 func (s *Server) EffectiveHTTPAddr() string {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()
-	if s.httpLeg == nil || s.httpLeg.ln == nil || s.httpLeg.dead {
+	// httpLeg / ln are swapped only under lifeMu, so read them here; dead is
+	// atomic (set without lifeMu by the serve goroutine to avoid a shutdown
+	// lock-ordering deadlock — see listenerLeg.dead).
+	if s.httpLeg == nil || s.httpLeg.ln == nil || s.httpLeg.dead.Load() {
 		return ""
 	}
 	return s.httpLeg.ln.Addr().String()
