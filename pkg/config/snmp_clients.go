@@ -95,9 +95,17 @@ func (c *SNMPCommunity) AllowsSource(srcIP net.IP) bool {
 		if !cn.net.Contains(srcIP) {
 			continue
 		}
-		if cn.ones > bestBits {
+		switch {
+		case cn.ones > bestBits:
 			bestBits = cn.ones
 			bestAllow = !cn.restrict
+		case cn.ones == bestBits && cn.restrict:
+			// Equal-length tie: deny wins (C179-049). A `restrict` entry at
+			// the same prefix length overrides an allow regardless of the
+			// insertion order the two self-contradictory prefixes appeared in
+			// — otherwise `10.0.0.0/24` before `10.0.0.0/24 restrict` would
+			// leak the allow, while the reverse order denied.
+			bestAllow = false
 		}
 	}
 	if bestBits < 0 {

@@ -58529,3 +58529,80 @@ top.
     pkg/daemon/daemon_run.go,
     pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go,
     pkg/dataplane/watchdog_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: Cohort #5523 (codex-179 low-materiality survivors) — fixed 3
+    real+independent+low-risk in-Go-scope commit-time validation bugs, each
+    with a firsthand-verified fail-on-revert test. No HA-touching code; no
+    smoke needed.
+    - **C179-046** (pkg/config/schema_security.go): `security log stream
+      <name> severity` validated against a truncated {error,warning,info}
+      enum, rejecting critical/notice/debug/emergency/alert/any/none at
+      commit — every one of which the runtime honors (daemon_system.go sets
+      MinSeverity = logging.ParseSeverity(stream.Severity)). Aliased
+      syslogSeverities to the shared junosSyslogSeverities SSOT already used
+      by the mirror `system syslog <facility> <severity>` leaf. Both severity
+      surfaces now share one SSOT. Tests: log_stream_severity_ssot_5523_test.go
+      (full-domain accepted + bogus still rejected).
+    - **C179-049** (pkg/config/snmp_clients.go): SNMPCommunity.AllowsSource
+      resolved an equal-length prefix tie by insertion order, so
+      `10.0.0.0/24` before `10.0.0.0/24 restrict` leaked an allow. Added a
+      deny-wins tie-break (restrict at equal length overrides allow in any
+      order). Longest-prefix ordering intact. Single decision surface (v2c;
+      v3 uses USM). Tests: snmp_clients_equal_len_tie_5523_test.go.
+    - **C179-042** (pkg/config/compiler_services.go + pkg/rpm/rpm.go): a
+      hostless http-get target (`http://`, `https://`, schemeless `:8080`)
+      passed the #2495 scheme gate but canonicalizes to an undialable URL —
+      the probe never runs and its permanent no-run is counted as path loss.
+      validateRPMHTTPGetSchemeStrict now rejects an empty effective host in
+      BOTH the scheme'd and schemeless forms (strict commit; lenient warn per
+      #1960). Mirrored the check in the runtime canonicalizeHTTPTarget so a
+      leniently-loaded config HOLDS at probe setup instead of miscounting path
+      loss. Scope-tight: a schemeless url.Parse failure (bare unbracketed
+      IPv6) stays lenient — only the empty host is newly rejected. Tests:
+      compiler_rpm_http_host_5523_test.go, pkg/rpm/http_host_5523_test.go.
+    Fail-on-revert firsthand-verified for all four edit sites (neutralize →
+    clean-assertion RED → restore). build + vet + gofmt clean; full go test
+    ./pkg/config ./pkg/rpm GREEN; go build ./... clean.
+  - **File(s)**: pkg/config/schema_security.go, pkg/config/snmp_clients.go,
+    pkg/config/compiler_services.go, pkg/rpm/rpm.go,
+    pkg/config/log_stream_severity_ssot_5523_test.go,
+    pkg/config/snmp_clients_equal_len_tie_5523_test.go,
+    pkg/config/compiler_rpm_http_host_5523_test.go,
+    pkg/rpm/http_host_5523_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: Cohort #5523 follow-on — folded C179-021 (a fourth clean,
+    single-surface, low-risk fix) into the same PR after triage-agent
+    verification of the batch-B/C survivors.
+    - **C179-021** (cmd/cli/show_flow.go): `show security flow session
+      limit <n>` parsed the limit with strconv.Atoi (64-bit); a value
+      exceeding int32 passed the `n < 1` guard and int32(n) wrapped
+      NEGATIVE, and the daemon clamps <= 0 to the default limit — so an
+      over-range request silently became the default. Switched to
+      strconv.ParseInt(v,10,32) so an out-of-range limit is rejected,
+      matching the sibling source-port/destination-port parsers in the
+      same function. Test: cmd/cli/show_flow_limit_int32_5523_test.go
+      (over-int32 rejected + MaxInt32 accepted). Fail-on-revert verified.
+    Remaining batch-B/C REAL survivors dispositioned (not folded): C179-114
+    (needs a routing stub for its test — deferred), C179-117 (needs a proto
+    change: GetSessionsResponse has no peer_status/peer_error field, only
+    fields 1-7 — the triage agent's "field 11 exists" was inaccurate, verified
+    firsthand), C179-026/033/034/044/048/112/113/118 and the daemon/routing/
+    snmp REALs (089/092/093/104/121/122/123) recommended for follow-up.
+    ALREADY-FIXED (cited): 022(#5328), 043, 097(#5328), 109(#5849), 124(#5283).
+    NOT-A-BUG: 057/058/059/075/085. MIS-BUCKETED: 128. HA-touching (defer,
+    need loss-cluster smoke): 065/073/074. Rust (dataplane owner): 001/002/
+    003/006/010/013/014/017/018/019/020/030/047.
+  - **File(s)**: cmd/cli/show_flow.go, cmd/cli/show_flow_limit_int32_5523_test.go,
+    _Log.md
+
+- **Timestamp**: 2026-07-23 (rev6390/Codex6390 review-fold)
+  - **Action**: Fold the two doc-comment staleness findings on #6390 (#5523):
+    SyslogStream.Severity comment (3→10 severities per the C179-046 SSOT alias)
+    and the daemon_snmp_reconcile.go clientsAllowlistHash order-significance
+    rationale (now deny-wins/order-independent per C179-049; document-order hash
+    retained as a conservative superset). Comment-only; no behavior change.
+    C179-021 (over-int32 flow-session limit) was added to the branch after the
+    reviewers ran and was parent-RED-verified firsthand.
+  - **File(s)**: pkg/config/types_security.go, pkg/daemon/daemon_snmp_reconcile.go
