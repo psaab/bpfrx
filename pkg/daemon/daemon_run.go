@@ -602,6 +602,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		shell := cli.New(d.store, cliDP, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)
+		// #5328 (A10-b2-F5): give `show system services` the daemon's effective
+		// management-listener addresses so a relocated/HTTP-disabled listener is
+		// reported honestly instead of a hardcoded 127.0.0.1:8080 (always on).
+		shell.SetServiceListeners(d.opts.APIAddr, d.opts.GRPCAddr)
 		shell.SetForwardingSampler(fwdSampler)
 		// #797 H2 / #846: route in-process CLI commits through the
 		// daemon's atomic commit+apply so they serialize against

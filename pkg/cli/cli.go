@@ -140,6 +140,18 @@ type CLI struct {
 	fabricPeerPort     int
 	peerSystemActionFn func(ctx context.Context, action string) (string, error)
 
+	// #5328 (A10-b2-F5): effective management-listener state for
+	// `show system services`. serviceListenersSet is false when the CLI is
+	// spawned OUTSIDE the daemon (offline recovery / unit test) — then the show
+	// falls back to the historical hardcoded default display (bit-identical to
+	// pre-#5328). The daemon wires the real --api-addr / --grpc-addr via
+	// SetServiceListeners so a relocated (off-loopback, #5127) or HTTP-disabled
+	// (apiAddr=="") listener is reported honestly instead of a fixed
+	// "127.0.0.1:8080 (always on)".
+	serviceListenersSet bool
+	apiAddr             string
+	grpcAddr            string
+
 	// Monitor security flow state (per-CLI-session).
 	monitorFlow *monitorFlowState
 
@@ -189,6 +201,18 @@ func (c *CLI) applyResult() *dataplane.ApplyResult {
 
 func (c *CLI) dataplaneLoaded() bool {
 	return c != nil && c.dp != nil && c.dp.IsLoaded()
+}
+
+// SetServiceListeners records the daemon's effective HTTP-REST (--api-addr;
+// empty = disabled) and gRPC (--grpc-addr) listener addresses so
+// `show system services` reports the real listener state rather than a
+// hardcoded 127.0.0.1:8080 / 127.0.0.1:50051 default. Called once at daemon
+// startup (#5328 A10-b2-F5). When never called (CLI spawned outside the
+// daemon) the show keeps its historical hardcoded display.
+func (c *CLI) SetServiceListeners(apiAddr, grpcAddr string) {
+	c.apiAddr = apiAddr
+	c.grpcAddr = grpcAddr
+	c.serviceListenersSet = true
 }
 
 // SetForwardingSampler wires the pkg/fwdstatus Sampler into the CLI

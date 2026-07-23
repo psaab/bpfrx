@@ -476,6 +476,43 @@ func TestIndirectionTableMatches_FalseWhenQueueOutOfRange(t *testing.T) {
 	}
 }
 
+// TestIndirectionTableMatches_FalseWhenActiveQueueMissing_5328 is the
+// #5328 (A7-b2-F10) RED-on-revert guard. 4 workers are configured (weights
+// [1,1,1,1,0,0] → active=4, so queues 0..3 must all be used), but the live
+// table only spreads onto queues 0..2 — queue 3 never appears. That is a
+// stale/driver-reset table that starves worker 3, so it must be reported as a
+// MISMATCH to force the ethtool -X weight reprogram, NOT accepted as converged.
+//
+// FAIL-ON-REVERT: drop the per-active-queue coverage check (return true once
+// every entry is < active) and every entry here is 0..2 < 4, so the subset
+// table falsely matches and this assertion goes RED.
+func TestIndirectionTableMatches_FalseWhenActiveQueueMissing_5328(t *testing.T) {
+	out := []byte(`RX flow hash indirection table for eth0 with 6 RX ring(s):
+    0:      0     1     2     0     1     2
+    8:      0     1     2     0     1     2
+RSS hash key:
+...
+`)
+	if indirectionTableMatches(out, []int{1, 1, 1, 1, 0, 0}) {
+		t.Fatal("table omits active queue 3: must not match (subset-coverage regression)")
+	}
+}
+
+// TestIndirectionTableMatches_FalseWhenPinnedToQueueZero_5328 covers the
+// extreme #5328 case the audit called out directly: a table using ONLY queue 0
+// while 4 workers are configured. Under the pre-fix `q >= active` check every
+// entry (0) passed, so the concentrated table was accepted and workers 1..3
+// stayed idle.
+func TestIndirectionTableMatches_FalseWhenPinnedToQueueZero_5328(t *testing.T) {
+	out := []byte(`RX flow hash indirection table for eth0 with 6 RX ring(s):
+    0:      0     0     0     0     0     0
+    8:      0     0     0     0     0     0
+`)
+	if indirectionTableMatches(out, []int{1, 1, 1, 1, 0, 0}) {
+		t.Fatal("table pinned to queue 0: must not match with 4 active queues")
+	}
+}
+
 // Codex H1: the allowlist must scope apply — mlx5 siblings not in the
 // userspace-dp binding list must never see an ethtool call. An mlx5 PF
 // unused by xpf must stay at its driver-default RSS regardless of its

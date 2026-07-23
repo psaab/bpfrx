@@ -550,14 +550,33 @@ func indirectionTableMatches(output []byte, weights []int) bool {
 	if !ok {
 		return false
 	}
+	if len(rows) == 0 {
+		return false
+	}
+	// Track which of the active queues actually appear. A queue index >=
+	// active (or negative) is an immediate mismatch (the table spreads onto
+	// a queue no worker owns); everything else marks coverage.
+	seen := make([]bool, active)
 	for _, row := range rows {
 		for _, q := range row.entries {
 			if q < 0 || q >= active {
 				return false
 			}
+			seen[q] = true
 		}
 	}
-	return len(rows) > 0
+	// #5328 (A7-b2-F10): a table that uses only a SUBSET of the active
+	// queues (e.g. a stale/driver-reset table pinned to queue 0 while N
+	// workers are configured) must NOT be treated as converged. Every
+	// active queue 0..active-1 must appear; otherwise applyRSSIndirectionOne
+	// would skip the `ethtool -X ... weight` reprogram and leave the workers
+	// bound to the absent queues idle (one queue/CPU overloaded).
+	for _, covered := range seen {
+		if !covered {
+			return false
+		}
+	}
+	return true
 }
 
 // isExecNotFound returns true if err indicates the ethtool binary is

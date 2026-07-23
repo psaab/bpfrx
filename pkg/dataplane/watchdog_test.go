@@ -18,8 +18,20 @@ func TestUpdateHAWatchdog_MapNotLoaded(t *testing.T) {
 }
 
 func TestUpdateHAWatchdog_InterfaceCompliance(t *testing.T) {
-	// Verify UpdateHAWatchdog is part of the DataPlane interface.
-	// This is a compile-time check; if it fails, the test won't compile.
-	var dp DataPlane
-	_ = dp
+	// #5328 (A6-b3-F3): the pre-fix body was `var dp DataPlane; _ = dp`, which
+	// asserted nothing about the method set — removing UpdateHAWatchdog from the
+	// DataPlane interface left this test green (a vacuous placeholder). Exercise
+	// the method THROUGH the interface with a runtime behavioral assertion
+	// instead: a *Manager with no loaded ha_watchdog map, dispatched via a
+	// DataPlane value, must return the map-not-found error. Interface membership
+	// itself is additionally compile-enforced by the real consumer that calls
+	// c.dp.UpdateHAWatchdog through the interface (apply.go).
+	var dp DataPlane = &Manager{maps: make(map[string]*ebpf.Map)}
+	err := dp.UpdateHAWatchdog(0, 12345)
+	if err == nil {
+		t.Fatal("expected an error dispatching UpdateHAWatchdog through DataPlane with no ha_watchdog map")
+	}
+	if err.Error() != "ha_watchdog map not found" {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }

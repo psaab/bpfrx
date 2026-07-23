@@ -314,6 +314,113 @@ func TestNATPoolStatsHandlerInterfaceModePerRuleSet(t *testing.T) {
 	}
 }
 
+// natIfaceSNATDualStackDP emits interface-mode SNAT sessions on BOTH families:
+// IPv4 forward SNAT on trust->wan, and IPv6 forward SNAT on trust->wan AND
+// guest->wan (plus a reverse and a non-SNAT v6 session that must NOT count).
+// It exercises the #5328 (A8-b1-F6) v6 attribution path.
+//
+// Zone IDs: trust=2, guest=4, wan=5.
+//   - 2 forward SNAT v4 trust(2)->wan(5)
+//   - 4 forward SNAT v6 trust(2)->wan(5)
+//   - 2 forward SNAT v6 guest(4)->wan(5)
+//   - 1 reverse SNAT v6 (excluded) + 1 forward non-SNAT v6 (excluded)
+type natIfaceSNATDualStackDP struct {
+	*dataplane.Manager
+	result *dataplane.ApplyResult
+}
+
+func (d *natIfaceSNATDualStackDP) IsLoaded() bool { return true }
+
+func (d *natIfaceSNATDualStackDP) LastApplyResult() *dataplane.ApplyResult {
+	return d.result.Clone()
+}
+
+func (d *natIfaceSNATDualStackDP) IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	emit := func(ingress, egress uint16, reverse uint8, flags uint16) {
+		fn(dataplane.SessionKey{Protocol: 6}, dataplane.SessionValue{
+			IsReverse:   reverse,
+			Flags:       flags,
+			IngressZone: ingress,
+			EgressZone:  egress,
+		})
+	}
+	// 2 forward SNAT v4 trust(2)->wan(5)
+	emit(2, 5, 0, dataplane.SessFlagSNAT)
+	emit(2, 5, 0, dataplane.SessFlagSNAT)
+	return nil
+}
+
+func (d *natIfaceSNATDualStackDP) IterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	emit := func(ingress, egress uint16, reverse uint8, flags uint16) {
+		fn(dataplane.SessionKeyV6{Protocol: 6}, dataplane.SessionValueV6{
+			IsReverse:   reverse,
+			Flags:       flags,
+			IngressZone: ingress,
+			EgressZone:  egress,
+		})
+	}
+	// 4 forward SNAT v6 trust(2)->wan(5)
+	emit(2, 5, 0, dataplane.SessFlagSNAT)
+	emit(2, 5, 0, dataplane.SessFlagSNAT)
+	emit(2, 5, 0, dataplane.SessFlagSNAT)
+	emit(2, 5, 0, dataplane.SessFlagSNAT)
+	// 2 forward SNAT v6 guest(4)->wan(5)
+	emit(4, 5, 0, dataplane.SessFlagSNAT)
+	emit(4, 5, 0, dataplane.SessFlagSNAT)
+	// reverse SNAT v6 (excluded) + forward non-SNAT v6 (excluded)
+	emit(5, 2, 1, dataplane.SessFlagSNAT)
+	emit(2, 5, 0, dataplane.SessFlagDNAT)
+	return nil
+}
+
+// TestNATPoolStatsHandlerInterfaceModeCountsV6_5328 is a FAIL-ON-REVERT guard
+// for #5328 (A8-b1-F6): interface-mode source-NAT usage must include IPv6
+// sessions, not just IPv4. trust->wan sees 2 v4 + 4 v6 = 6 forward SNAT
+// sessions; guest->wan sees 2 v6 forward SNAT sessions and NO v4.
+//
+// If the v6 IterateSessionsV6 pass is removed (the pre-fix v4-only tally),
+// trust->wan reports 2 and guest->wan reports 0 — both assertions go RED.
+func TestNATPoolStatsHandlerInterfaceModeCountsV6_5328(t *testing.T) {
+	dp := &natIfaceSNATDualStackDP{
+		Manager: dataplane.New(),
+		result: &dataplane.ApplyResult{
+			ZoneIDs: map[string]uint16{"trust": 2, "guest": 4, "wan": 5},
+		},
+	}
+	s := &Server{store: newIfaceNATStatsAPIStore(t), dp: dp}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/security/nat/source/pools", nil)
+	s.natPoolStatsHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Success bool               `json:"success"`
+		Data    []NATPoolStatsInfo `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("success = false; body: %s", rr.Body.String())
+	}
+
+	got := map[string]int{}
+	for _, p := range resp.Data {
+		if p.IsInterface {
+			got[p.Name] = p.UsedPorts
+		}
+	}
+	if got["trust->wan"] != 6 {
+		t.Errorf("trust->wan UsedPorts = %d, want 6 (2 v4 + 4 v6 forward SNAT); v6 sessions dropped?", got["trust->wan"])
+	}
+	if got["guest->wan"] != 2 {
+		t.Errorf("guest->wan UsedPorts = %d, want 2 (v6-only forward SNAT); v6 sessions dropped?", got["guest->wan"])
+	}
+}
+
 func TestNATRuleStatsHandlerReadsApplyResultOnce(t *testing.T) {
 	dp := &natApplyResultAPIDP{
 		Manager: dataplane.New(),
