@@ -341,6 +341,36 @@ type Query struct {
 	// closed on a nil state map (#3414), so a scheduled policy is treated as
 	// inactive exactly as the dataplane treats it rather than certified active.
 	PolicyInactiveFn func(schedulerName string) bool
+
+	// SrcFamily / DstFamily carry the COLON-STRICT address family ("v4"/"v6"/"")
+	// of the source/destination, derived by the caller from the RAW operator
+	// text before net.ParseIP folded it (#6377). net.ParseIP renders `192.0.2.1`
+	// and the IPv4-mapped literal `::ffff:192.0.2.1` as byte-identical 16-byte
+	// values whose .To4() is non-nil, so by the time Match sees q.SrcIP/q.DstIP
+	// the ':' that distinguishes a real IPv4 from a mapped IPv6 is gone. A caller
+	// populates these from config.NATAddrFamily on the original string (the SSOT
+	// colon-strict classifier that reproduces the Rust parsers,
+	// pkg/config/compiler_nat_helpers.go), so a source authored as
+	// `::ffff:192.0.2.1` yields "v6".
+	//
+	// The hint is consumed EVERYWHERE the family matters, so the simulator agrees
+	// with the colon-strict runtime (userspace-dp/src/policy.rs):
+	//
+	//   - the (V4 src, V6 dst) unsupported-tuple gate in Match (queryTupleFamily);
+	//   - the per-side address matcher matchAddr (its isV4 branch) — without the
+	//     hint a mapped-v6 source would fold to v4 and match the V4 address rules,
+	//     fabricating a permit the runtime never produces;
+	//   - the host-inbound classifier hostInboundAdmission (ipFamilyStrict), so a
+	//     mapped-v6 host-bound destination is classified ip6, not ip.
+	//
+	// Empty ("") means the caller supplied no hint — the net.IP-only callers,
+	// e.g. tests. Every consumer then falls back to the folding To4() heuristic
+	// for that side, preserving the pre-#6377 behavior. The hint never overrides
+	// the actual address bytes: address CONTAINMENT still uses q.SrcIP/q.DstIP;
+	// the family only selects which family's rules/tokens the side is tested
+	// against.
+	SrcFamily string
+	DstFamily string
 }
 
 // SelectorArgs is the parsed, VALIDATED result of a policy-simulator selector
@@ -572,12 +602,21 @@ func ParseSelectorArgs(args []string) (SelectorArgs, error) {
 // FeedOverlay and PolicyInactiveFn are left nil for the caller to populate.
 // An empty SrcIP/DstIP maps to a nil net.IP (the match-any wildcard); a
 // non-empty value is already net.ParseIP-validated by ParseSelectorArgs.
+//
+// #6377: the colon-strict family hint is derived from the RAW selector text
+// (s.SrcIP/s.DstIP), before net.ParseIP folds an IPv4-mapped IPv6 literal, so a
+// Query built here classifies the tuple family the same way the four operator
+// surfaces do. (No production surface currently routes through this helper — it
+// is a test/convenience builder — but keeping it colon-strict avoids seeding the
+// fold into any future caller.)
 func (s SelectorArgs) Query() Query {
 	return Query{
 		FromZone:         s.FromZone,
 		ToZone:           s.ToZone,
 		SrcIP:            net.ParseIP(s.SrcIP),
 		DstIP:            net.ParseIP(s.DstIP),
+		SrcFamily:        config.NATAddrFamily(s.SrcIP),
+		DstFamily:        config.NATAddrFamily(s.DstIP),
 		Protocol:         s.Protocol,
 		SrcPort:          s.SrcPort,
 		DstPort:          s.DstPort,
@@ -938,6 +977,29 @@ func (r Result) DisplayAction() string {
 // rather than a fabricated per-side verdict.
 const UnsupportedTupleFamilyActionString = "unsupported tuple: an IPv4 source with an IPv6 destination has no supported translation (NAT46 is not implemented), so the forwarding path never produces it and the runtime matcher fails closed — no simulated permit/deny/default verdict applies"
 
+// queryTupleFamily resolves the address family ("v4"/"v6"/"") of one side of a
+// query for the unsupported-tuple gate. It prefers the colon-strict text hint
+// (fam), which the caller derived from the RAW operator string via
+// config.NATAddrFamily before net.ParseIP folded an IPv4-mapped IPv6 literal
+// (#6377). When no hint is supplied (fam == "" — the net.IP-only callers, e.g.
+// tests), it falls back to the To4() heuristic, which FOLDS a mapped literal to
+// v4 (the pre-#6377 behavior). A nil ip with no hint is "" (unspecified). The
+// gate only fires on a resolved ("v4","v6"), so a "" from either source is
+// simply never the (v4,v6) shape.
+func queryTupleFamily(ip net.IP, fam string) string {
+	switch fam {
+	case "v4", "v6":
+		return fam
+	}
+	if ip == nil {
+		return ""
+	}
+	if ip.To4() != nil {
+		return "v4"
+	}
+	return "v6"
+}
+
 // Match runs the simulator against the active config and returns the verdict
 // with the SAME precedence the runtime enforces (userspace-dp/src/policy.rs
 // evaluate_policy_result_with_icmp / try_match_rule), first-match terminating:
@@ -965,33 +1027,28 @@ func Match(cfg *config.Config, q Query) (res Result) {
 	// never see. Reject it up front — this single shared entry point serves
 	// every transport (CLI, REST, gRPC MatchPolicies), so the fix covers all
 	// three. Both sides must be specified; the reverse (V6 src, V4 dst) NAT64
-	// arm and every same-family tuple fall through unchanged. Family is read
-	// with To4() to match the ipFamily helper the host-inbound path already
-	// uses.
+	// arm and every same-family tuple fall through unchanged.
 	//
-	// KNOWN LIMITATION (#5720 codex, tracked in #6377): To4() FOLDS an
-	// IPv4-mapped IPv6 literal — net.ParseIP("::ffff:192.0.2.1").To4() is
-	// NON-nil — so a source authored as `::ffff:192.0.2.1` is classified V4
-	// here and this gate FALSELY flags `::ffff:192.0.2.1 -> 2001:db8::1` as an
-	// unsupported (V4 src, V6 dst) tuple, even though the colon-strict runtime
-	// matcher (userspace-dp/src/policy.rs) sees a same-family V6/V6 tuple that
-	// should fall through and be evaluated normally. This is the documented
-	// Go/Rust family-parity trap (config.NATAddrFamily / natAddrFamily in
-	// pkg/config/compiler_nat_helpers.go: family is keyed on the presence of a
-	// ':' in the ORIGINAL text, which net.ParseIP has already discarded here).
-	// A colon-strict fix cannot be made at this gate from q.SrcIP/q.DstIP
-	// alone: all four Query builders (cli_request_testcmd.go, cli_show_
-	// security.go, server_show_firewall.go, server_cluster.go) parse with
-	// net.ParseIP, which renders `192.0.2.1` and `::ffff:192.0.2.1` byte-
-	// identical 16-byte values — the ':' signal is gone. The correct fix
-	// threads the colon-strict text family (config.NATAddrFamily on the raw
-	// srcIP/dstIP strings) from each caller into Query; that API change is out
-	// of scope for the #5720 tooling cohort and is filed as a follow-up. In
-	// practice an operator authoring a mapped-IPv6 source at these diagnostic
-	// surfaces is rare, and the failure mode is a spurious "unsupported tuple"
-	// advisory (fail-safe: it never hides or fabricates a permit), not a
-	// dataplane effect.
-	if q.SrcIP != nil && q.DstIP != nil && q.SrcIP.To4() != nil && q.DstIP.To4() == nil {
+	// Family is COLON-STRICT (#6377): each side is resolved by queryTupleFamily,
+	// which prefers the caller's q.SrcFamily/q.DstFamily text hint (derived from
+	// the RAW operator string via config.NATAddrFamily before net.ParseIP folded
+	// it) and falls back to To4() only when no hint is supplied. This closes the
+	// #5720 fold: net.ParseIP("::ffff:192.0.2.1").To4() is NON-nil, so before
+	// #6377 a source authored as the IPv4-mapped literal `::ffff:192.0.2.1` was
+	// classified V4 here and `::ffff:192.0.2.1 -> 2001:db8::1` was FALSELY flagged
+	// an unsupported (V4 src, V6 dst) tuple, diverging from the colon-strict
+	// runtime matcher (userspace-dp/src/policy.rs) that sees a same-family V6/V6
+	// tuple. All FIVE Query builders (cli_request_testcmd.go, cli_show_
+	// security.go, server_show_firewall.go, server_cluster.go, api/security.go)
+	// now thread the text family, so the mapped source yields "v6" and falls
+	// through to normal evaluation. This is the same Go/Rust family-parity
+	// convention the NAT compile gate uses (config.NATAddrFamily / natAddrFamily
+	// in pkg/config/compiler_nat_helpers.go: family keyed on the presence of a
+	// ':' in the ORIGINAL text). A net.IP-only caller that supplies no hint keeps
+	// the pre-#6377 To4() behavior for that side.
+	if q.SrcIP != nil && q.DstIP != nil &&
+		queryTupleFamily(q.SrcIP, q.SrcFamily) == "v4" &&
+		queryTupleFamily(q.DstIP, q.DstFamily) == "v6" {
 		return Result{UnsupportedTupleFamily: true, Action: config.PolicyDeny}
 	}
 	// #4373 (E4/H2/H7): a TRANSIT destination that is multicast / broadcast /
@@ -1291,6 +1348,12 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 // protocol via appid.ProtocolNumber (empty = unspecified) and the address family
 // from the destination (then source) IP, and delegates to the SSOT-backed
 // dataplane/userspace classifier. Returns nil for a nil config.
+//
+// #6377: the family is COLON-STRICT — ipFamilyStrict prefers the caller's
+// DstFamily/SrcFamily hint, so a mapped-v6 host-inbound destination (e.g. a
+// DHCPv6 flow to the firewall authored as ::ffff:...) is classified ip6, not
+// folded to ip by To4(). A family-scoped token (dhcpv6=ip6, dhcp=ip; ping's
+// ICMP vs ICMPv6 type) would otherwise be mis-admitted in the simulator.
 func hostInboundAdmission(cfg *config.Config, q Query) *dpuserspace.HostInboundAdmission {
 	if cfg == nil {
 		return nil
@@ -1299,9 +1362,9 @@ func hostInboundAdmission(cfg *config.Config, q Query) *dpuserspace.HostInboundA
 	family := ""
 	switch {
 	case q.DstIP != nil:
-		family = ipFamily(q.DstIP)
+		family = ipFamilyStrict(q.DstIP, q.DstFamily)
 	case q.SrcIP != nil:
-		family = ipFamily(q.SrcIP)
+		family = ipFamilyStrict(q.SrcIP, q.SrcFamily)
 	}
 	// #5579: when the query names an ingress interface, scope the host-inbound
 	// classification to THAT interface's effective view (admit vs deny for the
@@ -1321,6 +1384,19 @@ func hostInboundAdmission(cfg *config.Config, q Query) *dpuserspace.HostInboundA
 // the family spelling the host-inbound SSOT and views use.
 func ipFamily(ip net.IP) string {
 	if ip.To4() != nil {
+		return "ip"
+	}
+	return "ip6"
+}
+
+// ipFamilyStrict returns the nft-style family token ("ip" / "ip6") but keys on
+// the colon-strict family hint (fam, "v4"/"v6"/"") when present, so an
+// IPv4-mapped IPv6 literal is classified ip6 rather than folded to ip by To4()
+// (#6377). With no hint (fam == "" — net.IP-only callers) it is byte-identical
+// to ipFamily. The caller invokes this only for a non-nil ip, so
+// queryTupleFamily always resolves to "v4"/"v6" here.
+func ipFamilyStrict(ip net.IP, fam string) string {
+	if queryTupleFamily(ip, fam) == "v4" {
 		return "ip"
 	}
 	return "ip6"
@@ -1469,10 +1545,10 @@ func ruleMatches(cfg *config.Config, q Query, pol *config.Policy) bool {
 	if q.PolicyInactiveFn != nil && q.PolicyInactiveFn(pol.SchedulerName) {
 		return false
 	}
-	if !matchAddr(cfg, q.FeedOverlay, pol.Match.SourceAddresses, pol.Match.SourceAddressExcluded, q.SrcIP) {
+	if !matchAddr(cfg, q.FeedOverlay, pol.Match.SourceAddresses, pol.Match.SourceAddressExcluded, q.SrcIP, q.SrcFamily) {
 		return false
 	}
-	if !matchAddr(cfg, q.FeedOverlay, pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded, q.DstIP) {
+	if !matchAddr(cfg, q.FeedOverlay, pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded, q.DstIP, q.DstFamily) {
 		return false
 	}
 	// #5572: a non-first fragment is flowless (l4_present == false) — port-bearing
@@ -1508,12 +1584,28 @@ func ruleMatches(cfg *config.Config, q Query, pol *config.Policy) bool {
 //     the v4 address is then trivially NOT in the (v6-only) excluded set, so the
 //     side MATCHES. The old per-packet-family `contributesFamily` gate failed
 //     closed there and over-blocked legitimate cross-family traffic.
-func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, excluded bool, ip net.IP) bool {
+//
+// The packet's family is COLON-STRICT (#6377): it is resolved by
+// queryTupleFamily from the caller's family hint ("v4"/"v6"/"", derived from the
+// RAW operator text via config.NATAddrFamily), falling back to ip.To4() only
+// when no hint is supplied (net.IP-only callers, e.g. tests). This matters
+// because net.ParseIP("::ffff:192.0.2.1").To4() FOLDS an IPv4-mapped IPv6 source
+// to a v4-looking value: without the hint the mapped source would be matched
+// against the V4 address rules and could fabricate a PERMIT the runtime never
+// produces (the colon-strict Rust matcher, userspace-dp/src/policy.rs, sees a V6
+// address and evaluates it against the V6 rules). With the hint a mapped source
+// is classified v6 and takes the v6 branch, in parity with the dataplane.
+//
+// Only the isV4 branch selection (which family's nets the PACKET is tested
+// against) uses the family. The v4Empty/v6Empty gates below key on the ADDRESS
+// SETS, not the packet family, so the #3023 cross-family + #2008 excluded
+// fail-closed semantics above are unchanged.
+func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, excluded bool, ip net.IP, family string) bool {
 	if ip == nil {
 		return true
 	}
 
-	isV4 := ip.To4() != nil
+	isV4 := queryTupleFamily(ip, family) == "v4"
 
 	rawMatched := false
 	v4Empty := true
@@ -2071,10 +2163,10 @@ func isSkippedFragDeny(cfg *config.Config, q Query, pol *config.Policy) bool {
 	// L3 overlap: the zone is fixed by the tier bucket, so only source +
 	// destination address overlap is checked (the same matchAddr the runtime uses
 	// via rule_l3_matches).
-	if !matchAddr(cfg, q.FeedOverlay, pol.Match.SourceAddresses, pol.Match.SourceAddressExcluded, q.SrcIP) {
+	if !matchAddr(cfg, q.FeedOverlay, pol.Match.SourceAddresses, pol.Match.SourceAddressExcluded, q.SrcIP, q.SrcFamily) {
 		return false
 	}
-	if !matchAddr(cfg, q.FeedOverlay, pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded, q.DstIP) {
+	if !matchAddr(cfg, q.FeedOverlay, pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded, q.DstIP, q.DstFamily) {
 		return false
 	}
 	return true

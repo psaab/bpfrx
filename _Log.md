@@ -59230,6 +59230,122 @@ top.
     docs/config-schema.md, _Log.md
 
 - **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 — policymatch unsupported-tuple gate folded an
+    IPv4-mapped IPv6 source. The #5720 (V4 src, V6 dst) gate in
+    `pkg/policymatch/policymatch.go` `Match` classified family with
+    `net.IP.To4()`, which folds `::ffff:1.2.3.4` (To4 non-nil), so a source
+    authored as `::ffff:192.0.2.1` against a v6 destination was FALSELY reported
+    `UnsupportedTupleFamily` — diverging from the colon-strict runtime matcher
+    (userspace-dp/src/policy.rs) that sees a same-family V6/V6 tuple. Fail-safe
+    (a spurious advisory, never a hidden/fabricated permit) but off the
+    documented Go/Rust family-parity convention. Fix: threaded the colon-strict
+    text family from every caller. Added optional `Query.SrcFamily`/`DstFamily`
+    ("v4"/"v6"/"") hints; all four builders (cli_request_testcmd.go,
+    cli_show_security.go, server_show_firewall.go, server_cluster.go) populate
+    them via `config.NATAddrFamily` on the RAW operator string (the SSOT
+    colon-strict classifier, keyed on the ':' net.ParseIP discards). New
+    `queryTupleFamily` prefers the hint and falls back to `To4()` only when a
+    caller supplies none, preserving pre-#6377 behavior for net.IP-only callers.
+    Fail-on-revert `mapped_ipv4_tuple_6377_test.go`
+    (`TestMatchMappedIPv6SourceNotGated`) — verified RED (clean assertion,
+    UnsupportedTupleFamily:true) when the gate is reverted to To4()-only,
+    restored GREEN. Covers all three directions (genuine v4, genuine v6, mapped
+    v6) + the deliberate no-hint fold fallback. Not HA/cluster/dataplane —
+    diagnostic surface only, no failover smoke required. build+vet+gofmt clean;
+    full go test on pkg/policymatch + pkg/cli + pkg/grpcapi GREEN.
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/policymatch/mapped_ipv4_tuple_6377_test.go,
+    pkg/policymatch/README.md, pkg/cli/cli_request_testcmd.go,
+    pkg/cli/cli_show_security.go, pkg/grpcapi/server_show_firewall.go,
+    pkg/grpcapi/server_cluster.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 fold — the REST caller (the FIFTH builder) was missed
+    in the first pass. The hostile Claude review found MERGE-NEEDS-MAJOR: the
+    fix threaded the colon-strict family through FOUR `policymatch.Query{}`
+    builders but there are FIVE — `pkg/api/security.go` `matchPoliciesHandler`
+    (GET /api/v1/security/match) passed SrcIP/DstIP with NO SrcFamily/DstFamily,
+    so `::ffff:192.0.2.1 -> 2001:db8::1` was still falsely reported
+    `UnsupportedTupleFamily` on REST. Folded: added
+    `SrcFamily: config.NATAddrFamily(srcIPStr)` /
+    `DstFamily: config.NATAddrFamily(dstIPStr)` at security.go (classifying the
+    RAW query strings srcIPStr/dstIPStr, NOT the folded net.ParseIP results).
+    Added the REST fail-on-revert `security_matchpolicies_mapped_ipv4_6377_test.go`
+    (`TestMatchPoliciesRESTMappedIPv6SourceNotGated6377`) — drives the real
+    handler with src_ip=::ffff:192.0.2.1 & dst_ip=2001:db8::1 and asserts a
+    permit-through (NOT the unsupported verdict), plus a genuine 10.0.0.1 -> v6
+    control that MUST still be gated. Verified RED firsthand (drop the two
+    Family fields → REST response Action = the unsupported-tuple string,
+    Matched:false), restored GREEN. This was the one #6377 surface with no
+    binding test, which is why the miss slipped through. Corrected the "all
+    four builders" claims to FIVE and enumerated api/security.go in the
+    policymatch.go gate comment, pkg/policymatch/README.md, and this log. All
+    five builders: cli_request_testcmd.go, cli_show_security.go,
+    server_show_firewall.go, server_cluster.go, api/security.go.
+  - **File(s)**: pkg/api/security.go,
+    pkg/api/security_matchpolicies_mapped_ipv4_6377_test.go,
+    pkg/policymatch/policymatch.go, pkg/policymatch/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 fold #2 (Codex MAJOR, security-relevant) — the gate
+    fix alone was UNSAFE. `matchAddr` (the policy address evaluator) classified
+    the packet family with `isV4 := ip.To4() != nil`, which FOLDS a mapped-v6
+    source. After the gate fix let a mapped-v6 source fall through (correctly),
+    matchAddr folded it to v4 and matched it against the V4 address rules — so a
+    `::ffff:192.0.2.1` source against a V4-only permit rule (192.0.2.0/24 folds
+    to contain 192.0.2.1) would FABRICATE A PERMIT (fail-OPEN), worse than the
+    original spurious-advisory bug. The colon-strict Rust matcher sees V6 →
+    evaluates against V6 rules → default-deny. Fix: threaded the per-side family
+    into matchAddr — `isV4 := queryTupleFamily(ip, family) == "v4"` (hint first,
+    To4() fallback only when family==""); src passes q.SrcFamily, dst passes
+    q.DstFamily at all four call sites (ruleMatches x2, isSkippedFragDeny x2).
+    The v4Empty/v6Empty gates key on the ADDRESS SETS not the packet family, so
+    the #3023 cross-family + #2008 excluded fail-closed semantics are unchanged
+    (full pkg/policymatch suite GREEN confirms). Also threaded the family into
+    the test-only SelectorArgs.Query() helper (defensive; no production caller).
+    New eval-correctness fail-on-revert tests (Codex's point — the gate tests
+    only proved fall-through): TestMatchMappedIPv6SourceNotEvaluatedAsV4
+    (matcher) + TestMatchPoliciesRESTMappedIPv6SourceNotEvaluatedAsV4_6377
+    (REST) — mapped-v6 src against a V4-only permit rule must NOT permit
+    (matches v6 → default-deny); genuine v4 control still permits. BOTH verified
+    RED firsthand on `isV4 := ip.To4()` revert (Matched:true PolicyName:permit-v4
+    Action:permit), restored GREEN. Documented in matchAddr doc comment +
+    pkg/policymatch/README.md resolved section. SelectorArgs.Query() at
+    policymatch.go is test-only (grep: only fragment_5572_test.go +
+    selector_args_3696_test.go reference it).
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/policymatch/mapped_ipv4_tuple_6377_test.go,
+    pkg/api/security_matchpolicies_mapped_ipv4_6377_test.go,
+    pkg/policymatch/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 fold #3 (Codex round-2 MERGE-NEEDS-MINOR, 3 MINORs).
+    (1) hostInboundAdmission was a THIRD To4()-fold site: it computed the family
+    via ipFamily(q.DstIP)/ipFamily(q.SrcIP), folding a mapped-v6 host-bound
+    destination to ip. A family-scoped host-inbound token (dhcpv6=ip6, dhcp=ip;
+    ping ICMP vs ICMPv6) would then be mis-admitted in the simulator. Added
+    ipFamilyStrict(ip, fam) — maps the colon-strict hint to the nft ip/ip6 token,
+    To4() fallback when fam=="" — and threaded q.DstFamily/q.SrcFamily.
+    Fail-on-revert host_inbound_mapped_family_6377_test.go
+    (TestHostInboundMappedIPv6DstClassifiedAsV6): a mapped-v6 dst on udp/547 must
+    admit via the ip6-scoped dhcpv6 token; genuine v4 (dhcp/udp67) + genuine v6
+    controls prove both paths intact. VERIFIED RED firsthand on the ipFamily()
+    revert (mapped case flips TokenAdmit(dhcpv6)->Denied while controls stay
+    green), restored GREEN. (2) Corrected the Query.SrcFamily/DstFamily doc
+    comment: it falsely claimed the hints "never affect address matching" — they
+    now drive the gate, matchAddr's isV4, AND host-inbound family; reworded to
+    enumerate all three consumers and clarify the hint selects which family's
+    rules a side is tested against (address CONTAINMENT still uses the IP bytes).
+    (3) Strengthened the eval REST test
+    (TestMatchPoliciesRESTMappedIPv6SourceNotEvaluatedAsV4_6377) to assert the
+    EXACT default-deny result (action=="deny (default)" + default_used==true +
+    policy_name=="" + matched==false), not merely "not permit". Documented the
+    host-inbound consumer in pkg/policymatch/README.md resolved section. Gate +
+    matcher-eval + REST fail-on-reverts all still green.
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/policymatch/host_inbound_mapped_family_6377_test.go,
+    pkg/api/security_matchpolicies_mapped_ipv4_6377_test.go,
+    pkg/policymatch/README.md, _Log.md
   - **Action**: #6382 — clamp local console CLI ping `-s` payload to
     `diagcmd.MaxPingSize` (the third control surface). REST
     (`pkg/api/system.go`) and gRPC (`pkg/grpcapi/server_diag_ping.go`)
