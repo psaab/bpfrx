@@ -31,6 +31,7 @@ mod embedded_icmp;
 mod filter;
 mod flow_cache_hit;
 mod frag_assoc;
+mod host_inbound_policy;
 mod nat_exception;
 mod prerouting_scope;
 pub(in crate::afxdp) mod reject_reply;
@@ -43,6 +44,10 @@ use frag_assoc::{
     flowless_fragment_requires_nat_translation, nat64_consult_forward_fragment_assoc,
     nat64_install_forward_fragment_assoc, nat_consult_forward_fragment_assoc,
     nat_install_forward_fragment_assoc,
+};
+use host_inbound_policy::{
+    JunosHostLocalPolicy, emit_host_inbound_deny, emit_junos_host_deny,
+    junos_host_local_policy, junos_host_policy_eval, policy_packet_icmp,
 };
 use rx_telemetry::record_rx_descriptor_telemetry;
 
@@ -58,7 +63,7 @@ use crate::policy::evaluate_policy_result_with_icmp;
 use cookie_reply::{SynCookieReply, enqueue_syn_cookie_reply};
 use nat_exception::{record_source_nat_failure, source_nat_decision_for_flow};
 use prerouting_scope::{PreroutingIngressScope, prerouting_ingress_scope};
-use reject_reply::{deny_reply_and_emit, enqueue_deny_reply, enqueue_filter_reject_reply};
+use reject_reply::{deny_reply_and_emit, enqueue_filter_reject_reply};
 
 use filter::{
     emit_input_filter_log_match, emit_pending_filter_log,
@@ -66,237 +71,6 @@ use filter::{
     evaluate_non_pbr_input_filter_counters_cached, evaluate_non_pbr_input_filter_log_only,
     filter_terminal, host_inbound_gated_lo0_action,
 };
-
-/// #3020: extract the ICMP/ICMPv6 `(type, code)` for policy matching. Returns
-/// `None` for non-ICMP protocols, and for ICMP/ICMPv6 frames whose type/code
-/// bytes are not safely readable (a truncated frame or a non-first fragment),
-/// so an icmp-type-constrained application term (junos-ping = echo-request only)
-/// fails closed rather than matching against a fabricated type/code of 0.
-///
-/// Reuses the canonical, fragment/truncation-safe extractor
-/// `term_match_extra_from_frame` (the same one the firewall-filter icmp-type
-/// terms consume), so the policy and filter planes agree on which type/code a
-/// frame carries. Cold-path only (policy is evaluated on session miss).
-#[inline]
-fn policy_packet_icmp(packet_frame: &[u8], meta: UserspaceDpMeta) -> Option<(u8, u8)> {
-    if !matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        return None;
-    }
-    let extra = crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta);
-    if extra.l4_present {
-        Some((extra.icmp_type, extra.icmp_code))
-    } else {
-        None
-    }
-}
-
-/// #3019: enforce a configured `to-zone junos-host` security policy on the
-/// host-bound (LocalDelivery) path. MUST be called AFTER `host_inbound_admits`
-/// (Junos order: host-inbound-traffic admission first, then security policy),
-/// so a `then permit` can never re-admit what host-inbound already rejected.
-/// The gate itself is [`junos_host_local_policy`], which returns a
-/// [`JunosHostLocalPolicy`] verdict (drop / permit-with-metadata / no-match);
-/// [`junos_host_policy_eval`] is the reply-FREE evaluation core it and the
-/// flowless arm share.
-///
-/// #3019/#3292: evaluate the configured `to-zone junos-host` security policy for
-/// a host-bound (LocalDelivery) packet and, on a matching deny/reject, emit the
-/// policy-deny RT_FLOW. This is the reply-FREE core shared by both the
-/// flow-backed [`junos_host_local_policy`] gate (which adds the synthesized
-/// reject/tcp-rst reply on a deny/reject and surfaces a permit's metadata) and
-/// the flowless LocalDelivery arm (#3292, which can emit no reply — a fragment
-/// has no L4 header to build a RST from).
-///
-/// `l4_present = false` routes through the l3-aware junos-host evaluation so a
-/// port-bearing application term fails closed for a flowless packet; the
-/// flow-backed wrapper passes `true` (byte-identical to pre-#3292).
-///
-/// #3706: returns the FULL [`PolicyEvaluationResult`] of a matching junos-host
-/// rule — permit as well as deny/reject — so the local-delivery session-install
-/// path can stamp a matching PERMIT's `then log` selection, admitting
-/// `policy_id`, and hit-counter handle onto the installed host-bound session
-/// (parity with the transit permit path). `None` means no junos-host policy is
-/// configured or none matched; the caller then keeps the default no-policy
-/// local-session metadata. Callers that only gate (drop on deny/reject) inspect
-/// `result.action` themselves.
-#[allow(clippy::too_many_arguments)]
-fn junos_host_policy_eval(
-    forwarding: &ForwardingState,
-    flow: &SessionFlow,
-    from_zone_id: u16,
-    packet_len: u64,
-    l4_present: bool,
-    packet_icmp: Option<(u8, u8)>,
-) -> Option<crate::policy::PolicyEvaluationResult> {
-    crate::policy::evaluate_junos_host_policy_l3_aware(
-        &forwarding.policy,
-        from_zone_id,
-        flow.src_ip,
-        flow.dst_ip,
-        flow.forward_key.protocol,
-        flow.forward_key.src_port,
-        flow.forward_key.dst_port,
-        packet_icmp,
-        packet_len,
-        l4_present,
-    )
-}
-
-/// #3706: verdict of the flow-backed `to-zone junos-host` security-policy gate
-/// on the local-delivery (host-inbound) path, returned by
-/// [`junos_host_local_policy`]. The pre-#3706 gate collapsed to a bare `bool`
-/// (dropped?) and discarded a matching permit's metadata, so a
-/// `to-zone junos-host then permit log` session installed with no log flags and
-/// `policy_id` 0 — unlogged and unattributable.
-enum JunosHostLocalPolicy {
-    /// A matching junos-host `deny`/`reject` dropped the host-bound packet (the
-    /// reject/tcp-rst reply was enqueued and the policy-deny RT_FLOW emitted).
-    /// The caller recycles the frame and skips session install.
-    Dropped,
-    /// A matching junos-host policy PERMITTED the host-bound flow. Carries the
-    /// full evaluation result so the session-install path stamps the policy's
-    /// `then log session-init/session-close` selection, admitting `policy_id`,
-    /// and per-rule hit-counter handle onto the installed local session +
-    /// published conntrack row (#3706), matching the transit permit path.
-    Permit(crate::policy::PolicyEvaluationResult),
-    /// No junos-host policy matched (none configured, or none matched). The
-    /// caller continues local delivery with the default no-policy metadata
-    /// (byte-identical to pre-#3706 host-local behavior).
-    NoMatch,
-}
-
-/// #3019/#3292/#3615: emit the junos-host (`to-zone junos-host`) policy-deny
-/// RT_FLOW. `reject_reply_enqueued` is the ACTUAL outcome of the reject-reply
-/// enqueue — the flowless LocalDelivery arm can synthesize NO reply (a fragment
-/// has no L4 header), so it passes `false` and a `reject` there logs the
-/// truthful DENY; the flow-backed wrapper passes the real
-/// `enqueue_deny_reply` result. Kept emit-only (evaluation is
-/// `junos_host_policy_eval`) so the enqueue can run BEFORE the emit on the
-/// flow-backed path.
-fn emit_junos_host_deny(
-    forwarding: &ForwardingState,
-    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
-    flow: &SessionFlow,
-    meta: UserspaceDpMeta,
-    from_zone_id: u16,
-    policy_id: u32,
-    action: PolicyAction,
-    reject_reply_enqueued: bool,
-    now_ns: u64,
-) {
-    emit_policy_deny_event(
-        event_stream,
-        flow,
-        // LocalDelivery applies no NAT — the deny record carries no nat_*
-        // translation (byte-identical to a non-NAT transit deny).
-        &crate::nat::NatDecision::default(),
-        meta,
-        from_zone_id,
-        // The egress "zone" is the firewall host itself. The reserved
-        // JUNOS_HOST_ZONE_ID (u16::MAX-1) does not fit the u8 wire zone-id slot
-        // (#919/#922), so the deny RT_FLOW carries 0 ("unknown / host", the
-        // #3110 sentinel) rather than a value that would truncate into a real
-        // zone id on the wire.
-        0,
-        // Host-local sessions are not policy-forwarded; owner_rg_id 0.
-        0,
-        policy_id,
-        action,
-        resolve_policy_deny_app_id(&forwarding.app_catalog, flow, flow.forward_key.dst_port),
-        reject_reply_enqueued,
-        now_ns,
-    );
-}
-
-/// #3610: emit the tuple-rich host-inbound-traffic deny event for a host-bound
-/// packet rejected by the ingress zone's `host-inbound-traffic` admission gate.
-/// Resolves the application from the flow's destination (service) port with the
-/// same `resolve_policy_deny_app_id` the transit / junos-host deny path uses,
-/// then delegates to [`emit_host_inbound_deny_event`] (which reuses the #3615
-/// policy-deny event machinery with a distinct host-inbound reason). Shared by
-/// all three host-inbound deny arms: session-hit, session-miss, and the #3292
-/// flowless LocalDelivery arm — so every host-inbound drop emits an identical,
-/// tuple-rich record.
-fn emit_host_inbound_deny(
-    forwarding: &ForwardingState,
-    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
-    flow: &SessionFlow,
-    meta: UserspaceDpMeta,
-    from_zone_id: u16,
-    now_ns: u64,
-) {
-    emit_host_inbound_deny_event(
-        event_stream,
-        flow,
-        meta,
-        from_zone_id,
-        resolve_policy_deny_app_id(&forwarding.app_catalog, flow, flow.forward_key.dst_port),
-        now_ns,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn junos_host_local_policy(
-    forwarding: &ForwardingState,
-    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
-    tx_pipeline: &mut crate::afxdp::worker::WorkerTxPipeline,
-    ingress_ifindex: i32,
-    packet_frame: &[u8],
-    counters: &mut BatchCounters,
-    flow: &SessionFlow,
-    meta: UserspaceDpMeta,
-    from_zone_id: u16,
-    packet_len: u64,
-    now_ns: u64,
-) -> JunosHostLocalPolicy {
-    let policy_icmp = policy_packet_icmp(packet_frame, meta);
-    match junos_host_policy_eval(
-        forwarding,
-        flow,
-        from_zone_id,
-        packet_len,
-        // Flow-backed host-bound traffic always carries a real L4 header.
-        true,
-        policy_icmp,
-    ) {
-        // #3706: a matching PERMIT carries its `then log` selection, admitting
-        // policy_id, and hit-counter handle back to the caller so the installed
-        // host-bound session is logged + attributed like a transit permit.
-        Some(result) if matches!(result.action, PolicyAction::Permit) => {
-            JunosHostLocalPolicy::Permit(result)
-        }
-        Some(result) => {
-            let action = result.action;
-            // #3615: enqueue the reject/tcp-rst reply FIRST, then emit the
-            // junos-host deny with the ACTUAL reply outcome so a suppressed
-            // reject logs the truthful DENY.
-            let reject_reply_enqueued = enqueue_deny_reply(
-                tx_pipeline,
-                forwarding,
-                ingress_ifindex,
-                packet_frame,
-                meta,
-                flow,
-                counters,
-                matches!(action, PolicyAction::Reject),
-                from_zone_id,
-            );
-            emit_junos_host_deny(
-                forwarding,
-                event_stream,
-                flow,
-                meta,
-                from_zone_id,
-                result.policy_id,
-                action,
-                reject_reply_enqueued,
-                now_ns,
-            );
-            JunosHostLocalPolicy::Dropped
-        }
-        None => JunosHostLocalPolicy::NoMatch,
-    }
-}
 
 /// #3292: verdict for the FLOWLESS (no-L4) LocalDelivery security gate. A
 /// host-bound flowless packet — a non-first IPv4/IPv6 fragment, or any
