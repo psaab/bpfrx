@@ -409,6 +409,27 @@ pub(crate) struct Filter {
     pub(crate) has_three_color_policer_terms: bool,
 }
 
+impl Filter {
+    /// #6236 PR-2A: the canonical "the output filter must still be walked on the
+    /// TX path" predicate. An output filter earns a TX-path evaluation when it
+    /// can change or observe the packet: CoS/DSCP tx-selection, a `then count`,
+    /// a `then log`, a terminal (non-`accept`) action, or a three-color policer.
+    ///
+    /// This is the SOLE definition of the five-flag OR. The compiler's
+    /// `iface_filter_out_*_needs_tx_eval` set-insert, the
+    /// `has_output_needs_tx_eval_*` aggregates, and every `cos_classify` TX arm
+    /// call through here so the composite can never drift between the compile
+    /// path and the hot path (#2620-adjacent invariant).
+    #[inline]
+    pub(crate) fn needs_tx_eval(&self) -> bool {
+        self.affects_tx_selection
+            || self.has_counter_terms
+            || self.has_log_terms
+            || self.has_terminal_action_terms
+            || self.has_three_color_policer_terms
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct FilterTermCounter {
     pub(crate) packets: AtomicU64,
@@ -782,12 +803,21 @@ pub(crate) struct FilterState {
     pub(crate) iface_filter_out_v4_needs_tx_eval: rustc_hash::FxHashSet<i32>,
     /// Whether any inet output filter can affect CoS TX selection.
     pub(crate) has_output_tx_selection_v4: bool,
+    /// #6236 PR-2A: whether any inet output filter needs a TX-path walk
+    /// (`Filter::needs_tx_eval` — CoS/DSCP tx-selection, counter, log, terminal
+    /// action, or three-color policer). Recomputed from the FINAL output fast map
+    /// so a duplicate-ifindex last-wins overwrite cannot leave a stale-true
+    /// aggregate; it subsumes both `has_output_tx_selection_v4` and the
+    /// `iface_filter_out_v4_needs_tx_eval` set non-emptiness in the global gate.
+    pub(crate) has_output_needs_tx_eval_v4: bool,
     /// Direct per-interface inet6 output filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_out_v6_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
     /// Per-interface inet6 output filters that must still be evaluated in the TX path.
     pub(crate) iface_filter_out_v6_needs_tx_eval: rustc_hash::FxHashSet<i32>,
     /// Whether any inet6 output filter can affect CoS TX selection.
     pub(crate) has_output_tx_selection_v6: bool,
+    /// #6236 PR-2A: inet6 mirror of `has_output_needs_tx_eval_v4`.
+    pub(crate) has_output_needs_tx_eval_v6: bool,
     /// Direct lo0 inet filter reference for packet hot-path evaluation.
     pub(crate) lo0_filter_v4_fast: Option<Arc<Filter>>,
     /// Direct lo0 inet6 filter reference for packet hot-path evaluation.

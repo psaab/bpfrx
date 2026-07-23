@@ -2359,6 +2359,154 @@ fn resolve_cached_cos_tx_selection_flowless_port_term_does_not_spuriously_drop()
 }
 
 #[test]
+fn resolve_cached_cos_tx_selection_flowless_captures_counter_only_output_filter() {
+    // #6360 (#6236 PR-2A coverage): the CACHED flowless arm
+    // (`resolve_cached_cos_tx_selection`, flow_key = None) must still walk an
+    // interface output filter whose ONLY TX-relevant property is `then count`.
+    // Every existing flowless output-filter canary uses a terminal (discard /
+    // reject) or log term, so dropping `has_counter_terms` from
+    // `Filter::needs_tx_eval()` leaves them GREEN — the flowless CACHED
+    // needs_tx_eval predicate at cos_classify.rs:225 (and its compile-time
+    // `iface_filter_out_v4_needs_tx_eval` set-insert gate) was NOT bound by a
+    // counter-only canary. This test binds it: the filter is counter-only
+    // (has_counter_terms=true; affects_tx_selection / has_log_terms /
+    // has_terminal_action_terms / has_three_color_policer_terms all false), so
+    // `needs_tx_eval()` reduces to has_counter_terms alone.
+    //
+    // RED-on-revert: dropping `has_counter_terms` from `Filter::needs_tx_eval()`
+    // drops ifindex 202 from `iface_filter_out_v4_needs_tx_eval` (the outer gate)
+    // AND fails the inner `.filter(|f| f.needs_tx_eval())` at :225, so the output
+    // filter is never walked, `filter_counters` comes back empty, and the
+    // assertion below FAILS.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-count-l3".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-count-l3".into(),
+            family: "inet".into(),
+            // Counter-only, L3-only term (address + protocol, NO ports) so it
+            // matches a flowless packet (L4 ports absent, forced to 0) and the
+            // ONLY needs_tx_eval flag it sets is has_counter_terms.
+            terms: vec![FirewallTermSnapshot {
+                name: "count-host".into(),
+                destination_addresses: vec!["172.16.80.200/32".into()],
+                destination_constrained: true,
+                protocols: vec!["tcp".into()],
+                action: "accept".into(),
+                count: "wan-hits".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let cached = resolve_cached_cos_tx_selection(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        None,
+    );
+    assert!(
+        !cached.filter_counters.is_empty(),
+        "#6360: the cached flowless arm must capture a counter-only output \
+         filter's `then count` handle (has_counter_terms drives needs_tx_eval)"
+    );
+    assert!(
+        !cached.drop,
+        "a counter-only `then accept` term must not drop the flowless packet"
+    );
+
+    // Control: a flowless packet whose L3 dst does NOT match the counted term
+    // captures no counter — proves the assertion binds the term MATCH, not the
+    // mere presence of a counter-only output filter.
+    let unmatched = resolve_cached_cos_tx_selection(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 201]),
+        None,
+    );
+    assert!(
+        unmatched.filter_counters.is_empty(),
+        "#6360: a flowless packet not matching the counted term captures no counter",
+    );
+}
+
+#[test]
+fn resolve_cos_tx_selection_flowless_counts_counter_only_output_filter() {
+    // #6360 (#6236 PR-2A coverage): the RUNTIME flowless arm
+    // (`resolve_cos_tx_selection`, flow_key = None) must fire a `then count` on
+    // an interface output filter whose ONLY TX-relevant property is the counter.
+    // Binds the flowless RUNTIME needs_tx_eval predicate at cos_classify.rs:655
+    // (and its `iface_filter_out_v4_needs_tx_eval` outer gate) to
+    // has_counter_terms — the existing flowless canaries (terminal / log) do not.
+    //
+    // RED-on-revert: dropping `has_counter_terms` from `Filter::needs_tx_eval()`
+    // skips the output-filter walk, the `then count` term never fires, and the
+    // packet/byte counter assertions below FAIL.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-count-l3".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-count-l3".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "count-host".into(),
+                destination_addresses: vec!["172.16.80.200/32".into()],
+                destination_constrained: true,
+                protocols: vec!["tcp".into()],
+                action: "accept".into(),
+                count: "wan-hits".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    let selection = resolve_cos_tx_selection(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        None,
+        flowless_extra(),
+    );
+    assert!(
+        !selection.drop,
+        "a counter-only `then accept` term must not drop the flowless packet"
+    );
+
+    // `flowless_v4_meta` stamps pkt_len = 1514; the counted flowless walk must
+    // record exactly one packet of that byte length.
+    let filter = forwarding
+        .filter_state
+        .filters
+        .get("inet:wan-count-l3")
+        .expect("inet output filter");
+    let term = filter.terms.first().expect("first term");
+    assert_eq!(
+        term.counter.packets.load(Ordering::Relaxed),
+        1,
+        "#6360: the flowless runtime arm must fire the output filter's `then count`",
+    );
+    assert_eq!(
+        term.counter.bytes.load(Ordering::Relaxed),
+        1514,
+        "#6360: the counted flowless packet's pkt_len must be recorded as bytes",
+    );
+}
+
+#[test]
 fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filter_exists() {
     let snapshot = ConfigSnapshot {
         interfaces: vec![
