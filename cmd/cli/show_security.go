@@ -648,14 +648,9 @@ func (c *ctl) showStatistics(detail bool) error {
 	// `if err == nil && ...` and returning nil meant a degraded buffers read
 	// silently omitted the buffer section and still exited 0 — the base
 	// GetGlobalStats error above is surfaced, so this must be too.
-	// #5328 (A10-b1-F4): propagate the supplemental buffers RPC error instead
-	// of swallowing it in the success predicate. Reading the error only inside
-	// `if err == nil && ...` and returning nil meant a degraded buffers read
-	// silently omitted the buffer section and still exited 0 — the base
-	// GetGlobalStats error above is surfaced, so this must be too.
 	text, err := c.client.ShowText(c.ctx(), &pb.ShowTextRequest{Topic: "buffers"})
 	if err != nil {
-		return fmt.Errorf("%v", err)
+		return err
 	}
 	if text.Output != "" {
 		fmt.Printf("\n%s", text.Output)

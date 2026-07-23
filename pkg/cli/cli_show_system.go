@@ -265,27 +265,10 @@ func (c *CLI) showSystemServices() error {
 
 	fmt.Println("System services:")
 
-	// #5328 (A10-b2-F5): report the EFFECTIVE management-listener state when the
-	// daemon has wired it. A relocated (off-loopback, #5127) or HTTP-disabled
-	// (--api-addr "") daemon must not read as a fixed 127.0.0.1:8080 (always on).
-	// When unwired (CLI spawned outside the daemon) keep the historical display.
-	if c.serviceListenersSet {
-		if c.grpcAddr != "" {
-			fmt.Printf("  gRPC:           %s\n", c.grpcAddr)
-		} else {
-			fmt.Println("  gRPC:           disabled")
-		}
-		if c.apiAddr != "" {
-			fmt.Printf("  HTTP REST:      %s\n", c.apiAddr)
-		} else {
-			fmt.Println("  HTTP REST:      disabled")
-		}
-	} else {
-		// gRPC
-		fmt.Println("  gRPC:           127.0.0.1:50051 (always on)")
-		// HTTP REST
-		fmt.Println("  HTTP REST:      127.0.0.1:8080 (always on)")
-	}
+	// gRPC
+	fmt.Println("  gRPC:           127.0.0.1:50051 (always on)")
+	// HTTP REST
+	fmt.Println("  HTTP REST:      127.0.0.1:8080 (always on)")
 
 	// SSH
 	if cfg.System.Services != nil && cfg.System.Services.SSH != nil {

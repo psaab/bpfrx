@@ -17,7 +17,7 @@ func TestUpdateHAWatchdog_MapNotLoaded(t *testing.T) {
 	}
 }
 
-func TestUpdateHAWatchdog_InterfaceCompliance(t *testing.T) {
+func TestUpdateHAWatchdog_InterfaceCompliance_5328(t *testing.T) {
 	// #5328 (A6-b3-F3): the pre-fix body was `var dp DataPlane; _ = dp`, which
 	// asserted nothing about the method set — removing UpdateHAWatchdog from the
 	// DataPlane interface left this test green (a vacuous placeholder). Exercise

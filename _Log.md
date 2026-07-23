@@ -58256,3 +58256,51 @@ top.
     pkg/cli/cli.go, pkg/cli/cli_show_system.go,
     pkg/cli/cli_show_system_services_listeners_5328_test.go,
     pkg/daemon/daemon_run.go, pkg/dataplane/watchdog_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Revise PR #6384 (fix/5328-codex178) per hostile review — DROP
+    the materially-incomplete A10-b2-F5 fix + re-file it, and fold three minor
+    findings. Left the other five fixes (A7-b2-F10 RSS coverage, A8-b1-F6 v6
+    SNAT count, A8-b2-F6 DHCP HWAddress label, A10-b1-F4 buffers-error
+    propagation, A6-b3-F3 watchdog test) INTACT.
+    DROPPED (reverted to origin/master, no residue):
+    - **A10-b2-F5** (`show system services` effective listeners): the fix
+      reported the REQUESTED d.opts.APIAddr/GRPCAddr, not the EFFECTIVE
+      post-bind address (HTTP is resolved/clamped/rebound/can-fail-to-bind via
+      resolveAPIBinds + the #4047/#5127 loopback clamp; gRPC can be clamped),
+      AND it patched only the LOCAL pkg/cli renderer while the remote `cli`
+      routes `show system services` through the HARDCODED gRPC renderer at
+      pkg/grpcapi/server_show_system.go:174 (50051/8080 always on), which the
+      fix did NOT touch — so it made local and remote disagree while still
+      being wrong. Reverted pkg/cli/cli.go (removed SetServiceListeners +
+      serviceListenersSet/apiAddr/grpcAddr fields), pkg/cli/cli_show_system.go
+      (restored the plain hardcoded legacy display), pkg/daemon/daemon_run.go
+      (removed the SetServiceListeners call); deleted
+      pkg/cli/cli_show_system_services_listeners_5328_test.go. Re-filed the
+      proper implementation (daemon-owned effective-listener snapshot routed
+      through BOTH renderers, `disabled` when off, end-to-end-wired test) as
+      #6385.
+    FOLDED (3 minors):
+    - **cmd/cli/show_security.go**: removed a DUPLICATED "#5328 (A10-b1-F4)"
+      comment block (the paragraph appeared twice); changed
+      `return fmt.Errorf("%v", err)` → `return err` to preserve the error
+      chain. Buffers-error test still GREEN (asserts err != nil).
+    - **pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go**: added
+      TestShowDHCPServerDetail_V6ColumnLabeledHWAddress_5328 covering the
+      DETAIL renderer (showDHCPServerDetail) — the prior test only exercised
+      the non-detail path, leaving the detail label change untested. Factored
+      the lease-manager setup into writeV6LeaseManager. Fail-on-revert
+      verified: reverting the detail DHCPv6 header to "DUID" → the new case
+      goes RED.
+    - **pkg/dataplane/watchdog_test.go**: renamed
+      TestUpdateHAWatchdog_InterfaceCompliance →
+      TestUpdateHAWatchdog_InterfaceCompliance_5328 for cohort traceability
+      (behavioral assertion unchanged).
+    build + go vet + gofmt -l clean; full go test ./pkg/daemon ./pkg/api
+    ./pkg/grpcapi ./cmd/cli ./pkg/cli ./pkg/dataplane GREEN.
+  - **File(s)**: cmd/cli/show_security.go, pkg/cli/cli.go,
+    pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_services_listeners_5328_test.go (deleted),
+    pkg/daemon/daemon_run.go,
+    pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go,
+    pkg/dataplane/watchdog_test.go, _Log.md
