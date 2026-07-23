@@ -21,9 +21,11 @@
 //   - evaluate_dscp_sensitive_input_filter_on_session_hit runs per
 //     packet on the session-hit path for DSCP-sensitive-filter configs
 //     (flow_cache.rs:285 does not cache those). It stays #[inline] so
-//     the cheap interface_input_filter_has_dscp_match guard folds in
-//     and returns None with no call when no DSCP filter is configured.
-//     The post-guard body calls the cold evaluate_non_pbr_input_filter.
+//     the cheap interface_input_filter_varies_per_packet guard folds in
+//     (a single fast-map lookup evaluating the #1430 DSCP OR #2362
+//     per-packet-L4 OR, #6236 PR-2C) and returns None with no call when
+//     no such filter is configured. The post-guard body calls the cold
+//     evaluate_non_pbr_input_filter.
 //   - evaluate_non_pbr_input_filter / _log_only,
 //     emit_input_filter_log_match, apply_lo0_filter_action are the
 //     rare/exception bodies: #[cold] #[inline(never)] for .text.unlikely
@@ -350,14 +352,14 @@ pub(super) fn evaluate_dscp_sensitive_input_filter_on_session_hit(
     // carries EITHER a DSCP match term OR a per-packet L4 match term
     // (tcp-flags / is-fragment / icmp-type / icmp-code). Both classes vary per
     // packet within a flow, so the first-packet decision must not be replayed.
-    // The extra-build stays AFTER this gate so the common no-such-filter case
-    // pays only two FxHashMap lookups (this function is #[inline] on the hot
-    // session-hit path).
-    if !crate::filter::interface_input_filter_has_dscp_match(
-        &forwarding.filter_state,
-        ingress_ifindex,
-        is_v6,
-    ) && !crate::filter::interface_input_filter_has_per_packet_l4_match(
+    // #6236 PR-2C: fold the two per-flag prechecks (which each looked the same
+    // ingress ifindex up on the same-family input fast map) into ONE lookup that
+    // evaluates the `has_dscp_match_terms || has_per_packet_l4_match_terms` OR
+    // (`Filter::varies_per_packet_within_flow`) off a single borrow. The
+    // extra-build stays AFTER this gate so the common no-such-filter case pays
+    // ONE FxHashMap lookup (this function is #[inline] on the hot session-hit
+    // path).
+    if !crate::filter::interface_input_filter_varies_per_packet(
         &forwarding.filter_state,
         ingress_ifindex,
         is_v6,

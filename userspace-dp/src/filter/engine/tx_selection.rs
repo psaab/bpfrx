@@ -372,22 +372,44 @@ pub(crate) fn evaluate_interface_output_filter_tx_selection_counted<'a>(
     )
 }
 
+/// #6236 PR-2C: test-only `.is_some()` view over
+/// [`interface_output_filter_needing_tx_eval`]. Every production consumer now
+/// takes the borrow directly, so this bool has no runtime caller — it survives
+/// only to pin the accessor-equivalence tests (`filter/tests.rs`) against the
+/// fast-map flag. `#[cfg(test)]` keeps it out of the shipped binary.
+#[cfg(test)]
 pub(crate) fn interface_output_filter_needs_tx_eval(
     state: &FilterState,
     ifindex: i32,
     is_v6: bool,
 ) -> bool {
-    // #6236 PR-2B: read `Filter::needs_tx_eval()` off the output fast map,
-    // replacing the parallel `iface_filter_out_v*_needs_tx_eval` set. The set
-    // was populated iff `filter.needs_tx_eval()`, so `get().is_some_and(..)` is
-    // bit-identical for a unique ifindex and agrees with the last-wins filter
-    // the TX evaluator actually walks for a duplicate.
+    interface_output_filter_needing_tx_eval(state, ifindex, is_v6).is_some()
+}
+
+/// #6236 PR-2C: single-lookup borrow of the per-interface OUTPUT filter for this
+/// family, gated on `Filter::needs_tx_eval()`. This is the SOLE lookup+gate —
+/// every `cos_classify` TX arm borrows the returned `&Filter` straight into the
+/// tx-selection evaluator so the needs-tx-eval gate and the walk share ONE
+/// `.get()` (PR-2B ran the gate and the fetch as two separate lookups of the
+/// same ifindex, then re-checked `needs_tx_eval()` on the borrow). The
+/// test-only [`interface_output_filter_needs_tx_eval`] bool is `.is_some()` of
+/// this same lookup+gate.
+///
+/// The PR-2A family-wide `has_output_needs_tx_eval_*` aggregate still
+/// short-circuits the whole `cos_classify` TX path upstream
+/// (`tx_selection_enabled_v{4,6}`), BEFORE this per-interface lookup ever runs —
+/// this fold does not touch that gate.
+pub(crate) fn interface_output_filter_needing_tx_eval(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+) -> Option<&Filter> {
     let filter = if is_v6 {
         state.iface_filter_out_v6_fast.get(&ifindex)
     } else {
         state.iface_filter_out_v4_fast.get(&ifindex)
     };
-    filter.is_some_and(|filter| filter.needs_tx_eval())
+    filter.map(Arc::as_ref).filter(|filter| filter.needs_tx_eval())
 }
 
 #[inline]

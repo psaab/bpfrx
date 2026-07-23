@@ -57752,3 +57752,31 @@ top.
     README notes this bound.
   **File(s)**: pkg/cluster/failover.go, pkg/cluster/README.md,
     pkg/cluster/failover_lease_5079_test.go, pkg/daemon/daemon_ha_sync.go
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6236 PR-2C — fold co-located per-interface fast-map lookups into
+    ONE `.get()` per call site via shared pure `&Filter` evaluator cores. Added
+    `Filter::varies_per_packet_within_flow()` (SOLE has_dscp||has_l4 OR core) +
+    accessor `interface_input_filter_varies_per_packet`; the session-hit re-eval
+    gate (poll_descriptor/filter.rs) folds its two DSCP/L4 prechecks to one.
+    Added borrow accessors `interface_filter_route_lookup_affecting` (route-lookup
+    precheck, bool = `.is_some()` of it) + `&Filter` core
+    `evaluate_filter_ref_routing_instance_event_counted`; PBR (forwarding/pbr.rs)
+    shares ONE lookup between precheck + routing-instance eval. Added
+    `interface_output_filter_needing_tx_eval` (needs_tx_eval borrow gate, bool =
+    `.is_some()`); all four cos_classify TX arms fold their bool-precheck +
+    separate `.get()` + redundant `.filter(needs_tx_eval)` to one borrow. PR-2A
+    `has_output_needs_tx_eval_*` aggregate short-circuit untouched. Behavior-
+    preserving for unique ifindices, last-wins for dup. Added fail-on-revert
+    equivalence test `pr2c_folded_single_lookup_equals_two_lookup_path`.
+  **File(s)**: userspace-dp/src/filter/mod.rs,
+    userspace-dp/src/filter/engine/mod.rs,
+    userspace-dp/src/filter/engine/eval.rs,
+    userspace-dp/src/filter/engine/tx_selection.rs,
+    userspace-dp/src/filter/engine/cache_sensitive.rs,
+    userspace-dp/src/filter/engine/cache_sensitive/rotation.rs,
+    userspace-dp/src/afxdp/forwarding/pbr.rs,
+    userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+    userspace-dp/src/afxdp/tx/cos_classify.rs,
+    userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
+    userspace-dp/src/protocol/security.rs

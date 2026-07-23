@@ -139,10 +139,15 @@ pub(crate) struct FirewallFilterSnapshot {
 //       off FilterState.iface_filter_v{4,6}_fast via the
 //       interface_input_filter_has_<X>_match accessor — the parallel
 //       per-interface has_<X>_match sets were deleted in #6236 PR-2B),
-//       flow-cache insertion gate at afxdp/flow_cache.rs:297-309,
-//       established-session re-evaluation at afxdp/poll_descriptor/mod.rs:217-244,
-//       forwarding rotation purge at afxdp/worker/loop_body/mod.rs:295-330,
-//       and tests at afxdp/flow_cache_tests.rs.
+//       flow-cache insertion gate at afxdp/flow_cache.rs (per-flag,
+//       input + output direction), established-session re-evaluation at
+//       afxdp/poll_descriptor/filter.rs (the DSCP + per-packet-L4
+//       prechecks fold to ONE lookup of
+//       interface_input_filter_varies_per_packet — the
+//       Filter.varies_per_packet_within_flow() OR core — since #6236
+//       PR-2C), forwarding rotation purge at
+//       afxdp/worker/loop_body/mod.rs, and tests at
+//       afxdp/flow_cache_tests.rs.
 //
 // Skipping this classification SILENTLY breaks flow-cache: a
 // first-packet decision gets reused for later packets that can
