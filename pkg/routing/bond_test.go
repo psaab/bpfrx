@@ -21,6 +21,12 @@ type fakeBondLinkOps struct {
 	failLinkSetMaster map[string]error // member name -> LinkSetMaster error
 	failLinkDel       map[string]error // link name -> LinkDel error
 
+	// substituteAfterAdd[name], when set, replaces the link stored under name
+	// during LinkAdd so the post-create LinkByName readback returns the
+	// substitute — models the #6396 create-path TOCTOU where a same-name
+	// foreign link is swapped in between LinkAdd and the readback.
+	substituteAfterAdd map[string]netlink.Link
+
 	setUpCalls  []string
 	masterCalls []string
 	addCalls    []string // names passed to LinkAdd
@@ -29,12 +35,13 @@ type fakeBondLinkOps struct {
 
 func newFakeBondLinkOps() *fakeBondLinkOps {
 	return &fakeBondLinkOps{
-		links:             map[string]netlink.Link{},
-		nextIndex:         1000, // created bonds get 1001+, clear of small seeded indices
-		failLinkAdd:       map[string]error{},
-		failLinkSetUp:     map[string]error{},
-		failLinkSetMaster: map[string]error{},
-		failLinkDel:       map[string]error{},
+		links:              map[string]netlink.Link{},
+		nextIndex:          1000, // created bonds get 1001+, clear of small seeded indices
+		failLinkAdd:        map[string]error{},
+		failLinkSetUp:      map[string]error{},
+		failLinkSetMaster:  map[string]error{},
+		failLinkDel:        map[string]error{},
+		substituteAfterAdd: map[string]netlink.Link{},
 	}
 }
 
@@ -67,6 +74,11 @@ func (f *fakeBondLinkOps) LinkAdd(l netlink.Link) error {
 		l.Attrs().Index = f.nextIndex
 	}
 	f.links[name] = l
+	if sub, ok := f.substituteAfterAdd[name]; ok {
+		// The intended bond was created, but a foreign link now wears the name
+		// by the time the readback runs (#6396 TOCTOU).
+		f.links[name] = sub
+	}
 	return nil
 }
 

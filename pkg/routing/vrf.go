@@ -343,6 +343,27 @@ func createLinkedVRF(ops vrfOps, vrfName string, tableID int) (bool, error) {
 	if err != nil {
 		return true, fmt.Errorf("find VRF %s after add: %w", vrfName, err)
 	}
+	// #6396: re-assert the post-create readback is the VRF we just created,
+	// carrying the desired table, before bringing it up. LinkAdd and this
+	// LinkByName are two syscalls; a concurrent external actor that deleted the
+	// fresh device and substituted a same-name foreign link (or a VRF with a
+	// different table) in that window would otherwise be brought up and the
+	// name recorded as satisfied while no VRF with the desired table exists —
+	// the routes leaked into it silently blackhole. LinkAdd succeeded, so
+	// added=true (the caller records ownership so a later reconcile can clean
+	// up), but surface the error so the commit fails closed; the reconcile
+	// adopt path (vrfTable → recreate on table mismatch) reclaims it next cycle.
+	if vrf, ok := link.(*netlink.Vrf); !ok || vrf.Table != uint32(tableID) {
+		have := "non-VRF type " + link.Type()
+		if ok {
+			have = fmt.Sprintf("table %d", vrf.Table)
+		}
+		slog.Warn("VRF readback after create is not the intended interface",
+			"name", vrfName, "want_table", tableID, "have", have)
+		return true, fmt.Errorf(
+			"VRF %s readback after create mismatch (want table %d, have %s)",
+			vrfName, tableID, have)
+	}
 	if err := ops.LinkSetUp(link); err != nil {
 		return true, fmt.Errorf("set VRF %s up: %w", vrfName, err)
 	}

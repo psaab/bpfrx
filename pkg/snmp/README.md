@@ -418,7 +418,13 @@ authorization surface: every request is dropped because no community matches.
   `buildSNMPIfData` returns an empty slice when the netlink dump fails — but it
   LOGS the failure (`slog.Warn`, #5523 C179-123) so an empty ifTable caused by a
   transient netlink error is diagnosable and not mistaken for a genuine
-  no-interface box; the next poll re-reads netlink and self-heals.
+  no-interface box; the next poll re-reads netlink and self-heals. The warning
+  is rate-limited to at most once per minute (`warnThrottle`, #6396): the
+  callback runs once per SNMP poll and a manager may poll several times a
+  second, so a PERSISTENT failure would otherwise write one line per poll and
+  drown the journal — the first failure logs immediately, subsequent ones in the
+  window are counted and reported with the next emitted line, and a successful
+  read logs a one-time recovery.
 
 ### IF-MIB class-counter semantics (#5050)
 

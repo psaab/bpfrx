@@ -1081,7 +1081,35 @@ owned by the `journal/` subpackage.
   guarantees no archive is ever overwritten while the leading timestamp
   keeps rotation's lexical sort chronological. `ArchiveConfig` captures
   the text, timestamp AND seq together under the lock (no after-unlock
-  `time.Now()` race). The rollback/archive writers
+  `time.Now()` race). Rotation prunes by the parsed seq, and
+  `SetArchiveConfig` seeds the per-process counter from the highest seq on
+  disk so it stays globally monotonic across restarts (#5523 C179-060).
+  These monotonicity / no-overwrite guarantees hold **after a successful
+  reseed scan and outside the two #6404-deferred windows** (a commit that
+  lands after a failed scan but before the next `SetArchiveConfig` retry, and
+  a disable→re-enable to the same dir that skips the rescan) — see the #6396
+  hardening note below.
+  Two #6396 residual hardenings: `parseArchiveSeq` requires the current
+  two-dot `config-<ts>.<seq>.conf` shape (the ts's own
+  seconds.nanoseconds dot PLUS the seq dot), so a legacy pre-#3441
+  `config-<ts>.conf` — whose trailing nanoseconds would otherwise be
+  mis-read as a huge seq — is treated as unparseable (oldest, pruned
+  first) in a mixed legacy+current dir; and `SetArchiveConfig` re-seeds on
+  a target dir that DIFFERS from the last successfully-seeded one
+  (monotonic-up only), not just at process start, so a runtime switch to a
+  previously-used dir cannot let that dir's higher-seq archives outrank the
+  ones this process is about to write. The re-seed keys off `archiveSeedDir`
+  (the last successfully-scanned dir), and `maxArchiveSeq` distinguishes a
+  directory READ error from a legitimately empty dir: a transient scan failure
+  leaves the counter unchanged and the dir un-seeded so the next call retries,
+  rather than pinning the counter at 0 below the on-disk max and pruning every
+  fresh archive as stale (#6396 Codex MINOR 4). Two narrow reseed edges remain
+  open (tracked in #6404, not yet closed): a commit that lands in the window
+  AFTER a failed scan but BEFORE the next `SetArchiveConfig` retry captures the
+  still-low seq; and a disable→re-enable to the SAME dir (`A`→`""`→`A`) does
+  not rescan (archiveSeedDir is not invalidated on disable), so archives
+  written to `A` while archival was off are not accounted for. The
+  rollback/archive writers
   route through package-var seams (`rbWriteFileDurable`,
   `rbWriteFileAtomic`, `rbSyncDir`, `rbRemove`) so tests can pin the
   durability call and inject failures (#1916 pattern).

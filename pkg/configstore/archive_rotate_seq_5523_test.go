@@ -114,6 +114,10 @@ func TestParseArchiveSeq(t *testing.T) {
 		"config-20260628.conf",    // single field, no seq
 		"notes.txt",               // not an archive
 		"config-20260628-1.2.txt", // wrong suffix
+		// #6396: a legacy pre-#3441 config-<ts>.conf with a subsecond ts has ONE
+		// dot (the ts's nanoseconds) in core. The old parse mis-read those
+		// nanoseconds as a sequence; it must now be rejected as unparseable.
+		"config-20260628-120000.123456789.conf",
 	} {
 		if seq, ok := parseArchiveSeq(bad); ok {
 			t.Errorf("parseArchiveSeq(%q) = (%d, true), want ok=false", bad, seq)
