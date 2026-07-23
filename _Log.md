@@ -57707,3 +57707,19 @@ top.
     README notes this bound.
   **File(s)**: pkg/cluster/failover.go, pkg/cluster/README.md,
     pkg/cluster/failover_lease_5079_test.go, pkg/daemon/daemon_ha_sync.go
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6284 item 2 — close the residual config-epoch sweep-vs-advance
+    race. Added an apply-in-progress fence (`applyingConfigGen`) raised by
+    `configApplyLoop` before `OnConfigReceived` (the sweep runs inside it) and
+    lowered only after the high-water advances (success) or the apply fails.
+    `configEpochStale` now refuses against `max(applyingConfigGen,
+    lastAppliedConfigGen)` (fence read first) so an older-epoch install racing
+    the sub-µs window is refused against the applying generation instead of
+    admitted against the stale high-water. `resetRecvGen` clears the fence
+    alongside the high-water. Item 1 (reverse active/active direction) stays a
+    documented fail-OPEN residual. Fail-on-revert tests + docs updated.
+  **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn_config.go,
+    pkg/cluster/sync_conn_gen.go,
+    pkg/cluster/sync_config_epoch_sweep_race_6284_test.go,
+    docs/session-sync-architecture.md, pkg/cluster/README.md
