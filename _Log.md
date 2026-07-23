@@ -59562,3 +59562,21 @@ top.
     clean assertions; restored green.
   - **File(s)**: pkg/cli/cli_request_ping.go, pkg/cli/cli_request_argv_test.go,
     pkg/cli/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6355 fix — test/xsk-repro/selftest-compile.sh's SKIP probes
+    word-split $CC like the Makefile's $(CC). The tool-gate `command -v "$CC"`
+    and the trial-link `"$CC" -x c -` both QUOTED $CC, so a multi-token wrapper
+    compiler (`ccache gcc`, `env cc`, `gcc -flag`) that `make check` accepts
+    false-SKIPped (over-skip, never a hidden failure — hence LOW; #6353 Codex
+    M2 follow-up). Fix: extract the first word for the existence check
+    (`CC_BIN=${CC%% *}`) and leave $CC unquoted (word-split) for the trial link,
+    matching $(CC). Fail-on-revert gate `selftest-multitoken-cc_6355.sh`
+    (hermetic — `env <fakecc>` models a working toolchain) asserts the wrapper
+    CC reaches PASS (exit 0); re-quoting EITHER probe as "$CC" makes the wrapper
+    unfindable/unexecutable → SKIP (exit 77) → RED. Verified RED→GREEN on both
+    revert directions firsthand. Registered under `make selftest`. Documented
+    in test/xsk-repro/README.md (#6355 follow-up to the M2 note).
+  - **File(s)**: test/xsk-repro/selftest-compile.sh,
+    test/xsk-repro/selftest-multitoken-cc_6355.sh, scripts/run-selftests.sh,
+    test/xsk-repro/README.md, _Log.md
