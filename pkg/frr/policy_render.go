@@ -610,7 +610,11 @@ func (s *bfdSection) render() string {
 		// VRF-bound neighbor; otherwise the session stays DOWN and
 		// sub-second failover never works (#2489).
 		if p.vrfName != "" {
-			fmt.Fprintf(&b, " peer %s vrf %s\n", p.address, p.vrfName)
+			// Render belt (#5557): sanitize the routing-instance name like the
+			// `router ... vrf` and static-route vrf clauses. A leniently-loaded
+			// control character in the instance name would otherwise inject a
+			// standalone line into the managed `bfd` block.
+			fmt.Fprintf(&b, " peer %s vrf %s\n", p.address, sanitizeFRRValue(p.vrfName))
 		} else {
 			fmt.Fprintf(&b, " peer %s\n", p.address)
 		}
@@ -688,7 +692,14 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 
 	vrfSuffix := ""
 	if vrfName != "" {
-		vrfSuffix = " vrf " + vrfName
+		// Render belt (#5557): sanitize the routing-instance name for the
+		// `router <proto> ... vrf <name>` clauses this suffix feeds
+		// (OSPF/OSPFv3/BGP/RIP/IS-IS). The name is validated at commit, but
+		// the tolerant load / HA config-sync paths only warn (#1960 no-brick),
+		// so a control character could otherwise inject a second vtysh line
+		// into the managed frr.conf. Mirrors the static-route vrf clause
+		// (config_render.go) and the BFD peer vrf clause below.
+		vrfSuffix = " vrf " + sanitizeFRRValue(vrfName)
 	}
 
 	if ospf != nil {

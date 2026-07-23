@@ -77,20 +77,45 @@ func policyDetailState(schedulerName string, activeState map[string]bool, haveSc
 	return "enabled"
 }
 
-// validatePolicyZoneFilter rejects a malformed from-zone/to-zone selector: a
-// keyword with no following zone value (e.g. "... from-zone trust to-zone").
-// The prior loose parse silently dropped the dangling predicate and returned a
-// broader/one-sided policy inventory (#4908 / C175-HC-116/126 cohort), matching
-// the tighter parse already required by the policy simulator.
+// isPolicyFilterKeyword reports whether tok is a leading `show security
+// policies` subcommand keyword (brief/detail/hit-count/global) rather than a
+// zone filter. These carry no value and are not from-zone/to-zone selectors, so
+// the selector validator permits them while still rejecting a genuinely
+// unrecognized token.
+func isPolicyFilterKeyword(tok string) bool {
+	switch tok {
+	case "brief", "detail", "hit-count", "global":
+		return true
+	}
+	return false
+}
+
+// validatePolicyZoneFilter rejects BOTH a from-zone/to-zone selector missing its
+// zone value (e.g. "... from-zone trust to-zone") AND an unrecognized filter
+// token (e.g. a typo'd `from-zonee`, or a stray word). The local `show security
+// policies` dispatch extracts the from-zone/to-zone pair with
+// parsePolicyZoneFilter and silently DROPS every other token, so a mistyped
+// selector key (`from-zonee trust`) left that filter dimension empty and WIDENED
+// the view to every zone — an operator could read a narrow policy set as the
+// whole table (#4908 / C175-HC-116/126 cohort / #5557). Rejecting the unknown
+// key here mirrors the daemon-side gRPC parseZoneFilter's default-error rule
+// (pkg/grpcapi/server_show_policies_text.go). A leading subcommand keyword is
+// permitted; the token following from-zone/to-zone is consumed as its value
+// unconditionally.
 func validatePolicyZoneFilter(args []string) error {
 	for i := 0; i < len(args); i++ {
-		if args[i] != "from-zone" && args[i] != "to-zone" {
-			continue
+		switch args[i] {
+		case "from-zone", "to-zone":
+			if i+1 >= len(args) || args[i+1] == "from-zone" || args[i+1] == "to-zone" {
+				return fmt.Errorf("missing zone name after %q", args[i])
+			}
+			i++ // skip the consumed value
+		default:
+			if isPolicyFilterKeyword(args[i]) {
+				continue
+			}
+			return fmt.Errorf("unrecognized filter token %q (expected from-zone/to-zone)", args[i])
 		}
-		if i+1 >= len(args) || args[i+1] == "from-zone" || args[i+1] == "to-zone" {
-			return fmt.Errorf("missing zone name after %q", args[i])
-		}
-		i++ // skip the consumed value
 	}
 	return nil
 }
