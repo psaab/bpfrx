@@ -1,3 +1,65 @@
+## 2026-07-22 — #6236 PR-1: delete 8 grep-proven-dead FilterState fields
+
+- **Timestamp**: 2026-07-22 (refactor/6236-p1-dead-filter-fields)
+- **Action**: Pure-deletion refactor removing eight dead fields from
+  `FilterState` (`userspace-dp/src/filter/mod.rs`) plus their compiler writes.
+  This is PR-1 of the two-PR #6236 plan (`docs/research/6236-filterstate-
+  typed-hooks/plan.md` §3a/§5/§10); it advances but does NOT close #6236 —
+  PR-2 (the input property-set → `Filter`-flag convergence + single-lookup
+  call-site fold) stays in research per the plan-review. Deleted: the four
+  per-interface `"family:name"` name maps `iface_filter_v4` / `iface_filter_v6`
+  / `iface_filter_out_v4` / `iface_filter_out_v6` (`FxHashMap<i32,String>`,
+  zero production readers — one test read each at most); the two input
+  `iface_filter_v{4,6}_affects_tx_selection` sets (`FxHashSet<i32>`, read only
+  by the test-only helper `interface_filter_affects_tx_selection`, itself
+  deleted); and the two `lo0_filter_v{4,6}` qualified-key `String`s, which were
+  compiler intermediates only (used to derive `lo0_filter_v{4,6}_fast`) and are
+  now lifted to compiler locals `lo0_filter_v{4,6}_key`. The struct retains the
+  six `_fast` maps + two lo0 `_fast` Options, the three registries, and all six
+  aggregate booleans (`has_input_tx_selection_*`, `has_output_tx_selection_*`,
+  `has_input_three_color_policer_*`). The LIVE output `iface_filter_out_v{4,6}_
+  needs_tx_eval` sets and the six live input property sets (`_affects_route_
+  lookup`, `_has_dscp_match`, `_has_per_packet_l4_match`) are UNTOUCHED — they
+  are PR-2 scope. Net: **31 → 23 fields**. Files: `filter/mod.rs` (struct),
+  `filter/compiler.rs` (dropped four name-map `.insert`s + two dead-set
+  `.insert`s + lifted lo0 keys to locals), `filter/engine/tx_selection.rs`
+  (deleted the test-only helper), `filter/engine/mod.rs` (dropped its
+  re-export), `filter/tests.rs` (rewrote the two tests that read deleted fields
+  to read the retained fast maps + aggregate; added a `size_of::<FilterState>()`
+  evidence test), `filter/README.md` (#3296 section documents the removal).
+  CRITICAL: the #3296 `MissingFilterRef` fail-closed guards are byte-for-byte
+  unchanged — deleting a name-map `.insert` never touched the `filters.get()`
+  presence check that precedes it, and the retained `has_input_tx_selection_*`
+  aggregate writes are preserved.
+- **Validation**: `cargo build --release` green (exit 0). `cargo clippy
+  --release --all-targets` — the ONLY error is a pre-existing deny-by-default
+  `mut_from_ref` in the UNTOUCHED `afxdp/umem/mmap.rs:150` (`slice_mut_unchecked`
+  is byte-identical on origin/master; no toolchain pin, clippy 1.96.0); my diff
+  introduces ZERO new clippy findings in `filter/`. Plain-build warning count
+  is 176 on master → **175** on this branch (one FEWER — the deleted
+  `interface_filter_affects_tx_selection` re-export). Full `cargo test --release
+  -- --test-threads=1` GREEN from the crate root (disk target
+  `/home/ps/.cache/xpf-cargo-6236p1`, `TMPDIR=/tmp`): **4219 passed, 0 failed,
+  2 ignored** (4128 + 60 + 8 + 22 + 1), REAL cargo exit 0. `size_of::
+  <FilterState>` measured **736 → 496 bytes** (−240; matches the plan estimate)
+  via `filter_state_struct_size_is_reported`. Behavior-preservation proof:
+  (a) independent grep on origin/master shows each of the 8 fields has zero
+  production readers (name maps + lo0 strings = compiler-write + test-read only;
+  the two `_affects_tx_selection` sets read only by the deleted test-only
+  helper); (b) full suite green with the tx_selection helper's test callers
+  rewritten against the retained `filter_state_has_input_tx_selection` aggregate.
+  Fail-on-revert: the retained aggregate wiring is bound by the existing
+  `parse_filter_state_prequalifies_interface_and_lo0_filter_keys` (asserts
+  `has_input_tx_selection_v4`) and `thin_accessor_predicates` (asserts
+  `filter_state_has_input_tx_selection`) — neutralizing the kept
+  `state.has_input_tx_selection_v4 = true;` compiler line drives both RED
+  (verified).
+- **File(s)**: `userspace-dp/src/filter/mod.rs`,
+  `userspace-dp/src/filter/compiler.rs`,
+  `userspace-dp/src/filter/engine/tx_selection.rs`,
+  `userspace-dp/src/filter/engine/mod.rs`,
+  `userspace-dp/src/filter/tests.rs`, `userspace-dp/src/filter/README.md`
+
 ## 2026-07-22 — #6244: typed reconcile progress replaces last_reconcile_stage string
 
 - **Timestamp**: 2026-07-22 (fix/6244-typed-reconcile-progress)
