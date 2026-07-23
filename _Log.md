@@ -57928,3 +57928,99 @@ top.
     ./pkg/api/... ./pkg/grpcapi/... green; vet + gofmt clean.
   **File(s)**: pkg/api/server.go, pkg/api/tls_san_5719_test.go,
     pkg/api/tls_test.go, pkg/api/README.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #5720 C-TOOLS cohort triage — fixed 5 low-risk tooling
+    survivors from codex-review-182; dispositioned 2 out-of-scope. C01: extend
+    `analyzePolicyShadowing` to also lint the global-policy list
+    (`security policies global`) with a `globalScopeCovers` from/to-zone
+    containment gate (avoids false positives across disjoint global scopes).
+    C02: remove the unreachable `return nil` after the CLI REPL's infinite
+    `for {}` (go vet clean). C03: correct the `vdso_probe2.c` header comment
+    which claimed a `/proc/self/maps` cross-check it never performed. b02/C1:
+    add an up-front (V4 src, V6 dst) fail-closed gate to `policymatch.Match`
+    (`Result.UnsupportedTupleFamily` + dedicated `DisplayAction` string),
+    mirroring the runtime `policy.rs` NAT46-impossible arm. b03-C01: `validate.py`
+    cleanup retains `self.work` under `--keep` (day-0 media backing retained
+    VMs). Out-of-scope: C04 (cli_show_flow.go 1262-LOC modularity → open #5661),
+    b03-F03 (dangling `current` symlink rollback guard → PRODUCTION pkg/upgrade,
+    MATERIAL Medium → dedicated issue).
+  - **File(s)**: pkg/cli/cli.go, pkg/cli/cli_request_policies_check.go,
+    pkg/cli/cli_request_policies_check_test.go, pkg/policymatch/policymatch.go,
+    pkg/policymatch/mixed_family_tuple_5720_test.go, pkg/policymatch/README.md,
+    scripts/image/validate.py, scripts/image/test_validate_ownership.py,
+    docs/image-validation.md,
+    docs/pr/812-tx-latency-histogram/evidence/vdso_probe2.c
+
+- **Timestamp**: 2026-07-23 (rev6375 review-fold)
+  - **Action**: Fold rev6375 MINOR (#6375 / Advances #5720): surface the
+    `UnsupportedTupleFamily` verdict on all render surfaces, not just REST +
+    gRPC `MatchPolicies`. The #5720 `Match`-side gate is transport-agnostic, but
+    only the two `DisplayAction()` callers rendered the dedicated verdict; the
+    three hand-rolled text renders (`test security policy-match`,
+    `show security match-policies`, gRPC show-firewall `test policy` bridge) fell
+    through to a fabricated `Default deny (no matching policy)` for the
+    *impossible* (V4 src, V6 dst) tuple — misleading an operator toward a NAT46
+    permit that can never take effect. Added an `if res.UnsupportedTupleFamily`
+    branch to each (mirroring their `ContentRejected` / `HostInboundUnmatched`
+    arms) that prints `res.DisplayAction()`. Render-side fail-on-revert:
+    `server_show_testpolicy_unsupported_tuple_5720_test.go` (drop the gRPC-text
+    arm → the tuple falls back to `no matching policy`, RED-verified). Pure
+    diagnostic-display consistency; fail-closed safety was already correct on
+    every surface (all deny). README render-coverage note added.
+  - **File(s)**: pkg/cli/cli_request_testcmd.go, pkg/cli/cli_show_security.go,
+    pkg/grpcapi/server_show_firewall.go,
+    pkg/grpcapi/server_show_testpolicy_unsupported_tuple_5720_test.go,
+    pkg/policymatch/README.md
+
+- **Timestamp**: 2026-07-23 (rev6375 Codex-fold, findings 1/2/3/5)
+  - **Action**: Fold three verified Codex hostile-review findings + minor nits
+    into the C-TOOLS cohort (#6375 / Advances #5720).
+    - **Finding 1 (global-shadow lint FALSE-POSITIVE, fixed):**
+      `globalScopeCovers` now excludes CROSS-enforcement-path pairs. Host-inbound
+      globals (`match to-zone junos-host`, `config.IsHostToZoneScope`) and transit
+      globals are enforced on separate dataplane paths (the host gate
+      `matchJunosHost` never falls through to the transit global tier), so a
+      transit-scoped global must never be reported as shadowing a host-scoped one,
+      and vice versa. Before the fix an unscoped/`to-zone any` transit permit
+      falsely "covered" a later reachable `to-zone junos-host` deny. Fail-on-revert
+      test `TestAnalyzePolicyShadowingGlobalHostVsTransitNotShadowed` (drop the
+      `IsHostToZoneScope` guard → the host deny is falsely SHADOWED, RED-verified).
+    - **Finding 2 (global-shadow lint FALSE-NEGATIVE, fixed):** `zoneSetCovers`
+      now treats an explicit `["any"]` scope as the all-zones universal set via the
+      runtime SSOT `config.IsWildcardZoneSet` (empty OR contains "any"), matching
+      `build_global_zone_scope` in `userspace-dp/src/policy.rs`. Before, an
+      explicit-`any` global was read as a concrete one-element set and failed to
+      cover a narrower later global it in fact makes redundant. Fail-on-revert test
+      `TestAnalyzePolicyShadowingGlobalExplicitAnyScopeShadows` (restore the
+      len==0-only test → the redundancy goes unreported, RED-verified).
+    - **Finding 3 (policymatch gate folds IPv4-mapped IPv6, DOCUMENTED + FILED
+      #6377):** the #5720 unsupported-tuple gate reads family with `To4()`, which
+      folds `::ffff:192.0.2.1` to non-nil, so `::ffff:192.0.2.1 -> 2001:db8::1` is
+      falsely flagged UnsupportedTupleFamily while the colon-strict runtime sees
+      V6/V6. Verified firsthand that all four `Query` builders parse with
+      `net.ParseIP`, which makes `192.0.2.1` and `::ffff:192.0.2.1` byte-identical
+      16-byte values — the colon signal is destroyed at parse, so NO colon-strict
+      determination is available at the gate. The only correct fix threads the
+      text family (`config.NATAddrFamily`) from each caller through `Query` (a
+      cross-package API change, out of scope for this cohort). Documented precisely
+      in the gate comment + `pkg/policymatch/README.md`; filed follow-up #6377 with
+      the `compiler_nat_helpers.go` precedent and a concrete fix sketch. No
+      half-correct fix shipped. (Fail-safe: the false positive is a spurious
+      advisory, never a hidden/fabricated permit.)
+    - **Finding 5a (test coverage):** extended
+      `TestAnalyzePolicyShadowingGlobalDisjointScopeNotShadowed` with a ToZones
+      difference case (disjoint to-zone scopes must not shadow) plus an all-zones
+      to-zone positive control — the guard was previously only exercised on
+      FromZones.
+    - **Finding 5b (doc):** corrected `docs/pr/812-tx-latency-histogram/plan.md`
+      line 509 — the stale "dumps /proc/self/maps | grep vdso" claim now matches
+      the corrected `vdso_probe2.c` scope comment (probe checks AT_SYSINFO_EHDR +
+      one clock_gettime; the maps grep is a separate manual cross-check).
+    Skipped the pre-existing Makefile vet-scope nit (out of scope). Did not touch
+    the three render-surface UnsupportedTupleFamily arms (Codex finding 4 already
+    folded). `go build`/`go vet`/`gofmt -l` clean; full `go test ./pkg/cli/...`
+    and `./pkg/policymatch/...` GREEN.
+  - **File(s)**: pkg/cli/cli_request_policies_check.go,
+    pkg/cli/cli_request_policies_check_test.go, pkg/policymatch/policymatch.go,
+    pkg/policymatch/README.md, docs/pr/812-tx-latency-histogram/plan.md

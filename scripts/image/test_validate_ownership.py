@@ -26,6 +26,7 @@ and the foreign-tag deletion is no longer refused — the assertions flip.
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import types
 import unittest
 from pathlib import Path
@@ -158,6 +159,55 @@ class CleanupTests(unittest.TestCase):
                 h.cleanup()
         self.assertEqual(rec.image_deletes(), [],
                          "cleanup must not delete an alias this run did not import")
+
+
+class CleanupWorkDirTests(unittest.TestCase):
+    """--keep must retain the per-run scratch dir (codex-182 A10-b03-C01).
+
+    self.work backs the day-0 ISOs / config drives whose HOST paths are
+    attached to the instances. Before the fix cleanup() ran an unconditional
+    `rm -rf self.work` even under --keep, orphaning the retained VMs' media.
+
+    RED on revert: move `rm -rf self.work` back out of the else branch (make
+    it unconditional) and test_cleanup_keep_retains_work_dir flips — the rm
+    call reappears under keep=True.
+    """
+
+    @staticmethod
+    def _rm_work_calls(runs, work):
+        return [c for c in runs if c[:2] == ("rm", "-rf") and work in c]
+
+    def _run_cleanup(self, keep):
+        h = _harness(keep=keep)
+        # tempfile.mkdtemp made a real dir; reap it after the test since the
+        # keep path deliberately never deletes it.
+        self.addCleanup(shutil.rmtree, h.work, ignore_errors=True)
+        h.instances = []
+        h.created_net = False
+        h.imported_alias = False
+        runs = []
+
+        def _run(cmd, *a, **kw):
+            runs.append(tuple(cmd))
+            return types.SimpleNamespace(returncode=0)
+
+        with mock.patch.object(validate, "incus", _IncusRecorder()):
+            with mock.patch.object(validate.subprocess, "run", _run):
+                h.cleanup()
+        return h, runs
+
+    def test_cleanup_keep_retains_work_dir(self):
+        h, runs = self._run_cleanup(keep=True)
+        self.assertEqual(
+            self._rm_work_calls(runs, h.work), [],
+            "cleanup(--keep) must NOT rm -rf the scratch dir — it backs the "
+            "day-0 media attached to the instances we just kept")
+
+    def test_cleanup_no_keep_still_removes_work_dir(self):
+        h, runs = self._run_cleanup(keep=False)
+        self.assertEqual(
+            len(self._rm_work_calls(runs, h.work)), 1,
+            "cleanup() without --keep must still purge the scratch dir")
 
 
 if __name__ == "__main__":

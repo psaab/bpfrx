@@ -7,10 +7,19 @@
  * address of that mapping — a non-zero return is the kernel's
  * contract that VDSO is available to this process.
  *
+ * Scope: this probe checks only two things — that AT_SYSINFO_EHDR is
+ *        non-zero (the VDSO mapping is visible to the process) and that
+ *        clock_gettime(CLOCK_MONOTONIC) succeeds. It does NOT dump
+ *        /proc/self/maps, resolve __vdso_clock_gettime, or prove that
+ *        the call dispatched through the VDSO rather than a syscall
+ *        fallback. The sibling vdso_probe.c supplies that syscall-fallback
+ *        gate via its 10,000-call `strace` count; run it for the
+ *        dispatch-path proof this probe deliberately does not make.
+ *
  * Build:  gcc -O2 -o vdso_probe2 vdso_probe2.c
  * Output: prints the VDSO base address (must be non-zero on a
- *         seccomp profile that allows the process to observe it)
- *         and then dumps /proc/self/maps | grep vdso to cross-check.
+ *         seccomp profile that allows the process to observe it) and the
+ *         result of one clock_gettime(CLOCK_MONOTONIC) call.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
