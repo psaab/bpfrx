@@ -56711,6 +56711,68 @@ top.
   pkg/snmp/agent_ber.go, pkg/routing/README.md, pkg/snmp/README.md
 
 - **Timestamp**: 2026-07-22
+- **Action**: #6308 (WG transit-egress TX DISPATCH SSOT — follow-up to
+  #5292/#6306) — the AF_XDP WireGuard transit-egress DISPATCH selected the
+  egress NIC from the zeroed-endpoint resolution's tx_ifindex/egress_ifindex
+  (#2837 stores tx_ifindex=0 / egress=logical wgN). With a default route in
+  the WG transport table tx_ifindex>0 resolves to the physical WAN parent and
+  dispatch works (common case). With ONLY a specific peer route and NO default,
+  tx_ifindex=0 → resolve_tx_binding_ifindex(logical wgN) returned the logical
+  ifindex (no XSK binding) → the TX dispatcher NO_EGRESS_BINDING-DROPPED a frame
+  #5292 built correctly. Fix: resolve the physical underlay egress against the
+  SAME selected-peer route #5292 uses for the frame bytes
+  (wg_transit_egress_physical_egress_ifindex → wg_peer_outer_dst →
+  outer_physical_egress_resolution → outer_egress_ifindex_or_fallback), fed
+  through resolve_forward_target_ifindex → resolve_tx_binding_ifindex — so
+  dispatch and bytes agree on one physical NIC. The peer-route resolution runs
+  ONLY on the tx_ifindex==0 (previously-dropped) path; default-route WG traffic
+  and every non-WG forward keep the zero-extra-work tx_ifindex>0 fast path.
+  RED-on-revert (assertion, target-count 1): reverting the WG dispatch
+  resolution to resolve_tx_binding_ifindex(logical) makes
+  wg_transit_egress_dispatch_specific_peer_no_default_6308 fail with left=400
+  (logical wgN) vs right=6 (reth0.80 physical parent). Full cargo suite green:
+  4124 + 60 + 8 + 22 + 1, 0 failed; named test 3x clean.
+- **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/forward_request.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs,
+  userspace-dp/src/afxdp/frame/README.md, docs/wireguard-interop.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: Fold #6340 into #6308 PR — dispatch peer selection follows the
+  POST-NAT dst (close the #6308 DNAT SSOT hole). #6308 resolved the dispatch
+  egress by selecting the WG peer from the inner-dst AllowedIPs LPM, but at the
+  dispatch site (resolve_forward_target_ifindex) the frame in hand is the
+  PRE-NAT ingress frame while wg_encap_frame selects its peer from the POST-NAT
+  frame (build_forwarded_frame_into_from_frame writes nat.rewrite_dst into `out`
+  via apply_nat_ipv4/6, THEN wg.rs reads inner_dst_ip(&out)). Under a DNAT
+  rewriting the inner dst ACROSS two AllowedIPs peers on DISTINCT physical
+  underlays (no default route → tx_ifindex==0), the #6308 dispatch targeted the
+  PRE-NAT peer's NIC while the bytes carried the POST-NAT peer's L2 — a wire
+  mismatch (dispatch and bytes disagree on the physical NIC). Not a #6308
+  regression (that edge already dropped pre-#6308) but the SSOT thesis
+  "dispatch and bytes agree on ONE physical NIC" must hold unconditionally.
+  Fix: wg_transit_egress_physical_egress_ifindex now keys the peer selection on
+  decision.nat.rewrite_dst (the post-DNAT dst) when a same-family DNAT applies,
+  else the frame's parsed inner dst — the SAME key wg_encap_frame reads from
+  `out`. NAT64 (nat.nat64) is excluded (address-family change → neither
+  rewrite_dst nor the pre-NAT frame dst is a valid same-family AllowedIPs key):
+  returns None → the conservative logical-ifindex fallback (fail-closed; a
+  NAT64→WG transit flow is undeliverable on this path regardless). NatDecision
+  fields used: rewrite_dst: Option<IpAddr> (post-DNAT dst) and nat64: bool
+  (nat/mod.rs:91-99), reached via SessionDecision.nat (session/entry.rs:13).
+  RED-on-revert (assertion): neutralizing the rewrite_dst selection (revert the
+  fold → parse the pre-NAT frame) makes wg_transit_egress_dispatch_follows_post_
+  nat_peer_6308 fail with left=Some(12) (pre-NAT peer A / reth0.80) vs
+  right=Some(13) (post-NAT peer B / reth0.50). Original parent-RED still holds:
+  reverting the #6308 dispatch resolution makes
+  wg_transit_egress_dispatch_specific_peer_no_default_6308 fail left=400 vs
+  right=6. Full cargo --release suite green: 4216 passed, 0 failed; named tests
+  3x clean.
+- **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/frame/README.md, docs/wireguard-interop.md
 - **Action**: #5661 (Go control-plane modularity cohort) — pure
   code-motion split of pkg/cluster/sync_conn.go (2228 lines, ~1595 prod
   LOC, over the ~2000 threshold). Extracted five cohesive sibling files
