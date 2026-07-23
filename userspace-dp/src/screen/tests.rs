@@ -5681,3 +5681,173 @@ fn fabric_skip_leaves_direct_ingress_counting_intact_4155() {
         "direct ingress reaches the flood threshold at the correct count"
     );
 }
+
+// ================================================================
+// #6238 — shared source-independent screen extraction
+//
+// Two helpers now single-source the previously hand-mirrored
+// source-independent screen orchestration:
+//   - `stateless::check_fragment_and_route` — the common stateless tail
+//     (ping-of-death → teardrop → icmp-fragment → source-route), run at the
+//     SAME precedence slot on the flow-present and flowless paths.
+//   - `ZoneScreenState::enforce_common_rate_floods` — the common ICMP/UDP
+//     flood block, run right after each path's fabric `skip_rate_flood` gate.
+//
+// LAND and the TCP-flag screens are DELIBERATELY excluded from the shared
+// tail (LAND is `addrs_known`-gated on the flowless path and precedes the
+// full-only TCP-flag screens; a contiguous LAND-through-source-route helper
+// would flip drop precedence — the reason string selects the per-reason drop
+// counter via `screen_reason_drop_index`). These tests pin the precedence a
+// single-feature test cannot catch, and prove BOTH paths route through the
+// shared helpers (fail-on-revert).
+// ================================================================
+
+#[test]
+fn precedence_full_tcp_flag_screens_precede_fragment_route_tail_6238() {
+    // Multi-trigger: a TCP packet carrying an LSRR/SSRR source-route option
+    // that is ALSO SYN+FIN triggers BOTH the full-only TCP-flag screen
+    // (`tcp-syn-fin`, ordinal 8) AND the shared fragment/route tail
+    // (`ip-source-route`, ordinal 12). Because `check_tcp_flag_screens` runs
+    // IMMEDIATELY BEFORE `check_fragment_and_route` on the full path, the
+    // winning reason MUST be `tcp-syn-fin`. A single-feature test cannot catch
+    // a reorder that moved the shared tail ahead of the TCP-flag screens; this
+    // pins the precedence (and thus the per-reason drop-counter ordinal).
+    let mut state = make_state("trust", default_profile());
+    let mut pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        1234,
+        80,
+        TCP_SYN | TCP_FIN,
+    );
+    pkt.saw_ipv4_source_route = true; // extractor decoded LSRR/SSRR
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("tcp-syn-fin"),
+        "TCP-flag screens must precede the shared fragment/route tail"
+    );
+}
+
+#[test]
+fn precedence_full_land_precedes_tcp_flag_screens_6238() {
+    // Multi-trigger: a LAND packet (src == dst) that is ALSO SYN+FIN triggers
+    // BOTH LAND (`land-attack`, ordinal 5) and the TCP-flag screen
+    // (`tcp-syn-fin`, ordinal 8). LAND runs FIRST (unconditionally, before the
+    // TCP-flag screens), so the winning reason MUST be `land-attack`. Guards
+    // the LAND → TCP-flag ordering the shared-tail extraction must not disturb.
+    let mut state = make_state("trust", default_profile());
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let pkt = tcp_pkt(ip, ip, 80, 80, TCP_SYN | TCP_FIN);
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("land-attack"),
+        "LAND must precede the TCP-flag screens"
+    );
+}
+
+#[test]
+fn precedence_flowless_addrs_unknown_skips_land_runs_tail_and_floods_6238() {
+    // On the flowless path LAND is `addrs_known`-gated, but the shared
+    // fragment/route tail and the rate floods are NOT. A flowless fragment
+    // whose src == dst (would trip LAND) AND that carries a source-route
+    // option, with addrs_known=false, must SKIP LAND and drop on the tail's
+    // `ip-source-route` — proving the tail runs even when LAND is gated off.
+    // The same tuple with addrs_known=true drops `land-attack`, proving LAND
+    // precedes the tail when it is enabled.
+    let profile = ScreenProfile {
+        land: true,
+        source_route: true,
+        ..ScreenProfile::default()
+    };
+    let mut state = make_state("trust", profile);
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 7, 7));
+    let mut pkt = flowless_nonfirst_fragment(ip, ip, PROTO_UDP);
+    pkt.saw_ipv4_source_route = true;
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, false, 1),
+        ScreenVerdict::Drop("ip-source-route"),
+        "LAND gated off (addrs_known=false) but the shared tail must still run"
+    );
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 1),
+        ScreenVerdict::Drop("land-attack"),
+        "LAND precedes the shared tail when addrs are known"
+    );
+
+    // The rate floods run regardless of addrs_known. A clean flowless ICMP
+    // stream (no src==dst, no source-route) over threshold drops `icmp-flood`
+    // with addrs_known=false — proving `enforce_common_rate_floods` is reached
+    // on the flowless path independent of the LAND gate.
+    let flood_profile = ScreenProfile {
+        icmp_flood_threshold: 2,
+        ..ScreenProfile::default()
+    };
+    let mut flood_state = make_state("trust", flood_profile);
+    let fpkt = flowless_icmp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+    );
+    assert_eq!(
+        flood_state.check_flowless_screens("trust", &fpkt, false, 100),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        flood_state.check_flowless_screens("trust", &fpkt, false, 100),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        flood_state.check_flowless_screens("trust", &fpkt, false, 100),
+        ScreenVerdict::Drop("icmp-flood"),
+        "rate floods enforce regardless of addrs_known"
+    );
+}
+
+#[test]
+fn shared_fragment_route_helper_binds_flowless_path_6238() {
+    // FAIL-ON-REVERT (flowless leg): the flowless path enforces the shared
+    // fragment/route tail via `check_fragment_and_route`. Neutralizing the
+    // flowless `check_fragment_and_route` call site turns EXACTLY this test RED
+    // (the packet would PASS), proving the flowless path is single-sourced
+    // through the shared helper rather than an independent hand-mirrored copy.
+    let profile = ScreenProfile {
+        source_route: true,
+        ..ScreenProfile::default()
+    };
+    let mut state = make_state("trust", profile);
+    let mut pkt = flowless_nonfirst_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+    );
+    pkt.saw_ipv4_source_route = true;
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 1),
+        ScreenVerdict::Drop("ip-source-route")
+    );
+}
+
+#[test]
+fn shared_fragment_route_helper_binds_full_path_6238() {
+    // FAIL-ON-REVERT (full leg): the flow-present path enforces the SAME shared
+    // tail. Neutralizing the full-path `check_fragment_and_route` call site
+    // turns EXACTLY this test RED — the two paths route through ONE helper, so
+    // a future source-independent addition to `check_fragment_and_route` is
+    // enforced on both entry points by construction (the #3902 fail-open class).
+    let profile = ScreenProfile {
+        source_route: true,
+        ..ScreenProfile::default()
+    };
+    let mut state = make_state("trust", profile);
+    let mut pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        1234,
+        80,
+        TCP_SYN,
+    );
+    pkt.saw_ipv4_source_route = true;
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("ip-source-route")
+    );
+}

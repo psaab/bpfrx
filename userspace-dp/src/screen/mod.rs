@@ -61,7 +61,8 @@
 //!                     `SynCookieValidatedCache`, all cookie types.
 //! - `rate`          — per-zone sliding 1-second window `RateCounter`
 //!                     (two-bucket counter; no fixed wall-second reset, #2937).
-//! - `stateless`     — side-effect-free packet-policy helpers.
+//! - `stateless`     — side-effect-free packet-policy helpers, including the
+//!                     shared `check_fragment_and_route` tail (#6238).
 //! - `scan`          — port-scan + IP-sweep windowed trackers.
 //! - `session_limit` — per-IP session-count tracker.
 //! - `extract`       — allocation-free IP/TCP header parser.
@@ -103,6 +104,45 @@
 //! threshold-gated sub-state (see `ZoneScreenState::reconcile_substate`),
 //! preserving the exact pre-#4969 retention/reset behaviour. String keys are
 //! retained for now; numeric zone-id keying is deferred to #4421.
+//!
+//! ## Source-independent screen single-sourcing (#6238)
+//!
+//! Two entry points enforce the SOURCE-INDEPENDENT screens:
+//! `check_packet_with_zone_id_opts` (a packet with a real transport flow) and
+//! `check_flowless_screens_opts` (a non-first IP fragment / non-query ICMP
+//! control message that parses flowless, #2344/#3290). They historically
+//! HAND-MIRRORED the same checks in the same order, and a divergence between
+//! them was the fail-open class that bit #3902 (the flowless path once ran
+//! only the three fragment screens, bypassing source-route + the flood
+//! counters). Two helpers now single-source the shared orchestration so a
+//! future addition covers BOTH paths by construction:
+//!
+//! - [`stateless::check_fragment_and_route`] — the already-contiguous common
+//!   stateless tail: ping-of-death → teardrop → icmp-fragment → source-route.
+//!   Both paths call it at the SAME precedence slot.
+//! - [`ZoneScreenState::enforce_common_rate_floods`] — the common ICMP-flood
+//!   then UDP-flood block, called right after each path's fabric
+//!   `skip_rate_flood` gate.
+//!
+//! Deliberately NOT unified (a mega-helper would flip drop precedence, and the
+//! reason string selects the per-reason drop-counter ordinal via
+//! [`screen_reason_drop_index`], so a flip is operationally observable):
+//!
+//! - **LAND** stays a per-call at each site — UNCONDITIONAL on the full path,
+//!   `addrs_known`-gated on the flowless path — and on the full path it runs
+//!   BEFORE the TCP-flag screens. Folding it into the shared tail would drop
+//!   the flowless guard or reorder it across the TCP-flag screens.
+//! - **TCP-flag screens** and the whole **SYN-flood / SYN-cookie** block are
+//!   full-path only. The TCP-flag screens are INTERPOSED between LAND and the
+//!   shared tail on the full path and stay in place immediately before it.
+//!
+//! The full drop precedence is therefore, on the full path: LAND → TCP-flags →
+//! [fragment/route tail] → fabric-skip → [ICMP/UDP flood] → SYN-flood; and on
+//! the flowless path: LAND(`addrs_known`) → [fragment/route tail] →
+//! fabric-skip → [ICMP/UDP flood] → Pass. `skip_rate_flood` and LAND remain
+//! residual per-path mirrors; the extraction narrows the mirror surface, it
+//! does not eliminate it (issue #6238; the accepted-design plan lives on the
+//! `research/6238-unify-source-independent-screen` branch).
 
 use rustc_hash::FxHashMap;
 use std::net::IpAddr;
@@ -443,6 +483,48 @@ impl ZoneScreenState {
         }
         self.udp_counter
             .admit_is_over(now_ns, threshold.saturating_mul(SECONDARY_FLOOD_CEILING_MULT))
+    }
+
+    /// #6238: the common SOURCE-INDEPENDENT rate-flood block shared by the
+    /// flow-present (`check_packet_with_zone_id_opts`) and flowless
+    /// (`check_flowless_screens_opts`) paths — ICMP flood then UDP flood, in the
+    /// exact order and with the exact reason strings both paths already used.
+    ///
+    /// Both flood calls mutate DISJOINT sub-fields (`icmp_*` / `udp_*`) of THIS
+    /// already-looked-up `ZoneScreenState`, so routing both paths through this
+    /// one method keeps the #4969 single-`zones.get_mut`-per-packet invariant:
+    /// the caller still performs exactly one lookup and hands the borrow here.
+    /// The ICMP/UDP thresholds are copied out of `self.profile` up front so the
+    /// immutable profile read is released before the `&mut self` flood mutations
+    /// (the same disjoint-borrow discipline the open-coded block used).
+    ///
+    /// `pkt.dst_port` is passed through UNCHANGED so the #4567 flowless
+    /// zero-port fold stays INSIDE `udp_flood_drop` (a `dst_port == 0` fragment
+    /// folds into the per-destination-IP bucket). No flowless mode flag is
+    /// needed. Worker-local counters only; no allocation, lock, or dynamic
+    /// dispatch on the packet path. Returns the drop reason or `None`.
+    #[inline]
+    fn enforce_common_rate_floods(
+        &mut self,
+        pkt: &ScreenPacketInfo,
+        now_ns: u64,
+    ) -> Option<&'static str> {
+        let icmp_flood_threshold = self.profile.icmp_flood_threshold;
+        if icmp_flood_threshold > 0
+            && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
+            && self.icmp_flood_drop(&pkt.dst_ip, icmp_flood_threshold, now_ns)
+        {
+            return Some("icmp-flood");
+        }
+
+        let udp_flood_threshold = self.profile.udp_flood_threshold;
+        if udp_flood_threshold > 0
+            && pkt.protocol == PROTO_UDP
+            && self.udp_flood_drop(&pkt.dst_ip, pkt.dst_port, udp_flood_threshold, now_ns)
+        {
+            return Some("udp-flood");
+        }
+        None
     }
 }
 
@@ -850,16 +932,12 @@ impl ScreenState {
         if let Some(reason) = stateless::check_tcp_flag_screens(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_ping_of_death(&zstate.profile, pkt) {
-            return ScreenVerdict::Drop(reason);
-        }
-        if let Some(reason) = stateless::check_teardrop(&zstate.profile, pkt) {
-            return ScreenVerdict::Drop(reason);
-        }
-        if let Some(reason) = stateless::check_icmp_fragment(&zstate.profile, pkt) {
-            return ScreenVerdict::Drop(reason);
-        }
-        if let Some(reason) = stateless::check_source_route(&zstate.profile, pkt) {
+        // #6238: the common stateless tail (ping-of-death → teardrop →
+        // icmp-fragment → source-route) shared with the flowless path, called
+        // at the SAME precedence slot — immediately AFTER the full-only
+        // TCP-flag screens and BEFORE the fabric-skip gate. Byte-identical to
+        // the open-coded run it replaces (see `stateless::check_fragment_and_route`).
+        if let Some(reason) = stateless::check_fragment_and_route(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
 
@@ -883,14 +961,15 @@ impl ScreenState {
         }
 
         // --- Rate-based flood checks ---
-        // Copy the small scalar thresholds/flags out of the profile up front so
-        // the shared `&zstate.profile` borrow is released before the mutable
-        // per-zone sub-field accesses below (and the whole-`self` SYN-cookie
-        // epoch call on the mint path). #4969: `zstate.profile` and the mutable
-        // sub-fields are disjoint, but pulling the scalars up front keeps the
-        // borrow story trivial.
-        let icmp_flood_threshold = zstate.profile.icmp_flood_threshold;
-        let udp_flood_threshold = zstate.profile.udp_flood_threshold;
+        // Copy the small SYN scalar thresholds/flags out of the profile up
+        // front so the shared `&zstate.profile` borrow is released before the
+        // mutable per-zone sub-field accesses below (the ICMP/UDP flood helper
+        // and the whole-`self` SYN-cookie epoch call on the mint path). #4969:
+        // `zstate.profile` and the mutable sub-fields are disjoint, but pulling
+        // the scalars up front — BEFORE the rate mutation — keeps the borrow
+        // story trivial. #6238: the ICMP/UDP flood thresholds are no longer
+        // copied here; they are read inside `enforce_common_rate_floods`, which
+        // owns the shared flood block.
         let syn_flood_threshold = zstate.profile.syn_flood_threshold;
         let syn_cookie = zstate.profile.syn_cookie;
         // Profile-wide `alarm-without-drop` audit mode. Used to gate the
@@ -907,23 +986,15 @@ impl ScreenState {
 
         let mut syn_cookie_bypassed = false;
 
-        // ICMP flood — per-DESTINATION cap (PRIMARY) + per-zone aggregate ceiling
-        // (SECONDARY). Junos measures this rate per destination IP (#4112 F18).
-        if icmp_flood_threshold > 0
-            && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
-            && zstate.icmp_flood_drop(&pkt.dst_ip, icmp_flood_threshold, now_ns)
-        {
-            return ScreenVerdict::Drop("icmp-flood");
-        }
-
-        // UDP flood — per-DESTINATION (IP + PORT) cap (PRIMARY) + per-zone
-        // aggregate ceiling (SECONDARY). Junos caps per destination IP AND port
-        // (#4112 F18).
-        if udp_flood_threshold > 0
-            && pkt.protocol == PROTO_UDP
-            && zstate.udp_flood_drop(&pkt.dst_ip, pkt.dst_port, udp_flood_threshold, now_ns)
-        {
-            return ScreenVerdict::Drop("udp-flood");
+        // #6238: ICMP flood then UDP flood — the source-independent rate block
+        // shared with the flowless path (`enforce_common_rate_floods`). Same
+        // precedence, same reason strings, same per-destination-cap (PRIMARY) +
+        // per-zone aggregate ceiling (SECONDARY) as before (#4112 F18); the
+        // full-path SYN-flood block below is layered AFTER it, unchanged.
+        // `pkt.dst_port` is passed through so the #4567 zero-port fold stays
+        // inside `udp_flood_drop`.
+        if let Some(reason) = zstate.enforce_common_rate_floods(pkt, now_ns) {
+            return ScreenVerdict::Drop(reason);
         }
 
         // SYN flood: count TCP SYN (without ACK) per zone.
@@ -1222,16 +1293,13 @@ impl ScreenState {
         if addrs_known && let Some(reason) = stateless::check_land(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_ping_of_death(&zstate.profile, pkt) {
-            return ScreenVerdict::Drop(reason);
-        }
-        if let Some(reason) = stateless::check_teardrop(&zstate.profile, pkt) {
-            return ScreenVerdict::Drop(reason);
-        }
-        if let Some(reason) = stateless::check_icmp_fragment(&zstate.profile, pkt) {
-            return ScreenVerdict::Drop(reason);
-        }
-        if let Some(reason) = stateless::check_source_route(&zstate.profile, pkt) {
+        // #6238: the SAME common stateless tail the flow-present path runs
+        // (ping-of-death → teardrop → icmp-fragment → source-route), at the
+        // SAME precedence slot — after the `addrs_known`-gated LAND and before
+        // the fabric-skip gate. Single-sourcing this run is the anti-mirror
+        // guarantee: a future addition to `check_fragment_and_route` covers
+        // BOTH entry points by construction (the #3902 fail-open class).
+        if let Some(reason) = stateless::check_fragment_and_route(&zstate.profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
         // #4155: fabric-redirected flowless traffic was already rate-screened
@@ -1242,29 +1310,16 @@ impl ScreenState {
             return ScreenVerdict::Pass;
         }
         // --- Rate-based flood checks (source-independent, per-zone) ---
-        let icmp_flood_threshold = zstate.profile.icmp_flood_threshold;
-        let udp_flood_threshold = zstate.profile.udp_flood_threshold;
-
-        // ICMP flood — per-DESTINATION cap (PRIMARY) + per-zone aggregate ceiling
-        // (SECONDARY), same as the flow-present path (#4112 F18). Keeps a
-        // fragment-based flood from evading the per-destination cap.
-        if icmp_flood_threshold > 0
-            && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
-            && zstate.icmp_flood_drop(&pkt.dst_ip, icmp_flood_threshold, now_ns)
-        {
-            return ScreenVerdict::Drop("icmp-flood");
-        }
-
-        // UDP flood — per-DESTINATION cap (PRIMARY) + per-zone aggregate ceiling
-        // (SECONDARY). A flowless non-first fragment has no L4 port, so `dst_port`
-        // is 0 here and `udp_flood_drop` folds it into the per-destination-IP
-        // `increment(dst_ip)` bucket (the ICMP-flood abstraction) rather than a
-        // stray `(ip, 0)` cell (#4112 F18, #4567).
-        if udp_flood_threshold > 0
-            && pkt.protocol == PROTO_UDP
-            && zstate.udp_flood_drop(&pkt.dst_ip, pkt.dst_port, udp_flood_threshold, now_ns)
-        {
-            return ScreenVerdict::Drop("udp-flood");
+        // #6238: ICMP flood then UDP flood via the SAME shared block the
+        // flow-present path runs, inserted at the SAME slot (right after the
+        // fabric `skip_rate_flood` gate). Per-destination cap (PRIMARY) + per-zone
+        // aggregate ceiling (SECONDARY), same as the flow-present path (#4112
+        // F18). A flowless non-first fragment has no L4 port, so `dst_port` is 0
+        // here; the helper passes it through UNCHANGED and `udp_flood_drop` folds
+        // it into the per-destination-IP `increment(dst_ip)` bucket rather than a
+        // stray `(ip, 0)` cell (#4567) — so no flowless-specific mode flag.
+        if let Some(reason) = zstate.enforce_common_rate_floods(pkt, now_ns) {
+            return ScreenVerdict::Drop(reason);
         }
 
         ScreenVerdict::Pass
