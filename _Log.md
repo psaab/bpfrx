@@ -1,3 +1,32 @@
+## 2026-07-22 — #6261: outline rare ARP/NDP learn/program off the pre-cache RX stage
+
+- **Timestamp**: 2026-07-22 (refactor/6261-outline-arp-ndp)
+- **Action**: Behavior-preserving codegen/layout refactor. The ARP-reply
+  and NDP-NA learn-and-program tails inside the inline hot stage
+  `stage_link_layer_classify` (validation gates, #2370 logical-ifindex
+  resolve, #4475 Override read-before-write, #3048 change-detecting
+  `insert_if_changed`, #5288-limited synchronous kernel-neighbor program)
+  were extracted into two dedicated `#[cold] #[inline(never)]` handlers,
+  `outline_arp_reply_learn_and_program` and
+  `outline_ndp_na_learn_and_program`. The `classify_arp` /
+  `parse_ndp_neighbor_advert` parser probes and the EtherType classifier
+  stay inline; the ordinary (non-ARP/NDP) fast path is byte-for-byte
+  unchanged. Gate ordering (insert_if_changed → should_program →
+  add_kernel_neighbor), ARP-recycle vs NDP-continue dispositions, and the
+  `learn_ifindex` (now inlined into each handler) logic are identical to
+  the pre-#6261 inline block. No pending neighbor-generation fix was
+  hidden or reordered — the `mac_change_epoch` / limiter sequence is
+  preserved and made explicit in the handler doc comments. `#[cold]` is a
+  layout hint only; flood bounding stays with the #5288 limiter.
+- **File(s)**: userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_stages_tests.rs (added
+  `outlined_arp_ndp_handlers_still_learn_and_program_6261`),
+  userspace-dp/src/afxdp/README.md
+- **Validation**: `cargo build` clean; targeted + full cargo suite green
+  (existing ARP/NDP learn/change/own-IP/override/limiter tests are the
+  behavior-preserving gate; new #6261 test asserts both outlined handlers
+  still learn under the logical ifindex and preserve dispositions).
+
 ## 2026-07-22 — #6232: scope-complete Rust heatmap classifier + enforced drift gate
 
 - **Timestamp**: 2026-07-22 (fix/6232-heatmap-audit)
