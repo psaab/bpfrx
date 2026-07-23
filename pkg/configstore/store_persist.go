@@ -474,16 +474,31 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 // high-seq archive from the PRIOR process outrank — and evict — the fresh
 // low-seq archives of the NEW process. Seeding to max(existing seq) keeps the
 // newest commit's seq strictly highest so retention order is correct across
-// restarts. The scan runs only while archiveSeq is still 0 (process start,
-// before any archive is written); once the process has written one archive the
-// counter is already ahead of disk and the scan is skipped.
+// restarts. The scan runs when archiveSeq is still 0 (process start, before any
+// archive is written) OR when the archive dir changes (#6396: a runtime switch
+// to a previously-used dir must re-seed from that dir's existing max, else this
+// process's lower counter would let the pre-existing archives outrank the new
+// ones); an unchanged dir with a non-zero counter skips the scan because the
+// counter is already ahead of disk.
 func (s *Store) SetArchiveConfig(dir string, max int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	dirChanged := dir != s.archiveDir
 	s.archiveDir = dir
 	s.archiveMax = max
-	if dir != "" && s.archiveSeq.Load() == 0 {
-		if seed := maxArchiveSeq(dir); seed > 0 {
+	// Seed the monotonic archive seq from the highest seq already on disk in
+	// the target dir. Re-seed on ANY dir change, not only at process start
+	// (seq==0): a runtime archive-dir switch to a previously-used directory
+	// whose existing archives carry HIGHER seqs than this process's counter
+	// would otherwise let those pre-existing archives outrank — and evict — the
+	// archives this process is about to write, the same across-restart hazard
+	// #5523 C179-060 closed but reached via a live dir switch (#6396). The seed
+	// is monotonic-up only (max of the current counter and the on-disk max), so
+	// switching to an empty or lower-seq dir never rewinds the counter. An
+	// unchanged dir with a non-zero counter skips the scan (the counter is
+	// already ahead of disk).
+	if dir != "" && (dirChanged || s.archiveSeq.Load() == 0) {
+		if seed := maxArchiveSeq(dir); seed > s.archiveSeq.Load() {
 			s.archiveSeq.Store(seed)
 		}
 	}
@@ -501,6 +516,19 @@ func parseArchiveSeq(name string) (uint64, bool) {
 	core := strings.TrimSuffix(name, ".conf")
 	dot := strings.LastIndexByte(core, '.')
 	if dot < 0 {
+		return 0, false
+	}
+	// #6396: a current-format archive is config-<ts>.<seq>.conf where <ts>
+	// itself embeds a dot (seconds.nanoseconds), so core has TWO dots and the
+	// portion before the seq dot still contains one. A legacy pre-#3441
+	// config-<ts>.conf name has only the ts's single dot, whose trailing
+	// nanoseconds ("20240101-120000.123456789") would otherwise be mis-read as
+	// a huge sequence — corrupting the seq-ordered retention of a MIXED
+	// legacy+current archive dir. Require the ts dot to be present so a legacy
+	// name is treated as unparseable (oldest, pruned first, lexical-by-ts among
+	// its peers), matching a config-<ts>.conf with no subsecond ts (which has
+	// no dot in core and already returns false).
+	if strings.IndexByte(core[:dot], '.') < 0 {
 		return 0, false
 	}
 	seq, err := strconv.ParseUint(core[dot+1:], 10, 64)

@@ -1081,7 +1081,18 @@ owned by the `journal/` subpackage.
   guarantees no archive is ever overwritten while the leading timestamp
   keeps rotation's lexical sort chronological. `ArchiveConfig` captures
   the text, timestamp AND seq together under the lock (no after-unlock
-  `time.Now()` race). The rollback/archive writers
+  `time.Now()` race). Rotation prunes by the parsed seq, and
+  `SetArchiveConfig` seeds the per-process counter from the highest seq on
+  disk so it stays globally monotonic across restarts (#5523 C179-060).
+  Two #6396 residual hardenings: `parseArchiveSeq` requires the current
+  two-dot `config-<ts>.<seq>.conf` shape (the ts's own
+  seconds.nanoseconds dot PLUS the seq dot), so a legacy pre-#3441
+  `config-<ts>.conf` — whose trailing nanoseconds would otherwise be
+  mis-read as a huge seq — is treated as unparseable (oldest, pruned
+  first) in a mixed legacy+current dir; and `SetArchiveConfig` re-seeds on
+  ANY archive-dir change (monotonic-up only), not just at process start,
+  so a runtime switch to a previously-used dir cannot let that dir's
+  higher-seq archives outrank the ones this process is about to write. The rollback/archive writers
   route through package-var seams (`rbWriteFileDurable`,
   `rbWriteFileAtomic`, `rbSyncDir`, `rbRemove`) so tests can pin the
   durability call and inject failures (#1916 pattern).

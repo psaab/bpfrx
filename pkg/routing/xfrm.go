@@ -264,6 +264,30 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 			continue
 		}
 
+		// #6396 C179-104 residual: re-assert the post-create readback is the
+		// xfrm interface we just created before adopting it. LinkAdd and this
+		// LinkByName are two syscalls; if a concurrent external actor deleted our
+		// device and substituted a same-name foreign link (or an xfrmi with a
+		// different if_id) in that window, the bare readback would bring it up
+		// and track the NAME as satisfied while NO device carries the desired
+		// if_id — the route-based VPN bound to it silently blackholes, the same
+		// failure mode the adopt path guards above. Reject the mismatch: do not
+		// bring it up or track it, surface the error so the commit fails closed,
+		// and let the next reconcile's adopt path reclaim the foreign link via
+		// delete+recreate.
+		if xi, ok := link.(*netlink.Xfrmi); !ok || xi.Ifid != ifID {
+			have := "non-xfrmi type " + link.Type()
+			if ok {
+				have = fmt.Sprintf("if_id %d", xi.Ifid)
+			}
+			slog.Warn("xfrmi readback after create is not the intended interface",
+				"name", ifName, "want_if_id", ifID, "have", have)
+			errs = append(errs, fmt.Errorf(
+				"xfrmi %s readback after create mismatch (want if_id %d, have %s)",
+				ifName, ifID, have))
+			continue
+		}
+
 		if err := x.ops.LinkSetUp(link); err != nil {
 			slog.Warn("failed to bring up xfrmi",
 				"name", ifName, "err", err)

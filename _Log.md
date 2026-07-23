@@ -1,3 +1,44 @@
+## 2026-07-23 — #6396 codex-179 review residuals (3 low-risk hardenings)
+
+- **Timestamp**: 2026-07-23 (fix/6396-hardening-residuals)
+- **Action**: Implemented the three in-Go-scope #6396 residuals from the
+  codex-179 #6394 review, each with a firsthand-verified fail-on-revert test.
+  (1) SNMP ifTable warn flood — `buildSNMPIfData` (`pkg/daemon/
+  daemon_snmp_reconcile.go`) now rate-limits its netlink-failure `slog.Warn`
+  via a reusable `warnThrottle` (once per minute; first failure logs, later
+  ones in the window are counted + reported with the next line; a successful
+  read logs a one-time recovery). buildSNMPIfData runs once per SNMP poll, so a
+  persistent failure previously wrote one line per poll. (2) xfrm post-create
+  readback TOCTOU (`pkg/routing/xfrm.go`) — the `LinkByName` right after
+  `LinkAdd` now re-asserts the link is an `*netlink.Xfrmi` with the desired
+  `if_id` before bring-up/track, matching the adopt-path guard (#5523
+  C179-104); a same-name foreign or wrong-if_id link substituted in the
+  add→readback window is rejected (commit fails closed, next reconcile
+  reclaims). Both substitution shapes covered. (3) archive rotation edges
+  (`pkg/configstore/store_persist.go`) — `parseArchiveSeq` now requires the
+  two-dot current `config-<ts>.<seq>.conf` shape so a legacy pre-#3441
+  `config-<ts>.conf` (trailing nanoseconds) is no longer mis-read as a huge
+  seq in a mixed dir; `SetArchiveConfig` re-seeds the monotonic counter on ANY
+  archive-dir change (monotonic-up only), not just at process start, so a
+  runtime switch to a previously-used dir cannot let its higher-seq archives
+  outrank the ones this process writes. Scoped OUT: the SetIfDataFn error-
+  channel contract change and the best-effort RETH-MAC / CLI-display LinkList
+  swallows (issue defers as "remain"); the synchronous `ArchiveConfig` mirror's
+  target-dir seeding (zero production callers, shared-counter design).
+- **File(s)**: pkg/daemon/daemon_snmp_reconcile.go,
+  pkg/daemon/daemon_snmp_ifdata_throttle_6396_test.go,
+  pkg/daemon/daemon_snmp_ifdata_netlink_5523_test.go, pkg/routing/xfrm.go,
+  pkg/routing/iface_reuse_test.go, pkg/routing/xfrm_nonxfrmi_reject_5523_test.go,
+  pkg/configstore/store_persist.go, pkg/configstore/archive_6396_test.go,
+  pkg/configstore/archive_rotate_seq_5523_test.go, pkg/snmp/README.md,
+  pkg/configstore/README.md, pkg/routing/README.md
+- **Validation**: gofmt/build/vet clean on the three touched pkgs; full
+  `go test ./pkg/daemon ./pkg/routing ./pkg/configstore` GREEN; fail-on-revert
+  confirmed firsthand for all four fixes (SNMP throttle → 20 warns for 20
+  polls; xfrm readback → Apply returns nil + adopts foreign link; parseArchive
+  legacy → nanoseconds parsed as seq + legacy retained over current; dir-switch
+  reseed → counter stuck at old dir's max), then restored GREEN.
+
 ## 2026-07-23 — #5583 C180: fold two Codex MAJOR findings into #6383
 
 - **Timestamp**: 2026-07-23 (fix/5583-codex180, fold on PR #6383)
