@@ -84,6 +84,24 @@ static int load_xdp(int ifindex, int *map_fd_out)
 }
 
 /*
+ * #4906 HC-101 / #6289 M1: detach only our own program, and only if it is still
+ * ours, on both interfaces we attached to. XDP_FLAGS_REPLACE + old_prog_fd makes
+ * the kernel refuse if something else now owns the hook. Shared by the normal
+ * exit path AND the early umem/alloc-failure exits so a failed setup never leaks
+ * our attached program on the owner (and possibly secondary) interface.
+ */
+static void detach_ours(int ifindex, int sec_ifindex, int sec_attached,
+                        int prog_fd)
+{
+    LIBBPF_OPTS(bpf_xdp_attach_opts, dopts, .old_prog_fd = prog_fd);
+    if (bpf_xdp_detach(ifindex, XDP_FLAGS_REPLACE, &dopts))
+        fprintf(stderr, "  owner XDP detach skipped/failed — hook not ours\n");
+    if (sec_attached &&
+        bpf_xdp_detach(sec_ifindex, XDP_FLAGS_REPLACE, &dopts))
+        fprintf(stderr, "  secondary XDP detach skipped/failed — hook not ours\n");
+}
+
+/*
  * #4906 HC-069: drain up to BATCH_SIZE descriptors from an RX ring, count them,
  * and recycle the chunk-aligned frame bases back to `fill`. The previous code
  * released the RX descriptors BEFORE reading them and used xsk_ring_cons__comp_addr
@@ -355,6 +373,15 @@ int main(int argc, char **argv)
 
     /* Create UMEM */
     void *umem_area = aligned_alloc(getpagesize(), NUM_FRAMES * FRAME_SIZE);
+    /* #6289 M1: aligned_alloc() can return NULL. An unchecked NULL flows into
+     * xsk_umem__create below and, on its failure, the old code did `return 1`
+     * WITHOUT reaching the detach — leaking OUR program on the owner (and any
+     * secondary) interface. Detach before exiting. */
+    if (!umem_area) {
+        fprintf(stderr, "umem_area alloc failed\n");
+        detach_ours(ifindex, sec_ifindex, sec_attached, prog_fd);
+        return 1;
+    }
     struct xsk_ring_prod umem_fill;
     struct xsk_ring_cons umem_comp;
     struct xsk_umem *umem;
@@ -367,7 +394,11 @@ int main(int argc, char **argv)
     if (xsk_umem__create(&umem, umem_area,
                           (unsigned long long)NUM_FRAMES * FRAME_SIZE,
                           &umem_fill, &umem_comp, &ucfg)) {
+        /* #6289 M1: detach our program (and free the UMEM area) before exiting
+         * so the umem-failure path does not leak it on the interface(s). */
         fprintf(stderr, "umem create failed\n");
+        free(umem_area);
+        detach_ours(ifindex, sec_ifindex, sec_attached, prog_fd);
         return 1;
     }
     printf("umem created\n");
@@ -401,15 +432,10 @@ int main(int argc, char **argv)
         waitpid(child, NULL, 0);
     }
 
-    /* #4906 HC-101: detach only our own program, and only if still ours, on
-     * both interfaces we attached to. XDP_FLAGS_REPLACE + old_prog_fd makes the
-     * kernel refuse if something else now owns the hook. */
-    LIBBPF_OPTS(bpf_xdp_attach_opts, dopts, .old_prog_fd = prog_fd);
-    if (bpf_xdp_detach(ifindex, XDP_FLAGS_REPLACE, &dopts))
-        fprintf(stderr, "  owner XDP detach skipped/failed — hook not ours\n");
-    if (sec_attached &&
-        bpf_xdp_detach(sec_ifindex, XDP_FLAGS_REPLACE, &dopts))
-        fprintf(stderr, "  secondary XDP detach skipped/failed — hook not ours\n");
+    /* #4906 HC-101 / #6289 M1: detach only our own program, and only if still
+     * ours, on both interfaces we attached to (see detach_ours — the same path
+     * the early umem/alloc-failure exits take). */
+    detach_ours(ifindex, sec_ifindex, sec_attached, prog_fd);
     xsk_umem__delete(umem);
     free(umem_area);
 

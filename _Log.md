@@ -76,6 +76,43 @@
   userspace-dp/src/afxdp/coordinator/README.md,
   userspace-dp/src/afxdp/worker/README.md, _Log.md
 
+## 2026-07-22 — #6184: host-auth cancel closeout — per-owner panic recover + log actual budget
+
+- **Timestamp**: 2026-07-22 (fix/6184-host-auth-closeout-recover)
+- **Action**: Two LOW hardenings from the #6181/#5874 hostile review of the
+  cancelled-apply host-authorization closeout.
+  (1) Item 1 — per-owner defer/recover in `runHostAuthCloseoutOwners`: each
+  owner's goroutine now recovers a panic in its reconcile, logs it with the
+  owner id, and routes it through `done` as that owner's FAIL-VISIBLE error
+  (`host-auth closeout owner %q panicked: %v`) so `summarizeHostAuthCloseout`
+  joins it. Without it a single owner panic unwound its goroutine with no
+  recover and crashed the whole daemon-stop path, taking down the remaining
+  owners and the process — the opposite of the M35 fail-visible discipline.
+  `done` is buffered and fn's own send is skipped on panic, so the recover is
+  the sole send (no double-send).
+  (2) Item 2 — `summarizeHostAuthCloseout` now takes the wall-clock `budget`
+  and logs it in the "did not complete within budget" line instead of the
+  package global `hostAuthCloseoutBudget`; production still passes the global,
+  but a non-default (test/future) budget is now reported honestly. Threaded
+  the budget through the sole production caller and the three existing test
+  callers.
+- **Tests**: new `host_auth_closeout_6184_test.go` — fail-on-revert gates.
+  `TestHostAuthCloseoutRecoversPerOwnerPanic6184` (item 1): panic in the
+  middle owner; asserts batch does not crash, owners on both sides run, the
+  panicking owner is fail-visible + named in the join. RED-on-revert = the
+  removed-recover build stays clean (fmt/slog still used) but the owner panic
+  crashes `go test` (verified `panic: boom in owner closeout` → FAIL).
+  `TestHostAuthCloseoutLogsActualBudget6184` (item 2): captures slog records,
+  asserts the timed-out line logs budget=20ms (the passed budget), not the
+  30s global; RED-on-revert = clean assertion (`budget = 30s, want 20ms`).
+  Both 3x green, full `pkg/daemon` green under `-race`, gofmt + vet clean.
+  No design/state doc covers this closeout (contract lives in the
+  daemon_apply_hostauth.go doc-comments, updated here); control-plane
+  closeout, unit-provable — not HA / no smoke.
+- **File(s)**: pkg/daemon/daemon_apply_hostauth.go,
+  pkg/daemon/host_auth_closeout_6184_test.go (new),
+  pkg/daemon/host_auth_closeout_5874_test.go
+
 ## 2026-07-22 — #6241: typed worker-launch bundles (replace 38-arg positional worker_loop)
 
 - **Timestamp**: 2026-07-22 (refactor/6241-typed-launch-bundles)
@@ -57382,3 +57419,70 @@ top.
   - **File(s)**: userspace-dp/src/filter/engine/cache_sensitive.rs,
     userspace-dp/src/filter/engine/cache_sensitive/rotation.rs (new),
     userspace-dp/src/filter/README.md
+
+- **Timestamp**: 2026-07-22 21:12
+  - **Action**: #6238 narrow two-helper split — single-source the
+    source-independent screens shared by the flow-present
+    (`check_packet_with_zone_id_opts`) and flowless
+    (`check_flowless_screens_opts`) paths, which previously hand-mirrored
+    them (the #3902 fail-open class). Rejected the issue's literal contiguous
+    `check_source_independent` mega-helper (Claude SMR + Codex both concurred):
+    on the full path `check_tcp_flag_screens` is INTERPOSED between LAND and
+    the fragment tail, so a contiguous LAND→source-route helper would flip the
+    per-reason drop-counter ordinal (`screen_reason_drop_index`) for a
+    multi-trigger packet. Instead extracted (a) the already-contiguous stateless
+    tail `stateless::check_fragment_and_route` (ping-of-death → teardrop →
+    icmp-fragment → source-route), called at the SAME slot on both paths, and
+    (b) the ICMP/UDP flood block as a private `ZoneScreenState`
+    method `enforce_common_rate_floods`, inserted right after each path's fabric
+    `skip_rate_flood` gate with `pkt.dst_port` passed UNCHANGED so the #4567
+    zero-port fold stays inside `udp_flood_drop`. LAND (unconditional full /
+    `addrs_known`-gated flowless), TCP-flag screens, SYN-flood/cookie, and the
+    fabric skip stay per-path by necessity. Full-path SYN scalars still copied
+    before the rate mutation (no lengthened #4969 disjoint borrow); one
+    `zones.get_mut` per path preserved. Byte-identical drop precedence on both
+    paths. Tests: 3 multi-trigger precedence tests (LAND+SYN-FIN → land-attack;
+    SYN-FIN+LSRR → tcp-syn-fin; flowless addrs_unknown skips LAND but runs the
+    tail + floods) + 2 fail-on-revert binding tests (neutralizing the flowless
+    `check_fragment_and_route` call turned the flowless binding test — and the
+    other flowless source-route tests through that site — RED while the full
+    binding test stayed GREEN; the path-specific asymmetry proves both paths
+    route through the one shared helper — proof shown, then restored). cargo build
+    --release + clippy clean (sole error = pre-existing mut_from_ref in untouched
+    umem/mmap.rs:150). Full cargo test --release --test-threads=1 GREEN.
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/screen/stateless.rs, userspace-dp/src/screen/tests.rs,
+    userspace-dp/src/FEATURES.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6289 — two LOW robustness follow-ups in test/xsk-repro (from the
+    #4906 xsk-repro safety cohort hostile review). Neither is a firewall clobber
+    nor a false-PASS; both are error-path/robustness hardening on root-only
+    AF_XDP diagnostic tooling.
+    M1 (umem/alloc-failure leaked our attached XDP program): in
+    libbpf_xsk_shared_test.c, after load_xdp attached xdp_pass_redirect to the
+    owner (and any distinct secondary) interface, an unchecked aligned_alloc
+    NULL or an xsk_umem__create failure did `return 1` WITHOUT reaching the
+    detach — leaking our program (only possible on a non-firewall iface; a
+    firewall iface EBUSY's in load_xdp). Factored the detach into a shared
+    detach_ours() helper; the aligned_alloc-NULL and xsk_umem__create-failure
+    paths now call it (and free the UMEM area) before returning, and the normal
+    exit calls the same helper. Gate: -Wall -Wextra -Werror build keeps the
+    refactor clean; the leak path is only reachable via a real AF_XDP/allocator
+    failure so it is verified manually (documented in README, not a fabricated
+    unit test).
+    M2 (selftest-compile.sh SKIP gate probed headers but not static libs): the
+    gate probed only header syntax (-fsyntax-only) but `make check` links static
+    archives (-Wl,-Bstatic -lxdp -lbpf -lelf -lz -lzstd). A headers-present /
+    static-archive-missing host passed the SKIP gate then FAILed the link →
+    false-RED. Gate now probes a trial LINK with the same static-archive flags
+    and honors $CC like the Makefile. Fail-on-revert gate:
+    selftest-skipgate_6289.sh — hermetic (fake cc: headers-present /
+    static-missing), asserts the script SKIPs (exit 77) via the link probe;
+    reverting the probe to -fsyntax-only makes the script reach `make check` and
+    exit 1 → gate RED (verified both directions). Registered under `make
+    selftest` (run-selftests.sh); full selftest suite 44 passed / 0 failed.
+- **File(s)**: test/xsk-repro/libbpf_xsk_shared_test.c,
+    test/xsk-repro/selftest-compile.sh,
+    test/xsk-repro/selftest-skipgate_6289.sh (new),
+    test/xsk-repro/README.md, scripts/run-selftests.sh

@@ -77,6 +77,15 @@ func (d *Daemon) hostAuthCloseoutOwners() []hostAuthOwner {
 // atomic durable write, so an abandoned owner leaves consistent partial state
 // that is HONESTLY reported timed-out (convergence unknown), the fail-visible
 // outcome M35 requires.
+//
+// Each owner's goroutine carries a defer/recover (#6184): a panic in one owner's
+// reconcile is recovered, logged with the owner id, and converted into that
+// owner's fail-visible reconcile error (routed through `done`, so the select
+// records it as o.err exactly like a returned error). Without the recover an
+// owner panic would unwind the goroutine and crash the whole daemon-stop path,
+// taking down the remaining owners and the process — the opposite of the M35
+// fail-VISIBLE, one-owner-at-a-time discipline. The recover keeps the batch and
+// the process alive and surfaces the panicking owner as a named failure.
 func runHostAuthCloseoutOwners(cfg *config.Config, budget time.Duration, owners []hostAuthOwner) []hostAuthOwnerOutcome {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
@@ -90,7 +99,21 @@ func runHostAuthCloseoutOwners(cfg *config.Config, budget time.Duration, owners 
 			continue
 		}
 		done := make(chan error, 1)
-		go func(fn func(*config.Config) error) { done <- fn(cfg) }(o.fn)
+		go func(name string, fn func(*config.Config) error) {
+			// #6184: recover a panic in this owner's reconcile so it fails
+			// VISIBLE (recorded as this owner's error and joined by
+			// summarizeHostAuthCloseout) instead of crashing the daemon-stop
+			// path and skipping the remaining owners. `done` is buffered and
+			// fn's own send is skipped when it panics, so this is the sole send.
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("host-authorization cancel closeout: owner panicked",
+						"owner", name, "panic", r)
+					done <- fmt.Errorf("host-auth closeout owner %q panicked: %v", name, r)
+				}
+			}()
+			done <- fn(cfg)
+		}(o.name, o.fn)
 		select {
 		case err := <-done:
 			outcomes = append(outcomes, hostAuthOwnerOutcome{name: o.name, err: err})
@@ -107,13 +130,19 @@ func runHostAuthCloseoutOwners(cfg *config.Config, budget time.Duration, owners 
 // config within budget; a non-nil return names WHICH owners did not, and is
 // propagated by closeoutHostAuthOnCancel so the cancel fails visibly instead of
 // reporting clean over a silently-failed credential reconcile (#5874).
-func summarizeHostAuthCloseout(outcomes []hostAuthOwnerOutcome) error {
+//
+// budget is the wall-clock budget the outcomes were produced under — the value
+// actually passed to runHostAuthCloseoutOwners — so the timed-out log line
+// reports the REAL budget in effect, not the package global (#6184). Production
+// passes hostAuthCloseoutBudget; a test that shrinks the budget sees its own
+// value in the log instead of a misleading 30s.
+func summarizeHostAuthCloseout(outcomes []hostAuthOwnerOutcome, budget time.Duration) error {
 	var errs []error
 	for _, o := range outcomes {
 		switch {
 		case o.timedOut:
 			slog.Error("host-authorization cancel closeout: owner did not complete within budget",
-				"owner", o.name, "budget", hostAuthCloseoutBudget)
+				"owner", o.name, "budget", budget)
 			errs = append(errs, fmt.Errorf("host-auth closeout owner %q timed out", o.name))
 		case o.err != nil:
 			slog.Error("host-authorization cancel closeout: owner failed to reconcile",
@@ -131,7 +160,7 @@ func (d *Daemon) applyHostAuthorizationCloseout(cfg *config.Config) error {
 		return nil
 	}
 	outcomes := runHostAuthCloseoutOwners(cfg, hostAuthCloseoutBudget, d.hostAuthCloseoutOwners())
-	return summarizeHostAuthCloseout(outcomes)
+	return summarizeHostAuthCloseout(outcomes, hostAuthCloseoutBudget)
 }
 
 // closeoutHostAuthOnCancel wraps a post-promotion apply-abort error so a #2926
