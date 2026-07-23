@@ -93,3 +93,40 @@ safety/false-result defects (Codex review 175, C175-HC-001/025/069/081/090/091/
   PASS reflected only the owner. The secondary now has its own (disjoint) UMEM
   frames primed, is polled and recycled, and its receive count is folded into
   PASS/FAIL; a distinct secondary interface also gets the redirect program.
+
+### Robustness follow-ups (#6289)
+
+Two LOW robustness follow-ups from the #4906 hostile review (neither a
+firewall-clobber nor a false-PASS — the safety-critical properties above all
+hold):
+
+- **M1 — umem/alloc-failure path leaked our attached XDP program.** In
+  `libbpf_xsk_shared_test.c`, after `load_xdp` attached our
+  `xdp_pass_redirect` to the owner (and, for a distinct secondary interface,
+  the secondary), an `aligned_alloc` NULL (previously unchecked) or an
+  `xsk_umem__create` failure did `return 1` WITHOUT reaching the detach —
+  leaving our program attached. (Not a firewall clobber: attach only succeeds
+  on an EMPTY hook via `UPDATE_IF_NOEXIST`, so a firewall interface would have
+  already `EBUSY`'d in `load_xdp`; the leak was only possible on a non-firewall
+  interface.) The detach is now factored into `detach_ours()` and the
+  `aligned_alloc` NULL and `xsk_umem__create` failure paths both call it (and
+  free the UMEM area) before returning. **Gate:** the `-Wall -Wextra -Werror`
+  build (`make check` / `selftest-compile.sh`) keeps the refactor clean; the
+  leak path itself is only reachable via a real AF_XDP / allocator failure, so
+  it is verified manually — run the shared test against a non-firewall
+  interface with an artificially failing UMEM (e.g. an over-large `NUM_FRAMES`
+  so `xsk_umem__create` fails) and confirm `bpftool net` shows no leftover
+  `xdp_pass_redirect` on the interface afterward.
+- **M2 — `selftest-compile.sh` SKIP gate probed headers but not static libs.**
+  The gate probed only header syntax (`-fsyntax-only` on `<bpf/bpf.h>` /
+  `<xdp/xsk.h>`) but `make check` links against static archives
+  (`-Wl,-Bstatic -lxdp -lbpf -lelf -lz -lzstd`). A host with dev HEADERS but a
+  MISSING static archive (e.g. no `libzstd.a`) passed the SKIP gate then FAILed
+  the link → a false-RED for this leg. The gate now probes a trial LINK with
+  the same static-archive flags (and honors `$CC` like the Makefile), so such a
+  host SKIPs cleanly. **Gate:** `selftest-skipgate_6289.sh` — a hermetic
+  fail-on-revert test that points `selftest-compile.sh` at a fake compiler
+  modelling exactly that host (headers present, static archive missing) and
+  asserts the script SKIPs (exit 77) via the link probe; reverting the fix
+  (probe back to `-fsyntax-only`) makes the script reach `make check` and exit
+  1 instead → the gate goes RED. Registered under `make selftest`.
