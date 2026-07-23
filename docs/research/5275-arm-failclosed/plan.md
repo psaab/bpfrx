@@ -3,14 +3,19 @@
 - **Issue:** #5275 (HIGH; bug, dataplane, security, vsrx-parity)
 - **Research branch:** `research/5275-arm-failclosed`
 - **Base:** origin/master @ `6131eb4e6`
-- **Revision:** r12 (Codex r10 confirmed the crash-restart gate SOUND and isolated ONE
-  asymmetry: sender-silent-on-scrub-failure is safe for crash-restart but UNSAFE for a
-  LIVE re-arm (silencing a healthy primary lets the peer activate VIP/Kea while the old
-  owner still holds them). r12 scopes the fallback per-path — crash-restart stays
-  sender-silent; the LIVE path keeps its incumbent heartbeat/takeover interlock until the
-  scrub SUCCEEDS, then atomically holds+yields (never silent-while-holding) — and fixes
-  the §12 and §3-orderly-shutdown doc-consistency nits. Architecture VIABLE across seven
-  Codex rounds; D1–D4 + D5(b) + facade + the crash-restart gate Codex-accepted.)
+- **Revision:** r13 (CONVERGED — applies Codex r11's two prescribed wording fixes to r12;
+  Codex r11 = PLAN-NEEDS-MINOR with "no remaining genuine safety defect or false source
+  claim" + only those two wording items, now corrected; Claude SMR = PLAN-READY. The r12
+  substance stands: the crash-restart gate + the path-specific scrub-failure fallback
+  (crash-restart sender-silent; LIVE re-arm keeps its incumbent heartbeat/takeover
+  interlock until the scrub SUCCEEDS, then atomically holds+yields, fail-closed
+  meanwhile). Architecture ruled VIABLE across eight Codex rounds; D1–D4 + D5 + facade +
+  barrier + delayed-promotion + arm-state machine all Codex-accepted.)
+- **Convergence:** Codex PLAN-NEEDS-MINOR (r11, wording-only, now applied) + Claude SMR
+  PLAN-READY. AGY infra-down (best-effort, per `feedback_codex_infra_must_retry`
+  2-of-3). The one remaining OPEN item is a HUMAN operations sign-off (§13-D5:
+  accept the pre-existing dead-node timeout window vs add external STONITH), not a code
+  defect — exactly the `/engineer` manual-approval gate.
 - **Prior art:** PR #6358 (draft) — MERGE-NEEDS-MAJOR. Superseded.
 - **Status:** PLAN-READY candidate (research only — no production code;
   `/engineer 5275`).
@@ -528,7 +533,8 @@ resolved below with a recommended choice (the human approves/overrides at `/engi
     node still holds them → dual ownership). Instead the `fencing` state is **pre-hold
     and KEEPS the incumbent heartbeat/takeover interlock** (the peer stays backup) UNTIL
     the scrub SUCCEEDS; only THEN does it ATOMICALLY enter `effectiveHold`/`armFailed`
-    and publish weight-zero. While it holds-but-cannot-scrub it is fail-CLOSED
+    and publish weight-zero. While it remains in fencing/pre-hold with the scrub
+    incomplete it is fail-CLOSED
     (the §6 barrier drops transit — a fail-closed blackhole, the security-correct
     default over dual-ownership), until the scrub succeeds or a **separately verified
     service/host fence** (the STONITH sign-off) resolves it. It NEVER yields
@@ -538,9 +544,11 @@ resolved below with a recommended choice (the human approves/overrides at `/engi
   incumbent heartbeat on the live path until scrub, prevents VIP re-addition / queued
   Kea restart) + the scrub sequencing are the §13-D5 deliverables.
 
-  **HUMAN SIGN-OFF (D5):** with the unified yield gate in place (a node never yields
-  before its synchronous scrub, and a failed scrub keeps it sender-silent), #5275 never
-  ACCELERATES takeover into an un-scrubbed state. The residual is the pre-existing case
+  **HUMAN SIGN-OFF (D5):** with the yield gate in place (a node never yields before its
+  synchronous scrub; on scrub failure a CRASH-restart node stays sender-silent while a
+  LIVE re-arm node keeps its incumbent heartbeat until scrub succeeds — §13-D5(c)),
+  #5275 never ACCELERATES takeover into an un-scrubbed state. The residual is the
+  pre-existing case
   where the node is TRULY DEAD (never restarts) and the peer's ordinary timeout expires
   with the kernel VIP still up — the SAME window ANY `xpfd` crash has today. Accept that
   existing window (RECOMMENDED, no new hardware) **versus** adding external STONITH
