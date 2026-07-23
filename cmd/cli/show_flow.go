@@ -104,7 +104,7 @@ func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
 			if err != nil {
 				return nil, err
 			}
-			n, err := strconv.Atoi(v)
+			n, err := strconv.ParseInt(v, 10, 32)
 			if err != nil || n < 1 || n > 65535 {
 				return nil, fmt.Errorf("invalid source-port %q", v)
 			}
@@ -115,7 +115,7 @@ func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
 			if err != nil {
 				return nil, err
 			}
-			n, err := strconv.Atoi(v)
+			n, err := strconv.ParseInt(v, 10, 32)
 			if err != nil || n < 1 || n > 65535 {
 				return nil, fmt.Errorf("invalid destination-port %q", v)
 			}
@@ -129,7 +129,13 @@ func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
 			if err != nil {
 				return nil, err
 			}
-			n, err := strconv.Atoi(v)
+			// C179-021: parse into a 32-bit range so an overflowing value
+			// is rejected, not silently wrapped. strconv.Atoi returns a
+			// 64-bit int, so a value like 3000000000 passed the `n < 1`
+			// guard and then int32(n) wrapped NEGATIVE — the daemon clamps
+			// <= 0 to the default limit, so an over-range request silently
+			// became the default instead of erroring.
+			n, err := strconv.ParseInt(v, 10, 32)
 			if err != nil || n < 1 {
 				return nil, fmt.Errorf("invalid limit %q", v)
 			}
