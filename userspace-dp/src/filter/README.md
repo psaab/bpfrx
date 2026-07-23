@@ -708,15 +708,15 @@ both lo0 input families. Tests: `missing_filter_ref_3296_*` /
 `defined_filter_ref_3296_compiles_cleanly` in `filter/tests.rs` (fail-on-revert).
 
 The fail-closed contract keys off the RETAINED per-interface fast maps
-(`iface_filter_*_fast`) and, for output hooks, the
-`iface_filter_out_*_needs_tx_eval` sets — the structures the per-interface hot
-path consults. (#6236 PR-2A additionally re-anchors the FAMILY-WIDE global TX
-gate onto the `has_output_needs_tx_eval_*` aggregate; see "Output-filter
-TX-eval predicate and aggregates (#6236 PR-2A)" below. The per-interface
-`iface_filter_out_*_needs_tx_eval` sets are still populated and consulted by the
-`interface_output_filter_needs_tx_eval` accessor in PR-2A — PR-2B migrates that
-accessor onto the fast map and deletes the sets.) #6236 PR-1 removed the dead
-parallel bookkeeping that shadowed these:
+(`iface_filter_*_fast`) — the structures the per-interface hot path consults —
+and the FAMILY-WIDE global TX gate keys off the `has_output_needs_tx_eval_*`
+aggregate (#6236 PR-2A; see "Output-filter TX-eval predicate and aggregates"
+below). #6236 PR-2B deleted the parallel per-interface property sets
+(`iface_filter_v{4,6}_affects_route_lookup` / `_has_dscp_match` /
+`_has_per_packet_l4_match` and `iface_filter_out_{v4,v6}_needs_tx_eval`); every
+capability accessor now reads the mirrored `Filter` flag off the fast-map entry,
+so a single `.get()` returns the filter and every derived flag. #6236 PR-1
+removed the dead parallel bookkeeping that shadowed these:
 the four `"family:name"` name maps (`iface_filter_v4`/`iface_filter_v6`/
 `iface_filter_out_v4`/`iface_filter_out_v6`), the two input
 `iface_filter_v{4,6}_affects_tx_selection` sets (their only reader was a
@@ -727,42 +727,55 @@ guards are byte-for-byte unchanged — deleting a name-map `.insert` never touch
 the `filters.get()` presence check that precedes it. `FilterState` drops from 31
 to 23 fields with zero live-dataplane behavior change.
 
-### Output-filter TX-eval predicate and aggregates (#6236 PR-2A)
+### Output-filter TX-eval predicate and aggregates (#6236 PR-2A/2B)
 
 An output filter must still be walked on the TX path when it can change or
 observe the packet: CoS/DSCP tx-selection, a `then count`, a `then log`, a
 terminal (non-`accept`) action, or a three-color policer. That five-flag OR is
 now the **single** `Filter::needs_tx_eval()` method (`filter/mod.rs`), the SOLE
-definition. Every consumer routes through it — the compiler's
-`iface_filter_out_*_needs_tx_eval` set-insert, the `has_output_needs_tx_eval_*`
-aggregates, and all four `cos_classify` TX arms (cached/runtime ×
-flow-keyed/flowless) — so the composite can never drift between the compile path
-and the hot path.
+definition. Every consumer routes through it — the
+`interface_output_filter_needs_tx_eval` accessor (fast-map backed since PR-2B),
+the `has_output_needs_tx_eval_*` aggregates, and all four `cos_classify` TX arms
+(cached/runtime × flow-keyed/flowless) — so the composite can never drift
+between the compile path and the hot path.
 
-**Aggregate-from-final-map rule.** Every family-wide `FilterState` aggregate
-(`has_input_tx_selection_*`, `has_input_three_color_policer_*`,
-`has_output_tx_selection_*`, and the new `has_output_needs_tx_eval_*`) is
-recomputed **after** the interface loop from the FINAL fast maps via
-`iface_filter_*_fast.values().any(..)`, NOT accumulated monotonically inside the
-loop. The fast maps overwrite last-wins on a duplicate ifindex, so a positive
-filter followed by a non-sensitive filter at the same ifindex must not leave a
-stale-true aggregate; deriving each aggregate from the final map makes it agree
-with the filter the hot path actually evaluates. For the common unique-ifindex
-case this is bit-identical to the old in-loop OR (only the duplicate-ifindex
-drift case changes, and it changes to the correct value).
+**Capability accessors read the fast map (#6236 PR-2B).** The four hot
+per-interface capability prechecks — `interface_filter_affects_route_lookup`,
+`interface_input_filter_has_dscp_match`,
+`interface_input_filter_has_per_packet_l4_match`, and
+`interface_output_filter_needs_tx_eval` — read the mirrored `Filter` flag off
+`iface_filter_*_fast.get(&ifindex)` (e.g. `.is_some_and(|f| f.has_dscp_match_terms)`)
+rather than a parallel `FxHashSet<i32>`. PR-2B deleted those eight property sets
+(`iface_filter_v{4,6}_affects_route_lookup` / `_has_dscp_match` /
+`_has_per_packet_l4_match` and `iface_filter_out_{v4,v6}_needs_tx_eval`). For a
+unique ifindex the fast-map read is bit-identical to the old `set.contains`
+(the set was populated iff the same `Filter` flag was set); for a duplicate
+ifindex the fast map is the last-wins canonical source, so the precheck now
+agrees with the filter the evaluator that follows actually walks. `FilterState`
+drops from 25 to 15 fields.
+
+**Aggregate-from-final-map rule.** Every retained family-wide `FilterState`
+aggregate (`has_input_tx_selection_*`, `has_input_three_color_policer_*`, and
+`has_output_needs_tx_eval_*`) is recomputed **after** the interface loop from the
+FINAL fast maps via `iface_filter_*_fast.values().any(..)`, NOT accumulated
+monotonically inside the loop. The fast maps overwrite last-wins on a duplicate
+ifindex, so a positive filter followed by a non-sensitive filter at the same
+ifindex must not leave a stale-true aggregate; deriving each aggregate from the
+final map makes it agree with the filter the hot path actually evaluates. For the
+common unique-ifindex case this is bit-identical to the old in-loop OR (only the
+duplicate-ifindex drift case changes, and it changes to the correct value).
 
 **Global TX gate.** `forwarding_build` computes the family-wide
 `tx_selection_enabled_v{4,6}` gate that short-circuits the entire `cos_classify`
-TX path. Its output clause is now the single `has_output_needs_tx_eval_*`
-aggregate, which SUBSUMES both the old `has_output_tx_selection_*` clause AND the
-old `!iface_filter_out_*_needs_tx_eval.is_empty()` clause (because
+TX path. Its output clause is the single `has_output_needs_tx_eval_*` aggregate,
+which SUBSUMES both the old `has_output_tx_selection_*` clause AND the old
+`!iface_filter_out_*_needs_tx_eval.is_empty()` clause (because
 `needs_tx_eval ⊇ affects_tx_selection`, also covering counter/log/terminal/
 policer). This is behavior-equivalent — a counter/log/terminal/policer-only
 output filter keeps the gate armed, so its enforcement never fails open — and
-cannot be tricked by a duplicate-ifindex overwrite. `has_output_tx_selection_*`
-and its production-dead accessor `filter_state_has_output_tx_selection` become
-unused-in-production once the gate stops reading them; PR-2A retains them (still
-recomputed, still test-asserted) for PR-2B to delete alongside the property sets.
+cannot be tricked by a duplicate-ifindex overwrite. PR-2A rewired the gate onto
+this aggregate; PR-2B then deleted the now-unread `has_output_tx_selection_*`
+fields and their production-dead accessor `filter_state_has_output_tx_selection`.
 
 Unparseable tcp-flags backstop (#3367): a term whose Junos `tcp-flags`
 expression the Go control plane could not parse into required/forbidden masks

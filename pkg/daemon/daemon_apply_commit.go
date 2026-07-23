@@ -422,6 +422,21 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 	// between the apply and here cannot re-introduce the skip. It does NOT run on
 	// a genuinely-fatal apply (see below), where the config is not live-forwarding
 	// and there is no session state to invalidate.
+
+	// #6296: capture the convergence digest of the tree SyncApply just promoted,
+	// while applySem is still held and BEFORE applyConfigLocked. The applied
+	// marker is stamped from this captured value in the deferred below (only on
+	// full success), so it records the config THIS sync actually applied — not a
+	// re-read of s.active at stamp time. Before #6296 handleConfigSync stamped
+	// MarkActiveApplied() AFTER syncAndApply released applySem, keyed to whatever
+	// s.active was then: a concurrent secondary-side promoter (a local commit /
+	// commit-confirmed rollback) landing in that post-release window, whose own
+	// apply then failed non-fatally, could make the stamp key the WRONG
+	// (unapplied) active digest, and a later re-push of that text would be falsely
+	// treated as converged (TOCTOU). ActiveDigest keys the same space
+	// ActiveApplied() reads (configTextDigest(s.active.Format())).
+	appliedDigest := d.store.ActiveDigest()
+
 	var armedActive bool
 	defer func() {
 		if !armedActive {
@@ -446,6 +461,19 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		// documented end-state follow-up.)
 		d.deviceMapPassiveAdmissionAlarm(compiled)
 		retErr = errors.Join(retErr, clearErr)
+		// #6296: stamp the applied marker HERE — inside syncAndApply while
+		// applySem is still held (this defer runs before the applySem.Release
+		// defer registered above), keyed to the digest captured above from the
+		// tree SyncApply promoted. Stamp only on FULL success (retErr == nil after
+		// the clearErr join: no fatal or non-fatal apply error AND no partial
+		// session-invalidation), matching the prior handleConfigSync gate which
+		// stamped MarkActiveApplied only when syncAndApply returned nil. A no-op
+		// on empty digest (nil-active defensive path) or a non-nil retErr leaves
+		// the prior digest, so a config whose apply did not fully converge is never
+		// marked applied — the #4957 invariant handleConfigSync's shortcut relies on.
+		if retErr == nil {
+			d.store.MarkAppliedDigest(appliedDigest)
+		}
 	}()
 
 	// #5564: capture the apply error instead of returning early on ANY error.

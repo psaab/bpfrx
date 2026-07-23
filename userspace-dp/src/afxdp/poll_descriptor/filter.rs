@@ -351,7 +351,7 @@ pub(super) fn evaluate_dscp_sensitive_input_filter_on_session_hit(
     // (tcp-flags / is-fragment / icmp-type / icmp-code). Both classes vary per
     // packet within a flow, so the first-packet decision must not be replayed.
     // The extra-build stays AFTER this gate so the common no-such-filter case
-    // pays only two FxHashSet lookups (this function is #[inline] on the hot
+    // pays only two FxHashMap lookups (this function is #[inline] on the hot
     // session-hit path).
     if !crate::filter::interface_input_filter_has_dscp_match(
         &forwarding.filter_state,
