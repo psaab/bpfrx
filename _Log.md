@@ -58760,3 +58760,88 @@ top.
     pkg/natshow/scan_error_5557_test.go, pkg/dataplane/userspace/interfaces.go,
     pkg/dataplane/userspace/synthetic_ifindex_exhaust_5557_test.go,
     pkg/configstore/rollback_size_cap_5557_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6395 — bound the shutdown session-aggregation final-flush join so
+    a stalled syslog sink cannot delay the HA takeover fence. `stopAggregator`
+    (pkg/daemon/daemon_system.go) previously did `cancel(); d.aggWg.Wait()` — an
+    UNBOUNDED join. The cancel triggers SessionAggregator.Run's #5313 ctx.Done
+    final flush, which forwards the pending report SYNCHRONOUSLY through the
+    syslog client (logFn -> er.ForwardLogMsg); stream syslog allows up to
+    defaultWriteTimeout (~4s) PER line, so an unreachable collector could block
+    the join for many seconds. Because stopAggregator runs in runShutdownSequence
+    BEFORE the HA/dataplane teardown fence, that unbounded wait could push the
+    stop past the systemd 20s TimeoutStopSec -> SIGKILL before the peer takeover
+    fence ran (a C179-093 residual regression from merged PR #6394: before #6394
+    the aggregator was leaked at shutdown, so shutdown never waited on it). Fix:
+    the join now runs on a `done` channel closed by a `d.aggWg.Wait()` goroutine,
+    selected against `time.After(aggregatorFlushJoinTimeout)` (3s — under a single
+    ~4s syslog write timeout and well under the #5643 5s applyCloseoutDrainTimeout
+    and the fence's stop-budget share). Happy path returns in ms; a stalled sink
+    logs a warning and PROCEEDS, dropping the partial report. aggStopped latch +
+    handle-clear semantics unchanged. stopIPsecRebindLoop left unbounded on
+    purpose (ctx.Done does no blocking forward; applySem.Acquire is ctx-cancelled;
+    same safe shape as the #5308 pin/scheduler joins) — noted in the README.
+    Test: daemon_aggregator_flush_bound_6395_test.go arms an aggregator with a
+    WEDGED logFn + one seeded SESSION_CLOSE, asserts stopAggregator RETURNS within
+    the bound (RED-on-revert: plain d.aggWg.Wait() blocks forever -> clean t.Fatal
+    at the 8s in-test timeout, verified firsthand) and that the handles clear +
+    aggStopped latches; a second test asserts the bound does not penalize a fast
+    flush. build+vet+gofmt clean; full `go test ./pkg/daemon/ ./pkg/logging/`
+    GREEN. No pkg/cluster / pkg/vrrp code touched — unit-testable shutdown-hygiene
+    class, no loss-cluster smoke needed.
+  - **File(s)**: pkg/daemon/daemon_system.go,
+    pkg/daemon/daemon_aggregator_flush_bound_6395_test.go, pkg/daemon/README.md,
+    _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6397 (fold into PR #6397 / branch fix/6395-bound-shutdown-flush)
+    — bound the shutdown IPsec DHCP-rebind retry-loop join, closing the same
+    fence-starvation gap the #6395 aggregator bound just fixed. The #6395 fix
+    left `stopIPsecRebindLoop` (pkg/daemon/daemon_ipsec_rebind.go) on a plain
+    `d.ipsecRebindWg.Wait()` and justified it in the README/commit as "safe by
+    shape / unbounded is fine". That premise is FALSE: the loop's cancel is
+    observed only at its ctx.Done / ticker select and at
+    `applySem.Acquire(ctx, 1)` — but once a tick has ACQUIRED applySem and
+    entered `tryIPsecRebindRetry`'s apply, the swanctl re-render+reload shells
+    out under `context.WithTimeout(context.Background(), swanctlTimeout=15s)`
+    (pkg/ipsec/manager.go runSwanctl — a BACKGROUND context, NOT the loop ctx)
+    plus a 5s WaitDelay, so a rebind that is MID-APPLY when shutdown fires blocks
+    the Wait for up to ~20s. Since `stopIPsecRebindLoop` runs in
+    runShutdownSequence (daemon_run_shutdown.go:93) BEFORE the HA takeover fence
+    (~:159), an unbounded wait can exhaust the systemd 20s TimeoutStopSec and get
+    the process SIGKILLed before the peer-takeover fence runs. Fix: the join now
+    runs on a `done` channel closed by a `d.ipsecRebindWg.Wait()` goroutine,
+    selected against `time.After(ipsecRebindJoinTimeout)`. Budget = 3s (sibling
+    const mirroring aggregatorFlushJoinTimeout): the mid-apply worst case is the
+    whole ~20s stop budget, so 3s leaves the fence the bulk of the 20s window;
+    the happy path is a loop parked on the ticker / ctx.Done and returns in
+    microseconds. On a stalled mid-apply we slog.Warn and PROCEED to teardown,
+    letting the in-flight swanctl finish in the background as the process exits
+    (harmless — nothing downstream reads its result). The ipsecRebindStopped
+    latch + cancel-clear under ipsecRebindMu are unchanged, before the bounded
+    join. README (pkg/daemon/README.md) corrected: the "left unbounded on purpose
+    / same safe shape as #5308 pin-scheduler" note was WRONG (those loops do no
+    background-context shell-out on cancel; this one does) — now documents BOTH
+    shutdown joins (aggregator + ipsec-rebind) as bounded because both block on a
+    context-insensitive downstream (syslog forward / swanctl apply) before the
+    fence. Codex MINOR noted: stopAggregator/stopIPsecRebindLoop are called BOTH
+    in runShutdownSequence AND as Run() defers, so a persistent stall waits the
+    bound twice; added a one-line comment at the defers clarifying the PRE-fence
+    call is the fence-critical one and the POST-fence re-wait is harmless (fence
+    already ran). Defers KEPT (fallback for a non-graceful Run exit). Test
+    (daemon_ipsec_rebind_flush_bound_6397_test.go): arms the loop with a WEDGED
+    swanctl seam that blocks (NOT ctx-aware, modeling the background-context
+    shell-out), waits until the loop is genuinely mid-apply (holding applySem),
+    then asserts stopIPsecRebindLoop RETURNS within the bound and latches
+    stopped + clears cancel; a second test asserts an unwedged (fast-apply) loop
+    is not penalized. RED-on-revert verified FIRSTHAND: reverting to a plain
+    `d.ipsecRebindWg.Wait()` blocks on the parked apply forever, so the stop
+    never returns and the test's generous outer select trips a clean t.Fatal at
+    8s (not a suite hang); restored -> GREEN at 3.01s. build + vet + gofmt clean;
+    full `go test ./pkg/daemon/ ./pkg/logging/ ./pkg/ipsec/` GREEN. No
+    pkg/cluster / pkg/vrrp touched — unit-testable shutdown-hygiene class
+    (#5308/#5681 lineage), no loss-cluster smoke needed.
+  - **File(s)**: pkg/daemon/daemon_ipsec_rebind.go,
+    pkg/daemon/daemon_ipsec_rebind_flush_bound_6397_test.go,
+    pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md

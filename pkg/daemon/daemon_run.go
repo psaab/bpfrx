@@ -102,7 +102,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// covered by the run WaitGroup, so guarantee they are cancelled + joined on
 	// every Run return — including the early-error / embedded-caller paths that
 	// skip runShutdownSequence. On the normal path runShutdownSequence stops
-	// both first (idempotent / nil-safe), so these defers are no-ops there.
+	// both first (idempotent / nil-safe), so these defers are no-ops there. A
+	// persistent stall is the only case where both the runShutdownSequence call
+	// and this defer do real work — each bounded join (#6395/#6397) waits its
+	// budget once, but the fence-starvation that matters is the PRE-fence call in
+	// runShutdownSequence; this POST-fence re-wait runs after the HA fence has
+	// already completed, so its extra budget is harmless.
 	defer d.stopIPsecRebindLoop()
 	defer d.stopAggregator()
 	d.startPolicySchedulerLoopLocked()

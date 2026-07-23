@@ -88,16 +88,47 @@ func (d *Daemon) armIPsecRebind() {
 	}()
 }
 
+// ipsecRebindJoinTimeout bounds how long stopIPsecRebindLoop waits to JOIN the
+// retry loop at shutdown before proceeding to teardown (#6397). The loop's
+// ctx.Done and applySem.Acquire branches ARE ctx-cancellable, so a loop parked
+// on the ticker or blocked waiting for applySem unwinds immediately on cancel.
+// But once a tick has ACQUIRED applySem and entered tryIPsecRebindRetry's apply,
+// the swanctl re-render+reload shells out under
+// context.WithTimeout(context.Background(), swanctlTimeout=15s)
+// (pkg/ipsec/manager.go runSwanctl) — a BACKGROUND context that the loop's
+// cancel does NOT interrupt — plus a 5s WaitDelay, so a rebind that is mid-apply
+// when shutdown fires can block a plain ipsecRebindWg.Wait() for up to ~20s.
+// stopIPsecRebindLoop runs in runShutdownSequence BEFORE the HA takeover fence,
+// so an unbounded join could push the whole stop past the systemd 20s
+// TimeoutStopSec (test/incus/xpfd.service) and get the process SIGKILLed before
+// the fence runs — the same fence-starvation class the #6395 aggregator join
+// bound fixed. 3s mirrors aggregatorFlushJoinTimeout and leaves the fence the
+// bulk of the 20s stop budget.
+const ipsecRebindJoinTimeout = 3 * time.Second
+
 // stopIPsecRebindLoop cancels the ipsecRebindRetryLoop goroutine and JOINS it at
 // shutdown, so a late 30s rebind tick can never run a swanctl reapply against a
 // torn-down subsystem (#5523 C179-093). It latches ipsecRebindStopped so a late
 // armIPsecRebind cannot start a new loop after the join. Idempotent / nil-safe:
 // a loop that was never armed (no lease-change rebind failure) joins cleanly.
 //
+// The join is BOUNDED by ipsecRebindJoinTimeout (#6397): the loop's cancel is
+// ctx-observed only at its ticker/ctx.Done select and the applySem.Acquire —
+// NOT inside a swanctl apply already in flight, which runs under a background
+// context (runSwanctl). A rebind that is mid-apply when shutdown fires would
+// otherwise block this join for up to ~20s, and since it precedes the HA
+// takeover fence, an unbounded wait can blow the systemd stop budget and get the
+// process SIGKILLed before the fence runs. On the happy path the loop is parked
+// on the ticker / ctx.Done and the cancel + join returns in microseconds; on a
+// stalled mid-apply we log a warning and PROCEED to teardown, letting the
+// in-flight swanctl shell-out finish in the background as the process exits
+// (harmless — nothing downstream reads its result).
+//
 // ipsecRebindMu is held only to latch the flag and read+clear the cancel, then
 // RELEASED before the join: the loop takes ipsecRebindMu on both its ctx.Done
 // (disarmIPsecRebindOnShutdown) and ticker branches, so holding it across the
-// join would deadlock. Mirrors the #5308 stopPinRetryLoop.
+// join would deadlock. Mirrors the #5308 stopPinRetryLoop, plus the #6395
+// aggregator's bounded-join shape.
 func (d *Daemon) stopIPsecRebindLoop() {
 	d.ipsecRebindMu.Lock()
 	d.ipsecRebindStopped = true
@@ -107,7 +138,20 @@ func (d *Daemon) stopIPsecRebindLoop() {
 	if cancel != nil {
 		cancel()
 	}
-	d.ipsecRebindWg.Wait()
+
+	done := make(chan struct{})
+	go func() {
+		d.ipsecRebindWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(ipsecRebindJoinTimeout):
+		slog.Warn("shutdown: timed out joining IPsec DHCP-rebind retry loop; "+
+			"proceeding to teardown (a mid-apply swanctl shell-out runs under a "+
+			"background context and finishes as the process exits)",
+			"timeout", ipsecRebindJoinTimeout)
+	}
 }
 
 // clearIPsecRebindPending drops the health signal after a successful reapply,
