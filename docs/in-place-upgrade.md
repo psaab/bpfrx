@@ -291,7 +291,12 @@ exist.
   `restorableCurrentTarget`, which returns `ver==""` unless `current` is a
   symlink naming a **bare in-tree segment** whose `versions/<ver>/`
   **directory exists** and holds the **complete managed lockstep set**
-  (`manifest.LockstepNames`). The same `validateRestorableVersion` predicate
+  (`manifest.LockstepNames`), where each lockstep binary is a **regular,
+  executable file** — the flip drop-in execs the literal
+  `versions/<ver>/xpfd` path, so a lockstep entry that is a directory / FIFO
+  / socket / symlink / non-executable file is not systemd-startable and is
+  rejected (`os.Lstat`, so a symlink is rejected outright rather than
+  followed). The same `validateRestorableVersion` predicate
   re-checks a *persisted* `PreviousVersion` on every resume before STOP (a
   pre-#6374 journal or a dir damaged/GC'd after INIT is caught), and gates
   the standalone `rollback()` **before** it stops the daemon or restores the

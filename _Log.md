@@ -59303,3 +59303,29 @@ top.
     restored GREEN. build+vet+gofmt clean. Still NOT HA-touching.
   - **File(s)**: pkg/upgrade/cutover.go,
     pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-23T22:10Z
+  - **Action**: Fix #6374 round-4 fold (Codex MAJOR — "restorable" predicate was
+    stat-only). validateRestorableVersion checked only `os.Stat(binary) != nil`
+    for each lockstep binary — it ignored file TYPE and permissions, so a
+    DIRECTORY / FIFO / socket / symlink / NON-EXECUTABLE file named `xpfd`
+    counted as restorable. But the flip drop-in execs the literal
+    versions/<ver>/xpfd path, so systemd cannot start such a target → StopUnit
+    into an unstartable rollback state (the #6374 hazard on a deeper corruption
+    mode), reachable at INIT and both resume branches. Fold: each
+    manifest.LockstepNames() binary must be a REGULAR, EXECUTABLE file
+    (`fi.Mode().IsRegular()` && `Perm()&0o111 != 0`), via `os.Lstat` so a
+    symlink is rejected outright (a managed runtime is a real copied file; a
+    symlink at that path is corruption). These flow through the existing
+    present-but-broken → refuse path unchanged (composes with r3). New tests:
+    file-type unit matrix (non-exec / directory / fifo / symlink-to-real-exec /
+    valid control) via restorableCurrentTarget; INIT + resumed integration
+    tests for a non-exec `current` refusing under sanction. The symlink case
+    points at a REAL executable so os.Stat would follow-and-accept — only Lstat
+    rejects it, keeping the fail-on-revert discriminating. Neutralizing to
+    stat-only drives all 4 file-type subtests + both integration tests RED while
+    the valid control stays GREEN (confirmed firsthand), restored GREEN. Full
+    `go test ./pkg/upgrade/...` GREEN (existing valid dirs use 0755 exec regular
+    files — no regression); build+vet+gofmt clean. Still NOT HA-touching.
+  - **File(s)**: pkg/upgrade/runner.go,
+    pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md

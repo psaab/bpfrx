@@ -199,6 +199,110 @@ func TestRestorableCurrentTarget_Cases(t *testing.T) {
 	})
 }
 
+// firstLockstepBinPath returns versions/<ver>/<first lockstep binary>, skipping
+// the test if the manifest declares no lockstep binaries.
+func firstLockstepBinPath(t *testing.T, cfg Config, ver string) string {
+	t.Helper()
+	lock := manifest.LockstepNames()
+	if len(lock) == 0 {
+		t.Skip("no lockstep binaries in manifest")
+	}
+	return filepath.Join(cfg.VersionsDir, ver, lock[0])
+}
+
+// TestRestorableCurrentTarget_LockstepFileTypes is the #6374 round-4 matrix:
+// "restorable" must mean SYSTEMD-STARTABLE, not merely "the path stats OK". The
+// flip drop-in execs the literal versions/<ver>/xpfd path, so a lockstep binary
+// that is a directory / FIFO / symlink / non-executable file is NOT a startable
+// rollback target — validateRestorableVersion must reject it, and
+// restorableCurrentTarget must report it as present-but-broken (ver=="",
+// present==true) so it refuses under any sanction, exactly like a dangling
+// current.
+//
+// FAIL-ON-REVERT: revert the mode/type check to stat-only and the
+// non-exec/directory/fifo/symlink subtests get a nonempty ver -> clean
+// ASSERTION RED.
+func TestRestorableCurrentTarget_LockstepFileTypes(t *testing.T) {
+	check := func(t *testing.T, why string, mutate func(t *testing.T, binPath string)) {
+		t.Helper()
+		fs := newFakeSystem(t, "2.0.0")
+		r, cfg := testEnv(t, fs)
+		writeCompleteVersionDir(t, cfg, "1.0.0")
+		mutate(t, firstLockstepBinPath(t, cfg, "1.0.0"))
+		if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
+			t.Fatal(err)
+		}
+		ver, present := r.restorableCurrentTarget()
+		if ver != "" {
+			t.Fatalf("%s: lockstep binary wrongly accepted as restorable target %q "+
+				"(#6374: the flip drop-in execs the literal path — it must be a "+
+				"regular executable file)", why, ver)
+		}
+		if !present {
+			t.Fatalf("%s: wrongly classified as ABSENT (sanctionable)", why)
+		}
+	}
+
+	t.Run("non-executable", func(t *testing.T) {
+		check(t, "non-executable lockstep binary", func(t *testing.T, bp string) {
+			if err := os.Chmod(bp, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	t.Run("directory", func(t *testing.T) {
+		check(t, "lockstep binary is a directory", func(t *testing.T, bp string) {
+			if err := os.Remove(bp); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(bp, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	t.Run("fifo", func(t *testing.T) {
+		check(t, "lockstep binary is a FIFO", func(t *testing.T, bp string) {
+			if err := os.Remove(bp); err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Mkfifo(bp, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	t.Run("symlink", func(t *testing.T) {
+		check(t, "lockstep binary is a symlink", func(t *testing.T, bp string) {
+			if err := os.Remove(bp); err != nil {
+				t.Fatal(err)
+			}
+			// Point the symlink at a REAL regular executable so os.Stat would
+			// FOLLOW it and (wrongly) accept — only Lstat rejecting the symlink
+			// itself makes this refuse. A managed runtime is a real copied file;
+			// a symlink at this path is corruption/tampering, not a valid
+			// startable target (and keeps the fail-on-revert discriminating).
+			realTarget := bp + ".real"
+			writeFakeBin(t, realTarget, "real-executable")
+			if err := os.Symlink(realTarget, bp); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	t.Run("valid-regular-executable-proceeds", func(t *testing.T) {
+		// Control: an untouched complete dir (regular + executable via
+		// writeFakeBin's 0755) IS restorable.
+		fs := newFakeSystem(t, "2.0.0")
+		r, cfg := testEnv(t, fs)
+		writeCompleteVersionDir(t, cfg, "1.0.0")
+		if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
+			t.Fatal(err)
+		}
+		ver, present := r.restorableCurrentTarget()
+		if ver != "1.0.0" || !present {
+			t.Fatalf("valid regular+executable current: got (%q,present=%v), want (\"1.0.0\",true)", ver, present)
+		}
+	})
+}
+
 // assertNoLiveMutation fails if the cut ran any live-mutating step or stopped
 // the daemon — the whole point of a refuse-before-STOP.
 func assertNoLiveMutation(t *testing.T, fs *fakeSystem, why string) {
@@ -488,6 +592,75 @@ func TestRun_ResumedEmptyPreviousAbsentCurrentSanctionedProceeds(t *testing.T) {
 	if filepath.Base(tgt) != "2.0.0" {
 		t.Errorf("resumed sanctioned first cut did not flip current to 2.0.0: %q", tgt)
 	}
+}
+
+// TestRun_NonExecCurrentRefusesEvenWhenSanctioned is the #6374 round-4 INIT
+// integration case: a `current` whose rollback runtime's lockstep binary is a
+// NON-EXECUTABLE regular file is not systemd-startable, so it is a
+// present-but-broken rollback target that must refuse before STOP even under a
+// first-cut sanction (an executable-blind check would STOP into an unstartable
+// rollback state).
+//
+// FAIL-ON-REVERT: revert validateRestorableVersion to stat-only -> the
+// non-executable xpfd is accepted as restorable, the cut records it and reaches
+// STOP -> the no-live-mutation assertions go RED.
+func TestRun_NonExecCurrentRefusesEvenWhenSanctioned(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	writeCompleteVersionDir(t, cfg, "1.0.0")
+	if err := os.Chmod(firstLockstepBinPath(t, cfg, "1.0.0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
+		t.Fatal(err)
+	}
+
+	err := r.Run(Options{AllowNoRollbackFirstCut: true}) // SANCTIONED
+	if err == nil {
+		t.Fatal("expected refuse-before-STOP on a current whose rollback xpfd is " +
+			"non-executable, even when sanctioned")
+	}
+	if !strings.Contains(err.Error(), "refuse-before-STOP") {
+		t.Fatalf("error is not the refuse-before-STOP guard: %v", err)
+	}
+	assertNoLiveMutation(t, fs, "a present-but-unstartable (non-executable xpfd) rollback target")
+	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
+		t.Error("a journal was persisted despite refusing a non-executable rollback target")
+	}
+}
+
+// TestRun_ResumedEmptyPreviousNonExecCurrentRefusesSanction is the round-4
+// resume variant: a resumed empty-previous sanctioned journal whose `current`
+// points at a runtime with a non-executable lockstep binary must refuse before
+// STOP — the resume-time re-check keys on the same startable predicate.
+func TestRun_ResumedEmptyPreviousNonExecCurrentRefusesSanction(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	writeCompleteVersionDir(t, cfg, "2.0.0") // target complete
+	writeCompleteVersionDir(t, cfg, "1.0.0") // rollback dir, but xpfd non-exec below
+	if err := os.Chmod(firstLockstepBinPath(t, cfg, "1.0.0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
+		t.Fatal(err)
+	}
+	j := &Journal{
+		State:              StateVerified,
+		TargetVersion:      "2.0.0",
+		PreviousVersion:    "",
+		FirstCutSanctioned: true,
+	}
+	must(t, r.saveJournal(j))
+
+	err := r.Run(Options{})
+	if err == nil {
+		t.Fatal("expected refuse-before-STOP on a resumed empty-previous cut whose " +
+			"`current` rollback xpfd is non-executable, despite the sanction")
+	}
+	if !strings.Contains(err.Error(), "refuse-before-STOP") {
+		t.Fatalf("error is not the refuse-before-STOP guard: %v", err)
+	}
+	assertNoLiveMutation(t, fs, "a resumed present-but-unstartable rollback target (sanction must not bypass)")
 }
 
 // TestRollback_RefusesUnrestorablePrevious proves the #6374 pre-rollback
