@@ -791,10 +791,16 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	inactiveFn := dpuserspace.PolicyInactiveFn(schedState)
 	res := policymatch.Match(cfg, policymatch.Query{
-		FromZone:         fromZone,
-		ToZone:           toZone,
-		SrcIP:            srcIP,
-		DstIP:            dstIP,
+		FromZone: fromZone,
+		ToZone:   toZone,
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+		// #6377: colon-strict text family from the RAW query strings so the
+		// unsupported-tuple gate does not fold an IPv4-mapped IPv6 source to v4.
+		// Classify srcIPStr/dstIPStr (the un-parsed operator text) — srcIP/dstIP
+		// are net.ParseIP results that have already discarded the ':'.
+		SrcFamily:        config.NATAddrFamily(srcIPStr),
+		DstFamily:        config.NATAddrFamily(dstIPStr),
 		Protocol:         proto,
 		SrcPort:          srcPort,
 		DstPort:          dstPort,

@@ -238,11 +238,16 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		ToZone:   req.ToZone,
 		SrcIP:    parsedSrc,
 		DstIP:    parsedDst,
-		Protocol: req.Protocol,
-		SrcPort:  int(req.SourcePort),
-		DstPort:  int(req.DestinationPort),
-		ICMPType: icmpType,
-		ICMPCode: icmpCode,
+		// #6377: colon-strict text family from the RAW request string so the
+		// unsupported-tuple gate does not fold an IPv4-mapped IPv6 source to v4
+		// (net.ParseIP has discarded the ':' above).
+		SrcFamily: config.NATAddrFamily(req.SourceIp),
+		DstFamily: config.NATAddrFamily(req.DestinationIp),
+		Protocol:  req.Protocol,
+		SrcPort:   int(req.SourcePort),
+		DstPort:   int(req.DestinationPort),
+		ICMPType:  icmpType,
+		ICMPCode:  icmpCode,
 		// #5572: a non-first IP fragment (no L4 header) is the flowless packet
 		// shape the dataplane calls l4_present == false; the simulator then
 		// reproduces the #4569 fragment-associated deny. false (default) is a

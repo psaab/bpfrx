@@ -377,11 +377,16 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			ToZone:   toZone,
 			SrcIP:    net.ParseIP(srcIP),
 			DstIP:    net.ParseIP(dstIP),
-			Protocol: proto,
-			SrcPort:  srcPort,
-			DstPort:  dstPort,
-			ICMPType: icmpType,
-			ICMPCode: icmpCode,
+			// #6377: colon-strict text family from the RAW operator string so
+			// the unsupported-tuple gate does not fold an IPv4-mapped IPv6
+			// source to v4 (net.ParseIP has discarded the ':' above).
+			SrcFamily: config.NATAddrFamily(srcIP),
+			DstFamily: config.NATAddrFamily(dstIP),
+			Protocol:  proto,
+			SrcPort:   srcPort,
+			DstPort:   dstPort,
+			ICMPType:  icmpType,
+			ICMPCode:  icmpCode,
 			// #5572: non-first-fragment (l4_present == false) reproduces the
 			// #4569 fragment-associated deny; false is a normal L4 packet.
 			NonFirstFragment: nonFirstFrag,

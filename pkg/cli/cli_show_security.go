@@ -404,11 +404,15 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		ToZone:   toZone,
 		SrcIP:    parsedSrc,
 		DstIP:    parsedDst,
-		Protocol: proto,
-		SrcPort:  srcPort,
-		DstPort:  dstPort,
-		ICMPType: icmpType,
-		ICMPCode: icmpCode,
+		// #6377: colon-strict text family from the RAW operator string so the
+		// unsupported-tuple gate does not fold an IPv4-mapped IPv6 source to v4.
+		SrcFamily: config.NATAddrFamily(srcIP),
+		DstFamily: config.NATAddrFamily(dstIP),
+		Protocol:  proto,
+		SrcPort:   srcPort,
+		DstPort:   dstPort,
+		ICMPType:  icmpType,
+		ICMPCode:  icmpCode,
 		// #5572: a non-first IP fragment (no L4 header) reproduces the #4569
 		// fragment-associated deny; false is a normal L4-present packet.
 		NonFirstFragment: nonFirstFrag,

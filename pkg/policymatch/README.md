@@ -520,35 +520,72 @@ wildcard and never triggers the gate), it returns a first-class
 `Result.UnsupportedTupleFamily` verdict: `Matched`/`DefaultUsed`/
 `HostInboundUnmatched`/`ContentRejected` are all false, `Action` is the
 conservative `PolicyDeny` for a raw reader, and `DisplayAction` renders the
-dedicated `UnsupportedTupleFamilyActionString`. Family is read with `To4()`, the
-same convention the host-inbound `ipFamily` helper uses. The fail-on-revert
-artifact is `mixed_family_tuple_5720_test.go`: dropping the gate makes the
-(V4 src, V6 dst) query fall through to a fabricated default verdict.
+dedicated `UnsupportedTupleFamilyActionString`. Family is **colon-strict**
+(#6377, see below): `queryTupleFamily` prefers the caller's
+`Query.SrcFamily`/`Query.DstFamily` text hint and falls back to `To4()` only
+when no hint is supplied. The fail-on-revert artifact is
+`mixed_family_tuple_5720_test.go`: dropping the gate makes the (V4 src, V6 dst)
+query fall through to a fabricated default verdict.
 
-### Known limitation — IPv4-mapped IPv6 source is folded (#5720)
+### Colon-strict family — IPv4-mapped IPv6 source (#6377, resolved)
 
-The gate reads family with `net.IP.To4()`, which FOLDS an IPv4-mapped IPv6
-literal: `net.ParseIP("::ffff:192.0.2.1").To4()` is non-nil. So a source
-authored as `::ffff:192.0.2.1` against a `2001:db8::1` destination is classified
-(V4 src, V6 dst) and **falsely** reported `UnsupportedTupleFamily`, even though
-the colon-strict runtime matcher (`userspace-dp/src/policy.rs`) treats the
-mapped literal as V6 and sees a valid same-family V6/V6 tuple that should be
-evaluated normally. This is the documented Go/Rust family-parity trap: the
-authoritative colon-strict classifier is `config.NATAddrFamily` /
-`natAddrFamily` (`pkg/config/compiler_nat_helpers.go`), which keys family on the
-presence of a `':'` in the *original text* — precisely the signal `net.ParseIP`
-has already discarded by the time the gate sees `q.SrcIP`/`q.DstIP`.
+`net.IP.To4()` FOLDS an IPv4-mapped IPv6 literal:
+`net.ParseIP("::ffff:192.0.2.1").To4()` is non-nil. Before #6377 the gate read
+family with `To4()` alone, so a source authored as `::ffff:192.0.2.1` against a
+`2001:db8::1` destination was classified (V4 src, V6 dst) and **falsely**
+reported `UnsupportedTupleFamily`, even though the colon-strict runtime matcher
+(`userspace-dp/src/policy.rs`) treats the mapped literal as V6 and sees a valid
+same-family V6/V6 tuple that should be evaluated normally. This is the
+documented Go/Rust family-parity trap: the authoritative colon-strict classifier
+is `config.NATAddrFamily` / `natAddrFamily`
+(`pkg/config/compiler_nat_helpers.go`), which keys family on the presence of a
+`':'` in the *original text* — precisely the signal `net.ParseIP` has already
+discarded by the time the gate sees `q.SrcIP`/`q.DstIP`.
 
-The limitation cannot be fixed at the gate from `q.SrcIP`/`q.DstIP` alone: all
-four `Query` builders (`cli_request_testcmd.go`, `cli_show_security.go`,
-`server_show_firewall.go`, `server_cluster.go`) parse with `net.ParseIP`, which
-makes `192.0.2.1` and `::ffff:192.0.2.1` byte-identical 16-byte values. The
-correct fix threads the colon-strict text family (`config.NATAddrFamily` on the
-raw `srcIP`/`dstIP` strings) from each caller into `Query`; that cross-package
-`Query` API change is out of scope for the #5720 tooling cohort and is filed as
-follow-up #6377. The failure mode is a spurious "unsupported tuple" advisory
-on a diagnostic surface (fail-safe — it never hides or fabricates a permit), not
-a dataplane effect.
+The fix threads that colon-strict text family from every caller into the query.
+`Query` carries an optional `SrcFamily`/`DstFamily` ("v4"/"v6"/"") hint, and all
+FIVE builders (`cli_request_testcmd.go`, `cli_show_security.go`,
+`server_show_firewall.go`, `server_cluster.go`, and the REST
+`api/security.go` `matchPoliciesHandler`) populate it with
+`config.NATAddrFamily` on the RAW operator string before `net.ParseIP` folds it.
+`queryTupleFamily` prefers the hint and falls back to `To4()` only when a caller
+supplies none (the `net.IP`-only callers, e.g. tests — their pre-#6377 fold is
+preserved). So `::ffff:192.0.2.1` now yields `SrcFamily == "v6"`, the tuple is a
+same-family V6/V6 pair, and the gate falls through to normal evaluation, exactly
+as the runtime does. A genuine dotted-quad `10.0.0.1 -> 2001:db8::1` still
+classifies (V4 src, V6 dst) and is still flagged. The fail-on-revert artifact is
+`mapped_ipv4_tuple_6377_test.go`
+(`TestMatchMappedIPv6SourceNotGated`): restoring the `To4()`-only gate folds the
+mapped source to v4 and falsely flags it. The pre-fix failure mode was a
+spurious "unsupported tuple" advisory on a diagnostic surface (fail-safe — it
+never hid or fabricated a permit), not a dataplane effect.
+
+The same colon-strict family also governs the policy EVALUATOR, not just the
+up-front gate. `matchAddr` (the per-side address matcher) classifies the
+packet's family with `queryTupleFamily(ip, family)` — the threaded hint, falling
+back to `To4()` only when absent — so a mapped source is tested against the
+**V6** address rules, never folded to v4. Without this, letting the mapped tuple
+fall through the gate would be **worse** than the original bug: `net.IP.To4()`
+folds `::ffff:192.0.2.1` to `192.0.2.1`, which is inside a `192.0.2.0/24` V4
+policy, so the simulator would **fabricate a PERMIT** (fail-OPEN) the runtime
+never produces (the Rust matcher evaluates the V6 source against the V6 rules →
+default-deny). Only the `isV4` branch selection consumes the family; the
+`v4Empty`/`v6Empty` gates key on the ADDRESS SETS, so the #3023 cross-family and
+#2008 excluded fail-closed semantics are unchanged. The evaluation fail-on-revert
+artifacts are `TestMatchMappedIPv6SourceNotEvaluatedAsV4` (matcher) and
+`TestMatchPoliciesRESTMappedIPv6SourceNotEvaluatedAsV4_6377` (REST): restoring
+`isV4 := ip.To4() != nil` makes the mapped source match a V4-only permit rule.
+
+The host-inbound classifier is the third colon-strict consumer.
+`hostInboundAdmission` derives the nft-style family token via `ipFamilyStrict`
+(the hint mapped to `ip`/`ip6`, `To4()` fallback when absent) instead of the
+folding `ipFamily`, so a mapped-v6 host-bound destination (e.g. a DHCPv6 flow to
+the firewall authored as `::ffff:...`) is classified `ip6`. A family-scoped
+`system-services` token (`dhcpv6`=ip6, `dhcp`=ip; `ping`'s ICMP vs ICMPv6 type)
+would otherwise be mis-admitted. Fail-on-revert:
+`TestHostInboundMappedIPv6DstClassifiedAsV6` — restoring `family =
+ipFamily(q.DstIP)` flips a mapped-v6 dst on udp/547 from `TokenAdmit(dhcpv6)` to
+`Denied`.
 
 The `Match`-side gate is transport-agnostic (every surface funnels through the
 one entry point), but rendering the *dedicated verdict* to an operator is
