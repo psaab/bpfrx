@@ -10,6 +10,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/api"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/sysservices"
 )
 
 // managementReconciler owns the HTTP/HTTPS management-listener lifecycle so a
@@ -66,6 +67,12 @@ type managementReconciler struct {
 	srv    *api.Server  // single long-lived server; its HTTP/HTTPS legs reconcile in place (nil until started)
 	cur    mgmtEndpoint // last-CONVERGED per-leg fingerprint (a leg field advances only on that leg's successful reconcile)
 	curSet bool
+	// lastHTTPAttempt is the most-recent HTTP bind address the reconciler tried
+	// (desired.Addr), recorded BEFORE the bind attempt so a boot bind FAILURE
+	// (curSet stays false) can report the address it could not bind as
+	// `(bind failed)` in `show system services` (#6401). Distinct from cur.addr,
+	// which advances only on a successful bind.
+	lastHTTPAttempt string
 }
 
 // mgmtEndpoint fingerprints the listener-defining fields. An auth change does
@@ -122,12 +129,57 @@ func (m *managementReconciler) start(ctx context.Context) error {
 func (m *managementReconciler) startTo(ctx context.Context, next api.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Record the attempted HTTP bind BEFORE Start so a bind failure (curSet stays
+	// false) can report it as `(bind failed)` in `show system services` (#6401).
+	m.lastHTTPAttempt = next.Addr
 	srv := api.NewServer(next)
 	if err := srv.Start(ctx); err != nil {
 		return err
 	}
 	m.srv, m.cur, m.curSet = srv, endpointOf(next), true
 	return nil
+}
+
+// effectiveHTTPListener returns the effective STATE of the HTTP REST listener
+// for `show system services` (#6385/#6401):
+//
+//   - nil reconciler → StateDisabled: --api-addr was empty, so Daemon.Run never
+//     started the HTTP listener. A genuinely-off listener, distinct from a
+//     failed one.
+//   - configured but never converged (curSet false) → StateFailed: the boot
+//     bind failed. Reports lastHTTPAttempt (the address it could not bind).
+//   - converged but the live HTTP leg is no longer serving (an UNEXPECTED serve
+//     exit — EffectiveHTTPAddr returns "") → StateFailed, symmetric with the
+//     gRPC serve-exit clear. Reports m.cur.addr (or lastHTTPAttempt). A day-2
+//     rebind FAILURE is NOT this case: it RETAINS the old serving leg (its
+//     socket stays live → EffectiveHTTPAddr non-empty), so it correctly stays
+//     Listening.
+//   - converged and serving → StateListening: reports the ACTUAL bound address
+//     from the live server (EffectiveHTTPAddr — so an ephemeral :0 resolves to
+//     its concrete port).
+func (m *managementReconciler) effectiveHTTPListener() sysservices.Listener {
+	if m == nil {
+		return sysservices.Listener{State: sysservices.StateDisabled}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.curSet {
+		return sysservices.Listener{Addr: m.lastHTTPAttempt, State: sysservices.StateFailed}
+	}
+	var bound string
+	if m.srv != nil {
+		bound = m.srv.EffectiveHTTPAddr()
+	}
+	if bound == "" {
+		// The converged HTTP leg died (an unexpected serve exit): report Failed,
+		// not a stale Listening on a dead socket.
+		addr := m.cur.addr
+		if addr == "" {
+			addr = m.lastHTTPAttempt
+		}
+		return sysservices.Listener{Addr: addr, State: sysservices.StateFailed}
+	}
+	return sysservices.Listener{Addr: bound, State: sysservices.StateListening}
 }
 
 // reconcile matches the live listener + auth snapshot to cfg. It returns a

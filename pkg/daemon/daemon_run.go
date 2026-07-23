@@ -679,6 +679,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		shell.SetSurfaceADDNSStatusFn(d.SurfaceAStatus)
 		shell.SetSurfaceADDNSForceFn(d.ForceDDNSUpdate)
 		shell.SetFlowCollectorHealthFn(d.FlowCollectorHealth)
+		// #6385: the local console `show system services` renderer reports the
+		// EFFECTIVE post-bind listener addresses from the SAME daemon-owned
+		// snapshot the remote gRPC renderer reads (grpcapi.Config.ListenersFn), so
+		// local and remote never disagree.
+		shell.SetListenersFn(d.effectiveListeners)
 		shell.SetVRRPManager(d.vrrpMgr)
 		shell.SetFabricPeer(func() []string {
 			var addrs []string

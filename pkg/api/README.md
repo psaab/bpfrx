@@ -326,6 +326,19 @@ under the daemon's errgroup. Nothing else imports this package.
     re-enable, HTTPS-bind-only change, HTTP-change-keeps-HTTPS, auth swap,
     bind-failure retain-old). `Run`/`serveBound` remain the single-lifecycle test
     entry point.
+  - `EffectiveHTTPAddr()` (#6385/#6401) returns the live HTTP leg's ACTUAL bound
+    address (`httpLeg.ln.Addr()`) — an ephemeral `:0` request resolves to its
+    concrete port, a wildcard/hostname bind is normalized — or `""` when no HTTP
+    leg is serving OR the live leg's serve loop exited UNEXPECTEDLY (the serve
+    goroutine marks the leg `dead` — an ATOMIC store, NOT under `lifeMu`, so a
+    serve-exit racing a shutdown `Wait()` cannot deadlock: the goroutine still
+    holds its `wg` count when it marks dead and `Wait()` holds `lifeMu` across
+    `wg.Wait()`, so a lifeMu-guarded marker would form a lock-ordering cycle; a
+    requested shutdown via `stopLegLocked`/`rootCtx` does NOT mark dead). The
+    daemon's `show system services`
+    effective-listener snapshot reads it
+    (`managementReconciler.effectiveHTTPListener`) and renders a dead leg
+    `Failed`, symmetric with the gRPC serve-exit clear.
   - The auto-generated HTTPS cert (`generateSelfSignedCertAt`, used when no
     operator cert is provisioned) carries Subject Alternative Names, not just a
     CommonName (#5719, codex-review-182 C-API TLS hygiene). Every modern TLS

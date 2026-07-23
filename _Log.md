@@ -59045,6 +59045,140 @@ top.
     pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md
 
 - **Timestamp**: 2026-07-23
+  - **Action**: #6385 — `show system services` reports EFFECTIVE post-bind
+    management-listener addresses on BOTH surfaces (re-file of fix-5 dropped
+    from #6384). Root cause: the remote gRPC renderer
+    (`pkg/grpcapi/server_show_system.go`) AND the local CLI renderer
+    (`pkg/cli/cli_show_system.go`) each hardcoded
+    `127.0.0.1:50051 / 127.0.0.1:8080 (always on)`, reporting the
+    requested/config-declared listeners, not the addresses the daemon
+    actually bound (post-#5035 gRPC loopback clamp / post-#4047/#5127 REST
+    clamp / disabled listener). A local-only patch left the remote path — the
+    common operator path — wrong. Fix: new leaf pkg `pkg/sysservices`
+    (`Listeners` + shared `Lines()` renderer, stdlib-only). Daemon aggregator
+    `Daemon.effectiveListeners()` builds ONE snapshot — gRPC from a new
+    `grpcapi.Server.EffectiveAddr()` recorded after `net.Listen`, HTTP REST
+    from a new `managementReconciler.effectiveHTTPAddr()` (converged
+    `m.cur.addr`; `""` -> rendered `disabled` when `--api-addr` empty). BOTH
+    renderers read that ONE snapshot: gRPC via `Config.ListenersFn`, local CLI
+    via `SetListenersFn`, both formatting through `Listeners.Lines`, so local
+    and remote can never diverge. Surface enumeration: only two `System
+    services:` emitters exist (local CLI + remote gRPC) — both fixed; no HTTP
+    REST / JSON / display-xml variant renders the listener block. Fail-on-
+    revert nets: `TestShowSystemServicesEffectiveListenersGRPC` (primary,
+    remote path) + `TestShowSystemServicesEffectiveListenersLocal` +
+    `sysservices.TestListenersLines`; each RED verified FIRSTHAND by
+    neutralizing the render substitution (clean ASSERTION failure, nil-
+    fallback test stays GREEN), restored -> GREEN. build+vet+gofmt clean;
+    `go test ./pkg/sysservices/ ./pkg/grpcapi/ ./pkg/cli/ ./pkg/daemon/`
+    GREEN. Unit-testable show-render class — no loss-cluster smoke needed.
+  - **File(s)**: pkg/sysservices/listeners.go,
+    pkg/sysservices/listeners_test.go, pkg/grpcapi/server.go,
+    pkg/grpcapi/server_show_system.go,
+    pkg/grpcapi/server_show_system_listeners_6385_test.go,
+    pkg/cli/cli.go, pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_listeners_6385_test.go,
+    pkg/daemon/management.go, pkg/daemon/daemon_run_servers.go,
+    pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385/#6401 fold — model listener STATE, not just an address
+    (Codex MERGE-NEEDS-MAJOR completeness gap adjudicated real by team-lead).
+    `sysservices.Listener` now carries `{Addr, State}` with State ∈
+    {StateListening, StateFailed, StateDisabled}; `Lines()` renders Listening →
+    "addr", Failed → "addr (bind failed)" / "bind failed", Disabled →
+    "disabled". gRPC state: `grpcapi.Server` records a `grpcListenState`
+    (pre-bind → listening → failed); `EffectiveListener()` replaces
+    `EffectiveAddr()` — net.Listen error → Failed(requested addr); serve-loop
+    exit CLEARS the bound addr → Failed (no stale bind for a dead server);
+    pre-bind → Listening(requested). HTTP state:
+    `managementReconciler.effectiveHTTPListener()` — nil reconciler (empty
+    --api-addr) → Disabled; configured-but-boot-bind-failed (curSet false) →
+    Failed(lastHTTPAttempt, recorded pre-bind in startTo); converged →
+    Listening. #4 fold: HTTP Listening addr sourced from the ACTUAL bound
+    listener via new `api.Server.EffectiveHTTPAddr()` (httpLeg.ln.Addr()), so
+    --api-addr=127.0.0.1:0 reports the concrete ephemeral port, not ":0".
+    Daemon aggregator `effectiveListeners()` maps both into one
+    `sysservices.Listeners`. New fail-on-revert nets (each RED verified
+    firsthand, clean ASSERTION failure, restored GREEN): grpcapi
+    TestGRPCEffectiveListenerBindFailure (real Run against an in-use addr →
+    Failed) + TestGRPCEffectiveListenerLifecycle (pre-bind→bound-concrete-port
+    →serve-exit-clears) + TestShowSystemServicesFailedHTTPGRPC (remote render
+    "(bind failed)"); daemon TestEffectiveHTTPListenerStatesDistinct
+    (Disabled≠Failed≠Listening) + TestEffectiveHTTPListenerEphemeralPort (:0 →
+    concrete); sysservices Lines() Failed/Disabled cases. gofmt/vet clean;
+    `go test ./pkg/sysservices/ ./pkg/api/ ./pkg/grpcapi/ ./pkg/cli/
+    ./pkg/daemon/` GREEN, `-race` GREEN on the listener tests. docs:
+    pkg/daemon/README.md effective-listener section rewritten for the state
+    model; pkg/api/README.md notes EffectiveHTTPAddr.
+  - **File(s)**: pkg/sysservices/listeners.go,
+    pkg/sysservices/listeners_test.go, pkg/api/listener.go, pkg/api/README.md,
+    pkg/grpcapi/server.go, pkg/grpcapi/server_show_system.go,
+    pkg/grpcapi/server_show_system_listeners_6385_test.go, pkg/cli/cli.go,
+    pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_listeners_6385_test.go,
+    pkg/daemon/management.go, pkg/daemon/daemon_run_servers.go,
+    pkg/daemon/effective_listeners_6401_test.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385/#6401 fold round 2 — HTTP↔gRPC serve-exit SYMMETRY
+    (Codex MAJOR, adjudicated real) + gRPC-lifecycle test tightening (Codex
+    MINOR). MAJOR: an UNEXPECTED HTTP `Serve` exit in `serveLegLocked`
+    (pkg/api/listener.go) only logged+returned, leaving `httpLeg.ln` live, so
+    `EffectiveHTTPAddr()` still returned the dead listener's addr and
+    `effectiveHTTPListener()` reported StateListening on a DEAD leg — asymmetric
+    with the gRPC serve-exit clear. Fix: added `listenerLeg.dead`, marked true
+    under `lifeMu` on the unexpected-exit branch ONLY (requested shutdown via
+    stopCh/rootCtx unaffected); `EffectiveHTTPAddr()` returns "" for a dead leg;
+    `effectiveHTTPListener()` maps converged-but-EffectiveHTTPAddr=="" →
+    StateFailed (day-2 rebind failure RETAINS the old live leg → non-empty →
+    stays Listening, unaffected). MINOR: tightened
+    TestGRPCEffectiveListenerLifecycle to assert (a) pre-bind state before Run
+    (Listening on requested addr) and (b) post-serve-exit addr is CLEARED (==
+    requested, != the stale concrete bound port) — the old test asserted only
+    State==Failed and would miss a retain-stale-effAddr regression. New test
+    TestEffectiveHTTPListenerServeExitFails drives the serve-exit via an
+    in-memory erroring listener (NO real socket — review sandbox blocks
+    sockets): Accept errors on a signal → Serve exits → leg dead → reconciler
+    reports Failed. Both RED verified FIRSTHAND (neutralize leg.dead → Listening
+    on dead leg RED; neutralize the gRPC clear to retain stale addr → stale-port
+    RED), restored GREEN. gofmt/vet clean; `go test ./pkg/sysservices/
+    ./pkg/api/ ./pkg/grpcapi/ ./pkg/cli/ ./pkg/daemon/` GREEN; `-race` GREEN
+    (full pkg/api + listener tests + mgmt reconcile). docs: pkg/daemon/README.md
+    HTTP bullet + pkg/api/README.md EffectiveHTTPAddr note updated for the
+    dead-leg/serve-exit symmetry.
+  - **File(s)**: pkg/api/listener.go, pkg/api/README.md,
+    pkg/daemon/management.go, pkg/daemon/effective_listeners_6401_test.go,
+    pkg/daemon/README.md, pkg/grpcapi/server.go,
+    pkg/grpcapi/server_show_system_listeners_6385_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385/#6401 fold round 3 — FIX a shutdown DEADLOCK my round-2
+    serve-exit fold introduced (Codex MAJOR, reproduced firsthand). Lock-order
+    cycle: the HTTP leg's serve goroutine still holds its `wg` count when the
+    round-2 code acquired `lifeMu` to set `leg.dead` on an unexpected serve
+    exit; `Server.Wait()` holds `lifeMu` ACROSS `wg.Wait()` — so a serve-exit
+    racing a shutdown Wait hung permanently (Wait holds lifeMu waiting on the
+    goroutine's wg.Done; the goroutine waits on lifeMu before it can
+    return->Done). PATH TAKEN: atomic fix (bounded, low-risk) — `listenerLeg.dead`
+    is now an `atomic.Bool`; the serve goroutine `leg.dead.Store(true)` WITHOUT
+    lifeMu (breaks the cycle); `EffectiveHTTPAddr()` reads `httpLeg`/`ln` under
+    lifeMu (swapped only under lifeMu) but the dead flag via `dead.Load()`.
+    Requested-shutdown paths (stopCh/rootCtx) unchanged. NEW test
+    (pkg/api/serve_exit_wait_deadlock_6401_test.go)
+    TestServeExitDoesNotDeadlockConcurrentWait_6401: launches Wait() concurrently
+    (holds lifeMu in wg.Wait while the leg is parked at Accept via an in-memory
+    erroring listener — NO real socket), then triggers the unexpected serve-exit;
+    asserts Wait returns within 3s (no deadlock) AND the leg ends dead
+    (EffectiveHTTPAddr==""). RED verified FIRSTHAND: reintroducing the
+    lifeMu-guarded marking hangs Wait -> clean t.Fatal at 3s (bounded, not a
+    suite hang); restored -> GREEN at 0.10s. gofmt/vet clean; `go test
+    ./pkg/sysservices/ ./pkg/api/ ./pkg/grpcapi/ ./pkg/cli/ ./pkg/daemon/`
+    GREEN; `-race` GREEN on the FULL pkg/api suite + listener/deadlock tests +
+    mgmt reconcile. docs: pkg/api/README.md EffectiveHTTPAddr note explains the
+    atomic (lock-free) marking + the lock-ordering rationale.
+  - **File(s)**: pkg/api/listener.go, pkg/api/README.md,
+    pkg/api/serve_exit_wait_deadlock_6401_test.go, _Log.md
   - **Action**: #6391 host-inbound sibling-isolation regression guard +
     doc. STEP-0 firsthand finding: the host-inbound sibling LEAK the issue
     describes is NOT present on current master (a00aa3cd9). PR #6389 (the
