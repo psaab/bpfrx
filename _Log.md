@@ -1,3 +1,53 @@
+## 2026-07-23 — #5583 C180: fold two Codex MAJOR findings into #6383
+
+- **Timestamp**: 2026-07-23 (fix/5583-codex180, fold on PR #6383)
+- **Action**: Folded two verified Codex MERGE-NEEDS-MAJOR findings.
+  FINDING 1 — tcp-flags empty/misordered group rejection
+  (pkg/config/tcp_flags.go). The prior parenDepth fix rejected UNBALANCED
+  parens but still ACCEPTED balanced-but-malformed groups: `syn()` parsed to
+  0x02 (an empty `()` after a flag inherited the global segHasFlag) and
+  `(syn&)ack` parsed to 0x12 (a dangling `&` before `)` plus `ack` crossing the
+  close with no operator). Added (a) a per-group flag-presence stack
+  (`groupHasFlag`): a `(` pushes a false frame, a flag sets the top frame, a `)`
+  pops and REJECTS an empty frame — with transitive propagation so `((syn))`
+  stays accepted; and (b) a single top-of-loop `justClosedGroup` guard: after a
+  `)` the only valid next tokens are `&`, another `)`, or end — any operand
+  (flag / `!` / `(`) is a `)`-followed-by-operand misorder. Both are single
+  load-bearing checks (verified RED-on-revert: neutralize `!had` → `syn()`,
+  `syn ( )` accept; neutralize the top guard → `(syn)ack`, `(syn)!ack`,
+  `(syn)(ack)`, `(syn&)ack`, and the leak case `(syn)(& ack)` accept). A
+  dedicated in-`)` segHasFlag check for `(syn&)` was DROPPED as a non-load-
+  bearing shadow — the trailing-`&` post-loop guard already rejects it. All
+  legitimate forms preserved with identical masks: `syn`(0x02), `(syn)`(0x02),
+  `(syn & ack)`(0x12), `(syn & !ack)`(req0x02/forb0x10), `((syn & !ack))`(same),
+  `!ack`(forb0x10), `(!fin)`(forb0x01), `syn ack`(0x12), `(syn) & (ack)`(0x12).
+  New test TestParseTCPFlagsMalformedGroups + two commit-layer asserts in
+  TestFirewallFilterTCPFlagsCommitReject (`syn()`, `(syn)ack`).
+  FINDING 2 — SNMP shutdown accounting overclaim (pkg/snmp/traps.go +
+  README.md). The C180-026 comment/README claimed `accepted == delivered +
+  trapsDropped` exactly, but enqueueTrap passed the stopped check then UNLOCKED
+  before sending, so an enqueue could buffer into an orphaned queue after the
+  worker drained and exited — a job neither sent nor counted. Chose path (a):
+  actually CLOSE the race. enqueueTrap now publishes the job with a NON-BLOCKING
+  send under the SAME a.mu that Stop takes to set stopped / close trapStop, so
+  enqueue and Stop are strictly serialized: a job admitted to the queue is
+  buffered before close(trapStop) is observable (the shutdown drain counts it),
+  and a job that loses the race sees stopped and drops+counts. Accounting is now
+  EXACT with no residual, so the README exactness claim is TRUE (updated to
+  explain WHY, not softened). No send-under-lock deadlock: the send is non-
+  blocking and the worker never takes a.mu (verified `go test -race ./pkg/snmp`
+  GREEN, full suite). Kept TestStop_CountsAbandonedTrapBacklog (backlog case,
+  deterministic). Added TestStop_AccountingExactUnderConcurrentEnqueue as an
+  invariant + -race guard (documented as NOT a deterministic fail-on-revert:
+  the orphan window is too narrow to hit without a production seam; exactness is
+  guaranteed by the lock discipline). No follow-up issue needed — the race is
+  closed, not documented-around. No HA/cluster/vrrp/failover code touched.
+  build + vet + gofmt clean; full `go test ./pkg/config` (12.9s) and
+  `go test -race ./pkg/snmp` (18.6s) GREEN.
+- **File(s)**: pkg/config/tcp_flags.go, pkg/config/tcp_flags_test.go,
+  pkg/snmp/traps.go, pkg/snmp/agent_stop_leak_4916_test.go,
+  pkg/snmp/README.md, _Log.md
+
 ## 2026-07-23 — #6380 fold: bind both syslog port guard sites + config-search truncation header
 
 - **Timestamp**: 2026-07-23 (fix/5250-psreview042)
@@ -58295,6 +58345,78 @@ top.
     cmd/cli/confirm_pending_bounded_5649_test.go, docs/config-schema.md, _Log.md
 
 - **Timestamp**: 2026-07-23
+  - **Action**: Triage cohort #5583 (codex-review-180 low-materiality +
+    doc-drift survivors, 4 items) against origin/master f5a3da609. FIXED the
+    two REAL + INDEPENDENT + LOW-RISK + in-Go-scope items in one PR; DEFERRED
+    the two Rust items to the userspace-dp/dataplane owner.
+    C180-024 (pkg/config/tcp_flags.go): the TCP-flags grammar discarded
+    unbalanced/reversed parentheses — `case "(", ")"` only errored on a
+    negated group, otherwise `continue`d with no balance tracking, so "(syn",
+    "syn)", "syn)(" all committed as plain "syn" (verified live: req=0x02
+    ok=true). The redundant grouping parens were stripped unconditionally.
+    Added parenDepth tracking: reject a ')' at depth 0 (unbalanced/reversed
+    close) and a nonzero depth after the last token (unclosed group); balanced
+    and nested-balanced groups ("((syn & !ack))") stay accepted. The packet
+    mask is not widened (the flag bits still parse), so this is strict-grammar/
+    auditability hardening, not an admission bypass. Both consumers
+    (pkg/dataplane/userspace/filters.go, pkg/daemon/daemon_nft.go) already fail
+    CLOSED on a parse error, and the commit-layer strict validator
+    (compiler_validate_strict_filter.go) now rejects the malformed value at
+    commit — consistent with #3076/#3367 fail-closed discipline.
+    C180-026 (pkg/snmp/traps.go + agent.go): shutdown-abandoned trap jobs were
+    omitted from trapsDropped. On Stop() the worker returned on `<-stop`
+    without counting the buffered backlog; trapsDropped counted only queue-full
+    and post-Stop-enqueue drops, so a shutdown that discarded queued link-state
+    traps reported zero drops. Added countAbandonedTraps: the worker (sole queue
+    reader) counts every dequeued-but-unsent job plus every buffered job into
+    trapsDropped exactly once before exiting, so accepted == delivered +
+    trapsDropped. Safety (#4916 no-post-Stop-delivery) is unchanged.
+    DEFER (Rust / userspace-dp — dataplane owner): C180-021 (docs/afxdp-packet-
+    processing.md item 7 documents the userspace-xdp shim non-SYN contract —
+    a dataplane doc, not Go control-plane), C180-023 (userspace-dp/src/nat/
+    destination.rs malformed-prefix host fallback). C180-022 already dropped in
+    the cohort (dup of open #4971). No HA/cluster/vrrp/failover code touched.
+    build + vet + gofmt clean; full `go test ./pkg/config` (14.5s) and
+    `go test -race ./pkg/snmp` (17.5s) GREEN. RED-on-revert verified for both
+    fixes (stash the production file, new tests FAIL).
+  - **File(s)**: pkg/config/tcp_flags.go, pkg/config/tcp_flags_test.go,
+    pkg/snmp/traps.go, pkg/snmp/agent_stop_leak_4916_test.go,
+    pkg/snmp/README.md, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Close the tcp-flags grammar MIRROR asymmetry (C180-024 mirror
+    completion) on PR #6383 (Advances #5583). The `justClosedGroup` guard
+    rejected a CLOSED `)` operand directly followed by another operand
+    (`(syn)ack`, `(syn)(ack)`, `(syn)!ack`), but the MIRROR direction — a
+    bare-flag operand directly followed by a `(` group with no intervening `&`
+    — was UNGUARDED, so `syn(ack)`, `ack(syn)`, `syn (ack)`, and `syn(&ack)`
+    were WRONGLY ACCEPTED (parsed as a plain conjunction and committed). A group
+    is an operand, so it must be joined to a preceding flag with `&`
+    (`syn & (ack)`). Root cause + minimal fix: add ONE symmetric guard inside
+    the `case "("` arm of ParseTCPFlagsExpression — `if segHasFlag` (a bare flag
+    already appeared in the current `&`-segment with no intervening `&`) reject.
+    This is the exact mirror of the top-of-loop justClosedGroup guard. It also
+    fixes `syn(&ack)` at the `(` (before this guard the outer flag's presence
+    leaked into the inner group and let its leading `&` pass). Deliberately NOT
+    added: a separate per-group `&` flag-presence check. The mirror guard
+    guarantees `segHasFlag == false` at the start of every freshly-opened group,
+    so a group that itself leads with `&`/`)` (`(&ack)`, `(&)`, `((&syn))`) is
+    already bound by the EXISTING global segHasFlag `&`-no-operand / empty-group
+    checks — a per-group `&` check would be a shadowed, non-load-bearing
+    duplicate, contrary to this file's stated single-load-bearing-check design.
+    New test TestParseTCPFlagsFlagThenGroup (exhaustive reject + accept matrix).
+    RED-on-revert verified firsthand for BOTH mechanisms: (1) neutralize the
+    mirror guard → `syn(ack)`, `ack(syn)`, `syn (ack)`, `syn(&ack)` go RED
+    (clean t.Fatal, group-lead cases stay GREEN); (2) neutralize the existing
+    `&`-no-operand check → `(&ack)`, `((&syn))` go RED (`(&)` stays green,
+    caught by the empty-group check). No masks change for any accepted form
+    (`syn`, `(syn)`, `((syn))`, `syn & (ack)`, `(syn) & (ack)`, `(syn & !ack)`,
+    `((syn & !ack))`, `!ack`, `(!fin)`, `syn ack` list all identical). No
+    pkg/snmp touched (that PR fix is done). No HA/cluster/vrrp/failover code
+    touched. gofmt + go build + go vet clean; full `go test ./pkg/config`
+    (12.5s) GREEN.
+  - **File(s)**: pkg/config/tcp_flags.go, pkg/config/tcp_flags_test.go,
+    docs/config-schema.md, _Log.md
   - **Action**: Triage cohort #5328 (codex-178 low-materiality + test-coverage
     survivors). Verified all 15 sub-items firsthand against origin/master
     (f5a3da609); fixed the real+independent+low-risk Go-scope survivors in one

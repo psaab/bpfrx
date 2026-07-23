@@ -59,6 +59,35 @@ var tcpFlagBits = map[string]uint8{
 //     otherwise return "no constraint" (or silently drop the dangling '&') and
 //     the term would match EVERY TCP segment (#5455, fail-open widening of a
 //     security filter); reject it so a malformed value never commits
+//   - an unbalanced or reversed parenthesis (e.g. "(syn", "syn)", "syn)(") —
+//     a ')' with no matching '(' or a '(' left unclosed. The parens are
+//     redundant grouping only, so without balance tracking they were stripped
+//     unconditionally and the malformed value committed as if the parens were
+//     absent (C180-024); reject it so the grammar is auditable. Balanced
+//     groups, including nested ones ("((syn & !ack))"), remain accepted.
+//   - a balanced-but-malformed group (C180-024 completion): an EMPTY group
+//     that contributes no flag operand (e.g. "syn()", "x()", or a bare "()"
+//     inside a larger expression); a '&' or other dangling operator standing
+//     immediately before a ')' with no right operand in the group (e.g.
+//     "(syn&)"); and a ')' immediately followed by another operand — a bare
+//     flag, a '!', or a '(' — with no intervening '&' operator (e.g.
+//     "(syn)ack", "(syn&)ack", "(syn)(ack)"). Balancing the parens alone did
+//     not catch these — the flag bits still parsed and the malformed value
+//     committed — so reject them via per-group flag-presence tracking plus an
+//     "a closed group must be followed by an operator, not another operand"
+//     rule. Legitimate grouping — "(syn)", "(syn & ack)", "((syn & !ack))",
+//     "(!fin)", and "(syn) & (ack)" — remains accepted with identical masks.
+//   - the MIRROR of the closed-group-then-operand misorder: a flag operand
+//     immediately followed by a '(' group with no intervening '&' operator
+//     (e.g. "syn(ack)", "ack(syn)", "syn (ack)", "syn(&ack)"). A group is an
+//     operand, so juxtaposing it against a preceding flag is the same
+//     operand-then-operand misorder as "(syn)ack" — it must be written
+//     "syn & (ack)". The earlier justClosedGroup rule only covered the
+//     ')'-then-operand direction, so these were WRONGLY ACCEPTED (the flag
+//     bits parsed as a plain conjunction); reject them so the grammar is
+//     symmetric. "syn(&ack)" is caught here at the '(' — before this guard the
+//     outer flag's flag-presence leaked into the inner group and let its
+//     leading '&' pass.
 //
 // An input that carries no flag at all (empty / whitespace only) returns
 // ok=false with no error: the caller leaves the wire field nil, i.e. no
@@ -107,7 +136,46 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 	// with no flag operand — reject it so the malformed value never commits and
 	// silently matches all TCP (#5455, fail-open).
 	segHasFlag := false
+	// parenDepth tracks the balance of grouping parentheses. A ')' reached at
+	// depth 0 is an unbalanced or reversed close (e.g. "syn)", "syn)("); a
+	// nonzero depth after the last token is an unclosed group (e.g. "(syn").
+	// Without this tracking the parser stripped every paren unconditionally and
+	// committed "(syn", "syn)", "syn)(" as plain "syn" — strict-grammar debt
+	// that admits malformed values (C180-024). The packet mask is not widened
+	// (the flag bits still parse), so this is auditability/grammar hardening,
+	// not an admission bypass.
+	parenDepth := 0
+	// groupHasFlag is a per-group stack (one frame per open '('): the top frame
+	// records whether the CURRENT group has contributed a flag operand yet. A
+	// '(' pushes a fresh false frame; a flag sets the top frame true; a ')' pops
+	// and REJECTS an empty frame (e.g. "syn()", "()") — parenDepth balance alone
+	// accepted these because segHasFlag was global (a preceding "syn" left it
+	// true). A non-empty group is transitively non-empty for its parent, so on a
+	// clean pop the flag is propagated to the enclosing frame ("((syn))" is
+	// accepted). This is the empty/misordered-group completion of C180-024.
+	var groupHasFlag []bool
+	// justClosedGroup is set immediately after a ')' and cleared by the '&'
+	// conjunction operator. A closed group is an operand; the grammar requires
+	// the next token to be an operator ('&'), another ')' (closing an outer
+	// group), or end — NOT another operand. So a flag, a '!', or a '(' seen
+	// while justClosedGroup is set is a ')'-followed-by-operand misorder (e.g.
+	// "(syn)ack", "(syn)(ack)", "(syn)!ack") and is rejected. Without this an
+	// expression like "(syn)ack" parsed as the plain conjunction "syn ack"
+	// (C180-024).
+	justClosedGroup := false
 	for _, t := range toks {
+		// A closed group ')' is an operand: the only tokens that may follow it
+		// are the conjunction operator '&', another ')' closing an enclosing
+		// group, or end of input. Any operand-introducing token — a flag, '!',
+		// or '(' — is a ')'-followed-by-operand misorder ("(syn)ack",
+		// "(syn)!ack", "(syn)(ack)"). Reject it here in ONE place so the guard
+		// is a single load-bearing check rather than three partly-shadowed
+		// per-token checks. '|' is excluded so it keeps its specific
+		// disjunction diagnostic below; it is rejected there regardless.
+		if justClosedGroup && t != "&" && t != ")" && t != "|" {
+			return 0, 0, false, fmt.Errorf(
+				"tcp-flags %q: a closed group \")\" must be followed by \"&\" or the end of the expression, not %q", expr, t)
+		}
 		switch t {
 		case "&":
 			// A conjunction separator carries no negation across itself. A '!'
@@ -126,6 +194,9 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 			}
 			pendingNeg = false
 			segHasFlag = false
+			// A conjunction operator legitimately follows a closed group
+			// ("(syn) & ack"), so the operand-after-close guard is cleared.
+			justClosedGroup = false
 			continue
 		case "|":
 			return 0, 0, false, fmt.Errorf(
@@ -133,11 +204,75 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 		case "!":
 			pendingNeg = !pendingNeg
 			continue
-		case "(", ")":
+		case "(":
+			// A '!' immediately before '(' is a negated group ("!(...)"), a
+			// disjunction by De Morgan's law that the conjunctive matcher cannot
+			// enforce — reject it (#3076).
 			if pendingNeg {
 				return 0, 0, false, fmt.Errorf(
 					"tcp-flags %q: a negated group is a disjunction (De Morgan) and is not representable by the firewall dataplane", expr)
 			}
+			// A '(' opens a group, which is itself an operand. An operand may not
+			// directly follow another operand without a '&' conjunction between
+			// them. This is the MIRROR of the justClosedGroup guard (which rejects
+			// a closed ')' operand directly followed by another operand). Here
+			// segHasFlag is true exactly when a bare flag already appeared in the
+			// current '&'-segment with no intervening '&' — a preceding closed
+			// ')' would have set justClosedGroup instead, and the top-of-loop
+			// guard already rejects a '(' after ')'. So a '(' seen while
+			// segHasFlag is set is a flag-then-group misorder ("syn(ack)",
+			// "syn (ack)", and "syn(&ack)" — the outer flag's segHasFlag is what
+			// let the inner group-leading '&' pass before this guard). Reject it;
+			// a group must be joined to a preceding flag with '&' ("syn & (ack)").
+			// This also guarantees segHasFlag is false at the start of every
+			// freshly-opened group, so a group that itself leads with '&' or ')'
+			// ("(&ack)", "(&)", "((&syn))") is still caught by the existing
+			// segHasFlag left-operand checks below.
+			if segHasFlag {
+				return 0, 0, false, fmt.Errorf(
+					"tcp-flags %q: a flag operand may not be directly followed by a \"(\" group; separate them with \"&\"", expr)
+			}
+			groupHasFlag = append(groupHasFlag, false)
+			parenDepth++
+			continue
+		case ")":
+			// A '!' immediately before ')' has no flag operand — dangling
+			// negation (e.g. "syn & !)"); reject it (#4714, fail-open).
+			if pendingNeg {
+				return 0, 0, false, fmt.Errorf(
+					"tcp-flags %q: dangling negation \"!\" with no flag operand", expr)
+			}
+			// A ')' at depth 0 has no matching '(' — an unbalanced or reversed
+			// close (e.g. "syn)", "syn)(") — reject it (C180-024).
+			if parenDepth == 0 {
+				return 0, 0, false, fmt.Errorf(
+					"tcp-flags %q: unbalanced parenthesis: \")\" with no matching \"(\"", expr)
+			}
+			// Pop this group's flag-presence frame. An empty frame is a group
+			// that contributed no flag operand (e.g. "syn()", "()") — reject it
+			// (C180-024 completion); parenDepth balance alone accepted it.
+			had := groupHasFlag[len(groupHasFlag)-1]
+			groupHasFlag = groupHasFlag[:len(groupHasFlag)-1]
+			if !had {
+				return 0, 0, false, fmt.Errorf(
+					"tcp-flags %q: empty group \"()\" with no flag operand", expr)
+			}
+			// A dangling '&' immediately before this ')' (e.g. "(syn&)") leaves
+			// segHasFlag false with no path to acceptance: the only tokens that
+			// may follow the ')' are '&' (rejected by the "&"-no-operand guard,
+			// segHasFlag is false), another operand (rejected by the
+			// top-of-loop operand-after-close guard), another ')' (segHasFlag
+			// stays false), or end (rejected by the post-loop trailing-'&'
+			// guard). So it is rejected downstream — no dedicated in-')'
+			// segHasFlag check is needed here, and adding one would be a
+			// non-load-bearing shadow.
+			// A non-empty group is transitively an operand of its parent, so
+			// propagate the flag to the enclosing frame ("((syn))" is accepted).
+			if len(groupHasFlag) > 0 {
+				groupHasFlag[len(groupHasFlag)-1] = true
+			}
+			parenDepth--
+			justClosedGroup = true
 			continue
 		}
 		bit, found := tcpFlagBits[strings.ToLower(t)]
@@ -151,6 +286,11 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 		}
 		pendingNeg = false
 		segHasFlag = true
+		// Record that the current group (if any) now has a flag operand, so a
+		// later ')' does not reject it as empty.
+		if len(groupHasFlag) > 0 {
+			groupHasFlag[len(groupHasFlag)-1] = true
+		}
 	}
 
 	// A negation left pending after the last token is a dangling '!' with no
@@ -160,6 +300,16 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 	if pendingNeg {
 		return 0, 0, false, fmt.Errorf(
 			"tcp-flags %q: dangling negation \"!\" with no flag operand", expr)
+	}
+
+	// A nonzero paren depth after the last token is an unclosed group (e.g.
+	// "(syn", "((syn)"). Without this the trailing '(' was silently stripped
+	// and the malformed value committed (C180-024). Balanced groups —
+	// including nested ones like "((syn & !ack))" — leave depth at 0 and are
+	// still accepted.
+	if parenDepth != 0 {
+		return 0, 0, false, fmt.Errorf(
+			"tcp-flags %q: unbalanced parenthesis: %d unclosed \"(\"", expr, parenDepth)
 	}
 
 	// The final '&'-delimited segment must also carry a flag operand. A segment
