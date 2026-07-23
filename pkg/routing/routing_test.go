@@ -19,6 +19,17 @@ import (
 type fakeVRFOps struct {
 	links map[string]*netlink.Vrf // name -> link
 
+	// overlay returns a NON-*netlink.Vrf link (or a wrong-table Vrf) from
+	// LinkByName ahead of the typed links map — the only way to model a
+	// foreign link wearing a VRF name, since links is *netlink.Vrf-typed
+	// (#6396 create-path readback substitution).
+	overlay map[string]netlink.Link
+	// substituteAfterAdd[name], when set, installs overlay[name] during
+	// LinkAdd so the post-create LinkByName readback returns the substitute —
+	// models the #6396 create-path TOCTOU (a same-name link swapped between
+	// LinkAdd and the readback).
+	substituteAfterAdd map[string]netlink.Link
+
 	adds       int
 	dels       int
 	setUps     int
@@ -30,11 +41,18 @@ type fakeVRFOps struct {
 }
 
 func newFakeVRFOps() *fakeVRFOps {
-	return &fakeVRFOps{links: map[string]*netlink.Vrf{}}
+	return &fakeVRFOps{
+		links:              map[string]*netlink.Vrf{},
+		overlay:            map[string]netlink.Link{},
+		substituteAfterAdd: map[string]netlink.Link{},
+	}
 }
 
 func (f *fakeVRFOps) LinkByName(name string) (netlink.Link, error) {
 	f.byNameHits++
+	if l, ok := f.overlay[name]; ok {
+		return l, nil
+	}
 	if l, ok := f.links[name]; ok {
 		return l, nil
 	}
@@ -56,6 +74,11 @@ func (f *fakeVRFOps) LinkAdd(link netlink.Link) error {
 	// Clone so callers can't mutate our table.
 	clone := *vrf
 	f.links[name] = &clone
+	if sub, ok := f.substituteAfterAdd[name]; ok {
+		// The intended VRF was created, but a foreign link now wears the name
+		// by the time the readback runs (#6396 TOCTOU).
+		f.overlay[name] = sub
+	}
 	return nil
 }
 

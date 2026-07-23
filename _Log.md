@@ -39,6 +39,29 @@
   legacy → nanoseconds parsed as seq + legacy retained over current; dir-switch
   reseed → counter stuck at old dir's max), then restored GREEN.
 
+- **Timestamp**: 2026-07-23 (fold on PR #6399, review MERGE-NEEDS-MINOR)
+- **Action**: Folded the Claude-hostile-review completeness MINOR: the xfrm
+  post-create readback guard had structurally-identical UNGUARDED siblings in
+  the same package. (a) createLinkedVRF (pkg/routing/vrf.go) now re-asserts the
+  post-LinkAdd readback is an netlink.Vrf carrying the desired table before
+  bring-up; on mismatch it returns (added=true, err) so the caller keeps
+  ownership and the reconcile adopt path (vrfTable → recreate on table
+  mismatch) reclaims a substitute next cycle. (b) createBond
+  (pkg/routing/bond.go) now re-asserts the readback is an netlink.Bond before
+  enslaving/bring-up: enslaveMembers only surfaces a foreign substitute via a
+  real-netlink LinkSetMaster failure when a member is enslavable, so a bond
+  whose configured members are all absent (the #4823 soft-error case) would
+  otherwise adopt a foreign link — the type check closes that for every member
+  state. Added substituteAfterAdd seams to fakeVRFOps + fakeBondLinkOps and
+  three VRF + one bond fail-on-revert tests (RED→GREEN confirmed firsthand:
+  VRF non-Vrf + wrong-table → Apply nil + brought up; bond foreign readback →
+  tracked + created). Routing README identity-re-assertion invariant
+  generalized to cover xfrm + VRF + bond (correcting the prior xfrm-only
+  scope-out).
+- **File(s)**: pkg/routing/vrf.go, pkg/routing/bond.go,
+  pkg/routing/routing_test.go, pkg/routing/bond_test.go,
+  pkg/routing/readback_guard_6396_test.go, pkg/routing/README.md
+
 ## 2026-07-23 — #5583 C180: fold two Codex MAJOR findings into #6383
 
 - **Timestamp**: 2026-07-23 (fix/5583-codex180, fold on PR #6383)

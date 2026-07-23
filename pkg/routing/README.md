@@ -110,19 +110,38 @@ path already draws (see the WireGuard/tunnel removal notes below and
   covered a failed `LinkDel` **after** a successful lookup; this closes the
   predating `LinkByName`-error branch.
 
-**Identity re-assertion on every readback (#5523 C179-104 + #6396).** A
-`LinkByName` result is adopted only after confirming it is an
-`*netlink.Xfrmi` whose actual `Ifid` matches the desired one — never by
-name alone. This holds on BOTH readbacks: the **adopt** path (a kernel
-link outliving in-memory tracking) recreates a same-name link that is not
-an xfrmi, or is an xfrmi with a stale `if_id` (#5523 C179-104); and the
-**post-create** readback (the `LinkByName` right after `LinkAdd`) rejects
-a foreign or wrong-`if_id` link that a concurrent external actor may have
-substituted in the add→readback window (#6396) — it is not brought up or
-tracked, the commit fails closed, and the next reconcile's adopt path
-reclaims the intruder via delete+recreate. Without the check the name
-would be tracked as satisfied while **no** device carries the desired
-`if_id`, silently blackholing the route-based VPN bound to it.
+**Identity re-assertion on every post-create readback (#5523 C179-104 +
+#6396).** `LinkAdd` and the `LinkByName` readback that follows it are two
+syscalls. A device is adopted only after confirming the readback is the
+INTENDED type carrying the desired discriminator — never by name alone —
+so a same-name foreign link (or a right-type link with the wrong
+discriminator) substituted by a concurrent external actor in the
+add→readback window is rejected: it is not brought up or tracked, the
+commit fails closed, and a later reconcile reclaims the intruder. This
+invariant now holds across all three netlink-device managers:
+
+- **xfrm** (`xfrm.go`) — the readback must be an `*netlink.Xfrmi` whose
+  `Ifid` matches. Enforced on BOTH the adopt path (a kernel link outliving
+  in-memory tracking; a non-xfrmi or stale-`if_id` link is delete+recreated,
+  #5523 C179-104) and the post-create readback (#6396).
+- **VRF** (`vrf.go` `createLinkedVRF`) — the readback must be an
+  `*netlink.Vrf` whose `Table` matches (#6396). `added` stays true so the
+  caller records ownership; the reconcile adopt path (`vrfTable` →
+  recreate on table mismatch) reclaims a substitute on the next cycle.
+- **bond** (`bond.go` `createLocked`) — the post-create readback must be an
+  `*netlink.Bond` before enslaving members or bringing it up (#6396).
+  `enslaveMembers` only surfaces a substitute via a real-netlink
+  `LinkSetMaster` failure when a member is actually enslavable, so a bond
+  whose configured members are all currently absent (the #4823 soft-error
+  case) would otherwise adopt a foreign link; the explicit type check
+  closes that hole for every member state.
+
+Without the check the name is tracked as satisfied while **no** device
+carries the desired identity, silently blackholing the VPN / leaked routes
+/ fabric LAG bound to it. (The tunnel/WireGuard manager reaches its reuse
+path through a distinct anchor-reuse gate that already type-checks
+`*netlink.Tuntap` — see the reuse notes below — so it is not part of this
+readback family.)
 
 ### Bond (fabric/ae LAG) reconcile (#5119)
 
