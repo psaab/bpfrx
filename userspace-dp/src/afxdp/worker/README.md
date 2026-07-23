@@ -30,7 +30,7 @@ each cluster has a clear ownership boundary.
 |------|---------|
 | `mod.rs` | `BindingWorker` struct + shared-binding helpers + `pub(crate) use loop_body::worker_loop` re-export. |
 | `loop_body/mod.rs` | `worker_loop` body (extracted in #1326 Phase 1; decomposed in #1776). Per-tick orchestrator — all per-tick logic stays inline here. |
-| `loop_body/setup.rs` | #1776 — one-shot cold setup (`worker_loop_setup`): thread pin via `pin_current_thread` (defined in `afxdp/neighbor.rs`), TSC calibration, binding construction, BPF-map-FD cache; returns `WorkerLoopSetup`. |
+| `loop_body/setup.rs` | #1776 — one-shot cold setup (`worker_loop_setup`): thread pin via `pin_current_thread` (defined in `afxdp/neighbor.rs`), TSC calibration, binding construction, BPF-map-FD cache; returns `WorkerLoopSetup`. #6245: binding construction now accumulates EXPLICIT per-slot terminal failures (`binding_failures`) + recovered shared-group fallbacks (`recovered_fallbacks`), sorted deterministically and carried through `WorkerLoopSetup` into `WorkerStartupReport` (the failed slot is no longer signalled only by OMISSION from `bindings`). See `coordinator/README.md` #6245. |
 | `loop_body/debug_report.rs` | #1776 — cfg(debug-log)-only `DbgCounters` + per-second verbose report (`emit_periodic_report`) + stall dump (`check_and_dump_stall`). Compiled out of release builds. |
 | `lifecycle.rs` | `poll_binding` — the per-poll RX/TX orchestrator. The "central function" extracted in Issue 73 step 2. |
 | `cos.rs` | Per-worker CoS runtime helpers + shared-exact threshold (the empirical sustained per-worker exact throughput ceiling — see comment block in the file for the evidence basis). |

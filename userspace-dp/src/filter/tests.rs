@@ -2210,17 +2210,22 @@ fn filter_result_modifiers_roundtrip_5444() {
 
 #[test]
 fn filter_state_struct_size_is_reported() {
-    // #6236 PR-1 evidence: print the compiled size of FilterState so the
-    // dead-field deletion (31 -> 23 fields) is measurable rather than
-    // back-solved. Run with `-- --nocapture` to see the value. The exact
-    // byte count is toolchain-dependent (hashbrown inline size, niche
-    // packing), so this asserts only a loose ceiling that the post-deletion
-    // struct clears; the printed number is the real evidence.
+    // #6236 PR-1 evidence + #6350 revert guard: print the compiled size of
+    // FilterState so the dead-field deletion (31 -> 23 fields) is measurable
+    // rather than back-solved. Run with `-- --nocapture` to see the value.
+    // The exact byte count is toolchain-dependent (hashbrown inline size,
+    // niche packing), so the ceiling is `<=` the measured post-deletion size
+    // rather than an exact `==` — a benign alignment shift will not false-RED,
+    // but re-adding ANY deleted field (each was >= 24 bytes: HashSet<u32> is
+    // 48, Option<u8> plus padding is 24, so the struct jumps to >= 520) breaks
+    // the ceiling. The old `<= 736` ceiling was the PRE-deletion footprint and
+    // passed even after a full revert; this tightens it to guard the deletion.
     let bytes = std::mem::size_of::<FilterState>();
     println!("FilterState size_of = {bytes} bytes");
     assert!(
-        bytes <= 736,
-        "FilterState grew past the pre-#6236 footprint ({bytes} bytes)"
+        bytes <= 496,
+        "FilterState grew past the post-#6236 footprint ({bytes} bytes) — a \
+         deleted dead field was likely re-added"
     );
 }
 
@@ -3689,6 +3694,66 @@ fn thin_accessor_predicates() {
     // No filter bound to an unrelated ifindex.
     assert!(!interface_input_filter_has_dscp_match(&state, 99, false));
     assert!(!state.iface_filter_v4_fast.contains_key(&99));
+}
+
+// --- Gap 8b: a DSCP-match-only filter does not imply TX selection ---
+#[test]
+fn dscp_only_filter_does_not_imply_tx_selection() {
+    // #6350 (#6236 PR-1 follow-up): the `thin_accessor_predicates` rewrite
+    // deleted the per-ifindex `!interface_filter_affects_tx_selection(&state,
+    // 22, false)` negative when the dead helper was removed. Restore that
+    // guarantee at the retained family-wide accessor: a filter whose ONLY
+    // modifier is a DSCP *match* (`from dscp`) — NO forwarding-class
+    // classification, NO `then dscp` rewrite, NO counter / log /
+    // three-color-policer / terminal action — must NOT flip the input
+    // tx-selection aggregate. `affects_tx_selection` keys strictly on
+    // forwarding-class or dscp_rewrite (compiler.rs), so a from-dscp match
+    // sets `has_dscp_match_terms` but leaves tx-selection untouched. Make it
+    // the ONLY input filter so the family-wide aggregate reflects it alone.
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 41,
+        filter_input_v4: "dscp-only-in".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "dscp-only-in".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "match-ef".into(),
+                dscp_values: vec![46],
+                action: "accept".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+
+    // The DSCP-only input filter must NOT imply tx-selection for either
+    // family. If the compiler ever mis-classified a DSCP-bearing filter as
+    // tx-selecting (e.g. keying `affects_tx_selection` on dscp_match_enabled),
+    // the v4 assertion goes RED.
+    assert!(
+        !filter_state_has_input_tx_selection(&state, false),
+        "a DSCP-match-only input filter must not imply v4 tx-selection"
+    );
+    assert!(
+        !filter_state_has_input_tx_selection(&state, true),
+        "no inet6 input filter is present"
+    );
+    // Sanity: the filter IS bound and IS a DSCP-match filter, proving the
+    // negatives above are about tx-selection classification, not a missing
+    // filter bind that would trivially make every accessor false.
+    assert!(interface_input_filter_has_dscp_match(&state, 41, false));
+    assert_eq!(
+        state.iface_filter_v4_fast.get(&41).map(|f| f.name.as_str()),
+        Some("dscp-only-in")
+    );
 }
 
 // --- Gap 9: cached-vs-runtime baseline parity for a plain (no-policer) term ---

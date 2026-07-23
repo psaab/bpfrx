@@ -37,6 +37,20 @@ sync.
   `(ifindex, ip) -> mac` binding into `dynamic_neighbors` AND the kernel
   neighbor table, so these parsers are a MAC->IP write primitive — they
   MUST fail closed on untrusted input.
+  - **Cold-outlined learn/program tails (`#6261`):** `classify_arp` and
+    `parse_ndp_neighbor_advert` (the EtherType classifier + parser probes)
+    stay inline in the hot `stage_link_layer_classify` stage, but the rare
+    *accepted* ARP-reply and NDP-NA learn-and-program work (unicast/own-IP
+    gates, `#2370` logical-ifindex resolve, `#4475` Override read-before-
+    write, `#3048` `insert_if_changed`, `#5288`-limited kernel program) is
+    moved into two dedicated `#[cold] #[inline(never)]` handlers,
+    `outline_arp_reply_learn_and_program` and
+    `outline_ndp_na_learn_and_program`. This is a pure codegen/layout
+    change — behavior, gate ordering, and dispositions (ARP recycles, NDP
+    continues/transits) are byte-for-byte identical to the pre-#6261 inline
+    block; it only keeps the ordinary (non-ARP/NDP) fast path cache-hot.
+    `#[cold]` is a layout hint, NOT a rate limiter — ARP/NDP flood bounding
+    stays with the `#5288` per-worker `KernelNeighborProgramLimiter`.
   - **MAC-change invalidation (`#3048` / `#5147`):** the learn goes through
     `insert_if_changed`, NOT a plain `insert`, so a MAC change observed
     directly on the wire (e.g. an upstream gateway VRRP failover whose

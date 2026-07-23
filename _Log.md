@@ -1,3 +1,30 @@
+## 2026-07-22 — #6350: fold two test-only revert-guard nits into #6236 PR-1
+
+- **Timestamp**: 2026-07-22 (fix/6350-test-nits → refactor/6236-p1-dead-filter-fields)
+- **Action**: Two TEST-ONLY strengthenings on the #6236 PR-1 dead-field
+  deletion, plus a `_Log.md` union rebase onto master (#6348/#6349/#6261/
+  #6244/#6245 merged; only `_Log.md` conflicted, filter code untouched).
+  (1) `dscp_only_filter_does_not_imply_tx_selection` (new): restores the
+  DSCP-only tx-selection negative that the `thin_accessor_predicates`
+  rewrite dropped when the per-ifindex
+  `interface_filter_affects_tx_selection` helper was deleted. Compiles a
+  state whose ONLY input filter is a DSCP *match* (`from dscp 46`, no
+  forwarding-class / `then dscp` rewrite / counter / log / policer /
+  terminal action) and asserts `filter_state_has_input_tx_selection(&state,
+  false) == false`. Genuine fail-on-revert: temporarily OR-ing
+  `term.dscp_match_enabled` into the compiler's `affects_tx_selection`
+  predicate flips it RED (verified, then restored).
+  (2) `filter_state_struct_size_is_reported`: tightened the ceiling from the
+  pre-deletion `<= 736` (which passed even after a full revert) to `<= 496`,
+  the measured post-deletion `size_of::<FilterState>()`. `<=` not `==` so a
+  benign alignment shift does not false-RED, but re-adding any deleted field
+  (each >= 24 bytes → struct >= 520) breaks the ceiling. Printed `size_of`
+  evidence line retained; comment now says it is a revert guard.
+- **Validation**: `cargo test --release -- --test-threads=1` full suite green
+  (4129 + 60 + 8 + 22 + 1 passed, 0 failed) incl. both new/changed tests;
+  measured `FilterState size_of = 496 bytes`. No production code changed.
+- **File(s)**: userspace-dp/src/filter/tests.rs
+
 ## 2026-07-22 — #6236 PR-1: delete 8 grep-proven-dead FilterState fields
 
 - **Timestamp**: 2026-07-22 (refactor/6236-p1-dead-filter-fields)
@@ -60,6 +87,114 @@
   `userspace-dp/src/filter/engine/mod.rs`,
   `userspace-dp/src/filter/tests.rs`, `userspace-dp/src/filter/README.md`
 
+## 2026-07-22 — #6261: outline rare ARP/NDP learn/program off the pre-cache RX stage
+
+- **Timestamp**: 2026-07-22 (refactor/6261-outline-arp-ndp)
+- **Action**: Behavior-preserving codegen/layout refactor. The ARP-reply
+  and NDP-NA learn-and-program tails inside the inline hot stage
+  `stage_link_layer_classify` (validation gates, #2370 logical-ifindex
+  resolve, #4475 Override read-before-write, #3048 change-detecting
+  `insert_if_changed`, #5288-limited synchronous kernel-neighbor program)
+  were extracted into two dedicated `#[cold] #[inline(never)]` handlers,
+  `outline_arp_reply_learn_and_program` and
+  `outline_ndp_na_learn_and_program`. The `classify_arp` /
+  `parse_ndp_neighbor_advert` parser probes and the EtherType classifier
+  stay inline; the ordinary (non-ARP/NDP) fast path is byte-for-byte
+  unchanged. Gate ordering (insert_if_changed → should_program →
+  add_kernel_neighbor), ARP-recycle vs NDP-continue dispositions, and the
+  `learn_ifindex` (now inlined into each handler) logic are identical to
+  the pre-#6261 inline block. No pending neighbor-generation fix was
+  hidden or reordered — the `mac_change_epoch` / limiter sequence is
+  preserved and made explicit in the handler doc comments. `#[cold]` is a
+  layout hint only; flood bounding stays with the #5288 limiter.
+- **File(s)**: userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_stages_tests.rs (added
+  `outlined_arp_ndp_handlers_still_learn_and_program_6261`),
+  userspace-dp/src/afxdp/README.md
+- **Validation**: `cargo build` clean; targeted + full cargo suite green
+  (existing ARP/NDP learn/change/own-IP/override/limiter tests are the
+  behavior-preserving gate; new #6261 test asserts both outlined handlers
+  still learn under the logical ifindex and preserve dispositions).
+
+## 2026-07-22 — #6245: report binding-setup failures explicitly in WorkerStartupReport
+
+- **Timestamp**: 2026-07-22 (fix/6245-explicit-binding-failures)
+- **Action**: Make a worker's one-shot binding setup report bind failures
+  EXPLICITLY instead of only by OMISSION. Pre-#6245 a failed slot was simply
+  absent from `WorkerStartupReport.bound_slots` (`worker_loop_setup` logged +
+  mutated `BindingLiveState.last_error` and dropped the binding), so the
+  readiness barrier could prove `bound != planned` but not the cause. Added
+  three types in `afxdp/types/runtime.rs`: `BindingSetupPhase`
+  (`Private`/`SharedFallback` + `as_str`), `BindingSetupFailure`
+  (`{ slot, phase, reason }`), `BindingRecoveredFallback` (`{ group, reason }`);
+  extended `WorkerStartupReport` with `binding_failures` +
+  `recovered_fallbacks`. `worker_loop_setup` (`loop_body/setup.rs`) now captures
+  the slot before the moved bind call, pushes a `BindingSetupFailure` on the
+  private-bind `Err` arm, threads two accumulators into
+  `fallback_shared_group_to_private` (`worker/mod.rs`) — which records a
+  terminal `SharedFallback` failure per slot whose private fallback also fails,
+  or a `BindingRecoveredFallback` when the whole group recovers — and sorts both
+  (failures by slot, fallbacks by group) before returning. `worker_loop`
+  (`loop_body/mod.rs`) carries them into the report. The barrier
+  (`coordinator/reconcile/bringup.rs`) retains the full report per worker,
+  keeps `bound == planned` as the readiness criterion, and renders the explicit
+  cause into the fail-closed stage via `render_binding_setup_failures`
+  (`...:failures=[private:slot=1:<reason>]`; empty →
+  `failures=[no-explicit-failure]`). Success path behavior-identical (both vecs
+  empty). Docs: `coordinator/README.md` #6245 paragraph + `worker/README.md`
+  setup row.
+- **File(s)**: `userspace-dp/src/afxdp/types/runtime.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/setup.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/mod.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/README.md`,
+  `userspace-dp/src/afxdp/worker/README.md`.
+- **Validation**: `cargo build` green. `cargo test --release` new tests green —
+  `worker_bind_incomplete_report_carries_explicit_failure_6245` (extends the
+  `force_worker_bind_incomplete` stub to emit a matching explicit failure;
+  asserts the stage carries `failures=[private:slot=1:...]` + the owned reason,
+  end-to-end report->barrier->stage without CAP_NET_ADMIN) and
+  `bringup::tests_6245::render_binding_setup_failures_is_deterministic` (pure
+  renderer). Existing `post_spawn_inthread_bind_failure_fails_closed_5143` still
+  green. Fail-on-revert: reverting the barrier's explicit-cause append to the
+  pre-#6245 `bound=N:planned=M` stage makes the e2e test ASSERTION-fail
+  (`got "worker_bind_incomplete:0:bound=0:planned=1"`), restored → green.
+
+## 2026-07-22 — #6245 rebase: compose explicit binding-failures onto #6244 typed stage
+
+- **Timestamp**: 2026-07-22 (fix/6245-explicit-binding-failures, rebased on
+  origin/master after #6244 merged)
+- **Action**: Re-integrate #6245 on top of #6244's typed `ReconcileStage`.
+  #6244 changed the fail-closed reconcile stage from a free-form `String` to a
+  typed enum whose legacy operator string is produced in EXACTLY one place —
+  `ReconcileStage`'s `Display`. Composed #6245's explicit per-slot failures
+  onto that foundation instead of reverting either PR: (1) added a
+  `failures: Vec<BindingSetupFailure>` field to `WorkerBindShortfall`
+  (`reconcile/stage.rs`); (2) MOVED `render_binding_setup_failures` (and its
+  deterministic-renderer unit test) from `bringup.rs` INTO `stage.rs`, where
+  the `WorkerBindIncomplete` `Display` arm now appends
+  `:{render_binding_setup_failures(&shortfall.failures)}` for the partial-bind
+  (`Some`) case — byte-identical to #6245's original barrier string
+  `worker_bind_incomplete:<id>:bound=<n>:planned=<m>:failures=[...]`; the
+  timeout (`None`) case keeps the pre-#6245 counts-only string (no reported
+  cause to attribute); (3) the barrier now builds the typed
+  `WorkerBindShortfall { ..., failures: report.binding_failures.clone() }` off
+  the retained per-worker `report_by_worker` map (empty failures for the
+  no-report/timeout case); (4) updated the byte-identical Display test's
+  `WorkerBindIncomplete` expectations (the one variant that intentionally
+  changes per #6245) and the e2e test's typed-stage assertions
+  (`ReconcileError::WorkerBindIncomplete(ReconcileStage::WorkerBindIncomplete)`
+  + `last_reconcile_stage.to_string()` for the substring checks).
+- **File(s)**: `userspace-dp/src/afxdp/coordinator/reconcile/stage.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`, `_Log.md`.
+- **Validation**: `cargo build` green; `cargo test --release` green including
+  `worker_bind_incomplete_report_carries_explicit_failure_6245` and
+  `reconcile_stage_renders_byte_identical_legacy_strings`. Fail-on-revert:
+  dropping the `Display` failures-append flips the #6245 e2e test RED.
+
 ## 2026-07-22 — #6244: typed reconcile progress replaces last_reconcile_stage string
 
 - **Timestamp**: 2026-07-22 (fix/6244-typed-reconcile-progress)
@@ -105,6 +240,7 @@
   userspace-dp/src/afxdp/coordinator/tests.rs,
   userspace-dp/src/server/tests.rs,
   docs/userspace-dataplane-architecture.md
+
 ## 2026-07-22 — #6232: scope-complete Rust heatmap classifier + enforced drift gate
 
 - **Timestamp**: 2026-07-22 (fix/6232-heatmap-audit)

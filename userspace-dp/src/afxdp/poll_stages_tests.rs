@@ -863,6 +863,53 @@ fn ndp_learns_vlan_neighbor_under_logical_ifindex_2370() {
     );
 }
 
+/// #6261 outline regression. The ARP-reply and NDP-NA learn-and-program
+/// tails were moved out of the inline `stage_link_layer_classify` into
+/// dedicated `#[cold] #[inline(never)]` handlers
+/// (`outline_arp_reply_learn_and_program` /
+/// `outline_ndp_na_learn_and_program`). That is a pure codegen/layout
+/// change and MUST remain behavior-preserving: driving a valid ARP reply
+/// and a valid NDP NA through the stage must still learn the neighbor
+/// under the LOGICAL ifindex AND preserve the ARP-recycle vs NDP-continue
+/// dispositions. If the extraction ever drops the learn, mis-passes an
+/// argument, or flips a disposition, these asserts fail.
+#[test]
+fn outlined_arp_ndp_handlers_still_learn_and_program_6261() {
+    let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+        &super::super::test_fixtures::nat_snapshot(),
+    )));
+    let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+
+    // ARP reply on VLAN 80 (parent 11 -> logical 12): the outlined ARP
+    // handler must learn AND the stage must still recycle the ARP frame.
+    let arp_ip = Ipv4Addr::new(172, 16, 80, 61);
+    let arp_mac = [0x02, 0x00, 0x00, 0x00, 0x62, 0x61];
+    let arp_outcome = classify(&arp_reply_frame(arp_ip, arp_mac), link_layer_meta(11, 80), ctx);
+    assert!(
+        matches!(arp_outcome, StageOutcome::RecycleAndContinue),
+        "ARP frames must still recycle after outlining (#6261)"
+    );
+    assert_eq!(
+        neighbors.get(&(12, IpAddr::V4(arp_ip))).map(|e| e.mac),
+        Some(arp_mac),
+        "outlined ARP handler must still learn under logical ifindex 12 (#6261)"
+    );
+
+    // NDP NA on VLAN 80: the outlined NDP handler must learn AND the
+    // stage must still Continue (the NA frame transits).
+    let (na_frame, na_ip, na_mac) = ndp_na_frame();
+    let na_outcome = classify(&na_frame, link_layer_meta(11, 80), ctx);
+    assert!(
+        matches!(na_outcome, StageOutcome::Continue(())),
+        "NDP NA must still Continue (transit) after outlining (#6261)"
+    );
+    assert_eq!(
+        neighbors.get(&(12, na_ip)).map(|e| e.mac),
+        Some(na_mac),
+        "outlined NDP handler must still learn under logical ifindex 12 (#6261)"
+    );
+}
+
 /// A `nat_snapshot`-shaped config with TWO VLAN sub-interfaces on the
 /// same physical parent (ifindex 11): `reth0.80` (logical 12, VID 80)
 /// and `reth0.50` (logical 13, VID 50), in different subnets.

@@ -96,80 +96,26 @@ pub(super) fn stage_link_layer_classify(
     // resolve to distinct logical ifindexes (distinct (parent, vlan)
     // keys), so a same-IP-different-subnet neighbor never collides.
     //
-    // The resolve is computed ONLY inside the ARP-reply / NDP-NA learn
-    // arms below, NOT at the top of the stage. This stage runs per-packet
-    // for ALL ingress traffic (before the flow-cache fast path), so the
-    // overwhelming majority of packets (every non-ARP/non-NDP frame,
-    // including flow-cache hits) must skip the FastMap lookup entirely —
-    // they pay zero resolve cost, matching the pre-#2370 data path.
-    let learn_ifindex = || {
-        resolve_ingress_logical_ifindex(
-            worker_ctx.forwarding,
-            meta.ingress_ifindex as i32,
-            meta.ingress_vlan_id,
-        )
-        .unwrap_or(meta.ingress_ifindex as i32)
-    };
+    // #6261: the resolve is computed ONLY inside the outlined ARP-reply /
+    // NDP-NA learn-and-program handlers below, NOT at the top of the
+    // stage. This stage runs per-packet for ALL ingress traffic (before
+    // the flow-cache fast path), so the overwhelming majority of packets
+    // (every non-ARP/non-NDP frame, including flow-cache hits) must skip
+    // the FastMap lookup entirely — they pay zero resolve cost, matching
+    // the pre-#2370 data path. The rare learn-and-program work now lives
+    // in `#[cold] #[inline(never)]` handlers so it does not bloat the
+    // inline hot stage; the ordinary (non-ARP/NDP) fast path is
+    // byte-for-byte unchanged — it only classifies the EtherType and
+    // probes the ARP/NDP parsers, exactly as before.
     match parser::classify_arp(raw_frame) {
         parser::ArpClassification::Reply(arp) => {
-            // #2790: validate the advertised sender protocol address BEFORE
-            // caching it. RFC 826 — a learnable ARP reply must name a single
-            // unicast host. A reply claiming an unspecified / loopback /
-            // multicast / broadcast sender IP would otherwise pollute both
-            // the userspace `dynamic_neighbors` map and the kernel ARP table
-            // (spoofed-reply DoS / routing disruption). Fail closed: recycle
-            // the ARP frame (it never transits) but skip learning, mirroring
-            // the #2369 fail-closed-on-malformed-ARP posture and the cold
-            // neighbor warmer's unicast-only gate.
-            // #2851: anti-poisoning own-IP gate, ADDITIONAL to the #2790
-            // unicast-only gate above. Refuse to learn an ARP reply whose
-            // advertised sender IP equals one of the router's OWN configured
-            // interface IPs. A host on the local link could otherwise send an
-            // unsolicited/spoofed reply claiming our own interface address and
-            // teach us `(ifindex, our_ip) -> attacker_mac` in both
-            // `dynamic_neighbors` and the kernel ARP table (RFC 826 — do not
-            // install a neighbor entry for an address we own). This MUST run
-            // BEFORE the `insert_if_changed` below so a rejected own-IP learn
-            // neither inserts nor bumps `mac_change_epoch` (#3048/#3169).
-            // (Solicited-only learning — only caching replies to probes we
-            // actually sent — is a larger, separate concern, tracked as a
-            // follow-up; this fix is the bounded own-IP rejection.)
-            if neighbor_ip_is_learnable(arp.sender_ip)
-                && !worker_ctx.forwarding.owns_configured_ip(arp.sender_ip)
-            {
-                let ifindex = learn_ifindex();
-                // #3048: route the data-path learn through insert_if_changed
-                // so a MAC change observed directly from an ARP reply
-                // (e.g. an upstream gateway VRRP failover whose reply
-                // traverses our XSK ingress) advances the neighbor
-                // mac_change_epoch and evicts stale cached dst_macs. A plain
-                // insert would silently overwrite the userspace map with the
-                // new MAC, then SHADOW the kernel-monitor RTM_NEWNEIGH that
-                // follows add_kernel_neighbor (the monitor would see
-                // prior == new and not bump), leaving the flow cache stale.
-                let changed = worker_ctx.dynamic_neighbors.insert_if_changed(
-                    (ifindex, arp.sender_ip),
-                    NeighborEntry {
-                        mac: arp.sender_mac,
-                    },
-                );
-                // #5288: gate the kernel-neighbor program (a raw netlink
-                // socket()/sendto()/close() + Vec allocations, on this XSK
-                // worker) behind the per-worker limiter. A same-key/same-MAC
-                // repeat (`!changed`) skips the netlink work entirely — the
-                // amplification an ARP-reply flood relied on — and even a
-                // changed-flood is rate-capped, while a genuine MAC change is
-                // still programmed (retried if rate-limited, never silently
-                // lost). See neighbor_program_limiter.
-                if neigh_limiter.should_program(
-                    (ifindex, arp.sender_ip),
-                    arp.sender_mac,
-                    changed,
-                    now_ns,
-                ) {
-                    add_kernel_neighbor(ifindex, arp.sender_ip, arp.sender_mac);
-                }
-            }
+            // #6261: the accepted ARP-reply learn-and-program tail
+            // (validation gates, #2370 logical-ifindex resolve,
+            // change-detecting learn, #5288-limited kernel program) is
+            // outlined to a #[cold] #[inline(never)] handler. ARP frames
+            // never transit the firewall — recycle either way, preserving
+            // the ARP-recycle semantics.
+            outline_arp_reply_learn_and_program(arp, meta, now_ns, neigh_limiter, worker_ctx);
             return StageOutcome::RecycleAndContinue;
         }
         parser::ArpClassification::OtherArp => {
@@ -177,61 +123,175 @@ pub(super) fn stage_link_layer_classify(
         }
         parser::ArpClassification::NotArp => {}
     }
+    // #6261: the NDP parser probe (`parse_ndp_neighbor_advert`) and its
+    // Target Link-Layer Address destructure stay inline; only the accepted
+    // learn-and-program tail (unicast/own-IP gates, #2370 resolve, #4475
+    // Override=0 read-before-write, change-detecting learn, #5288-limited
+    // program) is outlined to a #[cold] #[inline(never)] handler. NDP
+    // "continue" semantics are unchanged — an NA frame still transits the
+    // firewall (we fall through to `Continue` below regardless of whether
+    // the learn happened).
     if let Some(na) = parser::parse_ndp_neighbor_advert(raw_frame)
         && let Some(mac) = na.target_mac
-        // #2790: same unicast-only gate for the NDP NA target address —
-        // an NA advertising an unspecified / loopback / multicast target
-        // IP is not a learnable neighbor (RFC 4861 §7.2.4 targets are
-        // unicast). The NA frame still transits (falls through below);
-        // only the neighbor write is suppressed.
-        && neighbor_ip_is_learnable(na.target_ip)
-        // #2851: same anti-poisoning own-IP gate as the ARP-reply arm above.
-        // An NDP NA advertising one of the router's OWN configured IPv6
-        // addresses must not be learned — a local attacker could otherwise
-        // poison `(ifindex, our_v6) -> attacker_mac` (RFC 4861: do not learn
-        // an entry for an address we own from an unsolicited advert). Runs
-        // BEFORE the `insert_if_changed` below so a rejected learn neither
-        // inserts nor bumps `mac_change_epoch`.
+    {
+        outline_ndp_na_learn_and_program(na, mac, meta, now_ns, neigh_limiter, worker_ctx);
+    }
+    StageOutcome::Continue(())
+}
+
+/// #6261 — outlined ARP-reply learn-and-program tail of
+/// [`stage_link_layer_classify`].
+///
+/// Split out of the inline pre-flow-cache RX stage into a `#[cold]
+/// #[inline(never)]` handler so the ordinary (non-ARP/NDP) packet fast
+/// path stays cache-hot: an actual ARP *reply* on the data path is rare,
+/// but the inline validation / neighbor-learn / rate-limit / synchronous
+/// kernel-neighbor socket work would otherwise bloat the hot stage.
+///
+/// Behavior is byte-for-byte identical to the pre-#6261 inline block —
+/// this is a pure codegen/layout change, not a logic change:
+///
+/// - #2790: validate the advertised sender protocol address BEFORE
+///   caching it. RFC 826 — a learnable ARP reply must name a single
+///   unicast host. A reply claiming an unspecified / loopback /
+///   multicast / broadcast sender IP would otherwise pollute both the
+///   userspace `dynamic_neighbors` map and the kernel ARP table
+///   (spoofed-reply DoS / routing disruption). Fail closed: the caller
+///   recycles the ARP frame (it never transits) but this handler skips
+///   learning, mirroring the #2369 fail-closed-on-malformed-ARP posture
+///   and the cold neighbor warmer's unicast-only gate.
+/// - #2851: anti-poisoning own-IP gate, ADDITIONAL to the #2790
+///   unicast-only gate. Refuse to learn an ARP reply whose advertised
+///   sender IP equals one of the router's OWN configured interface IPs.
+///   A host on the local link could otherwise send an unsolicited /
+///   spoofed reply claiming our own interface address and teach us
+///   `(ifindex, our_ip) -> attacker_mac` in both `dynamic_neighbors` and
+///   the kernel ARP table (RFC 826 — do not install a neighbor entry for
+///   an address we own). This MUST run BEFORE the `insert_if_changed`
+///   below so a rejected own-IP learn neither inserts nor bumps
+///   `mac_change_epoch` (#3048/#3169).
+/// - #2370: learn under the LOGICAL (L3) ifindex, resolving
+///   `(parent, vlan) -> logical` so the insert key matches the
+///   forwarder's lookup key.
+/// - #3048: route the data-path learn through `insert_if_changed` so a
+///   MAC change observed directly from an ARP reply advances the
+///   neighbor `mac_change_epoch` and evicts stale cached dst_macs.
+/// - #5288: gate the kernel-neighbor program (a raw netlink
+///   socket()/sendto()/close() + Vec allocations) behind the per-worker
+///   limiter. A same-key/same-MAC repeat (`!changed`) skips the netlink
+///   work entirely; even a changed-flood is rate-capped, while a genuine
+///   MAC change is still programmed. `#[cold]` is a layout hint, NOT a
+///   rate limiter — flood bounding stays with this limiter.
+///
+/// The generation (`mac_change_epoch`) / limiter ordering is preserved
+/// exactly: `insert_if_changed` computes `changed` first, then
+/// `should_program` consults it, then `add_kernel_neighbor` runs.
+#[cold]
+#[inline(never)]
+fn outline_arp_reply_learn_and_program(
+    arp: parser::ArpReply,
+    meta: UserspaceDpMeta,
+    now_ns: u64,
+    neigh_limiter: &mut KernelNeighborProgramLimiter,
+    worker_ctx: &WorkerContext,
+) {
+    if neighbor_ip_is_learnable(arp.sender_ip)
+        && !worker_ctx.forwarding.owns_configured_ip(arp.sender_ip)
+    {
+        let ifindex = resolve_ingress_logical_ifindex(
+            worker_ctx.forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32);
+        let changed = worker_ctx.dynamic_neighbors.insert_if_changed(
+            (ifindex, arp.sender_ip),
+            NeighborEntry {
+                mac: arp.sender_mac,
+            },
+        );
+        if neigh_limiter.should_program((ifindex, arp.sender_ip), arp.sender_mac, changed, now_ns) {
+            add_kernel_neighbor(ifindex, arp.sender_ip, arp.sender_mac);
+        }
+    }
+}
+
+/// #6261 — outlined NDP Neighbor-Advertisement learn-and-program tail of
+/// [`stage_link_layer_classify`].
+///
+/// Split out of the inline pre-flow-cache RX stage into a `#[cold]
+/// #[inline(never)]` handler for the same reason as the ARP handler
+/// above. Called with the parsed `na` and its Target Link-Layer Address
+/// `mac` — the caller keeps the inline `parse_ndp_neighbor_advert`
+/// parser probe and the `target_mac` destructure. This handler never
+/// recycles: the NA frame still transits the firewall, so the caller
+/// always returns `StageOutcome::Continue(())`.
+///
+/// Behavior is byte-for-byte identical to the pre-#6261 inline block —
+/// pure codegen/layout change:
+///
+/// - #2790: unicast-only gate for the NA target address — an NA
+///   advertising an unspecified / loopback / multicast target IP is not
+///   a learnable neighbor (RFC 4861 §7.2.4 targets are unicast). Only
+///   the neighbor write is suppressed; the NA frame still transits.
+/// - #2851: same anti-poisoning own-IP gate as the ARP-reply handler —
+///   an NA advertising one of the router's OWN configured IPv6 addresses
+///   must not be learned. Runs BEFORE `insert_if_changed` so a rejected
+///   learn neither inserts nor bumps `mac_change_epoch`.
+/// - #2370: learn under the LOGICAL (L3) ifindex (VLAN sub-interface).
+/// - #4475 (opus-172 H-2): honor the RFC 4861 §7.2.5 Override (O) flag.
+///   An NA with Override=0 MUST NOT overwrite a cached neighbor entry
+///   that maps to a DIFFERENT link-layer address — the unsolicited-NA
+///   next-hop hijack primitive. A legitimate host announcing a
+///   link-layer-address change sets Override=1 (§7.2.6), so an Override=0
+///   NA is only allowed to create a first-time entry or refresh the same
+///   LLA; a live differing LLA is left untouched (this handler returns
+///   without learning — the NA frame still transits). This reads the
+///   per-worker `dynamic_neighbors` snapshot and the `insert_if_changed`
+///   below re-locks the shard, so it is a best-effort gate; the worker is
+///   the sole data-path writer for this key, and the kernel STALE install
+///   (see `DATA_PATH_NEIGH_STATE`) is the second line of defense.
+/// - #3048 / #5288: same change-detecting learn and bounded kernel
+///   program as the ARP handler — an NA flood for a non-owned unicast
+///   target must not storm netlink on the worker.
+///
+/// The generation (`mac_change_epoch`) / limiter ordering is preserved
+/// exactly, and the Override read happens BEFORE the `insert_if_changed`
+/// write, as before.
+#[cold]
+#[inline(never)]
+fn outline_ndp_na_learn_and_program(
+    na: parser::NdpNeighborAdvert,
+    mac: [u8; 6],
+    meta: UserspaceDpMeta,
+    now_ns: u64,
+    neigh_limiter: &mut KernelNeighborProgramLimiter,
+    worker_ctx: &WorkerContext,
+) {
+    if neighbor_ip_is_learnable(na.target_ip)
         && !worker_ctx.forwarding.owns_configured_ip(na.target_ip)
     {
-        let ifindex = learn_ifindex();
-        // #4475 (opus-172 H-2): honor the RFC 4861 §7.2.5 Override (O)
-        // flag. An NA with Override=0 MUST NOT overwrite a cached neighbor
-        // entry that maps to a DIFFERENT link-layer address — that is the
-        // unsolicited-NA next-hop hijack primitive (a local attacker
-        // claiming the WAN gateway's IPv6 with its own MAC). A legitimate
-        // host announcing a link-layer-address change sets Override=1
-        // (§7.2.6), so this blocks the poison while preserving legit
-        // MAC-change propagation (#3048): an Override=0 NA is allowed only
-        // to create a FIRST-TIME entry (no cached MAC) or refresh the SAME
-        // LLA; a live differing LLA is left untouched (the NA frame still
-        // transits — we fall through to `Continue`). This reads the
-        // per-worker `dynamic_neighbors` snapshot and the `insert_if_changed`
-        // below re-locks the shard, so it is a best-effort gate; the worker
-        // is the sole data-path writer for this key, and the kernel STALE
-        // install (see `DATA_PATH_NEIGH_STATE`) is the second line of
-        // defense for any residual race.
+        let ifindex = resolve_ingress_logical_ifindex(
+            worker_ctx.forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32);
         if !na.override_flag
             && worker_ctx
                 .dynamic_neighbors
                 .get(&(ifindex, na.target_ip))
                 .is_some_and(|existing| existing.mac != mac)
         {
-            return StageOutcome::Continue(());
+            return;
         }
-        // #3048: same change-detecting learn for NDP NA — a target-MAC
-        // change observed on the data path must bump mac_change_epoch and
-        // evict stale cached dst_macs (see the ARP-reply arm above).
         let changed = worker_ctx
             .dynamic_neighbors
             .insert_if_changed((ifindex, na.target_ip), NeighborEntry { mac });
-        // #5288: same bounded kernel-program gate as the ARP arm — an NA flood
-        // for a non-owned unicast target must not storm netlink on the worker.
         if neigh_limiter.should_program((ifindex, na.target_ip), mac, changed, now_ns) {
             add_kernel_neighbor(ifindex, na.target_ip, mac);
         }
     }
-    StageOutcome::Continue(())
 }
 
 /// Stage 6 — native GRE decapsulation.
