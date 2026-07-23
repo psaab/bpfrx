@@ -3,7 +3,7 @@
 - **Issue:** #5275 (HIGH; bug, dataplane, security, vsrx-parity)
 - **Research branch:** `research/5275-arm-failclosed`
 - **Base:** origin/master @ `6131eb4e6`
-- **Revision:** r3 (converged)
+- **Revision:** r2 (incorporates Claude SMR r1 M1–M5)
 - **Prior art:** PR #6358 (draft, `fix/5275-arm-failure-failclosed`) — returned
   MERGE-NEEDS-MAJOR. This plan supersedes it; §3 records what to reuse vs rewrite.
 - **Status:** PLAN-READY (research only — no production code; implementation via
@@ -158,22 +158,42 @@ the point where #6358's "skip applyConfig" freeze could act. Three shapes:
 **Option A1 — Abort-class classification (prevent-the-publish). RECOMMENDED.**
 - `attachUserspaceShimXDP` returns a typed sentinel `ErrShimAttachFailed`
   (wrapping the both-fail per-ifindex error) so the case is distinguishable from
-  ordinary compile/snapshot errors.
-- In `applyDataplaneAndHACore`, when `d.dp.ApplyConfig` errors: if
-  `applyErrorIsArmFailure(err) && !d.dataplaneEverArmed.Load()` → return it as a
-  **terminal abort** (like `compileErrorMustAbortApply`), so the caller bails
-  **before** the tail (networkd/RETH-MAC/VRRP/FRR never publish). Otherwise the
-  existing branches stand (required-protocol-gate abort; #5679 deferred for
-  everything else — including a day-2 attach failure on an ever-armed node).
-- `d.dataplaneEverArmed.Store(true)` is set after the first ApplyConfig whose
-  attach succeeds.
-- The boot arm + bootstrap-exit arm capture `applyConfig`'s (now non-discarded)
-  return; an arm-failure abort routes into `enterDataplaneArmFailedFailClosed()`.
+  ordinary compile/snapshot errors. Verified propagation:
+  `attachUserspaceShimXDP` (loader.go:242) → `CompileUserspaceShim`
+  (loader.go:191) → userspace `Manager.Compile` (manager_compile.go:187) →
+  userspace `Manager.ApplyConfig` (manager.go:354-355) → `d.dp.ApplyConfig` in
+  `applyDataplaneAndHACore` (daemon_apply.go:1073).
+- **The detection + fail-closed action live INSIDE the apply pipeline, NOT at the
+  arm sites** — because `applyConfig` (daemon_apply.go:49) is **void** (it
+  swallows `applyConfigLocked`'s error with an internal `slog.Warn`, and has many
+  callers). So the arm sites keep calling `applyConfig` unchanged; the pipeline
+  self-fails-closed:
+  - In `applyDataplaneAndHACore`, when `d.dp.ApplyConfig` errors: if
+    `applyErrorIsArmFailure(err) && !d.dataplaneEverArmed.Load()` → return it as a
+    **terminal abort** (like `compileErrorMustAbortApply`). Verified this
+    short-circuits: `applyConfigLocked` line 288 `if err != nil { return ... }`
+    bails **before** `applyRoutingRules`/`applyServicesReconcile`/`applyTailReconciles`
+    (lines 318/335/355), so networkd-tail/RETH-MAC/VRRP/FRR/RA never publish.
+  - `applyConfigLocked` (right after the line-288 bail) detects the
+    arm-failure-abort class and calls `d.enterDataplaneArmFailedFailClosed()`
+    before returning. (The handler's calls — `frr.Clear`,
+    `vrrpMgr.UpdateInstances(nil)`, `cluster.SetArmFailedHold` — do NOT
+    re-acquire `applySem`, so invoking it under the held `applySem` cannot
+    deadlock; confirm at /engineer time.)
+  - Otherwise the existing branches stand (required-protocol-gate abort; #5679
+    deferred for everything else — a day-2 attach failure on an ever-armed node
+    keeps the old policy live).
+- **`dataplaneEverArmed` flips to true ONLY when ApplyConfig returns nil AND
+  `ForwardingArmed()==true`** (A2 below) — so a silent partial attach that
+  returned no error does not wrongly mark the node ever-armed.
 - **Pro:** no ownership is ever published (no flap); the abort short-circuits the
-  tail; day-2 (#5679) untouched via the `dataplaneEverArmed` guard.
-- **Con:** requires a sentinel + a `dataplaneEverArmed` flag + capturing the boot
-  return. Aborting before networkd on boot leaves interfaces in startup-naming
-  state — which is exactly the #1960 "freeze in last-known-good" behaviour.
+  tail; day-2 (#5679) untouched via the `dataplaneEverArmed` guard; a single
+  choke-point covers boot arm, bootstrap-exit arm, AND a post-bootstrap
+  first-ever operator commit uniformly.
+- **Con:** requires the sentinel + `dataplaneEverArmed` + `ForwardingArmed()`.
+  Aborting before networkd on boot leaves interfaces in startup-naming state —
+  exactly the #1960 "freeze in last-known-good" behaviour. The handler's ~40 s
+  FRR clear runs under `applySem` on boot (acceptable).
 
 **Option A2 — Post-apply positive arm verification (tear-down-after).**
 - Let the first `applyConfig` run fully, then on the boot/bootstrap-exit arm
@@ -273,6 +293,24 @@ test** that enumerates the ownership publishers and asserts each consults
 `ownershipFrozen()` (a compile-time/registry check or a table test), so a future
 publisher cannot silently bypass — the specific miss that made #6358 MAJOR.
 
+**Considered and OUT of scope (with reason)** — these `ActiveConfig` readers do
+NOT publish transit forwarding, route advertisement, or VIP/ownership, so they are
+not part of the #5275 fail-closed surface:
+
+- `daemon_ha_userspace_stream` (session sync) — syncs conntrack sessions; a no-op
+  with `d.dp==nil` (arm-failed) and not a forwarding/advertisement publish.
+- `daemon_ha_fabric` (fabric redirect) — for peer-owned synced sessions; no-op
+  with `d.dp==nil`.
+- `daemon_dhcp` (relay), `daemon_ddns`, SNMP (ifTable) — control-plane services,
+  not transit policy enforcement or route/VIP advertisement.
+- `daemon_neighbor` (proactive neighbor resolution) — populates ARP/ND for
+  next-hops; advertises nothing and, in cluster mode, is gated on VRRP MASTER
+  (which never fires on a frozen node).
+
+They are listed so the enumeration is auditable and the canary's publisher set is
+justified; if a future change makes any of them advertise/forward, it joins the
+gated set.
+
 ---
 
 ## 7. Teardown sequencing + hard sysctl failure (Finding 4)
@@ -316,6 +354,21 @@ Two problems:
    the transit/data interfaces DOWN (the shim is being detached anyway), which
    fails closed independently of `ip_forward`, plus a loud alarm/log. Never leave
    the code path claiming fail-closed while `ip_forward=1`.
+   - **Lifeline safety (G2):** the escalation MUST reuse the SAME protected-mgmt
+     resolver networkd uses (`resolveProtectedInterfaces` /
+     `SetProtectedResolver`, derived from ActiveConfig independently of
+     `ManagedInterfaces`) and NEVER bring down a protected/mgmt interface
+     (`fxp0` / mgmt-VRF member). A naive "down all transit interfaces" that
+     catches the mgmt NIC would sever the console lifeline — the exact opposite of
+     the design goal.
+
+**Scope note (A1 minimizes this surface):** on the recommended A1 abort path the
+tail never published, so the handler's VRRP/FRR teardown acts on a node that never
+took ownership — the blackhole-ordering concern above applies mainly to (a) the A2
+backstop (applyConfig ran fully and published before the tear-down) and (b)
+`cluster.Start()` having already claimed primary via the isolated single-node
+election before the arm result was known. The re-order is still REQUIRED for those
+two cases.
 
 Optionally the FRR clear may run asynchronously *after* the ownership relinquish
 (management does not depend on it); the minimum required change is the re-order so
@@ -328,9 +381,13 @@ determinism at boot; revisit only if boot latency is measured to matter.
 
 - **Detection (A3):** `attachUserspaceShimXDP` returns `ErrShimAttachFailed`
   sentinel; `applyErrorIsArmFailure` classifier; in `applyDataplaneAndHACore`
-  route an arm-failure abort when `!dataplaneEverArmed`; set `dataplaneEverArmed`
-  after the first successful arm; add `d.dp.ForwardingArmed()` accessor as the A2
-  backstop at the two arm sites. Keep #6358's `Start()`-failure wiring.
+  route an arm-failure abort when `!dataplaneEverArmed`, and in `applyConfigLocked`
+  (after the line-288 bail) call `enterDataplaneArmFailedFailClosed()` on that
+  abort class — the detection lives in the pipeline, NOT at the arm sites (because
+  `applyConfig` is void). Set `dataplaneEverArmed=true` only when ApplyConfig
+  returns nil AND `d.dp.ForwardingArmed()==true`; use `ForwardingArmed()` as the
+  A2 backstop (fail closed if ApplyConfig returned nil but nothing armed). Keep
+  #6358's `Start()`-failure wiring at the two arm sites.
 - **Peer-yield (B1):** `SetArmFailedHold` demotes to `StateSecondaryHold`.
 - **Publishers (§6):** central `ownershipFrozen()` predicate; gate #5–#8; canary
   test.
@@ -394,7 +451,11 @@ both-attach-fail (e.g. force both attach modes to fail on the data VF) and asser
 the PEER holds the VIPs and forwards (no both-secondary), the injected node has
 `ip_forward=0` + no FRR managed section + no VIPs, and SSH/console stay reachable.
 Per `feedback_verify_forwarding_with_sustained_iperf`, verify with sustained
-iperf3 through the peer, not a health-200.
+iperf3 through the peer, not a health-200. The both-attach-fail injection needs a
+concrete test seam (an env var / build-tag hook that forces `link.AttachXDP` to
+fail both modes on a chosen data ifindex, mirroring the existing
+`failedNativeXDP` path) — name it in the implementation PR or land it as a
+harness follow-up rather than a hand-wave (`feedback_runnable_repro_before_measurement_claim`).
 
 ---
 
