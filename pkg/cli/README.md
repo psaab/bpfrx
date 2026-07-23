@@ -26,7 +26,10 @@ sibling files (same package, so unexported helpers stay reachable):
 - `cli_request.go` — the `handleRequest` dispatch shell plus the small
   `request dhcp` / `request protocols` handlers.
 - `cli_request_ping.go` — `ping` / `traceroute` and their `diagcmd` argv
-  builders (`buildPingArgv`, `buildTracerouteArgv`).
+  builders (`buildPingArgv`, `buildTracerouteArgv`). `buildPingArgv`
+  clamps the `-s` payload to `diagcmd.MaxPingSize` (#6382), so the local
+  console shares the single ping-size ceiling the REST and gRPC surfaces
+  already enforce (#5250 A8-b1 F4).
 - `cli_request_testcmd.go` — `test policy` / `test routing` /
   `test security-zone` (the `policymatch` adapters).
 - `monitor_traffic.go` — `monitor` dispatch + `monitor traffic` tcpdump

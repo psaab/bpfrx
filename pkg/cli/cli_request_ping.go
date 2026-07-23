@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"time"
 
 	"github.com/psaab/xpf/pkg/diagcmd"
@@ -69,7 +70,18 @@ func (c *CLI) handlePing(args []string) error {
 // byte-for-byte. Before #2143 this path prepended "vrf-"
 // unconditionally, turning `routing-instance vrf-red` into the
 // non-existent device `vrf-vrf-red`.
+//
+// The payload size is clamped to diagcmd.MaxPingSize so this third
+// control surface shares the single ceiling the REST and gRPC
+// buildPingArgv callers already enforce (#6382, mirroring #5250 A8-b1
+// F4): a -s above the max valid ICMP echo data could never yield a
+// valid probe. size arrives here as the raw operator token; a
+// non-numeric value is left untouched for the ping child to reject,
+// preserving the pre-clamp behavior of this trusted local surface.
 func buildPingArgv(target, count, source, size, vrfName string) []string {
+	if n, err := strconv.Atoi(size); err == nil && n > diagcmd.MaxPingSize {
+		size = strconv.Itoa(diagcmd.MaxPingSize)
+	}
 	return diagcmd.PingArgv(diagcmd.PingOptions{
 		Target:          target,
 		Count:           count,

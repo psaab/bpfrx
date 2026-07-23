@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/diagcmd"
 )
 
 // assertVRFDeviceOnce checks the #2143 invariant on a VRF-wrapped argv:
@@ -124,6 +127,40 @@ func TestBuildPingArgvParityWithVRF(t *testing.T) {
 	want := []string{"ip", "vrf", "exec", "vrf-red", "ping", "-c", "5", "--", "192.0.2.1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildPingArgv =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// pingArgvSize returns the value passed to `ping -s` in argv, or "" if none.
+func pingArgvSize(argv []string) string {
+	if i := indexOf(argv, "-s"); i >= 0 && i+1 < len(argv) {
+		return argv[i+1]
+	}
+	return ""
+}
+
+// TestBuildPingArgvClampsSize_6382 is the fail-on-revert guard for the local
+// console CLI ping payload clamp (#6382 — the third control surface, matching
+// the REST/gRPC #5250 A8-b1 F4 clamp). A size token far above the max valid
+// ICMP echo data must be capped to diagcmd.MaxPingSize. Removing the clamp in
+// buildPingArgv passes the raw operator value straight through.
+func TestBuildPingArgvClampsSize_6382(t *testing.T) {
+	argv := buildPingArgv("192.0.2.1", "5", "", "1048576", "")
+	got := pingArgvSize(argv)
+	want := fmt.Sprintf("%d", diagcmd.MaxPingSize)
+	if got != want {
+		t.Fatalf("ping -s = %q, want clamped %q", got, want)
+	}
+}
+
+// TestBuildPingArgvKeepsInBoundSize_6382 confirms an in-range size token is
+// passed through untouched, and a non-numeric token is left for the ping child
+// to reject rather than being swallowed by the clamp.
+func TestBuildPingArgvKeepsInBoundSize_6382(t *testing.T) {
+	if got := pingArgvSize(buildPingArgv("192.0.2.1", "5", "", "1400", "")); got != "1400" {
+		t.Fatalf("ping -s = %q, want 1400 (in-bound size must pass through)", got)
+	}
+	if got := pingArgvSize(buildPingArgv("192.0.2.1", "5", "", "huge", "")); got != "huge" {
+		t.Fatalf("ping -s = %q, want \"huge\" (non-numeric size must reach ping unchanged)", got)
 	}
 }
 

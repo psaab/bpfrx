@@ -59228,3 +59228,20 @@ top.
     #6391" (no close keyword).
   - **File(s)**: pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
     docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6382 — clamp local console CLI ping `-s` payload to
+    `diagcmd.MaxPingSize` (the third control surface). REST
+    (`pkg/api/system.go`) and gRPC (`pkg/grpcapi/server_diag_ping.go`)
+    `buildPingArgv` already clamped (#5250 A8-b1 F4); the console
+    `buildPingArgv` in `pkg/cli/cli_request_ping.go` passed the operator
+    `size` token through unclamped. Now `strconv.Atoi` + `min(size,
+    MaxPingSize)`; non-numeric tokens left for the ping child to reject.
+    Added `TestBuildPingArgvClampsSize_6382` (fail-on-revert) +
+    `TestBuildPingArgvKeepsInBoundSize_6382` (in-bound + non-numeric pass
+    through). Updated `MaxPingSize` doc comment (now all three surfaces
+    clamp) and `pkg/cli/README.md`. Parent-RED verified: neutralizing the
+    clamp fails `TestBuildPingArgvClampsSize_6382` with a clean assertion
+    (`ping -s = "1048576", want clamped "65507"`).
+  - **File(s)**: pkg/cli/cli_request_ping.go, pkg/cli/cli_request_argv_test.go,
+    pkg/diagcmd/diagcmd.go, pkg/cli/README.md, _Log.md
