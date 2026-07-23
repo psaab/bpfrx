@@ -24,8 +24,209 @@ use super::ReconcileSnapshotFds;
 // Re-use afxdp scope (coordinator/mod.rs uses the same pattern).
 use super::super::super::*;
 use super::super::Coordinator;
+use crate::protocol::snapshot::MapPins;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// #6243: every snapshot BPF map FD opened by [`open_snapshot_maps`], held
+/// together until the whole seven-pin contract succeeds. The three mandatory
+/// FDs (xsk/heartbeat/sessions) are always present; the four optional FDs are
+/// `Some` only when their pin was configured (present + openable). The
+/// activated caller ([`preflight_map_fds`]) destructures this into a
+/// [`ReconcileSnapshotFds`] and KEEPS the FDs; the deferred caller
+/// ([`validate_map_pins`]) DROPS it (RAII). That keep-vs-drop is the ONLY
+/// difference between the two callers — no `mode` parameter is needed.
+struct OpenedSnapshotMaps {
+    xsk: OwnedFd,
+    heartbeat: OwnedFd,
+    sessions: OwnedFd,
+    conntrack_v4: Option<OwnedFd>,
+    conntrack_v6: Option<OwnedFd>,
+    dnat_table: Option<OwnedFd>,
+    dnat_table_v6: Option<OwnedFd>,
+}
+
+/// #6243: a fault opening the seven snapshot map pins, produced by the single
+/// shared [`open_snapshot_maps`]. It carries enough identity to reproduce BOTH
+/// operator-visible artifacts the two callers used to build independently:
+///
+/// - [`stage`](MapPinFault::stage) — the typed #6244 [`ReconcileStage`]
+///   (`MissingPin` / `OpenMapFailed`) whose `Display` renders the byte-identical
+///   `missing_{token}_pin` / `open_{token}_map_failed:{err}` operator string.
+///   Both callers set this (the activated path onto `last_reconcile_stage`, the
+///   deferred path wrapped in `ReconcileError::MapSetup`).
+/// - [`binding_error`](MapPinFault::binding_error) — the verbatim per-binding
+///   `last_error` string the activated path stamps onto every registered
+///   binding. Its label root DIVERGES from the stage token for the xsk pin
+///   (stage token `xsk`, binding label `XSK`); this type carries the label
+///   explicitly so that byte-parity trap lives in exactly one place.
+enum MapPinFault {
+    /// A mandatory pin (xsk/heartbeat/sessions) was empty. An empty mandatory
+    /// pin is always fatal (feature-absent is not an option for a mandatory
+    /// pin, unlike the optional pins).
+    MissingRequired {
+        pin: MandatoryPin,
+        /// The per-binding label root — uppercase `XSK`, lowercase
+        /// `heartbeat`/`session` — DISTINCT from the lowercase stage token.
+        binding_label: &'static str,
+    },
+    /// A pin (mandatory OR a PRESENT optional) failed to open. `map` is the
+    /// lowercase `OpenMapFailed { map }` stage token; `binding_label` is the
+    /// per-binding label root (they differ only for xsk). `err` is the opened
+    /// error rendered to `String` once, so `stage()` and `binding_error()`
+    /// render byte-identically from the same text.
+    Open {
+        map: &'static str,
+        binding_label: &'static str,
+        err: String,
+    },
+}
+
+impl MapPinFault {
+    /// Build the typed #6244 [`ReconcileStage`] — the ONLY place both callers
+    /// derive the failure identity. Inherits #6244's byte-identical `Display`.
+    fn stage(&self) -> ReconcileStage {
+        match self {
+            MapPinFault::MissingRequired { pin, .. } => ReconcileStage::MissingPin(*pin),
+            MapPinFault::Open { map, err, .. } => ReconcileStage::OpenMapFailed {
+                map,
+                err: err.clone(),
+            },
+        }
+    }
+
+    /// The verbatim per-binding `last_error` string (test-locked in
+    /// `coordinator/tests.rs`): `missing {label} map pin path` for an empty
+    /// mandatory pin, `open {label} map: {err}` for an open failure. The
+    /// uppercase `XSK` label root is preserved here (vs the lowercase `xsk`
+    /// stage token) — the #6243 byte-parity trap.
+    fn binding_error(&self) -> String {
+        match self {
+            MapPinFault::MissingRequired { binding_label, .. } => {
+                format!("missing {binding_label} map pin path")
+            }
+            MapPinFault::Open {
+                binding_label, err, ..
+            } => format!("open {binding_label} map: {err}"),
+        }
+    }
+}
+
+/// #6243: THE single opener for the seven snapshot BPF map pins — the shared
+/// source of truth both the activated reconcile ([`preflight_map_fds`]) and the
+/// deferred-apply validation ([`validate_map_pins`]) route through, so they can
+/// never drift on which snapshots pass the map-pin gate or how a fault is
+/// classified.
+///
+/// PURE: it opens FDs and returns them (or a typed [`MapPinFault`]); it mutates
+/// no coordinator/binding state and writes no `last_reconcile_stage`. The
+/// side-effect stamping is a cold adapter on the activated caller.
+///
+/// Canonical order (fixes the two pre-#6243 divergences, both normalizing the
+/// deferred path toward the activated SSOT, both still fail-closed):
+///
+/// 1. TWO-PASS mandatory precedence: check ALL THREE mandatory pins for
+///    emptiness first (xsk -> heartbeat -> session), THEN open the three in the
+///    same order. A multi-fault snapshot (an earlier mandatory pin
+///    present-but-unopenable + a later one empty) therefore reports the SAME
+///    stage from both callers. The old one-pass deferred walk
+///    (check-empty-then-open per pin) instead reported the earlier pin's open
+///    failure where the activated two-pass reported the later pin's emptiness.
+/// 2. FD RETENTION: every opened FD is held in [`OpenedSnapshotMaps`] until the
+///    WHOLE contract succeeds. The old deferred walk dropped each FD
+///    immediately, so under FD-table pressure a later open could succeed where
+///    the activated path (holding all earlier FDs simultaneously) failed.
+///    Holding them here gives the deferred path the identical low-FD failure.
+///
+/// Requiredness (#2444): the 3 mandatory pins are fatal if empty; the 4
+/// optional pins (conntrack v4/v6, dnat tables) are silent-absent if empty but
+/// FATAL if present-but-unopenable. On any mandatory fault or present-optional
+/// open failure it returns `Err` (never a partial `Ok`), so the caller aborts
+/// BEFORE teardown/publish (#2440).
+///
+/// RAII single-close: `OwnedFd` is the non-`Clone` sole owner of its fd and
+/// closes it on `Drop`, so a later open failure drops every earlier-opened FD
+/// exactly once — enforced STRUCTURALLY by ownership, not a runtime assertion.
+fn open_snapshot_maps(pins: &MapPins) -> Result<OpenedSnapshotMaps, MapPinFault> {
+    // Pass 1: all mandatory pins must be non-empty (xsk -> heartbeat ->
+    // session). Checking all three for emptiness BEFORE opening any is the
+    // canonical two-pass precedence.
+    if pins.xsk.is_empty() {
+        return Err(MapPinFault::MissingRequired {
+            pin: MandatoryPin::Xsk,
+            binding_label: "XSK",
+        });
+    }
+    if pins.heartbeat.is_empty() {
+        return Err(MapPinFault::MissingRequired {
+            pin: MandatoryPin::Heartbeat,
+            binding_label: "heartbeat",
+        });
+    }
+    if pins.sessions.is_empty() {
+        return Err(MapPinFault::MissingRequired {
+            pin: MandatoryPin::Session,
+            binding_label: "session",
+        });
+    }
+    // Pass 2: open the three mandatory pins in the same order. Each opened FD
+    // is held in a local; if a later open fails, `?` returns Err and the
+    // earlier FDs drop (RAII single-close).
+    let xsk = OwnedFd::open_bpf_map(&pins.xsk).map_err(|err| MapPinFault::Open {
+        map: "xsk",
+        binding_label: "XSK",
+        err: err.to_string(),
+    })?;
+    let heartbeat = OwnedFd::open_bpf_map(&pins.heartbeat).map_err(|err| MapPinFault::Open {
+        map: "heartbeat",
+        binding_label: "heartbeat",
+        err: err.to_string(),
+    })?;
+    let sessions = OwnedFd::open_bpf_map(&pins.sessions).map_err(|err| MapPinFault::Open {
+        map: "session",
+        binding_label: "session",
+        err: err.to_string(),
+    })?;
+    // Optional pins (#2444 empty-vs-present discipline): an empty pin is a
+    // genuinely-absent feature (`Ok(None)`, the common case); a present pin
+    // that fails to open is fatal, exactly like a mandatory pin. All earlier
+    // FDs stay held across these opens.
+    let conntrack_v4 = open_optional_snapshot_map(&pins.conntrack_v4, "conntrack_v4")?;
+    let conntrack_v6 = open_optional_snapshot_map(&pins.conntrack_v6, "conntrack_v6")?;
+    let dnat_table = open_optional_snapshot_map(&pins.dnat_table, "dnat_table")?;
+    let dnat_table_v6 = open_optional_snapshot_map(&pins.dnat_table_v6, "dnat_table_v6")?;
+    Ok(OpenedSnapshotMaps {
+        xsk,
+        heartbeat,
+        sessions,
+        conntrack_v4,
+        conntrack_v6,
+        dnat_table,
+        dnat_table_v6,
+    })
+}
+
+/// #6243: open one OPTIONAL snapshot map pin with the #2444 empty-vs-present
+/// discipline, folded out of the two former list-walks so both callers share
+/// it. Empty pin -> `Ok(None)` (feature absent, no gating). Present pin -> open;
+/// an open failure is fatal (`Err(MapPinFault::Open)`, the same fail-closed path
+/// as a mandatory pin). The optional pins reuse ONE `&'static str` as both the
+/// stage token and the per-binding label (only xsk's two forms diverge).
+fn open_optional_snapshot_map(
+    pin: &str,
+    name: &'static str,
+) -> Result<Option<OwnedFd>, MapPinFault> {
+    if pin.is_empty() {
+        return Ok(None);
+    }
+    OwnedFd::open_bpf_map(pin)
+        .map(Some)
+        .map_err(|err| MapPinFault::Open {
+            map: name,
+            binding_label: name,
+            err: err.to_string(),
+        })
+}
 
 /// #2440: open the mandatory + optional BPF map FDs and surface any
 /// missing-pin / open-failure BEFORE the orchestrator tears down the
@@ -50,142 +251,40 @@ pub(super) fn preflight_map_fds(
     snapshot: &ConfigSnapshot,
     bindings: &mut [BindingStatus],
 ) -> Option<ReconcileSnapshotFds> {
-    if snapshot.map_pins.xsk.is_empty() {
-        coord.last_reconcile_stage = ReconcileStage::MissingPin(MandatoryPin::Xsk);
-        for binding in bindings.iter_mut() {
-            if binding.registered {
-                binding.last_error = "missing XSK map pin path".to_string();
-            }
-        }
-        return None;
-    }
-    if snapshot.map_pins.heartbeat.is_empty() {
-        coord.last_reconcile_stage = ReconcileStage::MissingPin(MandatoryPin::Heartbeat);
-        for binding in bindings.iter_mut() {
-            if binding.registered {
-                binding.last_error = "missing heartbeat map pin path".to_string();
-            }
-        }
-        return None;
-    }
-    if snapshot.map_pins.sessions.is_empty() {
-        coord.last_reconcile_stage = ReconcileStage::MissingPin(MandatoryPin::Session);
-        for binding in bindings.iter_mut() {
-            if binding.registered {
-                binding.last_error = "missing session map pin path".to_string();
-            }
-        }
-        return None;
-    }
-    let map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.xsk) {
-        Ok(fd) => fd,
-        Err(err) => {
-            coord.last_reconcile_stage = ReconcileStage::OpenMapFailed {
-                map: "xsk",
-                err: err.to_string(),
-            };
+    // #6243: open all seven pins through the shared `open_snapshot_maps` (the
+    // SSOT both this activated path and the deferred `validate_map_pins` route
+    // through). On a fault this is the COLD ADAPTER — the only activated-
+    // specific behavior — that stamps `last_reconcile_stage` (from the typed
+    // #6244 stage) plus every registered binding's `last_error` (verbatim
+    // pre-#1328 message), then aborts before teardown/publish. On success it
+    // KEEPS the opened FDs (the deferred caller drops them).
+    let maps = match open_snapshot_maps(&snapshot.map_pins) {
+        Ok(maps) => maps,
+        Err(fault) => {
+            coord.last_reconcile_stage = fault.stage();
+            let binding_error = fault.binding_error();
             for binding in bindings.iter_mut() {
                 if binding.registered {
-                    binding.last_error = format!("open XSK map: {err}");
+                    binding.last_error = binding_error.clone();
                 }
             }
             return None;
         }
     };
-    let heartbeat_map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.heartbeat) {
-        Ok(fd) => fd,
-        Err(err) => {
-            coord.last_reconcile_stage = ReconcileStage::OpenMapFailed {
-                map: "heartbeat",
-                err: err.to_string(),
-            };
-            for binding in bindings.iter_mut() {
-                if binding.registered {
-                    binding.last_error = format!("open heartbeat map: {err}");
-                }
-            }
-            return None;
-        }
-    };
-    let session_map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.sessions) {
-        Ok(fd) => fd,
-        Err(err) => {
-            coord.last_reconcile_stage = ReconcileStage::OpenMapFailed {
-                map: "session",
-                err: err.to_string(),
-            };
-            for binding in bindings.iter_mut() {
-                if binding.registered {
-                    binding.last_error = format!("open session map: {err}");
-                }
-            }
-            return None;
-        }
-    };
-    // #2444: Open the optional BPF maps (conntrack v4/v6, dnat tables)
-    // with the same EMPTY-vs-PRESENT discipline as the mandatory maps.
-    // The pin string IS the "feature configured" signal:
-    //   - empty pin  -> feature absent -> None (the common case; many
-    //     deploys carry no conntrack/dnat pins). Returns None silently;
-    //     it never gates the reconcile.
-    //   - present pin + open Ok  -> Some(fd).
-    //   - present pin + open Err -> the feature WAS configured but its
-    //     map cannot be opened (permission / pin mismatch / corruption).
-    //     Running degraded would silently lose session zone/interface
-    //     visibility (conntrack) or break embedded-ICMP NAT reversal —
-    //     PMTUD / traceroute breakage (dnat) — with NO readiness signal.
-    //     So fail closed exactly like the mandatory maps: record a
-    //     descriptive stage + per-binding last_error and return None to
-    //     abort BEFORE teardown/publish (#2440 invariant: prior
-    //     generation + workers stay live).
-    let conntrack_v4_fd = match open_optional_map(
-        coord,
-        bindings,
-        &snapshot.map_pins.conntrack_v4,
-        "conntrack_v4",
-    ) {
-        Ok(fd) => fd,
-        Err(()) => return None,
-    };
-    let conntrack_v6_fd = match open_optional_map(
-        coord,
-        bindings,
-        &snapshot.map_pins.conntrack_v6,
-        "conntrack_v6",
-    ) {
-        Ok(fd) => fd,
-        Err(()) => return None,
-    };
-    let dnat_table_fd = match open_optional_map(
-        coord,
-        bindings,
-        &snapshot.map_pins.dnat_table,
-        "dnat_table",
-    ) {
-        Ok(fd) => fd,
-        Err(()) => return None,
-    };
-    let dnat_table_v6_fd = match open_optional_map(
-        coord,
-        bindings,
-        &snapshot.map_pins.dnat_table_v6,
-        "dnat_table_v6",
-    ) {
-        Ok(fd) => fd,
-        Err(()) => return None,
-    };
+    // Derive the raw dnat fd ints from the retained `OwnedFd`s (still owned by
+    // `maps` at this point) BEFORE moving the FDs into the returned bundle.
     let dnat_fds = DnatTableFds {
-        v4: dnat_table_fd.as_ref().map(|f| f.fd),
-        v6: dnat_table_v6_fd.as_ref().map(|f| f.fd),
+        v4: maps.dnat_table.as_ref().map(|f| f.fd),
+        v6: maps.dnat_table_v6.as_ref().map(|f| f.fd),
     };
     Some(ReconcileSnapshotFds {
-        map_fd,
-        heartbeat_map_fd,
-        session_map_fd,
-        conntrack_v4_fd,
-        conntrack_v6_fd,
-        dnat_table_fd,
-        dnat_table_v6_fd,
+        map_fd: maps.xsk,
+        heartbeat_map_fd: maps.heartbeat,
+        session_map_fd: maps.sessions,
+        conntrack_v4_fd: maps.conntrack_v4,
+        conntrack_v6_fd: maps.conntrack_v6,
+        dnat_table_fd: maps.dnat_table,
+        dnat_table_v6_fd: maps.dnat_table_v6,
         dnat_fds,
         // #2484: filled in by `build_reconcile_forwarding`, which the
         // orchestrator runs right after this (still before teardown). A
@@ -274,62 +373,35 @@ pub(super) fn preflight_policy_state(
     .map(|_| ())
 }
 
-/// #5171: side-effect-free validation that every MANDATORY BPF map pin
-/// (xsk/heartbeat/sessions) is present and openable, and every PRESENT
-/// optional pin (conntrack v4/v6, dnat tables) is openable — exactly the
-/// emptiness + open checks `preflight_map_fds` runs (via the same
-/// `OwnedFd::open_bpf_map`), but WITHOUT keeping the FDs, mutating
-/// `bindings`, or writing `last_reconcile_stage`. Each opened FD is dropped
-/// immediately; openability is the only signal a validate-only path needs.
-/// Returns the same stage descriptor `preflight_map_fds` would set, wrapped
-/// in `ReconcileError::MapSetup`, so the deferred-apply integrity gate
-/// reports an identical error to the reconcile path (a MISSING/UNOPENABLE
-/// mandatory pin is the #5171 headline fail-open a deferred apply must
-/// reject before ack/persist).
+/// #5171/#6243: side-effect-free validation that every MANDATORY BPF map pin
+/// (xsk/heartbeat/sessions) is present and openable, and every PRESENT optional
+/// pin (conntrack v4/v6, dnat tables) is openable.
+///
+/// #6243: this now routes through the SAME [`open_snapshot_maps`] the activated
+/// [`preflight_map_fds`] uses, then DROPS the returned bundle (`.map(|_| ())`)
+/// — RAII closes every opened FD — and maps the typed [`MapPinFault`] to the
+/// same `ReconcileStage` via `fault.stage()`, wrapped in
+/// `ReconcileError::MapSetup`. It keeps NO FDs, mutates no `bindings`, and
+/// writes no `last_reconcile_stage`; openability is the only signal a
+/// validate-only path needs. Sharing the opener closes two pre-#6243
+/// divergences (both fail-closed, both normalized toward the activated SSOT):
+///
+/// - the deferred walk was ONE-pass (empty-then-open per pin) while activated
+///   was TWO-pass, so a multi-fault snapshot could report a DIFFERENT stage
+///   from each path; the shared two-pass order makes them identical.
+/// - the deferred walk dropped each FD immediately, so under FD-table pressure
+///   it could PASS where activated (retaining all seven FDs) FAILED; the shared
+///   bundle now holds every opened FD until the whole contract succeeds, so the
+///   deferred path catches the low-FD case too.
+///
+/// A MISSING/UNOPENABLE mandatory (or present-optional) pin is the #5171
+/// headline fail-open a deferred apply must reject before ack/persist.
 pub(super) fn validate_map_pins(snapshot: &ConfigSnapshot) -> Result<(), super::ReconcileError> {
-    for (pin, mandatory, map_token) in [
-        (&snapshot.map_pins.xsk, MandatoryPin::Xsk, "xsk"),
-        (
-            &snapshot.map_pins.heartbeat,
-            MandatoryPin::Heartbeat,
-            "heartbeat",
-        ),
-        (&snapshot.map_pins.sessions, MandatoryPin::Session, "session"),
-    ] {
-        if pin.is_empty() {
-            return Err(super::ReconcileError::MapSetup(ReconcileStage::MissingPin(
-                mandatory,
-            )));
-        }
-        // Open then drop: proves the mandatory pin resolves to a real map
-        // without retaining the FD or mutating any published state.
-        OwnedFd::open_bpf_map(pin).map_err(|err| {
-            super::ReconcileError::MapSetup(ReconcileStage::OpenMapFailed {
-                map: map_token,
-                err: err.to_string(),
-            })
-        })?;
-    }
-    // #2444 empty-vs-present discipline: an empty optional pin means the
-    // feature is absent (no gating); a PRESENT pin that fails to open is
-    // fatal (the feature WAS configured but its map is unopenable), exactly
-    // as `open_optional_map` treats it.
-    for (pin, name) in [
-        (&snapshot.map_pins.conntrack_v4, "conntrack_v4"),
-        (&snapshot.map_pins.conntrack_v6, "conntrack_v6"),
-        (&snapshot.map_pins.dnat_table, "dnat_table"),
-        (&snapshot.map_pins.dnat_table_v6, "dnat_table_v6"),
-    ] {
-        if !pin.is_empty() {
-            OwnedFd::open_bpf_map(pin).map_err(|err| {
-                super::ReconcileError::MapSetup(ReconcileStage::OpenMapFailed {
-                    map: name,
-                    err: err.to_string(),
-                })
-            })?;
-        }
-    }
-    Ok(())
+    open_snapshot_maps(&snapshot.map_pins)
+        // Drop the retained FD bundle (RAII single-close) — the deferred gate
+        // only needs the Ok/Err verdict, never the FDs.
+        .map(|_| ())
+        .map_err(|fault| super::ReconcileError::MapSetup(fault.stage()))
 }
 
 /// #5171: side-effect-free forwarding-build integrity validation. Runs the
@@ -374,47 +446,6 @@ pub(super) fn validate_forwarding_buildable(
     )
     .map(|_| ())
     .map_err(super::ReconcileError::Integrity)
-}
-
-/// #2444: open an OPTIONAL BPF map pin with empty-vs-present discipline.
-///
-/// - empty pin -> `Ok(None)` (feature genuinely absent; no gating). This
-///   is the anti-over-gate path: the overwhelmingly common deploy has no
-///   conntrack/dnat pins and must reconcile normally.
-/// - present pin + open Ok -> `Ok(Some(fd))`.
-/// - present pin + open Err -> the feature was configured but its map is
-///   unopenable. Set `coord.last_reconcile_stage =
-///   "open_{name}_map_failed:{err}"` + per-registered-binding
-///   `last_error`, then return `Err(())` so the caller aborts the
-///   reconcile BEFORE teardown/publish (fail closed, mirroring the
-///   mandatory maps in `preflight_map_fds`).
-fn open_optional_map(
-    coord: &mut Coordinator,
-    bindings: &mut [BindingStatus],
-    pin: &str,
-    // #6244: `&'static str` so the map token can flow into the typed
-    // `ReconcileStage::OpenMapFailed { map }` without an allocation. All
-    // callers pass a string literal.
-    name: &'static str,
-) -> Result<Option<OwnedFd>, ()> {
-    if pin.is_empty() {
-        return Ok(None);
-    }
-    match OwnedFd::open_bpf_map(pin) {
-        Ok(fd) => Ok(Some(fd)),
-        Err(err) => {
-            coord.last_reconcile_stage = ReconcileStage::OpenMapFailed {
-                map: name,
-                err: err.to_string(),
-            };
-            for binding in bindings.iter_mut() {
-                if binding.registered {
-                    binding.last_error = format!("open {name} map: {err}");
-                }
-            }
-            Err(())
-        }
-    }
 }
 
 /// #5801 day-2 slow-path MTU reconcile decision, extracted from
