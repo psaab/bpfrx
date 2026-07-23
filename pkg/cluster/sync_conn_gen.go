@@ -352,6 +352,14 @@ func (s *SessionSync) resetRecvGen() {
 	// CURRENT config (pushConfigToPeer sends ShowActive), so the newest
 	// content still wins.
 	s.lastAppliedConfigGen.Store(0)
+	// #6284: drop the apply-in-progress fence alongside the high-water so a
+	// concurrent bulk re-prime restores the accept-everything posture the reset
+	// intends. A re-prime admits the rebooted peer's lower-generation set; a
+	// stale fence from an apply that raced the reset would otherwise keep
+	// refusing it. configApplyLoop may re-raise the fence on its next apply —
+	// the same benign race the high-water reset already has with a concurrent
+	// advance — and the re-primed installs are re-sent by the next sweep.
+	s.applyingConfigGen.Store(0)
 	// #5563: reset the received-config high-water alongside the applied mark so
 	// the manual-failover readiness gate's applied<=received invariant holds
 	// across the reset window. The reconnect re-push then re-establishes both
@@ -401,8 +409,27 @@ func (s *SessionSync) resetRecvGen() {
 // as before (rolling-upgrade safe). The check is authoritative here in the Go
 // cluster layer: the #3931 namespace lives entirely in SessionSync, and the
 // receiver refuses BEFORE forwarding the install to the userspace helper.
+//
+// #6284 item 2: the refusal threshold is max(applyingConfigGen, lastApplied-
+// ConfigGen), not the high-water alone. configApplyLoop raises the fence
+// (applyingConfigGen) to the generation it is applying BEFORE running the
+// clearSessionsForDeletedPolicies sweep and lowers it only AFTER the high-water
+// advances (success) or the apply fails, so during that whole window an install
+// stamped with an older epoch is refused against the applying generation
+// instead of admitted against the not-yet-advanced high-water. The fence is
+// read FIRST and folded with a max: on the success-release ordering (high-water
+// stored, THEN fence cleared) this guarantees a reader that observes fence==0
+// has already observed the advanced high-water, so the effective threshold
+// never dips — closing the sub-µs sweep-vs-advance stale-permit race.
 func (s *SessionSync) configEpochStale(epoch uint64) bool {
-	return epoch != 0 && epoch < s.lastAppliedConfigGen.Load()
+	if epoch == 0 {
+		return false
+	}
+	barrier := s.applyingConfigGen.Load()
+	if applied := s.lastAppliedConfigGen.Load(); applied > barrier {
+		barrier = applied
+	}
+	return epoch < barrier
 }
 
 func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val dataplane.SessionValue) {

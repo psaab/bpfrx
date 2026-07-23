@@ -573,6 +573,19 @@ type SessionSync struct {
 	// config).
 	configGenCounter     atomic.Uint64
 	lastAppliedConfigGen atomic.Uint64
+	// applyingConfigGen is the apply-in-progress config fence (#6284, item 2).
+	// The single-consumer configApplyLoop sets it to the generation it is about
+	// to apply BEFORE calling OnConfigReceived (which runs the receiver's
+	// clearSessionsForDeletedPolicies sweep) and clears it to 0 only AFTER the
+	// high-water (lastAppliedConfigGen) has advanced on success, or immediately
+	// on an apply failure. The config-epoch install guard (configEpochStale)
+	// folds this into its refusal threshold so a synced session stamped with an
+	// epoch older than the generation being applied — one racing the sub-µs
+	// window between the sweep completing and the high-water advancing — is
+	// refused NOW instead of admitted against the not-yet-advanced high-water
+	// (the residual stale-permit window #5274 left open). 0 means no apply is in
+	// flight (or a gen==0 legacy apply, which carries no comparable epoch).
+	applyingConfigGen atomic.Uint64
 	// lastRecvConfigGen is the highest config generation this node has RECEIVED
 	// from the peer (recorded at enqueue in the syncMsgConfig handler, BEFORE
 	// apply). It is the receiver's local view of the config sender's current
