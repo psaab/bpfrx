@@ -5806,9 +5806,12 @@ fn precedence_flowless_addrs_unknown_skips_land_runs_tail_and_floods_6238() {
 fn shared_fragment_route_helper_binds_flowless_path_6238() {
     // FAIL-ON-REVERT (flowless leg): the flowless path enforces the shared
     // fragment/route tail via `check_fragment_and_route`. Neutralizing the
-    // flowless `check_fragment_and_route` call site turns EXACTLY this test RED
-    // (the packet would PASS), proving the flowless path is single-sourced
-    // through the shared helper rather than an independent hand-mirrored copy.
+    // flowless `check_fragment_and_route` call site turns this flowless binding
+    // test RED (the packet would PASS) — together with the other flowless
+    // source-route tests that traverse the same call site — while the
+    // opposite-path (full) binding test below stays GREEN. That path-specific
+    // asymmetry proves the flowless path is single-sourced through the shared
+    // helper rather than an independent hand-mirrored copy.
     let profile = ScreenProfile {
         source_route: true,
         ..ScreenProfile::default()
@@ -5830,9 +5833,11 @@ fn shared_fragment_route_helper_binds_flowless_path_6238() {
 fn shared_fragment_route_helper_binds_full_path_6238() {
     // FAIL-ON-REVERT (full leg): the flow-present path enforces the SAME shared
     // tail. Neutralizing the full-path `check_fragment_and_route` call site
-    // turns EXACTLY this test RED — the two paths route through ONE helper, so
-    // a future source-independent addition to `check_fragment_and_route` is
-    // enforced on both entry points by construction (the #3902 fail-open class).
+    // turns this full binding test RED (with the other full-path source-route
+    // tests through that call site), while the flowless binding test above
+    // stays GREEN — the two paths route through ONE helper, so a future
+    // source-independent addition to `check_fragment_and_route` is enforced on
+    // both entry points by construction (the #3902 fail-open class).
     let profile = ScreenProfile {
         source_route: true,
         ..ScreenProfile::default()
