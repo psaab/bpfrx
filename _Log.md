@@ -57486,3 +57486,17 @@ top.
     test/xsk-repro/selftest-compile.sh,
     test/xsk-repro/selftest-skipgate_6289.sh (new),
     test/xsk-repro/README.md, scripts/run-selftests.sh
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5275 /research — plan-of-action doc for fail-closed-on-dataplane-
+    arm-failure. Supersedes PR #6358 (draft, MERGE-NEEDS-MAJOR). Firsthand-
+    confirmed the real arm boundary is the first ApplyConfig attach
+    (attachUserspaceShimXDP both-native+generic fail), not d.dp.Start; the
+    both-fail error is mis-classified as #5679-deferred so the tail publishes.
+    Plan: A3 detection (abort-class sentinel + ForwardingArmed backstop,
+    dataplaneEverArmed guard preserves #5679 day-2), B1 peer-yield
+    (StateSecondaryHold — sticky vs recalcWeight, unlike weight-0), central
+    ownershipFrozen() gate for the 4 ungated publishers + canary test, teardown
+    re-order (relinquish before slow FRR clear) + hardened disableForwarding.
+    Research only — no production code; STOP at PLAN-READY.
+- **File(s)**: docs/research/5275-arm-failclosed/plan.md
