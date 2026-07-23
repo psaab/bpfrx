@@ -135,10 +135,12 @@ pub(crate) struct FirewallFilterSnapshot {
 //       lookup. File a tracker issue against session/key.rs.
 //
 //   (b) NOT in cache key (cache-sensitive) — wire the #1430
-//       runbook: per-interface FilterState.iface_filter_v{4,6}_has_<X>_match
-//       set, Filter.has_<X>_match_terms aggregate flag, flow-cache
-//       insertion gate at afxdp/flow_cache.rs:297-309, established-
-//       session re-evaluation at afxdp/poll_descriptor/mod.rs:217-244,
+//       runbook: Filter.has_<X>_match_terms flag (read per-interface
+//       off FilterState.iface_filter_v{4,6}_fast via the
+//       interface_input_filter_has_<X>_match accessor — the parallel
+//       per-interface has_<X>_match sets were deleted in #6236 PR-2B),
+//       flow-cache insertion gate at afxdp/flow_cache.rs:297-309,
+//       established-session re-evaluation at afxdp/poll_descriptor/mod.rs:217-244,
 //       forwarding rotation purge at afxdp/worker/loop_body/mod.rs:295-330,
 //       and tests at afxdp/flow_cache_tests.rs.
 //

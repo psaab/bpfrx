@@ -1091,13 +1091,15 @@ pub(crate) fn interface_filter_affects_route_lookup(
     ifindex: i32,
     is_v6: bool,
 ) -> bool {
-    if is_v6 {
-        state
-            .iface_filter_v6_affects_route_lookup
-            .contains(&ifindex)
+    // #6236 PR-2B: read the flag off the per-interface fast map instead of a
+    // parallel `iface_filter_v*_affects_route_lookup` set. The set was populated
+    // iff `filter.affects_route_lookup`, so `get().is_some_and(..)` is
+    // bit-identical for a unique ifindex and last-wins-consistent for a
+    // duplicate — agreeing with the filter the eval that follows actually runs.
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex)
     } else {
-        state
-            .iface_filter_v4_affects_route_lookup
-            .contains(&ifindex)
-    }
+        state.iface_filter_v4_fast.get(&ifindex)
+    };
+    filter.is_some_and(|filter| filter.affects_route_lookup)
 }

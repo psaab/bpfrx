@@ -2366,17 +2366,18 @@ fn resolve_cached_cos_tx_selection_flowless_captures_counter_only_output_filter(
     // Every existing flowless output-filter canary uses a terminal (discard /
     // reject) or log term, so dropping `has_counter_terms` from
     // `Filter::needs_tx_eval()` leaves them GREEN — the flowless CACHED
-    // needs_tx_eval predicate at cos_classify.rs:225 (and its compile-time
-    // `iface_filter_out_v4_needs_tx_eval` set-insert gate) was NOT bound by a
-    // counter-only canary. This test binds it: the filter is counter-only
-    // (has_counter_terms=true; affects_tx_selection / has_log_terms /
-    // has_terminal_action_terms / has_three_color_policer_terms all false), so
+    // needs_tx_eval predicate at cos_classify.rs:225 (and the
+    // `interface_output_filter_needs_tx_eval` accessor it gates on, which since
+    // #6236 PR-2B reads `Filter::needs_tx_eval()` off the output fast map) was
+    // NOT bound by a counter-only canary. This test binds it: the filter is
+    // counter-only (has_counter_terms=true; affects_tx_selection / has_log_terms
+    // / has_terminal_action_terms / has_three_color_policer_terms all false), so
     // `needs_tx_eval()` reduces to has_counter_terms alone.
     //
     // RED-on-revert: dropping `has_counter_terms` from `Filter::needs_tx_eval()`
-    // drops ifindex 202 from `iface_filter_out_v4_needs_tx_eval` (the outer gate)
-    // AND fails the inner `.filter(|f| f.needs_tx_eval())` at :225, so the output
-    // filter is never walked, `filter_counters` comes back empty, and the
+    // makes `interface_output_filter_needs_tx_eval(202)` return false (the outer
+    // gate) AND fails the inner `.filter(|f| f.needs_tx_eval())` at :225, so the
+    // output filter is never walked, `filter_counters` comes back empty, and the
     // assertion below FAILS.
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
@@ -2443,8 +2444,9 @@ fn resolve_cos_tx_selection_flowless_counts_counter_only_output_filter() {
     // (`resolve_cos_tx_selection`, flow_key = None) must fire a `then count` on
     // an interface output filter whose ONLY TX-relevant property is the counter.
     // Binds the flowless RUNTIME needs_tx_eval predicate at cos_classify.rs:655
-    // (and its `iface_filter_out_v4_needs_tx_eval` outer gate) to
-    // has_counter_terms — the existing flowless canaries (terminal / log) do not.
+    // (and its `interface_output_filter_needs_tx_eval` accessor gate, fast-map
+    // backed since #6236 PR-2B) to has_counter_terms — the existing flowless
+    // canaries (terminal / log) do not.
     //
     // RED-on-revert: dropping `has_counter_terms` from `Filter::needs_tx_eval()`
     // skips the output-filter walk, the `then count` term never fires, and the

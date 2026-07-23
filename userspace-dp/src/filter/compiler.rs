@@ -163,19 +163,10 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                 // are recomputed from the FINAL fast map after this loop so a
                 // duplicate-ifindex last-wins overwrite cannot strand a
                 // stale-true aggregate. Do not OR them in here.
-                if filter.affects_route_lookup {
-                    state
-                        .iface_filter_v4_affects_route_lookup
-                        .insert(iface.ifindex);
-                }
-                if filter.has_dscp_match_terms {
-                    state.iface_filter_v4_has_dscp_match.insert(iface.ifindex);
-                }
-                if filter.has_per_packet_l4_match_terms {
-                    state
-                        .iface_filter_v4_has_per_packet_l4_match
-                        .insert(iface.ifindex);
-                }
+                // #6236 PR-2B: the per-interface capability sets
+                // (affects_route_lookup / has_dscp_match / has_per_packet_l4_match)
+                // are gone — the accessors read the flag off the fast map entry,
+                // so populating the fast map below is the only per-interface work.
                 state
                     .iface_filter_v4_fast
                     .insert(iface.ifindex, filter.clone());
@@ -195,15 +186,11 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         if !iface.filter_output_v4.is_empty() {
             let key = qualify_filter_key("inet", &iface.filter_output_v4);
             if let Some(filter) = state.filters.get(&key) {
-                // #6236 PR-2A: the set-insert predicate is now the sole
-                // Filter::needs_tx_eval() definition (was an inline five-flag OR).
-                // has_output_tx_selection_v4 / has_output_needs_tx_eval_v4 are
-                // recomputed from the FINAL fast map after this loop.
-                if filter.needs_tx_eval() {
-                    state
-                        .iface_filter_out_v4_needs_tx_eval
-                        .insert(iface.ifindex);
-                }
+                // #6236 PR-2B: the per-interface `iface_filter_out_v4_needs_tx_eval`
+                // set is gone — `interface_output_filter_needs_tx_eval` reads
+                // `Filter::needs_tx_eval()` off this fast-map entry. The
+                // `has_output_needs_tx_eval_v4` aggregate is recomputed from the
+                // FINAL fast map after this loop.
                 state
                     .iface_filter_out_v4_fast
                     .insert(iface.ifindex, filter.clone());
@@ -224,19 +211,8 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
             if let Some(filter) = state.filters.get(&key) {
                 // #6236 PR-2A: aggregates recomputed from the FINAL fast map
                 // after this loop (see the inet input block above).
-                if filter.affects_route_lookup {
-                    state
-                        .iface_filter_v6_affects_route_lookup
-                        .insert(iface.ifindex);
-                }
-                if filter.has_dscp_match_terms {
-                    state.iface_filter_v6_has_dscp_match.insert(iface.ifindex);
-                }
-                if filter.has_per_packet_l4_match_terms {
-                    state
-                        .iface_filter_v6_has_per_packet_l4_match
-                        .insert(iface.ifindex);
-                }
+                // #6236 PR-2B: per-interface capability sets deleted — accessors
+                // read the flag off the fast-map entry.
                 state
                     .iface_filter_v6_fast
                     .insert(iface.ifindex, filter.clone());
@@ -253,13 +229,10 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         if !iface.filter_output_v6.is_empty() {
             let key = qualify_filter_key("inet6", &iface.filter_output_v6);
             if let Some(filter) = state.filters.get(&key) {
-                // #6236 PR-2A: sole Filter::needs_tx_eval() predicate; aggregates
-                // recomputed from the FINAL fast map after this loop.
-                if filter.needs_tx_eval() {
-                    state
-                        .iface_filter_out_v6_needs_tx_eval
-                        .insert(iface.ifindex);
-                }
+                // #6236 PR-2B: per-interface `iface_filter_out_v6_needs_tx_eval`
+                // set deleted (see the inet output block above); the
+                // `has_output_needs_tx_eval_v6` aggregate is recomputed from the
+                // FINAL fast map after this loop.
                 state
                     .iface_filter_out_v6_fast
                     .insert(iface.ifindex, filter.clone());
@@ -301,14 +274,9 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         .iface_filter_v6_fast
         .values()
         .any(|f| f.has_three_color_policer_terms);
-    state.has_output_tx_selection_v4 = state
-        .iface_filter_out_v4_fast
-        .values()
-        .any(|f| f.affects_tx_selection);
-    state.has_output_tx_selection_v6 = state
-        .iface_filter_out_v6_fast
-        .values()
-        .any(|f| f.affects_tx_selection);
+    // #6236 PR-2B: `has_output_tx_selection_v*` is deleted — the global TX gate
+    // reads only `has_output_needs_tx_eval_*` (which is a superset), so the
+    // `affects_tx_selection`-only aggregate is no longer computed.
     state.has_output_needs_tx_eval_v4 = state
         .iface_filter_out_v4_fast
         .values()

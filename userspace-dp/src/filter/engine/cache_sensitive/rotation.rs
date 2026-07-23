@@ -214,11 +214,16 @@ pub(crate) fn interface_input_filter_has_dscp_match(
     ifindex: i32,
     is_v6: bool,
 ) -> bool {
-    if is_v6 {
-        state.iface_filter_v6_has_dscp_match.contains(&ifindex)
+    // #6236 PR-2B: read `has_dscp_match_terms` off the fast map (mirrors the
+    // OUTPUT accessor below), replacing the parallel
+    // `iface_filter_v*_has_dscp_match` set. #1430 cache-sensitivity is preserved
+    // bit-for-bit: the set was populated iff `filter.has_dscp_match_terms`.
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex)
     } else {
-        state.iface_filter_v4_has_dscp_match.contains(&ifindex)
-    }
+        state.iface_filter_v4_fast.get(&ifindex)
+    };
+    filter.is_some_and(|filter| filter.has_dscp_match_terms)
 }
 
 pub(crate) fn interface_output_filter_has_dscp_match(
@@ -287,15 +292,16 @@ pub(crate) fn interface_input_filter_has_per_packet_l4_match(
     ifindex: i32,
     is_v6: bool,
 ) -> bool {
-    if is_v6 {
-        state
-            .iface_filter_v6_has_per_packet_l4_match
-            .contains(&ifindex)
+    // #6236 PR-2B: read `has_per_packet_l4_match_terms` off the fast map,
+    // replacing the parallel `iface_filter_v*_has_per_packet_l4_match` set
+    // (mirrors the OUTPUT accessor below). #1430/#2362 cache-sensitivity is
+    // preserved bit-for-bit for a unique ifindex.
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex)
     } else {
-        state
-            .iface_filter_v4_has_per_packet_l4_match
-            .contains(&ifindex)
-    }
+        state.iface_filter_v4_fast.get(&ifindex)
+    };
+    filter.is_some_and(|filter| filter.has_per_packet_l4_match_terms)
 }
 
 pub(crate) fn interface_output_filter_has_per_packet_l4_match(

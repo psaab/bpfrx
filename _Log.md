@@ -1,3 +1,48 @@
+## 2026-07-23 — #6236 PR-2B: capability-accessor migration + property-set deletion
+
+- **Timestamp**: 2026-07-23 (refactor/6236-pr2b-migrate-delete)
+- **Action**: PR-2B of the #6236 PR-2 filter-flag convergence (A→B→C split;
+  PR-1 dead-field deletion + PR-2A needs_tx_eval foundations already merged).
+  Migrated the four hot per-interface capability accessors to read the mirrored
+  `Filter` flag off `iface_filter_*_fast.get(&ifindex)` instead of a parallel
+  `FxHashSet<i32>`: `interface_filter_affects_route_lookup` (eval.rs),
+  `interface_input_filter_has_dscp_match` /
+  `interface_input_filter_has_per_packet_l4_match` (rotation.rs), and
+  `interface_output_filter_needs_tx_eval` (tx_selection.rs). Accessor SIGNATURES
+  unchanged — consumers (PBR, poll-descriptor, cos_classify, flow_cache)
+  untouched (no single-lookup fold; that is PR-2C). Then DELETED the eight
+  now-unread property sets + the two `has_output_tx_selection_v{4,6}` aggregates
+  (PR-2A already rewired the global TX gate onto `has_output_needs_tx_eval_*`,
+  which subsumes them) + the production-dead accessor
+  `filter_state_has_output_tx_selection`. Removed the compiler `.insert`
+  population for each deleted set and the post-loop `has_output_tx_selection_*`
+  recompute. `FilterState` 25 → 15 fields.
+- **Gate discipline**: landed the equivalence test FIRST in its pre-deletion
+  form (`set.contains(&if) == fast.get(&if).is_some_and(flag)` across all 8
+  sets/flags, both families + directions) and confirmed GREEN before deleting
+  any set; post-deletion it survives as an accessor-vs-fast-map regression pin
+  (`capability_accessors_equal_fast_map_flags_for_unique_ifindices`). Parent-RED:
+  making `interface_filter_affects_route_lookup` read `has_dscp_match_terms`
+  turned 8 route-lookup/PBR tests RED (assertion failures, not build breaks);
+  restored. #1430 cache-sensitivity is bit-identical for unique ifindices and
+  last-wins-consistent for duplicates; #3296 MissingFilterRef guards untouched.
+- **Tests**: full `cargo test --release -- --test-threads=1` GREEN — 4248
+  passed, 0 failed, 2 pre-existing ignored, exit 0. Migrated the tests that
+  inspected the deleted fields onto the accessors / retained aggregate. Docs
+  updated: `filter/README.md`, `filter/mod.rs` + `protocol/security.rs` #1430
+  runbook, and stale mechanism comments in cos_classify/flow_cache tests.
+- **File(s)**: userspace-dp/src/filter/mod.rs,
+    userspace-dp/src/filter/compiler.rs,
+    userspace-dp/src/filter/engine/eval.rs,
+    userspace-dp/src/filter/engine/tx_selection.rs,
+    userspace-dp/src/filter/engine/mod.rs,
+    userspace-dp/src/filter/engine/cache_sensitive/rotation.rs,
+    userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
+    userspace-dp/src/protocol/security.rs,
+    userspace-dp/src/afxdp/forwarding_build/tests.rs,
+    userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+    userspace-dp/src/afxdp/flow_cache_tests.rs
+
 ## 2026-07-22 — #6361: three TEST-STRENGTH tightenings on the #6243 map-pin suite
 
 - **Timestamp**: 2026-07-22 (fix/6361-test-tighten → refactor/6243-unify-map-pin-preflight)
