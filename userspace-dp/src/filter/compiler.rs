@@ -159,9 +159,6 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
             let key = qualify_filter_key("inet", &iface.filter_input_v4);
             if let Some(filter) = state.filters.get(&key) {
                 if filter.affects_tx_selection {
-                    state
-                        .iface_filter_v4_affects_tx_selection
-                        .insert(iface.ifindex);
                     state.has_input_tx_selection_v4 = true;
                 }
                 if filter.has_three_color_policer_terms {
@@ -195,7 +192,6 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                     filter: iface.filter_input_v4.clone(),
                 });
             }
-            state.iface_filter_v4.insert(iface.ifindex, key);
         }
         if !iface.filter_output_v4.is_empty() {
             let key = qualify_filter_key("inet", &iface.filter_output_v4);
@@ -227,15 +223,11 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                     filter: iface.filter_output_v4.clone(),
                 });
             }
-            state.iface_filter_out_v4.insert(iface.ifindex, key);
         }
         if !iface.filter_input_v6.is_empty() {
             let key = qualify_filter_key("inet6", &iface.filter_input_v6);
             if let Some(filter) = state.filters.get(&key) {
                 if filter.affects_tx_selection {
-                    state
-                        .iface_filter_v6_affects_tx_selection
-                        .insert(iface.ifindex);
                     state.has_input_tx_selection_v6 = true;
                 }
                 if filter.has_three_color_policer_terms {
@@ -266,7 +258,6 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                     filter: iface.filter_input_v6.clone(),
                 });
             }
-            state.iface_filter_v6.insert(iface.ifindex, key);
         }
         if !iface.filter_output_v6.is_empty() {
             let key = qualify_filter_key("inet6", &iface.filter_output_v6);
@@ -296,16 +287,19 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                     filter: iface.filter_output_v6.clone(),
                 });
             }
-            state.iface_filter_out_v6.insert(iface.ifindex, key);
         }
     }
 
-    state.lo0_filter_v4 = if lo0_filter_v4.is_empty() {
+    // #6236 PR-1: the qualified lo0 keys are compiler intermediates only — they
+    // exist solely to look up lo0_filter_v*_fast and were never read on the
+    // packet path. Keep them as locals; the struct retains only the fast
+    // Option<Arc<Filter>>. The #3296 fail-closed guards below are unchanged.
+    let lo0_filter_v4_key = if lo0_filter_v4.is_empty() {
         String::new()
     } else {
         qualify_filter_key("inet", lo0_filter_v4)
     };
-    state.lo0_filter_v4_fast = state.filters.get(&state.lo0_filter_v4).cloned();
+    state.lo0_filter_v4_fast = state.filters.get(&lo0_filter_v4_key).cloned();
     if !lo0_filter_v4.is_empty() && state.lo0_filter_v4_fast.is_none() {
         // #3296: lo0 host-bound input filter names a filter not in the table.
         // Falling through to the default Accept would leave the routing-engine
@@ -317,12 +311,12 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
             filter: lo0_filter_v4.to_string(),
         });
     }
-    state.lo0_filter_v6 = if lo0_filter_v6.is_empty() {
+    let lo0_filter_v6_key = if lo0_filter_v6.is_empty() {
         String::new()
     } else {
         qualify_filter_key("inet6", lo0_filter_v6)
     };
-    state.lo0_filter_v6_fast = state.filters.get(&state.lo0_filter_v6).cloned();
+    state.lo0_filter_v6_fast = state.filters.get(&lo0_filter_v6_key).cloned();
     if !lo0_filter_v6.is_empty() && state.lo0_filter_v6_fast.is_none() {
         // #3296: lo0 host-bound inet6 input filter missing → fail-open. Refuse.
         return Err(SnapshotIntegrityError::MissingFilterRef {

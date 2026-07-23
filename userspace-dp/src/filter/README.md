@@ -707,6 +707,20 @@ peer-sync path. An EMPTY reference (no filter on the hook) is the legitimate
 both lo0 input families. Tests: `missing_filter_ref_3296_*` /
 `defined_filter_ref_3296_compiles_cleanly` in `filter/tests.rs` (fail-on-revert).
 
+The fail-closed contract keys off the RETAINED per-interface fast maps
+(`iface_filter_*_fast`) and, for output hooks, the
+`iface_filter_out_*_needs_tx_eval` sets — the only structures the hot path
+consults. #6236 PR-1 removed the dead parallel bookkeeping that shadowed these:
+the four `"family:name"` name maps (`iface_filter_v4`/`iface_filter_v6`/
+`iface_filter_out_v4`/`iface_filter_out_v6`), the two input
+`iface_filter_v{4,6}_affects_tx_selection` sets (their only reader was a
+test-only helper; production reads the family-wide `has_input_tx_selection_*`
+aggregate), and the two `lo0_filter_v{4,6}` qualified-key Strings (now compiler
+locals used only to look up `lo0_filter_v{4,6}_fast`). The `MissingFilterRef`
+guards are byte-for-byte unchanged — deleting a name-map `.insert` never touched
+the `filters.get()` presence check that precedes it. `FilterState` drops from 31
+to 23 fields with zero live-dataplane behavior change.
+
 Unparseable tcp-flags backstop (#3367): a term whose Junos `tcp-flags`
 expression the Go control plane could not parse into required/forbidden masks
 (disjunction, negated groups, unknown flags) is marked with the
