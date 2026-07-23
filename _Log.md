@@ -56822,3 +56822,44 @@ top.
   pkg/vrrp/instance_socket.go (new), pkg/vrrp/instance_receive.go (new),
   pkg/vrrp/instance_send.go (new), pkg/vrrp/instance_garp.go (new),
   pkg/vrrp/instance_vip.go (new), pkg/vrrp/README.md
+## #5661 — daemon_apply.go pure code-motion split
+- **Timestamp**: 2026-07-22
+- **Action**: Split ~3095-line pkg/daemon/daemon_apply.go into 7 cohesive
+  sibling files (pure code motion; behavior/ordering/locking unchanged).
+  daemon_apply.go dropped to 412 lines. All moved declaration bodies are
+  byte-identical to origin/master (line-multiset diff = 0 except one
+  gofmt-mandated comment-indent normalization that master itself was not
+  clean on). Full build ./... green; go test ./pkg/daemon/... green;
+  gofmt -l empty.
+- **File(s)**: pkg/daemon/daemon_apply.go (edit),
+  pkg/daemon/daemon_apply_reset.go (new),
+  pkg/daemon/daemon_apply_commit.go (new),
+  pkg/daemon/daemon_apply_hostauth.go (new),
+  pkg/daemon/daemon_apply_dataplane.go (new),
+  pkg/daemon/daemon_apply_routing.go (new),
+  pkg/daemon/daemon_apply_interfaces.go (new),
+  pkg/daemon/daemon_apply_tail.go (new),
+  pkg/daemon/README.md (edit — config-apply file-layout note)
+- **Timestamp**: 2026-07-22
+- **Action**: #5661 split — pure code-motion split of pkg/daemon/daemon_run.go
+  (~2820 prod LOC → 836) into five cohesive sibling files in package daemon:
+  daemon_run_routehelpers.go (riMemberLinuxName, collectAppliedTunnels,
+  linkLocalV6Net, inferIPv6StaticNextHopInterfaces), daemon_run_shutdown.go
+  (applyCloseoutDrainTimeout, runShutdownSequence, runHAShutdownUpdate),
+  daemon_run_servers.go (six *CommitFn/*CommitConfirmedFn seams +
+  #5054/#5961 section comment, startGRPCServer, startHTTPServer,
+  resolveAPIBinds), daemon_run_bringup.go (initManagers,
+  loadAndBootstrapConfig, setupDataplaneAndInitialConfig, enableForwarding),
+  daemon_run_naming.go (setupInterfaceNaming, namingParamsFromConfig,
+  applyStartupNamingForConfig, maybeReapplyConfigArrivalNaming,
+  runBootstrapExitStartup). Declarations moved verbatim — no rename, reorder,
+  or logic change; startup-phase / shutdown ordering untouched.
+  buildRuntimeDataPlane deliberately KEPT in daemon_run.go (retirement-boundary
+  canary TestDaemonRuntimeEntryPointUsesRuntimeDataPlane requires the
+  dataplane.NewRuntimeDataPlane call there). Per-decl byte-identity check:
+  all 32 top-level decls unchanged. go build ./..., go test ./pkg/daemon/...,
+  and the pkg/dataplane canary all green; gofmt clean.
+- **File(s)**: pkg/daemon/daemon_run.go, pkg/daemon/daemon_run_routehelpers.go
+  (new), pkg/daemon/daemon_run_shutdown.go (new),
+  pkg/daemon/daemon_run_servers.go (new), pkg/daemon/daemon_run_bringup.go
+  (new), pkg/daemon/daemon_run_naming.go (new), pkg/daemon/README.md
