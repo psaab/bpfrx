@@ -350,6 +350,10 @@ func (s *SessionSync) Stop() {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	// #6387: stop the config-apply grace-expiry timer and invalidate any
+	// in-flight callback so no timer survives this SessionSync's teardown (a
+	// comms transport change tears down this instance and creates a fresh one).
+	s.stopConfigApplyGraceTimer()
 	if s.listener != nil {
 		s.listener.Close()
 	}

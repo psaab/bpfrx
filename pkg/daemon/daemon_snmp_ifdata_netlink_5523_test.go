@@ -20,6 +20,9 @@ import (
 // netlink error) makes the failure invisible — the warning-count assertion goes
 // RED while the return-value assertion stays green.
 func TestBuildSNMPIfDataSurfacesNetlinkFailure(t *testing.T) {
+	// Reset the #6396 per-failure warn throttle so this single-call assertion
+	// (exactly one log) is independent of any failure logged by an earlier test.
+	snmpIfDataFailThrottle.reset()
 	prevLister := snmpLinkLister
 	snmpLinkLister = func() ([]netlink.Link, error) {
 		return nil, errors.New("injected: netlink RTM_GETLINK dump failed")

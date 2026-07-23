@@ -110,6 +110,68 @@ path already draws (see the WireGuard/tunnel removal notes below and
   covered a failed `LinkDel` **after** a successful lookup; this closes the
   predating `LinkByName`-error branch.
 
+**Identity re-assertion on every post-create readback (#5523 C179-104 +
+#6396).** `LinkAdd` and the `LinkByName` readback that follows it are two
+syscalls. A device is adopted only after confirming the readback is the
+INTENDED type — and, for xfrm and VRF, carrying the desired discriminator
+too — never by name alone. The discriminator checked is per-manager: **xfrm
+rejects type + `Ifid` + `ParentIndex==0`, VRF rejects type + table, but bond
+rejects TYPE only** (the create-path mode/MTU check, plus the adopt/KEEP-path
+identity checks, are deferred to #6402 — see the bond bullet). So a same-name
+foreign link (or, for xfrm/VRF, a right-type link with the wrong
+discriminator) substituted by a concurrent external actor in the
+add→readback window is rejected: it is not brought up or tracked, the
+commit fails closed, and a later reconcile reclaims the intruder. This
+invariant now holds across all three netlink-device managers:
+
+- **xfrm** (`xfrm.go`) — the readback must be an `*netlink.Xfrmi` whose
+  `Ifid` matches. Enforced on BOTH the adopt path (a kernel link outliving
+  in-memory tracking; a non-xfrmi or stale-`if_id` link is delete+recreated,
+  #5523 C179-104) and the post-create readback (#6396).
+- **VRF** (`vrf.go` `createLinkedVRF`) — the readback must be an
+  `*netlink.Vrf` whose `Table` matches (#6396). `added` stays true so the
+  caller records ownership; the reconcile adopt path (`vrfTable` →
+  recreate on table mismatch) reclaims a substitute on the next cycle.
+- **bond** (`bond.go` `createLocked`) — the **create-path** readback must be
+  an `*netlink.Bond` before enslaving members or bringing it up (#6396).
+  `enslaveMembers` only surfaces a substitute via a real-netlink
+  `LinkSetMaster` failure when a member is actually enslavable, so a bond
+  whose configured members are all currently absent (the #4823 soft-error
+  case) would otherwise adopt a foreign link; the explicit type check
+  closes that hole for every member state.
+
+  **Bond is only PARTIALLY in the identity-assertion family — the remaining
+  bond identity checks are deferred to #6402 (HA-touching; a fabric/RETH LAG
+  change needs a loss-cluster `test-failover` smoke).** The #6396 create-path
+  guard is a strict improvement (it rejects a non-`*netlink.Bond` substitute)
+  but is NOT complete, and these gaps are ALL pre-existing (master never
+  validated them — they are not #6396 regressions):
+    1. **create-path mode/MTU** — the guard checks the `*netlink.Bond` type
+       only, then tracks the DESIRED `bondSig` (`sigWithMembers(sig, …)`), not
+       the readback's observed mode/MTU. An `*netlink.Bond` substitute with the
+       wrong bond mode (802.3ad vs active-backup) or MTU passes and is tracked
+       as satisfied.
+    2. **adopt-path type + mode + MTU** — the adopt branch
+       (`if existing, err := LinkByName(name); err == nil`) accepts `existing`
+       by name after checking only the enslaved member set; a foreign or
+       wrong-mode/MTU same-name link present at steady state is adopted.
+    3. **KEEP-path identity** — the tracked-and-unchanged fast path
+       (`if trackedSig == sig` → `LinkByName` → `LinkSetUp`) brings up whatever
+       wears the name without re-asserting it is even a bond, so a same-name
+       `Dummy` swapped in under a tracked bond is accepted.
+  #6402 covers all three and must validate mode + MTU, not just the
+  `*netlink.Bond` type. (xfrm and VRF adopt paths ARE fully gated —
+  xfrm.go:203 asserts type + `Ifid` + `ParentIndex==0`, and `vrfTable`→recreate
+  asserts type + table — so bond is the sole manager with open identity
+  residuals.)
+
+Without the check the name is tracked as satisfied while **no** device
+carries the desired identity, silently blackholing the VPN / leaked routes
+/ fabric LAG bound to it. (The tunnel/WireGuard manager reaches its reuse
+path through a distinct anchor-reuse gate that already type-checks
+`*netlink.Tuntap` — see the reuse notes below — so it is not part of this
+readback family.)
+
 ### Bond (fabric/ae LAG) reconcile (#5119)
 
 `bondManager.Apply` is called by `pkg/daemon` on **every** config commit

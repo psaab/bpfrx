@@ -3,7 +3,221 @@ package cluster
 import (
 	"context"
 	"log/slog"
+	"time"
 )
+
+// DefaultConfigApplyFailGrace is how long a received config-sync generation may
+// stay un-applied — apply hard-failing, standby config stale, high-water pinned
+// per M-2/#4151 — before the node raises the CF config-sync monitor-failure /
+// degraded-health annotation (#6387, §12.6). The trigger is TIME-BASED rather
+// than attempt-count: configApplyLoop only runs on a RECEIVED config, and the
+// sender pushes a generation at most ONCE per connection/generation (the
+// daemon's level-triggered reconcileConfigSyncToPeer is idempotent after the
+// first push), so an "N consecutive failures" gate — or any gate keyed on a
+// second delivery edge — could strand the standby forever below the threshold.
+// The raise is therefore driven by an independent grace-expiry TIMER armed on
+// the first failure of a streak (armConfigApplyGraceTimerLocked): it fires and
+// raises CF once the grace elapses with no further delivery required. The grace
+// is a wall-clock window an order of magnitude longer than a transient
+// RG0-primary config rejection — which clears within a few seconds as the local
+// node settles ownership — so a genuine persistent apply failure surfaces to
+// the operator promptly while a momentary rejection never flaps the flag (the
+// timer is cancelled by the intervening successful apply). It clears on the
+// first successful apply. Sized off the peer-loss / transfer-lease timescale
+// (DefaultRemoteTransferOutLease is 30s); tests override via
+// SessionSync.configApplyFailGrace and SessionSync.afterFuncFn.
+const DefaultConfigApplyFailGrace = 30 * time.Second
+
+// nowMono returns CLOCK_MONOTONIC nanos, honoring the test injection seam
+// (#6387). Production uses MonotonicNanos.
+func (s *SessionSync) nowMono() int64 {
+	if s.nowMonoFn != nil {
+		return s.nowMonoFn()
+	}
+	return MonotonicNanos()
+}
+
+// configApplyGrace returns the stale-duration grace before a persistently
+// un-applied config raises the CF health signal, honoring the test override
+// (#6387).
+func (s *SessionSync) configApplyGrace() time.Duration {
+	if s.configApplyFailGrace > 0 {
+		return s.configApplyFailGrace
+	}
+	return DefaultConfigApplyFailGrace
+}
+
+// afterFunc schedules f to run after d, honoring the test injection seam
+// (#6387). Production uses time.AfterFunc; a test can capture the callback and
+// drive the grace-expiry timer deterministically.
+func (s *SessionSync) afterFunc(d time.Duration, f func()) *time.Timer {
+	if s.afterFuncFn != nil {
+		return s.afterFuncFn(d, f)
+	}
+	return time.AfterFunc(d, f)
+}
+
+// noteConfigApplyFailure drives the time-based config-sync health signal on an
+// apply-failure edge (#6387). On the FIRST failure of an un-applied streak it
+// ARMS an independent grace-expiry timer (armConfigApplyGraceTimerLocked): the
+// config sender re-pushes a generation at most once per connection/generation
+// (daemon reconcileConfigSyncToPeer is level-triggered but idempotent), so a
+// STABLE connection with a single persistent apply failure receives NO second
+// delivery — the periodic reconcile is a no-op after the first push. Without
+// the timer the standby would stay silently stranded forever below the
+// threshold; the timer guarantees CF surfaces once the grace elapses even with
+// no further delivery.
+//
+// If a later re-delivery of the same generation DOES arrive (the high-water
+// never advanced on failure, so it is re-admitted) after the streak has
+// persisted STRICTLY longer than the grace, the on-edge fast path raises
+// immediately. Both the timer and the on-edge path funnel through
+// raiseConfigApplyHealthLocked, which is idempotent and epoch-guarded, so CF
+// raises at most once per streak. A transient failure that clears within the
+// grace never raises (noteConfigApplySuccess cancels the timer and resets the
+// streak) — no flap. Called from the single-consumer configApplyLoop; the
+// shared state is guarded by configApplyMu because the timer callback runs on
+// its own goroutine.
+func (s *SessionSync) noteConfigApplyFailure(applyErr error) {
+	now := s.nowMono()
+	reason := ""
+	if applyErr != nil {
+		reason = applyErr.Error()
+	}
+
+	s.configApplyMu.Lock()
+	defer s.configApplyMu.Unlock()
+	if s.firstUnappliedFailNano == 0 {
+		s.firstUnappliedFailNano = now
+		s.armConfigApplyGraceTimerLocked()
+	}
+	s.configApplyFailReason = reason
+	// On-edge fast path: raise immediately if a re-delivery arrives after the
+	// streak has already persisted STRICTLY longer than the grace. Strictly-
+	// greater per the #6387 contract — an elapsed exactly equal to the grace
+	// has not yet crossed the window (the grace-expiry timer, armed above,
+	// covers the boundary/no-redelivery case).
+	//
+	// #6398 fix: the OnConfigApplyHealth delivery happens WHILE STILL HOLDING
+	// configApplyMu. Serializing every raise and clear publish under the one
+	// mutex is what prevents a late raise from landing after a concurrent
+	// success has cleared CF (the callback-reorder race). The callback runs
+	// SetConfigSyncHealth, a cheap two-field setter under m.mu, so the fixed
+	// lock order configApplyMu → m.mu has no inverse and cannot deadlock.
+	if s.raiseWanted(now) {
+		s.raiseConfigApplyHealthLocked()
+		if s.OnConfigApplyHealth != nil {
+			s.OnConfigApplyHealth(true, reason)
+		}
+	}
+}
+
+// raiseWanted reports whether the un-applied streak has persisted strictly
+// longer than the grace and CF has not already been raised. Caller holds
+// configApplyMu.
+func (s *SessionSync) raiseWanted(now int64) bool {
+	if s.configApplyHealthRaised || s.firstUnappliedFailNano == 0 {
+		return false
+	}
+	return time.Duration(now-s.firstUnappliedFailNano) > s.configApplyGrace()
+}
+
+// raiseConfigApplyHealthLocked marks CF raised for the current streak. Caller
+// holds configApplyMu and fires OnConfigApplyHealth(true, reason) WHILE STILL
+// HOLDING that lock (#6398), so a raise cannot be reordered behind a concurrent
+// clear. Idempotent (callers gate on !configApplyHealthRaised).
+func (s *SessionSync) raiseConfigApplyHealthLocked() {
+	s.configApplyHealthRaised = true
+}
+
+// armConfigApplyGraceTimerLocked arms (or re-arms) the independent grace-expiry
+// timer for the current un-applied streak (#6387). Caller holds configApplyMu.
+// It stops any prior timer and bumps configApplyFailEpoch so an in-flight
+// callback from a superseded streak/connection cannot raise CF, guaranteeing no
+// timer/goroutine leak across re-arms.
+func (s *SessionSync) armConfigApplyGraceTimerLocked() {
+	s.stopConfigApplyGraceTimerLocked()
+	s.configApplyFailEpoch++
+	epoch := s.configApplyFailEpoch
+	s.configApplyFailTimer = s.afterFunc(s.configApplyGrace(), func() {
+		s.fireConfigApplyGraceExpiry(epoch)
+	})
+}
+
+// stopConfigApplyGraceTimerLocked stops and drops the grace-expiry timer.
+// Caller holds configApplyMu.
+func (s *SessionSync) stopConfigApplyGraceTimerLocked() {
+	if s.configApplyFailTimer != nil {
+		s.configApplyFailTimer.Stop()
+		s.configApplyFailTimer = nil
+	}
+}
+
+// stopConfigApplyGraceTimer stops the grace-expiry timer and invalidates any
+// in-flight callback (epoch bump), used on SessionSync teardown (Stop) so no
+// timer survives a comms restart. Safe to call with no timer armed.
+func (s *SessionSync) stopConfigApplyGraceTimer() {
+	s.configApplyMu.Lock()
+	s.stopConfigApplyGraceTimerLocked()
+	s.configApplyFailEpoch++
+	s.configApplyMu.Unlock()
+}
+
+// fireConfigApplyGraceExpiry is the grace-expiry timer callback (own
+// goroutine, #6387). It raises CF for the streak that armed it — no fresh
+// delivery required — unless a success or a re-arm has since advanced the epoch
+// (the cancelled-but-already-firing race) or CF is already raised. Idempotent.
+func (s *SessionSync) fireConfigApplyGraceExpiry(epoch uint64) {
+	s.configApplyMu.Lock()
+	defer s.configApplyMu.Unlock()
+	if epoch != s.configApplyFailEpoch || s.configApplyHealthRaised || s.firstUnappliedFailNano == 0 {
+		return
+	}
+	s.raiseConfigApplyHealthLocked()
+	// #6398 fix: deliver the raise WHILE STILL HOLDING configApplyMu so it
+	// cannot be reordered behind a concurrent noteConfigApplySuccess clear. If
+	// a success wins the lock first it bumps the epoch and this callback never
+	// runs (the guard above); if this callback wins, its raise is fully
+	// published before the success's clear can acquire the lock. Either
+	// interleaving leaves CF in the correct final state. See
+	// noteConfigApplyFailure for the lock-order (configApplyMu → m.mu) rationale.
+	if s.OnConfigApplyHealth != nil {
+		s.OnConfigApplyHealth(true, s.configApplyFailReason)
+	}
+}
+
+// noteConfigApplySuccess clears the config-sync health streak on a successful
+// apply (#6387). It cancels the grace-expiry timer, resets the streak, and
+// bumps the epoch so an in-flight timer callback becomes a no-op. It then
+// clears the node-global CF annotation UNCONDITIONALLY — NOT gated on this
+// instance's configApplyHealthRaised. A comms transport change tears down this
+// SessionSync but KEEPS the cluster Manager (daemon stopClusterComms), so a CF
+// raised by a PRIOR SessionSync instance would otherwise stay stuck forever:
+// the replacement instance records the applied generation but, gated on its own
+// never-set flag, would never clear the manager. An idempotent clear is cheap,
+// so the first successful apply on ANY instance re-converges the annotation.
+// Called from the single-consumer configApplyLoop; guarded by configApplyMu.
+func (s *SessionSync) noteConfigApplySuccess() {
+	s.configApplyMu.Lock()
+	defer s.configApplyMu.Unlock()
+	s.firstUnappliedFailNano = 0
+	s.configApplyFailReason = ""
+	s.stopConfigApplyGraceTimerLocked()
+	s.configApplyFailEpoch++
+	s.configApplyHealthRaised = false
+
+	// #6398 fix: deliver the clear WHILE STILL HOLDING configApplyMu. The epoch
+	// bump above invalidates any in-flight grace-expiry timer, and publishing
+	// the clear under the same mutex that serializes the raise sites guarantees
+	// a late raise callback cannot overtake this clear: a timer callback still
+	// parked on configApplyMu resumes only after this clear returns, sees the
+	// bumped epoch, and no-ops. Delivering the clear OUTSIDE the lock (the prior
+	// behavior) let a late raise land after it and leave the Manager stuck
+	// configSyncFailing=true after a successful apply.
+	if s.OnConfigApplyHealth != nil {
+		s.OnConfigApplyHealth(false, "")
+	}
+}
 
 // nextConfigGen draws the next strictly-monotonic config generation stamped
 // on an outgoing config-sync message (#3931). The counter is seeded from
@@ -152,11 +366,27 @@ func (s *SessionSync) configApplyLoop(ctx context.Context) {
 				// above (surfaced in cluster status), not this log.
 				slog.Debug("cluster sync: config apply failed — retaining prior high-water so the peer re-push re-converges",
 					"incoming_gen", item.gen, "last_applied_gen", s.lastAppliedConfigGen.Load(), "size", len(item.text), "err", err)
+				// #6387: drive the time-based CF health signal on this failure
+				// edge. On the FIRST failure of a streak it ARMS an independent
+				// grace-expiry timer that raises OnConfigApplyHealth(true) once
+				// the grace elapses even if no further config is delivered — the
+				// sender pushes a generation at most once per connection, so a
+				// stable connection with a persistent apply failure would
+				// otherwise never re-enter this edge. A standby stranded by a
+				// persistent apply failure thus surfaces as a CF monitor-failure /
+				// degraded health instead of only the terse `Transfer ready: no`
+				// string.
+				s.noteConfigApplyFailure(err)
 				// #6284: drop the fence — the high-water intentionally stays put
 				// (M-2/#4151), so restore the pre-apply admission posture.
 				s.endConfigApply()
 				continue
 			}
+			// #6387: a confirmed apply clears any raised CF health signal (the
+			// standby has re-converged). Fired on every success — including a
+			// gen==0 legacy apply that does not advance the high-water — since
+			// the host-inbound sub-step applied cleanly.
+			s.noteConfigApplySuccess()
 			// Apply confirmed — advance the high-water so a duplicate re-push of
 			// the same generation is correctly skipped as stale, THEN drop the
 			// fence. Advancing first keeps the effective refusal threshold

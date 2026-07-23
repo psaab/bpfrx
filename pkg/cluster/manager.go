@@ -317,6 +317,27 @@ type Manager struct {
 	// had already fired and is blocked on m.mu when Stop() runs cannot run an
 	// election on a stopped manager (#4716). Guarded by m.mu.
 	stopped bool
+
+	// configSyncFailing is a node-global DIAGNOSTIC health annotation raised
+	// when a received config-sync generation has stayed un-applied past the
+	// stale-duration grace (#6387). Config-sync apply hard-fails on the standby
+	// (e.g. a missing host-inbound enforcement dependency) leave the config
+	// high-water pinned (M-2/#4151), so the node is stuck `Transfer ready: no`
+	// with `applied gen=0` while looking "healthy" in the summary. This flag
+	// renders `CF` in the Monitor-failures column and flips Node health →
+	// degraded so the stranded standby is operator-visible.
+	//
+	// It is deliberately a DEDICATED manager-level field, NOT a "CF"-in-
+	// rg.MonitorFails sentinel: reconcileMonitorDebtsLocked (election.go) DELETES
+	// any MonitorFails entry that is neither a configured interface-monitor nor
+	// isIPMonitorName-true on EVERY UpdateConfig, so a sentinel would be wiped on
+	// the next commit. A dedicated field also can NEVER perturb
+	// Weight/monitorWeights/readiness/election — a config-apply failure is
+	// node-global and must only annotate health, never demote priority or gate
+	// failover (manual failover stays gated solely by ConfigStale(); crash
+	// takeover stays ungated). Set via SetConfigSyncHealth; guarded by m.mu.
+	configSyncFailing    bool
+	configSyncFailReason string // bounded/sanitized, never a raw apply error
 }
 
 type peerGroupSnapshot struct {

@@ -1,3 +1,148 @@
+## 2026-07-23 — #6396 codex-179 review residuals (3 low-risk hardenings)
+
+- **Timestamp**: 2026-07-23 (fix/6396-hardening-residuals)
+- **Action**: Implemented the three in-Go-scope #6396 residuals from the
+  codex-179 #6394 review, each with a firsthand-verified fail-on-revert test.
+  (1) SNMP ifTable warn flood — `buildSNMPIfData` (`pkg/daemon/
+  daemon_snmp_reconcile.go`) now rate-limits its netlink-failure `slog.Warn`
+  via a reusable `warnThrottle` (once per minute; first failure logs, later
+  ones in the window are counted + reported with the next line; a successful
+  read logs a one-time recovery). buildSNMPIfData runs once per SNMP poll, so a
+  persistent failure previously wrote one line per poll. (2) xfrm post-create
+  readback TOCTOU (`pkg/routing/xfrm.go`) — the `LinkByName` right after
+  `LinkAdd` now re-asserts the link is an `*netlink.Xfrmi` with the desired
+  `if_id` before bring-up/track, matching the adopt-path guard (#5523
+  C179-104); a same-name foreign or wrong-if_id link substituted in the
+  add→readback window is rejected (commit fails closed, next reconcile
+  reclaims). Both substitution shapes covered. (3) archive rotation edges
+  (`pkg/configstore/store_persist.go`) — `parseArchiveSeq` now requires the
+  two-dot current `config-<ts>.<seq>.conf` shape so a legacy pre-#3441
+  `config-<ts>.conf` (trailing nanoseconds) is no longer mis-read as a huge
+  seq in a mixed dir; `SetArchiveConfig` re-seeds the monotonic counter on ANY
+  archive-dir change (monotonic-up only), not just at process start, so a
+  runtime switch to a previously-used dir cannot let its higher-seq archives
+  outrank the ones this process writes. Scoped OUT: the SetIfDataFn error-
+  channel contract change and the best-effort RETH-MAC / CLI-display LinkList
+  swallows (issue defers as "remain"); the synchronous `ArchiveConfig` mirror's
+  target-dir seeding (zero production callers, shared-counter design).
+- **File(s)**: pkg/daemon/daemon_snmp_reconcile.go,
+  pkg/daemon/daemon_snmp_ifdata_throttle_6396_test.go,
+  pkg/daemon/daemon_snmp_ifdata_netlink_5523_test.go, pkg/routing/xfrm.go,
+  pkg/routing/iface_reuse_test.go, pkg/routing/xfrm_nonxfrmi_reject_5523_test.go,
+  pkg/configstore/store_persist.go, pkg/configstore/archive_6396_test.go,
+  pkg/configstore/archive_rotate_seq_5523_test.go, pkg/snmp/README.md,
+  pkg/configstore/README.md, pkg/routing/README.md
+- **Validation**: gofmt/build/vet clean on the three touched pkgs; full
+  `go test ./pkg/daemon ./pkg/routing ./pkg/configstore` GREEN; fail-on-revert
+  confirmed firsthand for all four fixes (SNMP throttle → 20 warns for 20
+  polls; xfrm readback → Apply returns nil + adopts foreign link; parseArchive
+  legacy → nanoseconds parsed as seq + legacy retained over current; dir-switch
+  reseed → counter stuck at old dir's max), then restored GREEN.
+
+- **Timestamp**: 2026-07-23 (fold on PR #6399, review MERGE-NEEDS-MINOR)
+- **Action**: Folded the Claude-hostile-review completeness MINOR: the xfrm
+  post-create readback guard had structurally-identical UNGUARDED siblings in
+  the same package. (a) createLinkedVRF (pkg/routing/vrf.go) now re-asserts the
+  post-LinkAdd readback is an netlink.Vrf carrying the desired table before
+  bring-up; on mismatch it returns (added=true, err) so the caller keeps
+  ownership and the reconcile adopt path (vrfTable → recreate on table
+  mismatch) reclaims a substitute next cycle. (b) createBond
+  (pkg/routing/bond.go) now re-asserts the readback is an netlink.Bond before
+  enslaving/bring-up: enslaveMembers only surfaces a foreign substitute via a
+  real-netlink LinkSetMaster failure when a member is enslavable, so a bond
+  whose configured members are all absent (the #4823 soft-error case) would
+  otherwise adopt a foreign link — the type check closes that for every member
+  state. Added substituteAfterAdd seams to fakeVRFOps + fakeBondLinkOps and
+  three VRF + one bond fail-on-revert tests (RED→GREEN confirmed firsthand:
+  VRF non-Vrf + wrong-table → Apply nil + brought up; bond foreign readback →
+  tracked + created). Routing README identity-re-assertion invariant
+  generalized to cover xfrm + VRF + bond (correcting the prior xfrm-only
+  scope-out).
+- **File(s)**: pkg/routing/vrf.go, pkg/routing/bond.go,
+  pkg/routing/routing_test.go, pkg/routing/bond_test.go,
+  pkg/routing/readback_guard_6396_test.go, pkg/routing/README.md
+
+- **Timestamp**: 2026-07-23 (re-gate fold on PR #6399, Codex MERGE-NEEDS-MAJOR)
+- **Action**: Folded the adjudicated Codex6399 findings (all complete the 4
+  stated fixes; not new scope). MAJOR 1 — xfrm ParentIndex identity: xpf
+  creates every xfrmi PARENTLESS, so a same-name/same-if_id xfrmi bound to a
+  NONZERO parent (IFLA_XFRM_LINK, selects egress) passed both the #5523 adopt
+  guard and the #6396 post-create guard and would egress SA traffic out the
+  wrong device. Extended BOTH guards to also assert
+  xi.Attrs().ParentIndex==0. MINOR 3 — xfrm stale-ownership: on a rejected
+  post-create readback, delete(x.xfrmis, ifName) so a pre-tracked name cannot
+  leave a later reconcile acting on a foreign substitute. MINOR 4 — archive
+  reseed scan-error: maxArchiveSeq now returns (uint64, error) via an
+  archiveDirReader seam; SetArchiveConfig keys the reseed off a new
+  archiveSeedDir (last successfully-scanned dir) and, on a ReadDir error,
+  leaves the counter unchanged AND the dir un-seeded so the next call retries
+  — a transient scan failure no longer pins the counter below the on-disk max
+  forever. MINOR 6 — SNMP recovery bound: added a fail-on-revert test
+  (attrCapturingHandler) asserting the recovery slog.Info fires once with the
+  correct suppressed_failures count after a failing→succeeding transition.
+  Test quality (item 5) — dir-switch test now proves a real archive SURVIVES
+  rotation (reseeded seq outranks pre-existing; oldest pruned) instead of
+  asserting the private counter. README (MAJOR 2) — bond scope-out made
+  explicit: create-path gated here, ADOPT path deferred to #6402 (HA-touching,
+  must validate mode/MTU not just type; loss-cluster smoke). Added a mode/MTU
+  note to #6402. DEFERRED — ArchiveConfig ordering race (Codex MINOR 5): zero
+  production callers; holding s.mu across the off-lock write reintroduces the
+  #6185 QuiesceArchival deadlock, so NOT trivial — reported for a follow-up,
+  not folded.
+- **File(s)**: pkg/routing/xfrm.go,
+  pkg/routing/xfrm_nonxfrmi_reject_5523_test.go, pkg/configstore/store.go,
+  pkg/configstore/store_persist.go, pkg/configstore/archive_6396_test.go,
+  pkg/daemon/daemon_snmp_reconcile.go,
+  pkg/daemon/daemon_snmp_ifdata_throttle_6396_test.go,
+  pkg/routing/README.md, pkg/configstore/README.md
+- **Validation**: gofmt/build/vet clean on the three touched pkgs; full
+  `go test ./pkg/routing ./pkg/configstore ./pkg/daemon` GREEN; fail-on-revert
+  confirmed firsthand for every new fold (ParentIndex adopt+create → adopted
+  not recreated / Apply nil; stale-ownership → xfrmis[name] persists;
+  scan-error → counter stuck at 5 not caught up to 202; SNMP recovery → 0
+  recovery logs; strengthened dir-switch → reseed neutralized fails the
+  rotation-survival assertion), then restored GREEN.
+
+- **Timestamp**: 2026-07-23 (convergence round on PR #6399, Codex 3rd MAJOR)
+- **Action**: Converged #6399 — kept the Codex-verified core, honestly
+  deferred the bond validation rabbit-hole. FOLDED (Codex MINOR 4): xfrm
+  LinkAdd-FAILURE stale ownership — the genuine create-failure exit
+  (xfrm.go:259) now also `delete(x.xfrmis, ifName)` so a pre-tracked name
+  whose recreate fails does not leave the removal pass able to delete a
+  foreign link that later wears the name; test
+  TestXfrmCreateLinkAddFailureDropsStaleTracking (PRE-TRACKED manager +
+  addFail), fail-on-revert firsthand RED (xfrmis=map[st0.1:2] persists) →
+  restored GREEN. DEFERRED to #6402 (HA-touching, NOT folded): bond identity
+  residuals — README (pkg/routing/README.md) now honestly enumerates all
+  three (create-path mode/MTU, adopt-path type+mode+MTU, KEEP-path identity
+  bond.go:181) as deferred; kept the create-path `*netlink.Bond` type guard
+  (net improvement). Updated #6402 to cover all three. DEFERRED to NEW #6404
+  (NOT folded): archive reseed edges (Codex MINOR 2 commit-interval race at
+  store_commit.go:284 + MINOR 3 disable/re-enable A→""→A skip); corrected the
+  configstore README's "ANY archive-dir change" wording to what is actually
+  guaranteed (re-seeds on a dir DIFFERENT from the last successfully-seeded
+  one) and cited #6404.
+- **File(s)**: pkg/routing/xfrm.go,
+  pkg/routing/xfrm_nonxfrmi_reject_5523_test.go, pkg/routing/README.md,
+  pkg/configstore/README.md
+- **Validation**: gofmt/build/vet clean; full
+  `go test ./pkg/routing ./pkg/configstore ./pkg/daemon` GREEN; new
+  LinkAdd-failure fold fail-on-revert verified firsthand this round; the
+  ParentIndex/readback/scan-error/SNMP guards (unchanged this round) verified
+  in the prior fold round.
+
+- **Timestamp**: 2026-07-23 (doc-honesty round on PR #6399, Codex MINOR)
+- **Action**: Two doc-summary honesty qualifications, NO code/test change.
+  (1) pkg/routing/README.md — the "Identity re-assertion" summary claimed all
+  three managers reject right-type/wrong-discriminator readbacks; qualified to
+  match the honest per-manager detail below it (xfrm type+Ifid+ParentIndex==0,
+  VRF type+table, bond TYPE ONLY — mode/MTU + adopt/KEEP-path deferred to
+  #6402). (2) pkg/configstore/README.md — the seq monotonicity / no-overwrite
+  summary retained unconditional guarantees its own #6404 exceptions
+  contradict; qualified to "after a successful reseed scan and outside the two
+  #6404-deferred windows". Production .go byte-identical to f36c2c814.
+- **File(s)**: pkg/routing/README.md, pkg/configstore/README.md
+
 ## 2026-07-23 — #5583 C180: fold two Codex MAJOR findings into #6383
 
 - **Timestamp**: 2026-07-23 (fix/5583-codex180, fold on PR #6383)
@@ -58762,6 +58907,59 @@ top.
     pkg/configstore/rollback_size_cap_5557_test.go, _Log.md
 
 - **Timestamp**: 2026-07-23
+  **Action**: #6387 PR-1 — surface persistent config-sync APPLY failure as a
+    node-global `CF` config-sync monitor-failure / degraded health (time-based,
+    election-neutral, survives reconcileMonitorDebtsLocked). configApplyLoop
+    fires `OnConfigApplyHealth` off the failure/success edges past a 30s
+    stale-duration grace; daemon translates to `Manager.SetConfigSyncHealth`;
+    FormatStatus folds `CF`, FormatInformation degrades node health + adds a
+    `Config sync: failing (<reason>)` line. Diagnostic only — not a failover
+    gate. Parent-RED verified (raise + reconcile-survival). Does NOT touch the
+    netlink migration (PR-2/PR-3).
+  **File(s)**: pkg/cluster/manager.go, pkg/cluster/readiness.go,
+    pkg/cluster/sync.go, pkg/cluster/sync_conn_config.go, pkg/cluster/status.go,
+    pkg/cluster/sync_config_health_6387_test.go, pkg/daemon/daemon_ha_sync.go,
+    docs/sync-protocol.md, docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6387 PR-1 (PR #6398) MERGE-NEEDS-MAJOR fixes — config-sync
+    apply-failure CF monitor-failure. BUG 1: raise now driven by an independent
+    grace-expiry timer armed on the first failure (armConfigApplyGraceTimerLocked
+    → time.AfterFunc, afterFuncFn test seam) so a stable connection with one
+    persistent apply failure raises CF with no second delivery; on-edge check
+    fixed to strictly-greater (> grace); epoch-guard + configApplyMu protect the
+    cancelled-but-already-firing race; timer stopped on Stop(). BUG 2:
+    noteConfigApplySuccess clears CF UNCONDITIONALLY (idempotent) so a fresh
+    SessionSync after a comms restart clears a CF the prior instance raised on
+    the shared Manager. Rewrote raise test (timer-driven, no 2nd delivery), added
+    comms-restart clear test + timer-cancel/no-flap+goroutine-leak assertions;
+    parent-RED verified for both fixes.
+  **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
+    pkg/cluster/sync_conn_config.go, pkg/cluster/sync_config_health_6387_test.go,
+    docs/sync-protocol.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6387 PR-1 (PR #6398) review fix — callback-reorder race in the
+    config-sync CF monitor-failure signal. Both hostile reviewers (Codex +
+    independent) converged on the same defect: OnConfigApplyHealth was delivered
+    OUTSIDE configApplyMu in the timer-raise (fireConfigApplyGraceExpiry) and the
+    success-clear (noteConfigApplySuccess) paths, so a timer raise callback
+    preempted between deciding-to-raise and delivering could land AFTER a
+    concurrent success cleared CF — leaving the Manager stuck
+    configSyncFailing=true after a successful apply (the epoch guard only covers
+    decision-time staleness, not the two out-of-lock deliveries). Fix: deliver
+    every OnConfigApplyHealth publish (timer raise, on-edge raise, success clear)
+    WHILE STILL HOLDING configApplyMu, serializing raise vs clear. Verified the
+    fixed lock order configApplyMu → m.mu (SetConfigSyncHealth is a cheap
+    two-field setter, no callback) has no inverse — nothing takes m.mu then a
+    configApplyMu path. Added TestConfigSyncHealthRaiseClearReorderSerialized
+    (forces the hostile interleave deterministically via the callback as the
+    seam); parent-RED verified (reverting to out-of-lock delivery → RED with the
+    stuck-CF assertion). pkg/cluster/... -race clean, pkg/daemon clean.
+    pkg/dataplane/userspace event-stream failures are PRE-EXISTING on
+    origin/master (verified in a detached worktree), unrelated to this change.
+  **File(s)**: pkg/cluster/sync_conn_config.go,
+    pkg/cluster/sync_config_health_6387_test.go, docs/sync-protocol.md, _Log.md
   **Action**: #6395 — bound the shutdown session-aggregation final-flush join so
     a stalled syslog sink cannot delay the HA takeover fence. `stopAggregator`
     (pkg/daemon/daemon_system.go) previously did `cancel(); d.aggWg.Wait()` — an
@@ -58981,3 +59179,52 @@ top.
     atomic (lock-free) marking + the lock-ordering rationale.
   - **File(s)**: pkg/api/listener.go, pkg/api/README.md,
     pkg/api/serve_exit_wait_deadlock_6401_test.go, _Log.md
+  - **Action**: #6391 host-inbound sibling-isolation regression guard +
+    doc. STEP-0 firsthand finding: the host-inbound sibling LEAK the issue
+    describes is NOT present on current master (a00aa3cd9). PR #6389 (the
+    `zoneInterfaceMembers` fanout that leaked) was CLOSED unmerged;
+    `compileZones` keys the per-interface override strictly on `iface.Name()`
+    (the direct child the stanza is written under), so a bracket sibling never
+    inherits it. Verified across 6 shapes (flat-set first/later member,
+    3-member, multi-service ssh+ping, hierarchical nested-child, hierarchical
+    bracket-with-body): only the named interface carries the override in every
+    case. Since master is already fail-safe, this ships the missing REGRESSION
+    GUARD rather than a behavior fix. Added
+    `compiler_zone_iface_hostinbound_sibling_6391_test.go` (7 tests) pinning
+    sibling isolation across all 5 symmetric surfaces the issue enumerates plus
+    a no-shared-backing-store aliasing guard. Fail-on-revert demonstrated
+    FIRSTHAND: re-applying the exact #6389 fanout turns 5 of the cases RED with
+    clean ASSERTION failures (sibling `ge-0/0/1`/`ge-0/0/2` wrongly gets
+    `[ssh]`/`[ping ssh]`); restoring master -> all GREEN, compiler byte-identical
+    to master. Documented the sibling-isolation invariant + why the #6389 fanout
+    is unsound (flat-set single-scoped and hierarchical multi-member compile to
+    the same AST) in docs/config-schema.md. build + vet + gofmt clean; full
+    `go test ./pkg/config/` GREEN.
+  - **File(s)**: pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6400 review-fold — folded 3 Codex MINORs on the #6391
+    host-inbound sibling-isolation guard (production still byte-identical to
+    master; test/doc quality only). (1) Assertion completeness: the guard
+    helper compared only sorted SystemServices, dropping Protocols — a fanout
+    leaking host-inbound `protocols` (ospf/bgp) to a sibling would slip past.
+    Reworked `compileHostInbound6391` to return the FULL per-interface map keyed
+    on a `hib6391{SystemServices,Protocols}` view (both dimensions, every key),
+    so cardinality + protocols are asserted; extended the aliasing test with a
+    whole-map cardinality assertion; added
+    `TestHostInbound6391ProtocolsNoSiblingLeak` (ssh + ospf under the first
+    member) so the Protocols dimension is exercised by fail-on-revert. (2)
+    Prose overclaim: reworded the test-header + docs "every case goes RED" to the
+    accurate split — the six container-sharing cases (first-member, three-member,
+    multi-service, protocols, hierarchical nested-child, hierarchical
+    bracket-body) go RED, later-member + no-shared-backing-store stay GREEN
+    controls. (3) Doc self-contradiction: qualified config-schema.md that a
+    bracketed member cannot carry host-inbound in FLAT-SET / canonical `set`
+    syntax — the `[ a b ] { host-inbound }` shape is reachable only via a
+    raw-hierarchical `load override` parse. Re-verified: #6389 fanout →
+    6 RED / 2 GREEN controls; full `go test ./pkg/config/` GREEN; vet + gofmt
+    clean; compiler_security_zones.go byte-identical to master. Kept "Advances
+    #6391" (no close keyword).
+  - **File(s)**: pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+    docs/config-schema.md, _Log.md

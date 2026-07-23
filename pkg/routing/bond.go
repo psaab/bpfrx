@@ -312,6 +312,23 @@ func (b *bondManager) createLocked(name string, ifc *config.InterfaceConfig, sig
 		return fmt.Errorf("bond %s: find after create: %w", name, err)
 	}
 
+	// #6396: re-assert the post-create readback is the bond we just created
+	// before enslaving members and bringing it up. A same-name foreign link
+	// substituted in the add→readback window is only caught by enslaveMembers
+	// (via a real-netlink LinkSetMaster failure) when at least one member is
+	// actually enslavable; a bond whose configured members are all currently
+	// absent (the #4823 soft-error enumeration case) enslaves nothing, so no
+	// LinkSetMaster fires and the foreign link would be brought up and tracked
+	// as a satisfied bond. The explicit type re-assertion closes that hole for
+	// every member state. Fail the commit closed on the mismatch; the bond is
+	// left untracked so the next reconcile retries.
+	if _, ok := bondLink.(*netlink.Bond); !ok {
+		slog.Warn("bond readback after create is not a bond interface",
+			"name", name, "type", bondLink.Type())
+		return fmt.Errorf("bond %s: readback after create is %s, not a bond",
+			name, bondLink.Type())
+	}
+
 	enslaved, errs := b.enslaveMembers(name, bondLink, ifc.FabricMembers, nil)
 	if err := b.ops.LinkSetUp(bondLink); err != nil {
 		slog.Warn("failed to bring up bond", "name", name, "err", err)

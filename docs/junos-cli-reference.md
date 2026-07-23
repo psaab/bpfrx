@@ -2097,7 +2097,13 @@ node1  0        primary              no      no       IF
 - **RG header:** `Redundancy group: <N> , Failover count: <N>` (note space before comma).
 - **Node entries:** Fixed columns matching header.
   - Status: `primary`, `secondary`, `hold`, `lost`, `disabled`.
-  - Monitor-failures: `None` or failure code(s) like `IF`.
+  - Monitor-failures: `None` or failure code(s) like `IF`. `CF` (Config Sync
+    monitoring) appears node-globally on every RG row when a received config-sync
+    generation has stayed un-applied past the stale-duration grace (#6387) — a
+    persistent config-apply failure that leaves the standby stuck
+    `Transfer ready: no`. It is diagnostic only (also degrades `Node health` and
+    adds a `Config sync: failing (<reason>)` line under `show chassis cluster
+    information`); it never gates failover.
 - Blank line between redundancy groups.
 
 ---
