@@ -226,8 +226,15 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			break
 		}
 		if s.bulkRecvEpoch != epoch {
+			// #5718 (codex-182 C-HA C01b): snapshot the mutex-protected
+			// expected epoch BEFORE releasing bulkMu. Reading s.bulkRecvEpoch
+			// in the log arguments after Unlock races a concurrent BulkStart
+			// on another fabric receive loop (which writes bulkRecvEpoch under
+			// bulkMu, sync_conn_read.go BulkStart handler) — a diagnostic-only
+			// data race the Go memory model forbids and go test -race flags.
+			want := s.bulkRecvEpoch
 			s.bulkMu.Unlock()
-			slog.Warn("cluster sync: ignoring BulkEnd with mismatched epoch", "expected", s.bulkRecvEpoch, "got", epoch)
+			slog.Warn("cluster sync: ignoring BulkEnd with mismatched epoch", "expected", want, "got", epoch)
 			break
 		}
 		s.bulkMu.Unlock()

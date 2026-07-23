@@ -57930,6 +57930,56 @@ top.
     pkg/api/tls_test.go, pkg/api/README.md
 
 - **Timestamp**: 2026-07-23
+  **Action**: #5718 (cohort codex-182 C-HA) — fix the two independent
+    diagnostic-race survivors. C01b: the syncMsgBulkEnd mismatch-epoch
+    handler read s.bulkRecvEpoch in its slog.Warn args AFTER releasing
+    s.bulkMu, racing a concurrent BulkStart write under bulkMu — snapshot
+    `want := s.bulkRecvEpoch` before Unlock, log the snapshot. C01c:
+    Manager.Status() formatted vi.cfg.Priority/Preempt/AdvertiseInterval/
+    VirtualAddresses under only m.mu.RLock, racing a failover
+    UpdateRGPriority write under vi.mu.Lock — snapshot the cfg fields under
+    vi.mu.RLock before formatting, mirroring advertInterval/getPriority
+    (#6230). Both are diagnostic-only (log/status output byte-identical),
+    go test -race flags the unfixed reads. Added fail-on-revert -race tests
+    (RED verified: DATA RACE + FAIL on revert). Deferred C01a (process-
+    sticky heartbeat-ACK capability — heartbeat-wire + peer-incarnation
+    coupled to #5480/#6169/anti-replay) and A6-b01-C1 (worker clamp cast —
+    pkg/dataplane/userspace, out of cluster/daemon scope). go vet + gofmt
+    clean; ./pkg/cluster/... ./pkg/vrrp/... ./pkg/daemon/... green.
+  **File(s)**: pkg/cluster/sync_conn_read.go,
+    pkg/cluster/bulkend_epoch_log_race_5718_test.go, pkg/vrrp/manager.go,
+    pkg/vrrp/status_config_race_5718_test.go
+
+- **Timestamp**: 2026-07-23
+  **Action**: #5718 (cohort codex-182 C-HA) — strengthen the two
+    fail-on-revert -race gates and correct one comment; production race
+    fixes (sync_conn_read.go BulkEnd snapshot, manager.go Status snapshot)
+    left byte-identical. FINDING 1 (Codex MINOR): the original gates
+    launched a finite writer goroutine WITHOUT an overlap barrier, so the
+    writer could finish before the reader started → no concurrent access →
+    false GREEN on revert (Codex saw the reverted VRRP test PASS under
+    GOMAXPROCS=1 and one cluster false-green). Rewrote BOTH tests with a
+    `start` barrier releasing writer+reader together and a writer that LOOPS
+    mutating the raced field(s) under its proper lock until the reader
+    signals `done`, guaranteeing overlap for the whole reader window.
+    FINDING 2 (Codex): widened the VRRP writer to also mutate Preempt and
+    AdvertiseInterval (not just Priority) under vi.mu.Lock, so a revert of
+    ANY of the three genuinely-raced snapshot fields is caught. FINDING 3
+    (Claude nit): reworded the manager.go Status snapshot comment (and the
+    VRRP test doc string) — VirtualAddresses is IMMUTABLE per instance (a
+    VIP change rebuilds the instance under m.mu.Lock; instance_addr.go
+    vipAddrSet / instance.go vipFamilies), so reading it under only
+    m.mu.RLock was already race-free; it is deep-copied defensively, not as
+    part of this race. VALIDATION (TMPDIR=/dev/shm short-path, -race):
+    build+vet+gofmt clean. GREEN with fix at -count=10 under both default
+    and GOMAXPROCS=1. RED-on-revert proven with independent-process runs
+    (Go -race dedups repeat reports across -count iterations, so per-process
+    exit is the true signal): cluster BulkEnd snapshot revert 6/6
+    DATA RACE+FAIL; VRRP full snapshot revert 8/8; Preempt-only revert 6/6;
+    AdvertiseInterval-only revert 6/6 — all GOMAXPROCS=1, zero false greens.
+    Fixes restored; final tree = test files + comment only.
+  **File(s)**: pkg/cluster/bulkend_epoch_log_race_5718_test.go,
+    pkg/vrrp/status_config_race_5718_test.go, pkg/vrrp/manager.go
   - **Action**: #5720 C-TOOLS cohort triage — fixed 5 low-risk tooling
     survivors from codex-review-182; dispositioned 2 out-of-scope. C01: extend
     `analyzePolicyShadowing` to also lint the global-policy list
