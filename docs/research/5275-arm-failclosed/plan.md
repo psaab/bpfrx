@@ -3,13 +3,13 @@
 - **Issue:** #5275 (HIGH; bug, dataplane, security, vsrx-parity)
 - **Research branch:** `research/5275-arm-failclosed`
 - **Base:** origin/master @ `6131eb4e6`
-- **Revision:** r10 (Codex r8 confirmed D1–D4 correct; r10 grounds D5 in the SHIPPED
-  preserved-address crash recovery — `reconcileDirectVIPOwnership` + `surfaceStaleVIP`
-  #5482 — so the crash-restart handoff is "no worse than the existing xpfd-crash
-  window", scopes the live path to zero-publication-after-fast-fence, and flags the ONE
-  genuine operations tradeoff (accept-existing-window vs external STONITH) for human
-  sign-off; also fixes the §5 facade-OPEN omission. Architecture VIABLE across six
-  consecutive Codex rounds; D1–D4 Codex-accepted.)
+- **Revision:** r11 (Codex r9 confirmed D1–D4 + D5(b)-live + the §5 facade fix + the
+  STONITH tradeoff, and isolated ONE fix: the crash-restart path must NOT yield-before-
+  scrub. r11 UNIFIES the yield gate across both paths — a node never publishes its first
+  weight-zero until it has synchronously removed+verified its VIP/stable-link-local/Kea,
+  and a failed scrub keeps it sender-silent (no accelerated takeover) — and makes §3/§12/
+  D5(c) consistent. Architecture VIABLE across six Codex rounds; D1–D4 + D5(b) + facade
+  Codex-accepted.)
 - **Prior art:** PR #6358 (draft) — MERGE-NEEDS-MAJOR. Superseded.
 - **Status:** PLAN-READY candidate (research only — no production code;
   `/engineer 5275`).
@@ -95,15 +95,15 @@ must run a **verified withdrawal-only scrub BEFORE it advertises yield**:
   cannot diverge the cluster, yet it can still accept a corrected candidate for the
   next restart.
 
-**Withdrawal-scrub failure has a safe branch (Codex r5 hole):** if the verified
-withdrawal of inherited VIP/RA/Kea/FRR FAILS, withholding the explicit yield does
-NOT stop the peer's timeout promotion, and the nft transit barrier does not suppress
-stale VIP/Kea/FRR *ownership/attraction*. So a failed scrub MUST escalate to a
-proved-down / service-fenced fallback (administratively down the affected
-data/service surface + stop Kea + clear FRR, each verified) BEFORE the peer can take
-over — never a "logged and continue". The nft barrier (§6) stops transit but NOT
-attraction / dual service ownership, which is why the scrub + this fallback are
-required in addition to the barrier.
+**Withdrawal scrub gates the yield (Codex r5 hole + r9 refinement):** the inherited
+VIP + stable link-local + Kea are withdrawn SYNCHRONOUSLY and VERIFIED **before** this
+node publishes its first weight-zero yield (the unified §13-D5(c) gate). If that scrub
+FAILS, the node does NOT publish weight-zero — it stays sender-silent and falls back to
+the pre-existing peer-timeout window (it must never yield-before-scrub, which would let
+the peer promote onto un-withdrawn state). The nft barrier (§6) stops transit but NOT
+attraction / dual service ownership, which is why the synchronous VIP+link-local+Kea
+scrub gating the yield is required in addition to the barrier. FRR route de-dup is
+async (availability/ECMP behind the barrier, not an ownership defect).
 
 ---
 
@@ -468,22 +468,31 @@ resolved below with a recommended choice (the human approves/overrides at `/engi
   EXISTING mechanism, the live case needs a small new gate.
 
   **(a) Former-primary CRASH restart — reuse the SHIPPED preserved-address recovery;
-  #5275 adds only "never re-claim".** When only `xpfd` crashes but the kernel keeps
-  the NODAD VIPs, the design ALREADY treats this as a known duplicate-address hazard:
-  `reconcileDirectVIPOwnership` runs EVERY tick because "the kernel preserves NODAD
-  addresses across daemon restarts, so stale addresses can exist without a state
-  transition" (daemon_ha.go:910), and `surfaceStaleVIP` (#5482, instance_vip.go)
-  self-heals a failed VIP removal with a bounded async retry. On such a crash the peer
-  correctly promotes (its GARP wins the hosts' ARP to the peer's MAC) — this is the
-  SAME transient duplicate-address/ECMP window ANY `xpfd` crash has today, NOT a
-  #5275 regression, and a truly-dead box has no reachable VIPs at all. #5275's ONLY
-  addition on this path: the arm-failed restart (i) NEVER re-claims ownership
-  (weight-zero yield, never re-advertise) and (ii) scrubs its stale VIP/RA/Kea/FRR via
-  the SAME existing reconcile/`surfaceStaleVIP` convergence. So the contract is "no
-  WORSE than the existing crash-recovery window", which the reconcile loop + peer GARP
-  already bound. A ZERO-window guarantee is impossible without external
-  **STONITH-style fencing** (a power/port fence the surviving peer controls) — that is
-  a separate operator/hardware decision, called out below as the human sign-off.
+  #5275 must NOT accelerate takeover ahead of the scrub (Codex r9).** When only `xpfd`
+  crashes but the kernel keeps the NODAD VIPs, the design ALREADY treats this as a known
+  duplicate-address hazard: `reconcileDirectVIPOwnership` runs EVERY tick because "the
+  kernel preserves NODAD addresses across daemon restarts, so stale addresses can exist
+  without a state transition" (daemon_ha.go:910), and `surfaceStaleVIP` (#5482,
+  instance_vip.go) retries a failed VIP removal (a bounded RETRY budget — 5 delayed
+  retries — not guaranteed convergence). A truly-dead box has no reachable VIPs; when
+  the peer times out and promotes, its GARP steers hosts to the peer.
+  - **The #5275 hazard Codex r9 found:** with a LONG (valid) heartbeat timeout, the
+    crashed primary can RESTART before the peer times out. TODAY that node re-elects as
+    sole owner → NO dual ownership. Under a naive yield, the arm-failed restart would
+    publish weight-zero WHILE its inherited VIP/Kea still exist, and the peer promotes
+    IMMEDIATELY on receiving weight-zero (heartbeat_manager.go:293 → election.go:138,
+    peer-weight-0 promotes) → dual VIP + dual DHCP before the async scrub — an overlap
+    #5275 would CREATE by accelerating takeover. That is not excused by the STONITH
+    tradeoff.
+  - **Fix (unify with (b)): the FIRST weight-zero yield — on the crash-restart path
+    TOO — is gated on the SYNCHRONOUS, verified removal of the owned VIP + stable
+    link-local + the Kea stop.** The arm-failed restart scrubs those synchronously
+    BEFORE it publishes any weight-zero; only then does it yield. **If the synchronous
+    scrub FAILS, it does NOT publish weight-zero** — it stays sender-silent and falls
+    back to the PRE-EXISTING peer-timeout window (so #5275 never accelerates takeover
+    into an un-scrubbed state; it is then "no worse than the existing crash window",
+    which the human accepts or replaces with STONITH). Only FRR route de-dup is async
+    (availability/ECMP behind the §6 barrier, not an ownership-safety defect).
 
   **(b) Live re-arm (a RUNNING primary loses its dataplane) — gate zero-publication on
   completed fast fencing.** Here the node IS running and controls its actions, but the
@@ -498,19 +507,28 @@ resolved below with a recommended choice (the human approves/overrides at `/engi
   `SendLivenessKeepalive` with an ack + a bounded lease, dead node still promotes on
   expiry) is a follow-up, not required for safety.
 
-  **(c) State machine + reconciliation:** define `armed → (arm-verify fails) → fencing
-  → armFailed` with the arm-coverage proof (§5) as the failure detector; crash-mid-fence
-  degrades to path (a). §3/§12 "verified withdrawal before yield" is scoped to the LIVE
-  path (b) — synchronous VIP + Kea — while the crash path (a) reuses the existing
-  reconcile convergence (a dead node cannot verify anything; the peer's GARP + the
-  restart scrub own it). `pkg/cluster` + `pkg/vrrp` (the zero-pub-after-fence gate) and
-  the scrub sequencing are the §13-D5 deliverables.
+  **(c) State machine + the UNIFIED yield gate:** define `armed → (arm-verify fails) →
+  fencing → armFailed` with the arm-coverage proof (§5) as the failure detector. The
+  **invariant is uniform across BOTH (a) and (b):** a node NEVER publishes its first
+  weight-zero yield until it has SYNCHRONOUSLY removed + verified its owned VIP + stable
+  link-local + stopped Kea; on scrub failure it stays sender-silent (no accelerated
+  takeover). This is what §3/§12 "verified withdrawal before yield" means, and it now
+  applies to the crash-restart first-yield too (correcting r10's incorrect exclusion) —
+  a dead node that never restarts is the pre-existing timeout window (the human
+  accepts-or-STONITH), but a node that DOES restart must not yield-before-scrub. Only
+  FRR route de-dup is async (availability/ECMP behind the barrier). `pkg/cluster` +
+  `pkg/vrrp` (the sticky `fencing` state that gates the first zero-publication and
+  prevents VIP re-addition / queued Kea restart) + the scrub sequencing are the §13-D5
+  deliverables.
 
-  **HUMAN SIGN-OFF (D5):** accept "crash-restart handoff is no worse than the existing
-  `xpfd`-crash window (reconcile + GARP + surfaceStaleVIP bound it)" — RECOMMENDED, no
-  new hardware — **versus** adding external STONITH fencing for a zero dual-address
-  window (new operational/hardware dependency). This is the one #5275 decision that is
-  a genuine operations tradeoff, not a code detail.
+  **HUMAN SIGN-OFF (D5):** with the unified yield gate in place (a node never yields
+  before its synchronous scrub, and a failed scrub keeps it sender-silent), #5275 never
+  ACCELERATES takeover into an un-scrubbed state. The residual is the pre-existing case
+  where the node is TRULY DEAD (never restarts) and the peer's ordinary timeout expires
+  with the kernel VIP still up — the SAME window ANY `xpfd` crash has today. Accept that
+  existing window (RECOMMENDED, no new hardware) **versus** adding external STONITH
+  fencing for a zero dual-address guarantee (new operational/hardware dependency). This
+  is the one #5275 decision that is a genuine operations tradeoff, not a code detail.
 
 Two minor residuals folded: §8's `armPending` route now distinguishes the **boot
 single-generation arm** (PR1) from the §9 **staged-delta transaction** (PR3); the §5
