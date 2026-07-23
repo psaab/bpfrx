@@ -525,6 +525,31 @@ same convention the host-inbound `ipFamily` helper uses. The fail-on-revert
 artifact is `mixed_family_tuple_5720_test.go`: dropping the gate makes the
 (V4 src, V6 dst) query fall through to a fabricated default verdict.
 
+### Known limitation — IPv4-mapped IPv6 source is folded (#5720)
+
+The gate reads family with `net.IP.To4()`, which FOLDS an IPv4-mapped IPv6
+literal: `net.ParseIP("::ffff:192.0.2.1").To4()` is non-nil. So a source
+authored as `::ffff:192.0.2.1` against a `2001:db8::1` destination is classified
+(V4 src, V6 dst) and **falsely** reported `UnsupportedTupleFamily`, even though
+the colon-strict runtime matcher (`userspace-dp/src/policy.rs`) treats the
+mapped literal as V6 and sees a valid same-family V6/V6 tuple that should be
+evaluated normally. This is the documented Go/Rust family-parity trap: the
+authoritative colon-strict classifier is `config.NATAddrFamily` /
+`natAddrFamily` (`pkg/config/compiler_nat_helpers.go`), which keys family on the
+presence of a `':'` in the *original text* — precisely the signal `net.ParseIP`
+has already discarded by the time the gate sees `q.SrcIP`/`q.DstIP`.
+
+The limitation cannot be fixed at the gate from `q.SrcIP`/`q.DstIP` alone: all
+four `Query` builders (`cli_request_testcmd.go`, `cli_show_security.go`,
+`server_show_firewall.go`, `server_cluster.go`) parse with `net.ParseIP`, which
+makes `192.0.2.1` and `::ffff:192.0.2.1` byte-identical 16-byte values. The
+correct fix threads the colon-strict text family (`config.NATAddrFamily` on the
+raw `srcIP`/`dstIP` strings) from each caller into `Query`; that cross-package
+`Query` API change is out of scope for the #5720 tooling cohort and is filed as
+follow-up #6377. The failure mode is a spurious "unsupported tuple" advisory
+on a diagnostic surface (fail-safe — it never hides or fabricates a permit), not
+a dataplane effect.
+
 The `Match`-side gate is transport-agnostic (every surface funnels through the
 one entry point), but rendering the *dedicated verdict* to an operator is
 per-surface: the REST (`pkg/api`) and gRPC `MatchPolicies`

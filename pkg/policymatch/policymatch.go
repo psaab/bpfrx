@@ -968,6 +968,29 @@ func Match(cfg *config.Config, q Query) (res Result) {
 	// arm and every same-family tuple fall through unchanged. Family is read
 	// with To4() to match the ipFamily helper the host-inbound path already
 	// uses.
+	//
+	// KNOWN LIMITATION (#5720 codex, tracked in #6377): To4() FOLDS an
+	// IPv4-mapped IPv6 literal — net.ParseIP("::ffff:192.0.2.1").To4() is
+	// NON-nil — so a source authored as `::ffff:192.0.2.1` is classified V4
+	// here and this gate FALSELY flags `::ffff:192.0.2.1 -> 2001:db8::1` as an
+	// unsupported (V4 src, V6 dst) tuple, even though the colon-strict runtime
+	// matcher (userspace-dp/src/policy.rs) sees a same-family V6/V6 tuple that
+	// should fall through and be evaluated normally. This is the documented
+	// Go/Rust family-parity trap (config.NATAddrFamily / natAddrFamily in
+	// pkg/config/compiler_nat_helpers.go: family is keyed on the presence of a
+	// ':' in the ORIGINAL text, which net.ParseIP has already discarded here).
+	// A colon-strict fix cannot be made at this gate from q.SrcIP/q.DstIP
+	// alone: all four Query builders (cli_request_testcmd.go, cli_show_
+	// security.go, server_show_firewall.go, server_cluster.go) parse with
+	// net.ParseIP, which renders `192.0.2.1` and `::ffff:192.0.2.1` byte-
+	// identical 16-byte values — the ':' signal is gone. The correct fix
+	// threads the colon-strict text family (config.NATAddrFamily on the raw
+	// srcIP/dstIP strings) from each caller into Query; that API change is out
+	// of scope for the #5720 tooling cohort and is filed as a follow-up. In
+	// practice an operator authoring a mapped-IPv6 source at these diagnostic
+	// surfaces is rare, and the failure mode is a spurious "unsupported tuple"
+	// advisory (fail-safe: it never hides or fabricates a permit), not a
+	// dataplane effect.
 	if q.SrcIP != nil && q.DstIP != nil && q.SrcIP.To4() != nil && q.DstIP.To4() == nil {
 		return Result{UnsupportedTupleFamily: true, Action: config.PolicyDeny}
 	}

@@ -221,6 +221,18 @@ func TestAnalyzePolicyShadowingGlobalDisjointScopeNotShadowed(t *testing.T) {
 			},
 		}
 	}
+	scopedTo := func(name string, action config.PolicyAction, toZones []string) *config.Policy {
+		return &config.Policy{
+			Name:   name,
+			Action: action,
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+				ToZones:              toZones,
+			},
+		}
+	}
 	cfg := &config.Config{}
 	cfg.Security.GlobalPolicies = []*config.Policy{
 		// earlier permit-any scoped to from-zone trust ONLY.
@@ -231,6 +243,29 @@ func TestAnalyzePolicyShadowingGlobalDisjointScopeNotShadowed(t *testing.T) {
 	}
 	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
 		t.Fatalf("globals with disjoint from-zone scopes must not shadow, got: %v", findings)
+	}
+
+	// #5720 (codex, finding 5a): the guard must key on ToZones too, not only
+	// FromZones. Two transit globals narrowed to DISJOINT to-zone contexts never
+	// shadow each other even when their address/application match sets nest.
+	cfg.Security.GlobalPolicies = []*config.Policy{
+		scopedTo("g-permit-to-untrust", config.PolicyPermit, []string{"untrust"}),
+		scopedTo("g-deny-to-dmz", config.PolicyDeny, []string{"dmz"}),
+	}
+	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
+		t.Fatalf("globals with disjoint to-zone scopes must not shadow, got: %v", findings)
+	}
+
+	// Control (positive, ToZones): an all-zones (nil) to-zone earlier global DOES
+	// shadow a later to-zone-dmz global of a different action — the ToZones
+	// dimension is exercised end-to-end, not just FromZones.
+	cfg.Security.GlobalPolicies = []*config.Policy{
+		scopedTo("g-permit-to-any", config.PolicyPermit, nil),
+		scopedTo("g-deny-to-dmz", config.PolicyDeny, []string{"dmz"}),
+	}
+	findingsTo := analyzePolicyShadowing(cfg)
+	if len(findingsTo) != 1 || !strings.Contains(findingsTo[0], "g-deny-to-dmz") || !strings.Contains(findingsTo[0], "SHADOWED") {
+		t.Fatalf("an all-zones to-zone earlier global must shadow a to-zone-dmz later global, got: %v", findingsTo)
 	}
 
 	// Control: a later global with NO from-zone scope (all zones) is BROADER
@@ -252,5 +287,121 @@ func TestAnalyzePolicyShadowingGlobalDisjointScopeNotShadowed(t *testing.T) {
 	findings := analyzePolicyShadowing(cfg)
 	if len(findings) != 1 || !strings.Contains(findings[0], "g-deny-trust") || !strings.Contains(findings[0], "SHADOWED") {
 		t.Fatalf("an all-zones earlier global must shadow a trust-only later global, got: %v", findings)
+	}
+}
+
+// TestAnalyzePolicyShadowingGlobalHostVsTransitNotShadowed pins the #5720
+// (codex, finding 1) cross-enforcement-path exclusion in globalScopeCovers.
+// Host-inbound globals (`match to-zone junos-host`) and transit globals are
+// enforced on SEPARATE dataplane paths: the host gate (matchJunosHost) never
+// falls through to the transit global tier, and a transit global is only
+// reached once no host policy matched. So a transit-scoped global can NEVER
+// shadow a host-scoped one, and vice versa — regardless of address/application
+// superset or zone-set nesting.
+//
+// RED on revert (drop the IsHostToZoneScope guard in globalScopeCovers): the
+// unscoped transit permit's empty ToZones covers the `junos-host` token under
+// zoneSetCovers, so the reachable host deny is falsely reported SHADOWED.
+func TestAnalyzePolicyShadowingGlobalHostVsTransitNotShadowed(t *testing.T) {
+	g := func(name string, action config.PolicyAction, toZones []string) *config.Policy {
+		return &config.Policy{
+			Name:   name,
+			Action: action,
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+				ToZones:              toZones,
+			},
+		}
+	}
+
+	// Transit permit (unscoped) authored BEFORE a reachable host-inbound deny:
+	// the host deny takes the separate host gate and must NOT be reported
+	// shadowed by the transit permit.
+	cfg := &config.Config{}
+	cfg.Security.GlobalPolicies = []*config.Policy{
+		g("g-transit-permit", config.PolicyPermit, nil),
+		g("g-host-deny", config.PolicyDeny, []string{"junos-host"}),
+	}
+	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
+		t.Fatalf("a transit global must not shadow a to-zone junos-host global, got: %v", findings)
+	}
+
+	// Vice versa: a host-inbound permit authored BEFORE a transit deny must not
+	// shadow it either — the transit deny is on the other enforcement path.
+	cfg.Security.GlobalPolicies = []*config.Policy{
+		g("g-host-permit", config.PolicyPermit, []string{"junos-host"}),
+		g("g-transit-deny", config.PolicyDeny, nil),
+	}
+	if findings := analyzePolicyShadowing(cfg); len(findings) != 0 {
+		t.Fatalf("a host-inbound global must not shadow a transit global, got: %v", findings)
+	}
+
+	// Control (positive): two host-inbound globals on the SAME path DO shadow —
+	// the earlier all-from-zones permit makes the later trust-scoped deny
+	// unreachable. Confirms the guard only excludes CROSS-path pairs, not
+	// genuine same-path host shadows.
+	hostScoped := func(name string, action config.PolicyAction, fromZones []string) *config.Policy {
+		return &config.Policy{
+			Name:   name,
+			Action: action,
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+				FromZones:            fromZones,
+				ToZones:              []string{"junos-host"},
+			},
+		}
+	}
+	cfg.Security.GlobalPolicies = []*config.Policy{
+		hostScoped("g-host-permit-any", config.PolicyPermit, nil),
+		hostScoped("g-host-deny-trust", config.PolicyDeny, []string{"trust"}),
+	}
+	findings := analyzePolicyShadowing(cfg)
+	if len(findings) != 1 || !strings.Contains(findings[0], "g-host-deny-trust") || !strings.Contains(findings[0], "SHADOWED") {
+		t.Fatalf("two host-inbound globals on the same path must still shadow, got: %v", findings)
+	}
+}
+
+// TestAnalyzePolicyShadowingGlobalExplicitAnyScopeShadows pins the #5720
+// (codex, finding 2) fix: zoneSetCovers must treat an explicit `["any"]` scope
+// as the all-zones universal set, matching the runtime SSOT
+// config.IsWildcardZoneSet (empty OR contains "any"). An explicit-`any`-scoped
+// earlier global therefore covers — and makes redundant — a later narrower
+// same-action global.
+//
+// RED on revert (restore the len(a)==0-only universality test in zoneSetCovers):
+// the explicit `["any"]` scope is read as a concrete one-element set, so it no
+// longer covers the trust-only later global and the redundancy goes unreported.
+func TestAnalyzePolicyShadowingGlobalExplicitAnyScopeShadows(t *testing.T) {
+	g := func(name string, action config.PolicyAction, fromZones, toZones []string) *config.Policy {
+		return &config.Policy{
+			Name:   name,
+			Action: action,
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+				FromZones:            fromZones,
+				ToZones:              toZones,
+			},
+		}
+	}
+	cfg := &config.Config{}
+	cfg.Security.GlobalPolicies = []*config.Policy{
+		// earlier permit scoped with the EXPLICIT reserved token "any" on both
+		// sides — the idiomatic Junos all-zones spelling.
+		g("g-permit-any", config.PolicyPermit, []string{"any"}, []string{"any"}),
+		// later permit narrowed to from-zone trust / to-zone untrust: the
+		// explicit-any earlier permit already matches its superset with the same
+		// action, so it is REDUNDANT.
+		g("g-permit-narrow", config.PolicyPermit, []string{"trust"}, []string{"untrust"}),
+	}
+	findings := analyzePolicyShadowing(cfg)
+	joined := strings.Join(findings, "\n")
+	if !strings.Contains(joined, "g-permit-narrow") || !strings.Contains(joined, "REDUNDANT") {
+		t.Fatalf("an explicit-any earlier global must make a narrower same-action later global REDUNDANT, got:\n%s", joined)
 	}
 }

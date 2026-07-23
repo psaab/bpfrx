@@ -57972,3 +57972,55 @@ top.
     pkg/grpcapi/server_show_firewall.go,
     pkg/grpcapi/server_show_testpolicy_unsupported_tuple_5720_test.go,
     pkg/policymatch/README.md
+
+- **Timestamp**: 2026-07-23 (rev6375 Codex-fold, findings 1/2/3/5)
+  - **Action**: Fold three verified Codex hostile-review findings + minor nits
+    into the C-TOOLS cohort (#6375 / Advances #5720).
+    - **Finding 1 (global-shadow lint FALSE-POSITIVE, fixed):**
+      `globalScopeCovers` now excludes CROSS-enforcement-path pairs. Host-inbound
+      globals (`match to-zone junos-host`, `config.IsHostToZoneScope`) and transit
+      globals are enforced on separate dataplane paths (the host gate
+      `matchJunosHost` never falls through to the transit global tier), so a
+      transit-scoped global must never be reported as shadowing a host-scoped one,
+      and vice versa. Before the fix an unscoped/`to-zone any` transit permit
+      falsely "covered" a later reachable `to-zone junos-host` deny. Fail-on-revert
+      test `TestAnalyzePolicyShadowingGlobalHostVsTransitNotShadowed` (drop the
+      `IsHostToZoneScope` guard → the host deny is falsely SHADOWED, RED-verified).
+    - **Finding 2 (global-shadow lint FALSE-NEGATIVE, fixed):** `zoneSetCovers`
+      now treats an explicit `["any"]` scope as the all-zones universal set via the
+      runtime SSOT `config.IsWildcardZoneSet` (empty OR contains "any"), matching
+      `build_global_zone_scope` in `userspace-dp/src/policy.rs`. Before, an
+      explicit-`any` global was read as a concrete one-element set and failed to
+      cover a narrower later global it in fact makes redundant. Fail-on-revert test
+      `TestAnalyzePolicyShadowingGlobalExplicitAnyScopeShadows` (restore the
+      len==0-only test → the redundancy goes unreported, RED-verified).
+    - **Finding 3 (policymatch gate folds IPv4-mapped IPv6, DOCUMENTED + FILED
+      #6377):** the #5720 unsupported-tuple gate reads family with `To4()`, which
+      folds `::ffff:192.0.2.1` to non-nil, so `::ffff:192.0.2.1 -> 2001:db8::1` is
+      falsely flagged UnsupportedTupleFamily while the colon-strict runtime sees
+      V6/V6. Verified firsthand that all four `Query` builders parse with
+      `net.ParseIP`, which makes `192.0.2.1` and `::ffff:192.0.2.1` byte-identical
+      16-byte values — the colon signal is destroyed at parse, so NO colon-strict
+      determination is available at the gate. The only correct fix threads the
+      text family (`config.NATAddrFamily`) from each caller through `Query` (a
+      cross-package API change, out of scope for this cohort). Documented precisely
+      in the gate comment + `pkg/policymatch/README.md`; filed follow-up #6377 with
+      the `compiler_nat_helpers.go` precedent and a concrete fix sketch. No
+      half-correct fix shipped. (Fail-safe: the false positive is a spurious
+      advisory, never a hidden/fabricated permit.)
+    - **Finding 5a (test coverage):** extended
+      `TestAnalyzePolicyShadowingGlobalDisjointScopeNotShadowed` with a ToZones
+      difference case (disjoint to-zone scopes must not shadow) plus an all-zones
+      to-zone positive control — the guard was previously only exercised on
+      FromZones.
+    - **Finding 5b (doc):** corrected `docs/pr/812-tx-latency-histogram/plan.md`
+      line 509 — the stale "dumps /proc/self/maps | grep vdso" claim now matches
+      the corrected `vdso_probe2.c` scope comment (probe checks AT_SYSINFO_EHDR +
+      one clock_gettime; the maps grep is a separate manual cross-check).
+    Skipped the pre-existing Makefile vet-scope nit (out of scope). Did not touch
+    the three render-surface UnsupportedTupleFamily arms (Codex finding 4 already
+    folded). `go build`/`go vet`/`gofmt -l` clean; full `go test ./pkg/cli/...`
+    and `./pkg/policymatch/...` GREEN.
+  - **File(s)**: pkg/cli/cli_request_policies_check.go,
+    pkg/cli/cli_request_policies_check_test.go, pkg/policymatch/policymatch.go,
+    pkg/policymatch/README.md, docs/pr/812-tx-latency-histogram/plan.md
