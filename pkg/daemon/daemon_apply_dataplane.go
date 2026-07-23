@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
@@ -339,16 +338,16 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 								"iface", subName, "mac", mac)
 						}
 					}
-					removeAutoLinkLocal(subName)
-					// Re-add link-local if this VLAN sub-interface has IPv6.
-					// Extract VLAN ID from sub-interface name (e.g. "ge-7-0-1.100").
-					if dotIdx := strings.LastIndex(subName, "."); dotIdx >= 0 {
-						if vid, err := strconv.Atoi(subName[dotIdx+1:]); err == nil {
-							if rethUnitHasIPv6(rethCfg, vid) {
-								ensureRethLinkLocal(subName)
-							}
-						}
-					}
+					// Strip any stale auto link-local, then re-add a stable one
+					// if this VLAN sub-interface carries IPv6. The kernel suffix
+					// is the unit's vlan-id (e.g. "ge-7-0-1.180"), which may
+					// differ from the logical unit number rethCfg.Units is keyed
+					// by (`unit 80 vlan-id 180`); the repair resolves the vlan-id
+					// back to its unit(s) before checking for IPv6 — indexing
+					// Units[vid] directly silently skipped the repair (#5107).
+					// The whole decision+action lives in rethSubIfaceLinkLocalRepair
+					// (spy-tested); this loop only enumerates the child netdevs.
+					rethSubIfaceLinkLocalRepair(rethCfg, subName)
 				}
 			}
 		}

@@ -1,3 +1,90 @@
+## 2026-07-22 — #6361: three TEST-STRENGTH tightenings on the #6243 map-pin suite
+
+- **Timestamp**: 2026-07-22 (fix/6361-test-tighten → refactor/6243-unify-map-pin-preflight)
+- **Action**: Test-only follow-up folded into PR #6361 (the #6243 map-pin
+  preflight unify). Production code UNCHANGED — three Codex-flagged assertion
+  tightenings, all in `userspace-dp/src/afxdp/coordinator/tests.rs`:
+  1. **Exact byte-parity on open-failure cases** in
+     `reconcile_all_seven_pin_faults_lock_stage_and_binding_strings_6243`: the
+     seven OPEN-failure cases asserted the stage token + per-binding label with
+     `starts_with`, so a corrupted SUFFIX after the prefix (or a stage-vs-binding
+     `err` divergence) slipped past. Replaced with an `assert_open_parity` helper
+     that strips the EXACT stage/label prefix (fails otherwise), requires a
+     nonempty `{err}` suffix, and asserts BOTH paths render the IDENTICAL err
+     text — robust to a nondeterministic OS error string (never hardcodes it).
+  2. **Bind all-seven-opened from the fault side** in
+     `both_paths_open_full_seven_pin_bundle_before_ok_6243`: the test only
+     observed Ok acceptance, staying green if an optional open were dropped from
+     the shared opener. Added a per-optional probe — each optional pin set to a
+     present-but-unopenable FAIL pin must be rejected by BOTH paths with the
+     matching `OpenMapFailed(token)`. FD-RETENTION parity stays STRUCTURAL (the
+     fd=-1 `TEST_MAP_PIN_OK` seam admits no real FD-pressure); documented inline.
+  3. **Named identity test binds the two-pass revert** in
+     `map_pin_faults_react_identically_activated_and_deferred_6243`: it was
+     single-fault-only, hence tautological on a one-pass deferred revert (a lone
+     fault surfaces the same stage either way). Added a MULTI-FAULT case (xsk
+     present-but-unopenable + heartbeat EMPTY → both paths `MissingPin(Heartbeat)`
+     under two-pass) so THIS named test — not only the separate `multi_fault_...`
+     sibling — reds on a one-pass deferred revert.
+- **Validation**: `cargo test --release -- --test-threads=1` GREEN (whole
+  userspace-dp suite). Proof of the one-pass-revert gate: temporarily gave the
+  deferred `validate_map_pins` its own one-pass walk (faithful — mandatory AND
+  optional) → `map_pin_faults_react_identically_..._6243` FAILED at its new
+  multi-fault assertion (`activated=missing_heartbeat_pin`,
+  `deferred=open_xsk_map_failed:...`) alongside the `multi_fault_...` sibling,
+  while the single-fault `both_paths_...` and `reconcile_all_seven_...` stayed
+  GREEN (no false divergence); restored the shared opener (snapshot.rs pristine).
+- **File(s)**: userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
+
+## 2026-07-22 — #6243: unify the activated + deferred BPF map-pin preflight
+
+- **Timestamp**: 2026-07-22 (refactor/6243-unify-map-pin-preflight)
+- **Action**: Class-B dedup + two latent divergence fixes on the reconcile
+  map-pin gate. `reconcile/snapshot.rs` carried TWO hand-kept copies of the
+  seven-pin open/validate contract: `preflight_map_fds` (activated reconcile —
+  opens + RETAINS FDs, stamps `last_reconcile_stage` + per-binding `last_error`)
+  and `validate_map_pins` (deferred-apply gate — opens then drops, stage only).
+  Collapsed both onto ONE pure opener `open_snapshot_maps(&MapPins) ->
+  Result<OpenedSnapshotMaps, MapPinFault>` (no side effects, no `mode` param —
+  keep-vs-drop is pure RAII on the returned bundle). The activated caller is now
+  a thin COLD ADAPTER (`fault.stage()` → typed #6244 `ReconcileStage`;
+  `fault.binding_error()` → verbatim per-binding string, owning the
+  uppercase-`XSK`-label vs lowercase-`xsk`-token byte-parity trap); the deferred
+  caller is `open_snapshot_maps(..).map(|_| ()).map_err(|f| MapSetup(f.stage()))`.
+  Removed the now-unused `open_optional_map` (folded into the opener's optional
+  arm as `open_optional_snapshot_map`).
+  - **Divergence 1 FIXED (two-pass multi-fault precedence):** the deferred walk
+    was one-pass (empty-then-open per pin); the shared opener is two-pass (check
+    all 3 mandatory pins for emptiness first, then open). A multi-fault snapshot
+    (earlier mandatory present-but-unopenable + later mandatory empty) now
+    reports the SAME stage from both paths (was `OpenMapFailed(earlier)` deferred
+    vs `MissingPin(later)` activated). Both stay fail-closed.
+  - **Divergence 2 FIXED (FD retention):** the deferred walk dropped each FD
+    immediately, so under FD-table pressure it PASSED where activated (holding
+    all seven) FAILED. The shared bundle retains every opened FD until the whole
+    contract succeeds → deferred now catches the low-FD case too.
+  - **Requiredness matrix preserved (#2444):** 3 mandatory (fatal if empty), 4
+    optional (silent-absent if empty, FATAL if present-but-unopenable). Abort
+    BEFORE teardown/publish (#2440). RAII single-close of earlier FDs on a later
+    open failure is enforced STRUCTURALLY (non-`Clone` `OwnedFd` sole ownership +
+    `Drop`).
+  - **Tests:** added 4 fail-on-revert tests locking ALL SEVEN pins' stage +
+    per-binding strings (incl. previously-uncovered uppercase-`XSK`, heartbeat,
+    `conntrack_v6`, `dnat_table_v6`), both-paths-react-identically parity, the
+    two-pass multi-fault normalization, and full-bundle-open equivalence.
+    Demonstrated RED→restore: reverting the deferred caller to its old one-pass
+    walk turns the two divergence tests RED (`deferred: OpenMapFailed(xsk)` vs
+    `activated: MissingPin(Heartbeat)`).
+  - **Out of scope:** #6246 (`ReconcileSnapshotFds` no-default / non-`Option`
+    `apply_snapshot` state-representability cleanup) — a separate follow-up on
+    #6243.
+- **File(s)**: `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/README.md`, `_Log.md`
+- **Validation**: `cargo build` + clippy clean on the changed file (the only
+  clippy error is the pre-existing `mut_from_ref` in untouched
+  `umem/mmap.rs:150`); full `cargo test --release -- --test-threads=1` GREEN.
+
 ## 2026-07-22 — #6242: consolidate a worker's 4 horizontal owners into one transactional WorkerRuntimeRecord
 
 - **Timestamp**: 2026-07-22 (refactor/6242-worker-runtime-record)
@@ -57525,3 +57612,64 @@ top.
     `Filter::needs_tx_eval()` turns BOTH new flowless canaries RED; restored ->
     GREEN. Full `cargo test --release -- --test-threads=1` GREEN.
 - **File(s)**: userspace-dp/src/afxdp/tx/cos_classify_tests.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5107 — fix RETH RA + post-MAC IPv6 repair using logical unit
+    numbers as VLAN IDs. Bug 1: `buildRAConfigs` resolved RA interface names via
+    `config.LinuxIfName(cfg.ResolveReth(...))`, which preserves the UNIT suffix
+    (reth0.80 -> member.80) instead of mapping unit -> configured vlan-id;
+    swapped to `cfg.ResolveKernelIfName` (reth0 unit 80 vlan-id 180 ->
+    member.180), which also matches `rethInterfacesForRG`'s vlan-id suffix so the
+    cluster RA owner match no longer drops the sender. Bug 2: the post-MAC IPv6
+    link-local repair in `daemon_apply_dataplane.go` parsed the vlan-id from the
+    kernel VLAN sub-interface name and indexed `rethCfg.Units[vid]` directly, but
+    Units is keyed by unit number — added `rethUnitForVlanID` (vlan-id -> unit
+    reverse lookup, deterministic lowest-unit on duplicate vlan-id + log) +
+    `rethSubIfaceNeedsLinkLocal` and index Units by the resolved unit. Fixed the
+    misleading `rethUnitHasIPv6` doc comment. Fail-on-revert Go tests in
+    reth_unit_vlanid_5107_test.go (both bugs go RED on revert; verified both
+    directions). Docs: ha-cluster-test-plan.md RA resolution note updated.
+- **File(s)**: pkg/daemon/daemon_ra.go, pkg/daemon/daemon_reth.go,
+    pkg/daemon/daemon_apply_dataplane.go,
+    pkg/daemon/reth_unit_vlanid_5107_test.go, docs/ha-cluster-test-plan.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5107 fold (PR #6359, Codex MERGE-NEEDS-MINOR). (1) Duplicate-VID
+    robustness: `rethSubIfaceNeedsLinkLocal` now scans ALL units mapped to a
+    vlan-id and returns true if ANY carries IPv6 (was: lowest-only via
+    `rethUnitForVlanID` — skipped repair when the lowest unit was IPv4-only and a
+    higher unit had IPv6). `rethUnitForVlanID` kept (lowest+deterministic+warn)
+    and still called for the existence check + collision log. (2) Bound the
+    production call sites: extracted `rethSubIfaceNameNeedsLinkLocal` seam
+    (parse vlan-id from kernel netdev name + resolve) now called by the post-MAC
+    repair loop in daemon_apply_dataplane.go (removed now-unused strconv import);
+    added TestRethSubIfaceNameNeedsLinkLocal (binds path a) and
+    TestDesiredClusterRAResolvesByVlanID (binds the desiredClusterRA ownership
+    gate — the bonus cluster-RA fix). Updated the dup-VID test to assert the
+    collision WARN via recordingSlogHandler. All three fold neutralizations
+    verified RED then restored. Full pkg/daemon + pkg/config suites green, vet +
+    gofmt clean.
+- **File(s)**: pkg/daemon/daemon_reth.go,
+    pkg/daemon/daemon_apply_dataplane.go,
+    pkg/daemon/reth_unit_vlanid_5107_test.go
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5107 fold round 2 (PR #6359, Codex re-review of 8e96f5612).
+    MINOR-2 (MUST-FIX): rethUnitForVlanID's duplicate-vlan-id WARN said "using
+    lowest unit for IPv6 repair", but after fold-1 the IPv6 repair scans ALL
+    matching units — the lowest unit is used only for the netdev name. Reworded
+    to "using lowest unit for the netdev name (all matching units scanned for
+    IPv6 link-local repair)"; updated the dupVIDWarn test constant. MINOR-1
+    (bind the caller): extracted rethSubIfaceLinkLocalRepair(rethCfg, subName)
+    — removeAutoLinkLocal + resolve-by-vlan-id decision + ensureRethLinkLocal —
+    with removeAutoLinkLocalFn/ensureRethLinkLocalFn package-var seams
+    (device_map.go idiom); the post-MAC enumeration loop now delegates in one
+    line. Added TestRethSubIfaceLinkLocalRepairDrivesEnsureByVlanID (spies,
+    no netlink) binding the repair action+ordering+resolution. The residual
+    netlink LinkList/ParentIndex enumeration is the only unbound surface (needs
+    real netlink); noted at the call site. RED-on-revert verified for both new/
+    changed tests then restored. Full pkg/daemon + pkg/config green, vet+gofmt
+    clean.
+- **File(s)**: pkg/daemon/daemon_reth.go,
+    pkg/daemon/daemon_apply_dataplane.go,
+    pkg/daemon/reth_unit_vlanid_5107_test.go

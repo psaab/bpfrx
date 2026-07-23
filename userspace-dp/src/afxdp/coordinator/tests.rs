@@ -4911,6 +4911,461 @@ fn reconcile_present_optional_pins_open_ok_advance_generation() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #6243 — the activated (`preflight_map_fds`) and deferred (`validate_map_pins`)
+// map-pin preflights are now ONE shared opener (`open_snapshot_maps`). These
+// tests lock ALL SEVEN pins' stage + per-binding strings (including the
+// previously-UNCOVERED uppercase-XSK label, heartbeat strings, conntrack_v6,
+// and dnat_table_v6), prove BOTH callers react IDENTICALLY, and lock the two
+// divergence fixes (two-pass multi-fault precedence + shared FD retention).
+// ---------------------------------------------------------------------------
+
+/// A `MapPins` whose three mandatory pins are sentinel-OK and every optional
+/// pin is empty (absent). Individual pins are overridden per case.
+fn all_map_pins_ok_6243() -> crate::protocol::snapshot::MapPins {
+    crate::protocol::snapshot::MapPins {
+        xsk: format!("{TEST_MAP_PIN_OK}xsk"),
+        heartbeat: format!("{TEST_MAP_PIN_OK}heartbeat"),
+        sessions: format!("{TEST_MAP_PIN_OK}sessions"),
+        ..Default::default()
+    }
+}
+
+/// Drive the ACTIVATED path (`reconcile` -> `preflight_map_fds`) for a faulted
+/// `MapPins` and return the rendered `last_reconcile_stage` string + the
+/// per-registered-binding `last_error` string it stamped.
+fn drive_map_pin_reconcile_6243(pins: crate::protocol::snapshot::MapPins) -> (String, String) {
+    let mut coord = Coordinator::new();
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        ..BindingStatus::default()
+    }];
+    let snap = ConfigSnapshot {
+        generation: 99,
+        map_pins: pins,
+        ..Default::default()
+    };
+    let _ = coord.reconcile(Some(&snap), &mut bindings, 64);
+    (
+        coord.last_reconcile_stage.to_string(),
+        bindings[0].last_error.clone(),
+    )
+}
+
+/// The typed `ReconcileStage` the ACTIVATED path records for a faulted
+/// `MapPins` (asserts the reconcile fails closed with `MapSetup`).
+fn activated_map_pin_stage_6243(pins: crate::protocol::snapshot::MapPins) -> ReconcileStage {
+    let mut coord = Coordinator::new();
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+    let snap = ConfigSnapshot {
+        generation: 99,
+        map_pins: pins,
+        ..Default::default()
+    };
+    let result = coord.reconcile(Some(&snap), &mut bindings, 64);
+    assert!(
+        matches!(result, Err(ReconcileError::MapSetup(_))),
+        "expected a MapSetup reject from reconcile, got {result:?}"
+    );
+    coord.last_reconcile_stage.clone()
+}
+
+/// The typed `ReconcileStage` the DEFERRED path (`validate_snapshot_buildable`
+/// -> `validate_map_pins`) reports for a faulted `MapPins`.
+fn deferred_map_pin_stage_6243(pins: crate::protocol::snapshot::MapPins) -> ReconcileStage {
+    let coord = Coordinator::new();
+    let snap = ConfigSnapshot {
+        generation: 99,
+        map_pins: pins,
+        ..Default::default()
+    };
+    match coord.validate_snapshot_buildable(Some(&snap)) {
+        Err(ReconcileError::MapSetup(stage)) => stage,
+        other => {
+            panic!("expected Err(MapSetup(_)) from validate_snapshot_buildable, got {other:?}")
+        }
+    }
+}
+
+/// #6243 fail-on-revert (byte-parity): lock every one of the seven pins' typed
+/// stage string AND per-binding `last_error` string on the activated path. The
+/// pre-#6243 suite covered only `session` / `conntrack_v4` / `dnat_table`; this
+/// adds the UNCOVERED cases — the uppercase-`XSK` per-binding label (vs the
+/// lowercase `xsk` stage token), the `heartbeat` strings, `conntrack_v6`, and
+/// `dnat_table_v6`. Rewriting the per-binding `XSK` label to the lowercase stage
+/// token (or dropping any pin's requiredness/label) turns the matching
+/// assertion RED.
+#[test]
+fn reconcile_all_seven_pin_faults_lock_stage_and_binding_strings_6243() {
+    // #6361 OPEN-failure byte-parity helper. The old `starts_with` accepted ANY
+    // suffix after the prefix, so a corrupted stage/label suffix — or a
+    // stage-vs-binding `err` divergence — could slip past. This asserts the
+    // stage-token prefix AND the per-binding-label prefix EXACTLY (strip_prefix
+    // fails otherwise), that a NONEMPTY `{err}` suffix exists, and that BOTH
+    // paths render the IDENTICAL err text (they share one `MapPinFault::Open {
+    // err }`, so a suffix corruption on either side reds this). It stays robust
+    // to a nondeterministic OS error string — it never hardcodes the err text.
+    let assert_open_parity = |stage: &str, be: &str, stage_prefix: &str, be_prefix: &str| {
+        let stage_err = stage.strip_prefix(stage_prefix).unwrap_or_else(|| {
+            panic!("stage {stage:?} must start with the exact prefix {stage_prefix:?}")
+        });
+        let be_err = be.strip_prefix(be_prefix).unwrap_or_else(|| {
+            panic!("binding {be:?} must start with the exact prefix {be_prefix:?}")
+        });
+        assert!(
+            !stage_err.is_empty(),
+            "stage {stage:?} must carry a nonempty err suffix after {stage_prefix:?}"
+        );
+        assert_eq!(
+            stage_err, be_err,
+            "stage and binding must render the identical open err \
+             (stage={stage:?}, binding={be:?})"
+        );
+    };
+
+    // Mandatory xsk — the byte-parity trap: stage token lowercase `xsk`,
+    // per-binding label UPPERCASE `XSK`.
+    let mut p = all_map_pins_ok_6243();
+    p.xsk = String::new();
+    let (stage, be) = drive_map_pin_reconcile_6243(p);
+    assert_eq!(stage, "missing_xsk_pin");
+    assert_eq!(be, "missing XSK map pin path");
+
+    let mut p = all_map_pins_ok_6243();
+    p.xsk = format!("{TEST_MAP_PIN_FAIL}xsk");
+    let (stage, be) = drive_map_pin_reconcile_6243(p);
+    assert_open_parity(&stage, &be, "open_xsk_map_failed:", "open XSK map: ");
+
+    // Mandatory heartbeat.
+    let mut p = all_map_pins_ok_6243();
+    p.heartbeat = String::new();
+    let (stage, be) = drive_map_pin_reconcile_6243(p);
+    assert_eq!(stage, "missing_heartbeat_pin");
+    assert_eq!(be, "missing heartbeat map pin path");
+
+    let mut p = all_map_pins_ok_6243();
+    p.heartbeat = format!("{TEST_MAP_PIN_FAIL}heartbeat");
+    let (stage, be) = drive_map_pin_reconcile_6243(p);
+    assert_open_parity(&stage, &be, "open_heartbeat_map_failed:", "open heartbeat map: ");
+
+    // Mandatory session.
+    let mut p = all_map_pins_ok_6243();
+    p.sessions = String::new();
+    let (stage, be) = drive_map_pin_reconcile_6243(p);
+    assert_eq!(stage, "missing_session_pin");
+    assert_eq!(be, "missing session map pin path");
+
+    let mut p = all_map_pins_ok_6243();
+    p.sessions = format!("{TEST_MAP_PIN_FAIL}sessions");
+    let (stage, be) = drive_map_pin_reconcile_6243(p);
+    assert_open_parity(&stage, &be, "open_session_map_failed:", "open session map: ");
+
+    // Optional pins: PRESENT-but-unopenable is fatal (#2444). There is no
+    // "missing" variant — an empty optional pin is silent absence. The stage
+    // token and per-binding label are the SAME lowercase name for optionals
+    // (only xsk's two forms diverge).
+    let mut p = all_map_pins_ok_6243();
+    p.conntrack_v4 = format!("{TEST_MAP_PIN_FAIL}conntrack_v4");
+    let (stage, be) = drive_map_pin_reconcile_6243(p);
+    assert_open_parity(
+        &stage,
+        &be,
+        "open_conntrack_v4_map_failed:",
+        "open conntrack_v4 map: ",
+    );
+
+    let mut p = all_map_pins_ok_6243();
+    p.conntrack_v6 = format!("{TEST_MAP_PIN_FAIL}conntrack_v6");
+    let (stage, be) = drive_map_pin_reconcile_6243(p);
+    assert_open_parity(
+        &stage,
+        &be,
+        "open_conntrack_v6_map_failed:",
+        "open conntrack_v6 map: ",
+    );
+
+    let mut p = all_map_pins_ok_6243();
+    p.dnat_table = format!("{TEST_MAP_PIN_FAIL}dnat_table");
+    let (stage, be) = drive_map_pin_reconcile_6243(p);
+    assert_open_parity(
+        &stage,
+        &be,
+        "open_dnat_table_map_failed:",
+        "open dnat_table map: ",
+    );
+
+    let mut p = all_map_pins_ok_6243();
+    p.dnat_table_v6 = format!("{TEST_MAP_PIN_FAIL}dnat_table_v6");
+    let (stage, be) = drive_map_pin_reconcile_6243(p);
+    assert_open_parity(
+        &stage,
+        &be,
+        "open_dnat_table_v6_map_failed:",
+        "open dnat_table_v6 map: ",
+    );
+}
+
+/// #6243 fail-on-revert (SSOT parity): for EACH of the seven pins' single-fault
+/// snapshots, the activated (`reconcile`) and deferred
+/// (`validate_snapshot_buildable`) paths must report the IDENTICAL typed
+/// `ReconcileStage`. Both now route through the one `open_snapshot_maps`;
+/// reverting either caller to its own hand-rolled pin list (or flipping a pin's
+/// requiredness) diverges one of these pairs.
+#[test]
+fn map_pin_faults_react_identically_activated_and_deferred_6243() {
+    let mut cases: Vec<crate::protocol::snapshot::MapPins> = Vec::new();
+    // Mandatory empties.
+    {
+        let mut p = all_map_pins_ok_6243();
+        p.xsk = String::new();
+        cases.push(p);
+    }
+    {
+        let mut p = all_map_pins_ok_6243();
+        p.heartbeat = String::new();
+        cases.push(p);
+    }
+    {
+        let mut p = all_map_pins_ok_6243();
+        p.sessions = String::new();
+        cases.push(p);
+    }
+    // Mandatory open failures.
+    {
+        let mut p = all_map_pins_ok_6243();
+        p.xsk = format!("{TEST_MAP_PIN_FAIL}xsk");
+        cases.push(p);
+    }
+    {
+        let mut p = all_map_pins_ok_6243();
+        p.heartbeat = format!("{TEST_MAP_PIN_FAIL}heartbeat");
+        cases.push(p);
+    }
+    {
+        let mut p = all_map_pins_ok_6243();
+        p.sessions = format!("{TEST_MAP_PIN_FAIL}sessions");
+        cases.push(p);
+    }
+    // Present-optional open failures.
+    {
+        let mut p = all_map_pins_ok_6243();
+        p.conntrack_v4 = format!("{TEST_MAP_PIN_FAIL}conntrack_v4");
+        cases.push(p);
+    }
+    {
+        let mut p = all_map_pins_ok_6243();
+        p.conntrack_v6 = format!("{TEST_MAP_PIN_FAIL}conntrack_v6");
+        cases.push(p);
+    }
+    {
+        let mut p = all_map_pins_ok_6243();
+        p.dnat_table = format!("{TEST_MAP_PIN_FAIL}dnat_table");
+        cases.push(p);
+    }
+    {
+        let mut p = all_map_pins_ok_6243();
+        p.dnat_table_v6 = format!("{TEST_MAP_PIN_FAIL}dnat_table_v6");
+        cases.push(p);
+    }
+
+    for pins in cases {
+        let activated = activated_map_pin_stage_6243(pins.clone());
+        let deferred = deferred_map_pin_stage_6243(pins);
+        assert_eq!(
+            activated, deferred,
+            "activated and deferred map-pin paths must report the identical stage; \
+             activated={activated}, deferred={deferred}"
+        );
+    }
+
+    // #6361: a MULTI-FAULT case so THIS named identity test — not only the
+    // separate `multi_fault_map_pins_use_two_pass_precedence_from_both_paths`
+    // sibling — reds on a one-pass revert of the deferred path. The single-fault
+    // cases above are tautological on such a revert: with only one fault both
+    // one-pass and two-pass surface the same stage. Here xsk is
+    // present-but-unopenable AND heartbeat is EMPTY: the canonical two-pass
+    // order (check ALL emptiness first, then open) reports the LATER empty
+    // heartbeat from BOTH paths, while a one-pass deferred walk would surface
+    // the EARLIER xsk open failure — breaking the identity assertion.
+    let mut multi = all_map_pins_ok_6243();
+    multi.xsk = format!("{TEST_MAP_PIN_FAIL}xsk");
+    multi.heartbeat = String::new();
+    let activated = activated_map_pin_stage_6243(multi.clone());
+    let deferred = deferred_map_pin_stage_6243(multi);
+    assert_eq!(
+        activated, deferred,
+        "multi-fault (xsk unopenable + heartbeat empty) must report the identical \
+         stage from both paths; a one-pass deferred revert diverges here \
+         (activated={activated}, deferred={deferred})"
+    );
+    assert_eq!(
+        activated,
+        ReconcileStage::MissingPin(MandatoryPin::Heartbeat),
+        "two-pass precedence must report the later empty heartbeat, not the xsk open failure"
+    );
+}
+
+/// #6243 fail-on-revert (DIVERGENCE 1 — two-pass multi-fault precedence): when
+/// an EARLIER mandatory pin is present-but-unopenable AND a LATER mandatory pin
+/// is EMPTY, the canonical two-pass order (check ALL emptiness first, then open)
+/// makes BOTH paths report the LATER pin's emptiness — not the earlier pin's
+/// open failure a one-pass walk would surface. Before #6243 the deferred path
+/// was one-pass and reported a DIFFERENT stage than the activated two-pass path
+/// on exactly these inputs (both still fail-closed). Reverting the shared opener
+/// to a one-pass walk flips the deferred assertions to `OpenMapFailed`.
+#[test]
+fn multi_fault_map_pins_use_two_pass_precedence_from_both_paths_6243() {
+    // Case 1: xsk present-but-unopenable, heartbeat EMPTY.
+    let mut p = all_map_pins_ok_6243();
+    p.xsk = format!("{TEST_MAP_PIN_FAIL}xsk");
+    p.heartbeat = String::new();
+    let activated = activated_map_pin_stage_6243(p.clone());
+    let deferred = deferred_map_pin_stage_6243(p);
+    assert_eq!(
+        activated,
+        ReconcileStage::MissingPin(MandatoryPin::Heartbeat),
+        "activated two-pass must report the empty heartbeat, not the xsk open failure"
+    );
+    assert_eq!(
+        deferred,
+        ReconcileStage::MissingPin(MandatoryPin::Heartbeat),
+        "deferred must MATCH the activated two-pass (was OpenMapFailed(xsk) pre-#6243)"
+    );
+
+    // Case 2: xsk OK, heartbeat present-but-unopenable, sessions EMPTY.
+    let mut p = all_map_pins_ok_6243();
+    p.heartbeat = format!("{TEST_MAP_PIN_FAIL}heartbeat");
+    p.sessions = String::new();
+    let activated = activated_map_pin_stage_6243(p.clone());
+    let deferred = deferred_map_pin_stage_6243(p);
+    assert_eq!(
+        activated,
+        ReconcileStage::MissingPin(MandatoryPin::Session),
+        "activated two-pass must report the empty sessions, not the heartbeat open failure"
+    );
+    assert_eq!(
+        deferred,
+        ReconcileStage::MissingPin(MandatoryPin::Session),
+        "deferred must MATCH the activated two-pass (was OpenMapFailed(heartbeat) pre-#6243)"
+    );
+}
+
+/// #6243 (DIVERGENCE 2 — shared FD retention): the shared `open_snapshot_maps`
+/// holds every opened FD in one `OpenedSnapshotMaps` bundle until the WHOLE
+/// seven-pin contract succeeds. The activated path KEEPS the bundle; the
+/// deferred path DROPS it (RAII). Because both callers route through that single
+/// opener, the point at which FD-table pressure would fail an open is identical
+/// for both — the deferred path can no longer PASS (dropping each FD per pin)
+/// where the activated path (holding all seven simultaneously) FAILS.
+///
+/// Real FD-pressure cannot be injected through the `TEST_MAP_PIN_OK` seam (it
+/// returns fd=-1 without consuming a descriptor), so retention parity is
+/// enforced STRUCTURALLY by the shared opener; the observable anchor here is
+/// that BOTH paths accept a snapshot whose all seven pins are present + openable
+/// — proving each walks and opens the FULL bundle before returning Ok.
+#[test]
+fn both_paths_open_full_seven_pin_bundle_before_ok_6243() {
+    let mut pins = all_map_pins_ok_6243();
+    pins.conntrack_v4 = format!("{TEST_MAP_PIN_OK}conntrack_v4");
+    pins.conntrack_v6 = format!("{TEST_MAP_PIN_OK}conntrack_v6");
+    pins.dnat_table = format!("{TEST_MAP_PIN_OK}dnat_table");
+    pins.dnat_table_v6 = format!("{TEST_MAP_PIN_OK}dnat_table_v6");
+
+    // Activated: reconcile advances the published generation (opened + retained
+    // all seven FDs and proceeded past the preflight).
+    let mut coord = Coordinator::new();
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 70,
+        fib_generation: 0,
+    };
+    coord.validation = prior;
+    coord.shared_validation.store(Arc::new(prior));
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+    let snap = ConfigSnapshot {
+        generation: 71,
+        map_pins: pins.clone(),
+        ..Default::default()
+    };
+    let _ = coord.reconcile(Some(&snap), &mut bindings, 64);
+    assert_eq!(
+        coord.validation.config_generation, 71,
+        "all seven present+openable pins must let the activated reconcile advance"
+    );
+
+    // Deferred: validate_snapshot_buildable returns Ok (opened all seven, then
+    // dropped the bundle) with no worker side effects.
+    let validate_coord = Coordinator::new();
+    let snap2 = ConfigSnapshot {
+        generation: 71,
+        map_pins: pins,
+        ..Default::default()
+    };
+    assert!(
+        validate_coord
+            .validate_snapshot_buildable(Some(&snap2))
+            .is_ok(),
+        "all seven present+openable pins must pass the deferred validation gate"
+    );
+    assert!(
+        validate_coord.workers.live.is_empty(),
+        "the deferred validation must not bring up workers"
+    );
+
+    // #6361: bind "opens the FULL bundle" from the FAULT side too, HERE — the
+    // Ok-acceptance above only proves all-seven-present+openable passes; it
+    // stays green if an optional open were dropped from the shared
+    // `open_snapshot_maps`. Each optional pin set to a present-but-unopenable
+    // FAIL pin must be REJECTED by BOTH paths with the matching
+    // `OpenMapFailed(token)` — dropping any one optional open would let its FAIL
+    // pin slip through Ok and red this loop. The sibling
+    // `reconcile_all_seven_pin_faults` test independently catches the same
+    // dropped open on the activated path; this adds the DEFERRED path and ties
+    // the guarantee to this test's own all-seven claim.
+    //
+    // Retention (all seven FDs held simultaneously until the whole contract
+    // succeeds) cannot be exercised directly: the fd=-1 `TEST_MAP_PIN_OK` seam
+    // consumes no descriptor, so real FD-table pressure is uninjectable. That
+    // guarantee is therefore STRUCTURAL — the RAII `OwnedFd`s in the private
+    // `OpenedSnapshotMaps` bundle (`reconcile/snapshot.rs`) are held together by
+    // ownership — and this fault probe is the strongest observable proxy.
+    let assert_optional_open_fault = |faulted: crate::protocol::snapshot::MapPins, token: &str| {
+        let activated = activated_map_pin_stage_6243(faulted.clone());
+        let deferred = deferred_map_pin_stage_6243(faulted);
+        match &activated {
+            ReconcileStage::OpenMapFailed { map, err } => {
+                assert_eq!(*map, token, "activated must fault the {token} optional open");
+                assert!(!err.is_empty(), "activated {token} fault must carry a nonempty err");
+            }
+            other => panic!("expected OpenMapFailed({token}) from activated, got {other:?}"),
+        }
+        assert_eq!(
+            activated, deferred,
+            "both paths must reject the present-but-unopenable {token} optional identically \
+             (activated={activated}, deferred={deferred})"
+        );
+    };
+
+    let mut p = all_map_pins_ok_6243();
+    p.conntrack_v4 = format!("{TEST_MAP_PIN_FAIL}conntrack_v4");
+    assert_optional_open_fault(p, "conntrack_v4");
+
+    let mut p = all_map_pins_ok_6243();
+    p.conntrack_v6 = format!("{TEST_MAP_PIN_FAIL}conntrack_v6");
+    assert_optional_open_fault(p, "conntrack_v6");
+
+    let mut p = all_map_pins_ok_6243();
+    p.dnat_table = format!("{TEST_MAP_PIN_FAIL}dnat_table");
+    assert_optional_open_fault(p, "dnat_table");
+
+    let mut p = all_map_pins_ok_6243();
+    p.dnat_table_v6 = format!("{TEST_MAP_PIN_FAIL}dnat_table_v6");
+    assert_optional_open_fault(p, "dnat_table_v6");
+}
+
 /// #3766 fail-closed same-plan refresh (H2 + H3 + M1): a runtime-snapshot
 /// refresh whose POLICY preflight passes but whose full
 /// `build_forwarding_state` FAILS a non-policy integrity check (here an
