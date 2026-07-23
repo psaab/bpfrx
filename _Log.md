@@ -56798,6 +56798,24 @@ top.
   userspace-dp/src/event_stream/clock.rs,
   userspace-dp/src/event_stream/README.md
 
+## #5661 — daemon_apply.go pure code-motion split
+- **Timestamp**: 2026-07-22
+- **Action**: Split ~3095-line pkg/daemon/daemon_apply.go into 7 cohesive
+  sibling files (pure code motion; behavior/ordering/locking unchanged).
+  daemon_apply.go dropped to 412 lines. All moved declaration bodies are
+  byte-identical to origin/master (line-multiset diff = 0 except one
+  gofmt-mandated comment-indent normalization that master itself was not
+  clean on). Full build ./... green; go test ./pkg/daemon/... green;
+  gofmt -l empty.
+- **File(s)**: pkg/daemon/daemon_apply.go (edit),
+  pkg/daemon/daemon_apply_reset.go (new),
+  pkg/daemon/daemon_apply_commit.go (new),
+  pkg/daemon/daemon_apply_hostauth.go (new),
+  pkg/daemon/daemon_apply_dataplane.go (new),
+  pkg/daemon/daemon_apply_routing.go (new),
+  pkg/daemon/daemon_apply_interfaces.go (new),
+  pkg/daemon/daemon_apply_tail.go (new),
+  pkg/daemon/README.md (edit — config-apply file-layout note)
 - **Timestamp**: 2026-07-22
 - **Action**: #5661 split — pure code-motion split of pkg/daemon/daemon_run.go
   (~2820 prod LOC → 836) into five cohesive sibling files in package daemon:
