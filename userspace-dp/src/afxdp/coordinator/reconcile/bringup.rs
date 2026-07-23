@@ -868,4 +868,3 @@ pub(in crate::afxdp) fn planned_worker_slots<V>(workers: &BTreeMap<u32, V>) -> u
         .map(|&id| id as usize + 1)
         .unwrap_or(0)
 }
-
