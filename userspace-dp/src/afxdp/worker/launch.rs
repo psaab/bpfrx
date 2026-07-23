@@ -232,10 +232,12 @@ pub(crate) struct WorkerPublishedTelemetry {
     // here): `recent_exceptions` and `last_resolution` are the SAME Arcs
     // that #6242's future per-worker `WorkerRuntimeRecord` will own. They
     // are allocated once per worker in `bring_up_workers`
-    // (`recent_exceptions` / `last_resolution` locals) and cloned twice:
-    // one clone into this worker-facing bundle, one clone into the
-    // coordinator-side maps (`coord.worker_exception_rings` /
-    // `coord.worker_last_resolution`). #6241 lands FIRST and allocates
+    // (`recent_exceptions` / `last_resolution` locals): the original Arc is
+    // cloned ONCE into the coordinator-side maps
+    // (`coord.worker_exception_rings` / `coord.worker_last_resolution`) and
+    // the original binding is MOVED into this worker-facing bundle. End
+    // state: one allocation, strong_count 2 — bit-identical to master.
+    // #6241 lands FIRST and allocates
     // them EXACTLY as today. Whichever of #6241/#6242 lands second MUST
     // integrate with the pending runtime record rather than re-allocate
     // these Arcs — #6242 owns the coordinator-side storage record, #6241
