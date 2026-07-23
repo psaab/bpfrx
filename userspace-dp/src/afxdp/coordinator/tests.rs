@@ -3893,6 +3893,84 @@ fn post_spawn_inthread_bind_failure_fails_closed_5143() {
     );
 }
 
+/// #6245: a post-spawn in-thread bind failure must now be reported EXPLICITLY.
+/// The `WorkerStartupReport` carries a typed per-slot `BindingSetupFailure`
+/// (worker + slot + phase + owned error) instead of signalling the failure
+/// ONLY by OMITTING the failed slot from a success-shaped `bound_slots` list.
+/// The readiness barrier surfaces that explicit cause into the fail-closed
+/// reconcile stage, so the `worker_bind_incomplete:..` descriptor now names the
+/// slot, phase, and reason — not just the `bound=N:planned=M` set-difference
+/// counts.
+///
+/// This is the #6245 contract change over #5143: #5143 established
+/// HEARTBEAT != READINESS (a partial bind fails the reconcile closed by
+/// set-difference); #6245 makes the CAUSE of that shortfall explicit in the
+/// report and the surfaced stage.
+///
+/// The `force_worker_bind_incomplete` stub reports a bound set short by one
+/// slot AND a matching explicit `BindingSetupFailure` for the dropped (smallest
+/// planned) slot — modelling what the real `worker_loop_setup` Err arm now
+/// records — so the report->barrier->stage explicit-failure path is verified
+/// end-to-end without CAP_NET_ADMIN.
+///
+/// Fail-on-revert: revert the explicit-failure contract (drop the report's
+/// `binding_failures` field, or the barrier's `render_binding_setup_failures`
+/// append, returning to the pre-#6245 `bound=N:planned=M` omission-only stage)
+/// and the `failures=[private:slot=1:..]` assertion below FAILS — the stage no
+/// longer carries the typed cause. The pre-#6245 counts-only prefix is
+/// deliberately NOT asserted-absent (it is retained), so this pins the ADDED
+/// explicit cause, not its formatting.
+#[test]
+fn worker_bind_incomplete_report_carries_explicit_failure_6245() {
+    let mut coordinator = Coordinator::new();
+    // One registered binding at slot 1 => exactly one planned worker (id 0),
+    // one planned slot (1). The stub drops the smallest planned slot (1).
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        worker_id: 0,
+        queue_id: 0,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        ..BindingStatus::default()
+    }];
+    coordinator.force_worker_bind_incomplete = 1;
+
+    let snap = mandatory_ok_snapshot(5);
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    // Still fails closed with the typed post-spawn-bind error (the #5143 gate).
+    assert!(
+        matches!(result, Err(ReconcileError::WorkerBindIncomplete(ref stage)) if !stage.is_empty()),
+        "a post-spawn in-thread bind failure must surface as \
+         Err(WorkerBindIncomplete) with a non-empty stage, got {result:?}"
+    );
+    let stage = coordinator.last_reconcile_stage.clone();
+    assert!(
+        stage.starts_with("worker_bind_incomplete:"),
+        "the bind-incomplete stage must be recorded, got {stage:?}"
+    );
+    // #6245 core assertion: the EXPLICIT typed failure (phase + slot) reached
+    // the barrier via WorkerStartupReport.binding_failures and is surfaced in
+    // the stage — NOT inferred solely from the shorter bound_slots list.
+    assert!(
+        stage.contains("failures=[private:slot=1:"),
+        "the stage must carry the EXPLICIT per-slot binding-setup failure \
+         (phase + slot), not just the bound/planned counts, got {stage:?}"
+    );
+    // The owned error reason string propagated end-to-end (report -> barrier).
+    assert!(
+        stage.contains("forced private bind failure (test seam #6245)"),
+        "the explicit failure's owned reason must propagate into the stage, \
+         got {stage:?}"
+    );
+    // The seam consumed its single forced incomplete report (no over-fire).
+    assert_eq!(
+        coordinator.force_worker_bind_incomplete, 0,
+        "exactly one forced bind-incomplete report should have been consumed"
+    );
+}
+
 /// #5171: the side-effect-free `validate_snapshot_buildable` gate (used by
 /// the deferred-activation apply path, which never reaches `reconcile`) and
 /// the worker-spawning `reconcile` MUST reject the IDENTICAL non-buildable

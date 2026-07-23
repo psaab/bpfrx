@@ -1,3 +1,49 @@
+## 2026-07-22 — #6245: report binding-setup failures explicitly in WorkerStartupReport
+
+- **Timestamp**: 2026-07-22 (fix/6245-explicit-binding-failures)
+- **Action**: Make a worker's one-shot binding setup report bind failures
+  EXPLICITLY instead of only by OMISSION. Pre-#6245 a failed slot was simply
+  absent from `WorkerStartupReport.bound_slots` (`worker_loop_setup` logged +
+  mutated `BindingLiveState.last_error` and dropped the binding), so the
+  readiness barrier could prove `bound != planned` but not the cause. Added
+  three types in `afxdp/types/runtime.rs`: `BindingSetupPhase`
+  (`Private`/`SharedFallback` + `as_str`), `BindingSetupFailure`
+  (`{ slot, phase, reason }`), `BindingRecoveredFallback` (`{ group, reason }`);
+  extended `WorkerStartupReport` with `binding_failures` +
+  `recovered_fallbacks`. `worker_loop_setup` (`loop_body/setup.rs`) now captures
+  the slot before the moved bind call, pushes a `BindingSetupFailure` on the
+  private-bind `Err` arm, threads two accumulators into
+  `fallback_shared_group_to_private` (`worker/mod.rs`) — which records a
+  terminal `SharedFallback` failure per slot whose private fallback also fails,
+  or a `BindingRecoveredFallback` when the whole group recovers — and sorts both
+  (failures by slot, fallbacks by group) before returning. `worker_loop`
+  (`loop_body/mod.rs`) carries them into the report. The barrier
+  (`coordinator/reconcile/bringup.rs`) retains the full report per worker,
+  keeps `bound == planned` as the readiness criterion, and renders the explicit
+  cause into the fail-closed stage via `render_binding_setup_failures`
+  (`...:failures=[private:slot=1:<reason>]`; empty →
+  `failures=[no-explicit-failure]`). Success path behavior-identical (both vecs
+  empty). Docs: `coordinator/README.md` #6245 paragraph + `worker/README.md`
+  setup row.
+- **File(s)**: `userspace-dp/src/afxdp/types/runtime.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/setup.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/mod.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/README.md`,
+  `userspace-dp/src/afxdp/worker/README.md`.
+- **Validation**: `cargo build` green. `cargo test --release` new tests green —
+  `worker_bind_incomplete_report_carries_explicit_failure_6245` (extends the
+  `force_worker_bind_incomplete` stub to emit a matching explicit failure;
+  asserts the stage carries `failures=[private:slot=1:...]` + the owned reason,
+  end-to-end report->barrier->stage without CAP_NET_ADMIN) and
+  `bringup::tests_6245::render_binding_setup_failures_is_deterministic` (pure
+  renderer). Existing `post_spawn_inthread_bind_failure_fails_closed_5143` still
+  green. Fail-on-revert: reverting the barrier's explicit-cause append to the
+  pre-#6245 `bound=N:planned=M` stage makes the e2e test ASSERTION-fail
+  (`got "worker_bind_incomplete:0:bound=0:planned=1"`), restored → green.
+
 ## 2026-07-22 — #4976: build-time ABI check for the libxdp ring mirror
 
 - **Timestamp**: 2026-07-22 14:00 PDT (fix/4976-build-abi-check)
