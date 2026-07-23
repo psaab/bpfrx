@@ -58845,3 +58845,54 @@ top.
   - **File(s)**: pkg/daemon/daemon_ipsec_rebind.go,
     pkg/daemon/daemon_ipsec_rebind_flush_bound_6397_test.go,
     pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6391 host-inbound sibling-isolation regression guard +
+    doc. STEP-0 firsthand finding: the host-inbound sibling LEAK the issue
+    describes is NOT present on current master (a00aa3cd9). PR #6389 (the
+    `zoneInterfaceMembers` fanout that leaked) was CLOSED unmerged;
+    `compileZones` keys the per-interface override strictly on `iface.Name()`
+    (the direct child the stanza is written under), so a bracket sibling never
+    inherits it. Verified across 6 shapes (flat-set first/later member,
+    3-member, multi-service ssh+ping, hierarchical nested-child, hierarchical
+    bracket-with-body): only the named interface carries the override in every
+    case. Since master is already fail-safe, this ships the missing REGRESSION
+    GUARD rather than a behavior fix. Added
+    `compiler_zone_iface_hostinbound_sibling_6391_test.go` (7 tests) pinning
+    sibling isolation across all 5 symmetric surfaces the issue enumerates plus
+    a no-shared-backing-store aliasing guard. Fail-on-revert demonstrated
+    FIRSTHAND: re-applying the exact #6389 fanout turns 5 of the cases RED with
+    clean ASSERTION failures (sibling `ge-0/0/1`/`ge-0/0/2` wrongly gets
+    `[ssh]`/`[ping ssh]`); restoring master -> all GREEN, compiler byte-identical
+    to master. Documented the sibling-isolation invariant + why the #6389 fanout
+    is unsound (flat-set single-scoped and hierarchical multi-member compile to
+    the same AST) in docs/config-schema.md. build + vet + gofmt clean; full
+    `go test ./pkg/config/` GREEN.
+  - **File(s)**: pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6400 review-fold — folded 3 Codex MINORs on the #6391
+    host-inbound sibling-isolation guard (production still byte-identical to
+    master; test/doc quality only). (1) Assertion completeness: the guard
+    helper compared only sorted SystemServices, dropping Protocols — a fanout
+    leaking host-inbound `protocols` (ospf/bgp) to a sibling would slip past.
+    Reworked `compileHostInbound6391` to return the FULL per-interface map keyed
+    on a `hib6391{SystemServices,Protocols}` view (both dimensions, every key),
+    so cardinality + protocols are asserted; extended the aliasing test with a
+    whole-map cardinality assertion; added
+    `TestHostInbound6391ProtocolsNoSiblingLeak` (ssh + ospf under the first
+    member) so the Protocols dimension is exercised by fail-on-revert. (2)
+    Prose overclaim: reworded the test-header + docs "every case goes RED" to the
+    accurate split — the six container-sharing cases (first-member, three-member,
+    multi-service, protocols, hierarchical nested-child, hierarchical
+    bracket-body) go RED, later-member + no-shared-backing-store stay GREEN
+    controls. (3) Doc self-contradiction: qualified config-schema.md that a
+    bracketed member cannot carry host-inbound in FLAT-SET / canonical `set`
+    syntax — the `[ a b ] { host-inbound }` shape is reachable only via a
+    raw-hierarchical `load override` parse. Re-verified: #6389 fanout →
+    6 RED / 2 GREEN controls; full `go test ./pkg/config/` GREEN; vet + gofmt
+    clean; compiler_security_zones.go byte-identical to master. Kept "Advances
+    #6391" (no close keyword).
+  - **File(s)**: pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+    docs/config-schema.md, _Log.md
