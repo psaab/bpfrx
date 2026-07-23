@@ -62,6 +62,47 @@
   pkg/routing/routing_test.go, pkg/routing/bond_test.go,
   pkg/routing/readback_guard_6396_test.go, pkg/routing/README.md
 
+- **Timestamp**: 2026-07-23 (re-gate fold on PR #6399, Codex MERGE-NEEDS-MAJOR)
+- **Action**: Folded the adjudicated Codex6399 findings (all complete the 4
+  stated fixes; not new scope). MAJOR 1 — xfrm ParentIndex identity: xpf
+  creates every xfrmi PARENTLESS, so a same-name/same-if_id xfrmi bound to a
+  NONZERO parent (IFLA_XFRM_LINK, selects egress) passed both the #5523 adopt
+  guard and the #6396 post-create guard and would egress SA traffic out the
+  wrong device. Extended BOTH guards to also assert
+  xi.Attrs().ParentIndex==0. MINOR 3 — xfrm stale-ownership: on a rejected
+  post-create readback, delete(x.xfrmis, ifName) so a pre-tracked name cannot
+  leave a later reconcile acting on a foreign substitute. MINOR 4 — archive
+  reseed scan-error: maxArchiveSeq now returns (uint64, error) via an
+  archiveDirReader seam; SetArchiveConfig keys the reseed off a new
+  archiveSeedDir (last successfully-scanned dir) and, on a ReadDir error,
+  leaves the counter unchanged AND the dir un-seeded so the next call retries
+  — a transient scan failure no longer pins the counter below the on-disk max
+  forever. MINOR 6 — SNMP recovery bound: added a fail-on-revert test
+  (attrCapturingHandler) asserting the recovery slog.Info fires once with the
+  correct suppressed_failures count after a failing→succeeding transition.
+  Test quality (item 5) — dir-switch test now proves a real archive SURVIVES
+  rotation (reseeded seq outranks pre-existing; oldest pruned) instead of
+  asserting the private counter. README (MAJOR 2) — bond scope-out made
+  explicit: create-path gated here, ADOPT path deferred to #6402 (HA-touching,
+  must validate mode/MTU not just type; loss-cluster smoke). Added a mode/MTU
+  note to #6402. DEFERRED — ArchiveConfig ordering race (Codex MINOR 5): zero
+  production callers; holding s.mu across the off-lock write reintroduces the
+  #6185 QuiesceArchival deadlock, so NOT trivial — reported for a follow-up,
+  not folded.
+- **File(s)**: pkg/routing/xfrm.go,
+  pkg/routing/xfrm_nonxfrmi_reject_5523_test.go, pkg/configstore/store.go,
+  pkg/configstore/store_persist.go, pkg/configstore/archive_6396_test.go,
+  pkg/daemon/daemon_snmp_reconcile.go,
+  pkg/daemon/daemon_snmp_ifdata_throttle_6396_test.go,
+  pkg/routing/README.md, pkg/configstore/README.md
+- **Validation**: gofmt/build/vet clean on the three touched pkgs; full
+  `go test ./pkg/routing ./pkg/configstore ./pkg/daemon` GREEN; fail-on-revert
+  confirmed firsthand for every new fold (ParentIndex adopt+create → adopted
+  not recreated / Apply nil; stale-ownership → xfrmis[name] persists;
+  scan-error → counter stuck at 5 not caught up to 202; SNMP recovery → 0
+  recovery logs; strengthened dir-switch → reseed neutralized fails the
+  rotation-survival assertion), then restored GREEN.
+
 ## 2026-07-23 — #5583 C180: fold two Codex MAJOR findings into #6383
 
 - **Timestamp**: 2026-07-23 (fix/5583-codex180, fold on PR #6383)

@@ -128,13 +128,22 @@ invariant now holds across all three netlink-device managers:
   `*netlink.Vrf` whose `Table` matches (#6396). `added` stays true so the
   caller records ownership; the reconcile adopt path (`vrfTable` →
   recreate on table mismatch) reclaims a substitute on the next cycle.
-- **bond** (`bond.go` `createLocked`) — the post-create readback must be an
-  `*netlink.Bond` before enslaving members or bringing it up (#6396).
+- **bond** (`bond.go` `createLocked`) — the **create-path** readback must be
+  an `*netlink.Bond` before enslaving members or bringing it up (#6396).
   `enslaveMembers` only surfaces a substitute via a real-netlink
   `LinkSetMaster` failure when a member is actually enslavable, so a bond
   whose configured members are all currently absent (the #4823 soft-error
   case) would otherwise adopt a foreign link; the explicit type check
-  closes that hole for every member state.
+  closes that hole for every member state. **Scope note:** only the bond
+  CREATE path is type-gated here. The bond **ADOPT** path (`createLocked`'s
+  `if existing, err := LinkByName(name); err == nil` branch) is NOT yet
+  type/mode/MTU-gated — a foreign or wrong-mode same-name link present at
+  steady state is still adopted. That guard is deferred to **#6402** because
+  it changes fabric/RETH bond reconcile behavior and so needs a loss-cluster
+  `test-failover` smoke; it must validate mode + MTU, not just the
+  `*netlink.Bond` type. (xfrm and VRF adopt paths ARE already gated —
+  xfrm.go:203 and `vrfTable`→recreate — so bond is the only adopt-path
+  residual.)
 
 Without the check the name is tracked as satisfied while **no** device
 carries the desired identity, silently blackholing the VPN / leaked routes

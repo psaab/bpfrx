@@ -1,6 +1,7 @@
 package configstore
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -140,8 +141,27 @@ func TestSetArchiveConfigReseedsOnDirSwitch(t *testing.T) {
 		t.Fatalf("after switching to dirB, archiveSeq must re-seed to dirB's max (102) so a new "+
 			"archive there is not outranked by the pre-existing ones (#6396); got %d", got)
 	}
-	if next := s.archiveSeq.Add(1); next != 103 {
-		t.Fatalf("post-switch next seq = %d, want 103", next)
+
+	// Prove the REAL rotation outcome, not just the private counter: an archive
+	// written to dirB with the reseeded counter must SURVIVE rotation (its seq
+	// now outranks the pre-existing 100..102) and the oldest pre-existing
+	// archive must be pruned. Without the reseed the new file would carry a seq
+	// below 100 and be pruned as stale instead.
+	seq := s.archiveSeq.Add(1) // 103, from the reseeded 102
+	ts := base.Add(time.Duration(seq) * time.Second)
+	if err := writeArchive(dirB, 3, "b-new\n", ts, seq); err != nil {
+		t.Fatal(err)
+	}
+	remain := archiveContents(t, dirB)
+	if !remain["b-new"] {
+		t.Errorf("the freshly-written archive must survive rotation (its reseeded seq outranks "+
+			"the pre-existing ones); remain=%v", remain)
+	}
+	if remain["b-100"] {
+		t.Errorf("the oldest pre-existing archive (b-100) must be pruned; remain=%v", remain)
+	}
+	if len(remain) != 3 {
+		t.Errorf("want 3 archives after rotation (max=3), got %d: %v", len(remain), remain)
 	}
 
 	// Switching to an empty dir must NOT rewind the monotonic counter.
@@ -151,4 +171,77 @@ func TestSetArchiveConfigReseedsOnDirSwitch(t *testing.T) {
 		t.Fatalf("switching to an empty dir rewound archiveSeq to %d, want it held at 103 "+
 			"(seed is monotonic-up only)", got)
 	}
+}
+
+// TestSetArchiveConfigReseedScanErrorDoesNotRegress is the #6396 Codex MINOR 4
+// guard: a transient failure to READ the archive dir during the reseed scan
+// must NOT pin the monotonic counter below the on-disk max. maxArchiveSeq now
+// distinguishes a read error from an empty dir, and SetArchiveConfig leaves the
+// counter unchanged AND the dir un-seeded on error, so the next call retries.
+//
+// FAIL-ON-REVERT: treating a scan error as an empty dir (seed 0 + mark the dir
+// seeded) means the retry call skips the rescan and the counter stays stuck —
+// the "retry catches up to 202" assertion goes RED.
+func TestSetArchiveConfigReseedScanErrorDoesNotRegress(t *testing.T) {
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	dirA := t.TempDir()
+	for seq := 1; seq <= 5; seq++ {
+		ts := base.Add(time.Duration(seq) * time.Second)
+		if err := writeArchive(dirA, 100, fmt.Sprintf("a-%d\n", seq), ts, uint64(seq)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dirB := t.TempDir()
+	for seq := 200; seq <= 202; seq++ {
+		ts := base.Add(time.Duration(seq) * time.Second)
+		if err := writeArchive(dirB, 100, fmt.Sprintf("b-%d\n", seq), ts, uint64(seq)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := &Store{}
+	s.SetArchiveConfig(dirA, 3)
+	if got := s.archiveSeq.Load(); got != 5 {
+		t.Fatalf("after dirA, archiveSeq = %d, want 5", got)
+	}
+
+	// Switch to dirB, but the scan fails (transient mount/permission error).
+	injErr := errors.New("injected: ReadDir EIO")
+	prev := archiveDirReader
+	archiveDirReader = func(string) ([]os.DirEntry, error) { return nil, injErr }
+	s.SetArchiveConfig(dirB, 3)
+	archiveDirReader = prev
+
+	// The counter must NOT have regressed (stays 5, not dropped to 0), and dirB
+	// must NOT be recorded as seeded.
+	if got := s.archiveSeq.Load(); got != 5 {
+		t.Fatalf("a failed reseed scan regressed archiveSeq to %d, want it held at 5", got)
+	}
+
+	// Retry: the scan now succeeds and must RESCAN dirB (not skip it), catching
+	// the counter up to dirB's on-disk max (202).
+	s.SetArchiveConfig(dirB, 3)
+	if got := s.archiveSeq.Load(); got != 202 {
+		t.Fatalf("after a failed scan the next same-dir call must rescan and catch up to "+
+			"dirB's max (202); got %d", got)
+	}
+}
+
+// archiveContents reads dir and returns the set of trimmed archive-file
+// contents present, for asserting rotation outcomes.
+func archiveContents(t *testing.T, dir string) map[string]bool {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]bool{}
+	for _, e := range ents {
+		d, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[strings.TrimSpace(string(d))] = true
+	}
+	return out
 }

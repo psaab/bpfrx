@@ -129,3 +129,102 @@ func TestXfrmApplyRejectsWrongIfIDReadbackAfterCreate(t *testing.T) {
 		t.Errorf("a wrong-if_id readback must not be tracked; xfrmis=%v", xm.xfrmis)
 	}
 }
+
+// TestXfrmAdoptRejectsParentBoundReadback is the #6396 Codex MAJOR 1 guard for
+// the ADOPT path. xpf creates every xfrmi PARENTLESS (the SA selects the egress
+// device), so a same-name, same-if_id xfrmi bound to a NONZERO parent link
+// (IFLA_XFRM_LINK, which pins the physical egress interface) is NOT the device
+// we intend: adopting it would egress the VPN's SA traffic out the wrong
+// interface. if_id alone does not distinguish it, so the adopt guard asserts
+// ParentIndex == 0 and delete+recreates on a mismatch.
+//
+// FAIL-ON-REVERT: dropping the ParentIndex==0 clause adopts the parent-bound
+// link as-is (0 LinkDel / 0 LinkAdd) — the delete/recreate/parentless
+// assertions go RED.
+func TestXfrmAdoptRejectsParentBoundReadback(t *testing.T) {
+	ops := newFakeLinkOps()
+	ifName, ifID := config.XFRMIfNameAndID("st0.1")
+	if ifName == "" || ifID == 0 {
+		t.Fatalf("XFRMIfNameAndID returned name=%q id=%d for st0.1", ifName, ifID)
+	}
+	// Same name + if_id, but bound to a nonzero parent link.
+	ops.links[ifName] = &netlink.Xfrmi{
+		LinkAttrs: netlink.LinkAttrs{Name: ifName, Index: 7, ParentIndex: 3},
+		Ifid:      ifID,
+	}
+
+	xm := &xfrmManager{ops: ops}
+	if err := xm.Apply(xfrmVPNs("st0.1")); err != nil {
+		t.Fatalf("reclaim of a parent-bound xfrmi must succeed (delete+recreate), got %v", err)
+	}
+	if !sliceHas(ops.delNames, ifName) {
+		t.Errorf("a parent-bound xfrmi must be delete+recreated, not adopted; delNames=%v", ops.delNames)
+	}
+	if ops.addCount != 1 {
+		t.Errorf("exactly one xfrmi must be recreated after reclaim, got %d LinkAdd", ops.addCount)
+	}
+	created, ok := ops.links[ifName].(*netlink.Xfrmi)
+	if !ok {
+		t.Fatalf("link %q after reclaim must be *netlink.Xfrmi, got %T", ifName, ops.links[ifName])
+	}
+	if created.Attrs().ParentIndex != 0 {
+		t.Errorf("recreated xfrmi must be parentless, got ParentIndex %d", created.Attrs().ParentIndex)
+	}
+	if got := xm.xfrmis[ifName]; got != ifID {
+		t.Errorf("reclaimed xfrmi tracked if_id %d, want %d", got, ifID)
+	}
+}
+
+// TestXfrmCreateRejectsParentBoundReadback is the #6396 Codex MAJOR 1 guard for
+// the POST-CREATE readback: a same-name, same-if_id xfrmi bound to a nonzero
+// parent, substituted in the add→readback window, must be rejected (not brought
+// up or tracked) — if_id matches, so only the ParentIndex==0 assertion catches
+// it.
+//
+// FAIL-ON-REVERT: dropping the ParentIndex==0 clause brings the parent-bound
+// link up and tracks it (Apply returns nil) — RED.
+func TestXfrmCreateRejectsParentBoundReadback(t *testing.T) {
+	ops := newFakeLinkOps()
+	ifName, ifID := config.XFRMIfNameAndID("st0.1")
+	ops.substituteAfterAdd[ifName] = &netlink.Xfrmi{
+		LinkAttrs: netlink.LinkAttrs{Name: ifName, Index: 9, ParentIndex: 5},
+		Ifid:      ifID, // matching if_id — only the parent differs
+	}
+
+	xm := &xfrmManager{ops: ops}
+	if err := xm.Apply(xfrmVPNs("st0.1")); err == nil {
+		t.Fatalf("a parent-bound readback after create must fail the commit closed, got nil")
+	}
+	if _, ok := xm.xfrmis[ifName]; ok {
+		t.Errorf("a parent-bound readback must not be tracked; xfrmis=%v", xm.xfrmis)
+	}
+}
+
+// TestXfrmCreateRejectDropsStaleTracking is the #6396 Codex MINOR 3 guard: when
+// the create-path readback is rejected AND the name was already tracked from a
+// prior reconcile, the stale x.xfrmis entry must be DROPPED — otherwise a later
+// reconcile path could treat the foreign substitute as a satisfied xfrmi.
+//
+// FAIL-ON-REVERT: without the delete on the mismatch branch the pre-existing
+// tracking entry survives — the "not tracked" assertion goes RED. (The other
+// create-path tests use fresh managers, so only this pre-tracked case binds the
+// delete.)
+func TestXfrmCreateRejectDropsStaleTracking(t *testing.T) {
+	ops := newFakeLinkOps()
+	ifName, ifID := config.XFRMIfNameAndID("st0.1")
+	// Foreign substitute swapped into the readback window.
+	ops.substituteAfterAdd[ifName] = &netlink.Dummy{
+		LinkAttrs: netlink.LinkAttrs{Name: ifName, Index: 9},
+	}
+	// PRE-TRACKED: a prior reconcile recorded this name as satisfied, but the
+	// kernel link is absent now (deleted out-of-band), so Apply takes the create
+	// path and the readback returns the substitute.
+	xm := &xfrmManager{ops: ops, xfrmis: map[string]uint32{ifName: ifID}}
+	if err := xm.Apply(xfrmVPNs("st0.1")); err == nil {
+		t.Fatalf("a foreign readback after create must fail the commit closed, got nil")
+	}
+	if _, ok := xm.xfrmis[ifName]; ok {
+		t.Errorf("the stale tracking entry must be dropped on a rejected readback so a later "+
+			"reconcile cannot act on the foreign substitute; xfrmis=%v", xm.xfrmis)
+	}
+}

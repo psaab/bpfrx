@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,6 +48,105 @@ func TestBuildSNMPIfDataWarnThrottled(t *testing.T) {
 	if n := rec.count(warn); n != 1 {
 		t.Fatalf("a persistent netlink failure must log %q at most once per window, "+
 			"not once per poll; %d polls produced %d warnings", warn, polls, n)
+	}
+}
+
+// attrCapturingHandler records each log record's message plus the integer
+// value of a single named attribute, so a test can assert both that a line
+// fired and what count it carried.
+type attrCapturingHandler struct {
+	mu   sync.Mutex
+	key  string
+	recs []attrRecord
+}
+
+type attrRecord struct {
+	msg string
+	val int64
+	has bool
+}
+
+func (h *attrCapturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *attrCapturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	rec := attrRecord{msg: r.Message}
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == h.key {
+			rec.val = a.Value.Int64()
+			rec.has = true
+		}
+		return true
+	})
+	h.recs = append(h.recs, rec)
+	return nil
+}
+
+func (h *attrCapturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *attrCapturingHandler) WithGroup(string) slog.Handler      { return h }
+
+// find returns the count of records with the given message and the captured
+// attribute value of the FIRST such record.
+func (h *attrCapturingHandler) find(msg string) (count int, val int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.recs {
+		if r.msg == msg {
+			if count == 0 {
+				val = r.val
+			}
+			count++
+		}
+	}
+	return count, val
+}
+
+// TestBuildSNMPIfDataRecoveryLogged is the #6396 Codex MINOR 6 guard: after a
+// failing→succeeding transition, buildSNMPIfData must log a one-time recovery
+// carrying the number of failures suppressed since the last emitted failure
+// line. Without a test the recovery log (and its count) is unbound — deleting
+// it or zeroing the count would leave every other test green.
+//
+// FAIL-ON-REVERT: removing the recovery slog.Info makes the count-1 assertion
+// go RED; hardcoding suppressed_failures to 0 makes the count-2 assertion RED.
+func TestBuildSNMPIfDataRecoveryLogged(t *testing.T) {
+	snmpIfDataFailThrottle.reset()
+	t.Cleanup(func() { snmpIfDataFailThrottle.reset() })
+
+	failing := true
+	prevLister := snmpLinkLister
+	snmpLinkLister = func() ([]netlink.Link, error) {
+		if failing {
+			return nil, errors.New("injected: netlink dump failed")
+		}
+		return nil, nil // success, empty table
+	}
+	defer func() { snmpLinkLister = prevLister }()
+
+	rec := &attrCapturingHandler{key: "suppressed_failures"}
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(rec))
+	defer slog.SetDefault(prevLogger)
+
+	// Three failing polls: the first logs, the next two are suppressed+counted.
+	for i := 0; i < 3; i++ {
+		buildSNMPIfData()
+	}
+	// Transition to success → one recovery log reporting the 2 suppressed.
+	failing = false
+	buildSNMPIfData()
+	// A further success must NOT re-log recovery (throttle already reset).
+	buildSNMPIfData()
+
+	const rmsg = "SNMP ifTable read recovered"
+	n, sup := rec.find(rmsg)
+	if n != 1 {
+		t.Fatalf("recovery must be logged exactly once on a failing->succeeding transition, got %d", n)
+	}
+	if sup != 2 {
+		t.Fatalf("recovery suppressed_failures = %d, want 2 (the two failures suppressed since "+
+			"the first emitted failure line)", sup)
 	}
 }
 
