@@ -100,6 +100,15 @@ func peerNodeID(nodeID int) (int, bool) {
 // whole (splitting them would duplicate logic) so the peer gate is a beneficial
 // superset that matches their local-view behavior exactly — a peer-only DNAT
 // pool / address-name / match error is caught too, never a false-reject.
+//
+// The set also includes validateNATPoolExternalTupleOverlapStrict (#5144, run
+// strict), because a peer-only overlapping pool set — differently-named
+// overlapping source pools, a source pool that also backs a NAT64 rule-set, or
+// duplicate members produced only under the peer's `${node}`/groups resolution —
+// is precisely the divergent-commit fail-open this gate exists to close: the
+// origin commits green and the standby lenient-loads the vulnerable independent
+// allocators. It is the last strict source-NAT gate wired in runTailGates rather
+// than runUniformGates, so it is carried here explicitly.
 func validateSourceNATStrictView(cfg *Config) error {
 	if cfg == nil {
 		return nil
@@ -129,6 +138,18 @@ func validateSourceNATStrictView(cfg *Config) error {
 		return err
 	}
 	if err := validateNATMatchApplicationsStrict(cfg); err != nil {
+		return err
+	}
+	// #5144: source-NAT / NAT64 external-tuple overlap. A `${node}`/groups
+	// rewrite that makes the peer's resolved pool set overlap (differently-named
+	// overlapping source pools, a source pool that also backs a NAT64 rule-set,
+	// or duplicate members) while the origin's is disjoint would COMMIT green on
+	// the origin, and the standby's lenient SyncApply only WARNS + installs the
+	// vulnerable independent allocators — a peer-only false-ACCEPT of the exact
+	// #5144 collision. Run the strict overlap gate against the peer-effective view
+	// too (lenient=false → error, no warnings). The local commit already runs it
+	// in runTailGates; this is its #5876 peer-effective mirror.
+	if _, err := validateNATPoolExternalTupleOverlapStrict(cfg, false); err != nil {
 		return err
 	}
 	return nil

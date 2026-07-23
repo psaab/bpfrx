@@ -59613,6 +59613,90 @@ top.
     pkg/cli/README.md, _Log.md
 
 - **Timestamp**: 2026-07-23
+  - **Action**: #5144 — reject overlapping/duplicate source-NAT and NAT64
+    pools at commit (external-tuple / reply-misdelivery). Added
+    `validateNATPoolExternalTupleOverlapStrict(cfg, lenient)` in
+    `compiler_validate_strict_nat.go`, wired into `runTailGates` next to the
+    #2241 NPTv6 overlap gate with a dedicated `opts.lenientNATPoolOverlap`
+    flag (strict on commit / warn on load / peer-sync, #1960 no-brick). It
+    enumerates one allocator owner per referenced source pool and per
+    (prefix, source-pool) NAT64 pair — matching the Rust source.rs /
+    nat64.rs keying — expands members to family-scoped intervals (v4 uint64,
+    v6 netip.Addr; colon-strict family bucketing) and O(n log n)
+    sort-and-sweeps for the first overlap (within-pool duplicate vs
+    cross-owner collision). Material choice S1 (reject overlap); does NOT
+    build the deferred R2 packet-path global allocator. Fail-on-revert:
+    `compiler_nat_pool_overlap_5144_test.go` (8 reject + 5 accept cases);
+    parent-RED verified (early `return nil,nil` → 8 reject cases go RED as
+    clean assertions, build stays clean, accept cases stay green). Updated
+    the overlap-agnostic #5877 aggregate fixtures to distinct addresses
+    (distinctHostIP / distinctSlash16) so they exercise cardinality without
+    tripping the new gate. Separated the shipped `xpf-test.conf` /
+    `xpf-cluster-fw0.conf` cross-feature overlap (one pool drawn by both
+    NAT64 and a source-NAT rule) into distinct pools + proxy-ARP. Doc:
+    docs/config-schema.md new #5144 subsection. Gates: build/vet/gofmt
+    clean; full `go test ./pkg/config/` + consumer userspace/configstore
+    suites GREEN.
+  - **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+    pkg/config/compiler_tailgates.go, pkg/config/compiler.go,
+    pkg/config/compiler_nat_pool_overlap_5144_test.go,
+    pkg/config/compiler_nat_source_pool_aggregate_5877_test.go,
+    test/incus/xpf-test.conf, test/incus/xpf-cluster-fw0.conf,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #5144 / PR #6414 — Codex MERGE-NEEDS-MAJOR fold (3 findings).
+    (MAJOR) The overlap gate was MISSING from the #5876 peer-effective strict
+    view → a node-divergent ${node} config (node0 disjoint / node1
+    overlapping) committed on node0 and the standby lenient-loaded the
+    vulnerable independent allocators. Added
+    `validateNATPoolExternalTupleOverlapStrict(cfg, false)` to
+    validateSourceNATStrictView (compiler_peer_effective_snat.go) + doc
+    contract. (MEDIUM) NAT64 owner keyed on raw prefix TEXT → false-REJECT of
+    equivalent /96 spellings (64:ff9b::/96 vs 0064:ff9b:0:0:0:0:0:0/96, same
+    pool = one Rust allocator). Added canonicalNAT64PrefixKey
+    (netip.ParsePrefix().Masked()) to key on canonical bytes like nat64.rs.
+    (LOW) Added interval-boundary tests: adjacent v4 /25s accept, IPv6
+    /120-nesting-/124 reject, IPv6 adjacent /121s accept, bare-v6-vs-/128
+    duplicate reject, mapped-v6-vs-genuine-v4 accept end-to-end. Parent-RED
+    re-verified firsthand: main-gate neutralize → 11 reject cases RED (8
+    original + 2 v6 boundary + peer) / 9 accept green; canonical-key revert →
+    equivalent-spelling accept RED; peer-view call removed → peer-overlap RED.
+    Also confirmed the Codex-reported app_catalog_test.go panic does NOT
+    reproduce on origin/master (full userspace suite clean) NOR on this branch
+    — a transient in Codex's run, not a #6414 regression; not touched.
+    Gates: build/vet/gofmt clean; full go test ./pkg/config/ + consumer
+    userspace/configstore GREEN. Doc: docs/config-schema.md #5144 subsection
+    updated (canonical key + peer-view).
+  - **File(s)**: pkg/config/compiler_peer_effective_snat.go,
+    pkg/config/compiler_validate_strict_nat.go,
+    pkg/config/compiler_nat_pool_overlap_5144_test.go,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #5144 / PR #6414 — Codex round-2 MERGE-NEEDS-MINOR fold (2
+    NAT64-keying edges). (1) Empty/malformed-prefix NAT64 rule-sets were
+    enumerated as overlap owners though they build no live allocator
+    (nat64.rs skips them; validateNAT64PrefixStrict skips an empty prefix)
+    → false-reject of an empty-prefix nat64 sharing a pool with a live
+    source-NAT owner. (2) canonicalNAT64PrefixKey used netip.ParsePrefix
+    which rejects a leading-zero mask, so /96 vs /096 (both accepted by the
+    strict gate + Rust numeric parse) became separate owners → false-reject.
+    Fix: replaced canonicalNAT64PrefixKey with nat64PrefixOwnerKey(prefix)
+    (string,bool) that mirrors the Rust build condition EXACTLY (split on /,
+    mask ParseUint==96 so /096 is honored, address v6 by colon-strict rule)
+    and returns the canonical /96 network via netip Masked(); ok=false drops
+    empty/malformed prefixes from the owner set. Tests: LeadingZeroMask /096
+    accept, EmptyPrefixNotAnOwner accept, EmptyPrefixPair accept. Parent-RED
+    (isolated, firsthand): neutralize the empty skip → EmptyPrefixNotAnOwner
+    RED; neutralize the mask canonicalization (raw-mask key) → LeadingZero
+    RED while Equivalent/Different stay green. Full go test ./pkg/config/ +
+    consumer userspace/configstore GREEN; gofmt/vet clean. Doc:
+    docs/config-schema.md #5144 subsection updated (live-allocator owner
+    condition + /096).
+  - **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+    pkg/config/compiler_nat_pool_overlap_5144_test.go,
+    docs/config-schema.md, _Log.md
   - **Action**: #6176 metric-HELP precision (Go half only — area-partition
     split; the userspace-dp Rust doc-comment half is split to #6413 for the
     userspace-dp owner). DOC/string-only, no behavior change (verified
@@ -59704,3 +59788,15 @@ top.
     readiness gate skips the archive when the counter is unconfirmed. Matches
     the code; no behavior change. Suite GREEN, gofmt/vet clean.
   - **File(s)**: pkg/configstore/store_persist.go, _Log.md
+- **Timestamp**: 2026-07-23
+- **Action**: Fix #6381 — TestMgmtReconcileTLSChange_5866 asserted a false
+    "fresh leaf per rebind" invariant that only passed as a CI artifact
+    (unwritable /etc/xpf/tls). Redirected certGen to a writable temp dir via a
+    new test-only api.Server.SetTLSCertDirForTest hook and re-encoded the
+    intended invariant: an HTTPS bind change make-before-break rebinds the HTTPS
+    leg but the DURABLE self-signed cert (#1916 D6) is reloaded AS-IS (identical
+    leaf bytes) — a rebind must not re-mint (TOFU-pin churn). Parent-RED:
+    neutralizing the durable-reload path (forced re-mint) turns the corrected
+    assertion RED, proving it now binds (the old assertion PASSED under exactly
+    that re-mint condition). Test-only; no production behavior change.
+- **File(s)**: pkg/api/server.go, pkg/daemon/management_5866_test.go, _Log.md

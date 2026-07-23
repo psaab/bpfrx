@@ -179,6 +179,29 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	}
 	cfg.Warnings = append(cfg.Warnings, nat64PrefixWarnings...)
 
+	// #5144: source-NAT / NAT64 external-tuple overlap gate — the source-NAT
+	// analog of the #2241 NPTv6 overlap check above. Differently-named
+	// overlapping source pools, a source pool that also backs a NAT64 rule-set,
+	// two NAT64 rule-sets sharing a pool under different prefixes, and duplicate
+	// members within one pool each own an INDEPENDENT PortAllocator/occupancy
+	// bitmap in the Rust dataplane (source.rs keys by pool-name+addresses, nat64.rs
+	// by (prefix, pool_v4)). Independent bitmaps can each mint the same translated
+	// (family, address, port) external tuple, and the reverse (1:N) NAT index then
+	// misdelivers the return packet. Reject the overlap at commit (material choice
+	// S1 — the commit-time detection half of #5144; the deferred packet-path global
+	// cross-domain allocator is NOT implemented here). Strict (commit /
+	// commit-check): hard-reject naming both allocators and the overlapping members.
+	// Lenient (load / peer-sync): warn so a config committed before this gate
+	// existed still boots (#1960 no-brick) — unlike NPTv6/NAT64 the dataplane does
+	// NOT reject the overlapping snapshot, so the latent collision persists until
+	// corrected and the warning says so. Runs AFTER the NAT64 prefix gate so a
+	// malformed-prefix error still wins the first-error slot.
+	natOverlapWarnings, err := validateNATPoolExternalTupleOverlapStrict(cfg, opts.lenientNATPoolOverlap)
+	if err != nil {
+		return err
+	}
+	cfg.Warnings = append(cfg.Warnings, natOverlapWarnings...)
+
 	// #1434 multi-peer WireGuard: per-tunnel commit gate. Strict (commit /
 	// commit-check): hard-reject a WG tunnel with a missing/invalid
 	// local identity (listen-port not in [1,65535] or a private-key that
