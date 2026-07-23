@@ -57304,3 +57304,36 @@ top.
   - **File(s)**: userspace-dp/src/filter/engine/cache_sensitive.rs,
     userspace-dp/src/filter/engine/cache_sensitive/rotation.rs (new),
     userspace-dp/src/filter/README.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6289 — two LOW robustness follow-ups in test/xsk-repro (from the
+    #4906 xsk-repro safety cohort hostile review). Neither is a firewall clobber
+    nor a false-PASS; both are error-path/robustness hardening on root-only
+    AF_XDP diagnostic tooling.
+    M1 (umem/alloc-failure leaked our attached XDP program): in
+    libbpf_xsk_shared_test.c, after load_xdp attached xdp_pass_redirect to the
+    owner (and any distinct secondary) interface, an unchecked aligned_alloc
+    NULL or an xsk_umem__create failure did `return 1` WITHOUT reaching the
+    detach — leaking our program (only possible on a non-firewall iface; a
+    firewall iface EBUSY's in load_xdp). Factored the detach into a shared
+    detach_ours() helper; the aligned_alloc-NULL and xsk_umem__create-failure
+    paths now call it (and free the UMEM area) before returning, and the normal
+    exit calls the same helper. Gate: -Wall -Wextra -Werror build keeps the
+    refactor clean; the leak path is only reachable via a real AF_XDP/allocator
+    failure so it is verified manually (documented in README, not a fabricated
+    unit test).
+    M2 (selftest-compile.sh SKIP gate probed headers but not static libs): the
+    gate probed only header syntax (-fsyntax-only) but `make check` links static
+    archives (-Wl,-Bstatic -lxdp -lbpf -lelf -lz -lzstd). A headers-present /
+    static-archive-missing host passed the SKIP gate then FAILed the link →
+    false-RED. Gate now probes a trial LINK with the same static-archive flags
+    and honors $CC like the Makefile. Fail-on-revert gate:
+    selftest-skipgate_6289.sh — hermetic (fake cc: headers-present /
+    static-missing), asserts the script SKIPs (exit 77) via the link probe;
+    reverting the probe to -fsyntax-only makes the script reach `make check` and
+    exit 1 → gate RED (verified both directions). Registered under `make
+    selftest` (run-selftests.sh); full selftest suite 44 passed / 0 failed.
+- **File(s)**: test/xsk-repro/libbpf_xsk_shared_test.c,
+    test/xsk-repro/selftest-compile.sh,
+    test/xsk-repro/selftest-skipgate_6289.sh (new),
+    test/xsk-repro/README.md, scripts/run-selftests.sh

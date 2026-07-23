@@ -16,23 +16,36 @@ set -u
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$HERE" || { echo "FATAL: cannot cd to $HERE" >&2; exit 1; }
 
+# Honor $CC (defaulting to cc) like the Makefile's `CC ?= cc`, so the SKIP
+# probe and `make check` use the SAME compiler/toolchain. The #6289 M2 gate
+# test drives this by pointing CC at a fake compiler.
+CC=${CC:-cc}
+
 # --- tool gate ---
-for tool in cc make xxd; do
+for tool in "$CC" make xxd; do
 	command -v "$tool" >/dev/null 2>&1 || {
 		echo "SKIP: $tool not installed"
 		exit 77
 	}
 done
-# Header gate: probe the two headers the reproducers include.
+# Link gate (#6289 M2): probe a trial LINK against the SAME static archives
+# `make check` links, not just header syntax. The static build recipe
+# (Makefile LIBS_SHARED) links `-Wl,-Bstatic -lxdp -lbpf -lelf -lz -lzstd`; a
+# host with the dev HEADERS present but a static archive MISSING (e.g. no
+# libzstd.a) passed the old header-only -fsyntax-only probe and then FAILed the
+# `make check` static link → a false-RED for this leg. Probing the actual link
+# makes such a host SKIP cleanly. -o /dev/null discards the trial binary.
 if ! printf '#include <bpf/bpf.h>\n#include <xdp/xsk.h>\nint main(void){return 0;}\n' \
-	| cc -x c -fsyntax-only - >/dev/null 2>&1; then
-	echo "SKIP: libbpf-dev / libxdp-dev headers not available"
+	| "$CC" -x c - -o /dev/null \
+		-Wl,-Bstatic -lxdp -lbpf -lelf -lz -lzstd -Wl,-Bdynamic -lpthread \
+		>/dev/null 2>&1; then
+	echo "SKIP: libbpf-dev / libxdp-dev headers or static archives not available"
 	exit 77
 fi
 
 # --- the actual gate: strict-warning build must succeed ---
 rc=0
-if out=$(make -s check 2>&1); then
+if out=$(make -s check CC="$CC" 2>&1); then
 	echo "PASS: xsk-repro strict-warning build"
 else
 	rc=1
