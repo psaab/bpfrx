@@ -222,13 +222,7 @@ fn resolve_cached_cos_tx_selection_impl(
                     .get(&egress_ifindex)
                     .map(Arc::as_ref)
             };
-            if let Some(output_filter) = output_filter.filter(|filter| {
-                filter.affects_tx_selection
-                    || filter.has_counter_terms
-                    || filter.has_log_terms
-                    || filter.has_terminal_action_terms
-                    || filter.has_three_color_policer_terms
-            }) {
+            if let Some(output_filter) = output_filter.filter(|filter| filter.needs_tx_eval()) {
                 let output_result = crate::filter::evaluate_filter_ref_tx_selection_cached(
                     output_filter,
                     src_ip,
@@ -308,13 +302,7 @@ fn resolve_cached_cos_tx_selection_impl(
         None
     };
     let output_result = output_filter
-        .filter(|filter| {
-            filter.affects_tx_selection
-                || filter.has_counter_terms
-                || filter.has_log_terms
-                || filter.has_terminal_action_terms
-                || filter.has_three_color_policer_terms
-        })
+        .filter(|filter| filter.needs_tx_eval())
         .map(|filter| {
             crate::filter::evaluate_filter_ref_tx_selection_cached(
                 filter,
@@ -664,13 +652,7 @@ fn resolve_cos_tx_selection_internal(
                     .get(&egress_ifindex)
                     .map(Arc::as_ref)
             };
-            if let Some(output_filter) = output_filter.filter(|filter| {
-                filter.affects_tx_selection
-                    || filter.has_counter_terms
-                    || filter.has_log_terms
-                    || filter.has_terminal_action_terms
-                    || filter.has_three_color_policer_terms
-            }) {
+            if let Some(output_filter) = output_filter.filter(|filter| filter.needs_tx_eval()) {
                 // Mirror the flow-keyed eval entry points below: ports are 0
                 // (L4 absent), `extra` carries the frame-derived is-fragment /
                 // l4-present=false predicates so port/flag/icmp-type terms fail
@@ -810,13 +792,9 @@ fn resolve_cos_tx_selection_internal(
     } else {
         None
     };
-    let output_result = if let Some(output_filter) = output_filter.filter(|filter| {
-        filter.affects_tx_selection
-            || filter.has_counter_terms
-            || filter.has_log_terms
-            || filter.has_terminal_action_terms
-            || filter.has_three_color_policer_terms
-    }) {
+    let output_result = if let Some(output_filter) =
+        output_filter.filter(|filter| filter.needs_tx_eval())
+    {
         if let Some(now_ns) = now_ns {
             crate::filter::evaluate_filter_ref_tx_selection_runtime_counted(
                 output_filter,

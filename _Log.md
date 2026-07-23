@@ -57408,3 +57408,23 @@ top.
     test/xsk-repro/selftest-compile.sh,
     test/xsk-repro/selftest-skipgate_6289.sh (new),
     test/xsk-repro/README.md, scripts/run-selftests.sh
+
+## 2026-07-22 — #6236 PR-2A (filter needs_tx_eval foundations)
+- **Timestamp**: 2026-07-22
+- **Action**: Add canonical `Filter::needs_tx_eval()` (sole 5-flag OR);
+    recompute all FilterState family aggregates from the FINAL fast maps
+    post-loop (fixes duplicate-ifindex stale-true); add
+    `has_output_needs_tx_eval_v{4,6}` aggregate; rewrite the global
+    `tx_selection_enabled_v{4,6}` gate onto it (subsumes has_output_tx_selection
+    + set-nonempty, behavior-equivalent); replace all 4 cos_classify inline
+    5-flag recomputes + both compiler set-insert recomputes with the method.
+    Behavior-preserving foundations — NO field/set deletion (PR-2B), NO
+    call-site ownership change (PR-2C). FilterState 23 -> 25 fields (temp).
+- **Tests**: parent-RED (drop has_counter_terms -> 4 tests RED, restored),
+    global-gate + equivalence + counter-only + duplicate-ifindex, all GREEN.
+- **Docs**: filter/README.md (needs_tx_eval predicate, aggregate-from-final-map
+    rule, global-gate re-anchor).
+- **File(s)**: userspace-dp/src/filter/mod.rs, userspace-dp/src/filter/compiler.rs,
+    userspace-dp/src/afxdp/forwarding_build/mod.rs,
+    userspace-dp/src/afxdp/tx/cos_classify.rs, userspace-dp/src/filter/tests.rs,
+    userspace-dp/src/afxdp/forwarding_build/tests.rs, userspace-dp/src/filter/README.md
