@@ -3,8 +3,9 @@
 - **Issue:** #5275 (HIGH; bug, dataplane, security, vsrx-parity)
 - **Research branch:** `research/5275-arm-failclosed`
 - **Base:** origin/master @ `6131eb4e6`
-- **Revision:** r6 (complete design contract — folds Codex r1–r4; r4 confirmed the
-  architecture is VIABLE and specified the contracts a full fail-closed spec needs)
+- **Revision:** r7 (folds Codex r5 — the last 5 blocking design-composition items +
+  2 correctness holes on the r6 contract; Codex r5 confirmed 5/8 contracts closed
+  and reaffirmed the architecture VIABLE)
 - **Prior art:** PR #6358 (draft) — MERGE-NEEDS-MAJOR. Superseded.
 - **Status:** PLAN-READY candidate (research only — no production code;
   `/engineer 5275`).
@@ -79,16 +80,26 @@ must run a **verified withdrawal-only scrub BEFORE it advertises yield**:
 - VRRP stale VIPs (only removed after instances run) — explicit removal;
 - Kea — authoritative `Apply(nil)` (dhcpserver.go:239);
 - FRR — clear the managed section (it can advertise persisted state);
-- **RG0 read-only:** a held RG0 is created directly Secondary and emits NO demotion
-  event, so `applyRG0OwnershipTransition` (daemon_ha.go:417) never sets the store
-  read-only → both nodes could accept divergent commits. Force the RG0 read-only
-  gate explicitly while `armPending`/`armFailed` (the apply gate §8 also blocks
-  publication, but the store-write gate must be set independently so a config
-  divergence cannot even be persisted-as-authoritative on a held node — see §8 for
-  the persist-but-not-authoritative nuance).
+- **RG0 authority:** a held RG0 is created directly Secondary and emits NO demotion
+  event, so `applyRG0OwnershipTransition` (daemon_ha.go:417) never makes the store
+  read-only → both nodes could accept divergent authoritative commits. But the
+  store read-only gate (`ensureWritableLocked` → `ErrClusterReadOnly`,
+  store_lock.go) rejects user Set/Delete/**Commit**, so simply forcing read-only
+  would ALSO block the promised fix-forward recovery (Codex r5 §2). The resolution
+  is the **delayed-promotion config-authority contract (§8.5)**, not a blanket
+  read-only: a held node never promotes a candidate to AUTHORITATIVE active, so it
+  cannot diverge the cluster, yet it can still accept a corrected candidate for the
+  next restart.
 
-The nft barrier (§6) stops transit but NOT traffic attraction / dual service
-ownership, which is why the scrub is required in addition to the barrier.
+**Withdrawal-scrub failure has a safe branch (Codex r5 hole):** if the verified
+withdrawal of inherited VIP/RA/Kea/FRR FAILS, withholding the explicit yield does
+NOT stop the peer's timeout promotion, and the nft transit barrier does not suppress
+stale VIP/Kea/FRR *ownership/attraction*. So a failed scrub MUST escalate to a
+proved-down / service-fenced fallback (administratively down the affected
+data/service surface + stop Kea + clear FRR, each verified) BEFORE the peer can take
+over — never a "logged and continue". The nft barrier (§6) stops transit but NOT
+attraction / dual service ownership, which is why the scrub + this fallback are
+required in addition to the barrier.
 
 ---
 
@@ -107,6 +118,11 @@ atomically**:
   a non-issue — only the advertised copy is forced zero while unproven), and
   existing heartbeat authentication already covers it. A new "cannot-own" bit is
   rejected (an old peer ignores it unless weight-zero is also present).
+  - **The advertised weight-zero MUST be gated on `effectiveHold` (§2), not on
+    `dataplaneUnproven` alone (Codex r5 hole):** otherwise the dataplane proof could
+    restore normal advertised weight while `kernelTrialUnpromoted` still blocks local
+    ownership → the higher-priority-node both-secondary returns. Any active hold
+    reason ⇒ advertise weight-zero.
 - **Pre-proof heartbeat-only lifecycle:** the held node MUST heartbeat its yield so
   the peer takes over — but `startClusterComms` (the sole heartbeat starter,
   daemon_ha_sync.go:687/:771) today also bundles watchdog + session/config sync +
@@ -133,20 +149,33 @@ also return success with snapshot publication still deferred (manager_compile.go
 So an expected program can be attached while the helper generation / XSK bindings
 are not operational.
 
-**Coverage proof (all required, readback-fail ⇒ unarmed):**
-- exact candidate config digest + successfully reconciled helper snapshot generation;
-- the exact expected registered / armed / ready XSK bindings;
-- strict program INSTANCE identity (ID/tag) on every mapped attach point (native or
-  generic) — NOT the global `ProbeForwardingArmed` (boot_probe.go, flags only), and
-  NOT the pre-compile probe (the next compile deletes every `xdp_*` pin before
-  attach, manager_compile.go:162, so a pre-compile "covered" can be destroyed);
-- proof taken AFTER the final link-cycle/reapply/rebind mutation; the second
-  reapply/rebind must RETURN proof-or-failure, not record retry debt.
+**Two-stage proof (Codex r5 §1 — proof must not be followed by proof-invalidating
+mutation):**
+- **PRELIMINARY attachment proof** — during the staged surface transaction (§9), a
+  per-interface check that the expected shim program attached (so the transaction
+  can decide to proceed/abort). This is NOT the release trigger.
+- **FINAL post-mutation proof** — taken AFTER the LAST mutation that can affect the
+  attachment: networkd, RETH MAC link-cycle, and the AF_XDP rebind/deferred-worker
+  reapply (daemon_apply_dataplane.go:219/386). Addresses, FRR, services, barrier
+  removal, forwarding enable, and ownership release all happen ONLY after this final
+  proof. The reapply/rebind must RETURN proof-or-failure, not record retry debt.
 
-**Release ordering (Codex r4 §2 — the hold clears LAST):**
-`final mutation → complete coverage proof → enable forwarding (+readback) → remove
-barrier (+readback) → clear dataplaneUnproven / advertise armed → startTakeoverMachinery`.
-A crash at any earlier step stays closed.
+**Coverage proof ingredients (both stages; readback-fail ⇒ unarmed):** exact
+candidate config digest + reconciled helper snapshot generation; the exact expected
+registered/armed/ready XSK bindings; strict program INSTANCE identity (ID/tag) on
+every mapped attach point (native or generic) — NOT the global `ProbeForwardingArmed`
+(boot_probe.go, flags only) and NOT the pre-compile probe (the next compile deletes
+every `xdp_*` pin before attach, manager_compile.go:162, so a pre-compile "covered"
+can be destroyed).
+
+**One atomic release owner (Codex r5 §4 — clearing the hold is the FINAL act):**
+`startTakeoverMachinery()` is the SOLE `armPending → armed` release path and owns the
+full post-proof lifecycle inventory IN ORDER: enable forwarding (+readback) → remove
+barrier (+readback) → start the post-proof consumers (session/config sync, GC,
+watchdog, reconcile loops) → **clear `dataplaneUnproven` LAST** (which may
+synchronously re-elect, so it must be the final ownership-enabling action, with
+nothing following it). A crash at any earlier step stays closed. `dataplaneUnproven`
+is never cleared outside this owner.
 
 ---
 
@@ -174,10 +203,14 @@ on any partial/unverified state.
 
 `d.dp=nil` does NOT contain the backend: gRPC/REST/CLI capture backend **aliases at
 construction** (daemon_run_servers.go:88, daemon_run.go:597), and they expose
-mutators (`SetForwardingArmed`, …) — directly exploitable on bootstrap-exit, where
-management already holds the backend when the later arm fails. Require a **shared
-revocable facade**: every consumer holds the facade, not the raw backend; on arm
-failure the facade is REVOKED (all method calls fail closed) and the real backend
+mutators (`SetForwardingArmed`, …, server_diag_system_action.go:396) that do NOT
+traverse the apply gate — directly exploitable on bootstrap-exit, where management
+already holds the backend when the later arm fails. Require a **shared revocable
+facade** that starts **SEALED** (Codex r5 §5): every consumer holds the facade, not
+the raw backend; while `armPending` the facade rejects all operational calls and
+permits arming ONLY through a private capability held by the arm transaction; it is
+OPENED atomically at the §5 final release; on arm failure (or any time) it is REVOKED
+stickily against concurrent calls (all method calls fail closed) and the real backend
 moves to a quarantined cleanup owner. Hardened `Teardown` keeps its per-handle
 retention (loader.go:1203/1223 must retain each failed handle, aggregate errors,
 readback that every link/pin incl. the partial attach is gone; barrier stays on
@@ -200,6 +233,34 @@ One gate at the top of the apply pipeline, three explicit routes:
   (daemon_apply_commit.go:303 `applyErrSkipsPeerSync`).
 - **`armed`** — the normal pipeline.
 
+## 8.5 Config authority = DELAYED PROMOTION (Codex r5 §2 §3) — resolves the
+## publisher-generation TOCTOU AND the fix-forward contradiction with one contract
+
+Today `commit` PROMOTES + PERSISTS the candidate as authoritative `ActiveConfig`
+BEFORE the apply/arm (`applyAndSyncCommitted` runs on an already-committed+active
+config, daemon_apply_commit.go:225). So independent reconcilers (DDNS, RA, direct-VIP)
+that read `ActiveConfig` can publish an UN-ARMED candidate even if the current apply
+stack aborts (Codex r5 §3) — aborting the apply is insufficient. And a blanket
+read-only on a held node blocks fix-forward (Codex r5 §2). Both are resolved by
+**delayed promotion**:
+
+- **The candidate is promoted to authoritative `ActiveConfig` ONLY after the §5 final
+  arm proof.** Until then, every publisher reads a durable **applied/published
+  generation** that stays at the LAST ARMED config (a first-ever arm has none → the
+  fail-closed empty/default-deny). On arm failure the applied generation never
+  advances, so no reconciler can publish the un-armed candidate — the TOCTOU is
+  structurally gone, not raced.
+- **Fix-forward recovery:** the failed candidate is retained in a NON-authoritative
+  recovery slot (persisted for the next restart) so an operator can correct it; a
+  restart re-arms against the corrected config. A held HA node accepts a
+  **narrowly-scoped inbound authoritative sync** from the primary (the existing
+  `SyncApply` ingress already bypasses the read-only gate, store_lock.go) but does
+  NOT itself promote a local candidate as authoritative while held — so it can
+  receive the primary's correction without diverging the cluster.
+- **`pkg/configstore` enters the blast radius** (the promote-after-arm reordering +
+  the recovery slot). This is the one contract that reaches beyond `pkg/daemon`/
+  `dataplane`/`cluster`.
+
 ---
 
 ## 9. Staged surface-activation transaction (Codex r4 §4) — B + empty transitions
@@ -215,10 +276,16 @@ transaction, so they depend on the PR3 machinery, not PR1):
 1. compute the candidate surface diff BEFORE mutation;
 2. quarantine each newly-required surface (incl. a pre-existing/up one);
 3. create it DOWN + unaddressed only as needed to obtain an ifindex;
-4. attach + prove program identity + helper-generation/binding coverage (§5);
-5. ONLY THEN publish address / networkd / VRF / FRR / service changes for it;
-6. on failure, abort ALL candidate downstream publication while RETAINING the prior
-   armed generation's policy (#5679 keeps the already-covered surface live).
+4. attach + take the **PRELIMINARY** attachment proof (§5) — decide proceed/abort;
+5. run the remaining attachment-affecting mutations (networkd, RETH MAC link-cycle,
+   AF_XDP rebind/reapply) — see Codex r5 §1: these come AFTER the preliminary proof;
+6. take the **FINAL** post-mutation coverage proof (§5); ONLY on success promote the
+   candidate (§8.5) and publish address / FRR / services + release ownership (§5
+   release owner);
+7. on failure, do NOT promote (delayed promotion §8.5 keeps the prior armed
+   generation authoritative for every publisher) and abort the candidate's staged
+   surface, RETAINING the prior armed generation's policy (#5679 keeps the
+   already-covered surface live).
 
 `startTakeoverMachinery()` (idempotent, §2/§5) is the release path from `armPending`
 to `armed`; it must be callable from BOTH the boot arm-proof AND the bootstrap-exit
@@ -233,12 +300,16 @@ Codex r4 is right that "multi-PR" is honest but "each PR independently correct" 
 not. Corrected phasing, each a real architecture increment gated by smoke:
 
 - **PR1 — foundation (standalone), INERT under cluster config:** the daemon-owned
-  arm-state machine (§2), the revocable runtime facade + quarantine + hardened
-  teardown (§7), the bridge+flowtable+FORWARD barrier (§6), deferred forwarding +
-  the release ordering (§5), the three-route apply gate (§8), and the coverage proof
-  at the final boundary (§5). Fixes the STANDALONE cold-boot policy-free-router hole
-  end-to-end. Explicitly inert when `cfg.Chassis.Cluster != nil` (no HA behaviour
-  change) so it cannot half-activate HA.
+  arm-state machine (§2), the revocable sealed-until-armed runtime facade + quarantine
+  + hardened teardown (§7), the bridge+flowtable+FORWARD barrier (§6), deferred
+  forwarding + the single-owner release ordering (§5), the three-route apply gate +
+  delayed-promotion config authority (§8/§8.5), and the two-stage coverage proof (§5).
+  Fixes the STANDALONE cold-boot policy-free-router hole end-to-end. PR1 handles the
+  BOOT single-generation arm (the whole configured surface arms or the node stays
+  fail-closed); it does NOT require the §9 multi-generation staged transaction (that
+  is the day-2 add-interface case, PR3) — so §8's PR1 gate must not depend on §9.
+  Explicitly inert when `cfg.Chassis.Cluster != nil` (no HA behaviour change) so it
+  cannot half-activate HA.
 - **PR2 — HA hold+yield atomic + pre-proof heartbeat + withdrawal scrub + RG0:**
   §3, §4. Activates the arm-state in cluster mode: the composed election hold, the
   atomic advertised-weight-zero yield, the pre-proof heartbeat-only lifecycle, and
@@ -260,7 +331,9 @@ Partial PRs say "advances #5275", never a close-keyword.
   gRPC/REST/CLI/sampler, three-route apply gate, staged surface transaction,
   withdrawal scrub, bootstrap-exit `startTakeoverMachinery`), `pkg/cluster`
   (composed-reason hold, advertised-weight-zero yield, pre-proof heartbeat-only
-  start). Genuinely large; the facade + arm-state + barrier are foundational.
+  start), and `pkg/configstore` (delayed promotion: promote-after-arm + the
+  non-authoritative recovery slot, §8.5). Genuinely large; the facade + arm-state +
+  barrier + delayed-promotion are foundational.
 - **Risks:** (1) day-2 regression tearing a working dataplane — per-generation
   coverage + #5679 retention + RED tests; (2) the facade wiring missing a captured
   alias — a grep/audit of every `d.dp` capture + a revocation test on each consumer
@@ -288,16 +361,27 @@ Partial PRs say "advances #5275", never a close-keyword.
   disabled/flushed, all present BEFORE interface mutation and removed only at the
   release step; a bridged L2 flow AND an offloaded flow are dropped while pending; a
   crash between coverage-proof and barrier-removal stays closed.
-- **Revocable facade:** on arm failure every captured consumer (gRPC, REST, CLI,
-  sampler) gets fail-closed method results; bootstrap-exit late-arm-failure revokes
-  the alien management already held the backend through.
+- **Revocable sealed facade:** while `armPending` every captured consumer (gRPC,
+  REST, CLI, sampler) gets fail-closed results (facade sealed) EXCEPT the private arm
+  capability; on arm failure the revoke is sticky against a concurrent in-flight call;
+  bootstrap-exit late-arm-failure revokes the alias management already held.
+- **Delayed promotion (§8.5):** on arm failure `ActiveConfig`/the published generation
+  never advances to the candidate — an independent DDNS/RA/direct-VIP reconcile reads
+  the last-armed generation, never the un-armed candidate (the TOCTOU is structurally
+  absent); the recovery slot holds the failed candidate; a narrowly-scoped inbound HA
+  sync still lands on a held node. Final proof taken AFTER networkd/RETH-rebind ⇒ a
+  proof-then-mutation ordering bug is RED.
 - **Arm-state / apply gate:** armPending permits only the arm transaction; armFailed
   permits persistence+validation only (no publish, RG0 non-authoritative, no peer
   push, no session clear); armed = normal.
 - **HA:** held node advertises weight-zero yield via the pre-proof heartbeat ⇒ peer
-  owns every RG (real heartbeat/election), no both-secondary even at higher held
-  priority, no dual VIP in direct-VIP mode; legacy-peer golden promotes on
-  weight-zero; withdrawal scrub removes inherited VIP/RA/Kea/FRR before yield;
+  owns every mutually-configured, eligible RG (real heartbeat/election), no
+  both-secondary even at higher held priority, no dual VIP in direct-VIP mode;
+  weight-zero stays asserted while ANY hold reason is set (effectiveHold), so a
+  dataplane proof under a still-set kernel-trial hold does not un-yield; a failed
+  withdrawal scrub escalates to the proved-down/service-fenced fallback before the
+  peer takes over; legacy-peer golden promotes on weight-zero; withdrawal scrub
+  removes inherited VIP/RA/Kea/FRR before yield;
   held RG0 store is non-authoritative.
 - **Staged transaction:** add-B-fails ⇒ B never addressed/up, A's policy retained,
   commit fails; committed-empty→first-interface + remove-all→add use the same
