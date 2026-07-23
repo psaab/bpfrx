@@ -310,12 +310,21 @@ exist.
   refuse-before-STOP guard **only when `!present`**. A present-but-corrupt
   `current` still had a rollback target and it is now broken — stopping the
   daemon would strand it, the exact #6374 hazard — so it **refuses regardless
-  of the sanction**, at INIT and on every resume. Symmetrically the pre-STOP
-  revalidation of a *nonempty* recorded `PreviousVersion` refuses regardless
-  of the sanction (a recorded-but-broken target is never a sanctionable first
-  install); the sanction applies only to a recorded-*empty* target. An
-  indeterminate I/O error on the target fails **closed** (`present=true` →
-  refuse), never silently treated as absent-and-sanctionable.
+  of the sanction**, both at INIT **and on every resume**. The resumed
+  empty-previous branch does not trust the persisted/invocation sanction on
+  its own: it **re-resolves `current` at resume time** and refuses if
+  `current` is now present-but-unrestorable — defending against a poisoned
+  pre-#6374 journal (an over-broad sanction persisted for a present-but-corrupt
+  `current`) or a `current` that corrupted after a genuinely-sanctioned INIT.
+  It keys on *present AND unrestorable* (`present && ver==""`), NOT merely
+  *present*, so a legitimate first-cut resume whose flip already pointed
+  `current` at the (restorable) target still proceeds. Symmetrically the
+  pre-STOP revalidation of a *nonempty* recorded `PreviousVersion` refuses
+  regardless of the sanction (a recorded-but-broken target is never a
+  sanctionable first install); the sanction applies only to a recorded-*empty*
+  target with a still-absent `current`. An indeterminate I/O error on the
+  target fails **closed** (`present=true` → refuse), never silently treated as
+  absent-and-sanctionable.
 
   `readCurrentVersion` itself is unchanged — it still returns the raw
   basename for the conservative "never delete a dir that might be live" GC /

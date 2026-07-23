@@ -59277,3 +59277,29 @@ top.
     build+vet+gofmt clean. Still NOT HA-touching.
   - **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/cutover.go,
     pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-23T21:40Z
+  - **Action**: Fix #6374 round-3 fold (Codex MAJOR — symmetric resumed-path
+    residual). The round-2 INIT gate was correct, but the RESUMED empty-previous
+    branch (cutover.go) trusted the sanction and never re-checked `current`:
+    `case j.PreviousVersion == "": refuseNoTarget = !sanctioned`. A resumed
+    journal with PreviousVersion="" + a persisted OR invocation sanction reached
+    StopUnit without verifying `current` is genuinely absent NOW — reachable via
+    a poisoned pre-#6374 journal (over-broad sanction persisted for a
+    present-but-corrupt current, carried across a deploy) or a `current` that
+    corrupted after a genuinely-sanctioned INIT, STOPping into a broken box (the
+    #6374 hazard). Fold: the empty-previous branch now re-resolves
+    `restorableCurrentTarget()` at resume time and refuses when `current` is
+    present-but-unrestorable, regardless of any sanction. Deliberately keyed on
+    `curPresent && curVer == ""` (present AND unrestorable), NOT Codex's literal
+    `|| prevPresent` — the latter would over-refuse a legit post-flip first-cut
+    resume whose flip already pointed `current` at the restorable target. New
+    tests: resumed-empty-previous + dangling current refuses under BOTH the
+    persisted-sanction and invocation-sanction; genuinely-absent resumed
+    first-cut still PROCEEDS (over-refusal control, transition-driven). Full
+    `go test ./pkg/upgrade/...` GREEN (existing sanctioned-resume test
+    unaffected); neutralizing the resume-time re-check drives the 2 dangling
+    tests RED while the absent control stays GREEN (confirmed firsthand),
+    restored GREEN. build+vet+gofmt clean. Still NOT HA-touching.
+  - **File(s)**: pkg/upgrade/cutover.go,
+    pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md

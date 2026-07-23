@@ -371,6 +371,125 @@ func TestRun_ResumedJournalRefusesBrokenPreviousEvenSanctioned(t *testing.T) {
 	assertNoLiveMutation(t, fs, "a recorded-but-broken rollback target (sanction must not bypass)")
 }
 
+// TestRun_ResumedEmptyPreviousDanglingCurrentRefusesPersistedSanction is the
+// Codex round-3 residual: the RESUMED empty-previous path must ALSO re-check
+// `current` at resume time. A resumed journal with PreviousVersion=="" and a
+// PERSISTED FirstCutSanctioned=true (e.g. a poisoned pre-#6374 journal whose
+// over-broad sanction was set for a present-but-corrupt current, carried across
+// a deploy) reaches the pre-STOP guard; if `current` is present-but-dangling
+// NOW, the cut must REFUSE before STOP regardless of that persisted sanction —
+// otherwise it STOPs into a box with a broken prior runtime and no recorded
+// rollback target (the exact #6374 hazard).
+//
+// FAIL-ON-REVERT: drop the resume-time `current` re-check (revert to
+// refuseNoTarget = !sanctioned) -> the persisted sanction waves the dangling
+// resume through to STOP -> the no-live-mutation assertions go RED.
+func TestRun_ResumedEmptyPreviousDanglingCurrentRefusesPersistedSanction(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	writeCompleteVersionDir(t, cfg, "2.0.0") // target complete; only `current` is broken
+	// Present-but-dangling current: symlink -> 1.0.0, versions/1.0.0 missing.
+	if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
+		t.Fatal(err)
+	}
+	j := &Journal{
+		State:              StateVerified,
+		TargetVersion:      "2.0.0",
+		PreviousVersion:    "",   // recorded EMPTY (first-cut-shaped)...
+		FirstCutSanctioned: true, // ...and the journal claims a first-cut sanction
+	}
+	must(t, r.saveJournal(j))
+
+	err := r.Run(Options{}) // no invocation flag; only the persisted sanction
+	if err == nil {
+		t.Fatal("expected refuse-before-STOP on a resumed empty-previous journal whose " +
+			"`current` is present-but-dangling, despite the persisted sanction")
+	}
+	if !strings.Contains(err.Error(), "refuse-before-STOP") {
+		t.Fatalf("error is not the refuse-before-STOP guard: %v", err)
+	}
+	assertNoLiveMutation(t, fs, "a resumed empty-previous cut over a present-but-dangling "+
+		"current (persisted sanction must not bypass)")
+}
+
+// TestRun_ResumedEmptyPreviousDanglingCurrentRefusesInvocationSanction is the
+// invocation-flag variant: the same resumed empty-previous journal, sanctioned
+// by THIS invocation's AllowNoRollbackFirstCut, must still refuse when `current`
+// is present-but-dangling at resume.
+func TestRun_ResumedEmptyPreviousDanglingCurrentRefusesInvocationSanction(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	writeCompleteVersionDir(t, cfg, "2.0.0")
+	if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
+		t.Fatal(err)
+	}
+	j := &Journal{
+		State:           StateVerified,
+		TargetVersion:   "2.0.0",
+		PreviousVersion: "", // recorded empty, NO persisted sanction
+	}
+	must(t, r.saveJournal(j))
+
+	err := r.Run(Options{AllowNoRollbackFirstCut: true}) // invocation sanction
+	if err == nil {
+		t.Fatal("expected refuse-before-STOP on a resumed empty-previous journal whose " +
+			"`current` is present-but-dangling, despite the invocation sanction")
+	}
+	if !strings.Contains(err.Error(), "refuse-before-STOP") {
+		t.Fatalf("error is not the refuse-before-STOP guard: %v", err)
+	}
+	assertNoLiveMutation(t, fs, "a resumed empty-previous cut over a present-but-dangling "+
+		"current (invocation sanction must not bypass)")
+}
+
+// TestRun_ResumedEmptyPreviousAbsentCurrentSanctionedProceeds is the round-3
+// contrast control: the resume-time re-check must NOT over-refuse. A genuinely
+// ABSENT `current` (a real first install resuming past VERIFY) + a sanction
+// must still PROCEED through STOP to a completed cut. Guards against a
+// fail-closed change that also breaks the legit first-cut resume (Codex's
+// literal `|| prevPresent` form would have broken the post-flip variant; this
+// keys on present-AND-unrestorable, so a genuinely-absent current proceeds).
+//
+// FAIL-ON-REVERT: gate the resume on `curPresent` instead of
+// `curPresent && curVer==""` (or refuse all empty-previous) -> this legit
+// first-cut resume is wrongly refused -> RED.
+func TestRun_ResumedEmptyPreviousAbsentCurrentSanctionedProceeds(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	// Drive a sanctioned first cut through VERIFY via real transitions (sets
+	// SourceGeneration etc.), leaving `current` genuinely absent (no flip yet),
+	// then resume. This is the legit first-install resume.
+	j := &Journal{State: StateInit, TargetVersion: "2.0.0", FirstCutSanctioned: true}
+	must(t, r.transition(j, StateStaged))
+	must(t, r.preflight(j))
+	must(t, r.transition(j, StatePreflight))
+	must(t, r.copyStaged(j))
+	must(t, r.transition(j, StateCopied))
+	must(t, r.verify(j))
+	must(t, r.transition(j, StateVerified))
+
+	if _, lerr := os.Lstat(currentLinkPath(cfg)); !os.IsNotExist(lerr) {
+		t.Fatalf("precondition: current must be absent before the resume (lstat: %v)", lerr)
+	}
+
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("genuinely-absent-current sanctioned first-cut resume must complete: %v", err)
+	}
+	sawStop := false
+	for _, c := range fs.calls {
+		if c == "stop" {
+			sawStop = true
+		}
+	}
+	if !sawStop {
+		t.Error("the pre-STOP gate refused a genuinely-absent sanctioned first-cut resume")
+	}
+	tgt, _ := os.Readlink(currentLinkPath(cfg))
+	if filepath.Base(tgt) != "2.0.0" {
+		t.Errorf("resumed sanctioned first cut did not flip current to 2.0.0: %q", tgt)
+	}
+}
+
 // TestRollback_RefusesUnrestorablePrevious proves the #6374 pre-rollback
 // preflight: rollback() refuses when PreviousVersion's runtime is missing/
 // incomplete BEFORE it stops the daemon or restores the config DB.

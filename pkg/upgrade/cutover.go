@@ -578,12 +578,24 @@ func (r *Runner) Run(opts Options) (err error) {
 	// the flag is still honored).
 	//
 	// REVALIDATE the persisted rollback target (#6374). The sanction is
-	// ASYMMETRIC by design:
+	// ASYMMETRIC by design, and — like the INIT gate — is honored ONLY when
+	// `current` is genuinely absent RIGHT NOW, never for a present-but-corrupt
+	// one:
 	//
 	//   - j.PreviousVersion == "" is the recorded-empty case (a genuinely
-	//     absent `current` at INIT). It is refused UNLESS sanctioned — a real
-	//     first install (AllowNoRollbackFirstCut / FirstCutSanctioned) is the
-	//     one legitimate no-rollback-target cut.
+	//     absent `current` at INIT). It is refused UNLESS sanctioned AND
+	//     `current` is STILL genuinely absent at resume. The sanction alone is
+	//     NOT enough: re-resolve `current` here and refuse if it is now
+	//     present-but-unrestorable (dangling / not-a-symlink / incomplete / I/O
+	//     error) even under a persisted OR invocation sanction. This mirrors the
+	//     INIT gate onto the symmetric resume path (Codex r3) and defends
+	//     against a poisoned pre-#6374 journal whose FirstCutSanctioned=true was
+	//     set for a present-but-corrupt current, or a `current` that corrupted
+	//     after a genuinely-sanctioned INIT. A `current` that resolves to a
+	//     RESTORABLE version (ver != "" — e.g. a post-flip first-cut resume
+	//     whose flip already pointed `current` at the target) is NOT corrupt and
+	//     must still proceed, so the guard keys on "present AND unrestorable",
+	//     not merely "present".
 	//   - j.PreviousVersion != "" means a rollback target WAS recorded. It must
 	//     still be restorable NOW: a journal written by an older (pre-#6374) run
 	//     could carry a dangling basename, or the dir could have been damaged /
@@ -600,7 +612,17 @@ func (r *Runner) Run(opts Options) (err error) {
 	refuseNoTarget := false
 	switch {
 	case j.PreviousVersion == "":
-		refuseNoTarget = !sanctioned
+		// Re-resolve `current` at resume time; a sanction proceeds only if
+		// `current` is genuinely absent (or already points at a restorable
+		// version), never if it is present-but-corrupt.
+		curVer, curPresent := r.restorableCurrentTarget()
+		currentPresentButBroken := curPresent && curVer == ""
+		if currentPresentButBroken {
+			r.logf("upgrade: resumed empty-previous cut but `current` is present and " +
+				"NOT restorable; refusing before STOP regardless of any first-cut " +
+				"sanction (#6374)")
+		}
+		refuseNoTarget = !sanctioned || currentPresentButBroken
 	default:
 		if verr := r.validateRestorableVersion(j.PreviousVersion); verr != nil {
 			r.logf("upgrade: recorded rollback target %s is not restorable before "+
