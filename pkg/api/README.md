@@ -354,19 +354,26 @@ under the daemon's errgroup. Nothing else imports this package.
       wildcard (`:8443` → empty) / non-encodable bind host is skipped, and a
       value already present is coalesced. Like the hostname path this only ever
       ADDS an encodable SAN, so it never aborts generation.
-    - **STILL NOT covered (tracked #5719 C001 residual):** a later `set system
-      host-name` (or a bind-address change) does NOT re-mint an
-      already-persisted cert, so its DNS/IP SANs can go stale. Closing this
-      needs a mint-ordering / invalidation hook and a decision on churning the
-      durable cert — deferred, because the bind host is baked at FIRST
-      generation only.
+    - **Re-mint STILL deferred, but no longer SILENT (#5719 C001 residual):** a
+      later `set system host-name` (or a bind-address change) does NOT re-mint
+      an already-persisted cert, so its DNS/IP SANs can go stale. Re-minting is
+      deferred (it needs a mint-ordering / invalidation hook and a decision on
+      churning the durable TOFU pin). What WAS a silent failure is now
+      diagnosed: on the load-success path `generateSelfSignedCertAt` parses the
+      loaded leaf and, when the current bind host is a concrete non-loopback
+      management host (`bindHostWarnable`) that the leaf's SANs do NOT cover
+      (`certCoversHost` — the same strict check a remote client applies), emits
+      a `slog.Warn` naming the bind host and the cert's SANs, so an operator
+      re-mints (remove `/etc/xpf/tls`) instead of chasing a silent
+      verification failure.
     An already-persisted cert is NOT auto-regenerated — the #1916 D6
     durable-cert contract keeps the on-disk pair stable so remote clients' TOFU
     pins survive a power loss; only freshly generated certs gain SANs (delete
     `cert.pem`/`key.pem` to force a regenerate). Pinned by
     `tls_san_5719_test.go` (SAN presence, hostname classification, the
-    non-ASCII no-abort guard, and the bind-host mgmt-IP/DNS threading +
-    `buildHTTPSServer` host-extraction), fail-on-revert.
+    non-ASCII no-abort guard, the bind-host mgmt-IP/DNS threading +
+    `buildHTTPSServer` host-extraction, and the stale-cert-on-rebind
+    mismatch warning), fail-on-revert.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during

@@ -1,3 +1,46 @@
+## 2026-07-23 — #5719 C001: fold Codex hostile-review findings into #6378
+
+- **Timestamp**: 2026-07-23 (fix/5719-capi-residuals, fold on PR #6378)
+- **Action**: Folded three verified Codex hostile-review findings on top of the
+  (sound) SAN-threading fix. Did NOT touch the SAN-threading logic.
+  1. **Silent stale-cert-on-rebind (substantive):** `generateSelfSignedCertAt`
+     LOADS an existing on-disk cert as-is (durable #1916 D6), so an A→B
+     management-IP rebind serves a cert whose SANs miss B and strict remote
+     verification silently fails. Re-mint stays deferred (durable-TOFU
+     contract), but the silence is closed: the load-success path now parses the
+     loaded leaf and, when the bind host is a concrete non-loopback management
+     host (`bindHostWarnable`) the leaf's SANs do NOT cover (`certCoversHost`,
+     via `x509.VerifyHostname` — the strict check a remote client applies),
+     emits a `slog.Warn` naming the bind host + the cert's DNS/IP SANs. Two
+     small testable helpers factored out.
+  2. **Comment/contract reconcile:** the `certGen` comment (`server.go` ~:303),
+     `buildHTTPSServer` doc, and `ReconcileHTTPS` doc (`listener.go` ~:155) said
+     the cert is "minted fresh on each (re)bind" — contradicting the durable
+     contract. Reworded: the cert is durable; a rebind LOADS the on-disk pair
+     as-is; a fresh mint happens ONLY when no on-disk pair exists.
+  3. **Case-insensitive DNS SANs (low):** `dnsSANsContain` now uses
+     `strings.EqualFold` (DNS is case-insensitive per RFC 4343) so
+     case-variant names coalesce instead of double-encoding.
+- **Tests**: added `TestLoadedCertBindHostMismatchWarns` (mint bind A → reload
+  bind B, assert the `slog.Warn` fires and names B; same/loopback rebind stays
+  silent — VERIFIED RED on neutralizing `certCoversHost`),
+  `TestCertCoversHostAndWarnable` (helper units), and a case-insensitive
+  coalescing subtest under `TestGenerateSelfSignedCertBindHostSAN`. Full
+  `go test ./pkg/api/... ./pkg/grpcapi/...` GREEN; go build + vet + gofmt clean.
+- **#5866 tension (report, NOT changed):** `TestMgmtReconcileTLSChange_5866`
+  (`pkg/daemon/management_5866_test.go:180-192`) asserts a HTTPS rebind serves
+  DIFFERENT leaf bytes — the OPPOSITE of the durable no-re-mint contract. It
+  passes only because the daemon test uses the production `/etc/xpf/tls` paths
+  (`certGen = generateSelfSignedCert`, no path redirect) which are unwritable in
+  CI, so persistence fails silently and each reconcile mints a fresh in-memory
+  cert. In production (writable `/etc/xpf/tls`) the second reconcile would LOAD
+  the same on-disk pair → same bytes → that assertion would FAIL. Needs a
+  follow-up issue: redirect the test to a temp TLS dir and re-encode the
+  intended semantic (a MATERIAL change rebinds the listener, not necessarily a
+  new cert). Left untouched per instructions.
+- **File(s)**: pkg/api/server.go, pkg/api/listener.go, pkg/api/README.md,
+  pkg/api/tls_san_5719_test.go
+
 ## 2026-07-23 — #5719 C001 residual: thread HTTPS mgmt bind IP into cert SANs
 
 - **Timestamp**: 2026-07-23 (fix/5719-capi-residuals)

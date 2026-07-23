@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"log/slog"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -240,6 +243,138 @@ func TestGenerateSelfSignedCertBindHostSAN(t *testing.T) {
 		leaf := certLeafBind(t, "fw-node0", "")
 		assertLoopbackSANs(t, leaf)
 	})
+
+	t.Run("bind_host_case_differs_from_hostname_not_duplicated", func(t *testing.T) {
+		// DNS SANs are case-insensitive (RFC 4343): a bind host that differs
+		// from the kernel hostname only in case must COALESCE, not double-
+		// encode. RED on revert: dnsSANsContain drops strings.EqualFold and
+		// "FW-NODE0" is appended alongside "fw-node0" (count=2).
+		leaf := certLeafBind(t, "fw-node0", "FW-NODE0")
+		n := 0
+		for _, s := range leaf.DNSNames {
+			if strings.EqualFold(s, "fw-node0") {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatalf("case-variant bind host duplicated DNS SAN fw-node0 (count=%d) in %v", n, leaf.DNSNames)
+		}
+	})
+}
+
+// TestLoadedCertBindHostMismatchWarns is a FAIL-ON-REVERT guard for the #5719
+// C001 silent-stale-cert-on-rebind residual: generateSelfSignedCertAt LOADS an
+// existing on-disk cert AS-IS (the durable #1916 D6 contract — it must NOT
+// re-mint on a bind change, which would churn remote clients' TOFU pins). But a
+// cert minted for management host A does NOT cover a later rebind to host B, so
+// strict remote verification by B silently fails. The load-success path must
+// emit a diagnostic naming the uncovered bind host so an operator can re-mint
+// (remove /etc/xpf/tls), rather than serving the stale cert in silence.
+//
+// RED on revert: drop the bindHostWarnable/certCoversHost check on the load-
+// success path (or neutralize certCoversHost to always return true) and the
+// A→B reload emits no warning — the mismatch subtests below fail.
+func TestLoadedCertBindHostMismatchWarns(t *testing.T) {
+	restore := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(restore) })
+
+	// mintThenReload mints a durable cert for firstBind at a fresh temp dir,
+	// then RELOADS it (the on-disk pair now exists) for secondBind, returning
+	// any slog output the reload emits.
+	mintThenReload := func(t *testing.T, hostname, firstBind, secondBind string) string {
+		t.Helper()
+		resetTLSSeams(t)
+		tlsHostname = func() (string, error) { return hostname, nil }
+		dir, certPath, keyPath := tlsPaths(t)
+		if _, err := generateSelfSignedCertAt(dir, certPath, keyPath, firstBind); err != nil {
+			t.Fatalf("first mint (bind %q): %v", firstBind, err)
+		}
+		var buf bytes.Buffer
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, secondBind)
+		if err != nil {
+			t.Fatalf("reload (bind %q): %v", secondBind, err)
+		}
+		// The reload must return the SAME durable leaf bytes — the #1916 D6
+		// no-re-mint contract the warning exists to compensate for.
+		leaf, perr := x509.ParseCertificate(cert.Certificate[0])
+		if perr != nil {
+			t.Fatalf("parse reloaded leaf: %v", perr)
+		}
+		if leaf.Subject.CommonName != hostname && hostname != "" {
+			t.Fatalf("reload minted a fresh cert (CN=%q) instead of loading the durable pair", leaf.Subject.CommonName)
+		}
+		return buf.String()
+	}
+
+	const mismatchMsg = "does not cover bind host"
+
+	t.Run("ip_rebind_mismatch_warns", func(t *testing.T) {
+		out := mintThenReload(t, "fw-node0", "10.0.0.1", "10.0.0.2")
+		if !strings.Contains(out, mismatchMsg) {
+			t.Fatalf("A→B management-IP rebind must warn on a stale cert; got log %q", out)
+		}
+		if !strings.Contains(out, "10.0.0.2") {
+			t.Fatalf("warning must name the uncovered bind host 10.0.0.2; got %q", out)
+		}
+	})
+
+	t.Run("dns_rebind_mismatch_warns", func(t *testing.T) {
+		out := mintThenReload(t, "fw-node0", "mgmt-a.example.com", "mgmt-b.example.com")
+		if !strings.Contains(out, mismatchMsg) {
+			t.Fatalf("A→B DNS rebind must warn on a stale cert; got %q", out)
+		}
+	})
+
+	t.Run("same_bind_reload_is_silent", func(t *testing.T) {
+		out := mintThenReload(t, "fw-node0", "10.0.0.1", "10.0.0.1")
+		if strings.Contains(out, mismatchMsg) {
+			t.Fatalf("a reload with the SAME covered bind host must not warn; got %q", out)
+		}
+	})
+
+	t.Run("loopback_rebind_is_silent", func(t *testing.T) {
+		// Loopback SANs are always present, so a loopback rebind is covered and
+		// not warnable (bindHostWarnable gates it out).
+		out := mintThenReload(t, "fw-node0", "10.0.0.1", "127.0.0.1")
+		if strings.Contains(out, mismatchMsg) {
+			t.Fatalf("a loopback rebind must not warn (loopback SANs always present); got %q", out)
+		}
+	})
+}
+
+// TestCertCoversHostAndWarnable unit-checks the two folded helpers directly so a
+// neutralization is caught even if the load-path integration changes.
+func TestCertCoversHostAndWarnable(t *testing.T) {
+	leaf := certLeafBind(t, "fw-node0", "10.0.0.1")
+	if !certCoversHost(leaf, "10.0.0.1") {
+		t.Fatal("certCoversHost must be true for the covered mgmt IP")
+	}
+	if certCoversHost(leaf, "10.0.0.2") {
+		t.Fatal("certCoversHost must be false for an uncovered mgmt IP")
+	}
+	if !certCoversHost(leaf, "127.0.0.1") {
+		t.Fatal("certCoversHost must be true for a loopback SAN")
+	}
+
+	warnable := []struct {
+		host string
+		want bool
+	}{
+		{"10.0.0.1", true},
+		{"mgmt.example.com", true},
+		{"", false},
+		{"localhost", false},
+		{"127.0.0.1", false},
+		{"::1", false},
+		{"0.0.0.0", false},
+		{"::", false},
+	}
+	for _, c := range warnable {
+		if got := bindHostWarnable(c.host); got != c.want {
+			t.Errorf("bindHostWarnable(%q) = %v, want %v", c.host, got, c.want)
+		}
+	}
 }
 
 // TestBuildHTTPSServerThreadsBindHost is a FAIL-ON-REVERT guard that
