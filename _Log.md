@@ -1,3 +1,53 @@
+## 2026-07-23 — #5583 C180: fold two Codex MAJOR findings into #6383
+
+- **Timestamp**: 2026-07-23 (fix/5583-codex180, fold on PR #6383)
+- **Action**: Folded two verified Codex MERGE-NEEDS-MAJOR findings.
+  FINDING 1 — tcp-flags empty/misordered group rejection
+  (pkg/config/tcp_flags.go). The prior parenDepth fix rejected UNBALANCED
+  parens but still ACCEPTED balanced-but-malformed groups: `syn()` parsed to
+  0x02 (an empty `()` after a flag inherited the global segHasFlag) and
+  `(syn&)ack` parsed to 0x12 (a dangling `&` before `)` plus `ack` crossing the
+  close with no operator). Added (a) a per-group flag-presence stack
+  (`groupHasFlag`): a `(` pushes a false frame, a flag sets the top frame, a `)`
+  pops and REJECTS an empty frame — with transitive propagation so `((syn))`
+  stays accepted; and (b) a single top-of-loop `justClosedGroup` guard: after a
+  `)` the only valid next tokens are `&`, another `)`, or end — any operand
+  (flag / `!` / `(`) is a `)`-followed-by-operand misorder. Both are single
+  load-bearing checks (verified RED-on-revert: neutralize `!had` → `syn()`,
+  `syn ( )` accept; neutralize the top guard → `(syn)ack`, `(syn)!ack`,
+  `(syn)(ack)`, `(syn&)ack`, and the leak case `(syn)(& ack)` accept). A
+  dedicated in-`)` segHasFlag check for `(syn&)` was DROPPED as a non-load-
+  bearing shadow — the trailing-`&` post-loop guard already rejects it. All
+  legitimate forms preserved with identical masks: `syn`(0x02), `(syn)`(0x02),
+  `(syn & ack)`(0x12), `(syn & !ack)`(req0x02/forb0x10), `((syn & !ack))`(same),
+  `!ack`(forb0x10), `(!fin)`(forb0x01), `syn ack`(0x12), `(syn) & (ack)`(0x12).
+  New test TestParseTCPFlagsMalformedGroups + two commit-layer asserts in
+  TestFirewallFilterTCPFlagsCommitReject (`syn()`, `(syn)ack`).
+  FINDING 2 — SNMP shutdown accounting overclaim (pkg/snmp/traps.go +
+  README.md). The C180-026 comment/README claimed `accepted == delivered +
+  trapsDropped` exactly, but enqueueTrap passed the stopped check then UNLOCKED
+  before sending, so an enqueue could buffer into an orphaned queue after the
+  worker drained and exited — a job neither sent nor counted. Chose path (a):
+  actually CLOSE the race. enqueueTrap now publishes the job with a NON-BLOCKING
+  send under the SAME a.mu that Stop takes to set stopped / close trapStop, so
+  enqueue and Stop are strictly serialized: a job admitted to the queue is
+  buffered before close(trapStop) is observable (the shutdown drain counts it),
+  and a job that loses the race sees stopped and drops+counts. Accounting is now
+  EXACT with no residual, so the README exactness claim is TRUE (updated to
+  explain WHY, not softened). No send-under-lock deadlock: the send is non-
+  blocking and the worker never takes a.mu (verified `go test -race ./pkg/snmp`
+  GREEN, full suite). Kept TestStop_CountsAbandonedTrapBacklog (backlog case,
+  deterministic). Added TestStop_AccountingExactUnderConcurrentEnqueue as an
+  invariant + -race guard (documented as NOT a deterministic fail-on-revert:
+  the orphan window is too narrow to hit without a production seam; exactness is
+  guaranteed by the lock discipline). No follow-up issue needed — the race is
+  closed, not documented-around. No HA/cluster/vrrp/failover code touched.
+  build + vet + gofmt clean; full `go test ./pkg/config` (12.9s) and
+  `go test -race ./pkg/snmp` (18.6s) GREEN.
+- **File(s)**: pkg/config/tcp_flags.go, pkg/config/tcp_flags_test.go,
+  pkg/snmp/traps.go, pkg/snmp/agent_stop_leak_4916_test.go,
+  pkg/snmp/README.md, _Log.md
+
 ## 2026-07-23 — #5719 C001: fold Codex hostile-review findings into #6378
 
 - **Timestamp**: 2026-07-23 (fix/5719-capi-residuals, fold on PR #6378)

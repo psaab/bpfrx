@@ -362,11 +362,23 @@ the old target.
 The abandoned backlog is ACCOUNTED for, not silently discarded (C180-026): on
 stop the worker (the sole queue reader) counts every dequeued-but-unsent job
 plus every job still buffered in the queue into `trapsDropped` exactly once via
-`countAbandonedTraps`, so `accepted == delivered + trapsDropped` and the drop
-total covers shutdown-abandoned link-state traps — not just queue-full and
-post-Stop-enqueue drops. Before this, `trapsDropped` reported zero for a
-shutdown that discarded a queued backlog. Fail-on-revert guard:
-`TestStop_CountsAbandonedTrapBacklog`.
+`countAbandonedTraps`, so the drop total covers shutdown-abandoned link-state
+traps — not just queue-full and post-Stop-enqueue drops. Before this,
+`trapsDropped` reported zero for a shutdown that discarded a queued backlog.
+Fail-on-revert guard: `TestStop_CountsAbandonedTrapBacklog`.
+
+This accounting is **exact** — `accepted == delivered + trapsDropped` with no
+residual — because `enqueueTrap` publishes to the queue under the same `a.mu`
+that `Stop` takes to set `stopped` / close `trapStop`. Enqueue and Stop are
+therefore strictly serialized: a job admitted to the queue is buffered before
+`close(trapStop)` is observable (so the shutdown drain counts it), and a job
+that loses the race sees `stopped` and drops+counts. The send is non-blocking
+(buffered channel + `default`) and the worker never takes `a.mu`, so publishing
+under the lock cannot deadlock. Before the send was moved under the lock, an
+enqueue that passed the stopped check could buffer into an orphaned queue after
+the worker had already drained and exited — a job neither delivered nor
+counted, breaking the invariant. Concurrent-accounting guard:
+`TestStop_AccountingExactUnderConcurrentEnqueue`.
 
 The reconcile runs **early** in `applyConfigLocked` — before the dataplane
 apply, which can abort the reconcile pipeline early (it returns on

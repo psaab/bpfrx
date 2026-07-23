@@ -280,6 +280,90 @@ func TestParseTCPFlagsUnbalancedParens(t *testing.T) {
 	}
 }
 
+// TestParseTCPFlagsMalformedGroups is the C180-024-completion RED-on-revert
+// guard. Balancing the grouping parentheses (the earlier parenDepth fix) still
+// accepted balanced-but-malformed groups: an EMPTY group that contributes no
+// flag operand ("syn()", "()" inside a larger expression), a dangling '&'
+// standing immediately before a ')' with no right operand ("(syn&)"), and a
+// ')' immediately followed by another operand — a bare flag, a '!', or a '(' —
+// with no intervening '&' operator ("(syn)ack", "(syn&)ack", "(syn)(ack)").
+// The flag bits still parsed, so the malformed value COMMITTED as if the parens
+// were absent; these must now be REJECTED. RED on revert: neutralize the
+// per-group flag-presence check (empty group), the segHasFlag-before-')' check
+// (dangling '&'), or the justClosedGroup operand-after-close check
+// (')' followed by an operand) in ParseTCPFlagsExpression and the matching
+// reject case below FAILS.
+//
+// Distinct from the earlier #5455 (an EMPTY group "()" at the TOP level sets no
+// flag bits and was already caught by the post-loop no-flag guard) and the
+// C180-024 parenDepth balance check ("(syn", "syn)") — this guards the
+// balanced-but-empty / balanced-but-misordered residual those did not catch.
+func TestParseTCPFlagsMalformedGroups(t *testing.T) {
+	// Balanced-but-malformed groups → error (fail-closed).
+	reject := []struct {
+		name string
+		in   []string
+	}{
+		{"empty-group-after-flag", []string{"syn()"}},          // "x()" empty group
+		{"empty-group-in-expr", []string{"syn & ()"}},          // "()" inside a larger expr
+		{"empty-group-after-flag-spaced", []string{"syn ( )"}}, // whitespace does not fill it
+		{"amp-before-close", []string{"(syn&)"}},               // dangling '&' before ')'
+		{"amp-before-close-then-flag", []string{"(syn&)ack"}},  // finding case #2
+		{"close-then-bare-flag", []string{"(syn)ack"}},         // finding case: ')' then flag
+		{"close-then-neg", []string{"(syn)!ack"}},              // ')' then '!'
+		{"close-then-group", []string{"(syn)(ack)"}},           // ')' then '('
+		// ')(' where the second group leads with '&': the segHasFlag from the
+		// first group would leak across the boundary and let the '&' pass, so
+		// only the operand-after-close guard rejects this.
+		{"close-then-group-lead-amp", []string{"(syn)(& ack)"}},
+	}
+	for _, r := range reject {
+		t.Run("reject/"+r.name, func(t *testing.T) {
+			req, forb, ok, err := ParseTCPFlagsExpression(r.in)
+			if err == nil {
+				t.Fatalf("ParseTCPFlagsExpression(%v): expected malformed-group error, got req=0x%02x forb=0x%02x ok=%v",
+					r.in, req, forb, ok)
+			}
+			if ok {
+				t.Errorf("ParseTCPFlagsExpression(%v): ok must be false on error, got true", r.in)
+			}
+		})
+	}
+
+	// Over-rejection guard: every legitimate Junos grouping form still ACCEPTS
+	// with the SAME masks. The fix must not narrow or widen any valid input.
+	valid := []struct {
+		name      string
+		in        []string
+		required  uint8
+		forbidden uint8
+	}{
+		{"plain-flag", []string{"syn"}, 0x02, 0},
+		{"group-single", []string{"(syn)"}, 0x02, 0},
+		{"group-conjunction", []string{"(syn & ack)"}, 0x12, 0},
+		{"group-syn-not-ack", []string{"(syn & !ack)"}, 0x02, 0x10},
+		{"nested-balanced", []string{"((syn & !ack))"}, 0x02, 0x10},
+		{"nested-single", []string{"((syn))"}, 0x02, 0},
+		{"neg-flag", []string{"!ack"}, 0, 0x10},
+		{"group-neg", []string{"(!fin)"}, 0, 0x01},
+		{"flag-list", []string{"syn ack"}, 0x12, 0},
+		{"group-amp-group", []string{"(syn) & (ack)"}, 0x12, 0},
+		{"syn-not-ack", []string{"syn & !ack"}, 0x02, 0x10},
+	}
+	for _, v := range valid {
+		t.Run("accept/"+v.name, func(t *testing.T) {
+			req, forb, ok, err := ParseTCPFlagsExpression(v.in)
+			if err != nil {
+				t.Fatalf("ParseTCPFlagsExpression(%v): unexpected error (over-rejection): %v", v.in, err)
+			}
+			if !ok || req != v.required || forb != v.forbidden {
+				t.Errorf("ParseTCPFlagsExpression(%v) = (req=0x%02x, forb=0x%02x, ok=%v), want (req=0x%02x, forb=0x%02x, ok=true)",
+					v.in, req, forb, ok, v.required, v.forbidden)
+			}
+		})
+	}
+}
+
 // TestFirewallFilterTCPFlagsCommitReject is the #3076 commit-layer guard. A
 // firewall filter carrying a tcp-flags expression the dataplane cannot enforce
 // (here a disjunction) MUST fail to compile rather than commit with the
@@ -335,5 +419,14 @@ func TestFirewallFilterTCPFlagsCommitReject(t *testing.T) {
 	// than committing as if the paren were absent (strict-grammar hardening).
 	if _, err := build("(syn"); err == nil {
 		t.Error("tcp-flags \"(syn\" (unbalanced paren) should be rejected at commit (fail-closed), but compiled")
+	}
+	// C180-024 completion: a balanced-but-malformed group — an empty group and
+	// a ')' followed by a bare flag — must also be rejected at commit rather
+	// than committing as if the parens were absent.
+	if _, err := build("syn()"); err == nil {
+		t.Error("tcp-flags \"syn()\" (empty group) should be rejected at commit (fail-closed), but compiled")
+	}
+	if _, err := build("(syn)ack"); err == nil {
+		t.Error("tcp-flags \"(syn)ack\" (misordered group) should be rejected at commit (fail-closed), but compiled")
 	}
 }
