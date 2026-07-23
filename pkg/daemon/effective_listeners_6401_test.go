@@ -10,8 +10,12 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"net"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/api"
 	"github.com/psaab/xpf/pkg/sysservices"
@@ -78,5 +82,75 @@ func TestEffectiveHTTPListenerEphemeralPort(t *testing.T) {
 	}
 	if got.Addr == "" || strings.HasSuffix(got.Addr, ":0") {
 		t.Errorf("ephemeral bind addr not resolved to a concrete port: %q", got.Addr)
+	}
+}
+
+// serveExitLn is an in-memory listener whose Accept blocks until either Close
+// (a requested shutdown → net.ErrClosed) or fail is closed (an UNEXPECTED
+// self-termination → a non-net error, so http.Server.Serve returns it). It
+// drives the serve-exit path WITHOUT a real socket (the review sandbox blocks
+// them).
+type serveExitLn struct {
+	addr   net.Addr
+	fail   chan struct{}
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (l *serveExitLn) Accept() (net.Conn, error) {
+	select {
+	case <-l.fail:
+		return nil, errors.New("simulated unexpected serve failure")
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+func (l *serveExitLn) Close() error   { l.once.Do(func() { close(l.closed) }); return nil }
+func (l *serveExitLn) Addr() net.Addr { return l.addr }
+
+// TestEffectiveHTTPListenerServeExitFails pins the #6401 HTTP↔gRPC SYMMETRY
+// fold: when a CONVERGED HTTP leg's serve loop exits UNEXPECTEDLY (not a
+// requested shutdown), `show system services` must report the listener Failed —
+// NOT StateListening on a dead socket. Before the fold the reconciler reported
+// Listening on the dead listener's address (curSet stayed true and
+// EffectiveHTTPAddr returned the dead leg's Addr), asymmetric with the gRPC
+// serve-exit clear.
+func TestEffectiveHTTPListenerServeExitFails(t *testing.T) {
+	ln := &serveExitLn{
+		addr:   &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080},
+		fail:   make(chan struct{}),
+		closed: make(chan struct{}),
+	}
+	cfg := api.Config{
+		Addr:       "127.0.0.1:8080",
+		ListenFunc: func(_, _ string) (net.Listener, error) { return ln, nil },
+	}
+	m := newManagementReconciler(&Daemon{}, api.Config{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.startTo(ctx, cfg); err != nil {
+		t.Fatalf("startTo: %v", err)
+	}
+	// Converged and serving.
+	if got := m.effectiveHTTPListener(); got.State != sysservices.StateListening {
+		t.Fatalf("initial state = %v, want StateListening: %+v", got.State, got)
+	}
+
+	// Trigger an UNEXPECTED serve exit (not a requested shutdown).
+	close(ln.fail)
+
+	// The leg's serve goroutine marks the leg dead asynchronously; poll until
+	// the reconciler reports Failed (with a generous bound so a GREEN run
+	// finishes in a few ms and a RED run trips cleanly, not a hang).
+	var got sysservices.Listener
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got = m.effectiveHTTPListener(); got.State == sysservices.StateFailed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got.State != sysservices.StateFailed {
+		t.Fatalf("HTTP serve exit not reported Failed (still Listening on a dead leg): %+v", got)
 	}
 }

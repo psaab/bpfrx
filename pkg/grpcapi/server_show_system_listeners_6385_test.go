@@ -150,7 +150,16 @@ func TestGRPCEffectiveListenerBindFailure(t *testing.T) {
 // serve loop exits the state clears to Failed so a stale bound address is not
 // reported for a dead server.
 func TestGRPCEffectiveListenerLifecycle(t *testing.T) {
-	s := NewServer("127.0.0.1:0", Config{})
+	const requested = "127.0.0.1:0"
+	s := NewServer(requested, Config{})
+
+	// PRE-BIND: before Run, EffectiveListener reports the requested address as
+	// Listening (gRPC always binds on loopback; the tiny pre-bind window is not
+	// flagged as a failure).
+	if pre := s.EffectiveListener(); pre.State != sysservices.StateListening || pre.Addr != requested {
+		t.Fatalf("pre-bind listener = %+v, want {Addr:%q State:Listening}", pre, requested)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
@@ -172,10 +181,22 @@ func TestGRPCEffectiveListenerLifecycle(t *testing.T) {
 		<-done
 		t.Fatalf("gRPC never reached bound Listening with a concrete port: %+v", ln)
 	}
+	boundAddr := ln.Addr // the concrete ephemeral port, e.g. 127.0.0.1:45321
 
+	// SERVE EXIT: after the serve loop returns, the state must clear to Failed
+	// AND the reported address must NOT be the stale concrete bound address — a
+	// regression that sets Failed but retains effAddr would still render the dead
+	// server at its old bound port. The cleared Failed reports the requested addr.
 	cancel()
 	<-done
-	if got := s.EffectiveListener(); got.State != sysservices.StateFailed {
-		t.Errorf("after serve exit, state = %v, want StateFailed (cleared): %+v", got.State, got)
+	got := s.EffectiveListener()
+	if got.State != sysservices.StateFailed {
+		t.Errorf("after serve exit, state = %v, want StateFailed: %+v", got.State, got)
+	}
+	if got.Addr == boundAddr {
+		t.Errorf("after serve exit, addr = %q still the STALE bound address (not cleared)", got.Addr)
+	}
+	if got.Addr != requested {
+		t.Errorf("after serve exit, addr = %q, want the cleared/requested %q", got.Addr, requested)
 	}
 }

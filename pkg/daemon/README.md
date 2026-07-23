@@ -278,13 +278,16 @@ from a serving listener's bare address:
 - **HTTP REST** — `d.mgmt.effectiveHTTPListener()`. `Disabled` when the
   reconciler is absent (empty `--api-addr`, listener never started); `Failed`
   (reporting the attempted `lastHTTPAttempt`) when it was configured but the boot
-  bind never converged (`curSet` false); else `Listening` on the ACTUAL bound
-  address read from the live server (`api.Server.EffectiveHTTPAddr()` →
-  `httpLeg.ln.Addr()`, so an ephemeral `:0` resolves to its concrete port and a
-  wildcard/hostname bind is normalized), falling back to the converged
-  `m.cur.addr`. A day-2 rebind failure RETAINS the old serving leg (`curSet`
-  stays true), so this reports the address still serving, not the failed new
-  bind.
+  bind never converged (`curSet` false); `Failed` ALSO when a converged leg's
+  serve loop later exits UNEXPECTEDLY — `api.Server.EffectiveHTTPAddr()` returns
+  `""` for a leg the serve goroutine marked `dead` (listener.go), symmetric with
+  the gRPC serve-exit clear, so a dead HTTP listener is never reported
+  `Listening`; else `Listening` on the ACTUAL bound address read from the live
+  server (`EffectiveHTTPAddr()` → `httpLeg.ln.Addr()`, so an ephemeral `:0`
+  resolves to its concrete port and a wildcard/hostname bind is normalized). A
+  day-2 rebind failure RETAINS the old serving leg (its socket stays live →
+  `EffectiveHTTPAddr` non-empty), so this reports the address still serving, not
+  the failed new bind.
 
 BOTH render surfaces read this ONE snapshot: the remote gRPC renderer via
 `grpcapi.Config.ListenersFn` and the local console CLI via `cli.SetListenersFn`,

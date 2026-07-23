@@ -148,12 +148,15 @@ func (m *managementReconciler) startTo(ctx context.Context, next api.Config) err
 //     failed one.
 //   - configured but never converged (curSet false) → StateFailed: the boot
 //     bind failed. Reports lastHTTPAttempt (the address it could not bind).
-//   - converged → StateListening: reports the ACTUAL bound address from the live
-//     server (EffectiveHTTPAddr — so an ephemeral :0 resolves to its concrete
-//     port), falling back to the converged requested fingerprint (m.cur.addr) if
-//     the server can't report it. A day-2 rebind failure RETAINS the old serving
-//     leg (curSet stays true), so this correctly reports the address still
-//     serving, not the failed new bind.
+//   - converged but the live HTTP leg is no longer serving (an UNEXPECTED serve
+//     exit — EffectiveHTTPAddr returns "") → StateFailed, symmetric with the
+//     gRPC serve-exit clear. Reports m.cur.addr (or lastHTTPAttempt). A day-2
+//     rebind FAILURE is NOT this case: it RETAINS the old serving leg (its
+//     socket stays live → EffectiveHTTPAddr non-empty), so it correctly stays
+//     Listening.
+//   - converged and serving → StateListening: reports the ACTUAL bound address
+//     from the live server (EffectiveHTTPAddr — so an ephemeral :0 resolves to
+//     its concrete port).
 func (m *managementReconciler) effectiveHTTPListener() sysservices.Listener {
 	if m == nil {
 		return sysservices.Listener{State: sysservices.StateDisabled}
@@ -163,13 +166,20 @@ func (m *managementReconciler) effectiveHTTPListener() sysservices.Listener {
 	if !m.curSet {
 		return sysservices.Listener{Addr: m.lastHTTPAttempt, State: sysservices.StateFailed}
 	}
-	addr := m.cur.addr
+	var bound string
 	if m.srv != nil {
-		if bound := m.srv.EffectiveHTTPAddr(); bound != "" {
-			addr = bound
-		}
+		bound = m.srv.EffectiveHTTPAddr()
 	}
-	return sysservices.Listener{Addr: addr, State: sysservices.StateListening}
+	if bound == "" {
+		// The converged HTTP leg died (an unexpected serve exit): report Failed,
+		// not a stale Listening on a dead socket.
+		addr := m.cur.addr
+		if addr == "" {
+			addr = m.lastHTTPAttempt
+		}
+		return sysservices.Listener{Addr: addr, State: sysservices.StateFailed}
+	}
+	return sysservices.Listener{Addr: bound, State: sysservices.StateListening}
 }
 
 // reconcile matches the live listener + auth snapshot to cfg. It returns a

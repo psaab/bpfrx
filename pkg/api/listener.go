@@ -21,6 +21,13 @@ type listenerLeg struct {
 	ln       net.Listener
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	// dead is set (under lifeMu) when the leg's serve loop exits UNEXPECTEDLY —
+	// the listener terminated on its own, not via a requested shutdown
+	// (stopLegLocked / rootCtx). EffectiveHTTPAddr treats a dead leg as
+	// not-serving so `show system services` reports the HTTP listener Failed
+	// rather than Listening on a dead socket, symmetric with the gRPC serve-exit
+	// clear (#6401).
+	dead bool
 }
 
 // serveLegLocked launches srv on ln in a background goroutine registered on the
@@ -58,6 +65,17 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool) *
 			if err != nil && err != http.ErrServerClosed {
 				slog.Error("API listener terminated unexpectedly", "addr", srv.Addr, "tls", isTLS, "err", err)
 			}
+			// #6401: an UNEXPECTED serve exit means this leg is no longer
+			// serving. Mark it dead (under lifeMu, freshly acquired — this
+			// runs AFTER serveLegLocked returned and released the caller's
+			// lock, so no nesting) so EffectiveHTTPAddr stops reporting the
+			// dead listener's address and `show system services` renders the
+			// HTTP listener Failed, mirroring the gRPC serve-exit clear. A leg
+			// already retired/replaced by a reconcile takes the stopCh path
+			// below instead, so this only fires on a genuine self-termination.
+			s.lifeMu.Lock()
+			leg.dead = true
+			s.lifeMu.Unlock()
 			return
 		case <-leg.stopCh:
 		case <-rootDone:
@@ -133,7 +151,7 @@ func (s *Server) Wait() {
 func (s *Server) EffectiveHTTPAddr() string {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()
-	if s.httpLeg == nil || s.httpLeg.ln == nil {
+	if s.httpLeg == nil || s.httpLeg.ln == nil || s.httpLeg.dead {
 		return ""
 	}
 	return s.httpLeg.ln.Addr().String()

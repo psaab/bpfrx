@@ -58921,3 +58921,35 @@ top.
     pkg/cli/cli_show_system_listeners_6385_test.go,
     pkg/daemon/management.go, pkg/daemon/daemon_run_servers.go,
     pkg/daemon/effective_listeners_6401_test.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6385/#6401 fold round 2 — HTTP↔gRPC serve-exit SYMMETRY
+    (Codex MAJOR, adjudicated real) + gRPC-lifecycle test tightening (Codex
+    MINOR). MAJOR: an UNEXPECTED HTTP `Serve` exit in `serveLegLocked`
+    (pkg/api/listener.go) only logged+returned, leaving `httpLeg.ln` live, so
+    `EffectiveHTTPAddr()` still returned the dead listener's addr and
+    `effectiveHTTPListener()` reported StateListening on a DEAD leg — asymmetric
+    with the gRPC serve-exit clear. Fix: added `listenerLeg.dead`, marked true
+    under `lifeMu` on the unexpected-exit branch ONLY (requested shutdown via
+    stopCh/rootCtx unaffected); `EffectiveHTTPAddr()` returns "" for a dead leg;
+    `effectiveHTTPListener()` maps converged-but-EffectiveHTTPAddr=="" →
+    StateFailed (day-2 rebind failure RETAINS the old live leg → non-empty →
+    stays Listening, unaffected). MINOR: tightened
+    TestGRPCEffectiveListenerLifecycle to assert (a) pre-bind state before Run
+    (Listening on requested addr) and (b) post-serve-exit addr is CLEARED (==
+    requested, != the stale concrete bound port) — the old test asserted only
+    State==Failed and would miss a retain-stale-effAddr regression. New test
+    TestEffectiveHTTPListenerServeExitFails drives the serve-exit via an
+    in-memory erroring listener (NO real socket — review sandbox blocks
+    sockets): Accept errors on a signal → Serve exits → leg dead → reconciler
+    reports Failed. Both RED verified FIRSTHAND (neutralize leg.dead → Listening
+    on dead leg RED; neutralize the gRPC clear to retain stale addr → stale-port
+    RED), restored GREEN. gofmt/vet clean; `go test ./pkg/sysservices/
+    ./pkg/api/ ./pkg/grpcapi/ ./pkg/cli/ ./pkg/daemon/` GREEN; `-race` GREEN
+    (full pkg/api + listener tests + mgmt reconcile). docs: pkg/daemon/README.md
+    HTTP bullet + pkg/api/README.md EffectiveHTTPAddr note updated for the
+    dead-leg/serve-exit symmetry.
+  - **File(s)**: pkg/api/listener.go, pkg/api/README.md,
+    pkg/daemon/management.go, pkg/daemon/effective_listeners_6401_test.go,
+    pkg/daemon/README.md, pkg/grpcapi/server.go,
+    pkg/grpcapi/server_show_system_listeners_6385_test.go, _Log.md
