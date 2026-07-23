@@ -1,0 +1,61 @@
+package nftables
+
+// netlink_fence.go builds the #5644 cold-boot fail-closed fence and the #5789
+// additive coverage-gap fence via netlink, mirroring buildHostInboundFencePayload
+// / buildHostInboundGapFencePayload / hostInboundFenceMandatoryAdmits in
+// pkg/daemon/daemon_nft.go (the parity ORACLE). Both fences are the real
+// host-inbound table with every per-service ACCEPT removed: the shared mandatory
+// admits (return/ND/PMTUD/ESP-AH/WG) followed by a catch-all DROP (no named
+// counter) for the fenced firewall-local addresses.
+
+// hostInboundFenceMandatoryAdmitsNetlink mirrors hostInboundFenceMandatoryAdmits:
+// the fence chain's mandatory-admit rules — established/related, raw ESP/AH, IPv6
+// ND, v4/v6 PMTUD/error, and the configured WireGuard listen port(s). No named
+// counters (a fence is transient).
+func hostInboundFenceMandatoryAdmitsNetlink(p *nlPlan, wgListenPorts []uint16) {
+	p.rule().ctEstablishedRelated().emit(verdictAccept()...)
+	p.rule().l4protoSet([]uint8{50, 51}).emit(verdictAccept()...)
+	p.rule().icmpType(famV6, []uint8{1, 2, 3, 4}).emit(verdictAccept()...)
+	p.rule().icmpType(famV6, []uint8{133, 134, 135, 136, 137}).emit(verdictAccept()...)
+	p.rule().icmpType(famV4, []uint8{3, 11, 12}).emit(verdictAccept()...)
+	if len(wgListenPorts) > 0 {
+		p.rule().l4Port(protoUDP, "dport", portsFromUint16(wgListenPorts), false).emit(verdictAccept()...)
+	}
+}
+
+// buildHostInboundFenceNetlink mirrors buildHostInboundFencePayload: the
+// mandatory admits plus a catch-all DROP for every firewall-local address the
+// real ruleset would scope (per host-inbound-configured zone + the unzoned set).
+// The caller has created the table + `input` chain (priority
+// nftHostInboundPriority, policy accept).
+func buildHostInboundFenceNetlink(p *nlPlan, spec FenceSpec) {
+	hostInboundFenceMandatoryAdmitsNetlink(p, spec.WGListenPorts)
+	for _, v := range spec.Views {
+		if len(v.V4Addrs) > 0 {
+			p.rule().daddr(famV4, v.V4Addrs, false).emit(verdictDrop()...)
+		}
+		if len(v.V6Addrs) > 0 {
+			p.rule().daddr(famV6, v.V6Addrs, false).emit(verdictDrop()...)
+		}
+	}
+	if len(spec.UnzonedV4) > 0 {
+		p.rule().daddr(famV4, spec.UnzonedV4, false).emit(verdictDrop()...)
+	}
+	if len(spec.UnzonedV6) > 0 {
+		p.rule().daddr(famV6, spec.UnzonedV6, false).emit(verdictDrop()...)
+	}
+}
+
+// buildHostInboundGapFenceNetlink mirrors buildHostInboundGapFencePayload: the
+// mandatory admits plus a catch-all DROP for ONLY the supplied uncovered
+// addresses. The caller has created the table + `input` chain (priority
+// nftHostInboundGapPriority, policy accept).
+func buildHostInboundGapFenceNetlink(p *nlPlan, spec GapFenceSpec) {
+	hostInboundFenceMandatoryAdmitsNetlink(p, spec.WGListenPorts)
+	if len(spec.UncoveredV4) > 0 {
+		p.rule().daddr(famV4, spec.UncoveredV4, false).emit(verdictDrop()...)
+	}
+	if len(spec.UncoveredV6) > 0 {
+		p.rule().daddr(famV6, spec.UncoveredV6, false).emit(verdictDrop()...)
+	}
+}

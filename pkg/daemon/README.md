@@ -794,6 +794,18 @@ never lock an operator out of a remote box it manages.
   runtime HA controller under one daemon-owned deadline. Controller
   implementations may have their own RPC deadlines, but daemon shutdown does
   not wait past the outer deadline for those calls to return.
+  **Netlink installer migration (#6387, in progress).** PR-2 added an
+  ADDITIVE `pkg/nftables` netlink `Installer` (no `nft` binary) that renders
+  the host-inbound / lo0 / fence rulesets bit-for-bit equivalent to the
+  `build*Payload` text these functions emit, plus a non-skippable kernel
+  ruleset-parity CI (`daemon_nft_netlink_parity_test.go`) that diffs the
+  oracle `nft -f -` dump vs the netlink dump in a private netns. The daemon
+  still shells to `nft` here — the `build*Payload` builders are retained as
+  the parity ORACLE. PR-3 will replace the `nftApplyPayload` / `nftDeleteTable`
+  seams with the netlink `Installer` and port the 14 fail-closed tests onto
+  it. Do not delete the `build*Payload` builders while the parity CI depends
+  on them.
+
 - lo0 input filters (`interfaces lo0 unit 0 family inet[6] filter input
   <name>`) lock down host-bound/control-plane traffic via an nftables table
   `inet xpf_lo0`. `daemon_nft.go:applyLo0Filter` builds the table with

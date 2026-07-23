@@ -58898,3 +58898,34 @@ top.
   - **File(s)**: pkg/daemon/daemon_ipsec_rebind.go,
     pkg/daemon/daemon_ipsec_rebind_flush_bound_6397_test.go,
     pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md
+
+## 2026-07-23 — #6387 PR-2: additive pkg/nftables netlink host-inbound/lo0/fence installer + ruleset-parity CI
+
+- **Timestamp**: 2026-07-23
+- **Action**: Implemented PR-2 of #6387 — an ADDITIVE `pkg/nftables` netlink
+  installer (`Installer` interface: InstallHostInbound / InstallColdBootFence /
+  InstallGapFence / InstallLo0 / DeleteTable) rendering the host-inbound / lo0 /
+  fence rulesets via `github.com/google/nftables` (no `nft` binary),
+  bit-for-bit equivalent to the exec-`nft` `build*Payload` oracle in
+  `daemon_nft.go`. Added the functional nf_tables capability probe
+  (`ProbeNFTablesAvailable` / `ErrNFTablesUnavailable`). Added the T1 kernel
+  ruleset-parity CI (oracle nft-text vs netlink dump diff in a self-isolated
+  private netns) + mutation-sensitivity (widened set / dropped saddr!= /
+  weakened verdict / dropped counter all diverge) + T1b pure-unit goldens
+  (oracle-derived) + kernel-load + counter-readback through the existing
+  readers. Daemon still shells to `nft` (zero production behavior change);
+  `build*Payload` retained as the parity oracle. Registered pkg/nftables in the
+  #1373 retirement allowlist (uses dataplane.DSCPValues SSOT).
+- **Validation**: `go build ./...` clean; `go vet ./pkg/nftables ./pkg/daemon`
+  clean; `go test ./pkg/nftables` (netns) green incl. kernel-load +
+  counter-readback; T1 parity gate RUN + PASS against real nft v1.1.6 (all
+  rulesets byte-identical, all 4 mutation classes detected); retirement canary
+  green.
+- **File(s)**: pkg/nftables/netlink_build.go, netlink_spec.go,
+  netlink_hostinbound.go, netlink_lo0.go, netlink_fence.go,
+  netlink_installer.go, netlink_capability.go, netlink_scenario_test.go,
+  netlink_canon_test.go, netlink_golden_test.go, netlink_mutation_test.go,
+  netlink_kernel_test.go, netlink_capability_test.go, README.md;
+  pkg/daemon/daemon_nft_netlink_parity_test.go, pkg/daemon/README.md;
+  pkg/dataplane/retirement_boundary_canary_test.go;
+  docs/pr/1373-retire-ebpf-dataplane/README.md; _Log.md
