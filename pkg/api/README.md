@@ -674,6 +674,14 @@ under the daemon's errgroup. Nothing else imports this package.
   security nat source pool` renders the gRPC value directly. Pinned by
   `TestNATPoolStatsHandlerInterfaceModePerRuleSet` (REST) and
   `TestGetNATPoolStatsInterfaceModePerRuleSet` (gRPC), both fail-on-revert.
+- The gRPC `GetNATRuleStats` `nat_type` selector fails CLOSED (#5719,
+  codex-review-182 C-API). Only `""` (default = source), `"source"`, and
+  `"destination"` select a rule family; any other value (a typo like `"src"`
+  or `"static"`) is rejected with `codes.InvalidArgument` rather than falling
+  through both branches to an empty "no NAT rules" response — a false-empty
+  diagnostic indistinguishable from a firewall with no rules. Same discipline
+  as the show routing/zones/firewall unknown-selector diagnostics. Pinned by
+  `TestGetNATRuleStatsRejectsUnknownSelector` (gRPC), fail-on-revert.
 - Query-filter parsing fails CLOSED, matching the gRPC contract
   (#2934/#2935/#2939). A filter sentinel of `0`/`""` means "no filter",
   so a *malformed* filter value must error rather than silently fall
