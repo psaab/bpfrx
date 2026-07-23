@@ -795,7 +795,7 @@ pub(crate) struct FilterState {
     // (same as the inet input block above).
     /// Direct per-interface inet output filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_out_v4_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
-    // #6236 PR-2B: `iface_filter_out_v4_needs_tx_eval` (per-interface set) and
+    // #6236 PR-2B: `iface_filter_out_v4_needs_tx_eval` (the former per-interface FxHashSet) and
     // `has_output_tx_selection_v4` (aggregate) are deleted. The
     // `interface_output_filter_needs_tx_eval` accessor reads
     // `Filter::needs_tx_eval()` off `iface_filter_out_v4_fast`, and the global TX

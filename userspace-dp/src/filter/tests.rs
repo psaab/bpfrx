@@ -2469,10 +2469,12 @@ fn duplicate_ifindex_output_filter_aggregate_is_last_wins() {
     assert!(!interface_output_filter_needs_tx_eval(&state, 7, false));
 }
 
-/// #6236 PR-2B equivalence gate. This test was landed FIRST in the pre-deletion
-/// form (`set.contains(&if) == fast.get(&if).is_some_and(flag)`) and confirmed
-/// green to PROVE the accessor body-swap is behavior-preserving BEFORE any of
-/// the eight property sets were removed. Post-deletion it survives as an
+/// #6236 PR-2B equivalence gate. During development this assertion was written
+/// and confirmed green in the pre-deletion form
+/// (`set.contains(&if) == fast.get(&if).is_some_and(flag)`) to PROVE the
+/// accessor body-swap is behavior-preserving before the eight property sets
+/// were removed; that pre-deletion form is not a separate commit in this
+/// squashed PR. Post-deletion it survives as an
 /// accessor-semantics regression pin: for a normally compiled `FilterState`
 /// (unique ifindices) each migrated capability accessor returns exactly the
 /// mirrored `Filter` flag off the per-interface fast map, across both families
