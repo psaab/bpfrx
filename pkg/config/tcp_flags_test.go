@@ -364,6 +364,99 @@ func TestParseTCPFlagsMalformedGroups(t *testing.T) {
 	}
 }
 
+// TestParseTCPFlagsFlagThenGroup is the C180-024 mirror RED-on-revert guard.
+// The justClosedGroup rule rejected a CLOSED ')' operand directly followed by
+// another operand ("(syn)ack", "(syn)(ack)", "(syn)!ack"), but the MIRROR
+// direction was unguarded: a bare-flag operand directly followed by a '('
+// group with no intervening '&' ("syn(ack)", "ack(syn)", "syn (ack)") was
+// WRONGLY ACCEPTED — the flag bits parsed as a plain conjunction and the
+// malformed value committed. A group is an operand, so it must be joined to a
+// preceding flag with '&' ("syn & (ack)"). "syn(&ack)" is the same misorder:
+// before the guard the outer flag's flag-presence leaked into the inner group
+// and let its leading '&' pass; now the '(' after "syn" is rejected first.
+//
+// RED on revert: neutralize the `if segHasFlag` operand-then-'(' guard in the
+// `case "("` arm of ParseTCPFlagsExpression and every reject case below that
+// leads with a flag ("syn(ack)", "ack(syn)", "syn (ack)", "syn(&ack)") parses
+// cleanly and its wantErr assertion FAILS. The group-leading '&' cases
+// ("(&ack)", "(&)", "((&syn))") stay rejected by the existing segHasFlag
+// left-operand checks even with the mirror guard reverted — the mirror guard
+// only guarantees segHasFlag is false at each group start so those checks bind.
+func TestParseTCPFlagsFlagThenGroup(t *testing.T) {
+	// Operand-then-'(' misorder + group-leading operator → error (fail-closed).
+	reject := []struct {
+		name string
+		in   []string
+	}{
+		// Mirror of ')'-then-operand: a flag directly before a '(' group.
+		{"flag-then-group", []string{"syn(ack)"}},
+		{"flag-then-group-ack-syn", []string{"ack(syn)"}},
+		{"flag-then-group-spaced", []string{"syn (ack)"}},
+		// The outer flag's presence must not leak into the inner group and let a
+		// group-leading '&' pass — rejected here at the '(' after "syn".
+		{"flag-then-group-lead-amp", []string{"syn(&ack)"}},
+		// A group that itself leads with '&' or ')' has no left operand in that
+		// group — still rejected (segHasFlag is false at the group start).
+		{"group-lead-amp", []string{"(&ack)"}},
+		{"group-lead-amp-empty", []string{"(&)"}},
+		{"nested-group-lead-amp", []string{"((&syn))"}},
+		// Re-confirm the already-guarded ')'-then-operand mirror direction.
+		{"close-then-flag", []string{"(syn)ack"}},
+		{"close-then-group", []string{"(syn)(ack)"}},
+		{"close-then-neg", []string{"(syn)!ack"}},
+		{"empty-group-after-flag", []string{"syn()"}},
+		{"amp-before-close", []string{"(syn&)"}},
+		{"open-only", []string{"("}},
+		{"close-only", []string{"syn)"}},
+		{"parens-empty", []string{"()"}},
+	}
+	for _, r := range reject {
+		t.Run("reject/"+r.name, func(t *testing.T) {
+			req, forb, ok, err := ParseTCPFlagsExpression(r.in)
+			if err == nil {
+				t.Fatalf("ParseTCPFlagsExpression(%v): expected operand-then-group / group-leading-operator error, got req=0x%02x forb=0x%02x ok=%v",
+					r.in, req, forb, ok)
+			}
+			if ok {
+				t.Errorf("ParseTCPFlagsExpression(%v): ok must be false on error, got true", r.in)
+			}
+		})
+	}
+
+	// Over-rejection guard: every mirror-correct form (the operator IS present)
+	// still ACCEPTS with the SAME masks. The fix must not narrow any valid form.
+	valid := []struct {
+		name      string
+		in        []string
+		required  uint8
+		forbidden uint8
+	}{
+		{"plain-flag", []string{"syn"}, 0x02, 0},
+		{"group-single", []string{"(syn)"}, 0x02, 0},
+		{"nested-single", []string{"((syn))"}, 0x02, 0},
+		{"flag-amp-group", []string{"syn & (ack)"}, 0x12, 0},
+		{"group-amp-group", []string{"(syn) & (ack)"}, 0x12, 0},
+		{"group-conjunction", []string{"(syn & ack)"}, 0x12, 0},
+		{"nested-syn-not-ack", []string{"((syn & !ack))"}, 0x02, 0x10},
+		{"neg-flag", []string{"!ack"}, 0, 0x10},
+		{"group-neg", []string{"(!fin)"}, 0, 0x01},
+		{"flag-list", []string{"syn ack"}, 0x12, 0},
+		{"group-syn-not-ack", []string{"(syn & !ack)"}, 0x02, 0x10},
+	}
+	for _, v := range valid {
+		t.Run("accept/"+v.name, func(t *testing.T) {
+			req, forb, ok, err := ParseTCPFlagsExpression(v.in)
+			if err != nil {
+				t.Fatalf("ParseTCPFlagsExpression(%v): unexpected error (over-rejection): %v", v.in, err)
+			}
+			if !ok || req != v.required || forb != v.forbidden {
+				t.Errorf("ParseTCPFlagsExpression(%v) = (req=0x%02x, forb=0x%02x, ok=%v), want (req=0x%02x, forb=0x%02x, ok=true)",
+					v.in, req, forb, ok, v.required, v.forbidden)
+			}
+		})
+	}
+}
+
 // TestFirewallFilterTCPFlagsCommitReject is the #3076 commit-layer guard. A
 // firewall filter carrying a tcp-flags expression the dataplane cannot enforce
 // (here a disjunction) MUST fail to compile rather than commit with the

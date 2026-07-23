@@ -1812,7 +1812,18 @@ rather than silently dropped:
 - an unbalanced or reversed parenthesis (`"(syn"`, `"syn)"`, `"syn)("`) — the
   grouping parens are redundant, so before C180-024 they were stripped
   unconditionally and a malformed value committed as if they were absent.
-  Balanced groups, including nested ones (`"((syn & !ack))"`), stay accepted.
+  Balanced groups, including nested ones (`"((syn & !ack))"`), stay accepted;
+- a misordered group — an operand directly juxtaposed against another operand
+  with no `&` between them. Both directions are now rejected symmetrically: a
+  closed group followed by an operand (`"(syn)ack"`, `"(syn)(ack)"`,
+  `"(syn)!ack"`) **and** the mirror, a flag followed by a `(` group
+  (`"syn(ack)"`, `"ack(syn)"`, `"syn (ack)"`, `"syn(&ack)"`). A group is an
+  operand, so it must be joined to a preceding flag with `&` (`"syn & (ack)"`).
+  Before the mirror guard the flag-then-group forms parsed as a plain
+  conjunction and committed; `"syn(&ack)"` additionally leaked the outer flag's
+  presence into the inner group and let its leading `&` pass. A group that
+  itself leads with `&`/`)` (`"(&ack)"`, `"(&)"`, `"((&syn))"`) stays rejected
+  by the empty-left-operand checks.
 
 This is the #3076 fix: before it, the schema accepted any `tcp-flags` token
 (the leaf is `multi: true` with no value validator) and the snapshot builder's

@@ -58279,3 +58279,38 @@ top.
   - **File(s)**: pkg/config/tcp_flags.go, pkg/config/tcp_flags_test.go,
     pkg/snmp/traps.go, pkg/snmp/agent_stop_leak_4916_test.go,
     pkg/snmp/README.md, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Close the tcp-flags grammar MIRROR asymmetry (C180-024 mirror
+    completion) on PR #6383 (Advances #5583). The `justClosedGroup` guard
+    rejected a CLOSED `)` operand directly followed by another operand
+    (`(syn)ack`, `(syn)(ack)`, `(syn)!ack`), but the MIRROR direction — a
+    bare-flag operand directly followed by a `(` group with no intervening `&`
+    — was UNGUARDED, so `syn(ack)`, `ack(syn)`, `syn (ack)`, and `syn(&ack)`
+    were WRONGLY ACCEPTED (parsed as a plain conjunction and committed). A group
+    is an operand, so it must be joined to a preceding flag with `&`
+    (`syn & (ack)`). Root cause + minimal fix: add ONE symmetric guard inside
+    the `case "("` arm of ParseTCPFlagsExpression — `if segHasFlag` (a bare flag
+    already appeared in the current `&`-segment with no intervening `&`) reject.
+    This is the exact mirror of the top-of-loop justClosedGroup guard. It also
+    fixes `syn(&ack)` at the `(` (before this guard the outer flag's presence
+    leaked into the inner group and let its leading `&` pass). Deliberately NOT
+    added: a separate per-group `&` flag-presence check. The mirror guard
+    guarantees `segHasFlag == false` at the start of every freshly-opened group,
+    so a group that itself leads with `&`/`)` (`(&ack)`, `(&)`, `((&syn))`) is
+    already bound by the EXISTING global segHasFlag `&`-no-operand / empty-group
+    checks — a per-group `&` check would be a shadowed, non-load-bearing
+    duplicate, contrary to this file's stated single-load-bearing-check design.
+    New test TestParseTCPFlagsFlagThenGroup (exhaustive reject + accept matrix).
+    RED-on-revert verified firsthand for BOTH mechanisms: (1) neutralize the
+    mirror guard → `syn(ack)`, `ack(syn)`, `syn (ack)`, `syn(&ack)` go RED
+    (clean t.Fatal, group-lead cases stay GREEN); (2) neutralize the existing
+    `&`-no-operand check → `(&ack)`, `((&syn))` go RED (`(&)` stays green,
+    caught by the empty-group check). No masks change for any accepted form
+    (`syn`, `(syn)`, `((syn))`, `syn & (ack)`, `(syn) & (ack)`, `(syn & !ack)`,
+    `((syn & !ack))`, `!ack`, `(!fin)`, `syn ack` list all identical). No
+    pkg/snmp touched (that PR fix is done). No HA/cluster/vrrp/failover code
+    touched. gofmt + go build + go vet clean; full `go test ./pkg/config`
+    (12.5s) GREEN.
+  - **File(s)**: pkg/config/tcp_flags.go, pkg/config/tcp_flags_test.go,
+    docs/config-schema.md, _Log.md

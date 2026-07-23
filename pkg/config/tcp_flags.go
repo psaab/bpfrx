@@ -77,6 +77,17 @@ var tcpFlagBits = map[string]uint8{
 //     "a closed group must be followed by an operator, not another operand"
 //     rule. Legitimate grouping — "(syn)", "(syn & ack)", "((syn & !ack))",
 //     "(!fin)", and "(syn) & (ack)" — remains accepted with identical masks.
+//   - the MIRROR of the closed-group-then-operand misorder: a flag operand
+//     immediately followed by a '(' group with no intervening '&' operator
+//     (e.g. "syn(ack)", "ack(syn)", "syn (ack)", "syn(&ack)"). A group is an
+//     operand, so juxtaposing it against a preceding flag is the same
+//     operand-then-operand misorder as "(syn)ack" — it must be written
+//     "syn & (ack)". The earlier justClosedGroup rule only covered the
+//     ')'-then-operand direction, so these were WRONGLY ACCEPTED (the flag
+//     bits parsed as a plain conjunction); reject them so the grammar is
+//     symmetric. "syn(&ack)" is caught here at the '(' — before this guard the
+//     outer flag's flag-presence leaked into the inner group and let its
+//     leading '&' pass.
 //
 // An input that carries no flag at all (empty / whitespace only) returns
 // ok=false with no error: the caller leaves the wire field nil, i.e. no
@@ -200,6 +211,26 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 			if pendingNeg {
 				return 0, 0, false, fmt.Errorf(
 					"tcp-flags %q: a negated group is a disjunction (De Morgan) and is not representable by the firewall dataplane", expr)
+			}
+			// A '(' opens a group, which is itself an operand. An operand may not
+			// directly follow another operand without a '&' conjunction between
+			// them. This is the MIRROR of the justClosedGroup guard (which rejects
+			// a closed ')' operand directly followed by another operand). Here
+			// segHasFlag is true exactly when a bare flag already appeared in the
+			// current '&'-segment with no intervening '&' — a preceding closed
+			// ')' would have set justClosedGroup instead, and the top-of-loop
+			// guard already rejects a '(' after ')'. So a '(' seen while
+			// segHasFlag is set is a flag-then-group misorder ("syn(ack)",
+			// "syn (ack)", and "syn(&ack)" — the outer flag's segHasFlag is what
+			// let the inner group-leading '&' pass before this guard). Reject it;
+			// a group must be joined to a preceding flag with '&' ("syn & (ack)").
+			// This also guarantees segHasFlag is false at the start of every
+			// freshly-opened group, so a group that itself leads with '&' or ')'
+			// ("(&ack)", "(&)", "((&syn))") is still caught by the existing
+			// segHasFlag left-operand checks below.
+			if segHasFlag {
+				return 0, 0, false, fmt.Errorf(
+					"tcp-flags %q: a flag operand may not be directly followed by a \"(\" group; separate them with \"&\"", expr)
 			}
 			groupHasFlag = append(groupHasFlag, false)
 			parenDepth++
