@@ -445,13 +445,45 @@ func rethUnitForVlanID(rethCfg *config.InterfaceConfig, vid int) (int, bool) {
 
 // rethSubIfaceNeedsLinkLocal reports whether the RETH VLAN sub-interface whose
 // kernel vlan-id is `vid` carries IPv6 in config and therefore needs its
-// link-local re-added after a post-MAC-programming link cycle. It resolves the
-// vlan-id back to its logical unit first (Units is unit-keyed, not vlan-id
-// keyed) before checking that unit for IPv6 — see rethUnitForVlanID (#5107).
+// link-local re-added after a post-MAC-programming link cycle. The kernel netdev
+// is keyed by vlan-id, but rethCfg.Units is keyed by logical unit number, so the
+// vlan-id must be resolved back to a unit before checking for IPv6 (#5107).
+//
+// rethUnitForVlanID handles the existence check and logs a deterministic warning
+// when several units share this vlan-id. We do NOT trust the single (lowest) unit
+// it returns for the IPv6 decision: a duplicate vlan-id (an invalid config the
+// compiler does not reject for uniqueness) can split addressing so a lower unit
+// is IPv4-only while a higher unit carries IPv6. The one shared kernel netdev
+// needs a link-local if ANY mapped unit has IPv6, so scan them all (#5107 fold).
 func rethSubIfaceNeedsLinkLocal(rethCfg *config.InterfaceConfig, vid int) bool {
-	unitNum, ok := rethUnitForVlanID(rethCfg, vid)
-	if !ok {
+	if _, ok := rethUnitForVlanID(rethCfg, vid); !ok {
 		return false
 	}
-	return rethUnitHasIPv6(rethCfg, unitNum)
+	for unitNum, unit := range rethCfg.Units {
+		if unit == nil || unit.VlanID != vid {
+			continue
+		}
+		if rethUnitHasIPv6(rethCfg, unitNum) {
+			return true
+		}
+	}
+	return false
+}
+
+// rethSubIfaceNameNeedsLinkLocal parses the kernel vlan-id out of a RETH VLAN
+// sub-interface name (e.g. "ge-7-0-1.180") and reports whether that
+// sub-interface needs its IPv6 link-local re-added after a post-MAC link cycle.
+// It is the smallest testable seam over the post-MAC repair decision in
+// applyDataplaneAndHACore, so the production loop and its regression test share
+// one code path (#5107). A name with no numeric vlan-id suffix returns false.
+func rethSubIfaceNameNeedsLinkLocal(rethCfg *config.InterfaceConfig, subName string) bool {
+	dotIdx := strings.LastIndex(subName, ".")
+	if dotIdx < 0 {
+		return false
+	}
+	vid, err := strconv.Atoi(subName[dotIdx+1:])
+	if err != nil {
+		return false
+	}
+	return rethSubIfaceNeedsLinkLocal(rethCfg, vid)
 }

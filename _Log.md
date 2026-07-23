@@ -57506,3 +57506,23 @@ top.
 - **File(s)**: pkg/daemon/daemon_ra.go, pkg/daemon/daemon_reth.go,
     pkg/daemon/daemon_apply_dataplane.go,
     pkg/daemon/reth_unit_vlanid_5107_test.go, docs/ha-cluster-test-plan.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5107 fold (PR #6359, Codex MERGE-NEEDS-MINOR). (1) Duplicate-VID
+    robustness: `rethSubIfaceNeedsLinkLocal` now scans ALL units mapped to a
+    vlan-id and returns true if ANY carries IPv6 (was: lowest-only via
+    `rethUnitForVlanID` — skipped repair when the lowest unit was IPv4-only and a
+    higher unit had IPv6). `rethUnitForVlanID` kept (lowest+deterministic+warn)
+    and still called for the existence check + collision log. (2) Bound the
+    production call sites: extracted `rethSubIfaceNameNeedsLinkLocal` seam
+    (parse vlan-id from kernel netdev name + resolve) now called by the post-MAC
+    repair loop in daemon_apply_dataplane.go (removed now-unused strconv import);
+    added TestRethSubIfaceNameNeedsLinkLocal (binds path a) and
+    TestDesiredClusterRAResolvesByVlanID (binds the desiredClusterRA ownership
+    gate — the bonus cluster-RA fix). Updated the dup-VID test to assert the
+    collision WARN via recordingSlogHandler. All three fold neutralizations
+    verified RED then restored. Full pkg/daemon + pkg/config suites green, vet +
+    gofmt clean.
+- **File(s)**: pkg/daemon/daemon_reth.go,
+    pkg/daemon/daemon_apply_dataplane.go,
+    pkg/daemon/reth_unit_vlanid_5107_test.go

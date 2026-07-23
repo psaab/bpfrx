@@ -113,9 +113,15 @@ func TestRethUnitForVlanID(t *testing.T) {
 	}
 }
 
+// dupVIDWarn is the collision warning rethUnitForVlanID emits when several
+// units share a vlan-id (an invalid config). Kept in one place so the test
+// asserting it stays in lockstep with the production string.
+const dupVIDWarn = "reth: multiple units share a vlan-id; using lowest unit for IPv6 repair"
+
 // TestRethUnitForVlanIDDuplicateDeterministic proves a duplicate vlan-id (an
 // invalid config) resolves deterministically to the lowest unit number
-// regardless of map iteration order.
+// regardless of map iteration order, AND that the collision is logged (an
+// invalid duplicate vlan-id must not pass silently).
 func TestRethUnitForVlanIDDuplicateDeterministic(t *testing.T) {
 	cfg := &config.InterfaceConfig{
 		Name: "reth1",
@@ -124,18 +130,25 @@ func TestRethUnitForVlanIDDuplicateDeterministic(t *testing.T) {
 			90: {Number: 90, VlanID: 200, Addresses: []string{"2001:db8:90::1/64"}},
 		},
 	}
-	// Silence the expected duplicate-vlan-id WARN across the loop.
+	// Capture WARN records so we can assert the deterministic-lowest collision
+	// warning fires exactly once per call.
+	rec := &recordingSlogHandler{level: slog.LevelWarn}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	slog.SetDefault(slog.New(rec))
 	defer slog.SetDefault(prev)
 
 	// Repeat to defeat Go's randomized map iteration order.
-	for i := 0; i < 64; i++ {
+	const iters = 64
+	for i := 0; i < iters; i++ {
 		gotUnit, gotOK := rethUnitForVlanID(cfg, 200)
 		if !gotOK || gotUnit != 70 {
 			t.Fatalf("duplicate vlan-id 200: rethUnitForVlanID = (%d, %v), "+
 				"want (70, true) deterministically (lowest unit)", gotUnit, gotOK)
 		}
+	}
+	if n := rec.count(dupVIDWarn); n != iters {
+		t.Errorf("duplicate-vlan-id warning fired %d times, want %d (once per call)",
+			n, iters)
 	}
 }
 
@@ -185,6 +198,160 @@ func TestRethSubIfaceNeedsLinkLocal(t *testing.T) {
 				tt.name, tt.vid, got, tt.want)
 		}
 	}
+}
+
+// TestRethSubIfaceNeedsLinkLocalDuplicateVIDAnyIPv6 is the #5107-fold guard: a
+// duplicate vlan-id may split addressing so the LOWEST unit is IPv4-only while a
+// higher unit carries IPv6. The single shared kernel netdev (member.<vid>) still
+// needs a link-local, so rethSubIfaceNeedsLinkLocal must scan ALL units mapped
+// to the vlan-id, not just the deterministic-lowest one.
+//
+// Fail-on-revert: restoring the lowest-only predicate
+// (`u, _ := rethUnitForVlanID(...); return rethUnitHasIPv6(rethCfg, u)`) checks
+// only unit 70 (IPv4-only) for the first config and returns false.
+func TestRethSubIfaceNeedsLinkLocalDuplicateVIDAnyIPv6(t *testing.T) {
+	silenceLogs(t) // duplicate vlan-id emits the expected collision warning
+
+	// Lowest unit IPv4-only, higher unit IPv6 → true.
+	cfgHigh := &config.InterfaceConfig{
+		Name: "reth0",
+		Units: map[int]*config.InterfaceUnit{
+			70: {Number: 70, VlanID: 200, Addresses: []string{"172.16.70.8/24"}},
+			90: {Number: 90, VlanID: 200, Addresses: []string{"2001:db8:90::8/64"}},
+		},
+	}
+	if !rethSubIfaceNeedsLinkLocal(cfgHigh, 200) {
+		t.Errorf("duplicate vlan-id 200, IPv6 on the higher unit: got false, want " +
+			"true (any mapped unit with IPv6 needs the shared netdev's link-local)")
+	}
+
+	// Reversed roles (lowest unit IPv6) → true.
+	cfgLow := &config.InterfaceConfig{
+		Name: "reth0",
+		Units: map[int]*config.InterfaceUnit{
+			70: {Number: 70, VlanID: 200, Addresses: []string{"2001:db8:70::8/64"}},
+			90: {Number: 90, VlanID: 200, Addresses: []string{"172.16.90.8/24"}},
+		},
+	}
+	if !rethSubIfaceNeedsLinkLocal(cfgLow, 200) {
+		t.Errorf("duplicate vlan-id 200, IPv6 on the lower unit: got false, want true")
+	}
+
+	// Neither unit has IPv6 → false.
+	cfgNone := &config.InterfaceConfig{
+		Name: "reth0",
+		Units: map[int]*config.InterfaceUnit{
+			70: {Number: 70, VlanID: 200, Addresses: []string{"172.16.70.8/24"}},
+			90: {Number: 90, VlanID: 200, Addresses: []string{"172.16.90.8/24"}},
+		},
+	}
+	if rethSubIfaceNeedsLinkLocal(cfgNone, 200) {
+		t.Errorf("duplicate vlan-id 200, IPv4-only on both units: got true, want false")
+	}
+}
+
+// TestRethSubIfaceNameNeedsLinkLocal binds the post-MAC IPv6 repair PRODUCTION
+// path in applyDataplaneAndHACore, which routes the whole decision through
+// rethSubIfaceNameNeedsLinkLocal(rethCfg, subName) — parse the vlan-id out of the
+// kernel VLAN sub-interface name and resolve it to the IPv6-bearing unit(s).
+//
+// Fail-on-revert: reverting the vlan-id -> unit resolution (making the seam index
+// Units[vid] directly, e.g. `return rethUnitHasIPv6(rethCfg, vid)`) misses
+// Units[180] and flips the ".180" cases to false.
+func TestRethSubIfaceNameNeedsLinkLocal(t *testing.T) {
+	cfg := &config.InterfaceConfig{
+		Name:            "reth0",
+		RedundancyGroup: 1,
+		Units: map[int]*config.InterfaceUnit{
+			// unit != vlan-id, has IPv6.
+			80: {Number: 80, VlanID: 180, Addresses: []string{
+				"172.16.80.8/24", "2001:db8:80::8/64"}},
+			// unit != vlan-id, IPv4-only.
+			90: {Number: 90, VlanID: 190, Addresses: []string{"172.16.90.8/24"}},
+		},
+	}
+	tests := []struct {
+		subName string
+		want    bool
+	}{
+		// Real kernel VLAN sub-interface names are parent.<vlan-id>.
+		{"ge-7-0-1.180", true},  // node-1 name, vlan-id 180 -> unit 80 (IPv6)
+		{"ge-0-0-2.180", true},  // node-0 name, same result
+		{"ge-7-0-1.190", false}, // vlan-id 190 -> unit 90 (IPv4-only)
+		// A unit-number suffix is NOT a vlan-id — the whole #5107 bug.
+		{"ge-7-0-1.80", false},
+		// No vlan-id suffix: the parent netdev is repaired elsewhere.
+		{"ge-7-0-1", false},
+		// Non-numeric suffix: false, no panic.
+		{"ge-7-0-1.foo", false},
+	}
+	for _, tt := range tests {
+		if got := rethSubIfaceNameNeedsLinkLocal(cfg, tt.subName); got != tt.want {
+			t.Errorf("rethSubIfaceNameNeedsLinkLocal(%q) = %v, want %v",
+				tt.subName, got, tt.want)
+		}
+	}
+}
+
+// TestDesiredClusterRAResolvesByVlanID binds the cluster RA ownership gate in
+// desiredClusterRA (daemon_ra_reconcile.go). An owned RG's RETH interfaces are
+// enumerated by rethInterfacesForRG, which suffixes by unit.VlanID (member.180);
+// buildRAConfigs must resolve the RA interface to the SAME member.180 or the
+// `ownedIfaces[ra.Interface]` match drops the sender. reth0 unit 80 vlan-id 180
+// exercises unit# != vlan-id.
+//
+// Fail-on-revert: reverting buildRAConfigs to
+// `config.LinuxIfName(cfg.ResolveReth(ra.Interface))` resolves reth0.80 to
+// member.80, which misses ownedIfaces[member.180], so desiredClusterRA returns
+// an EMPTY set and the len(desired)==1 assertion fails — binding the bonus
+// cluster-RA-ownership fix, not just buildRAConfigs in isolation.
+func TestDesiredClusterRAResolvesByVlanID(t *testing.T) {
+	cfg := &config.Config{
+		Chassis: config.ChassisConfig{Cluster: &config.ClusterConfig{NodeID: 0, ClusterID: 1}},
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name:            "reth0",
+					RedundancyGroup: 1,
+					Units: map[int]*config.InterfaceUnit{
+						80: {Number: 80, VlanID: 180, Addresses: []string{
+							"172.16.80.8/24", "2001:db8:80::8/64"}},
+					},
+				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
+				"ge-7/0/0": {Name: "ge-7/0/0", RedundantParent: "reth0"},
+			},
+		},
+		Protocols: config.ProtocolsConfig{
+			RouterAdvertisement: []*config.RAInterfaceConfig{
+				{Interface: "reth0.80"},
+			},
+		},
+	}
+	d := &Daemon{rgStates: make(map[int]*rgStateMachine)}
+	// Own RG1: the node is VRRP master for reth0.
+	d.getOrCreateRGState(1).SetVRRP("reth0", true)
+
+	desired := d.desiredClusterRA(cfg)
+	if len(desired) != 1 {
+		t.Fatalf("desiredClusterRA returned %d RAs, want 1 — the owned reth0.80 "+
+			"sender must survive the ownership match (member.80 misses "+
+			"ownedIfaces[member.180] and drops it)", len(desired))
+	}
+	if desired[0].Interface != "ge-0-0-0.180" {
+		t.Fatalf("owned RA Interface = %q, want ge-0-0-0.180 (vlan-id)",
+			desired[0].Interface)
+	}
+}
+
+// silenceLogs swaps the default slog logger for a discard handler for the
+// duration of the test (restored via Cleanup). Used where a test intentionally
+// drives a duplicate-vlan-id path that logs an expected collision warning.
+func silenceLogs(t *testing.T) {
+	t.Helper()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
 }
 
 // keys returns the set's members for error messages.
