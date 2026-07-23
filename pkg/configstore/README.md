@@ -1084,11 +1084,13 @@ owned by the `journal/` subpackage.
   `time.Now()` race). Rotation prunes by the parsed seq, and
   `SetArchiveConfig` seeds the per-process counter from the highest seq on
   disk so it stays globally monotonic across restarts (#5523 C179-060).
-  These monotonicity / no-overwrite guarantees hold **after a successful
-  reseed scan and outside the two #6404-deferred windows** (a commit that
-  lands after a failed scan but before the next `SetArchiveConfig` retry, and
-  a disable→re-enable to the same dir that skips the rescan) — see the #6396
-  hardening note below.
+  These monotonicity / no-overwrite guarantees hold **once the target
+  archive dir has been successfully scanned** — the reseed is retried on
+  every archiving commit until that scan succeeds (#6404), and while the
+  scan is still failing (the on-disk max unknown) an archiving commit
+  SKIPS its archive rather than write a below-max seq that rotation would
+  prune, archiving normally on the next commit after the scan recovers —
+  see the #6396/#6404 hardening note below.
   Two #6396 residual hardenings: `parseArchiveSeq` requires the current
   two-dot `config-<ts>.<seq>.conf` shape (the ts's own
   seconds.nanoseconds dot PLUS the seq dot), so a legacy pre-#3441
@@ -1103,12 +1105,28 @@ owned by the `journal/` subpackage.
   directory READ error from a legitimately empty dir: a transient scan failure
   leaves the counter unchanged and the dir un-seeded so the next call retries,
   rather than pinning the counter at 0 below the on-disk max and pruning every
-  fresh archive as stale (#6396 Codex MINOR 4). Two narrow reseed edges remain
-  open (tracked in #6404, not yet closed): a commit that lands in the window
-  AFTER a failed scan but BEFORE the next `SetArchiveConfig` retry captures the
-  still-low seq; and a disable→re-enable to the SAME dir (`A`→`""`→`A`) does
-  not rescan (archiveSeedDir is not invalidated on disable), so archives
-  written to `A` while archival was off are not accounted for. The
+  fresh archive as stale (#6396 Codex MINOR 4). #6404 closed the remaining
+  reseed windows the #6396 retry left open, all via the shared
+  `ensureArchiveSeededLocked` helper (called under the write lock; it returns
+  whether the counter is CONFIRMED relative to the active dir):
+  the archiving commit path re-attempts the reseed BEFORE it captures its seq,
+  so a commit that lands after a failed `SetArchiveConfig` scan but before the
+  next explicit retry re-scans the dir instead of writing a still-low seq that
+  rotation would prune as stale (edge 1). If that commit-time rescan ALSO fails
+  (a persistent scan error), the counter is still unconfirmed, so the commit
+  SKIPS its archive entirely rather than write a below-max seq — skipping one
+  archive during the failure window is strictly safer than writing a mis-seq'd
+  one that rotation prunes out of order; the next commit after the scan recovers
+  archives normally (Codex round-2 MAJOR). A nonexistent dir (first use,
+  `os.ErrNotExist`) is treated as a CONFIRMED-empty dir, not a scan failure:
+  there are no pre-existing archives to outrank, so seq 0 is correct and the
+  write path's `MkdirAll` creates it. Disabling archival (`SetArchiveConfig("")`)
+  INVALIDATES `archiveSeedDir`, so a disable→re-enable to the SAME dir
+  (`A`→`""`→`A`) re-scans `A` and accounts for any on-disk max that advanced
+  while archival was off (edge 2); likewise a genuine scan FAILURE clears
+  `archiveSeedDir`, so navigating away to a dir that fails to scan and back
+  (`A`→failed-`B`→`A`) re-scans `A` rather than trusting the stale marker (Codex
+  adjacent). The
   rollback/archive writers
   route through package-var seams (`rbWriteFileDurable`,
   `rbWriteFileAtomic`, `rbSyncDir`, `rbRemove`) so tests can pin the
