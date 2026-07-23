@@ -155,6 +155,13 @@ func snmpConfigHash(cfg *config.Config) uint64 {
 	return h.Sum64()
 }
 
+// snmpLinkLister enumerates the kernel links buildSNMPIfData turns into the
+// SNMP ifTable. It is a package-level seam (defaulting to netlink.LinkList) so a
+// test can drive the netlink-failure path — a live RTM_GETLINK dump cannot be
+// forced to fail from a unit test — and assert the failure is surfaced rather
+// than silently reported as an empty ifTable (#5523 C179-123).
+var snmpLinkLister = netlink.LinkList
+
 // buildSNMPIfData returns the live interface table for the SNMP ifTable /
 // ifXTable, read from netlink at call time. It is the SetIfDataFn callback
 // wired onto every agent the daemon starts (both the boot start and a day-2
@@ -162,8 +169,18 @@ func snmpConfigHash(cfg *config.Config) uint64 {
 // state regardless of when it was started (#3967 extracted this from the boot
 // block so the two start paths share one implementation).
 func buildSNMPIfData() []snmp.IfData {
-	links, err := netlink.LinkList()
+	links, err := snmpLinkLister()
 	if err != nil {
+		// #5523 C179-123: a transient netlink failure must NOT masquerade as a
+		// healthy 0-interface ifTable. The SetIfDataFn callback contract
+		// (func() []snmp.IfData) has no error channel, so an empty slice is the
+		// only value we can hand back — but returning it SILENTLY let a manager
+		// read the box as having no interfaces while the poll still looked
+		// successful. Log the failure so the empty table is diagnosable and
+		// distinguishable from a genuine no-interface box; the next poll
+		// re-reads netlink and self-heals a transient error.
+		slog.Warn("SNMP ifTable read failed; reporting empty interface table",
+			"err", err)
 		return nil
 	}
 	var result []snmp.IfData

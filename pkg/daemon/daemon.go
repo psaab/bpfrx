@@ -135,6 +135,18 @@ type Daemon struct {
 	ipsecRebindMu          sync.Mutex
 	ipsecRebindPending     atomic.Bool // health signal: local_addrs stale, rebind not yet reconverged
 	ipsecRebindRetryActive bool        // single-flight guard for the retry loop (guarded by ipsecRebindMu)
+	// #5523 C179-093: cancel + join for the retry loop at shutdown. The loop
+	// used to bind directly to d.daemonCtx (the RAW background context that is
+	// NEVER cancelled in production, #5807), so it leaked past shutdown and a
+	// 30s rebind tick could run a swanctl reapply while teardown was in flight.
+	// It now binds to a cancellable child (ipsecRebindCancel) and is tracked on
+	// ipsecRebindWg so stopIPsecRebindLoop can cancel + join it, mirroring the
+	// #5308 stopPinRetryLoop. ipsecRebindStopped latches the stop so a late
+	// armIPsecRebind after shutdown never starts a new loop (that Add would race
+	// ipsecRebindWg.Wait). All three are guarded by ipsecRebindMu.
+	ipsecRebindCancel  context.CancelFunc
+	ipsecRebindWg      sync.WaitGroup
+	ipsecRebindStopped bool
 	// ipsecRebindRetryEvery overrides the retry cadence (tests); 0 =
 	// ipsecRebindRetryInterval.
 	ipsecRebindRetryEvery time.Duration
@@ -456,6 +468,16 @@ type Daemon struct {
 	aggSig     aggregatorSig
 	aggCBOnce  sync.Once
 	aggReconMu sync.Mutex
+	// #5523 C179-093: the aggregator's Run goroutine binds to context.Background
+	// (cancelled only via aggCancel), so shutdown used to leak it and skip its
+	// #5313 ctx.Done final flush — up to a full ~5 min window of SESSION_CLOSE
+	// counters was dropped on every daemon stop. aggWg tracks every started
+	// generation (current + any still-flushing retired one) so stopAggregator
+	// can cancel + JOIN them at shutdown; aggStopped latches the stop so a late
+	// applyAggregator after shutdown never starts a new generation (that Add
+	// would race aggWg.Wait). Both guarded by aggReconMu.
+	aggWg      sync.WaitGroup
+	aggStopped bool
 	vrrpMgr    *vrrp.Manager
 	gc         *conntrack.GC
 	startTime  time.Time // daemon start time; used to suppress stale config sync

@@ -58607,6 +58607,98 @@ top.
     reviewers ran and was parent-RED-verified firsthand.
   - **File(s)**: pkg/config/types_security.go, pkg/daemon/daemon_snmp_reconcile.go
 
+- **Timestamp**: 2026-07-23 (fix/5523-c179-material)
+  - **Action**: Implement four firsthand-verified codex-179 material-logic
+    residuals of cohort #5523 (deferred from #6390); each with a fail-on-revert
+    test (neutralize → clean assertion RED, confirmed). DEFERRED two coupled/
+    higher-risk items.
+    FIXED:
+    * C179-123 (pkg/daemon/daemon_snmp_reconcile.go): a netlink LinkList
+      failure in buildSNMPIfData silently returned an empty ifTable
+      indistinguishable from a healthy 0-interface box. The SetIfDataFn
+      contract has no error channel, so log the failure (slog.Warn) via a
+      package-level snmpLinkLister seam. Test: netlink-failure logs exactly
+      once.
+    * C179-060 (pkg/configstore/store_persist.go + store.go): archive rotation
+      pruned by ts-dominated lexical sort, so a backward wall-clock step made
+      the newest commit sort earliest and get pruned. rotateArchives now prunes
+      by the monotonic seq (parseArchiveSeq); SetArchiveConfig SEEDS archiveSeq
+      from the max on-disk seq so it stays globally monotonic across restarts
+      (naive seq-sort alone would prune fresh low-seq archives in favor of a
+      prior process's stale high-seq ones — the coupled restart-safety half).
+      Tests: prune-by-seq under out-of-order ts; seed across restart; parse.
+    * C179-104 (pkg/routing/xfrm.go): the adopt type guard gated only the
+      stale-if_id recreate branch, so a same-name NON-xfrmi link was adopted +
+      tracked with no xfrm interface created (route-based VPN blackhole).
+      Reject non-*netlink.Xfrmi via delete+recreate (deleteLocked reclaims any
+      type), bringing xfrm to parity with the already-guarded vrf/reth/tunnel
+      managers. Test: a seeded dummy is deleted+recreated, not adopted.
+    * C179-093 (pkg/daemon/daemon_system.go, daemon_ipsec_rebind.go, daemon.go,
+      daemon_run_shutdown.go, daemon_run.go): the aggregator flush goroutine
+      (context.Background, #5313 final flush) and the ipsec-rebind loop
+      (d.daemonCtx, never cancelled at shutdown) leaked at stop. Add
+      stopAggregator/stopIPsecRebindLoop cancel+join helpers mirroring the
+      #5308 stopPinRetryLoop (WaitGroup join, lock released before join, stopped
+      latch, defer in Run), wired into runShutdownSequence. Tests: bounded
+      join + no-late-apply + latch (RED via joinWithin timeout / post-join
+      call-count).
+    DEFERRED:
+    * C179-092 (device_map.go teardown): reload-debt lost on a failed
+      networkctl reload after markers are os.Remove'd. No clean minimal reorder
+      (reload-before-remove is semantically wrong; removal can't be undone) —
+      a correct fix needs a durable reload-pending sentinel. Higher-risk than
+      "clean low-risk".
+    * C179-056 (store_commit.go/history.go rollback tombstone): a stale slot
+      file left by the tombstone-skip resurrects a wrong-generation config on
+      restart. A load guard alone can't distinguish a stale-but-valid config
+      from a legit one; a complete fix needs a durable tombstone-marker save+
+      load protocol change in the safety-critical rollback path. Deferred per
+      the task's explicit guard.
+    NOT TOUCHED (HA, need loss-cluster smoke — separate PR): C179-065/073/074.
+    Gates: build + vet + gofmt clean (my files); full go test GREEN on
+    pkg/daemon, pkg/routing, pkg/configstore; pkg/dataplane retirement canary
+    GREEN.
+  - **File(s)**: pkg/daemon/daemon_snmp_reconcile.go,
+    pkg/daemon/daemon_snmp_ifdata_netlink_5523_test.go, pkg/routing/xfrm.go,
+    pkg/routing/xfrm_nonxfrmi_reject_5523_test.go,
+    pkg/configstore/store_persist.go, pkg/configstore/store.go,
+    pkg/configstore/archive_rotate_seq_5523_test.go, pkg/daemon/daemon.go,
+    pkg/daemon/daemon_system.go, pkg/daemon/daemon_ipsec_rebind.go,
+    pkg/daemon/daemon_run_shutdown.go, pkg/daemon/daemon_run.go,
+    pkg/daemon/daemon_goroutine_shutdown_5523_test.go, pkg/daemon/README.md,
+    pkg/snmp/README.md, pkg/configstore/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23 (fold on fix/5523-c179-material, PR #6394)
+  - **Action**: Add the missing #5523 C179-093 WIRING test. The existing
+    #5523 coverage (daemon_goroutine_shutdown_5523_test.go) calls
+    d.stopAggregator()/d.stopIPsecRebindLoop() DIRECTLY, binding the helper
+    MECHANICS but NOT the call sites — deleting the wiring (the two stop
+    calls in runShutdownSequence + the matching Run() defers) left the daemon
+    suite GREEN while fully reintroducing the leaked aggregator + skipped
+    #5313 final flush + leaked IPsec rebind loop. The new test DRIVES
+    runShutdownSequence itself (never the stop helpers) with an armed
+    aggregator (applyAggregator, Security.Log.Report=true) + an actively
+    ticking IPsec DHCP-rebind loop (reapplyIPsecForLeaseChange with a failing
+    injected swanctl seam), then asserts the OBSERVABLE post-shutdown state
+    only the wiring produces: aggCancel==nil, aggregatorPtr==nil,
+    ipsecRebindRetryActive==false, and ZERO swanctl reapplies after the
+    sequence returns (joined, not merely flagged). A real (empty) configstore
+    backs d.store so runShutdownSequence's ActiveConfig() does not nil-panic
+    (fresh store => nil active cfg => hitless/non-HA teardown with d.dp==nil).
+    The 4 production fixes were NOT changed. Ordering assertion (aggregator
+    flush BEFORE log/event teardown) skipped: it is already structurally
+    guaranteed by stopAggregator's position (line 92, before teardownSNMP/
+    stopFlowExporter/eventEngine.Close), and the minimal harness wires no
+    eventEngine/syslog to observe a teardown-vs-flush race cleanly.
+    Firsthand RED/GREEN: GREEN with the fix intact; neutralizing BOTH the
+    runShutdownSequence stop calls AND the Run() defers turned the new test
+    RED on all four observables (aggCancel non-nil / aggregatorPtr non-nil /
+    ipsecRebindRetryActive true / 20 late reapplies) with clean messages;
+    restoring the wiring => GREEN. Production files verified diff-clean vs
+    HEAD after restore. The pre-existing direct-method #5523 tests pass
+    throughout. Gates: go build ./... OK, go vet ./pkg/daemon OK, new file
+    gofmt-clean, full `go test ./pkg/daemon/` GREEN (10.4s).
+  - **File(s)**: pkg/daemon/daemon_shutdown_wiring_5523_test.go, _Log.md
 - **Timestamp**: 2026-07-23 (eng5557/claude-review-003 cohort)
   - **Action**: Advance #5557 — fix 7 real, independent, low-risk Go control-plane
     survivors from claude-review-003, each with a firsthand-verified

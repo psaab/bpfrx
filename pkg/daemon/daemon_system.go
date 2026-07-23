@@ -242,6 +242,14 @@ func (d *Daemon) applyAggregator(er *logging.EventReader, cfg *config.Config) {
 	d.aggReconMu.Lock()
 	defer d.aggReconMu.Unlock()
 
+	// #5523 C179-093: once stopAggregator has run at shutdown, a late commit
+	// (e.g. a racing apply) must NOT start a new aggregator generation — that
+	// aggWg.Add would race the shutdown join. Mirrors the pinRetryStopped /
+	// schedulerStopped latches (#5308).
+	if d.aggStopped {
+		return
+	}
+
 	desired := aggregatorSig{
 		enabled:       cfg.Security.Log.Report,
 		flushInterval: aggregatorFlushInterval,
@@ -300,8 +308,44 @@ func (d *Daemon) applyAggregator(er *logging.EventReader, cfg *config.Config) {
 		er.AddCallback(d.aggregationCallback)
 	})
 
-	go agg.Run(ctx)
+	// Track the flush goroutine on aggWg so stopAggregator can JOIN it at
+	// shutdown (#5523 C179-093). A retired generation (cancel+replace above)
+	// stays tracked until its ctx.Done final flush returns, so the shutdown join
+	// covers both the live generation and any still-flushing retired one.
+	d.aggWg.Add(1)
+	go func() {
+		defer d.aggWg.Done()
+		agg.Run(ctx)
+	}()
 	slog.Info("session aggregation reporting enabled (5 min interval)")
+}
+
+// stopAggregator cancels the live session-aggregation generation and JOINS its
+// flush goroutine (and any still-flushing retired generation) at shutdown. The
+// cancel triggers SessionAggregator.Run's #5313 ctx.Done final flush, so the
+// pending ~5 min window is emitted as a partial report instead of being dropped
+// when the daemon stops. It latches aggStopped so a late applyAggregator cannot
+// start a new generation after the join. Idempotent / nil-safe: with reporting
+// never enabled there is no cancel and the WaitGroup is empty.
+//
+// aggReconMu is held only to latch the flag and read+clear the handles, then
+// RELEASED before the join: SessionAggregator.Run does not take aggReconMu, so
+// releasing avoids holding the commit-path lock across the flush. Called from
+// runShutdownSequence BEFORE the syslog/event teardown so the final flush still
+// has a live forwarding path (SetLogFunc -> er.ForwardLogMsg). Mirrors the
+// #5308 stopPinRetryLoop shape.
+func (d *Daemon) stopAggregator() {
+	d.aggReconMu.Lock()
+	d.aggStopped = true
+	cancel := d.aggCancel
+	d.aggCancel = nil
+	d.aggregatorPtr.Store(nil)
+	d.aggSig = aggregatorSig{}
+	d.aggReconMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	d.aggWg.Wait()
 }
 
 // applyHostname sets the system hostname from system { host-name } config.

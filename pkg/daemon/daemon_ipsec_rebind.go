@@ -70,11 +70,44 @@ func (d *Daemon) armIPsecRebind() {
 	d.ipsecRebindMu.Lock()
 	defer d.ipsecRebindMu.Unlock()
 	d.ipsecRebindPending.Store(true)
-	if d.daemonCtx == nil || d.ipsecRebindRetryActive {
+	// #5523 C179-093: do not (re)start the loop once shutdown has stopped it —
+	// a late Add would race stopIPsecRebindLoop's Wait. Mirrors pinRetryStopped.
+	if d.daemonCtx == nil || d.ipsecRebindRetryActive || d.ipsecRebindStopped {
 		return
 	}
 	d.ipsecRebindRetryActive = true
-	go d.ipsecRebindRetryLoop(d.daemonCtx)
+	// Bind the loop to a CANCELLABLE child of d.daemonCtx (not d.daemonCtx
+	// itself, which is never cancelled in production, #5807) and track it on
+	// ipsecRebindWg so stopIPsecRebindLoop can cancel + join it at shutdown.
+	ctx, cancel := context.WithCancel(d.daemonCtx)
+	d.ipsecRebindCancel = cancel
+	d.ipsecRebindWg.Add(1)
+	go func() {
+		defer d.ipsecRebindWg.Done()
+		d.ipsecRebindRetryLoop(ctx)
+	}()
+}
+
+// stopIPsecRebindLoop cancels the ipsecRebindRetryLoop goroutine and JOINS it at
+// shutdown, so a late 30s rebind tick can never run a swanctl reapply against a
+// torn-down subsystem (#5523 C179-093). It latches ipsecRebindStopped so a late
+// armIPsecRebind cannot start a new loop after the join. Idempotent / nil-safe:
+// a loop that was never armed (no lease-change rebind failure) joins cleanly.
+//
+// ipsecRebindMu is held only to latch the flag and read+clear the cancel, then
+// RELEASED before the join: the loop takes ipsecRebindMu on both its ctx.Done
+// (disarmIPsecRebindOnShutdown) and ticker branches, so holding it across the
+// join would deadlock. Mirrors the #5308 stopPinRetryLoop.
+func (d *Daemon) stopIPsecRebindLoop() {
+	d.ipsecRebindMu.Lock()
+	d.ipsecRebindStopped = true
+	cancel := d.ipsecRebindCancel
+	d.ipsecRebindCancel = nil
+	d.ipsecRebindMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	d.ipsecRebindWg.Wait()
 }
 
 // clearIPsecRebindPending drops the health signal after a successful reapply,

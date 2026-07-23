@@ -215,14 +215,18 @@ type Store struct {
 	archiveDir string // local archive directory (empty = disabled)
 	archiveMax int    // max archives to keep
 
-	// archiveSeq is a monotonic per-process counter appended to every
-	// archive filename (#3441 H4, Codex MAJOR). The wall-clock timestamp
-	// alone is not a unique key: two successive (mutex-serialized) commits
-	// can format the SAME nanosecond under a coarse clock or an NTP
-	// step-back, and the later atomic write would overwrite the earlier
-	// archive. The seq always advances, so config-<ts>.<seq>.conf is unique
-	// even on an identical timestamp; the ts still gives chronological
-	// sort/prune order (it dominates the lexical compare).
+	// archiveSeq is a monotonic counter appended to every archive filename
+	// (#3441 H4, Codex MAJOR). The wall-clock timestamp alone is not a unique
+	// key: two successive (mutex-serialized) commits can format the SAME
+	// nanosecond under a coarse clock or an NTP step-back, and the later atomic
+	// write would overwrite the earlier archive. The seq always advances, so
+	// config-<ts>.<seq>.conf is unique even on an identical timestamp; the seq
+	// (not the ts) is the retention/prune key rotateArchives uses (#5523
+	// C179-060). It is a per-PROCESS counter that restarts at 0, so
+	// SetArchiveConfig seeds it from the highest seq on disk at startup, making
+	// it globally monotonic across restarts — otherwise a fresh process's
+	// low-seq archives would be pruned in favor of a prior process's stale
+	// high-seq ones.
 	archiveSeq atomic.Uint64
 
 	// archiveWG tracks the in-flight async auto-archive writer goroutines
