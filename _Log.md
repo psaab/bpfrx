@@ -1,3 +1,40 @@
+## 2026-07-22 — #6184: host-auth cancel closeout — per-owner panic recover + log actual budget
+
+- **Timestamp**: 2026-07-22 (fix/6184-host-auth-closeout-recover)
+- **Action**: Two LOW hardenings from the #6181/#5874 hostile review of the
+  cancelled-apply host-authorization closeout.
+  (1) Item 1 — per-owner defer/recover in `runHostAuthCloseoutOwners`: each
+  owner's goroutine now recovers a panic in its reconcile, logs it with the
+  owner id, and routes it through `done` as that owner's FAIL-VISIBLE error
+  (`host-auth closeout owner %q panicked: %v`) so `summarizeHostAuthCloseout`
+  joins it. Without it a single owner panic unwound its goroutine with no
+  recover and crashed the whole daemon-stop path, taking down the remaining
+  owners and the process — the opposite of the M35 fail-visible discipline.
+  `done` is buffered and fn's own send is skipped on panic, so the recover is
+  the sole send (no double-send).
+  (2) Item 2 — `summarizeHostAuthCloseout` now takes the wall-clock `budget`
+  and logs it in the "did not complete within budget" line instead of the
+  package global `hostAuthCloseoutBudget`; production still passes the global,
+  but a non-default (test/future) budget is now reported honestly. Threaded
+  the budget through the sole production caller and the three existing test
+  callers.
+- **Tests**: new `host_auth_closeout_6184_test.go` — fail-on-revert gates.
+  `TestHostAuthCloseoutRecoversPerOwnerPanic6184` (item 1): panic in the
+  middle owner; asserts batch does not crash, owners on both sides run, the
+  panicking owner is fail-visible + named in the join. RED-on-revert = the
+  removed-recover build stays clean (fmt/slog still used) but the owner panic
+  crashes `go test` (verified `panic: boom in owner closeout` → FAIL).
+  `TestHostAuthCloseoutLogsActualBudget6184` (item 2): captures slog records,
+  asserts the timed-out line logs budget=20ms (the passed budget), not the
+  30s global; RED-on-revert = clean assertion (`budget = 30s, want 20ms`).
+  Both 3x green, full `pkg/daemon` green under `-race`, gofmt + vet clean.
+  No design/state doc covers this closeout (contract lives in the
+  daemon_apply_hostauth.go doc-comments, updated here); control-plane
+  closeout, unit-provable — not HA / no smoke.
+- **File(s)**: pkg/daemon/daemon_apply_hostauth.go,
+  pkg/daemon/host_auth_closeout_6184_test.go (new),
+  pkg/daemon/host_auth_closeout_5874_test.go
+
 ## 2026-07-22 — #6241: typed worker-launch bundles (replace 38-arg positional worker_loop)
 
 - **Timestamp**: 2026-07-22 (refactor/6241-typed-launch-bundles)
