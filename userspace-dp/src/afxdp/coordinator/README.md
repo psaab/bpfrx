@@ -220,3 +220,30 @@ Differences that matter (#1881):
   stopped) drives the regression tests (coordinator-level
   `post_spawn_inthread_bind_failure_fails_closed_5143` + handler-level
   `full_apply_post_spawn_inthread_bind_failure_fails_closed_no_persist_5143`).
+
+- **Explicit binding-setup failures in the startup report (#6245).** #5143
+  reported a bind failure ONLY by OMISSION — the failed slot was simply absent
+  from `WorkerStartupReport.bound_slots`, so the barrier could prove
+  incompleteness (`bound != planned`) but not say WHY (`worker_loop_setup`
+  merely logged + mutated `BindingLiveState.last_error`, discarding the causal
+  error, the phase, and the fallback path). The report now ALSO carries the
+  EXPLICIT cause: `binding_failures: Vec<BindingSetupFailure>` — one
+  `{ slot, phase, reason }` per TERMINAL per-slot failure
+  (`BindingSetupPhase::Private` for a private-UMEM bind, `SharedFallback` for a
+  shared-group bind whose private fallback ALSO failed), sorted by slot — plus
+  `recovered_fallbacks: Vec<BindingRecoveredFallback>` recording shared-UMEM
+  groups that failed their group bind but FULLY recovered via private fallback
+  (a diagnostic DEGRADATION, sorted by group, that does NOT affect readiness —
+  all slots still bound). The readiness criterion is UNCHANGED (`bound ==
+  planned` set equality); on a shortfall the barrier renders the explicit cause
+  into the fail-closed stage via `render_binding_setup_failures`, so
+  `worker_bind_incomplete:<id>:bound=N:planned=M:failures=[private:slot=1:..]`
+  names the slot, phase, and reason instead of only the set-difference counts
+  (a shortfall with no recorded failure renders `failures=[no-explicit-failure]`
+  rather than a blank). The SUCCESS path is behavior-identical: a worker that
+  bound its full planned set reports both vecs empty. The
+  `force_worker_bind_incomplete` stub now emits a matching explicit failure for
+  the dropped slot, so the report->barrier->stage explicit path is verified
+  end-to-end without CAP_NET_ADMIN
+  (`worker_bind_incomplete_report_carries_explicit_failure_6245`); the pure
+  renderer is unit-tested in `bringup::tests_6245`.

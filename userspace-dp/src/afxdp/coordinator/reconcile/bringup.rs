@@ -501,6 +501,22 @@ pub(super) fn bring_up_workers(
             // is short by one — either way bound != planned -> barrier fails
             // closed.
             let incomplete_bound: Vec<u32> = planned_slots.iter().copied().skip(1).collect();
+            // #6245: the omitted slot is the SMALLEST planned slot (`skip(1)`
+            // drops the first of the sorted BTreeSet). Report it as an EXPLICIT
+            // per-slot failure so the barrier surfaces the cause, exercising the
+            // #6245 explicit-failure contract end-to-end (a real `worker_loop`
+            // cannot bind an XSK in-process). Empty when no slots are planned.
+            let stub_failures: Vec<BindingSetupFailure> = planned_slots
+                .iter()
+                .copied()
+                .next()
+                .map(|slot| BindingSetupFailure {
+                    slot,
+                    phase: BindingSetupPhase::Private,
+                    reason: "forced private bind failure (test seam #6245)".to_string(),
+                })
+                .into_iter()
+                .collect();
             let stub_stop = stop.clone();
             let stub_heartbeat = heartbeat.clone();
             let stub_tx = startup_report_tx.clone();
@@ -513,6 +529,8 @@ pub(super) fn bring_up_workers(
                     let _ = stub_tx.send(WorkerStartupReport {
                         worker_id: stub_worker_id,
                         bound_slots: incomplete_bound,
+                        binding_failures: stub_failures,
+                        recovered_fallbacks: Vec::new(),
                     });
                     // Heartbeat while "live-but-unbound" until the barrier
                     // stops us — bounded so a REVERTED (barrier removed) build
@@ -766,15 +784,18 @@ fn collect_worker_startup_readiness(
     // Collect one report per spawned worker (last write wins per id) until we
     // have them all or the deadline elapses.
     let deadline_ns = monotonic_nanos().saturating_add(WORKER_STARTUP_BARRIER_TIMEOUT_NS);
-    let mut bound_by_worker: BTreeMap<u32, std::collections::BTreeSet<u32>> = BTreeMap::new();
-    while bound_by_worker.len() < spawned_worker_ids.len() {
+    // #6245: retain the FULL report (not just the bound-slot set) so a
+    // shortfall can be attributed to its EXPLICIT per-slot failure(s) rather
+    // than inferred from the missing slots alone.
+    let mut report_by_worker: BTreeMap<u32, WorkerStartupReport> = BTreeMap::new();
+    while report_by_worker.len() < spawned_worker_ids.len() {
         let now = monotonic_nanos();
         if now >= deadline_ns {
             break;
         }
         match startup_report_rx.recv_timeout(std::time::Duration::from_nanos(deadline_ns - now)) {
             Ok(report) => {
-                bound_by_worker.insert(report.worker_id, report.bound_slots.into_iter().collect());
+                report_by_worker.insert(report.worker_id, report);
             }
             // Timed out with reports still outstanding, or every sender was
             // dropped (a worker panicked in setup before reporting). Either
@@ -788,13 +809,23 @@ fn collect_worker_startup_readiness(
             .get(&worker_id)
             .cloned()
             .unwrap_or_default();
-        match bound_by_worker.get(&worker_id) {
-            Some(bound) if *bound == planned => {}
-            Some(bound) => {
+        match report_by_worker.get(&worker_id) {
+            Some(report) => {
+                let bound: std::collections::BTreeSet<u32> =
+                    report.bound_slots.iter().copied().collect();
+                if bound == planned {
+                    continue;
+                }
+                // #6245: a shortfall — surface the EXPLICIT cause. The report's
+                // `binding_failures` carries the slot + phase + owned error for
+                // each terminal bind failure that produced the shortfall (empty
+                // only if a slot went missing without a recorded failure, which
+                // the `cause` renderer flags as `no-explicit-failure`).
                 return Some(format!(
-                    "worker_bind_incomplete:{worker_id}:bound={}:planned={}",
+                    "worker_bind_incomplete:{worker_id}:bound={}:planned={}:{}",
                     bound.len(),
-                    planned.len()
+                    planned.len(),
+                    render_binding_setup_failures(&report.binding_failures),
                 ));
             }
             None => {
@@ -806,6 +837,25 @@ fn collect_worker_startup_readiness(
         }
     }
     None
+}
+
+/// #6245: render a worker's EXPLICIT per-slot binding-setup failures into a
+/// compact, deterministic descriptor for the fail-closed reconcile stage. The
+/// failures arrive already sorted by slot (`worker_loop_setup`), so the output
+/// is stable regardless of setup/channel ordering. Empty input renders
+/// `failures=[no-explicit-failure]` — a shortfall with no recorded cause,
+/// which should not happen once every setup leg reports through the outcome,
+/// but is surfaced rather than silently dropped.
+fn render_binding_setup_failures(failures: &[BindingSetupFailure]) -> String {
+    if failures.is_empty() {
+        return "failures=[no-explicit-failure]".to_string();
+    }
+    let rendered = failures
+        .iter()
+        .map(|failure| format!("{}:slot={}:{}", failure.phase.as_str(), failure.slot, failure.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("failures=[{rendered}]")
 }
 
 /// #1830 follow-up (Codex review on PR #1841): array length needed to
@@ -823,4 +873,52 @@ pub(in crate::afxdp) fn planned_worker_slots<V>(workers: &BTreeMap<u32, V>) -> u
         .next_back()
         .map(|&id| id as usize + 1)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests_6245 {
+    use super::*;
+
+    /// #6245: the explicit-failure renderer is deterministic and never blank —
+    /// empty input yields a "no explicit cause" marker, and populated input
+    /// renders `phase:slot=<n>:<reason>` per failure joined by "; " in the
+    /// caller-supplied (slot-sorted) order. Fail-on-revert: drop the phase or
+    /// reason from the render and these assertions fail.
+    #[test]
+    fn render_binding_setup_failures_is_deterministic() {
+        assert_eq!(
+            render_binding_setup_failures(&[]),
+            "failures=[no-explicit-failure]",
+            "empty input must render an explicit no-cause marker, not a blank"
+        );
+
+        let one = [BindingSetupFailure {
+            slot: 3,
+            phase: BindingSetupPhase::Private,
+            reason: "create binding umem: ENOMEM".to_string(),
+        }];
+        assert_eq!(
+            render_binding_setup_failures(&one),
+            "failures=[private:slot=3:create binding umem: ENOMEM]",
+        );
+
+        // Two failures (already slot-sorted by the producer) with distinct
+        // phases render in order, joined by "; ".
+        let many = [
+            BindingSetupFailure {
+                slot: 1,
+                phase: BindingSetupPhase::Private,
+                reason: "a".to_string(),
+            },
+            BindingSetupFailure {
+                slot: 4,
+                phase: BindingSetupPhase::SharedFallback,
+                reason: "b".to_string(),
+            },
+        ];
+        assert_eq!(
+            render_binding_setup_failures(&many),
+            "failures=[private:slot=1:a; shared-fallback:slot=4:b]",
+        );
+    }
 }
