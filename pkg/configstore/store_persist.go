@@ -481,39 +481,75 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 // would let the pre-existing archives outrank the new ones). A scan that fails
 // to READ the dir leaves archiveSeedDir unchanged so the next call retries,
 // rather than pinning the counter below the on-disk max (#6396 Codex MINOR 4).
+//
+// #6404 edge 2: disabling archival (dir=="") INVALIDATES archiveSeedDir, so a
+// later re-enable to the SAME dir re-scans it. Without the invalidation
+// A→""→A left archiveSeedDir==A and the re-enable skipped the rescan; if the
+// on-disk max in A advanced while archival was off (another process/tenant
+// wrote there), the counter would stay low and every fresh archive would be
+// pruned as stale. The seed retry the commit path performs (#6404 edge 1,
+// ensureArchiveSeededLocked) rests on the same invariant: archiveSeedDir names
+// a dir this process has actually scanned, never a stale disabled one.
 func (s *Store) SetArchiveConfig(dir string, max int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.archiveDir = dir
 	s.archiveMax = max
-	// Seed the monotonic archive seq from the highest seq already on disk in
-	// the target dir. Scan whenever the dir differs from the one last
-	// SUCCESSFULLY seeded (archiveSeedDir) — that covers both process start
-	// (archiveSeedDir=="") and a runtime archive-dir switch: switching to a
-	// previously-used directory whose existing archives carry HIGHER seqs than
-	// this process's counter would otherwise let those pre-existing archives
-	// outrank — and evict — the archives this process is about to write, the
-	// same across-restart hazard #5523 C179-060 closed but reached via a live
-	// dir switch (#6396). The seed is monotonic-up only (max of the current
-	// counter and the on-disk max), so switching to an empty or lower-seq dir
-	// never rewinds the counter.
-	if dir != "" && s.archiveSeedDir != dir {
-		seed, err := maxArchiveSeq(dir)
-		if err != nil {
-			// #6396 Codex MINOR 4: a transient scan failure (mount/permission)
-			// must NOT reseed the counter to 0 and must NOT record the dir as
-			// seeded — leaving archiveSeedDir unchanged so the next call retries.
-			// Regressing the counter here would prune every fresh archive as stale
-			// until a restart re-scanned.
-			slog.Warn("archive seq reseed scan failed; leaving counter unchanged, will retry",
-				"dir", dir, "err", err)
-		} else {
-			if seed > s.archiveSeq.Load() {
-				s.archiveSeq.Store(seed)
-			}
-			s.archiveSeedDir = dir
-		}
+	if dir == "" {
+		// #6404 edge 2: archival disabled. Clear archiveSeedDir so a later
+		// re-enable to a previously-seeded dir re-scans it (the on-disk max may
+		// have advanced while archival was off). A disabled store writes no
+		// archives, so clearing the marker only forces the rescan the re-enable
+		// must do — it never rewinds the monotonic counter itself.
+		s.archiveSeedDir = ""
+		return
 	}
+	// Seed the monotonic archive seq from the highest seq already on disk in
+	// the target dir (see ensureArchiveSeededLocked for the full rationale).
+	s.ensureArchiveSeededLocked()
+}
+
+// ensureArchiveSeededLocked seeds the monotonic archive counter (archiveSeq)
+// from the highest seq present in the active archive dir, when that dir has not
+// yet been SUCCESSFULLY scanned (archiveSeedDir != archiveDir). The caller MUST
+// hold s.mu for WRITING — it may store archiveSeedDir.
+//
+// Switching to a previously-used directory whose existing archives carry HIGHER
+// seqs than this process's counter would otherwise let those pre-existing
+// archives outrank — and evict — the archives this process is about to write,
+// the same across-restart hazard #5523 C179-060 closed but reached via a live
+// dir switch (#6396). The seed is monotonic-up only (max of the current counter
+// and the on-disk max), so switching to an empty or lower-seq dir never rewinds
+// the counter. A scan that fails to READ the dir leaves archiveSeedDir
+// unchanged so a later call retries, rather than pinning the counter below the
+// on-disk max (#6396 Codex MINOR 4).
+//
+// #6404 edge 1: the commit archive path calls this BEFORE it captures a seq, so
+// a commit that lands in the window AFTER a failed SetArchiveConfig scan but
+// BEFORE the next SetArchiveConfig retry re-attempts the reseed instead of
+// writing an archive with a below-max seq that rotateArchives would prune as
+// stale. In the common case (dir already successfully seeded) the archiveSeedDir
+// guard makes this a cheap string compare — no per-commit ReadDir.
+func (s *Store) ensureArchiveSeededLocked() {
+	dir := s.archiveDir
+	if dir == "" || s.archiveSeedDir == dir {
+		return
+	}
+	seed, err := maxArchiveSeq(dir)
+	if err != nil {
+		// #6396 Codex MINOR 4: a transient scan failure (mount/permission)
+		// must NOT reseed the counter to 0 and must NOT record the dir as
+		// seeded — leaving archiveSeedDir unchanged so the next call retries.
+		// Regressing the counter here would prune every fresh archive as stale
+		// until a later scan succeeded.
+		slog.Warn("archive seq reseed scan failed; leaving counter unchanged, will retry",
+			"dir", dir, "err", err)
+		return
+	}
+	if seed > s.archiveSeq.Load() {
+		s.archiveSeq.Store(seed)
+	}
+	s.archiveSeedDir = dir
 }
 
 // parseArchiveSeq extracts the monotonic sequence number from an archive

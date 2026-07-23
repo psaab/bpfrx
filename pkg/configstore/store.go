@@ -216,11 +216,17 @@ type Store struct {
 	archiveMax int    // max archives to keep
 
 	// archiveSeedDir is the archive dir for which the archiveSeq reseed scan
-	// last SUCCEEDED (#6396 Codex MINOR 4). SetArchiveConfig scans a dir only
-	// when it differs from this — so a transient scan failure (mount/permission)
-	// leaves it unchanged and the next call retries, instead of the failure
-	// silently marking the dir seeded and pinning the counter below the on-disk
-	// max forever (which would prune every fresh archive as stale).
+	// last SUCCEEDED (#6396 Codex MINOR 4). ensureArchiveSeededLocked scans a
+	// dir only when it differs from this — so a transient scan failure
+	// (mount/permission) leaves it unchanged and a later call retries, instead
+	// of the failure silently marking the dir seeded and pinning the counter
+	// below the on-disk max forever (which would prune every fresh archive as
+	// stale). #6404: the retry is driven not only by an explicit
+	// SetArchiveConfig call but by the archiving commit path itself (edge 1), so
+	// a commit that lands in the post-failure window re-scans before capturing
+	// its seq; and disabling archival (SetArchiveConfig("")) CLEARS this (edge
+	// 2), so a disable→re-enable to the same dir re-scans to pick up any on-disk
+	// max that advanced while archival was off.
 	archiveSeedDir string
 
 	// archiveSeq is a monotonic counter appended to every archive filename

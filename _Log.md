@@ -59660,3 +59660,19 @@ top.
   - **File(s)**: test/xsk-repro/selftest-compile.sh,
     test/xsk-repro/selftest-multitoken-cc_6355.sh, scripts/run-selftests.sh,
     test/xsk-repro/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23 23:06 UTC
+  - **Action**: Close #6404 archive-reseed edges. Extracted
+    `ensureArchiveSeededLocked` from `SetArchiveConfig`; the archiving commit
+    path (`commitWithDescriptionLocked`) now re-attempts the reseed BEFORE
+    capturing its seq so a commit in the post-scan-failure window never writes
+    a below-max seq (edge 1); `SetArchiveConfig("")` now invalidates
+    `archiveSeedDir` so a disable→re-enable to the same dir re-scans (edge 2).
+    Added fail-on-revert tests asserting the REAL rotation outcome (fresh
+    archive survives / oldest pre-existing pruned), not just the private
+    counter; verified RED→GREEN on both revert directions. Updated README +
+    archiveSeedDir field doc. Control-plane only, no HA/smoke.
+  - **File(s)**: pkg/configstore/store_persist.go,
+    pkg/configstore/store_commit.go, pkg/configstore/store.go,
+    pkg/configstore/README.md, pkg/configstore/archive_reseed_6404_test.go,
+    _Log.md

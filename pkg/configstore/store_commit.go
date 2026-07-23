@@ -274,6 +274,15 @@ func (s *Store) commitWithDescriptionLocked(description string) (*config.Config,
 	// same lock before it Wait()s — so no Add can start after the fence, and the
 	// WaitGroup counter never rises from zero concurrently with Wait.
 	if s.archiveDir != "" && !s.archiveFenced.Load() {
+		// #6404 edge 1: re-attempt the archive-seq reseed if a prior
+		// SetArchiveConfig scan of this dir failed (archiveSeedDir !=
+		// archiveDir). commitWithDescriptionLocked runs under s.mu.Lock (write),
+		// so this may safely store archiveSeedDir. Without it, a commit that
+		// lands in the window between a failed scan and the next SetArchiveConfig
+		// retry would capture the still-low seq below and write an archive that
+		// rotateArchives immediately prunes as stale. When the dir is already
+		// seeded this is a cheap string compare — no per-commit ReadDir.
+		s.ensureArchiveSeededLocked()
 		dir := s.archiveDir
 		max := s.archiveMax
 		if max <= 0 {
