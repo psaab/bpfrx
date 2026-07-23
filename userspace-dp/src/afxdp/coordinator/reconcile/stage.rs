@@ -53,7 +53,7 @@ impl MandatoryPin {
 
 /// The per-attempt shortfall recorded when a spawned worker did not bind its
 /// full planned queue set (or never reported readiness before the barrier
-/// deadline). Owned by bring-up (`collect_worker_startup_readiness`).
+/// deadline). Owned by bring-up (`await_readiness`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkerBindShortfall {
     pub(crate) worker_id: u32,

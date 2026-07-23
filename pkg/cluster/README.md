@@ -812,6 +812,19 @@ outside the monitor loop:
   *local* commit counter (`Manager.bumpGeneration`) that is not cross-node
   comparable, so the receiver rejects the stale install BEFORE forwarding it to
   the helper, and no config-epoch field or guard is added on the Rust side.
+  **Apply-in-progress fence (#6284, item 2):** the bare `epoch <
+  lastAppliedConfigGen` compare closes the gap only once the high-water has
+  advanced, but the high-water advances AFTER `OnConfigReceived` returns while
+  the `clearSessionsForDeletedPolicies` sweep runs INSIDE it — leaving a sub-µs
+  window where a racing install is admitted against the stale high-water.
+  `configApplyLoop` raises `applyingConfigGen` to the generation it is applying
+  BEFORE the apply and lowers it only AFTER the high-water advances (success) or
+  the apply fails; `configEpochStale` refuses against `max(applyingConfigGen,
+  lastAppliedConfigGen)` (fence read first), so an older-epoch install racing the
+  window is refused against the applying generation instead of admitted. The
+  guard still covers only the config-authority → peer direction; the reverse
+  active/active direction stays a documented fail-OPEN residual on #6284 (item 1,
+  needs a bidirectional config-gen namespace #5274 scoped out).
 - **RT_FLOW session id (#5212)**: distinct from BOTH the synthesized BPF-ABI
   `SessionID` (`now<<16|slot`, node-local) AND the per-key install generation,
   every session install carries the ORIGINATING node's stable RT_FLOW session id

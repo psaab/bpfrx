@@ -1,13 +1,22 @@
 //! #1328 Phase 2 — worker bringup phase.
 //!
-//! Pure code motion of the tail of the pre-#1328 monolithic
-//! `Coordinator::reconcile` body (lines 529–819 of the old
-//! `mod.rs`): build per-worker `BindingPlan` lists, apply shared
-//! UMEM policy, store BPF map FDs on `self.bpf_maps`, publish
-//! mirror-target + CoS owner maps, replay preserved synced
-//! sessions, spawn worker threads (with the #925 panic-slot
-//! insert + remove pairing kept inline), start the neighbor
-//! monitor, and spawn the local tunnel sources. Final
+//! #6240: the bring-up transaction is decomposed into cohesive phase
+//! helpers, all kept in THIS module (no one-file-per-phase). `bring_up_workers`
+//! is now a short shell that sequences them and — critically — keeps the
+//! two-armed #4952 rollback DECISION visible and distinct in the shell
+//! (spawn-fail returns WITHOUT `stop_inner`; bind-incomplete calls
+//! `stop_inner(false)`); no helper ever calls `stop_inner`. The phase order is
+//! preserved verbatim: clamp the ring depth ([`clamp_ring_entries`]),
+//! [`plan_workers`] (build per-worker `BindingPlan` lists + live/identities +
+//! sizing + the `Planned` stage), [`publish_runtime`] (move the BPF map FDs onto
+//! `coord.bpf_maps` + publish the mirror-target/CoS owner maps),
+//! [`replay_preserved_sessions`] (build the command queues + replay preserved
+//! synced sessions), [`ensure_resolver`] (best-effort on-demand neighbor
+//! resolver, ATTEMPTED before worker launch), [`spawn_workers`] (the per-worker
+//! spawn loop with the #925 panic slot + the #6242 post-spawn-success record
+//! insert → a typed [`LaunchOutcome`]), [`await_readiness`] (the #5143
+//! startup-readiness barrier), then [`start_post_readiness_neighbor_services`]
+//! (neighbor monitor + warmer + the local tunnel/WG reconcile). Final
 //! `refresh_bindings` is invoked by the orchestrator, not here.
 use super::ReconcileSnapshotFds;
 // Pull everything the bringup body needs from afxdp scope via the
@@ -49,6 +58,26 @@ pub(super) enum WorkerBringUpError {
     /// silent forwarding outage this guards. #6244: carries the preserved typed
     /// [`ReconcileStage::WorkerBindIncomplete`] identity (was a stage `String`).
     BindIncomplete(ReconcileStage),
+}
+
+/// #6240: the outcome of the per-worker spawn loop ([`spawn_workers`]),
+/// returned to the [`bring_up_workers`] shell so the two-armed #4952 rollback
+/// DECISION stays in the shell — `spawn_workers` itself NEVER calls
+/// `stop_inner`.
+enum LaunchOutcome {
+    /// #4952 ARM 1: a worker thread failed to SPAWN. Carries the preserved typed
+    /// [`ReconcileStage::SpawnWorkerFailed`] identity (already recorded on
+    /// `coord.last_reconcile_stage` by the loop). The launched workers `0..N-1`
+    /// KEEP their records — a failed worker never registered one (post-spawn
+    /// insert) — so the shell returns `Err(Spawn)` WITHOUT `stop_inner`.
+    SpawnFailed(ReconcileStage),
+    /// Every planned worker spawned. Carries the set of spawned worker ids and
+    /// the per-worker DISPATCHED planned-slot sets the #5143 readiness barrier
+    /// checks `bound == planned` against.
+    AllSpawned {
+        spawned_worker_ids: Vec<u32>,
+        planned_slots_by_worker: BTreeMap<u32, std::collections::BTreeSet<u32>>,
+    },
 }
 
 /// Bring up the worker threads for the just-applied snapshot.
@@ -93,6 +122,13 @@ pub(super) enum WorkerBringUpError {
 /// new workers claim. So this is the minimal fail-closed guarantee (do not
 /// persist a known-broken snapshot); a staged spawn-before-teardown is a
 /// possible follow-up.
+///
+/// #6240: the body is a short shell over the phase helpers below. The phase
+/// ORDER is load-bearing and preserved exactly: FD ownership transfer BEFORE any
+/// launch; mirror/CoS publication BEFORE replay/launch; preserved sessions +
+/// command queues BEFORE launch; the resolver ATTEMPT BEFORE worker launch; ALL
+/// launches BEFORE the readiness barrier. The two-armed rollback decision stays
+/// HERE, in the shell (never in a helper).
 pub(super) fn bring_up_workers(
     coord: &mut Coordinator,
     snapshot: &ConfigSnapshot,
@@ -101,27 +137,105 @@ pub(super) fn bring_up_workers(
     ring_entries: usize,
     preserved_synced_sessions: Vec<SyncedSessionEntry>,
 ) -> Result<(), WorkerBringUpError> {
-    let ReconcileSnapshotFds {
-        map_fd,
-        heartbeat_map_fd,
-        session_map_fd,
-        conntrack_v4_fd,
-        conntrack_v6_fd,
-        dnat_table_fd,
-        dnat_table_v6_fd,
-        dnat_fds,
-        // #2484: forwarding was consumed by apply_snapshot (built in the
-        // pre-teardown preflight, moved into coord.forwarding); bring-up
-        // reads coord.forwarding, not this field.
-        forwarding: _,
-    } = fds;
-    // #2524: clamp to the shared sanity ceiling (MAX_RING_ENTRIES) as the
-    // helper-side backstop for the Go commit-time bound. Floor stays 64.
-    // The Go gate rejects any normally-committed value > MAX_RING_ENTRIES, so
-    // a clamp here only fires on a config persisted by an older binary (before
-    // the bound landed). Warn so an operator on the stale-binary path can see
-    // the configured ring depth was capped rather than silently running a
-    // smaller ring than configured.
+    let ring_entries = clamp_ring_entries(ring_entries);
+    // Phase: PLAN. Build the per-worker binding plans (+ live/identities +
+    // sizing + the `Planned` stage) from the snapshot and the just-opened map
+    // FDs, read by RAW descriptor — the `OwnedFd`s are still owned by `fds`.
+    let workers = plan_workers(coord, snapshot, bindings, &fds, ring_entries);
+    // Capture the values the later phases need BEFORE `fds` is moved into
+    // `publish_runtime`: the session map's raw descriptor (replay) and the DNAT
+    // table fds (Copy; the worker launch bundle).
+    let session_map_raw_fd = fds.session_map_fd.fd;
+    let dnat_fds = fds.dnat_fds;
+    // Phase: PUBLISH. Move the OwnedFds onto `coord.bpf_maps` and publish the
+    // mirror-target + CoS owner/active-shard maps the workers read — BEFORE any
+    // replay or launch.
+    publish_runtime(coord, &workers, fds);
+    // Phase: REPLAY. Build the per-worker command queues and replay preserved
+    // synced sessions into the session map — BEFORE launch.
+    let worker_command_queues =
+        replay_preserved_sessions(coord, &workers, &preserved_synced_sessions, session_map_raw_fd);
+    // Phase: RESOLVER (best-effort, ATTEMPTED before worker launch so every
+    // worker's `WorkerSharedDataplane::from_coord` clones a live handle). A
+    // spawn failure leaves it `None` and workers still launch (with
+    // `resolver: None`) — the invariant is attempt-before-launch, NOT
+    // resolver-must-exist, so the resolver is NEVER threaded into
+    // `spawn_workers`.
+    let _ = ensure_resolver(coord);
+    // Phase: SPAWN. The startup-report channel is created HERE, in the shell,
+    // and the SENDER is passed BY REFERENCE into the spawn loop (each worker
+    // clones it). Keeping the original sender alive in the shell through the
+    // readiness barrier preserves the exact channel-disconnect semantics
+    // `await_readiness` relies on (the barrier never sees `Disconnected` while
+    // this sender lives).
+    let (startup_report_tx, startup_report_rx) = mpsc::channel::<WorkerStartupReport>();
+    match spawn_workers(coord, workers, worker_command_queues, dnat_fds, &startup_report_tx) {
+        // #4952 differential ARM 1 (stays in the shell): a spawn failed on the
+        // post-teardown path. Return WITHOUT `stop_inner` — the already-launched
+        // workers KEEP their records (reclaimed by the next reconcile's
+        // teardown); the failed worker never registered one.
+        LaunchOutcome::SpawnFailed(stage) => {
+            eprintln!(
+                "xpf-userspace-dp: worker bring-up FAILED ({stage}); a queue set has no \
+                 XSK-bound worker after teardown — failing reconcile closed"
+            );
+            return Err(WorkerBringUpError::Spawn(stage));
+        }
+        LaunchOutcome::AllSpawned {
+            spawned_worker_ids,
+            planned_slots_by_worker,
+        } => {
+            // #5143 STARTUP READINESS BARRIER. Every worker SPAWNED, but a spawn
+            // only proves the thread exists — NOT that its in-thread XSK/UMEM
+            // binds brought up the full planned queue set. Wait (under a bounded
+            // deadline) for each spawned worker to report the slot set it
+            // actually bound, then require bound == planned. A worker that bound
+            // a PARTIAL/EMPTY set (the #5143 silent forwarding outage) or never
+            // reported in time fails the reconcile CLOSED.
+            if let Some(stage) = await_readiness(
+                &startup_report_rx,
+                &spawned_worker_ids,
+                &planned_slots_by_worker,
+            ) {
+                eprintln!(
+                    "xpf-userspace-dp: worker bring-up FAILED ({stage}); a spawned worker did not \
+                     bind its full planned queue set after teardown — failing reconcile closed"
+                );
+                // #4952 differential ARM 2 (stays in the shell): stop + JOIN the
+                // newly-started workers (the teardown path) so no live-but-unbound
+                // worker keeps heartbeating past this fail-closed reconcile, and
+                // clear the coordinator worker state so a retry / last-good
+                // reconcile starts from a coherent baseline. Preserved synced
+                // sessions are kept (`clear_synced_state=false`). #6244:
+                // `stop_inner` no longer writes `last_reconcile_stage`, so the
+                // typed bind-incomplete identity is recorded once, after the
+                // teardown, and survives.
+                coord.stop_inner(false);
+                coord.last_reconcile_stage = stage.clone();
+                return Err(WorkerBringUpError::BindIncomplete(stage));
+            }
+        }
+    }
+    coord.last_reconcile_stage = ReconcileStage::Spawned {
+        // #6242: the `Spawned` stage's `handles` field is the worker COUNT,
+        // now sourced from the consolidated `records` map (was `handles`).
+        handles: coord.workers.records.len(),
+        identities: coord.workers.identities.len(),
+        live: coord.workers.live.len(),
+    };
+    // Phase: POST-READINESS neighbor services + the local tunnel/WG reconcile.
+    start_post_readiness_neighbor_services(coord);
+    Ok(())
+}
+
+/// #2524: clamp the configured ring depth to the shared sanity ceiling
+/// ([`MAX_RING_ENTRIES`]) with a floor of 64 — the helper-side backstop for the
+/// Go commit-time bound. The Go gate rejects any normally-committed value >
+/// MAX_RING_ENTRIES, so a clamp here only fires on a config persisted by an
+/// older binary (before the bound landed). Warn so an operator on the
+/// stale-binary path can see the configured ring depth was capped rather than
+/// silently running a smaller ring than configured.
+fn clamp_ring_entries(ring_entries: usize) -> u32 {
     if ring_entries > MAX_RING_ENTRIES as usize {
         eprintln!(
             "xpf-dp: ring-entries {ring_entries} exceeds MAX_RING_ENTRIES {}; \
@@ -129,7 +243,32 @@ pub(super) fn bring_up_workers(
             MAX_RING_ENTRIES
         );
     }
-    let ring_entries = ring_entries.max(64).min(MAX_RING_ENTRIES as usize) as u32;
+    ring_entries.max(64).min(MAX_RING_ENTRIES as usize) as u32
+}
+
+/// #6240 phase: PLAN. Build the per-worker `BindingPlan` lists from the
+/// registered bindings and the just-opened BPF map FDs (read by RAW descriptor
+/// — the `OwnedFd`s stay owned by `fds`, which `publish_runtime` moves onto
+/// `coord.bpf_maps` next), insert the per-slot live-state + identity, apply the
+/// shared-UMEM policy, project the resulting shared-UMEM status back onto
+/// `bindings`, record the sizing values, and set the `Planned` stage. Returns
+/// the worker->plans map the rest of the transaction consumes. Verbatim move of
+/// the pre-#6240 inline block.
+fn plan_workers(
+    coord: &mut Coordinator,
+    snapshot: &ConfigSnapshot,
+    bindings: &mut [BindingStatus],
+    fds: &ReconcileSnapshotFds,
+    ring_entries: u32,
+) -> BTreeMap<u32, Vec<BindingPlan>> {
+    let ReconcileSnapshotFds {
+        map_fd,
+        heartbeat_map_fd,
+        session_map_fd,
+        conntrack_v4_fd,
+        conntrack_v6_fd,
+        ..
+    } = fds;
     let mut workers: BTreeMap<u32, Vec<BindingPlan>> = BTreeMap::new();
     for binding in bindings.iter_mut() {
         if !binding.registered || binding.ifindex <= 0 {
@@ -213,7 +352,32 @@ pub(super) fn bring_up_workers(
         planned_bindings,
         coord.workers.live.len()
     );
-    let session_map_raw_fd = session_map_fd.fd;
+    workers
+}
+
+/// #6240 phase: PUBLISH. Move the owned BPF map FDs onto `coord.bpf_maps`
+/// (transferring ownership so `stop_inner`'s teardown order governs their drop —
+/// join workers, delete XSK/heartbeat slots while the FDs live, THEN drop the
+/// `OwnedFd`s) and publish the mirror-target + CoS owner/active-shard maps the
+/// workers read — BEFORE any replay or launch. Verbatim move of the pre-#6240
+/// inline block (the `session_map_raw_fd` read stays in the shell, before the
+/// move).
+fn publish_runtime(
+    coord: &mut Coordinator,
+    workers: &BTreeMap<u32, Vec<BindingPlan>>,
+    fds: ReconcileSnapshotFds,
+) {
+    let ReconcileSnapshotFds {
+        map_fd,
+        heartbeat_map_fd,
+        session_map_fd,
+        conntrack_v4_fd,
+        conntrack_v6_fd,
+        dnat_table_fd,
+        dnat_table_v6_fd,
+        dnat_fds: _,
+        forwarding: _,
+    } = fds;
     coord.bpf_maps.map_fd = Some(map_fd);
     coord.bpf_maps.heartbeat_map_fd = Some(heartbeat_map_fd);
     coord.bpf_maps.session_map_fd = Some(session_map_fd);
@@ -233,7 +397,7 @@ pub(super) fn bring_up_workers(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let owner_map = super::super::build_cos_owner_worker_by_queue(&coord.forwarding, &workers);
+    let owner_map = super::super::build_cos_owner_worker_by_queue(&coord.forwarding, workers);
     coord
         .mirror_targets
         .store(Arc::new(super::super::build_mirror_target_map(
@@ -247,6 +411,19 @@ pub(super) fn bring_up_workers(
             &worker_binding_ifindexes,
         );
     coord.refresh_cos_runtime_maps(owner_map, active_shards_by_egress_ifindex);
+}
+
+/// #6240 phase: REPLAY. Build the per-worker command queues and replay the
+/// preserved synced sessions into the session map (seeding the session table +
+/// the queues) BEFORE launch, recording the `ReplayedSynced` stage when any
+/// replayed. Returns the shared command-queue map the spawn loop hands to each
+/// worker. Verbatim move of the pre-#6240 inline block.
+fn replay_preserved_sessions(
+    coord: &mut Coordinator,
+    workers: &BTreeMap<u32, Vec<BindingPlan>>,
+    preserved_synced_sessions: &[SyncedSessionEntry],
+    session_map_raw_fd: core::ffi::c_int,
+) -> Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> {
     let worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> = Arc::new(
         workers
             .keys()
@@ -255,7 +432,7 @@ pub(super) fn bring_up_workers(
             .collect(),
     );
     let replayed_synced_sessions = coord.replay_synced_sessions(
-        &preserved_synced_sessions,
+        preserved_synced_sessions,
         worker_command_queues.as_ref(),
         session_map_raw_fd,
     );
@@ -265,6 +442,21 @@ pub(super) fn bring_up_workers(
             workers: worker_command_queues.len(),
         };
     }
+    worker_command_queues
+}
+
+/// #6240 phase: RESOLVER (best-effort, ATTEMPTED before worker launch). Spawn
+/// the shared on-demand neighbor resolver so every worker's
+/// `WorkerSharedDataplane::from_coord` captures a clone of the handle. Guarded
+/// by `resolver.is_none()` so a re-reconcile reuses the existing thread. The
+/// attempt is BEST-EFFORT: on spawn failure `coord.neighbors.resolver` stays
+/// `None` and workers still launch (with `resolver: None`) — the invariant is
+/// attempt-before-launch, NOT resolver-must-exist, so the resolver is NEVER
+/// threaded into `spawn_workers` as a required input. Returns the resulting
+/// handle (`Some` when installed/already-present, `None` when the spawn failed)
+/// so the ordering/best-effort contract is directly unit-testable. Verbatim
+/// move of the pre-#6240 inline block.
+pub(in crate::afxdp) fn ensure_resolver(coord: &mut Coordinator) -> Option<Arc<NeighborResolver>> {
     // #1769: spawn the shared on-demand neighbor resolver BEFORE the
     // worker spawn loop so every worker captures a clone of the resolver
     // handle. Guarded like the monitor/warmer so a re-reconcile reuses
@@ -329,20 +521,37 @@ pub(super) fn bring_up_workers(
             }
         }
     }
-    // #4952: set on the FIRST worker-spawn failure; carries the preserved
-    // `spawn_worker_failed:<id>:<err>` stage. Once set, the loop breaks
-    // (abort remaining launches) and the tail returns Err(stage) so the
-    // reconcile fails closed instead of persisting a broken snapshot.
-    let mut spawn_failure: Option<ReconcileStage> = None;
+    coord.neighbors.resolver.clone()
+}
+
+/// #6240 phase: SPAWN. The per-worker spawn loop — build the five typed #6241
+/// launch bundles, spawn the worker thread (with the #925 panic slot + the
+/// `#[cfg(test)]` force-failure seams), and on success register ONE #6242
+/// post-spawn `WorkerRuntimeRecord`. Returns a typed [`LaunchOutcome`]:
+/// `SpawnFailed` on the FIRST spawn failure (its stage already recorded on
+/// `coord.last_reconcile_stage`; launched records left INTACT), else
+/// `AllSpawned` with the spawned ids + dispatched planned-slot sets for the
+/// readiness barrier.
+///
+/// #4952 (non-negotiable): this NEVER calls `stop_inner`. The two-armed rollback
+/// DECISION lives in the [`bring_up_workers`] shell. The startup-report SENDER is
+/// owned by the shell and passed BY REFERENCE (`startup_report_tx`); each worker
+/// clones it. Verbatim move of the pre-#6240 inline spawn loop.
+fn spawn_workers(
+    coord: &mut Coordinator,
+    workers: BTreeMap<u32, Vec<BindingPlan>>,
+    worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>>,
+    dnat_fds: DnatTableFds,
+    startup_report_tx: &mpsc::Sender<WorkerStartupReport>,
+) -> LaunchOutcome {
     // #5143: per-worker STARTUP READINESS barrier. Each spawned worker reports
-    // (over this channel, after its in-thread binds) the set of planned slots
-    // whose XSK actually bound. `planned_slots_by_worker` records the set the
-    // reconcile DISPATCHED to each worker; `spawned_worker_ids` is the set of
-    // workers whose spawn succeeded (only those are expected to report). After
-    // the spawn loop the barrier waits for every spawned worker's report under
+    // (over the shell-owned channel, after its in-thread binds) the set of
+    // planned slots whose XSK actually bound. `planned_slots_by_worker` records
+    // the set the reconcile DISPATCHED to each worker; `spawned_worker_ids` is
+    // the set of workers whose spawn succeeded (only those are expected to
+    // report). The shell's barrier waits for every spawned worker's report under
     // a bounded deadline and checks bound == planned — a heartbeat alone no
     // longer counts as ready.
-    let (startup_report_tx, startup_report_rx) = mpsc::channel::<WorkerStartupReport>();
     let mut planned_slots_by_worker: BTreeMap<u32, std::collections::BTreeSet<u32>> =
         BTreeMap::new();
     let mut spawned_worker_ids: Vec<u32> = Vec::new();
@@ -645,67 +854,29 @@ pub(super) fn bring_up_workers(
                 // NO XSK-bound worker (silent forwarding outage). ABORT the
                 // remaining launches (the data plane is already broken;
                 // spawning more XSK-bound workers cannot restore forwarding
-                // and only compounds the resource pressure) and remember the
-                // preserved stage so the tail returns Err and the caller
+                // and only compounds the resource pressure) and return the
+                // preserved stage so the shell returns Err and the caller
                 // fails closed instead of persisting a broken snapshot.
-                spawn_failure = Some(stage);
-                break;
+                // #4952/#6240: NEVER `stop_inner` here — the launched workers'
+                // records are left INTACT; the two-armed rollback decision is
+                // made by the shell.
+                return LaunchOutcome::SpawnFailed(stage);
             }
         }
     }
-    // #4952: on a post-teardown spawn failure, PRESERVE the
-    // "spawn_worker_failed:.." stage (do NOT overwrite it with
-    // "spawned:.."), skip the auxiliary-thread bring-up (forwarding is
-    // down — the next successful reconcile starts them), and return the
-    // failure so `reconcile` maps it to `ReconcileError::WorkerSpawn` and
-    // the control handler fails closed, NOT persisting this broken snapshot
-    // as the boot baseline.
-    if let Some(stage) = spawn_failure {
-        eprintln!(
-            "xpf-userspace-dp: worker bring-up FAILED ({stage}); a queue set has no \
-             XSK-bound worker after teardown — failing reconcile closed"
-        );
-        return Err(WorkerBringUpError::Spawn(stage));
+    LaunchOutcome::AllSpawned {
+        spawned_worker_ids,
+        planned_slots_by_worker,
     }
-    // #5143: STARTUP READINESS BARRIER. Every worker SPAWNED (the #4952
-    // spawn-failure fast-path above already returned otherwise), but a spawn
-    // only proves the thread exists — NOT that its in-thread XSK/UMEM binds
-    // brought up the full planned queue set. Wait (under a bounded deadline)
-    // for each spawned worker to report the slot set it actually bound, then
-    // require bound == planned. A worker that bound a PARTIAL/EMPTY set (the
-    // #5143 silent forwarding outage: a live-but-unbound worker whose
-    // heartbeat satisfied the supervisor) or never reported in time fails the
-    // reconcile CLOSED — the same post-teardown fail-closed contract #4952
-    // established for spawn failures, extended to the post-spawn bind failure.
-    if let Some(stage) = collect_worker_startup_readiness(
-        &startup_report_rx,
-        &spawned_worker_ids,
-        &planned_slots_by_worker,
-    ) {
-        eprintln!(
-            "xpf-userspace-dp: worker bring-up FAILED ({stage}); a spawned worker did not \
-             bind its full planned queue set after teardown — failing reconcile closed"
-        );
-        // Stop + JOIN the newly-started workers (the teardown path) so no
-        // live-but-unbound worker keeps heartbeating past this fail-closed
-        // reconcile, and clear the coordinator worker state so a retry /
-        // last-good reconcile starts from a coherent baseline. Preserved
-        // synced sessions are kept (`clear_synced_state=false`), matching the
-        // reconcile teardown. #6244: `stop_inner` no longer writes
-        // `last_reconcile_stage`, so the former overwrite-then-restore dance is
-        // gone — the typed bind-incomplete identity is recorded once, after the
-        // teardown, and survives.
-        coord.stop_inner(false);
-        coord.last_reconcile_stage = stage.clone();
-        return Err(WorkerBringUpError::BindIncomplete(stage));
-    }
-    coord.last_reconcile_stage = ReconcileStage::Spawned {
-        // #6242: the `Spawned` stage's `handles` field is the worker COUNT,
-        // now sourced from the consolidated `records` map (was `handles`).
-        handles: coord.workers.records.len(),
-        identities: coord.workers.identities.len(),
-        live: coord.workers.live.len(),
-    };
+}
+
+/// #6240 phase: POST-READINESS neighbor services + the local tunnel/WG
+/// reconcile. Runs ONLY after the #5143 readiness barrier passes (every worker
+/// bound its full planned set): start the helper-owned neighbor monitor +
+/// warmer (each guarded so a re-reconcile reuses the existing thread), then run
+/// the #1881 three-pass local tunnel-source reconcile + the WireGuard control
+/// threads. Verbatim move of the pre-#6240 inline block.
+fn start_post_readiness_neighbor_services(coord: &mut Coordinator) {
     // Start the helper-owned neighbor sync path. It does an initial
     // RTM_GETNEIGH dump so startup sees the existing kernel table, then
     // subscribes to RTM_{NEW,DEL}NEIGH for incremental updates.
@@ -799,7 +970,6 @@ pub(super) fn bring_up_workers(
     // the spawn-pass worker gate).
     coord.reconcile_local_tunnel_sources();
     coord.spawn_wg_control_threads();
-    Ok(())
 }
 
 /// #5143: the STARTUP READINESS BARRIER. Wait for every SPAWNED worker to
@@ -810,6 +980,10 @@ pub(super) fn bring_up_workers(
 /// [`ReconcileStage::WorkerBindIncomplete`] identity — on the FIRST worker that
 /// bound a partial/empty set OR never reported in time (fail closed).
 ///
+/// #6240: the shell owns the two-armed rollback DECISION — this barrier only
+/// COMPUTES the verdict (it never calls `stop_inner`); the shell calls
+/// `stop_inner(false)` on `Some(stage)`.
+///
 /// The barrier does NOT block forever: it stops waiting at the deadline and
 /// treats any worker with no report as failed. A worker that finished setup
 /// with a partial binding set reports IMMEDIATELY (the common failure), so this
@@ -817,7 +991,7 @@ pub(super) fn bring_up_workers(
 /// hangs/dies inside setup consumes the full budget. Reads a moved-value report
 /// off the channel — no shared mutable state, so the channel's send→recv
 /// establishes the happens-before for the reported set.
-fn collect_worker_startup_readiness(
+fn await_readiness(
     startup_report_rx: &mpsc::Receiver<WorkerStartupReport>,
     spawned_worker_ids: &[u32],
     planned_slots_by_worker: &BTreeMap<u32, std::collections::BTreeSet<u32>>,

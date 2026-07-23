@@ -4233,6 +4233,67 @@ fn worker_bind_incomplete_report_carries_explicit_failure_6245() {
     );
 }
 
+/// #6240: the on-demand neighbor resolver is ATTEMPTED before the worker launch
+/// (so `WorkerSharedDataplane::from_coord` captures a live handle for every
+/// worker), and that attempt is BEST-EFFORT. `ensure_resolver` returns the
+/// installed handle as an `Option` and is guarded by `resolver.is_none()` so a
+/// re-reconcile REUSES the existing thread rather than re-spawning. This pins
+/// the ORDERING/ATTEMPT contract — attempt-before-launch, resolver as an
+/// `Option` — NOT "resolver must exist": the resolver is NEVER threaded into
+/// `spawn_workers` as a required input (a compile-time property of its
+/// signature), so a resolver spawn failure would leave `neighbors.resolver`
+/// `None` and workers would still launch with `resolver: None`.
+///
+/// Fail-on-revert: drop the `is_none()` reuse guard in `ensure_resolver` (so it
+/// re-spawns a fresh resolver every reconcile) and the `Arc::ptr_eq` reuse
+/// assertion below FAILS — the second attempt returns a different handle. Making
+/// `ensure_resolver` mandatory (returning the handle threaded into
+/// `spawn_workers`) would not compile against the best-effort `Option` return
+/// this test asserts.
+#[test]
+fn ensure_resolver_attempts_before_launch_best_effort_6240() {
+    let mut coordinator = Coordinator::new();
+    // A fresh coordinator has no resolver installed — the attempt has not run.
+    assert!(
+        coordinator.neighbors.resolver.is_none(),
+        "a fresh coordinator has no resolver before bring-up attempts one"
+    );
+
+    // ATTEMPT (pre-launch): `ensure_resolver` spawns + installs the shared
+    // resolver and RETURNS the installed handle as `Some` — the best-effort
+    // `Option` (it would be `None` on a spawn failure). The shell runs exactly
+    // this BEFORE `spawn_workers`, so each worker's `from_coord` clone captures a
+    // live handle.
+    let installed = reconcile::bringup::ensure_resolver(&mut coordinator);
+    assert!(
+        installed.is_some(),
+        "ensure_resolver returns the installed handle (Some) on a successful attempt"
+    );
+    assert!(
+        coordinator.neighbors.resolver.is_some(),
+        "the resolver is installed on coord so a worker's from_coord captures it before launch"
+    );
+
+    // BEST-EFFORT / idempotent: the `is_none()` guard makes a re-reconcile REUSE
+    // the already-installed resolver thread (never re-spawn). The second attempt
+    // returns the SAME `Arc` — proving the guarded attempt, not an unconditional
+    // spawn.
+    let again = reconcile::bringup::ensure_resolver(&mut coordinator);
+    assert!(again.is_some());
+    assert!(
+        Arc::ptr_eq(installed.as_ref().unwrap(), again.as_ref().unwrap()),
+        "a re-reconcile reuses the already-installed resolver (guarded attempt), never re-spawns"
+    );
+
+    // Clean up the spawned resolver thread (stop + join) — the resolver retains
+    // a join handle exactly so `stop_inner` can reclaim it.
+    coordinator.stop_inner(false);
+    assert!(
+        coordinator.neighbors.resolver.is_none(),
+        "stop_inner joins + clears the resolver"
+    );
+}
+
 /// #5171: the side-effect-free `validate_snapshot_buildable` gate (used by
 /// the deferred-activation apply path, which never reaches `reconcile`) and
 /// the worker-spawning `reconcile` MUST reject the IDENTICAL non-buildable

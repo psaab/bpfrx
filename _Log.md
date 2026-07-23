@@ -1,3 +1,44 @@
+## 2026-07-23 — #6240: decompose `bring_up_workers` into cohesive phase helpers
+
+- **Timestamp**: 2026-07-23 (refactor/6240-decompose-bringup)
+- **Action**: Behavior-preserving decomposition of the 708-line
+  `bring_up_workers` transaction (`reconcile/bringup.rs`) into named phase
+  helpers, all kept IN bringup.rs (no one-file-per-phase). `bring_up_workers`
+  is now a short shell sequencing: `clamp_ring_entries`, `plan_workers`
+  (takes the snapshot; builds workers map + live/identities + sizing + Planned
+  stage), `publish_runtime` (FD ownership transfer + CoS/mirror publication),
+  `replay_preserved_sessions` (command-queue build + preserved-session replay),
+  `ensure_resolver` (best-effort, returns `Option`, attempt-before-launch),
+  `spawn_workers` (the ~323-line spawn loop → typed `LaunchOutcome`),
+  `await_readiness` (renamed from `collect_worker_startup_readiness`; the #5143
+  barrier), `start_post_readiness_neighbor_services` (monitor + warmer +
+  tunnel/WG reconcile). The #4952 two-armed rollback DECISION stays in the
+  shell and is distinct/visible: spawn-fail returns `Err(Spawn)` WITHOUT
+  `stop_inner`; bind-incomplete calls `stop_inner(false)`. `spawn_workers`
+  NEVER calls `stop_inner`. Phase bodies moved VERBATIM (diff-audit: code
+  byte-identical modulo the helper signatures + `&workers`→`workers` /
+  `&preserved`→`preserved` boundary refs + `spawn_failure=Some/break`→`return
+  LaunchOutcome::SpawnFailed`). The startup-report SENDER stays alive in the
+  shell, passed by reference into `spawn_workers`, preserving the barrier's
+  channel-disconnect semantics.
+- **File(s)**: `userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs`
+  (decomposed), `.../reconcile/stage.rs` (doc rename ref),
+  `.../coordinator/tests.rs` (added
+  `ensure_resolver_attempts_before_launch_best_effort_6240`),
+  `.../coordinator/README.md` (#6240 phase-structure bullet), `_Log.md`.
+- **Validation**: `cargo build` + clippy clean for the touched files (the sole
+  clippy error is the pre-existing `mut_from_ref` in the untouched
+  `umem/mmap.rs:150`). Anchor tests GREEN
+  (`reconcile_partial_spawn_failure_preserves_launched_records_6242`,
+  `reconcile_bind_incomplete_clears_all_records_6242`,
+  `post_spawn_inthread_bind_failure_fails_closed_5143`,
+  `reconcile_post_teardown_worker_spawn_failure_fails_closed_4952`,
+  `worker_bind_incomplete_report_carries_explicit_failure_6245`,
+  `stop_inner_drops_worker_record_owners_exactly_once_6242`,
+  `planned_worker_slots_uses_max_id_not_count`). Fail-on-revert DEMONSTRATED:
+  adding `stop_inner(false)` to the spawn-fail arm (unify) REDs the #6242
+  partial-spawn test (records.len 2→0); reverted. Full
+  `cargo test --release -- --test-threads=1` GREEN.
 ## 2026-07-23 — #6236 PR-2B: capability-accessor migration + property-set deletion
 
 - **Timestamp**: 2026-07-23 (refactor/6236-pr2b-migrate-delete)
@@ -57791,3 +57832,17 @@ top.
     (`needs_tx_eval`→`affects_route_lookup`) now REDs
     `pr2c_folded_single_lookup_equals_two_lookup_path` ("left false != right
     true"), proving the restored leg binds. Full cargo 4249/0.
+  **Action**: #6284 item 2 — close the residual config-epoch sweep-vs-advance
+    race. Added an apply-in-progress fence (`applyingConfigGen`) raised by
+    `configApplyLoop` before `OnConfigReceived` (the sweep runs inside it) and
+    lowered only after the high-water advances (success) or the apply fails.
+    `configEpochStale` now refuses against `max(applyingConfigGen,
+    lastAppliedConfigGen)` (fence read first) so an older-epoch install racing
+    the sub-µs window is refused against the applying generation instead of
+    admitted against the stale high-water. `resetRecvGen` clears the fence
+    alongside the high-water. Item 1 (reverse active/active direction) stays a
+    documented fail-OPEN residual. Fail-on-revert tests + docs updated.
+  **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn_config.go,
+    pkg/cluster/sync_conn_gen.go,
+    pkg/cluster/sync_config_epoch_sweep_race_6284_test.go,
+    docs/session-sync-architecture.md, pkg/cluster/README.md

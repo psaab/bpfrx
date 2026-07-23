@@ -72,6 +72,29 @@ func (s *SessionSync) recordAppliedConfigGen(gen uint64) {
 	}
 }
 
+// beginConfigApply raises the apply-in-progress fence to gen for the duration
+// of an apply (#6284, item 2). It is set BEFORE OnConfigReceived runs — so it
+// covers the whole apply, including the receiver's clearSessionsForDeletedPolicies
+// sweep — and configEpochStale folds max(fence, high-water) into its refusal
+// threshold. A gen==0 (legacy/unconditional) apply carries no comparable epoch,
+// so the fence stays 0 and no install is refused on its account. Called ONLY
+// from the single-consumer configApplyLoop, so the store needs no CAS.
+func (s *SessionSync) beginConfigApply(gen uint64) {
+	s.applyingConfigGen.Store(gen)
+}
+
+// endConfigApply lowers the apply-in-progress fence (#6284, item 2). On a
+// SUCCESSFUL apply the caller advances the high-water (recordAppliedConfigGen)
+// FIRST and only then calls this, so the effective refusal threshold
+// max(fence, high-water) never dips between the sweep and the high-water
+// advance — closing the residual window. On an apply FAILURE the high-water
+// deliberately stays put (M-2/#4151) and the fence is simply dropped, restoring
+// the pre-apply admission posture (the transiently-refused installs are re-sent
+// by the peer's next sweep). Called ONLY from configApplyLoop.
+func (s *SessionSync) endConfigApply() {
+	s.applyingConfigGen.Store(0)
+}
+
 // configApplyLoop is the single ordered consumer of config-sync messages
 // (#3931). It drains configApplyCh in receive order and attempts a config only
 // when shouldApplyConfigGen accepts its generation, so a reordered older config
@@ -103,6 +126,14 @@ func (s *SessionSync) configApplyLoop(ctx context.Context) {
 				// re-applies on the primary's next push of this generation.
 				continue
 			}
+			// #6284 item 2: fence installs against the generation being applied
+			// for the ENTIRE apply. The clearSessionsForDeletedPolicies sweep
+			// runs inside OnConfigReceived, so a synced session stamped with an
+			// older epoch that races the sub-µs gap between the sweep and the
+			// high-water advance must be refused now — the fence makes
+			// configEpochStale refuse it against the applying generation rather
+			// than admit it against the not-yet-advanced high-water.
+			s.beginConfigApply(item.gen)
 			if err := s.OnConfigReceived(item.text); err != nil {
 				// The apply did not take effect (compile/promote failure or a
 				// transient RG0-primary rejection). Do NOT advance the
@@ -121,11 +152,17 @@ func (s *SessionSync) configApplyLoop(ctx context.Context) {
 				// above (surfaced in cluster status), not this log.
 				slog.Debug("cluster sync: config apply failed — retaining prior high-water so the peer re-push re-converges",
 					"incoming_gen", item.gen, "last_applied_gen", s.lastAppliedConfigGen.Load(), "size", len(item.text), "err", err)
+				// #6284: drop the fence — the high-water intentionally stays put
+				// (M-2/#4151), so restore the pre-apply admission posture.
+				s.endConfigApply()
 				continue
 			}
 			// Apply confirmed — advance the high-water so a duplicate re-push of
-			// the same generation is correctly skipped as stale.
+			// the same generation is correctly skipped as stale, THEN drop the
+			// fence. Advancing first keeps the effective refusal threshold
+			// max(fence, high-water) from dipping in the release window (#6284).
 			s.recordAppliedConfigGen(item.gen)
+			s.endConfigApply()
 		}
 	}
 }

@@ -306,6 +306,51 @@ non-authority's sessions carry the authority-independent seed epoch and the
 guard is inert for them (no false reject), which is acceptable because config
 changes originate on the authority.
 
+#### Apply-in-progress fence — sweep-vs-advance window (#6284, item 2)
+
+The bare epoch compare above (`ConfigEpoch < lastAppliedConfigGen`) closes the
+gap only once `lastAppliedConfigGen` has advanced — but the high-water advances
+**after** `OnConfigReceived` returns, while the deleted-policy sweep
+(`clearSessionsForDeletedPolicies`) runs **inside** it. That leaves a residual
+sub-µs window on the receiver: the moment between the sweep completing and the
+high-water advancing. A session install racing on the `receiveLoop` in that
+window is compared against the STALE high-water and wrongly admitted — reviving
+exactly the permit the just-run sweep invalidated.
+
+The apply-in-progress fence (`applyingConfigGen`) closes it. The single-consumer
+`configApplyLoop` raises the fence to the generation it is about to apply
+**before** calling `OnConfigReceived` (so it covers the whole apply, including
+the sweep) and lowers it to 0 only **after** the high-water advances on success
+(or immediately on an apply failure). `configEpochStale` refuses against
+`max(applyingConfigGen, lastAppliedConfigGen)`, reading the fence **first** so
+that on the success release order (high-water stored, then fence cleared) a
+reader observing `fence == 0` has necessarily already observed the advanced
+high-water — the effective refusal threshold never dips across the window.
+
+Ordering and correctness:
+
+- **No stale permit.** From before the sweep starts until the high-water
+  advances, an install stamped with an epoch older than the applying generation
+  is refused, so it can never land after the sweep against a stale high-water.
+- **No false reject.** The fence refuses only STRICTLY-older epochs. A session
+  the peer stamped with the CURRENT generation (equal to the one being applied)
+  is still admitted, exactly like the post-advance steady state; a transiently
+  refused older session is re-sent by the peer's next sweep.
+- **Apply failure.** The high-water deliberately stays put (M-2/#4151) and the
+  fence simply drops, restoring the pre-apply admission posture — the fence is
+  never held against a generation that never took effect.
+- **Bulk re-prime.** `resetRecvGen` clears the fence alongside the high-water so
+  a rebooted peer's lower-generation re-prime is accepted (the same
+  accept-everything reset the high-water already performs).
+
+**Item 1 (deferred, documented residual).** The guard still covers only the
+config-authority → peer direction (the primary that admits the session is also
+the RG0 config-sync authority). A non-authority's sessions carry the
+authority-independent seed epoch, so the guard is inert for the reverse
+direction in an active/active deployment (fail-OPEN). Closing it requires a
+bidirectional config-generation namespace that #5274 deliberately scoped out (a
+design-heavy change, not part of #6284 item 2); it remains tracked on #6284.
+
 ### RT_FLOW Session Id (#5212)
 
 The dataplane assigns each session a STABLE id (`SessionTable::alloc_session_id`)
