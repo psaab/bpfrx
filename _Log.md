@@ -57673,3 +57673,16 @@ top.
 - **File(s)**: pkg/daemon/daemon_reth.go,
     pkg/daemon/daemon_apply_dataplane.go,
     pkg/daemon/reth_unit_vlanid_5107_test.go
+
+- **Timestamp**: 2026-07-22
+  **Action**: #6301 item 1 — clear the dormant remoteTransferOutLease entry in
+    ResetFailover (map hygiene, mirrors the ManualFailover / ForceSecondary /
+    ManualFailoverBatch reset paths) with a fail-on-revert test. Item 2
+    (lease-sizing hardening) DROPPED as unnecessary: the fixed 20s
+    failover-ACK cap (failoverAckTimeout, sync.go) bounds a real commit's
+    arrival latency to ~20s+settle (< the existing 26s lease), so a large
+    failoverActuateTimeout cannot delay a real commit past the lease — it
+    times the requester out (no commit), the case the lease already handles.
+    README notes this bound.
+  **File(s)**: pkg/cluster/failover.go, pkg/cluster/README.md,
+    pkg/cluster/failover_lease_5079_test.go, pkg/daemon/daemon_ha_sync.go

@@ -190,6 +190,13 @@ func (m *Manager) ResetFailover(rgID int) error {
 	}
 	rg.ManualFailover = false
 	rg.ManualFailoverAt = time.Time{}
+	// Drop any armed remote transfer-out lease for this RG, mirroring the
+	// ManualFailover / ForceSecondary(ISSU) / ManualFailoverBatch reset paths.
+	// The lease's electRG auto-restore is gated on ManualFailover, so a leftover
+	// entry is inert once we clear the hold here — but leaving it in the maps
+	// lets repeated resets accumulate dormant entries. Clearing it keeps the
+	// lease maps in lockstep with ManualFailover on every reset path (#6301).
+	m.clearRemoteTransferOutLeaseLocked(rgID)
 	// Invalidate any in-flight ManualFailover / ManualFailoverBatch whose
 	// pre-failover hook released m.mu: bump the per-RG failover generation so
 	// its post-hook re-check abandons the trailing SecondaryHold write instead
