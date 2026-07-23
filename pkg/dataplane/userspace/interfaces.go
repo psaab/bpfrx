@@ -13,21 +13,24 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-const (
-	// Keep logical-only synthetic ifindexes in a high private range so
-	// they do not collide with kernel-assigned ifindexes in practical
-	// deployments, while remaining positive int32 values for protocol
-	// compatibility.
+// Keep logical-only synthetic ifindexes in a high private range so they do
+// not collide with kernel-assigned ifindexes in practical deployments, while
+// remaining positive int32 values for protocol compatibility.
+//
+// These bounds are package vars (not consts) ONLY so a test can temporarily
+// shrink the window to drive the range-exhaustion path through the real
+// buildInterfaceSnapshots caller (#5557); production never mutates them and the
+// initial values are identical to the pre-#5557 constants.
+var (
 	syntheticInterfaceIfindexMin = 1 << 30
-	syntheticInterfaceIfindexMax = syntheticInterfaceIfindexMin + (1 << 20) - 1
-
-	// syntheticIfindexExhausted is the sentinel syntheticLogicalIfindex
-	// returns when the whole synthetic range is already claimed. It is a
-	// negative value so it can never be mistaken for a real (positive)
-	// ifindex; the caller skips the affected unit and logs rather than
-	// crashing the daemon (#5557).
-	syntheticIfindexExhausted = -1
+	syntheticInterfaceIfindexMax = (1 << 30) + (1 << 20) - 1
 )
+
+// syntheticIfindexExhausted is the sentinel syntheticLogicalIfindex returns
+// when the whole synthetic range is already claimed. It is a negative value so
+// it can never be mistaken for a real (positive) ifindex; the caller skips the
+// affected unit and logs rather than crashing the daemon (#5557).
+const syntheticIfindexExhausted = -1
 
 // syntheticLogicalIfindex assigns a unique logical-only ifindex from the
 // private synthetic range. It returns syntheticIfindexExhausted (a

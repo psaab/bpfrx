@@ -58627,3 +58627,44 @@ top.
     dest}.go, pkg/configstore/store_commit.go, pkg/dataplane/userspace/
     interfaces.go, pkg/frr/config_render.go, pkg/grpcapi/{server_sessions,
     server_show_policies_text}.go + 7 *_5557_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23 (eng6393/rev6393 review-fold)
+  - **Action**: Fold the #6393 hostile-review findings into the #5557
+    claude-review-003 cohort (branch fix/5557-claudereview003). Seven
+    production fixes unchanged in core logic; four completions added.
+    FINDING 1 (MAJOR): the strict gRPC parseZoneFilter never reached the
+    operator because BOTH CLI wrappers stripped unknown tokens before
+    forwarding. Make validatePolicyZoneSelectors (cmd/cli) and
+    validatePolicyZoneFilter (pkg/cli) reject an unrecognized filter token
+    (whitelisting only the leading brief/detail/hit-count/global keywords and
+    from-zone/to-zone pairs), mirroring parseZoneFilter's default-error rule.
+    Added CLI-LEVEL fail-on-revert tests for both wrappers x both subcases
+    (detail, hit-count): the bad token aborts at the CLI and, on the remote
+    side, issues NO ShowText RPC (showTextCalls==0). FINDING 2: the free-text
+    routing-instance name was interpolated UNSANITIZED into the `router <proto>
+    ... vrf` clauses (policy_render.go generateProtocols) and the `bfd` block's
+    `peer ... vrf` clause — same line-injection surface fix #5557 closed for the
+    static route. Wrap both with sanitizeFRRValue; corrected fix #5's overclaim
+    comment to name all three sanitized vrf sites. Added an injection
+    fail-on-revert test per site. FINDING 3 (MINOR): GetSessions now rejects
+    Limit<0 (Limit==0 kept as the default-100 sentinel). FINDING 4 (test gaps):
+    (a) v6-only-error natshow readers bind the v6 capture branch in all three
+    detail renderers; (b) a buildInterfaceSnapshots test drives the range-
+    exhaustion caller-skip (interfaces.go) by shrinking the synthetic ifindex
+    window to one slot (the bounds are now package vars, value-identical, for
+    this seam) and asserting the exhausted sibling unit is dropped, not emitted
+    with the negative sentinel; (c) a rollback test proves continuation PAST an
+    oversized INTERMEDIATE slot — slot 3 still loads at rollback 3 while slot 2
+    tombstones in place. build+vet+gofmt clean; full go test green for cmd/cli,
+    pkg/cli, pkg/grpcapi, pkg/frr, pkg/natshow, pkg/configstore,
+    pkg/dataplane/userspace. Every new reject/sanitize revert-verified firsthand
+    RED.
+  - **File(s)**: cmd/cli/show_security.go, cmd/cli/
+    show_security_policy_filter_reject_5557_test.go,
+    pkg/cli/cli_show_security_dispatch.go, pkg/cli/
+    cli_show_security_policy_filter_reject_5557_test.go, pkg/frr/policy_render.go,
+    pkg/frr/config_render.go, pkg/frr/vrf_name_sanitize_5557_test.go,
+    pkg/grpcapi/server_sessions.go, pkg/grpcapi/sessions_pagesize_5557_test.go,
+    pkg/natshow/scan_error_5557_test.go, pkg/dataplane/userspace/interfaces.go,
+    pkg/dataplane/userspace/synthetic_ifindex_exhaust_5557_test.go,
+    pkg/configstore/rollback_size_cap_5557_test.go, _Log.md
