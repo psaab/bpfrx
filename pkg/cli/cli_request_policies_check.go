@@ -47,40 +47,101 @@ func analyzePolicyShadowing(cfg *config.Config) []string {
 		if zpp == nil {
 			continue
 		}
-		for j := 1; j < len(zpp.Policies); j++ {
-			later := zpp.Policies[j]
-			if later == nil {
+		scope := fmt.Sprintf("from-zone %s to-zone %s", zpp.FromZone, zpp.ToZone)
+		findings = analyzePolicyListShadowing(zpp.Policies, scope, nil, findings)
+	}
+	// codex-182 A10-b00-C01: global policies (`security policies global`) are
+	// an ordered, terminal, first-match list too — an earlier global shadows a
+	// later one on the same conservative name-set superset. The extra
+	// globalScopeCovers gate additionally requires the earlier global's
+	// from-zone/to-zone match context (#3148/#4626) to COVER the later's (an
+	// empty zone set = all zones), so two globals narrowed to disjoint zone
+	// contexts are never falsely reported as shadowing. Cross-tier shadowing
+	// between a zone-pair policy and a global is deliberately NOT analyzed: the
+	// global tier is reached only when no zone-pair policy matched, so a
+	// zone-pair superset is not an unreachability proof for a global.
+	findings = analyzePolicyListShadowing(cfg.Security.GlobalPolicies, "global", globalScopeCovers, findings)
+	return findings
+}
+
+// analyzePolicyListShadowing runs the conservative shadow / redundancy pass
+// over ONE ordered, terminal, first-match policy list (a single zone-pair list
+// or the global list) and appends findings tagged with scope. extraSuperset,
+// when non-nil, is an ADDITIONAL superset predicate that must also hold for a
+// shadow to be reported (used by the global list to require zone-context
+// containment on top of the address/application superset); it is nil for
+// zone-pair lists, whose zone context is fixed by the surrounding stanza.
+func analyzePolicyListShadowing(policies []*config.Policy, scope string, extraSuperset func(earlier, later *config.Policy) bool, findings []string) []string {
+	for j := 1; j < len(policies); j++ {
+		later := policies[j]
+		if later == nil {
+			continue
+		}
+		for i := 0; i < j; i++ {
+			earlier := policies[i]
+			if earlier == nil {
 				continue
 			}
-			for i := 0; i < j; i++ {
-				earlier := zpp.Policies[i]
-				if earlier == nil {
-					continue
-				}
-				if !policyMatchIsSuperset(earlier, later) {
-					continue
-				}
-				scope := fmt.Sprintf("from-zone %s to-zone %s", zpp.FromZone, zpp.ToZone)
-				if earlier.Action == later.Action &&
-					policyMatchIsSuperset(later, earlier) {
-					findings = append(findings, fmt.Sprintf(
-						"  [%s] policy %q is REDUNDANT: identical match and action to earlier policy %q",
-						scope, later.Name, earlier.Name))
-				} else if earlier.Action == later.Action {
-					findings = append(findings, fmt.Sprintf(
-						"  [%s] policy %q is REDUNDANT: earlier policy %q already matches a superset with the same action (%s)",
-						scope, later.Name, earlier.Name, policyActionName(earlier.Action)))
-				} else {
-					findings = append(findings, fmt.Sprintf(
-						"  [%s] policy %q is SHADOWED and UNREACHABLE: earlier policy %q matches a superset with a different action (%s vs %s)",
-						scope, later.Name, earlier.Name,
-						policyActionName(earlier.Action), policyActionName(later.Action)))
-				}
-				break // report the first shadower only
+			if !policyMatchIsSuperset(earlier, later) {
+				continue
 			}
+			if extraSuperset != nil && !extraSuperset(earlier, later) {
+				continue
+			}
+			if earlier.Action == later.Action &&
+				policyMatchIsSuperset(later, earlier) &&
+				(extraSuperset == nil || extraSuperset(later, earlier)) {
+				findings = append(findings, fmt.Sprintf(
+					"  [%s] policy %q is REDUNDANT: identical match and action to earlier policy %q",
+					scope, later.Name, earlier.Name))
+			} else if earlier.Action == later.Action {
+				findings = append(findings, fmt.Sprintf(
+					"  [%s] policy %q is REDUNDANT: earlier policy %q already matches a superset with the same action (%s)",
+					scope, later.Name, earlier.Name, policyActionName(earlier.Action)))
+			} else {
+				findings = append(findings, fmt.Sprintf(
+					"  [%s] policy %q is SHADOWED and UNREACHABLE: earlier policy %q matches a superset with a different action (%s vs %s)",
+					scope, later.Name, earlier.Name,
+					policyActionName(earlier.Action), policyActionName(later.Action)))
+			}
+			break // report the first shadower only
 		}
 	}
 	return findings
+}
+
+// globalScopeCovers reports whether global policy a's from-zone/to-zone match
+// context (#3148/#4626) covers b's — a's zone set must be a superset of b's on
+// BOTH sides, where an empty set means "all zones" (the universal set). Two
+// global policies narrowed to disjoint (or merely non-nesting) zone contexts
+// never shadow each other even when their address/application match sets nest,
+// so this gate keeps the global shadow pass free of that false positive.
+func globalScopeCovers(a, b *config.Policy) bool {
+	return zoneSetCovers(a.Match.FromZones, b.Match.FromZones) &&
+		zoneSetCovers(a.Match.ToZones, b.Match.ToZones)
+}
+
+// zoneSetCovers reports whether zone set a covers zone set b: an empty a is the
+// universal set and covers everything; a non-empty a covers b only when every
+// zone in b is present in a. An empty b against a non-empty a is NOT covered —
+// b ("all zones") is the broader context.
+func zoneSetCovers(a, b []string) bool {
+	if len(a) == 0 {
+		return true
+	}
+	if len(b) == 0 {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, z := range a {
+		set[z] = struct{}{}
+	}
+	for _, z := range b {
+		if _, ok := set[z]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // policyMatchIsSuperset reports whether policy a matches a superset of the
