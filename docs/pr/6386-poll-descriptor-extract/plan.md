@@ -1,6 +1,24 @@
 # #6386 — poll_descriptor/mod.rs leaf-extraction plan
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: PLAN-READY v2 — Codex PLAN-READY + Claude SMR PLAN-NEEDS-MINOR (all
+minors folded into v2 below). Ready to engineer.
+
+### Plan-review verdicts
+- **Codex** (round 1): PLAN-READY. Confirmed: the `nat_snapshot()` absolute-path
+  fix (mod.rs:6958) is the ONLY required non-verbatim test change; no test has a
+  CODE reference to a moved item in another sibling (comment-only); the 6
+  `#[inline]` hints are behavior-safe (compiler-controlled; largest helper is a
+  real dispatch-core call per objdump → low bloat); no dispatch-core change
+  (1049–6112 untouched; only the stranded contract comment relocates).
+- **Claude SMR** (round 1): PLAN-NEEDS-MINOR — boundary right + safe to engineer;
+  all 7 checks PASS; three minors folded into v2: (A) the PR-1 "attr-verbatim /
+  zero non-motion changes" label contradicted including `prerouting_scope` (whose
+  `prerouting_ingress_scope` gains a new `#[inline]`) → resolved by collapsing to
+  ONE combined PR with a logical commit per module (§11); (B) tighten the #4404
+  citation to the "#1697-style leaf outlining is the surviving class" language
+  (the "filed as its own scoped issue" phrase in #6386's body referred to #4404
+  §7's FUTURE arm-adjacent revisit, not this pre-loop leaf motion) — §2/§9 here
+  already cite the surviving-class language accurately; (C) impl note added (§10a).
 
 ## 1. Canonical contract
 
@@ -122,15 +140,55 @@ host-bound deny drops+emits), a fragmented-traffic pass (`frag_assoc` +
 session-sync code touched. Gate: behavior-preserving PR + Codex + AGY hostile +
 independent Claude review.
 
-## 11. Sequencing
+## 10a. Implementation notes (from plan review — do these during the move)
 
-- PR-1 (attr-verbatim): `frag_assoc`, `session_admission`, `resolver_enqueue`,
-  `prerouting_scope` + test siblings.
-- PR-2 (adds `#[inline]` hints + objdump spot-check): `host_inbound_policy`,
-  `flowless_verdict` + test siblings.
-- One combined PR acceptable (both halves motion-only); full smoke gates the
-  final PR, `cargo test` gates each. Extractions share mod.rs → serial (one
-  engineer, one logical commit per module); NOT parallelizable across agents.
+1. **`nat_snapshot()` absolute-path fix (the ONE required non-verbatim test
+   change).** When `prerouting_scope_tests` moves under its `prerouting_scope`
+   sibling, its `super::super::test_fixtures::nat_snapshot()` (mod.rs:6958) is
+   one nesting level too shallow (`super::super` becomes `poll_descriptor`, not
+   `afxdp`). Change it to the absolute `crate::afxdp::test_fixtures::nat_snapshot()`
+   (matches the `reject_reply_tests.rs` `crate::`-absolute convention). This is
+   the only code-level relative path that breaks; every other test cross-sibling
+   mention is comment-only prose (verified: `emit_host_inbound_deny`
+   mod.rs:6730, `prerouting_ingress_scope` 6933-ish, `new_flow_session_limit_drop`
+   6297-ish, `flowless_*` 6626-ish — all `//`/`///`).
+2. **Prune + relocate now-unused mod.rs imports.** Moving a fn takes its
+   dependency edges with it: e.g. `source_nat_would_translate_fragment`
+   (imported at mod.rs:53) is used only by `flowless_fragment_requires_nat_translation`
+   (mod.rs:342), so once that fn moves to `frag_assoc`, the mod.rs `use` becomes
+   dead → add it to `frag_assoc`'s `use super::…;` and drop it from mod.rs.
+   `cargo build` flags each unused import; sweep them per moved cluster.
+3. **Cross-sibling code deps use explicit `use super::<sibling>::item;`** (the
+   established pattern: `reject_reply.rs:17` → cookie_reply, `filter.rs:44` →
+   reject_reply). Each new sibling opens `use super::*;` for mod.rs's imports,
+   plus explicit `use super::<other_sibling>::…;` for any cross-sibling call
+   (`flowless_verdict` → `host_inbound_policy` fns + `filter::…`; `frag_assoc` →
+   `prerouting_scope` + `nat_exception::…`). No cycles (edges are one-directional).
+4. **Test modules** keep `use super::*;` (now resolving to their production
+   sibling) + `crate::`-absolute for external deps, per the reject_reply_tests
+   precedent. Load each via `#[path = "<x>_tests.rs"] #[cfg(test)] mod <x>_tests;`
+   from the production sibling (the `reject_reply.rs:447` / `cookie_reply.rs:129`
+   convention).
+
+## 11. Sequencing — ONE combined PR, a logical commit per module
+
+Collapse the earlier PR-1/PR-2 split (it created an internal contradiction:
+`prerouting_scope` was in the "attr-verbatim / zero non-motion changes" PR-1 but
+`prerouting_ingress_scope` gains a new `#[inline]`, so it is NOT attr-verbatim).
+Both halves are motion-only and both reviewers accept a combined PR, so:
+
+- **One PR** with **6 logical commits, one per sibling module** (each builds
+  clean; `git diff --color-moved=dimmed-zebra` per commit proves motion-purity).
+  The commit for a module that adds an `#[inline]` states so in its body:
+  `host_inbound_policy` (junos_host_policy_eval, junos_host_local_policy),
+  `flowless_verdict` (ipv6_ext_header_over_limit_drop,
+  flowless_local_delivery_verdict, flowless_base_resolution), `prerouting_scope`
+  (prerouting_ingress_scope). `frag_assoc`, `session_admission`,
+  `resolver_enqueue` are attr-verbatim.
+- `cargo test --release` gates each commit; the objdump/nm call-edge spot-check
+  + full loss-cluster smoke gate the final PR before merge.
+- Extractions all edit the same mod.rs → SERIAL (one engineer, one commit per
+  module); NOT parallelizable across agents (they would conflict on mod.rs).
 
 ## 12. Out of scope
 
