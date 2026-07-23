@@ -519,6 +519,9 @@ pub use self::coordinator::Coordinator;
 // the control-plane server (`server/helpers.rs` + `handlers/snapshot.rs`)
 // can name `afxdp::ReconcileError` on `reconcile_status_bindings`.
 pub(crate) use self::coordinator::ReconcileError;
+// #6244: the typed reconcile progress / failure identity, named by the
+// control-plane server tests and any consumer that inspects the stage.
+pub(crate) use self::coordinator::{MandatoryPin, ReconcileStage, WorkerBindShortfall};
 // #2962: the lock-free owner-RG export wait handle. The control-socket
 // dispatcher (server/handlers) names this as the return type of
 // kick_owner_rg_export so it can run the blocking ack-wait off the

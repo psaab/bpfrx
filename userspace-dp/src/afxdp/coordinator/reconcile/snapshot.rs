@@ -51,7 +51,7 @@ pub(super) fn preflight_map_fds(
     bindings: &mut [BindingStatus],
 ) -> Option<ReconcileSnapshotFds> {
     if snapshot.map_pins.xsk.is_empty() {
-        coord.last_reconcile_stage = "missing_xsk_pin".to_string();
+        coord.last_reconcile_stage = ReconcileStage::MissingPin(MandatoryPin::Xsk);
         for binding in bindings.iter_mut() {
             if binding.registered {
                 binding.last_error = "missing XSK map pin path".to_string();
@@ -60,7 +60,7 @@ pub(super) fn preflight_map_fds(
         return None;
     }
     if snapshot.map_pins.heartbeat.is_empty() {
-        coord.last_reconcile_stage = "missing_heartbeat_pin".to_string();
+        coord.last_reconcile_stage = ReconcileStage::MissingPin(MandatoryPin::Heartbeat);
         for binding in bindings.iter_mut() {
             if binding.registered {
                 binding.last_error = "missing heartbeat map pin path".to_string();
@@ -69,7 +69,7 @@ pub(super) fn preflight_map_fds(
         return None;
     }
     if snapshot.map_pins.sessions.is_empty() {
-        coord.last_reconcile_stage = "missing_session_pin".to_string();
+        coord.last_reconcile_stage = ReconcileStage::MissingPin(MandatoryPin::Session);
         for binding in bindings.iter_mut() {
             if binding.registered {
                 binding.last_error = "missing session map pin path".to_string();
@@ -80,7 +80,10 @@ pub(super) fn preflight_map_fds(
     let map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.xsk) {
         Ok(fd) => fd,
         Err(err) => {
-            coord.last_reconcile_stage = format!("open_xsk_map_failed:{err}");
+            coord.last_reconcile_stage = ReconcileStage::OpenMapFailed {
+                map: "xsk",
+                err: err.to_string(),
+            };
             for binding in bindings.iter_mut() {
                 if binding.registered {
                     binding.last_error = format!("open XSK map: {err}");
@@ -92,7 +95,10 @@ pub(super) fn preflight_map_fds(
     let heartbeat_map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.heartbeat) {
         Ok(fd) => fd,
         Err(err) => {
-            coord.last_reconcile_stage = format!("open_heartbeat_map_failed:{err}");
+            coord.last_reconcile_stage = ReconcileStage::OpenMapFailed {
+                map: "heartbeat",
+                err: err.to_string(),
+            };
             for binding in bindings.iter_mut() {
                 if binding.registered {
                     binding.last_error = format!("open heartbeat map: {err}");
@@ -104,7 +110,10 @@ pub(super) fn preflight_map_fds(
     let session_map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.sessions) {
         Ok(fd) => fd,
         Err(err) => {
-            coord.last_reconcile_stage = format!("open_session_map_failed:{err}");
+            coord.last_reconcile_stage = ReconcileStage::OpenMapFailed {
+                map: "session",
+                err: err.to_string(),
+            };
             for binding in bindings.iter_mut() {
                 if binding.registered {
                     binding.last_error = format!("open session map: {err}");
@@ -220,7 +229,7 @@ pub(super) fn build_reconcile_forwarding(
     ) {
         Ok(fwd) => Ok(fwd),
         Err(err) => {
-            coord.last_reconcile_stage = "snapshot_integrity_error".to_string();
+            coord.last_reconcile_stage = ReconcileStage::SnapshotIntegrityError;
             eprintln!(
                 "xpf-userspace-dp: snapshot integrity error during reconcile preflight: {} — keeping previous forwarding state + workers",
                 err
@@ -278,30 +287,28 @@ pub(super) fn preflight_policy_state(
 /// mandatory pin is the #5171 headline fail-open a deferred apply must
 /// reject before ack/persist).
 pub(super) fn validate_map_pins(snapshot: &ConfigSnapshot) -> Result<(), super::ReconcileError> {
-    for (pin, empty_stage, open_stage) in [
-        (
-            &snapshot.map_pins.xsk,
-            "missing_xsk_pin",
-            "open_xsk_map_failed",
-        ),
+    for (pin, mandatory, map_token) in [
+        (&snapshot.map_pins.xsk, MandatoryPin::Xsk, "xsk"),
         (
             &snapshot.map_pins.heartbeat,
-            "missing_heartbeat_pin",
-            "open_heartbeat_map_failed",
+            MandatoryPin::Heartbeat,
+            "heartbeat",
         ),
-        (
-            &snapshot.map_pins.sessions,
-            "missing_session_pin",
-            "open_session_map_failed",
-        ),
+        (&snapshot.map_pins.sessions, MandatoryPin::Session, "session"),
     ] {
         if pin.is_empty() {
-            return Err(super::ReconcileError::MapSetup(empty_stage.to_string()));
+            return Err(super::ReconcileError::MapSetup(ReconcileStage::MissingPin(
+                mandatory,
+            )));
         }
         // Open then drop: proves the mandatory pin resolves to a real map
         // without retaining the FD or mutating any published state.
-        OwnedFd::open_bpf_map(pin)
-            .map_err(|err| super::ReconcileError::MapSetup(format!("{open_stage}:{err}")))?;
+        OwnedFd::open_bpf_map(pin).map_err(|err| {
+            super::ReconcileError::MapSetup(ReconcileStage::OpenMapFailed {
+                map: map_token,
+                err: err.to_string(),
+            })
+        })?;
     }
     // #2444 empty-vs-present discipline: an empty optional pin means the
     // feature is absent (no gating); a PRESENT pin that fails to open is
@@ -315,7 +322,10 @@ pub(super) fn validate_map_pins(snapshot: &ConfigSnapshot) -> Result<(), super::
     ] {
         if !pin.is_empty() {
             OwnedFd::open_bpf_map(pin).map_err(|err| {
-                super::ReconcileError::MapSetup(format!("open_{name}_map_failed:{err}"))
+                super::ReconcileError::MapSetup(ReconcileStage::OpenMapFailed {
+                    map: name,
+                    err: err.to_string(),
+                })
             })?;
         }
     }
@@ -382,7 +392,10 @@ fn open_optional_map(
     coord: &mut Coordinator,
     bindings: &mut [BindingStatus],
     pin: &str,
-    name: &str,
+    // #6244: `&'static str` so the map token can flow into the typed
+    // `ReconcileStage::OpenMapFailed { map }` without an allocation. All
+    // callers pass a string literal.
+    name: &'static str,
 ) -> Result<Option<OwnedFd>, ()> {
     if pin.is_empty() {
         return Ok(None);
@@ -390,7 +403,10 @@ fn open_optional_map(
     match OwnedFd::open_bpf_map(pin) {
         Ok(fd) => Ok(Some(fd)),
         Err(err) => {
-            coord.last_reconcile_stage = format!("open_{name}_map_failed:{err}");
+            coord.last_reconcile_stage = ReconcileStage::OpenMapFailed {
+                map: name,
+                err: err.to_string(),
+            };
             for binding in bindings.iter_mut() {
                 if binding.registered {
                     binding.last_error = format!("open {name} map: {err}");

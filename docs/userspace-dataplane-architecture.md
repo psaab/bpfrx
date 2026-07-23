@@ -207,7 +207,8 @@ mandatory BPF map FDs**:
   `ha.forwarding`, `ha.fabrics`) or advances
   `validation.snapshot_installed` / `config_generation`.
 - If any mandatory pin is missing or its FD fails to open, the reconcile
-  aborts in the preflight: it sets `last_reconcile_stage` +
+  aborts in the preflight: it sets the typed `last_reconcile_stage`
+  (`ReconcileStage::MissingPin` / `OpenMapFailed`, #6244) +
   per-registered-binding `last_error`, and returns **without** tearing
   down the prior workers or publishing a newer generation. The previous
   (stale-but-correct) forwarding generation stays published and the
@@ -239,7 +240,8 @@ mandatory BPF map FDs**:
   workers and reset `coord.validation` / `shared_validation`. They are now
   detected by `snapshot::build_reconcile_forwarding` in the preflight: on
   an integrity `Err` the reconcile sets
-  `last_reconcile_stage = "snapshot_integrity_error"` and aborts before
+  `last_reconcile_stage = ReconcileStage::SnapshotIntegrityError` (which
+  renders `"snapshot_integrity_error"` byte-for-byte, #6244) and aborts before
   teardown/publish, so the prior generation + workers stay live. The built
   state is stashed on `ReconcileSnapshotFds::forwarding` and **reused** by
   `apply_snapshot` (build-once — no second build on the success path, and
@@ -309,7 +311,8 @@ helper) now return `Result<(), ReconcileError>`
 (`coordinator/reconcile/mod.rs`), where `ReconcileError::Integrity`
 carries the `SnapshotIntegrityError` from the policy preflight or
 `build_reconcile_forwarding`, and `ReconcileError::MapSetup` carries the
-`last_reconcile_stage` descriptor for a mandatory-pin abort. Both
+typed `ReconcileStage` failure identity for a mandatory-pin abort (#6244;
+was a cloned `last_reconcile_stage` string). Both
 handler legs now mirror #3766's pattern: install the new snapshot for the
 reconcile, and on `Err` **restore** the prior snapshot (+ the full-apply
 leg also restores `status.bindings`) and the bumped status-reporting
