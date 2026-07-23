@@ -58529,3 +58529,44 @@ top.
     pkg/daemon/daemon_run.go,
     pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go,
     pkg/dataplane/watchdog_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: Cohort #5523 (codex-179 low-materiality survivors) — fixed 3
+    real+independent+low-risk in-Go-scope commit-time validation bugs, each
+    with a firsthand-verified fail-on-revert test. No HA-touching code; no
+    smoke needed.
+    - **C179-046** (pkg/config/schema_security.go): `security log stream
+      <name> severity` validated against a truncated {error,warning,info}
+      enum, rejecting critical/notice/debug/emergency/alert/any/none at
+      commit — every one of which the runtime honors (daemon_system.go sets
+      MinSeverity = logging.ParseSeverity(stream.Severity)). Aliased
+      syslogSeverities to the shared junosSyslogSeverities SSOT already used
+      by the mirror `system syslog <facility> <severity>` leaf. Both severity
+      surfaces now share one SSOT. Tests: log_stream_severity_ssot_5523_test.go
+      (full-domain accepted + bogus still rejected).
+    - **C179-049** (pkg/config/snmp_clients.go): SNMPCommunity.AllowsSource
+      resolved an equal-length prefix tie by insertion order, so
+      `10.0.0.0/24` before `10.0.0.0/24 restrict` leaked an allow. Added a
+      deny-wins tie-break (restrict at equal length overrides allow in any
+      order). Longest-prefix ordering intact. Single decision surface (v2c;
+      v3 uses USM). Tests: snmp_clients_equal_len_tie_5523_test.go.
+    - **C179-042** (pkg/config/compiler_services.go + pkg/rpm/rpm.go): a
+      hostless http-get target (`http://`, `https://`, schemeless `:8080`)
+      passed the #2495 scheme gate but canonicalizes to an undialable URL —
+      the probe never runs and its permanent no-run is counted as path loss.
+      validateRPMHTTPGetSchemeStrict now rejects an empty effective host in
+      BOTH the scheme'd and schemeless forms (strict commit; lenient warn per
+      #1960). Mirrored the check in the runtime canonicalizeHTTPTarget so a
+      leniently-loaded config HOLDS at probe setup instead of miscounting path
+      loss. Scope-tight: a schemeless url.Parse failure (bare unbracketed
+      IPv6) stays lenient — only the empty host is newly rejected. Tests:
+      compiler_rpm_http_host_5523_test.go, pkg/rpm/http_host_5523_test.go.
+    Fail-on-revert firsthand-verified for all four edit sites (neutralize →
+    clean-assertion RED → restore). build + vet + gofmt clean; full go test
+    ./pkg/config ./pkg/rpm GREEN; go build ./... clean.
+  - **File(s)**: pkg/config/schema_security.go, pkg/config/snmp_clients.go,
+    pkg/config/compiler_services.go, pkg/rpm/rpm.go,
+    pkg/config/log_stream_severity_ssot_5523_test.go,
+    pkg/config/snmp_clients_equal_len_tie_5523_test.go,
+    pkg/config/compiler_rpm_http_host_5523_test.go,
+    pkg/rpm/http_host_5523_test.go, _Log.md
