@@ -130,3 +130,17 @@ hold):
   asserts the script SKIPs (exit 77) via the link probe; reverting the fix
   (probe back to `-fsyntax-only`) makes the script reach `make check` and exit
   1 instead → the gate goes RED. Registered under `make selftest`.
+- **#6355 — the SKIP probe honored `$CC` only for a SINGLE-token compiler.**
+  The M2 gate claimed to "honor `$CC` like the Makefile", but the tool-gate
+  `command -v "$CC"` and the trial-link `"$CC" -x c -` both QUOTED `$CC`,
+  treating the whole string as one executable. The Makefile's `$(CC)`
+  word-splits, so a multi-token wrapper CC (`ccache gcc`, `env cc`,
+  `gcc -flag`) that `make check` accepts made both probes fail → a false-SKIP
+  (over-skip, never a hidden failure — hence LOW). The probe now splits the
+  first word for the existence check (`CC_BIN=${CC%% *}`) and leaves `$CC`
+  unquoted for the trial link, matching `$(CC)`. **Gate:**
+  `selftest-multitoken-cc_6355.sh` — a hermetic fail-on-revert test that points
+  `selftest-compile.sh` at a multi-token CC (`env <fakecc>` modelling a working
+  toolchain) and asserts the script reaches PASS (exit 0); re-quoting either
+  probe as `"$CC"` makes the wrapper unfindable/unexecutable → the script SKIPs
+  (exit 77) → the gate goes RED. Registered under `make selftest`.

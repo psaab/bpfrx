@@ -301,6 +301,139 @@ func (r *Runner) readCurrentVersion() (string, error) {
 	return filepath.Base(target), nil
 }
 
+// statVersionDir stats a candidate rollback version dir. It is a package var
+// so a test can inject a NON-ENOENT stat error (EACCES/EIO/ELOOP) and prove an
+// indeterminate I/O error on the rollback target fails closed — refuse, never
+// silently treated as absent-and-therefore-sanctionable (#6374). Production is
+// os.Stat.
+var statVersionDir = os.Stat
+
+// validateRestorableVersion reports whether ver names a restorable rollback
+// target by validating its on-disk METADATA: a safe single path segment whose
+// versions/<ver> directory exists and holds the complete managed lockstep set,
+// each entry a regular file carrying the executable bit. It is the shared
+// predicate behind "is `current` a real rollback target"
+// (restorableCurrentTarget) and the pre-STOP / pre-DB-rollback revalidation of
+// a persisted PreviousVersion (#6374). A pathful, missing-dir, non-directory,
+// lockstep-incomplete, wrong-type/non-executable-bit, OR I/O-unreadable target
+// is NOT restorable: a rollback flip to it would fail and strand the control
+// plane offline, so it must never gate a STOP or a destructive DB restore. The
+// completeness set is the manifest lockstep SSOT (manifest.LockstepNames),
+// matching versionDirComplete's pre-start check.
+//
+// This raises the bar past "the path stats OK" (#6374): the flip drop-in execs
+// the LITERAL path versions/<ver>/xpfd (flip.go:writeUnitDropin), so a lockstep
+// entry that is a directory / FIFO / socket / symlink / non-executable-bit file
+// cannot be exec'd by systemd after StopUnit — it would strand the daemon
+// exactly like a missing binary. Each managed lockstep entry must therefore be
+// a REGULAR file with the executable bit. os.Lstat (not os.Stat) rejects a
+// symlink outright: a managed runtime is a real copied file, and a symlink at
+// this path is corruption/tampering.
+//
+// LIMIT (static validation, #6409): this checks the executable BIT and file
+// TYPE, not the file's CONTENT. A regular exec-bit file with non-executable
+// content (arbitrary text chmod'd 0755, a corrupt/truncated or wrong-arch
+// binary) passes here but execve would fail — that is undecidable statically
+// (an ELF-magic probe is a heuristic; a shebang script is executable but not
+// ELF), so final content-executability is systemd's arbiter at restart. That
+// rare tampering/corruption residual is tracked in #6409; the common
+// dangling/pathful/incomplete/wrong-type/non-exec modes are rejected here.
+func (r *Runner) validateRestorableVersion(ver string) error {
+	if err := ValidateVersionSegment(ver); err != nil {
+		return err
+	}
+	dir := r.versionDir(ver)
+	fi, err := statVersionDir(dir)
+	if err != nil {
+		return fmt.Errorf("version dir %s: %w", dir, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("version path %s is not a directory", dir)
+	}
+	for _, b := range manifest.LockstepNames() {
+		p := filepath.Join(dir, b)
+		bi, serr := os.Lstat(p)
+		if serr != nil {
+			return fmt.Errorf("version dir %s is missing the managed lockstep "+
+				"binary %s: %w", dir, b, serr)
+		}
+		// A regular, executable file is the only startable form — the flip
+		// drop-in execs this literal path. Reject a symlink / directory /
+		// FIFO / socket (Lstat's Mode is not IsRegular) and a non-executable
+		// regular file.
+		if !bi.Mode().IsRegular() {
+			return fmt.Errorf("version dir %s lockstep binary %s is not a regular "+
+				"file (mode %s); the flip drop-in execs it by literal path so it is "+
+				"not a startable rollback target", dir, b, bi.Mode())
+		}
+		if bi.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("version dir %s lockstep binary %s is not executable "+
+				"(mode %s); systemd could not exec it after STOP", dir, b, bi.Mode())
+		}
+	}
+	return nil
+}
+
+// restorableCurrentTarget resolves the `current` bookkeeping symlink into a
+// restorable rollback target, distinguishing a GENUINELY ABSENT `current` from
+// a PRESENT-but-unrestorable one (#6374). It returns (ver, present):
+//
+//   - ver != ""              a fully restorable target (bare in-tree segment,
+//     existing dir, complete lockstep set).
+//   - ver == "", present==false   `current` genuinely does not exist
+//     (os.IsNotExist) — a legitimate first install.
+//   - ver == "", present==true    `current` IS there but cannot be resolved
+//     as a restorable target: not a symlink (EINVAL), a
+//     pathful/escaping target, a dangling / non-directory
+//     / lockstep-incomplete dir, or an indeterminate I/O
+//     error (EACCES/EIO/ELOOP). Something exists, so a
+//     broken rollback target IS present.
+//
+// The distinction is load-bearing for the first-cut sanction: the caller may
+// let AllowNoRollbackFirstCut / FirstCutSanctioned bypass the refuse-before-STOP
+// guard ONLY when !present (a real absent-current first install). A
+// present-but-unrestorable `current` had a rollback target that is now broken —
+// stopping the daemon would strand it offline, the exact #6374 hazard — so it
+// must REFUSE regardless of any sanction. Unlike readCurrentVersion (raw
+// basename, backing the conservative "never delete a dir that might be live"
+// guards), every non-absent unreadable case here fails closed (present=true),
+// never silently collapsed to a sanctionable "no current".
+func (r *Runner) restorableCurrentTarget() (ver string, present bool) {
+	raw, err := os.Readlink(r.currentPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false // genuinely absent: a legitimate first install.
+		}
+		// `current` exists but is not a resolvable symlink:
+		//   - EINVAL: it is not a symlink (a regular file / dir left by a
+		//     corrupt or interrupted repair).
+		//   - any other error (EACCES/EIO/ELOOP): indeterminate I/O.
+		// In every case SOMETHING is present, so the first-cut sanction (which
+		// is only for a genuinely-absent `current`) must NOT bypass the refuse.
+		// Fail closed with present=true (#6374).
+		r.logf("upgrade: `current` is present but not a resolvable symlink (%v); "+
+			"no restorable rollback target and NOT a sanctionable first cut (#6374)", err)
+		return "", true
+	}
+	// The bookkeeping symlink is a BARE in-tree segment (current -> <ver>). A
+	// pathful target (current -> ../x, /abs/x, a/b) escaped VersionsDir or
+	// drifted; filepath.Base would silently strip it, so reject it here rather
+	// than key a rollback off a segment the link never actually named. Mirrors
+	// stagedgen.ResolveCurrent's current-gen bare-segment guard.
+	if raw != filepath.Base(raw) {
+		r.logf("upgrade: `current` -> %q is not a bare in-tree version segment; "+
+			"present but no restorable rollback target (#6374)", raw)
+		return "", true
+	}
+	ver = raw
+	if verr := r.validateRestorableVersion(ver); verr != nil {
+		r.logf("upgrade: `current` -> %q is present but not a restorable rollback "+
+			"target: %v; recording no rollback target (#6374)", ver, verr)
+		return "", true
+	}
+	return ver, true
+}
+
 // loadJournal reads the persisted journal, or returns a zero Journal if
 // none exists.
 func (r *Runner) loadJournal() (*Journal, error) {

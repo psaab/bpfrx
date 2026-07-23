@@ -270,16 +270,79 @@ exist.
   falling back to a sanitized dpkg `$2` if the old binary won't exec; never
   fails the transaction. Writes NO upgrade journal.
 - **C — refuse-before-STOP (unconditional pre-STOP invariant).** The cut
-  NEVER calls `StopUnit` unless a restorable target exists
-  (`PreviousVersion != ""`) OR it is an explicitly sanctioned no-rollback
-  first cut (`Options.AllowNoRollbackFirstCut`). With A/B this is
-  unreachable in the field (`current` always exists), so the refusal fires
-  only on an unexpected loss of the rollback target — exactly when a blind
-  STOP would brick the daemon. On a flip failure AFTER STOP (the unit is
-  already down), `recoverFromFlipFailure` rolls back to the previous
-  version, or — for a sanctioned first cut — restarts the first-install
-  binary from `versions/current`; it always returns a non-nil error so a
-  flip failure is never reported as success.
+  NEVER calls `StopUnit` unless a **restorable** target exists OR it is an
+  explicitly sanctioned no-rollback first cut
+  (`Options.AllowNoRollbackFirstCut`). With A/B this is unreachable in the
+  field (`current` always exists), so the refusal fires only on an
+  unexpected loss of the rollback target — exactly when a blind STOP would
+  brick the daemon. On a flip failure AFTER STOP (the unit is already down),
+  `recoverFromFlipFailure` rolls back to the previous version, or — for a
+  sanctioned first cut — restarts the first-install binary from
+  `versions/current`; it always returns a non-nil error so a flip failure is
+  never reported as success.
+
+  **"Restorable" is stricter than `PreviousVersion != ""` (#6374).** A
+  nonempty basename is NOT sufficient: `os.Readlink` succeeds on a *dangling*
+  `current` (target dir missing after storage damage / an interrupted
+  repair), and `filepath.Base` silently strips a pathful target, so a
+  corrupt `current` used to yield a nonempty `PreviousVersion` that passed
+  every guard — then the post-STOP rollback flip to the missing dir failed
+  and left xpfd offline. The recorded rollback target now comes from
+  `restorableCurrentTarget`, which returns `ver==""` unless `current` is a
+  symlink naming a **bare in-tree segment** whose `versions/<ver>/`
+  **directory exists** and holds the **complete managed lockstep set**
+  (`manifest.LockstepNames`), where each lockstep binary is a **regular file
+  carrying the executable bit** — the flip drop-in execs the literal
+  `versions/<ver>/xpfd` path, so a lockstep entry that is a directory / FIFO
+  / socket / symlink / non-executable-bit file cannot be exec'd by systemd
+  and is rejected (`os.Lstat`, so a symlink is rejected outright rather than
+  followed). This validates on-disk **metadata** (type + exec bit), not the
+  binary's **content**: a regular exec-bit file whose content is not actually
+  executable (corrupt / truncated / wrong-arch / plain text `chmod 0755`)
+  passes this static check but would fail `execve` — that is undecidable
+  without exec'ing it, so final content-executability is systemd's arbiter at
+  restart. That rare tampering/corruption residual is out of scope for static
+  validation and tracked as a follow-up (#6409); the common
+  dangling/pathful/incomplete/wrong-type/non-executable-bit modes are
+  rejected here. The same `validateRestorableVersion` predicate
+  re-checks a *persisted* `PreviousVersion` on every resume before STOP (a
+  pre-#6374 journal or a dir damaged/GC'd after INIT is caught), and gates
+  the standalone `rollback()` **before** it stops the daemon or restores the
+  config DB — so an unrestorable target surfaces a clear error instead of
+  rolling the DB back and then stranding the control plane on a missing
+  runtime. (The HA path sets `SkipStartHealthRollback`; its rollback is
+  operator-driven and never enters `rollback()`.)
+
+  **The sanction covers ONLY a genuinely-absent `current` (#6374).**
+  `restorableCurrentTarget` returns a second value, `present`, that
+  distinguishes a **genuinely absent** `current` (`os.IsNotExist` →
+  `present=false`, a real first install) from a **present-but-unrestorable**
+  one (`present=true`: not a symlink / pathful / dangling / non-directory /
+  lockstep-incomplete / an indeterminate `EACCES`/`EIO` stat error).
+  `AllowNoRollbackFirstCut` / `FirstCutSanctioned` may bypass the
+  refuse-before-STOP guard **only when `!present`**. A present-but-corrupt
+  `current` still had a rollback target and it is now broken — stopping the
+  daemon would strand it, the exact #6374 hazard — so it **refuses regardless
+  of the sanction**, both at INIT **and on every resume**. The resumed
+  empty-previous branch does not trust the persisted/invocation sanction on
+  its own: it **re-resolves `current` at resume time** and refuses if
+  `current` is now present-but-unrestorable — defending against a poisoned
+  pre-#6374 journal (an over-broad sanction persisted for a present-but-corrupt
+  `current`) or a `current` that corrupted after a genuinely-sanctioned INIT.
+  It keys on *present AND unrestorable* (`present && ver==""`), NOT merely
+  *present*, so a legitimate first-cut resume whose flip already pointed
+  `current` at the (restorable) target still proceeds. Symmetrically the
+  pre-STOP revalidation of a *nonempty* recorded `PreviousVersion` refuses
+  regardless of the sanction (a recorded-but-broken target is never a
+  sanctionable first install); the sanction applies only to a recorded-*empty*
+  target with a still-absent `current`. An indeterminate I/O error on the
+  target fails **closed** (`present=true` → refuse), never silently treated as
+  absent-and-sanctionable.
+
+  `readCurrentVersion` itself is unchanged — it still returns the raw
+  basename for the conservative "never delete a dir that might be live" GC /
+  stale-dir-replace guards, which must protect a present-but-incomplete live
+  dir rather than treat it as absent.
 
 Version strings that key `versions/<ver>` — and, the strictest sink, the
 `ExecStart` line in the `10-xpf-version.conf` unit drop-in — are validated by a
