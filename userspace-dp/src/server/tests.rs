@@ -481,7 +481,7 @@ fn sync_session_delete_with_unparseable_ip_is_rejected() {
 #[test]
 fn rebind_preserves_synced_sessions() {
     // #1921 regression. `rebind::handle` must NOT call `guard.afxdp.stop()`:
-    // that runs `stop_inner(true)`, which clears `coord.workers.handles`
+    // that runs `stop_inner(true)`, which clears `coord.workers.records`
     // before `tear_down` samples them (so the 500ms zero-copy teardown
     // quiesce is bypassed -> EBUSY/rebind loop) AND wipes the in-memory
     // synced-session map (mod.rs:488). The reconcile pipeline's `tear_down`

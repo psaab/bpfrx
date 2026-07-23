@@ -10,7 +10,7 @@ impl crate::afxdp::Coordinator {
     /// installs, snapshot/FIB bumps, HA state updates) for up to 15 s.
     ///
     /// This method MUST be called under the `ServerState` lock: it reads
-    /// `workers.handles` / `workers.live` and bumps `export_seq`. Those
+    /// `workers.records` / `workers.live` and bumps `export_seq`. Those
     /// collections are only mutated by other control-socket handlers, which
     /// all hold the same lock, so snapshotting the per-worker ack atomics
     /// (`Arc<AtomicU64>`) and the per-binding delta buffers
@@ -40,8 +40,11 @@ impl crate::afxdp::Coordinator {
             .export_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        let mut ack_atomics = Vec::with_capacity(self.workers.handles.len());
-        for handle in self.workers.handles.values() {
+        let mut ack_atomics = Vec::with_capacity(self.workers.records.len());
+        // #6242: enqueue the export command + collect the ack atomic via each
+        // worker's runtime record.
+        for rec in self.workers.records.values() {
+            let handle = &rec.handle;
             // #1790/#1807: recover, don't early-return — one dead worker's
             // poisoned queue must not block session export for every
             // HEALTHY worker (the export-ack timeout handles dead workers
@@ -224,7 +227,7 @@ pub struct OwnerRgExportWait {
     /// Per-worker `session_export_ack` atomics captured at kick time. The
     /// worker SET is stable for the lock-free wait window (every mutator
     /// holds the `ServerState` lock), so this snapshot is equivalent to
-    /// re-reading `workers.handles` live.
+    /// re-reading `workers.records` live.
     ack_atomics: Vec<Arc<AtomicU64>>,
     /// Per-binding delta buffers (`workers.live` values) captured at kick
     /// time; drained after all workers ack.

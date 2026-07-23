@@ -52,7 +52,7 @@ fn quiesce(coord: &mut Coordinator, d: Duration) {
 /// teardown with no following bind (`no_snapshot` / shutdown) passes
 /// `false` and skips the quiesce.
 pub(super) fn tear_down(coord: &mut Coordinator, will_rebind: bool) -> PreservedReconcileState {
-    let had_live_workers = !coord.workers.handles.is_empty();
+    let had_live_workers = !coord.workers.records.is_empty();
     let synced_sessions = coord.snapshot_shared_session_entries();
     // #1873 R-D (AGY code r3): capture the tunnel-owner map and the
     // installed flag BEFORE stop_inner defaults coord.forwarding and

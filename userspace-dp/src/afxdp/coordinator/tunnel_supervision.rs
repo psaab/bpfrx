@@ -92,7 +92,7 @@ impl super::Coordinator {
         // Spawn pass (apply-time only; the periodic liveness sweep
         // respawns tombstones but never creates entries).
         let mut spawned = false;
-        if !self.workers.handles.is_empty() {
+        if !self.workers.records.is_empty() {
             let now = monotonic_nanos();
             let desired: Vec<u16> = self
                 .forwarding
@@ -229,9 +229,9 @@ impl super::Coordinator {
         let shared_owner_rg_indexes = self.sessions.owner_rg_indexes.clone();
         let worker_commands = self
             .workers
-            .handles
+            .records
             .values()
-            .map(|handle| handle.commands.clone())
+            .map(|rec| rec.handle.commands.clone())
             .collect::<Vec<_>>();
         let recent_exceptions = self.recent_exceptions.clone();
         let thread_tunnel_name = tunnel_name.clone();
@@ -430,7 +430,7 @@ impl super::Coordinator {
         let swept = self.sweep_finished_local_tunnel_sources();
         let mut spawned = false;
         if let Some(snapshot) = latest_snapshot {
-            if !self.workers.handles.is_empty() {
+            if !self.workers.records.is_empty() {
                 let now = monotonic_nanos();
                 let tombstones: Vec<u16> = self
                     .tunnel_sources
