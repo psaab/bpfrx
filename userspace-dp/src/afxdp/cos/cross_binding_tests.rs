@@ -26,6 +26,13 @@ fn test_prepared_mirror_request(offset: u64, len: u32) -> PreparedTxRequest {
     }
 }
 
+fn test_prepared_request(offset: u64, len: u32) -> PreparedTxRequest {
+    PreparedTxRequest {
+        mirror_clone: false,
+        ..test_prepared_mirror_request(offset, len)
+    }
+}
+
 #[test]
 fn redirect_local_cos_request_to_owner_pushes_worker_command() {
     let commands = Arc::new(Mutex::new(VecDeque::new()));
@@ -665,4 +672,198 @@ fn redirect_prepared_cos_request_to_owner_binding_preserves_mirror_clone_on_live
     assert_eq!(req.bytes, vec![4, 5, 6]);
     assert_eq!(req.egress_ifindex, 80);
     assert_eq!(req.cos_queue_id, Some(4));
+}
+
+// #6310 FAIL-ON-REVERT merge gate: the cross-worker prepared-redirect
+// copy must be allocation-free on the WARMED path (a pooled buffer is
+// available). Reverting either `frame.to_vec()` site in cross_binding.rs
+// makes the measured redirect allocate, so the `allocs == 0` assertion
+// goes RED as an ASSERTION FAILURE (not a build break — `to_vec()` and
+// `redirect_pool::checkout` both yield a `Vec<u8>`, so the test compiles
+// against both). The byte-identity assertion additionally guarantees the
+// buffer reuse never corrupts the redirected frame.
+#[test]
+fn cos_cross_worker_redirect_is_allocation_free_6310() {
+    use crate::afxdp::cos::redirect_pool;
+
+    // Isolate the per-thread pool from any residue (single-threaded test
+    // runs share a thread-local across tests).
+    redirect_pool::clear_for_test();
+
+    let owner_live = Arc::new(BindingLiveState::new());
+    let fast_path = test_cos_fast_interfaces(
+        80,
+        12,
+        4,
+        vec![(4, test_queue_fast_path(false, 7, None, None))],
+        Some(owner_live.clone()),
+        None,
+    )
+    .remove(&80)
+    .expect("fast path");
+    let root = test_cos_runtime_with_exact(false);
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 2, 80, root, fast_path);
+
+    // A realistic multi-byte source frame at UMEM offset 128.
+    let payload: Vec<u8> = (0..64u16).map(|i| (i & 0xff) as u8).collect();
+    let len = payload.len() as u32;
+    unsafe { binding.umem.area().slice_mut_unchecked(128, payload.len()) }
+        .expect("source frame")
+        .copy_from_slice(&payload);
+
+    // Pre-reserve the recycle deque so its push_back never reallocates
+    // during the measured pass.
+    binding.tx_pipeline.free_tx_frames.reserve(16);
+
+    // Warm pass: the first redirect checks out from an EMPTY pool (it
+    // allocates a correctly-sized buffer) and warms the free-frame deque
+    // and inbox. Drain the owner and recycle the buffer back into the
+    // pool, mirroring the production replenish path where the owner
+    // recycles the buffer at exact-Local settle.
+    let warm_req = test_prepared_request(128, len);
+    assert!(
+        redirect_prepared_cos_request_to_owner_binding(&mut binding, warm_req, None).is_ok(),
+        "warm redirect must route to the owner-live queue",
+    );
+    let mut warm_drained = VecDeque::new();
+    owner_live.take_pending_tx_into(&mut warm_drained);
+    let warm_bytes = warm_drained
+        .pop_front()
+        .expect("warm request queued")
+        .bytes;
+    assert_eq!(warm_bytes, payload, "warm redirect copied the frame verbatim");
+    redirect_pool::recycle(warm_bytes);
+    assert_eq!(
+        redirect_pool::len_for_test(),
+        1,
+        "committed buffer returned to the per-worker pool",
+    );
+
+    // Measured pass: the redirect must REUSE the pooled buffer and
+    // perform ZERO heap allocations.
+    let measured_req = test_prepared_request(128, len);
+    let (res, allocs) = crate::test_alloc::count_allocs(|| {
+        redirect_prepared_cos_request_to_owner_binding(&mut binding, measured_req, None)
+    });
+    assert!(
+        res.is_ok(),
+        "measured redirect must route to the owner-live queue",
+    );
+    assert_eq!(
+        allocs, 0,
+        "#6310: the warmed cross-worker prepared-redirect copy must be \
+         allocation-free (reverting to `frame.to_vec()` makes this > 0)",
+    );
+
+    // Byte-identity: buffer reuse must not corrupt the redirected frame.
+    let mut measured_drained = VecDeque::new();
+    owner_live.take_pending_tx_into(&mut measured_drained);
+    let measured = measured_drained
+        .pop_front()
+        .expect("measured request queued");
+    assert_eq!(
+        measured.bytes, payload,
+        "buffer reuse must preserve the redirected bytes byte-for-byte",
+    );
+    assert_eq!(measured.egress_ifindex, 80);
+    assert_eq!(measured.cos_queue_id, Some(4));
+}
+
+// #6310 FAIL-ON-REVERT merge gate — SIBLING SITE. The test above gates the
+// `frame.to_vec()` site in `redirect_prepared_cos_request_to_owner_binding`;
+// this one gates the OTHER site, in `redirect_prepared_cos_request_to_owner`
+// (the queue-owner_live Step-1 redirect arm). Together the two tests gate
+// BOTH `to_vec()` sites enumerated in #6310: reverting EITHER makes its
+// respective test allocate (`allocs == 0` → RED as an ASSERTION, not a build
+// break — `to_vec()` and `redirect_pool::checkout` both yield `Vec<u8>`).
+#[test]
+fn cos_cross_worker_redirect_to_owner_is_allocation_free_6310() {
+    use crate::afxdp::cos::redirect_pool;
+
+    redirect_pool::clear_for_test();
+
+    // owner_live path: the queue's own owner_live routes via
+    // `enqueue_tx_owned` (no worker-command channel needed).
+    let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
+    let owner_live = Arc::new(BindingLiveState::new());
+    let fast_path = test_cos_fast_interfaces(
+        80,
+        12,
+        4,
+        vec![(4, test_queue_fast_path(false, 7, Some(owner_live.clone()), None))],
+        None,
+        None,
+    )
+    .remove(&80)
+    .expect("fast path");
+    let root = test_cos_runtime_with_exact(false);
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 2, 80, root, fast_path);
+
+    let payload: Vec<u8> = (0..64u16).map(|i| (i & 0xff) as u8).collect();
+    let len = payload.len() as u32;
+    unsafe { binding.umem.area().slice_mut_unchecked(128, payload.len()) }
+        .expect("source frame")
+        .copy_from_slice(&payload);
+    binding.tx_pipeline.free_tx_frames.reserve(16);
+
+    // Warm pass: checkout from an empty pool (allocates), then recycle the
+    // committed buffer back — mirrors the owner-worker settle replenish.
+    let warm_req = test_prepared_request(128, len);
+    assert!(
+        redirect_prepared_cos_request_to_owner(
+            &mut binding,
+            warm_req,
+            2,
+            &worker_commands_by_id,
+            None,
+        )
+        .is_ok(),
+        "warm redirect must route to the owner-live queue",
+    );
+    let mut warm_drained = VecDeque::new();
+    owner_live.take_pending_tx_into(&mut warm_drained);
+    let warm_bytes = warm_drained
+        .pop_front()
+        .expect("warm request queued")
+        .bytes;
+    assert_eq!(warm_bytes, payload, "warm redirect copied the frame verbatim");
+    redirect_pool::recycle(warm_bytes);
+    assert_eq!(
+        redirect_pool::len_for_test(),
+        1,
+        "committed buffer returned to the per-worker pool",
+    );
+
+    // Measured pass: reuse the pooled buffer — ZERO heap allocations.
+    let measured_req = test_prepared_request(128, len);
+    let (res, allocs) = crate::test_alloc::count_allocs(|| {
+        redirect_prepared_cos_request_to_owner(
+            &mut binding,
+            measured_req,
+            2,
+            &worker_commands_by_id,
+            None,
+        )
+    });
+    assert!(
+        res.is_ok(),
+        "measured redirect must route to the owner-live queue",
+    );
+    assert_eq!(
+        allocs, 0,
+        "#6310: the warmed cross-worker redirect_prepared_cos_request_to_owner \
+         copy must be allocation-free (reverting to `frame.to_vec()` makes this > 0)",
+    );
+
+    let mut measured_drained = VecDeque::new();
+    owner_live.take_pending_tx_into(&mut measured_drained);
+    let measured = measured_drained
+        .pop_front()
+        .expect("measured request queued");
+    assert_eq!(
+        measured.bytes, payload,
+        "buffer reuse must preserve the redirected bytes byte-for-byte",
+    );
+    assert_eq!(measured.egress_ifindex, 80);
+    assert_eq!(measured.cos_queue_id, Some(4));
 }

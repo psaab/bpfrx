@@ -56828,6 +56828,22 @@ top.
   manifest via cmd/shim-manifest. Verified: fsatomic+dataplane green;
   editing xpf_common.h now trips the freshness test; src-edit coverage intact.
 
+## #6310 — CoS cross-worker prepared-redirect allocation-free (eng6310)
+- **Timestamp**: 2026-07-22
+- **Action**: Eliminate per-packet `frame.to_vec()` at the two cross-binding
+  prepared-redirect sites. Adopted a per-worker THREAD-LOCAL copy-buffer pool
+  (`cos::redirect_pool`): `checkout` reuses a pooled buffer (retained cap)
+  instead of allocating; `recycle` returns committed buffers at the two
+  exact-Local settle sites (owner worker, after the UMEM copy — buffer dead).
+  The copy is genuinely required (source UMEM frame recycled immediately;
+  owner consumes bytes async on its own thread), so a shared scratch is
+  unsound — thread-local pools + Rust move semantics keep the cross-thread
+  hand-off aliasing-free. Reverted an alternative source-side MPSC/Drop pool
+  after reconciling a self-inflicted fork double-drive in this worktree.
+- **File(s)**: userspace-dp/src/afxdp/cos/redirect_pool.rs (new),
+  cos/mod.rs, cos/cross_binding.rs, cos/queue_service/mod.rs,
+  cos/cross_binding_tests.rs (two fail-on-revert alloc tests — one per
+  to_vec site), cos/README.md (allocation-cohort note).
 ## 2026-07-22 — #6234 server/helpers split (audit-183 cohort)
 - **Action**: Convert `server/helpers.rs` (1.4k-line cold-path grab-bag) into a
   `server/helpers/` directory module; extract HA session-sync reconstruction
