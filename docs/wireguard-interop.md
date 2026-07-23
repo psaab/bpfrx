@@ -424,6 +424,33 @@ logical `egress_ifindex` + `tx_ifindex = 0` (#2837). RED-on-revert:
 logical wgN 400 → `NO_EGRESS_BINDING`; a default-route flow with `tx_ifindex >
 0` still dispatches to the default egress verbatim).
 
+**#6340 (dispatch peer selection follows the POST-NAT dst — closing the #6308
+DNAT SSOT hole).** #6308 resolved the dispatch egress by selecting the WG peer
+from the inner destination's AllowedIPs LPM, but at the dispatch site
+(`resolve_forward_target_ifindex`) the frame in hand is the PRE-NAT ingress
+frame, while `wg_encap_frame` selects its peer from the POST-NAT frame — the
+encap builder applies DNAT into `out` (`apply_nat_ipv4/6` writes
+`nat.rewrite_dst`) BEFORE its own peer LPM (`inner_dst_ip(&out)`). Under a DNAT
+that rewrites the inner dst ACROSS two AllowedIPs peers on DISTINCT physical
+underlays (no default route → `tx_ifindex == 0`), the #6308 dispatch selected
+the PRE-NAT peer's NIC while the bytes carried the POST-NAT peer's L2 — a wire
+mismatch (dispatch and bytes disagree on the physical NIC). Not a #6308
+regression (that edge already dropped pre-#6308), but the SSOT thesis "dispatch
+and bytes agree on ONE physical NIC" must hold unconditionally. The fix keys the
+dispatch peer selection on the POST-NAT dst: `wg_transit_egress_physical_egress_ifindex`
+now uses `decision.nat.rewrite_dst` (the post-DNAT dst) when a same-family DNAT
+applies, else the frame's parsed inner dst — the SAME key `wg_encap_frame` reads
+from `out`. NAT64 (`nat.nat64`) is excluded (the address family changes, so
+neither `rewrite_dst` nor the pre-NAT frame dst is a valid same-family AllowedIPs
+key for the endpoint's peers): it returns `None` → the conservative
+logical-ifindex fallback (fail-closed; a NAT64→WG transit flow is undeliverable
+on this path regardless). RED-on-revert:
+`wg_transit_egress_dispatch_follows_post_nat_peer_6308` (a DNAT rewriting the
+inner dst across two AllowedIPs peers on distinct physical NICs dispatches to the
+POST-NAT peer's NIC, the one `wg_encap_frame` emits bytes for; selecting from the
+pre-NAT dst resolves the wrong peer). The non-DNAT
+`wg_transit_egress_dispatch_specific_peer_no_default_6308` is unchanged.
+
 **#2703 (outer TTL default).** A tunnel TTL of `0` is the "use the default
 64" sentinel in the Go config (`schema_interfaces.go`, `types_routing.go`),
 and the netlink GRE path applies it (`pkg/routing/tunnel.go: if ttl == 0 {

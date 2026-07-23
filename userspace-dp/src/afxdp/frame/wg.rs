@@ -399,6 +399,14 @@ pub(in crate::afxdp) fn wg_endpoint_physical_outer_mtu(
 /// peer route egresses its physical NIC (which has a binding) instead of the
 /// logical wgN fallback.
 ///
+/// #6340: the peer selection is keyed on the POST-NAT inner dst
+/// (`decision.nat.rewrite_dst` when a same-family DNAT applies, else the frame
+/// dst) so DISPATCH resolves the SAME peer `wg_encap_frame` emits bytes for —
+/// the encap builder applies DNAT into the outgoing frame before its own peer
+/// LPM (`inner_dst_ip(&out)`), so a DNAT-across-AllowedIPs-peers flow on
+/// distinct underlays must not split the dispatch NIC from the byte NIC. NAT64
+/// is excluded (address-family change → returns `None`, the logical fallback).
+///
 /// Returns `None` — the caller keeps the pre-#6308 logical fallback — when the
 /// decision is not a WG transit-egress (no tunnel id / a GRE or unknown mode),
 /// or no covering peer with an endpoint exists. `Some(logical egress_ifindex)`
@@ -425,16 +433,44 @@ pub(in crate::afxdp) fn wg_transit_egress_physical_egress_ifindex(
     if !matches!(tunnel_mode_kind(&endpoint.mode), TunnelKind::WireGuard) {
         return None;
     }
-    // Same inner-destination peer selection the encap builder / PTB path use:
-    // parse the pre-encap inner frame's L3 (with the `meta.l3_offset` fallback),
-    // then LPM the AllowedIPs trie to the covering peer's endpoint.
-    let inner_dst = frame_l3_offset(inner_frame)
-        .or_else(|| match inner_l3_offset {
-            14 | 18 => Some(inner_l3_offset as usize),
-            _ => None,
-        })
-        .and_then(|l3| inner_frame.get(l3..))
-        .and_then(|pkt| crate::afxdp::gre::inner_dst_ip(pkt, inner_addr_family));
+    // #6340: DISPATCH must select the SAME peer `wg_encap_frame` emits bytes
+    // for. The encap builder applies DNAT into the outgoing frame BEFORE
+    // `wg_encap_frame` LPMs the AllowedIPs trie on the POST-NAT inner dst
+    // (`build_forwarded_frame_into_from_frame` writes `nat.rewrite_dst` into
+    // `out` via `apply_nat_ipv4/6`, then wg.rs reads `inner_dst_ip(&out)`).
+    // Under a DNAT that rewrites the inner dst ACROSS AllowedIPs peers on
+    // DISTINCT physical underlays, selecting the peer from the PRE-NAT frame dst
+    // here would dispatch to the wrong peer's NIC while the encap bytes carry
+    // the OTHER peer's L2 — a wire mismatch. Resolve the peer from the POST-NAT
+    // dst so dispatch and bytes agree on ONE physical NIC.
+    //
+    // NAT64 (`nat.nat64`) is deliberately excluded: it changes the address
+    // family, so `rewrite_dst` is a DIFFERENT-family address and the pre-NAT
+    // frame dst is the pre-translation family — NEITHER is a valid same-family
+    // AllowedIPs key for this WG endpoint's (same-family) peers, so reusing
+    // either would mis-select. Fail closed to the caller's logical-ifindex
+    // fallback (the pre-#6308 drop) rather than dispatch to a mis-selected NIC;
+    // a NAT64→WG transit flow is undeliverable on this path regardless (the
+    // pre-NAT frame parse already returned `None` here for that family
+    // mismatch).
+    if decision.nat.nat64 {
+        return None;
+    }
+    // Same inner-destination peer selection the encap builder / PTB path use,
+    // but keyed on the POST-DNAT dst (`nat.rewrite_dst`) when a same-family DNAT
+    // applies, else the frame's parsed inner dst (with the `meta.l3_offset`
+    // fallback) — which for a non-DNAT flow is byte-identical to the frame the
+    // encap path reads. Then LPM the AllowedIPs trie to the covering peer's
+    // endpoint.
+    let inner_dst = decision.nat.rewrite_dst.or_else(|| {
+        frame_l3_offset(inner_frame)
+            .or_else(|| match inner_l3_offset {
+                14 | 18 => Some(inner_l3_offset as usize),
+                _ => None,
+            })
+            .and_then(|l3| inner_frame.get(l3..))
+            .and_then(|pkt| crate::afxdp::gre::inner_dst_ip(pkt, inner_addr_family))
+    });
     let outer_dst = wg_peer_outer_dst(forwarding, endpoint, inner_dst)?;
     let outer = outer_physical_egress_resolution(forwarding, endpoint, outer_dst);
     Some(outer_egress_ifindex_or_fallback(decision, forwarding, &outer))

@@ -933,6 +933,135 @@ fn wg_transit_egress_dispatch_specific_peer_no_default_6308() {
     );
 }
 
+/// #6340: an engine with TWO cryptokey-routed peers on ONE wg interface, each
+/// covering a DISTINCT AllowedIPs prefix that routes to a DISTINCT physical
+/// underlay egress. `peer_for_dest` (the encap + dispatch peer selector) reads
+/// the AllowedIPs trie + per-peer endpoint from config alone — no transport
+/// session is required to resolve WHICH physical NIC a dst egresses — so this
+/// builds the two peers without driving a handshake (the function under test
+/// routes, it does not encrypt). Peer A: 10.123.0.0/24 → 203.0.113.7 (reth0.80);
+/// peer B: 10.200.0.0/24 → 198.51.100.7 (reth0.50).
+fn two_peer_config_engine() -> WgEngine {
+    let (local_priv, _local_pub) = wg_keypair();
+    let (_a_priv, a_pub) = wg_keypair();
+    let (_b_priv, b_pub) = wg_keypair();
+    WgEngine::new(WgEngineConfig {
+        local_private_key: local_priv.into(),
+        listen_port: 51820,
+        peers: vec![
+            WgPeerConfig {
+                pubkey: a_pub,
+                endpoint: Some("203.0.113.7:51820".parse().unwrap()),
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.123.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32].into(),
+            },
+            WgPeerConfig {
+                pubkey: b_pub,
+                endpoint: Some("198.51.100.7:51820".parse().unwrap()),
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.200.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32].into(),
+            },
+        ],
+    })
+}
+
+#[test]
+fn wg_transit_egress_dispatch_follows_post_nat_peer_6308() {
+    // #6340: the #6308 DNAT SSOT hole. A WG transit-egress flow where DNAT
+    // rewrites the inner dst ACROSS two AllowedIPs peers that live on DISTINCT
+    // physical underlay egresses. The encap builder applies DNAT into `out`
+    // BEFORE `wg_encap_frame` selects the peer from the POST-NAT dst
+    // (`inner_dst_ip(&out)`); DISPATCH must resolve the SAME (post-NAT) peer's
+    // physical NIC, not the PRE-NAT peer's — otherwise dispatch targets one
+    // NIC while the bytes carry the other peer's L2 (a wire mismatch).
+    let mut state = build_forwarding_state(&wg_two_peer_dnat_snapshot());
+    state
+        .wg_engines
+        .insert(1, Arc::new(two_peer_config_engine()));
+
+    // The two peers really do resolve to DISTINCT physical egresses / binds.
+    let peer_a_egress = 12; // reth0.80
+    let peer_b_egress = 13; // reth0.50
+    let bind_a = state
+        .egress
+        .get(&peer_a_egress)
+        .map(|e| e.bind_ifindex)
+        .expect("reth0.80 egress row present");
+    let bind_b = state
+        .egress
+        .get(&peer_b_egress)
+        .map(|e| e.bind_ifindex)
+        .expect("reth0.50 egress row present");
+    assert_ne!(
+        bind_a, bind_b,
+        "the two peers must live on DISTINCT physical NICs for this test to \
+         distinguish pre- vs post-NAT dispatch"
+    );
+
+    // Ingress (PRE-NAT) frame: inner dst 10.123.0.9 ∈ peer A's AllowedIPs
+    // (10.123.0.0/24). DNAT rewrites it to 10.200.0.9 ∈ peer B's AllowedIPs
+    // (10.200.0.0/24) — a DIFFERENT physical underlay.
+    let frame = inner_v4_frame(); // dst 10.123.0.9 (peer A)
+    let meta = inner_v4_meta();
+    let mut decision = wg_tunnel_decision(400, 1);
+    decision.nat.rewrite_dst = Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 200, 0, 9)));
+
+    // Baseline (no DNAT): the un-rewritten frame egresses peer A (reth0.80,
+    // ifindex 12). Proves the fixture selects A on the pre-NAT dst so the
+    // post-NAT assertion below is meaningful (not a fixture that always
+    // resolves B).
+    let mut no_nat = decision;
+    no_nat.nat.rewrite_dst = None;
+    assert_eq!(
+        wg_transit_egress_physical_egress_ifindex(
+            &no_nat,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        Some(peer_a_egress),
+        "without DNAT the frame egresses peer A (reth0.80 ifindex 12)"
+    );
+
+    // The fix: DISPATCH follows the POST-NAT dst → peer B's physical egress
+    // (reth0.50, ifindex 13) — the SAME NIC `wg_encap_frame` emits bytes for
+    // (it reads `inner_dst_ip(&out)` on the DNAT'd `out`). Reverting the fold
+    // (select from the pre-NAT frame dst) resolves peer A (12) → RED.
+    assert_eq!(
+        wg_transit_egress_physical_egress_ifindex(
+            &decision,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        Some(peer_b_egress),
+        "DNAT-across-peers: dispatch must follow the POST-NAT dst to peer B's \
+         physical egress (reth0.50 ifindex 13), NOT the pre-NAT peer A (12)"
+    );
+
+    // And the full dispatch target (the XSK bind ifindex the TX dispatcher
+    // looks up) is peer B's physical bind, not peer A's.
+    let target = crate::afxdp::forward_request::resolve_forward_target_ifindex(
+        &decision,
+        &state,
+        &frame,
+        meta.addr_family,
+        meta.l3_offset,
+    );
+    assert_eq!(
+        target, bind_b,
+        "dispatch must target peer B's physical bind ({bind_b})"
+    );
+    assert_ne!(
+        target, bind_a,
+        "dispatch must NOT target the pre-NAT peer A's physical bind ({bind_a})"
+    );
+}
+
 /// Minimal L2/IPv6/UDP inner frame with dst in `fd00:123::/64` so
 /// `peer_for_dest` selects the v6-endpoint peer.
 fn inner_v6_frame() -> Vec<u8> {
