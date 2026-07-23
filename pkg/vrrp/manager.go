@@ -1015,14 +1015,18 @@ func (m *Manager) Status() string {
 		vi := m.instances[key]
 		state := vi.getState()
 		// #5718 (codex-182 C-HA C01c): snapshot the mutable cfg fields under
-		// vi.mu.RLock before formatting. Priority/Preempt/AdvertiseInterval/
-		// VirtualAddresses are all mutated under vi.mu.Lock (updateConfig,
-		// UpdateRGPriority, suppressPreempt/restorePreempt); reading them here
-		// while holding only m.mu.RLock races a concurrent failover priority
-		// update — a diagnostic-only data race go test -race flags. Mirrors the
-		// snapshot idiom in advertInterval/getPriority (#6230). getState()
-		// already RLocks internally, so it stays outside this block; vi.key()
-		// reads only immutable identity fields.
+		// vi.mu.RLock before formatting. Priority/Preempt/AdvertiseInterval are
+		// mutated under vi.mu.Lock (updateConfig, UpdateRGPriority,
+		// suppressPreempt/restorePreempt); reading them here while holding only
+		// m.mu.RLock races a concurrent failover priority update — a
+		// diagnostic-only data race go test -race flags. Mirrors the snapshot
+		// idiom in advertInterval/getPriority (#6230). VirtualAddresses is
+		// immutable per instance (a VIP change rebuilds the whole instance under
+		// m.mu.Lock, see instance_addr.go vipAddrSet / instance.go vipFamilies),
+		// so reading it under only m.mu.RLock was already race-free; it is
+		// deep-copied here defensively alongside the genuinely-raced fields.
+		// getState() already RLocks internally, so it stays outside this block;
+		// vi.key() reads only immutable identity fields.
 		vi.mu.RLock()
 		priority := vi.cfg.Priority
 		preempt := vi.cfg.Preempt

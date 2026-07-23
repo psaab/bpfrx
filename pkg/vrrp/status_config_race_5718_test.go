@@ -8,20 +8,29 @@ import (
 )
 
 // #5718 (codex-182 C-HA C01c): Manager.Status() formatted vi.cfg.Priority,
-// vi.cfg.Preempt, vi.cfg.AdvertiseInterval, and vi.cfg.VirtualAddresses while
-// holding only m.mu.RLock. Those cfg fields are mutated under vi.mu.Lock by
-// updateConfig, UpdateRGPriority, and suppressPreempt/restorePreempt. A `show`/
-// status render concurrent with a failover priority update is therefore an
-// unsynchronized concurrent read/write — a diagnostic-only data race the Go
-// memory model forbids and go test -race flags. The fix snapshots the cfg
-// fields under vi.mu.RLock before formatting, mirroring advertInterval/
-// getPriority (#6230).
+// vi.cfg.Preempt, and vi.cfg.AdvertiseInterval while holding only m.mu.RLock.
+// Those three cfg fields are mutated under vi.mu.Lock by updateConfig,
+// UpdateRGPriority, and suppressPreempt/restorePreempt, so a `show`/status
+// render concurrent with a failover priority update is an unsynchronized
+// concurrent read/write — a diagnostic-only data race the Go memory model
+// forbids and go test -race flags. The fix snapshots those fields under
+// vi.mu.RLock before formatting, mirroring advertInterval/getPriority (#6230).
+// (vi.cfg.VirtualAddresses is ALSO deep-copied there, but only defensively: it
+// is immutable per instance — a VIP change rebuilds the whole instance under
+// m.mu.Lock, see instance_addr.go vipAddrSet / instance.go vipFamilies — so it
+// was never part of this race.)
 //
-// This is the fail-on-revert gate. The race detector reports on the FIRST
-// unsynchronized concurrent access, so a few thousand tightly interleaved
-// iterations suffice and stay fast under -race. It is CLEAN with the snapshot
-// fix and DETECTS the race if Status() reverts to reading vi.cfg.* directly.
-// Must be run with `go test -race`.
+// This is the fail-on-revert gate. A start barrier releases the writer and
+// reader together, and the writer LOOPS mutating all three raced fields under
+// vi.mu.Lock until the reader signals done, so the reader's Status() renders
+// overlap a live concurrent writer for the whole window. That guaranteed
+// overlap makes the race detector reliably observe the concurrent access under
+// both the default GOMAXPROCS and GOMAXPROCS=1 — a fixed-count writer that can
+// run to completion before the reader starts leaves no concurrent access and
+// false-greens on revert. It is CLEAN with the snapshot fix and reliably
+// reports WARNING: DATA RACE + FAIL if Status() reverts to reading any of
+// vi.cfg.Priority/Preempt/AdvertiseInterval directly. Must be run with
+// `go test -race`.
 func TestStatusConfigNoRace5718(t *testing.T) {
 	m := NewManager()
 	reth := newInstance(
@@ -30,34 +39,54 @@ func TestStatusConfigNoRace5718(t *testing.T) {
 	m.instances[instanceKey{iface: "reth0", groupID: 101}] = reth
 
 	const iters = 5000
+	start := make(chan struct{})
+	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Writer: a locked mutation of cfg.Priority, mirroring the vi.mu.Lock()
-	// discipline every cfg writer (updateConfig, UpdateRGPriority) uses.
+	// Writer: a locked mutation of the three genuinely-raced snapshot fields
+	// (Priority, Preempt, AdvertiseInterval), mirroring the vi.mu.Lock()
+	// discipline every cfg writer (updateConfig, UpdateRGPriority,
+	// suppressPreempt/restorePreempt) uses. It loops until the reader signals
+	// done so a revert of ANY of the three snapshots — not just Priority — is
+	// caught by the -race detector.
 	go func() {
 		defer wg.Done()
-		for i := 0; i < iters; i++ {
+		<-start
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+			}
 			reth.mu.Lock()
 			if i%2 == 0 {
 				reth.cfg.Priority = 100
+				reth.cfg.Preempt = true
+				reth.cfg.AdvertiseInterval = 30
 			} else {
 				reth.cfg.Priority = 1
+				reth.cfg.Preempt = false
+				reth.cfg.AdvertiseInterval = 100
 			}
 			reth.mu.Unlock()
 		}
 	}()
 
-	// Reader: the real Status() render path.
+	// Reader: the real Status() render path, run for a bounded window while the
+	// writer is guaranteed to be concurrently mutating the cfg snapshot fields.
 	go func() {
 		defer wg.Done()
+		<-start
 		for i := 0; i < iters; i++ {
 			if out := m.Status(); !strings.Contains(out, "reth0") {
 				t.Errorf("Status() missing instance: %q", out)
-				return
+				break
 			}
 		}
+		close(done)
 	}()
 
+	close(start)
 	wg.Wait()
 }
