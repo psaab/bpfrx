@@ -48,6 +48,52 @@
   pkg/snmp/traps.go, pkg/snmp/agent_stop_leak_4916_test.go,
   pkg/snmp/README.md, _Log.md
 
+## 2026-07-23 — #6380 fold: bind both syslog port guard sites + config-search truncation header
+
+- **Timestamp**: 2026-07-23 (fix/5250-psreview042)
+- **Action**: Close two verified test-coverage gaps + one comment inaccuracy on
+  PR #6380 (Advances #5250). NO production logic changed — a Claude reviewer and
+  Codex both confirmed the 4 production fixes correct; this is tests + a comment
+  only.
+  1. **Syslog nested-host-port guard now bound.**
+     `syslog_stream_port_5250_test.go` previously exercised ONLY the direct
+     `stream port` guard site (`compileLog` `case "port":`), leaving the nested
+     `host { port <p>; }` guard site (`compiler_security_log.go:52`) unbound —
+     reverting just that site stayed GREEN. Added
+     `compileOneStreamNestedHostPort` (a stream whose only child is a nested
+     `host` block with a bare IP + `port` child, so ONLY the nested guard runs)
+     plus `TestSyslogStreamNestedHostPortRejectsOutOfRange_5250` (70000 → keeps
+     514) and `TestSyslogStreamNestedHostPortAcceptsInRange_5250` (9006 honored).
+     Firsthand RED-on-revert: neutralizing ONLY `&& validSyslogPort(n)` at :52 →
+     nested test RED (Port=70000), flat `TestSyslogStreamPortRejectsOutOfRange`
+     stayed GREEN; restore → GREEN.
+  2. **Config-search production truncation cap + header now bound.**
+     `config_search_bound_5250_test.go` drove only the pure `searchConfigLines`
+     helper; the `maxConfigSearchResults=500` cap wired into
+     `configSearchHandler` and the `X-Result-Truncated: true` header were
+     unbound. Added `stageAddressConfig` (N committed address-book entries via
+     real LoadSet+Commit) + `searchResultCount` (unmarshals the Response) plus
+     `TestConfigSearchHandlerTruncatesResults_5250` (stage 550, broad "address"
+     query → exactly 500 results AND header=="true") and
+     `TestConfigSearchHandlerNoTruncateHeaderUnderCap_5250` (stage 10 → under-cap
+     count, header ABSENT). Firsthand RED-on-revert: neutralizing the
+     `w.Header().Set("X-Result-Truncated", ...)` block → header assertion RED
+     (count still 500); neutralizing the handler's cap (call-site
+     `maxConfigSearchResults` → `1<<30`) → count assertion RED (551 vs 500).
+  3. **Comment fix (`validSyslogPort` doc).** The comment claimed "The strict
+     commit path has no syslog-stream port-range gate" — INCORRECT (Codex-
+     flagged). The strict commit path DOES range-gate the port
+     (`validateSecurityLogStreamPortsAST`, #3349, hard-rejects out-of-range at
+     commit/commit-check). Reworded to state that reality and that this guard
+     protects the LENIENT tolerant-load / peer-sync path (#1960) where that gate
+     only warns, so an out-of-range value can still reach `compileLog`.
+  - SKIPPED the `strings.SplitSeq` perf micro-opt Codex mentioned: the 256-byte
+    query cap + 500-result cap already bound the work; not worth the churn.
+  - GATES: go build + go vet + gofmt -l clean; full `go test ./pkg/config/...`
+    and `./pkg/api/...` GREEN (`-count=1`; pkg/api clean, no NaN flake this run).
+- **File(s)**: pkg/config/syslog_stream_port_5250_test.go,
+  pkg/config/compiler_security_log.go,
+  pkg/api/config_search_bound_5250_test.go
 ## 2026-07-23 — #5719 C001: fold Codex hostile-review findings into #6378
 
 - **Timestamp**: 2026-07-23 (fix/5719-capi-residuals, fold on PR #6378)
@@ -58197,6 +58243,63 @@ top.
     pkg/policymatch/README.md, docs/pr/812-tx-latency-histogram/plan.md
 
 - **Timestamp**: 2026-07-23
+  - **Action**: #5250 (cohort ps-review-042) — triaged 21 low-materiality
+    survivors against origin/master 55cf5a9b2 and fixed the 4 real +
+    independent + low-risk + in-Go-scope items in one PR, each with a
+    verified fail-on-revert test (neutralize the guard → new test RED with a
+    clean assertion). Fixes:
+    - **A8-b1 F2 (configSearchHandler unbounded q + result set)** — cap the
+      search substring at 256 bytes (400 on over-long q) and the returned
+      match set at 500 lines, setting an `X-Result-Truncated: true` response
+      header when clipped. Extracted a pure `searchConfigLines` helper for the
+      cap so it is unit-testable without staging a 500-line config. The
+      response `data` shape stays an array (non-breaking); truncation is
+      signalled by header.
+    - **A8-b1 F4 (diag ping Size uncapped)** — clamp `req.Size` to the new
+      `diagcmd.MaxPingSize` (65507 = max valid ICMP echo data) in BOTH the REST
+      (`pkg/api/system.go`) and gRPC (`pkg/grpcapi/server_diag_ping.go`)
+      buildPingArgv callers. The shared ceiling lives in `pkg/diagcmd` but the
+      clamp stays in the callers per the PingOptions "layout only" contract.
+      The console-local CLI surface (`pkg/cli/cli_request_ping.go`) is
+      operator-trusted and outside the finding's authed-network scope; left
+      unchanged.
+    - **A3-b2 F2 (syslog stream port stored unclamped)** — guard both port
+      parse sites in `compileLog` with `validSyslogPort` ([1,65535]); an
+      out-of-range value (e.g. lenient-loaded 70000, which no strict gate
+      rejects) is ignored so the dial-able 514 default (or a prior valid value)
+      is retained instead of silently breaking every syslog dial.
+    - **A3-b1 b1-F1 (deterministic NAT block-size negative via Atoi)** — add an
+      `n > 0` guard to both block-size parse sites in
+      `compiler_nat_helpers.go` so the lenient/tolerant load path no longer
+      retains a non-positive block-size (strict commit already rejects it).
+    Triage dispositions (rest of the cohort): ALREADY-FIXED — A9 F1 flowBatch
+    maxDepth (#5048 CAS-max), A9 F2 SNMPv3 privParams (#5032 fail-closed), A8-b2
+    F2 showSessionsTop (#5319 codes.Internal), A3-b2 F1 FilterTermExpansionCount
+    (#5456 uint64 overflow-checked), A7-b2 F3 frr/manager ctx (mgrCancel +
+    retryWG on Stop), A10-b2 F-06 dhcprelay giaddr (selectPrimaryIPv4 +
+    IFA_F_SECONDARY). NOT-A-BUG/unreachable — A3-b3 F-03 expandAppSet nil apps
+    (callers always pass &cfg.Applications), A8-b2 F3 int32 session clamp (needs
+    2^31 sessions). DESIGN/DEFERRED — A9 F4 eventengine edge-latch (Junos
+    escalation semantics), A3-b2 F3 lifeline fab prefix (matching-semantics is a
+    tracked design question, #3682 visibility-only). LOW/MODERATE residual left
+    tracked under #5250 — A9 F3 routemask no Stop hook (pile-up already bounded by
+    #3743 inflight cap), A6-b2 F1 ForEachSnapshotNeighbor callback-under-mu
+    (latent; only caller is daemon-local addTarget), A6-b2 F3 appPortsFromSpec
+    (perf, no clean test), A7-b1 F1 coalescence scanner.Err (ethtool -c lines
+    short; unreachable trigger), A7-b1 F4 daemon_ha AfterFunc/ctx (HA-TOUCHING —
+    flagged for a separate change), A7-b2 F2 rss_indirection queues==0 (needs
+    readQueueCount interface change). DEFERRED to dataplane owner — A2 F1
+    reverse-pool O(n) (Rust userspace-dp). No new issue filed (all residuals stay
+    tracked in the cohort, which remains OPEN). build/vet/gofmt clean; full
+    `go test ./pkg/api/... ./pkg/grpcapi/... ./pkg/config/... ./pkg/diagcmd/...`
+    GREEN.
+  - **File(s)**: pkg/diagcmd/diagcmd.go, pkg/api/system.go, pkg/api/config.go,
+    pkg/grpcapi/server_diag_ping.go, pkg/config/compiler_security_log.go,
+    pkg/config/compiler_nat_helpers.go, pkg/api/config_search_bound_5250_test.go,
+    pkg/api/ping_size_clamp_5250_test.go,
+    pkg/grpcapi/ping_size_clamp_5250_test.go,
+    pkg/config/deterministic_nat_block_size_5250_test.go,
+    pkg/config/syslog_stream_port_5250_test.go
   - **Action**: Triaged cohort #5649 (codex-review-181 low-materiality / bounded-
     hardening survivors, 19 IDs) against current origin/master 55cf5a9b2 and
     fixed the 4 REAL + INDEPENDENT + LOW-RISK + in-Go-scope items in one PR
@@ -58314,3 +58417,115 @@ top.
     (12.5s) GREEN.
   - **File(s)**: pkg/config/tcp_flags.go, pkg/config/tcp_flags_test.go,
     docs/config-schema.md, _Log.md
+  - **Action**: Triage cohort #5328 (codex-178 low-materiality + test-coverage
+    survivors). Verified all 15 sub-items firsthand against origin/master
+    (f5a3da609); fixed the real+independent+low-risk Go-scope survivors in one
+    PR, each with a fail-on-revert test (neutralize → clean assertion RED,
+    verified). FIXED:
+    - **A7-b2-F10** (pkg/daemon/rss_indirection.go): indirectionTableMatches
+      accepted a SUBSET-of-active-queues table (e.g. pinned to queue 0 with 4
+      workers) as converged, so applyRSSIndirectionOne skipped the ethtool -X
+      weight reprogram and left workers 1..3 idle. Now require full active-queue
+      coverage (every 0..active-1 must appear).
+    - **A8-b1-F6** (pkg/api/nat.go): REST interface-mode source-NAT usage counted
+      only IPv4 sessions (IterateSessions); added the IPv6 pass
+      (IterateSessionsV6) reusing the same admission lease + zone map, restoring
+      gRPC/CLI dual-stack parity.
+    - **A8-b2-F6** (pkg/grpcapi/server_show_dhcp_lldp_snmp.go): the DHCPv6 lease
+      table header said "DUID" while rendering l.HWAddress (link-layer addr, not
+      the client DUID) in BOTH showDHCPServer and showDHCPServerDetail. Relabeled
+      to "HWAddress", matching the pkg/cli #4908 fix the remote renderer missed.
+      (The error-swallow half of this finding was already fixed by #5938's
+      GetLeasesWithSource4/6 + degraded banners.)
+    - **A10-b1-F4** (cmd/cli/show_security.go): `show security statistics detail`
+      read the supplemental buffers ShowText error only inside the success
+      predicate and returned nil, silently omitting the buffer section on a
+      degraded read. Now propagate the error (parity with the base
+      GetGlobalStats error).
+    - **A10-b2-F5** (pkg/cli/cli.go, cli_show_system.go, pkg/daemon/daemon_run.go):
+      `show system services` printed hardcoded 127.0.0.1:50051 / :8080
+      "(always on)" regardless of --api-addr/--grpc-addr or an HTTP-disabled
+      daemon. Added SetServiceListeners (daemon-wired at bring-up) so the show
+      reports the effective listener state / "disabled"; an unwired CLI keeps
+      the legacy display (bit-identical).
+    - **A6-b3-F3** (pkg/dataplane/watchdog_test.go, test-hygiene): replaced the
+      vacuous `var dp DataPlane; _ = dp` compliance test with a real
+      through-interface behavioral assertion (map-not-found via a DataPlane
+      value). Interface membership is additionally compile-enforced by the real
+      consumer apply.go:311.
+    DISPOSITIONED (no code change):
+    - **A3-b1-F2** (pkg/appid/runtime.go resolveTupleFallback O(M×N)):
+      efficiency-only, off the packet path, no correctness/parity impact and no
+      clean behavioral fail-on-revert test — left as a known low-value
+      optimization.
+    - **A5-b1-F7** (pkg/vrrp/manager.go Status data race): ALREADY-FIXED by #5718
+      — Status now snapshots vi.cfg.Priority/Preempt/AdvertiseInterval/VIPs under
+      vi.mu.RLock (manager.go:1030-1035). HA-touching but already resolved (no
+      smoke needed).
+    - **A6-b1-F4** (pkg/dataplane/userspace/control.go negative selectors):
+      ALREADY-FIXED by #5449/#4894 — ParseQueueCommand/ParseBindingCommand route
+      through parseQueueID/parseBindingSlot which bounds-check.
+    - **A6-b2-F4** (pkg/dataplane/userspace/manager_overlay.go scheduler
+      co-publish): REAL but dataplane-publish-coupled and NOT low-risk (fail-
+      closed hybrid-ACK snapshot semantics) → DEFER to dataplane owner.
+    - Rust/dataplane items A1-b2-F3, A1-b5-F1, A1-b6-F2, A1-b6-F3, A10-b5-F1
+      (xsk-repro) → DEFER to dataplane owner (out of Go scope).
+    No HA/cluster/vrrp/failover code touched (A5-b1-F7 was already-fixed).
+    build+vet+gofmt clean; full go test ./pkg/daemon ./pkg/api ./pkg/grpcapi
+    ./cmd/cli ./pkg/cli ./pkg/dataplane GREEN.
+  - **File(s)**: pkg/daemon/rss_indirection.go,
+    pkg/daemon/rss_indirection_test.go, pkg/api/nat.go, pkg/api/nat_stats_test.go,
+    pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+    pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go,
+    cmd/cli/show_security.go, cmd/cli/show_security_buffers_error_5328_test.go,
+    pkg/cli/cli.go, pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_services_listeners_5328_test.go,
+    pkg/daemon/daemon_run.go, pkg/dataplane/watchdog_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Revise PR #6384 (fix/5328-codex178) per hostile review — DROP
+    the materially-incomplete A10-b2-F5 fix + re-file it, and fold three minor
+    findings. Left the other five fixes (A7-b2-F10 RSS coverage, A8-b1-F6 v6
+    SNAT count, A8-b2-F6 DHCP HWAddress label, A10-b1-F4 buffers-error
+    propagation, A6-b3-F3 watchdog test) INTACT.
+    DROPPED (reverted to origin/master, no residue):
+    - **A10-b2-F5** (`show system services` effective listeners): the fix
+      reported the REQUESTED d.opts.APIAddr/GRPCAddr, not the EFFECTIVE
+      post-bind address (HTTP is resolved/clamped/rebound/can-fail-to-bind via
+      resolveAPIBinds + the #4047/#5127 loopback clamp; gRPC can be clamped),
+      AND it patched only the LOCAL pkg/cli renderer while the remote `cli`
+      routes `show system services` through the HARDCODED gRPC renderer at
+      pkg/grpcapi/server_show_system.go:174 (50051/8080 always on), which the
+      fix did NOT touch — so it made local and remote disagree while still
+      being wrong. Reverted pkg/cli/cli.go (removed SetServiceListeners +
+      serviceListenersSet/apiAddr/grpcAddr fields), pkg/cli/cli_show_system.go
+      (restored the plain hardcoded legacy display), pkg/daemon/daemon_run.go
+      (removed the SetServiceListeners call); deleted
+      pkg/cli/cli_show_system_services_listeners_5328_test.go. Re-filed the
+      proper implementation (daemon-owned effective-listener snapshot routed
+      through BOTH renderers, `disabled` when off, end-to-end-wired test) as
+      #6385.
+    FOLDED (3 minors):
+    - **cmd/cli/show_security.go**: removed a DUPLICATED "#5328 (A10-b1-F4)"
+      comment block (the paragraph appeared twice); changed
+      `return fmt.Errorf("%v", err)` → `return err` to preserve the error
+      chain. Buffers-error test still GREEN (asserts err != nil).
+    - **pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go**: added
+      TestShowDHCPServerDetail_V6ColumnLabeledHWAddress_5328 covering the
+      DETAIL renderer (showDHCPServerDetail) — the prior test only exercised
+      the non-detail path, leaving the detail label change untested. Factored
+      the lease-manager setup into writeV6LeaseManager. Fail-on-revert
+      verified: reverting the detail DHCPv6 header to "DUID" → the new case
+      goes RED.
+    - **pkg/dataplane/watchdog_test.go**: renamed
+      TestUpdateHAWatchdog_InterfaceCompliance →
+      TestUpdateHAWatchdog_InterfaceCompliance_5328 for cohort traceability
+      (behavioral assertion unchanged).
+    build + go vet + gofmt -l clean; full go test ./pkg/daemon ./pkg/api
+    ./pkg/grpcapi ./cmd/cli ./pkg/cli ./pkg/dataplane GREEN.
+  - **File(s)**: cmd/cli/show_security.go, pkg/cli/cli.go,
+    pkg/cli/cli_show_system.go,
+    pkg/cli/cli_show_system_services_listeners_5328_test.go (deleted),
+    pkg/daemon/daemon_run.go,
+    pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go,
+    pkg/dataplane/watchdog_test.go, _Log.md
