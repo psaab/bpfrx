@@ -1,3 +1,50 @@
+## 2026-07-23 — #6380 fold: bind both syslog port guard sites + config-search truncation header
+
+- **Timestamp**: 2026-07-23 (fix/5250-psreview042)
+- **Action**: Close two verified test-coverage gaps + one comment inaccuracy on
+  PR #6380 (Advances #5250). NO production logic changed — a Claude reviewer and
+  Codex both confirmed the 4 production fixes correct; this is tests + a comment
+  only.
+  1. **Syslog nested-host-port guard now bound.**
+     `syslog_stream_port_5250_test.go` previously exercised ONLY the direct
+     `stream port` guard site (`compileLog` `case "port":`), leaving the nested
+     `host { port <p>; }` guard site (`compiler_security_log.go:52`) unbound —
+     reverting just that site stayed GREEN. Added
+     `compileOneStreamNestedHostPort` (a stream whose only child is a nested
+     `host` block with a bare IP + `port` child, so ONLY the nested guard runs)
+     plus `TestSyslogStreamNestedHostPortRejectsOutOfRange_5250` (70000 → keeps
+     514) and `TestSyslogStreamNestedHostPortAcceptsInRange_5250` (9006 honored).
+     Firsthand RED-on-revert: neutralizing ONLY `&& validSyslogPort(n)` at :52 →
+     nested test RED (Port=70000), flat `TestSyslogStreamPortRejectsOutOfRange`
+     stayed GREEN; restore → GREEN.
+  2. **Config-search production truncation cap + header now bound.**
+     `config_search_bound_5250_test.go` drove only the pure `searchConfigLines`
+     helper; the `maxConfigSearchResults=500` cap wired into
+     `configSearchHandler` and the `X-Result-Truncated: true` header were
+     unbound. Added `stageAddressConfig` (N committed address-book entries via
+     real LoadSet+Commit) + `searchResultCount` (unmarshals the Response) plus
+     `TestConfigSearchHandlerTruncatesResults_5250` (stage 550, broad "address"
+     query → exactly 500 results AND header=="true") and
+     `TestConfigSearchHandlerNoTruncateHeaderUnderCap_5250` (stage 10 → under-cap
+     count, header ABSENT). Firsthand RED-on-revert: neutralizing the
+     `w.Header().Set("X-Result-Truncated", ...)` block → header assertion RED
+     (count still 500); neutralizing the handler's cap (call-site
+     `maxConfigSearchResults` → `1<<30`) → count assertion RED (551 vs 500).
+  3. **Comment fix (`validSyslogPort` doc).** The comment claimed "The strict
+     commit path has no syslog-stream port-range gate" — INCORRECT (Codex-
+     flagged). The strict commit path DOES range-gate the port
+     (`validateSecurityLogStreamPortsAST`, #3349, hard-rejects out-of-range at
+     commit/commit-check). Reworded to state that reality and that this guard
+     protects the LENIENT tolerant-load / peer-sync path (#1960) where that gate
+     only warns, so an out-of-range value can still reach `compileLog`.
+  - SKIPPED the `strings.SplitSeq` perf micro-opt Codex mentioned: the 256-byte
+    query cap + 500-result cap already bound the work; not worth the churn.
+  - GATES: go build + go vet + gofmt -l clean; full `go test ./pkg/config/...`
+    and `./pkg/api/...` GREEN (`-count=1`; pkg/api clean, no NaN flake this run).
+- **File(s)**: pkg/config/syslog_stream_port_5250_test.go,
+  pkg/config/compiler_security_log.go,
+  pkg/api/config_search_bound_5250_test.go
+
 ## 2026-07-23 — #6240: decompose `bring_up_workers` into cohesive phase helpers
 
 - **Timestamp**: 2026-07-23 (refactor/6240-decompose-bringup)
