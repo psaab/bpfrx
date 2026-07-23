@@ -91,7 +91,16 @@ force-deletes ONLY objects carrying that tag (and only the alias it
 imported). So a concurrent bake, or an unrelated same-named VM/image, is
 never destroyed — before this the constant `xpf-image-validate` alias and
 `xpf-image-a…e` instances were force-deleted at import/launch/cleanup with
-no run-ID or ownership check (#4905-D). Scenarios:
+no run-ID or ownership check (#4905-D).
+
+`--keep` retains the run's instances, alias, and network for post-mortem
+inspection. It now ALSO retains the per-run scratch directory
+(`xpf-validate-<rand>`) and prints its path: scenarios attach host-side
+day-0 config drives / ISOs from that directory to the VMs, so deleting it
+while keeping the VMs would leave each retained instance referencing a
+source that can no longer be reopened on restart (codex-182 A10-b03-C01).
+
+Scenarios:
 
 | Scenario | Proves |
 |---|---|

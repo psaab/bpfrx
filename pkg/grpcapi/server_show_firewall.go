@@ -443,6 +443,15 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			if note := res.FragmentDenyNote(); note != "" {
 				fmt.Fprintf(buf, "  %s\n", note)
 			}
+		case res.UnsupportedTupleFamily:
+			// #5720 (codex-182 C-TOOLS): an IPv4 source with an IPv6 destination
+			// is an impossible tuple (NAT46 is unimplemented); the forwarding
+			// path never produces it and the runtime matcher fails closed.
+			// Surface the dedicated verdict instead of a fabricated "Default deny
+			// (no matching policy)", which would send an operator to add a permit
+			// that can never take effect. Mirrors the REST / gRPC MatchPolicies
+			// DisplayAction() render.
+			fmt.Fprintf(buf, "%s\n", res.DisplayAction())
 		default:
 			// No zone-pair or global policy matched: report the configured
 			// default-policy, NOT a hard-coded "deny" (#3103). When the

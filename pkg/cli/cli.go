@@ -542,7 +542,11 @@ func (c *CLI) Run() error {
 		// changes (failover) are reflected immediately.
 		c.refreshPrompt()
 	}
-	return nil
+	// The read loop above never falls through — every exit is a `return`
+	// (exitCh, io.EOF at operational level, Readline error, or errExit from
+	// dispatch). A trailing `return nil` here was unreachable and tripped
+	// `go vet` (codex-182 A10-b00-C02); Go accepts the infinite `for {}` as
+	// the function's terminating statement, so no return is needed.
 }
 
 func (c *CLI) refreshPrompt() {

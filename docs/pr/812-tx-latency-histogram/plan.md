@@ -506,10 +506,13 @@ proportional response.
    despite 10 000 userspace calls — strace-reported proof that the
    entire loop served from VDSO.
 
-2. `evidence/vdso_probe2.c` — checks `getauxval(AT_SYSINFO_EHDR)` and
-   dumps `/proc/self/maps | grep vdso`. Pushed as a static binary to
-   the deploy VM `xpf-userspace-fw0` (Linux 7.0.0-rc7+, Debian glibc 2.42-14) and
-   run in place. Captured in `evidence/vm_xpf_userspace_fw0.txt`:
+2. `evidence/vdso_probe2.c` — checks `getauxval(AT_SYSINFO_EHDR)` is
+   non-zero and that one `clock_gettime(CLOCK_MONOTONIC)` call succeeds
+   (the probe itself does NOT dump `/proc/self/maps` — see its header
+   comment). Pushed as a static binary to the deploy VM
+   `xpf-userspace-fw0` (Linux 7.0.0-rc7+, Debian glibc 2.42-14) and run in
+   place, alongside a manual `grep vdso /proc/self/maps` cross-check.
+   Captured in `evidence/vm_xpf_userspace_fw0.txt`:
 
    ```text
    AT_SYSINFO_EHDR = 0x7fa6efce0000

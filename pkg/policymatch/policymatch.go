@@ -627,6 +627,21 @@ type Result struct {
 	ContentRejected         bool
 	ContentRejectionReasons []string
 
+	// UnsupportedTupleFamily is true when the query carries an
+	// IPv4-source / IPv6-destination tuple (codex-182 A10-b02-C1). The
+	// forwarding path never produces that tuple — NAT46 is not supported, so
+	// no inbound translation yields a v4 source with a v6 destination — and the
+	// runtime matcher fails it closed (userspace-dp/src/policy.rs try_match_rule
+	// rejects the (V4 src, V6 dst) arm). The reverse V6-source / V4-destination
+	// tuple IS valid (it is the NAT64 arm) and is evaluated normally. Before
+	// this gate the simulator evaluated the two address sides independently and
+	// could return a concrete permit/deny/default verdict for a packet shape
+	// the runtime can never see. When set, Matched / DefaultUsed /
+	// HostInboundUnmatched / ContentRejected are all false and Action is the
+	// conservative PolicyDeny for a raw reader; DisplayAction renders the
+	// dedicated UnsupportedTupleFamilyActionString.
+	UnsupportedTupleFamily bool
+
 	// HostInboundUnmatched is true ONLY for a `to-zone junos-host` query that
 	// matched no host-bound policy (#3285). The dataplane host gate
 	// (evaluate_junos_host_policy) returns None here — no security *policy*
@@ -903,6 +918,8 @@ const ContentRejectedShowLine = "policy content rejected: the dataplane fails th
 //   - concrete policy match -> "<action>"
 func (r Result) DisplayAction() string {
 	switch {
+	case r.UnsupportedTupleFamily:
+		return UnsupportedTupleFamilyActionString
 	case r.ContentRejected:
 		return ContentRejectedActionString
 	case r.HostInboundUnmatched:
@@ -913,6 +930,13 @@ func (r Result) DisplayAction() string {
 		return ActionString(r.Action)
 	}
 }
+
+// UnsupportedTupleFamilyActionString is the operator-facing verdict rendered
+// for a query whose source is IPv4 and destination is IPv6 (codex-182
+// A10-b02-C1). NAT46 is not supported, so no forwarding path ever produces this
+// tuple and the runtime matcher fails it closed; the simulator reports that
+// rather than a fabricated per-side verdict.
+const UnsupportedTupleFamilyActionString = "unsupported tuple: an IPv4 source with an IPv6 destination has no supported translation (NAT46 is not implemented), so the forwarding path never produces it and the runtime matcher fails closed — no simulated permit/deny/default verdict applies"
 
 // Match runs the simulator against the active config and returns the verdict
 // with the SAME precedence the runtime enforces (userspace-dp/src/policy.rs
@@ -931,6 +955,45 @@ func (r Result) DisplayAction() string {
 // path (matchJunosHost, #3285): exact ingress->junos-host then
 // `from-zone any`->junos-host, with NO global/default transit fallback.
 func Match(cfg *config.Config, q Query) (res Result) {
+	// codex-182 A10-b02-C1: an IPv4 source with an IPv6 destination is a tuple
+	// the forwarding path never produces — NAT46 is unsupported, so no inbound
+	// translation yields a v4 source with a v6 destination — and the runtime
+	// matcher fails it closed (userspace-dp/src/policy.rs try_match_rule rejects
+	// the (V4 src, V6 dst) arm). matchAddr evaluates the two address sides
+	// INDEPENDENTLY below, so without this gate the simulator could return a
+	// concrete permit/deny/default verdict for a packet shape the runtime can
+	// never see. Reject it up front — this single shared entry point serves
+	// every transport (CLI, REST, gRPC MatchPolicies), so the fix covers all
+	// three. Both sides must be specified; the reverse (V6 src, V4 dst) NAT64
+	// arm and every same-family tuple fall through unchanged. Family is read
+	// with To4() to match the ipFamily helper the host-inbound path already
+	// uses.
+	//
+	// KNOWN LIMITATION (#5720 codex, tracked in #6377): To4() FOLDS an
+	// IPv4-mapped IPv6 literal — net.ParseIP("::ffff:192.0.2.1").To4() is
+	// NON-nil — so a source authored as `::ffff:192.0.2.1` is classified V4
+	// here and this gate FALSELY flags `::ffff:192.0.2.1 -> 2001:db8::1` as an
+	// unsupported (V4 src, V6 dst) tuple, even though the colon-strict runtime
+	// matcher (userspace-dp/src/policy.rs) sees a same-family V6/V6 tuple that
+	// should fall through and be evaluated normally. This is the documented
+	// Go/Rust family-parity trap (config.NATAddrFamily / natAddrFamily in
+	// pkg/config/compiler_nat_helpers.go: family is keyed on the presence of a
+	// ':' in the ORIGINAL text, which net.ParseIP has already discarded here).
+	// A colon-strict fix cannot be made at this gate from q.SrcIP/q.DstIP
+	// alone: all four Query builders (cli_request_testcmd.go, cli_show_
+	// security.go, server_show_firewall.go, server_cluster.go) parse with
+	// net.ParseIP, which renders `192.0.2.1` and `::ffff:192.0.2.1` byte-
+	// identical 16-byte values — the ':' signal is gone. The correct fix
+	// threads the colon-strict text family (config.NATAddrFamily on the raw
+	// srcIP/dstIP strings) from each caller into Query; that API change is out
+	// of scope for the #5720 tooling cohort and is filed as a follow-up. In
+	// practice an operator authoring a mapped-IPv6 source at these diagnostic
+	// surfaces is rare, and the failure mode is a spurious "unsupported tuple"
+	// advisory (fail-safe: it never hides or fabricates a permit), not a
+	// dataplane effect.
+	if q.SrcIP != nil && q.DstIP != nil && q.SrcIP.To4() != nil && q.DstIP.To4() == nil {
+		return Result{UnsupportedTupleFamily: true, Action: config.PolicyDeny}
+	}
 	// #4373 (E4/H2/H7): a TRANSIT destination that is multicast / broadcast /
 	// unspecified / loopback is dropped by the forwarding path at ROUTE LOOKUP,
 	// before the policy engine runs, so any permit/deny verdict below (and a
