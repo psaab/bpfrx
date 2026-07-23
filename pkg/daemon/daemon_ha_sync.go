@@ -1067,7 +1067,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// #5079: size the owner-side transfer-out lease above the requester's
 			// worst-case post-ACK commit latency — the local commit-ready settle
 			// window (localFailoverCommitTimeout) plus the commit round-trip — so
-			// a legitimate slow commit never trips it. The cluster floors it.
+			// a legitimate slow commit never trips it. The cluster floors it. The
+			// upstream 20s failover-ACK cap (failoverAckTimeout, sync.go) bounds
+			// the actuation-barrier contribution: if the owner takes longer than
+			// 20s to ack, the requester times out and sends NO commit, so a large
+			// failoverActuateTimeout cannot delay a real commit past this lease.
 			d.cluster.SetRemoteTransferOutLeaseDuration(2*d.localFailoverCommitTimeout + 20*time.Second)
 			d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
 			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)

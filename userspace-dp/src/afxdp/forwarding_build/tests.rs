@@ -2288,6 +2288,159 @@ fn build_forwarding_state_enables_tx_selection_when_cos_interfaces_exist() {
     assert!(state.tx_selection_enabled_v6);
 }
 
+/// #6236 PR-2A parent-RED: a counter-only OUTPUT filter (no CoS interface, no
+/// input filter, no `then forwarding-class`/`dscp`, no terminal action) MUST
+/// still enable the family-wide TX gate, because `Filter::needs_tx_eval()`
+/// covers `then count`. The rewritten gate reads the `has_output_needs_tx_eval_*`
+/// aggregate = `values().any(needs_tx_eval)` over the FINAL output fast map.
+///
+/// Drop `has_counter_terms` from `Filter::needs_tx_eval()` and this fails RED:
+/// the aggregate clears, the gate disables, and this counter-only filter's
+/// `then count` would silently stop being enforced on the TX path. It also pins
+/// that the new single aggregate subsumes the OLD two-clause gate — the old
+/// `has_output_tx_selection_v4` clause is `false` here (counter-only), so only
+/// the `needs_tx_eval` superset keeps the gate armed.
+#[test]
+fn build_forwarding_state_enables_tx_selection_for_counter_only_output_filter() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 7,
+            filter_output_v4: "wan-count".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-count".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "tally".into(),
+                action: "accept".into(),
+                count: "wan-bytes".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+    // affects_tx_selection is false (no forwarding-class / dscp-rewrite), so the
+    // OLD has_output_tx_selection clause does NOT arm the gate — only the
+    // needs_tx_eval superset (which covers `then count`) does.
+    assert!(
+        !state.filter_state.has_output_tx_selection_v4,
+        "counter-only filter does not affect tx-selection"
+    );
+    assert!(
+        state.filter_state.has_output_needs_tx_eval_v4,
+        "counter-only output filter needs a TX-path walk"
+    );
+    assert!(
+        state.tx_selection_enabled_v4,
+        "global TX gate must stay armed for a counter-only output filter"
+    );
+    // v6 has no output filter → the gate stays disabled (no fail-open on the
+    // other family).
+    assert!(!state.tx_selection_enabled_v6);
+}
+
+/// #6236 PR-2A equivalence: on a NORMAL (unique-ifindex) compiled state the new
+/// `has_output_needs_tx_eval_*` aggregate is bit-equivalent to the OLD two-clause
+/// gate it replaces — `has_output_tx_selection_* OR !needs_tx_eval-set.is_empty()`.
+/// The `iface_filter_out_*_needs_tx_eval` sets still exist in PR-2A, so this
+/// asserts the replacement is behavior-preserving across a mix of output-filter
+/// shapes (tx-selection, counter-only, terminal-only, and plain accept).
+#[test]
+fn has_output_needs_tx_eval_matches_old_two_clause_gate() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                ifindex: 10,
+                filter_output_v4: "cos".into(),
+                filter_output_v6: "count6".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                ifindex: 11,
+                filter_output_v4: "deny".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                ifindex: 12,
+                filter_output_v4: "plain".into(),
+                filter_output_v6: "plain6".into(),
+                ..Default::default()
+            },
+        ],
+        filters: vec![
+            FirewallFilterSnapshot {
+                name: "cos".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "mark".into(),
+                    action: "accept".into(),
+                    forwarding_class: "expedited".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "count6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "tally".into(),
+                    action: "accept".into(),
+                    count: "c6".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "deny".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "drop".into(),
+                    action: "discard".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "plain".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "ok".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "plain6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "ok".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+
+    let fs = build_forwarding_state(&snapshot).filter_state;
+    let old_gate_v4 =
+        fs.has_output_tx_selection_v4 || !fs.iface_filter_out_v4_needs_tx_eval.is_empty();
+    let old_gate_v6 =
+        fs.has_output_tx_selection_v6 || !fs.iface_filter_out_v6_needs_tx_eval.is_empty();
+    assert_eq!(
+        fs.has_output_needs_tx_eval_v4, old_gate_v4,
+        "new v4 aggregate must equal the old two-clause gate"
+    );
+    assert_eq!(
+        fs.has_output_needs_tx_eval_v6, old_gate_v6,
+        "new v6 aggregate must equal the old two-clause gate"
+    );
+    // Sanity: the mix actually exercises a true aggregate on both families
+    // (a tx-selection filter on v4, a counter-only filter on v6).
+    assert!(fs.has_output_needs_tx_eval_v4);
+    assert!(fs.has_output_needs_tx_eval_v6);
+}
+
 /// #3075 fail-on-revert: a stable name-hash zone id > 255 (the common case) MUST
 /// be admitted to the forwarding zone table now that the event-stream wire is
 /// u16 — the former >u8::MAX skip is retired. Restoring that skip drops the zone

@@ -2336,6 +2336,129 @@ fn accept_only_output_filter_does_not_need_tx_eval() {
     assert!(!filter_state_has_output_tx_selection(&state, false));
 }
 
+/// #6236 PR-2A parent-RED anchor: a `then count`-only OUTPUT filter (no
+/// forwarding-class / dscp-rewrite, no terminal action, no log, no policer)
+/// still needs a TX-path walk. This binds `Filter::needs_tx_eval()` — the SOLE
+/// five-flag predicate — to (a) the compiler set-insert (via the
+/// `interface_output_filter_needs_tx_eval` accessor), and (b) the
+/// `has_output_needs_tx_eval_v4` aggregate recomputed from the final fast map.
+/// Dropping `has_counter_terms` from `Filter::needs_tx_eval()` fails all of them
+/// RED. It also pins `needs_tx_eval ⊋ affects_tx_selection` (the old
+/// `has_output_tx_selection` clause stays false).
+#[test]
+fn counter_only_output_filter_needs_tx_eval_and_sets_aggregate() {
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth0.80".into(),
+        ifindex: 7,
+        filter_output_v4: "wan-count".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "wan-count".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "tally".into(),
+                action: "accept".into(),
+                count: "wan-bytes".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+
+    let filter = state
+        .iface_filter_out_v4_fast
+        .get(&7)
+        .expect("output filter present in fast map");
+    assert!(filter.needs_tx_eval(), "counter-only filter needs a TX walk");
+    assert!(
+        !filter.affects_tx_selection,
+        "counter is not a tx-selection action"
+    );
+    // Accessor reads the set, which the compiler populates via needs_tx_eval().
+    assert!(interface_output_filter_needs_tx_eval(&state, 7, false));
+    // Aggregate recomputed from the FINAL output fast map.
+    assert!(state.has_output_needs_tx_eval_v4);
+    // needs_tx_eval strictly supersets affects_tx_selection.
+    assert!(!state.has_output_tx_selection_v4);
+}
+
+/// #6236 PR-2A blocker-#1 pin: a duplicate ifindex where a needs-tx-eval output
+/// filter is followed by a plain-accept one at the SAME ifindex+family+direction.
+/// The fast map overwrites last-wins (holds the SECOND, plain filter); the
+/// `has_output_needs_tx_eval_v4` aggregate — recomputed from the FINAL map, NOT
+/// accumulated in-loop — therefore reads FALSE, agreeing with the filter the hot
+/// path actually evaluates. The monotonic `iface_filter_out_v4_needs_tx_eval`
+/// set still carries the stale ifindex (union kept the first); this documents
+/// exactly the §5.1 divergence the recompute closes. The snapshot still compiles
+/// Ok (last-wins canonical, NOT reject-fail-closed).
+#[test]
+fn duplicate_ifindex_output_filter_aggregate_is_last_wins() {
+    let ifaces = vec![
+        crate::InterfaceSnapshot {
+            name: "reth0.80".into(),
+            ifindex: 7,
+            filter_output_v4: "wan-count".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "reth0.80-dup".into(),
+            ifindex: 7,
+            filter_output_v4: "plain".into(),
+            ..Default::default()
+        },
+    ];
+    let state = parse_filter_state(
+        &[
+            FirewallFilterSnapshot {
+                name: "wan-count".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "tally".into(),
+                    action: "accept".into(),
+                    count: "wan-bytes".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "plain".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "ok".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("duplicate ifindex is accepted (last-wins canonical, not rejected)");
+
+    // (a) last-wins: the fast map holds the SECOND (plain) filter.
+    assert_eq!(
+        state.iface_filter_out_v4_fast.get(&7).map(|f| f.name.as_str()),
+        Some("plain")
+    );
+    // (b) the recomputed aggregate follows the final map (plain → false), NOT the
+    // stale union.
+    assert!(
+        !state.has_output_needs_tx_eval_v4,
+        "aggregate must derive from the final last-wins filter"
+    );
+    // (c) the monotonic set still carries the stale ifindex — this is the exact
+    // divergence the recompute fixes at the aggregate level (PR-2B deletes the
+    // set and migrates the accessor).
+    assert!(state.iface_filter_out_v4_needs_tx_eval.contains(&7));
+}
+
 #[test]
 fn interface_filter_routing_instance_counted_returns_matching_override() {
     let ifaces = vec![crate::InterfaceSnapshot {

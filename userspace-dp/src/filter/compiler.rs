@@ -158,12 +158,11 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         if !iface.filter_input_v4.is_empty() {
             let key = qualify_filter_key("inet", &iface.filter_input_v4);
             if let Some(filter) = state.filters.get(&key) {
-                if filter.affects_tx_selection {
-                    state.has_input_tx_selection_v4 = true;
-                }
-                if filter.has_three_color_policer_terms {
-                    state.has_input_three_color_policer_v4 = true;
-                }
+                // #6236 PR-2A: the family-wide aggregates
+                // (has_input_tx_selection_v4 / has_input_three_color_policer_v4)
+                // are recomputed from the FINAL fast map after this loop so a
+                // duplicate-ifindex last-wins overwrite cannot strand a
+                // stale-true aggregate. Do not OR them in here.
                 if filter.affects_route_lookup {
                     state
                         .iface_filter_v4_affects_route_lookup
@@ -196,18 +195,14 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         if !iface.filter_output_v4.is_empty() {
             let key = qualify_filter_key("inet", &iface.filter_output_v4);
             if let Some(filter) = state.filters.get(&key) {
-                if filter.affects_tx_selection
-                    || filter.has_counter_terms
-                    || filter.has_log_terms
-                    || filter.has_terminal_action_terms
-                    || filter.has_three_color_policer_terms
-                {
+                // #6236 PR-2A: the set-insert predicate is now the sole
+                // Filter::needs_tx_eval() definition (was an inline five-flag OR).
+                // has_output_tx_selection_v4 / has_output_needs_tx_eval_v4 are
+                // recomputed from the FINAL fast map after this loop.
+                if filter.needs_tx_eval() {
                     state
                         .iface_filter_out_v4_needs_tx_eval
                         .insert(iface.ifindex);
-                }
-                if filter.affects_tx_selection {
-                    state.has_output_tx_selection_v4 = true;
                 }
                 state
                     .iface_filter_out_v4_fast
@@ -227,12 +222,8 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         if !iface.filter_input_v6.is_empty() {
             let key = qualify_filter_key("inet6", &iface.filter_input_v6);
             if let Some(filter) = state.filters.get(&key) {
-                if filter.affects_tx_selection {
-                    state.has_input_tx_selection_v6 = true;
-                }
-                if filter.has_three_color_policer_terms {
-                    state.has_input_three_color_policer_v6 = true;
-                }
+                // #6236 PR-2A: aggregates recomputed from the FINAL fast map
+                // after this loop (see the inet input block above).
                 if filter.affects_route_lookup {
                     state
                         .iface_filter_v6_affects_route_lookup
@@ -262,18 +253,12 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         if !iface.filter_output_v6.is_empty() {
             let key = qualify_filter_key("inet6", &iface.filter_output_v6);
             if let Some(filter) = state.filters.get(&key) {
-                if filter.affects_tx_selection
-                    || filter.has_counter_terms
-                    || filter.has_log_terms
-                    || filter.has_terminal_action_terms
-                    || filter.has_three_color_policer_terms
-                {
+                // #6236 PR-2A: sole Filter::needs_tx_eval() predicate; aggregates
+                // recomputed from the FINAL fast map after this loop.
+                if filter.needs_tx_eval() {
                     state
                         .iface_filter_out_v6_needs_tx_eval
                         .insert(iface.ifindex);
-                }
-                if filter.affects_tx_selection {
-                    state.has_output_tx_selection_v6 = true;
                 }
                 state
                     .iface_filter_out_v6_fast
@@ -289,6 +274,49 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
             }
         }
     }
+
+    // #6236 PR-2A: recompute the family-wide aggregates from the FINAL fast
+    // maps, NOT monotonically inside the loop above. The fast maps overwrite
+    // last-wins on a duplicate ifindex, so a positive filter followed by a
+    // non-sensitive filter at the same ifindex must NOT leave a stale-true
+    // aggregate. Deriving every aggregate from `values().any(..)` over the final
+    // map makes it agree with the filter the hot path actually evaluates (the
+    // last-wins entry). For the common unique-ifindex case this is bit-identical
+    // to the old in-loop OR. `has_output_needs_tx_eval_*` is the new aggregate
+    // that subsumes both `has_output_tx_selection_*` and the
+    // `iface_filter_out_*_needs_tx_eval` set non-emptiness for the global gate.
+    state.has_input_tx_selection_v4 = state
+        .iface_filter_v4_fast
+        .values()
+        .any(|f| f.affects_tx_selection);
+    state.has_input_tx_selection_v6 = state
+        .iface_filter_v6_fast
+        .values()
+        .any(|f| f.affects_tx_selection);
+    state.has_input_three_color_policer_v4 = state
+        .iface_filter_v4_fast
+        .values()
+        .any(|f| f.has_three_color_policer_terms);
+    state.has_input_three_color_policer_v6 = state
+        .iface_filter_v6_fast
+        .values()
+        .any(|f| f.has_three_color_policer_terms);
+    state.has_output_tx_selection_v4 = state
+        .iface_filter_out_v4_fast
+        .values()
+        .any(|f| f.affects_tx_selection);
+    state.has_output_tx_selection_v6 = state
+        .iface_filter_out_v6_fast
+        .values()
+        .any(|f| f.affects_tx_selection);
+    state.has_output_needs_tx_eval_v4 = state
+        .iface_filter_out_v4_fast
+        .values()
+        .any(|f| f.needs_tx_eval());
+    state.has_output_needs_tx_eval_v6 = state
+        .iface_filter_out_v6_fast
+        .values()
+        .any(|f| f.needs_tx_eval());
 
     // #6236 PR-1: the qualified lo0 keys are compiler intermediates only — they
     // exist solely to look up lo0_filter_v*_fast and were never read on the
