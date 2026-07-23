@@ -186,15 +186,24 @@ func (t *ConfigTree) FormatPathSet(path []string) string {
 	if len(matches) == 0 {
 		return ""
 	}
-	// Compute parent prefix: path elements before the matched node's first key.
-	var parentPrefix []string
-	firstKey := matches[0].Keys[0]
-	for _, p := range path {
-		if p == firstKey {
-			break
-		}
-		parentPrefix = append(parentPrefix, p)
+	// Compute the parent prefix: the path elements BEFORE the matched terminal
+	// node's keys. navigatePath consumed the trailing tokens of `path` into the
+	// terminal node, so strip the node's keys from the RIGHT. The pre-#5717 code
+	// searched for the node's first key from the LEFT and stopped at its FIRST
+	// occurrence, so an ANCESTOR argument equal to that key (e.g. a security zone
+	// NAMED "interfaces" holding an `interfaces` stanza) truncated the prefix and
+	// emitted a malformed, non-round-trippable set line that dropped the ancestor
+	// token (codex-182 A3-b00-C001, #5717). Shrink k until the path suffix aligns
+	// with the node's leading keys to tolerate a partial multi-key terminal match.
+	mk := matches[0].Keys
+	k := len(mk)
+	if k > len(path) {
+		k = len(path)
 	}
+	for k > 0 && !keysEqual(path[len(path)-k:], mk[:k]) {
+		k--
+	}
+	parentPrefix := append([]string(nil), path[:len(path)-k]...)
 	var b strings.Builder
 	for _, n := range matches {
 		prefix := append(append([]string{}, parentPrefix...), n.Keys...)

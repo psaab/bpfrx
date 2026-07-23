@@ -880,6 +880,25 @@ display-set round-trip, policy match `source-address`, block-shape
 `system-services` member toggle, single-value-leaf and keyed-entry
 non-regression).
 
+**Scoped display-set parent prefix: strip the terminal node's keys from the
+RIGHT, not the first-key match from the LEFT (#5717).** `FormatPathSet`
+(`ast_format.go`, the `show configuration <path> | display set` renderer)
+reconstructs the leading prefix for each emitted `set` line by removing the
+matched terminal node's keys from the scoped path. It previously searched the
+path left-to-right for the FIRST token equal to the matched node's first key and
+stopped there, so an ANCESTOR argument equal to that key truncated the prefix and
+dropped the ancestor token — a security zone NAMED `interfaces` holding an
+`interfaces` stanza rendered `set security zones security-zone interfaces
+ge-0/0/9.0` (one `interfaces` missing), a malformed line that reloads as a
+different object. `navigatePath` consumes the trailing path tokens into the
+terminal node, so the fix strips the node's keys from the RIGHT (suffix-aligned
+to tolerate a partial multi-key terminal match), keeping every ancestor token.
+This is the display-side twin of the copy-side #5822 fix (`CopyPath` first-keyword
+`insertNode`); both are the codex-182 A3-b00-C001 AST path-identity cohort.
+Covered by `pkg/config/ast_format_pathset_ancestor_5717_test.go` (zone-named-
+`interfaces` round-trip + policy-named-`then` prefix; fail-on-revert restores the
+left-search truncation).
+
 **Rename-side contract: resolve the SPECIFIC named sibling by full identity
 (#3982).** `rename <old> to <new>` (`RenamePath`, `ast_edit.go`) is the same
 read-all-siblings class as the delete/deactivate fixes above, but on a
