@@ -85,6 +85,17 @@ use cos::{
 mod loop_body;
 pub(crate) use loop_body::worker_loop;
 
+// #6241: typed worker-launch bundles that replace the 38-parameter
+// positional `worker_loop` protocol. Grouped named fields (constructed
+// via `from_coord` / `new` builders) eliminate the positional
+// silent-swap hazard; `worker_loop` destructures them back into the
+// same locals at entry, so the hot loop body is unchanged.
+mod launch;
+pub(crate) use launch::{
+    WorkerControlChannels, WorkerCoSState, WorkerLaunchPlan, WorkerNeighbors,
+    WorkerPublishedTelemetry, WorkerSharedDataplane, WorkerSharedSessions,
+};
+
 // #956 Phase 4-5: explicit imports for items that moved out of tx.rs into
 // cos/token_bucket.rs (Phase 4) and cos/queue_ops.rs (Phase 5). Without
 // this, neither the local `use super::*;` glob nor afxdp.rs's

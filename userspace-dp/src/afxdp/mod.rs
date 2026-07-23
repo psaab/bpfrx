@@ -539,8 +539,9 @@ pub(in crate::afxdp) use self::coordinator::{
     WARM_GC_INTERVAL_NS, WARM_GC_MAX_AGE_NS, WARM_PER_KEY_RATE_LIMIT_NS, WARM_QUEUE_DEPTH,
 };
 pub(crate) use self::worker::{
-    BindingLiveSnapshot, BindingWorker, SyncedSessionEntry, XskBindMode, fabric_queue_hash,
-    push_recent_exception, push_recent_session_delta, worker_loop,
+    BindingLiveSnapshot, BindingWorker, SyncedSessionEntry, WorkerControlChannels, WorkerCoSState,
+    WorkerLaunchPlan, WorkerPublishedTelemetry, WorkerSharedDataplane, XskBindMode,
+    fabric_queue_hash, push_recent_exception, push_recent_session_delta, worker_loop,
 };
 #[cfg(test)]
 pub(crate) use self::worker::fabric_queue_hash_seeded;

@@ -1,3 +1,52 @@
+## 2026-07-22 — #6241: typed worker-launch bundles (replace 38-arg positional worker_loop)
+
+- **Timestamp**: 2026-07-22 (refactor/6241-typed-launch-bundles)
+- **Action**: Behavior-preserving (Refactor class A) launch-protocol
+  refactor. Replaced the 38-parameter POSITIONAL `worker_loop` launch
+  protocol with 5 top-level typed bundles + 2 nested (7 structs) in a new
+  `worker/launch.rs`: `WorkerLaunchPlan` (worker_id, binding_plans,
+  poll_mode, dnat_fds), `WorkerSharedDataplane` (validation, forwarding,
+  ha_state, local_tunnel_deliveries, fabrics, mirror_targets, rg_epochs,
+  slow_path + nested `WorkerNeighbors`{dynamic,resolver} + nested
+  `WorkerSharedSessions`{synced,nat,forward_wire,owner_rg_indexes}),
+  `WorkerControlChannels` (commands, peer_worker_commands,
+  worker_commands_by_id, stop, heartbeat, session_export_ack, event_stream,
+  startup_report_tx), `WorkerCoSState` (the 6 CoS scheduler ArcSwaps), and
+  `WorkerPublishedTelemetry` (recent_exceptions, recent_session_deltas,
+  last_resolution, cos_status, runtime_atomics, cold_path_atomics). All 38
+  params map 1:1 into exactly one field (4+14+8+6+6=38). `worker_loop` now
+  takes the 5 bundles and destructures them at ENTRY into the EXACT same
+  locals used before, so `worker_loop_setup` and the steady 10K–100K-tick/s
+  loop body are TEXTUALLY UNCHANGED (git diff = single hunk in the
+  signature/destructure region; loop body byte-identical). The production
+  spawn closure in `bring_up_workers` builds the bundles via named builders
+  — `WorkerSharedDataplane::from_coord` / `WorkerCoSState::from_coord`
+  (coordinator-published state) and the `::new` builders (per-worker fresh
+  slots) — NOT inline struct literals, so a same-typed source swap
+  (`synced`↔`nat`, `heartbeat`↔`session_export_ack`) is caught by
+  `Arc::ptr_eq` wiring tests that call the SAME builders. ZERO added
+  clone/alloc/indirection on the launch path (bundles moved in, one
+  `Arc::clone` per field exactly as the old inline call), and nothing
+  bundle-shaped survives into the hot loop (#1776 constraint). Bundle
+  fields + builders scoped `pub(in crate::afxdp)` (structs stay pub(crate)
+  for the worker_loop signature) — removes the 15 pre-existing
+  private_interfaces warnings that sat on `worker_loop`, net −15 clippy
+  warnings vs master; the (38/7) too_many_arguments finding is also gone;
+  no NEW clippy findings. #6242 lifecycle contract documented (not
+  integrated) on `WorkerPublishedTelemetry.recent_exceptions` +
+  `.last_resolution`: they are the Arcs #6242's future runtime record will
+  own — integrate, don't re-allocate. Validation: `cargo build --release`
+  clean; full `cargo test --release --test-threads=1` GREEN (incl.
+  #4952/#5143/#6245 launch-path readiness/spawn tests + 4 new launch wiring
+  tests); fail-on-revert proven (synced↔nat swap → wiring test RED at
+  launch.rs, restore → green).
+- **File(s)**: userspace-dp/src/afxdp/worker/launch.rs (new),
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/worker/README.md,
+  userspace-dp/src/afxdp/coordinator/README.md
+
 ## 2026-07-22 — #6261: outline rare ARP/NDP learn/program off the pre-cache RX stage
 
 - **Timestamp**: 2026-07-22 (refactor/6261-outline-arp-ndp)

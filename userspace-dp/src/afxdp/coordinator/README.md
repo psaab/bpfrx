@@ -14,7 +14,7 @@ the workers share.
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | `Coordinator` struct + worker-spawn + reconcile entry. |
+| `mod.rs` | `Coordinator` struct + worker-spawn + reconcile entry. The per-worker spawn closure (in `reconcile/bringup.rs`) launches `worker_loop` via 5 typed bundles (#6241): `WorkerSharedDataplane::from_coord` / `WorkerCoSState::from_coord` clone the coordinator-published shared state, and the `::new` builders carry the per-worker fresh slots — behavior-preserving, no extra clone/alloc vs. the old positional call. |
 | `bpf_maps.rs` | `BpfMaps` — pinned BPF map FDs (XSK map, heartbeat, session, conntrack v4/v6) opened once and shared with every worker. |
 | `cos_leases.rs` | CoS runtime-map plumbing: `refresh_cos_owner_worker_map_*` / `refresh_cos_runtime_maps` (diff-and-store of the `SharedCoSState` Arcs) plus the owner-by-queue / active-shard / root- and queue-lease / exact-backlog / vtime-floor builders with their Arc-reuse match predicates, and the #710 cross-worker status aggregation used by `status.rs`. (#1890 split.) |
 | `cos_state.rs` | `SharedCoSState` — Arcs that workers consult to find owner-by-queue, live owner, root/queue leases, vtime floors. |
@@ -82,6 +82,23 @@ Differences that matter (#1881):
 
 ## Notable invariants
 
+- **The worker launch boundary is 5 typed bundles, constructed via named
+  builders — not a positional arg list (#6241).** The `bring_up_workers`
+  spawn closure (`reconcile/bringup.rs`) builds `WorkerLaunchPlan`,
+  `WorkerSharedDataplane`, `WorkerControlChannels`, `WorkerCoSState`, and
+  `WorkerPublishedTelemetry` (defined in `worker/launch.rs`) and moves them
+  into `worker_loop`, which destructures them back into the same locals at
+  entry. Construct them ONLY via `WorkerSharedDataplane::from_coord` /
+  `WorkerCoSState::from_coord` (coordinator-published state) and the `::new`
+  builders (per-worker fresh slots) — NOT inline struct literals — so the
+  `Arc::ptr_eq` wiring tests in `worker/launch.rs` bind the exact
+  session-map (`synced`/`nat`/`forward_wire`) and heartbeat/export-ack
+  silent-swap hazards the old 38-parameter positional protocol carried.
+  Behavior-preserving: one `Arc::clone` per field, exactly as the old
+  inline call did. `recent_exceptions` / `last_resolution` also register in
+  `worker_exception_rings` / `worker_last_resolution` and carry a #6242
+  lifecycle contract (see `worker/launch.rs`) — the two Arcs #6242's future
+  per-worker runtime record will own; integrate, don't re-allocate.
 - **Reconcile progress + failure identity are a TYPED value, not a free-form
   string (#6244).** `Coordinator::last_reconcile_stage` is a
   `ReconcileStage` enum (`reconcile/stage.rs`) — one variant per progress
