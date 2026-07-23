@@ -1805,7 +1805,14 @@ rather than silently dropped:
 - disjunction (`|`, e.g. `"ack | rst"`) — not a single required/forbidden pair;
 - a negated parenthesized group (`!(...)`) — a disjunction by De Morgan;
 - an unrecognized flag token;
-- a flag that is both required and forbidden (the term could never match).
+- a flag that is both required and forbidden (the term could never match);
+- an operator-only / empty-operand / dangling-`&` or dangling-`!` expression
+  that sets no flag bits (`"&"`, `"()"`, `"syn &"`, `"syn & !"`) — it would
+  otherwise match every TCP segment (#4714/#5455, fail-open);
+- an unbalanced or reversed parenthesis (`"(syn"`, `"syn)"`, `"syn)("`) — the
+  grouping parens are redundant, so before C180-024 they were stripped
+  unconditionally and a malformed value committed as if they were absent.
+  Balanced groups, including nested ones (`"((syn & !ack))"`), stay accepted.
 
 This is the #3076 fix: before it, the schema accepted any `tcp-flags` token
 (the leaf is `multi: true` with no value validator) and the snapshot builder's

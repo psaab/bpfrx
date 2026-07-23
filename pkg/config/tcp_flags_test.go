@@ -212,6 +212,74 @@ func TestParseTCPFlagsOperatorOnly(t *testing.T) {
 	}
 }
 
+// TestParseTCPFlagsUnbalancedParens is the C180-024 RED-on-revert guard. The
+// grouping parentheses in a tcp-flags expression are redundant (they only wrap
+// a pure conjunction), so the parser previously stripped every '(' and ')'
+// unconditionally — an unbalanced or reversed paren ("(syn", "syn)", "syn)(")
+// committed as if the paren were absent, e.g. "(syn" became plain "syn". The
+// flag bits still parse so the packet mask is not widened, but a malformed
+// grammar committing silently is auditability debt. Reverting the parenDepth
+// tracking in ParseTCPFlagsExpression makes these inputs parse cleanly and the
+// wantErr assertions below FAIL.
+//
+// Distinct from #3076 (a NEGATED group "!(...)" is a De Morgan disjunction) and
+// #5455 (an EMPTY group "()" sets no flag bits): those reject on other grounds.
+// This guard is specifically the balance/order of the parens themselves.
+func TestParseTCPFlagsUnbalancedParens(t *testing.T) {
+	// Unbalanced / reversed parens → error naming the imbalance (fail-closed).
+	reject := []struct {
+		name string
+		in   []string
+	}{
+		{"open-only", []string{"(syn"}},
+		{"close-only", []string{"syn)"}},
+		{"reversed-pair", []string{"syn)("}},
+		{"leading-close", []string{")syn"}},
+		{"reversed-empty", []string{")("}},
+		{"extra-close", []string{"(syn) ack)"}},
+		{"extra-open", []string{"((syn & !ack)"}},
+		{"nested-open-only", []string{"((syn"}},
+	}
+	for _, r := range reject {
+		t.Run("reject/"+r.name, func(t *testing.T) {
+			req, forb, ok, err := ParseTCPFlagsExpression(r.in)
+			if err == nil {
+				t.Fatalf("ParseTCPFlagsExpression(%v): expected unbalanced-parenthesis error, got req=0x%02x forb=0x%02x ok=%v",
+					r.in, req, forb, ok)
+			}
+			if ok {
+				t.Errorf("ParseTCPFlagsExpression(%v): ok must be false on error, got true", r.in)
+			}
+		})
+	}
+
+	// Over-rejection guard: BALANCED groups — including nested ones — must still
+	// parse to the SAME masks. The fix must not reject legitimate grouping.
+	valid := []struct {
+		name      string
+		in        []string
+		required  uint8
+		forbidden uint8
+	}{
+		{"paren-conjunction", []string{"(syn & ack)"}, 0x12, 0},
+		{"paren-syn-not-ack", []string{"(syn & !ack)"}, 0x02, 0x10},
+		{"nested-balanced", []string{"((syn & !ack))"}, 0x02, 0x10},
+		{"paren-single", []string{"(syn)"}, 0x02, 0},
+	}
+	for _, v := range valid {
+		t.Run("accept/"+v.name, func(t *testing.T) {
+			req, forb, ok, err := ParseTCPFlagsExpression(v.in)
+			if err != nil {
+				t.Fatalf("ParseTCPFlagsExpression(%v): unexpected error (over-rejection): %v", v.in, err)
+			}
+			if !ok || req != v.required || forb != v.forbidden {
+				t.Errorf("ParseTCPFlagsExpression(%v) = (req=0x%02x, forb=0x%02x, ok=%v), want (req=0x%02x, forb=0x%02x, ok=true)",
+					v.in, req, forb, ok, v.required, v.forbidden)
+			}
+		})
+	}
+}
+
 // TestFirewallFilterTCPFlagsCommitReject is the #3076 commit-layer guard. A
 // firewall filter carrying a tcp-flags expression the dataplane cannot enforce
 // (here a disjunction) MUST fail to compile rather than commit with the
@@ -262,5 +330,10 @@ func TestFirewallFilterTCPFlagsCommitReject(t *testing.T) {
 	}
 	if _, err := build("syn &"); err == nil {
 		t.Error("tcp-flags \"syn &\" (trailing '&') should be rejected at commit (fail-closed), but compiled")
+	}
+	// C180-024: an unbalanced parenthesis must be rejected at commit rather
+	// than committing as if the paren were absent (strict-grammar hardening).
+	if _, err := build("(syn"); err == nil {
+		t.Error("tcp-flags \"(syn\" (unbalanced paren) should be rejected at commit (fail-closed), but compiled")
 	}
 }

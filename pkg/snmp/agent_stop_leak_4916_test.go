@@ -116,3 +116,66 @@ func TestStop_StopsTrapWorkerNoPostDelivery(t *testing.T) {
 		t.Fatalf("a post-Stop enqueue was delivered: delivered = %d, want 1", got)
 	}
 }
+
+// TestStop_CountsAbandonedTrapBacklog is the C180-026 RED-on-revert guard. When
+// Stop() abandons the queued trap backlog (#4916 safety: no post-Stop
+// delivery), those discarded traps MUST be accounted for in trapsDropped —
+// otherwise the drop total under-reports, claiming zero drops while link-state
+// traps are silently discarded during SNMP disable / target rotation /
+// shutdown. RED on revert: remove the countAbandonedTraps drain (and the
+// dequeued-but-unsent Add(1)) from trapWorker and the worker returns on stop
+// without counting, so trapsDropped stays 0 and the assertion below FAILS.
+func TestStop_CountsAbandonedTrapBacklog(t *testing.T) {
+	const total = 8 // 1 delivered in-flight + 7 abandoned in the queue buffer
+	var calls, delivered atomic.Int64
+	entered := make(chan struct{}, 64)
+	release := make(chan struct{})
+	sender := func(target string, pkt []byte) error {
+		n := calls.Add(1)
+		entered <- struct{}{}
+		if n == 1 {
+			<-release // hold the first send so the rest of the backlog buffers
+		}
+		delivered.Add(1)
+		return nil
+	}
+
+	a := &Agent{startTime: time.Now(), trapSender: sender}
+	if got := a.trapsDropped.Load(); got != 0 {
+		t.Fatalf("fresh agent trapsDropped = %d, want 0", got)
+	}
+	// Enqueue the backlog: the worker dequeues job #1 and blocks in the sender;
+	// the remaining total-1 jobs sit buffered behind it (queue depth is 256, so
+	// none are dropped queue-full here).
+	for i := 0; i < total; i++ {
+		a.enqueueTrap(trapJob{target: "192.0.2.9:162", pkt: []byte{1}})
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("trap worker never entered the sender")
+	}
+
+	stopped := make(chan struct{})
+	go func() { a.Stop(); close(stopped) }()
+	time.Sleep(50 * time.Millisecond) // let Stop set stopped + close trapStop
+	close(release)
+
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return — the trap worker leaked")
+	}
+
+	// Exactly one trap was delivered (the in-flight send); every other queued
+	// trap was abandoned AND counted. Accepted == delivered + dropped == total,
+	// so no queued trap is silently lost from the accounting.
+	if got := delivered.Load(); got != 1 {
+		t.Fatalf("delivered = %d, want exactly 1 (only the in-flight send may complete)", got)
+	}
+	if got := a.trapsDropped.Load(); got != total-1 {
+		t.Fatalf("trapsDropped = %d, want %d — the abandoned trap backlog was not counted on Stop (C180-026)",
+			got, total-1)
+	}
+}

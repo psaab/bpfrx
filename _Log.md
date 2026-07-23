@@ -58190,3 +58190,42 @@ top.
     pkg/grpcapi/server_sessions.go,
     pkg/grpcapi/pagination_canonical_5649_test.go, cmd/cli/main.go,
     cmd/cli/confirm_pending_bounded_5649_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Triage cohort #5583 (codex-review-180 low-materiality +
+    doc-drift survivors, 4 items) against origin/master f5a3da609. FIXED the
+    two REAL + INDEPENDENT + LOW-RISK + in-Go-scope items in one PR; DEFERRED
+    the two Rust items to the userspace-dp/dataplane owner.
+    C180-024 (pkg/config/tcp_flags.go): the TCP-flags grammar discarded
+    unbalanced/reversed parentheses — `case "(", ")"` only errored on a
+    negated group, otherwise `continue`d with no balance tracking, so "(syn",
+    "syn)", "syn)(" all committed as plain "syn" (verified live: req=0x02
+    ok=true). The redundant grouping parens were stripped unconditionally.
+    Added parenDepth tracking: reject a ')' at depth 0 (unbalanced/reversed
+    close) and a nonzero depth after the last token (unclosed group); balanced
+    and nested-balanced groups ("((syn & !ack))") stay accepted. The packet
+    mask is not widened (the flag bits still parse), so this is strict-grammar/
+    auditability hardening, not an admission bypass. Both consumers
+    (pkg/dataplane/userspace/filters.go, pkg/daemon/daemon_nft.go) already fail
+    CLOSED on a parse error, and the commit-layer strict validator
+    (compiler_validate_strict_filter.go) now rejects the malformed value at
+    commit — consistent with #3076/#3367 fail-closed discipline.
+    C180-026 (pkg/snmp/traps.go + agent.go): shutdown-abandoned trap jobs were
+    omitted from trapsDropped. On Stop() the worker returned on `<-stop`
+    without counting the buffered backlog; trapsDropped counted only queue-full
+    and post-Stop-enqueue drops, so a shutdown that discarded queued link-state
+    traps reported zero drops. Added countAbandonedTraps: the worker (sole queue
+    reader) counts every dequeued-but-unsent job plus every buffered job into
+    trapsDropped exactly once before exiting, so accepted == delivered +
+    trapsDropped. Safety (#4916 no-post-Stop-delivery) is unchanged.
+    DEFER (Rust / userspace-dp — dataplane owner): C180-021 (docs/afxdp-packet-
+    processing.md item 7 documents the userspace-xdp shim non-SYN contract —
+    a dataplane doc, not Go control-plane), C180-023 (userspace-dp/src/nat/
+    destination.rs malformed-prefix host fallback). C180-022 already dropped in
+    the cohort (dup of open #4971). No HA/cluster/vrrp/failover code touched.
+    build + vet + gofmt clean; full `go test ./pkg/config` (14.5s) and
+    `go test -race ./pkg/snmp` (17.5s) GREEN. RED-on-revert verified for both
+    fixes (stash the production file, new tests FAIL).
+  - **File(s)**: pkg/config/tcp_flags.go, pkg/config/tcp_flags_test.go,
+    pkg/snmp/traps.go, pkg/snmp/agent_stop_leak_4916_test.go,
+    pkg/snmp/README.md, docs/config-schema.md, _Log.md

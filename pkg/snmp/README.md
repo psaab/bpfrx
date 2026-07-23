@@ -359,6 +359,15 @@ worker. Without this, each disable/re-enable cycle leaked a goroutine pair and
 the trap worker could keep sending a stale backlog with the old community to
 the old target.
 
+The abandoned backlog is ACCOUNTED for, not silently discarded (C180-026): on
+stop the worker (the sole queue reader) counts every dequeued-but-unsent job
+plus every job still buffered in the queue into `trapsDropped` exactly once via
+`countAbandonedTraps`, so `accepted == delivered + trapsDropped` and the drop
+total covers shutdown-abandoned link-state traps — not just queue-full and
+post-Stop-enqueue drops. Before this, `trapsDropped` reported zero for a
+shutdown that discarded a queued backlog. Fail-on-revert guard:
+`TestStop_CountsAbandonedTrapBacklog`.
+
 The reconcile runs **early** in `applyConfigLocked` — before the dataplane
 apply, which can abort the reconcile pipeline early (it returns on
 `ErrPolicySchedulerProtocolIncompatible`). `Store.Commit()` has already

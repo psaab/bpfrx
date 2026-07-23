@@ -59,6 +59,12 @@ var tcpFlagBits = map[string]uint8{
 //     otherwise return "no constraint" (or silently drop the dangling '&') and
 //     the term would match EVERY TCP segment (#5455, fail-open widening of a
 //     security filter); reject it so a malformed value never commits
+//   - an unbalanced or reversed parenthesis (e.g. "(syn", "syn)", "syn)(") —
+//     a ')' with no matching '(' or a '(' left unclosed. The parens are
+//     redundant grouping only, so without balance tracking they were stripped
+//     unconditionally and the malformed value committed as if the parens were
+//     absent (C180-024); reject it so the grammar is auditable. Balanced
+//     groups, including nested ones ("((syn & !ack))"), remain accepted.
 //
 // An input that carries no flag at all (empty / whitespace only) returns
 // ok=false with no error: the caller leaves the wire field nil, i.e. no
@@ -107,6 +113,15 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 	// with no flag operand — reject it so the malformed value never commits and
 	// silently matches all TCP (#5455, fail-open).
 	segHasFlag := false
+	// parenDepth tracks the balance of grouping parentheses. A ')' reached at
+	// depth 0 is an unbalanced or reversed close (e.g. "syn)", "syn)("); a
+	// nonzero depth after the last token is an unclosed group (e.g. "(syn").
+	// Without this tracking the parser stripped every paren unconditionally and
+	// committed "(syn", "syn)", "syn)(" as plain "syn" — strict-grammar debt
+	// that admits malformed values (C180-024). The packet mask is not widened
+	// (the flag bits still parse), so this is auditability/grammar hardening,
+	// not an admission bypass.
+	parenDepth := 0
 	for _, t := range toks {
 		switch t {
 		case "&":
@@ -133,11 +148,30 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 		case "!":
 			pendingNeg = !pendingNeg
 			continue
-		case "(", ")":
+		case "(":
+			// A '!' immediately before '(' is a negated group ("!(...)"), a
+			// disjunction by De Morgan's law that the conjunctive matcher cannot
+			// enforce — reject it (#3076).
 			if pendingNeg {
 				return 0, 0, false, fmt.Errorf(
 					"tcp-flags %q: a negated group is a disjunction (De Morgan) and is not representable by the firewall dataplane", expr)
 			}
+			parenDepth++
+			continue
+		case ")":
+			// A '!' immediately before ')' has no flag operand — dangling
+			// negation (e.g. "syn & !)"); reject it (#4714, fail-open).
+			if pendingNeg {
+				return 0, 0, false, fmt.Errorf(
+					"tcp-flags %q: dangling negation \"!\" with no flag operand", expr)
+			}
+			// A ')' at depth 0 has no matching '(' — an unbalanced or reversed
+			// close (e.g. "syn)", "syn)(") — reject it (C180-024).
+			if parenDepth == 0 {
+				return 0, 0, false, fmt.Errorf(
+					"tcp-flags %q: unbalanced parenthesis: \")\" with no matching \"(\"", expr)
+			}
+			parenDepth--
 			continue
 		}
 		bit, found := tcpFlagBits[strings.ToLower(t)]
@@ -160,6 +194,16 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 	if pendingNeg {
 		return 0, 0, false, fmt.Errorf(
 			"tcp-flags %q: dangling negation \"!\" with no flag operand", expr)
+	}
+
+	// A nonzero paren depth after the last token is an unclosed group (e.g.
+	// "(syn", "((syn)"). Without this the trailing '(' was silently stripped
+	// and the malformed value committed (C180-024). Balanced groups —
+	// including nested ones like "((syn & !ack))" — leave depth at 0 and are
+	// still accepted.
+	if parenDepth != 0 {
+		return 0, 0, false, fmt.Errorf(
+			"tcp-flags %q: unbalanced parenthesis: %d unclosed \"(\"", expr, parenDepth)
 	}
 
 	// The final '&'-delimited segment must also carry a flag operand. A segment
