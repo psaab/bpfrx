@@ -57342,6 +57342,40 @@ top.
     userspace-dp/src/filter/engine/cache_sensitive/rotation.rs (new),
     userspace-dp/src/filter/README.md
 
+- **Timestamp**: 2026-07-22 21:12
+  - **Action**: #6238 narrow two-helper split — single-source the
+    source-independent screens shared by the flow-present
+    (`check_packet_with_zone_id_opts`) and flowless
+    (`check_flowless_screens_opts`) paths, which previously hand-mirrored
+    them (the #3902 fail-open class). Rejected the issue's literal contiguous
+    `check_source_independent` mega-helper (Claude SMR + Codex both concurred):
+    on the full path `check_tcp_flag_screens` is INTERPOSED between LAND and
+    the fragment tail, so a contiguous LAND→source-route helper would flip the
+    per-reason drop-counter ordinal (`screen_reason_drop_index`) for a
+    multi-trigger packet. Instead extracted (a) the already-contiguous stateless
+    tail `stateless::check_fragment_and_route` (ping-of-death → teardrop →
+    icmp-fragment → source-route), called at the SAME slot on both paths, and
+    (b) the ICMP/UDP flood block as a private `ZoneScreenState`
+    method `enforce_common_rate_floods`, inserted right after each path's fabric
+    `skip_rate_flood` gate with `pkt.dst_port` passed UNCHANGED so the #4567
+    zero-port fold stays inside `udp_flood_drop`. LAND (unconditional full /
+    `addrs_known`-gated flowless), TCP-flag screens, SYN-flood/cookie, and the
+    fabric skip stay per-path by necessity. Full-path SYN scalars still copied
+    before the rate mutation (no lengthened #4969 disjoint borrow); one
+    `zones.get_mut` per path preserved. Byte-identical drop precedence on both
+    paths. Tests: 3 multi-trigger precedence tests (LAND+SYN-FIN → land-attack;
+    SYN-FIN+LSRR → tcp-syn-fin; flowless addrs_unknown skips LAND but runs the
+    tail + floods) + 2 fail-on-revert binding tests (neutralizing the flowless
+    `check_fragment_and_route` call turned the flowless binding test — and the
+    other flowless source-route tests through that site — RED while the full
+    binding test stayed GREEN; the path-specific asymmetry proves both paths
+    route through the one shared helper — proof shown, then restored). cargo build
+    --release + clippy clean (sole error = pre-existing mut_from_ref in untouched
+    umem/mmap.rs:150). Full cargo test --release --test-threads=1 GREEN.
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/screen/stateless.rs, userspace-dp/src/screen/tests.rs,
+    userspace-dp/src/FEATURES.md
+
 - **Timestamp**: 2026-07-22
 - **Action**: #6289 — two LOW robustness follow-ups in test/xsk-repro (from the
     #4906 xsk-repro safety cohort hostile review). Neither is a firewall clobber

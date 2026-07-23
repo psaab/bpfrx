@@ -260,3 +260,50 @@ pub(super) fn check_source_route(
     }
     None
 }
+
+/// #6238: the ALREADY-CONTIGUOUS common stateless tail shared by the
+/// flow-present (`check_packet_with_zone_id_opts`) and flowless
+/// (`check_flowless_screens_opts`) paths: ping-of-death → teardrop →
+/// icmp-fragment → source-route, in the exact order and with the exact
+/// reason strings both paths already run them.
+///
+/// Extracting this run single-sources the fragment/source-route family so a
+/// future addition covers BOTH entry points by construction — the fail-open
+/// class that bit #3902 (the flowless path once ran only the three fragment
+/// screens and BYPASSED source-route + LAND + the flood counters). Because
+/// the four checks were already adjacent, identically ordered, and identically
+/// guarded on both paths, this extraction is behavior-preserving by
+/// construction: it reorders nothing.
+///
+/// Deliberately does NOT include:
+///   - **LAND** — it is `addrs_known`-gated on the flowless path and
+///     UNCONDITIONAL on the full path, and on the full path it runs BEFORE the
+///     TCP-flag screens. Folding it in would either drop the flowless guard or
+///     reorder it across the TCP-flag screens (an observable drop-reason /
+///     per-reason-counter flip). LAND stays a per-call at each site.
+///   - **TCP-flag screens** (`check_tcp_flag_screens`) — full-path only, and
+///     INTERPOSED between LAND and this tail. They stay in place immediately
+///     before this helper on the full path.
+///
+/// Side-effect-free: reads only `&profile` / `&pkt`, mutates nothing,
+/// allocates nothing. `#[inline]` so LLVM folds the bodies back into each
+/// caller exactly as the pre-#6238 open-coded run did.
+#[inline]
+pub(super) fn check_fragment_and_route(
+    profile: &ScreenProfile,
+    pkt: &ScreenPacketInfo,
+) -> Option<&'static str> {
+    if let Some(reason) = check_ping_of_death(profile, pkt) {
+        return Some(reason);
+    }
+    if let Some(reason) = check_teardrop(profile, pkt) {
+        return Some(reason);
+    }
+    if let Some(reason) = check_icmp_fragment(profile, pkt) {
+        return Some(reason);
+    }
+    if let Some(reason) = check_source_route(profile, pkt) {
+        return Some(reason);
+    }
+    None
+}
