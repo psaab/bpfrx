@@ -132,10 +132,14 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 // Apply SKIP the whole server (it registers NONE of its feeds, including any
 // nested feed-name entries). The endpoint-less server still compiles into
 // SecurityConfig.DynamicAddress.FeedServers, so its feed names are
-// syntactically "declared", but at runtime no feed exists: an address-name
-// bound to one resolves to an empty (match-nothing) address book and a
-// feed-backed deny policy silently denies nothing — the same #3300 fail-open
-// symptom one layer up, at the feed-server root rather than the binding.
+// syntactically "declared", but at runtime no feed exists: the address-name
+// bound to one is UNRESOLVABLE and fails CLOSED (#5645: omitted -> the policy
+// lowering treats it as unrepresentable -> __unsupported_address__ -> the
+// userspace snapshot preflight rejects the whole publication -> previous-good /
+// fresh-boot default-deny). Historically this was the #3300 fail-open symptom
+// one layer up (silent match-none for a deny); #5645 makes the runtime fail
+// closed, and this gate still turns the silent default-deny into an
+// operator-visible commit error at the feed-server root rather than the binding.
 //
 // This gate replicates resolveBaseURL's emptiness condition directly on the
 // FeedServer config struct (feedServerBaseURLEmpty) rather than importing
@@ -149,9 +153,11 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 // warning (opts.lenientDynamicAddressFeedRef, shared with the feed-name
 // cross-reference gate) so an already-persisted or peer-synced config carrying
 // an endpoint-less server still boots — the runtime already drops the server
-// (registers no feed), so any bound address-name is fail-closed match-none
-// rather than bricking the load (#1960 / #3261 class). Commit / commit-check
-// stay strict. Mirrors validateLogProfileStreamReferencesStrict.
+// (registers no feed), so any bound address-name is unresolvable and fails
+// CLOSED (#5645: omitted -> __unsupported_address__ -> whole-snapshot preflight
+// reject -> previous-good/default-deny) rather than bricking the load (#1960 /
+// #3261 class). Commit / commit-check stay strict. Mirrors
+// validateLogProfileStreamReferencesStrict.
 func validateDynamicAddressFeedServerEndpointStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
@@ -179,8 +185,11 @@ func validateDynamicAddressFeedServerEndpointStrict(cfg *Config) error {
 			}
 			return fmt.Errorf("security dynamic-address feed-server %q resolves "+
 				"to an empty endpoint (no url or hostname, or a slash-only url) "+
-				"so it registers no feeds — any address-name bound to it "+
-				"silently matches nothing; set a valid url or hostname",
+				"so it registers no feeds — any address-name bound to it is "+
+				"unresolvable and fails CLOSED at runtime (omitted -> "+
+				"__unsupported_address__ -> whole-snapshot preflight reject -> "+
+				"previous-good/default-deny, #5645), not silently match-none; "+
+				"set a valid url or hostname",
 				display)
 		}
 		// #5183: a NON-empty but MALFORMED base url (e.g. `http://%`, a
@@ -195,8 +204,10 @@ func validateDynamicAddressFeedServerEndpointStrict(cfg *Config) error {
 		// runtime uses so a garbage endpoint is operator-visible at commit
 		// instead of silently non-functional. Tolerant load / peer-sync
 		// downgrades to a warning via the shared lenient wrapper at the call
-		// site (the runtime is already fail-closed match-none for the dead
-		// feed, so a leniently-loaded config still boots — #1960 / #3261).
+		// site (the runtime is already fail-closed for the dead feed — #5645:
+		// the bound name is omitted -> __unsupported_address__ -> whole-snapshot
+		// preflight reject -> previous-good/default-deny — so a leniently-loaded
+		// config still boots, #1960 / #3261).
 		if reason := feedServerBaseURLUnconstructible(feedServerResolvedBaseURL(fs)); reason != "" {
 			display := fs.Name
 			if display == "" {
@@ -210,7 +221,9 @@ func validateDynamicAddressFeedServerEndpointStrict(cfg *Config) error {
 			return fmt.Errorf("security dynamic-address feed-server %q base url "+
 				"%q is malformed (%s) — http.NewRequestWithContext fails before "+
 				"any fetch, so it registers no feeds and any address-name bound "+
-				"to it silently matches nothing; set a valid http(s) url or hostname",
+				"to it is unresolvable and fails CLOSED at runtime (omitted -> "+
+				"__unsupported_address__ -> whole-snapshot preflight reject, "+
+				"#5645), not silently match-none; set a valid http(s) url or hostname",
 				display, RedactURL(feedServerResolvedBaseURL(fs)), reason)
 		}
 	}
@@ -472,10 +485,14 @@ func validateDynamicAddressFeedReferencesStrict(cfg *Config) error {
 				continue
 			}
 			return fmt.Errorf("security dynamic-address address-name %q "+
-				"profile references undefined feed-name %q (the binding would "+
-				"resolve to an empty address set — a feed-backed policy would "+
-				"silently match nothing; declare the feed under a "+
-				"dynamic-address feed-server or fix the feed-name)", ab.Name, fn)
+				"profile references undefined feed-name %q (the binding is "+
+				"unresolvable, so at runtime it is OMITTED and lowers to the "+
+				"__unsupported_address__ sentinel; the userspace snapshot "+
+				"preflight then REJECTS the whole publication and the dataplane "+
+				"retains previous-good or fresh-boot default-deny — the "+
+				"feed-backed policy fails CLOSED, it does NOT silently match "+
+				"nothing (#5645); declare the feed under a dynamic-address "+
+				"feed-server or fix the feed-name)", ab.Name, fn)
 		}
 	}
 	return nil

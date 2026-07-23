@@ -1360,15 +1360,17 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 
 	// #3300 residual: an endpoint-less dynamic-address feed-server (no url
 	// AND no hostname) is SKIPPED by feeds.Manager.Apply (resolveBaseURL ==
-	// "" registers none of its feeds), so an address-name bound to it
-	// resolves to an empty match-nothing book and a feed-backed deny policy
-	// silently denies nothing — the #3300 symptom at the feed-server root.
-	// Reject it so the runtime-nonfunctional config fails at commit. This
-	// must run BEFORE the feed-name cross-reference gate below so the
-	// declared-feed set the latter trusts is exact (no skipped servers in
-	// it). Strict on commit / commit-check; lenient on load / peer-sync
-	// (warn — the runtime already drops the server, so a bound address-name
-	// is fail-closed rather than bricking the load — #1960 / #3261).
+	// "" registers none of its feeds), so an address-name bound to it is
+	// unresolvable and fails CLOSED at runtime (#5645: omitted ->
+	// __unsupported_address__ -> whole-snapshot preflight reject ->
+	// previous-good/default-deny) — historically the #3300 fail-open symptom
+	// at the feed-server root, now caught. Reject it so the
+	// runtime-nonfunctional config fails at commit instead of silently
+	// default-denying. This must run BEFORE the feed-name cross-reference gate
+	// below so the declared-feed set the latter trusts is exact (no skipped
+	// servers in it). Strict on commit / commit-check; lenient on load /
+	// peer-sync (warn — the runtime already drops the server, so a bound
+	// address-name is fail-closed rather than bricking the load — #1960 / #3261).
 	if err := validateDynamicAddressFeedServerEndpointStrict(cfg); err != nil {
 		if opts.lenientDynamicAddressFeedRef {
 			cfg.Warnings = append(cfg.Warnings,
@@ -1398,16 +1400,16 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 
 	// #3300 dynamic-address feed cross-reference gate. A
 	// `security dynamic-address address-name <addr> profile feed-name <feed>`
-	// whose feed-name resolves to no declared feed-server feed records an
-	// empty (match-nothing) address book at runtime, so a feed-backed deny
-	// policy silently denies nothing with no commit error — a typo is
-	// indistinguishable from a not-yet-fetched feed. Strict on commit /
-	// commit-check (hard reject so the typo is operator-visible); lenient on
-	// load / peer-sync (warn so an already-persisted or peer-synced config
-	// still boots — #1960 / #3261; the runtime stays fail-closed match-none
-	// for the unknown feed). Runs on the fully-compiled *Config so the
-	// feed-server map is populated regardless of authoring order. Mirrors
-	// validateLogProfileStreamReferencesStrict.
+	// whose feed-name resolves to no declared feed-server feed is UNRESOLVABLE
+	// at runtime and fails CLOSED (#5645: omitted -> __unsupported_address__ ->
+	// whole-snapshot preflight reject -> previous-good/default-deny), with no
+	// commit error — a typo is indistinguishable from a not-yet-fetched feed.
+	// Strict on commit / commit-check (hard reject so the typo is
+	// operator-visible); lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 / #3261; the
+	// runtime stays fail-closed for the unknown feed). Runs on the
+	// fully-compiled *Config so the feed-server map is populated regardless of
+	// authoring order. Mirrors validateLogProfileStreamReferencesStrict.
 	if err := validateDynamicAddressFeedReferencesStrict(cfg); err != nil {
 		if opts.lenientDynamicAddressFeedRef {
 			cfg.Warnings = append(cfg.Warnings,
