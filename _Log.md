@@ -57908,3 +57908,23 @@ top.
   **File(s)**: pkg/grpcapi/server_nat.go,
     pkg/grpcapi/server_nat_selector_5719_test.go, pkg/api/server.go,
     pkg/api/tls_san_5719_test.go, pkg/api/README.md
+- **Timestamp**: 2026-07-23
+  **Action**: #5719 PR #6373 fold — hardened the cert-SAN fix per reviewer
+    convergence (rev + Codex). FOLD-1: guard the kernel hostname before
+    placing it in DNSNames (`isDNSSANSafeHostname`) — a non-ASCII hostname
+    (e.g. "café") HARD-FAILS x509.CreateCertificate (IA5String), which under
+    the #5058 all-or-nothing management-server lifecycle would tear down the
+    whole HTTP+HTTPS server; it now degrades to loopback-only SANs. FOLD-2:
+    an IP-literal hostname goes to IPAddresses via net.ParseIP, not DNSNames
+    (a DNS SAN of an IP never verifies as an IP). localhost + 127.0.0.1/::1
+    are ALWAYS present. Added a `tlsHostname` seam so tests drive the branches
+    deterministically. FOLD-3: strengthened tls_san_5719_test.go — asserts the
+    hostname SAN for a valid hostname, non-ASCII/control-char/empty degrade to
+    loopback without aborting cert-gen, IP-literal lands in IP SANs; plus a
+    direct isDNSSANSafeHostname unit table. DOC: corrected pkg/api/README.md to
+    state accurately that this covers loopback + local hostname/localhost only,
+    and marked the mgmt-interface-IP SAN + host-name-change re-mint as tracked
+    #5719 C001 residuals. RED-on-revert verified per fold. go test
+    ./pkg/api/... ./pkg/grpcapi/... green; vet + gofmt clean.
+  **File(s)**: pkg/api/server.go, pkg/api/tls_san_5719_test.go,
+    pkg/api/tls_test.go, pkg/api/README.md

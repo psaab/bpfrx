@@ -328,16 +328,34 @@ under the daemon's errgroup. Nothing else imports this package.
     entry point.
   - The auto-generated HTTPS cert (`generateSelfSignedCertAt`, used when no
     operator cert is provisioned) carries Subject Alternative Names, not just a
-    CommonName (#5719, codex-review-182 C-API TLS hygiene): the DNS SANs
-    `hostname` + `localhost` and the loopback IP SANs `127.0.0.1` / `::1`.
-    Every modern TLS client (Go's own client since 1.15, browsers, curl)
-    rejects a SAN-less cert for hostname verification, so a CN-only cert broke
-    `curl https://localhost:8443` / health probes even though the bind
-    succeeded. An already-persisted SAN-less cert is NOT auto-regenerated — the
-    #1916 D6 durable-cert contract keeps the on-disk pair stable so remote
-    clients' TOFU pins survive a power loss; only freshly generated certs gain
-    SANs (delete `cert.pem`/`key.pem` to force a regenerate). Pinned by
-    `tls_san_5719_test.go`, fail-on-revert.
+    CommonName (#5719, codex-review-182 C-API TLS hygiene). Every modern TLS
+    client (Go's own client since 1.15, browsers, curl) rejects a SAN-less
+    cert for hostname verification, so a CN-only cert broke `curl
+    https://localhost:8443` / health probes even though the bind succeeded.
+    What the SANs cover, precisely:
+    - **Always present:** the loopback IP SANs `127.0.0.1` / `::1` and the DNS
+      SAN `localhost` — so a **loopback-bound** HTTPS API (the default) always
+      verifies. These can never fail to encode.
+    - **Best-effort:** the kernel hostname. A valid ASCII hostname is added as
+      a DNS SAN; an IP-literal hostname is added to the IP SANs (a DNS SAN of
+      an IP never verifies as an IP). A **non-ASCII / malformed** hostname
+      (e.g. a `café` kernel hostname) is DROPPED, not appended — x509 marshals
+      DNS SANs as an IA5String and HARD-FAILS on non-ASCII, which under the
+      #5058 all-or-nothing management-server lifecycle would abort cert
+      generation and tear down the entire HTTP+HTTPS server. The cert degrades
+      to loopback-only SANs (`isDNSSANSafeHostname` guard) instead of failing.
+    - **NOT covered (tracked #5719 C001 residual):** the configured
+      management-interface IP is not added to the SANs, so
+      remote-verification-by-mgmt-IP (`https://<mgmt-ip>:8443` with strict
+      verification) is out of scope here; and a later host-name change does
+      NOT re-mint the cert. Both need the resolved bind address threaded into
+      cert generation and a mint-ordering fix — deferred.
+    An already-persisted SAN-less cert is NOT auto-regenerated — the #1916 D6
+    durable-cert contract keeps the on-disk pair stable so remote clients' TOFU
+    pins survive a power loss; only freshly generated certs gain SANs (delete
+    `cert.pem`/`key.pem` to force a regenerate). Pinned by
+    `tls_san_5719_test.go` (SAN presence, hostname classification, and the
+    non-ASCII no-abort guard), fail-on-revert.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during
