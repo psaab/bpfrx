@@ -406,15 +406,30 @@ source-NAT / NAT64 analog.
 NPTv6 / NAT64 gates) rejects the overlap at commit. It enumerates one allocator
 "owner" per the exact keys the helper uses — one per DISTINCT source-NAT
 pool a pool-mode `then source-nat pool` rule references, and one per DISTINCT
-`(prefix, source-pool)` a `nat64 rule-set` references (unreferenced pools build
-no allocator and are out of scope, mirroring the #5877 aggregate gate). Each
-owner's members (`pool.Address` + `pool.Addresses`, ranges already expanded to
-/32s) become family-scoped numeric intervals — v4 vs v6 bucketed by the
-colon-strict textual family (`natAddrFamily(natCIDRIPPart(...))`, the Go/Rust
-parity rule, so an IPv4-mapped IPv6 literal never compares against a real v4
-member) — and an O(n log n) sort-and-sweep per family reports the first
-overlapping pair. Two members of the SAME owner is a within-pool
-duplicate/overlap; two owners is the cross-pool / cross-feature collision.
+`(canonical prefix, source-pool)` a `nat64 rule-set` references (unreferenced
+pools build no allocator and are out of scope, mirroring the #5877 aggregate
+gate). The NAT64 prefix is folded to its canonical masked form
+(`canonicalNAT64PrefixKey` → `netip.ParsePrefix(...).Masked()`) before keying,
+matching the Rust `nat64.rs` canonical-bytes first-match: two rule-sets naming
+one pool under the SAME /96 in different valid spellings (`64:ff9b::/96` vs
+`0064:ff9b:0:0:0:0:0:0/96`) are ONE runtime allocator, so keying on raw text
+would FALSELY reject them. Each owner's members (`pool.Address` +
+`pool.Addresses`, ranges already expanded to /32s) become family-scoped numeric
+intervals — v4 vs v6 bucketed by the colon-strict textual family
+(`natAddrFamily(natCIDRIPPart(...))`, the Go/Rust parity rule, so an IPv4-mapped
+IPv6 literal never compares against a real v4 member) — and an O(n log n)
+sort-and-sweep per family reports the first overlapping pair. Two members of the
+SAME owner is a within-pool duplicate/overlap; two owners is the cross-pool /
+cross-feature collision.
+
+The gate is ALSO carried in the #5876 peer-effective source-NAT view
+(`validateSourceNATStrictView`, `compiler_peer_effective_snat.go`): a
+`${node}`/groups rewrite whose PEER resolution produces an overlapping pool set
+while the origin's is disjoint would otherwise commit green on the origin and let
+the standby lenient-load the vulnerable independent allocators — the same
+divergent-commit fail-open #5876 closes for the other source-NAT gates. Run
+strict there (`lenient=false`), it rejects the node1-only overlap at a node0
+commit.
 
 This is the commit-time DETECTION half of #5144 (material choice **S1**: reject
 independently-owned overlap). It does NOT introduce the deferred packet-path
@@ -429,9 +444,14 @@ so the latent reverse-index collision persists until corrected and the warning
 says so. Covered by `pkg/config/compiler_nat_pool_overlap_5144_test.go`
 (exact-duplicate / partial-overlap / source-NAT-vs-source-NAT /
 source-NAT-vs-NAT64 same-and-distinct-pool / NAT64-different-prefix /
-within-pool-duplicate / IPv6 reject cases, plus distinct-pool / shared-pool /
-cross-family / same-prefix-dedup / unreferenced accept guards), RED on revert of
-the gate (the overlap is accepted). The shipped `test/incus/xpf-test.conf` and
+within-pool-duplicate / IPv6-overlap / IPv6-nesting / IPv6-bare-vs-/128 reject
+cases; a peer-only-`${node}`-overlap reject through the #5876 peer gate; plus
+distinct-pool / shared-pool / cross-family / same-prefix-dedup /
+NAT64-equivalent-prefix-spelling / adjacent-v4 / adjacent-v6 /
+mapped-v6-vs-genuine-v4 / unreferenced accept guards), RED on revert of the gate
+(the overlap is accepted) — and separately RED on revert of the canonical NAT64
+key (equivalent spellings wrongly rejected) and of the peer-view wiring (node0
+accepts the peer-only overlap). The shipped `test/incus/xpf-test.conf` and
 `test/incus/xpf-cluster-fw0.conf` each carried the cross-feature overlap (one
 pool drawn by both NAT64 and a source-NAT rule) and were separated into distinct
 pools + proxy-ARP as part of this change.

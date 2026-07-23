@@ -263,3 +263,161 @@ func TestNAT5144UnreferencedOverlapAccepted(t *testing.T) {
 	}
 	assertNATOverlapAccepted(t, cmds...)
 }
+
+// --- MEDIUM (#6414 fold): NAT64 prefix keyed on CANONICAL bytes, not raw text ---
+
+// TestNAT5144NAT64EquivalentPrefixSpellingAccepted: two NAT64 rule-sets naming
+// the SAME pool under the SAME /96 prefix in DIFFERENT valid spellings resolve to
+// ONE runtime allocator (the Rust nat64.rs canonical-bytes first-match), so they
+// must NOT false-positive. Before the canonical-key fix the raw-text key treated
+// the two spellings as two owners with identical members → wrongly rejected.
+func TestNAT5144NAT64EquivalentPrefixSpellingAccepted(t *testing.T) {
+	cmds := []string{
+		"set security nat source pool P address 100.64.0.7/32",
+		"set security nat nat64 rule-set A prefix 64:ff9b::/96",
+		"set security nat nat64 rule-set A source-pool P",
+		// Same /96 network, expanded (non-canonical) spelling — same canonical
+		// bytes, so the same allocator.
+		"set security nat nat64 rule-set B prefix 0064:ff9b:0:0:0:0:0:0/96",
+		"set security nat nat64 rule-set B source-pool P",
+	}
+	assertNATOverlapAccepted(t, cmds...)
+}
+
+// --- MAJOR (#6414 fold): peer-effective strict view must run the overlap gate ---
+
+// TestNAT5144PeerOnlyOverlapRejectedAtOriginCommit: a `${node}`/groups config
+// whose node0 resolution has DISJOINT pools but whose node1 resolution has
+// OVERLAPPING pools. node0's local compile is clean (green commit today), yet the
+// peer-effective gate run at a node0 commit
+// (ValidatePeerEffectiveSourceNATStrict(tree, 0)) must REJECT the node1-only
+// overlap — else the standby lenient-loads the vulnerable independent allocators
+// (the #5876 divergent-commit fail-open, for the #5144 collision).
+//
+// FAIL-ON-REVERT: dropping the validateNATPoolExternalTupleOverlapStrict call from
+// validateSourceNATStrictView (compiler_peer_effective_snat.go) makes the node1
+// overlap COMMIT at a node0 commit → this REJECT assertion goes RED.
+func TestNAT5144PeerOnlyOverlapRejectedAtOriginCommit(t *testing.T) {
+	cmds := []string{
+		// Shared top-level rules reference pools A and B on BOTH nodes.
+		"set security nat source rule-set RSA from zone trust",
+		"set security nat source rule-set RSA to zone untrust",
+		"set security nat source rule-set RSA rule r1 match source-address 10.0.0.0/24",
+		"set security nat source rule-set RSA rule r1 then source-nat pool A",
+		"set security nat source rule-set RSB from zone dmz",
+		"set security nat source rule-set RSB to zone untrust",
+		"set security nat source rule-set RSB rule r1 match source-address 10.0.0.0/24",
+		"set security nat source rule-set RSB rule r1 then source-nat pool B",
+		// node0: DISJOINT addresses — its own view is clean.
+		"set groups node0 security nat source pool A address 203.0.113.5/32",
+		"set groups node0 security nat source pool B address 203.0.113.6/32",
+		// node1: OVERLAPPING (identical) addresses — the peer-only collision.
+		"set groups node1 security nat source pool A address 203.0.113.5/32",
+		"set groups node1 security nat source pool B address 203.0.113.5/32",
+		`set apply-groups "${node}"`,
+	}
+	tree := buildTreeFromSet(t, cmds)
+
+	// node0's own view is clean — this is the green commit today.
+	if _, err := CompileConfigForNode(tree, 0); err != nil {
+		t.Fatalf("node0 local compile must be clean (its pools are disjoint): %v", err)
+	}
+
+	// The peer-effective gate at a node0 commit must reject the node1-only overlap.
+	err := ValidatePeerEffectiveSourceNATStrict(tree, 0)
+	if err == nil {
+		t.Fatal("node0 commit ACCEPTED a peer-only source-NAT pool overlap (node1 view) — #5144 divergent-commit fail-open")
+	}
+	for _, want := range []string{"node1", "#5144"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("peer reject %q does not contain %q", err.Error(), want)
+		}
+	}
+
+	// Symmetric: with the overlap on node0 and disjoint on node1, a node1 commit
+	// must reject the node0-only overlap too.
+	swapped := []string{
+		"set security nat source rule-set RSA from zone trust",
+		"set security nat source rule-set RSA to zone untrust",
+		"set security nat source rule-set RSA rule r1 match source-address 10.0.0.0/24",
+		"set security nat source rule-set RSA rule r1 then source-nat pool A",
+		"set security nat source rule-set RSB from zone dmz",
+		"set security nat source rule-set RSB to zone untrust",
+		"set security nat source rule-set RSB rule r1 match source-address 10.0.0.0/24",
+		"set security nat source rule-set RSB rule r1 then source-nat pool B",
+		"set groups node0 security nat source pool A address 203.0.113.5/32",
+		"set groups node0 security nat source pool B address 203.0.113.5/32",
+		"set groups node1 security nat source pool A address 203.0.113.5/32",
+		"set groups node1 security nat source pool B address 203.0.113.6/32",
+		`set apply-groups "${node}"`,
+	}
+	if err := ValidatePeerEffectiveSourceNATStrict(buildTreeFromSet(t, swapped), 1); err == nil {
+		t.Fatal("node1 commit ACCEPTED a peer-only (node0) source-NAT pool overlap — #5144 divergent-commit fail-open")
+	}
+}
+
+// --- LOW (#6414 fold): interval-boundary coverage ---
+
+// TestNAT5144AdjacentV4RangesAccepted: two source pools whose /25s are ADJACENT
+// but disjoint ([0,127] and [128,255]) must NOT false-positive — the sweep must
+// not treat touching-but-non-overlapping ranges as overlapping.
+func TestNAT5144AdjacentV4RangesAccepted(t *testing.T) {
+	cmds := []string{
+		"set security nat source pool A address 10.0.0.0/25",
+		"set security nat source pool B address 10.0.0.128/25",
+	}
+	cmds = append(cmds, srcRule("RSA", "r1", "A")...)
+	cmds = append(cmds, srcRule("RSB", "r1", "B")...)
+	assertNATOverlapAccepted(t, cmds...)
+}
+
+// TestNAT5144IPv6NestingRejected: a v6 /120 nesting a v6 /124 across two pools
+// overlaps — proves the v6 sweep detects CIDR containment (not just exact dupes).
+func TestNAT5144IPv6NestingRejected(t *testing.T) {
+	cmds := []string{
+		"set security nat source pool A address 2001:db8::/120",
+		"set security nat source pool B address 2001:db8::/124",
+	}
+	cmds = append(cmds, srcRule("RSA", "r1", "A")...)
+	cmds = append(cmds, srcRule("RSB", "r1", "B")...)
+	assertNATOverlapRejected(t, "independent NAT allocators", cmds...)
+}
+
+// TestNAT5144IPv6AdjacentAccepted: two v6 /121 halves of a /120 are adjacent but
+// disjoint ([::00..::7f] and [::80..::ff]) — no v6 false-positive.
+func TestNAT5144IPv6AdjacentAccepted(t *testing.T) {
+	cmds := []string{
+		"set security nat source pool A address 2001:db8::/121",
+		"set security nat source pool B address 2001:db8::80/121",
+	}
+	cmds = append(cmds, srcRule("RSA", "r1", "A")...)
+	cmds = append(cmds, srcRule("RSB", "r1", "B")...)
+	assertNATOverlapAccepted(t, cmds...)
+}
+
+// TestNAT5144IPv6BareVs128DuplicateRejected: the same v6 host as a bare address
+// and a /128 across two pools is a duplicate — the v6 analog of the v4
+// bare-vs-/32 within-pool case, here cross-pool.
+func TestNAT5144IPv6BareVs128DuplicateRejected(t *testing.T) {
+	cmds := []string{
+		"set security nat source pool A address 2001:db8::5",
+		"set security nat source pool B address 2001:db8::5/128",
+	}
+	cmds = append(cmds, srcRule("RSA", "r1", "A")...)
+	cmds = append(cmds, srcRule("RSB", "r1", "B")...)
+	assertNATOverlapRejected(t, "independent NAT allocators", cmds...)
+}
+
+// TestNAT5144MappedV6VsGenuineV4Accepted: an IPv4-mapped IPv6 literal
+// (::ffff:203.0.113.5, classified v6 by the colon-strict family rule, matching
+// Rust) and the genuine v4 address 203.0.113.5 are DIFFERENT families end-to-end
+// through the real gate — they must NOT collide (the Go/Rust parity guard).
+func TestNAT5144MappedV6VsGenuineV4Accepted(t *testing.T) {
+	cmds := []string{
+		"set security nat source pool A address 203.0.113.5",
+		"set security nat source pool B address ::ffff:203.0.113.5",
+	}
+	cmds = append(cmds, srcRule("RSA", "r1", "A")...)
+	cmds = append(cmds, srcRule("RSB", "r1", "B")...)
+	assertNATOverlapAccepted(t, cmds...)
+}

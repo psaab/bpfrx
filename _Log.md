@@ -59594,3 +59594,32 @@ top.
     pkg/config/compiler_nat_source_pool_aggregate_5877_test.go,
     test/incus/xpf-test.conf, test/incus/xpf-cluster-fw0.conf,
     docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #5144 / PR #6414 — Codex MERGE-NEEDS-MAJOR fold (3 findings).
+    (MAJOR) The overlap gate was MISSING from the #5876 peer-effective strict
+    view → a node-divergent ${node} config (node0 disjoint / node1
+    overlapping) committed on node0 and the standby lenient-loaded the
+    vulnerable independent allocators. Added
+    `validateNATPoolExternalTupleOverlapStrict(cfg, false)` to
+    validateSourceNATStrictView (compiler_peer_effective_snat.go) + doc
+    contract. (MEDIUM) NAT64 owner keyed on raw prefix TEXT → false-REJECT of
+    equivalent /96 spellings (64:ff9b::/96 vs 0064:ff9b:0:0:0:0:0:0/96, same
+    pool = one Rust allocator). Added canonicalNAT64PrefixKey
+    (netip.ParsePrefix().Masked()) to key on canonical bytes like nat64.rs.
+    (LOW) Added interval-boundary tests: adjacent v4 /25s accept, IPv6
+    /120-nesting-/124 reject, IPv6 adjacent /121s accept, bare-v6-vs-/128
+    duplicate reject, mapped-v6-vs-genuine-v4 accept end-to-end. Parent-RED
+    re-verified firsthand: main-gate neutralize → 11 reject cases RED (8
+    original + 2 v6 boundary + peer) / 9 accept green; canonical-key revert →
+    equivalent-spelling accept RED; peer-view call removed → peer-overlap RED.
+    Also confirmed the Codex-reported app_catalog_test.go panic does NOT
+    reproduce on origin/master (full userspace suite clean) NOR on this branch
+    — a transient in Codex's run, not a #6414 regression; not touched.
+    Gates: build/vet/gofmt clean; full go test ./pkg/config/ + consumer
+    userspace/configstore GREEN. Doc: docs/config-schema.md #5144 subsection
+    updated (canonical key + peer-view).
+  - **File(s)**: pkg/config/compiler_peer_effective_snat.go,
+    pkg/config/compiler_validate_strict_nat.go,
+    pkg/config/compiler_nat_pool_overlap_5144_test.go,
+    docs/config-schema.md, _Log.md

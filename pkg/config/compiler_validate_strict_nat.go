@@ -2539,7 +2539,18 @@ func validateNATPoolExternalTupleOverlapStrict(cfg *Config, lenient bool) ([]str
 		if pool == nil {
 			continue
 		}
-		key := rs.Prefix + "\x00" + rs.SourcePool
+		// Dedup on the CANONICAL (prefix, pool) key the Rust nat64 allocator
+		// uses: nat64.rs canonicalizes the prefix to its 12 network bytes and
+		// first-matches those, so two rule-sets naming the SAME pool under
+		// different valid /96 spellings (`64:ff9b::/96` vs
+		// `0064:ff9b:0:0:0:0:0:0/96`) are ONE runtime allocator, not two. Keying
+		// on the raw text would treat them as separate owners and FALSELY reject
+		// an equivalent-spelling config. netip.ParsePrefix + Masked() folds the
+		// spelling to the canonical masked prefix; an unparseable prefix (only
+		// reachable on the tolerant path — the strict NAT64-prefix gate rejects
+		// it first on commit) falls back to raw text so it never crashes and a
+		// genuinely distinct malformed prefix is not silently merged.
+		key := canonicalNAT64PrefixKey(rs.Prefix) + "\x00" + rs.SourcePool
 		if nat64Seen[key] {
 			continue
 		}
@@ -2596,6 +2607,19 @@ func emitNATOverlap(lenient bool, msg string) ([]string, error) {
 			"external tuple can be misdelivered until the overlap is corrected)"}, nil
 	}
 	return nil, fmt.Errorf("%s", msg)
+}
+
+// canonicalNAT64PrefixKey folds a NAT64 `prefix` string to its canonical masked
+// form so equivalent /96 spellings dedup to one allocator identity, matching the
+// Rust nat64.rs canonical-bytes first-match. An unparseable prefix returns its
+// raw text unchanged (the strict NAT64-prefix gate rejects malformed prefixes on
+// commit before this runs; on the tolerant path a bad prefix keeps its raw key
+// rather than crashing or false-merging).
+func canonicalNAT64PrefixKey(prefix string) string {
+	if p, err := netip.ParsePrefix(prefix); err == nil {
+		return p.Masked().String()
+	}
+	return prefix
 }
 
 // poolMemberTexts returns a source pool's translated-address members: the single
