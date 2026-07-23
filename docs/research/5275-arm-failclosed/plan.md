@@ -3,9 +3,10 @@
 - **Issue:** #5275 (HIGH; bug, dataplane, security, vsrx-parity)
 - **Research branch:** `research/5275-arm-failclosed`
 - **Base:** origin/master @ `6131eb4e6`
-- **Revision:** r7 (folds Codex r5 — the last 5 blocking design-composition items +
-  2 correctness holes on the r6 contract; Codex r5 confirmed 5/8 contracts closed
-  and reaffirmed the architecture VIABLE)
+- **Revision:** r8 (folds Codex r6 — §13 resolves the last 4 transaction/HA-recovery/
+  fencing DESIGN DECISIONS with a recommended choice each; Codex r6 fully closed 3/7
+  and reaffirmed the architecture VIABLE. These four are genuine human go/no-go
+  design choices, which is precisely the `/engineer` manual-approval gate.)
 - **Prior art:** PR #6358 (draft) — MERGE-NEEDS-MAJOR. Superseded.
 - **Status:** PLAN-READY candidate (research only — no production code;
   `/engineer 5275`).
@@ -331,9 +332,11 @@ Partial PRs say "advances #5275", never a close-keyword.
   gRPC/REST/CLI/sampler, three-route apply gate, staged surface transaction,
   withdrawal scrub, bootstrap-exit `startTakeoverMachinery`), `pkg/cluster`
   (composed-reason hold, advertised-weight-zero yield, pre-proof heartbeat-only
-  start), and `pkg/configstore` (delayed promotion: promote-after-arm + the
-  non-authoritative recovery slot, §8.5). Genuinely large; the facade + arm-state +
-  barrier + delayed-promotion are foundational.
+  start), `pkg/configstore` (delayed promotion: promote-after-arm + the
+  non-authoritative recovery slot + PromoteRollback arm-gating + commit-confirmed at
+  the promotion boundary, §8.5/§13-D3/D4), and `pkg/networkd` (link/address phase
+  split, §13-D2). Genuinely large; the facade + arm-state + barrier +
+  delayed-promotion + the networkd phase split are foundational.
 - **Risks:** (1) day-2 regression tearing a working dataplane — per-generation
   coverage + #5679 retention + RED tests; (2) the facade wiring missing a captured
   alias — a grep/audit of every `d.dp` capture + a revocation test on each consumer
@@ -398,6 +401,74 @@ Partial PRs say "advances #5275", never a close-keyword.
   ip_forward=0, no XDP, no FRR/VRRP/VIP, held, yield advertised), peer carries
   sustained iperf3 (`feedback_verify_forwarding_with_sustained_iperf`), SSH up.
   Seam lands WITH the fix.
+
+---
+
+## 13. Resolved design decisions (Codex r6) — recommended choices for human go/no-go
+
+Codex r6 fully closed release-ownership (§5), the sealed facade (§7), and
+weight-zero gating (§4), and confirmed the delayed-promotion and recovery-slot
+DIRECTIONS are right. Four contracts required an explicit design decision; each is
+resolved below with a recommended choice (the human approves/overrides at `/engineer`):
+
+- **D1 — Two-stage proof INGREDIENTS split (Codex r6 §1).** The preliminary stage
+  cannot require ready XSK bindings (they do not exist until the deferred-worker
+  rebind, daemon_apply_dataplane.go / manager_compile.go:318). Resolution:
+  *preliminary* proves the attach-point INVENTORY + the exact shim program instance
+  (ID/tag) per required surface; *final* (after the last rebind/reapply) proves the
+  candidate digest + reconciled helper generation + ALL registered/armed/ready
+  bindings. Only the FINAL proof triggers release.
+
+- **D2 — networkd link/address phase split (Codex r6 §2; `pkg/networkd` now in the
+  blast radius).** `networkd.Apply` writes link+address and reloads (can bounce the
+  link, networkd.go:130). Resolution: split into a **link-only pre-proof phase**
+  (create/rename to obtain an ifindex + attach — no address/route/reload that bounces
+  the attached link) and an **attachment-neutral post-proof address/route phase**
+  (address-only apply that does not re-cycle the proven link). Recommended over
+  relocating the final boundary, which would leave addresses published pre-proof.
+
+- **D3 — Delayed-promotion transaction invariants (Codex r6 §3).** Resolution:
+  1. **Digest binding:** promote EXACTLY the immutable candidate tree that was
+     proved; if the candidate mutated since the proof, reject (no silent substitution).
+  2. **Boot selection:** `Store.Load` exposes the **last-armed applied** generation
+     to publishers as authoritative; the failed candidate lives in a SEPARATE
+     non-authoritative **recovery slot** used only for the next restart's arm attempt.
+  3. **commit confirmed:** the confirm timer + durable rollback record begin at
+     PROMOTION (post-arm). An arm failure ⇒ no promotion ⇒ no confirm timer; the prior
+     armed generation stays authoritative (a bootstrap-takeover commit-confirmed that
+     fails to arm falls back to the prior armed state, never a half-confirmed one).
+  4. **Automatic rollback:** `PromoteRollback` routes through the arm-proof too — the
+     rollback target must re-arm-prove before it is promoted+published (else it
+     recreates the very publication race delayed promotion removes); if the rollback
+     target also fails to arm, stay fail-closed.
+  5. **History / RG0-demotion / confirmation** are recorded at the promotion boundary,
+     not at candidate-commit.
+
+- **D4 — Inbound HA recovery lifecycle (Codex r6 §4).** Reusing `SyncApply`
+  (store.go:611 — it immediately promotes+resets) pre-proof would reopen the TOCTOU,
+  and full config-sync starts only post-proof (an `armFailed` node never reaches it).
+  Resolution: an **authenticated inbound-config-ONLY** ingress available pre-proof
+  (separate from the full session/config-sync machinery) that lands the primary's
+  config into the **recovery slot** (NOT immediate promote/reset), with an
+  applied-high-water/ack so the primary knows it was received; the primary's
+  authoritative config supersedes a local recovery edit (a held node is
+  non-authoritative). Recovery is thus RESTART-based: the correction is staged for the
+  next restart's arm attempt; the held node never promotes it live.
+
+- **D5 — Scrub fence BEFORE peer election (Codex r6 §5).** The peer elects on
+  ~500 ms heartbeat loss (heartbeat.go), and the held node CONTROLS when it starts its
+  pre-proof heartbeat-only advertisement (§4). Resolution: the enter-`armFailed`
+  sequence performs a **fast VIP/service fence FIRST** (administratively down the owned
+  data/VIP surface + `Kea Apply(nil)`, each verified — completes in ms), THEN starts
+  the yield heartbeat; the slow FRR clear (~40 s) is route-advertisement, not
+  VIP dual-ownership, so it proceeds async AFTER the fast fence. For a re-arm where the
+  node was already advertising, stop advertising during the fence. The peer therefore
+  cannot take VIP ownership before this node has verifiably relinquished it.
+
+Two minor residuals folded: §8's `armPending` route now distinguishes the **boot
+single-generation arm** (PR1) from the §9 **staged-delta transaction** (PR3); the §5
+release inventory places **facade OPEN immediately before the final `dataplaneUnproven`
+clear**.
 
 ---
 
