@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/upgrade/manifest"
@@ -21,26 +22,29 @@ func writeCompleteVersionDir(t *testing.T, cfg Config, ver string) {
 	}
 }
 
-// TestRestorableCurrentTarget_Cases is the #6374 unit matrix for
-// restorableCurrentTarget: only a `current` symlink resolving to a bare,
-// existing, lockstep-complete version dir is a restorable rollback target.
-// Every corrupt layout (absent, dangling, pathful, non-directory target,
-// lockstep-incomplete, non-symlink) MUST resolve to "" so it is never recorded
-// as PreviousVersion — recording an unrestorable target lets a flip/start
-// failure STOP the running daemon and strand it offline.
-//
-// FAIL-ON-REVERT: neutralize the fix by making restorableCurrentTarget return
-// readCurrentVersion's raw basename and the dangling/pathful/incomplete/
-// non-directory subtests wrongly get a nonempty target -> clean ASSERTION RED.
-func TestRestorableCurrentTarget_Cases(t *testing.T) {
-	linkPath := func(cfg Config) string { return filepath.Join(cfg.VersionsDir, currentLink) }
+func currentLinkPath(cfg Config) string {
+	return filepath.Join(cfg.VersionsDir, currentLink)
+}
 
+// TestRestorableCurrentTarget_Cases is the #6374 unit matrix for
+// restorableCurrentTarget, which returns (ver, present). It must DISTINGUISH a
+// genuinely ABSENT `current` (present==false — a legitimate first install,
+// sanctionable) from every PRESENT-but-unrestorable layout (present==true —
+// there IS a broken rollback target, NEVER sanctionable). ver is nonempty only
+// for a fully restorable target (bare in-tree segment, existing dir, complete
+// lockstep set).
+//
+// FAIL-ON-REVERT: collapse the present/absent distinction (e.g. return the raw
+// readCurrentVersion basename, or present:=false everywhere) and the
+// dangling/pathful/incomplete/non-directory/non-symlink/EACCES subtests get the
+// wrong ver or present -> clean ASSERTION RED.
+func TestRestorableCurrentTarget_Cases(t *testing.T) {
 	t.Run("absent-current", func(t *testing.T) {
 		fs := newFakeSystem(t, "2.0.0")
 		r, _ := testEnv(t, fs)
-		got, err := r.restorableCurrentTarget()
-		if err != nil || got != "" {
-			t.Fatalf("absent current: got (%q,%v), want (\"\",nil)", got, err)
+		ver, present := r.restorableCurrentTarget()
+		if ver != "" || present {
+			t.Fatalf("absent current: got (%q,present=%v), want (\"\",false)", ver, present)
 		}
 	})
 
@@ -48,12 +52,12 @@ func TestRestorableCurrentTarget_Cases(t *testing.T) {
 		fs := newFakeSystem(t, "2.0.0")
 		r, cfg := testEnv(t, fs)
 		writeCompleteVersionDir(t, cfg, "1.0.0")
-		if err := os.Symlink("1.0.0", linkPath(cfg)); err != nil {
+		if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
 			t.Fatal(err)
 		}
-		got, err := r.restorableCurrentTarget()
-		if err != nil || got != "1.0.0" {
-			t.Fatalf("valid current: got (%q,%v), want (\"1.0.0\",nil)", got, err)
+		ver, present := r.restorableCurrentTarget()
+		if ver != "1.0.0" || !present {
+			t.Fatalf("valid current: got (%q,present=%v), want (\"1.0.0\",true)", ver, present)
 		}
 	})
 
@@ -65,16 +69,17 @@ func TestRestorableCurrentTarget_Cases(t *testing.T) {
 		if err := os.MkdirAll(cfg.VersionsDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink("9.9.9", linkPath(cfg)); err != nil {
+		if err := os.Symlink("9.9.9", currentLinkPath(cfg)); err != nil {
 			t.Fatal(err)
 		}
-		got, err := r.restorableCurrentTarget()
-		if err != nil {
-			t.Fatalf("dangling current: unexpected error %v", err)
-		}
-		if got != "" {
+		ver, present := r.restorableCurrentTarget()
+		if ver != "" {
 			t.Fatalf("dangling current wrongly accepted as restorable target %q "+
-				"(#6374: a broken `current` must resolve to no rollback target)", got)
+				"(#6374: a broken `current` must resolve to no rollback target)", ver)
+		}
+		if !present {
+			t.Fatal("dangling current wrongly classified as ABSENT (sanctionable) — a " +
+				"present-but-broken `current` must report present=true (#6374)")
 		}
 	})
 
@@ -83,17 +88,17 @@ func TestRestorableCurrentTarget_Cases(t *testing.T) {
 		r, cfg := testEnv(t, fs)
 		// A complete dir exists at 1.0.0, but the link target carries path
 		// components — filepath.Base would strip them to a segment the link
-		// never actually named. Must be rejected as not-in-tree.
+		// never actually named. Must be rejected as not-in-tree, present=true.
 		writeCompleteVersionDir(t, cfg, "1.0.0")
-		if err := os.Symlink("../versions/1.0.0", linkPath(cfg)); err != nil {
+		if err := os.Symlink("../versions/1.0.0", currentLinkPath(cfg)); err != nil {
 			t.Fatal(err)
 		}
-		got, err := r.restorableCurrentTarget()
-		if err != nil {
-			t.Fatalf("pathful current: unexpected error %v", err)
+		ver, present := r.restorableCurrentTarget()
+		if ver != "" {
+			t.Fatalf("pathful current wrongly accepted as restorable target %q", ver)
 		}
-		if got != "" {
-			t.Fatalf("pathful current wrongly accepted as restorable target %q", got)
+		if !present {
+			t.Fatal("pathful current wrongly classified as ABSENT (sanctionable)")
 		}
 	})
 
@@ -112,15 +117,15 @@ func TestRestorableCurrentTarget_Cases(t *testing.T) {
 			}
 			writeFakeBin(t, filepath.Join(verDir, b), "binary-"+b)
 		}
-		if err := os.Symlink("1.0.0", linkPath(cfg)); err != nil {
+		if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
 			t.Fatal(err)
 		}
-		got, err := r.restorableCurrentTarget()
-		if err != nil {
-			t.Fatalf("incomplete current: unexpected error %v", err)
+		ver, present := r.restorableCurrentTarget()
+		if ver != "" {
+			t.Fatalf("lockstep-incomplete current wrongly accepted as restorable target %q", ver)
 		}
-		if got != "" {
-			t.Fatalf("lockstep-incomplete current wrongly accepted as restorable target %q", got)
+		if !present {
+			t.Fatal("lockstep-incomplete current wrongly classified as ABSENT (sanctionable)")
 		}
 	})
 
@@ -132,15 +137,15 @@ func TestRestorableCurrentTarget_Cases(t *testing.T) {
 			t.Fatal(err)
 		}
 		mkfile(t, filepath.Join(cfg.VersionsDir, "1.0.0"), "not-a-dir")
-		if err := os.Symlink("1.0.0", linkPath(cfg)); err != nil {
+		if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
 			t.Fatal(err)
 		}
-		got, err := r.restorableCurrentTarget()
-		if err != nil {
-			t.Fatalf("non-dir target: unexpected error %v", err)
+		ver, present := r.restorableCurrentTarget()
+		if ver != "" {
+			t.Fatalf("non-directory target wrongly accepted as restorable %q", ver)
 		}
-		if got != "" {
-			t.Fatalf("non-directory target wrongly accepted as restorable %q", got)
+		if !present {
+			t.Fatal("non-directory target wrongly classified as ABSENT (sanctionable)")
 		}
 	})
 
@@ -149,41 +154,77 @@ func TestRestorableCurrentTarget_Cases(t *testing.T) {
 		r, cfg := testEnv(t, fs)
 		// `current` exists but is a regular file (a corrupt/interrupted repair
 		// left a file where the symlink should be). os.Readlink returns EINVAL;
-		// it must resolve to "" (no restorable target), not propagate an error.
+		// it must resolve to (ver=="", present==true), not absent.
 		if err := os.MkdirAll(cfg.VersionsDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		mkfile(t, linkPath(cfg), "not-a-symlink")
-		got, err := r.restorableCurrentTarget()
-		if err != nil {
-			t.Fatalf("non-symlink current: unexpected error %v", err)
+		mkfile(t, currentLinkPath(cfg), "not-a-symlink")
+		ver, present := r.restorableCurrentTarget()
+		if ver != "" {
+			t.Fatalf("non-symlink current wrongly accepted as restorable %q", ver)
 		}
-		if got != "" {
-			t.Fatalf("non-symlink current wrongly accepted as restorable %q", got)
+		if !present {
+			t.Fatal("non-symlink current wrongly classified as ABSENT (sanctionable) — a " +
+				"present regular file where the symlink should be is not a first install (#6374)")
+		}
+	})
+
+	t.Run("non-enoent-stat-error", func(t *testing.T) {
+		fs := newFakeSystem(t, "2.0.0")
+		r, cfg := testEnv(t, fs)
+		writeCompleteVersionDir(t, cfg, "1.0.0")
+		if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
+			t.Fatal(err)
+		}
+		// Stat of the version dir returns EACCES (indeterminate I/O) — NOT
+		// os.IsNotExist. It must fail closed as present (never treated as an
+		// absent, sanctionable first install).
+		orig := statVersionDir
+		defer func() { statVersionDir = orig }()
+		statVersionDir = func(p string) (os.FileInfo, error) {
+			if filepath.Base(p) == "1.0.0" {
+				return nil, &os.PathError{Op: "stat", Path: p, Err: syscall.EACCES}
+			}
+			return orig(p)
+		}
+		ver, present := r.restorableCurrentTarget()
+		if ver != "" {
+			t.Fatalf("EACCES version dir wrongly accepted as restorable %q", ver)
+		}
+		if !present {
+			t.Fatal("EACCES on the version dir wrongly classified as ABSENT (sanctionable) " +
+				"— an indeterminate I/O error on the rollback target must fail closed as " +
+				"present (#6374)")
 		}
 	})
 }
 
-// TestRun_DanglingCurrentRefusesBeforeStop is the #6374 headline regression: a
-// nonempty but DANGLING `current` symlink (its target dir is missing) must be
-// treated as NO restorable rollback target — the cut is refused BEFORE
-// StopUnit, so the running daemon is never stopped into an unrestorable
-// rollback. Pre-fix, the dangling basename was recorded as PreviousVersion,
-// passed every rollback guard, and a start/health failure could strand xpfd
-// offline.
-//
-// FAIL-ON-REVERT: reverting the recording change (restorablePrev -> raw prev)
-// records "1.0.0" as PreviousVersion, the refuse-at-init no longer fires, the
-// cut runs to STOP -> the "no live mutation" / "unit still running" assertions
-// go RED.
+// assertNoLiveMutation fails if the cut ran any live-mutating step or stopped
+// the daemon — the whole point of a refuse-before-STOP.
+func assertNoLiveMutation(t *testing.T, fs *fakeSystem, why string) {
+	t.Helper()
+	for _, c := range fs.calls {
+		if c == "stop" || c == "start" || c == "dropin" {
+			t.Errorf("live mutation %q happened despite %s", c, why)
+		}
+	}
+	if !fs.unitRunning {
+		t.Errorf("daemon stopped despite %s", why)
+	}
+}
+
+// TestRun_DanglingCurrentRefusesBeforeStop is the #6374 headline regression on
+// the UNSANCTIONED path: a nonempty but DANGLING `current` symlink (target dir
+// missing) is treated as NO restorable rollback target — the cut is refused
+// BEFORE StopUnit, so the running daemon is never stopped into an unrestorable
+// rollback.
 func TestRun_DanglingCurrentRefusesBeforeStop(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
 	r, cfg := testEnv(t, fs)
-	// Seed a dangling current: symlink -> 1.0.0 but versions/1.0.0 never exists.
 	if err := os.MkdirAll(cfg.VersionsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("1.0.0", filepath.Join(cfg.VersionsDir, currentLink)); err != nil {
+	if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -194,45 +235,92 @@ func TestRun_DanglingCurrentRefusesBeforeStop(t *testing.T) {
 	if !strings.Contains(err.Error(), "refuse-before-STOP") {
 		t.Fatalf("error is not the refuse-before-STOP guard: %v", err)
 	}
-	// The daemon must NOT have been stopped / flipped / started.
-	for _, c := range fs.calls {
-		if c == "stop" || c == "start" || c == "dropin" {
-			t.Errorf("live mutation %q happened despite a dangling rollback target", c)
-		}
-	}
-	if !fs.unitRunning {
-		t.Error("daemon stopped despite an unrestorable (dangling) rollback target")
-	}
-	// No journal persisted: the refuse happens at INIT before any transition.
+	assertNoLiveMutation(t, fs, "a dangling rollback target")
 	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
 		t.Error("a journal was persisted on the dangling-current refusal")
 	}
-	// current is untouched (still the dangling 1.0.0, never re-flipped).
-	tgt, _ := os.Readlink(filepath.Join(cfg.VersionsDir, currentLink))
+	tgt, _ := os.Readlink(currentLinkPath(cfg))
 	if filepath.Base(tgt) != "1.0.0" {
 		t.Errorf("current changed from the dangling 1.0.0: %q", tgt)
 	}
 }
 
-// TestRun_ResumedJournalRevalidatesPreviousVersion proves the #6374 pre-STOP
-// revalidation: a resumed journal whose PreviousVersion names a version whose
-// runtime dir is now missing (a pre-#6374 journal that recorded a dangling
-// basename, or storage damage between INIT and resume) is refused BEFORE STOP
-// rather than being stopped and rolled back to a missing runtime. A nonempty
-// PreviousVersion STRING is not sufficient — the dir must be restorable.
+// TestRun_DanglingCurrentRefusesEvenWhenSanctioned is the Codex round-2 safety
+// case: AllowNoRollbackFirstCut sanctions ONLY a genuinely-absent `current` (a
+// real first install). A PRESENT-but-dangling `current` still had a rollback
+// target that is now broken — stopping the daemon would strand it — so the cut
+// must REFUSE before STOP even with the sanction. Pre-fold the sanction wrongly
+// bypassed the refusal because restorableCurrentTarget could not tell "absent"
+// from "present-but-broken".
 //
-// FAIL-ON-REVERT: reverting the pre-STOP revalidation (guard checks only
-// PreviousVersion == "") lets the resume proceed past the guard to STOP the
-// running daemon -> the "no stop" / "unit still running" assertions go RED.
+// FAIL-ON-REVERT: gate the sanction on restorablePrev=="" instead of on
+// !present -> a sanctioned dangling cut proceeds to STOP -> the no-live-mutation
+// assertions go RED.
+func TestRun_DanglingCurrentRefusesEvenWhenSanctioned(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	if err := os.MkdirAll(cfg.VersionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Present but dangling: symlink -> 1.0.0, versions/1.0.0 never created.
+	if err := os.Symlink("1.0.0", currentLinkPath(cfg)); err != nil {
+		t.Fatal(err)
+	}
+
+	err := r.Run(Options{AllowNoRollbackFirstCut: true}) // SANCTIONED
+	if err == nil {
+		t.Fatal("expected refuse-before-STOP on a sanctioned cut over a PRESENT-but-" +
+			"dangling current, got nil")
+	}
+	if !strings.Contains(err.Error(), "refuse-before-STOP") {
+		t.Fatalf("error is not the refuse-before-STOP guard: %v", err)
+	}
+	assertNoLiveMutation(t, fs, "a present-but-dangling rollback target (sanction must not bypass)")
+	// No journal + no FirstCutSanctioned persisted (the sanction never applied).
+	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
+		t.Error("a journal was persisted despite refusing a present-but-dangling current")
+	}
+}
+
+// TestRun_AbsentCurrentSanctionedProceeds is the contrast case: the sanction
+// STILL works where it should — a GENUINELY ABSENT `current` + the operator
+// flag is a legitimate first install and must PROCEED through STOP to a
+// completed cut. This guards the fix from over-refusing (a fail-closed change
+// that also broke first install would be a regression).
+//
+// FAIL-ON-REVERT: make restorableCurrentTarget report present=true for an
+// absent current (or refuse regardless of present) -> the first install can no
+// longer be sanctioned -> this cut is wrongly refused -> RED.
+func TestRun_AbsentCurrentSanctionedProceeds(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	// No `current` at all — the genuine first-install layout.
+
+	if err := r.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
+		t.Fatalf("genuinely-absent current + sanction must complete a first cut: %v", err)
+	}
+	sawStop := false
+	for _, c := range fs.calls {
+		if c == "stop" {
+			sawStop = true
+		}
+	}
+	if !sawStop {
+		t.Error("sanctioned first install did not STOP/cut — the sanction was wrongly refused")
+	}
+	tgt, _ := os.Readlink(currentLinkPath(cfg))
+	if filepath.Base(tgt) != "2.0.0" {
+		t.Errorf("sanctioned first cut did not flip current to 2.0.0: %q", tgt)
+	}
+}
+
+// TestRun_ResumedJournalRevalidatesPreviousVersion proves the #6374 pre-STOP
+// revalidation on the UNSANCTIONED resume path: a resumed journal whose
+// PreviousVersion names a now-missing runtime dir is refused BEFORE STOP.
 func TestRun_ResumedJournalRevalidatesPreviousVersion(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
 	r, cfg := testEnv(t, fs)
-	// The target version dir is complete (the cut got as far as VERIFIED), so
-	// the ONLY defect is that PreviousVersion's runtime has vanished.
-	writeCompleteVersionDir(t, cfg, "2.0.0")
-	// Hand-write a VERIFIED journal whose PreviousVersion points at a version
-	// with NO dir on disk. TargetVersion matches the staged version so the
-	// resume-vs-fresh recovery keeps it (a genuine resume, not a reset).
+	writeCompleteVersionDir(t, cfg, "2.0.0") // target complete; only prev is broken
 	j := &Journal{
 		State:           StateVerified,
 		TargetVersion:   "2.0.0",
@@ -247,32 +335,48 @@ func TestRun_ResumedJournalRevalidatesPreviousVersion(t *testing.T) {
 	if !strings.Contains(err.Error(), "refuse-before-STOP") {
 		t.Fatalf("error is not the refuse-before-STOP guard: %v", err)
 	}
-	for _, c := range fs.calls {
-		if c == "stop" || c == "start" || c == "dropin" {
-			t.Errorf("live mutation %q happened despite an unrestorable persisted "+
-				"rollback target", c)
-		}
+	assertNoLiveMutation(t, fs, "an unrestorable persisted rollback target")
+}
+
+// TestRun_ResumedJournalRefusesBrokenPreviousEvenSanctioned is the Codex
+// round-2 resumed-gate variant: a resumed journal that RECORDED a rollback
+// target (PreviousVersion != "") which is now broken must refuse before STOP
+// REGARDLESS of a first-cut sanction. The sanction covers only a recorded-EMPTY
+// target (a genuinely-absent first install), never a recorded-but-broken one.
+//
+// FAIL-ON-REVERT: fold the recorded-nonempty-broken case back under the shared
+// `!sanctioned` gate -> FirstCutSanctioned bypasses the refusal -> the resume
+// proceeds to STOP -> RED.
+func TestRun_ResumedJournalRefusesBrokenPreviousEvenSanctioned(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	writeCompleteVersionDir(t, cfg, "2.0.0")
+	j := &Journal{
+		State:              StateVerified,
+		TargetVersion:      "2.0.0",
+		PreviousVersion:    "1.0.0", // recorded a target; its dir is now MISSING
+		FirstCutSanctioned: true,    // and the cut was sanctioned
 	}
-	if !fs.unitRunning {
-		t.Error("daemon stopped despite an unrestorable persisted rollback target")
+	must(t, r.saveJournal(j))
+
+	// Sanctioned via BOTH the persisted flag and the invocation flag.
+	err := r.Run(Options{AllowNoRollbackFirstCut: true})
+	if err == nil {
+		t.Fatal("expected refuse-before-STOP on a resumed journal with a recorded-but-" +
+			"broken PreviousVersion, even when sanctioned")
 	}
+	if !strings.Contains(err.Error(), "refuse-before-STOP") {
+		t.Fatalf("error is not the refuse-before-STOP guard: %v", err)
+	}
+	assertNoLiveMutation(t, fs, "a recorded-but-broken rollback target (sanction must not bypass)")
 }
 
 // TestRollback_RefusesUnrestorablePrevious proves the #6374 pre-rollback
-// preflight: rollback() must refuse when PreviousVersion's runtime is missing/
-// incomplete BEFORE it stops the daemon or restores the config DB — otherwise
-// the re-flip to the missing runtime fails AFTER the DB was already rolled
-// back, turning a recoverable new-version failure into a control-plane outage.
-//
-// FAIL-ON-REVERT: reverting the preflight lets rollback() run StopUnit (and the
-// DB restore) before failing on the missing dir -> the "no stop" assertion and
-// the "refuse-rollback" error-message assertion go RED.
+// preflight: rollback() refuses when PreviousVersion's runtime is missing/
+// incomplete BEFORE it stops the daemon or restores the config DB.
 func TestRollback_RefusesUnrestorablePrevious(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
 	r, _ := testEnv(t, fs)
-	// PreviousVersion names a version whose dir does not exist. Keep the DB
-	// restore out of the picture (AdvancedStateFloor=false) so the ONLY thing
-	// under test is the pre-rollback restorability preflight.
 	j := &Journal{
 		State:              StateStarted,
 		TargetVersion:      "2.0.0",
@@ -286,14 +390,5 @@ func TestRollback_RefusesUnrestorablePrevious(t *testing.T) {
 	if !strings.Contains(err.Error(), "refuse-rollback") {
 		t.Fatalf("error is not the pre-rollback preflight refusal: %v", err)
 	}
-	// The destructive steps must NOT have run.
-	for _, c := range fs.calls {
-		if c == "stop" || c == "start" || c == "dropin" {
-			t.Errorf("destructive rollback step %q ran despite an unrestorable "+
-				"previous version", c)
-		}
-	}
-	if !fs.unitRunning {
-		t.Error("daemon stopped despite the pre-rollback preflight refusal")
-	}
+	assertNoLiveMutation(t, fs, "an unrestorable previous version at rollback")
 }

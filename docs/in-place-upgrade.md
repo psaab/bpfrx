@@ -288,21 +288,39 @@ exist.
   corrupt `current` used to yield a nonempty `PreviousVersion` that passed
   every guard — then the post-STOP rollback flip to the missing dir failed
   and left xpfd offline. The recorded rollback target now comes from
-  `restorableCurrentTarget`, which returns "" (→ the same refuse path an
-  absent `current` takes) unless `current` is a symlink naming a **bare
-  in-tree segment** whose `versions/<ver>/` **directory exists** and holds
-  the **complete managed lockstep set** (`manifest.LockstepNames`). The same
-  `validateRestorableVersion` predicate re-checks a *persisted*
-  `PreviousVersion` on every resume before STOP (a pre-#6374 journal or a dir
-  damaged/GC'd after INIT is caught), and gates the standalone
-  `rollback()` **before** it stops the daemon or restores the config DB — so
-  an unrestorable target surfaces a clear error instead of rolling the DB
-  back and then stranding the control plane on a missing runtime. (The HA
-  path sets `SkipStartHealthRollback`; its rollback is operator-driven and
-  never enters `rollback()`.) `readCurrentVersion` itself is unchanged — it
-  still returns the raw basename for the conservative "never delete a dir
-  that might be live" GC / stale-dir-replace guards, which must protect a
-  present-but-incomplete live dir rather than treat it as absent.
+  `restorableCurrentTarget`, which returns `ver==""` unless `current` is a
+  symlink naming a **bare in-tree segment** whose `versions/<ver>/`
+  **directory exists** and holds the **complete managed lockstep set**
+  (`manifest.LockstepNames`). The same `validateRestorableVersion` predicate
+  re-checks a *persisted* `PreviousVersion` on every resume before STOP (a
+  pre-#6374 journal or a dir damaged/GC'd after INIT is caught), and gates
+  the standalone `rollback()` **before** it stops the daemon or restores the
+  config DB — so an unrestorable target surfaces a clear error instead of
+  rolling the DB back and then stranding the control plane on a missing
+  runtime. (The HA path sets `SkipStartHealthRollback`; its rollback is
+  operator-driven and never enters `rollback()`.)
+
+  **The sanction covers ONLY a genuinely-absent `current` (#6374).**
+  `restorableCurrentTarget` returns a second value, `present`, that
+  distinguishes a **genuinely absent** `current` (`os.IsNotExist` →
+  `present=false`, a real first install) from a **present-but-unrestorable**
+  one (`present=true`: not a symlink / pathful / dangling / non-directory /
+  lockstep-incomplete / an indeterminate `EACCES`/`EIO` stat error).
+  `AllowNoRollbackFirstCut` / `FirstCutSanctioned` may bypass the
+  refuse-before-STOP guard **only when `!present`**. A present-but-corrupt
+  `current` still had a rollback target and it is now broken — stopping the
+  daemon would strand it, the exact #6374 hazard — so it **refuses regardless
+  of the sanction**, at INIT and on every resume. Symmetrically the pre-STOP
+  revalidation of a *nonempty* recorded `PreviousVersion` refuses regardless
+  of the sanction (a recorded-but-broken target is never a sanctionable first
+  install); the sanction applies only to a recorded-*empty* target. An
+  indeterminate I/O error on the target fails **closed** (`present=true` →
+  refuse), never silently treated as absent-and-sanctionable.
+
+  `readCurrentVersion` itself is unchanged — it still returns the raw
+  basename for the conservative "never delete a dir that might be live" GC /
+  stale-dir-replace guards, which must protect a present-but-incomplete live
+  dir rather than treat it as absent.
 
 Version strings that key `versions/<ver>` — and, the strictest sink, the
 `ExecStart` line in the `10-xpf-version.conf` unit drop-in — are validated by a

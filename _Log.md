@@ -59252,3 +59252,28 @@ top.
   - **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/cutover.go,
     pkg/upgrade/flip.go, pkg/upgrade/dangling_current_6374_test.go,
     docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-23T21:10Z
+  - **Action**: Fix #6374 round-2 fold (Codex MERGE-NEEDS-MAJOR). The first-cut
+    sanction was over-broad: `restorableCurrentTarget` collapsed "genuinely
+    absent `current`" and "present-but-unrestorable `current`" into one
+    `("", nil)`, so a PRESENT-but-corrupt/dangling current + the operator's
+    `AllowNoRollbackFirstCut` bypassed refuse-before-STOP and STOPPED the daemon
+    into a broken rollback target — re-introducing the #6374 outage on the
+    sanctioned path. Fold: `restorableCurrentTarget` now returns `(ver, present)`
+    — `present=false` ONLY for `os.IsNotExist`; `present=true` (ver="") for
+    not-a-symlink / pathful / dangling / non-dir / incomplete / any non-ENOENT
+    I/O error (fail-closed). Gated the sanction on ABSENCE (`!present`), not on
+    `ver==""`, at the INIT refuse + FirstCutSanctioned persistence. The pre-STOP
+    resumed gate now refuses a NONEMPTY-but-broken recorded PreviousVersion
+    REGARDLESS of any sanction (the sanction covers only a recorded-empty
+    target). Added a `statVersionDir` seam so the EACCES-indeterminate case is
+    tested root-independently. New tests: sanctioned-dangling-refuses,
+    absent-sanctioned-proceeds (contrast control), resumed-broken-even-
+    sanctioned-refuses, EACCES present-flag; unit matrix now asserts `present`.
+    Neutralizing the present/absent distinction drives the sanction-safety +
+    present assertions RED while the correctness controls stay GREEN (confirmed
+    firsthand), restored GREEN. Full `go test ./pkg/upgrade/...` GREEN;
+    build+vet+gofmt clean. Still NOT HA-touching.
+  - **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/cutover.go,
+    pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md

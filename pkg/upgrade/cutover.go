@@ -407,15 +407,19 @@ func (r *Runner) Run(opts Options) (err error) {
 		// above (os.Readlink succeeds on a broken link, filepath.Base strips
 		// path components) yet cannot be flipped back to; recording it would let
 		// a flip/start failure STOP the daemon with an unrestorable rollback
-		// target and strand it offline. restorableCurrentTarget returns "" for
-		// those corrupt layouts, so the no-rollback-target refuse below fires
-		// exactly as it does for an absent `current`. `prev` (raw) is still used
-		// for the live-dir-replace identity guard, which must protect a
-		// present-but-incomplete live dir from deletion.
-		restorablePrev, rperr := r.restorableCurrentTarget()
-		if rperr != nil {
-			return rperr
-		}
+		// target and strand it offline. restorableCurrentTarget returns ver=""
+		// for those corrupt layouts AND reports whether `current` was PRESENT.
+		// `prev` (raw) is still used for the live-dir-replace identity guard,
+		// which must protect a present-but-incomplete live dir from deletion.
+		restorablePrev, prevPresent := r.restorableCurrentTarget()
+		// The first-cut sanction (AllowNoRollbackFirstCut) is ONLY for a
+		// GENUINELY ABSENT `current` — a real first install with no prior
+		// runtime. A PRESENT-but-unrestorable `current` (dangling / pathful /
+		// not-a-symlink / incomplete / I/O-unreadable) still had a rollback
+		// target and it is now broken: stopping the daemon would strand it, so
+		// it must REFUSE regardless of the sanction (#6374). Gate the sanction
+		// on ABSENCE (!prevPresent), never on restorablePrev=="" alone.
+		sanctionedFirstCut := !prevPresent && opts.AllowNoRollbackFirstCut
 		// REFUSE-AT-INIT (mechanism C, Codex r2): an unsanctioned cut with no
 		// rollback target must be refused BEFORE any journal is persisted. If
 		// we instead let it run preflight/copy/verify and only refused at the
@@ -429,15 +433,15 @@ func (r *Runner) Run(opts Options) (err error) {
 		// resume-vs-fresh recovery (which resets j in memory but does not
 		// remove the stale on-disk record), so the refuse leaves a fully
 		// clean state and a re-run does not re-run recovery.
-		if restorablePrev == "" && !opts.AllowNoRollbackFirstCut {
+		if restorablePrev == "" && !sanctionedFirstCut {
 			if cerr := r.clearJournal(); cerr != nil {
 				r.logf("upgrade: WARN clear stale journal on refuse: %v", cerr)
 			}
-			return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
-				"(versions/current is absent, unreadable, or names a missing/incomplete "+
-				"runtime) and this is not a sanctioned first cut; refusing the %s cut "+
-				"because a flip/start failure would leave the daemon offline with no "+
-				"recovery target. Seed the versioned runtime (xpfd seed-runtime), then "+
+			return fmt.Errorf("refuse-before-STOP: no restorable previous version to roll "+
+				"back to (versions/current is absent, unreadable, not a symlink, or names a "+
+				"missing/incomplete runtime) and this is not a sanctioned first cut; refusing "+
+				"the %s cut because a flip/start failure would leave the daemon offline with "+
+				"no recovery target. Seed the versioned runtime (xpfd seed-runtime), then "+
 				"re-run the upgrade", stagedVer)
 		}
 		// REFUSE-AT-INIT (#1981 B-P3b OPT1, Codex r5-#2 / r6): a same-version cut
@@ -497,13 +501,14 @@ func (r *Runner) Run(opts Options) (err error) {
 		// PAST the STOP step (where the refuse guard no longer re-runs) still
 		// honors the original sanction, and recoverFromFlipFailure can prove
 		// the empty-previous flip-failure restart is legitimate.
-		// Sanction the first cut on the RESTORABLE-target notion too: if
-		// `current` dangles/incomplete (restorablePrev=="") and the operator
-		// passes AllowNoRollbackFirstCut, PreviousVersion is recorded "" above,
-		// so FirstCutSanctioned MUST be set to match — otherwise a crash-resume
-		// past STOP would see empty-prev + unsanctioned and refuse forever
-		// (#6374).
-		if restorablePrev == "" && opts.AllowNoRollbackFirstCut {
+		// Persist the sanction ONLY for a genuinely-absent `current`
+		// (sanctionedFirstCut == !prevPresent && AllowNoRollbackFirstCut). A
+		// present-but-unrestorable `current` already refused above, so it never
+		// reaches here; gating on sanctionedFirstCut (not restorablePrev=="")
+		// makes that explicit and guarantees FirstCutSanctioned is set only for
+		// a real first install — never for a broken rollback target that a
+		// crash-resume could then wave through the pre-STOP guard (#6374).
+		if sanctionedFirstCut {
 			j.FirstCutSanctioned = true
 		}
 		if err := r.transition(j, StateStaged); err != nil {
@@ -572,25 +577,39 @@ func (r *Runner) Run(opts Options) (err error) {
 	// decision from the original run (so a crash-resume re-entering without
 	// the flag is still honored).
 	//
-	// REVALIDATE the persisted rollback target (#6374): a nonempty
-	// PreviousVersion is not sufficient — a journal written by an older
-	// (pre-#6374) run could carry a dangling basename, or the previous version
-	// dir could have been damaged / GC'd between INIT and this resume. If the
-	// recorded target is not a restorable version (missing dir, non-directory,
-	// lockstep-incomplete), treat it exactly like PreviousVersion=="" for this
-	// guard: a STOP followed by a rollback flip to a missing runtime would
-	// strand the daemon offline. This makes the guard bind the actual on-disk
-	// restorability, not just the string being nonempty.
+	// REVALIDATE the persisted rollback target (#6374). The sanction is
+	// ASYMMETRIC by design:
+	//
+	//   - j.PreviousVersion == "" is the recorded-empty case (a genuinely
+	//     absent `current` at INIT). It is refused UNLESS sanctioned — a real
+	//     first install (AllowNoRollbackFirstCut / FirstCutSanctioned) is the
+	//     one legitimate no-rollback-target cut.
+	//   - j.PreviousVersion != "" means a rollback target WAS recorded. It must
+	//     still be restorable NOW: a journal written by an older (pre-#6374) run
+	//     could carry a dangling basename, or the dir could have been damaged /
+	//     GC'd between INIT and this resume. If it is no longer restorable there
+	//     IS a broken rollback target, and a STOP followed by a rollback flip to
+	//     the missing runtime would strand the daemon offline — so REFUSE
+	//     regardless of any first-cut sanction. The sanction is for a
+	//     genuinely-absent first install, NEVER a broken recorded target.
+	//
+	// Sanctioned either by THIS invocation's flag or by the persisted journal
+	// decision from the original run (so a crash-resume re-entering without the
+	// flag is still honored).
 	sanctioned := opts.AllowNoRollbackFirstCut || j.FirstCutSanctioned
-	noRestorableTarget := j.PreviousVersion == ""
-	if j.PreviousVersion != "" {
+	refuseNoTarget := false
+	switch {
+	case j.PreviousVersion == "":
+		refuseNoTarget = !sanctioned
+	default:
 		if verr := r.validateRestorableVersion(j.PreviousVersion); verr != nil {
 			r.logf("upgrade: recorded rollback target %s is not restorable before "+
-				"STOP: %v; treating as no rollback target (#6374)", j.PreviousVersion, verr)
-			noRestorableTarget = true
+				"STOP: %v; refusing regardless of any first-cut sanction (#6374)",
+				j.PreviousVersion, verr)
+			refuseNoTarget = true
 		}
 	}
-	if j.State.atLeast(StateStaged) && noRestorableTarget && !sanctioned {
+	if j.State.atLeast(StateStaged) && refuseNoTarget {
 		return fmt.Errorf("refuse-before-STOP: no restorable previous version to roll "+
 			"back to (versions/current is absent, unreadable, or names a "+
 			"missing/incomplete runtime) and this is not a sanctioned first cut; "+
