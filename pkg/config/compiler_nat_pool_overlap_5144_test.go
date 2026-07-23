@@ -284,6 +284,51 @@ func TestNAT5144NAT64EquivalentPrefixSpellingAccepted(t *testing.T) {
 	assertNATOverlapAccepted(t, cmds...)
 }
 
+// TestNAT5144NAT64LeadingZeroMaskSpellingAccepted: `/96` and `/096` (leading-zero
+// mask, accepted by validateNAT64PrefixStrict and Rust's numeric parse) on the
+// SAME pool are ONE allocator. The owner key normalizes the mask so they dedup —
+// keying via a raw netip.ParsePrefix (which rejects `/096`) would split them into
+// two owners and false-reject.
+func TestNAT5144NAT64LeadingZeroMaskSpellingAccepted(t *testing.T) {
+	cmds := []string{
+		"set security nat source pool P address 100.64.0.7/32",
+		"set security nat nat64 rule-set A prefix 64:ff9b::/96",
+		"set security nat nat64 rule-set A source-pool P",
+		"set security nat nat64 rule-set B prefix 64:ff9b::/096",
+		"set security nat nat64 rule-set B source-pool P",
+	}
+	assertNATOverlapAccepted(t, cmds...)
+}
+
+// TestNAT5144NAT64EmptyPrefixNotAnOwner: a NAT64 rule-set with NO prefix builds
+// no live allocator (nat64.rs skips it; validateNAT64PrefixStrict skips an empty
+// prefix rather than rejecting it), so it must NOT be enumerated as an overlap
+// owner. Here a source-NAT rule and an empty-prefix NAT64 rule-set share pool P;
+// only the source-NAT allocator is live, so there is no cross-feature collision
+// and the config must compile clean. Enumerating the empty-prefix rule-set as an
+// owner would falsely report the source-NAT-vs-NAT64 overlap.
+func TestNAT5144NAT64EmptyPrefixNotAnOwner(t *testing.T) {
+	cmds := []string{
+		"set security nat source pool P address 100.64.0.7/32",
+		// NAT64 rule-set with a source-pool but NO prefix — inert (no allocator).
+		"set security nat nat64 rule-set N64 source-pool P",
+	}
+	cmds = append(cmds, srcRule("RS", "r1", "P")...)
+	assertNATOverlapAccepted(t, cmds...)
+}
+
+// TestNAT5144NAT64EmptyPrefixPairNotOverlap: two NAT64 rule-sets sharing one pool
+// but BOTH with empty prefixes are two inert (non-allocator) rule-sets, not a
+// collision — they must not false-reject.
+func TestNAT5144NAT64EmptyPrefixPairNotOverlap(t *testing.T) {
+	cmds := []string{
+		"set security nat source pool P address 100.64.0.7/32",
+		"set security nat nat64 rule-set A source-pool P",
+		"set security nat nat64 rule-set B source-pool P",
+	}
+	assertNATOverlapAccepted(t, cmds...)
+}
+
 // --- MAJOR (#6414 fold): peer-effective strict view must run the overlap gate ---
 
 // TestNAT5144PeerOnlyOverlapRejectedAtOriginCommit: a `${node}`/groups config

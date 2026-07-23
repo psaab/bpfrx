@@ -59623,3 +59623,28 @@ top.
     pkg/config/compiler_validate_strict_nat.go,
     pkg/config/compiler_nat_pool_overlap_5144_test.go,
     docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #5144 / PR #6414 — Codex round-2 MERGE-NEEDS-MINOR fold (2
+    NAT64-keying edges). (1) Empty/malformed-prefix NAT64 rule-sets were
+    enumerated as overlap owners though they build no live allocator
+    (nat64.rs skips them; validateNAT64PrefixStrict skips an empty prefix)
+    → false-reject of an empty-prefix nat64 sharing a pool with a live
+    source-NAT owner. (2) canonicalNAT64PrefixKey used netip.ParsePrefix
+    which rejects a leading-zero mask, so /96 vs /096 (both accepted by the
+    strict gate + Rust numeric parse) became separate owners → false-reject.
+    Fix: replaced canonicalNAT64PrefixKey with nat64PrefixOwnerKey(prefix)
+    (string,bool) that mirrors the Rust build condition EXACTLY (split on /,
+    mask ParseUint==96 so /096 is honored, address v6 by colon-strict rule)
+    and returns the canonical /96 network via netip Masked(); ok=false drops
+    empty/malformed prefixes from the owner set. Tests: LeadingZeroMask /096
+    accept, EmptyPrefixNotAnOwner accept, EmptyPrefixPair accept. Parent-RED
+    (isolated, firsthand): neutralize the empty skip → EmptyPrefixNotAnOwner
+    RED; neutralize the mask canonicalization (raw-mask key) → LeadingZero
+    RED while Equivalent/Different stay green. Full go test ./pkg/config/ +
+    consumer userspace/configstore GREEN; gofmt/vet clean. Doc:
+    docs/config-schema.md #5144 subsection updated (live-allocator owner
+    condition + /096).
+  - **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+    pkg/config/compiler_nat_pool_overlap_5144_test.go,
+    docs/config-schema.md, _Log.md

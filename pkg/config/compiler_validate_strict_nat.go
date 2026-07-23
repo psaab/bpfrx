@@ -2539,18 +2539,18 @@ func validateNATPoolExternalTupleOverlapStrict(cfg *Config, lenient bool) ([]str
 		if pool == nil {
 			continue
 		}
-		// Dedup on the CANONICAL (prefix, pool) key the Rust nat64 allocator
-		// uses: nat64.rs canonicalizes the prefix to its 12 network bytes and
-		// first-matches those, so two rule-sets naming the SAME pool under
-		// different valid /96 spellings (`64:ff9b::/96` vs
-		// `0064:ff9b:0:0:0:0:0:0/96`) are ONE runtime allocator, not two. Keying
-		// on the raw text would treat them as separate owners and FALSELY reject
-		// an equivalent-spelling config. netip.ParsePrefix + Masked() folds the
-		// spelling to the canonical masked prefix; an unparseable prefix (only
-		// reachable on the tolerant path — the strict NAT64-prefix gate rejects
-		// it first on commit) falls back to raw text so it never crashes and a
-		// genuinely distinct malformed prefix is not silently merged.
-		key := canonicalNAT64PrefixKey(rs.Prefix) + "\x00" + rs.SourcePool
+		// Only a rule-set whose prefix builds a LIVE NAT64 allocator is an owner,
+		// keyed on the CANONICAL (prefix, pool) identity the Rust nat64 allocator
+		// uses (12 network bytes + pool_v4). An empty / malformed / non-/96 prefix
+		// builds no allocator and is dropped (ok=false) so it cannot false-report
+		// an overlap; two rule-sets naming one pool under equivalent /96 spellings
+		// (`64:ff9b::/96` vs `64:ff9b::/096` vs `0064:ff9b:0:0:0:0:0:0/96`) dedup to
+		// one owner rather than false-rejecting. See nat64PrefixOwnerKey.
+		prefixKey, ok := nat64PrefixOwnerKey(rs.Prefix)
+		if !ok {
+			continue
+		}
+		key := prefixKey + "\x00" + rs.SourcePool
 		if nat64Seen[key] {
 			continue
 		}
@@ -2609,17 +2609,45 @@ func emitNATOverlap(lenient bool, msg string) ([]string, error) {
 	return nil, fmt.Errorf("%s", msg)
 }
 
-// canonicalNAT64PrefixKey folds a NAT64 `prefix` string to its canonical masked
-// form so equivalent /96 spellings dedup to one allocator identity, matching the
-// Rust nat64.rs canonical-bytes first-match. An unparseable prefix returns its
-// raw text unchanged (the strict NAT64-prefix gate rejects malformed prefixes on
-// commit before this runs; on the tolerant path a bad prefix keeps its raw key
-// rather than crashing or false-merging).
-func canonicalNAT64PrefixKey(prefix string) string {
-	if p, err := netip.ParsePrefix(prefix); err == nil {
-		return p.Masked().String()
+// nat64PrefixOwnerKey returns the canonical allocator key for a NAT64 rule-set
+// prefix, and ok=false when the prefix would NOT build a live NAT64 allocator.
+//
+// It mirrors the Rust nat64.rs build condition — and validateNAT64PrefixStrict's
+// accept set — EXACTLY: the prefix must split on '/' into exactly two parts, the
+// mask must parse as a decimal 96 (so a leading-zero `/096` — which the strict
+// gate and Rust's numeric parse both accept — is honored, unlike a raw
+// netip.ParsePrefix which rejects it), and the address part must be IPv6 by the
+// colon-strict family rule. Only such a rule-set mints external tuples at
+// runtime, so only it is an allocator "owner" for the #5144 overlap gate. An
+// empty / malformed / non-/96 prefix builds no allocator (nat64.rs skips it; the
+// strict gate rejects a non-empty malformed prefix on commit and skips an empty
+// one) — enumerating it as an owner would FALSELY report an overlap (two
+// empty-prefix rule-sets sharing a pool, or an empty-prefix rule-set vs a live
+// source-NAT owner), so ok=false drops it from the owner set on both paths.
+//
+// The key is the CANONICAL /96 network (the Rust 12-byte prefix identity) via
+// netip Masked(), so equivalent spellings — a leading-zero `/096`, an expanded
+// `0064:ff9b:0:0:0:0:0:0`, or host bits beyond /96 — dedup to one owner and never
+// false-reject.
+func nat64PrefixOwnerKey(prefix string) (string, bool) {
+	parts := strings.Split(prefix, "/")
+	if len(parts) != 2 {
+		return "", false
 	}
-	return prefix
+	if m, err := strconv.ParseUint(parts[1], 10, 8); err != nil || m != 96 {
+		return "", false
+	}
+	if natAddrFamily(parts[0]) != "v6" {
+		return "", false
+	}
+	addr, err := netip.ParseAddr(parts[0])
+	if err != nil {
+		// natAddrFamily classified it v6 but netip disagrees (should not happen
+		// for a genuine IPv6 literal) — fall back to a stable normalized text key
+		// so it still dedups by (address text, /96) rather than crashing.
+		return parts[0] + "/96", true
+	}
+	return netip.PrefixFrom(addr, 96).Masked().String(), true
 }
 
 // poolMemberTexts returns a source pool's translated-address members: the single

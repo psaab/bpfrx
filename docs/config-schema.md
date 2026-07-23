@@ -408,12 +408,21 @@ NPTv6 / NAT64 gates) rejects the overlap at commit. It enumerates one allocator
 pool a pool-mode `then source-nat pool` rule references, and one per DISTINCT
 `(canonical prefix, source-pool)` a `nat64 rule-set` references (unreferenced
 pools build no allocator and are out of scope, mirroring the #5877 aggregate
-gate). The NAT64 prefix is folded to its canonical masked form
-(`canonicalNAT64PrefixKey` → `netip.ParsePrefix(...).Masked()`) before keying,
-matching the Rust `nat64.rs` canonical-bytes first-match: two rule-sets naming
-one pool under the SAME /96 in different valid spellings (`64:ff9b::/96` vs
-`0064:ff9b:0:0:0:0:0:0/96`) are ONE runtime allocator, so keying on raw text
-would FALSELY reject them. Each owner's members (`pool.Address` +
+gate). A NAT64 rule-set is an owner ONLY when its prefix would build a live
+allocator — `nat64PrefixOwnerKey` mirrors the Rust `nat64.rs` build condition and
+`validateNAT64PrefixStrict`'s accept set exactly (split on `/` into two parts, the
+mask a decimal 96, the address IPv6 by the colon-strict rule) and returns the
+CANONICAL /96 network (the Rust 12-byte identity) via `netip … Masked()`. An
+empty / malformed / non-/96 prefix builds no allocator (Rust skips it; the strict
+gate rejects a non-empty malformed prefix and *skips* an empty one), so it is
+dropped from the owner set — never enumerated as a phantom owner that would
+falsely report an overlap (two empty-prefix rule-sets sharing a pool, or an
+empty-prefix rule-set vs a live source-NAT owner). The canonical key means two
+rule-sets naming one pool under the SAME /96 in different valid spellings —
+`64:ff9b::/96` vs `0064:ff9b:0:0:0:0:0:0/96` vs a leading-zero `64:ff9b::/096`
+(which `validateNAT64PrefixStrict` and Rust's numeric mask parse both accept, but
+a raw `netip.ParsePrefix` rejects) — are ONE runtime allocator, so keying on raw
+text would FALSELY reject them. Each owner's members (`pool.Address` +
 `pool.Addresses`, ranges already expanded to /32s) become family-scoped numeric
 intervals — v4 vs v6 bucketed by the colon-strict textual family
 (`natAddrFamily(natCIDRIPPart(...))`, the Go/Rust parity rule, so an IPv4-mapped
@@ -447,11 +456,13 @@ source-NAT-vs-NAT64 same-and-distinct-pool / NAT64-different-prefix /
 within-pool-duplicate / IPv6-overlap / IPv6-nesting / IPv6-bare-vs-/128 reject
 cases; a peer-only-`${node}`-overlap reject through the #5876 peer gate; plus
 distinct-pool / shared-pool / cross-family / same-prefix-dedup /
-NAT64-equivalent-prefix-spelling / adjacent-v4 / adjacent-v6 /
+NAT64-equivalent-prefix-spelling / NAT64-leading-zero-`/096`-mask /
+NAT64-empty-prefix-not-an-owner / adjacent-v4 / adjacent-v6 /
 mapped-v6-vs-genuine-v4 / unreferenced accept guards), RED on revert of the gate
 (the overlap is accepted) — and separately RED on revert of the canonical NAT64
-key (equivalent spellings wrongly rejected) and of the peer-view wiring (node0
-accepts the peer-only overlap). The shipped `test/incus/xpf-test.conf` and
+key (equivalent + leading-zero spellings wrongly rejected), of the empty-prefix
+owner skip (an inert NAT64 rule-set falsely reported as an overlap), and of the
+peer-view wiring (node0 accepts the peer-only overlap). The shipped `test/incus/xpf-test.conf` and
 `test/incus/xpf-cluster-fw0.conf` each carried the cross-feature overlap (one
 pool drawn by both NAT64 and a source-NAT rule) and were separated into distinct
 pools + proxy-ARP as part of this change.
