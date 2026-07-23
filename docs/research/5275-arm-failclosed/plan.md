@@ -3,13 +3,14 @@
 - **Issue:** #5275 (HIGH; bug, dataplane, security, vsrx-parity)
 - **Research branch:** `research/5275-arm-failclosed`
 - **Base:** origin/master @ `6131eb4e6`
-- **Revision:** r11 (Codex r9 confirmed D1–D4 + D5(b)-live + the §5 facade fix + the
-  STONITH tradeoff, and isolated ONE fix: the crash-restart path must NOT yield-before-
-  scrub. r11 UNIFIES the yield gate across both paths — a node never publishes its first
-  weight-zero until it has synchronously removed+verified its VIP/stable-link-local/Kea,
-  and a failed scrub keeps it sender-silent (no accelerated takeover) — and makes §3/§12/
-  D5(c) consistent. Architecture VIABLE across six Codex rounds; D1–D4 + D5(b) + facade
-  Codex-accepted.)
+- **Revision:** r12 (Codex r10 confirmed the crash-restart gate SOUND and isolated ONE
+  asymmetry: sender-silent-on-scrub-failure is safe for crash-restart but UNSAFE for a
+  LIVE re-arm (silencing a healthy primary lets the peer activate VIP/Kea while the old
+  owner still holds them). r12 scopes the fallback per-path — crash-restart stays
+  sender-silent; the LIVE path keeps its incumbent heartbeat/takeover interlock until the
+  scrub SUCCEEDS, then atomically holds+yields (never silent-while-holding) — and fixes
+  the §12 and §3-orderly-shutdown doc-consistency nits. Architecture VIABLE across seven
+  Codex rounds; D1–D4 + D5(b) + facade + the crash-restart gate Codex-accepted.)
 - **Prior art:** PR #6358 (draft) — MERGE-NEEDS-MAJOR. Superseded.
 - **Status:** PLAN-READY candidate (research only — no production code;
   `/engineer 5275`).
@@ -74,8 +75,10 @@ clear the dataplane reason prematurely. `dataplaneUnproven` is cleared only by �
 ## 3. Suppress AND withdraw pre-existing ownership (Codex r4 §1)
 
 Holding election blocks NEW Primary transitions but does not withdraw ownership a
-**former-Primary daemon left behind on a crash restart** (orderly shutdown scrubs;
-a crash does not). A held/`armPending` startup that detects inherited ownership
+**former-Primary daemon left behind on a crash restart** (a crash leaves it — and note
+even orderly shutdown does NOT stop Kea or clear persisted FRR, daemon_run_shutdown.go,
+so the scrub below must cover Kea/FRR regardless of how the prior daemon exited). A
+held/`armPending` startup that detects inherited ownership
 must run a **verified withdrawal-only scrub BEFORE it advertises yield**:
 
 - direct VIPs + stable link-locals (reconcile-removed today, daemon_ha.go:891) —
@@ -95,15 +98,17 @@ must run a **verified withdrawal-only scrub BEFORE it advertises yield**:
   cannot diverge the cluster, yet it can still accept a corrected candidate for the
   next restart.
 
-**Withdrawal scrub gates the yield (Codex r5 hole + r9 refinement):** the inherited
-VIP + stable link-local + Kea are withdrawn SYNCHRONOUSLY and VERIFIED **before** this
-node publishes its first weight-zero yield (the unified §13-D5(c) gate). If that scrub
-FAILS, the node does NOT publish weight-zero — it stays sender-silent and falls back to
-the pre-existing peer-timeout window (it must never yield-before-scrub, which would let
-the peer promote onto un-withdrawn state). The nft barrier (§6) stops transit but NOT
-attraction / dual service ownership, which is why the synchronous VIP+link-local+Kea
-scrub gating the yield is required in addition to the barrier. FRR route de-dup is
-async (availability/ECMP behind the barrier, not an ownership defect).
+**Withdrawal scrub gates the yield (Codex r5 hole + r9/r10 refinement):** on a held
+STARTUP (crash-restart/boot) the inherited VIP + stable link-local + Kea are withdrawn
+SYNCHRONOUSLY and VERIFIED **before** this node publishes its first weight-zero yield;
+if that scrub FAILS the startup node stays sender-silent and falls back to the
+pre-existing peer-timeout window (it must never yield-before-scrub). The LIVE re-arm
+case (a running primary) has a DIFFERENT failure fallback — it keeps its incumbent
+heartbeat until the scrub succeeds rather than going silent — see §13-D5(c). The nft
+barrier (§6) stops transit but NOT attraction / dual service ownership, which is why the
+synchronous VIP+link-local+Kea scrub gating the yield is required in addition to the
+barrier. FRR route de-dup is async (availability/ECMP behind the barrier, not an
+ownership defect).
 
 ---
 
@@ -387,11 +392,13 @@ Partial PRs say "advances #5275", never a close-keyword.
   owns every mutually-configured, eligible RG (real heartbeat/election), no
   both-secondary even at higher held priority, no dual VIP in direct-VIP mode;
   weight-zero stays asserted while ANY hold reason is set (effectiveHold), so a
-  dataplane proof under a still-set kernel-trial hold does not un-yield; a failed
-  withdrawal scrub escalates to the proved-down/service-fenced fallback before the
-  peer takes over; legacy-peer golden promotes on weight-zero; withdrawal scrub
-  removes inherited VIP/RA/Kea/FRR before yield;
-  held RG0 store is non-authoritative.
+  dataplane proof under a still-set kernel-trial hold does not un-yield; the first
+  weight-zero yield is NEVER published before the synchronous verified VIP + stable
+  link-local removal + Kea stop (§13-D5(c)); on scrub failure the CRASH-restart path
+  stays sender-silent (pre-existing timeout window) while the LIVE re-arm path KEEPS its
+  incumbent heartbeat (peer stays backup) until the scrub succeeds — it never goes
+  silent-while-holding; FRR route de-dup is async; legacy-peer golden promotes on
+  weight-zero; held RG0 store is non-authoritative.
 - **Staged transaction:** add-B-fails ⇒ B never addressed/up, A's policy retained,
   commit fails; committed-empty→first-interface + remove-all→add use the same
   staged transaction (RED if they take the one-way release path).
@@ -507,19 +514,29 @@ resolved below with a recommended choice (the human approves/overrides at `/engi
   `SendLivenessKeepalive` with an ack + a bounded lease, dead node still promotes on
   expiry) is a follow-up, not required for safety.
 
-  **(c) State machine + the UNIFIED yield gate:** define `armed → (arm-verify fails) →
-  fencing → armFailed` with the arm-coverage proof (§5) as the failure detector. The
-  **invariant is uniform across BOTH (a) and (b):** a node NEVER publishes its first
-  weight-zero yield until it has SYNCHRONOUSLY removed + verified its owned VIP + stable
-  link-local + stopped Kea; on scrub failure it stays sender-silent (no accelerated
-  takeover). This is what §3/§12 "verified withdrawal before yield" means, and it now
-  applies to the crash-restart first-yield too (correcting r10's incorrect exclusion) —
-  a dead node that never restarts is the pre-existing timeout window (the human
-  accepts-or-STONITH), but a node that DOES restart must not yield-before-scrub. Only
-  FRR route de-dup is async (availability/ECMP behind the barrier). `pkg/cluster` +
-  `pkg/vrrp` (the sticky `fencing` state that gates the first zero-publication and
-  prevents VIP re-addition / queued Kea restart) + the scrub sequencing are the §13-D5
-  deliverables.
+  **(c) State machine + the yield gate (SHARED gate, PATH-SPECIFIC failure handling —
+  Codex r10).** Define `armed → (arm-verify fails) → fencing → armFailed` with the
+  arm-coverage proof (§5) as the failure detector. **Shared invariant:** a node NEVER
+  publishes its first weight-zero yield until it has SYNCHRONOUSLY removed + verified its
+  owned VIP + stable link-local + stopped Kea. **The scrub-FAILURE fallback differs by
+  path (this is the Codex r10 correction — sender-silent is safe ONLY for crash-restart):**
+  - **Crash-restart (node was DOWN):** on scrub failure stay **sender-silent** → the
+    peer's pre-existing timeout window takes over (no #5275 acceleration). Safe because
+    the node was not a healthy sender.
+  - **Live re-arm (node is a RUNNING primary):** on scrub failure it must NOT go silent
+    (silencing a healthy sender makes the peer time out and activate VIP/Kea while THIS
+    node still holds them → dual ownership). Instead the `fencing` state is **pre-hold
+    and KEEPS the incumbent heartbeat/takeover interlock** (the peer stays backup) UNTIL
+    the scrub SUCCEEDS; only THEN does it ATOMICALLY enter `effectiveHold`/`armFailed`
+    and publish weight-zero. While it holds-but-cannot-scrub it is fail-CLOSED
+    (the §6 barrier drops transit — a fail-closed blackhole, the security-correct
+    default over dual-ownership), until the scrub succeeds or a **separately verified
+    service/host fence** (the STONITH sign-off) resolves it. It NEVER yields
+    before the scrub and NEVER goes silent-while-holding.
+  Only FRR route de-dup is async (availability/ECMP behind the barrier). `pkg/cluster` +
+  `pkg/vrrp` (the sticky `fencing` state: gates the first zero-publication, keeps the
+  incumbent heartbeat on the live path until scrub, prevents VIP re-addition / queued
+  Kea restart) + the scrub sequencing are the §13-D5 deliverables.
 
   **HUMAN SIGN-OFF (D5):** with the unified yield gate in place (a node never yields
   before its synchronous scrub, and a failed scrub keeps it sender-silent), #5275 never
