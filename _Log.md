@@ -59288,6 +59288,127 @@ top.
   - **File(s)**: pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
     docs/config-schema.md, _Log.md
 
+- **Timestamp**: 2026-07-23T20:43Z
+  - **Action**: Fix #6374 — a nonempty but DANGLING/pathful/incomplete
+    `versions/current` symlink satisfied the pre-STOP rollback guard and could
+    strand xpfd offline. `readCurrentVersion` returned `filepath.Base(readlink)`
+    with no validation, so a broken `current` yielded a nonempty
+    `PreviousVersion` that passed every guard; a post-STOP rollback flip to the
+    missing dir then failed. Added `restorableCurrentTarget` +
+    `validateRestorableVersion` (bare in-tree segment, existing directory,
+    complete `manifest.LockstepNames` set) and routed the rollback-target
+    RECORDING (cutover INIT) + first-cut-sanction through it; a corrupt
+    `current` now takes the same refuse-before-STOP path an absent one does.
+    Also revalidate a PERSISTED `PreviousVersion` on every resume before STOP,
+    and preflight the standalone `rollback()` BEFORE it stops the daemon /
+    restores the config DB. `readCurrentVersion` is UNCHANGED — it still backs
+    the conservative "never delete a live-looking dir" GC / stale-replace
+    guards. NOT HA-touching (no pkg/cluster/pkg/vrrp/failover; HA rollback is
+    operator-driven via SkipStartHealthRollback). Fail-on-revert:
+    dangling_current_6374_test.go (4 tests, 7-case unit matrix) — neutralizing
+    each mechanism drives clean ASSERTION RED (confirmed firsthand), restored
+    GREEN. Full `go test ./pkg/upgrade/...` GREEN; build+vet+gofmt clean.
+  - **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/cutover.go,
+    pkg/upgrade/flip.go, pkg/upgrade/dangling_current_6374_test.go,
+    docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-23T21:10Z
+  - **Action**: Fix #6374 round-2 fold (Codex MERGE-NEEDS-MAJOR). The first-cut
+    sanction was over-broad: `restorableCurrentTarget` collapsed "genuinely
+    absent `current`" and "present-but-unrestorable `current`" into one
+    `("", nil)`, so a PRESENT-but-corrupt/dangling current + the operator's
+    `AllowNoRollbackFirstCut` bypassed refuse-before-STOP and STOPPED the daemon
+    into a broken rollback target — re-introducing the #6374 outage on the
+    sanctioned path. Fold: `restorableCurrentTarget` now returns `(ver, present)`
+    — `present=false` ONLY for `os.IsNotExist`; `present=true` (ver="") for
+    not-a-symlink / pathful / dangling / non-dir / incomplete / any non-ENOENT
+    I/O error (fail-closed). Gated the sanction on ABSENCE (`!present`), not on
+    `ver==""`, at the INIT refuse + FirstCutSanctioned persistence. The pre-STOP
+    resumed gate now refuses a NONEMPTY-but-broken recorded PreviousVersion
+    REGARDLESS of any sanction (the sanction covers only a recorded-empty
+    target). Added a `statVersionDir` seam so the EACCES-indeterminate case is
+    tested root-independently. New tests: sanctioned-dangling-refuses,
+    absent-sanctioned-proceeds (contrast control), resumed-broken-even-
+    sanctioned-refuses, EACCES present-flag; unit matrix now asserts `present`.
+    Neutralizing the present/absent distinction drives the sanction-safety +
+    present assertions RED while the correctness controls stay GREEN (confirmed
+    firsthand), restored GREEN. Full `go test ./pkg/upgrade/...` GREEN;
+    build+vet+gofmt clean. Still NOT HA-touching.
+  - **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/cutover.go,
+    pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-23T21:40Z
+  - **Action**: Fix #6374 round-3 fold (Codex MAJOR — symmetric resumed-path
+    residual). The round-2 INIT gate was correct, but the RESUMED empty-previous
+    branch (cutover.go) trusted the sanction and never re-checked `current`:
+    `case j.PreviousVersion == "": refuseNoTarget = !sanctioned`. A resumed
+    journal with PreviousVersion="" + a persisted OR invocation sanction reached
+    StopUnit without verifying `current` is genuinely absent NOW — reachable via
+    a poisoned pre-#6374 journal (over-broad sanction persisted for a
+    present-but-corrupt current, carried across a deploy) or a `current` that
+    corrupted after a genuinely-sanctioned INIT, STOPping into a broken box (the
+    #6374 hazard). Fold: the empty-previous branch now re-resolves
+    `restorableCurrentTarget()` at resume time and refuses when `current` is
+    present-but-unrestorable, regardless of any sanction. Deliberately keyed on
+    `curPresent && curVer == ""` (present AND unrestorable), NOT Codex's literal
+    `|| prevPresent` — the latter would over-refuse a legit post-flip first-cut
+    resume whose flip already pointed `current` at the restorable target. New
+    tests: resumed-empty-previous + dangling current refuses under BOTH the
+    persisted-sanction and invocation-sanction; genuinely-absent resumed
+    first-cut still PROCEEDS (over-refusal control, transition-driven). Full
+    `go test ./pkg/upgrade/...` GREEN (existing sanctioned-resume test
+    unaffected); neutralizing the resume-time re-check drives the 2 dangling
+    tests RED while the absent control stays GREEN (confirmed firsthand),
+    restored GREEN. build+vet+gofmt clean. Still NOT HA-touching.
+  - **File(s)**: pkg/upgrade/cutover.go,
+    pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-23T22:10Z
+  - **Action**: Fix #6374 round-4 fold (Codex MAJOR — "restorable" predicate was
+    stat-only). validateRestorableVersion checked only `os.Stat(binary) != nil`
+    for each lockstep binary — it ignored file TYPE and permissions, so a
+    DIRECTORY / FIFO / socket / symlink / NON-EXECUTABLE file named `xpfd`
+    counted as restorable. But the flip drop-in execs the literal
+    versions/<ver>/xpfd path, so systemd cannot start such a target → StopUnit
+    into an unstartable rollback state (the #6374 hazard on a deeper corruption
+    mode), reachable at INIT and both resume branches. Fold: each
+    manifest.LockstepNames() binary must be a REGULAR, EXECUTABLE file
+    (`fi.Mode().IsRegular()` && `Perm()&0o111 != 0`), via `os.Lstat` so a
+    symlink is rejected outright (a managed runtime is a real copied file; a
+    symlink at that path is corruption). These flow through the existing
+    present-but-broken → refuse path unchanged (composes with r3). New tests:
+    file-type unit matrix (non-exec / directory / fifo / symlink-to-real-exec /
+    valid control) via restorableCurrentTarget; INIT + resumed integration
+    tests for a non-exec `current` refusing under sanction. The symlink case
+    points at a REAL executable so os.Stat would follow-and-accept — only Lstat
+    rejects it, keeping the fail-on-revert discriminating. Neutralizing to
+    stat-only drives all 4 file-type subtests + both integration tests RED while
+    the valid control stays GREEN (confirmed firsthand), restored GREEN. Full
+    `go test ./pkg/upgrade/...` GREEN (existing valid dirs use 0755 exec regular
+    files — no regression); build+vet+gofmt clean. Still NOT HA-touching.
+  - **File(s)**: pkg/upgrade/runner.go,
+    pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-23T22:35Z
+  - **Action**: Fix #6374 round-5 SPLIT CONVERGENCE (no logic change). Codex
+    found a residual in the SAME predicate dimension: a regular file with the
+    exec BIT but non-executable CONTENT (text chmod 0755, corrupt/wrong-arch
+    binary) passes IsRegular+exec-bit yet execve fails — undecidable statically
+    (ELF-magic is a heuristic; a shebang script is executable but not ELF). Per
+    the armed split trigger, STOP folding the predicate and ship the verified
+    core. Delta: (1) NO logic change — no exec-content probe (would false-reject
+    a legit non-ELF runtime; systemd is the final arbiter at restart). (2) Added
+    the missing `socket` case to the file-type matrix (net.Listen unix +
+    SetUnlinkOnClose(false); skips gracefully on a long sun_path). (3)
+    Doc/comment HONESTY: validateRestorableVersion + docs/in-place-upgrade.md no
+    longer claim the check guarantees "systemd-startable"; clarified it
+    validates METADATA (type + exec bit), content-executability is systemd's at
+    restart. (4) Filed follow-up #6409 for the ELF-heuristic residual, referenced
+    from the doc + code comment. Full `go test ./pkg/upgrade/...` GREEN; vet/
+    gofmt clean; artifact-grep 0. Closes #6374 stays (original dangling bug +
+    common corruption modes fully fixed; exec-content residual is #6409).
+  - **File(s)**: pkg/upgrade/runner.go,
+    pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md
 - **Timestamp**: 2026-07-23
   - **Action**: Fix #6377 — policymatch unsupported-tuple gate folded an
     IPv4-mapped IPv6 source. The #5720 (V4 src, V6 dst) gate in
