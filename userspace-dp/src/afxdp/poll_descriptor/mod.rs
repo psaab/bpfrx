@@ -36,6 +36,7 @@ mod host_inbound_policy;
 mod nat_exception;
 mod prerouting_scope;
 pub(in crate::afxdp) mod reject_reply;
+mod resolver_enqueue;
 mod rx_telemetry;
 mod session_admission;
 
@@ -70,6 +71,7 @@ use cookie_reply::{SynCookieReply, enqueue_syn_cookie_reply};
 use nat_exception::{record_source_nat_failure, source_nat_decision_for_flow};
 use prerouting_scope::{PreroutingIngressScope, prerouting_ingress_scope};
 use reject_reply::{deny_reply_and_emit, enqueue_filter_reject_reply};
+use resolver_enqueue::try_enqueue_resolver;
 
 use filter::{
     emit_input_filter_log_match,
@@ -104,44 +106,6 @@ use filter::{
 // polling — so each shared reborrow is valid and cannot alias a
 // mutable reference. The raw pointer only decouples the immutable
 // UMEM-area borrow from the `&mut BindingWorker` borrow.
-/// #1769/#1912: per-key rate-limited enqueue of the shared neighbor
-/// resolver. Both the neg-cache fast-fail branch and the #1912 tunnel
-/// outer-hop branch use the identical throttle-check / `ifindex_to_name`
-/// clone / `enqueue` / cap-clear / `insert` sequence keyed by
-/// `(ifindex, next_hop)` — factored here so the throttle window, the cap
-/// constant, and the clear-vs-evict policy live in ONE place (Copilot
-/// #1912 r1 Medium). Returns true iff it actually enqueued (i.e. was not
-/// throttled and the iface had a name). Cold-path only.
-#[inline]
-fn try_enqueue_resolver(
-    resolver: &NeighborResolver,
-    throttle: &mut FastMap<(i32, IpAddr), u64>,
-    ifindex_to_name: &FastMap<i32, String>,
-    key: (i32, IpAddr),
-    now_ns: u64,
-) -> bool {
-    // Cheap (i32, IpAddr) map check runs before any clone.
-    let throttled = matches!(
-        throttle.get(&key),
-        Some(&t) if now_ns.saturating_sub(t) < RESOLVER_ENQUEUE_THROTTLE_NS
-    );
-    if throttled {
-        return false;
-    }
-    let Some(name) = ifindex_to_name.get(&key.0) else {
-        return false;
-    };
-    resolver.enqueue(key.0, key.1, name.clone());
-    // Bound the throttle map like the negative cache: a /24 scan touches
-    // <=254 keys, so clear wholesale past the cap (best-effort — losing
-    // throttle for a few keys only risks one extra clone).
-    if throttle.len() >= MAX_NEG_NEIGH_CACHE && !throttle.contains_key(&key) {
-        throttle.clear();
-    }
-    throttle.insert(key, now_ns);
-    true
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn poll_binding_process_descriptor(
     binding: &mut BindingWorker,
@@ -5205,87 +5169,5 @@ pub(super) fn poll_binding_process_descriptor(
     }
     received.release();
     drop(received);
-}
-
-#[cfg(test)]
-mod try_enqueue_resolver_tests {
-    use super::*;
-    use crate::afxdp::neighbor_resolver::{NeighborResolver, ResolveItem, ResolverCounters};
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::mpsc;
-
-    fn make_resolver() -> (NeighborResolver, mpsc::Receiver<ResolveItem>) {
-        let (tx, rx) = mpsc::sync_channel::<ResolveItem>(8);
-        let resolver = NeighborResolver::new(
-            tx,
-            Arc::new(ResolverCounters::default()),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(crate::afxdp::neighbor_latency::NeighborLatencyHist::default()),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-        );
-        (resolver, rx)
-    }
-
-    #[test]
-    fn try_enqueue_resolver_throttles_within_window_and_bounds_map() {
-        let (resolver, rx) = make_resolver();
-        let mut throttle: FastMap<(i32, IpAddr), u64> = FastMap::default();
-        let mut names: FastMap<i32, String> = FastMap::default();
-        names.insert(12, "ge-0-0-2.80".to_string());
-        let key = (12, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)));
-
-        // First call enqueues and records the throttle entry.
-        assert!(try_enqueue_resolver(
-            &resolver,
-            &mut throttle,
-            &names,
-            key,
-            1_000
-        ));
-        assert_eq!(rx.try_recv().expect("first enqueue").ifindex, 12);
-        assert!(throttle.contains_key(&key));
-
-        // Second call within RESOLVER_ENQUEUE_THROTTLE_NS is throttled: no
-        // enqueue (storm bound — at most one per key per window).
-        assert!(!try_enqueue_resolver(
-            &resolver,
-            &mut throttle,
-            &names,
-            key,
-            1_000 + RESOLVER_ENQUEUE_THROTTLE_NS - 1
-        ));
-        assert!(rx.try_recv().is_err(), "throttled call must not enqueue");
-
-        // After the window elapses, it enqueues again.
-        assert!(try_enqueue_resolver(
-            &resolver,
-            &mut throttle,
-            &names,
-            key,
-            1_000 + RESOLVER_ENQUEUE_THROTTLE_NS
-        ));
-        assert_eq!(rx.try_recv().expect("post-window enqueue").ifindex, 12);
-    }
-
-    #[test]
-    fn try_enqueue_resolver_skips_when_iface_has_no_name() {
-        let (resolver, rx) = make_resolver();
-        let mut throttle: FastMap<(i32, IpAddr), u64> = FastMap::default();
-        let names: FastMap<i32, String> = FastMap::default(); // empty
-        let key = (362, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)));
-        // No name for the ifindex ⇒ no enqueue, no throttle entry.
-        assert!(!try_enqueue_resolver(
-            &resolver,
-            &mut throttle,
-            &names,
-            key,
-            1_000
-        ));
-        assert!(rx.try_recv().is_err());
-        assert!(throttle.is_empty());
-    }
 }
 
