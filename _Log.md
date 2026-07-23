@@ -59562,3 +59562,36 @@ top.
     clean assertions; restored green.
   - **File(s)**: pkg/cli/cli_request_ping.go, pkg/cli/cli_request_argv_test.go,
     pkg/cli/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6176 metric-HELP precision (Go half only — area-partition
+    split; the userspace-dp Rust doc-comment half is split to #6413 for the
+    userspace-dp owner). DOC/string-only, no behavior change (verified
+    firsthand against the code). The `synced_import_cap_drops_total` metric
+    HELP said the bound was the LOGICAL ceiling `worker_count * max_sessions`;
+    the shared `synced` map is bounded at 2× that in ENTRIES (each admitted
+    forward publishes a forward AND a synthesized reverse companion per
+    logical session). Aligned the two Go formula sites to
+    `2 * worker_count * max_sessions` entries, keeping the correct firing
+    semantics (a drop = a peer past its OWN logical session ceiling; a full
+    symmetric-peer set of N logical → 2N entries EXACTLY fits and never trips
+    it). Correctness cited against the userspace-dp coordinator
+    (`upsert_synced_session` gate + `synced_import_cap` = `2 * worker_count *
+    DEFAULT_MAX_SESSIONS`, which `bpf_map/metrics.rs` already documents at
+    2N). Not a metric-code change (name/labels/direction/firing all unchanged
+    and correct) — a pure HELP/doc-string correction, so no fail-on-revert
+    test; no existing test binds the HELP prose (metrics_test.go asserts the
+    counter VALUE, unaffected). Reverted the 4 userspace-dp files (README +
+    session_import.rs/control.rs/coordinator/status.rs comments) OUT of this
+    PR — handed off in #6413. Codex re-review fold (MERGE-NEEDS-MINOR): the
+    "a peer exceeded its OWN ceiling" clause was a receiver-local claim
+    mis-attributed to the peer — the gate (session_import.rs:91) only
+    observes THIS appliance's occupancy vs the RECEIVER-derived cap, so a
+    larger asymmetric peer can legitimately trip a smaller receiver's cap
+    (session/README.md:775). Reworded both Go sites to "a peer's import
+    would push THIS appliance past its own aggregate entry ceiling (2N)"
+    (receiver-local), and noted in the internal status doc that 2N is the
+    FORWARD-admission threshold (a lone reverse bypasses the gate, so
+    occupancy can momentarily reach 2N+1).
+  - **File(s)**: pkg/api/metrics_descriptors.go,
+    pkg/dataplane/userspace/protocol_status.go, _Log.md
