@@ -21,14 +21,6 @@ import (
 // (drop the installHostInboundColdBootFence call, or its emitted drops) and the
 // cold-boot assertions go RED.
 
-// realHostInboundPayload reports whether an nft `-f -` payload is the REAL
-// host-inbound ruleset (carries a per-service ACCEPT) rather than the fence
-// (drops only). hostInboundTestConfig's wan zone permits ssh, so the real
-// payload contains `tcp dport 22 accept`; the fence never accepts a service.
-func realHostInboundPayload(payload string) bool {
-	return strings.Contains(payload, "tcp dport 22 accept")
-}
-
 // TestColdBootHostInboundInstallFailureInstallsFence is the primary #5644
 // fail-on-revert proof: at cold boot, when the real host-inbound `nft -f -`
 // install fails and no enforcement table has ever loaded this boot, a fail-closed
@@ -39,21 +31,22 @@ func realHostInboundPayload(payload string) bool {
 func TestColdBootHostInboundInstallFailureInstallsFence(t *testing.T) {
 	cfg := hostInboundTestConfig()
 
-	injected := errors.New("nft: rule load failed")
-	var payloads []string
-	var fencePayload string
-	orig := nftApplyPayload
-	nftApplyPayload = func(payload string) ([]byte, error) {
-		payloads = append(payloads, payload)
-		if realHostInboundPayload(payload) {
-			// Real ruleset install fails (injected cold-boot install failure).
-			return []byte("Error: could not process rule\n"), injected
-		}
-		// The fence payload loads.
-		fencePayload = payload
-		return nil, nil
+	injected := errors.New("nftables: rule load failed")
+	var hostInboundCalls, fenceCalls int
+	var fenceSpec xnft.FenceSpec
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{
+		hostInbound: func(xnft.HostInboundSpec) error {
+			hostInboundCalls++
+			return injected // real ruleset install fails (injected cold-boot install failure)
+		},
+		coldBootFence: func(spec xnft.FenceSpec) error {
+			fenceCalls++
+			fenceSpec = spec
+			return nil // the fence installs
+		},
 	}
-	defer func() { nftApplyPayload = orig }()
+	defer func() { nftInstaller = orig }()
 
 	d := &Daemon{}
 	// Cold boot: no enforcement table has ever loaded.
@@ -68,15 +61,15 @@ func TestColdBootHostInboundInstallFailureInstallsFence(t *testing.T) {
 		t.Fatal("cold-boot install failure must be surfaced as an error, got nil")
 	}
 	if !errors.Is(err, injected) {
-		t.Errorf("returned error must wrap the nft failure, got %v", err)
+		t.Errorf("returned error must wrap the netlink failure, got %v", err)
 	}
 
-	// A fence must have been installed (the second nft call).
-	if fencePayload == "" {
-		t.Fatalf("cold-boot install failure must install a fail-closed fence; nft payloads seen:\n%v", payloads)
+	// A fence must have been installed (exactly one cold-boot fence install).
+	if fenceCalls != 1 {
+		t.Fatalf("cold-boot install failure must install exactly one fail-closed fence, got %d", fenceCalls)
 	}
-	if len(payloads) != 2 {
-		t.Errorf("expected exactly 2 nft applies (real + fence), got %d:\n%v", len(payloads), payloads)
+	if hostInboundCalls != 1 {
+		t.Errorf("expected exactly one real host-inbound install attempt, got %d", hostInboundCalls)
 	}
 
 	// Enforcement is now established (via the fence) — a later day-2 failure is
@@ -85,27 +78,16 @@ func TestColdBootHostInboundInstallFailureInstallsFence(t *testing.T) {
 		t.Error("hostInboundEnforced must be true after the fence installs (enforcement established)")
 	}
 
-	// The fence must be a real xpf_hostinbound table that DENIES host services to
-	// the enforced zone's addresses (both families), NOT leave them open.
-	fenceMust := []string{
-		"table inet xpf_hostinbound",
-		"type filter hook input priority 10; policy accept;",
-		"ct state established,related accept",
-		// deny-all to the wan v4 + v6 firewall-local addresses (host services fenced).
-		"ip daddr 172.16.50.8 drop",
-		"ip6 daddr 2001:db8:50::8 drop",
+	// The fence must DENY host services to the enforced zone's addresses (both
+	// families) — the wan v4 + v6 firewall-local addresses appear in the fence's
+	// DROP scope. (A FenceSpec structurally carries NO per-service accept, so the
+	// "fence must not accept a service" fail-open is guaranteed by the type; the
+	// exact drop-rule rendering is pinned by the PR-2 netlink builder + parity CI.)
+	if !sliceContains(fenceViewAddrs(fenceSpec, false), "172.16.50.8") {
+		t.Errorf("fence must fence the enforced wan v4 address 172.16.50.8:\n%+v", fenceSpec)
 	}
-	for _, want := range fenceMust {
-		if !strings.Contains(fencePayload, want) {
-			t.Errorf("fence payload missing %q\n---\n%s", want, fencePayload)
-		}
-	}
-
-	// The fence must NOT accept any host service — that would re-open the exposure.
-	for _, banned := range []string{"tcp dport 22 accept", "icmp type echo-request accept"} {
-		if strings.Contains(fencePayload, banned) {
-			t.Errorf("fence must not accept host service %q (fail-open):\n%s", banned, fencePayload)
-		}
+	if !sliceContains(fenceViewAddrs(fenceSpec, true), "2001:db8:50::8") {
+		t.Errorf("fence must fence the enforced wan v6 address 2001:db8:50::8:\n%+v", fenceSpec)
 	}
 }
 
@@ -175,8 +157,8 @@ func TestDay2HostInboundInstallFailureNoFence(t *testing.T) {
 	cfg := hostInboundTestConfig()
 
 	// First apply: real install succeeds → enforcement established.
-	orig := nftApplyPayload
-	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{} // all succeed
 	d := &Daemon{}
 	if err := d.applyHostInboundFilter(cfg); err != nil {
 		t.Fatalf("first (successful) apply: %v", err)
@@ -186,28 +168,37 @@ func TestDay2HostInboundInstallFailureNoFence(t *testing.T) {
 	}
 
 	// Second apply: real install fails. The prior table is retained by the atomic
-	// load, so NO fence must be installed.
-	injected := errors.New("nft: transient failure")
-	var payloads []string
-	nftApplyPayload = func(payload string) ([]byte, error) {
-		payloads = append(payloads, payload)
-		if realHostInboundPayload(payload) {
-			return []byte("Error\n"), injected
-		}
-		t.Errorf("day-2 failure must NOT install a fence; got fence payload:\n%s", payload)
-		return nil, nil
+	// load, and the desired coverage is unchanged (same config), so NEITHER the
+	// cold-boot fence NOR the additive gap fence must be installed.
+	injected := errors.New("nftables: transient failure")
+	var hostInboundCalls, fenceCalls, gapCalls int
+	nftInstaller = &fakeNftInstaller{
+		hostInbound: func(xnft.HostInboundSpec) error { hostInboundCalls++; return injected },
+		coldBootFence: func(xnft.FenceSpec) error {
+			fenceCalls++
+			t.Errorf("day-2 failure must NOT install a cold-boot fence")
+			return nil
+		},
+		gapFence: func(xnft.GapFenceSpec) error {
+			gapCalls++
+			t.Errorf("day-2 failure with full coverage must NOT install a gap fence")
+			return nil
+		},
 	}
-	defer func() { nftApplyPayload = orig }()
+	defer func() { nftInstaller = orig }()
 
 	err := d.applyHostInboundFilter(cfg)
 	if err == nil {
 		t.Fatal("day-2 install failure must still be surfaced as an error")
 	}
 	if !errors.Is(err, injected) {
-		t.Errorf("returned error must wrap the nft failure, got %v", err)
+		t.Errorf("returned error must wrap the netlink failure, got %v", err)
 	}
-	if len(payloads) != 1 {
-		t.Errorf("day-2 failure must attempt only the real payload (no fence), got %d applies:\n%v", len(payloads), payloads)
+	if hostInboundCalls != 1 {
+		t.Errorf("day-2 failure must attempt exactly one real install, got %d", hostInboundCalls)
+	}
+	if fenceCalls != 0 || gapCalls != 0 {
+		t.Errorf("day-2 failure must install no fence (cold-boot=%d, gap=%d)", fenceCalls, gapCalls)
 	}
 }
 
@@ -217,16 +208,14 @@ func TestDay2HostInboundInstallFailureNoFence(t *testing.T) {
 func TestColdBootFenceCatastrophicFailureSurfaced(t *testing.T) {
 	cfg := hostInboundTestConfig()
 
-	realErr := errors.New("nft: rule load failed")
-	fenceErr := errors.New("nft: binary missing")
-	orig := nftApplyPayload
-	nftApplyPayload = func(payload string) ([]byte, error) {
-		if realHostInboundPayload(payload) {
-			return nil, realErr
-		}
-		return nil, fenceErr
+	realErr := errors.New("nftables: rule load failed")
+	fenceErr := errors.New("nftables: kernel refused fence")
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{
+		hostInbound:   func(xnft.HostInboundSpec) error { return realErr },
+		coldBootFence: func(xnft.FenceSpec) error { return fenceErr },
 	}
-	defer func() { nftApplyPayload = orig }()
+	defer func() { nftInstaller = orig }()
 
 	d := &Daemon{}
 	err := d.applyHostInboundFilter(cfg)
@@ -311,52 +300,23 @@ func TestColdBootZeroDropFenceRetriesAfterAddressAppears5759(t *testing.T) {
 		t.Fatal("precondition: hostInboundEnforced must start false")
 	}
 
-	injected := errors.New("nft: issue 5759 real load failure")
-	cn := xnft.HostInboundJunosHostDenyCounterName("untrust", "ip")
-	wantIIFDrop := `iifname "xpf5759wan" ip saddr 10.0.0.5/32 counter name "` + cn + `" drop`
-	wantAddressDrop := "ip daddr 198.51.100.57 drop"
-	var payloads []string
-	orig := nftApplyPayload
-	nftApplyPayload = func(payload string) ([]byte, error) {
-		index := len(payloads)
-		payloads = append(payloads, payload)
-		if !strings.Contains(payload, "table inet xpf_hostinbound") {
-			t.Fatalf("payload %d is not an xpf_hostinbound table:\n%s", index, payload)
-		}
-		switch index {
-		case 0:
-			if !strings.Contains(payload, wantIIFDrop) {
-				t.Fatalf("initial real payload missing %q:\n%s", wantIIFDrop, payload)
-			}
-			return []byte("injected real failure"), injected
-		case 1:
-			if strings.Contains(payload, "iifname") || strings.Contains(payload, " daddr ") {
-				t.Fatalf("initial fallback must have no iifname or address-scoped DROP:\n%s", payload)
-			}
-			return nil, nil
-		case 2:
-			if !strings.Contains(payload, wantIIFDrop) || !strings.Contains(payload, "ip daddr 198.51.100.57") {
-				t.Fatalf("addressed real payload missing iifname deny or appeared destination:\n%s", payload)
-			}
-			return []byte("injected real failure"), injected
-		case 3:
-			if strings.Contains(payload, "iifname") {
-				t.Fatalf("addressed fallback must not contain iifname:\n%s", payload)
-			}
-			if strings.Count(payload, wantAddressDrop) != 1 || strings.Count(payload, " daddr ") != 1 {
-				t.Fatalf("addressed fallback must contain exactly one %q and one daddr rule:\n%s", wantAddressDrop, payload)
-			}
-			if strings.Contains(payload, cn) || strings.Contains(payload, "tcp dport 22 accept") {
-				t.Fatalf("addressed fallback must not contain a junos-host counter or service accept:\n%s", payload)
-			}
-			return nil, nil
-		default:
-			t.Fatalf("unexpected nft payload index %d:\n%s", index, payload)
-			return nil, nil
-		}
+	injected := errors.New("nftables: issue 5759 real load failure")
+	var realSpecs []xnft.HostInboundSpec
+	var fenceSpecs []xnft.FenceSpec
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{
+		hostInbound: func(spec xnft.HostInboundSpec) error {
+			realSpecs = append(realSpecs, spec)
+			return injected // the real ruleset always fails
+		},
+		coldBootFence: func(spec xnft.FenceSpec) error {
+			fenceSpecs = append(fenceSpecs, spec)
+			return nil // the fence loads
+		},
 	}
-	defer func() { nftApplyPayload = orig }()
+	defer func() { nftInstaller = orig }()
 
+	// --- Apply 1: addressless (program-only) — the fence is ZERO-DROP. ---
 	err := d.applyHostInboundFilter(cfg)
 	if !errors.Is(err, injected) {
 		t.Fatalf("initial apply error = %v, want wrapped sentinel", err)
@@ -364,10 +324,21 @@ func TestColdBootZeroDropFenceRetriesAfterAddressAppears5759(t *testing.T) {
 	if d.hostInboundEnforced.Load() {
 		t.Fatal("zero-drop fallback must leave state false")
 	}
-	if len(payloads) != 2 {
-		t.Fatalf("initial apply payload count = %d, want 2", len(payloads))
+	if len(realSpecs) != 1 || len(fenceSpecs) != 1 {
+		t.Fatalf("apply 1 call counts: real=%d fence=%d, want 1/1", len(realSpecs), len(fenceSpecs))
+	}
+	// The real spec carries the junos-host iifname DENY for 10.0.0.5/32.
+	if !hostInboundProgramHasSrc(realSpecs[0], "xpf5759wan", "10.0.0.5/32") {
+		t.Fatalf("initial real spec missing the junos-host iifname deny for 10.0.0.5/32:\n%+v", realSpecs[0])
+	}
+	// The fallback fence is ZERO-DROP: no address-scoped drop in either family (a
+	// FenceSpec structurally carries no iifname/program scope, so a junos-host-only
+	// generation fences nothing).
+	if len(fenceViewAddrs(fenceSpecs[0], false)) != 0 || len(fenceViewAddrs(fenceSpecs[0], true)) != 0 {
+		t.Fatalf("initial fallback must be a zero-drop fence:\n%+v", fenceSpecs[0])
 	}
 
+	// --- Apply 2: an address appears — the fence becomes ADDRESS-SCOPED. ---
 	unit.Addresses = []string{"198.51.100.57/24"}
 	assertProjection(true)
 	err = d.applyHostInboundFilter(cfg)
@@ -377,8 +348,22 @@ func TestColdBootZeroDropFenceRetriesAfterAddressAppears5759(t *testing.T) {
 	if !d.hostInboundEnforced.Load() {
 		t.Fatal("address-scoped fallback must publish state true")
 	}
-	if len(payloads) != 4 {
-		t.Fatalf("total payload count = %d, want 4", len(payloads))
+	if len(realSpecs) != 2 || len(fenceSpecs) != 2 {
+		t.Fatalf("apply 2 call counts: real=%d fence=%d, want 2/2", len(realSpecs), len(fenceSpecs))
+	}
+	// The addressed real spec still carries the program AND the appeared destination.
+	if !hostInboundProgramHasSrc(realSpecs[1], "xpf5759wan", "10.0.0.5/32") {
+		t.Fatalf("addressed real spec missing the junos-host iifname deny:\n%+v", realSpecs[1])
+	}
+	if !sliceContains(hostInboundViewAddrs(realSpecs[1], false), "198.51.100.57") {
+		t.Fatalf("addressed real spec missing the appeared destination 198.51.100.57:\n%+v", realSpecs[1])
+	}
+	// The address-scoped fence fences EXACTLY the appeared v4 address, nothing v6.
+	if got := fenceViewAddrs(fenceSpecs[1], false); len(got) != 1 || got[0] != "198.51.100.57" {
+		t.Fatalf("addressed fallback must fence exactly [198.51.100.57], got %v:\n%+v", got, fenceSpecs[1])
+	}
+	if len(fenceViewAddrs(fenceSpecs[1], true)) != 0 {
+		t.Fatalf("addressed fallback must not fence a v6 address:\n%+v", fenceSpecs[1])
 	}
 }
 
@@ -388,24 +373,18 @@ func TestColdBootZeroDropFenceRetriesAfterAddressAppears5759(t *testing.T) {
 // selected unzoned-address term.
 func TestColdBootFenceUnzonedDropPublishesState5759(t *testing.T) {
 	tests := []struct {
-		name         string
-		views        []dpuserspace.ZoneHostInboundView
-		unzonedV4    []string
-		unzonedV6    []string
-		wantDrop     string
-		oppositeRule string
+		name      string
+		views     []dpuserspace.ZoneHostInboundView
+		unzonedV4 []string
+		unzonedV6 []string
 	}{
 		{
-			name:         "ipv4",
-			unzonedV4:    []string{"192.0.2.57"},
-			wantDrop:     "ip daddr 192.0.2.57 drop",
-			oppositeRule: "ip6 daddr",
+			name:      "ipv4",
+			unzonedV4: []string{"192.0.2.57"},
 		},
 		{
-			name:         "ipv6",
-			unzonedV6:    []string{"2001:db8:5759::57"},
-			wantDrop:     "ip6 daddr 2001:db8:5759::57 drop",
-			oppositeRule: "ip daddr",
+			name:      "ipv6",
+			unzonedV6: []string{"2001:db8:5759::57"},
 		},
 	}
 
@@ -432,36 +411,36 @@ func TestColdBootFenceUnzonedDropPublishesState5759(t *testing.T) {
 			}
 
 			calls := 0
-			orig := nftApplyPayload
-			nftApplyPayload = func(payload string) ([]byte, error) {
-				calls++
-				if calls != 1 {
-					t.Fatalf("fallback nft call count = %d, want exactly 1", calls)
-				}
-				if !strings.Contains(payload, "table inet xpf_hostinbound") {
-					t.Fatalf("fallback payload missing xpf_hostinbound table:\n%s", payload)
-				}
-				if strings.Count(payload, tc.wantDrop) != 1 || strings.Count(payload, " daddr ") != 1 {
-					t.Fatalf("fallback must contain exactly one %q and one daddr rule:\n%s", tc.wantDrop, payload)
-				}
-				if strings.Contains(payload, tc.oppositeRule) {
-					t.Fatalf("fallback contains opposite-family daddr rule %q:\n%s", tc.oppositeRule, payload)
-				}
-				for _, banned := range []string{"iifname", "counter name", "tcp dport", "udp dport", "icmp type echo-request"} {
-					if strings.Contains(payload, banned) {
-						t.Fatalf("fallback must not contain %q:\n%s", banned, payload)
-					}
-				}
-				return nil, nil
+			var fenceSpec xnft.FenceSpec
+			orig := nftInstaller
+			nftInstaller = &fakeNftInstaller{
+				coldBootFence: func(spec xnft.FenceSpec) error {
+					calls++
+					fenceSpec = spec
+					return nil
+				},
 			}
-			defer func() { nftApplyPayload = orig }()
+			defer func() { nftInstaller = orig }()
 
 			if err := d.installHostInboundColdBootFence(tc.views, tc.unzonedV4, tc.unzonedV6, nil,
 				hostInboundDesiredDropAddrs(tc.views, tc.unzonedV4, tc.unzonedV6)); err != nil {
 				t.Fatalf("installHostInboundColdBootFence: %v", err)
 			}
 			if calls != 1 {
-				t.Fatalf("fallback nft call count = %d, want 1", calls)
+				t.Fatalf("fence install call count = %d, want exactly 1", calls)
+			}
+			// The fence scopes EXACTLY the selected-family unzoned address and nothing
+			// in the opposite family (a FenceSpec structurally carries no iifname /
+			// counter / service accept). Views are empty in this table-driven case.
+			wantAddrs, wantV6 := tc.unzonedV4, false
+			if tc.name == "ipv6" {
+				wantAddrs, wantV6 = tc.unzonedV6, true
+			}
+			if got := fenceViewAddrs(fenceSpec, wantV6); len(got) != 1 || got[0] != wantAddrs[0] {
+				t.Fatalf("fence must scope exactly %v, got %v:\n%+v", wantAddrs, got, fenceSpec)
+			}
+			if got := fenceViewAddrs(fenceSpec, !wantV6); len(got) != 0 {
+				t.Fatalf("fence must not scope the opposite family, got %v:\n%+v", got, fenceSpec)
 			}
 			if !d.hostInboundEnforced.Load() {
 				t.Fatal("successful U-only fallback must publish true")

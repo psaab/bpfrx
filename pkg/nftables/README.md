@@ -13,11 +13,14 @@ the counter READERS the observability surface scrapes.
   the new one isn't installed.
 - `RemoveRSTSuppression()`.
 
-### Host-inbound / lo0 / fence installer (#6387 PR-2, ADDITIVE)
+### Host-inbound / lo0 / fence installer (#6387 PR-2 additive, PR-3 CUTOVER)
 The `Installer` interface (`netlink_installer.go`) is the concrete
 injection seam covering every kernel-touching host-inbound / lo0 / fence
-operation that today goes through the exec-`nft` package vars
-(`nftApplyPayload` / `nftDeleteTable`) in `pkg/daemon/daemon_nft.go`:
+operation. Since #6387 PR-3 it is the PRODUCTION path: `pkg/daemon`
+(`daemon_nft_netlink.go`) drives it via the `nftInstaller` package var
+instead of the exec-`nft` package vars (`nftApplyPayload` /
+`nftDeleteTable`, now retained only as the parity-CI ORACLE), so a node
+needs the kernel `nf_tables` MODULE but no `nft` BINARY:
 
 - `InstallHostInbound(HostInboundSpec)` — the real host-inbound table
   (#3070/#3333): ct-state / ESP-AH / ICMP-accept + counters / WireGuard,
@@ -79,9 +82,15 @@ host path. Three test layers pin this:
 ### Capability probe (`netlink_capability.go`, #6387 §12.5)
 - `ProbeNFTablesAvailable()` — functional probe (NOT `/proc/modules`; the
   module may be built-in). Returns the distinct `ErrNFTablesUnavailable`
-  when the kernel nf_tables subsystem is absent, so PR-3 can raise the CF
+  when the kernel nf_tables subsystem is absent, so PR-3 raises the CF
   monitor-failure with an explicit reason.
 - `IsNFTablesUnavailable(err)` — classifies that distinct signal.
+- PR-3 wiring: on a netlink install failure `pkg/daemon` (`tagNftInstallErr`)
+  probes and, when the subsystem is unavailable, tags the returned error
+  with `ErrNFTablesUnavailable` (one-time distinct operator log + the CF
+  monitor-failure reason via `Manager.SetConfigSyncHealth`). The probe NEVER
+  downgrades the H7 fail-closed contract — the real install still runs and its
+  error still fails the commit closed.
 
 ### Counter readers
 `ReadLo0Counters` / `ReadHostInboundDenyCounters` /
