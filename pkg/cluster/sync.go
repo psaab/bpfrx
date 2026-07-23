@@ -345,6 +345,18 @@ type SessionSync struct {
 	// the standby eligible for the primary's re-push instead of silently
 	// stranded on the prior config (M-2/#4151).
 	OnConfigReceived func(configText string) error
+	// OnConfigApplyHealth reports the config-sync APPLY health edge (#6387).
+	// configApplyLoop fires failing=true (once) when a received config
+	// generation has stayed un-applied — apply hard-failing, high-water pinned
+	// per M-2/#4151 — for longer than the stale-duration grace
+	// (configApplyFailGrace), and failing=false (once) the first time an apply
+	// succeeds after such a raise. reason is the raw apply error on a raise (the
+	// Manager sanitizes/bounds it before storage) and empty on a clear. The
+	// daemon wires this to Manager.SetConfigSyncHealth so a persistently
+	// stranded standby surfaces as a CF monitor-failure / degraded health
+	// instead of only the terse `Transfer ready: no` string. Diagnostic only —
+	// it NEVER gates failover.
+	OnConfigApplyHealth func(failing bool, reason string)
 	// OnIPsecSAReceived is called when an IPsec SA list arrives from the peer.
 	OnIPsecSAReceived func(connectionNames []string)
 	// OnDHCPLeasesReceived is called when a DHCP-server lease set arrives from
@@ -596,6 +608,23 @@ type SessionSync struct {
 	// monotonic counter lower.
 	lastRecvConfigGen atomic.Uint64
 	configApplyCh     chan configApplyItem
+
+	// Config-sync APPLY health tracking (#6387). These drive the time-based CF
+	// monitor-failure edge and are touched ONLY by the single-consumer
+	// configApplyLoop goroutine, so they need no lock/atomic (same ownership as
+	// the loop-local high-water logic).
+	//
+	// firstUnappliedFailNano is MonotonicNanos of the FIRST apply failure in the
+	// current un-applied streak (0 = no active streak). configApplyHealthRaised
+	// records whether OnConfigApplyHealth(true) has already fired for this
+	// streak, so the raise fires at most once and the matching clear fires on
+	// the first subsequent success. nowMonoFn/configApplyFailGrace are injection
+	// seams (nil / 0 = production defaults) that let a test drive the
+	// stale-duration clock and threshold deterministically.
+	firstUnappliedFailNano  int64
+	configApplyHealthRaised bool
+	nowMonoFn               func() int64
+	configApplyFailGrace    time.Duration
 
 	// #5706 full-set state-sync ordering guard (IPsec SA + DHCP leases).
 	//

@@ -17,6 +17,7 @@ func (m *Manager) FormatStatus() string {
 	peerVersion := m.peerSoftwareVersion
 	localProtocol := normalizeHAProtocolVersion(m.localHAProtocolVersion)
 	peerProtocol := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
+	configSyncFailing := m.configSyncFailing // #6387: node-global CF annotation
 	peerGroups := make(map[int]PeerGroupState, len(m.peerGroups))
 	for k, v := range m.peerGroups {
 		peerGroups[k] = v
@@ -61,6 +62,17 @@ func (m *Manager) FormatStatus() string {
 		monFails := "None"
 		if len(rg.MonitorFails) > 0 {
 			monFails = strings.Join(rg.MonitorFails, ", ")
+		}
+		// #6387: fold the node-global CF config-sync monitor-failure into the
+		// Monitor-failures column for every RG row. It is a dedicated manager
+		// field (not an rg.MonitorFails entry) so reconcileMonitorDebtsLocked
+		// cannot wipe it on the next UpdateConfig.
+		if configSyncFailing {
+			if monFails == "None" {
+				monFails = "CF"
+			} else {
+				monFails += ", CF"
+			}
 		}
 		readyStr := "yes"
 		if !rg.Ready {
@@ -107,6 +119,8 @@ func (m *Manager) FormatInformation() string {
 	interval := m.hbInterval
 	threshold := m.hbThreshold
 	controlIface := m.controlInterface
+	configSyncFailing := m.configSyncFailing   // #6387
+	configSyncReason := m.configSyncFailReason // #6387
 	m.mu.RUnlock()
 
 	states := m.GroupStates()
@@ -157,6 +171,12 @@ func (m *Manager) FormatInformation() string {
 
 	// Node health.
 	localHealth := "healthy"
+	// #6387: a persistent config-sync apply failure degrades node health
+	// node-wide (same annotate-only semantics as a monitor-failure, but it
+	// never perturbs Weight/election).
+	if configSyncFailing {
+		localHealth = "degraded"
+	}
 	for _, rg := range states {
 		if len(rg.MonitorFails) > 0 || rg.Weight < 255 {
 			localHealth = "degraded"
@@ -336,6 +356,17 @@ func (m *Manager) FormatInformation() string {
 		}
 	} else {
 		fmt.Fprintln(&b, "  Not configured")
+	}
+	// #6387: surface the node-global CF config-sync health beside the
+	// apply-failed counter so an operator sees WHY the standby is stuck
+	// `Transfer ready: no` (e.g. host-inbound apply hard-failing) instead of
+	// only the terse status string.
+	if configSyncFailing {
+		reason := configSyncReason
+		if reason == "" {
+			reason = "config-sync apply failing"
+		}
+		fmt.Fprintf(&b, "  Config sync: failing (%s)\n", reason)
 	}
 	cfgEvents := m.history.Events(EventConfigSync)
 	if len(cfgEvents) > 0 {

@@ -2,8 +2,56 @@ package cluster
 
 import (
 	"log/slog"
+	"strings"
 	"time"
 )
+
+// maxConfigSyncReasonLen bounds the stored/rendered config-sync failure reason
+// (#6387) so an arbitrary apply error can never blow up the status output.
+const maxConfigSyncReasonLen = 200
+
+// SetConfigSyncHealth records the node-global config-sync APPLY health (#6387),
+// mirroring SetRGReady's manager-mutation shape. failing=true raises the CF
+// config-sync monitor-failure / degraded-health annotation surfaced by
+// FormatStatus / FormatInformation; failing=false clears it. The reason is
+// bounded/sanitized (sanitizeConfigSyncReason) before storage so an arbitrary
+// multi-line apply error is never rendered verbatim (§12.6).
+//
+// This is DIAGNOSTIC ONLY. It deliberately does NOT touch Weight,
+// monitorWeights, readiness, or trigger an election: a config-apply failure is
+// node-global and must annotate health without perturbing the failover math.
+// Manual failover stays gated solely by ConfigStale(); crash takeover stays
+// intentionally ungated. See the Manager.configSyncFailing field comment.
+func (m *Manager) SetConfigSyncHealth(failing bool, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.configSyncFailing = failing
+	if failing {
+		m.configSyncFailReason = sanitizeConfigSyncReason(reason)
+	} else {
+		m.configSyncFailReason = ""
+	}
+}
+
+// sanitizeConfigSyncReason reduces an apply error to a single bounded status
+// line (#6387): it keeps the first line only, collapses internal whitespace,
+// and caps the length on a rune boundary. This keeps the operator-facing reason
+// useful (it still names the failing sub-step, e.g. the host-inbound nft step)
+// while guaranteeing the stored value is never a raw multi-line arbitrary error
+// string (§12.6). An empty reason falls back to a generic label.
+func sanitizeConfigSyncReason(reason string) string {
+	if i := strings.IndexByte(reason, '\n'); i >= 0 {
+		reason = reason[:i]
+	}
+	reason = strings.Join(strings.Fields(reason), " ")
+	if reason == "" {
+		return "config-sync apply failing"
+	}
+	if r := []rune(reason); len(r) > maxConfigSyncReasonLen {
+		reason = string(r[:maxConfigSyncReasonLen]) + "…"
+	}
+	return reason
+}
 
 // SetRGReady updates the readiness state for a redundancy group.
 // When transitioning not-ready → ready, sets ReadySince to now.

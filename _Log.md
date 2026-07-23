@@ -58760,3 +58760,18 @@ top.
     pkg/natshow/scan_error_5557_test.go, pkg/dataplane/userspace/interfaces.go,
     pkg/dataplane/userspace/synthetic_ifindex_exhaust_5557_test.go,
     pkg/configstore/rollback_size_cap_5557_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6387 PR-1 — surface persistent config-sync APPLY failure as a
+    node-global `CF` config-sync monitor-failure / degraded health (time-based,
+    election-neutral, survives reconcileMonitorDebtsLocked). configApplyLoop
+    fires `OnConfigApplyHealth` off the failure/success edges past a 30s
+    stale-duration grace; daemon translates to `Manager.SetConfigSyncHealth`;
+    FormatStatus folds `CF`, FormatInformation degrades node health + adds a
+    `Config sync: failing (<reason>)` line. Diagnostic only — not a failover
+    gate. Parent-RED verified (raise + reconcile-survival). Does NOT touch the
+    netlink migration (PR-2/PR-3).
+  **File(s)**: pkg/cluster/manager.go, pkg/cluster/readiness.go,
+    pkg/cluster/sync.go, pkg/cluster/sync_conn_config.go, pkg/cluster/status.go,
+    pkg/cluster/sync_config_health_6387_test.go, pkg/daemon/daemon_ha_sync.go,
+    docs/sync-protocol.md, docs/junos-cli-reference.md, _Log.md

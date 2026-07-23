@@ -912,6 +912,17 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				return d.handleConfigSync(configText)
 			}
 
+			// #6387: surface a persistent config-sync APPLY failure as a
+			// node-global CF monitor-failure / degraded health. configApplyLoop
+			// fires this on the time-based stale-duration edge (raise) and on
+			// the first post-failure success (clear); the cluster manager stores
+			// it as a diagnostic-only annotation. This never gates failover —
+			// manual failover stays gated solely by ConfigStale(); crash
+			// takeover stays ungated.
+			ss.OnConfigApplyHealth = func(failing bool, reason string) {
+				d.cluster.SetConfigSyncHealth(failing, reason)
+			}
+
 			// Wire peer connected callback: reconcile config to the returning
 			// peer. #5863: the push is level-triggered, not a one-shot connect
 			// edge — reconcileConfigSyncToPeer re-evaluates the RG0-authority +

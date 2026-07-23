@@ -3,7 +3,94 @@ package cluster
 import (
 	"context"
 	"log/slog"
+	"time"
 )
+
+// DefaultConfigApplyFailGrace is how long a received config-sync generation may
+// stay un-applied — apply hard-failing, standby config stale, high-water pinned
+// per M-2/#4151 — before the node raises the CF config-sync monitor-failure /
+// degraded-health annotation (#6387, §12.6). The trigger is TIME-BASED rather
+// than attempt-count: configApplyLoop only runs on a RECEIVED config and the
+// primary re-pushes the same generation on reconnect (~1s retry) / on every
+// later commit rather than continuously, so an "N consecutive failures" gate
+// could strand the standby forever below the threshold. The grace is a
+// wall-clock window an order of magnitude longer than a transient RG0-primary
+// config rejection — which clears within a few seconds as the local node
+// settles ownership — and longer than the reconnect/re-push cadence, so a
+// genuine persistent apply failure surfaces to the operator promptly while a
+// momentary rejection never flaps the flag. It clears on the first successful
+// apply. Sized off the peer-loss / transfer-lease timescale
+// (DefaultRemoteTransferOutLease is 30s); tests override via
+// SessionSync.configApplyFailGrace.
+const DefaultConfigApplyFailGrace = 30 * time.Second
+
+// nowMono returns CLOCK_MONOTONIC nanos, honoring the test injection seam
+// (#6387). Production uses MonotonicNanos.
+func (s *SessionSync) nowMono() int64 {
+	if s.nowMonoFn != nil {
+		return s.nowMonoFn()
+	}
+	return MonotonicNanos()
+}
+
+// configApplyGrace returns the stale-duration grace before a persistently
+// un-applied config raises the CF health signal, honoring the test override
+// (#6387).
+func (s *SessionSync) configApplyGrace() time.Duration {
+	if s.configApplyFailGrace > 0 {
+		return s.configApplyFailGrace
+	}
+	return DefaultConfigApplyFailGrace
+}
+
+// noteConfigApplyFailure evaluates the time-based config-sync health signal on
+// an apply-failure edge (#6387). It stamps the monotonic time of the FIRST
+// failure in the current un-applied streak and, once that streak has persisted
+// past configApplyGrace, fires OnConfigApplyHealth(true) exactly ONCE so a
+// genuinely stranded standby (config-sync apply hard-failing, high-water pinned
+// per M-2/#4151) becomes operator-visible as a CF monitor-failure / degraded
+// health. Because the high-water never advances on failure, the primary's
+// re-push of the same generation is re-admitted and re-attempted, so this edge
+// recurs on every reconnect/commit and the grace is reliably crossed by a later
+// re-push. A transient failure that clears within the grace never raises
+// (noteConfigApplySuccess resets the streak) — no flap. Called ONLY from the
+// single-consumer configApplyLoop, so the fields need no lock.
+func (s *SessionSync) noteConfigApplyFailure(applyErr error) {
+	now := s.nowMono()
+	if s.firstUnappliedFailNano == 0 {
+		s.firstUnappliedFailNano = now
+	}
+	if s.configApplyHealthRaised {
+		return
+	}
+	if time.Duration(now-s.firstUnappliedFailNano) < s.configApplyGrace() {
+		return
+	}
+	s.configApplyHealthRaised = true
+	if s.OnConfigApplyHealth != nil {
+		reason := ""
+		if applyErr != nil {
+			reason = applyErr.Error()
+		}
+		s.OnConfigApplyHealth(true, reason)
+	}
+}
+
+// noteConfigApplySuccess clears the config-sync health streak on a successful
+// apply (#6387). If a failure had previously been surfaced
+// (configApplyHealthRaised), it fires OnConfigApplyHealth(false) exactly once so
+// the CF annotation / degraded health clears the moment the standby
+// re-converges. Called ONLY from the single-consumer configApplyLoop.
+func (s *SessionSync) noteConfigApplySuccess() {
+	s.firstUnappliedFailNano = 0
+	if !s.configApplyHealthRaised {
+		return
+	}
+	s.configApplyHealthRaised = false
+	if s.OnConfigApplyHealth != nil {
+		s.OnConfigApplyHealth(false, "")
+	}
+}
 
 // nextConfigGen draws the next strictly-monotonic config generation stamped
 // on an outgoing config-sync message (#3931). The counter is seeded from
@@ -152,11 +239,23 @@ func (s *SessionSync) configApplyLoop(ctx context.Context) {
 				// above (surfaced in cluster status), not this log.
 				slog.Debug("cluster sync: config apply failed — retaining prior high-water so the peer re-push re-converges",
 					"incoming_gen", item.gen, "last_applied_gen", s.lastAppliedConfigGen.Load(), "size", len(item.text), "err", err)
+				// #6387: evaluate the time-based CF health signal on this
+				// failure edge. It raises OnConfigApplyHealth(true) only once the
+				// un-applied streak has persisted past the stale-duration grace,
+				// so a standby stranded by a persistent apply failure surfaces as
+				// a CF monitor-failure / degraded health instead of only the
+				// terse `Transfer ready: no` string.
+				s.noteConfigApplyFailure(err)
 				// #6284: drop the fence — the high-water intentionally stays put
 				// (M-2/#4151), so restore the pre-apply admission posture.
 				s.endConfigApply()
 				continue
 			}
+			// #6387: a confirmed apply clears any raised CF health signal (the
+			// standby has re-converged). Fired on every success — including a
+			// gen==0 legacy apply that does not advance the high-water — since
+			// the host-inbound sub-step applied cleanly.
+			s.noteConfigApplySuccess()
 			// Apply confirmed — advance the high-water so a duplicate re-push of
 			// the same generation is correctly skipped as stale, THEN drop the
 			// fence. Advancing first keeps the effective refusal threshold

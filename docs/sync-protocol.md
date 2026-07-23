@@ -506,6 +506,32 @@ reintroduced on the *receiver* by the #3931 ordering guard). This preserves the
 (nil = store promoted + applied; error = not applied) is exactly what gates the
 mark, so the high-water always reflects the config actually in effect.
 
+**Config-sync apply-failure health surfacing (`CF`, #6387).** Leaving the
+high-water pinned on a persistent apply failure is correct for convergence but
+made the failure *invisible*: a standby whose apply hard-fails every time (e.g.
+the host-inbound enforcement step cannot install because a dependency is
+missing) is stuck `Transfer ready: no`, `applied gen=0` forever, yet reports as
+"healthy" in `show chassis cluster status`. `configApplyLoop` now drives a
+**time-based** config-sync monitor-failure (`CF`) off that same failure edge.
+On the FIRST apply failure it stamps a monotonic timestamp; once the received
+generation has stayed un-applied past a stale-duration grace
+(`DefaultConfigApplyFailGrace`, 30s — because the loop only runs on a RECEIVED
+config and the primary re-pushes the same generation on reconnect / on later
+commits rather than continuously, an "N consecutive failures" count could never
+fire, and 30s is comfortably longer than a transient RG0-primary rejection so it
+never flaps) it fires `OnConfigApplyHealth(true)`, which the daemon translates
+into `cluster.Manager.SetConfigSyncHealth`. The first successful apply clears it.
+The manager stores this as a **dedicated node-global field**
+(`configSyncFailing` / bounded `configSyncFailReason`), NOT an
+`rg.MonitorFails` sentinel — `reconcileMonitorDebtsLocked` would wipe any
+non-interface/non-IP `MonitorFails` entry on the next `UpdateConfig`. It renders
+as `CF` in the `Monitor-failures` column of every RG row, flips `Node health` →
+`degraded`, and adds a `Config sync: failing (<reason>)` line beside the
+`Configs apply-failed:` counter. It is **diagnostic only**: it never perturbs
+`Weight`/`monitorWeights`/readiness/election, and it is **not** a second failover
+gate — manual failover stays gated solely by `ConfigStale()`
+(`ReadyForManualFailover`), and crash takeover stays intentionally ungated.
+
 **Applied-not-just-active convergence shortcut (#4957).** `handleConfigSync`
 short-circuits a re-push whose text already matches the active config so a
 duplicate does not re-run the whole reconcile. That shortcut is gated on
