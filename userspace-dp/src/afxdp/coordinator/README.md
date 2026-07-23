@@ -338,3 +338,39 @@ Differences that matter (#1881):
   verified end-to-end without CAP_NET_ADMIN
   (`worker_bind_incomplete_report_carries_explicit_failure_6245`); the pure
   renderer is unit-tested in `reconcile::stage::tests`.
+
+- **`bring_up_workers` is decomposed into cohesive phase helpers (#6240).**
+  The 708-line transaction is now a short SHELL that sequences named phase
+  helpers, all kept IN `reconcile/bringup.rs` (no one-file-per-phase). The
+  helpers are behavior-preserving VERBATIM moves of the pre-#6240 inline
+  blocks — only the shell + the helper boundaries change. In shell order:
+  `clamp_ring_entries` (the #2524 ring-depth clamp), `plan_workers` (build the
+  per-worker `BindingPlan` lists + `live`/`identities` + sizing + the `Planned`
+  stage; TAKES the snapshot, reads the map FDs by RAW descriptor while `fds`
+  still owns the `OwnedFd`s), `publish_runtime` (MOVE the `OwnedFd`s onto
+  `coord.bpf_maps` + publish the mirror-target/CoS owner/active-shard maps),
+  `replay_preserved_sessions` (build the command queues + replay preserved
+  synced sessions), `ensure_resolver` (best-effort on-demand resolver,
+  ATTEMPTED before launch), `spawn_workers` (the ~323-line per-worker spawn
+  loop → a typed `LaunchOutcome`), the #5143 `await_readiness` barrier (renamed
+  from `collect_worker_startup_readiness`), then
+  `start_post_readiness_neighbor_services` (neighbor monitor + warmer + the
+  #1881 local tunnel/WG reconcile). The load-bearing ORDER is preserved
+  exactly: FD ownership transfer BEFORE any launch; mirror/CoS publication
+  BEFORE replay/launch; sessions/queues BEFORE launch; resolver ATTEMPT BEFORE
+  worker launch; ALL launches BEFORE the readiness barrier.
+  **The #4952 two-armed rollback DECISION stays in the SHELL, distinct and
+  visible — `spawn_workers` NEVER calls `stop_inner`.** `LaunchOutcome::SpawnFailed`
+  → the shell returns `Err(Spawn)` WITHOUT `stop_inner` (launched records
+  survive — structural via #6242's post-spawn-success insert);
+  `LaunchOutcome::AllSpawned` → the shell runs the barrier and, on a shortfall,
+  calls `stop_inner(false)` (clears ALL). Unifying the arms or moving
+  `stop_inner` into a helper REDs
+  `reconcile_partial_spawn_failure_preserves_launched_records_6242`. The
+  resolver is BEST-EFFORT: `ensure_resolver` returns the installed handle as an
+  `Option` (`None` on a spawn failure) and is NOT threaded into `spawn_workers`
+  as a required input — the invariant is attempt-before-launch, NOT
+  resolver-must-exist (`ensure_resolver_attempts_before_launch_best_effort_6240`).
+  The startup-report SENDER is owned by the shell and passed by reference into
+  `spawn_workers`, so it stays alive through the barrier — preserving
+  `await_readiness`'s exact channel-disconnect semantics.
