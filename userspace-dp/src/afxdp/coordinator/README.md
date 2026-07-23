@@ -82,6 +82,25 @@ Differences that matter (#1881):
 
 ## Notable invariants
 
+- **Reconcile progress + failure identity are a TYPED value, not a free-form
+  string (#6244).** `Coordinator::last_reconcile_stage` is a
+  `ReconcileStage` enum (`reconcile/stage.rs`) — one variant per progress
+  step (`Idle`/`Start`/`NoSnapshot`/`Planned`/`ReplayedSynced`/`Spawned`) and
+  per failure identity (`MissingPin`/`OpenMapFailed`/`SnapshotIntegrityError`
+  {,`Detail`}/`SpawnWorkerFailed`/`WorkerBindIncomplete`). The legacy operator
+  string is produced in exactly one place — the enum's `Display` — and is
+  rendered ONLY at the `reconcile_debug` / wire `debug_reconcile_stage`
+  boundary (`status.rs`) and inside `ReconcileError`'s `Display`; the strings
+  are preserved byte-for-byte. `ReconcileError::{MapSetup,WorkerSpawn,
+  WorkerBindIncomplete}` carry the typed `ReconcileStage` rather than a cloned
+  string, so a failure identity cannot be silently reinterpreted as informal
+  success text (the #4952 overwrite class). #6244 also moved the `"stopped"`
+  write OUT of `stop_inner` (which is called mid-reconcile by `tear_down` and
+  by the bring-up fail path): an EXPLICIT stop records `ReconcileStage::Stopped`
+  in `stop`/`stop_with_event_stream`, so a terminal failure identity is never
+  clobbered by a teardown that is part of the same reconcile attempt — the
+  bring-up fail path no longer needs the old overwrite-then-restore dance.
+  Fail-on-revert: `reconcile_stage_renders_byte_identical_legacy_strings`.
 - The coordinator is the single owner; workers hold `Arc` clones.
   Lifetime hazards from breaking that invariant are how cross-binding
   redirect designs have died historically (see `docs/per-5-tuple/state.md`).
@@ -220,3 +239,36 @@ Differences that matter (#1881):
   stopped) drives the regression tests (coordinator-level
   `post_spawn_inthread_bind_failure_fails_closed_5143` + handler-level
   `full_apply_post_spawn_inthread_bind_failure_fails_closed_no_persist_5143`).
+
+- **Explicit binding-setup failures in the startup report (#6245).** #5143
+  reported a bind failure ONLY by OMISSION — the failed slot was simply absent
+  from `WorkerStartupReport.bound_slots`, so the barrier could prove
+  incompleteness (`bound != planned`) but not say WHY (`worker_loop_setup`
+  merely logged + mutated `BindingLiveState.last_error`, discarding the causal
+  error, the phase, and the fallback path). The report now ALSO carries the
+  EXPLICIT cause: `binding_failures: Vec<BindingSetupFailure>` — one
+  `{ slot, phase, reason }` per TERMINAL per-slot failure
+  (`BindingSetupPhase::Private` for a private-UMEM bind, `SharedFallback` for a
+  shared-group bind whose private fallback ALSO failed), sorted by slot — plus
+  `recovered_fallbacks: Vec<BindingRecoveredFallback>` recording shared-UMEM
+  groups that failed their group bind but FULLY recovered via private fallback
+  (a diagnostic DEGRADATION, sorted by group, that does NOT affect readiness —
+  all slots still bound). The readiness criterion is UNCHANGED (`bound ==
+  planned` set equality); on a shortfall the barrier records the EXPLICIT cause
+  on the typed `ReconcileStage::WorkerBindIncomplete` identity — its
+  `WorkerBindShortfall` now carries `failures: Vec<BindingSetupFailure>` cloned
+  from the worker's report. Per #6244 the legacy operator string is produced in
+  exactly one place: `ReconcileStage`'s `Display`, which appends the rendered
+  cause (`render_binding_setup_failures`, co-located with `Display` in
+  `reconcile/stage.rs`) for the partial-bind case, so
+  `worker_bind_incomplete:<id>:bound=N:planned=M:failures=[private:slot=1:..]`
+  names the slot, phase, and reason instead of only the set-difference counts
+  (a shortfall with no recorded failure renders `failures=[no-explicit-failure]`
+  rather than a blank; the timeout/no-report case keeps the counts-only
+  `worker_bind_incomplete:<id>:timeout:planned=M`). The SUCCESS path is
+  behavior-identical: a worker that bound its full planned set reports both vecs
+  empty. The `force_worker_bind_incomplete` stub now emits a matching explicit
+  failure for the dropped slot, so the report->barrier->stage explicit path is
+  verified end-to-end without CAP_NET_ADMIN
+  (`worker_bind_incomplete_report_carries_explicit_failure_6245`); the pure
+  renderer is unit-tested in `reconcile::stage::tests`.

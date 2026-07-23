@@ -1735,7 +1735,9 @@ fn reconcile_with_none_snapshot_reaches_no_snapshot_early_exit() {
         ..BindingStatus::default()
     }];
     let _ = coordinator.reconcile(None, &mut bindings, 64);
-    assert_eq!(coordinator.last_reconcile_stage, "no_snapshot");
+    assert_eq!(coordinator.last_reconcile_stage, ReconcileStage::NoSnapshot);
+    // #6244: legacy operator string preserved byte-for-byte.
+    assert_eq!(coordinator.last_reconcile_stage.to_string(), "no_snapshot");
     assert_eq!(coordinator.reconcile_calls, 1);
     assert!(
         coordinator.workers.live.is_empty(),
@@ -1802,7 +1804,9 @@ fn reconcile_none_snapshot_refreshes_bindings_clearing_reset_survivor_fields() {
 
     let _ = coordinator.reconcile(None, &mut bindings, 64);
 
-    assert_eq!(coordinator.last_reconcile_stage, "no_snapshot");
+    assert_eq!(coordinator.last_reconcile_stage, ReconcileStage::NoSnapshot);
+    // #6244: legacy operator string preserved byte-for-byte.
+    assert_eq!(coordinator.last_reconcile_stage.to_string(), "no_snapshot");
     // The reset-survivor fields must now be cleared by the teardown
     // refresh. Each of these stays stale if refresh_bindings is skipped.
     assert_eq!(
@@ -1893,9 +1897,11 @@ fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
     let mut bindings: Vec<BindingStatus> = Vec::new();
     let _ = coordinator.reconcile(None, &mut bindings, 64);
     assert_eq!(
-        coordinator.last_reconcile_stage, "no_snapshot",
+        coordinator.last_reconcile_stage,
+        ReconcileStage::NoSnapshot,
         "None snapshot reaches the no_snapshot early-exit"
     );
+    assert_eq!(coordinator.last_reconcile_stage.to_string(), "no_snapshot");
     assert!(
         coordinator.workers.handles.is_empty(),
         "the seeded worker WAS torn down (proves had_live_workers held)"
@@ -3542,11 +3548,19 @@ fn reconcile_mandatory_map_open_failure_keeps_prior_generation_published() {
 
     // The reconcile aborted at the session-map open.
     assert!(
-        coordinator
-            .last_reconcile_stage
-            .starts_with("open_session_map_failed:"),
+        matches!(
+            coordinator.last_reconcile_stage,
+            ReconcileStage::OpenMapFailed { map: "session", .. }
+        ),
         "expected abort at session-map open, got {:?}",
         coordinator.last_reconcile_stage
+    );
+    // #6244: legacy operator string preserved byte-for-byte.
+    assert!(
+        coordinator
+            .last_reconcile_stage
+            .to_string()
+            .starts_with("open_session_map_failed:")
     );
 
     // FAIL-ON-REVERT CORE: the prior generation is still the published
@@ -3613,8 +3627,13 @@ fn reconcile_missing_session_pin_keeps_prior_generation_published() {
     let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert_eq!(
-        coordinator.last_reconcile_stage, "missing_session_pin",
+        coordinator.last_reconcile_stage,
+        ReconcileStage::MissingPin(MandatoryPin::Session),
         "expected abort at the missing-session-pin guard"
+    );
+    assert_eq!(
+        coordinator.last_reconcile_stage.to_string(),
+        "missing_session_pin"
     );
     assert_eq!(coordinator.validation.config_generation, 11);
     assert_eq!((**coordinator.shared_validation.load()).config_generation, 11);
@@ -3733,7 +3752,11 @@ fn reconcile_missing_pin_returns_map_setup_err_3789() {
 
     match result {
         Err(ReconcileError::MapSetup(stage)) => {
-            assert_eq!(stage, "missing_session_pin", "unexpected stage: {stage}");
+            assert!(
+                matches!(stage, ReconcileStage::MissingPin(MandatoryPin::Session)),
+                "unexpected stage: {stage}"
+            );
+            assert_eq!(stage.to_string(), "missing_session_pin");
         }
         other => panic!("expected Err(MapSetup(missing_session_pin)), got {other:?}"),
     }
@@ -3786,21 +3809,37 @@ fn reconcile_post_teardown_worker_spawn_failure_fails_closed_4952() {
     let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert!(
-        matches!(result, Err(ReconcileError::WorkerSpawn(ref stage)) if !stage.is_empty()),
-        "a post-teardown worker-spawn failure must surface as Err(WorkerSpawn) with a \
-         non-empty stage, got {result:?}"
+        matches!(
+            result,
+            Err(ReconcileError::WorkerSpawn(ReconcileStage::SpawnWorkerFailed { .. }))
+        ),
+        "a post-teardown worker-spawn failure must surface as \
+         Err(WorkerSpawn(SpawnWorkerFailed)), got {result:?}"
+    );
+    // #6244: the spawn-failure identity must be PRESERVED as the typed
+    // SpawnWorkerFailed variant (not overwritten with the Spawned success
+    // variant). The legacy operator string is preserved byte-for-byte.
+    assert!(
+        matches!(
+            coordinator.last_reconcile_stage,
+            ReconcileStage::SpawnWorkerFailed { .. }
+        ),
+        "the spawn-failure stage must be PRESERVED (not the Spawned variant), got {:?}",
+        coordinator.last_reconcile_stage
+    );
+    assert!(
+        !matches!(
+            coordinator.last_reconcile_stage,
+            ReconcileStage::Spawned { .. }
+        ),
+        "the reconcile must NOT report a successful spawn after a spawn failure, got {:?}",
+        coordinator.last_reconcile_stage
     );
     assert!(
         coordinator
             .last_reconcile_stage
-            .starts_with("spawn_worker_failed:"),
-        "the spawn-failure stage must be PRESERVED (not overwritten with spawned:..), got {:?}",
-        coordinator.last_reconcile_stage
-    );
-    assert!(
-        !coordinator.last_reconcile_stage.starts_with("spawned:"),
-        "the reconcile must NOT report a successful spawn after a spawn failure, got {:?}",
-        coordinator.last_reconcile_stage
+            .to_string()
+            .starts_with("spawn_worker_failed:")
     );
     // The seam consumed its single forced failure (no over-fire).
     assert_eq!(
@@ -3859,22 +3898,38 @@ fn post_spawn_inthread_bind_failure_fails_closed_5143() {
 
     // (a) fail closed with the typed post-spawn-bind error.
     assert!(
-        matches!(result, Err(ReconcileError::WorkerBindIncomplete(ref stage)) if !stage.is_empty()),
+        matches!(
+            result,
+            Err(ReconcileError::WorkerBindIncomplete(
+                ReconcileStage::WorkerBindIncomplete(_)
+            ))
+        ),
         "a post-spawn in-thread bind failure must surface as \
-         Err(WorkerBindIncomplete) with a non-empty stage, got {result:?}"
+         Err(WorkerBindIncomplete(WorkerBindIncomplete)), got {result:?}"
     );
-    // The stage identifies the barrier verdict (not a spawn success).
+    // #6244: the stage identifies the barrier verdict (the typed
+    // WorkerBindIncomplete variant), not a spawn success; legacy string kept.
     assert!(
-        coordinator
-            .last_reconcile_stage
-            .starts_with("worker_bind_incomplete:"),
+        matches!(
+            coordinator.last_reconcile_stage,
+            ReconcileStage::WorkerBindIncomplete(_)
+        ),
         "the bind-incomplete stage must be recorded, got {:?}",
         coordinator.last_reconcile_stage
     );
     assert!(
-        !coordinator.last_reconcile_stage.starts_with("spawned:"),
+        !matches!(
+            coordinator.last_reconcile_stage,
+            ReconcileStage::Spawned { .. }
+        ),
         "the reconcile must NOT report a successful spawn after a partial bind, got {:?}",
         coordinator.last_reconcile_stage
+    );
+    assert!(
+        coordinator
+            .last_reconcile_stage
+            .to_string()
+            .starts_with("worker_bind_incomplete:")
     );
     // (c) the newly-started worker was STOPPED + JOINED and its coordinator
     // state cleared — no leaked live-but-unbound worker.
@@ -3885,6 +3940,94 @@ fn post_spawn_inthread_bind_failure_fails_closed_5143() {
     assert!(
         coordinator.workers.live.is_empty(),
         "the partially-bound worker's live state must be cleared on fail-close"
+    );
+    // The seam consumed its single forced incomplete report (no over-fire).
+    assert_eq!(
+        coordinator.force_worker_bind_incomplete, 0,
+        "exactly one forced bind-incomplete report should have been consumed"
+    );
+}
+
+/// #6245: a post-spawn in-thread bind failure must now be reported EXPLICITLY.
+/// The `WorkerStartupReport` carries a typed per-slot `BindingSetupFailure`
+/// (worker + slot + phase + owned error) instead of signalling the failure
+/// ONLY by OMITTING the failed slot from a success-shaped `bound_slots` list.
+/// The readiness barrier surfaces that explicit cause into the fail-closed
+/// reconcile stage, so the `worker_bind_incomplete:..` descriptor now names the
+/// slot, phase, and reason — not just the `bound=N:planned=M` set-difference
+/// counts.
+///
+/// This is the #6245 contract change over #5143: #5143 established
+/// HEARTBEAT != READINESS (a partial bind fails the reconcile closed by
+/// set-difference); #6245 makes the CAUSE of that shortfall explicit in the
+/// report and the surfaced stage.
+///
+/// The `force_worker_bind_incomplete` stub reports a bound set short by one
+/// slot AND a matching explicit `BindingSetupFailure` for the dropped (smallest
+/// planned) slot — modelling what the real `worker_loop_setup` Err arm now
+/// records — so the report->barrier->stage explicit-failure path is verified
+/// end-to-end without CAP_NET_ADMIN.
+///
+/// Fail-on-revert: revert the explicit-failure contract (drop the report's
+/// `binding_failures` field, or the barrier's `render_binding_setup_failures`
+/// append, returning to the pre-#6245 `bound=N:planned=M` omission-only stage)
+/// and the `failures=[private:slot=1:..]` assertion below FAILS — the stage no
+/// longer carries the typed cause. The pre-#6245 counts-only prefix is
+/// deliberately NOT asserted-absent (it is retained), so this pins the ADDED
+/// explicit cause, not its formatting.
+#[test]
+fn worker_bind_incomplete_report_carries_explicit_failure_6245() {
+    let mut coordinator = Coordinator::new();
+    // One registered binding at slot 1 => exactly one planned worker (id 0),
+    // one planned slot (1). The stub drops the smallest planned slot (1).
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        worker_id: 0,
+        queue_id: 0,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        ..BindingStatus::default()
+    }];
+    coordinator.force_worker_bind_incomplete = 1;
+
+    let snap = mandatory_ok_snapshot(5);
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    // Still fails closed with the typed post-spawn-bind error (the #5143 gate).
+    // #6244 composed: the error now carries the typed `ReconcileStage`
+    // (`WorkerBindIncomplete` variant), not a free-form `String`.
+    assert!(
+        matches!(
+            result,
+            Err(ReconcileError::WorkerBindIncomplete(
+                ReconcileStage::WorkerBindIncomplete(_)
+            ))
+        ),
+        "a post-spawn in-thread bind failure must surface as \
+         Err(WorkerBindIncomplete(WorkerBindIncomplete)), got {result:?}"
+    );
+    // Render the typed stage to its legacy operator string for the
+    // substring assertions below (the #6245 explicit-cause contract lives in
+    // the rendered form).
+    let stage = coordinator.last_reconcile_stage.to_string();
+    assert!(
+        stage.starts_with("worker_bind_incomplete:"),
+        "the bind-incomplete stage must be recorded, got {stage:?}"
+    );
+    // #6245 core assertion: the EXPLICIT typed failure (phase + slot) reached
+    // the barrier via WorkerStartupReport.binding_failures and is surfaced in
+    // the stage — NOT inferred solely from the shorter bound_slots list.
+    assert!(
+        stage.contains("failures=[private:slot=1:"),
+        "the stage must carry the EXPLICIT per-slot binding-setup failure \
+         (phase + slot), not just the bound/planned counts, got {stage:?}"
+    );
+    // The owned error reason string propagated end-to-end (report -> barrier).
+    assert!(
+        stage.contains("forced private bind failure (test seam #6245)"),
+        "the explicit failure's owned reason must propagate into the stage, \
+         got {stage:?}"
     );
     // The seam consumed its single forced incomplete report (no over-fire).
     assert_eq!(
@@ -3922,7 +4065,10 @@ fn validate_snapshot_buildable_matches_reconcile_5171() {
     let mut bindings: Vec<BindingStatus> = Vec::new();
     let recon = recon_coord.reconcile(Some(&missing_pin), &mut bindings, 64);
     assert!(
-        matches!(&recon, Err(ReconcileError::MapSetup(stage)) if stage == "missing_session_pin"),
+        matches!(
+            &recon,
+            Err(ReconcileError::MapSetup(ReconcileStage::MissingPin(MandatoryPin::Session)))
+        ),
         "reconcile must reject the missing-session-pin snapshot at missing_session_pin, got {recon:?}"
     );
 
@@ -3931,7 +4077,10 @@ fn validate_snapshot_buildable_matches_reconcile_5171() {
     let validate_coord = Coordinator::new();
     let validated = validate_coord.validate_snapshot_buildable(Some(&missing_pin));
     assert!(
-        matches!(&validated, Err(ReconcileError::MapSetup(stage)) if stage == "missing_session_pin"),
+        matches!(
+            &validated,
+            Err(ReconcileError::MapSetup(ReconcileStage::MissingPin(MandatoryPin::Session)))
+        ),
         "validate_snapshot_buildable must reject the same snapshot with the same MapSetup stage, got {validated:?}"
     );
     // Side-effect-free: no workers spawned, no per-binding error stamped.
@@ -4135,9 +4284,11 @@ fn reconcile_fresh_boot_concrete_zone_policy_passes_preflight_3402() {
     let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert!(
-        !coordinator
-            .last_reconcile_stage
-            .starts_with("snapshot_integrity_error"),
+        !matches!(
+            coordinator.last_reconcile_stage,
+            ReconcileStage::SnapshotIntegrityError
+                | ReconcileStage::SnapshotIntegrityErrorDetail(_)
+        ),
         "fresh-boot concrete-zone policy must pass the integrity preflight, got stage {:?}",
         coordinator.last_reconcile_stage
     );
@@ -4190,14 +4341,20 @@ fn reconcile_policy_references_undefined_zone_still_fails_closed_3402() {
     let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert!(
-        coordinator
-            .last_reconcile_stage
-            .starts_with("snapshot_integrity_error"),
+        matches!(
+            coordinator.last_reconcile_stage,
+            ReconcileStage::SnapshotIntegrityErrorDetail(_)
+        ),
         "a policy naming a zone absent from snapshot.zones must fail closed, got stage {:?}",
         coordinator.last_reconcile_stage
     );
+    // #6244: the typed detail still renders the unresolvable zone name in the
+    // legacy operator string byte-for-byte.
     assert!(
-        coordinator.last_reconcile_stage.contains("ghostzone"),
+        coordinator
+            .last_reconcile_stage
+            .to_string()
+            .contains("ghostzone"),
         "the integrity error must name the unresolvable zone, got {:?}",
         coordinator.last_reconcile_stage
     );
@@ -4273,9 +4430,14 @@ fn reconcile_snapshot_integrity_error_preserves_prior_generation_and_state() {
     let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert_eq!(
-        coordinator.last_reconcile_stage, "snapshot_integrity_error",
+        coordinator.last_reconcile_stage,
+        ReconcileStage::SnapshotIntegrityError,
         "integrity-error leg must record an observable stage, got {:?}",
         coordinator.last_reconcile_stage
+    );
+    assert_eq!(
+        coordinator.last_reconcile_stage.to_string(),
+        "snapshot_integrity_error"
     );
 
     // FAIL-ON-REVERT CORE: the prior generation is still the published one,
@@ -4378,11 +4540,21 @@ fn reconcile_present_conntrack_pin_open_failure_keeps_prior_generation() {
     let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert!(
-        coordinator
-            .last_reconcile_stage
-            .starts_with("open_conntrack_v4_map_failed:"),
+        matches!(
+            coordinator.last_reconcile_stage,
+            ReconcileStage::OpenMapFailed {
+                map: "conntrack_v4",
+                ..
+            }
+        ),
         "expected abort at the conntrack_v4 open, got {:?}",
         coordinator.last_reconcile_stage
+    );
+    assert!(
+        coordinator
+            .last_reconcile_stage
+            .to_string()
+            .starts_with("open_conntrack_v4_map_failed:")
     );
 
     // FAIL-ON-REVERT CORE: the prior generation is still published.
@@ -4438,11 +4610,21 @@ fn reconcile_present_dnat_pin_open_failure_keeps_prior_generation() {
     let _ = coordinator.reconcile(Some(&snap), &mut bindings, 64);
 
     assert!(
-        coordinator
-            .last_reconcile_stage
-            .starts_with("open_dnat_table_map_failed:"),
+        matches!(
+            coordinator.last_reconcile_stage,
+            ReconcileStage::OpenMapFailed {
+                map: "dnat_table",
+                ..
+            }
+        ),
         "expected abort at the dnat_table open, got {:?}",
         coordinator.last_reconcile_stage
+    );
+    assert!(
+        coordinator
+            .last_reconcile_stage
+            .to_string()
+            .starts_with("open_dnat_table_map_failed:")
     );
     assert_eq!(
         coordinator.validation.config_generation, 40,

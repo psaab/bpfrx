@@ -27,6 +27,131 @@
   behavior-preserving gate; new #6261 test asserts both outlined handlers
   still learn under the logical ifindex and preserve dispositions).
 
+## 2026-07-22 — #6245: report binding-setup failures explicitly in WorkerStartupReport
+
+- **Timestamp**: 2026-07-22 (fix/6245-explicit-binding-failures)
+- **Action**: Make a worker's one-shot binding setup report bind failures
+  EXPLICITLY instead of only by OMISSION. Pre-#6245 a failed slot was simply
+  absent from `WorkerStartupReport.bound_slots` (`worker_loop_setup` logged +
+  mutated `BindingLiveState.last_error` and dropped the binding), so the
+  readiness barrier could prove `bound != planned` but not the cause. Added
+  three types in `afxdp/types/runtime.rs`: `BindingSetupPhase`
+  (`Private`/`SharedFallback` + `as_str`), `BindingSetupFailure`
+  (`{ slot, phase, reason }`), `BindingRecoveredFallback` (`{ group, reason }`);
+  extended `WorkerStartupReport` with `binding_failures` +
+  `recovered_fallbacks`. `worker_loop_setup` (`loop_body/setup.rs`) now captures
+  the slot before the moved bind call, pushes a `BindingSetupFailure` on the
+  private-bind `Err` arm, threads two accumulators into
+  `fallback_shared_group_to_private` (`worker/mod.rs`) — which records a
+  terminal `SharedFallback` failure per slot whose private fallback also fails,
+  or a `BindingRecoveredFallback` when the whole group recovers — and sorts both
+  (failures by slot, fallbacks by group) before returning. `worker_loop`
+  (`loop_body/mod.rs`) carries them into the report. The barrier
+  (`coordinator/reconcile/bringup.rs`) retains the full report per worker,
+  keeps `bound == planned` as the readiness criterion, and renders the explicit
+  cause into the fail-closed stage via `render_binding_setup_failures`
+  (`...:failures=[private:slot=1:<reason>]`; empty →
+  `failures=[no-explicit-failure]`). Success path behavior-identical (both vecs
+  empty). Docs: `coordinator/README.md` #6245 paragraph + `worker/README.md`
+  setup row.
+- **File(s)**: `userspace-dp/src/afxdp/types/runtime.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/setup.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/mod.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/README.md`,
+  `userspace-dp/src/afxdp/worker/README.md`.
+- **Validation**: `cargo build` green. `cargo test --release` new tests green —
+  `worker_bind_incomplete_report_carries_explicit_failure_6245` (extends the
+  `force_worker_bind_incomplete` stub to emit a matching explicit failure;
+  asserts the stage carries `failures=[private:slot=1:...]` + the owned reason,
+  end-to-end report->barrier->stage without CAP_NET_ADMIN) and
+  `bringup::tests_6245::render_binding_setup_failures_is_deterministic` (pure
+  renderer). Existing `post_spawn_inthread_bind_failure_fails_closed_5143` still
+  green. Fail-on-revert: reverting the barrier's explicit-cause append to the
+  pre-#6245 `bound=N:planned=M` stage makes the e2e test ASSERTION-fail
+  (`got "worker_bind_incomplete:0:bound=0:planned=1"`), restored → green.
+
+## 2026-07-22 — #6245 rebase: compose explicit binding-failures onto #6244 typed stage
+
+- **Timestamp**: 2026-07-22 (fix/6245-explicit-binding-failures, rebased on
+  origin/master after #6244 merged)
+- **Action**: Re-integrate #6245 on top of #6244's typed `ReconcileStage`.
+  #6244 changed the fail-closed reconcile stage from a free-form `String` to a
+  typed enum whose legacy operator string is produced in EXACTLY one place —
+  `ReconcileStage`'s `Display`. Composed #6245's explicit per-slot failures
+  onto that foundation instead of reverting either PR: (1) added a
+  `failures: Vec<BindingSetupFailure>` field to `WorkerBindShortfall`
+  (`reconcile/stage.rs`); (2) MOVED `render_binding_setup_failures` (and its
+  deterministic-renderer unit test) from `bringup.rs` INTO `stage.rs`, where
+  the `WorkerBindIncomplete` `Display` arm now appends
+  `:{render_binding_setup_failures(&shortfall.failures)}` for the partial-bind
+  (`Some`) case — byte-identical to #6245's original barrier string
+  `worker_bind_incomplete:<id>:bound=<n>:planned=<m>:failures=[...]`; the
+  timeout (`None`) case keeps the pre-#6245 counts-only string (no reported
+  cause to attribute); (3) the barrier now builds the typed
+  `WorkerBindShortfall { ..., failures: report.binding_failures.clone() }` off
+  the retained per-worker `report_by_worker` map (empty failures for the
+  no-report/timeout case); (4) updated the byte-identical Display test's
+  `WorkerBindIncomplete` expectations (the one variant that intentionally
+  changes per #6245) and the e2e test's typed-stage assertions
+  (`ReconcileError::WorkerBindIncomplete(ReconcileStage::WorkerBindIncomplete)`
+  + `last_reconcile_stage.to_string()` for the substring checks).
+- **File(s)**: `userspace-dp/src/afxdp/coordinator/reconcile/stage.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`, `_Log.md`.
+- **Validation**: `cargo build` green; `cargo test --release` green including
+  `worker_bind_incomplete_report_carries_explicit_failure_6245` and
+  `reconcile_stage_renders_byte_identical_legacy_strings`. Fail-on-revert:
+  dropping the `Display` failures-append flips the #6245 e2e test RED.
+
+## 2026-07-22 — #6244: typed reconcile progress replaces last_reconcile_stage string
+
+- **Timestamp**: 2026-07-22 (fix/6244-typed-reconcile-progress)
+- **Action**: Replace the mutable free-form
+  `Coordinator::last_reconcile_stage: String` side-channel with a typed
+  `ReconcileStage` enum (new `userspace-dp/src/afxdp/coordinator/reconcile/
+  stage.rs`). One variant per progress step (Idle/Start/NoSnapshot/Planned/
+  ReplayedSynced/Spawned) and per failure identity (MissingPin/OpenMapFailed/
+  SnapshotIntegrityError{,Detail}/SpawnWorkerFailed/WorkerBindIncomplete, plus
+  sub-types `MandatoryPin` and `WorkerBindShortfall`). The legacy operator
+  string is produced in exactly ONE place — the enum's `Display` — and is
+  rendered ONLY at the `reconcile_debug` / wire `debug_reconcile_stage`
+  boundary (`status.rs`) and inside `ReconcileError`'s `Display`; every legacy
+  string is preserved byte-for-byte. `ReconcileError::{MapSetup,WorkerSpawn,
+  WorkerBindIncomplete}` and `WorkerBringUpError::{Spawn,BindIncomplete}` now
+  carry the typed `ReconcileStage` (was a cloned stage `String`), so a failure
+  identity can no longer be reinterpreted as informal success text. Applied
+  amendment option B: the `"stopped"` write moved OUT of `stop_inner` (called
+  mid-reconcile by `tear_down` and the bring-up fail path) into the explicit
+  `stop`/`stop_with_event_stream` entry points, eliminating the bring-up
+  overwrite-then-restore dance while preserving observable behavior (the
+  transient stop-write mid-reconcile was never externally observed). Scope:
+  types the STAGE (transaction channel); underlying error payloads stay
+  `String` (deeper typing is sibling #6243/#6245). Control-plane / status only
+  — no packet-path, atomics, locks, or trait objects.
+- **Validation**: `cargo build` green (crate root, disk target). Full
+  `cargo test --release -- --test-threads=1` — see run below. Added
+  fail-on-revert `reconcile_stage_renders_byte_identical_legacy_strings`
+  (stage.rs) asserting every variant's legacy render; perturbing
+  `NoSnapshot`'s `Display` (`no_snapshot` → `no_snapshot_PERTURBED`) flips it
+  RED (`left: "no_snapshot_PERTURBED", right: "no_snapshot"`), restored GREEN.
+  Converted the existing exact/prefix/contains stage tests
+  (`coordinator/tests.rs`, `server/tests.rs`) to typed `matches!` assertions
+  PLUS byte-identical legacy-render assertions.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/stage.rs (new),
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/server/tests.rs,
+  docs/userspace-dataplane-architecture.md
+
 ## 2026-07-22 — #6232: scope-complete Rust heatmap classifier + enforced drift gate
 
 - **Timestamp**: 2026-07-22 (fix/6232-heatmap-audit)

@@ -19,7 +19,10 @@ use super::super::*;
 pub(super) mod bringup;
 pub(super) mod reset;
 pub(super) mod snapshot;
+pub(crate) mod stage;
 pub(super) mod teardown;
+
+pub(crate) use stage::{MandatoryPin, ReconcileStage, WorkerBindShortfall};
 
 /// #3789: the outcome of a full-`reconcile` that aborted in one of the
 /// PRE-TEARDOWN legs (policy preflight, mandatory-map preflight, or the
@@ -54,18 +57,20 @@ pub(crate) enum ReconcileError {
     Integrity(crate::policy::SnapshotIntegrityError),
     /// A mandatory BPF map pin was missing or its FD failed to open
     /// (`preflight_map_fds`), or `apply_snapshot` returned `None`
-    /// (defensively unreachable post-#2484). Carries the
-    /// `last_reconcile_stage` descriptor for the control-plane error.
-    MapSetup(String),
+    /// (defensively unreachable post-#2484). #6244: carries the TYPED
+    /// [`ReconcileStage`] failure identity (was the cloned stage `String`);
+    /// its `Display` renders the identical control-plane error text.
+    MapSetup(ReconcileStage),
     /// #4952: a worker thread failed to spawn on the POST-TEARDOWN
     /// destructive path (`bring_up_workers` -> `spawn_supervised_worker` ->
     /// `pthread_create` EAGAIN/ENOMEM under resource exhaustion). Unlike the
     /// two pre-teardown variants above, `tear_down` has already stopped the
     /// old workers, so the affected queue set has NO XSK-bound worker and
     /// forwarding is DOWN. Surfaced so the control handler fails closed and
-    /// does NOT persist the broken snapshot as the boot baseline. Carries
-    /// the preserved `spawn_worker_failed:<id>:<err>` stage.
-    WorkerSpawn(String),
+    /// does NOT persist the broken snapshot as the boot baseline. #6244:
+    /// carries the preserved typed [`ReconcileStage::SpawnWorkerFailed`]
+    /// identity (was its stage `String`).
+    WorkerSpawn(ReconcileStage),
     /// #5143: a worker SPAWNED successfully on the POST-TEARDOWN path but its
     /// IN-THREAD XSK/UMEM bind did not bring up its full planned binding set
     /// (a partial/empty bind), or it never reported startup readiness within
@@ -75,8 +80,10 @@ pub(crate) enum ReconcileError {
     /// used to satisfy the supervisor (the #5143 silent forwarding outage).
     /// Like `WorkerSpawn` this is raised AFTER teardown (the queue set has no
     /// XSK-bound worker), so the handler fails closed and does NOT persist the
-    /// broken snapshot. Carries the `worker_bind_incomplete:<id>:..` stage.
-    WorkerBindIncomplete(String),
+    /// broken snapshot. #6244: carries the preserved typed
+    /// [`ReconcileStage::WorkerBindIncomplete`] identity (was its stage
+    /// `String`).
+    WorkerBindIncomplete(ReconcileStage),
 }
 
 impl std::fmt::Display for ReconcileError {
@@ -229,7 +236,7 @@ impl Coordinator {
         ring_entries: usize,
     ) -> Result<(), ReconcileError> {
         self.reconcile_calls += 1;
-        self.last_reconcile_stage = "start".to_string();
+        self.last_reconcile_stage = ReconcileStage::Start;
         // #1606 (AGY r2 finding 4.2): policy-integrity preflight
         // BEFORE tear_down. If the snapshot has duplicate / zero /
         // unknown book IDs, reject WITHOUT tearing down the
@@ -250,7 +257,8 @@ impl Coordinator {
                     "xpf-userspace-dp: snapshot integrity error during reconcile preflight: {} — keeping previous workers + forwarding state",
                     err
                 );
-                self.last_reconcile_stage = format!("snapshot_integrity_error: {}", err);
+                self.last_reconcile_stage =
+                    ReconcileStage::SnapshotIntegrityErrorDetail(err.to_string());
                 // #3789: surface the reject so the control handler fails
                 // closed instead of persisting the rejected snapshot.
                 return Err(ReconcileError::Integrity(err));
@@ -348,7 +356,7 @@ impl Coordinator {
             // runs at the end of `reconcile`. Run it BEFORE setting the
             // stage so the operator-visible state is consistent on return.
             self.refresh_bindings(bindings);
-            self.last_reconcile_stage = "no_snapshot".to_string();
+            self.last_reconcile_stage = ReconcileStage::NoSnapshot;
             // #3789: a config-cleared / shutdown teardown is a successful
             // reconcile (the caller intentionally passed no snapshot).
             return Ok(());
