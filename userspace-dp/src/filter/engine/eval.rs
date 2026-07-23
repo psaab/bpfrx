@@ -1132,11 +1132,21 @@ pub(crate) fn interface_filter_affects_route_lookup(
     ifindex: i32,
     is_v6: bool,
 ) -> bool {
-    // #6236 PR-2C: thin `.is_some()` view over the borrow accessor below (the
-    // SOLE lookup+gate). Retained for the poll-descriptor session-miss
-    // counter-policy precheck (`evaluate_non_pbr_input_filter`), which needs only
-    // the bool, not the filter.
-    interface_filter_route_lookup_affecting(state, ifindex, is_v6).is_some()
+    // #6236 PR-2C: independent single lookup — its OWN `.get()` on the
+    // per-interface input fast map, then the `affects_route_lookup` flag.
+    // Retained for the poll-descriptor session-miss counter-policy precheck
+    // (`evaluate_non_pbr_input_filter`), which needs only the bool, not the
+    // filter — AND as the INDEPENDENT reference the accessor-equivalence tests
+    // compare the folded borrow accessor `interface_filter_route_lookup_affecting`
+    // against. Delegating to that accessor would make the comparison tautological
+    // (`X == X`); this re-derives the flag by its own lookup. Same single-lookup
+    // cost either way.
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex)
+    } else {
+        state.iface_filter_v4_fast.get(&ifindex)
+    };
+    filter.is_some_and(|f| f.affects_route_lookup)
 }
 
 /// #6236 PR-2C: single-lookup borrow of the per-interface input filter for this

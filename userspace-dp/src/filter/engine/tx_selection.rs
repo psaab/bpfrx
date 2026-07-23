@@ -372,18 +372,28 @@ pub(crate) fn evaluate_interface_output_filter_tx_selection_counted<'a>(
     )
 }
 
-/// #6236 PR-2C: test-only `.is_some()` view over
-/// [`interface_output_filter_needing_tx_eval`]. Every production consumer now
-/// takes the borrow directly, so this bool has no runtime caller — it survives
-/// only to pin the accessor-equivalence tests (`filter/tests.rs`) against the
-/// fast-map flag. `#[cfg(test)]` keeps it out of the shipped binary.
+/// #6236 PR-2C: test-only reference implementing the OLD independent two-step
+/// lookup — its OWN `.get()` on the per-interface output fast map, then
+/// `Filter::needs_tx_eval()` on the borrow. Every production consumer now takes
+/// the folded borrow accessor [`interface_output_filter_needing_tx_eval`]
+/// directly, so this bool has no runtime caller — it survives only as the
+/// INDEPENDENT reference the accessor-equivalence tests (`filter/tests.rs`)
+/// compare the folded path against. A delegating `.is_some()` view over the
+/// borrow accessor would make that comparison tautological (`X == X`), so the
+/// reference deliberately re-derives the flag by an independent lookup.
+/// `#[cfg(test)]` keeps it out of the shipped binary.
 #[cfg(test)]
 pub(crate) fn interface_output_filter_needs_tx_eval(
     state: &FilterState,
     ifindex: i32,
     is_v6: bool,
 ) -> bool {
-    interface_output_filter_needing_tx_eval(state, ifindex, is_v6).is_some()
+    let filter = if is_v6 {
+        state.iface_filter_out_v6_fast.get(&ifindex)
+    } else {
+        state.iface_filter_out_v4_fast.get(&ifindex)
+    };
+    filter.is_some_and(|f| f.needs_tx_eval())
 }
 
 /// #6236 PR-2C: single-lookup borrow of the per-interface OUTPUT filter for this

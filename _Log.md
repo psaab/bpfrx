@@ -57780,3 +57780,14 @@ top.
     userspace-dp/src/afxdp/tx/cos_classify.rs,
     userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
     userspace-dp/src/protocol/security.rs
+  **Review-fold (Codex MINOR)**: the `#[cfg(test)]`
+    `interface_output_filter_needs_tx_eval` and the production
+    `interface_filter_affects_route_lookup` bool accessors were delegating to
+    the folded borrow accessors (`.is_some()` of them), making two
+    equivalence-test comparison legs tautological (`X == X`). Restored each to an
+    INDEPENDENT single lookup (own `.get()` on the fast map + flag read) so the
+    old-vs-new equivalence gate is genuine; behavior-identical (still one lookup
+    each). Parent-RED: neutralising the folded output accessor
+    (`needs_tx_eval`→`affects_route_lookup`) now REDs
+    `pr2c_folded_single_lookup_equals_two_lookup_path` ("left false != right
+    true"), proving the restored leg binds. Full cargo 4249/0.
