@@ -144,6 +144,54 @@ func TestLocalManualFailoverClearsRemoteTransferOutLease(t *testing.T) {
 	}
 }
 
+// TestResetFailoverClearsRemoteTransferOutLease is the #6301 fail-on-revert
+// guard. A peer failover request demotes this node and arms a reqID-bound
+// auto-restore lease. An operator then runs `request ... reset`
+// (ResetFailover), which clears ManualFailover — but before #6301 it left the
+// remoteTransferOutLease{Until,ReqID} entry dormant in the maps. Repeated
+// resets accumulate dead entries. ResetFailover must clear the lease too,
+// mirroring the ManualFailover / ForceSecondary(ISSU) / ManualFailoverBatch
+// reset paths, so the lease maps stay in lockstep with ManualFailover.
+//
+// Revert the clearRemoteTransferOutLeaseLocked call added to ResetFailover and
+// this test goes RED: the lease entry survives the reset.
+func TestResetFailoverClearsRemoteTransferOutLease(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	if err := m.ManualFailover(0); err != nil {
+		t.Fatalf("ManualFailover() error = %v", err)
+	}
+	<-m.Events()
+	m.ArmRemoteTransferOutLease([]int{0}, 13)
+
+	// Sanity: the lease is armed before the reset.
+	m.mu.Lock()
+	_, untilBefore := m.remoteTransferOutLeaseUntil[0]
+	_, reqIDBefore := m.remoteTransferOutLeaseReqID[0]
+	m.mu.Unlock()
+	if !untilBefore || !reqIDBefore {
+		t.Fatal("precondition: remote transfer-out lease must be armed before ResetFailover")
+	}
+
+	if err := m.ResetFailover(0); err != nil {
+		t.Fatalf("ResetFailover() error = %v", err)
+	}
+
+	m.mu.Lock()
+	_, untilAfter := m.remoteTransferOutLeaseUntil[0]
+	_, reqIDAfter := m.remoteTransferOutLeaseReqID[0]
+	m.mu.Unlock()
+	if untilAfter {
+		t.Fatal("ResetFailover must clear the remote transfer-out lease Until entry")
+	}
+	if reqIDAfter {
+		t.Fatal("ResetFailover must clear the remote transfer-out lease ReqID entry")
+	}
+}
+
 // TestRemoteTransferOutLeaseRestoresBatchOwners exercises the multi-RG path: a
 // batch transfer-out arms a lease per RG, and expiry restores every member.
 func TestRemoteTransferOutLeaseRestoresBatchOwners(t *testing.T) {
