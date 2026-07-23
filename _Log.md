@@ -59562,3 +59562,35 @@ top.
     clean assertions; restored green.
   - **File(s)**: pkg/cli/cli_request_ping.go, pkg/cli/cli_request_argv_test.go,
     pkg/cli/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #5144 — reject overlapping/duplicate source-NAT and NAT64
+    pools at commit (external-tuple / reply-misdelivery). Added
+    `validateNATPoolExternalTupleOverlapStrict(cfg, lenient)` in
+    `compiler_validate_strict_nat.go`, wired into `runTailGates` next to the
+    #2241 NPTv6 overlap gate with a dedicated `opts.lenientNATPoolOverlap`
+    flag (strict on commit / warn on load / peer-sync, #1960 no-brick). It
+    enumerates one allocator owner per referenced source pool and per
+    (prefix, source-pool) NAT64 pair — matching the Rust source.rs /
+    nat64.rs keying — expands members to family-scoped intervals (v4 uint64,
+    v6 netip.Addr; colon-strict family bucketing) and O(n log n)
+    sort-and-sweeps for the first overlap (within-pool duplicate vs
+    cross-owner collision). Material choice S1 (reject overlap); does NOT
+    build the deferred R2 packet-path global allocator. Fail-on-revert:
+    `compiler_nat_pool_overlap_5144_test.go` (8 reject + 5 accept cases);
+    parent-RED verified (early `return nil,nil` → 8 reject cases go RED as
+    clean assertions, build stays clean, accept cases stay green). Updated
+    the overlap-agnostic #5877 aggregate fixtures to distinct addresses
+    (distinctHostIP / distinctSlash16) so they exercise cardinality without
+    tripping the new gate. Separated the shipped `xpf-test.conf` /
+    `xpf-cluster-fw0.conf` cross-feature overlap (one pool drawn by both
+    NAT64 and a source-NAT rule) into distinct pools + proxy-ARP. Doc:
+    docs/config-schema.md new #5144 subsection. Gates: build/vet/gofmt
+    clean; full `go test ./pkg/config/` + consumer userspace/configstore
+    suites GREEN.
+  - **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+    pkg/config/compiler_tailgates.go, pkg/config/compiler.go,
+    pkg/config/compiler_nat_pool_overlap_5144_test.go,
+    pkg/config/compiler_nat_source_pool_aggregate_5877_test.go,
+    test/incus/xpf-test.conf, test/incus/xpf-cluster-fw0.conf,
+    docs/config-schema.md, _Log.md

@@ -385,6 +385,57 @@ both-views-valid + standalone over-reject guards, node0/node1 symmetry) and
 `pkg/configstore/peer_effective_snat_5876_test.go` (store-gate wiring), each RED
 on revert of the peer gate (node0 accepts the peer-only SNAT error).
 
+### Source-NAT / NAT64 external-tuple overlap (#5144)
+
+The Rust dataplane keys the source-NAT `PortAllocator` by pool name + address
+vector (`userspace-dp/src/nat/source.rs`) and the NAT64 allocator by
+`(prefix_bytes, pool_v4)` (`userspace-dp/src/nat64.rs`). Nothing tied those
+independent allocators together, so four config shapes each gave two allocators
+an overlapping claim on the same translated IPv4/IPv6 address: differently-named
+source pools with overlapping addresses; a source pool that also backs a NAT64
+`source-pool`; two NAT64 rule-sets sharing one pool under DIFFERENT prefixes; and
+duplicate/overlapping members WITHIN one pool. Independent occupancy bitmaps
+share no ownership word, so two flows to the same remote endpoint can be handed
+the same `(family, translated IP, translated port)` and the reverse (1:N) NAT
+index cannot disambiguate the return packet — it is misdelivered. The only
+pre-existing NAT overlap gate was NPTv6 static-prefix (#2241); this is its
+source-NAT / NAT64 analog.
+
+`validateNATPoolExternalTupleOverlapStrict(cfg, lenient)`
+(`compiler_validate_strict_nat.go`, wired into `runTailGates` right after the
+NPTv6 / NAT64 gates) rejects the overlap at commit. It enumerates one allocator
+"owner" per the exact keys the helper uses — one per DISTINCT source-NAT
+pool a pool-mode `then source-nat pool` rule references, and one per DISTINCT
+`(prefix, source-pool)` a `nat64 rule-set` references (unreferenced pools build
+no allocator and are out of scope, mirroring the #5877 aggregate gate). Each
+owner's members (`pool.Address` + `pool.Addresses`, ranges already expanded to
+/32s) become family-scoped numeric intervals — v4 vs v6 bucketed by the
+colon-strict textual family (`natAddrFamily(natCIDRIPPart(...))`, the Go/Rust
+parity rule, so an IPv4-mapped IPv6 literal never compares against a real v4
+member) — and an O(n log n) sort-and-sweep per family reports the first
+overlapping pair. Two members of the SAME owner is a within-pool
+duplicate/overlap; two owners is the cross-pool / cross-feature collision.
+
+This is the commit-time DETECTION half of #5144 (material choice **S1**: reject
+independently-owned overlap). It does NOT introduce the deferred packet-path
+global cross-domain allocator (the R2 design, gated on user signoff and
+#2387/#5338/#5698) — rejecting the overlap at commit forecloses the runtime
+collision because the vulnerable config never reaches the dataplane. Strict
+(commit / commit-check): hard-reject naming both allocators and the overlapping
+members. Lenient (load / peer-sync): warn via `opts.lenientNATPoolOverlap`
+(#1960 no-brick) so a config committed before this gate existed still boots —
+but UNLIKE NPTv6 / NAT64 the dataplane does NOT reject the overlapping snapshot,
+so the latent reverse-index collision persists until corrected and the warning
+says so. Covered by `pkg/config/compiler_nat_pool_overlap_5144_test.go`
+(exact-duplicate / partial-overlap / source-NAT-vs-source-NAT /
+source-NAT-vs-NAT64 same-and-distinct-pool / NAT64-different-prefix /
+within-pool-duplicate / IPv6 reject cases, plus distinct-pool / shared-pool /
+cross-family / same-prefix-dedup / unreferenced accept guards), RED on revert of
+the gate (the overlap is accepted). The shipped `test/incus/xpf-test.conf` and
+`test/incus/xpf-cluster-fw0.conf` each carried the cross-feature overlap (one
+pool drawn by both NAT64 and a source-NAT rule) and were separated into distinct
+pools + proxy-ARP as part of this change.
+
 **Phase 2 (#5878) — reference-binder canonicalization.** Phase 1 (above) closes
 the divergent-commit fail-open by rejecting a duplicate-spelling collision at
 commit. The second, subtler half of #5878 is that a cross-subsystem reference
