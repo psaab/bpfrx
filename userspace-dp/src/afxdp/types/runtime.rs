@@ -163,6 +163,60 @@ pub(in crate::afxdp) struct BindingPlan {
     pub(in crate::afxdp) shared_umem: SharedUmemBindingPlan,
 }
 
+/// #6245: the phase in which a per-slot binding setup TERMINALLY failed,
+/// carried (as an owned, Copy discriminant) in [`BindingSetupFailure`]. The
+/// shared-UMEM-group-attempt-then-recovered case is NOT a terminal failure —
+/// it is reported separately as [`BindingRecoveredFallback`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) enum BindingSetupPhase {
+    /// A private (non-shared-UMEM) XSK/UMEM bind failed for this slot.
+    Private,
+    /// A shared-UMEM group's bind failed AND this slot's private-UMEM
+    /// fallback ALSO failed — the slot has no surviving binding. (A group
+    /// whose fallback fully recovered is a [`BindingRecoveredFallback`], not
+    /// a failure.)
+    SharedFallback,
+}
+
+impl BindingSetupPhase {
+    pub(in crate::afxdp) fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::SharedFallback => "shared-fallback",
+        }
+    }
+}
+
+/// #6245: an EXPLICIT per-slot binding-setup failure carried in
+/// [`WorkerStartupReport`]. Pre-#6245 a failed binding was reported ONLY by
+/// OMISSION — the slot was simply absent from `bound_slots`, discarding the
+/// causal error, the phase, and the fallback path (`worker_loop_setup` merely
+/// logged + mutated `BindingLiveState.last_error`). The readiness barrier could
+/// prove incompleteness (bound != planned) but not say WHY. This makes the
+/// cause explicit so the barrier's fail-closed diagnostic carries the slot,
+/// phase, and owned error string. Owned strings only — this is the one-shot
+/// cold setup path, never per-packet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) struct BindingSetupFailure {
+    pub(in crate::afxdp) slot: u32,
+    pub(in crate::afxdp) phase: BindingSetupPhase,
+    pub(in crate::afxdp) reason: String,
+}
+
+/// #6245: a shared-UMEM group whose group bind FAILED but which then RECOVERED
+/// via a COMPLETE private-UMEM fallback (every member slot rebound privately).
+/// This is a recorded DEGRADATION, not a terminal failure — the readiness
+/// criterion is unaffected (all planned slots still bound), so a fully
+/// recovered group must NOT fail the reconcile. Modeled separately from
+/// [`BindingSetupFailure`] per the #6245 design amendment so a recovered
+/// fallback is never conflated with a terminal per-slot failure. Purely
+/// diagnostic: it makes the recovered path visible in the startup report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) struct BindingRecoveredFallback {
+    pub(in crate::afxdp) group: String,
+    pub(in crate::afxdp) reason: String,
+}
+
 /// #5143: a newly-started worker's one-shot STARTUP READINESS report,
 /// sent once — after the worker finishes its in-thread XSK/UMEM binds in
 /// `worker_loop_setup` and BEFORE it enters its steady poll loop — back to
@@ -171,17 +225,29 @@ pub(in crate::afxdp) struct BindingPlan {
 /// `bound_slots` is the set of planned binding slots whose XSK actually bound
 /// (derived from the bindings the worker successfully constructed). A worker
 /// whose in-thread bind failed for one or more planned bindings reports a set
-/// SMALLER than its planned set — the setup Err arm records the failure by
-/// OMISSION (the failed binding never enters the worker's `bindings` vec, so
-/// its slot is absent here). The `bring_up_workers` readiness barrier compares
-/// this against the slot set it dispatched to the worker; any shortfall (or a
-/// worker that never reports within the bounded deadline) fails the reconcile
-/// closed. HEARTBEAT != READINESS: a live heartbeat alone no longer satisfies
-/// the reconcile transaction — one READY binding must exist per required plan.
+/// SMALLER than its planned set. The `bring_up_workers` readiness barrier
+/// compares this against the slot set it dispatched to the worker; any
+/// shortfall (or a worker that never reports within the bounded deadline)
+/// fails the reconcile closed. HEARTBEAT != READINESS: a live heartbeat alone
+/// no longer satisfies the reconcile transaction — one READY binding must exist
+/// per required plan.
+///
+/// #6245: `binding_failures` now carries the EXPLICIT per-slot terminal
+/// failures (slot + phase + owned error) that produced any shortfall, instead
+/// of leaving the barrier to infer the cause from the missing slots alone.
+/// `recovered_fallbacks` records shared-UMEM groups that failed their group
+/// bind but fully recovered via private fallback — a diagnostic degradation
+/// that does NOT affect readiness (all slots still bound). Both are sorted
+/// deterministically (failures by slot, fallbacks by group) so the surfaced
+/// diagnostic is stable regardless of setup/channel ordering. The success path
+/// is unchanged: a worker that bound its full planned set reports both vecs
+/// empty.
 #[derive(Clone, Debug)]
 pub(in crate::afxdp) struct WorkerStartupReport {
     pub(in crate::afxdp) worker_id: u32,
     pub(in crate::afxdp) bound_slots: Vec<u32>,
+    pub(in crate::afxdp) binding_failures: Vec<BindingSetupFailure>,
+    pub(in crate::afxdp) recovered_fallbacks: Vec<BindingRecoveredFallback>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

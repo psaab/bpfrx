@@ -46,6 +46,17 @@ pub(super) struct WorkerLoopSetup {
     pub(super) conntrack_v4_fd: c_int,
     pub(super) conntrack_v6_fd: c_int,
     pub(super) last_cos_status_ns: u64,
+    // #6245: EXPLICIT per-slot terminal binding-setup failures (private
+    // bind, or a shared-group bind whose private fallback also failed).
+    // Pre-#6245 these were recorded ONLY by leaving the failed slot out of
+    // `bindings`; now they are carried through to the WorkerStartupReport so
+    // the readiness barrier's fail-closed diagnostic names the cause. Sorted
+    // by slot before return for a stable report.
+    pub(super) binding_failures: Vec<BindingSetupFailure>,
+    // #6245: shared-UMEM groups that failed their group bind but fully
+    // recovered via private fallback — a diagnostic degradation, NOT a
+    // failure (all slots still bound). Sorted by group before return.
+    pub(super) recovered_fallbacks: Vec<BindingRecoveredFallback>,
 }
 
 /// One-shot worker setup (moved verbatim from the head of
@@ -138,9 +149,17 @@ pub(super) fn worker_loop_setup(
     // install/remove counter maintenance is skipped for the ~99% case.
     sessions.set_session_limit_active(screen_state.any_session_limit_configured());
     let mut bindings = Vec::with_capacity(binding_plans.len());
+    // #6245: accumulate EXPLICIT per-slot terminal failures and recovered
+    // shared-group fallbacks so the WorkerStartupReport can carry the causal
+    // error, not just the survivor set. Empty in the common (all-bound) case.
+    let mut binding_failures: Vec<BindingSetupFailure> = Vec::new();
+    let mut recovered_fallbacks: Vec<BindingRecoveredFallback> = Vec::new();
     let (private_plans, shared_groups) = partition_binding_plans(binding_plans);
     for plan in private_plans {
         let live = plan.live.clone();
+        // #6245: capture the slot BEFORE `plan` is moved into the bind call so
+        // a failure can be reported explicitly (was lost with the moved plan).
+        let slot = plan.status.slot;
         match create_private_binding_from_plan(plan) {
             Ok(binding) => bindings.push(binding),
             Err(err) => {
@@ -151,18 +170,29 @@ pub(super) fn worker_loop_setup(
                 // sends to the `bring_up_workers` barrier. That OMISSION is how
                 // the barrier learns this worker came up with a PARTIAL binding
                 // set and fails the reconcile closed (HEARTBEAT != READINESS).
-                // Pre-#5143 this `eprintln!` + `set_error` was the ONLY signal,
-                // and the worker went on heartbeating with an incomplete set —
-                // the silent forwarding outage.
-                eprintln!("xpf-userspace-dp: private binding creation failed: {err}");
-                live.set_error(err.to_string());
+                // #6245: ALSO record the failure EXPLICITLY (slot + phase +
+                // owned error) so the barrier's fail-closed diagnostic can name
+                // the cause instead of inferring it from the missing slot.
+                let reason = err.to_string();
+                eprintln!("xpf-userspace-dp: private binding creation failed: {reason}");
+                live.set_error(reason.clone());
+                binding_failures.push(BindingSetupFailure {
+                    slot,
+                    phase: BindingSetupPhase::Private,
+                    reason,
+                });
             }
         }
     }
     for (group_key, plans) in shared_groups {
         match create_shared_binding_group(&group_key, plans) {
             Ok(mut group_bindings) => bindings.append(&mut group_bindings),
-            Err(err) => fallback_shared_group_to_private(err, &mut bindings),
+            Err(err) => fallback_shared_group_to_private(
+                err,
+                &mut bindings,
+                &mut binding_failures,
+                &mut recovered_fallbacks,
+            ),
         }
     }
     bindings.sort_by_key(|binding| (binding.queue_id, binding.ifindex, binding.slot));
@@ -237,6 +267,11 @@ pub(super) fn worker_loop_setup(
         last_cos_status_ns,
     )));
     runtime_atomics.set_tid(current_tid());
+    // #6245: stable ordering for the startup report — failures by slot,
+    // recovered fallbacks by group — so the surfaced diagnostic is
+    // deterministic regardless of plan/partition iteration order.
+    binding_failures.sort_by_key(|failure| failure.slot);
+    recovered_fallbacks.sort_by(|a, b| a.group.cmp(&b.group));
     WorkerLoopSetup {
         ha_startup_grace_until_secs,
         validation,
@@ -257,5 +292,7 @@ pub(super) fn worker_loop_setup(
         conntrack_v4_fd,
         conntrack_v6_fd,
         last_cos_status_ns,
+        binding_failures,
+        recovered_fallbacks,
     }
 }
