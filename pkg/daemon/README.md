@@ -70,6 +70,36 @@ only the apply entrypoints and core orchestrator:
 - `daemon_apply_tail.go` — the `applyTailReconciles` orchestrator and its
   LLDP / DHCP-relay / event-engine / initial policy-scheduler reconcile
   helpers.
+### `daemon_run.go` file layout (#5661)
+
+`Run` and its startup/shutdown machinery were split out of a single
+~2820-LOC `daemon_run.go` into cohesive sibling files in `package daemon`
+— pure code motion, no rename/reorder/logic change, so the load-bearing
+startup-phase and shutdown ordering is untouched:
+
+- `daemon_run.go` — the core lifecycle: `buildRuntimeDataPlane`, `Run`,
+  and the startup-phase orchestration (`startupSignalContext`,
+  `startupPhase`, `runStartupPhases`, `runStartupOrAbort`,
+  `startReconcileRGStateLoop`). `buildRuntimeDataPlane` **must stay here**:
+  the retirement-boundary canary
+  (`TestDaemonRuntimeEntryPointUsesRuntimeDataPlane`,
+  `pkg/dataplane/retirement_boundary_canary_test.go`) parses this file and
+  requires a `dataplane.NewRuntimeDataPlane` call in it.
+- `daemon_run_bringup.go` — startup bring-up phases: `initManagers`,
+  `loadAndBootstrapConfig`, `setupDataplaneAndInitialConfig`,
+  `enableForwarding`.
+- `daemon_run_naming.go` — startup interface naming/enumeration:
+  `setupInterfaceNaming`, `namingParamsFromConfig`,
+  `applyStartupNamingForConfig`, `maybeReapplyConfigArrivalNaming`,
+  `runBootstrapExitStartup`.
+- `daemon_run_servers.go` — API-surface bring-up and the #5054/#5961
+  per-transport commit-wiring seams: the six `*CommitFn`/`*CommitConfirmedFn`
+  methods, `startGRPCServer`, `startHTTPServer`, `resolveAPIBinds`.
+- `daemon_run_shutdown.go` — ordered teardown: `applyCloseoutDrainTimeout`,
+  `runShutdownSequence`, `runHAShutdownUpdate`.
+- `daemon_run_routehelpers.go` — route/tunnel inference helpers:
+  `riMemberLinuxName`, `collectAppliedTunnels`, `linkLocalV6Net`,
+  `inferIPv6StaticNextHopInterfaces`.
 
 ### Struct decomposition (#4407, in progress)
 
