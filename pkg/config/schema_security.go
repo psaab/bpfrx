@@ -1127,7 +1127,19 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				valueType: ValueSecureTunnelIf, valueDesc: "IPsec secure-tunnel interface (st<N> or st<N>.<unit>)",
 				valueExamples: []string{"st0", "st0.1"},
 				validator:     ValidateSecureTunnelBindInterface, children: nil},
-			"df-bit": {desc: "Outer-header DF bit handling (copy|set|clear)", args: 1, placeholder: "<mode>", children: nil},
+			// #5649 (C181-M22): type the enum so a typo (`cler`) fails closed at
+			// commit instead of storing verbatim and silently becoming
+			// strongSwan's copy-DF default. The renderer at pkg/ipsec/policy.go
+			// only emits copy_df for copy/set/clear and OMITS the directive for
+			// anything else, so `df-bit cler` would leave the outer DF copied
+			// (the opposite of an intended `clear`) and blackhole oversized
+			// encapsulated packets via PMTUD while commit reported success.
+			// Mirrors the #4301 establish-tunnels pattern; the copy/set/clear
+			// set matches the renderer's switch exactly.
+			"df-bit": {desc: "Outer-header DF bit handling (copy|set|clear)", args: 1, placeholder: "<mode>",
+				valueType: ValueEnumOf, valueDesc: "outer-header DF bit mode",
+				valueExamples: []string{"copy", "set", "clear"},
+				validator:     ValidateEnum([]string{"copy", "set", "clear"}), children: nil},
 			// #4301 (V-5): type the enum so a typo (`on-tarffic`) fails closed
 			// at commit instead of storing verbatim and silently degrading to
 			// on-traffic. Only `immediately` is acted on (start_action =

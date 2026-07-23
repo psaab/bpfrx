@@ -209,6 +209,13 @@ func (s *Server) showTestZone(req *pb.ShowTextRequest, cfg *config.Config, buf *
 	// bare `test-zone:` (empty params) still falls through to the
 	// "Missing interface parameter" diagnostic below.
 	if params != "" {
+		// #5649 (C181-C09): reject a repeated selector key. Without a `seen`
+		// set a duplicate `interface=a,interface=b` silently LAST-WON in the
+		// switch below, so the archived diagnostic reported a DIFFERENT
+		// interface's zone/posture than the operator typed. This mirrors the
+		// #4921 showTestRouting and #3709 showTestPolicy duplicate-selector
+		// contract (server_show_routes_text.go).
+		seen := map[string]bool{}
 		for _, kv := range strings.Split(params, ",") {
 			parts := strings.SplitN(kv, "=", 2)
 			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -217,6 +224,17 @@ func (s *Server) showTestZone(req *pb.ShowTextRequest, cfg *config.Config, buf *
 				}
 				continue
 			}
+			if seen[parts[0]] {
+				// A duplicate KNOWN key would last-win below; a duplicate
+				// UNKNOWN key already recorded an "unknown selector" error on
+				// its first occurrence (parseErr is set-once), so this only
+				// overrides when no earlier grammar error was captured.
+				if parseErr == nil {
+					parseErr = fmt.Errorf("selector %q specified more than once", parts[0])
+				}
+				continue
+			}
+			seen[parts[0]] = true
 			switch parts[0] {
 			case "interface":
 				ifName = parts[1]

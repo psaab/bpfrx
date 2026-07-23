@@ -58074,3 +58074,48 @@ top.
   - **File(s)**: pkg/cli/cli_request_policies_check.go,
     pkg/cli/cli_request_policies_check_test.go, pkg/policymatch/policymatch.go,
     pkg/policymatch/README.md, docs/pr/812-tx-latency-histogram/plan.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Triaged cohort #5649 (codex-review-181 low-materiality / bounded-
+    hardening survivors, 19 IDs) against current origin/master 55cf5a9b2 and
+    fixed the 4 REAL + INDEPENDENT + LOW-RISK + in-Go-scope items in one PR
+    ("Advances #5649"), each with a fail-on-revert test (neutralize -> clean
+    assertion RED verified firsthand, restore -> GREEN).
+    - **M22** (C181-M22): `security ipsec vpn <v> df-bit` was an untyped leaf,
+      so a typo (`cler`) committed clean and the swanctl renderer then OMITTED
+      `copy_df`, leaving strongSwan's copy-DF default (opposite of intended
+      `clear`) -> PMTUD blackhole. Typed the leaf ValueEnumOf +
+      ValidateEnum([copy,set,clear]), mirroring the #4301 establish-tunnels
+      pattern. Test rejects cler/copyy/on/yes, accepts copy/set/clear.
+    - **C09** (C181-C09): gRPC `test-zone:` selector parser had no `seen` set,
+      so `interface=a,interface=b` silently last-won and archived a DIFFERENT
+      interface's zone/posture. Added a duplicate-selector reject mirroring the
+      #4921 showTestRouting / #3709 showTestPolicy contract.
+    - **C11** (C181-C11): session page-token decoders used `len(b) <
+      binary.Size(key)`, so oversized/trailing-byte tokens aliased the same
+      cursor and amplified base64/hex allocations up to the 16 MiB gRPC cap.
+      Require EXACT ABI length in decodeSessionKeyV4/V6 and reject tokens over
+      maxPageTokenLen (256) before any decode.
+    - **C13** (C181-C13): the pre-prompt commit-confirm poll used
+      context.Background(), so a daemon that accepted the connection but never
+      completed GetConfigModeStatus wedged the interactive CLI before Readline.
+      Extracted confirmPending() using a bounded context (confirmPendingTimeout,
+      2s); test asserts the poll context carries a deadline.
+    DEFER (Rust / out of Go scope -> dataplane owner): M04 (afxdp/icmp.rs),
+    M05 (slowpath.rs), M13 (nat/allocator.rs), C03 (read_bytes AF_XDP),
+    C15/C16 (test/incus/cold-path-flooder/src/main.rs), C19 (filter matching.rs).
+    Real Go-scope but NOT low-risk (own PR, kept in cohort): C06 (journal fsync
+    inode-retention concurrency), C12a/C12b (feed join-ownership / aggregate
+    budget), C14 (policymatch simulator quarantine projection), C20 (CLI coarse
+    host-verdict rendering), C08 (gRPC counters-available proto field),
+    C10 (SSE post-shutdown Close), M18 (duplicate NAT rule-name rejection —
+    config-acceptance behavior change). No HA/cluster/vrrp/failover code touched.
+    build+vet+gofmt clean; full go test ./pkg/config ./pkg/grpcapi ./cmd/cli
+    ./pkg/ipsec GREEN.
+  - **File(s)**: pkg/config/schema_security.go,
+    pkg/config/schema_ipsec_dfbit_enum_5649_test.go,
+    pkg/grpcapi/server_show_zones_text.go,
+    pkg/grpcapi/server_show_zones_dupselector_5649_test.go,
+    pkg/grpcapi/server_sessions.go,
+    pkg/grpcapi/pagination_canonical_5649_test.go, cmd/cli/main.go,
+    cmd/cli/confirm_pending_bounded_5649_test.go, docs/config-schema.md, _Log.md
