@@ -40,12 +40,20 @@ import (
 // preserves the explicit operand order
 // (#1778/#2987/#4433/#5083/#5310/#5679/#5696/#5700).
 func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr error) error {
-	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
+	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances.
+	//
+	// #5275: suppress ALL VRRP ownership when the dataplane failed to arm — a
+	// policy-free node must not advertise VRRP or take VIPs. Leaving the desired
+	// set empty tears down / never re-creates any instances a continuing
+	// (bootstrap-exit) or recovery-commit apply would otherwise publish.
 	var vrrpErr error
-	vrrpInstances := vrrp.CollectInstances(cfg)
-	if d.cluster != nil {
-		localPri := d.cluster.LocalPriorities()
-		vrrpInstances = append(vrrpInstances, vrrp.CollectRethInstances(cfg, localPri)...)
+	var vrrpInstances []*vrrp.Instance
+	if !d.dataplaneArmFailed.Load() {
+		vrrpInstances = vrrp.CollectInstances(cfg)
+		if d.cluster != nil {
+			localPri := d.cluster.LocalPriorities()
+			vrrpInstances = append(vrrpInstances, vrrp.CollectRethInstances(cfg, localPri)...)
+		}
 	}
 	if err := d.vrrpMgr.UpdateInstances(vrrpInstances); err != nil {
 		slog.Warn("failed to update VRRP instances", "err", err)

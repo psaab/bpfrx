@@ -487,39 +487,7 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 		// arm it on the first confirmed commit (C1: construct always, arm
 		// only when not bootstrap). The control plane (gRPC/REST/CLI) is
 		// started later regardless.
-		if d.inBootstrap() {
-			slog.Info("bootstrap mode: dataplane arm and boot-time config apply suppressed")
-		} else {
-			if d.dp != nil {
-				if err := d.dp.Start(d.daemonCtx); err != nil {
-					slog.Warn("failed to start dataplane, running in config-only mode",
-						"err", err)
-					d.dp = nil
-				} else {
-					// natSeeder is satisfied by both *dataplane.Manager
-					// (legacy eBPF — SeedNATPortCounters in maps_nat.go,
-					// SeedSessionIDCounter in maps_session.go) and the userspace
-					// *LegacyDataPlaneAdapter (via embedded bpfShim). The
-					// seed methods are no-ops on the userspace fast path
-					// but harmless to invoke. The legacyDP() round-trip is
-					// no longer required (#1519).
-					if seeder, ok := d.dp.(natSeeder); ok {
-						seeder.SeedNATPortCounters()
-						nodeID := 0
-						if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
-							nodeID = cfg.Chassis.Cluster.NodeID
-						}
-						seeder.SeedSessionIDCounter(nodeID)
-					}
-				}
-			}
-			// Apply current config — needed even in config-only mode so that
-			// VRFs, interfaces, and routing are configured before cluster comms.
-			if cfg := d.store.ActiveConfig(); cfg != nil {
-				slog.Info("applying active configuration")
-				d.applyConfig(cfg)
-			}
-		}
+		d.armBuiltDataplaneAndApplyBootConfig()
 	}
 	// #1715: the boot-time DNS reconcile (inside the apply above) ran
 	// before DHCP clients start, so its empty-merge policy was
@@ -537,6 +505,68 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 		d.reconcileBlackholeRoutes()
 	}
 	return nil
+}
+
+// armBuiltDataplaneAndApplyBootConfig arms the already-built dataplane backend
+// (unless bootstrap suppresses it) and runs the boot-time applyConfig — UNLESS
+// the arm fails, in which case it FAILS CLOSED (#5275) instead of degrading to a
+// policy-free kernel router. Split out of setupDataplaneAndInitialConfig so the
+// arm→fail-closed decision is unit-tested with a fake backend whose Start()
+// fails, without a live AF_XDP attach (buildRuntimeDataPlane needs root/XDP).
+//
+// #1922 Item 2: in bootstrap mode do NOT arm (AF_XDP attach) and do NOT run the
+// boot-time applyConfig — the backend object stays constructed (d.dp != nil) so
+// the bootstrap-exit reconcile arms it on the first confirmed commit.
+func (d *Daemon) armBuiltDataplaneAndApplyBootConfig() {
+	if d.inBootstrap() {
+		slog.Info("bootstrap mode: dataplane arm and boot-time config apply suppressed")
+		return
+	}
+	armFailed := false
+	if d.dp != nil {
+		if err := d.dp.Start(d.daemonCtx); err != nil {
+			// #5275: a SUCCESSFUL compile whose dataplane did not arm must FAIL
+			// CLOSED exactly like the #1960 compile-failure boot — NOT degrade to
+			// a policy-free kernel router. The pre-#5275 code set d.dp=nil, logged
+			// "config-only mode", and FELL THROUGH to applyConfig, which enabled
+			// transit forwarding, published the FRR managed section, and took
+			// VRRP/VIP/cluster ownership on a node enforcing ZERO security policy.
+			slog.Error("failed to arm dataplane at boot; failing closed "+
+				"(no transit forwarding, no route advertisement, no HA/VIP takeover) "+
+				"until a policy-enforcement dataplane arms — management stays "+
+				"reachable for in-band recovery", "err", err)
+			d.dp = nil
+			armFailed = true
+		} else if seeder, ok := d.dp.(natSeeder); ok {
+			// natSeeder is satisfied by both *dataplane.Manager (legacy eBPF —
+			// SeedNATPortCounters in maps_nat.go, SeedSessionIDCounter in
+			// maps_session.go) and the userspace *LegacyDataPlaneAdapter (via
+			// embedded bpfShim). The seed methods are no-ops on the userspace fast
+			// path but harmless to invoke. The legacyDP() round-trip is no longer
+			// required (#1519).
+			seeder.SeedNATPortCounters()
+			nodeID := 0
+			if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+				nodeID = cfg.Chassis.Cluster.NodeID
+			}
+			seeder.SeedSessionIDCounter(nodeID)
+		}
+	}
+	if armFailed {
+		// #5275: fail closed and SKIP the boot applyConfig — no VRF/interface/
+		// routing/FRR/VRRP/cluster takeover is published. Management freezes in
+		// last-known-good networkd state (mirrors #1960). The sticky
+		// d.dataplaneArmFailed flag keeps every later apply/reconcile fail-closed.
+		d.enterDataplaneArmFailedFailClosed()
+		return
+	}
+	// Apply current config — needed even in config-only mode (a retired-backend
+	// build) so that VRFs, interfaces, and routing are configured before cluster
+	// comms.
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		slog.Info("applying active configuration")
+		d.applyConfig(cfg)
+	}
 }
 
 // isInteractive returns true if stdin is a real terminal (not /dev/null or a pipe).
@@ -567,4 +597,27 @@ func enableForwarding() {
 		}
 	}
 	slog.Info("IP forwarding enabled, RA acceptance disabled")
+}
+
+// writeForwardingSysctl applies a transit-forwarding sysctl (ip_forward / ipv6
+// forwarding). It is a package var so the #5275 fail-closed forwarding decision
+// (disableForwarding + the applyKernelTuning gate) is unit-testable without
+// touching /proc. Warns-and-continues on error, matching enableForwarding.
+var writeForwardingSysctl = func(path, val string) {
+	if err := os.WriteFile(path, []byte(val), 0644); err != nil {
+		slog.Warn("failed to set forwarding sysctl", "path", path, "err", err)
+	}
+}
+
+// disableForwarding is the #5275 fail-closed inverse of enableForwarding's
+// forwarding knobs: it clears ONLY the two transit-forwarding sysctls (IPv4
+// ip_forward and IPv6 all/forwarding) so the kernel does not route unpoliced
+// transit on a node with no policy-enforcement dataplane. It deliberately leaves
+// the management-plane sysctls (tcp/udp_l3mdev_accept for SSH on the mgmt VRF,
+// accept_ra=0, accept_local) untouched so the console/mgmt lifeline stays
+// reachable — fail closed means no TRANSIT forwarding, not a dead box.
+func disableForwarding() {
+	writeForwardingSysctl("/proc/sys/net/ipv4/ip_forward", "0\n")
+	writeForwardingSysctl("/proc/sys/net/ipv6/conf/all/forwarding", "0\n")
+	slog.Warn("transit IP forwarding disabled (fail-closed, #5275): dataplane not armed")
 }

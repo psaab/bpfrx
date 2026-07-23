@@ -530,7 +530,23 @@ func (d *Daemon) runBootstrapTeardownSteps() []bootstrapTeardownStep {
 // re-attempts. Management reachability beats a perfectly-clean FRR reload, so
 // boot must proceed regardless.
 func (d *Daemon) clearFRRForFailClosedBoot(compileFailed bool) {
-	if !compileFailed || d.frr == nil {
+	if !compileFailed {
+		return
+	}
+	d.clearFRRManagedSectionOnFailClosedBoot("compile-failed")
+}
+
+// clearFRRManagedSectionOnFailClosedBoot strips the last-good xpf-managed FRR
+// section on a fail-closed boot, gated on the same two-stage live-forwarding
+// decision (failClosedBootShouldClearFRR) so a genuine hitless crash-survivor
+// still forwarding keeps advertising. It is shared by the two fail-closed
+// triggers: a COMPILE failure (#1993, reason "compile-failed") and a dataplane
+// arm/attach failure (#5275, reason "dataplane-arm-failed"). In both cases the
+// node has no live policy-enforcement dataplane, so advertising last-good
+// prefixes would route transit into a blackhole instead of the HA partner. The
+// `reason` is logged. A nil d.frr (NoDataplane / pre-manager) is a safe no-op.
+func (d *Daemon) clearFRRManagedSectionOnFailClosedBoot(reason string) {
+	if d.frr == nil {
 		return
 	}
 	if !d.failClosedBootShouldClearFRR() {
@@ -539,15 +555,59 @@ func (d *Daemon) clearFRRForFailClosedBoot(compileFailed bool) {
 	if err := d.frr.Clear(); err != nil {
 		// Includes ErrFRRReloadDegraded — log, do not abort boot.
 		slog.Warn("fail-closed boot: failed to clear FRR managed section; node may still "+
-			"advertise last-good routes to peers until the operator fixes the config and "+
-			"'commit confirmed'; if the managed section was already stripped on disk, a later "+
-			"FRR restart will still converge",
-			"err", err, "pin_dir", userspaceShimLinkPinDir)
+			"advertise last-good routes to peers until the operator fixes the condition; "+
+			"if the managed section was already stripped on disk, a later FRR restart will "+
+			"still converge",
+			"reason", reason, "err", err, "pin_dir", userspaceShimLinkPinDir)
 		return
 	}
-	slog.Warn("fail-closed boot: cleared FRR managed section so peers fail over to the HA " +
-		"partner instead of blackholing transit to this unarmed node. The first compilable " +
-		"'commit confirmed' re-installs the managed section.")
+	slog.Warn("fail-closed boot: cleared FRR managed section so peers fail over to the HA "+
+		"partner instead of blackholing transit to this unarmed node; the first commit that "+
+		"re-arms a policy-enforcement dataplane re-installs the managed section",
+		"reason", reason)
+}
+
+// enterDataplaneArmFailedFailClosed is the #5275 fail-closed handler for a
+// SUCCESSFUL compile whose dataplane failed to ARM (Start/LoadUserspaceShim).
+// #1960/#1993 fail closed ONLY on a compile failure; a compile-success +
+// arm-failure previously set d.dp=nil, logged "config-only mode", and FELL
+// THROUGH to applyConfig, degrading the node to a policy-free Linux router that
+// still enabled transit forwarding, advertised routes via FRR, and took
+// VRRP/VIP/cluster ownership. This mirrors the #1960 contract onto the
+// arm-failure path.
+//
+// Called from BOTH arm sites — the boot arm (setupDataplaneAndInitialConfig) and
+// the bootstrap-exit arm (runBootstrapExitStartup). It sets the sticky
+// d.dataplaneArmFailed flag (which gates every config-driven ownership publish so
+// no later apply re-opens the hole) and takes the immediate fail-closed actions:
+//
+//   - disable transit forwarding — manager-init already ran enableForwarding
+//     because a successful compile is NOT bootstrap, so ip_forward was set to 1;
+//     reverse it. Only the two forwarding sysctls are cleared, so the mgmt-VRF
+//     l3mdev / accept_local knobs stay intact and the mgmt/console lifeline is
+//     reachable.
+//   - strip the FRR managed section (route advertisement) via the #1993 seam.
+//   - hold the cluster SECONDARY so the healthy peer owns the RGs (covers the
+//     no-reth-vrrp / direct-announce cluster mode where VIP ownership follows
+//     cluster state, not VRRP).
+//   - tear down VRRP instances so this node stops advertising and the peer
+//     masters the VIPs (covers RETH VRRP mode).
+//
+// d.dp is never rebuilt at runtime, so recovery is a daemon restart; the flag
+// keeps a commit-while-arm-failed fail-closed rather than re-opening the hole.
+func (d *Daemon) enterDataplaneArmFailedFailClosed() {
+	d.dataplaneArmFailed.Store(true)
+	disableForwarding()
+	d.clearFRRManagedSectionOnFailClosedBoot("dataplane-arm-failed")
+	if d.cluster != nil {
+		d.cluster.SetArmFailedHold()
+	}
+	if d.vrrpMgr != nil {
+		if err := d.vrrpMgr.UpdateInstances(nil); err != nil {
+			slog.Warn("fail-closed (#5275): could not tear down VRRP instances after "+
+				"dataplane arm failure", "err", err)
+		}
+	}
 }
 
 // failClosedBootShouldClearFRR is the pure two-stage decision behind

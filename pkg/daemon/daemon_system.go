@@ -534,16 +534,34 @@ func (d *Daemon) applyKernelTuning(cfg *config.Config) {
 		}
 	}
 
-	// Enable IP forwarding (required for firewall operation)
+	// Enable IP forwarding (required for firewall operation) — UNLESS the
+	// dataplane failed to arm (#5275). A node with no policy-enforcement
+	// dataplane must not route unpoliced transit, so leave ip_forward at the
+	// fail-closed value that enterDataplaneArmFailedFailClosed set. This is the
+	// "applyKernelTuning re-writes ip_forward=1 at the apply tail" re-arm the
+	// issue calls out; the gate stops a continuing (bootstrap-exit) or
+	// recovery-commit apply from re-opening the hole.
+	if d.dataplaneArmFailed.Load() {
+		slog.Warn("fail-closed (#5275): not re-enabling ip_forward — dataplane not armed")
+		return
+	}
+	enableTransitForwardingSysctls()
+}
+
+// enableTransitForwardingSysctls sets the two transit-forwarding sysctls to 1
+// (idempotent — a write is skipped when the value is already 1). It is a package
+// var so the #5275 fail-closed gate in applyKernelTuning is unit-testable
+// (assert this is NOT invoked when the dataplane is unarmed) without depending on
+// the host's /proc/sys/net/ipv4/ip_forward, which on a firewall dev box is
+// already 1 and would mask the gate.
+var enableTransitForwardingSysctls = func() {
 	for _, path := range []string{
 		"/proc/sys/net/ipv4/ip_forward",
 		"/proc/sys/net/ipv6/conf/all/forwarding",
 	} {
 		current, _ := os.ReadFile(path)
 		if strings.TrimSpace(string(current)) != "1" {
-			if err := os.WriteFile(path, []byte("1\n"), 0644); err != nil {
-				slog.Warn("failed to enable forwarding", "path", path, "err", err)
-			}
+			writeForwardingSysctl(path, "1\n")
 		}
 	}
 }

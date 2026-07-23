@@ -126,6 +126,16 @@ type Manager struct {
 	// Start() on a candidate boot; cleared by promote/rejoin/revert.
 	kernelUpgradeHold bool
 
+	// armFailedHold, when set, unconditionally holds this node SECONDARY in
+	// election (#5275): a boot whose dataplane failed to ARM (Start/attach) has
+	// NO policy-enforcement forwarding, so it must never become primary / own the
+	// RGs — the healthy peer owns them. Like kernelUpgradeHold (and unlike
+	// ManualFailover) it is NOT auto-cleared for an isolated node, so a broken
+	// node that cannot see the peer still cannot claim primary and blackhole
+	// traffic. There is no runtime clear: d.dp is never rebuilt at runtime, so
+	// recovery is a daemon restart. See SetArmFailedHold.
+	armFailedHold bool
+
 	// Peer state tracking (heartbeat).
 	peerAlive    bool
 	peerEverSeen bool // true once first heartbeat received; distinguishes "never heard" from "lost"

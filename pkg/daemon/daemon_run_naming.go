@@ -229,9 +229,20 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 	// constructed at boot (C1) but never started in bootstrap mode.
 	if d.dp != nil {
 		if err := d.dp.Start(d.daemonCtx); err != nil {
-			slog.Warn("bootstrap exit: failed to start dataplane, running in config-only mode",
+			// #5275: the bootstrap-exit arm has the SAME hole as the boot arm —
+			// a successful compile whose dataplane fails to attach must fail
+			// closed, not fall through and let applyConfigLocked's continuing
+			// reconcile enable forwarding + publish FRR/VRRP/cluster ownership on
+			// a policy-free node. The sticky flag set here gates every ownership
+			// publish in the reconcile that follows this call (applyKernelTuning
+			// forwarding, applyFRRConfig, the VRRP tail), so no ownership is
+			// taken; the immediate actions disable forwarding, clear FRR, hold
+			// the cluster SECONDARY, and tear down VRRP.
+			slog.Error("bootstrap exit: failed to arm dataplane; failing closed "+
+				"(no transit forwarding, no route advertisement, no HA/VIP takeover)",
 				"err", err)
 			d.dp = nil
+			d.enterDataplaneArmFailedFailClosed()
 		} else {
 			if seeder, ok := d.dp.(natSeeder); ok {
 				seeder.SeedNATPortCounters()

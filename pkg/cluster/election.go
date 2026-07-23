@@ -48,7 +48,11 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 	// candidate with a broken dataplane must NEVER become primary even if it
 	// can't see the peer, or it would blackhole traffic (r2 AGY Critical). It is
 	// cleared only by promote/rejoin/revert (KernelUpgradeHoldClear).
-	if m.kernelUpgradeHold {
+	//
+	// #5275: armFailedHold is the same "hold SECONDARY unconditionally" gate for a
+	// boot whose dataplane failed to arm — a node with no policy-enforcement
+	// forwarding must never win election / own the RGs.
+	if m.kernelUpgradeHold || m.armFailedHold {
 		return electNoChange, ""
 	}
 
@@ -409,7 +413,11 @@ func (m *Manager) electSingleNode() {
 	// The hold is NOT auto-cleared (unlike ManualFailover), so an isolated
 	// candidate with a broken dataplane never claims primary. Cleared only by
 	// promote/rejoin/revert.
-	if m.kernelUpgradeHold {
+	//
+	// #5275: armFailedHold holds SECONDARY for the same reason on a boot whose
+	// dataplane failed to arm — the isolated single-node path is exactly where a
+	// broken node would otherwise auto-promote with no peer to hold it back.
+	if m.kernelUpgradeHold || m.armFailedHold {
 		return
 	}
 	for _, rg := range m.groups {

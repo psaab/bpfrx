@@ -655,6 +655,18 @@ func (d *Daemon) reconcileVRRPInstances() {
 	if d.vrrpMgr == nil || d.store == nil {
 		return
 	}
+	// #5275: with no policy-enforcement dataplane armed, this node must NOT own
+	// any VRRP VIPs (it cannot enforce policy). The periodic reconcile reads the
+	// still-non-nil ActiveConfig (a successful compile), so without this gate it
+	// would re-create the very instances enterDataplaneArmFailedFailClosed tore
+	// down. Keep the desired set EMPTY so the peer masters the VIPs. Sticky until
+	// a restart re-arms the dataplane.
+	if d.dataplaneArmFailed.Load() {
+		if err := d.vrrpMgr.UpdateInstances(nil); err != nil {
+			slog.Warn("fail-closed (#5275): reconcile could not tear down VRRP instances", "err", err)
+		}
+		return
+	}
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
 		return

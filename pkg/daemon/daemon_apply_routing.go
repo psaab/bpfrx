@@ -207,7 +207,15 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 	// step 1.95, so an operator commit while a policy is FAILED
 	// preserves a still-valid injected failover route and drops
 	// removed/edited entries on the commit itself.
-	if d.frr != nil {
+	if d.frr != nil && d.dataplaneArmFailed.Load() {
+		// #5275: no policy-enforcement dataplane armed — do NOT advertise routes.
+		// The managed section was already stripped by
+		// enterDataplaneArmFailedFailClosed; publishing it again here (on a
+		// bootstrap-exit or recovery-commit apply) would route transit into a
+		// blackhole instead of the HA partner. Skip the publish entirely so the
+		// section stays cleared until a restart re-arms the dataplane.
+		slog.Warn("fail-closed (#5275): skipping FRR managed-section publish — dataplane not armed")
+	} else if d.frr != nil {
 		// The full apply path deliberately warns-and-continues on an FRR
 		// reload error (a transient FRR hiccup must not fail an
 		// otherwise-valid operator commit; the in-manager degraded-retry

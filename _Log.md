@@ -57374,3 +57374,23 @@ top.
     test/xsk-repro/selftest-compile.sh,
     test/xsk-repro/selftest-skipgate_6289.sh (new),
     test/xsk-repro/README.md, scripts/run-selftests.sh
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5275 fail-closed on dataplane arm/attach failure. #1960/#1993
+    fail closed only on COMPILE failure; a successful compile + Start/
+    LoadUserspaceShim arm failure fell through to applyConfig and degraded the
+    node to a policy-free Linux router (ip_forward=1, FRR advertising,
+    VRRP/VIP/cluster ownership). Added sticky d.dataplaneArmFailed flag +
+    enterDataplaneArmFailedFailClosed handler (disableForwarding, clear FRR
+    managed section, cluster SetArmFailedHold, VRRP teardown), wired at BOTH arm
+    sites (boot + bootstrap-exit), and gated applyKernelTuning / applyFRRConfig /
+    VRRP publish + periodic reconcile on the flag. New cluster armFailedHold
+    election hold. Fail-on-revert unit tests (daemon + cluster), all verified RED
+    on gate revert. README fail-closed section updated.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/bootstrap.go,
+    pkg/daemon/daemon_run_bringup.go, pkg/daemon/daemon_run_naming.go,
+    pkg/daemon/daemon_ha.go, pkg/daemon/daemon_apply_tail.go,
+    pkg/daemon/daemon_system.go, pkg/daemon/daemon_apply_routing.go,
+    pkg/daemon/dataplane_arm_failclosed_5275_test.go, pkg/daemon/README.md,
+    pkg/cluster/manager.go, pkg/cluster/election.go,
+    pkg/cluster/arm_failed_hold.go, pkg/cluster/arm_failed_hold_test.go

@@ -511,6 +511,52 @@ never lock an operator out of a remote box it manages.
       drop (peer hold-down then carries transit on the partner). A unit-ordering
       change (`xpfd` clears FRR before FRR forms peerings) would shrink the
       window further but is a separable follow-up, not required for the Go fix.
+- **Fail-closed on dataplane ARM failure (#5275, mirroring the #1960/#1993
+  compile-failure contract onto the arm path):** #1960/#1993 fail closed ONLY on
+  a COMPILE failure. A SUCCESSFUL compile followed by a dataplane arm/attach
+  failure (`d.dp.Start()` / `LoadUserspaceShim`) bypassed that gate: the code set
+  `d.dp = nil`, logged "config-only mode", and FELL THROUGH to `applyConfig`,
+  which enabled transit forwarding (`enableForwarding` in `initManagers`, re-armed
+  by `applyKernelTuning`'s `ip_forward=1` at the apply tail), published the FRR
+  managed section, and took VRRP/VIP/cluster ownership. A cold boot with a valid
+  persisted config whose AF_XDP attach failed therefore came up as a **plain
+  Linux router enforcing ZERO security policy** while still routing and
+  advertising. There are TWO arm sites with this shape: the boot arm
+  (`armBuiltDataplaneAndApplyBootConfig`, split out of
+  `setupDataplaneAndInitialConfig`) and the bootstrap-exit arm
+  (`runBootstrapExitStartup`).
+  - **The sticky `d.dataplaneArmFailed` atomic** is set at either arm site (via
+    `enterDataplaneArmFailedFailClosed`) and gates every config-driven ownership
+    publish so no later apply/reconcile re-opens the hole: `applyKernelTuning`
+    does not re-enable `ip_forward` (the enable is factored into the
+    `enableTransitForwardingSysctls` seam), `applyRoutingRules` skips the
+    `applyFRRConfig` publish, and both the VRRP tail (`applyTailReconciles`) and
+    the periodic `reconcileVRRPInstances` keep the desired VRRP set EMPTY. `d.dp`
+    is never rebuilt at runtime, so recovery is a **daemon restart** (a fresh boot
+    re-attempts the arm); a commit while arm-failed stays fail-closed.
+  - **`enterDataplaneArmFailedFailClosed` immediate actions:** `disableForwarding`
+    (clears ONLY the two transit-forwarding sysctls — the mgmt-VRF `l3mdev`
+    knobs stay so SSH/console survive), `clearFRRManagedSectionOnFailClosedBoot`
+    ("dataplane-arm-failed" — shares the #1993 two-stage `failClosedBootShouldClearFRR`
+    live-forwarding probe, so a genuine hitless crash-survivor still forwarding
+    keeps advertising), `cluster.SetArmFailedHold()` (a new unconditional
+    SECONDARY election hold, mirroring `SetKernelUpgradeHold` — it BLOCKS future
+    promotions AND DEMOTES any RG already primary, since `cluster.Start()` may have
+    run an isolated single-node election before the arm result was known; covers
+    the no-reth-vrrp / direct-announce cluster mode where VIP ownership follows
+    cluster state), and `vrrpMgr.UpdateInstances(nil)` (tears down VRRP so the peer
+    masters the VIPs; covers RETH VRRP mode).
+  - **Management lifeline preserved (mirrors #1960):** the boot arm SKIPS
+    `applyConfig` (freeze in last-known-good networkd `.link`/`.network`), only the
+    transit-forwarding sysctls are cleared, and the console stays reachable — fail
+    closed means no TRANSIT forwarding + no route advertisement + no HA VIP
+    takeover, NOT a dead box. Tests: `dataplane_arm_failclosed_5275_test.go`
+    (boot-arm skips `applyConfig`; the handler's immediate actions; the
+    `applyKernelTuning` / `applyTailReconciles` VRRP / `applyRoutingRules` FRR
+    gates, each fail-on-revert) and `pkg/cluster/arm_failed_hold_test.go` (the
+    election hold keeps an isolated node SECONDARY and demotes an already-primary
+    RG). This touches VRRP/HA/forwarding, so a loss-cluster `make test-failover`
+    smoke gates the merge.
 - **Bootstrap mode** (`d.bootstrapMode` atomic): runs gRPC/REST/CLI normally
   but SUPPRESSES interface takeover ACTIONS — the full rename loop, host
   tunables, `enableForwarding`, dataplane arm (`dp.Start`), the boot-time

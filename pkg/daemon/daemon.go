@@ -889,6 +889,20 @@ type Daemon struct {
 	// every subsystem.
 	bootstrapMode atomic.Bool
 
+	// dataplaneArmFailed is the #5275 sticky fail-closed flag. It is set when a
+	// SUCCESSFUL config compile is followed by a dataplane arm/attach failure
+	// (Start/LoadUserspaceShim) — the case #1960/#1993 do NOT cover, since they
+	// fail closed only on a COMPILE failure. When set, the node has NO
+	// policy-enforcement dataplane, so every config-driven ownership publish must
+	// fail closed: applyKernelTuning must not re-enable transit forwarding,
+	// applyFRRConfig must not advertise routes, and the VRRP tail + periodic
+	// reconcileVRRPInstances must not (re-)create VRRP instances. Set once from
+	// enterDataplaneArmFailedFailClosed (at either arm site) and read on every
+	// apply/reconcile, so an atomic avoids a lock on the read path. d.dp is never
+	// rebuilt at runtime, so recovery is a daemon restart (a fresh boot
+	// re-attempts the arm); it is intentionally never cleared at runtime.
+	dataplaneArmFailed atomic.Bool
+
 	// emptyHANamingPending is the #4179 one-shot flag for the HA-guard
 	// EMPTY-config takeover. A node with /etc/xpf/node-id but no committed
 	// config resolves NOT-bootstrap (computeBootClass HA-node guard) and names
