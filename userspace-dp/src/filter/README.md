@@ -501,7 +501,7 @@ exactly one of these two classes:
 | `is_fragment` (#2362) | NO — cache-sensitive | Junos `is-fragment`: matches ANY fragment (IPv4 MF set OR offset != 0; IPv6 fragment header present). Computed by `is_any_fragment` |
 | (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
 | `icmp_type` / `icmp_code` (#2362) | NO — cache-sensitive | exact match on the ICMP/ICMPv6 type/code byte; non-ICMP packets never match. Could later be promoted to cache-key by adding (type, code) to `SessionKey` |
-| `flex_match` (#3077, #3232) | NO — cache-sensitive | Junos `from flexible-match-range`: reads `length` bytes (1..4) at `offset` from the START of the base header selected by `flex_match_start` (#3232) — `Layer3` (match-start layer-3, the default) reads from `TermMatchExtra::flex_l3` (the L3/IP header); `Layer4` (match-start layer-4) reads from `TermMatchExtra::flex_l4` (the transport header at `meta.l4_offset`); `Unsupported` (any other match-start, e.g. `payload`, that the Go commit gate rejects but the tolerant peer-sync path could still deliver) always FAILS CLOSED. The chosen bytes are ANDed with `mask` and required to `== value`. Byte-offset read, fully per-packet. The base slice being `None` (no frame / deferred CoS path; or, for layer-4, a non-first fragment whose post-IP bytes are payload) or a packet too short for the window FAILS CLOSED (no match, no OOB). **#5150: both base slices end at the IP-DECLARED datagram end (`l3_offset + IPv4 total-length`, or `l3_offset + 40 + IPv6 payload-length`), CLAMPED to `frame.len()` — NOT the physical frame end.** So attacker-controlled bytes in Ethernet slack (padding beyond the declared IP length) are excluded (a byte-match can only see the logical IP datagram), and a lying oversized IP length can never over-read past the frame. Before #5150 the slices extended to `frame.len()`, letting a flex term match padding bytes (match-on-padding / filter-evasion). Compiled from `FlexMatchSnapshot`; before #3077 the constraint was parsed but dropped on the wire (matched too broadly, fail-open); before #3232 a layer-4/payload match-start was silently evaluated at the L3 base (wrong-offset match — security evasion). **#5293: all six `flex_*` fields (`flex_enabled`, `flex_offset`, `flex_length`, `flex_value`, `flex_mask`, `flex_match_start`) are now compared in `filter_term_semantics_match` (`engine/cache_sensitive.rs`) — before #5293 they were omitted from the forwarding-rotation change detector, so a rotation touching only a flex field skipped the session purge and stranded established sessions on their stale routing-instance / forwarding decision (cross-VRF policy-coherency failure)** |
+| `flex_match` (#3077, #3232) | NO — cache-sensitive | Junos `from flexible-match-range`: reads `length` bytes (1..4) at `offset` from the START of the base header selected by `flex_match_start` (#3232) — `Layer3` (match-start layer-3, the default) reads from `TermMatchExtra::flex_l3` (the L3/IP header); `Layer4` (match-start layer-4) reads from `TermMatchExtra::flex_l4` (the transport header at `meta.l4_offset`); `Unsupported` (any other match-start, e.g. `payload`, that the Go commit gate rejects but the tolerant peer-sync path could still deliver) always FAILS CLOSED. The chosen bytes are ANDed with `mask` and required to `== value`. Byte-offset read, fully per-packet. The base slice being `None` (no frame / deferred CoS path; or, for layer-4, a non-first fragment whose post-IP bytes are payload) or a packet too short for the window FAILS CLOSED (no match, no OOB). **#5150: both base slices end at the IP-DECLARED datagram end (`l3_offset + IPv4 total-length`, or `l3_offset + 40 + IPv6 payload-length`), CLAMPED to `frame.len()` — NOT the physical frame end.** So attacker-controlled bytes in Ethernet slack (padding beyond the declared IP length) are excluded (a byte-match can only see the logical IP datagram), and a lying oversized IP length can never over-read past the frame. Before #5150 the slices extended to `frame.len()`, letting a flex term match padding bytes (match-on-padding / filter-evasion). Compiled from `FlexMatchSnapshot`; before #3077 the constraint was parsed but dropped on the wire (matched too broadly, fail-open); before #3232 a layer-4/payload match-start was silently evaluated at the L3 base (wrong-offset match — security evasion). **#5293: all six `flex_*` fields (`flex_enabled`, `flex_offset`, `flex_length`, `flex_value`, `flex_mask`, `flex_match_start`) are now compared in `filter_term_semantics_match` (`engine/cache_sensitive/rotation.rs`) — before #5293 they were omitted from the forwarding-rotation change detector, so a rotation touching only a flex field skipped the session purge and stranded established sessions on their stale routing-instance / forwarding decision (cross-VRF policy-coherency failure)** |
 
 The `tcp_flags_mask` / `tcp_flags_forbidden` / `is_fragment` / `icmp_type` /
 `icmp_code` inputs (and the #3077 `flex_match` L3 slice, `flex_l3`) are
@@ -607,7 +607,7 @@ DNAT). A bare-host address (`203.0.113.7`, no `/32`) is handled by
 `parse_address`'s bare-IP fallback (`IpNet::parse` rejects a bare IP). The flags
 are DERIVED from the existing snapshot lists, so there is NO new wire field
 (`protocol_wire_v1.json` is unchanged). The flags are also compared in
-`filter_term_semantics_match` (`engine/cache_sensitive.rs`) because the
+`filter_term_semantics_match` (`engine/cache_sensitive/rotation.rs`) because the
 unscoped↔all-malformed transition flips match semantics WITHOUT changing the
 parsed vecs/matcher, so a flow-cache rebuild must catch it.
 
@@ -632,7 +632,7 @@ per-direction wire flags on `FirewallTermSnapshot` — `source_except` /
 `FilterTerm.source_except` / `dest_except`, and the matcher
 (`engine/matching.rs` `nets_match_v4` / `nets_match_v6`) evaluates
 `nets.iter().any(contains) ^ except`. The except flags are compared in
-`filter_term_semantics_match` (`engine/cache_sensitive.rs`) — they flip the
+`filter_term_semantics_match` (`engine/cache_sensitive/rotation.rs`) — they flip the
 address decision without changing the parsed vecs, so a flow-cache rebuild must
 catch a toggle.
 
@@ -863,7 +863,7 @@ implementation (#1430); use it as the template:
    `iface_filter_v{4,6}_has_dscp_match` fields in
    `userspace-dp/src/filter/mod.rs`.
 3. **Lookup helpers** in
-   `userspace-dp/src/filter/engine/cache_sensitive.rs` —
+   `userspace-dp/src/filter/engine/cache_sensitive/rotation.rs` —
    `interface_input_filter_has_<X>_match` and
    `interface_output_filter_has_<X>_match` (or thread the new
    flag through one general helper if the DSCP-specific
@@ -879,7 +879,7 @@ implementation (#1430); use it as the template:
    `userspace-dp/src/afxdp/worker/loop_body/mod.rs:295-330`
    uses `input_dscp_filter_families_changed` to decide whether
    to purge sessions. Extend the semantics-match comparison in
-   `userspace-dp/src/filter/engine/cache_sensitive.rs`
+   `userspace-dp/src/filter/engine/cache_sensitive/rotation.rs`
    (`filter_term_semantics_match`) to cover the new match
    field's aggregate flag and per-term content. **Compare by
    content, never by compiler-positional filter/term IDs** —
@@ -898,7 +898,7 @@ implementation (#1430); use it as the template:
    its per-packet-L4 session purge, and an established session
    stranded on its stale (pre-rotation) routing-instance /
    forwarding decision until timeout. Regression test:
-   `filter/engine/cache_sensitive.rs`
+   `filter/engine/cache_sensitive/rotation.rs`
    ::`flex_field_change_is_not_cache_equal`.
 7. **Tests** in `userspace-dp/src/afxdp/flow_cache_tests.rs`
    following the DSCP runbook pattern in
