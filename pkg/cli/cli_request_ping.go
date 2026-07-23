@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/diagcmd"
@@ -69,7 +72,37 @@ func (c *CLI) handlePing(args []string) error {
 // byte-for-byte. Before #2143 this path prepended "vrf-"
 // unconditionally, turning `routing-instance vrf-red` into the
 // non-existent device `vrf-vrf-red`.
+//
+// The payload size is clamped to diagcmd.MaxPingSize so this third
+// control surface shares the single upper ceiling the REST and gRPC
+// buildPingArgv callers already enforce (#6382, mirroring #5250 A8-b1
+// F4): a -s above the max valid ICMP echo data could never yield a
+// valid probe.
+//
+// size arrives here as the RAW operator token, unlike the structured
+// int the REST/gRPC surfaces receive (where 0 means "unset" and -s is
+// omitted unless positive). Only the upper MaxPingSize ceiling is
+// enforced here — the console INTENTIONALLY preserves an explicit
+// operator -s for zero, negative, and non-numeric tokens, handing them
+// to the ping child to reject rather than silently dropping input the
+// operator typed. Silently swallowing an explicit `-s 0` would be less
+// faithful to intent than the structured-int surfaces' "0 == unset".
+//
+// A numeric token that is too large is clamped whether it merely
+// exceeds MaxPingSize (parses fine, n > ceiling) OR overflows int64
+// (strconv.ErrRange on a non-negative literal) — the latter is the
+// bug the naive strconv.Atoi guard missed, since Atoi returns ErrRange
+// and would leave the huge token to reach `ping -s <huge>` unclamped.
+// A leading '-' overflow stays a huge negative the child rejects,
+// consistent with the ≤0 pass-through above.
 func buildPingArgv(target, count, source, size, vrfName string) []string {
+	if n, err := strconv.ParseInt(size, 10, 64); err == nil {
+		if n > diagcmd.MaxPingSize {
+			size = strconv.Itoa(diagcmd.MaxPingSize)
+		}
+	} else if errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(size, "-") {
+		size = strconv.Itoa(diagcmd.MaxPingSize)
+	}
 	return diagcmd.PingArgv(diagcmd.PingOptions{
 		Target:          target,
 		Count:           count,

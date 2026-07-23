@@ -41,12 +41,13 @@ func VRFDeviceName(name string) string {
 // MaxPingSize is the largest ping payload (ping -s) any control surface
 // accepts. It is the maximum ICMP echo data an IPv4 datagram can carry —
 // 65535 (max IP total length) − 20 (IP header) − 8 (ICMP header) = 65507
-// — so a request above it could never produce a valid probe anyway. The
-// REST and gRPC callers clamp req.Size to this bound before building the
-// options so an oversized -s can neither be passed to the ping child nor
-// wrapped negative; validation and clamping stay with the callers per the
-// PingOptions contract, but the shared ceiling lives here so both surfaces
-// stay in lockstep (#5250 A8-b1 F4).
+// — so a request above it could never produce a valid probe anyway. All
+// three callers — REST, gRPC, and the local console CLI — clamp the
+// operator size to this bound before building the options so an oversized
+// -s can neither be passed to the ping child nor wrapped negative;
+// validation and clamping stay with the callers per the PingOptions
+// contract, but the shared ceiling lives here so every surface stays in
+// lockstep (#5250 A8-b1 F4 for REST/gRPC; #6382 for the console CLI).
 const MaxPingSize = 65507
 
 // PingOptions carries the already-validated, already-clamped ping

@@ -59044,6 +59044,65 @@ top.
     pkg/daemon/daemon_ipsec_rebind_flush_bound_6397_test.go,
     pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md
 
+## 2026-07-23 — #6387 PR-2: additive pkg/nftables netlink host-inbound/lo0/fence installer + ruleset-parity CI
+
+- **Timestamp**: 2026-07-23
+- **Action**: Implemented PR-2 of #6387 — an ADDITIVE `pkg/nftables` netlink
+  installer (`Installer` interface: InstallHostInbound / InstallColdBootFence /
+  InstallGapFence / InstallLo0 / DeleteTable) rendering the host-inbound / lo0 /
+  fence rulesets via `github.com/google/nftables` (no `nft` binary),
+  bit-for-bit equivalent to the exec-`nft` `build*Payload` oracle in
+  `daemon_nft.go`. Added the functional nf_tables capability probe
+  (`ProbeNFTablesAvailable` / `ErrNFTablesUnavailable`). Added the T1 kernel
+  ruleset-parity CI (oracle nft-text vs netlink dump diff in a self-isolated
+  private netns) + mutation-sensitivity (widened set / dropped saddr!= /
+  weakened verdict / dropped counter all diverge) + T1b pure-unit goldens
+  (oracle-derived) + kernel-load + counter-readback through the existing
+  readers. Daemon still shells to `nft` (zero production behavior change);
+  `build*Payload` retained as the parity oracle. Registered pkg/nftables in the
+  #1373 retirement allowlist (uses dataplane.DSCPValues SSOT).
+- **Validation**: `go build ./...` clean; `go vet ./pkg/nftables ./pkg/daemon`
+  clean; `go test ./pkg/nftables` (netns) green incl. kernel-load +
+  counter-readback; T1 parity gate RUN + PASS against real nft v1.1.6 (all
+  rulesets byte-identical, all 4 mutation classes detected); retirement canary
+  green.
+- **File(s)**: pkg/nftables/netlink_build.go, netlink_spec.go,
+  netlink_hostinbound.go, netlink_lo0.go, netlink_fence.go,
+  netlink_installer.go, netlink_capability.go, netlink_scenario_test.go,
+  netlink_canon_test.go, netlink_golden_test.go, netlink_mutation_test.go,
+  netlink_kernel_test.go, netlink_capability_test.go, README.md;
+  pkg/daemon/daemon_nft_netlink_parity_test.go, pkg/daemon/README.md;
+  pkg/dataplane/retirement_boundary_canary_test.go;
+  docs/pr/1373-retire-ebpf-dataplane/README.md; _Log.md
+
+- **Timestamp**: 2026-07-23
+- **Action**: #6405 (#6387 PR-2) security fixes — lo0 fail-open + parity
+  blind spots. FIX-1: netlink lo0 port/DSCP tokens now RESOLVE via the SSOT
+  (config.ResolveFilterPortRange, dataplane.DSCPValues; ssh->22) and FAIL
+  CLOSED (nlPlan.fail -> install aborts) on any unrepresentable token,
+  matching the nft oracle (raw token -> nft rejects -> prior ruleset
+  retained). Pre-fix parsePortTokens/lo0DSCPs DROPPED the predicate ->
+  a port/DSCP-constrained accept widened to match-all. Audited every builder
+  site: host-inbound service ports / WG dport / ESP/AH are numeric (safe);
+  protocols drop identically on both sides (parity, config-gated); DSCP had
+  the SAME omit bug (nftDSCPValue emits raw) and is now fixed too. FIX-2:
+  T1 parity compares PER-RULE iifname scope (iifnameScopeByRule, read via
+  netlink) instead of a global union, so an IKE-exemption widen that
+  preserves the union is caught. FIX-3: added a named-port lo0 term
+  (bit-identical), a fail-closed unrepresentable-port sub-case (oracle nft
+  rejects + netlink InstallLo0 errors + no partial table), an
+  iifname-exemption-widen mutation, and a dropped-counter mutation to the
+  real oracle-parity block; README mutation list corrected.
+- **Validation**: go build ./... + go vet clean; gofmt clean; nftables suite
+  green incl. new TestLo0PortResolveOrFailClosed (5 fail-closed + named
+  resolve); T1 parity RUN + PASS firsthand against real nft v1.1.6 (all
+  rulesets byte-identical, all 6 mutation classes + fail-closed detected);
+  parent-RED verified BOTH unit (revert to omit -> RED) and kernel (union
+  neutralize -> iifname mutation RED; omit neutralize -> fail-closed RED);
+  retirement canary green.
+- **File(s)**: pkg/nftables/netlink_lo0.go,
+  pkg/nftables/netlink_lo0_ports_test.go, pkg/nftables/README.md,
+  pkg/daemon/daemon_nft_netlink_parity_test.go; _Log.md
 - **Timestamp**: 2026-07-23
   - **Action**: #6385 — `show system services` reports EFFECTIVE post-bind
     management-listener addresses on BOTH surfaces (re-file of fix-5 dropped
@@ -59350,3 +59409,156 @@ top.
     common corruption modes fully fixed; exec-content residual is #6409).
   - **File(s)**: pkg/upgrade/runner.go,
     pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 — policymatch unsupported-tuple gate folded an
+    IPv4-mapped IPv6 source. The #5720 (V4 src, V6 dst) gate in
+    `pkg/policymatch/policymatch.go` `Match` classified family with
+    `net.IP.To4()`, which folds `::ffff:1.2.3.4` (To4 non-nil), so a source
+    authored as `::ffff:192.0.2.1` against a v6 destination was FALSELY reported
+    `UnsupportedTupleFamily` — diverging from the colon-strict runtime matcher
+    (userspace-dp/src/policy.rs) that sees a same-family V6/V6 tuple. Fail-safe
+    (a spurious advisory, never a hidden/fabricated permit) but off the
+    documented Go/Rust family-parity convention. Fix: threaded the colon-strict
+    text family from every caller. Added optional `Query.SrcFamily`/`DstFamily`
+    ("v4"/"v6"/"") hints; all four builders (cli_request_testcmd.go,
+    cli_show_security.go, server_show_firewall.go, server_cluster.go) populate
+    them via `config.NATAddrFamily` on the RAW operator string (the SSOT
+    colon-strict classifier, keyed on the ':' net.ParseIP discards). New
+    `queryTupleFamily` prefers the hint and falls back to `To4()` only when a
+    caller supplies none, preserving pre-#6377 behavior for net.IP-only callers.
+    Fail-on-revert `mapped_ipv4_tuple_6377_test.go`
+    (`TestMatchMappedIPv6SourceNotGated`) — verified RED (clean assertion,
+    UnsupportedTupleFamily:true) when the gate is reverted to To4()-only,
+    restored GREEN. Covers all three directions (genuine v4, genuine v6, mapped
+    v6) + the deliberate no-hint fold fallback. Not HA/cluster/dataplane —
+    diagnostic surface only, no failover smoke required. build+vet+gofmt clean;
+    full go test on pkg/policymatch + pkg/cli + pkg/grpcapi GREEN.
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/policymatch/mapped_ipv4_tuple_6377_test.go,
+    pkg/policymatch/README.md, pkg/cli/cli_request_testcmd.go,
+    pkg/cli/cli_show_security.go, pkg/grpcapi/server_show_firewall.go,
+    pkg/grpcapi/server_cluster.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 fold — the REST caller (the FIFTH builder) was missed
+    in the first pass. The hostile Claude review found MERGE-NEEDS-MAJOR: the
+    fix threaded the colon-strict family through FOUR `policymatch.Query{}`
+    builders but there are FIVE — `pkg/api/security.go` `matchPoliciesHandler`
+    (GET /api/v1/security/match) passed SrcIP/DstIP with NO SrcFamily/DstFamily,
+    so `::ffff:192.0.2.1 -> 2001:db8::1` was still falsely reported
+    `UnsupportedTupleFamily` on REST. Folded: added
+    `SrcFamily: config.NATAddrFamily(srcIPStr)` /
+    `DstFamily: config.NATAddrFamily(dstIPStr)` at security.go (classifying the
+    RAW query strings srcIPStr/dstIPStr, NOT the folded net.ParseIP results).
+    Added the REST fail-on-revert `security_matchpolicies_mapped_ipv4_6377_test.go`
+    (`TestMatchPoliciesRESTMappedIPv6SourceNotGated6377`) — drives the real
+    handler with src_ip=::ffff:192.0.2.1 & dst_ip=2001:db8::1 and asserts a
+    permit-through (NOT the unsupported verdict), plus a genuine 10.0.0.1 -> v6
+    control that MUST still be gated. Verified RED firsthand (drop the two
+    Family fields → REST response Action = the unsupported-tuple string,
+    Matched:false), restored GREEN. This was the one #6377 surface with no
+    binding test, which is why the miss slipped through. Corrected the "all
+    four builders" claims to FIVE and enumerated api/security.go in the
+    policymatch.go gate comment, pkg/policymatch/README.md, and this log. All
+    five builders: cli_request_testcmd.go, cli_show_security.go,
+    server_show_firewall.go, server_cluster.go, api/security.go.
+  - **File(s)**: pkg/api/security.go,
+    pkg/api/security_matchpolicies_mapped_ipv4_6377_test.go,
+    pkg/policymatch/policymatch.go, pkg/policymatch/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 fold #2 (Codex MAJOR, security-relevant) — the gate
+    fix alone was UNSAFE. `matchAddr` (the policy address evaluator) classified
+    the packet family with `isV4 := ip.To4() != nil`, which FOLDS a mapped-v6
+    source. After the gate fix let a mapped-v6 source fall through (correctly),
+    matchAddr folded it to v4 and matched it against the V4 address rules — so a
+    `::ffff:192.0.2.1` source against a V4-only permit rule (192.0.2.0/24 folds
+    to contain 192.0.2.1) would FABRICATE A PERMIT (fail-OPEN), worse than the
+    original spurious-advisory bug. The colon-strict Rust matcher sees V6 →
+    evaluates against V6 rules → default-deny. Fix: threaded the per-side family
+    into matchAddr — `isV4 := queryTupleFamily(ip, family) == "v4"` (hint first,
+    To4() fallback only when family==""); src passes q.SrcFamily, dst passes
+    q.DstFamily at all four call sites (ruleMatches x2, isSkippedFragDeny x2).
+    The v4Empty/v6Empty gates key on the ADDRESS SETS not the packet family, so
+    the #3023 cross-family + #2008 excluded fail-closed semantics are unchanged
+    (full pkg/policymatch suite GREEN confirms). Also threaded the family into
+    the test-only SelectorArgs.Query() helper (defensive; no production caller).
+    New eval-correctness fail-on-revert tests (Codex's point — the gate tests
+    only proved fall-through): TestMatchMappedIPv6SourceNotEvaluatedAsV4
+    (matcher) + TestMatchPoliciesRESTMappedIPv6SourceNotEvaluatedAsV4_6377
+    (REST) — mapped-v6 src against a V4-only permit rule must NOT permit
+    (matches v6 → default-deny); genuine v4 control still permits. BOTH verified
+    RED firsthand on `isV4 := ip.To4()` revert (Matched:true PolicyName:permit-v4
+    Action:permit), restored GREEN. Documented in matchAddr doc comment +
+    pkg/policymatch/README.md resolved section. SelectorArgs.Query() at
+    policymatch.go is test-only (grep: only fragment_5572_test.go +
+    selector_args_3696_test.go reference it).
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/policymatch/mapped_ipv4_tuple_6377_test.go,
+    pkg/api/security_matchpolicies_mapped_ipv4_6377_test.go,
+    pkg/policymatch/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: Fix #6377 fold #3 (Codex round-2 MERGE-NEEDS-MINOR, 3 MINORs).
+    (1) hostInboundAdmission was a THIRD To4()-fold site: it computed the family
+    via ipFamily(q.DstIP)/ipFamily(q.SrcIP), folding a mapped-v6 host-bound
+    destination to ip. A family-scoped host-inbound token (dhcpv6=ip6, dhcp=ip;
+    ping ICMP vs ICMPv6) would then be mis-admitted in the simulator. Added
+    ipFamilyStrict(ip, fam) — maps the colon-strict hint to the nft ip/ip6 token,
+    To4() fallback when fam=="" — and threaded q.DstFamily/q.SrcFamily.
+    Fail-on-revert host_inbound_mapped_family_6377_test.go
+    (TestHostInboundMappedIPv6DstClassifiedAsV6): a mapped-v6 dst on udp/547 must
+    admit via the ip6-scoped dhcpv6 token; genuine v4 (dhcp/udp67) + genuine v6
+    controls prove both paths intact. VERIFIED RED firsthand on the ipFamily()
+    revert (mapped case flips TokenAdmit(dhcpv6)->Denied while controls stay
+    green), restored GREEN. (2) Corrected the Query.SrcFamily/DstFamily doc
+    comment: it falsely claimed the hints "never affect address matching" — they
+    now drive the gate, matchAddr's isV4, AND host-inbound family; reworded to
+    enumerate all three consumers and clarify the hint selects which family's
+    rules a side is tested against (address CONTAINMENT still uses the IP bytes).
+    (3) Strengthened the eval REST test
+    (TestMatchPoliciesRESTMappedIPv6SourceNotEvaluatedAsV4_6377) to assert the
+    EXACT default-deny result (action=="deny (default)" + default_used==true +
+    policy_name=="" + matched==false), not merely "not permit". Documented the
+    host-inbound consumer in pkg/policymatch/README.md resolved section. Gate +
+    matcher-eval + REST fail-on-reverts all still green.
+  - **File(s)**: pkg/policymatch/policymatch.go,
+    pkg/policymatch/host_inbound_mapped_family_6377_test.go,
+    pkg/api/security_matchpolicies_mapped_ipv4_6377_test.go,
+    pkg/policymatch/README.md, _Log.md
+  - **Action**: #6382 — clamp local console CLI ping `-s` payload to
+    `diagcmd.MaxPingSize` (the third control surface). REST
+    (`pkg/api/system.go`) and gRPC (`pkg/grpcapi/server_diag_ping.go`)
+    `buildPingArgv` already clamped (#5250 A8-b1 F4); the console
+    `buildPingArgv` in `pkg/cli/cli_request_ping.go` passed the operator
+    `size` token through unclamped. Now `strconv.Atoi` + `min(size,
+    MaxPingSize)`; non-numeric tokens left for the ping child to reject.
+    Added `TestBuildPingArgvClampsSize_6382` (fail-on-revert) +
+    `TestBuildPingArgvKeepsInBoundSize_6382` (in-bound + non-numeric pass
+    through). Updated `MaxPingSize` doc comment (now all three surfaces
+    clamp) and `pkg/cli/README.md`. Parent-RED verified: neutralizing the
+    clamp fails `TestBuildPingArgvClampsSize_6382` with a clean assertion
+    (`ping -s = "1048576", want clamped "65507"`).
+  - **File(s)**: pkg/cli/cli_request_ping.go, pkg/cli/cli_request_argv_test.go,
+    pkg/diagcmd/diagcmd.go, pkg/cli/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6382 review fold — (1) MINOR 1 (overflow bypass): the
+    `strconv.Atoi` guard returned `ErrRange` for a digit token above the
+    platform int, skipping the clamp and letting `ping -s <huge>` run
+    unbounded. Reworked `buildPingArgv` to `strconv.ParseInt(..,10,64)`;
+    clamp when the value parses and `> MaxPingSize`, OR when it overflows
+    int64 (`errors.Is ErrRange`) on a non-negative literal. A leading '-'
+    overflow stays a huge negative the ping child rejects. Added
+    `TestBuildPingArgvClampsOverflowSize_6382` (fail-on-revert:
+    "99999999999999999999" → capped 65507). (2) MINOR 2 (≤0 divergence):
+    documented — NOT changed — that the console preserves an explicit
+    `-s 0`/`-s -1`/non-numeric token (raw operator input model) while the
+    structured-int REST/gRPC surfaces omit a non-positive size; only the
+    upper ceiling is shared. Locked with
+    `TestBuildPingArgvPreservesNonPositiveSize_6382`. Updated the fn doc
+    comment + `pkg/cli/README.md`. Parent-RED re-verified on the new head:
+    neutralizing the clamp fails BOTH ClampsSize + ClampsOverflowSize with
+    clean assertions; restored green.
+  - **File(s)**: pkg/cli/cli_request_ping.go, pkg/cli/cli_request_argv_test.go,
+    pkg/cli/README.md, _Log.md
