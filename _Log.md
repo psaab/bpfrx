@@ -1,3 +1,46 @@
+## 2026-07-22 — #6232: scope-complete Rust heatmap classifier + enforced drift gate
+
+- **Timestamp**: 2026-07-22 (fix/6232-heatmap-audit)
+- **Action**: The committed modularity heatmap
+  (`docs/refactoring-audit-current.txt`) was stale AND scope-inaccurate —
+  `make audit-check` exited non-zero on master, and the generator counted
+  whole-file Rust test modules (`tests_pool.rs`, `tests_support.rs`,
+  `tests_destination.rs`, `tests_bind_forward.rs`, ...) as production,
+  producing false `[REFACTOR]`/`[WATCH]` rows. Root cause: `SKIP_RE`
+  excluded `tests.rs` / `*_tests.rs` / three hand-listed `test_*.rs`
+  files, but not the generic `tests_*.rs` / `test_*.rs` sibling
+  `#[path] mod` test modules introduced by the #4840/#4409 test splits.
+  Fix: (1) moved the exclusion regex + LOC measurement into a shared
+  single-source-of-truth library `scripts/refactoring-audit-lib.sh`
+  (`$AUDIT_SKIP_RE`, `audit_loc`), adding anchored patterns for all four
+  Rust test filename shapes; the generator now sources it. (2) Added a
+  thin CLI `scripts/refactoring-audit-classify.sh` (`classify`/`loc`) so
+  a Go test can exercise the same classifier. (3) Regenerated the
+  heatmap — 8 test files dropped, 48 production-only rows remain
+  (verified all test-named `.rs` in the tree are `#[cfg(test)]`-gated).
+  (4) Added the `pkg/refactoraudit` enforcement canary
+  (`TestHeatmapNotStale` byte-diffs the regenerated heatmap;
+  `TestClassifierFilenameShapes` pins positive/negative/anchoring cases;
+  `TestProductionSentinelVisible` keeps the >=2000 LOC
+  `poll_descriptor/mod.rs` visible and asserts no test file leaks;
+  `TestInlineTestBlockNotStripped` pins the raw-LOC / no-inline-strip
+  invariant). Because it is an ordinary Go test it runs under
+  `go test ./...` inside the required `make test` aggregate, so the
+  artifact can no longer silently drift on master. Updated
+  `docs/refactoring-audit.md` and the `Makefile` audit-check comment.
+- **Validation**: `make audit-check` green; `go test ./pkg/refactoraudit`
+  4/4 PASS; gofmt clean; `go vet ./pkg/refactoraudit` clean; shellcheck
+  clean on the three scripts. FAIL-ON-REVERT demonstrated: perturbing a
+  LOC number (7168→9999) in the committed heatmap turns BOTH
+  `make audit-check` (exit 2) and `TestHeatmapNotStale` (FAIL) RED;
+  restoring returns GREEN. Class A tooling/docs — no dataplane or codegen
+  change, no cluster smoke needed.
+- **File(s)**: scripts/refactoring-audit-lib.sh (new),
+  scripts/refactoring-audit-classify.sh (new), scripts/refactoring-audit.sh,
+  docs/refactoring-audit-current.txt, docs/refactoring-audit.md, Makefile,
+  pkg/refactoraudit/doc.go (new),
+  pkg/refactoraudit/audit_canary_test.go (new)
+
 ## 2026-07-22 — #4976: build-time ABI check for the libxdp ring mirror
 
 - **Timestamp**: 2026-07-22 14:00 PDT (fix/4976-build-abi-check)
