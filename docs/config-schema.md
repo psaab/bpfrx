@@ -3279,6 +3279,18 @@ reserved for whole-dataplane selection where a rewrite shim
     The accepted sets are EXACTLY the generator-recognized values (a value the
     generator handles but the enum omitted would be a false-reject regression).
     A typo is now rejected at commit with an error naming the bad value.
+  - **#5649 (IPsec VPN `df-bit` enum, codex-181 C181-M22):** the `security
+    ipsec vpn <v> df-bit` leaf was untyped free-form (`args:1`, no validator),
+    so a typo committed clean and was then silently dropped by the swanctl
+    generator — the same MEDIUM footgun class as #3896. `df-bit` is now
+    `ValidateEnum([copy, set, clear])`, matching the `pkg/ipsec/policy.go`
+    renderer switch EXACTLY: it emits `copy_df = yes` for `copy`/`set` and
+    `copy_df = no` for `clear`, and OMITS `copy_df` for any other spelling.
+    An intended `clear` typed as `cler` therefore left strongSwan's copy-DF
+    default in force (the opposite of `clear`) and could blackhole oversized
+    encapsulated packets via PMTUD while commit reported success. This is the
+    input-domain gate the #4015 valid-token `set`/`clear` mapping fix and the
+    #4301 `establish-tunnels` enum did not cover.
   - **#2404 (responder-only / dynamic-IP peer):** the `security ike gateway
     <g> dynamic` node now declares a `hostname <fqdn>` child (it was a
     `children: nil` leaf in both the `ike` and `ipsec` stanza copies of the
