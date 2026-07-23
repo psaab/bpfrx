@@ -372,22 +372,6 @@ pub(crate) fn evaluate_interface_output_filter_tx_selection_counted<'a>(
     )
 }
 
-pub(crate) fn interface_filter_affects_tx_selection(
-    state: &FilterState,
-    ifindex: i32,
-    is_v6: bool,
-) -> bool {
-    if is_v6 {
-        state
-            .iface_filter_v6_affects_tx_selection
-            .contains(&ifindex)
-    } else {
-        state
-            .iface_filter_v4_affects_tx_selection
-            .contains(&ifindex)
-    }
-}
-
 pub(crate) fn interface_output_filter_needs_tx_eval(
     state: &FilterState,
     ifindex: i32,

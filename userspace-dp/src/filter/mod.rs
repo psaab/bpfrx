@@ -751,12 +751,8 @@ pub(crate) struct FilterState {
         rustc_hash::FxHashMap<String, Arc<ThreeColorPolicerRuntime>>,
     /// Name-derived ID-indexed three-color policer runtimes.
     pub(crate) three_color_policers: Vec<Arc<ThreeColorPolicerRuntime>>,
-    /// Per-interface (ifindex) input filter key for inet.
-    pub(crate) iface_filter_v4: rustc_hash::FxHashMap<i32, String>,
     /// Direct per-interface inet filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_v4_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
-    /// Per-interface inet input filters that can affect CoS TX selection.
-    pub(crate) iface_filter_v4_affects_tx_selection: rustc_hash::FxHashSet<i32>,
     /// Whether any inet input filter can affect CoS TX selection.
     pub(crate) has_input_tx_selection_v4: bool,
     /// Whether any inet input filter contains a three-color policer.
@@ -768,12 +764,8 @@ pub(crate) struct FilterState {
     /// Per-interface inet input filters with per-packet L4 match terms (#2362:
     /// tcp-flags / is-fragment / icmp-type / icmp-code). Cache-sensitive.
     pub(crate) iface_filter_v4_has_per_packet_l4_match: rustc_hash::FxHashSet<i32>,
-    /// Per-interface (ifindex) input filter key for inet6.
-    pub(crate) iface_filter_v6: rustc_hash::FxHashMap<i32, String>,
     /// Direct per-interface inet6 filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_v6_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
-    /// Per-interface inet6 input filters that can affect CoS TX selection.
-    pub(crate) iface_filter_v6_affects_tx_selection: rustc_hash::FxHashSet<i32>,
     /// Whether any inet6 input filter can affect CoS TX selection.
     pub(crate) has_input_tx_selection_v6: bool,
     /// Whether any inet6 input filter contains a three-color policer.
@@ -784,28 +776,20 @@ pub(crate) struct FilterState {
     pub(crate) iface_filter_v6_has_dscp_match: rustc_hash::FxHashSet<i32>,
     /// Per-interface inet6 input filters with per-packet L4 match terms (#2362).
     pub(crate) iface_filter_v6_has_per_packet_l4_match: rustc_hash::FxHashSet<i32>,
-    /// Per-interface (ifindex) output filter key for inet.
-    pub(crate) iface_filter_out_v4: rustc_hash::FxHashMap<i32, String>,
     /// Direct per-interface inet output filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_out_v4_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
     /// Per-interface inet output filters that must still be evaluated in the TX path.
     pub(crate) iface_filter_out_v4_needs_tx_eval: rustc_hash::FxHashSet<i32>,
     /// Whether any inet output filter can affect CoS TX selection.
     pub(crate) has_output_tx_selection_v4: bool,
-    /// Per-interface (ifindex) output filter key for inet6.
-    pub(crate) iface_filter_out_v6: rustc_hash::FxHashMap<i32, String>,
     /// Direct per-interface inet6 output filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_out_v6_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
     /// Per-interface inet6 output filters that must still be evaluated in the TX path.
     pub(crate) iface_filter_out_v6_needs_tx_eval: rustc_hash::FxHashSet<i32>,
     /// Whether any inet6 output filter can affect CoS TX selection.
     pub(crate) has_output_tx_selection_v6: bool,
-    /// lo0 inet input filter key.
-    pub(crate) lo0_filter_v4: String,
     /// Direct lo0 inet filter reference for packet hot-path evaluation.
     pub(crate) lo0_filter_v4_fast: Option<Arc<Filter>>,
-    /// lo0 inet6 input filter key.
-    pub(crate) lo0_filter_v6: String,
     /// Direct lo0 inet6 filter reference for packet hot-path evaluation.
     pub(crate) lo0_filter_v6_fast: Option<Arc<Filter>>,
 }
