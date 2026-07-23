@@ -44,6 +44,76 @@
 - **File(s)**: pkg/config/syslog_stream_port_5250_test.go,
   pkg/config/compiler_security_log.go,
   pkg/api/config_search_bound_5250_test.go
+## 2026-07-23 — #5719 C001: fold Codex hostile-review findings into #6378
+
+- **Timestamp**: 2026-07-23 (fix/5719-capi-residuals, fold on PR #6378)
+- **Action**: Folded three verified Codex hostile-review findings on top of the
+  (sound) SAN-threading fix. Did NOT touch the SAN-threading logic.
+  1. **Silent stale-cert-on-rebind (substantive):** `generateSelfSignedCertAt`
+     LOADS an existing on-disk cert as-is (durable #1916 D6), so an A→B
+     management-IP rebind serves a cert whose SANs miss B and strict remote
+     verification silently fails. Re-mint stays deferred (durable-TOFU
+     contract), but the silence is closed: the load-success path now parses the
+     loaded leaf and, when the bind host is a concrete non-loopback management
+     host (`bindHostWarnable`) the leaf's SANs do NOT cover (`certCoversHost`,
+     via `x509.VerifyHostname` — the strict check a remote client applies),
+     emits a `slog.Warn` naming the bind host + the cert's DNS/IP SANs. Two
+     small testable helpers factored out.
+  2. **Comment/contract reconcile:** the `certGen` comment (`server.go` ~:303),
+     `buildHTTPSServer` doc, and `ReconcileHTTPS` doc (`listener.go` ~:155) said
+     the cert is "minted fresh on each (re)bind" — contradicting the durable
+     contract. Reworded: the cert is durable; a rebind LOADS the on-disk pair
+     as-is; a fresh mint happens ONLY when no on-disk pair exists.
+  3. **Case-insensitive DNS SANs (low):** `dnsSANsContain` now uses
+     `strings.EqualFold` (DNS is case-insensitive per RFC 4343) so
+     case-variant names coalesce instead of double-encoding.
+- **Tests**: added `TestLoadedCertBindHostMismatchWarns` (mint bind A → reload
+  bind B, assert the `slog.Warn` fires and names B; same/loopback rebind stays
+  silent — VERIFIED RED on neutralizing `certCoversHost`),
+  `TestCertCoversHostAndWarnable` (helper units), and a case-insensitive
+  coalescing subtest under `TestGenerateSelfSignedCertBindHostSAN`. Full
+  `go test ./pkg/api/... ./pkg/grpcapi/...` GREEN; go build + vet + gofmt clean.
+- **#5866 tension (report, NOT changed):** `TestMgmtReconcileTLSChange_5866`
+  (`pkg/daemon/management_5866_test.go:180-192`) asserts a HTTPS rebind serves
+  DIFFERENT leaf bytes — the OPPOSITE of the durable no-re-mint contract. It
+  passes only because the daemon test uses the production `/etc/xpf/tls` paths
+  (`certGen = generateSelfSignedCert`, no path redirect) which are unwritable in
+  CI, so persistence fails silently and each reconcile mints a fresh in-memory
+  cert. In production (writable `/etc/xpf/tls`) the second reconcile would LOAD
+  the same on-disk pair → same bytes → that assertion would FAIL. Needs a
+  follow-up issue: redirect the test to a temp TLS dir and re-encode the
+  intended semantic (a MATERIAL change rebinds the listener, not necessarily a
+  new cert). Left untouched per instructions.
+- **File(s)**: pkg/api/server.go, pkg/api/listener.go, pkg/api/README.md,
+  pkg/api/tls_san_5719_test.go
+
+## 2026-07-23 — #5719 C001 residual: thread HTTPS mgmt bind IP into cert SANs
+
+- **Timestamp**: 2026-07-23 (fix/5719-capi-residuals)
+- **Action**: Triaged cohort #5719 (codex-review-182 C-API). Two representative
+  survivors already fixed by merged PR #6373: unknown-NAT-stats-selector
+  (grpcapi rejects with InvalidArgument, `server_nat.go:216-227` +
+  `server_nat_selector_5719_test.go`) and SAN-less generated cert (loopback +
+  hostname SANs, `server.go`). Fixed the open C001 residual-1: the auto-
+  generated HTTPS cert did NOT carry the configured management bind IP, so
+  `https://<mgmt-ip>:8443` strict-verify failed for a remote client.
+  `buildHTTPSServer(addr)` now extracts the listener host via
+  `net.SplitHostPort` and threads it (`certGen func(bindHost string)`) into
+  `generateSelfSignedCertAt`, which adds a non-loopback IP-literal bind host to
+  IP SANs / a DNS-safe bind host to DNS SANs (loopback / unspecified / wildcard-
+  empty / non-encodable skipped; existing SANs coalesced). Baked at FIRST
+  generation only — the #1916 D6 durable cert is deliberately NOT re-minted on
+  a later bind/host-name change (residual-2, deferred: needs a mint-ordering
+  hook + a TOFU-churn decision). The "applied-nft truth projection" bucket line
+  has no concrete traceable finding; the API/gRPC truth surfaces
+  (`HostInboundKernelDeniesUnavailable` #3681, SSOT `hostInboundToREST`
+  #3375/#3627) are already complete, and any nft-apply projection lives in
+  `pkg/daemon` (out of scope). Two fail-on-revert tests (SAN threading +
+  `buildHTTPSServer` host extraction), each verified RED via a clean-assertion
+  neutralization. `go build`/`go vet`/`gofmt -l` clean; full
+  `go test ./pkg/api/... ./pkg/grpcapi/...` GREEN.
+- **File(s)**: pkg/api/server.go, pkg/api/tls_test.go,
+  pkg/api/tls_san_5719_test.go, pkg/api/README.md
 
 ## 2026-07-23 — #6240: decompose `bring_up_workers` into cohesive phase helpers
 
@@ -58180,3 +58250,46 @@ top.
     pkg/grpcapi/ping_size_clamp_5250_test.go,
     pkg/config/deterministic_nat_block_size_5250_test.go,
     pkg/config/syslog_stream_port_5250_test.go
+  - **Action**: Triaged cohort #5649 (codex-review-181 low-materiality / bounded-
+    hardening survivors, 19 IDs) against current origin/master 55cf5a9b2 and
+    fixed the 4 REAL + INDEPENDENT + LOW-RISK + in-Go-scope items in one PR
+    ("Advances #5649"), each with a fail-on-revert test (neutralize -> clean
+    assertion RED verified firsthand, restore -> GREEN).
+    - **M22** (C181-M22): `security ipsec vpn <v> df-bit` was an untyped leaf,
+      so a typo (`cler`) committed clean and the swanctl renderer then OMITTED
+      `copy_df`, leaving strongSwan's copy-DF default (opposite of intended
+      `clear`) -> PMTUD blackhole. Typed the leaf ValueEnumOf +
+      ValidateEnum([copy,set,clear]), mirroring the #4301 establish-tunnels
+      pattern. Test rejects cler/copyy/on/yes, accepts copy/set/clear.
+    - **C09** (C181-C09): gRPC `test-zone:` selector parser had no `seen` set,
+      so `interface=a,interface=b` silently last-won and archived a DIFFERENT
+      interface's zone/posture. Added a duplicate-selector reject mirroring the
+      #4921 showTestRouting / #3709 showTestPolicy contract.
+    - **C11** (C181-C11): session page-token decoders used `len(b) <
+      binary.Size(key)`, so oversized/trailing-byte tokens aliased the same
+      cursor and amplified base64/hex allocations up to the 16 MiB gRPC cap.
+      Require EXACT ABI length in decodeSessionKeyV4/V6 and reject tokens over
+      maxPageTokenLen (256) before any decode.
+    - **C13** (C181-C13): the pre-prompt commit-confirm poll used
+      context.Background(), so a daemon that accepted the connection but never
+      completed GetConfigModeStatus wedged the interactive CLI before Readline.
+      Extracted confirmPending() using a bounded context (confirmPendingTimeout,
+      2s); test asserts the poll context carries a deadline.
+    DEFER (Rust / out of Go scope -> dataplane owner): M04 (afxdp/icmp.rs),
+    M05 (slowpath.rs), M13 (nat/allocator.rs), C03 (read_bytes AF_XDP),
+    C15/C16 (test/incus/cold-path-flooder/src/main.rs), C19 (filter matching.rs).
+    Real Go-scope but NOT low-risk (own PR, kept in cohort): C06 (journal fsync
+    inode-retention concurrency), C12a/C12b (feed join-ownership / aggregate
+    budget), C14 (policymatch simulator quarantine projection), C20 (CLI coarse
+    host-verdict rendering), C08 (gRPC counters-available proto field),
+    C10 (SSE post-shutdown Close), M18 (duplicate NAT rule-name rejection —
+    config-acceptance behavior change). No HA/cluster/vrrp/failover code touched.
+    build+vet+gofmt clean; full go test ./pkg/config ./pkg/grpcapi ./cmd/cli
+    ./pkg/ipsec GREEN.
+  - **File(s)**: pkg/config/schema_security.go,
+    pkg/config/schema_ipsec_dfbit_enum_5649_test.go,
+    pkg/grpcapi/server_show_zones_text.go,
+    pkg/grpcapi/server_show_zones_dupselector_5649_test.go,
+    pkg/grpcapi/server_sessions.go,
+    pkg/grpcapi/pagination_canonical_5649_test.go, cmd/cli/main.go,
+    cmd/cli/confirm_pending_bounded_5649_test.go, docs/config-schema.md, _Log.md

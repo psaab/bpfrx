@@ -198,11 +198,8 @@ func main() {
 	defer signal.Stop(sigCh)
 
 	for {
-		if c.configMode.Load() {
-			st, err := client.GetConfigModeStatus(context.Background(), &pb.GetConfigModeStatusRequest{})
-			if err == nil && st.ConfirmPending {
-				fmt.Println("[commit confirmed pending - issue 'commit' to confirm]")
-			}
+		if c.configMode.Load() && confirmPending(client) {
+			fmt.Println("[commit confirmed pending - issue 'commit' to confirm]")
 		}
 
 		line, err := rl.Readline()
@@ -265,6 +262,24 @@ func exitConfigureBounded(client pb.BpfrxServiceClient) {
 	ctx, cancel := context.WithTimeout(context.Background(), exitConfigureTimeout)
 	defer cancel()
 	_, _ = client.ExitConfigure(ctx, &pb.ExitConfigureRequest{})
+}
+
+// confirmPendingTimeout bounds the pre-prompt commit-confirm status poll
+// (#5649, C181-C13). The advisory poll runs before Readline with no active
+// command context, so a Ctrl-C cannot cancel it.
+const confirmPendingTimeout = 2 * time.Second
+
+// confirmPending reports whether a commit-confirmed rollback is armed, using a
+// BOUNDED context (#5649, C181-C13). The poll fires before every config-mode
+// prompt with no command context to cancel it, so a daemon that accepts the
+// connection but never completes GetConfigModeStatus would otherwise wedge the
+// interactive client indefinitely before Readline. On timeout/error the prompt
+// simply proceeds without the advisory line.
+func confirmPending(client pb.BpfrxServiceClient) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), confirmPendingTimeout)
+	defer cancel()
+	st, err := client.GetConfigModeStatus(ctx, &pb.GetConfigModeStatusRequest{})
+	return err == nil && st != nil && st.ConfirmPending
 }
 
 // interruptWindow is the double-Ctrl-C window: a second interrupt within this

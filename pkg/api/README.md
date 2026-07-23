@@ -344,18 +344,36 @@ under the daemon's errgroup. Nothing else imports this package.
       #5058 all-or-nothing management-server lifecycle would abort cert
       generation and tear down the entire HTTP+HTTPS server. The cert degrades
       to loopback-only SANs (`isDNSSANSafeHostname` guard) instead of failing.
-    - **NOT covered (tracked #5719 C001 residual):** the configured
-      management-interface IP is not added to the SANs, so
+    - **HTTPS bind host (#5719 C001 residual, now closed):** the listener's
+      bind host is threaded from the resolved `web-management https interface`
+      address into cert generation (`buildHTTPSServer` → `net.SplitHostPort` →
+      `certGen(bindHost)`). A non-loopback management IP lands in the IP SANs
+      and a DNS-safe bind hostname in the DNS SANs, so
       remote-verification-by-mgmt-IP (`https://<mgmt-ip>:8443` with strict
-      verification) is out of scope here; and a later host-name change does
-      NOT re-mint the cert. Both need the resolved bind address threaded into
-      cert generation and a mint-ordering fix — deferred.
-    An already-persisted SAN-less cert is NOT auto-regenerated — the #1916 D6
+      verification) succeeds. A loopback / unspecified (`0.0.0.0`/`::`) /
+      wildcard (`:8443` → empty) / non-encodable bind host is skipped, and a
+      value already present is coalesced. Like the hostname path this only ever
+      ADDS an encodable SAN, so it never aborts generation.
+    - **Re-mint STILL deferred, but no longer SILENT (#5719 C001 residual):** a
+      later `set system host-name` (or a bind-address change) does NOT re-mint
+      an already-persisted cert, so its DNS/IP SANs can go stale. Re-minting is
+      deferred (it needs a mint-ordering / invalidation hook and a decision on
+      churning the durable TOFU pin). What WAS a silent failure is now
+      diagnosed: on the load-success path `generateSelfSignedCertAt` parses the
+      loaded leaf and, when the current bind host is a concrete non-loopback
+      management host (`bindHostWarnable`) that the leaf's SANs do NOT cover
+      (`certCoversHost` — the same strict check a remote client applies), emits
+      a `slog.Warn` naming the bind host and the cert's SANs, so an operator
+      re-mints (remove `/etc/xpf/tls`) instead of chasing a silent
+      verification failure.
+    An already-persisted cert is NOT auto-regenerated — the #1916 D6
     durable-cert contract keeps the on-disk pair stable so remote clients' TOFU
     pins survive a power loss; only freshly generated certs gain SANs (delete
     `cert.pem`/`key.pem` to force a regenerate). Pinned by
-    `tls_san_5719_test.go` (SAN presence, hostname classification, and the
-    non-ASCII no-abort guard), fail-on-revert.
+    `tls_san_5719_test.go` (SAN presence, hostname classification, the
+    non-ASCII no-abort guard, the bind-host mgmt-IP/DNS threading +
+    `buildHTTPSServer` host-extraction, and the stale-cert-on-rebind
+    mismatch warning), fail-on-revert.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during
