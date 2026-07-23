@@ -53,7 +53,7 @@ func TestHostAuthCloseoutSurfacesReconcilerFailure(t *testing.T) {
 		{"root-auth", noopCloseoutOwner},
 	}
 
-	err := summarizeHostAuthCloseout(runHostAuthCloseoutOwners(cfg, hostAuthCloseoutBudget, owners))
+	err := summarizeHostAuthCloseout(runHostAuthCloseoutOwners(cfg, hostAuthCloseoutBudget, owners), hostAuthCloseoutBudget)
 	if err == nil {
 		t.Fatal("host-auth cancel closeout returned nil despite a sudoers reconcile failure — " +
 			"the credential-reconcile failure was DISCARDED (the #5874 bug)")
@@ -64,7 +64,7 @@ func TestHostAuthCloseoutSurfacesReconcilerFailure(t *testing.T) {
 
 	// Control: a writable sudoers dir → the same reconcile succeeds → clean.
 	sudoersDir = t.TempDir()
-	if err := summarizeHostAuthCloseout(runHostAuthCloseoutOwners(cfg, hostAuthCloseoutBudget, owners)); err != nil {
+	if err := summarizeHostAuthCloseout(runHostAuthCloseoutOwners(cfg, hostAuthCloseoutBudget, owners), hostAuthCloseoutBudget); err != nil {
 		t.Fatalf("closeout returned %v with all owners succeeding, want nil", err)
 	}
 }
@@ -118,7 +118,7 @@ func TestHostAuthCloseoutEnforcesBudget(t *testing.T) {
 	}
 
 	// The summary surfaces the timed-out owners as a joined, named error.
-	err := summarizeHostAuthCloseout(outcomes)
+	err := summarizeHostAuthCloseout(outcomes, 50*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "wedged") || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("summary = %v, want it to name the timed-out wedged owner", err)
 	}
