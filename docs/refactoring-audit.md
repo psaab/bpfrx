@@ -23,9 +23,34 @@ three language families:
   absent; the script tolerates that (a no-op) and will pick them up
   again if the directories ever return.
 
-Test files (`tests.rs`, `*_tests.rs`, `*_test.go`) and generated code
-(`*.pb.go`, `*_grpc.pb.go`, `*_bpfel.go`, `*_bpfeb.go`, `zz_generated_*`)
-are excluded by name pattern.
+Test files and generated code are excluded by name pattern. The
+classifier (skip regex) and the LOC measurement live in one place —
+`scripts/refactoring-audit-lib.sh` — so the generator, `make
+audit-check`, and the enforcement fixtures all classify a path
+identically.
+
+**Rust test-only filename shapes (#6232).** All four are excluded:
+
+| Shape         | Example                       | Purpose                        |
+|---------------|-------------------------------|--------------------------------|
+| `tests.rs`    | `screen/tests.rs`             | exact catch-all sibling        |
+| `*_tests.rs`  | `policy_tests.rs`             | per-subsystem suffix split     |
+| `tests_*.rs`  | `nat/tests_pool.rs`           | per-subsystem prefix split (#4840/#4409) |
+| `test_*.rs`   | `test_fixtures.rs`, `test_support.rs`, `test_alloc.rs` | fixtures / support helpers |
+
+Before #6232 only `tests.rs`, `*_tests.rs`, and three hand-listed
+`test_*.rs` files were excluded, so the `tests_*.rs` / generic
+`test_*.rs` sibling `#[path] mod` test modules the #4840/#4409 test
+splits introduced were miscounted as production and produced false
+`[REFACTOR]`/`[WATCH]` rows (e.g. an 8k-LOC `tests_pool.rs`). The
+patterns are anchored to the basename, so a production file that merely
+*contains* "test" — `attestation.rs`, `latest_state.rs`, `contest.rs` —
+is still counted.
+
+Go tests (`*_test.go`) and generated code (`*.pb.go`, `*_grpc.pb.go`,
+`*_bpfel.go`, `*_bpfeb.go`, `zz_generated_*`) are also excluded, along
+with `target/`, `vendor/`, `*.lock`, retired plan retrospectives
+(`_KILLED` / `_WITHDRAWN`), and `docs/pr/*/findings` evidence artifacts.
 
 BPF C programs appear in the output with the same `[REFACTOR]`/`[WATCH]`
 tags, but the refactoring mechanic is different: verifier constraints
@@ -37,10 +62,18 @@ complexity hazard independent of the modularity concern.
 This audit deliberately does NOT strip inline `#[cfg(test)] mod tests`
 blocks. Earlier `awk` approaches were fragile (the `EOF` keyword bug
 silently erased production code following an inline test block, per
-Gemini round-1 review of #1208's plan). The #1034 colocated-tests
-refactor moved most inline test blocks to `tests.rs` siblings anyway;
-remaining inline cases are rare and the modest over-count is
-acceptable at the 1500-2000 thresholds.
+Gemini round-1 review of #1208's plan). The measurement stays a plain
+raw line count (`audit_loc` in `scripts/refactoring-audit-lib.sh`) so
+that failure mode is structurally impossible; the
+`TestInlineTestBlockNotStripped` fixture in
+`pkg/refactoraudit/audit_canary_test.go` pins it (a fixture file with
+production code after an inline test block must report its full LOC).
+The #1034 colocated-tests refactor moved most inline test blocks to
+`tests.rs` siblings anyway; remaining inline cases are rare and the
+modest over-count is acceptable at the 1500-2000 thresholds. Only
+whole-file test *modules* (the four filename shapes above) are
+excluded — a filename classifier cannot safely strip inline syntax, so
+it does not try.
 
 ## Regeneration
 
@@ -56,14 +89,35 @@ runs produce byte-identical output.
 
 ## Drift guard
 
-`make audit-check` (#1661 item 8) regenerates the heatmap to a temp
-file and `diff`s it against the committed
-`docs/refactoring-audit-current.txt`, failing if they differ or if the
-generator itself errors. Run it after any change that adds, deletes, or
-resizes a `>=1500` LOC source file, then commit the regenerated artifact
-so the two stay in sync. The target is standalone (not wired into `make
-test`/`all`) so an unrelated PR is not blocked until the artifact is
-refreshed; run it explicitly or in a dedicated CI lane.
+The committed heatmap is enforced two ways:
+
+1. **`make test` (required, automatic).** The `pkg/refactoraudit`
+   canary (`TestHeatmapNotStale`) regenerates the heatmap and asserts it
+   byte-for-byte matches the committed
+   `docs/refactoring-audit-current.txt`. Because it is an ordinary Go
+   test it runs under `go test ./...` — part of the single pre-commit
+   aggregate `make test` — so the artifact **cannot** silently drift on
+   `master` the way it did before #6232 (62 generated rows vs 16
+   committed). Sibling tests pin the classifier (`TestClassifierFilenameShapes`),
+   the >=2000 LOC production sentinel (`TestProductionSentinelVisible`),
+   and the raw-LOC / no-inline-strip invariant
+   (`TestInlineTestBlockNotStripped`).
+
+2. **`make audit-check` (#1661 item 8, standalone convenience).**
+   Regenerates the heatmap to a temp file and `diff`s it against the
+   committed artifact, printing the exact drift and the one-line
+   regenerate command. Run this after any change that adds, deletes, or
+   resizes a `>=1500` LOC source file to see and fix the drift *before*
+   `make test` fails, then commit the regenerated artifact.
+
+Both paths share the classifier and measurement in
+`scripts/refactoring-audit-lib.sh`, so they can never disagree about
+what counts as production LOC. To refresh the artifact after a
+legitimate resize:
+
+```bash
+bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt
+```
 
 ## When to refactor a candidate
 

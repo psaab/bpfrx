@@ -299,6 +299,61 @@ pub(super) fn wg_outer_mtu_snapshot() -> ConfigSnapshot {
     }
 }
 
+/// #6340: a WG endpoint (id 1) with TWO cryptokey-routed peers whose AllowedIPs
+/// live on DISTINCT physical underlay egresses, so a DNAT that rewrites the
+/// inner dst ACROSS the two peers changes which physical NIC the frame must
+/// egress. Peer A (10.123.0.0/24 → outer endpoint 203.0.113.7) routes out
+/// reth0.80 (ifindex 12, physical parent/bind 6, the base fixture); peer B
+/// (10.200.0.0/24 → outer endpoint 198.51.100.7) routes out reth0.50 (ifindex
+/// 13, physical parent/bind 7). No default route (the #6308 specific-peer-route
+/// + tx_ifindex==0 case), so the TX dispatcher consults the peer-route egress
+/// helper — which must follow the POST-NAT dst to peer B's NIC, the SAME NIC
+/// `wg_encap_frame` emits bytes for. Built by extending `wg_outer_mtu_snapshot`.
+pub(super) fn wg_two_peer_dnat_snapshot() -> ConfigSnapshot {
+    let mut snap = wg_outer_mtu_snapshot();
+    // Second physical underlay egress on a DISTINCT parent NIC (bind 7 != 6).
+    snap.interfaces.push(InterfaceSnapshot {
+        name: "reth0.50".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "ge-0-0-2.50".to_string(),
+        ifindex: 13,
+        parent_ifindex: 7,
+        vlan_id: 50,
+        mtu: 1500,
+        redundancy_group: 1,
+        hardware_addr: "02:bf:72:00:50:07".to_string(),
+        addresses: vec![InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "172.16.50.8/24".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    // Route peer B's outer endpoint (198.51.100.7) out reth0.50 via the
+    // connected next-hop 172.16.50.1 (mirroring the base peer-A route).
+    snap.routes.push(RouteSnapshot {
+        table: "inet.0".to_string(),
+        family: "inet".to_string(),
+        destination: "198.51.100.0/24".to_string(),
+        next_hops: vec!["172.16.50.1@reth0.50".to_string()],
+        discard: false,
+        next_table: String::new(),
+        preference: 0,
+    });
+    // Mirror peer B in the endpoint hydration so `endpoint.wg_peers` matches the
+    // live two-peer engine the test inserts (the dispatch path selects via the
+    // engine's AllowedIPs LPM; this keeps the hydrated snapshot consistent).
+    if let Some(ep) = snap.tunnel_endpoints.first_mut() {
+        ep.wg_peers.push(crate::TunnelWgPeerSnapshot {
+            wg_peer_pubkey_hex: "beadfeed".repeat(8),
+            wg_allowed_ips: vec!["10.200.0.0/24".to_string()],
+            wg_endpoint: "198.51.100.7:51820".to_string(),
+            ..Default::default()
+        });
+    }
+    snap
+}
+
 pub(super) fn native_gre_pbr_snapshot(include_neighbor: bool) -> ConfigSnapshot {
     let mut snapshot = native_gre_snapshot(include_neighbor);
     snapshot.zones.insert(

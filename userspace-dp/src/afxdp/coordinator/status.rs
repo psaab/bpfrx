@@ -1089,8 +1089,12 @@ impl super::Coordinator {
         )
     }
 
+    /// #6244: render the typed reconcile stage to its legacy operator string
+    /// for the `debug_reconcile_stage` wire field. This (and
+    /// `ReconcileError`'s `Display`) are the ONLY places the string is
+    /// produced; the strings are preserved byte-for-byte.
     pub fn reconcile_debug(&self) -> (u64, String) {
-        (self.reconcile_calls, self.last_reconcile_stage.clone())
+        (self.reconcile_calls, self.last_reconcile_stage.to_string())
     }
 }
 

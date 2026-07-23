@@ -44,6 +44,127 @@
   pre-#6245 `bound=N:planned=M` stage makes the e2e test ASSERTION-fail
   (`got "worker_bind_incomplete:0:bound=0:planned=1"`), restored → green.
 
+## 2026-07-22 — #6245 rebase: compose explicit binding-failures onto #6244 typed stage
+
+- **Timestamp**: 2026-07-22 (fix/6245-explicit-binding-failures, rebased on
+  origin/master after #6244 merged)
+- **Action**: Re-integrate #6245 on top of #6244's typed `ReconcileStage`.
+  #6244 changed the fail-closed reconcile stage from a free-form `String` to a
+  typed enum whose legacy operator string is produced in EXACTLY one place —
+  `ReconcileStage`'s `Display`. Composed #6245's explicit per-slot failures
+  onto that foundation instead of reverting either PR: (1) added a
+  `failures: Vec<BindingSetupFailure>` field to `WorkerBindShortfall`
+  (`reconcile/stage.rs`); (2) MOVED `render_binding_setup_failures` (and its
+  deterministic-renderer unit test) from `bringup.rs` INTO `stage.rs`, where
+  the `WorkerBindIncomplete` `Display` arm now appends
+  `:{render_binding_setup_failures(&shortfall.failures)}` for the partial-bind
+  (`Some`) case — byte-identical to #6245's original barrier string
+  `worker_bind_incomplete:<id>:bound=<n>:planned=<m>:failures=[...]`; the
+  timeout (`None`) case keeps the pre-#6245 counts-only string (no reported
+  cause to attribute); (3) the barrier now builds the typed
+  `WorkerBindShortfall { ..., failures: report.binding_failures.clone() }` off
+  the retained per-worker `report_by_worker` map (empty failures for the
+  no-report/timeout case); (4) updated the byte-identical Display test's
+  `WorkerBindIncomplete` expectations (the one variant that intentionally
+  changes per #6245) and the e2e test's typed-stage assertions
+  (`ReconcileError::WorkerBindIncomplete(ReconcileStage::WorkerBindIncomplete)`
+  + `last_reconcile_stage.to_string()` for the substring checks).
+- **File(s)**: `userspace-dp/src/afxdp/coordinator/reconcile/stage.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`, `_Log.md`.
+- **Validation**: `cargo build` green; `cargo test --release` green including
+  `worker_bind_incomplete_report_carries_explicit_failure_6245` and
+  `reconcile_stage_renders_byte_identical_legacy_strings`. Fail-on-revert:
+  dropping the `Display` failures-append flips the #6245 e2e test RED.
+
+## 2026-07-22 — #6244: typed reconcile progress replaces last_reconcile_stage string
+
+- **Timestamp**: 2026-07-22 (fix/6244-typed-reconcile-progress)
+- **Action**: Replace the mutable free-form
+  `Coordinator::last_reconcile_stage: String` side-channel with a typed
+  `ReconcileStage` enum (new `userspace-dp/src/afxdp/coordinator/reconcile/
+  stage.rs`). One variant per progress step (Idle/Start/NoSnapshot/Planned/
+  ReplayedSynced/Spawned) and per failure identity (MissingPin/OpenMapFailed/
+  SnapshotIntegrityError{,Detail}/SpawnWorkerFailed/WorkerBindIncomplete, plus
+  sub-types `MandatoryPin` and `WorkerBindShortfall`). The legacy operator
+  string is produced in exactly ONE place — the enum's `Display` — and is
+  rendered ONLY at the `reconcile_debug` / wire `debug_reconcile_stage`
+  boundary (`status.rs`) and inside `ReconcileError`'s `Display`; every legacy
+  string is preserved byte-for-byte. `ReconcileError::{MapSetup,WorkerSpawn,
+  WorkerBindIncomplete}` and `WorkerBringUpError::{Spawn,BindIncomplete}` now
+  carry the typed `ReconcileStage` (was a cloned stage `String`), so a failure
+  identity can no longer be reinterpreted as informal success text. Applied
+  amendment option B: the `"stopped"` write moved OUT of `stop_inner` (called
+  mid-reconcile by `tear_down` and the bring-up fail path) into the explicit
+  `stop`/`stop_with_event_stream` entry points, eliminating the bring-up
+  overwrite-then-restore dance while preserving observable behavior (the
+  transient stop-write mid-reconcile was never externally observed). Scope:
+  types the STAGE (transaction channel); underlying error payloads stay
+  `String` (deeper typing is sibling #6243/#6245). Control-plane / status only
+  — no packet-path, atomics, locks, or trait objects.
+- **Validation**: `cargo build` green (crate root, disk target). Full
+  `cargo test --release -- --test-threads=1` — see run below. Added
+  fail-on-revert `reconcile_stage_renders_byte_identical_legacy_strings`
+  (stage.rs) asserting every variant's legacy render; perturbing
+  `NoSnapshot`'s `Display` (`no_snapshot` → `no_snapshot_PERTURBED`) flips it
+  RED (`left: "no_snapshot_PERTURBED", right: "no_snapshot"`), restored GREEN.
+  Converted the existing exact/prefix/contains stage tests
+  (`coordinator/tests.rs`, `server/tests.rs`) to typed `matches!` assertions
+  PLUS byte-identical legacy-render assertions.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/stage.rs (new),
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/server/tests.rs,
+  docs/userspace-dataplane-architecture.md
+## 2026-07-22 — #6232: scope-complete Rust heatmap classifier + enforced drift gate
+
+- **Timestamp**: 2026-07-22 (fix/6232-heatmap-audit)
+- **Action**: The committed modularity heatmap
+  (`docs/refactoring-audit-current.txt`) was stale AND scope-inaccurate —
+  `make audit-check` exited non-zero on master, and the generator counted
+  whole-file Rust test modules (`tests_pool.rs`, `tests_support.rs`,
+  `tests_destination.rs`, `tests_bind_forward.rs`, ...) as production,
+  producing false `[REFACTOR]`/`[WATCH]` rows. Root cause: `SKIP_RE`
+  excluded `tests.rs` / `*_tests.rs` / three hand-listed `test_*.rs`
+  files, but not the generic `tests_*.rs` / `test_*.rs` sibling
+  `#[path] mod` test modules introduced by the #4840/#4409 test splits.
+  Fix: (1) moved the exclusion regex + LOC measurement into a shared
+  single-source-of-truth library `scripts/refactoring-audit-lib.sh`
+  (`$AUDIT_SKIP_RE`, `audit_loc`), adding anchored patterns for all four
+  Rust test filename shapes; the generator now sources it. (2) Added a
+  thin CLI `scripts/refactoring-audit-classify.sh` (`classify`/`loc`) so
+  a Go test can exercise the same classifier. (3) Regenerated the
+  heatmap — 8 test files dropped, 48 production-only rows remain
+  (verified all test-named `.rs` in the tree are `#[cfg(test)]`-gated).
+  (4) Added the `pkg/refactoraudit` enforcement canary
+  (`TestHeatmapNotStale` byte-diffs the regenerated heatmap;
+  `TestClassifierFilenameShapes` pins positive/negative/anchoring cases;
+  `TestProductionSentinelVisible` keeps the >=2000 LOC
+  `poll_descriptor/mod.rs` visible and asserts no test file leaks;
+  `TestInlineTestBlockNotStripped` pins the raw-LOC / no-inline-strip
+  invariant). Because it is an ordinary Go test it runs under
+  `go test ./...` inside the required `make test` aggregate, so the
+  artifact can no longer silently drift on master. Updated
+  `docs/refactoring-audit.md` and the `Makefile` audit-check comment.
+- **Validation**: `make audit-check` green; `go test ./pkg/refactoraudit`
+  4/4 PASS; gofmt clean; `go vet ./pkg/refactoraudit` clean; shellcheck
+  clean on the three scripts. FAIL-ON-REVERT demonstrated: perturbing a
+  LOC number (7168→9999) in the committed heatmap turns BOTH
+  `make audit-check` (exit 2) and `TestHeatmapNotStale` (FAIL) RED;
+  restoring returns GREEN. Class A tooling/docs — no dataplane or codegen
+  change, no cluster smoke needed.
+- **File(s)**: scripts/refactoring-audit-lib.sh (new),
+  scripts/refactoring-audit-classify.sh (new), scripts/refactoring-audit.sh,
+  docs/refactoring-audit-current.txt, docs/refactoring-audit.md, Makefile,
+  pkg/refactoraudit/doc.go (new),
+  pkg/refactoraudit/audit_canary_test.go (new)
+
 ## 2026-07-22 — #4976: build-time ABI check for the libxdp ring mirror
 
 - **Timestamp**: 2026-07-22 14:00 PDT (fix/4976-build-abi-check)
@@ -56714,6 +56835,68 @@ top.
   pkg/snmp/agent_ber.go, pkg/routing/README.md, pkg/snmp/README.md
 
 - **Timestamp**: 2026-07-22
+- **Action**: #6308 (WG transit-egress TX DISPATCH SSOT — follow-up to
+  #5292/#6306) — the AF_XDP WireGuard transit-egress DISPATCH selected the
+  egress NIC from the zeroed-endpoint resolution's tx_ifindex/egress_ifindex
+  (#2837 stores tx_ifindex=0 / egress=logical wgN). With a default route in
+  the WG transport table tx_ifindex>0 resolves to the physical WAN parent and
+  dispatch works (common case). With ONLY a specific peer route and NO default,
+  tx_ifindex=0 → resolve_tx_binding_ifindex(logical wgN) returned the logical
+  ifindex (no XSK binding) → the TX dispatcher NO_EGRESS_BINDING-DROPPED a frame
+  #5292 built correctly. Fix: resolve the physical underlay egress against the
+  SAME selected-peer route #5292 uses for the frame bytes
+  (wg_transit_egress_physical_egress_ifindex → wg_peer_outer_dst →
+  outer_physical_egress_resolution → outer_egress_ifindex_or_fallback), fed
+  through resolve_forward_target_ifindex → resolve_tx_binding_ifindex — so
+  dispatch and bytes agree on one physical NIC. The peer-route resolution runs
+  ONLY on the tx_ifindex==0 (previously-dropped) path; default-route WG traffic
+  and every non-WG forward keep the zero-extra-work tx_ifindex>0 fast path.
+  RED-on-revert (assertion, target-count 1): reverting the WG dispatch
+  resolution to resolve_tx_binding_ifindex(logical) makes
+  wg_transit_egress_dispatch_specific_peer_no_default_6308 fail with left=400
+  (logical wgN) vs right=6 (reth0.80 physical parent). Full cargo suite green:
+  4124 + 60 + 8 + 22 + 1, 0 failed; named test 3x clean.
+- **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/forward_request.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs,
+  userspace-dp/src/afxdp/frame/README.md, docs/wireguard-interop.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: Fold #6340 into #6308 PR — dispatch peer selection follows the
+  POST-NAT dst (close the #6308 DNAT SSOT hole). #6308 resolved the dispatch
+  egress by selecting the WG peer from the inner-dst AllowedIPs LPM, but at the
+  dispatch site (resolve_forward_target_ifindex) the frame in hand is the
+  PRE-NAT ingress frame while wg_encap_frame selects its peer from the POST-NAT
+  frame (build_forwarded_frame_into_from_frame writes nat.rewrite_dst into `out`
+  via apply_nat_ipv4/6, THEN wg.rs reads inner_dst_ip(&out)). Under a DNAT
+  rewriting the inner dst ACROSS two AllowedIPs peers on DISTINCT physical
+  underlays (no default route → tx_ifindex==0), the #6308 dispatch targeted the
+  PRE-NAT peer's NIC while the bytes carried the POST-NAT peer's L2 — a wire
+  mismatch (dispatch and bytes disagree on the physical NIC). Not a #6308
+  regression (that edge already dropped pre-#6308) but the SSOT thesis
+  "dispatch and bytes agree on ONE physical NIC" must hold unconditionally.
+  Fix: wg_transit_egress_physical_egress_ifindex now keys the peer selection on
+  decision.nat.rewrite_dst (the post-DNAT dst) when a same-family DNAT applies,
+  else the frame's parsed inner dst — the SAME key wg_encap_frame reads from
+  `out`. NAT64 (nat.nat64) is excluded (address-family change → neither
+  rewrite_dst nor the pre-NAT frame dst is a valid same-family AllowedIPs key):
+  returns None → the conservative logical-ifindex fallback (fail-closed; a
+  NAT64→WG transit flow is undeliverable on this path regardless). NatDecision
+  fields used: rewrite_dst: Option<IpAddr> (post-DNAT dst) and nat64: bool
+  (nat/mod.rs:91-99), reached via SessionDecision.nat (session/entry.rs:13).
+  RED-on-revert (assertion): neutralizing the rewrite_dst selection (revert the
+  fold → parse the pre-NAT frame) makes wg_transit_egress_dispatch_follows_post_
+  nat_peer_6308 fail with left=Some(12) (pre-NAT peer A / reth0.80) vs
+  right=Some(13) (post-NAT peer B / reth0.50). Original parent-RED still holds:
+  reverting the #6308 dispatch resolution makes
+  wg_transit_egress_dispatch_specific_peer_no_default_6308 fail left=400 vs
+  right=6. Full cargo --release suite green: 4216 passed, 0 failed; named tests
+  3x clean.
+- **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/frame/README.md, docs/wireguard-interop.md
 - **Action**: #5661 (Go control-plane modularity cohort) — pure
   code-motion split of pkg/cluster/sync_conn.go (2228 lines, ~1595 prod
   LOC, over the ~2000 threshold). Extracted five cohesive sibling files
