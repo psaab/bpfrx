@@ -152,10 +152,11 @@ func (s *Server) ReconcileHTTP(addr string) error {
 // listener (#5866), leaving the live HTTP listener untouched — this is the fix
 // for the whole-server rebuild that re-bound the still-held HTTP socket on a
 // TLS-enable (EADDRINUSE). useTLS=false or addr=="" disables HTTPS. A same-addr
-// enabled call is a no-op. On enable/rebind the new HTTPS listener (with a fresh
-// self-signed cert) is bound and serving BEFORE any old one is retired. A cert
-// or bind failure retains the previous HTTPS state (fail-closed) and returns the
-// error for retry debt.
+// enabled call is a no-op. On enable/rebind the new HTTPS listener (with its
+// durable self-signed cert — loaded AS-IS from disk on a rebind, freshly minted
+// only when no on-disk pair exists, #1916 D6) is bound and serving BEFORE any
+// old one is retired. A cert or bind failure retains the previous HTTPS state
+// (fail-closed) and returns the error for retry debt.
 func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()
