@@ -2209,6 +2209,27 @@ fn filter_result_modifiers_roundtrip_5444() {
 }
 
 #[test]
+fn filter_state_struct_size_is_reported() {
+    // #6236 PR-1 evidence + #6350 revert guard: print the compiled size of
+    // FilterState so the dead-field deletion (31 -> 23 fields) is measurable
+    // rather than back-solved. Run with `-- --nocapture` to see the value.
+    // The exact byte count is toolchain-dependent (hashbrown inline size,
+    // niche packing), so the ceiling is `<=` the measured post-deletion size
+    // rather than an exact `==` — a benign alignment shift will not false-RED,
+    // but re-adding ANY deleted field (each was >= 24 bytes: HashSet<u32> is
+    // 48, Option<u8> plus padding is 24, so the struct jumps to >= 520) breaks
+    // the ceiling. The old `<= 736` ceiling was the PRE-deletion footprint and
+    // passed even after a full revert; this tightens it to guard the deletion.
+    let bytes = std::mem::size_of::<FilterState>();
+    println!("FilterState size_of = {bytes} bytes");
+    assert!(
+        bytes <= 496,
+        "FilterState grew past the post-#6236 footprint ({bytes} bytes) — a \
+         deleted dead field was likely re-added"
+    );
+}
+
+#[test]
 fn parse_filter_state_prequalifies_interface_and_lo0_filter_keys() {
     let ifaces = vec![crate::InterfaceSnapshot {
         name: "reth0.80".into(),
@@ -2251,11 +2272,16 @@ fn parse_filter_state_prequalifies_interface_and_lo0_filter_keys() {
         "protect-re-v6",
     )
     .expect("filter state compiles");
+    // #6236 PR-1: the dead per-interface/lo0 name maps and the dead input
+    // `iface_filter_v4_affects_tx_selection` set are removed. The retained fast
+    // maps carry the resolved `Arc<Filter>` (name is the unqualified filter
+    // name), and the aggregate boolean carries the family-wide tx-selection
+    // fact. The route-lookup and output needs_tx_eval sets are retained (PR-2
+    // scope) and asserted as before.
     assert_eq!(
-        state.iface_filter_v4.get(&7).map(String::as_str),
-        Some("inet:ingress-v4")
+        state.iface_filter_v4_fast.get(&7).map(|f| f.name.as_str()),
+        Some("ingress-v4")
     );
-    assert!(state.iface_filter_v4_affects_tx_selection.contains(&7));
     assert!(state.has_input_tx_selection_v4);
     assert!(state.iface_filter_v4_affects_route_lookup.contains(&7));
     assert!(!state.iface_filter_out_v4_needs_tx_eval.contains(&7));
@@ -2263,11 +2289,20 @@ fn parse_filter_state_prequalifies_interface_and_lo0_filter_keys() {
     assert!(!state.has_output_tx_selection_v4);
     assert!(!state.has_output_tx_selection_v6);
     assert_eq!(
-        state.iface_filter_out_v6.get(&7).map(String::as_str),
-        Some("inet6:egress-v6")
+        state
+            .iface_filter_out_v6_fast
+            .get(&7)
+            .map(|f| f.name.as_str()),
+        Some("egress-v6")
     );
-    assert_eq!(state.lo0_filter_v4, "inet:protect-re");
-    assert_eq!(state.lo0_filter_v6, "inet6:protect-re-v6");
+    assert_eq!(
+        state.lo0_filter_v4_fast.as_ref().map(|f| f.name.as_str()),
+        Some("protect-re")
+    );
+    assert_eq!(
+        state.lo0_filter_v6_fast.as_ref().map(|f| f.name.as_str()),
+        Some("protect-re-v6")
+    );
 }
 
 #[test]
@@ -3642,11 +3677,10 @@ fn thin_accessor_predicates() {
     )
     .expect("filter state compiles");
 
-    // TX-selection accessor reads the TX-selection set, NOT the DSCP set:
-    // true on the TX-only ifindex, false on the DSCP-only ifindex.
-    assert!(interface_filter_affects_tx_selection(&state, 21, false));
-    assert!(!interface_filter_affects_tx_selection(&state, 22, false));
-    assert!(!interface_filter_affects_tx_selection(&state, 21, true));
+    // #6236 PR-1: the per-ifindex `interface_filter_affects_tx_selection`
+    // helper and its dead `iface_filter_v*_affects_tx_selection` sets are
+    // removed. The retained family-wide aggregate carries the same fact: an
+    // inet input filter affects TX selection (v4), none does for inet6.
     assert!(filter_state_has_input_tx_selection(&state, false));
     assert!(!filter_state_has_input_tx_selection(&state, true));
 
@@ -3659,7 +3693,67 @@ fn thin_accessor_predicates() {
     assert!(!interface_output_filter_has_dscp_match(&state, 23, true));
     // No filter bound to an unrelated ifindex.
     assert!(!interface_input_filter_has_dscp_match(&state, 99, false));
-    assert!(!interface_filter_affects_tx_selection(&state, 99, false));
+    assert!(!state.iface_filter_v4_fast.contains_key(&99));
+}
+
+// --- Gap 8b: a DSCP-match-only filter does not imply TX selection ---
+#[test]
+fn dscp_only_filter_does_not_imply_tx_selection() {
+    // #6350 (#6236 PR-1 follow-up): the `thin_accessor_predicates` rewrite
+    // deleted the per-ifindex `!interface_filter_affects_tx_selection(&state,
+    // 22, false)` negative when the dead helper was removed. Restore that
+    // guarantee at the retained family-wide accessor: a filter whose ONLY
+    // modifier is a DSCP *match* (`from dscp`) — NO forwarding-class
+    // classification, NO `then dscp` rewrite, NO counter / log /
+    // three-color-policer / terminal action — must NOT flip the input
+    // tx-selection aggregate. `affects_tx_selection` keys strictly on
+    // forwarding-class or dscp_rewrite (compiler.rs), so a from-dscp match
+    // sets `has_dscp_match_terms` but leaves tx-selection untouched. Make it
+    // the ONLY input filter so the family-wide aggregate reflects it alone.
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 41,
+        filter_input_v4: "dscp-only-in".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "dscp-only-in".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "match-ef".into(),
+                dscp_values: vec![46],
+                action: "accept".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+
+    // The DSCP-only input filter must NOT imply tx-selection for either
+    // family. If the compiler ever mis-classified a DSCP-bearing filter as
+    // tx-selecting (e.g. keying `affects_tx_selection` on dscp_match_enabled),
+    // the v4 assertion goes RED.
+    assert!(
+        !filter_state_has_input_tx_selection(&state, false),
+        "a DSCP-match-only input filter must not imply v4 tx-selection"
+    );
+    assert!(
+        !filter_state_has_input_tx_selection(&state, true),
+        "no inet6 input filter is present"
+    );
+    // Sanity: the filter IS bound and IS a DSCP-match filter, proving the
+    // negatives above are about tx-selection classification, not a missing
+    // filter bind that would trivially make every accessor false.
+    assert!(interface_input_filter_has_dscp_match(&state, 41, false));
+    assert_eq!(
+        state.iface_filter_v4_fast.get(&41).map(|f| f.name.as_str()),
+        Some("dscp-only-in")
+    );
 }
 
 // --- Gap 9: cached-vs-runtime baseline parity for a plain (no-policer) term ---

@@ -1,0 +1,502 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"reflect"
+
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/eventengine"
+	"github.com/psaab/xpf/pkg/lldp"
+	"github.com/psaab/xpf/pkg/vrrp"
+)
+
+// applyTailReconciles runs steps 8–21 of applyConfigLocked — the tail of the
+// commit/apply pipeline that dispatches to independent subsystems after the
+// ordering-entangled head (VRF/tunnel/IPVLAN/dataplane/RETH-MAC/networkd/FRR,
+// steps 0–7). Each step reads only the compiled config (+ nil-guarded
+// subsystems); none feeds a later head step, so grouping them here is a
+// behavior-preserving mechanical move (#4407 Phase A). The helper runs
+// synchronously in the caller's goroutine under d.applySem (the caller holds
+// it), so the lock discipline of the inline body is preserved; the few
+// intentionally-async callbacks the apply body spawns all live in the head,
+// not here.
+//
+// Error-join contract: the deferred reconcile errors accumulate across the
+// whole apply body but are joined only at this tail (fail-closed — every step
+// still runs). networkdErr/applyErr/dhcpServerErr/ipsecErr/ifaceErr originate in
+// the head and are threaded in as parameters (applyErr is the #5679 ordinary
+// non-abort dataplane-apply failure that must fail the commit while the OLD
+// policy stays live); routeLeakErr is the #5696 route-leak snapshot
+// republish/FIB-bump failure (also head-produced, threaded in like ifaceErr);
+// vrrpErr originates in step 8 below when runtime identity validation rejects
+// the desired set (#5083); vrfErr is the #5700 VRF-device-setup (ReconcileVRFs)
+// failure and routingRuleErr/mgmtRouteErr are threaded from the caller;
+// lo0Err/hostInboundErr originate in step 9.5. The returned errors.Join
+// preserves the explicit operand order
+// (#1778/#2987/#4433/#5083/#5310/#5679/#5696/#5700).
+func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr error) error {
+	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
+	var vrrpErr error
+	vrrpInstances := vrrp.CollectInstances(cfg)
+	if d.cluster != nil {
+		localPri := d.cluster.LocalPriorities()
+		vrrpInstances = append(vrrpInstances, vrrp.CollectRethInstances(cfg, localPri)...)
+	}
+	if err := d.vrrpMgr.UpdateInstances(vrrpInstances); err != nil {
+		slog.Warn("failed to update VRRP instances", "err", err)
+		// Identity/family validation is a fail-closed runtime gate. Returning a
+		// successful commit while the manager retained the old instance set
+		// would claim HA coverage for a family/segment that is not running.
+		vrrpErr = fmt.Errorf("update VRRP instances: %w", err)
+	}
+
+	// 9. Apply system DNS and NTP configuration.
+	//
+	// #1715: a single locked reconcileDNS owns /etc/resolv.conf as a
+	// managed plain file (resolved disabled+masked), merging static
+	// `system name-server` with live DHCP-learned servers. It replaces
+	// the prior applySystemDNS (resolved drop-in + restart) and
+	// applyDNSService (disable resolved) pair, whose apply order
+	// (write-drop-in-then-disable) was a self-inflicted race that left
+	// /etc/resolv.conf a dangling symlink. bootEmptyRepairOnly is set
+	// before DHCP clients start so the first apply does not blank a good
+	// resolv.conf when no static name-server is configured yet.
+	d.reconcileDNSLocked(cfg, !d.dnsBootDone)
+	d.applySystemNTP(cfg)
+
+	// 9.5. Apply system hostname, timezone, and kernel tuning
+	d.applyHostname(cfg)
+	d.applyTimezone(cfg)
+	d.applyKernelTuning(cfg)
+	// #3392: the lo0 input filter is host-protection control-plane enforcement,
+	// so an apply/teardown failure must fail the commit closed rather than be
+	// swallowed at WARN — the same fail-open #3333 fixed for host-inbound. The
+	// error is joined into the commit result at the tail (alongside networkdErr /
+	// dhcpServerErr / hostInboundErr); the remaining apply steps still run so
+	// management/SSH reconcile is never skipped by an lo0 nft failure.
+	lo0Err := d.applyLo0Filter(cfg)
+	// #3333: host-inbound is the kernel-nftables PRIMARY enforcement of the
+	// host-inbound contract, so an apply/teardown failure must fail the commit
+	// closed rather than be swallowed at WARN. The error is joined into the
+	// commit result at the tail (alongside networkdErr / dhcpServerErr); the
+	// remaining apply steps still run so management/SSH reconcile is never
+	// skipped by a host-inbound nft failure.
+	hostInboundErr := d.applyHostInboundFilter(cfg)
+
+	// 9.6. Write SSH known hosts file
+	d.applySSHKnownHosts(cfg)
+
+	// 10. Apply system syslog forwarding
+	d.applySystemSyslog(cfg)
+
+	// Steps 11–13 are the login/credential reconcilers. They return their
+	// accumulated failures (#5874) so the cancel closeout can surface them,
+	// but on the NORMAL apply path the returns are intentionally DISCARDED:
+	// the tail is best-effort here because the next boot re-renders login /
+	// sudoers / SSH / root-auth from the active config, so a transient failure
+	// converges (the #2926 next-boot contract). Only the daemon-stop cancel
+	// closeout — where next-boot convergence does NOT happen while the daemon
+	// stays intentionally stopped — collects and fails on these.
+
+	// 11. Apply system login users (create OS accounts, SSH keys)
+	_ = d.applySystemLogin(cfg)
+
+	// 11b. Reconcile super-user sudo grants against the CURRENT config so a
+	// class downgrade or user removal REVOKES the stale NOPASSWD grant
+	// (#3889). Runs unconditionally — applySystemLogin returns early when
+	// there are no users, which is exactly the "all users removed" case
+	// that must still sweep stale grants.
+	_ = d.reconcileSudoers(cfg)
+
+	// 11c. Revoke host credentials for any xpf-provisioned login account that
+	// was removed from config (#5128). reconcileSudoers above only revokes the
+	// sudo grant; without this a deprovisioned operator keeps their password
+	// and authorized_keys and can still SSH in. Like reconcileSudoers it MUST
+	// run unconditionally — the "all users removed" case must still revoke.
+	_ = d.reconcileAbsentLoginUsers(cfg)
+
+	// 12. Apply SSH service configuration (root-login)
+	_ = d.applySSHConfig(cfg)
+
+	// 13. Apply root authentication (encrypted-password + SSH keys)
+	_ = d.applyRootAuth(cfg)
+
+	// 14. Apply syslog file destinations (rsyslog configs)
+	d.applySyslogFiles(cfg)
+
+	// 14b. Update security log syslog clients + zone name mapping
+	if d.eventReader != nil {
+		d.applySyslogConfig(d.eventReader, cfg)
+	}
+
+	// 15. Archive config to remote sites if transfer-on-commit is enabled
+	d.archiveConfig(cfg)
+
+	// 15b. Configure local archival settings for auto-archive on commit
+	if cfg.System.Archival != nil {
+		dir := cfg.System.Archival.ArchiveDir
+		if dir == "" {
+			dir = "/var/lib/xpf/archive"
+		}
+		max := cfg.System.Archival.MaxArchives
+		if max <= 0 {
+			max = 10
+		}
+		d.store.SetArchiveConfig(dir, max)
+	} else {
+		d.store.SetArchiveConfig("", 0)
+	}
+
+	// 15c. Reconcile the periodic configuration-archival timer (#4078). Junos
+	// `transfer-interval N` archives the running config to the archive-sites
+	// every N minutes, independent of transfer-on-commit. Hash-gated so an
+	// unrelated commit never bounces a healthy timer; re-armed on daemon
+	// restart via this same boot apply; stopped when the leaf is removed.
+	d.reconcileArchiveTimer(cfg)
+
+	// 16. Update flow traceoptions (trace file + filters)
+	d.updateFlowTrace(cfg)
+
+	// 16b. Reconcile the NetFlow v9 / IPFIX exporters (#2075). Before
+	// this, the exporters were only started at boot and stopped at
+	// shutdown, so forwarding-options sampling / flow-monitoring config
+	// changes were ignored until a daemon restart (and flow export
+	// added in a later commit never started). Hash-gated per family so
+	// an unrelated commit never bounces a healthy exporter. Placed
+	// below the dataplane-apply abort (consistent with reconcileRPM /
+	// applySyslogConfig): an aborting commit defers the exporter change
+	// to the next clean commit.
+	d.reconcileFlowExporters(cfg)
+
+	// 16c. Reconcile the DHCP relay (#2348). Before this the relay was
+	// applied only at boot (daemon_run.go), so a day-2 commit that added,
+	// removed, or changed a `forwarding-options dhcp-relay` group was
+	// ignored until a daemon restart. Manager.Apply diffs desired-vs-running
+	// per interface (start added, stop removed, restart changed, leave
+	// unchanged) and a nil relay config stops all relays. Bound to
+	// d.daemonCtx so the relay goroutines outlive this apply call.
+	d.reconcileDHCPRelay(cfg)
+
+	// 16d. Reconcile the LLDP service (#2372). Before this, LLDP was applied
+	// only at boot (daemon_run.go), so a day-2 commit that enabled, disabled,
+	// or changed `protocols lldp` (interface set, transmit-interval,
+	// hold-multiplier) was silently ignored until a daemon restart. reconcileLLDP
+	// lazily instantiates the manager on the first enable and Apply()s the new
+	// config; a disabled/empty stanza stops the running service. Bound to
+	// d.daemonCtx so the TX/RX goroutines outlive this apply call.
+	d.reconcileLLDP(cfg)
+
+	// 17. Reconcile event-options policies (RPM-driven failover). Before
+	// #3752 this was a bare `if d.eventEngine != nil { Apply }`, and the
+	// engine was constructed at boot ONLY when the boot config already had
+	// policies — so committing the FIRST event-options policy on a running
+	// daemon (day-2) left d.eventEngine nil and the policy inert until a
+	// restart. The engine is now constructed unconditionally at boot
+	// (daemon_run.go, mirroring LLDP/dhcpRelay); reconcileEventOptions runs
+	// here on every day-2 commit so a first-enable takes effect immediately.
+	d.reconcileEventOptions(cfg)
+
+	// 17b. Reconcile RPM probes (#1827 PR-1a). Config-hash-gated: the
+	// probe set (and the probe next-hop pin rules) is re-applied only
+	// when the rendered RPM stanza actually changed, so unrelated
+	// commits never wipe probe state.
+	d.reconcileRPM(cfg)
+
+	// 17c. Reconcile the ip-monitoring engine (#1827 PR-1b): install
+	// the committed policy set (preserving FAIL state across unrelated
+	// commits) and seed it with current probe results.
+	d.reconcileIPMon(cfg)
+
+	// 18. Update chassis cluster interface monitors
+	if d.routing != nil && cfg.Chassis.Cluster != nil &&
+		len(cfg.Chassis.Cluster.RedundancyGroups) > 0 {
+		d.routing.ApplyInterfaceMonitors(cfg.Chassis.Cluster.RedundancyGroups)
+	}
+
+	// 19. Update chassis cluster state machine
+	if d.cluster != nil && cfg.Chassis.Cluster != nil {
+		d.cluster.UpdateConfig(cfg.Chassis.Cluster)
+		// Feed interface monitor statuses into cluster weight calculation
+		if d.routing != nil {
+			monStatuses := d.routing.InterfaceMonitorStatuses()
+			for rgID, statuses := range monStatuses {
+				for _, st := range statuses {
+					d.cluster.SetMonitorWeight(rgID, st.Interface, !st.Up, st.Weight)
+				}
+			}
+		}
+
+		// RETH GARP is handled by native VRRP (VRRP-backed RETH).
+		// No manual GARP registration needed.
+	}
+
+	// 20. Detect cluster transport config changes and restart comms (#87).
+	// Only restart if comms were previously started (activeClusterTransport
+	// is non-zero) and the new config differs.
+	if d.cluster != nil && d.daemonCtx != nil {
+		newTransport := clusterTransportFromConfig(cfg)
+		if d.activeClusterTransport != (clusterTransportKey{}) && newTransport != d.activeClusterTransport {
+			slog.Info("cluster: transport config changed, restarting comms",
+				"old_control", d.activeClusterTransport.ControlInterface,
+				"new_control", newTransport.ControlInterface,
+				"old_peer", d.activeClusterTransport.PeerAddress,
+				"new_peer", newTransport.PeerAddress,
+				"old_fabric", d.activeClusterTransport.FabricInterface,
+				"new_fabric", newTransport.FabricInterface,
+				"old_fabric_peer", d.activeClusterTransport.FabricPeerAddress,
+				"new_fabric_peer", newTransport.FabricPeerAddress)
+			d.stopClusterComms()
+			d.startClusterComms(d.daemonCtx)
+		}
+
+		// #4647 BUG-B: reconcile the #2239 DHCP lease-sync push loop against
+		// the just-committed `dhcp-lease-synchronization` knob. Without this a
+		// runtime knob-ON commit on a running cluster was a silent no-op (the
+		// loop was launched only from the connect-time block) — counters stayed
+		// 0/0 until an xpfd restart. ensureDHCPLeaseSyncLoop is idempotent, so a
+		// knob-unchanged commit is a no-op, a knob-ON commit (re)launches the
+		// loop against the live comms context, and a knob-OFF commit stops it.
+		d.ensureDHCPLeaseSyncLoop(d.dhcpLeaseSyncEnabled(cfg))
+	}
+
+	// 21. Re-apply D3 RSS indirection on config change (#797 HIGH #2).
+	// Worker count can change via commit (e.g. `set system dataplane
+	// workers 6`), and the D3 disable knob can flip; either requires
+	// re-running the reshape (or restore) against the current HW state.
+	// Idempotent: matching tables skip the write. Non-mlx5 interfaces
+	// are skipped at the per-interface guard. The allowlist is
+	// recomputed from the *new* compiled config so interface-set
+	// changes (added/removed zoned mlx5 interfaces, fabric interface
+	// changes) take effect on the same commit.
+	if !d.opts.NoDataplane {
+		rssEnabled := true
+		workers := 0
+		var rssAllowed []string
+		// #801: mirror the startup site so a commit that changes any
+		// of the Step-0 knobs takes effect without a restart.
+		var (
+			governor          string
+			netdevBudget      int
+			coalesceEnable    bool
+			coalesceRX        int
+			coalesceTX        int
+			userspaceDP       bool
+			coalesceExplicit  bool
+			claimHostTunables bool
+		)
+		if dataplane.EffectiveType(cfg.System.DataplaneType) == dataplane.TypeUserspace &&
+			cfg.System.UserspaceDataplane != nil {
+			userspaceDP = true
+			workers = cfg.System.UserspaceDataplane.Workers
+			if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
+				rssEnabled = false
+			}
+			rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
+			claimHostTunables = cfg.System.UserspaceDataplane.ClaimHostTunables
+			governor = cfg.System.UserspaceDataplane.CPUGovernor
+			netdevBudget = cfg.System.UserspaceDataplane.NetdevBudget
+			coalesceExplicit = cfg.System.UserspaceDataplane.CoalescenceAdaptiveExplicit
+			if coalesceExplicit &&
+				!cfg.System.UserspaceDataplane.CoalescenceAdaptiveDisabled {
+				coalesceEnable = true
+			}
+			coalesceRX = cfg.System.UserspaceDataplane.CoalescenceRXUsecs
+			coalesceTX = cfg.System.UserspaceDataplane.CoalescenceTXUsecs
+		}
+		reapplyRSSIndirection(rssEnabled, workers, rssAllowed)
+		// #801 B1 + B2: opt-in gate + restore-on-disable.
+		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
+			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
+	}
+	// #1778 + #2987 + #4433 + #5083 + #5310 + #5679 + #5696: deferred reconcile failures —
+	// every reconcile step above has run; surface the networkd write failure, the
+	// ordinary (non-abort) dataplane-apply failure (#5679 — the new policy is
+	// NOT on the wire, the old one still is), the Kea restart/stop failure, the
+	// IPsec render/reload failure, the interface-reconcile failure
+	// (xfrmi/bond/tunnel/legacy-reth create/up/delete — #5310), and the route-leak
+	// snapshot republish/FIB-bump failure (#5696 — a stale inter-VRF leak would
+	// otherwise survive on a "successful" commit) through the commit so a step
+	// that left stale or missing kernel/swanctl/dataplane state fails the commit
+	// (fail-closed) instead of reporting success. All are joined so none masks the
+	// other.
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, vrrpErr)
+}
+
+// reconcileDHCPRelay re-applies the DHCP relay config on every commit (#2348).
+// The relay Manager is created at boot (daemon_run.go) regardless of whether a
+// relay was configured then, so a relay added on a day-2 commit starts here and
+// a relay removed here stops. Manager.Apply diffs desired-vs-running per
+// interface (start added / stop removed / restart changed / leave unchanged),
+// and a nil relay config stops all relays. The relay goroutines bind to
+// d.daemonCtx (the daemon lifetime) — NOT a request-scoped context — so they
+// survive past this apply call and are torn down only at daemon stop. Guarded
+// on d.dhcpRelay so a daemon constructed without a relay Manager (e.g. a test
+// harness or NoDataplane boot that skipped the boot wiring) is a safe no-op.
+func (d *Daemon) reconcileDHCPRelay(cfg *config.Config) {
+	if d.dhcpRelay == nil {
+		return
+	}
+	ctx := d.daemonCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.dhcpRelay.Apply(ctx, cfg.ForwardingOptions.DHCPRelay)
+}
+
+// effectiveLLDPConfig translates the typed `protocols lldp` stanza into the
+// lldp.LLDPConfig the manager consumes, or returns nil when LLDP is disabled,
+// empty, or absent (the "stop the service" signal). It is the single mapping
+// used by both boot and the day-2 reconcile, so the diff-guard in reconcileLLDP
+// compares like-for-like.
+func effectiveLLDPConfig(cfg *config.Config) *lldp.LLDPConfig {
+	if cfg == nil || cfg.Protocols.LLDP == nil ||
+		cfg.Protocols.LLDP.Disable || len(cfg.Protocols.LLDP.Interfaces) == 0 {
+		return nil
+	}
+	lldpIfaces := make([]lldp.LLDPInterface, 0, len(cfg.Protocols.LLDP.Interfaces))
+	for _, iface := range cfg.Protocols.LLDP.Interfaces {
+		lldpIfaces = append(lldpIfaces, lldp.LLDPInterface{
+			Name:    iface.Name,
+			Disable: iface.Disable,
+		})
+	}
+	return &lldp.LLDPConfig{
+		Interfaces:     lldpIfaces,
+		Interval:       cfg.Protocols.LLDP.Interval,
+		HoldMultiplier: cfg.Protocols.LLDP.HoldMultiplier,
+		SystemName:     cfg.System.HostName,
+	}
+}
+
+// reconcileLLDP re-applies the LLDP service config on every commit (#2372). It
+// is the single source of truth for LLDP lifecycle — daemon_run.go calls it at
+// boot, and applyConfigLocked calls it on every day-2 commit, so a change to
+// `protocols lldp` takes effect without a daemon restart.
+//
+// The manager itself is constructed exactly once at boot (daemon_run.go),
+// mirroring d.dhcpRelay. reconcileLLDP NEVER reassigns the d.lldpMgr pointer —
+// it only calls Apply()/Stop() on the already-constructed manager. This keeps
+// the lock-free d.lldpMgr reads on the `show lldp neighbors` handler goroutines
+// race-free against a concurrent commit (finding 3): the pointer is written
+// once, before any handler can run.
+//
+// Change-guarded (finding 6): lldp.Manager.Apply unconditionally Stop()s the
+// current generation — closing every per-interface socket, joining goroutines,
+// AND wiping the neighbor table — before rebuilding. Calling it on every commit
+// would blank `show lldp neighbors` and churn sockets on any unrelated day-2
+// commit (e.g. a firewall-policy change) while neighbors re-learn. So Apply (or
+// Stop) is invoked only when the effective LLDP config actually changed from the
+// last-applied one, matching the diff discipline of the adjacent
+// reconcileDHCPRelay (#2348). The first call (boot) always applies.
+//
+// The manager is bound to d.daemonCtx (the daemon lifetime) — NOT a
+// request-scoped context — so the TX/RX/expiry goroutines survive past this
+// apply call and are torn down only at daemon stop (or the next reconcile that
+// disables LLDP).
+func (d *Daemon) reconcileLLDP(cfg *config.Config) {
+	if d.lldpMgr == nil {
+		// Defensive: a test harness or a boot path that skipped the construct-
+		// once wiring leaves the manager nil. Nothing to reconcile.
+		return
+	}
+
+	want := effectiveLLDPConfig(cfg)
+
+	// Skip when the effective config is unchanged since the last reconcile, so
+	// an unrelated commit never bounces a healthy LLDP generation (sockets +
+	// neighbor table). The first reconcile (boot) always runs.
+	if d.lldpApplyInit && lldpConfigEqual(d.lldpApplied, want) {
+		return
+	}
+	d.lldpApplyInit = true
+	d.lldpApplied = want
+
+	if want == nil {
+		// Disabled / empty: stop the running service (idempotent if already
+		// stopped).
+		d.lldpMgr.Stop()
+		return
+	}
+
+	ctx := d.daemonCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.lldpMgr.Apply(ctx, want)
+}
+
+// initEventEngine constructs the event-options engine and registers the RPM
+// event callback (#3752). Like the LLDP manager and the DHCP relay manager, it
+// is created UNCONDITIONALLY at boot — not gated on the boot config already
+// carrying an event-options policy — so:
+//
+//   - the d.eventEngine pointer is written exactly ONCE at boot and read-only
+//     thereafter, keeping the lock-free reads on the `Stats()` metric/CLI
+//     handler goroutines race-free (the same pointer-race discipline #2372
+//     established for d.lldpMgr); and
+//   - a day-2 commit enabling the FIRST event-options policy takes effect
+//     immediately via reconcileEventOptions, instead of being inert until a
+//     daemon restart (the #3752 defect).
+//
+// The engine routes its remediation commit through d.commitAndApply so it
+// serializes with HTTP/gRPC commits under d.applySem (#846). Event-options
+// changes do not sync to the peer — the engine fires independently on each
+// node from that node's local RPM events. Idempotent: a second call is a no-op.
+func (d *Daemon) initEventEngine() {
+	if d.eventEngine != nil {
+		return
+	}
+	d.eventEngine = eventengine.New(d.store, func(ctx context.Context, comment string) (*config.Config, error) {
+		return d.commitAndApply(ctx, comment, false)
+	})
+	if d.rpm != nil {
+		d.rpm.SetEventCallback(d.eventEngine.HandleEvent)
+	}
+	slog.Info("event-options engine constructed")
+}
+
+// reconcileEventOptions applies the committed event-options policy set to the
+// engine on every commit (#3752). The engine is constructed once at boot
+// (initEventEngine); this only ever calls Apply, which RECONCILES per-policy
+// runtime state (carrying cooldown/window memory forward for unchanged
+// policies, #2140). It NEVER reassigns the pointer. A nil cfg (or empty policy
+// set) applies zero policies — a no-op that also clears a removed set.
+func (d *Daemon) reconcileEventOptions(cfg *config.Config) {
+	if d.eventEngine == nil {
+		// Defensive: boot wiring constructs the engine before any reconcile.
+		return
+	}
+	var policies []*config.EventPolicy
+	if cfg != nil {
+		policies = cfg.EventOptions
+	}
+	d.eventEngine.Apply(policies)
+}
+
+// lldpConfigEqual reports whether two effective LLDP configs are equivalent for
+// reconcile purposes (both nil, or deeply equal). nil means "service stopped".
+func lldpConfigEqual(a, b *lldp.LLDPConfig) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+func (d *Daemon) publishInitialPolicySchedulerStateLocked(cfg *config.Config, activeState map[string]bool, applyResult *dataplane.ApplyResult) {
+	if d.dp == nil || activeState == nil || applyResult == nil {
+		return
+	}
+	if _, isUserspace := d.dp.(userspaceRuntimeModeReporter); isUserspace {
+		return
+	}
+	// #3780: initial (eBPF-path) publish rides the apply transaction; a
+	// failure here is surfaced via the same republish-failure metric so
+	// it is not silently swallowed. The retired eBPF updater always
+	// reports success, so this is a no-op there today.
+	d.recordSchedulerRepublishResult(d.updatePolicyScheduleStateLocked(cfg, activeState))
+}

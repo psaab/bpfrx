@@ -99,7 +99,12 @@ locating any symbol below is now a matter of opening the named file.
   `SendGratuitousARPBurst` / `SendGratuitousIPv6Burst` are thin wrappers that
   pass a nil predicate (ungated, run-to-completion) for callers with no
   per-instance epoch/state to gate against (direct-mode re-announce, tests).
-- `SessionSync` — `sync.go`, `sync_conn.go`, `sync_bulk.go`, `runtime.go`. HA
+- `SessionSync` — `sync.go`, `sync_conn.go` (connection lifecycle:
+  dial/accept/install/start/stop/disconnect), `sync_conn_gen.go` (session
+  generation guards + synced-session apply), `sync_conn_read.go`
+  (receive/dispatch), `sync_conn_write.go` (send/queue/delete-journal),
+  `sync_conn_sweep.go` (incremental sync sweep), `sync_conn_config.go`
+  (config replication), `sync_bulk.go`, `runtime.go`. HA
   session replication. After #1518, `NewSessionSync`, `NewDualSessionSync`,
   and `SetRuntime` accept the narrow `clusterRuntime` (see `runtime.go`) —
   `Sessions() dataplane.SessionStore` plus `Telemetry() dataplane.Telemetry`.
@@ -723,7 +728,7 @@ outside the monitor loop:
   `m.mu`. This mirrors the `hbStartMu` discipline `StartHeartbeat` uses for the
   same reason (#4033). Any future method that both takes `m.mu` and joins a
   goroutine that re-enters the manager must follow the same split.
-- The incremental sync sweep (`sync_conn.go`) re-syncs a session ONLY on
+- The incremental sync sweep (`sync_conn_sweep.go`) re-syncs a session ONLY on
   `val.Created >= threshold` — it deliberately does NOT re-publish an
   established flow on `LastSeen` activity (#270 narrowed this; #131's
   `|| val.LastSeen >= threshold` clause was removed on purpose to keep the
@@ -744,7 +749,7 @@ outside the monitor loop:
 - **Install-generation delete guard (#2170, #2221)**: every session install and
   every delete carries a per-`(sender,key)` monotonic install generation as a
   length-gated trailing `uint64` (see `docs/sync-protocol.md`). The sender
-  (`sync_conn.go`/`sync_bulk.go`) stamps installs from a single boot-seeded
+  (`sync_conn_gen.go`/`sync_bulk.go`) stamps installs from a single boot-seeded
   counter. A delete draws a **fresh, strictly-greater** generation
   (`takeDeleteGenV4/V6` → `nextInstallGen`) rather than echoing the install's
   stamp, so a delete always out-ranks the install it cancels — this is what makes

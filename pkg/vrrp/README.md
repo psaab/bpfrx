@@ -95,8 +95,36 @@ This is the package that drives chassis-cluster failover.
 
 - `manager.go` — redundancy-group coordinator: `Manager`, instance
   diff/lifecycle, sync-hold, RG force/resign helpers, socket helpers.
-- `instance.go` — per-instance state machine, RX receivers, advert
-  send, VIP add/remove, GARP/NA.
+- `instance.go` — per-instance state machine core: the `vrrpInstance`
+  struct, `newInstance`, config/preempt control, advert-interval and
+  master-down/preempt-hold timing, the `run` loop and `stepBackup`,
+  RX-driven state resolution (`handleBackupRx`/`handleMasterRx`/
+  `resolveEqualPriorityMaster`), and the `becomeMaster`/`becomeBackup`
+  transitions. Pure code-motion split (#5661) moved the cohesive
+  sub-responsibilities below into sibling files (same `package vrrp`,
+  no symbol renames):
+  - `instance_addr.go` — local IPv4/IPv6 + VIP-set address resolution
+    (`interfaceAddrs`, `get/setLocalIP`, `get/setLocalIPv6`,
+    `vipAddrSet`, `canonAddr`, `resolveLocalIPv4`, `reresolveLocalAddrs`,
+    `resolveIPv6LinkLocal`).
+  - `instance_socket.go` — raw-socket lifecycle (`openSocket`,
+    `openSocketWith`, `closeSockets`, `closeSocketDescriptors`,
+    `clearSocketRefs`).
+  - `instance_receive.go` — RX receivers + packet parse/enqueue
+    (`receiver`, `receiverIPv6`, `receiverAfPacket`,
+    `parseAfPacketIPv4`/`parseAfPacketIPv6`, `enqueuePacket`,
+    `walkIPv6ExtHeaders`, `acceptArrivalIfindex`, `expectedIfindex`,
+    `warnRXDrop`, `isTimeoutError`).
+  - `instance_send.go` — advert/event send (`emitEvent`, `sendAdvert`,
+    `sendPacket`, `sendPacketIPv6`).
+  - `instance_garp.go` — gratuitous-ARP/NA burst + gateway probe
+    (`sendGARP`, `garpSendAllowed`, `garpDampened`, `GatewayProbeTarget`,
+    the `arpProbeFn`/`garpBurstFn`/`naBurstFn` seams, `minGARPInterval`).
+  - `instance_vip.go` — netlink VIP add/remove actuation +
+    stale-VIP reconcile (`addVIPsLocked`, `removeVIPs`,
+    `removeVIPsLocked`, `nlLinkByName`/`nlAddrAdd`/`nlAddrDel`,
+    `removeVIPsIfBackup`, `scheduleVIPRemoveReconcile`, `surfaceStaleVIP`,
+    `vipActuationResult`).
 - `packet.go` — VRRPv3 advert parser/builder + IPv4/IPv6 checksums.
 - `track.go` — interface tracking (#1814): the per-instance
   effective-priority primitives (`getPriority`, `setTrackDown`,
@@ -495,7 +523,7 @@ load/peer-sync compile paths.
   socket's `SO_BINDTODEVICE`, so the unconditional bind was cosmetic for
   RX there. The genuine split-brain it repaired is the **AF_PACKET-unavailable
   fallback** (`receiverIPv6` reads IPv6 VRRP directly from the raw socket,
-  `instance.go`): there a VLAN-pinned `SO_BINDTODEVICE` could drop inbound
+  `instance_receive.go`): there a VLAN-pinned `SO_BINDTODEVICE` could drop inbound
   multicast → the IPv6 instance misses peer adverts → both nodes hold
   MASTER. Aligning v4/v6 is correct hygiene on both paths and closes that
   fallback-path split-brain; `make test-failover` on the native-XDP loss
@@ -552,7 +580,7 @@ For IPv6 the conformant wire format places that link-local as **address[0]**,
 followed by the configured global VIPs — a strict vSRX/keepalived-v3 peer can
 reject an advert whose first address is a global VIP.
 
-`sendPacketIPv6` (`instance.go`) resolves that link-local as `srcIP`
+`sendPacketIPv6` (`instance_send.go`) resolves that link-local as `srcIP`
 (`getLocalIPv6()`, with the #2258 lazy-resolve fallback), uses it as the outer
 IPv6 source and the pseudo-header checksum source (#2644), **and now prepends
 it to `pkt.IPAddresses` ahead of the configured VIPs** before `Marshal`. Three
@@ -673,7 +701,7 @@ ethertype (#5088):
 - **Kernel prefilter and userspace parser MUST admit the same
   encapsulation set (#5088).** A single S-tag has the identical layout as
   a C-tag (real ethertype at offset 16), and `parseAfPacket`
-  (`instance.go`) accepts both `0x8100` and `0x88a8`. Before #5088 the
+  (`instance_receive.go`) accepts both `0x8100` and `0x88a8`. Before #5088 the
   cBPF matched only `0x8100`, so on an S-tagged / provider-bridged segment
   the kernel dropped every advert before Go — both nodes went mutually
   deaf and could own the same VRID/VIPs (split-brain) despite the parser's
@@ -751,7 +779,7 @@ dataplane reuses this Go walker, and do NOT try to consolidate them.
   (`schema_interfaces.go`, `compiler_interfaces.go`), but no non-test
   code reads it to gate behavior. xpf uses a **VIP-as-real-address**
   model: on MASTER, `addVIPs()` installs each VIP as a genuine local
-  kernel address via `netlink.AddrAdd` (`instance.go`), so the Linux
+  kernel address via `netlink.AddrAdd` (`instance_vip.go`), so the Linux
   stack itself answers ARP/ND and replies to ICMP echo / accepts
   host-inbound traffic addressed to the VIP — regardless of the flag.
   That is exactly RFC 5798 §6.1 `Accept_Mode=on` (a pingable VIP, the

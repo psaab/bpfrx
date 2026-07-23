@@ -1,3 +1,289 @@
+## 2026-07-22 — #6350: fold two test-only revert-guard nits into #6236 PR-1
+
+- **Timestamp**: 2026-07-22 (fix/6350-test-nits → refactor/6236-p1-dead-filter-fields)
+- **Action**: Two TEST-ONLY strengthenings on the #6236 PR-1 dead-field
+  deletion, plus a `_Log.md` union rebase onto master (#6348/#6349/#6261/
+  #6244/#6245 merged; only `_Log.md` conflicted, filter code untouched).
+  (1) `dscp_only_filter_does_not_imply_tx_selection` (new): restores the
+  DSCP-only tx-selection negative that the `thin_accessor_predicates`
+  rewrite dropped when the per-ifindex
+  `interface_filter_affects_tx_selection` helper was deleted. Compiles a
+  state whose ONLY input filter is a DSCP *match* (`from dscp 46`, no
+  forwarding-class / `then dscp` rewrite / counter / log / policer /
+  terminal action) and asserts `filter_state_has_input_tx_selection(&state,
+  false) == false`. Genuine fail-on-revert: temporarily OR-ing
+  `term.dscp_match_enabled` into the compiler's `affects_tx_selection`
+  predicate flips it RED (verified, then restored).
+  (2) `filter_state_struct_size_is_reported`: tightened the ceiling from the
+  pre-deletion `<= 736` (which passed even after a full revert) to `<= 496`,
+  the measured post-deletion `size_of::<FilterState>()`. `<=` not `==` so a
+  benign alignment shift does not false-RED, but re-adding any deleted field
+  (each >= 24 bytes → struct >= 520) breaks the ceiling. Printed `size_of`
+  evidence line retained; comment now says it is a revert guard.
+- **Validation**: `cargo test --release -- --test-threads=1` full suite green
+  (4129 + 60 + 8 + 22 + 1 passed, 0 failed) incl. both new/changed tests;
+  measured `FilterState size_of = 496 bytes`. No production code changed.
+- **File(s)**: userspace-dp/src/filter/tests.rs
+
+## 2026-07-22 — #6236 PR-1: delete 8 grep-proven-dead FilterState fields
+
+- **Timestamp**: 2026-07-22 (refactor/6236-p1-dead-filter-fields)
+- **Action**: Pure-deletion refactor removing eight dead fields from
+  `FilterState` (`userspace-dp/src/filter/mod.rs`) plus their compiler writes.
+  This is PR-1 of the two-PR #6236 plan (`docs/research/6236-filterstate-
+  typed-hooks/plan.md` §3a/§5/§10); it advances but does NOT close #6236 —
+  PR-2 (the input property-set → `Filter`-flag convergence + single-lookup
+  call-site fold) stays in research per the plan-review. Deleted: the four
+  per-interface `"family:name"` name maps `iface_filter_v4` / `iface_filter_v6`
+  / `iface_filter_out_v4` / `iface_filter_out_v6` (`FxHashMap<i32,String>`,
+  zero production readers — one test read each at most); the two input
+  `iface_filter_v{4,6}_affects_tx_selection` sets (`FxHashSet<i32>`, read only
+  by the test-only helper `interface_filter_affects_tx_selection`, itself
+  deleted); and the two `lo0_filter_v{4,6}` qualified-key `String`s, which were
+  compiler intermediates only (used to derive `lo0_filter_v{4,6}_fast`) and are
+  now lifted to compiler locals `lo0_filter_v{4,6}_key`. The struct retains the
+  six `_fast` maps + two lo0 `_fast` Options, the three registries, and all six
+  aggregate booleans (`has_input_tx_selection_*`, `has_output_tx_selection_*`,
+  `has_input_three_color_policer_*`). The LIVE output `iface_filter_out_v{4,6}_
+  needs_tx_eval` sets and the six live input property sets (`_affects_route_
+  lookup`, `_has_dscp_match`, `_has_per_packet_l4_match`) are UNTOUCHED — they
+  are PR-2 scope. Net: **31 → 23 fields**. Files: `filter/mod.rs` (struct),
+  `filter/compiler.rs` (dropped four name-map `.insert`s + two dead-set
+  `.insert`s + lifted lo0 keys to locals), `filter/engine/tx_selection.rs`
+  (deleted the test-only helper), `filter/engine/mod.rs` (dropped its
+  re-export), `filter/tests.rs` (rewrote the two tests that read deleted fields
+  to read the retained fast maps + aggregate; added a `size_of::<FilterState>()`
+  evidence test), `filter/README.md` (#3296 section documents the removal).
+  CRITICAL: the #3296 `MissingFilterRef` fail-closed guards are byte-for-byte
+  unchanged — deleting a name-map `.insert` never touched the `filters.get()`
+  presence check that precedes it, and the retained `has_input_tx_selection_*`
+  aggregate writes are preserved.
+- **Validation**: `cargo build --release` green (exit 0). `cargo clippy
+  --release --all-targets` — the ONLY error is a pre-existing deny-by-default
+  `mut_from_ref` in the UNTOUCHED `afxdp/umem/mmap.rs:150` (`slice_mut_unchecked`
+  is byte-identical on origin/master; no toolchain pin, clippy 1.96.0); my diff
+  introduces ZERO new clippy findings in `filter/`. Plain-build warning count
+  is 176 on master → **175** on this branch (one FEWER — the deleted
+  `interface_filter_affects_tx_selection` re-export). Full `cargo test --release
+  -- --test-threads=1` GREEN from the crate root (disk target
+  `/home/ps/.cache/xpf-cargo-6236p1`, `TMPDIR=/tmp`): **4219 passed, 0 failed,
+  2 ignored** (4128 + 60 + 8 + 22 + 1), REAL cargo exit 0. `size_of::
+  <FilterState>` measured **736 → 496 bytes** (−240; matches the plan estimate)
+  via `filter_state_struct_size_is_reported`. Behavior-preservation proof:
+  (a) independent grep on origin/master shows each of the 8 fields has zero
+  production readers (name maps + lo0 strings = compiler-write + test-read only;
+  the two `_affects_tx_selection` sets read only by the deleted test-only
+  helper); (b) full suite green with the tx_selection helper's test callers
+  rewritten against the retained `filter_state_has_input_tx_selection` aggregate.
+  Fail-on-revert: the retained aggregate wiring is bound by the existing
+  `parse_filter_state_prequalifies_interface_and_lo0_filter_keys` (asserts
+  `has_input_tx_selection_v4`) and `thin_accessor_predicates` (asserts
+  `filter_state_has_input_tx_selection`) — neutralizing the kept
+  `state.has_input_tx_selection_v4 = true;` compiler line drives both RED
+  (verified).
+- **File(s)**: `userspace-dp/src/filter/mod.rs`,
+  `userspace-dp/src/filter/compiler.rs`,
+  `userspace-dp/src/filter/engine/tx_selection.rs`,
+  `userspace-dp/src/filter/engine/mod.rs`,
+  `userspace-dp/src/filter/tests.rs`, `userspace-dp/src/filter/README.md`
+
+## 2026-07-22 — #6261: outline rare ARP/NDP learn/program off the pre-cache RX stage
+
+- **Timestamp**: 2026-07-22 (refactor/6261-outline-arp-ndp)
+- **Action**: Behavior-preserving codegen/layout refactor. The ARP-reply
+  and NDP-NA learn-and-program tails inside the inline hot stage
+  `stage_link_layer_classify` (validation gates, #2370 logical-ifindex
+  resolve, #4475 Override read-before-write, #3048 change-detecting
+  `insert_if_changed`, #5288-limited synchronous kernel-neighbor program)
+  were extracted into two dedicated `#[cold] #[inline(never)]` handlers,
+  `outline_arp_reply_learn_and_program` and
+  `outline_ndp_na_learn_and_program`. The `classify_arp` /
+  `parse_ndp_neighbor_advert` parser probes and the EtherType classifier
+  stay inline; the ordinary (non-ARP/NDP) fast path is byte-for-byte
+  unchanged. Gate ordering (insert_if_changed → should_program →
+  add_kernel_neighbor), ARP-recycle vs NDP-continue dispositions, and the
+  `learn_ifindex` (now inlined into each handler) logic are identical to
+  the pre-#6261 inline block. No pending neighbor-generation fix was
+  hidden or reordered — the `mac_change_epoch` / limiter sequence is
+  preserved and made explicit in the handler doc comments. `#[cold]` is a
+  layout hint only; flood bounding stays with the #5288 limiter.
+- **File(s)**: userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_stages_tests.rs (added
+  `outlined_arp_ndp_handlers_still_learn_and_program_6261`),
+  userspace-dp/src/afxdp/README.md
+- **Validation**: `cargo build` clean; targeted + full cargo suite green
+  (existing ARP/NDP learn/change/own-IP/override/limiter tests are the
+  behavior-preserving gate; new #6261 test asserts both outlined handlers
+  still learn under the logical ifindex and preserve dispositions).
+
+## 2026-07-22 — #6245: report binding-setup failures explicitly in WorkerStartupReport
+
+- **Timestamp**: 2026-07-22 (fix/6245-explicit-binding-failures)
+- **Action**: Make a worker's one-shot binding setup report bind failures
+  EXPLICITLY instead of only by OMISSION. Pre-#6245 a failed slot was simply
+  absent from `WorkerStartupReport.bound_slots` (`worker_loop_setup` logged +
+  mutated `BindingLiveState.last_error` and dropped the binding), so the
+  readiness barrier could prove `bound != planned` but not the cause. Added
+  three types in `afxdp/types/runtime.rs`: `BindingSetupPhase`
+  (`Private`/`SharedFallback` + `as_str`), `BindingSetupFailure`
+  (`{ slot, phase, reason }`), `BindingRecoveredFallback` (`{ group, reason }`);
+  extended `WorkerStartupReport` with `binding_failures` +
+  `recovered_fallbacks`. `worker_loop_setup` (`loop_body/setup.rs`) now captures
+  the slot before the moved bind call, pushes a `BindingSetupFailure` on the
+  private-bind `Err` arm, threads two accumulators into
+  `fallback_shared_group_to_private` (`worker/mod.rs`) — which records a
+  terminal `SharedFallback` failure per slot whose private fallback also fails,
+  or a `BindingRecoveredFallback` when the whole group recovers — and sorts both
+  (failures by slot, fallbacks by group) before returning. `worker_loop`
+  (`loop_body/mod.rs`) carries them into the report. The barrier
+  (`coordinator/reconcile/bringup.rs`) retains the full report per worker,
+  keeps `bound == planned` as the readiness criterion, and renders the explicit
+  cause into the fail-closed stage via `render_binding_setup_failures`
+  (`...:failures=[private:slot=1:<reason>]`; empty →
+  `failures=[no-explicit-failure]`). Success path behavior-identical (both vecs
+  empty). Docs: `coordinator/README.md` #6245 paragraph + `worker/README.md`
+  setup row.
+- **File(s)**: `userspace-dp/src/afxdp/types/runtime.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/setup.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/mod.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/README.md`,
+  `userspace-dp/src/afxdp/worker/README.md`.
+- **Validation**: `cargo build` green. `cargo test --release` new tests green —
+  `worker_bind_incomplete_report_carries_explicit_failure_6245` (extends the
+  `force_worker_bind_incomplete` stub to emit a matching explicit failure;
+  asserts the stage carries `failures=[private:slot=1:...]` + the owned reason,
+  end-to-end report->barrier->stage without CAP_NET_ADMIN) and
+  `bringup::tests_6245::render_binding_setup_failures_is_deterministic` (pure
+  renderer). Existing `post_spawn_inthread_bind_failure_fails_closed_5143` still
+  green. Fail-on-revert: reverting the barrier's explicit-cause append to the
+  pre-#6245 `bound=N:planned=M` stage makes the e2e test ASSERTION-fail
+  (`got "worker_bind_incomplete:0:bound=0:planned=1"`), restored → green.
+
+## 2026-07-22 — #6245 rebase: compose explicit binding-failures onto #6244 typed stage
+
+- **Timestamp**: 2026-07-22 (fix/6245-explicit-binding-failures, rebased on
+  origin/master after #6244 merged)
+- **Action**: Re-integrate #6245 on top of #6244's typed `ReconcileStage`.
+  #6244 changed the fail-closed reconcile stage from a free-form `String` to a
+  typed enum whose legacy operator string is produced in EXACTLY one place —
+  `ReconcileStage`'s `Display`. Composed #6245's explicit per-slot failures
+  onto that foundation instead of reverting either PR: (1) added a
+  `failures: Vec<BindingSetupFailure>` field to `WorkerBindShortfall`
+  (`reconcile/stage.rs`); (2) MOVED `render_binding_setup_failures` (and its
+  deterministic-renderer unit test) from `bringup.rs` INTO `stage.rs`, where
+  the `WorkerBindIncomplete` `Display` arm now appends
+  `:{render_binding_setup_failures(&shortfall.failures)}` for the partial-bind
+  (`Some`) case — byte-identical to #6245's original barrier string
+  `worker_bind_incomplete:<id>:bound=<n>:planned=<m>:failures=[...]`; the
+  timeout (`None`) case keeps the pre-#6245 counts-only string (no reported
+  cause to attribute); (3) the barrier now builds the typed
+  `WorkerBindShortfall { ..., failures: report.binding_failures.clone() }` off
+  the retained per-worker `report_by_worker` map (empty failures for the
+  no-report/timeout case); (4) updated the byte-identical Display test's
+  `WorkerBindIncomplete` expectations (the one variant that intentionally
+  changes per #6245) and the e2e test's typed-stage assertions
+  (`ReconcileError::WorkerBindIncomplete(ReconcileStage::WorkerBindIncomplete)`
+  + `last_reconcile_stage.to_string()` for the substring checks).
+- **File(s)**: `userspace-dp/src/afxdp/coordinator/reconcile/stage.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`, `_Log.md`.
+- **Validation**: `cargo build` green; `cargo test --release` green including
+  `worker_bind_incomplete_report_carries_explicit_failure_6245` and
+  `reconcile_stage_renders_byte_identical_legacy_strings`. Fail-on-revert:
+  dropping the `Display` failures-append flips the #6245 e2e test RED.
+
+## 2026-07-22 — #6244: typed reconcile progress replaces last_reconcile_stage string
+
+- **Timestamp**: 2026-07-22 (fix/6244-typed-reconcile-progress)
+- **Action**: Replace the mutable free-form
+  `Coordinator::last_reconcile_stage: String` side-channel with a typed
+  `ReconcileStage` enum (new `userspace-dp/src/afxdp/coordinator/reconcile/
+  stage.rs`). One variant per progress step (Idle/Start/NoSnapshot/Planned/
+  ReplayedSynced/Spawned) and per failure identity (MissingPin/OpenMapFailed/
+  SnapshotIntegrityError{,Detail}/SpawnWorkerFailed/WorkerBindIncomplete, plus
+  sub-types `MandatoryPin` and `WorkerBindShortfall`). The legacy operator
+  string is produced in exactly ONE place — the enum's `Display` — and is
+  rendered ONLY at the `reconcile_debug` / wire `debug_reconcile_stage`
+  boundary (`status.rs`) and inside `ReconcileError`'s `Display`; every legacy
+  string is preserved byte-for-byte. `ReconcileError::{MapSetup,WorkerSpawn,
+  WorkerBindIncomplete}` and `WorkerBringUpError::{Spawn,BindIncomplete}` now
+  carry the typed `ReconcileStage` (was a cloned stage `String`), so a failure
+  identity can no longer be reinterpreted as informal success text. Applied
+  amendment option B: the `"stopped"` write moved OUT of `stop_inner` (called
+  mid-reconcile by `tear_down` and the bring-up fail path) into the explicit
+  `stop`/`stop_with_event_stream` entry points, eliminating the bring-up
+  overwrite-then-restore dance while preserving observable behavior (the
+  transient stop-write mid-reconcile was never externally observed). Scope:
+  types the STAGE (transaction channel); underlying error payloads stay
+  `String` (deeper typing is sibling #6243/#6245). Control-plane / status only
+  — no packet-path, atomics, locks, or trait objects.
+- **Validation**: `cargo build` green (crate root, disk target). Full
+  `cargo test --release -- --test-threads=1` — see run below. Added
+  fail-on-revert `reconcile_stage_renders_byte_identical_legacy_strings`
+  (stage.rs) asserting every variant's legacy render; perturbing
+  `NoSnapshot`'s `Display` (`no_snapshot` → `no_snapshot_PERTURBED`) flips it
+  RED (`left: "no_snapshot_PERTURBED", right: "no_snapshot"`), restored GREEN.
+  Converted the existing exact/prefix/contains stage tests
+  (`coordinator/tests.rs`, `server/tests.rs`) to typed `matches!` assertions
+  PLUS byte-identical legacy-render assertions.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/stage.rs (new),
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/server/tests.rs,
+  docs/userspace-dataplane-architecture.md
+
+## 2026-07-22 — #6232: scope-complete Rust heatmap classifier + enforced drift gate
+
+- **Timestamp**: 2026-07-22 (fix/6232-heatmap-audit)
+- **Action**: The committed modularity heatmap
+  (`docs/refactoring-audit-current.txt`) was stale AND scope-inaccurate —
+  `make audit-check` exited non-zero on master, and the generator counted
+  whole-file Rust test modules (`tests_pool.rs`, `tests_support.rs`,
+  `tests_destination.rs`, `tests_bind_forward.rs`, ...) as production,
+  producing false `[REFACTOR]`/`[WATCH]` rows. Root cause: `SKIP_RE`
+  excluded `tests.rs` / `*_tests.rs` / three hand-listed `test_*.rs`
+  files, but not the generic `tests_*.rs` / `test_*.rs` sibling
+  `#[path] mod` test modules introduced by the #4840/#4409 test splits.
+  Fix: (1) moved the exclusion regex + LOC measurement into a shared
+  single-source-of-truth library `scripts/refactoring-audit-lib.sh`
+  (`$AUDIT_SKIP_RE`, `audit_loc`), adding anchored patterns for all four
+  Rust test filename shapes; the generator now sources it. (2) Added a
+  thin CLI `scripts/refactoring-audit-classify.sh` (`classify`/`loc`) so
+  a Go test can exercise the same classifier. (3) Regenerated the
+  heatmap — 8 test files dropped, 48 production-only rows remain
+  (verified all test-named `.rs` in the tree are `#[cfg(test)]`-gated).
+  (4) Added the `pkg/refactoraudit` enforcement canary
+  (`TestHeatmapNotStale` byte-diffs the regenerated heatmap;
+  `TestClassifierFilenameShapes` pins positive/negative/anchoring cases;
+  `TestProductionSentinelVisible` keeps the >=2000 LOC
+  `poll_descriptor/mod.rs` visible and asserts no test file leaks;
+  `TestInlineTestBlockNotStripped` pins the raw-LOC / no-inline-strip
+  invariant). Because it is an ordinary Go test it runs under
+  `go test ./...` inside the required `make test` aggregate, so the
+  artifact can no longer silently drift on master. Updated
+  `docs/refactoring-audit.md` and the `Makefile` audit-check comment.
+- **Validation**: `make audit-check` green; `go test ./pkg/refactoraudit`
+  4/4 PASS; gofmt clean; `go vet ./pkg/refactoraudit` clean; shellcheck
+  clean on the three scripts. FAIL-ON-REVERT demonstrated: perturbing a
+  LOC number (7168→9999) in the committed heatmap turns BOTH
+  `make audit-check` (exit 2) and `TestHeatmapNotStale` (FAIL) RED;
+  restoring returns GREEN. Class A tooling/docs — no dataplane or codegen
+  change, no cluster smoke needed.
+- **File(s)**: scripts/refactoring-audit-lib.sh (new),
+  scripts/refactoring-audit-classify.sh (new), scripts/refactoring-audit.sh,
+  docs/refactoring-audit-current.txt, docs/refactoring-audit.md, Makefile,
+  pkg/refactoraudit/doc.go (new),
+  pkg/refactoraudit/audit_canary_test.go (new)
+
 ## 2026-07-22 — #4976: build-time ABI check for the libxdp ring mirror
 
 - **Timestamp**: 2026-07-22 14:00 PDT (fix/4976-build-abi-check)
@@ -56558,3 +56844,386 @@ top.
   cos/mod.rs, cos/cross_binding.rs, cos/queue_service/mod.rs,
   cos/cross_binding_tests.rs (two fail-on-revert alloc tests — one per
   to_vec site), cos/README.md (allocation-cohort note).
+## 2026-07-22 — #6234 server/helpers split (audit-183 cohort)
+- **Action**: Convert `server/helpers.rs` (1.4k-line cold-path grab-bag) into a
+  `server/helpers/` directory module; extract HA session-sync reconstruction
+  into `session_sync.rs`. Pure code-motion, bodies byte-for-byte identical;
+  `mod.rs` re-exports so all `server::helpers::<name>` call sites are unchanged.
+- **File(s)**: server/helpers.rs -> server/helpers/mod.rs (git mv);
+  server/helpers/session_sync.rs (new). Build: userspace-dp cargo build green.
+
+- **Action**: #6234 increment 2 — extract binding/queue planning into
+  `server/helpers/planning.rs` (settle predicates, canonical plan-key hashing,
+  RX-queue/binding replanner kept as one correctness unit per server/README).
+  Pure code-motion; explicit imports replace the crate-root glob. mod.rs
+  re-exports `planning::*`; dropped now-unused sha2/std::io imports from mod.rs.
+- **File(s)**: server/helpers/planning.rs (new), server/helpers/mod.rs.
+  Build: userspace-dp cargo build green, no new warnings in helpers/.
+
+- **Action**: #6234 increment 3 — extract state-file persistence into
+  `server/helpers/persistence.rs` (OwnedStatePayload, build_state_payload,
+  lock-free write_state, and the #5469 pre-persist lock probe). Pure
+  code-motion; explicit imports; mod.rs re-exports `persistence::*`.
+- **File(s)**: server/helpers/persistence.rs (new), server/helpers/mod.rs.
+  Build: userspace-dp cargo build green, no new warnings in helpers/.
+
+- **Action**: #6234 increment 4 (final) — extract status projection into
+  `server/helpers/status.rs` (refresh_status + should_run_afxdp,
+  reconcile_status_bindings, set_bindings_forwarding_armed,
+  forwarding_unsupported_error); reduce `helpers/mod.rs` to a 30-line
+  re-export facade. Replacing the crate-root glob exposed 3 now-dead
+  feeder imports in main.rs (SyncedSessionEntry, Serialize, Instant) —
+  removed — and one BTreeMap import consumed only by main_tests.rs via
+  `use super::*` — relocated into main_tests.rs. Updated server/README.md
+  to describe the helpers/ submodule layout.
+- **File(s)**: server/helpers/status.rs (new), server/helpers/mod.rs,
+  main.rs, main_tests.rs, server/README.md.
+- **Validation**: PURE CODE-MOTION (Class A). Full bin cargo test suite
+  green run serially: 4121 passed, 0 failed. Targeted: server:: 89 passed
+  (incl. write_state_releases_lock_before_persist #5469); the tests::
+  superset 3487 passed (incl. binding_plan/planning + session-sync);
+  3 integration binaries 31 passed. Build green, warnings 176->175 (net
+  cleanup, 0 new in helpers/). The full PARALLEL run starves a
+  pre-existing WG concurrency test (afxdp::wg::engine::engine_internal_tests,
+  skb_wait_for_more_packet); it passes in isolation (24/0) and my diff
+  adds no test/socket/WG code — unrelated known flake (#6157/#6294/#6279).
+## 2026-07-22 — #5650 forwarding/mod.rs hot-path-preserving split (PR)
+- **Timestamp**: 2026-07-22
+- **Action**: Pure code-motion split of userspace-dp forwarding/mod.rs
+  (2868 LOC / 81 free fns) into 9 cohesive submodules under forwarding/.
+  Functions moved VERBATIM; no logic/signature/hot-path change; #[inline]
+  preserved exactly (2 total: is_ipsec_traffic→ipsec.rs, zone_pair_ids_*
+  stays in mod.rs). pub(super) → pub(in crate::afxdp) with mod.rs glob
+  re-exports so all external call sites resolve unchanged. Two private
+  helpers (select_route_next_hop, ecmp_hash_flow_seeded) promoted to
+  pub(in crate::afxdp) because forwarding/tests.rs (a sibling of fib)
+  calls them. PbrRejectSink struct fields also promoted so the external
+  poll_descriptor constructor still compiles. mod.rs 2868 → 143 LOC.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/{mod.rs, fib.rs,
+  fabric.rs, nat.rs, ha.rs, mss.rs, ipsec.rs, pbr.rs, local_delivery.rs,
+  tunnel.rs}; forwarding/README.md; docs/fabric-cross-chassis-fwd.md;
+  docs/userspace-native-gre-plan.md; docs/host-inbound-service-matrix.md;
+  docs/flow-cache-simplification.md; CLAUDE.md (fabric path pointer).
+- **Layout**: fib.rs 1021 (FIB resolve/ECMP/next-hop), fabric.rs 492,
+  ha.rs 235, mss.rs 203, nat.rs 201, local_delivery.rs 192, tunnel.rs
+  174, pbr.rs 163, ipsec.rs 112.
+- **Validation**: cargo build clean (0 errors; 175 pre-existing warnings,
+  unchanged from baseline). Diff touches ONLY forwarding/*.rs. fn count
+  81→81; #[inline] 2→2. Full cargo test --release suite green (parent
+  runs the loss-cluster iperf smoke before merge).
+## 2026-07-22 — #6314: join the neighbor warmer aux thread at teardown
+- **Action**: Make the #1636 neighbor WARMER consistent with its two
+  #5165-hardened siblings (monitor + resolver). Retain the warmer's
+  JoinHandle (`warm_join`, no longer `.ok()`-discarded), log spawn
+  failures instead of swallowing them, and deterministically JOIN the
+  warmer at teardown via `stop_and_join_warmer` (signal `warm_stop` +
+  drop the producer + join). Fail-on-revert test
+  `neighbor_warmer_joined_at_teardown_6314` (target-count 1, RED by
+  assertion under the drop-only teardown). Full Rust suite green; named
+  test 3x no-flake.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/neighbor_manager.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/README.md
+## 2026-07-22 — #4839 protocol.go wire-protocol god-file split
+- **Action**: Pure code-motion split of the 3,156-line
+  pkg/dataplane/userspace/protocol.go wire-protocol monolith into 11
+  cohesive per-domain sibling files in the same userspace package. No
+  rename, no logic change, all json tags preserved byte-identical
+  (verified: sorted non-blank code-line multiset identical to
+  origin/master). protocol.go reduced 3,156 -> 368 lines. One commit
+  per extracted file; each builds. Updated the ProcessStatus
+  source-AST canary (retirement_boundary_canary_test.go) to follow
+  ProcessStatus into protocol_status.go, and two living module docs
+  (userspace-dataplane-architecture.md SlowPathStatus,
+  config-schema.md FirewallTermSnapshot) to point at the new files.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/protocol_nat.go,
+  pkg/dataplane/userspace/protocol_cos.go,
+  pkg/dataplane/userspace/protocol_zones.go,
+  pkg/dataplane/userspace/protocol_tunnels.go,
+  pkg/dataplane/userspace/protocol_routes.go,
+  pkg/dataplane/userspace/protocol_policies.go,
+  pkg/dataplane/userspace/protocol_status.go,
+  pkg/dataplane/userspace/protocol_counters.go,
+  pkg/dataplane/userspace/protocol_binding.go,
+  pkg/dataplane/userspace/protocol_ha.go,
+  pkg/dataplane/userspace/protocol_events.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/userspace-dataplane-architecture.md, docs/config-schema.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5661 (Go control-plane modularity cohort) — pure
+  code-motion split of the two over-threshold low-risk files. On current
+  origin/master the four candidate low-risk files measure: rules.go 1534,
+  tunnel.go 2048, agent.go 2143, cli_show_flow.go 1272 prod LOC. Only
+  tunnel.go and agent.go exceed the ~2000-prod-LOC threshold, so only
+  those two were split (rules.go and cli_show_flow.go left untouched).
+  tunnel.go 2048 -> 1362: WireGuard TUN lifecycle to
+  tunnel_wireguard.go, keepalive runner to tunnel_keepalive_runner.go.
+  agent.go 2143 -> 1737: ASN.1 BER codec + OID helpers to agent_ber.go.
+  Byte-identical moves, no renames, no logic change; go build ./... +
+  go test ./pkg/routing/... ./pkg/snmp/... green, gofmt clean. HA files
+  (daemon/vrrp/cluster) explicitly NOT touched — tracked separately.
+- **File(s)**: pkg/routing/tunnel.go, pkg/routing/tunnel_wireguard.go,
+  pkg/routing/tunnel_keepalive_runner.go, pkg/snmp/agent.go,
+  pkg/snmp/agent_ber.go, pkg/routing/README.md, pkg/snmp/README.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6308 (WG transit-egress TX DISPATCH SSOT — follow-up to
+  #5292/#6306) — the AF_XDP WireGuard transit-egress DISPATCH selected the
+  egress NIC from the zeroed-endpoint resolution's tx_ifindex/egress_ifindex
+  (#2837 stores tx_ifindex=0 / egress=logical wgN). With a default route in
+  the WG transport table tx_ifindex>0 resolves to the physical WAN parent and
+  dispatch works (common case). With ONLY a specific peer route and NO default,
+  tx_ifindex=0 → resolve_tx_binding_ifindex(logical wgN) returned the logical
+  ifindex (no XSK binding) → the TX dispatcher NO_EGRESS_BINDING-DROPPED a frame
+  #5292 built correctly. Fix: resolve the physical underlay egress against the
+  SAME selected-peer route #5292 uses for the frame bytes
+  (wg_transit_egress_physical_egress_ifindex → wg_peer_outer_dst →
+  outer_physical_egress_resolution → outer_egress_ifindex_or_fallback), fed
+  through resolve_forward_target_ifindex → resolve_tx_binding_ifindex — so
+  dispatch and bytes agree on one physical NIC. The peer-route resolution runs
+  ONLY on the tx_ifindex==0 (previously-dropped) path; default-route WG traffic
+  and every non-WG forward keep the zero-extra-work tx_ifindex>0 fast path.
+  RED-on-revert (assertion, target-count 1): reverting the WG dispatch
+  resolution to resolve_tx_binding_ifindex(logical) makes
+  wg_transit_egress_dispatch_specific_peer_no_default_6308 fail with left=400
+  (logical wgN) vs right=6 (reth0.80 physical parent). Full cargo suite green:
+  4124 + 60 + 8 + 22 + 1, 0 failed; named test 3x clean.
+- **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/forward_request.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs,
+  userspace-dp/src/afxdp/frame/README.md, docs/wireguard-interop.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: Fold #6340 into #6308 PR — dispatch peer selection follows the
+  POST-NAT dst (close the #6308 DNAT SSOT hole). #6308 resolved the dispatch
+  egress by selecting the WG peer from the inner-dst AllowedIPs LPM, but at the
+  dispatch site (resolve_forward_target_ifindex) the frame in hand is the
+  PRE-NAT ingress frame while wg_encap_frame selects its peer from the POST-NAT
+  frame (build_forwarded_frame_into_from_frame writes nat.rewrite_dst into `out`
+  via apply_nat_ipv4/6, THEN wg.rs reads inner_dst_ip(&out)). Under a DNAT
+  rewriting the inner dst ACROSS two AllowedIPs peers on DISTINCT physical
+  underlays (no default route → tx_ifindex==0), the #6308 dispatch targeted the
+  PRE-NAT peer's NIC while the bytes carried the POST-NAT peer's L2 — a wire
+  mismatch (dispatch and bytes disagree on the physical NIC). Not a #6308
+  regression (that edge already dropped pre-#6308) but the SSOT thesis
+  "dispatch and bytes agree on ONE physical NIC" must hold unconditionally.
+  Fix: wg_transit_egress_physical_egress_ifindex now keys the peer selection on
+  decision.nat.rewrite_dst (the post-DNAT dst) when a same-family DNAT applies,
+  else the frame's parsed inner dst — the SAME key wg_encap_frame reads from
+  `out`. NAT64 (nat.nat64) is excluded (address-family change → neither
+  rewrite_dst nor the pre-NAT frame dst is a valid same-family AllowedIPs key):
+  returns None → the conservative logical-ifindex fallback (fail-closed; a
+  NAT64→WG transit flow is undeliverable on this path regardless). NatDecision
+  fields used: rewrite_dst: Option<IpAddr> (post-DNAT dst) and nat64: bool
+  (nat/mod.rs:91-99), reached via SessionDecision.nat (session/entry.rs:13).
+  RED-on-revert (assertion): neutralizing the rewrite_dst selection (revert the
+  fold → parse the pre-NAT frame) makes wg_transit_egress_dispatch_follows_post_
+  nat_peer_6308 fail with left=Some(12) (pre-NAT peer A / reth0.80) vs
+  right=Some(13) (post-NAT peer B / reth0.50). Original parent-RED still holds:
+  reverting the #6308 dispatch resolution makes
+  wg_transit_egress_dispatch_specific_peer_no_default_6308 fail left=400 vs
+  right=6. Full cargo --release suite green: 4216 passed, 0 failed; named tests
+  3x clean.
+- **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/frame/README.md, docs/wireguard-interop.md
+- **Action**: #5661 (Go control-plane modularity cohort) — pure
+  code-motion split of pkg/cluster/sync_conn.go (2228 lines, ~1595 prod
+  LOC, over the ~2000 threshold). Extracted five cohesive sibling files
+  in the same package pkg/cluster, verbatim (no rename, no logic/timing
+  change, no goroutine/defer/lock reordering — critical for HA session
+  sync): sync_conn_gen.go (session generation guards + synced-session
+  apply), sync_conn_sweep.go (incremental sync sweep), sync_conn_write.go
+  (send/queue/delete-journal), sync_conn_config.go (config replication),
+  sync_conn_read.go (receive/dispatch). sync_conn.go now 617 lines
+  (connection lifecycle: dial/accept/install/start/stop/disconnect).
+  Verified all 63 declaration bodies byte-identical vs origin/master.
+  go build ./... + go test ./pkg/cluster/... green, go vet clean, gofmt
+  clean. HA session-sync code — parent runs loss-cluster test-failover
+  before merge.
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_conn_gen.go,
+  pkg/cluster/sync_conn_sweep.go, pkg/cluster/sync_conn_write.go,
+  pkg/cluster/sync_conn_config.go, pkg/cluster/sync_conn_read.go,
+  pkg/cluster/README.md
+## 2026-07-22 — #6247 afxdp/ha.rs ownership split (pure code-motion)
+- **Timestamp**: 2026-07-22
+- **Action**: Split the 1035-line `userspace-dp/src/afxdp/ha.rs` HA control
+  module into a `ha/` directory with four cohesive owner submodules
+  (byte-exact code motion, no logic/signature/ordering change). Preserves
+  the ordered-import invariant, export/tunnel-purge lock phasing, and the
+  RG-epoch-before-runtime publication ordering. 5 incremental commits, each
+  builds; branch `refactor/6247-afxdp-ha-split`.
+    - `ha/state.rs`   — update_ha_state, handle_activated_rgs, ha_groups,
+      last_cache_flush_at
+    - `ha/export.rs`  — kick_owner_rg_export, snapshot_all_sessions_export,
+      AllSessionsExport / OwnerRgExportWait handle types,
+      drain_session_deltas_from_live (widened private->pub(crate) so the
+      relocated characterization test can name it via the ha re-export)
+    - `ha/session_import.rs` — synced_import_cap, upsert_synced_session,
+      delete_synced_session[_gen], test_install_local_forward_session
+    - `ha/tunnel_purge.rs`   — purge_remapped_tunnel_sessions,
+      push_purge_close_deltas
+    - `ha/mod.rs` — narrow facade: submodule decls, pub(crate) re-exports of
+      the export handle types (afxdp/mod.rs `self::ha::OwnerRgExportWait` /
+      `AllSessionsExport` resolve unchanged), cfg(test) drain re-export, and
+      the `#[path="../ha_tests.rs"]` test include. Retains a documented
+      `#[allow(unused_imports)] use super::*` so the ha_tests child module's
+      `use super::*` resolves the afxdp namespace exactly as before.
+  Verbatim verified: non-blank code-line multiset identical to the original
+  (0 missing; only 4 extra structural `}` for the 4 new impl blocks).
+  #[inline]/#[cold]: 0 in original, 0 lost. mod.rs prod-LOC 1035 -> 21.
+- **File(s)**: userspace-dp/src/afxdp/ha/{mod,state,export,session_import,
+  tunnel_purge}.rs (new), userspace-dp/src/afxdp/ha.rs (removed),
+  userspace-dp/src/afxdp/mod.rs (drop stale #[path]),
+  docs/fabric-cross-chassis-fwd.md, docs/session-sync-architecture.md
+  (live-doc path references afxdp/ha.rs -> new submodule paths).
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 pure code-motion split of event_stream/mod.rs — extract
+  wall-clock conversion into event_stream/clock.rs (NS_PER_SEC +
+  read_mono_and_wall_clocks + monotonic_ns_to_unix_ns/_secs/_secs_subnanos +
+  mono_ns_to_wall_clock_unix_ns, verbatim). mod.rs re-exports the pub(crate)
+  clock fns so callers (afxdp/event_emit.rs, tests) resolve unchanged. Build
+  green.
+- **File(s)**: userspace-dp/src/event_stream/clock.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract WriteBacklog + WRITE_BACKLOG_MAX_BYTES into
+  event_stream/backlog.rs (verbatim, cursor-backed geometric-compaction backlog,
+  #[inline] preserved on pending_len/is_empty/pending/compact_if_needed). Struct,
+  methods, and compacted_bytes test field widened private->pub(super) so callers
+  (mod.rs connected loop/drain, write_backlog tests) resolve unchanged. mod.rs
+  re-imports both names. Build green.
+- **File(s)**: userspace-dp/src/event_stream/backlog.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract release_dataplane_event_queue_budget into
+  event_stream/budget.rs (verbatim; the I/O-thread queue-budget RETIREMENT side,
+  paired with producer.rs admission). Widened private->pub(super); mod.rs
+  re-imports it. Build green.
+- **File(s)**: userspace-dp/src/event_stream/budget.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract replay-buffer admission/eviction/retirement
+  (push_replay_frame, evict_replay_frame, pop_replay_frame,
+  release_replay_dataplane_event_queue_budget) into event_stream/replay.rs
+  (verbatim). Widened the three cross-module fns to pub(super); evict stays
+  private (only push calls it). Build green.
+- **File(s)**: userspace-dp/src/event_stream/replay.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract channel-drain mechanics (DrainOutcome,
+  drain_channel_into_write_buf, flush_pending_resync, drain_remaining) into
+  event_stream/drain.rs (verbatim, WRITE_BACKLOG_MAX_BYTES cap enforced there).
+  Widened to pub(super) incl DrainOutcome fields (tests assert them).
+  Consolidated mod.rs internal re-exports under #[allow(unused_imports)] (many
+  now serve only siblings/tests via `use super::*`). Build green.
+- **File(s)**: userspace-dp/src/event_stream/drain.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract control-frame decode + drain/resync state
+  machine (process_control_frames, handle_drain_request) into
+  event_stream/control.rs (verbatim; ACK-window #2959, Pause/Resume, DrainRequest
+  #2876/#2882/#2875). Widened to pub(super); MSG_*/FRAME_HEADER_SIZE codec
+  re-imports annotated (now serve siblings/tests). Build green.
+- **File(s)**: userspace-dp/src/event_stream/control.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract the I/O thread (io_thread_main, try_connect,
+  replay_buffered, write_all_backpressured, run_connected_loop) into
+  event_stream/connection.rs (verbatim; reconnect + replay + backpressured
+  connected loop). Widened cross-module fns to pub(super); try_connect stays
+  private. Removed orphaned I/O-thread section comment; annotated the now
+  submodule-only std imports (VecDeque/io/UnixStream/TryRecvError). Build green.
+- **File(s)**: userspace-dp/src/event_stream/connection.rs (new),
+  userspace-dp/src/event_stream/mod.rs
+
+- **Timestamp**: 2026-07-22
+- **Action**: #6235 split — extract RT_FLOW SESSION_CLOSE/CREATE projection
+  methods (emit_session_close_rt_flow, emit_session_create_rt_flow) into
+  event_stream/rt_flow.rs as a second impl EventStreamWorkerHandle block
+  (verbatim, pub(crate) methods unchanged). Made NS_PER_SEC pub(super) +
+  re-imported (rt_flow tests consume it via super::*). Removed orphan section
+  comment. Updated event_stream/README.md Files section for the new submodule
+  layout. Full cargo test --release: 4214 passed, 0 failed, 2 ignored. mod.rs
+  down to 733 lines (from 2001); all 4 #[inline] preserved, 0 #[cold].
+- **File(s)**: userspace-dp/src/event_stream/rt_flow.rs (new),
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/clock.rs,
+  userspace-dp/src/event_stream/README.md
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5661 split — pure code-motion of pkg/vrrp/instance.go (2925
+  prod LOC, over the 2000 threshold) into six cohesive sibling files in
+  package vrrp. Extracted, in six build-green increments (one commit each):
+  instance_addr.go (local IPv4/IPv6 + VIP-set resolution), instance_socket.go
+  (raw-socket lifecycle), instance_receive.go (RX receivers + AF_PACKET/IPv6
+  parse/enqueue), instance_send.go (advert/event send), instance_garp.go
+  (gratuitous-ARP/NA burst + gateway probe), instance_vip.go (netlink VIP
+  actuation + stale-VIP reconcile). Declarations moved VERBATIM — no exported
+  symbol renamed, no logic/timing/const change, no goroutine/defer/channel/
+  mutex reorder (whole functions moved intact). Verified pure motion: 94 decls
+  on origin/master == 94 decls across the 7 files, identical decl set, zero
+  bodies differ. Imports pruned by goimports; gofmt -l clean; go build ./...
+  green; go test ./pkg/vrrp/... green; instance.go now 1392 LOC. Updated
+  pkg/vrrp/README.md File-layout section + four inline symbol->file pointers
+  (receiverIPv6, sendPacketIPv6, parseAfPacket, netlink.AddrAdd). NOTE: the
+  full-suite canary TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports
+  fails PRE-EXISTING on the base commit (edf62745e, the #6338 sync_conn split)
+  — drift is entirely in pkg/cluster/sync_conn*.go allowlist entries, no vrrp
+  file imports pkg/dataplane; orthogonal to this change.
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/instance_addr.go (new),
+  pkg/vrrp/instance_socket.go (new), pkg/vrrp/instance_receive.go (new),
+  pkg/vrrp/instance_send.go (new), pkg/vrrp/instance_garp.go (new),
+  pkg/vrrp/instance_vip.go (new), pkg/vrrp/README.md
+## #5661 — daemon_apply.go pure code-motion split
+- **Timestamp**: 2026-07-22
+- **Action**: Split ~3095-line pkg/daemon/daemon_apply.go into 7 cohesive
+  sibling files (pure code motion; behavior/ordering/locking unchanged).
+  daemon_apply.go dropped to 412 lines. All moved declaration bodies are
+  byte-identical to origin/master (line-multiset diff = 0 except one
+  gofmt-mandated comment-indent normalization that master itself was not
+  clean on). Full build ./... green; go test ./pkg/daemon/... green;
+  gofmt -l empty.
+- **File(s)**: pkg/daemon/daemon_apply.go (edit),
+  pkg/daemon/daemon_apply_reset.go (new),
+  pkg/daemon/daemon_apply_commit.go (new),
+  pkg/daemon/daemon_apply_hostauth.go (new),
+  pkg/daemon/daemon_apply_dataplane.go (new),
+  pkg/daemon/daemon_apply_routing.go (new),
+  pkg/daemon/daemon_apply_interfaces.go (new),
+  pkg/daemon/daemon_apply_tail.go (new),
+  pkg/daemon/README.md (edit — config-apply file-layout note)
+- **Timestamp**: 2026-07-22
+- **Action**: #5661 split — pure code-motion split of pkg/daemon/daemon_run.go
+  (~2820 prod LOC → 836) into five cohesive sibling files in package daemon:
+  daemon_run_routehelpers.go (riMemberLinuxName, collectAppliedTunnels,
+  linkLocalV6Net, inferIPv6StaticNextHopInterfaces), daemon_run_shutdown.go
+  (applyCloseoutDrainTimeout, runShutdownSequence, runHAShutdownUpdate),
+  daemon_run_servers.go (six *CommitFn/*CommitConfirmedFn seams +
+  #5054/#5961 section comment, startGRPCServer, startHTTPServer,
+  resolveAPIBinds), daemon_run_bringup.go (initManagers,
+  loadAndBootstrapConfig, setupDataplaneAndInitialConfig, enableForwarding),
+  daemon_run_naming.go (setupInterfaceNaming, namingParamsFromConfig,
+  applyStartupNamingForConfig, maybeReapplyConfigArrivalNaming,
+  runBootstrapExitStartup). Declarations moved verbatim — no rename, reorder,
+  or logic change; startup-phase / shutdown ordering untouched.
+  buildRuntimeDataPlane deliberately KEPT in daemon_run.go (retirement-boundary
+  canary TestDaemonRuntimeEntryPointUsesRuntimeDataPlane requires the
+  dataplane.NewRuntimeDataPlane call there). Per-decl byte-identity check:
+  all 32 top-level decls unchanged. go build ./..., go test ./pkg/daemon/...,
+  and the pkg/dataplane canary all green; gofmt clean.
+- **File(s)**: pkg/daemon/daemon_run.go, pkg/daemon/daemon_run_routehelpers.go
+  (new), pkg/daemon/daemon_run_shutdown.go (new),
+  pkg/daemon/daemon_run_servers.go (new), pkg/daemon/daemon_run_bringup.go
+  (new), pkg/daemon/daemon_run_naming.go (new), pkg/daemon/README.md

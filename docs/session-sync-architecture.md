@@ -722,7 +722,7 @@ pre-computed NAT decision over the fabric — so before #4393 the standby held n
 could not steer the inbound embedded-ICMP error into the helper, so PMTUD
 blackholed for exactly the flows that survived the failover.
 
-- **Publish site:** `Coordinator::upsert_synced_session` (`afxdp/ha.rs`) calls
+- **Publish site:** `Coordinator::upsert_synced_session` (`afxdp/ha/session_import.rs`) calls
   `publish_dnat_table_entry` for every forward peer-synced entry, immediately
   after the `publish_shared_session` that populates the (also process-global)
   `shared_nat_sessions` reverse-NAT map. `dnat_table` is a **single shared BPF
@@ -734,7 +734,7 @@ blackholed for exactly the flows that survived the failover.
   node becomes active, and inbound SNAT-return traffic never reaches the standby,
   so an early entry is inert until failover. A reverse companion carries no
   source rewrite and publishes nothing.
-- **Release site:** `Coordinator::delete_synced_session_gen` (`afxdp/ha.rs`)
+- **Release site:** `Coordinator::delete_synced_session_gen` (`afxdp/ha/session_import.rs`)
   calls `delete_dnat_table_entry` alongside the session-map delete, keyed on the
   same `dnat_v4_key_bytes` / `dnat_v6_key_bytes` SSOT the publish used, so the
   delete byte-matches the insert. The maps are non-LRU `HASH`

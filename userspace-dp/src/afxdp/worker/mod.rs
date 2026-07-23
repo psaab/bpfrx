@@ -1136,7 +1136,18 @@ fn create_shared_binding_group(
     Ok(created.into_iter().map(|(binding, _)| binding).collect())
 }
 
-fn fallback_shared_group_to_private(err: SharedGroupBindError, bindings: &mut Vec<BindingWorker>) {
+// #6245: `binding_failures` / `recovered_fallbacks` accumulate the EXPLICIT
+// per-slot terminal failures and the recovered-degradation record so the
+// WorkerStartupReport can carry the cause. A shared-group bind that FAILS but
+// whose private fallback fully recovers is a `BindingRecoveredFallback` (all
+// slots rebound, readiness unaffected); a slot whose private fallback ALSO
+// fails is a terminal `BindingSetupFailure { phase: SharedFallback }`.
+fn fallback_shared_group_to_private(
+    err: SharedGroupBindError,
+    bindings: &mut Vec<BindingWorker>,
+    binding_failures: &mut Vec<BindingSetupFailure>,
+    recovered_fallbacks: &mut Vec<BindingRecoveredFallback>,
+) {
     let SharedGroupBindError {
         group_key,
         plans,
@@ -1145,8 +1156,13 @@ fn fallback_shared_group_to_private(err: SharedGroupBindError, bindings: &mut Ve
     let fallback_reason =
         format!("shared UMEM group {group_key} failed; using private UMEM: {reason}");
     eprintln!("xpf-userspace-dp: {fallback_reason}");
+    // #6245: track whether EVERY member slot recovered — only a fully recovered
+    // group is a `BindingRecoveredFallback` (a partially-recovered group has its
+    // failed slots recorded as terminal failures below, so it is not "recovered").
+    let mut all_slots_recovered = true;
     for mut plan in plans {
         let live = plan.live.clone();
+        let slot = plan.status.slot;
         let mode = plan.shared_umem.mode;
         plan.shared_umem = SharedUmemBindingPlan::disabled(mode, fallback_reason.clone());
         publish_shared_umem_plan_to_binding_status(&mut plan.status, &plan.shared_umem);
@@ -1155,9 +1171,21 @@ fn fallback_shared_group_to_private(err: SharedGroupBindError, bindings: &mut Ve
             Err(err) => {
                 let msg = format!("private fallback after shared UMEM failure failed: {err}");
                 eprintln!("xpf-userspace-dp: {msg}");
-                live.set_error(msg);
+                live.set_error(msg.clone());
+                binding_failures.push(BindingSetupFailure {
+                    slot,
+                    phase: BindingSetupPhase::SharedFallback,
+                    reason: msg,
+                });
+                all_slots_recovered = false;
             }
         }
+    }
+    if all_slots_recovered {
+        recovered_fallbacks.push(BindingRecoveredFallback {
+            group: group_key,
+            reason,
+        });
     }
 }
 

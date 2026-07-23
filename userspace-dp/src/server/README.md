@@ -62,9 +62,24 @@ this surface over a Unix socket using a newline-delimited text protocol.
     `drain_session_deltas_survive_write_state_failure_5294` (a rigged
     `write_state` failure must still deliver every drained delta; reverting to
     pop-then-fallible-write drops the batch → EOF on the client read → RED).
-- `helpers.rs` — shared daemon-loop utilities (`replan_queues`,
-  `replan_bindings_from_candidates`, `summarize_queues`, capability
-  checks).
+- `helpers/` — shared daemon-loop utilities, split into cohesive
+  submodules (#6234) behind a narrow `helpers/mod.rs` re-export facade so
+  every `server::helpers::<name>` call site is unchanged:
+  - `helpers/status.rs` — `refresh_status` cold-path projection onto
+    `ProcessStatus` plus the capability/forwarding predicates
+    (`should_run_afxdp`, `reconcile_status_bindings`,
+    `set_bindings_forwarding_armed`, `forwarding_unsupported_error`).
+  - `helpers/session_sync.rs` — HA synced key/entry reconstruction and the
+    #4565 NAT64 cross-family reverse rebuild.
+  - `helpers/planning.rs` — the binding-settle predicates, the canonical
+    same-plan hash key, and the RX-queue / binding replanner
+    (`replan_queues`, `replan_bindings_from_candidates`,
+    `summarize_queues`, `effective_rx_queues`, `plan_key_rx_queues`,
+    `include_userspace_binding_interface`). Hash ownership and layout
+    ownership stay in ONE module — separating them invites the same-plan /
+    stale-layout regressions fixed by #2915/#2916/#3007/#3175.
+  - `helpers/persistence.rs` — the owned state payload build and the
+    lock-free `write_state`.
   - **`write_state` holds the `ServerState` lock only to snapshot, not to
     persist (#5469).** Persisting the state file used to run
     `refresh_status`, `serde_json::to_vec_pretty` over the whole

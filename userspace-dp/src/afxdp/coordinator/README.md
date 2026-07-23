@@ -20,7 +20,7 @@ the workers share.
 | `cos_state.rs` | `SharedCoSState` — Arcs that workers consult to find owner-by-queue, live owner, root/queue leases, vtime floors. |
 | `ha_state.rs` | `HaState`: HA snapshot, shared fabrics, forwarding state. (RG epoch counters live on `Coordinator` itself in `mod.rs`, not here.) |
 | `inject.rs` | `request inject-packet` RPC handler — synthesizes a packet against the live state, reports disposition. The operator/API-supplied `packet_length` is bounded by `MAX_INJECT_PACKET_LENGTH` (= `UMEM_FRAME_SIZE`, 4096): an injected packet is a single unfragmented frame that must fit in one UMEM frame on TX, and 4096 keeps the IPv4 total-length / IPv6 payload-length wire fields within u16. `check_inject_packet_length` REJECTS an over-max request up front (it is NOT clamped, so an API misuse / DoS attempt surfaces as an error); the 64-byte minimum still applies. The frame builders (`frame/mod.rs`) additionally clamp the allocation to the maximum and use `u16::try_from` for the wire length as a defense-in-depth backstop so a bypassed bound can never emit a wrapped on-wire length. (#2443) |
-| `neighbor_manager.rs` | `NeighborManager` — sharded ARP/NDP cache + netlink monitor for incremental updates. **#5165: the monitor thread's `JoinHandle` is now retained (`monitor_join`, no longer discarded via `.ok()`) and `stop_inner` signals + JOINs it via `stop_and_join_monitor` — mirroring `resolver_join`. Joining (bounded by the monitor's 500ms `SO_RCVTIMEO`) is what enforces no-mutation-after-stop: a retired old-generation monitor blocked in `recv()` can no longer apply a queued kernel neighbor event to `dynamic` after a reconcile cleared/rebuilt the baseline. The steady-state loop also re-checks `stop` AFTER `recv()`, before mutating, as belt-and-suspenders.** |
+| `neighbor_manager.rs` | `NeighborManager` — sharded ARP/NDP cache + netlink monitor for incremental updates. **#5165: the monitor thread's `JoinHandle` is now retained (`monitor_join`, no longer discarded via `.ok()`) and `stop_inner` signals + JOINs it via `stop_and_join_monitor` — mirroring `resolver_join`. Joining (bounded by the monitor's 500ms `SO_RCVTIMEO`) is what enforces no-mutation-after-stop: a retired old-generation monitor blocked in `recv()` can no longer apply a queued kernel neighbor event to `dynamic` after a reconcile cleared/rebuilt the baseline. The steady-state loop also re-checks `stop` AFTER `recv()`, before mutating, as belt-and-suspenders.** **#6314: the #1636 neighbor WARMER — the third neighbor aux thread — now follows the SAME pattern (it was the pre-#5165 odd-one-out). Its `JoinHandle` is retained (`warm_join`, no longer discarded via `.ok()`), a spawn failure is now logged instead of swallowed (leaving `warm_queue`/`warm_stop`/`warm_join` all `None` so the next reconcile retries), and `stop_inner` signals `warm_stop` + drops the producer + JOINs it via `stop_and_join_warmer`. Joining (bounded by the warmer loop's 500ms recv timeout) guarantees a detached warmer can never fire a stray ARP/NDP solicit or mutate `last_probed_at` after teardown. Fail-on-revert: `neighbor_warmer_joined_at_teardown_6314`.** |
 | `session_manager.rs` | Cross-thread session-table state shared between coordinator, HA worker, and packet workers via `Arc<Mutex<...>>`. Holds the synced + nat + forward-wire tables together because they're written and queried as a unit. |
 | `snapshot_refresh.rs` | `refresh_runtime_snapshot{,_disarmed,_inner}` (armed/disarmed same-plan snapshot-apply legs: preflight, #1873 tunnel-remap purge, forwarding swap + stores, aux-thread reconcile, CoS owner-map + warm passes) and `refresh_fabric_links`. (#1890 split.) **#5166: the CoS owner/lease maps + `ha.fabrics` are published BEFORE the `ha.forwarding` worker-visible store — a live worker (loop_body loads forwarding then CoS in one tick) must never observe new queue config without its matching CoS owners/leases (else transient class blackhole / stale-rate / over-admission).** **#3766: `_inner` is a FALLIBLE atomic swap — it returns `Result<(), SnapshotIntegrityError>`, builds the new forwarding state FIRST, and only then bumps `self.validation` + rotates the neighbor-manager keys + publishes; on a build integrity error nothing mutates and the error is returned so the handler fails closed (no split-brain, no persisted reject).** |
 | `status.rs` | Read-side snapshots for `show ...` queries. **#5289: `recent_exceptions()` / `last_resolution()` drain the per-worker POD exception rings (`Coordinator::worker_exception_rings` / `worker_last_resolution`, one `Arc<Mutex<ExceptionEventRing>>` per worker, mirroring `worker_panics`) plus the control-thread ring, format each compact `ExceptionEvent`/`ResolutionEvent` into the operator-visible `ExceptionStatus`/`PacketResolution` HERE (interface/reason/IP/zone strings + monotonic→wall-clock via a single captured `MonoWallAnchor`), and merge by timestamp. The retired inline path formatted + locked a process-global mutex on EVERY terminal packet — the cross-worker DoS closed by #5289. The record path (`disposition::record_exception`) now writes a `&'static`-reason / `Arc<str>`-interface / `Copy`-`IpAddr` / numeric-zone POD event under a per-worker mutex with a per-(reason,5-tuple) sampler; the batched `BindingLiveState` counters stay the lossless signal. #6101: the slow-path reinject-failure sites (`_rate_limited` / `_queue_full` / `_slow_path_mtu_exceeded` / `_enqueue_failed`) record via `disposition::record_exception_suffixed`, which stores a `&'static` base reason + a `&'static` suffix (new `ExceptionEvent::reason_suffix`) so the record path stays alloc-free under a reinject-failure flood — the operator text `"{reason}{suffix}"` is reconstructed byte-identically by `ExceptionEvent::reason()` on the status thread. `record_exception_owned` remains ONLY for genuinely dynamic reasons (the `cfg!(feature = "debug-log")` forward-tuple-mismatch diagnostic). The cross-worker merge/sort/cap (`recent_exceptions`/`last_resolution` across ≥2 per-worker rings + the control ring) and the bring-up insert / teardown `.remove` are unit-tested in `status_tests.rs::exception_ring_merge_6101`.** The other read-side exception is `drain_session_deltas`, which mutates per-binding state. **#5290: this RPC-fallback drain is FAIR — it spreads a `budget/num_bindings` quantum across live bindings via a rotating cursor (`WorkerManager::session_delta_drain_cursor`) using the shared `session_delta::drain_session_deltas_fair` helper, instead of handing the whole budget to the first slot with an early break. A low-slot worker can no longer consume the caller-wide budget and starve higher slots during the event-stream fallback. On budget overflow (undrained deltas remain) it arms `BindingLiveState::set_delta_loss` on the residual bindings; the owning worker loop folds that latch into `SessionTable::set_delta_loss` for the existing #2442 owner-RG resync, so no delta is silently lost. The owner-RG bulk-export mirror `ha.rs::drain_session_deltas_from_live` shares the same fair helper but does NOT arm the latch (it IS the resync).** |
@@ -82,6 +82,25 @@ Differences that matter (#1881):
 
 ## Notable invariants
 
+- **Reconcile progress + failure identity are a TYPED value, not a free-form
+  string (#6244).** `Coordinator::last_reconcile_stage` is a
+  `ReconcileStage` enum (`reconcile/stage.rs`) — one variant per progress
+  step (`Idle`/`Start`/`NoSnapshot`/`Planned`/`ReplayedSynced`/`Spawned`) and
+  per failure identity (`MissingPin`/`OpenMapFailed`/`SnapshotIntegrityError`
+  {,`Detail`}/`SpawnWorkerFailed`/`WorkerBindIncomplete`). The legacy operator
+  string is produced in exactly one place — the enum's `Display` — and is
+  rendered ONLY at the `reconcile_debug` / wire `debug_reconcile_stage`
+  boundary (`status.rs`) and inside `ReconcileError`'s `Display`; the strings
+  are preserved byte-for-byte. `ReconcileError::{MapSetup,WorkerSpawn,
+  WorkerBindIncomplete}` carry the typed `ReconcileStage` rather than a cloned
+  string, so a failure identity cannot be silently reinterpreted as informal
+  success text (the #4952 overwrite class). #6244 also moved the `"stopped"`
+  write OUT of `stop_inner` (which is called mid-reconcile by `tear_down` and
+  by the bring-up fail path): an EXPLICIT stop records `ReconcileStage::Stopped`
+  in `stop`/`stop_with_event_stream`, so a terminal failure identity is never
+  clobbered by a teardown that is part of the same reconcile attempt — the
+  bring-up fail path no longer needs the old overwrite-then-restore dance.
+  Fail-on-revert: `reconcile_stage_renders_byte_identical_legacy_strings`.
 - The coordinator is the single owner; workers hold `Arc` clones.
   Lifetime hazards from breaking that invariant are how cross-binding
   redirect designs have died historically (see `docs/per-5-tuple/state.md`).
@@ -220,3 +239,36 @@ Differences that matter (#1881):
   stopped) drives the regression tests (coordinator-level
   `post_spawn_inthread_bind_failure_fails_closed_5143` + handler-level
   `full_apply_post_spawn_inthread_bind_failure_fails_closed_no_persist_5143`).
+
+- **Explicit binding-setup failures in the startup report (#6245).** #5143
+  reported a bind failure ONLY by OMISSION — the failed slot was simply absent
+  from `WorkerStartupReport.bound_slots`, so the barrier could prove
+  incompleteness (`bound != planned`) but not say WHY (`worker_loop_setup`
+  merely logged + mutated `BindingLiveState.last_error`, discarding the causal
+  error, the phase, and the fallback path). The report now ALSO carries the
+  EXPLICIT cause: `binding_failures: Vec<BindingSetupFailure>` — one
+  `{ slot, phase, reason }` per TERMINAL per-slot failure
+  (`BindingSetupPhase::Private` for a private-UMEM bind, `SharedFallback` for a
+  shared-group bind whose private fallback ALSO failed), sorted by slot — plus
+  `recovered_fallbacks: Vec<BindingRecoveredFallback>` recording shared-UMEM
+  groups that failed their group bind but FULLY recovered via private fallback
+  (a diagnostic DEGRADATION, sorted by group, that does NOT affect readiness —
+  all slots still bound). The readiness criterion is UNCHANGED (`bound ==
+  planned` set equality); on a shortfall the barrier records the EXPLICIT cause
+  on the typed `ReconcileStage::WorkerBindIncomplete` identity — its
+  `WorkerBindShortfall` now carries `failures: Vec<BindingSetupFailure>` cloned
+  from the worker's report. Per #6244 the legacy operator string is produced in
+  exactly one place: `ReconcileStage`'s `Display`, which appends the rendered
+  cause (`render_binding_setup_failures`, co-located with `Display` in
+  `reconcile/stage.rs`) for the partial-bind case, so
+  `worker_bind_incomplete:<id>:bound=N:planned=M:failures=[private:slot=1:..]`
+  names the slot, phase, and reason instead of only the set-difference counts
+  (a shortfall with no recorded failure renders `failures=[no-explicit-failure]`
+  rather than a blank; the timeout/no-report case keeps the counts-only
+  `worker_bind_incomplete:<id>:timeout:planned=M`). The SUCCESS path is
+  behavior-identical: a worker that bound its full planned set reports both vecs
+  empty. The `force_worker_bind_incomplete` stub now emits a matching explicit
+  failure for the dropped slot, so the report->barrier->stage explicit path is
+  verified end-to-end without CAP_NET_ADMIN
+  (`worker_bind_incomplete_report_carries_explicit_failure_6245`); the pure
+  renderer is unit-tested in `reconcile::stage::tests`.

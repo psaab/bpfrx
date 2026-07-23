@@ -107,6 +107,8 @@ pub(crate) fn worker_loop(
         conntrack_v4_fd,
         conntrack_v6_fd,
         mut last_cos_status_ns,
+        binding_failures,
+        recovered_fallbacks,
     } = setup::worker_loop_setup(
         worker_id,
         binding_plans,
@@ -136,9 +138,15 @@ pub(crate) fn worker_loop(
     // dropped the receiver — the worker is about to be stopped/joined anyway.
     {
         let bound_slots: Vec<u32> = bindings.iter().map(|binding| binding.slot).collect();
+        // #6245: carry the EXPLICIT per-slot terminal failures + recovered
+        // shared-group fallbacks (both empty on the all-bound success path) so
+        // the readiness barrier's fail-closed diagnostic names the cause,
+        // rather than inferring it from the missing slots alone.
         let _ = startup_report_tx.send(WorkerStartupReport {
             worker_id,
             bound_slots,
+            binding_failures,
+            recovered_fallbacks,
         });
     }
     const COS_STATUS_INTERVAL_NS: u64 = 100_000_000;

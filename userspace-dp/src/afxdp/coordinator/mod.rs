@@ -19,6 +19,7 @@ pub(crate) use bpf_maps::BpfMaps;
 // (`reconcile_status_bindings`) and the control-socket handler can name
 // the fallible return type.
 pub(crate) use reconcile::ReconcileError;
+pub(crate) use reconcile::{MandatoryPin, ReconcileStage, WorkerBindShortfall};
 // #1890: re-import the split-out CoS builders at coordinator scope so
 // pre-split references keep resolving unchanged — `status.rs` and
 // `tests.rs` reach them through `use super::*`, and
@@ -322,7 +323,13 @@ pub struct Coordinator {
     /// parallel tests never race.
     #[cfg(test)]
     pub(crate) cos_owner_at_forwarding_publish: Option<BTreeMap<(i32, u8), u32>>,
-    pub(crate) last_reconcile_stage: String,
+    /// #6244: typed reconcile progress + failure identity. Replaces the
+    /// former free-form `String` side-channel; the legacy operator string is
+    /// rendered only at the `reconcile_debug` / `debug_reconcile_stage` wire
+    /// boundary and inside `ReconcileError`'s `Display`. Written on the cold
+    /// reconcile / status boundary, read at ~1 Hz status polls — never on the
+    /// packet path.
+    pub(crate) last_reconcile_stage: ReconcileStage,
     pub(crate) poll_mode: crate::PollMode,
     pub(crate) event_stream: Option<crate::event_stream::EventStreamSender>,
     pub(crate) cos_owner_worker_by_queue: BTreeMap<(i32, u8), u32>,
@@ -388,7 +395,7 @@ impl Coordinator {
             synced_import_cap_override: 0,
             #[cfg(test)]
             cos_owner_at_forwarding_publish: None,
-            last_reconcile_stage: "idle".to_string(),
+            last_reconcile_stage: ReconcileStage::Idle,
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
             cos_owner_worker_by_queue: BTreeMap::new(),
@@ -402,6 +409,10 @@ impl Coordinator {
 
     pub fn stop(&mut self) {
         self.stop_inner(true);
+        // #6244: an explicit stop records the terminal lifecycle stage (the
+        // "stopped" write moved out of `stop_inner`, which is also called
+        // mid-reconcile where the caller sets its own stage).
+        self.last_reconcile_stage = ReconcileStage::Stopped;
         // NOTE: Do NOT tear down event_stream here. The event stream must
         // survive across XSK bind/unbind cycles (e.g. when forwarding_armed
         // is temporarily false during startup). Use stop_with_event_stream()
@@ -411,6 +422,8 @@ impl Coordinator {
     /// Full shutdown including the event stream. Called only on process exit.
     pub fn stop_with_event_stream(&mut self) {
         self.stop_inner(true);
+        // #6244: explicit stop -> terminal lifecycle stage (see `stop`).
+        self.last_reconcile_stage = ReconcileStage::Stopped;
         if let Some(mut es) = self.event_stream.take() {
             es.stop();
         }
@@ -542,13 +555,15 @@ impl Coordinator {
         // the monitor's 500ms SO_RCVTIMEO) is the real no-mutation-after-stop
         // guard, mirroring the resolver join below.
         self.neighbors.stop_and_join_monitor();
-        // #1636: stop the neighbor warmer and drop the producer handle so
-        // the worker's recv side disconnects and it exits cleanly. The
-        // 500ms recv timeout bounds the join latency.
-        if let Some(warm_stop) = self.neighbors.warm_stop.take() {
-            warm_stop.store(true, Ordering::Relaxed);
-        }
-        self.neighbors.warm_queue = None;
+        // #1636 / #6314: stop the neighbor warmer, drop the producer handle so
+        // the worker's recv side disconnects, and JOIN it — mirroring the
+        // monitor (above) and resolver (below) siblings. Signalling + dropping
+        // the queue alone left the warmer detached (the pre-#5165 odd-one-out):
+        // a warmer blocked in recv_timeout could fire one stray ARP/NDP solicit
+        // or mutate `last_probed_at` after this teardown cleared the dataplane.
+        // Joining (bounded by the warmer's 500ms recv timeout) is the real
+        // no-mutation-after-stop guard.
+        self.neighbors.stop_and_join_warmer();
         // #1769: stop the on-demand resolver. Signal stop, drop the
         // producer handle so the recv side disconnects promptly, then
         // JOIN the worker before returning. Joining (not just signalling)
@@ -713,7 +728,15 @@ impl Coordinator {
         self.workers.last_planned_workers = 0;
         self.workers.last_planned_bindings = 0;
         self.workers.last_planned_worker_slots = 0;
-        self.last_reconcile_stage = "stopped".to_string();
+        // #6244: `stop_inner` no longer writes `last_reconcile_stage`. It is
+        // called mid-reconcile by `tear_down` (which then records its own
+        // progress) and by the bring-up fail-closed path (which records the
+        // preserved failure identity right after) — in both the "stopped"
+        // write was a transient the caller immediately overwrote, and in
+        // bring-up it forced an overwrite-then-restore dance. An EXPLICIT stop
+        // records `ReconcileStage::Stopped` in `stop` / `stop_with_event_stream`
+        // instead, so a terminal failure identity is never clobbered by a
+        // teardown that is part of the same reconcile attempt.
     }
 
     pub(crate) fn snapshot_shared_session_entries(&self) -> Vec<SyncedSessionEntry> {
