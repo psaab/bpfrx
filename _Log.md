@@ -103,6 +103,34 @@
   recovery logs; strengthened dir-switch → reseed neutralized fails the
   rotation-survival assertion), then restored GREEN.
 
+- **Timestamp**: 2026-07-23 (convergence round on PR #6399, Codex 3rd MAJOR)
+- **Action**: Converged #6399 — kept the Codex-verified core, honestly
+  deferred the bond validation rabbit-hole. FOLDED (Codex MINOR 4): xfrm
+  LinkAdd-FAILURE stale ownership — the genuine create-failure exit
+  (xfrm.go:259) now also `delete(x.xfrmis, ifName)` so a pre-tracked name
+  whose recreate fails does not leave the removal pass able to delete a
+  foreign link that later wears the name; test
+  TestXfrmCreateLinkAddFailureDropsStaleTracking (PRE-TRACKED manager +
+  addFail), fail-on-revert firsthand RED (xfrmis=map[st0.1:2] persists) →
+  restored GREEN. DEFERRED to #6402 (HA-touching, NOT folded): bond identity
+  residuals — README (pkg/routing/README.md) now honestly enumerates all
+  three (create-path mode/MTU, adopt-path type+mode+MTU, KEEP-path identity
+  bond.go:181) as deferred; kept the create-path `*netlink.Bond` type guard
+  (net improvement). Updated #6402 to cover all three. DEFERRED to NEW #6404
+  (NOT folded): archive reseed edges (Codex MINOR 2 commit-interval race at
+  store_commit.go:284 + MINOR 3 disable/re-enable A→""→A skip); corrected the
+  configstore README's "ANY archive-dir change" wording to what is actually
+  guaranteed (re-seeds on a dir DIFFERENT from the last successfully-seeded
+  one) and cited #6404.
+- **File(s)**: pkg/routing/xfrm.go,
+  pkg/routing/xfrm_nonxfrmi_reject_5523_test.go, pkg/routing/README.md,
+  pkg/configstore/README.md
+- **Validation**: gofmt/build/vet clean; full
+  `go test ./pkg/routing ./pkg/configstore ./pkg/daemon` GREEN; new
+  LinkAdd-failure fold fail-on-revert verified firsthand this round; the
+  ParentIndex/readback/scan-error/SNMP guards (unchanged this round) verified
+  in the prior fold round.
+
 ## 2026-07-23 — #5583 C180: fold two Codex MAJOR findings into #6383
 
 - **Timestamp**: 2026-07-23 (fix/5583-codex180, fold on PR #6383)

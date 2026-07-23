@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -226,5 +227,32 @@ func TestXfrmCreateRejectDropsStaleTracking(t *testing.T) {
 	if _, ok := xm.xfrmis[ifName]; ok {
 		t.Errorf("the stale tracking entry must be dropped on a rejected readback so a later "+
 			"reconcile cannot act on the foreign substitute; xfrmis=%v", xm.xfrmis)
+	}
+}
+
+// TestXfrmCreateLinkAddFailureDropsStaleTracking is the #6396 Codex MINOR 4
+// guard: a GENUINE LinkAdd failure on the create path must also honor the
+// "UNTRACKED" contract by dropping any pre-existing x.xfrmis entry for the
+// name. Otherwise, a name that a prior reconcile tracked (then its kernel link
+// vanished, forcing the create path) whose recreate then fails would stay
+// tracked — and the removal pass (deleteLocked) could later delete whatever
+// foreign link comes to wear that name.
+//
+// FAIL-ON-REVERT: without the delete on the LinkAdd-failure exit the pre-tracked
+// entry survives — the "not tracked" assertion goes RED.
+func TestXfrmCreateLinkAddFailureDropsStaleTracking(t *testing.T) {
+	ops := newFakeLinkOps()
+	ifName, ifID := config.XFRMIfNameAndID("st0.1")
+	// A GENUINE (non-EEXIST) LinkAdd failure — the link is never created.
+	ops.addFail[ifName] = errors.New("injected: LinkAdd EPERM")
+	// PRE-TRACKED from a prior reconcile; the kernel link is absent now, so Apply
+	// takes the create path and LinkAdd fails.
+	xm := &xfrmManager{ops: ops, xfrmis: map[string]uint32{ifName: ifID}}
+	if err := xm.Apply(xfrmVPNs("st0.1")); err == nil {
+		t.Fatalf("a genuine LinkAdd failure must fail the commit closed, got nil")
+	}
+	if _, ok := xm.xfrmis[ifName]; ok {
+		t.Errorf("a failed LinkAdd must drop the stale tracking entry so the removal pass "+
+			"cannot act on a foreign link that later wears the name; xfrmis=%v", xm.xfrmis)
 	}
 }

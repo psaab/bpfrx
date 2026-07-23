@@ -263,6 +263,15 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 			// (the next reconcile retries) and fails the commit closed — a
 			// route-based VPN bound to an xfrmi that never made it into the
 			// kernel must not report a successful commit.
+			//
+			// #6396 Codex MINOR 4: to actually HONOR the "UNTRACKED" contract we
+			// must drop any PRE-EXISTING x.xfrmis entry for this name (a prior
+			// reconcile tracked it, then the kernel link vanished — that is why
+			// we are on the create path — and now the recreate failed). Leaving
+			// the stale entry would let the removal pass (deleteLocked) later act
+			// on whatever foreign link comes to wear this name. delete is a no-op
+			// when the name was never tracked.
+			delete(x.xfrmis, ifName)
 			errs = append(errs, fmt.Errorf("create xfrmi %s (if_id %d): %w", ifName, ifID, err))
 			continue
 		}

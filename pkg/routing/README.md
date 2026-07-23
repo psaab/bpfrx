@@ -134,16 +134,32 @@ invariant now holds across all three netlink-device managers:
   `LinkSetMaster` failure when a member is actually enslavable, so a bond
   whose configured members are all currently absent (the #4823 soft-error
   case) would otherwise adopt a foreign link; the explicit type check
-  closes that hole for every member state. **Scope note:** only the bond
-  CREATE path is type-gated here. The bond **ADOPT** path (`createLocked`'s
-  `if existing, err := LinkByName(name); err == nil` branch) is NOT yet
-  type/mode/MTU-gated — a foreign or wrong-mode same-name link present at
-  steady state is still adopted. That guard is deferred to **#6402** because
-  it changes fabric/RETH bond reconcile behavior and so needs a loss-cluster
-  `test-failover` smoke; it must validate mode + MTU, not just the
-  `*netlink.Bond` type. (xfrm and VRF adopt paths ARE already gated —
-  xfrm.go:203 and `vrfTable`→recreate — so bond is the only adopt-path
-  residual.)
+  closes that hole for every member state.
+
+  **Bond is only PARTIALLY in the identity-assertion family — the remaining
+  bond identity checks are deferred to #6402 (HA-touching; a fabric/RETH LAG
+  change needs a loss-cluster `test-failover` smoke).** The #6396 create-path
+  guard is a strict improvement (it rejects a non-`*netlink.Bond` substitute)
+  but is NOT complete, and these gaps are ALL pre-existing (master never
+  validated them — they are not #6396 regressions):
+    1. **create-path mode/MTU** — the guard checks the `*netlink.Bond` type
+       only, then tracks the DESIRED `bondSig` (`sigWithMembers(sig, …)`), not
+       the readback's observed mode/MTU. An `*netlink.Bond` substitute with the
+       wrong bond mode (802.3ad vs active-backup) or MTU passes and is tracked
+       as satisfied.
+    2. **adopt-path type + mode + MTU** — the adopt branch
+       (`if existing, err := LinkByName(name); err == nil`) accepts `existing`
+       by name after checking only the enslaved member set; a foreign or
+       wrong-mode/MTU same-name link present at steady state is adopted.
+    3. **KEEP-path identity** — the tracked-and-unchanged fast path
+       (`if trackedSig == sig` → `LinkByName` → `LinkSetUp`) brings up whatever
+       wears the name without re-asserting it is even a bond, so a same-name
+       `Dummy` swapped in under a tracked bond is accepted.
+  #6402 covers all three and must validate mode + MTU, not just the
+  `*netlink.Bond` type. (xfrm and VRF adopt paths ARE fully gated —
+  xfrm.go:203 asserts type + `Ifid` + `ParentIndex==0`, and `vrfTable`→recreate
+  asserts type + table — so bond is the sole manager with open identity
+  residuals.)
 
 Without the check the name is tracked as satisfied while **no** device
 carries the desired identity, silently blackholing the VPN / leaked routes
