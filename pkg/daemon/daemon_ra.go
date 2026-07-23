@@ -95,9 +95,17 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 		}
 	}
 
-	// Resolve RETH interface names for RA senders (needs real Linux names).
+	// Resolve interface names for RA senders (needs real Linux names).
+	// ResolveKernelIfName maps a logical unit to its configured vlan-id for
+	// the kernel VLAN sub-interface suffix (reth0.80 with `vlan-id 180` →
+	// member.180), whereas the old LinuxIfName(ResolveReth(...)) preserved the
+	// UNIT number as the suffix (member.80) and bound RA to a netdev that does
+	// not exist. It also keeps the resolved name consistent with
+	// rethInterfacesForRG (which already suffixes by unit.VlanID), so the
+	// cluster RA ownership match in desiredClusterRA does not drop the sender
+	// when unit# != vlan-id (#5107).
 	for _, ra := range result {
-		ra.Interface = config.LinuxIfName(cfg.ResolveReth(ra.Interface))
+		ra.Interface = cfg.ResolveKernelIfName(ra.Interface)
 	}
 
 	return result
