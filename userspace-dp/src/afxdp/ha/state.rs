@@ -71,7 +71,8 @@ impl crate::afxdp::Coordinator {
         }
         self.ha.rg_runtime.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
-            for handle in self.workers.handles.values() {
+            // #6242: fan out demote commands via each worker's runtime record.
+            for rec in self.workers.records.values() {
                 // #1790/#1807: recover from a poisoned worker command mutex
                 // instead of early-returning. The new HA state was already
                 // published via rg_runtime.store above, so an Err here would
@@ -80,7 +81,7 @@ impl crate::afxdp::Coordinator {
                 // demote commands, demote_shared_owner_rgs, and the
                 // rg_epochs bumps. lock_recover applies the uniform
                 // committed-prefix + clear_poison policy (worker_queue.rs).
-                let mut pending = worker_queue::lock_recover(&handle.commands);
+                let mut pending = worker_queue::lock_recover(&rec.handle.commands);
                 pending.push_back(WorkerCommand::DemoteOwnerRGS {
                     owner_rgs: demoted_rgs.clone(),
                 });
@@ -109,7 +110,7 @@ impl crate::afxdp::Coordinator {
             eprintln!(
                 "xpf-ha: RG activation detected: {:?}, workers={}, shared_sessions={}",
                 activated_rgs,
-                self.workers.handles.len(),
+                self.workers.records.len(),
                 self.sessions.synced.lock().map(|s| s.len()).unwrap_or(0),
             );
             self.handle_activated_rgs(&activated_rgs, now_secs);
@@ -129,9 +130,9 @@ impl crate::afxdp::Coordinator {
 
         let worker_commands = self
             .workers
-            .handles
+            .records
             .values()
-            .map(|handle| handle.commands.clone())
+            .map(|rec| rec.handle.commands.clone())
             .collect::<Vec<_>>();
         for commands in &worker_commands {
             // #1790/#1807: uniform poison recovery (worker_queue.rs).

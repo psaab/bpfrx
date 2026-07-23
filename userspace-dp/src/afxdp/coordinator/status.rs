@@ -435,8 +435,10 @@ impl super::Coordinator {
         if let Ok(ring) = self.recent_exceptions.lock() {
             events.extend(ring.iter().cloned());
         }
-        for ring in self.worker_exception_rings.values() {
-            if let Ok(ring) = ring.lock() {
+        // #6242: drain each worker's exception ring off its runtime record
+        // (was the standalone `worker_exception_rings` map).
+        for rec in self.workers.records.values() {
+            if let Ok(ring) = rec.exception_ring.lock() {
                 events.extend(ring.iter().cloned());
             }
         }
@@ -470,8 +472,10 @@ impl super::Coordinator {
         if let Ok(last) = self.last_resolution.lock() {
             consider(last.clone());
         }
-        for slot in self.worker_last_resolution.values() {
-            if let Ok(last) = slot.lock() {
+        // #6242: pick the newest across each worker's last-resolution slot off
+        // its runtime record (was the standalone `worker_last_resolution` map).
+        for rec in self.workers.records.values() {
+            if let Ok(last) = rec.last_resolution.lock() {
                 consider(last.clone());
             }
         }
@@ -488,9 +492,9 @@ impl super::Coordinator {
     pub fn cos_statuses(&self) -> Vec<crate::protocol::CoSInterfaceStatus> {
         let snapshots: Vec<Vec<_>> = self
             .workers
-            .handles
+            .records
             .values()
-            .map(|worker| worker.cos_status.load().iter().cloned().collect())
+            .map(|rec| rec.handle.cos_status.load().iter().cloned().collect())
             .collect();
         let mut statuses =
             aggregate_cos_statuses_across_workers(&snapshots, &self.cos_owner_worker_by_queue);
@@ -701,11 +705,11 @@ impl super::Coordinator {
         let now_wall = Utc::now();
         let now_mono = monotonic_nanos();
         self.workers
-            .handles
+            .records
             .iter()
-            .map(|(_, handle)| {
+            .map(|(_, rec)| {
                 monotonic_timestamp_to_datetime(
-                    handle.heartbeat.load(Ordering::Relaxed),
+                    rec.handle.heartbeat.load(Ordering::Relaxed),
                     now_mono,
                     now_wall,
                 )
@@ -715,7 +719,7 @@ impl super::Coordinator {
     }
 
     pub fn worker_count(&self) -> usize {
-        self.workers.handles.len()
+        self.workers.records.len()
     }
 
     /// #869: snapshot per-worker busy/idle runtime counters.  Each row is
@@ -723,12 +727,16 @@ impl super::Coordinator {
     /// on the worker's ~1s publish cadence.
     /// #925: also surfaces `dead` (one-shot AtomicBool set when the
     /// supervisor catches a worker_loop panic) and the rendered panic
-    /// payload from the per-worker slot in `worker_panics`.
+    /// payload from the per-worker slot. #6242: the panic slot now lives on
+    /// the worker's runtime record (`rec.panic`) alongside its handle — the
+    /// former cross-map join (`handles.iter()` + `worker_panics.get(id)`)
+    /// collapses into a single record read.
     pub fn worker_runtime_snapshots(&self) -> Vec<crate::protocol::WorkerRuntimeStatus> {
         self.workers
-            .handles
+            .records
             .iter()
-            .map(|(worker_id, handle)| {
+            .map(|(worker_id, rec)| {
+                let handle = &rec.handle;
                 let s = handle.runtime_atomics.snapshot();
                 let w = handle.runtime_atomics.snapshot_window();
                 let dead = handle
@@ -736,13 +744,11 @@ impl super::Coordinator {
                     .dead
                     .load(std::sync::atomic::Ordering::Relaxed);
                 let panic_message = if dead {
-                    self.worker_panics
-                        .get(worker_id)
-                        .and_then(|slot| match slot.lock() {
-                            Ok(g) => g.clone(),
-                            Err(poisoned) => poisoned.into_inner().clone(),
-                        })
-                        .unwrap_or_default()
+                    match rec.panic.lock() {
+                        Ok(g) => g.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
+                    }
+                    .unwrap_or_default()
                 } else {
                     String::new()
                 };

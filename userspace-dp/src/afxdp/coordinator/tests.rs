@@ -1891,7 +1891,7 @@ fn teardown_quiesce_skipped_when_no_live_workers() {
 fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
     let mut coordinator = gre1881_coordinator_with_worker();
     assert!(
-        !coordinator.workers.handles.is_empty(),
+        !coordinator.workers.records.is_empty(),
         "precondition: a live worker handle is seeded (had_live_workers == true)"
     );
     let mut bindings: Vec<BindingStatus> = Vec::new();
@@ -1903,7 +1903,7 @@ fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
     );
     assert_eq!(coordinator.last_reconcile_stage.to_string(), "no_snapshot");
     assert!(
-        coordinator.workers.handles.is_empty(),
+        coordinator.workers.records.is_empty(),
         "the seeded worker WAS torn down (proves had_live_workers held)"
     );
     assert_eq!(
@@ -1930,7 +1930,7 @@ fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
 fn teardown_quiesce_fires_when_live_workers_and_snapshot_rebinds() {
     let mut coordinator = gre1881_coordinator_with_worker();
     assert!(
-        !coordinator.workers.handles.is_empty(),
+        !coordinator.workers.records.is_empty(),
         "precondition: had_live_workers == true"
     );
     // All-OK mandatory pins so the map-FD preflight + forwarding build
@@ -3207,10 +3207,12 @@ fn gre1881_fake_worker_handle() -> WorkerHandle {
 
 fn gre1881_coordinator_with_worker() -> Coordinator {
     let mut coordinator = Coordinator::new();
+    // #6242: register the whole runtime record (handle + empty observability
+    // slots) as one op.
     coordinator
         .workers
-        .handles
-        .insert(0, gre1881_fake_worker_handle());
+        .records
+        .insert(0, WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle()));
     coordinator
 }
 
@@ -3871,7 +3873,7 @@ fn reconcile_post_teardown_worker_spawn_failure_fails_closed_4952() {
 /// Fail-on-revert: remove the readiness barrier (the worker binds partially but
 /// `bring_up_workers` returns Ok and the reconcile commits) and BOTH the
 /// `Err(WorkerBindIncomplete)` match and the stop/join assertions flip
-/// (`reconcile` returns Ok, the stub worker leaks in `workers.handles`, and the
+/// (`reconcile` returns Ok, the stub worker leaks in `workers.records`, and the
 /// stage becomes `spawned:workers=..`).
 #[test]
 fn post_spawn_inthread_bind_failure_fails_closed_5143() {
@@ -3934,7 +3936,7 @@ fn post_spawn_inthread_bind_failure_fails_closed_5143() {
     // (c) the newly-started worker was STOPPED + JOINED and its coordinator
     // state cleared — no leaked live-but-unbound worker.
     assert!(
-        coordinator.workers.handles.is_empty(),
+        coordinator.workers.records.is_empty(),
         "the partially-bound worker must be stopped/joined (no leaked handle)"
     );
     assert!(
@@ -3945,6 +3947,201 @@ fn post_spawn_inthread_bind_failure_fails_closed_5143() {
     assert_eq!(
         coordinator.force_worker_bind_incomplete, 0,
         "exactly one forced bind-incomplete report should have been consumed"
+    );
+}
+
+/// #6242: three registered bindings on distinct worker_ids so `bring_up_workers`
+/// plans exactly three workers, iterated in worker-id order.
+fn six242_three_worker_bindings() -> Vec<BindingStatus> {
+    (0..3u32)
+        .map(|i| BindingStatus {
+            slot: i + 1,
+            worker_id: i,
+            queue_id: i,
+            interface: "ge-0-0-0".into(),
+            ifindex: 10,
+            registered: true,
+            ..BindingStatus::default()
+        })
+        .collect()
+}
+
+/// #6242 — THE DIFFERENTIAL ROLLBACK (the crux). A PARTIAL-success worker spawn
+/// on the POST-TEARDOWN path (workers `0..K-1` launched, worker `K` fails to
+/// spawn) must fail the reconcile closed WITHOUT tearing down the launched
+/// workers — their consolidated `WorkerRuntimeRecord`s SURVIVE (they are
+/// reclaimed by the next reconcile's teardown), and the failed worker never
+/// registered a record at all.
+///
+/// The pre-existing #4952 test uses ONE worker, so partial-success cleanup was
+/// UNCHARACTERIZED — `force_worker_spawn_fail` alone always fails the FIRST
+/// worker. The #6242 `force_worker_spawn_fail_skip` seam lets the first K
+/// workers launch (as benign healthy stubs, `force_worker_healthy_stub`, so no
+/// real `worker_loop` runs in-process) before the (K+1)th spawn is forced to
+/// fail.
+///
+/// This pins the invariant the consolidation must preserve: because
+/// registration is now ONE `records.insert` POST-spawn-success, a failed worker
+/// has nothing to unwind and the launched records are NEVER touched on the
+/// spawn-fail arm. Fail-on-revert: make the spawn-fail arm also
+/// `coord.workers.records.clear()` (or move registration back pre-spawn) and the
+/// launched-records-survive assertions below flip RED.
+#[test]
+fn reconcile_partial_spawn_failure_preserves_launched_records_6242() {
+    let mut coordinator = Coordinator::new();
+    let mut bindings = six242_three_worker_bindings();
+    // Fail the spawn of the THIRD worker (skip the first two), routing the first
+    // two through a benign healthy stub so no real dataplane body runs.
+    coordinator.force_worker_spawn_fail = 1;
+    coordinator.force_worker_spawn_fail_skip = 2;
+    coordinator.force_worker_healthy_stub = true;
+
+    let snap = mandatory_ok_snapshot(5);
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    // (a) fail closed with the typed post-teardown spawn error.
+    assert!(
+        matches!(
+            result,
+            Err(ReconcileError::WorkerSpawn(ReconcileStage::SpawnWorkerFailed { worker_id: 2, .. }))
+        ),
+        "a partial-success spawn failure must surface as \
+         Err(WorkerSpawn(SpawnWorkerFailed{{worker_id:2}})), got {result:?}"
+    );
+
+    // (b) THE DIFFERENTIAL: workers 0 and 1 LAUNCHED — their records SURVIVE
+    // (no stop_inner ran); worker 2 (the failed spawn) has NO record.
+    assert_eq!(
+        coordinator.workers.records.len(),
+        2,
+        "launched workers 0 and 1 keep their records (differential rollback)"
+    );
+    assert!(
+        coordinator.workers.records.contains_key(&0)
+            && coordinator.workers.records.contains_key(&1),
+        "workers 0 and 1 launched before the failure and must still be registered"
+    );
+    assert!(
+        !coordinator.workers.records.contains_key(&2),
+        "the failed worker never registered a record (post-spawn insert)"
+    );
+
+    // (c) each surviving record carries ALL FOUR owners together — a live
+    // (joinable) handle AND its panic / exception-ring / last-resolution slots.
+    for wid in [0u32, 1] {
+        let rec = coordinator
+            .workers
+            .records
+            .get(&wid)
+            .expect("launched worker record");
+        assert!(
+            rec.handle.join.is_some(),
+            "launched worker {wid} keeps a joinable handle (still live)"
+        );
+        // The three observability Arcs are the SAME allocations registered with
+        // the handle in ONE op — the consolidation's point. They are readable
+        // (real slots, not phantoms).
+        assert!(rec.panic.lock().is_ok());
+        assert!(rec.exception_ring.lock().is_ok());
+        assert!(rec.last_resolution.lock().is_ok());
+    }
+
+    // (d) the seams consumed exactly their budget (no over-fire).
+    assert_eq!(coordinator.force_worker_spawn_fail, 0);
+    assert_eq!(coordinator.force_worker_spawn_fail_skip, 0);
+
+    // Clean up the two live healthy-stub threads (this is the NEXT reconcile's
+    // teardown that reclaims them). stop_inner clears ALL records in one step.
+    coordinator.stop_inner(false);
+    assert!(
+        coordinator.workers.records.is_empty(),
+        "teardown clears every launched record"
+    );
+}
+
+/// #6242 — the OTHER side of the differential (symmetric pin). A post-spawn
+/// BIND-INCOMPLETE failure (HEARTBEAT != READINESS) fails the reconcile closed
+/// via `stop_inner`, which tears down and clears ALL worker records — contrast
+/// the spawn-fail partial case above, where launched records survive. Uses
+/// THREE workers (worker 0 reports an incomplete bound set; 1 and 2 are healthy
+/// stubs) to prove the clear is fleet-wide, not just the one failing worker.
+#[test]
+fn reconcile_bind_incomplete_clears_all_records_6242() {
+    let mut coordinator = Coordinator::new();
+    let mut bindings = six242_three_worker_bindings();
+    // Worker 0 reports an INCOMPLETE bound set; workers 1 and 2 spawn as healthy
+    // stubs (full bound set) so the barrier's verdict is driven solely by 0.
+    coordinator.force_worker_bind_incomplete = 1;
+    coordinator.force_worker_healthy_stub = true;
+
+    let snap = mandatory_ok_snapshot(5);
+    let result = coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert!(
+        matches!(
+            result,
+            Err(ReconcileError::WorkerBindIncomplete(
+                ReconcileStage::WorkerBindIncomplete(_)
+            ))
+        ),
+        "a post-spawn bind-incomplete must surface as \
+         Err(WorkerBindIncomplete(_)), got {result:?}"
+    );
+    // stop_inner cleared the WHOLE fleet — every record, not just worker 0.
+    assert!(
+        coordinator.workers.records.is_empty(),
+        "bind-incomplete fail-close clears ALL worker records (records.clear via stop_inner)"
+    );
+    assert!(
+        coordinator.workers.live.is_empty(),
+        "the workers' live state is cleared on the fail-closed teardown"
+    );
+}
+
+/// #6242 — teardown atomicity / no double-clear. `stop_inner` drops each worker
+/// record's FOUR owners (handle + panic + exception ring + last-resolution)
+/// EXACTLY ONCE via `records.clear()`. The pre-#6242 layout ran three separate
+/// `Coordinator.*.clear()` calls PLUS two dead content-clear loops that iterated
+/// the already-emptied maps (the #5289 double-clear drift artifact); both are
+/// deleted. This asserts the single-drop by holding external clones of the
+/// record's observability `Arc`s and checking their strong counts collapse from
+/// 2 (record + our clone) to 1 (our clone) after teardown.
+#[test]
+fn stop_inner_drops_worker_record_owners_exactly_once_6242() {
+    let mut coordinator = Coordinator::new();
+    // Seed one worker record; retain external clones of its observability Arcs.
+    let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
+    let panic = rec.panic.clone();
+    let exception_ring = rec.exception_ring.clone();
+    let last_resolution = rec.last_resolution.clone();
+    coordinator.workers.records.insert(0, rec);
+
+    // Two owners each: the registered record + our external clone.
+    assert_eq!(Arc::strong_count(&panic), 2, "record + external clone own the panic slot");
+    assert_eq!(Arc::strong_count(&exception_ring), 2);
+    assert_eq!(Arc::strong_count(&last_resolution), 2);
+
+    coordinator.stop_inner(false);
+
+    // records.clear() dropped the record — and its four owners — exactly once.
+    assert!(
+        coordinator.workers.records.is_empty(),
+        "stop_inner clears the records map"
+    );
+    assert_eq!(
+        Arc::strong_count(&panic),
+        1,
+        "the record's panic Arc is dropped exactly once (no lingering owner)"
+    );
+    assert_eq!(
+        Arc::strong_count(&exception_ring),
+        1,
+        "the record's exception-ring Arc is dropped exactly once"
+    );
+    assert_eq!(
+        Arc::strong_count(&last_resolution),
+        1,
+        "the record's last-resolution Arc is dropped exactly once"
     );
 }
 

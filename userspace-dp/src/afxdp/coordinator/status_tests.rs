@@ -272,15 +272,57 @@ fn drain_session_deltas_no_overflow_leaves_latch_clear() {
 // wiring. `Coordinator::recent_exceptions()` drains the control-thread ring
 // plus EVERY per-worker ring, sorts by monotonic timestamp, and caps at the
 // historical ring depth; `last_resolution()` picks the newest across the
-// control slot and every per-worker slot. The per-worker rings are inserted
-// at bring-up (`reconcile/bringup.rs`) and dropped on teardown/spawn-Err
-// (`worker_exception_rings.remove` / `worker_last_resolution.remove`). Prior
-// coverage exercised only the single-ring POD/sampler/reconstruction path;
-// these lock the cross-worker merge/sort/cap + the teardown drop.
+// control slot and every per-worker slot. #6242: the per-worker rings +
+// last-resolution slots now live on each worker's `WorkerRuntimeRecord`
+// (`workers.records`), registered as one op at bring-up
+// (`reconcile/bringup.rs`) and dropped when the record is removed on
+// teardown (a failed spawn never registers a record). Prior coverage
+// exercised only the single-ring POD/sampler/reconstruction path; these lock
+// the cross-worker merge/sort/cap + the record-drop teardown.
 mod exception_ring_merge_6101 {
     use super::*;
     use crate::afxdp::disposition::{ExceptionEvent, ResolutionEvent};
     use std::time::{Duration, Instant};
+
+    /// #6242: a bare dummy `WorkerHandle`. These tests exercise the merge/sort
+    /// of the per-worker EXCEPTION RING / LAST-RESOLUTION slots, not the
+    /// handle, so the handle is inert.
+    fn dummy_handle() -> WorkerHandle {
+        WorkerHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            heartbeat: Arc::new(AtomicU64::new(0)),
+            commands: Arc::new(Mutex::new(VecDeque::new())),
+            session_export_ack: Arc::new(AtomicU64::new(0)),
+            cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            runtime_atomics: Arc::new(crate::afxdp::worker_runtime::WorkerRuntimeAtomics::new()),
+            cold_path_atomics: Arc::new(crate::afxdp::cold_path_hist::WorkerColdPathAtomics::new()),
+            join: None,
+        }
+    }
+
+    /// #6242: register a worker whose runtime record carries the given
+    /// exception ring (the field under test) and default everything else.
+    fn insert_worker_with_exception_ring(
+        coord: &mut Coordinator,
+        worker_id: u32,
+        exception_ring: Arc<Mutex<ExceptionEventRing>>,
+    ) {
+        let mut rec = WorkerRuntimeRecord::for_test(dummy_handle());
+        rec.exception_ring = exception_ring;
+        coord.workers.records.insert(worker_id, rec);
+    }
+
+    /// #6242: register a worker whose runtime record carries the given
+    /// last-resolution slot (the field under test) and default everything else.
+    fn insert_worker_with_last_resolution(
+        coord: &mut Coordinator,
+        worker_id: u32,
+        last_resolution: Arc<Mutex<Option<ResolutionEvent>>>,
+    ) {
+        let mut rec = WorkerRuntimeRecord::for_test(dummy_handle());
+        rec.last_resolution = last_resolution;
+        coord.workers.records.insert(worker_id, rec);
+    }
 
     #[test]
     fn recent_exceptions_merges_and_sorts_across_workers_and_control_ring() {
@@ -299,7 +341,7 @@ mod exception_ring_merge_6101 {
             g.push(ExceptionEvent::for_test(base + Duration::from_millis(10), "w0_a", "w0"));
             g.push(ExceptionEvent::for_test(base + Duration::from_millis(50), "w0_b", "w0"));
         }
-        coord.worker_exception_rings.insert(0, w0);
+        insert_worker_with_exception_ring(&mut coord, 0, w0);
 
         // Worker 1 ring: events at t+20ms and t+40ms.
         let w1 = Arc::new(Mutex::new(ExceptionEventRing::new()));
@@ -308,7 +350,7 @@ mod exception_ring_merge_6101 {
             g.push(ExceptionEvent::for_test(base + Duration::from_millis(20), "w1_a", "w1"));
             g.push(ExceptionEvent::for_test(base + Duration::from_millis(40), "w1_b", "w1"));
         }
-        coord.worker_exception_rings.insert(1, w1);
+        insert_worker_with_exception_ring(&mut coord, 1, w1);
 
         // Merge: all 5 events from 2 workers + the control ring, ordered by
         // monotonic timestamp (the read-side contract: oldest-first among the
@@ -321,10 +363,10 @@ mod exception_ring_merge_6101 {
             "events from 2 workers + the control ring merge sorted by monotonic timestamp"
         );
 
-        // Teardown: removing worker 0's ring (mirroring bringup.rs's
-        // `.remove(&worker_id)` on spawn-Err / teardown) drops its events from
+        // Teardown: removing worker 0's record (#6242: the whole runtime
+        // record, which drops its exception ring with it) drops its events from
         // the drain; worker 1 + control remain, still sorted.
-        coord.worker_exception_rings.remove(&0);
+        coord.workers.records.remove(&0);
         let after: Vec<String> = coord
             .recent_exceptions()
             .into_iter()
@@ -357,7 +399,7 @@ mod exception_ring_merge_6101 {
                     ));
                 }
             }
-            coord.worker_exception_rings.insert(wid, ring);
+            insert_worker_with_exception_ring(&mut coord, wid, ring);
         }
 
         let merged = coord.recent_exceptions();
@@ -387,7 +429,8 @@ mod exception_ring_merge_6101 {
         *coord.last_resolution.lock().expect("control") =
             Some(ResolutionEvent::for_test(base + Duration::from_millis(10), 10));
         // Worker 0 slot: t+30ms, egress 30 (the newest).
-        coord.worker_last_resolution.insert(
+        insert_worker_with_last_resolution(
+            &mut coord,
             0,
             Arc::new(Mutex::new(Some(ResolutionEvent::for_test(
                 base + Duration::from_millis(30),
@@ -395,7 +438,8 @@ mod exception_ring_merge_6101 {
             )))),
         );
         // Worker 1 slot: t+20ms, egress 20.
-        coord.worker_last_resolution.insert(
+        insert_worker_with_last_resolution(
+            &mut coord,
             1,
             Arc::new(Mutex::new(Some(ResolutionEvent::for_test(
                 base + Duration::from_millis(20),
@@ -410,7 +454,8 @@ mod exception_ring_merge_6101 {
         );
 
         // Teardown of the newest slot → the next-newest (worker 1, t+20) wins.
-        coord.worker_last_resolution.remove(&0);
+        // #6242: removing worker 0's record drops its last-resolution slot.
+        coord.workers.records.remove(&0);
         let after = coord.last_resolution().expect("resolution");
         assert_eq!(
             after.egress_ifindex, 20,

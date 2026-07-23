@@ -522,6 +522,12 @@ pub(crate) use self::coordinator::ReconcileError;
 // #6244: the typed reconcile progress / failure identity, named by the
 // control-plane server tests and any consumer that inspects the stage.
 pub(crate) use self::coordinator::{MandatoryPin, ReconcileStage, WorkerBindShortfall};
+// #6242: the per-worker transactional runtime record, re-exported into afxdp
+// scope so the HA modules' `#[path]`-included test child (`ha_tests.rs`, via
+// `use super::*`) can seed `workers.records` — mirroring how `WorkerHandle`
+// resolves for the same tests.
+#[cfg(test)]
+pub(in crate::afxdp) use self::coordinator::WorkerRuntimeRecord;
 // #2962: the lock-free owner-RG export wait handle. The control-socket
 // dispatcher (server/handlers) names this as the return type of
 // kick_owner_rg_export so it can run the blocking ack-wait off the

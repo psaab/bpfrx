@@ -16,7 +16,7 @@ use super::ReconcileSnapshotFds;
 // the same here brings them into bringup's scope.
 use super::super::super::*;
 use super::super::supervisor::{spawn_supervised_aux, spawn_supervised_worker};
-use super::super::{Coordinator, WorkerHandle};
+use super::super::{Coordinator, WorkerHandle, WorkerRuntimeRecord};
 
 /// #5143: how long `bring_up_workers` waits for every newly-started worker to
 /// report its startup readiness (the set of planned bindings whose XSK
@@ -362,21 +362,25 @@ pub(super) fn bring_up_workers(
             .cloned()
             .unwrap_or_else(|| Arc::new(Mutex::new(VecDeque::new())));
         // #5289: give each worker its OWN exception ring + last-resolution
-        // slot (registered in the coordinator so the ~1 Hz status thread can
-        // drain them). This replaces the shared process-global
-        // `recent_exceptions`/`last_resolution` mutexes whose cross-worker
-        // contention was the DoS. The per-worker mutex is locked only by its
-        // owning worker plus the status reader — no cross-worker false
-        // sharing. Paired with the `.remove(&worker_id)` on the spawn-Err arm
-        // and the teardown clear.
+        // slot so the ~1 Hz status thread can drain them. This replaces the
+        // shared process-global `recent_exceptions`/`last_resolution` mutexes
+        // whose cross-worker contention was the DoS. The per-worker mutex is
+        // locked only by its owning worker plus the status reader — no
+        // cross-worker false sharing.
+        //
+        // #6242: allocate each `Arc` ONCE, then RETAIN one clone for the
+        // post-spawn-success runtime record (`record_exception_ring` /
+        // `record_last_resolution`) and MOVE the original into
+        // `WorkerPublishedTelemetry` (the worker-facing bundle takes them by
+        // value below). Same allocation + live-worker ownership topology as
+        // master — the record and the live worker share the alloc — but the
+        // record is registered as ONE `records.insert` AFTER the spawn
+        // succeeds, so there is no pre-spawn coordinator-map insert to unwind
+        // on a spawn failure (the #4952 differential is structural).
         let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
-        coord
-            .worker_exception_rings
-            .insert(worker_id, recent_exceptions.clone());
+        let record_exception_ring = recent_exceptions.clone();
         let last_resolution = Arc::new(Mutex::new(None));
-        coord
-            .worker_last_resolution
-            .insert(worker_id, last_resolution.clone());
+        let record_last_resolution = last_resolution.clone();
         let recent_session_deltas = coord.recent_session_deltas.clone();
         let stop_clone = stop.clone();
         let heartbeat_clone = heartbeat.clone();
@@ -404,11 +408,15 @@ pub(super) fn bring_up_workers(
             std::sync::Arc::new(crate::afxdp::cold_path_hist::WorkerColdPathAtomics::new());
         let cold_path_atomics_clone = cold_path_atomics.clone();
         // #925 Phase 1: per-worker panic slot, keyed by worker_id.
-        // Paired with `coord.worker_panics.remove(&worker_id)` on
-        // the spawn-Err arm below — DO NOT split that pairing across
-        // a helper without re-validating the panic-payload contract.
+        // #6242: retain ONE clone (`record_panic`) for the post-spawn-success
+        // runtime record and pass a clone into `spawn_supervised_worker` (its
+        // catch_unwind closure owns it, `supervisor.rs`). Same allocation +
+        // live-worker ownership topology as master — the record holds the same
+        // `Arc` the supervisor closure writes the panic payload into. No
+        // pre-spawn coordinator-map insert, so the spawn-Err arm has nothing to
+        // `.remove` (the #4952 differential is structural).
         let panic_slot = Arc::new(Mutex::new(None::<String>));
-        coord.worker_panics.insert(worker_id, panic_slot.clone());
+        let record_panic = panic_slot.clone();
         // #5143: the worker's end of the startup-readiness channel. Moved into
         // the worker body; `worker_loop` sends the achieved bound-slot set on
         // it after setup, before entering the steady loop.
@@ -519,13 +527,50 @@ pub(super) fn bring_up_workers(
                     }
                 },
             )
-        } else if coord.force_worker_spawn_fail > 0 {
+        } else if coord.force_worker_spawn_fail > 0 && coord.force_worker_spawn_fail_skip == 0 {
+            // #4952 / #6242: the forced spawn failure fires once the skip credit
+            // is exhausted. With `force_worker_spawn_fail_skip == 0` (the #4952
+            // default) this fails the FIRST planned worker; with a positive skip
+            // it fails the `(skip+1)`th, after the first `skip` workers launched
+            // (as healthy stubs, below) — exercising PARTIAL-success rollback.
             coord.force_worker_spawn_fail -= 1;
             drop(body);
             Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                "forced worker spawn failure (test seam #4952)",
+                "forced worker spawn failure (test seam #4952/#6242)",
             ))
+        } else if coord.force_worker_healthy_stub {
+            // #6242: benign HEALTHY stub — reports the FULL planned bound set so
+            // the readiness barrier passes, then heartbeats until stopped. Used
+            // to launch the workers that PRECEDE a fail-at-K spawn failure (or
+            // that coexist with a single bind-incomplete worker) WITHOUT running
+            // the real `worker_loop`, which cannot bind a real XSK in-process.
+            // When skipping toward a forced failure, consume one skip credit so
+            // the failure fires on the intended Kth worker.
+            if coord.force_worker_spawn_fail > 0 && coord.force_worker_spawn_fail_skip > 0 {
+                coord.force_worker_spawn_fail_skip -= 1;
+            }
+            drop(body);
+            let full_bound: Vec<u32> = planned_slots.iter().copied().collect();
+            let stub_stop = stop.clone();
+            let stub_heartbeat = heartbeat.clone();
+            let stub_tx = startup_report_tx.clone();
+            let stub_worker_id = worker_id;
+            spawn_supervised_worker(worker_id, runtime_atomics.clone(), panic_slot, move || {
+                let _ = stub_tx.send(WorkerStartupReport {
+                    worker_id: stub_worker_id,
+                    bound_slots: full_bound,
+                    binding_failures: Vec::new(),
+                    recovered_fallbacks: Vec::new(),
+                });
+                let mut ticks = 0u32;
+                while !stub_stop.load(std::sync::atomic::Ordering::Relaxed) && ticks < 5_000 {
+                    stub_heartbeat
+                        .store(monotonic_nanos(), std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    ticks += 1;
+                }
+            })
         } else {
             spawn_supervised_worker(worker_id, runtime_atomics.clone(), panic_slot, body)
         };
@@ -542,17 +587,30 @@ pub(super) fn bring_up_workers(
                 // barrier's bound-vs-planned check below.
                 planned_slots_by_worker.insert(worker_id, planned_slots);
                 spawned_worker_ids.push(worker_id);
-                coord.workers.handles.insert(
+                // #6242: registration is ONE `records.insert` AFTER the spawn
+                // succeeded. The record consolidates the worker's handle plus
+                // its three observability `Arc`s (panic / exception ring /
+                // last-resolution) — the same allocations the worker telemetry
+                // and the supervisor closure hold. "Registered" now type-level
+                // means "spawn succeeded and all four owners exist"; a failed
+                // worker never reaches here, so its locals just drop (the #4952
+                // differential: launched records are never touched).
+                coord.workers.records.insert(
                     worker_id,
-                    WorkerHandle {
-                        stop,
-                        heartbeat,
-                        commands,
-                        session_export_ack,
-                        cos_status,
-                        runtime_atomics,
-                        cold_path_atomics,
-                        join: Some(join),
+                    WorkerRuntimeRecord {
+                        handle: WorkerHandle {
+                            stop,
+                            heartbeat,
+                            commands,
+                            session_export_ack,
+                            cos_status,
+                            runtime_atomics,
+                            cold_path_atomics,
+                            join: Some(join),
+                        },
+                        panic: record_panic,
+                        exception_ring: record_exception_ring,
+                        last_resolution: record_last_resolution,
                     },
                 );
             }
@@ -566,15 +624,16 @@ pub(super) fn bring_up_workers(
                     err: err.to_string(),
                 };
                 coord.last_reconcile_stage = stage.clone();
-                // #925 Phase 1: the panic slot was inserted before
-                // spawn; drop it now so a snapshot reader doesn't
-                // see a phantom slot for a worker that never ran.
-                coord.worker_panics.remove(&worker_id);
-                // #5289: the per-worker ring/last-resolution slots were
-                // inserted before spawn; drop them so a status reader does
-                // not see phantom slots for a worker that never ran.
-                coord.worker_exception_rings.remove(&worker_id);
-                coord.worker_last_resolution.remove(&worker_id);
+                // #6242: registration is POST-spawn-success, so a FAILED worker
+                // never had a record — there is nothing to unwind. The
+                // pre-#6242 layout inserted the panic slot (#925) + exception
+                // ring / last-resolution slot (#5289) BEFORE spawn and had to
+                // `.remove(&worker_id)` all three here; those removes are gone.
+                // The record's `Arc` locals (`record_panic` /
+                // `record_exception_ring` / `record_last_resolution`) simply
+                // drop at end of this loop iteration. LAUNCHED workers' records
+                // are untouched (the #4952 differential — they are reclaimed by
+                // the next reconcile's teardown).
                 if let Ok(mut recent) = coord.recent_exceptions.lock() {
                     // #6244: the control notice still carries the byte-identical
                     // legacy stage string (rendered from the typed stage), so
@@ -641,7 +700,9 @@ pub(super) fn bring_up_workers(
         return Err(WorkerBringUpError::BindIncomplete(stage));
     }
     coord.last_reconcile_stage = ReconcileStage::Spawned {
-        handles: coord.workers.handles.len(),
+        // #6242: the `Spawned` stage's `handles` field is the worker COUNT,
+        // now sourced from the consolidated `records` map (was `handles`).
+        handles: coord.workers.records.len(),
         identities: coord.workers.identities.len(),
         live: coord.workers.live.len(),
     };
@@ -734,7 +795,7 @@ pub(super) fn bring_up_workers(
     }
     // #1881: three-pass reconcile (degenerates to pure spawn here —
     // stop_inner cleared the entry map before this bring-up, and the
-    // worker spawn loop above populated `workers.handles`, satisfying
+    // worker spawn loop above populated `workers.records`, satisfying
     // the spawn-pass worker gate).
     coord.reconcile_local_tunnel_sources();
     coord.spawn_wg_control_threads();
