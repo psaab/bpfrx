@@ -789,3 +789,42 @@ func (s *Store) ActiveApplied() bool {
 	}
 	return s.appliedDigest == configTextDigest(s.active.Format())
 }
+
+// ActiveDigest returns the convergence digest of the CURRENT active config
+// text — exactly the value ActiveApplied() compares appliedDigest against
+// (configTextDigest(s.active.Format()), the ShowActive render). It lets a
+// caller CAPTURE the digest of the config it is about to apply, under its own
+// apply serialization, and stamp that captured value later via
+// MarkAppliedDigest — instead of re-reading s.active at stamp time. A concurrent
+// promoter (a local commit / commit-confirmed rollback) that mutated s.active
+// between the apply and a post-serialization stamp would otherwise make
+// MarkActiveApplied key the marker to a different, never-applied tree (the #6296
+// TOCTOU). Empty when active is nil (nothing to have applied).
+func (s *Store) ActiveDigest() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.active == nil {
+		return ""
+	}
+	return configTextDigest(s.active.Format())
+}
+
+// MarkAppliedDigest records that the config whose convergence digest is
+// `digest` has completed a full apply to the dataplane/kernel (#6296). Unlike
+// MarkActiveApplied — which re-reads s.active at call time — it stamps a digest
+// the caller captured earlier (via ActiveDigest) for the exact tree it applied.
+// So a stamp taken after the apply serialization is released, or one racing a
+// concurrent promoter that mutated s.active in that window, cannot key the
+// marker to a different, never-applied tree. The cluster config-sync path
+// (daemon.syncAndApply) captures the digest right after SyncApply promotes the
+// peer config — while still holding the apply semaphore — and replays it here on
+// full success. An empty digest is a no-op (nothing was captured / applied); it
+// deliberately does NOT clear a prior digest.
+func (s *Store) MarkAppliedDigest(digest string) {
+	if digest == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appliedDigest = digest
+}

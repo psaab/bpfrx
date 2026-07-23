@@ -707,12 +707,19 @@ outside the monitor loop:
   already rides the failover request/commit payloads), so no mixed-base
   compatibility concern, and it defends against requester death/partition that an
   abort frame could not. Only a REMOTE transfer-out arms a lease; `ManualFailover`
-  / `ManualFailoverBatch` / `ForceSecondary` clear any stale entry at the demotion
-  site so a deliberate operator or ISSU hold is never auto-restored. The lease
+  / `ManualFailoverBatch` / `ForceSecondary` / `ResetFailover` clear any stale
+  entry at their demotion/reset site so a deliberate operator or ISSU hold is
+  never auto-restored (`ResetFailover` clears it for map hygiene — its restore is
+  already gated on `ManualFailover`, which the reset clears; #6301). The lease
   duration (`SetRemoteTransferOutLeaseDuration`, default
   `DefaultRemoteTransferOutLease` = 30s, floored at 15s) is sized above the
   requester's worst-case post-ACK commit latency (local commit-ready settle +
-  commit round-trip) so a legitimate slow commit never trips it. reqID is threaded
+  commit round-trip) so a legitimate slow commit never trips it. The upstream 20s
+  failover-ACK cap (`failoverAckTimeout`, `sync.go`) further bounds this: if the
+  owner's actuation barrier delays the applied-ack past 20s the requester times
+  out and sends NO commit — the exact stranded case the lease-expiry restore
+  handles — so a large `failoverActuateTimeout` cannot delay a real commit past
+  the lease. reqID is threaded
   into `OnRemoteFailover`/`OnRemoteFailoverBatch`/`OnRemoteFailoverCommit`/
   `OnRemoteFailoverCommitBatch` (`sync.go`) to arm/clear it.
 - HA delete-sync callbacks fire from the GC loop. They must not block, and
