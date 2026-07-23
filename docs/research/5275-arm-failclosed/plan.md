@@ -3,10 +3,13 @@
 - **Issue:** #5275 (HIGH; bug, dataplane, security, vsrx-parity)
 - **Research branch:** `research/5275-arm-failclosed`
 - **Base:** origin/master @ `6131eb4e6`
-- **Revision:** r9 (Codex r7 ruled D1–D4 SOUND and isolated D5 as the one unsafe
-  design choice; r9 redesigns D5 around the SHIPPED peer-side liveness-suppression +
-  a stale-ownership scrub, and folds the D1/D4 wording fixes. Codex has ruled the
-  architecture VIABLE across five consecutive rounds.)
+- **Revision:** r10 (Codex r8 confirmed D1–D4 correct; r10 grounds D5 in the SHIPPED
+  preserved-address crash recovery — `reconcileDirectVIPOwnership` + `surfaceStaleVIP`
+  #5482 — so the crash-restart handoff is "no worse than the existing xpfd-crash
+  window", scopes the live path to zero-publication-after-fast-fence, and flags the ONE
+  genuine operations tradeoff (accept-existing-window vs external STONITH) for human
+  sign-off; also fixes the §5 facade-OPEN omission. Architecture VIABLE across six
+  consecutive Codex rounds; D1–D4 Codex-accepted.)
 - **Prior art:** PR #6358 (draft) — MERGE-NEEDS-MAJOR. Superseded.
 - **Status:** PLAN-READY candidate (research only — no production code;
   `/engineer 5275`).
@@ -176,10 +179,10 @@ destroyed).
 `startTakeoverMachinery()` is the SOLE `armPending → armed` release path and owns the
 full post-proof lifecycle inventory IN ORDER: enable forwarding (+readback) → remove
 barrier (+readback) → start the post-proof consumers (session/config sync, GC,
-watchdog, reconcile loops) → **clear `dataplaneUnproven` LAST** (which may
-synchronously re-elect, so it must be the final ownership-enabling action, with
-nothing following it). A crash at any earlier step stays closed. `dataplaneUnproven`
-is never cleared outside this owner.
+watchdog, reconcile loops) → **OPEN the revocable dataplane facade (§7)** →
+**clear `dataplaneUnproven` LAST** (which may synchronously re-elect, so it must be the
+final ownership-enabling action, with nothing following it). A crash at any earlier
+step stays closed. `dataplaneUnproven` is never cleared outside this owner.
 
 ---
 
@@ -460,40 +463,54 @@ resolved below with a recommended choice (the human approves/overrides at `/engi
   non-authoritative). Recovery is thus RESTART-based: the correction is staged for the
   next restart's arm attempt; the held node never promotes it live.
 
-- **D5 — Stale-ownership scrub without racing the peer's election (Codex r6 §5 +
-  r7 UNSAFE).** The r8 "fence, then start advertising, so the peer can't elect first"
-  is WRONG (Codex r7, confirmed in source): on a **former-primary CRASH restart** the
-  peer's `lastSeen` timer runs INDEPENDENTLY of when the replacement daemon starts and
-  it calls `electSingleNode()` BEFORE any optional fencing (heartbeat_manager.go:404);
-  the failed node cannot control that ordering (it may not even be running yet), the
-  interval/threshold can be a valid **1 ms/1** (schema_chassis.go:74), and `Kea
-  Apply(nil)` is NOT a millisecond op (systemd stop, 15 s/call, dhcpserver.go). The
-  correct model does NOT try to beat the election — the peer's takeover is CORRECT and
-  desired — it prevents DUAL ownership and reuses the SHIPPED suppression:
-  1. **Crash-restart (the §3 in-scope case):** the peer's independent-timer takeover
-     is correct. The restarting fail-closed node must SCRUB its STALE inherited state
-     so it does not dual-own with the now-promoted peer: remove owned VIPs
-     SYNCHRONOUSLY (fast netlink, verified) + advertise weight-zero yield immediately +
-     stop Kea and clear FRR ASYNChronously as tracked teardown debt (these are service
-     / route-advertisement de-dup, not VIP dual-ownership; the §6 barrier + the
-     weight-zero yield mean the node forwards nothing and owns no RG meanwhile). It
-     NEVER re-advertises ownership. There is no race to win — only stale state to
-     remove.
-  2. **Live re-arm (a running PRIMARY loses its dataplane):** reuse the EXISTING
-     peer-side liveness-suppression (`shouldSuppressPeerHeartbeatTimeout` /
-     `SendLivenessKeepalive`, the bounded self-clearing 2 s-recency / 5 s-cap guard the
-     heartbeat RESTART path already uses, heartbeat_manager.go:171) as the promotion
-     interlock: keep the authenticated keepalive flowing while the local VIP fence +
-     weight-zero yield are applied, then the peer promotes on the yield — a genuinely
-     dead node still fails over because the suppression is bounded and message-recency
-     derived.
-  3. **§3 reconciliation:** "attraction cleared+verified before takeover" is scoped to
-     the FAST attraction (VIP — synchronous verified netlink); the SLOW attraction
-     (Kea service, FRR routes) is de-duplicated ASYNC as teardown debt, because
-     blocking the yield on a 15 s Kea stop / 40 s FRR clear would DELAY the peer's
-     clean takeover (worse), and the barrier + weight-zero yield already prevent this
-     node from forwarding or owning any RG. `pkg/cluster` (the interlock reuse) and the
-     scrub sequencing are the §13-D5 deliverables.
+- **D5 — Fail-closed HA ownership handoff (Codex r6 §5 → r7 → r8; the ONE remaining
+  human design decision).** Two distinct cases; the crash case is bounded by an
+  EXISTING mechanism, the live case needs a small new gate.
+
+  **(a) Former-primary CRASH restart — reuse the SHIPPED preserved-address recovery;
+  #5275 adds only "never re-claim".** When only `xpfd` crashes but the kernel keeps
+  the NODAD VIPs, the design ALREADY treats this as a known duplicate-address hazard:
+  `reconcileDirectVIPOwnership` runs EVERY tick because "the kernel preserves NODAD
+  addresses across daemon restarts, so stale addresses can exist without a state
+  transition" (daemon_ha.go:910), and `surfaceStaleVIP` (#5482, instance_vip.go)
+  self-heals a failed VIP removal with a bounded async retry. On such a crash the peer
+  correctly promotes (its GARP wins the hosts' ARP to the peer's MAC) — this is the
+  SAME transient duplicate-address/ECMP window ANY `xpfd` crash has today, NOT a
+  #5275 regression, and a truly-dead box has no reachable VIPs at all. #5275's ONLY
+  addition on this path: the arm-failed restart (i) NEVER re-claims ownership
+  (weight-zero yield, never re-advertise) and (ii) scrubs its stale VIP/RA/Kea/FRR via
+  the SAME existing reconcile/`surfaceStaleVIP` convergence. So the contract is "no
+  WORSE than the existing crash-recovery window", which the reconcile loop + peer GARP
+  already bound. A ZERO-window guarantee is impossible without external
+  **STONITH-style fencing** (a power/port fence the surviving peer controls) — that is
+  a separate operator/hardware decision, called out below as the human sign-off.
+
+  **(b) Live re-arm (a RUNNING primary loses its dataplane) — gate zero-publication on
+  completed fast fencing.** Here the node IS running and controls its actions, but the
+  shipped `shouldSuppressPeerHeartbeatTimeout` guard only covers the TIMEOUT path — a
+  received **weight-zero heartbeat runs election immediately** (heartbeat_manager.go:293),
+  so the interlock cannot be the keepalive alone. The gate is on OUR side: **emit the
+  weight-zero yield ONLY AFTER** the synchronous, verified fast withdrawal of the owned
+  VIP **and** the Kea stop (so when the peer elects on our zero, the VIP/DHCP authority
+  is already gone). FRR route de-dup is async (the §6 barrier already blocks forwarding;
+  the transient ECMP equals today's failover). For a zero-DROP (not merely
+  no-dual-owner) handoff, an OPTIONAL acknowledged suppression lease (extend
+  `SendLivenessKeepalive` with an ack + a bounded lease, dead node still promotes on
+  expiry) is a follow-up, not required for safety.
+
+  **(c) State machine + reconciliation:** define `armed → (arm-verify fails) → fencing
+  → armFailed` with the arm-coverage proof (§5) as the failure detector; crash-mid-fence
+  degrades to path (a). §3/§12 "verified withdrawal before yield" is scoped to the LIVE
+  path (b) — synchronous VIP + Kea — while the crash path (a) reuses the existing
+  reconcile convergence (a dead node cannot verify anything; the peer's GARP + the
+  restart scrub own it). `pkg/cluster` + `pkg/vrrp` (the zero-pub-after-fence gate) and
+  the scrub sequencing are the §13-D5 deliverables.
+
+  **HUMAN SIGN-OFF (D5):** accept "crash-restart handoff is no worse than the existing
+  `xpfd`-crash window (reconcile + GARP + surfaceStaleVIP bound it)" — RECOMMENDED, no
+  new hardware — **versus** adding external STONITH fencing for a zero dual-address
+  window (new operational/hardware dependency). This is the one #5275 decision that is
+  a genuine operations tradeoff, not a code detail.
 
 Two minor residuals folded: §8's `armPending` route now distinguishes the **boot
 single-generation arm** (PR1) from the §9 **staged-delta transaction** (PR3); the §5
