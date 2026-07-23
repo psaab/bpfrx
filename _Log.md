@@ -57809,3 +57809,17 @@ top.
     pkg/cluster/sync_conn_gen.go,
     pkg/cluster/sync_config_epoch_sweep_race_6284_test.go,
     docs/session-sync-architecture.md, pkg/cluster/README.md
+
+## 2026-07-23 — #6169 heartbeat boot-epoch anti-replay (fix/6169-heartbeat-boot-epoch)
+- **Timestamp**: 2026-07-23
+- **Action**: Added a monotonic-across-reboot boot-epoch counter to the keyed
+  cluster heartbeat, closing the >=65-recording sustained replay the bounded
+  session ring (#5477/#6167) cannot. v2 auth trailer ("XPFE", +8-byte signed
+  epoch); receiver `epochAdmit` rejects any frame below the per-peer high-water
+  epoch; v1-after-v2 rejected as a downgrade; dual-accept migration preserves a
+  mixed-version cluster. Sender epoch = max(persisted+1, wallclock-nanos)
+  persisted via fsatomic (SNMP engineBoots pattern). Fail-on-revert test binds
+  the retired-incarnation reject after ring churn.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/manager.go,
+  pkg/cluster/README.md

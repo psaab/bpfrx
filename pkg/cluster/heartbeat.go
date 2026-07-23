@@ -86,8 +86,24 @@ const (
 
 	// heartbeatAuthTrailerSize = magic(4) + session(8) + counter(8) + HMAC(32).
 	// session+counter are the anti-replay nonce: a random per-sender-process
-	// session id plus a monotonic per-session counter.
+	// session id plus a monotonic per-session counter. This is the v1 (#4107)
+	// trailer, still emitted by a not-yet-upgraded peer and accepted during a
+	// rolling upgrade.
 	heartbeatAuthTrailerSize = 4 + 8 + 8 + heartbeatAuthMACSize
+
+	// heartbeatAuthEpochMagic marks the #6169 v2 auth trailer, which additionally
+	// carries a monotonic-across-reboot boot epoch. It is DISTINCT from
+	// heartbeatAuthMagic ("XPFA") so a reader can tell a v1 (nonce-only) trailer
+	// from a v2 (epoch) trailer at the tail of the frame, and it is tried BEFORE
+	// the v1 magic during parse. An old reader that only knows v1 ignores the
+	// longer v2 trailer (it looks for "XPFA" at the v1 offset and finds none),
+	// so a v2 frame is wire-compatible with a legacy peer — the same dual-accept
+	// property the v1 trailer has against a fully legacy peer.
+	heartbeatAuthEpochMagic = "XPFE"
+
+	// heartbeatAuthEpochTrailerSize = magic(4) + session(8) + counter(8) +
+	// epoch(8) + HMAC(32).
+	heartbeatAuthEpochTrailerSize = 4 + 8 + 8 + 8 + heartbeatAuthMACSize
 )
 
 // HeartbeatPacket is the wire format for cluster heartbeats.
@@ -442,6 +458,56 @@ func MarshalHeartbeatAuth(pkt *HeartbeatPacket, authKey []byte, session, counter
 	return out
 }
 
+// MarshalHeartbeatAuthEpoch encodes a heartbeat and, when authKey is non-empty,
+// appends the #6169 v2 auth trailer carrying the anti-replay nonce
+// (session,counter) PLUS a monotonic-across-reboot boot epoch. The epoch is
+// SIGNED (inside the HMAC), so an attacker cannot forge a higher epoch, and the
+// receiver rejects any frame whose epoch is below the highest it has accepted
+// from the peer (heartbeatReceiver.epochAdmit). That closes the
+// >=65-recording sustained replay the bounded session ring alone cannot
+// (heartbeatReplaySessions): a retired incarnation always carries a lower epoch
+// than the live one and is rejected regardless of session-ring churn.
+//
+// When authKey is empty the output is byte-identical to MarshalHeartbeat — a
+// node without a key emits legacy frames (dual-accept). This is the v2
+// counterpart of MarshalHeartbeatAuth and preserves its INVARIANT: once a key
+// is configured the returned frame is ALWAYS signed, because the trailer space
+// is reserved WHILE building the body (marshalHeartbeatBody drops best-effort
+// monitors to make room) — a keyed heartbeat is never silently downgraded to
+// unsigned (which an enforcing peer would reject → split-brain). The key is
+// never logged.
+func MarshalHeartbeatAuthEpoch(pkt *HeartbeatPacket, authKey []byte, session, counter, epoch uint64) []byte {
+	if len(authKey) == 0 {
+		return marshalHeartbeatBody(pkt, 0)
+	}
+	// Reserve the (larger) v2 trailer up front so the signed frame is guaranteed
+	// to fit within the frame cap.
+	body := marshalHeartbeatBody(pkt, heartbeatAuthEpochTrailerSize)
+	if len(body)+heartbeatAuthEpochTrailerSize > maxHeartbeatSize {
+		// Unreachable (uint8-bounded RG count + monitors already truncated to
+		// leave the reserve). Guard so a future change can never SILENTLY
+		// downgrade a keyed heartbeat to unsigned. Fail loud and still sign.
+		slog.Error("cluster: keyed heartbeat exceeds frame cap after monitor truncation; signing anyway to preserve the auth invariant",
+			"body_bytes", len(body), "cap", maxHeartbeatSize)
+	}
+	trailer := make([]byte, heartbeatAuthEpochTrailerSize)
+	copy(trailer[0:4], heartbeatAuthEpochMagic)
+	binary.LittleEndian.PutUint64(trailer[4:12], session)
+	binary.LittleEndian.PutUint64(trailer[12:20], counter)
+	binary.LittleEndian.PutUint64(trailer[20:28], epoch)
+	// Sign the body PLUS magic+session+counter+epoch (everything but the digest),
+	// so the nonce, the epoch, and the whole packet are bound by the MAC.
+	mac := hmac.New(sha256.New, authKey)
+	mac.Write(body)
+	mac.Write(trailer[:28])
+	copy(trailer[28:], mac.Sum(nil))
+
+	out := make([]byte, 0, len(body)+heartbeatAuthEpochTrailerSize)
+	out = append(out, body...)
+	out = append(out, trailer...)
+	return out
+}
+
 // heartbeatAuthTrailer locates the auth trailer at the tail of a raw heartbeat
 // frame and returns its nonce. present is false when the frame carries no
 // trailer (a legacy / not-yet-keyed peer).
@@ -473,6 +539,73 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 	return hmac.Equal(got, mac.Sum(nil))
 }
 
+// heartbeatAuthInfo is the parsed and (when a key is present) verified auth
+// state of a received heartbeat frame.
+type heartbeatAuthInfo struct {
+	present  bool   // a recognized auth trailer (v1 or v2) sits at the tail
+	macOK    bool   // key non-empty AND the trailer's HMAC verified
+	session  uint64 // anti-replay session id (meaningful when present)
+	counter  uint64 // anti-replay counter (meaningful when present)
+	epoch    uint64 // boot epoch (meaningful when hasEpoch)
+	hasEpoch bool   // the trailer is the #6169 v2 form and carries an epoch
+}
+
+// parseHeartbeatAuth locates and verifies the auth trailer at the tail of a raw
+// heartbeat frame. It tries the v2 (epoch) trailer FIRST, then the v1
+// (nonce-only) trailer, so a mixed-version cluster keeps working during a
+// rolling upgrade: a new receiver reads an old peer's v1 frame, and an old
+// receiver silently ignores a new peer's longer trailer (it never finds the v1
+// magic at the v1 offset), exactly the dual-accept property the v1 trailer
+// already had against a fully legacy peer.
+//
+// verifyHeartbeatMAC is format-agnostic — it recomputes the HMAC over
+// data[:len-32] regardless of trailer layout — so a genuine v2 frame verifies
+// under the v2 interpretation and a genuine v1 frame under the v1
+// interpretation. The v2-first order plus the MAC check means a v1 frame whose
+// body bytes coincidentally form the v2 magic at the v2 offset (≈2^-32) fails
+// the v2 MAC and falls through to the correct v1 parse rather than being
+// wrongly rejected.
+//
+// When key is empty, macOK is false (this node cannot verify and may be the
+// not-yet-keyed side of a rolling upgrade) but present/hasEpoch still reflect
+// the detected format.
+func parseHeartbeatAuth(data, key []byte) heartbeatAuthInfo {
+	if len(data) >= heartbeatAuthEpochTrailerSize {
+		start := len(data) - heartbeatAuthEpochTrailerSize
+		if bytes.Equal(data[start:start+4], []byte(heartbeatAuthEpochMagic)) {
+			info := heartbeatAuthInfo{
+				present:  true,
+				session:  binary.LittleEndian.Uint64(data[start+4 : start+12]),
+				counter:  binary.LittleEndian.Uint64(data[start+12 : start+20]),
+				epoch:    binary.LittleEndian.Uint64(data[start+20 : start+28]),
+				hasEpoch: true,
+				macOK:    len(key) > 0 && verifyHeartbeatMAC(data, key),
+			}
+			// A genuine v2 frame verifies here (or we have no key to verify
+			// with). Only when a key is set AND the v2 MAC failed do we retry as
+			// v1 — the frame may be a v1 frame with a coincidental v2 magic.
+			if info.macOK || len(key) == 0 {
+				return info
+			}
+			if s, c, present := heartbeatAuthTrailer(data); present && verifyHeartbeatMAC(data, key) {
+				return heartbeatAuthInfo{present: true, macOK: true, session: s, counter: c}
+			}
+			// A present-but-unverified v2 trailer: keep it present so the
+			// enforce path REJECTS it rather than treating it as unsigned.
+			return info
+		}
+	}
+	if s, c, present := heartbeatAuthTrailer(data); present {
+		return heartbeatAuthInfo{
+			present: true,
+			session: s,
+			counter: c,
+			macOK:   len(key) > 0 && verifyHeartbeatMAC(data, key),
+		}
+	}
+	return heartbeatAuthInfo{}
+}
+
 // heartbeatReplaySessions bounds how many distinct sender sessions the
 // anti-replay tracker remembers a counter watermark for. Each genuine peer
 // reboot picks a fresh random session (randomSessionID) and consumes one slot;
@@ -502,11 +635,16 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 //     (Confirmed empirically: M == heartbeatReplaySessions recordings -> all
 //     replays rejected; M == heartbeatReplaySessions+1 -> sustained admits.)
 //
-// This receiver-only map cannot close that residual completely: a full fix
-// needs a boot-epoch / monotonic-across-reboot counter carried in the frame (a
-// wire change), tracked as a follow-up. It does NOT cause a genuine-peer
-// lockout (an evicted live-peer watermark just makes the peer's next frame
-// never-seen -> admitted) and cannot grow memory (fixed 64-slot array).
+// This receiver-only map cannot close that residual completely on its own: a
+// full fix needs a boot-epoch / monotonic-across-reboot counter carried in the
+// frame (a wire change). That fix SHIPPED in #6169 — MarshalHeartbeatAuthEpoch
+// signs a boot epoch into a v2 trailer and heartbeatReceiver.epochAdmit rejects
+// any frame whose epoch is below the highest accepted from the peer, closing the
+// >= heartbeatReplaySessions+1 sustained replay with O(1) state regardless of
+// ring churn. This ring still gates intra-incarnation (same-epoch) replays and
+// still causes NO genuine-peer lockout (an evicted live-peer watermark just
+// makes the peer's next frame never-seen -> admitted) and cannot grow memory
+// (fixed 64-slot array).
 //
 // 64 slots (64*16 = 1 KiB) bounds memory while forcing an attacker to have
 // captured 65+ distinct daemon incarnations before any replay is sustainable.
@@ -582,6 +720,30 @@ func (a *heartbeatAuthReplay) admit(session, counter uint64) bool {
 	return true
 }
 
+// epochAdmit reports whether an authenticated (MAC-verified) v2 frame's boot
+// epoch is acceptable and, when it is, advances the per-peer high-water epoch.
+// Callers must invoke it only after the MAC has verified — an unauthenticated
+// caller must never mutate epoch state.
+//
+// #6169: a frame whose epoch is STRICTLY BELOW the highest ever accepted from
+// the peer is a replay of a RETIRED incarnation and is rejected — independent
+// of the bounded session ring (heartbeatReplaySessions), so it holds even after
+// >=65 recorded incarnations have churned that ring. The first epoch seen
+// anchors the high-water mark. An EQUAL epoch (another frame from the SAME live
+// incarnation) is admitted — the session+counter ring, not the epoch, is what
+// rejects an intra-incarnation replay. A HIGHER epoch (a genuine reboot with a
+// fresh, strictly-greater boot epoch — see nextBootEpoch) advances the mark.
+func (r *heartbeatReceiver) epochAdmit(epoch uint64) bool {
+	if r.sawEpoch && epoch < r.highEpoch {
+		return false
+	}
+	if epoch > r.highEpoch {
+		r.highEpoch = epoch
+	}
+	r.sawEpoch = true
+	return true
+}
+
 // heartbeatAuthDecision applies the #4107 dual-accept policy for one received
 // heartbeat and returns whether to accept it (and, when rejected, a short
 // reason for logging — never the key or packet bytes).
@@ -617,6 +779,38 @@ func heartbeatAuthDecision(keyConfigured, present, macOK, nonceFresh, peerAuthSe
 	}
 	if peerAuthSeen {
 		return false, "missing auth trailer (enforced: peer previously authenticated)"
+	}
+	return true, ""
+}
+
+// heartbeatEpochDecision applies the #6169 across-reboot boot-epoch policy to
+// one MAC-VERIFIED heartbeat (the caller must only invoke it when macOK). It is
+// composed with heartbeatAuthDecision — the base auth/replay/downgrade policy —
+// so each stays small and independently testable.
+//
+//	hasEpoch      — the frame carried a v2 (epoch-bearing) trailer.
+//	epochFresh    — epochAdmit accepted the epoch (only meaningful when hasEpoch;
+//	                false for a replay of a retired lower-epoch incarnation).
+//	peerEpochSeen — the peer has previously sent a MAC-valid epoch (sawEpoch),
+//	                proving it speaks v2.
+//
+// Policy:
+//   - v2 frame: accept only a fresh epoch; a stale (retired) epoch is a replay.
+//   - v1 frame (no epoch) and the peer never sent an epoch: accept — the peer
+//     has not upgraded to the epoch format yet (rolling upgrade dual-accept).
+//   - v1 frame (no epoch) but the peer HAS sent an epoch: reject — dropping the
+//     epoch once the peer proved it carries one is a downgrade (epoch strip to
+//     replay a captured pre-epoch frame), mirroring the cleartext-downgrade gate
+//     in heartbeatAuthDecision.
+func heartbeatEpochDecision(hasEpoch, epochFresh, peerEpochSeen bool) (bool, string) {
+	if hasEpoch {
+		if !epochFresh {
+			return false, "stale boot epoch (replay of a retired incarnation)"
+		}
+		return true, ""
+	}
+	if peerEpochSeen {
+		return false, "missing boot epoch (enforced: peer previously sent one)"
 	}
 	return true, ""
 }
@@ -678,6 +872,13 @@ type heartbeatReceiver struct {
 	// lazily-arming on-demand fabric RPCs), so it is an atomic.
 	authReplay   heartbeatAuthReplay // per-peer anti-replay watermark
 	peerAuthSeen atomic.Bool         // sticky: peer has sent a valid authed HB
+
+	// #6169 across-reboot boot-epoch anti-replay. Both fields are touched only
+	// from readLoop (like authReplay), so they need no locking. sawEpoch is
+	// sticky: once the peer has proven it carries a boot epoch, a later
+	// MAC-valid frame WITHOUT one is a downgrade (epoch strip) and is rejected.
+	sawEpoch  bool   // a MAC-valid epoch-bearing (v2) frame has been accepted
+	highEpoch uint64 // highest boot epoch accepted from the peer
 }
 
 // peerAuthenticated reports whether the peer has ever sent a valid
@@ -727,7 +928,11 @@ func (s *heartbeatSender) send() {
 	// without a heartbeat restart. Never logged.
 	var data []byte
 	if key := s.mgr.controlLinkAuthKey(); len(key) > 0 {
-		data = MarshalHeartbeatAuth(pkt, key, s.authSession, s.authCounter.Add(1))
+		// #6169: sign with the v2 trailer carrying this incarnation's boot epoch
+		// so the receiver can reject a replayed retired incarnation regardless of
+		// session-ring churn. The epoch is computed once per daemon incarnation
+		// (heartbeatBootEpoch) and reused across heartbeat restarts.
+		data = MarshalHeartbeatAuthEpoch(pkt, key, s.authSession, s.authCounter.Add(1), s.mgr.heartbeatBootEpoch())
 	} else {
 		data = MarshalHeartbeat(pkt)
 	}
@@ -827,17 +1032,30 @@ func (r *heartbeatReceiver) readLoop() {
 		// Dual-accept keeps a mixed-version / not-yet-keyed cluster from
 		// splitting — see heartbeatAuthDecision. The key is never logged.
 		key := r.mgr.controlLinkAuthKey()
-		session, counter, present := heartbeatAuthTrailer(buf[:n])
-		macOK := present && len(key) > 0 && verifyHeartbeatMAC(buf[:n], key)
-		nonceFresh := macOK && r.authReplay.admit(session, counter)
-		accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthSeen.Load())
+		auth := parseHeartbeatAuth(buf[:n], key)
+		nonceFresh := auth.macOK && r.authReplay.admit(auth.session, auth.counter)
+		accept, reason := heartbeatAuthDecision(len(key) > 0, auth.present, auth.macOK, nonceFresh, r.peerAuthSeen.Load())
+		if accept && auth.macOK {
+			// #6169: on a MAC-verified frame, additionally enforce the
+			// across-reboot boot-epoch bound. epochAdmit mutates the high-water
+			// mark only for a fresh (>= high) epoch, so a frame rejected here has
+			// not advanced any accept-only state. r.sawEpoch is read for the
+			// downgrade gate BEFORE epochAdmit could set it (epochAdmit runs only
+			// for a v2 frame, whose branch does not consult peerEpochSeen).
+			epochFresh := auth.hasEpoch && r.epochAdmit(auth.epoch)
+			var epochReason string
+			accept, epochReason = heartbeatEpochDecision(auth.hasEpoch, epochFresh, r.sawEpoch)
+			if !accept {
+				reason = epochReason
+			}
+		}
 		if !accept {
 			r.recvErrors.Add(1)
 			slog.Warn("cluster: heartbeat auth rejected",
 				"reason", reason, "peer_node", pkt.NodeID)
 			continue
 		}
-		if macOK {
+		if auth.macOK {
 			// The peer proved it holds the key — from now on an
 			// unauthenticated frame from it is a downgrade attack. This also
 			// arms the gRPC fabric listener's downgrade-guard (via

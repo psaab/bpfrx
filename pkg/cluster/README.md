@@ -248,11 +248,49 @@ peer liveness (`lastSeen`) or drive election.
   never-seen, so an attacker who captured `heartbeatReplaySessions`+1 (= 65)
   or more distinct incarnations can churn the ring by REPLAY ALONE (no
   reboot, no minting) and SUSTAIN the replay indefinitely; with fewer than
-  65 recordings every retired-session replay is rejected. A complete fix
-  needs a boot-epoch / monotonic-across-reboot counter carried in the frame
-  (a wire change) — tracked as a follow-up. The map still causes NO
-  genuine-peer lockout (an evicted live watermark just makes the peer's next
-  frame never-seen → admitted) and cannot grow memory (fixed 64 slots).
+  65 recordings every retired-session replay is rejected. That residual is
+  now CLOSED by the across-reboot boot epoch (#6169, below). The map still
+  causes NO genuine-peer lockout (an evicted live watermark just makes the
+  peer's next frame never-seen → admitted) and cannot grow memory (fixed 64
+  slots).
+- **Across-reboot boot epoch (#6169) — the complete anti-replay fix.** The
+  bounded ring above cannot close the ≥65-recording sustained replay because
+  it has O(64) memory of retired sessions. `MarshalHeartbeatAuthEpoch` carries
+  a **monotonic-across-reboot boot epoch** in a v2 auth trailer, and the
+  receiver (`heartbeatReceiver.epochAdmit`) rejects any authenticated frame
+  whose epoch is **below the highest it has ever accepted from the peer** — a
+  retired incarnation always carries a lower epoch than the live one, so its
+  replay is rejected with **O(1) state, independent of ring churn**.
+  - **Wire (v2).** A 60-byte trailer `magic "XPFE"(4) + session(8) +
+    counter(8) + epoch(8) + HMAC-SHA256(32)`; the HMAC covers the whole frame
+    plus magic/session/counter/**epoch**, so the epoch cannot be forged. It is
+    parsed by `parseHeartbeatAuth`, which tries the v2 trailer FIRST then the
+    v1 (`heartbeatAuthTrailer`) form, so a mixed-version cluster keeps working:
+    a new receiver reads an old peer's v1 frame, and an old receiver silently
+    ignores the longer v2 trailer (never finds `XPFA` at the v1 offset) — the
+    same additive dual-accept the v1 trailer already had. `verifyHeartbeatMAC`
+    is format-agnostic (it MACs `data[:len-32]`), so a v1 frame whose bytes
+    coincidentally form the v2 magic (≈2⁻³²) fails the v2 MAC and falls through
+    to the correct v1 parse. The never-unsigned-when-keyed invariant holds: the
+    (larger) v2 trailer is reserved up front while building the body.
+  - **Epoch policy (`heartbeatEpochDecision`).** On a MAC-verified frame: a v2
+    frame is accepted only for a fresh (≥ high-water) epoch — a strictly-lower
+    epoch is a retired-incarnation replay and is rejected; a v1 frame (no
+    epoch) is accepted while the peer has NOT yet sent an epoch (rolling
+    upgrade), but once the peer has proven it carries one (`sawEpoch`) a later
+    MAC-valid v1 frame is rejected as a **downgrade** (epoch strip to replay a
+    pre-epoch capture) — mirroring the cleartext-downgrade gate. This composes
+    with `heartbeatAuthDecision`; each stays small and independently tested.
+  - **Sender epoch source (`nextBootEpoch`).** `max(persisted_previous+1,
+    wall_clock_nanos)`, persisted durably to `/var/lib/xpf/ha-boot-epoch` via
+    `fsatomic` (the same persistent-counter pattern as SNMP `engineBoots`).
+    The two terms make it strictly increase across restarts under BOTH a
+    wall-clock step backwards (persisted+1 dominates → no genuine-peer lockout)
+    and a lost state file (wall clock dominates → still above any retired
+    counter). Computed ONCE per daemon incarnation (`heartbeatBootEpoch`,
+    `sync.Once`) and reused across heartbeat restarts (a VRF rebind is the same
+    incarnation); resolved lazily only on the first KEYED send, so an unkeyed
+    cluster never touches the path. A persist failure is non-fatal (logged).
 - **Dual-accept (rolling upgrade), `heartbeatAuthDecision`.** Mirrors
   the #4126 VRRP-checksum dual-accept migration:
   - No local key → accept everything (this node cannot verify; may be

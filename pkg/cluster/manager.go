@@ -206,6 +206,14 @@ type Manager struct {
 	hbPeerAddr     string // last StartHeartbeat peerAddr (for restart)
 	hbVRFDevice    string // last StartHeartbeat vrfDevice (for restart)
 
+	// #6169 boot epoch: a monotonic-across-reboot counter signed into keyed
+	// heartbeats so the peer can reject a replayed retired incarnation. Computed
+	// ONCE per daemon incarnation (bootEpochOnce) and reused across heartbeat
+	// restarts — a VRF rebind / comms restart is the SAME incarnation, so it
+	// keeps the same epoch. See nextBootEpoch and heartbeatReceiver.epochAdmit.
+	bootEpoch     uint64
+	bootEpochOnce sync.Once
+
 	// Sync stats provider (set by daemon after sessionSync creation).
 	syncStats SyncStatsProvider
 
