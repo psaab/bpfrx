@@ -155,6 +155,39 @@ Differences that matter (#1881):
   interface address / CoS queue / NAT64 / NPTv6 rule, or a
   MISSING/UNOPENABLE mandatory map pin) was acked `ok=true` and persisted,
   only to fail-OPEN at the later deferred bring-up.
+- **The map-pin gate is ONE opener shared by both callers (#6243).** The
+  activated `preflight_map_fds` and the deferred `validate_map_pins` used
+  to carry two hand-kept copies of the seven-pin contract (3 mandatory
+  xsk/heartbeat/sessions + 4 optional conntrack v4/v6, dnat_table[/v6]).
+  They now both route through one pure `open_snapshot_maps(&MapPins) ->
+  Result<OpenedSnapshotMaps, MapPinFault>` (`reconcile/snapshot.rs`), so
+  they can never drift on which snapshots pass or how a fault is
+  classified. The opener is side-effect-free and returns the opened FD
+  bundle; the ONLY per-caller difference is keep-vs-drop of that bundle
+  (RAII — the activated path assembles it into `ReconcileSnapshotFds`, the
+  deferred path `.map(|_| ())` drops it), so no `mode` parameter is
+  needed. On a fault a thin COLD ADAPTER on the activated caller stamps
+  `last_reconcile_stage` (from `MapPinFault::stage()` — the typed #6244
+  `ReconcileStage`) plus every registered binding's `last_error` (from
+  `MapPinFault::binding_error()`, which owns the byte-parity trap that the
+  xsk per-binding label is uppercase `XSK` while its stage token is
+  lowercase `xsk`). Unifying FIXES two latent divergences (both normalize
+  the deferred path toward the activated SSOT, both stay fail-closed):
+  (1) the deferred walk was ONE-pass (empty-then-open per pin) while
+  activated was TWO-pass (check all mandatory emptiness first, then open),
+  so a multi-fault snapshot could report a different stage from each path;
+  the shared two-pass order makes them identical. (2) the deferred walk
+  dropped each FD immediately, so under FD-table pressure it could PASS
+  where activated (retaining all seven FDs simultaneously) FAILED; the
+  shared bundle now holds every opened FD until the whole contract
+  succeeds, giving the deferred path the same low-FD failure. Fail-on-
+  revert: `reconcile_all_seven_pin_faults_lock_stage_and_binding_strings_6243`,
+  `map_pin_faults_react_identically_activated_and_deferred_6243`,
+  `multi_fault_map_pins_use_two_pass_precedence_from_both_paths_6243`,
+  `both_paths_open_full_seven_pin_bundle_before_ok_6243`. (Follow-up:
+  #6246's `ReconcileSnapshotFds` state-representability cleanup — no
+  `default()` placeholder, non-`Option` `apply_snapshot` return — is a
+  SEPARATE concern tracked on #6243, not done here.)
 - **Same-plan refresh is a fail-closed atomic swap (#3766).** The
   same-plan `apply_snapshot` leg (binding plan unchanged) runs
   `refresh_runtime_snapshot{,_disarmed}` instead of a full reconcile.

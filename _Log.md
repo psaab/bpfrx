@@ -1,3 +1,52 @@
+## 2026-07-22 — #6243: unify the activated + deferred BPF map-pin preflight
+
+- **Timestamp**: 2026-07-22 (refactor/6243-unify-map-pin-preflight)
+- **Action**: Class-B dedup + two latent divergence fixes on the reconcile
+  map-pin gate. `reconcile/snapshot.rs` carried TWO hand-kept copies of the
+  seven-pin open/validate contract: `preflight_map_fds` (activated reconcile —
+  opens + RETAINS FDs, stamps `last_reconcile_stage` + per-binding `last_error`)
+  and `validate_map_pins` (deferred-apply gate — opens then drops, stage only).
+  Collapsed both onto ONE pure opener `open_snapshot_maps(&MapPins) ->
+  Result<OpenedSnapshotMaps, MapPinFault>` (no side effects, no `mode` param —
+  keep-vs-drop is pure RAII on the returned bundle). The activated caller is now
+  a thin COLD ADAPTER (`fault.stage()` → typed #6244 `ReconcileStage`;
+  `fault.binding_error()` → verbatim per-binding string, owning the
+  uppercase-`XSK`-label vs lowercase-`xsk`-token byte-parity trap); the deferred
+  caller is `open_snapshot_maps(..).map(|_| ()).map_err(|f| MapSetup(f.stage()))`.
+  Removed the now-unused `open_optional_map` (folded into the opener's optional
+  arm as `open_optional_snapshot_map`).
+  - **Divergence 1 FIXED (two-pass multi-fault precedence):** the deferred walk
+    was one-pass (empty-then-open per pin); the shared opener is two-pass (check
+    all 3 mandatory pins for emptiness first, then open). A multi-fault snapshot
+    (earlier mandatory present-but-unopenable + later mandatory empty) now
+    reports the SAME stage from both paths (was `OpenMapFailed(earlier)` deferred
+    vs `MissingPin(later)` activated). Both stay fail-closed.
+  - **Divergence 2 FIXED (FD retention):** the deferred walk dropped each FD
+    immediately, so under FD-table pressure it PASSED where activated (holding
+    all seven) FAILED. The shared bundle retains every opened FD until the whole
+    contract succeeds → deferred now catches the low-FD case too.
+  - **Requiredness matrix preserved (#2444):** 3 mandatory (fatal if empty), 4
+    optional (silent-absent if empty, FATAL if present-but-unopenable). Abort
+    BEFORE teardown/publish (#2440). RAII single-close of earlier FDs on a later
+    open failure is enforced STRUCTURALLY (non-`Clone` `OwnedFd` sole ownership +
+    `Drop`).
+  - **Tests:** added 4 fail-on-revert tests locking ALL SEVEN pins' stage +
+    per-binding strings (incl. previously-uncovered uppercase-`XSK`, heartbeat,
+    `conntrack_v6`, `dnat_table_v6`), both-paths-react-identically parity, the
+    two-pass multi-fault normalization, and full-bundle-open equivalence.
+    Demonstrated RED→restore: reverting the deferred caller to its old one-pass
+    walk turns the two divergence tests RED (`deferred: OpenMapFailed(xsk)` vs
+    `activated: MissingPin(Heartbeat)`).
+  - **Out of scope:** #6246 (`ReconcileSnapshotFds` no-default / non-`Option`
+    `apply_snapshot` state-representability cleanup) — a separate follow-up on
+    #6243.
+- **File(s)**: `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/README.md`, `_Log.md`
+- **Validation**: `cargo build` + clippy clean on the changed file (the only
+  clippy error is the pre-existing `mut_from_ref` in untouched
+  `umem/mmap.rs:150`); full `cargo test --release -- --test-threads=1` GREEN.
+
 ## 2026-07-22 — #6242: consolidate a worker's 4 horizontal owners into one transactional WorkerRuntimeRecord
 
 - **Timestamp**: 2026-07-22 (refactor/6242-worker-runtime-record)
