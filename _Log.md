@@ -57227,3 +57227,31 @@ top.
   (new), pkg/daemon/daemon_run_shutdown.go (new),
   pkg/daemon/daemon_run_servers.go (new), pkg/daemon/daemon_run_bringup.go
   (new), pkg/daemon/daemon_run_naming.go (new), pkg/daemon/README.md
+
+- **Timestamp**: 2026-07-22 20:35
+  - **Action**: #6237 rotation-only extraction from
+    filter/engine/cache_sensitive.rs. Pure behavior-preserving code motion
+    (hostile-plan-reviewed: narrowed to the rotation domain over the issue's
+    literal 3-way split on cohesion grounds — cached-TX rebuild +
+    input-counter-capture STAY together as two products of the same seed/replay
+    descriptor workflow). Moved the cold filter-rotation semantic-comparison
+    domain (three_color_policer_semantics_match, filter_term_semantics_match with
+    the #5293 exhaustive FilterTerm destructure, dscp_sensitive_filter_semantics_match,
+    input_dscp_filter_family/families_changed, input_per_packet_l4_filter_family/
+    families_changed, interface_input/output_filter_has_dscp/per_packet_l4_match)
+    plus the cache_sensitive_2400_tests comparator tests VERBATIM into a new
+    engine/cache_sensitive/rotation.rs submodule (Rust 2018 file+sibling-dir
+    layout). Parent cache_sensitive.rs now declares "mod rotation;" and
+    re-exports the 6 pub(crate) rotation fns, so engine/mod.rs's 8-symbol
+    re-export and ALL consumers stay untouched. Only diff in the moved region:
+    module-level "use super::super::*" gained one "super::" (submodule sits one
+    level deeper), test-mod glob likewise. Function bodies byte-identical vs
+    origin/master (proved by diff of src 276-732). cargo build --release +
+    clippy clean (sole error = pre-existing mut_from_ref deny in untouched
+    umem/mmap.rs:150). Full cargo test --release --test-threads=1 GREEN
+    (4134 passed / 2 ignored / 0 failed + sibling test bins); the 3 #5293
+    comparator tests now run under
+    filter::engine::cache_sensitive::rotation::cache_sensitive_2400_tests.
+  - **File(s)**: userspace-dp/src/filter/engine/cache_sensitive.rs,
+    userspace-dp/src/filter/engine/cache_sensitive/rotation.rs (new),
+    userspace-dp/src/filter/README.md
