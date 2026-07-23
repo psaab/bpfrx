@@ -1,3 +1,49 @@
+## 2026-07-22 — #6244: typed reconcile progress replaces last_reconcile_stage string
+
+- **Timestamp**: 2026-07-22 (fix/6244-typed-reconcile-progress)
+- **Action**: Replace the mutable free-form
+  `Coordinator::last_reconcile_stage: String` side-channel with a typed
+  `ReconcileStage` enum (new `userspace-dp/src/afxdp/coordinator/reconcile/
+  stage.rs`). One variant per progress step (Idle/Start/NoSnapshot/Planned/
+  ReplayedSynced/Spawned) and per failure identity (MissingPin/OpenMapFailed/
+  SnapshotIntegrityError{,Detail}/SpawnWorkerFailed/WorkerBindIncomplete, plus
+  sub-types `MandatoryPin` and `WorkerBindShortfall`). The legacy operator
+  string is produced in exactly ONE place — the enum's `Display` — and is
+  rendered ONLY at the `reconcile_debug` / wire `debug_reconcile_stage`
+  boundary (`status.rs`) and inside `ReconcileError`'s `Display`; every legacy
+  string is preserved byte-for-byte. `ReconcileError::{MapSetup,WorkerSpawn,
+  WorkerBindIncomplete}` and `WorkerBringUpError::{Spawn,BindIncomplete}` now
+  carry the typed `ReconcileStage` (was a cloned stage `String`), so a failure
+  identity can no longer be reinterpreted as informal success text. Applied
+  amendment option B: the `"stopped"` write moved OUT of `stop_inner` (called
+  mid-reconcile by `tear_down` and the bring-up fail path) into the explicit
+  `stop`/`stop_with_event_stream` entry points, eliminating the bring-up
+  overwrite-then-restore dance while preserving observable behavior (the
+  transient stop-write mid-reconcile was never externally observed). Scope:
+  types the STAGE (transaction channel); underlying error payloads stay
+  `String` (deeper typing is sibling #6243/#6245). Control-plane / status only
+  — no packet-path, atomics, locks, or trait objects.
+- **Validation**: `cargo build` green (crate root, disk target). Full
+  `cargo test --release -- --test-threads=1` — see run below. Added
+  fail-on-revert `reconcile_stage_renders_byte_identical_legacy_strings`
+  (stage.rs) asserting every variant's legacy render; perturbing
+  `NoSnapshot`'s `Display` (`no_snapshot` → `no_snapshot_PERTURBED`) flips it
+  RED (`left: "no_snapshot_PERTURBED", right: "no_snapshot"`), restored GREEN.
+  Converted the existing exact/prefix/contains stage tests
+  (`coordinator/tests.rs`, `server/tests.rs`) to typed `matches!` assertions
+  PLUS byte-identical legacy-render assertions.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/stage.rs (new),
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/server/tests.rs,
+  docs/userspace-dataplane-architecture.md
+
 ## 2026-07-22 — #4976: build-time ABI check for the libxdp ring mirror
 
 - **Timestamp**: 2026-07-22 14:00 PDT (fix/4976-build-abi-check)

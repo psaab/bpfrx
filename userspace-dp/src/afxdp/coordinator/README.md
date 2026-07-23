@@ -82,6 +82,25 @@ Differences that matter (#1881):
 
 ## Notable invariants
 
+- **Reconcile progress + failure identity are a TYPED value, not a free-form
+  string (#6244).** `Coordinator::last_reconcile_stage` is a
+  `ReconcileStage` enum (`reconcile/stage.rs`) — one variant per progress
+  step (`Idle`/`Start`/`NoSnapshot`/`Planned`/`ReplayedSynced`/`Spawned`) and
+  per failure identity (`MissingPin`/`OpenMapFailed`/`SnapshotIntegrityError`
+  {,`Detail`}/`SpawnWorkerFailed`/`WorkerBindIncomplete`). The legacy operator
+  string is produced in exactly one place — the enum's `Display` — and is
+  rendered ONLY at the `reconcile_debug` / wire `debug_reconcile_stage`
+  boundary (`status.rs`) and inside `ReconcileError`'s `Display`; the strings
+  are preserved byte-for-byte. `ReconcileError::{MapSetup,WorkerSpawn,
+  WorkerBindIncomplete}` carry the typed `ReconcileStage` rather than a cloned
+  string, so a failure identity cannot be silently reinterpreted as informal
+  success text (the #4952 overwrite class). #6244 also moved the `"stopped"`
+  write OUT of `stop_inner` (which is called mid-reconcile by `tear_down` and
+  by the bring-up fail path): an EXPLICIT stop records `ReconcileStage::Stopped`
+  in `stop`/`stop_with_event_stream`, so a terminal failure identity is never
+  clobbered by a teardown that is part of the same reconcile attempt — the
+  bring-up fail path no longer needs the old overwrite-then-restore dance.
+  Fail-on-revert: `reconcile_stage_renders_byte_identical_legacy_strings`.
 - The coordinator is the single owner; workers hold `Arc` clones.
   Lifetime hazards from breaking that invariant are how cross-binding
   redirect designs have died historically (see `docs/per-5-tuple/state.md`).

@@ -1277,12 +1277,20 @@ fn post_teardown_spawn_failure_fails_closed_no_persist_4952() {
     );
     // (c) last_reconcile_stage retains the spawn_worker_failed descriptor.
     assert!(
+        matches!(
+            guard.afxdp.last_reconcile_stage,
+            crate::afxdp::ReconcileStage::SpawnWorkerFailed { .. }
+        ),
+        "the spawn-failure stage must be preserved (not the Spawned variant), got {:?}",
+        guard.afxdp.last_reconcile_stage
+    );
+    // #6244: legacy operator string preserved byte-for-byte.
+    assert!(
         guard
             .afxdp
             .last_reconcile_stage
-            .starts_with("spawn_worker_failed:"),
-        "the spawn-failure stage must be preserved (not overwritten with spawned:..), got {:?}",
-        guard.afxdp.last_reconcile_stage
+            .to_string()
+            .starts_with("spawn_worker_failed:")
     );
 
     let _ = std::fs::remove_file(&state_file);
@@ -1449,12 +1457,20 @@ fn full_apply_post_teardown_spawn_failure_fails_closed_no_persist_6140() {
     );
     // (d) last_reconcile_stage retains the spawn_worker_failed descriptor.
     assert!(
+        matches!(
+            guard.afxdp.last_reconcile_stage,
+            crate::afxdp::ReconcileStage::SpawnWorkerFailed { .. }
+        ),
+        "the spawn-failure stage must be preserved (not the Spawned variant), got {:?}",
+        guard.afxdp.last_reconcile_stage
+    );
+    // #6244: legacy operator string preserved byte-for-byte.
+    assert!(
         guard
             .afxdp
             .last_reconcile_stage
-            .starts_with("spawn_worker_failed:"),
-        "the spawn-failure stage must be preserved (not overwritten with spawned:..), got {:?}",
-        guard.afxdp.last_reconcile_stage
+            .to_string()
+            .starts_with("spawn_worker_failed:")
     );
     // LEG PROOF (2): only the full-apply leg runs replan_queues, which
     // rewrites status.bindings to the NEW snapshot's interface. The
@@ -1601,12 +1617,20 @@ fn full_apply_post_spawn_inthread_bind_failure_fails_closed_no_persist_5143() {
     // (c) the coordinator recorded the bind-incomplete verdict (not a spawn
     // success) and stopped/joined the partially-bound worker.
     assert!(
+        matches!(
+            guard.afxdp.last_reconcile_stage,
+            crate::afxdp::ReconcileStage::WorkerBindIncomplete(_)
+        ),
+        "the bind-incomplete stage must be preserved (not the Spawned variant), got {:?}",
+        guard.afxdp.last_reconcile_stage
+    );
+    // #6244: legacy operator string preserved byte-for-byte.
+    assert!(
         guard
             .afxdp
             .last_reconcile_stage
-            .starts_with("worker_bind_incomplete:"),
-        "the bind-incomplete stage must be preserved (not overwritten with spawned:..), got {:?}",
-        guard.afxdp.last_reconcile_stage
+            .to_string()
+            .starts_with("worker_bind_incomplete:")
     );
 
     let _ = std::fs::remove_file(&state_file);

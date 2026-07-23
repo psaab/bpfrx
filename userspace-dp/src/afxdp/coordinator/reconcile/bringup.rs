@@ -39,16 +39,16 @@ const WORKER_STARTUP_BARRIER_TIMEOUT_NS: u64 = 10_000_000_000;
 /// persist the broken snapshot as the boot baseline.
 pub(super) enum WorkerBringUpError {
     /// #4952: a worker thread failed to SPAWN (`spawn_supervised_worker` ->
-    /// `pthread_create` EAGAIN/ENOMEM). Carries the preserved
-    /// `spawn_worker_failed:<id>:<err>` stage.
-    Spawn(String),
+    /// `pthread_create` EAGAIN/ENOMEM). #6244: carries the preserved typed
+    /// [`ReconcileStage::SpawnWorkerFailed`] identity (was a stage `String`).
+    Spawn(ReconcileStage),
     /// #5143: a worker SPAWNED successfully but its in-thread XSK/UMEM bind
     /// did not bring up its FULL planned binding set (a partial/empty bind), or
     /// it never reported readiness within the bounded deadline. HEARTBEAT !=
     /// READINESS — a live heartbeat over an incomplete binding set is the
-    /// silent forwarding outage this guards. Carries the
-    /// `worker_bind_incomplete:<id>:..` stage.
-    BindIncomplete(String),
+    /// silent forwarding outage this guards. #6244: carries the preserved typed
+    /// [`ReconcileStage::WorkerBindIncomplete`] identity (was a stage `String`).
+    BindIncomplete(ReconcileStage),
 }
 
 /// Bring up the worker threads for the just-applied snapshot.
@@ -202,12 +202,11 @@ pub(super) fn bring_up_workers(
     // rotation scratch / V_min floors from workers.len() would put
     // that worker out of range (acquire_v8 returns 0 + debug-panics).
     coord.workers.last_planned_worker_slots = planned_worker_slots(&workers);
-    coord.last_reconcile_stage = format!(
-        "planned:workers={}:bindings={}:live={}",
-        coord.workers.last_planned_workers(),
-        coord.workers.last_planned_bindings(),
-        coord.workers.live.len()
-    );
+    coord.last_reconcile_stage = ReconcileStage::Planned {
+        workers: coord.workers.last_planned_workers(),
+        bindings: coord.workers.last_planned_bindings(),
+        live: coord.workers.live.len(),
+    };
     eprintln!(
         "xpf-userspace-dp: reconcile planned_workers={} planned_bindings={} live_slots={}",
         workers.len(),
@@ -261,11 +260,10 @@ pub(super) fn bring_up_workers(
         session_map_raw_fd,
     );
     if replayed_synced_sessions > 0 {
-        coord.last_reconcile_stage = format!(
-            "replayed_synced:{}:workers={}",
-            replayed_synced_sessions,
-            worker_command_queues.len()
-        );
+        coord.last_reconcile_stage = ReconcileStage::ReplayedSynced {
+            count: replayed_synced_sessions,
+            workers: worker_command_queues.len(),
+        };
     }
     // #1769: spawn the shared on-demand neighbor resolver BEFORE the
     // worker spawn loop so every worker captures a clone of the resolver
@@ -335,7 +333,7 @@ pub(super) fn bring_up_workers(
     // `spawn_worker_failed:<id>:<err>` stage. Once set, the loop breaks
     // (abort remaining launches) and the tail returns Err(stage) so the
     // reconcile fails closed instead of persisting a broken snapshot.
-    let mut spawn_failure: Option<String> = None;
+    let mut spawn_failure: Option<ReconcileStage> = None;
     // #5143: per-worker STARTUP READINESS barrier. Each spawned worker reports
     // (over this channel, after its in-thread binds) the set of planned slots
     // whose XSK actually bound. `planned_slots_by_worker` records the set the
@@ -567,7 +565,10 @@ pub(super) fn bring_up_workers(
                     "xpf-userspace-dp: failed to start worker thread worker_id={} err={}",
                     worker_id, err
                 );
-                let stage = format!("spawn_worker_failed:{worker_id}:{err}");
+                let stage = ReconcileStage::SpawnWorkerFailed {
+                    worker_id,
+                    err: err.to_string(),
+                };
                 coord.last_reconcile_stage = stage.clone();
                 // #925 Phase 1: the panic slot was inserted before
                 // spawn; drop it now so a snapshot reader doesn't
@@ -579,7 +580,10 @@ pub(super) fn bring_up_workers(
                 coord.worker_exception_rings.remove(&worker_id);
                 coord.worker_last_resolution.remove(&worker_id);
                 if let Ok(mut recent) = coord.recent_exceptions.lock() {
-                    push_recent_exception(&mut recent, control_notice_event("", stage.clone()));
+                    // #6244: the control notice still carries the byte-identical
+                    // legacy stage string (rendered from the typed stage), so
+                    // the operator-facing notice is unchanged.
+                    push_recent_exception(&mut recent, control_notice_event("", stage.to_string()));
                 }
                 // #4952: a spawn failed on the POST-TEARDOWN destructive
                 // path — the old workers are gone, so this queue set now has
@@ -632,18 +636,19 @@ pub(super) fn bring_up_workers(
         // reconcile, and clear the coordinator worker state so a retry /
         // last-good reconcile starts from a coherent baseline. Preserved
         // synced sessions are kept (`clear_synced_state=false`), matching the
-        // reconcile teardown. `stop_inner` overwrites `last_reconcile_stage`
-        // with "stopped", so restore the diagnostic stage AFTER it.
+        // reconcile teardown. #6244: `stop_inner` no longer writes
+        // `last_reconcile_stage`, so the former overwrite-then-restore dance is
+        // gone — the typed bind-incomplete identity is recorded once, after the
+        // teardown, and survives.
         coord.stop_inner(false);
         coord.last_reconcile_stage = stage.clone();
         return Err(WorkerBringUpError::BindIncomplete(stage));
     }
-    coord.last_reconcile_stage = format!(
-        "spawned:workers={}:identities={}:live={}",
-        coord.workers.handles.len(),
-        coord.workers.identities.len(),
-        coord.workers.live.len()
-    );
+    coord.last_reconcile_stage = ReconcileStage::Spawned {
+        handles: coord.workers.handles.len(),
+        identities: coord.workers.identities.len(),
+        live: coord.workers.live.len(),
+    };
     // Start the helper-owned neighbor sync path. It does an initial
     // RTM_GETNEIGH dump so startup sees the existing kernel table, then
     // subscribes to RTM_{NEW,DEL}NEIGH for incremental updates.
@@ -744,9 +749,9 @@ pub(super) fn bring_up_workers(
 /// report the slot set its in-thread XSK/UMEM binds actually brought up, under
 /// a bounded deadline ([`WORKER_STARTUP_BARRIER_TIMEOUT_NS`]), then check
 /// `bound == planned` for each. Returns `None` when every worker bound its full
-/// planned set (the reconcile may proceed), or `Some(stage)` — a
-/// `worker_bind_incomplete:<id>:..` descriptor — on the FIRST worker that bound
-/// a partial/empty set OR never reported in time (fail closed).
+/// planned set (the reconcile may proceed), or `Some(stage)` — the typed
+/// [`ReconcileStage::WorkerBindIncomplete`] identity — on the FIRST worker that
+/// bound a partial/empty set OR never reported in time (fail closed).
 ///
 /// The barrier does NOT block forever: it stops waiting at the deadline and
 /// treats any worker with no report as failed. A worker that finished setup
@@ -759,7 +764,7 @@ fn collect_worker_startup_readiness(
     startup_report_rx: &mpsc::Receiver<WorkerStartupReport>,
     spawned_worker_ids: &[u32],
     planned_slots_by_worker: &BTreeMap<u32, std::collections::BTreeSet<u32>>,
-) -> Option<String> {
+) -> Option<ReconcileStage> {
     if spawned_worker_ids.is_empty() {
         return None;
     }
@@ -791,17 +796,18 @@ fn collect_worker_startup_readiness(
         match bound_by_worker.get(&worker_id) {
             Some(bound) if *bound == planned => {}
             Some(bound) => {
-                return Some(format!(
-                    "worker_bind_incomplete:{worker_id}:bound={}:planned={}",
-                    bound.len(),
-                    planned.len()
-                ));
+                return Some(ReconcileStage::WorkerBindIncomplete(WorkerBindShortfall {
+                    worker_id,
+                    bound: Some(bound.len()),
+                    planned: planned.len(),
+                }));
             }
             None => {
-                return Some(format!(
-                    "worker_bind_incomplete:{worker_id}:timeout:planned={}",
-                    planned.len()
-                ));
+                return Some(ReconcileStage::WorkerBindIncomplete(WorkerBindShortfall {
+                    worker_id,
+                    bound: None,
+                    planned: planned.len(),
+                }));
             }
         }
     }
