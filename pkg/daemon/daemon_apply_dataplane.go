@@ -341,10 +341,15 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 					}
 					removeAutoLinkLocal(subName)
 					// Re-add link-local if this VLAN sub-interface has IPv6.
-					// Extract VLAN ID from sub-interface name (e.g. "ge-7-0-1.100").
+					// The kernel suffix is the unit's vlan-id (e.g.
+					// "ge-7-0-1.180"), but rethCfg.Units is keyed by the
+					// logical unit number, which may differ from the vlan-id
+					// (`unit 80 vlan-id 180`). Resolve the vlan-id back to its
+					// unit before checking for IPv6 — indexing Units[vid]
+					// directly silently skipped the repair (#5107).
 					if dotIdx := strings.LastIndex(subName, "."); dotIdx >= 0 {
 						if vid, err := strconv.Atoi(subName[dotIdx+1:]); err == nil {
-							if rethUnitHasIPv6(rethCfg, vid) {
+							if rethSubIfaceNeedsLinkLocal(rethCfg, vid) {
 								ensureRethLinkLocal(subName)
 							}
 						}

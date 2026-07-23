@@ -57486,3 +57486,23 @@ top.
     test/xsk-repro/selftest-compile.sh,
     test/xsk-repro/selftest-skipgate_6289.sh (new),
     test/xsk-repro/README.md, scripts/run-selftests.sh
+
+- **Timestamp**: 2026-07-22
+- **Action**: #5107 — fix RETH RA + post-MAC IPv6 repair using logical unit
+    numbers as VLAN IDs. Bug 1: `buildRAConfigs` resolved RA interface names via
+    `config.LinuxIfName(cfg.ResolveReth(...))`, which preserves the UNIT suffix
+    (reth0.80 -> member.80) instead of mapping unit -> configured vlan-id;
+    swapped to `cfg.ResolveKernelIfName` (reth0 unit 80 vlan-id 180 ->
+    member.180), which also matches `rethInterfacesForRG`'s vlan-id suffix so the
+    cluster RA owner match no longer drops the sender. Bug 2: the post-MAC IPv6
+    link-local repair in `daemon_apply_dataplane.go` parsed the vlan-id from the
+    kernel VLAN sub-interface name and indexed `rethCfg.Units[vid]` directly, but
+    Units is keyed by unit number — added `rethUnitForVlanID` (vlan-id -> unit
+    reverse lookup, deterministic lowest-unit on duplicate vlan-id + log) +
+    `rethSubIfaceNeedsLinkLocal` and index Units by the resolved unit. Fixed the
+    misleading `rethUnitHasIPv6` doc comment. Fail-on-revert Go tests in
+    reth_unit_vlanid_5107_test.go (both bugs go RED on revert; verified both
+    directions). Docs: ha-cluster-test-plan.md RA resolution note updated.
+- **File(s)**: pkg/daemon/daemon_ra.go, pkg/daemon/daemon_reth.go,
+    pkg/daemon/daemon_apply_dataplane.go,
+    pkg/daemon/reth_unit_vlanid_5107_test.go, docs/ha-cluster-test-plan.md

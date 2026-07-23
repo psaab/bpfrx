@@ -389,7 +389,10 @@ func rethUnitHasConfiguredLinkLocal(rethCfg *config.InterfaceConfig, unitNum int
 }
 
 // rethUnitHasIPv6 checks whether the RETH config has IPv6 addresses on the
-// given unit number (VLAN ID). Unit 0 is the native/untagged interface.
+// given logical unit number. Unit 0 is the native/untagged interface. The
+// argument is a UNIT number, not a vlan-id — callers that start from a kernel
+// VLAN sub-interface suffix must translate the vlan-id to a unit with
+// rethUnitForVlanID first (#5107).
 func rethUnitHasIPv6(rethCfg *config.InterfaceConfig, unitNum int) bool {
 	unit, ok := rethCfg.Units[unitNum]
 	if !ok {
@@ -401,4 +404,54 @@ func rethUnitHasIPv6(rethCfg *config.InterfaceConfig, unitNum int) bool {
 		}
 	}
 	return unit.DHCPv6
+}
+
+// rethUnitForVlanID reverse-maps a kernel VLAN id to the logical unit number
+// that carries it. RETH VLAN sub-interfaces are named after the unit's
+// configured vlan-id (e.g. kernel "ge-7-0-1.180" for `reth1 unit 80 vlan-id
+// 180`), but rethCfg.Units is keyed by the logical UNIT number (80), not the
+// vlan-id (180). Callers that parse a vid out of a kernel netdev name MUST
+// translate it back to the unit number before indexing Units — indexing
+// Units[vid] directly silently misses whenever unit# != vlan-id (#5107).
+//
+// Returns (unit, true) for the unit whose VlanID == vid. Only units with a
+// matching non-zero VlanID are considered: an untagged unit has no kernel
+// VLAN sub-interface and is repaired on the parent netdev, not this path. If
+// two units share a vlan-id (an invalid config Junos rejects), the lowest
+// unit number wins deterministically and the collision is logged.
+func rethUnitForVlanID(rethCfg *config.InterfaceConfig, vid int) (int, bool) {
+	found := -1
+	matches := 0
+	for unitNum, unit := range rethCfg.Units {
+		// Skip untagged units (VlanID 0): they have no VLAN sub-interface,
+		// so a vlan-id parsed from a kernel netdev suffix never maps to them.
+		if unit == nil || unit.VlanID <= 0 || unit.VlanID != vid {
+			continue
+		}
+		matches++
+		if found < 0 || unitNum < found {
+			found = unitNum
+		}
+	}
+	if found < 0 {
+		return 0, false
+	}
+	if matches > 1 {
+		slog.Warn("reth: multiple units share a vlan-id; using lowest unit for IPv6 repair",
+			"iface", rethCfg.Name, "vlan-id", vid, "unit", found)
+	}
+	return found, true
+}
+
+// rethSubIfaceNeedsLinkLocal reports whether the RETH VLAN sub-interface whose
+// kernel vlan-id is `vid` carries IPv6 in config and therefore needs its
+// link-local re-added after a post-MAC-programming link cycle. It resolves the
+// vlan-id back to its logical unit first (Units is unit-keyed, not vlan-id
+// keyed) before checking that unit for IPv6 — see rethUnitForVlanID (#5107).
+func rethSubIfaceNeedsLinkLocal(rethCfg *config.InterfaceConfig, vid int) bool {
+	unitNum, ok := rethUnitForVlanID(rethCfg, vid)
+	if !ok {
+		return false
+	}
+	return rethUnitHasIPv6(rethCfg, unitNum)
 }
