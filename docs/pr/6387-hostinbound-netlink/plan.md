@@ -2,7 +2,7 @@
 
 ## 1. Status
 
-- **Status:** PLAN — research only. No production code, no PR. Deliverable is
+- **Status:** PLAN v2 — round-1 review folded (see §12). Research only, no production code. Deliverable is
   this doc.
 - **Issue:** #6387 (`bug`, `security`) — cluster standby stuck `Transfer ready:
   no`, `applied config gen=0`, because config-sync APPLY hard-fails on the
@@ -443,3 +443,121 @@ just curl-200 (memory rule).
    consecutive failures (avoid flapping on a transient RG0-primary rejection,
    which `configApplyLoop` already treats as a non-fatal retry)? The same gen
    re-pushes on every reconnect, so a first-failure raise could be noisy.
+
+---
+
+## 12. Round-1 plan-review resolutions → PLAN v2
+
+**Verdicts.** Codex: PLAN-NEEDS-MAJOR. Claude SMR: PLAN-NEEDS-MINOR. They
+converge on the SAME concrete hardening list (differing only on the severity
+label and the CF-trigger, adjudicated below). Both confirm the design is
+fundamentally sound: the parity oracle is genuinely external (not a tautology),
+every construct is expressible via `google/nftables` v0.3.0 with no residual
+exec-`nft`, and the fail-closed contract + injection seam are preserved. No
+PLAN-KILL. The items below are MUST-fix BEFORE implementation given the
+host-inbound fail-open stakes.
+
+### 12.1 Parity test (the security gate) — hardened (§9 T1/T1b amended)
+- **Construct-complete matrix, not "representative":** every row of the §5.1
+  nft-text→netlink mapping table MUST be exercised — CIDR/prefix INTERVAL sets,
+  `!=`/except subtraction sets, the v6-DSCP nibble-spanning bitfield, tcp-flags
+  mask, the icmpx-reject + tcp-reset pair, named counters, cold-boot fence,
+  gap fence, no-prior-table (cold-boot) install.
+- **Normalization MUST NOT sort rules within a chain** — a reorder-precedence
+  fail-open would otherwise be masked. Canonicalize table name / set element
+  formatting / handle numbers only; preserve intra-chain rule order.
+- **T1 MUST RUN GREEN (not tool-gate SKIP) as a HARD, NON-SKIPPABLE merge gate
+  for the cutover PR (PR-B)** in a trusted `nft`+root+netns env. A skipped
+  security gate is no gate (Codex). A SKIP is acceptable only for the local dev
+  fast path; the merge gate must execute.
+- **Mutation-sensitivity tests:** inject a deliberately widened set (`/24` for a
+  `/32`), a dropped `saddr !=` subtraction, a dropped counter, a weakened
+  verdict — the parity test MUST fail on each. Proves the gate catches a
+  fail-open rather than passing vacuously.
+- **T1b (pure-unit golden) fixtures MUST be derived from the text-oracle KERNEL
+  DUMP, NOT captured from the netlink builder's own output** — capturing from
+  the builder is the project's recurring equivalence-TAUTOLOGY trap (X==X; cf.
+  the #6236 PR-2C cfg(test) reference bug). The golden is the oracle, never the
+  subject.
+
+### 12.2 Cold-boot atomic-replace ordering — corrected (§5.1 amended)
+The §5.1 pseudocode's UNCONDITIONAL `DelTable` then `AddTable` aborts the batch
+on cold boot (absent table → `DelTable` ENOENT). Fix: mirror the nft-text
+`add table; delete table; table{}` idiom (LEADING `AddTable` so the delete
+always has a target) OR do rst_suppress's existence-check-first. Keep `xpf_lo0`
+/ `xpf_hostinbound` / `xpf_hostinbound_gap` as SEPARATE `Flush()` transactions
+— batching them cross-couples failure semantics. The matrix (§12.1) MUST cover
+the no-prior-table install so #5644 catches a regression here.
+
+### 12.3 IPv6 DSCP encoding — corrected
+The §5.1 `ip6 dscp` mapping is WRONG (Codex): the IPv6 traffic-class field is
+NOT a single byte at the IPv4-TOS offset — it spans the low nibble of byte 0 and
+the high nibble of byte 1 of the v6 header. The netlink builder MUST extract it
+with the correct 2-byte `Payload` + `Bitwise` mask/shift for the 6 DSCP bits,
+and the parity matrix (§12.1) MUST include a v6-dscp rule so a wrong encoding
+fails the build.
+
+### 12.4 Injection seam — concrete interface + parent-RED (§5.1/§6 amended)
+Replace the underspecified "func(*nftables.Conn plan) or a small interface" with
+a CONCRETE interface whose methods cover EVERY kernel-touching op that today
+goes through `nftApplyPayload`/`nftDeleteTable`: real host-inbound install,
+cold-boot fence install (#5644), gap fence install (#5789), lo0 install, and
+table deletion. All five share ONE failure-injection path so the 14 existing
+fail-closed `_test.go` files port onto it. **Parent-RED each ported test**
+(neutralize the `errors.Join` at daemon_apply_tail.go:327 → the test must go
+RED) so a mis-stubbed port is not false-green.
+
+### 12.5 Kernel-module capability — functional probe + fw1 verify
+- **Empirically verify fw1 SPECIFICALLY has the `nf_tables` kernel module**
+  (RST-suppression green on fw1, not merely node0) BEFORE the cutover — else
+  PR-B just moves fw1's trap from `nft`-exec-not-found to netlink-EOPNOTSUPP.
+- Add a FUNCTIONAL netlink capability behavior (NOT `/proc/modules` — the module
+  may be built-in): the first `nftables.New()`/`Flush` permits normal kernel
+  autoload; on `EOPNOTSUPP`/subsystem-unavailable, emit a one-time DISTINCT log
+  ("nf_tables subsystem unavailable") and raise the CF monitor-failure (§12.6)
+  with that explicit reason. The real install MUST still execute and propagate
+  its error — the probe NEVER downgrades the H7 fail-closed contract.
+- Platform/image validation (out-of-band, tracked separately) proves the module
+  is built-in or loadable on every supported appliance base.
+
+### 12.6 CF monitor signal — time-based, node-global (§5.2 amended; adjudicated)
+- **Trigger = TIME-BASED / stale-duration, NOT attempt-count hysteresis.**
+  Adjudication of the reviewer disagreement: Codex is right that
+  "N consecutive apply failures" MAY NEVER FIRE (`configApplyLoop` only acts on
+  a RECEIVED config; the same gen re-pushes on reconnect, not continuously — one
+  failed apply strands the standby indefinitely below the threshold). smr6387's
+  first-failure-flaps concern is real but is resolved by a TIME threshold, not
+  by attempt-count. Design: raise `ConfigSyncFailing` when a received config gen
+  remains un-applied (ConfigStale true / last apply failed) for longer than T
+  (reuse a sensible default, e.g. a few heartbeat intervals); clear on the first
+  confirmed `recordAppliedConfigGen`. A transient RG0-primary rejection that
+  resolves within T never raises → no flap.
+- **Manager-level, node-global (RG0), dedicated field** — `ConfigSyncFailing` +
+  bounded/sanitized `ConfigSyncFailReason` on the Manager (not per-RG mutable
+  state; not a `"CF"`-in-`MonitorFails` sentinel that
+  `reconcileMonitorDebtsLocked` wipes). Rendered as `CF` in the Monitor-failures
+  column for the configured RG rows + folded into `FormatInformation` Node-health
+  (`|| ConfigSyncFailing` → degraded) + a `Config sync: failing (<reason>)` line.
+- **Election-neutral; NOT a failover gate.** Zero `Weight`/`monitorWeights`/
+  readiness perturbation. `ReadyForManualFailover()` stays `!ConfigStale()`;
+  crash takeover stays intentionally ungated. CF only annotates health.
+- Store a bounded/sanitized reason (e.g. "host-inbound apply failed: nf_tables
+  unavailable"), never a raw arbitrary apply error string.
+
+### 12.7 Decomposition order — reconfirmed (both reviewers)
+- **PR-1 = CF monitor-failure + the functional netlink capability probe**
+  (§5.2 + §12.5/§12.6). Independent diagnostic; land FIRST so today's fw1 trap
+  becomes operator-visible immediately and any environmental failure during the
+  later netlink rollout is visible. Orthogonal to #1; does NOT belong in the
+  cutover.
+- **PR-2 = additive `pkg/nftables` netlink host-inbound/lo0/fence installer
+  library + the T1/T1b/mutation parity CI** (§5.1 + §9 + §12.1-12.4). Purely
+  additive — daemon still uses exec-`nft`. Front-loads the safety proof.
+- **PR-3 = daemon cutover** — replace ALL real/cold-boot-fence/gap-fence/lo0/
+  delete ops together, port the 14 fail-closed tests (parent-RED'd), prove the
+  `errors.Join` path, and run mandatory `make test-failover`. UNSAFE to merge
+  unless PR-2's non-skippable parity CI passed.
+
+**Status:** PLAN v2 — the above resolutions are folded. Pending a round-2
+confirmation that v2 addresses Codex's MAJOR points before implementation of
+PR-1 begins.
