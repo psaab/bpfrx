@@ -1255,10 +1255,16 @@ func newCollector(srv *Server) *xpfCollector {
 				"peer) could drive this node past its own aggregate session "+
 				"ceiling and multiply that state across all workers. The "+
 				"import path now bounds the shared synced map at this "+
-				"appliance's own ceiling (worker_count * max_sessions) and "+
-				"drop-newest-rejects an over-ceiling import; a rising value "+
-				"means a peer exceeded that ceiling. A legitimate "+
-				"symmetric-pair failover never trips it (#5674).",
+				"appliance's own aggregate ENTRY ceiling "+
+				"(2 * worker_count * max_sessions -- 2x the logical session "+
+				"ceiling, because each admitted forward publishes a forward "+
+				"plus a synthesized reverse companion) and drop-newest-rejects "+
+				"an over-ceiling import; a rising value means a peer's import "+
+				"would push THIS appliance past its own aggregate entry "+
+				"ceiling (2N) — receiver-local, so a larger asymmetric peer "+
+				"can legitimately trip a smaller receiver. A symmetric-pair "+
+				"failover (N logical sessions = 2N entries) exactly fits and "+
+				"never trips it (#5674).",
 			nil, nil,
 		),
 		userspaceWorkerCommandQueuePoisonRecoveries: prometheus.NewDesc(
