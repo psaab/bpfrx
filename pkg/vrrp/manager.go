@@ -1014,9 +1014,24 @@ func (m *Manager) Status() string {
 	for _, key := range keys {
 		vi := m.instances[key]
 		state := vi.getState()
+		// #5718 (codex-182 C-HA C01c): snapshot the mutable cfg fields under
+		// vi.mu.RLock before formatting. Priority/Preempt/AdvertiseInterval/
+		// VirtualAddresses are all mutated under vi.mu.Lock (updateConfig,
+		// UpdateRGPriority, suppressPreempt/restorePreempt); reading them here
+		// while holding only m.mu.RLock races a concurrent failover priority
+		// update — a diagnostic-only data race go test -race flags. Mirrors the
+		// snapshot idiom in advertInterval/getPriority (#6230). getState()
+		// already RLocks internally, so it stays outside this block; vi.key()
+		// reads only immutable identity fields.
+		vi.mu.RLock()
+		priority := vi.cfg.Priority
+		preempt := vi.cfg.Preempt
+		interval := vi.cfg.AdvertiseInterval
+		vips := append([]string(nil), vi.cfg.VirtualAddresses...)
+		vi.mu.RUnlock()
 		sb.WriteString(fmt.Sprintf("  %s: state=%s, priority=%d, preempt=%t, interval=%dms\n",
-			vi.key(), state, vi.cfg.Priority, vi.cfg.Preempt, vi.cfg.AdvertiseInterval))
-		for _, vip := range vi.cfg.VirtualAddresses {
+			vi.key(), state, priority, preempt, interval))
+		for _, vip := range vips {
 			sb.WriteString(fmt.Sprintf("    VIP: %s\n", vip))
 		}
 	}
