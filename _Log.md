@@ -56798,6 +56798,30 @@ top.
   userspace-dp/src/event_stream/clock.rs,
   userspace-dp/src/event_stream/README.md
 
+- **Timestamp**: 2026-07-22
+- **Action**: #5661 split — pure code-motion of pkg/vrrp/instance.go (2925
+  prod LOC, over the 2000 threshold) into six cohesive sibling files in
+  package vrrp. Extracted, in six build-green increments (one commit each):
+  instance_addr.go (local IPv4/IPv6 + VIP-set resolution), instance_socket.go
+  (raw-socket lifecycle), instance_receive.go (RX receivers + AF_PACKET/IPv6
+  parse/enqueue), instance_send.go (advert/event send), instance_garp.go
+  (gratuitous-ARP/NA burst + gateway probe), instance_vip.go (netlink VIP
+  actuation + stale-VIP reconcile). Declarations moved VERBATIM — no exported
+  symbol renamed, no logic/timing/const change, no goroutine/defer/channel/
+  mutex reorder (whole functions moved intact). Verified pure motion: 94 decls
+  on origin/master == 94 decls across the 7 files, identical decl set, zero
+  bodies differ. Imports pruned by goimports; gofmt -l clean; go build ./...
+  green; go test ./pkg/vrrp/... green; instance.go now 1392 LOC. Updated
+  pkg/vrrp/README.md File-layout section + four inline symbol->file pointers
+  (receiverIPv6, sendPacketIPv6, parseAfPacket, netlink.AddrAdd). NOTE: the
+  full-suite canary TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports
+  fails PRE-EXISTING on the base commit (edf62745e, the #6338 sync_conn split)
+  — drift is entirely in pkg/cluster/sync_conn*.go allowlist entries, no vrrp
+  file imports pkg/dataplane; orthogonal to this change.
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/instance_addr.go (new),
+  pkg/vrrp/instance_socket.go (new), pkg/vrrp/instance_receive.go (new),
+  pkg/vrrp/instance_send.go (new), pkg/vrrp/instance_garp.go (new),
+  pkg/vrrp/instance_vip.go (new), pkg/vrrp/README.md
 ## #5661 — daemon_apply.go pure code-motion split
 - **Timestamp**: 2026-07-22
 - **Action**: Split ~3095-line pkg/daemon/daemon_apply.go into 7 cohesive
