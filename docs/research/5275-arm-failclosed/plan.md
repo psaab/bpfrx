@@ -3,10 +3,10 @@
 - **Issue:** #5275 (HIGH; bug, dataplane, security, vsrx-parity)
 - **Research branch:** `research/5275-arm-failclosed`
 - **Base:** origin/master @ `6131eb4e6`
-- **Revision:** r8 (folds Codex r6 — §13 resolves the last 4 transaction/HA-recovery/
-  fencing DESIGN DECISIONS with a recommended choice each; Codex r6 fully closed 3/7
-  and reaffirmed the architecture VIABLE. These four are genuine human go/no-go
-  design choices, which is precisely the `/engineer` manual-approval gate.)
+- **Revision:** r9 (Codex r7 ruled D1–D4 SOUND and isolated D5 as the one unsafe
+  design choice; r9 redesigns D5 around the SHIPPED peer-side liveness-suppression +
+  a stale-ownership scrub, and folds the D1/D4 wording fixes. Codex has ruled the
+  architecture VIABLE across five consecutive rounds.)
 - **Prior art:** PR #6358 (draft) — MERGE-NEEDS-MAJOR. Superseded.
 - **Status:** PLAN-READY candidate (research only — no production code;
   `/engineer 5275`).
@@ -161,13 +161,16 @@ mutation):**
   removal, forwarding enable, and ownership release all happen ONLY after this final
   proof. The reapply/rebind must RETURN proof-or-failure, not record retry debt.
 
-**Coverage proof ingredients (both stages; readback-fail ⇒ unarmed):** exact
-candidate config digest + reconciled helper snapshot generation; the exact expected
-registered/armed/ready XSK bindings; strict program INSTANCE identity (ID/tag) on
-every mapped attach point (native or generic) — NOT the global `ProbeForwardingArmed`
-(boot_probe.go, flags only) and NOT the pre-compile probe (the next compile deletes
-every `xdp_*` pin before attach, manager_compile.go:162, so a pre-compile "covered"
-can be destroyed).
+**Coverage proof ingredients are PER-STAGE (§13-D1; readback-fail ⇒ unarmed) —
+NOT identical across both stages:** the PRELIMINARY stage proves only the attach-point
+INVENTORY + strict program INSTANCE identity (ID/tag) on every mapped attach point
+(native or generic) — because ready XSK bindings do not exist yet on the
+deferred-worker path; the FINAL stage (after the last rebind/reapply) adds the exact
+candidate config digest + reconciled helper snapshot generation + ALL registered/
+armed/ready XSK bindings. Neither stage uses the global `ProbeForwardingArmed`
+(boot_probe.go, flags only) nor the pre-compile probe (the next compile deletes every
+`xdp_*` pin before attach, manager_compile.go:162, so a pre-compile "covered" can be
+destroyed).
 
 **One atomic release owner (Codex r5 §4 — clearing the hold is the FINAL act):**
 `startTakeoverMachinery()` is the SOLE `armPending → armed` release path and owns the
@@ -449,21 +452,48 @@ resolved below with a recommended choice (the human approves/overrides at `/engi
   and full config-sync starts only post-proof (an `armFailed` node never reaches it).
   Resolution: an **authenticated inbound-config-ONLY** ingress available pre-proof
   (separate from the full session/config-sync machinery) that lands the primary's
-  config into the **recovery slot** (NOT immediate promote/reset), with an
-  applied-high-water/ack so the primary knows it was received; the primary's
-  authoritative config supersedes a local recovery edit (a held node is
+  config into the **recovery slot** (NOT immediate promote/reset), acknowledged with a
+  **durably-staged recovery receipt** (§13-D4, Codex r7 — explicitly NOT an
+  "applied-high-water": it must NEVER advance the existing live-applied generation used
+  for failover readiness, or it would reopen the very TOCTOU delayed promotion closes);
+  the primary's authoritative config supersedes a local recovery edit (a held node is
   non-authoritative). Recovery is thus RESTART-based: the correction is staged for the
   next restart's arm attempt; the held node never promotes it live.
 
-- **D5 — Scrub fence BEFORE peer election (Codex r6 §5).** The peer elects on
-  ~500 ms heartbeat loss (heartbeat.go), and the held node CONTROLS when it starts its
-  pre-proof heartbeat-only advertisement (§4). Resolution: the enter-`armFailed`
-  sequence performs a **fast VIP/service fence FIRST** (administratively down the owned
-  data/VIP surface + `Kea Apply(nil)`, each verified — completes in ms), THEN starts
-  the yield heartbeat; the slow FRR clear (~40 s) is route-advertisement, not
-  VIP dual-ownership, so it proceeds async AFTER the fast fence. For a re-arm where the
-  node was already advertising, stop advertising during the fence. The peer therefore
-  cannot take VIP ownership before this node has verifiably relinquished it.
+- **D5 — Stale-ownership scrub without racing the peer's election (Codex r6 §5 +
+  r7 UNSAFE).** The r8 "fence, then start advertising, so the peer can't elect first"
+  is WRONG (Codex r7, confirmed in source): on a **former-primary CRASH restart** the
+  peer's `lastSeen` timer runs INDEPENDENTLY of when the replacement daemon starts and
+  it calls `electSingleNode()` BEFORE any optional fencing (heartbeat_manager.go:404);
+  the failed node cannot control that ordering (it may not even be running yet), the
+  interval/threshold can be a valid **1 ms/1** (schema_chassis.go:74), and `Kea
+  Apply(nil)` is NOT a millisecond op (systemd stop, 15 s/call, dhcpserver.go). The
+  correct model does NOT try to beat the election — the peer's takeover is CORRECT and
+  desired — it prevents DUAL ownership and reuses the SHIPPED suppression:
+  1. **Crash-restart (the §3 in-scope case):** the peer's independent-timer takeover
+     is correct. The restarting fail-closed node must SCRUB its STALE inherited state
+     so it does not dual-own with the now-promoted peer: remove owned VIPs
+     SYNCHRONOUSLY (fast netlink, verified) + advertise weight-zero yield immediately +
+     stop Kea and clear FRR ASYNChronously as tracked teardown debt (these are service
+     / route-advertisement de-dup, not VIP dual-ownership; the §6 barrier + the
+     weight-zero yield mean the node forwards nothing and owns no RG meanwhile). It
+     NEVER re-advertises ownership. There is no race to win — only stale state to
+     remove.
+  2. **Live re-arm (a running PRIMARY loses its dataplane):** reuse the EXISTING
+     peer-side liveness-suppression (`shouldSuppressPeerHeartbeatTimeout` /
+     `SendLivenessKeepalive`, the bounded self-clearing 2 s-recency / 5 s-cap guard the
+     heartbeat RESTART path already uses, heartbeat_manager.go:171) as the promotion
+     interlock: keep the authenticated keepalive flowing while the local VIP fence +
+     weight-zero yield are applied, then the peer promotes on the yield — a genuinely
+     dead node still fails over because the suppression is bounded and message-recency
+     derived.
+  3. **§3 reconciliation:** "attraction cleared+verified before takeover" is scoped to
+     the FAST attraction (VIP — synchronous verified netlink); the SLOW attraction
+     (Kea service, FRR routes) is de-duplicated ASYNC as teardown debt, because
+     blocking the yield on a 15 s Kea stop / 40 s FRR clear would DELAY the peer's
+     clean takeover (worse), and the barrier + weight-zero yield already prevent this
+     node from forwarding or owning any RG. `pkg/cluster` (the interlock reuse) and the
+     scrub sequencing are the §13-D5 deliverables.
 
 Two minor residuals folded: §8's `armPending` route now distinguishes the **boot
 single-generation arm** (PR1) from the §9 **staged-delta transaction** (PR3); the §5
