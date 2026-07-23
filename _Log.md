@@ -1,3 +1,49 @@
+## 2026-07-23 — #6380 fold: bind both syslog port guard sites + config-search truncation header
+
+- **Timestamp**: 2026-07-23 (fix/5250-psreview042)
+- **Action**: Close two verified test-coverage gaps + one comment inaccuracy on
+  PR #6380 (Advances #5250). NO production logic changed — a Claude reviewer and
+  Codex both confirmed the 4 production fixes correct; this is tests + a comment
+  only.
+  1. **Syslog nested-host-port guard now bound.**
+     `syslog_stream_port_5250_test.go` previously exercised ONLY the direct
+     `stream port` guard site (`compileLog` `case "port":`), leaving the nested
+     `host { port <p>; }` guard site (`compiler_security_log.go:52`) unbound —
+     reverting just that site stayed GREEN. Added
+     `compileOneStreamNestedHostPort` (a stream whose only child is a nested
+     `host` block with a bare IP + `port` child, so ONLY the nested guard runs)
+     plus `TestSyslogStreamNestedHostPortRejectsOutOfRange_5250` (70000 → keeps
+     514) and `TestSyslogStreamNestedHostPortAcceptsInRange_5250` (9006 honored).
+     Firsthand RED-on-revert: neutralizing ONLY `&& validSyslogPort(n)` at :52 →
+     nested test RED (Port=70000), flat `TestSyslogStreamPortRejectsOutOfRange`
+     stayed GREEN; restore → GREEN.
+  2. **Config-search production truncation cap + header now bound.**
+     `config_search_bound_5250_test.go` drove only the pure `searchConfigLines`
+     helper; the `maxConfigSearchResults=500` cap wired into
+     `configSearchHandler` and the `X-Result-Truncated: true` header were
+     unbound. Added `stageAddressConfig` (N committed address-book entries via
+     real LoadSet+Commit) + `searchResultCount` (unmarshals the Response) plus
+     `TestConfigSearchHandlerTruncatesResults_5250` (stage 550, broad "address"
+     query → exactly 500 results AND header=="true") and
+     `TestConfigSearchHandlerNoTruncateHeaderUnderCap_5250` (stage 10 → under-cap
+     count, header ABSENT). Firsthand RED-on-revert: neutralizing the
+     `w.Header().Set("X-Result-Truncated", ...)` block → header assertion RED
+     (count still 500); neutralizing the handler's cap (call-site
+     `maxConfigSearchResults` → `1<<30`) → count assertion RED (551 vs 500).
+  3. **Comment fix (`validSyslogPort` doc).** The comment claimed "The strict
+     commit path has no syslog-stream port-range gate" — INCORRECT (Codex-
+     flagged). The strict commit path DOES range-gate the port
+     (`validateSecurityLogStreamPortsAST`, #3349, hard-rejects out-of-range at
+     commit/commit-check). Reworded to state that reality and that this guard
+     protects the LENIENT tolerant-load / peer-sync path (#1960) where that gate
+     only warns, so an out-of-range value can still reach `compileLog`.
+  - SKIPPED the `strings.SplitSeq` perf micro-opt Codex mentioned: the 256-byte
+    query cap + 500-result cap already bound the work; not worth the churn.
+  - GATES: go build + go vet + gofmt -l clean; full `go test ./pkg/config/...`
+    and `./pkg/api/...` GREEN (`-count=1`; pkg/api clean, no NaN flake this run).
+- **File(s)**: pkg/config/syslog_stream_port_5250_test.go,
+  pkg/config/compiler_security_log.go,
+  pkg/api/config_search_bound_5250_test.go
 ## 2026-07-23 — #5719 C001: fold Codex hostile-review findings into #6378
 
 - **Timestamp**: 2026-07-23 (fix/5719-capi-residuals, fold on PR #6378)
@@ -58147,6 +58193,63 @@ top.
     pkg/policymatch/README.md, docs/pr/812-tx-latency-histogram/plan.md
 
 - **Timestamp**: 2026-07-23
+  - **Action**: #5250 (cohort ps-review-042) — triaged 21 low-materiality
+    survivors against origin/master 55cf5a9b2 and fixed the 4 real +
+    independent + low-risk + in-Go-scope items in one PR, each with a
+    verified fail-on-revert test (neutralize the guard → new test RED with a
+    clean assertion). Fixes:
+    - **A8-b1 F2 (configSearchHandler unbounded q + result set)** — cap the
+      search substring at 256 bytes (400 on over-long q) and the returned
+      match set at 500 lines, setting an `X-Result-Truncated: true` response
+      header when clipped. Extracted a pure `searchConfigLines` helper for the
+      cap so it is unit-testable without staging a 500-line config. The
+      response `data` shape stays an array (non-breaking); truncation is
+      signalled by header.
+    - **A8-b1 F4 (diag ping Size uncapped)** — clamp `req.Size` to the new
+      `diagcmd.MaxPingSize` (65507 = max valid ICMP echo data) in BOTH the REST
+      (`pkg/api/system.go`) and gRPC (`pkg/grpcapi/server_diag_ping.go`)
+      buildPingArgv callers. The shared ceiling lives in `pkg/diagcmd` but the
+      clamp stays in the callers per the PingOptions "layout only" contract.
+      The console-local CLI surface (`pkg/cli/cli_request_ping.go`) is
+      operator-trusted and outside the finding's authed-network scope; left
+      unchanged.
+    - **A3-b2 F2 (syslog stream port stored unclamped)** — guard both port
+      parse sites in `compileLog` with `validSyslogPort` ([1,65535]); an
+      out-of-range value (e.g. lenient-loaded 70000, which no strict gate
+      rejects) is ignored so the dial-able 514 default (or a prior valid value)
+      is retained instead of silently breaking every syslog dial.
+    - **A3-b1 b1-F1 (deterministic NAT block-size negative via Atoi)** — add an
+      `n > 0` guard to both block-size parse sites in
+      `compiler_nat_helpers.go` so the lenient/tolerant load path no longer
+      retains a non-positive block-size (strict commit already rejects it).
+    Triage dispositions (rest of the cohort): ALREADY-FIXED — A9 F1 flowBatch
+    maxDepth (#5048 CAS-max), A9 F2 SNMPv3 privParams (#5032 fail-closed), A8-b2
+    F2 showSessionsTop (#5319 codes.Internal), A3-b2 F1 FilterTermExpansionCount
+    (#5456 uint64 overflow-checked), A7-b2 F3 frr/manager ctx (mgrCancel +
+    retryWG on Stop), A10-b2 F-06 dhcprelay giaddr (selectPrimaryIPv4 +
+    IFA_F_SECONDARY). NOT-A-BUG/unreachable — A3-b3 F-03 expandAppSet nil apps
+    (callers always pass &cfg.Applications), A8-b2 F3 int32 session clamp (needs
+    2^31 sessions). DESIGN/DEFERRED — A9 F4 eventengine edge-latch (Junos
+    escalation semantics), A3-b2 F3 lifeline fab prefix (matching-semantics is a
+    tracked design question, #3682 visibility-only). LOW/MODERATE residual left
+    tracked under #5250 — A9 F3 routemask no Stop hook (pile-up already bounded by
+    #3743 inflight cap), A6-b2 F1 ForEachSnapshotNeighbor callback-under-mu
+    (latent; only caller is daemon-local addTarget), A6-b2 F3 appPortsFromSpec
+    (perf, no clean test), A7-b1 F1 coalescence scanner.Err (ethtool -c lines
+    short; unreachable trigger), A7-b1 F4 daemon_ha AfterFunc/ctx (HA-TOUCHING —
+    flagged for a separate change), A7-b2 F2 rss_indirection queues==0 (needs
+    readQueueCount interface change). DEFERRED to dataplane owner — A2 F1
+    reverse-pool O(n) (Rust userspace-dp). No new issue filed (all residuals stay
+    tracked in the cohort, which remains OPEN). build/vet/gofmt clean; full
+    `go test ./pkg/api/... ./pkg/grpcapi/... ./pkg/config/... ./pkg/diagcmd/...`
+    GREEN.
+  - **File(s)**: pkg/diagcmd/diagcmd.go, pkg/api/system.go, pkg/api/config.go,
+    pkg/grpcapi/server_diag_ping.go, pkg/config/compiler_security_log.go,
+    pkg/config/compiler_nat_helpers.go, pkg/api/config_search_bound_5250_test.go,
+    pkg/api/ping_size_clamp_5250_test.go,
+    pkg/grpcapi/ping_size_clamp_5250_test.go,
+    pkg/config/deterministic_nat_block_size_5250_test.go,
+    pkg/config/syslog_stream_port_5250_test.go
   - **Action**: Triaged cohort #5649 (codex-review-181 low-materiality / bounded-
     hardening survivors, 19 IDs) against current origin/master 55cf5a9b2 and
     fixed the 4 REAL + INDEPENDENT + LOW-RISK + in-Go-scope items in one PR

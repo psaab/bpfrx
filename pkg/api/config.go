@@ -386,20 +386,52 @@ func (s *Server) configHistoryHandler(w http.ResponseWriter, _ *http.Request) {
 	writeOK(w, result)
 }
 
+// maxConfigSearchQueryLen bounds the search substring. No real config token is
+// anywhere near this long, so a longer q is a malformed/abusive request rather
+// than a legitimate search — reject it instead of running an O(q × lines)
+// Contains scan for every line of the render (#5250 A8-b1 F2).
+const maxConfigSearchQueryLen = 256
+
+// maxConfigSearchResults caps the number of matching lines configSearchHandler
+// returns. A broad query (e.g. a single space) over a large ≤16 MiB render
+// would otherwise build an unbounded result slice and spike RSS/GC. When the
+// cap is reached the response carries an X-Result-Truncated: true header so the
+// caller can tell the match set was clipped (#5250 A8-b1 F2).
+const maxConfigSearchResults = 500
+
+// searchConfigLines returns up to maxResults ConfigSearchResults whose line
+// contains query, and reports whether more matches existed past the cap.
+func searchConfigLines(text, query string, maxResults int) (results []ConfigSearchResult, truncated bool) {
+	for i, line := range strings.Split(text, "\n") {
+		if !strings.Contains(line, query) {
+			continue
+		}
+		if len(results) >= maxResults {
+			// At least one more match exists beyond the cap.
+			return results, true
+		}
+		results = append(results, ConfigSearchResult{LineNumber: i + 1, Line: line})
+	}
+	return results, false
+}
+
 func (s *Server) configSearchHandler(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {
 		writeError(w, http.StatusBadRequest, "missing q parameter")
 		return
 	}
+	if len(query) > maxConfigSearchQueryLen {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("q too long: %d bytes (max %d)", len(query), maxConfigSearchQueryLen))
+		return
+	}
 	// Search over the redacted render so a matching line never returns a
 	// cleartext secret in its snippet (#4051).
 	text := s.store.ShowActiveRedacted(nil)
-	var results []ConfigSearchResult
-	for i, line := range strings.Split(text, "\n") {
-		if strings.Contains(line, query) {
-			results = append(results, ConfigSearchResult{LineNumber: i + 1, Line: line})
-		}
+	results, truncated := searchConfigLines(text, query, maxConfigSearchResults)
+	if truncated {
+		w.Header().Set("X-Result-Truncated", "true")
 	}
 	writeOK(w, results)
 }

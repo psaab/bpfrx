@@ -5,6 +5,17 @@ import (
 	"strconv"
 )
 
+// validSyslogPort reports whether n is a dial-able TCP/UDP port. The strict
+// commit path DOES range-gate the syslog-stream port at commit / commit-check
+// (validateSecurityLogStreamPortsAST, #3349, which hard-rejects an out-of-range
+// value), but the lenient tolerant-load / peer-sync path (#1960) downgrades
+// that same gate to a warning so an already-persisted or peer-synced config
+// still boots — so an out-of-range value like 70000 can still reach compileLog
+// on that path. Guarding the parse here keeps the dial-able 514 default (or any
+// prior valid value) rather than storing an unusable port that would fail every
+// syslog dial and silently lose audit records (#5250 A3-b2 F2).
+func validSyslogPort(n int) bool { return n >= 1 && n <= 65535 }
+
 func compileLog(node *Node, sec *SecurityConfig) error {
 	if sec.Log.Streams == nil {
 		sec.Log.Streams = make(map[string]*SyslogStream)
@@ -41,7 +52,7 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 					switch hc.Name() {
 					case "port":
 						if v := nodeVal(hc); v != "" {
-							if n, err := strconv.Atoi(v); err == nil {
+							if n, err := strconv.Atoi(v); err == nil && validSyslogPort(n) {
 								stream.Port = n
 							}
 						}
@@ -54,7 +65,7 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 				}
 			case "port":
 				if v := nodeVal(prop); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
+					if n, err := strconv.Atoi(v); err == nil && validSyslogPort(n) {
 						stream.Port = n
 					}
 				}
