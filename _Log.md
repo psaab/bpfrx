@@ -131,6 +131,18 @@
   ParentIndex/readback/scan-error/SNMP guards (unchanged this round) verified
   in the prior fold round.
 
+- **Timestamp**: 2026-07-23 (doc-honesty round on PR #6399, Codex MINOR)
+- **Action**: Two doc-summary honesty qualifications, NO code/test change.
+  (1) pkg/routing/README.md — the "Identity re-assertion" summary claimed all
+  three managers reject right-type/wrong-discriminator readbacks; qualified to
+  match the honest per-manager detail below it (xfrm type+Ifid+ParentIndex==0,
+  VRF type+table, bond TYPE ONLY — mode/MTU + adopt/KEEP-path deferred to
+  #6402). (2) pkg/configstore/README.md — the seq monotonicity / no-overwrite
+  summary retained unconditional guarantees its own #6404 exceptions
+  contradict; qualified to "after a successful reseed scan and outside the two
+  #6404-deferred windows". Production .go byte-identical to f36c2c814.
+- **File(s)**: pkg/routing/README.md, pkg/configstore/README.md
+
 ## 2026-07-23 — #5583 C180: fold two Codex MAJOR findings into #6383
 
 - **Timestamp**: 2026-07-23 (fix/5583-codex180, fold on PR #6383)

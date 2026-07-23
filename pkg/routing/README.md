@@ -113,8 +113,12 @@ path already draws (see the WireGuard/tunnel removal notes below and
 **Identity re-assertion on every post-create readback (#5523 C179-104 +
 #6396).** `LinkAdd` and the `LinkByName` readback that follows it are two
 syscalls. A device is adopted only after confirming the readback is the
-INTENDED type carrying the desired discriminator — never by name alone —
-so a same-name foreign link (or a right-type link with the wrong
+INTENDED type — and, for xfrm and VRF, carrying the desired discriminator
+too — never by name alone. The discriminator checked is per-manager: **xfrm
+rejects type + `Ifid` + `ParentIndex==0`, VRF rejects type + table, but bond
+rejects TYPE only** (the create-path mode/MTU check, plus the adopt/KEEP-path
+identity checks, are deferred to #6402 — see the bond bullet). So a same-name
+foreign link (or, for xfrm/VRF, a right-type link with the wrong
 discriminator) substituted by a concurrent external actor in the
 add→readback window is rejected: it is not brought up or tracked, the
 commit fails closed, and a later reconcile reclaims the intruder. This

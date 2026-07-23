@@ -1084,6 +1084,11 @@ owned by the `journal/` subpackage.
   `time.Now()` race). Rotation prunes by the parsed seq, and
   `SetArchiveConfig` seeds the per-process counter from the highest seq on
   disk so it stays globally monotonic across restarts (#5523 C179-060).
+  These monotonicity / no-overwrite guarantees hold **after a successful
+  reseed scan and outside the two #6404-deferred windows** (a commit that
+  lands after a failed scan but before the next `SetArchiveConfig` retry, and
+  a disable→re-enable to the same dir that skips the rescan) — see the #6396
+  hardening note below.
   Two #6396 residual hardenings: `parseArchiveSeq` requires the current
   two-dot `config-<ts>.<seq>.conf` shape (the ts's own
   seconds.nanoseconds dot PLUS the seq dot), so a legacy pre-#3441
