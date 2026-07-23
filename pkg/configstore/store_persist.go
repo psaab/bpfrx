@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -464,11 +465,69 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 }
 
 // SetArchiveConfig configures automatic archival on commit.
+//
+// #5523 C179-060: it also SEEDS the monotonic archive sequence from the highest
+// seq already present on disk, so config-<ts>.<seq>.conf filenames stay
+// GLOBALLY monotonic across daemon restarts. archiveSeq is otherwise a fresh
+// per-process counter that restarts at 0; because rotateArchives now prunes by
+// seq (not lexical/ts order), a restart that reset seq to 0 would let a stale
+// high-seq archive from the PRIOR process outrank — and evict — the fresh
+// low-seq archives of the NEW process. Seeding to max(existing seq) keeps the
+// newest commit's seq strictly highest so retention order is correct across
+// restarts. The scan runs only while archiveSeq is still 0 (process start,
+// before any archive is written); once the process has written one archive the
+// counter is already ahead of disk and the scan is skipped.
 func (s *Store) SetArchiveConfig(dir string, max int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.archiveDir = dir
 	s.archiveMax = max
+	if dir != "" && s.archiveSeq.Load() == 0 {
+		if seed := maxArchiveSeq(dir); seed > 0 {
+			s.archiveSeq.Store(seed)
+		}
+	}
+}
+
+// parseArchiveSeq extracts the monotonic sequence number from an archive
+// filename of the form config-<ts>.<seq>.conf. The ts itself embeds a dot
+// (seconds.nanoseconds), so the seq is the LAST dot-delimited field before the
+// .conf suffix. Returns (0, false) for any name that is not a well-formed
+// archive filename (a legacy or foreign file) so callers can order it as oldest.
+func parseArchiveSeq(name string) (uint64, bool) {
+	if !strings.HasPrefix(name, "config-") || !strings.HasSuffix(name, ".conf") {
+		return 0, false
+	}
+	core := strings.TrimSuffix(name, ".conf")
+	dot := strings.LastIndexByte(core, '.')
+	if dot < 0 {
+		return 0, false
+	}
+	seq, err := strconv.ParseUint(core[dot+1:], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return seq, true
+}
+
+// maxArchiveSeq returns the highest config-<ts>.<seq>.conf sequence number
+// present in dir, or 0 when the directory is unreadable or holds no well-formed
+// archive. Used by SetArchiveConfig to seed archiveSeq across restarts.
+func maxArchiveSeq(dir string) uint64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var maxSeq uint64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if seq, ok := parseArchiveSeq(e.Name()); ok && seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+	return maxSeq
 }
 
 // QuiesceArchival fences and drains the async auto-archive writers so a
@@ -587,9 +646,10 @@ func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
 // can still format the SAME wall-clock nanosecond under a coarse clock or
 // an NTP step-back, and the later atomic write would overwrite the earlier
 // archive. The seq always advances, so the filename is unique even on an
-// identical timestamp. The ts is kept first so the lexical sort
-// rotateArchives uses stays chronological (ts dominates; the 20-digit
-// zero-padded seq only breaks same-ts ties, in monotonic commit order).
+// identical timestamp. The ts is kept first so a human `ls` reads
+// chronologically; retention order does NOT rely on that lexical order —
+// rotateArchives prunes by the parsed seq (#5523 C179-060), which is robust
+// to a backward wall-clock step that a ts-lexical sort would mis-order.
 func writeArchive(archiveDir string, maxArchives int, data string, ts time.Time, seq uint64) error {
 	// Owner-only 0700 (#4056): the archive directory holds only timestamped
 	// copies of the full config text (each with cleartext secrets), so it
@@ -652,8 +712,29 @@ func rotateArchives(dir string, maxArchives int) {
 		return
 	}
 
-	// Sort alphabetically (timestamps sort naturally)
-	sort.Strings(archives)
+	// Sort by the monotonic per-filename SEQ (#5523 C179-060), NOT lexically by
+	// filename. The name is config-<ts>.<seq>.conf with the ts FIRST, so a
+	// lexical sort is ts-dominated: a backward wall-clock step (an NTP
+	// correction) makes the NEWEST commit format an EARLIER ts and sort first,
+	// so the ts-lexical prune would evict that newest archive as if it were the
+	// oldest. The seq always advances in commit order — and SetArchiveConfig
+	// seeds it across restarts, so it is globally monotonic — hence seq order is
+	// the true retention order. A filename with no parseable seq (legacy or
+	// foreign) sorts as oldest (pruned first), with a lexical tiebreak among
+	// such files and among equal seqs.
+	sort.Slice(archives, func(i, j int) bool {
+		si, oki := parseArchiveSeq(archives[i])
+		sj, okj := parseArchiveSeq(archives[j])
+		if oki != okj {
+			// A parseable seq always outranks an unparseable name, so the
+			// unparseable (legacy/foreign) one sorts first as oldest.
+			return okj
+		}
+		if oki && okj && si != sj {
+			return si < sj
+		}
+		return archives[i] < archives[j]
+	})
 
 	// Remove oldest.
 	for i := 0; i < len(archives)-maxArchives; i++ {

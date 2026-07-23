@@ -34,7 +34,7 @@ re-created 0600 on the next commit.
 | `master.key` | `.configdb/master.key` | 0600 | `crypto.go readOrCreateMasterKey` |
 | Text rollback slots | `<config>.N` (e.g. `xpf.conf.1`) | 0600 | `store_commit.go saveRollbackFiles` |
 | Rescue config | `rescue.conf` | 0600 | `store_persist.go SaveRescueConfig` |
-| Config archives | `<archive-dir>/config-*.conf` | 0600 | `store_persist.go writeArchive` |
+| Config archives | `<archive-dir>/config-<ts>.<seq>.conf` | 0600 | `store_persist.go writeArchive` |
 | Audit journal (#4579 A4-02, migrate #5188) | `.config.journal`(+`.N`) | 0600 | `journal/journal.go Log` / `migratePermsLocked` |
 
 The `.configdb` and archive directories are created **0700** (they hold

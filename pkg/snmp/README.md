@@ -414,6 +414,11 @@ authorization surface: every request is dropped because no community matches.
   interface data. The daemon wires `buildSNMPIfData`, which does a full
   netlink `LinkList` (RTM_GETLINK dump) per call — so the request path must
   invoke it at most once per PDU (see the per-PDU snapshot gotcha below).
+  The callback contract is `func() []IfData` (no error channel), so
+  `buildSNMPIfData` returns an empty slice when the netlink dump fails — but it
+  LOGS the failure (`slog.Warn`, #5523 C179-123) so an empty ifTable caused by a
+  transient netlink error is diagnosable and not mistaken for a genuine
+  no-interface box; the next poll re-reads netlink and self-heals.
 
 ### IF-MIB class-counter semantics (#5050)
 

@@ -182,22 +182,38 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 			continue
 		}
 		if err == nil {
-			// Verify the adopted kernel link's ACTUAL if_id matches the
-			// desired one before re-tracking it. A kernel xfrmi with the
-			// same NAME but a stale Ifid (e.g. a daemon restart after the
-			// VPN's derived if_id changed, or a leftover from an aborted
-			// recreate) must NOT be silently adopted — Ifid is immutable in
-			// place, so a mismatch requires delete+recreate. On match (or a
-			// non-xfrmi link of that name, which should not happen) keep the
-			// existing adopt behavior.
-			if xi, ok := link.(*netlink.Xfrmi); ok && xi.Ifid != ifID {
-				slog.Info("xfrmi has stale if_id, recreating",
-					"name", ifName, "have", xi.Ifid, "want", ifID)
-				// #5310: if the stale-if_id delete fails the kernel link is
-				// still present with the wrong if_id, so a LinkAdd below would
-				// EEXIST — skip the recreate this cycle (mirroring the #5119
-				// bond changed-signature path) and surface the delete failure so
-				// the commit fails closed; the next reconcile retries the delete.
+			// Verify the adopted kernel link is an xfrm interface whose ACTUAL
+			// if_id matches the desired one before re-tracking it. Two cases
+			// must NOT be silently adopted:
+			//
+			//   - A kernel xfrmi with the same NAME but a stale Ifid (e.g. a
+			//     daemon restart after the VPN's derived if_id changed, or a
+			//     leftover from an aborted recreate). Ifid is immutable in place,
+			//     so a mismatch requires delete+recreate.
+			//   - A link wearing the xfrmi's name that is NOT an xfrm interface
+			//     at all (a foreign/leftover dummy/veth/etc). Adopting it would
+			//     track the name as satisfied while NO xfrm interface carries
+			//     if_id, so the route-based VPN bound to it silently blackholes
+			//     (#5523 C179-104). The type guard previously gated only the
+			//     stale-if_id recreate branch, so a non-xfrmi link fell through
+			//     to the adopt path.
+			//
+			// Both cases reclaim the name via delete+recreate; only a matching
+			// xfrmi is adopted.
+			xi, isXfrmi := link.(*netlink.Xfrmi)
+			if !isXfrmi || xi.Ifid != ifID {
+				if isXfrmi {
+					slog.Info("xfrmi has stale if_id, recreating",
+						"name", ifName, "have", xi.Ifid, "want", ifID)
+				} else {
+					slog.Info("link with xfrmi name is not an xfrm interface, recreating",
+						"name", ifName, "type", link.Type(), "want_if_id", ifID)
+				}
+				// #5310: if the delete fails the kernel link is still present
+				// (wrong if_id, or wrong type), so a LinkAdd below would EEXIST —
+				// skip the recreate this cycle (mirroring the #5119 bond
+				// changed-signature path) and surface the delete failure so the
+				// commit fails closed; the next reconcile retries the delete.
 				if err := x.deleteLocked(ifName); err != nil {
 					errs = append(errs, err)
 					continue

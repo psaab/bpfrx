@@ -720,6 +720,25 @@ never lock an operator out of a remote box it manages.
     in `Run`, so an early-error return (or an embedded library caller whose ctx
     cancels) that never reaches the shutdown sequence still cancels + joins both
     loops instead of leaking them.
+  - **Two MORE background loops are cancelled + joined the same way (#5523
+    C179-093):** the session-aggregation flush goroutine (`applyAggregator` →
+    `agg.Run`, which binds to `context.Background()` and was previously cancelled
+    only on a config replace/disable — never at shutdown, so its `#5313`
+    `ctx.Done` final flush was skipped and up to a full ~5 min window of
+    `SESSION_CLOSE` counters was dropped on every stop) and the IPsec
+    DHCP-rebind retry loop (`ipsecRebindRetryLoop`, which bound directly to
+    `d.daemonCtx` so a 30s rebind tick could run a `swanctl` reapply while
+    teardown was in flight). `stopAggregator()` / `stopIPsecRebindLoop()` run
+    immediately after `stopPinRetryLoop()` — the aggregator BEFORE the
+    flow/feeds/event teardown so its final flush still has a live
+    `SetLogFunc → er.ForwardLogMsg` path, the rebind loop BEFORE FRR/IPsec
+    teardown. Each mirrors the #5308 shape: a cancellable child of
+    `d.daemonCtx` (rebind loop) or the existing `aggCancel` (aggregator), a
+    `WaitGroup` join (`aggWg` / `ipsecRebindWg`), the lock (`aggReconMu` /
+    `ipsecRebindMu`) released before the join, an `aggStopped` /
+    `ipsecRebindStopped` latch against a late restart, and a matching `defer` in
+    `Run`. Other still-`daemonCtx`-bound goroutines (VRRP/cluster/fabric HA
+    watchers) are intentionally left for a separate HA-scoped change.
   - **The RG-state reconcile safety-net loop IS run-`WaitGroup`-registered so
     `wg.Wait()` joins it BEFORE HA ownership relinquish (#5681 / M23).**
     `reconcileRGStateLoop` (the periodic safety net that corrects `rg_active` /

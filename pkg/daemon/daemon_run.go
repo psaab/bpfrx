@@ -97,6 +97,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// defers here covers every subsequent return.
 	defer d.stopPinRetryLoop()
 	defer d.stopPolicySchedulerLoop()
+	// #5523 C179-093: the aggregator flush goroutine and the IPsec DHCP-rebind
+	// retry loop are also started during the boot apply below and are NOT
+	// covered by the run WaitGroup, so guarantee they are cancelled + joined on
+	// every Run return — including the early-error / embedded-caller paths that
+	// skip runShutdownSequence. On the normal path runShutdownSequence stops
+	// both first (idempotent / nil-safe), so these defers are no-ops there.
+	defer d.stopIPsecRebindLoop()
+	defer d.stopAggregator()
 	d.startPolicySchedulerLoopLocked()
 
 	// WaitGroup for coordinated shutdown of background goroutines. Declared here

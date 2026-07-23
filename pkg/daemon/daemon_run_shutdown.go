@@ -78,6 +78,20 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 	d.stopPolicySchedulerLoop()
 	d.stopPinRetryLoop()
 
+	// #5523 C179-093: cancel + join the two remaining background loops that do
+	// NOT bind to the run WaitGroup and were previously leaked at shutdown:
+	//   - the session-aggregation flush goroutine (binds to context.Background,
+	//     cancelled only via aggCancel) — cancelling here triggers its #5313
+	//     ctx.Done final flush so the pending window is emitted rather than
+	//     dropped, and joins it. Done BEFORE the flow/feeds/event teardown below
+	//     so the flush still has a live SetLogFunc -> er.ForwardLogMsg path.
+	//   - the IPsec DHCP-rebind retry loop (bound to d.daemonCtx, never
+	//     cancelled in production) — stopping it before FRR/IPsec teardown keeps
+	//     a late 30s rebind tick from racing a swanctl reapply against a
+	//     torn-down subsystem. Both helpers are idempotent / nil-safe.
+	d.stopAggregator()
+	d.stopIPsecRebindLoop()
+
 	// Stop the SNMP agent + link-state trap monitor (#3967). Their goroutines
 	// bind to d.daemonCtx (never cancelled in production) rather than the run
 	// WaitGroup, so wg.Wait above does not cover them — teardownSNMP cancels
