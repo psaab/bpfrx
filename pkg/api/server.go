@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -725,13 +726,15 @@ func (s *Server) ReplaceAuth(a *AuthConfig) {
 func (s *Server) AuthSnapshotForTest() *AuthConfig { return s.auth.Load() }
 
 // HTTPSCertForTest returns the served TLS leaf certificate, or nil when the
-// server is HTTP-only (#5866). Test-only: lets a cross-package test assert that a
-// TLS-material reconcile rebuilds the listener with a FRESH certificate.
+// server is HTTP-only (#5866). Test-only: lets a cross-package test read the cert
+// the LIVE HTTPS leg is serving after a reconcile, to assert that the durable
+// self-signed pair is reloaded AS-IS across a rebind (#1916 D6 / #6381) rather
+// than re-minted.
 func (s *Server) HTTPSCertForTest() *tls.Certificate {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()
 	// Read the LIVE HTTPS leg (post-reconcile), not the construction template, so
-	// a TLS-material rebind's fresh cert is observed (#5866).
+	// the cert the rebound listener actually serves is observed (#5866).
 	srv := s.httpsServer
 	if s.httpsLeg != nil {
 		srv = s.httpsLeg.srv
@@ -740,6 +743,24 @@ func (s *Server) HTTPSCertForTest() *tls.Certificate {
 		return nil
 	}
 	return &srv.TLSConfig.Certificates[0]
+}
+
+// SetTLSCertDirForTest points the server's HTTPS certificate generator at dir
+// instead of the production /etc/xpf/tls paths (#6381). Test-only: it lets a
+// cross-package test (pkg/daemon managementReconciler) exercise the DURABLE
+// self-signed-cert path (#1916 D6) against a WRITABLE temp dir, so an HTTPS
+// rebind LOADS the persisted pair AS-IS (the shipping behavior) instead of
+// failing to persist and re-minting a fresh in-memory cert on every reconcile
+// (the CI-only artifact — an unwritable /etc/xpf/tls — that the old
+// TestMgmtReconcileTLSChange_5866 assertion silently depended on). It routes
+// through the real production generateSelfSignedCertAt, so the durable
+// load-as-is path is genuinely bound.
+func (s *Server) SetTLSCertDirForTest(dir string) {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	s.certGen = func(bindHost string) (tls.Certificate, error) {
+		return generateSelfSignedCertAt(dir, filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), bindHost)
+	}
 }
 
 // dynamicAuthMiddleware wraps next with the LIVE auth snapshot (#5866): it reads

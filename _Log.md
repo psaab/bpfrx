@@ -59660,3 +59660,16 @@ top.
   - **File(s)**: test/xsk-repro/selftest-compile.sh,
     test/xsk-repro/selftest-multitoken-cc_6355.sh, scripts/run-selftests.sh,
     test/xsk-repro/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+- **Action**: Fix #6381 — TestMgmtReconcileTLSChange_5866 asserted a false
+    "fresh leaf per rebind" invariant that only passed as a CI artifact
+    (unwritable /etc/xpf/tls). Redirected certGen to a writable temp dir via a
+    new test-only api.Server.SetTLSCertDirForTest hook and re-encoded the
+    intended invariant: an HTTPS bind change make-before-break rebinds the HTTPS
+    leg but the DURABLE self-signed cert (#1916 D6) is reloaded AS-IS (identical
+    leaf bytes) — a rebind must not re-mint (TOFU-pin churn). Parent-RED:
+    neutralizing the durable-reload path (forced re-mint) turns the corrected
+    assertion RED, proving it now binds (the old assertion PASSED under exactly
+    that re-mint condition). Test-only; no production behavior change.
+- **File(s)**: pkg/api/server.go, pkg/daemon/management_5866_test.go, _Log.md
