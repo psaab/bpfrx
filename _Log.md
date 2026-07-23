@@ -58760,3 +58760,36 @@ top.
     pkg/natshow/scan_error_5557_test.go, pkg/dataplane/userspace/interfaces.go,
     pkg/dataplane/userspace/synthetic_ifindex_exhaust_5557_test.go,
     pkg/configstore/rollback_size_cap_5557_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6395 — bound the shutdown session-aggregation final-flush join so
+    a stalled syslog sink cannot delay the HA takeover fence. `stopAggregator`
+    (pkg/daemon/daemon_system.go) previously did `cancel(); d.aggWg.Wait()` — an
+    UNBOUNDED join. The cancel triggers SessionAggregator.Run's #5313 ctx.Done
+    final flush, which forwards the pending report SYNCHRONOUSLY through the
+    syslog client (logFn -> er.ForwardLogMsg); stream syslog allows up to
+    defaultWriteTimeout (~4s) PER line, so an unreachable collector could block
+    the join for many seconds. Because stopAggregator runs in runShutdownSequence
+    BEFORE the HA/dataplane teardown fence, that unbounded wait could push the
+    stop past the systemd 20s TimeoutStopSec -> SIGKILL before the peer takeover
+    fence ran (a C179-093 residual regression from merged PR #6394: before #6394
+    the aggregator was leaked at shutdown, so shutdown never waited on it). Fix:
+    the join now runs on a `done` channel closed by a `d.aggWg.Wait()` goroutine,
+    selected against `time.After(aggregatorFlushJoinTimeout)` (3s — under a single
+    ~4s syslog write timeout and well under the #5643 5s applyCloseoutDrainTimeout
+    and the fence's stop-budget share). Happy path returns in ms; a stalled sink
+    logs a warning and PROCEEDS, dropping the partial report. aggStopped latch +
+    handle-clear semantics unchanged. stopIPsecRebindLoop left unbounded on
+    purpose (ctx.Done does no blocking forward; applySem.Acquire is ctx-cancelled;
+    same safe shape as the #5308 pin/scheduler joins) — noted in the README.
+    Test: daemon_aggregator_flush_bound_6395_test.go arms an aggregator with a
+    WEDGED logFn + one seeded SESSION_CLOSE, asserts stopAggregator RETURNS within
+    the bound (RED-on-revert: plain d.aggWg.Wait() blocks forever -> clean t.Fatal
+    at the 8s in-test timeout, verified firsthand) and that the handles clear +
+    aggStopped latches; a second test asserts the bound does not penalize a fast
+    flush. build+vet+gofmt clean; full `go test ./pkg/daemon/ ./pkg/logging/`
+    GREEN. No pkg/cluster / pkg/vrrp code touched — unit-testable shutdown-hygiene
+    class, no loss-cluster smoke needed.
+  - **File(s)**: pkg/daemon/daemon_system.go,
+    pkg/daemon/daemon_aggregator_flush_bound_6395_test.go, pkg/daemon/README.md,
+    _Log.md

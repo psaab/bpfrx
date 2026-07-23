@@ -739,6 +739,23 @@ never lock an operator out of a remote box it manages.
     `ipsecRebindStopped` latch against a late restart, and a matching `defer` in
     `Run`. Other still-`daemonCtx`-bound goroutines (VRRP/cluster/fabric HA
     watchers) are intentionally left for a separate HA-scoped change.
+  - **The aggregator join is BOUNDED by `aggregatorFlushJoinTimeout` (3s, #6395).**
+    The `#5313` final flush forwards the pending report SYNCHRONOUSLY through the
+    syslog client (`logFn → er.ForwardLogMsg`), and a stream-syslog sink allows up
+    to `defaultWriteTimeout` (~4s) PER line. Since `stopAggregator()` runs BEFORE
+    the HA takeover fence, a plain `aggWg.Wait()` join could let a stalled or
+    unreachable collector block shutdown for many seconds — past the systemd 20s
+    `TimeoutStopSec`, so the process is SIGKILLed before the peer takeover fence
+    runs. `stopAggregator` therefore joins on a `done` channel with a
+    `time.After(aggregatorFlushJoinTimeout)` fallback: the happy path returns in
+    milliseconds, a stalled sink logs a warning and PROCEEDS to teardown (dropping
+    the partial report — a missed fence is worse), and the join goroutine is left
+    to finish late since the process is exiting. `stopIPsecRebindLoop`'s join is
+    left unbounded on purpose: its `ctx.Done` branch does no blocking forward
+    (just a mutex-guarded disarm), and `tryIPsecRebindRetry` acquires `applySem`
+    through the cancellable ctx — so it is the same safe shape as the accepted
+    #5308 `stopPinRetryLoop` / `stopPolicySchedulerLoop` joins, not a
+    deterministic on-cancel forward like the aggregator's.
   - **The RG-state reconcile safety-net loop IS run-`WaitGroup`-registered so
     `wg.Wait()` joins it BEFORE HA ownership relinquish (#5681 / M23).**
     `reconcileRGStateLoop` (the periodic safety net that corrects `rg_active` /
