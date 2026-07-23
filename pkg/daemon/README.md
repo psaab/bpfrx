@@ -739,6 +739,36 @@ never lock an operator out of a remote box it manages.
     `ipsecRebindStopped` latch against a late restart, and a matching `defer` in
     `Run`. Other still-`daemonCtx`-bound goroutines (VRRP/cluster/fabric HA
     watchers) are intentionally left for a separate HA-scoped change.
+  - **BOTH shutdown joins are BOUNDED because both can block on a
+    context-insensitive downstream before the HA takeover fence (#6395 / #6397).**
+    `stopAggregator()` and `stopIPsecRebindLoop()` both run in
+    `runShutdownSequence` BEFORE the fence, so a plain `WaitGroup.Wait()` on
+    either could push the whole stop past the systemd 20s `TimeoutStopSec` and get
+    the process SIGKILLed before the peer takeover fence runs.
+    - **The aggregator join is bounded by `aggregatorFlushJoinTimeout` (3s,
+      #6395).** The `#5313` final flush forwards the pending report SYNCHRONOUSLY
+      through the syslog client (`logFn → er.ForwardLogMsg`), and a stream-syslog
+      sink allows up to `defaultWriteTimeout` (~4s) PER line — a stalled or
+      unreachable collector could block `aggWg.Wait()` for many seconds.
+    - **The IPsec DHCP-rebind join is bounded by `ipsecRebindJoinTimeout` (3s,
+      #6397).** The loop's `cancel` IS observed at its `ctx.Done` / ticker select
+      and at `applySem.Acquire(ctx, …)` — but NOT inside a `swanctl` apply already
+      in flight. `tryIPsecRebindRetry`'s re-render+reload shells out under
+      `context.WithTimeout(context.Background(), swanctlTimeout=15s)`
+      (`pkg/ipsec/manager.go` `runSwanctl`) — a BACKGROUND context the loop's
+      cancel does not interrupt — plus a 5s `WaitDelay`, so a rebind that is
+      MID-APPLY when shutdown fires blocks a plain `ipsecRebindWg.Wait()` for up
+      to ~20s. (The earlier "left unbounded on purpose / same safe shape as the
+      #5308 pin/scheduler joins" note was WRONG: those loops do no
+      background-context shell-out on cancel; this one does.)
+
+    Each `stop*` therefore joins on a `done` channel with a `time.After(<budget>)`
+    fallback: the happy path returns in microseconds (aggregator flush completes
+    in ms; the rebind loop is normally parked on its ticker / `ctx.Done`, not
+    mid-apply), and on a stalled downstream we log a warning and PROCEED to
+    teardown — the aggregator drops the partial report, the rebind loop leaves its
+    in-flight `swanctl` shell-out to finish in the background as the process exits.
+    A missed fence is worse than either.
   - **The RG-state reconcile safety-net loop IS run-`WaitGroup`-registered so
     `wg.Wait()` joins it BEFORE HA ownership relinquish (#5681 / M23).**
     `reconcileRGStateLoop` (the periodic safety net that corrects `rg_active` /
