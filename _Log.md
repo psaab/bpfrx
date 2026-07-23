@@ -57890,3 +57890,21 @@ top.
     pkg/config/compiler_validate_strict_observability.go,
     pkg/config/compiler_feed_diag_failclosed_5717_test.go,
     docs/config-schema.md
+- **Timestamp**: 2026-07-23
+  **Action**: #5719 (codex-review-182 C-API cohort) — fixed two independent
+    diagnostic/automation-hardening survivors. (1) gRPC `GetNATRuleStats`
+    now rejects an unknown `nat_type` selector with `codes.InvalidArgument`
+    instead of falling through both branches to a false-empty "no NAT rules"
+    response (a typo like `src`/`static` was indistinguishable from an empty
+    firewall). (2) The auto-generated HTTPS self-signed cert now carries
+    Subject Alternative Names (DNS: hostname + localhost; IP: 127.0.0.1 / ::1)
+    — a CN-only cert is rejected by every modern TLS client. An
+    already-persisted SAN-less cert is NOT auto-regenerated (preserves the
+    #1916 D6 TOFU-pin durability contract). Both fixes have fail-on-revert
+    tests. The third representative survivor (applied-nft truth projection
+    gaps) is an observability extension of #5644 requiring a daemon-side
+    applied-generation latch — out of the pkg/grpcapi/api/cli API-surface
+    scope; deferred, not fixed.
+  **File(s)**: pkg/grpcapi/server_nat.go,
+    pkg/grpcapi/server_nat_selector_5719_test.go, pkg/api/server.go,
+    pkg/api/tls_san_5719_test.go, pkg/api/README.md

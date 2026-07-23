@@ -326,6 +326,18 @@ under the daemon's errgroup. Nothing else imports this package.
     re-enable, HTTPS-bind-only change, HTTP-change-keeps-HTTPS, auth swap,
     bind-failure retain-old). `Run`/`serveBound` remain the single-lifecycle test
     entry point.
+  - The auto-generated HTTPS cert (`generateSelfSignedCertAt`, used when no
+    operator cert is provisioned) carries Subject Alternative Names, not just a
+    CommonName (#5719, codex-review-182 C-API TLS hygiene): the DNS SANs
+    `hostname` + `localhost` and the loopback IP SANs `127.0.0.1` / `::1`.
+    Every modern TLS client (Go's own client since 1.15, browsers, curl)
+    rejects a SAN-less cert for hostname verification, so a CN-only cert broke
+    `curl https://localhost:8443` / health probes even though the bind
+    succeeded. An already-persisted SAN-less cert is NOT auto-regenerated — the
+    #1916 D6 durable-cert contract keeps the on-disk pair stable so remote
+    clients' TOFU pins survive a power loss; only freshly generated certs gain
+    SANs (delete `cert.pem`/`key.pem` to force a regenerate). Pinned by
+    `tls_san_5719_test.go`, fail-on-revert.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during

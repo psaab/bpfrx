@@ -870,6 +870,19 @@ func generateSelfSignedCertAt(dir, certPath, keyPath string) (tls.Certificate, e
 		hostname = "xpf"
 	}
 
+	// Subject Alternative Names. A cert that carries only a CommonName and no
+	// SANs is rejected for hostname verification by every modern TLS client
+	// (Go's own client since 1.15, browsers, curl) — "x509: certificate is
+	// not valid for any names". The HTTPS API binds loopback (127.0.0.1/::1)
+	// by default and can bind a hostname-addressed non-loopback
+	// `web-management https interface`, so populate the DNS/IP SANs a local
+	// or hostname-pinned client actually matches (codex-review-182 C-API TLS
+	// hygiene). CommonName is retained for legacy display only.
+	dnsNames := []string{hostname}
+	if hostname != "localhost" {
+		dnsNames = append(dnsNames, "localhost")
+	}
+
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: hostname, Organization: []string{"xpf"}},
@@ -877,6 +890,8 @@ func generateSelfSignedCertAt(dir, certPath, keyPath string) (tls.Certificate, e
 		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     dnsNames,
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
