@@ -1,3 +1,41 @@
+## 2026-07-22 — #6361: three TEST-STRENGTH tightenings on the #6243 map-pin suite
+
+- **Timestamp**: 2026-07-22 (fix/6361-test-tighten → refactor/6243-unify-map-pin-preflight)
+- **Action**: Test-only follow-up folded into PR #6361 (the #6243 map-pin
+  preflight unify). Production code UNCHANGED — three Codex-flagged assertion
+  tightenings, all in `userspace-dp/src/afxdp/coordinator/tests.rs`:
+  1. **Exact byte-parity on open-failure cases** in
+     `reconcile_all_seven_pin_faults_lock_stage_and_binding_strings_6243`: the
+     seven OPEN-failure cases asserted the stage token + per-binding label with
+     `starts_with`, so a corrupted SUFFIX after the prefix (or a stage-vs-binding
+     `err` divergence) slipped past. Replaced with an `assert_open_parity` helper
+     that strips the EXACT stage/label prefix (fails otherwise), requires a
+     nonempty `{err}` suffix, and asserts BOTH paths render the IDENTICAL err
+     text — robust to a nondeterministic OS error string (never hardcodes it).
+  2. **Bind all-seven-opened from the fault side** in
+     `both_paths_open_full_seven_pin_bundle_before_ok_6243`: the test only
+     observed Ok acceptance, staying green if an optional open were dropped from
+     the shared opener. Added a per-optional probe — each optional pin set to a
+     present-but-unopenable FAIL pin must be rejected by BOTH paths with the
+     matching `OpenMapFailed(token)`. FD-RETENTION parity stays STRUCTURAL (the
+     fd=-1 `TEST_MAP_PIN_OK` seam admits no real FD-pressure); documented inline.
+  3. **Named identity test binds the two-pass revert** in
+     `map_pin_faults_react_identically_activated_and_deferred_6243`: it was
+     single-fault-only, hence tautological on a one-pass deferred revert (a lone
+     fault surfaces the same stage either way). Added a MULTI-FAULT case (xsk
+     present-but-unopenable + heartbeat EMPTY → both paths `MissingPin(Heartbeat)`
+     under two-pass) so THIS named test — not only the separate `multi_fault_...`
+     sibling — reds on a one-pass deferred revert.
+- **Validation**: `cargo test --release -- --test-threads=1` GREEN (whole
+  userspace-dp suite). Proof of the one-pass-revert gate: temporarily gave the
+  deferred `validate_map_pins` its own one-pass walk (faithful — mandatory AND
+  optional) → `map_pin_faults_react_identically_..._6243` FAILED at its new
+  multi-fault assertion (`activated=missing_heartbeat_pin`,
+  `deferred=open_xsk_map_failed:...`) alongside the `multi_fault_...` sibling,
+  while the single-fault `both_paths_...` and `reconcile_all_seven_...` stayed
+  GREEN (no false divergence); restored the shared opener (snapshot.rs pristine).
+- **File(s)**: userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
+
 ## 2026-07-22 — #6243: unify the activated + deferred BPF map-pin preflight
 
 - **Timestamp**: 2026-07-22 (refactor/6243-unify-map-pin-preflight)
