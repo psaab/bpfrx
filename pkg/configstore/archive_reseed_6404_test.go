@@ -200,6 +200,177 @@ func TestSetArchiveConfigDisableReenableNoOnDiskAdvanceNoRewind(t *testing.T) {
 	}
 }
 
+// TestCommitDoubleScanFailureSkipsBelowMaxArchive is the #6404 Codex round-2
+// MAJOR guard: when BOTH the SetArchiveConfig reseed scan AND the commit-time
+// rescan fail (a persistent scan error), the commit path must NOT write an
+// archive at the still-low counter. The on-disk max is unknown, so a below-max
+// archive would carry a seq beneath the pre-existing entries — mis-ranked by the
+// seq-ordered retention and pruned out of chronological order (or immediately,
+// when the dir is full). Skipping this commit's archive (it archives on the next
+// successful commit) is strictly safer.
+//
+// The dir holds 3 pre-existing archives and max=4, so a below-max write is NOT
+// pruned — its PRESENCE is directly observable. This is the REAL rotation
+// outcome (an extra, mis-seq'd file on disk), not a private-counter check.
+//
+// FAIL-ON-REVERT: reverting the readiness gate (writing unconditionally after
+// the scan failure) makes the double-failure commit write a seq-1 archive that
+// survives (4 <= max), so the dir holds 4 files including the below-max marker —
+// the "no below-max archive / exactly the 3 pre-existing survive" assertions go
+// RED. The recovery phase then confirms a post-recovery commit archives normally
+// at the confirmed seq.
+func TestCommitDoubleScanFailureSkipsBelowMaxArchive(t *testing.T) {
+	s := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+
+	// The (existing) target dir already holds high-seq archives 100..102.
+	for seq := 100; seq <= 102; seq++ {
+		ts := base.Add(time.Duration(seq) * time.Second)
+		if err := writeArchive(archiveDir, 100, fmt.Sprintf("pre-%d\n", seq), ts, uint64(seq)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A PERSISTENT scan error: the seam fails for both the SetArchiveConfig
+	// reseed AND the commit-time rescan. max=4 (> the 3 pre-existing) so a
+	// below-max write would survive rotation and be directly observable.
+	injErr := errors.New("injected: persistent ReadDir EIO")
+	prev := archiveDirReader
+	archiveDirReader = func(string) ([]os.DirEntry, error) { return nil, injErr }
+	s.SetArchiveConfig(archiveDir, 4)
+	if got := s.archiveSeq.Load(); got != 0 {
+		t.Fatalf("after the failed reseed scan, archiveSeq = %d, want 0 (un-seeded)", got)
+	}
+
+	// A commit lands while the scan is STILL failing. The reseed cannot confirm
+	// the on-disk max, so the archive must be skipped (no below-max write).
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFromInput("system host-name dbl-fail-6404"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("commit (scan failing): %v", err)
+	}
+	// If a writer was (wrongly) launched, wait for it so the assertion sees the
+	// settled dir; if it was correctly skipped, Wait returns immediately.
+	s.archiveWG.Wait()
+
+	remain := archiveConfigText(t, archiveDir)
+	if hasMarker(remain, "host-name dbl-fail-6404") {
+		t.Errorf("a commit during a persistent scan failure must NOT write a below-max "+
+			"archive (the seq is unconfirmed); surviving archives=%v", markerSet(remain))
+	}
+	if len(remain) != 3 {
+		t.Errorf("the 3 pre-existing archives must be untouched by the skipped commit, got %d: %v",
+			len(remain), markerSet(remain))
+	}
+	for _, w := range []string{"pre-100", "pre-101", "pre-102"} {
+		if !hasMarker(remain, w) {
+			t.Errorf("pre-existing archive %q must remain; surviving=%v", w, markerSet(remain))
+		}
+	}
+
+	// Recovery: the scan now succeeds. The next commit re-seeds from the on-disk
+	// max (102) and archives at a confirmed seq (103) that survives rotation.
+	archiveDirReader = prev
+	if err := s.SetFromInput("system host-name recovered-6404"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("commit (scan recovered): %v", err)
+	}
+	s.archiveWG.Wait()
+
+	if got := s.archiveSeq.Load(); got < 103 {
+		t.Errorf("after recovery the commit must reseed past the on-disk max (102) and archive "+
+			"at >= 103; archiveSeq = %d", got)
+	}
+	remain = archiveConfigText(t, archiveDir)
+	if !hasMarker(remain, "host-name recovered-6404") {
+		t.Errorf("the post-recovery commit must archive normally at the confirmed seq; surviving=%v",
+			markerSet(remain))
+	}
+}
+
+// TestSetArchiveConfigFailedNewDirRescansOriginalOnReturn is the #6404 adjacent
+// guard (Codex): after a FAILED scan of a NEW dir, archiveSeedDir must be
+// invalidated, so navigating back to the ORIGINAL dir re-scans it. Otherwise
+// A → failed-B → A leaves archiveSeedDir == A and the return to A skips the
+// rescan; if A's on-disk max advanced while this process was pointed at B (an
+// external writer), the counter stays low and fresh archives are pruned as
+// stale.
+//
+// FAIL-ON-REVERT: reverting the archiveSeedDir="" clear on a genuine scan error
+// leaves archiveSeedDir == dirA after B's failed scan, so the return to dirA
+// skips the rescan, the counter stays at dirA's stale max, and the fresh archive
+// carries a below-max seq that rotation prunes — the "fresh archive survives"
+// assertion goes RED.
+func TestSetArchiveConfigFailedNewDirRescansOriginalOnReturn(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+
+	// dirA holds seqs 1..5; configuring it seeds the counter to 5.
+	for seq := 1; seq <= 5; seq++ {
+		ts := base.Add(time.Duration(seq) * time.Second)
+		if err := writeArchive(dirA, 100, fmt.Sprintf("a-%d\n", seq), ts, uint64(seq)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &Store{}
+	s.SetArchiveConfig(dirA, 3)
+	if got := s.archiveSeq.Load(); got != 5 || s.archiveSeedDir != dirA {
+		t.Fatalf("after configuring dirA, archiveSeq=%d seedDir=%q, want 5 / %q", got, s.archiveSeedDir, dirA)
+	}
+
+	// Navigate to dirB, but the scan of dirB FAILS (transient error).
+	injErr := errors.New("injected: dirB ReadDir EIO")
+	prev := archiveDirReader
+	archiveDirReader = func(string) ([]os.DirEntry, error) { return nil, injErr }
+	s.SetArchiveConfig(dirB, 3)
+	archiveDirReader = prev
+
+	// While this process was pointed at dirB, an external writer advanced dirA's
+	// on-disk max to 100..102.
+	for seq := 100; seq <= 102; seq++ {
+		ts := base.Add(time.Duration(seq) * time.Second)
+		if err := writeArchive(dirA, 100, fmt.Sprintf("a-%d\n", seq), ts, uint64(seq)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Return to dirA. The failed dirB scan must have invalidated archiveSeedDir,
+	// so this re-scans dirA and catches the counter up to the advanced max (102).
+	s.SetArchiveConfig(dirA, 3)
+	// Supporting signal (non-fatal so the REAL rotation assertion is load-bearing).
+	if got := s.archiveSeq.Load(); got != 102 {
+		t.Errorf("returning to dirA after a failed dirB scan must rescan dirA and catch up to "+
+			"its advanced on-disk max (102); got %d", got)
+	}
+
+	// REAL rotation outcome: an archive written with the re-seeded counter must
+	// survive and the oldest pre-existing archive (a-100) must be pruned.
+	seq := s.archiveSeq.Add(1) // 103, from the reseeded 102
+	ts := base.Add(time.Duration(seq) * time.Second)
+	if err := writeArchive(dirA, 3, "a-return-6404\n", ts, seq); err != nil {
+		t.Fatal(err)
+	}
+	remain := archiveContents(t, dirA)
+	if !remain["a-return-6404"] {
+		t.Errorf("the archive written after returning to dirA must survive rotation (its "+
+			"re-seeded seq outranks the advanced pre-existing max); remain=%v", remain)
+	}
+	if remain["a-100"] {
+		t.Errorf("the oldest pre-existing archive (a-100) must be pruned; remain=%v", remain)
+	}
+	if len(remain) != 3 {
+		t.Errorf("want 3 archives after rotation (max=3), got %d: %v", len(remain), remain)
+	}
+}
+
 // archiveConfigText reads dir and returns the raw contents of every archive
 // file present, for asserting rotation outcomes on multi-line config text (the
 // commit path writes the formatted active tree, not a one-line marker).

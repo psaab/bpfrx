@@ -59676,3 +59676,22 @@ top.
     pkg/configstore/store_commit.go, pkg/configstore/store.go,
     pkg/configstore/README.md, pkg/configstore/archive_reseed_6404_test.go,
     _Log.md
+
+- **Timestamp**: 2026-07-23 23:40 UTC
+  - **Action**: #6404 Codex round-2 fold. `ensureArchiveSeededLocked` now
+    RETURNS a readiness bool; the archiving commit path SKIPS its archive when
+    the counter is unconfirmed (both the SetArchiveConfig scan AND the
+    commit-time rescan failed) rather than writing a below-max seq rotation
+    would prune (Codex MAJOR). ENOENT/first-use is treated as confirmed-empty
+    (preserves the nonexistent-archive-dir first-commit path). A genuine scan
+    failure now also CLEARS archiveSeedDir, so A→failed-B→A re-scans A (Codex
+    adjacent). Added TestCommitDoubleScanFailureSkipsBelowMaxArchive (parent-RED:
+    reverting the readiness gate writes+survives a below-max archive) and
+    TestSetArchiveConfigFailedNewDirRescansOriginalOnReturn (parent-RED:
+    reverting the clear-on-failure prunes the fresh archive). Both assert the
+    real rotation outcome. Verified RED→GREEN. README + archiveSeedDir doc
+    updated for skip-on-unconfirmed.
+  - **File(s)**: pkg/configstore/store_persist.go,
+    pkg/configstore/store_commit.go, pkg/configstore/store.go,
+    pkg/configstore/README.md, pkg/configstore/archive_reseed_6404_test.go,
+    _Log.md

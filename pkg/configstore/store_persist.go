@@ -3,6 +3,7 @@ package configstore
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -511,8 +512,11 @@ func (s *Store) SetArchiveConfig(dir string, max int) {
 
 // ensureArchiveSeededLocked seeds the monotonic archive counter (archiveSeq)
 // from the highest seq present in the active archive dir, when that dir has not
-// yet been SUCCESSFULLY scanned (archiveSeedDir != archiveDir). The caller MUST
-// hold s.mu for WRITING — it may store archiveSeedDir.
+// yet been SUCCESSFULLY scanned (archiveSeedDir != archiveDir). It returns
+// whether the counter is CONFIRMED relative to the active dir — true when
+// seeding is moot or succeeded, false only when a genuine scan failure leaves
+// the on-disk max UNKNOWN. The caller MUST hold s.mu for WRITING — it may store
+// archiveSeedDir.
 //
 // Switching to a previously-used directory whose existing archives carry HIGHER
 // seqs than this process's counter would otherwise let those pre-existing
@@ -520,36 +524,59 @@ func (s *Store) SetArchiveConfig(dir string, max int) {
 // the same across-restart hazard #5523 C179-060 closed but reached via a live
 // dir switch (#6396). The seed is monotonic-up only (max of the current counter
 // and the on-disk max), so switching to an empty or lower-seq dir never rewinds
-// the counter. A scan that fails to READ the dir leaves archiveSeedDir
-// unchanged so a later call retries, rather than pinning the counter below the
-// on-disk max (#6396 Codex MINOR 4).
+// the counter.
 //
-// #6404 edge 1: the commit archive path calls this BEFORE it captures a seq, so
-// a commit that lands in the window AFTER a failed SetArchiveConfig scan but
-// BEFORE the next SetArchiveConfig retry re-attempts the reseed instead of
-// writing an archive with a below-max seq that rotateArchives would prune as
-// stale. In the common case (dir already successfully seeded) the archiveSeedDir
-// guard makes this a cheap string compare — no per-commit ReadDir.
-func (s *Store) ensureArchiveSeededLocked() {
+// Readiness (#6404 Codex MAJOR round 2): the archiving commit path calls this
+// BEFORE it captures a seq and SKIPS the archive when it returns false. A commit
+// that lands in the window AFTER a failed SetArchiveConfig scan re-attempts the
+// reseed here (edge 1); if that rescan ALSO fails the on-disk max is still
+// unknown, so writing at the low counter would drop a below-max archive that
+// rotateArchives prunes as stale — skipping this commit's archive (it archives
+// on the next successful commit) is strictly safer than writing a mis-seq'd one.
+//
+// Result cases:
+//   - dir=="" (archival off) or archiveSeedDir==dir (already confirmed): ready,
+//     no scan (the common case is a cheap string compare — no per-commit ReadDir).
+//   - dir does not exist yet (first use, os.ErrNotExist): CONFIRMED empty —
+//     there are no pre-existing archives to outrank, so seq 0 is correct and the
+//     write path's MkdirAll creates the dir. Recorded as seeded, ready.
+//   - scan succeeds (including a readable empty dir → seed 0): seeded, ready.
+//   - genuine READ error (mount/permission): UNCONFIRMED. archiveSeedDir is
+//     CLEARED (#6404 adjacent) so we never retain confidence in a dir we have
+//     navigated away from — A→failed-B→A then re-scans A — and a later call
+//     retries. Returns false so the commit path skips this archive.
+func (s *Store) ensureArchiveSeededLocked() bool {
 	dir := s.archiveDir
 	if dir == "" || s.archiveSeedDir == dir {
-		return
+		return true
 	}
 	seed, err := maxArchiveSeq(dir)
 	if err != nil {
-		// #6396 Codex MINOR 4: a transient scan failure (mount/permission)
-		// must NOT reseed the counter to 0 and must NOT record the dir as
-		// seeded — leaving archiveSeedDir unchanged so the next call retries.
-		// Regressing the counter here would prune every fresh archive as stale
-		// until a later scan succeeded.
-		slog.Warn("archive seq reseed scan failed; leaving counter unchanged, will retry",
+		if errors.Is(err, os.ErrNotExist) {
+			// First use: the archive dir does not exist yet. This is NOT a scan
+			// failure — a nonexistent dir holds no pre-existing archives, so seq
+			// 0 is confirmed-correct and the write path's MkdirAll creates it.
+			// Treat exactly like a readable empty dir: record as seeded, ready.
+			s.archiveSeedDir = dir
+			return true
+		}
+		// #6396 Codex MINOR 4 + #6404: a genuine scan failure (mount/permission)
+		// must NOT reseed the counter to 0. The on-disk max is UNKNOWN, so the
+		// counter is unconfirmed. Clear archiveSeedDir (#6404 adjacent) so a
+		// stale marker for a previously-confirmed dir is not trusted after we
+		// navigate to a new dir, and so the next call retries. Return false so
+		// the commit path skips this archive rather than writing a below-max seq
+		// that rotateArchives would prune as stale.
+		slog.Warn("archive seq reseed scan failed; counter unconfirmed, will retry",
 			"dir", dir, "err", err)
-		return
+		s.archiveSeedDir = ""
+		return false
 	}
 	if seed > s.archiveSeq.Load() {
 		s.archiveSeq.Store(seed)
 	}
 	s.archiveSeedDir = dir
+	return true
 }
 
 // parseArchiveSeq extracts the monotonic sequence number from an archive
