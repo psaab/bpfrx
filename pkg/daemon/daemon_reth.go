@@ -437,7 +437,7 @@ func rethUnitForVlanID(rethCfg *config.InterfaceConfig, vid int) (int, bool) {
 		return 0, false
 	}
 	if matches > 1 {
-		slog.Warn("reth: multiple units share a vlan-id; using lowest unit for IPv6 repair",
+		slog.Warn("reth: multiple units share a vlan-id; using lowest unit for the netdev name (all matching units scanned for IPv6 link-local repair)",
 			"iface", rethCfg.Name, "vlan-id", vid, "unit", found)
 	}
 	return found, true
@@ -486,4 +486,27 @@ func rethSubIfaceNameNeedsLinkLocal(rethCfg *config.InterfaceConfig, subName str
 		return false
 	}
 	return rethSubIfaceNeedsLinkLocal(rethCfg, vid)
+}
+
+// removeAutoLinkLocalFn / ensureRethLinkLocalFn are the live wiring for the two
+// netlink side-effects of rethSubIfaceLinkLocalRepair. They are package vars
+// (mirroring the device_map.go seam idiom) so a test can drive the repair
+// decision without real netlink and assert which sub-interface got a link-local.
+var (
+	removeAutoLinkLocalFn = removeAutoLinkLocal
+	ensureRethLinkLocalFn = ensureRethLinkLocal
+)
+
+// rethSubIfaceLinkLocalRepair performs the per-VLAN-sub-interface link-local
+// repair the post-MAC loop in applyDataplaneAndHACore runs for each child of a
+// RETH member: always strip any stale kernel auto link-local, then re-add a
+// stable one IF the sub-interface carries IPv6 in config (resolved vlan-id ->
+// unit, #5107). Extracting the whole decision+action here keeps the netlink
+// enumeration loop a trivial one-line delegation and lets a spy-driven test bind
+// the parse/resolve/scan and the repair ordering without real netlink.
+func rethSubIfaceLinkLocalRepair(rethCfg *config.InterfaceConfig, subName string) {
+	removeAutoLinkLocalFn(subName)
+	if rethSubIfaceNameNeedsLinkLocal(rethCfg, subName) {
+		ensureRethLinkLocalFn(subName)
+	}
 }

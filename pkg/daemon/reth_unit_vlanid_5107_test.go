@@ -116,7 +116,7 @@ func TestRethUnitForVlanID(t *testing.T) {
 // dupVIDWarn is the collision warning rethUnitForVlanID emits when several
 // units share a vlan-id (an invalid config). Kept in one place so the test
 // asserting it stays in lockstep with the production string.
-const dupVIDWarn = "reth: multiple units share a vlan-id; using lowest unit for IPv6 repair"
+const dupVIDWarn = "reth: multiple units share a vlan-id; using lowest unit for the netdev name (all matching units scanned for IPv6 link-local repair)"
 
 // TestRethUnitForVlanIDDuplicateDeterministic proves a duplicate vlan-id (an
 // invalid config) resolves deterministically to the lowest unit number
@@ -293,6 +293,61 @@ func TestRethSubIfaceNameNeedsLinkLocal(t *testing.T) {
 	}
 }
 
+// TestRethSubIfaceLinkLocalRepairDrivesEnsureByVlanID binds the per-sub-interface
+// repair ACTION that the post-MAC loop in applyDataplaneAndHACore delegates to:
+// removeAutoLinkLocal runs for every child (unconditional stale-LL strip) and
+// ensureRethLinkLocal runs ONLY when the resolved vlan-id carries IPv6. The two
+// netlink side-effects are swapped for spies so the decision path (parse +
+// vlan-id->unit resolve + all-units scan + repair ordering) is driven without
+// real netlink. The remaining unbound surface is just the netlink LinkList/
+// ParentIndex enumeration, which the loop delegates to this function in one line.
+//
+// Fail-on-revert: reverting rethSubIfaceNameNeedsLinkLocal's resolution to index
+// Units[vid] directly (`return rethUnitHasIPv6(rethCfg, vid)`) drops the ".180"
+// ensure (Units[180] is absent), so `ensured` no longer equals ["ge-7-0-1.180"].
+func TestRethSubIfaceLinkLocalRepairDrivesEnsureByVlanID(t *testing.T) {
+	var removed, ensured []string
+	origRemove := removeAutoLinkLocalFn
+	origEnsure := ensureRethLinkLocalFn
+	removeAutoLinkLocalFn = func(n string) { removed = append(removed, n) }
+	ensureRethLinkLocalFn = func(n string) { ensured = append(ensured, n) }
+	t.Cleanup(func() {
+		removeAutoLinkLocalFn = origRemove
+		ensureRethLinkLocalFn = origEnsure
+	})
+
+	cfg := &config.InterfaceConfig{
+		Name:            "reth0",
+		RedundancyGroup: 1,
+		Units: map[int]*config.InterfaceUnit{
+			// vlan-id 180 (!= unit 80), has IPv6.
+			80: {Number: 80, VlanID: 180, Addresses: []string{
+				"172.16.80.8/24", "2001:db8:80::8/64"}},
+			// vlan-id 190 (!= unit 90), IPv4-only.
+			90: {Number: 90, VlanID: 190, Addresses: []string{"172.16.90.8/24"}},
+		},
+	}
+
+	// Kernel VLAN sub-interface names the enumeration loop would hand us.
+	for _, sub := range []string{"ge-7-0-1.180", "ge-7-0-1.190", "ge-7-0-1.80"} {
+		rethSubIfaceLinkLocalRepair(cfg, sub)
+	}
+
+	// Stale-LL strip is unconditional: every child.
+	wantRemoved := []string{"ge-7-0-1.180", "ge-7-0-1.190", "ge-7-0-1.80"}
+	if !equalStrs(removed, wantRemoved) {
+		t.Errorf("removeAutoLinkLocalFn calls = %v, want %v (every child)",
+			removed, wantRemoved)
+	}
+	// ensure only for the IPv6-bearing vlan-id 180 -> unit 80. Not .190
+	// (IPv4-only) and not .80 (a unit number, not a vlan-id).
+	wantEnsured := []string{"ge-7-0-1.180"}
+	if !equalStrs(ensured, wantEnsured) {
+		t.Errorf("ensureRethLinkLocalFn calls = %v, want %v (only the IPv6 vlan-id)",
+			ensured, wantEnsured)
+	}
+}
+
 // TestDesiredClusterRAResolvesByVlanID binds the cluster RA ownership gate in
 // desiredClusterRA (daemon_ra_reconcile.go). An owned RG's RETH interfaces are
 // enumerated by rethInterfacesForRG, which suffixes by unit.VlanID (member.180);
@@ -352,6 +407,19 @@ func silenceLogs(t *testing.T) {
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	t.Cleanup(func() { slog.SetDefault(prev) })
+}
+
+// equalStrs reports whether two string slices are equal in order and contents.
+func equalStrs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // keys returns the set's members for error messages.
