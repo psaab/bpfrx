@@ -57928,3 +57928,24 @@ top.
     ./pkg/api/... ./pkg/grpcapi/... green; vet + gofmt clean.
   **File(s)**: pkg/api/server.go, pkg/api/tls_san_5719_test.go,
     pkg/api/tls_test.go, pkg/api/README.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #5718 (cohort codex-182 C-HA) — fix the two independent
+    diagnostic-race survivors. C01b: the syncMsgBulkEnd mismatch-epoch
+    handler read s.bulkRecvEpoch in its slog.Warn args AFTER releasing
+    s.bulkMu, racing a concurrent BulkStart write under bulkMu — snapshot
+    `want := s.bulkRecvEpoch` before Unlock, log the snapshot. C01c:
+    Manager.Status() formatted vi.cfg.Priority/Preempt/AdvertiseInterval/
+    VirtualAddresses under only m.mu.RLock, racing a failover
+    UpdateRGPriority write under vi.mu.Lock — snapshot the cfg fields under
+    vi.mu.RLock before formatting, mirroring advertInterval/getPriority
+    (#6230). Both are diagnostic-only (log/status output byte-identical),
+    go test -race flags the unfixed reads. Added fail-on-revert -race tests
+    (RED verified: DATA RACE + FAIL on revert). Deferred C01a (process-
+    sticky heartbeat-ACK capability — heartbeat-wire + peer-incarnation
+    coupled to #5480/#6169/anti-replay) and A6-b01-C1 (worker clamp cast —
+    pkg/dataplane/userspace, out of cluster/daemon scope). go vet + gofmt
+    clean; ./pkg/cluster/... ./pkg/vrrp/... ./pkg/daemon/... green.
+  **File(s)**: pkg/cluster/sync_conn_read.go,
+    pkg/cluster/bulkend_epoch_log_race_5718_test.go, pkg/vrrp/manager.go,
+    pkg/vrrp/status_config_race_5718_test.go
