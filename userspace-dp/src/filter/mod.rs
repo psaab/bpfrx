@@ -74,10 +74,12 @@ pub(crate) enum FilterAction {
 //       lookup. File a tracker issue against session/key.rs.
 //
 //   (b) NOT in cache key (cache-sensitive) — wire the #1430
-//       runbook: per-interface FilterState.iface_filter_v{4,6}_has_<X>_match
-//       set, Filter.has_<X>_match_terms aggregate flag, flow-cache
-//       insertion gate at afxdp/flow_cache.rs:297-309, established-
-//       session re-evaluation at afxdp/poll_descriptor/mod.rs:217-244,
+//       runbook: Filter.has_<X>_match_terms flag (read per-interface
+//       off FilterState.iface_filter_v{4,6}_fast via the
+//       interface_input_filter_has_<X>_match accessor — the parallel
+//       per-interface has_<X>_match sets were deleted in #6236 PR-2B),
+//       flow-cache insertion gate at afxdp/flow_cache.rs:297-309,
+//       established-session re-evaluation at afxdp/poll_descriptor/mod.rs:217-244,
 //       forwarding rotation purge at afxdp/worker/loop_body/mod.rs:295-330,
 //       and tests at afxdp/flow_cache_tests.rs.
 //
@@ -778,44 +780,39 @@ pub(crate) struct FilterState {
     pub(crate) has_input_tx_selection_v4: bool,
     /// Whether any inet input filter contains a three-color policer.
     pub(crate) has_input_three_color_policer_v4: bool,
-    /// Per-interface inet input filters that can affect route-table selection.
-    pub(crate) iface_filter_v4_affects_route_lookup: rustc_hash::FxHashSet<i32>,
-    /// Per-interface inet input filters with DSCP match terms.
-    pub(crate) iface_filter_v4_has_dscp_match: rustc_hash::FxHashSet<i32>,
-    /// Per-interface inet input filters with per-packet L4 match terms (#2362:
-    /// tcp-flags / is-fragment / icmp-type / icmp-code). Cache-sensitive.
-    pub(crate) iface_filter_v4_has_per_packet_l4_match: rustc_hash::FxHashSet<i32>,
+    // #6236 PR-2B: the per-interface inet input capability sets
+    // (`iface_filter_v4_affects_route_lookup`, `iface_filter_v4_has_dscp_match`,
+    // `iface_filter_v4_has_per_packet_l4_match`) are deleted — every accessor now
+    // reads the mirrored `Filter` flag off `iface_filter_v4_fast`.
     /// Direct per-interface inet6 filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_v6_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
     /// Whether any inet6 input filter can affect CoS TX selection.
     pub(crate) has_input_tx_selection_v6: bool,
     /// Whether any inet6 input filter contains a three-color policer.
     pub(crate) has_input_three_color_policer_v6: bool,
-    /// Per-interface inet6 input filters that can affect route-table selection.
-    pub(crate) iface_filter_v6_affects_route_lookup: rustc_hash::FxHashSet<i32>,
-    /// Per-interface inet6 input filters with DSCP match terms.
-    pub(crate) iface_filter_v6_has_dscp_match: rustc_hash::FxHashSet<i32>,
-    /// Per-interface inet6 input filters with per-packet L4 match terms (#2362).
-    pub(crate) iface_filter_v6_has_per_packet_l4_match: rustc_hash::FxHashSet<i32>,
+    // #6236 PR-2B: the per-interface inet6 input capability sets are deleted —
+    // the accessors read the mirrored `Filter` flag off `iface_filter_v6_fast`
+    // (same as the inet input block above).
     /// Direct per-interface inet output filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_out_v4_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
-    /// Per-interface inet output filters that must still be evaluated in the TX path.
-    pub(crate) iface_filter_out_v4_needs_tx_eval: rustc_hash::FxHashSet<i32>,
-    /// Whether any inet output filter can affect CoS TX selection.
-    pub(crate) has_output_tx_selection_v4: bool,
+    // #6236 PR-2B: `iface_filter_out_v4_needs_tx_eval` (per-interface set) and
+    // `has_output_tx_selection_v4` (aggregate) are deleted. The
+    // `interface_output_filter_needs_tx_eval` accessor reads
+    // `Filter::needs_tx_eval()` off `iface_filter_out_v4_fast`, and the global TX
+    // gate reads the `has_output_needs_tx_eval_v4` aggregate (PR-2A) which
+    // subsumes the deleted `affects_tx_selection`-only aggregate.
     /// #6236 PR-2A: whether any inet output filter needs a TX-path walk
     /// (`Filter::needs_tx_eval` — CoS/DSCP tx-selection, counter, log, terminal
     /// action, or three-color policer). Recomputed from the FINAL output fast map
     /// so a duplicate-ifindex last-wins overwrite cannot leave a stale-true
-    /// aggregate; it subsumes both `has_output_tx_selection_v4` and the
-    /// `iface_filter_out_v4_needs_tx_eval` set non-emptiness in the global gate.
+    /// aggregate. It is the SOLE output clause of the global TX gate: it subsumes
+    /// both the old `affects_tx_selection`-only aggregate and the old
+    /// per-interface needs-tx-eval set non-emptiness (both deleted in PR-2B).
     pub(crate) has_output_needs_tx_eval_v4: bool,
     /// Direct per-interface inet6 output filter reference for packet hot-path evaluation.
     pub(crate) iface_filter_out_v6_fast: rustc_hash::FxHashMap<i32, Arc<Filter>>,
-    /// Per-interface inet6 output filters that must still be evaluated in the TX path.
-    pub(crate) iface_filter_out_v6_needs_tx_eval: rustc_hash::FxHashSet<i32>,
-    /// Whether any inet6 output filter can affect CoS TX selection.
-    pub(crate) has_output_tx_selection_v6: bool,
+    // #6236 PR-2B: `iface_filter_out_v6_needs_tx_eval` and
+    // `has_output_tx_selection_v6` are deleted (see the inet output block above).
     /// #6236 PR-2A: inet6 mirror of `has_output_needs_tx_eval_v4`.
     pub(crate) has_output_needs_tx_eval_v6: bool,
     /// Direct lo0 inet filter reference for packet hot-path evaluation.

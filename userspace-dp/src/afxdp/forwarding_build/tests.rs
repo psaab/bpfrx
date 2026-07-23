@@ -2298,8 +2298,8 @@ fn build_forwarding_state_enables_tx_selection_when_cos_interfaces_exist() {
 /// the aggregate clears, the gate disables, and this counter-only filter's
 /// `then count` would silently stop being enforced on the TX path. It also pins
 /// that the new single aggregate subsumes the OLD two-clause gate — the old
-/// `has_output_tx_selection_v4` clause is `false` here (counter-only), so only
-/// the `needs_tx_eval` superset keeps the gate armed.
+/// `affects_tx_selection` clause is `false` here (counter-only), so only the
+/// `needs_tx_eval` superset keeps the gate armed.
 #[test]
 fn build_forwarding_state_enables_tx_selection_for_counter_only_output_filter() {
     let snapshot = ConfigSnapshot {
@@ -2325,8 +2325,15 @@ fn build_forwarding_state_enables_tx_selection_for_counter_only_output_filter() 
     // affects_tx_selection is false (no forwarding-class / dscp-rewrite), so the
     // OLD has_output_tx_selection clause does NOT arm the gate — only the
     // needs_tx_eval superset (which covers `then count`) does.
+    // #6236 PR-2B: `has_output_tx_selection_v4` is deleted; read the
+    // `affects_tx_selection` flag off the output fast-map filter to make the
+    // same point — a counter-only filter does not affect tx-selection.
     assert!(
-        !state.filter_state.has_output_tx_selection_v4,
+        !state
+            .filter_state
+            .iface_filter_out_v4_fast
+            .get(&7)
+            .is_some_and(|f| f.affects_tx_selection),
         "counter-only filter does not affect tx-selection"
     );
     assert!(
@@ -2342,12 +2349,15 @@ fn build_forwarding_state_enables_tx_selection_for_counter_only_output_filter() 
     assert!(!state.tx_selection_enabled_v6);
 }
 
-/// #6236 PR-2A equivalence: on a NORMAL (unique-ifindex) compiled state the new
+/// #6236 PR-2A/2B equivalence: on a NORMAL (unique-ifindex) compiled state the
 /// `has_output_needs_tx_eval_*` aggregate is bit-equivalent to the OLD two-clause
-/// gate it replaces — `has_output_tx_selection_* OR !needs_tx_eval-set.is_empty()`.
-/// The `iface_filter_out_*_needs_tx_eval` sets still exist in PR-2A, so this
-/// asserts the replacement is behavior-preserving across a mix of output-filter
-/// shapes (tx-selection, counter-only, terminal-only, and plain accept).
+/// gate it replaced — `has_output_tx_selection_* OR !needs_tx_eval-set.is_empty()`.
+/// PR-2B deleted both `has_output_tx_selection_*` and the
+/// `iface_filter_out_*_needs_tx_eval` sets, so the two original clauses are
+/// reconstructed here independently from the retained output fast maps (an
+/// `affects_tx_selection` scan for the first clause, a `needs_tx_eval()` scan for
+/// the second). Exercises a mix of output-filter shapes (tx-selection,
+/// counter-only, terminal-only, and plain accept).
 #[test]
 fn has_output_needs_tx_eval_matches_old_two_clause_gate() {
     let snapshot = ConfigSnapshot {
@@ -2423,10 +2433,26 @@ fn has_output_needs_tx_eval_matches_old_two_clause_gate() {
     };
 
     let fs = build_forwarding_state(&snapshot).filter_state;
-    let old_gate_v4 =
-        fs.has_output_tx_selection_v4 || !fs.iface_filter_out_v4_needs_tx_eval.is_empty();
-    let old_gate_v6 =
-        fs.has_output_tx_selection_v6 || !fs.iface_filter_out_v6_needs_tx_eval.is_empty();
+    // #6236 PR-2B: reconstruct the two original clauses from the retained output
+    // fast maps — clause 1 = old `has_output_tx_selection_*` (any output filter
+    // affects tx-selection); clause 2 = old `!needs_tx_eval-set.is_empty()` (any
+    // output filter needs a TX walk).
+    let old_gate_v4 = fs
+        .iface_filter_out_v4_fast
+        .values()
+        .any(|f| f.affects_tx_selection)
+        || fs
+            .iface_filter_out_v4_fast
+            .values()
+            .any(|f| f.needs_tx_eval());
+    let old_gate_v6 = fs
+        .iface_filter_out_v6_fast
+        .values()
+        .any(|f| f.affects_tx_selection)
+        || fs
+            .iface_filter_out_v6_fast
+            .values()
+            .any(|f| f.needs_tx_eval());
     assert_eq!(
         fs.has_output_needs_tx_eval_v4, old_gate_v4,
         "new v4 aggregate must equal the old two-clause gate"

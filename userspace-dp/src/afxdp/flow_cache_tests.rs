@@ -1125,10 +1125,11 @@ fn dscp_input_gate_blocks_flow_cache_insertion_via_runbook_pattern() {
             name: "reth1.0".into(),
             ifindex: meta.ingress_ifindex as i32,
             // Step 3: bind the filter as an INPUT filter on the
-            // ingress interface. The snapshot compiler in
-            // userspace-dp/src/filter/compiler.rs populates the
-            // per-interface has_dscp_match set
-            // (FilterState.iface_filter_v4_has_dscp_match).
+            // ingress interface. Since #6236 PR-2B the
+            // `interface_input_filter_has_dscp_match` accessor reads the
+            // `has_dscp_match_terms` flag off the per-interface fast map
+            // (FilterState.iface_filter_v4_fast) — the parallel has_dscp_match
+            // set was deleted.
             filter_input_v4: "lan-runbook-input".into(),
             ..Default::default()
         }],

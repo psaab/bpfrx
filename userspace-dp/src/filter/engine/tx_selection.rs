@@ -377,11 +377,17 @@ pub(crate) fn interface_output_filter_needs_tx_eval(
     ifindex: i32,
     is_v6: bool,
 ) -> bool {
-    if is_v6 {
-        state.iface_filter_out_v6_needs_tx_eval.contains(&ifindex)
+    // #6236 PR-2B: read `Filter::needs_tx_eval()` off the output fast map,
+    // replacing the parallel `iface_filter_out_v*_needs_tx_eval` set. The set
+    // was populated iff `filter.needs_tx_eval()`, so `get().is_some_and(..)` is
+    // bit-identical for a unique ifindex and agrees with the last-wins filter
+    // the TX evaluator actually walks for a duplicate.
+    let filter = if is_v6 {
+        state.iface_filter_out_v6_fast.get(&ifindex)
     } else {
-        state.iface_filter_out_v4_needs_tx_eval.contains(&ifindex)
-    }
+        state.iface_filter_out_v4_fast.get(&ifindex)
+    };
+    filter.is_some_and(|filter| filter.needs_tx_eval())
 }
 
 #[inline]
@@ -393,11 +399,8 @@ pub(crate) fn filter_state_has_input_tx_selection(state: &FilterState, is_v6: bo
     }
 }
 
-#[inline]
-pub(crate) fn filter_state_has_output_tx_selection(state: &FilterState, is_v6: bool) -> bool {
-    if is_v6 {
-        state.has_output_tx_selection_v6
-    } else {
-        state.has_output_tx_selection_v4
-    }
-}
+// #6236 PR-2B: `filter_state_has_output_tx_selection` (and the
+// `has_output_tx_selection_v*` fields it read) are deleted. PR-2A already
+// rewired the global TX gate onto `has_output_needs_tx_eval_*`, which subsumes
+// the old `affects_tx_selection`-only aggregate; the accessor had no production
+// consumer left.

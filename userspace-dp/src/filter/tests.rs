@@ -2276,18 +2276,20 @@ fn parse_filter_state_prequalifies_interface_and_lo0_filter_keys() {
     // `iface_filter_v4_affects_tx_selection` set are removed. The retained fast
     // maps carry the resolved `Arc<Filter>` (name is the unqualified filter
     // name), and the aggregate boolean carries the family-wide tx-selection
-    // fact. The route-lookup and output needs_tx_eval sets are retained (PR-2
-    // scope) and asserted as before.
+    // fact. #6236 PR-2B: the route-lookup and output needs_tx_eval property sets
+    // are deleted — the capability facts are now read through the migrated
+    // accessors (which read the flag off the fast map) and the retained
+    // `has_output_needs_tx_eval_*` aggregate.
     assert_eq!(
         state.iface_filter_v4_fast.get(&7).map(|f| f.name.as_str()),
         Some("ingress-v4")
     );
     assert!(state.has_input_tx_selection_v4);
-    assert!(state.iface_filter_v4_affects_route_lookup.contains(&7));
-    assert!(!state.iface_filter_out_v4_needs_tx_eval.contains(&7));
-    assert!(!state.iface_filter_out_v6_needs_tx_eval.contains(&7));
-    assert!(!state.has_output_tx_selection_v4);
-    assert!(!state.has_output_tx_selection_v6);
+    assert!(interface_filter_affects_route_lookup(&state, 7, false));
+    assert!(!interface_output_filter_needs_tx_eval(&state, 7, false));
+    assert!(!interface_output_filter_needs_tx_eval(&state, 7, true));
+    assert!(!state.has_output_needs_tx_eval_v4);
+    assert!(!state.has_output_needs_tx_eval_v6);
     assert_eq!(
         state
             .iface_filter_out_v6_fast
@@ -2333,7 +2335,9 @@ fn accept_only_output_filter_does_not_need_tx_eval() {
     .expect("filter state compiles");
 
     assert!(!interface_output_filter_needs_tx_eval(&state, 7, false));
-    assert!(!filter_state_has_output_tx_selection(&state, false));
+    // #6236 PR-2B: `filter_state_has_output_tx_selection` is deleted; an
+    // accept-only output filter leaves the retained needs-tx-eval aggregate false.
+    assert!(!state.has_output_needs_tx_eval_v4);
 }
 
 /// #6236 PR-2A parent-RED anchor: a `then count`-only OUTPUT filter (no
@@ -2380,23 +2384,27 @@ fn counter_only_output_filter_needs_tx_eval_and_sets_aggregate() {
         !filter.affects_tx_selection,
         "counter is not a tx-selection action"
     );
-    // Accessor reads the set, which the compiler populates via needs_tx_eval().
+    // #6236 PR-2B: the accessor now reads `Filter::needs_tx_eval()` off the
+    // output fast-map entry (the set is deleted).
     assert!(interface_output_filter_needs_tx_eval(&state, 7, false));
     // Aggregate recomputed from the FINAL output fast map.
     assert!(state.has_output_needs_tx_eval_v4);
-    // needs_tx_eval strictly supersets affects_tx_selection.
-    assert!(!state.has_output_tx_selection_v4);
+    // needs_tx_eval strictly supersets affects_tx_selection — read the flag off
+    // the fast-map filter now that `has_output_tx_selection_v4` is deleted.
+    assert!(!filter.affects_tx_selection);
 }
 
-/// #6236 PR-2A blocker-#1 pin: a duplicate ifindex where a needs-tx-eval output
-/// filter is followed by a plain-accept one at the SAME ifindex+family+direction.
-/// The fast map overwrites last-wins (holds the SECOND, plain filter); the
-/// `has_output_needs_tx_eval_v4` aggregate — recomputed from the FINAL map, NOT
-/// accumulated in-loop — therefore reads FALSE, agreeing with the filter the hot
-/// path actually evaluates. The monotonic `iface_filter_out_v4_needs_tx_eval`
-/// set still carries the stale ifindex (union kept the first); this documents
-/// exactly the §5.1 divergence the recompute closes. The snapshot still compiles
-/// Ok (last-wins canonical, NOT reject-fail-closed).
+/// #6236 PR-2A blocker-#1 pin (updated for PR-2B): a duplicate ifindex where a
+/// needs-tx-eval output filter is followed by a plain-accept one at the SAME
+/// ifindex+family+direction. The fast map overwrites last-wins (holds the
+/// SECOND, plain filter); the `has_output_needs_tx_eval_v4` aggregate —
+/// recomputed from the FINAL map, NOT accumulated in-loop — therefore reads
+/// FALSE, agreeing with the filter the hot path actually evaluates. PR-2B
+/// deleted the monotonic `iface_filter_out_v4_needs_tx_eval` set, so the
+/// migrated `interface_output_filter_needs_tx_eval` accessor now also reads the
+/// last-wins fast-map filter → FALSE (part c), closing the §5.1 divergence at
+/// the per-interface level too. The snapshot still compiles Ok (last-wins
+/// canonical, NOT reject-fail-closed).
 #[test]
 fn duplicate_ifindex_output_filter_aggregate_is_last_wins() {
     let ifaces = vec![
@@ -2453,10 +2461,278 @@ fn duplicate_ifindex_output_filter_aggregate_is_last_wins() {
         !state.has_output_needs_tx_eval_v4,
         "aggregate must derive from the final last-wins filter"
     );
-    // (c) the monotonic set still carries the stale ifindex — this is the exact
-    // divergence the recompute fixes at the aggregate level (PR-2B deletes the
-    // set and migrates the accessor).
-    assert!(state.iface_filter_out_v4_needs_tx_eval.contains(&7));
+    // (c) #6236 PR-2B: the monotonic set is deleted and the accessor now reads
+    // `Filter::needs_tx_eval()` off the last-wins fast-map entry — so it returns
+    // FALSE, agreeing with the (plain) filter the TX path actually evaluates.
+    // This is exactly the divergence the fold closes: before PR-2B the set
+    // `.contains(&7)` was stale-true while the fast map held the plain filter.
+    assert!(!interface_output_filter_needs_tx_eval(&state, 7, false));
+}
+
+/// #6236 PR-2B equivalence gate. This test was landed FIRST in the pre-deletion
+/// form (`set.contains(&if) == fast.get(&if).is_some_and(flag)`) and confirmed
+/// green to PROVE the accessor body-swap is behavior-preserving BEFORE any of
+/// the eight property sets were removed. Post-deletion it survives as an
+/// accessor-semantics regression pin: for a normally compiled `FilterState`
+/// (unique ifindices) each migrated capability accessor returns exactly the
+/// mirrored `Filter` flag off the per-interface fast map, across both families
+/// and both directions. If any accessor drifts to the wrong flag/map this fails.
+#[test]
+fn capability_accessors_equal_fast_map_flags_for_unique_ifindices() {
+    let ifaces = vec![
+        // input v4 / v6 route-lookup (routing-instance term)
+        crate::InterfaceSnapshot {
+            name: "a".into(),
+            ifindex: 10,
+            filter_input_v4: "pbr4".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "b".into(),
+            ifindex: 11,
+            filter_input_v6: "pbr6".into(),
+            ..Default::default()
+        },
+        // input v4 / v6 DSCP match
+        crate::InterfaceSnapshot {
+            name: "c".into(),
+            ifindex: 20,
+            filter_input_v4: "dscp4".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "d".into(),
+            ifindex: 21,
+            filter_input_v6: "dscp6".into(),
+            ..Default::default()
+        },
+        // input v4 / v6 per-packet L4 match (tcp-flags)
+        crate::InterfaceSnapshot {
+            name: "e".into(),
+            ifindex: 30,
+            filter_input_v4: "ppl4".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "f".into(),
+            ifindex: 31,
+            filter_input_v6: "ppl6".into(),
+            ..Default::default()
+        },
+        // output v4 (counter) / v6 (log) → needs_tx_eval
+        crate::InterfaceSnapshot {
+            name: "g".into(),
+            ifindex: 40,
+            filter_output_v4: "count4".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "h".into(),
+            ifindex: 41,
+            filter_output_v6: "log6".into(),
+            ..Default::default()
+        },
+        // plain-accept input+output (no capability flag) — negative side
+        crate::InterfaceSnapshot {
+            name: "i".into(),
+            ifindex: 50,
+            filter_input_v4: "plain4".into(),
+            filter_input_v6: "plain6".into(),
+            filter_output_v4: "plain4".into(),
+            filter_output_v6: "plain6".into(),
+            ..Default::default()
+        },
+    ];
+    let state = parse_filter_state(
+        &[
+            FirewallFilterSnapshot {
+                name: "pbr4".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    routing_instance: "ri".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "pbr6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    routing_instance: "ri".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "dscp4".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    dscp_values: vec![46],
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "dscp6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    dscp_values: vec![46],
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "ppl4".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    protocols: vec!["tcp".into()],
+                    tcp_flags: Some(0x02),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "ppl6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    protocols: vec!["tcp".into()],
+                    tcp_flags: Some(0x02),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "count4".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    count: "c4".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "log6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    log: true,
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "plain4".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "plain6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+
+    // Probe every used ifindex plus absent ones (0, 1, 99) so both the positive
+    // and negative sides of the equivalence are exercised.
+    let probe: [i32; 12] = [10, 11, 20, 21, 30, 31, 40, 41, 50, 99, 0, 1];
+    for &ifx in &probe {
+        assert_eq!(
+            interface_filter_affects_route_lookup(&state, ifx, false),
+            state
+                .iface_filter_v4_fast
+                .get(&ifx)
+                .is_some_and(|f| f.affects_route_lookup),
+            "v4 affects_route_lookup accessor != fast-map flag at {ifx}"
+        );
+        assert_eq!(
+            interface_filter_affects_route_lookup(&state, ifx, true),
+            state
+                .iface_filter_v6_fast
+                .get(&ifx)
+                .is_some_and(|f| f.affects_route_lookup),
+            "v6 affects_route_lookup accessor != fast-map flag at {ifx}"
+        );
+        assert_eq!(
+            interface_input_filter_has_dscp_match(&state, ifx, false),
+            state
+                .iface_filter_v4_fast
+                .get(&ifx)
+                .is_some_and(|f| f.has_dscp_match_terms),
+            "v4 has_dscp_match accessor != fast-map flag at {ifx}"
+        );
+        assert_eq!(
+            interface_input_filter_has_dscp_match(&state, ifx, true),
+            state
+                .iface_filter_v6_fast
+                .get(&ifx)
+                .is_some_and(|f| f.has_dscp_match_terms),
+            "v6 has_dscp_match accessor != fast-map flag at {ifx}"
+        );
+        assert_eq!(
+            interface_input_filter_has_per_packet_l4_match(&state, ifx, false),
+            state
+                .iface_filter_v4_fast
+                .get(&ifx)
+                .is_some_and(|f| f.has_per_packet_l4_match_terms),
+            "v4 has_per_packet_l4_match accessor != fast-map flag at {ifx}"
+        );
+        assert_eq!(
+            interface_input_filter_has_per_packet_l4_match(&state, ifx, true),
+            state
+                .iface_filter_v6_fast
+                .get(&ifx)
+                .is_some_and(|f| f.has_per_packet_l4_match_terms),
+            "v6 has_per_packet_l4_match accessor != fast-map flag at {ifx}"
+        );
+        assert_eq!(
+            interface_output_filter_needs_tx_eval(&state, ifx, false),
+            state
+                .iface_filter_out_v4_fast
+                .get(&ifx)
+                .is_some_and(|f| f.needs_tx_eval()),
+            "v4 out needs_tx_eval accessor != fast-map flag at {ifx}"
+        );
+        assert_eq!(
+            interface_output_filter_needs_tx_eval(&state, ifx, true),
+            state
+                .iface_filter_out_v6_fast
+                .get(&ifx)
+                .is_some_and(|f| f.needs_tx_eval()),
+            "v6 out needs_tx_eval accessor != fast-map flag at {ifx}"
+        );
+    }
+
+    // Sanity: the fixture actually drives a positive result on every
+    // accessor/flag pair (otherwise the equivalence above is vacuously true).
+    assert!(interface_filter_affects_route_lookup(&state, 10, false));
+    assert!(interface_filter_affects_route_lookup(&state, 11, true));
+    assert!(interface_input_filter_has_dscp_match(&state, 20, false));
+    assert!(interface_input_filter_has_dscp_match(&state, 21, true));
+    assert!(interface_input_filter_has_per_packet_l4_match(&state, 30, false));
+    assert!(interface_input_filter_has_per_packet_l4_match(&state, 31, true));
+    assert!(interface_output_filter_needs_tx_eval(&state, 40, false));
+    assert!(interface_output_filter_needs_tx_eval(&state, 41, true));
 }
 
 #[test]
@@ -4530,8 +4806,13 @@ fn per_packet_match_marks_filter_cache_sensitive() {
     }];
     let state =
         parse_filter_state(&filters, &[], &interfaces, "", "").expect("filter state compiles");
+    // #6236 PR-2B: read the `has_per_packet_l4_match_terms` flag off the fast
+    // map (the `iface_filter_v4_has_per_packet_l4_match` set is deleted).
     assert!(
-        state.iface_filter_v4_has_per_packet_l4_match.contains(&7),
+        state
+            .iface_filter_v4_fast
+            .get(&7)
+            .is_some_and(|f| f.has_per_packet_l4_match_terms),
         "interface input filter with a tcp-flags term must be marked per-packet-L4 cache-sensitive"
     );
     assert!(interface_input_filter_has_per_packet_l4_match(
