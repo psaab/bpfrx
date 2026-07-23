@@ -1,6 +1,7 @@
 package upgrade
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -267,6 +268,27 @@ func TestRestorableCurrentTarget_LockstepFileTypes(t *testing.T) {
 			}
 			if err := syscall.Mkfifo(bp, 0o755); err != nil {
 				t.Fatal(err)
+			}
+		})
+	})
+	t.Run("socket", func(t *testing.T) {
+		check(t, "lockstep binary is a socket", func(t *testing.T, bp string) {
+			if err := os.Remove(bp); err != nil {
+				t.Fatal(err)
+			}
+			l, lerr := net.Listen("unix", bp)
+			if lerr != nil {
+				// A unix socket path over the sun_path limit (long TMPDIR) — the
+				// type check is exercised by the other cases; skip rather than
+				// misreport.
+				t.Skipf("cannot create a unix socket at %s (len %d): %v", bp, len(bp), lerr)
+			}
+			// Leave the socket file in place (default Close would unlink it).
+			if ul, ok := l.(*net.UnixListener); ok {
+				ul.SetUnlinkOnClose(false)
+			}
+			if cerr := l.Close(); cerr != nil {
+				t.Fatal(cerr)
 			}
 		})
 	})

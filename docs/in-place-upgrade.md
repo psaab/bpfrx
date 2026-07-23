@@ -291,12 +291,20 @@ exist.
   `restorableCurrentTarget`, which returns `ver==""` unless `current` is a
   symlink naming a **bare in-tree segment** whose `versions/<ver>/`
   **directory exists** and holds the **complete managed lockstep set**
-  (`manifest.LockstepNames`), where each lockstep binary is a **regular,
-  executable file** — the flip drop-in execs the literal
+  (`manifest.LockstepNames`), where each lockstep binary is a **regular file
+  carrying the executable bit** — the flip drop-in execs the literal
   `versions/<ver>/xpfd` path, so a lockstep entry that is a directory / FIFO
-  / socket / symlink / non-executable file is not systemd-startable and is
-  rejected (`os.Lstat`, so a symlink is rejected outright rather than
-  followed). The same `validateRestorableVersion` predicate
+  / socket / symlink / non-executable-bit file cannot be exec'd by systemd
+  and is rejected (`os.Lstat`, so a symlink is rejected outright rather than
+  followed). This validates on-disk **metadata** (type + exec bit), not the
+  binary's **content**: a regular exec-bit file whose content is not actually
+  executable (corrupt / truncated / wrong-arch / plain text `chmod 0755`)
+  passes this static check but would fail `execve` — that is undecidable
+  without exec'ing it, so final content-executability is systemd's arbiter at
+  restart. That rare tampering/corruption residual is out of scope for static
+  validation and tracked as a follow-up (#6409); the common
+  dangling/pathful/incomplete/wrong-type/non-executable-bit modes are
+  rejected here. The same `validateRestorableVersion` predicate
   re-checks a *persisted* `PreviousVersion` on every resume before STOP (a
   pre-#6374 journal or a dir damaged/GC'd after INIT is caught), and gates
   the standalone `rollback()` **before** it stops the daemon or restores the

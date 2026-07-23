@@ -59329,3 +59329,24 @@ top.
     files — no regression); build+vet+gofmt clean. Still NOT HA-touching.
   - **File(s)**: pkg/upgrade/runner.go,
     pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-23T22:35Z
+  - **Action**: Fix #6374 round-5 SPLIT CONVERGENCE (no logic change). Codex
+    found a residual in the SAME predicate dimension: a regular file with the
+    exec BIT but non-executable CONTENT (text chmod 0755, corrupt/wrong-arch
+    binary) passes IsRegular+exec-bit yet execve fails — undecidable statically
+    (ELF-magic is a heuristic; a shebang script is executable but not ELF). Per
+    the armed split trigger, STOP folding the predicate and ship the verified
+    core. Delta: (1) NO logic change — no exec-content probe (would false-reject
+    a legit non-ELF runtime; systemd is the final arbiter at restart). (2) Added
+    the missing `socket` case to the file-type matrix (net.Listen unix +
+    SetUnlinkOnClose(false); skips gracefully on a long sun_path). (3)
+    Doc/comment HONESTY: validateRestorableVersion + docs/in-place-upgrade.md no
+    longer claim the check guarantees "systemd-startable"; clarified it
+    validates METADATA (type + exec bit), content-executability is systemd's at
+    restart. (4) Filed follow-up #6409 for the ELF-heuristic residual, referenced
+    from the doc + code comment. Full `go test ./pkg/upgrade/...` GREEN; vet/
+    gofmt clean; artifact-grep 0. Closes #6374 stays (original dangling bug +
+    common corruption modes fully fixed; exec-content residual is #6409).
+  - **File(s)**: pkg/upgrade/runner.go,
+    pkg/upgrade/dangling_current_6374_test.go, docs/in-place-upgrade.md, _Log.md

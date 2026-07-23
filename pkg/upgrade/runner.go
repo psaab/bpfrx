@@ -308,26 +308,36 @@ func (r *Runner) readCurrentVersion() (string, error) {
 // os.Stat.
 var statVersionDir = os.Stat
 
-// validateRestorableVersion reports whether ver names a genuinely restorable
-// runtime version: a safe single path segment whose versions/<ver> directory
-// exists and holds a complete, SYSTEMD-STARTABLE managed lockstep runtime. It
-// is the shared predicate behind "is `current` a real rollback target"
+// validateRestorableVersion reports whether ver names a restorable rollback
+// target by validating its on-disk METADATA: a safe single path segment whose
+// versions/<ver> directory exists and holds the complete managed lockstep set,
+// each entry a regular file carrying the executable bit. It is the shared
+// predicate behind "is `current` a real rollback target"
 // (restorableCurrentTarget) and the pre-STOP / pre-DB-rollback revalidation of
 // a persisted PreviousVersion (#6374). A pathful, missing-dir, non-directory,
-// lockstep-incomplete/unstartable, OR I/O-unreadable target is NOT restorable:
-// a rollback flip to it would fail and strand the control plane offline, so it
-// must never gate a STOP or a destructive DB restore. The completeness set is
-// the manifest lockstep SSOT (manifest.LockstepNames), matching
-// versionDirComplete's pre-start check.
+// lockstep-incomplete, wrong-type/non-executable-bit, OR I/O-unreadable target
+// is NOT restorable: a rollback flip to it would fail and strand the control
+// plane offline, so it must never gate a STOP or a destructive DB restore. The
+// completeness set is the manifest lockstep SSOT (manifest.LockstepNames),
+// matching versionDirComplete's pre-start check.
 //
-// "Startable" is stronger than "present" (#6374): the flip drop-in execs the
-// LITERAL path versions/<ver>/xpfd (flip.go:writeUnitDropin), so a lockstep
-// binary that exists but is a directory / FIFO / socket / symlink / non-
-// executable file cannot be exec'd by systemd after StopUnit — it would strand
-// the daemon exactly like a missing binary. Each managed lockstep entry must
-// therefore be a REGULAR, EXECUTABLE file. os.Lstat (not os.Stat) rejects a
+// This raises the bar past "the path stats OK" (#6374): the flip drop-in execs
+// the LITERAL path versions/<ver>/xpfd (flip.go:writeUnitDropin), so a lockstep
+// entry that is a directory / FIFO / socket / symlink / non-executable-bit file
+// cannot be exec'd by systemd after StopUnit — it would strand the daemon
+// exactly like a missing binary. Each managed lockstep entry must therefore be
+// a REGULAR file with the executable bit. os.Lstat (not os.Stat) rejects a
 // symlink outright: a managed runtime is a real copied file, and a symlink at
-// this path is corruption/tampering, not a valid startable target.
+// this path is corruption/tampering.
+//
+// LIMIT (static validation, #6409): this checks the executable BIT and file
+// TYPE, not the file's CONTENT. A regular exec-bit file with non-executable
+// content (arbitrary text chmod'd 0755, a corrupt/truncated or wrong-arch
+// binary) passes here but execve would fail — that is undecidable statically
+// (an ELF-magic probe is a heuristic; a shebang script is executable but not
+// ELF), so final content-executability is systemd's arbiter at restart. That
+// rare tampering/corruption residual is tracked in #6409; the common
+// dangling/pathful/incomplete/wrong-type/non-exec modes are rejected here.
 func (r *Runner) validateRestorableVersion(ver string) error {
 	if err := ValidateVersionSegment(ver); err != nil {
 		return err
