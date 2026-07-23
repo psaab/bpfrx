@@ -401,6 +401,21 @@ func (r *Runner) Run(opts Options) (err error) {
 					"path segment: %w", verr)
 			}
 		}
+		// The rollback target RECORDED as PreviousVersion must be a genuinely
+		// restorable version, not merely a nonempty basename (#6374). A
+		// dangling / pathful / incomplete `current` yields a nonempty `prev`
+		// above (os.Readlink succeeds on a broken link, filepath.Base strips
+		// path components) yet cannot be flipped back to; recording it would let
+		// a flip/start failure STOP the daemon with an unrestorable rollback
+		// target and strand it offline. restorableCurrentTarget returns "" for
+		// those corrupt layouts, so the no-rollback-target refuse below fires
+		// exactly as it does for an absent `current`. `prev` (raw) is still used
+		// for the live-dir-replace identity guard, which must protect a
+		// present-but-incomplete live dir from deletion.
+		restorablePrev, rperr := r.restorableCurrentTarget()
+		if rperr != nil {
+			return rperr
+		}
 		// REFUSE-AT-INIT (mechanism C, Codex r2): an unsanctioned cut with no
 		// rollback target must be refused BEFORE any journal is persisted. If
 		// we instead let it run preflight/copy/verify and only refused at the
@@ -414,15 +429,16 @@ func (r *Runner) Run(opts Options) (err error) {
 		// resume-vs-fresh recovery (which resets j in memory but does not
 		// remove the stale on-disk record), so the refuse leaves a fully
 		// clean state and a re-run does not re-run recovery.
-		if prev == "" && !opts.AllowNoRollbackFirstCut {
+		if restorablePrev == "" && !opts.AllowNoRollbackFirstCut {
 			if cerr := r.clearJournal(); cerr != nil {
 				r.logf("upgrade: WARN clear stale journal on refuse: %v", cerr)
 			}
 			return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
-				"(versions/current is absent or unreadable) and this is not a sanctioned "+
-				"first cut; refusing the %s cut because a flip/start failure would leave "+
-				"the daemon offline with no recovery target. Seed the versioned runtime "+
-				"(xpfd seed-runtime), then re-run the upgrade", stagedVer)
+				"(versions/current is absent, unreadable, or names a missing/incomplete "+
+				"runtime) and this is not a sanctioned first cut; refusing the %s cut "+
+				"because a flip/start failure would leave the daemon offline with no "+
+				"recovery target. Seed the versioned runtime (xpfd seed-runtime), then "+
+				"re-run the upgrade", stagedVer)
 		}
 		// REFUSE-AT-INIT (#1981 B-P3b OPT1, Codex r5-#2 / r6): a same-version cut
 		// whose target version dir already EXISTS, is the LIVE current or the
@@ -461,7 +477,11 @@ func (r *Runner) Run(opts Options) (err error) {
 			}
 		}
 		j.TargetVersion = stagedVer
-		j.PreviousVersion = prev
+		// Record the RESTORABLE current, not the raw basename: a dangling /
+		// pathful / incomplete `current` must be recorded as "" (no rollback
+		// target), which the refuse-before-STOP guard above already required
+		// for an unsanctioned cut (#6374).
+		j.PreviousVersion = restorablePrev
 		j.StartedAtUnixNano = r.cfg.Sys.Now().UnixNano()
 		// Pin the source generation NOW (#1981 Option B, B-P3): the cut copies
 		// from staged-gen/<SourceGeneration>/ — the resolved DIRECTORY, never
@@ -477,7 +497,13 @@ func (r *Runner) Run(opts Options) (err error) {
 		// PAST the STOP step (where the refuse guard no longer re-runs) still
 		// honors the original sanction, and recoverFromFlipFailure can prove
 		// the empty-previous flip-failure restart is legitimate.
-		if prev == "" && opts.AllowNoRollbackFirstCut {
+		// Sanction the first cut on the RESTORABLE-target notion too: if
+		// `current` dangles/incomplete (restorablePrev=="") and the operator
+		// passes AllowNoRollbackFirstCut, PreviousVersion is recorded "" above,
+		// so FirstCutSanctioned MUST be set to match — otherwise a crash-resume
+		// past STOP would see empty-prev + unsanctioned and refuse forever
+		// (#6374).
+		if restorablePrev == "" && opts.AllowNoRollbackFirstCut {
 			j.FirstCutSanctioned = true
 		}
 		if err := r.transition(j, StateStaged); err != nil {
@@ -545,14 +571,32 @@ func (r *Runner) Run(opts Options) (err error) {
 	// Sanctioned either by THIS invocation's flag or by the persisted journal
 	// decision from the original run (so a crash-resume re-entering without
 	// the flag is still honored).
+	//
+	// REVALIDATE the persisted rollback target (#6374): a nonempty
+	// PreviousVersion is not sufficient — a journal written by an older
+	// (pre-#6374) run could carry a dangling basename, or the previous version
+	// dir could have been damaged / GC'd between INIT and this resume. If the
+	// recorded target is not a restorable version (missing dir, non-directory,
+	// lockstep-incomplete), treat it exactly like PreviousVersion=="" for this
+	// guard: a STOP followed by a rollback flip to a missing runtime would
+	// strand the daemon offline. This makes the guard bind the actual on-disk
+	// restorability, not just the string being nonempty.
 	sanctioned := opts.AllowNoRollbackFirstCut || j.FirstCutSanctioned
-	if j.State.atLeast(StateStaged) && j.PreviousVersion == "" && !sanctioned {
-		return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
-			"(versions/current is absent or unreadable) and this is not a sanctioned "+
-			"first cut; refusing to proceed past STOP for the %s cut because a "+
-			"flip/start failure would leave the daemon offline with no recovery "+
-			"target. Re-seed the versioned runtime (xpfd seed-runtime), then re-run "+
-			"the upgrade", j.TargetVersion)
+	noRestorableTarget := j.PreviousVersion == ""
+	if j.PreviousVersion != "" {
+		if verr := r.validateRestorableVersion(j.PreviousVersion); verr != nil {
+			r.logf("upgrade: recorded rollback target %s is not restorable before "+
+				"STOP: %v; treating as no rollback target (#6374)", j.PreviousVersion, verr)
+			noRestorableTarget = true
+		}
+	}
+	if j.State.atLeast(StateStaged) && noRestorableTarget && !sanctioned {
+		return fmt.Errorf("refuse-before-STOP: no restorable previous version to roll "+
+			"back to (versions/current is absent, unreadable, or names a "+
+			"missing/incomplete runtime) and this is not a sanctioned first cut; "+
+			"refusing to proceed past STOP for the %s cut because a flip/start failure "+
+			"would leave the daemon offline with no recovery target. Re-seed the "+
+			"versioned runtime (xpfd seed-runtime), then re-run the upgrade", j.TargetVersion)
 	}
 
 	// ---- STOP (live mutation #1) ----

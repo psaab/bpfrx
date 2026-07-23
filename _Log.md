@@ -59228,3 +59228,27 @@ top.
     #6391" (no close keyword).
   - **File(s)**: pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
     docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23T20:43Z
+  - **Action**: Fix #6374 — a nonempty but DANGLING/pathful/incomplete
+    `versions/current` symlink satisfied the pre-STOP rollback guard and could
+    strand xpfd offline. `readCurrentVersion` returned `filepath.Base(readlink)`
+    with no validation, so a broken `current` yielded a nonempty
+    `PreviousVersion` that passed every guard; a post-STOP rollback flip to the
+    missing dir then failed. Added `restorableCurrentTarget` +
+    `validateRestorableVersion` (bare in-tree segment, existing directory,
+    complete `manifest.LockstepNames` set) and routed the rollback-target
+    RECORDING (cutover INIT) + first-cut-sanction through it; a corrupt
+    `current` now takes the same refuse-before-STOP path an absent one does.
+    Also revalidate a PERSISTED `PreviousVersion` on every resume before STOP,
+    and preflight the standalone `rollback()` BEFORE it stops the daemon /
+    restores the config DB. `readCurrentVersion` is UNCHANGED — it still backs
+    the conservative "never delete a live-looking dir" GC / stale-replace
+    guards. NOT HA-touching (no pkg/cluster/pkg/vrrp/failover; HA rollback is
+    operator-driven via SkipStartHealthRollback). Fail-on-revert:
+    dangling_current_6374_test.go (4 tests, 7-case unit matrix) — neutralizing
+    each mechanism drives clean ASSERTION RED (confirmed firsthand), restored
+    GREEN. Full `go test ./pkg/upgrade/...` GREEN; build+vet+gofmt clean.
+  - **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/cutover.go,
+    pkg/upgrade/flip.go, pkg/upgrade/dangling_current_6374_test.go,
+    docs/in-place-upgrade.md, _Log.md

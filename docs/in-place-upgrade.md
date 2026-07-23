@@ -270,16 +270,39 @@ exist.
   falling back to a sanitized dpkg `$2` if the old binary won't exec; never
   fails the transaction. Writes NO upgrade journal.
 - **C — refuse-before-STOP (unconditional pre-STOP invariant).** The cut
-  NEVER calls `StopUnit` unless a restorable target exists
-  (`PreviousVersion != ""`) OR it is an explicitly sanctioned no-rollback
-  first cut (`Options.AllowNoRollbackFirstCut`). With A/B this is
-  unreachable in the field (`current` always exists), so the refusal fires
-  only on an unexpected loss of the rollback target — exactly when a blind
-  STOP would brick the daemon. On a flip failure AFTER STOP (the unit is
-  already down), `recoverFromFlipFailure` rolls back to the previous
-  version, or — for a sanctioned first cut — restarts the first-install
-  binary from `versions/current`; it always returns a non-nil error so a
-  flip failure is never reported as success.
+  NEVER calls `StopUnit` unless a **restorable** target exists OR it is an
+  explicitly sanctioned no-rollback first cut
+  (`Options.AllowNoRollbackFirstCut`). With A/B this is unreachable in the
+  field (`current` always exists), so the refusal fires only on an
+  unexpected loss of the rollback target — exactly when a blind STOP would
+  brick the daemon. On a flip failure AFTER STOP (the unit is already down),
+  `recoverFromFlipFailure` rolls back to the previous version, or — for a
+  sanctioned first cut — restarts the first-install binary from
+  `versions/current`; it always returns a non-nil error so a flip failure is
+  never reported as success.
+
+  **"Restorable" is stricter than `PreviousVersion != ""` (#6374).** A
+  nonempty basename is NOT sufficient: `os.Readlink` succeeds on a *dangling*
+  `current` (target dir missing after storage damage / an interrupted
+  repair), and `filepath.Base` silently strips a pathful target, so a
+  corrupt `current` used to yield a nonempty `PreviousVersion` that passed
+  every guard — then the post-STOP rollback flip to the missing dir failed
+  and left xpfd offline. The recorded rollback target now comes from
+  `restorableCurrentTarget`, which returns "" (→ the same refuse path an
+  absent `current` takes) unless `current` is a symlink naming a **bare
+  in-tree segment** whose `versions/<ver>/` **directory exists** and holds
+  the **complete managed lockstep set** (`manifest.LockstepNames`). The same
+  `validateRestorableVersion` predicate re-checks a *persisted*
+  `PreviousVersion` on every resume before STOP (a pre-#6374 journal or a dir
+  damaged/GC'd after INIT is caught), and gates the standalone
+  `rollback()` **before** it stops the daemon or restores the config DB — so
+  an unrestorable target surfaces a clear error instead of rolling the DB
+  back and then stranding the control plane on a missing runtime. (The HA
+  path sets `SkipStartHealthRollback`; its rollback is operator-driven and
+  never enters `rollback()`.) `readCurrentVersion` itself is unchanged — it
+  still returns the raw basename for the conservative "never delete a dir
+  that might be live" GC / stale-dir-replace guards, which must protect a
+  present-but-incomplete live dir rather than treat it as absent.
 
 Version strings that key `versions/<ver>` — and, the strictest sink, the
 `ExecStart` line in the `10-xpf-version.conf` unit drop-in — are validated by a

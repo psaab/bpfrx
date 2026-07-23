@@ -4,12 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
@@ -299,6 +301,85 @@ func (r *Runner) readCurrentVersion() (string, error) {
 	}
 	// current -> <ver> (relative within VersionsDir).
 	return filepath.Base(target), nil
+}
+
+// validateRestorableVersion reports whether ver names a genuinely restorable
+// runtime version: a safe single path segment whose versions/<ver> directory
+// exists and holds the complete managed lockstep runtime. It is the shared
+// predicate behind "is `current` a real rollback target"
+// (restorableCurrentTarget) and the pre-STOP / pre-DB-rollback revalidation of
+// a persisted PreviousVersion (#6374). A pathful, missing-dir, non-directory,
+// or lockstep-incomplete target is NOT restorable: a rollback flip to it would
+// fail and strand the control plane offline, so it must never gate a STOP or a
+// destructive DB restore. The completeness set is the manifest lockstep SSOT
+// (manifest.LockstepNames), matching versionDirComplete's pre-start check.
+func (r *Runner) validateRestorableVersion(ver string) error {
+	if err := ValidateVersionSegment(ver); err != nil {
+		return err
+	}
+	dir := r.versionDir(ver)
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("version dir %s: %w", dir, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("version path %s is not a directory", dir)
+	}
+	for _, b := range manifest.LockstepNames() {
+		p := filepath.Join(dir, b)
+		if _, serr := os.Stat(p); serr != nil {
+			return fmt.Errorf("version dir %s is missing the managed lockstep "+
+				"binary %s: %w", dir, b, serr)
+		}
+	}
+	return nil
+}
+
+// restorableCurrentTarget resolves the `current` bookkeeping symlink and
+// returns the version it names ONLY when that version is a genuinely
+// restorable rollback target. Unlike readCurrentVersion — which returns the
+// raw basename and backs the conservative "never delete a dir that might be
+// live" guards — this returns "" for a `current` that is absent, not a
+// symlink, dangling, pathful, or names a missing / non-directory /
+// lockstep-incomplete target. None of those can be flipped back to, so
+// recording one as PreviousVersion would let a flip/start failure STOP the
+// running daemon with an unrestorable rollback target and strand xpfd offline
+// (#6374). A "" result routes the caller into the same no-rollback-target
+// refuse-before-STOP path an absent `current` already takes. Only genuinely
+// unexpected I/O errors are propagated.
+func (r *Runner) restorableCurrentTarget() (string, error) {
+	raw, err := os.Readlink(r.currentPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil // no current: first cut.
+		}
+		if errors.Is(err, syscall.EINVAL) {
+			// `current` exists but is NOT a symlink (a regular file / directory
+			// left by a corrupt or interrupted repair). It cannot name a
+			// rollback target; treat it as no restorable current.
+			r.logf("upgrade: `current` is not a symlink; no restorable rollback " +
+				"target (#6374)")
+			return "", nil
+		}
+		return "", fmt.Errorf("read current symlink: %w", err)
+	}
+	// The bookkeeping symlink is a BARE in-tree segment (current -> <ver>). A
+	// pathful target (current -> ../x, /abs/x, a/b) escaped VersionsDir or
+	// drifted; filepath.Base would silently strip it, so reject it here rather
+	// than key a rollback off a segment the link never actually named. Mirrors
+	// stagedgen.ResolveCurrent's current-gen bare-segment guard.
+	if raw != filepath.Base(raw) {
+		r.logf("upgrade: `current` -> %q is not a bare in-tree version segment; "+
+			"no restorable rollback target (#6374)", raw)
+		return "", nil
+	}
+	ver := raw
+	if verr := r.validateRestorableVersion(ver); verr != nil {
+		r.logf("upgrade: `current` -> %q is not a restorable rollback target: %v; "+
+			"recording no rollback target (#6374)", ver, verr)
+		return "", nil
+	}
+	return ver, nil
 }
 
 // loadJournal reads the persisted journal, or returns a zero Journal if
