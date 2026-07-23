@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"net"
 	"testing"
@@ -15,7 +16,7 @@ func certLeaf(t *testing.T, hostname string) *x509.Certificate {
 	resetTLSSeams(t)
 	tlsHostname = func() (string, error) { return hostname, nil }
 	dir, certPath, keyPath := tlsPaths(t)
-	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath)
+	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, "")
 	if err != nil {
 		t.Fatalf("hostname=%q: cert generation aborted: %v", hostname, err)
 	}
@@ -145,6 +146,128 @@ func TestGenerateSelfSignedCertHostnameSANClassification(t *testing.T) {
 			t.Fatalf("empty hostname CommonName = %q, want xpf fallback", leaf.Subject.CommonName)
 		}
 	})
+}
+
+// certLeafBind is certLeaf with an explicit HTTPS bind host threaded into cert
+// generation (#5719 C001 residual: the configured management bind IP must reach
+// the SANs so a remote client verifying by mgmt IP succeeds).
+func certLeafBind(t *testing.T, hostname, bindHost string) *x509.Certificate {
+	t.Helper()
+	resetTLSSeams(t)
+	tlsHostname = func() (string, error) { return hostname, nil }
+	dir, certPath, keyPath := tlsPaths(t)
+	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, bindHost)
+	if err != nil {
+		t.Fatalf("hostname=%q bindHost=%q: cert generation aborted: %v", hostname, bindHost, err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	return leaf
+}
+
+// TestGenerateSelfSignedCertBindHostSAN is a FAIL-ON-REVERT guard for the #5719
+// C001 residual: the configured HTTPS management bind host must be threaded into
+// the cert SANs. Before this fix the cert carried only loopback + kernel-
+// hostname SANs, so `https://<mgmt-ip>:8443` strict-verify failed for a remote
+// client — the original C001 remote-verification goal #6373 did NOT complete.
+//
+// RED on revert: drop the bindHost SAN block in generateSelfSignedCertAt and the
+// management IP / DNS bind host no longer appears in the cert, tripping the
+// mgmt_ip / dns assertions below.
+func TestGenerateSelfSignedCertBindHostSAN(t *testing.T) {
+	t.Run("mgmt_ip_bind_host_becomes_ip_san", func(t *testing.T) {
+		leaf := certLeafBind(t, "fw-node0", "10.0.0.1")
+		assertLoopbackSANs(t, leaf)
+		if !hasIPSAN(leaf, net.ParseIP("10.0.0.1")) {
+			t.Fatalf("management bind IP missing from cert IP SANs %v", leaf.IPAddresses)
+		}
+		if err := leaf.VerifyHostname("10.0.0.1"); err != nil {
+			t.Fatalf("VerifyHostname(10.0.0.1) = %v; want valid (remote mgmt-IP verification must pass)", err)
+		}
+		// The kernel-hostname DNS SAN and loopback SANs still coexist.
+		if !hasDNSSAN(leaf, "fw-node0") {
+			t.Fatalf("hostname DNS SAN dropped when bind IP added: %v", leaf.DNSNames)
+		}
+	})
+
+	t.Run("dns_bind_host_becomes_dns_san", func(t *testing.T) {
+		leaf := certLeafBind(t, "fw-node0", "mgmt.example.com")
+		assertLoopbackSANs(t, leaf)
+		if !hasDNSSAN(leaf, "mgmt.example.com") {
+			t.Fatalf("DNS bind host missing from cert DNS SANs %v", leaf.DNSNames)
+		}
+	})
+
+	t.Run("loopback_bind_host_not_duplicated", func(t *testing.T) {
+		leaf := certLeafBind(t, "fw-node0", "127.0.0.1")
+		want := net.ParseIP("127.0.0.1")
+		n := 0
+		for _, s := range leaf.IPAddresses {
+			if s.Equal(want) {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatalf("loopback bind host duplicated 127.0.0.1 in IP SANs %v (count=%d)", leaf.IPAddresses, n)
+		}
+	})
+
+	t.Run("unspecified_bind_host_skipped", func(t *testing.T) {
+		leaf := certLeafBind(t, "fw-node0", "0.0.0.0")
+		if hasIPSAN(leaf, net.ParseIP("0.0.0.0")) {
+			t.Fatalf("wildcard bind host 0.0.0.0 must not be an IP SAN: %v", leaf.IPAddresses)
+		}
+	})
+
+	t.Run("bind_host_equal_hostname_not_duplicated", func(t *testing.T) {
+		leaf := certLeafBind(t, "fw-node0", "fw-node0")
+		n := 0
+		for _, s := range leaf.DNSNames {
+			if s == "fw-node0" {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatalf("bind host equal to hostname duplicated DNS SAN fw-node0 (count=%d) in %v", n, leaf.DNSNames)
+		}
+	})
+
+	t.Run("empty_bind_host_is_loopback_only", func(t *testing.T) {
+		// A wildcard bind (":8443") threads bindHost="" — the prior behavior:
+		// loopback + hostname SANs, no extra bind SAN.
+		leaf := certLeafBind(t, "fw-node0", "")
+		assertLoopbackSANs(t, leaf)
+	})
+}
+
+// TestBuildHTTPSServerThreadsBindHost is a FAIL-ON-REVERT guard that
+// buildHTTPSServer extracts the listener host from the bind addr and passes it
+// to certGen. RED on revert: restore the no-arg certGen() call / drop the
+// net.SplitHostPort, and the recorded bindHost is "" instead of "10.0.0.1".
+func TestBuildHTTPSServerThreadsBindHost(t *testing.T) {
+	s := &Server{}
+	var got string
+	s.certGen = func(bindHost string) (tls.Certificate, error) {
+		got = bindHost
+		return tls.Certificate{}, nil
+	}
+	if _, err := s.buildHTTPSServer("10.0.0.1:8443"); err != nil {
+		t.Fatalf("buildHTTPSServer: %v", err)
+	}
+	if got != "10.0.0.1" {
+		t.Fatalf("certGen bindHost = %q, want 10.0.0.1", got)
+	}
+
+	// A wildcard bind yields an empty host (no single name to certify).
+	got = "sentinel"
+	if _, err := s.buildHTTPSServer(":8443"); err != nil {
+		t.Fatalf("buildHTTPSServer wildcard: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("wildcard certGen bindHost = %q, want empty", got)
+	}
 }
 
 // TestIsDNSSANSafeHostname unit-checks the classifier directly.

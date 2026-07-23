@@ -1,3 +1,31 @@
+## 2026-07-23 — #5719 C001 residual: thread HTTPS mgmt bind IP into cert SANs
+
+- **Timestamp**: 2026-07-23 (fix/5719-capi-residuals)
+- **Action**: Triaged cohort #5719 (codex-review-182 C-API). Two representative
+  survivors already fixed by merged PR #6373: unknown-NAT-stats-selector
+  (grpcapi rejects with InvalidArgument, `server_nat.go:216-227` +
+  `server_nat_selector_5719_test.go`) and SAN-less generated cert (loopback +
+  hostname SANs, `server.go`). Fixed the open C001 residual-1: the auto-
+  generated HTTPS cert did NOT carry the configured management bind IP, so
+  `https://<mgmt-ip>:8443` strict-verify failed for a remote client.
+  `buildHTTPSServer(addr)` now extracts the listener host via
+  `net.SplitHostPort` and threads it (`certGen func(bindHost string)`) into
+  `generateSelfSignedCertAt`, which adds a non-loopback IP-literal bind host to
+  IP SANs / a DNS-safe bind host to DNS SANs (loopback / unspecified / wildcard-
+  empty / non-encodable skipped; existing SANs coalesced). Baked at FIRST
+  generation only — the #1916 D6 durable cert is deliberately NOT re-minted on
+  a later bind/host-name change (residual-2, deferred: needs a mint-ordering
+  hook + a TOFU-churn decision). The "applied-nft truth projection" bucket line
+  has no concrete traceable finding; the API/gRPC truth surfaces
+  (`HostInboundKernelDeniesUnavailable` #3681, SSOT `hostInboundToREST`
+  #3375/#3627) are already complete, and any nft-apply projection lives in
+  `pkg/daemon` (out of scope). Two fail-on-revert tests (SAN threading +
+  `buildHTTPSServer` host extraction), each verified RED via a clean-assertion
+  neutralization. `go build`/`go vet`/`gofmt -l` clean; full
+  `go test ./pkg/api/... ./pkg/grpcapi/...` GREEN.
+- **File(s)**: pkg/api/server.go, pkg/api/tls_test.go,
+  pkg/api/tls_san_5719_test.go, pkg/api/README.md
+
 ## 2026-07-23 — #6240: decompose `bring_up_workers` into cohesive phase helpers
 
 - **Timestamp**: 2026-07-23 (refactor/6240-decompose-bringup)

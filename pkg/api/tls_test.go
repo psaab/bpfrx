@@ -75,7 +75,7 @@ func TestGenerateSelfSignedCertHappyPath(t *testing.T) {
 	resetTLSSeams(t)
 	dir, certPath, keyPath := tlsPaths(t)
 
-	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath)
+	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, "")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestGenerateSelfSignedCertHappyPath(t *testing.T) {
 		t.Fatal("on-disk cert differs from returned cert")
 	}
 	// A second call loads the persisted pair (stable cert — no churn).
-	cert2, err := generateSelfSignedCertAt(dir, certPath, keyPath)
+	cert2, err := generateSelfSignedCertAt(dir, certPath, keyPath, "")
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestGenerateSelfSignedCertFailedCertWrite(t *testing.T) {
 
 	// Persistence failure → usable cert returned with NIL error (HTTPS
 	// still installs); only the disk write failed.
-	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath)
+	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, "")
 	if err != nil {
 		t.Fatalf("persistence failure must return nil error, got %v", err)
 	}
@@ -146,7 +146,7 @@ func TestGenerateSelfSignedCertFailedKeyWrite(t *testing.T) {
 		return fsatomic.WriteFileDurable(path, data, perm, opts...)
 	}
 
-	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath)
+	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, "")
 	if err != nil {
 		t.Fatalf("persistence failure must return nil error, got %v", err)
 	}
@@ -179,7 +179,7 @@ func TestGenerateSelfSignedCertMismatchedStartRegens(t *testing.T) {
 
 	// LoadX509KeyPair rejects the mismatch → regen runs → strict-remove of
 	// the stale pair → a fresh MATCHING pair lands on disk.
-	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath)
+	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, "")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestGenerateSelfSignedCertStaleCertOnlyRegens(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath)
+	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, "")
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestGenerateSelfSignedCertStrictRemoveFailureAborts(t *testing.T) {
 		return fsatomic.WriteFileDurable(path, data, perm, opts...)
 	}
 
-	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath)
+	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, "")
 	if err != nil {
 		t.Fatalf("persistence abort must still return usable in-memory cert with nil error, got %v", err)
 	}
@@ -268,7 +268,7 @@ func TestGenerateSelfSignedCertDirSyncFailureAborts(t *testing.T) {
 		return fsatomic.WriteFileDurable(path, data, perm, opts...)
 	}
 
-	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath)
+	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, "")
 	if err != nil {
 		t.Fatalf("dir-sync abort must return usable in-memory cert with nil error, got %v", err)
 	}
@@ -292,7 +292,7 @@ func TestGenerateSelfSignedCertMkdirFailureAborts(t *testing.T) {
 		return fsatomic.WriteFileDurable(path, data, perm, opts...)
 	}
 
-	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath)
+	cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, "")
 	if err != nil {
 		t.Fatalf("mkdir abort must return usable in-memory cert with nil error, got %v", err)
 	}

@@ -301,9 +301,10 @@ type Server struct {
 	// pre-auth mux+collector+CSRF handler both legs wrap (per-listener auth gate
 	// via listenerHandler), so the #4162 shared scrape limiter / session cache is
 	// preserved across a rebind. certGen mints a fresh self-signed cert on each
-	// HTTPS (re)bind.
+	// HTTPS (re)bind; bindHost is the listener's host (net.SplitHostPort of the
+	// bind addr) so a non-loopback management IP lands in the cert SANs (#5719).
 	sharedBase http.Handler
-	certGen    func() (tls.Certificate, error)
+	certGen    func(bindHost string) (tls.Certificate, error)
 	lifeMu     sync.Mutex      // guards httpLeg/httpsLeg/rootCtx across reconciles
 	rootCtx    context.Context // daemon lifetime; every leg drains on its cancel
 	wg         sync.WaitGroup  // joins EVERY serve goroutine (live + retiring legs)
@@ -622,7 +623,16 @@ func (s *Server) buildHTTPServer(addr string) *http.Server {
 // newly generated self-signed certificate (#5866). A cert-generation failure is
 // returned so the caller retains the previous leg (fail-closed).
 func (s *Server) buildHTTPSServer(addr string) (*http.Server, error) {
-	tlsCert, err := s.certGen()
+	// Thread the listener's host into cert generation so a non-loopback
+	// management bind IP (e.g. `web-management https interface 10.0.0.1`)
+	// lands in the cert's SANs and a remote client verifies under strict
+	// hostname checking (#5719 C001 residual). A wildcard/empty host
+	// (":8443") yields "" and is ignored by the SAN builder.
+	bindHost := ""
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		bindHost = h
+	}
+	tlsCert, err := s.certGen(bindHost)
 	if err != nil {
 		return nil, err
 	}
@@ -852,8 +862,29 @@ func isDNSSANSafeHostname(h string) bool {
 
 // generateSelfSignedCert creates or loads a self-signed TLS certificate
 // using the production /etc/xpf/tls paths. See generateSelfSignedCertAt.
-func generateSelfSignedCert() (tls.Certificate, error) {
-	return generateSelfSignedCertAt(tlsDir, certPath, keyPath)
+func generateSelfSignedCert(bindHost string) (tls.Certificate, error) {
+	return generateSelfSignedCertAt(tlsDir, certPath, keyPath, bindHost)
+}
+
+// ipSANsContain reports whether ip is already present in sans. net.IP.Equal
+// normalizes the 4-byte / 16-byte-mapped forms so a v4 SAN never duplicates.
+func ipSANsContain(sans []net.IP, ip net.IP) bool {
+	for _, s := range sans {
+		if s.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// dnsSANsContain reports whether name is already present in names.
+func dnsSANsContain(names []string, name string) bool {
+	for _, n := range names {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // generateSelfSignedCertAt creates or loads a self-signed TLS certificate
@@ -880,7 +911,7 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 // only the disk write failed, so HTTPS still installs (the caller binds
 // httpsServer on the nil-error path). A non-nil error is returned ONLY for
 // a true generation failure (no usable cert at all).
-func generateSelfSignedCertAt(dir, certPath, keyPath string) (tls.Certificate, error) {
+func generateSelfSignedCertAt(dir, certPath, keyPath, bindHost string) (tls.Certificate, error) {
 	// Try loading an existing on-disk pair. LoadX509KeyPair reads the cert
 	// first and errors on a key-only / mismatched state → falls through to
 	// regen, which restores a matching pair.
@@ -907,9 +938,9 @@ func generateSelfSignedCertAt(dir, certPath, keyPath string) (tls.Certificate, e
 	// not valid for any names". Always include the loopback names/addresses:
 	// the HTTPS API binds loopback (127.0.0.1/::1) by default and these can
 	// never fail to encode (codex-review-182 C-API TLS hygiene). This covers
-	// a loopback-bound API and local hostname/localhost verification; it does
-	// NOT add the configured management-interface IP (remote-verification-by-
-	// mgmt-IP) — that is a tracked #5719 C001 residual.
+	// a loopback-bound API and local hostname/localhost verification; the
+	// configured management-interface bind IP is added below from bindHost so
+	// remote verification by management IP also succeeds (#5719 C001 residual).
 	dnsNames := []string{"localhost"}
 	ipSANs := []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
 
@@ -928,6 +959,30 @@ func generateSelfSignedCertAt(dir, certPath, keyPath string) (tls.Certificate, e
 		}
 	} else if hostname != "localhost" && isDNSSANSafeHostname(hostname) {
 		dnsNames = append(dnsNames, hostname)
+	}
+
+	// Thread the HTTPS listener's bind host into the SANs so a non-loopback
+	// management bind (e.g. `web-management https interface 10.0.0.1`) verifies
+	// under strict hostname checking from a remote client (#5719 C001 residual).
+	// An IP-literal bind host goes in IPAddresses; a DNS-safe hostname goes in
+	// DNSNames. A loopback, unspecified (0.0.0.0/::), empty, or non-encodable
+	// bind host is skipped (loopback SANs are already present, and a wildcard
+	// bind names no single host); a value already added above is coalesced.
+	// Like the hostname path this can only ADD an encodable SAN, so it never
+	// aborts generation under the #5058 all-or-nothing management lifecycle.
+	//
+	// The bind IP is baked at FIRST generation only: the cert is durable
+	// (#1916 D6) and deliberately NOT re-minted when the bind address later
+	// changes — auto-regenerating would churn remote clients' TOFU pins. That
+	// re-mint-on-change concern is a separate tracked #5719 C001 residual.
+	if bindHost != "" {
+		if ip := net.ParseIP(bindHost); ip != nil {
+			if !ip.IsLoopback() && !ip.IsUnspecified() && !ipSANsContain(ipSANs, ip) {
+				ipSANs = append(ipSANs, ip)
+			}
+		} else if bindHost != "localhost" && isDNSSANSafeHostname(bindHost) && !dnsSANsContain(dnsNames, bindHost) {
+			dnsNames = append(dnsNames, bindHost)
+		}
 	}
 
 	template := &x509.Certificate{
