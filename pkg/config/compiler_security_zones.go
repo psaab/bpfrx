@@ -59,6 +59,27 @@ func mergeHostInbound(dst, src *HostInboundTraffic) *HostInboundTraffic {
 	return dst
 }
 
+// cloneHostInbound returns a deep copy of hib with freshly-allocated token
+// slices. It is used when one parsed per-interface host-inbound override is
+// fanned out to multiple bracketed / load-override members (#5609) so each
+// member owns an independent struct — a later mergeHostInbound into one
+// member's entry (append+dedup mutates in place) can never leak into a
+// sibling that was assigned the same source override. Returns nil for a nil
+// input so callers can pass it through unconditionally.
+func cloneHostInbound(hib *HostInboundTraffic) *HostInboundTraffic {
+	if hib == nil {
+		return nil
+	}
+	out := &HostInboundTraffic{}
+	if len(hib.SystemServices) > 0 {
+		out.SystemServices = append([]string(nil), hib.SystemServices...)
+	}
+	if len(hib.Protocols) > 0 {
+		out.Protocols = append([]string(nil), hib.Protocols...)
+	}
+	return out
+}
+
 // dedupHostInboundTokens returns vals with duplicate entries removed, preserving
 // first-seen order. Used only on the merged (2+ block) host-inbound path (#4544)
 // so a single block keeps its exact token multiset (byte-identical behaviour).
@@ -158,7 +179,30 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 						if zone.InterfaceHostInbound == nil {
 							zone.InterfaceHostInbound = make(map[string]*HostInboundTraffic)
 						}
-						zone.InterfaceHostInbound[iface.Name()] = mergeHostInbound(zone.InterfaceHostInbound[iface.Name()], hib)
+						// #5609: apply the per-interface host-inbound override to
+						// EVERY member of a bracketed / load-override membership
+						// chain, mirroring the #5248 membership flatten above. A
+						// raw `interfaces { a { b; host-inbound-traffic { ... } } }`
+						// (only reachable via `load override` — Junos grammar does
+						// not let a bracketed `interfaces [ a b ]` list carry a
+						// host-inbound-traffic body; the flat-set form is rejected
+						// at commit because the collapsed tokens become undefined
+						// zone members) NESTS b under a, so iface.Name() names only
+						// `a`. Keying the override on iface.Name() alone silently
+						// DROPPED it for every nested member, which then fell back
+						// to the zone-level host-inbound — a MORE-permissive result
+						// than the operator's per-interface override whenever the
+						// zone-level admits a wider set. zoneInterfaceMembers skips
+						// the host-inbound-traffic body, so it returns the real
+						// interface set; the normal one-interface-per-child shape
+						// yields a single member and stays byte-identical. Each
+						// member gets its OWN copy so a later merge (a duplicate
+						// #4818 instance re-naming one member) cannot mutate a
+						// sibling's aliased override.
+						for _, member := range zoneInterfaceMembers(iface) {
+							zone.InterfaceHostInbound[member] = mergeHostInbound(
+								zone.InterfaceHostInbound[member], cloneHostInbound(hib))
+						}
 					}
 				}
 			case "screen":

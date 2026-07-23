@@ -695,12 +695,26 @@ therefore the WRONG helper here — it reads one node's `Keys[1:]` + immediate
 children and would still see only the first member. `compileZones`
 (`compiler_security_zones.go`) flattens the nested chain with the recursive
 `zoneInterfaceMembers`, which reads every key at each level and skips a
-`host-inbound-traffic` body (a bracketed member is bare membership — it cannot
-carry a per-interface host-inbound stanza). Before #5248 the reader took only
+`host-inbound-traffic` body. Before #5248 the reader took only
 `iface.Name()` and silently dropped every member after the first — a zone-
 membership (security boundary) loss that also hid the dropped interface from
 the strict `validateZoneInterfaceDefinedStrict` gate. Covered by
 `pkg/config/compiler_zone_interfaces_bracket_5248_test.go`.
+
+The flat-set bracketed list is bare membership: `host-inbound-traffic` tokens
+appended after it collapse onto the leaf's `Keys` and become undefined zone
+members, so the strict commit gate rejects that shape. A raw `load override`
+hierarchical block, however, CAN nest a `host-inbound-traffic` body under the
+first member (`interfaces { a { b; host-inbound-traffic { ... } } }`; Junos
+grammar disallows it, but the parser accepts it). Before #5609 the
+per-interface override attached to `iface.Name()` (member `a`) ONLY, so every
+nested member (`b`) silently fell back to the zone-level host-inbound — a
+MORE-permissive result than the operator's per-interface override whenever the
+zone-level admits a wider set. #5609 fans the parsed override across the SAME
+`zoneInterfaceMembers` flatten (each member gets an independent copy so a later
+merge cannot alias a sibling), keeping the host-inbound override in lockstep
+with the membership flatten. Covered by
+`pkg/config/compiler_zone_iface_hostinbound_bracket_5609_test.go`.
 
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a

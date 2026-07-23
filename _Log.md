@@ -58529,3 +58529,13 @@ top.
     pkg/daemon/daemon_run.go,
     pkg/grpcapi/server_show_dhcp_hwaddr_label_5328_test.go,
     pkg/dataplane/watchdog_test.go, _Log.md
+
+- **Timestamp**: 2026-07-23
+    - **Action**: #5609 triage — fan the per-interface host-inbound override
+      across every bracketed / load-override zone membership member (completes
+      the #5248 membership flatten); each member gets an independent copy so a
+      later merge cannot alias a sibling. Rest of the cohort dispositioned
+      (intentional / deferred / not-a-bug / architectural). Advances #5609.
+    - **File(s)**: pkg/config/compiler_security_zones.go,
+      pkg/config/compiler_zone_iface_hostinbound_bracket_5609_test.go,
+      docs/config-schema.md, _Log.md
