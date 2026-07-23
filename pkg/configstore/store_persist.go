@@ -480,8 +480,11 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 // a runtime dir switch both qualify (#6396: a switch to a previously-used dir
 // must re-seed from that dir's existing max, else this process's lower counter
 // would let the pre-existing archives outrank the new ones). A scan that fails
-// to READ the dir leaves archiveSeedDir unchanged so the next call retries,
-// rather than pinning the counter below the on-disk max (#6396 Codex MINOR 4).
+// to READ the dir does NOT mark the dir seeded — it leaves archiveSeedDir unset
+// (#6404 clears it on a genuine error) so the next attempt rescans, rather than
+// pinning the counter below the on-disk max (#6396 Codex MINOR 4); and while the
+// counter is unconfirmed the readiness gate makes an archiving commit SKIP its
+// archive rather than write a below-max seq (see ensureArchiveSeededLocked).
 //
 // #6404 edge 2: disabling archival (dir=="") INVALIDATES archiveSeedDir, so a
 // later re-enable to the SAME dir re-scans it. Without the invalidation

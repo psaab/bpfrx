@@ -59695,3 +59695,12 @@ top.
     pkg/configstore/store_commit.go, pkg/configstore/store.go,
     pkg/configstore/README.md, pkg/configstore/archive_reseed_6404_test.go,
     _Log.md
+
+- **Timestamp**: 2026-07-23 23:58 UTC
+  - **Action**: #6404 Codex round-3 MINOR (doc-only). Corrected the stale
+    SetArchiveConfig lead-in comment that still said a scan failure "leaves
+    archiveSeedDir unchanged" — it now states a genuine scan failure leaves the
+    marker unset (clears it) so the next attempt rescans, and notes the
+    readiness gate skips the archive when the counter is unconfirmed. Matches
+    the code; no behavior change. Suite GREEN, gofmt/vet clean.
+  - **File(s)**: pkg/configstore/store_persist.go, _Log.md
