@@ -22,6 +22,38 @@ import (
 	"github.com/psaab/xpf/pkg/policymatch"
 )
 
+// parseZoneFilter parses the optional `from-zone X to-zone Y` selector
+// that gates the policies-hit-count / policies-detail views. It rejects
+// an unrecognized token (e.g. a typo'd `from-zonee`) rather than
+// silently ignoring it — an ignored key left the corresponding filter
+// dimension empty, which widened the view to ALL zones and could make an
+// operator read a narrow policy set as the whole table. Mirrors the
+// unknown-key rejection the other show surfaces adopted (#4814/#3696).
+// Both showPoliciesHitCount and showPoliciesDetail route through this one
+// parser so the two surfaces stay in lockstep (#5557).
+func parseZoneFilter(filter string) (from, to string, err error) {
+	parts := strings.Fields(filter)
+	for i := 0; i < len(parts); {
+		switch parts[i] {
+		case "from-zone":
+			if i+1 >= len(parts) {
+				return "", "", fmt.Errorf("from-zone requires a zone name")
+			}
+			from = parts[i+1]
+			i += 2
+		case "to-zone":
+			if i+1 >= len(parts) {
+				return "", "", fmt.Errorf("to-zone requires a zone name")
+			}
+			to = parts[i+1]
+			i += 2
+		default:
+			return "", "", fmt.Errorf("unrecognized filter token %q (expected from-zone/to-zone)", parts[i])
+		}
+	}
+	return from, to, nil
+}
+
 // policySchedulerStateProvider is the optional dataplane capability the
 // gRPC policy-detail text surface uses to learn the live per-scheduler
 // active-state map (#3062). The userspace dataplane adapter implements
@@ -83,20 +115,13 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 		fmt.Fprintln(buf, "No active configuration")
 		return
 	}
-	// Parse optional zone filter from filter: "from-zone X to-zone Y"
-	var filterFrom, filterTo string
-	if filter != "" {
-		parts := strings.Fields(filter)
-		for i := 0; i+1 < len(parts); i++ {
-			switch parts[i] {
-			case "from-zone":
-				filterFrom = parts[i+1]
-				i++
-			case "to-zone":
-				filterTo = parts[i+1]
-				i++
-			}
-		}
+	// Parse optional zone filter from filter: "from-zone X to-zone Y".
+	// An unrecognized token is rejected rather than silently widening the
+	// view to all zones (#5557).
+	filterFrom, filterTo, err := parseZoneFilter(filter)
+	if err != nil {
+		fmt.Fprintf(buf, "invalid filter: %v\n", err)
+		return
 	}
 	// Honor `set security policy-stats system-wide enable` (#2008 M4 /
 	// #2118): Junos maintains and displays per-policy hit counters only
@@ -264,19 +289,12 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 		fmt.Fprintln(buf, "No active configuration")
 		return
 	}
-	var filterFrom, filterTo string
-	if filter != "" {
-		parts := strings.Fields(filter)
-		for i := 0; i+1 < len(parts); i++ {
-			switch parts[i] {
-			case "from-zone":
-				filterFrom = parts[i+1]
-				i++
-			case "to-zone":
-				filterTo = parts[i+1]
-				i++
-			}
-		}
+	// Reject an unrecognized filter token rather than silently widening
+	// the view to all zones — same rule as showPoliciesHitCount (#5557).
+	filterFrom, filterTo, err := parseZoneFilter(filter)
+	if err != nil {
+		fmt.Fprintf(buf, "invalid filter: %v\n", err)
+		return
 	}
 	// Same policy-stats gate as showPoliciesHitCount (#2008 M4 / #2118):
 	// the "Session statistics" block is per-policy hit-count display, so

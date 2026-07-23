@@ -132,7 +132,15 @@ func (m *Manager) generateStaticRouteInTable(sr *config.StaticRoute, vrfName str
 
 	vrfPart := ""
 	if vrfName != "" {
-		vrfPart = " vrf " + vrfName
+		// Render belt (#5557): route the routing-instance name through
+		// sanitizeFRRValue like every other free-text FRR interpolation
+		// (policy_render.go). The name is validated at commit, but the
+		// tolerant load / HA config-sync paths only warn (#1960 no-brick),
+		// so a control character reaching here could otherwise inject a
+		// second vtysh line into the managed frr.conf. This is the single
+		// interpolation point for `vrf <name>`, so it covers every static
+		// route the function renders (v4/v6, discard/reject, ECMP).
+		vrfPart = " vrf " + sanitizeFRRValue(vrfName)
 	} else if tableID > 0 {
 		vrfPart = fmt.Sprintf(" table %d", tableID)
 	}

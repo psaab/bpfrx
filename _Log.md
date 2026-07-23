@@ -58606,3 +58606,24 @@ top.
     C179-021 (over-int32 flow-session limit) was added to the branch after the
     reviewers ran and was parent-RED-verified firsthand.
   - **File(s)**: pkg/config/types_security.go, pkg/daemon/daemon_snmp_reconcile.go
+
+- **Timestamp**: 2026-07-23 (eng5557/claude-review-003 cohort)
+  - **Action**: Advance #5557 — fix 7 real, independent, low-risk Go control-plane
+    survivors from claude-review-003, each with a firsthand-verified
+    fail-on-revert test. (1) dhcprelay: gate an IPv6 server out of the udp4
+    DHCPv4 relay build (ip.To4()==nil). (2) natshow: surface a dataplane
+    session-scan error as a caveat in the persistent/source/dest detail
+    renderers instead of silently understating counts (v4+v6, all three
+    renderers). (3) configstore: bound a rollback slot by MaxConfigSize before
+    parsing at boot (tombstone oversize). (4) userspace ifindex: return a
+    negative sentinel + skip the unit on synthetic-range exhaustion instead of
+    panicking the daemon. (5) frr: route the static-route vrf name through
+    sanitizeFRRValue (render belt at the single interpolation point). (6) grpcapi
+    show-policies: reject an unknown filter token in BOTH hit-count and detail
+    via a shared parseZoneFilter. (7) grpcapi GetSessions: reject negative
+    page_size for symmetry with the existing Offset<0 guard. Rust A1/A2 items
+    and HA-touching survivors deferred; #45 (snmp IV) verified ALREADY-FIXED.
+  - **File(s)**: pkg/dhcprelay/relay.go, pkg/natshow/{natshow,persistent,source,
+    dest}.go, pkg/configstore/store_commit.go, pkg/dataplane/userspace/
+    interfaces.go, pkg/frr/config_render.go, pkg/grpcapi/{server_sessions,
+    server_show_policies_text}.go + 7 *_5557_test.go, _Log.md

@@ -31,25 +31,31 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 	// Count active SNAT sessions per rule-set
 	type ruleSetKey struct{ from, to string }
 	rsSessions := make(map[ruleSetKey]int)
+	var scanErr error
 	if dp != nil && dp.IsLoaded() && cr != nil {
 		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
 		for name, id := range cr.ZoneIDs {
 			zoneByID[id] = name
 		}
-		_ = dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if err := dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
 			}
 			return true
-		})
-		_ = dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		}); err != nil {
+			scanErr = err
+		}
+		if err := dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
 			}
 			return true
-		})
+		}); err != nil && scanErr == nil {
+			scanErr = err
+		}
 	}
 
+	noteSessionScanError(w, scanErr)
 	ruleIdx := 0
 	for _, rs := range cfg.Security.NAT.Source {
 		for _, rule := range rs.Rules {

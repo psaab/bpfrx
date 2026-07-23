@@ -86,6 +86,15 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 		return nil, status.Errorf(codes.InvalidArgument, "invalid offset %d", req.Offset)
 	}
 
+	// #5557: reject a negative page_size for symmetry with Offset above.
+	// req.PageSize is a signed int32; a negative value silently fell
+	// through the `PageSize > 0` guard below into the legacy limit/offset
+	// path — surfacing bad input as a full page returned as success
+	// rather than InvalidArgument.
+	if req.PageSize < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid page_size %d", req.PageSize)
+	}
+
 	// Cursor-based pagination: when page_size > 0, use cursor path.
 	if req.PageSize > 0 {
 		return s.getSessionsCursor(ctx, req)

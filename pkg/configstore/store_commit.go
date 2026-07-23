@@ -1238,6 +1238,20 @@ func (s *Store) loadRollbackHistory() {
 			entries = append(entries, &HistoryEntry{Timestamp: time.Now()})
 			continue
 		}
+		// #5557: bound a rollback slot the same way every other parse
+		// entry point is bounded (LoadOverride/LoadMerge/LoadSet/SyncApply
+		// via checkConfigSize). loadRollbackHistory reads straight off disk
+		// and would otherwise hand an unbounded payload to the parser at
+		// boot — a local-root-planted or corrupt oversized slot could
+		// exhaust memory before the daemon even finishes starting. Tombstone
+		// the slot (preserving later slots' `rollback N` positions, per the
+		// #4810 invariant above) rather than parse it.
+		if len(data) > MaxConfigSize {
+			slog.Warn("rollback file exceeds max config size, skipping",
+				"path", path, "bytes", len(data), "max", MaxConfigSize)
+			entries = append(entries, &HistoryEntry{Timestamp: time.Now()})
+			continue
+		}
 		parser := config.NewParser(string(data))
 		tree, errs := parser.Parse()
 		if len(errs) > 0 {

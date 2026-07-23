@@ -2,6 +2,7 @@ package userspace
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,8 +20,21 @@ const (
 	// compatibility.
 	syntheticInterfaceIfindexMin = 1 << 30
 	syntheticInterfaceIfindexMax = syntheticInterfaceIfindexMin + (1 << 20) - 1
+
+	// syntheticIfindexExhausted is the sentinel syntheticLogicalIfindex
+	// returns when the whole synthetic range is already claimed. It is a
+	// negative value so it can never be mistaken for a real (positive)
+	// ifindex; the caller skips the affected unit and logs rather than
+	// crashing the daemon (#5557).
+	syntheticIfindexExhausted = -1
 )
 
+// syntheticLogicalIfindex assigns a unique logical-only ifindex from the
+// private synthetic range. It returns syntheticIfindexExhausted (a
+// negative sentinel) when every slot in the range is already used — an
+// exhaustion that is unreachable in practice (it needs >1<<20 logical-only
+// VLAN units on one box) but must degrade gracefully instead of panicking
+// and crash-looping the daemon (#5557).
 func syntheticLogicalIfindex(name string, vlanID int, used map[int]struct{}) int {
 	if used == nil {
 		used = make(map[int]struct{})
@@ -42,15 +56,15 @@ func syntheticLogicalIfindex(name string, vlanID int, used map[int]struct{}) int
 		used[candidate] = struct{}{}
 		return candidate
 	}
-	panic(fmt.Sprintf(
-		"userspace snapshot: exhausted synthetic ifindex range for %q (vlan=%d hash=%d tried=%d range=[%d,%d]); check for hash collisions or excessive logical-only VLAN units",
-		name,
-		vlanID,
-		hash,
-		span,
-		syntheticInterfaceIfindexMin,
-		syntheticInterfaceIfindexMax,
-	))
+	slog.Error("userspace snapshot: exhausted synthetic ifindex range; skipping logical-only unit",
+		"name", name,
+		"vlan", vlanID,
+		"hash", hash,
+		"tried", span,
+		"range_min", syntheticInterfaceIfindexMin,
+		"range_max", syntheticInterfaceIfindexMax,
+	)
+	return syntheticIfindexExhausted
 }
 
 func shouldUseLogicalOnlyParentBoundRethVLAN(cfg *config.Config, ifName string, unit *config.InterfaceUnit, childIfindex int, parentIfindex int) bool {
@@ -250,6 +264,14 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			// existing ParentIfindex path remains the socket bind target.
 			if shouldUseLogicalOnlyParentBoundRethVLAN(cfg, name, unit, ifindex, parentIfindex) {
 				ifindex = syntheticLogicalIfindex(unitName, unit.VlanID, usedSyntheticIfindexes)
+				if ifindex == syntheticIfindexExhausted {
+					// Range exhausted (unreachable in practice; already
+					// logged in syntheticLogicalIfindex). Skip this unit
+					// rather than emit a snapshot with a bogus/negative
+					// ifindex — degrade gracefully instead of crashing the
+					// daemon (#5557).
+					continue
+				}
 				logicalOnly = true
 				if mtu == 0 {
 					mtu = parentMTU
