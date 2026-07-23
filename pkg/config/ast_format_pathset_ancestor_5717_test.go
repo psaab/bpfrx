@@ -62,6 +62,46 @@ func TestFormatPathSetAncestorEqualsKey_5717(t *testing.T) {
 	}
 }
 
+// The multi-key repeated-key case (codex-182 fold): a firewall filter NAMED
+// `term` holding a term NAMED `term`. The full render is
+// `set firewall family inet filter term term term then accept`. Scoping to
+// `... filter term term` matches the `term term` node by only its FIRST key (a
+// single-key bare-keyword terminal, true consumed width 1), but the path's last
+// TWO tokens `["term","term"]` also equal the node's whole Keys — so the first
+// #5717 cut (suffix-align the node's keys against the path) over-stripped and
+// dropped an ancestor `term`. The width-based reconstruction uses navigatePath's
+// TRUE consumed width and keeps every token. Both `filter <name>` and
+// `term <name>` accept `term` as a legal name (schema_cos.go).
+//
+// RED-on-revert: replace the width-based parentPrefix with the suffix-align
+// heuristic and the `... filter term term` scope drops a `term`.
+func TestFormatPathSetRepeatedMultiKey_5717(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set firewall family inet filter term term term then accept",
+	})
+	full := "set firewall family inet filter term term term then accept"
+
+	// Every scoped depth into the repeated-`term` chain must render the full,
+	// round-trippable statement — none may drop a `term`.
+	scopes := [][]string{
+		{"firewall", "family", "inet", "filter", "term"},                         // the filter named term
+		{"firewall", "family", "inet", "filter", "term", "term"},                 // + the term named term (single-key terminal, width 1)
+		{"firewall", "family", "inet", "filter", "term", "term", "term"},         // full term identity (multi-key terminal, width 2)
+		{"firewall", "family", "inet", "filter", "term", "term", "term", "then"}, // the then action
+	}
+	for _, path := range scopes {
+		got := strings.TrimSpace(tree.FormatPathSet(path))
+		if got != full {
+			t.Fatalf("FormatPathSet(%v) dropped a token:\n got: %q\nwant: %q", path, got, full)
+		}
+		// Round-trip the emitted line.
+		rt := buildTreeFromSet(t, []string{got})
+		if back := strings.TrimSpace(rt.FormatPathSet(scopes[len(scopes)-1])); back != full {
+			t.Fatalf("round-trip of %v diverged:\n got: %q\nwant: %q", path, back, full)
+		}
+	}
+}
+
 // A second shape: an ancestor policy NAMED after a descendant keyword. Here the
 // term is named "match" (a legal Junos name) and the matched leaf keyword is
 // also reachable such that a naive first-key search truncates the prefix.

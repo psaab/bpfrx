@@ -198,8 +198,10 @@ func validateDynamicAddressFeedServerEndpointStrict(cfg *Config) error {
 		// the runtime issues — feeds.Manager.readFeed does
 		// http.NewRequestWithContext(ctx, "GET", fs.url, nil), which errors
 		// BEFORE any I/O, so the feed registers no content and any deny policy
-		// bound to that address-name enforces an empty (match-nothing) set — the
-		// #3300 fail-open one layer up from the emptiness case. Validate the
+		// bound to that address-name is unresolvable and fails CLOSED (#5645:
+		// omitted -> __unsupported_address__ -> whole-snapshot preflight reject
+		// -> previous-good/default-deny) — historically the #3300 fail-open
+		// symptom one layer up from the emptiness case, now caught. Validate the
 		// resolved base url with the SAME request-construction semantics the
 		// runtime uses so a garbage endpoint is operator-visible at commit
 		// instead of silently non-functional. Tolerant load / peer-sync

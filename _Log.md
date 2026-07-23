@@ -57870,3 +57870,23 @@ top.
     pkg/config/compiler_uniformgates.go,
     pkg/config/compiler_feed_diag_failclosed_5717_test.go,
     docs/config-schema.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #5717 PR #6372 Codex review-fold (MERGE-NEEDS-MINOR ×2).
+    MINOR-1: FormatPathSet suffix-align was a heuristic that over-strips when a
+    multi-key terminal is matched by only its first key AND the path tail equals
+    its full keys (filter NAMED `term` holding a term NAMED `term`,
+    `... filter term term term`). Replaced the inference with navigatePath's TRUE
+    consumed width: added navigatePathWidth (returns (matches, width)),
+    navigatePath now a thin wrapper; FormatPathSet uses path[:len(path)-width].
+    RED-on-revert: restoring suffix-align drops a `term` on the
+    `... filter term term` scope. MINOR-2: added a malformed-feed-url subtest
+    (http://%) to the shared fail-closed assertion (the :226 rewording had no
+    regression binding) and corrected the stale #5183 malformed-url fail-open
+    comment (:195) to the #5645 fail-closed sequence. RED-on-revert: reverting
+    the malformed-url wording to fail-open fails the new subtest.
+  **File(s)**: pkg/config/ast.go, pkg/config/ast_format.go,
+    pkg/config/ast_format_pathset_ancestor_5717_test.go,
+    pkg/config/compiler_validate_strict_observability.go,
+    pkg/config/compiler_feed_diag_failclosed_5717_test.go,
+    docs/config-schema.md

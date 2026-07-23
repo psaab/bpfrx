@@ -182,28 +182,22 @@ func (t *ConfigTree) FormatPathSet(path []string) string {
 	if len(path) == 0 {
 		return t.FormatSet()
 	}
-	matches := navigatePath(t.Children, path)
+	matches, width := navigatePathWidth(t.Children, path)
 	if len(matches) == 0 {
 		return ""
 	}
 	// Compute the parent prefix: the path elements BEFORE the matched terminal
-	// node's keys. navigatePath consumed the trailing tokens of `path` into the
-	// terminal node, so strip the node's keys from the RIGHT. The pre-#5717 code
-	// searched for the node's first key from the LEFT and stopped at its FIRST
-	// occurrence, so an ANCESTOR argument equal to that key (e.g. a security zone
-	// NAMED "interfaces" holding an `interfaces` stanza) truncated the prefix and
-	// emitted a malformed, non-round-trippable set line that dropped the ancestor
-	// token (codex-182 A3-b00-C001, #5717). Shrink k until the path suffix aligns
-	// with the node's leading keys to tolerate a partial multi-key terminal match.
-	mk := matches[0].Keys
-	k := len(mk)
-	if k > len(path) {
-		k = len(path)
-	}
-	for k > 0 && !keysEqual(path[len(path)-k:], mk[:k]) {
-		k--
-	}
-	parentPrefix := append([]string(nil), path[:len(path)-k]...)
+	// node. navigatePath consumed exactly `width` trailing `path` tokens into the
+	// terminal node's keys, so the prefix is the leading part of `path` with that
+	// width stripped from the RIGHT. Using the TRUE consumed width — rather than
+	// the node's first key from the LEFT (pre-#5717) or a suffix match of the
+	// node's whole keys (the first #5717 cut) — is the only reconstruction that
+	// stays correct when an ancestor value repeats the terminal node's keys: a
+	// zone NAMED "interfaces" holding an `interfaces` stanza (single-key terminal,
+	// width 1) and a filter NAMED `term` holding a term NAMED `term` (`... filter
+	// term term term`, width 1) both broke the earlier heuristics
+	// (codex-182 A3-b00-C001, #5717).
+	parentPrefix := append([]string(nil), path[:len(path)-width]...)
 	var b strings.Builder
 	for _, n := range matches {
 		prefix := append(append([]string{}, parentPrefix...), n.Keys...)

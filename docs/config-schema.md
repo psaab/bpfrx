@@ -880,24 +880,31 @@ display-set round-trip, policy match `source-address`, block-shape
 `system-services` member toggle, single-value-leaf and keyed-entry
 non-regression).
 
-**Scoped display-set parent prefix: strip the terminal node's keys from the
-RIGHT, not the first-key match from the LEFT (#5717).** `FormatPathSet`
-(`ast_format.go`, the `show configuration <path> | display set` renderer)
-reconstructs the leading prefix for each emitted `set` line by removing the
-matched terminal node's keys from the scoped path. It previously searched the
-path left-to-right for the FIRST token equal to the matched node's first key and
-stopped there, so an ANCESTOR argument equal to that key truncated the prefix and
-dropped the ancestor token — a security zone NAMED `interfaces` holding an
-`interfaces` stanza rendered `set security zones security-zone interfaces
-ge-0/0/9.0` (one `interfaces` missing), a malformed line that reloads as a
-different object. `navigatePath` consumes the trailing path tokens into the
-terminal node, so the fix strips the node's keys from the RIGHT (suffix-aligned
-to tolerate a partial multi-key terminal match), keeping every ancestor token.
-This is the display-side twin of the copy-side #5822 fix (`CopyPath` first-keyword
-`insertNode`); both are the codex-182 A3-b00-C001 AST path-identity cohort.
-Covered by `pkg/config/ast_format_pathset_ancestor_5717_test.go` (zone-named-
-`interfaces` round-trip + policy-named-`then` prefix; fail-on-revert restores the
-left-search truncation).
+**Scoped display-set parent prefix: use `navigatePath`'s TRUE consumed width,
+not a key-token heuristic (#5717).** `FormatPathSet` (`ast_format.go`, the
+`show configuration <path> | display set` renderer) reconstructs the leading
+prefix for each emitted `set` line by removing the matched terminal node's tokens
+from the scoped path. Two heuristics both failed on legal repeated names:
+searching the path left-to-right for the FIRST token equal to the matched node's
+first key dropped an ancestor token when an ANCESTOR argument equaled that key (a
+security zone NAMED `interfaces` holding an `interfaces` stanza rendered
+`set security zones security-zone interfaces ge-0/0/9.0`, one `interfaces`
+missing); suffix-aligning the node's WHOLE keys against the path over-stripped
+when an ancestor value repeated the node's keys (a firewall filter NAMED `term`
+holding a term NAMED `term`, `... filter term term term`, scoped to
+`... filter term term` — the `term term` node matched by only its first key, but
+the path tail `["term","term"]` also equalled its full keys). The robust fix
+exposes the exact number of trailing path tokens `navigatePath` consumed into the
+terminal node — `navigatePathWidth` (`ast.go`) returns `(matches, width)`, and
+`navigatePath` is now a thin wrapper — so the parent prefix is
+`path[:len(path)-width]` from the TRUE width (a single-key bare-keyword terminal
+consumes ONE token even when its full Keys are longer). This is the display-side
+twin of the copy-side #5822 fix (`CopyPath` first-keyword `insertNode`); both are
+the codex-182 A3-b00-C001 AST path-identity cohort. Covered by
+`pkg/config/ast_format_pathset_ancestor_5717_test.go` (zone-named-`interfaces`
+round-trip, policy-named-`then` prefix, and every scoped depth of the
+filter-`term`/term-`term` chain; fail-on-revert restores the token-heuristic and
+drops a token).
 
 **Rename-side contract: resolve the SPECIFIC named sibling by full identity
 (#3982).** `rename <old> to <new>` (`RenamePath`, `ast_edit.go`) is the same

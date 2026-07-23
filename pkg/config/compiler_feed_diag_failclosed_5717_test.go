@@ -53,6 +53,24 @@ func TestFeedDiagnosticsAreFailClosed_5717(t *testing.T) {
 		}
 		assertFailClosedFeedDiag_5717(t, err.Error())
 	})
+
+	// The strict feed-server MALFORMED-url diagnostic (#5183 gate): a non-empty
+	// but unconstructible base url (`http://%`) clears the emptiness gate, so a
+	// bound address-name is unresolvable and must be reported fail-closed. Before
+	// this fold the malformed-url wording had no regression binding — reverting
+	// it to the fail-open framing left the suite green.
+	t.Run("malformed-url-server", func(t *testing.T) {
+		tree := buildTreeFromSet(t, []string{
+			"set security dynamic-address feed-server threat url http://%",
+			"set security dynamic-address feed-server threat feed-name malware path /malware.txt",
+			"set security dynamic-address address-name bad-actors profile feed-name malware",
+		})
+		_, err := CompileConfig(tree)
+		if err == nil {
+			t.Fatal("CompileConfig should reject a malformed feed-server url")
+		}
+		assertFailClosedFeedDiag_5717(t, err.Error())
+	})
 }
 
 // assertFailClosedFeedDiag_5717 verifies a feed diagnostic describes the #5645
