@@ -270,17 +270,26 @@ class Harness:
         if self.keep:
             print(f"keeping instances {self.instances}, alias {self.alias}, "
                   f"network {self.net}")
-        else:
-            for i in self.instances:
-                self._owned_delete(i)   # ownership-gated (#4905-D)
-            # Only delete the alias if WE imported it this run, and only the
-            # run-namespaced name — never a bystander's `xpf-image-validate`
-            # (#4905-D).
-            if self.imported_alias:
-                incus("image", "delete", self.alias, check=False, capture=True)
-            # created_net already gates the network delete to one WE created.
-            if self.created_net:
-                incus("network", "delete", self.net, check=False, capture=True)
+            # Retain the per-run scratch dir under --keep too (codex-182
+            # A10-b03-C01). Scenarios B/C/E/Q write config files and day-0
+            # ISOs under self.work and attach those HOST paths to the
+            # instances. Deleting self.work while keeping the VMs leaves each
+            # retained instance referencing a source that can no longer be
+            # reopened on a later restart/inspection/reproduction — the exact
+            # forensic environment --keep was asked to preserve. Print the
+            # path so the operator can find the retained media.
+            print(f"keeping work dir {self.work} (day-0 media / config drives)")
+            return
+        for i in self.instances:
+            self._owned_delete(i)   # ownership-gated (#4905-D)
+        # Only delete the alias if WE imported it this run, and only the
+        # run-namespaced name — never a bystander's `xpf-image-validate`
+        # (#4905-D).
+        if self.imported_alias:
+            incus("image", "delete", self.alias, check=False, capture=True)
+        # created_net already gates the network delete to one WE created.
+        if self.created_net:
+            incus("network", "delete", self.net, check=False, capture=True)
         subprocess.run(["rm", "-rf", self.work], check=False)
 
     # ── waiters ──

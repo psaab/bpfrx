@@ -57928,3 +57928,26 @@ top.
     ./pkg/api/... ./pkg/grpcapi/... green; vet + gofmt clean.
   **File(s)**: pkg/api/server.go, pkg/api/tls_san_5719_test.go,
     pkg/api/tls_test.go, pkg/api/README.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #5720 C-TOOLS cohort triage — fixed 5 low-risk tooling
+    survivors from codex-review-182; dispositioned 2 out-of-scope. C01: extend
+    `analyzePolicyShadowing` to also lint the global-policy list
+    (`security policies global`) with a `globalScopeCovers` from/to-zone
+    containment gate (avoids false positives across disjoint global scopes).
+    C02: remove the unreachable `return nil` after the CLI REPL's infinite
+    `for {}` (go vet clean). C03: correct the `vdso_probe2.c` header comment
+    which claimed a `/proc/self/maps` cross-check it never performed. b02/C1:
+    add an up-front (V4 src, V6 dst) fail-closed gate to `policymatch.Match`
+    (`Result.UnsupportedTupleFamily` + dedicated `DisplayAction` string),
+    mirroring the runtime `policy.rs` NAT46-impossible arm. b03-C01: `validate.py`
+    cleanup retains `self.work` under `--keep` (day-0 media backing retained
+    VMs). Out-of-scope: C04 (cli_show_flow.go 1262-LOC modularity → open #5661),
+    b03-F03 (dangling `current` symlink rollback guard → PRODUCTION pkg/upgrade,
+    MATERIAL Medium → dedicated issue).
+  - **File(s)**: pkg/cli/cli.go, pkg/cli/cli_request_policies_check.go,
+    pkg/cli/cli_request_policies_check_test.go, pkg/policymatch/policymatch.go,
+    pkg/policymatch/mixed_family_tuple_5720_test.go, pkg/policymatch/README.md,
+    scripts/image/validate.py, scripts/image/test_validate_ownership.py,
+    docs/image-validation.md,
+    docs/pr/812-tx-latency-histogram/evidence/vdso_probe2.c
