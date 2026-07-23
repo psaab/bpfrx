@@ -754,6 +754,44 @@ ifindex the fast map is the last-wins canonical source, so the precheck now
 agrees with the filter the evaluator that follows actually walks. `FilterState`
 drops from 25 to 15 fields.
 
+**Co-located lookups fold to one (#6236 PR-2C).** After PR-2B a call site that
+checks N flags of the same ifindex paid N separate `iface_filter_*_fast.get()`
+lookups. PR-2C folds each co-located multi-flag check into ONE `.get()` that
+borrows `Option<&Arc<Filter>>` and evaluates every needed flag off that single
+borrow, through shared pure `&Filter` evaluator cores so the folded site and the
+per-flag accessor can never drift:
+
+- **Route-lookup / PBR precheck** (`afxdp/forwarding/pbr.rs`): the
+  `affects_route_lookup` precheck and the routing-instance evaluator used to look
+  the same ingress ifindex up twice on the input fast map. The SOLE lookup+gate
+  is now `interface_filter_route_lookup_affecting` (returns the borrowed
+  route-lookup-affecting `&Filter`); the bool `interface_filter_affects_route_lookup`
+  is `.is_some()` of it, and the PBR site feeds the borrow straight into the new
+  `&Filter` core `evaluate_filter_ref_routing_instance_event_counted`. One lookup.
+- **Session-hit DSCP/L4 re-eval gate** (`afxdp/poll_descriptor/filter.rs`): the
+  `has_dscp_match` + `has_per_packet_l4_match` prechecks fold to one lookup of
+  `interface_input_filter_varies_per_packet`, which reads the SOLE OR core
+  `Filter::varies_per_packet_within_flow()`. The flow-cache decline gate
+  (`afxdp/flow_cache.rs`) still consults the two per-flag accessors individually
+  (input **and** output directions), so they stay live.
+- **CoS TX-selection output arms** (`afxdp/tx/cos_classify.rs`, all four
+  cached/runtime × flow-keyed/flowless): the `needs_tx_eval` bool precheck + the
+  separate output-filter `.get()` + a redundant `.filter(needs_tx_eval)` fold to
+  one `interface_output_filter_needing_tx_eval` borrow (gated on
+  `Filter::needs_tx_eval()`; the bool `interface_output_filter_needs_tx_eval` is
+  `.is_some()` of it). The PR-2A family-wide `has_output_needs_tx_eval_*`
+  aggregate still short-circuits the whole TX path (`tx_selection_enabled_*`)
+  BEFORE any per-interface lookup — that fast branch is unchanged.
+
+The fold is behavior-preserving: for a unique ifindex the single borrow is the
+same `Arc<Filter>` the second lookup would have returned; the fast map is the
+last-wins SSOT for a duplicate. Anti-drift invariant: the accessor is
+`map.get(&if).is_some_and(|f| core(f))` and the folded site evaluates `core(f)`
+off the borrow — BOTH through the same `&Filter` core
+(`affects_route_lookup` field / `varies_per_packet_within_flow()` /
+`needs_tx_eval()`), pinned by `pr2c_folded_single_lookup_equals_two_lookup_path`
+in `filter/tests.rs`.
+
 **Aggregate-from-final-map rule.** Every retained family-wide `FilterState`
 aggregate (`has_input_tx_selection_*`, `has_input_three_color_policer_*`, and
 `has_output_needs_tx_eval_*`) is recomputed **after** the interface loop from the

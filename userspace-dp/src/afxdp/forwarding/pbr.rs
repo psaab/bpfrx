@@ -57,35 +57,39 @@ pub(in crate::afxdp) fn ingress_route_table_override(
     )
     .unwrap_or(meta.ingress_ifindex as i32);
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
-    if !crate::filter::interface_filter_affects_route_lookup(
+    // #6236 PR-2C: the `affects_route_lookup` precheck and the routing-instance
+    // evaluation used to look the SAME ingress ifindex up twice on the input fast
+    // map. Fold to ONE `.get()`: borrow the route-lookup-affecting filter (the
+    // precheck is now `.is_some()` of this same lookup+gate) and evaluate off
+    // that borrow. `None` collapses the precheck-false and no-filter cases — both
+    // return RouteOverride::None, exactly as before.
+    let Some(filter) = crate::filter::interface_filter_route_lookup_affecting(
         &forwarding.filter_state,
         ingress_ifindex,
         is_v6,
-    ) {
+    ) else {
         return RouteOverride::None;
-    }
+    };
     // #2362: PBR terms may carry per-packet L4 match conditions (tcp-flags /
     // is-fragment / icmp-type / icmp-code); build the extra inputs so a
     // `from { tcp-flags ...; } then routing-instance ...` term matches exactly
-    // the authored packets.
+    // the authored packets. Built AFTER the precheck so a non-route-lookup-
+    // affecting filter pays no extra-build.
     let extra = crate::afxdp::frame::term_match_extra_from_frame(frame, meta);
-    let routing_result =
-        match crate::filter::evaluate_interface_filter_routing_instance_event_counted(
-            &forwarding.filter_state,
-            ingress_ifindex,
-            is_v6,
-            flow.src_ip,
-            flow.dst_ip,
-            meta.protocol,
-            flow.forward_key.src_port,
-            flow.forward_key.dst_port,
-            meta.dscp,
-            extra,
-            meta.pkt_len as u64,
-        ) {
-            Some(result) => result,
-            None => return RouteOverride::None,
-        };
+    let routing_result = match crate::filter::evaluate_filter_ref_routing_instance_event_counted(
+        filter,
+        flow.src_ip,
+        flow.dst_ip,
+        meta.protocol,
+        flow.forward_key.src_port,
+        flow.forward_key.dst_port,
+        meta.dscp,
+        extra,
+        meta.pkt_len as u64,
+    ) {
+        Some(result) => result,
+        None => return RouteOverride::None,
+    };
     // #4392: a matched PBR routing-instance term may ALSO carry a drop action
     // (`then { routing-instance X; reject | discard; }`). Such a term is a DENY,
     // NOT a forward: the routing-instance override must NOT be applied. On the

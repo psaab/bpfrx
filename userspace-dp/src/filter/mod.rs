@@ -78,10 +78,15 @@ pub(crate) enum FilterAction {
 //       off FilterState.iface_filter_v{4,6}_fast via the
 //       interface_input_filter_has_<X>_match accessor — the parallel
 //       per-interface has_<X>_match sets were deleted in #6236 PR-2B),
-//       flow-cache insertion gate at afxdp/flow_cache.rs:297-309,
-//       established-session re-evaluation at afxdp/poll_descriptor/mod.rs:217-244,
-//       forwarding rotation purge at afxdp/worker/loop_body/mod.rs:295-330,
-//       and tests at afxdp/flow_cache_tests.rs.
+//       flow-cache insertion gate at afxdp/flow_cache.rs (per-flag,
+//       input + output direction), established-session re-evaluation at
+//       afxdp/poll_descriptor/filter.rs (the DSCP + per-packet-L4
+//       prechecks fold to ONE lookup of
+//       interface_input_filter_varies_per_packet — the
+//       Filter.varies_per_packet_within_flow() OR core — since #6236
+//       PR-2C), forwarding rotation purge at
+//       afxdp/worker/loop_body/mod.rs, and tests at
+//       afxdp/flow_cache_tests.rs.
 //
 // Skipping this classification SILENTLY breaks flow-cache: a
 // first-packet decision gets reused for later packets that can
@@ -429,6 +434,26 @@ impl Filter {
             || self.has_log_terms
             || self.has_terminal_action_terms
             || self.has_three_color_policer_terms
+    }
+
+    /// #6236 PR-2C: the #1430/#2362 "this filter's per-packet verdict is NOT a
+    /// pure function of the flow-cache 5-tuple" predicate. A DSCP match term
+    /// (#1430) or a per-packet L4 match term (#2362: tcp-flags / is-fragment /
+    /// icmp-type / icmp-code) keys off a field outside the 5-tuple, so a
+    /// first-packet decision must not be replayed: the flow-cache declines and
+    /// the session-hit path re-evaluates.
+    ///
+    /// This is the SOLE definition of the `has_dscp_match_terms ||
+    /// has_per_packet_l4_match_terms` OR. The single-lookup accessor
+    /// `interface_input_filter_varies_per_packet` and the folded session-hit
+    /// re-eval gate (`afxdp/poll_descriptor/filter.rs`) both evaluate it off ONE
+    /// borrowed `&Filter`, so they cannot drift from the per-flag accessors
+    /// (`interface_input_filter_has_dscp_match` /
+    /// `interface_input_filter_has_per_packet_l4_match`) that the flow-cache
+    /// decline gate (`afxdp/flow_cache.rs`) still consults individually.
+    #[inline]
+    pub(crate) fn varies_per_packet_within_flow(&self) -> bool {
+        self.has_dscp_match_terms || self.has_per_packet_l4_match_terms
     }
 }
 

@@ -879,6 +879,12 @@ pub(crate) fn evaluate_interface_filter_log_match(
     )
 }
 
+// #6236 PR-2C: this `(state, ifindex, ..)` map-lookup wrapper is now test-only —
+// production (afxdp/forwarding/pbr.rs) shares the borrow from
+// `interface_filter_route_lookup_affecting` into the `&Filter` core
+// `evaluate_filter_ref_routing_instance_event_counted` (one lookup). `#[cfg(test)]`
+// keeps the wrapper out of the shipped binary.
+#[cfg(test)]
 pub(crate) fn evaluate_interface_filter_routing_instance_counted<'a>(
     state: &'a FilterState,
     ifindex: i32,
@@ -908,6 +914,11 @@ pub(crate) fn evaluate_interface_filter_routing_instance_counted<'a>(
     .map(|result| result.routing_instance)
 }
 
+// #6236 PR-2C: test-only map-lookup wrapper (see
+// `evaluate_interface_filter_routing_instance_counted` above); production shares
+// the borrow into the `&Filter` core below. `#[cfg(test)]` keeps it out of the
+// shipped binary.
+#[cfg(test)]
 pub(crate) fn evaluate_interface_filter_routing_instance_event_counted<'a>(
     state: &'a FilterState,
     ifindex: i32,
@@ -926,9 +937,39 @@ pub(crate) fn evaluate_interface_filter_routing_instance_event_counted<'a>(
     } else {
         state.iface_filter_v4_fast.get(&ifindex).map(Arc::as_ref)
     };
-    let Some(filter) = filter else {
-        return None;
-    };
+    let filter = filter?;
+    evaluate_filter_ref_routing_instance_event_counted(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        extra,
+        packet_bytes,
+    )
+}
+
+/// #6236 PR-2C: `&Filter`-taking core of the routing-instance evaluator — the
+/// `(src, dst)`-family dispatch, extracted so the PBR call site
+/// (`afxdp/forwarding/pbr.rs`) can share the SAME borrow the
+/// `affects_route_lookup` precheck already took
+/// ([`interface_filter_route_lookup_affecting`]) instead of re-looking-up the
+/// ifindex. The map-lookup wrapper above and the folded PBR site both funnel
+/// through this one body, so the precheck-then-evaluate pair pays a single
+/// `.get()`.
+pub(crate) fn evaluate_filter_ref_routing_instance_event_counted<'a>(
+    filter: &'a Filter,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    extra: TermMatchExtra<'_>,
+    packet_bytes: u64,
+) -> Option<FilterRoutingInstanceResult<'a>> {
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_routing_instance_counted_v4(
             filter,
@@ -1091,15 +1132,46 @@ pub(crate) fn interface_filter_affects_route_lookup(
     ifindex: i32,
     is_v6: bool,
 ) -> bool {
-    // #6236 PR-2B: read the flag off the per-interface fast map instead of a
-    // parallel `iface_filter_v*_affects_route_lookup` set. The set was populated
-    // iff `filter.affects_route_lookup`, so `get().is_some_and(..)` is
-    // bit-identical for a unique ifindex and last-wins-consistent for a
-    // duplicate — agreeing with the filter the eval that follows actually runs.
+    // #6236 PR-2C: independent single lookup — its OWN `.get()` on the
+    // per-interface input fast map, then the `affects_route_lookup` flag.
+    // Retained for the poll-descriptor session-miss counter-policy precheck
+    // (`evaluate_non_pbr_input_filter`), which needs only the bool, not the
+    // filter — AND as the INDEPENDENT reference the accessor-equivalence tests
+    // compare the folded borrow accessor `interface_filter_route_lookup_affecting`
+    // against. Delegating to that accessor would make the comparison tautological
+    // (`X == X`); this re-derives the flag by its own lookup. Same single-lookup
+    // cost either way.
     let filter = if is_v6 {
         state.iface_filter_v6_fast.get(&ifindex)
     } else {
         state.iface_filter_v4_fast.get(&ifindex)
     };
-    filter.is_some_and(|filter| filter.affects_route_lookup)
+    filter.is_some_and(|f| f.affects_route_lookup)
+}
+
+/// #6236 PR-2C: single-lookup borrow of the per-interface input filter for this
+/// family, gated on `affects_route_lookup`. This is the SOLE lookup+gate — the
+/// bool precheck [`interface_filter_affects_route_lookup`] is `.is_some()` of
+/// it, and the PBR call site (`afxdp/forwarding/pbr.rs`) borrows the returned
+/// `&Filter` straight into [`evaluate_filter_ref_routing_instance_event_counted`]
+/// so the precheck and the routing-instance evaluation share ONE `.get()`
+/// instead of looking the same ifindex up twice (the PR-2B two-lookup shape).
+///
+/// Behavior is identical to the two-lookup path: for a unique ifindex the borrow
+/// is the same `Arc<Filter>` the evaluator's own lookup would return; for a
+/// duplicate ifindex the fast map is the last-wins SSOT, so the precheck agrees
+/// with the filter the evaluator walks.
+pub(crate) fn interface_filter_route_lookup_affecting(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+) -> Option<&Filter> {
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex)
+    } else {
+        state.iface_filter_v4_fast.get(&ifindex)
+    };
+    filter
+        .map(Arc::as_ref)
+        .filter(|filter| filter.affects_route_lookup)
 }

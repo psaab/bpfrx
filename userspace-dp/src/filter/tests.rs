@@ -2737,6 +2737,330 @@ fn capability_accessors_equal_fast_map_flags_for_unique_ifindices() {
     assert!(interface_output_filter_needs_tx_eval(&state, 41, true));
 }
 
+/// #6236 PR-2C fail-on-revert equivalence gate. PR-2C folds the co-located
+/// multi-flag hot-path checks into ONE `.get()` per call site via shared pure
+/// `&Filter` evaluator cores. This test proves each folded single-lookup path
+/// returns EXACTLY the value the pre-fold two-lookup path returned, for
+/// representative filters (DSCP-only, L4-only, both, needs-tx-eval, none) across
+/// both families and both directions.
+///
+/// The three cores under test:
+///   1. route-lookup: `interface_filter_route_lookup_affecting(..).is_some()`
+///      == the bool precheck, AND the borrow feeds the routing-instance
+///      evaluator core so `evaluate_filter_ref_routing_instance_event_counted`
+///      (one lookup) == `evaluate_interface_filter_routing_instance_event_counted`
+///      (its own lookup).
+///   2. DSCP/L4: `interface_input_filter_varies_per_packet` (the folded session-
+///      hit re-eval gate) == `has_dscp_match(..) || has_per_packet_l4_match(..)`.
+///   3. needs-tx-eval: `interface_output_filter_needing_tx_eval(..).is_some()`
+///      == the bool accessor `interface_output_filter_needs_tx_eval`.
+///
+/// Reverts that make a core read the wrong flag, or drop one of the two OR'd
+/// flags (`Filter::varies_per_packet_within_flow`), fail this test at a
+/// representative ifindex.
+#[test]
+fn pr2c_folded_single_lookup_equals_two_lookup_path() {
+    let ifaces = vec![
+        // input v4/v6 DSCP-only
+        crate::InterfaceSnapshot {
+            name: "dscp-a".into(),
+            ifindex: 100,
+            filter_input_v4: "dscp4".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "dscp-b".into(),
+            ifindex: 101,
+            filter_input_v6: "dscp6".into(),
+            ..Default::default()
+        },
+        // input v4/v6 per-packet-L4-only (tcp-flags)
+        crate::InterfaceSnapshot {
+            name: "l4-a".into(),
+            ifindex: 110,
+            filter_input_v4: "ppl4".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "l4-b".into(),
+            ifindex: 111,
+            filter_input_v6: "ppl6".into(),
+            ..Default::default()
+        },
+        // input v4/v6 BOTH DSCP and per-packet-L4 on one term
+        crate::InterfaceSnapshot {
+            name: "both-a".into(),
+            ifindex: 120,
+            filter_input_v4: "both4".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "both-b".into(),
+            ifindex: 121,
+            filter_input_v6: "both6".into(),
+            ..Default::default()
+        },
+        // input v4/v6 route-lookup-affecting (routing-instance PBR term)
+        crate::InterfaceSnapshot {
+            name: "pbr-a".into(),
+            ifindex: 130,
+            filter_input_v4: "pbr4".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "pbr-b".into(),
+            ifindex: 131,
+            filter_input_v6: "pbr6".into(),
+            ..Default::default()
+        },
+        // output v4 (counter) / v6 (log) → needs_tx_eval
+        crate::InterfaceSnapshot {
+            name: "out-a".into(),
+            ifindex: 140,
+            filter_output_v4: "count4".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "out-b".into(),
+            ifindex: 141,
+            filter_output_v6: "log6".into(),
+            ..Default::default()
+        },
+        // plain input+output both families (no capability flag) — negative side
+        crate::InterfaceSnapshot {
+            name: "plain".into(),
+            ifindex: 150,
+            filter_input_v4: "plain4".into(),
+            filter_input_v6: "plain6".into(),
+            filter_output_v4: "plain4".into(),
+            filter_output_v6: "plain6".into(),
+            ..Default::default()
+        },
+    ];
+    let dscp_term = |dscp: bool, l4: bool| FirewallTermSnapshot {
+        name: "t".into(),
+        action: "accept".into(),
+        dscp_values: if dscp { vec![46] } else { vec![] },
+        protocols: if l4 { vec!["tcp".into()] } else { vec![] },
+        tcp_flags: if l4 { Some(0x02) } else { None },
+        ..Default::default()
+    };
+    let state = parse_filter_state(
+        &[
+            FirewallFilterSnapshot {
+                name: "dscp4".into(),
+                family: "inet".into(),
+                terms: vec![dscp_term(true, false)],
+            },
+            FirewallFilterSnapshot {
+                name: "dscp6".into(),
+                family: "inet6".into(),
+                terms: vec![dscp_term(true, false)],
+            },
+            FirewallFilterSnapshot {
+                name: "ppl4".into(),
+                family: "inet".into(),
+                terms: vec![dscp_term(false, true)],
+            },
+            FirewallFilterSnapshot {
+                name: "ppl6".into(),
+                family: "inet6".into(),
+                terms: vec![dscp_term(false, true)],
+            },
+            FirewallFilterSnapshot {
+                name: "both4".into(),
+                family: "inet".into(),
+                terms: vec![dscp_term(true, true)],
+            },
+            FirewallFilterSnapshot {
+                name: "both6".into(),
+                family: "inet6".into(),
+                terms: vec![dscp_term(true, true)],
+            },
+            FirewallFilterSnapshot {
+                name: "pbr4".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    routing_instance: "ri".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "pbr6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    routing_instance: "ri".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "count4".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    count: "c4".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "log6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    log: true,
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "plain4".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "plain6".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "t".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+
+    // Probe every used ifindex plus absent ones so both sides of each
+    // equivalence are exercised.
+    let probe: [i32; 15] = [
+        100, 101, 110, 111, 120, 121, 130, 131, 140, 141, 150, 0, 1, 999, 42,
+    ];
+    for &ifx in &probe {
+        for is_v6 in [false, true] {
+            // Core 1a: route-lookup borrow `.is_some()` == the bool precheck.
+            let borrow = interface_filter_route_lookup_affecting(&state, ifx, is_v6);
+            assert_eq!(
+                borrow.is_some(),
+                interface_filter_affects_route_lookup(&state, ifx, is_v6),
+                "route-lookup borrow.is_some() != bool precheck at {ifx} v6={is_v6}"
+            );
+            // The borrow, when present, is a route-lookup-affecting filter.
+            if let Some(filter) = borrow {
+                assert!(
+                    filter.affects_route_lookup,
+                    "route-lookup borrow returned a non-affecting filter at {ifx} v6={is_v6}"
+                );
+            }
+
+            // Core 2: the folded DSCP||L4 gate == OR of the two per-flag
+            // accessors the flow-cache decline gate still uses individually.
+            assert_eq!(
+                interface_input_filter_varies_per_packet(&state, ifx, is_v6),
+                interface_input_filter_has_dscp_match(&state, ifx, is_v6)
+                    || interface_input_filter_has_per_packet_l4_match(&state, ifx, is_v6),
+                "varies_per_packet != (has_dscp || has_l4) at {ifx} v6={is_v6}"
+            );
+
+            // Core 3: needs-tx-eval borrow `.is_some()` == the bool accessor,
+            // and the borrow, when present, actually needs a TX walk.
+            let out_borrow = interface_output_filter_needing_tx_eval(&state, ifx, is_v6);
+            assert_eq!(
+                out_borrow.is_some(),
+                interface_output_filter_needs_tx_eval(&state, ifx, is_v6),
+                "needs-tx-eval borrow.is_some() != bool accessor at {ifx} v6={is_v6}"
+            );
+            if let Some(filter) = out_borrow {
+                assert!(
+                    filter.needs_tx_eval(),
+                    "needs-tx-eval borrow returned a filter that does not need eval at {ifx} v6={is_v6}"
+                );
+            }
+        }
+    }
+
+    // Core 1b: the routing-instance evaluator core off the shared borrow returns
+    // the same override the two-lookup entry point returns, for the v4 and v6
+    // route-lookup-affecting interfaces. A `routing-instance ri; accept` term
+    // with no `from` match steers every packet.
+    for &(ifx, is_v6, src, dst) in &[
+        (
+            130i32,
+            false,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        ),
+        (
+            131i32,
+            true,
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+        ),
+    ] {
+        let two_lookup = evaluate_interface_filter_routing_instance_event_counted(
+            &state,
+            ifx,
+            is_v6,
+            src,
+            dst,
+            PROTO_TCP,
+            40000,
+            5201,
+            0,
+            TermMatchExtra::default(),
+            1400,
+        );
+        let borrow = interface_filter_route_lookup_affecting(&state, ifx, is_v6)
+            .expect("route-lookup-affecting filter present");
+        let single_lookup = evaluate_filter_ref_routing_instance_event_counted(
+            borrow,
+            src,
+            dst,
+            PROTO_TCP,
+            40000,
+            5201,
+            0,
+            TermMatchExtra::default(),
+            1400,
+        );
+        assert_eq!(
+            two_lookup.map(|r| r.routing_instance),
+            single_lookup.map(|r| r.routing_instance),
+            "routing-instance override diverged between one- and two-lookup paths at {ifx} v6={is_v6}"
+        );
+        assert_eq!(
+            single_lookup.map(|r| r.routing_instance),
+            Some("ri"),
+            "expected the fixture PBR term to steer to `ri` at {ifx} v6={is_v6}"
+        );
+    }
+
+    // Sanity: the fixture drives a positive result on each folded core so the
+    // equivalences above are not vacuously true.
+    assert!(interface_filter_route_lookup_affecting(&state, 130, false).is_some());
+    assert!(interface_filter_route_lookup_affecting(&state, 131, true).is_some());
+    assert!(interface_input_filter_varies_per_packet(&state, 100, false)); // dscp-only
+    assert!(interface_input_filter_varies_per_packet(&state, 110, false)); // l4-only
+    assert!(interface_input_filter_varies_per_packet(&state, 120, false)); // both
+    assert!(interface_input_filter_varies_per_packet(&state, 121, true)); // both v6
+    assert!(!interface_input_filter_varies_per_packet(&state, 150, false)); // plain
+    assert!(interface_output_filter_needing_tx_eval(&state, 140, false).is_some());
+    assert!(interface_output_filter_needing_tx_eval(&state, 141, true).is_some());
+    assert!(interface_output_filter_needing_tx_eval(&state, 150, false).is_none());
+}
+
 #[test]
 fn interface_filter_routing_instance_counted_returns_matching_override() {
     let ifaces = vec![crate::InterfaceSnapshot {

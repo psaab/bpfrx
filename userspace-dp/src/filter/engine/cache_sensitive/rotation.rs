@@ -317,6 +317,29 @@ pub(crate) fn interface_output_filter_has_per_packet_l4_match(
     filter.is_some_and(|filter| filter.has_per_packet_l4_match_terms)
 }
 
+/// #6236 PR-2C: single-lookup fold of the #1430 DSCP + #2362 per-packet-L4
+/// INPUT-filter "verdict varies per packet" gate. Reads
+/// `Filter::varies_per_packet_within_flow()` (the SOLE `has_dscp_match_terms ||
+/// has_per_packet_l4_match_terms` OR) off ONE `iface_filter_v{4,6}_fast.get(&
+/// ifindex)`, replacing the two separate lookups the folded session-hit re-eval
+/// gate (`afxdp/poll_descriptor/filter.rs`) used to pay
+/// (`interface_input_filter_has_dscp_match` + `..._has_per_packet_l4_match`).
+/// Equal by construction to the OR of those two per-flag accessors — which the
+/// flow-cache decline gate (`afxdp/flow_cache.rs`) still consults individually,
+/// keeping them live.
+pub(crate) fn interface_input_filter_varies_per_packet(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+) -> bool {
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex)
+    } else {
+        state.iface_filter_v4_fast.get(&ifindex)
+    };
+    filter.is_some_and(|filter| filter.varies_per_packet_within_flow())
+}
+
 #[cfg(test)]
 mod cache_sensitive_2400_tests {
     use super::super::super::super::*;
