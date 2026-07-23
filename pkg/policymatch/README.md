@@ -501,6 +501,30 @@ dataplane reference is `userspace-dp/src/policy.rs` (`note_skipped_frag_deny` /
 `apply_frag_deny_override` / `rule_is_skipped_frag_ambiguous_deny` /
 `has_l4_constrained_term`) pinned in `userspace-dp/src/policy_tests.rs` (#4569).
 
+## Unsupported tuple family (V4 src / V6 dst) — codex-182 A10-b02-C1
+
+`matchAddr` evaluates the source and destination address sides INDEPENDENTLY,
+so a query carrying an IPv4 source with an IPv6 destination could match a rule
+per-side and yield a concrete permit/deny/default verdict for a packet shape the
+forwarding path never produces. NAT46 is not implemented, so no inbound
+translation yields a v4 source with a v6 destination, and the runtime matcher
+fails that arm closed (`userspace-dp/src/policy.rs` `try_match_rule` `_ =>
+return false`). The reverse (V6 src, V4 dst) tuple IS valid — it is the NAT64
+arm — and every same-family tuple is normal.
+
+`Match` therefore rejects the impossible tuple up front, at the single shared
+entry point every transport (CLI, REST, gRPC `MatchPolicies`) funnels through,
+so the fix covers all three without per-surface logic. When the source is IPv4
+and the destination is IPv6 (both sides specified — a nil/unspecified side is a
+wildcard and never triggers the gate), it returns a first-class
+`Result.UnsupportedTupleFamily` verdict: `Matched`/`DefaultUsed`/
+`HostInboundUnmatched`/`ContentRejected` are all false, `Action` is the
+conservative `PolicyDeny` for a raw reader, and `DisplayAction` renders the
+dedicated `UnsupportedTupleFamilyActionString`. Family is read with `To4()`, the
+same convention the host-inbound `ipFamily` helper uses. The fail-on-revert
+artifact is `mixed_family_tuple_5720_test.go`: dropping the gate makes the
+(V4 src, V6 dst) query fall through to a fabricated default verdict.
+
 ## Not modeled
 
 Scheduler-driven policy `inactive` state is not applied — a scheduled policy is

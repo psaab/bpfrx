@@ -627,6 +627,21 @@ type Result struct {
 	ContentRejected         bool
 	ContentRejectionReasons []string
 
+	// UnsupportedTupleFamily is true when the query carries an
+	// IPv4-source / IPv6-destination tuple (codex-182 A10-b02-C1). The
+	// forwarding path never produces that tuple — NAT46 is not supported, so
+	// no inbound translation yields a v4 source with a v6 destination — and the
+	// runtime matcher fails it closed (userspace-dp/src/policy.rs try_match_rule
+	// rejects the (V4 src, V6 dst) arm). The reverse V6-source / V4-destination
+	// tuple IS valid (it is the NAT64 arm) and is evaluated normally. Before
+	// this gate the simulator evaluated the two address sides independently and
+	// could return a concrete permit/deny/default verdict for a packet shape
+	// the runtime can never see. When set, Matched / DefaultUsed /
+	// HostInboundUnmatched / ContentRejected are all false and Action is the
+	// conservative PolicyDeny for a raw reader; DisplayAction renders the
+	// dedicated UnsupportedTupleFamilyActionString.
+	UnsupportedTupleFamily bool
+
 	// HostInboundUnmatched is true ONLY for a `to-zone junos-host` query that
 	// matched no host-bound policy (#3285). The dataplane host gate
 	// (evaluate_junos_host_policy) returns None here — no security *policy*
@@ -903,6 +918,8 @@ const ContentRejectedShowLine = "policy content rejected: the dataplane fails th
 //   - concrete policy match -> "<action>"
 func (r Result) DisplayAction() string {
 	switch {
+	case r.UnsupportedTupleFamily:
+		return UnsupportedTupleFamilyActionString
 	case r.ContentRejected:
 		return ContentRejectedActionString
 	case r.HostInboundUnmatched:
@@ -913,6 +930,13 @@ func (r Result) DisplayAction() string {
 		return ActionString(r.Action)
 	}
 }
+
+// UnsupportedTupleFamilyActionString is the operator-facing verdict rendered
+// for a query whose source is IPv4 and destination is IPv6 (codex-182
+// A10-b02-C1). NAT46 is not supported, so no forwarding path ever produces this
+// tuple and the runtime matcher fails it closed; the simulator reports that
+// rather than a fabricated per-side verdict.
+const UnsupportedTupleFamilyActionString = "unsupported tuple: an IPv4 source with an IPv6 destination has no supported translation (NAT46 is not implemented), so the forwarding path never produces it and the runtime matcher fails closed — no simulated permit/deny/default verdict applies"
 
 // Match runs the simulator against the active config and returns the verdict
 // with the SAME precedence the runtime enforces (userspace-dp/src/policy.rs
@@ -931,6 +955,22 @@ func (r Result) DisplayAction() string {
 // path (matchJunosHost, #3285): exact ingress->junos-host then
 // `from-zone any`->junos-host, with NO global/default transit fallback.
 func Match(cfg *config.Config, q Query) (res Result) {
+	// codex-182 A10-b02-C1: an IPv4 source with an IPv6 destination is a tuple
+	// the forwarding path never produces — NAT46 is unsupported, so no inbound
+	// translation yields a v4 source with a v6 destination — and the runtime
+	// matcher fails it closed (userspace-dp/src/policy.rs try_match_rule rejects
+	// the (V4 src, V6 dst) arm). matchAddr evaluates the two address sides
+	// INDEPENDENTLY below, so without this gate the simulator could return a
+	// concrete permit/deny/default verdict for a packet shape the runtime can
+	// never see. Reject it up front — this single shared entry point serves
+	// every transport (CLI, REST, gRPC MatchPolicies), so the fix covers all
+	// three. Both sides must be specified; the reverse (V6 src, V4 dst) NAT64
+	// arm and every same-family tuple fall through unchanged. Family is read
+	// with To4() to match the ipFamily helper the host-inbound path already
+	// uses.
+	if q.SrcIP != nil && q.DstIP != nil && q.SrcIP.To4() != nil && q.DstIP.To4() == nil {
+		return Result{UnsupportedTupleFamily: true, Action: config.PolicyDeny}
+	}
 	// #4373 (E4/H2/H7): a TRANSIT destination that is multicast / broadcast /
 	// unspecified / loopback is dropped by the forwarding path at ROUTE LOOKUP,
 	// before the policy engine runs, so any permit/deny verdict below (and a
