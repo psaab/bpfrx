@@ -30,6 +30,7 @@ import (
 	"testing"
 
 	gnft "github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	xnft "github.com/psaab/xpf/pkg/nftables"
@@ -76,20 +77,13 @@ func runNftNetlinkParityInner(t *testing.T) {
 	t.Run("host_inbound", func(t *testing.T) {
 		oracle := buildHostInboundFilterPayload(views, unzonedV4, unzonedV6, programs, wg)
 		spec := toNftHostInboundSpec(views, unzonedV4, unzonedV6, programs, wg)
+		// parityCheck compares the nft-text dump AND the PER-RULE iifname scope
+		// (read byte-for-byte via netlink, since google/nftables v0.3.0 renders
+		// anonymous string-set elements empty in `nft list`, so the TEXT cannot
+		// carry the iifname scope). The per-rule comparison — not a global union —
+		// is what catches a scope move/widen between the narrow IKE/ident exemption
+		// and the broad zone deny (#6405 FIX-2).
 		parityCheck(t, xnft.HostInboundTableName, oracle, func() error { return inst.InstallHostInbound(spec) })
-
-		// The junos-host iifname SET (`iifname { ge-0-0-2, ge-0-0-2.50 }`) is an
-		// anonymous string-keyed set; google/nftables v0.3.0 does not emit the
-		// NFTA_SET_USERDATA that nft's `list` uses to render such elements, so nft
-		// renders it `{ "", "" }` even though the stored 16-byte ifname keys are
-		// byte-identical to nft's own (verified below). The interface names are
-		// canonicalized out of the TEXT diff (normalizeNftDump), so this asserts the
-		// actual iifname SCOPE (the fail-open surface) directly against the kernel.
-		if err := inst.InstallHostInbound(spec); err != nil {
-			t.Fatalf("host-inbound re-install for iifname check: %v", err)
-		}
-		assertNetlinkIifnameSet(t, xnft.HostInboundTableName, []string{"ge-0-0-2", "ge-0-0-2.50"})
-		nftDeleteTableBestEffort(xnft.HostInboundTableName)
 	})
 
 	t.Run("cold_boot_fence", func(t *testing.T) {
@@ -113,6 +107,43 @@ func runNftNetlinkParityInner(t *testing.T) {
 		parityCheck(t, xnft.Lo0TableName, oracle, func() error { return inst.InstallLo0(spec) })
 	})
 
+	t.Run("lo0_unrepresentable_port_fails_closed", func(t *testing.T) {
+		// #6405 FIX-1: a port token nft cannot resolve (not numeric, not a service
+		// name). BOTH sides must FAIL CLOSED: the oracle emits the raw token and
+		// `nft -f -` REJECTS the whole ruleset (prior ruleset retained); the netlink
+		// build must likewise error (InstallLo0 != nil) and leave NO partial table —
+		// never drop the predicate and widen the accept to match-all.
+		badCfg := &config.Config{}
+		badCfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+			"badf": {Terms: []*config.FirewallFilterTerm{
+				{Name: "bad-port", Protocols: []string{"tcp"}, DestinationPorts: []string{"definitely-not-a-service"}, Action: "accept"},
+			}},
+		}
+		nftDeleteTableBestEffort(xnft.Lo0TableName)
+
+		// Oracle side: nft must REJECT the unresolvable token.
+		oracle := buildLo0FilterPayload(badCfg, "badf", "")
+		cmd := exec.Command("nft", "-f", "-")
+		cmd.Stdin = strings.NewReader(oracle)
+		if out, err := cmd.CombinedOutput(); err == nil {
+			nftDeleteTableBestEffort(xnft.Lo0TableName)
+			t.Fatalf("oracle FAIL-CLOSED expected: nft ACCEPTED an unresolvable port token (fail-open):\n%s", oracle)
+		} else {
+			t.Logf("oracle correctly rejected the unresolvable port: %s", strings.TrimSpace(string(out)))
+		}
+
+		// Netlink side: InstallLo0 must ERROR and install nothing.
+		spec := toNftLo0Spec(badCfg, "badf", "")
+		if err := inst.InstallLo0(spec); err == nil {
+			nftDeleteTableBestEffort(xnft.Lo0TableName)
+			t.Fatal("netlink FAIL-CLOSED expected: InstallLo0 returned nil on an unresolvable port token (fail-open: the accept widened to match-all)")
+		}
+		if out, err := exec.Command("nft", "list", "table", "inet", xnft.Lo0TableName).CombinedOutput(); err == nil {
+			nftDeleteTableBestEffort(xnft.Lo0TableName)
+			t.Fatalf("netlink left a PARTIAL ruleset after a fail-closed build (should have installed nothing):\n%s", out)
+		}
+	})
+
 	// Mutation-sensitivity against the REAL oracle: each fail-open class must make
 	// the netlink dump DIVERGE from the oracle dump — proving the gate catches a
 	// fail-open rather than passing vacuously (§12.1).
@@ -125,12 +156,22 @@ func runNftNetlinkParityInner(t *testing.T) {
 		{"dropped_saddr_except_subtraction", func(s *xnft.HostInboundSpec) { s.Programs[0].RulesV4[0].PermitSubtract = nil }},
 		{"weakened_verdict_zone_opened_all", func(s *xnft.HostInboundSpec) { s.Views[0].SystemServices = []string{"all"} }},
 		{"dropped_unzoned_deny", func(s *xnft.HostInboundSpec) { s.UnzonedV4 = nil; s.UnzonedV6 = nil }},
+		// FIX-2: widen the narrow IKE exemption to also cover ge-0-0-2.80 — an
+		// interface ALREADY in the broad zone-deny IngressIfnames, so the global
+		// iifname UNION is unchanged and the TEXT diff is blind (anonymous ifname
+		// sets render empty). Only the PER-RULE iifname comparison catches it. If
+		// the parity used a union (the pre-fix blind spot) this mutation would pass
+		// vacuously — a real IKE-exemption widening merged undetected.
+		{"iifname_ike_exemption_widened", func(s *xnft.HostInboundSpec) {
+			s.Programs[0].IKEExemptNetdevs = []string{"ge-0-0-2", "ge-0-0-2.50", "ge-0-0-2.80"}
+		}},
 	}
 	for _, mc := range mutations {
 		t.Run("mutation_"+mc.name+"_diverges", func(t *testing.T) {
 			nftDeleteTableBestEffort(xnft.HostInboundTableName)
 			nftLoad(t, oracle)
 			dumpOracle := nftListNormalized(t, xnft.HostInboundTableName)
+			iifOracle := iifnameScopeByRule(t, xnft.HostInboundTableName)
 			nftDeleteTableBestEffort(xnft.HostInboundTableName)
 
 			mutated := toNftHostInboundSpec(views, unzonedV4, unzonedV6, programs, wg)
@@ -139,13 +180,60 @@ func runNftNetlinkParityInner(t *testing.T) {
 				t.Fatalf("mutated install failed: %v", err)
 			}
 			dumpMut := nftListNormalized(t, xnft.HostInboundTableName)
+			iifMut := iifnameScopeByRule(t, xnft.HostInboundTableName)
 			nftDeleteTableBestEffort(xnft.HostInboundTableName)
-			if dumpOracle == dumpMut {
-				t.Errorf("mutation %q NOT detected: netlink dump identical to the oracle — the parity gate is vacuous", mc.name)
+			// A mutation is DETECTED if EITHER the nft-text dump OR the per-rule
+			// iifname scope diverges. The iifname-widening class is text-invisible,
+			// so it relies entirely on the per-rule comparison.
+			if dumpOracle == dumpMut && iifScopesEqual(iifOracle, iifMut) {
+				t.Errorf("mutation %q NOT detected: netlink dump AND per-rule iifname scope identical "+
+					"to the oracle — the parity gate is vacuous", mc.name)
 			}
 		})
 	}
+
+	// Dropped-counter mutation (README §"dropped counter"): a rule that silently
+	// loses its named deny counter is a metric-blindness fail-open (the #3361
+	// scraper stops seeing the deny). It MUST survive normalizeNftDump so the
+	// parity gate catches it. Strip ONE `counter name "..."` reference from the
+	// oracle payload and assert the normalized dumps DIVERGE — proving the gate's
+	// dump+normalize step is counter-sensitive. (The netlink builder's structural
+	// counter emission is pinned bit-identically by the host_inbound parity check
+	// above and the kernel counter-readback test, so netlink==oracle-with-counter
+	// != oracle-without-counter; a netlink build that dropped a counter would fail
+	// the gate.)
+	t.Run("mutation_dropped_counter_diverges", func(t *testing.T) {
+		dropped, ok := stripOneCounterRef(oracle)
+		if !ok {
+			t.Fatal("expected the host-inbound oracle payload to contain a `counter name` reference to drop")
+		}
+		nftDeleteTableBestEffort(xnft.HostInboundTableName)
+		nftLoad(t, oracle)
+		dumpFull := nftListNormalized(t, xnft.HostInboundTableName)
+		nftDeleteTableBestEffort(xnft.HostInboundTableName)
+
+		nftLoad(t, dropped)
+		dumpDropped := nftListNormalized(t, xnft.HostInboundTableName)
+		nftDeleteTableBestEffort(xnft.HostInboundTableName)
+		if dumpFull == dumpDropped {
+			t.Error("dropped-counter NOT detected: normalizeNftDump collapsed a removed `counter name` — " +
+				"the parity gate would miss a metric-blindness fail-open")
+		}
+	})
 }
+
+// stripOneCounterRef removes the FIRST `counter name "<n>"` reference from an nft
+// payload (leaving the `counter <n> {}` object declaration and the rule's
+// verdict), modeling a rule that silently loses its named deny counter.
+func stripOneCounterRef(payload string) (string, bool) {
+	loc := counterRefRe.FindStringIndex(payload)
+	if loc == nil {
+		return payload, false
+	}
+	return payload[:loc[0]] + payload[loc[1]:], true
+}
+
+var counterRefRe = regexp.MustCompile(`counter name "[^"]*" `)
 
 // --- parity mechanics -------------------------------------------------------
 
@@ -154,17 +242,28 @@ func parityCheck(t *testing.T, table, oracleText string, install func() error) {
 	nftDeleteTableBestEffort(table)
 	nftLoad(t, oracleText)
 	dumpOracle := nftListNormalized(t, table)
+	iifOracle := iifnameScopeByRule(t, table)
 	nftDeleteTableBestEffort(table)
 
 	if err := install(); err != nil {
 		t.Fatalf("netlink install failed: %v", err)
 	}
 	dumpNetlink := nftListNormalized(t, table)
+	iifNetlink := iifnameScopeByRule(t, table)
 	nftDeleteTableBestEffort(table)
 
 	if dumpOracle != dumpNetlink {
 		t.Errorf("RULESET PARITY DIFF for %s (netlink diverged from the exec-nft oracle):\n"+
 			"--- oracle (nft -f -) ---\n%s\n--- netlink ---\n%s", table, dumpOracle, dumpNetlink)
+	}
+	// Per-rule iifname scope parity: the nft TEXT renders anonymous ifname-set
+	// elements empty (google/nftables v0.3.0), so the byte-level scope is compared
+	// PER RULE via netlink — a scope move/widen between two rules (an IKE/ident
+	// per-interface exemption vs the broad zone deny) that preserves the global
+	// union is caught here, not by the text diff or a union (#6405 FIX-2).
+	if !iifScopesEqual(iifOracle, iifNetlink) {
+		t.Errorf("IIFNAME PER-RULE SCOPE DIFF for %s (netlink diverged from the exec-nft oracle):\n"+
+			"--- oracle per-rule iifname ---\n%v\n--- netlink ---\n%v", table, iifOracle, iifNetlink)
 	}
 }
 
@@ -231,21 +330,27 @@ func sortBraceSet(set string) string {
 	return "{ " + strings.Join(parts, ", ") + " }"
 }
 
-// assertNetlinkIifnameSet reads the netlink-installed table's anonymous
-// ifname-typed sets and asserts the UNION of their decoded interface names
-// equals want — a direct byte-level check of the junos-host iifname scope (the
-// fail-open surface the cosmetic nft-list rendering gap would otherwise hide).
-func assertNetlinkIifnameSet(t *testing.T, table string, want []string) {
+// iifnameScopeByRule reads a table's `input` chain rules IN ORDER and returns,
+// for each rule, the sorted set of interface names its `iifname` predicate
+// scopes ("" when the rule has no iifname match). Both the single `iifname "x"`
+// (Meta+Cmp) and the anonymous `iifname { .. }` (Meta+Lookup) forms are decoded
+// byte-for-byte via netlink, because google/nftables v0.3.0 renders anonymous
+// string-set ELEMENTS empty in `nft list` — so the nft TEXT cannot carry the
+// scope, and a per-rule widen/move between two rules is invisible to both the
+// text diff and a global union. Reading the kernel PER RULE turns that widen
+// into a per-rule diff (#6405 FIX-2).
+func iifnameScopeByRule(t *testing.T, table string) []string {
 	t.Helper()
 	c, err := gnft.New()
 	if err != nil {
 		t.Fatalf("nftables conn: %v", err)
 	}
-	sets, err := c.GetSets(&gnft.Table{Family: gnft.TableFamilyINet, Name: table})
+	tbl := &gnft.Table{Family: gnft.TableFamilyINet, Name: table}
+	setNames := map[string][]string{}
+	sets, err := c.GetSets(tbl)
 	if err != nil {
 		t.Fatalf("GetSets(%s): %v", table, err)
 	}
-	got := map[string]bool{}
 	for _, s := range sets {
 		if s.KeyType.Name != "ifname" {
 			continue
@@ -254,23 +359,68 @@ func assertNetlinkIifnameSet(t *testing.T, table string, want []string) {
 		if err != nil {
 			t.Fatalf("GetSetElements: %v", err)
 		}
+		names := make([]string, 0, len(els))
 		for _, e := range els {
-			got[string(bytesTrimRightZero(e.Key))] = true
+			names = append(names, string(bytesTrimRightZero(e.Key)))
+		}
+		setNames[s.Name] = names
+	}
+	rules, err := c.GetRules(tbl, &gnft.Chain{Name: "input", Table: tbl})
+	if err != nil {
+		t.Fatalf("GetRules(%s): %v", table, err)
+	}
+	out := make([]string, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, ruleIifnameScope(r, setNames))
+	}
+	return out
+}
+
+// ruleIifnameScope decodes one rule's iifname scope: the name(s) compared right
+// after a `meta iifname` load, whether a single Cmp or an anonymous set Lookup.
+func ruleIifnameScope(r *gnft.Rule, setNames map[string][]string) string {
+	var names []string
+	pending := false
+	var reg uint32
+	for _, e := range r.Exprs {
+		switch x := e.(type) {
+		case *expr.Meta:
+			if x.Key == expr.MetaKeyIIFNAME {
+				pending, reg = true, x.Register
+				continue
+			}
+			pending = false
+		case *expr.Cmp:
+			if pending && x.Register == reg {
+				names = append(names, string(bytesTrimRightZero(x.Data)))
+			}
+			pending = false
+		case *expr.Lookup:
+			if pending && x.SourceRegister == reg {
+				names = append(names, setNames[x.SetName]...)
+			}
+			pending = false
+		default:
+			pending = false
 		}
 	}
-	wantSet := map[string]bool{}
-	for _, w := range want {
-		wantSet[w] = true
+	sort.Strings(names)
+	return strings.Join(names, ",")
+}
+
+// iifScopesEqual compares two per-rule iifname-scope lists index-by-index (NOT
+// as a union) so a scope move/widen between rules that preserves the global
+// union is still detected (#6405 FIX-2).
+func iifScopesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	if len(got) != len(wantSet) {
-		t.Errorf("iifname set membership: got %v, want %v", keysOf(got), want)
-		return
-	}
-	for w := range wantSet {
-		if !got[w] {
-			t.Errorf("iifname set missing %q; got %v", w, keysOf(got))
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
+	return true
 }
 
 func bytesTrimRightZero(b []byte) []byte {
@@ -279,15 +429,6 @@ func bytesTrimRightZero(b []byte) []byte {
 		i--
 	}
 	return b[:i]
-}
-
-func keysOf(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // --- converters (daemon/dpuserspace -> pkg/nftables spec) -------------------
@@ -432,12 +573,16 @@ func parityHostInboundInputs() (views []dpuserspace.ZoneHostInboundView, unzoned
 	programs = []dpuserspace.JunosHostProgram{
 		{
 			Zone:                  "untrust",
-			IngressIfnames:        []string{"ge-0-0-2", "ge-0-0-2.50"},
+			IngressIfnames:        []string{"ge-0-0-2", "ge-0-0-2.50", "ge-0-0-2.80"},
 			HasApplicationAnyDeny: true,
 			CoarseAdmitsIKE:       true,
 			CoarseIdentResets:     true,
-			IKEExemptNetdevs:      []string{"ge-0-0-2"},
-			IdentResetNetdevs:     []string{"ge-0-0-2"},
+			// IKE exemption is a per-interface SUBSET of the zone deny scope (a
+			// 2-member anonymous set). The #6405 FIX-2 mutation widens it to also
+			// cover ge-0-0-2.80 — already in IngressIfnames, so the global iifname
+			// UNION is unchanged; only the PER-RULE parity check catches the widen.
+			IKEExemptNetdevs:  []string{"ge-0-0-2", "ge-0-0-2.50"},
+			IdentResetNetdevs: []string{"ge-0-0-2"},
 			RulesV4: []config.JunosHostDenyRule{
 				{Family: "ip", Src: []string{"192.0.2.0/24", "198.51.100.7"}, PermitSubtract: []string{"192.0.2.10"}},
 				{Family: "ip", SrcExcluded: true, Src: []string{"203.0.113.0/24"}, L4: []config.JunosHostDenyL4{{Proto: config.HostInboundProtoTCP, Ports: []config.PortRange{{Lo: 22, Hi: 22}}}}},
@@ -456,6 +601,11 @@ func parityLo0Config() *config.Config {
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
 		"lo0f": {Terms: []*config.FirewallFilterTerm{
 			{Name: "ssh-in", SourceAddresses: []string{"10.0.0.0/8"}, DestAddresses: []string{"10.0.1.1"}, Protocols: []string{"tcp"}, DestinationPorts: []string{"22"}, Count: "ssh_hits", Action: "accept"},
+			// #6405 FIX-1: a NAMED destination port. The oracle emits the raw
+			// `th dport ssh`; nft resolves it via /etc/services -> 22. The netlink
+			// build must resolve it to the SAME number (config.ResolveFilterPortRange)
+			// and produce bit-identical kernel state — never drop the predicate.
+			{Name: "named-svc", Protocols: []string{"tcp"}, DestinationPorts: []string{"ssh"}, Action: "accept"},
 			{Name: "range-drop", SourcePorts: []string{"1024", "2048"}, DestinationPorts: []string{"33434-33523"}, DSCPs: []string{"ef"}, Log: true, Action: "discard"},
 			{Name: "reject-term", DestPortsExcept: []string{"80", "443"}, ICMPTypes: []int{3}, ICMPCodes: []int{4}, IsFragment: true, Action: "reject"},
 			{Name: "syn-only", TCPFlags: []string{"syn", "&", "!ack"}, Action: "accept"},
@@ -474,3 +624,21 @@ func parityLo0Config() *config.Config {
 }
 
 func ptrU8(v uint8) *uint8 { return &v }
+
+// TestIifnameScopePerRuleVsUnion is the no-kernel parent-RED for #6405 FIX-2: it
+// proves the PER-RULE iifname comparison catches a scope widen that a global
+// UNION misses. Reverting iifScopesEqual to a union comparison turns this RED.
+func TestIifnameScopePerRuleVsUnion(t *testing.T) {
+	// rule0 = narrow IKE exemption, rule1 = broad zone deny. The widened variant
+	// moves ge-0-0-2.50 into rule0's exemption (a real fail-open) while keeping
+	// the GLOBAL union {ge-0-0-2, ge-0-0-2.50} identical — a union check is blind.
+	oracle := []string{"ge-0-0-2", "ge-0-0-2,ge-0-0-2.50"}
+	widened := []string{"ge-0-0-2,ge-0-0-2.50", "ge-0-0-2,ge-0-0-2.50"}
+	if iifScopesEqual(oracle, widened) {
+		t.Error("per-rule iifname comparison must DETECT a widen that preserves the global union " +
+			"(a union check would pass it vacuously)")
+	}
+	if !iifScopesEqual(oracle, []string{"ge-0-0-2", "ge-0-0-2,ge-0-0-2.50"}) {
+		t.Error("identical per-rule iifname scopes must compare equal")
+	}
+}

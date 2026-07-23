@@ -54,10 +54,19 @@ host path. Three test layers pin this:
   private netns (self-isolated via `unshare -rn` re-exec so a forked `nft`
   shares it and the host ruleset is never touched), dumps `nft list table`
   of both, normalizes (strip handles, sort set elements, but NEVER reorder
-  rules) and DIFFS. Mutation-sensitivity sub-cases (widened set, dropped
-  `saddr !=`, weakened verdict, dropped counter) assert the netlink dump
-  DIVERGES from the oracle. **Runs where `nft` exists; SKIPs with a logged
-  reason otherwise** (no silent caps).
+  rules) and DIFFS. It ALSO compares the PER-RULE `iifname` scope read
+  byte-for-byte via netlink (`iifnameScopeByRule`) — NOT a global union —
+  because google/nftables v0.3.0 renders anonymous string-set elements
+  empty in `nft list`, so a scope move/widen between a narrow IKE/ident
+  per-interface exemption and the broad zone deny that preserves the union
+  is invisible to the text diff and a union check (#6405). Mutation-
+  sensitivity sub-cases (widened daddr, dropped `saddr !=`, weakened
+  verdict, dropped unzoned deny, dropped counter, and an iifname
+  exemption-widen that preserves the global union) assert the netlink dump
+  or per-rule iifname scope DIVERGES from the oracle. A dedicated
+  `lo0_unrepresentable_port_fails_closed` sub-case asserts BOTH sides fail
+  CLOSED on a port token nft cannot resolve. **Runs where `nft` exists;
+  SKIPs with a logged reason otherwise** (no silent caps).
 - **T1b golden expr** (`netlink_golden_test.go`): per-construct
   `[]expr.Any` asserted against goldens DERIVED FROM nft-text semantics
   (netfilter constant values), never captured from the builder (the
@@ -113,6 +122,17 @@ those types into the self-contained spec structs in `netlink_spec.go`.
   `NFTA_SET_USERDATA` nft's `list` uses to render string-typed anonymous
   sets, so `nft list` shows `{ "", "" }`. The scope is still enforced
   correctly (verified) — the T1 parity test canonicalizes the iifname-set
-  text and asserts membership by decoded element bytes instead.
+  text and compares the decoded element bytes PER RULE (`iifnameScopeByRule`),
+  NOT as a global union: a scope move/widen between the narrow IKE/ident
+  per-interface exemption and the broad zone deny that preserves the union
+  is a fail-open a union check misses (#6405).
+- lo0 filter ports and DSCP are RESOLVED numerically at build time via the
+  same SSOT the compile path uses (`config.ResolveFilterPortRange`,
+  `dataplane.DSCPValues`) — the same resolution nft applies to the raw
+  token the oracle emits (`ssh` -> 22). A token that cannot be represented
+  numerically FAILS the build CLOSED (`parsePortTokens`/`lo0DSCPs` error ->
+  `nlPlan.fail` -> the install aborts, prior ruleset retained), mirroring
+  the oracle whose raw token `nft -f -` rejects. NEVER drop the predicate
+  and widen a port/DSCP-constrained rule to match-all (the #6405 fail-open).
 - Table name `xpf_dp_rst`, family `INet` (covers both IPv4 and IPv6 in
   one table — don't split it without rethinking the atomic batch).

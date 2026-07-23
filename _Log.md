@@ -58929,3 +58929,32 @@ top.
   pkg/daemon/daemon_nft_netlink_parity_test.go, pkg/daemon/README.md;
   pkg/dataplane/retirement_boundary_canary_test.go;
   docs/pr/1373-retire-ebpf-dataplane/README.md; _Log.md
+
+- **Timestamp**: 2026-07-23
+- **Action**: #6405 (#6387 PR-2) security fixes — lo0 fail-open + parity
+  blind spots. FIX-1: netlink lo0 port/DSCP tokens now RESOLVE via the SSOT
+  (config.ResolveFilterPortRange, dataplane.DSCPValues; ssh->22) and FAIL
+  CLOSED (nlPlan.fail -> install aborts) on any unrepresentable token,
+  matching the nft oracle (raw token -> nft rejects -> prior ruleset
+  retained). Pre-fix parsePortTokens/lo0DSCPs DROPPED the predicate ->
+  a port/DSCP-constrained accept widened to match-all. Audited every builder
+  site: host-inbound service ports / WG dport / ESP/AH are numeric (safe);
+  protocols drop identically on both sides (parity, config-gated); DSCP had
+  the SAME omit bug (nftDSCPValue emits raw) and is now fixed too. FIX-2:
+  T1 parity compares PER-RULE iifname scope (iifnameScopeByRule, read via
+  netlink) instead of a global union, so an IKE-exemption widen that
+  preserves the union is caught. FIX-3: added a named-port lo0 term
+  (bit-identical), a fail-closed unrepresentable-port sub-case (oracle nft
+  rejects + netlink InstallLo0 errors + no partial table), an
+  iifname-exemption-widen mutation, and a dropped-counter mutation to the
+  real oracle-parity block; README mutation list corrected.
+- **Validation**: go build ./... + go vet clean; gofmt clean; nftables suite
+  green incl. new TestLo0PortResolveOrFailClosed (5 fail-closed + named
+  resolve); T1 parity RUN + PASS firsthand against real nft v1.1.6 (all
+  rulesets byte-identical, all 6 mutation classes + fail-closed detected);
+  parent-RED verified BOTH unit (revert to omit -> RED) and kernel (union
+  neutralize -> iifname mutation RED; omit neutralize -> fail-closed RED);
+  retirement canary green.
+- **File(s)**: pkg/nftables/netlink_lo0.go,
+  pkg/nftables/netlink_lo0_ports_test.go, pkg/nftables/README.md,
+  pkg/daemon/daemon_nft_netlink_parity_test.go; _Log.md

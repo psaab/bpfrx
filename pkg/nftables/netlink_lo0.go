@@ -10,6 +10,7 @@ package nftables
 // nftRulesFromTerm encodes, so a term lowers to the SAME 0/1/2 kernel rules.
 
 import (
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"strconv"
@@ -73,6 +74,22 @@ func buildLo0TermNetlink(p *nlPlan, t Lo0FilterTerm, f nlFamily) {
 			tcpFailClosed = true
 		}
 	}
+	// addPorts resolves one port-token list and appends its transport-port match.
+	// An unrepresentable token FAILS the plan CLOSED (a.p.fail), exactly as the
+	// nft oracle does: the oracle emits the raw token and `nft -f -` REJECTS it,
+	// retaining the prior ruleset — so the netlink build must abort the install
+	// rather than DROP the predicate and widen a port-constrained rule to
+	// match-all (the #6405 fail-open).
+	addPorts := func(a *ruleAsm, tokens []string, dir string, except bool) {
+		ports, err := parsePortTokens(tokens)
+		if err != nil {
+			a.p.fail(fmt.Errorf("lo0 filter term %q %s (except=%t): %w", t.Name, dir, except, err))
+			return
+		}
+		if len(ports) > 0 {
+			a.thPort(dir, ports, except)
+		}
+	}
 	applyMatches := func(a *ruleAsm) {
 		if len(srcAddrs) > 0 {
 			a.saddr(f, srcAddrs, t.SrcExcept)
@@ -83,20 +100,20 @@ func buildLo0TermNetlink(p *nlPlan, t Lo0FilterTerm, f nlFamily) {
 		if protos := lo0Protocols(t.Protocols); len(protos) > 0 {
 			a.l4protoSet(protos)
 		}
-		if ports, ok := parsePortTokens(t.SourcePorts); ok && len(ports) > 0 {
-			a.thPort("sport", ports, false)
-		}
-		if ports, ok := parsePortTokens(t.DestinationPorts); ok && len(ports) > 0 {
-			a.thPort("dport", ports, false)
-		}
-		if ports, ok := parsePortTokens(t.SourcePortsExcept); ok && len(ports) > 0 {
-			a.thPort("sport", ports, true)
-		}
-		if ports, ok := parsePortTokens(t.DestPortsExcept); ok && len(ports) > 0 {
-			a.thPort("dport", ports, true)
-		}
-		if dscps := lo0DSCPs(t.DSCPs); len(dscps) > 0 {
-			a.dscp(f, dscps)
+		addPorts(a, t.SourcePorts, "sport", false)
+		addPorts(a, t.DestinationPorts, "dport", false)
+		addPorts(a, t.SourcePortsExcept, "sport", true)
+		addPorts(a, t.DestPortsExcept, "dport", true)
+		if len(t.DSCPs) > 0 {
+			// DSCP mirrors the port path: nftDSCPValue emits the raw token on an
+			// unresolvable name (nft then rejects -> fail closed), so dropping the
+			// predicate here would widen the match. Fail the plan closed instead.
+			dscps, err := lo0DSCPs(t.DSCPs)
+			if err != nil {
+				a.p.fail(fmt.Errorf("lo0 filter term %q dscp: %w", t.Name, err))
+			} else if len(dscps) > 0 {
+				a.dscp(f, dscps)
+			}
 		}
 		if len(t.ICMPTypes) > 0 {
 			a.icmpType(f, intsToU8(t.ICMPTypes))
@@ -244,8 +261,12 @@ func lo0Protocols(tokens []string) []uint8 {
 }
 
 // lo0DSCPs mirrors nftDSCPValue: resolve each DSCP token to a numeric codepoint
-// via the shared dataplane.DSCPValues SSOT, or a bare numeric 0..63.
-func lo0DSCPs(tokens []string) []uint8 {
+// via the shared dataplane.DSCPValues SSOT, or a bare numeric 0..63. An
+// unresolvable token returns a non-nil error so the caller FAILS CLOSED — the
+// oracle's nftDSCPValue emits the raw token, which `nft -f -` then rejects
+// (prior ruleset retained), so silently dropping the predicate here would widen
+// the match (a fail-open, the same class as the #6405 port bug).
+func lo0DSCPs(tokens []string) ([]uint8, error) {
 	out := make([]uint8, 0, len(tokens))
 	for _, tok := range tokens {
 		key := strings.ToLower(strings.TrimSpace(tok))
@@ -257,40 +278,36 @@ func lo0DSCPs(tokens []string) []uint8 {
 			out = append(out, uint8(v))
 			continue
 		}
-		slog.Warn("dropping unresolvable dscp from lo0 netlink term", "dscp", tok)
+		return nil, fmt.Errorf("unrepresentable dscp token %q (fail closed to match the nft oracle, which rejects it)", tok)
 	}
-	return out
+	return out, nil
 }
 
-// parsePortTokens parses lo0 filter port strings ("22", "1024-2048") into
-// nlPort. ok is false if any token is unparseable (mirrors the oracle emitting
-// the raw token; the netlink path cannot render a named port, so it drops the
-// whole port predicate rather than a partial one).
-func parsePortTokens(tokens []string) ([]nlPort, bool) {
+// parsePortTokens resolves lo0 filter port tokens ("22", "ssh", "1024-2048")
+// into numeric [lo,hi] ranges via config.ResolveFilterPortRange — the SAME SSOT
+// the compile path and the kernel filter-based-forwarding mirror use, and the
+// same numeric resolution nft applies to the raw token the oracle emits (a
+// /etc/services-style name like `ssh` -> 22).
+//
+// A token that cannot be represented numerically (an unknown service name, a
+// malformed range) returns a non-nil error so the caller FAILS CLOSED: the
+// oracle emits the raw token and `nft -f -` REJECTS it, so the prior ruleset is
+// retained. The netlink build MUST likewise abort the install rather than DROP
+// the whole port predicate and widen a port-constrained rule to match ALL ports
+// (the #6405 host-inbound fail-open). An empty token list yields no predicate.
+func parsePortTokens(tokens []string) ([]nlPort, error) {
 	if len(tokens) == 0 {
-		return nil, true
+		return nil, nil
 	}
 	out := make([]nlPort, 0, len(tokens))
 	for _, tok := range tokens {
-		tok = strings.TrimSpace(tok)
-		if lo, hi, ok := strings.Cut(tok, "-"); ok {
-			l, err1 := strconv.Atoi(lo)
-			h, err2 := strconv.Atoi(hi)
-			if err1 != nil || err2 != nil || l < 0 || h > 0xffff || l > h {
-				slog.Warn("dropping unparseable lo0 port range", "token", tok)
-				return nil, false
-			}
-			out = append(out, nlPort{lo: uint16(l), hi: uint16(h)})
-			continue
+		lo, hi, ok := config.ResolveFilterPortRange(strings.TrimSpace(tok))
+		if !ok {
+			return nil, fmt.Errorf("unrepresentable port token %q (fail closed to match the nft oracle, which rejects it)", tok)
 		}
-		v, err := strconv.Atoi(tok)
-		if err != nil || v < 0 || v > 0xffff {
-			slog.Warn("dropping unparseable lo0 port", "token", tok)
-			return nil, false
-		}
-		out = append(out, nlPort{lo: uint16(v), hi: uint16(v)})
+		out = append(out, nlPort{lo: lo, hi: hi})
 	}
-	return out, true
+	return out, nil
 }
 
 // nftLo0LogPrefix mirrors nftLo0LogPrefix in the oracle: `xpf-lo0 <term>: `,
