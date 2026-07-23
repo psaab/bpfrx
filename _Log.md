@@ -59245,3 +59245,24 @@ top.
     (`ping -s = "1048576", want clamped "65507"`).
   - **File(s)**: pkg/cli/cli_request_ping.go, pkg/cli/cli_request_argv_test.go,
     pkg/diagcmd/diagcmd.go, pkg/cli/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  - **Action**: #6382 review fold — (1) MINOR 1 (overflow bypass): the
+    `strconv.Atoi` guard returned `ErrRange` for a digit token above the
+    platform int, skipping the clamp and letting `ping -s <huge>` run
+    unbounded. Reworked `buildPingArgv` to `strconv.ParseInt(..,10,64)`;
+    clamp when the value parses and `> MaxPingSize`, OR when it overflows
+    int64 (`errors.Is ErrRange`) on a non-negative literal. A leading '-'
+    overflow stays a huge negative the ping child rejects. Added
+    `TestBuildPingArgvClampsOverflowSize_6382` (fail-on-revert:
+    "99999999999999999999" → capped 65507). (2) MINOR 2 (≤0 divergence):
+    documented — NOT changed — that the console preserves an explicit
+    `-s 0`/`-s -1`/non-numeric token (raw operator input model) while the
+    structured-int REST/gRPC surfaces omit a non-positive size; only the
+    upper ceiling is shared. Locked with
+    `TestBuildPingArgvPreservesNonPositiveSize_6382`. Updated the fn doc
+    comment + `pkg/cli/README.md`. Parent-RED re-verified on the new head:
+    neutralizing the clamp fails BOTH ClampsSize + ClampsOverflowSize with
+    clean assertions; restored green.
+  - **File(s)**: pkg/cli/cli_request_ping.go, pkg/cli/cli_request_argv_test.go,
+    pkg/cli/README.md, _Log.md

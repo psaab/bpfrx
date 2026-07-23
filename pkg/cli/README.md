@@ -29,7 +29,14 @@ sibling files (same package, so unexported helpers stay reachable):
   builders (`buildPingArgv`, `buildTracerouteArgv`). `buildPingArgv`
   clamps the `-s` payload to `diagcmd.MaxPingSize` (#6382), so the local
   console shares the single ping-size ceiling the REST and gRPC surfaces
-  already enforce (#5250 A8-b1 F4).
+  already enforce (#5250 A8-b1 F4) — including a digit token that
+  overflows `int64` (that arm is why a naive `strconv.Atoi` guard would
+  leak the huge value). Because the console's input is a RAW operator
+  token (unlike the structured int the REST/gRPC surfaces receive, where
+  `0` means "unset"), it enforces ONLY the upper ceiling and
+  intentionally preserves an explicit `-s 0` / `-s -1` / non-numeric
+  token for the `ping` child to reject rather than dropping input the
+  operator typed.
 - `cli_request_testcmd.go` — `test policy` / `test routing` /
   `test security-zone` (the `policymatch` adapters).
 - `monitor_traffic.go` — `monitor` dispatch + `monitor traffic` tcpdump

@@ -152,6 +152,21 @@ func TestBuildPingArgvClampsSize_6382(t *testing.T) {
 	}
 }
 
+// TestBuildPingArgvClampsOverflowSize_6382 is the fail-on-revert guard for the
+// int64-overflow arm of the clamp (#6382, Codex MINOR 1). A digit token larger
+// than the widest integer type must STILL be capped to diagcmd.MaxPingSize — a
+// naive strconv.Atoi guard returns ErrRange for such a token, skips the clamp,
+// and hands `ping -s <huge>` the raw value, bypassing the very ceiling this
+// change adds. Neutralizing the clamp lets the huge token pass through.
+func TestBuildPingArgvClampsOverflowSize_6382(t *testing.T) {
+	argv := buildPingArgv("192.0.2.1", "5", "", "99999999999999999999", "")
+	got := pingArgvSize(argv)
+	want := fmt.Sprintf("%d", diagcmd.MaxPingSize)
+	if got != want {
+		t.Fatalf("ping -s = %q, want clamped %q (int64-overflow token must be capped)", got, want)
+	}
+}
+
 // TestBuildPingArgvKeepsInBoundSize_6382 confirms an in-range size token is
 // passed through untouched, and a non-numeric token is left for the ping child
 // to reject rather than being swallowed by the clamp.
@@ -161,6 +176,20 @@ func TestBuildPingArgvKeepsInBoundSize_6382(t *testing.T) {
 	}
 	if got := pingArgvSize(buildPingArgv("192.0.2.1", "5", "", "huge", "")); got != "huge" {
 		t.Fatalf("ping -s = %q, want \"huge\" (non-numeric size must reach ping unchanged)", got)
+	}
+}
+
+// TestBuildPingArgvPreservesNonPositiveSize_6382 locks the DOCUMENTED
+// divergence from the REST/gRPC surfaces (#6382, Codex MINOR 2): the console's
+// input model is a raw operator token, so an explicit `-s 0` / `-s -1` (and a
+// huge-negative overflow) is preserved for the ping child to reject rather than
+// omitted the way the structured-int siblings drop a non-positive size. Only
+// the upper MaxPingSize ceiling is enforced here.
+func TestBuildPingArgvPreservesNonPositiveSize_6382(t *testing.T) {
+	for _, tok := range []string{"0", "-1", "-99999999999999999999"} {
+		if got := pingArgvSize(buildPingArgv("192.0.2.1", "5", "", tok, "")); got != tok {
+			t.Fatalf("ping -s = %q, want %q preserved (console keeps explicit non-positive -s)", got, tok)
+		}
 	}
 }
 
