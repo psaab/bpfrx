@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"strings"
 	"sync"
@@ -377,6 +378,108 @@ func TestConfigSyncHealthTransientFailureWithinGraceNoFlap(t *testing.T) {
 	}
 	if after := runtime.NumGoroutine(); after > goroutinesBefore {
 		t.Fatalf("goroutine leak: before=%d after=%d", goroutinesBefore, after)
+	}
+}
+
+// TestConfigSyncHealthRaiseClearReorderSerialized is the RED-on-revert test for
+// the PR #6398 callback-reorder race. The grace-expiry timer raise and the
+// success clear both publish OnConfigApplyHealth; if the raise callback is
+// delivered OUTSIDE configApplyMu it can be preempted between deciding-to-raise
+// and delivering, so a concurrent success's clear(false) can land FIRST and the
+// late raise(true) overtakes it — leaving the Manager stuck
+// configSyncFailing=true after a SUCCESSFUL apply (the epoch guard only covers
+// decision-time staleness, not the two out-of-lock callback deliveries).
+//
+// The fix delivers every OnConfigApplyHealth publish while STILL HOLDING
+// configApplyMu, serializing raise vs clear. This test forces the exact hostile
+// interleaving deterministically using the callback itself as the seam: the
+// raise callback announces it is mid-delivery and then blocks, and the test only
+// releases it AFTER a concurrent success has had its chance to run.
+//
+//   - With the fix (callback under lock): the raise callback holds configApplyMu
+//     while blocked, so the success goroutine cannot acquire the lock and cannot
+//     clear early; once released, the raise publishes, the lock drops, and the
+//     success then clears LAST → final state cleared.
+//   - Without the fix (callback outside lock): the raise has already released the
+//     lock before delivering, so the success runs to completion and clears FIRST;
+//     the test then releases the late raise, which sets CF true LAST → final
+//     state stuck-true → RED.
+func TestConfigSyncHealthRaiseClearReorderSerialized(t *testing.T) {
+	const grace = 5 * time.Second
+	clk := &healthClk{}
+	clk.set(1_000_000_000)
+	af := &fakeAfterFunc{}
+
+	m := NewManager(0, 22)
+	m.UpdateConfig(makeConfig(makeRG(0, false, map[int]int{0: 200, 1: 100})))
+	flushClusterEvents(m)
+
+	s := NewSessionSync("127.0.0.1:0", "127.0.0.1:0", nil)
+	s.nowMonoFn = clk.now
+	s.configApplyFailGrace = grace
+	s.afterFuncFn = af.schedule
+
+	raiseDelivering := make(chan struct{}) // closed when the raise callback starts delivering
+	letRaiseFinish := make(chan struct{})  // closed by the test to release the blocked raise
+	var raiseOnce sync.Once
+	s.OnConfigApplyHealth = func(failing bool, reason string) {
+		if failing {
+			// The raise delivery — hold it open until the test says go, so a
+			// concurrent success clear has a chance to be reordered ahead of it.
+			raiseOnce.Do(func() {
+				close(raiseDelivering)
+				<-letRaiseFinish
+			})
+		}
+		m.SetConfigSyncHealth(failing, reason)
+	}
+
+	// (1) First failure arms the grace-expiry timer (no raise yet — elapsed 0).
+	s.noteConfigApplyFailure(errors.New("host-inbound apply failed: dependency missing"))
+	if calls, d := af.armed(); calls != 1 || d != grace {
+		t.Fatalf("grace-expiry timer must be armed once with the grace, got calls=%d d=%s", calls, d)
+	}
+	if mgrConfigSyncFailing(m) {
+		t.Fatal("CF must not raise before the grace elapses")
+	}
+
+	// (2) Grace elapses; fire the armed timer on its own goroutine. The raise
+	// callback blocks mid-delivery (raiseDelivering closed, waiting on letRaiseFinish).
+	clk.advance(grace + time.Second)
+	raiseReturned := make(chan struct{})
+	go func() {
+		af.fire()
+		close(raiseReturned)
+	}()
+	<-raiseDelivering
+
+	// (3) A successful apply runs concurrently while the raise is mid-delivery.
+	successDone := make(chan struct{})
+	go func() {
+		s.noteConfigApplySuccess()
+		close(successDone)
+	}()
+
+	// Give the success a chance to complete. Without the fix it runs to
+	// completion here (raise already released the lock) and clears CF first;
+	// with the fix it blocks on configApplyMu (held by the raise) and cannot.
+	select {
+	case <-successDone:
+		// Success cleared already — only reachable when the raise was delivered
+		// outside the lock (the bug). Releasing the raise now makes it overtake.
+	case <-time.After(250 * time.Millisecond):
+		// Success is blocked on the lock (the fix) — expected.
+	}
+
+	// (4) Release the blocked raise and let both callbacks settle.
+	close(letRaiseFinish)
+	<-successDone
+	<-raiseReturned
+
+	// The final state after a SUCCESSFUL apply must be cleared — a late raise
+	// must never be able to land after the clear.
+	if mgrConfigSyncFailing(m) {
+		t.Fatal("callback-reorder race: a late raise overtook the success clear — CF stuck raised after a successful apply")
 	}
 }
 

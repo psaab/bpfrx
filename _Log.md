@@ -58792,3 +58792,26 @@ top.
   **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
     pkg/cluster/sync_conn_config.go, pkg/cluster/sync_config_health_6387_test.go,
     docs/sync-protocol.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+  **Action**: #6387 PR-1 (PR #6398) review fix — callback-reorder race in the
+    config-sync CF monitor-failure signal. Both hostile reviewers (Codex +
+    independent) converged on the same defect: OnConfigApplyHealth was delivered
+    OUTSIDE configApplyMu in the timer-raise (fireConfigApplyGraceExpiry) and the
+    success-clear (noteConfigApplySuccess) paths, so a timer raise callback
+    preempted between deciding-to-raise and delivering could land AFTER a
+    concurrent success cleared CF — leaving the Manager stuck
+    configSyncFailing=true after a successful apply (the epoch guard only covers
+    decision-time staleness, not the two out-of-lock deliveries). Fix: deliver
+    every OnConfigApplyHealth publish (timer raise, on-edge raise, success clear)
+    WHILE STILL HOLDING configApplyMu, serializing raise vs clear. Verified the
+    fixed lock order configApplyMu → m.mu (SetConfigSyncHealth is a cheap
+    two-field setter, no callback) has no inverse — nothing takes m.mu then a
+    configApplyMu path. Added TestConfigSyncHealthRaiseClearReorderSerialized
+    (forces the hostile interleave deterministically via the callback as the
+    seam); parent-RED verified (reverting to out-of-lock delivery → RED with the
+    stuck-CF assertion). pkg/cluster/... -race clean, pkg/daemon clean.
+    pkg/dataplane/userspace event-stream failures are PRE-EXISTING on
+    origin/master (verified in a detached worktree), unrelated to this change.
+  **File(s)**: pkg/cluster/sync_conn_config.go,
+    pkg/cluster/sync_config_health_6387_test.go, docs/sync-protocol.md, _Log.md

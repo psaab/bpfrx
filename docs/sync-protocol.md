@@ -530,7 +530,18 @@ arrived. If a re-delivery *does* arrive after the streak has persisted
 **strictly** longer than the grace (`>`, not `>=`), an on-edge fast path raises
 immediately; both paths are idempotent and **epoch-guarded** so CF raises at
 most once per streak and a success that cancels a timer already past its
-`Stop()` cannot raise a stale CF (the cancelled-but-already-firing race). The
+`Stop()` cannot raise a stale CF (the cancelled-but-already-firing race).
+Every `OnConfigApplyHealth` publish — the timer raise, the on-edge raise, and
+the success clear — is delivered **while still holding `configApplyMu`** (#6398).
+The epoch guard alone only covers *decision-time* staleness (the timer acquiring
+the lock after a success); it does not order the two callback *deliveries*.
+Publishing both edges under the one mutex serializes them, so a timer raise
+callback preempted between deciding-to-raise and delivering cannot land *after* a
+concurrent success has already cleared CF — the reorder that would otherwise
+leave the manager stuck `configSyncFailing=true` after a successful apply. The
+callback runs `SetConfigSyncHealth`, a cheap two-field setter under the manager's
+`m.mu`, so the lock order is fixed `configApplyMu → m.mu` with no inverse
+(nothing takes `m.mu` then calls back into a `configApplyMu` path). The
 daemon translates `OnConfigApplyHealth` into `cluster.Manager.SetConfigSyncHealth`.
 A successful apply cancels the timer, resets the streak, and clears CF
 **unconditionally** — not gated on the instance's own local raised flag —

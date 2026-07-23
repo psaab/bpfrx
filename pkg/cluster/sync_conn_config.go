@@ -86,6 +86,7 @@ func (s *SessionSync) noteConfigApplyFailure(applyErr error) {
 	}
 
 	s.configApplyMu.Lock()
+	defer s.configApplyMu.Unlock()
 	if s.firstUnappliedFailNano == 0 {
 		s.firstUnappliedFailNano = now
 		s.armConfigApplyGraceTimerLocked()
@@ -96,14 +97,18 @@ func (s *SessionSync) noteConfigApplyFailure(applyErr error) {
 	// greater per the #6387 contract — an elapsed exactly equal to the grace
 	// has not yet crossed the window (the grace-expiry timer, armed above,
 	// covers the boundary/no-redelivery case).
-	fire := s.raiseWanted(now)
-	if fire {
+	//
+	// #6398 fix: the OnConfigApplyHealth delivery happens WHILE STILL HOLDING
+	// configApplyMu. Serializing every raise and clear publish under the one
+	// mutex is what prevents a late raise from landing after a concurrent
+	// success has cleared CF (the callback-reorder race). The callback runs
+	// SetConfigSyncHealth, a cheap two-field setter under m.mu, so the fixed
+	// lock order configApplyMu → m.mu has no inverse and cannot deadlock.
+	if s.raiseWanted(now) {
 		s.raiseConfigApplyHealthLocked()
-	}
-	s.configApplyMu.Unlock()
-
-	if fire && s.OnConfigApplyHealth != nil {
-		s.OnConfigApplyHealth(true, reason)
+		if s.OnConfigApplyHealth != nil {
+			s.OnConfigApplyHealth(true, reason)
+		}
 	}
 }
 
@@ -118,8 +123,9 @@ func (s *SessionSync) raiseWanted(now int64) bool {
 }
 
 // raiseConfigApplyHealthLocked marks CF raised for the current streak. Caller
-// holds configApplyMu and MUST fire OnConfigApplyHealth(true, reason) after
-// releasing the lock. Idempotent (callers gate on !configApplyHealthRaised).
+// holds configApplyMu and fires OnConfigApplyHealth(true, reason) WHILE STILL
+// HOLDING that lock (#6398), so a raise cannot be reordered behind a concurrent
+// clear. Idempotent (callers gate on !configApplyHealthRaised).
 func (s *SessionSync) raiseConfigApplyHealthLocked() {
 	s.configApplyHealthRaised = true
 }
@@ -163,16 +169,20 @@ func (s *SessionSync) stopConfigApplyGraceTimer() {
 // (the cancelled-but-already-firing race) or CF is already raised. Idempotent.
 func (s *SessionSync) fireConfigApplyGraceExpiry(epoch uint64) {
 	s.configApplyMu.Lock()
+	defer s.configApplyMu.Unlock()
 	if epoch != s.configApplyFailEpoch || s.configApplyHealthRaised || s.firstUnappliedFailNano == 0 {
-		s.configApplyMu.Unlock()
 		return
 	}
 	s.raiseConfigApplyHealthLocked()
-	reason := s.configApplyFailReason
-	s.configApplyMu.Unlock()
-
+	// #6398 fix: deliver the raise WHILE STILL HOLDING configApplyMu so it
+	// cannot be reordered behind a concurrent noteConfigApplySuccess clear. If
+	// a success wins the lock first it bumps the epoch and this callback never
+	// runs (the guard above); if this callback wins, its raise is fully
+	// published before the success's clear can acquire the lock. Either
+	// interleaving leaves CF in the correct final state. See
+	// noteConfigApplyFailure for the lock-order (configApplyMu → m.mu) rationale.
 	if s.OnConfigApplyHealth != nil {
-		s.OnConfigApplyHealth(true, reason)
+		s.OnConfigApplyHealth(true, s.configApplyFailReason)
 	}
 }
 
@@ -189,13 +199,21 @@ func (s *SessionSync) fireConfigApplyGraceExpiry(epoch uint64) {
 // Called from the single-consumer configApplyLoop; guarded by configApplyMu.
 func (s *SessionSync) noteConfigApplySuccess() {
 	s.configApplyMu.Lock()
+	defer s.configApplyMu.Unlock()
 	s.firstUnappliedFailNano = 0
 	s.configApplyFailReason = ""
 	s.stopConfigApplyGraceTimerLocked()
 	s.configApplyFailEpoch++
 	s.configApplyHealthRaised = false
-	s.configApplyMu.Unlock()
 
+	// #6398 fix: deliver the clear WHILE STILL HOLDING configApplyMu. The epoch
+	// bump above invalidates any in-flight grace-expiry timer, and publishing
+	// the clear under the same mutex that serializes the raise sites guarantees
+	// a late raise callback cannot overtake this clear: a timer callback still
+	// parked on configApplyMu resumes only after this clear returns, sees the
+	// bumped epoch, and no-ops. Delivering the clear OUTSIDE the lock (the prior
+	// behavior) let a late raise land after it and leave the Manager stuck
+	// configSyncFailing=true after a successful apply.
 	if s.OnConfigApplyHealth != nil {
 		s.OnConfigApplyHealth(false, "")
 	}
