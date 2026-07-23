@@ -695,12 +695,64 @@ therefore the WRONG helper here — it reads one node's `Keys[1:]` + immediate
 children and would still see only the first member. `compileZones`
 (`compiler_security_zones.go`) flattens the nested chain with the recursive
 `zoneInterfaceMembers`, which reads every key at each level and skips a
-`host-inbound-traffic` body (a bracketed member is bare membership — it cannot
-carry a per-interface host-inbound stanza). Before #5248 the reader took only
+`host-inbound-traffic` body (a bracketed member is bare membership in flat-set /
+canonical `set` syntax — it cannot carry a per-interface host-inbound stanza
+there; the `[ a b ] { host-inbound-traffic ... }` shape documented below is
+reachable only via a raw-hierarchical `load override` parse). Before #5248 the
+reader took only
 `iface.Name()` and silently dropped every member after the first — a zone-
 membership (security boundary) loss that also hid the dropped interface from
 the strict `validateZoneInterfaceDefinedStrict` gate. Covered by
 `pkg/config/compiler_zone_interfaces_bracket_5248_test.go`.
+
+**A per-interface `host-inbound-traffic` override is scoped to the SINGLE
+interface it is written under — it NEVER fans out to bracket siblings
+(#6391).** The `zoneInterfaceMembers` flatten above is for zone MEMBERSHIP
+only. Host-inbound is compiled separately and keyed strictly on the direct
+child the stanza hangs under (`iface.Name()` in `compileZones`), never across
+the flattened member set. This matters because the flat-set single-scoped case
+and a hierarchical multi-member `load override` block compile to the SAME AST:
+`interfaces [ ge-0/0/0 ge-0/0/1 ]` followed by
+`interfaces ge-0/0/0 host-inbound-traffic system-services ssh` reuses the FIRST
+member's SetPath container, so the `ge-0/0/0` node carries BOTH the `ge-0/0/1`
+membership leaf AND the host-inbound body — structurally identical to a
+hand-authored `interfaces { ge-0/0/0 { ge-0/0/1; host-inbound-traffic {...} } }`.
+A fanout keyed on the compiled AST alone therefore cannot tell "scope ssh to
+`ge-0/0/0` only" from "apply to every bracket member", so fanning the override
+across `zoneInterfaceMembers` (attempted in PR #6389, closed unmerged) OPENS ssh
+on `ge-0/0/1`, which the operator never configured — an over-permission /
+host-inbound leak.
+
+Two properties, do NOT conflate them:
+
+- **Individually-scoped isolation (UNCONDITIONAL invariant).** A service
+  authored under ONE named interface via its own `set` statement
+  (`interfaces ge-0/0/0 host-inbound-traffic system-services ssh`) is
+  single-scoped by definition and must NEVER appear on a sibling — under every
+  design option. This holds today and must keep holding after any future fix.
+
+- **Multi-member body (CURRENT fail-safe, pending a design call).** A
+  host-inbound BODY hanging off a bracket membership itself
+  (`interfaces [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic { ... } }`, or the
+  `ge-0/0/0 { ge-0/0/1; host-inbound-traffic { ... } }` load-override artifact)
+  currently applies to the first member ONLY. That is the issue's **option 1**
+  (fail-safe): the override stays on the single named interface and a bracketed
+  multi-member intent UNDER-applies (a sibling falls back to the zone-level
+  host-inbound) rather than over-admitting. This is the current default, NOT the
+  final multi-member semantics — making the multi-member intent apply to every
+  member without the flat-set leak needs parse-time scope disambiguation
+  (options 2/3), still an OPEN design call on #6391.
+
+Both properties are pinned by
+`pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go`, which asserts
+the FULL per-interface host-inbound map (every interface, both system-services
+AND protocols). Re-introducing the #6389 fanout turns the CONTAINER-SHARING
+cases RED — first-member, three-member, multi-service, protocols, and the two
+hierarchical multi-member-body cases — while the later-member and
+no-shared-backing-store cases stay GREEN CONTROLS (their interfaces do not share
+a SetPath container, so the fanout cannot touch them). The two multi-member-body
+cases assert current option-1 behavior only; an options-2/3 fix intentionally
+updates those two expectations.
 
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a
