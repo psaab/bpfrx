@@ -12,6 +12,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/networkd"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
@@ -29,19 +30,18 @@ import (
 func TestApplyConfigLockedSurfacesHostInboundFailure(t *testing.T) {
 	installFakeNetworkctl(t)
 
-	injected := errors.New("nft: host-inbound rule load failed")
-	origApply, origDelete := nftApplyPayload, nftDeleteTable
-	nftApplyPayload = func(string) ([]byte, error) { return []byte("Error: load failed\n"), injected }
-	// #3392: applyLo0Filter now also routes its no-filter teardown through the
-	// shared nftDeleteTable seam (whose default impl delegates to nftApplyPayload).
-	// This config binds no lo0 filter, so without stubbing nftDeleteTable the lo0
-	// teardown would ALSO fail with `injected` and ride in via lo0Err — making the
-	// hostInboundErr RED-on-revert false-green (dropping hostInboundErr from the
-	// join would still surface `injected` through lo0Err). Stub the teardown to
-	// succeed so the injected failure rides SOLELY on the host-inbound apply path,
-	// isolating this test to its own join term.
-	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
-	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+	injected := errors.New("nftables: host-inbound rule load failed")
+	// #6387 PR-3: inject the failure through the netlink install seam. The failure
+	// rides SOLELY on the host-inbound real install (InstallHostInbound); the
+	// cold-boot fence and every table delete succeed (nil hooks), so the lo0
+	// no-filter teardown and the host-inbound gap/fence paths do NOT also surface
+	// `injected` — isolating this test to the hostInboundErr join term (dropping it
+	// from the join must be the ONLY thing that makes the commit go green → RED).
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{
+		hostInbound: func(xnft.HostInboundSpec) error { return injected },
+	}
+	defer func() { nftInstaller = orig }()
 
 	networkDir := t.TempDir()
 	d := &Daemon{
@@ -96,16 +96,16 @@ func TestApplyConfigLockedSurfacesHostInboundFailure(t *testing.T) {
 func TestApplyConfigLockedSurfacesLo0Failure(t *testing.T) {
 	installFakeNetworkctl(t)
 
-	injected := errors.New("nft: lo0 rule load failed")
-	origApply, origDelete := nftApplyPayload, nftDeleteTable
-	nftApplyPayload = func(string) ([]byte, error) { return []byte("Error: load failed\n"), injected }
-	// nftDeleteTable's default impl delegates to nftApplyPayload, so without this
-	// stub the host-inbound no-enforceable-view TEARDOWN (which this config takes)
-	// would also fail with `injected` and mask the RED-on-revert: removing lo0Err
-	// from the join must be the ONLY thing that surfaces `injected`. Stub the
-	// teardown to succeed so the injected error rides solely on the lo0 apply.
-	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
-	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+	injected := errors.New("nftables: lo0 rule load failed")
+	// #6387 PR-3: inject the failure through the netlink lo0 install seam. The
+	// host-inbound no-enforceable-view TEARDOWN (this config takes it) and every
+	// other table delete succeed (nil del hook), so removing lo0Err from the join
+	// must be the ONLY thing that surfaces `injected` → RED-on-revert.
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{
+		lo0: func(xnft.Lo0FilterSpec) error { return injected },
+	}
+	defer func() { nftInstaller = orig }()
 
 	networkDir := t.TempDir()
 	d := &Daemon{

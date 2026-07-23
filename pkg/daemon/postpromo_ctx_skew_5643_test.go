@@ -55,14 +55,13 @@ func (d *postPromoCancelDP) ApplyConfig(_ context.Context, _ *config.Config) (*d
 func TestPostPromotionCancelRunsHostAuthorizationCloseout(t *testing.T) {
 	installFakeNetworkctl(t)
 
-	// Hermetic nft: record every nft operation (applyLo0Filter /
-	// applyHostInboundFilter route both their apply and their delete-table
-	// idioms through nftApplyPayload) instead of shelling out to `nft`.
-	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	// Hermetic nftables: count every kernel-touching op through the netlink
+	// installer seam (#6387 PR-3: applyLo0Filter / applyHostInboundFilter route
+	// their install + table-delete through nftInstaller) instead of shelling out.
+	orig := nftInstaller
 	nftCalls := 0
-	nftApplyPayload = func(string) ([]byte, error) { nftCalls++; return nil, nil }
-	nftDeleteTable = func(string, string) ([]byte, error) { nftCalls++; return nil, nil }
-	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+	nftInstaller = &countingNftInstaller{calls: &nftCalls}
+	defer func() { nftInstaller = orig }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -170,11 +169,10 @@ func TestPostPromotionCancelReconcilesRootAuth(t *testing.T) {
 func TestC1PostPromotionCancelRunsHostAuthorizationCloseout(t *testing.T) {
 	installFakeNetworkctl(t)
 
-	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	orig := nftInstaller
 	nftCalls := 0
-	nftApplyPayload = func(string) ([]byte, error) { nftCalls++; return nil, nil }
-	nftDeleteTable = func(string, string) ([]byte, error) { nftCalls++; return nil, nil }
-	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+	nftInstaller = &countingNftInstaller{calls: &nftCalls}
+	defer func() { nftInstaller = orig }()
 
 	sentinel, _ := stageRootAuthEnv(t, "$6$old5643salt$oldroot")
 
@@ -228,11 +226,10 @@ func assertRootAuthApplied(t *testing.T, sentinel, why string) {
 func TestLiveApplyRunsHostAuthorizationTailOnce(t *testing.T) {
 	installFakeNetworkctl(t)
 
-	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	orig := nftInstaller
 	nftCalls := 0
-	nftApplyPayload = func(string) ([]byte, error) { nftCalls++; return nil, nil }
-	nftDeleteTable = func(string, string) ([]byte, error) { nftCalls++; return nil, nil }
-	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+	nftInstaller = &countingNftInstaller{calls: &nftCalls}
+	defer func() { nftInstaller = orig }()
 
 	dp := &runtimeOnlyApplyTestDP{}
 	d := &Daemon{

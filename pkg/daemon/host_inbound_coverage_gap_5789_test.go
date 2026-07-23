@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 )
 
 // #5789: hostInboundEnforced=true only proves SOME protecting table loaded at
@@ -22,13 +23,6 @@ import (
 // hostInboundTestConfig are defined in host_inbound_coldboot_fence_5644_test.go /
 // host_inbound_nft_test.go.
 
-// gapFencePayload reports whether an nft `-f -` payload is the #5789 additive gap
-// fence (the separate xpf_hostinbound_gap table) rather than the real ruleset or
-// the whole-table cold-boot fence.
-func gapFencePayload(payload string) bool {
-	return strings.Contains(payload, "table inet xpf_hostinbound_gap")
-}
-
 // TestHostInboundCoverageGapFencesNewAddressAfterFailedRerender_5789 is the
 // primary fail-on-revert proof AND the "distinguish coverage from mere table
 // existence" crux (issue path 1): an enforceable config installs a real table
@@ -38,14 +32,12 @@ func gapFencePayload(payload string) bool {
 // without touching the retained table. Reverting the day-2 coverage-gap branch
 // leaves the new address fail-open (no gap payload) → RED.
 func TestHostInboundCoverageGapFencesNewAddressAfterFailedRerender_5789(t *testing.T) {
-	origApply := nftApplyPayload
-	origDelete := nftDeleteTable
-	defer func() { nftApplyPayload = origApply; nftDeleteTable = origDelete }()
-	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	orig := nftInstaller
+	defer func() { nftInstaller = orig }()
 
 	// Step 1: enforceable config with wan addrs 172.16.50.8 / 2001:db8:50::8 —
 	// real install succeeds → coverage recorded.
-	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftInstaller = &fakeNftInstaller{} // all succeed
 	d := &Daemon{}
 	if err := d.applyHostInboundFilter(hostInboundTestConfig()); err != nil {
 		t.Fatalf("step 1 (install): %v", err)
@@ -62,50 +54,44 @@ func TestHostInboundCoverageGapFencesNewAddressAfterFailedRerender_5789(t *testi
 	cfg2.Interfaces.Interfaces["reth0"].Units[50].Addresses = []string{
 		"172.16.50.8/24", "172.16.50.9/24", "2001:db8:50::8/64",
 	}
-	injected := errors.New("nft: rerender failed")
-	var calls []string
-	var gapPayload string
-	nftApplyPayload = func(payload string) ([]byte, error) {
-		calls = append(calls, payload)
-		if gapFencePayload(payload) {
-			gapPayload = payload
-			return nil, nil
-		}
-		return []byte("Error: could not process rule\n"), injected // real ruleset fails
+	injected := errors.New("nftables: rerender failed")
+	var realCalls, gapCalls int
+	var gapSpec xnft.GapFenceSpec
+	nftInstaller = &fakeNftInstaller{
+		hostInbound: func(xnft.HostInboundSpec) error { realCalls++; return injected }, // real ruleset fails
+		gapFence:    func(spec xnft.GapFenceSpec) error { gapCalls++; gapSpec = spec; return nil },
 	}
 
 	err := d.applyHostInboundFilter(cfg2)
 	if err == nil || !errors.Is(err, injected) {
-		t.Fatalf("step 2: the failed rerender must surface the nft error, got %v", err)
+		t.Fatalf("step 2: the failed rerender must surface the netlink error, got %v", err)
 	}
 	// CRUX: the table still exists (enforced=true) but coverage was stale.
 	if !d.hostInboundEnforced.Load() {
 		t.Fatal("step 2: hostInboundEnforced must remain true (the retained real table is untouched)")
 	}
-	if gapPayload == "" {
+	if gapCalls != 1 {
 		t.Fatalf("step 2 (#5789 FAIL-OPEN): a new address appeared and the rerender failed, but no "+
 			"additive gap fence was installed — the stale-coverage-but-enforced case took the day-2 "+
-			"retention branch and left 172.16.50.9 fail-open. nft calls:\n%v", calls)
+			"retention branch and left 172.16.50.9 fail-open (gap installs=%d)", gapCalls)
 	}
 	// The gap denies the NEW address...
-	if !strings.Contains(gapPayload, "ip daddr 172.16.50.9 drop") {
-		t.Errorf("gap fence must deny the newly-appeared address 172.16.50.9:\n%s", gapPayload)
+	if !sliceContains(gapSpec.UncoveredV4, "172.16.50.9") {
+		t.Errorf("gap fence must deny the newly-appeared address 172.16.50.9:\n%+v", gapSpec)
 	}
-	// ...in the SEPARATE table, WITHOUT re-fencing the already-covered address
-	// (the retained table still serves 172.16.50.8's accepts — not weakened).
-	if strings.Contains(gapPayload, "172.16.50.8") {
-		t.Errorf("gap fence must NOT re-fence the already-covered 172.16.50.8 (retained table serves it):\n%s", gapPayload)
-	}
-	if strings.Contains(gapPayload, "tcp dport 22 accept") {
-		t.Errorf("gap fence is a fence, not the real table — it must carry no service accepts:\n%s", gapPayload)
+	// ...WITHOUT re-fencing the already-covered address (the retained table still
+	// serves 172.16.50.8's accepts — not weakened). A GapFenceSpec structurally
+	// carries no service accept.
+	if sliceContains(gapSpec.UncoveredV4, "172.16.50.8") {
+		t.Errorf("gap fence must NOT re-fence the already-covered 172.16.50.8 (retained table serves it):\n%+v", gapSpec)
 	}
 	// Coverage is unchanged: the retained real generation still covers only its
 	// original set; the gap-only address is NOT recorded as real-covered.
 	if _, ok := d.hostInboundCoveredAddrs[hostInboundDropAddrKey('4', "172.16.50.9")]; ok {
 		t.Error("covered set must NOT include the gap-only address 172.16.50.9 (retained real table does not cover it)")
 	}
-	if len(calls) != 2 {
-		t.Errorf("step 2: expected exactly real + gap (2 nft applies), got %d:\n%v", len(calls), calls)
+	if realCalls != 1 {
+		t.Errorf("step 2: expected exactly one real install attempt, got %d", realCalls)
 	}
 }
 
@@ -116,10 +102,8 @@ func TestHostInboundCoverageGapFencesNewAddressAfterFailedRerender_5789(t *testi
 // fence must protect the new address. This is the case the sticky boolean cannot
 // distinguish (enforced=true, but covered={}).
 func TestHostInboundProgramOnlyThenAddressGapFence_5789(t *testing.T) {
-	origApply := nftApplyPayload
-	origDelete := nftDeleteTable
-	defer func() { nftApplyPayload = origApply; nftDeleteTable = origDelete }()
-	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	orig := nftInstaller
+	defer func() { nftInstaller = orig }()
 
 	unit := &config.InterfaceUnit{Number: 0, DHCP: true} // addressless initially
 	cfg := &config.Config{}
@@ -154,7 +138,7 @@ func TestHostInboundProgramOnlyThenAddressGapFence_5789(t *testing.T) {
 
 	// Step 1: program-only real install (no address drops) succeeds → enforced
 	// true, covered EMPTY.
-	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftInstaller = &fakeNftInstaller{} // all succeed
 	if err := d.applyHostInboundFilter(cfg); err != nil {
 		t.Fatalf("step 1 (program-only install): %v", err)
 	}
@@ -167,31 +151,26 @@ func TestHostInboundProgramOnlyThenAddressGapFence_5789(t *testing.T) {
 
 	// Step 2: an address appears on the interface; the rerender FAILS.
 	unit.Addresses = []string{"198.51.100.57/24"}
-	injected := errors.New("nft: issue 5789 program-then-address failure")
-	var gapPayload string
-	var calls int
-	nftApplyPayload = func(payload string) ([]byte, error) {
-		calls++
-		if gapFencePayload(payload) {
-			gapPayload = payload
-			return nil, nil
-		}
-		return []byte("Error\n"), injected // real ruleset fails
+	injected := errors.New("nftables: issue 5789 program-then-address failure")
+	var gapCalls int
+	var gapSpec xnft.GapFenceSpec
+	nftInstaller = &fakeNftInstaller{
+		hostInbound: func(xnft.HostInboundSpec) error { return injected }, // real ruleset fails
+		gapFence:    func(spec xnft.GapFenceSpec) error { gapCalls++; gapSpec = spec; return nil },
 	}
 	err := d.applyHostInboundFilter(cfg)
 	if err == nil || !errors.Is(err, injected) {
-		t.Fatalf("step 2: failed rerender must surface the nft error, got %v", err)
+		t.Fatalf("step 2: failed rerender must surface the netlink error, got %v", err)
 	}
-	if gapPayload == "" {
+	if gapCalls != 1 {
 		t.Fatalf("step 2 (#5789 path 2 FAIL-OPEN): an address appeared on a program-only-covered "+
 			"interface and the rerender failed; the enforced=true/covered-empty case must install a "+
-			"gap fence for the new address, got none (nft applies=%d)", calls)
+			"gap fence for the new address, got %d gap installs", gapCalls)
 	}
-	if !strings.Contains(gapPayload, "ip daddr 198.51.100.57 drop") {
-		t.Errorf("gap fence must deny the newly-appeared address 198.51.100.57:\n%s", gapPayload)
-	}
-	if !strings.Contains(gapPayload, "table inet xpf_hostinbound_gap") {
-		t.Errorf("protection must be the separate additive gap table, not a whole-table replace:\n%s", gapPayload)
+	// The gap denies the appeared address, via the separate additive gap table
+	// (InstallGapFence, xpf_hostinbound_gap), not a whole-table replace.
+	if !sliceContains(gapSpec.UncoveredV4, "198.51.100.57") {
+		t.Errorf("gap fence must deny the newly-appeared address 198.51.100.57:\n%+v", gapSpec)
 	}
 }
 
@@ -201,13 +180,11 @@ func TestHostInboundProgramOnlyThenAddressGapFence_5789(t *testing.T) {
 // (the atomic-untouched table still protects everything). If the coverage check
 // were wrong (always treating enforced as stale) this would spuriously fence.
 func TestHostInboundFullyCoveredFailedRerenderNoGap_5789(t *testing.T) {
-	origApply := nftApplyPayload
-	origDelete := nftDeleteTable
-	defer func() { nftApplyPayload = origApply; nftDeleteTable = origDelete }()
-	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	orig := nftInstaller
+	defer func() { nftInstaller = orig }()
 
 	// Install once (coverage = the wan addrs).
-	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftInstaller = &fakeNftInstaller{} // all succeed
 	d := &Daemon{}
 	cfg := hostInboundTestConfig()
 	if err := d.applyHostInboundFilter(cfg); err != nil {
@@ -215,20 +192,24 @@ func TestHostInboundFullyCoveredFailedRerenderNoGap_5789(t *testing.T) {
 	}
 
 	// Same config, real rerender fails, but coverage is COMPLETE → no gap.
-	injected := errors.New("nft: transient failure, same address set")
-	var calls int
-	nftApplyPayload = func(payload string) ([]byte, error) {
-		calls++
-		if gapFencePayload(payload) {
-			t.Errorf("a fully-covered failed rerender must NOT install a gap fence (day-2 retention holds):\n%s", payload)
-		}
-		return []byte("Error\n"), injected
+	injected := errors.New("nftables: transient failure, same address set")
+	var realCalls, gapCalls int
+	nftInstaller = &fakeNftInstaller{
+		hostInbound: func(xnft.HostInboundSpec) error { realCalls++; return injected },
+		gapFence: func(xnft.GapFenceSpec) error {
+			gapCalls++
+			t.Error("a fully-covered failed rerender must NOT install a gap fence (day-2 retention holds)")
+			return nil
+		},
 	}
 	if err := d.applyHostInboundFilter(cfg); !errors.Is(err, injected) {
-		t.Fatalf("rerender must surface the nft error, got %v", err)
+		t.Fatalf("rerender must surface the netlink error, got %v", err)
 	}
-	if calls != 1 {
-		t.Errorf("fully-covered failed rerender must attempt only the real payload (no gap), got %d applies", calls)
+	if gapCalls != 0 {
+		t.Errorf("fully-covered failed rerender must install no gap fence, got %d", gapCalls)
+	}
+	if realCalls != 1 {
+		t.Errorf("fully-covered failed rerender must attempt exactly one real install, got %d", realCalls)
 	}
 }
 
@@ -237,16 +218,13 @@ func TestHostInboundFullyCoveredFailedRerenderNoGap_5789(t *testing.T) {
 // gap table, so a later enforceable generation whose first real load fails takes
 // the cold-boot fence (there is no retained table to cover anything).
 func TestHostInboundTeardownClearsCoverageAndGap_5789(t *testing.T) {
-	origApply := nftApplyPayload
-	origDelete := nftDeleteTable
-	defer func() { nftApplyPayload = origApply; nftDeleteTable = origDelete }()
-
-	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	orig := nftInstaller
 	deleted := map[string]bool{}
-	nftDeleteTable = func(family, name string) ([]byte, error) {
-		deleted[name] = true
-		return nil, nil
+	nftInstaller = &fakeNftInstaller{
+		del: func(name string) error { deleted[name] = true; return nil },
 	}
+	defer func() { nftInstaller = orig }()
+
 	d := &Daemon{}
 	if err := d.applyHostInboundFilter(hostInboundTestConfig()); err != nil {
 		t.Fatalf("install: %v", err)
@@ -265,7 +243,7 @@ func TestHostInboundTeardownClearsCoverageAndGap_5789(t *testing.T) {
 	if d.hostInboundEnforced.Load() {
 		t.Error("teardown must clear hostInboundEnforced (#5790)")
 	}
-	if !deleted["xpf_hostinbound"] || !deleted["xpf_hostinbound_gap"] {
+	if !deleted[xnft.HostInboundTableName] || !deleted[xnft.HostInboundGapTableName] {
 		t.Errorf("teardown must delete BOTH the main and gap tables, deleted=%v", deleted)
 	}
 }
