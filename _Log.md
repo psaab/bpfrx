@@ -59044,6 +59044,65 @@ top.
     pkg/daemon/daemon_ipsec_rebind_flush_bound_6397_test.go,
     pkg/daemon/daemon_run.go, pkg/daemon/README.md, _Log.md
 
+## 2026-07-23 — #6387 PR-2: additive pkg/nftables netlink host-inbound/lo0/fence installer + ruleset-parity CI
+
+- **Timestamp**: 2026-07-23
+- **Action**: Implemented PR-2 of #6387 — an ADDITIVE `pkg/nftables` netlink
+  installer (`Installer` interface: InstallHostInbound / InstallColdBootFence /
+  InstallGapFence / InstallLo0 / DeleteTable) rendering the host-inbound / lo0 /
+  fence rulesets via `github.com/google/nftables` (no `nft` binary),
+  bit-for-bit equivalent to the exec-`nft` `build*Payload` oracle in
+  `daemon_nft.go`. Added the functional nf_tables capability probe
+  (`ProbeNFTablesAvailable` / `ErrNFTablesUnavailable`). Added the T1 kernel
+  ruleset-parity CI (oracle nft-text vs netlink dump diff in a self-isolated
+  private netns) + mutation-sensitivity (widened set / dropped saddr!= /
+  weakened verdict / dropped counter all diverge) + T1b pure-unit goldens
+  (oracle-derived) + kernel-load + counter-readback through the existing
+  readers. Daemon still shells to `nft` (zero production behavior change);
+  `build*Payload` retained as the parity oracle. Registered pkg/nftables in the
+  #1373 retirement allowlist (uses dataplane.DSCPValues SSOT).
+- **Validation**: `go build ./...` clean; `go vet ./pkg/nftables ./pkg/daemon`
+  clean; `go test ./pkg/nftables` (netns) green incl. kernel-load +
+  counter-readback; T1 parity gate RUN + PASS against real nft v1.1.6 (all
+  rulesets byte-identical, all 4 mutation classes detected); retirement canary
+  green.
+- **File(s)**: pkg/nftables/netlink_build.go, netlink_spec.go,
+  netlink_hostinbound.go, netlink_lo0.go, netlink_fence.go,
+  netlink_installer.go, netlink_capability.go, netlink_scenario_test.go,
+  netlink_canon_test.go, netlink_golden_test.go, netlink_mutation_test.go,
+  netlink_kernel_test.go, netlink_capability_test.go, README.md;
+  pkg/daemon/daemon_nft_netlink_parity_test.go, pkg/daemon/README.md;
+  pkg/dataplane/retirement_boundary_canary_test.go;
+  docs/pr/1373-retire-ebpf-dataplane/README.md; _Log.md
+
+- **Timestamp**: 2026-07-23
+- **Action**: #6405 (#6387 PR-2) security fixes — lo0 fail-open + parity
+  blind spots. FIX-1: netlink lo0 port/DSCP tokens now RESOLVE via the SSOT
+  (config.ResolveFilterPortRange, dataplane.DSCPValues; ssh->22) and FAIL
+  CLOSED (nlPlan.fail -> install aborts) on any unrepresentable token,
+  matching the nft oracle (raw token -> nft rejects -> prior ruleset
+  retained). Pre-fix parsePortTokens/lo0DSCPs DROPPED the predicate ->
+  a port/DSCP-constrained accept widened to match-all. Audited every builder
+  site: host-inbound service ports / WG dport / ESP/AH are numeric (safe);
+  protocols drop identically on both sides (parity, config-gated); DSCP had
+  the SAME omit bug (nftDSCPValue emits raw) and is now fixed too. FIX-2:
+  T1 parity compares PER-RULE iifname scope (iifnameScopeByRule, read via
+  netlink) instead of a global union, so an IKE-exemption widen that
+  preserves the union is caught. FIX-3: added a named-port lo0 term
+  (bit-identical), a fail-closed unrepresentable-port sub-case (oracle nft
+  rejects + netlink InstallLo0 errors + no partial table), an
+  iifname-exemption-widen mutation, and a dropped-counter mutation to the
+  real oracle-parity block; README mutation list corrected.
+- **Validation**: go build ./... + go vet clean; gofmt clean; nftables suite
+  green incl. new TestLo0PortResolveOrFailClosed (5 fail-closed + named
+  resolve); T1 parity RUN + PASS firsthand against real nft v1.1.6 (all
+  rulesets byte-identical, all 6 mutation classes + fail-closed detected);
+  parent-RED verified BOTH unit (revert to omit -> RED) and kernel (union
+  neutralize -> iifname mutation RED; omit neutralize -> fail-closed RED);
+  retirement canary green.
+- **File(s)**: pkg/nftables/netlink_lo0.go,
+  pkg/nftables/netlink_lo0_ports_test.go, pkg/nftables/README.md,
+  pkg/daemon/daemon_nft_netlink_parity_test.go; _Log.md
 - **Timestamp**: 2026-07-23
   - **Action**: #6385 — `show system services` reports EFFECTIVE post-bind
     management-listener addresses on BOTH surfaces (re-file of fix-5 dropped

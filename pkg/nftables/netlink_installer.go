@@ -1,0 +1,175 @@
+package nftables
+
+// netlink_installer.go defines the concrete injection interface (#6387 plan
+// §12.4) covering EVERY kernel-touching host-inbound / lo0 / fence operation
+// that today goes through the exec-`nft` package vars nftApplyPayload /
+// nftDeleteTable in pkg/daemon/daemon_nft.go, plus its netlink implementation.
+//
+// PR-2 only DEFINES + implements + parity-tests this interface. PR-3 wires the
+// daemon apply path to it and ports the 14 fail-closed tests onto its single
+// failure-injection seam (a fake Installer that returns an error).
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/google/nftables"
+	"golang.org/x/sys/unix"
+)
+
+// HostInboundGapTableName is the kernel nftables table for the #5789 additive
+// coverage-gap fence (a distinct input-hook base chain at a later priority than
+// the main host-inbound table).
+const HostInboundGapTableName = "xpf_hostinbound_gap"
+
+// Base-chain hook-input priorities, mirroring the pkg/daemon constants
+// nftLo0FilterPriority (0) < nftHostInboundPriority (10) <
+// nftHostInboundGapPriority (11). The spread is a determinism invariant
+// (nft_chain_priority_test.go): the operator's explicit lo0 filter evaluates
+// before the zone default-deny backstop, and the coverage-gap fence last.
+const (
+	lo0FilterPriority      = 0
+	hostInboundPriority    = 10
+	hostInboundGapPriority = 11
+)
+
+// Installer is the netlink host-inbound / lo0 / fence installer seam. Each
+// method is one atomic kernel transaction. A fake implementation returning an
+// error drives the fail-closed regression tests without a live kernel (PR-3).
+type Installer interface {
+	// InstallHostInbound installs the real host-inbound table (#3070/#3333).
+	InstallHostInbound(spec HostInboundSpec) error
+	// InstallColdBootFence installs the #5644 cold-boot fail-closed fence
+	// (the xpf_hostinbound table reduced to mandatory admits + address drops).
+	InstallColdBootFence(spec FenceSpec) error
+	// InstallGapFence installs the #5789 additive coverage-gap fence.
+	InstallGapFence(spec GapFenceSpec) error
+	// InstallLo0 installs the lo0 loopback input filter (#3445/#3392).
+	InstallLo0(spec Lo0FilterSpec) error
+	// DeleteTable idempotently removes a table (absent -> nil; a genuine
+	// kernel/permission failure -> error, preserving the fail-closed teardown
+	// contract #5790).
+	DeleteTable(name string) error
+}
+
+// netlinkInstaller is the production Installer: it renders each ruleset into a
+// single google/nftables batch and Flushes it as one nf_tables transaction.
+type netlinkInstaller struct {
+	// newConn returns a fresh *nftables.Conn. Overridable so tests can bind the
+	// installer to a private network namespace (WithNetNSFd).
+	newConn func() (*nftables.Conn, error)
+}
+
+// NewNetlinkInstaller returns an Installer that talks to the host's default
+// network namespace via netlink (no `nft` binary).
+func NewNetlinkInstaller() Installer {
+	return &netlinkInstaller{newConn: func() (*nftables.Conn, error) { return nftables.New() }}
+}
+
+// newNetlinkInstallerConn constructs a netlinkInstaller with a custom conn
+// factory (used by the kernel-gated parity tests to target a private netns).
+func newNetlinkInstallerConn(newConn func() (*nftables.Conn, error)) *netlinkInstaller {
+	return &netlinkInstaller{newConn: newConn}
+}
+
+func (in *netlinkInstaller) InstallHostInbound(spec HostInboundSpec) error {
+	return in.replaceTable(HostInboundTableName, hostInboundPriority, func(p *nlPlan) {
+		buildHostInboundNetlink(p, spec)
+	})
+}
+
+func (in *netlinkInstaller) InstallColdBootFence(spec FenceSpec) error {
+	return in.replaceTable(HostInboundTableName, hostInboundPriority, func(p *nlPlan) {
+		buildHostInboundFenceNetlink(p, spec)
+	})
+}
+
+func (in *netlinkInstaller) InstallGapFence(spec GapFenceSpec) error {
+	return in.replaceTable(HostInboundGapTableName, hostInboundGapPriority, func(p *nlPlan) {
+		buildHostInboundGapFenceNetlink(p, spec)
+	})
+}
+
+func (in *netlinkInstaller) InstallLo0(spec Lo0FilterSpec) error {
+	return in.replaceTable(Lo0TableName, lo0FilterPriority, func(p *nlPlan) {
+		buildLo0FilterNetlink(p, spec)
+	})
+}
+
+// replaceTable performs the atomic delete-then-recreate of one inet table +
+// `input` base chain in a SINGLE Flush (plan §12.2). Cold-boot safe: the table
+// is deleted only when it already exists, so an absent table does NOT abort the
+// batch (the unconditional-DelTable v1 bug). On any error the kernel aborts the
+// whole transaction and the PREVIOUS table is retained untouched — the exact
+// atomicity `nft -f -` gave (invariant H4). Each ruleset is its own transaction;
+// xpf_lo0 / xpf_hostinbound / xpf_hostinbound_gap are never cross-coupled.
+func (in *netlinkInstaller) replaceTable(name string, priority nftables.ChainPriority, build func(p *nlPlan)) error {
+	c, err := in.newConn()
+	if err != nil {
+		return fmt.Errorf("nftables conn: %w", err)
+	}
+	exists, err := tableExists(c, name)
+	if err != nil {
+		return err
+	}
+	tbl := &nftables.Table{Family: nftables.TableFamilyINet, Name: name}
+	if exists {
+		c.DelTable(tbl)
+	}
+	tbl = c.AddTable(tbl)
+	prio := priority
+	policy := nftables.ChainPolicyAccept
+	chain := c.AddChain(&nftables.Chain{
+		Name:     "input",
+		Table:    tbl,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookInput,
+		Priority: &prio,
+		Policy:   &policy,
+	})
+	p := &nlPlan{c: c, table: tbl, chain: chain}
+	build(p)
+	if p.err != nil {
+		return p.err
+	}
+	if err := c.Flush(); err != nil {
+		return fmt.Errorf("nftables flush %s: %w", name, err)
+	}
+	return nil
+}
+
+func (in *netlinkInstaller) DeleteTable(name string) error {
+	c, err := in.newConn()
+	if err != nil {
+		return fmt.Errorf("nftables conn: %w", err)
+	}
+	exists, err := tableExists(c, name)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	c.DelTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: name})
+	if err := c.Flush(); err != nil {
+		return fmt.Errorf("nftables delete table %s: %w", name, err)
+	}
+	return nil
+}
+
+// tableExists reports whether an inet table of the given name is installed.
+func tableExists(c *nftables.Conn, name string) (bool, error) {
+	tables, err := c.ListTablesOfFamily(nftables.TableFamilyINet)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false, nil
+		}
+		return false, fmt.Errorf("nftables list tables: %w", err)
+	}
+	for _, t := range tables {
+		if t != nil && t.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
