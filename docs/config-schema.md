@@ -2248,6 +2248,35 @@ Fail-on-revert: `TestFilterICMPTypeNameResolves{V4,V6}_3205`,
 `TestFilterNamedPortExceptResolves_3205` in
 `pkg/config/firewall_symbolic_match_3205_test.go`.
 
+The #3205 kept-verbatim channel had a residual fail-open (#6459/#6463): on the
+tolerant path the Rust filter compiler dropped an unresolvable port token (or
+a malformed literal address token) PER-TOKEN, so a PARTIALLY-bad list still
+built a matcher over the surviving subset — a `then discard`/`reject` term
+silently enforced a NARROWER set than the operator wrote (the rest fell
+through to the implicit accept). The all-unresolvable case already failed
+closed at match-time (#2400/#3205); the partial case now carries fail-closed
+wire markers, same shape as the #3406 ICMP/DSCP family: the snapshot builder
+sets `ports_unrepresentable` from `UnknownPorts` and
+`address_unrepresentable` from `UnknownAddresses` (recorded by
+`recordFilterAddrTokens` via the shared `classifyFilterAddrFamily`), and the
+Rust `parse_term` rejects the WHOLE snapshot
+(`SnapshotIntegrityError::UnrepresentableFilterPorts` /
+`UnrepresentableFilterAddress`). The strict gates
+(`validateFilterMatchValuesStrict`, `validateFilterAddressLiteralsStrict`)
+remain the primary defense; the markers guard the lenient / peer-synced /
+hand-built / version-drifted snapshot. Sibling parser alignment (#6477): the
+Rust filter-side `parse_port_spec` now routes through the shared digit-only
+`parse_port_u16` (#3606), so all four port parsers (Go commit gate, Go
+capability gate, policy-side Rust, filter-side Rust) reject the same
+non-canonical tokens (e.g. `+80`). Fail-on-revert:
+`TestFilterSnapshot*Unrepresentable*` /
+`TestFilterSnapshotLenientPartial{Port,Address}List*` (Go,
+`pkg/dataplane/userspace/filters_snapshot_integrity_6459_test.go`),
+`TestFilterMalformedAddressRecorded_6463` (Go,
+`pkg/config/firewall_address_unknown_6463_test.go`), and
+`ports_unrepresentable_marker_*` / `address_unrepresentable_marker_*` /
+`filter_parse_port_spec_rejects_signed_6477` (Rust).
+
 ### `firewall ... from` cross-field satisfiability — port/tcp-flags/icmp must match the protocol (#3723)
 
 A firewall-filter `from` block can combine a `protocol` (or the inet6
