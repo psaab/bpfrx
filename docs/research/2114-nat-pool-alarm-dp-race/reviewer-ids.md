@@ -56,6 +56,9 @@ reviewer (joins at /engineer on the code PR).
 | r17 | Codex | codex companion task-mrz6e3hp-k8sknb (session 019f9508-6dfb-7842-9a71-75c434058a2a) | NEEDS-REVISION (6 MAJOR, 3 MINOR) |
 | r17 | AGY | agy print-mode direct (agy-plan-r17.md; cwd /home/ps/git/kimi-xpf + --add-dir worktree) | PLAN-READY (0 findings; soft pass on the falsified ≤1+1 bound + observer-less remediation — see claude-smr-plan-r17.md) |
 | r17 | Claude SMR | in-conversation (claude-smr-plan-r17.md) | NEEDS-REVISION (6 MAJOR, 4 MINOR — converging with Codex on independent verification) |
+| r18 | Codex | codex companion task-mrz8pf3q-wm7p94 (session 019f9543-bf13-7791-8cce-3a26b0f817fc) | NEEDS-REVISION (7 MAJOR, 5 MINOR) |
+| r18 | AGY | agy print-mode direct (agy-plan-r18.md) | PLAN-READY (0 findings; attack-2/3 rationales factually wrong — see claude-smr-plan-r18.md §C) |
+| r18 | Claude SMR | in-conversation (claude-smr-plan-r18.md) | NEEDS-REVISION (1 MAJOR, 2 MINOR — its M1/m1/m2 independently anticipated Codex M6/M5/m2) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
