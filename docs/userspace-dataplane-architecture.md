@@ -1315,7 +1315,16 @@ Policy scheduler state is no longer a propagation gap: #1396 carries scheduler
 state into the userspace snapshot and Rust policy evaluator, and the 2026-05-19
 #1378 live artifact set validates hit-counter lifetime, strict missing-scheduler
 commit behavior, and integration/failover evidence with
-`test/incus/policy_scheduler_validate.py`.
+`test/incus/policy_scheduler_validate.py`. The **route-overlay** partial
+republish (`PublishRouteOverlaySnapshot`, the ip-monitoring actuator) co-honors
+this contract (#5328 A6-b2-F4): when the daemon hands it a live
+`scheduler.ActiveState()` it rebuilds the published snapshot's `policies` /
+`address_books` inactive bits from that map in the SAME publish — exactly as the
+dedicated policy-scheduler republish (`UpdatePolicyScheduleState`) does — so a
+route flap never ships a snapshot that reports success while the helper enforces
+a stale schedule window. Previously the overlay only cached the map and inherited
+the last-compiled policy sections, leaving the helper on stale bits until the next
+scheduler tick or full apply.
 #1377 now preserves unusable pool-mode source-NAT rules in the snapshot and
 fails closed at the `poll_descriptor.rs` source-NAT call sites for missing
 pools, empty pools, invalid pool inputs, wrong-family-only pools, or allocator
