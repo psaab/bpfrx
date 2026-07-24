@@ -1,3 +1,40 @@
+## 2026-07-23 — #6165: gate the ~1s desired-state forwarding reconcile with the required-protocol check
+
+- **Timestamp**: 2026-07-23 (fix/6165-forwarding-reconcile-audit)
+- **Action**: Closed the #6163 hostile-review residual. The desired-state
+  forwarding reconcile (`syncDesiredForwardingStateLocked`, invoked ~1s from
+  the status poll and from the compile path) sent
+  `set_forwarding_state{Armed: desiredForwardingArmedLocked()}` with NO
+  required-generation protocol gate, while `desiredForwardingArmedLocked()`
+  returns true whenever forwarding is *supported* (it never consults the
+  accepted-snapshot protocol version). Reachable fail-open trace: a
+  scheduler-driven-policy (or persistent-source-NAT) config is committed while
+  the helper protocol is current, so `m.lastSnapshot.Config` REQUIRES the
+  protocol; the helper is then behind (mixed-base HA deploy / in-place upgrade /
+  older restarted binary); a scheduler tick (`UpdatePolicyScheduleState` →
+  `disarmSnapshotProtocolFailureLocked`) disarms the helper fail-closed and,
+  UNLIKE an operator commit, does NOT revert the active config — so
+  `m.lastSnapshot` keeps requiring the protocol while the helper is disarmed +
+  protocol-stale, and the next reconcile tick re-arms the stale image
+  (forwarding a config the helper cannot represent). Added the SAME scoped gate
+  #6163/#5648 put on `SetForwardingArmed`: `syncDesiredForwardingStateLocked`
+  now re-runs `ensureRequiredSnapshotProtocolLocked(m.lastSnapshot.Config)` and
+  returns the sentinel (leaving the helper disarmed) before re-arming. Scoped to
+  the ARM direction only (`if desired && ...`) so a disarm (demotion, shutdown,
+  the protocol disarm itself) is never blocked; no-op unless the last-applied
+  config requires the protocol; the gate re-polls the helper first so an
+  upgraded helper still arms. Single choke point covers all three reconcile
+  call sites (status poll, compile path, RefreshOwnerRGs/UpdateRGActive). The
+  compile-path call (manager_compile.go:396) already passed the gate at :312 so
+  the added check is a no-op there.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/sync_desired_forwarding_generation_6165_test.go,
+  docs/userspace-dataplane-gaps.md
+- **Validation**: gofmt/vet/build clean; full `go test ./pkg/dataplane/userspace/`
+  GREEN (17.7s). Fail-on-revert (both parent-RED cases clean assertion
+  failures): (1) neutralize the whole gate → mismatch test RED (reconcile arms
+  the stale image); (2) drop the `desired &&` scope → disarm test RED (gate
+  blocks the disarm). Restored → all three #6165 tests GREEN.
 ## 2026-07-23 — #6284 item 1: active/active directional coverage for the #5274 config-epoch guard
 
 - **Timestamp**: 2026-07-23 (fix/6284-config-epoch-coverage)

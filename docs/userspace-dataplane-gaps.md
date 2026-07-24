@@ -268,6 +268,19 @@ There are two distinct fallback boundaries:
      enforced on the explicit arm path (#5648 / M43b): `SetForwardingArmed(true)`
      re-runs `ensureRequiredSnapshotProtocolLocked` and refuses to arm a
      stale accepted image, so an operator/gRPC arm cannot undo the disarm.
+     The SAME gate now also guards the ~1s desired-state reconcile
+     (#6165): `syncDesiredForwardingStateLocked` re-runs the protocol check
+     before it re-arms, because `desiredForwardingArmedLocked()` returns true
+     whenever forwarding is *supported* and never consults the accepted
+     snapshot protocol version. Without it, a scheduler-tick disarm
+     (`UpdatePolicyScheduleState` → `disarmSnapshotProtocolFailureLocked`,
+     which unlike an operator commit does NOT revert the active config) would
+     leave `m.lastSnapshot` requiring the protocol while the helper is
+     disarmed + protocol-stale, and the next reconcile tick would re-arm it —
+     forwarding a config the helper cannot represent. The reconcile gate is
+     scoped identically: only the ARM direction is checked (a disarm — demotion,
+     shutdown, the protocol disarm itself — is never blocked), and it is a
+     no-op unless the last-applied config requires the protocol.
 
 2. **Runtime XDP decision**
    - Even when `xdp_userspace_prog` is active, the XDP shim can still:
