@@ -60395,3 +60395,38 @@ top.
     pkg/config/compiler_validate_strict_nat.go, pkg/config/compiler_tailgates.go,
     pkg/config/types_security.go, pkg/config/static_nat_multitarget_6483_test.go,
     docs/config-schema.md, docs/refactoring-audit-current.txt, _Log.md
+
+## 2026-07-24 — #6484 fold: grammar-role-aware full-traversal target counter
+- **Timestamp**: 2026-07-24 (fix/6483-multitarget-static-nat)
+- **Action**: Fold a confirmed hostile-review MAJOR (both reviewers + Codex) into
+    the #6483 gate: the target counter under-counted a genuine multi-target rule
+    whose targets COLLAPSE onto one node/child. staticNATCollectTargetIdents read
+    only the FIRST (keyword,value) pair per node (fixed Keys[1]/Keys[2] on the
+    collapsed branch, c.Keys[1]/Children[0] on the child branch) and pre-filtered a
+    value slot equal to a modifier keyword, so `prefix <ip> prefix-name POOL` /
+    `prefix <ip> inet` / `prefix <ip> prefix <ip2>` (one line, collapsed onto one
+    child's Keys), hierarchical `prefix { X; Y; }` (two values as grandchildren of
+    one keyword), and `prefix + prefix-name mapped-port` (pool literally NAMED
+    "mapped-port", pre-filtered away as a modifier carrier — Codex second finding)
+    all counted 1 and ESCAPED the >1 gate. Rewrote the counter as a grammar-role-
+    aware FULL TRAVERSAL (new staticNATCollectTargetIdentsFromKeys, mirroring the
+    #6479 staticNATMappedPortOperandsFromKeys slot-classification walk): walk the
+    whole key stream of the static-nat node AND every child, plus a bare keyword's
+    grandchild values, classifying each position as a keyword or a consumed value
+    slot. prefix-name's value is an opaque name ALWAYS consumed (registers even when
+    named "mapped-port"); prefix/nptv6-prefix's IP value can never be a modifier, so
+    a following mapped-port/routing-instance is a modifier carrier (registers no
+    target); mapped-port/routing-instance consume their operand. Register every
+    distinct (keyword,value) identity; ThenTargetCount = the distinct count.
+    INVARIANT B preserved (all count 1): 4 single-target types collapsed+hier, the
+    #5523 restate idiom, prefix<ip> mapped-port, target+routing-instance, inet
+    alone, and the canonical separate-set-line modifier carrier. PARENT-RED: revert
+    the counter to the old first-pair read (build stays GREEN) -> the 5 new
+    escaping reject tests go clean-assertion RED ("strict CompileConfig must reject
+    a multi-target static-nat rule"); the accept locks stay GREEN under both
+    counters. Firsthand probe table: 4 escaping shapes count=2 REJECT [multi-target
+    gate]; 5 invariant-B shapes count=1 ACCEPT. go build ./... , go vet
+    ./pkg/config/ , gofmt, FULL pkg/config suite, TestHeatmapNotStale all GREEN
+    (no LOC bucket shift).
+- **File(s)**: pkg/config/compiler_nat_static.go,
+    pkg/config/static_nat_multitarget_6483_test.go, docs/config-schema.md, _Log.md

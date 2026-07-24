@@ -1964,15 +1964,34 @@ also dropped any `mapped-port` that rode ONLY on the discarded target (the #6479
 the mapped-port fold read. `validateStaticNATSingleTargetStrict` now counts the
 DISTINCT translation targets a rule declares — from the AST during compile
 (`staticNATThenTargetCount`, recorded as `StaticNATRule.ThenTargetCount`), BEFORE
-the fields collapse, across every authoring shape (the flat-set targets collapse
-onto one `static-nat` node's children; the hierarchical `then { static-nat {…}
-static-nat {…} }` shape spreads them across siblings) — and hard-rejects a rule
-declaring more than one. Counting DISTINCT `(keyword, value)` identities (not
-occurrences) is what keeps the canonical "restate the target to attach a
-mapped-port" form — `then static-nat prefix-name N` + `then static-nat
-prefix-name N mapped-port 8080` — a single target. Rejecting the multi-target
-rule outright is the Junos-faithful closure and FORECLOSES the #6479 dropped-
-target mapped-port residual as a side effect (the rule never compiles, so no
+the fields collapse — and hard-rejects a rule declaring more than one. The count
+is a GRAMMAR-ROLE-AWARE FULL TRAVERSAL (#6484), the SAME slot-classification walk
+the #6479 mapped-port scan uses (`staticNATCollectTargetIdentsFromKeys` mirrors
+`staticNATMappedPortOperandsFromKeys`): it walks the ENTIRE key stream of the
+`static-nat` node AND every child, plus the grandchild values of a bare keyword,
+classifying each position as a KEYWORD slot or a consumed VALUE slot. Reading only
+the FIRST `(keyword, value)` pair per node — the pre-#6484 `Keys[1]`/`Keys[2]` /
+`Children[0]` read — undercounted a rule whose two targets COLLAPSE onto one
+node/child and let it escape: the free-form `static-nat` leaf packs a one-line
+`prefix <ip> prefix-name POOL` / `prefix <ip> inet` / `prefix <ip> prefix <ip2>`
+onto a SINGLE child's Keys, and a hierarchical `prefix { <ip>; <ip2>; }` carries
+two prefix values as grandchildren of ONE `prefix` keyword — all counted 1 and
+ACCEPTED on master (the #6484 MAJOR). The full traversal registers every distinct
+`(keyword, value)` identity across the whole leaf, so these now count 2 and
+reject. Two role subtleties make the walk correct: (1) a `prefix-name` value is an
+OPAQUE address-book name that is ALWAYS its value — so `prefix-name mapped-port`
+(a pool literally NAMED "mapped-port") registers a genuine target, not a modifier
+carrier (the pre-#6484 counter wrongly pre-filtered a value equal to a modifier
+keyword and DISCARDED that target — the Codex second finding); (2) a `prefix` /
+`nptv6-prefix` value is an IP that can never be a modifier keyword, so a FOLLOWING
+`mapped-port` / `routing-instance` IS a modifier carrier (the canonical
+separate-set-line `prefix mapped-port <port>` form) and registers no second
+target. Counting DISTINCT identities (not occurrences) keeps the canonical
+"restate the target to attach a mapped-port" form — `then static-nat prefix-name
+N` + `then static-nat prefix-name N mapped-port 8080` — a single target (both
+restatements share identity `prefix-name\x00N`). Rejecting the multi-target rule
+outright is the Junos-faithful closure and FORECLOSES the #6479 dropped-target
+mapped-port residual as a side effect (the rule never compiles, so no
 dropped-target modifier can slip). The gate runs in `runTailGates` AFTER the
 host-mask (#2173) and NPTv6 (#2240/#5818) gates, so a rule that ALSO carries a
 malformed `mapped-port` or a bad nptv6 prefix reports that concrete token first
