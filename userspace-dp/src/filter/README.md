@@ -40,7 +40,9 @@ Mirrors the BPF firewall-filter pipeline in userspace.
     protocol esp; then discard` term matched EVERY protocol — a
     fail-wide security bug. The Go gate is the primary defense; this is
     the helper-boundary backstop against version/snapshot drift.
-- `engine.rs` — per-term evaluation, first-match-wins. It carries the
+- `engine/` — per-term evaluation, first-match-wins (the #1546 split of
+  the monolithic `engine.rs` into `mod.rs` / `eval.rs` / `matching.rs` /
+  `policer.rs` / `tx_selection.rs` / `cache_sensitive*.rs`). It carries the
   matched `then policer ...` name in the filter result. Routing-instance
   evaluation can also return log/action/filter/term metadata so AF_XDP
   can emit PBR RT_FLOW filter-log events without re-evaluating the term
