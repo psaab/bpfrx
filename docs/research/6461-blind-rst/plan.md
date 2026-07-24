@@ -835,6 +835,11 @@ and one ungated node, each gating only its own packet-driven marks).
   - **Both-direction path-switch stall** (§5.2): permanent per-flow
     soft-refuse after an unobserved both-direction stretch; bounded
     aggregate table pressure; no hatch.
+  - **Re-import anchor wipe:** `upsert_synced_with_origin` `remove_entry`s
+    any prior entry, so an HA re-sync/bulk re-import discards locally-built
+    anchor trust — the flow returns to the imported-entry residual (closes
+    refuse until churn). Same bounded class as the failover residual; the
+    §10 wire-anchor follow-up covers it.
 - **LocalDelivery replies** leave via kernel TX and never traverse AF_XDP;
   the anchor for a firewall-originated flow's outbound direction is pinned
   by the inbound ACK stream (cross-direction leg) — the attack-relevant
