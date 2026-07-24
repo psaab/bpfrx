@@ -1244,6 +1244,22 @@ resolved application (an application-set still expands to its members). Coverage
 `compiler_nat_match_multivalue_3431_test.go` (both AST shapes, all axes) and
 `nat_match_multivalue_3431_test.go` (snapshot expansion).
 
+**A protocol-less `match destination-port` matches tcp AND udp (#6462).** When a
+DNAT rule pins a `match destination-port` but NO `match protocol`, Junos matches
+BOTH TCP and UDP (ports exist only for those two L4s). `buildDestinationNATSnapshots`
+(`pkg/dataplane/userspace/nat_destination.go`) therefore emits one entry under
+`tcp` AND one under `udp` — not a single `tcp` default (the pre-#6462 bug, which
+left UDP to the VIP:port silently untranslated), and not a single `PROTO_ANY`
+entry (that would wrongly translate ICMP/other, and the Rust `DnatTable` lookup
+probes `(proto,dst_ip,dst_port) -> (proto,dst_ip,0) -> (PROTO_ANY,dst_ip,0)` but
+never `(PROTO_ANY,dst_ip,dst_port)`, so a UDP packet could not find a
+`PROTO_ANY`+port row anyway). The two rows are identical except the protocol key
+and share the rule's single counter id, exactly like an explicit `match protocol
+[ tcp udp ]`: a packet is tcp or udp, so it hits exactly one row and the counter
+increments once. An explicit `match protocol` is honored verbatim (no synthetic
+second protocol); a protocol-less rule with NO port stays a single match-any
+(empty-protocol) entry. Coverage: `nat_destination_6462_test.go`.
+
 **A source-NAT pool `address` is multi-value (#4521).** A source pool's
 `address` value carries EVERY IP the SNAT allocator may draw from, in four
 shapes: discrete `set` lines (one `address <ip>;` per IP), a bracket list

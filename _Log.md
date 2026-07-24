@@ -60371,6 +60371,38 @@ top.
 - **File(s)**: pkg/api/sessions.go,
     pkg/api/sessions_pagination_canonical_5649_test.go,
     docs/refactoring-audit-current.txt, _Log.md
+- **Timestamp**: 2026-07-24
+- **Action**: #6462 — DNAT bare `match destination-port` with no `match
+    protocol` installed a TCP-only entry, so UDP to the VIP:port was silently
+    not translated (Junos matches a bare destination-port across BOTH tcp and
+    udp). Fixed buildDestinationNATSnapshots (pkg/dataplane/userspace/
+    nat_destination.go): a protocol-less port-based rule now emits one snapshot
+    per protocol under `tcp` AND `udp` (a `protos` slice replacing the scalar
+    `proto = "tcp"` default; the per-destination emit loops over it). Explicit
+    `match protocol` is honored verbatim; a protocol-less rule with NO port
+    stays a single match-any (empty-protocol) entry. Two EXPLICIT rows (never
+    PROTO_ANY — that would over-match ICMP/other, and the Rust DnatTable lookup
+    probes (proto,dst_ip,dst_port) but never (PROTO_ANY,dst_ip,dst_port), so a
+    PROTO_ANY+port row would be unreachable for a UDP packet). Both rows share
+    the rule's single CounterID (mirrors an explicit `match protocol [ tcp udp
+    ]`, #3431), so a packet hits exactly one row and the counter increments
+    once. Updated the #3449 range / #3446 port-validity tests to pin `match
+    protocol tcp` (isolate their single-concern from the new dual-emit). NEW
+    nat_destination_6462_test.go: dual-emit (tcp+udp) for exact port AND range,
+    explicit-proto-not-dual, no-port-stays-match-any. FAIL-ON-REVERT:
+    TestBuildDNATBareDestPortEmitsTCPAndUDP_6462 goes RED ("no udp-keyed entry
+    for 198.51.100.10:53 (the #6462 bug)") when the dual-emit hunk is
+    neutralized to `protos = []string{"tcp"}` — verified then restored (GREEN).
+    Docs: config-schema.md (DNAT per-protocol expansion) + feature-coverage.md
+    (Destination NAT row). go build ./... , go vet ./pkg/dataplane/userspace/ ,
+    gofmt -l (clean), go test ./pkg/dataplane/... , go test ./pkg/refactoraudit
+    -run TestHeatmapNotStale — all GREEN (TMPDIR=/dev/shm). Go-only; no Rust
+    touched.
+- **File(s)**: pkg/dataplane/userspace/nat_destination.go,
+    pkg/dataplane/userspace/nat_destination_6462_test.go,
+    pkg/dataplane/userspace/nat_dnat_port_range_3449_test.go,
+    pkg/dataplane/userspace/nat_dnat_match_dport_3446_test.go,
+    docs/config-schema.md, docs/feature-coverage.md, _Log.md
 
 ## 2026-07-24 — #6483 static-NAT single-translation-target gate
 - **Timestamp**: 2026-07-24
