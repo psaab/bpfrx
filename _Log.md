@@ -44,6 +44,29 @@
   mixed-version-peer snapshots).
 
 
+## 2026-07-24 — #6432: converge MissingNeighbor-arm recycle onto StageOutcome
+
+- **Timestamp**: 2026-07-24 (fix/6432-recycle-stage-outcome)
+- **Action**: Piloted the recycle-exactly-once convergence on the
+  MissingNeighbor arm of `poll_binding_process_descriptor`: the arm body now
+  produces the proven `poll_stages::StageOutcome<()>` ownership enum from a
+  labeled block, the five hand-maintained `scratch_recycle.push + continue`
+  pairs collapsed to `break 'missing_neighbor StageOutcome::RecycleAndContinue`,
+  and a single consumer at the arm tail performs the one push + continue. Pure
+  code-motion inside the same function — the pending_neigh buffer branch still
+  sets the caller's `recycle_now = false`, so the shared epilogue/finalizer are
+  untouched. Added the `missing_neighbor_recycle_exactly_once_pin` invariant
+  test (buffered / duplicate-hop / policy-deny terminal shapes; passes on both
+  pre- and post-refactor code, per honest framing for a behavior-preserving
+  refactor).
+- **Files**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_txn_flow_cache.rs.
+- **Validation**: cargo test --release --test-threads=1 green (4251 passed, 0
+  failed); clippy warning count identical to HEAD (675); cargo check
+  --features debug-log clean; release disasm of
+  poll_binding_process_descriptor old-vs-new 14653 vs 14641 instructions,
+  482 vs 478 calls, 112 vs 112 locked instructions, allocator-facing call set
+  unchanged.
 ## 2026-07-24 — #6457: flow-cache invalidation on control-plane session delete (clear/cluster-stale/HA DeleteSynced)
 
 - **Timestamp**: 2026-07-24 (fix/6457-flowcache-delete-invalidate)
