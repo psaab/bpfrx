@@ -349,6 +349,32 @@ func TestStaticNATMappedPortNPTv65523(t *testing.T) {
 				"set security nat static rule-set rs1 rule r1 then static-nat mapped-port notaport")
 		})
 	})
+	// Canonical separate-set-line: the nptv6-prefix keyword is RESTATED on the
+	// mapped-port line (`nptv6-prefix <p6>` + `nptv6-prefix mapped-port <port>`).
+	// SetPath merges both lines onto one static-nat node with two nptv6-prefix
+	// children, the second being Keys=["nptv6-prefix","mapped-port","<port>"] — so
+	// `mapped-port` immediately follows the literal `nptv6-prefix` keyword. This
+	// was the LAST residual C179-038 silent-accept: while `nptv6-prefix` sat in the
+	// name-valued skip set the modifier was discarded before it reached
+	// recordNPTv6MappedPortPresence, so validateNPTv6Strict never fired and BOTH a
+	// malformed and a well-formed port were silently accepted. It is the exact
+	// sibling of the round-5 `prefix mapped-port` fix; both must now reject on
+	// presence. Parent-RED: re-adding "nptv6-prefix" to mappedPortNameValuedKeywords
+	// makes these two subtests go RED (the silent-accept returns).
+	t.Run("canonical-separate-valid-rejects", func(t *testing.T) {
+		assertNPTv6MappedPortReject(t, func() *ConfigTree {
+			return natBaseZoneV6Tree(t,
+				"set security nat static rule-set rs1 rule r1 then static-nat nptv6-prefix 2001:db8:1::/64",
+				"set security nat static rule-set rs1 rule r1 then static-nat nptv6-prefix mapped-port 8080")
+		})
+	})
+	t.Run("canonical-separate-malformed-rejects", func(t *testing.T) {
+		assertNPTv6MappedPortReject(t, func() *ConfigTree {
+			return natBaseZoneV6Tree(t,
+				"set security nat static rule-set rs1 rule r1 then static-nat nptv6-prefix 2001:db8:1::/64",
+				"set security nat static rule-set rs1 rule r1 then static-nat nptv6-prefix mapped-port notaport")
+		})
+	})
 	// Hierarchical: nptv6-prefix block with a nested mapped-port.
 	t.Run("hierarchical-valid-rejects", func(t *testing.T) {
 		assertNPTv6MappedPortReject(t, func() *ConfigTree {

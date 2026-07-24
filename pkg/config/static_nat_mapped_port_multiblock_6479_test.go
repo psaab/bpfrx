@@ -189,6 +189,55 @@ func TestStaticNATMappedPortMultiBlockPrefixSibling6479(t *testing.T) {
 	}
 }
 
+// TestStaticNATMappedPortMultiBlockBareThenValidProvenance6479 pins the #6479
+// diagnostic-provenance fix in mergeMappedPortState. When a bare/empty malformed
+// sibling latches the rule fail-closed (present, MappedPort==0, raw=="" =
+// "(missing value)"), a LATER VALID sibling (`mapped-port 9090`) must NOT
+// backfill its token into MappedPortRaw: the strict gate must still report the
+// true "(missing value)" diagnostic, not `mapped-port "9090"`. Before the fix the
+// unconditional raw-backfill in the failClosed branch captured the valid
+// operand's token, misnaming the error. Parent-RED: dropping the `port == 0`
+// guard on that backfill makes this go RED (the error names "9090").
+func TestStaticNATMappedPortMultiBlockBareThenValidProvenance6479(t *testing.T) {
+	// Sibling 1: a bare `mapped-port;` (no operand) — present-but-malformed with an
+	// empty raw ("(missing value)"). Sibling 2: a VALID `mapped-port 9090`. The
+	// bare sibling latches fail-closed; the valid sibling must not rewrite the
+	// provenance token. hierRuleV4AB carries NO match destination-port, so the
+	// present-but-malformed gate (MappedPort==0) is the only defect that fires.
+	tree := buildHier(t, hierRuleV4AB(
+		`                        static-nat { prefix 10.0.0.5/32 { mapped-port; } }
+                        static-nat { prefix 10.0.0.6/32 { mapped-port 9090; } }`))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("bare-then-valid multi-block must reject fail-closed (the bare sibling is malformed)")
+	}
+	if !strings.Contains(err.Error(), "(missing value)") {
+		t.Fatalf("diagnostic must name the bare sibling's \"(missing value)\", got %v", err)
+	}
+	if strings.Contains(err.Error(), "9090") {
+		t.Fatalf("the later VALID sibling's token 9090 must NOT backfill the diagnostic, got %v", err)
+	}
+	// Lenient path mirrors the diagnostic in a warning and installs no bogus port.
+	cfg, errL := CompileConfigLenient(tree)
+	if errL != nil {
+		t.Fatalf("lenient compile must not hard-error, got %v", errL)
+	}
+	rule := cfg.Security.NAT.Static[0].Rules[0]
+	if rule.MappedPort != 0 {
+		t.Fatalf("fail-closed rule must keep MappedPort==0 (no bogus port), got %d", rule.MappedPort)
+	}
+	var warned bool
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "(missing value)") && !strings.Contains(w, "9090") {
+			warned = true
+			break
+		}
+	}
+	if !warned {
+		t.Fatalf("lenient warning must name \"(missing value)\" and not 9090, got %v", cfg.Warnings)
+	}
+}
+
 // TestStaticNATMappedPortMultiBlockAccept6479 is the INVARIANT B guard: a clean
 // sibling target must NOT silently clear a VALID mapped-port set by another
 // sibling, and among valid siblings the LAST valid port wins. (Before the fix the
