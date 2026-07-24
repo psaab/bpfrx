@@ -59866,3 +59866,24 @@ top.
     assertion RED, proving it now binds (the old assertion PASSED under exactly
     that re-mint condition). Test-only; no production behavior change.
 - **File(s)**: pkg/api/server.go, pkg/daemon/management_5866_test.go, _Log.md
+- **Timestamp**: 2026-07-24 00:45 UTC
+  - **Action**: Refactor #6424 — split the 2,470-LOC pkg/frr/policy_render.go
+    god-renderer into cohesive per-aspect sibling files by PURE code-motion.
+    Extracted (whole functions/types, unchanged signatures + bodies):
+    render_validate.go (sanitize/valid* belt), redistribute.go (export->FRR
+    redistribute), bgp_policy_chain.go (#5277 ordered-chain resolution),
+    bfd.go (#2550 profile/peer accumulator), protocols_render.go
+    (generateProtocols OSPF/OSPFv3/BGP/RIP/ISIS), prefix_list_render.go
+    (ip|ipv6 prefix-list). Residual policy_render.go (885 LOC) keeps
+    policy-statement->route-map rendering + community classification +
+    redist-alias guard; its header rewritten to index the siblings.
+    Verified zero code-line delta (normalized diff old-single vs new-7-files
+    IDENTICAL, 1244 lines) — comment delta is only the new file headers.
+    gofmt/vet/build clean; FULL go test ./... GREEN. Regenerated
+    docs/refactoring-audit-current.txt (audit canary; note: heatmap was
+    already stale/RED on origin/master ed6999000 from unrelated pre-existing
+    drift, only the policy_render.go entry removal is mine).
+  - **File(s)**: pkg/frr/policy_render.go, pkg/frr/render_validate.go,
+    pkg/frr/redistribute.go, pkg/frr/bgp_policy_chain.go, pkg/frr/bfd.go,
+    pkg/frr/protocols_render.go, pkg/frr/prefix_list_render.go,
+    docs/refactoring-audit-current.txt, _Log.md
