@@ -7,6 +7,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 func (c *CLI) showDHCPLeases() error {
@@ -282,14 +283,16 @@ func (c *CLI) showDHCPServer(detail bool) error {
 		if detail {
 			fmt.Printf("  %-18s %-20s %-15s %-10s %-12s %s\n", "Address", "MAC", "Hostname", "Subnet", "Lifetime", "Expires")
 			for _, l := range leases4 {
+				// HWAddress and Hostname are device-supplied (client chaddr /
+				// DHCP option 12) — escape terminal control sequences (#6468).
 				fmt.Printf("  %-18s %-20s %-15s %-10s %-12s %s\n",
-					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
+					l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.SubnetID, l.ValidLife, l.ExpireTime)
 			}
 		} else {
 			fmt.Printf("  %-18s %-20s %-15s %-12s %s\n", "Address", "MAC", "Hostname", "Lifetime", "Expires")
 			for _, l := range leases4 {
 				fmt.Printf("  %-18s %-20s %-15s %-12s %s\n",
-					l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+					l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.ValidLife, l.ExpireTime)
 			}
 		}
 	}
@@ -301,14 +304,16 @@ func (c *CLI) showDHCPServer(detail bool) error {
 		if detail {
 			fmt.Printf("  %-40s %-20s %-15s %-10s %-12s %s\n", "Address", "HWAddress", "Hostname", "Subnet", "Lifetime", "Expires")
 			for _, l := range leases6 {
+				// HWAddress and Hostname are device-supplied — escape terminal
+				// control sequences before display (#6468).
 				fmt.Printf("  %-40s %-20s %-15s %-10s %-12s %s\n",
-					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
+					l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.SubnetID, l.ValidLife, l.ExpireTime)
 			}
 		} else {
 			fmt.Printf("  %-40s %-20s %-15s %-12s %s\n", "Address", "HWAddress", "Hostname", "Lifetime", "Expires")
 			for _, l := range leases6 {
 				fmt.Printf("  %-40s %-20s %-15s %-12s %s\n",
-					l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+					l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.ValidLife, l.ExpireTime)
 			}
 		}
 	}

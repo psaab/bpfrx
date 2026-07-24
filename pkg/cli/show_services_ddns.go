@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // showServicesDynamicDNS renders the Surface A (router/interface-address) DDNS
@@ -174,8 +175,10 @@ func (c *CLI) showDHCPDynamicDNS(detail bool) error {
 				if r.PTRPending {
 					pending = "PTR"
 				}
+				// FQDN is built from the device-supplied DHCP client hostname
+				// (option 12) — escape terminal control sequences (#6468).
 				fmt.Printf("    %-32s %-6s %-39s %-26s %s\n",
-					r.FQDN, r.ForwardType, r.Address, r.PTRName, pending)
+					termsafe.SanitizeForDisplay(r.FQDN), r.ForwardType, r.Address, r.PTRName, pending)
 			}
 		}
 	}

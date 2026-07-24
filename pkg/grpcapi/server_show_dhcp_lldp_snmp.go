@@ -16,6 +16,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dhcpserver"
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // showSNMP renders `cli show snmp` — community/trap-group/USM-user
@@ -108,7 +109,7 @@ func (s *Server) showDHCPServer(buf *strings.Builder) {
 		fmt.Fprintf(buf, "  %-18s %-20s %-15s %-12s %s\n", "Address", "MAC", "Hostname", "Lifetime", "Expires")
 		for _, l := range leases4 {
 			fmt.Fprintf(buf, "  %-18s %-20s %-15s %-12s %s\n",
-				l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+				l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.ValidLife, l.ExpireTime)
 		}
 	}
 	if len(leases6) > 0 {
@@ -121,7 +122,7 @@ func (s *Server) showDHCPServer(buf *strings.Builder) {
 		fmt.Fprintf(buf, "  %-40s %-20s %-15s %-12s %s\n", "Address", "HWAddress", "Hostname", "Lifetime", "Expires")
 		for _, l := range leases6 {
 			fmt.Fprintf(buf, "  %-40s %-20s %-15s %-12s %s\n",
-				l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+				l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.ValidLife, l.ExpireTime)
 		}
 	}
 }
@@ -197,7 +198,7 @@ func (s *Server) showDHCPServerDetail(cfg *config.Config, buf *strings.Builder) 
 			fmt.Fprintf(buf, "  %-18s %-20s %-15s %-10s %-12s %s\n", "Address", "MAC", "Hostname", "Subnet", "Lifetime", "Expires")
 			for _, l := range leases4 {
 				fmt.Fprintf(buf, "  %-18s %-20s %-15s %-10s %-12s %s\n",
-					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
+					l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.SubnetID, l.ValidLife, l.ExpireTime)
 			}
 		}
 		if len(leases6) > 0 {
@@ -206,7 +207,7 @@ func (s *Server) showDHCPServerDetail(cfg *config.Config, buf *strings.Builder) 
 			fmt.Fprintf(buf, "  %-40s %-20s %-15s %-10s %-12s %s\n", "Address", "HWAddress", "Hostname", "Subnet", "Lifetime", "Expires")
 			for _, l := range leases6 {
 				fmt.Fprintf(buf, "  %-40s %-20s %-15s %-10s %-12s %s\n",
-					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
+					l.Address, termsafe.SanitizeForDisplay(l.HWAddress), termsafe.SanitizeForDisplay(l.Hostname), l.SubnetID, l.ValidLife, l.ExpireTime)
 			}
 		}
 	} else {
@@ -296,7 +297,7 @@ func (s *Server) showDHCPDynamicDNS(cfg *config.Config, buf *strings.Builder, de
 					pending = "PTR"
 				}
 				fmt.Fprintf(buf, "    %-32s %-6s %-39s %-26s %s\n",
-					r.FQDN, r.ForwardType, r.Address, r.PTRName, pending)
+					termsafe.SanitizeForDisplay(r.FQDN), r.ForwardType, r.Address, r.PTRName, pending)
 			}
 		}
 	}

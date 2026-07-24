@@ -167,6 +167,26 @@ presenter's rendered output is byte-identical:
   when the daemon hookups are absent (test/standalone).
 - `fwdSampler` (forwarding CPU stats) can be `nil` — every show handler
   null-checks it.
+- Device-originated strings printed to the operator's terminal MUST pass
+  through `termsafe.SanitizeForDisplay` (`pkg/termsafe`, #6468). A DHCP lease
+  hostname (option 12) and client hardware address are supplied by a device on
+  a served segment and stored opaque by Kea; the DHCP-DDNS forward record name
+  is built from that same hostname. Printed raw they can smuggle terminal
+  escape sequences (OSC 52 clipboard write, CSI erase/redraw) that the terminal
+  acts on — clipboard hijack and output spoofing. The helper backslash-escapes
+  C0/DEL/C1 control bytes and invalid UTF-8 while passing legitimate multibyte
+  UTF-8 through unchanged. `show dhcp server leases` runs on BOTH the local and
+  the remote CLI, so the guard is applied on BOTH terminal-facing renderers:
+  `pkg/cli` (`show_services_dhcp.go` lease `Hostname`/`HWAddress`,
+  `show_services_ddns.go` owned-record `FQDN`) AND the gRPC text renderer that
+  feeds the remote `cli`'s verbatim `fmt.Print(resp.Output)`
+  (`pkg/grpcapi/server_show_dhcp_lldp_snmp.go`, same fields). The sanitizer
+  lives in the leaf package `pkg/termsafe` (stdlib-only) because `pkg/cli`
+  imports `pkg/grpcapi`, so a helper in `pkg/cli` could not be shared upward.
+  LLDP neighbor fields are already sanitized at the ingest boundary
+  (`lldp.sanitizeTLVString`); the DHCPv6 DUID view and the Surface A DDNS name
+  are firewall-self/operator-authored, not device-controlled, so they are left
+  raw.
 - Session filters (`session_filter.go`) serve BOTH show and clear. The
   clear path must call `validate()` (unknown zone/pool names are
   command errors — an inert filter degrades into clear-nothing or, via

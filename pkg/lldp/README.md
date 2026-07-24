@@ -209,7 +209,12 @@ Two properties keep this safe (#2372 review findings 3 + 6):
   `show lldp neighbors` table read already-clean strings. Each Unicode
   control rune (C0 `0x00-0x1F` including ESC/CR/LF, DEL `0x7F`, and C1
   `0x80-0x9F`) is replaced by a space; a legitimate multi-byte UTF-8 name is
-  preserved unchanged (`strings.Map` is rune-aware). This is the
-  LLDP-receive counterpart of the #1798/#3900 free-text sanitizer and
-  neutralizes terminal-escape spoofing (`show lldp neighbors`) and syslog
-  log-injection (a forged/split log line) from a hostile neighbor.
+  preserved unchanged (`strings.Map` is rune-aware). A **raw invalid-UTF-8
+  byte** (e.g. a bare `0x9B`, the 8-bit CSI introducer an 8-bit terminal acts
+  on like `ESC[`) is folded to `U+FFFD`: it is not a control *rune*, so the
+  fast-path skip now also gates on `utf8.ValidString` to force the
+  `strings.Map` slow path for any invalid-UTF-8 input — an `IsControl`-only
+  skip returned such a byte verbatim (#6482). This is the LLDP-receive
+  counterpart of the #1798/#3900 free-text sanitizer and neutralizes
+  terminal-escape spoofing (`show lldp neighbors`) and syslog log-injection (a
+  forged/split log line) from a hostile neighbor.
