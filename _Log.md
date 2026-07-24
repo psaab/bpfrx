@@ -36,6 +36,43 @@
   2 pre-existing #[ignore] CoS benches); release build (LTO off,
   codegen-units 16) has NO out-of-line walk_ipv6_ext_chain symbol — the
   #[inline(always)] core folds into every caller across CGUs.
+## 2026-07-24 — #6459/#6463/#6477: fail-close partial filter port/address lists on the tolerant path
+
+- **Timestamp**: 2026-07-24 (fix/6459-filter-fail-closed-markers)
+- **Action**: Closed the tolerant/HA-sync silent-narrowing class for filter
+  port and address lists, and aligned the Rust filter port parser with the
+  other three port parsers. (1) #6459: a partially-unresolvable port list
+  previously narrowed a term on the tolerant path; the term now carries the
+  `PortsUnrepresentable` marker and the whole snapshot rejects at the helper
+  integrity preflight, matching the #3406 ICMP/DSCP/tcp-flags/flex family
+  (same SnapshotIntegrityError struct-variant shape, same preflight
+  placement, same Go builder + render treatment). (2) #6463: same class for
+  malformed address literals via `AddressUnrepresentable`
+  (`recordFilterAddrTokens` records only classifier rejects; valid lists,
+  placeholders, and wrong-family literals verified marker-free). (3) #6477:
+  Rust filter `parse_port_spec` now routes through the shared digit-only
+  `parse_port_u16` (#3606) so `+80` and other non-canonical tokens reject
+  identically on all four parsers. Wire: `ports_unrepresentable` /
+  `address_unrepresentable` tag-matched Go emit ↔ Rust decode;
+  `protocol_wire_v1.json` regenerated (exactly two keys); `golden_4406.json`
+  delta is exactly the new zero-value struct field x12 terms.
+- **File(s)**: pkg/config/{compiler_firewall.go,
+  compiler_validate_warn_firewall.go, filter_match_resolve.go,
+  types_system.go, firewall_address_unknown_6463_test.go,
+  testdata/golden_4406.json}, pkg/dataplane/userspace/{filters.go,
+  filters_snapshot_integrity_6459_test.go, firewall_snapshot_render.go,
+  protocol_policies.go}, userspace-dp/src/filter/{compiler.rs, tests.rs,
+  README.md}, userspace-dp/src/{policy.rs, policy_snapshot_error.rs},
+  userspace-dp/src/protocol/{security.rs, tests.rs},
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/config-schema.md
+- **Validation**: RED-on-revert confirmed firsthand on all three legs (Go
+  emit, Go builder, Rust decode each reverted → the new tests fail with the
+  pre-fix narrowing visible). Full pkg/config + pkg/dataplane/userspace Go
+  suites GREEN; full Rust bin suite 4165 passed / 0 failed;
+  wire_invariant_default_specimens + TestCompileGolden4406 GREEN; go
+  build/vet clean on touched packages. Independent hostile review:
+  MERGE-NEEDS-MINOR (this _Log entry + a pre-existing lo0 nft-mirror
+  residual filed as a follow-up).
 
 ## 2026-07-23 — #5557 (advance): host-inbound service-token case-fold in the junos-host coarse shield
 
