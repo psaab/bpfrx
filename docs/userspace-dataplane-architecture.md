@@ -1324,7 +1324,16 @@ dedicated policy-scheduler republish (`UpdatePolicyScheduleState`) does — so a
 route flap never ships a snapshot that reports success while the helper enforces
 a stale schedule window. Previously the overlay only cached the map and inherited
 the last-compiled policy sections, leaving the helper on stale bits until the next
-scheduler tick or full apply.
+scheduler tick or full apply. Both republish paths share one core
+(`rebuildScheduledPolicySectionsLocked`), which re-applies the StableZoneID zone
+quarantine's policy scrub after rebuilding `policies` from raw config (#6480): the
+raw builder has no knowledge of the quarantine and would reintroduce a policy
+referencing a quarantined zone, while the inherited `next.Zones` stays reduced —
+a dangling policy->zone reference the Rust `UnresolvableZoneReference` preflight
+rejects wholesale. Because the ip-monitoring actuator updates FRR *before* the
+publish, that reject would strand the kernel/FRR on the new routes while userspace
+kept the old FIB, unable to converge; the shared scrub keeps both paths in
+lockstep so neither can drift.
 #1377 now preserves unusable pool-mode source-NAT rules in the snapshot and
 fails closed at the `poll_descriptor.rs` source-NAT call sites for missing
 pools, empty pools, invalid pool inputs, wrong-family-only pools, or allocator

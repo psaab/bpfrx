@@ -200,41 +200,25 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 		return false, fmt.Errorf("build route overlay snapshot: %w", err)
 	}
 
-	// #5328 (A6-b2-F4): when the caller supplies a policy-scheduler
-	// active-state map, refresh the policy snapshot's inactive bits from
-	// that map in THIS publish — the doc contract above promised it, and
-	// daemon_ipmon.go passes a live scheduler.ActiveState() here. Before
-	// this fix only m.policySchedulerActive was cached (above) while
-	// `next := *m.lastSnapshot` inherited the PRIOR compiled Policies /
-	// AddressBooks verbatim, so the helper enforced stale schedule bits and
-	// this publish reported success while the dataplane dropped/permitted a
-	// scheduled rule against the wrong window — until the dedicated
-	// UpdatePolicyScheduleState callback next fired (plus a redundant full
-	// reconcile). Rebuild exactly as the scheduler-only republish does
-	// (buildPolicySnapshotsWithSchedulerStateAndFeeds +
-	// collectPolicyContentRejections + buildAddressBookTableWithFeeds),
-	// reusing the cached feed overlay so a concurrent CoS scheduler flip is
-	// not dropped, and placed BEFORE the duplicate-skip hash below so a
-	// scheduler-only bit flip on unchanged routes is not falsely deduped. A
-	// nil schedulerState leaves the inherited policy sections untouched
-	// (the route-apply caller that never carries scheduler state).
+	// #5328 (A6-b2-F4): when the caller supplies a policy-scheduler active-state
+	// map, refresh the policy snapshot's inactive bits from that map in THIS
+	// publish — the doc contract above promised it, and daemon_ipmon.go passes a
+	// live scheduler.ActiveState() here. Before this fix only m.policySchedulerActive
+	// was cached (above) while `next := *m.lastSnapshot` inherited the PRIOR
+	// compiled Policies / AddressBooks verbatim, so the helper enforced stale
+	// schedule bits while this publish reported success — until the dedicated
+	// UpdatePolicyScheduleState callback next fired. Rebuild exactly as the
+	// scheduler-only republish does, via the shared rebuildScheduledPolicySectionsLocked
+	// (which reuses the cached feed overlay AND re-applies the StableZoneID zone
+	// quarantine's policy scrub so a rebuilt policy never dangles against the
+	// inherited, already-reduced next.Zones — #6480). Placed BEFORE the
+	// duplicate-skip hash below so a scheduler-only bit flip on unchanged routes is
+	// not falsely deduped. A nil schedulerState leaves the inherited policy sections
+	// untouched (the route-apply caller that never carries scheduler state).
 	if schedulerState != nil {
-		feedOverlay := cloneFeedOverlay(m.feedOverlay)
-		policies, perr := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, m.policySchedulerActive, feedOverlay)
-		if perr != nil {
-			return false, fmt.Errorf("build policy overlay snapshot for scheduler state: %w", perr)
+		if err := m.rebuildScheduledPolicySectionsLocked(&next, cfg, m.policySchedulerActive); err != nil {
+			return false, fmt.Errorf("build policy overlay snapshot for scheduler state: %w", err)
 		}
-		next.Policies = policies
-		// #3261: recompute the content-rejection diagnostic from the new
-		// rules' sentinels; the copied lastSnapshot value would be stale.
-		next.Capabilities.PolicyContentRejected = collectPolicyContentRejections(policies)
-		// #1606: refresh the address-book table alongside the policies so
-		// book IDs cited by the rebuilt rules always resolve dataplane-side.
-		books, _, berr := buildAddressBookTableWithFeeds(cfg, feedOverlay)
-		if berr != nil {
-			return false, fmt.Errorf("build address-book overlay snapshot for scheduler state: %w", berr)
-		}
-		next.AddressBooks = books
 	}
 
 	// Duplicate-publish skip: identical content (e.g. the actuator ran
