@@ -60652,3 +60652,39 @@ top.
   vet / gofmt / pkg-ipsec-suite / heatmap GREEN.
 - **File(s)**: pkg/ipsec/policy.go,
     pkg/ipsec/swanctl_addr_sanitize_6469_test.go, pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-07-24
+- **Action**: #6455 — close the two family-wide limitations of the
+    pre-expansion duplicate-name commit gates
+    (validateDuplicateNamedBlockAST #5180, validateDuplicateNATRuleNamesAST
+    #5649, validateDuplicateNATRuleSetNamesAST #6454). Finding 1
+    (group-authored duplicates): the three gates scanned ONLY the top-level
+    stanzas, so a duplicate authored entirely inside an applied group body
+    (no inline peer to deep-merge it) was appended wholesale by mergeNodes and
+    survived ExpandGroups() as two rows with no gate to catch it. Added
+    scanNamespaces (dup_names_6455.go): each gate's scan runs once for the
+    top-level stanza list AND once per DEFINED group body, each a SEPARATE
+    namespace with a fresh seen-set. False-positive-safe — a group-vs-inline
+    same name deep-merges to one node (different namespaces, never
+    cross-counted), a same name across two groups coalesces via mergeNodes (no
+    surviving duplicate), and the #3096 bracket-list Cartesian expansion
+    happens later in compileExpanded so the pre-compile AST scan (one instance)
+    never flags it. Strictly more complete than a post-expansion rescan (which
+    would miss a group-internal duplicate an inline peer coalesces). Group-body
+    duplicates name the enclosing group in the diagnostic. Finding 2
+    (quoted-empty names): the gates `continue` on an empty name, so a
+    quoted-empty name (`rule ""`, `rule-set ""`, `group ""`, `interface ""`,
+    `ids-option ""`) was neither dup-rejected nor empty-rejected. An empty name
+    is not a valid operational identity — recorded as an emptyName6455 defect
+    (strict rejects, lenient warns), mirroring the #5636 empty-credential
+    rejection. Duplicates keep first-error priority so a no-empty-name config
+    produces byte-identical pre-#6455 diagnostics. Parent-RED confirmed
+    firsthand per finding: neutralize the group-body scan → all 4
+    group-authored reject sub-tests RED on clean assertions while the 4
+    no-false-positive accepts stay GREEN; neutralize emptyNameError → all 5
+    empty-name reject sub-tests RED. go build ./... / go vet ./pkg/config/ /
+    gofmt / full pkg/config suite / refactoraudit heatmap all GREEN.
+- **File(s)**: pkg/config/dup_names_6455.go (new),
+    pkg/config/dup_named_blocks.go, pkg/config/dup_nat_rule_names.go,
+    pkg/config/dup_nat_ruleset_names.go,
+    pkg/config/dup_names_6455_test.go (new), docs/config-schema.md, _Log.md

@@ -32,8 +32,9 @@ var screenIDSFamily = map[string]bool{
 
 // dupBlock is one detected duplicate authored hierarchical named block.
 type dupBlock struct {
-	kind string // human category, e.g. "interface" / "screen ids-option"
-	name string // the duplicated name
+	kind     string // human category, e.g. "interface" / "screen ids-option"
+	name     string // the duplicated name
+	groupCtx string // "" for a top-level duplicate, else the enclosing group name
 }
 
 // validateDuplicateNamedBlockAST rejects (strict) or warns (lenient) when the
@@ -62,22 +63,32 @@ type dupBlock struct {
 // flat shape merges it in, the hierarchical shape is told to author it once.
 //
 // It runs PRE-expansion on the (inactive-pruned) clone alongside the tunnel /
-// zone / routing-instance collision gates, and it walks ONLY the top-level
-// `interfaces`/`security` stanzas — never a group body — so a legitimate
-// apply-groups inheritance (expandGroups deep-MERGES a group's interface/screen
-// config into the target, producing no duplicate sibling) is not misreported.
-// The `groups` check is inherently top-level. Strict on commit / commit-check;
-// lenient on tolerant load / peer-sync (#1960 no-brick), where the runtime
-// keeps the historical last-writer-wins result and boots.
+// zone / routing-instance collision gates. The `interfaces` and `screen
+// ids-option` checks scan BOTH the top-level stanzas AND each defined group body
+// as a SEPARATE namespace (scanNamespaces, #6455): a legitimate apply-groups
+// inheritance (expandGroups deep-MERGES a group's block into a same-named inline
+// peer) produces no duplicate sibling and is not misreported — the fresh
+// per-namespace seen-set never cross-counts a group block against its inline peer
+// — while a duplicate authored ENTIRELY inside a group body (no inline peer, so
+// expandGroups appends the parent container wholesale) IS caught. The `groups`
+// name check is inherently top-level (Junos has no nested group definitions). A
+// quoted-empty group / interface / screen-ids-option name is recorded as an
+// emptyName6455 defect (#6455) rather than skipped. Strict on commit /
+// commit-check; lenient on tolerant load / peer-sync (#1960 no-brick), where the
+// runtime keeps the historical last-writer-wins result and boots.
 func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, error) {
 	if tree == nil {
 		return nil, nil
 	}
 	var dups []dupBlock
+	var empties []emptyName6455
 
-	// 1. groups { <name> { … } } — mirror ast_groups.go name extraction.
+	// 1. groups { <name> { … } } — top-level only (Junos has no nested group
+	// definitions). Mirror ast_groups.go name extraction; an empty group name is
+	// an emptyName6455 defect.
 	seenGroup := map[string]bool{}
 	reportedGroup := map[string]bool{}
+	emptyGroupReported := false
 	for _, child := range tree.Children {
 		if child.Name() != "groups" {
 			continue
@@ -85,11 +96,15 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 		for _, g := range child.Children {
 			name := groupDefinitionName(g)
 			if name == "" {
+				if len(g.Keys) >= 1 && !emptyGroupReported {
+					empties = append(empties, emptyName6455{"group", ""})
+					emptyGroupReported = true
+				}
 				continue
 			}
 			if seenGroup[name] {
 				if !reportedGroup[name] {
-					dups = append(dups, dupBlock{"group", name})
+					dups = append(dups, dupBlock{"group", name, ""})
 					reportedGroup[name] = true
 				}
 			} else {
@@ -98,105 +113,138 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 		}
 	}
 
-	// 2. interfaces { <ifname> { … } } — mirror compileInterfaces (non-leaf
-	// child keyed by Name(), skipping the non-interface container keywords).
-	// Union across every top-level `interfaces` stanza so a name split across
-	// two stanzas (also last-writer-wins in compileSections) is caught.
-	seenIf := map[string]bool{}
-	reportedIf := map[string]bool{}
-	for _, child := range tree.Children {
-		if child.Name() != "interfaces" {
-			continue
-		}
-		for _, ifc := range child.Children {
-			if ifc.IsLeaf {
+	// 2 + 3. interfaces { <ifname> { … } } and security { screen { ids-option
+	// <name> { … } } } — scanned in the top-level stanzas AND each group body as a
+	// separate namespace (#6455). Each namespace gets a fresh seen-set so a
+	// group-vs-inline deep-merge is not cross-counted, but a duplicate authored
+	// entirely inside a group body is caught.
+	scanNamespaces(tree, func(stanzas []*Node, groupCtx string) {
+		// 2. interfaces — mirror compileInterfaces (non-leaf child keyed by
+		// Name(), skipping the non-interface container keywords). Union across
+		// every `interfaces` stanza in this namespace so a name split across two
+		// stanzas (also last-writer-wins in compileSections) is caught.
+		seenIf := map[string]bool{}
+		reportedIf := map[string]bool{}
+		emptyIfReported := false
+		for _, child := range stanzas {
+			if child.Name() != "interfaces" {
 				continue
 			}
-			name := ifc.Name()
-			if name == "" || nonInterfaceIfKeyword[name] {
-				continue
-			}
-			if seenIf[name] {
-				if !reportedIf[name] {
-					dups = append(dups, dupBlock{"interface", name})
-					reportedIf[name] = true
-				}
-			} else {
-				seenIf[name] = true
-			}
-		}
-	}
-
-	// 3. security { screen { ids-option <name> { … } } } — duplicate profile
-	// names AND duplicate same-family blocks within one profile. Union across
-	// every top-level `security` stanza and every `screen` block therein.
-	seenProfile := map[string]bool{}
-	reportedProfile := map[string]bool{}
-	for _, child := range tree.Children {
-		if child.Name() != "security" {
-			continue
-		}
-		for _, screen := range child.FindChildren("screen") {
-			for _, inst := range namedInstances(screen.FindChildren("ids-option")) {
-				if inst.name == "" {
+			for _, ifc := range child.Children {
+				if ifc.IsLeaf {
 					continue
 				}
-				if seenProfile[inst.name] {
-					if !reportedProfile[inst.name] {
-						dups = append(dups, dupBlock{"screen ids-option", inst.name})
-						reportedProfile[inst.name] = true
+				name := ifc.Name()
+				if name == "" {
+					if len(ifc.Keys) >= 1 && !emptyIfReported {
+						empties = append(empties, emptyName6455{"interface", groupCtx})
+						emptyIfReported = true
+					}
+					continue
+				}
+				if nonInterfaceIfKeyword[name] {
+					continue
+				}
+				if seenIf[name] {
+					if !reportedIf[name] {
+						dups = append(dups, dupBlock{"interface", name, groupCtx})
+						reportedIf[name] = true
 					}
 				} else {
-					seenProfile[inst.name] = true
+					seenIf[name] = true
 				}
-				// Duplicate family block WITHIN this ids-option instance.
-				famSeen := map[string]bool{}
-				famReported := map[string]bool{}
-				for _, fam := range inst.node.Children {
-					fn := fam.Name()
-					if !screenIDSFamily[fn] {
+			}
+		}
+
+		// 3. security screen ids-option — duplicate profile names AND duplicate
+		// same-family blocks within one profile. Union across every `security`
+		// stanza and every `screen` block therein in this namespace.
+		seenProfile := map[string]bool{}
+		reportedProfile := map[string]bool{}
+		emptyProfileReported := false
+		for _, child := range stanzas {
+			if child.Name() != "security" {
+				continue
+			}
+			for _, screen := range child.FindChildren("screen") {
+				for _, inst := range namedInstances(screen.FindChildren("ids-option")) {
+					if inst.name == "" {
+						if !emptyProfileReported {
+							empties = append(empties, emptyName6455{"screen ids-option", groupCtx})
+							emptyProfileReported = true
+						}
 						continue
 					}
-					if famSeen[fn] {
-						if !famReported[fn] {
-							dups = append(dups, dupBlock{
-								kind: fmt.Sprintf("screen ids-option %q family", inst.name),
-								name: fn,
-							})
-							famReported[fn] = true
+					if seenProfile[inst.name] {
+						if !reportedProfile[inst.name] {
+							dups = append(dups, dupBlock{"screen ids-option", inst.name, groupCtx})
+							reportedProfile[inst.name] = true
 						}
 					} else {
-						famSeen[fn] = true
+						seenProfile[inst.name] = true
+					}
+					// Duplicate family block WITHIN this ids-option instance.
+					famSeen := map[string]bool{}
+					famReported := map[string]bool{}
+					for _, fam := range inst.node.Children {
+						fn := fam.Name()
+						if !screenIDSFamily[fn] {
+							continue
+						}
+						if famSeen[fn] {
+							if !famReported[fn] {
+								dups = append(dups, dupBlock{
+									kind:     fmt.Sprintf("screen ids-option %q family", inst.name),
+									name:     fn,
+									groupCtx: groupCtx,
+								})
+								famReported[fn] = true
+							}
+						} else {
+							famSeen[fn] = true
+						}
 					}
 				}
 			}
 		}
-	}
+	})
 
-	if len(dups) == 0 {
+	if len(dups) == 0 && len(empties) == 0 {
 		return nil, nil
 	}
-	// Deterministic order: kind, then name.
+	// Deterministic order: kind, then name, then group context.
 	sort.Slice(dups, func(i, j int) bool {
 		if dups[i].kind != dups[j].kind {
 			return dups[i].kind < dups[j].kind
 		}
-		return dups[i].name < dups[j].name
+		if dups[i].name != dups[j].name {
+			return dups[i].name < dups[j].name
+		}
+		return dups[i].groupCtx < dups[j].groupCtx
 	})
+	sortEmptyNames(empties)
 
 	if !lenient {
-		d := dups[0]
-		return nil, fmt.Errorf("duplicate %s %q: a repeated hierarchical block is "+
-			"silently reduced to last-writer-wins, dropping the earlier block's "+
-			"configuration — author it once (flat `set` merges repeated "+
-			"statements automatically) (#5180)", d.kind, d.name)
+		// Duplicates keep first-error priority so the pre-#6455 messages are
+		// unchanged when no empty name is present.
+		if len(dups) > 0 {
+			d := dups[0]
+			return nil, fmt.Errorf("duplicate %s %q%s: a repeated hierarchical block is "+
+				"silently reduced to last-writer-wins, dropping the earlier block's "+
+				"configuration — author it once (flat `set` merges repeated "+
+				"statements automatically) (#5180)", d.kind, d.name, groupCtxSuffix(d.groupCtx))
+		}
+		return nil, emptyNameError(empties[0])
 	}
 
-	warnings := make([]string, 0, len(dups))
+	warnings := make([]string, 0, len(dups)+len(empties))
 	for _, d := range dups {
-		warnings = append(warnings, fmt.Sprintf("duplicate %s %q: only the LAST "+
+		warnings = append(warnings, fmt.Sprintf("duplicate %s %q%s: only the LAST "+
 			"hierarchical block is kept (earlier block dropped) — author it once "+
-			"to avoid silently losing config (#5180)", d.kind, d.name))
+			"to avoid silently losing config (#5180)", d.kind, d.name, groupCtxSuffix(d.groupCtx)))
+	}
+	for _, e := range empties {
+		warnings = append(warnings, emptyNameWarning(e))
 	}
 	return warnings, nil
 }
