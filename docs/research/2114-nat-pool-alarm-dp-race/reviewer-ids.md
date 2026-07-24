@@ -71,6 +71,9 @@ reviewer (joins at /engineer on the code PR).
 | r22 | Codex | codex companion task-mrzhcqms-c4sh29 (session 019f9621-6127-7b13-b891-4dc25b622385) | NEEDS-REVISION (4 MAJOR, 3 MINOR) |
 | r22 | AGY | agy print-mode direct (agy-plan-r22.md) | PLAN-READY (attack-1 assumes the unspecified clear transition — see claude-smr-plan-r22.md) |
 | r22 | Claude SMR | in-conversation (claude-smr-plan-r22.md) | NEEDS-REVISION (1 MAJOR, 1 MINOR — the D-kind retry hazard, converging with Codex M2) |
+| r23 | Codex | codex companion task-mrzidzng-o7br27 (session 019f963b-e63a-7683-be11-7b73d526b21c) | NEEDS-REVISION (2 MAJOR, 3 MINOR) |
+| r23 | AGY | agy print-mode direct (agy-plan-r23.md) | PLAN-READY (attack-2 cites the wrong lines for the transient pin — see claude-smr-plan-r23.md + agy-plan-r23.md header note) |
+| r23 | Claude SMR | in-conversation (claude-smr-plan-r23.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — the (d-i) transient boundary, converging with Codex M1) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
