@@ -5,13 +5,14 @@
   coarse `application any` shield so it matches enforcement, which lower-cases
   every token (unionHostInboundTokens/lowerTokens in pkg/dataplane/userspace and
   the Rust classify_system_service). A lenient-loaded UPPER-case `IKE`/`IPSEC`/
-  `ALL`/`IDENT-RESET` full-admits on the wire, but `junosHostZoneExemptNetdevs`
-  compared the raw case (`s == "ike"`, `HostInboundFullAdmitService("ALL")`) and
+  `ALL` reaches the wire admitted (`IDENT-RESET` RST-marked), but
+  `junosHostZoneExemptNetdevs` compared the raw case (`s == "ike"`,
+  `HostInboundFullAdmitService("ALL")`) and
   so left CoarseAdmitsIKE/CoarseIdentResets false — the coarse shield then
   DROPPED the very IKE/NAT-T (udp 500/4500) and ident (tcp 113) traffic the
   host-inbound gate admits (#5557 A3 survivor; distinct from the seven #6393
   items). The sibling protocol path in the same file already normalizes
-  (junosHostAppL4), so this closes the one un-normalized host-inbound match.
+  (junosHostReduceApp), so this closes the one un-normalized host-inbound match.
 - **Files**: pkg/config/host_inbound_tokens.go (HostInboundFullAdmitService now
   case/space-folds — this also fixes the #3226 commit full-admit advisory
   silently skipping an upper-case `ALL`), pkg/config/junos_host_deny.go

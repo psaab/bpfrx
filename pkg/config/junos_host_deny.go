@@ -877,7 +877,7 @@ func junosHostSvcAdmitsIKE(svc []string) bool {
 		// Match enforcement, which lower-cases every token before admitting
 		// (unionHostInboundTokens/lowerTokens in pkg/dataplane/userspace, the
 		// Rust classify_system_service). The sibling protocol path in this file
-		// already normalizes (junosHostAppL4, line ~775); the service path must
+		// already normalizes (junosHostReduceApp, line ~776); the service path must
 		// too or a lenient-loaded upper-case `IKE`/`IPSEC`/`ALL` is admitted by
 		// enforcement yet missed here, so the coarse `application any` shield
 		// drops the very IKE/NAT-T it was supposed to exempt (#5557).

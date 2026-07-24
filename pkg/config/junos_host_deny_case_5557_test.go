@@ -6,10 +6,11 @@ import "testing"
 // for the #5557 host-inbound service-token case drift. Enforcement lower-cases
 // every host-inbound token before admitting (unionHostInboundTokens /
 // lowerTokens in pkg/dataplane/userspace and the Rust classify_system_service),
-// so a lenient-loaded UPPER-case `IKE`/`IPSEC`/`ALL`/`IDENT-RESET` full-admits
-// on the wire. The junos-host coarse `application any` shield must reach the
-// SAME verdict, or it drops the very IKE/NAT-T (udp 500/4500) and ident (tcp
-// 113 RST) traffic enforcement admits.
+// so a lenient-loaded UPPER-case `IKE`/`IPSEC`/`ALL` is admitted (and
+// `IDENT-RESET` RST-marked) on the wire. The junos-host coarse `application
+// any` shield must reach the SAME verdict, or it drops the very IKE/NAT-T (udp
+// 500/4500) and ident (tcp 113 RST) traffic enforcement admits. Only `ALL`/
+// `any-service` are packet-wide full-admits; `IKE`/`IPsec` admit udp 500/4500.
 //
 // This mirrors the lower-case TestJunosHostExemptionFlags with upper-case
 // tokens. Reverting the case-fold (junosHostSvcAdmitsIKE / the note() loop /
@@ -32,15 +33,15 @@ func TestJunosHostExemptionFlagsCaseInsensitive_5557(t *testing.T) {
 	// IKE / IPsec / full-admit are all case-insensitive coarse-admits for IKE.
 	for _, tok := range []string{"IKE", "IPsec", "ALL", "Any-Service"} {
 		if p := mk(tok); !p.CoarseAdmitsIKE {
-			t.Errorf("system-services %q: want CoarseAdmitsIKE (enforcement full-admits, shield must too)", tok)
+			t.Errorf("system-services %q: want CoarseAdmitsIKE (enforcement admits, shield must too)", tok)
 		}
 	}
 	// Upper-case ident-reset must set the RST verdict, matching enforcement.
 	if p := mk("IDENT-RESET"); !p.CoarseIdentResets {
 		t.Error("system-services IDENT-RESET: want CoarseIdentResets")
 	}
-	// A single per-interface upper-case IKE override must scope the exemption to
-	// its own netdev (the CoarseAdmitsIKE bit follows len(IKEExemptNetdevs)).
+	// A zone-level upper-case IKE service must scope the exemption to a netdev
+	// (the CoarseAdmitsIKE bit follows len(IKEExemptNetdevs)).
 	if p := mk("IKE"); len(p.IKEExemptNetdevs) == 0 {
 		t.Error("system-services IKE: want a scoped IKE-exempt netdev, got none")
 	}
