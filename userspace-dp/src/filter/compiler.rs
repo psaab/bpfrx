@@ -1,6 +1,10 @@
 // Snapshot/AST → typed Filter compiler extracted from filter.rs (#1049 P2 structural split).
-// Pure relocation — bodies are byte-for-byte identical; only the
-// enclosing module and visibility paths change.
+// #6434: `parse_filter_state_with_three_color_preserving` and `parse_term`
+// are decomposed into single-responsibility phase helpers (policer runtime
+// loading / filter-table build / interface assignment / aggregate recompute /
+// lo0 resolution; marker preflight / value-range preflight / address /
+// protocol / cross-field / port / action / flex lowering + term assembly).
+// Pure code motion — the compiled `FilterState` is bit-identical.
 
 use super::*;
 
@@ -61,15 +65,36 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
     previous: Option<&FilterState>,
 ) -> Result<FilterState, SnapshotIntegrityError> {
     let mut state = FilterState::default();
+    let mut used_runtime_ids = rustc_hash::FxHashSet::default();
+    load_three_color_policer_runtimes(
+        &mut state,
+        three_color_policers,
+        previous,
+        &mut used_runtime_ids,
+    );
+    lower_single_rate_policer_runtimes(&mut state, policers, previous, &mut used_runtime_ids);
+    parse_filter_table(&mut state, filters)?;
+    assign_interface_filters(&mut state, interfaces)?;
+    recompute_fast_map_aggregates(&mut state);
+    state.lo0_filter_v4_fast = resolve_lo0_filter(&state.filters, "inet", lo0_filter_v4)?;
+    state.lo0_filter_v6_fast = resolve_lo0_filter(&state.filters, "inet6", lo0_filter_v6)?;
 
-    // Parse three-color policers by stable name order. Runtime IDs are
-    // name-derived so inserting a lower-sorted policer does not reset
-    // unchanged existing runtimes.
+    Ok(state)
+}
+
+/// Parse three-color policers by stable name order. Runtime IDs are
+/// name-derived so inserting a lower-sorted policer does not reset
+/// unchanged existing runtimes.
+fn load_three_color_policer_runtimes(
+    state: &mut FilterState,
+    three_color_policers: &[ThreeColorPolicerSnapshot],
+    previous: Option<&FilterState>,
+    used_runtime_ids: &mut rustc_hash::FxHashSet<u32>,
+) {
     let mut three_color = three_color_policers.iter().collect::<Vec<_>>();
     three_color.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut used_runtime_ids = rustc_hash::FxHashSet::default();
     for snap in three_color {
-        let id = unique_three_color_policer_runtime_id(&snap.name, &mut used_runtime_ids);
+        let id = unique_three_color_policer_runtime_id(&snap.name, used_runtime_ids);
         let Some(runtime) = parse_three_color_policer(snap, id, previous) else {
             continue;
         };
@@ -78,19 +103,26 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
             .insert(runtime.name.to_string(), runtime.clone());
         state.three_color_policers.push(runtime);
     }
+}
 
-    // #4514: lower legacy single-rate `firewall policer` token buckets into the
-    // SAME metered three-color runtime the terms already resolve against, by
-    // name. Before #4514 these policers were parsed into a `state.policers`
-    // map that NOTHING consumed — `PolicerState::consume` had zero non-test
-    // call sites — so a configured `then policer X` (e.g. a DoS-mitigation
-    // rate-limit) was silently UNENFORCED (a fail-open of the rate limit) even
-    // though the capability doc claimed support. A single-rate token bucket
-    // with `then discard` is exactly an srTCM committed bucket (CIR=bandwidth,
-    // CBS=burst) where only in-rate (green) packets pass and everything above
-    // the bucket drops; reusing the three-color runtime gives it metering,
-    // drop-on-exceed, flow-cache handle+replay, and status export for free.
-    // Sorted for the same stable-ID property as the three-color loop.
+/// #4514: lower legacy single-rate `firewall policer` token buckets into the
+/// SAME metered three-color runtime the terms already resolve against, by
+/// name. Before #4514 these policers were parsed into a `state.policers`
+/// map that NOTHING consumed — `PolicerState::consume` had zero non-test
+/// call sites — so a configured `then policer X` (e.g. a DoS-mitigation
+/// rate-limit) was silently UNENFORCED (a fail-open of the rate limit) even
+/// though the capability doc claimed support. A single-rate token bucket
+/// with `then discard` is exactly an srTCM committed bucket (CIR=bandwidth,
+/// CBS=burst) where only in-rate (green) packets pass and everything above
+/// the bucket drops; reusing the three-color runtime gives it metering,
+/// drop-on-exceed, flow-cache handle+replay, and status export for free.
+/// Sorted for the same stable-ID property as the three-color loop.
+fn lower_single_rate_policer_runtimes(
+    state: &mut FilterState,
+    policers: &[PolicerSnapshot],
+    previous: Option<&FilterState>,
+    used_runtime_ids: &mut rustc_hash::FxHashSet<u32>,
+) {
     let mut single_rate = policers.iter().collect::<Vec<_>>();
     single_rate.sort_by(|a, b| a.name.cmp(&b.name));
     for snap in single_rate {
@@ -99,10 +131,7 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         if state.three_color_policer_by_name.contains_key(&snap.name) {
             continue;
         }
-        let id = unique_runtime_id(
-            single_rate_policer_runtime_id(&snap.name),
-            &mut used_runtime_ids,
-        );
+        let id = unique_runtime_id(single_rate_policer_runtime_id(&snap.name), used_runtime_ids);
         let Some(runtime) = parse_single_rate_policer_runtime(snap, id, previous) else {
             continue;
         };
@@ -111,8 +140,15 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
             .insert(runtime.name.to_string(), runtime.clone());
         state.three_color_policers.push(runtime);
     }
+}
 
-    // Parse filters
+/// Parse every filter snapshot into a compiled `Filter` keyed by
+/// `family:name`. Term compilation fails closed (see `parse_term`), so one
+/// unrepresentable term rejects the whole snapshot.
+fn parse_filter_table(
+    state: &mut FilterState,
+    filters: &[FirewallFilterSnapshot],
+) -> Result<(), SnapshotIntegrityError> {
     for (filter_idx, snap) in filters.iter().enumerate() {
         let key = qualify_filter_key(&snap.family, &snap.name);
         let terms = snap
@@ -149,115 +185,116 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         };
         state.filters.insert(key, Arc::new(filter));
     }
+    Ok(())
+}
 
-    // Build per-interface filter assignments
+/// Build per-interface filter assignments: each of the four hooks
+/// (inet/inet6 x input/output) resolves its named filter against the
+/// compiled table and installs it into the per-ifindex fast map.
+fn assign_interface_filters(
+    state: &mut FilterState,
+    interfaces: &[crate::InterfaceSnapshot],
+) -> Result<(), SnapshotIntegrityError> {
     for iface in interfaces {
         if iface.ifindex <= 0 {
             continue;
         }
         if !iface.filter_input_v4.is_empty() {
-            let key = qualify_filter_key("inet", &iface.filter_input_v4);
-            if let Some(filter) = state.filters.get(&key) {
-                // #6236 PR-2A: the family-wide aggregates
-                // (has_input_tx_selection_v4 / has_input_three_color_policer_v4)
-                // are recomputed from the FINAL fast map after this loop so a
-                // duplicate-ifindex last-wins overwrite cannot strand a
-                // stale-true aggregate. Do not OR them in here.
-                // #6236 PR-2B: the per-interface capability sets
-                // (affects_route_lookup / has_dscp_match / has_per_packet_l4_match)
-                // are gone — the accessors read the flag off the fast map entry,
-                // so populating the fast map below is the only per-interface work.
-                state
-                    .iface_filter_v4_fast
-                    .insert(iface.ifindex, filter.clone());
-            } else {
-                // #3296: the hook names a filter that is not in the compiled
-                // table. Leaving no _fast entry would fall through to the
-                // default Accept — a fail-open on a typo'd security hook.
-                // Refuse the snapshot (preflight preserves prior good state).
-                return Err(SnapshotIntegrityError::MissingFilterRef {
-                    interface: iface.name.clone(),
-                    family: "inet".to_string(),
-                    direction: "input".to_string(),
-                    filter: iface.filter_input_v4.clone(),
-                });
-            }
+            resolve_interface_filter(
+                &state.filters,
+                &mut state.iface_filter_v4_fast,
+                iface,
+                "inet",
+                "input",
+                &iface.filter_input_v4,
+            )?;
         }
         if !iface.filter_output_v4.is_empty() {
-            let key = qualify_filter_key("inet", &iface.filter_output_v4);
-            if let Some(filter) = state.filters.get(&key) {
-                // #6236 PR-2B: the per-interface `iface_filter_out_v4_needs_tx_eval`
-                // set is gone — `interface_output_filter_needs_tx_eval` reads
-                // `Filter::needs_tx_eval()` off this fast-map entry. The
-                // `has_output_needs_tx_eval_v4` aggregate is recomputed from the
-                // FINAL fast map after this loop.
-                state
-                    .iface_filter_out_v4_fast
-                    .insert(iface.ifindex, filter.clone());
-            } else {
-                // #3296: missing output filter ref. With no _fast entry AND no
-                // needs_tx_eval flag, the TX evaluator is skipped entirely and
-                // the packet is accepted — a fail-open. Refuse the snapshot.
-                return Err(SnapshotIntegrityError::MissingFilterRef {
-                    interface: iface.name.clone(),
-                    family: "inet".to_string(),
-                    direction: "output".to_string(),
-                    filter: iface.filter_output_v4.clone(),
-                });
-            }
+            resolve_interface_filter(
+                &state.filters,
+                &mut state.iface_filter_out_v4_fast,
+                iface,
+                "inet",
+                "output",
+                &iface.filter_output_v4,
+            )?;
         }
         if !iface.filter_input_v6.is_empty() {
-            let key = qualify_filter_key("inet6", &iface.filter_input_v6);
-            if let Some(filter) = state.filters.get(&key) {
-                // #6236 PR-2A: aggregates recomputed from the FINAL fast map
-                // after this loop (see the inet input block above).
-                // #6236 PR-2B: per-interface capability sets deleted — accessors
-                // read the flag off the fast-map entry.
-                state
-                    .iface_filter_v6_fast
-                    .insert(iface.ifindex, filter.clone());
-            } else {
-                // #3296: missing input filter ref → fail-open. Refuse.
-                return Err(SnapshotIntegrityError::MissingFilterRef {
-                    interface: iface.name.clone(),
-                    family: "inet6".to_string(),
-                    direction: "input".to_string(),
-                    filter: iface.filter_input_v6.clone(),
-                });
-            }
+            resolve_interface_filter(
+                &state.filters,
+                &mut state.iface_filter_v6_fast,
+                iface,
+                "inet6",
+                "input",
+                &iface.filter_input_v6,
+            )?;
         }
         if !iface.filter_output_v6.is_empty() {
-            let key = qualify_filter_key("inet6", &iface.filter_output_v6);
-            if let Some(filter) = state.filters.get(&key) {
-                // #6236 PR-2B: per-interface `iface_filter_out_v6_needs_tx_eval`
-                // set deleted (see the inet output block above); the
-                // `has_output_needs_tx_eval_v6` aggregate is recomputed from the
-                // FINAL fast map after this loop.
-                state
-                    .iface_filter_out_v6_fast
-                    .insert(iface.ifindex, filter.clone());
-            } else {
-                // #3296: missing output filter ref → fail-open. Refuse.
-                return Err(SnapshotIntegrityError::MissingFilterRef {
-                    interface: iface.name.clone(),
-                    family: "inet6".to_string(),
-                    direction: "output".to_string(),
-                    filter: iface.filter_output_v6.clone(),
-                });
-            }
+            resolve_interface_filter(
+                &state.filters,
+                &mut state.iface_filter_out_v6_fast,
+                iface,
+                "inet6",
+                "output",
+                &iface.filter_output_v6,
+            )?;
         }
     }
+    Ok(())
+}
 
-    // #6236 PR-2A: recompute the family-wide aggregates from the FINAL fast
-    // maps, NOT monotonically inside the loop above. The fast maps overwrite
-    // last-wins on a duplicate ifindex, so a positive filter followed by a
-    // non-sensitive filter at the same ifindex must NOT leave a stale-true
-    // aggregate. Deriving every aggregate from `values().any(..)` over the final
-    // map makes it agree with the filter the hot path actually evaluates (the
-    // last-wins entry). For the common unique-ifindex case this is bit-identical
-    // to the old in-loop OR. `has_output_needs_tx_eval_*` is the new aggregate
-    // that subsumes both `has_output_tx_selection_*` and the
-    // `iface_filter_out_*_needs_tx_eval` set non-emptiness for the global gate.
+/// Resolve one interface filter hook into its fast map.
+///
+/// #3296: the hook may name a filter that is not in the compiled table.
+/// Leaving no _fast entry would fall through to the default Accept (and, for
+/// an output hook, skip the TX evaluator entirely — no _fast entry AND no
+/// needs_tx_eval flag) — a fail-open on a typo'd security hook. Refuse the
+/// snapshot instead (the reconcile preflight preserves prior good state).
+///
+/// #6236 PR-2A: the family-wide aggregates
+/// (has_input_tx_selection_v4 / has_input_three_color_policer_v4 /
+/// has_output_needs_tx_eval_*) are recomputed from the FINAL fast maps by
+/// `recompute_fast_map_aggregates` after the assignment loop, so a
+/// duplicate-ifindex last-wins overwrite cannot strand a stale-true
+/// aggregate. Do not OR them in here.
+///
+/// #6236 PR-2B: the per-interface capability sets
+/// (affects_route_lookup / has_dscp_match / has_per_packet_l4_match /
+/// iface_filter_out_*_needs_tx_eval) are gone — the accessors read the flag
+/// off the fast map entry (`Filter::needs_tx_eval()` for the output hooks),
+/// so populating the fast map here is the only per-interface work.
+fn resolve_interface_filter(
+    filters: &rustc_hash::FxHashMap<String, Arc<Filter>>,
+    fast_map: &mut rustc_hash::FxHashMap<i32, Arc<Filter>>,
+    iface: &crate::InterfaceSnapshot,
+    family: &'static str,
+    direction: &'static str,
+    filter_name: &str,
+) -> Result<(), SnapshotIntegrityError> {
+    let key = qualify_filter_key(family, filter_name);
+    if let Some(filter) = filters.get(&key) {
+        fast_map.insert(iface.ifindex, filter.clone());
+        return Ok(());
+    }
+    Err(SnapshotIntegrityError::MissingFilterRef {
+        interface: iface.name.clone(),
+        family: family.to_string(),
+        direction: direction.to_string(),
+        filter: filter_name.to_string(),
+    })
+}
+
+/// #6236 PR-2A: recompute the family-wide aggregates from the FINAL fast
+/// maps, NOT monotonically inside the assignment loop. The fast maps
+/// overwrite last-wins on a duplicate ifindex, so a positive filter followed
+/// by a non-sensitive filter at the same ifindex must NOT leave a stale-true
+/// aggregate. Deriving every aggregate from `values().any(..)` over the final
+/// map makes it agree with the filter the hot path actually evaluates (the
+/// last-wins entry). For the common unique-ifindex case this is bit-identical
+/// to the old in-loop OR. `has_output_needs_tx_eval_*` is the aggregate that
+/// subsumes both `has_output_tx_selection_*` and the
+/// `iface_filter_out_*_needs_tx_eval` set non-emptiness for the global gate.
+fn recompute_fast_map_aggregates(state: &mut FilterState) {
     state.has_input_tx_selection_v4 = state
         .iface_filter_v4_fast
         .values()
@@ -285,45 +322,37 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         .iface_filter_out_v6_fast
         .values()
         .any(|f| f.needs_tx_eval());
+}
 
-    // #6236 PR-1: the qualified lo0 keys are compiler intermediates only — they
-    // exist solely to look up lo0_filter_v*_fast and were never read on the
-    // packet path. Keep them as locals; the struct retains only the fast
-    // Option<Arc<Filter>>. The #3296 fail-closed guards below are unchanged.
-    let lo0_filter_v4_key = if lo0_filter_v4.is_empty() {
-        String::new()
-    } else {
-        qualify_filter_key("inet", lo0_filter_v4)
-    };
-    state.lo0_filter_v4_fast = state.filters.get(&lo0_filter_v4_key).cloned();
-    if !lo0_filter_v4.is_empty() && state.lo0_filter_v4_fast.is_none() {
-        // #3296: lo0 host-bound input filter names a filter not in the table.
-        // Falling through to the default Accept would leave the routing-engine
-        // protect filter unarmed (the canonical lo0 lockout hook) — fail-open.
-        return Err(SnapshotIntegrityError::MissingFilterRef {
-            interface: "lo0".to_string(),
-            family: "inet".to_string(),
-            direction: "input".to_string(),
-            filter: lo0_filter_v4.to_string(),
-        });
+/// Resolve one lo0 host-bound input filter hook. Returns `Ok(None)` when the
+/// hook is unconfigured.
+///
+/// #3296: a configured hook that names a filter not in the table is refused.
+/// Falling through to the default Accept would leave the routing-engine
+/// protect filter unarmed (the canonical lo0 lockout hook) — fail-open.
+///
+/// #6236 PR-1: the qualified lo0 key is a compiler intermediate only — it
+/// exists solely to resolve the fast filter and was never read on the packet
+/// path, so it stays a local here; the struct retains only the fast
+/// Option<Arc<Filter>>.
+fn resolve_lo0_filter(
+    filters: &rustc_hash::FxHashMap<String, Arc<Filter>>,
+    family: &'static str,
+    filter_name: &str,
+) -> Result<Option<Arc<Filter>>, SnapshotIntegrityError> {
+    if filter_name.is_empty() {
+        return Ok(None);
     }
-    let lo0_filter_v6_key = if lo0_filter_v6.is_empty() {
-        String::new()
-    } else {
-        qualify_filter_key("inet6", lo0_filter_v6)
-    };
-    state.lo0_filter_v6_fast = state.filters.get(&lo0_filter_v6_key).cloned();
-    if !lo0_filter_v6.is_empty() && state.lo0_filter_v6_fast.is_none() {
-        // #3296: lo0 host-bound inet6 input filter missing → fail-open. Refuse.
-        return Err(SnapshotIntegrityError::MissingFilterRef {
-            interface: "lo0".to_string(),
-            family: "inet6".to_string(),
-            direction: "input".to_string(),
-            filter: lo0_filter_v6.to_string(),
-        });
+    let key = qualify_filter_key(family, filter_name);
+    if let Some(filter) = filters.get(&key) {
+        return Ok(Some(filter.clone()));
     }
-
-    Ok(state)
+    Err(SnapshotIntegrityError::MissingFilterRef {
+        interface: "lo0".to_string(),
+        family: family.to_string(),
+        direction: "input".to_string(),
+        filter: filter_name.to_string(),
+    })
 }
 
 fn parse_three_color_policer(
@@ -520,6 +549,41 @@ fn parse_term(
     filter_name: &str,
     three_color_policers: &rustc_hash::FxHashMap<String, Arc<ThreeColorPolicerRuntime>>,
 ) -> Result<FilterTerm, SnapshotIntegrityError> {
+    // Non-mutating preflight first: every guard rejects the WHOLE snapshot
+    // (the reconcile preflight keeps the previous good filter state), so all
+    // of them run before any lowering begins.
+    preflight_term_markers(snap, filter_family, filter_name)?;
+    preflight_term_value_ranges(snap, filter_family, filter_name)?;
+    let addresses = parse_term_addresses(snap);
+    let protocols = resolve_term_protocols(snap, filter_family, filter_name)?;
+    check_cross_field_satisfiability(snap, &protocols, filter_family, filter_name)?;
+    let ports = parse_term_ports(snap);
+    let action = resolve_term_action(snap);
+    Ok(build_filter_term(
+        snap,
+        id,
+        action,
+        addresses,
+        protocols,
+        ports,
+        three_color_policers,
+    ))
+}
+
+/// Fail-closed preflight over the Go control plane's "unrepresentable" wire
+/// markers. Each marker means the builder could not resolve a match token but
+/// still emitted the term; the pre-fix compiler dropped the bad token (or
+/// left the field absent), which the matcher reads as "no constraint" —
+/// silently WIDENING a `then discard`/`reject` term, or enforcing a NARROWER
+/// set than the operator wrote with the remainder falling through to the
+/// implicit accept. Every guard rejects the whole snapshot, mirroring the
+/// #2505 UnrepresentableFilterProtocol backstop. Checked first so the
+/// preflight stays non-mutating.
+fn preflight_term_markers(
+    snap: &FirewallTermSnapshot,
+    filter_family: &str,
+    filter_name: &str,
+) -> Result<(), SnapshotIntegrityError> {
     // #3367: the Go control plane sets `tcp_flags_unparseable` when it could not
     // parse the term's tcp-flags expression into required/forbidden masks. Leaving
     // the masks None (the pre-fix behavior) makes the matcher treat the term as
@@ -607,6 +671,18 @@ fn parse_term(
             term: snap.name.clone(),
         });
     }
+    Ok(())
+}
+
+/// Fail-closed preflight over raw wire VALUES the Go gates already bound: a
+/// value outside the representable range can only arrive from a corrupt /
+/// hand-built / version-drifted snapshot. Checked before any mutation so the
+/// preflight stays non-mutating.
+fn preflight_term_value_ranges(
+    snap: &FirewallTermSnapshot,
+    filter_family: &str,
+    filter_name: &str,
+) -> Result<(), SnapshotIntegrityError> {
     // #3715: DSCP is a 6-bit field (0..=63). A raw wire value >= 64 can only
     // arrive from a corrupt / hand-built / version-drifted snapshot — the Go
     // commit gate (validateFilterDSCPStrict) and the snapshot builder both bound
@@ -655,6 +731,44 @@ fn parse_term(
             });
         }
     }
+    Ok(())
+}
+
+/// The address half of a term's match scope: per-family prefix vectors plus
+/// the per-direction constrained flags (#2400/#2506).
+struct TermAddressMatch {
+    source_v4: Vec<PrefixV4>,
+    source_v6: Vec<PrefixV6>,
+    dest_v4: Vec<PrefixV4>,
+    dest_v6: Vec<PrefixV6>,
+    source_constrained: bool,
+    dest_constrained: bool,
+}
+
+/// Lower the snapshot's `from {source,destination}-address` lists into
+/// per-family prefix vectors and derive the per-direction constrained flags.
+///
+/// #2400 (032-18): a term is ADDRESS-CONSTRAINED when it has at least one
+/// REAL `from { source-address / destination-address }` entry — `addr_is_real`
+/// EXCLUDES the empty string and the literal `any` (the placeholders
+/// `parse_address` already drops), so an explicit `from { source-address
+/// any; }` stays UNCONSTRAINED (match-any) rather than degrading to
+/// fail-closed. When the term is constrained but every real entry failed to
+/// parse, the per-family vecs are empty and the matcher fails closed (see
+/// engine/matching.rs).
+///
+/// #2506 (Copilot): OR in the EXPLICIT `source_constrained` /
+/// `destination_constrained` snapshot signal. The address-length derivation
+/// alone is insufficient for prefix-list scopes that resolve EMPTY: a `from
+/// source-prefix-list X` whose X is defined-but-empty or lenient-unresolved
+/// produces an empty `source_addresses` list, so the length test yields
+/// `false` and the direction would wrongly collapse to match-any. The Go side
+/// sets the explicit flag whenever the term wrote ANY scope (literal address
+/// OR prefix-list ref), so the OR makes the matcher fail closed (positive) /
+/// match-all (except) per the Junos empty-set semantics. An older Go control
+/// plane that omits the flag (false) falls back to the length derivation —
+/// unchanged for the non-prefix-list cases that have no empty-resolution gap.
+fn parse_term_addresses(snap: &FirewallTermSnapshot) -> TermAddressMatch {
     let mut source_v4 = Vec::new();
     let mut source_v6 = Vec::new();
     for addr in &snap.source_addresses {
@@ -665,43 +779,38 @@ fn parse_term(
     for addr in &snap.destination_addresses {
         parse_address(addr, &mut dest_v4, &mut dest_v6);
     }
-    // #2400 (032-18): a term is ADDRESS-CONSTRAINED when it has at least one
-    // REAL `from { source-address / destination-address }` entry — `addr_is_real`
-    // EXCLUDES the empty string and the literal `any` (the placeholders
-    // `parse_address` already drops), so an explicit `from { source-address
-    // any; }` stays UNCONSTRAINED (match-any) rather than degrading to
-    // fail-closed. When the term is constrained but every real entry failed to
-    // parse, the per-family vecs are empty and the matcher fails closed (see
-    // engine/matching.rs).
-    //
-    // #2506 (Copilot): OR in the EXPLICIT `source_constrained` /
-    // `destination_constrained` snapshot signal. The address-length derivation
-    // alone is insufficient for prefix-list scopes that resolve EMPTY: a `from
-    // source-prefix-list X` whose X is defined-but-empty or lenient-unresolved
-    // produces an empty `source_addresses` list, so the length test yields
-    // `false` and the direction would wrongly collapse to match-any. The Go side
-    // sets the explicit flag whenever the term wrote ANY scope (literal address
-    // OR prefix-list ref), so the OR makes the matcher fail closed (positive) /
-    // match-all (except) per the Junos empty-set semantics. An older Go control
-    // plane that omits the flag (false) falls back to the length derivation —
-    // unchanged for the non-prefix-list cases that have no empty-resolution gap.
-    let source_addr_constrained =
-        snap.source_constrained || snap.source_addresses.iter().any(|a| addr_is_real(a));
-    let dest_addr_constrained =
-        snap.destination_constrained || snap.destination_addresses.iter().any(|a| addr_is_real(a));
-    // #2505: resolve every `from protocol` token via the SHARED, normalizing
-    // resolver `ip_proto::proto_number` (trim + lowercase + the full
-    // appid.ProtocolNumber acceptance set: esp/ah/sctp/vrrp/igmp/pim/egp +
-    // the junos-* aliases), NOT the stale local parser this function used to
-    // carry (tcp/udp/icmp/icmpv6/gre/ospf/ipip + bare numeric, no
-    // normalization). An EMPTY input list is the legitimate "no protocol
-    // constraint" case -> empty `protocols` -> `protocol_match_enabled` false
-    // (match-any, preserved below). A NON-EMPTY list with any UNRESOLVABLE
-    // token is a snapshot-integrity error: silently dropping it (the pre-fix
-    // `filter_map`) collapses the list to empty and disables the protocol
-    // match, so a `from protocol esp; then discard` term would match EVERY
-    // protocol (fail-WIDE). Fail closed by rejecting the whole snapshot — the
-    // reconcile preflight keeps the previous good filter state.
+    TermAddressMatch {
+        source_v4,
+        source_v6,
+        dest_v4,
+        dest_v6,
+        source_constrained: snap.source_constrained
+            || snap.source_addresses.iter().any(|a| addr_is_real(a)),
+        dest_constrained: snap.destination_constrained
+            || snap.destination_addresses.iter().any(|a| addr_is_real(a)),
+    }
+}
+
+/// Resolve every `from protocol` token to its IANA number.
+///
+/// #2505: resolve via the SHARED, normalizing resolver
+/// `ip_proto::proto_number` (trim + lowercase + the full
+/// appid.ProtocolNumber acceptance set: esp/ah/sctp/vrrp/igmp/pim/egp +
+/// the junos-* aliases), NOT the stale local parser this function used to
+/// carry (tcp/udp/icmp/icmpv6/gre/ospf/ipip + bare numeric, no
+/// normalization). An EMPTY input list is the legitimate "no protocol
+/// constraint" case -> empty `protocols` -> `protocol_match_enabled` false
+/// (match-any, preserved by the caller). A NON-EMPTY list with any
+/// UNRESOLVABLE token is a snapshot-integrity error: silently dropping it
+/// (the pre-fix `filter_map`) collapses the list to empty and disables the
+/// protocol match, so a `from protocol esp; then discard` term would match
+/// EVERY protocol (fail-WIDE). Fail closed by rejecting the whole snapshot —
+/// the reconcile preflight keeps the previous good filter state.
+fn resolve_term_protocols(
+    snap: &FirewallTermSnapshot,
+    filter_family: &str,
+    filter_name: &str,
+) -> Result<Vec<u8>, SnapshotIntegrityError> {
     let mut protocols: Vec<u8> = Vec::with_capacity(snap.protocols.len());
     for token in &snap.protocols {
         // An empty / whitespace-only entry is a placeholder, never a real
@@ -723,143 +832,181 @@ fn parse_term(
             }
         }
     }
-    // #3723: cross-field satisfiability backstop. A term whose resolved protocol
-    // constraint is PRESENT but INCOMPATIBLE with a co-configured L4 predicate is
-    // a NEVER-MATCH: the matcher (engine/matching.rs) keys ports on the extracted
-    // L4 port (0 for a non-port protocol — only TCP/UDP carry ports per
-    // ip_proto::has_l4_ports), gates tcp-flags on protocol==TCP, and gates
-    // icmp-type/code on ICMP/ICMPv6. Because a filter falls through to the implicit
-    // ACCEPT on no-match, a `then discard`/`reject` term over such a pair silently
-    // fails OPEN. The Go commit gate (validateFilterCrossFieldStrict, #3723) is the
-    // primary defense — a committed config never carries such a term — so this is
-    // the helper-boundary backstop for a corrupt / hand-built / version-drifted or
-    // leniently-loaded snapshot, consistent with the #2505/#3367/#3406 fail-closed
-    // family. Rejecting the whole snapshot (the reconcile preflight keeps the
-    // previous good filter state) is action-agnostic. An EMPTY protocol list is
-    // the legitimate "no protocol constraint" case: a port / tcp-flags / icmp
-    // predicate with no protocol is enforceable for a FILTER (the matcher matches
-    // the port on whatever port-bearing packet arrives, and the tcp-flags/icmp
-    // arms self-gate on the packet protocol), so it is NOT an error.
-    if !protocols.is_empty() {
-        let ports_present = snap.source_ports.iter().any(|p| port_is_real(p))
-            || snap.destination_ports.iter().any(|p| port_is_real(p))
-            || snap.source_ports_except.iter().any(|p| port_is_real(p))
-            || snap.destination_ports_except.iter().any(|p| port_is_real(p));
-        if ports_present {
-            if let Some(&proto) = protocols
-                .iter()
-                .find(|&&p| !crate::ip_proto::has_l4_ports(p))
-            {
-                return Err(SnapshotIntegrityError::UnsatisfiableFilterCrossField {
-                    family: filter_family.to_string(),
-                    filter: filter_name.to_string(),
-                    term: snap.name.clone(),
-                    predicate: "port",
-                    protocol: proto,
-                });
-            }
-        }
-        let tcp_flags_present =
-            snap.tcp_flags.is_some_and(|m| m != 0) || snap.tcp_flags_forbidden.is_some_and(|m| m != 0);
-        if tcp_flags_present {
-            if let Some(&proto) = protocols
-                .iter()
-                .find(|&&p| p != crate::ip_proto::PROTO_TCP)
-            {
-                return Err(SnapshotIntegrityError::UnsatisfiableFilterCrossField {
-                    family: filter_family.to_string(),
-                    filter: filter_name.to_string(),
-                    term: snap.name.clone(),
-                    predicate: "tcp-flags",
-                    protocol: proto,
-                });
-            }
-        }
-        let icmp_present = !snap.icmp_types.is_empty() || !snap.icmp_codes.is_empty();
-        if icmp_present {
-            if let Some(&proto) = protocols
-                .iter()
-                .find(|&&p| p != crate::ip_proto::PROTO_ICMP && p != crate::ip_proto::PROTO_ICMPV6)
-            {
-                return Err(SnapshotIntegrityError::UnsatisfiableFilterCrossField {
-                    family: filter_family.to_string(),
-                    filter: filter_name.to_string(),
-                    term: snap.name.clone(),
-                    predicate: "icmp-type/code",
-                    protocol: proto,
-                });
-            }
+    Ok(protocols)
+}
+
+/// #3723: cross-field satisfiability backstop. A term whose resolved protocol
+/// constraint is PRESENT but INCOMPATIBLE with a co-configured L4 predicate is
+/// a NEVER-MATCH: the matcher (engine/matching.rs) keys ports on the extracted
+/// L4 port (0 for a non-port protocol — only TCP/UDP carry ports per
+/// ip_proto::has_l4_ports), gates tcp-flags on protocol==TCP, and gates
+/// icmp-type/code on ICMP/ICMPv6. Because a filter falls through to the implicit
+/// ACCEPT on no-match, a `then discard`/`reject` term over such a pair silently
+/// fails OPEN. The Go commit gate (validateFilterCrossFieldStrict, #3723) is the
+/// primary defense — a committed config never carries such a term — so this is
+/// the helper-boundary backstop for a corrupt / hand-built / version-drifted or
+/// leniently-loaded snapshot, consistent with the #2505/#3367/#3406 fail-closed
+/// family. Rejecting the whole snapshot (the reconcile preflight keeps the
+/// previous good filter state) is action-agnostic.
+fn check_cross_field_satisfiability(
+    snap: &FirewallTermSnapshot,
+    protocols: &[u8],
+    filter_family: &str,
+    filter_name: &str,
+) -> Result<(), SnapshotIntegrityError> {
+    // An EMPTY protocol list is the legitimate "no protocol constraint" case:
+    // a port / tcp-flags / icmp predicate with no protocol is enforceable for
+    // a FILTER (the matcher matches the port on whatever port-bearing packet
+    // arrives, and the tcp-flags/icmp arms self-gate on the packet protocol),
+    // so it is NOT an error.
+    if protocols.is_empty() {
+        return Ok(());
+    }
+    let ports_present = snap.source_ports.iter().any(|p| port_is_real(p))
+        || snap.destination_ports.iter().any(|p| port_is_real(p))
+        || snap.source_ports_except.iter().any(|p| port_is_real(p))
+        || snap.destination_ports_except.iter().any(|p| port_is_real(p));
+    if ports_present {
+        if let Some(&proto) = protocols
+            .iter()
+            .find(|&&p| !crate::ip_proto::has_l4_ports(p))
+        {
+            return Err(SnapshotIntegrityError::UnsatisfiableFilterCrossField {
+                family: filter_family.to_string(),
+                filter: filter_name.to_string(),
+                term: snap.name.clone(),
+                predicate: "port",
+                protocol: proto,
+            });
         }
     }
-    // #2622: a direction's port scope is either the positive `source-port` /
-    // `destination-port` list OR the negated `source-port-except` /
-    // `destination-port-except` list (Junos treats them as mutually exclusive,
-    // and the Go commit gate `validateFilterPortExceptStrict` — #3297 — rejects
-    // a term that carries both). Build ONE PortMatcher per direction from
-    // whichever list carries entries, and set `*_port_except` when the except
-    // list is the source.
-    //
-    // #3716 positive-wins boundary contract: because #3297 rejects both-present
-    // at commit, this only fires for a hand-built / version-drifted / leniently
-    // loaded snapshot. When it does, the positive list builds the matcher and
-    // the except list is IGNORED (positive wins) — the except flag stays false
-    // so the positive set is honored verbatim. That is a deliberate NARROWING
-    // (the term matches only the positive ports, strictly tighter than the
-    // operator-authored except would have been), never a widening, so it is
-    // fail-safe at the Rust boundary even without a SnapshotIntegrityError. The
-    // status is pinned by `port_both_positive_and_except_positive_wins_3716` in
-    // tests.rs so a future change to this selection is caught.
-    let source_port_except = snap.source_ports.iter().all(|p| !port_is_real(p))
+    let tcp_flags_present =
+        snap.tcp_flags.is_some_and(|m| m != 0) || snap.tcp_flags_forbidden.is_some_and(|m| m != 0);
+    if tcp_flags_present {
+        if let Some(&proto) = protocols
+            .iter()
+            .find(|&&p| p != crate::ip_proto::PROTO_TCP)
+        {
+            return Err(SnapshotIntegrityError::UnsatisfiableFilterCrossField {
+                family: filter_family.to_string(),
+                filter: filter_name.to_string(),
+                term: snap.name.clone(),
+                predicate: "tcp-flags",
+                protocol: proto,
+            });
+        }
+    }
+    let icmp_present = !snap.icmp_types.is_empty() || !snap.icmp_codes.is_empty();
+    if icmp_present {
+        if let Some(&proto) = protocols
+            .iter()
+            .find(|&&p| p != crate::ip_proto::PROTO_ICMP && p != crate::ip_proto::PROTO_ICMPV6)
+        {
+            return Err(SnapshotIntegrityError::UnsatisfiableFilterCrossField {
+                family: filter_family.to_string(),
+                filter: filter_name.to_string(),
+                term: snap.name.clone(),
+                predicate: "icmp-type/code",
+                protocol: proto,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The port half of a term's match scope: per-direction range vectors plus
+/// the except-inversion and constrained flags (#2400/#2622/#3716).
+struct TermPortMatch {
+    source_ports: Vec<PortRange>,
+    dest_ports: Vec<PortRange>,
+    source_except: bool,
+    dest_except: bool,
+    source_constrained: bool,
+    dest_constrained: bool,
+}
+
+/// Lower the snapshot's port lists into per-direction range vectors.
+///
+/// #2622: a direction's port scope is either the positive `source-port` /
+/// `destination-port` list OR the negated `source-port-except` /
+/// `destination-port-except` list (Junos treats them as mutually exclusive,
+/// and the Go commit gate `validateFilterPortExceptStrict` — #3297 — rejects
+/// a term that carries both). Build ONE range set per direction from
+/// whichever list carries entries, and set `*_except` when the except list is
+/// the source.
+///
+/// #3716 positive-wins boundary contract: because #3297 rejects both-present
+/// at commit, this only fires for a hand-built / version-drifted / leniently
+/// loaded snapshot. When it does, the positive list builds the matcher and
+/// the except list is IGNORED (positive wins) — the except flag stays false
+/// so the positive set is honored verbatim. That is a deliberate NARROWING
+/// (the term matches only the positive ports, strictly tighter than the
+/// operator-authored except would have been), never a widening, so it is
+/// fail-safe at the Rust boundary even without a SnapshotIntegrityError. The
+/// status is pinned by `port_both_positive_and_except_positive_wins_3716` in
+/// tests.rs so a future change to this selection is caught.
+///
+/// #2400 (032-19): mirror of the address constraint for the port match sets.
+/// `port_is_real` ignores the empty-string placeholder (which `parse_port_spec`
+/// treats as "no port range") so an empty entry never trips fail-closed. A
+/// constrained port set whose entries ALL failed to parse yields zero ranges
+/// -> `PortMatcher::Any`; the `*_constrained` flag lets the matcher tell
+/// that apart from a genuinely unscoped term and fail closed. The constraint
+/// is derived from the SELECTED spec list (positive or except), so an
+/// except-only term is correctly constrained (#2622).
+fn parse_term_ports(snap: &FirewallTermSnapshot) -> TermPortMatch {
+    let source_except = snap.source_ports.iter().all(|p| !port_is_real(p))
         && snap.source_ports_except.iter().any(|p| port_is_real(p));
-    let dest_port_except = snap.destination_ports.iter().all(|p| !port_is_real(p))
+    let dest_except = snap.destination_ports.iter().all(|p| !port_is_real(p))
         && snap.destination_ports_except.iter().any(|p| port_is_real(p));
-    let source_port_specs: &[String] = if source_port_except {
+    let source_specs: &[String] = if source_except {
         &snap.source_ports_except
     } else {
         &snap.source_ports
     };
-    let dest_port_specs: &[String] = if dest_port_except {
+    let dest_specs: &[String] = if dest_except {
         &snap.destination_ports_except
     } else {
         &snap.destination_ports
     };
-    let source_ports: Vec<PortRange> = source_port_specs
-        .iter()
-        .filter_map(|p| parse_port_spec(p))
-        .flatten()
-        .collect();
-    let dest_ports: Vec<PortRange> = dest_port_specs
-        .iter()
-        .filter_map(|p| parse_port_spec(p))
-        .flatten()
-        .collect();
-    // #2400 (032-19): mirror of the address constraint for the port match sets.
-    // `port_is_real` ignores the empty-string placeholder (which `parse_port_spec`
-    // treats as "no port range") so an empty entry never trips fail-closed. A
-    // constrained port set whose entries ALL failed to parse yields zero ranges
-    // -> `PortMatcher::Any`; the `*_port_constrained` flag lets the matcher tell
-    // that apart from a genuinely unscoped term and fail closed. The constraint
-    // is derived from the SELECTED spec list (positive or except), so an
-    // except-only term is correctly constrained (#2622).
-    let source_port_constrained = source_port_specs.iter().any(|p| port_is_real(p));
-    let dest_port_constrained = dest_port_specs.iter().any(|p| port_is_real(p));
-    let action = match snap.action.as_str() {
+    TermPortMatch {
+        source_ports: source_specs
+            .iter()
+            .filter_map(|p| parse_port_spec(p))
+            .flatten()
+            .collect(),
+        dest_ports: dest_specs
+            .iter()
+            .filter_map(|p| parse_port_spec(p))
+            .flatten()
+            .collect(),
+        source_except,
+        dest_except,
+        source_constrained: source_specs.iter().any(|p| port_is_real(p)),
+        dest_constrained: dest_specs.iter().any(|p| port_is_real(p)),
+    }
+}
+
+/// Map the snapshot action string to a `FilterAction`.
+///
+/// #2399 (032-16) / #2544: an EMPTY action is the legitimate "no
+/// terminating action" case — the term carries only modifiers
+/// (count/log/forwarding-class/policer/dscp) and falls through to the
+/// next term. Map it to Accept as a PLACEHOLDER (the action field is
+/// never returned for a matched fall-through term — see `continue_term`
+/// in `build_filter_term`), but the real semantic is carried by
+/// FilterTerm.continue_term: the evaluator applies the modifiers and
+/// CONTINUES rather than short-circuiting to a terminating decision. A
+/// NON-EMPTY but unrecognized action string can only arrive from a
+/// mixed-version snapshot (the Go commit gate validateFilterActionsStrict
+/// rejects an unknown `then` token before it is persisted). For a FIREWALL
+/// FILTER an unknown terminating action must fail CLOSED, never silently
+/// permit — map it to Discard rather than Accept.
+fn resolve_term_action(snap: &FirewallTermSnapshot) -> FilterAction {
+    match snap.action.as_str() {
         "accept" => FilterAction::Accept,
         "reject" => FilterAction::Reject,
         "discard" => FilterAction::Discard,
-        // #2399 (032-16) / #2544: an EMPTY action is the legitimate "no
-        // terminating action" case — the term carries only modifiers
-        // (count/log/forwarding-class/policer/dscp) and falls through to the
-        // next term. Map it to Accept as a PLACEHOLDER (the action field is
-        // never returned for a matched fall-through term — see continue_term
-        // below), but the real semantic is carried by FilterTerm.continue_term:
-        // the evaluator applies the modifiers and CONTINUES rather than
-        // short-circuiting to a terminating decision. A NON-EMPTY but
-        // unrecognized action string can only arrive from a mixed-version
-        // snapshot (the Go commit gate validateFilterActionsStrict rejects an
-        // unknown `then` token before it is persisted). For a FIREWALL FILTER an
-        // unknown terminating action must fail CLOSED, never silently permit —
-        // map it to Discard rather than Accept.
         "" => FilterAction::Accept,
         other => {
             eprintln!(
@@ -869,22 +1016,75 @@ fn parse_term(
             );
             FilterAction::Discard
         }
-    };
-    // #3715: no `& 0x3f` mask — the preflight above already rejected any
+    }
+}
+
+/// The lowered flexible-match-range fields of a term (#3077/#3232).
+struct TermFlexMatch {
+    enabled: bool,
+    offset: u8,
+    length: u8,
+    value: u32,
+    mask: u32,
+    match_start: FlexMatchStart,
+}
+
+/// #3077 flexible-match-range. Lower the wire snapshot into the per-term
+/// match fields. A flex match is only enabled when the length is a sane
+/// 1..=4 bytes (the wire value is a u32); a 0 or out-of-range length is
+/// treated as "no constraint" rather than a degenerate always-fail match,
+/// mirroring the Go side which already caps length to 4 and drops 0. The
+/// value is pre-masked by the Go control plane; we re-AND defensively so
+/// a hand-built snapshot with value bits outside the mask cannot match.
+///
+/// #3232: the match-start base. "" / "layer-3" => L3 base (the #3077
+/// default); "layer-4" => transport-header base. The Go control plane
+/// rejects payload/unknown at commit, but the tolerant peer-sync path
+/// could still deliver one, so an unrecognized value lowers to
+/// Unsupported and the matcher fails the term closed (never the
+/// pre-#3232 silent L3-base mis-match).
+fn lower_flex_match(flex_match: Option<&FlexMatchSnapshot>) -> TermFlexMatch {
+    TermFlexMatch {
+        enabled: flex_match.is_some_and(|f| (1..=4).contains(&f.length)),
+        offset: flex_match.map_or(0, |f| f.offset),
+        length: flex_match.map_or(0, |f| f.length),
+        value: flex_match.map_or(0, |f| f.value & f.mask),
+        mask: flex_match.map_or(0, |f| f.mask),
+        match_start: match flex_match.map(|f| f.match_start.as_str()) {
+            None | Some("") | Some("layer-3") => FlexMatchStart::Layer3,
+            Some("layer-4") => FlexMatchStart::Layer4,
+            Some(_) => FlexMatchStart::Unsupported,
+        },
+    }
+}
+
+/// Assemble the `FilterTerm` from the lowered match scope, action, and
+/// modifiers. Pure construction — every fail-closed validation already ran
+/// in the preflight helpers above.
+fn build_filter_term(
+    snap: &FirewallTermSnapshot,
+    id: u32,
+    action: FilterAction,
+    addresses: TermAddressMatch,
+    protocols: Vec<u8>,
+    ports: TermPortMatch,
+    three_color_policers: &rustc_hash::FxHashMap<String, Arc<ThreeColorPolicerRuntime>>,
+) -> FilterTerm {
+    let flex = lower_flex_match(snap.flex_match.as_ref());
+    // #3715: no `& 0x3f` mask — the preflight already rejected any
     // dscp_rewrite >= 64, so the value is a valid 0..=63 code point verbatim.
     // Masking would silently turn a corrupt byte (e.g. 110) into a DIFFERENT
     // valid code point (46 = EF).
     let dscp_rewrite = snap.dscp_rewrite;
-
-    Ok(FilterTerm {
+    FilterTerm {
         id,
         name: snap.name.clone(),
-        source_v4,
-        source_v6,
-        dest_v4,
-        dest_v6,
-        source_addr_constrained,
-        dest_addr_constrained,
+        source_v4: addresses.source_v4,
+        source_v6: addresses.source_v6,
+        dest_v4: addresses.dest_v4,
+        dest_v6: addresses.dest_v6,
+        source_addr_constrained: addresses.source_constrained,
+        dest_addr_constrained: addresses.dest_constrained,
         // #2506: carry the per-direction `except` inversion flag from the
         // snapshot. The Go control plane only sets it when the address set is an
         // `except` prefix-list (the inversion is meaningful only against a
@@ -893,13 +1093,13 @@ fn parse_term(
         dest_except: snap.destination_except,
         protocol_bitmap: build_u8_match_bitmap(&protocols),
         protocol_match_enabled: !protocols.is_empty(),
-        source_ports: build_port_matcher(source_ports),
-        dest_ports: build_port_matcher(dest_ports),
-        source_port_constrained,
-        dest_port_constrained,
+        source_ports: build_port_matcher(ports.source_ports),
+        dest_ports: build_port_matcher(ports.dest_ports),
+        source_port_constrained: ports.source_constrained,
+        dest_port_constrained: ports.dest_constrained,
         // #2622: carry the negated-port inversion flag (Junos `*-port-except`).
-        source_port_except,
-        dest_port_except,
+        source_port_except: ports.source_except,
+        dest_port_except: ports.dest_except,
         dscp_bitmap: build_u6_match_bitmap(&snap.dscp_values),
         dscp_match_enabled: !snap.dscp_values.is_empty(),
         // #2362 per-packet L4 match conditions. A zero tcp_flags mask means
@@ -919,39 +1119,12 @@ fn parse_term(
         icmp_type_match_enabled: !snap.icmp_types.is_empty(),
         icmp_code_bitmap: build_u8_match_bitmap(&snap.icmp_codes),
         icmp_code_match_enabled: !snap.icmp_codes.is_empty(),
-        // #3077 flexible-match-range. Lower the wire snapshot into the per-term
-        // match fields. A flex match is only enabled when the length is a sane
-        // 1..=4 bytes (the wire value is a u32); a 0 or out-of-range length is
-        // treated as "no constraint" rather than a degenerate always-fail match,
-        // mirroring the Go side which already caps length to 4 and drops 0. The
-        // value is pre-masked by the Go control plane; we re-AND defensively so
-        // a hand-built snapshot with value bits outside the mask cannot match.
-        flex_enabled: snap
-            .flex_match
-            .as_ref()
-            .is_some_and(|f| (1..=4).contains(&f.length)),
-        flex_offset: snap.flex_match.as_ref().map_or(0, |f| f.offset),
-        flex_length: snap.flex_match.as_ref().map_or(0, |f| f.length),
-        flex_value: snap
-            .flex_match
-            .as_ref()
-            .map_or(0, |f| f.value & f.mask),
-        flex_mask: snap.flex_match.as_ref().map_or(0, |f| f.mask),
-        // #3232: the match-start base. "" / "layer-3" => L3 base (the #3077
-        // default); "layer-4" => transport-header base. The Go control plane
-        // rejects payload/unknown at commit, but the tolerant peer-sync path
-        // could still deliver one, so an unrecognized value lowers to
-        // Unsupported and the matcher fails the term closed (never the
-        // pre-#3232 silent L3-base mis-match).
-        flex_match_start: match snap
-            .flex_match
-            .as_ref()
-            .map(|f| f.match_start.as_str())
-        {
-            None | Some("") | Some("layer-3") => FlexMatchStart::Layer3,
-            Some("layer-4") => FlexMatchStart::Layer4,
-            Some(_) => FlexMatchStart::Unsupported,
-        },
+        flex_enabled: flex.enabled,
+        flex_offset: flex.offset,
+        flex_length: flex.length,
+        flex_value: flex.value,
+        flex_mask: flex.mask,
+        flex_match_start: flex.match_start,
         action,
         // #2544: this term falls through (applies modifiers, continues to the
         // next term) when it carries no terminating action. The Go control
@@ -988,7 +1161,7 @@ fn parse_term(
         forwarding_class: Arc::<str>::from(snap.forwarding_class.as_str()),
         dscp_rewrite,
         counter: Arc::new(FilterTermCounter::default()),
-    })
+    }
 }
 
 /// #2400: whether an address entry imposes a real scope. `parse_address` drops

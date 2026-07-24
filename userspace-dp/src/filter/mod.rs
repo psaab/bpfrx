@@ -13,7 +13,8 @@ use crate::prefix::{PrefixV4, PrefixV6};
 // referenced by both compiler.rs and the tests module. Importing here makes
 // them visible to all submodules via `use super::*;`.
 use crate::{
-    FirewallFilterSnapshot, FirewallTermSnapshot, PolicerSnapshot, ThreeColorPolicerSnapshot,
+    FirewallFilterSnapshot, FirewallTermSnapshot, FlexMatchSnapshot, PolicerSnapshot,
+    ThreeColorPolicerSnapshot,
 };
 use ipnet::IpNet;
 #[cfg(not(test))]
