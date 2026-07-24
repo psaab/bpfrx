@@ -13,7 +13,6 @@
 [REFACTOR]   2166  userspace-dp/src/afxdp/cos/queue_service/mod.rs
 [REFACTOR]   2157  pkg/config/compiler_system.go
 [REFACTOR]   2148  pkg/dhcp/dhcp.go
-[REFACTOR]   2120  pkg/api/metrics_descriptors.go
 [REFACTOR]   2062  pkg/dataplane/userspace/manager_ha.go
 [REFACTOR]   2017  userspace-dp/src/afxdp/frame/mod.rs
 [REFACTOR]   2004  userspace-dp/src/afxdp/frame/inspect.rs

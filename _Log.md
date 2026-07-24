@@ -59866,6 +59866,23 @@ top.
     assertion RED, proving it now binds (the old assertion PASSED under exactly
     that re-mint condition). Test-only; no production behavior change.
 - **File(s)**: pkg/api/server.go, pkg/daemon/management_5866_test.go, _Log.md
+- **Timestamp**: 2026-07-23
+- **Action**: Refactor #6425 — split the 2,120-line single-function
+    pkg/api/metrics_descriptors.go (one newCollector composite literal building
+    a 295-field collector) into 23 per-subsystem sibling files. Pure
+    code-motion: newCollector now delegates to init<Subsystem>Descriptors()
+    methods that assign the SAME prometheus.NewDesc(...) expressions to the SAME
+    fields; the xpfCollector struct is untouched. Verified behavior-identical —
+    the multiset of NewDesc(name,help,labels) is byte-identical to origin/master
+    (295 descriptors), the assigned field set is identical (296 incl.
+    fairnessThroughputWindow), and #6411's corrected synced-import-cap HELP text
+    is preserved. Regenerated docs/refactoring-audit-current.txt (the
+    pkg/refactoraudit TestHeatmapNotStale canary mandates a regen whenever a
+    >=1500 LOC file is deleted; the canary was already RED on origin/master from
+    prior unrelated drift, so this regen also brings it green).
+- **File(s)**: pkg/api/metrics_descriptors.go (+ 23 new
+    metrics_descriptors_<subsystem>.go), docs/refactoring-audit-current.txt,
+    _Log.md
 - **Timestamp**: 2026-07-24 00:45 UTC
   - **Action**: Refactor #6424 — split the 2,470-LOC pkg/frr/policy_render.go
     god-renderer into cohesive per-aspect sibling files by PURE code-motion.
