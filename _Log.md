@@ -60688,3 +60688,38 @@ top.
     pkg/config/dup_named_blocks.go, pkg/config/dup_nat_rule_names.go,
     pkg/config/dup_nat_ruleset_names.go,
     pkg/config/dup_names_6455_test.go (new), docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-24
+- **Action**: #6455 SPLIT after a Codex MAJOR (false-reject) + firsthand
+    verification. The per-group-body scan shipped in the first commit
+    (scanNamespaces) FALSE-REJECTS legitimate apply-groups FRAGMENT configs.
+    Firsthand proof (neutralized the group scan, observed the compiled
+    object): fragments of ONE named object authored across repeated group
+    roots COALESCE via mergeNodes during ExpandGroups — two `interfaces` roots
+    each contributing a ge-0/0/0 unit compile to ONE ge-0/0/0(units=2); an
+    ICMP-fragment + TCP-fragment screen profile compile to ONE P(icmp,tcp); a
+    match/then-split NAT rule compiles to ONE rule R — yet the per-body scan
+    rejected all three. A pre-expansion sibling-scan cannot model that
+    same-pass coalescing. WITHDREW the group-authored per-body scan
+    (scanNamespaces + groupCtx machinery) entirely and KEPT only the
+    quoted-empty half (correct; both reviewers passed it). The three gates
+    revert to their top-level-only pre-expansion scan (byte-identical dup
+    messages) + a quoted-empty-name reject (strict) / warn (lenient). Codex
+    MINOR fixed: the empty rule-SET name is now owned solely by the #6454 gate
+    (the #5649 rule-name gate skips an empty rule-set), so the lenient warning
+    fires exactly once, not double-reported. compiler.go call-site comments
+    (both compile paths) note the quoted-empty reject. The group-authored
+    detection is deferred — the correct fix runs POST-ExpandGroups (coalesced,
+    pre-#3096-Cartesian at compiler_nat_source.go:766) and must union node0 +
+    node1 expansions for HA symmetry (like the tunnel/zone/unit-alias gates) —
+    tracked as the group-authored half of #6455 for a research pass. Added
+    TestDup6455GroupFragmentCoalescingAccepted as the load-bearing regression
+    guard locking the 4 fragment-coalescing configs ACCEPT. Parent-RED: 5
+    quoted-empty reject sub-tests RED on clean assertions when emptyNameError
+    is neutralized; the coalescing accepts stay GREEN. go build ./... / go vet
+    / gofmt / full pkg/config suite / refactoraudit heatmap GREEN. PR now
+    Advances #6455 (quoted-empty shipped; group-authored deferred).
+- **File(s)**: pkg/config/dup_names_6455.go, pkg/config/dup_named_blocks.go,
+    pkg/config/dup_nat_rule_names.go, pkg/config/dup_nat_ruleset_names.go,
+    pkg/config/dup_names_6455_test.go, pkg/config/compiler.go,
+    docs/config-schema.md, _Log.md

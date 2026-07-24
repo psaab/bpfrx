@@ -236,7 +236,10 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	// top-level stanzas (never a group body — apply-groups deep-merges rather
 	// than duplicating) so an authored `groups`/`interfaces`/`screen ids-option`
 	// block written twice is rejected (strict) instead of silently reduced to
-	// last-writer-wins; lenient warns and keeps the historical result.
+	// last-writer-wins; lenient warns and keeps the historical result. It also
+	// rejects a quoted-empty group/interface/screen-ids-option name (#6455). A
+	// duplicate authored entirely inside an applied group body is deferred (#6455
+	// Finding 1) — see dup_names_6455.go.
 	dupBlockWarnings, dupBlockErr := validateDuplicateNamedBlockAST(
 		tree, opts.lenientDuplicateNamedBlock)
 	if dupBlockErr != nil {
@@ -248,7 +251,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	// stanzas only, beside the #5180 gate. Two same-named rules in one NAT
 	// rule-set BOTH survive as first-match entries sharing one config identity
 	// (the rule name; counter-less for NPTv6 static); strict rejects,
-	// lenient warns.
+	// lenient warns. Also rejects a quoted-empty rule name (#6455).
 	dupNATRuleWarnings, dupNATRuleErr := validateDuplicateNATRuleNamesAST(
 		tree, opts.lenientDuplicateNATRuleName)
 	if dupNATRuleErr != nil {
@@ -264,7 +267,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	// per-rule counter merge — NATCounterKey includes the rule name). Pre-
 	// expansion, top-level `security` stanzas only, keyed by (natType, rule-set)
 	// so a same-named rule-set across DIFFERENT nat types stays legitimate; strict
-	// rejects, lenient warns.
+	// rejects, lenient warns. Also rejects a quoted-empty rule-set name (#6455).
 	dupNATRuleSetWarnings, dupNATRuleSetErr := validateDuplicateNATRuleSetNamesAST(
 		tree, opts.lenientDuplicateNATRuleSetName)
 	if dupNATRuleSetErr != nil {
@@ -398,7 +401,8 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	}
 
 	// #5180: duplicate hierarchical named-block gate — see compileConfigWithOpts.
-	// Pre-expansion, top-level stanzas only; strict rejects, lenient warns.
+	// Pre-expansion, top-level stanzas only; strict rejects, lenient warns. Also
+	// rejects a quoted-empty group/interface/screen-ids-option name (#6455).
 	dupBlockWarnings, dupBlockErr := validateDuplicateNamedBlockAST(
 		tree, opts.lenientDuplicateNamedBlock)
 	if dupBlockErr != nil {
@@ -407,7 +411,8 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 
 	// #5649 (C181-M18): duplicate NAT rule-name gate — see compileConfigWithOpts
 	// / validateDuplicateNATRuleNamesAST. Pre-expansion, top-level `security`
-	// stanzas only; strict rejects, lenient warns.
+	// stanzas only; strict rejects, lenient warns. Also rejects a quoted-empty
+	// rule name (#6455).
 	dupNATRuleWarnings, dupNATRuleErr := validateDuplicateNATRuleNamesAST(
 		tree, opts.lenientDuplicateNATRuleName)
 	if dupNATRuleErr != nil {
@@ -417,7 +422,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	// #6454 (C181-M18 sibling): duplicate NAT rule-SET-name gate — see
 	// compileConfigWithOpts / validateDuplicateNATRuleSetNamesAST. Pre-expansion,
 	// top-level `security` stanzas only, keyed by (natType, rule-set); strict
-	// rejects, lenient warns.
+	// rejects, lenient warns. Also rejects a quoted-empty rule-set name (#6455).
 	dupNATRuleSetWarnings, dupNATRuleSetErr := validateDuplicateNATRuleSetNamesAST(
 		tree, opts.lenientDuplicateNATRuleSetName)
 	if dupNATRuleSetErr != nil {
