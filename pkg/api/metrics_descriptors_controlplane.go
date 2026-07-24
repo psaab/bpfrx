@@ -1,0 +1,118 @@
+package api
+
+import "github.com/prometheus/client_golang/prometheus"
+
+func (c *xpfCollector) initControlPlaneDescriptors() {
+	c.neighborPeriodicAge = prometheus.NewDesc(
+		"xpf_daemon_neighbor_periodic_last_success_age_seconds",
+		"Seconds since each Go periodic neighbor-maintenance phase "+
+			"last completed. A monotonically climbing value means that "+
+			"phase's guarded goroutine is wedged on a stuck netlink/probe "+
+			"syscall (#1780).",
+		[]string{"phase"}, nil,
+	)
+	c.frrReloadDegraded = prometheus.NewDesc(
+		"xpf_frr_reload_degraded",
+		"1 while the last applied FRR reload fell back to the additive "+
+			"vtysh -f path (full frr-reload.py diff failed) and the "+
+			"in-manager retry has not yet converged; stale-config "+
+			"removal is deferred while set (#1880).",
+		nil, nil,
+	)
+	c.ipsecRebindPending = prometheus.NewDesc(
+		"xpf_ipsec_rebind_pending",
+		"1 while the last DHCP-lease-change IPsec rebind failed and has "+
+			"not yet reconverged (#4899): a DHCP renewal moved the kernel "+
+			"address an IPsec gateway is dynamically bound to "+
+			"(external-interface, no explicit local-address), but the "+
+			"swanctl re-render/reload failed, so strongSwan keeps binding "+
+			"the STALE lease address and the tunnel cannot re-establish. "+
+			"The daemon retries the rebind autonomously; 0 once swanctl "+
+			"local_addrs reconverge on the current lease.",
+		nil, nil,
+	)
+	c.schedulerRepublishFailed = prometheus.NewDesc(
+		"xpf_scheduler_republish_failed",
+		"1 while the most recent scheduler-driven policy republish "+
+			"failed and has not yet converged (#3780): stale "+
+			"enforcement is live past a schedule window — a scheduled "+
+			"permit may still be forwarding after its window closed, or "+
+			"a scheduled block never engaged. The daemon retries the "+
+			"transition autonomously on each scheduler tick; 0 when the "+
+			"enforcement snapshot is in sync with the schedule state.",
+		nil, nil,
+	)
+	c.schedulerRepublishStale = prometheus.NewDesc(
+		"xpf_scheduler_republish_stale_seconds",
+		"Seconds since the current scheduler-republish failure streak "+
+			"began (#3780); 0 when healthy. A climbing value means "+
+			"enforcement has been out of sync with the schedule window "+
+			"for that long while the daemon retries.",
+		nil, nil,
+	)
+	c.schedulerRepublishFailClosed = prometheus.NewDesc(
+		"xpf_scheduler_republish_fail_closed",
+		"1 while the scheduler-republish failure streak has persisted past "+
+			"the bounded age and the scheduler has escalated to FAIL-CLOSED "+
+			"(#5669): scheduled policies are forced inactive (deny) so a "+
+			"scheduled permit stops forwarding past its window close instead "+
+			"of relying on an eventual republish recovery. 0 when healthy or "+
+			"still inside the bounded retry window (xpf_scheduler_republish_"+
+			"failed=1, xpf_scheduler_republish_stale_seconds climbing).",
+		nil, nil,
+	)
+	c.configPersistDegraded = prometheus.NewDesc(
+		"xpf_daemon_config_persist_degraded",
+		"1 while the running active configuration failed to persist "+
+			"to disk and the background retry has not yet succeeded "+
+			"(a daemon restart would load a stale config, #1799); 0 "+
+			"when config persistence is healthy.",
+		nil, nil,
+	)
+	c.rollbackHistoryDegraded = prometheus.NewDesc(
+		"xpf_config_rollback_persist_degraded",
+		"1 while the most recent commit failed to durably persist its "+
+			"text rollback-history files (the canonical rollback "+
+			"history, #3441); 0 when healthy. The commit still "+
+			"succeeded and the active config is durable (#1799) — this "+
+			"flags a degraded recovery aid, not a forwarding outage.",
+		nil, nil,
+	)
+	c.userspacePolicyContentRejected = prometheus.NewDesc(
+		"xpf_userspace_policy_content_rejected",
+		"1 while the most recently built userspace snapshot carries "+
+			"unrepresentable policy content (a policy names an "+
+			"application protocol/port or address the matcher cannot "+
+			"represent) that the helper integrity preflight rejects "+
+			"(#3261). The helper stays armed and retains the "+
+			"previous-good policy state (a fresh boot lands on "+
+			"default-deny) — it never fails open to the kernel. Nonzero "+
+			"means the running dataplane policy is NOT the committed "+
+			"config; edit out the offending application/address and "+
+			"re-commit. 0 when the last build was fully representable.",
+		nil, nil,
+	)
+	c.userspaceZoneIDCollision = prometheus.NewDesc(
+		"xpf_userspace_zone_id_collision",
+		"1 while the most recently built userspace snapshot QUARANTINED "+
+			"one or more security zones because two zone names fold to the "+
+			"same StableZoneID (#3719). The strict commit path rejects a "+
+			"collision; this fires only on the lenient / HA-sync / "+
+			"pre-#3075-persisted path, where the later-sorting zone is "+
+			"dropped from the dataplane (its interfaces unzoned, its "+
+			"traffic denied) so two zones never share an id. The dataplane "+
+			"is fail-closed, but zone isolation is DEGRADED (the "+
+			"quarantined zone forwards nothing) until an operator renames "+
+			"one zone and re-commits. 0 when every zone has a distinct id.",
+		nil, nil,
+	)
+	c.rpmPinInstallFailures = prometheus.NewDesc(
+		"xpf_rpm_probe_pin_install_failures",
+		"Number of RPM next-hop probe pins whose kernel fwmark rule / "+
+			"pinned route failed to install. Affected tests hold their "+
+			"prior state (ErrProbeSetup) instead of probing the default "+
+			"path, so a nonzero value means those uplinks are NOT being "+
+			"health-checked (#1895).",
+		nil, nil,
+	)
+}
