@@ -6,12 +6,12 @@ import (
 )
 
 // #5649 (C181-M18): two rules with the SAME name in one NAT rule-set both
-// compile as separate first-match rows — the first shadows the second and both
-// share the single natType/ruleset/rule counter identity (pkg/dataplane/
-// compiler_nat.go). The operator gets order-dependent translation, an
-// unreachable rule, and merged telemetry that show/counter surfaces cannot
-// disambiguate. validateDuplicateNATRuleNamesAST rejects this at strict commit
-// and warns on the tolerant load path.
+// compile as separate first-match entries sharing one operational identity (the
+// rule name). A NAT rule-set is keyed by rule name, so the duplicate is a config
+// error regardless of NAT type — counted rows on the shared natType/ruleset/rule
+// hit counter for source/destination/ordinary-static, two snapshots for a
+// counter-less NPTv6 static rule. validateDuplicateNATRuleNamesAST rejects this
+// at strict commit and warns on the tolerant load path.
 //
 // RED-on-revert: neutralize the gate by making validateDuplicateNATRuleNamesAST
 // return `nil, nil` at the top (a clean assertion RED, not a build break) — the
@@ -125,7 +125,9 @@ func TestDuplicateNATRuleNameRejected(t *testing.T) {
 			if err == nil {
 				t.Fatalf("CompileConfig must reject a duplicate NAT %s rule name", tc.name)
 			}
-			for _, want := range []string{tc.name, "R1", "RS", "5649"} {
+			// Bind the exact natType phrase, not just the bare word, plus the
+			// rule / rule-set names and the issue tag.
+			for _, want := range []string{"NAT " + tc.name + " rule", "R1", "RS", "5649"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("error should mention %q, got: %v", want, err)
 				}
@@ -134,22 +136,24 @@ func TestDuplicateNATRuleNameRejected(t *testing.T) {
 	}
 }
 
-// TestDuplicateNATRuleNameNPTv6AwareDiagnostic binds the #6452 review fold
-// (Codex finding #3). NPTv6 (RFC 6296) static rules are COUNTER-LESS
-// (compileStaticNAT skips rule.IsNPTv6 before assignNATCounterID;
-// buildNptv6Snapshots appends each as its own snapshot) AND the #2241 NPTv6
-// overlap gate deliberately SKIPS same-(rule-set, rule) pairs (#4339). So two
-// same-named NPTv6 rules are caught by NO other gate — this gate MUST still
-// reject them (a duplicate rule name is always invalid), but the diagnostic
-// must NOT claim a shared "counter identity" for a counter-less rule.
+// TestDuplicateNATRuleNameNPTv6Counterless binds the #6452 review fold. NPTv6
+// (RFC 6296) static rules are COUNTER-LESS: compileStaticNAT skips rule.IsNPTv6
+// before assignNATCounterID, and buildNptv6Snapshots appends each as its own
+// snapshot. The #2241 NPTv6 overlap gate deliberately SKIPS same-(rule-set,
+// rule) pairs (#4339, so a multi-from-scope rule is not flagged against
+// itself), so it never compares two same-named NPTv6 rules — this gate is the
+// only one that catches them. A duplicate NPTv6 rule name is therefore still
+// rejected (a duplicate name is always invalid), but the type-agnostic
+// diagnostic must NOT claim a per-rule counter the NPTv6 rule does not have.
 //
-// RED-on-revert of the NPTv6-awareness (drop the staticRuleIsNPTv6 detection or
-// the reason() nptv6 branch): the message reverts to the counter-identity
-// wording, so the "must NOT mention counter identity" assertion goes RED.
-func TestDuplicateNATRuleNameNPTv6AwareDiagnostic(t *testing.T) {
-	// Two same-named NPTv6 rules with DIFFERENT, non-overlapping prefixes —
-	// the overlap gate would not flag them even if it inspected them, so this
-	// gate is the sole catcher.
+// RED-on-revert of a counter-specific message (e.g. reintroducing "share the
+// one natType/ruleset/rule counter identity"): the "must NOT mention counter"
+// assertion goes RED. RED-on-revert of the gate itself (return nil, nil):
+// CompileConfig no longer rejects and the first assertion goes RED.
+func TestDuplicateNATRuleNameNPTv6Counterless(t *testing.T) {
+	// Two same-named NPTv6 rules with DIFFERENT, non-overlapping prefixes — the
+	// overlap gate would not flag them even if it compared them, so this gate is
+	// the sole catcher.
 	tree := parseHier5649(t, `security {
     nat {
         static {
@@ -173,25 +177,15 @@ func TestDuplicateNATRuleNameNPTv6AwareDiagnostic(t *testing.T) {
 		t.Fatal("CompileConfig must still reject a duplicate NPTv6 static rule name")
 	}
 	msg := err.Error()
-	for _, want := range []string{"static", "R1", "RS", "NPTv6", "5649"} {
+	for _, want := range []string{"NAT static rule", "R1", "RS", "5649"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("NPTv6 duplicate error should mention %q, got: %v", want, err)
 		}
 	}
-	// The rule is counter-less; the diagnostic must not claim a shared counter.
-	if strings.Contains(msg, "counter identity") {
-		t.Fatalf("NPTv6 duplicate diagnostic must NOT claim a shared counter identity, got: %v", err)
-	}
-
-	// Flat-set nptv6-prefix shape is detected too (dual-AST): a single R1 via
-	// flat set MERGES and must pass — proof the detector reads both shapes and
-	// the flat form does not duplicate.
-	flat := setTree5649(t, []string{
-		"set security nat static rule-set RS rule R1 match destination-address 2001:db8:1::/48",
-		"set security nat static rule-set RS rule R1 then static-nat nptv6-prefix 2001:db8:2::/48",
-	})
-	if _, err := validateDuplicateNATRuleNamesAST(flat, false); err != nil {
-		t.Fatalf("flat-set single NPTv6 rule must pass, got: %v", err)
+	// The rule is counter-less; the type-agnostic diagnostic must not claim any
+	// per-rule counter.
+	if strings.Contains(msg, "counter") {
+		t.Fatalf("NPTv6 duplicate diagnostic must NOT claim a per-rule counter, got: %v", err)
 	}
 }
 

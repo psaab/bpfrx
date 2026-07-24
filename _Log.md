@@ -60250,3 +60250,28 @@ top.
     heatmap unchanged, FULL go test ./... GREEN.
 - **File(s)**: pkg/config/dup_nat_rule_names.go,
     pkg/config/dup_nat_rule_names_5649_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23 22:10
+- **Action**: #6452 review fold round 2 (Codex 3 precision findings on the
+    NPTv6-diagnostic code). Took the SIMPLIFY path: dropped the NPTv6 vs
+    counter classification entirely (removed staticRuleIsNPTv6, the nptv6
+    field, the reason() method, and the seenNPTv6 tracking) and use ONE
+    type-agnostic reason for all duplicate NAT rule names — "a NAT rule-set is
+    keyed by rule name, so the same name authored twice compiles both instances
+    as separate first-match entries sharing one operational identity". This is
+    TRUE regardless of type (counted rows for source/destination/ordinary-static,
+    snapshots for counter-less NPTv6) and never claims a per-rule counter,
+    eliminating all three findings (last-then faithfulness, disjoint/mixed-pair
+    accuracy, vacuous flat test) in one stroke. Rejection + core dup-detection
+    untouched. Findings #1/#2 remain deferred to #6455. Tests: tightened the
+    natType assertion to "NAT <type> rule"; replaced the NPTv6-aware test with
+    TestDuplicateNATRuleNameNPTv6Counterless (two same-named NPTv6 static rules
+    → rejected, message must NOT contain "counter"); dropped the vacuous
+    single-rule flat assertion (no detector to bind — a flat-set duplicate can't
+    exist, SetPath merges same-named rules). Parent-RED verified firsthand:
+    (A) `return nil,nil` at gate top → all reject tests RED; (B) flip the strict
+    message "operational identity"→"counter identity" → the NPTv6 no-counter
+    test RED. go vet ./pkg/config clean, heatmap UNCHANGED, FULL go test ./...
+    GREEN.
+- **File(s)**: pkg/config/dup_nat_rule_names.go,
+    pkg/config/dup_nat_rule_names_5649_test.go, docs/config-schema.md, _Log.md

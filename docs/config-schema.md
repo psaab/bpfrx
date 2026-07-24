@@ -494,23 +494,30 @@ blocks (compileNAT merges those, #3915), so a rule name split across two
 lenient (load / peer-sync) warns via `opts.lenientDuplicateNATRuleName` (#1960
 no-brick) and keeps the historical two-row behavior.
 
-**NPTv6 (RFC 6296) static rules are counter-less** — `compileStaticNAT` skips
+The reason line is deliberately **type-agnostic** — it states the genuine,
+type-independent defect (a rule-set is keyed by rule name, so the same name
+authored twice is a config error) and never claims a per-rule hit counter.
+NPTv6 (RFC 6296) static rules are COUNTER-LESS — `compileStaticNAT` skips
 `rule.IsNPTv6` before `assignNATCounterID`, and `buildNptv6Snapshots`
-(`pkg/dataplane/userspace/nat_nptv6.go`) appends each rule as its own snapshot.
-The #2241 NPTv6 overlap gate (`compiler_validate_strict_nat.go`) deliberately
-SKIPS same-`(rule-set, rule)` pairs (#4339, so a single multi-`from`-scope rule
-is not flagged against itself), so it never compares two same-named NPTv6 rules
-— this duplicate-name gate is the ONLY one that catches them. A duplicate NPTv6
-rule name is therefore still rejected (a duplicate name is always invalid), but
-the diagnostic is NPTv6-aware: it reports order-dependent first-match resolution
-between the two snapshots rather than a shared counter identity the rule does
-not have (`staticRuleIsNPTv6` + `dupNATRule.reason()`).
+(`pkg/dataplane/userspace/nat_nptv6.go`) appends each rule as its own snapshot —
+so a counter-specific diagnostic would be false for them. The #2241 NPTv6
+overlap gate (`compiler_validate_strict_nat.go`) also deliberately SKIPS
+same-`(rule-set, rule)` pairs (#4339, so a single multi-`from`-scope rule is not
+flagged against itself), so it never compares two same-named NPTv6 rules — this
+duplicate-name gate is the ONLY one that catches them, and it does so with the
+same name-identity reason it uses for every other NAT type.
 
 Covered by `pkg/config/dup_nat_rule_names_5649_test.go` (source / destination /
-static reject, NPTv6-aware-diagnostic reject, lenient warn, and distinct-name /
+static reject, NPTv6 counter-less reject, lenient warn, and distinct-name /
 different-rule-set / flat-set-merge accept guards), RED on revert of the gate
-(the duplicate is accepted) and, separately, RED on revert of the NPTv6
-detection (the diagnostic wrongly claims a counter identity).
+(the duplicate is accepted) and, separately, RED if the diagnostic reintroduces
+a per-rule counter claim (false for a counter-less NPTv6 rule).
+
+The two limitations this gate shares with its #5180 sibling — a duplicate
+authored entirely inside an applied group bypasses the top-level-only
+pre-expansion scan, and a quoted-empty rule name is skipped — are tracked
+family-wide in #6455 rather than diverging this gate's scope from the
+named-block gate.
 
 **Phase 2 (#5878) — reference-binder canonicalization.** Phase 1 (above) closes
 the divergent-commit fail-open by rejecting a duplicate-spelling collision at
