@@ -1,8 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v14 — r13 findings folded (Codex NEEDS-REVISION
+- **Status**: DRAFT v15 — r14 findings folded (Codex NEEDS-REVISION
   3M/3m; AGY PLAN-READY-WITH-NITS 0M/1m; Claude SMR
-  PLAN-READY-WITH-NITS 0M/1m); pending convergence review r14
+  PLAN-READY-WITH-NITS 0M/1m); pending convergence review r15
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -253,6 +253,43 @@
   retry loop — process exit abandons the retry goroutine), the
   `wrapEnvelope` cite corrected (active/candidate/rollback files,
   never confirm.json).
+  v15: r14 convergence — three final-precision folds (all verified):
+  (a) the tombstone scope is re-based from API-method classes to the
+  actual BINDING-AMBIGUITY predicate (Codex M1, verified: edit-away/
+  edit-back restores byte-identical content while marking the candidate
+  dirty — `store_command.go:32-37,72-77`,
+  `gen_commit_5848_test.go:65-90` — so a "content-changing" plain
+  commit can leave the record's hash MATCHING; SyncApply can likewise
+  produce active-identical content; and legacy empty-`GuardedHash`
+  records categorically disable the mismatch check,
+  `store_persist.go:149-159`): the split is now NON-IDEMPOTENT
+  confirm-type resolutions (keep-active confirms AND content-changing
+  supersessions — a lingering record is NOT safe to re-arm) →
+  tombstone; IDEMPOTENT-REVERT replacement resolutions (timeout
+  rollback, boot-recovery revert, SyncApply supersede-with-failed-
+  replacement — re-execution yields the same state BY DESIGN, which is
+  why #5473 tolerates lingering records there) → NO tombstone; plus
+  class 0, factory reset (terminal wipe of state+record,
+  `factory_reset.go:252-268` — no tombstone, inventory completed).
+  (b) the keyed-debt retry is a FOUR-STATE machine (Codex M2, verified
+  the post-unlink dir-fsync state — `DeleteConfirm` can unlink A then
+  fail SyncDir, and master's retry intentionally re-drives it on
+  ABSENT, `db.go:297-315`, `store_persist.go:441-443`): matching A →
+  tombstone+delete; ABSENT → call DeleteConfirm (finish the dir
+  fsync); different B → clear; read error → retain+retry.
+  (c) the debt identity is a persisted opaque `ArmID` (Codex M3,
+  verified: same-content arms share `GuardedHash`, and wall-clock
+  `Deadline` can collide under clock adjustment — the only true
+  uniqueness token, `confirmGen`, is memory-only): additive `ArmID`
+  field (crypto/rand, written at arm); the debt keys on `ArmID` alone.
+  Residual repairs: the irreducible-residual wording corrected (the
+  hazard is bounded by the NEXT BOOT's resolution, not the deadline —
+  booted after the deadline, the lingering pending-shaped record
+  executes the erroneous expired-revert; irreducible without
+  durability-gated confirm); the stale-drop diagnostic text itself is
+  updated to hedge the cause ("superseded OR basis-incompatible") —
+  the v14 "loud log" cite misattributed it categorically
+  (`store_persist.go:159-165`).
 
 ---
 
@@ -892,66 +929,92 @@ records, work item H would instead revert the confirmed config AT LOAD
 — immediate divergence. Fix (configstore, ~55 LoC + tests), with the
 r12-hardened mechanics:
 
-- **SCOPE: tombstone ONLY for keep-active confirmations (r13 Codex M1,
-  verified against the #5473 durable-intent semantics).** The resolution
-  paths split three ways, and only ONE class needs the tombstone:
-  (i) CONTENT-PRESERVING confirmations — explicit
-  `ConfirmCommit/ConfirmCommitAs` and `ConfirmPendingOnDemotion`: the
-  intent is "keep the current active config", the content does not
-  change, the record's hash keeps matching, and nothing in the durable
-  state records the resolution. THE TOMBSTONE EXISTS FOR THIS CLASS.
-  (ii) CONTENT-CHANGING supersessions — plain commit and HA SyncApply
-  that advance the active config: the #5835 GuardedHash mismatch
-  ALREADY disambiguates (a lingering record no longer matches the
-  advanced active tree → stale-drop at recovery); these paths are
-  UNCHANGED (existing retry debt only, no tombstone).
-  (iii) REPLACEMENT/ROLLBACK resolutions — timeout rollback
+- **SCOPE: tombstone by BINDING-AMBIGUITY / IDEMPOTENCE, not by API
+  method (r13 Codex M1 + r14 Codex M1, both verified).** The resolution
+  paths split by what a LINGERING record would do on re-arm:
+  (i) NON-IDEMPOTENT confirm-type resolutions — keep-active confirms
+  (explicit `ConfirmCommit/ConfirmCommitAs`,
+  `ConfirmPendingOnDemotion`) AND content-changing supersessions
+  (plain commit, HA SyncApply advancing active): the resolution's
+  intent is "the (possibly new) active config STANDS"; a lingering
+  record that still BINDS would re-arm and roll that state back —
+  unsafe. THE TOMBSTONE COVERS THIS WHOLE CLASS, because binding
+  ambiguity survives even here: edit-away/edit-back can restore
+  byte-identical content while marking the candidate dirty
+  (`store_command.go:32-37,72-77`, `gen_commit_5848_test.go:65-90`),
+  so a "content-changing" commit can leave the hash MATCHING; SyncApply
+  can produce active-identical content; and legacy empty-`GuardedHash`
+  records categorically skip the mismatch check
+  (`store_persist.go:149-159`). The #5835 stale-drop remains the
+  first-line disambiguator on this class; the tombstone is the durable
+  one that never depends on content equality.
+  (ii) IDEMPOTENT-REVERT replacement resolutions — timeout rollback
   (`store_commit.go:867-937`), boot-recovery revert
-  (`store_persist.go:171-227`), and the SyncApply supersede that rolls
-  the local store (`store.go:738-760`): the record IS the rollback
-  intent. The #5473 semantics already linearize these correctly —
-  persist the replacement target FIRST, remove the record ONLY when the
-  replacement is durable, RETAIN it + `confirmResolvePendingPersist`
-  debt on failure, and re-execute idempotently on crash (pinned by
-  `confirm_rollback_durable_5473_test.go:221-293`). Tombstoning here
-  would DESTROY the only durable intent capable of reverting a
-  still-unconfirmed disk config — EXPLICITLY FORBIDDEN on this class.
-- **Linearization order for the keep-active class (r12 Codex M1,
-  r13-scoped).** Master resolves in memory first —
+  (`store_persist.go:171-227`), SyncApply supersede-with-failed-
+  replacement (`store.go:738-760`): the record IS the rollback intent,
+  and re-execution is IDEMPOTENT BY DESIGN ("the NEXT boot re-reads
+  confirm.json (deadline still past) and reverts to prevTree again" —
+  `confirm_rollback_durable_5473_test.go:221-293` pins it). The #5473
+  semantics linearize these correctly — persist the replacement target
+  FIRST, remove the record ONLY when the replacement is durable,
+  RETAIN it + `confirmResolvePendingPersist` debt on failure.
+  Tombstoning here would DESTROY durable intent — EXPLICITLY
+  FORBIDDEN.
+  (iii) CLASS 0 — factory reset (`factory_reset.go:252-268`): terminal
+  wipe of active state AND confirm.json under a reset generation; no
+  tombstone, nothing to resolve. (r14 Codex m2 — the v14 inventory
+  omitted it.)
+  Exhaustiveness (AGY r14, verified): every master resolution path —
+  `ConfirmCommit/ConfirmCommitAs`, plain-commit auto-confirm, HA-sync
+  auto-confirm, `ConfirmPendingOnDemotion`, timeout rollback,
+  boot-recovery resolution, factory reset — lands in exactly one of
+  (i)/(ii)/(iii).
+- **Linearization order for the confirm-type class (r12 Codex M1,
+  r13/r14-scoped).** Master resolves in memory first —
   `cancelPendingConfirmTimerLocked` (`store_commit.go:717-726`) stops
   the timer, bumps `confirmGen`, and NILS the in-memory record content
   — then deletes durably; a crash between leaves a matching
   pending-shaped record that recovery re-arms. For class (i) the order
   is pinned: (1) READ-MUTATE-WRITE the tombstone durably — THE
-  resolution linearization point; (2) in-memory resolution (timer stop
-  + confirmGen bump + state clear — still covering the in-flight
-  callback race, `:717-726` + `PromoteRollback`'s gen check `:860`);
-  (3) best-effort delete with retry. Tombstone-write FAILURE: proceed
-  with the in-memory resolution and retain retry debt (re-driving
-  tombstone→delete) — making the confirm itself durability-gated would
-  invert a disk failure into a rollback of a confirmed config, which is
-  strictly worse. The irreducible residual (write-failure AND crash
-  before retry heals) re-arms a resolved window — documented, bounded
-  by the record's DEADLINE (r13 Codex m2: the retry loop dies with the
-  process, so it is NOT the bound), and strictly smaller than today's
-  window (which spans the entire deletion, not just the tombstone
-  write).
-- **Identity-keyed removal debt (r13 Codex M2, subsuming r13 SMR m1 +
-  AGY nit1).** `confirmRemoveDegraded` becomes a KEYED debt: it carries
-  the resolved record's identity (`GuardedHash` + `Deadline`) captured
-  when the debt is raised. The retry reads the CURRENT confirm.json and
-  acts ONLY on identity match (tombstone if needed → delete); on
-  mismatch it CLEARS the debt — the debt's target is gone regardless of
-  which `WriteConfirm` phase intervened: success (B overwrote A),
-  pre-rename failure (A intact → identity MATCHES → the retry correctly
-  completes A's removal), or post-rename failure (B live but durability
-  uncertain → identity MISMATCH → clear → B kept; B's own best-effort
-  arm doctrine covers its durability, `store_commit.go:530-535`). NO
-  eager arm-time clearing — the identity check at retry time is
-  phase-safe by construction, which also subsumes the r13 SMR m1 /
-  AGY nit1 ordering pin. Master's unkeyed version of this race destroys
-  a fresh pending record's crash-recovery file TODAY; the keyed debt
-  closes it.
+  resolution linearization point (NO-OP when no confirm.json exists —
+  the best-effort arm failed to persist or an earlier cleanup removed
+  it; there is nothing to resurrect and nothing to tombstone, and the
+  in-memory resolution proceeds regardless — r14 SMR m1 = AGY nit1);
+  (2) in-memory resolution (timer stop + confirmGen bump + state clear
+  — still covering the in-flight callback race, `:717-726` +
+  `PromoteRollback`'s gen check `:860`); (3) best-effort delete with
+  retry. Tombstone-write FAILURE: proceed with the in-memory resolution
+  and retain retry debt (re-driving tombstone→delete) — making the
+  confirm itself durability-gated would invert a disk failure into a
+  rollback of a confirmed config, which is strictly worse. The
+  irreducible residual (write-failure AND crash before retry heals)
+  re-arms a resolved window — and the hazard is bounded by the NEXT
+  BOOT's resolution, NOT by the record's deadline (r14 Codex m1: booted
+  after the deadline, the lingering pending-shaped record executes the
+  erroneous expired-revert immediately). Irreducible without
+  durability-gated confirm; strictly smaller than today's window (which
+  spans the entire deletion, not just the tombstone write).
+- **ArmID-keyed removal debt, FOUR-STATE retry (r13 Codex M2 + r14
+  Codex M2/M3, subsuming r13 SMR m1 + AGY nit1).** The debt identity is
+  a persisted opaque `ArmID` — an additive field written at arm
+  (crypto/rand; r14 Codex M3: `GuardedHash` collides across
+  same-content arms, wall-clock `Deadline` can collide under clock
+  adjustment, and `confirmGen` — the only true token — is memory-only,
+  `store.go:168-179`). `confirmRemoveDegraded` carries the resolved
+  record's `ArmID`; the retry reads the CURRENT confirm.json and runs a
+  FOUR-STATE table (r14 Codex M2, covering the post-unlink dir-fsync
+  state master's retry already handles — `DeleteConfirm` reaches the
+  dir fsync even when the file is absent, `store_persist.go:441-443`,
+  `db.go:297-315`): (a) record present, `ArmID` MATCHES → tombstone (if
+  not already) → delete; (b) record ABSENT → call `DeleteConfirm` again
+  (the unlink may have landed without a durable dir sync — finish it);
+  (c) record present, `ArmID` MISMATCH (a new arm B overwrote — in ANY
+  `WriteConfirm` phase: success, pre-rename failure, post-rename
+  failure) → CLEAR the debt, B kept; (d) READ ERROR → retain the debt,
+  retry with backoff. No eager arm-time clearing — the identity check
+  at retry time is phase-safe by construction. Master's unkeyed version
+  of this race destroys a fresh pending record's crash-recovery file
+  TODAY; the keyed four-state debt closes it.
 - **Tombstone write = READ-MUTATE-WRITE, full record (r12 Claude SMR m2
   = AGY Attack 2; inventory r13-corrected).** The tombstone is the
   EXISTING record read back, `Resolved` set, rewritten via the same
@@ -966,9 +1029,9 @@ r12-hardened mechanics:
   is explicitly REJECTED: it trips #5637 and wedges recovery at the
   early error return (`store_persist.go:141`).
 - **Additive schema fields — DECIDED, not deferred (r12 Codex M3 =
-  Claude SMR m1 = AGY Attack 1).** `Resolved bool` and `HashBasis
-  string` are ADDITIVE JSON fields on `confirmRecord`, per the
-  `WriteConfirm` contract comment itself: "No #1917 compatibility
+  Claude SMR m1 = AGY Attack 1).** `Resolved bool`, `HashBasis string`,
+  and `ArmID string` are ADDITIVE JSON fields on `confirmRecord`, per
+  the `WriteConfirm` contract comment itself: "No #1917 compatibility
   envelope is used — the file is transient recovery state, not a
   committed config, and confirmRecord evolves via additive JSON fields"
   (`db.go:200-205`). The v12 claim that the schema change "rides the
@@ -979,43 +1042,53 @@ r12-hardened mechanics:
   `EnvelopeMinReaderVersion`, `envelope.go:111-123`) does not apply.
   Downgrade semantics (documented, accepted): an old reader's
   `json.Unmarshal` silently IGNORES the unknown fields — `Resolved` →
-  it re-arms a resolved record through its deadline (master's
-  delete-failure semantics; bounded by the DEADLINE, not the retry);
-  `HashBasis` → it compares on its own legacy basis (faithful to its
-  build).
+  it re-arms a resolved record (master's delete-failure semantics; the
+  hazard resolves at the next boot — after the deadline the erroneous
+  expired-revert executes); `HashBasis` → it compares on its own legacy
+  basis (faithful to its build); `ArmID` → inert (only the new build's
+  keyed debt consumes it).
 - **Recovery total order (AGY r12, verified)**: ReadConfirm parse gate
   → `rec.Resolved` check (tombstone → drop) → GuardedHash mismatch
   (dual-basis → stale-drop) → expired (existing revert) → work item H
   (unexpired FirstCommit+cluster → revert-at-Load) → re-arm.
 
-Regressions: (x1) demotion-confirm (keep-active class) + injected
+Regressions: (x1) demotion-confirm (confirm-type class) + injected
 deletion failure + restart → recovery drops the tombstoned record (no
 re-arm, no H, no rollback of the confirmed config; the #4378
 `commit_confirm_demote_4378_test.go:5-17,50-72` divergence stays
 closed); (x2) crash BETWEEN arm and tombstone → genuinely pending →
-normal re-arm; (x3) tombstone-write failure → in-memory resolution
-proceeds, identity-keyed retry converges tombstone→delete, health
-degraded until healed; (x4) identity-keyed debt across all three
-WriteConfirm phases: (x4a) B-arm SUCCESS → retry sees identity mismatch
-→ clears debt, B intact; (x4b) PRE-RENAME failure (A intact) → identity
-match → retry completes A's removal; (x4c) POST-RENAME failure (B live,
-durability uncertain) → identity mismatch → clears debt, B KEPT (no
-retry deletion of the live record — the master's unkeyed race);
-(x5) the read-mutate-write helper is the ONLY tombstone producer —
-assert its output passes the #5637 degenerate gate unmodified AND
-preserves `FirstCommit`/`Deadline`/`PrevTree`/`GuardedHash`/`HashBasis`
-exactly (r13 Codex m1: there is NO `Gen` field); (x6) HASH-BASIS
-cross-version: upgrade-in-window (legacy NORMAL record → legacy-basis
-compare BINDS, no spurious stale-drop) + downgrade-shape (canonical
-NORMAL record under a `HashBasis`-ignoring reader binds identically;
-additive fields inert); the exceptional-content cross-version cases are
-documented irrecoverable-by-construction (NOT tested as passing — they
-are admitted loss with loud logs). REPLACEMENT-class resolutions
-(timeout rollback, SyncApply supersede) keep their #5473 tests
-unchanged — assert explicitly that NO tombstone is written on those
-paths (the record is the rollback intent). This
-closes the master's re-arm-after-confirmed residual for the keep-active
-class — the only class where the residual exists.
+normal re-arm; (x2b) resolution with NO confirm.json on disk
+(best-effort arm-write failure) → tombstone NO-OP, in-memory
+resolution completes, no error (r14 SMR m1 = AGY nit1); (x3)
+tombstone-write failure → in-memory resolution proceeds, keyed retry
+converges tombstone→delete, health degraded until healed; (x4)
+four-state keyed debt: (x4a) arm-B SUCCESS → mismatch → debt cleared,
+B intact; (x4b) PRE-RENAME failure (A intact) → match → A's removal
+completed; (x4c) POST-RENAME failure (B live) → mismatch → debt
+cleared, B KEPT; (x4d) record ABSENT at retry (post-unlink dir-fsync
+owed) → `DeleteConfirm` re-driven to finish the sync; (x4e) READ ERROR
+→ debt retained, retried; (x4f) same-content re-arm → distinct
+`ArmID`s (crypto/rand) — no key collision even with identical
+`GuardedHash`+`Deadline`; (x5) the read-mutate-write helper is the
+ONLY tombstone producer — #5637 gate passes unmodified and
+`FirstCommit`/`Deadline`/`PrevTree`/`GuardedHash`/`HashBasis`/`ArmID`
+are preserved exactly (no `Gen` field exists); (x6) HASH-BASIS
+cross-version: legacy NORMAL record upgrade binds; canonical NORMAL
+record downgrade-shape binds (canonical == legacy for normal content);
+exceptional-content cross-version cases documented
+irrecoverable-by-construction (admitted loss — the stale-drop
+diagnostic text is updated to hedge "superseded OR
+basis-incompatible", r14 Codex m3); (x7) SCOPE regressions: a
+byte-identical plain-commit supersession (edit-away/edit-back) with
+injected removal failure + restart → the TOMBSTONED record is dropped
+(stale-drop would have bound); a legacy empty-`GuardedHash` record
+superseded + removal failure → tombstoned → dropped (the mismatch
+check never fires for legacy records); REPLACEMENT-class resolutions
+(timeout rollback, SyncApply supersede) assert NO tombstone is written
+— the record is the rollback intent and the #5473 tests stand
+unchanged; factory reset erases state+record with no tombstone. This
+closes the master's re-arm-after-confirmed residual for the whole
+confirm-type class — the only class where the residual is unsafe.
 
 **bootstrapFromFile interaction — DOCUMENTED CONSISTENCY, suppression
 rejected (r10 Codex M3, adjudicated).** After the guard's revert,
@@ -1199,16 +1272,18 @@ coexistence) is deleted as incoherent (r1 B3).
   touch configstore): the permanent FirstCommit+cluster recovery guard +
   the factored expired-branch FirstCommit revert helper + the canonical
   binding capture at Load.
-- `pkg/configstore/store_commit.go` + `db.go` (r11/r12/r13): the
+- `pkg/configstore/store_commit.go` + `db.go` (r11/r12/r13/r14): the
   `canonicalConfigHash` binding at the sole arm site
-  (`writeConfirmState`); the additive `Resolved` + `HashBasis` fields
-  on `confirmRecord` (per the `db.go:200-205` additive-evolution
-  contract — NO envelope bump, none exists for confirm.json); the
-  read-mutate-write tombstone helper (the ONLY tombstone producer —
-  its output always passes the #5637 gate); the tombstone-first
-  ordering ON THE KEEP-ACTIVE CONFIRM PATHS ONLY (replacement/rollback
-  resolutions keep #5473 semantics); the identity-keyed
-  `confirmRemoveDegraded` debt + retry match/clear logic.
+  (`writeConfirmState`); the additive `Resolved` + `HashBasis` +
+  `ArmID` fields on `confirmRecord` (per the `db.go:200-205`
+  additive-evolution contract — NO envelope bump, none exists for
+  confirm.json); the read-mutate-write tombstone helper (the ONLY
+  tombstone producer — its output always passes the #5637 gate;
+  NO-OP on absent record); the tombstone-first ordering ON THE
+  CONFIRM-TYPE RESOLUTION PATHS (idempotent-revert replacements keep
+  #5473 semantics; factory reset untouched); the ArmID-keyed
+  four-state `confirmRemoveDegraded` debt + retry table; the
+  hedge-the-cause stale-drop diagnostic (`store_persist.go:159-165`).
 - `pkg/fwdstatus/sampler.go`: `CachedStatusProvider` interface; `NewSampler`
   + `Sampler.dp` retyped; `sample()` direct call.
 - `pkg/dataplane/retirement_boundary_canary_test.go`: matcher extension
@@ -1365,10 +1440,12 @@ classification snapshot.
   new fields' downgrade semantics AND the correction that
   `wrapEnvelope` covers active/candidate/rollback, never confirm.json),
   and the `resolveConfirmRemovalLocked` / `noteConfirmRemoveFailureLocked`
-  comments (`store_commit.go:575-608`) for the keep-active-scoped
-  tombstone-first linearization + the identity-keyed debt semantics. The
-  irrecoverable cross-version cases are documented in the same comments
-  (admitted loss, loud logs).
+  comments (`store_commit.go:575-608`) for the confirm-type-scoped
+  tombstone-first linearization + the ArmID-keyed four-state debt
+  semantics. The irrecoverable cross-version cases are documented in
+  the same comments, AND the stale-drop diagnostic text at
+  `store_persist.go:159-165` is updated to hedge the cause
+  ("superseded OR basis-incompatible", r14 Codex m3).
 - `_Log.md` entries for every implementation edit (CLAUDE.md).
 
 ## 6. Public API preservation
@@ -1448,7 +1525,7 @@ Preserved exactly:
     apply — out of scope. The abandoned timer's persisted record
     re-resolves on the next boot's expired-window path (same semantics as
     the startup-failure abandon).
-12. **#4577 confirm contract (r8/r10/r11/r12/r13)**: an unconfirmed
+12. **#4577 confirm contract (r8/r10/r11/r12/r13/r14)**: an unconfirmed
     config must NEVER stand, and a CONFIRMED config must never be
     rolled back. Work item H's revert-at-Load honors the first half for
     the FirstCommit+cluster class by resolving the window EARLY (revert
@@ -1457,20 +1534,23 @@ Preserved exactly:
     hybrid-generating class, loudly and on purpose. Expired records keep
     the existing expired-branch behavior bit-for-bit. The second half is
     enforced by mechanisms with pinned linearization, CLASS BY CLASS:
-    keep-active confirmations get the resolution tombstone (the DURABLE
-    tombstone write is the linearization point — a resolved window is
-    never re-armed or reverted after it lands); content-changing
-    supersessions rely on the #5835 hash-mismatch stale-drop (unchanged);
-    replacement/rollback resolutions keep the #5473 durable-intent
-    semantics (the record IS the intent — persist target first, remove
-    on durable success, retain + debt on failure, idempotent
-    re-execution; NO tombstone). The identity-keyed removal debt makes
-    the retry act only on the record it resolved, in every WriteConfirm
-    failure phase. The irreducible residuals are documented, not hidden:
-    tombstone-write failure + crash before retry (bounded by the
-    record's deadline), and exceptional-content cross-version windows
-    (information lost at persistence — the arming basis is
-    uncomputable; admitted with loud logs, never papered over).
+    confirm-type resolutions (keep-active confirms AND content-changing
+    supersessions — any lingering record whose re-arm would be unsafe)
+    get the resolution tombstone (the DURABLE tombstone write is the
+    linearization point — a resolved window is never re-armed or
+    reverted after it lands); idempotent-revert replacement resolutions
+    keep the #5473 durable-intent semantics (the record IS the intent —
+    re-execution yields the same state by design; NO tombstone);
+    factory reset is a terminal wipe (no tombstone). The ArmID-keyed
+    four-state removal debt makes the retry act only on the record it
+    resolved, in every `WriteConfirm` failure phase including the
+    post-unlink dir-fsync state. The irreducible residuals are
+    documented, not hidden: tombstone-write failure + crash before
+    retry (hazard resolves at the NEXT BOOT — after the deadline the
+    erroneous expired-revert executes), and exceptional-content
+    cross-version windows (information lost at persistence — the
+    arming basis is uncomputable; admitted with hedge-the-cause
+    diagnostics, never papered over).
 
 ## 8. Risk assessment
 
@@ -1634,30 +1714,36 @@ Preserved exactly:
      bootstrap-with-live-cluster hybrid, and the seed-file import
      behavior is identical to the expired-window path (same
      `shouldBootstrapFromFile` decision, distinct journal trail);
-     (x) RESOLUTION-TOMBSTONE regressions (r11/r12/r13): (x1)
-     demotion-confirm (keep-active class) + injected confirm.json
+     (x) RESOLUTION-TOMBSTONE regressions (r11/r12/r13/r14): (x1)
+     demotion-confirm (confirm-type class) + injected confirm.json
      deletion failure + restart → recovery drops the TOMBSTONED record
      (no re-arm, no H, no rollback of the confirmed config — the #4378
      divergence stays closed); (x2) crash BETWEEN arm and tombstone →
-     genuinely pending → normal re-arm; (x3) tombstone-write failure →
-     in-memory resolution proceeds, identity-keyed retry converges
-     tombstone→delete, health degraded until healed; (x4)
-     identity-keyed debt across the three WriteConfirm phases:
-     (x4a) arm success → mismatch → debt cleared, B intact; (x4b)
-     pre-rename failure → match → A's removal completed; (x4c)
-     post-rename failure → mismatch → B KEPT (master's unkeyed race
-     closed); (x5) the read-mutate-write helper is the ONLY tombstone
-     producer — #5637 gate passes unmodified and
-     `FirstCommit`/`Deadline`/`PrevTree`/`GuardedHash`/`HashBasis` are
-     preserved exactly (no `Gen` field exists); (x6) HASH-BASIS
-     cross-version: legacy NORMAL record upgrade binds; canonical
-     NORMAL record downgrade-shape binds (canonical == legacy for
-     normal content); exceptional-content cross-version cases
-     documented irrecoverable-by-construction (admitted loss, loud
-     logs — NOT tested as passing); REPLACEMENT-class resolutions
-     (timeout rollback, SyncApply supersede) assert NO tombstone is
-     written — the record is the rollback intent and the #5473 tests
-     stand unchanged.
+     genuinely pending → normal re-arm; (x2b) resolution with NO
+     confirm.json on disk → tombstone NO-OP, in-memory resolution
+     completes; (x3) tombstone-write failure → in-memory resolution
+     proceeds, keyed retry converges tombstone→delete; (x4) four-state
+     keyed debt: (x4a) arm success → mismatch → clear, B intact;
+     (x4b) pre-rename failure → match → act; (x4c) post-rename failure
+     → mismatch → B KEPT; (x4d) record absent → DeleteConfirm
+     re-driven (dir-fsync); (x4e) read error → retain+retry; (x4f)
+     same-content re-arm → distinct ArmIDs; (x5) the read-mutate-write
+     helper is the ONLY tombstone producer — #5637 gate passes
+     unmodified and FirstCommit/Deadline/PrevTree/GuardedHash/
+     HashBasis/ArmID preserved exactly (no `Gen` field exists); (x6)
+     HASH-BASIS cross-version: legacy NORMAL record upgrade binds;
+     canonical NORMAL record downgrade-shape binds (canonical ==
+     legacy for normal content); exceptional-content cross-version
+     cases documented irrecoverable-by-construction (admitted loss;
+     the stale-drop diagnostic hedges "superseded OR
+     basis-incompatible"); (x7) SCOPE: byte-identical plain-commit
+     supersession (edit-away/edit-back) + removal failure + restart →
+     tombstoned record dropped; legacy empty-GuardedHash record
+     superseded + removal failure → tombstoned → dropped;
+     REPLACEMENT-class resolutions (timeout rollback, SyncApply
+     supersede) assert NO tombstone — the record is the rollback
+     intent and the #5473 tests stand unchanged; factory reset erases
+     state+record tombstone-free.
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
    `setDataplane`) and `daemon_forwarding_status_test.go` (rewrite against
    the narrowed adapter: `ProjectsMapStats`/`UsesUserspaceStatusAdapter`
@@ -1708,7 +1794,7 @@ Preserved exactly:
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r14)
+## 11. Open questions for adversarial review (r15)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
@@ -1806,7 +1892,20 @@ exceptional-content cases admitted irrecoverable-by-construction with
 loud logs, dual-hash evaluated and rejected as equivalent), record
 inventory corrected (`FirstCommit`, no `Gen`), downgrade bound
 corrected (deadline, not retry loop), `wrapEnvelope` cite corrected
-(active/candidate/rollback, never confirm.json).
+(active/candidate/rollback, never confirm.json); r14 additions: the
+tombstone scope re-based to the BINDING-AMBIGUITY/IDEMPOTENCE
+predicate (confirm-type resolutions — keep-active confirms AND
+content-changing supersessions — get the tombstone, closing the
+byte-identical-supersession and legacy-empty-hash holes; idempotent-
+revert replacements keep #5473; factory reset listed as class 0), the
+keyed debt is a FOUR-STATE machine (match → act; absent →
+DeleteConfirm to finish the dir fsync; mismatch → clear; read error →
+retain+retry), the debt identity is a persisted opaque `ArmID`
+(same-content hash collisions and clock-adjusted deadline collisions
+eliminated), the no-record-at-resolution NO-OP branch pinned (SMR m1
+= AGY nit1), the irreducible-residual wording corrected (hazard
+resolves at next boot, not the deadline), the stale-drop diagnostic
+hedges its cause, factory reset joins the exhaustive inventory.
 
 Still open:
 
