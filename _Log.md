@@ -60371,3 +60371,27 @@ top.
 - **File(s)**: pkg/api/sessions.go,
     pkg/api/sessions_pagination_canonical_5649_test.go,
     docs/refactoring-audit-current.txt, _Log.md
+
+## 2026-07-24 — #6483 static-NAT single-translation-target gate
+- **Timestamp**: 2026-07-24
+- **Action**: Add commit-check that a static-NAT rule declares EXACTLY ONE
+    translation target (prefix/prefix-name/nptv6-prefix/inet). Multi-target rules
+    (prefix+prefix-name, inet+prefix sibling, two prefixes, hier two static-nat
+    blocks) were silently accepted — the compiler honored one target by fixed
+    priority and dropped the rest into the shared Then field, which also let a
+    malformed mapped-port on a dropped target slip (the #6479/C179-038 residual).
+    New staticNATThenTargetCount counts DISTINCT (keyword,value) target identities
+    from the AST during compile (so the "restate the target to attach mapped-port"
+    idiom stays one target), recorded as StaticNATRule.ThenTargetCount (json:"-").
+    validateStaticNATSingleTargetStrict rejects >1, wired into runTailGates AFTER
+    the host-mask (#2173) and NPTv6 (#2240/#5818) gates so a rule ALSO carrying a
+    bad mapped-port/nptv6 prefix reports that concrete token first (never masks
+    the multi-target defect). Strict reject / lenient warn (#1960). PARENT-RED:
+    neutralize the `> 1` guard -> 5 reject tests go clean-assertion RED; restore
+    GREEN. gofmt/vet/go build ./... GREEN, full pkg/config suite GREEN,
+    regenerated docs/refactoring-audit-current.txt (compiler_validate_strict_nat.go
+    2865->2928 REFACTOR tier).
+- **File(s)**: pkg/config/compiler_nat_static.go,
+    pkg/config/compiler_validate_strict_nat.go, pkg/config/compiler_tailgates.go,
+    pkg/config/types_security.go, pkg/config/static_nat_multitarget_6483_test.go,
+    docs/config-schema.md, docs/refactoring-audit-current.txt, _Log.md

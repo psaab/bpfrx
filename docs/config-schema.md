@@ -1948,6 +1948,42 @@ above (`buildNAT64Snapshots` from `cfg.Security.NAT.NAT64`), which is unaffected
 Tests: `static_nat_inet_failclosed_5859_test.go` (both `pkg/config` and
 `pkg/dataplane/userspace`).
 
+**A static-NAT rule has EXACTLY ONE translation target (#6483).** A Junos
+`then static-nat` maps to exactly one of `prefix <ip>` | `prefix-name <name>`
+(#4290) | `nptv6-prefix <p6>` | `inet` (#5859). Authoring two or more — both a
+`prefix` and a `prefix-name`, an `inet` sibling alongside a `prefix` sibling, two
+`prefix` targets — is invalid Junos, but the compiler silently accepted it: the
+`compileNATStatic` child loop honors the FIRST target it matches by a fixed
+priority (`nptv6-prefix` > `prefix-name` > `prefix` > `inet`) and drops the rest,
+and because `prefix` / `inet` / `nptv6-prefix` all land in the shared `Then`
+field a later target simply overwrites an earlier one. The rule compiled to one
+arbitrary target with no operator feedback — `inet` + `prefix` even installed as
+a plain prefix rule, EVADING the #5859 `inet` reject. Dropping a target this way
+also dropped any `mapped-port` that rode ONLY on the discarded target (the #6479
+/ C179-038 residual), because that target's node was never the one whose modifier
+the mapped-port fold read. `validateStaticNATSingleTargetStrict` now counts the
+DISTINCT translation targets a rule declares — from the AST during compile
+(`staticNATThenTargetCount`, recorded as `StaticNATRule.ThenTargetCount`), BEFORE
+the fields collapse, across every authoring shape (the flat-set targets collapse
+onto one `static-nat` node's children; the hierarchical `then { static-nat {…}
+static-nat {…} }` shape spreads them across siblings) — and hard-rejects a rule
+declaring more than one. Counting DISTINCT `(keyword, value)` identities (not
+occurrences) is what keeps the canonical "restate the target to attach a
+mapped-port" form — `then static-nat prefix-name N` + `then static-nat
+prefix-name N mapped-port 8080` — a single target. Rejecting the multi-target
+rule outright is the Junos-faithful closure and FORECLOSES the #6479 dropped-
+target mapped-port residual as a side effect (the rule never compiles, so no
+dropped-target modifier can slip). The gate runs in `runTailGates` AFTER the
+host-mask (#2173) and NPTv6 (#2240/#5818) gates, so a rule that ALSO carries a
+malformed `mapped-port` or a bad nptv6 prefix reports that concrete token first
+(the multi-target defect is still caught on the next compile once the token is
+fixed — never masked). Strict on commit / commit-check (hard reject); the
+tolerant load / peer-sync path downgrades to a warning (#1960 no-brick) — the
+compiler still lowers the single honored target, so a leniently-loaded config is
+no worse than before the gate. A well-formed single-target rule (any of the four,
+in any authoring shape, with or without a `mapped-port` / `routing-instance`
+modifier) is unaffected. Tests: `static_nat_multitarget_6483_test.go`.
+
 **The systematic per-subtree closure continues (#4313).** Each of the flips
 above (destination-NAT then, the three IPsec option containers, master-password,
 the Phase-1 IKE proposal, now the Phase-2 IPsec proposal and the two
@@ -3675,6 +3711,13 @@ reserved for whole-dataplane selection where a rewrite shim
     `combineMappedPortOperands` fails closed on. In every shape a
     present-but-malformed mapped-port is surfaced (strict reject / lenient
     warn), never silently accepted, and no bogus non-zero port is installed.
+    The one residual this fold could not reach — a malformed mapped-port riding
+    ONLY on a target the compiler DROPS when a rule declares more than one
+    translation target (the dropped target's node is never the one the
+    mapped-port fold reads) — is closed by the single-target cardinality gate
+    (#6483, `validateStaticNATSingleTargetStrict`): a multi-target static-nat
+    rule is rejected outright, so no dropped-target modifier can slip. See "A
+    static-NAT rule has EXACTLY ONE translation target" above.
   - `security nat source/destination rule-set rule match
     destination-address-name <book-entry>` (#3229) — the destination twin
     of the `source-address-name` leaf (#2416). It references an

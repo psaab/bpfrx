@@ -472,6 +472,109 @@ func resolveStaticNATThenPrefixNames(sec *SecurityConfig) {
 	}
 }
 
+// staticNATTargetKeywords is the set of `then static-nat` keywords that name a
+// mutually-exclusive TRANSLATION TARGET — the destination a 1:1 rule maps to. A
+// well-formed static-NAT rule declares EXACTLY ONE of them (#6483). They are
+// distinct from the trailing MODIFIER keywords (mapped-port, routing-instance),
+// which refine a target rather than being one.
+var staticNATTargetKeywords = map[string]struct{}{
+	"prefix":       {},
+	"prefix-name":  {},
+	"nptv6-prefix": {},
+	"inet":         {},
+}
+
+// staticNATModifierKeywords are the `then static-nat` trailer keywords that are
+// NOT targets. When one sits in a target keyword's VALUE slot the node is a
+// MODIFIER CARRIER, not a second target — e.g. the canonical Junos separate-set-
+// line `then static-nat prefix mapped-port <port>` collapses to a `prefix` node
+// whose value slot is `mapped-port` (#6479 canonical form), and the trailing
+// `routing-instance <ri>` (#4292) rides the same way. staticNATNodeTargetCount
+// excludes these so a lone target carrying a modifier still counts as one target.
+var staticNATModifierKeywords = map[string]struct{}{
+	"mapped-port":      {},
+	"routing-instance": {},
+}
+
+// staticNATCollectTargetIdents adds a stable IDENTITY string for each translation
+// target one `static-nat` `then` node declares into set (#6483). A target's
+// identity is its keyword plus, for the address/name targets, its value token
+// (inet has no value, so its identity is just "inet"). Using a SET keyed by
+// identity — rather than an occurrence count — is what makes the Junos "restate
+// the target to attach a modifier" idiom count as ONE target: the canonical
+// separate-set-line mapped-port form authors the SAME target twice,
+//
+//	set ... then static-nat prefix-name TARGET
+//	set ... then static-nat prefix-name TARGET mapped-port 8080   (#5523)
+//
+// which SetPath keeps as two `prefix-name` children with the SAME value TARGET;
+// both map to identity "prefix-name\x00TARGET" and collapse to one. Two GENUINELY
+// different targets (a prefix and a prefix-name, an inet and a prefix, or two
+// different prefixes) map to different identities and stay distinct.
+//
+// It reads BOTH the collapsed-keys shape (the free-form static-nat leaf absorbs
+// `prefix <ip>` onto t.Keys) AND the child shape (a `prefix`/`prefix-name`/
+// `nptv6-prefix`/`inet` child leaf — the shape SetPath produces when several
+// targets land under one static-nat node, or the hierarchical `prefix { <ip>; }`
+// nesting). A MODIFIER CARRIER whose value slot is a modifier keyword
+// (`prefix mapped-port <port>` — the collapsed canonical form, or the ambiguous
+// name-slot `prefix-name mapped-port <p>`) is NOT a target and is skipped,
+// matching how staticNATMappedPortForNode reads that same node.
+func staticNATCollectTargetIdents(t *Node, set map[string]struct{}) {
+	add := func(kw, val string) {
+		if kw == "inet" {
+			set["inet"] = struct{}{} // inet has no value slot
+			return
+		}
+		if _, mod := staticNATModifierKeywords[val]; mod {
+			return // modifier carrier (`prefix mapped-port <p>`), not a target
+		}
+		set[kw+"\x00"+val] = struct{}{}
+	}
+	// Collapsed-keys target: ["static-nat","<target-kw>","<value>", ...].
+	if len(t.Keys) >= 2 {
+		if _, ok := staticNATTargetKeywords[t.Keys[1]]; ok {
+			val := ""
+			if len(t.Keys) >= 3 {
+				val = t.Keys[2]
+			}
+			if t.Keys[1] == "inet" || val != "" {
+				add(t.Keys[1], val)
+			}
+		}
+	}
+	// Child targets: a `prefix`/`prefix-name`/`nptv6-prefix`/`inet` child leaf.
+	for _, c := range t.Children {
+		kw := c.Name()
+		if _, ok := staticNATTargetKeywords[kw]; !ok {
+			continue // a mapped-port / routing-instance sibling — a modifier, not a target
+		}
+		val := ""
+		if len(c.Keys) >= 2 {
+			val = c.Keys[1]
+		} else if len(c.Children) > 0 {
+			val = c.Children[0].Name() // hierarchical `prefix { <ip>; }`
+		}
+		add(kw, val)
+	}
+}
+
+// staticNATThenTargetCount returns how many DISTINCT translation targets one
+// `then {}` block declares across EVERY `static-nat` sibling node in it (#6483).
+// The flat-set shape collapses targets onto a single static-nat node with several
+// target children; the hierarchical shape carries one target per static-nat
+// sibling. Either way the distinct-identity count is the rule's declared target
+// cardinality for that block, which the strict gate
+// (validateStaticNATSingleTargetStrict) requires to be at most one. Restatements
+// of the same target (to attach a mapped-port) share an identity and count once.
+func staticNATThenTargetCount(thenNode *Node) int {
+	set := make(map[string]struct{})
+	for _, t := range thenNode.FindChildren("static-nat") {
+		staticNATCollectTargetIdents(t, set)
+	}
+	return len(set)
+}
+
 func compileNATStatic(node *Node, sec *SecurityConfig) error {
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
 		// #3096: capture from scope across zone | interface |
@@ -560,6 +663,15 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 				// then-set fields so only the LAST then-block's spec survives.
 				rule.ThenPrefixName = ""
 				rule.ThenRoutingInstance = ""
+				// #6483: count the translation targets THIS `then` block declares,
+				// from the AST, BEFORE the if/else chain below collapses them into
+				// the shared Then/ThenPrefixName fields (prefix/inet/nptv6 all
+				// overwrite Then, so the final field state cannot reveal a
+				// >1-target rule). Assigned (not accumulated) per block so the LAST
+				// block wins, matching the #3850 last-then-block-wins semantics the
+				// field resets above encode. validateStaticNATSingleTargetStrict
+				// rejects a count > 1.
+				rule.ThenTargetCount = staticNATThenTargetCount(thenNode)
 				for _, t := range thenNode.Children {
 					if t.Name() == "static-nat" {
 						if len(t.Keys) >= 3 && t.Keys[1] == "nptv6-prefix" {
