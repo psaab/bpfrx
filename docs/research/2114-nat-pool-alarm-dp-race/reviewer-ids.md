@@ -38,6 +38,21 @@ reviewer (joins at /engineer on the code PR).
 | r11 | Codex | codex companion task-mrylebih-92b79h (session 019f92ee-618f-7c41-bca8-87f9026d37c5) | NEEDS-REVISION (2 MAJOR, 2 MINOR; M3 adjudication ACCEPTED) |
 | r11 | AGY | agy print-mode direct (agy-plan-r11.md) | PLAN-READY (M3 adjudication ACCEPTED) |
 | r11 | Claude SMR | in-conversation (claude-smr-plan-r11.md) | PLAN-READY (conditional on M3) |
+| r12 | Codex | codex companion task-mrymdz90-yppxbx | NEEDS-REVISION (4 MAJOR, 1 MINOR) |
+| r12 | AGY | agy print-mode direct (agy-plan-r12.md) | NEEDS-REVISION |
+| r12 | Claude SMR | in-conversation (claude-smr-plan-r12.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR) |
+| r13 | Codex | codex companion task-mrynd5fi-73uuip | NEEDS-REVISION (3 MAJOR, 3 MINOR) |
+| r13 | AGY | agy print-mode direct (agy-plan-r13.md) | PLAN-READY-WITH-NITS |
+| r13 | Claude SMR | in-conversation (claude-smr-plan-r13.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR) |
+| r14 | Codex | codex companion task-mryo9wh2-1bdhg9 | NEEDS-REVISION (3 MAJOR, 3 MINOR) |
+| r14 | AGY | agy print-mode direct (agy-plan-r14.md) | PLAN-READY-WITH-NITS |
+| r14 | Claude SMR | in-conversation (claude-smr-plan-r14.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR) |
+| r15 | Codex | codex companion task-mryp8l35-fwtat6 | NEEDS-REVISION (4 MAJOR, 2 MINOR) |
+| r15 | AGY | agy print-mode direct (agy-plan-r15.md) | PLAN-READY (SAFE/HOLDS) |
+| r15 | Claude SMR | in-conversation (claude-smr-plan-r15.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR) |
+| r16 | Codex | codex companion task-mryq552r-semyw3 (session 019f9367-fc8e-7423-93b4-c002c7b90293) | NEEDS-REVISION (4 MAJOR, 3 MINOR) |
+| r16 | AGY | agy print-mode direct (agy-plan-r16.md) | PLAN-READY (0 findings) |
+| r16 | Claude SMR | in-conversation (claude-smr-plan-r16.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
@@ -67,3 +82,7 @@ reviewer (joins at /engineer on the code PR).
 - r8 dispatch: `task --background --fresh "$(cat <prompt-file>)"` from the
   worktree; polled `status <id> --json` until `completed`; `result <id>`
   for the body. ~11 min wall.
+- Plugin cache path moved mid-run (r16 fetch): companion now at
+  `/home/ps/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs`
+  (was 1.0.4). `status --json` → `latestFinished` holds the most recent
+  completed job when `recent` is capped.
