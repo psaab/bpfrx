@@ -902,6 +902,28 @@ const (
 	// It also bounds the number of PBR ip rules the applier installs
 	// (pkg/routing maxPBRRules) and the priority window clear() scans.
 	PBRRuleWindow = 1000
+	// NextTableRulePriorityBase is the first ip-rule priority of the
+	// next-table inter-VRF route-leak band (100-199): global
+	// `routing-options static route <p> next-table <instance>` leaks installed
+	// by pkg/routing's nextTableManager. Unlike the PBR band these rules carry
+	// a pure per-prefix Dst with NO selectors, so the userspace FIB snapshot
+	// (pkg/dataplane/userspace/routes.go) DOES mirror them as bare NextTable
+	// leaks. Both pkg/routing (install side) and pkg/dataplane/userspace
+	// (config-static mirror side) consume the band, so it lives here as the
+	// single source of truth alongside PBRRulePriorityBase.
+	NextTableRulePriorityBase = 100
+	// NextTableRuleWindow is the size of the next-table band; the band is
+	// [NextTableRulePriorityBase, NextTableRulePriorityBase+NextTableRuleWindow)
+	// = 100-199. It bounds THREE things that MUST agree or the control plane
+	// and dataplane diverge past the cap (#6467): the number of next-table ip
+	// rules the applier installs and the priority window clear() scans
+	// (pkg/routing maxNextTableRules), the commit-time over-subscription gate
+	// (pkg/config maxNextTableRules, #5854), and the number of config-static
+	// next-table leaks the userspace FIB mirror publishes
+	// (pkg/dataplane/userspace/routes.go). Capping all three at this single
+	// value keeps the kernel ip-rule table and the userspace dataplane FIB from
+	// disagreeing on which leaks survive truncation.
+	NextTableRuleWindow = 100
 )
 
 // RPMTest defines a test within an RPM probe.
