@@ -36,6 +36,7 @@
   2 pre-existing #[ignore] CoS benches); release build (LTO off,
   codegen-units 16) has NO out-of-line walk_ipv6_ext_chain symbol — the
   #[inline(always)] core folds into every caller across CGUs.
+
 ## 2026-07-24 — #6459/#6463/#6477: fail-close partial filter port/address lists on the tolerant path
 
 - **Timestamp**: 2026-07-24 (fix/6459-filter-fail-closed-markers)

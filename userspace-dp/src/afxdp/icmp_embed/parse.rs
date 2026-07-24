@@ -117,26 +117,27 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v4(
 /// Fragment-aware IPv6 extension-chain walk for QUOTED (embedded)
 /// packets inside ICMPv6 errors (#1838 / plan §5.7). #6435: folds the ONE
 /// canonical walker (`walk_ipv6_ext_chain`, shared with the forwarding
-/// path's `packet_rel_l4_offset_and_protocol(.., AF_INET6)`) and, on the
-/// recorded first Fragment header (44), reads the fragment-offset bits and
-/// returns `None` unless they are zero: a quoted NON-FIRST fragment has no
-/// L4 header, and reading "ports" from its payload bytes would enable
-/// false NAT/session matches (the bug class the old fixed-40 read
-/// accidentally avoided by leaving proto = 44). First and atomic
-/// fragments (offset 0) are allowed. Returns the L4 offset relative
-/// to the embedded IPv6 header plus the final L4 protocol.
+/// path's `packet_rel_l4_offset_and_protocol(.., AF_INET6)`); #6513-review:
+/// judges EVERY sighted Fragment header (not just the recorded first) via
+/// `ExtChainWalk::non_first_fragment_offset_seen`, restoring the pre-#6435
+/// every-header verdict — a quoted NON-FIRST fragment has no L4 header, and
+/// reading "ports" from its payload bytes would enable false NAT/session
+/// matches (the bug class the old fixed-40 read accidentally avoided by
+/// leaving proto = 44). First and atomic fragments (offset 0) are allowed.
+/// Returns the L4 offset relative to the embedded IPv6 header plus the
+/// final L4 protocol.
 pub(in crate::afxdp::icmp_embed) fn parse_embedded_v6_l4(packet: &[u8]) -> Option<(usize, u8)> {
     let walk = walk_ipv6_ext_chain(packet, 0);
     // #1838: a quoted NON-FIRST fragment has no L4 header in the quoted
-    // bytes. A declared-but-truncated Fragment header (offset bits
-    // unreadable) is NOT rejected here — it fails closed on the
-    // `Truncated` outcome below instead, exactly like the pre-#6435
-    // walker's `packet.get(offset..offset + 8)?` (both yield `None`).
-    if let Some(frag) = walk.fragment
-        && frag
-            .bytes
-            .is_some_and(|b| (u16::from_be_bytes([b[2], b[3]]) & 0xFFF8) != 0)
-    {
+    // bytes — judged across EVERY Fragment header sighted, so a hostile
+    // [Frag(off=0)][Frag(off!=0)][TCP] chain cannot smuggle the second
+    // header's payload bytes past this resolver as "ports" (the first-
+    // sighting-only check let exactly that through). A declared-but-
+    // truncated Fragment header (offset bits unreadable) is NOT rejected
+    // here — it fails closed on the `Truncated` outcome below instead,
+    // exactly like the pre-#6435 walker's `packet.get(offset..offset + 8)?`
+    // (both yield `None`).
+    if walk.non_first_fragment_offset_seen {
         return None;
     }
     // #4533: every non-L4 verdict fails CLOSED (None) — an over-bound
@@ -328,6 +329,39 @@ mod embedded_v6_parse_tests {
             let hdr = parse_embedded_v6(&p, 0).expect("parse succeeds");
             assert_eq!((hdr.src_port, hdr.dst_port), (0x1111, 0x2222));
         }
+    }
+
+    #[test]
+    fn embedded_double_fragment_chain_never_matches() {
+        // #6513 hostile-review pin: a (RFC 8200-non-conformant) chain with
+        // a SECOND Fragment header carrying non-zero offset bits must fail
+        // closed — the pre-#6435 walker judged EVERY sighted Fragment
+        // header; judging only the recorded first sighting let
+        // [Frag(off=0)][Frag(off!=0)][TCP] smuggle the second header's
+        // payload past this resolver as "ports" (fail-open on the #1838
+        // gate). Every-header judgement is restored via
+        // ExtChainWalk::non_first_fragment_offset_seen.
+        let frag_first = (44u8, vec![44u8, 0, 0, 0, 0, 0, 0, 1]); // next=44, offset 0
+        let mut second_bytes = vec![PROTO_TCP, 0, 0, 0, 0, 0, 0, 1];
+        second_bytes[2..4].copy_from_slice(&0x0008u16.to_be_bytes()); // offset != 0
+        let frag_second = (44u8, second_bytes);
+        let p = embedded_v6(&[frag_first.clone(), frag_second], PROTO_TCP);
+        assert_eq!(
+            parse_embedded_v6_l4(&p),
+            None,
+            "a second Fragment header with non-zero offset must refuse the chain"
+        );
+        assert!(
+            parse_embedded_v6(&p, 0).is_none(),
+            "parse_embedded_v6 must refuse the double-fragment chain"
+        );
+        // Control: the same two-header chain with offset 0 in BOTH
+        // Fragment headers walks to L4 at 40 + 8 + 8 = 56.
+        let frag_second_ok = (44u8, vec![PROTO_TCP, 0, 0, 0, 0, 0, 0, 1]);
+        let p_ok = embedded_v6(&[frag_first, frag_second_ok], PROTO_TCP);
+        let (rel, proto) =
+            parse_embedded_v6_l4(&p_ok).expect("all-atomic fragments walk to L4");
+        assert_eq!((rel, proto), (56, PROTO_TCP));
     }
 
     #[test]

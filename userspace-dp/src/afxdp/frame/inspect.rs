@@ -104,11 +104,20 @@ pub(crate) struct ExtChainFragment {
 /// first Fragment header sighted along the way, when the chain declared
 /// one. Only the FIRST Fragment header is recorded — a (hostile) chain
 /// with a second Fragment header keeps the first sighting, matching the
-/// stop-at-first-fragment pre-#6435 predicates.
+/// stop-at-first-fragment pre-#6435 fragment predicates; consumers that
+/// judged EVERY sighting pre-#6435 (the #1838 embedded-ICMP resolver)
+/// read [`ExtChainWalk::non_first_fragment_offset_seen`] instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExtChainWalk {
     pub outcome: ExtChainOutcome,
     pub fragment: Option<ExtChainFragment>,
+    /// Set when ANY Fragment header sighted along the walk (first OR a
+    /// later, RFC 8200-non-conformant repeat) carried non-zero
+    /// fragment-offset bits in readable bytes. The embedded-ICMP L4
+    /// resolver (#1838) judges EVERY sighted Fragment header, not just
+    /// the first recorded one — this flag is what preserves that
+    /// every-header judgement on top of the single recorded sighting.
+    pub non_first_fragment_offset_seen: bool,
 }
 
 /// #6435: the single IPv6 extension-header chain walk shared by every
@@ -143,10 +152,12 @@ pub(crate) struct ExtChainWalk {
 #[inline(always)]
 pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
     let mut fragment = None;
+    let mut non_first_fragment_offset_seen = false;
     if buf.len() < l3 + 40 {
         return ExtChainWalk {
             outcome: ExtChainOutcome::Truncated,
             fragment,
+            non_first_fragment_offset_seen,
         };
     }
     let mut protocol = buf[l3 + 6];
@@ -161,6 +172,7 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
                     return ExtChainWalk {
                         outcome: ExtChainOutcome::Truncated,
                         fragment,
+                        non_first_fragment_offset_seen,
                     };
                 };
                 protocol = opt[0];
@@ -168,6 +180,7 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
                     return ExtChainWalk {
                         outcome: ExtChainOutcome::Truncated,
                         fragment,
+                        non_first_fragment_offset_seen,
                     };
                 };
                 offset = next;
@@ -175,6 +188,7 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
                     return ExtChainWalk {
                         outcome: ExtChainOutcome::Truncated,
                         fragment,
+                        non_first_fragment_offset_seen,
                     };
                 }
             }
@@ -183,6 +197,7 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
                     return ExtChainWalk {
                         outcome: ExtChainOutcome::Truncated,
                         fragment,
+                        non_first_fragment_offset_seen,
                     };
                 };
                 protocol = opt[0];
@@ -190,6 +205,7 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
                     return ExtChainWalk {
                         outcome: ExtChainOutcome::Truncated,
                         fragment,
+                        non_first_fragment_offset_seen,
                     };
                 };
                 offset = next;
@@ -197,6 +213,7 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
                     return ExtChainWalk {
                         outcome: ExtChainOutcome::Truncated,
                         fragment,
+                        non_first_fragment_offset_seen,
                     };
                 }
             }
@@ -212,10 +229,19 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
                         bytes: header.and_then(|h| <[u8; 8]>::try_from(h).ok()),
                     });
                 }
+                if let Some(f) = header {
+                    // #1838 every-sighting judgement: a non-zero offset in
+                    // ANY sighted Fragment header (not just the recorded
+                    // first) is a quoted/forwarded non-first fragment.
+                    if (u16::from_be_bytes([f[2], f[3]]) & 0xFFF8) != 0 {
+                        non_first_fragment_offset_seen = true;
+                    }
+                }
                 let Some(frag) = header else {
                     return ExtChainWalk {
                         outcome: ExtChainOutcome::Truncated,
                         fragment,
+                        non_first_fragment_offset_seen,
                     };
                 };
                 protocol = frag[0];
@@ -223,6 +249,7 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
                     return ExtChainWalk {
                         outcome: ExtChainOutcome::Truncated,
                         fragment,
+                        non_first_fragment_offset_seen,
                     };
                 };
                 offset = next;
@@ -230,6 +257,7 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
                     return ExtChainWalk {
                         outcome: ExtChainOutcome::Truncated,
                         fragment,
+                        non_first_fragment_offset_seen,
                     };
                 }
             }
@@ -237,12 +265,14 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
                 return ExtChainWalk {
                     outcome: ExtChainOutcome::NoNextHeader,
                     fragment,
+                    non_first_fragment_offset_seen,
                 };
             }
             _ => {
                 return ExtChainWalk {
                     outcome: ExtChainOutcome::L4(offset, protocol),
                     fragment,
+                    non_first_fragment_offset_seen,
                 };
             }
         }
@@ -250,6 +280,7 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
     ExtChainWalk {
         outcome: ExtChainOutcome::OverLimit,
         fragment,
+        non_first_fragment_offset_seen,
     }
 }
 
