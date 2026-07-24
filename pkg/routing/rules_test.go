@@ -572,12 +572,14 @@ func TestNextTableRulesPriorityCap(t *testing.T) {
 		assertAllRulesInRange(t, ops, nextTableRulePriority, nextTableRulePriority+100)
 	})
 
-	// One over the window: cap fires, only 100 admitted, none out of range.
+	// One over the window: cap fires, only 100 admitted, none out of range,
+	// and Apply surfaces a degraded error naming the cap (#6467) rather than a
+	// silent Warn — mirroring the rib-group/PBR over-limit subtests.
 	t.Run("over-limit", func(t *testing.T) {
 		ops := newFakeRuleOps()
 		nt := &nextTableManager{ops: ops}
-		if err := nt.Apply(mkRoutes(150), instances); err != nil {
-			t.Fatalf("Apply: %v", err)
+		if err := nt.Apply(mkRoutes(150), instances); err == nil {
+			t.Fatal("over-limit Apply must return a degraded error naming the cap (#6467)")
 		}
 		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
 		if total != 100 {
@@ -588,8 +590,9 @@ func TestNextTableRulesPriorityCap(t *testing.T) {
 		// Re-apply must leave no residue: every programmed rule is inside
 		// clear()'s window, so clear-then-add keeps the count stable. A
 		// leaked rule at prio >= 200 would survive clear() and grow the set.
-		if err := nt.Apply(mkRoutes(150), instances); err != nil {
-			t.Fatalf("Apply (second): %v", err)
+		// The degraded error still surfaces on every over-limit apply.
+		if err := nt.Apply(mkRoutes(150), instances); err == nil {
+			t.Fatal("re-apply over-limit must still surface the degraded error (#6467)")
 		}
 		total = ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
 		if total != 100 {

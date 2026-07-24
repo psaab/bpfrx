@@ -149,8 +149,8 @@ silently no-op — for the cases Phase 1 cannot fully realize:
 
 The applier programs next-table and interface-routes rib-group leaks into
 **fixed ip-rule priority windows** and hard-caps at each boundary: 100 rules for
-next-table (`pkg/routing/rules.go`, the `nextTableRulePriority+100` cap) and
-`maxRibGroupLeakRules` (1000) rules for the per-prefix rib-group leak (the
+next-table (`pkg/routing/rules.go`, the `nextTableRulePriority+maxNextTableRules`
+cap) and `maxRibGroupLeakRules` (1000) rules for the per-prefix rib-group leak (the
 `ribGroupLeakRulePriority+maxRibGroupLeakRules` cap). A config that exceeds a
 window used to commit green with only a **warning**
 (`validateRoutingRuleWindowWarnings`); the reconciler then silently stopped at
@@ -165,11 +165,33 @@ strict on commit / commit-check so the operator sees the over-limit condition
 before it truncates, downgraded to a single warning on the tolerant load /
 peer-sync paths (`opts.lenientRoutingRuleWindows`, #1960 no-brick) so an
 already-committed or peer-synced over-limit generation still boots (the
-applier's window hard-cap keeps the excess inert). The window sizes
-(`maxNextTableRules` = 100, `maxRibGroupLeakRules` = 1000) are duplicated in
+applier's window hard-cap keeps the excess inert).
+
+**Apply-side degraded error + FIB cap reconcile (#6467).** On the tolerant
+load / peer-sync path the commit gate is only a warning, so an over-limit
+generation still reaches the applier. There the next-table cap used to
+`slog.Warn` and `break` with **no aggregated error**, so `Apply` returned nil
+and reported success while truncating the leak set — and, worse, the userspace
+FIB (`buildRouteSnapshots`) mirrored **all** config next-table leaks
+**uncapped**, so leak #101+ existed in the userspace FIB but not the kernel. A
+slow-path packet (XDP_PASS / IPsec-reinjected / non-native-XDP fabric) matching
+leak #101+ then resolved into the target VRF on the AF_XDP fast path but the
+main table in the kernel — a kernel/dataplane verdict split for the same flow.
+The next-table cap now **aggregates a degraded error** naming how many leaks
+were dropped (mirroring the rib-group and PBR caps in the same file), and the
+FIB config-static path caps GLOBAL next-table leaks at the **same** window,
+counting v4 then v6 in the same order as `ApplyNextTableRules`, so both planes
+truncate the identical tail.
+
+The rib-group window size (`maxRibGroupLeakRules` = 1000) is duplicated in
 `pkg/config` with a keep-in-sync comment because `pkg/config` cannot import
 `pkg/routing` (that would be an import cycle — `pkg/routing` imports
-`pkg/config`); they MUST stay in lockstep with `pkg/routing/rules.go`.
+`pkg/config`); it MUST stay in lockstep with `pkg/routing/rules.go`. The
+next-table window is now the **exported SSOT** `config.NextTableRuleWindow`
+(alongside `config.NextTableRulePriorityBase`, mirroring the #4479 PBR band
+constants): `pkg/config`'s commit gate (`maxNextTableRules`), the applier
+(`pkg/routing.maxNextTableRules`), and the userspace FIB config-static mirror
+all reference that one value, so the three cannot drift.
 
 ### Strict rejection — undefined `next-table` target (#5693)
 
@@ -227,7 +249,10 @@ forwarding route*:
 - `buildRouteSnapshots` no longer publishes a per-instance `next-table` into the
   userspace FIB (`perInstance` guard in `addRoutes`). GLOBAL `next-table` IS
   programmed via `ip rule` and stays published so the Rust FIB can
-  cross-reference the target table. A leniently-loaded legacy per-instance
+  cross-reference the target table — but the config-static path now caps the
+  GLOBAL next-table leaks it publishes at `config.NextTableRuleWindow`, the same
+  window the applier installs, so the FIB never carries a leak past the cap that
+  the kernel dropped (#6467). A leniently-loaded legacy per-instance
   `next-table` is thus inert on **both** planes.
 
 Supporting per-instance `next-table` for real is a **feature**, not a bug fix:

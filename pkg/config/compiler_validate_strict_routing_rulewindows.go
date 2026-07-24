@@ -8,20 +8,26 @@ import "fmt"
 // boundary and skips any rule past it, so a config that exceeds a window has
 // the excess routes silently dropped at apply time (#5854):
 //
-//   - next-table: nextTableRulePriority .. nextTableRulePriority+100 — a
+//   - next-table: [NextTableRulePriorityBase, +NextTableRuleWindow) — a
 //     100-rule window that clear() scans (pkg/routing/rules.go, the
-//     `prio >= nextTableRulePriority+100` cap).
+//     `prio >= nextTableRulePriority+maxNextTableRules` cap). maxNextTableRules
+//     derives from the exported NextTableRuleWindow SSOT (types_system.go) so
+//     the commit gate here, the runtime applier, AND the userspace FIB mirror
+//     (pkg/dataplane/userspace/routes.go) share one window value (#6467) —
+//     no lockstep drift possible.
 //   - rib-group:  [ribGroupLeakRulePriority, +maxRibGroupLeakRules) — a
 //     1000-rule window (pkg/routing/rules.go const maxRibGroupLeakRules = 1000,
-//     the `prio >= ribGroupLeakRulePriority+maxRibGroupLeakRules` cap).
+//     the `prio >= ribGroupLeakRulePriority+maxRibGroupLeakRules` cap). This
+//     window is NOT shared with the userspace FIB, so it stays duplicated here
+//     and MUST stay in lockstep with pkg/routing/rules.go.
 //
 // pkg/config CANNOT import pkg/routing — pkg/routing already imports pkg/config,
-// so the reverse edge would be an import cycle. The window sizes are therefore
-// duplicated here and MUST stay in lockstep with pkg/routing/rules.go: if a
-// window size changes there, change it here too or the commit-time gate and the
-// runtime applier disagree on what fits.
+// so the reverse edge would be an import cycle. maxRibGroupLeakRules is
+// therefore duplicated here and MUST stay in lockstep with pkg/routing/rules.go:
+// if that window size changes there, change it here too or the commit-time gate
+// and the runtime applier disagree on what fits.
 const (
-	maxNextTableRules    = 100
+	maxNextTableRules    = NextTableRuleWindow
 	maxRibGroupLeakRules = 1000
 )
 

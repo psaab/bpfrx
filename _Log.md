@@ -60371,3 +60371,40 @@ top.
 - **File(s)**: pkg/api/sessions.go,
     pkg/api/sessions_pagination_canonical_5649_test.go,
     docs/refactoring-audit-current.txt, _Log.md
+- **Timestamp**: 2026-07-24
+- **Action**: #6467 — next-table ip-rule 100-rule cap was Warn-only (no
+    aggregated error) AND the userspace FIB mirrored ALL config next-table
+    leaks uncapped, so leak #101+ existed in the userspace FIB but not the
+    kernel — a slow-path packet matching #101+ resolved into the target VRF on
+    the AF_XDP fast path but the main table in the kernel (verdict split).
+    FIX (Go control-plane): (1) pkg/routing/rules.go nextTableManager.Apply now
+    aggregates a degraded error naming how many next-table routes past the cap
+    are not leaked (mirroring the rib-group :358 and PBR :611 caps) instead of
+    slog.Warn+break; the loop is index-based to count the dropped tail. (2)
+    pkg/dataplane/userspace/routes.go buildRouteSnapshots caps GLOBAL
+    config-static next-table leaks at config.NextTableRuleWindow via a shared
+    v4-then-v6 counter, matching ApplyNextTableRules's shared priority counter,
+    so both planes truncate the identical tail. (3) SSOT: promoted the window
+    to exported config.NextTableRuleWindow + config.NextTableRulePriorityBase
+    (types_system.go, mirroring the #4479 PBR band); pkg/config's commit-gate
+    maxNextTableRules (#5854), pkg/routing's new maxNextTableRules, and the FIB
+    mirror all derive from it — no lockstep drift. FAIL-ON-REVERT:
+    TestNextTableApplyCapAggregatesDegradedError (rules_6467_test.go) asserts
+    non-nil error naming "next-table rule limit" + "50 next-table route(s)";
+    TestBuildRouteSnapshotsCapsConfigStaticNextTableLeaks
+    (routes_6467_test.go) asserts the FIB publishes <= 100 leaks; existing
+    TestNextTableRulesPriorityCap/over-limit flipped to expect the degraded
+    error. Confirmed parent-RED by neutralizing the errs-append to slog.Warn
+    (routing cap tests RED at rules_6467_test.go:48 + rules_test.go:582, clean
+    assertion, not compile break) then restoring GREEN. Updated
+    docs/rib-group-route-leaking.md (#6467 apply-side + FIB reconcile + SSOT).
+    Regenerated docs/refactoring-audit-current.txt (rules.go 1534->1566,
+    types_system.go 1610->1632). go build ./..., go vet, gofmt -l clean,
+    go test ./pkg/routing/... ./pkg/config/... ./pkg/dataplane/... GREEN,
+    heatmap canary GREEN (TMPDIR=/dev/shm).
+- **File(s)**: pkg/config/types_system.go,
+    pkg/config/compiler_validate_strict_routing_rulewindows.go,
+    pkg/routing/rules.go, pkg/routing/rules_test.go,
+    pkg/routing/rules_6467_test.go, pkg/dataplane/userspace/routes.go,
+    pkg/dataplane/userspace/routes_6467_test.go,
+    docs/rib-group-route-leaking.md, docs/refactoring-audit-current.txt, _Log.md

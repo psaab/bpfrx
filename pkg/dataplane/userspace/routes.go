@@ -55,6 +55,15 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 		seen[key] = struct{}{}
 		out = append(out, snap)
 	}
+	// #6467: the kernel programs GLOBAL next-table leaks as ip rules capped at
+	// config.NextTableRuleWindow entries (pkg/routing nextTableManager.Apply
+	// iterates v4 then v6 with a single shared priority counter). The two global
+	// addRoutes calls below (v4 then v6) share this counter so the userspace FIB
+	// mirror truncates the SAME tail the kernel drops — otherwise leak #101+
+	// would resolve into the target VRF on the AF_XDP fast path while a slow-path
+	// (XDP_PASS / IPsec-reinjected / non-native-XDP fabric) packet resolves in
+	// the main table, a kernel/dataplane verdict split for the same flow.
+	nextTableLeakCount := 0
 	addRoutes := func(table, family string, routes []*config.StaticRoute, perInstance bool) {
 		for _, route := range routes {
 			if route == nil {
@@ -77,6 +86,21 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 			// published so the Rust FIB can cross-reference the target table.
 			if perInstance && route.NextTable != "" {
 				continue
+			}
+			// #6467: cap the GLOBAL next-table leaks the FIB publishes at the
+			// same window the kernel applier installs (config.NextTableRuleWindow),
+			// counting v4 then v6 in the same order as ApplyNextTableRules. A
+			// route past the cap is dropped here just as the kernel drops the
+			// ip rule past prio nextTableRulePriority+maxNextTableRules, so the
+			// userspace FIB never carries a next-table leak the kernel does not.
+			// Only GLOBAL next-table routes are programmed as ip rules (the
+			// per-instance case is skipped above), so this is the only leak class
+			// that must be bounded here.
+			if !perInstance && route.NextTable != "" {
+				if nextTableLeakCount >= config.NextTableRuleWindow {
+					continue
+				}
+				nextTableLeakCount++
 			}
 			tableName, familyName := normalizeRouteSnapshotFamily(table, family, route.Destination)
 			base := RouteSnapshot{
