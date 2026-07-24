@@ -4,11 +4,21 @@
 // invoke `runtime.meter()` once per matching term and merge the returned
 // `ThreeColorDecision` into the caller-visible `ThreeColorPolicerAction`.
 //
-// Concurrency contract preserved across the split:
-//   - `ThreeColorPolicerState::meter` is `&mut self` and not used directly
-//     here; we go through `ThreeColorPolicerRuntime::meter(&self, ...)`
-//     which serializes via the wrapper's `Mutex<ThreeColorPolicerState>`
-//     and then records counters via relaxed atomic adds.
+// Concurrency contract (#5390 — LOCK-FREE; the pre-#5390
+// `Mutex<ThreeColorPolicerState>` wrapper this header used to describe is
+// RETIRED):
+//   - `ThreeColorPolicerState::meter` is `&self` (not `&mut self`): the
+//     token-bucket state is shared across all workers behind an `Arc` and
+//     metered concurrently — refills through per-rate timestamp CAS, then
+//     consumes tokens through a bounded `compare_exchange_weak` loop over
+//     the packed `credits` word (`filter/policer.rs`). NO `Mutex` anywhere:
+//     the RSS-spread flow aggregate no longer serializes on a per-packet
+//     futex, and the poison failure mode is gone with the lock. The #5390
+//     fail-on-revert test in `filter/policer.rs` guards this shape — do not
+//     "restore" a mutex here.
+//   - `ThreeColorPolicerRuntime::meter(&self, ...)` (filter/mod.rs) meters
+//     lock-free through the state CAS and then records counters via relaxed
+//     atomic adds.
 //   - The `meter()` call -> counter-record order is preserved: each call
 //     site invokes `runtime.meter()` and propagates its `dscp_rewrite`/
 //     `drop` decision without intervening allocations.

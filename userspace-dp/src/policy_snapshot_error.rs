@@ -277,6 +277,53 @@ pub(crate) enum SnapshotIntegrityError {
         filter: String,
         term: String,
     },
+    /// #6459: a firewall-filter term carried the `ports_unrepresentable` wire
+    /// marker — the Go control plane could not resolve a
+    /// `from {source,destination}-port[-except]` token to a number (an unknown
+    /// service name, a malformed range, or a non-canonical token such as
+    /// "+80"). The pre-fix Rust compiler dropped the token PER-TOKEN
+    /// (`filter_map(parse_port_spec)`), so a PARTIALLY-unresolvable list built
+    /// a matcher over only the surviving subset: a `then discard`/`reject`
+    /// term silently enforced a NARROWER port set than the operator wrote, and
+    /// the traffic meant for the dropped ports fell through to the implicit
+    /// accept (fail-OPEN). (An ALL-unresolvable list already failed closed at
+    /// match-time via `constrained && PortMatcher::Any`, #2400/#3205.) The Go
+    /// commit gate (`validateFilterMatchValuesStrict`, #3205) is the primary
+    /// defense — a committed config never sets the marker — so this is the
+    /// helper-boundary backstop for a lenient / peer-synced / hand-built /
+    /// version-drifted snapshot, consistent with the #2505/#3367/#3406
+    /// fail-closed family. Rejecting the whole snapshot (the reconcile
+    /// preflight keeps the previous good filter state) is action-agnostic.
+    /// `family` (inet / inet6) is carried because filter names can be reused
+    /// across families.
+    UnrepresentableFilterPorts {
+        family: String,
+        filter: String,
+        term: String,
+    },
+    /// #6463: a firewall-filter term carried the `address_unrepresentable`
+    /// wire marker — the Go control plane classified a literal
+    /// `from source-address` / `destination-address` token as not a parseable
+    /// IP/CIDR (`classifyFilterAddrFamily` rejects it). The pre-fix
+    /// `parse_address` dropped the token PER-TOKEN (its `Err(_)` arm pushed
+    /// nothing), so a PARTIALLY-malformed list matched only the surviving
+    /// prefixes: a `then discard`/`reject` term silently enforced a NARROWER
+    /// address set than the operator wrote, and a host in the dropped range
+    /// was accepted by fall-through (fail-OPEN). (An ALL-malformed direction
+    /// already failed closed at match-time via `constrained && empty`, #2400.)
+    /// The Go commit gate (`validateFilterAddressLiteralsStrict`, #3433) is the
+    /// primary defense — a committed config never sets the marker — so this is
+    /// the helper-boundary backstop for a lenient / peer-synced / hand-built /
+    /// version-drifted snapshot, consistent with the #2505/#3367/#3406
+    /// fail-closed family. Rejecting the whole snapshot (the reconcile
+    /// preflight keeps the previous good filter state) is action-agnostic.
+    /// `family` (inet / inet6) is carried because filter names can be reused
+    /// across families.
+    UnrepresentableFilterAddress {
+        family: String,
+        filter: String,
+        term: String,
+    },
     /// #3406: a firewall-filter term's `flex_match` carried a byte `length` outside
     /// the representable 1..=4 range (the `value` / `mask` wire fields are u32). The
     /// pre-fix Go builder CAPPED an oversized width to 4 and still emitted the term,
@@ -546,8 +593,10 @@ pub(crate) enum SnapshotIntegrityError {
     /// the default-deny `PolicyState`) is action-agnostic: it never turns a deny
     /// into a pass nor a permit into match-any. The empty token and the special
     /// `any` / `junos-host` zone names always resolve (see
-    /// `resolve_policy_zone_id` / `build_global_zone_scope`) and so never trip
-    /// this.
+    /// `resolve_policy_zone_id`) and so never trip this. An empty ELEMENT inside
+    /// a plural `match_*_zones` list DOES trip this via `build_global_zone_scope`
+    /// (#6464); only the empty singular field is exempt (dropped by
+    /// `effective_match_zones` as an omitted scope).
     UnresolvableZoneReference { rule_id: String, zone: String },
     /// #3771 (M4): a `RouteSnapshot` carried a NON-EMPTY `family` that does not
     /// match the address family of its `destination` prefix (e.g. family="inet6"
@@ -736,6 +785,24 @@ impl std::fmt::Display for SnapshotIntegrityError {
             } => write!(
                 f,
                 "firewall family {:?} filter {:?} term {:?} has an unresolvable from-dscp/traffic-class match token — refusing to fail wide by dropping it (which would make the term match every DSCP)",
+                family, filter, term
+            ),
+            Self::UnrepresentableFilterPorts {
+                family,
+                filter,
+                term,
+            } => write!(
+                f,
+                "firewall family {:?} filter {:?} term {:?} has an unresolvable port token — refusing to fail open by dropping it per-token (which would narrow a discard/reject term to only the surviving ports and let the rest fall through to the implicit accept)",
+                family, filter, term
+            ),
+            Self::UnrepresentableFilterAddress {
+                family,
+                filter,
+                term,
+            } => write!(
+                f,
+                "firewall family {:?} filter {:?} term {:?} has an unparseable address literal — refusing to fail open by dropping it per-token (which would narrow a discard/reject term to only the surviving prefixes and let the rest fall through to the implicit accept)",
                 family, filter, term
             ),
             Self::UnrepresentableFilterFlexMatch {
