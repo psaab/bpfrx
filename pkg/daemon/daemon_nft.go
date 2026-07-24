@@ -129,13 +129,19 @@ const (
 // on COLD BOOT both nft tables are absent — there is no prior lo0 generation to
 // retain — so a failed real InstallLo0 would leave the host input path OPEN with
 // only a WARN (the boot apply only logs+discards the error), publishing host
-// services / VIP / HA-ready over an unenforced RE-protection path. When no
-// protecting xpf_lo0 table has loaded this boot (lo0Enforced false), a failed
-// install therefore installs a fail-closed fence that denies host-bound traffic
-// to firewall-local addresses (minus lifelines) instead of proceeding open. On a
-// DAY-2 failure (lo0Enforced true) the atomic replaceTable retained the prior
-// real lo0 filter, so no fence is needed — the operator's filter (not per-
-// destination-address scoped) still governs every local address.
+// services / VIP / HA-ready over an unenforced RE-protection path. The fence-skip
+// gate keys on lo0Enforced — whether a REAL operator filter is currently
+// loaded — NOT on "any protecting table exists": a fence is `policy accept` and
+// drops only its snapshot's addresses, so a retained FENCE does not cover a
+// later-appearing address (#6489). When no real filter is loaded, a failed
+// InstallLo0 (re-)installs a fail-closed fence rendered from the CURRENT
+// firewall-local snapshot (minus lifelines) — so a fence -> new-address -> real
+// install fails sequence re-fences and covers the new address instead of leaving
+// it open through the stale fence. Only on a DAY-2 failure with a REAL filter
+// loaded (lo0Enforced true) is no fence installed: the atomic replaceTable
+// retained the operator's filter, which — unlike the per-destination-address
+// host-inbound table — is not per-address scoped and still governs every local
+// address (the deliberate divergence from the #5789 gap fence).
 func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 	filterV4 := cfg.System.Lo0FilterInputV4
 	filterV6 := cfg.System.Lo0FilterInputV6
@@ -148,16 +154,17 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 		if err := nftInstaller.DeleteTable(xnft.Lo0TableName); err != nil {
 			// Teardown FAILED: a stale xpf_lo0 table (real filter OR a prior fence)
 			// may still be installed. Surface the failure (fail closed) and do NOT
-			// clear lo0Enforced — a later failed install must keep retaining rather
-			// than fence over a live table (mirrors the host-inbound #5790 teardown
-			// semantics).
+			// clear lo0Enforced — if a real filter was the live table it may
+			// still be there, so keep the flag (mirrors the host-inbound #5790
+			// teardown semantics).
 			err = tagNftInstallErr(err)
 			slog.Warn("failed to delete stale lo0 filter table", "err", err)
 			return fmt.Errorf("delete stale lo0 nftables table: %w", err)
 		}
-		// Teardown SUCCEEDED: no xpf_lo0 table is installed now. Clear the historical
-		// gate so a later enforceable generation whose first real load fails takes the
-		// cold-boot fence path rather than assuming a retained table (#5790 parity).
+		// Teardown SUCCEEDED: no xpf_lo0 table is installed now, so no real filter is
+		// loaded. Clear the gate so a later generation whose first real load fails
+		// takes the cold-boot fence path rather than assuming a retained table
+		// (#5790 parity).
 		d.lo0Enforced.Store(false)
 		return nil
 	}
@@ -171,14 +178,15 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 	if err := nftInstaller.InstallLo0(spec); err != nil {
 		err = tagNftInstallErr(err)
 		slog.Warn("failed to apply lo0 filter", "err", err)
-		// #6476 cold-boot fail-closed fence. On cold boot no prior xpf_lo0 table
-		// exists to retain, so a failed real install here would leave the RE input
-		// path OPEN. Gate on the historical state and, when no protecting table has
-		// loaded, install a fence that denies host-bound traffic to the firewall-
-		// local addresses (minus lifelines) rendered from this snapshot. On a day-2
-		// failure (lo0Enforced true) the atomic replaceTable retained the prior real
-		// lo0 filter, which — unlike the address-scoped host-inbound table — still
-		// governs every local address, so no fence is installed.
+		// #6476 cold-boot fail-closed fence. Install (or re-install) a fence UNLESS a
+		// REAL operator filter is currently loaded. Keying on lo0Enforced (not
+		// "any protecting table") is the #6489 fix: a retained FENCE is `policy accept`
+		// and covers only its own snapshot, so if the live table is a fence a failed
+		// real install must RE-FENCE from the CURRENT snapshot to cover any address
+		// that appeared since — otherwise the new address falls through the stale
+		// fence's policy-accept (fail-open). Only a retained REAL filter is trusted to
+		// govern every local address (unlike the address-scoped host-inbound table), so
+		// with lo0Enforced true no fence is installed.
 		if !d.lo0Enforced.Load() {
 			views := dpuserspace.BuildZoneHostInboundViews(cfg)
 			unzonedV4, unzonedV6 := dpuserspace.BuildUnzonedHostInboundAddrs(cfg)
@@ -189,8 +197,8 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 		}
 		return fmt.Errorf("apply lo0 nftables filter: %w", err)
 	}
-	// A real lo0 filter is now installed. Record the historical success so a later
-	// failed install retains that exact generation and skips the cold-boot fence.
+	// A real lo0 filter is now the live table. Record it so a later failed install
+	// retains this generation and skips the fence (the intended day-2 divergence).
 	d.lo0Enforced.Store(true)
 	slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6)
 	return nil
@@ -203,18 +211,27 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 // ESP+AH, IPv6 ND, v4/v6 PMTUD+error, and the configured WireGuard listen
 // port(s)). It is the lo0-table analogue of installHostInboundColdBootFence and
 // shares the SAME FenceSpec + fence builder, differing only in the target table
-// (xpf_lo0 at lo0FilterPriority). It is attempted only when the real lo0 install
-// failed and lo0Enforced is false.
+// (xpf_lo0 at lo0FilterPriority). It is attempted whenever a real lo0 install
+// failed and no real filter is currently loaded (lo0Enforced false).
 //
 // Safety: the fence drops only to the SAME lifeline-excluded address sets the
 // host-inbound fence uses (fxp0/em0/fab* and their addresses are subtracted by
 // BuildZoneHostInboundViews / BuildUnzonedHostInboundAddrs), so it can never
 // strand management or break HA. It carries no named counters (a fence is
-// transient). After a successful install, lo0Enforced is set true only when this
-// snapshot contains an address-scoped DROP; a successful zero-drop shell leaves it
-// false so a later failed real invocation can retry with a better snapshot
-// (mirrors the host-inbound #5759 zero-drop retry). On failure (nft itself is
-// broken) the error is returned and joined into the commit result.
+// transient).
+//
+// A fence deliberately does NOT set lo0Enforced — that flag is set true ONLY by a
+// successful real InstallLo0, so it means exactly "a real operator lo0 filter is
+// loaded". A fence is NOT a real filter (its chain is `policy accept` and drops
+// only THIS snapshot's addresses). lo0Enforced is already false whenever this runs
+// (we only reach here when the day-2 gate `!lo0Enforced` passed), so it stays
+// false and a subsequent failed real install RE-RENDERS the whole-table fence from
+// the then-current snapshot — covering any address that appeared after this fence
+// — rather than trusting the stale fence (#6489). This subsumes the zero-drop
+// case: an addressless snapshot yields a policy-accept shell, still not a real
+// filter, so a later failure re-fences from a possibly-now-addressed snapshot. On
+// failure (nft itself is broken) the error is returned and joined into the commit
+// result; the daemon has done all it can.
 func (d *Daemon) installLo0ColdBootFence(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) error {
 	fenceHasScopedDrop := hostInboundHasEnforceableView(views) || len(unzonedV4) > 0 || len(unzonedV6) > 0
 	spec := xnft.FenceSpec{Views: toNftViews(views), UnzonedV4: unzonedV4, UnzonedV6: unzonedV6, WGListenPorts: wgListenPorts}
@@ -226,13 +243,13 @@ func (d *Daemon) installLo0ColdBootFence(views []dpuserspace.ZoneHostInboundView
 			"err", err)
 		return fmt.Errorf("install lo0 cold-boot fail-closed fence: %w", err)
 	}
+	// lo0Enforced is intentionally NOT set here (a fence is not a real filter).
 	if fenceHasScopedDrop {
-		d.lo0Enforced.Store(true)
-		slog.Warn("lo0 real install failed; fallback succeeded with address-scoped DROPs for its rendered snapshot",
+		slog.Warn("lo0 real install failed; installed an address-scoped fail-closed fence for the current snapshot (re-rendered on each later failure until a real filter loads)",
 			"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
 			"fenced_unzoned_v6", len(unzonedV6))
 	} else {
-		slog.Warn("lo0 real install failed; fallback succeeded with zero address-scoped DROPs; lo0Enforced remains false and another fallback requires a later failed real invocation reaching lo0 while false",
+		slog.Warn("lo0 real install failed; installed a zero-drop fence shell (no firewall-local addresses in this snapshot); re-rendered on each later failure until a real filter loads",
 			"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
 			"fenced_unzoned_v6", len(unzonedV6))
 	}

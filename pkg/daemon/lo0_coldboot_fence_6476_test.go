@@ -15,12 +15,14 @@ import (
 // apply only logs+discards the error) left the host input path OPEN with only a
 // WARN, while host services / VIP / HA-ready were published — the same fail-open
 // #5644 closed for the host-inbound table. The fix mirrors installHostInbound
-// ColdBootFence for lo0: when the real lo0 install fails and no protecting xpf_lo0
-// table has loaded this boot (lo0Enforced false), a fail-closed fence that denies
+// ColdBootFence for lo0: when the real lo0 install fails and no REAL filter is
+// currently loaded (lo0Enforced false), a fail-closed fence that denies
 // host-bound traffic to the firewall-local addresses (minus lifelines) is
-// installed instead of proceeding open. These are the fail-on-revert proofs:
-// neutralize the fence (drop the installLo0ColdBootFence call, or route it to the
-// wrong table) and the cold-boot assertions go RED.
+// installed instead of proceeding open. A fence is NOT a real filter, so it leaves
+// lo0Enforced false and a later failed install re-fences from the current
+// snapshot (#6489). These are the fail-on-revert proofs: neutralize the fence
+// (drop the installLo0ColdBootFence call, or route it to the wrong table) and the
+// cold-boot assertions go RED.
 
 // lo0FenceTestConfig returns hostInboundTestConfig augmented with a bound lo0
 // input filter for both families, so applyLo0Filter takes the INSTALL path and
@@ -50,7 +52,7 @@ func lo0FenceTestConfig() *config.Config {
 // ever loaded this boot, a fail-closed fence MUST be installed via the lo0 table
 // seam so the RE-protection input path stays fenced. It also asserts the commit
 // still fails (the error is surfaced) so the retry/re-render path is driven.
-// Reverting the fence makes the fence-installed and lo0Enforced assertions RED.
+// Reverting the fence makes the fence-installed assertion RED.
 func TestColdBootLo0InstallFailureInstallsFence(t *testing.T) {
 	cfg := lo0FenceTestConfig()
 
@@ -72,7 +74,7 @@ func TestColdBootLo0InstallFailureInstallsFence(t *testing.T) {
 	defer func() { nftInstaller = orig }()
 
 	d := &Daemon{}
-	// Cold boot: no protecting lo0 table has ever loaded.
+	// Cold boot: no real lo0 filter is loaded.
 	if d.lo0Enforced.Load() {
 		t.Fatal("precondition: lo0Enforced must start false (cold boot)")
 	}
@@ -96,10 +98,13 @@ func TestColdBootLo0InstallFailureInstallsFence(t *testing.T) {
 		t.Errorf("expected exactly one real lo0 install attempt, got %d", lo0Calls)
 	}
 
-	// Enforcement is now established (via the fence) — a later day-2 failure is
-	// retained by the atomic load and needs no fence.
-	if !d.lo0Enforced.Load() {
-		t.Error("lo0Enforced must be true after the fence installs (enforcement established)")
+	// A fence is NOT a real filter, so lo0Enforced must stay FALSE — this is
+	// the #6489 correctness core: it keeps the day-2 gate open so a later failed real
+	// install RE-FENCES from the then-current snapshot (covering a new address)
+	// rather than retaining this stale snapshot fence. The pre-fix code set the gate
+	// true here (conflating fence-loaded with real-filter-loaded), the fail-open.
+	if d.lo0Enforced.Load() {
+		t.Error("a cold-boot fence must NOT set lo0Enforced (a fence is not a real filter); doing so re-opens the #6489 stale-fence fail-open")
 	}
 
 	// The fence must DENY host services to the enforced wan address (both
@@ -168,18 +173,20 @@ func TestColdBootLo0FenceAdmitsMandatoryL3(t *testing.T) {
 	}
 }
 
-// TestDay2Lo0InstallFailureNoFence proves the NORMAL (table-present) path is
-// unchanged: once a real lo0 filter has installed (lo0Enforced == true), a LATER
-// failed install must NOT install a fence — the atomic replaceTable already
-// retains the prior real filter (fail-closed by retention), and unlike the
-// address-scoped host-inbound table the operator's lo0 filter still governs every
-// local address, so there is no day-2 coverage gap to fence. This is the
-// no-regression guard: an unconditional cold-boot fence would clobber the
-// retained day-2 filter with a deny-all, so this goes RED.
+// TestDay2Lo0InstallFailureNoFence proves the intended divergence holds when a
+// REAL filter is the live table: once a real lo0 filter has installed
+// (lo0Enforced == true), a LATER failed install must NOT install a fence —
+// the atomic replaceTable already retains the prior real filter (fail-closed by
+// retention), and unlike the address-scoped host-inbound table the operator's lo0
+// filter still governs every local address, so there is no day-2 coverage gap to
+// fence. This is the no-regression guard: a fence here would clobber the retained
+// real filter with a deny-all, so this goes RED. (Contrast
+// TestColdBootLo0FenceThenNewAddressReFences, where the retained table is a FENCE,
+// not a real filter, and a day-2 failure MUST re-fence.)
 func TestDay2Lo0InstallFailureNoFence(t *testing.T) {
 	cfg := lo0FenceTestConfig()
 
-	// First apply: real install succeeds → enforcement established.
+	// First apply: real install succeeds → a real filter is now loaded.
 	orig := nftInstaller
 	nftInstaller = &fakeNftInstaller{} // all succeed
 	d := &Daemon{}
@@ -221,7 +228,7 @@ func TestDay2Lo0InstallFailureNoFence(t *testing.T) {
 
 // TestColdBootLo0FenceCatastrophicFailureSurfaced proves that when the real lo0
 // install AND the fence both fail (nft itself broken), both errors are surfaced
-// so the commit fails closed and lo0Enforced stays false (no protecting table).
+// so the commit fails closed and lo0Enforced stays false (no real filter).
 func TestColdBootLo0FenceCatastrophicFailureSurfaced(t *testing.T) {
 	cfg := lo0FenceTestConfig()
 
@@ -242,16 +249,16 @@ func TestColdBootLo0FenceCatastrophicFailureSurfaced(t *testing.T) {
 	if !errors.Is(err, realErr) || !errors.Is(err, fenceErr) {
 		t.Errorf("error must join both the real and fence failures, got %v", err)
 	}
-	// The fence never loaded, so enforcement is NOT established.
+	// The fence never loaded, so no real filter is loaded either.
 	if d.lo0Enforced.Load() {
 		t.Error("lo0Enforced must stay false when the fence also fails")
 	}
 }
 
-// TestColdBootLo0ZeroDropFenceLeavesEnforcedFalse proves that a cold-boot fence
-// rendered from a snapshot with NO firewall-local addresses is a zero-drop shell
-// and leaves lo0Enforced false, so a later failed real invocation can retry with
-// an address-scoped snapshot (mirrors the host-inbound #5759 zero-drop retry).
+// TestColdBootLo0ZeroDropFenceLeavesEnforcedFalse proves that a cold-boot
+// fence rendered from a snapshot with NO firewall-local addresses is a zero-drop
+// shell and leaves lo0Enforced false, so a later failed real invocation
+// re-fences from a possibly-now-addressed snapshot.
 func TestColdBootLo0ZeroDropFenceLeavesEnforcedFalse(t *testing.T) {
 	// An lo0 filter bound but NO firewall-local addresses (no zoned/unzoned
 	// interfaces), so the fence scopes nothing.
@@ -289,20 +296,20 @@ func TestColdBootLo0ZeroDropFenceLeavesEnforcedFalse(t *testing.T) {
 		t.Fatalf("fence must be zero-drop (no firewall-local addresses):\n%+v", fenceSpec)
 	}
 	if d.lo0Enforced.Load() {
-		t.Error("zero-drop fence must leave lo0Enforced false (retry on next failure)")
+		t.Error("zero-drop fence must leave lo0Enforced false (re-fence on next failure)")
 	}
 }
 
-// TestLo0TeardownClearsEnforced proves a successful no-filter teardown clears the
-// lo0Enforced gate, so a later cold-boot failure re-fences rather than assuming a
-// retained table (the #5790 teardown-clears-state parity for lo0).
+// TestLo0TeardownClearsEnforced proves a successful no-filter teardown
+// clears the lo0Enforced gate, so a later cold-boot failure fences rather
+// than assuming a retained table (the #5790 teardown-clears-state parity for lo0).
 func TestLo0TeardownClearsEnforced(t *testing.T) {
 	orig := nftInstaller
 	nftInstaller = &fakeNftInstaller{} // all succeed
 	defer func() { nftInstaller = orig }()
 
 	d := &Daemon{}
-	// Establish enforcement with a successful real install.
+	// Load a real filter with a successful real install.
 	if err := d.applyLo0Filter(lo0FenceTestConfig()); err != nil {
 		t.Fatalf("initial apply: %v", err)
 	}
@@ -315,5 +322,81 @@ func TestLo0TeardownClearsEnforced(t *testing.T) {
 	}
 	if d.lo0Enforced.Load() {
 		t.Error("successful teardown must clear lo0Enforced (no table retained)")
+	}
+}
+
+// TestColdBootLo0FenceThenNewAddressReFences is the #6489 fail-on-revert proof for
+// the stale-fence fail-open. Sequence: cold-boot real install FAILS → a fence is
+// installed for snapshot A (address 172.16.50.8); then a NEW firewall-local
+// address B (10.0.61.1) appears and the real install FAILS again. Because the live
+// table is a FENCE (policy accept + drops for A only), NOT a real filter, the
+// day-2 gate MUST re-fence from the current snapshot so B is covered — otherwise B
+// falls through the stale fence's `policy accept` (fail-open).
+//
+// PARENT-RED: make the cold-boot fence Store lo0Enforced TRUE (the pre-fix
+// conflation) and this test goes RED — the second apply's gate sees "real filter
+// loaded", skips the fence (fenceCalls stays 1), and B is left uncovered.
+func TestColdBootLo0FenceThenNewAddressReFences(t *testing.T) {
+	// One zoned interface with address A; B is added to the same unit later.
+	unit := &config.InterfaceUnit{Number: 0, Addresses: []string{"172.16.50.8/24"}}
+	cfg := &config.Config{}
+	cfg.System.Lo0FilterInputV4 = "protect-re"
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"protect-re": {Name: "protect-re", Terms: []*config.FirewallFilterTerm{
+			{Name: "deny-rest", Action: "discard"},
+		}},
+	}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{0: unit}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"wan": {
+			Name:               "wan",
+			Interfaces:         []string{"reth0.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+		},
+	}
+
+	injected := errors.New("nftables: lo0 real load failure")
+	var fenceSpecs []xnft.FenceSpec
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{
+		lo0: func(xnft.Lo0FilterSpec) error { return injected }, // real install always fails
+		lo0ColdBootFence: func(spec xnft.FenceSpec) error {
+			fenceSpecs = append(fenceSpecs, spec)
+			return nil
+		},
+	}
+	defer func() { nftInstaller = orig }()
+
+	d := &Daemon{}
+
+	// Apply 1 (cold boot): real install fails → fence for snapshot A.
+	if err := d.applyLo0Filter(cfg); !errors.Is(err, injected) {
+		t.Fatalf("apply 1 error = %v, want wrapped injected", err)
+	}
+	if len(fenceSpecs) != 1 {
+		t.Fatalf("apply 1 must install exactly one fence, got %d", len(fenceSpecs))
+	}
+	if !sliceContains(fenceViewAddrs(fenceSpecs[0], false), "172.16.50.8") {
+		t.Fatalf("apply-1 fence must cover address A 172.16.50.8:\n%+v", fenceSpecs[0])
+	}
+
+	// A new firewall-local address B appears on the same unit.
+	unit.Addresses = []string{"172.16.50.8/24", "10.0.61.1/24"}
+
+	// Apply 2 (day-2): real install fails again over a RETAINED FENCE. The gate must
+	// re-fence from the current snapshot so B is covered.
+	if err := d.applyLo0Filter(cfg); !errors.Is(err, injected) {
+		t.Fatalf("apply 2 error = %v, want wrapped injected", err)
+	}
+	if len(fenceSpecs) != 2 {
+		t.Fatalf("day-2 failure over a retained FENCE must RE-FENCE (got %d fence installs, want 2); "+
+			"the stale snapshot-A fence is policy-accept and does not cover the new address", len(fenceSpecs))
+	}
+	// The re-rendered fence must cover BOTH A and the newly-appeared B.
+	got := fenceViewAddrs(fenceSpecs[1], false)
+	if !sliceContains(got, "172.16.50.8") || !sliceContains(got, "10.0.61.1") {
+		t.Fatalf("re-rendered fence must cover both A (172.16.50.8) and new B (10.0.61.1), got %v:\n%+v", got, fenceSpecs[1])
 	}
 }

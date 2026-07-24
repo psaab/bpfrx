@@ -517,12 +517,6 @@ filter is unenforced.
 
 The fix mirrors the host-inbound cold-boot fence for the lo0 table:
 
-- `d.lo0Enforced` (a `Daemon` atomic bool) is the lo0 analogue of
-  `hostInboundEnforced`: a successful real `InstallLo0` stores true; a successful
-  address-scoped `installLo0ColdBootFence` stores true; a successful no-filter
-  TEARDOWN stores false (the `xpf_lo0` table is deleted, so a later failed install
-  must re-fence rather than assume a retained table); a teardown FAILURE does not
-  clear it. `applySem`-serialized like `hostInboundEnforced`.
 - `installLo0ColdBootFence` / `buildLo0FencePayload` (`daemon_nft.go`) build the
   fence from the SAME lifeline-excluded firewall-local address sets
   (`BuildZoneHostInboundViews` + `BuildUnzonedHostInboundAddrs`) and the SAME
@@ -534,21 +528,58 @@ The fix mirrors the host-inbound cold-boot fence for the lo0 table:
   filter occupies, so a later successful `InstallLo0` **atomically replaces** it.
   Netlink install is `Installer.InstallLo0ColdBootFence` (T1 parity gate:
   `lo0_cold_boot_fence`).
-- **No day-2 gap fence (the deliberate divergence from #5789).** Unlike the
-  auto-generated, per-destination-address-scoped `xpf_hostinbound` table, the
-  operator's lo0 filter is hand-authored and NOT per-destination scoped — its
-  terms (typically ending in a catch-all `discard`) govern every firewall-local
-  address, including one that appears later. So on a DAY-2 failure
-  (`lo0Enforced` true) the atomic `replaceTable` retains the prior real filter
-  and that retained generation still covers new addresses; no additive gap fence
-  is installed (or needed). The cold-boot fence alone closes the issue.
-- A zero-drop fence (an addressless boot snapshot) leaves `lo0Enforced` false so a
-  later failed real invocation can retry with an address-scoped snapshot; a
-  catastrophic double-failure (real load AND fence both fail) joins both errors,
-  fires the `COLD-BOOT FAIL-OPEN GUARD` ERROR log, and leaves `lo0Enforced` false.
+- **The gate keys on `d.lo0Enforced` — "is the live `xpf_lo0` table a REAL
+  operator filter" — NOT "does any protecting table exist" (#6489).** A failed
+  `InstallLo0` installs (or re-installs) a fence UNLESS a real filter is currently
+  loaded. It is true ONLY after a successful real `InstallLo0`; a FENCE deliberately
+  does **not** set it (a fence is not a real filter — its chain is `policy accept`
+  and drops only the addresses in the snapshot it was rendered from — so it stays
+  false across a fence). A successful no-filter TEARDOWN stores false (the table is
+  deleted); a teardown FAILURE does not clear it. `applySem`-serialized.
+- **Why it must not key on "any table exists".** The earlier design set a single
+  `lo0Enforced` bool true on BOTH a real load AND a scoped fence, so this sequence
+  FAILED OPEN: cold-boot real install fails → fence(snapshot A) installed → gate
+  true → a new local address **B** appears + real install fails again → the gate
+  skips re-fencing → the retained table is the OLD FENCE (`policy accept` + drops
+  for A only), so **B** falls through `policy accept` → the RE input path is open
+  for B. Keying on `lo0Enforced` instead RE-RENDERS the whole-table fence
+  from the CURRENT snapshot on every day-2 failure while no real filter is loaded,
+  so B is covered.
+- **No day-2 gap fence (the deliberate divergence from #5789) — but only once a
+  REAL filter is loaded.** When `lo0Enforced` is true, a day-2 failure
+  installs no fence: the atomic `replaceTable` retains the operator's filter, which
+  — unlike the auto-generated, per-destination-address-scoped `xpf_hostinbound`
+  table — is hand-authored and NOT per-destination scoped (its terms, typically
+  ending in a catch-all `discard`, govern every firewall-local address, including
+  one that appears later). So lo0 needs neither a per-address coverage set nor an
+  additive gap table; the whole-table re-render (fence path) and retain-the-real-
+  filter (real-filter path) together close the gap.
+- A zero-drop fence (an addressless boot snapshot) is likewise not a real filter,
+  so it leaves `lo0Enforced` false and a later failed real invocation
+  re-fences from a possibly-now-addressed snapshot; a catastrophic double-failure
+  (real load AND fence both fail) joins both errors, fires the `COLD-BOOT
+  FAIL-OPEN GUARD` ERROR log, and leaves `lo0Enforced` false.
 
-Fail-on-revert proof: `pkg/daemon/lo0_coldboot_fence_6476_test.go`. The
-lo0-first-then-host-inbound priority ordering (0 < 10) is pinned by
+**Pre-existing residuals (NOT introduced or addressed by #6476/#6489, tracked
+separately):**
+
+- A retained REAL lo0 filter with **no catch-all term** is a valid config
+  (`compiler_filter_nocatchall_3295_test`); such a filter need not itself cover a
+  new day-2 address. That is the lo0 filter's own coverage semantics, independent
+  of this boot fence — the fence only guarantees the RE path is not left fully
+  open when NO real filter is loaded.
+- The shared fence body / `BuildZoneHostInboundViews` / `BuildUnzonedHostInbound
+  Addrs` that this fence reuses carry two known behaviours that affect the
+  **host-inbound #5644 fence identically** (a shared-mechanism concern, not
+  lo0-specific — tracked in **#6492**): a management IP shared onto a non-lifeline
+  interface can pick up a global `daddr` drop, and a zone-less router yields empty
+  address sets → an accept-all fence shell. Both live in the shared mechanism and
+  pre-date #6476.
+
+Fail-on-revert proof: `pkg/daemon/lo0_coldboot_fence_6476_test.go` —
+`TestColdBootLo0FenceThenNewAddressReFences` pins the #6489 fence→fail→re-fence
+sequence (RED if a fence marks a real filter loaded). The lo0-first-then-host-
+inbound priority ordering (0 < 10) is pinned by
 `pkg/daemon/nft_chain_priority_test.go`; the fence's netlink/exec-nft parity by
 the `lo0_cold_boot_fence` case in `daemon_nft_netlink_parity_test.go`.
 

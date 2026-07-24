@@ -60682,3 +60682,39 @@ top.
     pkg/daemon/lo0_coldboot_fence_6476_test.go,
     docs/host-inbound-service-matrix.md,
     docs/refactoring-audit-current.txt, _Log.md
+
+- **Timestamp**: 2026-07-24
+- **Action**: #6489 fold — CONFIRMED Codex MAJOR (Finding 1): the lo0
+    day-2 fence-skip gate `!d.lo0Enforced.Load()` conflated "real filter
+    loaded" with "fence loaded" (a scoped fence Stored lo0Enforced=true),
+    so a fence(snapshotA) → new-address-B-appears → real-install-fails-again
+    sequence SKIPPED re-fencing and left B reachable through the retained
+    fence's `policy accept` (fence drops only snapshot-A addrs). Fix (per
+    lead: prefer rev6476's 1-line change over a new field): KEEP `lo0Enforced`
+    and simply DROP the `Store(true)` on the scoped cold-boot fence path — a
+    fence never sets lo0Enforced, so lo0Enforced now means EXACTLY "a real
+    operator lo0 filter is loaded" (set true ONLY by a real InstallLo0
+    success; the zero-drop path already never set it). The unchanged gate
+    `!d.lo0Enforced.Load()` then correctly re-fences after a prior fence: while
+    no real filter is loaded a failed install RE-RENDERS the whole-table fence
+    from the CURRENT snapshot (covering B); once a real filter loads the
+    intended #5789 divergence (retain the real filter, no fence) holds. No new
+    field, no lo0 gap fence / covered-set. New test
+    TestColdBootLo0FenceThenNewAddressReFences (fence→fail→re-fence, asserts 2
+    fence installs + B covered); flipped the primary test's stale assertion (a
+    fence must NOT set lo0Enforced). Fixed the now-false "retains the prior
+    REAL filter" framing in the day-2 comment, the lo0Enforced field doc, and
+    docs/host-inbound-service-matrix.md. Parent-RED confirmed firsthand —
+    restore `d.lo0Enforced.Store(true)` on the scoped-fence path → "day-2
+    failure over a retained FENCE must RE-FENCE (got 1 fence installs, want
+    2)". Noted pre-existing residuals (non-catch-all real filter coverage
+    #3295; shared BuildZone.../fence-body Findings 2+3 tracked in follow-up
+    #6492 — they hit the host-inbound #5644 fence identically). Ran the T1
+    nft-parity gate with nft in PATH (FRESH GOCACHE) and CONFIRMED the new
+    `lo0_cold_boot_fence` subtest EXECUTES + PASSES (not a stale-binary SKIP).
+    go build / vet / gofmt / pkg-daemon + pkg-nftables suites / heatmap
+    (regenerated) GREEN.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_nft.go,
+    pkg/daemon/lo0_coldboot_fence_6476_test.go,
+    docs/host-inbound-service-matrix.md,
+    docs/refactoring-audit-current.txt, _Log.md
