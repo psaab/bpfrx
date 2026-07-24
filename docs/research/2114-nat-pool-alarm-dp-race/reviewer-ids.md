@@ -8,9 +8,27 @@ reviewer (joins at /engineer on the code PR).
 | r1 | Codex | codex task-mry8v5cj-stxrjr (session 019f91ad-3135-7281-a48c-981e3f08cba8) | NEEDS-REVISION (7 MAJOR, 6 MINOR) |
 | r1 | AGY | agy print-mode direct (jetski; cwd /home/ps/git/bpfrx trusted-workspace + --add-dir worktree) | PLAN-READY-WITH-NITS (1 MAJOR, 3 MINOR) |
 | r1 | Claude SMR | in-conversation (claude-smr-plan-r1.md) | NEEDS-REVISION (4 BLOCKER, 3 MAJOR, 4 MINOR) |
-| r2 | Codex | (convergence round — pending) | (pending) |
-| r2 | AGY | (convergence round — pending) | (pending) |
-| r2 | Claude SMR | in-conversation (claude-smr-plan-r2.md) | (pending) |
+| r2 | Codex | codex companion task (see codex-plan-r2.md) | NEEDS-REVISION (6 MAJOR, 3 MINOR) |
+| r2 | AGY | agy print-mode direct (agy-plan-r2.md) | PLAN-READY-WITH-NITS (1 MAJOR, 2 MINOR) |
+| r2 | Claude SMR | in-conversation (claude-smr-plan-r2.md) | NEEDS-REVISION (2 BLOCKER, 3 MAJOR, 3 MINOR) |
+| r3 | Codex | codex companion task (see codex-plan-r3.md) | NEEDS-REVISION (3 MAJOR, 3 MINOR) |
+| r3 | AGY | agy print-mode direct (agy-plan-r3.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR) |
+| r3 | Claude SMR | in-conversation (claude-smr-plan-r3.md) | NEEDS-REVISION (1 BLOCKER, 2 MAJOR, 2 MINOR) |
+| r4 | Codex | codex companion task (see codex-plan-r4.md) | NEEDS-REVISION (1 MAJOR, 5 MINOR) |
+| r4 | AGY | agy print-mode direct (agy-plan-r4.md) | PLAN-READY (0 findings) |
+| r4 | Claude SMR | in-conversation (claude-smr-plan-r4.md) | NEEDS-REVISION (1 BLOCKER, 2 MAJOR, 3 MINOR) |
+| r5 | Codex | codex companion task (see codex-plan-r5.md) | NEEDS-REVISION (2 MAJOR, 4 MINOR) |
+| r5 | AGY | agy print-mode direct (agy-plan-r5.md) | PLAN-READY (0 MAJOR, 1 MINOR prose) |
+| r5 | Claude SMR | in-conversation (claude-smr-plan-r5.md) | NEEDS-REVISION (1 BLOCKER, 2 MAJOR, 3 MINOR) |
+| r6 | Codex | codex companion task (see codex-plan-r6.md) | NEEDS-REVISION (2 MAJOR, 5 MINOR) |
+| r6 | AGY | agy print-mode direct (agy-plan-r6.md) | NEEDS-REVISION (1 MAJOR, 1 MINOR) |
+| r6 | Claude SMR | in-conversation (claude-smr-plan-r6.md) | NEEDS-REVISION (2 BLOCKER, 1 MAJOR, 3 MINOR) |
+| r7 | Codex | codex companion task (see codex-plan-r7.md) | NEEDS-REVISION (2 MAJOR, 4 MINOR) |
+| r7 | AGY | agy print-mode direct (agy-plan-r7.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR) |
+| r7 | Claude SMR | in-conversation (claude-smr-plan-r7.md) | NEEDS-REVISION (2 MAJOR, 3 MINOR) |
+| r8 | Codex | codex companion task-mryhteof-3r6csp (session 019f9292-9b88-7513-b7ff-c9ea0c3a9e46; worktree cwd) | NEEDS-REVISION (3 MAJOR, 4 MINOR) |
+| r8 | AGY | agy print-mode direct (agy-plan-r8.md; resumed from prior session) | PLAN-READY (0 MAJOR, 0 MINOR) |
+| r8 | Claude SMR | in-conversation (claude-smr-plan-r8.md) | NEEDS-REVISION (1 MAJOR, 2 MINOR) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
@@ -30,4 +48,13 @@ reviewer (joins at /engineer on the code PR).
 - WORKING INVOCATION (attempt 5): `cd /home/ps/git/bpfrx` (trusted
   workspace, same repo) + `agy --print-timeout 9m --add-dir <worktree>
   --print "<prompt>"` — produced the substantive r1 review captured in
-  `agy-plan-r1.md`.
+  `agy-plan-r1.md`. Same invocation pattern used for r2-r8.
+
+## Codex infra notes
+
+- The codex-companion job registry is keyed by workspace root: dispatch AND
+  status/result polling must run with cwd = the worktree, else the job is
+  invisible (`status` from the main checkout reports "No job found").
+- r8 dispatch: `task --background --fresh "$(cat <prompt-file>)"` from the
+  worktree; polled `status <id> --json` until `completed`; `result <id>`
+  for the body. ~11 min wall.

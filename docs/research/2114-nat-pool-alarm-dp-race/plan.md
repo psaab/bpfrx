@@ -1,8 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v8 — r7 findings folded (Codex NEEDS-REVISION 2M/4m;
-  AGY PLAN-READY-WITH-NITS 0M/1m; Claude SMR NEEDS-REVISION 2M/3m);
-  pending convergence review r8
+- **Status**: DRAFT v9 — r8 findings folded (Codex NEEDS-REVISION 3M/4m;
+  AGY PLAN-READY 0M/0m; Claude SMR NEEDS-REVISION 1M/2m);
+  pending convergence review r9
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -20,16 +20,36 @@
   (r5: startup-readiness gate v1 for the pre-existing vrrpMgr nil-deref /
   bootstrap-armed defects). v7 @ `5de29ed7d` (r6: gate redesigned as
   startupDone+startupOK outcome; exclusion scoped to current-version
-  records after the cross-upgrade counterexample). v8: r7 convergence —
-  gate outcome publisher `finishStartup(ok)` (`sync.Once`, killing the
-  double-close both reviewers caught independently); linearization moved to
-  END of PHASE 5 (the only point exactly-equivalent to remote-commit
-  arrival); gate tests gain an entry hook, dual real failure-path coverage,
-  executor-entry+no-side-effects assertion, a backend-factory seam,
-  phase-level orchestration + late-manager milestone; the NARROW legacy
-  recovery guard (resolve `FirstCommit`+cluster records as expired before
-  manager construction) ships IN this PR (OQ7 adjudicated for Codex over
-  AGY); preamble/table/citation consistency; fixture list completed.
+  records after the cross-upgrade counterexample). v8 @ `9c2bc5bbd` (r7:
+  `finishStartup(ok)` Once-guarded publisher; END-of-PHASE-5 linearization;
+  gate-test strengthening; work item H admitted as narrow recovery guard).
+  v9: r8 convergence — work item G gains a shutdown-admission fence (Codex
+  M1, verified: shutdown drains applySem once and releases at
+  `daemon_run_shutdown.go:50-53`, so a gate-released rollback can re-acquire
+  and run the full apply against live teardown — a `stopping` flag published
+  before the drain, checked by the executor under applySem), a Run-scoped
+  `defer d.finishStartup(false)` for panic/unwind safety (Codex m1), and
+  corrected rationales (gate-before-applySem prevents the executor holding
+  applySem ACROSS its gate-wait and deadlocking the phase-4 boot apply —
+  the boot does NOT hold applySem across startup, `daemon_apply.go:50-51`;
+  END-of-PHASE-5 is "all server construction complete", NOT "first server
+  contact" — HTTP already serves from `daemon_run.go:586-589`). Work item H
+  is REDESIGNED (Codex M2 subsuming Claude SMR M1, both verified): the
+  guard is a PERMANENT recovery invariant (a current-version regeneration
+  chain re-creates FirstCommit+cluster records after any seeded hybrid —
+  Codex M3, verified through `store_commit.go:901-907` +
+  `bootstrap.go:321-334` + the runtime-keyed preflight) and its semantics
+  change from keep-active/drop-record to REVERT-AT-LOAD (running the
+  expired-branch FirstCommit revert body for UNEXPIRED records), because
+  keep-active silently confirms an unconfirmed config — the #4577 contract
+  violation both reviewers caught. Expired records keep flowing through the
+  existing branch untouched. Fixture list completed for real (adds
+  `bootstrap_rollback_test.go:74`, `rollback_resync_test.go:81`,
+  `startup_signal_5807_test.go:118,157` — the last two need an initialized
+  open gate or `close(nil)` panics). Fwdstatus deletion inventory completed
+  (`var _` assertion :10, userspace wrapper :52-75, `userspaceStatusProbe`
+  :83-87); §5.1 "no other package touched" corrected (work item H touches
+  `pkg/configstore`).
 
 ---
 
@@ -147,12 +167,27 @@ no cycles/MB/retransmits to win back. The win, at absolute scale:
   and a later corrected re-exit can run the RACE-2 writer against live HA
   readers. On current-version records this cannot happen (the preflight
   rejects the topology add), and a never-committed marker cannot coexist
-  with a same-version committed cluster config. **Consequence (r7-resolved)**: the plan
-  does NOT rely on the exclusion for safety — it converts every reader
-  uniformly, which covers the legacy path by construction — AND the NARROW
-  recovery guard ships in this PR (work item H, §4): recovery resolves a
-  `FirstCommit`+cluster record as expired before manager construction, so
-  the coexistence is prevented going forward. Only the BROADER
+  with a same-version committed cluster config (r8-verified:
+  `bootstrapFromFile` imports the seed config via a REAL commit —
+  `daemon_apply_commit.go:57` → `store_commit.go:203` sets
+  `everCommitted=true` — so a file-seeded node's first operator commit
+  records `FirstCommit=false`; a truly fresh store's first cluster commit
+  is preflight-rejected; factory-reset stops the daemon).
+  **r8 recurrence (Codex M3, verified)**: the hybrid REGENERATES on
+  current-version code once seeded. The legacy record's timeout runs
+  `PromoteRollback`'s FirstCommit leg (`store_commit.go:901-907`:
+  `everCommitted=false`, empty active tree) into `enterBootstrapMode`,
+  which leaves `d.cluster` ALIVE; a subsequent cluster `commit confirmed`
+  passes the runtime-keyed preflight (`d.cluster != nil`,
+  `daemon_apply_commit.go:558`), records `firstCommit=true`, and persists
+  a NEW FirstCommit+cluster record with a CURRENT nonempty GuardedHash —
+  whose next recovery re-arms the same hybrid. **Consequence (r8-resolved)**:
+  the plan does NOT rely on the exclusion for safety — it converts every
+  reader uniformly, which covers the legacy path by construction — AND a
+  PERMANENT recovery invariant ships in this PR (work item H, §4): at
+  recovery, ANY FirstCommit record whose recovered active config declares
+  a cluster is reverted at Load (before manager construction), terminating
+  every recurrence generation at the next boot. Only the BROADER
   cluster-runtime lifecycle question (stop cluster comms in
   `enterBootstrapMode` when `d.cluster != nil`) defers to a follow-up
   issue (§10).
@@ -308,75 +343,179 @@ func (d *Daemon) finishStartup(ok bool) {
 
 // executeConfirmedRollback (daemon_apply_commit.go:629) — wait for the
 // outcome, then check it, THEN take applySem. Gate-before-applySem is
-// mandatory: the boot apply holds applySem across startup, so gating
-// while holding it would deadlock startup.
+// mandatory (r8-corrected rationale): the executor must NOT hold applySem
+// across its gate-wait — an early-fired timer would otherwise acquire the
+// semaphore before the phase-4 boot apply (`daemon_apply.go:50-51`, called
+// from the bringup phases) and park on the gate, the boot apply would
+// block on applySem, startup would never finish, and the gate would never
+// open: deadlock. (The v8 claim "the boot apply holds applySem across
+// startup" was wrong — it holds it only around the phase-4 apply; the
+// deadlock conclusion stands on the corrected reasoning, Codex m4a.)
 <-d.startupDone
 if !d.startupOK.Load() {
     slog.Warn("commit-confirmed rollback abandoned: daemon startup did not complete; " +
         "the persisted confirm record is re-resolved on the next boot (expired-window path)")
     return
 }
+_ = d.applySem.Acquire(context.Background(), 1)
+defer d.applySem.Release(1)
+// r8 shutdown-admission fence (Codex M1, verified): shutdown drains
+// applySem ONCE and releases it (`daemon_run_shutdown.go:50-53`) before
+// tearing down managers/dataplane (:95-230). A gate-released waiter that
+// loses the drain race would otherwise re-acquire applySem AFTER the
+// drain and run the full non-cancellable rollback against live teardown
+// (the timer goroutine is not wg-joined, `store_commit.go:815-823`).
+// runShutdownSequence publishes d.stopping BEFORE its applySem drain; the
+// executor re-checks the fence UNDER applySem so the drain's
+// acquire/release linearizes the admission decision: any executor
+// entering its critical section after the drain sees stopping=true and
+// abandons. The persisted confirm record is re-resolved on the next
+// boot's expired-window path, same as the startup-failure abandon.
+if d.stopping.Load() {
+    slog.Warn("commit-confirmed rollback abandoned: daemon shutdown in progress; " +
+        "the persisted confirm record is re-resolved on the next boot (expired-window path)")
+    return
+}
 ```
+
+- **`stopping` fence publication**: a new `stopping atomic.Bool` on
+  `Daemon` (no general shutdown flag exists today — only `resetting` for
+  factory reset, `daemon_apply_reset.go:18`), set by `runShutdownSequence`
+  BEFORE its applySem drain block. An executor already INSIDE its critical
+  section when shutdown starts is drained by the existing bounded drain
+  (documented tradeoff, `daemon_run_shutdown.go:46-49`); the fence orders
+  every later acquirer. `isResetting()` stays as the factory-reset guard;
+  the fence is the ordinary-shutdown sibling.
+- **Panic/unwind safety (r8 Codex m1)**: a `Run`-scoped
+  `defer d.finishStartup(false)` covers a panic out of a phase
+  (`daemon_run.go:799` bypasses the explicit failure returns at :828/:832)
+  and any future recovered unwind; `sync.Once` makes the deferred publish
+  a no-op after a successful `finishStartup(true)`. (A process-fatal panic
+  kills the waiters with the process; the defer makes the invariant local
+  rather than argued.)
 
 - **Success publish**: `d.finishStartup(true)` at the linearization point —
   the END of PHASE 5 (after `startGRPCServer` returns, before PHASE 6).
-  This is the ONLY point where a dispatched rollback is EXACTLY equivalent
-  to a remote commit arriving at first server contact: zero applies run
-  concurrent with server construction (r7 correction — the earlier
-  before-exposure point permitted a promoted rollback to race gRPC's
-  `ActiveConfig` snapshot at `daemon_run_servers.go:216`).
+  r8-corrected claim (Codex m4b): this is the point where ALL server
+  CONSTRUCTION is complete — zero applies can race server construction
+  (the r7 defect — the earlier before-exposure point permitted a promoted
+  rollback to race gRPC's `ActiveConfig` snapshot at
+  `daemon_run_servers.go:216`). It is NOT "first server contact": HTTP
+  already serves from `daemon_run.go:586-589`, before gRPC construction at
+  :599. Serving-path concurrency between a dispatched rollback and live
+  HTTP/gRPC requests is the ORDINARY steady-state apply-vs-request kind,
+  identical to any post-startup commit — not a new exposure.
 - **Failure publish**: `d.finishStartup(false)` from the startup-failure
   paths — placed inside `runStartupOrAbort`'s failure handling (or its
   immediate wrapper) so BOTH the plain-phase-error return AND the
   signal-abort return reach it (existing tests drive `runStartupOrAbort`
   directly, `startup_signal_5807_test.go:131`; the publish must live where
-  those paths reach it). The waiter wakes and abandons. No leak on any
-  path; no context-cancellation semantics involved.
-- **Signal-during-PHASE-5**: a rollback dispatched while a shutdown is
-  pending is ordinary apply-vs-shutdown behavior (applySem-ordered,
-  `daemon_run_shutdown.go:50`) — not a defect.
-- **Test-fixture migration**: existing executor fixtures construct
-  `Daemon` directly and must initialize the outcome (closed + OK):
-  `rollback_resync_test.go:31`, `bootstrap_rollback_test.go:24`,
-  `rollback_serialize_test.go:71,150,201,247`. A nil gate must never
-  silently mean "ready".
+  those paths reach it). On the signal-abort leg the publish fires BEFORE
+  `teardown(err)` is invoked, bounding the waiter's lifetime (a gated
+  waiter during teardown is harmless — it holds nothing — but abandoning
+  early is strictly cleaner). The waiter wakes and abandons. No leak on any
+  path; no context-cancellation semantics involved. Plus the Run-scoped
+  `defer d.finishStartup(false)` above for panic/unwind.
+- **Signal-during-PHASE-5 (r8-rewritten, Codex M1)**: a rollback released
+  by `finishStartup(true)` while a shutdown is pending is NOT safely
+  "applySem-ordered" — shutdown drains applySem once and releases it
+  (`daemon_run_shutdown.go:50-53`), so the waiter could re-acquire after
+  the drain and apply against live teardown. The `stopping` fence above
+  closes this: published before the drain, re-checked under applySem.
+- **Test-fixture migration (r8-completed, Codex m2 + Claude SMR m1)**:
+  existing executor fixtures construct `Daemon` directly and must
+  initialize the outcome (closed + OK): `rollback_resync_test.go:31,81`,
+  `bootstrap_rollback_test.go:24,74`, `rollback_serialize_test.go:71,150,
+  201,247` — v8 omitted `:81` and `:74`; both drive the executor
+  (`rollback_resync_test.go:85` direct call,
+  `bootstrap_rollback_test.go:82` registers + fires) and would hang on a
+  nil gate until the go-test timeout. ADDITIONALLY
+  `startup_signal_5807_test.go:118,157` construct bare `&Daemon{}` and
+  drive `runStartupOrAbort` directly — with the failure publish inside
+  that helper, a nil `startupDone` panics at `close(nil)`; these fixtures
+  initialize an OPEN gate (no waiter). A nil gate must never silently
+  mean "ready", and an uninitialized gate must never panic the failure
+  publish.
 - **Contract comments**: the "acquires applySem FIRST" lock-order notes at
   `store_commit.go:327-334` and `daemon_apply_commit.go:611-628` are
   reworded for the gate-before-applySem order.
 - Store-internal fallback (`performAutoRollback`, `store_commit.go:822-823`)
   is untouched — it is store-state-only, no daemon managers. (Executor
   dispatch is `store_commit.go:819-820`.)
-- Scope note: small companion fix inside the same PR (~40 LoC + tests),
+- Scope note: small companion fix inside the same PR (~55 LoC + tests —
+  gate + fence + defer),
   landed as a SEPARATE PREREQUISITE COMMIT in the same PR/stack (both r7
   reviewers) so it stays reviewable and bisectable ahead of the mechanical
   `dpCell` conversion.
 
-**Work item H — narrow legacy recovery guard (r6 counterexample follow-through;
-ships IN this PR per r7 adjudication).** The cross-upgrade path (§2 r6
-boundary) can boot a node into live-cluster-runtime + pending
-first-commit-rollback, and the timeout then rolls into
-bootstrap-with-cluster — a live-topology hybrid the repo's own preflight
-classifies as unsafe (`cluster_topology_preflight.go:27`). The atomic cell
-fixes field tearing on that path but not the lifecycle semantics. Guard, at
-confirm-record recovery (`store_persist.go` recovery path, BEFORE any
-manager construction):
+**Work item H — permanent FirstCommit+cluster recovery invariant,
+revert-at-Load semantics (r8-REDESIGNED; ships IN this PR).** The r6
+cross-upgrade boundary AND the r8 recurrence (§2, both verified) boot a
+node into live-cluster-runtime + pending first-commit-rollback, and the
+timeout rolls into bootstrap-with-cluster — a live-topology hybrid the
+repo's own preflight classifies as unsafe
+(`cluster_topology_preflight.go:27`). The atomic cell fixes field tearing
+on that path but not the lifecycle semantics. v8's guard design
+(keep-active, drop record) was broken twice over in r8: (a) placed before
+the expired branch it would keep an already-expired unconfirmed config
+whose window lapsed during downtime — reverting is exactly what the
+expired branch does safely today at Load, BEFORE any cluster manager is
+constructed (Claude SMR M1); (b) even for UNEXPIRED records,
+keep-active/drop-record silently converts an UNCONFIRMED config into a
+permanent one — the precise failure #4577 exists to prevent ("the
+operator never confirmed, so the unconfirmed config on disk must NOT
+stand", `store_persist.go:172-175`; contract at
+`pkg/configstore/README.md:417-449`) (Codex M2). The only rollback of
+this record class that is EVER safe is the Load-time one (the cluster
+runtime does not exist yet — `d.cluster` constructs in PHASE 3,
+`daemon_run_bringup.go:164`), so the window resolves EARLY, at recovery,
+by reverting — the operator's remaining confirm window is sacrificed for
+this narrow hybrid-generating class, loudly and on purpose. Guard, at
+confirm-record recovery (`recoverPendingConfirmLocked`,
+`store_persist.go:136-251`), placed AFTER the GuardedHash-mismatch branch
+(:159-165) AND AFTER the expired-during-downtime branch (:171-227) —
+expired records keep flowing through the existing branch untouched — and
+BEFORE the unexpired re-arm (:229+):
 
 ```go
-// A FirstCommit record whose recovered ACTIVE config declares a cluster
-// is a pre-topology-guard artifact: rolling it back would strand a live
-// cluster node in bootstrap (HA silently drops out). Resolve the window
-// as expired instead: keep the active config, drop the record, log loudly.
-if rec.FirstCommit && recoveredActiveHasCluster(rec) {
-    // resolve-as-expired: no re-arm, remove confirm.json, warn
+// PERMANENT invariant (r8): a FirstCommit record whose recovered ACTIVE
+// config declares a cluster cannot be safely rolled back post-boot: its
+// rollback target is the empty bootstrap tree, and executing that
+// rollback after d.cluster is constructed strands a live cluster runtime
+// in bootstrap (the r6/r8 hybrid — and a subsequent re-exit REGENERATES
+// a fresh FirstCommit+cluster record, §2 r8 recurrence). Re-arming is
+// what produces the hybrid; keeping the unconfirmed config would
+// silently confirm it (#4577). Resolve the window NOW, at the only safe
+// point — Load, before manager construction — by running the SAME revert
+// the expired branch's FirstCommit leg runs.
+if rec.FirstCommit && recoveredActiveHasCluster(s.active) {
+    // revert-at-Load: s.active = empty prevTree, s.compiled = nil,
+    // persistMarkerCommitted/everCommitted = false,
+    // writeActiveMarker(prevTree, false) with the #5473 durable-removal
+    // debt handling, candidate reset, journal + loud warn; NO re-arm.
 }
 ```
 
-Tests (configstore/daemon seams, no cluster needed): (i) legacy
-empty-`GuardedHash` FirstCommit+cluster record → guard fires (no re-arm,
-record removed, active config kept); (ii) matching nonempty-hash
-FirstCommit+cluster record (GuardedHash/preflight rollout interval) →
-guard fires; (iii) standalone `FirstCommit` record (no cluster) → normal
-re-arm + rollback proceeds unchanged. The BROADER cluster-runtime
+The implementation REUSES the expired branch's FirstCommit revert body
+(:177-184 + the shared persist/removal/candidate/journal tail) — factor
+it into a helper both branches call rather than duplicating it; the
+guard's observable end state is identical to an expired-window recovery.
+
+Tests (configstore/daemon seams, no cluster needed): (i) UNEXPIRED legacy
+empty-`GuardedHash` FirstCommit+cluster record → guard fires: active
+reverted to the empty tree, `everCommitted=false`, record removed (or
+removal debt retained on persist failure), NO re-arm, loud log; (ii)
+UNEXPIRED nonempty-hash FirstCommit+cluster record (the r8 recurrence
+generation) → guard fires identically; (iii) UNEXPIRED standalone
+FirstCommit record (no cluster) → normal re-arm + rollback proceeds
+unchanged; (iv) EXPIRED FirstCommit+cluster record → the existing expired
+branch handles it (revert to empty) and the guard does NOT double-fire
+(no guard log, single journal entry) — the r8 negative case both
+reviewers required; (v) recurrence test: synthesize the post-hybrid state
+(`everCommitted=false`, live `d.cluster`, bootstrap mode) → a cluster
+`commit confirmed` persists a fresh nonempty-hash FirstCommit record →
+recovery → guard fires — proving the invariant terminates the
+regeneration chain at the next boot. The BROADER cluster-runtime
 lifecycle question (should `enterBootstrapMode` stop cluster comms when
 `d.cluster != nil`) stays a follow-up issue.
 
@@ -421,6 +560,19 @@ func (a forwardingStatusDaemonDataPlane) CachedStatus() (dpuserspace.ProcessStat
   `server_show_forwarding.go:21-22`, `cli_show_chassis.go:59-60`, and are
   untouched); the now-dead `userspaceDataplaneStatus()` helper is removed;
   `userspaceDataplaneCachedStatus()` is retained.
+  **Deletion inventory (r8-completed, Codex m3 + Claude SMR m2 — all in
+  `daemon_forwarding_status.go`)**: the
+  `var _ fwdstatus.DataPlaneAccessor = forwardingStatusDaemonDataPlane{}`
+  assertion (:10 — the collapsed type no longer satisfies the interface;
+  the line fails to compile, forcing its removal), the
+  `forwardingStatusDaemonUserspaceDataPlane` wrapper type (:52-75 — its
+  `Status`/`CachedStatus` methods and the embedding), and the
+  `userspaceStatusProbe` interface (:83-87 — dead once the Status-capable
+  wrapper selection and `userspaceDataplaneStatus()` are gone);
+  `userspaceCachedStatusProbe` is retained. A NEW unit test asserts the
+  negative: the collapsed type must NOT satisfy
+  `fwdstatus.DataPlaneAccessor` (plain type-assertion test — the `var _`
+  idiom cannot express negation).
 
 ### Option B: eliminate the writer (write-once `d.dp` + degraded adapter)
 
@@ -471,16 +623,30 @@ coexistence) is deleted as incoherent (r1 B3).
 - `pkg/daemon/daemon.go`: `dpSlot`, `dpCell atomic.Pointer[dpSlot]`
   replacing `dp`; `dataplane()` / `setDataplane()` (kind-gated); field doc
   comment mirroring the `natPoolAlarm` contract (`daemon.go:211-223`).
+  PLUS the work-item-G state: `startupDone chan struct{}`,
+  `startupDoneOnce sync.Once`, `startupOK atomic.Bool`, `finishStartup`,
+  and the r8 `stopping atomic.Bool` shutdown-admission fence.
 - `pkg/daemon/daemon_forwarding_status.go`: single-method sampler-only
   adapter (§4 A1); `userspaceDataplaneStatus()` removed;
   `userspaceCachedStatusProbe` retained; `forwardingStatusDataplane()`
-  returns `fwdstatus.CachedStatusProvider`, nil iff `d.opts.NoDataplane`.
+  returns `fwdstatus.CachedStatusProvider`, nil iff `d.opts.NoDataplane`;
+  the §4 A1 deletion inventory (`var _` assertion, userspace wrapper,
+  `userspaceStatusProbe`) executed.
+- `pkg/daemon/daemon_apply_commit.go`: gate + fence checks in
+  `executeConfirmedRollback`; lock-order contract comments reworded.
+- `pkg/daemon/daemon_run.go` / `daemon_run_shutdown.go`: `finishStartup`
+  publish points (END-of-PHASE-5 success; `runStartupOrAbort` failure
+  handling; Run-scoped defer); `stopping` publication before the applySem
+  drain.
+- `pkg/configstore/store_persist.go` (r8 correction — work item H DOES
+  touch configstore): the permanent FirstCommit+cluster recovery guard +
+  the factored expired-branch FirstCommit revert helper.
 - `pkg/fwdstatus/sampler.go`: `CachedStatusProvider` interface; `NewSampler`
   + `Sampler.dp` retyped; `sample()` direct call.
 - `pkg/dataplane/retirement_boundary_canary_test.go`: matcher extension
   (incl. `*ast.IndexExpr` renderer support).
 - `pkg/daemon/daemon_dp_canary_test.go` (new): dpCell-access AST canary.
-- No other package touched. `pkg/grpcapi`, `pkg/cli`, `pkg/api` untouched.
+- `pkg/grpcapi`, `pkg/cli`, `pkg/api` untouched.
 
 ### 5.2 Writer conversion (5 sites — complete, both reviewers verified)
 
@@ -670,15 +836,28 @@ Preserved exactly:
 10. **Retirement boundary**: the canary's invariant (daemon holds a
     `dataplane.RuntimeDataPlane` built by `NewRuntimeDataPlane`) preserved
     through the redesigned matcher; both-direction canary self-tests (§4).
+11. **Shutdown-admission fence (r8)**: `stopping` is published BEFORE the
+    shutdown applySem drain and re-checked by the rollback executor UNDER
+    applySem — the drain's acquire/release linearizes admission, so no
+    rollback enters its critical section against live teardown. The
+    abandoned timer's persisted record re-resolves on the next boot's
+    expired-window path (same semantics as the startup-failure abandon).
+12. **#4577 confirm contract (r8)**: an unconfirmed config must NEVER
+    stand. Work item H's revert-at-Load honors it for the
+    FirstCommit+cluster class by resolving the window EARLY (revert
+    before manager construction) rather than by keeping the config; the
+    operator's remaining confirm window is sacrificed for this narrow
+    hybrid-generating class, loudly and on purpose. Expired records keep
+    the existing expired-branch behavior bit-for-bit.
 
 ## 8. Risk assessment
 
 | Class | Rating | Assessment |
 |---|---|---|
-| Behavioral regression | **MED** | Large but mechanical diff; compiler-enforced completeness + regenerated §5.4 table + the new dpCell canary. Real risks: (a) a §5.3 snapshot-boundary mistake; (b) canary redesign errors (mitigated by both-direction self-tests); (c) the fwdstatus narrowing touching `NewSampler` (contained: 1 prod caller + 2 test sites; full-suite gate). |
+| Behavioral regression | **MED** | Large but mechanical diff; compiler-enforced completeness + regenerated §5.4 table + the new dpCell canary. Real risks: (a) a §5.3 snapshot-boundary mistake; (b) canary redesign errors (mitigated by both-direction self-tests); (c) the fwdstatus narrowing touching `NewSampler` (contained: 1 prod caller + 2 test sites; full-suite gate); (d) work item H narrows commit-confirmed recovery semantics for the FirstCommit+cluster class (revert-at-Load vs re-arm) — deliberate, loudly logged, covered by five dedicated tests including the expired-record negative case. |
 | Lifetime / borrow | **LOW** | Immutable slots; captured references keep backends alive exactly as today. No FFI/Rust interaction. |
 | Performance regression | **LOW** | One atomic load + indirection per control-plane read (1 Hz sampler, request rate, watchdog 2/s, HA ≤15/s). One small allocation per Store, ≤5/lifetime. No per-packet Go code. |
-| Architectural mismatch | **LOW** | #2116 `atomic.Pointer` precedent; daemon atomics-for-publication idiom; no dataplane-lifecycle redesign (Option B rejected); canary redesign extends the existing boundary-guard pattern. Work item G IS a deliberate lifecycle change (startup-outcome gating of the rollback executor) — scoped, ~40 LoC + tests, with its own invariants: startup-outcome handled on EVERY exit path (no goroutine leak on failure leg, no rollback against partial init); gate-before-applySem ordering (no deadlock vs the boot apply); timer-retention on abandon is INTENTIONAL (the persisted confirm record is re-resolved by the next boot's expired-window path, `store_persist.go:225-228`). |
+| Architectural mismatch | **LOW** | #2116 `atomic.Pointer` precedent; daemon atomics-for-publication idiom; no dataplane-lifecycle redesign (Option B rejected); canary redesign extends the existing boundary-guard pattern. Work item G IS a deliberate lifecycle change (startup-outcome gating of the rollback executor + the r8 shutdown-admission fence) — scoped, ~55 LoC + tests, with its own invariants: startup-outcome handled on EVERY exit path (no goroutine leak on failure leg, no rollback against partial init, panic-safe via the Run-scoped defer); gate-before-applySem ordering (no executor-held applySem across the gate-wait — that is what deadlocks the phase-4 boot apply); fence-before-drain ordering (no rollback admitted against live teardown); timer-retention on abandon is INTENTIONAL (the persisted confirm record is re-resolved by the next boot's expired-window path, `store_persist.go:225-228`). Work item H reuses the expired-branch FirstCommit revert body — no new persistence semantics, no new failure modes beyond the class it terminates. |
 
 ## 9. Test plan
 
@@ -781,11 +960,29 @@ Preserved exactly:
      intact AND a LATE-MANAGER milestone initialized (`snmpBootReady`
      true / LLDP manager non-nil — a close placed immediately after
      phase 4 fails this).
-   - Work item H tests (configstore/daemon seams, no cluster): (i) legacy
-     empty-`GuardedHash` FirstCommit+cluster record → guard fires (no
-     re-arm, record removed, active config kept); (ii) matching
-     nonempty-hash FirstCommit+cluster record → guard fires; (iii)
-     standalone `FirstCommit` record → normal re-arm + rollback.
+     (d) SHUTDOWN-FENCE test (r8, Codex M1): with the gate OPEN
+     (post-startup), publish `d.stopping` (mirroring
+     `runShutdownSequence`'s pre-drain publication), fire the executor —
+     it must pass the gate, acquire applySem, observe the fence, and
+     ABANDON with zero `PromoteRollback`/apply side effects; the persisted
+     record is left for the next boot. Second leg: an executor already
+     inside its critical section blocks the drain until it releases
+     (pre-existing bounded-drain behavior, unchanged).
+   - Work item H tests (r8-reworked; configstore/daemon seams, no
+     cluster): (i) UNEXPIRED legacy empty-`GuardedHash`
+     FirstCommit+cluster record → guard reverts AT LOAD: active = empty
+     tree, `everCommitted=false`, record removed (or removal debt
+     retained), NO re-arm, loud log; (ii) UNEXPIRED nonempty-hash
+     FirstCommit+cluster record (recurrence generation) → identical
+     revert; (iii) UNEXPIRED standalone FirstCommit record → normal
+     re-arm + rollback unchanged; (iv) EXPIRED FirstCommit+cluster
+     record → existing expired branch reverts, guard does NOT double-fire
+     (single journal entry, no guard log) — the mandatory already-expired
+     negative case (Codex M2 / Claude SMR M1); (v) recurrence test:
+     synthesize the post-hybrid state (`everCommitted=false`, live
+     `d.cluster`, bootstrap mode) → cluster `commit confirmed` persists a
+     fresh nonempty-hash FirstCommit record → recovery → guard fires
+     (Codex M3).
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
    `setDataplane`) and `daemon_forwarding_status_test.go` (rewrite against
    the narrowed adapter: `ProjectsMapStats`/`UsesUserspaceStatusAdapter`
@@ -831,14 +1028,14 @@ Preserved exactly:
 - Full-repo `go test -race` wiring.
 - **Broader cluster-runtime lifecycle question (follow-up issue, filed at
   /engineer time)**: should `enterBootstrapMode` stop cluster comms when
-  `d.cluster != nil`? The NARROW recovery guard (work item H) ships in
-  this PR and prevents the bootstrap-with-cluster state going forward;
-  the lifecycle redesign is a pre-existing policy question, not a `d.dp`
-  publication concern.
+  `d.cluster != nil`? The permanent recovery invariant (work item H) ships
+  in this PR and prevents the bootstrap-with-cluster state from persisting
+  past the next boot; the lifecycle redesign is a pre-existing policy
+  question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r8)
+## 11. Open questions for adversarial review (r9)
 
-Resolved in v2-v8 (for the record): A2 deletion; atomic cell choice;
+Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
 policy-invalidate APPLY-class; HA smoke gates mandatory + specific;
 typed-nil kind-gated guard over all nillable kinds with a table-driven
@@ -848,20 +1045,37 @@ completeness AND exact count (134 = 5 + 129) with consistent per-row
 exposure cells and narrowed preamble; deterministic real-sampler barrier
 as a two-sided gate with a bounded sustained-quiescence teardown;
 bootstrap/cluster exclusion scoped to current-version records with the r6
-cross-upgrade coexistence documented AND prevented going forward by work
-item H; RACE-1 scoped to the pre-publication watcher chain INCLUDING the
-blackhole→readiness hop; RACE-3 documented; the pre-existing
-startup-ordering defect addressed by work item G — `finishStartup(ok)`
-Once-guarded outcome publisher (no double-close, no leak on any exit
-path, no rollback against partial init), linearization at END of PHASE 5
-(exactly remote-commit-equivalent), constructor initialization,
-fixture migration (all four executor fixture files), contract-comment
-updates, gate tests with entry hook + dual real failure paths +
-backend-factory seam + phase-level orchestration + late-manager
-milestone; work item G lands as a separate prerequisite commit in the
-same PR/stack (OQ6); the narrow legacy recovery guard ships IN this PR
-(OQ7 — adjudicated for Codex over AGY); broader cluster-lifecycle work
-defers to a follow-up.
+cross-upgrade coexistence documented; RACE-1 scoped to the
+pre-publication watcher chain INCLUDING the blackhole→readiness hop;
+RACE-3 documented; the pre-existing startup-ordering defect addressed by
+work item G — `finishStartup(ok)` Once-guarded outcome publisher (no
+double-close, no leak on any exit path, no rollback against partial
+init), linearization at END of PHASE 5 (all server construction complete;
+serving concurrency is ordinary steady-state), constructor
+initialization, fixture migration (ALL executor fixtures —
+`rollback_resync_test.go:31,81`, `bootstrap_rollback_test.go:24,74`,
+`rollback_serialize_test.go:71,150,201,247` — plus open-gate
+initialization for the `runStartupOrAbort` fixtures
+`startup_signal_5807_test.go:118,157`), contract-comment updates, gate
+tests with entry hook + dual real failure paths + backend-factory seam +
+phase-level orchestration + late-manager milestone; r8 additions: the
+`stopping` shutdown-admission fence (published before the applySem drain,
+re-checked under applySem — closing the gate-release-vs-teardown race
+Codex proved against the v8 "applySem-ordered" claim), the Run-scoped
+`defer d.finishStartup(false)` panic/unwind backstop, and the corrected
+gate-before-applySem rationale (the executor must not hold applySem
+ACROSS its gate-wait); work item G lands as a separate prerequisite
+commit in the same PR/stack (OQ6); work item H REDESIGNED in v9 as a
+PERMANENT recovery invariant with revert-at-Load semantics — placed after
+the expired branch (expired records untouched), reusing the
+expired-branch FirstCommit revert body, terminating the r8
+current-version regeneration chain, honoring #4577 (an unconfirmed
+config never stands) — with five tests including the expired-record
+negative case and the recurrence test; broader cluster-lifecycle work
+defers to a follow-up; fwdstatus deletion inventory completed (`var _`
+assertion, userspace wrapper, `userspaceStatusProbe`) with a
+negative-satisfaction unit test; §5.1 package-touch list corrected
+(work item H touches `pkg/configstore`).
 
 Still open:
 
