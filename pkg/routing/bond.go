@@ -179,30 +179,62 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 		if trackedSig, kept := b.bonds[name]; kept {
 			// Survived the delete pass.
 			if trackedSig == sig {
-				// Unchanged in the desired config. Verify the kernel device
-				// is actually PRESENT before declaring convergence. If it is
-				// still there, bring it up idempotently (a no-op on an
-				// already-up bond, matching the XFRM keep path); zero
-				// LinkDel/LinkAdd/LinkSetMaster, so no flap.
+				// Unchanged in the desired config. Verify the kernel device is
+				// actually PRESENT *and is a bond* before declaring convergence.
+				// If a real bond is still there, bring it up idempotently (a
+				// no-op on an already-up bond, matching the XFRM keep path);
+				// zero LinkDel/LinkAdd/LinkSetMaster, so no flap.
+				//
+				// #6402: the type re-assertion is REQUIRED here, symmetric with
+				// the createLocked adopt gate. LinkByName resolves the NAME, not
+				// the type, so this KEEP fast-path must NOT bring up + `continue`
+				// on whatever wears the name — that would re-open the silent
+				// LAG-absence bug the adopt gate closes, on two reachable
+				// transitions:
+				//   1. A tracked bond (b.bonds[name]==sig) is replaced by a
+				//      same-name FOREIGN (non-bond) link. The KEEP path would
+				//      bring the foreign link up and report convergence while the
+				//      LAG is gone.
+				//   2. The delete-fail loop: createLocked found a foreign link,
+				//      deleteLocked FAILED (fail-closed for that reconcile) but
+				//      tracking only clears after a SUCCESSFUL LinkDel, so
+				//      b.bonds[name] is still == sig. Without this gate the next
+				//      reconcile's KEEP path would bring the foreign link up and
+				//      `continue`, never re-entering createLocked, never retrying
+				//      the delete — false convergence forever.
+				// So a non-bond link falls through to the recreate path below,
+				// which re-enters createLocked; its #6402 adopt gate reclaims the
+				// foreign link (delete+recreate) or fails closed again on a delete
+				// error, so b.bonds[name] is never left == sig with a foreign link
+				// presented as satisfied.
 				if link, err := b.ops.LinkByName(name); err == nil {
-					if err := b.ops.LinkSetUp(link); err != nil {
-						slog.Warn("failed to bring up existing bond", "name", name, "err", err)
-						errs = append(errs, fmt.Errorf("bond %s: bring up existing: %w", name, err))
+					if _, isBond := link.(*netlink.Bond); isBond {
+						if err := b.ops.LinkSetUp(link); err != nil {
+							slog.Warn("failed to bring up existing bond", "name", name, "err", err)
+							errs = append(errs, fmt.Errorf("bond %s: bring up existing: %w", name, err))
+						}
+						continue
 					}
-					continue
+					// A same-name foreign link wears the bond's name — do NOT
+					// bring it up or `continue`. Fall through to the recreate
+					// path below.
 				}
 				// The tracked bond has VANISHED from the kernel (deleted out
 				// from under the daemon — an operator `ip link del`, a driver
-				// reset, or a transient kernel failure) yet is still desired
-				// with an identical signature. Treating this as "unchanged"
-				// is false convergence: the reconciler reports success while
-				// the bond stays down forever (#5703 / codex-review-182 M29).
-				// RECREATE it via createLocked, which finds no kernel device
-				// (LinkByName miss) and takes the create+enslave path,
-				// tracking the ACTUAL realized member set (a still-absent
-				// member yields a partial sig for a later in-place completion,
-				// #5261). A create failure is aggregated, not swallowed.
-				slog.Warn("tracked bond missing from kernel; recreating", "name", name)
+				// reset, or a transient kernel failure) OR has been REPLACED by
+				// a same-name foreign link (#6402), yet is still desired with an
+				// identical signature. Treating either as "unchanged" is false
+				// convergence: the reconciler reports success while no bond
+				// carries the fabric/RETH members (#5703 / codex-review-182 M29,
+				// extended to the foreign-replacement case in #6402). RECREATE
+				// via createLocked: on a VANISHED bond it finds no kernel device
+				// (LinkByName miss) and takes the create+enslave path; on a
+				// foreign replacement its adopt gate reclaims the link
+				// (delete+recreate) or fails closed on a delete error. Either way
+				// it tracks the ACTUAL realized member set (a still-absent member
+				// yields a partial sig for a later in-place completion, #5261). A
+				// create/delete failure is aggregated, not swallowed.
+				slog.Warn("tracked bond missing or replaced by a foreign link; recreating", "name", name)
 				if err := b.createLocked(name, ifcByName[name], sig); err != nil {
 					errs = append(errs, err)
 				}
@@ -270,25 +302,53 @@ func (b *bondManager) createLocked(name string, ifc *config.InterfaceConfig, sig
 	//     KEEP-ing a partial bond forever.
 	// No LinkDel/LinkAdd is issued on the adopt path — the same code path
 	// serves both a restart adoption and an in-place partial completion.
+	//
+	// #6402: the adopt path must FIRST re-assert the found link is actually a
+	// bond before adopting it. LinkByName resolves the NAME, not the type: a
+	// same-name FOREIGN link (an external actor's device, or a leftover of a
+	// different type after a name collision) would otherwise be brought up and
+	// tracked as a satisfied bond while NO bond device carries the fabric/RETH
+	// members — the LAG silently does not exist yet the reconcile reports
+	// success. This is the last member of the post-create/adopt readback
+	// identity-assertion family: the #6396 create readback re-asserts
+	// *netlink.Bond, xfrm/VRF gate both create and adopt, and this closes the
+	// bond adopt gap. Reclaim the name via delete+recreate (mirroring the xfrm
+	// #5523 adopt gate and the vrfTable→recreate adopt path) rather than
+	// adopting the foreign link. If the delete fails the kernel link is still
+	// present, so a LinkAdd below would EEXIST — surface the delete failure so
+	// the commit fails closed and the next reconcile retries the delete first,
+	// exactly like the #5119 changed-signature and xfrm #5310 recreate paths.
 	if existing, err := b.ops.LinkByName(name); err == nil {
-		var errs []error
-		trackSig := sig
-		observed, ok := b.observedMembers(existing)
-		if ok && !membersCoverDesired(ifc, observed) {
-			enslaved, memberErrs := b.enslaveMembers(name, existing, ifc.FabricMembers, observed)
-			errs = append(errs, memberErrs...)
-			for _, m := range enslaved {
-				observed[m] = true
+		if _, isBond := existing.(*netlink.Bond); isBond {
+			var errs []error
+			trackSig := sig
+			observed, ok := b.observedMembers(existing)
+			if ok && !membersCoverDesired(ifc, observed) {
+				enslaved, memberErrs := b.enslaveMembers(name, existing, ifc.FabricMembers, observed)
+				errs = append(errs, memberErrs...)
+				for _, m := range enslaved {
+					observed[m] = true
+				}
+				trackSig = sigWithMembers(sig, observed)
 			}
-			trackSig = sigWithMembers(sig, observed)
+			b.bonds[name] = trackSig
+			slog.Debug("bond already exists", "name", name, "complete", trackSig == sig)
+			if err := b.ops.LinkSetUp(existing); err != nil {
+				slog.Warn("failed to bring up existing bond", "name", name, "err", err)
+				errs = append(errs, fmt.Errorf("bond %s: bring up existing: %w", name, err))
+			}
+			return errors.Join(errs...)
 		}
-		b.bonds[name] = trackSig
-		slog.Debug("bond already exists", "name", name, "complete", trackSig == sig)
-		if err := b.ops.LinkSetUp(existing); err != nil {
-			slog.Warn("failed to bring up existing bond", "name", name, "err", err)
-			errs = append(errs, fmt.Errorf("bond %s: bring up existing: %w", name, err))
+		// A same-name FOREIGN (non-bond) link wears the bond's name. Do NOT
+		// adopt it: reclaim the name via delete+recreate and fall through to
+		// the create path below. On a delete failure the kernel link is still
+		// present, so a LinkAdd below would EEXIST — return the delete error so
+		// the commit fails closed and the next reconcile retries the delete.
+		slog.Info("link with bond name is not a bond interface, recreating",
+			"name", name, "type", existing.Type())
+		if err := b.deleteLocked(name); err != nil {
+			return err
 		}
-		return errors.Join(errs...)
 	}
 
 	bond := netlink.NewLinkBond(netlink.LinkAttrs{Name: name})
