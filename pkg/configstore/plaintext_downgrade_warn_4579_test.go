@@ -5,11 +5,37 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/fsatomic"
 )
+
+// syncBuffer is a bytes.Buffer whose Write and String share a mutex so a
+// leaked background goroutine still logging through slog.Default() cannot
+// race the test's read (#6446). captureWarnLogs installs the buffer as the
+// process-global slog default; a persistRetryLoop goroutine leaked from an
+// earlier test (store_persist.go — intentionally no close signal) keeps
+// calling slog.Warn() and writes through the newly-installed handler. slog's
+// handler mutex only serializes writers among themselves; the test reads the
+// raw buffer, so the read needs the same lock as the write to be safe.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // masterPwTree builds the minimal config tree that declares a
 // master-password pseudorandom-function — the leaf masterPasswordPRF
@@ -30,14 +56,17 @@ func masterPwTree() *config.ConfigTree {
 }
 
 // captureWarnLogs redirects slog to a buffer at Warn level for the test's
-// lifetime and returns the buffer.
-func captureWarnLogs(t *testing.T) *bytes.Buffer {
+// lifetime and returns the buffer. The buffer is mutex-guarded (syncBuffer)
+// because slog.SetDefault installs it process-globally: a leaked
+// persistRetryLoop goroutine from an earlier test writes through the handler
+// concurrently with the test's read (#6446).
+func captureWarnLogs(t *testing.T) *syncBuffer {
 	t.Helper()
-	var buf bytes.Buffer
+	buf := &syncBuffer{}
 	old := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(old) })
-	return &buf
+	return buf
 }
 
 // TestPlaintextDowngradeWarn_4579 pins the #4579 A4-06 hardening: reading a

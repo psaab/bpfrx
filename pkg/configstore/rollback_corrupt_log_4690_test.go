@@ -1,7 +1,6 @@
 package configstore
 
 import (
-	"bytes"
 	"log/slog"
 	"os"
 	"strings"
@@ -49,9 +48,13 @@ func TestLoadRollbackHistoryCorruptFileLogsPositionOnly(t *testing.T) {
 		t.Fatal("test setup: corrupt config must fail to parse")
 	}
 
-	var buf bytes.Buffer
+	// syncBuffer (not a raw bytes.Buffer): the slog sink is installed
+	// process-globally, so a persistRetryLoop goroutine leaked from an earlier
+	// test writes through the handler while this test reads via String() —
+	// the -race read/write must share a lock (#6446).
+	buf := &syncBuffer{}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)
 
 	s.loadRollbackHistory()

@@ -1,3 +1,33 @@
+## 2026-07-23 — #6446: fix -race data race on configstore test log buffer
+
+- **Timestamp**: 2026-07-23 (fix/6446-configstore-race)
+- **Action**: Guard every test-installed slog sink in pkg/configstore with a
+  mutex-backed syncBuffer. A test installs a bytes.Buffer as the
+  process-global slog.Default() and reads it via String(); a persistRetryLoop
+  goroutine leaked from an earlier test (store_persist.go, intentionally no
+  close signal) keeps calling slog.Warn() through the newly-installed handler
+  — the -race detector fires on that read/write. slog's handler mutex only
+  serializes writers among themselves; the raw read bypasses it, so syncBuffer
+  shares one lock across Write and String.
+- **Round 1**: migrated captureWarnLogs (covers the #4579 + #4705 tests) to
+  return *syncBuffer.
+- **Round 2 (Codex MERGE-NEEDS-MAJOR fold)**: the same race class survived in
+  two more tests that installed their OWN raw bytes.Buffer as slog.Default():
+  nodeid_lenient_test.go (now reuses captureWarnLogs, Warn level) and
+  rollback_corrupt_log_4690_test.go (inline syncBuffer to keep its Debug
+  level + defer). Package-wide grep confirms NO raw &buffer slog sink remains
+  (journal_compat_test.go's sb is a strings.Builder writing a file, not a
+  sink).
+- **Validation**: RAW-master (raw bytes.Buffer) reproduced firsthand — full
+  `-race -count=5` = 10 DATA RACE + FAIL (4579/4705 readers); a dense-writer
+  reproducer (permanently failing 1ms-backoff retry loop) fired 9 races
+  naming nodeid_lenient_test.go:47 and rollback_corrupt_log_4690_test.go:59.
+  WITH the fix that same reproducer is clean; full-package `-race -count=15`
+  = 0 races, PASS. build/vet clean; full `go test ./...` for regressions.
+- **File(s)**: pkg/configstore/plaintext_downgrade_warn_4579_test.go,
+  pkg/configstore/nodeid_lenient_test.go,
+  pkg/configstore/rollback_corrupt_log_4690_test.go
+
 ## 2026-07-23 — #6426: decompose pkg/dataplane compileZones god-function
 
 - **Timestamp**: 2026-07-23 (refactor/6426-compilezones)
