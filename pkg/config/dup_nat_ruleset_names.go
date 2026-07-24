@@ -27,26 +27,39 @@ type dupNATRuleSet struct {
 // rule-SET axis (#6454).
 //
 // A NAT rule-set name is its operational identity: the from/to scope binding
-// and, for source / destination / static, the natType/ruleSet/rule counter
-// namespace (pkg/dataplane/compiler_nat.go NATCounterKey — keyed by natType so
-// the SAME rule-set name across DIFFERENT nat types is a distinct namespace and
-// legitimate, but the same name WITHIN one nat type collides). Two same-named
-// rule-sets do NOT reduce to last-writer-wins like a #5180 hierarchical block —
-// they BOTH survive: compileNATSource / compileNATDestination / compileNATStatic
-// / compileNAT64 each APPEND the rule-set (sec.NAT.Source / Destination.RuleSets
-// / Static / NAT64), so both compile as separate first-match tables sharing one
-// identity and per-rule telemetry MERGES across them (for the counted natTypes),
-// with show / counter surfaces unable to disambiguate their rules. For a
-// counter-less nat64 rule-set the name is still the show-surface identity, so
-// the diagnostic is deliberately type-agnostic (it never claims a per-rule
-// counter) — the genuine, type-independent defect is the shared name identity.
+// and the CLI show key. The name is UNIQUE per nat type but reusable ACROSS nat
+// types — Junos gives source / destination / static / nat64 independent name
+// spaces (NATCounterKey in pkg/dataplane/compiler_nat.go is natType-prefixed for
+// the counted types), so the same rule-set name in two DIFFERENT nat types is a
+// distinct identity and legitimate; only the same name WITHIN one nat type
+// collides. Two same-named rule-sets do NOT reduce to last-writer-wins like a
+// #5180 hierarchical block — they BOTH survive: compileNATSource /
+// compileNATDestination / compileNATStatic / compileNAT64 each APPEND the
+// rule-set (sec.NAT.Source / Destination.RuleSets / Static / NAT64), never
+// merging by name, so both compile as separate first-match tables sharing one
+// name. The operator authored what they read as one rule-set; it compiles to
+// two, evaluated in sequence. The CLI named-rule-set show lookup (e.g.
+// showNATSourceRuleSet in pkg/cli/cli_show_nat.go) returns on the FIRST name
+// match, so the second same-named rule-set — and its rules — is invisible on
+// that surface and the operator cannot disambiguate the two.
+//
+// This is NOT a per-rule counter merge: NATCounterKey INCLUDES the rule name, so
+// the disjoint rules this gate uniquely catches (rule R1 in the first RS, rule
+// R2 in the second) get DISTINCT counter keys and never share a hit counter — a
+// SAME rule name in both rule-sets is caught first by the #5649 rule-NAME gate.
+// The genuine, type-independent defect is the shared rule-set NAME identity, so
+// the diagnostic is deliberately type-agnostic and never claims a per-rule
+// counter (a nat64 rule-set is counter-less anyway).
 //
 // Runs PRE-expansion on top-level `security` stanzas only, exactly like
 // validateDuplicateNATRuleNamesAST (#5649) and validateDuplicateNamedBlockAST
 // (#5180): apply-groups DEEP-MERGES a same-named rule-set rather than
 // duplicating it, and a rule-set authored once via flat `set` reuses its
 // rule-set node (tree.SetPath merges), so only a directly-authored hierarchical
-// duplicate reaches here. The seen-set is keyed by (natType, ruleSet) and
+// duplicate reaches here. (Two limitations shared with the #5649 / #5180
+// siblings — a duplicate authored ENTIRELY inside an applied group, and a
+// quoted-empty rule-set name — bypass this top-level-only pre-expansion scan and
+// are tracked family-wide in #6455.) The seen-set is keyed by (natType, ruleSet) and
 // unioned across repeated `security` / `nat` / sub-block stanzas — compileNAT
 // (#3915) merges those repeats — so a rule-set name split across two `source {}`
 // blocks is caught too. Crucially the dedup is at the AST rule-set-INSTANCE

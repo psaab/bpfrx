@@ -9,22 +9,34 @@ import (
 // type (source/destination/static/nat64) BOTH survive — compileNATSource /
 // compileNATDestination / compileNATStatic / compileNAT64 each APPEND the
 // rule-set (they never merge by name), so both compile as separate first-match
-// tables sharing one operational identity (the rule-set name). For the counted
-// natTypes that identity is also the shared natType/ruleSet/rule counter
-// namespace, so per-rule telemetry merges and show/counter surfaces cannot
-// disambiguate; a counter-less nat64 rule-set still shares its show-surface
-// name identity. validateDuplicateNATRuleSetNamesAST rejects this at strict
-// commit and warns on the tolerant load path (#1960).
+// tables sharing one name. The operator authored what they read as one
+// rule-set; it compiles to two, evaluated in sequence, and the CLI
+// named-rule-set show lookup (showNATSourceRuleSet, pkg/cli/cli_show_nat.go)
+// returns on the FIRST name match — so the second same-named rule-set and its
+// rules are invisible on that surface and the operator cannot disambiguate the
+// two. This is NOT a per-rule counter merge: NATCounterKey includes the rule
+// name, so the disjoint rules this gate uniquely catches get distinct counter
+// keys (a SAME rule name in both is caught first by the #5649 rule-NAME gate).
+// validateDuplicateNATRuleSetNamesAST rejects this at strict commit and warns on
+// the tolerant load path (#1960).
 //
-// This is the rule-SET axis one level above the #5649 rule-NAME gate. The
+// This is the rule-SET axis one level above the #5649 rule-NAME gate. The reject
 // fixtures use DISJOINT rule names inside each duplicate rule-set so the #5649
 // gate (which runs first, keyed by (natType, ruleSet, rule)) does NOT fire —
 // control reaches THIS gate.
 //
+// Both the reject AND the accept tests drive the PUBLIC compile entry points
+// (CompileConfig / CompileConfigLenient), not the private validator, so the
+// false-positive guarantee (a #3096 bracket-list-scoped rule-set, a cross-type
+// name reuse, a flat-set merge) is bound through the REAL commit path — a future
+// change to the compile-path expansion that reintroduced a false-positive would
+// turn an accept test RED.
+//
 // RED-on-revert: neutralize the gate so it never records a duplicate (guard the
 // `seen[key]` detection with `&& false`, keeping the fmt/sort references and
 // therefore the imports live — a clean assertion RED, not a build break). The
-// strict sub-tests then no longer see a #6454 error and go RED.
+// strict sub-tests then no longer see a #6454 error and go RED; the accept
+// sub-tests still compile cleanly (the gate never fired for them either way).
 
 // parseHier6454 parses a hierarchical (brace-delimited) config via NewParser —
 // the correct tool for a hierarchical duplicate block. Flat `set` MERGES a
@@ -52,6 +64,19 @@ func setTree6454(t *testing.T, cmds []string) *ConfigTree {
 		}
 	}
 	return tree
+}
+
+// countSourceRuleSets6454 returns how many compiled source NAT rule-sets carry
+// the given name (a single authored rule-set may legitimately Cartesian-expand
+// into several same-named entries via #3096 scope lists).
+func countSourceRuleSets6454(cfg *Config, name string) int {
+	n := 0
+	for _, rs := range cfg.Security.NAT.Source {
+		if rs.Name == name {
+			n++
+		}
+	}
+	return n
 }
 
 // TestDuplicateNATRuleSetNameRejected is the #6454 RED-on-revert proof: strict
@@ -204,9 +229,11 @@ func TestDuplicateNATRuleSetNameNat64NotCounter(t *testing.T) {
 
 // TestDuplicateNATRuleSetNameLenientWarns proves the tolerant path (Load /
 // peer-sync) downgrades the reject to a warning so an already-persisted or
-// peer-synced config still boots through (#1960 class).
+// peer-synced config still boots through (#1960 class). Both halves drive the
+// public entry points: CompileConfig (strict → hard error) and
+// CompileConfigLenient (tolerant → no hard error + the #6454 warning surfaced).
 func TestDuplicateNATRuleSetNameLenientWarns(t *testing.T) {
-	tree := parseHier6454(t, `security {
+	const cfg = `security {
     nat {
         source {
             rule-set RS {
@@ -223,54 +250,64 @@ func TestDuplicateNATRuleSetNameLenientWarns(t *testing.T) {
             }
         }
     }
-}`)
+}`
 
-	// Strict: hard error.
-	if _, err := validateDuplicateNATRuleSetNamesAST(tree, false); err == nil {
-		t.Fatal("strict validator must reject the duplicate rule-set name")
+	// Strict public path: hard error naming the rule-set and #6454.
+	if _, err := CompileConfig(parseHier6454(t, cfg)); err == nil {
+		t.Fatal("strict CompileConfig must reject the duplicate rule-set name")
 	}
 
-	// Lenient: no error, one warning that names the rule-set and references #6454.
-	warnings, err := validateDuplicateNATRuleSetNamesAST(tree, true)
+	// Tolerant public path: no hard error, and the #6454 warning is surfaced on
+	// cfg.Warnings (the runtime keeps the historical two-table behavior).
+	lenientCfg, err := CompileConfigLenient(parseHier6454(t, cfg))
 	if err != nil {
-		t.Fatalf("lenient validator must not error, got: %v", err)
+		t.Fatalf("CompileConfigLenient must not hard-fail on a duplicate rule-set name, got: %v", err)
 	}
-	if len(warnings) != 1 {
-		t.Fatalf("lenient validator must emit exactly one warning, got %d: %v", len(warnings), warnings)
-	}
-	for _, want := range []string{"RS", "6454"} {
-		if !strings.Contains(warnings[0], want) {
-			t.Fatalf("warning should mention %q, got: %v", want, warnings[0])
+	found := false
+	for _, w := range lenientCfg.Warnings {
+		if strings.Contains(w, "rule-set") && strings.Contains(w, "RS") && strings.Contains(w, "6454") {
+			found = true
+			break
 		}
+	}
+	if !found {
+		t.Fatalf("lenient compile must warn naming the duplicate rule-set + #6454, warnings: %v", lenientCfg.Warnings)
 	}
 }
 
-// TestDuplicateNATRuleSetNameNoFalsePositive guards the gate's scope: distinct
-// rule-set names, the SAME rule-set name in two DIFFERENT nat types (a distinct
-// natType namespace — the counter key is prefixed by natType), a single
-// rule-set carrying a bracket list of from-scopes that Cartesian-expands into
-// multiple same-named NATRuleSet objects downstream (#3096, one AST instance —
-// NOT a duplicate), and the flat-set form (which MERGES a repeated rule-set onto
-// one node) must all pass strict.
+// TestDuplicateNATRuleSetNameNoFalsePositive guards the gate's scope through the
+// PUBLIC compile path (CompileConfig, strict): distinct rule-set names, the SAME
+// rule-set name in two DIFFERENT nat types (a distinct natType namespace — the
+// counter key is prefixed by natType), a single rule-set carrying a bracket list
+// of from-scopes that Cartesian-expands into multiple same-named NATRuleSet
+// objects downstream (#3096, one AST instance — NOT a duplicate), and the
+// flat-set form (which MERGES a repeated rule-set onto one node) must all commit
+// cleanly with the expected rule-sets present.
 func TestDuplicateNATRuleSetNameNoFalsePositive(t *testing.T) {
 	t.Run("distinct rule-set names in one nat type", func(t *testing.T) {
-		tree := parseHier6454(t, `security {
+		cfg, err := CompileConfig(parseHier6454(t, `security {
     nat {
         source {
             rule-set RS_A { rule R1 { then { source-nat { interface; } } } }
             rule-set RS_B { rule R1 { then { source-nat { off; } } } }
         }
     }
-}`)
-		if _, err := validateDuplicateNATRuleSetNamesAST(tree, false); err != nil {
-			t.Fatalf("distinct rule-set names must pass, got: %v", err)
+}`))
+		if err != nil {
+			t.Fatalf("distinct rule-set names must commit, got: %v", err)
+		}
+		if got := countSourceRuleSets6454(cfg, "RS_A"); got != 1 {
+			t.Fatalf("want 1 source rule-set RS_A, got %d", got)
+		}
+		if got := countSourceRuleSets6454(cfg, "RS_B"); got != 1 {
+			t.Fatalf("want 1 source rule-set RS_B, got %d", got)
 		}
 	})
 
 	t.Run("same rule-set name in two different nat types", func(t *testing.T) {
-		// source RS keys "source\x00RS", static RS keys "static\x00RS": distinct
-		// namespaces (the counter key is natType-prefixed), so this is legitimate.
-		tree := parseHier6454(t, `security {
+		// source RS and static RS are distinct namespaces (the counter key is
+		// natType-prefixed), so both must commit — one entry in each slice.
+		cfg, err := CompileConfig(parseHier6454(t, `security {
     nat {
         source {
             rule-set RS { rule R1 { then { source-nat { interface; } } } }
@@ -285,19 +322,32 @@ func TestDuplicateNATRuleSetNameNoFalsePositive(t *testing.T) {
             }
         }
     }
-}`)
-		if _, err := validateDuplicateNATRuleSetNamesAST(tree, false); err != nil {
-			t.Fatalf("same rule-set name across different nat types is a distinct identity and must pass, got: %v", err)
+}`))
+		if err != nil {
+			t.Fatalf("same rule-set name across different nat types must commit, got: %v", err)
+		}
+		if got := countSourceRuleSets6454(cfg, "RS"); got != 1 {
+			t.Fatalf("want 1 source rule-set RS, got %d", got)
+		}
+		staticRS := 0
+		for _, rs := range cfg.Security.NAT.Static {
+			if rs.Name == "RS" {
+				staticRS++
+			}
+		}
+		if staticRS != 1 {
+			t.Fatalf("want 1 static rule-set RS, got %d", staticRS)
 		}
 	})
 
 	t.Run("bracket-list from-scope expands one authored rule-set (#3096)", func(t *testing.T) {
 		// ONE authored `rule-set RS` with a bracket list of from-zones
-		// Cartesian-expands into TWO same-named NATRuleSet objects downstream in
+		// Cartesian-expands into TWO same-named NATRuleSet objects in
 		// compileNATSource — but that is one AST rule-set instance, not a
 		// duplicate. Dedup at the compiled level would false-positive here; the
-		// gate dedups at the AST instance level, so this passes.
-		tree := parseHier6454(t, `security {
+		// gate dedups at the AST instance level, so this commits, and the two
+		// expanded entries (from trust + from dmz) are BOTH present.
+		cfg, err := CompileConfig(parseHier6454(t, `security {
     nat {
         source {
             rule-set RS {
@@ -307,20 +357,45 @@ func TestDuplicateNATRuleSetNameNoFalsePositive(t *testing.T) {
             }
         }
     }
-}`)
-		if _, err := validateDuplicateNATRuleSetNamesAST(tree, false); err != nil {
-			t.Fatalf("a single bracket-list-scoped rule-set must pass (one AST instance), got: %v", err)
+}`))
+		if err != nil {
+			t.Fatalf("a single bracket-list-scoped rule-set must commit (one AST instance), got: %v", err)
+		}
+		if got := countSourceRuleSets6454(cfg, "RS"); got != 2 {
+			t.Fatalf("want 2 same-named source rule-sets from the #3096 from-zone expansion, got %d", got)
+		}
+		fromZones := map[string]bool{}
+		for _, rs := range cfg.Security.NAT.Source {
+			if rs.Name == "RS" {
+				fromZones[rs.FromZone] = true
+			}
+		}
+		if !fromZones["trust"] || !fromZones["dmz"] {
+			t.Fatalf("expanded rule-sets must cover from-zones {trust, dmz}, got: %v", fromZones)
 		}
 	})
 
 	t.Run("flat-set repeated rule-set merges (dual-AST equivalence)", func(t *testing.T) {
-		tree := setTree6454(t, []string{
+		cfg, err := CompileConfig(setTree6454(t, []string{
 			"set security nat source rule-set RS from zone trust",
 			"set security nat source rule-set RS rule R1 then source-nat interface",
 			"set security nat source rule-set RS rule R2 then source-nat off",
-		})
-		if _, err := validateDuplicateNATRuleSetNamesAST(tree, false); err != nil {
-			t.Fatalf("flat-set repeated rule-set statements merge onto one node and must pass, got: %v", err)
+		}))
+		if err != nil {
+			t.Fatalf("flat-set repeated rule-set statements merge onto one node and must commit, got: %v", err)
+		}
+		if got := countSourceRuleSets6454(cfg, "RS"); got != 1 {
+			t.Fatalf("flat-set merge must yield exactly 1 source rule-set RS, got %d", got)
+		}
+		// The merged rule-set carries BOTH rules (R1, R2) — proof it is one
+		// rule-set, not two.
+		for _, rs := range cfg.Security.NAT.Source {
+			if rs.Name != "RS" {
+				continue
+			}
+			if len(rs.Rules) != 2 {
+				t.Fatalf("merged rule-set RS must carry 2 rules, got %d", len(rs.Rules))
+			}
 		}
 	})
 }

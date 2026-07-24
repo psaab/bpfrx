@@ -259,11 +259,12 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	// validateDuplicateNATRuleSetNamesAST. The rule-SET axis one level above the
 	// #5649 rule-name gate: two same-named rule-sets within one nat type
 	// (source/destination/static/nat64) BOTH survive as separate first-match
-	// tables sharing one operational identity, so per-rule telemetry merges and
-	// show/counter surfaces cannot disambiguate. Pre-expansion, top-level
-	// `security` stanzas only, keyed by (natType, rule-set) so a same-named
-	// rule-set across DIFFERENT nat types stays legitimate; strict rejects,
-	// lenient warns.
+	// tables sharing one name, and the CLI named-rule-set show lookup returns on
+	// the first match, so the operator cannot disambiguate the two (not a
+	// per-rule counter merge — NATCounterKey includes the rule name). Pre-
+	// expansion, top-level `security` stanzas only, keyed by (natType, rule-set)
+	// so a same-named rule-set across DIFFERENT nat types stays legitimate; strict
+	// rejects, lenient warns.
 	dupNATRuleSetWarnings, dupNATRuleSetErr := validateDuplicateNATRuleSetNamesAST(
 		tree, opts.lenientDuplicateNATRuleSetName)
 	if dupNATRuleSetErr != nil {

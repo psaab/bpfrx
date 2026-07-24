@@ -431,10 +431,11 @@ type compileOpts struct {
 	// a hard error to a warning on the tolerant load / peer-sync paths. Like
 	// #5649 (and unlike #5180) the duplicate is NOT last-writer-wins: two
 	// same-named rule-sets within one nat type (source/destination/static/nat64)
-	// BOTH survive as separate first-match tables sharing one operational
-	// identity (the rule-set name — the from/to scope binding and, for the
-	// counted natTypes, the natType/ruleSet/rule counter namespace), so per-rule
-	// telemetry merges and show/counter surfaces cannot disambiguate. An
+	// BOTH survive as separate first-match tables sharing one name (the from/to
+	// scope binding and the CLI show key), and the named-rule-set show lookup
+	// returns on the first match so the operator cannot disambiguate the two — not
+	// a per-rule counter merge (NATCounterKey includes the rule name, so disjoint
+	// rules get distinct counters). An
 	// already-persisted config (or one synced from a peer) may carry such a
 	// duplicate; an upgrading / receiving node must still boot through it (warn —
 	// the runtime keeps the historical two-table behavior) rather than

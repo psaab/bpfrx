@@ -524,23 +524,27 @@ named-block gate.
 ### Duplicate NAT rule-SET name (#6454, C181-M18 sibling)
 
 The #5649 gate above closes the rule-NAME axis; #6454 closes the rule-SET-name
-axis one level up. Like a rule, a rule-set name is its operational identity —
-the from/to scope binding and, for source / destination / ordinary static NAT,
-the `natType/ruleset/rule` counter namespace (`NATCounterKey`,
-`pkg/dataplane/compiler_nat.go`, keyed by natType). Two rule-sets authored with
-the SAME name WITHIN one nat type are NOT reduced to last-writer-wins like a
-#5180 hierarchical block — they BOTH survive: `compileNATSource` /
+axis one level up. A rule-set name is its operational identity — the from/to
+scope binding and the CLI show key. It is UNIQUE per nat type but reusable
+ACROSS nat types (Junos gives source / destination / static / nat64 independent
+name spaces; `NATCounterKey` in `pkg/dataplane/compiler_nat.go` is natType-
+prefixed for the counted types). Two rule-sets authored with the SAME name
+WITHIN one nat type are NOT reduced to last-writer-wins like a #5180
+hierarchical block — they BOTH survive: `compileNATSource` /
 `compileNATDestination` / `compileNATStatic` / `compileNAT64` each APPEND the
 rule-set (`sec.NAT.Source` / `Destination.RuleSets` / `Static` / `NAT64`), never
 merging by name, so both compile as separate first-match tables sharing one
-identity. For the counted natTypes their rules then merge on the shared
-`natType/ruleset/rule` counter identity, so `show` / counter surfaces cannot
-disambiguate; a counter-less nat64 rule-set (prefix / source-pool, no `rule`
-nodes — correctly excluded from the #5649 rule-name gate) still shares its
-show-surface name identity, so it is deduped here too. Either way the duplicate
-name is a config error — the harm is type-independent (the shared name
-identity), which is why the diagnostic is type-agnostic and never claims a
-per-rule counter.
+name. The operator authored what they read as one rule-set; it compiles to two,
+evaluated in sequence. The CLI named-rule-set show lookup
+(`showNATSourceRuleSet` in `pkg/cli/cli_show_nat.go`) returns on the FIRST name
+match, so the second same-named rule-set — and its rules — is invisible on that
+surface and the operator cannot disambiguate the two. This is NOT a per-rule
+counter merge: `NATCounterKey` includes the rule name, so the disjoint rules
+this gate uniquely catches get distinct counter keys (a SAME rule name in both
+is caught first by the #5649 gate); a nat64 rule-set (prefix / source-pool, no
+`rule` nodes — correctly excluded from the #5649 rule-name gate) is counter-less
+anyway. The harm is type-independent (the shared rule-set NAME identity), which
+is why the diagnostic is type-agnostic and never claims a per-rule counter.
 
 `validateDuplicateNATRuleSetNamesAST(tree, lenient)`
 (`pkg/config/dup_nat_ruleset_names.go`, wired beside the #5649 duplicate-rule-name
