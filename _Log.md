@@ -1,4 +1,52 @@
+## 2026-07-24 — #6471: forged IKE Responder SPI bypasses the Stage-11 host-inbound gate
+
+- **Timestamp**: 2026-07-24 (fix/6471-ike-responder-spi-gate)
+- **Action**: Closed the forged-Responder-SPI IKE bypass on the AF_XDP
+  secondary path (DNAT/static-NAT-to-self, native-GRE-inner). Stage 11
+  classified ANY IKE packet with a non-zero Responder SPI as Exempt and
+  reinjected it to the local XFRM stack unconditionally; the SPI bytes are
+  attacker-controlled, so a forged one reached strongSwan on a zone the
+  operator closed to IKE. Added the node-shared `IkeExchangeTable`
+  (4096-cap, oldest-evicted, 24h sliding idle reap): seeded at Stage 11 when
+  a NEW IKE initiation passes the host-inbound `ike` gate (a denied
+  initiation never seeds) and in the native-GRE local-origin path when the
+  firewall initiates IKE through a tunnel; a Responder-SPI-nonzero IKE
+  packet matching no seed now faces the same host-inbound gate a NEW
+  initiation faces (denied on `ike`-omitting zones, admitted on
+  `ike`-permitting zones — primary-path conntrack parity). Keyed on
+  (Initiator SPI, peer IP, local IP) — no ports (RFC 5996 float) and no
+  Responder SPI (never observed inbound). ESP/AH, ESP-in-UDP and NAT-T
+  keepalives stay unconditionally exempt; the table is touched only for
+  IKE-to-self packets.
+- **Files**: userspace-dp/src/afxdp/forwarding/ipsec.rs (IkeExchangeTable +
+  SPI extractors + single isakmp_demux SSOT + local-origin seed helper +
+  unit tests), userspace-dp/src/afxdp/poll_stages.rs (Stage 11 restructure +
+  now_ns param), userspace-dp/src/afxdp/tunnel.rs (outbound seed),
+  userspace-dp/src/afxdp/{types/runtime.rs,worker/lifecycle.rs,
+  worker/launch.rs,worker/loop_body/mod.rs,coordinator/mod.rs,
+  coordinator/tunnel_supervision.rs,poll_descriptor/mod.rs} (plumbing),
+  userspace-dp/src/afxdp/poll_stages_tests.rs (fail-on-revert coverage),
+  userspace-dp/src/afxdp/forwarding/README.md (docs), plus mechanical
+  WorkerContext/test-builder call-site updates in
+  tests_support.rs / tests_embedded_poll_filter.rs /
+  tests_gre_local_delivery.rs / frame/tests_native_gre_ecn.rs /
+  frame/tests_mss_inject_inspect.rs.
+- **Fail-on-revert**: stage_ipsec_passthrough_gates_forged_responder_spi_6471
+  (forged 500/4500 SPI → Denied on closed zone; permit zone admits; seeded
+  exchange admitted; wrong SPI/peer → Denied). Verified RED with the gate
+  neutralized (Denied flips to Passthrough), GREEN restored — twice (pre-
+  and post-final-apply). #4323 test updated: established-on-deny-zone now
+  passes via the seed planted by the admitted initiation.
+- **Validation**: full `cargo test --release -- --test-threads=1` (= make
+  test-rust legs) EXIT=0 on the final tree; clippy clean on new code;
+  no Go files touched (kernel nft path unchanged — it already enforces
+  conntrack NEW on the primary path).
+
 ## 2026-07-23 — #5557 (advance): host-inbound service-token case-fold in the junos-host coarse shield
+
+- **Timestamp**: 2026-07-23 (fix/5557-hostinbound-service-token-case)
+
+
 
 - **Timestamp**: 2026-07-23 (fix/5557-hostinbound-service-token-case)
 - **Action**: Case-fold host-inbound `system-services` tokens in the junos-host

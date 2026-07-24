@@ -245,12 +245,14 @@ fn local_origin_tunnel_tx_request_encapsulates_raw_ip_for_active_owner() {
         Ipv4Addr::new(10, 255, 192, 41),
         64,
     );
+    let ike_exchanges = crate::afxdp::forwarding::IkeExchangeTable::new();
     let plan = build_local_origin_tunnel_tx_request(
         &packet[14..],
         1,
         &state,
         &ha_state,
         &dynamic_neighbors,
+        &ike_exchanges,
     )
     .expect("local-origin tunnel tx request");
     assert_eq!(plan.tx_ifindex, 6);
@@ -287,12 +289,14 @@ fn local_origin_tunnel_session_uses_global_timeout_no_policy_match_6224() {
         Ipv4Addr::new(10, 255, 192, 41),
         64,
     );
+    let ike_exchanges = crate::afxdp::forwarding::IkeExchangeTable::new();
     let plan = build_local_origin_tunnel_tx_request(
         &packet[14..],
         1,
         &state,
         &ha_state,
         &dynamic_neighbors,
+        &ike_exchanges,
     )
     .expect("local-origin tunnel tx request");
 
@@ -335,12 +339,14 @@ fn local_origin_tunnel_tx_request_rejects_inactive_owner() {
         Ipv4Addr::new(10, 255, 192, 41),
         64,
     );
+    let ike_exchanges = crate::afxdp::forwarding::IkeExchangeTable::new();
     let err = build_local_origin_tunnel_tx_request(
         &packet[14..],
         1,
         &state,
         &ha_state,
         &dynamic_neighbors,
+        &ike_exchanges,
     )
     .expect_err("inactive owner should not originate tunnel traffic");
     assert!(err.contains("ha_inactive"), "unexpected error: {err}");

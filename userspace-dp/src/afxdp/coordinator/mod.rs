@@ -256,6 +256,14 @@ pub struct Coordinator {
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) neighbors: NeighborManager,
     pub(in crate::afxdp) sessions: SessionManager,
+    /// #6471: node-shared live-IKE-exchange table backing the Stage-11
+    /// established-vs-forged discriminator on the IPsec secondary path.
+    /// Runtime state (NOT config): lives outside `ForwardingState` so a
+    /// snapshot apply does not wipe the seeds, and outside `SessionManager`
+    /// (it is IKE admission state, not an HA-synced session map). Shared
+    /// with every packet worker (via `WorkerSharedDataplane`) and the GRE
+    /// local-origin threads (via the tunnel-spawn site).
+    pub(in crate::afxdp) ike_exchanges: crate::afxdp::forwarding::SharedIkeExchangeTable,
     pub(in crate::afxdp) workers: WorkerManager,
     pub(crate) mirror_targets: Arc<ArcSwap<MirrorTargetMap>>,
     pub(crate) forwarding: ForwardingState,
@@ -387,6 +395,7 @@ impl Coordinator {
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             neighbors: NeighborManager::new(),
             sessions: SessionManager::new(),
+            ike_exchanges: Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new()),
             workers: WorkerManager::new(),
             mirror_targets: Arc::new(ArcSwap::from_pointee(MirrorTargetMap::default())),
             forwarding: ForwardingState::default(),

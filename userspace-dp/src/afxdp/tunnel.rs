@@ -244,6 +244,10 @@ pub(super) fn local_tunnel_source_loop(
     shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_owner_rg_indexes: SharedSessionOwnerRgIndexes,
+    // #6471: node-shared live-IKE-exchange table — seeded when the firewall
+    // INITIATES IKE through this tunnel so the peer's replies are recognized
+    // as established at Stage 11 (see `build_local_origin_tunnel_tx_request`).
+    ike_exchanges: crate::afxdp::forwarding::SharedIkeExchangeTable,
     worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     delivery_rx: Receiver<Vec<u8>>,
     // #2412: the eventfd this thread blocks on in poll(2) alongside the
@@ -356,6 +360,7 @@ pub(super) fn local_tunnel_source_loop(
                         &forwarding,
                         ha_runtime.as_ref(),
                         &dynamic_neighbors,
+                        &ike_exchanges,
                     ) {
                         Ok(plan) => {
                             maybe_enqueue_local_tunnel_session(
@@ -518,6 +523,10 @@ pub(super) fn build_local_origin_tunnel_tx_request(
     forwarding: &ForwardingState,
     ha_runtime: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    // #6471: seeded for an outbound IKE initiation (see below). Production
+    // passes the node-shared table; tests pass a scratch one to assert the
+    // seed (or its absence).
+    ike_exchanges: &crate::afxdp::forwarding::IkeExchangeTable,
 ) -> Result<LocalTunnelTxPlan, String> {
     let mut meta = local_origin_packet_meta(packet)
         .ok_or_else(|| "unsupported_local_origin_packet".to_string())?;
@@ -551,6 +560,23 @@ pub(super) fn build_local_origin_tunnel_tx_request(
     };
     let flow = parse_session_flow_from_bytes(&inner_frame, meta)
         .ok_or_else(|| "parse_local_origin_session_flow_failed".to_string())?;
+    // #6471: a firewall-INITIATED IKE exchange routed via this tunnel sees
+    // its replies arrive on the Stage-11 secondary path (GRE-inner local
+    // destination) with the Responder SPI set and NO inbound seed — without
+    // this outbound seed the reply would fail the live-exchange lookup and
+    // face the host-inbound `ike` gate as a forgery, breaking
+    // firewall-initiated tunnels on zones that omit `ike` (the primary path
+    // admits such replies via kernel conntrack-established). Only a genuine
+    // initiation (all-zero Responder SPI) seeds; the firewall's own later
+    // packets in the exchange are ignored here (they already match the seed
+    // direction-wise on the return lookup).
+    crate::afxdp::forwarding::maybe_seed_local_origin_ike(
+        ike_exchanges,
+        &inner_frame,
+        meta.l4_offset as usize,
+        &flow,
+        monotonic_nanos(),
+    );
     // #921: zone_id is now a u16 field on EgressInterface — direct
     // load, no name round-trip.
     let zone_id = forwarding
