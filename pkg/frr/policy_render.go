@@ -1,19 +1,23 @@
-// policy_render.go holds protocols + policy rendering.
+// policy_render.go renders Junos policy-options into FRR route-maps.
 //
-// Despite the filename "policy_render", this file owns both protocol
-// rendering (OSPF/OSPFv3/BGP/RIP/ISIS) and policy-options rendering
-// (prefix-lists, route-maps, communities). They share the
-// resolveRedistribute helper and the BFD profile dedup machinery.
-//
-// File name held at "policy_render.go" per project-level file-layout
-// mandate (exactly 5 sibling .go files in pkg/frr: manager,
-// config_render, vtysh, status_parse, policy_render).
+// After the #6424 split this file owns policy-statement -> route-map
+// rendering (per-policy route-maps and composed chains), community-list
+// regex classification, and the redistribute-alias collision guard. The
+// other render aspects that used to share this file were moved, whole and
+// unchanged, into cohesive sibling files:
+//   - render_validate.go     value sanitization / validation belt
+//   - redistribute.go        Junos export -> FRR redistribute resolution
+//   - bgp_policy_chain.go    ordered BGP import/export chain resolution (#5277)
+//   - bfd.go                 BFD profile/peer accumulator (#2550)
+//   - protocols_render.go    OSPF/OSPFv3/BGP/RIP/IS-IS protocol stanzas
+//   - prefix_list_render.go  ip|ipv6 prefix-list rendering
 //
 // Symbols:
-//   - knownRedistProtocols, resolveRedistribute
-//   - bfdProfile, bfdProfileName
-//   - generateProtocols (OSPF/OSPFv3/BGP/RIP/ISIS)
-//   - generatePolicyOptions (prefix-lists, route-maps, communities)
+//   - communityRegexChars, communityMemberIsRegex
+//   - redistFailClosedRouteMap, redistAliasCollision
+//   - policyNeedsRedistAlias, policyTrailingAction
+//   - generatePolicyOptions, renderPolicyTermSequences
+//   - renderRouteMapForPolicy, renderComposedRouteMap
 package frr
 
 import (
@@ -21,98 +25,10 @@ import (
 	"log/slog"
 	"net"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
-
-// sanitizeFRRValue strips ASCII control characters — the C0 set
-// (0x00-0x1F, including newline) and DEL (0x7F), each replaced by a
-// space — from a free-text config value (description, auth key,
-// password, BGP community member, AS-path regex) before it is
-// interpolated into a generated frr.conf line. Render-side belt for
-// #1798 / #4097: a BGP neighbor description, auth key, community-list
-// member, or as-path-access-list regex containing an embedded newline
-// must not be able to inject extra frr.conf commands even if the
-// commit-time validation layer were bypassed (a leniently-loaded /
-// peer-synced / rolled-back stored value re-parses through the same
-// lexer, which materializes a `\n` escape into a real newline byte).
-// Collapsing the newline to a space keeps the whole value on the single
-// rendered line, so no injected `router bgp` / `neighbor` command
-// reaches the managed section. A single SPACE (0x20) is preserved: an
-// FRR `bgp as-path access-list ... permit LINE` and an expanded
-// `bgp community-list expanded ... permit LINE` take the regex as a
-// rest-of-line token, so a space inside the regex is legitimate (unlike
-// a whitespace-split auth secret, which frrTokenUnsafeIndex also rejects
-// at commit).
-func sanitizeFRRValue(s string) string {
-	clean := true
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] == 0x7f {
-			clean = false
-			break
-		}
-	}
-	if clean {
-		return s
-	}
-	b := []byte(s)
-	for i := range b {
-		if b[i] < 0x20 || b[i] == 0x7f {
-			b[i] = ' '
-		}
-	}
-	return string(b)
-}
-
-// validRouterID reports whether a router-id is a valid 32-bit IPv4
-// dotted-quad. FRR/vtysh requires an IPv4 router-id for ALL routing
-// protocols (including the IPv6 protocols OSPFv3 and BGP) and rejects
-// anything else, failing the whole frr-reload. This is the render-side
-// defense-in-depth for #2980: commit-time validation
-// (validateRouterIDStrict, pkg/config) hard-rejects a bad router-id, but
-// the tolerant load / peer-sync paths only warn (#1960 no-brick), so the
-// renderer must keep a leniently-loaded malformed router-id out of frr.conf
-// entirely. Empty is intentionally invalid here (the caller already gates
-// on != "" and an empty value is omitted so FRR auto-derives the router-id).
-func validRouterID(s string) bool {
-	ip := net.ParseIP(s)
-	return ip != nil && ip.To4() != nil
-}
-
-// validClusterID reports whether a BGP route-reflector cluster-id is one of
-// the two forms FRR/vtysh's `bgp cluster-id <A.B.C.D | (1-4294967295)>` grammar
-// accepts: an IPv4 dotted-quad or a 32-bit unsigned integer in 1..4294967295.
-// Render-side defense-in-depth for #4919: `protocols bgp cluster-id` is stored
-// verbatim, so a tolerant-load / peer-synced / rolled-back config may carry a
-// malformed value (e.g. `not.an.ip`, an IPv6 literal, or an embedded-newline
-// injection). FRR rejects anything else and fails the whole frr-reload, so the
-// renderer must keep a leniently-loaded bad cluster-id out of frr.conf
-// entirely. Commit / commit-check stay strict (config.ValidateBGPClusterID).
-// Mirrors validRouterID; the accept set matches ValidateBGPClusterID exactly.
-func validClusterID(s string) bool {
-	if ip := net.ParseIP(s); ip != nil {
-		return ip.To4() != nil
-	}
-	v, err := strconv.ParseUint(s, 10, 32)
-	return err == nil && v >= 1
-}
-
-// validBGPOrigin reports whether a route-map `then origin` value is one of the
-// three tokens FRR's `set origin <egp|igp|incomplete>` grammar accepts.
-// Render-side belt for #4919: `then origin` is stored verbatim and was only
-// control-char sanitized (#4498), so a non-control typo (`igpp`) or a
-// leniently-loaded / peer-synced bad value reached FRR and failed the route-map
-// grammar, stalling the reload. Skipping an invalid origin (fail-closed) keeps
-// it out of frr.conf; commit-check stays strict (schema ValidateEnum).
-func validBGPOrigin(s string) bool {
-	switch s {
-	case "igp", "egp", "incomplete":
-		return true
-	}
-	return false
-}
 
 // communityRegexChars are the characters whose presence in a community
 // member means it cannot be a plain literal ASN:VALUE (or well-known
