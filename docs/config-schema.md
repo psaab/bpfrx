@@ -515,11 +515,12 @@ different-rule-set / flat-set-merge accept guards), RED on revert of the gate
 (the duplicate is accepted) and, separately, RED if the diagnostic reintroduces
 a per-rule counter claim (false for a counter-less NPTv6 rule).
 
-The two limitations this gate shares with its #5180 sibling — a duplicate
-authored entirely inside an applied group bypasses the top-level-only
-pre-expansion scan, and a quoted-empty rule name is skipped — are tracked
-family-wide in #6455 rather than diverging this gate's scope from the
-named-block gate.
+The quoted-empty rule name this gate once skipped is now rejected as an
+authoring error (#6455, see the subsection below). The other limitation it
+shares with its #5180 sibling — a duplicate authored entirely inside an applied
+group — is DEFERRED (#6455 Finding 1): a pre-expansion per-group-body scan
+false-rejects a legitimate apply-groups fragment config that coalesces
+post-expansion.
 
 ### Duplicate NAT rule-SET name (#6454, C181-M18 sibling)
 
@@ -569,9 +570,10 @@ two-table behavior.
 Covered by `pkg/config/dup_nat_ruleset_names_6454_test.go` (source / destination
 / static / nat64 reject, nat64 counter-less-diagnostic guard, lenient warn, and
 distinct-name / different-nat-type / bracket-list-scope-expansion / flat-set-merge
-accept guards), RED on revert of the gate (the duplicate is accepted). Shares the
-same applied-group and quoted-empty-name limitations as its #5649 / #5180 siblings
-(tracked family-wide in #6455).
+accept guards), RED on revert of the gate (the duplicate is accepted). The
+quoted-empty rule-set name it once skipped is now rejected (#6455, this gate
+owns the empty rule-set name); the applied-group limitation it shares with its
+#5649 / #5180 siblings is deferred (see the subsection below).
 
 **Phase 2 (#5878) — reference-binder canonicalization.** Phase 1 (above) closes
 the divergent-commit fail-open by rejecting a duplicate-spelling collision at
@@ -635,6 +637,55 @@ unit name, so each binder now stores its map key on the canonical unit:
   a two-zone `.01`/`.1` duplicate-membership reject), and
   `pkg/daemon/ri_member_canonical_5878_test.go` (netlink `.01`→canonical device
   via both the tunnel-device and LinuxIfName paths, RED on revert).
+
+### Quoted-empty names + group-authored duplicates (family-wide, #6455)
+
+The three pre-expansion duplicate-name gates — `validateDuplicateNamedBlockAST`
+(#5180: groups / interfaces / screen ids-option), `validateDuplicateNATRuleNamesAST`
+(#5649: NAT rule names), and `validateDuplicateNATRuleSetNamesAST` (#6454: NAT
+rule-set names) — shared two limitations. #6455 closes the quoted-empty-name half
+here (shared helpers in `pkg/config/dup_names_6455.go`) and DEFERS the
+group-authored half (below).
+
+**Closed — quoted-empty names.** The gates `continue` on an empty name, so a
+quoted-empty name (`rule ""`, `rule-set ""`, `group ""`, `interface ""`,
+`ids-option ""`) was neither rejected as a duplicate nor rejected as empty. An
+empty name is not a valid operational identity for any of these containers — the
+object cannot be referenced or shown by name — so it is an authoring error
+regardless of duplication (mirroring the #5636 empty-credential rejection). Each
+gate now rejects it: strict commit / commit-check hard-rejects (`empty <kind>
+name … (#6455)`), tolerant load / peer-sync (#1960) warns and keeps booting.
+Duplicates keep first-error priority, so a config with no empty name produces
+byte-identical pre-#6455 diagnostics. The empty **rule-set** name is owned by the
+#6454 gate — the #5649 rule-name gate skips an empty rule-set — so the lenient
+warning fires exactly once, not double-reported.
+
+**Deferred — group-authored duplicates (#6455 Finding 1).** A duplicate authored
+entirely inside an applied group body (no inline peer) survives `ExpandGroups()`
+and reaches the compiler, but no gate catches it because the gates scan only the
+top level. The tempting fix — a pre-expansion per-group-body scan — is WRONG: it
+false-rejects a legitimate apply-groups FRAGMENT config. Fragments of one named
+object authored across repeated group roots (two `interfaces` roots each
+contributing a `ge-0/0/0` unit; a screen profile split into an ICMP fragment + a
+TCP fragment; a NAT rule split into complementary `match` / `then` fragments)
+COALESCE into a SINGLE object under `mergeNodes` during `ExpandGroups`, but a
+pre-expansion sibling-scan cannot model that same-pass coalescing and rejects a
+config that compiles to one object. The correct detection point is AFTER
+`ExpandGroups` (the coalesced tree) but before the #3096 Cartesian bracket-list
+expansion in `compileExpanded` (`compiler_nat_source.go`), AND — to stay
+HA-symmetric like the sibling tunnel / zone / unit-alias gates — it must union the
+node0 and node1 expansions rather than scan a single node's view. That is a design
+pass tracked as the group-authored half of #6455, not shipped here.
+
+Covered by `pkg/config/dup_names_6455_test.go`: quoted-empty reject for all five
+containers (RED on revert of the empty-name recording), a lenient warns-EXACTLY-
+once guard for the empty rule-set, and — the load-bearing regression guard for the
+deferral — `TestDup6455GroupFragmentCoalescingAccepted` locks the four fragment-
+coalescing configs (interface / screen / NAT-rule fragments, group-siblings +
+inline peer) as ACCEPT so a future group-authored detector cannot reintroduce the
+false-reject. Plus the top-level no-false-positive accepts (apply-groups
+deep-merge carrying both rules, cross-group coalescing, #3096 bracket-list
+expansion).
 
 ### Non-numeric logical-unit identity fail-closed (#5829)
 

@@ -43,21 +43,29 @@ type dupNATRule struct {
 // This is a DIFFERENT failure mode from #5180's last-writer-wins hierarchical
 // blocks: duplicate NAT rules BOTH survive. Runs PRE-expansion on top-level
 // `security` stanzas only, exactly like validateDuplicateNamedBlockAST (#5180):
-// apply-groups DEEP-MERGES a rule of the same name rather than duplicating it,
-// and a rule authored once via flat `set` reuses its rule node, so only
-// hierarchical duplicates authored directly reach here. The seen-set is keyed
-// by (natType, ruleSet, rule) and unioned across repeated `security` / `nat` /
-// `source|destination|static` blocks — compileNAT (#3915) merges those repeats
-// — so a rule name split across two `source {}` blocks is caught too. Strict
-// rejects on the operator commit / commit-check path; lenient (Load /
-// peer-sync, #1960) warns and keeps the historical two-row behavior.
+// apply-groups DEEP-MERGES a rule of the same name rather than duplicating it, and
+// a rule authored once via flat `set` reuses its rule node, so only hierarchical
+// duplicates authored directly reach here. The seen-set is keyed by (natType,
+// ruleSet, rule) and unioned across repeated `security` / `nat` /
+// `source|destination|static` blocks — compileNAT (#3915) merges those repeats —
+// so a rule name split across two `source {}` blocks is caught too. A quoted-empty
+// rule name is recorded as an empty-name defect (#6455) rather than skipped; an
+// empty rule-SET name is NOT reported here (the #6454 rule-set gate owns it, so
+// the warning is not double-reported) — this gate skips an empty rule-set. Strict
+// rejects on the operator commit / commit-check path; lenient (Load / peer-sync,
+// #1960) warns and keeps the historical two-row behavior.
+//
+// A duplicate authored ENTIRELY inside an applied group body is NOT caught here —
+// see the group-authored deferral note in dup_names_6455.go (#6455 Finding 1).
 func validateDuplicateNATRuleNamesAST(tree *ConfigTree, lenient bool) ([]string, error) {
 	if tree == nil {
 		return nil, nil
 	}
 	var dups []dupNATRule
+	var emptyKinds []string
 	seen := map[string]bool{}
 	reported := map[string]bool{}
+	emptyRuleReported := map[string]bool{}
 	for _, top := range tree.Children {
 		if top.Name() != "security" {
 			continue
@@ -66,11 +74,19 @@ func validateDuplicateNATRuleNamesAST(tree *ConfigTree, lenient bool) ([]string,
 			for _, natType := range natRuleSubBlocks {
 				for _, sub := range nat.FindChildren(natType) {
 					for _, rsInst := range namedInstances(sub.FindChildren("rule-set")) {
+						// An empty rule-set name is owned by the #6454 rule-set
+						// gate; skip it here so the empty-name warning is not
+						// double-reported (the #6455 lenient double-warning fix).
 						if rsInst.name == "" {
 							continue
 						}
 						for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 							if ruleInst.name == "" {
+								ek := natType + "\x00" + rsInst.name
+								if !emptyRuleReported[ek] {
+									emptyKinds = append(emptyKinds, "NAT "+natType+" rule")
+									emptyRuleReported[ek] = true
+								}
 								continue
 							}
 							key := natType + "\x00" + rsInst.name + "\x00" + ruleInst.name
@@ -89,7 +105,7 @@ func validateDuplicateNATRuleNamesAST(tree *ConfigTree, lenient bool) ([]string,
 		}
 	}
 
-	if len(dups) == 0 {
+	if len(dups) == 0 && len(emptyKinds) == 0 {
 		return nil, nil
 	}
 	// Deterministic order: natType, then rule-set, then rule.
@@ -102,23 +118,32 @@ func validateDuplicateNATRuleNamesAST(tree *ConfigTree, lenient bool) ([]string,
 		}
 		return dups[i].rule < dups[j].rule
 	})
+	sort.Strings(emptyKinds)
 
 	if !lenient {
-		d := dups[0]
-		return nil, fmt.Errorf("duplicate NAT %s rule %q in rule-set %q: a NAT "+
-			"rule-set is keyed by rule name, so the same name authored twice "+
-			"compiles both instances as separate first-match entries sharing one "+
-			"operational identity — author the rule once (flat `set` merges "+
-			"repeated statements automatically) (#5649)",
-			d.natType, d.rule, d.ruleSet)
+		// Duplicates keep first-error priority so the pre-#6455 messages are
+		// unchanged when no empty name is present.
+		if len(dups) > 0 {
+			d := dups[0]
+			return nil, fmt.Errorf("duplicate NAT %s rule %q in rule-set %q: a NAT "+
+				"rule-set is keyed by rule name, so the same name authored twice "+
+				"compiles both instances as separate first-match entries sharing one "+
+				"operational identity — author the rule once (flat `set` merges "+
+				"repeated statements automatically) (#5649)",
+				d.natType, d.rule, d.ruleSet)
+		}
+		return nil, emptyNameError(emptyKinds[0])
 	}
 
-	warnings := make([]string, 0, len(dups))
+	warnings := make([]string, 0, len(dups)+len(emptyKinds))
 	for _, d := range dups {
 		warnings = append(warnings, fmt.Sprintf("duplicate NAT %s rule %q in "+
 			"rule-set %q: the same name compiles both instances as separate "+
 			"first-match entries sharing one operational identity — author it "+
 			"once (#5649)", d.natType, d.rule, d.ruleSet))
+	}
+	for _, k := range emptyKinds {
+		warnings = append(warnings, emptyNameWarning(k))
 	}
 	return warnings, nil
 }

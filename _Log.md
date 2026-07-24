@@ -60718,3 +60718,102 @@ top.
     pkg/daemon/lo0_coldboot_fence_6476_test.go,
     docs/host-inbound-service-matrix.md,
     docs/refactoring-audit-current.txt, _Log.md
+- **Action**: #6455 — close the two family-wide limitations of the
+    pre-expansion duplicate-name commit gates
+    (validateDuplicateNamedBlockAST #5180, validateDuplicateNATRuleNamesAST
+    #5649, validateDuplicateNATRuleSetNamesAST #6454). Finding 1
+    (group-authored duplicates): the three gates scanned ONLY the top-level
+    stanzas, so a duplicate authored entirely inside an applied group body
+    (no inline peer to deep-merge it) was appended wholesale by mergeNodes and
+    survived ExpandGroups() as two rows with no gate to catch it. Added
+    scanNamespaces (dup_names_6455.go): each gate's scan runs once for the
+    top-level stanza list AND once per DEFINED group body, each a SEPARATE
+    namespace with a fresh seen-set. False-positive-safe — a group-vs-inline
+    same name deep-merges to one node (different namespaces, never
+    cross-counted), a same name across two groups coalesces via mergeNodes (no
+    surviving duplicate), and the #3096 bracket-list Cartesian expansion
+    happens later in compileExpanded so the pre-compile AST scan (one instance)
+    never flags it. Strictly more complete than a post-expansion rescan (which
+    would miss a group-internal duplicate an inline peer coalesces). Group-body
+    duplicates name the enclosing group in the diagnostic. Finding 2
+    (quoted-empty names): the gates `continue` on an empty name, so a
+    quoted-empty name (`rule ""`, `rule-set ""`, `group ""`, `interface ""`,
+    `ids-option ""`) was neither dup-rejected nor empty-rejected. An empty name
+    is not a valid operational identity — recorded as an emptyName6455 defect
+    (strict rejects, lenient warns), mirroring the #5636 empty-credential
+    rejection. Duplicates keep first-error priority so a no-empty-name config
+    produces byte-identical pre-#6455 diagnostics. Parent-RED confirmed
+    firsthand per finding: neutralize the group-body scan → all 4
+    group-authored reject sub-tests RED on clean assertions while the 4
+    no-false-positive accepts stay GREEN; neutralize emptyNameError → all 5
+    empty-name reject sub-tests RED. go build ./... / go vet ./pkg/config/ /
+    gofmt / full pkg/config suite / refactoraudit heatmap all GREEN.
+- **File(s)**: pkg/config/dup_names_6455.go (new),
+    pkg/config/dup_named_blocks.go, pkg/config/dup_nat_rule_names.go,
+    pkg/config/dup_nat_ruleset_names.go,
+    pkg/config/dup_names_6455_test.go (new), docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-24
+- **Action**: #6455 SPLIT after a Codex MAJOR (false-reject) + firsthand
+    verification. The per-group-body scan shipped in the first commit
+    (scanNamespaces) FALSE-REJECTS legitimate apply-groups FRAGMENT configs.
+    Firsthand proof (neutralized the group scan, observed the compiled
+    object): fragments of ONE named object authored across repeated group
+    roots COALESCE via mergeNodes during ExpandGroups — two `interfaces` roots
+    each contributing a ge-0/0/0 unit compile to ONE ge-0/0/0(units=2); an
+    ICMP-fragment + TCP-fragment screen profile compile to ONE P(icmp,tcp); a
+    match/then-split NAT rule compiles to ONE rule R — yet the per-body scan
+    rejected all three. A pre-expansion sibling-scan cannot model that
+    same-pass coalescing. WITHDREW the group-authored per-body scan
+    (scanNamespaces + groupCtx machinery) entirely and KEPT only the
+    quoted-empty half (correct; both reviewers passed it). The three gates
+    revert to their top-level-only pre-expansion scan (byte-identical dup
+    messages) + a quoted-empty-name reject (strict) / warn (lenient). Codex
+    MINOR fixed: the empty rule-SET name is now owned solely by the #6454 gate
+    (the #5649 rule-name gate skips an empty rule-set), so the lenient warning
+    fires exactly once, not double-reported. compiler.go call-site comments
+    (both compile paths) note the quoted-empty reject. The group-authored
+    detection is deferred — the correct fix runs POST-ExpandGroups (coalesced,
+    pre-#3096-Cartesian at compiler_nat_source.go:766) and must union node0 +
+    node1 expansions for HA symmetry (like the tunnel/zone/unit-alias gates) —
+    tracked as the group-authored half of #6455 for a research pass. Added
+    TestDup6455GroupFragmentCoalescingAccepted as the load-bearing regression
+    guard locking the 4 fragment-coalescing configs ACCEPT. Parent-RED: 5
+    quoted-empty reject sub-tests RED on clean assertions when emptyNameError
+    is neutralized; the coalescing accepts stay GREEN. go build ./... / go vet
+    / gofmt / full pkg/config suite / refactoraudit heatmap GREEN. PR now
+    Advances #6455 (quoted-empty shipped; group-authored deferred).
+- **File(s)**: pkg/config/dup_names_6455.go, pkg/config/dup_named_blocks.go,
+    pkg/config/dup_nat_rule_names.go, pkg/config/dup_nat_ruleset_names.go,
+    pkg/config/dup_names_6455_test.go, pkg/config/compiler.go,
+    docs/config-schema.md, _Log.md
+- **Action**: Add test coverage for handleOversizedFrame's drop-to-re-establish-
+    framing branch (#6160 — follow-up to #6159/#6132). The two #6132 regression
+    tests only exercise the discard-and-realign `return true` branch (well-framed
+    payload <= 64KB). This adds two table-independent tests for the UNTESTED
+    `return false` drop path, one per trigger:
+  - `..._over_ceiling_...`: declared length > maxDiscardableOversizedFrameBytes
+    (64KB, header only on the wire). The reader must NOT drain an untrusted
+    over-ceiling length — it flushes the advanced ACK and drops the connection.
+    Asserts the flushed ACK(seq) is read off the wire, the connection is dropped
+    (client EOF + IsConnected flips false), DecodeErrors==1, exactly one
+    rate-limited resync, and the watermark advanced PAST the frame.
+  - `..._short_drain_...`: in-ceiling declared length (2000) but a SHORT payload
+    (100 bytes) + CloseWrite → io.CopyN drain errors → falls through to the SAME
+    flush-ACK + drop tail. Half-close keeps the client read half open so the
+    synchronously-flushed ACK is observable.
+  Neutralize-proof (COVERAGE test — inverts an existing invariant), run firsthand
+  per trigger with eventstream.go restored to 0-diff after each:
+  - A: terminal `return false`→`return true` → over_ceiling RED "the connection
+    was NOT dropped ... must return false for length > maxDiscardable..." (2.06s,
+    deadline hit = conn wrongly kept). short_drain stays GREEN.
+  - B: failed drain wrongly `return true` (ignore io.CopyN err) → short_drain RED
+    "the advanced ACK (seq 2) was not flushed on the drop path ...". over_ceiling
+    stays GREEN — each test binds its OWN trigger.
+  eventstream.go is 0-diff (test-only). No module-doc change: this is
+  test-coverage for existing #6159 behavior, no contract change. Validation:
+  go build ./..., go vet ./pkg/dataplane/userspace/, gofmt -l clean,
+  go test ./pkg/dataplane/... GREEN, heatmap TestHeatmapNotStale GREEN (prod LOC
+  unchanged → no regen).
+- **File(s)**: pkg/dataplane/userspace/eventstream_oversized_drop_path_6160_test.go,
+    _Log.md
