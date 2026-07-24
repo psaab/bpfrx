@@ -249,6 +249,20 @@ fn should_bypass_unseeded_tunnel_ha(
 
 pub(super) struct WorkerCommandResults {
     pub cancelled_keys: Vec<SessionKey>,
+    /// #6457: every session key dropped by a `WorkerCommand::DeleteSynced`
+    /// this tick, recorded unconditionally by `handle_delete_synced` (even
+    /// when the worker's session table had no entry — a stale flow-cache
+    /// slot outlives its table entry, so the invalidate must not gate on
+    /// the lookup). `apply_worker_commands` has no `BindingWorker` access;
+    /// the worker loop (`worker/loop_body/mod.rs`) drains this list and
+    /// calls `flow_cache.invalidate_slot(&key, binding.ifindex)` on every
+    /// binding it owns — the same pattern #3776's `reap_expired_sessions`
+    /// uses on the GC path — so a revoked 5-tuple MISSES the cache on its
+    /// next packet and re-runs full session lookup + policy instead of
+    /// forwarding via a stale cached permit with no live session (the
+    /// operator `clear security flow session`, cluster-stale sweep, and HA
+    /// DeleteSynced paths all funnel through this command).
+    pub deleted_synced_keys: Vec<SessionKey>,
     pub exported_sequences: Vec<u64>,
     /// #2653: the union of owner RGs requested by every
     /// `ExportOwnerRGSessions` command processed this tick. The command
@@ -668,6 +682,7 @@ pub(super) fn apply_worker_commands(
             if pending.is_empty() {
                 return WorkerCommandResults {
                     cancelled_keys: Vec::new(),
+                    deleted_synced_keys: Vec::new(),
                     exported_sequences: Vec::new(),
                     export_owner_rgs: Vec::new(),
                     shaped_tx_requests: Vec::new(),
@@ -679,6 +694,7 @@ pub(super) fn apply_worker_commands(
         None => {
             return WorkerCommandResults {
                 cancelled_keys: Vec::new(),
+                deleted_synced_keys: Vec::new(),
                 exported_sequences: Vec::new(),
                 export_owner_rgs: Vec::new(),
                 shaped_tx_requests: Vec::new(),
@@ -692,6 +708,12 @@ pub(super) fn apply_worker_commands(
     let now_ns = monotonic_nanos();
     let now_secs = now_ns / 1_000_000_000;
     let mut cancelled_keys: Vec<SessionKey> = Vec::new();
+    // #6457: keys dropped by `DeleteSynced` this tick, drained by the
+    // worker loop into per-binding flow-cache invalidations (the struct
+    // field comment carries the full rationale). Not pre-sized — delete
+    // bursts are control-plane paced and the common no-delete tick pays
+    // no allocation (same policy as `cancelled_keys`).
+    let mut deleted_synced_keys: Vec<SessionKey> = Vec::new();
     // #5155: companion dedup set for `handle_demote_owner_rgs`. Kept
     // beside `cancelled_keys` (not pre-sized) so the O(1) membership
     // test persists across the multiple DemoteOwnerRGS arms in one
@@ -809,7 +831,14 @@ pub(super) fn apply_worker_commands(
                 let _ = installed;
             }
             WorkerCommand::DeleteSynced(key) => {
-                commands::handle_delete_synced(sessions, session_map_fd, forwarding, key, now_ns);
+                commands::handle_delete_synced(
+                    sessions,
+                    session_map_fd,
+                    forwarding,
+                    key,
+                    now_ns,
+                    &mut deleted_synced_keys,
+                );
             }
             WorkerCommand::EnqueueShapedLocal(req) => {
                 // Trivial variant — kept inline (#1346 plan v2 §4.1).
@@ -827,6 +856,7 @@ pub(super) fn apply_worker_commands(
     }
     WorkerCommandResults {
         cancelled_keys,
+        deleted_synced_keys,
         exported_sequences,
         export_owner_rgs,
         shaped_tx_requests,
