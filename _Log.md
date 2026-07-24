@@ -35,6 +35,34 @@
   failures): (1) neutralize the whole gate → mismatch test RED (reconcile arms
   the stale image); (2) drop the `desired &&` scope → disarm test RED (gate
   blocks the disarm). Restored → all three #6165 tests GREEN.
+## 2026-07-23 — #6284 item 1: active/active directional coverage for the #5274 config-epoch guard
+
+- **Timestamp**: 2026-07-23 (fix/6284-config-epoch-coverage)
+- **Action**: Test-only. Added active/active directional coverage for the
+  #5274 config-epoch guard's item-1 residual (item 2's sweep-vs-advance fence
+  is already covered by sync_config_epoch_sweep_race_6284_test.go + PR #6366).
+  Config sync is unidirectional from the RG0 authority, so the SEND-stamp
+  counter (configGenCounter, stampInstallGen*) advances only on the authority
+  while the RECEIVE high-water (lastAppliedConfigGen) advances only where a peer
+  config is applied. The new test drives the SAME frozen non-authority epoch
+  into two receivers with OPPOSITE outcomes on the real apply path: REFUSED at a
+  receiver that applied a newer config (the protected config-authority → peer
+  direction) and ADMITTED at the config authority (receive high-water 0 — the
+  documented inert fail-OPEN reverse direction). It also pins the sender-side
+  root cause: recordAppliedConfigGen advances the receive high-water but NOT
+  configGenCounter, so stampInstallGen* stamps the frozen boot-seed epoch.
+  Parent-RED verified three ways: neutralizing configEpochStale (admit-all)
+  turns the protected-direction reject RED; folding configGenCounter into the
+  guard barrier turns the inert-direction admit RED; coupling
+  recordAppliedConfigGen to configGenCounter turns the root-cause assert RED.
+  No production change. #6418 + #6366 close #6284's COVERAGE gap (both
+  residuals now test-pinned); the inert fail-OPEN reverse direction is a
+  deliberate #5274 scope-out documented in docs/session-sync-architecture.md
+  and tracked as a design-heavy future enhancement in the new follow-up #6419
+  (bidirectional config-gen namespace) — NOT on #6284. gofmt/vet/build clean;
+  full pkg/cluster suite GREEN.
+- **File(s)**: pkg/cluster/sync_config_epoch_active_active_6284_test.go,
+  docs/session-sync-architecture.md, _Log.md
 
 ## 2026-07-23 — #6387 PR-3: host-inbound/lo0/fence install via netlink (cutover)
 
