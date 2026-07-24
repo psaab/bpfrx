@@ -13,7 +13,7 @@
   keeps the swanctl config-render aspect (childSelector, generateConfig,
   renderConfig, resolveRemoteAddr, sortedVPNNames, effectiveTrafficSelectors,
   childNameDisambiguator, sanitize/escape helpers, pskIDSelectors,
-  formatIdentity, authMethodToSwan, xfrmiIfID) at 637 LOC; policy_addr.go is
+  formatIdentity, authMethodToSwan, xfrmiIfID) at 632 LOC; policy_addr.go is
   511 LOC. Only per-file package/import lines differ — no logic edit, rename,
   or reorder. The two halves have no cross-calls; the island has no upward
   deps. Import split is mutually exclusive except shared sort/strings/config:
