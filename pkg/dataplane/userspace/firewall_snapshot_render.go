@@ -38,6 +38,9 @@ func RenderFirewallFilterSnapshot(snap *FirewallFilterSnapshot) string {
 		if s := effectiveAddrMatchLine("destination", term.DestAddresses, term.DestExcept, term.DestConstrained); s != "" {
 			b.WriteString(s)
 		}
+		if term.AddressUnrepresentable {
+			fmt.Fprintf(&b, "    from address <unrepresentable — snapshot fails closed>\n")
+		}
 		for _, p := range term.Protocols {
 			fmt.Fprintf(&b, "    from protocol %s\n", p)
 		}
@@ -52,6 +55,9 @@ func RenderFirewallFilterSnapshot(snap *FirewallFilterSnapshot) string {
 		}
 		if len(term.DestPortsExcept) > 0 {
 			fmt.Fprintf(&b, "    from destination-port-except %s\n", strings.Join(term.DestPortsExcept, ", "))
+		}
+		if term.PortsUnrepresentable {
+			fmt.Fprintf(&b, "    from port <unrepresentable — snapshot fails closed>\n")
 		}
 		if len(term.DSCPValues) > 0 {
 			fmt.Fprintf(&b, "    from dscp %s\n", formatWireUint8List(term.DSCPValues))

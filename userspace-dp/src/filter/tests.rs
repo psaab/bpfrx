@@ -64,6 +64,8 @@ fn basic_accept_discard() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -97,6 +99,8 @@ fn basic_accept_discard() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -311,6 +315,8 @@ fn port_range_matching() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -390,6 +396,8 @@ fn destination_port_except_negation() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -484,6 +492,8 @@ fn source_port_except_negation() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -562,6 +572,8 @@ fn protocol_matching() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -633,6 +645,8 @@ fn dscp_rewrite_action() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -690,6 +704,8 @@ fn dscp_rewrite_action_allows_default_zero() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -1793,6 +1809,8 @@ fn multiple_terms_first_match_wins() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -1826,6 +1844,8 @@ fn multiple_terms_first_match_wins() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -1898,6 +1918,8 @@ fn source_dest_address_matching() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -4722,6 +4744,8 @@ fn tcp_flags_term_forbidden_mask_excludes_negated_flag() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                 ..Default::default()
             },
             FirewallTermSnapshot {
@@ -4781,6 +4805,8 @@ fn tcp_flags_term_forbidden_only_mask() {
                 icmp_type_unrepresentable: false,
                 icmp_code_unrepresentable: false,
                 dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
                 ..Default::default()
             },
             FirewallTermSnapshot {
@@ -6768,6 +6794,171 @@ fn dscp_match_unrepresentable_marker_fails_closed_not_match_all() {
             assert_eq!(term, "marked");
         }
         other => panic!("expected UnrepresentableFilterDSCP, got {other:?}"),
+    }
+}
+
+#[test]
+fn ports_unrepresentable_marker_fails_closed_not_narrowed() {
+    // #6459 RED-on-revert: a term carrying the `ports_unrepresentable` wire
+    // marker (the Go control plane could not resolve one of the term's
+    // `{source,destination}-port[-except]` tokens, e.g. `[ ssh bogussvc ]`)
+    // must reject the WHOLE snapshot — NOT compile a matcher over only the
+    // surviving subset. Pre-fix the compiler dropped the unresolvable token
+    // PER-TOKEN (`filter_map(parse_port_spec)`), so a partially-unresolvable
+    // list on a `then discard`/`reject` term silently enforced a NARROWER port
+    // set than the operator wrote: traffic to the dropped ports fell through
+    // to the implicit accept (fail-OPEN). The term below carries a SURVIVING
+    // port ("22") alongside the marker, so reverting the parse_term guard
+    // returns Ok here (non-tautological).
+    let err = filter_with_marked_term("inet", |t| {
+        t.destination_ports = vec!["22".into(), "bogussvc".into()];
+        t.ports_unrepresentable = true;
+    })
+    .expect_err("an unrepresentable ports marker must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterPorts {
+            family,
+            filter,
+            term,
+        } => {
+            assert_eq!(family, "inet");
+            assert_eq!(filter, "f");
+            assert_eq!(term, "marked");
+        }
+        other => panic!("expected UnrepresentableFilterPorts, got {other:?}"),
+    }
+    // A term WITHOUT the marker compiles fine (the guard is keyed on the
+    // marker, not on every port-scoped term).
+    filter_with_marked_term("inet", |t| {
+        t.destination_ports = vec!["22".into()];
+    })
+    .expect("a term without the marker must compile");
+}
+
+#[test]
+fn ports_unrepresentable_error_names_the_family_for_reused_filter_names() {
+    // Filter names can be reused across families; the diagnostic must name the
+    // family carrying the marker.
+    let err = filter_with_marked_term("inet6", |t| t.ports_unrepresentable = true)
+        .expect_err("an unrepresentable ports marker must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterPorts { family, .. } => {
+            assert_eq!(family, "inet6");
+        }
+        other => panic!("expected UnrepresentableFilterPorts, got {other:?}"),
+    }
+}
+
+#[test]
+fn address_unrepresentable_marker_fails_closed_not_narrowed() {
+    // #6463 RED-on-revert: a term carrying the `address_unrepresentable` wire
+    // marker (the Go control plane classified one of the term's literal
+    // `from source-address` / `destination-address` tokens as not a parseable
+    // IP/CIDR, e.g. `[ 10.0.0.0/8 garbage.example ]`) must reject the WHOLE
+    // snapshot — NOT compile a matcher over only the surviving prefixes.
+    // Pre-fix `parse_address` dropped the malformed token PER-TOKEN (its
+    // `Err(_)` arm pushed nothing), so a partially-malformed list on a `then
+    // discard`/`reject` term silently enforced a NARROWER address set than the
+    // operator wrote: a host in the dropped range fell through to the implicit
+    // accept (fail-OPEN). The term below carries a SURVIVING prefix alongside
+    // the marker, so reverting the parse_term guard returns Ok here
+    // (non-tautological).
+    let err = filter_with_marked_term("inet", |t| {
+        t.source_addresses = vec!["10.0.0.0/8".into(), "garbage.example".into()];
+        t.address_unrepresentable = true;
+    })
+    .expect_err("an unrepresentable address marker must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterAddress {
+            family,
+            filter,
+            term,
+        } => {
+            assert_eq!(family, "inet");
+            assert_eq!(filter, "f");
+            assert_eq!(term, "marked");
+        }
+        other => panic!("expected UnrepresentableFilterAddress, got {other:?}"),
+    }
+    // A term WITHOUT the marker compiles fine (the guard is keyed on the
+    // marker, not on every address-scoped term).
+    filter_with_marked_term("inet", |t| {
+        t.source_addresses = vec!["10.0.0.0/8".into()];
+    })
+    .expect("a term without the marker must compile");
+}
+
+#[test]
+fn filter_parse_port_spec_rejects_signed_6477() {
+    // #6477 RED-on-revert: the filter-side port parser must reject a
+    // non-canonical SIGNED token. Rust's u16 FromStr accepts a leading '+'
+    // ("+80" -> Ok(80)), so the pre-fix `.parse::<u16>()` built Single(80) and
+    // enforced it — while the Go commit gate, the Go capability gate, and the
+    // policy-side Rust parser (parse_port_u16, #3606) all reject the token.
+    // One of four port parsers being more lenient violates the #3606 agreement
+    // invariant. A rejected token yields ZERO ranges: the direction stays
+    // constrained (port_is_real) with PortMatcher::Any, so the matcher fails
+    // the term closed (matches nothing) rather than enforcing 80. Reverting
+    // the shared-helper routing restores Single(80) here — RED.
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "signed".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["+80".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let term = state
+        .filters
+        .get("inet:f")
+        .expect("filter compiled")
+        .terms
+        .first()
+        .expect("one term");
+    assert!(
+        term.dest_port_constrained,
+        "a non-empty port token keeps the direction constrained"
+    );
+    assert!(
+        matches!(term.dest_ports, PortMatcher::Any),
+        "'+80' must be rejected (zero ranges -> PortMatcher::Any, fail closed); \
+         a Single(80) here means the signed token was enforced (#6477)"
+    );
+    // Range endpoints are signed-checked too (mirrors the #3606 policy-side
+    // pins): a signed low or high must reject the whole spec.
+    for spec in ["+80-90", "80-+90"] {
+        let state = make_filter_state(
+            &[FirewallFilterSnapshot {
+                name: "f".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "signed-range".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec![spec.into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                }],
+            }],
+            &[],
+        );
+        let term = state
+            .filters
+            .get("inet:f")
+            .expect("filter compiled")
+            .terms
+            .first()
+            .expect("one term");
+        assert!(
+            matches!(term.dest_ports, PortMatcher::Any),
+            "{spec:?} must be rejected (signed endpoint); a range here means a \
+             signed endpoint was enforced (#6477)"
+        );
     }
 }
 
