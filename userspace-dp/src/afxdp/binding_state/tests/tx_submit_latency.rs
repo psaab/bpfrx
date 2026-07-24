@@ -411,7 +411,7 @@ fn tx_latency_hist_cross_thread_snapshot_skew_within_bound() {
 fn tx_submit_ns_sidecar_single_writer_ownership_is_rc_not_arc() {
     // #812 plan §6.1 test #6 (per §3.3 single-writer
     // invariant). `WorkerUmem` is `Rc<WorkerUmemInner>` at
-    // umem.rs:16-18 — NOT `Arc` — enforcing single-owner
+    // umem/mod.rs — NOT `Arc` — enforcing single-owner
     // semantics on the sidecar's backing UMEM. A future
     // refactor that quietly upgrades the field to `Arc` to
     // share bindings across threads would silently break the

@@ -1277,3 +1277,143 @@ fn txn_refused_seed_recycles_instead_of_buffering() {
     );
 }
 
+/// #6432 recycle-exactly-once pin for the MissingNeighbor arm — the pilot
+/// conversion of the arm's five hand-maintained
+/// `scratch_recycle.push + continue` pairs onto the
+/// `poll_stages::StageOutcome` ownership enum (one outcome per terminal
+/// path, one push + continue at the consumer). Every terminal path of the
+/// arm must account for the trigger frame EXACTLY ONCE: a leak (never
+/// recycled, never buffered) strands the UMEM frame forever, and a
+/// double-push hands the same addr back to the fill ring twice (UMEM
+/// aliasing — the #2208/#4041 class). Invariant pin: it also passes on
+/// the pre-refactor code — the refactor must leave it green.
+#[test]
+fn missing_neighbor_recycle_exactly_once_pin() {
+    // txn_run_descriptor* parks the frame at this UMEM offset, so the
+    // descriptor addr is known.
+    let frame_offset = 128u64;
+
+    // ── Phase 1: permitted + unresolved → the arm BUFFERS the frame
+    // (Continue outcome, recycle_now = false). scratch_recycle stays
+    // empty; pending_neigh takes ownership of the addr exactly once.
+    let mut snapshot = nat_snapshot();
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert!(
+        dbg.missing_neigh >= 1,
+        "phase 1 must take the MissingNeighbor arm"
+    );
+    assert_eq!(sessions.len(), 1, "permitted flow seeds a session");
+    assert!(
+        binding.scratch.scratch_recycle.is_empty(),
+        "a buffered frame must NOT also be recycled (double-push once the \
+         fill ring hands the addr out again)"
+    );
+    assert_eq!(binding.pending_neigh.len(), 1);
+    assert_eq!(
+        binding.pending_neigh.values().next().unwrap().addr,
+        frame_offset,
+        "pending_neigh owns the trigger frame's addr exactly once"
+    );
+
+    // ── Phase 2: a NEW flow (different 5-tuple) to the SAME unresolved
+    // next-hop is a duplicate-hop drop (Continue outcome, recycle_now
+    // stays true): the seed installs, but the frame is NOT buffered and
+    // the finalizer recycles it EXACTLY ONCE.
+    let frame2 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12346,
+        444,
+        TCP_FLAG_SYN,
+    );
+    let meta2 = txn_meta_v4(24, TCP_FLAG_SYN, (frame2.len() - 14) as u16);
+    let (_batch2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame2,
+        meta2,
+    );
+    assert!(
+        dbg2.missing_neigh >= 1,
+        "phase 2 must re-enter the MissingNeighbor arm"
+    );
+    assert_eq!(binding.pending_neigh.len(), 1, "buffer holds only the first hop representative");
+    assert_eq!(
+        binding
+            .scratch
+            .scratch_recycle
+            .iter()
+            .filter(|&&a| a == frame_offset)
+            .count(),
+        1,
+        "duplicate-hop frame recycled exactly once (no leak, no double-push)"
+    );
+
+    // ── Phase 3: policy-DENY inside the arm → the RecycleAndContinue
+    // outcome; the frame is recycled EXACTLY ONCE by the single consumer,
+    // nothing seeds, nothing buffers.
+    let mut deny_snapshot = nat_snapshot();
+    deny_snapshot.neighbors.clear();
+    deny_snapshot.policies.clear(); // default_policy = deny
+    let deny_forwarding = build_forwarding_state(&deny_snapshot);
+    let mut deny_binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    deny_binding.interface = Arc::<str>::from("reth1.0");
+    let mut deny_sessions = SessionTable::new();
+    let meta3 = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch3, dbg3) = txn_run_descriptor(
+        &mut deny_binding,
+        &mut deny_sessions,
+        &deny_forwarding,
+        &ha_state,
+        &frame,
+        meta3,
+    );
+    assert!(
+        dbg3.missing_neigh >= 1,
+        "phase 3 must take the MissingNeighbor arm"
+    );
+    assert!(
+        dbg3.policy_deny >= 1,
+        "default-deny must fire in the arm's #1913 policy gate"
+    );
+    assert_eq!(
+        deny_binding
+            .scratch
+            .scratch_recycle
+            .iter()
+            .filter(|&&a| a == frame_offset)
+            .count(),
+        1,
+        "denied frame recycled exactly once via the arm's single outcome consumer"
+    );
+    assert!(
+        deny_binding.pending_neigh.is_empty(),
+        "a denied flow never buffers"
+    );
+    assert_eq!(deny_sessions.len(), 0, "a denied flow seeds no session");
+}
+

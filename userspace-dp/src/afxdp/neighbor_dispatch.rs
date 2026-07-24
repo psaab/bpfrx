@@ -1320,7 +1320,7 @@ mod pending_admission_tests {
     #[test]
     fn record_drop_counts_capacity_separately() {
         use super::record_pending_neigh_admission_drop;
-        use crate::afxdp::umem::BindingLiveState;
+        use crate::afxdp::binding_state::BindingLiveState;
         use std::sync::atomic::Ordering;
 
         let live = BindingLiveState::new();

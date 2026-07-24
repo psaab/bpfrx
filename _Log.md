@@ -37,6 +37,180 @@
   codegen-units 16) has NO out-of-line walk_ipv6_ext_chain symbol — the
   #[inline(always)] core folds into every caller across CGUs.
 
+## 2026-07-24 — #6473: flip inbound NAT precedence to static-first (Junos parity)
+
+- **Timestamp**: 2026-07-24 (fix/6473-static-nat-precedence, stacked on
+  fix/6433-flow-cache-seed)
+- **Action**: BEHAVIOR CHANGE. The inbound pre-routing NAT evaluation in
+  `poll_binding_process_descriptor` consulted the DNAT pool table FIRST and
+  only fell back to static-DNAT on a pool miss — inverted vs Junos
+  (first-packet order: static NAT → destination NAT → route → policy →
+  reverse static → source NAT) and internally inconsistent with the outbound
+  direction (static SNAT first in `source_nat_decision_for_flow`). Flipped
+  the pre-routing arm to static-first: `match_dnat_with_counter_scoped`
+  runs first, the pool lookup only on a static miss, and the winner's
+  per-rule counter flows to `pre_routing_dnat_counter` as before. On an
+  overlapping static+pool config the static mapping now wins (and its
+  counter advances instead of the pool rule's); where the static rule does
+  not match the pool still applies. Documented the precedence + migration
+  note in docs/feature-coverage.md (Destination NAT row, cross-ref from the
+  Static NAT row).
+- **Files**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_policy_inbound_nat.rs,
+  docs/feature-coverage.md.
+- **Fail-on-revert**: static_nat_precedes_overlapping_dnat_pool_6473 — an
+  external address covered by BOTH a static 1:1 (→ 10.0.61.50) and a DNAT
+  pool rule (→ 10.0.61.102:8443): asserts the installed session carries the
+  STATIC translation. RED on the pre-flip code (pool shadowed the static
+  rule), GREEN after.
+- **Validation**: full cargo test --release --test-threads=1 green (4252
+  passed, 0 failed — no existing test had baked the DNAT-first order);
+  clippy warning count identical to base (675); cargo check --features
+  debug-log clean.
+
+## 2026-07-24 — #6433: extract the flow-cache seed path to flow_cache_seed.rs
+
+- **Timestamp**: 2026-07-24 (fix/6433-flow-cache-seed, stacked on
+  fix/6432-recycle-stage-outcome)
+- **Action**: Extracted the ~105-LOC flow-cache seed/write block (plus the
+  #5147 pre-resolve shard-epoch TOCTOU stamping) out of
+  `poll_binding_process_descriptor` into the new
+  `poll_descriptor/flow_cache_seed.rs` sibling (`stage_flow_cache_seed`,
+  `#[inline]`), colocating the seed half with the already-extracted read half
+  (`flow_cache_hit.rs`) so the cache's eviction invariants (#1861 §5.4
+  refused-install gate, #3048/#3918/#5147 epoch stamp, #3073/#3322
+  policy-counter stamps) review as one contract. Pure code-motion with the
+  #1327 disjoint-field-borrow discipline (`&mut binding.flow.flow_cache`) —
+  no SlowPathCarry needed: the seed's free variables are all passable
+  scalars/borrows, so the extraction was not blocked by the god fn's hoisted
+  mut-locals. Body verified verbatim against the inline original (the only
+  deltas: receiver rename, a clippy `needless_borrow` auto-ref, one joined
+  call line). Header comments in mod.rs and flow_cache_hit.rs updated to
+  name the new sibling.
+- **Files**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_seed.rs (new),
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (doc cross-ref).
+- **Validation**: cargo test --release --test-threads=1 green (4251 passed,
+  0 failed); clippy warning count identical to base (675); cargo check
+  --features debug-log clean; release disasm of
+  poll_binding_process_descriptor base-vs-branch: 14641 vs 14634
+  instructions, 478 vs 478 calls, 112 vs 112 locked instructions, called-
+  symbol set unchanged (no standalone stage_flow_cache_seed symbol — the
+  #[inline] hint was honored, zero call edge; residual diff is stack-slot
+  recoloring plus one outer_neighbor_ifindex/resolve_tunnel_outer outline
+  split of identical net call count).
+## 2026-07-24 — #6464 + #6465: scoped-global empty-element fail-open + junos-host fragment-association parity
+
+- **Timestamp**: 2026-07-24 (fix/6464-global-scope-empty-string)
+- **Action**: Two fail-closed fixes in userspace-dp/src/policy.rs, one PR.
+  (1) #6464: `build_global_zone_scope` no longer folds a scope list carrying an
+  EMPTY-STRING element into `GlobalZoneScope::Any` — the element now rejects the
+  whole snapshot with `SnapshotIntegrityError::UnresolvableZoneReference`,
+  matching the #3402 unresolvable-name arm (the `== "any"` token stays the
+  genuine wildcard). Before, a corrupt / hand-built / mixed-version-HA-peer
+  snapshot with `match_to_zones = ["dmz",""]` silently widened a scoped PERMIT
+  global to every zone pair (fail OPEN); the identical corruption with a
+  garbage name rejected the snapshot. (2) #6465: ported the #4569
+  fragment-association deny override (`note_skipped_frag_deny` /
+  `apply_frag_deny_override`) into `evaluate_junos_host_policy_l3_aware` across
+  all three tiers (exact pair, from-any wildcard, host-scoped global). A
+  host-bound non-first fragment overlapping a port-bearing junos-host DENY was
+  previously DELIVERED (the term fails closed for l4_present == false, so
+  first-match fell through to a junos-host permit or the deliver-on-no-match
+  lifeline); it now inherits the fragment-associated DROP attributed to the
+  skipped DENY, and the no-match fall-through converts to
+  `Some(frag_associated_deny_result)` when a deny was skipped (the lifeline is
+  permit-like). The L4 (l4_present = true) path never records a skip, so it is
+  byte-identical.
+- **Files**: userspace-dp/src/policy.rs (both fixes + doc comments),
+  userspace-dp/src/policy_tests.rs (new
+  `global_policy_empty_string_scope_element_fails_closed_6464`,
+  `junos_host_flowless_fragment_fails_closed_against_skipped_port_bearing_deny_6465`,
+  `junos_host_flowless_fragment_fails_closed_on_deliver_fall_through_6465`;
+  updated `junos_host_l3_aware_fails_port_bearing_term_closed_for_flowless`
+  whose fall-through assertion encoded the pre-#6465 behavior),
+  docs/feature-gaps.md (#4569 note gains the junos-host parity sentence).
+- **Fail-on-revert**: reverting the #6464 short-circuit/check turns
+  `global_policy_empty_string_scope_element_fails_closed_6464` RED (parse
+  returns Ok); reverting the #6465 junos-host body turns all three junos-host
+  frag tests RED (fragment permitted / delivered). Both verified firsthand
+  (neutralize → RED → restore → GREEN).
+- **Validation**: cargo build clean; policy::tests 183 passed; flowless (61)
+  and forwarding_build (114) suites green; full `make test-rust` green.
+  docs/junos-cli-reference.md unchanged — no committed config can emit a
+  blank scope element: the compiler emit path strips blanks before
+  validation (`firewallMatchValues` skips empty tokens; `sortDedupZones`
+  drops them), so the operator-visible commit contract is untouched (#6464
+  hardens only the snapshot-decode backstop against corrupt / hand-built /
+  mixed-version-peer snapshots).
+
+
+## 2026-07-24 — #6432: converge MissingNeighbor-arm recycle onto StageOutcome
+
+- **Timestamp**: 2026-07-24 (fix/6432-recycle-stage-outcome)
+- **Action**: Piloted the recycle-exactly-once convergence on the
+  MissingNeighbor arm of `poll_binding_process_descriptor`: the arm body now
+  produces the proven `poll_stages::StageOutcome<()>` ownership enum from a
+  labeled block, the five hand-maintained `scratch_recycle.push + continue`
+  pairs collapsed to `break 'missing_neighbor StageOutcome::RecycleAndContinue`,
+  and a single consumer at the arm tail performs the one push + continue. Pure
+  code-motion inside the same function — the pending_neigh buffer branch still
+  sets the caller's `recycle_now = false`, so the shared epilogue/finalizer are
+  untouched. Added the `missing_neighbor_recycle_exactly_once_pin` invariant
+  test (buffered / duplicate-hop / policy-deny terminal shapes; passes on both
+  pre- and post-refactor code, per honest framing for a behavior-preserving
+  refactor).
+- **Files**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_txn_flow_cache.rs.
+- **Validation**: cargo test --release --test-threads=1 green (4251 passed, 0
+  failed); clippy warning count identical to HEAD (675); cargo check
+  --features debug-log clean; release disasm of
+  poll_binding_process_descriptor old-vs-new 14653 vs 14641 instructions,
+  482 vs 478 calls, 112 vs 112 locked instructions, allocator-facing call set
+  unchanged.
+## 2026-07-24 — #6457: flow-cache invalidation on control-plane session delete (clear/cluster-stale/HA DeleteSynced)
+
+- **Timestamp**: 2026-07-24 (fix/6457-flowcache-delete-invalidate)
+- **Action**: Close the fail-open where a control-plane session delete never
+  invalidated the per-worker flow cache. The stage-12 hit path validates only
+  config/fib generation, RG epoch/lease, and the neighbor-MAC epoch — never
+  session existence — and none of the three delete flows that funnel through
+  `WorkerCommand::DeleteSynced` (operator `clear security flow session [all]`,
+  cluster-stale sweep `BatchDeleteSessions`, HA DeleteSynced propagation via
+  `delete_synced_session_gen` / `replicate_session_delete`) bumps any of those
+  stamps. A revoked-but-continuously-active 5-tuple kept HITTING its cached
+  RewriteDescriptor: forwarded with no session row, no policy re-eval, no
+  `show security flow session` visibility, no HA sync — the operator's
+  revocation primitive silently defeated. Fix extends the #3776 GC-reap
+  invalidation pattern: `handle_delete_synced` records every deleted key
+  (unconditionally — a stale descriptor outlives its table entry) into the
+  new `WorkerCommandResults.deleted_synced_keys`; the worker loop (the only
+  site with `&mut bindings`, same constraint as the #941 vacate dispatch)
+  drains it through `invalidate_flow_cache_slots_for_deleted_sessions`,
+  calling `flow_cache.invalidate_slot(&key, binding.ifindex)` on every
+  binding. Zero per-packet cost: cold control path only, hit path untouched.
+- **Files**: userspace-dp/src/afxdp/session_glue/commands/delete_synced.rs
+  (record the key), userspace-dp/src/afxdp/session_glue/mod.rs
+  (WorkerCommandResults.deleted_synced_keys + dispatch accumulator),
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs (dispatch +
+  invalidate_flow_cache_slots_for_deleted_sessions + tests; reap test module
+  renamed flow_cache_invalidation_tests with parameterized fixtures),
+  userspace-dp/src/afxdp/session_glue/tests.rs (record-half tests),
+  userspace-dp/src/session/README.md (new "Flow-cache invalidation on
+  control-plane delete (#6457)" section).
+- **Fail-on-revert**: session_glue `delete_synced_records_key_for_flow_cache_
+  invalidation` + `delete_synced_records_key_even_when_session_already_absent`
+  (RED when the `deleted_keys.push` is removed — verified); loop_body
+  `delete_synced_flow_cache_slot_is_invalidated`,
+  `delete_synced_snat_descriptor_is_not_reused`,
+  `delete_synced_invalidation_walks_every_binding` (RED when the helper's
+  invalidate_slot loop is gutted — verified; the #3776 reap tests stayed
+  GREEN under both probes).
+- **Validation**: cargo build green; targeted tests 8/8 green; full
+  `cargo test --release --bins --tests -- --test-threads=1` green
+  (4164 bin + 91 integration, 0 failed). No Go files touched (the delete
+  IPC fan-out in pkg/dataplane/userspace already routes per-key deletes to
+  the helper; the missing half was helper-side).
 ## 2026-07-24 — #6459/#6463/#6477: fail-close partial filter port/address lists on the tolerant path
 
 - **Timestamp**: 2026-07-24 (fix/6459-filter-fail-closed-markers)
@@ -60894,3 +61068,32 @@ top.
   unchanged → no regen).
 - **File(s)**: pkg/dataplane/userspace/eventstream_oversized_drop_path_6160_test.go,
     _Log.md
+- **Timestamp**: 2026-07-24
+- **Action**: Extract `afxdp::binding_state` out of `afxdp::umem` (#6436).
+    `umem/mod.rs` was ~85% binding runtime state fused into the memory-region
+    module: the 153-field `BindingLiveState` cluster, the `PendingTxAdmission`
+    RAII single-release token, the hot per-packet TX enqueue paths, and the HA
+    session-delta loss-latch buffer. Pure code-motion split:
+    `binding_state/{mod,tx_inbox,latency,session_delta,snapshot,debug_state,
+    profile}.rs` + `binding_state/tests/` (the #4667 per-concern test layout
+    maps 1:1; `umem/tests/` keeps `mmap_area` only). `umem/` shrinks to
+    ~120 lines of pure memory region (`MmapArea`, `WorkerUmem{,Inner,Pool}`).
+    No field reordering; atomic orderings + RAII disarm-on-push byte-identical;
+    all 8 `const _: () = assert!` guards travel verbatim. Method visibility
+    re-declared `pub(in crate::afxdp)` at the new module depth — same effective
+    visibility as `pub(super)` from `umem`. asm-diff on the canonical release
+    binary: `push_redirect_inbox` 89/89 insns identical, `take_pending_tx_into`
+    135/135 identical, `drop_in_place<PendingTxAdmission>` 10/10 identical,
+    `enqueue_tx_owned` 254/254 (only the REDIRECT_SAMPLE_SEQ TLS slot offset
+    moved — module-rename TLS relocation). Warning parity 159/159 (check) and
+    120/120 (check --tests) vs the 023f17a60 base. Validation: cargo check,
+    cargo test --release --bins --tests --test-threads=1 GREEN (two full runs).
+- **File(s)**: userspace-dp/src/afxdp/binding_state/{mod,tx_inbox,latency,
+    session_delta,snapshot,debug_state,profile,README}.rs/md,
+    userspace-dp/src/afxdp/binding_state/tests/{mod,tx_inbox,latency_buckets,
+    snapshot_propagation,tx_submit_latency,tx_kick_latency,debug_state}.rs,
+    userspace-dp/src/afxdp/umem/{mod.rs,README.md,tests/mod.rs},
+    userspace-dp/src/afxdp/{mod.rs,README.md},
+    userspace-dp/src/afxdp/{coordinator/status.rs,coordinator/tests.rs,
+    cos/cross_binding.rs,neighbor_dispatch.rs,tx/stats.rs,types/cos.rs},
+    docs/pr/6436-binding-state-extract/plan.md, _Log.md
