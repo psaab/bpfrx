@@ -3576,7 +3576,24 @@ reserved for whole-dataplane selection where a rewrite shim
     mapped-port notaport`) fails closed — any malformed occurrence zeroes
     the port and the strict gate names the bad token, with no first-wins
     gate that could let a later malformed duplicate slip past an earlier
-    valid one. The scan is grammar-POSITION-aware
+    valid one. Across MULTIPLE `static-nat` sibling targets in ONE `then`
+    block (the hierarchical `then { static-nat {…} static-nat {…} }` shape,
+    which Junos merges into one action), each sibling's reading folds
+    through `mergeMappedPortState`, which OR-accumulates presence and
+    LATCHES fail-closed on any malformed operand — so a later clean sibling
+    can no longer overwrite an earlier sibling's presence/malformed stamp
+    back to false (the #6479 multi-block silent-accept, closed in BOTH the
+    nptv6 and the prefix/prefix-name branches). This sibling accumulation is
+    scoped WITHIN one `then` block; SEPARATE `then {}` blocks remain #3850
+    last-then-block-wins (a whole superseded block is dead config, not part
+    of the effective action). NOTE on duplicate resolution: the all-valid
+    duplicate last-wins (`mapped-port 8080 mapped-port 9090` → 9090) is the
+    INTENTIONAL disposition of a contradictory duplicate and DIFFERS from
+    origin/master's first-wins (8080). It is not a working-config
+    regression — a duplicate mapped-port on one target is malformed
+    authoring, defensible either way — and last-wins is chosen for
+    consistency with the Junos duplicate-stanza rule the rest of this fold
+    already follows. The scan is grammar-POSITION-aware
     (`staticNATMappedPortOperandsFromKeys`): a `mapped-port` token is
     skipped ONLY when it is the free-form VALUE of an immediately preceding
     NAME-valued keyword (`mappedPortNameValuedKeywords`: `routing-instance`,

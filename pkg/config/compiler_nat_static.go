@@ -227,12 +227,14 @@ func staticNATMappedPortForNode(t *Node) (port int, raw string, present bool) {
 // gate (validateNPTv6Strict) rejects it — warns on the lenient no-brick path —
 // while keeping MappedPort==0: a port is meaningless on nptv6 and no bogus port
 // must cross the wire to the port-less nptv6 dataplane path.
+//
+// #6479 item 1: it folds through mergeMappedPortState with a FORCED port 0 (nptv6
+// never installs a value) so PRESENCE accumulates and, critically, a later clean
+// `prefix`/`prefix-name` sibling target in the same `then` block can no longer
+// overwrite the stamp back to false — the multi-block nptv6 silent-accept.
 func recordNPTv6MappedPortPresence(rule *StaticNATRule, t *Node) {
-	if _, raw, present := staticNATMappedPortForNode(t); present {
-		rule.MappedPort = 0 // nptv6 has no port; never install one
-		rule.MappedPortRaw = raw
-		rule.MappedPortPresent = true
-	}
+	_, raw, present := staticNATMappedPortForNode(t)
+	mergeMappedPortState(rule, 0, raw, present) // nptv6 has no port; never install one
 }
 
 // combineMappedPortOperands folds one-or-more `mapped-port` operands (the
@@ -247,6 +249,14 @@ func recordNPTv6MappedPortPresence(rule *StaticNATRule, t *Node) {
 //   - no operands:                    (0, "",          false) — keyword absent.
 //   - every operand a valid 1-65535:  (last, "<last>", true) — last-wins, the
 //     Junos duplicate-stanza rule; a single valid token is the common case.
+//     #6479 semantics note: an all-valid DUPLICATE on one target
+//     (`mapped-port 8080 mapped-port 9090` → 9090) resolves last-wins,
+//     which DIFFERS from origin/master's first-wins (8080). A duplicate
+//     mapped-port on a single target is contradictory/malformed authoring
+//     (either resolution is defensible); last-wins is the INTENTIONAL
+//     choice here for consistency with the Junos duplicate-stanza rule the
+//     rest of this fold uses, and is NOT a working-config regression (a
+//     duplicate is not a valid production config on master either).
 //   - ANY operand malformed (empty, bare, non-numeric, or out-of-range):
 //     (0, "<first non-empty bad token>", true) — FAIL CLOSED. A contradictory
 //     duplicate (`mapped-port 8080 mapped-port notaport`) is rejected, not
@@ -284,6 +294,70 @@ func combineMappedPortOperands(operands []string) (port int, raw string, present
 		return 0, badRaw, true
 	}
 	return lastValidPort, lastValidRaw, true
+}
+
+// mergeMappedPortState folds ONE static-nat target block's mapped-port reading
+// (port, raw, present) into the rule's ACCUMULATING mapped-port state, so a later
+// clean target block in the SAME `then` block can never silently CLEAR a presence
+// or malformed stamp an earlier block set (#6479 item 1, the multi-block silent-
+// accept). A single `then` may carry several `static-nat` targets (the
+// hierarchical `then { static-nat { nptv6-prefix P { mapped-port BAD; } }
+// static-nat { prefix Q; } }` sibling shape); Junos merges them into one action,
+// so the mapped-port from ANY sibling is part of that action and must be gated.
+// Before this fold the per-target direct assignment `rule.MappedPort, … =
+// staticNATMappedPortForNode(t)` let the LAST sibling's (0,"",false) reading
+// overwrite an earlier sibling's malformed stamp — the C179-038 class reopened
+// for the multi-block shape, in BOTH the nptv6 and non-nptv6 branches.
+//
+// Semantics (matching combineMappedPortOperands, applied across sibling blocks):
+//   - present==false: NO-OP. An absent mapped-port neither stamps presence nor
+//     clears an earlier stamp — this is the exact overwrite the fix removes.
+//   - the FIRST present block stamps MappedPortPresent (never reset to false here).
+//   - a malformed operand in ANY block (present && port==0) LATCHES the rule
+//     fail-closed (MappedPort==0, raw naming the offending token); a later valid
+//     or absent block cannot un-fail it (order-independent fail-closed).
+//   - among all-valid blocks the LAST valid port wins (Junos duplicate-stanza
+//     last-wins).
+//
+// The per-`then`-block reset (compileNATStatic) still runs BETWEEN separate
+// `then {}` blocks, preserving the #3850 last-then-block-wins semantics: a whole
+// superseded `then` block is dead config, not part of the effective action. This
+// accumulation is scoped to sibling targets WITHIN one `then` block.
+func mergeMappedPortState(rule *StaticNATRule, port int, raw string, present bool) {
+	if !present {
+		return
+	}
+	// Latch: once a malformed operand has been seen for this rule the state is
+	// fail-closed (present && MappedPort==0). A later block cannot un-fail it;
+	// capture a diagnostic token only if none was recorded yet.
+	failClosed := rule.MappedPortPresent && rule.MappedPort == 0
+	rule.MappedPortPresent = true
+	if failClosed {
+		if rule.MappedPortRaw == "" && raw != "" {
+			rule.MappedPortRaw = raw
+		}
+		return
+	}
+	if port == 0 {
+		// This block is present-but-malformed (empty, bare, non-numeric,
+		// out-of-range, or the literal "0"): fail closed, name its token.
+		rule.MappedPort = 0
+		rule.MappedPortRaw = raw
+		return
+	}
+	// This block carries a valid 1-65535 port: last-valid-wins.
+	rule.MappedPort = port
+	rule.MappedPortRaw = raw
+}
+
+// mergeMappedPortForNode reads the genuine `mapped-port` modifier(s) attached to
+// one static-nat target node (across every AST shape, via staticNATMappedPortFor-
+// Node) and folds the result into the rule's accumulating state
+// (mergeMappedPortState). It is the accumulate-don't-overwrite replacement for the
+// per-target direct assignment on the prefix / prefix-name branches (#6479).
+func mergeMappedPortForNode(rule *StaticNATRule, t *Node) {
+	port, raw, present := staticNATMappedPortForNode(t)
+	mergeMappedPortState(rule, port, raw, present)
 }
 
 // staticNATRoutingInstanceFromKeys scans a collapsed static-nat `then` leaf's
@@ -427,6 +501,17 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 			// persist. A single static-nat then-block is a complete spec, so
 			// `prefix X mapped-port P` within one block stays coupled: the reset
 			// runs BETWEEN blocks, then the whole block is read (#3850 review).
+			//
+			// #6479 item 1: WITHIN one `then` block the child loop below may see
+			// several `static-nat` sibling targets (the hierarchical `then {
+			// static-nat {…} static-nat {…} }` shape). Those siblings are one
+			// merged Junos action, so their mapped-port readings ACCUMULATE
+			// through mergeMappedPortState (not a per-target overwrite): a later
+			// clean sibling can no longer clear a presence/malformed stamp an
+			// earlier sibling set, in either the nptv6 or the prefix/prefix-name
+			// branch. The reset here is scoped to BETWEEN `then` blocks and still
+			// gives #3850 last-then-block-wins — a superseded whole block is dead
+			// config, distinct from a merged sibling target that is live.
 			for _, thenNode := range ruleInst.node.FindChildren("then") {
 				rule.Then = ""
 				rule.IsNPTv6 = false
@@ -469,13 +554,13 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// reopened for the prefix-name shape. The scan is grammar-
 							// aware: a prefix-name entry NAMED "mapped-port" is the
 							// name value, not a modifier, and registers no port.
-							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortForNode(t)
+							mergeMappedPortForNode(rule, t)
 						} else if pn := t.FindChild("prefix-name"); pn != nil {
 							// static-nat { prefix-name NAME; }
 							rule.ThenPrefixName = nodeVal(pn)
 							// #6479: gate a prefix-name mapped-port identically (see
 							// the collapsed-keys branch above).
-							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortForNode(t)
+							mergeMappedPortForNode(rule, t)
 						} else if len(t.Keys) >= 3 && t.Keys[1] == "prefix" {
 							rule.Then = t.Keys[2]
 							// #2491 / #6479: recover the optional `mapped-port
@@ -487,7 +572,7 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// through one combine so a malformed operand in any
 							// shape fails closed, and skips a `mapped-port` that
 							// is actually a routing-instance/prefix-name VALUE.
-							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortForNode(t)
+							mergeMappedPortForNode(rule, t)
 						} else if pn := t.FindChild("prefix"); pn != nil {
 							rule.Then = nodeVal(pn)
 							// #2491 / C179-038 / #6479: recover the `mapped-port
@@ -510,7 +595,7 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// NAMED "mapped-port" no longer false-rejects). It does
 							// NOT skip after `prefix`, whose value is always an IP,
 							// so `prefix mapped-port <port>` is recovered (#6479).
-							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortForNode(t)
+							mergeMappedPortForNode(rule, t)
 						} else if t.FindChild("inet") != nil || (len(t.Keys) >= 2 && t.Keys[1] == "inet") {
 							// static-nat { inet; } — NAT64 translation
 							rule.Then = "inet"
