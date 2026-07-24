@@ -463,29 +463,40 @@ must be neither attacker-jumpable nor attacker-seedable):**
    (≫ `FWD_SLACK` away) can never repair it — a permanent acceptance
    window near sequence zero that a naive `seq=1` blind RST validates
    (round-2 Codex 3; this was a live hole in v1–v3).
-4. **seed trust (round-2 Codex 3 / SMR 3):** a `!valid` seed is adopted
-   only when it is *corroborated*:
-   - the opposite-direction anchor side that bounds it is **trusted**, and
-     the seed lands inside that side's window — a seq seed for direction D
-     is cross-bounded by `ack_hi(O)` (O's ack of D's data tracks D's real
-     position even while D is unobserved, so legit asymmetric rejoins pass);
-     an ack seed for D is cross-bounded by `seq_hi(O)`. Adopt → set
-     `valid` + `trusted`. Attacker cost for a fake seed: one in-window
-     guess (~1/2^13) — identical to attacking the close directly, no
-     amplification;
-   - OR no trusted bounding side exists → adopt the sample as **valid but
-     UNtrusted** (tracking only). An untrusted side never validates a
-     close (§5.4), and untrusted sides cannot confer trust on each other
-     (self-consistent fabrication stays untrusted). The 2-packet seed race
-     from v3 (spoof data seq=X, then RST at X) dies: either a trusted
-     opposite anchor exists (the seed is a 1/2^13 guess) or it doesn't
-     (the close is refused regardless).
-   Install-time seeds (rule (c)) are born trusted. The residual: an
-   HA-imported/pre-upgrade entry with zero local wire-truth never
-   validates a close — its legit teardowns linger to the ordinary timeout
-   (bounded; delivery unaffected; churn replaces the entry with trusted
-   seeds). The additive HA-wire anchor field (§10 follow-up) restores
-   fast-reap for the synced class.
+4. **seed trust (round-2 Codex 3 / SMR 3):** trust is acquired per
+   *segment*, not per field — **a segment authenticates when ANY of its
+   fields cross-bounds against trusted state, and all samples of an
+   authenticated segment are adopted `valid`+`trusted`**:
+   - a seq sample for direction D cross-bounds against `ack_hi(O)`
+     (O's ack of D's data tracks D's real position even while D is
+     unobserved, so legit asymmetric rejoins pass);
+   - an ack sample for D cross-bounds against `seq_hi(O)`;
+   - install seeds (rule (c)) are self-authenticating (the session exists
+     because the firewall saw this segment; an attacker's spoofed SYN
+     anchors only its own invented flow).
+   The handshake bootstraps cleanly: the SYN self-authenticates (fwd seq
+   trusted); the SYN-ACK authenticates via `ack == fwd seed` (the
+   handshake proof — a spoofed SYN-ACK needs the client ISN, 1/2^32) so
+   BOTH its seq and ack are trusted (a fast server abort right after
+   connect validates — rule-1 leg `seq_hi(rev)` is trusted from birth);
+   the client's first ACK authenticates via `ack == rev seed`. Mid-flow,
+   every real segment authenticates trivially (contiguity). Attacker
+   cost: landing ANY field inside a trusted window is one ~1/2^13 guess —
+   identical to attacking the close directly, so seeding confers **no
+   amplification** (a fake trusted seed at X then a RST at X costs the
+   same expected sprays as a direct in-window RST guess).
+   Samples of an UNauthenticated segment are adopted `valid` but
+   **untrusted** (tracking only): they never validate a close (§5.4), and
+   untrusted state cannot authenticate other segments (a fabricated
+   self-consistent pair stays untrusted). The 2-packet seed race from v3
+   (spoof data seq=X, then RST at X) dies: either trusted state exists to
+   bound against (the seed is a 1/2^13 guess, same as the direct attack)
+   or it doesn't (the close is refused regardless).
+   The residual: an HA-imported/pre-upgrade entry with zero local
+   wire-truth never authenticates a segment — its legit teardowns linger
+   to the ordinary timeout (bounded; delivery unaffected; churn replaces
+   the entry with trusted seeds). The additive HA-wire anchor field (§10
+   follow-up) restores fast-reap for the synced class.
 5. **Closing packets never promote.** `promote_from_reverse`
    (`lookup.rs:146-149`) currently sets `established` in-borrow on any
    reverse SYN-ACK — including a SYN+ACK+RST-flagged packet whose close is
@@ -956,15 +967,19 @@ Smoke (loss userspace cluster, lock protocol per CLAUDE.md):
 
 ## 11. Open questions for adversarial review (round 3)
 
-1. **Seed cross-bounding soundness (§5.2 rule 4):** a `!valid` seed is
-   adopted+trusted only inside an already-trusted opposite anchor's
-   window. Verify the TCP invariant both directions: (a) legit — is
-   `ack_hi(O)` ALWAYS within `FWD_SLACK` of a legit first-observed
-   direction-D sample (asymmetric rejoin, long-unobserved stretch where
-   acks kept flowing, SACK-driven ack jumps)? (b) attacker — is the fake
-   seed cost really identical to a direct close guess (no amplification),
-   and does the untrusted-can-never-confer-trust rule have any legit
-   casualty beyond the documented imported-entry lingering?
+1. **Seed authentication soundness (§5.2 rule 4):** a segment
+   authenticates when ANY field cross-bounds against trusted state, and
+   all its samples then adopt trusted. Verify the TCP invariant both
+   directions: (a) legit — the handshake chain (SYN self-authenticates;
+   SYN-ACK via `ack == fwd seed`; client ACK via `ack == rev seed`) plus
+   mid-flow contiguity must leave every real flow fully trusted within
+   the handshake; is there ANY real segment early in a flow that fails
+   to authenticate (asymmetric start, simultaneous open, TFO, pickup
+   from a data segment)? (b) attacker — is the fake-authentication cost
+   really identical to a direct close guess (one ~1/2^13 window hit
+   either way, no amplification), and does the
+   untrusted-can-never-authenticate rule have any legit casualty beyond
+   the documented imported-entry lingering?
 2. **Refuse-demote cost bound (§5.4 rule 3):** post-failover, every
    imported flow's closes refuse until churn. Quantify the worst realistic
    table pressure: N imported flows × peers that died during failover →
