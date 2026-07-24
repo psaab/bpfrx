@@ -2,6 +2,7 @@ package upgrade
 
 import (
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -330,14 +331,25 @@ var statVersionDir = os.Stat
 // symlink outright: a managed runtime is a real copied file, and a symlink at
 // this path is corruption/tampering.
 //
-// LIMIT (static validation, #6409): this checks the executable BIT and file
-// TYPE, not the file's CONTENT. A regular exec-bit file with non-executable
-// content (arbitrary text chmod'd 0755, a corrupt/truncated or wrong-arch
-// binary) passes here but execve would fail — that is undecidable statically
-// (an ELF-magic probe is a heuristic; a shebang script is executable but not
-// ELF), so final content-executability is systemd's arbiter at restart. That
-// rare tampering/corruption residual is tracked in #6409; the common
-// dangling/pathful/incomplete/wrong-type/non-exec modes are rejected here.
+// CONTENT gate (#6409): metadata (regular file + executable bit) does not
+// prove the file's CONTENT is kernel-executable. A regular exec-bit file whose
+// content is arbitrary text (chmod'd 0755), an empty/truncated file, or a file
+// with a corrupt header passes the type/bit checks yet execve would fail,
+// stranding the daemon after STOP exactly like a missing binary. Each lockstep
+// entry is therefore parsed as an ELF image (elfHeaderParseable): the lockstep
+// set is exclusively native compiled binaries (xpfd, xpf-userspace-dp), never a
+// script, so an ELF header gate carries no false-reject risk for a legitimate
+// non-ELF runtime — that concern applies only to the non-lockstep managed set,
+// which this predicate does not gate.
+//
+// LIMIT (#6409): the ELF header parse is a HEURISTIC, not a guarantee. It
+// rejects the common corruption modes (non-ELF text/script, empty/truncated,
+// corrupt header), but a structurally valid ELF whose MACHINE is wrong for the
+// running architecture or whose BODY is corrupt still parses here and would
+// only fail execve at restart. Proving "systemd can exec this" without exec'ing
+// it is undecidable statically, so that residual (a valid-header, wrong-arch or
+// corrupt-body image) remains systemd's arbiter, surfaced by the existing
+// start-failure / auto-rollback path — not a silent bad cutover.
 func (r *Runner) validateRestorableVersion(ver string) error {
 	if err := ValidateVersionSegment(ver); err != nil {
 		return err
@@ -370,8 +382,40 @@ func (r *Runner) validateRestorableVersion(ver string) error {
 			return fmt.Errorf("version dir %s lockstep binary %s is not executable "+
 				"(mode %s); systemd could not exec it after STOP", dir, b, bi.Mode())
 		}
+		// Best-effort CONTENT gate (#6409): the exec bit and regular-file type
+		// do not prove the content is a loadable image. Reject a regular
+		// exec-bit file whose content is not a parseable ELF image (arbitrary
+		// text chmod'd 0755, an empty/truncated file, a corrupt header) — it is
+		// not a safe rollback runtime to keep before STOP. This is a heuristic,
+		// not an execve oracle: see the CONTENT gate / LIMIT note above — a
+		// valid-header wrong-arch or corrupt-body image still parses here and
+		// remains systemd's arbiter at restart, and a rejection here proves this
+		// policy gate failed, not that execve would definitively fail.
+		if cerr := elfHeaderParseable(p); cerr != nil {
+			return fmt.Errorf("version dir %s lockstep binary %s failed the "+
+				"ELF-image content gate (%v); its content is not a loadable ELF "+
+				"image, so it is unsafe to keep as a restorable rollback target",
+				dir, b, cerr)
+		}
 	}
 	return nil
+}
+
+// elfHeaderParseable is the best-effort content-executability probe behind
+// validateRestorableVersion's #6409 CONTENT gate. It reports nil only when path
+// opens as an ELF image (valid ELF identifier + a parseable header). It is
+// deliberately a header parse, not an exec dry-run: proving a file is
+// kernel-executable without exec'ing it is undecidable statically, so this
+// rejects the common corruption modes (non-ELF text/script, empty/truncated,
+// corrupt header) and leaves the wrong-architecture / corrupt-body residual to
+// systemd at restart. debug/elf.Open reads only the header structures and is
+// closed immediately; it never maps or executes the file.
+func elfHeaderParseable(path string) error {
+	f, err := elf.Open(path)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // restorableCurrentTarget resolves the `current` bookkeeping symlink into a

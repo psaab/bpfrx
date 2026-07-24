@@ -59961,6 +59961,54 @@ top.
     now lives). Doc/comment-only — go build/vet clean, heatmap canary +
     pkg/frr tests GREEN, zero code delta.
   - **File(s)**: pkg/frr/manager.go, pkg/frr/README.md, _Log.md
+- **Timestamp**: 2026-07-23
+  - **Action**: #6409 — add a best-effort ELF-header CONTENT gate to
+    pkg/upgrade validateRestorableVersion. Metadata (regular file + exec
+    bit) does not prove a lockstep rollback binary's content is
+    kernel-executable; a regular exec-bit file that is arbitrary text
+    (chmod 0755), empty/truncated, or has a corrupt header passes the
+    #6408 type/bit checks yet execve fails, stranding the daemon after
+    STOP. Each manifest.LockstepNames() entry is now parsed via
+    debug/elf.Open (new elfHeaderParseable helper). The lockstep set is
+    exclusively native compiled binaries (xpfd, xpf-userspace-dp), never
+    a script, so an ELF gate carries no false-reject risk for a
+    legitimate non-ELF runtime. Documented as a heuristic: a valid-header
+    wrong-arch / corrupt-body image still parses and remains systemd's
+    arbiter at restart. Test helpers writeFakeBin/fakeBinContent now emit
+    a minimal parseable ELF so restorable-target tests stay valid; six
+    copy-fidelity assertions compare against fakeBinContent(). New
+    fail-on-revert test restorable_content_6409_test.go covers text /
+    empty / truncated / partial-header content plus a valid-ELF control
+    and a sanctioned-cut INIT integration case. go build/vet clean, full
+    go test ./... GREEN; parent-RED verified (neutralizing the gate makes
+    the corrupt-content subtests + the sanctioned-cut test go clean
+    ASSERTION RED while the valid-ELF control stays green).
+  - **File(s)**: pkg/upgrade/runner.go,
+    pkg/upgrade/restorable_content_6409_test.go,
+    pkg/upgrade/runner_test.go, pkg/upgrade/stagedgen_cut_test.go,
+    pkg/upgrade/verify_cleanup_test.go, docs/in-place-upgrade.md, _Log.md
+- **Timestamp**: 2026-07-23
+  - **Action**: #6409 (PR #6445) — fold Codex MERGE-NEEDS-MINOR. (1)
+    Scope-boundary canary TestValidateRestorableVersion_NonLockstepEntryNotELFGated:
+    a restorable version whose NON-lockstep managed entry (cli /
+    xpf-day0-config) is an executable `#!/bin/sh` shebang script must be
+    ACCEPTED (validateRestorableVersion returns nil) — the ELF gate
+    iterates manifest.LockstepNames(), not Names(), so it never touches a
+    legitimate non-ELF script runtime. Parent-RED: broaden the loop
+    selector LockstepNames()->Names() at runner.go:365 -> canary goes
+    clean-assertion RED (cli shebang ELF-rejected); verified + restored.
+    (2) Softened the content-gate error string to the heuristic framing
+    ("failed the ELF-image content gate ...; its content is not a loadable
+    ELF image, so it is unsafe to keep as a restorable rollback target") —
+    an elf.Open rejection proves the policy gate failed, not definitive
+    execve failure; updated the matching inline comment and the test
+    substring assertion. (3) NIT: restored the explicit os.Chmod(0755) in
+    writeFakeBin so overwriting a pre-existing non-exec file still yields
+    an exec-bit binary. go build/vet clean, pkg/upgrade + full go test
+    ./... GREEN.
+  - **File(s)**: pkg/upgrade/runner.go,
+    pkg/upgrade/restorable_content_6409_test.go,
+    pkg/upgrade/runner_test.go, _Log.md
   - **Timestamp**: 2026-07-24 02:30 UTC
   - **Action**: #6430 pure code-motion split of pkg/dhcp/dhcp.go (2,148
     LOC), which fused the DHCPv4 client, the DHCPv6 client/PD, DUID
