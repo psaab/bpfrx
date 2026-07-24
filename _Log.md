@@ -60855,3 +60855,32 @@ top.
   unchanged → no regen).
 - **File(s)**: pkg/dataplane/userspace/eventstream_oversized_drop_path_6160_test.go,
     _Log.md
+- **Timestamp**: 2026-07-24
+- **Action**: Extract `afxdp::binding_state` out of `afxdp::umem` (#6436).
+    `umem/mod.rs` was ~85% binding runtime state fused into the memory-region
+    module: the 153-field `BindingLiveState` cluster, the `PendingTxAdmission`
+    RAII single-release token, the hot per-packet TX enqueue paths, and the HA
+    session-delta loss-latch buffer. Pure code-motion split:
+    `binding_state/{mod,tx_inbox,latency,session_delta,snapshot,debug_state,
+    profile}.rs` + `binding_state/tests/` (the #4667 per-concern test layout
+    maps 1:1; `umem/tests/` keeps `mmap_area` only). `umem/` shrinks to
+    ~120 lines of pure memory region (`MmapArea`, `WorkerUmem{,Inner,Pool}`).
+    No field reordering; atomic orderings + RAII disarm-on-push byte-identical;
+    all 8 `const _: () = assert!` guards travel verbatim. Method visibility
+    re-declared `pub(in crate::afxdp)` at the new module depth — same effective
+    visibility as `pub(super)` from `umem`. asm-diff on the canonical release
+    binary: `push_redirect_inbox` 89/89 insns identical, `take_pending_tx_into`
+    135/135 identical, `drop_in_place<PendingTxAdmission>` 10/10 identical,
+    `enqueue_tx_owned` 254/254 (only the REDIRECT_SAMPLE_SEQ TLS slot offset
+    moved — module-rename TLS relocation). Warning parity 159/159 (check) and
+    120/120 (check --tests) vs the 023f17a60 base. Validation: cargo check,
+    cargo test --release --bins --tests --test-threads=1 GREEN (two full runs).
+- **File(s)**: userspace-dp/src/afxdp/binding_state/{mod,tx_inbox,latency,
+    session_delta,snapshot,debug_state,profile,README}.rs/md,
+    userspace-dp/src/afxdp/binding_state/tests/{mod,tx_inbox,latency_buckets,
+    snapshot_propagation,tx_submit_latency,tx_kick_latency,debug_state}.rs,
+    userspace-dp/src/afxdp/umem/{mod.rs,README.md,tests/mod.rs},
+    userspace-dp/src/afxdp/{mod.rs,README.md},
+    userspace-dp/src/afxdp/{coordinator/status.rs,coordinator/tests.rs,
+    cos/cross_binding.rs,neighbor_dispatch.rs,tx/stats.rs,types/cos.rs},
+    docs/pr/6436-binding-state-extract/plan.md, _Log.md
