@@ -6,9 +6,28 @@
 //   - config_render.go:  Non-protocol config rendering (interface settings,
 //     static routes, generate-routes, DHCP defaults,
 //     backup-router, cluster-mode defaults, ECMP).
-//   - policy_render.go:  Protocols + policy rendering (OSPF/OSPFv3/BGP/RIP/
-//     ISIS, policy-options, redistribute, BFD profile
-//     dedup).
+//   - policy_render.go:  Policy-statement -> route-map rendering
+//     (generatePolicyOptions), community classification,
+//     renderComposedRouteMap, and the -xpf-redist
+//     fail-closed alias guard (redistAliasCollision).
+//     #6424 split the protocol/redistribute/BFD/
+//     prefix-list/chain/validation aspects into the
+//     sibling files below.
+//   - protocols_render.go: generateProtocols for OSPF/OSPFv3/BGP/RIP/ISIS.
+//   - redistribute.go:   export -> FRR redistribute (resolveRedistribute).
+//   - bgp_policy_chain.go: #5277 ordered export/import composed-chain
+//     resolution (bgpNeighborExportChain/ImportChain,
+//     bgpComposedChainCollision).
+//   - bfd.go:            #2550 single-block BFD profile/peer accumulator
+//     (bfdSection, newBFDSection, addProfile/addPeer,
+//     bfdProfileName).
+//   - prefix_list_render.go: route-filter / from-prefix-list rendering
+//     (renderRouteFilterEntry, renderFromPrefixListACL,
+//     partitionRouteFiltersByFamily, fromPrefixListRefs).
+//   - render_validate.go: sanitizeFRRValue + the FRR value-validation
+//     belt (validRouterID / validClusterID / validBGPOrigin).
+//   - naming.go:         FRR identifier naming for xpf-generated objects
+//     (#5872 routeFilterACLName + collision precheck).
 //   - vtysh.go:          frrExecutor interface + realExecutor + thin raw
 //     Get* shells.
 //   - status_parse.go:   Parsed Get* methods + their public types +
