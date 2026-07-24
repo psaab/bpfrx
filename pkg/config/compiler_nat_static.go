@@ -67,11 +67,13 @@ func applyStaticNATFromScope(rs *StaticNATRuleSet, s natMatchScope) {
 	}
 }
 
-// mappedPortNameValuedKeywords is the set of static-NAT `then` keywords whose
-// following token is an operator-chosen NAME (not an IP/prefix), so that name
-// could legally be the literal string "mapped-port". A `mapped-port` token that
-// is the VALUE of one of these keywords is NOT a mapped-port modifier and must
-// be skipped by the operand scan (#6479):
+// mappedPortNameValuedKeywords is the set of static-NAT `then` keywords that
+// CONSUME their following token as an operator-chosen NAME (not an IP/prefix),
+// so that name could legally be the literal string "mapped-port". The
+// grammar-role-aware operand scan (staticNATMappedPortOperandsFromKeys) treats
+// the token immediately after one of these keywords as a consumed VALUE slot,
+// never a modifier keyword — so a `mapped-port` sitting in that slot is the name,
+// not the port modifier (#6479):
 //
 //   - `routing-instance <ri>` — a translation-target routing-instance may be
 //     NAMED "mapped-port" (#4292).
@@ -79,19 +81,20 @@ func applyStaticNATFromScope(rs *StaticNATRuleSet, s natMatchScope) {
 //     global address-book entry (#4290) that may be NAMED "mapped-port".
 //
 // `prefix` AND `nptv6-prefix` are deliberately ABSENT: both take an IP/CIDR
-// prefix value that can NEVER be the string "mapped-port", so a `mapped-port`
-// token immediately after either literal keyword is ALWAYS the genuine modifier.
+// prefix value that can NEVER be the string "mapped-port", so the scan does NOT
+// consume-and-shadow the token after either literal keyword — a `mapped-port`
+// immediately following `prefix`/`nptv6-prefix` is ALWAYS the genuine modifier.
 // The canonical separate-set-line Junos forms `prefix <ip>` + `prefix
 // mapped-port <port>` and `nptv6-prefix <p6>` + `nptv6-prefix mapped-port
 // <port>` collapse the modifier line to Keys `["prefix","mapped-port","<port>"]`
 // / `["nptv6-prefix","mapped-port","<port>"]`, and the modifier MUST be
 // recovered from that position. `prefix` was a round-4 over-defensive addition
 // removed in round 5 (it false-rejected the canonical clean rule AND reopened
-// the C179-038 fail-open); `nptv6-prefix` is its sibling and is removed here —
-// leaving it in the skip set discarded the mapped-port before it could reach
-// recordNPTv6MappedPortPresence, so validateNPTv6Strict never fired and a
-// malformed (or well-formed) nptv6 mapped-port on the canonical-separate form
-// was SILENTLY ACCEPTED (the last residual C179-038 fail-open). NPTv6 still
+// the C179-038 fail-open); `nptv6-prefix` is its sibling and was removed for the
+// same reason — treating it as name-valued discarded the mapped-port before it
+// could reach recordNPTv6MappedPortPresence, so validateNPTv6Strict never fired
+// and a malformed (or well-formed) nptv6 mapped-port on the canonical-separate
+// form was SILENTLY ACCEPTED (the last residual C179-038 fail-open). NPTv6 still
 // carries no port; recovering the modifier is what lets the nptv6 gate REJECT
 // it rather than drop it silently.
 var mappedPortNameValuedKeywords = map[string]struct{}{
@@ -101,43 +104,61 @@ var mappedPortNameValuedKeywords = map[string]struct{}{
 
 // staticNATMappedPortOperandsFromKeys returns the operand token trailing each
 // GENUINE `mapped-port` modifier in a static-NAT `then` node's collapsed Keys,
-// in AST order (#2491, #6479 grammar-position fix). The lexer collapses
-// `then static-nat prefix <ip> mapped-port <port>` onto one leaf whose Keys are
+// in AST order (#2491, #6479 grammar-role fix). The lexer collapses `then
+// static-nat prefix <ip> mapped-port <port>` onto one leaf whose Keys are
 // `["prefix","<ip>","mapped-port","<port>"]` (or, on the static-nat node itself,
 // `["static-nat","prefix","<ip>","mapped-port","<port>"]`) because `static-nat`
-// is a children:nil schema leaf, so this in-leaf token bypasses the schema
-// value validator and must be recovered here.
+// is a children:nil schema leaf, so this in-leaf token bypasses the schema value
+// validator and must be recovered here.
 //
-// A `mapped-port` token is a modifier ONLY in modifier position. It is SKIPPED
-// only when it is the free-form VALUE of an immediately preceding NAME-valued
-// keyword (mappedPortNameValuedKeywords: routing-instance / prefix-name) —
-// those take an arbitrary following token that can legally be the literal
-// string "mapped-port". It is NOT skipped after `prefix` OR `nptv6-prefix`,
-// whose values are always an IP/prefix: `prefix mapped-port <port>` and
-// `nptv6-prefix mapped-port <port>` are the canonical modifier forms (the #6479
-// regressions this restores — the nptv6 one so validateNPTv6Strict can reject
-// the port rather than silently accept it). A genuine modifier with no trailing
-// operand (a bare `mapped-port` at the end of the key list) contributes an EMPTY
-// operand so combineMappedPortOperands flags it malformed rather than dropping
-// the occurrence.
+// The scan is GRAMMAR-ROLE-AWARE, not a lexeme lookbehind: it walks the key
+// stream tracking whether each position is a KEYWORD slot or a consumed VALUE
+// slot, and a `mapped-port` is the modifier ONLY in a keyword slot. A NAME-valued
+// keyword (mappedPortNameValuedKeywords: routing-instance / prefix-name) consumes
+// its following token as an opaque name, so a `mapped-port` in that consumed slot
+// is the NAME and is skipped — even when the name itself is literally
+// "prefix-name" or "routing-instance". That is the #6479 root cause a lexeme
+// lookbehind could not fix: it inspected the neighbouring TEXT and could not tell
+// whether the preceding token was the keyword or its value, so a target NAMED
+// after a skip-keyword (`prefix-name prefix-name mapped-port <bad>`) shifted a
+// real modifier into the skipped position and silently accepted a malformed port.
+// `prefix` and `nptv6-prefix` are NOT name-valued: their IP value can never be
+// the literal "mapped-port", so the scan does not consume-and-shadow the token
+// after them and `prefix mapped-port <port>` / `nptv6-prefix mapped-port <port>`
+// (the canonical separate-set-line forms) still recover the modifier — the nptv6
+// one so validateNPTv6Strict can reject the port rather than silently accept it.
+// A genuine modifier with no trailing operand (a bare `mapped-port` at the end of
+// the key list) contributes an EMPTY operand so combineMappedPortOperands flags
+// it malformed rather than dropping the occurrence.
 func staticNATMappedPortOperandsFromKeys(keys []string) []string {
 	var operands []string
-	for i := 0; i < len(keys); i++ {
-		if keys[i] != "mapped-port" {
+	for i := 0; i < len(keys); {
+		tok := keys[i]
+		if _, nameValued := mappedPortNameValuedKeywords[tok]; nameValued {
+			// A NAME-valued keyword consumes the NEXT token as its opaque name
+			// value; skip both slots so a value that is literally "mapped-port"
+			// (or a skip-keyword lexeme) is never read as the modifier keyword.
+			i += 2
 			continue
 		}
-		// Grammar-position guard: a "mapped-port" immediately following a
-		// NAME-valued keyword is that keyword's VALUE, not the modifier keyword.
-		if i > 0 {
-			if _, nameValued := mappedPortNameValuedKeywords[keys[i-1]]; nameValued {
-				continue
+		if tok == "mapped-port" {
+			// A `mapped-port` in a KEYWORD slot: the genuine modifier. Its next
+			// token (if any) is the port operand, and it too is consumed so a
+			// value that happens to read "mapped-port" is not re-scanned as a
+			// keyword. A bare trailing keyword yields "" (malformed).
+			if i+1 < len(keys) {
+				operands = append(operands, keys[i+1])
+			} else {
+				operands = append(operands, "")
 			}
+			i += 2
+			continue
 		}
-		if i+1 < len(keys) {
-			operands = append(operands, keys[i+1])
-		} else {
-			operands = append(operands, "")
-		}
+		// prefix / nptv6-prefix / inet / static-nat / an IP or port value: a
+		// single keyword slot that does NOT shadow the following token (its value
+		// can never be the literal "mapped-port"), so advance by one and let a
+		// `mapped-port` that follows it be read as the modifier.
+		i++
 	}
 	return operands
 }
@@ -613,8 +634,28 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// so `prefix mapped-port <port>` is recovered (#6479).
 							mergeMappedPortForNode(rule, t)
 						} else if t.FindChild("inet") != nil || (len(t.Keys) >= 2 && t.Keys[1] == "inet") {
-							// static-nat { inet; } — NAT64 translation
+							// static-nat { inet; } — NAT64 translation. A mapped-port
+							// here needs no separate gate: the `inet` target itself is
+							// rejected (#5859, not representable), so the whole rule
+							// fails closed regardless of any port it carries.
 							rule.Then = "inet"
+						} else {
+							// #6479 SECOND FINDING: a modifier-only `static-nat`
+							// sibling. A hierarchical `then { static-nat {
+							// mapped-port <p>; } static-nat { prefix <ip>; } }` block
+							// can carry a sibling whose ONLY content is a mapped-port
+							// modifier (no prefix / prefix-name / nptv6-prefix / inet
+							// target). It matched NO target branch above, so its
+							// mapped-port reached no validator and a malformed operand
+							// was SILENTLY ACCEPTED — the multi-block analogue of the
+							// collection gap the prefix/prefix-name branches close.
+							// Route it through the SAME accumulator so it fails closed
+							// like every co-located modifier, in either sibling order
+							// (mergeMappedPortState latches fail-closed order-
+							// independently). A sibling with no mapped-port at all (an
+							// empty or routing-instance-only static-nat) reads
+							// present=false and is a harmless no-op.
+							mergeMappedPortForNode(rule, t)
 						}
 						// #4292: a translation-target `routing-instance <ri>`
 						// may trail ANY of the targets above (Junos allows it on

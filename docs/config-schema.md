@@ -3583,7 +3583,14 @@ reserved for whole-dataplane selection where a rewrite shim
     LATCHES fail-closed on any malformed operand — so a later clean sibling
     can no longer overwrite an earlier sibling's presence/malformed stamp
     back to false (the #6479 multi-block silent-accept, closed in BOTH the
-    nptv6 and the prefix/prefix-name branches). This sibling accumulation is
+    nptv6 and the prefix/prefix-name branches). A MODIFIER-ONLY `static-nat`
+    sibling (a `static-nat {…}` block carrying ONLY a `mapped-port`, with no
+    `prefix`/`prefix-name`/`nptv6-prefix`/`inet` target) is routed through the
+    same accumulator by a catch-all `else` branch in `compileNATStatic`, so
+    its malformed operand fails closed in either sibling order and even when a
+    co-sibling is a clean nptv6 target — previously it matched no target
+    branch and reached no validator (the #6479 modifier-only silent-accept).
+    This sibling accumulation is
     scoped WITHIN one `then` block; SEPARATE `then {}` blocks remain #3850
     last-then-block-wins (a whole superseded block is dead config, not part
     of the effective action). NOTE on duplicate resolution: the all-valid
@@ -3593,21 +3600,33 @@ reserved for whole-dataplane selection where a rewrite shim
     regression — a duplicate mapped-port on one target is malformed
     authoring, defensible either way — and last-wins is chosen for
     consistency with the Junos duplicate-stanza rule the rest of this fold
-    already follows. The scan is grammar-POSITION-aware
-    (`staticNATMappedPortOperandsFromKeys`): a `mapped-port` token is
-    skipped ONLY when it is the free-form VALUE of an immediately preceding
-    NAME-valued keyword (`mappedPortNameValuedKeywords`: `routing-instance`,
-    `prefix-name`, `nptv6-prefix`) whose value could legally be the literal
-    string `mapped-port`, so a translation-target routing-instance NAMED
-    `mapped-port` (`... routing-instance mapped-port`, #4292) or a
-    prefix-name entry NAMED `mapped-port` compiles clean instead of being
-    falsely rejected as a bare mapped-port. It is NOT skipped after `prefix`,
-    whose value is ALWAYS an IP and can never be the string `mapped-port`:
-    `prefix mapped-port <port>` is the canonical modifier. A round-4
-    over-defensive addition of `prefix` to the skip set broke that canonical
-    form — it both false-rejected the clean rule (it looked like a
-    match-port with no mapped-port) and reopened the C179-038 fail-open for
-    a canonical malformed value; #6479 removes it. Second, the
+    already follows. The scan is grammar-ROLE-aware
+    (`staticNATMappedPortOperandsFromKeys`): it walks the collapsed key
+    stream tracking whether each position is a KEYWORD slot or a consumed
+    VALUE slot, and a `mapped-port` counts as the modifier ONLY in a keyword
+    slot. A NAME-valued keyword (`mappedPortNameValuedKeywords`:
+    `routing-instance`, `prefix-name`) CONSUMES its following token as an
+    opaque name, so a `mapped-port` in that consumed slot is the name — a
+    translation-target routing-instance NAMED `mapped-port`
+    (`... routing-instance mapped-port`, #4292) or a prefix-name entry NAMED
+    `mapped-port` compiles clean instead of being falsely rejected as a bare
+    mapped-port. Because it is the SLOT (keyword vs value) that decides, never
+    the neighbouring text, a target whose NAME is itself literally
+    `prefix-name` or `routing-instance`
+    (`prefix-name prefix-name mapped-port <bad>`) no longer fools the scan:
+    the earlier LEXEME-only lookbehind saw the preceding token `prefix-name`
+    and wrongly skipped the real modifier, silently accepting a malformed
+    port (the #6479 root cause); the role-aware walk consumes that name as the
+    prefix-name VALUE and reads the following `mapped-port` as the
+    keyword-slot modifier. `prefix` and `nptv6-prefix` are deliberately NOT
+    name-valued: their value is ALWAYS an IP and can never be the string
+    `mapped-port`, so the scan does not consume-and-shadow the token after
+    them and `prefix mapped-port <port>` / `nptv6-prefix mapped-port <port>`
+    (the canonical separate-set-line modifiers) are recovered. A round-4
+    over-defensive addition of `prefix` to the name-valued set — and its
+    `nptv6-prefix` sibling — broke those canonical forms (false-rejecting the
+    clean rule and reopening the C179-038 fail-open, the nptv6 one so
+    `validateNPTv6Strict` never fired); #6479 keeps both out. Second, the
     port-match-without-mapped-port (#2769) gate is guarded on
     `!MappedPortPresent` so it fires ONLY on a
     true absence: a present-but-malformed mapped-port that also carries a
