@@ -92,8 +92,11 @@ func (m *Manager) SetFeedSnapshots(overlay map[string][]string) {
 // duplicate-skip would churn established-flow route caches for
 // nothing (Codex PR #1843 MED).
 //
-// schedulerState refreshes the policy snapshots in the same publish
-// when non-nil; nil keeps the manager's current scheduler view.
+// A non-nil schedulerState both updates the manager's cached scheduler
+// view AND rebuilds this publish's Policies / AddressBooks from it in the
+// SAME snapshot (#5328 A6-b2-F4), so the helper never enforces stale
+// schedule bits between overlay publishes; nil keeps the current view and
+// the inherited (last-compiled) policy sections.
 func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) (published bool, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -195,6 +198,27 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	next.Routes, err = buildRouteSnapshots(cfg, next.Interfaces, desiredOverlay)
 	if err != nil {
 		return false, fmt.Errorf("build route overlay snapshot: %w", err)
+	}
+
+	// #5328 (A6-b2-F4): when the caller supplies a policy-scheduler active-state
+	// map, refresh the policy snapshot's inactive bits from that map in THIS
+	// publish — the doc contract above promised it, and daemon_ipmon.go passes a
+	// live scheduler.ActiveState() here. Before this fix only m.policySchedulerActive
+	// was cached (above) while `next := *m.lastSnapshot` inherited the PRIOR
+	// compiled Policies / AddressBooks verbatim, so the helper enforced stale
+	// schedule bits while this publish reported success — until the dedicated
+	// UpdatePolicyScheduleState callback next fired. Rebuild exactly as the
+	// scheduler-only republish does, via the shared rebuildScheduledPolicySectionsLocked
+	// (which reuses the cached feed overlay AND re-applies the StableZoneID zone
+	// quarantine's policy scrub so a rebuilt policy never dangles against the
+	// inherited, already-reduced next.Zones — #6480). Placed BEFORE the
+	// duplicate-skip hash below so a scheduler-only bit flip on unchanged routes is
+	// not falsely deduped. A nil schedulerState leaves the inherited policy sections
+	// untouched (the route-apply caller that never carries scheduler state).
+	if schedulerState != nil {
+		if err := m.rebuildScheduledPolicySectionsLocked(&next, cfg, m.policySchedulerActive); err != nil {
+			return false, fmt.Errorf("build policy overlay snapshot for scheduler state: %w", err)
+		}
 	}
 
 	// Duplicate-publish skip: identical content (e.g. the actuator ran

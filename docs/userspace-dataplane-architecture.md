@@ -1315,7 +1315,38 @@ Policy scheduler state is no longer a propagation gap: #1396 carries scheduler
 state into the userspace snapshot and Rust policy evaluator, and the 2026-05-19
 #1378 live artifact set validates hit-counter lifetime, strict missing-scheduler
 commit behavior, and integration/failover evidence with
-`test/incus/policy_scheduler_validate.py`.
+`test/incus/policy_scheduler_validate.py`. The **route-overlay** partial
+republish (`PublishRouteOverlaySnapshot`, the ip-monitoring actuator) co-honors
+this contract (#5328 A6-b2-F4): when the daemon hands it a live
+`scheduler.ActiveState()` it rebuilds the published snapshot's `policies` /
+`address_books` inactive bits from that map in the SAME publish — exactly as the
+dedicated policy-scheduler republish (`UpdatePolicyScheduleState`) does — so a
+route flap never ships a snapshot that reports success while the helper enforces
+a stale schedule window. Previously the overlay only cached the map and inherited
+the last-compiled policy sections, leaving the helper on stale bits until the next
+scheduler tick or full apply. Both republish paths share one core
+(`rebuildScheduledPolicySectionsLocked`), which re-applies the StableZoneID zone
+quarantine's policy scrub after rebuilding `policies` from raw config (#6480): the
+raw builder has no knowledge of the quarantine and would reintroduce a policy
+referencing a quarantined zone, while the inherited `next.Zones` stays reduced —
+a dangling policy->zone reference the Rust `UnresolvableZoneReference` preflight
+rejects wholesale. Because the ip-monitoring actuator updates FRR *before* the
+publish, that reject would strand the kernel/FRR on the new routes while userspace
+kept the old FIB, unable to converge; the shared scrub keeps both paths in
+lockstep so neither can drift. The shared core additionally **refuses the
+republish outright when the passed `cfg` content-differs from the inherited
+`m.lastSnapshot.Config`** (#6480), mirroring the route-overlay path's
+`routeOnlyPublishHybrid` skew guard (#5680). This closes a fold-introduced
+fail-open: during a config-skew window the daemon can reconcile the scheduler to
+the newly promoted config B (the store promotes B before applying, and the apply
+path continues on a transient dataplane error) while the OLD snapshot A is still
+live. Rebuilding + scrubbing the policies against B's quarantine set while
+inheriting A's `next.Zones` can drop a policy whose zone is still a live member of
+A's zones — a snapshot the preflight *accepts* but whose missing rule lets traffic
+fall through to the inherited default policy (a full Compile of B would instead
+drop the quarantined zone and stay fail-closed). Refusing on skew retains the
+prior snapshot and reconverges once B's full apply lands
+(`m.lastSnapshot.Config == cfg`), under the existing #3780 retry semantics.
 #1377 now preserves unusable pool-mode source-NAT rules in the snapshot and
 fails closed at the `poll_descriptor.rs` source-NAT call sites for missing
 pools, empty pools, invalid pool inputs, wrong-family-only pools, or allocator
