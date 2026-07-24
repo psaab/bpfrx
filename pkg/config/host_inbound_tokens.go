@@ -2,6 +2,7 @@ package config
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/webmgmt"
 )
@@ -487,6 +488,18 @@ func HostInboundProtocolMatch(token, family string) []L4Match {
 // the nft builder emits a bare `accept` and the classifier reports admission
 // regardless of the tuple. `protocols all` is deliberately NOT a full admit
 // (#3199) — it expands to the routing-protocol set via HostInboundProtocolMatch.
+//
+// The token match is case-insensitive to stay in lockstep with enforcement: the
+// dataplane snapshot (unionHostInboundTokens / lowerTokens in
+// pkg/dataplane/userspace) and the Rust classifier
+// (classify_system_service, host_inbound.rs) both lower-case every token before
+// admitting. A predicate that only matched lower-case `all` would let a
+// lenient-loaded upper-case `ALL` slip past this SSOT while enforcement still
+// full-admits — the #5557 coarse-shield / commit-warning drift.
 func HostInboundFullAdmitService(token string) bool {
-	return token == "all" || token == "any-service"
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "all", "any-service":
+		return true
+	}
+	return false
 }
