@@ -4689,14 +4689,21 @@ fn junos_host_policy_no_match_falls_through_to_today_behavior() {
 }
 
 // #3292: a `to-zone junos-host` rule with a PORT-BEARING application
-// (`destination-port 22`). The two assertions below hold the 5-tuple IDENTICAL
+// (`destination-port 22`). The first two assertions hold the 5-tuple IDENTICAL
 // (dst_port = 22) and flip ONLY `l4_present`, so the difference in verdict is
 // attributable solely to the L4-presence gate: a flowless host-bound packet
-// (l4_present = false) MUST fail the port-bearing term closed even when a port
+// (l4_present = false) MUST fail the port-bearing TERM closed even when a port
 // byte happens to be supplied, because a non-first fragment's post-IP bytes are
 // payload, never an authoritative L4 header. Reverting
 // `evaluate_junos_host_policy_l3_aware` to ignore `l4_present` (force true) makes
 // the flowless call spuriously MATCH → the flowless assertion flips RED.
+//
+// #6465: the term-level fail-closed no longer means the fragment is DELIVERED.
+// Since the rule is a port-bearing DENY whose L3 overlaps the fragment, the
+// #4569 fragment-association override (ported to the junos-host gate) records
+// the skipped deny and the no-match fall-through returns the fragment-
+// associated DROP instead of None — Junos parity with the transit path (a
+// non-first fragment inherits the first fragment's deny).
 fn junos_host_port_app_snapshot() -> PolicyRuleSnapshot {
     PolicyRuleSnapshot {
         name: "host-ssh-port".to_string(),
@@ -4738,15 +4745,20 @@ fn junos_host_l3_aware_fails_port_bearing_term_closed_for_flowless() {
     );
 
     // Flowless (l4_present = false) — SAME tuple, only l4_present flipped: the
-    // port-bearing term fails CLOSED → no match → None → local delivery proceeds
-    // (a fragment's port is not authoritative, so it must not be denied by a
-    // port-specific rule it cannot be classified into).
-    assert!(
-        evaluate_junos_host_policy_l3_aware(
-            &state, TEST_TRUST_ZONE_ID, src, dst, PROTO_TCP, 12345, 22, None, 64, false,
-        )
-        .is_none(),
-        "flowless call must NOT match a port-bearing junos-host app term (l4_present=false)",
+    // port-bearing term fails CLOSED at the TERM level (the rule cannot match a
+    // fragment it cannot classify), but the rule is an overlapping port-bearing
+    // DENY, so the #6465 fragment-association override denies the fragment at
+    // the POLICY level rather than delivering it. RED ON REVERT: without the
+    // #6465 override this returns None (delivered) — the pre-#6465 fail-open
+    // asymmetry vs the transit gate.
+    let frag = evaluate_junos_host_policy_l3_aware(
+        &state, TEST_TRUST_ZONE_ID, src, dst, PROTO_TCP, 12345, 22, None, 64, false,
+    )
+    .expect("#6465: an overlapping skipped port-bearing deny must fail the fragment closed");
+    assert_eq!(
+        frag.action,
+        PolicyAction::Deny,
+        "a host-bound flowless fragment overlapping a skipped port-bearing deny must fail closed",
     );
 }
 
@@ -4764,6 +4776,175 @@ fn junos_host_l3_aware_any_app_matches_regardless_of_l4_presence() {
         .map(|r| r.action),
         Some(PolicyAction::Deny),
         "an `any` junos-host rule denies a flowless host-bound packet too",
+    );
+}
+
+// ── #6465: fragment-association fail-closed (junos-host policy) ─────
+//
+// The junos-host twin of the #4569 transit guard below: a `from-zone trust
+// to-zone junos-host` policy that DENIES a port-bearing app (junos-https =
+// tcp/443) from 10.0.0.0/8, FOLLOWED by a permit-any. A host-bound non-first
+// fragment (l4_present = false, dst_port = 0) cannot be classified into the
+// port-bearing deny, so before #6465 first-match fell through to the permit —
+// or to the no-match `None` fall-through the caller treats as deliver — and
+// the fragment reached the host stack, bypassing the deny the FIRST fragment
+// (with the real port) hit. The guard now remembers the skipped overlapping
+// deny and overrides the permit / deliver fall-through to a DROP.
+fn junos_host_frag_deny_https_snapshot() -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        policy_id: 7,
+        name: "deny-https-10".to_string(),
+        from_zone: "trust".to_string(),
+        to_zone: JUNOS_HOST_ZONE_NAME.to_string(),
+        source_addresses: vec!["10.0.0.0/8".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["junos-https".to_string()],
+        application_terms: vec![PolicyApplicationSnapshot {
+            name: "junos-https".to_string(),
+            protocol: "tcp".to_string(),
+            source_port: String::new(),
+            destination_port: "443".to_string(),
+            icmp_type: None,
+            icmp_code: None,
+            inactivity_timeout: None,
+        }],
+        action: "deny".to_string(),
+        ..Default::default()
+    }
+}
+
+fn junos_host_frag_permit_any_snapshot() -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        policy_id: 8,
+        name: "permit-rest".to_string(),
+        from_zone: "trust".to_string(),
+        to_zone: JUNOS_HOST_ZONE_NAME.to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn junos_host_flowless_fragment_fails_closed_against_skipped_port_bearing_deny_6465() {
+    let state = parse_policy_state(
+        "permit",
+        &[
+            junos_host_frag_deny_https_snapshot(),
+            junos_host_frag_permit_any_snapshot(),
+        ],
+        &test_zone_name_to_id(),
+    );
+    // Overlaps the deny's source 10.0.0.0/8.
+    let denied_src = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3));
+    // Does NOT overlap the deny's source.
+    let other_src = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1));
+    let dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 1));
+
+    // (a) FIRST / atomic fragment (l4_present = true, dst_port = 443): the
+    //     junos-https deny matches on the real port -> Deny. Unchanged behavior;
+    //     anchors that the deny's port term itself matches.
+    assert_eq!(
+        evaluate_junos_host_policy_l3_aware(
+            &state, TEST_TRUST_ZONE_ID, denied_src, dst, PROTO_TCP, 40000, 443, None, 64, true,
+        )
+        .map(|r| r.action),
+        Some(PolicyAction::Deny),
+        "first fragment (l4_present) must hit the junos-https deny on the real port",
+    );
+
+    // (b) FULL L4 packet on a DIFFERENT port (dst_port = 80) from the SAME L3:
+    //     the deny's 443 term does not match -> falls to permit -> Permit. Proves
+    //     the guard does NOT over-drop L4-present traffic (it is flowless-only)
+    //     and that the L4 path is byte-identical.
+    assert_eq!(
+        evaluate_junos_host_policy_l3_aware(
+            &state, TEST_TRUST_ZONE_ID, denied_src, dst, PROTO_TCP, 40000, 80, None, 64, true,
+        )
+        .map(|r| r.action),
+        Some(PolicyAction::Permit),
+        "an L4-present packet on a non-denied port must still be permitted",
+    );
+
+    // (c) NON-FIRST fragment (l4_present = false, dst_port = 0) from 10.0.0.0/8:
+    //     the port-bearing junos-https deny is skipped for l4_present == false
+    //     and the walk would fall to permit-any -> OVERRIDE to Deny (fail
+    //     closed). RED ON REVERT: without the guard this returns Permit
+    //     (fragment delivered), bypassing the deny.
+    let frag = evaluate_junos_host_policy_l3_aware(
+        &state, TEST_TRUST_ZONE_ID, denied_src, dst, PROTO_TCP, 0, 0, None, 64, false,
+    )
+    .expect("#6465: an overlapping skipped port-bearing deny must fail the fragment closed");
+    assert_eq!(
+        frag.action,
+        PolicyAction::Deny,
+        "a host-bound flowless fragment overlapping a skipped port-bearing deny must fail closed",
+    );
+    // The drop is attributed to the skipped junos-https deny rule (policy_id 7),
+    // not to the permit that first-match would have landed on.
+    assert_eq!(
+        frag.policy_id, 7,
+        "the fragment drop must be attributed to the skipped deny rule",
+    );
+
+    // (d) NON-FIRST fragment from an L3 with NO overlapping deny (192.168.1.1):
+    //     the deny does not overlap -> not a skipped-overlap -> the permit stands
+    //     -> delivered. Proves the guard is scoped to overlapping denies only and
+    //     does not over-drop unrelated fragments (the lifeline guarantee holds).
+    assert_eq!(
+        evaluate_junos_host_policy_l3_aware(
+            &state, TEST_TRUST_ZONE_ID, other_src, dst, PROTO_TCP, 0, 0, None, 64, false,
+        )
+        .map(|r| r.action),
+        Some(PolicyAction::Permit),
+        "a host-bound flowless fragment with no overlapping deny must deliver normally",
+    );
+}
+
+#[test]
+fn junos_host_flowless_fragment_fails_closed_on_deliver_fall_through_6465() {
+    // The no-permit twin: a LONE port-bearing junos-host deny. Before #6465 the
+    // flowless fragment matched nothing and the gate returned None — the
+    // deliver-on-no-match lifeline fall-through — so the fragment reached the
+    // host stack even though the first fragment (with the real port) is denied.
+    // The "no implicit default-deny" posture is permit-like, so the #6465
+    // override converts the fall-through into the fragment-associated deny.
+    // RED ON REVERT: without the fall-through override this returns None.
+    let state = parse_policy_state(
+        "permit",
+        &[junos_host_frag_deny_https_snapshot()],
+        &test_zone_name_to_id(),
+    );
+    let denied_src = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3));
+    let other_src = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1));
+    let dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 1));
+
+    let frag = evaluate_junos_host_policy_l3_aware(
+        &state, TEST_TRUST_ZONE_ID, denied_src, dst, PROTO_TCP, 0, 0, None, 64, false,
+    )
+    .expect("#6465: the deliver fall-through must fail closed against a skipped deny");
+    assert_eq!(frag.action, PolicyAction::Deny);
+    assert_eq!(frag.policy_id, 7);
+
+    // No overlapping deny -> the lifeline is untouched: None (deliver).
+    assert!(
+        evaluate_junos_host_policy_l3_aware(
+            &state, TEST_TRUST_ZONE_ID, other_src, dst, PROTO_TCP, 0, 0, None, 64, false,
+        )
+        .is_none(),
+        "a host-bound flowless fragment with no overlapping deny keeps the lifeline (None)",
+    );
+
+    // The L4 path never records a skip, so a non-denied-port L4 packet keeps the
+    // byte-identical lifeline (None — no rule matches, no override possible).
+    assert!(
+        evaluate_junos_host_policy_l3_aware(
+            &state, TEST_TRUST_ZONE_ID, denied_src, dst, PROTO_TCP, 40000, 80, None, 64, true,
+        )
+        .is_none(),
+        "the L4 lifeline path must be byte-identical (no rule match -> None)",
     );
 }
 
@@ -5894,6 +6075,66 @@ fn global_policy_unknown_zone_context_fails_closed() {
             assert_eq!(zone, "ghostzone");
         }
         other => panic!("expected UnresolvableZoneReference (match to-zone), got {other:?}"),
+    }
+}
+
+#[test]
+fn global_policy_empty_string_scope_element_fails_closed_6464() {
+    // #6464: a scoped-global policy whose match-from/to zone LIST carries an
+    // EMPTY-STRING element must fail the WHOLE snapshot closed
+    // (SnapshotIntegrityError::UnresolvableZoneReference), exactly like the
+    // unresolvable-name arm above (#3402) — not silently widen the scope to
+    // `GlobalZoneScope::Any`. The Go emit paths strip blanks (sortDedupZones /
+    // firewallMatchValues), so only a corrupt / hand-built / mixed-version-
+    // HA-peer snapshot can carry one — the #3402 backstop's reachability class.
+    // Before #6464 the empty element took the `Any` short-circuit: a scoped
+    // PERMIT global silently applied to EVERY zone pair (fail OPEN).
+    //
+    // Fail-on-revert: restoring `n.is_empty()` to the `Any` short-circuit in
+    // build_global_zone_scope makes `parse_policy_state_with_counters` return
+    // `Ok`, so the `Err` matches below panic → RED. Both sides are covered, as
+    // is the plural-only and mixed concrete+empty shapes.
+    let zones = test_zone_name_to_id();
+
+    // (a) Plural to-zone scope ["untrust", ""] — the issue's exact trace shape
+    //     (["dmz",""] with the test zone map).
+    let store = PolicyCounterStore::default();
+    let mut rule = global_zone_set_rule("empty-to", &["trust"], &["untrust"], "permit");
+    rule.match_to_zones.push(String::new());
+    match parse_policy_state_with_counters("deny", &[rule], &zones, &[], &store) {
+        Err(SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }) => {
+            assert!(rule_id.ends_with("/empty-to"), "rule_id={rule_id}");
+            assert_eq!(zone, "", "the empty element is the unresolvable reference");
+        }
+        other => panic!("expected UnresolvableZoneReference (empty to-zone element), got {other:?}"),
+    }
+
+    // (b) Empty as the FIRST from-zone element (order must not matter).
+    let store = PolicyCounterStore::default();
+    let mut rule = global_zone_set_rule("empty-from", &["trust"], &["untrust"], "permit");
+    rule.match_from_zones = vec![String::new(), "trust".to_string()];
+    rule.match_from_zone = String::new();
+    match parse_policy_state_with_counters("deny", &[rule], &zones, &[], &store) {
+        Err(SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }) => {
+            assert!(rule_id.ends_with("/empty-from"), "rule_id={rule_id}");
+            assert_eq!(zone, "");
+        }
+        other => panic!("expected UnresolvableZoneReference (empty from-zone element), got {other:?}"),
+    }
+
+    // (c) A lone empty element (no concrete sibling) also fails closed — it is
+    //     NOT the omitted-scope `Any` (an empty LIST is Any; a list of one
+    //     empty STRING is corruption).
+    let store = PolicyCounterStore::default();
+    let mut rule = global_zone_set_rule("empty-only", &["trust"], &["untrust"], "permit");
+    rule.match_to_zones = vec![String::new()];
+    rule.match_to_zone = String::new();
+    match parse_policy_state_with_counters("deny", &[rule], &zones, &[], &store) {
+        Err(SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }) => {
+            assert!(rule_id.ends_with("/empty-only"), "rule_id={rule_id}");
+            assert_eq!(zone, "");
+        }
+        other => panic!("expected UnresolvableZoneReference (lone empty element), got {other:?}"),
     }
 }
 

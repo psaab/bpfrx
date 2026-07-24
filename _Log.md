@@ -1,4 +1,46 @@
-## 2026-07-23 — #5557 (advance): host-inbound service-token case-fold in the junos-host coarse shield
+## 2026-07-24 — #6464 + #6465: scoped-global empty-element fail-open + junos-host fragment-association parity
+
+- **Timestamp**: 2026-07-24 (fix/6464-global-scope-empty-string)
+- **Action**: Two fail-closed fixes in userspace-dp/src/policy.rs, one PR.
+  (1) #6464: `build_global_zone_scope` no longer folds a scope list carrying an
+  EMPTY-STRING element into `GlobalZoneScope::Any` — the element now rejects the
+  whole snapshot with `SnapshotIntegrityError::UnresolvableZoneReference`,
+  matching the #3402 unresolvable-name arm (the `== "any"` token stays the
+  genuine wildcard). Before, a corrupt / hand-built / mixed-version-HA-peer
+  snapshot with `match_to_zones = ["dmz",""]` silently widened a scoped PERMIT
+  global to every zone pair (fail OPEN); the identical corruption with a
+  garbage name rejected the snapshot. (2) #6465: ported the #4569
+  fragment-association deny override (`note_skipped_frag_deny` /
+  `apply_frag_deny_override`) into `evaluate_junos_host_policy_l3_aware` across
+  all three tiers (exact pair, from-any wildcard, host-scoped global). A
+  host-bound non-first fragment overlapping a port-bearing junos-host DENY was
+  previously DELIVERED (the term fails closed for l4_present == false, so
+  first-match fell through to a junos-host permit or the deliver-on-no-match
+  lifeline); it now inherits the fragment-associated DROP attributed to the
+  skipped DENY, and the no-match fall-through converts to
+  `Some(frag_associated_deny_result)` when a deny was skipped (the lifeline is
+  permit-like). The L4 (l4_present = true) path never records a skip, so it is
+  byte-identical.
+- **Files**: userspace-dp/src/policy.rs (both fixes + doc comments),
+  userspace-dp/src/policy_tests.rs (new
+  `global_policy_empty_string_scope_element_fails_closed_6464`,
+  `junos_host_flowless_fragment_fails_closed_against_skipped_port_bearing_deny_6465`,
+  `junos_host_flowless_fragment_fails_closed_on_deliver_fall_through_6465`;
+  updated `junos_host_l3_aware_fails_port_bearing_term_closed_for_flowless`
+  whose fall-through assertion encoded the pre-#6465 behavior),
+  docs/feature-gaps.md (#4569 note gains the junos-host parity sentence).
+- **Fail-on-revert**: reverting the #6464 short-circuit/check turns
+  `global_policy_empty_string_scope_element_fails_closed_6464` RED (parse
+  returns Ok); reverting the #6465 junos-host body turns all three junos-host
+  frag tests RED (fragment permitted / delivered). Both verified firsthand
+  (neutralize → RED → restore → GREEN).
+- **Validation**: cargo build clean; policy::tests 183 passed; flowless (61)
+  and forwarding_build (114) suites green; full `make test-rust` green.
+  docs/junos-cli-reference.md unchanged — the strict commit gate already
+  rejects blank scope elements, so the operator-visible commit contract is
+  untouched (#6464 hardens only the snapshot-decode backstop).
+
+
 
 - **Timestamp**: 2026-07-23 (fix/5557-hostinbound-service-token-case)
 - **Action**: Case-fold host-inbound `system-services` tokens in the junos-host
