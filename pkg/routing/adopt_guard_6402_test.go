@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -94,5 +95,118 @@ func TestBondAdoptAcceptsRealBond(t *testing.T) {
 	}
 	if _, tracked := b.bonds[name]; !tracked {
 		t.Errorf("the adopted bond must be tracked; bonds=%v", b.bonds)
+	}
+}
+
+// TestBondKeepPathRejectsForeignReplacement is the #6402 fold guard for the
+// SYMMETRIC readback: the Apply create/reconcile pass KEEP fast-path
+// (`if trackedSig == sig` → LinkByName → LinkSetUp → continue). A bond that is
+// already TRACKED as satisfied (b.bonds[name] == desired sig) can be replaced
+// by a same-name FOREIGN (non-bond) link out from under the daemon. Without a
+// type gate on the KEEP path, the next reconcile brings the foreign link up and
+// declares convergence — the same silent LAG-absence bug the createLocked adopt
+// gate closes, on a different path. The KEEP-path type gate falls a non-bond
+// link through to createLocked, which reclaims it via delete+recreate.
+//
+// FAIL-ON-REVERT: dropping the KEEP-path `isBond` check makes the KEEP path
+// bring the foreign *netlink.Dummy up and `continue` — it is never deleted
+// (delCalls empty) and never recreated, so the kernel link under the name stays
+// a *netlink.Dummy tracked as satisfied. Both assertions below then go RED
+// (clean assertion failures, not a build break).
+func TestBondKeepPathRejectsForeignReplacement(t *testing.T) {
+	ops := newFakeBondLinkOps()
+	const name = "bond0"
+	cfg := bondFabricConfig(name, "ge-0-0-1")
+	// A same-name foreign (non-bond) link now wears the tracked bond's name.
+	ops.links[name] = &netlink.Dummy{
+		LinkAttrs: netlink.LinkAttrs{Name: name, Index: 4242},
+	}
+
+	// Seed the bond as already TRACKED and SATISFIED (trackedSig == desired), so
+	// Apply routes it through the KEEP fast-path rather than the fresh-create /
+	// adopt branch the other #6402 tests exercise.
+	b := &bondManager{ops: ops, bonds: map[string]bondSig{name: bondSigOf(cfg)}}
+	if err := b.Apply([]*config.InterfaceConfig{cfg}); err != nil {
+		t.Fatalf("Apply must succeed: the foreign link is reclaimed via delete+recreate "+
+			"and the absent member is a soft error; got %v", err)
+	}
+
+	// The foreign link must have been deleted to reclaim the name.
+	if !contains(ops.delCalls, name) {
+		t.Errorf("the KEEP path must fall through to createLocked and delete the foreign "+
+			"link; delCalls=%v", ops.delCalls)
+	}
+	// A REAL bond must wear the name after the reconcile — the foreign Dummy must
+	// not survive as the tracked device.
+	link, ok := ops.links[name]
+	if !ok {
+		t.Fatalf("a bond must exist under %q after the reconcile; kernel links=%v", name, ops.links)
+	}
+	if _, isBond := link.(*netlink.Bond); !isBond {
+		t.Errorf("the kernel link under %q must be a *netlink.Bond after delete+recreate, "+
+			"got %T (the KEEP path adopted the foreign link instead of reclaiming it)", name, link)
+	}
+	if _, tracked := b.bonds[name]; !tracked {
+		t.Errorf("the recreated bond must be tracked; bonds=%v", b.bonds)
+	}
+}
+
+// TestBondKeepPathForeignDeleteFailRetries covers the delete-fail transition
+// Codex flagged: a tracked bond is replaced by a foreign link whose deletion
+// FAILS. createLocked's adopt gate fails the commit closed, but tracking only
+// clears after a SUCCESSFUL LinkDel (#4901), so b.bonds[name] is retained ==
+// desired sig. The KEEP-path type gate guarantees the NEXT reconcile re-enters
+// createLocked (re-attempts the delete) instead of KEEP-adopting the foreign
+// link and reporting false convergence — createLocked is re-entered every
+// reconcile until the delete succeeds.
+//
+// FAIL-ON-REVERT: dropping the KEEP-path `isBond` check makes the very first
+// reconcile bring the foreign link up and `continue` (returning nil), so the
+// fail-closed assertion goes RED; the next-reconcile re-entry assertions go RED
+// too (no delete is attempted).
+func TestBondKeepPathForeignDeleteFailRetries(t *testing.T) {
+	ops := newFakeBondLinkOps()
+	const name = "bond0"
+	cfg := bondFabricConfig(name, "ge-0-0-1")
+	// A foreign (non-bond) link wears the tracked bond's name, and its deletion
+	// is stuck (a wedged netlink op).
+	ops.links[name] = &netlink.Dummy{
+		LinkAttrs: netlink.LinkAttrs{Name: name, Index: 4242},
+	}
+	ops.failLinkDel[name] = errors.New("injected: EBUSY")
+
+	b := &bondManager{ops: ops, bonds: map[string]bondSig{name: bondSigOf(cfg)}}
+
+	// First reconcile: the KEEP path must NOT adopt the foreign link. It falls
+	// through to createLocked, whose adopt gate ATTEMPTS the delete; the delete
+	// fails, so the commit fails closed.
+	if err := b.Apply([]*config.InterfaceConfig{cfg}); err == nil {
+		t.Fatalf("a failed reclaim of a foreign link on a tracked bond must fail the commit " +
+			"closed, got nil (false convergence)")
+	}
+	if !contains(ops.delCalls, name) {
+		t.Errorf("the KEEP path must fall through to createLocked and ATTEMPT the delete; "+
+			"delCalls=%v", ops.delCalls)
+	}
+	if contains(ops.setUpCalls, name) {
+		t.Errorf("the foreign link must NOT be brought up as a satisfied bond; setUpCalls=%v",
+			ops.setUpCalls)
+	}
+
+	// Tracking is retained after the failed delete (#4901), but the type gate
+	// guarantees the NEXT reconcile re-enters createLocked (re-attempts the
+	// delete) rather than KEEP-adopting the foreign link — no false convergence.
+	ops.reset()
+	if err := b.Apply([]*config.InterfaceConfig{cfg}); err == nil {
+		t.Fatalf("the next reconcile must STILL fail closed (re-enter createLocked), not " +
+			"KEEP-adopt the foreign link, got nil")
+	}
+	if !contains(ops.delCalls, name) {
+		t.Errorf("the next reconcile must re-attempt the delete (re-enter createLocked), not "+
+			"KEEP-adopt; delCalls=%v", ops.delCalls)
+	}
+	if contains(ops.setUpCalls, name) {
+		t.Errorf("the next reconcile must NOT bring up the foreign link as satisfied; "+
+			"setUpCalls=%v", ops.setUpCalls)
 	}
 }

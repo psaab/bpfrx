@@ -60067,3 +60067,38 @@ top.
     go test ./pkg/routing/ , FULL go test ./... GREEN.
 - **File(s)**: pkg/routing/bond.go, pkg/routing/adopt_guard_6402_test.go,
     pkg/routing/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+- **Action**: #6402 FOLD (Codex MERGE-NEEDS-MAJOR, confirmed firsthand) —
+    type-gate the SYMMETRIC KEEP-path readback. The initial PR gated the
+    createLocked adopt readback but left the `Apply` create/reconcile-pass KEEP
+    fast-path (`if trackedSig == sig` → `LinkByName` → `LinkSetUp` → `continue`)
+    ungated, so the same silent-LAG-absence bug survived on a different path via
+    two reachable transitions: (1) a TRACKED bond (b.bonds[name]==sig) is
+    replaced by a same-name FOREIGN link → KEEP path brings it up + reports
+    convergence; (2) the delete-fail loop — createLocked finds a foreign link,
+    deleteLocked FAILS (fail-closed for that reconcile) but tracking only clears
+    after a successful LinkDel (#4901), so b.bonds[name] stays == sig; the next
+    reconcile's KEEP path would bring the foreign link up + `continue`, never
+    re-entering createLocked, never retrying the delete → false convergence
+    forever. Fix: re-assert `link.(*netlink.Bond)` in the KEEP branch; a
+    non-bond link falls through to the recreate path (re-enters createLocked,
+    whose #6402 adopt gate reclaims it via delete+recreate or fails closed
+    again), so createLocked is re-entered every reconcile until the delete
+    succeeds — b.bonds[name] is never presented as satisfied by a foreign link.
+    Updated the KEEP-branch slog message ("tracked bond missing or replaced by
+    a foreign link; recreating") + pkg/routing/README.md to state ALL THREE
+    readbacks (create/adopt/KEEP) are type-gated; only the mode/MTU residual
+    remains. Added fold tests (adopt_guard_6402_test.go):
+    TestBondKeepPathRejectsForeignReplacement (tracked bond → foreign
+    replacement → KEEP path falls through, deletes+recreates a real bond, does
+    not adopt) and TestBondKeepPathForeignDeleteFailRetries (tracked; foreign;
+    LinkDel FAILS → Apply fails closed AND the next reconcile re-enters
+    createLocked / re-attempts the delete rather than KEEP-adopting — no false
+    convergence). FRESH PARENT-RED: neutralize ONLY the KEEP-path `isBond` check
+    (`; isBond || true {`) → both new KEEP tests go clean-assertion RED while
+    TestBondAdoptRejectsForeignLink/AcceptsRealBond stay GREEN; restored.
+    go build ./... , go vet ./pkg/routing/ , go test ./pkg/routing/ -race , FULL
+    go test ./... (TMPDIR=/tmp, disk GOCACHE) GREEN.
+- **File(s)**: pkg/routing/bond.go, pkg/routing/adopt_guard_6402_test.go,
+    pkg/routing/README.md, _Log.md

@@ -116,16 +116,16 @@ syscalls. A device is adopted only after confirming the readback is the
 INTENDED type — and, for xfrm and VRF, carrying the desired discriminator
 too — never by name alone. The discriminator checked is per-manager: **xfrm
 rejects type + `Ifid` + `ParentIndex==0`, VRF rejects type + table, and bond
-rejects TYPE (`*netlink.Bond`) on BOTH its create-path (#6396) and adopt-path
-(#6402) readbacks** (the mode/MTU and KEEP-path residuals remain — see the
-bond bullet). So a same-name foreign link (or, for xfrm/VRF, a right-type link
-with the wrong discriminator) substituted by a concurrent external actor in the
-add→readback window — or, for the bond adopt path, a foreign link already
-wearing a fabric/RETH bond's name at steady state — is rejected: it is not
-brought up or adopted, the name is reclaimed via delete+recreate (or the commit
-fails closed on a create-path substitute), and no foreign device is tracked as a
-satisfied device. This invariant now holds across all three netlink-device
-managers:
+rejects TYPE (`*netlink.Bond`) on ALL THREE of its create-path (#6396),
+adopt-path (#6402), and KEEP-path (#6402) readbacks** (only a mode/MTU residual
+remains — see the bond bullet). So a same-name foreign link (or, for xfrm/VRF, a
+right-type link with the wrong discriminator) substituted by a concurrent
+external actor in the add→readback window — or, for the bond adopt/KEEP paths, a
+foreign link already wearing a fabric/RETH bond's name at steady state — is
+rejected: it is not brought up or adopted, the name is reclaimed via
+delete+recreate (or the commit fails closed on a create-path substitute), and no
+foreign device is tracked as a satisfied device. This invariant now holds across
+all three netlink-device managers:
 
 - **xfrm** (`xfrm.go`) — the readback must be an `*netlink.Xfrmi` whose
   `Ifid` matches. Enforced on BOTH the adopt path (a kernel link outliving
@@ -135,48 +135,60 @@ managers:
   `*netlink.Vrf` whose `Table` matches (#6396). `added` stays true so the
   caller records ownership; the reconcile adopt path (`vrfTable` →
   recreate on table mismatch) reclaims a substitute on the next cycle.
-- **bond** (`bond.go` `createLocked`) — BOTH the **create-path** and the
-  **adopt-path** readbacks must be an `*netlink.Bond` before the link is
-  enslaved, brought up, or tracked. The **create-path** gate (#6396) re-asserts
-  the type after `LinkAdd`: `enslaveMembers` only surfaces a substitute via a
-  real-netlink `LinkSetMaster` failure when a member is actually enslavable, so
-  a bond whose configured members are all currently absent (the #4823
-  soft-error case) would otherwise adopt a foreign link; the explicit type
-  check closes that hole for every member state. The **adopt-path** gate
-  (#6402) re-asserts the type at the top of the steady-state reconcile branch
-  (`if existing, err := LinkByName(name); err == nil`): `LinkByName` resolves
-  the NAME, not the type, so a same-name foreign link already wearing a
-  fabric/RETH bond's name — an external actor's device, or a leftover of a
-  different type after a name collision — is reclaimed via `deleteLocked` +
-  fall-through to the create path (mirroring the xfrm #5523 adopt gate and the
-  `vrfTable`→recreate adopt path) rather than adopted. A `deleteLocked` failure
-  leaves the foreign link present, so the recreate is skipped this cycle and the
-  delete error is surfaced (commit fails closed, next reconcile retries the
-  delete) — the #5119 changed-signature / xfrm #5310 recreate discipline.
+- **bond** (`bond.go`) — ALL THREE readbacks that can bring a link up and track
+  it as a satisfied bond must first re-assert `*netlink.Bond` — the **create
+  path** (`createLocked` post-`LinkAdd`), the **adopt path** (`createLocked`
+  steady-state reconcile branch), and the **KEEP path** (`Apply`'s
+  tracked-and-unchanged fast path). `LinkByName` resolves the NAME, not the
+  type, so any of the three, left ungated, would bring a same-name foreign link
+  up and report convergence while NO bond carries the fabric/RETH members.
+    - **create-path** gate (#6396) re-asserts the type after `LinkAdd`:
+      `enslaveMembers` only surfaces a substitute via a real-netlink
+      `LinkSetMaster` failure when a member is actually enslavable, so a bond
+      whose configured members are all currently absent (the #4823 soft-error
+      case) would otherwise adopt a foreign link; the explicit type check closes
+      that hole for every member state.
+    - **adopt-path** gate (#6402) re-asserts the type at the top of the
+      steady-state reconcile branch (`if existing, err := LinkByName(name); err
+      == nil`): a same-name foreign link already wearing a fabric/RETH bond's
+      name — an external actor's device, or a leftover of a different type after
+      a name collision — is reclaimed via `deleteLocked` + fall-through to the
+      create path (mirroring the xfrm #5523 adopt gate and the
+      `vrfTable`→recreate adopt path) rather than adopted. A `deleteLocked`
+      failure leaves the foreign link present, so the recreate is skipped this
+      cycle and the delete error is surfaced (commit fails closed, next reconcile
+      retries the delete) — the #5119 / xfrm #5310 recreate discipline.
+    - **KEEP-path** gate (#6402) re-asserts the type in `Apply`'s
+      tracked-and-unchanged fast path (`if trackedSig == sig` → `LinkByName` →
+      `LinkSetUp`). A tracked bond can be replaced by a same-name foreign link,
+      and — because a failed `deleteLocked` retains tracking (#4901) — the
+      adopt-gate delete-fail transition leaves `b.bonds[name]` still == desired
+      sig with a foreign link present. Without the KEEP-path gate the next
+      reconcile would bring that foreign link up and `continue`, never
+      re-entering `createLocked`, never retrying the delete → false convergence
+      forever. The gate falls a non-bond link through to the recreate path
+      (which re-enters `createLocked`, whose adopt gate reclaims it or fails
+      closed again), so `b.bonds[name]` is never presented as satisfied by a
+      foreign link: `createLocked` is re-entered every reconcile until the delete
+      succeeds.
 
-  **Bond adopt is HA-touching** (a fabric/RETH LAG reconcile change), so #6402
-  carries a loss-cluster `make test-failover` smoke; in the healthy case the
-  gate is a pure pass-through (`existing` IS a `*netlink.Bond`), so steady-state
-  reconcile of a real fabric bond is bit-identical and never flapped.
+  **Bond adopt/KEEP are HA-touching** (a fabric/RETH LAG reconcile change), so
+  #6402 carries a loss-cluster `make test-failover` smoke; in the healthy case
+  every gate is a pure pass-through (the link IS a `*netlink.Bond`), so
+  steady-state reconcile of a real fabric bond is bit-identical and never
+  flapped.
 
-  The bond identity gate is now the TYPE assertion on both create and adopt
-  paths. Two narrower residuals remain OPEN as further hardening (all
-  pre-existing — master never validated them; NOT #6396/#6402 regressions), and
-  are a distinct concern from the type/identity-assertion readback family #6402
-  closed:
-    1. **mode/MTU (create + adopt)** — the guards check the `*netlink.Bond`
-       type only, then track the DESIRED `bondSig` (`sigWithMembers(sig, …)`),
-       not the readback's observed mode/MTU. An `*netlink.Bond` with the wrong
-       bond mode (802.3ad vs active-backup) or MTU passes and is tracked as
-       satisfied.
-    2. **KEEP-path identity** — the tracked-and-unchanged fast path in `Apply`
-       (`if trackedSig == sig` → `LinkByName` → `LinkSetUp`) brings up whatever
-       wears the name without re-asserting it is even a bond, so a same-name
-       `Dummy` swapped in under an already-tracked bond (a surface distinct from
-       `createLocked`'s adopt branch) is accepted.
+  The bond identity gate is now the TYPE assertion on all three readbacks. One
+  narrower residual remains OPEN as further hardening (pre-existing — master
+  never validated it; NOT a #6396/#6402 regression), a distinct concern from the
+  type/identity-assertion readback family #6402 closed:
+    1. **mode/MTU (all paths)** — the guards check the `*netlink.Bond` type
+       only, then track the DESIRED `bondSig` (`sigWithMembers(sig, …)`), not the
+       readback's observed mode/MTU. An `*netlink.Bond` with the wrong bond mode
+       (802.3ad vs active-backup) or MTU passes and is tracked as satisfied.
   (xfrm and VRF adopt paths ARE fully gated — xfrm.go asserts type + `Ifid` +
   `ParentIndex==0`, and `vrfTable`→recreate asserts type + table. Bond now gates
-  TYPE on create + adopt; only the mode/MTU + KEEP-path residuals above remain.)
+  TYPE on create + adopt + KEEP; only the mode/MTU residual above remains.)
 
 Without the check the name is tracked as satisfied while **no** device
 carries the desired identity, silently blackholing the VPN / leaked routes
