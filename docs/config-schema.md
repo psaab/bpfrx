@@ -521,6 +521,58 @@ pre-expansion scan, and a quoted-empty rule name is skipped — are tracked
 family-wide in #6455 rather than diverging this gate's scope from the
 named-block gate.
 
+### Duplicate NAT rule-SET name (#6454, C181-M18 sibling)
+
+The #5649 gate above closes the rule-NAME axis; #6454 closes the rule-SET-name
+axis one level up. A rule-set name is its operational identity — the from/to
+scope binding and the CLI show key. It is UNIQUE per nat type but reusable
+ACROSS nat types (Junos gives source / destination / static / nat64 independent
+name spaces; `NATCounterKey` in `pkg/dataplane/compiler_nat.go` is natType-
+prefixed for the counted types). Two rule-sets authored with the SAME name
+WITHIN one nat type are NOT reduced to last-writer-wins like a #5180
+hierarchical block — they BOTH survive: `compileNATSource` /
+`compileNATDestination` / `compileNATStatic` / `compileNAT64` each APPEND the
+rule-set (`sec.NAT.Source` / `Destination.RuleSets` / `Static` / `NAT64`), never
+merging by name, so both compile as separate first-match tables sharing one
+name. The operator authored what they read as one rule-set; it compiles to two,
+evaluated in sequence. The CLI named-rule-set show lookup
+(`showNATSourceRuleSet` in `pkg/cli/cli_show_nat.go`) returns on the FIRST name
+match, so the second same-named rule-set — and its rules — is invisible on that
+surface and the operator cannot disambiguate the two. This is NOT a per-rule
+counter merge: `NATCounterKey` includes the rule name, so the disjoint rules
+this gate uniquely catches get distinct counter keys (a SAME rule name in both
+is caught first by the #5649 gate); a nat64 rule-set (prefix / source-pool, no
+`rule` nodes — correctly excluded from the #5649 rule-name gate) is counter-less
+anyway. The harm is type-independent (the shared rule-set NAME identity), which
+is why the diagnostic is type-agnostic and never claims a per-rule counter.
+
+`validateDuplicateNATRuleSetNamesAST(tree, lenient)`
+(`pkg/config/dup_nat_ruleset_names.go`, wired beside the #5649 duplicate-rule-name
+gate in both `compileConfigWithOpts` and `compileConfigForNodeWithOpts`) rejects
+this at commit. It runs **pre-expansion** on top-level `security` stanzas only,
+for the same reasons as #5649 — apply-groups DEEP-MERGES a same-named rule-set
+rather than duplicating it, and the flat `set` form reuses the rule-set node
+(`tree.SetPath` merges), so only a directly-authored hierarchical duplicate
+reaches the gate. The seen-set is keyed by `(natType, rule-set)` and unioned
+across repeated `security` / `nat` / sub-block stanzas (compileNAT merges those,
+#3915), so a rule-set name split across two `source {}` blocks is caught too.
+The same rule-set name in two DIFFERENT nat types (a distinct
+natType-prefixed namespace) is accepted. Crucially the dedup is at the AST
+rule-set-INSTANCE level, NOT the compiled level: a single authored rule-set
+carrying a bracket list of from/to scopes Cartesian-expands into MULTIPLE
+same-named `NATRuleSet` objects downstream (#3096) — that is one AST instance
+and is NOT flagged (a compiled-level dedup would false-positive here). Strict
+(commit / commit-check) hard-rejects; lenient (load / peer-sync) warns via
+`opts.lenientDuplicateNATRuleSetName` (#1960 no-brick) and keeps the historical
+two-table behavior.
+
+Covered by `pkg/config/dup_nat_ruleset_names_6454_test.go` (source / destination
+/ static / nat64 reject, nat64 counter-less-diagnostic guard, lenient warn, and
+distinct-name / different-nat-type / bracket-list-scope-expansion / flat-set-merge
+accept guards), RED on revert of the gate (the duplicate is accepted). Shares the
+same applied-group and quoted-empty-name limitations as its #5649 / #5180 siblings
+(tracked family-wide in #6455).
+
 **Phase 2 (#5878) — reference-binder canonicalization.** Phase 1 (above) closes
 the divergent-commit fail-open by rejecting a duplicate-spelling collision at
 commit. The second, subtler half of #5878 is that a cross-subsystem reference

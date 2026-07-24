@@ -255,6 +255,22 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		return nil, dupNATRuleErr
 	}
 
+	// #6454 (C181-M18 sibling): duplicate NAT rule-SET-name gate — see
+	// validateDuplicateNATRuleSetNamesAST. The rule-SET axis one level above the
+	// #5649 rule-name gate: two same-named rule-sets within one nat type
+	// (source/destination/static/nat64) BOTH survive as separate first-match
+	// tables sharing one name, and the CLI named-rule-set show lookup returns on
+	// the first match, so the operator cannot disambiguate the two (not a
+	// per-rule counter merge — NATCounterKey includes the rule name). Pre-
+	// expansion, top-level `security` stanzas only, keyed by (natType, rule-set)
+	// so a same-named rule-set across DIFFERENT nat types stays legitimate; strict
+	// rejects, lenient warns.
+	dupNATRuleSetWarnings, dupNATRuleSetErr := validateDuplicateNATRuleSetNamesAST(
+		tree, opts.lenientDuplicateNATRuleSetName)
+	if dupNATRuleSetErr != nil {
+		return nil, dupNATRuleSetErr
+	}
+
 	// #5878: numeric interface-unit alias gate (#5631) as a BOTH-NODE-effective
 	// union. Runs PRE-expansion, beside the tunnel/zone/table-id gates, so a
 	// peer-only `groups node1`/`${node}` alias that collides only in the
@@ -318,6 +334,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupNATRuleWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dupNATRuleSetWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
 	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)
@@ -397,6 +414,16 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, dupNATRuleErr
 	}
 
+	// #6454 (C181-M18 sibling): duplicate NAT rule-SET-name gate — see
+	// compileConfigWithOpts / validateDuplicateNATRuleSetNamesAST. Pre-expansion,
+	// top-level `security` stanzas only, keyed by (natType, rule-set); strict
+	// rejects, lenient warns.
+	dupNATRuleSetWarnings, dupNATRuleSetErr := validateDuplicateNATRuleSetNamesAST(
+		tree, opts.lenientDuplicateNATRuleSetName)
+	if dupNATRuleSetErr != nil {
+		return nil, dupNATRuleSetErr
+	}
+
 	// #5878: numeric interface-unit alias gate (#5631) as a BOTH-NODE-effective
 	// union — see compileConfigWithOpts. Pre-expansion on purpose: the union
 	// across View 1 (groups) + Views 2/3 (node0/node1 expansions) is identical
@@ -454,6 +481,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupNATRuleWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dupNATRuleSetWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
 	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)

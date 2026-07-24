@@ -60591,6 +60591,30 @@ top.
 - **File(s)**: pkg/config/compiler_nat_static.go,
     pkg/config/static_nat_multitarget_6483_test.go, docs/config-schema.md, _Log.md
 
+- **Timestamp**: 2026-07-24
+- **Action**: #6454 — commit-time gate rejecting duplicate NAT rule-SET names
+  within one nat type (source/destination/static/nat64). Sibling of #5649
+  (rule-NAME axis) one level up. Two same-named rule-sets both SURVIVE (compileNAT*
+  APPEND, never merge by name), so their rules share the natType/ruleSet/rule
+  counter namespace and per-rule telemetry merges; nat64 rule-sets (counter-less,
+  no `rule` nodes) still share their show-surface name identity. New gate
+  validateDuplicateNATRuleSetNamesAST keyed by (natType, rule-set), unioned across
+  repeated sub-blocks (#3915), deduped at the AST rule-set-INSTANCE level so a
+  single #3096 bracket-list-scoped rule-set (Cartesian-expands into multiple
+  same-named NATRuleSet objects downstream) is NOT flagged. Scope: only WITHIN one
+  nat type — the counter key is natType-prefixed (NATCounterKey), so a same-named
+  rule-set across DIFFERENT nat types is a distinct namespace and accepted. Wired
+  into compileConfigWithOpts + compileConfigForNodeWithOpts; strict rejects,
+  lenient warns via opts.lenientDuplicateNATRuleSetName (#1960 no-brick).
+  PARENT-RED: guard `seen[key]` with `&& false` (imports stay live, go vet OK) →
+  all reject tests go clean-assertion RED (strict CompileConfig returns nil); the
+  no-false-positive accepts stay GREEN. go build ./..., go vet ./pkg/config/,
+  gofmt, FULL pkg/config suite (12s), TestHeatmapNotStale all GREEN (regenerated
+  heatmap — only compiler_opts.go bucket 2095→2113).
+- **File(s)**: pkg/config/dup_nat_ruleset_names.go,
+    pkg/config/dup_nat_ruleset_names_6454_test.go, pkg/config/compiler.go,
+    pkg/config/compiler_opts.go, docs/config-schema.md,
+    docs/refactoring-audit-current.txt, _Log.md
 ## 2026-07-24 — #6469 swanctl render-belt completeness (endpoints + proposals)
 - **Timestamp**: 2026-07-24
 - **Action**: Sanitize EVERY remaining raw-`%s` swanctl render slot that
