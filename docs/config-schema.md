@@ -469,16 +469,18 @@ pools + proxy-ARP as part of this change.
 
 ### Duplicate NAT rule name (#5649, C181-M18)
 
-NAT rule-sets are ordered, first-match tables and each rule's operational /
-counter identity is `natType/ruleset/rule` (`pkg/dataplane/compiler_nat.go`).
-Two rules authored with the SAME name in one rule-set are NOT reduced to
-last-writer-wins like a #5180 hierarchical block — they BOTH survive:
-`namedInstances` (the rule loop in `compiler_nat_source.go` /
-`compiler_nat_destination.go` / `compiler_nat_static.go`) appends each as a
-separate row. The first shadows the second (first-match), the second is
-unreachable, and both map to the ONE name-derived counter identity, so
-`show` / counter surfaces cannot tell the two rows apart and reordering
-equivalent text can silently change enforcement.
+NAT rule-sets are ordered, first-match tables keyed by rule name, so a rule's
+CONFIG identity is `natType/ruleset/rule`. Two rules authored with the SAME
+name in one rule-set are NOT reduced to last-writer-wins like a #5180
+hierarchical block — they BOTH survive: `namedInstances` (the rule loop in
+`compiler_nat_source.go` / `compiler_nat_destination.go` /
+`compiler_nat_static.go`) appends each as a separate first-match entry sharing
+that one config identity. For source / destination / ordinary static NAT that
+identity is also the shared `natType/ruleset/rule` hit counter (so `show` /
+counter surfaces cannot tell the rows apart); for a counter-less NPTv6 (RFC
+6296) static rule they are two snapshots (`buildNptv6Snapshots`). Either way the
+duplicate name is a config error — the harm is type-independent (the shared
+config identity), which is why the gate's diagnostic is type-agnostic (below).
 
 `validateDuplicateNATRuleNamesAST(tree, lenient)`
 (`pkg/config/dup_nat_rule_names.go`, wired beside the #5180 duplicate-named-block

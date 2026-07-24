@@ -416,8 +416,8 @@ type compileOpts struct {
 	// NAT rule-name gate (validateDuplicateNATRuleNamesAST) from a hard error
 	// to a warning on the tolerant load / peer-sync paths. Unlike #5180 the
 	// duplicate is NOT last-writer-wins: both same-named rules survive as
-	// separate first-match rows, the first shadowing the second, and both
-	// share the one natType/ruleset/rule counter identity. An already-persisted
+	// separate first-match entries sharing one config identity (the rule name —
+	// the counter for ordinary rules, but NPTv6 static is counter-less). An already-persisted
 	// config (or one synced from a peer) may carry such a duplicate; an
 	// upgrading / receiving node must still boot through it (warn — the runtime
 	// keeps the historical two-row behavior) rather than fail-closed-on-load

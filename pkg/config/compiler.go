@@ -246,8 +246,8 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	// #5649 (C181-M18): duplicate NAT rule-name gate — see
 	// validateDuplicateNATRuleNamesAST. Pre-expansion, top-level `security`
 	// stanzas only, beside the #5180 gate. Two same-named rules in one NAT
-	// rule-set BOTH survive as first-match rows (the first shadows the second)
-	// and share one natType/ruleset/rule counter identity; strict rejects,
+	// rule-set BOTH survive as first-match entries sharing one config identity
+	// (the rule name; counter-less for NPTv6 static); strict rejects,
 	// lenient warns.
 	dupNATRuleWarnings, dupNATRuleErr := validateDuplicateNATRuleNamesAST(
 		tree, opts.lenientDuplicateNATRuleName)

@@ -60275,3 +60275,19 @@ top.
     GREEN.
 - **File(s)**: pkg/config/dup_nat_rule_names.go,
     pkg/config/dup_nat_rule_names_5649_test.go, docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-07-24 04:40 UTC
+- **Action**: Fold Codex6452c round-3 MINOR — purge the stale "counter
+    identity" / shadowing framing from the three surviving comment/doc sites
+    that the SIMPLIFY commit's emitted message already dropped: the
+    compiler.go call-site comment and the compiler_opts.go
+    lenientDuplicateNATRuleName comment (both retargeted to the type-agnostic
+    config-identity framing, counter-less for NPTv6), and the config-schema.md
+    #5649 section top (which self-contradicted its own type-agnostic bottom
+    paragraph — rewritten so the whole section states the shared-config-identity
+    defect: the shared counter for source/dest/ordinary-static, two snapshots
+    for counter-less NPTv6). Doc/comment-only — no code change (the gate + its
+    emitted diagnostic were confirmed correct by Codex6452c). compiler_opts.go
+    stayed line-count-neutral (2095) so the heatmap is unchanged; build/vet
+    clean, heatmap canary + pkg/config GREEN.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_opts.go,
+    docs/config-schema.md, _Log.md
