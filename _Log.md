@@ -1,3 +1,32 @@
+## 2026-07-23 — #6439: split pkg/ipsec/policy.go — lift the address/family-resolution island to policy_addr.go
+
+- **Timestamp**: 2026-07-23 (refactor/6439-ipsec-policy-split)
+- **Action**: Pure code-motion modularity split of pkg/ipsec/policy.go
+  (1,135 LOC, fused two aspects). Lifted the bottom self-contained
+  config-prep + address/family-resolution island (PrepareConfig,
+  HasDHCPBoundGateway, interfaceRefIsDHCP, resolveInterfaceAddress[Family],
+  resolveHostFamily machinery, resolveGatewayFamilyHints,
+  gatewayRemoteFamilyHint, resolveConfiguredInterfaceAddress,
+  selectUnitAddress, resolveKernelInterfaceAddress, selectFamilyAddress,
+  bareIP, bareIPGlobalOnly, parseBareIP, zoneQualify, addressFamilyHint,
+  matchFamily) verbatim into a new sibling pkg/ipsec/policy_addr.go. policy.go
+  keeps the swanctl config-render aspect (childSelector, generateConfig,
+  renderConfig, resolveRemoteAddr, sortedVPNNames, effectiveTrafficSelectors,
+  childNameDisambiguator, sanitize/escape helpers, pskIDSelectors,
+  formatIdentity, authMethodToSwan, xfrmiIfID) at 632 LOC; policy_addr.go is
+  511 LOC. Only per-file package/import lines differ — no logic edit, rename,
+  or reorder. The two halves have no cross-calls; the island has no upward
+  deps. Import split is mutually exclusive except shared sort/strings/config:
+  policy.go dropped context/net/strconv/sync/time, policy_addr.go gained them.
+  Behavior-preservation proof: normalized multiset diff (strip
+  package/import/blank/comment-only) old-single vs new-two-files = 697 == 697
+  logic lines, ZERO delta; ordered byte-diff of the moved island (old lines
+  639-1135 vs the new decls) = verbatim, empty diff. go build ./..., go vet
+  ./pkg/ipsec/, go test ./pkg/ipsec/, and FULL go test ./... GREEN (incl.
+  #1373 pkg/dataplane retirement canary + TestHeatmapNotStale). policy.go was
+  1135 (< 1500 restructure trigger), so no heatmap regen needed.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/policy_addr.go, _Log.md
+
 ## 2026-07-23 — #6403: seed the synchronous ArchiveConfig mirror from its target dir under the write lock
 
 - **Timestamp**: 2026-07-23 (fix/6403-archive-offlock)
