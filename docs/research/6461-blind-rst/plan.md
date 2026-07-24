@@ -1,8 +1,6 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v4 — revised after round-2 convergence (Codex PLAN NO, AGY
-PLAN NO, Claude SMR PLAN NO — same core verdict: flip no-baseline to
-refuse-demote, gate the materialize constructor, bound seed trust)**
+**Status: DRAFT v5 — revised after round-3 reviews (Codex PLAN NO 4B/4H/2M, AGY PLAN YES 1M/1L, Claude SMR adjudication folded)**
 
 v1 → v2: round-1 review killed v1's architecture (attacker-writable trust
 anchor, missed reverse-NAT constructor, invalid cross-store serial merge).
@@ -14,21 +12,30 @@ v2 → v3: round-2 AGY folds — anchor updates in BOTH `lookup_with_origin`
 (cache-hit bulk); refused close seed SKIPS the reverse install; `FWD_SLACK`
 from `wnd(O)`; TFO-aware OPENING seed.
 v3 → v4: round-2 convergence (all three reviewers independently traced the
-same blocker): (a) no-baseline **fail-open re-admitted the cluster kill** —
-post-failover, a blind RST as the first locally-observed packet promotes a
-synced entry to `SharedPromote` (NOT peer-synced, `entry.rs:245-250`), and
-its 2 s reap emits a Close delta that deletes the shared + standby copies
-cluster-wide; (b) the **materialize seed** (`materialize_shared_session_hit`
-threads the current packet's flags into `upsert_synced_with_origin` →
-`install.rs:399-400`) is a third packet-derived constructor v3 missed;
-(c) **seed trust**: `!valid` seeds are now cross-bounded against an
-already-trusted opposite anchor (kills the 2-packet seed race), ack samples
-require `has_ack` (a SYN retransmit's zero ACK field permanently poisoned a
-near-zero acceptance leg), seq slides require `seg_len > 0`, closing
-segments never update the anchor, closing packets never promote; (d)
-arithmetic restated — the ESTABLISHED union acceptance is TWO windows
-(1/16384 floor, ~1/10923 max reachable), and `2×wnd(O)` self-bounds at
-131,070 (the 512 KiB cap was dead). Round-1/2 review docs sit alongside
+same blocker): refuse-demote on no-baseline everywhere; the materialize
+constructor gated (install-alive); seed trust model (cross-bounded seeds);
+`has_ack`/`seg_len>0` slide gates; closing segments never update/promote;
+dead 512 KiB cap removed; union arithmetic restated.
+v4 → v5: round-3 folds (Codex 1-10, AGY MEDIUM): (a) **provenance matrix**
+— only primary miss installs of genuinely new flows self-authenticate
+(materialize/import/synth/upsert never do — a non-close attacker packet
+materializing a shared victim would otherwise re-plant the two-packet
+SharedPromote kill); (b) **commit-point observation** — anchor updates
+moved out of `lookup_with_origin` to per-disposition forwarding-commit
+hooks (post input-filter/admission/TTL/output-drop), so undelivered
+packets cannot poison future validation; (c) **OPENING ack interval**
+`[isn+1, isn+SEG.LEN]` (RFC 9293 SYN-SENT + RFC 7413 §4.2.2 TFO
+partial-ack), exact — not windowed — at the point-seed bootstrap;
+(d) **trust transaction semantics** (authenticated samples replace
+untrusted storage, never bless it; unauthenticated samples never clear
+trusted state; `wnd` only from authenticated segments); (e) plumbing:
+`TcpSegView` carries flags, seg threads both install paths,
+`ForwardSessionMatch` carries scope + anchor snapshot; (f) refused-close
+inertness extended to the promote write (no refresh/re-bucket); (g) the
+imported-entry absorbing state stated honestly — the HA-wire anchor is a
+REQUIRED fast-follow (Phase 2, §10.5), not an option; (h) arithmetic
+residuals (overlap range 1/32768..1/21845, precursor two-channel ~2×,
+serial-max spec, 24 B not 26 B). Round-1/2/3 review docs sit alongside
 this file.
 
 Research branch: `research/6461-blind-rst`. Plan-only deliverable; no
@@ -143,31 +150,28 @@ What the fix buys, at absolute scale:
   acceptance interval — up to **two** windows,
   `window(seq_hi(D)) ∪ window(ack_hi(O))`, each `BACK_SLACK + FWD_SLACK + 1`
   wide (`FWD_SLACK = max(2×wnd(O), 64 KiB)`, self-bounding at 131,070 since
-  raw `wnd` is u16). Worst-case (both legs valid and disjoint):
-  floor `2 × 131,073 = 262,146` values ≈ **1/16384 per guess**; maximum
-  reachable `2 × 196,607 = 393,214` ≈ **1/10923**. When the legs overlap
-  (the common case — seq and ack positions track within a window) the
-  figure halves toward 1/32768. At 1,000 minimum-size closes/s (~1 Mbit/s)
-  the expected spray-to-kill is **~16 s (floor) to ~11 s (max)** of
-  sustained spraying per kill — stated as the honest worst case, not the
-  best.
-- **Observation boundary (round-2 Codex, restated honestly):** the anchor
-  learns from segments the *session layer observes*, which is not
-  identical to "packets endpoints receive." Both `account_packet` sites
-  are post-TTL (the cache path's TTL check is hoisted above its side
-  effects, `flow_cache_hit.rs:321-325`; the slow-path site runs after the
-  :846-880 TTL arm), but site (b) at resolve time precedes input-filter
-  and host-admission drops, and site (a) precedes output-filter/CoS drops
-  (`forward_request.rs:264-290, :368`). A TTL-crafted or filter-dropped
-  in-window close can therefore demote without endpoint delivery — but
-  that is master's existing trust boundary for closing state (marking has
-  always happened at lookup, before those drops), the in-window
-  difficulty is unchanged, and the gate strictly *reduces* what an
-  observed packet can do. Moving the anchor to a post-forward-commit hook
-  is purity without a security delta; rejected, with the boundary
-  documented here instead. The endpoint-backstop framing from v1-v3 is
-  dropped: sprayed closes may never reach an endpoint, so RFC 5961
-  endpoint handling is not part of the cost model.
+  raw `wnd` is u16, and `wnd` accepted only from authenticated segments).
+  Worst-case (both legs valid and disjoint): floor `2 × 131,073 = 262,146`
+  values ≈ **1/16384 per guess**; maximum reachable `2 × 196,607 = 393,214`
+  ≈ **1/10923**. With legs overlapping (the common case) the per-guess
+  figure is 1/32768 at the floor and ≈1/21845 at the max (round-3 Codex 8).
+  A precursor seed attempt can place independent guesses in BOTH the seq
+  and ack fields of one packet — its two chances are additive even where
+  the close's two intervals overlap, so "seed cost == direct close cost"
+  is optimistic by up to ~2× (stated, not hidden). At 1,000 minimum-size
+  closes/s (~1 Mbit/s) the expected spray-to-kill is **~16 s (floor) to
+  ~11 s (max)** of sustained spraying per kill — the honest worst case.
+- **Observation boundary (v5 — commit-point):** the anchor learns ONLY
+  from packets the firewall committed to forward or deliver (per-disposition
+  commit hooks, §5.2 — post input-filter, host-admission, TTL, and
+  output-filter/CoS drop evaluation). v3–v4's resolve-time updates let
+  TTL=1 or filter-dropped bounded packets walk a trusted anchor and convert
+  the endpoint's next legit close into a refusal (griefing regression);
+  that class is closed. The DEMOTE decision still happens at lookup
+  (pre-filter), exactly as master's marking always has — an in-window
+  close with TTL expiring at the firewall demotes without delivery on
+  master too; no regression there. RFC 5961 endpoint handling is not part
+  of the cost model: sprayed closes may never reach an endpoint.
 - Anchor-walking (feeding contiguous fake in-window data to slide the
   anchor, then RST) requires landing a first in-window sample (the same
   ~1/2^13–1/2^14 guess) and buys the attacker nothing beyond it: the
@@ -175,19 +179,23 @@ What the fix buys, at absolute scale:
   in-window guess regardless. `seg_len > 0` is required for `seq_hi`
   slides (v4), so zero-length probes cannot walk the anchor at one packet
   per slack.
-- **First-observation race residual (v4, bounded):** entries with no
-  trusted local baseline (HA-imported and never locally observed,
-  pre-upgrade) refuse demotion outright — the post-failover
-  `SharedPromote` cluster-kill trace is dead. A direction's first
-  observed sample seeds only if cross-bounded against an *already-trusted*
-  opposite anchor (attacker cost: one in-window guess, ~1/2^13, same as
-  attacking the close directly — no amplification); seeds with no trusted
-  opposite anchor stay untrusted and never validate a close. The
-  irreducible residual: with *zero* wire-truth on both sides, any policy
-  is arbitrary — refuse-demote is the safe one, and it costs legit
-  RST-first-after-failover flows a lingering entry (≤ ordinary timeout,
-  delivery unaffected, endpoints tear down). The additive HA-wire anchor
-  field (§10 follow-up) closes even that for synced flows.
+- **Imported-entry absorbing state (v5, stated without varnish):** an
+  HA-imported (`SyncImport`/`SharedMaterialize`/`WorkerLocalImport`) or
+  pre-upgrade entry has no trusted bootstrap, and per the transaction
+  semantics NO observed packet can create the first trusted bit — the
+  state is absorbing until the entry churns. Every such flow's closes
+  (legit included) refuse demotion for the entry's remaining life:
+  entries linger to their inactivity timeout (300 s default; per-app
+  values up to 86,400 s) instead of the 2 s/30 s fast reap. Delivery is
+  never blocked; endpoints tear down normally. Slot pressure: bounded by
+  the synced-flow count at the event; note honestly that synced upserts
+  bypass the local admission cap (`install.rs:295-323`) so 131,072 is an
+  admission ceiling, not headroom — a high-churn failover can hold
+  thousands of lingering entries for minutes while new local installs
+  contend. This residual is exactly what the **REQUIRED Phase-2 HA-wire
+  anchor (§10.5)** closes; it is not optional for the synced class. The
+  post-failover `SharedPromote` cluster-kill trace is dead regardless
+  (nothing marks without trust).
 - What this costs a legitimate teardown when the gate misjudges: the
   packet is always delivered (endpoints tear down normally), the entry
   idles out on its ordinary timeout instead of the 2 s/30 s fast reap —
@@ -195,12 +203,12 @@ What the fix buys, at absolute scale:
   (round-2 Codex): a both-direction path-switch can stall an anchor
   permanently (§5.2); many flows stalling after one path event linger to
   their established timeouts — bounded, self-healing as flows churn.
-- Cost: ~26 B of new state on `SessionEntry` (uniform slab — includes
+- Cost: 24 B of new state on `SessionEntry` (uniform slab — includes
   UDP/ICMP entries that never use it; ≈ 3 MiB per worker at the 131,072
-  cap, ≈ 18 MiB at 6 workers), one 8-byte TCP-header read plus two
-  plausibility-gated `u32` stores per TCP data packet inside the existing
-  `account_packet` session-table probe, and a second table probe only on
-  closing-flag segments (which already take the full slow path).
+  cap, ≈ 18 MiB at 6 workers), one TCP-header view compute (seq/ack/wnd/
+  flags/seg_len) plus ≤2 plausibility-gated `u32` stores per committed
+  TCP data packet, and a second table probe only on closing-flag segments
+  (which already take the full slow path).
 
 What the fix does **not** buy: protection against an on-path attacker
 (observes sequence numbers; out of threat model); protection of pre-5961
@@ -288,9 +296,9 @@ in §1.*
 | 3 | `install.rs:179-180` primary miss installs | creating packet flags | already unreachable for bare closes (#4400); SYN-bearing malformed closes are screen-owned; no change |
 | 4 | HA wire re-import — eventstream `UpsertSynced` → `upsert_synced_with_origin` (no packet exists) | peer delta | validation-free by design (the peer validated before reaping and emitting the Close); distinct from site 2c, which HAS a packet |
 | 5 | tunnel `UpsertLocal` (`tunnel.rs:563-615` → `session_glue/mod.rs:786-800`) | locally generated packets (firewall-originated tunnel TX) | trusted-local class, documented; not wire-attacker-controllable. Inbound tunnel closes land on site 1 with whatever anchor the inbound stream built — none if the flow is outbound-only → refuse-demote; local blast radius (round-2 Codex 5) |
-| 6 | fabric-return reverse seed (`cluster_peer_return_fast_path` install) | fabric-ingress packet flags | bare closes already excluded (#4453); the non-close seed bypasses both anchor sites (round-2 Codex 5) — a later close demotes only the local reverse seed and `is_reverse` suppresses the Close delta; no owner kill; documented |
+| 6 | fabric-return reverse seed (`cluster_peer_return_fast_path` install) | fabric-ingress packet flags | bare closes already excluded (#4453); the seed bypasses the commit hooks (round-2 Codex 5) so the reverse seed carries no anchor — a later close on it is REFUSED (missing-forward/no-baseline, §5.1) and the seed ages on its ordinary timeout; `is_reverse` suppresses any Close delta; no owner kill; documented |
 | 7 | CLI/control deletes, GC/reaper, screens/SYN-cookie | — | consumers / unaffected |
-| 8 | **forward-wire immutable match** — `find_forward_wire_match_with_origin` (`lookup.rs:258-293` via `shared_ops.rs:614-628`): NAT64 forward direction, hairpin, non-bijective NAT | wire packet on the forward-wire tuple | **demote-free by construction (round-2 Codex 4):** the match is immutable (cloned decision/metadata — no `&mut`, no mark, no refresh, today and after this change). Closes on this path never demoted on master, so there is nothing to gate. The anchor for these flows advances from the reverse (mutable alias) direction only; pre-existing forward-direction accounting/refresh asymmetry (NAT64) is out of scope — filed as a follow-up candidate |
+| 8 | **forward-wire immutable match** — `find_forward_wire_match_with_origin` (`lookup.rs:258-293` via `shared_ops.rs:614-628`): NAT64 forward direction, hairpin, non-bijective NAT | wire packet on the forward-wire tuple | The match itself never marks (cloned decision/metadata — no `&mut`, today and after). **But it is not demote-free (round-3 Codex 7a):** a promotable-origin forward-wire hit reaches `maybe_promote_synced_session` → `update_session`, which marks closing/reset from the packet's flags on master — that path is gated by §5.5's transactional promote rule like every other promote (no anchor on an import → refuse, inert). The anchor for these flows advances from the reverse (mutable alias) direction only; pre-existing forward-direction accounting/refresh asymmetry (NAT64) is out of scope — filed as a follow-up candidate |
 
 ---
 
@@ -353,7 +361,7 @@ RFC 5961-immune.
 
 ### 5.1 The anchor: one two-direction track on the canonical forward entry
 
-`SessionEntry` gains (~26 B; plain POD, worker-owned, no serde, no HA
+`SessionEntry` gains (24 B; plain POD, worker-owned, no serde, no HA
 wire):
 
 ```rust
@@ -389,134 +397,158 @@ non-owner's copies are non-authoritative — `is_reverse`/peer-synced origins
 suppress their Close deltas — and the owner validates the redirected close
 against its own anchor).
 
-### 5.2 Anchor updates: trust, gating, and the two chokepoints
+### 5.2 Anchor updates: commit-point observation, trust, and gating
 
-Two update sites, one store, one gating rule — together they cover every
-TCP forwarding class:
+**Where updates run (v5 — round-3 Codex 6):** the anchor learns ONLY from
+packets the firewall **committed to forward or deliver** — applied at
+per-disposition forwarding-commit hooks, never inside the session lookup:
 
-- (a) **`account_packet`** (`flow_cache_hit.rs:312` and
-  `poll_descriptor/mod.rs:3497`) — covers the cache-hit bulk AND the
-  ForwardCandidate/FabricRedirect slow-path forward build. TCP only: read
-  the 8 bytes at `packet_frame[meta.l4_offset+4 .. +12]` → `(seq, ack)`;
-  `seg_len` from IP-declared length (§5.3). **The active frame is
-  `packet_frame`, NOT `raw_frame`** — native GRE builds a synthetic
-  decapped frame and the meta offsets index into it
-  (`flow_cache_hit.rs:65-103`); reading `raw_frame` would parse the GRE
-  outer header. Both sites are post-TTL (cache path: #3779 hoisted the
-  TTL check above the side effects, `flow_cache_hit.rs:321-325`; slow
-  path: the :846-880 TTL arm precedes the :3494 forward build).
-- (b) **`lookup_with_origin`** — covers every slow-path session hit that
-  never reaches (or precedes) the cache: control segments, pre-cache
-  packets, NAT64/NPTv6, and — round-2 AGY B1 — **LocalDelivery**, whose
-  per-packet `to-zone junos-host` re-evaluation
-  (`poll_descriptor/mod.rs:640-654`, #3706/#3485) runs through
-  `resolve_flow_session_decision` → `lookup_session_across_scopes` on every
-  host-inbound packet. `account_packet` is gated on
-  ForwardCandidate|FabricRedirect (`poll_descriptor/mod.rs:3478-3481`) and
-  LocalDelivery is neither, so WITHOUT this site the anchor of a
-  firewall-destined BGP/SSH/IKE session would freeze at its install-time
-  seed and every post-handshake legitimate close would soft-refuse — the
-  exact management flows the issue names as victims. A firewall-originated
-  flow's outbound direction is kernel-TX (unseen at AF_XDP); its anchor
-  side is pinned by the inbound ACK stream (cross-direction leg, §5.4).
-  **Boundary note (round-2 Codex 2):** site (b) runs at resolve time,
-  before input-filter/host-admission drops — anchor samples are
-  session-layer observations, not forwarded-commitments. That is master's
-  existing trust boundary for closing state (marking has always happened
-  at lookup); the in-window difficulty of abusing it is unchanged; the
-  gate strictly reduces what an observed packet can do. Not moved (§2).
-- (c) install time — the creating packet seeds the anchor for its direction
-  (adopt unconditionally, set the validity **and trust** bits — a locally
-  observed handshake/pickup is wire-truth): SYN seeds `isn + SEG.LEN`
-  (TFO/SYN-with-data included), a mid-stream pickup seeds from its first
-  segment. Install seeds set **seq validity only** — never ack validity
-  (a SYN's ACK field is meaningless; round-2 Codex 3 — see the gating
-  rule). An attacker-invented pickup flow anchors itself — killing a flow
-  you yourself created is no loss; victim flows anchor from victim traffic.
+- **Transit slow path / cache path:** the seg view (§5.3) is computed once
+  per TCP packet; the anchor update is applied at the commit point AFTER
+  input filter, TTL/hop-limit, and output-filter/CoS drop evaluation
+  (`forward_request.rs:264-290, :368` on the slow path; the cache path's
+  precomputed TX-selection drop gate). #2501 counter placement is
+  UNCHANGED (`account_packet` keeps counting attempted forwards at
+  `flow_cache_hit.rs:312` / `poll_descriptor/mod.rs:3497` — RT_FLOW volume
+  semantics untouched); the anchor rides a separate apply hook fed by the
+  same seg view, so only committed packets move it. Rationale: with
+  updates at resolve/account time, TTL=1 or filter-dropped bounded packets
+  could walk a trusted anchor >BACK_SLACK and convert the endpoint's next
+  legit close into a refusal — a griefing regression master does not have
+  (round-3 Codex 6).
+- **LocalDelivery (host-inbound):** applied post host-admission
+  (`poll_descriptor/mod.rs:640-844`, #3706/#3485 junos-host re-eval) —
+  the disposition never reaches the transit commit hook, and this is the
+  class round-2 AGY B1 found anchor-blind. A firewall-originated flow's
+  outbound direction is kernel-TX (unseen); its anchor side is pinned by
+  the inbound ACK stream (cross-direction leg, §5.4).
+- **`lookup_with_origin` does NO anchor updates (v5):** the lookup path
+  validates and marks only. Closing segments never update (rule 1);
+  transit non-close control segments reach the transit commit hook;
+  LocalDelivery reaches its own. This removes the pre-filter observation
+  window entirely rather than arguing it harmless.
+- **Install-time seeds** are applied at the constructors (rule 4's
+  provenance matrix).
 
 Reverse-direction samples fold onto the canonical forward entry exactly as
-`account_packet` folds counters today (`mod.rs:1177-1211`); lookup-path
-updates on a reverse hit use the same post-borrow companion hop the close
-marking uses (§5.5). A slow-path ForwardCandidate packet transits BOTH
-sites — the same sample applied twice, value-idempotent via the gated max
-(sequential borrows, no hazard; deliberately no dedup token — round-2
-Codex 9 confirms none is required).
+`account_packet` folds counters today (`mod.rs:1177-1211`); commit-hook
+updates on a reverse-direction packet use the same reverse→forward key
+hop. One store, one gating rule, per-disposition commit hooks.
 
-**The gating rules (round-1 Codex B1 + round-2 Codex 3 — the trust anchor
-must be neither attacker-jumpable nor attacker-seedable):**
+**The gating rules (round-1 Codex B1 + round-2/3 Codex — the trust anchor
+must be neither attacker-jumpable nor attacker-seedable nor
+attacker-poisonable):**
 
-1. **Closing segments never update the anchor.** A FIN/RST's own sample is
-   not applied at any site, before or after validation (validation reads
+1. **Closing segments never update the anchor.** A FIN/RST's own sample
+   is not applied anywhere, before or after validation (validation reads
    the pre-packet anchor; on accept the entry is dying and the anchor is
-   moot). `account_packet` skips anchor updates for `is_closing(flags)`
-   packets outright — it never learns the close verdict (round-2 Codex 9).
+   moot).
 2. **seq slides:** an ordinary (non-close) sample `s = seq + seg_len` with
    **`seg_len > 0`** slides `seq_hi` forward only within the current
    window: accepted iff `!valid` (seed — rule 4) or
    `s.wrapping_sub(seq_hi) <= FWD_SLACK` (serially: at most `FWD_SLACK`
-   ahead; anything at or behind is a no-op via max). Zero-length samples
-   update `wnd`/`ack_hi` only — one packet per slack of anchor-walking is
-   no longer available (round-2 Codex 3).
+   ahead). "Behind is a no-op" is a **serial max**, not `u32::max`
+   (round-3 Codex 8): advance iff `s.wrapping_sub(cur)` is in
+   `(0, FWD_SLACK]`; tracker wrap tested separately from validator wrap.
+   Zero-length samples never slide `seq_hi` (one packet per slack of
+   anchor-walking is not available).
 3. **ack slides:** `ack_hi` updates ONLY from ACK-bearing segments
    (`has_ack`), same window rule. Without this, a SYN retransmit's zero
    ACK field seeds `ack_hi ≈ 0` on an OPENING hit, and the real ACK stream
    (≫ `FWD_SLACK` away) can never repair it — a permanent acceptance
    window near sequence zero that a naive `seq=1` blind RST validates
-   (round-2 Codex 3; this was a live hole in v1–v3).
-4. **seed trust (round-2 Codex 3 / SMR 3):** trust is acquired per
-   *segment*, not per field — **a segment authenticates when ANY of its
-   fields cross-bounds against trusted state, and all samples of an
-   authenticated segment are adopted `valid`+`trusted`**:
-   - a seq sample for direction D cross-bounds against `ack_hi(O)`
-     (O's ack of D's data tracks D's real position even while D is
-     unobserved, so legit asymmetric rejoins pass);
-   - an ack sample for D cross-bounds against `seq_hi(O)`;
-   - install seeds (rule (c)) are self-authenticating (the session exists
-     because the firewall saw this segment; an attacker's spoofed SYN
-     anchors only its own invented flow).
-   The handshake bootstraps cleanly: the SYN self-authenticates (fwd seq
-   trusted); the SYN-ACK authenticates via `ack == fwd seed` (the
-   handshake proof — a spoofed SYN-ACK needs the client ISN, 1/2^32) so
-   BOTH its seq and ack are trusted (a fast server abort right after
-   connect validates — rule-1 leg `seq_hi(rev)` is trusted from birth);
-   the client's first ACK authenticates via `ack == rev seed`. Mid-flow,
-   every real segment authenticates trivially (contiguity). Attacker
-   cost: landing ANY field inside a trusted window is one ~1/2^13 guess —
-   identical to attacking the close directly, so seeding confers **no
-   amplification** (a fake trusted seed at X then a RST at X costs the
-   same expected sprays as a direct in-window RST guess).
-   Samples of an UNauthenticated segment are adopted `valid` but
-   **untrusted** (tracking only): they never validate a close (§5.4), and
-   untrusted state cannot authenticate other segments (a fabricated
-   self-consistent pair stays untrusted). The 2-packet seed race from v3
-   (spoof data seq=X, then RST at X) dies: either trusted state exists to
-   bound against (the seed is a 1/2^13 guess, same as the direct attack)
-   or it doesn't (the close is refused regardless).
-   The residual: an HA-imported/pre-upgrade entry with zero local
-   wire-truth never authenticates a segment — its legit teardowns linger
-   to the ordinary timeout (bounded; delivery unaffected; churn replaces
-   the entry with trusted seeds). The additive HA-wire anchor field (§10
-   follow-up) restores fast-reap for the synced class.
+   (round-2 Codex 3).
+4. **Trust acquisition (v5, provenance matrix + segment authentication):**
+   every anchor side carries `(value, valid, trusted)`.
+   - **Self-authenticating constructors (only these):** the *primary
+     miss install* of a genuinely new flow (origins `ForwardFlow`/
+     `LocalMiss`/`MissingNeighborSeed` and the LocalDelivery new-flow
+     install) — the session exists because the firewall saw this packet;
+     an attacker's spoofed SYN anchors only its own invented flow. SYN
+     seeds `seq_hi = isn + SEG.LEN` (TFO included), a mid-stream pickup
+     seeds from its first segment — both born `trusted`, **seq side
+     only** (a SYN's ACK field is meaningless; ack trust comes from the
+     first authenticated ACK-bearing segment).
+   - **Never self-authenticating:** `SyncImport`, `SharedMaterialize`,
+     `WorkerLocalImport`, reverse-companion synthesis, tunnel
+     `UpsertLocal` refreshes, and any re-import/upsert (which
+     `remove_entry`s the prior record — an anchor wipe, §7). Their
+     packets' samples adopt `valid`+**untrusted** only (round-3 Codex 1:
+     without this matrix, a non-close attacker packet materializing a
+     shared victim would self-authenticate a planted seq and the
+     two-packet SharedPromote kill would revive).
+   - **Segment authentication:** a segment *authenticates* when ANY of
+     its fields proves against trusted state, and all its samples then
+     adopt trusted. Two proof strengths:
+     - **OPENING handshake proof (strong, exact):** against an install
+       point seed, the proving ack must lie in the exact interval
+       `[isn+1, isn+SEG.LEN]` — RFC 9293 SYN-SENT's
+       `ISS < SEG.ACK <= SND.NXT`, covering RFC 7413 §4.2.2 TFO
+       partial-ack (a server rejecting SYN data acks only the SYN).
+       For a bare SYN the interval collapses to one value (a spoofed
+       SYN-ACK needs the client ISN, 1/2^32; with a ≤MSS TFO payload,
+       ≤1/2^21). The SYN-ACK authenticates via this proof → BOTH its
+       seq and ack adopt trusted (fast server abort validates);
+       the client's first ACK authenticates against the now-trusted
+       rev anchor. **Not windowed** (round-2 AGY MEDIUM + round-3
+       Codex 2: a BACK/FWD window around the seed would drop the
+       handshake proof to ~1/2^13).
+     - **Mid-flow proof (weak, windowed):** a seq sample for direction D
+       proves inside `window(ack_hi(O))`; an ack sample for D proves
+       inside `window(seq_hi(O))` — both requiring the bounding side
+       trusted. Every real mid-flow segment proves trivially
+       (contiguity). **Segment-wide adoption is deliberate:** per-field
+       adoption deadlocks the asymmetric bootstrap (one-sided pickup:
+       `seq_hi(rev)` needs `ack_hi(fwd)`, `ack_hi(fwd)` needs
+       `seq_hi(rev)` — neither can ever authenticate → legit closes on
+       a common #3152 class refuse forever). The cost is stated
+       honestly: where no usable close leg existed (direct-close
+       probability 0), a weak segment proof gives the attacker a
+       1/2^13 channel **in the first-observation race for an
+       unobserved direction** — the attacker must beat the real
+       reverse traffic, and the difficulty never drops below the
+       design's 1/2^13..1/2^14 floor anywhere else. Refuse-forever for
+       a common legit class is the worse failure; the race is accepted
+       and documented (round-3 Codex 3a, adjudicated).
+   - **Transaction semantics (round-3 Codex 3b/c):** on each packet,
+     per side: (i) an authenticated sample for a `!trusted` side
+     **replaces** the stored untrusted value (never max-merges with it —
+     attacker-planted untrusted values are discarded, never blessed);
+     (ii) an authenticated sample for a `trusted` side applies the
+     serial-max slide (rule 2/3); (iii) an unauthenticated sample
+     adopts ONLY into a `!valid` slot as untrusted — it NEVER clears or
+     alters existing valid/trusted state (a SYN retransmit cannot
+     demote the trusted SYN seed); (iv) untrusted state never validates
+     a close and never authenticates other segments (fabricated
+     self-consistent pairs stay untrusted).
+   - **`wnd` trust (round-3 Codex 8):** `wnd(D)` updates only from
+     authenticated/install-trusted segments — otherwise a no-knowledge
+     precursor advertising 65,535 would widen `FWD_SLACK` and the whole
+     acceptance interval (1/16384 → ~1/10923) for free.
+   - **Fabric-ingress refinement:** a fabric-ingress packet is
+     peer-vouched wire-truth (the owner forwarded it; the fabric is the
+     cluster trusted domain) — its samples authenticate for the anchor
+     of the materialized/synced entry on the receiving node. Coverage
+     is thin (only asymmetric/failover-transit traffic) but free.
 5. **Closing packets never promote.** `promote_from_reverse`
    (`lookup.rs:146-149`) currently sets `established` in-borrow on any
    reverse SYN-ACK — including a SYN+ACK+RST-flagged packet whose close is
-   later refused. v4: the in-borrow promote is skipped for
-   `is_closing(flags)` packets (a legit simultaneous SYN-ACK+RST is
-   pathological; screens own the malformed combos) so every close-packet
-   mutation is gated by the verdict (round-2 Codex 9).
+   later refused. v4+: the in-borrow promote is skipped for
+   `is_closing(flags)` packets (round-3 Codex 10 confirms: SYN-ACK+RST is
+   an abort, not an establishment signal; FIN is not a SYN-SENT promote
+   signal; simultaneous open converges through the exchanged SYN-ACKs).
 
 **Stall analysis (round-2 AGY B2 + Codex 7, made precise):** on a
-per-packet-tracked path every forwarded packet is a sample, so `seq_hi`
+per-packet-tracked path every committed packet is a sample, so `seq_hi`
 advances essentially contiguously — the gap between the anchor and the
 next new-sequence sample is bounded by the *reordering extent* of the
 path (in practice ≪ 64 KiB), NOT by in-flight size. The anchor can fall
 >`FWD_SLACK` behind when (a) observation is interrupted (an untracked
-stretch — the covered classes are fixed by sites (a)+(b); the documented
-residuals in §7 stay), (b) reordering extent exceeds `FWD_SLACK`, or
-(c) **a both-direction path switch** (round-2 Codex 7): a route/asymmetry
-flap lets seq AND cumulative-ack progress advance off-box together, then
-rejoin >slack ahead — the endpoints accepted the stretch, nothing
-retransmits near the stale anchor, and both legs stay rejected
+stretch — the documented residuals in §7), (b) reordering extent exceeds
+`FWD_SLACK`, or (c) **a both-direction path switch** (round-2 Codex 7): a
+route/asymmetry flap lets seq AND cumulative-ack progress advance off-box
+together, then rejoin >slack ahead — the endpoints accepted the stretch,
+nothing retransmits near the stale anchor, and both legs stay rejected
 permanently. The consequence per flow is soft-refused legit closes +
 ordinary-timeout aging (delivery unaffected, endpoints tear down
 normally); the aggregate version is many flows lingering to their
@@ -524,8 +556,9 @@ established timeouts after one path event — bounded, self-healing as
 flows churn. **No re-anchor escape hatch**: an "N contiguous rejected
 samples → re-anchor" rule is stageable at ~N+1 packets of contiguous fake
 data, reopening the round-1 B1 weakness; round-2 Codex 7 independently
-reached the same refusal. Recovery belongs to trusted state (the §10
-HA-wire follow-up), not to observation-counting heuristics.
+reached the same refusal (round-3 Codex 10 confirms). Recovery belongs to
+trusted state (the §10 HA-wire follow-up), not to observation-counting
+heuristics.
 
 **Ordering:** on a closing-flag packet, validation (§5.4) reads the
 pre-packet anchor; per rule 1 the packet never updates it.
@@ -584,16 +617,17 @@ is honestly stated in §2 (262,146–393,214 values worst case):
    the asymmetric-routing case (a direction never observed has no trusted
    `seq_hi(D)`; the opposite ACK stream still pins it).
 2. **OPENING** (`!established` on the FORWARD entry): accept iff (`ACK`
-   set and `seg.ack ==` the seeded peer-side `seq_hi` value — i.e.
-   `peer_isn + SEG.LEN`, covering TFO/SYN-with-data, since the seed at
-   §5.2(c) already folds the SYN's payload into `seq_hi`; this accepts the
-   Linux/Windows `seq=0, ack=isn+SEG.LEN` connection-refused RST, round-1
-   AGY Q6 / round-2 AGY F6) **or** `seg.seq ==` the seeded own-side
-   `seq_hi` (self-abort). Install seeds are trusted, so an OPENING entry
-   always has at least its creating direction's trusted baseline; a
-   materialized OPENING import with no local observation falls to rule 3
-   (its natural timeout is the 20 s opening window — the lingering cost
-   of a refused legit close is negligible).
+   set and `seg.ack ∈ [peer_isn+1, peer_isn+SEG.LEN]` — the RFC 9293
+   SYN-SENT interval `ISS < SEG.ACK <= SND.NXT`, covering RFC 7413 §4.2.2
+   TFO partial-ack (server rejecting SYN data acks only the SYN); for a
+   bare SYN the interval collapses to `isn+1`; this accepts the
+   Linux/Windows `seq=0, ack=isn+SEG.LEN` connection-refused RST AND its
+   TFO-reject sibling, round-3 Codex 2) **or** `seg.seq ==` the seeded
+   own-side `seq_hi` (self-abort). Install seeds are trusted, so an
+   OPENING entry always has at least its creating direction's trusted
+   baseline; a materialized OPENING import with no local observation
+   falls to rule 3 (its natural timeout is the 20 s opening window — the
+   lingering cost of a refused legit close is negligible).
 3. **No trusted baseline in any form → REFUSE-DEMOTE (v4, the round-2
    convergence flip).** The closing packet is forwarded unchanged; no
    mark, no constructor seed of `closing`/`reset`, no `last_seen_ns`
@@ -653,11 +687,22 @@ segments only; the no-close path is byte-identical):
      `expires_after_ns`/`last_seen_ns` stay at their prior values — the
      entry ages on its pre-attack trajectory.
 
-`update_session` (site 2) applies the same conjunction: the promote path
-threads the packet's `TcpSegView`; validation reads the forward entry's
-anchor (the entry being promoted IS the forward entry in the promotable
-case — `is_translated_forward_session_key` family — so no extra probe);
-wire-driven `update_session` callers (no packet) skip validation.
+`update_session` (site 2) applies the same conjunction, **transactionally
+(round-3 Codex 7b):** the promote path threads the packet's `TcpSegView`;
+validation reads the forward entry's anchor (the entry being promoted IS
+the forward entry in the promotable case — `is_translated_forward_session_key`
+family — so no extra probe). On a **refused** closing promote: no flag
+seeds (already), no `last_seen_ns` refresh, no wheel re-bucket — the
+refused-close inertness of §5.7 extends to the promote write, or spraying
+refused closes at a synced entry would pin it alive at the established
+timeout (master reaps 2 s after the spray stops; a refreshing refuse
+would hold it for 300 s). The ownership bookkeeping — origin flip to
+`SharedPromote`, owner-RG index, the Open delta announcing local
+ownership — still fires: it is forwarding truth (the node owns the RG and
+forwarded the packet), not close state, and the packet's delivery is
+never blocked. On **accept**, the update proceeds exactly as today with
+`reset |=` before timeout selection. Wire-driven `update_session` callers
+(no packet) skip validation.
 
 ### 5.6 Constructor gating (sites 2b + 2c)
 
@@ -692,15 +737,18 @@ baseline → refuse (round-2 Codex 8):
   A legit close we misjudged (stale anchor) costs only a re-synth on the
   next reply packet.
 
-**Reactive materialize (site 2c, round-2 Codex 1 / SMR 2):**
-`materialize_shared_session_hit` threads the current packet's `tcp_flags`
-into `upsert_synced_with_origin`, which seeds `closing`/`reset` at
-`install.rs:399-400`. An imported replica carries no anchor → every
-closing-flagged materialize is no-baseline → **refuse**: install the copy
-ALIVE (`closing=false, reset=false`) regardless of the packet's flags.
-Unlike site 2b the install cannot be skipped — the packet needs its
-decision and the entry must own the flow — so the seed is suppressed
-instead. (If the §10 wire-anchor follow-up lands, a wire-carried anchor
+**Reactive materialize (site 2c, round-2 Codex 1 / SMR 2, round-3 Codex
+1):** `materialize_shared_session_hit` threads the current packet's
+`tcp_flags` into `upsert_synced_with_origin`, which seeds `closing`/`reset`
+at `install.rs:399-400`. Two v5 rules apply: (i) the constructor is NOT in
+the self-authenticating provenance set — the driving packet's samples
+adopt `valid`+untrusted only, so a non-close attacker packet materializing
+a shared victim plants nothing usable; (ii) an imported replica carries no
+trusted anchor → every closing-flagged materialize is no-baseline →
+**refuse**: install the copy ALIVE (`closing=false, reset=false`)
+regardless of the packet's flags. Unlike site 2b the install cannot be
+skipped — the packet needs its decision and the entry must own the flow —
+so the seed is suppressed instead. (Phase 2 §10.5's wire-carried anchor
 makes this site validatable; until then every materialize-seed close is
 refused by construction.)
 
@@ -722,24 +770,35 @@ non-close path.
 
 ### 5.8 Signature/signature-shape changes (all crate-internal)
 
-- `account_packet(key, len, tcp_flags, dscp)` → gains `seg: Option<TcpSegView>`
-  (Both call sites already have the frame + meta; the helper is invoked
-  only when `protocol == TCP` and `!is_closing(flags)` — rule 1.)
-- `lookup_with_origin` — the seg view is computed by the `session_glue`
-  caller and threaded via a new small struct on the resolve path
-  (`resolve_flow_session_decision` already receives `tcp_flags`; it gains
-  the pre-computed view); `icmp_embed` callers pass `None` and flags 0 —
-  validation never fires and no anchor updates, byte-identical.
-- `SessionInstall` (`session/ctx.rs:31-48` — today carries flags only)
-  gains `seg: Option<TcpSegView>` so install-time seeding (§5.2(c)) and
-  the materialize gate (site 2c) have the seq/ack/seg_len inputs
-  (round-2 Codex 10: v3 claimed no install-side plumbing change; that was
-  not implementable).
+- **Commit-hook plumbing (v5):** the §5.3 seg view is computed once per
+  TCP packet at the flow-resolve stage and threaded to the per-disposition
+  commit hooks (transit slow path, cache path, LocalDelivery). The anchor
+  apply helper is invoked only at the commit point; #2501
+  `account_packet` counters keep their current placement and semantics.
+- **`TcpSegView` carries flags (round-3 Codex 5c):**
+  `(seq, ack, wnd, seg_len, tcp_flags)` — the OPENING predicate needs
+  `has_ack`; the update rules need `is_closing`/`has_ack` without a second
+  header read. `Option<TcpSegView>` = `None` is reserved for control-path
+  callers with NO packet (wire-driven updates, tunnel refreshes,
+  `icmp_embed` lookups); an unparseable wire TCP closing segment is NOT
+  `None` — it fails closed to refuse-demote (round-3 Codex 5d).
+- **Install threading (round-3 Codex 5b):** the seg view threads BOTH
+  install paths — the positional primary install
+  (`install_with_protocol_with_origin`, `install.rs:106-122`; fresh
+  SYN/pickup seeds incl. LocalDelivery) and the synced-upsert context
+  (`SessionInstall`, `session/ctx.rs:31-48`) used by materialize.
+- **`ForwardSessionMatch` provenance (round-3 Codex 5a):** gains the
+  match scope (LOCAL vs SHARED) plus an anchor/`established` snapshot
+  taken at match time — `lookup_forward_nat_across_scopes`
+  (`shared_ops.rs:638-665`) can select a shared entry while a local
+  fabric placeholder coexists, and re-probing by key would read the wrong
+  local anchor.
 - `install_reverse_session_from_forward_match` gains the forward anchor
   read + validator call.
 - `SessionUpdate` gains `seg: Option<TcpSegView>`.
 - No `FlowCacheEntry` change, no shim/meta change (no `make generate`),
-  no HA wire change, no shared-map schema change, no config schema change.
+  no HA wire change (Phase 1; the §10 Phase-2 field is a separate PR),
+  no shared-map schema change, no config schema change.
 
 ---
 
@@ -758,13 +817,16 @@ and one ungated node, each gating only its own packet-driven marks).
 ## 7. Hidden invariants the change must preserve
 
 - **Anchor single-store invariant:** only the canonical forward entry
-  carries an anchor; every update goes through `account_packet` /
-  `lookup_with_origin` (+install seed); every validation reads the same
-  store. No second store, no merge.
-- **Trust invariant (v4):** a close validates only against a TRUSTED
-  anchor side; trust is born at install seeds or conferred by
-  cross-bounding against an already-trusted opposite side; untrusted
-  sides never confer trust. No-baseline ⇒ refuse-demote, everywhere
+  carries an anchor; every update goes through the per-disposition
+  commit hooks (+install seeds); every validation reads the same store
+  (`lookup_with_origin` validates/marks only — never updates). No second
+  store, no merge.
+- **Trust invariant (v5):** a close validates only against a TRUSTED
+  anchor side; trust is born ONLY at primary new-flow install seeds
+  (provenance matrix) or conferred by segment authentication against
+  already-trusted state; untrusted sides never confer trust, are never
+  blessed by later authentication (replacement, not max-merge), and
+  never validate a close. No-baseline ⇒ refuse-demote, everywhere
   (hit path, promote, materialize, synth, missing-forward).
 - **Pre-packet validation:** a closing segment never updates the anchor
   (rule 1), never promotes (rule 5), and on refuse mutates nothing at all.
@@ -801,7 +863,7 @@ and one ungated node, each gating only its own packet-driven marks).
 - **Hot-path discipline:** zero new allocations; zero new atomics; the
   per-TCP-data-packet cost inside `account_packet`'s existing probe is one
   8-byte read + ≤2 gated stores; closing segments add one table probe on a
-  path that already takes the full slow path. `SessionEntry` grows ~26 B
+  path that already takes the full slow path. `SessionEntry` grows 24 B
   (§2 cost stated; slab is uniform — UDP/ICMP entries carry it unused).
 - **Borrow shape:** close-path validation and marking happen post-borrow in
   the existing propagation phase; no new cross-`&mut` aliasing; the
@@ -821,9 +883,12 @@ and one ungated node, each gating only its own packet-driven marks).
     packets cannot demote Rust state (no userspace path runs); after a
     REDIRECT/publish transition the entry is no-baseline → refuse-demote
     until local observation builds trust.
-  - **fabric-return reverse seeds** bypass both anchor sites; a later
-    close demotes only the local reverse seed, `is_reverse` suppresses
-    the Close delta — no owner kill.
+  - **fabric-return reverse seeds** bypass the commit hooks; a later
+    close on such a seed is refused (no anchor), the seed ages on its
+    ordinary timeout, and `is_reverse` suppresses any Close delta — no
+    owner kill. (Fabric-ingress packets ARE peer-vouched observations —
+    §5.2 rule 4's fabric refinement lets them authenticate anchors on
+    the receiving node.)
   - **tunnel UpsertLocal** entries anchor only from inbound traffic;
     outbound-only flows refuse inbound closes until observed (local blast
     radius only).
@@ -853,30 +918,50 @@ and one ungated node, each gating only its own packet-driven marks).
 |---|---|---|
 | Behavioral regression | MED | Gate only withholds demotion, never blocks delivery; refuse on missing/untrusted baseline. Residuals (stated in §2/§5.2/§7): soft-refused legit close after unobserved stretches or both-direction path switches → entry idles ≤ established timeout; imported entries never validate closes until churn (bounded lingering; §10 wire-anchor restores); tuple stays busy meanwhile — pre-existing semantics for silently-dead flows. Restart-RST covered by the union rule. OPENING covered by SEG.LEN-aware ack check against the FORWARD entry's state. |
 | Lifetime / borrow-checker | LOW | Anchor is `Copy` POD on an existing entry; marking restructured into the existing post-borrow propagation phase; no new cross-boundary borrows. |
-| Performance regression | LOW-MED | ~26 B/entry slab growth (~3 MiB/worker at cap); one 8-byte read + ≤2 gated stores per TCP data packet inside an existing probe (closing segments skip updates entirely); one extra probe per closing segment. Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
+| Performance regression | LOW-MED | 24 B/entry slab growth (~3 MiB/worker at cap); one TCP-header view compute (seq/ack/wnd/flags/seg_len) + ≤2 gated stores per committed TCP data packet (closing segments skip updates entirely); one extra probe per closing segment. Must be measured at minimum-frame rates (§9) — the 23 Gbit/s MTU-sized iperf run alone is insufficient (≈37 Mpps at 25 Gbit/s small-frame is the real gate; `iperf3 -l 64` is a proxy, not a demonstrated line-rate generator — gate on pps, not bandwidth). |
 | Architectural mismatch | LOW | No new subsystem; anchors at the existing #2501/#3706 chokepoints; #4400-style always-on gate. No pipeline restructure. |
-| HA / rolling upgrade | LOW | No wire change; mixed-version peers each gate only their own marks; pre-upgrade entries converge to trusted seeds on first observed traffic and refuse closes until then (behavior strictly more conservative than master); the replica no-Close invariant + the SharedPromote refuse trace are regression-tested. |
+| HA / rolling upgrade | LOW-MED | Phase 1: no wire change; mixed-version peers each gate only their own marks; pre-upgrade and imported entries sit in the absorbing zero-trust state — closes refuse until churn (strictly more conservative than master; bounded lingering, §2; Phase 2 §10.5 closes it for synced flows). The replica no-Close invariant + the SharedPromote refuse trace are regression-tested. |
 | Merge collision | LOW | No `FlowCacheEntry` change (v1's #6457 tension gone). `account_packet` signature change is local to two call sites; `SessionInstall`/`SessionUpdate` gains are crate-internal. |
 
 ---
 
 ## 9. Test plan
 
-Unit (cargo):
+Unit (cargo) — all close-placement cases use DETERMINISTIC in/out-of-window
+values (round-3 Codex 9: probabilistic sprays can legitimately hit the
+admitted interval):
 
 - Validator truth table: ESTABLISHED fresh trusted anchor (accept
   in-window RST/FIN; refuse low/high out-of-window; refuse far-future),
   the union leg (restart-RST `SEQ=SEG.ACK` accepted via trusted
   `ack_hi(O)` when `seq_hi(D)` refuses), serial-wrap edges (anchor near
-  2^32−1, `wrapping_sub` membership, no panic), OPENING (`ack ==
-  isn+SEG.LEN` accept incl. TFO, wrong-ack refuse, untrusted-baseline
-  refuse), asymmetric (only one direction observed/trusted), missing/
-  untrusted baseline → refuse (NEVER fail-open).
-- **Trust acquisition (v4):** `!valid` seed cross-bounded by a trusted
-  opposite anchor → adopted+trusted inside window, rejected outside;
-  seed with no trusted opposite → valid-but-untrusted, close refused;
-  untrusted sides cannot confer trust (fabricated self-consistent pair
-  stays untrusted, close refused); install seeds born trusted.
+  2^32−1, `wrapping_sub` membership, no panic — tracker serial-max wrap
+  tested separately from validator membership wrap), OPENING (`ack ∈
+  [isn+1, isn+SEG.LEN]` accept incl. TFO partial-ack at both interval
+  ends, `isn` refuse, `isn+SEG.LEN+1` refuse, untrusted-baseline refuse),
+  asymmetric (only one direction observed/trusted), missing/untrusted
+  baseline → refuse (NEVER fail-open).
+- **Provenance matrix (v5, round-3 Codex 1):** primary miss install
+  self-authenticates (SYN/pickup seeds trusted); materialize/import/
+  reverse-synth/upsert NEVER self-authenticate — a non-close attacker
+  packet materializing a shared victim plants only untrusted state, a
+  following close refuses, and the promoted entry emits NO Close delta
+  on its ordinary reap.
+- **Trust transactions (v5, round-3 Codex 3):** authenticated sample
+  REPLACES untrusted storage (planted X discarded, not blessed/max-merged);
+  unauthenticated sample never clears/alters trusted state (SYN
+  retransmit preserves the trusted seed); untrusted never authenticates
+  (fabricated self-consistent pair stays untrusted); `wnd` updates only
+  from authenticated segments (no-knowledge precursor advertising 65535
+  does not widen FWD_SLACK).
+- **Handshake bootstrap:** SYN-ACK exact-interval authentication (TFO
+  partial-ack inside interval authenticates both fields; outside
+  refuses); client first ACK authenticates via rev anchor; fast server
+  abort right after SYN-ACK validates (trusted rev seq from birth).
+- **Commit-point observation (v5, round-3 Codex 6):** TTL=1 bounded data
+  (Time-Exceeded at the firewall) does NOT update the anchor;
+  input/output-filter-dropped packets do NOT update it; LocalDelivery
+  admitted packets DO (post-admission hook).
 - **ack poisoning (round-2 Codex 3):** SYN retransmit on an OPENING hit
   does NOT set ack validity (no near-zero acceptance leg); non-ACK
   segments never slide `ack_hi`; zero-length samples never slide
@@ -884,7 +969,7 @@ Unit (cargo):
 - **Poisoning (round-1 Codex B1):** ACK-only plant ahead of window does not
   move the anchor; RST at the planted seq still refused; in-window
   contiguous fake data slides the anchor at most FWD_SLACK per packet;
-  closing segments never update the anchor at any site (accepted or
+  closing segments never update the anchor anywhere (accepted or
   refused).
 - **Two-packet reverse-NAT bypass (round-1 Codex B2):** blind RST on
   reverse tuple → NO reverse entry minted (skip-install), forward
@@ -892,20 +977,26 @@ Unit (cargo):
   variant → seeded closing + the honest master chain (reverse marked;
   #4380 companion retention defers its reap while the forward lives;
   next accepted hit propagates to both) — NOT an idealized 2 s whole-flow
-  reap (round-2 Codex 8).
+  reap (round-2 Codex 8). Match-provenance: a SHARED forward match with a
+  coexisting local fabric placeholder validates against the SHARED
+  snapshot (refuse), never the wrong local anchor.
 - **Materialize gate (site 2c):** closing-flagged shared-hit materialize
   installs the copy ALIVE (`closing=false, reset=false`), no Close delta
-  on its later ordinary reap; non-closing materialize unchanged.
+  on its later ordinary reap; non-closing materialize adopts untrusted
+  tracking only.
 - **SharedPromote refuse trace (round-2 convergence):** blind first-packet
-  close on a promotable import → no mark, no promote-driven close seed,
-  entry ages on ordinary timeout, reap emits NO Close delta (nothing was
-  marked); validated post-trust close on a promoted entry DOES emit the
-  Close (owner semantics preserved).
+  close on a promotable import → no mark, no close seed, NO
+  last_seen/wheel refresh (transactional inertness), entry ages on its
+  pre-packet trajectory; ownership flip + Open delta still fire;
+  validated post-trust close on a promoted entry DOES emit the Close
+  (owner semantics preserved).
 - **Promote staging (round-2 Codex 9):** closing-flagged SYN+ACK never
   sets `established` in-borrow, accept or refuse.
+- **Re-import wipe (round-3):** `upsert_synced_with_origin` over a
+  locally-observed entry discards the anchor → closes refuse (documented
+  absorbing state).
 - Anchor single-store: reverse packets update only the forward entry;
-  missing-forward refuse (FabricRedirect no-local-reverse shape); slow-path
-  ForwardCandidate double-update is value-idempotent.
+  missing-forward refuse (FabricRedirect no-local-reverse shape).
 - Refused-close inertness: no `last_seen` change, no wheel re-queue, prior
   expiry trajectory preserved; closing-window not extendable by refused
   packets after an accepted close.
@@ -924,17 +1015,21 @@ Smoke (loss userspace cluster, lock protocol per CLAUDE.md):
   Gbit/s (no regression vs pre-change), **plus a small-frame/high-pps
   run** to gate the per-packet anchor cost (measured in pps).
 - Attack negative: long-lived SSH + iperf3 trust→untrust; off-path scapy
-  RST/FIN with random seq (thousands, ≥ window scale) → flow survives,
-  session stays established, `tcp_close_seq_rejected` advances.
+  RST/FIN with DETERMINISTIC out-of-window seq (below/above the tracked
+  anchor, far-future, seq≈0) → flow survives, session stays established,
+  `tcp_close_seq_rejected` advances.
 - Legit positive: in-window RST (seq captured via tcpdump) → demote
   exactly as today; ordinary iperf3/SSH Ctrl-C teardown identical to
   master; connection-refused RST against a half-open → opening reap
   unchanged.
 - HA: `make test-failover` (mandatory); **post-failover blind-spray
-  negative (v4)**: immediately after RG switchover, spray blind closes at
+  negative (v4+)**: immediately after RG switchover, spray blind closes at
   synced-but-not-yet-observed flows → entries survive (refuse-demote),
-  no Close deltas, standby copies intact; the next legit traffic
-  re-establishes trust and a later in-window close demotes normally.
+  no Close deltas, standby copies intact; the imported flows' later legit
+  closes refuse and entries linger to ordinary timeout (the absorbing
+  state — trust does NOT return until churn; Phase 2 §10.5 restores
+  fast-reap via the wire anchor, and its smoke gate re-runs this test
+  expecting validated closes to reap at 2 s again).
 
 ---
 
@@ -945,12 +1040,40 @@ Smoke (loss userspace cluster, lock protocol per CLAUDE.md):
   segment. Bigger, throughput-sensitive, asymmetric-routing-hostile;
   separate issue. (Named honestly: xpf lacks this Junos-DEFAULT check;
   this plan closes only the RST/FIN demote DoS.)
-- **HA-wire anchor carriage (follow-up issue to file):** an additive,
-  rolling-gated wire field (`fwd/rev seq_hi/ack_hi` + valid bits, ~18 B)
-  lets a post-failover node validate closes on imported entries
-  immediately instead of refusing until churn — it shrinks the §2
-  first-observation residual for the entire synced class. Deliberately
-  NOT in this PR (§6's no-wire-change rolling-upgrade story stays clean).
+(See §10.5 for the Phase-2 HA-wire anchor — a REQUIRED fast-follow, not
+an option for the synced class.)
+
+### 10.5 Phase 2 (required fast-follow): HA-wire anchor carriage
+
+Phase 1 leaves the §2 absorbing-state residual: imported entries never
+validate closes until churn. Phase 2 carries the trusted anchor on the HA
+session-sync wire so a post-failover/re-import node inherits the peer's
+validated baseline instead of starting at zero-trust. Spec:
+
+- **Field:** additive per-entry extension on the session-sync delta/
+  snapshot format: `{fwd_seq_hi, fwd_ack_hi, rev_seq_hi, rev_ack_hi:
+  u32, valid: u8, trusted: u8}` (18 B). Only the RG-owner's validated
+  anchor is ever sent (standbys receive, never originate); a node sends
+  only sides whose `trusted` bit is set — untrusted tracking state never
+  crosses the wire (the peer cannot launder attacker-planted untrusted
+  values into trusted imports).
+- **Rolling gate:** sent only when the peer advertises the capability
+  (session-sync handshake version bitmap, the same gate pattern ISSU
+  uses); a mixed pair degrades to Phase-1 behavior (refuse-until-churn)
+  in the old-peer direction only. Verify the delta framing tolerates
+  unknown trailing fields as a fallback; if not, the version gate is
+  mandatory (it is cheap either way).
+- **Import semantics:** a wire-carried side lands as `valid`+`trusted`
+  directly (it was validated by the owner from real traffic); after
+  import, normal commit-hook updates resume. A side absent from the wire
+  stays invalid (asymmetric/no-traffic-yet — same as Phase 1).
+- **Security review surface:** the wire is the cluster trusted domain
+  (same as heartbeat/session sync today — an attacker who can inject
+  session-sync frames already owns the table). The field adds no new
+  trust domain, only new content on an existing one.
+- **Scope guard:** no Go control-plane behavioral change beyond
+  decode/re-encode of the additive field; the Rust expire/delta origin
+  gates stay exactly as Phase 1 leaves them.
 - Option B (drop + challenge-ACK, `rst-sequence-check` leaf) and
   `fin-invalidate-session` — deferred until anchor accuracy is proven in
   the field. (`rst-invalidate-session` already parses; wiring its immediate
@@ -970,43 +1093,37 @@ Smoke (loss userspace cluster, lock protocol per CLAUDE.md):
 
 ---
 
-## 11. Open questions for adversarial review (round 3)
+## 11. Open questions for adversarial review (round 4)
 
-1. **Seed authentication soundness (§5.2 rule 4):** a segment
-   authenticates when ANY field cross-bounds against trusted state, and
-   all its samples then adopt trusted. Verify the TCP invariant both
-   directions: (a) legit — the handshake chain (SYN self-authenticates;
-   SYN-ACK via `ack == fwd seed`; client ACK via `ack == rev seed`) plus
-   mid-flow contiguity must leave every real flow fully trusted within
-   the handshake; is there ANY real segment early in a flow that fails
-   to authenticate (asymmetric start, simultaneous open, TFO, pickup
-   from a data segment)? (b) attacker — is the fake-authentication cost
-   really identical to a direct close guess (one ~1/2^13 window hit
-   either way, no amplification), and does the
-   untrusted-can-never-authenticate rule have any legit casualty beyond
-   the documented imported-entry lingering?
-2. **Refuse-demote cost bound (§5.4 rule 3):** post-failover, every
-   imported flow's closes refuse until churn. Quantify the worst realistic
-   table pressure: N imported flows × peers that died during failover →
-   all linger to established/application timeout instead of 2 s. Is the
-   131,072-slot headroom argument sufficient, or does this need a
-   probationary shorter timeout for never-trusted entries (a new timer
-   class — the complexity v3 was told to avoid)?
-3. **Closing-packet promote skip (§5.2 rule 5):** is there ANY
-   standards-compliant flow where a SYN-ACK bearing RST or FIN is a
-   required promote signal (simultaneous-open abort, TFO edge)? If yes,
-   stage the promote on accept instead of skipping outright.
-4. **`FWD_SLACK = max(2×wnd(O), 64 KiB)`:** with wscale untracked the
-   slack self-bounds at 131,070. Show the arithmetic that this covers
-   reordering + abort-time in-flight on observed paths at 10/25 Gbit/s,
-   and that wscale tracking would only shrink the blind-hit probability
-   from ~1/10923 toward 1/16384 — not worth the SYN-option parse state.
-5. **Site (b) pre-filter observation (§5.2 boundary note):** the
-   rebuttal is "master's existing trust boundary, gate strictly reduces,
-   no security delta for moving." Punch a hole in it if one exists —
-   concretely: name a packet class that (i) updates/marks via site (b),
-   (ii) is dropped before delivery, AND (iii) creates an attack or
-   regression master does not already have.
+1. **Provenance matrix completeness (§5.2 rule 4):** the
+   self-authenticating set is exactly {primary miss installs of genuinely
+   new flows: ForwardFlow/LocalMiss/MissingNeighborSeed + the LocalDelivery
+   new-flow install}. Verify against `SessionOrigin` (`entry.rs`) that no
+   other origin reaches `install_with_protocol_with_origin` with a wire
+   packet, and that the fabric-ingress peer-vouched refinement cannot be
+   reached by an off-fabric attacker (fabric ingress is stamped at the
+   shim/ipvlan boundary — find the stamp and confirm it is
+   unspoofable from a non-fabric port).
+2. **Segment-wide weak authentication (adjudicated):** the plan accepts a
+   0 → 1/2^13 channel in the first-observation race for an unobserved
+   direction, because per-field authentication deadlocks the asymmetric
+   bootstrap (`seq_hi(rev)` needs `ack_hi(fwd)` needs `seq_hi(rev)`).
+   Verify the deadlock claim independently, and check the race is really
+   bounded by real-traffic arrival (any legit segment of the raced
+   direction authenticates first and closes the window).
+3. **OPENING interval (§5.4 rule 2 + §5.2 rule 4):** `[isn+1, isn+SEG.LEN]`
+   for both handshake authentication and OPENING close validation. Confirm
+   RFC 9293 §3.10.7.3 + RFC 7413 §4.2.2 coverage (TFO data-reject acks
+   only the SYN) and that no stack acks MORE than isn+SEG.LEN at this
+   stage (which would wrongly refuse).
+4. **Commit-hook placement (§5.2):** name any TCP packet class on a live
+   session that reaches NO commit hook (transit slow/cache paths,
+   LocalDelivery post-admission) — i.e., a class that is committed but
+   never updates, or updated but never committed.
+5. **Phase-2 wire field (§10.5):** is the version-gated additive field
+   the right shape, and does the session-sync framing tolerate it without
+   a gate (check the Go decode path)? Any objection to "only trusted
+   sides cross the wire"?
 6. **Counter surface:** is a per-worker `tcp_close_seq_rejected` enough
    observability, or should refused closes also emit a rate-limited
    RT_FLOW/screen-class record so operators can see an attack in progress
