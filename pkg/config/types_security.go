@@ -973,6 +973,18 @@ type StaticNATRule struct {
 	// outbound return SNAT un-translates it back to MatchDestinationPort.
 	// #2491.
 	MappedPort int
+	// MappedPortRaw records the raw `then static-nat prefix <ip> mapped-port
+	// <token>` value when it FAILED to parse as a number ("" when the keyword
+	// is absent or its value is well-formed). The token rides inside the
+	// children:nil static-nat leaf and bypasses the schema value validator, so
+	// a non-numeric value would otherwise collapse silently to MappedPort==0
+	// (== "no port translation") with no diagnostic — accepted even though a
+	// well-formed value in the same position without a `match destination-port`
+	// is rejected. Strict commit-check rejects a non-empty MappedPortRaw
+	// (validateNATHostMaskStrict, C179-038); the lenient load / peer-sync path
+	// keeps MappedPort==0 so the dataplane installs a plain 1:1 (no bogus
+	// port), matching the pre-fix fail-closed behaviour.
+	MappedPortRaw string
 }
 
 // LimitSessionScreen configures per-IP session limiting.

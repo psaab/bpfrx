@@ -3525,11 +3525,16 @@ reserved for whole-dataplane selection where a rewrite shim
     `... routing-instance <ri>` (#4292) all collapse onto ONE leaf node and
     SetPath grouping is preserved); the
     `mapped-port` token therefore bypasses the schema value validator and
-    is range-checked in the compiler (`validateNATHostMaskStrict`,
-    `compiler_nat.go`), which ALSO rejects a `mapped-port` with no
-    matching `match destination-port` (the reverse SNAT could not recover
-    the original port) AND the mirror half-config — a `match
-    destination-port` with no `mapped-port` (#2769). The port-match-without-
+    is validated in the compiler (`validateNATHostMaskStrict`,
+    `compiler_nat.go`): it is range-checked (1..65535), a NON-NUMERIC value
+    is rejected as malformed (C179-038 — before this a garbage token
+    collapsed silently to `MappedPort==0`/"no port translation", so it was
+    accepted even though a well-formed value in the same position without a
+    `match destination-port` is rejected; the raw token is carried on
+    `StaticNATRule.MappedPortRaw` so the strict gate can name it), it is
+    rejected when it has no matching `match destination-port` (the reverse
+    SNAT could not recover the original port), AND the mirror half-config —
+    a `match destination-port` with no `mapped-port` (#2769) — is rejected. The port-match-without-
     mapped-port form is a port-scoped 1:1 (no port translation); rejecting
     it at strict commit-check forces the operator to either drop the port
     match (a whole-address 1:1) or add a `mapped-port` (a port forward). If

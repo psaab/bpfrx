@@ -71,20 +71,35 @@ func applyStaticNATFromScope(rs *StaticNATRuleSet, s natMatchScope) {
 // from a flat-set static-NAT leaf's collapsed Keys (#2491). The lexer
 // collapses `then static-nat prefix <ip> mapped-port <port>` onto one node
 // whose Keys are `["static-nat","prefix","<ip>","mapped-port","<port>"]`
-// because `static-nat` is a children:nil schema leaf. Returns 0 (no port
-// translation) when the keyword is absent or its value is non-numeric;
-// the schema does not yet range-check this in-leaf token, so the caller's
-// dataplane parse fails closed on an out-of-range value.
-func staticNATMappedPortFromKeys(keys []string) int {
+// because `static-nat` is a children:nil schema leaf, so this in-leaf token
+// bypasses the schema value validator.
+//
+// Returns (port, malformedRaw):
+//   - keyword absent:            (0, "")
+//   - present, numeric value:    (<port>, "")
+//   - present, non-numeric value: (0, "<raw token>")
+//
+// The malformedRaw return is how a PRESENT-but-non-numeric mapped-port is
+// distinguished from an ABSENT one (C179-038). Before this the helper folded
+// both to a bare 0, so `mapped-port notaport` compiled clean to MappedPort==0
+// (== "no port translation") with no diagnostic — even though a WELL-FORMED
+// value in the same position without a `match destination-port` IS rejected at
+// strict commit-check, so a garbage token was treated more leniently than a
+// valid one. The caller records malformedRaw on the rule and the strict gate
+// (validateNATHostMaskStrict) rejects it; the lenient load / peer-sync path
+// keeps MappedPort==0 so the dataplane still installs a plain 1:1 (no bogus
+// port), matching the pre-fix fail-closed behaviour.
+func staticNATMappedPortFromKeys(keys []string) (port int, malformedRaw string) {
 	for i := 0; i+1 < len(keys); i++ {
 		if keys[i] == "mapped-port" {
-			if p, err := strconv.Atoi(keys[i+1]); err == nil {
-				return p
+			raw := keys[i+1]
+			if p, err := strconv.Atoi(raw); err == nil {
+				return p, ""
 			}
-			return 0
+			return 0, raw
 		}
 	}
-	return 0
+	return 0, ""
 }
 
 // staticNATRoutingInstanceFromKeys scans a collapsed static-nat `then` leaf's
@@ -232,6 +247,7 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 				rule.Then = ""
 				rule.IsNPTv6 = false
 				rule.MappedPort = 0
+				rule.MappedPortRaw = ""
 				// #4290 / #4292: reset the named-target reference and the
 				// translation-target routing-instance alongside the other
 				// then-set fields so only the LAST then-block's spec survives.
@@ -268,7 +284,7 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// mapped-port <port>` onto this one leaf's Keys
 							// (`static-nat` is a children:nil schema leaf), so
 							// scan for the keyword + value pair.
-							rule.MappedPort = staticNATMappedPortFromKeys(t.Keys)
+							rule.MappedPort, rule.MappedPortRaw = staticNATMappedPortFromKeys(t.Keys)
 						} else if pn := t.FindChild("prefix"); pn != nil {
 							rule.Then = nodeVal(pn)
 							// #2491: `then static-nat prefix <ip> mapped-port
@@ -277,13 +293,20 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// because `static-nat` is a children:nil schema
 							// leaf, so the modifier rides on the prefix leaf,
 							// not a sibling `mapped-port` node. Scan pn.Keys.
-							rule.MappedPort = staticNATMappedPortFromKeys(pn.Keys)
+							rule.MappedPort, rule.MappedPortRaw = staticNATMappedPortFromKeys(pn.Keys)
 							// Hierarchical shape `static-nat { prefix X;
 							// mapped-port P; }` carries it as a sibling child.
-							if rule.MappedPort == 0 {
+							// A non-numeric sibling value is recorded as
+							// malformed (mirroring the collapsed-keys helper)
+							// so the strict gate rejects it instead of the
+							// value collapsing silently to MappedPort==0.
+							if rule.MappedPort == 0 && rule.MappedPortRaw == "" {
 								if mp := t.FindChild("mapped-port"); mp != nil {
-									if p, err := strconv.Atoi(nodeVal(mp)); err == nil {
+									raw := nodeVal(mp)
+									if p, err := strconv.Atoi(raw); err == nil {
 										rule.MappedPort = p
+									} else if raw != "" {
+										rule.MappedPortRaw = raw
 									}
 								}
 							}

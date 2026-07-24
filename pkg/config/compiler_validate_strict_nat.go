@@ -1421,6 +1421,24 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					return nil, err
 				}
 			}
+			// C179-038: a PRESENT-but-non-numeric `then static-nat mapped-port
+			// <token>` rides inside the children:nil static-nat leaf, bypassing
+			// the schema value validator, so the compiler recorded the raw
+			// token on MappedPortRaw (MappedPort stayed 0). Reject it at strict
+			// commit-check — otherwise a garbage token collapses silently to
+			// MappedPort==0 ("no port translation") and is accepted even though
+			// a well-formed value in the same position IS rejected (the
+			// mapped-port-without-match-port gate below). The lenient load /
+			// peer-sync path downgrades this to a warning and the dataplane
+			// installs a plain 1:1 (MappedPort==0, no bogus port).
+			if rule.MappedPortRaw != "" {
+				if err := emitSuffix(fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat mapped-port %q is not a valid port number (1-65535)",
+					rs.Name, rule.Name, rule.MappedPortRaw),
+					" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
+					return nil, err
+				}
+			}
 			if rule.MappedPort != 0 {
 				if rule.MappedPort < 1 || rule.MappedPort > 65535 {
 					if err := emitSuffix(fmt.Sprintf(
