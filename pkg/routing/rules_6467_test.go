@@ -53,7 +53,10 @@ func TestNextTableApplyCapAggregatesDegradedError(t *testing.T) {
 		t.Errorf("degraded error must name the next-table cap, got %v", err)
 	}
 	// The error must name HOW MANY leaks were dropped (the routes past the cap).
-	if !strings.Contains(err.Error(), fmt.Sprintf("%d next-table route", over)) {
+	// Match the full unique fragment ("; N next-table route(s) beyond ") so a
+	// count bug that emitted e.g. 150 could not satisfy a bare "50" substring
+	// ("150 next-table route" contains "50 next-table route").
+	if !strings.Contains(err.Error(), fmt.Sprintf("; %d next-table route(s) beyond ", over)) {
 		t.Errorf("degraded error must name the %d dropped leaks, got %v", over, err)
 	}
 	// The cap still holds: exactly NextTableRuleWindow rules install, none beyond.
@@ -138,13 +141,71 @@ func TestNextTableApplyDroppedCountCountsOnlyEligible(t *testing.T) {
 	if err == nil {
 		t.Fatal("over-cap Apply must return a degraded error (#6467)")
 	}
-	if !strings.Contains(err.Error(), "50 next-table route") {
+	// Match the full unique fragment ("; N next-table route(s) beyond ") so a
+	// bare "50" substring cannot be satisfied by an inflated count like 150/180.
+	if !strings.Contains(err.Error(), "; 50 next-table route(s) beyond ") {
 		t.Errorf("drop count must name only the 50 ELIGIBLE routes past the cap, got %v", err)
 	}
-	if strings.Contains(err.Error(), "80 next-table route") {
+	if strings.Contains(err.Error(), "; 80 next-table route(s) beyond ") {
 		t.Errorf("drop count must NOT include the 30 dangling routes that never install, got %v", err)
 	}
 	// Only the window's worth of valid rules installed.
+	if total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6); total != config.NextTableRuleWindow {
+		t.Errorf("expected the cap to hold at %d installed rules, got %d", config.NextTableRuleWindow, total)
+	}
+}
+
+// TestNextTableApplyDroppedCountExcludesMalformedCIDR binds the net.ParseCIDR
+// half of the dropped-count eligibility scan (its sibling above only exercises
+// the unknown-instance half). A DEFINED-instance next-table route with an
+// UNPARSEABLE destination past the cap installs no ip rule (the applier's
+// top-of-loop net.ParseCIDR gate skips it) and must NOT be counted as a
+// "dropped leak".
+//
+// Layout: the window's worth of valid routes fill the window, then the tail
+// carries 50 valid + 1 malformed-CIDR (defined-instance) route. The accurate
+// eligible drop count is 50, not 51.
+//
+// RED-on-revert: removing ONLY the net.ParseCIDR check in the dropped-count scan
+// makes the count 51, so the "; 50 next-table route(s) beyond " assertion fails.
+func TestNextTableApplyDroppedCountExcludesMalformedCIDR(t *testing.T) {
+	instances := []*config.RoutingInstanceConfig{{Name: "dmz-vr", TableID: 101}}
+
+	var routes []*config.StaticRoute
+	// Fill the window with valid routes.
+	for i := 0; i < config.NextTableRuleWindow; i++ {
+		routes = append(routes, &config.StaticRoute{
+			Destination: fmt.Sprintf("10.%d.%d.0/24", i/256, i%256),
+			NextTable:   "dmz-vr",
+		})
+	}
+	// Tail: 50 eligible (valid) routes past the cap...
+	for i := 0; i < 50; i++ {
+		routes = append(routes, &config.StaticRoute{
+			Destination: fmt.Sprintf("172.16.%d.0/24", i),
+			NextTable:   "dmz-vr",
+		})
+	}
+	// ...plus one DEFINED-instance route with an unparseable destination, which
+	// the applier skips (no ip rule) and must not count as a dropped leak.
+	routes = append(routes, &config.StaticRoute{
+		Destination: "10.2.0.0/99", // invalid mask — net.ParseCIDR fails
+		NextTable:   "dmz-vr",
+	})
+
+	ops := newFakeRuleOps()
+	nt := &nextTableManager{ops: ops}
+	err := nt.Apply(routes, instances)
+	if err == nil {
+		t.Fatal("over-cap Apply must return a degraded error (#6467)")
+	}
+	if !strings.Contains(err.Error(), "; 50 next-table route(s) beyond ") {
+		t.Errorf("drop count must exclude the malformed-CIDR route (want 50, not 51), got %v", err)
+	}
+	if strings.Contains(err.Error(), "; 51 next-table route(s) beyond ") {
+		t.Errorf("drop count must NOT count the malformed-CIDR route that never installs, got %v", err)
+	}
+	// The malformed route must not be installed, and the cap holds at the window.
 	if total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6); total != config.NextTableRuleWindow {
 		t.Errorf("expected the cap to hold at %d installed rules, got %d", config.NextTableRuleWindow, total)
 	}

@@ -174,3 +174,51 @@ func TestBuildRouteSnapshotsFIBEligibilityMirrorsApplier(t *testing.T) {
 			"installs (#6467)", validLeaks, config.NextTableRuleWindow)
 	}
 }
+
+// TestBuildRouteSnapshotsSkipsMalformedCIDRNextTable binds the SECOND half of
+// the FIB eligibility gate: a next-table route whose target instance IS defined
+// but whose destination fails net.ParseCIDR must be skipped — the applier's
+// top-of-loop net.ParseCIDR gate `continue`s such a route (no ip rule), so the
+// FIB must not publish it either. The sibling ghost test only feeds parseable
+// destinations, so without this the net.ParseCIDR half of the gate is unbound
+// (removing it would leave that test green).
+//
+// RED-on-revert: removing ONLY the net.ParseCIDR check in the buildRouteSnapshots
+// config-static eligibility gate makes the malformed routes publish, so this
+// assertion fires.
+func TestBuildRouteSnapshotsSkipsMalformedCIDRNextTable(t *testing.T) {
+	orig := ruleListFn
+	t.Cleanup(func() { ruleListFn = orig })
+	ruleListFn = func(family int) ([]netlink.Rule, error) { return nil, nil }
+
+	cfg := &config.Config{}
+	cfg.RoutingInstances = []*config.RoutingInstanceConfig{{Name: "blue", TableID: 100}}
+	cfg.RoutingOptions.StaticRoutes = []*config.StaticRoute{
+		{Destination: "10.1.0.0/16", NextTable: "blue"}, // valid → published
+		{Destination: "not-a-cidr", NextTable: "blue"},  // DEFINED instance, UNPARSEABLE
+		{Destination: "10.2.0.0/99", NextTable: "blue"}, // DEFINED instance, out-of-range mask
+		{Destination: "10.3.0.0/16", NextTable: "blue"}, // valid → published
+	}
+
+	routes, err := buildRouteSnapshots(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("buildRouteSnapshots: %v", err)
+	}
+	for _, r := range routes {
+		if r.NextTable == "blue" && (r.Destination == "not-a-cidr" || r.Destination == "10.2.0.0/99") {
+			t.Errorf("FIB published a next-table leak with an unparseable destination %q — "+
+				"the applier's net.ParseCIDR gate skips it (no ip rule), so the FIB must too (#6467)",
+				r.Destination)
+		}
+	}
+	// The two well-formed routes must STILL publish (no over-suppression).
+	valid := 0
+	for _, r := range routes {
+		if r.NextTable == "blue" && (r.Destination == "10.1.0.0/16" || r.Destination == "10.3.0.0/16") {
+			valid++
+		}
+	}
+	if valid != 2 {
+		t.Errorf("both well-formed next-table leaks must still publish, got %d", valid)
+	}
+}

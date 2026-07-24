@@ -56,6 +56,13 @@ func TestRouteSnapshotDedupeKeepsDiscardAndConnected(t *testing.T) {
 // ONLY in preference are distinct and both survive so the Rust FIB can
 // apply its preference tie-break.
 func TestRouteSnapshotDedupeKeepsDistinctPreference(t *testing.T) {
+	// Hermetic: stub the kernel ip-rule dump so a live host rule cannot enter the
+	// snapshot (the defined table IDs below would otherwise map a stray dump rule
+	// into a NextTable leak). Only the config-static dedupe path is under test.
+	orig := ruleListFn
+	t.Cleanup(func() { ruleListFn = orig })
+	ruleListFn = func(family int) ([]netlink.Rule, error) { return nil, nil }
+
 	cfg := &config.Config{}
 	// The target instance must be DEFINED and named by its bare instance name:
 	// the compiler stores route.NextTable as the bare name (parseNextTableInstance
@@ -91,6 +98,12 @@ func TestRouteSnapshotDedupeKeepsDistinctPreference(t *testing.T) {
 // with the two entries in opposite input order must yield an identical
 // snapshot.
 func TestRouteSnapshotSortIsDeterministic(t *testing.T) {
+	// Hermetic: stub the kernel ip-rule dump so host state cannot perturb the
+	// deterministic-order assertion (only the config-static sort path is tested).
+	orig := ruleListFn
+	t.Cleanup(func() { ruleListFn = orig })
+	ruleListFn = func(family int) ([]netlink.Rule, error) { return nil, nil }
+
 	// Both targets DEFINED and referenced by bare instance name (the compiler
 	// strips the ".inet[6].0" suffix; the #6467 eligibility gate skips a
 	// next-table route whose target is not a defined instance, mirroring the
