@@ -10,7 +10,7 @@ import (
 // <port>` must compile both fields onto the StaticNATRule.
 //
 // Fail-on-revert: dropping the `destination-port` / `mapped-port` parse in
-// compileNATStatic (or the staticNATMappedPortFromKeys helper) leaves both
+// compileNATStatic (or the staticNATMappedPortForNode helper) leaves both
 // fields at 0 and this test goes RED.
 func TestStaticNATMappedPortCompiles(t *testing.T) {
 	cfg := compileSetLines(t, []string{

@@ -973,6 +973,28 @@ type StaticNATRule struct {
 	// outbound return SNAT un-translates it back to MatchDestinationPort.
 	// #2491.
 	MappedPort int
+	// MappedPortRaw records the raw `then static-nat prefix <ip> mapped-port
+	// <token>` value as authored ("" when the keyword is absent OR present
+	// with no operand). The token rides inside the children:nil static-nat
+	// leaf and bypasses the schema value validator; MappedPortRaw lets the
+	// strict gate name the offending token when the parsed MappedPort is not
+	// a valid 1-65535 port. Compile-only (`json:"-"`): it is a Go-internal
+	// diagnostic artifact and must NOT cross the control-socket / REST /
+	// ConfigSnapshot wire — the Rust dataplane reads only MappedPort.
+	MappedPortRaw string `json:"-"`
+	// MappedPortPresent is true whenever a `then static-nat mapped-port`
+	// keyword appears, EVEN with no operand or an empty/zero/garbage operand.
+	// It is the explicit presence signal that breaks the sentinel collision
+	// the string/int fields alone could not: MappedPort==0 means BOTH "absent"
+	// and "present-but-malformed" (non-numeric, empty, bare, or the literal
+	// "0"), and MappedPortRaw=="" means BOTH "absent" and "present-but-empty".
+	// The strict gate (validateNATHostMaskStrict, C179-038) rejects a PRESENT
+	// mapped-port whose parsed value is not a valid 1-65535 port; an ABSENT
+	// mapped-port (Present==false) is never rejected. Compile-only (`json:"-"`)
+	// — it is never serialized, so the dataplane never sees it and the lenient
+	// load / peer-sync path (#1960 no-brick) keeps MappedPort==0 (plain 1:1,
+	// no bogus port).
+	MappedPortPresent bool `json:"-"`
 }
 
 // LimitSessionScreen configures per-IP session limiting.

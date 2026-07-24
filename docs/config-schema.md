@@ -3525,15 +3525,116 @@ reserved for whole-dataplane selection where a rewrite shim
     `... routing-instance <ri>` (#4292) all collapse onto ONE leaf node and
     SetPath grouping is preserved); the
     `mapped-port` token therefore bypasses the schema value validator and
-    is range-checked in the compiler (`validateNATHostMaskStrict`,
-    `compiler_nat.go`), which ALSO rejects a `mapped-port` with no
-    matching `match destination-port` (the reverse SNAT could not recover
-    the original port) AND the mirror half-config — a `match
-    destination-port` with no `mapped-port` (#2769). The port-match-without-
+    is validated in the compiler (`validateNATHostMaskStrict`,
+    `compiler_nat.go`): the compiler records an explicit presence signal
+    (`StaticNATRule.MappedPortPresent`) alongside the parsed port and the
+    raw token, and a PRESENT mapped-port whose value is not a valid
+    1..65535 port is rejected as malformed (C179-038 + fold). One gate
+    covers every sentinel-collision sibling: a non-numeric token
+    (`notaport`), an empty operand (`mapped-port ""`), a bare `mapped-port`
+    with no operand, the literal `0`, and an out-of-range number
+    (`70000`). Before the presence signal these all collapsed silently to
+    `MappedPort==0`/"no port translation" (the int/string sentinels could
+    not tell "absent" from "present-but-malformed"), so a garbage token was
+    accepted even though a well-formed value in the same position without a
+    `match destination-port` is rejected. The strict error names the
+    offending token from `MappedPortRaw` (or `(missing value)` when the
+    operand is empty/bare); `MappedPortRaw` and `MappedPortPresent` are
+    compile-only (`json:"-"`) and never cross the dataplane wire. A valid
+    in-range mapped-port is still rejected when it has no matching `match
+    destination-port` (the reverse SNAT could not recover the original
+    port), AND the mirror half-config — a `match destination-port` with no
+    `mapped-port` (#2769) — is rejected. The port-match-without-
     mapped-port form is a port-scoped 1:1 (no port translation); rejecting
     it at strict commit-check forces the operator to either drop the port
-    match (a whole-address 1:1) or add a `mapped-port` (a port forward). If
-    such a rule slips through the lenient load / peer-sync path, the Rust
+    match (a whole-address 1:1) or add a `mapped-port` (a port forward).
+    Two refinements land in the #6479 fold. First,
+    `staticNATMappedPortForNode` gathers every `mapped-port` operand
+    attached to a `then static-nat` node across EVERY Junos AST shape, into
+    ONE list folded through `combineMappedPortOperands` exactly once:
+      - the collapsed one-line `prefix <ip> mapped-port <port>` leaf;
+      - the CANONICAL separate-set-line form — Juniper documents mapped-port
+        as a sub-statement of `prefix`, authored as two set lines
+        (`... prefix 10.0.0.5/32` + `... prefix mapped-port 8080`) that
+        SetPath collapses to a distinct leaf `Keys=["prefix","mapped-port",
+        "8080"]`, mapped-port immediately following the literal `prefix`;
+      - the CANONICAL hierarchical nested form — `prefix <ip> { mapped-port
+        P; }` / `prefix { <ip>; mapped-port P; }`, where mapped-port is a
+        CHILD of the `prefix` node (a grandchild of `static-nat`), scanned
+        via the target child's `Children`, not just its `Keys`;
+      - a `prefix-name <name> mapped-port <port>` target (#4290) — the
+        prefix-name compile branch feeds `staticNATMappedPortForNode` too,
+        so a prefix-name-scoped mapped-port is gated identically;
+      - a hierarchical `static-nat { prefix X; mapped-port P; }` sibling,
+        scanning ALL operands of a packed `mapped-port a mapped-port b`
+        child (not just the first);
+      - AND every child of a duplicate split across two
+        `then static-nat prefix <ip> mapped-port <p>` set lines.
+    Duplicate operands are last-wins ONLY when they are all valid in-range
+    numbers (`mapped-port 8080 mapped-port 9090` → 9090); a contradictory
+    duplicate in ANY shape or ACROSS nodes (e.g. `mapped-port 8080
+    mapped-port notaport`) fails closed — any malformed occurrence zeroes
+    the port and the strict gate names the bad token, with no first-wins
+    gate that could let a later malformed duplicate slip past an earlier
+    valid one. Across MULTIPLE `static-nat` sibling targets in ONE `then`
+    block (the hierarchical `then { static-nat {…} static-nat {…} }` shape,
+    which Junos merges into one action), each sibling's reading folds
+    through `mergeMappedPortState`, which OR-accumulates presence and
+    LATCHES fail-closed on any malformed operand — so a later clean sibling
+    can no longer overwrite an earlier sibling's presence/malformed stamp
+    back to false (the #6479 multi-block silent-accept, closed in BOTH the
+    nptv6 and the prefix/prefix-name branches). A MODIFIER-ONLY `static-nat`
+    sibling (a `static-nat {…}` block carrying ONLY a `mapped-port`, with no
+    `prefix`/`prefix-name`/`nptv6-prefix`/`inet` target) is routed through the
+    same accumulator by a catch-all `else` branch in `compileNATStatic`, so
+    its malformed operand fails closed in either sibling order and even when a
+    co-sibling is a clean nptv6 target — previously it matched no target
+    branch and reached no validator (the #6479 modifier-only silent-accept).
+    This sibling accumulation is
+    scoped WITHIN one `then` block; SEPARATE `then {}` blocks remain #3850
+    last-then-block-wins (a whole superseded block is dead config, not part
+    of the effective action). NOTE on duplicate resolution: the all-valid
+    duplicate last-wins (`mapped-port 8080 mapped-port 9090` → 9090) is the
+    INTENTIONAL disposition of a contradictory duplicate and DIFFERS from
+    origin/master's first-wins (8080). It is not a working-config
+    regression — a duplicate mapped-port on one target is malformed
+    authoring, defensible either way — and last-wins is chosen for
+    consistency with the Junos duplicate-stanza rule the rest of this fold
+    already follows. The scan is grammar-ROLE-aware
+    (`staticNATMappedPortOperandsFromKeys`): it walks the collapsed key
+    stream tracking whether each position is a KEYWORD slot or a consumed
+    VALUE slot, and a `mapped-port` counts as the modifier ONLY in a keyword
+    slot. A NAME-valued keyword (`mappedPortNameValuedKeywords`:
+    `routing-instance`, `prefix-name`) CONSUMES its following token as an
+    opaque name, so a `mapped-port` in that consumed slot is the name — a
+    translation-target routing-instance NAMED `mapped-port`
+    (`... routing-instance mapped-port`, #4292) or a prefix-name entry NAMED
+    `mapped-port` compiles clean instead of being falsely rejected as a bare
+    mapped-port. Because it is the SLOT (keyword vs value) that decides, never
+    the neighbouring text, a target whose NAME is itself literally
+    `prefix-name` or `routing-instance`
+    (`prefix-name prefix-name mapped-port <bad>`) no longer fools the scan:
+    the earlier LEXEME-only lookbehind saw the preceding token `prefix-name`
+    and wrongly skipped the real modifier, silently accepting a malformed
+    port (the #6479 root cause); the role-aware walk consumes that name as the
+    prefix-name VALUE and reads the following `mapped-port` as the
+    keyword-slot modifier. `prefix` and `nptv6-prefix` are deliberately NOT
+    name-valued: their value is ALWAYS an IP and can never be the string
+    `mapped-port`, so the scan does not consume-and-shadow the token after
+    them and `prefix mapped-port <port>` / `nptv6-prefix mapped-port <port>`
+    (the canonical separate-set-line modifiers) are recovered. A round-4
+    over-defensive addition of `prefix` to the name-valued set — and its
+    `nptv6-prefix` sibling — broke those canonical forms (false-rejecting the
+    clean rule and reopening the C179-038 fail-open, the nptv6 one so
+    `validateNPTv6Strict` never fired); #6479 keeps both out. Second, the
+    port-match-without-mapped-port (#2769) gate is guarded on
+    `!MappedPortPresent` so it fires ONLY on a
+    true absence: a present-but-malformed mapped-port that also carries a
+    `match destination-port` is owned solely by the presence gate (which
+    names the token), never double-reported by the absence gate — which,
+    emitting first, would otherwise mask the accurate "not a valid port
+    number" message in strict mode and add a second warning in lenient mode.
+    If such a rule slips through the lenient load / peer-sync path, the Rust
     dataplane backstop (`static_nat.rs from_snapshots`) keys the reverse
     SNAT on `(internal_ip, Some(match_dst_port))` rather than
     `(internal_ip, None)`, keeping the source translation scoped to the one
@@ -3545,6 +3646,35 @@ reserved for whole-dataplane selection where a rewrite shim
     plus a port-less whole-address 1:1 rule (the dataplane keys the
     static-NAT tables by `(IP, Option<port>)` and falls back to the
     port-less entry).
+    The #5523/#6479 shape-completeness fold closes the last authoring
+    shapes a mapped-port could take. **NPTv6 + mapped-port is rejected on
+    PRESENCE.** NPTv6 (RFC 6296) translates the IPv6 address prefix and has
+    no transport-port concept, and the host-mask loop
+    (`validateNATHostMaskStrict`) skips nptv6 rules entirely, so a
+    `then static-nat nptv6-prefix <p6> mapped-port <p>` in ANY shape
+    (collapsed keys, hierarchical nptv6-prefix child, or a distinct
+    `mapped-port` sibling) previously reached NO validator — a malformed
+    operand was silently accepted and a well-formed one silently ignored.
+    `recordNPTv6MappedPortPresence` (`compiler_nat_static.go`) now stamps
+    `MappedPortPresent` on the nptv6 branches while keeping `MappedPort==0`
+    (no bogus port on the port-less nptv6 path), and `validateNPTv6Strict`
+    rejects a present mapped-port on an nptv6 rule regardless of value (even
+    a well-formed 1-65535 port is meaningless on nptv6) — strict error,
+    lenient warning, with the nptv6 prefix translation itself still applied.
+    The remaining flagged shapes are fail-safe without new code: the
+    modifier-first ordering `... prefix mapped-port <p>` authored BEFORE the
+    `... prefix <ip>` set line makes the modifier line's `prefix` keyword
+    take the value `mapped-port`, so the target resolves to the literal
+    `"mapped-port"` (not an IP) and the rule fails closed on the target;
+    a `prefix-name` mapped-port must RESTATE the name on the same statement
+    (`prefix-name N mapped-port P`) — the non-restated two-line form
+    `prefix-name N` + `prefix-name mapped-port P` parses `mapped-port` into
+    the name slot (name-valued skip), recovering no port and installing none
+    (a plain prefix-name 1:1, matching origin/master); and a range operand
+    (`mapped-port 8080-8090`) is a single non-numeric token that
+    `combineMappedPortOperands` fails closed on. In every shape a
+    present-but-malformed mapped-port is surfaced (strict reject / lenient
+    warn), never silently accepted, and no bogus non-zero port is installed.
   - `security nat source/destination rule-set rule match
     destination-address-name <book-entry>` (#3229) — the destination twin
     of the `source-address-name` leaf (#2416). It references an

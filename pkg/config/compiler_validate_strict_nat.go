@@ -1413,7 +1413,15 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// forward). The dataplane backstop (static_nat.rs) keeps the
 			// reverse SNAT scoped to the matched port if the rule slips through
 			// the lenient load / peer-sync path.
-			if rule.MatchDestinationPort != 0 && rule.MappedPort == 0 {
+			//
+			// #6479 fold: guard on !MappedPortPresent so this fires ONLY on a
+			// TRUE absence. A PRESENT-but-malformed mapped-port (`mapped-port
+			// 0`/``/bare/`notaport`) also lands at MappedPort==0, but it is the
+			// presence gate below that owns that case (naming the bad token).
+			// Without this guard both gates fire — two warnings in lenient mode,
+			// and in strict the misleading "requires a mapped-port" message
+			// (emitted first) wins over the accurate "not a valid port number".
+			if rule.MatchDestinationPort != 0 && rule.MappedPort == 0 && !rule.MappedPortPresent {
 				if err := emitSuffix(fmt.Sprintf(
 					"security nat static rule-set %q rule %q match destination-port %d requires a matching `then static-nat mapped-port` (a port match without a port translation either broadens or scopes the reverse source-NAT in a non-obvious way; drop the port match for a whole-address 1:1, or add a mapped-port for a port forward)",
 					rs.Name, rule.Name, rule.MatchDestinationPort),
@@ -1421,22 +1429,50 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					return nil, err
 				}
 			}
-			if rule.MappedPort != 0 {
-				if rule.MappedPort < 1 || rule.MappedPort > 65535 {
-					if err := emitSuffix(fmt.Sprintf(
-						"security nat static rule-set %q rule %q then static-nat mapped-port %d is out of range (1-65535)",
-						rs.Name, rule.Name, rule.MappedPort),
-						" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
-						return nil, err
-					}
+			// C179-038 + fold: a PRESENT `then static-nat mapped-port <token>`
+			// rides inside the children:nil static-nat leaf, bypassing the
+			// schema value validator. The compiler records an explicit presence
+			// signal (MappedPortPresent) plus the parsed port (MappedPort, 0
+			// when absent OR malformed) and the raw token (MappedPortRaw). This
+			// ONE gate rejects every present-but-not-1-65535 sibling the earlier
+			// string/int sentinels let slip: a non-numeric token ("notaport"),
+			// an empty operand (`mapped-port ""`), a bare keyword with no
+			// operand, the literal "0", and an out-of-range number ("70000").
+			// All previously collapsed to MappedPort==0-or-out-of-range with no
+			// diagnostic under the old `MappedPortRaw != ""` / `MappedPort != 0`
+			// gates (MappedPort==0 conflated "absent" with "present-but-
+			// malformed"; MappedPortRaw=="" conflated "absent" with "present-
+			// but-empty"), so the value silently degraded to "no port
+			// translation" even though a WELL-FORMED value in the same position
+			// without a `match destination-port` IS rejected. The lenient load /
+			// peer-sync path (#1960 no-brick) downgrades this to a warning and
+			// the dataplane installs a plain 1:1 (MappedPort==0, no bogus port).
+			// MappedPortPresent is compile-only (json:"-") and never reaches the
+			// dataplane.
+			if rule.MappedPortPresent && (rule.MappedPort < 1 || rule.MappedPort > 65535) {
+				token := "(missing value)"
+				if rule.MappedPortRaw != "" {
+					token = fmt.Sprintf("%q", rule.MappedPortRaw)
 				}
-				if rule.MatchDestinationPort == 0 {
-					if err := emitSuffix(fmt.Sprintf(
-						"security nat static rule-set %q rule %q then static-nat mapped-port %d requires a matching `match destination-port`",
-						rs.Name, rule.Name, rule.MappedPort),
-						" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
-						return nil, err
-					}
+				if err := emitSuffix(fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat mapped-port %s is not a valid port number (1-65535)",
+					rs.Name, rule.Name, token),
+					" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
+					return nil, err
+				}
+			}
+			// A VALID in-range mapped-port still requires a matching `match
+			// destination-port`: without an external port to match, the port
+			// rewrite has no inbound trigger and the reverse SNAT cannot recover
+			// the original port. Guarded on MappedPort != 0 so it does not
+			// double-fire on a malformed mapped-port (MappedPort==0), which the
+			// presence gate above already rejected.
+			if rule.MappedPort != 0 && rule.MatchDestinationPort == 0 {
+				if err := emitSuffix(fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat mapped-port %d requires a matching `match destination-port`",
+					rs.Name, rule.Name, rule.MappedPort),
+					" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
+					return nil, err
 				}
 			}
 		}
@@ -1554,6 +1590,35 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 		for _, rule := range rs.Rules {
 			if rule == nil || !rule.IsNPTv6 {
 				continue
+			}
+
+			// #5523/#6479: NPTv6 (RFC 6296) translates the IPv6 address prefix
+			// and has NO transport-port concept, so a `then static-nat
+			// nptv6-prefix <p6> mapped-port <p>` is invalid in EVERY shape
+			// (collapsed keys, hierarchical nptv6-prefix child, or a distinct
+			// `mapped-port` sibling). The host-mask loop skips nptv6 rules
+			// entirely (`IsNPTv6` continue), so WITHOUT this gate a mapped-port
+			// on an nptv6 rule reached no validator at all: a malformed operand
+			// was silently accepted (the C179-038 class for the nptv6 shape) and
+			// a well-formed one was silently ignored. recordNPTv6MappedPort-
+			// Presence stamps MappedPortPresent whenever the keyword appears, so
+			// reject on PRESENCE alone — the value is irrelevant on nptv6, even a
+			// well-formed 1-65535 port is meaningless. This runs BEFORE the
+			// prefix-parse/length checks so it fires even when the prefixes are
+			// otherwise valid (the pure silent-accept case). No `continue`: on the
+			// lenient no-brick path the prefix diagnostics still accumulate, and
+			// the nptv6 prefix translation itself still applies (MappedPort==0),
+			// so this warning is scoped to the dropped mapped-port, not the rule.
+			if rule.MappedPortPresent {
+				msg := fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat nptv6-prefix does not support mapped-port (NPTv6 translates the address prefix per RFC 6296, not transport ports); remove the mapped-port",
+					rs.Name, rule.Name)
+				if lenient {
+					warnings = append(warnings, msg+
+						" (ignored: mapped-port dropped by dataplane; the nptv6 prefix translation still applies)")
+				} else {
+					return nil, fmt.Errorf("%s", msg)
+				}
 			}
 
 			// External prefix = `match destination-address`. The family is
