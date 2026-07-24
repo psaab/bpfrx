@@ -1,3 +1,21 @@
+## 2026-07-23 — #6446: fix -race data race on configstore test log buffer
+
+- **Timestamp**: 2026-07-23 (fix/6446-configstore-race)
+- **Action**: Guard captureWarnLogs' slog buffer with a mutex-backed
+  syncBuffer. `captureWarnLogs` installs the buffer as the process-global
+  slog.Default(); a persistRetryLoop goroutine leaked from an earlier test
+  (store_persist.go, intentionally no close signal) keeps calling slog.Warn()
+  and writes through the newly-installed handler while the 4579 test reads
+  the raw buffer via String() — the -race detector fired on that read/write.
+  slog's handler mutex only serializes writers among themselves; the raw
+  read bypasses it, so the syncBuffer shares one lock across Write and
+  String.
+- **Validation**: master (raw bytes.Buffer) -> `go test ./pkg/configstore/
+  -race -count=5` = 10 DATA RACE reports + FAIL TestEncryptedRoundTripNoWarn_4579.
+  With the fix -> `-race -count=10` clean (0 races, package PASS, 572s).
+  build/vet clean; full `go test ./...` for regressions.
+- **File(s)**: pkg/configstore/plaintext_downgrade_warn_4579_test.go
+
 ## 2026-07-23 — #6426: decompose pkg/dataplane compileZones god-function
 
 - **Timestamp**: 2026-07-23 (refactor/6426-compilezones)
