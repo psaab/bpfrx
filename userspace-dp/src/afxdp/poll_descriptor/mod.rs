@@ -1023,9 +1023,26 @@ pub(super) fn poll_binding_process_descriptor(
                         }
 
                         // --- DNAT pre-routing ---
-                        // Check DNAT table first (port-based DNAT), then
-                        // fall back to static NAT DNAT (IP-only 1:1).
-                        // The translated destination affects FIB lookup.
+                        // #6473: Junos evaluates static NAT BEFORE
+                        // destination NAT (Junos NAT overview, first-packet
+                        // order: static NAT → destination NAT → route →
+                        // policy → reverse static → source NAT; "static NAT
+                        // rules take precedence over destination NAT
+                        // rules"). The pre-#6473 code checked the DNAT pool
+                        // table first and only fell back to static-DNAT on
+                        // a miss, so an external address covered by BOTH a
+                        // static rule and a DNAT pool rule took the pool
+                        // translation and the static mapping was silently
+                        // shadowed (policy is written for the static
+                        // tuple). The outbound direction already evaluates
+                        // static SNAT first (source_nat_decision_for_flow
+                        // in nat_exception.rs); this aligns the inbound
+                        // direction with Junos and with the outbound order.
+                        // Behavior change: on an overlapping static+pool
+                        // config the static mapping now wins, and the
+                        // static rule's hit counter advances instead of the
+                        // pool rule's. The translated destination affects
+                        // FIB lookup.
                         //
                         // #5802: derive the pre-routing DNAT/static-NAT/NPTv6
                         // scope identity from the LOGICAL VLAN unit that received
@@ -1062,7 +1079,23 @@ pub(super) fn poll_binding_process_descriptor(
                         // non-ICMP packet yields None and never satisfies an
                         // ICMP-type-constrained entry (fail closed).
                         let dnat_packet_icmp = policy_packet_icmp(packet_frame, meta);
-                        let dnat_decision = if !worker_ctx.forwarding.dnat_table.is_empty() {
+                        // #6473 (Junos order): static DNAT first.
+                        let static_dnat_decision = worker_ctx
+                            .forwarding
+                            .static_nat
+                            .match_dnat_with_counter_scoped(
+                                resolution_target,
+                                flow.forward_key.dst_port,
+                                // #3435: gate the inbound static DNAT on the
+                                // packet SOURCE against `match source-address`.
+                                Some(flow.forward_key.src_ip),
+                                ingress_zone_name,
+                                ingress_ifname_dnat,
+                                ingress_ri_dnat,
+                            );
+                        let dnat_decision = if static_dnat_decision.is_none()
+                            && !worker_ctx.forwarding.dnat_table.is_empty()
+                        {
                             worker_ctx.forwarding.dnat_table.lookup_with_counter_scoped(
                                 meta.protocol,
                                 flow.forward_key.src_ip,
@@ -1077,20 +1110,6 @@ pub(super) fn poll_binding_process_descriptor(
                         } else {
                             None
                         };
-                        let static_dnat_decision = if dnat_decision.is_none() {
-                            worker_ctx.forwarding.static_nat.match_dnat_with_counter_scoped(
-                                resolution_target,
-                                flow.forward_key.dst_port,
-                                // #3435: gate the inbound static DNAT on the
-                                // packet SOURCE against `match source-address`.
-                                Some(flow.forward_key.src_ip),
-                                ingress_zone_name,
-                                ingress_ifname_dnat,
-                                ingress_ri_dnat,
-                            )
-                        } else {
-                            None
-                        };
                         // #2218: DNAT/static-DNAT now yields
                         // (NatDecision, Option<Arc<NatRuleCounter>>). Split
                         // the counter off — the decision flows unchanged into
@@ -1099,7 +1118,7 @@ pub(super) fn poll_binding_process_descriptor(
                         // `pre_routing_dnat_counter` and incremented only at a
                         // committed session install (here or the later
                         // MissingNeighbor seed path).
-                        let pre_routing_dnat = match dnat_decision.or(static_dnat_decision) {
+                        let pre_routing_dnat = match static_dnat_decision.or(dnat_decision) {
                             Some((decision, counter)) => {
                                 pre_routing_dnat_counter = counter;
                                 Some(decision)

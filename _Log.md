@@ -1,3 +1,34 @@
+## 2026-07-24 — #6473: flip inbound NAT precedence to static-first (Junos parity)
+
+- **Timestamp**: 2026-07-24 (fix/6473-static-nat-precedence, stacked on
+  fix/6433-flow-cache-seed)
+- **Action**: BEHAVIOR CHANGE. The inbound pre-routing NAT evaluation in
+  `poll_binding_process_descriptor` consulted the DNAT pool table FIRST and
+  only fell back to static-DNAT on a pool miss — inverted vs Junos
+  (first-packet order: static NAT → destination NAT → route → policy →
+  reverse static → source NAT) and internally inconsistent with the outbound
+  direction (static SNAT first in `source_nat_decision_for_flow`). Flipped
+  the pre-routing arm to static-first: `match_dnat_with_counter_scoped`
+  runs first, the pool lookup only on a static miss, and the winner's
+  per-rule counter flows to `pre_routing_dnat_counter` as before. On an
+  overlapping static+pool config the static mapping now wins (and its
+  counter advances instead of the pool rule's); where the static rule does
+  not match the pool still applies. Documented the precedence + migration
+  note in docs/feature-coverage.md (Destination NAT row, cross-ref from the
+  Static NAT row).
+- **Files**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_policy_inbound_nat.rs,
+  docs/feature-coverage.md.
+- **Fail-on-revert**: static_nat_precedes_overlapping_dnat_pool_6473 — an
+  external address covered by BOTH a static 1:1 (→ 10.0.61.50) and a DNAT
+  pool rule (→ 10.0.61.102:8443): asserts the installed session carries the
+  STATIC translation. RED on the pre-flip code (pool shadowed the static
+  rule), GREEN after.
+- **Validation**: full cargo test --release --test-threads=1 green (4252
+  passed, 0 failed — no existing test had baked the DNAT-first order);
+  clippy warning count identical to base (675); cargo check --features
+  debug-log clean.
+
 ## 2026-07-24 — #6433: extract the flow-cache seed path to flow_cache_seed.rs
 
 - **Timestamp**: 2026-07-24 (fix/6433-flow-cache-seed, stacked on
