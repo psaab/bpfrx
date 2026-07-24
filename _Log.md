@@ -60652,3 +60652,35 @@ top.
   vet / gofmt / pkg-ipsec-suite / heatmap GREEN.
 - **File(s)**: pkg/ipsec/policy.go,
     pkg/ipsec/swanctl_addr_sanitize_6469_test.go, pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-07-24
+- **Action**: Add test coverage for handleOversizedFrame's drop-to-re-establish-
+    framing branch (#6160 — follow-up to #6159/#6132). The two #6132 regression
+    tests only exercise the discard-and-realign `return true` branch (well-framed
+    payload <= 64KB). This adds two table-independent tests for the UNTESTED
+    `return false` drop path, one per trigger:
+  - `..._over_ceiling_...`: declared length > maxDiscardableOversizedFrameBytes
+    (64KB, header only on the wire). The reader must NOT drain an untrusted
+    over-ceiling length — it flushes the advanced ACK and drops the connection.
+    Asserts the flushed ACK(seq) is read off the wire, the connection is dropped
+    (client EOF + IsConnected flips false), DecodeErrors==1, exactly one
+    rate-limited resync, and the watermark advanced PAST the frame.
+  - `..._short_drain_...`: in-ceiling declared length (2000) but a SHORT payload
+    (100 bytes) + CloseWrite → io.CopyN drain errors → falls through to the SAME
+    flush-ACK + drop tail. Half-close keeps the client read half open so the
+    synchronously-flushed ACK is observable.
+  Neutralize-proof (COVERAGE test — inverts an existing invariant), run firsthand
+  per trigger with eventstream.go restored to 0-diff after each:
+  - A: terminal `return false`→`return true` → over_ceiling RED "the connection
+    was NOT dropped ... must return false for length > maxDiscardable..." (2.06s,
+    deadline hit = conn wrongly kept). short_drain stays GREEN.
+  - B: failed drain wrongly `return true` (ignore io.CopyN err) → short_drain RED
+    "the advanced ACK (seq 2) was not flushed on the drop path ...". over_ceiling
+    stays GREEN — each test binds its OWN trigger.
+  eventstream.go is 0-diff (test-only). No module-doc change: this is
+  test-coverage for existing #6159 behavior, no contract change. Validation:
+  go build ./..., go vet ./pkg/dataplane/userspace/, gofmt -l clean,
+  go test ./pkg/dataplane/... GREEN, heatmap TestHeatmapNotStale GREEN (prod LOC
+  unchanged → no regen).
+- **File(s)**: pkg/dataplane/userspace/eventstream_oversized_drop_path_6160_test.go,
+    _Log.md
