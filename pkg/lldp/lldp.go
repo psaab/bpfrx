@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/linuxsock"
@@ -835,11 +836,18 @@ func encodeTTL(seconds int) []byte {
 // LLDP-receive counterpart of the #1798/#3900 free-text control-char
 // sanitizer. strings.Map is rune-aware, so a legitimate multi-byte UTF-8
 // system name passes through unchanged and only control runes are
-// neutralized; an invalid UTF-8 byte decodes to U+FFFD (not a control rune)
-// so no raw byte escapes. Replacing rather than deleting keeps adjacent words
+// neutralized; a raw invalid UTF-8 byte (e.g. a bare 0x9B, the 8-bit CSI
+// introducer) is folded to U+FFFD by strings.Map so no raw byte escapes.
+//
+// The fast path returns s verbatim ONLY when it holds no control rune AND is
+// already valid UTF-8. A bare 0x9B is NOT a control rune — it decodes to
+// U+FFFD — so an IsControl-only guard would return it unchanged and let the
+// 8-bit CSI reach the operator's terminal via `show lldp neighbors` (#6482);
+// the utf8.ValidString check forces the strings.Map slow path for any
+// invalid-UTF-8 input. Replacing rather than deleting keeps adjacent words
 // readable.
 func sanitizeTLVString(s string) string {
-	if strings.IndexFunc(s, unicode.IsControl) < 0 {
+	if strings.IndexFunc(s, unicode.IsControl) < 0 && utf8.ValidString(s) {
 		return s
 	}
 	return strings.Map(func(r rune) rune {

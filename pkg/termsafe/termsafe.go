@@ -25,13 +25,24 @@ import (
 
 const hexDigits = "0123456789abcdef"
 
-// SanitizeForDisplay renders a device-originated string safe to print to a
-// terminal. Every C0 control byte (0x00-0x1F), DEL (0x7F), C1 control byte
-// (0x80-0x9F), and invalid UTF-8 byte is replaced with a visible backslash-hex
-// escape (e.g. an ESC becomes the four printable characters \x1b) so the
-// operator sees exactly what the device sent instead of the terminal
-// interpreting it. Every printable rune — including legitimate multibyte UTF-8,
-// so an international hostname is not corrupted — passes through unchanged.
+// SanitizeForDisplay escapes the terminal-protocol control bytes in a
+// device-originated string so the terminal does not ACT on embedded escape
+// sequences when the value is printed. Every C0 control byte (0x00-0x1F,
+// including ESC), DEL (0x7F), C1 control byte (0x80-0x9F), and invalid UTF-8
+// byte is replaced with a visible backslash-hex escape (e.g. an ESC becomes the
+// four printable characters \x1b) so the operator sees exactly what the device
+// sent instead of the terminal interpreting it. Every printable rune —
+// including legitimate multibyte UTF-8, so an international hostname is not
+// corrupted — passes through unchanged.
+//
+// Scope is deliberately narrow. This neutralizes exactly the C0/DEL/C1
+// terminal-protocol control bytes and invalid UTF-8 that drive escape-sequence
+// injection (OSC clipboard writes, CSI cursor/erase) — unicode.IsControl covers
+// only Unicode category Cc. It does NOT address Unicode display-order spoofing:
+// bidirectional overrides (U+200E, U+202A-U+202E), line/paragraph separators
+// (U+2028/U+2029), and zero-width format (Cf) characters are printable runes and
+// pass through unchanged. Defending against Trojan-Source-style bidi reordering
+// is a separate, lower-severity concern and out of scope here.
 func SanitizeForDisplay(s string) string {
 	// Fast path: the overwhelming majority of names are already clean, so
 	// return the input without allocating a builder.

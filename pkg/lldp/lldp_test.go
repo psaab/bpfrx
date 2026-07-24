@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 func TestEncodeTLV(t *testing.T) {
@@ -374,6 +375,49 @@ func TestSanitizeTLVString(t *testing.T) {
 			}
 			if i := strings.IndexFunc(got, unicode.IsControl); i >= 0 {
 				t.Errorf("sanitizeTLVString(%q) retained a control char at byte %d: %q", tc.in, i, got)
+			}
+		})
+	}
+}
+
+// TestSanitizeTLVString_RawInvalidUTF8 is the #6482 regression. A raw invalid
+// UTF-8 byte such as 0x9B — the 8-bit CSI introducer that an 8-bit terminal
+// acts on exactly like ESC[ — is NOT a Unicode control rune: it decodes to
+// U+FFFD, which unicode.IsControl reports false. The pre-#6482 fast path
+// `strings.IndexFunc(s, unicode.IsControl) < 0` therefore returned such a
+// string UNCHANGED, so the raw 0x9B reached the operator's terminal via `show
+// lldp neighbors`. The fast path now also requires utf8.ValidString, so the
+// strings.Map slow path runs and folds every invalid byte to U+FFFD.
+//
+// The `c1 stripped` case in TestSanitizeTLVString uses the VALID two-byte UTF-8
+// encoding of U+009B (0xC2 0x9B) — a real control rune — and so never exercised
+// this raw-byte path. Note the assertions below scan for the raw 0x9B BYTE
+// (strings.IndexByte), not strings.ContainsRune(0x9B): rune U+009B encodes to
+// 0xC2 0x9B, so ContainsRune looks for the wrong bytes and would false-negative.
+func TestSanitizeTLVString_RawInvalidUTF8(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"raw 8-bit csi erase", "\x9b2J"},             // bare 0x9B + "2J" == 8-bit CSI 2J
+		{"raw 8-bit osc plus bel", "n\x9d52;c;A\x07"}, // bare 0x9D (OSC) + C0 BEL
+		{"lone continuation byte", "ge\x80-0-0"},      // stray 0x80 continuation
+		{"truncated 2-byte lead", "a\xc3z"},           // 0xC3 with no continuation
+		{"raw 0xff never valid", "x\xffy"},            // 0xFF is never valid UTF-8
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeTLVString(tc.in)
+			// Every smuggled byte must be folded away: the output is well-formed
+			// UTF-8, carries no raw 0x9B, and holds no control rune.
+			if !utf8.ValidString(got) {
+				t.Errorf("sanitizeTLVString(%q) = %q is still not valid UTF-8", tc.in, got)
+			}
+			if i := strings.IndexByte(got, 0x9b); i >= 0 {
+				t.Errorf("sanitizeTLVString(%q) = %q retained a raw 0x9b byte at %d", tc.in, got, i)
+			}
+			if i := strings.IndexFunc(got, unicode.IsControl); i >= 0 {
+				t.Errorf("sanitizeTLVString(%q) = %q retained a control rune at byte %d", tc.in, got, i)
 			}
 		})
 	}
