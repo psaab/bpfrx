@@ -252,8 +252,10 @@ func reconcileInterfaceAddresses(ifaceName string, desired []string) {
 // and behavior-preserving:
 //
 //   - programZoneMaps: per-zone dataplane config + per-interface map
-//     programming and host setup (the rename -> address -> bring-down order
-//     is preserved inside mapZoneInterface);
+//     programming and host setup inside mapZoneInterface (disabled non-VLAN
+//     interfaces are brought down, then addresses are reconciled, in the
+//     original per-interface loop order — interface renaming happens earlier
+//     at daemon startup, not here);
 //   - buildInterfaceNetworkdModels / buildFabricBondModels /
 //     buildBridgeDomainModels: the networkd managed-interface model, threaded
 //     through a shared `seen` set so each interface is emitted exactly once;
