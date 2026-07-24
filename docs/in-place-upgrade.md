@@ -296,15 +296,23 @@ exist.
   `versions/<ver>/xpfd` path, so a lockstep entry that is a directory / FIFO
   / socket / symlink / non-executable-bit file cannot be exec'd by systemd
   and is rejected (`os.Lstat`, so a symlink is rejected outright rather than
-  followed). This validates on-disk **metadata** (type + exec bit), not the
-  binary's **content**: a regular exec-bit file whose content is not actually
-  executable (corrupt / truncated / wrong-arch / plain text `chmod 0755`)
-  passes this static check but would fail `execve` — that is undecidable
-  without exec'ing it, so final content-executability is systemd's arbiter at
-  restart. That rare tampering/corruption residual is out of scope for static
-  validation and tracked as a follow-up (#6409); the common
-  dangling/pathful/incomplete/wrong-type/non-executable-bit modes are
-  rejected here. The same `validateRestorableVersion` predicate
+  followed). Beyond that type+bit metadata, each lockstep binary's **content**
+  is parsed as an **ELF image** (`elfHeaderParseable` → `debug/elf.Open`, a
+  best-effort content gate, #6409): a regular exec-bit file whose content is
+  arbitrary text (`chmod 0755`), an empty/truncated file, or a file with a
+  corrupt header carries the exec bit yet `execve` would fail and strand the
+  daemon after STOP — the ELF parse rejects those. The lockstep set is
+  exclusively native compiled binaries (`xpfd`, `xpf-userspace-dp`), never a
+  script, so an ELF header gate carries no false-reject risk for a legitimate
+  non-ELF runtime. This remains a **heuristic, not a guarantee** (#6409):
+  proving "systemd can exec this" without exec'ing it is undecidable
+  statically, so a structurally valid ELF whose **machine is wrong for the
+  running architecture** or whose **body is corrupt** still parses here and is
+  left to systemd's arbitration at restart (surfaced by the existing
+  start-failure / auto-rollback path, not a silent bad cutover). The common
+  dangling/pathful/incomplete/wrong-type/non-executable-bit **and non-ELF /
+  truncated / corrupt-header content** modes are rejected here. The same
+  `validateRestorableVersion` predicate
   re-checks a *persisted* `PreviousVersion` on every resume before STOP (a
   pre-#6374 journal or a dir damaged/GC'd after INIT is caught), and gates
   the standalone `rollback()` **before** it stops the daemon or restores the

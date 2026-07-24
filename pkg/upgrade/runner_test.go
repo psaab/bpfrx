@@ -1,9 +1,13 @@
 package upgrade
 
 import (
+	"bytes"
+	"debug/elf"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -175,10 +179,62 @@ func publishStagedGen(t *testing.T, r *Runner) string {
 	return genid
 }
 
+// fakeBinContent builds the bytes a fake managed binary carries: a minimal but
+// genuinely PARSEABLE 64-bit little-endian ELF header (so it clears the #6409
+// content gate in validateRestorableVersion, which parses restorable-rollback
+// lockstep binaries as ELF images) followed by the caller's identifier tail (so
+// each fake binary stays byte-distinct per name/version and copy-fidelity
+// assertions still discriminate). The header declares no program/section
+// headers, which debug/elf.Open accepts; the trailing identifier is ignored by
+// the header parse. The machine matches the running architecture so the fake
+// reads as a genuine native binary, though the #6409 gate parses the header
+// without checking the machine.
+func fakeBinContent(content string) []byte {
+	var machine elf.Machine
+	switch runtime.GOARCH {
+	case "arm64":
+		machine = elf.EM_AARCH64
+	default:
+		machine = elf.EM_X86_64
+	}
+	var b bytes.Buffer
+	b.Write([]byte{0x7f, 'E', 'L', 'F'}) // ELFMAG
+	b.WriteByte(byte(elf.ELFCLASS64))    // 64-bit
+	b.WriteByte(byte(elf.ELFDATA2LSB))   // little-endian
+	b.WriteByte(byte(elf.EV_CURRENT))    // ELF version
+	b.WriteByte(byte(elf.ELFOSABI_NONE)) // ABI
+	b.Write(make([]byte, 8))             // ABI version + padding -> 16-byte e_ident
+	le := binary.LittleEndian
+	w16 := func(v uint16) { var t [2]byte; le.PutUint16(t[:], v); b.Write(t[:]) }
+	w32 := func(v uint32) { var t [4]byte; le.PutUint32(t[:], v); b.Write(t[:]) }
+	w64 := func(v uint64) { var t [8]byte; le.PutUint64(t[:], v); b.Write(t[:]) }
+	w16(uint16(elf.ET_EXEC))    // e_type
+	w16(uint16(machine))        // e_machine
+	w32(uint32(elf.EV_CURRENT)) // e_version
+	w64(0)                      // e_entry
+	w64(0)                      // e_phoff
+	w64(0)                      // e_shoff
+	w32(0)                      // e_flags
+	w16(64)                     // e_ehsize
+	w16(0)                      // e_phentsize
+	w16(0)                      // e_phnum
+	w16(0)                      // e_shentsize
+	w16(0)                      // e_shnum
+	w16(0)                      // e_shstrndx
+	b.WriteString(content)
+	return b.Bytes()
+}
+
+// writeFakeBin writes a regular, executable fake managed binary. Its content is
+// a parseable ELF image (fakeBinContent) so it is a valid restorable-rollback
+// target under the #6409 content gate; the identifier tail keeps it byte-
+// distinct so copy-fidelity assertions compare against fakeBinContent(content).
 func writeFakeBin(t *testing.T, path, content string) {
 	t.Helper()
-	mkfile(t, path, content)
-	if err := os.Chmod(path, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, fakeBinContent(content), 0755); err != nil {
 		t.Fatal(err)
 	}
 }

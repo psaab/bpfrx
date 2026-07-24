@@ -67,7 +67,7 @@ func TestVerifyFailCleanup_RecopiesOnRetry(t *testing.T) {
 	if rerr != nil {
 		t.Fatalf("versions/2.0.0/xpfd missing after successful retry: %v", rerr)
 	}
-	if string(got) != "binary-xpfd-corrected" {
+	if string(got) != string(fakeBinContent("binary-xpfd-corrected")) {
 		t.Errorf("version dir not recopied from corrected staged: got %q", string(got))
 	}
 	// current must now point at 2.0.0 (the cut committed).

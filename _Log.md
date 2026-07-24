@@ -59917,3 +59917,29 @@ top.
     now lives). Doc/comment-only — go build/vet clean, heatmap canary +
     pkg/frr tests GREEN, zero code delta.
   - **File(s)**: pkg/frr/manager.go, pkg/frr/README.md, _Log.md
+- **Timestamp**: 2026-07-23
+  - **Action**: #6409 — add a best-effort ELF-header CONTENT gate to
+    pkg/upgrade validateRestorableVersion. Metadata (regular file + exec
+    bit) does not prove a lockstep rollback binary's content is
+    kernel-executable; a regular exec-bit file that is arbitrary text
+    (chmod 0755), empty/truncated, or has a corrupt header passes the
+    #6408 type/bit checks yet execve fails, stranding the daemon after
+    STOP. Each manifest.LockstepNames() entry is now parsed via
+    debug/elf.Open (new elfHeaderParseable helper). The lockstep set is
+    exclusively native compiled binaries (xpfd, xpf-userspace-dp), never
+    a script, so an ELF gate carries no false-reject risk for a
+    legitimate non-ELF runtime. Documented as a heuristic: a valid-header
+    wrong-arch / corrupt-body image still parses and remains systemd's
+    arbiter at restart. Test helpers writeFakeBin/fakeBinContent now emit
+    a minimal parseable ELF so restorable-target tests stay valid; six
+    copy-fidelity assertions compare against fakeBinContent(). New
+    fail-on-revert test restorable_content_6409_test.go covers text /
+    empty / truncated / partial-header content plus a valid-ELF control
+    and a sanctioned-cut INIT integration case. go build/vet clean, full
+    go test ./... GREEN; parent-RED verified (neutralizing the gate makes
+    the corrupt-content subtests + the sanctioned-cut test go clean
+    ASSERTION RED while the valid-ELF control stays green).
+  - **File(s)**: pkg/upgrade/runner.go,
+    pkg/upgrade/restorable_content_6409_test.go,
+    pkg/upgrade/runner_test.go, pkg/upgrade/stagedgen_cut_test.go,
+    pkg/upgrade/verify_cleanup_test.go, docs/in-place-upgrade.md, _Log.md
