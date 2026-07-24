@@ -294,6 +294,15 @@ impl GlobalZoneScope {
 ///     tolerant-path `to-zone junos-host` resolves to the reserved host id,
 ///     which never matches a transit flow — inert fail-closed for transit and
 ///     the intended host-scope for the host-inbound tier.)
+///   - #6464: an EMPTY-STRING element fails closed the same way
+///     (`UnresolvableZoneReference`). The Go emit paths strip blanks
+///     (`sortDedupZones`, `firewallMatchValues`), so only a corrupt /
+///     hand-built / mixed-version-HA-peer snapshot can carry one — the same
+///     reachability class the #3402 backstop covers. Before #6464 the empty
+///     element took the `Any` short-circuit and silently WIDENED a scoped
+///     PERMIT global to every zone pair (fail open); the identical corruption
+///     with a garbage name rejects the snapshot. Empty is not `any`: the
+///     `== "any"` token stays the genuine all-zones wildcard.
 ///
 /// #4626 M03: `names` is the resolved scope LIST (the plural
 /// `match_from_zones`/`match_to_zones`, or `[singular]` when only the legacy
@@ -304,11 +313,25 @@ fn build_global_zone_scope(
     names: &[String],
     rule_id: &str,
 ) -> Result<GlobalZoneScope, SnapshotIntegrityError> {
-    if names.is_empty() || names.iter().any(|n| n.is_empty() || n == "any") {
+    if names.is_empty() || names.iter().any(|n| n == "any") {
         return Ok(GlobalZoneScope::Any);
     }
     let mut ids: SmallVec<[u16; 2]> = SmallVec::with_capacity(names.len());
     for name in names {
+        // #6464: an empty scope element is not the `any` wildcard — the Go
+        // emit paths strip blanks, so only a corrupt / hand-built /
+        // mixed-version-HA-peer snapshot can carry one. Fail closed exactly
+        // like an unresolvable zone name (#3402) instead of widening the
+        // scope to all zones. (Explicit, rather than relying on
+        // `resolve_policy_zone_id` missing "" — the map never holds an empty
+        // name, but that invariant belongs to `zone_name_to_id_from_snapshot`
+        // and must not be load-bearing here.)
+        if name.is_empty() {
+            return Err(SnapshotIntegrityError::UnresolvableZoneReference {
+                rule_id: rule_id.to_string(),
+                zone: name.clone(),
+            });
+        }
         match resolve_policy_zone_id(zone_name_to_id, name) {
             Some(id) => ids.push(id),
             None => {
@@ -2968,6 +2991,26 @@ pub(crate) fn evaluate_junos_host_policy(
 /// `application any` / address / protocol terms still match. The
 /// `evaluate_junos_host_policy` wrapper delegates here with `l4_present = true`,
 /// so the L4 (flow-backed / test) path is byte-identical to before.
+///
+/// #6465: the #4569 fragment-association deny override applies here too. A
+/// host-bound non-first fragment cannot be classified into a port-bearing
+/// junos-host DENY (the term fails closed for `l4_present == false`, #3292),
+/// so first-match could fall through to a LATER junos-host PERMIT — or to the
+/// no-match `None` fall-through, which the caller treats as deliver — and the
+/// fragment would reach the host stack even though the FIRST fragment (with
+/// the real port) is denied. Mirror the transit gate: while walking the tiers
+/// in precedence order, remember the FIRST port-bearing DENY whose L3 overlaps
+/// the fragment but was skipped only for `l4_present == false`
+/// (`note_skipped_frag_deny`); override a later PERMIT to that DROP
+/// (`apply_frag_deny_override`), and convert the deliver-on-no-match
+/// fall-through into `Some(frag_associated_deny_result)` when a deny was
+/// skipped — the junos-host "no implicit default-deny" lifeline is a
+/// deliver-on-no-match posture, i.e. permit-like, so it takes the same
+/// override the transit default-PERMIT takes. The override can only fire when
+/// an overlapping port-bearing DENY is actually configured, so the lifeline
+/// guarantee (an unmatched host-bound flow is never newly denied) is
+/// unaffected for every flow that does not overlap a deny. The L4 path never
+/// records a skip, so it stays byte-identical.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_junos_host_policy_l3_aware(
     state: &PolicyState,
@@ -2984,12 +3027,15 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware(
     if !state.has_junos_host_rules || from_id == 0 {
         return None;
     }
+    // #6465: fragment-association fail-closed, mirroring
+    // `evaluate_policy_result_l3_aware` (#4569) — inert on the L4 path.
+    let mut skipped_frag_deny: Option<SkippedFragDeny> = None;
     // Most-specific first: an exact `from-zone <ingress> to-zone junos-host`
     // pair before the `from-zone any to-zone junos-host` wildcard.
     let key = zone_pair_key(from_id, JUNOS_HOST_ZONE_ID);
     if let Some(indices) = state.zone_pair_index.get(&key) {
         for &idx in indices {
-            if let Some(mut result) = try_match_rule(
+            match try_match_rule(
                 &state.rules[idx],
                 state,
                 src_ip,
@@ -3004,9 +3050,24 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware(
                 // application terms then fail closed.
                 l4_present,
             ) {
-                // #3073: 1-based handle (see `evaluate_policy_result_with_icmp`).
-                result.policy_counter_idx = (idx as u32).saturating_add(1);
-                return Some(result);
+                Some(mut result) => {
+                    // #3073: 1-based handle (see `evaluate_policy_result_with_icmp`).
+                    result.policy_counter_idx = (idx as u32).saturating_add(1);
+                    return Some(apply_frag_deny_override(result, skipped_frag_deny));
+                }
+                // #6465: remember a port-bearing DENY skipped for this flowless
+                // fragment so a later PERMIT / deliver fall-through fails closed.
+                None => note_skipped_frag_deny(
+                    &mut skipped_frag_deny,
+                    l4_present,
+                    &state.rules[idx],
+                    idx,
+                    state,
+                    src_ip,
+                    dst_ip,
+                    protocol,
+                    packet_icmp,
+                ),
             }
         }
     }
@@ -3022,7 +3083,7 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware(
     // management lifeline.
     if let Some(indices) = state.from_any_index.get(&JUNOS_HOST_ZONE_ID) {
         for &idx in indices {
-            if let Some(mut result) = try_match_rule(
+            match try_match_rule(
                 &state.rules[idx],
                 state,
                 src_ip,
@@ -3037,8 +3098,21 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware(
                 // application terms then fail closed.
                 l4_present,
             ) {
-                result.policy_counter_idx = (idx as u32).saturating_add(1);
-                return Some(result);
+                Some(mut result) => {
+                    result.policy_counter_idx = (idx as u32).saturating_add(1);
+                    return Some(apply_frag_deny_override(result, skipped_frag_deny));
+                }
+                None => note_skipped_frag_deny(
+                    &mut skipped_frag_deny,
+                    l4_present,
+                    &state.rules[idx],
+                    idx,
+                    state,
+                    src_ip,
+                    dst_ip,
+                    protocol,
+                    packet_icmp,
+                ),
             }
         }
     }
@@ -3061,7 +3135,7 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware(
         if !rule.global_to_zone.is_host_scope() || !rule.global_from_zone.matches(from_id) {
             continue;
         }
-        if let Some(mut result) = try_match_rule(
+        match try_match_rule(
             rule,
             state,
             src_ip,
@@ -3073,9 +3147,33 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware(
             packet_len,
             l4_present,
         ) {
-            result.policy_counter_idx = (idx as u32).saturating_add(1);
-            return Some(result);
+            Some(mut result) => {
+                result.policy_counter_idx = (idx as u32).saturating_add(1);
+                return Some(apply_frag_deny_override(result, skipped_frag_deny));
+            }
+            None => note_skipped_frag_deny(
+                &mut skipped_frag_deny,
+                l4_present,
+                rule,
+                idx,
+                state,
+                src_ip,
+                dst_ip,
+                protocol,
+                packet_icmp,
+            ),
         }
+    }
+    // #6465: the junos-host fall-through is "no implicit default-deny" — an
+    // unmatched host-bound flow returns None and the caller DELIVERS it (the
+    // lifeline guarantee). That posture is permit-like, so a flowless fragment
+    // that skipped an overlapping port-bearing DENY must fail closed exactly as
+    // it would against a transit default-PERMIT (#4569): deliver the
+    // fragment-associated DROP (attributed to the skipped DENY) instead of
+    // None. When no deny was skipped this is inert — and the L4 path never
+    // records one, so the lifeline is byte-identical there.
+    if let Some(deny) = skipped_frag_deny {
+        return Some(frag_associated_deny_result(deny));
     }
     None
 }
@@ -3647,7 +3745,13 @@ fn parse_port_spec(spec: &str) -> Option<Vec<PortRange>> {
 // parse_port_spec MORE lenient than both Go gates — a parser divergence on a
 // security leaf (#3606). Reject any token that is not a bare run of ASCII
 // decimal digits so all three parsers agree.
-fn parse_port_u16(tok: &str) -> Option<u16> {
+//
+// #6477: this is the SHARED digit-only helper — the firewall-filter compiler
+// (filter/compiler.rs `parse_port_spec`) routes through it too, so all FOUR
+// port parsers (Go commit gate, Go capability gate, policy-side Rust,
+// filter-side Rust) agree on the same canonical-token acceptance set. Keep it
+// the single source of truth for "is this token a canonical port number".
+pub(crate) fn parse_port_u16(tok: &str) -> Option<u16> {
     if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }

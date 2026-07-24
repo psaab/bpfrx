@@ -59,6 +59,8 @@ macro_rules! debug_log {
 
 #[path = "bind.rs"]
 mod bind;
+#[path = "binding_state/mod.rs"]
+mod binding_state;
 #[path = "bpf_map/mod.rs"]
 mod bpf_map;
 #[path = "checksum.rs"]
@@ -154,6 +156,7 @@ use self::bind::{
     bind_strategy_for_driver, binder_for_strategy, describe_bind_flags,
     shared_umem_group_key_for_device,
 };
+use self::binding_state::*;
 use self::bpf_map::*;
 use self::checksum::*;
 use self::event_emit::*;

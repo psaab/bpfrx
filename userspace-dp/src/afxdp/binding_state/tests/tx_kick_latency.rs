@@ -14,7 +14,7 @@ fn tx_kick_latency_bucket_mapping_pin() {
     // buckets (boundary + interior + saturation) and assert
     // one count per bucket plus matching count / sum_ns.
     //
-    // bucket_index_for_ns pins (see umem.rs:198-202):
+    // bucket_index_for_ns pins (see binding_state/latency.rs):
     //   delta=0 → bucket 0, delta=1 → bucket 0
     //   bucket i occupies 2^(i+9) ≤ delta < 2^(i+10) ns (i>=1)
     //     so bucket 3 covers [2^12, 2^13) = [4096, 8192)
@@ -194,7 +194,7 @@ fn tx_kick_retry_count_observable_via_snapshot() {
 fn tx_kick_latency_cross_thread_snapshot_skew_within_bound() {
     // #825 plan §3.9 test #6 (cross-thread skew harness
     // mirroring #812's tx_latency_hist_cross_thread_snapshot_skew_within_bound
-    // at umem.rs:1097-1274).
+    // at binding_state/tests/tx_submit_latency.rs).
     //
     // Spawn a writer thread that calls `record_kick_latency` in
     // a tight loop; spawn a reader thread that calls

@@ -15,6 +15,15 @@
 // the architectural verdict that further extraction is blocked by
 // mutable-locals coupling.
 //
+// #6433: the flow-cache SEED (write) path joined the read half —
+// `flow_cache_seed::stage_flow_cache_seed` carries the #1861 §5.4
+// refused-install gate, the #3048/#3918/#5147 pre-resolve shard-epoch
+// stamp, and the #3073/#3322 policy-counter stamps, colocated with
+// `flow_cache_hit` so the cache's eviction invariants review as one
+// contract. Pure code-motion (`#[inline]`, disjoint `&mut
+// binding.flow.flow_cache` field borrow — the #1327 split-borrow
+// discipline); the order-coupled slow-path arms stay inline.
+//
 // #4404 increment 1: the cold-path `debug-log` throttle predicates
 // (`debug_log_throttle::{session_miss,policy_deny}_debug_log_allowed`,
 // their #4120 caps, and the `debug_log_throttle_tests` pinned-contract
@@ -30,6 +39,7 @@ mod debug_log_throttle;
 mod embedded_icmp;
 mod filter;
 mod flow_cache_hit;
+mod flow_cache_seed;
 mod flowless_verdict;
 mod frag_assoc;
 mod host_inbound_policy;
@@ -43,6 +53,7 @@ mod session_admission;
 use debug_log_throttle::{policy_deny_debug_log_allowed, session_miss_debug_log_allowed};
 use embedded_icmp::{EmbeddedIcmpReversal, try_reverse_embedded_icmp_error};
 use flow_cache_hit::{FlowCacheOutcome, stage_flow_cache_hit};
+use flow_cache_seed::stage_flow_cache_seed;
 use frag_assoc::{
     flowless_fragment_requires_nat_translation, nat64_consult_forward_fragment_assoc,
     nat64_install_forward_fragment_assoc, nat_consult_forward_fragment_assoc,
@@ -1012,9 +1023,26 @@ pub(super) fn poll_binding_process_descriptor(
                         }
 
                         // --- DNAT pre-routing ---
-                        // Check DNAT table first (port-based DNAT), then
-                        // fall back to static NAT DNAT (IP-only 1:1).
-                        // The translated destination affects FIB lookup.
+                        // #6473: Junos evaluates static NAT BEFORE
+                        // destination NAT (Junos NAT overview, first-packet
+                        // order: static NAT → destination NAT → route →
+                        // policy → reverse static → source NAT; "static NAT
+                        // rules take precedence over destination NAT
+                        // rules"). The pre-#6473 code checked the DNAT pool
+                        // table first and only fell back to static-DNAT on
+                        // a miss, so an external address covered by BOTH a
+                        // static rule and a DNAT pool rule took the pool
+                        // translation and the static mapping was silently
+                        // shadowed (policy is written for the static
+                        // tuple). The outbound direction already evaluates
+                        // static SNAT first (source_nat_decision_for_flow
+                        // in nat_exception.rs); this aligns the inbound
+                        // direction with Junos and with the outbound order.
+                        // Behavior change: on an overlapping static+pool
+                        // config the static mapping now wins, and the
+                        // static rule's hit counter advances instead of the
+                        // pool rule's. The translated destination affects
+                        // FIB lookup.
                         //
                         // #5802: derive the pre-routing DNAT/static-NAT/NPTv6
                         // scope identity from the LOGICAL VLAN unit that received
@@ -1051,7 +1079,23 @@ pub(super) fn poll_binding_process_descriptor(
                         // non-ICMP packet yields None and never satisfies an
                         // ICMP-type-constrained entry (fail closed).
                         let dnat_packet_icmp = policy_packet_icmp(packet_frame, meta);
-                        let dnat_decision = if !worker_ctx.forwarding.dnat_table.is_empty() {
+                        // #6473 (Junos order): static DNAT first.
+                        let static_dnat_decision = worker_ctx
+                            .forwarding
+                            .static_nat
+                            .match_dnat_with_counter_scoped(
+                                resolution_target,
+                                flow.forward_key.dst_port,
+                                // #3435: gate the inbound static DNAT on the
+                                // packet SOURCE against `match source-address`.
+                                Some(flow.forward_key.src_ip),
+                                ingress_zone_name,
+                                ingress_ifname_dnat,
+                                ingress_ri_dnat,
+                            );
+                        let dnat_decision = if static_dnat_decision.is_none()
+                            && !worker_ctx.forwarding.dnat_table.is_empty()
+                        {
                             worker_ctx.forwarding.dnat_table.lookup_with_counter_scoped(
                                 meta.protocol,
                                 flow.forward_key.src_ip,
@@ -1066,20 +1110,6 @@ pub(super) fn poll_binding_process_descriptor(
                         } else {
                             None
                         };
-                        let static_dnat_decision = if dnat_decision.is_none() {
-                            worker_ctx.forwarding.static_nat.match_dnat_with_counter_scoped(
-                                resolution_target,
-                                flow.forward_key.dst_port,
-                                // #3435: gate the inbound static DNAT on the
-                                // packet SOURCE against `match source-address`.
-                                Some(flow.forward_key.src_ip),
-                                ingress_zone_name,
-                                ingress_ifname_dnat,
-                                ingress_ri_dnat,
-                            )
-                        } else {
-                            None
-                        };
                         // #2218: DNAT/static-DNAT now yields
                         // (NatDecision, Option<Arc<NatRuleCounter>>). Split
                         // the counter off — the decision flows unchanged into
@@ -1088,7 +1118,7 @@ pub(super) fn poll_binding_process_descriptor(
                         // `pre_routing_dnat_counter` and incremented only at a
                         // committed session install (here or the later
                         // MissingNeighbor seed path).
-                        let pre_routing_dnat = match dnat_decision.or(static_dnat_decision) {
+                        let pre_routing_dnat = match static_dnat_decision.or(dnat_decision) {
                             Some((decision, counter)) => {
                                 pre_routing_dnat_counter = counter;
                                 Some(decision)
@@ -3872,110 +3902,32 @@ pub(super) fn poll_binding_process_descriptor(
                         binding.scratch.scratch_forwards.push(request);
                         recycle_now = false;
                         // ── Flow cache population ────────────────────
-                        // Cache ForwardCandidate decisions for established
-                        // TCP/UDP flows. Skip NAT64/NPTv6 (non-cacheable).
-                        // #1861 §5.4: never cache a decision whose backing
-                        // session install was attempted and refused
-                        // (flow_cache_install_failed) — a cached
-                        // sessionless decision would suppress the
-                        // per-packet reply repair until cache
-                        // invalidation. "No install required" paths
-                        // (DNS fast-path, fabric-return) keep the flag
-                        // false and cache as before.
-                        //
-                        // #5147: extract the pre-resolve epoch of THIS flow's
-                        // resolved next-hop shard from the whole-vector
-                        // snapshot taken before the resolve. Computed here,
-                        // while `decision` is still owned (it is moved into
-                        // `from_forward_decision` below), from the neighbor's
-                        // ACTUAL key ifindex — the OUTER transport ifindex for a
-                        // tunnel egress, the `egress_ifindex` for a direct
-                        // resolution — via `outer_neighbor_ifindex`, the same
-                        // ifindex `insert_if_changed` bumps on. `from_forward_decision`
-                        // derives `neighbor_shard` with the IDENTICAL
-                        // `outer_neighbor_ifindex(.., None, ..)` call, so the
-                        // stamped epoch and the hit-path re-read agree on the
-                        // shard (both `None` for the neighbor handle: the outer
-                        // ifindex is route-derived, so `None` yields the same
-                        // ifindex as the live resolve and keeps the two sites
-                        // coupled). Keying on the logical `egress_ifindex` for
-                        // tunnels was the review MAJOR — it stamped a different
-                        // shard than the bump, so a tunnel flow never evicted on
-                        // its outer gateway's MAC change (#3048 blackhole). A
-                        // resolution with no next-hop stamps 0 (paired with a
-                        // `NEIGHBOR_SHARD_NONE` shard → never MAC-stale).
-                        let neighbor_mac_epoch_at_resolve = match decision.resolution.next_hop {
-                            Some(nh) => neighbor_epoch_snapshot.epoch_for(&(
-                                outer_neighbor_ifindex(
-                                    worker_ctx.forwarding,
-                                    None,
-                                    &decision.resolution,
-                                ),
-                                nh,
-                            )),
-                            None => 0,
-                        };
-                        if !flow_cache_install_failed
-                            && let Some(flow) = flow.as_ref()
-                            && let Some(mut entry) = FlowCacheEntry::from_forward_decision(
-                                flow,
-                                meta,
-                                validation,
-                                decision,
-                                flow_cache_owner_rg_id,
-                                session_ingress_zone,
-                                request_target_binding_index,
-                                evaluate_non_pbr_input_filter_log_only(
-                                    worker_ctx.forwarding,
-                                    filter_match_extra,
-                                    Some(flow),
-                                    meta,
-                                    ingress_zone_override,
-                                ),
-                                // #3777: capture the input `then count` handles
-                                // so cache hits replay them (mirrors the output
-                                // counter replay). The seed packet was counted on
-                                // the cold path above; this only collects handles.
-                                evaluate_non_pbr_input_filter_counters_cached(
-                                    worker_ctx.forwarding,
-                                    Some(flow),
-                                    meta,
-                                ),
-                                worker_ctx.forwarding,
-                                worker_ctx.ha_state,
-                                apply_nat_on_fabric,
-                                &worker_ctx.rg_epochs,
-                                // #3048/#3918/#5147: stamp the PER-SHARD
-                                // neighbor-MAC-change epoch snapshotted BEFORE
-                                // the resolve above (the resolved shard's slot
-                                // of `neighbor_epoch_snapshot`), not a fresh
-                                // post-resolve read. A later kernel ARP/NDP MAC
-                                // change to THIS descriptor's next-hop neighbor
-                                // advances that shard's live epoch past this
-                                // stamp, evicting the cached stale dst_mac on
-                                // its next fast-path hit
-                                // (`neighbor_mac_epoch_stale`) — while a change
-                                // to an unrelated neighbor (a different shard)
-                                // leaves this flow cached (#5147). A MAC change
-                                // racing the resolve is caught too, because the
-                                // pre-resolve snapshot cannot already reflect it
-                                // (closes the #3918 TOCTOU).
-                                neighbor_mac_epoch_at_resolve,
-                            )
-                        {
-                            // #3073: stamp the admitting rule's hit-counter handle
-                            // onto the cached entry (the seed constructor leaves
-                            // it 0). The flow-cache hit path
-                            // (`stage_flow_cache_hit`) then re-counts every cached
-                            // packet against the same policy, so cacheable flows
-                            // count their full load — not just the first frame.
-                            entry.metadata.policy_counter_idx = flow_cache_policy_counter_idx;
-                            // #3322: stamp the reorder-stable bound handle so the
-                            // flow-cache hit path counts against the admitting
-                            // rule even after a live policy reorder.
-                            entry.metadata.policy_counter = flow_cache_policy_counter.clone();
-                            binding.flow.flow_cache.insert(entry);
-                        }
+                        // #6433: the seed/write half of the flow-cache contract
+                        // (the #1861 §5.4 refused-install gate, the
+                        // #3048/#3918/#5147 pre-resolve shard-epoch stamp, the
+                        // #3073/#3322 policy-counter stamps) is extracted to the
+                        // `flow_cache_seed` sibling — colocated with the read half
+                        // (`flow_cache_hit`) so the eviction invariants review as
+                        // one contract. Pure code-motion; `#[inline]` keeps the
+                        // body in this CGU.
+                        stage_flow_cache_seed(
+                            &mut binding.flow.flow_cache,
+                            &flow,
+                            meta,
+                            validation,
+                            decision,
+                            request_target_binding_index,
+                            flow_cache_owner_rg_id,
+                            session_ingress_zone,
+                            flow_cache_install_failed,
+                            flow_cache_policy_counter_idx,
+                            &flow_cache_policy_counter,
+                            filter_match_extra,
+                            ingress_zone_override,
+                            apply_nat_on_fabric,
+                            &neighbor_epoch_snapshot,
+                            worker_ctx,
+                        );
                         // ── End flow cache population ────────────────
                     } else {
                         telemetry.dbg.build_fail += 1;
@@ -4050,340 +4002,252 @@ pub(super) fn poll_binding_process_descriptor(
                             }
                         }
                         ForwardingDisposition::MissingNeighbor => {
-                            telemetry.dbg.missing_neigh += 1;
-                            // #919/#922: zero-allocation ID-native zone
-                            // resolution. Computed at the TOP of the arm so
-                            // the #1913 policy gate below can run BEFORE the
-                            // negative-cache fast-fail / resolver enqueue.
-                            //
-                            // #3021: resolve the LOGICAL ingress ifindex first
-                            // (see the ForwardCandidate arm above) so a VLAN
-                            // subinterface evaluates its OWN ingress zone, not
-                            // the parent's first-subinterface zone.
-                            let ingress_logical = resolve_ingress_logical_ifindex(
-                                worker_ctx.forwarding,
-                                meta.ingress_ifindex as i32,
-                                meta.ingress_vlan_id,
-                            )
-                            .unwrap_or(meta.ingress_ifindex as i32);
-                            let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
-                                worker_ctx.forwarding,
-                                ingress_logical,
-                                ingress_zone_override,
-                                decision.resolution.egress_ifindex,
-                            );
-                            // Borrow zone names as &str (no clone) for the
-                            // string-typed downstream NAT helpers.
-                            let from_zone: &str = worker_ctx
-                                .forwarding
-                                .zone_id_to_name
-                                .get(&from_zone_id)
-                                .map(|s| s.as_str())
-                                .unwrap_or("");
-                            let to_zone: &str = worker_ctx
-                                .forwarding
-                                .zone_id_to_name
-                                .get(&to_zone_id)
-                                .map(|s| s.as_str())
-                                .unwrap_or("");
-                            // #5174: the MissingNeighbor arm never ran NAT64
-                            // classification — that lives in the ForwardCandidate
-                            // session-miss branch (`nat64.allocate_source` ->
-                            // `decision.nat = Nat64State::forward_decision`), gated
-                            // on disposition==ForwardCandidate + Permit. So a NAT64
-                            // flow whose extracted-IPv4 next-hop is UNRESOLVED
-                            // reaches here with `decision.nat` still default
-                            // (rewrite_dst == None, nat64 == false): without this
-                            // its policy would evaluate on the SYNTHETIC IPv6 dst
-                            // and its seed/replay would forward the UNTRANSLATED
-                            // IPv6 frame to the IPv4 gateway. Re-classify the
-                            // destination (a cheap, pure dest-only lookup;
-                            // source-eligibility / RFC 6146 §3.5 hairpin was already
-                            // enforced by the pre-routing classify in the
-                            // session-miss block — which is exactly why the route
-                            // resolved to the IPv4 next-hop). `Some(dst_v4)` marks a
-                            // NAT64 MissingNeighbor flow: policy is matched on the
-                            // extracted IPv4 dst below (the #2358 cross-family
-                            // tuple), and a PERMITTED such flow is handled
-                            // fail-closed (probe + drop, NO seed/buffer) so it
-                            // recovers via the ForwardCandidate path once the
-                            // neighbor resolves. Full buffer-and-translate parity
-                            // (zero cold-start loss) is deferred to a follow-up —
-                            // the cross-family v6->v4 replay the cold-path lacks is
-                            // why this is fail-closed, not buffered.
-                            let nat64_dst_v4 = flow.as_ref().and_then(|f| {
-                                if decision.nat.rewrite_dst.is_some() {
-                                    return None;
-                                }
-                                match f.dst_ip {
-                                    IpAddr::V6(dst_v6) => {
-                                        match worker_ctx.forwarding.nat64.classify_ipv6_dest(dst_v6) {
-                                            crate::nat64::Nat64Match::MatchReady {
-                                                dst_v4,
-                                                ..
-                                            } => Some(dst_v4),
-                                            _ => None,
-                                        }
-                                    }
-                                    IpAddr::V4(_) => None,
-                                }
-                            });
-                            // #1913 (Codex r2/r3): evaluate policy for the
-                            // MissingNeighbor cold path BEFORE any forwarding
-                            // OR neighbor-resolution side-effect. The
-                            // MissingNeighbor arm has its OWN policy
-                            // evaluation (the main deny→PolicyDenied
-                            // conversion lives only in the ForwardCandidate
-                            // branch). A DENY must exit here so a denied flow
-                            // never enqueues the shared resolver / fires a
-                            // kernel ARP/NDP probe (network traffic for a
-                            // flow policy says to drop, repeated per packet
-                            // since denied frames are not buffered), never
-                            // runs the negative-cache fast-fail, never seeds
-                            // a session, never buffers in pending_neigh, and
-                            // never reaches the slow-path reinject gate.
-                            // `MissingNeighbor` is slow-path-eligible, so
-                            // without this conversion a denied unresolved-
-                            // neighbor cold-path packet was forwarded by the
-                            // kernel FIB (a zone-policy bypass). The cold-path
-                            // histogram samples this eval (session-install
-                            // slow path).
-                            if let Some(flow) = flow.as_ref() {
-                                let (cp_sample_tag, cp_t_in) = {
-                                    let cp = &mut binding.cold_path;
-                                    cp.sample_phase = cp.sample_phase.wrapping_add(1);
-                                    let tag =
-                                        (cp.sample_phase & worker_ctx.cold_path_sample_mask) == 0;
-                                    let t = if tag {
-                                        crate::afxdp::cold_path_hist::sample_tsc_start()
-                                    } else {
-                                        0
-                                    };
-                                    (tag, t)
-                                };
-                                // #2345: MissingNeighbor cold path must match
-                                // the SAME post-translation destination tuple as
-                                // the ForwardCandidate path above so a denied
-                                // (or permitted) verdict is identical whether or
-                                // not the next-hop neighbor is already resolved.
-                                // The session-miss block's `effective_resolution_target`
-                                // is out of scope here, so reconstruct the
-                                // post-translation dst tuple from the merged
-                                // `decision.nat`:
-                                //   - DNAT / static-DNAT / inbound NPTv6 each
-                                //     populate `decision.nat.rewrite_dst` (set at
-                                //     the decision build as `nptv6_nat.or(
-                                //     pre_routing_dnat)`), so the translated
-                                //     internal dst is used; only port-based DNAT
-                                //     also sets `rewrite_dst_port`.
-                                //   - NAT64 (#5174): `nat64_dst_v4` (computed at
-                                //     the top of this arm via `classify_ipv6_dest`)
-                                //     carries the extracted IPv4 destination when
-                                //     the flow is a NAT64 MissingNeighbor flow, so
-                                //     policy matches the SAME post-translation
-                                //     (V6 src, V4 dst) tuple the ForwardCandidate
-                                //     path matches (#2358) instead of the synthetic
-                                //     IPv6 dst. `decision.nat.rewrite_dst` is still
-                                //     None in this arm (the NAT64 forward decision
-                                //     is built only in the ForwardCandidate branch),
-                                //     which is why the extracted dst is recovered
-                                //     from a fresh classify rather than the merged
-                                //     `decision.nat`.
-                                // Both halves fall back to the original dst/port
-                                // when no inbound destination translation applies.
-                                let policy_dst_ip = match nat64_dst_v4 {
-                                    Some(dst_v4) => IpAddr::V4(dst_v4),
-                                    None => decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
-                                };
-                                let policy_dst_port = decision
-                                    .nat
-                                    .rewrite_dst_port
-                                    .unwrap_or(flow.forward_key.dst_port);
-                                // #3020: same ICMP type/code extraction as the
-                                // ForwardCandidate path so a denied/permitted
-                                // verdict for an icmp-type-constrained term
-                                // (junos-ping) is identical whether or not the
-                                // next-hop neighbor is already resolved.
-                                let policy_icmp = policy_packet_icmp(packet_frame, meta);
-                                let policy_result = evaluate_policy_result_with_icmp(
-                                    &worker_ctx.forwarding.policy,
-                                    from_zone_id,
-                                    to_zone_id,
-                                    flow.src_ip,
-                                    policy_dst_ip,
-                                    flow.forward_key.protocol,
-                                    flow.forward_key.src_port,
-                                    policy_dst_port,
-                                    policy_icmp,
-                                    desc.len as u64,
+                            // #6432: the arm's recycle-exactly-once invariant is
+                            // encoded in the proven poll_stages::StageOutcome
+                            // ownership enum instead of five hand-maintained
+                            // `scratch_recycle.push + continue` pairs. Every
+                            // terminal path of the arm produces the outcome and
+                            // the SINGLE push + continue lives at the consumer
+                            // below, so a future exit added to the arm cannot
+                            // forget (or duplicate) the recycle. `Continue(())`
+                            // falls through to the shared epilogue with
+                            // `recycle_now` still owned by the caller (the
+                            // pending_neigh buffer branch sets it false when it
+                            // takes the frame).
+                            let missing_neighbor_outcome: StageOutcome<()> = 'missing_neighbor: {
+                                telemetry.dbg.missing_neigh += 1;
+                                // #919/#922: zero-allocation ID-native zone
+                                // resolution. Computed at the TOP of the arm so
+                                // the #1913 policy gate below can run BEFORE the
+                                // negative-cache fast-fail / resolver enqueue.
+                                //
+                                // #3021: resolve the LOGICAL ingress ifindex first
+                                // (see the ForwardCandidate arm above) so a VLAN
+                                // subinterface evaluates its OWN ingress zone, not
+                                // the parent's first-subinterface zone.
+                                let ingress_logical = resolve_ingress_logical_ifindex(
+                                    worker_ctx.forwarding,
+                                    meta.ingress_ifindex as i32,
+                                    meta.ingress_vlan_id,
+                                )
+                                .unwrap_or(meta.ingress_ifindex as i32);
+                                let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
+                                    worker_ctx.forwarding,
+                                    ingress_logical,
+                                    ingress_zone_override,
+                                    decision.resolution.egress_ifindex,
                                 );
-                                if cp_sample_tag {
-                                    let t_out = crate::afxdp::cold_path_hist::sample_tsc_end();
-                                    let q32 = binding.cold_path.ns_per_tsc_q32;
-                                    if q32 != 0 {
-                                        let delta_tsc = t_out.saturating_sub(cp_t_in);
-                                        let raw_ns =
-                                            ((delta_tsc as u128 * q32 as u128) >> 32) as u64;
-                                        let baseline = binding.cold_path.wrapper_ns_baseline;
-                                        let delta_ns = if raw_ns < baseline {
-                                            binding.cold_path.wrapper_underflow_count = binding
-                                                .cold_path
-                                                .wrapper_underflow_count
-                                                .saturating_add(1);
-                                            0
-                                        } else {
-                                            raw_ns - baseline
-                                        };
-                                        if let Some(slot) =
-                                            crate::afxdp::cold_path_hist::lookup_slot(
-                                                &worker_ctx.forwarding.cold_path_slot_map,
-                                                from_zone_id,
-                                                to_zone_id,
-                                            )
-                                        {
-                                            binding.cold_path.record_sample(
-                                                slot,
-                                                from_zone_id,
-                                                to_zone_id,
-                                                delta_ns,
-                                            );
-                                        }
+                                // Borrow zone names as &str (no clone) for the
+                                // string-typed downstream NAT helpers.
+                                let from_zone: &str = worker_ctx
+                                    .forwarding
+                                    .zone_id_to_name
+                                    .get(&from_zone_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                let to_zone: &str = worker_ctx
+                                    .forwarding
+                                    .zone_id_to_name
+                                    .get(&to_zone_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                // #5174: the MissingNeighbor arm never ran NAT64
+                                // classification — that lives in the ForwardCandidate
+                                // session-miss branch (`nat64.allocate_source` ->
+                                // `decision.nat = Nat64State::forward_decision`), gated
+                                // on disposition==ForwardCandidate + Permit. So a NAT64
+                                // flow whose extracted-IPv4 next-hop is UNRESOLVED
+                                // reaches here with `decision.nat` still default
+                                // (rewrite_dst == None, nat64 == false): without this
+                                // its policy would evaluate on the SYNTHETIC IPv6 dst
+                                // and its seed/replay would forward the UNTRANSLATED
+                                // IPv6 frame to the IPv4 gateway. Re-classify the
+                                // destination (a cheap, pure dest-only lookup;
+                                // source-eligibility / RFC 6146 §3.5 hairpin was already
+                                // enforced by the pre-routing classify in the
+                                // session-miss block — which is exactly why the route
+                                // resolved to the IPv4 next-hop). `Some(dst_v4)` marks a
+                                // NAT64 MissingNeighbor flow: policy is matched on the
+                                // extracted IPv4 dst below (the #2358 cross-family
+                                // tuple), and a PERMITTED such flow is handled
+                                // fail-closed (probe + drop, NO seed/buffer) so it
+                                // recovers via the ForwardCandidate path once the
+                                // neighbor resolves. Full buffer-and-translate parity
+                                // (zero cold-start loss) is deferred to a follow-up —
+                                // the cross-family v6->v4 replay the cold-path lacks is
+                                // why this is fail-closed, not buffered.
+                                let nat64_dst_v4 = flow.as_ref().and_then(|f| {
+                                    if decision.nat.rewrite_dst.is_some() {
+                                        return None;
                                     }
-                                }
-                                if !matches!(policy_result.action, PolicyAction::Permit) {
-                                    let owner_rg_id = owner_rg_for_resolution(
-                                        worker_ctx.forwarding,
-                                        decision.resolution,
-                                    );
-                                    // #2089/#3071/#3615: enqueue the deny/reject
-                                    // reply FIRST, then emit the policy-deny
-                                    // RT_FLOW with the TRUTHFUL action (a `reject`
-                                    // whose reply fail-closes is logged as DENY,
-                                    // not REJECT). `decision.nat` carries the
-                                    // inbound dst translation (#2345/#3058); the
-                                    // AppID is resolved from the POST-translation
-                                    // dst port (#2520/#3058).
-                                    deny_reply_and_emit(
-                                        &mut binding.tx_pipeline,
-                                        worker_ctx.forwarding,
-                                        worker_ctx.event_stream,
-                                        binding.ifindex,
-                                        packet_frame,
-                                        meta,
-                                        flow,
-                                        telemetry.counters,
-                                        &decision.nat,
+                                    match f.dst_ip {
+                                        IpAddr::V6(dst_v6) => {
+                                            match worker_ctx.forwarding.nat64.classify_ipv6_dest(dst_v6) {
+                                                crate::nat64::Nat64Match::MatchReady {
+                                                    dst_v4,
+                                                    ..
+                                                } => Some(dst_v4),
+                                                _ => None,
+                                            }
+                                        }
+                                        IpAddr::V4(_) => None,
+                                    }
+                                });
+                                // #1913 (Codex r2/r3): evaluate policy for the
+                                // MissingNeighbor cold path BEFORE any forwarding
+                                // OR neighbor-resolution side-effect. The
+                                // MissingNeighbor arm has its OWN policy
+                                // evaluation (the main deny→PolicyDenied
+                                // conversion lives only in the ForwardCandidate
+                                // branch). A DENY must exit here so a denied flow
+                                // never enqueues the shared resolver / fires a
+                                // kernel ARP/NDP probe (network traffic for a
+                                // flow policy says to drop, repeated per packet
+                                // since denied frames are not buffered), never
+                                // runs the negative-cache fast-fail, never seeds
+                                // a session, never buffers in pending_neigh, and
+                                // never reaches the slow-path reinject gate.
+                                // `MissingNeighbor` is slow-path-eligible, so
+                                // without this conversion a denied unresolved-
+                                // neighbor cold-path packet was forwarded by the
+                                // kernel FIB (a zone-policy bypass). The cold-path
+                                // histogram samples this eval (session-install
+                                // slow path).
+                                if let Some(flow) = flow.as_ref() {
+                                    let (cp_sample_tag, cp_t_in) = {
+                                        let cp = &mut binding.cold_path;
+                                        cp.sample_phase = cp.sample_phase.wrapping_add(1);
+                                        let tag =
+                                            (cp.sample_phase & worker_ctx.cold_path_sample_mask) == 0;
+                                        let t = if tag {
+                                            crate::afxdp::cold_path_hist::sample_tsc_start()
+                                        } else {
+                                            0
+                                        };
+                                        (tag, t)
+                                    };
+                                    // #2345: MissingNeighbor cold path must match
+                                    // the SAME post-translation destination tuple as
+                                    // the ForwardCandidate path above so a denied
+                                    // (or permitted) verdict is identical whether or
+                                    // not the next-hop neighbor is already resolved.
+                                    // The session-miss block's `effective_resolution_target`
+                                    // is out of scope here, so reconstruct the
+                                    // post-translation dst tuple from the merged
+                                    // `decision.nat`:
+                                    //   - DNAT / static-DNAT / inbound NPTv6 each
+                                    //     populate `decision.nat.rewrite_dst` (set at
+                                    //     the decision build as `nptv6_nat.or(
+                                    //     pre_routing_dnat)`), so the translated
+                                    //     internal dst is used; only port-based DNAT
+                                    //     also sets `rewrite_dst_port`.
+                                    //   - NAT64 (#5174): `nat64_dst_v4` (computed at
+                                    //     the top of this arm via `classify_ipv6_dest`)
+                                    //     carries the extracted IPv4 destination when
+                                    //     the flow is a NAT64 MissingNeighbor flow, so
+                                    //     policy matches the SAME post-translation
+                                    //     (V6 src, V4 dst) tuple the ForwardCandidate
+                                    //     path matches (#2358) instead of the synthetic
+                                    //     IPv6 dst. `decision.nat.rewrite_dst` is still
+                                    //     None in this arm (the NAT64 forward decision
+                                    //     is built only in the ForwardCandidate branch),
+                                    //     which is why the extracted dst is recovered
+                                    //     from a fresh classify rather than the merged
+                                    //     `decision.nat`.
+                                    // Both halves fall back to the original dst/port
+                                    // when no inbound destination translation applies.
+                                    let policy_dst_ip = match nat64_dst_v4 {
+                                        Some(dst_v4) => IpAddr::V4(dst_v4),
+                                        None => decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
+                                    };
+                                    let policy_dst_port = decision
+                                        .nat
+                                        .rewrite_dst_port
+                                        .unwrap_or(flow.forward_key.dst_port);
+                                    // #3020: same ICMP type/code extraction as the
+                                    // ForwardCandidate path so a denied/permitted
+                                    // verdict for an icmp-type-constrained term
+                                    // (junos-ping) is identical whether or not the
+                                    // next-hop neighbor is already resolved.
+                                    let policy_icmp = policy_packet_icmp(packet_frame, meta);
+                                    let policy_result = evaluate_policy_result_with_icmp(
+                                        &worker_ctx.forwarding.policy,
                                         from_zone_id,
                                         to_zone_id,
-                                        owner_rg_id,
-                                        policy_result.policy_id,
-                                        policy_result.action,
-                                        resolve_policy_deny_app_id(
-                                            &worker_ctx.forwarding.app_catalog,
-                                            flow,
-                                            policy_dst_port,
-                                        ),
-                                        now_ns,
+                                        flow.src_ip,
+                                        policy_dst_ip,
+                                        flow.forward_key.protocol,
+                                        flow.forward_key.src_port,
+                                        policy_dst_port,
+                                        policy_icmp,
+                                        desc.len as u64,
                                     );
-                                    telemetry.dbg.policy_deny += 1;
-                                    decision.resolution.disposition =
-                                        ForwardingDisposition::PolicyDenied;
-                                    record_forwarding_disposition(
-                                        &worker_ctx.ident,
-                                        DispositionCounters::Hot(telemetry.counters),
-                                        decision.resolution,
-                                        desc.len as u32,
-                                        Some(meta),
-                                        debug.as_ref(),
-                                        worker_ctx.recent_exceptions,
-                                        worker_ctx.last_resolution,
-                                        worker_ctx.forwarding,
-                                    );
-                                    binding.scratch.scratch_recycle.push(desc.addr);
-                                    continue;
-                                }
-                            } else {
-                                // #4024: a FLOWLESS packet (non-first fragment /
-                                // no-L4) that resolves to MissingNeighbor still
-                                // carries FULL L3 identity — src/dst/protocol/
-                                // ingress+egress zones — so it MUST pass the zone
-                                // security policy BEFORE any neighbor-resolution
-                                // side-effect (neg-cache probe, #1769 resolver
-                                // enqueue, kernel ARP/NDP probe, pending_neigh
-                                // buffer) OR the trailing slow-path reinject.
-                                //
-                                // Before #4024 the flowless case fell through
-                                // here to the reinject path (documented as
-                                // "preserving the pre-#1913 behavior — a flowless
-                                // MissingNeighbor packet was always slow-path-
-                                // eligible"). That FAILED OPEN: under a `deny-all`
-                                // zone pair, a flowless fragment whose next-hop
-                                // neighbor was unresolved was FIB-reinjected and
-                                // the kernel forwarded it — a zone-policy bypass.
-                                // #3291 enforces zone policy on the flowless
-                                // ForwardCandidate arm but deferred MissingNeighbor
-                                // to "its own cold-path arm" (this one), whose
-                                // #1913 gate is `if let Some(flow)` and so never
-                                // fired for a flowless (flow == None) packet.
-                                //
-                                // `l3_session_flow_from_meta` rebuilds the L3
-                                // tuple the shim stamped even for a fragment; the
-                                // synthetic flow is evaluated with ports = 0 /
-                                // l4_present = false, so port-bearing application
-                                // terms fail closed while address/protocol/`any`
-                                // still match — parity with the #3291 flowless
-                                // ForwardCandidate gate and the #1913 flow-backed
-                                // gate above, with no over-gating of a permitted
-                                // flowless flow. `from_zone_id`/`to_zone_id` were
-                                // resolved at the top of this arm (MissingNeighbor
-                                // has a valid egress_ifindex). A deny is a SILENT
-                                // drop — a fragment has no L4 header to synthesize
-                                // a reject from — with a PolicyDeny event for
-                                // observability, then PolicyDenied so the trailing
-                                // #1913 reinject chokepoint drops it fail-closed.
-                                if let Some(l3_flow) =
-                                    crate::afxdp::frame::l3_session_flow_from_meta(meta)
-                                {
-                                    let policy_icmp = policy_packet_icmp(packet_frame, meta);
-                                    let policy_result =
-                                        crate::policy::evaluate_policy_result_l3_aware(
-                                            &worker_ctx.forwarding.policy,
-                                            from_zone_id,
-                                            to_zone_id,
-                                            l3_flow.src_ip,
-                                            l3_flow.dst_ip,
-                                            meta.protocol,
-                                            0,
-                                            0,
-                                            policy_icmp,
-                                            desc.len as u64,
-                                            // L4 header ABSENT — port-bearing app
-                                            // terms fail closed.
-                                            false,
-                                        );
+                                    if cp_sample_tag {
+                                        let t_out = crate::afxdp::cold_path_hist::sample_tsc_end();
+                                        let q32 = binding.cold_path.ns_per_tsc_q32;
+                                        if q32 != 0 {
+                                            let delta_tsc = t_out.saturating_sub(cp_t_in);
+                                            let raw_ns =
+                                                ((delta_tsc as u128 * q32 as u128) >> 32) as u64;
+                                            let baseline = binding.cold_path.wrapper_ns_baseline;
+                                            let delta_ns = if raw_ns < baseline {
+                                                binding.cold_path.wrapper_underflow_count = binding
+                                                    .cold_path
+                                                    .wrapper_underflow_count
+                                                    .saturating_add(1);
+                                                0
+                                            } else {
+                                                raw_ns - baseline
+                                            };
+                                            if let Some(slot) =
+                                                crate::afxdp::cold_path_hist::lookup_slot(
+                                                    &worker_ctx.forwarding.cold_path_slot_map,
+                                                    from_zone_id,
+                                                    to_zone_id,
+                                                )
+                                            {
+                                                binding.cold_path.record_sample(
+                                                    slot,
+                                                    from_zone_id,
+                                                    to_zone_id,
+                                                    delta_ns,
+                                                );
+                                            }
+                                        }
+                                    }
                                     if !matches!(policy_result.action, PolicyAction::Permit) {
                                         let owner_rg_id = owner_rg_for_resolution(
                                             worker_ctx.forwarding,
                                             decision.resolution,
                                         );
-                                        emit_policy_deny_event(
+                                        // #2089/#3071/#3615: enqueue the deny/reject
+                                        // reply FIRST, then emit the policy-deny
+                                        // RT_FLOW with the TRUTHFUL action (a `reject`
+                                        // whose reply fail-closes is logged as DENY,
+                                        // not REJECT). `decision.nat` carries the
+                                        // inbound dst translation (#2345/#3058); the
+                                        // AppID is resolved from the POST-translation
+                                        // dst port (#2520/#3058).
+                                        deny_reply_and_emit(
+                                            &mut binding.tx_pipeline,
+                                            worker_ctx.forwarding,
                                             worker_ctx.event_stream,
-                                            &l3_flow,
-                                            &decision.nat,
+                                            binding.ifindex,
+                                            packet_frame,
                                             meta,
+                                            flow,
+                                            telemetry.counters,
+                                            &decision.nat,
                                             from_zone_id,
                                             to_zone_id,
                                             owner_rg_id,
                                             policy_result.policy_id,
                                             policy_result.action,
-                                            // No L4 port for a flowless packet →
-                                            // no AppID.
-                                            0,
-                                            // #3615: a flowless deny is ALWAYS a
-                                            // silent drop — no reply can be
-                                            // synthesized — so a `reject` term
-                                            // logs the truthful DENY.
-                                            false,
+                                            resolve_policy_deny_app_id(
+                                                &worker_ctx.forwarding.app_catalog,
+                                                flow,
+                                                policy_dst_port,
+                                            ),
                                             now_ns,
                                         );
                                         telemetry.dbg.policy_deny += 1;
@@ -4400,721 +4264,827 @@ pub(super) fn poll_binding_process_descriptor(
                                             worker_ctx.last_resolution,
                                             worker_ctx.forwarding,
                                         );
-                                        binding.scratch.scratch_recycle.push(desc.addr);
-                                        continue;
+                                        break 'missing_neighbor StageOutcome::RecycleAndContinue;
                                     }
-                                }
-                                // Flowless permit (or no derivable L3 tuple):
-                                // fall through to the negative-cache / probe /
-                                // reinject path. A permitted flowless fragment is
-                                // legitimately forwarded once the neighbor
-                                // resolves — `MissingNeighbor` stays slow-path-
-                                // eligible for it.
-                            }
-                            // #1651 B3: dead-host fast-fail gate. Runs at
-                            // the very top of the MissingNeighbor arm,
-                            // BEFORE the kernel probe, session seed, and
-                            // pending_neigh buffer, so a dead host never
-                            // consumes a queue slot, fires a probe, or
-                            // creates a MissingNeighborSeed session.
-                            //
-                            // Resolved-neighbor-wins (RTM_NEWNEIGH
-                            // invalidation): check static then dynamic
-                            // neighbors FIRST (same order as
-                            // retry_pending_neigh / lookup_neighbor_entry).
-                            // If the dst is now resolved, drop any stale
-                            // negative entry and fall through to normal
-                            // forwarding. Otherwise, if it is still
-                            // negatively cached + un-expired, recycle the
-                            // frame immediately.
-                            // #1912: key the OUTER-hop neighbor
-                            // resolution side-effects (ARP/NDP probe,
-                            // #1769 resolver enqueue, neg-cache,
-                            // resolved-wins, already-probing dedup) by the
-                            // OUTER transport's L3 egress ifindex, not the
-                            // tunnel logical ifindex. For a non-tunnel
-                            // resolution this equals
-                            // decision.resolution.egress_ifindex so the
-                            // path is byte-identical; for a tunnel-marked
-                            // decision (next_hop = outer hop) it is the
-                            // outer transport egress where the outer
-                            // neighbor is actually keyed (a VLAN outer
-                            // transport keys on the L3 subif, not the VLAN
-                            // parent / tx_ifindex). Computed once per cold
-                            // packet on this arm.
-                            let neigh_if = outer_neighbor_ifindex(
-                                worker_ctx.forwarding,
-                                Some(worker_ctx.dynamic_neighbors),
-                                &decision.resolution,
-                            );
-                            if let Some(next_hop) = decision.resolution.next_hop {
-                                let neg_key = (neigh_if, next_hop);
-                                // neg_neigh_gate runs the resolved-wins
-                                // probe (static neighbors THEN dynamic,
-                                // same order as retry_pending_neigh /
-                                // lookup_neighbor_entry) and the TTL check.
-                                // Returns true ⇒ fast-fail this packet.
-                                let fast_fail = neg_neigh_gate(
-                                    &mut binding.neg_neigh_cache,
-                                    &neg_key,
-                                    now_ns,
-                                    || {
-                                        worker_ctx.forwarding.neighbors.contains_key(&neg_key)
-                                            || worker_ctx.dynamic_neighbors.get(&neg_key).is_some()
-                                    },
-                                );
-                                if fast_fail {
-                                    telemetry.dbg.neg_neigh_fast_fail += 1;
-                                    // #1782: promote the debug counter to a
-                                    // real per-binding atomic so the
-                                    // cold-start capture can read it from
-                                    // Prometheus. Single Relaxed fetch_add
-                                    // on the existing discard path — no new
-                                    // hot-path work, no behavior change.
-                                    binding
-                                        .live
-                                        .neg_neigh_fast_fail
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    // #1769: the negative gate suppresses
-                                    // the probe + buffer below, so a dst
-                                    // that lost its dynamic entry (transient
-                                    // FAILED/DELNEIGH or a dropped good
-                                    // RTM_NEWNEIGH) would blackhole for the
-                                    // full 3s TTL with nothing nudging it
-                                    // back. Route it through the shared
-                                    // resolver: a single-key RTM_GETNEIGH
-                                    // off the hot path caches a confirmed
-                                    // REACHABLE/PERMANENT lladdr (epoch-
-                                    // guarded) or probes to force kernel
-                                    // revalidation on a DELAY/STALE one.
-                                    // Per-key rate-limited in the resolver
-                                    // thread, so a SYN storm fires at most
-                                    // one GET/probe per key per window. The
-                                    // hot path only pays a non-blocking
-                                    // try_send here (not per-packet — this
-                                    // arm fires only on the negative fast-
-                                    // fail).
-                                    // Per-key rate-limited (the resolver
-                                    // coalesces per-key anyway) so a
-                                    // dead-host SYN storm does NOT clone +
-                                    // try_send per fast-failed packet. See
-                                    // try_enqueue_resolver.
-                                    if let Some(resolver) = worker_ctx.neighbor_resolver {
-                                        try_enqueue_resolver(
-                                            resolver,
-                                            &mut binding.resolver_enqueue_throttle,
-                                            &worker_ctx.forwarding.ifindex_to_name,
-                                            neg_key,
-                                            now_ns,
-                                        );
-                                    }
-                                    // Fresh RX descriptor → recycle via
-                                    // scratch_recycle + continue, matching
-                                    // the source-NAT-failure discard
-                                    // pattern. The continue skips the
-                                    // recycle_now epilogue and the
-                                    // session-seed/buffer below.
-                                    binding.scratch.scratch_recycle.push(desc.addr);
-                                    continue;
-                                }
-                            }
-                            // Send ARP/NDP solicitation via RAW socket (not XSK)
-                            // so the reply goes through the kernel's normal RX
-                            // path (cpumap_or_pass), bypassing XSK fill ring issues.
-                            // Also reinject original packet to slow-path for kernel
-                            // to forward once the neighbor is resolved.
-                            // Trigger ARP/NDP resolution via kernel netlink.
-                            // Adding an INCOMPLETE neighbor entry makes the
-                            // kernel send its own ARP/NDP solicitation through
-                            // the normal stack, which correctly handles VLAN
-                            // tagging and TX offload. The netlink monitor then
-                            // picks up the resolved entry instantly.
-                            if let Some(next_hop) = decision.resolution.next_hop {
-                                // #1912: tunnel-marked decisions are NEVER
-                                // buffered in pending_neigh (R-E), and the
-                                // per-hop neg-cache arms only on a
-                                // pending_neigh timeout (neighbor_dispatch.rs
-                                // neg_neigh_record), so for an unresolved
-                                // OUTER hop the top-of-arm neg fast-fail can
-                                // never arm and suppress this block. The
-                                // outer-hop probe + resolver are therefore
-                                // gated by the per-(neigh_if, next_hop)
-                                // resolver_enqueue_throttle window below.
-                                //
-                                // outer_if_distinct: true only when this is a
-                                // tunnel decision whose outer transport
-                                // RESOLVED to a real L3 egress distinct from
-                                // the tunnel logical ifindex. If
-                                // outer_neighbor_ifindex fell back to
-                                // egress_ifindex (endpoint vanished / outer
-                                // egress <= 0 — unreachable within the
-                                // single-threaded worker loop, but explicit),
-                                // neigh_if == egress_ifindex == tunnel logical;
-                                // probing / RTM_GETNEIGH on the GRE logical
-                                // iface is the useless pre-#1912 behavior, so
-                                // skip it (Copilot #1912 r1 Low).
-                                let tunnel_marked = decision.resolution.tunnel_endpoint_id != 0;
-                                let outer_if_distinct = tunnel_marked
-                                    && neigh_if > 0
-                                    && neigh_if != decision.resolution.egress_ifindex;
-                                let throttle_key = (neigh_if, next_hop);
-                                // For a tunnel decision, gate BOTH the kernel
-                                // ARP probe AND the resolver enqueue behind
-                                // ONE throttle window so a SYN flood to a
-                                // flushed outer hop fires at most one
-                                // probe + enqueue per outer key per window
-                                // (else trigger_kernel_arp_probe — a raw
-                                // socket open/setsockopt/sendto/close — would
-                                // run per packet; AGY #1912 r1 High).
-                                let tunnel_throttled = outer_if_distinct
-                                    && matches!(
-                                        binding
-                                            .resolver_enqueue_throttle
-                                            .get(&throttle_key),
-                                        Some(&t) if now_ns.saturating_sub(t)
-                                            < RESOLVER_ENQUEUE_THROTTLE_NS
-                                    );
-                                // Only spawn ping if we don't already have a
-                                // pending probe for this (ifindex, hop).
-                                // #1771 §2.2: pending_neigh is keyed by
-                                // (egress_ifindex, next_hop), so the
-                                // "already probing this hop" dedup is a
-                                // direct contains_key (was an O(n) iter scan).
-                                // #1912: dedup + iface lookup on the OUTER
-                                // L3 egress (neigh_if), not the tunnel
-                                // logical ifindex. For a non-tunnel flow
-                                // neigh_if == egress_ifindex so the dedup is
-                                // byte-identical; for a tunnel flow
-                                // pending_neigh never holds the key (R-E), so
-                                // the per-window throttle is the probe-storm
-                                // bound instead.
-                                let already_probing =
-                                    binding.pending_neigh.contains_key(&(neigh_if, next_hop));
-                                // Suppress the probe for a tunnel decision
-                                // with NO distinct outer egress: neigh_if
-                                // would be the tunnel logical ifindex and the
-                                // probe would bind to the GRE iface (no ARP —
-                                // the useless pre-#1912 behavior). For a
-                                // non-tunnel flow tunnel_marked is false so
-                                // this never suppresses (byte-identical).
-                                let tunnel_without_outer = tunnel_marked && !outer_if_distinct;
-                                if !already_probing && !tunnel_throttled && !tunnel_without_outer {
-                                    let iface_name = worker_ctx
-                                        .forwarding
-                                        .ifindex_to_name
-                                        .get(&neigh_if)
-                                        .cloned();
-                                    if let Some(name) = iface_name {
-                                        // Fast path: ICMP socket triggers kernel ARP
-                                        // in microseconds (no fork/exec).
-                                        trigger_kernel_arp_probe(&name, neigh_if, next_hop);
-                                    }
-                                }
-                                // #1912: for a tunnel-marked MissingNeighbor
-                                // with a DISTINCT resolved outer egress (e.g.
-                                // GRE outer hop), ALSO drive the #1769
-                                // resolver on the OUTER L3 egress, not only on
-                                // the neg-cache fast-fail. A freshly-flushed
-                                // outer hop has no negative entry, so without
-                                // this only the one-shot kernel ARP probe
-                                // fires; the resolver hardens the STALE/DELAY
-                                // outer-entry case via RTM_GETNEIGH. The frame
-                                // is STILL NOT buffered (R-E), so no
-                                // plaintext-leak window opens. try_enqueue_-
-                                // resolver re-reads the SAME throttle entry
-                                // and bumps it once, so the probe above and
-                                // this enqueue share one window per key.
-                                if outer_if_distinct && !tunnel_throttled {
-                                    if let Some(resolver) = worker_ctx.neighbor_resolver {
-                                        try_enqueue_resolver(
-                                            resolver,
-                                            &mut binding.resolver_enqueue_throttle,
-                                            &worker_ctx.forwarding.ifindex_to_name,
-                                            throttle_key,
-                                            now_ns,
-                                        );
-                                    } else {
-                                        // No resolver (probe-only build): bump
-                                        // the throttle directly so the probe
-                                        // above is still rate-limited to one
-                                        // per window. Bounded like the neg
-                                        // cache.
-                                        let throttle = &mut binding.resolver_enqueue_throttle;
-                                        if throttle.len() >= MAX_NEG_NEIGH_CACHE
-                                            && !throttle.contains_key(&throttle_key)
-                                        {
-                                            throttle.clear();
+                                } else {
+                                    // #4024: a FLOWLESS packet (non-first fragment /
+                                    // no-L4) that resolves to MissingNeighbor still
+                                    // carries FULL L3 identity — src/dst/protocol/
+                                    // ingress+egress zones — so it MUST pass the zone
+                                    // security policy BEFORE any neighbor-resolution
+                                    // side-effect (neg-cache probe, #1769 resolver
+                                    // enqueue, kernel ARP/NDP probe, pending_neigh
+                                    // buffer) OR the trailing slow-path reinject.
+                                    //
+                                    // Before #4024 the flowless case fell through
+                                    // here to the reinject path (documented as
+                                    // "preserving the pre-#1913 behavior — a flowless
+                                    // MissingNeighbor packet was always slow-path-
+                                    // eligible"). That FAILED OPEN: under a `deny-all`
+                                    // zone pair, a flowless fragment whose next-hop
+                                    // neighbor was unresolved was FIB-reinjected and
+                                    // the kernel forwarded it — a zone-policy bypass.
+                                    // #3291 enforces zone policy on the flowless
+                                    // ForwardCandidate arm but deferred MissingNeighbor
+                                    // to "its own cold-path arm" (this one), whose
+                                    // #1913 gate is `if let Some(flow)` and so never
+                                    // fired for a flowless (flow == None) packet.
+                                    //
+                                    // `l3_session_flow_from_meta` rebuilds the L3
+                                    // tuple the shim stamped even for a fragment; the
+                                    // synthetic flow is evaluated with ports = 0 /
+                                    // l4_present = false, so port-bearing application
+                                    // terms fail closed while address/protocol/`any`
+                                    // still match — parity with the #3291 flowless
+                                    // ForwardCandidate gate and the #1913 flow-backed
+                                    // gate above, with no over-gating of a permitted
+                                    // flowless flow. `from_zone_id`/`to_zone_id` were
+                                    // resolved at the top of this arm (MissingNeighbor
+                                    // has a valid egress_ifindex). A deny is a SILENT
+                                    // drop — a fragment has no L4 header to synthesize
+                                    // a reject from — with a PolicyDeny event for
+                                    // observability, then PolicyDenied so the trailing
+                                    // #1913 reinject chokepoint drops it fail-closed.
+                                    if let Some(l3_flow) =
+                                        crate::afxdp::frame::l3_session_flow_from_meta(meta)
+                                    {
+                                        let policy_icmp = policy_packet_icmp(packet_frame, meta);
+                                        let policy_result =
+                                            crate::policy::evaluate_policy_result_l3_aware(
+                                                &worker_ctx.forwarding.policy,
+                                                from_zone_id,
+                                                to_zone_id,
+                                                l3_flow.src_ip,
+                                                l3_flow.dst_ip,
+                                                meta.protocol,
+                                                0,
+                                                0,
+                                                policy_icmp,
+                                                desc.len as u64,
+                                                // L4 header ABSENT — port-bearing app
+                                                // terms fail closed.
+                                                false,
+                                            );
+                                        if !matches!(policy_result.action, PolicyAction::Permit) {
+                                            let owner_rg_id = owner_rg_for_resolution(
+                                                worker_ctx.forwarding,
+                                                decision.resolution,
+                                            );
+                                            emit_policy_deny_event(
+                                                worker_ctx.event_stream,
+                                                &l3_flow,
+                                                &decision.nat,
+                                                meta,
+                                                from_zone_id,
+                                                to_zone_id,
+                                                owner_rg_id,
+                                                policy_result.policy_id,
+                                                policy_result.action,
+                                                // No L4 port for a flowless packet →
+                                                // no AppID.
+                                                0,
+                                                // #3615: a flowless deny is ALWAYS a
+                                                // silent drop — no reply can be
+                                                // synthesized — so a `reject` term
+                                                // logs the truthful DENY.
+                                                false,
+                                                now_ns,
+                                            );
+                                            telemetry.dbg.policy_deny += 1;
+                                            decision.resolution.disposition =
+                                                ForwardingDisposition::PolicyDenied;
+                                            record_forwarding_disposition(
+                                                &worker_ctx.ident,
+                                                DispositionCounters::Hot(telemetry.counters),
+                                                decision.resolution,
+                                                desc.len as u32,
+                                                Some(meta),
+                                                debug.as_ref(),
+                                                worker_ctx.recent_exceptions,
+                                                worker_ctx.last_resolution,
+                                                worker_ctx.forwarding,
+                                            );
+                                            break 'missing_neighbor StageOutcome::RecycleAndContinue;
                                         }
-                                        throttle.insert(throttle_key, now_ns);
+                                    }
+                                    // Flowless permit (or no derivable L3 tuple):
+                                    // fall through to the negative-cache / probe /
+                                    // reinject path. A permitted flowless fragment is
+                                    // legitimately forwarded once the neighbor
+                                    // resolves — `MissingNeighbor` stays slow-path-
+                                    // eligible for it.
+                                }
+                                // #1651 B3: dead-host fast-fail gate. Runs at
+                                // the very top of the MissingNeighbor arm,
+                                // BEFORE the kernel probe, session seed, and
+                                // pending_neigh buffer, so a dead host never
+                                // consumes a queue slot, fires a probe, or
+                                // creates a MissingNeighborSeed session.
+                                //
+                                // Resolved-neighbor-wins (RTM_NEWNEIGH
+                                // invalidation): check static then dynamic
+                                // neighbors FIRST (same order as
+                                // retry_pending_neigh / lookup_neighbor_entry).
+                                // If the dst is now resolved, drop any stale
+                                // negative entry and fall through to normal
+                                // forwarding. Otherwise, if it is still
+                                // negatively cached + un-expired, recycle the
+                                // frame immediately.
+                                // #1912: key the OUTER-hop neighbor
+                                // resolution side-effects (ARP/NDP probe,
+                                // #1769 resolver enqueue, neg-cache,
+                                // resolved-wins, already-probing dedup) by the
+                                // OUTER transport's L3 egress ifindex, not the
+                                // tunnel logical ifindex. For a non-tunnel
+                                // resolution this equals
+                                // decision.resolution.egress_ifindex so the
+                                // path is byte-identical; for a tunnel-marked
+                                // decision (next_hop = outer hop) it is the
+                                // outer transport egress where the outer
+                                // neighbor is actually keyed (a VLAN outer
+                                // transport keys on the L3 subif, not the VLAN
+                                // parent / tx_ifindex). Computed once per cold
+                                // packet on this arm.
+                                let neigh_if = outer_neighbor_ifindex(
+                                    worker_ctx.forwarding,
+                                    Some(worker_ctx.dynamic_neighbors),
+                                    &decision.resolution,
+                                );
+                                if let Some(next_hop) = decision.resolution.next_hop {
+                                    let neg_key = (neigh_if, next_hop);
+                                    // neg_neigh_gate runs the resolved-wins
+                                    // probe (static neighbors THEN dynamic,
+                                    // same order as retry_pending_neigh /
+                                    // lookup_neighbor_entry) and the TTL check.
+                                    // Returns true ⇒ fast-fail this packet.
+                                    let fast_fail = neg_neigh_gate(
+                                        &mut binding.neg_neigh_cache,
+                                        &neg_key,
+                                        now_ns,
+                                        || {
+                                            worker_ctx.forwarding.neighbors.contains_key(&neg_key)
+                                                || worker_ctx.dynamic_neighbors.get(&neg_key).is_some()
+                                        },
+                                    );
+                                    if fast_fail {
+                                        telemetry.dbg.neg_neigh_fast_fail += 1;
+                                        // #1782: promote the debug counter to a
+                                        // real per-binding atomic so the
+                                        // cold-start capture can read it from
+                                        // Prometheus. Single Relaxed fetch_add
+                                        // on the existing discard path — no new
+                                        // hot-path work, no behavior change.
+                                        binding
+                                            .live
+                                            .neg_neigh_fast_fail
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        // #1769: the negative gate suppresses
+                                        // the probe + buffer below, so a dst
+                                        // that lost its dynamic entry (transient
+                                        // FAILED/DELNEIGH or a dropped good
+                                        // RTM_NEWNEIGH) would blackhole for the
+                                        // full 3s TTL with nothing nudging it
+                                        // back. Route it through the shared
+                                        // resolver: a single-key RTM_GETNEIGH
+                                        // off the hot path caches a confirmed
+                                        // REACHABLE/PERMANENT lladdr (epoch-
+                                        // guarded) or probes to force kernel
+                                        // revalidation on a DELAY/STALE one.
+                                        // Per-key rate-limited in the resolver
+                                        // thread, so a SYN storm fires at most
+                                        // one GET/probe per key per window. The
+                                        // hot path only pays a non-blocking
+                                        // try_send here (not per-packet — this
+                                        // arm fires only on the negative fast-
+                                        // fail).
+                                        // Per-key rate-limited (the resolver
+                                        // coalesces per-key anyway) so a
+                                        // dead-host SYN storm does NOT clone +
+                                        // try_send per fast-failed packet. See
+                                        // try_enqueue_resolver.
+                                        if let Some(resolver) = worker_ctx.neighbor_resolver {
+                                            try_enqueue_resolver(
+                                                resolver,
+                                                &mut binding.resolver_enqueue_throttle,
+                                                &worker_ctx.forwarding.ifindex_to_name,
+                                                neg_key,
+                                                now_ns,
+                                            );
+                                        }
+                                        // Fresh RX descriptor → recycle via
+                                        // scratch_recycle + continue, matching
+                                        // the source-NAT-failure discard
+                                        // pattern. The continue skips the
+                                        // recycle_now epilogue and the
+                                        // session-seed/buffer below.
+                                        break 'missing_neighbor StageOutcome::RecycleAndContinue;
                                     }
                                 }
-                            }
-                            // #5174: NAT64 MissingNeighbor fail-closed. The kernel
-                            // ARP/NDP probe above already fired for the extracted
-                            // IPv4 next-hop (so the neighbor will resolve), but the
-                            // cold-path seed + pending_neigh replay is SAME-FAMILY
-                            // only — the replay `rewrite_forwarded_frame_in_place`
-                            // does MAC/VLAN/NAT, NOT the v6->v4 cross-family NAT64
-                            // rebuild. Seeding a plain-forward decision + buffering
-                            // the IPv6 frame here would therefore TX the UNTRANSLATED
-                            // IPv6 frame to the IPv4 gateway AND persist a broken,
-                            // HA-synced `MissingNeighborSeed` session that poisons
-                            // every subsequent packet (session-hit → non-NAT64
-                            // decision). Drop this cold-start packet instead; the
-                            // flow forwards correctly via the ForwardCandidate path
-                            // (which builds the real NAT64 translation) on a later
-                            // packet once the neighbor is resolved. Only a PERMITTED
-                            // flow reaches here — a NAT64 deny already exited above
-                            // with the normal PolicyDenied disposition, so this
-                            // never probe-loops a denied flow. Buffer-and-translate
-                            // parity (zero cold-start loss) is a deferred follow-up.
-                            if nat64_dst_v4.is_some() {
-                                telemetry.dbg.nat64_missing_neigh_drop += 1;
-                                binding.scratch.scratch_recycle.push(desc.addr);
-                                continue;
-                            }
-                            // Create the session NOW so the SYN-ACK (reverse
-                            // direction) finds the forward NAT match and creates
-                            // a reverse session. Without this, the SYN-ACK hits
-                            // session miss → policy deny (no rule for WAN→LAN).
-                            let mut pending_decision = decision;
-                            let mut source_nat_release_key = None;
-                            // #2218: matched SNAT/static-SNAT rule counter
-                            // for the seeded translated flow; incremented at
-                            // the committed seed install below.
-                            let mut source_nat_counter: Option<
-                                std::sync::Arc<crate::nat::NatRuleCounter>,
-                            > = None;
-                            // #1861 §5.3: true when the seed install was
-                            // ATTEMPTED and refused (max_sessions). Gates
-                            // the pending-neighbor buffering below: a
-                            // refused seed's SNAT allocation was rolled
-                            // back, so replaying the buffered frame after
-                            // neighbor resolution would forward it on an
-                            // unreserved NAT tuple with no session. Flow-
-                            // less packets (no install attempted) keep
-                            // buffering as before.
-                            let mut seed_install_refused = false;
-                            if let Some(flow) = flow.as_ref() {
-                                // #1913 (Codex r2): policy was already
-                                // evaluated (and any DENY dropped+recycled)
-                                // above, BEFORE the kernel ARP probe. Only a
-                                // permitted flow reaches here, so the SNAT
-                                // allocation runs unconditionally for the
-                                // permitted MissingNeighbor flow. The
-                                // cold-path histogram sample is taken at the
-                                // early eval site above.
-                                {
-                                    let nat_match_flow = flow.with_destination(
-                                        pending_decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
-                                    );
-                                    // #1852: gate pool-mode SNAT allocation
-                                    // for a non-first fragment (no L4 ports).
-                                    let snat_non_first_fragment = {
-                                        let l3 = meta.l3_offset as usize;
-                                        l3 <= packet_frame.len()
-                                            && is_non_first_fragment(
-                                                &packet_frame[l3..],
-                                                meta.addr_family,
-                                            )
-                                    };
-                                    // #3121: mirror the main NAT-decision site
-                                    // (Permit path above) on the missing-neighbor
-                                    // seed path so the seed session carries the
-                                    // SAME composed NAT decision regardless of
-                                    // ARP-resolution timing. NPTv6 outbound source
-                                    // translation composes with any pre-routing DNAT
-                                    // (rewrite_dst): NPTv6 rewrites the source, DNAT
-                                    // the destination; both are merged. The NPTv6
-                                    // source rewrite is checksum-neutral (RFC 6296).
-                                    // #5176: gate on the EGRESS zone (`to_zone`) so
-                                    // a rule-set scoped `from zone X` never rewrites
-                                    // the source of traffic leaving via another zone.
-                                    let nptv6_snat =
-                                        if let IpAddr::V6(mut src_v6) = nat_match_flow.src_ip {
-                                            if worker_ctx
-                                                .forwarding
-                                                .nptv6
-                                                .translate_outbound(&mut src_v6, to_zone)
+                                // Send ARP/NDP solicitation via RAW socket (not XSK)
+                                // so the reply goes through the kernel's normal RX
+                                // path (cpumap_or_pass), bypassing XSK fill ring issues.
+                                // Also reinject original packet to slow-path for kernel
+                                // to forward once the neighbor is resolved.
+                                // Trigger ARP/NDP resolution via kernel netlink.
+                                // Adding an INCOMPLETE neighbor entry makes the
+                                // kernel send its own ARP/NDP solicitation through
+                                // the normal stack, which correctly handles VLAN
+                                // tagging and TX offload. The netlink monitor then
+                                // picks up the resolved entry instantly.
+                                if let Some(next_hop) = decision.resolution.next_hop {
+                                    // #1912: tunnel-marked decisions are NEVER
+                                    // buffered in pending_neigh (R-E), and the
+                                    // per-hop neg-cache arms only on a
+                                    // pending_neigh timeout (neighbor_dispatch.rs
+                                    // neg_neigh_record), so for an unresolved
+                                    // OUTER hop the top-of-arm neg fast-fail can
+                                    // never arm and suppress this block. The
+                                    // outer-hop probe + resolver are therefore
+                                    // gated by the per-(neigh_if, next_hop)
+                                    // resolver_enqueue_throttle window below.
+                                    //
+                                    // outer_if_distinct: true only when this is a
+                                    // tunnel decision whose outer transport
+                                    // RESOLVED to a real L3 egress distinct from
+                                    // the tunnel logical ifindex. If
+                                    // outer_neighbor_ifindex fell back to
+                                    // egress_ifindex (endpoint vanished / outer
+                                    // egress <= 0 — unreachable within the
+                                    // single-threaded worker loop, but explicit),
+                                    // neigh_if == egress_ifindex == tunnel logical;
+                                    // probing / RTM_GETNEIGH on the GRE logical
+                                    // iface is the useless pre-#1912 behavior, so
+                                    // skip it (Copilot #1912 r1 Low).
+                                    let tunnel_marked = decision.resolution.tunnel_endpoint_id != 0;
+                                    let outer_if_distinct = tunnel_marked
+                                        && neigh_if > 0
+                                        && neigh_if != decision.resolution.egress_ifindex;
+                                    let throttle_key = (neigh_if, next_hop);
+                                    // For a tunnel decision, gate BOTH the kernel
+                                    // ARP probe AND the resolver enqueue behind
+                                    // ONE throttle window so a SYN flood to a
+                                    // flushed outer hop fires at most one
+                                    // probe + enqueue per outer key per window
+                                    // (else trigger_kernel_arp_probe — a raw
+                                    // socket open/setsockopt/sendto/close — would
+                                    // run per packet; AGY #1912 r1 High).
+                                    let tunnel_throttled = outer_if_distinct
+                                        && matches!(
+                                            binding
+                                                .resolver_enqueue_throttle
+                                                .get(&throttle_key),
+                                            Some(&t) if now_ns.saturating_sub(t)
+                                                < RESOLVER_ENQUEUE_THROTTLE_NS
+                                        );
+                                    // Only spawn ping if we don't already have a
+                                    // pending probe for this (ifindex, hop).
+                                    // #1771 §2.2: pending_neigh is keyed by
+                                    // (egress_ifindex, next_hop), so the
+                                    // "already probing this hop" dedup is a
+                                    // direct contains_key (was an O(n) iter scan).
+                                    // #1912: dedup + iface lookup on the OUTER
+                                    // L3 egress (neigh_if), not the tunnel
+                                    // logical ifindex. For a non-tunnel flow
+                                    // neigh_if == egress_ifindex so the dedup is
+                                    // byte-identical; for a tunnel flow
+                                    // pending_neigh never holds the key (R-E), so
+                                    // the per-window throttle is the probe-storm
+                                    // bound instead.
+                                    let already_probing =
+                                        binding.pending_neigh.contains_key(&(neigh_if, next_hop));
+                                    // Suppress the probe for a tunnel decision
+                                    // with NO distinct outer egress: neigh_if
+                                    // would be the tunnel logical ifindex and the
+                                    // probe would bind to the GRE iface (no ARP —
+                                    // the useless pre-#1912 behavior). For a
+                                    // non-tunnel flow tunnel_marked is false so
+                                    // this never suppresses (byte-identical).
+                                    let tunnel_without_outer = tunnel_marked && !outer_if_distinct;
+                                    if !already_probing && !tunnel_throttled && !tunnel_without_outer {
+                                        let iface_name = worker_ctx
+                                            .forwarding
+                                            .ifindex_to_name
+                                            .get(&neigh_if)
+                                            .cloned();
+                                        if let Some(name) = iface_name {
+                                            // Fast path: ICMP socket triggers kernel ARP
+                                            // in microseconds (no fork/exec).
+                                            trigger_kernel_arp_probe(&name, neigh_if, next_hop);
+                                        }
+                                    }
+                                    // #1912: for a tunnel-marked MissingNeighbor
+                                    // with a DISTINCT resolved outer egress (e.g.
+                                    // GRE outer hop), ALSO drive the #1769
+                                    // resolver on the OUTER L3 egress, not only on
+                                    // the neg-cache fast-fail. A freshly-flushed
+                                    // outer hop has no negative entry, so without
+                                    // this only the one-shot kernel ARP probe
+                                    // fires; the resolver hardens the STALE/DELAY
+                                    // outer-entry case via RTM_GETNEIGH. The frame
+                                    // is STILL NOT buffered (R-E), so no
+                                    // plaintext-leak window opens. try_enqueue_-
+                                    // resolver re-reads the SAME throttle entry
+                                    // and bumps it once, so the probe above and
+                                    // this enqueue share one window per key.
+                                    if outer_if_distinct && !tunnel_throttled {
+                                        if let Some(resolver) = worker_ctx.neighbor_resolver {
+                                            try_enqueue_resolver(
+                                                resolver,
+                                                &mut binding.resolver_enqueue_throttle,
+                                                &worker_ctx.forwarding.ifindex_to_name,
+                                                throttle_key,
+                                                now_ns,
+                                            );
+                                        } else {
+                                            // No resolver (probe-only build): bump
+                                            // the throttle directly so the probe
+                                            // above is still rate-limited to one
+                                            // per window. Bounded like the neg
+                                            // cache.
+                                            let throttle = &mut binding.resolver_enqueue_throttle;
+                                            if throttle.len() >= MAX_NEG_NEIGH_CACHE
+                                                && !throttle.contains_key(&throttle_key)
                                             {
-                                                Some(NatDecision {
-                                                    rewrite_src: Some(IpAddr::V6(src_v6)),
-                                                    rewrite_dst: None,
-                                                    nat64: false,
-                                                    nptv6: true,
-                                                    ..NatDecision::default()
-                                                })
+                                                throttle.clear();
+                                            }
+                                            throttle.insert(throttle_key, now_ns);
+                                        }
+                                    }
+                                }
+                                // #5174: NAT64 MissingNeighbor fail-closed. The kernel
+                                // ARP/NDP probe above already fired for the extracted
+                                // IPv4 next-hop (so the neighbor will resolve), but the
+                                // cold-path seed + pending_neigh replay is SAME-FAMILY
+                                // only — the replay `rewrite_forwarded_frame_in_place`
+                                // does MAC/VLAN/NAT, NOT the v6->v4 cross-family NAT64
+                                // rebuild. Seeding a plain-forward decision + buffering
+                                // the IPv6 frame here would therefore TX the UNTRANSLATED
+                                // IPv6 frame to the IPv4 gateway AND persist a broken,
+                                // HA-synced `MissingNeighborSeed` session that poisons
+                                // every subsequent packet (session-hit → non-NAT64
+                                // decision). Drop this cold-start packet instead; the
+                                // flow forwards correctly via the ForwardCandidate path
+                                // (which builds the real NAT64 translation) on a later
+                                // packet once the neighbor is resolved. Only a PERMITTED
+                                // flow reaches here — a NAT64 deny already exited above
+                                // with the normal PolicyDenied disposition, so this
+                                // never probe-loops a denied flow. Buffer-and-translate
+                                // parity (zero cold-start loss) is a deferred follow-up.
+                                if nat64_dst_v4.is_some() {
+                                    telemetry.dbg.nat64_missing_neigh_drop += 1;
+                                    break 'missing_neighbor StageOutcome::RecycleAndContinue;
+                                }
+                                // Create the session NOW so the SYN-ACK (reverse
+                                // direction) finds the forward NAT match and creates
+                                // a reverse session. Without this, the SYN-ACK hits
+                                // session miss → policy deny (no rule for WAN→LAN).
+                                let mut pending_decision = decision;
+                                let mut source_nat_release_key = None;
+                                // #2218: matched SNAT/static-SNAT rule counter
+                                // for the seeded translated flow; incremented at
+                                // the committed seed install below.
+                                let mut source_nat_counter: Option<
+                                    std::sync::Arc<crate::nat::NatRuleCounter>,
+                                > = None;
+                                // #1861 §5.3: true when the seed install was
+                                // ATTEMPTED and refused (max_sessions). Gates
+                                // the pending-neighbor buffering below: a
+                                // refused seed's SNAT allocation was rolled
+                                // back, so replaying the buffered frame after
+                                // neighbor resolution would forward it on an
+                                // unreserved NAT tuple with no session. Flow-
+                                // less packets (no install attempted) keep
+                                // buffering as before.
+                                let mut seed_install_refused = false;
+                                if let Some(flow) = flow.as_ref() {
+                                    // #1913 (Codex r2): policy was already
+                                    // evaluated (and any DENY dropped+recycled)
+                                    // above, BEFORE the kernel ARP probe. Only a
+                                    // permitted flow reaches here, so the SNAT
+                                    // allocation runs unconditionally for the
+                                    // permitted MissingNeighbor flow. The
+                                    // cold-path histogram sample is taken at the
+                                    // early eval site above.
+                                    {
+                                        let nat_match_flow = flow.with_destination(
+                                            pending_decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
+                                        );
+                                        // #1852: gate pool-mode SNAT allocation
+                                        // for a non-first fragment (no L4 ports).
+                                        let snat_non_first_fragment = {
+                                            let l3 = meta.l3_offset as usize;
+                                            l3 <= packet_frame.len()
+                                                && is_non_first_fragment(
+                                                    &packet_frame[l3..],
+                                                    meta.addr_family,
+                                                )
+                                        };
+                                        // #3121: mirror the main NAT-decision site
+                                        // (Permit path above) on the missing-neighbor
+                                        // seed path so the seed session carries the
+                                        // SAME composed NAT decision regardless of
+                                        // ARP-resolution timing. NPTv6 outbound source
+                                        // translation composes with any pre-routing DNAT
+                                        // (rewrite_dst): NPTv6 rewrites the source, DNAT
+                                        // the destination; both are merged. The NPTv6
+                                        // source rewrite is checksum-neutral (RFC 6296).
+                                        // #5176: gate on the EGRESS zone (`to_zone`) so
+                                        // a rule-set scoped `from zone X` never rewrites
+                                        // the source of traffic leaving via another zone.
+                                        let nptv6_snat =
+                                            if let IpAddr::V6(mut src_v6) = nat_match_flow.src_ip {
+                                                if worker_ctx
+                                                    .forwarding
+                                                    .nptv6
+                                                    .translate_outbound(&mut src_v6, to_zone)
+                                                {
+                                                    Some(NatDecision {
+                                                        rewrite_src: Some(IpAddr::V6(src_v6)),
+                                                        rewrite_dst: None,
+                                                        nat64: false,
+                                                        nptv6: true,
+                                                        ..NatDecision::default()
+                                                    })
+                                                } else {
+                                                    None
+                                                }
                                             } else {
                                                 None
-                                            }
+                                            };
+                                        if let Some(nptv6_decision) = nptv6_snat {
+                                            // NPTv6 is the source translation and takes
+                                            // precedence over static/interface SNAT; merge
+                                            // into any pre-routing DNAT. No per-rule counter.
+                                            pending_decision.nat =
+                                                pending_decision.nat.merge(nptv6_decision);
+                                            source_nat_release_key =
+                                                Some(nat_match_flow.forward_key.clone());
                                         } else {
-                                            None
-                                        };
-                                    if let Some(nptv6_decision) = nptv6_snat {
-                                        // NPTv6 is the source translation and takes
-                                        // precedence over static/interface SNAT; merge
-                                        // into any pre-routing DNAT. No per-rule counter.
-                                        pending_decision.nat =
-                                            pending_decision.nat.merge(nptv6_decision);
-                                        source_nat_release_key =
-                                            Some(nat_match_flow.forward_key.clone());
-                                    } else {
-                                        let mut snat_match_counter = None;
-                                        match source_nat_decision_for_flow(
-                                            worker_ctx.forwarding,
-                                            meta.ingress_ifindex as i32,
-                                            &from_zone,
-                                            &to_zone,
-                                            pending_decision.resolution.egress_ifindex,
-                                            &nat_match_flow,
-                                            now_ns,
-                                            snat_non_first_fragment,
-                                            &mut snat_match_counter,
-                                        ) {
-                                            Ok(snat_decision) => {
-                                                pending_decision.nat =
-                                                    pending_decision.nat.merge(snat_decision);
-                                                source_nat_release_key =
-                                                    Some(nat_match_flow.forward_key.clone());
-                                                source_nat_counter = snat_match_counter;
-                                            }
-                                            Err(failure) => {
-                                                record_source_nat_failure(
-                                                    telemetry,
-                                                    worker_ctx,
-                                                    meta,
-                                                    flow,
-                                                    from_zone_id,
-                                                    to_zone_id,
-                                                    desc.len,
-                                                    &failure,
-                                                );
-                                                binding.scratch.scratch_recycle.push(desc.addr);
-                                                continue;
+                                            let mut snat_match_counter = None;
+                                            match source_nat_decision_for_flow(
+                                                worker_ctx.forwarding,
+                                                meta.ingress_ifindex as i32,
+                                                &from_zone,
+                                                &to_zone,
+                                                pending_decision.resolution.egress_ifindex,
+                                                &nat_match_flow,
+                                                now_ns,
+                                                snat_non_first_fragment,
+                                                &mut snat_match_counter,
+                                            ) {
+                                                Ok(snat_decision) => {
+                                                    pending_decision.nat =
+                                                        pending_decision.nat.merge(snat_decision);
+                                                    source_nat_release_key =
+                                                        Some(nat_match_flow.forward_key.clone());
+                                                    source_nat_counter = snat_match_counter;
+                                                }
+                                                Err(failure) => {
+                                                    record_source_nat_failure(
+                                                        telemetry,
+                                                        worker_ctx,
+                                                        meta,
+                                                        flow,
+                                                        from_zone_id,
+                                                        to_zone_id,
+                                                        desc.len,
+                                                        &failure,
+                                                    );
+                                                    break 'missing_neighbor StageOutcome::RecycleAndContinue;
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                let sess_meta = build_missing_neighbor_session_metadata(
-                                    worker_ctx.forwarding,
-                                    from_zone_id,
-                                    to_zone_id,
-                                    packet_fabric_ingress,
-                                    pending_decision,
-                                );
-                                let pending_installed = sessions.install_with_protocol_with_origin(
-                                    flow.forward_key.clone(),
-                                    pending_decision,
-                                    sess_meta.clone(),
-                                    SessionOrigin::MissingNeighborSeed,
-                                    now_ns,
-                                    meta.protocol,
-                                    meta.tcp_flags,
-                                );
-                                if pending_installed {
-                                    // #2218: the seed install is the
-                                    // committed translation for this
-                                    // missing-neighbor flow (a refused seed
-                                    // takes the else-arm below and rolls the
-                                    // SNAT allocation back, so it is never
-                                    // counted). Count the DNAT and SNAT
-                                    // per-rule hits once each.
-                                    let nat_hit_len = desc.len as u64;
-                                    if let Some(c) = pre_routing_dnat_counter.as_ref() {
-                                        c.add(nat_hit_len);
-                                    }
-                                    if let Some(c) = source_nat_counter.as_ref() {
-                                        c.add(nat_hit_len);
-                                    }
-                                    let entry = SyncedSessionEntry {
-                                        key: flow.forward_key.clone(),
-                                        decision: pending_decision,
-                                        metadata: sess_meta,
-                                        origin: SessionOrigin::MissingNeighborSeed,
-                                        protocol: meta.protocol,
-                                        tcp_flags: meta.tcp_flags,
-                                        // Local missing-neighbor seed (#2170): no peer gen.
-                                        generation: 0,
-                                        // #5212: local-origin seed; no carried id (0).
-                                        session_id: 0,
-                                    };
-                                    publish_shared_session(
-                                        worker_ctx.shared_sessions,
-                                        worker_ctx.shared_nat_sessions,
-                                        worker_ctx.shared_forward_wire_sessions,
-                                        &worker_ctx.shared_owner_rg_indexes,
-                                        &entry,
-                                    );
-                                    // #1789: count a failed publish
-                                    // (shim misses the key -> NO_SESSION
-                                    // degraded path for the seeded flow).
-                                    if publish_session_map_entry_for_session(
-                                        binding.bpf_maps.session_map_fd,
-                                        &flow.forward_key,
+                                    let sess_meta = build_missing_neighbor_session_metadata(
+                                        worker_ctx.forwarding,
+                                        from_zone_id,
+                                        to_zone_id,
+                                        packet_fabric_ingress,
                                         pending_decision,
-                                        &entry.metadata,
-                                    )
-                                    .is_err()
-                                    {
-                                        binding
-                                            .live
-                                            .session_publish_errors
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    // #2008 M5: stamp the resolved app id.
-                                    // #3321: directional resolution (service =
-                                    // dst forward / src reverse).
-                                    // #3416: forward service port from the
-                                    // post-translation (DNAT-rewritten)
-                                    // destination so a port-forwarded
-                                    // neighbor-seed row carries the admitting
-                                    // application, not the public port.
-                                    let app_id = worker_ctx.forwarding.app_catalog.lookup_admitted(
-                                        flow.forward_key.protocol,
-                                        flow.forward_key.src_port,
-                                        flow.forward_key.dst_port,
-                                        entry.metadata.is_reverse,
-                                        pending_decision.nat.rewrite_dst_port,
                                     );
-                                    // #5213: stable id from the just-installed
-                                    // neighbor-seed entry so the mirror row
-                                    // matches RT_FLOW.
-                                    let session_id =
-                                        sessions.session_id_for(&flow.forward_key);
-                                    publish_bpf_conntrack_entry(
-                                        conntrack_v4_fd,
-                                        conntrack_v6_fd,
-                                        &flow.forward_key,
+                                    let pending_installed = sessions.install_with_protocol_with_origin(
+                                        flow.forward_key.clone(),
                                         pending_decision,
-                                        &entry.metadata,
-                                        &worker_ctx.forwarding.zone_name_to_id,
-                                        worker_ctx.forwarding.alg_disable_flags,
-                                        app_id,
-                                        session_id,
-                                    );
-                                    // #2244: count failed reverse-NAT publishes so
-                                    // map-pressure loss is operator-visible.
-                                    if !publish_dnat_table_entry(
-                                        &worker_ctx.dnat_fds,
-                                        &flow.forward_key,
-                                        pending_decision.nat,
-                                    ) {
-                                        binding
-                                            .live
-                                            .dnat_publish_errors
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    telemetry.counters.session_creates += 1;
-                                } else {
-                                    // #1861 §5.3: at-cap seed refusal. The
-                                    // single-entry install IS the
-                                    // transaction here (no pair); the
-                                    // refusal is counted by the table's
-                                    // create_drops (exported since #1861 —
-                                    // admission_refused stays preflight-
-                                    // only). Roll back the SNAT allocation
-                                    // and drop the frame instead of
-                                    // buffering it for replay.
-                                    seed_install_refused = true;
-                                    rollback_source_nat_allocation(
-                                        &worker_ctx.forwarding.source_nat_rules,
-                                        source_nat_release_key
-                                            .as_ref()
-                                            .unwrap_or(&flow.forward_key),
-                                        pending_decision.nat,
-                                        false,
+                                        sess_meta.clone(),
+                                        SessionOrigin::MissingNeighborSeed,
                                         now_ns,
+                                        meta.protocol,
+                                        meta.tcp_flags,
                                     );
-                                }
-                            }
-                            // Buffer the packet. The ICMP probe resolves ARP
-                            // in ~1ms. The retry loop below re-forwards the
-                            // buffered packet once the neighbor resolves via the
-                            // netlink monitor. The session was already created
-                            // above so the SYN-ACK reverse path works too.
-                            // Total latency: ~2ms (ARP + netlink + retry).
-                            //
-                            // NOTE: we do NOT reinject to slow-path here because
-                            // kernel ARP resolution via XDP_PASS breaks VLAN demux
-                            // in zero-copy mode (mlx5). The ICMP probe + netlink
-                            // monitor + buffer-retry path bypasses this issue.
-                            // #1771 §2.2: buffer one representative packet
-                            // per (egress_ifindex, next_hop). Keep the
-                            // OLDEST (it drives the probe/dwell clock):
-                            // a duplicate for an already-buffered hop is
-                            // dropped+recycled (recycle_now stays true),
-                            // pinning ≤1 UMEM frame per unresolved hop.
-                            // A packet with no next_hop cannot be keyed or
-                            // resolved (the retry sweep needs next_hop to
-                            // look up a MAC), so it is not buffered —
-                            // recycled instead of held until timeout.
-                            // #1861 §5.3: a refused seed is recycled, not
-                            // buffered (see seed_install_refused above) —
-                            // the kernel ARP probe already fired, and the
-                            // next packet retries the install once the
-                            // table has room, converging with the #1771
-                            // duplicate-drop semantics.
-                            // #1873 R-E: tunnel-marked decisions are
-                            // NEVER admitted to pending_neigh. The retry
-                            // path TXes buffered frames via in-place
-                            // MAC/VLAN rewrite with no encapsulation, so
-                            // a buffered tunnel inner packet would go out
-                            // PLAINTEXT on the physical wire when the
-                            // outer neighbor resolves (AGY plan r2,
-                            // verified). The kernel ARP/ICMP probe above
-                            // already fired, and the post-match
-                            // maybe_reinject_slow_path_from_frame call
-                            // routes this frame into the R-C tunnel gate
-                            // (counted drop) — the #1769 resolver keeps
-                            // driving the outer next-hop, and the flow
-                            // recovers via retransmission once resolved.
-                            // #1902 (sibling of #1885): a GRE-DECAPPED
-                            // packet is NEVER admitted to pending_neigh.
-                            // `desc` still references the un-decapped
-                            // OUTER UMEM frame while `meta`/the decision
-                            // describe the synthetic INNER frame in
-                            // `owned_packet_frame`; the retry path's
-                            // rewrite_forwarded_frame_in_place(pkt.desc,
-                            // pkt.meta, ..) would MAC/NAT/TTL-rewrite the
-                            // still-encapsulated outer packet at inner
-                            // offsets and TX it toward the inner next-hop
-                            // — a corrupt transmit, not a drop. The
-                            // kernel ARP/ICMP probe above already fired,
-                            // the trailing decap-aware
-                            // maybe_reinject_slow_path_from_frame
-                            // chokepoint (#1901) still hands the
-                            // correctly-paired INNER packet to the kernel
-                            // slow path, and the #1769 resolver +
-                            // retransmission recover the flow once the
-                            // neighbor resolves. Counted per binding so
-                            // the live gate is observable
-                            // (xpf_userspace_pending_neigh_decap_drops_total).
-                            if !seed_install_refused
-                                && pending_decision.resolution.tunnel_endpoint_id == 0
-                                && pending_decision.resolution.next_hop.is_some()
-                                && owned_packet_frame.is_some()
-                            {
-                                binding
-                                    .live
-                                    .pending_neigh_decap_drops
-                                    .fetch_add(1, Ordering::Relaxed);
-                            } else if !seed_install_refused
-                                && pending_decision.resolution.tunnel_endpoint_id == 0
-                                && let Some(hop) = pending_decision.resolution.next_hop
-                            {
-                                let pending_key = (pending_decision.resolution.egress_ifindex, hop);
-                                // #1782: split the buffer-admission test so
-                                // the capture can tell WHY a sibling was not
-                                // buffered. The DuplicateDrop branch is the
-                                // H5 sibling drop (key already pending — the
-                                // first packet drove the kernel probe); the
-                                // CapacityDrop branch is a distinct
-                                // condition, counted SEPARATELY (#2375) in
-                                // pending_neigh_capacity_drops. #1771
-                                // §2.4: the decision is the pure
-                                // `pending_neigh_admission` helper so
-                                // invariant N1's "at most one buffered
-                                // packet per key" half is unit-tested;
-                                // behavior is unchanged — an insert happens
-                                // iff the key is absent AND there is room,
-                                // otherwise `recycle_now` stays true and
-                                // the frame is recycled.
-                                let admission = pending_neigh_admission(
-                                    binding.pending_neigh.contains_key(&pending_key),
-                                    binding.pending_neigh.len(),
-                                );
-                                // #2375: record the drop counters via the
-                                // extracted helper so both the duplicate and
-                                // the capacity case are a unit-tested
-                                // side-effect (the test fails if either
-                                // increment is removed). Buffer is a no-op
-                                // here — the buffering insert stays inline
-                                // below.
-                                record_pending_neigh_admission_drop(&binding.live, admission);
-                                match admission {
-                                    PendingNeighAdmission::DuplicateDrop => {}
-                                    PendingNeighAdmission::Buffer => {
-                                        // #2357: when this buffered packet is
-                                        // later flushed by retry_pending_neigh,
-                                        // its stored flow_key drives
-                                        // resolve_cos_tx_selection_at (egress
-                                        // queue / DSCP / output-filter). A
-                                        // non-first IP fragment carries no L4
-                                        // header, so refuse to synthesize a
-                                        // ported tuple from metadata for it —
-                                        // store `None` so the flush selects the
-                                        // interface default queue with no
-                                        // port-filter eval. `flow` is already
-                                        // `None` for a fragment (#2344); the
-                                        // gate only suppresses the meta
-                                        // fallback, leaving legitimate flowless
-                                        // TCP/UDP packets (real L4 header) their
-                                        // meta-derived ports. `raw_frame` is the
-                                        // UMEM slice for `desc`; this branch is
-                                        // only reached when
-                                        // `owned_packet_frame.is_none()`, so it
-                                        // describes the packet `meta` refers to.
-                                        // #2357/#3290: stored flow_key drives
-                                        // CoS/output-filter selection AND the TX
-                                        // request when retry_pending_neigh later
-                                        // flushes this packet. The helper gates
-                                        // the metadata fallback (non-first
-                                        // fragment, and non-identifier-bearing
-                                        // ICMP) so a fabricated pseudo-port is
-                                        // never buffered — the SAME gate the
-                                        // immediate forward path and the
-                                        // conntrack path apply. `raw_frame` is
-                                        // the UMEM slice for `desc` (this branch
-                                        // is only reached when
-                                        // `owned_packet_frame.is_none()`).
-                                        let pending_flow_key = pending_neigh_flow_key(
-                                            flow.as_ref(),
-                                            raw_frame,
-                                            meta,
+                                    if pending_installed {
+                                        // #2218: the seed install is the
+                                        // committed translation for this
+                                        // missing-neighbor flow (a refused seed
+                                        // takes the else-arm below and rolls the
+                                        // SNAT allocation back, so it is never
+                                        // counted). Count the DNAT and SNAT
+                                        // per-rule hits once each.
+                                        let nat_hit_len = desc.len as u64;
+                                        if let Some(c) = pre_routing_dnat_counter.as_ref() {
+                                            c.add(nat_hit_len);
+                                        }
+                                        if let Some(c) = source_nat_counter.as_ref() {
+                                            c.add(nat_hit_len);
+                                        }
+                                        let entry = SyncedSessionEntry {
+                                            key: flow.forward_key.clone(),
+                                            decision: pending_decision,
+                                            metadata: sess_meta,
+                                            origin: SessionOrigin::MissingNeighborSeed,
+                                            protocol: meta.protocol,
+                                            tcp_flags: meta.tcp_flags,
+                                            // Local missing-neighbor seed (#2170): no peer gen.
+                                            generation: 0,
+                                            // #5212: local-origin seed; no carried id (0).
+                                            session_id: 0,
+                                        };
+                                        publish_shared_session(
+                                            worker_ctx.shared_sessions,
+                                            worker_ctx.shared_nat_sessions,
+                                            worker_ctx.shared_forward_wire_sessions,
+                                            &worker_ctx.shared_owner_rg_indexes,
+                                            &entry,
                                         );
-                                        binding.pending_neigh.insert(
-                                            pending_key,
-                                            PendingNeighPacket {
-                                                addr: desc.addr,
-                                                desc,
-                                                meta,
-                                                decision: pending_decision,
-                                                flow_key: pending_flow_key,
-                                                queued_ns: now_ns,
-                                                probe_attempts: 0,
-                                            },
-                                        );
-                                        recycle_now = false;
-                                    }
-                                    PendingNeighAdmission::CapacityDrop => {
-                                        // #2375: a NEW distinct hop refused
-                                        // because pending_neigh is at
-                                        // MAX_PENDING_NEIGH (distinct-hop
-                                        // neighbor exhaustion — the
-                                        // scan/upstream-outage failure mode).
-                                        // The counter increment is the helper
-                                        // call above; the frame is recycled
-                                        // exactly like the duplicate branch
-                                        // (recycle_now stays true).
-                                    }
-                                }
-                            }
-                            if cfg!(feature = "debug-log") {
-                                if telemetry.dbg.missing_neigh <= 3 {
-                                    if let Some(flow) = flow.as_ref() {
-                                        eprintln!(
-                                            "DBG MISS_NEIGH→{}: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
-                                            "SOLICIT+SLOW",
-                                            flow.src_ip,
+                                        // #1789: count a failed publish
+                                        // (shim misses the key -> NO_SESSION
+                                        // degraded path for the seeded flow).
+                                        if publish_session_map_entry_for_session(
+                                            binding.bpf_maps.session_map_fd,
+                                            &flow.forward_key,
+                                            pending_decision,
+                                            &entry.metadata,
+                                        )
+                                        .is_err()
+                                        {
+                                            binding
+                                                .live
+                                                .session_publish_errors
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        // #2008 M5: stamp the resolved app id.
+                                        // #3321: directional resolution (service =
+                                        // dst forward / src reverse).
+                                        // #3416: forward service port from the
+                                        // post-translation (DNAT-rewritten)
+                                        // destination so a port-forwarded
+                                        // neighbor-seed row carries the admitting
+                                        // application, not the public port.
+                                        let app_id = worker_ctx.forwarding.app_catalog.lookup_admitted(
+                                            flow.forward_key.protocol,
                                             flow.forward_key.src_port,
-                                            flow.dst_ip,
                                             flow.forward_key.dst_port,
-                                            meta.protocol,
-                                            pending_decision.resolution.egress_ifindex,
-                                            pending_decision.resolution.next_hop,
+                                            entry.metadata.is_reverse,
+                                            pending_decision.nat.rewrite_dst_port,
+                                        );
+                                        // #5213: stable id from the just-installed
+                                        // neighbor-seed entry so the mirror row
+                                        // matches RT_FLOW.
+                                        let session_id =
+                                            sessions.session_id_for(&flow.forward_key);
+                                        publish_bpf_conntrack_entry(
+                                            conntrack_v4_fd,
+                                            conntrack_v6_fd,
+                                            &flow.forward_key,
+                                            pending_decision,
+                                            &entry.metadata,
+                                            &worker_ctx.forwarding.zone_name_to_id,
+                                            worker_ctx.forwarding.alg_disable_flags,
+                                            app_id,
+                                            session_id,
+                                        );
+                                        // #2244: count failed reverse-NAT publishes so
+                                        // map-pressure loss is operator-visible.
+                                        if !publish_dnat_table_entry(
+                                            &worker_ctx.dnat_fds,
+                                            &flow.forward_key,
+                                            pending_decision.nat,
+                                        ) {
+                                            binding
+                                                .live
+                                                .dnat_publish_errors
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        telemetry.counters.session_creates += 1;
+                                    } else {
+                                        // #1861 §5.3: at-cap seed refusal. The
+                                        // single-entry install IS the
+                                        // transaction here (no pair); the
+                                        // refusal is counted by the table's
+                                        // create_drops (exported since #1861 —
+                                        // admission_refused stays preflight-
+                                        // only). Roll back the SNAT allocation
+                                        // and drop the frame instead of
+                                        // buffering it for replay.
+                                        seed_install_refused = true;
+                                        rollback_source_nat_allocation(
+                                            &worker_ctx.forwarding.source_nat_rules,
+                                            source_nat_release_key
+                                                .as_ref()
+                                                .unwrap_or(&flow.forward_key),
+                                            pending_decision.nat,
+                                            false,
+                                            now_ns,
                                         );
                                     }
                                 }
+                                // Buffer the packet. The ICMP probe resolves ARP
+                                // in ~1ms. The retry loop below re-forwards the
+                                // buffered packet once the neighbor resolves via the
+                                // netlink monitor. The session was already created
+                                // above so the SYN-ACK reverse path works too.
+                                // Total latency: ~2ms (ARP + netlink + retry).
+                                //
+                                // NOTE: we do NOT reinject to slow-path here because
+                                // kernel ARP resolution via XDP_PASS breaks VLAN demux
+                                // in zero-copy mode (mlx5). The ICMP probe + netlink
+                                // monitor + buffer-retry path bypasses this issue.
+                                // #1771 §2.2: buffer one representative packet
+                                // per (egress_ifindex, next_hop). Keep the
+                                // OLDEST (it drives the probe/dwell clock):
+                                // a duplicate for an already-buffered hop is
+                                // dropped+recycled (recycle_now stays true),
+                                // pinning ≤1 UMEM frame per unresolved hop.
+                                // A packet with no next_hop cannot be keyed or
+                                // resolved (the retry sweep needs next_hop to
+                                // look up a MAC), so it is not buffered —
+                                // recycled instead of held until timeout.
+                                // #1861 §5.3: a refused seed is recycled, not
+                                // buffered (see seed_install_refused above) —
+                                // the kernel ARP probe already fired, and the
+                                // next packet retries the install once the
+                                // table has room, converging with the #1771
+                                // duplicate-drop semantics.
+                                // #1873 R-E: tunnel-marked decisions are
+                                // NEVER admitted to pending_neigh. The retry
+                                // path TXes buffered frames via in-place
+                                // MAC/VLAN rewrite with no encapsulation, so
+                                // a buffered tunnel inner packet would go out
+                                // PLAINTEXT on the physical wire when the
+                                // outer neighbor resolves (AGY plan r2,
+                                // verified). The kernel ARP/ICMP probe above
+                                // already fired, and the post-match
+                                // maybe_reinject_slow_path_from_frame call
+                                // routes this frame into the R-C tunnel gate
+                                // (counted drop) — the #1769 resolver keeps
+                                // driving the outer next-hop, and the flow
+                                // recovers via retransmission once resolved.
+                                // #1902 (sibling of #1885): a GRE-DECAPPED
+                                // packet is NEVER admitted to pending_neigh.
+                                // `desc` still references the un-decapped
+                                // OUTER UMEM frame while `meta`/the decision
+                                // describe the synthetic INNER frame in
+                                // `owned_packet_frame`; the retry path's
+                                // rewrite_forwarded_frame_in_place(pkt.desc,
+                                // pkt.meta, ..) would MAC/NAT/TTL-rewrite the
+                                // still-encapsulated outer packet at inner
+                                // offsets and TX it toward the inner next-hop
+                                // — a corrupt transmit, not a drop. The
+                                // kernel ARP/ICMP probe above already fired,
+                                // the trailing decap-aware
+                                // maybe_reinject_slow_path_from_frame
+                                // chokepoint (#1901) still hands the
+                                // correctly-paired INNER packet to the kernel
+                                // slow path, and the #1769 resolver +
+                                // retransmission recover the flow once the
+                                // neighbor resolves. Counted per binding so
+                                // the live gate is observable
+                                // (xpf_userspace_pending_neigh_decap_drops_total).
+                                if !seed_install_refused
+                                    && pending_decision.resolution.tunnel_endpoint_id == 0
+                                    && pending_decision.resolution.next_hop.is_some()
+                                    && owned_packet_frame.is_some()
+                                {
+                                    binding
+                                        .live
+                                        .pending_neigh_decap_drops
+                                        .fetch_add(1, Ordering::Relaxed);
+                                } else if !seed_install_refused
+                                    && pending_decision.resolution.tunnel_endpoint_id == 0
+                                    && let Some(hop) = pending_decision.resolution.next_hop
+                                {
+                                    let pending_key = (pending_decision.resolution.egress_ifindex, hop);
+                                    // #1782: split the buffer-admission test so
+                                    // the capture can tell WHY a sibling was not
+                                    // buffered. The DuplicateDrop branch is the
+                                    // H5 sibling drop (key already pending — the
+                                    // first packet drove the kernel probe); the
+                                    // CapacityDrop branch is a distinct
+                                    // condition, counted SEPARATELY (#2375) in
+                                    // pending_neigh_capacity_drops. #1771
+                                    // §2.4: the decision is the pure
+                                    // `pending_neigh_admission` helper so
+                                    // invariant N1's "at most one buffered
+                                    // packet per key" half is unit-tested;
+                                    // behavior is unchanged — an insert happens
+                                    // iff the key is absent AND there is room,
+                                    // otherwise `recycle_now` stays true and
+                                    // the frame is recycled.
+                                    let admission = pending_neigh_admission(
+                                        binding.pending_neigh.contains_key(&pending_key),
+                                        binding.pending_neigh.len(),
+                                    );
+                                    // #2375: record the drop counters via the
+                                    // extracted helper so both the duplicate and
+                                    // the capacity case are a unit-tested
+                                    // side-effect (the test fails if either
+                                    // increment is removed). Buffer is a no-op
+                                    // here — the buffering insert stays inline
+                                    // below.
+                                    record_pending_neigh_admission_drop(&binding.live, admission);
+                                    match admission {
+                                        PendingNeighAdmission::DuplicateDrop => {}
+                                        PendingNeighAdmission::Buffer => {
+                                            // #2357: when this buffered packet is
+                                            // later flushed by retry_pending_neigh,
+                                            // its stored flow_key drives
+                                            // resolve_cos_tx_selection_at (egress
+                                            // queue / DSCP / output-filter). A
+                                            // non-first IP fragment carries no L4
+                                            // header, so refuse to synthesize a
+                                            // ported tuple from metadata for it —
+                                            // store `None` so the flush selects the
+                                            // interface default queue with no
+                                            // port-filter eval. `flow` is already
+                                            // `None` for a fragment (#2344); the
+                                            // gate only suppresses the meta
+                                            // fallback, leaving legitimate flowless
+                                            // TCP/UDP packets (real L4 header) their
+                                            // meta-derived ports. `raw_frame` is the
+                                            // UMEM slice for `desc`; this branch is
+                                            // only reached when
+                                            // `owned_packet_frame.is_none()`, so it
+                                            // describes the packet `meta` refers to.
+                                            // #2357/#3290: stored flow_key drives
+                                            // CoS/output-filter selection AND the TX
+                                            // request when retry_pending_neigh later
+                                            // flushes this packet. The helper gates
+                                            // the metadata fallback (non-first
+                                            // fragment, and non-identifier-bearing
+                                            // ICMP) so a fabricated pseudo-port is
+                                            // never buffered — the SAME gate the
+                                            // immediate forward path and the
+                                            // conntrack path apply. `raw_frame` is
+                                            // the UMEM slice for `desc` (this branch
+                                            // is only reached when
+                                            // `owned_packet_frame.is_none()`).
+                                            let pending_flow_key = pending_neigh_flow_key(
+                                                flow.as_ref(),
+                                                raw_frame,
+                                                meta,
+                                            );
+                                            binding.pending_neigh.insert(
+                                                pending_key,
+                                                PendingNeighPacket {
+                                                    addr: desc.addr,
+                                                    desc,
+                                                    meta,
+                                                    decision: pending_decision,
+                                                    flow_key: pending_flow_key,
+                                                    queued_ns: now_ns,
+                                                    probe_attempts: 0,
+                                                },
+                                            );
+                                            recycle_now = false;
+                                        }
+                                        PendingNeighAdmission::CapacityDrop => {
+                                            // #2375: a NEW distinct hop refused
+                                            // because pending_neigh is at
+                                            // MAX_PENDING_NEIGH (distinct-hop
+                                            // neighbor exhaustion — the
+                                            // scan/upstream-outage failure mode).
+                                            // The counter increment is the helper
+                                            // call above; the frame is recycled
+                                            // exactly like the duplicate branch
+                                            // (recycle_now stays true).
+                                        }
+                                    }
+                                }
+                                if cfg!(feature = "debug-log") {
+                                    if telemetry.dbg.missing_neigh <= 3 {
+                                        if let Some(flow) = flow.as_ref() {
+                                            eprintln!(
+                                                "DBG MISS_NEIGH→{}: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
+                                                "SOLICIT+SLOW",
+                                                flow.src_ip,
+                                                flow.forward_key.src_port,
+                                                flow.dst_ip,
+                                                flow.forward_key.dst_port,
+                                                meta.protocol,
+                                                pending_decision.resolution.egress_ifindex,
+                                                pending_decision.resolution.next_hop,
+                                            );
+                                        }
+                                    }
+                                }
+                                StageOutcome::Continue(())
+                            };
+                            if let StageOutcome::RecycleAndContinue = missing_neighbor_outcome {
+                                // Fresh RX descriptor: the arm's recycle outcome is
+                                // consumed by the SINGLE scratch_recycle push +
+                                // continue here; the continue skips the recycle_now
+                                // epilogue below.
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
                             }
                         }
                         ForwardingDisposition::PolicyDenied => telemetry.dbg.policy_deny += 1,

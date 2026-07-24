@@ -6,15 +6,28 @@ use super::super::*;
 ///
 /// Lifted verbatim from `apply_worker_commands` at the
 /// `WorkerCommand::DeleteSynced` match arm.
+///
+/// #6457: the deleted key is ALSO pushed onto `deleted_keys` so the worker
+/// loop (which owns the per-binding flow caches `apply_worker_commands`
+/// cannot see) invalidates every flow-cache slot backing it. The key is
+/// recorded UNCONDITIONALLY — even when this worker's session table has no
+/// entry (`delete_alias` is `None`): a stale cached `RewriteDescriptor`
+/// outlives the table entry it was seeded from (that survival is exactly
+/// the bug), so gating the record on the table lookup would leave the
+/// stale permit in place. A superfluous record costs one no-op
+/// `invalidate_slot` per binding (key+ifindex mismatch) — bounded by the
+/// control-plane delete rate, never per-packet.
 pub(in crate::afxdp::session_glue) fn handle_delete_synced(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
     forwarding: &ForwardingState,
     key: SessionKey,
     now_ns: u64,
+    deleted_keys: &mut Vec<SessionKey>,
 ) {
     let delete_alias = sessions.lookup(&key, now_ns, 0);
     sessions.delete(&key);
+    deleted_keys.push(key.clone());
     if let Some(lookup) = delete_alias {
         // #4388: release the NAT pool port reserved for this peer-synced
         // session at install (`handle_upsert_synced` /

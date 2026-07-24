@@ -22,7 +22,7 @@ pub(in crate::afxdp) struct OwnerProfileOwnerWrites {
     /// writer AND reader are sufficient; the snapshot path documents
     /// the bounded read-skew semantics at plan §3.6 R2 and mirrors
     /// the existing `drain_latency_hist` pattern at
-    /// `umem.rs:1322-1329`.
+    /// `binding_state/snapshot.rs`.
     pub(in crate::afxdp) tx_submit_latency_hist: [AtomicU64; TX_SUBMIT_LAT_BUCKETS],
     /// #812: count of completions observed since process start (the
     /// histogram is monotonic, never reset on snapshot — plan §3.6).
@@ -120,7 +120,7 @@ pub(in crate::afxdp) struct OwnerProfileOwnerWrites {
 /// there is no owner-write path into this struct.
 ///
 /// #5160: the redirect-sample SEQUENCE counter is NOT here — it moved to a
-/// producer-local thread-local (`REDIRECT_SAMPLE_SEQ`, umem/mod.rs) so the
+/// producer-local thread-local (`REDIRECT_SAMPLE_SEQ`, binding_state/latency.rs) so the
 /// many-producer redirect hot path pays no shared RMW per enqueue. Only the
 /// sampled op writes `redirect_acquire_hist` (the destination's aggregate).
 #[repr(align(64))]

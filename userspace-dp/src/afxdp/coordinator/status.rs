@@ -694,7 +694,7 @@ impl super::Coordinator {
     /// dispatcher with deltas actually queued. Compiled out of production builds.
     #[cfg(test)]
     pub(crate) fn seed_pending_session_deltas_for_test(&mut self, slot: u32, count: usize) {
-        let live = std::sync::Arc::new(crate::afxdp::umem::BindingLiveState::new());
+        let live = std::sync::Arc::new(crate::afxdp::binding_state::BindingLiveState::new());
         for _ in 0..count {
             live.push_session_delta(crate::protocol::SessionDeltaInfo::default());
         }

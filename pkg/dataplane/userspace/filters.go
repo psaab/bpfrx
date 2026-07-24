@@ -143,6 +143,41 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		// separate wire fields; the Rust matcher inverts membership.
 		snap.SourcePortsExcept = append(snap.SourcePortsExcept, term.SourcePortsExcept...)
 		snap.DestPortsExcept = append(snap.DestPortsExcept, term.DestPortsExcept...)
+		// #6459: a `from {source,destination}-port[-except]` token the compiler
+		// could not resolve to a number is recorded on term.UnknownPorts by
+		// compileFilterFrom (resolveFilterPortTokens) and kept VERBATIM in the
+		// port lists above. The strict commit gate
+		// (validateFilterMatchValuesStrict, #3205) rejects it; on the lenient /
+		// peer-sync path it reaches here. The pre-#6459 Rust filter compiler
+		// dropped the unresolvable token PER-TOKEN
+		// (`filter_map(parse_port_spec)`): a PARTIALLY-unresolvable list built
+		// a matcher over only the surviving subset — a discard/reject term then
+		// silently enforced a NARROWER port set than the operator wrote, and
+		// the traffic meant for the dropped ports fell through to the implicit
+		// accept (fail-OPEN). (An ALL-unresolvable list already failed closed
+		// at match-time via `constrained && PortMatcher::Any`, #2400/#3205.)
+		// Mark the term so the Rust filter compiler fails the snapshot CLOSED
+		// rather than enforcing the narrowed subset — mirroring the
+		// ICMP/DSCP/tcp-flags/flex #3406 family.
+		if len(term.UnknownPorts) > 0 {
+			snap.PortsUnrepresentable = true
+		}
+		// #6463: a literal `from source-address` / `destination-address` token
+		// that is not a parseable IP/CIDR is recorded on term.UnknownAddresses
+		// by compileFilterFrom (recordFilterAddrTokens). The strict commit gate
+		// (validateFilterAddressLiteralsStrict, #3433) rejects it; on the
+		// lenient / peer-sync path it reaches here. The pre-#6463 Rust
+		// parse_address dropped such a token PER-TOKEN (its `Err(_)` arm pushed
+		// nothing): a PARTIALLY-malformed list matched only the surviving
+		// prefixes — a discard/reject term then silently enforced a NARROWER
+		// address set than the operator wrote, and a host in the dropped range
+		// was accepted by fall-through (fail-OPEN). (An ALL-malformed direction
+		// already failed closed at match-time via `constrained && empty`,
+		// #2400.) Mark the term so the Rust filter compiler fails the snapshot
+		// CLOSED rather than enforcing the narrowed subset.
+		if len(term.UnknownAddresses) > 0 {
+			snap.AddressUnrepresentable = true
+		}
 		// #3406: a single direction carrying BOTH a positive port list and a
 		// `*-port-except` list has no single-inversion representation, so the Rust
 		// filter compiler resolves it POSITIVE-WINS (the except list is ignored —
