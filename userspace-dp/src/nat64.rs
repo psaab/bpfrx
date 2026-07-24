@@ -168,6 +168,14 @@ use crate::afxdp::write_eth_header_slice;
 // instead of a hardcoded 6 so a valid 7-ext-header packet is not
 // NAT64-dropped while the forwarding path accepts it.
 use crate::afxdp::MAX_IPV6_EXT_HEADERS;
+// #6435: the single canonical IPv6 extension-header WALK, shared with the
+// forwarding path (`afxdp::frame::inspect`). The NAT64 L4 / fragment
+// resolvers below fold its verdict instead of hand-mirroring the loop, so
+// the #4517 ext-header set, the AH arithmetic, and the #2292/#4435
+// fail-closed-at-the-bound posture can never drift between copies again.
+// Re-exported `pub(crate)` from `crate::afxdp` because NAT64 lives outside
+// `crate::afxdp` (same channel as the bound above).
+use crate::afxdp::{ExtChainOutcome, walk_ipv6_ext_chain};
 use crate::nat::{
     DeterministicV6, NatDecision, PortAllocator, SourceNatFailureReason, SourceNatFlowKey,
     allocate_nat64_pool_port, allocate_nat64_pool_port_deterministic_v6, release_nat64_pool_port,
@@ -1461,87 +1469,25 @@ pub(crate) fn translate_v6_to_v4(
 /// No-Next-Header (59) and a chain that runs off the end of the packet
 /// return `None`.
 ///
-/// This is the NAT64 translator's own bounded walk. The loop LOGIC is kept
-/// local (the private walk deliberately does not call into `crate::afxdp`,
-/// which itself depends on `crate::nat64`), but the BOUND is now the single
-/// canonical `MAX_IPV6_EXT_HEADERS` (8) imported from `crate::afxdp` — the
-/// same const the forwarding/screen walkers use (#4435). Before #4435 this
-/// walker surrendered at 6, so a valid 7-ext-header packet to a NAT64 prefix
-/// was dropped here while `afxdp::frame::inspect` accepted it. #4435 aligns
-/// BOTH ends: the loop bound (`MAX_IPV6_EXT_HEADERS`) AND the post-loop
-/// return — reaching the end of the loop now fails CLOSED (`None`), exactly
-/// like the canonical `packet_rel_l4_offset_and_protocol` (#2292). Without
-/// the post-loop change the two walkers still diverged by one at exactly
-/// `MAX_IPV6_EXT_HEADERS` ext headers (nat64 resolved, canonical dropped) —
-/// the skew merely moved from the 6-bound to the 8-bound. The full
-/// walker-function unification onto one shared implementation remains
-/// tracked separately (#2292) and is not a prerequisite for this alignment.
+/// #6435: this is now a thin fold over the ONE canonical walker,
+/// `crate::afxdp::walk_ipv6_ext_chain` (`afxdp::frame::inspect`) — the same
+/// walk the forwarding path's `packet_rel_l4_offset_and_protocol` folds, so
+/// NAT64 and forwarding resolve the same L4 BY CONSTRUCTION (the #4435
+/// bound-share made the bounds agree; this makes the loop itself agree).
+/// Every non-`L4` verdict fails CLOSED (`None`), exactly like the canonical
+/// walker (#2292): a chain still on an extension header at the
+/// `MAX_IPV6_EXT_HEADERS` bound is `OverLimit`, NOT a terminal — before
+/// #4435 the post-loop fall-through resolved one header deeper than the
+/// canonical walker, a one-level parity skew at the bound.
 ///
 /// The returned offset is only the START of the L4 header; the caller is
 /// responsible for the non-first-fragment check (a non-first fragment carries
 /// NO L4 header at this offset — its bytes are payload).
 fn ipv6_l4_offset_and_protocol(packet: &[u8]) -> Option<(usize, u8)> {
-    if packet.len() < 40 {
-        return None;
+    match walk_ipv6_ext_chain(packet, 0).outcome {
+        ExtChainOutcome::L4(offset, protocol) => Some((offset, protocol)),
+        _ => None,
     }
-    let mut protocol = packet[6];
-    let mut offset = 40usize;
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            // #4517: generic length-prefixed IPv6 extension headers —
-            // Hop-by-Hop (0) / Routing (43) / Destination Options (60) /
-            // Mobility (135) / HIP (139) / Shim6 (140) / experimental
-            // (253/254): length in 8-byte units, NOT counting the first 8
-            // bytes (RFC 8200 / 6275 / 7401 / 5533 / 3692). Kept in parity
-            // with the canonical afxdp::frame::inspect walkers so NAT64
-            // resolves the same L4 as the forwarding/screen paths. ESP (50)
-            // stays unwalked (encrypted, non-walkable).
-            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                let opt = packet.get(offset..offset + 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            // Authentication Header: length in 4-byte units, "minus 2"
-            // (RFC 4302 §2.2).
-            51 => {
-                let opt = packet.get(offset..offset + 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            // Fragment header: fixed 8 bytes.
-            44 => {
-                let frag = packet.get(offset..offset + 8)?;
-                protocol = frag[0];
-                offset = offset.checked_add(8)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            // No Next Header — no transport to translate.
-            59 => return None,
-            // Terminal: a real upper-layer protocol.
-            _ => return Some((offset, protocol)),
-        }
-    }
-    // #4435: fail-CLOSED at the bound, mirroring the canonical
-    // `afxdp::frame::inspect::packet_rel_l4_offset_and_protocol` (#2292).
-    // Reaching here means the chain is STILL on an extension header after
-    // `MAX_IPV6_EXT_HEADERS` iterations; `protocol` is an unconsumed
-    // ext-header type (0/43/51/60), not a real L4. The previous
-    // `Some((offset, protocol))` resolved one header deeper than the
-    // canonical walker (a chain of exactly `MAX_IPV6_EXT_HEADERS` ext
-    // headers translated here but was dropped there — a one-level parity
-    // skew moved from the old 6-bound to the 8-bound). Returning `None`
-    // gives true parity: an `> MAX_IPV6_EXT_HEADERS - 1`-header chain is
-    // dropped by BOTH walkers. A chain that DOES terminate within the
-    // bound still returns via the in-loop `_ => Some(...)` above.
-    None
 }
 
 /// RFC 7915 §5.1 translation-eligibility gate (#5625).
@@ -1695,61 +1641,22 @@ pub(crate) fn frame_is_nat64_exthdr_ineligible(frame: &[u8], addr_family: i32) -
 
 /// Is this L3-relative IPv6 packet a NON-first fragment (#2290)?
 ///
-/// Walks the (bounded) extension-header chain looking for a Fragment header
-/// (44). Returns `true` iff a fragment header is present AND its fragment
-/// offset (upper 13 bits of bytes 2-3, mask `0xFFF8`, RFC 8200 §4.5) is
-/// non-zero. A non-first fragment carries no L4 header, so its payload bytes
-/// must NOT be read as L4 — the translators fail closed on it. First/atomic
-/// fragments (offset 0) and packets without a fragment header return `false`.
-/// Mirrors `afxdp::frame::inspect::ipv6_is_non_first_fragment`.
+/// Folds the shared `walk_ipv6_ext_chain` (#6435): returns `true` iff the
+/// chain declared a Fragment header (44) whose fragment offset (upper 13
+/// bits of bytes 2-3, mask `0xFFF8`, RFC 8200 §4.5) is non-zero. A
+/// non-first fragment carries no L4 header, so its payload bytes must NOT
+/// be read as L4 — the translators fail closed on it. First/atomic
+/// fragments (offset 0) and packets without a fragment header return
+/// `false`; a declared-but-truncated Fragment header (offset bits
+/// unreadable) fails closed (`false`), exactly like the pre-#6435
+/// walker's `packet.get(offset..offset + 8)` else-return. Mirrors
+/// `afxdp::frame::inspect::ipv6_is_non_first_fragment` — literally: both
+/// fold the same recorded first-Fragment sighting.
 fn ipv6_is_non_first_fragment(packet: &[u8]) -> bool {
-    if packet.len() < 40 {
-        return false;
-    }
-    let mut protocol = packet[6];
-    let mut offset = 40usize;
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            // #4517: generic length-prefixed EHs (see the first walker's
-            // comment) — HbH/Routing/DestOpt + Mobility/HIP/Shim6/experimental.
-            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                let Some(opt) = packet.get(offset..offset + 2) else {
-                    return false;
-                };
-                protocol = opt[0];
-                let Some(next) = offset.checked_add((usize::from(opt[1]) + 1) * 8) else {
-                    return false;
-                };
-                offset = next;
-                if packet.len() < offset {
-                    return false;
-                }
-            }
-            51 => {
-                let Some(opt) = packet.get(offset..offset + 2) else {
-                    return false;
-                };
-                protocol = opt[0];
-                let Some(next) = offset.checked_add((usize::from(opt[1]) + 2) * 4) else {
-                    return false;
-                };
-                offset = next;
-                if packet.len() < offset {
-                    return false;
-                }
-            }
-            44 => {
-                let Some(frag) = packet.get(offset..offset + 8) else {
-                    return false;
-                };
-                let frag_off = u16::from_be_bytes([frag[2], frag[3]]) & 0xFFF8;
-                return frag_off != 0;
-            }
-            59 => return false,
-            _ => return false,
-        }
-    }
-    false
+    walk_ipv6_ext_chain(packet, 0)
+        .fragment
+        .and_then(|frag| frag.bytes)
+        .is_some_and(|b| (u16::from_be_bytes([b[2], b[3]]) & 0xFFF8) != 0)
 }
 
 /// Parsed IPv6 Fragment Header (next-header 44) fields, RFC 8200 §4.5.
@@ -1766,53 +1673,24 @@ struct Ipv6FragInfo {
 
 /// Parse the IPv6 Fragment Header (next-header 44) if present (#2488).
 ///
-/// Walks the bounded extension-header chain like `ipv6_l4_offset_and_protocol`
-/// and returns the Fragment Header's offset / M flag / Identification the
-/// FIRST time a Fragment Header is seen. Returns `None` for a packet that
-/// carries no Fragment Header (an ordinary, non-fragmented datagram), so the
-/// v6→v4 translator can fall back to its option-gated atomic-datagram framing.
+/// Folds the shared `walk_ipv6_ext_chain` (#6435) and reads the FIRST
+/// Fragment Header's offset / M flag / Identification from its recorded
+/// sighting. Returns `None` for a packet that carries no Fragment Header
+/// (an ordinary, non-fragmented datagram), so the v6→v4 translator can
+/// fall back to its option-gated atomic-datagram framing. A
+/// declared-but-truncated Fragment header (bytes unreadable) also returns
+/// `None`, exactly like the pre-#6435 walker's `packet.get(offset..offset
+/// + 8)?`; only the FIRST sighting is consulted, matching the pre-#6435
+/// stop-at-first-fragment walk.
 fn ipv6_fragment_header(packet: &[u8]) -> Option<Ipv6FragInfo> {
-    if packet.len() < 40 {
-        return None;
-    }
-    let mut protocol = packet[6];
-    let mut offset = 40usize;
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            // #4517: generic length-prefixed EHs (see the first walker's
-            // comment) — HbH/Routing/DestOpt + Mobility/HIP/Shim6/experimental.
-            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                let opt = packet.get(offset..offset + 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            51 => {
-                let opt = packet.get(offset..offset + 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            44 => {
-                let frag = packet.get(offset..offset + 8)?;
-                // bytes 2-3: FragmentOffset[15:3] | Res[2:1] | M[0].
-                let word = u16::from_be_bytes([frag[2], frag[3]]);
-                return Some(Ipv6FragInfo {
-                    offset_units: word >> 3,
-                    more: (word & 0x0001) != 0,
-                    ident: u32::from_be_bytes([frag[4], frag[5], frag[6], frag[7]]),
-                });
-            }
-            // No-Next-Header or a terminal upper-layer protocol: no Fragment
-            // Header on the chain.
-            _ => return None,
-        }
-    }
-    None
+    let bytes = walk_ipv6_ext_chain(packet, 0).fragment?.bytes?;
+    // bytes 2-3: FragmentOffset[15:3] | Res[2:1] | M[0].
+    let word = u16::from_be_bytes([bytes[2], bytes[3]]);
+    Some(Ipv6FragInfo {
+        offset_units: word >> 3,
+        more: (word & 0x0001) != 0,
+        ident: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+    })
 }
 
 /// #2562: does this L3-relative IPv6 packet trigger the NAT64 v6→v4

@@ -216,6 +216,15 @@ pub(crate) use self::frame::write_eth_header_slice;
 // IPv6 ext-header loop bound so `crate::nat64`'s private walkers stay
 // in lockstep with the forwarding/screen paths (one const, no skew).
 pub(crate) use self::frame::MAX_IPV6_EXT_HEADERS;
+// #6435: and now the canonical WALK itself — `crate::nat64`'s
+// L4-offset / non-first-fragment / fragment-header resolvers fold this
+// one shared walker (declared in `frame/inspect.rs`) instead of
+// hand-mirroring the loop, retiring the last private copies the #4435
+// bound-share left behind. `afxdp/icmp_embed/parse.rs` reaches the same
+// items through this re-export + its `use super::*` chain. Only the two
+// items NAT64/icmp_embed NAME are re-exported here — the `ExtChainWalk`
+// / `ExtChainFragment` field access needs no import.
+pub(crate) use self::frame::{ExtChainOutcome, walk_ipv6_ext_chain};
 use self::umem::*;
 
 // #4435 (test-only): a thin `pub(crate)` wrapper over the canonical
