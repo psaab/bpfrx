@@ -1,3 +1,43 @@
+## 2026-07-23 — #6423: split the lenient-gate apparatus into cohesive sibling files
+
+- **Timestamp**: 2026-07-23 (refactor/6423-config-lenient-gate)
+- **Action**: Behavior-preserving modularity refactor of the pkg/config
+  lenient-gate apparatus (#6423), following the #6441/#6442/#6443
+  precedent. Three moves: (1) the 1,936-line `compileOpts` struct + its
+  doc comment moved VERBATIM out of the 2,761-line compiler.go into its
+  own compiler_opts.go; (2) the 2,197-line `runUniformGates` god-function
+  (101 uniform-shape validation gates) decomposed — #6442-style — into 12
+  per-domain sub-runs in compiler_uniformgates_<domain>.go siblings, each
+  a verbatim contiguous slice of the original flat gate sequence, with the
+  orchestrator dispatching them in the SAME order so the first-failing-
+  gate-wins strict ordering (invariant #6) and the tolerant warning-
+  accumulation order (invariant #7) are unchanged; (3) the two byte-
+  identical ~125-field lenient composite literals in CompileConfigLenient
+  and CompileConfigForNodeLenient deduped to a single `lenientCompileOpts()`
+  SSOT constructor (compileOpts is a value type — a fresh copy per call,
+  equivalent to the inline literals). compiler.go 2,761 -> 566;
+  compiler_uniformgates.go 2,197 -> 69 (orchestrator only).
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_uniformgates.go,
+  pkg/config/compiler_uniformgates_{cos_platform,policy,screen,cluster_zone,
+  nat,dhcp_app,filter,ipsec_event,log_feed_routing,firewall_nat2,
+  sampling_appset,routing_rib_rpm}.go,
+  docs/refactoring-audit-current.txt, _Log.md
+- **Validation**: Behavior-preservation proof — (A) struct+doc verbatim:
+  byte-exact diff of orig compiler.go 40-1979 vs compiler_opts.go struct
+  region = ZERO delta; (B) gate decomposition: concat of the 12 segment
+  bodies == original runUniformGates body (2,168 lines each) = ZERO delta,
+  segment-call order matches original block order; (C) dedup: constructor
+  fields byte-identical to BOTH original twin literals (126 == 126 == 126)
+  = ZERO delta. `go build ./...`, `go vet ./pkg/config/`, gofmt clean on
+  all touched files (3 pre-existing unformatted _test.go files left
+  untouched); golden gate-ordering test (compile_golden_4406_test.go)
+  GREEN; FULL `go test ./...` GREEN (58 ok, 0 FAIL — incl. #1373
+  pkg/dataplane retirement canary + TestHeatmapNotStale). Heatmap regen
+  drops the compiler.go + compiler_uniformgates.go REFACTOR lines and adds
+  compiler_opts.go (2,080, a single heavily-documented struct that pure
+  code-motion cannot subdivide); no untouched-file drift absorbed.
+
 ## 2026-07-23 — #6439: split pkg/ipsec/policy.go — lift the address/family-resolution island to policy_addr.go
 
 - **Timestamp**: 2026-07-23 (refactor/6439-ipsec-policy-split)
