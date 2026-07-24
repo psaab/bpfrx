@@ -1,3 +1,35 @@
+## 2026-07-23 — #6403: seed the synchronous ArchiveConfig mirror from its target dir under the write lock
+
+- **Timestamp**: 2026-07-23 (fix/6403-archive-offlock)
+- **Action**: Closed the #6403 latent off-lock seq race in the synchronous
+  archive mirror (`Store.ArchiveConfig`). The old code captured the archive seq
+  off the process-global `archiveSeq` under `RLock`, released the lock, then
+  wrote off-lock. `archiveSeq` is seeded by `SetArchiveConfig` from whatever dir
+  it last activated, but `ArchiveConfig` writes to a dir passed as a PARAMETER
+  (decoupled from the active `archiveDir`), so the shared counter could sit
+  BELOW that dir's on-disk max — the archive then landed with a below-max seq
+  that `rotateArchives` (#5523 seq-ordered retention) immediately pruned as
+  stale. A concurrent `SetArchiveConfig` reseed in the off-lock window is one
+  way the counter/target-dir relationship became undefined. Fix: `ArchiveConfig`
+  now holds the WRITE lock (not `RLock`) across the seed scan + seq claim and
+  seeds the counter from ITS target dir's on-disk max (monotonic-up, mirroring
+  the commit path's `ensureArchiveSeededLocked`, #6404) BEFORE claiming, so the
+  seq always outranks the dir's contents AND the claim is mutually exclusive
+  with a concurrent `SetArchiveConfig` reseed. Only the WRITE stays off-lock
+  (the #6185 `QuiesceArchival` deadlock is holding s.mu across the WRITE, not
+  the bounded seed `ReadDir` the commit path already does under lock). A genuine
+  seed scan error fails the synchronous call rather than write a below-max
+  archive; a nonexistent dir is confirmed-empty (seq 0, `MkdirAll` creates it).
+- **File(s)**: pkg/configstore/store_persist.go,
+  pkg/configstore/archive_offlock_6403_test.go, pkg/configstore/README.md
+- **Validation**: `go build ./...`, `go vet ./pkg/configstore/`, gofmt clean;
+  `go test ./pkg/configstore/ -race` GREEN; full `go test ./...` GREEN. Two new
+  fail-on-revert tests
+  (`TestArchiveConfigSeedsFromDirBeforeClaimingSeq`,
+  `TestArchiveConfigClaimSeqAtomicVsConcurrentReseed`) assert the REAL rotation
+  outcome (fresh archive survives, oldest pre-existing pruned); both go clean-
+  assertion RED when the `s.archiveSeq.Store(seed)` seed is neutralized.
+
 ## 2026-07-23 — #6165: gate the ~1s desired-state forwarding reconcile with the required-protocol check
 
 - **Timestamp**: 2026-07-23 (fix/6165-forwarding-reconcile-audit)
