@@ -696,6 +696,20 @@ pub(crate) enum Nat64Match {
     /// outside every Pref64 never reaches this arm, so eligible traffic is
     /// untouched.
     IneligibleSource,
+    /// #6475: the extracted embedded IPv4 DESTINATION is non-global per
+    /// RFC 6052 §2.2 — one of `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`,
+    /// `224.0.0.0/4`, or `240.0.0.0/4` (which subsumes `255.255.255.255/32`).
+    /// Pre-gate, `64:ff9b::127.0.0.1` classified `MatchReady(127.0.0.1)` and,
+    /// with lo0 configured, resolved LocalDelivery to the localhost-only
+    /// control plane (gRPC 50051 / REST 8080) — reachable from any NAT64
+    /// client, bidirectionally, through a minted session. The caller MUST drop
+    /// fail-closed with a distinct counter BEFORE route lookup (which precedes
+    /// the FIB walk AND the `local_v4` LocalDelivery resolution), policy, or
+    /// `allocate_source`, so no session/BIB/allocation state is minted for a
+    /// non-global embedded destination. The destination-side sibling of
+    /// [`Nat64Match::IneligibleSource`] (#5623); a global embedded destination
+    /// never reaches this arm, so eligible traffic is untouched.
+    IneligibleDestination,
 }
 
 /// Parse a NAT64 source-pool IPv4 address that may carry a canonical host
@@ -1017,6 +1031,42 @@ impl Nat64State {
             .any(|prefix| octets[..12] == prefix.prefix_bytes)
     }
 
+    /// #6475: RFC 6052 §2.2 non-global embedded-IPv4 screen. A NAT64 prefix
+    /// (the Well-Known Prefix 64:ff9b::/96 MUST, and any configured Pref64 here
+    /// is held to the same bar) MUST NOT translate an embedded IPv4 address
+    /// that is not globally routable. Pre-gate, `match_ipv6_dest` extracted the
+    /// low 32 bits unconditionally, so `64:ff9b::127.0.0.1` classified
+    /// `MatchReady(127.0.0.1)` and — with lo0 configured, whose addresses land
+    /// in `state.local_v4` (`afxdp/forwarding_build/interfaces.rs`) — resolved
+    /// LocalDelivery: a NAT64 client reached a socket bound to 127.0.0.1 on the
+    /// firewall itself (the localhost-only admin plane: gRPC 50051, REST 8080).
+    ///
+    /// The screened classes (first-octet checks, allocation-free, one short
+    /// compare chain per classified packet):
+    ///   * `0.0.0.0/8`        — "this host on this network" (RFC 1122 §3.2.1.3);
+    ///                          includes the `<prefix>::` lower boundary.
+    ///   * `127.0.0.0/8`      — loopback (RFC 1122 §3.2.1.3) — the LocalDelivery
+    ///                          exposure above.
+    ///   * `169.254.0.0/16`   — link-local (RFC 3927).
+    ///   * `224.0.0.0/4`      — multicast (RFC 5771); a translated multicast dst
+    ///                          has no unicast FIB/BIB semantics.
+    ///   * `240.0.0.0/4`      — reserved (RFC 1112 §4); subsumes
+    ///                          `255.255.255.255/32` limited broadcast and the
+    ///                          `<prefix>::ffff:ffff` upper boundary.
+    ///
+    /// RFC 6052 §2.2 also names RFC 1918 private space as non-global; the issue
+    /// scopes that screening to OPTIONAL even for the WKP (an NSP deployment may
+    /// legitimately translate to internal v4), so RFC 1918 / TEST-NET embedded
+    /// destinations still translate — pinned by the global-control test.
+    fn embedded_v4_is_non_global(v4: Ipv4Addr) -> bool {
+        let o = v4.octets();
+        o[0] == 0
+            || o[0] == 127
+            || (o[0] == 169 && o[1] == 254)
+            || (o[0] & 0xF0) == 0xE0
+            || (o[0] & 0xF0) == 0xF0
+    }
+
     /// #5623: source-eligibility-gated NAT64 classification. Runs the RFC 6146
     /// §3.5 source drop BEFORE the destination match, so a Pref64-sourced
     /// (looping/synthesized) packet returns the distinct fail-closed
@@ -1048,21 +1098,33 @@ impl Nat64State {
     /// [`Self::classify_ipv6_packet`], which calls this after clearing the
     /// source. Callers on the forward IPv6 path should use `classify_ipv6_packet`
     /// so an ineligible source is rejected before translation.
+    ///
+    /// #6475: a prefix-matched destination whose extracted embedded IPv4 is
+    /// non-global per RFC 6052 §2.2 (see [`Self::embedded_v4_is_non_global`])
+    /// now returns [`Nat64Match::IneligibleDestination`] — fail-closed with a
+    /// distinct counter — BEFORE the pool check, so input validation precedes
+    /// the capacity/config report and the packet never reaches route lookup,
+    /// policy, `allocate_source`, or the `local_v4` LocalDelivery resolution.
     pub(crate) fn classify_ipv6_dest(&self, dst: Ipv6Addr) -> Nat64Match {
         match self.match_ipv6_dest(dst) {
             None => Nat64Match::NoPrefixMatch,
-            Some((prefix_idx, dst_v4)) => match self.prefixes.get(prefix_idx) {
-                // #4381: liveness probe only — a non-empty pool means a source
-                // CAN be allocated at Permit; the actual `(snat_v4, port)`
-                // allocation is deferred to `allocate_source` so a denied flow
-                // never consumes a pool port. An empty pool fails closed.
-                Some(prefix) if !prefix.pool_v4.is_empty() => Nat64Match::MatchReady {
-                    prefix_idx,
-                    dst_v4,
-                    dst_v6: dst,
-                },
-                _ => Nat64Match::MatchUnavailable,
-            },
+            Some((prefix_idx, dst_v4)) => {
+                if Self::embedded_v4_is_non_global(dst_v4) {
+                    return Nat64Match::IneligibleDestination;
+                }
+                match self.prefixes.get(prefix_idx) {
+                    // #4381: liveness probe only — a non-empty pool means a source
+                    // CAN be allocated at Permit; the actual `(snat_v4, port)`
+                    // allocation is deferred to `allocate_source` so a denied flow
+                    // never consumes a pool port. An empty pool fails closed.
+                    Some(prefix) if !prefix.pool_v4.is_empty() => Nat64Match::MatchReady {
+                        prefix_idx,
+                        dst_v4,
+                        dst_v6: dst,
+                    },
+                    _ => Nat64Match::MatchUnavailable,
+                }
+            }
         }
     }
 

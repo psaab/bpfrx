@@ -4990,3 +4990,232 @@ fn nat64_5623_eligible_source_non_nat64_dest_still_routes() {
         Nat64Match::NoPrefixMatch
     );
 }
+
+// ===========================================================================
+// #6475: NAT64 DESTINATION-eligibility rejection (RFC 6052 §2.2).
+//
+// A NAT64 prefix MUST NOT translate an embedded IPv4 destination that is not
+// globally routable. Pre-gate, `match_ipv6_dest` extracted the low 32 bits
+// unconditionally, so `64:ff9b::127.0.0.1` classified `MatchReady(127.0.0.1)`
+// and — with lo0 configured, whose addresses land in `state.local_v4` —
+// resolved LocalDelivery to the localhost-only control plane (gRPC 50051 /
+// REST 8080), reachable bidirectionally from any NAT64 client through a minted
+// session. `classify_ipv6_dest` now returns the distinct fail-closed
+// `IneligibleDestination` BEFORE the pool check, route lookup, policy, or
+// `allocate_source`.
+//
+// These are the fail-on-revert guards: every reject case below is a VALID
+// Pref64 destination whose extracted v4 is in a screened class, so WITHOUT the
+// gate the classifier returns `MatchReady` (translate) — reverting the gate
+// flips each assertion RED. The global-control test stays green, guarding
+// against over-reject of a legitimate embedded destination.
+// ===========================================================================
+
+/// #6475 helper: assert BOTH classify entry points (the production
+/// `classify_ipv6_packet` with an eligible source, and the dest-only
+/// `classify_ipv6_dest` used by the degenerate V4-src arm and the #5174
+/// MissingNeighbor re-classify) reject the destination as
+/// `IneligibleDestination`.
+fn assert_dst_ineligible_6475(state: &Nat64State, dst: Ipv6Addr, what: &str) {
+    let src: Ipv6Addr = "2001:db8::1".parse().unwrap(); // eligible, outside Pref64
+    assert_eq!(
+        state.classify_ipv6_packet(src, dst),
+        Nat64Match::IneligibleDestination,
+        "#6475: {what} embedded in a NAT64 destination must be rejected before translation"
+    );
+    assert_eq!(
+        state.classify_ipv6_dest(dst),
+        Nat64Match::IneligibleDestination,
+        "#6475: {what} must also be rejected by the dest-only classify"
+    );
+    // Counterfactual pin: the prefix DOES match and the v4 WOULD have been
+    // extracted — the reject is the gate, not a no-match. Without the gate the
+    // extracted v4 reaches `MatchReady`, so this assertion pair flips RED.
+    assert!(
+        state.match_ipv6_dest(dst).is_some(),
+        "#6475: {what} still prefix-matches — the gate, not the prefix scan, rejects it"
+    );
+}
+
+#[test]
+fn nat64_6475_dst_this_host_on_this_network_rejected() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    // 0.0.0.0/8 "this host on this network" (RFC 1122 §3.2.1.3). `<prefix>::`
+    // is the embedded-v4 lower boundary (0.0.0.0).
+    assert_dst_ineligible_6475(&state, "64:ff9b::".parse().unwrap(), "0.0.0.0 (lower boundary)");
+    assert_dst_ineligible_6475(&state, "64:ff9b::1".parse().unwrap(), "0.0.0.1");
+    assert_dst_ineligible_6475(
+        &state,
+        "64:ff9b::ff:ffff".parse().unwrap(),
+        "0.255.255.255 (top of 0.0.0.0/8)",
+    );
+}
+
+#[test]
+fn nat64_6475_dst_loopback_rejected() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    // 127.0.0.0/8 loopback (RFC 1122 §3.2.1.3) — the issue's headline case:
+    // `64:ff9b::127.0.0.1` would otherwise LocalDeliver to the localhost-only
+    // control plane once lo0 lands in `state.local_v4`.
+    assert_dst_ineligible_6475(&state, "64:ff9b::127.0.0.1".parse().unwrap(), "127.0.0.1 loopback");
+    assert_dst_ineligible_6475(
+        &state,
+        "64:ff9b::7fff:ffff".parse().unwrap(),
+        "127.255.255.255 (top of 127.0.0.0/8)",
+    );
+}
+
+#[test]
+fn nat64_6475_dst_link_local_rejected() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    // 169.254.0.0/16 link-local (RFC 3927).
+    assert_dst_ineligible_6475(
+        &state,
+        "64:ff9b::a9fe:0001".parse().unwrap(),
+        "169.254.0.1 link-local",
+    );
+    assert_dst_ineligible_6475(
+        &state,
+        "64:ff9b::a9fe:fffe".parse().unwrap(),
+        "169.254.255.254 link-local",
+    );
+}
+
+#[test]
+fn nat64_6475_dst_multicast_rejected() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    // 224.0.0.0/4 multicast (RFC 5771) — a translated multicast destination has
+    // no unicast FIB/BIB semantics.
+    assert_dst_ineligible_6475(&state, "64:ff9b::e000:0001".parse().unwrap(), "224.0.0.1 multicast");
+    assert_dst_ineligible_6475(
+        &state,
+        "64:ff9b::efff:ffff".parse().unwrap(),
+        "239.255.255.255 (top of 224.0.0.0/4)",
+    );
+}
+
+#[test]
+fn nat64_6475_dst_reserved_and_limited_broadcast_rejected() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    // 240.0.0.0/4 reserved (RFC 1112 §4) — subsumes 255.255.255.255/32 limited
+    // broadcast; `<prefix>::ffff:ffff` is the embedded-v4 upper boundary.
+    assert_dst_ineligible_6475(&state, "64:ff9b::f000:0001".parse().unwrap(), "240.0.0.1 reserved");
+    assert_dst_ineligible_6475(
+        &state,
+        "64:ff9b::ffff:ffff".parse().unwrap(),
+        "255.255.255.255 limited broadcast (upper boundary)",
+    );
+}
+
+#[test]
+fn nat64_6475_global_dst_still_translates() {
+    // Over-reject guard: a legitimate embedded IPv4 destination must still
+    // translate exactly as before. 198.51.100.50 is TEST-NET-2 — RFC 6052 §2.2
+    // also names RFC 1918 / RFC 5735 special-use space, but the issue scopes
+    // that screening to OPTIONAL (an NSP deployment may legitimately translate
+    // to internal v4), so only the listed classes are rejected and TEST-NET /
+    // RFC 1918 embedded destinations still classify MatchReady.
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap(); // ::198.51.100.50
+    match state.classify_ipv6_packet(src, dst) {
+        Nat64Match::MatchReady {
+            prefix_idx,
+            dst_v4,
+            dst_v6,
+        } => {
+            assert_eq!(prefix_idx, 0);
+            assert_eq!(dst_v4, Ipv4Addr::new(198, 51, 100, 50));
+            assert_eq!(dst_v6, dst);
+        }
+        other => panic!("expected MatchReady for a global embedded dst, got {other:?}"),
+    }
+    // 8.8.8.8 — unambiguously global — translates too.
+    let dst2: Ipv6Addr = "64:ff9b::808:0808".parse().unwrap();
+    assert!(
+        matches!(
+            state.classify_ipv6_packet(src, dst2),
+            Nat64Match::MatchReady { .. }
+        ),
+        "a global embedded destination (8.8.8.8) must still translate"
+    );
+    // A non-NAT64 destination is untouched by the gate (still routes as IPv6).
+    let plain: Ipv6Addr = "2001:db8::2".parse().unwrap();
+    assert_eq!(
+        state.classify_ipv6_packet(src, plain),
+        Nat64Match::NoPrefixMatch,
+        "a non-Pref64 destination must still fall through to IPv6 routing"
+    );
+}
+
+#[test]
+fn nat64_6475_nonglobal_dst_rejected_before_pool_check() {
+    // Ordering pin: input validation precedes the capacity/config report — a
+    // non-global embedded destination on a prefix with an EMPTY pool reports
+    // the distinct `IneligibleDestination`, not `MatchUnavailable`, so the
+    // operator counter attributes the reject to the malformed destination.
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "no-pool".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec![],
+        no_v6_frag_header: false,
+        ..Default::default()
+    }]);
+    let dst: Ipv6Addr = "64:ff9b::127.0.0.1".parse().unwrap();
+    assert_eq!(
+        state.classify_ipv6_dest(dst),
+        Nat64Match::IneligibleDestination,
+        "a non-global embedded dst must reject before the empty-pool check"
+    );
+    // The eligible-dst empty-pool behavior is unchanged (still MatchUnavailable).
+    let global_dst: Ipv6Addr = "64:ff9b::808:0808".parse().unwrap();
+    assert_eq!(
+        state.classify_ipv6_dest(global_dst),
+        Nat64Match::MatchUnavailable,
+        "a global embedded dst on an empty pool still reports MatchUnavailable"
+    );
+}
+
+#[test]
+fn nat64_6475_embedded_v4_predicate_range_boundaries() {
+    // Pin the exact screened ranges at their edges so a mask/range drift (a
+    // widened or narrowed class) is RED. Each `true` case sits inside a
+    // screened class; each `false` case is the nearest global address outside
+    // it.
+    let non_global = [
+        Ipv4Addr::new(0, 0, 0, 0),          // 0.0.0.0/8 floor
+        Ipv4Addr::new(0, 255, 255, 255),    // 0.0.0.0/8 ceiling
+        Ipv4Addr::new(127, 0, 0, 0),        // 127.0.0.0/8 floor
+        Ipv4Addr::new(127, 255, 255, 255),  // 127.0.0.0/8 ceiling
+        Ipv4Addr::new(169, 254, 0, 0),      // 169.254.0.0/16 floor
+        Ipv4Addr::new(169, 254, 255, 255),  // 169.254.0.0/16 ceiling
+        Ipv4Addr::new(224, 0, 0, 0),        // 224.0.0.0/4 floor
+        Ipv4Addr::new(239, 255, 255, 255),  // 224.0.0.0/4 ceiling
+        Ipv4Addr::new(240, 0, 0, 0),        // 240.0.0.0/4 floor
+        Ipv4Addr::new(255, 255, 255, 255),  // limited broadcast
+    ];
+    for v4 in non_global {
+        assert!(
+            Nat64State::embedded_v4_is_non_global(v4),
+            "{v4} must be screened as non-global"
+        );
+    }
+    let global = [
+        Ipv4Addr::new(1, 0, 0, 0),          // just above 0.0.0.0/8
+        Ipv4Addr::new(126, 255, 255, 255),  // just below 127.0.0.0/8
+        Ipv4Addr::new(128, 0, 0, 0),        // just above 127.0.0.0/8
+        Ipv4Addr::new(169, 253, 255, 255),  // just below 169.254.0.0/16
+        Ipv4Addr::new(169, 255, 0, 0),      // just above 169.254.0.0/16
+        Ipv4Addr::new(223, 255, 255, 255),  // just below 224.0.0.0/4
+        Ipv4Addr::new(8, 8, 8, 8),          // ordinary global unicast
+        Ipv4Addr::new(198, 51, 100, 50),    // TEST-NET-2 (not screened, see issue)
+        Ipv4Addr::new(192, 168, 0, 1),      // RFC 1918 (not screened, see issue)
+        Ipv4Addr::new(10, 0, 0, 1),         // RFC 1918 (not screened, see issue)
+    ];
+    for v4 in global {
+        assert!(
+            !Nat64State::embedded_v4_is_non_global(v4),
+            "{v4} must NOT be screened as non-global"
+        );
+    }
+}

@@ -555,6 +555,17 @@ pub(crate) struct BindingStatus {
     /// safety (an older helper omits it and Go/Rust read 0).
     #[serde(rename = "nat64_ineligible_source", default)]
     pub nat64_ineligible_source: u64,
+    /// #6475: fail-closed NAT64 DESTINATION-ineligibility drops — an incoming
+    /// IPv6 packet whose NAT64-prefix-matched destination embeds a non-global
+    /// IPv4 per RFC 6052 §2.2 (0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16,
+    /// 224.0.0.0/4, 240.0.0.0/4 — e.g. `64:ff9b::127.0.0.1`, which would
+    /// otherwise resolve LocalDelivery to the localhost-only control plane once
+    /// lo0 lands in `state.local_v4`) dropped BEFORE route lookup, policy, or
+    /// `allocate_source`. Distinct from the source/pool counters — this is a
+    /// destination input-validation reject. `default` keeps cross-version wire
+    /// safety (an older helper omits it and Go/Rust read 0).
+    #[serde(rename = "nat64_ineligible_dest", default)]
+    pub nat64_ineligible_dest: u64,
     /// #5625: fail-closed NAT64 EXTENSION-HEADER ineligibility drops — a v6→v4
     /// forward translation rejected because the IPv6 packet carried an
     /// Authentication Header (51), an ACTIVE Routing header (43, Segments

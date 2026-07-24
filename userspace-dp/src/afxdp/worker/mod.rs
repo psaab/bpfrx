@@ -1502,6 +1502,12 @@ pub(crate) struct BindingLiveSnapshot {
     /// from BindingLiveState (an incoming IPv6 packet whose source lies within a
     /// configured Pref64 — the RFC 6146 §3.5 mandatory hairpin/source drop).
     pub(crate) nat64_ineligible_source: u64,
+    /// #6475: cumulative fail-closed NAT64 destination-ineligibility drops
+    /// snapshotted from BindingLiveState (a NAT64-prefix-matched destination
+    /// embedding a non-global IPv4 per RFC 6052 §2.2 — e.g.
+    /// `64:ff9b::127.0.0.1`, which would otherwise LocalDeliver to the
+    /// localhost-only control plane).
+    pub(crate) nat64_ineligible_dest: u64,
     /// #5625: cumulative fail-closed NAT64 ext-header ineligibility drops
     /// snapshotted from BindingLiveState (a v6→v4 forward translation rejected
     /// because the IPv6 packet carried an Authentication Header, an active
