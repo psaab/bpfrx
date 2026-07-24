@@ -1,9 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v19 — r18 findings folded (Codex NEEDS-REVISION
-  7M/5m; AGY PLAN-READY; Claude SMR NEEDS-REVISION 1M/2m — its M1/m1/m2
-  independently anticipated Codex M6/M5/m2); pending convergence review
-  r19
+- **Status**: DRAFT v20 — r19 findings folded (Codex NEEDS-REVISION
+  3M/6m + SPLIT-REJECTED; AGY PLAN-READY; Claude SMR
+  PLAN-READY-WITH-NITS 0M/2m — both nits folded here); pending
+  convergence review r20
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -499,6 +499,56 @@
   health.go:10-16, bootstrap.go:36-47 (Codex m4); §6's health
   "preserved exactly" claim corrected to contract-preserved,
   message-repertoire-grown.
+  v20: r19 convergence — the debt machinery's last semantic pins land
+  (Codex 3M/6m + SPLIT-REJECTED with reasoning recorded: H-without-H2
+  would turn master's DELAYED lingering-record hazard into an
+  IMMEDIATE revert-at-load for the confirmed FirstCommit+cluster
+  class, so the only sound split would move H WITH H2 — the split
+  question is moot if r20 converges; AGY PLAN-READY; SMR
+  PLAN-READY-WITH-NITS with both nits folded here): (a) the same-key
+  rule GENERALIZED to same-RECORD dominance (Codex M1, verified:
+  R_A's mismatch branch rewrites the CURRENT record B, so R-before-W
+  same-key ordering did not constrain R_A-vs-R_B — a stale-keyed
+  removal's mismatch rewrite could still durably restore a
+  pending-shaped record before its own removal ran): while ANY
+  R-kind debt keys the current record K, NO other write of K runs
+  (no W-kind rewrite, no stale-keyed mismatch rewrite); R_K's
+  tombstone is the universal barrier; x16 gains the R_A-first crash
+  leg. (b) DEBT-KIND SPLIT (Codex M2, verified: the v19 continuation
+  processed rewrite debts with removal semantics — tombstoning a
+  LIVE window's record or abandoning its recovery file): R-kind runs
+  the four-state removal table; W-kind runs a three-state rewrite
+  table (match → rewrite durable; mismatch → supersession
+  transitions; absent → restore-from-in-memory-window-state or
+  stale-clear); absent-for-W is NO-OP-and-clear ONLY when a same-key
+  R consumed it. (c) BOOT-origin persistent substates (Codex M3,
+  verified the clear-and-defer hole: health went green with the
+  record's fate unsettled, and a replacement landing DURING the
+  unreadable window left the record superseded-unknown):
+  RESTART-RECOVERY-OWED keeps the latch + a distinct
+  restart-required 503 until reboot (never green-while-unsettled);
+  SUPERSEDED-WHILE-UNREADABLE (a marker set by a durable plain
+  commit/SyncApply during the latch) converts the repaired record to
+  an R-kind debt. (d) Confirmed-commit orphan resolution BY
+  OVERWRITE (Codex m2 — a pre-arm tombstone+delete would add two
+  durable ops to the admitted recordless window): the arm's
+  WriteConfirm replaces the orphan; a PRE-rename arm failure leaves
+  it intact + an R-kind debt keyed A; x17 gains the leg. (e) The
+  convergence MEASURE corrected (Codex m1): lexicographic
+  remaining-stage per debt, eventual zero given quiescence + a
+  failure-free suffix; tombstone-required dominates delete-finishing
+  on merge. (f) Envelope arithmetic pinned (Codex m3): initial read
+  + ≤3 retries (4 reads), 100/200/400 ms delays, `LoadContext(ctx)`
+  with `Load()` preserved. (g) The confirm-persist health message is
+  GENERIC removal/rewrite + a debt-kind detail (Codex m4). (h) The
+  sweep gains db.go:239-241 + README.md:470-473 (stale
+  log-and-continue) + README.md:937-968 (three Load shapes → four,
+  plus the every-outcome seeding read), the "BOTH causes" r17
+  framing corrected to three (Codex m5), and the orphan premise
+  documented as single-Store ownership, not the mutex (Codex m6,
+  `daemon.go:1042-1053`). SMR r19 nits folded: x17's confirmed-commit
+  leg (as (d)) and the Load-seeding unreadable branch names the
+  class split explicitly.
 
 ---
 
@@ -1304,8 +1354,10 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   with no in-memory window, `store_commit.go:678-682`): `Load` reads
   confirm.json on EVERY outcome (absent-DB, compile-failed, success)
   and seeds a THREE-STATE identity — PRESENT(ArmID) / ABSENT /
-  unreadable (→ the terminal latch, taxonomy bullet) — so "" is only
-  ever a PRESENT legacy record's value, never "not observed". The
+  unreadable (the unreadable branch itself splits by class per the
+  taxonomy bullet: TRANSIENT → the bounded-retry-then-fail-closed
+  boot path; PERMANENT → the terminal latch) — so "" is only ever a
+  PRESENT legacy record's value, never "not observed". The
   absent-DB path logs a PRESENT orphan loudly and leaves it keyed: its
   lifecycle is the next successful boot's stale-drop (GuardedHash
   mismatch) or the first keyed resolution that targets it — never a
@@ -1319,15 +1371,32 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   `store_commit.go:678-682` — and a legacy empty-`GuardedHash` or
   byte-identical-content A then BINDS at the next recovery,
   `store_persist.go:149-165`, re-arming or reverting a config the
-  commit already superseded): every superseding replacement — plain
-  commit, confirmed commit, SyncApply — that lands durably ALSO
-  resolves a SEEDED Present(record) when NO in-memory window is
-  pending: the record is by construction an orphan (its window died
-  with the last process), the replacement supersedes whatever it
-  guarded, and the keyed tombstone→delete runs at the same
-  post-durability point as every other finalize. Regression (x17)
-  drives the absent-DB-Load → bootstrap/plain-commit → orphan
-  tombstoned+deleted chain (pre-fix: the orphan survives to bind).
+  commit already superseded): every superseding replacement that
+  lands durably ALSO resolves a SEEDED Present(record) when NO
+  in-memory window is pending: the record is by construction an
+  orphan (its window died with the last process — the
+  SINGLE-STORE-OWNERSHIP invariant, r19 Codex m6: exactly one Store
+  owns the `.configdb/` directory per node, created once at
+  `daemon.go:1042-1053`; the orphan premise rests on THAT ownership,
+  not on `s.mu`, which serializes only within one Store), the
+  replacement supersedes whatever it guarded. The MECHANICS differ
+  by path (r19 Codex m2): a PLAIN COMMIT or SYNCAPPLY (no fresh
+  confirm record of its own) resolves the orphan at the same
+  post-durability finalize point as every other removal
+  (keyed tombstone→delete); a CONFIRMED COMMIT resolves the orphan
+  BY OVERWRITE — the arm's `writeConfirmState` replaces the record
+  with the fresh window's (no pre-arm tombstone+delete: that would
+  add two durable operations to the admitted recordless crash window
+  between `writeActive` and `writeConfirmState`,
+  `store_commit.go:437-468,503-524`) — and a PRE-rename arm failure
+  leaves the orphan INTACT and converts it to an R-kind removal debt
+  keyed A (from the seeded identity; the retry's R-kind table
+  tombstones→deletes it). Regression (x17)
+  drives BOTH legs: absent-DB-Load → bootstrap/plain-commit → orphan
+  tombstoned+deleted (pre-fix: the orphan survives to bind), AND
+  absent-DB-Load → commit-confirmed → pre-rename arm failure →
+  orphan intact + R_A → retry completes the removal (no binding
+  record survives).
   Debts key on `onDiskArmID`, NEVER on `armedArmID` and never on a fresh
   disk read at debt-construction time (a resolution-time READ ERROR must
   still construct the right debt, r15 Codex M4). A resolution keys its
@@ -1381,47 +1450,68 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   concurrent: `persistRetryLoop` (`store_persist.go:414-428`) heals
   `persistDegraded` FIRST (the active write), then
   `clearConfirmResolutionPendingLocked` finalizes the deferred removal.
-  The confirm-side retry carries a KEYED DEBT SET — NOT a bounded pair
-  (r17 Codex M3 = SMR M3, independently walked: R_A from A's resolution
-  + W_B from B's post-rename arm failure + R_B from B's resolution whose
-  tombstone fails post-rename — all inside ONE retry sleep, since the
-  singleton sleeps OUTSIDE the lock, `store_persist.go:402-405` — the
-  v17 "≤1 removal + 1 rewrite" bound is FALSE and is deleted): the set
-  holds MULTIPLE removal debts (one per unresolved resolution) + AT
-  MOST ONE rewrite debt (re-keyed by the latest arm outcome —
-  `writeConfirmState` is the sole serialized arm, so two arm-side
-  post-rename failures for different records RE-KEY the single slot,
-  never stack). The convergence guarantee is stated HONESTLY (r18
-  Codex M1 — the v18 "strict per-pass convergence" was false as a
-  universal claim: arms and resolutions are NOT gated by degraded
-  persistence, `store_lock.go:9-28` gates only cluster read-only, so
-  debts can be ADDED between passes, and a transient/terminal outcome
-  RETAINS an entry, so a given pass need not shrink the set): the
-  guarantee is CONDITIONAL — given quiescence (no new arms/
-  resolutions) and eventually-successful I/O, every pass strictly
-  reduces the set (a debt completes its own record's action or goes
-  stale and clears once the current record is durably established);
-  under continuous churn the set stays small in practice (keys are
-  distinct per debt — a second resolution of the same record cannot
-  arise while its removal debt pends — and the single on-disk
-  confirm.json slot bounds live-action debts), per-pass work is
-  bounded by the live debt count, and health stays degraded and
-  VISIBLE the whole time (no silent growth). No liveness claim is
-  made under adversarial continuous churn — the retry is a best-effort
-  background healer, and the degraded signal is the contract.
-  SAME-KEY ORDERING (r18 Codex M2, verified: W_B and R_B can coexist,
-  and if B's resolution tombstone failed PRE-rename the visible record
-  is PENDING-shaped B — a W_B-first rewrite would DURABLY RESTORE the
-  pending record, and a crash before R_B runs would re-arm an
-  already-resolved window at recovery, `store_persist.go:149-165,
-  231-253`): for debts keying the SAME record, REMOVAL DOMINATES — a
-  pending removal debt SUBSUMES any same-key rewrite debt (the
-  removal's tombstone write IS the durability barrier the rewrite
-  exists to establish; after the delete there is nothing to rewrite),
-  so the retry processes R before W and clears W as stale once R's
-  tombstone lands. A rewrite NEVER runs against a record a removal
-  debt also keys. The crash-between-debts regression (x16) drives
-  exactly this interleaving.
+  The confirm-side retry carries a KEYED DEBT SET (r17 Codex M3 = SMR
+  M3: MULTIPLE R-kind debts — one per unresolved resolution — + AT
+  MOST ONE W-kind debt, re-keyed by the latest arm outcome since
+  `writeConfirmState` is the sole serialized arm; the v17 "≤1 removal
+  + 1 rewrite" bound stays deleted — R_A + W_B + R_B can coexist
+  inside one retry sleep, `store_persist.go:402-405`).
+  DEBT-KIND SPLIT (r19 Codex M2, verified the v19 conflation: the
+  retry and the probe continuation must NOT process a rewrite debt
+  with removal semantics — tombstoning a record whose window is still
+  LIVE would resolve an unconfirmed window, and DeleteConfirm-and-clear
+  on an absent one would abandon the live window's crash-recovery
+  file): R-kind (removal) debts run the FOUR-STATE removal table
+  (match → tombstone→delete; absent → `DeleteConfirm` re-drive;
+  mismatch → stale-clear once the current record is durable; read
+  error → typed). W-kind (rewrite) debts run a THREE-STATE rewrite
+  table: (w-a) record present, ArmID MATCHES → `WriteConfirm` the
+  record durable → clear; (w-b) MISMATCH → the A/B/C supersession
+  transitions above (stale-clear, or re-key on the newer post-rename
+  arm); (w-c) record ABSENT → if the keyed window is still LIVE
+  (in-memory `armedArmID` matches), RESTORE the record from the
+  in-memory window state (the same fields `writeConfirmState` used at
+  arm — deadline/`confirmPrevTree`/FirstCommit/GuardedHash/ArmID) via
+  a durable `WriteConfirm`; if the window has since resolved, the debt
+  is stale → clear. Absent-for-W is NO-OP-and-clear ONLY when a
+  same-key R-kind debt atomically consumed W (below). MERGE semantics
+  (r19 Codex m1): for the same record, tombstone-required dominates
+  delete-finishing — a removal debt needing tombstone+delete and a
+  removal debt needing only the delete-finish merge into the
+  tombstone-required action.
+  SAME-RECORD DOMINANCE (r18 Codex M2 + r19 Codex M1, which generalized
+  it past the r18 same-KEY rule, verified: R_A's mismatch branch
+  rewrites the CURRENT record B — so R_A running before R_B durably
+  restores pending-shaped B even with R-before-W same-key ordering;
+  a crash before R_B re-arms the resolved window,
+  `store_persist.go:149-165,231-253`): the removal debt keyed to the
+  CURRENT on-disk record dominates EVERY write of that record — while
+  any R-kind debt keys the current record K, NO other write of K runs
+  (no W-kind rewrite, NO mismatch-branch rewrite from a stale-keyed
+  removal debt); R_K's tombstone write IS the universal durability
+  barrier for K, and every stale-keyed debt (R_A, W_B superseded, or
+  mismatch-waiting) clears once R_K's barrier lands. The retry
+  evaluates the current-record removal FIRST; the guard is a
+  membership check at each debt's turn (no sort required). The x16
+  regression drives both counter-cases: W_B-first (r18) AND R_A-first
+  (r19) with the crash between.
+  The convergence guarantee is stated HONESTLY and with the right
+  MEASURE (r18 Codex M1 + r19 Codex m1 — "every pass shrinks the set"
+  was false: debts can be ADDED between passes since mutation is gated
+  only by cluster read-only, `store_lock.go:9-28`, and retained
+  outcomes need not shrink the set): the measure is LEXICOGRAPHIC
+  per-debt remaining-stage (tombstone-pending > delete-pending >
+  rewrite-pending > done), and the guarantee is: given quiescence (no
+  new arms/resolutions) and a failure-free suffix, every debt's stage
+  strictly decreases to done — eventual zero; under continuous churn
+  the live set stays small in practice (keys are distinct per debt —
+  a second resolution of the same record cannot arise while its
+  removal debt pends — and the single on-disk confirm.json slot
+  bounds live-action debts), per-pass work is bounded by the live
+  debt count, and health stays degraded and VISIBLE the whole time.
+  No liveness claim is made under adversarial continuous churn — the
+  retry is a best-effort background healer, and the degraded signal
+  is the contract.
 - **Post-rename FINALIZE durability barrier — stated honestly (r16
   Codex M1, verified: master's post-rename commit branches call
   `clearConfirmResolutionPendingLocked` with the replacement only
@@ -1494,30 +1584,54 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   never cleared in-process): the terminal latch keeps the singleton
   loop ALIVE in PROBE-ONLY mode — a READ-ONLY `ReadConfirm` per pass,
   NO writes — until the latch clears, with the clear transition keyed
-  on the LATCH ORIGIN (r18 Codex M5 = SMR m1): (i) DEBT-origin latch
-  (a removal/rewrite retry's read failed permanently — the in-memory
-  resolution is long settled, `confirmGen` bumped at
-  `store_commit.go:717-726`) → a CLEAN READ re-seeds `onDiskArmID`
-  from the record (the ONE identity update outside Load and writes —
-  stated explicitly) and RESUMES THE DEBT'S four-state retry
-  (match → tombstone→delete) — NEVER a window re-arm, which would
-  roll back a confirmed config; (ii) BOOT-origin latch (recovery's
-  read failed — no timer, no debt, the record never classified) → a
-  CLEAN READ clears the latch, re-seeds the identity, and DEFERS to
-  the NEXT BOOT's normal recovery (NO in-process recovery —
-  re-running the revert/H-guard/re-arm total order after managers
-  are serving could revert a config the daemon has been running;
-  the journal + runbook direct the operator to restart for the
-  recovered record to take effect, at which point the normal total
-  order classifies it: Resolved → drop; stale → stale-drop; expired
-  → revert; H → guard; pending → re-arm). A CONFIRMED ABSENCE (record
+  on the LATCH ORIGIN (r18 Codex M5 = SMR m1, kind-split + persistent
+  substates per r19 Codex M2/M3): (i) DEBT-origin latch (a
+  removal/rewrite retry's read failed permanently) → a CLEAN READ
+  re-seeds `onDiskArmID` from the record (the ONE identity update
+  outside Load and writes — stated explicitly) and RESUMES the debt's
+  retry BY KIND (r19 Codex M2: an R-kind debt resumes the four-state
+  removal table — tombstone→delete, NEVER a window re-arm, which
+  would roll back a confirmed config; a W-kind debt resumes the
+  THREE-STATE rewrite table — rewrite-durable / supersession
+  transitions / restore-or-stale — NEVER a tombstone of a live
+  window's record); (ii) BOOT-origin latch (recovery's read failed —
+  no timer, no debt, the record never classified) splits into TWO
+  persistent substates (r19 Codex M3, verified the clear-and-defer
+  hole: clearing at the clean read turns health GREEN while the
+  record's fate is unsettled — a pending record can expire under a
+  green light, AND a replacement that landed DURING the unreadable
+  window leaves the record superseded without the store knowing):
+  (ii-a) RESTART-RECOVERY-OWED (not superseded while unreadable) —
+  the latch does NOT clear at the clean read; health STAYS 503 with a
+  DISTINCT message ("commit-confirmed recovery record readable again;
+  restart required to complete recovery") until the daemon restarts
+  and the normal total order classifies the record (Resolved → drop;
+  stale → stale-drop; expired → revert — the deadline keeps running,
+  and an expired window reverting at restart is the #4577-correct
+  outcome for a window that lapsed unconfirmed; H → guard; pending →
+  re-arm). NO in-process recovery (re-running the total order after
+  managers are serving could revert a config the daemon has been
+  running); the journal + runbook direct the operator to restart
+  promptly. (ii-b) SUPERSEDED-WHILE-UNREADABLE — a plain commit or
+  SyncApply that lands durably while the BOOT latch stands sets a
+  `confirmRecordSupersededDuringLatch` marker (the seeded-orphan rule
+  cannot fire on an unreadable record — the seeded state is LATCH,
+  not Present): the probe's clean read then converts the record to an
+  R-kind removal debt (keyed from the re-seeded read — the record is
+  stale by construction: its window died with the last process AND a
+  newer durable config supersedes whatever it guarded), the R-kind
+  table tombstones→deletes it, and the latch clears when the delete
+  is durable. A CONFIRMED ABSENCE (record
   removed — observed by the probe's actual read, never assumed) does
-  NOT drop the debt directly (r18 Codex M4, verified: an external
+  NOT drop an R-kind debt directly (r18 Codex M4, verified: an external
   `rm` without a directory fsync + power loss replays the dirent on
   reboot): it REACTIVATES the debt's absent-state — the retry
   re-drives `DeleteConfirm` (a no-op unlink + the directory fsync
   that supplies the barrier, `db.go:297-315`) — and only the
-  successful barrier clears the latch and the debt. The
+  successful barrier clears the latch and the debt; for a W-kind debt
+  the same absence instead runs (w-c) — restore-or-stale per the
+  in-memory window, since a live window's crash-recovery file must
+  not be abandoned. The
   loop-exit condition gains "and no terminal latch set"; the
   probe keeps the same plain-goroutine shutdown posture as master's
   persistDegraded loop (r18 Codex m3: the worker was never joined —
@@ -1530,11 +1644,17 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   violation (an unconfirmed config stands with no timer, no debt, no
   retry) that v17 had enshrined. The boot path now splits by class:
   TRANSIENT → bounded retry INSIDE `Load` (before manager
-  construction) with a PINNED envelope (r18 Codex m2 = SMR m2: up to
-  3 attempts, 100 ms → 200 ms → 400 ms backoff, ≈0.7 s total budget,
-  boot-path-only — NOT the runtime loop's cadence — the sleep
-  select-drives on the startup context so shutdown cancellation
-  interrupts it, plus a test seam on the clock), and still-failing →
+  construction) with a PINNED envelope (r18 Codex m2 = SMR m2, r19
+  Codex m3's arithmetic: the INITIAL read + up to 3 RETRIES — 4 reads
+  total — with delays 100 ms → 200 ms → 400 ms between them, ≤ ~0.7 s
+  of added boot latency plus I/O, boot-path-only — NOT the runtime
+  loop's cadence), driven through a NEW `LoadContext(ctx)` variant
+  (`Load()` is preserved as `LoadContext(context.Background())` —
+  `store_persist.go:21-24` keeps its signature for existing callers;
+  the startup phase passes its own ctx,
+  `daemon_run.go:157-161`), so shutdown cancellation interrupts the
+  sleeps (the sleep select-drives on ctx), plus a test seam on the
+  clock, and still-failing →
   `Load` FAILS with a NEW TYPED error `ErrConfirmStateUnreadable`
   (r18 Codex M6 = SMR M1, verified the routing hole:
   `ErrConfigDBUnreadable` is explicitly active.json-specific,
@@ -1605,10 +1725,13 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   active-persist: `api/health.go` renders the terminal confirm-record
   message first ("commit-confirmed recovery record is
   unreadable/corrupt; operator remediation required — see journal"),
-  then a DISTINCT confirm-persist message ("commit-confirmed recovery
-  record removal not yet durable; a restart could resurrect a stale
-  rollback — retry in progress"), then the existing active-persist
-  message (`api/health.go:65-71`). The aggregate
+  then a GENERIC confirm-persist message (r19 Codex m4 — the category
+  covers BOTH removal and rewrite debts, and a rewrite-only failure
+  risks LOSING the live window's recovery record, not resurrecting a
+  stale rollback): "commit-confirmed recovery record persistence
+  degraded (removal/rewrite not yet durable; retry in progress)" with
+  a detail field naming the live debt kind(s),
+  then the existing active-persist message (`api/health.go:65-71`). The aggregate
   `ConfigPersistDegraded()` stays the OR for the gauge (health can
   never read healthy while the gauge reads 1). The wiring is a
   `Config` FIELD, not a functional option (r18 Codex m5, verified:
@@ -1748,42 +1871,71 @@ outcomes ALL seed the three-state identity (Present(ArmID) / Absent /
 unreadable→latch) — the orphan chain (orphan A + plain commit + B
 pre-rename arm failure + B resolution read error) now keys the debt
 on A so the retry tombstones it, never preserves it; (x12) PROBE
-OBSERVER (r17 Codex M4): a terminal-latched debt keeps the singleton
-ALIVE probe-only — operator repair → clean probe read → latch clears
-+ debt retry re-arms IN-PROCESS (no restart); operator removal →
-confirmed absence → latch clears + debt drops; the loop still exits
-when no debt and no latch remain; (x13) BOOT FAIL-CLOSED (r17 Codex
-M5): a TRANSIENT boot `ReadConfirm` failure retries bounded inside
-`Load` then FAILS `Load` (no manager construction, systemd re-drives)
+OBSERVER (r17 Codex M4 + r18/r19 refinements): a terminal-latched debt
+keeps the singleton ALIVE probe-only — a DEBT-origin clean read
+re-seeds the identity and resumes the debt's retry BY KIND (R-kind:
+tombstone→delete; W-kind: rewrite/restore) IN-PROCESS; a BOOT-origin
+clean read splits into RESTART-RECOVERY-OWED (latch HELD, 503 +
+restart-required message until reboot) or SUPERSEDED-WHILE-UNREADABLE
+(marker set by a durable plain commit/SyncApply during the latch →
+clean read converts the record to an R-kind debt); an operator
+`rm` reactivates the absent-state (`DeleteConfirm` barrier for
+R-kind; (w-c) restore-or-stale for W-kind) — only the barrier clears;
+the loop still exits when no debt and no latch remain; (x13) BOOT
+FAIL-CLOSED (r17 Codex M5): a TRANSIENT boot `ReadConfirm` failure
+retries bounded inside `Load` (initial read + ≤3 retries,
+100/200/400 ms, `LoadContext(ctx)`) then FAILS `Load` via
+`ErrConfirmStateUnreadable` routed fail-closed (no manager
+construction, systemd re-drives)
 — an unconfirmed config never stands from a lost read; a
 PERMANENT-class boot failure proceeds with the latch + 503;
-(x14) TYPED HEALTH CHANNEL (r17 Codex M6/m2):
-`ConfigPersistDegradedState()` carries both causes; /health renders
-the terminal confirm-record message with PRECEDENCE over the
-active-persist message; the gauge stays the aggregate OR; the
-descriptor/option/wiring comments name both causes; (x15) TAXONOMY
+(x14) TYPED HEALTH CHANNEL (r17 Codex M6/m2 + r18 M7 + r19 m4):
+`ConfigPersistDegradedState()` carries all THREE causes; /health
+renders by precedence terminal > confirm-persist (generic
+removal/rewrite message + debt-kind detail) > active-persist; the
+gauge stays the aggregate OR; the
+descriptor/option/wiring comments name all three causes; (x15)
+TAXONOMY
 BOUNDARY (r17 Codex M4): master-key IO (missing mount/EACCES) →
 TRANSIENT retry (no latch); invalid observed key length + envelope/
-auth/PRF/parse classes → PERMANENT latch; (x16) SAME-KEY ORDERING
-(r18 Codex M2): W_B + R_B coexisting with B's tombstone failed
-PRE-rename → R_B runs FIRST (tombstone barrier → delete), W_B clears
-as stale — the crash-between-debts leg proves a W_B-first
+auth/PRF/parse classes → PERMANENT latch; (x16) SAME-RECORD DOMINANCE
+(r18 Codex M2 + r19 Codex M1): W_B + R_B coexisting with B's tombstone
+failed PRE-rename → R_B runs FIRST (tombstone barrier → delete), W_B
+clears as stale — the crash-between-debts leg proves a W_B-first
 implementation would durably restore the pending record and re-arm an
-already-resolved window; (x17) SEEDED-ORPHAN resolution (r18 Codex
-M3): absent-DB `Load` with Present(A) → a superseding plain commit →
+already-resolved window; AND the r19 generalization: R_A + R_B
+coexisting → R_A's mismatch branch may NOT rewrite current B while
+R_B exists (the current-record removal dominates EVERY write of that
+record, from W-kind debts AND from stale-keyed mismatch branches) —
+the R_A-first crash leg proves B never becomes durable before R_B;
+(x17) SEEDED-ORPHAN resolution (r18 Codex M3 + r19 Codex m2):
+absent-DB `Load` with Present(A) → a superseding plain commit →
 the orphan tombstoned+deleted post-durability with NO in-memory
-window; (x18) PROBE ABSENCE BARRIER (r18 Codex M4): operator `rm` →
-probe ENOENT reactivates the absent-state `DeleteConfirm` re-drive;
+window; AND the confirmed-commit leg: the arm's `writeConfirmState`
+resolves the orphan BY OVERWRITE, while a PRE-rename arm failure
+leaves the orphan INTACT + an R-kind debt keyed A → the retry
+completes the removal (no binding record survives); (x18) PROBE
+ABSENCE BARRIER (r18 Codex M4 + r19 Codex M2): operator `rm` →
+probe ENOENT reactivates the absent-state — `DeleteConfirm` re-drive
+for an R-kind debt; (w-c) restore-or-stale for a W-kind debt (a live
+window's recovery file is never abandoned);
 only the successful directory barrier clears the latch; (x19)
-CONTINUATION KINDS (r18 Codex M5 = SMR m1): DEBT-origin clean read →
-identity re-seeded + DEBT retry resumes (never a window re-arm);
-BOOT-origin clean read → latch cleared + identity re-seeded + record
-action DEFERRED to the next boot; (x20) FAIL-CLOSED ROUTING (r18
-Codex M6 = SMR M1): `ErrConfirmStateUnreadable` →
+CONTINUATION KINDS (r18 Codex M5 = SMR m1 + r19 Codex M2/M3):
+DEBT-origin clean read → identity re-seeded + retry resumed BY KIND
+(R-kind tombstone→delete, never a window re-arm; W-kind
+rewrite/restore, never a tombstone of a live window); BOOT-origin →
+RESTART-RECOVERY-OWED (latch HELD, 503 + restart-required message
+until reboot — never green-while-unsettled) or
+SUPERSEDED-WHILE-UNREADABLE (marker → R-kind debt); (x20) FAIL-CLOSED
+ROUTING (r18 Codex M6 = SMR M1 + r19 Codex m3):
+`ErrConfirmStateUnreadable` →
 `classifyLoadError` fail-closed mapping (`bootstrap_test.go:10-36`
-legs), confirm.json-named diagnostic, pinned retry envelope; (x21)
-THREE-FIELD HEALTH PRECEDENCE (r18 Codex M7/m5): all three causes in
-the snapshot, /health precedence terminal > confirm-persist >
+legs), confirm.json-named diagnostic, pinned retry envelope (initial
+read + ≤3 retries, 100/200/400 ms, `LoadContext(ctx)`); (x21)
+THREE-FIELD HEALTH PRECEDENCE (r18 Codex M7/m5 + r19 Codex m4): all
+three causes in
+the snapshot, /health precedence terminal > confirm-persist (generic
+removal/rewrite message + debt-kind detail) >
 active-persist, gauge aggregate OR, Config → NewServer plumbing
 pinned. This closes the
 master's re-arm-after-confirmed residual for the whole confirm-type
@@ -1993,26 +2145,39 @@ coexistence) is deleted as incoherent (r1 B3).
   tombstone write doubles as the same-directory durability barrier
   for the replacement's active.json rename; factory reset untouched;
   the #5473 tests updated to the new observable retention semantics);
-  the `onDiskArmID`-keyed four-state typed-error debt SET + retry
-  table (MULTIPLE removal debts + at most one rewrite debt with the
-  A/B/C supersession transitions, the rewrite-on-match/never-on-
-  mismatch pin, the SAME-KEY removal-dominates-rewrite ordering, the
-  CONDITIONAL convergence guarantee — strict reduction given
-  quiescence + successful I/O, health visible throughout — and the
+  the `onDiskArmID`-keyed typed-error debt SET + retry tables
+  (MULTIPLE R-kind removal debts — four-state table: match →
+  tombstone→delete, absent → `DeleteConfirm` re-drive, mismatch →
+  stale-clear, read error → typed — + AT MOST ONE W-kind rewrite debt
+  — three-state table: match → rewrite durable, mismatch → the A/B/C
+  supersession transitions, absent → restore-from-window-state or
+  stale-clear; SAME-RECORD dominance: the current-record removal
+  dominates EVERY write of that record, from W-kind debts AND
+  stale-keyed mismatch branches alike; tombstone-required dominates
+  delete-finishing on merge; CONDITIONAL convergence on a
+  lexicographic remaining-stage measure — eventual zero given
+  quiescence + a failure-free suffix, health visible throughout; the
   PER-DEBT terminal
   state over the permanent `ReadConfirm` taxonomy — #5637 parse gates
   + envelope/auth/PRF/invalid-key-length behind a new
   `ConfirmRecordPermanentError` sentinel, with master-key IO
-  classified TRANSIENT); the SEEDED-ORPHAN resolution (every
-  superseding replacement resolves a seeded Present(record) when no
-  in-memory window pends); the `confirmRecordTerminal` latch folded
+  classified TRANSIENT); the SEEDED-ORPHAN resolution under the
+  single-Store-ownership invariant (plain commit/SyncApply: the
+  post-durability finalize resolves a seeded Present(record) with no
+  in-memory window; confirmed commit: the arm resolves BY OVERWRITE,
+  a PRE-rename failure converts the orphan to an R-kind debt); the
+  `confirmRecordTerminal` latch folded
   into `ConfigPersistDegraded` with boot reconstruction, the LIVE
   probe-only observer (the latch keeps the singleton alive read-only;
-  continuation kinds — DEBT-origin resumes the four-state retry,
-  BOOT-origin defers to the next boot's recovery; a confirmed absence
-  re-drives the `DeleteConfirm` barrier before clearing), the
-  TRANSIENT-boot bounded-retry (pinned envelope: 3 attempts,
-  100/200/400 ms, ctx-aware sleep, clock seam) then fail-`Load` with
+  continuation kinds — DEBT-origin resumes the debt's retry BY KIND;
+  BOOT-origin splits into RESTART-RECOVERY-OWED (latch held,
+  restart-required 503 until reboot) and SUPERSEDED-WHILE-UNREADABLE
+  (marker → R-kind debt); a confirmed absence re-drives the
+  `DeleteConfirm` barrier for R-kind / runs (w-c) restore-or-stale
+  for W-kind before clearing), the
+  TRANSIENT-boot bounded-retry (pinned envelope: initial read + ≤3
+  retries, 100/200/400 ms, `LoadContext(ctx)` with `Load()` preserved,
+  clock seam) then fail-`Load` with
   the NEW `ErrConfirmStateUnreadable` sentinel routed fail-closed
   through `classifyLoadError`, and the
   typed THREE-FIELD `ConfigPersistDegradedState()` snapshot accessor
@@ -2020,14 +2185,15 @@ coexistence) is deleted as incoherent (r1 B3).
   ConfirmRecordTerminal}`); the
   SyncApply finalize ordering in `store.go`; the hedge-the-cause
   stale-drop diagnostic (`store_persist.go:159-165`).
-- `pkg/api` (r16 Codex m3 + r17 Codex M6/m2 + r18 Codex M7/m5 —
-  `pkg/api` IS touched):
+- `pkg/api` (r16 Codex m3 + r17 Codex M6/m2 + r18 Codex M7/m5 + r19
+  Codex m4 — `pkg/api` IS touched):
   the new `ConfigPersistDegradedStateFn` Config FIELD (`server.go`,
   alongside the retained aggregate `ConfigPersistDegradedFn` the gauge
   consumes) wired from the store's typed snapshot;
-  `api/health.go` renders the DISTINCT messages by precedence
-  (terminal confirm-record > confirm-persist retry pending >
-  active-persist);
+  `api/health.go` renders the messages by precedence
+  (terminal confirm-record > confirm-persist — GENERIC removal/rewrite
+  text + a debt-kind detail field — > active-persist), plus the
+  DISTINCT restart-recovery-owed message for the BOOT-origin substate;
   `metrics.go` keeps the gauge on the aggregate OR;
   `metrics_descriptors.go` + the field/wiring comments name all three
   causes; a Config → NewServer plumbing test pins the wiring.
@@ -2200,9 +2366,11 @@ classification snapshot.
   replacement-class framing (supersede-on-sync with the #5473/#5835
   ordering), and the aggregate-cause surfaces
   (`metrics_descriptors.go:625-630`, `server.go:132-140`,
-  `daemon_run_servers.go:370-374`) name BOTH degradation causes
-  (active-persist retry pending AND terminal confirm-record
-  corruption). The r18 additions (Codex m4): the #5473 ordering prose
+  `daemon_run_servers.go:370-374`) name the degradation causes
+  (active-persist retry pending, confirm-record removal/rewrite debt,
+  AND terminal confirm-record corruption — "BOTH" was the r17
+  two-cause framing, corrected to three in r18/r19). The r18 additions
+  (Codex m4): the #5473 ordering prose
   at `pkg/configstore/README.md:476-540` gains the failure-phase
   classification (PRE-rename retention vs POST-rename immediate
   barrier); `pkg/api/README.md:30-36` describes the THREE-cause typed
@@ -2211,8 +2379,14 @@ classification snapshot.
   to the keyed debt-set semantics; the health contract header at
   `pkg/api/health.go:10-16` names all three causes; and the
   `classifyLoadError` class comments at `bootstrap.go:36-47` gain the
-  `ErrConfirmStateUnreadable` fail-closed class. The irrecoverable
-  cross-version cases are documented in
+  `ErrConfirmStateUnreadable` fail-closed class. The r19 additions
+  (Codex m5): the "every confirm-read failure logs and skips"
+  comment at `db.go:239-241` and the matching `README.md:470-473`
+  prose are reworded to the transient/permanent taxonomy + the
+  fail-closed transient boot path; and `README.md:937-968` ("`Load`
+  returns one of three error shapes") gains the fourth
+  (`ErrConfirmStateUnreadable`) and the every-outcome confirm.json
+  seeding read. The irrecoverable cross-version cases are documented in
   the same comments, AND the stale-drop diagnostic text at
   `store_persist.go:159-165` is updated to hedge the cause
   ("superseded OR basis-incompatible", r14 Codex m3).
@@ -2324,11 +2498,16 @@ Preserved exactly:
     ArmID-keyed, four-state, typed-error debt SET makes the retry act
     only on the record it resolved, in every `WriteConfirm` failure
     phase — with the current record's durability established BEFORE
-    any stale debt is cleared, SAME-KEY removal dominating rewrite (a
-    pending removal subsumes a same-key rewrite; a rewrite never runs
-    against a record a removal debt also keys), convergence guaranteed
-    CONDITIONALLY (strict per-pass reduction given quiescence +
-    eventually-successful I/O; health stays degraded and visible under
+    any stale debt is cleared, SAME-RECORD dominance (the removal debt
+    keyed to the CURRENT on-disk record dominates EVERY write of that
+    record — from W-kind rewrite debts AND from stale-keyed removal
+    debts' mismatch branches alike; its tombstone is the universal
+    barrier for that record), debt-kind-correct actions (R-kind:
+    tombstone→delete; W-kind: rewrite/restore — never a tombstone of
+    a live window's record, never an abandoned recovery file), and
+    convergence guaranteed CONDITIONALLY on a lexicographic
+    remaining-stage measure (eventual zero given quiescence + a
+    failure-free suffix; health stays degraded and visible under
     churn — no liveness claim against it), and the
     finalize's tombstone write doubling as the same-directory
     durability barrier for the replacement's active.json rename
@@ -2585,47 +2764,73 @@ Preserved exactly:
      the three-state identity; the orphan chain (orphan A + plain
      commit + B pre-rename arm failure + B resolution read error)
      keys the debt on A → retry tombstones it, never preserves it;
-     (x12) PROBE OBSERVER (r17 Codex M4): terminal-latched debt keeps
-     the singleton ALIVE probe-only — operator repair → clean probe →
-     latch clears + debt re-arms IN-PROCESS; operator removal →
-     confirmed absence → latch clears + debt drops; loop exits only
+     (x12) PROBE OBSERVER (r17 Codex M4 + r18/r19 refinements):
+     terminal-latched debt keeps
+     the singleton ALIVE probe-only — DEBT-origin clean read →
+     identity re-seeded + retry resumed BY KIND (R-kind
+     tombstone→delete; W-kind rewrite/restore) IN-PROCESS;
+     BOOT-origin clean read → RESTART-RECOVERY-OWED (latch held,
+     503 + restart-required message until reboot) or
+     SUPERSEDED-WHILE-UNREADABLE (marker → R-kind debt);
+     operator `rm` → absent-state re-drive (`DeleteConfirm` barrier
+     for R-kind; (w-c) restore-or-stale for W-kind);
+     loop exits only
      with no debt AND no latch; (x13) BOOT FAIL-CLOSED (r17 Codex M5):
      TRANSIENT boot `ReadConfirm` failure → bounded retry inside
-     `Load` → `Load` FAILS (no manager construction); PERMANENT-class
-     → proceed + latch + 503; (x14) TYPED HEALTH CHANNEL (r17 Codex
-     M6/m2): `ConfigPersistDegradedState()` carries both causes;
-     /health renders the terminal message with PRECEDENCE; the gauge
-     stays the aggregate OR; descriptor/option/wiring comments name
-     both causes; (x15) TAXONOMY BOUNDARY (r17 Codex M4): master-key
+     `Load` (initial read + ≤3 retries, 100/200/400 ms,
+     `LoadContext(ctx)`) → `ErrConfirmStateUnreadable` →
+     `classifyLoadError` fail-closed mapping (NOT
+     `loadOtherError` — `bootstrap_test.go:10-36` legs); the fatal
+     diagnostic names confirm.json; (x14) TYPED HEALTH CHANNEL (r17
+     Codex M6/m2 + r18 M7 + r19 m4): `ConfigPersistDegradedState()`
+     carries all THREE causes;
+     /health precedence terminal > confirm-persist (generic
+     removal/rewrite message + debt-kind detail) > active-persist;
+     the gauge stays the aggregate OR;
+     descriptor/option/wiring comments name all three causes; (x15) TAXONOMY BOUNDARY (r17 Codex M4): master-key
      IO → TRANSIENT retry, no latch; invalid observed key length +
-     envelope/auth/PRF/parse → PERMANENT latch; (x16) SAME-KEY
-     ORDERING (r18 Codex M2): W_B + R_B coexisting with B's tombstone
+     envelope/auth/PRF/parse → PERMANENT latch; (x16) SAME-RECORD
+     DOMINANCE (r18 Codex M2 + r19 Codex M1): W_B + R_B coexisting
+     with B's tombstone
      failed PRE-rename (visible record PENDING-shaped) → the retry
      runs R_B FIRST (tombstone barrier → delete) and clears W_B as
      stale — a W_B-first implementation DURABLY RESTORES the pending
      record and the crash-between-debts leg proves the re-arm hazard
-     is closed; (x17) SEEDED-ORPHAN resolution (r18 Codex M3):
+     is closed; AND R_A + R_B coexisting → R_A's mismatch branch may
+     NOT rewrite current B while R_B exists (the current-record
+     removal dominates EVERY write of that record) — the R_A-first
+     crash leg proves B never becomes durable before R_B; (x17)
+     SEEDED-ORPHAN resolution (r18 Codex M3 + r19 Codex m2):
      absent-DB `Load` with Present(A) → bootstrap/plain commit lands
      durably → the orphan is tombstoned+deleted at the post-durability
      finalize even with NO in-memory window (pre-fix: the orphan
-     survives to bind at the next recovery); (x18) PROBE ABSENCE
-     BARRIER (r18 Codex M4): operator `rm confirm.json` → the probe's
+     survives to bind at the next recovery); AND the confirmed-commit
+     leg: the arm resolves the orphan BY OVERWRITE; a PRE-rename arm
+     failure leaves the orphan INTACT + an R-kind debt keyed A → the
+     retry completes the removal; (x18) PROBE ABSENCE
+     BARRIER (r18 Codex M4 + r19 Codex M2): operator `rm confirm.json`
+     → the probe's
      ENOENT REACTIVATES the absent-state (`DeleteConfirm` re-drive for
      the directory fsync) — only the successful barrier clears the
      latch (a power-loss replay without the fsync resurrects the
      dirent, and the regression proves the re-drive happens);
-     (x19) CONTINUATION KINDS (r18 Codex M5 = SMR m1): DEBT-origin
-     latch + clean probe read → `onDiskArmID` re-seeded + the
-     four-state DEBT retry resumes (tombstone→delete — NEVER a window
-     re-arm); BOOT-origin latch + clean read → latch cleared +
-     identity re-seeded + record action DEFERRED to the next boot's
-     recovery (no in-process revert/re-arm); (x20) FAIL-CLOSED
-     ROUTING (r18 Codex M6 = SMR M1): a transient-exhausted boot
+     (x19) CONTINUATION KINDS (r18 Codex M5 = SMR m1 + r19 Codex M2/M3):
+     DEBT-origin clean read → identity re-seeded + retry resumed BY
+     KIND (R-kind: tombstone→delete, NEVER a window re-arm; W-kind:
+     rewrite/restore, NEVER a tombstone of a live window); BOOT-origin
+     → RESTART-RECOVERY-OWED (latch HELD, 503 + restart-required
+     message until reboot — never green-while-unsettled) or
+     SUPERSEDED-WHILE-UNREADABLE (marker set by a durable replacement
+     during the latch → clean read converts the record to an R-kind
+     debt → tombstone→delete → latch clears); (x20) FAIL-CLOSED
+     ROUTING (r18 Codex M6 = SMR M1 + r19 Codex m3):
+     a transient-exhausted boot
      confirm-read returns `ErrConfirmStateUnreadable`;
      `classifyLoadError` maps it to the fail-closed class (NOT
      `loadOtherError` — `bootstrap_test.go:10-36` legs); the fatal
-     diagnostic names confirm.json; the pinned envelope (3 attempts,
-     100/200/400 ms, ctx-aware sleep, clock seam) is asserted;
+     diagnostic names confirm.json; the pinned envelope (initial read
+     + ≤3 retries, delays 100/200/400 ms, `LoadContext(ctx)` with
+     `Load()` preserved, clock seam) is asserted;
      (x21) THREE-FIELD HEALTH PRECEDENCE (r18 Codex M7/m5):
      `ConfigPersistDegradedState()` carries all three causes; /health
      renders terminal > confirm-persist > active-persist; the gauge
@@ -2681,7 +2886,7 @@ Preserved exactly:
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r19)
+## 11. Open questions for adversarial review (r20)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
@@ -2885,7 +3090,26 @@ Config-field plumbing test (x21), the STAGED barrier outcome
 debt), the probe lifecycle posture, and the docs sweep completed
 (README.md:476-540, pkg/api/README.md:30-36,
 store_commit.go:556-570,667-695,732-735, health.go:10-16,
-bootstrap.go:36-47).
+bootstrap.go:36-47); r19 additions: same-RECORD dominance (while any
+R-kind debt keys the current record, NO other write of it runs — the
+r18 same-key rule generalized to cover stale-keyed mismatch rewrites;
+x16 gains the R_A-first crash leg), DEBT-KIND SPLIT (R-kind four-state
+removal table vs W-kind three-state rewrite table — never a tombstone
+of a live window's record, never an abandoned recovery file), BOOT-origin
+persistent substates (RESTART-RECOVERY-OWED keeps the latch + a
+restart-required 503 until reboot; SUPERSEDED-WHILE-UNREADABLE marker
+converts the repaired record to an R-kind debt), confirmed-commit
+orphan resolution BY OVERWRITE (pre-rename failure → orphan intact +
+R-kind debt; x17 leg), the lexicographic remaining-stage convergence
+measure with tombstone-required-dominates-delete-finishing merge
+semantics, the envelope arithmetic (initial read + ≤3 retries,
+100/200/400 ms, `LoadContext(ctx)` with `Load()` preserved), the
+GENERIC confirm-persist health message + debt-kind detail, the sweep
+gaining db.go:239-241 + README.md:470-473,937-968 and the
+three-cause "BOTH" correction, the single-Store-ownership invariant
+documented for the orphan premise, and Codex's SPLIT-REJECTED
+reasoning recorded (H-without-H2 turns the delayed master hazard into
+an immediate revert-at-load — the only sound split moves H WITH H2).
 
 Still open:
 

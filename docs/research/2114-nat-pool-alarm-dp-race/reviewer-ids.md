@@ -59,6 +59,9 @@ reviewer (joins at /engineer on the code PR).
 | r18 | Codex | codex companion task-mrz8pf3q-wm7p94 (session 019f9543-bf13-7791-8cce-3a26b0f817fc) | NEEDS-REVISION (7 MAJOR, 5 MINOR) |
 | r18 | AGY | agy print-mode direct (agy-plan-r18.md) | PLAN-READY (0 findings; attack-2/3 rationales factually wrong — see claude-smr-plan-r18.md §C) |
 | r18 | Claude SMR | in-conversation (claude-smr-plan-r18.md) | NEEDS-REVISION (1 MAJOR, 2 MINOR — its M1/m1/m2 independently anticipated Codex M6/M5/m2) |
+| r19 | Codex | codex companion task-mrzbgq1e-cqjb0p (session 019f958a-71f2-7f82-a285-5ebd1580d5f2) | NEEDS-REVISION (3 MAJOR, 6 MINOR); SPLIT-REJECTED (H-without-H2 worsens the narrow class to immediate revert-at-load) |
+| r19 | AGY | agy print-mode direct (agy-plan-r19.md) | PLAN-READY (0 findings); SPLIT-MOOT |
+| r19 | Claude SMR | in-conversation (claude-smr-plan-r19.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — both folded in v20); SPLIT-MOOT if convergence |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
