@@ -237,6 +237,12 @@ func writeFakeBin(t *testing.T, path, content string) {
 	if err := os.WriteFile(path, fakeBinContent(content), 0755); err != nil {
 		t.Fatal(err)
 	}
+	// WriteFile applies the mode only when CREATING the file; overwriting an
+	// existing file preserves its old mode. Force the exec bit so the helper
+	// always yields a regular executable binary regardless of any prior file.
+	if err := os.Chmod(path, 0755); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func mkfile(t *testing.T, path, content string) {

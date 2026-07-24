@@ -2,8 +2,11 @@ package upgrade
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/upgrade/manifest"
 )
 
 // writeRawExec overwrites path with exactly data and forces the executable bit,
@@ -65,7 +68,7 @@ func TestValidateRestorableVersion_ContentGate(t *testing.T) {
 					"non-executable content (%s); execve would fail and strand the "+
 					"daemon after STOP (#6409)", tc.name)
 			}
-			if !strings.Contains(verr.Error(), "not a parseable ELF image") {
+			if !strings.Contains(verr.Error(), "failed the ELF-image content gate") {
 				t.Fatalf("refusal is not the #6409 content gate: %v", verr)
 			}
 
@@ -136,5 +139,58 @@ func TestRun_CorruptContentCurrentRefusesEvenWhenSanctioned(t *testing.T) {
 	assertNoLiveMutation(t, fs, "a present-but-unstartable (non-ELF content) rollback target")
 	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
 		t.Error("a journal was persisted despite refusing a non-ELF-content rollback target")
+	}
+}
+
+// nonLockstepManagedName returns a managed binary that is NOT in the lockstep
+// set (e.g. cli, or the real xpf-day0-config shell script), skipping the test
+// if the manifest declares no such entry.
+func nonLockstepManagedName(t *testing.T) string {
+	t.Helper()
+	lock := map[string]bool{}
+	for _, b := range manifest.LockstepNames() {
+		lock[b] = true
+	}
+	for _, b := range manifest.Names() {
+		if !lock[b] {
+			return b
+		}
+	}
+	t.Skip("no non-lockstep managed binary in the manifest")
+	return ""
+}
+
+// TestValidateRestorableVersion_NonLockstepEntryNotELFGated PINS the scope
+// boundary of the #6409 content gate (Codex MINOR): the gate iterates ONLY
+// manifest.LockstepNames() (xpfd, xpf-userspace-dp), NOT manifest.Names(). The
+// non-lockstep managed set includes `cli` and the real `#!/bin/sh`
+// xpf-day0-config script — legitimate NON-ELF runtimes that must never be
+// ELF-rejected. A version whose non-lockstep managed entry is an executable
+// shebang script (regular + exec bit, NOT an ELF) must still be RESTORABLE:
+// validateRestorableVersion must return nil because the gate never reaches a
+// non-lockstep entry.
+//
+// FAIL-ON-REVERT: broaden the loop selector in validateRestorableVersion from
+// manifest.LockstepNames() to manifest.Names() -> the ELF gate now reaches the
+// shebang script and rejects the version ("failed the ELF-image content gate")
+// -> this canary's `verr != nil` assertion goes clean ASSERTION RED. It is the
+// only regression that pins the LockstepNames-not-Names boundary (the fixtures
+// otherwise make every managed file a parseable ELF).
+func TestValidateRestorableVersion_NonLockstepEntryNotELFGated(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	writeCompleteVersionDir(t, cfg, "1.0.0") // every managed entry a valid ELF...
+	// ...then replace a NON-lockstep managed entry with an executable shebang
+	// script: a regular, executable, but deliberately non-ELF runtime.
+	name := nonLockstepManagedName(t)
+	writeRawExec(t, filepath.Join(cfg.VersionsDir, "1.0.0", name),
+		[]byte("#!/bin/sh\nexec /usr/sbin/xpf-day0-config \"$@\"\n"))
+
+	if verr := r.validateRestorableVersion("1.0.0"); verr != nil {
+		t.Fatalf("validateRestorableVersion wrongly rejected version 1.0.0 because a "+
+			"NON-lockstep managed entry %q is an executable shebang script: %v\n"+
+			"the #6409 ELF content gate must iterate manifest.LockstepNames() "+
+			"(xpfd, xpf-userspace-dp), NOT manifest.Names() — a legitimate non-ELF "+
+			"script runtime must not be ELF-gated", name, verr)
 	}
 }

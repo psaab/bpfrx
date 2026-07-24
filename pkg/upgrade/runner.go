@@ -383,16 +383,19 @@ func (r *Runner) validateRestorableVersion(ver string) error {
 				"(mode %s); systemd could not exec it after STOP", dir, b, bi.Mode())
 		}
 		// Best-effort CONTENT gate (#6409): the exec bit and regular-file type
-		// do not prove the content is kernel-executable. Reject a regular
+		// do not prove the content is a loadable image. Reject a regular
 		// exec-bit file whose content is not a parseable ELF image (arbitrary
-		// text chmod'd 0755, an empty/truncated file, a corrupt header) — it
-		// would fail execve and strand the daemon after STOP. See the CONTENT
-		// gate / LIMIT note above: a valid-header wrong-arch or corrupt-body
-		// image still parses here and remains systemd's arbiter at restart.
+		// text chmod'd 0755, an empty/truncated file, a corrupt header) — it is
+		// not a safe rollback runtime to keep before STOP. This is a heuristic,
+		// not an execve oracle: see the CONTENT gate / LIMIT note above — a
+		// valid-header wrong-arch or corrupt-body image still parses here and
+		// remains systemd's arbiter at restart, and a rejection here proves this
+		// policy gate failed, not that execve would definitively fail.
 		if cerr := elfHeaderParseable(p); cerr != nil {
-			return fmt.Errorf("version dir %s lockstep binary %s is not a parseable "+
-				"ELF image (%v); its content is not kernel-executable so systemd "+
-				"could not exec it after STOP", dir, b, cerr)
+			return fmt.Errorf("version dir %s lockstep binary %s failed the "+
+				"ELF-image content gate (%v); its content is not a loadable ELF "+
+				"image, so it is unsafe to keep as a restorable rollback target",
+				dir, b, cerr)
 		}
 	}
 	return nil

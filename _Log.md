@@ -59943,3 +59943,25 @@ top.
     pkg/upgrade/restorable_content_6409_test.go,
     pkg/upgrade/runner_test.go, pkg/upgrade/stagedgen_cut_test.go,
     pkg/upgrade/verify_cleanup_test.go, docs/in-place-upgrade.md, _Log.md
+- **Timestamp**: 2026-07-23
+  - **Action**: #6409 (PR #6445) — fold Codex MERGE-NEEDS-MINOR. (1)
+    Scope-boundary canary TestValidateRestorableVersion_NonLockstepEntryNotELFGated:
+    a restorable version whose NON-lockstep managed entry (cli /
+    xpf-day0-config) is an executable `#!/bin/sh` shebang script must be
+    ACCEPTED (validateRestorableVersion returns nil) — the ELF gate
+    iterates manifest.LockstepNames(), not Names(), so it never touches a
+    legitimate non-ELF script runtime. Parent-RED: broaden the loop
+    selector LockstepNames()->Names() at runner.go:365 -> canary goes
+    clean-assertion RED (cli shebang ELF-rejected); verified + restored.
+    (2) Softened the content-gate error string to the heuristic framing
+    ("failed the ELF-image content gate ...; its content is not a loadable
+    ELF image, so it is unsafe to keep as a restorable rollback target") —
+    an elf.Open rejection proves the policy gate failed, not definitive
+    execve failure; updated the matching inline comment and the test
+    substring assertion. (3) NIT: restored the explicit os.Chmod(0755) in
+    writeFakeBin so overwriting a pre-existing non-exec file still yields
+    an exec-bit binary. go build/vet clean, pkg/upgrade + full go test
+    ./... GREEN.
+  - **File(s)**: pkg/upgrade/runner.go,
+    pkg/upgrade/restorable_content_6409_test.go,
+    pkg/upgrade/runner_test.go, _Log.md
