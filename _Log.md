@@ -59887,3 +59887,16 @@ top.
     pkg/frr/redistribute.go, pkg/frr/bgp_policy_chain.go, pkg/frr/bfd.go,
     pkg/frr/protocols_render.go, pkg/frr/prefix_list_render.go,
     docs/refactoring-audit-current.txt, _Log.md
+  - **Timestamp**: 2026-07-24 01:00 UTC
+  - **Action**: Fold Codex6441 MINOR — refresh stale FRR file-ownership
+    docs after the #6424 split. Updated the manager.go package-comment
+    file-map (policy_render.go re-described as the residual; added
+    protocols_render.go / redistribute.go / bgp_policy_chain.go / bfd.go /
+    prefix_list_render.go / render_validate.go rows, plus the previously
+    missing naming.go #5872 row) and pkg/frr/README.md (corrected the
+    "five sibling files" count + re-attributed the policy_render.go row
+    opening to the 6-way render split; the detailed rendering semantics
+    stay as a single behavior contract that applies wherever each function
+    now lives). Doc/comment-only — go build/vet clean, heatmap canary +
+    pkg/frr tests GREEN, zero code delta.
+  - **File(s)**: pkg/frr/manager.go, pkg/frr/README.md, _Log.md
