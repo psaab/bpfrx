@@ -1,8 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v7 — r6 findings folded (Codex NEEDS-REVISION 2M/5m;
-  AGY NEEDS-REVISION 1M/1m — SAME major found independently; Claude SMR
-  NEEDS-REVISION 2B/1M/3m); pending convergence review r7
+- **Status**: DRAFT v8 — r7 findings folded (Codex NEEDS-REVISION 2M/4m;
+  AGY PLAN-READY-WITH-NITS 0M/1m; Claude SMR NEEDS-REVISION 2M/3m);
+  pending convergence review r8
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -18,17 +18,18 @@
   all-kind nil gate, honest Option D). v5 @ `ee5f54484` (r4: RACE-3
   documented; readiness `:202` into RACE-1; residuals). v6 @ `ee270c729`
   (r5: startup-readiness gate v1 for the pre-existing vrrpMgr nil-deref /
-  bootstrap-armed defects). v7: r6 convergence — gate REDESIGNED as an
-  exactly-once startup outcome (`startupDone` closed on every exit path +
-  `startupOK` set only on success) after both reviewers independently found
-  the v6 select's failure leg leaks the timer goroutine (`d.daemonCtx`
-  never cancels); the four-link exclusion's link (iv) is scoped to
-  current-version records after Codex's verified cross-upgrade
-  counterexample (legacy first-commit cluster record → live cluster runtime
-  + `enterBootstrapMode` coexistence); gate tests strengthened to pin
-  applySem-freedom and a deterministic startup seam; table exposure cells
-  made consistent; constructor initialization + lock-order contract
-  comments + risk-table additions.
+  bootstrap-armed defects). v7 @ `5de29ed7d` (r6: gate redesigned as
+  startupDone+startupOK outcome; exclusion scoped to current-version
+  records after the cross-upgrade counterexample). v8: r7 convergence —
+  gate outcome publisher `finishStartup(ok)` (`sync.Once`, killing the
+  double-close both reviewers caught independently); linearization moved to
+  END of PHASE 5 (the only point exactly-equivalent to remote-commit
+  arrival); gate tests gain an entry hook, dual real failure-path coverage,
+  executor-entry+no-side-effects assertion, a backend-factory seam,
+  phase-level orchestration + late-manager milestone; the NARROW legacy
+  recovery guard (resolve `FirstCommit`+cluster records as expired before
+  manager construction) ships IN this PR (OQ7 adjudicated for Codex over
+  AGY); preamble/table/citation consistency; fixture list completed.
 
 ---
 
@@ -128,7 +129,7 @@ no cycles/MB/retransmits to win back. The win, at absolute scale:
   ONCE, at boot, only from a non-nil active cluster config
   (`daemon_run_bringup.go:164`, documented `cluster_topology_preflight.go:117`);
   (iii) standalone↔cluster topology transitions are rejected at commit
-  (`daemon_apply_commit.go:551-557` `clusterTopologyCommitPreflight`) and a
+  (`daemon_apply_commit.go:558` `clusterTopologyCommitPreflight`) and a
   peer SyncApply that would transition returns BEFORE `applyConfigLocked`
   (`daemon_apply_commit.go:364-379`); (iv) `enterBootstrapMode` fires only
   for a nil rollback target (`daemon_apply_commit.go:650-652`), which cannot
@@ -139,20 +140,22 @@ no cycles/MB/retransmits to win back. The win, at absolute scale:
   COMMIT (`store_commit.go:458-461`) while persisting `FirstCommit=true`;
   recovery accepts an empty legacy `GuardedHash` (`store_persist.go:149-159`)
   and reconstructs `confirmPrevCfg=nil` solely from `FirstCommit`
-  (`store_persist.go:241-242`); the ACTIVE cluster config constructs
+  (`store_persist.go:239-240`); the ACTIVE cluster config constructs
   `d.cluster` at boot (`daemon_run_bringup.go:164`); a later timeout rolls
   into `enterBootstrapMode` — which does NOT stop cluster comms
   (`bootstrap.go:321-478`). Result: bootstrap-with-live-cluster-runtime,
   and a later corrected re-exit can run the RACE-2 writer against live HA
   readers. On current-version records this cannot happen (the preflight
   rejects the topology add), and a never-committed marker cannot coexist
-  with a same-version committed cluster config. **Consequence**: the plan
+  with a same-version committed cluster config. **Consequence (r7-resolved)**: the plan
   does NOT rely on the exclusion for safety — it converts every reader
-  uniformly, which covers the legacy path by construction. Behavior-level
-  hardening for the legacy path (guard recovery against FirstCommit+cluster
-  records, or stop cluster comms in `enterBootstrapMode` when
-  `d.cluster != nil`) is out of scope — follow-up issue at /engineer time
-  (§10, §11 OQ7).
+  uniformly, which covers the legacy path by construction — AND the NARROW
+  recovery guard ships in this PR (work item H, §4): recovery resolves a
+  `FirstCommit`+cluster record as expired before manager construction, so
+  the coexistence is prevented going forward. Only the BROADER
+  cluster-runtime lifecycle question (stop cluster comms in
+  `enterBootstrapMode` when `d.cluster != nil`) defers to a follow-up
+  issue (§10).
 - **Converts non-local safety arguments into local ones.** r1-r4 review
   proved three of the plan's own non-local arguments false as stated. One
   publication mechanism makes each of the 129 read sites locally correct
@@ -271,29 +274,37 @@ allocation per Store (≤5 per daemon lifetime), zero per read; matches the
      access (both directions asserted).
 
 **Work item G — startup-readiness gate for the rollback executor (r5 B1,
-r6-redesigned; closes the pre-existing dispatch-ordering defect the RACE-3
-audit exposed).** The recovered commit-confirmed timer can fire before
-`initManagers` completes (§2 RACE-3), which today can nil-deref
+r6/r7-redesigned; closes the pre-existing dispatch-ordering defect the
+RACE-3 audit exposed).** The recovered commit-confirmed timer can fire
+before `initManagers` completes (§2 RACE-3), which today can nil-deref
 `d.vrrpMgr` (`daemon_apply_tail.go:50` vs construction at
 `daemon_run_bringup.go:219`) and can arm the dataplane inside bootstrap
 mode (`daemon_run_bringup.go:490` check vs `:494` Start, interleaved with
-`enterBootstrapMode`). Design — one exactly-once startup OUTCOME, not a
-one-arm channel (r6: `d.daemonCtx` is the raw, never-cancelled parent
-(#5807, `daemon_run.go:64-87`; production passes `context.Background()`),
-so a `select` on it has no live arm on a failed/aborted startup and the
-timer goroutine would leak forever; and closing a ready-channel on the
-failure path would wrongly authorize rollback against partial
-initialization):
+`enterBootstrapMode`). Design — one exactly-once startup OUTCOME, published
+through a `sync.Once`-guarded helper (r6: `d.daemonCtx` never cancels, so
+a select on it has no live arm on a failed startup; r7: a literal
+`defer close(...)` plus the success close double-closes on normal
+shutdown):
 
 ```go
 // daemon.go — the startup outcome. startupDone is initialized in the
 // production constructor (daemon.go:1086-1108) BEFORE the executor
 // registration (daemon_run.go:136) — a nil channel would hang the
-// executor even on success. It is closed EXACTLY once on EVERY
-// startup-exit path; startupOK is stored true ONLY at the success
-// linearization point.
-startupDone chan struct{}
-startupOK   atomic.Bool
+// executor even on success. finishStartup publishes the outcome exactly
+// once on EVERY startup-exit path; startupOK is true only for a fully
+// successful startup.
+startupDone     chan struct{}
+startupDoneOnce sync.Once
+startupOK       atomic.Bool
+
+func (d *Daemon) finishStartup(ok bool) {
+    d.startupDoneOnce.Do(func() {
+        if ok {
+            d.startupOK.Store(true)
+        }
+        close(d.startupDone)
+    })
+}
 
 // executeConfirmedRollback (daemon_apply_commit.go:629) — wait for the
 // outcome, then check it, THEN take applySem. Gate-before-applySem is
@@ -307,34 +318,67 @@ if !d.startupOK.Load() {
 }
 ```
 
-- **Success close**: at the linearization point — after the last late
-  manager initialization (`daemon_run.go:435-511`) and BEFORE exposing
-  HTTP (`:587`) / gRPC (`:599`): `d.startupOK.Store(true);
-  close(d.startupDone)`. A rollback dispatched after it is semantically
-  identical to a remote commit arriving at first server contact (already
-  tolerated), and no apply runs concurrent with server construction.
-- **Failure close**: the abort/phase-error return (`daemon_run.go:176-178`,
-  via a deferred close registered before `runStartupOrAbort`) closes
-  `startupDone` WITHOUT setting OK — the executor wakes and abandons. No
-  leak on any path; no context-cancellation semantics involved.
+- **Success publish**: `d.finishStartup(true)` at the linearization point —
+  the END of PHASE 5 (after `startGRPCServer` returns, before PHASE 6).
+  This is the ONLY point where a dispatched rollback is EXACTLY equivalent
+  to a remote commit arriving at first server contact: zero applies run
+  concurrent with server construction (r7 correction — the earlier
+  before-exposure point permitted a promoted rollback to race gRPC's
+  `ActiveConfig` snapshot at `daemon_run_servers.go:216`).
+- **Failure publish**: `d.finishStartup(false)` from the startup-failure
+  paths — placed inside `runStartupOrAbort`'s failure handling (or its
+  immediate wrapper) so BOTH the plain-phase-error return AND the
+  signal-abort return reach it (existing tests drive `runStartupOrAbort`
+  directly, `startup_signal_5807_test.go:131`; the publish must live where
+  those paths reach it). The waiter wakes and abandons. No leak on any
+  path; no context-cancellation semantics involved.
 - **Signal-during-PHASE-5**: a rollback dispatched while a shutdown is
   pending is ordinary apply-vs-shutdown behavior (applySem-ordered,
   `daemon_run_shutdown.go:50`) — not a defect.
-- **Test-fixture migration**: existing executor fixtures
-  (`rollback_resync_test.go:31`, `bootstrap_rollback_test.go:24`)
-  construct `Daemon` directly and must initialize the outcome
-  (closed + OK) — a nil gate must never silently mean "ready".
+- **Test-fixture migration**: existing executor fixtures construct
+  `Daemon` directly and must initialize the outcome (closed + OK):
+  `rollback_resync_test.go:31`, `bootstrap_rollback_test.go:24`,
+  `rollback_serialize_test.go:71,150,201,247`. A nil gate must never
+  silently mean "ready".
 - **Contract comments**: the "acquires applySem FIRST" lock-order notes at
   `store_commit.go:327-334` and `daemon_apply_commit.go:611-628` are
   reworded for the gate-before-applySem order.
 - Store-internal fallback (`performAutoRollback`, `store_commit.go:822-823`)
   is untouched — it is store-state-only, no daemon managers. (Executor
-  dispatch is `store_commit.go:821`.)
-- Scope note: small companion fix inside the same PR (~40 LoC + tests).
-  Shipping the publication fix while leaving a KNOWN boot-panic would
-  contradict issue requirement #4's spirit. Both r6 reviewers recommend
-  KEEP-in-PR (Codex: possibly as a separate prerequisite commit in the
-  same stack). r7 open question 6 confirms.
+  dispatch is `store_commit.go:819-820`.)
+- Scope note: small companion fix inside the same PR (~40 LoC + tests),
+  landed as a SEPARATE PREREQUISITE COMMIT in the same PR/stack (both r7
+  reviewers) so it stays reviewable and bisectable ahead of the mechanical
+  `dpCell` conversion.
+
+**Work item H — narrow legacy recovery guard (r6 counterexample follow-through;
+ships IN this PR per r7 adjudication).** The cross-upgrade path (§2 r6
+boundary) can boot a node into live-cluster-runtime + pending
+first-commit-rollback, and the timeout then rolls into
+bootstrap-with-cluster — a live-topology hybrid the repo's own preflight
+classifies as unsafe (`cluster_topology_preflight.go:27`). The atomic cell
+fixes field tearing on that path but not the lifecycle semantics. Guard, at
+confirm-record recovery (`store_persist.go` recovery path, BEFORE any
+manager construction):
+
+```go
+// A FirstCommit record whose recovered ACTIVE config declares a cluster
+// is a pre-topology-guard artifact: rolling it back would strand a live
+// cluster node in bootstrap (HA silently drops out). Resolve the window
+// as expired instead: keep the active config, drop the record, log loudly.
+if rec.FirstCommit && recoveredActiveHasCluster(rec) {
+    // resolve-as-expired: no re-arm, remove confirm.json, warn
+}
+```
+
+Tests (configstore/daemon seams, no cluster needed): (i) legacy
+empty-`GuardedHash` FirstCommit+cluster record → guard fires (no re-arm,
+record removed, active config kept); (ii) matching nonempty-hash
+FirstCommit+cluster record (GuardedHash/preflight rollout interval) →
+guard fires; (iii) standalone `FirstCommit` record (no cluster) → normal
+re-arm + rollback proceeds unchanged. The BROADER cluster-runtime
+lifecycle question (should `enterBootstrapMode` stop cluster comms when
+`d.cluster != nil`) stays a follow-up issue.
 
 **fwdstatus adapter: STRUCTURALLY sampler-only (r2 M1 — Codex's structural
 argument adopted over AGY's comment-level one, per this repo's
@@ -488,11 +532,16 @@ Run-goroutine read before any server can deliver a commit; **CONCURRENT** =
 background/request-goroutine reader. Reachability: RACE-2 reaches only
 standalone/bootstrap consumers (§2 four-link exclusion); RACE-1 reaches
 ONLY the pre-publication watcher chain (§2 scope note); RACE-3 reaches
-EVERY apply-path (APPLY-class) reader via the recovered confirm timer
-PRE-gate — POST-gate (work item G) all timer dispatch is ordered after
-startup, collapsing those rows back to plain APPLY-serialized, with the
-atomic cell as the uniform defense. Everything not labeled with a live
-exposure is converted for uniformity, not reachability. The compiler
+every apply-PIPELINE reader (`applyConfigLocked` and its callees — the
+APPLY-class rows) via the recovered confirm timer PRE-gate — POST-gate
+(work item G) all timer dispatch is ordered after startup, collapsing
+those rows back to plain APPLY-serialized, with the atomic cell as the
+uniform defense. (The NAT start gate `daemon_natpoolalarm.go:101` is
+APPLY-class but lives on the bootstrap-EXIT path, not the rollback apply
+path — not timer-reachable.) "RACE-2 reaches only standalone/bootstrap"
+and the exclusion statements are current-version claims; the legacy
+cross-upgrade path is handled by work item H. Everything not labeled
+with a live exposure is converted for uniformity, not reachability. The compiler
 (field retype) proves the conversion total; this table is the
 classification snapshot.
 
@@ -508,12 +557,12 @@ classification snapshot.
 | `daemon_ha_userspace_stream.go` 67,259 | drainer captures at goroutine/fallback-loop start (capture-once; :67 is mixed standalone/HA — the standalone fallback at :125 reads `d.dp` BEFORE the `d.cluster == nil` check at :68) | CONCURRENT | RACE-2 (:67 standalone) / uniformity |
 | `daemon_ha_userspace_stream.go` 235 | full-resync exporter read, per-callback (HA-only) | CONCURRENT | uniformity |
 | `daemon_natpoolalarm.go` 18,21 | monitor sampler goroutine (#2116 lifecycle-gated) | CONCURRENT (gated) | gated off by lifecycle |
-| `daemon_natpoolalarm.go` 101 | start gate (boot block + `runBootstrapExitStartup` under applySem) | APPLY/BOOT-SYNC | serialized |
+| `daemon_natpoolalarm.go` 101 | start gate (boot block + `runBootstrapExitStartup` under applySem — exit path, NOT traversed by a rollback apply) | APPLY/BOOT-SYNC | serialized |
 | `daemon_run.go` 312,324 | `er.AddCallback` per-SESSION_OPEN reads (registered :284 iff `getSessionSync() != nil`, post-publication) | CONCURRENT | unreachable-by-writer (uniformity) |
 | `daemon_run.go` 611,612 | CLI probe after gRPC start (:598) | CONCURRENT | RACE-2 (micro-window) |
 | `daemon_run_servers.go` 117,118 | gRPC construction probes (HTTP already serving) | CONCURRENT | RACE-2 (micro-window) |
 | `daemon_run_servers.go` 255,256 | API construction probes (before HTTP serving starts) | BOOT-SYNC | program order |
-| `daemon_run_shutdown.go` 161,167,173 | HA-only rg_active clear (requires cluster config) | CONCURRENT | unreachable via exclusion (uniformity) |
+| `daemon_run_shutdown.go` 161,167,173 | HA-only rg_active clear (requires cluster config) | CONCURRENT | unreachable via exclusion (current-version; legacy path guarded by work item H) |
 | `daemon_run_shutdown.go` 214,219,220,225,229 | final stats / Close / Teardown (applySem released at :50) | CONCURRENT | RACE-2 |
 | `daemon_ha_fabric.go` 533,537,554,555,567,570,724,728,750,753 | fabric probe/refresh goroutines (post-publication start) | CONCURRENT | uniformity |
 | `daemon_ha_sync.go` 193,299,300,311,733,750,1117,1124,1164,1165,1286,1297 | watchdog/sync/fence/SetRuntime goroutines (post-publication start) | CONCURRENT | uniformity |
@@ -533,7 +582,7 @@ classification snapshot.
 | `daemon_policy_invalidate.go` 286,290 | callers hold applySem (:114-116; `daemon_apply_commit.go:270`) | APPLY (vs RACE-2) / CONCURRENT (vs RACE-3) | serialized / **RACE-3** (pre-gate) |
 | `daemon_system.go` 41 | applySyslogConfig (boot-time and apply-path callers) | APPLY/BOOT-SYNC (vs RACE-2) / CONCURRENT (vs RACE-3) | serialized / **RACE-3** (pre-gate) |
 | `daemon.go` 1012 | `applyResult()` (boot-time and apply-path callers) | APPLY/BOOT-SYNC (vs RACE-2) / CONCURRENT (vs RACE-3) | serialized / **RACE-3** (pre-gate) |
-| `bootstrap.go` 472,473 | rollback teardown under applySem — but the recovered commit-confirmed TIMER path (§2 RACE-3) reaches it while the phase-3 boot writers run WITHOUT applySem | APPLY (vs RACE-2) / CONCURRENT (vs RACE-3) | **RACE-3** |
+| `bootstrap.go` 472,473 | rollback teardown under applySem — but the recovered commit-confirmed TIMER path (§2 RACE-3) reaches it while the phase-3 boot writers run WITHOUT applySem | APPLY (vs RACE-2) / CONCURRENT (vs RACE-3) | **RACE-3** (pre-gate) |
 | `daemon_run_naming.go` 230,231,236 | exit arm block (nil-check, Start, seeder) | APPLY (vs RACE-2) / CONCURRENT (vs RACE-3) | serialized / **RACE-3** (pre-gate) |
 | `daemon_run_bringup.go` 476,477,493,494,506 | boot post-construct reads (same goroutine as W) | BOOT-SYNC | program order |
 | `daemon_run.go` 212,223,238,270,354,365 | boot PHASE 3-5 setup, pre-server | BOOT-SYNC | program order |
@@ -697,28 +746,46 @@ Preserved exactly:
      watcher-shape reader loop racing the boot `setDataplane(dp)`
      publication; nil-or-full-slot assertion; `-race` clean.
    - `TestDataplaneCell_ConfirmTimerVsBootPublication` — RACE-3 + work
-     item G (r5 pivot, r6-strengthened):
+     item G (r5 pivot, r6/r7-strengthened):
      (a) GATE test: with `startupDone` OPEN, a fired
-     `executeConfirmedRollback` must BLOCK before applySem — assert no
-     rollback side effects AND that a second goroutine CAN acquire and
-     release `d.applySem` while the executor is gated (an implementation
-     that takes applySem THEN waits would deadlock the boot apply; this
-     assertion kills it). Then: close with `startupOK=true` ⇒ rollback
-     proceeds; close with `startupOK=false` (failure leg) ⇒ abandon with
-     no side effects and no leaked waiter.
+     `executeConfirmedRollback` must BLOCK before applySem — a test-only
+     ENTRY HOOK (counter/channel signalled immediately before the
+     `<-startupDone` wait) proves the executor is AT the gate before the
+     test contends (without it, a wrong acquire-then-wait implementation
+     passes if the contender runs first). While gated: assert no rollback
+     side effects AND that a second goroutine CAN acquire and release
+     `d.applySem`. Then: `finishStartup(true)` ⇒ rollback proceeds;
+     `finishStartup(false)` (failure leg) ⇒ abandon with no side effects
+     and no leaked waiter. The failure leg is ALSO driven through BOTH
+     REAL failure paths (plain phase error AND signal abort via
+     `runStartupOrAbort`, mirroring `startup_signal_5807_test.go:131`)
+     to prove the production publish fires, not just the manual one.
      (b) Cell revert-guard, post-startup shape: two-sided gate — a
      `setDataplane(dp)` publication gated immediately before the store vs
      an applySem-holding reader gated immediately before its
      `d.dataplane()` load; shared release; no channel between the pair.
-     (c) REAL-path ordering test: a fake `RuntimeDataPlane` (NOT
-     NoDataplane — that skips the boot writer/arm path), a stubbed
-     persisted confirm record, and a deterministic post-`Load`/
-     pre-`initManagers` startup seam (a phase-hook var for tests): fire
-     the timer while startup is paused, assert NO dispatch (gate holds),
-     resume startup, assert dispatch lands after the linearization point
-     with the fake dataplane intact (pre-gate the dispatch would touch
-     `d.vrrpMgr` — nil before construction — and interleave the boot
-     writer).
+     (c) REAL-path ordering test, phase-level orchestration (NOT a full
+     host-mutating `Run`): stubbed store with a persisted confirm record
+     + the phase functions driven in order (config-load → manager-init →
+     dataplane-setup), a per-Daemon BACKEND-FACTORY SEAM (test-only var
+     substituted for `buildRuntimeDataPlane` — the production factory
+     hard-codes userspace at `daemon_run.go:53-60` and phase 4 overwrites
+     `d.dp` at `daemon_run_bringup.go:421`) supplying a fake
+     `RuntimeDataPlane`, the existing `linkDir` test override for naming
+     side effects, and a deterministic post-`Load`/pre-`initManagers`
+     phase-hook. Fire the timer while paused: assert EXECUTOR ENTRY (the
+     hook) with NO `PromoteRollback`/apply side effects (the gate holds —
+     "no dispatch" is unobservable since `fireConfirmTimer` invokes the
+     executor directly at `store_commit.go:819-820`). Resume: assert the
+     rollback lands after the linearization point with the fake dataplane
+     intact AND a LATE-MANAGER milestone initialized (`snmpBootReady`
+     true / LLDP manager non-nil — a close placed immediately after
+     phase 4 fails this).
+   - Work item H tests (configstore/daemon seams, no cluster): (i) legacy
+     empty-`GuardedHash` FirstCommit+cluster record → guard fires (no
+     re-arm, record removed, active config kept); (ii) matching
+     nonempty-hash FirstCommit+cluster record → guard fires; (iii)
+     standalone `FirstCommit` record → normal re-arm + rollback.
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
    `setDataplane`) and `daemon_forwarding_status_test.go` (rewrite against
    the narrowed adapter: `ProjectsMapStats`/`UsesUserspaceStatusAdapter`
@@ -762,37 +829,39 @@ Preserved exactly:
 - Any Rust/helper change; dataplane hot-swap/re-arm support (the accessor
   ENABLES it safely later).
 - Full-repo `go test -race` wiring.
-- **Legacy-path hardening (r6 follow-up issue, filed at /engineer time)**:
-  behavior-level handling of the cross-upgrade coexistence (§2 r6
-  boundary) — either guarding recovery against `FirstCommit`+cluster
-  confirm records (resolve-as-expired rather than rolling back into
-  bootstrap-with-cluster), or stopping cluster comms in
-  `enterBootstrapMode` when `d.cluster != nil`. The publication fix
-  removes the crash vector on this path; the coexistence BEHAVIOR is a
-  pre-existing configstore/recovery policy question, not a `d.dp`
+- **Broader cluster-runtime lifecycle question (follow-up issue, filed at
+  /engineer time)**: should `enterBootstrapMode` stop cluster comms when
+  `d.cluster != nil`? The NARROW recovery guard (work item H) ships in
+  this PR and prevents the bootstrap-with-cluster state going forward;
+  the lifecycle redesign is a pre-existing policy question, not a `d.dp`
   publication concern.
 
-## 11. Open questions for adversarial review (r7)
+## 11. Open questions for adversarial review (r8)
 
-Resolved in v2-v7 (for the record): A2 deletion; atomic cell choice;
+Resolved in v2-v8 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
 policy-invalidate APPLY-class; HA smoke gates mandatory + specific;
 typed-nil kind-gated guard over all nillable kinds with a table-driven
 matrix; docs scope (README architecture + :936 + docs/ sweep + stale
 comments incl. the r3/r4/r5 additions + `_Log.md`); audit table
 completeness AND exact count (134 = 5 + 129) with consistent per-row
-exposure cells; deterministic real-sampler barrier as a two-sided gate
-with a bounded sustained-quiescence teardown; bootstrap/cluster exclusion
-scoped to current-version records with the r6 cross-upgrade coexistence
-documented; RACE-1 scoped to the pre-publication watcher chain INCLUDING
-the blackhole→readiness hop; RACE-3 (recovered commit-confirmed rollback
-timer) documented; the pre-existing startup-ordering defect it exposed
-(nil-deref `d.vrrpMgr`, bootstrap-armed interleaving) addressed by work
-item G, REDESIGNED as an exactly-once startup outcome (`startupDone` +
-`startupOK`, constructor-initialized, linearization before server
-exposure, fixture migration, contract-comment updates); work item G kept
-IN the PR (both r6 reviewers concur; Codex allows a separate prerequisite
-commit in the same stack).
+exposure cells and narrowed preamble; deterministic real-sampler barrier
+as a two-sided gate with a bounded sustained-quiescence teardown;
+bootstrap/cluster exclusion scoped to current-version records with the r6
+cross-upgrade coexistence documented AND prevented going forward by work
+item H; RACE-1 scoped to the pre-publication watcher chain INCLUDING the
+blackhole→readiness hop; RACE-3 documented; the pre-existing
+startup-ordering defect addressed by work item G — `finishStartup(ok)`
+Once-guarded outcome publisher (no double-close, no leak on any exit
+path, no rollback against partial init), linearization at END of PHASE 5
+(exactly remote-commit-equivalent), constructor initialization,
+fixture migration (all four executor fixture files), contract-comment
+updates, gate tests with entry hook + dual real failure paths +
+backend-factory seam + phase-level orchestration + late-manager
+milestone; work item G lands as a separate prerequisite commit in the
+same PR/stack (OQ6); the narrow legacy recovery guard ships IN this PR
+(OQ7 — adjudicated for Codex over AGY); broader cluster-lifecycle work
+defers to a follow-up.
 
 Still open:
 
@@ -814,13 +883,6 @@ Still open:
    reviewers want a lighter `grep`-based `make` check instead?
 5. `test-race-dp` wiring into `test-go`: acceptable growth of the
    pre-commit gate, or documented-manual-gate only?
-6. **Work item G kept IN this PR** (both r6 reviewers concur). Remaining
-   sub-question: single commit vs separate prerequisite commit in the same
-   stack (Codex's suggestion for reviewability)?
-7. **Legacy-path hardening** (§10): confirm the follow-up-issue split
-   (guard recovery against `FirstCommit`+cluster records, or stop cluster
-   comms in `enterBootstrapMode` when `d.cluster != nil`) rather than
-   folding it into this PR.
 
 ---
 
