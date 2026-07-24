@@ -141,11 +141,31 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, map[string
 			b.WriteString("    aggressive = yes\n")
 		}
 
+		// local_addrs / remote_addrs carry the endpoint address list
+		// (a real IP / dotted hostname, an IPv6 literal, a comma-
+		// separated multi-address list, or the responder-only "%any").
+		// Run them through sanitizeSwanctlValue for parity with the
+		// local_ts / remote_ts belt below and the id / PSK belts above:
+		// these are UNQUOTED list slots, so an embedded control
+		// character — a newline in particular — would otherwise inject an
+		// arbitrary `key = value` line (downgrade `version`, flip
+		// `aggressive`, add `also`/`children`) into the connection block.
+		// sanitizeSwanctlValue collapses the newline to a space, keeping
+		// the whole value on one line so a tampered address renders inert
+		// instead of live. It touches nothing in a legitimate address
+		// (letters, digits, `.`, `:`, `,`, `%` are all preserved), so a
+		// valid single/comma-list/IPv6 endpoint is byte-identical. The
+		// commit-time gate (validateIPsecEndpointsStrict) rejects such a
+		// value; this render belt is the by-construction backstop for a
+		// path that reaches render without local commit (HA peer-sync,
+		// direct IPsecConfig construction, a config persisted before the
+		// fix). Unquoted, so NO escapeSwanctlQuoted — that belt is for the
+		// quoted id / cert / secret slots only (#6469).
 		if localAddr != "" {
-			fmt.Fprintf(&b, "    local_addrs = %s\n", localAddr)
+			fmt.Fprintf(&b, "    local_addrs = %s\n", sanitizeSwanctlValue(localAddr))
 		}
 		if remoteAddr != "" {
-			fmt.Fprintf(&b, "    remote_addrs = %s\n", remoteAddr)
+			fmt.Fprintf(&b, "    remote_addrs = %s\n", sanitizeSwanctlValue(remoteAddr))
 		}
 
 		// NAT traversal
@@ -195,7 +215,20 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, map[string
 		b.WriteString("    }\n")
 
 		if ikeProposals != "" {
-			fmt.Fprintf(&b, "    proposals = %s\n", ikeProposals)
+			// Sanitize the IKE proposal list for the same reason as the
+			// child-SA esp_proposals below and the local_ts/remote_ts belt:
+			// buildIKEProposal / buildIKEProposalFromIKE append
+			// prop.EncryptionAlg / prop.AuthAlg VERBATIM on the unknown-
+			// algorithm fall-through (normalizeAuthAlg's default branch returns
+			// the collapsed token unchanged; normalizeEncAlg's generic gcm strip
+			// only removes `-cbc`/`-`), so a control character in a peer-synced
+			// or directly-constructed proposal survives into this UNQUOTED list
+			// slot and an embedded newline would inject a connection-level
+			// swanctl directive. sanitize-only, NOT escapeSwanctlQuoted (this is
+			// an unquoted list slot like local_ts/remote_ts): a proposal token is
+			// alnum / `-` / `,`, all preserved by sanitizeSwanctlValue, so a
+			// legitimate proposal or comma-list renders byte-identical (#6469).
+			fmt.Fprintf(&b, "    proposals = %s\n", sanitizeSwanctlValue(ikeProposals))
 		}
 		if ikeLifetime > 0 {
 			fmt.Fprintf(&b, "    rekey_time = %ds\n", ikeLifetime)
@@ -230,7 +263,19 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, map[string
 			if child.RemoteTS != "" {
 				fmt.Fprintf(&b, "        remote_ts = %s\n", sanitizeSwanctlValue(child.RemoteTS))
 			}
-			fmt.Fprintf(&b, "        esp_proposals = %s\n", espProposals)
+			// esp_proposals sits INSIDE the children{ <child> { } } block —
+			// the same block whose local_ts/remote_ts belt above cites an
+			// injected `updown = /tmp/x.sh` executed by charon as ROOT.
+			// buildESPProposal appends prop.EncryptionAlg / prop.AuthAlg
+			// VERBATIM on the unknown-algorithm fall-through, so a control
+			// character in a peer-synced or directly-constructed ESP proposal
+			// survives; an embedded newline here injects a child-SA directive
+			// (updown → root exec, or an esp_proposals/mode/mark_* crypto
+			// rewrite) — a strictly worse vector than the endpoint one on the
+			// identical validation-bypassed threat model. sanitize-only,
+			// unquoted list slot; a legitimate proposal / comma-list renders
+			// byte-identical (#6469).
+			fmt.Fprintf(&b, "        esp_proposals = %s\n", sanitizeSwanctlValue(espProposals))
 			if espLifetime > 0 {
 				fmt.Fprintf(&b, "        rekey_time = %ds\n", espLifetime)
 				b.WriteString("        rand_time = 0s\n")

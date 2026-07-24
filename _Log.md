@@ -60590,3 +60590,41 @@ top.
   (13s), TestHeatmapNotStale all GREEN (no LOC bucket shift).
 - **File(s)**: pkg/config/compiler_nat_static.go,
     pkg/config/static_nat_multitarget_6483_test.go, docs/config-schema.md, _Log.md
+
+## 2026-07-24 — #6469 swanctl render-belt completeness (endpoints + proposals)
+- **Timestamp**: 2026-07-24
+- **Action**: Sanitize EVERY remaining raw-`%s` swanctl render slot that
+  carries peer/operator-influenced free text, so the render belt in
+  `renderConfig` (`policy.go`) is complete. A validation-bypassed path (HA
+  peer-sync of a pre-fix config, direct IPsecConfig construction, a config
+  persisted before the fix) could carry an embedded newline and inject a
+  live swanctl directive. Wrapped four Fprintf sites in
+  `sanitizeSwanctlValue`:
+  - `local_addrs` / `remote_addrs` (resolved endpoint from
+    resolveRemoteAddr — the Gateways-map shape took gw.Address /
+    gw.DynamicHostname verbatim; the legacy inline vpn.Gateway shape was
+    already filtered by config.IsUsableIPsecEndpoint).
+  - `proposals` (IKE, ikeProposals) / `esp_proposals` (ESP, espProposals)
+    — buildIKEProposal* / buildESPProposal append prop.EncryptionAlg /
+    prop.AuthAlg VERBATIM on the unknown-algorithm fall-through
+    (normalizeAuthAlg default branch; normalizeEncAlg generic gcm strip),
+    so a control char survives. esp_proposals sits inside children{} where
+    an injected `updown = <script>` runs as ROOT — a strictly worse vector
+    than the endpoint one (the FOLD gap: the original PR's "last raw-%s
+    surface" claim was FALSE — a hostile review caught these two siblings).
+  All four are UNQUOTED list slots → sanitize alone (NO escapeSwanctlQuoted,
+  which is for the quoted id/cert/secret slots). Legit values byte-
+  identical: `.`/`,`/`:`/`%`/`-` preserved, so single/comma-list/IPv6/`%any`
+  endpoints and dashed multi-proposal lists render unchanged. Slot-
+  classification sweep confirmed the remaining slots are safe by
+  construction (auth / dpd_action = fixed enums; id/certs/secret already
+  belted; names sanitized; dpd_delay/rekey_time/if_id_* = integers).
+  Fail-on-revert tests: 4 endpoint vectors + 2 proposal vectors (IKE
+  `proposals` newline; ESP `esp_proposals` updown→root) + endpoint and
+  proposal over-escape guards. Parent-RED confirmed firsthand per slot —
+  revert proposals wrap → "proposal injection NOT neutralized: reauth_time
+  = 0 rendered as a live directive line"; revert esp_proposals wrap →
+  "... updown = /tmp/pwn.sh rendered as a live directive line". go build /
+  vet / gofmt / pkg-ipsec-suite / heatmap GREEN.
+- **File(s)**: pkg/ipsec/policy.go,
+    pkg/ipsec/swanctl_addr_sanitize_6469_test.go, pkg/ipsec/README.md, _Log.md
