@@ -412,6 +412,20 @@ type compileOpts struct {
 	// rejected so the author is told to write it once.
 	lenientDuplicateNamedBlock bool
 
+	// lenientDuplicateNATRuleName (#5649, C181-M18) downgrades the duplicate
+	// NAT rule-name gate (validateDuplicateNATRuleNamesAST) from a hard error
+	// to a warning on the tolerant load / peer-sync paths. Unlike #5180 the
+	// duplicate is NOT last-writer-wins: both same-named rules survive as
+	// separate first-match rows, the first shadowing the second, and both
+	// share the one natType/ruleset/rule counter identity. An already-persisted
+	// config (or one synced from a peer) may carry such a duplicate; an
+	// upgrading / receiving node must still boot through it (warn — the runtime
+	// keeps the historical two-row behavior) rather than fail-closed-on-load
+	// (#1960 class). Commit / commit-check stay strict — a new operator edit
+	// that authors a rule twice is rejected so the author is told to write it
+	// once.
+	lenientDuplicateNATRuleName bool
+
 	// lenientNATHostMask (#2173) downgrades the static-NAT / NAT64
 	// host-mask gate (validateNATHostMaskStrict) from a hard compile error
 	// to a cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync
@@ -1978,6 +1992,7 @@ func lenientCompileOpts() compileOpts {
 		lenientLogProfileStreamRef:             true,
 		lenientDynamicAddressFeedRef:           true,
 		lenientDuplicateNamedBlock:             true,
+		lenientDuplicateNATRuleName:            true,
 		lenientNATPoolAlarmThreshold:           true,
 		lenientNATHostMask:                     true,
 		lenientUnsupportedInterfaceStanzas:     true,

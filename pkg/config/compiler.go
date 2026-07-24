@@ -243,6 +243,18 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		return nil, dupBlockErr
 	}
 
+	// #5649 (C181-M18): duplicate NAT rule-name gate — see
+	// validateDuplicateNATRuleNamesAST. Pre-expansion, top-level `security`
+	// stanzas only, beside the #5180 gate. Two same-named rules in one NAT
+	// rule-set BOTH survive as first-match rows (the first shadows the second)
+	// and share one natType/ruleset/rule counter identity; strict rejects,
+	// lenient warns.
+	dupNATRuleWarnings, dupNATRuleErr := validateDuplicateNATRuleNamesAST(
+		tree, opts.lenientDuplicateNATRuleName)
+	if dupNATRuleErr != nil {
+		return nil, dupNATRuleErr
+	}
+
 	// #5878: numeric interface-unit alias gate (#5631) as a BOTH-NODE-effective
 	// union. Runs PRE-expansion, beside the tunnel/zone/table-id gates, so a
 	// peer-only `groups node1`/`${node}` alias that collides only in the
@@ -305,6 +317,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dupNATRuleWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
 	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)
@@ -375,6 +388,15 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, dupBlockErr
 	}
 
+	// #5649 (C181-M18): duplicate NAT rule-name gate — see compileConfigWithOpts
+	// / validateDuplicateNATRuleNamesAST. Pre-expansion, top-level `security`
+	// stanzas only; strict rejects, lenient warns.
+	dupNATRuleWarnings, dupNATRuleErr := validateDuplicateNATRuleNamesAST(
+		tree, opts.lenientDuplicateNATRuleName)
+	if dupNATRuleErr != nil {
+		return nil, dupNATRuleErr
+	}
+
 	// #5878: numeric interface-unit alias gate (#5631) as a BOTH-NODE-effective
 	// union — see compileConfigWithOpts. Pre-expansion on purpose: the union
 	// across View 1 (groups) + Views 2/3 (node0/node1 expansions) is identical
@@ -431,6 +453,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dupNATRuleWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
 	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)

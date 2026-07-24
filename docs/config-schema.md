@@ -467,6 +467,36 @@ peer-view wiring (node0 accepts the peer-only overlap). The shipped `test/incus/
 pool drawn by both NAT64 and a source-NAT rule) and were separated into distinct
 pools + proxy-ARP as part of this change.
 
+### Duplicate NAT rule name (#5649, C181-M18)
+
+NAT rule-sets are ordered, first-match tables and each rule's operational /
+counter identity is `natType/ruleset/rule` (`pkg/dataplane/compiler_nat.go`).
+Two rules authored with the SAME name in one rule-set are NOT reduced to
+last-writer-wins like a #5180 hierarchical block — they BOTH survive:
+`namedInstances` (the rule loop in `compiler_nat_source.go` /
+`compiler_nat_destination.go` / `compiler_nat_static.go`) appends each as a
+separate row. The first shadows the second (first-match), the second is
+unreachable, and both map to the ONE name-derived counter identity, so
+`show` / counter surfaces cannot tell the two rows apart and reordering
+equivalent text can silently change enforcement.
+
+`validateDuplicateNATRuleNamesAST(tree, lenient)`
+(`pkg/config/dup_nat_rule_names.go`, wired beside the #5180 duplicate-named-block
+gate in both `compileConfigWithOpts` and `compileConfigForNodeWithOpts`) rejects
+this at commit. It runs **pre-expansion** on top-level `security` stanzas only —
+apply-groups DEEP-MERGES a same-named rule rather than duplicating it, and the
+flat `set` form reuses the rule node, so only a directly-authored hierarchical
+duplicate reaches the gate. The seen-set is keyed by `(natType, rule-set, rule)`
+and unioned across repeated `security` / `nat` / `source|destination|static`
+blocks (compileNAT merges those, #3915), so a rule name split across two
+`source {}` blocks is caught too. The same rule name in two DIFFERENT rule-sets
+(a distinct identity) is accepted. Strict (commit / commit-check) hard-rejects;
+lenient (load / peer-sync) warns via `opts.lenientDuplicateNATRuleName` (#1960
+no-brick) and keeps the historical two-row behavior. Covered by
+`pkg/config/dup_nat_rule_names_5649_test.go` (source / destination / static
+reject, lenient warn, and distinct-name / different-rule-set / flat-set-merge
+accept guards), RED on revert of the gate (the duplicate is accepted).
+
 **Phase 2 (#5878) — reference-binder canonicalization.** Phase 1 (above) closes
 the divergent-commit fail-open by rejecting a duplicate-spelling collision at
 commit. The second, subtler half of #5878 is that a cross-subsystem reference

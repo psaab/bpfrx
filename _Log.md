@@ -60204,3 +60204,24 @@ top.
     go test ./... (TMPDIR=/tmp, disk GOCACHE) GREEN.
 - **File(s)**: pkg/routing/bond.go, pkg/routing/adopt_guard_6402_test.go,
     pkg/routing/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23 20:30
+- **Action**: #5649 (C181-M18) — reject duplicate NAT rule names at commit. A
+    NAT rule-set is an ordered first-match table and each rule's counter
+    identity is natType/ruleset/rule; two same-named rules in one rule-set BOTH
+    survive (namedInstances appends each row), so the first shadows the second,
+    the second is unreachable, and both share one counter identity — silently
+    order-dependent translation + merged telemetry. Added
+    validateDuplicateNATRuleNamesAST (pre-expansion, top-level `security` only,
+    keyed by (natType,rule-set,rule), unioned across repeated
+    security/nat/source|destination|static blocks) wired beside the #5180
+    dup-named-block gate in both compileConfigWithOpts and
+    compileConfigForNodeWithOpts; strict rejects, lenient
+    (opts.lenientDuplicateNATRuleName) warns (#1960 no-brick). Fail-on-revert:
+    TestDuplicateNATRuleNameRejected (source/destination/static via CompileConfig)
+    — neutralize by `return nil, nil` at the top of the validator → clean
+    assertion RED (no build break). go build ./pkg/config, go vet ./pkg/config,
+    go test ./pkg/config GREEN; FULL go test ./... GREEN.
+- **File(s)**: pkg/config/dup_nat_rule_names.go,
+    pkg/config/dup_nat_rule_names_5649_test.go, pkg/config/compiler.go,
+    pkg/config/compiler_opts.go, docs/config-schema.md, _Log.md
