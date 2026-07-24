@@ -60225,3 +60225,28 @@ top.
 - **File(s)**: pkg/config/dup_nat_rule_names.go,
     pkg/config/dup_nat_rule_names_5649_test.go, pkg/config/compiler.go,
     pkg/config/compiler_opts.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23 21:15
+- **Action**: #6452 review fold (Codex finding #3, NPTv6). NPTv6 (RFC 6296)
+    static rules are counter-less (compileStaticNAT skips rule.IsNPTv6 before
+    assignNATCounterID; buildNptv6Snapshots appends each as its own snapshot)
+    AND the #2241 NPTv6 overlap gate SKIPS same-(rule-set,rule) pairs (#4339),
+    so validateDuplicateNATRuleNamesAST is the ONLY gate that catches a
+    duplicate NPTv6 rule name. Chose Option B (verified firsthand): KEEP the
+    rejection (a duplicate rule name is always invalid) but make the diagnostic
+    NPTv6-aware — added staticRuleIsNPTv6 (mirrors compiler_nat_static.go
+    then-static-nat-nptv6-prefix detection, flat + hierarchical) and
+    dupNATRule.reason() which drops the false shared-counter-identity claim for
+    NPTv6 and reports order-dependent first-match snapshot ambiguity instead.
+    Findings #1 (group-authored dup bypasses top-level-only pre-expansion scan)
+    and #2 (empty rule "" name skipped) verified firsthand as INHERITED
+    #5180-family limitations (dup_named_blocks.go has identical scope), NOT
+    #6452 regressions — filed follow-up issue #6455 covering BOTH gates with a
+    verified repro; did NOT expand #6452 past its sibling's scope. New test
+    TestDuplicateNATRuleNameNPTv6AwareDiagnostic. Parent-RED (two recipes): (A)
+    `return nil,nil` at top of validateDuplicateNATRuleNamesAST → all reject
+    tests RED; (B) `return false` at top of staticRuleIsNPTv6 → ONLY the NPTv6
+    test RED (message reverts to counter-identity). go vet ./pkg/config clean,
+    heatmap unchanged, FULL go test ./... GREEN.
+- **File(s)**: pkg/config/dup_nat_rule_names.go,
+    pkg/config/dup_nat_rule_names_5649_test.go, docs/config-schema.md, _Log.md

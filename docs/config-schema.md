@@ -492,10 +492,25 @@ blocks (compileNAT merges those, #3915), so a rule name split across two
 `source {}` blocks is caught too. The same rule name in two DIFFERENT rule-sets
 (a distinct identity) is accepted. Strict (commit / commit-check) hard-rejects;
 lenient (load / peer-sync) warns via `opts.lenientDuplicateNATRuleName` (#1960
-no-brick) and keeps the historical two-row behavior. Covered by
-`pkg/config/dup_nat_rule_names_5649_test.go` (source / destination / static
-reject, lenient warn, and distinct-name / different-rule-set / flat-set-merge
-accept guards), RED on revert of the gate (the duplicate is accepted).
+no-brick) and keeps the historical two-row behavior.
+
+**NPTv6 (RFC 6296) static rules are counter-less** — `compileStaticNAT` skips
+`rule.IsNPTv6` before `assignNATCounterID`, and `buildNptv6Snapshots`
+(`pkg/dataplane/userspace/nat_nptv6.go`) appends each rule as its own snapshot.
+The #2241 NPTv6 overlap gate (`compiler_validate_strict_nat.go`) deliberately
+SKIPS same-`(rule-set, rule)` pairs (#4339, so a single multi-`from`-scope rule
+is not flagged against itself), so it never compares two same-named NPTv6 rules
+— this duplicate-name gate is the ONLY one that catches them. A duplicate NPTv6
+rule name is therefore still rejected (a duplicate name is always invalid), but
+the diagnostic is NPTv6-aware: it reports order-dependent first-match resolution
+between the two snapshots rather than a shared counter identity the rule does
+not have (`staticRuleIsNPTv6` + `dupNATRule.reason()`).
+
+Covered by `pkg/config/dup_nat_rule_names_5649_test.go` (source / destination /
+static reject, NPTv6-aware-diagnostic reject, lenient warn, and distinct-name /
+different-rule-set / flat-set-merge accept guards), RED on revert of the gate
+(the duplicate is accepted) and, separately, RED on revert of the NPTv6
+detection (the diagnostic wrongly claims a counter identity).
 
 **Phase 2 (#5878) — reference-binder canonicalization.** Phase 1 (above) closes
 the divergent-commit fail-open by rejecting a duplicate-spelling collision at

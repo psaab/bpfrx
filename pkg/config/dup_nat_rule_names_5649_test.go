@@ -134,6 +134,67 @@ func TestDuplicateNATRuleNameRejected(t *testing.T) {
 	}
 }
 
+// TestDuplicateNATRuleNameNPTv6AwareDiagnostic binds the #6452 review fold
+// (Codex finding #3). NPTv6 (RFC 6296) static rules are COUNTER-LESS
+// (compileStaticNAT skips rule.IsNPTv6 before assignNATCounterID;
+// buildNptv6Snapshots appends each as its own snapshot) AND the #2241 NPTv6
+// overlap gate deliberately SKIPS same-(rule-set, rule) pairs (#4339). So two
+// same-named NPTv6 rules are caught by NO other gate — this gate MUST still
+// reject them (a duplicate rule name is always invalid), but the diagnostic
+// must NOT claim a shared "counter identity" for a counter-less rule.
+//
+// RED-on-revert of the NPTv6-awareness (drop the staticRuleIsNPTv6 detection or
+// the reason() nptv6 branch): the message reverts to the counter-identity
+// wording, so the "must NOT mention counter identity" assertion goes RED.
+func TestDuplicateNATRuleNameNPTv6AwareDiagnostic(t *testing.T) {
+	// Two same-named NPTv6 rules with DIFFERENT, non-overlapping prefixes —
+	// the overlap gate would not flag them even if it inspected them, so this
+	// gate is the sole catcher.
+	tree := parseHier5649(t, `security {
+    nat {
+        static {
+            rule-set RS {
+                from zone untrust;
+                rule R1 {
+                    match { destination-address 2001:db8:1::/48; }
+                    then { static-nat { nptv6-prefix { 2001:db8:2::/48; } } }
+                }
+                rule R1 {
+                    match { destination-address 2001:db8:3::/48; }
+                    then { static-nat { nptv6-prefix { 2001:db8:4::/48; } } }
+                }
+            }
+        }
+    }
+}`)
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig must still reject a duplicate NPTv6 static rule name")
+	}
+	msg := err.Error()
+	for _, want := range []string{"static", "R1", "RS", "NPTv6", "5649"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("NPTv6 duplicate error should mention %q, got: %v", want, err)
+		}
+	}
+	// The rule is counter-less; the diagnostic must not claim a shared counter.
+	if strings.Contains(msg, "counter identity") {
+		t.Fatalf("NPTv6 duplicate diagnostic must NOT claim a shared counter identity, got: %v", err)
+	}
+
+	// Flat-set nptv6-prefix shape is detected too (dual-AST): a single R1 via
+	// flat set MERGES and must pass — proof the detector reads both shapes and
+	// the flat form does not duplicate.
+	flat := setTree5649(t, []string{
+		"set security nat static rule-set RS rule R1 match destination-address 2001:db8:1::/48",
+		"set security nat static rule-set RS rule R1 then static-nat nptv6-prefix 2001:db8:2::/48",
+	})
+	if _, err := validateDuplicateNATRuleNamesAST(flat, false); err != nil {
+		t.Fatalf("flat-set single NPTv6 rule must pass, got: %v", err)
+	}
+}
+
 // TestDuplicateNATRuleNameLenientWarns proves the tolerant path (Load /
 // peer-sync) downgrades the reject to a warning so an already-persisted or
 // peer-synced config still boots through (#1960 class).
