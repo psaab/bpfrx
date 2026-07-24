@@ -1769,6 +1769,51 @@ fn wire_invariant_default_specimens() {
     }
 }
 
+// #6459/#6463: cross-language wire-key contract for the two new fail-closed
+// filter-term markers. The Go producer
+// (pkg/dataplane/userspace/protocol_policies.go) marshals
+// `ports_unrepresentable` / `address_unrepresentable` with omitempty; the Rust
+// consumer (protocol/security.rs) decodes them with serde(default). A key
+// rename on either side must fail a test here (Rust decode) or in the Go-side
+// contract test (Go encode) instead of silently degrading to the pre-fix
+// narrowing behavior.
+#[test]
+fn firewall_term_snapshot_unrepresentable_marker_wire_keys_6459_6463() {
+    // Rust serialize: both markers set -> exact wire keys present and true.
+    let term = FirewallTermSnapshot {
+        ports_unrepresentable: true,
+        address_unrepresentable: true,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&term).expect("serialize FirewallTermSnapshot");
+    assert_eq!(value["ports_unrepresentable"], true);
+    assert_eq!(value["address_unrepresentable"], true);
+
+    // Go-style payload (only the two marker keys populated) decodes into the
+    // marker fields — mirrors the Go encoder on the tolerant/HA-sync path.
+    let decoded: FirewallTermSnapshot = serde_json::from_value(serde_json::json!({
+        "name": "t",
+        "action": "discard",
+        "ports_unrepresentable": true,
+        "address_unrepresentable": true
+    }))
+    .expect("decode Go-style marker payload");
+    assert!(decoded.ports_unrepresentable);
+    assert!(decoded.address_unrepresentable);
+
+    // Legacy payload (keys absent — an older Go control plane, #1961) decodes
+    // with both markers false, i.e. the pre-fix behavior window is explicit,
+    // not a decode failure.
+    let legacy: FirewallTermSnapshot = serde_json::from_value(serde_json::json!({
+        "name": "t",
+        "action": "discard"
+    }))
+    .expect("legacy payload without the markers decodes");
+    assert!(!legacy.ports_unrepresentable);
+    assert!(!legacy.address_unrepresentable);
+}
+
 // #1642: Rust→Go status-field parity. These serde tests pin the exact wire
 // keys for the four field groups the Go side previously dropped on unmarshal
 // (HAGroupStatus lease telemetry, CoSQueueStatus starvation/ring counters,

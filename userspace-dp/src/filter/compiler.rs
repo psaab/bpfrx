@@ -565,6 +565,48 @@ fn parse_term(
             term: snap.name.clone(),
         });
     }
+    // #6459: the Go control plane sets `ports_unrepresentable` when a
+    // `from {source,destination}-port[-except]` token could not be resolved to
+    // a number (an unknown service name, a malformed range, or a non-canonical
+    // token such as "+80" — recorded on term.UnknownPorts; the strict commit
+    // gate validateFilterMatchValuesStrict rejects it, so a committed config
+    // never sets this). The token is kept VERBATIM in the wire port lists, and
+    // the pre-fix compiler dropped it PER-TOKEN below
+    // (`filter_map(parse_port_spec)`): a PARTIALLY-unresolvable list then built
+    // a matcher over only the surviving subset, so a `then discard`/`reject`
+    // term silently enforced a NARROWER port set than the operator wrote — the
+    // traffic meant for the dropped ports fell through to the implicit accept
+    // (fail-OPEN). (An ALL-unresolvable list already failed closed at
+    // match-time via `constrained && PortMatcher::Any`, #2400/#3205.) Fail the
+    // whole snapshot closed instead, mirroring the #2505/#3367/#3406
+    // backstops. Checked before any mutation so the preflight stays
+    // non-mutating.
+    if snap.ports_unrepresentable {
+        return Err(SnapshotIntegrityError::UnrepresentableFilterPorts {
+            family: filter_family.to_string(),
+            filter: filter_name.to_string(),
+            term: snap.name.clone(),
+        });
+    }
+    // #6463: the Go control plane sets `address_unrepresentable` when a
+    // literal `from source-address` / `destination-address` token is not a
+    // parseable IP/CIDR (classifyFilterAddrFamily rejects it; the strict
+    // commit gate validateFilterAddressLiteralsStrict rejects it, so a
+    // committed config never sets this). The pre-fix `parse_address` dropped
+    // such a token PER-TOKEN (its `Err(_)` arm pushed nothing): a
+    // PARTIALLY-malformed list then matched only the surviving prefixes, so a
+    // `then discard`/`reject` term silently enforced a NARROWER address set
+    // than the operator wrote — a host in the dropped range was accepted by
+    // fall-through (fail-OPEN). (An ALL-malformed direction already failed
+    // closed at match-time via `constrained && empty`, #2400.) Fail the whole
+    // snapshot closed instead, same shape as the port marker above.
+    if snap.address_unrepresentable {
+        return Err(SnapshotIntegrityError::UnrepresentableFilterAddress {
+            family: filter_family.to_string(),
+            filter: filter_name.to_string(),
+            term: snap.name.clone(),
+        });
+    }
     // #3715: DSCP is a 6-bit field (0..=63). A raw wire value >= 64 can only
     // arrive from a corrupt / hand-built / version-drifted snapshot — the Go
     // commit gate (validateFilterDSCPStrict) and the snapshot builder both bound
@@ -1011,14 +1053,22 @@ fn parse_port_spec(spec: &str) -> Option<Vec<PortRange>> {
         other => other,
     };
     if let Some((low, high)) = normalized.split_once('-') {
-        let low = low.parse::<u16>().ok()?;
-        let high = high.parse::<u16>().ok()?;
+        // #6477: route through the SHARED digit-only `parse_port_u16`
+        // (policy.rs, #3606) — Rust's u16 FromStr accepts a leading '+'
+        // ("+80" -> Ok(80)), which the Go commit gate and the policy-side
+        // parser both reject. This parser accepting "+80" while the other
+        // three reject it is the #3606 agreement-invariant residual: a
+        // tolerant-path `from destination-port +80` survived verbatim and was
+        // enforced as port 80 HERE only. One helper keeps all four parsers in
+        // agreement.
+        let low = crate::policy::parse_port_u16(low)?;
+        let high = crate::policy::parse_port_u16(high)?;
         if low == 0 || low > high {
             return None;
         }
         return Some(vec![PortRange { low, high }]);
     }
-    let port = normalized.parse::<u16>().ok()?;
+    let port = crate::policy::parse_port_u16(normalized)?;
     if port == 0 {
         return None;
     }
