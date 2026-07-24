@@ -3610,6 +3610,35 @@ reserved for whole-dataplane selection where a rewrite shim
     plus a port-less whole-address 1:1 rule (the dataplane keys the
     static-NAT tables by `(IP, Option<port>)` and falls back to the
     port-less entry).
+    The #5523/#6479 shape-completeness fold closes the last authoring
+    shapes a mapped-port could take. **NPTv6 + mapped-port is rejected on
+    PRESENCE.** NPTv6 (RFC 6296) translates the IPv6 address prefix and has
+    no transport-port concept, and the host-mask loop
+    (`validateNATHostMaskStrict`) skips nptv6 rules entirely, so a
+    `then static-nat nptv6-prefix <p6> mapped-port <p>` in ANY shape
+    (collapsed keys, hierarchical nptv6-prefix child, or a distinct
+    `mapped-port` sibling) previously reached NO validator — a malformed
+    operand was silently accepted and a well-formed one silently ignored.
+    `recordNPTv6MappedPortPresence` (`compiler_nat_static.go`) now stamps
+    `MappedPortPresent` on the nptv6 branches while keeping `MappedPort==0`
+    (no bogus port on the port-less nptv6 path), and `validateNPTv6Strict`
+    rejects a present mapped-port on an nptv6 rule regardless of value (even
+    a well-formed 1-65535 port is meaningless on nptv6) — strict error,
+    lenient warning, with the nptv6 prefix translation itself still applied.
+    The remaining flagged shapes are fail-safe without new code: the
+    modifier-first ordering `... prefix mapped-port <p>` authored BEFORE the
+    `... prefix <ip>` set line makes the modifier line's `prefix` keyword
+    take the value `mapped-port`, so the target resolves to the literal
+    `"mapped-port"` (not an IP) and the rule fails closed on the target;
+    a `prefix-name` mapped-port must RESTATE the name on the same statement
+    (`prefix-name N mapped-port P`) — the non-restated two-line form
+    `prefix-name N` + `prefix-name mapped-port P` parses `mapped-port` into
+    the name slot (name-valued skip), recovering no port and installing none
+    (a plain prefix-name 1:1, matching origin/master); and a range operand
+    (`mapped-port 8080-8090`) is a single non-numeric token that
+    `combineMappedPortOperands` fails closed on. In every shape a
+    present-but-malformed mapped-port is surfaced (strict reject / lenient
+    warn), never silently accepted, and no bogus non-zero port is installed.
   - `security nat source/destination rule-set rule match
     destination-address-name <book-entry>` (#3229) — the destination twin
     of the `source-address-name` leaf (#2416). It references an

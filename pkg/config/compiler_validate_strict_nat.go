@@ -1592,6 +1592,35 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 				continue
 			}
 
+			// #5523/#6479: NPTv6 (RFC 6296) translates the IPv6 address prefix
+			// and has NO transport-port concept, so a `then static-nat
+			// nptv6-prefix <p6> mapped-port <p>` is invalid in EVERY shape
+			// (collapsed keys, hierarchical nptv6-prefix child, or a distinct
+			// `mapped-port` sibling). The host-mask loop skips nptv6 rules
+			// entirely (`IsNPTv6` continue), so WITHOUT this gate a mapped-port
+			// on an nptv6 rule reached no validator at all: a malformed operand
+			// was silently accepted (the C179-038 class for the nptv6 shape) and
+			// a well-formed one was silently ignored. recordNPTv6MappedPort-
+			// Presence stamps MappedPortPresent whenever the keyword appears, so
+			// reject on PRESENCE alone — the value is irrelevant on nptv6, even a
+			// well-formed 1-65535 port is meaningless. This runs BEFORE the
+			// prefix-parse/length checks so it fires even when the prefixes are
+			// otherwise valid (the pure silent-accept case). No `continue`: on the
+			// lenient no-brick path the prefix diagnostics still accumulate, and
+			// the nptv6 prefix translation itself still applies (MappedPort==0),
+			// so this warning is scoped to the dropped mapped-port, not the rule.
+			if rule.MappedPortPresent {
+				msg := fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat nptv6-prefix does not support mapped-port (NPTv6 translates the address prefix per RFC 6296, not transport ports); remove the mapped-port",
+					rs.Name, rule.Name)
+				if lenient {
+					warnings = append(warnings, msg+
+						" (ignored: mapped-port dropped by dataplane; the nptv6 prefix translation still applies)")
+				} else {
+					return nil, fmt.Errorf("%s", msg)
+				}
+			}
+
 			// External prefix = `match destination-address`. The family is
 			// classified from the original CIDR text (natCIDRIPPart +
 			// natAddrFamily below), not the parsed net.IP, so the parsed IP

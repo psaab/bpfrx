@@ -214,6 +214,27 @@ func staticNATMappedPortForNode(t *Node) (port int, raw string, present bool) {
 	return combineMappedPortOperands(operands)
 }
 
+// recordNPTv6MappedPortPresence stamps a `mapped-port` PRESENCE signal onto an
+// NPTv6 static-nat rule WITHOUT installing a port value (#5523/#6479). NPTv6
+// (RFC 6296) translates the IPv6 address prefix and has no transport-port
+// concept, so a `then static-nat nptv6-prefix <p6> mapped-port <p>` is invalid
+// in EVERY shape (collapsed keys, hierarchical nptv6-prefix child, or a distinct
+// `mapped-port` sibling). The host-mask loop skips nptv6 rules entirely, so
+// without recording presence a mapped-port on an nptv6 rule reached NO
+// validator: a malformed operand was silently accepted (the C179-038 class for
+// the nptv6 shape) and a well-formed one was silently ignored. This records
+// MappedPortPresent (and the raw token for the diagnostic) so the strict nptv6
+// gate (validateNPTv6Strict) rejects it — warns on the lenient no-brick path —
+// while keeping MappedPort==0: a port is meaningless on nptv6 and no bogus port
+// must cross the wire to the port-less nptv6 dataplane path.
+func recordNPTv6MappedPortPresence(rule *StaticNATRule, t *Node) {
+	if _, raw, present := staticNATMappedPortForNode(t); present {
+		rule.MappedPort = 0 // nptv6 has no port; never install one
+		rule.MappedPortRaw = raw
+		rule.MappedPortPresent = true
+	}
+}
+
 // combineMappedPortOperands folds one-or-more `mapped-port` operands (the
 // tokens trailing each `mapped-port` keyword, in AST order) into the
 // (port, raw, present) triple the strict gate (validateNATHostMaskStrict)
@@ -423,10 +444,12 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// set ... then static-nat nptv6-prefix PREFIX
 							rule.Then = t.Keys[2]
 							rule.IsNPTv6 = true
+							recordNPTv6MappedPortPresence(rule, t)
 						} else if np := t.FindChild("nptv6-prefix"); np != nil {
 							// static-nat { nptv6-prefix { PREFIX; } }
 							rule.Then = nodeVal(np)
 							rule.IsNPTv6 = true
+							recordNPTv6MappedPortPresence(rule, t)
 						} else if len(t.Keys) >= 3 && t.Keys[1] == "prefix-name" {
 							// #4290: set ... then static-nat prefix-name NAME.
 							// The named form of `prefix <ip>`: NAME references a
