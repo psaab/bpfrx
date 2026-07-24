@@ -62,6 +62,9 @@ reviewer (joins at /engineer on the code PR).
 | r19 | Codex | codex companion task-mrzbgq1e-cqjb0p (session 019f958a-71f2-7f82-a285-5ebd1580d5f2) | NEEDS-REVISION (3 MAJOR, 6 MINOR); SPLIT-REJECTED (H-without-H2 worsens the narrow class to immediate revert-at-load) |
 | r19 | AGY | agy print-mode direct (agy-plan-r19.md) | PLAN-READY (0 findings); SPLIT-MOOT |
 | r19 | Claude SMR | in-conversation (claude-smr-plan-r19.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — both folded in v20); SPLIT-MOOT if convergence |
+| r20 | Codex | codex companion task-mrzdpr86-uznxse (session 019f95c4-215c-7c73-a576-b8dd8c449882) | NEEDS-REVISION (3 MAJOR — 2 NEW + 1 re-verification gap, 3 MINOR) |
+| r20 | AGY | agy print-mode direct (agy-plan-r20.md) | PLAN-READY (attack-3 covers only the non-binding sub-case — see claude-smr-plan-r20.md) |
+| r20 | Claude SMR | in-conversation (claude-smr-plan-r20.md) | NEEDS-REVISION (1 MAJOR — the marker-loss hole, converging with Codex M2) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
