@@ -15,6 +15,15 @@
 // the architectural verdict that further extraction is blocked by
 // mutable-locals coupling.
 //
+// #6433: the flow-cache SEED (write) path joined the read half —
+// `flow_cache_seed::stage_flow_cache_seed` carries the #1861 §5.4
+// refused-install gate, the #3048/#3918/#5147 pre-resolve shard-epoch
+// stamp, and the #3073/#3322 policy-counter stamps, colocated with
+// `flow_cache_hit` so the cache's eviction invariants review as one
+// contract. Pure code-motion (`#[inline]`, disjoint `&mut
+// binding.flow.flow_cache` field borrow — the #1327 split-borrow
+// discipline); the order-coupled slow-path arms stay inline.
+//
 // #4404 increment 1: the cold-path `debug-log` throttle predicates
 // (`debug_log_throttle::{session_miss,policy_deny}_debug_log_allowed`,
 // their #4120 caps, and the `debug_log_throttle_tests` pinned-contract
@@ -30,6 +39,7 @@ mod debug_log_throttle;
 mod embedded_icmp;
 mod filter;
 mod flow_cache_hit;
+mod flow_cache_seed;
 mod flowless_verdict;
 mod frag_assoc;
 mod host_inbound_policy;
@@ -43,6 +53,7 @@ mod session_admission;
 use debug_log_throttle::{policy_deny_debug_log_allowed, session_miss_debug_log_allowed};
 use embedded_icmp::{EmbeddedIcmpReversal, try_reverse_embedded_icmp_error};
 use flow_cache_hit::{FlowCacheOutcome, stage_flow_cache_hit};
+use flow_cache_seed::stage_flow_cache_seed;
 use frag_assoc::{
     flowless_fragment_requires_nat_translation, nat64_consult_forward_fragment_assoc,
     nat64_install_forward_fragment_assoc, nat_consult_forward_fragment_assoc,
@@ -3854,110 +3865,32 @@ pub(super) fn poll_binding_process_descriptor(
                         binding.scratch.scratch_forwards.push(request);
                         recycle_now = false;
                         // ── Flow cache population ────────────────────
-                        // Cache ForwardCandidate decisions for established
-                        // TCP/UDP flows. Skip NAT64/NPTv6 (non-cacheable).
-                        // #1861 §5.4: never cache a decision whose backing
-                        // session install was attempted and refused
-                        // (flow_cache_install_failed) — a cached
-                        // sessionless decision would suppress the
-                        // per-packet reply repair until cache
-                        // invalidation. "No install required" paths
-                        // (DNS fast-path, fabric-return) keep the flag
-                        // false and cache as before.
-                        //
-                        // #5147: extract the pre-resolve epoch of THIS flow's
-                        // resolved next-hop shard from the whole-vector
-                        // snapshot taken before the resolve. Computed here,
-                        // while `decision` is still owned (it is moved into
-                        // `from_forward_decision` below), from the neighbor's
-                        // ACTUAL key ifindex — the OUTER transport ifindex for a
-                        // tunnel egress, the `egress_ifindex` for a direct
-                        // resolution — via `outer_neighbor_ifindex`, the same
-                        // ifindex `insert_if_changed` bumps on. `from_forward_decision`
-                        // derives `neighbor_shard` with the IDENTICAL
-                        // `outer_neighbor_ifindex(.., None, ..)` call, so the
-                        // stamped epoch and the hit-path re-read agree on the
-                        // shard (both `None` for the neighbor handle: the outer
-                        // ifindex is route-derived, so `None` yields the same
-                        // ifindex as the live resolve and keeps the two sites
-                        // coupled). Keying on the logical `egress_ifindex` for
-                        // tunnels was the review MAJOR — it stamped a different
-                        // shard than the bump, so a tunnel flow never evicted on
-                        // its outer gateway's MAC change (#3048 blackhole). A
-                        // resolution with no next-hop stamps 0 (paired with a
-                        // `NEIGHBOR_SHARD_NONE` shard → never MAC-stale).
-                        let neighbor_mac_epoch_at_resolve = match decision.resolution.next_hop {
-                            Some(nh) => neighbor_epoch_snapshot.epoch_for(&(
-                                outer_neighbor_ifindex(
-                                    worker_ctx.forwarding,
-                                    None,
-                                    &decision.resolution,
-                                ),
-                                nh,
-                            )),
-                            None => 0,
-                        };
-                        if !flow_cache_install_failed
-                            && let Some(flow) = flow.as_ref()
-                            && let Some(mut entry) = FlowCacheEntry::from_forward_decision(
-                                flow,
-                                meta,
-                                validation,
-                                decision,
-                                flow_cache_owner_rg_id,
-                                session_ingress_zone,
-                                request_target_binding_index,
-                                evaluate_non_pbr_input_filter_log_only(
-                                    worker_ctx.forwarding,
-                                    filter_match_extra,
-                                    Some(flow),
-                                    meta,
-                                    ingress_zone_override,
-                                ),
-                                // #3777: capture the input `then count` handles
-                                // so cache hits replay them (mirrors the output
-                                // counter replay). The seed packet was counted on
-                                // the cold path above; this only collects handles.
-                                evaluate_non_pbr_input_filter_counters_cached(
-                                    worker_ctx.forwarding,
-                                    Some(flow),
-                                    meta,
-                                ),
-                                worker_ctx.forwarding,
-                                worker_ctx.ha_state,
-                                apply_nat_on_fabric,
-                                &worker_ctx.rg_epochs,
-                                // #3048/#3918/#5147: stamp the PER-SHARD
-                                // neighbor-MAC-change epoch snapshotted BEFORE
-                                // the resolve above (the resolved shard's slot
-                                // of `neighbor_epoch_snapshot`), not a fresh
-                                // post-resolve read. A later kernel ARP/NDP MAC
-                                // change to THIS descriptor's next-hop neighbor
-                                // advances that shard's live epoch past this
-                                // stamp, evicting the cached stale dst_mac on
-                                // its next fast-path hit
-                                // (`neighbor_mac_epoch_stale`) — while a change
-                                // to an unrelated neighbor (a different shard)
-                                // leaves this flow cached (#5147). A MAC change
-                                // racing the resolve is caught too, because the
-                                // pre-resolve snapshot cannot already reflect it
-                                // (closes the #3918 TOCTOU).
-                                neighbor_mac_epoch_at_resolve,
-                            )
-                        {
-                            // #3073: stamp the admitting rule's hit-counter handle
-                            // onto the cached entry (the seed constructor leaves
-                            // it 0). The flow-cache hit path
-                            // (`stage_flow_cache_hit`) then re-counts every cached
-                            // packet against the same policy, so cacheable flows
-                            // count their full load — not just the first frame.
-                            entry.metadata.policy_counter_idx = flow_cache_policy_counter_idx;
-                            // #3322: stamp the reorder-stable bound handle so the
-                            // flow-cache hit path counts against the admitting
-                            // rule even after a live policy reorder.
-                            entry.metadata.policy_counter = flow_cache_policy_counter.clone();
-                            binding.flow.flow_cache.insert(entry);
-                        }
+                        // #6433: the seed/write half of the flow-cache contract
+                        // (the #1861 §5.4 refused-install gate, the
+                        // #3048/#3918/#5147 pre-resolve shard-epoch stamp, the
+                        // #3073/#3322 policy-counter stamps) is extracted to the
+                        // `flow_cache_seed` sibling — colocated with the read half
+                        // (`flow_cache_hit`) so the eviction invariants review as
+                        // one contract. Pure code-motion; `#[inline]` keeps the
+                        // body in this CGU.
+                        stage_flow_cache_seed(
+                            &mut binding.flow.flow_cache,
+                            &flow,
+                            meta,
+                            validation,
+                            decision,
+                            request_target_binding_index,
+                            flow_cache_owner_rg_id,
+                            session_ingress_zone,
+                            flow_cache_install_failed,
+                            flow_cache_policy_counter_idx,
+                            &flow_cache_policy_counter,
+                            filter_match_extra,
+                            ingress_zone_override,
+                            apply_nat_on_fabric,
+                            &neighbor_epoch_snapshot,
+                            worker_ctx,
+                        );
                         // ── End flow cache population ────────────────
                     } else {
                         telemetry.dbg.build_fail += 1;

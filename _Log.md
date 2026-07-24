@@ -1,3 +1,34 @@
+## 2026-07-24 — #6433: extract the flow-cache seed path to flow_cache_seed.rs
+
+- **Timestamp**: 2026-07-24 (fix/6433-flow-cache-seed, stacked on
+  fix/6432-recycle-stage-outcome)
+- **Action**: Extracted the ~105-LOC flow-cache seed/write block (plus the
+  #5147 pre-resolve shard-epoch TOCTOU stamping) out of
+  `poll_binding_process_descriptor` into the new
+  `poll_descriptor/flow_cache_seed.rs` sibling (`stage_flow_cache_seed`,
+  `#[inline]`), colocating the seed half with the already-extracted read half
+  (`flow_cache_hit.rs`) so the cache's eviction invariants (#1861 §5.4
+  refused-install gate, #3048/#3918/#5147 epoch stamp, #3073/#3322
+  policy-counter stamps) review as one contract. Pure code-motion with the
+  #1327 disjoint-field-borrow discipline (`&mut binding.flow.flow_cache`) —
+  no SlowPathCarry needed: the seed's free variables are all passable
+  scalars/borrows, so the extraction was not blocked by the god fn's hoisted
+  mut-locals. Body verified verbatim against the inline original (the only
+  deltas: receiver rename, a clippy `needless_borrow` auto-ref, one joined
+  call line). Header comments in mod.rs and flow_cache_hit.rs updated to
+  name the new sibling.
+- **Files**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_seed.rs (new),
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (doc cross-ref).
+- **Validation**: cargo test --release --test-threads=1 green (4251 passed,
+  0 failed); clippy warning count identical to base (675); cargo check
+  --features debug-log clean; release disasm of
+  poll_binding_process_descriptor base-vs-branch: 14641 vs 14634
+  instructions, 478 vs 478 calls, 112 vs 112 locked instructions, called-
+  symbol set unchanged (no standalone stage_flow_cache_seed symbol — the
+  #[inline] hint was honored, zero call edge; residual diff is stack-slot
+  recoloring plus one outer_neighbor_ifindex/resolve_tunnel_outer outline
+  split of identical net call count).
 ## 2026-07-24 — #6464 + #6465: scoped-global empty-element fail-open + junos-host fragment-association parity
 
 - **Timestamp**: 2026-07-24 (fix/6464-global-scope-empty-string)
