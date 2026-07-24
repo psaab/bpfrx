@@ -65,6 +65,9 @@ reviewer (joins at /engineer on the code PR).
 | r20 | Codex | codex companion task-mrzdpr86-uznxse (session 019f95c4-215c-7c73-a576-b8dd8c449882) | NEEDS-REVISION (3 MAJOR — 2 NEW + 1 re-verification gap, 3 MINOR) |
 | r20 | AGY | agy print-mode direct (agy-plan-r20.md) | PLAN-READY (attack-3 covers only the non-binding sub-case — see claude-smr-plan-r20.md) |
 | r20 | Claude SMR | in-conversation (claude-smr-plan-r20.md) | NEEDS-REVISION (1 MAJOR — the marker-loss hole, converging with Codex M2) |
+| r21 | Codex | codex companion task-mrzftmkd-ft8x9g (session 019f95fa-2519-7bd1-a93a-e60303a0b74c) | NEEDS-REVISION (3 MAJOR, 2 MINOR) |
+| r21 | AGY | agy print-mode direct (agy-plan-r21.md) | PLAN-READY (0 findings) |
+| r21 | Claude SMR | in-conversation (claude-smr-plan-r21.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — handoff-window pin, subsumed by Codex M1's restore-priority redesign) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
