@@ -467,6 +467,60 @@ peer-view wiring (node0 accepts the peer-only overlap). The shipped `test/incus/
 pool drawn by both NAT64 and a source-NAT rule) and were separated into distinct
 pools + proxy-ARP as part of this change.
 
+### Duplicate NAT rule name (#5649, C181-M18)
+
+NAT rule-sets are ordered, first-match tables keyed by rule name, so a rule's
+CONFIG identity is `natType/ruleset/rule`. Two rules authored with the SAME
+name in one rule-set are NOT reduced to last-writer-wins like a #5180
+hierarchical block — they BOTH survive: `namedInstances` (the rule loop in
+`compiler_nat_source.go` / `compiler_nat_destination.go` /
+`compiler_nat_static.go`) appends each as a separate first-match entry sharing
+that one config identity. For source / destination / ordinary static NAT that
+identity is also the shared `natType/ruleset/rule` hit counter (so `show` /
+counter surfaces cannot tell the rows apart); for a counter-less NPTv6 (RFC
+6296) static rule they are two snapshots (`buildNptv6Snapshots`). Either way the
+duplicate name is a config error — the harm is type-independent (the shared
+config identity), which is why the gate's diagnostic is type-agnostic (below).
+
+`validateDuplicateNATRuleNamesAST(tree, lenient)`
+(`pkg/config/dup_nat_rule_names.go`, wired beside the #5180 duplicate-named-block
+gate in both `compileConfigWithOpts` and `compileConfigForNodeWithOpts`) rejects
+this at commit. It runs **pre-expansion** on top-level `security` stanzas only —
+apply-groups DEEP-MERGES a same-named rule rather than duplicating it, and the
+flat `set` form reuses the rule node, so only a directly-authored hierarchical
+duplicate reaches the gate. The seen-set is keyed by `(natType, rule-set, rule)`
+and unioned across repeated `security` / `nat` / `source|destination|static`
+blocks (compileNAT merges those, #3915), so a rule name split across two
+`source {}` blocks is caught too. The same rule name in two DIFFERENT rule-sets
+(a distinct identity) is accepted. Strict (commit / commit-check) hard-rejects;
+lenient (load / peer-sync) warns via `opts.lenientDuplicateNATRuleName` (#1960
+no-brick) and keeps the historical two-row behavior.
+
+The reason line is deliberately **type-agnostic** — it states the genuine,
+type-independent defect (a rule-set is keyed by rule name, so the same name
+authored twice is a config error) and never claims a per-rule hit counter.
+NPTv6 (RFC 6296) static rules are COUNTER-LESS — `compileStaticNAT` skips
+`rule.IsNPTv6` before `assignNATCounterID`, and `buildNptv6Snapshots`
+(`pkg/dataplane/userspace/nat_nptv6.go`) appends each rule as its own snapshot —
+so a counter-specific diagnostic would be false for them. The #2241 NPTv6
+overlap gate (`compiler_validate_strict_nat.go`) also deliberately SKIPS
+same-`(rule-set, rule)` pairs (#4339, so a single multi-`from`-scope rule is not
+flagged against itself), so it never compares two same-named NPTv6 rules — this
+duplicate-name gate is the ONLY one that catches them, and it does so with the
+same name-identity reason it uses for every other NAT type.
+
+Covered by `pkg/config/dup_nat_rule_names_5649_test.go` (source / destination /
+static reject, NPTv6 counter-less reject, lenient warn, and distinct-name /
+different-rule-set / flat-set-merge accept guards), RED on revert of the gate
+(the duplicate is accepted) and, separately, RED if the diagnostic reintroduces
+a per-rule counter claim (false for a counter-less NPTv6 rule).
+
+The two limitations this gate shares with its #5180 sibling — a duplicate
+authored entirely inside an applied group bypasses the top-level-only
+pre-expansion scan, and a quoted-empty rule name is skipped — are tracked
+family-wide in #6455 rather than diverging this gate's scope from the
+named-block gate.
+
 **Phase 2 (#5878) — reference-binder canonicalization.** Phase 1 (above) closes
 the divergent-commit fail-open by rejecting a duplicate-spelling collision at
 commit. The second, subtler half of #5878 is that a cross-subsystem reference

@@ -60205,6 +60205,92 @@ top.
 - **File(s)**: pkg/routing/bond.go, pkg/routing/adopt_guard_6402_test.go,
     pkg/routing/README.md, _Log.md
 
+- **Timestamp**: 2026-07-23 20:30
+- **Action**: #5649 (C181-M18) — reject duplicate NAT rule names at commit. A
+    NAT rule-set is an ordered first-match table and each rule's counter
+    identity is natType/ruleset/rule; two same-named rules in one rule-set BOTH
+    survive (namedInstances appends each row), so the first shadows the second,
+    the second is unreachable, and both share one counter identity — silently
+    order-dependent translation + merged telemetry. Added
+    validateDuplicateNATRuleNamesAST (pre-expansion, top-level `security` only,
+    keyed by (natType,rule-set,rule), unioned across repeated
+    security/nat/source|destination|static blocks) wired beside the #5180
+    dup-named-block gate in both compileConfigWithOpts and
+    compileConfigForNodeWithOpts; strict rejects, lenient
+    (opts.lenientDuplicateNATRuleName) warns (#1960 no-brick). Fail-on-revert:
+    TestDuplicateNATRuleNameRejected (source/destination/static via CompileConfig)
+    — neutralize by `return nil, nil` at the top of the validator → clean
+    assertion RED (no build break). go build ./pkg/config, go vet ./pkg/config,
+    go test ./pkg/config GREEN; FULL go test ./... GREEN.
+- **File(s)**: pkg/config/dup_nat_rule_names.go,
+    pkg/config/dup_nat_rule_names_5649_test.go, pkg/config/compiler.go,
+    pkg/config/compiler_opts.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23 21:15
+- **Action**: #6452 review fold (Codex finding #3, NPTv6). NPTv6 (RFC 6296)
+    static rules are counter-less (compileStaticNAT skips rule.IsNPTv6 before
+    assignNATCounterID; buildNptv6Snapshots appends each as its own snapshot)
+    AND the #2241 NPTv6 overlap gate SKIPS same-(rule-set,rule) pairs (#4339),
+    so validateDuplicateNATRuleNamesAST is the ONLY gate that catches a
+    duplicate NPTv6 rule name. Chose Option B (verified firsthand): KEEP the
+    rejection (a duplicate rule name is always invalid) but make the diagnostic
+    NPTv6-aware — added staticRuleIsNPTv6 (mirrors compiler_nat_static.go
+    then-static-nat-nptv6-prefix detection, flat + hierarchical) and
+    dupNATRule.reason() which drops the false shared-counter-identity claim for
+    NPTv6 and reports order-dependent first-match snapshot ambiguity instead.
+    Findings #1 (group-authored dup bypasses top-level-only pre-expansion scan)
+    and #2 (empty rule "" name skipped) verified firsthand as INHERITED
+    #5180-family limitations (dup_named_blocks.go has identical scope), NOT
+    #6452 regressions — filed follow-up issue #6455 covering BOTH gates with a
+    verified repro; did NOT expand #6452 past its sibling's scope. New test
+    TestDuplicateNATRuleNameNPTv6AwareDiagnostic. Parent-RED (two recipes): (A)
+    `return nil,nil` at top of validateDuplicateNATRuleNamesAST → all reject
+    tests RED; (B) `return false` at top of staticRuleIsNPTv6 → ONLY the NPTv6
+    test RED (message reverts to counter-identity). go vet ./pkg/config clean,
+    heatmap unchanged, FULL go test ./... GREEN.
+- **File(s)**: pkg/config/dup_nat_rule_names.go,
+    pkg/config/dup_nat_rule_names_5649_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-23 22:10
+- **Action**: #6452 review fold round 2 (Codex 3 precision findings on the
+    NPTv6-diagnostic code). Took the SIMPLIFY path: dropped the NPTv6 vs
+    counter classification entirely (removed staticRuleIsNPTv6, the nptv6
+    field, the reason() method, and the seenNPTv6 tracking) and use ONE
+    type-agnostic reason for all duplicate NAT rule names — "a NAT rule-set is
+    keyed by rule name, so the same name authored twice compiles both instances
+    as separate first-match entries sharing one operational identity". This is
+    TRUE regardless of type (counted rows for source/destination/ordinary-static,
+    snapshots for counter-less NPTv6) and never claims a per-rule counter,
+    eliminating all three findings (last-then faithfulness, disjoint/mixed-pair
+    accuracy, vacuous flat test) in one stroke. Rejection + core dup-detection
+    untouched. Findings #1/#2 remain deferred to #6455. Tests: tightened the
+    natType assertion to "NAT <type> rule"; replaced the NPTv6-aware test with
+    TestDuplicateNATRuleNameNPTv6Counterless (two same-named NPTv6 static rules
+    → rejected, message must NOT contain "counter"); dropped the vacuous
+    single-rule flat assertion (no detector to bind — a flat-set duplicate can't
+    exist, SetPath merges same-named rules). Parent-RED verified firsthand:
+    (A) `return nil,nil` at gate top → all reject tests RED; (B) flip the strict
+    message "operational identity"→"counter identity" → the NPTv6 no-counter
+    test RED. go vet ./pkg/config clean, heatmap UNCHANGED, FULL go test ./...
+    GREEN.
+- **File(s)**: pkg/config/dup_nat_rule_names.go,
+    pkg/config/dup_nat_rule_names_5649_test.go, docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-07-24 04:40 UTC
+- **Action**: Fold Codex6452c round-3 MINOR — purge the stale "counter
+    identity" / shadowing framing from the three surviving comment/doc sites
+    that the SIMPLIFY commit's emitted message already dropped: the
+    compiler.go call-site comment and the compiler_opts.go
+    lenientDuplicateNATRuleName comment (both retargeted to the type-agnostic
+    config-identity framing, counter-less for NPTv6), and the config-schema.md
+    #5649 section top (which self-contradicted its own type-agnostic bottom
+    paragraph — rewritten so the whole section states the shared-config-identity
+    defect: the shared counter for source/dest/ordinary-static, two snapshots
+    for counter-less NPTv6). Doc/comment-only — no code change (the gate + its
+    emitted diagnostic were confirmed correct by Codex6452c). compiler_opts.go
+    stayed line-count-neutral (2095) so the heatmap is unchanged; build/vet
+    clean, heatmap canary + pkg/config GREEN.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_opts.go,
+    docs/config-schema.md, _Log.md
 - **Timestamp**: 2026-07-23
 - **Action**: #6421 — port the #5649 page-token cursor-hardening from the gRPC
     surface to the REST session-listing codec (pkg/api/sessions.go), which had
