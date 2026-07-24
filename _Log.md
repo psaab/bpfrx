@@ -59917,3 +59917,29 @@ top.
     now lives). Doc/comment-only — go build/vet clean, heatmap canary +
     pkg/frr tests GREEN, zero code delta.
   - **File(s)**: pkg/frr/manager.go, pkg/frr/README.md, _Log.md
+  - **Timestamp**: 2026-07-24 02:30 UTC
+  - **Action**: #6430 pure code-motion split of pkg/dhcp/dhcp.go (2,148
+    LOC), which fused the DHCPv4 client, the DHCPv6 client/PD, DUID
+    identity management, and the Lease value type. Extracted four cohesive
+    per-aspect siblings by verbatim whole-decl motion (unchanged signatures
+    and bodies; only per-file package/import lines differ): lease.go (Lease
+    / LeaseRoute types + Leases/LeaseFor accessors + #1715 DNS note),
+    duid.go (DUID generation/persistence/rotation + clear/enumerate +
+    #4857 path guards), dhcpv4.go (runDHCPv4 DORA/renew/rebind loop,
+    doDHCPv4, leaseFromACKv4, classlessStaticRoutes, errDHCPNAK/
+    abandonLeaseAfterNAK), dhcpv6.go (runDHCPv6 loop, doDHCPv6,
+    selectIANAAddress, parseV6Reply, buildDHCPv6*Modifiers,
+    extractDelegatedPrefixes, discoverIPv6Router, waitForLinkLocal,
+    DeriveSubPrefix, errV6AddrInvalidated). dhcp.go is now the manager core
+    alone (types, New, lifecycle registry, shared netlink address
+    plumbing) at 529 LOC. Committed one balanced move per aspect (delete
+    from dhcp.go + create sibling in the same commit — each builds), plus a
+    separate heatmap-regen docs commit. Behavior-preservation proof:
+    normalized multiset diff old-single vs new-5-files IDENTICAL,
+    1373 == 1373 logic lines, zero delta. go build ./... , go vet
+    ./pkg/dhcp/ , FULL go test ./... GREEN (incl. #1373 pkg/dataplane
+    retirement canary + TestHeatmapNotStale). Heatmap regen removes only
+    the single dhcp.go REFACTOR line; no untouched-file drift absorbed.
+  - **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/lease.go, pkg/dhcp/duid.go,
+    pkg/dhcp/dhcpv4.go, pkg/dhcp/dhcpv6.go,
+    docs/refactoring-audit-current.txt, _Log.md
