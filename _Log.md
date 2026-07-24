@@ -1,3 +1,47 @@
+## 2026-07-23 — #6403: seed the synchronous ArchiveConfig mirror from its target dir under the write lock
+
+- **Timestamp**: 2026-07-23 (fix/6403-archive-offlock)
+- **Action**: Closed the #6403 latent off-lock seq race in the synchronous
+  archive mirror (`Store.ArchiveConfig`). The old code captured the archive seq
+  off the process-global `archiveSeq` under `RLock`, released the lock, then
+  wrote off-lock. `archiveSeq` is seeded by `SetArchiveConfig` from whatever dir
+  it last activated, but `ArchiveConfig` writes to a dir passed as a PARAMETER
+  (decoupled from the active `archiveDir`), so the shared counter could sit
+  BELOW that dir's on-disk max — the archive then landed with a below-max seq
+  that `rotateArchives` (#5523 seq-ordered retention) immediately pruned as
+  stale. A concurrent `SetArchiveConfig` reseed in the off-lock window is one
+  way the counter/target-dir relationship became undefined. Fix: `ArchiveConfig`
+  now holds the WRITE lock (not `RLock`) across the seed scan + seq claim and
+  seeds the counter from ITS target dir's on-disk max (monotonic-up, mirroring
+  the commit path's `ensureArchiveSeededLocked`, #6404) BEFORE claiming, so the
+  seq always outranks the dir's contents AND the claim is mutually exclusive
+  with a concurrent `SetArchiveConfig` reseed. Only the WRITE stays off-lock
+  (the #6185 `QuiesceArchival` deadlock is holding s.mu across the WRITE, not
+  the bounded seed `ReadDir` the commit path already does under lock). A genuine
+  seed scan error fails the synchronous call rather than write a below-max
+  archive; a nonexistent dir is confirmed-empty (seq 0, `MkdirAll` creates it).
+- **File(s)**: pkg/configstore/store_persist.go,
+  pkg/configstore/archive_offlock_6403_test.go, pkg/configstore/README.md
+- **Validation**: `go build ./...`, `go vet ./pkg/configstore/`, gofmt clean;
+  `go test ./pkg/configstore/ -race` GREEN; full `go test ./...` GREEN. Two
+  fail-on-revert tests
+  (`TestArchiveConfigSeedsFromDirBeforeClaimingSeq`,
+  `TestArchiveConfigClaimSeqAtomicVsConcurrentReseed`) assert the REAL rotation
+  outcome (fresh archive survives, oldest pre-existing pruned); both go clean-
+  assertion RED when the `s.archiveSeq.Store(seed)` seed is neutralized.
+- **Fold (Codex MINOR, review round)**: added a third deterministic test
+  `TestArchiveConfigLockIsExclusiveAcrossSeedClaim` that PINS the exclusive
+  `s.mu.Lock` (vs `RLock`) — the two seed tests above still pass under an
+  RLock+seed regression because they exercise a single call. It blocks the first
+  `ArchiveConfig` inside its seed scan via the `archiveDirReader` seam (holding
+  the lock) and asserts a second concurrent call cannot reach its own scan
+  within a bounded 500ms window (blocked on `s.mu.Lock()`); under `RLock` the
+  second acquires the shared lock and proceeds, so `secondScanEntered` fires and
+  the assertion goes clean RED. Parent-RED for it: revert
+  `s.mu.Lock`→`s.mu.RLock` (+ paired `Unlock`→`RUnlock`) keeping the seed store —
+  the new test RED, the two seed tests stay GREEN. Verified firsthand; new test
+  stable over 20 `-race` runs (no flakiness).
+
 ## 2026-07-23 — #6165: gate the ~1s desired-state forwarding reconcile with the required-protocol check
 
 - **Timestamp**: 2026-07-23 (fix/6165-forwarding-reconcile-audit)
@@ -59965,3 +60009,29 @@ top.
   - **File(s)**: pkg/upgrade/runner.go,
     pkg/upgrade/restorable_content_6409_test.go,
     pkg/upgrade/runner_test.go, _Log.md
+  - **Timestamp**: 2026-07-24 02:30 UTC
+  - **Action**: #6430 pure code-motion split of pkg/dhcp/dhcp.go (2,148
+    LOC), which fused the DHCPv4 client, the DHCPv6 client/PD, DUID
+    identity management, and the Lease value type. Extracted four cohesive
+    per-aspect siblings by verbatim whole-decl motion (unchanged signatures
+    and bodies; only per-file package/import lines differ): lease.go (Lease
+    / LeaseRoute types + Leases/LeaseFor accessors + #1715 DNS note),
+    duid.go (DUID generation/persistence/rotation + clear/enumerate +
+    #4857 path guards), dhcpv4.go (runDHCPv4 DORA/renew/rebind loop,
+    doDHCPv4, leaseFromACKv4, classlessStaticRoutes, errDHCPNAK/
+    abandonLeaseAfterNAK), dhcpv6.go (runDHCPv6 loop, doDHCPv6,
+    selectIANAAddress, parseV6Reply, buildDHCPv6*Modifiers,
+    extractDelegatedPrefixes, discoverIPv6Router, waitForLinkLocal,
+    DeriveSubPrefix, errV6AddrInvalidated). dhcp.go is now the manager core
+    alone (types, New, lifecycle registry, shared netlink address
+    plumbing) at 529 LOC. Committed one balanced move per aspect (delete
+    from dhcp.go + create sibling in the same commit — each builds), plus a
+    separate heatmap-regen docs commit. Behavior-preservation proof:
+    normalized multiset diff old-single vs new-5-files IDENTICAL,
+    1373 == 1373 logic lines, zero delta. go build ./... , go vet
+    ./pkg/dhcp/ , FULL go test ./... GREEN (incl. #1373 pkg/dataplane
+    retirement canary + TestHeatmapNotStale). Heatmap regen removes only
+    the single dhcp.go REFACTOR line; no untouched-file drift absorbed.
+  - **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/lease.go, pkg/dhcp/duid.go,
+    pkg/dhcp/dhcpv4.go, pkg/dhcp/dhcpv6.go,
+    docs/refactoring-audit-current.txt, _Log.md

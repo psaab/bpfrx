@@ -1084,6 +1084,23 @@ owned by the `journal/` subpackage.
   `time.Now()` race). Rotation prunes by the parsed seq, and
   `SetArchiveConfig` seeds the per-process counter from the highest seq on
   disk so it stays globally monotonic across restarts (#5523 C179-060).
+  The SYNCHRONOUS mirror `ArchiveConfig` writes to a dir passed as a
+  PARAMETER (decoupled from the active `archiveDir`), so the shared counter —
+  seeded from whatever dir `SetArchiveConfig` last activated — can sit BELOW
+  that dir's on-disk max. #6403: it now holds the WRITE lock (not `RLock`)
+  across the seed scan + seq claim and seeds the counter from ITS target dir's
+  on-disk max (monotonic-up, mirroring the commit path's
+  `ensureArchiveSeededLocked`) BEFORE claiming, so its archive always outranks
+  the dir's existing contents. Claiming under the write lock also makes the
+  seed+claim mutually exclusive with a concurrent `SetArchiveConfig` reseed, so
+  the process-global counter cannot be bumped between its seed and its claim in
+  the off-lock write window. Only the WRITE itself stays off-lock (a long
+  archival I/O must not block reconcile/`QuiesceArchival`, #6185); the seed scan
+  is a bounded `ReadDir` under the lock, exactly what the commit path already
+  does. A genuine seed scan error (mount/permission — the on-disk max unknown)
+  fails the synchronous call rather than write a below-max archive; a
+  nonexistent dir is confirmed-empty, seq 0, and the write path's `MkdirAll`
+  creates it.
   These monotonicity / no-overwrite guarantees hold **once the target
   archive dir has been successfully scanned** — the reseed is retried on
   every archiving commit until that scan succeeds (#6404), and while the
