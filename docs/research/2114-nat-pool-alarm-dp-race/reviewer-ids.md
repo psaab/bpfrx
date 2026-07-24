@@ -68,6 +68,9 @@ reviewer (joins at /engineer on the code PR).
 | r21 | Codex | codex companion task-mrzftmkd-ft8x9g (session 019f95fa-2519-7bd1-a93a-e60303a0b74c) | NEEDS-REVISION (3 MAJOR, 2 MINOR) |
 | r21 | AGY | agy print-mode direct (agy-plan-r21.md) | PLAN-READY (0 findings) |
 | r21 | Claude SMR | in-conversation (claude-smr-plan-r21.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — handoff-window pin, subsumed by Codex M1's restore-priority redesign) |
+| r22 | Codex | codex companion task-mrzhcqms-c4sh29 (session 019f9621-6127-7b13-b891-4dc25b622385) | NEEDS-REVISION (4 MAJOR, 3 MINOR) |
+| r22 | AGY | agy print-mode direct (agy-plan-r22.md) | PLAN-READY (attack-1 assumes the unspecified clear transition — see claude-smr-plan-r22.md) |
+| r22 | Claude SMR | in-conversation (claude-smr-plan-r22.md) | NEEDS-REVISION (1 MAJOR, 1 MINOR — the D-kind retry hazard, converging with Codex M2) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 

@@ -1,9 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v22 — r21 findings folded (Codex NEEDS-REVISION
-  3M/2m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m — its
-  handoff-window nit is subsumed by the Codex M1 restore-priority
-  redesign); pending convergence review r22
+- **Status**: DRAFT v23 — r22 findings folded (Codex NEEDS-REVISION
+  4M/3m; AGY PLAN-READY; Claude SMR NEEDS-REVISION 1M/1m — its M1
+  converged with Codex M2 on the D-kind retry hazard); pending
+  convergence review r23
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -630,6 +630,44 @@
   (TerminalUnreadable > RestartRecoveryOwed > ConfirmDebt >
   ActivePersist) with the enum + mask, and §6 says THREE new
   degraded messages.
+  v23: r22 convergence — the D-kind machinery and the acceptance text
+  are completed (Codex 4M/3m; SMR's r22 M1 CONVERGED with Codex M2 on
+  the D-kind retry hazard; AGY PLAN-READY with its attack-1 rationale
+  again assuming the unspecified clear transition): (a) the remaining
+  R-first table copy is rewritten to D2 (Codex M1). (b) The D-kind
+  retry RE-READS and RE-CLASSIFIES (Codex M2 = SMR M1, independently
+  walked: an arm landing between the debt's raise and its retry
+  installs a LIVE window's record on the slot, and an unconditional
+  re-run would synthesized-tombstone and delete it): still-unreadable
+  → proceed; absent → `DeleteConfirm` re-drive → clear; READABLE →
+  clear as moot (the superseded unreadable record was already
+  replaced) and the readable record follows its normal path; a
+  successful arm on the slot clears the debt as moot. (c) The D-kind
+  debt is PROCESS-LOCAL with operator-mediated crash remediation
+  (Codex M3 — the retry is abandoned on exit, BOOT-origin is "no
+  timer, no debt", and auto-recreating D at boot would delete
+  genuinely-pending records the boot cannot distinguish): a
+  pre-tombstone crash reconstructs the LATCH and the runbook governs;
+  the residual is the admitted tombstone-write-failure ∧
+  crash-before-heal class with an operator-paced heal for this one
+  case. (d) The acceptance text is swept (Codex M4): all three
+  x12/x19 bare-delete copies now state the two-step synthesized
+  tombstone + D-kind debt, and all four "ONLY tombstone producer"
+  copies are scoped (the read-mutate-write helper is the only
+  READ-BACK producer; the synthesized producer writes only the
+  superseded-UNREADABLE slot — full fields, not the rejected minimal
+  form). (e) The recordless guarantee is SCOPED (Codex m1):
+  restore-first ORDERING never creates the gap; a restore FAILURE
+  returns K to D1, and a subsequent R_K delete + crash before the
+  next W pass is the admitted best-effort arm-persistence residual.
+  (f) The synthetic record's pins land (Codex m2 = SMR m1):
+  `FirstCommit=false` (LOAD-BEARING — true would trip work item H's
+  guard on any reader), `Deadline` = now + 60 s exactly, and the
+  downgrade behavior is documented (config-state neutral,
+  runtime-churning, self-limiting) with a downgrade-shape regression.
+  (g) The health schema carries D (Codex m3): the mask gains
+  `SLOT_DELETE` and the aggregate is defined as the OR of
+  `persistDegraded`, every confirm-side debt kind, and the latch.
 
 ---
 
@@ -1540,10 +1578,12 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   debt-kind-split block: (w-a) current record's ArmID == the debt key
   (the live window's record IS on disk) → `WriteConfirm` it durable →
   clear; (w-b) current record DIFFERS (a dead window's record) → the
-  restore's `WriteConfirm(s.armedRecord)` overwrites it — UNLESS an
-  R-kind debt keys that record, in which case same-record dominance
-  holds W back (R's tombstone barrier lands first; W then faces
-  absence and restores); (w-c) record ABSENT → restore
+  restore's `WriteConfirm(s.armedRecord)` overwrites it — the
+  restore IS the supersession (dominance D2: the ArmID-mismatch
+  overwrite is the POINT, never a write OF the dead record) — and it
+  SUBSUMES any R-kind debt keyed to that record (the dead record is
+  removed BY REPLACEMENT; the R debt clears once the restore's
+  dir-fsync lands); (w-c) record ABSENT → restore
   `s.armedRecord` VERBATIM (the immutable attempted record —
   `Deadline`, `GuardedHash`, `HashBasis`, `FirstCommit`, `PrevTree`,
   `ArmID` — never a recomputation) via a durable `WriteConfirm`;
@@ -1623,9 +1663,15 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   The crash cases collapse to the admitted residual class: crash
   after the restore → C durable, R_K cleared-by-barrier; crash before
   the restore → K intact, BOTH debts owed (R_K retries the
-  tombstone→delete, W retries the restore) — the tombstone-write
-  failure ∧ crash-before-heal residual already admitted, never a
-  recordless live window. The retry
+  tombstone→delete, W retries the restore). The guarantee is SCOPED
+  precisely (r22 Codex m1): restore-first ORDERING never creates a
+  recordless live window by itself — but a restore FAILURE returns K
+  to D1, and if R_K's tombstone→delete then SUCCEEDS and a crash
+  lands before the next W pass, K is absent with C's window live and
+  recordless: that is the admitted best-effort arm-persistence
+  residual (`store_commit.go:548-553` — a live window with no
+  recovery record, warned, seconds-wide since the W retry restores
+  on the next pass), not a new class. The retry
   evaluates the live-window restore FIRST, then the current-record
   removal; the guard is a membership check at each debt's turn (no
   sort required). The x16
@@ -1763,28 +1809,65 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   (1) `WriteConfirm` a SYNTHESIZED full-field tombstone over the
   unreadable record — `Resolved: true` plus NON-DEGENERATE synthetic
   fields so the #5637 gate passes unmodified (`PrevTree` = a clone of
-  the CURRENT active tree — semantically harmless: a revert to the
-  current config would be a no-op if the Resolved flag were ever
-  ignored; `Deadline` = now+window — non-zero; `GuardedHash` = the
-  canonical hash of the current active tree; `HashBasis` current;
-  `ArmID` = fresh crypto/rand). The write is the full fsatomic cycle,
+  the CURRENT active tree; `Deadline` = now + 60 s — pinned, non-zero;
+  `GuardedHash` = the canonical hash of the current active tree;
+  `HashBasis` current; `ArmID` = fresh crypto/rand; `FirstCommit` =
+  FALSE — LOAD-BEARING (r22 Codex m2): `FirstCommit=true` would trip
+  work item H's FirstCommit+cluster revert-at-Load guard on ANY
+  reader, reverting the current config). The write is the full fsatomic cycle,
   so its dir-fsync doubles as the replacement's durability barrier
   on POST-rename converge paths (same-directory, as r16-r17). A
   replay of this record drops at the Resolved-first recovery check —
-  no binding is possible from it.
+  no binding is possible from it. The DOWNGRADE behavior is pinned
+  (r22 Codex m2 = SMR m1): an old reader's `json.Unmarshal` IGNORES
+  the additive `Resolved` field — it sees a PENDING record with
+  `PrevTree` == the then-current tree and a ≤60 s deadline → it
+  re-arms and reverts to that tree: CONFIG-STATE NEUTRAL (a revert
+  to the running config) but RUNTIME-CHURNING per the corrected
+  idempotence premise (AF_XDP re-attach, generation bump, FRR
+  reload, possible heartbeat restart — the churn the uniform rule
+  exists to prevent, accepted once on a downgrade path),
+  self-limiting (the timer fires once; the record is consumed), and
+  covered by a downgrade-shape regression (old-shape reader re-arms
+  the synthetic record, reverts to the identical tree, deletes it).
   (2) `DeleteConfirm` (unlink + dir-fsync barrier).
   Any failure raises the D-kind slot debt, retried by the same
-  singleton loop: re-run (1)→(2) (the read of the record is EXPECTED
-  to fail permanent — that read does NOT re-terminalize; the
-  tombstone write's success is the signal). Crash cases: after (1)
-  before (2) → recovery drops the Resolved record (and the
-  Resolved-first drop finishes the deletion); before (1) → the
-  unreadable record stands, the latch reconstructs at boot, and the
-  D-kind debt re-runs — the only residual is the already-admitted
-  tombstone-write-failure ∧ crash-before-heal class (seconds-wide;
-  an operator repair inside it restores the pre-tombstone state,
-  which the GuardedHash gate plus the documented operator-error
-  boundary governs).
+  singleton loop — but the retry NEVER re-runs the tombstone blindly
+  (r22 Codex M2 = SMR M1, both walked the same hazard independently:
+  an arm landing between the debt's raise and its retry installs a
+  LIVE window's record on the slot, and an unconditional re-run
+  would synthesized-tombstone and delete it — a system-induced
+  durable loss of a live unconfirmed window's rollback intent): the
+  retry RE-READS the slot and RE-CLASSIFIES: (d-i) record STILL
+  unreadable (permanent) → proceed with the synthesized tombstone →
+  delete (that read does NOT re-terminalize; the tombstone write's
+  success is the signal); (d-ii) record ABSENT → `DeleteConfirm`
+  re-drive (finish the dir-fsync) → clear; (d-iii) record READABLE →
+  the superseded unreadable record is already GONE (replaced — by an
+  arm's overwrite per the confirmed-commit rule, or by operator
+  action): the D-kind debt CLEARS as moot, and the readable record
+  follows its normal path (live-window ArmID match → untouched;
+  `Resolved` → finish the delete; otherwise → the R-kind /
+  seeded-orphan machinery). A successful arm on the slot at ANY
+  point likewise clears the D-kind debt as moot (the overwrite IS
+  the supersession it existed to perform).
+  The D-kind debt is PROCESS-LOCAL (r22 Codex M3, verified: the retry
+  is an unjoined plain goroutine abandoned on exit, BOOT-origin is
+  "no timer, no debt", and a pre-tombstone crash persists no D
+  provenance — and auto-recreating D at boot would be WRONG, since
+  the boot cannot distinguish a superseded unreadable record from a
+  genuinely-pending one). Crash cases: after (1) before (2) →
+  recovery drops the Resolved record (and the Resolved-first drop
+  finishes the deletion); before (1) → the unreadable record stands,
+  the latch reconstructs at boot, and remediation is
+  OPERATOR-MEDIATED (the BOOT-latch substate path: the operator
+  repairs or removes the record per the runbook; the next boot's
+  total order classifies the result) — the residual is the
+  already-admitted tombstone-write-failure ∧ crash-before-heal
+  class, with the heal operator-paced rather than loop-paced for
+  this one crash case (an operator repair inside it restores the
+  pre-tombstone state, which the GuardedHash gate plus the
+  documented operator-error boundary governs).
   The rule applies where supersession is CERTAIN: a PLAIN COMMIT or
   SYNCAPPLY that lands durably while
   the BOOT latch stands has armed NO new window, and the replacement
@@ -1904,11 +1987,16 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   snapshot accessor `ConfigPersistDegradedState()` returning THREE
   fields (r19 Codex m2, verified three booleans cannot carry the
   promised subtypes): `{ActivePersistDegraded bool,
-  ConfirmDebtKindMask (bitmask: REMOVAL | REWRITE),
+  ConfirmDebtKindMask (bitmask: REMOVAL | REWRITE | SLOT_DELETE),
   ConfirmRecordState enum (OK | TerminalUnreadable |
   RestartRecoveryOwed)}` — the mask covers the
   removal + rewrite debts (the H2-expanded confirmRemoveDegraded
-  category) and the enum distinguishes terminal-unreadable from
+  category) AND the D-kind slot debt (r22 Codex m3: SLOT_DELETE —
+  a synthesized-tombstone record with its delete debt outstanding can
+  never read falsely healthy, and the detail field names the live
+  kinds; the aggregate `ConfigPersistDegraded()` is the OR of
+  `persistDegraded`, every confirm-side debt kind, and the latch),
+  and the enum distinguishes terminal-unreadable from
   readable-but-restart-required — with PRECEDENCE TerminalUnreadable
   > RestartRecoveryOwed > ConfirmDebt > ActivePersist:
   `api/health.go` renders the terminal confirm-record
@@ -1952,7 +2040,16 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   `HashBasis` to a legacy record (a downgrade reader then stays
   faithful to its own basis). A minimal `{"resolved":true}` tombstone
   is explicitly REJECTED: it trips #5637 and wedges recovery at the
-  early error return (`store_persist.go:141`).
+  early error return (`store_persist.go:141`). The ONE additional
+  producer (r22): the SYNTHESIZED tombstone of the (ii-b) eager rule
+  — full non-degenerate fields by construction (`PrevTree` = a clone
+  of the current active tree, non-zero `Deadline`, canonical
+  `GuardedHash`, fresh `ArmID`, `FirstCommit=false` — the last is
+  LOAD-BEARING: `FirstCommit=true` would trip work item H's
+  FirstCommit+cluster guard on any reader) — used ONLY when the
+  on-disk record is UNREADABLE (a read-back is impossible); it is
+  not the rejected minimal form, and any replay drops at the
+  Resolved-first check before its synthetic fields matter.
 - **Additive schema fields — DECIDED, not deferred (r12 Codex M3 =
   Claude SMR m1 = AGY Attack 1).** `Resolved bool`, `HashBasis string`,
   and `ArmID string` are ADDITIVE JSON fields on `confirmRecord`, per
@@ -2018,7 +2115,8 @@ the restore's barrier lands; an IDENTITY-PRESERVING rewrite of a
 record an R-kind debt keys remains forbidden (dominance D1);
 (x4f) same-content re-arm → distinct `ArmID`s (crypto/rand) — no key
 collision even with identical `GuardedHash`+`Deadline`; (x5) the
-read-mutate-write helper is the ONLY tombstone producer — #5637 gate
+read-mutate-write helper is the ONLY READ-BACK tombstone producer (the
+synthesized producer writes ONLY the superseded-UNREADABLE slot) — #5637 gate
 passes unmodified and `FirstCommit`/`Deadline`/`PrevTree`/`GuardedHash`/
 `HashBasis`/`ArmID` are preserved exactly (no `Gen` field exists);
 (x6) HASH-BASIS cross-version: legacy NORMAL record upgrade binds;
@@ -2082,11 +2180,16 @@ tombstone→delete; W-kind: rewrite/restore) IN-PROCESS; a BOOT-origin
 clean read splits into RESTART-RECOVERY-OWED (latch HELD, 503 +
 restart-required message until reboot) or SUPERSEDED-WHILE-UNREADABLE
 (resolved EAGERLY and DURABLY at the replacement's landing: plain
-commit/SyncApply with the latch standing DELETE the unreadable
-record + dir-fsync barrier at the post-durability point — no marker,
-no restart-before-repair replay; a confirmed commit's successful arm
-overwrites, and its PRE-rename failure applies the same delete rule
-to the unreadable orphan); an operator
+commit/SyncApply with the latch standing run the TWO-STEP synthesized
+tombstone + delete — the synthetic full-field `Resolved:true` record
+passes #5637 and drops at the Resolved-first check on any replay —
+with the D-KIND SLOT DEBT on failure (the retry RE-READS and
+RE-CLASSIFIES: still-unreadable → proceed; absent → `DeleteConfirm`
+re-drive; READABLE → clear as moot — never tombstone a readable
+record; the debt is process-local, crash remediation operator-mediated);
+a confirmed commit's successful arm
+overwrites, and its PRE-rename failure is handled by the W-kind
+restore REPLACING the unreadable record); an operator
 `rm` reactivates the absent-state (`DeleteConfirm` barrier for
 R-kind; (w-c) restore-or-stale for W-kind) — only the barrier clears;
 the loop still exits when no debt and no latch remain; (x13) BOOT
@@ -2142,8 +2245,10 @@ rewrite/restore, never a tombstone of a live window); BOOT-origin →
 RESTART-RECOVERY-OWED (latch HELD, 503 + restart-required message
 until reboot — never green-while-unsettled) or
 SUPERSEDED-WHILE-UNREADABLE (resolved EAGERLY at the replacement's
-durable landing — plain commit/SyncApply with the latch standing
-DELETE the unreadable record + dir-fsync barrier; the
+durable landing — plain commit/SyncApply with the latch standing run
+the TWO-STEP synthesized tombstone + delete with the process-local
+D-kind slot debt (retry re-reads and re-classifies; never tombstones
+a readable record); the
 restart-before-repair leg proves no replay: permanent-latch ∧
 commit-during-latch ∧ restart ∧ repair ∧ content-match ends with the
 record long gone); (x20) FAIL-CLOSED ROUTING (r18 Codex M6 = SMR M1 + r19 Codex m3):
@@ -2353,7 +2458,9 @@ coexistence) is deleted as incoherent (r1 B3).
   resolution clears; `onDiskArmID` known-on-disk identity — updated
   ONLY by write outcomes + the EVERY-outcome `Load` seeding:
   Present(ArmID) / Absent / unreadable→latch); the read-mutate-write
-  tombstone helper (the ONLY tombstone producer — its output always
+  tombstone helper (the ONLY READ-BACK tombstone producer — the
+  synthesized producer writes ONLY the superseded-UNREADABLE slot;
+  its output always
   passes the #5637 gate; NO-OP on absent record); the uniform
   tombstone-first ordering at EVERY `resolveConfirmRemovalLocked`
   call site; the FAILURE-PHASE CLASSIFICATION on all three replacement
@@ -2410,7 +2517,7 @@ coexistence) is deleted as incoherent (r1 B3).
   the NEW `ErrConfirmStateUnreadable` sentinel routed fail-closed
   through `classifyLoadError`, and the
   typed `ConfigPersistDegradedState()` snapshot accessor
-  (aggregate bool + `ConfirmDebtKindMask (REMOVAL|REWRITE)` +
+  (aggregate bool + `ConfirmDebtKindMask (REMOVAL|REWRITE|SLOT_DELETE)` +
   `ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed)`)
   with precedence TerminalUnreadable > RestartRecoveryOwed >
   ConfirmDebt > ActivePersist; the
@@ -2973,7 +3080,8 @@ Preserved exactly:
      TERMINAL (that debt stops, the singleton loop KEEPS healing
      `persistDegraded`, health 503, pinned remediation); (x4f)
      same-content re-arm → distinct ArmIDs; (x5) the read-mutate-write
-     helper is the ONLY tombstone producer — #5637 gate passes
+     helper is the ONLY READ-BACK tombstone producer (the synthesized
+     producer writes ONLY the superseded-UNREADABLE slot) — #5637 gate passes
      unmodified and FirstCommit/Deadline/PrevTree/GuardedHash/
      HashBasis/ArmID preserved exactly (no `Gen` field exists); (x6)
      HASH-BASIS cross-version: legacy NORMAL record upgrade binds;
@@ -3034,10 +3142,13 @@ Preserved exactly:
      503 + restart-required message until reboot) or
      SUPERSEDED-WHILE-UNREADABLE (resolved EAGERLY at the
      replacement's landing: plain commit/SyncApply with the latch
-     standing DELETE the unreadable record + dir-fsync barrier — no
-     marker, no restart-before-repair replay; confirmed commit's
-     successful arm overwrites, PRE-rename failure applies the same
-     delete rule);
+     standing run the TWO-STEP synthesized tombstone + delete with
+     the process-local D-kind slot debt (the retry re-reads and
+     re-classifies — still-unreadable → proceed, absent →
+     `DeleteConfirm` re-drive, READABLE → clear as moot; never
+     tombstones a readable record); confirmed commit's
+     successful arm overwrites, PRE-rename failure → the W-kind
+     restore REPLACES the unreadable record);
      operator `rm` → absent-state re-drive (`DeleteConfirm` barrier
      for R-kind; (w-c) restore-or-stale for W-kind);
      loop exits only
@@ -3108,7 +3219,7 @@ Preserved exactly:
      (x21) HEALTH SNAPSHOT PRECEDENCE (r18 Codex M7/m5 + r19 Codex
      m2/m4 + r20 Codex m2):
      `ConfigPersistDegradedState()` carries the aggregate bool + the
-     debt-kind MASK (REMOVAL|REWRITE) + the record-state ENUM
+     debt-kind MASK (REMOVAL|REWRITE|SLOT_DELETE) + the record-state ENUM
      (OK|TerminalUnreadable|RestartRecoveryOwed); /health
      renders by precedence TerminalUnreadable > RestartRecoveryOwed
      > ConfirmDebt (generic removal/rewrite message + mask detail)
@@ -3417,7 +3528,25 @@ debts key RECORDS via `onDiskArmID`; the W-kind debt keys the LIVE
 WINDOW via `armedArmID`/`s.armedRecord`), both x4c' copies restated
 to the live-window re-key + restore-overwrite, the §9 x19 marker
 workflow swept, and the health legs carried to the four-level
-precedence with the enum + mask.
+precedence with the enum + mask; r22 additions: the D-kind retry
+RE-READS and RE-CLASSIFIES (still-unreadable → proceed; absent →
+`DeleteConfirm` re-drive → clear; READABLE → clear as moot — never
+tombstone a readable record; a successful arm on the slot clears the
+debt as moot), the D-kind debt is PROCESS-LOCAL with
+operator-mediated crash remediation (no auto-recreation at boot —
+the boot cannot distinguish superseded from genuinely-pending
+unreadable records), the remaining R-first table copy rewritten to
+D2, all three x12/x19 bare-delete copies and all four "ONLY
+tombstone producer" copies swept (read-back producer vs the
+synthesized producer for the unreadable slot), the recordless
+guarantee SCOPED (restore-first ordering never creates the gap; a
+restore failure returns to D1 and the admitted arm-persistence
+residual), the synthetic record pinned (`FirstCommit=false`
+load-bearing, `Deadline` = now + 60 s, downgrade behavior documented
+config-neutral/runtime-churning/self-limiting with a downgrade-shape
+regression), and the health mask gains `SLOT_DELETE` with the
+aggregate defined as the OR of `persistDegraded`, every confirm-side
+debt kind, and the latch.
 
 Still open:
 
