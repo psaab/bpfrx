@@ -33,7 +33,7 @@
 [WATCH]      1719  userspace-dp/src/afxdp/worker/mod.rs
 [WATCH]      1670  pkg/config/compiler_validate_warn.go
 [WATCH]      1651  userspace-dp/src/screen/mod.rs
-[WATCH]      1613  pkg/api/sessions.go
+[WATCH]      1637  pkg/api/sessions.go
 [WATCH]      1610  pkg/config/types_system.go
 [WATCH]      1608  userspace-dp/src/afxdp/tx/dispatch/mod.rs
 [WATCH]      1606  pkg/cmdtree/tree.go

@@ -60204,3 +60204,24 @@ top.
     go test ./... (TMPDIR=/tmp, disk GOCACHE) GREEN.
 - **File(s)**: pkg/routing/bond.go, pkg/routing/adopt_guard_6402_test.go,
     pkg/routing/README.md, _Log.md
+
+- **Timestamp**: 2026-07-23
+- **Action**: #6421 — port the #5649 page-token cursor-hardening from the gRPC
+    surface to the REST session-listing codec (pkg/api/sessions.go), which had
+    drifted. decodeSessionKeyV4/V6 now require the EXACT ABI key length
+    (binary.Size) instead of a `len(b) < N` bound (a noncanonical trailing-byte
+    token previously aliased the same cursor), the encoders emit binary.Size
+    bytes so the token is byte-identical to gRPC, and parseSessionPageToken
+    rejects tokens over maxPageTokenLen (256) before any base64/hex decode
+    (alloc-amplification guard). Read-path only (REST list handler); no
+    VRRP/session-sync/failover code touched. FAIL-ON-REVERT:
+    TestRESTPageTokenCanonical_5649 (codec) + TestRESTSessionCursorNoncanonical_5649
+    (handler) go RED if the exact-length bound is reverted to `<` or the
+    maxPageTokenLen guard is removed — verified by neutralizing decodeSessionKeyV4
+    to `< 13` (both RED at lines 61/151) then restoring (GREEN). Regenerated
+    docs/refactoring-audit-current.txt (sessions.go 1613->1637 WATCH tier).
+    go build ./... , go vet ./pkg/api/ , go test ./pkg/api/ , FULL go test ./...
+    (TMPDIR=/dev/shm) GREEN.
+- **File(s)**: pkg/api/sessions.go,
+    pkg/api/sessions_pagination_canonical_5649_test.go,
+    docs/refactoring-audit-current.txt, _Log.md
