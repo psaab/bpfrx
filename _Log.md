@@ -60654,6 +60654,70 @@ top.
     pkg/ipsec/swanctl_addr_sanitize_6469_test.go, pkg/ipsec/README.md, _Log.md
 
 - **Timestamp**: 2026-07-24
+- **Action**: #6476 daemon(nft) — lo0 RE-protection cold-boot fail-closed
+    fence. The `inet xpf_lo0` input filter (Junos protect-RE) had no
+    cold-boot fence: on cold boot no prior table exists to retain, and the
+    boot apply reaches `applyLo0Filter` via `applyConfig` (logs+discards the
+    error), so a failed `InstallLo0` left the RE input path OPEN with only a
+    WARN while host service/VIP/HA-ready were published (the exact fail-open
+    #5644 closed for host-inbound). Mirrored #5644 for lo0: new
+    `d.lo0Enforced` gate; on a failed `InstallLo0` while false,
+    `installLo0ColdBootFence` installs a deny-all fence scoped to the SAME
+    lifeline-excluded firewall-local address sets and SAME
+    `buildFenceTablePayload` body as the host-inbound fence, into the
+    `xpf_lo0` table at priority 0 (so a later successful `InstallLo0`
+    atomically replaces it) via new `Installer.InstallLo0ColdBootFence`. NO
+    day-2 gap fence (deliberate #5789 divergence): the operator's lo0 filter
+    is not per-destination-address scoped, so a retained generation already
+    governs new addresses. Extracted `buildFenceTablePayload` so the two
+    fence oracles share one body; added a `lo0_cold_boot_fence` T1 parity
+    case. Parent-RED confirmed firsthand — neutralize the fence install →
+    "cold-boot lo0 install failure must install exactly one fail-closed lo0
+    fence, got 0". go build / vet / gofmt / pkg-daemon + pkg-nftables suites
+    / heatmap GREEN.
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/daemon.go,
+    pkg/nftables/netlink_installer.go,
+    pkg/daemon/daemon_nft_netlink_testhelper_test.go,
+    pkg/daemon/daemon_nft_netlink_parity_test.go,
+    pkg/daemon/lo0_coldboot_fence_6476_test.go,
+    docs/host-inbound-service-matrix.md,
+    docs/refactoring-audit-current.txt, _Log.md
+
+- **Timestamp**: 2026-07-24
+- **Action**: #6489 fold — CONFIRMED Codex MAJOR (Finding 1): the lo0
+    day-2 fence-skip gate `!d.lo0Enforced.Load()` conflated "real filter
+    loaded" with "fence loaded" (a scoped fence Stored lo0Enforced=true),
+    so a fence(snapshotA) → new-address-B-appears → real-install-fails-again
+    sequence SKIPPED re-fencing and left B reachable through the retained
+    fence's `policy accept` (fence drops only snapshot-A addrs). Fix (per
+    lead: prefer rev6476's 1-line change over a new field): KEEP `lo0Enforced`
+    and simply DROP the `Store(true)` on the scoped cold-boot fence path — a
+    fence never sets lo0Enforced, so lo0Enforced now means EXACTLY "a real
+    operator lo0 filter is loaded" (set true ONLY by a real InstallLo0
+    success; the zero-drop path already never set it). The unchanged gate
+    `!d.lo0Enforced.Load()` then correctly re-fences after a prior fence: while
+    no real filter is loaded a failed install RE-RENDERS the whole-table fence
+    from the CURRENT snapshot (covering B); once a real filter loads the
+    intended #5789 divergence (retain the real filter, no fence) holds. No new
+    field, no lo0 gap fence / covered-set. New test
+    TestColdBootLo0FenceThenNewAddressReFences (fence→fail→re-fence, asserts 2
+    fence installs + B covered); flipped the primary test's stale assertion (a
+    fence must NOT set lo0Enforced). Fixed the now-false "retains the prior
+    REAL filter" framing in the day-2 comment, the lo0Enforced field doc, and
+    docs/host-inbound-service-matrix.md. Parent-RED confirmed firsthand —
+    restore `d.lo0Enforced.Store(true)` on the scoped-fence path → "day-2
+    failure over a retained FENCE must RE-FENCE (got 1 fence installs, want
+    2)". Noted pre-existing residuals (non-catch-all real filter coverage
+    #3295; shared BuildZone.../fence-body Findings 2+3 tracked in follow-up
+    #6492 — they hit the host-inbound #5644 fence identically). Ran the T1
+    nft-parity gate with nft in PATH (FRESH GOCACHE) and CONFIRMED the new
+    `lo0_cold_boot_fence` subtest EXECUTES + PASSES (not a stale-binary SKIP).
+    go build / vet / gofmt / pkg-daemon + pkg-nftables suites / heatmap
+    (regenerated) GREEN.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_nft.go,
+    pkg/daemon/lo0_coldboot_fence_6476_test.go,
+    docs/host-inbound-service-matrix.md,
+    docs/refactoring-audit-current.txt, _Log.md
 - **Action**: #6455 — close the two family-wide limitations of the
     pre-expansion duplicate-name commit gates
     (validateDuplicateNamedBlockAST #5180, validateDuplicateNATRuleNamesAST

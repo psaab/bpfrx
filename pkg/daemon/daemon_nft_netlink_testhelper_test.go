@@ -33,6 +33,7 @@ type noopNftInstaller struct{}
 
 func (noopNftInstaller) InstallHostInbound(xnft.HostInboundSpec) error { return nil }
 func (noopNftInstaller) InstallColdBootFence(xnft.FenceSpec) error     { return nil }
+func (noopNftInstaller) InstallLo0ColdBootFence(xnft.FenceSpec) error  { return nil }
 func (noopNftInstaller) InstallGapFence(xnft.GapFenceSpec) error       { return nil }
 func (noopNftInstaller) InstallLo0(xnft.Lo0FilterSpec) error           { return nil }
 func (noopNftInstaller) DeleteTable(string) error                      { return nil }
@@ -42,11 +43,12 @@ func (noopNftInstaller) DeleteTable(string) error                      { return 
 // assertions. This is the netlink equivalent of the pre-PR-3 nftApplyPayload /
 // nftDeleteTable stubs.
 type fakeNftInstaller struct {
-	hostInbound   func(xnft.HostInboundSpec) error
-	coldBootFence func(xnft.FenceSpec) error
-	gapFence      func(xnft.GapFenceSpec) error
-	lo0           func(xnft.Lo0FilterSpec) error
-	del           func(string) error
+	hostInbound      func(xnft.HostInboundSpec) error
+	coldBootFence    func(xnft.FenceSpec) error
+	lo0ColdBootFence func(xnft.FenceSpec) error
+	gapFence         func(xnft.GapFenceSpec) error
+	lo0              func(xnft.Lo0FilterSpec) error
+	del              func(string) error
 }
 
 func (f *fakeNftInstaller) InstallHostInbound(s xnft.HostInboundSpec) error {
@@ -59,6 +61,13 @@ func (f *fakeNftInstaller) InstallHostInbound(s xnft.HostInboundSpec) error {
 func (f *fakeNftInstaller) InstallColdBootFence(s xnft.FenceSpec) error {
 	if f.coldBootFence != nil {
 		return f.coldBootFence(s)
+	}
+	return nil
+}
+
+func (f *fakeNftInstaller) InstallLo0ColdBootFence(s xnft.FenceSpec) error {
+	if f.lo0ColdBootFence != nil {
+		return f.lo0ColdBootFence(s)
 	}
 	return nil
 }
@@ -92,6 +101,7 @@ type countingNftInstaller struct{ calls *int }
 
 func (c countingNftInstaller) InstallHostInbound(xnft.HostInboundSpec) error { *c.calls++; return nil }
 func (c countingNftInstaller) InstallColdBootFence(xnft.FenceSpec) error     { *c.calls++; return nil }
+func (c countingNftInstaller) InstallLo0ColdBootFence(xnft.FenceSpec) error  { *c.calls++; return nil }
 func (c countingNftInstaller) InstallGapFence(xnft.GapFenceSpec) error       { *c.calls++; return nil }
 func (c countingNftInstaller) InstallLo0(xnft.Lo0FilterSpec) error           { *c.calls++; return nil }
 func (c countingNftInstaller) DeleteTable(string) error                      { *c.calls++; return nil }

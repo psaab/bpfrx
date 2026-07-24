@@ -593,6 +593,40 @@ type Daemon struct {
 	// be covered" (cold boot).
 	hostInboundCoveredAddrs map[string]struct{}
 
+	// lo0Enforced records whether the currently-loaded xpf_lo0 table is a REAL
+	// operator filter (the #6476 lo0 cold-boot fence gate). It means EXACTLY that:
+	// it is set true ONLY by a successful real InstallLo0. A cold-boot FENCE
+	// deliberately does NOT set it — a fence is NOT a real filter (its chain is
+	// `policy accept` and drops only the firewall-local addresses present in the
+	// snapshot it was rendered from, so a later-appearing address is not covered), so
+	// lo0Enforced stays false across a fence. A successful no-filter TEARDOWN Stores
+	// false (the table is deleted); a teardown FAILURE (a table may still be
+	// installed) does NOT clear it.
+	//
+	// It gates the day-2 fence-skip in applyLo0Filter: a failed InstallLo0 installs
+	// a fence UNLESS a real filter is currently loaded. This must key on real-filter-
+	// loaded, NOT "any protecting table exists" (#6489). The earlier design set a
+	// single flag true on BOTH a real load AND a scoped fence, conflating the two —
+	// so a fence -> new-address -> real-install-fails sequence SKIPPED re-fencing and
+	// left the newly-appeared address reachable through the stale fence's
+	// `policy accept` (fail-open). Because a fence no longer sets lo0Enforced, the
+	// gate stays open after a fence and RE-RENDERS the whole-table fence from the
+	// current snapshot on every day-2 failure while no real filter is loaded
+	// (covering the new address); a retained REAL filter (true) is trusted to govern
+	// every local address so no fence is installed — the intended divergence from the
+	// host-inbound per-address gap fence (#5789), which lo0 does not need because the
+	// operator's hand-authored filter is not per-destination-address scoped.
+	//
+	// Residuals (pre-existing, NOT introduced or addressed here — tracked in #6492):
+	// a retained REAL lo0 filter with no catch-all term (a valid config,
+	// compiler_filter_nocatchall_3295_test) need not itself cover a new day-2 address
+	// (the lo0 filter's own coverage semantics, independent of this boot fence); and
+	// the shared BuildZoneHostInboundViews / fence body carries a management-IP-on-
+	// non-lifeline and a zone-less-router behaviour that affect the host-inbound
+	// #5644 fence identically. Production access is serialized under applySem (via
+	// applyLo0Filter); atomic.Bool matches the hostInboundEnforced type.
+	lo0Enforced atomic.Bool
+
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
 	//
