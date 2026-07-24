@@ -1,8 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v5 — r4 findings folded (Codex NEEDS-REVISION 1M/5m; AGY
-  **PLAN-READY**; Claude SMR NEEDS-REVISION 1B/2M/3m); pending convergence
-  review r5
+- **Status**: DRAFT v6 — r5 findings folded (Codex NEEDS-REVISION 2M/4m;
+  AGY **PLAN-READY** 0M/1m; Claude SMR NEEDS-REVISION 1B/2M/3m); pending
+  convergence review r6
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -16,12 +16,16 @@
   `CachedStatusProvider`, real-sampler barrier, untruncated table). v4 @
   `e9ac48db1` (r3: two-sided barrier gate, exact 134 count, RACE-1 scoped to
   watcher chain, all-kind nil gate, honest Option D, extended comment sweep).
-  v5: r4 convergence — documented RACE-3 (recovered commit-confirmed
-  rollback timer races the boot publication) with regression coverage;
-  readiness `:202` moved into the RACE-1 set via the
-  watcher→blackhole→readiness chain; stream-row and prose residuals
-  repaired; teardown quiescence spec; typed-nil matrix over all nillable
-  kinds; three more comment-sweep entries.
+  v5 @ `ee5f54484` (r4: RACE-3 documented — recovered commit-confirmed
+  rollback timer races boot publication; readiness `:202` into RACE-1;
+  residual repairs). v6: r5 convergence — the RACE-3 audit exposed a
+  PRE-EXISTING startup-ordering defect (nil-deref panic on
+  `d.vrrpMgr` + bootstrap-armed interleaving when the recovered timer fires
+  before `initManagers` completes); adds the startup-readiness gate
+  companion work item (gate-before-applySem, abandon-on-shutdown), pivots
+  the RACE-3 tests to the gate, extends RACE-3 reachability to the whole
+  apply pipeline with pre/post-gate semantics, prose/citation corrections,
+  stream `:67` row fix, legacy-record scoping, two more stale-cite entries.
 
 ---
 
@@ -65,14 +69,16 @@ no cycles/MB/retransmits to win back. The win, at absolute scale:
     `setupDataplaneAndInitialConfig` assigns `d.dp` (:448/:469/:497). The
     watcher's event-handler chain reads `d.dp` at
     `daemon_ha.go:297,299,337,348,362,367` AND — via the promotion/demotion
-    blackhole paths (`daemon_ha.go:310` → `removeBlackholeRoutes`
+    blackhole paths (`daemon_ha.go:311` → `removeBlackholeRoutes`
     :1124; `:359-360` → `:1064-1066`) — at
     `daemon_ha_userspace_readiness.go:202`, with no happens-before edge to
     the assignment. **Scope note (r3/r4)**: this is the ONLY pre-publication
-    reader chain — every other HA goroutine (`startClusterComms`
-    `daemon_run.go:396`, VRRP watcher :578, reconcile :582, session sync
-    `daemon_ha_sync.go:790`) starts AFTER publication and is
-    goroutine-start HB-safe against the boot writer.
+    reader chain on the CLUSTER side — every other HA goroutine
+    (`startClusterComms` `daemon_run.go:396`, VRRP watcher :578, reconcile
+    :582, session sync `daemon_ha_sync.go:790`) starts AFTER publication
+    and is goroutine-start HB-safe against the boot writer. (The recovered
+    confirm-timer chain is the SEPARATE pre-publication entrant documented
+    as RACE-3 below.)
   - **RACE-2 (bootstrap-exit arm failure — standalone/bootstrap nodes)**:
     `runBootstrapExitStartup` writes `d.dp = nil`
     (`daemon_run_naming.go:234`) on the apply goroutine under `d.applySem`
@@ -86,17 +92,29 @@ no cycles/MB/retransmits to win back. The win, at absolute scale:
   - **RACE-3 (recovered commit-confirmed rollback timer vs boot
     publication — any restart inside a confirm window)**: the rollback
     executor is registered at daemon init, before any startup phase
-    (`daemon_run.go:129-135`); phase-1 `Store.Load` re-arms a pending
+    (`daemon_run.go:136`); phase-1 `Store.Load` re-arms a pending
     commit-confirmed timer for the remaining window — arbitrarily short
-    (`store_persist.go:231-238`); the timer goroutine fires the executor
-    (`store_commit.go:815` → `daemon_apply_commit.go:629`, taking
+    (`store_persist.go:251`); the timer goroutine fires the executor
+    (`store_commit.go:819` → `daemon_apply_commit.go:629`, taking
     `d.applySem`) and the rollback reads `d.dp` (`bootstrap.go:472-473` on
-    the first-commit path; `daemon_apply_dataplane.go:98` et seq. on a
-    non-nil rollback) WHILE the phase-3 boot writers
-    (`daemon_run_bringup.go:448,464,469,497`) assign `d.dp` WITHOUT holding
-    applySem. The executor's semaphore orders apply-vs-apply but never met
-    the boot writes. Precondition is mundane: operator issued
-    `commit confirmed` and rebooted inside the window.
+    the first-commit path; the full apply pipeline — from
+    `daemon_apply_dataplane.go:98` through `daemon_apply_interfaces.go:42`,
+    `daemon_apply_tail.go:491`, `daemon_apply_routing.go:367`, the
+    scheduler, ipmon, policy-invalidate — on a non-nil rollback) WHILE the
+    phase-3 boot writers (`daemon_run_bringup.go:448,464,469,497`) assign
+    `d.dp` WITHOUT holding applySem. The executor's semaphore orders
+    apply-vs-apply but never met the boot writes. Precondition is mundane:
+    operator issued `commit confirmed` and rebooted inside the window.
+    **r5 consequence discovery (pre-existing, worse than the field race)**:
+    the same early fire can run the apply tail's unconditional
+    `d.vrrpMgr.UpdateInstances` (`daemon_apply_tail.go:49`) BEFORE
+    `d.vrrpMgr` is constructed (`daemon_run_bringup.go:219`) — a nil-deref
+    panic on boot; and on the first-commit branch `enterBootstrapMode`
+    (`bootstrap.go:322` + `bootstrap.go:472` Teardown) can land between the
+    boot's `inBootstrap()` check (`daemon_run_bringup.go:490`) and its
+    `d.dp.Start` (:494), arming the dataplane inside bootstrap mode. These
+    are DISPATCH-ORDERING defects the atomic cell cannot fix — they need
+    the startup-readiness gate (§4 A1, work item G).
   A torn `(type, data)` read can panic the daemon process (fatal on a
   firewall) or yield an inconsistent type assertion.
 - **Bootstrap/cluster mutual exclusion — the PRECISE invariant (r2 B2)**:
@@ -117,7 +135,16 @@ no cycles/MB/retransmits to win back. The win, at absolute scale:
   RACE-2-unreachable, and only the watcher chain is RACE-1-reachable; the
   remaining HA readers are converted for UNIFORMITY (issue requirement #1:
   one mechanism for every reader and writer), not because a live race
-  reaches them today.
+  reaches them today. **Scope (r5)**: links (iii)-(iv) are current-version
+  guards; `store_persist.go:149` also accepts LEGACY persisted confirm
+  records without the modern GuardedHash binding and no topology preflight.
+  The exclusion survives them anyway: a never-committed marker and a
+  committed cluster config cannot coexist in one store, so
+  `enterBootstrapMode` (prevCfg==nil) with a live cluster runtime stays
+  unreachable — a legacy first-commit CLUSTER record implies the cluster
+  config WAS committed (pre-#5840 code allowed the topology add), making
+  the node ever-committed ⇒ prevCfg != nil ⇒ the non-first rollback path,
+  not `enterBootstrapMode`.
 - **Converts non-local safety arguments into local ones.** r1-r4 review
   proved three of the plan's own non-local arguments false as stated. One
   publication mechanism makes each of the 129 read sites locally correct
@@ -234,6 +261,47 @@ allocation per Store (≤5 per daemon lifetime), zero per read; matches the
   3. give the redesigned canary its own unit coverage: it must FAIL on a
      raw `dp dataplane.RuntimeDataPlane` field AND on an unguarded `dpCell`
      access (both directions asserted).
+
+**Work item G — startup-readiness gate for the rollback executor (r5 B1;
+closes the pre-existing dispatch-ordering defect the RACE-3 audit
+exposed).** The recovered commit-confirmed timer can fire before
+`initManagers` completes (§2 RACE-3), which today can nil-deref
+`d.vrrpMgr` (`daemon_apply_tail.go:49` vs construction at
+`daemon_run_bringup.go:219`) and can arm the dataplane inside bootstrap
+mode (`daemon_run_bringup.go:490` check vs `:494` Start, interleaved with
+`enterBootstrapMode`). Design:
+
+```go
+// daemon.go — closed at the END of the startup phases (after the boot
+// apply completes, before PHASE 6), signalling that every manager exists
+// and the dataplane state is settled.
+startupReady chan struct{}
+
+// executeConfirmedRollback (daemon_apply_commit.go:629) — FIRST wait for
+// startup readiness, THEN take applySem. Gate-before-applySem is
+// mandatory: the boot apply holds applySem across startup, so gating
+// while holding it would deadlock startup.
+select {
+case <-d.startupReady:
+case <-d.daemonCtx.Done():
+    return // shutdown during startup: the persisted confirm record is
+           // re-resolved on the next boot (store_persist.go:225-228)
+}
+```
+
+- `close(d.startupReady)` at the end of the startup phases (the same
+  program point where PHASE 5 hands off to PHASE 6).
+- Effects: the `d.vrrpMgr` nil-deref dies (all managers exist before
+  dispatch); the bootstrap-armed interleaving dies (the rollback runs only
+  after the boot settled bootstrap-vs-normal); the timer-vs-boot-writer
+  `d.dp` race is eliminated by ORDER (the cell remains the issue-required
+  uniform mechanism + defense for RACE-1/RACE-2/future writers).
+- Store-internal fallback (`performAutoRollback`, `store_commit.go:819`)
+  is untouched — it is store-state-only, no daemon managers.
+- Scope note: this is a small (~30 LoC + tests) companion fix inside the
+  same PR. Shipping the publication fix while leaving a KNOWN boot-panic
+  would contradict issue requirement #4's spirit. r6 open question 6 asks
+  reviewers to confirm keep-in vs split-to-follow-up.
 
 **fwdstatus adapter: STRUCTURALLY sampler-only (r2 M1 — Codex's structural
 argument adopted over AGY's comment-level one, per this repo's
@@ -386,9 +454,14 @@ minus 29 full-line comments): **5 writers + 129 readers**. Classes:
 Run-goroutine read before any server can deliver a commit; **CONCURRENT** =
 background/request-goroutine reader. Reachability: RACE-2 reaches only
 standalone/bootstrap consumers (§2 four-link exclusion); RACE-1 reaches
-ONLY the pre-publication watcher chain (§2 scope note). Everything else is
-converted for uniformity, not reachability. The compiler (field retype)
-proves the conversion total; this table is the classification snapshot.
+ONLY the pre-publication watcher chain (§2 scope note); RACE-3 reaches
+EVERY apply-path (APPLY-class) reader via the recovered confirm timer
+PRE-gate — POST-gate (work item G) all timer dispatch is ordered after
+startup, collapsing those rows back to plain APPLY-serialized, with the
+atomic cell as the uniform defense. Everything not labeled with a live
+exposure is converted for uniformity, not reachability. The compiler
+(field retype) proves the conversion total; this table is the
+classification snapshot.
 
 | File:lines | Context | Class | RACE exposure |
 |---|---|---|---|
@@ -399,7 +472,7 @@ proves the conversion total; this table is the classification snapshot.
 | `daemon_run_servers.go` 409,412 | REST simulator probe | CONCURRENT | RACE-2 |
 | `daemon_neighbor_listener.go` 304,307,473 | netlink listener/regen (started when `ActiveConfig() != nil` at boot, `daemon_run.go:518-533` — incl. never-committed-restart bootstrap) | CONCURRENT | RACE-2 |
 | `daemon_ha_userspace_stream.go` 122 | event-stream start assertion; launched standalone (`daemon_run.go:365-369`, RACE-2) and on cluster (`daemon_ha_sync.go:1176`, post-publication) | CONCURRENT | RACE-2 (standalone) / uniformity (cluster) |
-| `daemon_ha_userspace_stream.go` 67,259 | drainer captures at goroutine/fallback-loop start (capture-once, HA-context) | CONCURRENT | uniformity |
+| `daemon_ha_userspace_stream.go` 67,259 | drainer captures at goroutine/fallback-loop start (capture-once; :67 is mixed standalone/HA — the standalone fallback at :125 reads `d.dp` BEFORE the `d.cluster == nil` check at :68) | CONCURRENT | RACE-2 (:67 standalone) / uniformity |
 | `daemon_ha_userspace_stream.go` 235 | full-resync exporter read, per-callback (HA-only) | CONCURRENT | uniformity |
 | `daemon_natpoolalarm.go` 18,21 | monitor sampler goroutine (#2116 lifecycle-gated) | CONCURRENT (gated) | gated off by lifecycle |
 | `daemon_natpoolalarm.go` 101 | start gate (boot block + `runBootstrapExitStartup` under applySem) | APPLY/BOOT-SYNC | serialized |
@@ -415,7 +488,7 @@ proves the conversion total; this table is the classification snapshot.
 | `daemon_ha.go` 542,549,578,583 | `watchVRRPEvents` (:511-604, post-publication) | CONCURRENT | uniformity |
 | `daemon_ha.go` 813,826,842 | `reconcileRGState` (:707+, post-publication) | CONCURRENT | uniformity |
 | `daemon_ha.go` 1521,1531,1545 | `warmNeighborCache` (:1520, failover paths, post-publication) | CONCURRENT | uniformity |
-| `daemon_ha_userspace_readiness.go` 202 | `userspaceDataplaneActive` — reached from the PRE-publication watcher via `removeBlackholeRoutes` (`daemon_ha.go:310` → :1124; demotion `:359-360` → `:1064-1066`) | CONCURRENT | **RACE-1** |
+| `daemon_ha_userspace_readiness.go` 202 | `userspaceDataplaneActive` — reached from the PRE-publication watcher via `removeBlackholeRoutes` (`daemon_ha.go:311` → :1124; demotion `:359-360` → `:1064-1066`) | CONCURRENT | **RACE-1** |
 | `daemon_ha_userspace_readiness.go` 230,233 | takeover-readiness probes (post-publication) | CONCURRENT | uniformity |
 | `daemon_health.go` 141 | standby-neighbor refresh (session-sync trigger, `daemon_ha_sync.go:970`, post-publication) | CONCURRENT | uniformity |
 | `daemon_apply_dataplane.go` 53,98,122,139,141,293,295,390,393,397,455,459,463,482,485,497,501,505 | apply path (incl. `reapplyAfterDeferredMAC`, `recordDataplaneWorkerArmDebt`) — applySem-serialized vs RACE-2, but a timer-triggered rollback apply (§2 RACE-3) runs this path while the boot writers hold no applySem | APPLY (vs RACE-2) / CONCURRENT (vs RACE-3) | serialized / **RACE-3** |
@@ -449,10 +522,13 @@ proves the conversion total; this table is the classification snapshot.
   `daemon_run.go:1868` cite (now `daemon_run_bringup.go:164`), plus the r4
   additions `daemon_apply_commit.go:156` ("one-way"),
   `daemon_natpoolalarm.go:88` ("exactly once" vs discard-and-rearm at
-  `:118-126`), and `cluster_topology_preflight.go:59` (second stale
-  `daemon_run.go:1868` cite) — the recurrence (exit → `enterBootstrapMode`
-  → re-exit) is real and now tested; the comments must say "one-way per
-  bootstrap episode; rollback can re-enter" (r2-r4 Codex comment sweeps).
+  `:118-126`), `cluster_topology_preflight.go:59` (second stale
+  `daemon_run.go:1868` cite), plus the r5 stale-cite additions
+  `pkg/daemon/cluster_identity_preflight_6192_test.go:27` and
+  `docs/ha-no-hitless-restart.md:85,130` — the recurrence (exit →
+  `enterBootstrapMode` → re-exit) is real and now tested; the comments must
+  say "one-way per bootstrap episode; rollback can re-enter" (r2-r5 Codex
+  comment sweeps).
 - `docs/` sweep: `docs/ha-failover-status.md:279`,
   `docs/ha-no-hitless-restart.md:22`, `docs/rib-group-route-leaking.md:94`
   (the /engineer pass greps `docs/` for `d\.dp` and updates or justifies
@@ -587,17 +663,23 @@ Preserved exactly:
    - `TestDataplaneCell_ClusterStartPublication` — RACE-1 shape:
      watcher-shape reader loop racing the boot `setDataplane(dp)`
      publication; nil-or-full-slot assertion; `-race` clean.
-   - `TestDataplaneCell_ConfirmTimerVsBootPublication` — RACE-3 shape (r4
-     B1): two-sided gate — the boot-side `setDataplane(dp)` publication is
-     gated immediately BEFORE the store, and a rollback-executor-shape
-     reader (a goroutine that takes `d.applySem` and reads `d.dataplane()`,
-     mirroring `executeConfirmedRollback` → `bootstrap.go:472` /
-     `daemon_apply_dataplane.go:98`) is gated immediately BEFORE its read;
-     both block on a shared release; no channel between the pair. On the
-     plain field the detector fires; on the cell it is clean. The test
-     also drives the REAL `executeConfirmedRollback` once with a stubbed
-     store to pin the production call chain's reachability (PromoteRollback
-     → first-commit `enterBootstrapMode` path).
+   - `TestDataplaneCell_ConfirmTimerVsBootPublication` — RACE-3 + work
+     item G (r5 pivot):
+     (a) GATE test: with `startupReady` OPEN, a fired
+     `executeConfirmedRollback` must BLOCK before applySem (assert no
+     rollback side effects — no `PromoteRollback`, no teardown); close
+     `startupReady`, assert the rollback proceeds. Also assert
+     abandon-on-shutdown (cancel `daemonCtx` while gated ⇒ returns without
+     side effects).
+     (b) Cell revert-guard, post-startup shape: two-sided gate — a
+     `setDataplane(dp)` publication gated immediately before the store vs
+     an applySem-holding reader gated immediately before its
+     `d.dataplane()` load; shared release; no channel between the pair.
+     (c) REAL-path ordering test: a stubbed persisted confirm record +
+     the real recovered-timer wiring against a real (NoDataplane) startup
+     sequence — assert dispatch lands only after `startupReady` closes
+     (the pre-gate defect would fire `d.vrrpMgr.UpdateInstances` on a nil
+     manager; the test fails loudly pre-gate).
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
    `setDataplane`) and `daemon_forwarding_status_test.go` (rewrite against
    the narrowed adapter: `ProjectsMapStats`/`UsesUserspaceStatusAdapter`
@@ -642,21 +724,24 @@ Preserved exactly:
   ENABLES it safely later).
 - Full-repo `go test -race` wiring.
 
-## 11. Open questions for adversarial review (r5)
+## 11. Open questions for adversarial review (r6)
 
-Resolved in v2-v5 (for the record): A2 deletion; atomic cell choice;
+Resolved in v2-v6 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
 policy-invalidate APPLY-class; HA smoke gates mandatory + specific;
 typed-nil kind-gated guard over all nillable kinds with a table-driven
 matrix; docs scope (README architecture + :936 + docs/ sweep + stale
-comments incl. the r3/r4 additions + `_Log.md`); audit table completeness
-AND exact count (134 = 5 + 129); deterministic real-sampler barrier as a
-two-sided gate that cannot happens-before-order the conflicting accesses,
-with a bounded sustained-quiescence teardown; four-link bootstrap/cluster
-exclusion; RACE-1 scoped to the pre-publication watcher chain INCLUDING
-the blackhole→readiness hop (`daemon_ha_userspace_readiness.go:202`);
-RACE-3 (recovered commit-confirmed rollback timer vs boot publication)
-documented with regression coverage.
+comments incl. the r3/r4/r5 additions + `_Log.md`); audit table
+completeness AND exact count (134 = 5 + 129); deterministic real-sampler
+barrier as a two-sided gate with a bounded sustained-quiescence teardown;
+four-link bootstrap/cluster exclusion (scoped to current-version guards,
+legacy-record containment argued); RACE-1 scoped to the pre-publication
+watcher chain INCLUDING the blackhole→readiness hop
+(`daemon_ha_userspace_readiness.go:202`); RACE-3 (recovered
+commit-confirmed rollback timer) documented; the pre-existing
+startup-ordering defect it exposed (nil-deref `d.vrrpMgr`,
+bootstrap-armed interleaving) addressed by the startup-readiness gate
+(work item G).
 
 Still open:
 
@@ -678,6 +763,12 @@ Still open:
    reviewers want a lighter `grep`-based `make` check instead?
 5. `test-race-dp` wiring into `test-go`: acceptable growth of the
    pre-commit gate, or documented-manual-gate only?
+6. **Work item G (startup-readiness gate)**: keep IN this PR (plan's
+   recommendation — small, closes a pre-existing boot-panic the RACE-3
+   audit exposed, and the RACE-3 tests need it) vs SPLIT to a follow-up
+   issue (keeping this PR purely the `d.dp` publication)? If split, the
+   RACE-3 regression coverage in this PR is limited to the cell
+   revert-guard (§9 (b)) and the gate lands separately.
 
 ---
 
