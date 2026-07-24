@@ -166,3 +166,133 @@ func TestSwanctlAddrLegitPreserved_6469(t *testing.T) {
 		}
 	})
 }
+
+// TestSwanctlProposalsInjectionNeutralized_6469 is the fold guard: the swanctl
+// `proposals` (IKE, Phase 1) and `esp_proposals` (ESP, Phase 2, INSIDE the
+// children{} block) render sites must run the built proposal string through
+// sanitizeSwanctlValue. buildIKEProposal* / buildESPProposal append
+// prop.EncryptionAlg / prop.AuthAlg VERBATIM on the unknown-algorithm
+// fall-through (normalizeAuthAlg's default branch; normalizeEncAlg's generic
+// gcm strip), so a control char in a peer-synced / directly-constructed
+// proposal reaches the renderer. An embedded newline in esp_proposals injects
+// a child-SA directive (`updown = <script>` runs as ROOT under charon) — a
+// strictly worse vector than the endpoint one, on the identical
+// validation-bypassed threat model. Reverting either wrap makes the matching
+// case fail with a clean assertion: the injected directive is a live line.
+func TestSwanctlProposalsInjectionNeutralized_6469(t *testing.T) {
+	// IKE proposals: EncryptionAlg carries the payload, no AuthAlg / DHGroup,
+	// so buildIKEProposalFromIKE emits the payload as the whole proposals
+	// value (nothing is appended after the newline).
+	ikeCfg := &config.IPsecConfig{
+		Gateways: map[string]*config.IPsecGateway{
+			"gw": {Name: "gw", Address: "203.0.113.1", IKEPolicy: "ike-pol"},
+		},
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Name: "tun", Gateway: "gw"},
+		},
+		IKEPolicies: map[string]*config.IKEPolicy{
+			"ike-pol": {Name: "ike-pol", Proposals: []string{"ike-prop"}},
+		},
+		IKEProposals: map[string]*config.IKEProposal{
+			"ike-prop": {Name: "ike-prop", AuthMethod: "pre-shared-keys", EncryptionAlg: "aes256\n    reauth_time = 0"},
+		},
+	}
+
+	// ESP proposals: the ipsec-policy proposal's EncryptionAlg carries the
+	// updown→root payload; no AuthAlg / DHGroup so esp_proposals is exactly
+	// the payload. gw has a valid address so the VPN is not skipped.
+	espCfg := &config.IPsecConfig{
+		Gateways: map[string]*config.IPsecGateway{
+			"gw": {Name: "gw", Address: "203.0.113.1"},
+		},
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Name: "tun", Gateway: "gw", IPsecPolicy: "ipsec-pol"},
+		},
+		Policies: map[string]*config.IPsecPolicyDef{
+			"ipsec-pol": {Name: "ipsec-pol", Proposals: []string{"prop1"}},
+		},
+		Proposals: map[string]*config.IPsecProposal{
+			"prop1": {Name: "prop1", EncryptionAlg: "aes256\n        updown = /tmp/pwn.sh"},
+		},
+	}
+
+	cases := []struct {
+		name      string
+		cfg       *config.IPsecConfig
+		directive string // the injected line that must NOT render live
+		wantSlot  string // the render slot that must still be present
+	}{
+		{
+			name:      "IKE proposals newline injection",
+			cfg:       ikeCfg,
+			directive: "reauth_time = 0",
+			wantSlot:  "proposals = aes256",
+		},
+		{
+			name:      "ESP esp_proposals updown->root injection",
+			cfg:       espCfg,
+			directive: "updown = /tmp/pwn.sh",
+			wantSlot:  "esp_proposals = aes256",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+			got := m.generateConfig(c.cfg)
+			if hasBareDirectiveLine(got, c.directive) {
+				t.Fatalf("swanctl proposal injection NOT neutralized: %q rendered "+
+					"as a live directive line — the newline in the proposal value "+
+					"was not stripped:\n%s", c.directive, got)
+			}
+			if !strings.Contains(got, c.wantSlot) {
+				t.Fatalf("expected sanitized proposal slot %q in render:\n%s",
+					c.wantSlot, got)
+			}
+		})
+	}
+}
+
+// TestSwanctlProposalsLegitPreserved_6469 is the over-escape guard for the
+// proposal fold: a legitimate multi-proposal list — dashed swanctl tokens
+// (aes256-sha256-modp2048) comma-joined for a `proposals [ p1 p2 ]` offer —
+// must render BYTE-IDENTICAL through the sanitize belt on BOTH the IKE
+// `proposals` and the ESP `esp_proposals` line. sanitizeSwanctlValue only
+// touches control bytes, so `-` and `,` survive.
+func TestSwanctlProposalsLegitPreserved_6469(t *testing.T) {
+	cfg := &config.IPsecConfig{
+		Gateways: map[string]*config.IPsecGateway{
+			"gw": {Name: "gw", Address: "203.0.113.1", IKEPolicy: "ike-pol"},
+		},
+		VPNs: map[string]*config.IPsecVPN{
+			"tun": {Name: "tun", Gateway: "gw", IPsecPolicy: "ipsec-pol"},
+		},
+		IKEPolicies: map[string]*config.IKEPolicy{
+			"ike-pol": {Name: "ike-pol", Proposals: []string{"ike-a", "ike-b"}},
+		},
+		IKEProposals: map[string]*config.IKEProposal{
+			"ike-a": {Name: "ike-a", AuthMethod: "pre-shared-keys", EncryptionAlg: "aes-256-cbc", AuthAlg: "sha-256", DHGroup: 14},
+			"ike-b": {Name: "ike-b", AuthMethod: "pre-shared-keys", EncryptionAlg: "aes-128-cbc", AuthAlg: "sha-256", DHGroup: 14},
+		},
+		Policies: map[string]*config.IPsecPolicyDef{
+			"ipsec-pol": {Name: "ipsec-pol", Proposals: []string{"esp-a", "esp-b"}},
+		},
+		Proposals: map[string]*config.IPsecProposal{
+			"esp-a": {Name: "esp-a", EncryptionAlg: "aes-256-cbc", AuthAlg: "sha-256", DHGroup: 14},
+			"esp-b": {Name: "esp-b", EncryptionAlg: "aes-128-cbc", AuthAlg: "sha-256", DHGroup: 14},
+		},
+	}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	got := m.generateConfig(cfg)
+
+	const wantIKE = "    proposals = aes256-sha256-modp2048,aes128-sha256-modp2048\n"
+	const wantESP = "        esp_proposals = aes256-sha256-modp2048,aes128-sha256-modp2048\n"
+	if !strings.Contains(got, wantIKE) {
+		t.Fatalf("legit IKE proposal list over-escaped or dropped: want %q in "+
+			"render:\n%s", wantIKE, got)
+	}
+	if !strings.Contains(got, wantESP) {
+		t.Fatalf("legit ESP proposal list over-escaped or dropped: want %q in "+
+			"render:\n%s", wantESP, got)
+	}
+}

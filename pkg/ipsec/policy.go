@@ -215,7 +215,20 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, map[string
 		b.WriteString("    }\n")
 
 		if ikeProposals != "" {
-			fmt.Fprintf(&b, "    proposals = %s\n", ikeProposals)
+			// Sanitize the IKE proposal list for the same reason as the
+			// child-SA esp_proposals below and the local_ts/remote_ts belt:
+			// buildIKEProposal / buildIKEProposalFromIKE append
+			// prop.EncryptionAlg / prop.AuthAlg VERBATIM on the unknown-
+			// algorithm fall-through (normalizeAuthAlg's default branch returns
+			// the collapsed token unchanged; normalizeEncAlg's generic gcm strip
+			// only removes `-cbc`/`-`), so a control character in a peer-synced
+			// or directly-constructed proposal survives into this UNQUOTED list
+			// slot and an embedded newline would inject a connection-level
+			// swanctl directive. sanitize-only, NOT escapeSwanctlQuoted (this is
+			// an unquoted list slot like local_ts/remote_ts): a proposal token is
+			// alnum / `-` / `,`, all preserved by sanitizeSwanctlValue, so a
+			// legitimate proposal or comma-list renders byte-identical (#6469).
+			fmt.Fprintf(&b, "    proposals = %s\n", sanitizeSwanctlValue(ikeProposals))
 		}
 		if ikeLifetime > 0 {
 			fmt.Fprintf(&b, "    rekey_time = %ds\n", ikeLifetime)
@@ -250,7 +263,19 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, map[string
 			if child.RemoteTS != "" {
 				fmt.Fprintf(&b, "        remote_ts = %s\n", sanitizeSwanctlValue(child.RemoteTS))
 			}
-			fmt.Fprintf(&b, "        esp_proposals = %s\n", espProposals)
+			// esp_proposals sits INSIDE the children{ <child> { } } block —
+			// the same block whose local_ts/remote_ts belt above cites an
+			// injected `updown = /tmp/x.sh` executed by charon as ROOT.
+			// buildESPProposal appends prop.EncryptionAlg / prop.AuthAlg
+			// VERBATIM on the unknown-algorithm fall-through, so a control
+			// character in a peer-synced or directly-constructed ESP proposal
+			// survives; an embedded newline here injects a child-SA directive
+			// (updown → root exec, or an esp_proposals/mode/mark_* crypto
+			// rewrite) — a strictly worse vector than the endpoint one on the
+			// identical validation-bypassed threat model. sanitize-only,
+			// unquoted list slot; a legitimate proposal / comma-list renders
+			// byte-identical (#6469).
+			fmt.Fprintf(&b, "        esp_proposals = %s\n", sanitizeSwanctlValue(espProposals))
 			if espLifetime > 0 {
 				fmt.Fprintf(&b, "        rekey_time = %ds\n", espLifetime)
 				b.WriteString("        rand_time = 0s\n")

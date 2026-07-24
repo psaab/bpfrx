@@ -607,31 +607,59 @@ all files stay in `package ipsec`, so the public API is unchanged.
   rejected an embedded newline in ANY value at commit — the #4098 gate
   adds the traffic-selector-specific shape check (malformed / mis-scoped
   selector) and the render-side belt.
-- **Endpoint `local_addrs`/`remote_addrs` sanitize (#6469).** The
-  connection `local_addrs = <value>` / `remote_addrs = <value>` lines
-  (the resolved peer/local endpoint from `resolveRemoteAddr` — a gateway
-  `address`/`dynamic hostname`, a `local-address`, an
-  `external-interface`-derived local IP, or the legacy inline
-  `vpn.Gateway`) are now run through `sanitizeSwanctlValue` at the two
-  `policy.go` render sites, closing the last raw-`%s` swanctl-injection
-  surface. These are UNQUOTED comma-list slots, so — exactly like the
-  `local_ts`/`remote_ts` belt above — the sanitize alone is the right
-  form (NO `escapeSwanctlQuoted`, which is for the quoted `id`/`certs`/
-  `secret` slots): an embedded newline collapses to a space, keeping a
-  tampered endpoint inert on one line instead of injecting a live
-  `version`/`aggressive`/`also` directive into the connection block. A
-  legitimate endpoint is byte-identical (`.`, `,`, `:`, `%` are all
-  preserved, so a single address, a comma-separated multi-address list,
-  an IPv6 literal, and the responder-only `%any` sentinel render
-  unchanged). The commit-time gate (`validateIPsecEndpointsStrict`)
-  rejects a control-char endpoint at commit; this render belt is the
-  by-construction backstop for a validation-bypassed path (HA peer-sync
-  of a pre-fix config, a directly-constructed `IPsecConfig`, or a config
-  persisted before the fix), matching the #1798/#2126/#4098 belt
-  doctrine. The legacy inline `vpn.Gateway` shape is independently
-  filtered by `config.IsUsableIPsecEndpoint` (a control-char value is not
-  a usable endpoint → the VPN is skipped), but the Gateways-map shape
-  took `address`/`dynamic hostname` verbatim — that was the gap.
+- **Endpoint AND proposal list sanitize (#6469).** The remaining raw-`%s`
+  swanctl render slots that carry peer/operator-influenced free text are
+  now run through `sanitizeSwanctlValue`, completing the render belt so
+  that EVERY such slot in `renderConfig` (`policy.go`) is sanitized. Two
+  groups were still raw:
+  - **Endpoints** — the connection `local_addrs = <value>` /
+    `remote_addrs = <value>` lines (the resolved peer/local endpoint from
+    `resolveRemoteAddr` — a gateway `address`/`dynamic hostname`, a
+    `local-address`, an `external-interface`-derived local IP, or the
+    legacy inline `vpn.Gateway`). The legacy inline `vpn.Gateway` shape is
+    independently filtered by `config.IsUsableIPsecEndpoint` (a
+    control-char value is not a usable endpoint → the VPN is skipped), but
+    the Gateways-map shape took `address`/`dynamic hostname` verbatim.
+  - **Proposals** — the connection-level `proposals = <value>` (IKE /
+    Phase 1, `ikeProposals`) and the child-SA `esp_proposals = <value>`
+    (ESP / Phase 2, `espProposals`). `buildIKEProposal` /
+    `buildIKEProposalFromIKE` / `buildESPProposal` append
+    `prop.EncryptionAlg` / `prop.AuthAlg` VERBATIM on the unknown-
+    algorithm fall-through (`normalizeAuthAlg`'s default branch returns
+    the collapsed token unchanged; `normalizeEncAlg`'s generic gcm strip
+    only removes `-cbc`/`-`), so a control character in a peer-synced /
+    directly-constructed proposal reaches the renderer. `esp_proposals`
+    sits INSIDE `children {}` — the same block whose `local_ts`/`remote_ts`
+    belt cites `updown = /tmp/x.sh` executed by charon as **root** — so an
+    injected newline there is a config-injection → root RCE, a strictly
+    worse vector than the endpoint one on the identical
+    validation-bypassed threat model.
+
+  All four are UNQUOTED list slots, so — exactly like the
+  `local_ts`/`remote_ts` belt above — sanitize alone is the right form
+  (NO `escapeSwanctlQuoted`, which is for the quoted `id`/`certs`/`secret`
+  slots): an embedded newline collapses to a space, keeping the tampered
+  value inert on one line instead of injecting a live directive
+  (`version`/`aggressive`/`also` at the connection level, `updown`/
+  `esp_proposals`/`mode`/`mark_*` in the child block). A legitimate value
+  is byte-identical — `sanitizeSwanctlValue` only rewrites C0/DEL control
+  bytes, so `.`, `,`, `:`, `%`, and `-` are all preserved and a single
+  address, a comma-separated multi-address list, an IPv6 literal, the
+  responder-only `%any` sentinel, and a dashed multi-proposal list
+  (`aes256-sha256-modp2048,aes128-sha256-modp2048`) render unchanged. The
+  commit-time gates (`validateIPsecEndpointsStrict` for endpoints, the
+  proposal validators for crypto tokens) reject a control-char value at
+  commit; this render belt is the by-construction backstop for a
+  validation-bypassed path (HA peer-sync of a pre-fix config, a
+  directly-constructed `IPsecConfig`, or a config persisted before the
+  fix), matching the #1798/#2126/#4098 belt doctrine. The remaining
+  interpolated slots are safe by construction: `auth` and `dpd_action`
+  are fixed enums (`authMethodToSwan` errors on any unknown token;
+  `deriveDPD` only emits `restart`/`clear`/`trap`), the `id`/`certs`/
+  `secret` slots already carry the `sanitizeSwanctlValue` +
+  `escapeSwanctlQuoted` belt, connection / child / secret NAMES are
+  sanitized, and every `dpd_delay`/`rekey_time`/`if_id_*` slot is an
+  integer (`%d`).
 - **Injective child-section naming (#5122).** Each traffic selector
   renders one swanctl child section named `<conn>-<sanitizeChildName(ts)>`
   (`effectiveTrafficSelectors` in `policy.go`). `sanitizeChildName` maps
