@@ -1,8 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v3 — r2 findings folded (Codex NEEDS-REVISION 6M/3m; AGY
-  PLAN-READY-WITH-NITS 1M/2m, all 4 r1 findings FOLDED; Claude SMR
-  NEEDS-REVISION 2B/3M/3m); pending convergence review r3
+- **Status**: DRAFT v4 — r3 findings folded (Codex NEEDS-REVISION 3M/3m; AGY
+  PLAN-READY-WITH-NITS 0M/1m, all r2 findings FOLDED; Claude SMR
+  NEEDS-REVISION 1B/2M/2m); pending convergence review r4
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -11,14 +11,16 @@
   `/engineer 2114`.
 - **Revision history**: v1 @ `1d62be758` (initial). v2 @ `61568128f` (r1:
   deleted false invariants, deleted A2, canary redesign, sampler-only scope,
-  snapshot boundaries, table regeneration). v3: r2 convergence — kind-gated
-  typed-nil guard (B1); corrected four-link bootstrap/cluster mutual-
-  exclusion proof replacing v2's over-broad "class D eliminated" swing (B2);
-  STRUCTURALLY sampler-only adapter via a narrowed
-  `fwdstatus.CachedStatusProvider` interface (M1); deterministic real-sampler
-  barrier spec (M2); untruncated audit table with exact counts (M3);
-  transition-test start-state, Option D text, docs/comment/canary/smoke
-  specifics (m1-m3).
+  snapshot boundaries, table regeneration). v3 @ `f0c1605cd` (r2: kind-gated
+  typed-nil, four-link exclusion, STRUCTURAL sampler-only via
+  `CachedStatusProvider`, real-sampler barrier, untruncated table). v4: r3
+  convergence — corrected the real-sampler barrier so it no longer
+  happens-before-orders the conflicting accesses (two-sided gate;
+  cancel+quiesce teardown); exact reference count 134 = 5 writers + 129
+  readers with per-row classification fixes; RACE-1 scoped to the
+  pre-publication watcher chain only; typed-nil kind-gate broadened to all
+  nillable kinds; Option D rejection restated honestly; comment sweep
+  extended.
 
 ---
 
@@ -33,9 +35,9 @@ tests).
 
 The issue remains OPEN on the Paladin-audit **residual**: the field `d.dp
 dataplane.RuntimeDataPlane` (`pkg/daemon/daemon.go:73`) is a plain interface
-field with **5 writers** and **128 unsynchronized or non-locally-synchronized
-read sites** in `pkg/daemon` (133 non-comment greppable references total —
-exact enumeration in §5.4). Required closeout (verbatim):
+field with **5 writers** and **129 read sites** in `pkg/daemon` (134
+non-comment greppable references total — exact enumeration in §5.4), most
+of them unsynchronized or synchronized only by non-local reasoning. Required closeout (verbatim):
 
 1. Publish the runtime dataplane through one synchronized/immutable accessor
    used by **every reader and writer**, or bind the sampler to an immutable
@@ -55,13 +57,18 @@ no cycles/MB/retransmits to win back. The win, at absolute scale:
 
 - **Eliminates a real data race on a multiword Go interface value** on two
   structurally distinct, reviewer-verified interleavings:
-  - **RACE-1 (HA boot publication — no bootstrap needed)**: `initManagers`
-    starts the cluster event watcher (`daemon_run_bringup.go:203`; the
-    election inside `UpdateConfig` at :181 can synchronously enqueue the
-    initial transition) BEFORE `setupDataplaneAndInitialConfig` assigns
-    `d.dp` (:448/:469/:497). The watcher reads `d.dp` at `daemon_ha.go:297`
-    with no happens-before edge to the assignment. Every HA background
-    reader is exposed to this window.
+  - **RACE-1 (HA boot publication — no bootstrap needed, WATCHER-CHAIN
+    ONLY)**: `initManagers` starts the cluster event watcher
+    (`daemon_run_bringup.go:203`; the election inside `UpdateConfig` at :181
+    can synchronously enqueue the initial transition) BEFORE
+    `setupDataplaneAndInitialConfig` assigns `d.dp` (:448/:469/:497). The
+    watcher's event-handler chain reads `d.dp` at
+    `daemon_ha.go:297,299,337,348,362,367` with no happens-before edge to
+    the assignment. **Scope note (r3)**: this is the ONLY pre-publication
+    reader chain — every other HA goroutine (`startClusterComms`
+    `daemon_run.go:396`, VRRP watcher :578, reconcile :582, session sync
+    `daemon_ha_sync.go:790`) starts AFTER publication and is
+    goroutine-start HB-safe against the boot writer.
   - **RACE-2 (bootstrap-exit arm failure — standalone/bootstrap nodes)**:
     `runBootstrapExitStartup` writes `d.dp = nil`
     (`daemon_run_naming.go:234`) on the apply goroutine under `d.applySem`
@@ -89,14 +96,15 @@ no cycles/MB/retransmits to win back. The win, at absolute scale:
   (`daemon_apply_commit.go:364-379`); (iv) `enterBootstrapMode` fires only
   for a nil rollback target (`daemon_apply_commit.go:650-652`), which cannot
   follow a config that had a live cluster runtime. HA readers are therefore
-  RACE-1-reachable but RACE-2-unreachable; they are converted uniformly
-  anyway (RACE-1 reaches them, and issue requirement #1 demands one
-  mechanism for every reader and writer).
+  RACE-2-unreachable, and only the watcher chain is RACE-1-reachable; the
+  remaining HA readers are converted for UNIFORMITY (issue requirement #1:
+  one mechanism for every reader and writer), not because a live race
+  reaches them today.
 - **Converts non-local safety arguments into local ones.** r1/r2 review
   proved two of the plan's own non-local arguments false as stated. One
   publication mechanism makes each of the 128 read sites locally correct
   and keeps it correct when the next runtime writer appears.
-- **Cost**: ~133 production references + ~110 test sites (32 selector-style
+- **Cost**: ~134 production references + ~110 test sites (32 selector-style
   + ~79 `Daemon{dp: ...}` keyed literals) in `pkg/daemon`; 3 files in
   `pkg/fwdstatus`; the field is package-private, zero references outside
   `pkg/daemon`. No Rust/helper/FFI changes; no packet-path changes.
@@ -157,19 +165,26 @@ func (d *Daemon) dataplane() dataplane.RuntimeDataPlane {
 }
 
 // setDataplane publishes dp (nil clears). The kind-gated typed-nil check
-// keeps a non-nil interface wrapping a nil pointer out of the cell WITHOUT
-// panicking on value-type implementations (r2: reflect.IsNil panics on
-// non-nillable kinds; RuntimeDataPlane has no pointer-only constraint and
-// the registry at pkg/dataplane/dataplane.go:152,215 returns arbitrary
-// constructor results unchecked).
+// keeps a non-nil interface wrapping a nil value out of the cell WITHOUT
+// panicking on non-nillable kinds (r2: reflect.IsNil panics on struct
+// values) and WITHOUT missing non-pointer nillable kinds (r3: named
+// Chan/Func/Map/Slice types can have methods — in-repo precedent
+// pkg/dataplane/userspace/wire_uint8list.go:32). RuntimeDataPlane has no
+// pointer-only constraint and the registry (pkg/dataplane/dataplane.go:152,
+// 215) returns arbitrary constructor results unchecked.
 func (d *Daemon) setDataplane(dp dataplane.RuntimeDataPlane) {
     if dp == nil {
         d.dpCell.Store(nil)
         return
     }
-    if v := reflect.ValueOf(dp); v.Kind() == reflect.Pointer && v.IsNil() {
-        d.dpCell.Store(nil)
-        return
+    v := reflect.ValueOf(dp)
+    switch v.Kind() {
+    case reflect.Chan, reflect.Func, reflect.Map,
+        reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+        if v.IsNil() {
+            d.dpCell.Store(nil)
+            return
+        }
     }
     d.dpCell.Store(&dpSlot{v: dp})
 }
@@ -261,14 +276,18 @@ precedent, cheaper reads, hold-nothing-by-construction.
 ### Option D: immutable owner + atomic presence flag (r1 addition, REJECTED)
 
 Write-once `dpOwner` + `atomic.Bool dpPresent`; arm failure clears only the
-flag. It CAN represent never-constructed (`owner == nil && !present`) and
-cleared (`owner != nil && !present`) — r2 correction of v2's misstatement.
-Rejected on its real weaknesses: two-word state demands a flag-then-load
-ordering discipline from every reader with zero compiler help; identity is
-lost for post-clear introspection (`%T` logging, shutdown final stats); a
-future republish reintroduces tearing across the two words. A1 carries
-identity+presence in ONE atomic word; D's only edge (no per-store
-allocation) is noise at ≤5 stores/lifetime.
+flag. It cleanly represents never-constructed (`owner == nil && !present`)
+vs cleared (`owner != nil && !present`), and the immutable owner RETAINS
+identity for post-clear introspection (`%T` logging, shutdown final stats)
+— a genuine advantage over A1's nil-slot (which discards identity on clear).
+Rejected on its real weaknesses: (a) two-word state requires every reader
+to follow a flag-then-load ordering discipline with zero compiler help (A1
+makes the correct read the only read; D would need its own canary to be
+enforced); (b) the write-once premise forbids backend REPLACEMENT by
+construction — a future hot-swap/re-arm with a fresh object cannot be
+expressed, whereas A1 republishes trivially; (c) it deviates from the
+merged #2116 `atomic.Pointer` precedent. A1 carries identity+presence in
+ONE atomic word and is the simpler invariant to hold.
 
 ### Option E: per-consumer lifecycle gating
 
@@ -340,35 +359,42 @@ coexistence) is deleted as incoherent (r1 B3).
 
 ### 5.4 Reader audit table (issue requirement #4 — untruncated, exact)
 
-133 non-comment greppable production references (pattern
-`'d\.dp\b|a\.daemon\.dp\b'` over `pkg/daemon/*.go` minus `_test.go` and
-comment lines): **5 writers + 128 readers**. Classes: **W** = writer;
-**APPLY** = applySem-serialized reader; **BOOT-SYNC** = Run-goroutine read
-before any server can deliver a commit; **CONCURRENT** = background/request
-goroutine reader. Reachability: RACE-2 reaches only standalone/bootstrap
-consumers (§2 four-link exclusion); RACE-1 reaches every CONCURRENT reader
-on any node where the cluster watcher (or any pre-publication goroutine)
-runs. The compiler (field retype) proves the conversion total; this table
-is the classification snapshot.
+**134 executable production references** (163 greppable lines over
+`pkg/daemon/*.go` minus `_test.go` matching `'d\.dp\b|a\.daemon\.dp\b'`,
+minus 29 full-line comments): **5 writers + 129 readers**. Classes:
+**W** = writer; **APPLY** = applySem-serialized reader; **BOOT-SYNC** =
+Run-goroutine read before any server can deliver a commit; **CONCURRENT** =
+background/request-goroutine reader. Reachability: RACE-2 reaches only
+standalone/bootstrap consumers (§2 four-link exclusion); RACE-1 reaches
+ONLY the pre-publication watcher chain (§2 scope note). Everything else is
+converted for uniformity, not reachability. The compiler (field retype)
+proves the conversion total; this table is the classification snapshot.
 
 | File:lines | Context | Class | RACE exposure |
 |---|---|---|---|
 | `daemon_run_bringup.go` 448,464,469,497 | boot writes | W | — |
 | `daemon_run_naming.go` 234 | bootstrap-exit write | W | — |
-| `daemon_forwarding_status.go` 21,24,36,39,97,100,108,111,124,128 | sampler tick + adapter construction | CONCURRENT | RACE-2 (sampler) |
+| `daemon_forwarding_status.go` 108,111,124,128 | sampler tick (`CachedStatus`) + adapter construction | CONCURRENT | RACE-2 (sampler) |
+| `daemon_forwarding_status.go` 21,24,36,39,97,100 | `IsLoaded`/`GetMapStats`/`Status` methods — DELETED by the narrowing, not converted | — | — |
 | `daemon_run_servers.go` 409,412 | REST simulator probe | CONCURRENT | RACE-2 |
 | `daemon_neighbor_listener.go` 304,307,473 | netlink listener/regen (started when `ActiveConfig() != nil` at boot, `daemon_run.go:518-533` — incl. never-committed-restart bootstrap) | CONCURRENT | RACE-2 |
-| `daemon_ha_userspace_stream.go` 67,122,235,259 | event stream/delta; :122 launched when `d.cluster == nil` (`daemon_run.go:365`) — STANDALONE | CONCURRENT | RACE-2 |
-| `daemon_natpoolalarm.go` 18,21,101 | monitor sampler + gate (#2116-gated) | CONCURRENT | RACE-2 (gated) |
-| `daemon_run.go` 312,324 | `er.AddCallback` per-SESSION_OPEN reads (registered :288 iff `getSessionSync() != nil`) | CONCURRENT | RACE-1 |
+| `daemon_ha_userspace_stream.go` 67,122,235,259 | event stream/delta; launched when `d.cluster == nil` (`daemon_run.go:365`) — STANDALONE; :67,122 capture-once at start, :235,259 per-call | CONCURRENT | RACE-2 |
+| `daemon_natpoolalarm.go` 18,21 | monitor sampler goroutine (#2116 lifecycle-gated) | CONCURRENT (gated) | gated off by lifecycle |
+| `daemon_natpoolalarm.go` 101 | start gate (boot block + `runBootstrapExitStartup` under applySem) | APPLY/BOOT-SYNC | serialized |
+| `daemon_run.go` 312,324 | `er.AddCallback` per-SESSION_OPEN reads (registered :288 iff `getSessionSync() != nil`, post-publication) | CONCURRENT | unreachable-by-writer (uniformity) |
 | `daemon_run.go` 611,612 | CLI probe after gRPC start (:598) | CONCURRENT | RACE-2 (micro-window) |
-| `daemon_run_servers.go` 117,118,255,256 | gRPC/API construction probes (HTTP :588, gRPC :598) | CONCURRENT | RACE-2 (micro-window) |
-| `daemon_run_shutdown.go` 161,167,173,214,219,220,225,229 | shutdown (applySem released at :50) | CONCURRENT | RACE-2 |
-| `daemon_ha_fabric.go` 533,537,554,555,567,570,724,728,750,753 | fabric probe/refresh goroutines | CONCURRENT | RACE-1 |
-| `daemon_ha_sync.go` 193,299,300,311,733,750,1117,1124,1164,1165,1286,1297 | watchdog/sync/fence/SetRuntime goroutines | CONCURRENT | RACE-1 |
-| `daemon_ha.go` 297,299,337,348,362,367,542,549,578,583,813,826,842,1521,1531,1545 | VRRP/RG watcher, reconcile, warm cache | CONCURRENT | RACE-1 |
-| `daemon_ha_userspace_readiness.go` 202,230,233 | takeover-readiness probes | CONCURRENT | RACE-1 |
-| `daemon_health.go` 141 | standby-neighbor refresh (session-sync trigger, `daemon_ha_sync.go:970`) | CONCURRENT | RACE-1 |
+| `daemon_run_servers.go` 117,118 | gRPC construction probes (HTTP already serving) | CONCURRENT | RACE-2 (micro-window) |
+| `daemon_run_servers.go` 255,256 | API construction probes (before HTTP serving starts) | BOOT-SYNC | program order |
+| `daemon_run_shutdown.go` 161,167,173 | HA-only rg_active clear (requires cluster config) | CONCURRENT | unreachable via exclusion (uniformity) |
+| `daemon_run_shutdown.go` 214,219,220,225,229 | final stats / Close / Teardown (applySem released at :50) | CONCURRENT | RACE-2 |
+| `daemon_ha_fabric.go` 533,537,554,555,567,570,724,728,750,753 | fabric probe/refresh goroutines (post-publication start) | CONCURRENT | uniformity |
+| `daemon_ha_sync.go` 193,299,300,311,733,750,1117,1124,1164,1165,1286,1297 | watchdog/sync/fence/SetRuntime goroutines (post-publication start) | CONCURRENT | uniformity |
+| `daemon_ha.go` 297,299,337,348,362,367 | `watchClusterEvents` handler chain (started `daemon_run_bringup.go:203`, PRE-publication) | CONCURRENT | **RACE-1** |
+| `daemon_ha.go` 542,549,578,583 | `watchVRRPEvents` (:511-604, post-publication) | CONCURRENT | uniformity |
+| `daemon_ha.go` 813,826,842 | `reconcileRGState` (:707+, post-publication) | CONCURRENT | uniformity |
+| `daemon_ha.go` 1521,1531,1545 | `warmNeighborCache` (:1520, failover paths, post-publication) | CONCURRENT | uniformity |
+| `daemon_ha_userspace_readiness.go` 202,230,233 | takeover-readiness probes (post-publication) | CONCURRENT | uniformity |
+| `daemon_health.go` 141 | standby-neighbor refresh (session-sync trigger, `daemon_ha_sync.go:970`, post-publication) | CONCURRENT | uniformity |
 | `daemon_apply_dataplane.go` 53,98,122,139,141,293,295,390,393,397,455,459,463,482,485,497,501,505 | apply path (incl. `reapplyAfterDeferredMAC`, `recordDataplaneWorkerArmDebt`) | APPLY | serialized |
 | `daemon_apply_tail.go` 491,494 | apply path | APPLY | serialized |
 | `daemon_apply_interfaces.go` 42 | apply path | APPLY | serialized |
@@ -376,8 +402,8 @@ is the classification snapshot.
 | `daemon_scheduler.go` 211,221,224,230,239 | scheduler republish under applySem | APPLY | serialized |
 | `daemon_ipmon.go` 304 | route-overlay actuate under applySem | APPLY | serialized |
 | `daemon_policy_invalidate.go` 286,290 | callers hold applySem (:114-116; `daemon_apply_commit.go:270`) | APPLY | serialized |
-| `daemon_system.go` 41 | applySyslogConfig (apply path) | APPLY | serialized |
-| `daemon.go` 1012 | `applyResult()` (apply-path caller) | APPLY | serialized |
+| `daemon_system.go` 41 | applySyslogConfig (boot-time and apply-path callers) | APPLY/BOOT-SYNC | serialized |
+| `daemon.go` 1012 | `applyResult()` (boot-time and apply-path callers) | APPLY/BOOT-SYNC | serialized |
 | `bootstrap.go` 472,473 | rollback teardown under applySem | APPLY | serialized |
 | `daemon_run_naming.go` 230,231,236 | exit arm block (nil-check, Start, seeder) | APPLY | serialized (writer site) |
 | `daemon_run_bringup.go` 476,477,493,494,506 | boot post-construct reads (same goroutine as W) | BOOT-SYNC | program order |
@@ -393,10 +419,14 @@ is the classification snapshot.
 - Source comments contradicting the rollback recurrence get reworded in
   the same PR: `daemon_run_naming.go:200-206` ("one-way ... at most once"),
   `bootstrap.go:284-289` ("one-way for the daemon's lifetime"),
-  `daemon_apply.go:213-220` ("Exit is one-way") — the recurrence
-  (exit → `enterBootstrapMode` → re-exit) is real and now tested; the
-  comments must say "one-way per bootstrap episode; rollback can re-enter"
-  (r2 Codex MINOR 3).
+  `daemon_apply.go:213-220` ("Exit is one-way"), plus the r3 additions
+  `daemon.go:901`, `bootstrap.go:276` ("written once at startup and at most
+  once more"), `bootstrap.go:303` ("re-suppress takeover for the daemon's
+  lifetime"), and `cluster_topology_preflight.go:117`'s stale
+  `daemon_run.go:1868` cite (now `daemon_run_bringup.go:164`) — the
+  recurrence (exit → `enterBootstrapMode` → re-exit) is real and now
+  tested; the comments must say "one-way per bootstrap episode; rollback
+  can re-enter" (r2 Codex MINOR 3, r3 Codex MINOR 3).
 - `docs/` sweep: `docs/ha-failover-status.md:279`,
   `docs/ha-no-hitless-restart.md:22`, `docs/rib-group-route-leaking.md:94`
   (the /engineer pass greps `docs/` for `d\.dp` and updates or justifies
@@ -445,9 +475,10 @@ Preserved exactly:
 6. **Terminal nil**: nothing re-publishes a backend on current master; the
    accessor is correct under ANY Store sequence; tests assert observable
    post-nil state without relying on terminality for safety.
-7. **Typed-nil exclusion without panic**: kind-gated guard (§4 A1); a
-   value-type implementation Stores normally; a typed-nil pointer Stores as
-   nil. Both shapes covered by unit tests (r2 B1).
+7. **Typed-nil exclusion without panic**: kind-gated guard over ALL
+   nillable kinds (§4 A1); a value-type implementation Stores normally; a
+   typed-nil of any nillable kind (pointer, named slice/map/chan/func)
+   Stores as nil. All shapes covered by unit tests (r2 B1, r3 m1).
 8. **Shutdown ordering** (#5807): two snapshots per §5.3 rule 5; post-nil
    shutdown skips final stats exactly as today.
 9. **Allocation rules**: one `dpSlot` per Store (≤5/lifetime); zero per
@@ -475,9 +506,11 @@ Preserved exactly:
      `applyResult()`, a `PolicySchedulerActiveStateFn`-shape probe, the NAT
      pool sampler closure, a watchdog-shape per-tick load) while a writer
      alternates `setDataplane(nil)` / `setDataplane(fake)`. Revert-guard.
-   - `TestDataplaneCell_TypedNilAndValueShapes` (r2 B1) — a typed-nil
-     pointer fake Stores as nil (`d.dataplane() == nil`); a value-receiver
-     fake Stores normally (no panic, non-nil read).
+   - `TestDataplaneCell_TypedNilAndValueShapes` (r2 B1, r3 broadened) — a
+     typed-nil pointer fake Stores as nil (`d.dataplane() == nil`); a
+     value-receiver fake Stores normally (no panic, non-nil read); a
+     typed-nil named-slice fake (methods on a named slice type, per the
+     `wire_uint8list.go:32` precedent) Stores as nil.
    - `TestForwardingStatusAdapter_BackendTypeTransitions` — start
      `readyProbeOnlyFake` (adapter `CachedStatus` ok=false) →
      `setDataplane(userspaceFake)` (ok=true, injected status) →
@@ -491,14 +524,33 @@ Preserved exactly:
      from `runBootstrapExitStartup` so the test avoids the netlink/sysctl
      takeover steps); failing-Start fake; churn readers; assert `-race`
      clean, `d.dataplane() == nil`, monitor not started.
-   - `TestBootstrapExit_RealSamplerOverlap` (r2 M2 — deterministic barrier,
-     NO ticker seam): blocking fake `CachedStatus` (entered/release
-     channels); start the REAL `fwdstatus.Sampler` (`Start` runs one sample
-     SYNCHRONOUSLY, `sampler.go:64-67`); wait for the priming sample to
-     ENTER the fake; run `armBootstrapExitDataplane` with the failing
-     Start; release; cancel; join. Guarantees the sampler-tick-vs-writer
-     overlap the issue demands; barrier the direct status/probe reader
-     loops the same way.
+   - `TestBootstrapExit_RealSamplerOverlap` (r2 M2, r3 B1 — the barrier
+     must NOT happens-before-order the conflicting accesses): the adapter's
+     `CachedStatus` loads `d.dataplane()` BEFORE invoking the provider, so
+     a gate inside the provider's `CachedStatus` would serialize
+     `read(d.dp) → entered → writer`, keeping even the pre-fix plain field
+     race-clean (silent green). The gate must therefore sit BEFORE the
+     `d.dp` access on BOTH sides with NO channel between the two
+     conflicting accesses:
+     - Reader side: the fake `ProcReader.ReadSelfStat` (which
+       `Sampler.sample()` calls before touching the adapter,
+       `sampler.go:93`) signals `readerEntered` and blocks on a shared
+       `release` channel. `go fwdSampler.Start(ctx)` — `Start` MUST run on
+       its own goroutine because its prime sample is synchronous
+       (`sampler.go:64-67`).
+     - Writer side: the failing fake dataplane's `Start()` signals
+       `writerEntered` and blocks on the SAME `release` before returning
+       its error (the `setDataplane(nil)` store happens after `Start`
+       returns in `armBootstrapExitDataplane`).
+     - Test: wait for BOTH `readerEntered` and `writerEntered`, then
+       `close(release)`. The adapter's `d.dp` load and the writer's store
+       now proceed with no happens-before edge between them: on the plain
+       field the race detector fires (only the ABSENCE of an HB edge is
+       required — deterministic as a memory-model proposition, not a
+       timing one); on the atomic cell it is clean.
+     - Teardown: the sampler loop exposes no join handle (`Start` returns
+       nothing) — `cancel(ctx)` and quiesce-poll the fake `ReadSelfStat`
+       call counter until it stops increasing, instead of joining.
    - `TestDataplaneCell_RollbackRearmRecurrence` — real helpers: successful
      arm → monitor starts → `enterBootstrapMode` (discarded) → re-exit with
      failing Start → `d.dataplane() == nil`, no monitor, `-race` clean with
@@ -550,19 +602,22 @@ Preserved exactly:
   ENABLES it safely later).
 - Full-repo `go test -race` wiring.
 
-## 11. Open questions for adversarial review (r3)
+## 11. Open questions for adversarial review (r4)
 
-Resolved in v2/v3 (for the record): A2 deletion; atomic cell choice;
+Resolved in v2/v3/v4 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
 policy-invalidate APPLY-class; HA smoke gates mandatory + specific;
-typed-nil kind-gated guard; docs scope (README architecture + :936 +
-docs/ sweep + stale comments + `_Log.md`); audit table completeness;
-deterministic real-sampler barrier; four-link bootstrap/cluster exclusion.
+typed-nil kind-gated guard over all nillable kinds; docs scope (README
+architecture + :936 + docs/ sweep + stale comments + `_Log.md`); audit
+table completeness AND exact count (134 = 5 + 129); deterministic
+real-sampler barrier redesigned as a two-sided gate that cannot
+happens-before-order the conflicting accesses; four-link bootstrap/cluster
+exclusion; RACE-1 scoped to the pre-publication watcher chain.
 
 Still open:
 
 1. **PLAN-KILL fork**: with RACE-1 and RACE-2 both proven structural, does
-   any reviewer still judge the ~240-site conversion (133 prod + ~110 test)
+   any reviewer still judge the ~244-site conversion (134 prod + ~110 test)
    unjustified? A PLAN-KILL here means accepting both races as documented
    known-issues — state the reasoning explicitly if so.
 2. The `CachedStatusProvider` narrowing (§4 A1) is the one intentional
