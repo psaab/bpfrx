@@ -3548,15 +3548,28 @@ reserved for whole-dataplane selection where a rewrite shim
     mapped-port form is a port-scoped 1:1 (no port translation); rejecting
     it at strict commit-check forces the operator to either drop the port
     match (a whole-address 1:1) or add a `mapped-port` (a port forward).
-    Two refinements land in the #6479 fold. First, every `mapped-port`
-    occurrence is scanned across BOTH AST shapes (the collapsed-keys leaf
-    and the hierarchical `static-nat { prefix X; mapped-port P; }` sibling
-    form) via `combineMappedPortOperands`, not just the first: duplicate
-    operands are last-wins ONLY when they are all valid in-range numbers; a
-    contradictory duplicate (e.g. `mapped-port 8080 mapped-port notaport`)
-    fails closed — any malformed occurrence zeroes the port and the strict
-    gate names the bad token. Second, the port-match-without-mapped-port
-    (#2769) gate is guarded on `!MappedPortPresent` so it fires ONLY on a
+    Two refinements land in the #6479 fold. First,
+    `staticNATMappedPortForNode` gathers every `mapped-port` operand
+    attached to a `then static-nat` node — the collapsed-keys `prefix`
+    leaf, a hierarchical `static-nat { prefix X; mapped-port P; }` sibling,
+    AND every child of a duplicate split across two
+    `then static-nat prefix <ip> mapped-port <p>` set lines — into ONE list
+    folded through `combineMappedPortOperands` exactly once. Duplicate
+    operands are last-wins ONLY when they are all valid in-range numbers
+    (`mapped-port 8080 mapped-port 9090` → 9090); a contradictory duplicate
+    in ANY shape or ACROSS nodes (e.g. `mapped-port 8080 mapped-port
+    notaport`) fails closed — any malformed occurrence zeroes the port and
+    the strict gate names the bad token, with no first-wins gate that could
+    let a later malformed duplicate slip past an earlier valid one. The scan
+    is grammar-POSITION-aware (`staticNATMappedPortOperandsFromKeys`): a
+    `mapped-port` token that is the free-form VALUE of an immediately
+    preceding `routing-instance <ri>` or `prefix <addr>` is NOT a modifier,
+    so a translation-target routing-instance NAMED `mapped-port`
+    (`then static-nat prefix <ip> routing-instance mapped-port`, #4292)
+    compiles clean instead of being falsely rejected as a bare mapped-port
+    (the fold-introduced false positive this refinement closes). Second, the
+    port-match-without-mapped-port (#2769) gate is guarded on
+    `!MappedPortPresent` so it fires ONLY on a
     true absence: a present-but-malformed mapped-port that also carries a
     `match destination-port` is owned solely by the presence gate (which
     names the token), never double-reported by the absence gate — which,

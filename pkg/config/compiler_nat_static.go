@@ -67,34 +67,80 @@ func applyStaticNATFromScope(rs *StaticNATRuleSet, s natMatchScope) {
 	}
 }
 
-// staticNATMappedPortFromKeys extracts the `mapped-port <port>` modifier(s)
-// from a flat-set static-NAT leaf's collapsed Keys (#2491). The lexer
-// collapses `then static-nat prefix <ip> mapped-port <port>` onto one node
-// whose Keys are `["static-nat","prefix","<ip>","mapped-port","<port>"]`
-// because `static-nat` is a children:nil schema leaf, so this in-leaf token
-// bypasses the schema value validator.
+// staticNATMappedPortOperandsFromKeys returns the operand token trailing each
+// GENUINE `mapped-port` modifier in a static-NAT `then` node's collapsed Keys,
+// in AST order (#2491, #6479 grammar-position fix). The lexer collapses
+// `then static-nat prefix <ip> mapped-port <port>` onto one leaf whose Keys are
+// `["prefix","<ip>","mapped-port","<port>"]` (or, on the static-nat node itself,
+// `["static-nat","prefix","<ip>","mapped-port","<port>"]`) because `static-nat`
+// is a children:nil schema leaf, so this in-leaf token bypasses the schema
+// value validator and must be recovered here.
 //
-// It scans EVERY `mapped-port` occurrence (not just the first) and folds them
-// through combineMappedPortOperands so a contradictory duplicate fails closed;
-// a bare trailing keyword contributes an empty operand. The (port, raw,
-// present) triple feeds the strict gate (validateNATHostMaskStrict): present is
-// the explicit presence signal (C179-038 + fold) that MappedPort==0 and raw==""
-// cannot carry on their own (the literal "0", a non-numeric token, an empty
-// operand, and a bare keyword all collapse to port 0 / raw "").
-func staticNATMappedPortFromKeys(keys []string) (port int, raw string, present bool) {
+// A `mapped-port` token is a modifier ONLY in modifier position. It is SKIPPED
+// when it is the free-form VALUE of an immediately preceding `routing-instance`
+// or `prefix` keyword: both take an arbitrary following token that can legally
+// be the literal string "mapped-port" (a translation-target routing-instance
+// NAMED "mapped-port", #4292; or a prefix value that is that string). Treating
+// such a value as a bare mapped-port modifier would falsely reject an otherwise
+// clean rule — the #6479 fold-introduced false positive this guard closes. A
+// genuine modifier with no trailing operand (a bare `mapped-port` at the end of
+// the key list) contributes an EMPTY operand so combineMappedPortOperands flags
+// it malformed rather than dropping the occurrence.
+func staticNATMappedPortOperandsFromKeys(keys []string) []string {
 	var operands []string
 	for i := 0; i < len(keys); i++ {
 		if keys[i] != "mapped-port" {
 			continue
 		}
-		// A bare trailing `mapped-port` (keyword is the last key) has no
-		// operand — record an empty operand so combine flags it malformed
-		// (present=true, raw="") rather than dropping the occurrence.
+		// Grammar-position guard: a "mapped-port" immediately following
+		// `routing-instance` or `prefix` is that keyword's VALUE, not the
+		// modifier keyword — it is never a mapped-port operand source.
+		if i > 0 && (keys[i-1] == "routing-instance" || keys[i-1] == "prefix") {
+			continue
+		}
 		if i+1 < len(keys) {
 			operands = append(operands, keys[i+1])
 		} else {
 			operands = append(operands, "")
 		}
+	}
+	return operands
+}
+
+// staticNATMappedPortForNode folds every genuine `mapped-port` modifier operand
+// attached to a static-nat `then` node — across BOTH AST shapes AND across
+// duplicate target children — into the (port, raw, present) triple the strict
+// gate (validateNATHostMaskStrict) consumes (#2491, C179-038, #6479 fold).
+//
+// It gathers operands from the node's own collapsed Keys, from each `mapped-port`
+// sibling child (the hierarchical `static-nat { prefix X; mapped-port P; }`
+// shape), and — grammar-position-aware — from each target child leaf's Keys (the
+// collapsed `prefix <ip> mapped-port <port>` flat-set shape, INCLUDING every
+// child of a cross-node duplicate authored as two `then static-nat prefix <ip>
+// mapped-port <p>` set lines). It then folds the WHOLE operand list through
+// combineMappedPortOperands ONCE, so last-wins applies when every occurrence is
+// a valid 1-65535 and a malformed occurrence in ANY shape or ANY duplicate fails
+// closed. There is no first-wins gate that could let a later malformed duplicate
+// slip past an earlier valid one (the #6479 cross-node first-wins bug).
+//
+// The (port, raw, present) triple feeds the strict gate: present is the explicit
+// presence signal (C179-038 + fold) that MappedPort==0 and raw=="" cannot carry
+// on their own (the literal "0", a non-numeric token, an empty operand, and a
+// bare keyword all collapse to port 0 / raw "").
+func staticNATMappedPortForNode(t *Node) (port int, raw string, present bool) {
+	operands := staticNATMappedPortOperandsFromKeys(t.Keys)
+	for _, c := range t.Children {
+		if c.Name() == "mapped-port" {
+			// Hierarchical sibling: the operand is the child leaf's value
+			// (nodeVal handles the value-in-Keys and value-as-child shapes).
+			operands = append(operands, nodeVal(c))
+			continue
+		}
+		// A target child leaf (`prefix <ip> [mapped-port <p>] [routing-instance
+		// <ri>]`), scanned grammar-aware so a `mapped-port` that is really a
+		// routing-instance/prefix VALUE is skipped. Every child of a cross-node
+		// duplicate is scanned, so a malformed later duplicate fails closed.
+		operands = append(operands, staticNATMappedPortOperandsFromKeys(c.Keys)...)
 	}
 	return combineMappedPortOperands(operands)
 }
@@ -102,9 +148,10 @@ func staticNATMappedPortFromKeys(keys []string) (port int, raw string, present b
 // combineMappedPortOperands folds one-or-more `mapped-port` operands (the
 // tokens trailing each `mapped-port` keyword, in AST order) into the
 // (port, raw, present) triple the strict gate (validateNATHostMaskStrict)
-// consumes. It is shared by the flat collapsed-keys scan
-// (staticNATMappedPortFromKeys) and the hierarchical sibling scan in
-// compileNATStatic so BOTH AST shapes fail closed identically.
+// consumes. It is called once per static-nat `then` node by
+// staticNATMappedPortForNode over the UNION of operands from every AST shape
+// (collapsed keys, sibling `mapped-port` child, and duplicate target children)
+// so all shapes and duplicates fail closed identically.
 //
 // Returns (C179-038 + #6479 fold):
 //   - no operands:                    (0, "",          false) — keyword absent.
@@ -327,43 +374,33 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							rule.ThenPrefixName = nodeVal(pn)
 						} else if len(t.Keys) >= 3 && t.Keys[1] == "prefix" {
 							rule.Then = t.Keys[2]
-							// #2491: optional trailing `mapped-port <port>`.
-							// Flat-set collapses the whole `prefix <ip>
-							// mapped-port <port>` onto this one leaf's Keys
-							// (`static-nat` is a children:nil schema leaf), so
-							// scan for the keyword + value pair.
-							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortFromKeys(t.Keys)
+							// #2491 / #6479: recover the optional `mapped-port
+							// <port>` modifier(s). Flat-set collapses `prefix
+							// <ip> mapped-port <port>` onto this leaf's Keys
+							// (`static-nat` is a children:nil schema leaf).
+							// staticNATMappedPortForNode folds every occurrence
+							// — here and on any sibling/duplicate child —
+							// through one combine so a malformed operand in any
+							// shape fails closed, and skips a `mapped-port` that
+							// is actually a routing-instance/prefix VALUE.
+							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortForNode(t)
 						} else if pn := t.FindChild("prefix"); pn != nil {
 							rule.Then = nodeVal(pn)
-							// #2491: `then static-nat prefix <ip> mapped-port
-							// <port>` collapses onto the `prefix` child's Keys
-							// (`["prefix","<ip>","mapped-port","<port>"]`)
-							// because `static-nat` is a children:nil schema
-							// leaf, so the modifier rides on the prefix leaf,
-							// not a sibling `mapped-port` node. Scan pn.Keys.
-							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortFromKeys(pn.Keys)
-							// Hierarchical shape `static-nat { prefix X;
-							// mapped-port P; }` carries the modifier as a
-							// sibling child. Consult siblings ONLY when the
-							// collapsed keys did not carry a mapped-port (else
-							// the flat-set value wins). Scan ALL sibling
-							// `mapped-port` nodes (not just FindChild's first)
-							// so a contradictory duplicate fails closed through
-							// combineMappedPortOperands, and record presence +
-							// the raw token even for an empty / non-numeric
-							// sibling so the strict gate rejects it instead of
-							// collapsing silently to MappedPort==0.
-							if !rule.MappedPortPresent {
-								var sibOps []string
-								for _, c := range t.Children {
-									if c.Name() == "mapped-port" {
-										sibOps = append(sibOps, nodeVal(c))
-									}
-								}
-								if len(sibOps) > 0 {
-									rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = combineMappedPortOperands(sibOps)
-								}
-							}
+							// #2491 / C179-038 / #6479: recover the `mapped-port
+							// <port>` modifier(s) across every AST shape at once.
+							// The modifier may ride on the `prefix` child's
+							// collapsed Keys (`["prefix","<ip>","mapped-port",
+							// "<port>"]`), on a distinct `mapped-port` sibling
+							// child (`static-nat { prefix X; mapped-port P; }`),
+							// or be split across DUPLICATE `then static-nat
+							// prefix <ip> mapped-port <p>` children (two set
+							// lines). staticNATMappedPortForNode folds them all
+							// through one combine — fail-closed on any malformed
+							// occurrence, no first-wins gate — and skips a
+							// `mapped-port` that is a routing-instance/prefix
+							// VALUE (a routing-instance NAMED "mapped-port" no
+							// longer false-rejects).
+							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortForNode(t)
 						} else if t.FindChild("inet") != nil || (len(t.Keys) >= 2 && t.Keys[1] == "inet") {
 							// static-nat { inet; } — NAT64 translation
 							rule.Then = "inet"
