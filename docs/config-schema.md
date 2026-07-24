@@ -1244,6 +1244,22 @@ resolved application (an application-set still expands to its members). Coverage
 `compiler_nat_match_multivalue_3431_test.go` (both AST shapes, all axes) and
 `nat_match_multivalue_3431_test.go` (snapshot expansion).
 
+**A protocol-less `match destination-port` matches tcp AND udp (#6462).** When a
+DNAT rule pins a `match destination-port` but NO `match protocol`, Junos matches
+BOTH TCP and UDP (ports exist only for those two L4s). `buildDestinationNATSnapshots`
+(`pkg/dataplane/userspace/nat_destination.go`) therefore emits one entry under
+`tcp` AND one under `udp` — not a single `tcp` default (the pre-#6462 bug, which
+left UDP to the VIP:port silently untranslated), and not a single `PROTO_ANY`
+entry (that would wrongly translate ICMP/other, and the Rust `DnatTable` lookup
+probes `(proto,dst_ip,dst_port) -> (proto,dst_ip,0) -> (PROTO_ANY,dst_ip,0)` but
+never `(PROTO_ANY,dst_ip,dst_port)`, so a UDP packet could not find a
+`PROTO_ANY`+port row anyway). The two rows are identical except the protocol key
+and share the rule's single counter id, exactly like an explicit `match protocol
+[ tcp udp ]`: a packet is tcp or udp, so it hits exactly one row and the counter
+increments once. An explicit `match protocol` is honored verbatim (no synthetic
+second protocol); a protocol-less rule with NO port stays a single match-any
+(empty-protocol) entry. Coverage: `nat_destination_6462_test.go`.
+
 **A source-NAT pool `address` is multi-value (#4521).** A source pool's
 `address` value carries EVERY IP the SNAT allocator may draw from, in four
 shapes: discrete `set` lines (one `address <ip>;` per IP), a bracket list
@@ -1947,6 +1963,75 @@ The supported IPv6→IPv4 path is the xpf-native `security nat nat64` rule-set
 above (`buildNAT64Snapshots` from `cfg.Security.NAT.NAT64`), which is unaffected.
 Tests: `static_nat_inet_failclosed_5859_test.go` (both `pkg/config` and
 `pkg/dataplane/userspace`).
+
+**A static-NAT rule has EXACTLY ONE translation target (#6483).** A Junos
+`then static-nat` maps to exactly one of `prefix <ip>` | `prefix-name <name>`
+(#4290) | `nptv6-prefix <p6>` | `inet` (#5859). Authoring two or more — both a
+`prefix` and a `prefix-name`, an `inet` sibling alongside a `prefix` sibling, two
+`prefix` targets — is invalid Junos, but the compiler silently accepted it: the
+`compileNATStatic` child loop honors the FIRST target it matches by a fixed
+priority (`nptv6-prefix` > `prefix-name` > `prefix` > `inet`) and drops the rest,
+and because `prefix` / `inet` / `nptv6-prefix` all land in the shared `Then`
+field a later target simply overwrites an earlier one. The rule compiled to one
+arbitrary target with no operator feedback — `inet` + `prefix` even installed as
+a plain prefix rule, EVADING the #5859 `inet` reject. Dropping a target this way
+also dropped any `mapped-port` that rode ONLY on the discarded target (the #6479
+/ C179-038 residual), because that target's node was never the one whose modifier
+the mapped-port fold read. `validateStaticNATSingleTargetStrict` now counts the
+DISTINCT translation targets a rule declares — from the AST during compile
+(`staticNATThenTargetCount`, recorded as `StaticNATRule.ThenTargetCount`), BEFORE
+the fields collapse — and hard-rejects a rule declaring more than one. The count
+is a GRAMMAR-ROLE-AWARE FULL TRAVERSAL (#6484), the SAME slot-classification walk
+the #6479 mapped-port scan uses (`staticNATCollectTargetIdentsFromKeys` mirrors
+`staticNATMappedPortOperandsFromKeys`): it walks the ENTIRE key stream of the
+`static-nat` node AND every child, plus the grandchild values of a bare keyword,
+classifying each position as a KEYWORD slot or a consumed VALUE slot. Reading only
+the FIRST `(keyword, value)` pair per node — the pre-#6484 `Keys[1]`/`Keys[2]` /
+`Children[0]` read — undercounted a rule whose two targets COLLAPSE onto one
+node/child and let it escape: the free-form `static-nat` leaf packs a one-line
+`prefix <ip> prefix-name POOL` / `prefix <ip> inet` / `prefix <ip> prefix <ip2>`
+onto a SINGLE child's Keys, and a hierarchical `prefix { <ip>; <ip2>; }` carries
+two prefix values as grandchildren of ONE `prefix` keyword — all counted 1 and
+ACCEPTED on master (the #6484 MAJOR). The full traversal registers every distinct
+`(keyword, value)` identity across the whole leaf, so these now count 2 and
+reject. A **lexer-collapsed bracketed list** `prefix [ X Y ]` / `prefix-name
+[ A B ]` / `nptv6-prefix [ P6a P6b ]` (#2419 strips the brackets onto one leaf's
+Keys — `["prefix","X","Y"]`) is the same escape in packed form: the round-2
+counter registers EVERY packed value after a target keyword as a distinct target,
+not just the first, so a two-value bracketed list rejects (the round-1 walk
+consumed only the first value and let the rest fall through — a residual #6484
+escape). Two role subtleties make the walk correct: (1) a `prefix-name` value is
+an OPAQUE address-book name that is ALWAYS its value — so `prefix-name mapped-port`
+(a pool literally NAMED "mapped-port") registers a genuine target, not a modifier
+carrier (the pre-#6484 counter wrongly pre-filtered a value equal to a modifier
+keyword and DISCARDED that target). For a packed prefix-name the FIRST token is
+always consumed as the name; only a FOLLOWING keyword lexeme ends the packed-name
+run. (2) a `prefix` / `nptv6-prefix` value is an IP that can never be a modifier
+keyword, so a FOLLOWING `mapped-port` / `routing-instance` IS a modifier carrier
+(the canonical separate-set-line `prefix mapped-port <port>` form) and registers
+no second target. The grandchild walk applies the SAME slot classification: for a
+bare hierarchical `prefix-name { POOL; mapped-port 8080; }` the FIRST grandchild
+is the opaque name (`POOL`) and a LATER modifier grandchild (`mapped-port` /
+`routing-instance`) is skipped — so the rule counts ONE target, not two. The
+round-1 grandchild walk registered EVERY grandchild of a name-valued bare keyword
+as a target, counting `POOL` and `mapped-port` as two and FALSE-REJECTING a valid
+single-target rule that origin/master accepted (the round-2 second finding).
+Counting DISTINCT identities (not occurrences) keeps the canonical "restate the
+target to attach a mapped-port" form — `then static-nat prefix-name N` + `then
+static-nat prefix-name N mapped-port 8080` — a single target (both restatements
+share identity `prefix-name\x00N`). Rejecting the multi-target rule
+outright is the Junos-faithful closure and FORECLOSES the #6479 dropped-target
+mapped-port residual as a side effect (the rule never compiles, so no
+dropped-target modifier can slip). The gate runs in `runTailGates` AFTER the
+host-mask (#2173) and NPTv6 (#2240/#5818) gates, so a rule that ALSO carries a
+malformed `mapped-port` or a bad nptv6 prefix reports that concrete token first
+(the multi-target defect is still caught on the next compile once the token is
+fixed — never masked). Strict on commit / commit-check (hard reject); the
+tolerant load / peer-sync path downgrades to a warning (#1960 no-brick) — the
+compiler still lowers the single honored target, so a leniently-loaded config is
+no worse than before the gate. A well-formed single-target rule (any of the four,
+in any authoring shape, with or without a `mapped-port` / `routing-instance`
+modifier) is unaffected. Tests: `static_nat_multitarget_6483_test.go`.
 
 **The systematic per-subtree closure continues (#4313).** Each of the flips
 above (destination-NAT then, the three IPsec option containers, master-password,
@@ -3675,6 +3760,13 @@ reserved for whole-dataplane selection where a rewrite shim
     `combineMappedPortOperands` fails closed on. In every shape a
     present-but-malformed mapped-port is surfaced (strict reject / lenient
     warn), never silently accepted, and no bogus non-zero port is installed.
+    The one residual this fold could not reach — a malformed mapped-port riding
+    ONLY on a target the compiler DROPS when a rule declares more than one
+    translation target (the dropped target's node is never the one the
+    mapped-port fold reads) — is closed by the single-target cardinality gate
+    (#6483, `validateStaticNATSingleTargetStrict`): a multi-target static-nat
+    rule is rejected outright, so no dropped-target modifier can slip. See "A
+    static-NAT rule has EXACTLY ONE translation target" above.
   - `security nat source/destination rule-set rule match
     destination-address-name <book-entry>` (#3229) — the destination twin
     of the `source-address-name` leaf (#2416). It references an

@@ -472,6 +472,244 @@ func resolveStaticNATThenPrefixNames(sec *SecurityConfig) {
 	}
 }
 
+// staticNATTargetKeywords is the set of `then static-nat` keywords that name a
+// mutually-exclusive TRANSLATION TARGET — the destination a 1:1 rule maps to. A
+// well-formed static-NAT rule declares EXACTLY ONE of them (#6483). They are
+// distinct from the trailing MODIFIER keywords (mapped-port, routing-instance),
+// which refine a target rather than being one.
+var staticNATTargetKeywords = map[string]struct{}{
+	"prefix":       {},
+	"prefix-name":  {},
+	"nptv6-prefix": {},
+	"inet":         {},
+}
+
+// staticNATModifierKeywords are the `then static-nat` trailer keywords that are
+// NOT targets: they refine a target rather than being one. When one follows an
+// IP-VALUED target keyword (prefix / nptv6-prefix, whose value can never be a
+// keyword lexeme) the node is a MODIFIER CARRIER, not a second target — e.g. the
+// canonical Junos separate-set-line `then static-nat prefix mapped-port <port>`
+// collapses to a `prefix` leaf whose value slot is `mapped-port` (#6479 canonical
+// form), and the trailing `routing-instance <ri>` (#4292) rides the same way.
+// staticNATCollectTargetIdentsFromKeys uses this set to skip a modifier carrier
+// so a lone target carrying a modifier still counts as ONE target.
+//
+// This carrier-skip is deliberately NOT applied after a NAME-valued keyword
+// (prefix-name / routing-instance): their value is an OPAQUE address-book / VRF
+// name that may be literally "mapped-port" (#6479 second finding), so the token
+// after such a keyword is ALWAYS its value and is consumed as such — never
+// re-classified as a modifier that would erase the target.
+var staticNATModifierKeywords = map[string]struct{}{
+	"mapped-port":      {},
+	"routing-instance": {},
+}
+
+// isStaticNATKeywordLexeme reports whether tok is a static-nat grammar keyword —
+// a translation-target keyword, a trailing modifier keyword, or the "static-nat"
+// leaf name — as opposed to an operand VALUE. The bracketed/packed multi-value
+// target scan (staticNATCollectTargetIdentsFromKeys) uses it to end a value run:
+// after a `prefix`/`nptv6-prefix`/`prefix-name` keyword its IP prefix or address-
+// book name value can appear one-or-more times (a lexer-collapsed bracketed list,
+// #2419), and the run terminates at the first token that is a grammar keyword —
+// a trailing modifier or a new target — which a bracketed value list never
+// contains. For prefix/nptv6-prefix the value is an IP that can never equal one
+// of these lexemes; for prefix-name the FIRST value is consumed unconditionally
+// (a pool may be NAMED "mapped-port"/"prefix"), so the lexeme test only bounds
+// the SECOND-and-later packed values.
+func isStaticNATKeywordLexeme(tok string) bool {
+	if _, ok := staticNATTargetKeywords[tok]; ok {
+		return true
+	}
+	if _, ok := staticNATModifierKeywords[tok]; ok {
+		return true
+	}
+	return tok == "static-nat"
+}
+
+// staticNATCollectTargetIdentsFromKeys walks a collapsed static-nat key slice —
+// a target child's Keys (`["prefix","<ip>","prefix-name","POOL"]`), the static-nat
+// node's own Keys, or a hierarchical bare keyword's Keys (`["prefix"]`) — in
+// GRAMMAR ORDER and registers a stable IDENTITY into set for every translation
+// target it declares (#6483). It is the SAME slot-classification walk
+// staticNATMappedPortOperandsFromKeys uses for the mapped-port scan (#6479): it
+// tracks whether each position is a KEYWORD slot or a token already CONSUMED as a
+// preceding keyword's value, so a value that is literally a keyword lexeme is
+// never re-read as a keyword. Reading only the FIRST target pair (the pre-#6484
+// `Keys[1]`/`Keys[2]` read) let a genuine multi-target rule whose targets collapse
+// onto ONE node/child count as one and escape the >1 gate.
+//
+// A lexer-collapsed bracketed list (`prefix [ X Y ]` → ["prefix","X","Y"], #2419)
+// packs SEVERAL target values after ONE keyword; each value is a DISTINCT target,
+// so the scan registers EVERY packed value, not just the first (the pre-#6484
+// single-value read let `prefix [ X Y ]` count 1 and escape the >1 gate).
+//
+// Per-token roles:
+//   - `inet`                     → identity "inet"; NO value slot (i += 1).
+//   - `prefix <ip> [<ip>...]` /
+//     `nptv6-prefix <p6> [...]`  → identity "<kw>\x00<ip>" for EACH value. The
+//     value is an IP that can never be a keyword lexeme. If the token right after
+//     the keyword is a modifier the node is a MODIFIER CARRIER (the canonical
+//     separate-set-line `prefix mapped-port <p>` form) — register nothing and let
+//     the modifier consume its own operand. Otherwise consume EVERY following
+//     non-keyword token as a distinct packed IP value, stopping at the first
+//     trailing modifier or new target keyword.
+//   - `prefix-name <name> [...]` → identity "prefix-name\x00<name>" for EACH name.
+//     The FIRST token is the OPAQUE address-book name — always consumed as the
+//     value, even if it reads "mapped-port"/"routing-instance"/"prefix" (a pool may
+//     be so named), never re-classified as a modifier that would erase the target
+//     (#6479 name-slot). Further non-keyword tokens are additional packed names,
+//     each a distinct target; the run stops at the first modifier/target keyword.
+//   - `mapped-port <p>` /
+//     `routing-instance <ri>`    → a MODIFIER; consume its operand (i += 2),
+//     register no target. Consuming routing-instance's opaque-name operand keeps a
+//     VRF NAMED "prefix"/"inet" from being re-read as a target.
+//   - a leading "static-nat" or any stray token → advance one, register nothing.
+func staticNATCollectTargetIdentsFromKeys(keys []string, set map[string]struct{}) {
+	for i := 0; i < len(keys); {
+		tok := keys[i]
+		switch {
+		case tok == "inet":
+			set["inet"] = struct{}{} // no value slot
+			i++
+		case tok == "prefix-name":
+			// Name-valued target. The FIRST token after the keyword is ALWAYS the
+			// opaque address-book name — consumed verbatim even if it reads
+			// "mapped-port"/"prefix" (a pool may be so named). Any FURTHER
+			// non-keyword tokens are additional bracketed/packed name values
+			// (`prefix-name [ A B ]` collapses to ["prefix-name","A","B"], #2419),
+			// each a DISTINCT target; a trailing modifier or new target keyword
+			// ends the name run (a bracketed value list contains no keyword).
+			i++
+			if i < len(keys) {
+				set["prefix-name\x00"+keys[i]] = struct{}{}
+				i++
+				for i < len(keys) && !isStaticNATKeywordLexeme(keys[i]) {
+					set["prefix-name\x00"+keys[i]] = struct{}{}
+					i++
+				}
+			}
+		case tok == "prefix" || tok == "nptv6-prefix":
+			i++
+			if i < len(keys) {
+				if _, mod := staticNATModifierKeywords[keys[i]]; mod {
+					// Modifier carrier (`prefix mapped-port <p>`, the canonical
+					// separate-set-line form): NO prefix value on this node — the
+					// value rode a restate line. Register nothing; the modifier
+					// case below consumes its own operand.
+					break
+				}
+				// First IP value + any further bracketed/packed IP values
+				// (`prefix [ X Y ]` → ["prefix","X","Y"]), each a DISTINCT target.
+				// An IP prefix can never be a keyword lexeme, so the run stops at
+				// the first trailing modifier or new target keyword.
+				for i < len(keys) && !isStaticNATKeywordLexeme(keys[i]) {
+					set[tok+"\x00"+keys[i]] = struct{}{}
+					i++
+				}
+			}
+		case tok == "mapped-port" || tok == "routing-instance":
+			i += 2 // modifier consumes its own operand; not a target
+		default:
+			i++ // leading "static-nat" or a stray token
+		}
+	}
+}
+
+// staticNATCollectTargetIdents adds a stable IDENTITY string for each translation
+// target one `static-nat` `then` node declares into set (#6483). A target's
+// identity is its keyword plus, for the address/name/prefix targets, its value
+// token (inet has no value, so its identity is just "inet"). Using a SET keyed by
+// identity — rather than an occurrence count — is what makes the Junos "restate
+// the target to attach a modifier" idiom count as ONE target: the canonical
+// separate-set-line mapped-port form authors the SAME target twice,
+//
+//	set ... then static-nat prefix-name TARGET
+//	set ... then static-nat prefix-name TARGET mapped-port 8080   (#5523)
+//
+// which SetPath keeps as two `prefix-name` children with the SAME value TARGET;
+// both map to identity "prefix-name\x00TARGET" and collapse to one. Two GENUINELY
+// different targets (a prefix and a prefix-name, an inet and a prefix, two
+// different prefixes, or a pool NAMED "mapped-port" alongside a prefix) map to
+// different identities and stay distinct.
+//
+// It FULLY TRAVERSES the node, not just the first pair: it walks the static-nat
+// node's own Keys AND every child's Keys through the grammar-role-aware
+// staticNATCollectTargetIdentsFromKeys (so the one-line
+// `prefix <ip> prefix-name POOL` / `prefix <ip> inet` / `prefix <ip> prefix <ip2>`
+// collapse — where two targets land on ONE child's Keys — is counted, as is a
+// lexer-collapsed bracketed list `prefix [ X Y ]` / `prefix-name [ A B ]`, #2419),
+// and expands the hierarchical value-as-child shape (`prefix { <ip>; <ip2>; }`,
+// where each grandchild is a distinct prefix value). A MODIFIER CARRIER (`prefix
+// mapped-port <port>`) and a modifier riding a target (`prefix <ip> mapped-port
+// <p>`, target `routing-instance <ri>`, or a `prefix-name { POOL; mapped-port P; }`
+// block whose nested mapped-port is a modifier — NOT a second name) are NOT extra
+// targets — the walk consumes them — matching how staticNATMappedPortForNode reads
+// the same node.
+func staticNATCollectTargetIdents(t *Node, set map[string]struct{}) {
+	// The static-nat node's own Keys (a shape that would collapse the target onto
+	// ["static-nat","prefix","<ip>", ...]); the leading "static-nat" is a harmless
+	// stray token in the walk. In practice SetPath/the parser put the target on a
+	// child, but walk t.Keys too so no collapse shape is missed (identities dedup).
+	staticNATCollectTargetIdentsFromKeys(t.Keys, set)
+	for _, c := range t.Children {
+		// A target/modifier child. Its Keys carry the collapsed token stream:
+		// ["prefix","<ip>","prefix-name","POOL"] (one-line multi-target escape),
+		// ["prefix","<ip>","mapped-port","<p>"] (single target + modifier),
+		// ["prefix-name","POOL"] / ["prefix-name","mapped-port"] (bare target, the
+		// latter a pool NAMED "mapped-port"), or ["mapped-port","<p>"] (a modifier
+		// sibling — registers nothing).
+		staticNATCollectTargetIdentsFromKeys(c.Keys, set)
+		// Hierarchical value-as-child: a bare target keyword `prefix { <ip>; ... }`
+		// carries its value(s) as grandchildren (child Keys are just ["prefix"]).
+		// Each VALUE grandchild is a distinct target (two `prefix { X; Y; }` grand-
+		// children = two prefixes → count 2), but a nested MODIFIER grandchild
+		// (`mapped-port`/`routing-instance`) is skipped — so `prefix-name { POOL;
+		// mapped-port 8080; }` is ONE target, not two (the #6484 second finding).
+		// Skipped entirely when the value rides inline on the child's Keys (len >=
+		// 2), because then any grandchild is a nested modifier (`prefix <ip> {
+		// mapped-port P; }`), not another value.
+		kw := c.Name()
+		if _, isTarget := staticNATTargetKeywords[kw]; !isTarget || kw == "inet" || len(c.Keys) >= 2 {
+			continue
+		}
+		nameValued := kw == "prefix-name" // opaque names; "mapped-port" is legal
+		for gi, gc := range c.Children {
+			gname := gc.Name()
+			// A nested modifier grandchild (`mapped-port <p>` / `routing-instance
+			// <ri>`) is NOT a target value. For prefix/nptv6-prefix (IP-valued) a
+			// modifier can never be confused with a value, so skip it wherever it
+			// appears. For prefix-name the FIRST grandchild is the OPAQUE pool name
+			// — a pool may be NAMED "mapped-port", so it is consumed unconditionally;
+			// only a LATER modifier grandchild is the genuine modifier and is
+			// skipped. Without the gi>0 guard a bare `prefix-name { POOL;
+			// mapped-port 8080; }` registered both POOL and mapped-port and
+			// FALSE-REJECTED a valid single-target rule (the #6484 second finding).
+			if !(nameValued && gi == 0) {
+				if _, mod := staticNATModifierKeywords[gname]; mod {
+					continue // a nested modifier grandchild, not a target value
+				}
+			}
+			set[kw+"\x00"+gname] = struct{}{}
+		}
+	}
+}
+
+// staticNATThenTargetCount returns how many DISTINCT translation targets one
+// `then {}` block declares across EVERY `static-nat` sibling node in it (#6483).
+// The flat-set shape collapses targets onto a single static-nat node with several
+// target children; the hierarchical shape carries one target per static-nat
+// sibling. Either way the distinct-identity count is the rule's declared target
+// cardinality for that block, which the strict gate
+// (validateStaticNATSingleTargetStrict) requires to be at most one. Restatements
+// of the same target (to attach a mapped-port) share an identity and count once.
+func staticNATThenTargetCount(thenNode *Node) int {
+	set := make(map[string]struct{})
+	for _, t := range thenNode.FindChildren("static-nat") {
+		staticNATCollectTargetIdents(t, set)
+	}
+	return len(set)
+}
+
 func compileNATStatic(node *Node, sec *SecurityConfig) error {
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
 		// #3096: capture from scope across zone | interface |
@@ -560,6 +798,15 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 				// then-set fields so only the LAST then-block's spec survives.
 				rule.ThenPrefixName = ""
 				rule.ThenRoutingInstance = ""
+				// #6483: count the translation targets THIS `then` block declares,
+				// from the AST, BEFORE the if/else chain below collapses them into
+				// the shared Then/ThenPrefixName fields (prefix/inet/nptv6 all
+				// overwrite Then, so the final field state cannot reveal a
+				// >1-target rule). Assigned (not accumulated) per block so the LAST
+				// block wins, matching the #3850 last-then-block-wins semantics the
+				// field resets above encode. validateStaticNATSingleTargetStrict
+				// rejects a count > 1.
+				rule.ThenTargetCount = staticNATThenTargetCount(thenNode)
 				for _, t := range thenNode.Children {
 					if t.Name() == "static-nat" {
 						if len(t.Keys) >= 3 && t.Keys[1] == "nptv6-prefix" {

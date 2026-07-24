@@ -60451,3 +60451,142 @@ top.
     pkg/dataplane/userspace/routes_dedupe_3770_test.go, pkg/routing/rules.go,
     pkg/routing/rules_test.go, pkg/routing/rules_6467_test.go,
     docs/rib-group-route-leaking.md, docs/refactoring-audit-current.txt, _Log.md
+- **Action**: #6462 — DNAT bare `match destination-port` with no `match
+    protocol` installed a TCP-only entry, so UDP to the VIP:port was silently
+    not translated (Junos matches a bare destination-port across BOTH tcp and
+    udp). Fixed buildDestinationNATSnapshots (pkg/dataplane/userspace/
+    nat_destination.go): a protocol-less port-based rule now emits one snapshot
+    per protocol under `tcp` AND `udp` (a `protos` slice replacing the scalar
+    `proto = "tcp"` default; the per-destination emit loops over it). Explicit
+    `match protocol` is honored verbatim; a protocol-less rule with NO port
+    stays a single match-any (empty-protocol) entry. Two EXPLICIT rows (never
+    PROTO_ANY — that would over-match ICMP/other, and the Rust DnatTable lookup
+    probes (proto,dst_ip,dst_port) but never (PROTO_ANY,dst_ip,dst_port), so a
+    PROTO_ANY+port row would be unreachable for a UDP packet). Both rows share
+    the rule's single CounterID (mirrors an explicit `match protocol [ tcp udp
+    ]`, #3431), so a packet hits exactly one row and the counter increments
+    once. Updated the #3449 range / #3446 port-validity tests to pin `match
+    protocol tcp` (isolate their single-concern from the new dual-emit). NEW
+    nat_destination_6462_test.go: dual-emit (tcp+udp) for exact port AND range,
+    explicit-proto-not-dual, no-port-stays-match-any. FAIL-ON-REVERT:
+    TestBuildDNATBareDestPortEmitsTCPAndUDP_6462 goes RED ("no udp-keyed entry
+    for 198.51.100.10:53 (the #6462 bug)") when the dual-emit hunk is
+    neutralized to `protos = []string{"tcp"}` — verified then restored (GREEN).
+    Docs: config-schema.md (DNAT per-protocol expansion) + feature-coverage.md
+    (Destination NAT row). go build ./... , go vet ./pkg/dataplane/userspace/ ,
+    gofmt -l (clean), go test ./pkg/dataplane/... , go test ./pkg/refactoraudit
+    -run TestHeatmapNotStale — all GREEN (TMPDIR=/dev/shm). Go-only; no Rust
+    touched.
+- **File(s)**: pkg/dataplane/userspace/nat_destination.go,
+    pkg/dataplane/userspace/nat_destination_6462_test.go,
+    pkg/dataplane/userspace/nat_dnat_port_range_3449_test.go,
+    pkg/dataplane/userspace/nat_dnat_match_dport_3446_test.go,
+    docs/config-schema.md, docs/feature-coverage.md, _Log.md
+
+## 2026-07-24 — #6483 static-NAT single-translation-target gate
+- **Timestamp**: 2026-07-24
+- **Action**: Add commit-check that a static-NAT rule declares EXACTLY ONE
+    translation target (prefix/prefix-name/nptv6-prefix/inet). Multi-target rules
+    (prefix+prefix-name, inet+prefix sibling, two prefixes, hier two static-nat
+    blocks) were silently accepted — the compiler honored one target by fixed
+    priority and dropped the rest into the shared Then field, which also let a
+    malformed mapped-port on a dropped target slip (the #6479/C179-038 residual).
+    New staticNATThenTargetCount counts DISTINCT (keyword,value) target identities
+    from the AST during compile (so the "restate the target to attach mapped-port"
+    idiom stays one target), recorded as StaticNATRule.ThenTargetCount (json:"-").
+    validateStaticNATSingleTargetStrict rejects >1, wired into runTailGates AFTER
+    the host-mask (#2173) and NPTv6 (#2240/#5818) gates so a rule ALSO carrying a
+    bad mapped-port/nptv6 prefix reports that concrete token first (never masks
+    the multi-target defect). Strict reject / lenient warn (#1960). PARENT-RED:
+    neutralize the `> 1` guard -> 5 reject tests go clean-assertion RED; restore
+    GREEN. gofmt/vet/go build ./... GREEN, full pkg/config suite GREEN,
+    regenerated docs/refactoring-audit-current.txt (compiler_validate_strict_nat.go
+    2865->2928 REFACTOR tier).
+- **File(s)**: pkg/config/compiler_nat_static.go,
+    pkg/config/compiler_validate_strict_nat.go, pkg/config/compiler_tailgates.go,
+    pkg/config/types_security.go, pkg/config/static_nat_multitarget_6483_test.go,
+    docs/config-schema.md, docs/refactoring-audit-current.txt, _Log.md
+
+## 2026-07-24 — #6484 fold: grammar-role-aware full-traversal target counter
+- **Timestamp**: 2026-07-24 (fix/6483-multitarget-static-nat)
+- **Action**: Fold a confirmed hostile-review MAJOR (both reviewers + Codex) into
+    the #6483 gate: the target counter under-counted a genuine multi-target rule
+    whose targets COLLAPSE onto one node/child. staticNATCollectTargetIdents read
+    only the FIRST (keyword,value) pair per node (fixed Keys[1]/Keys[2] on the
+    collapsed branch, c.Keys[1]/Children[0] on the child branch) and pre-filtered a
+    value slot equal to a modifier keyword, so `prefix <ip> prefix-name POOL` /
+    `prefix <ip> inet` / `prefix <ip> prefix <ip2>` (one line, collapsed onto one
+    child's Keys), hierarchical `prefix { X; Y; }` (two values as grandchildren of
+    one keyword), and `prefix + prefix-name mapped-port` (pool literally NAMED
+    "mapped-port", pre-filtered away as a modifier carrier — Codex second finding)
+    all counted 1 and ESCAPED the >1 gate. Rewrote the counter as a grammar-role-
+    aware FULL TRAVERSAL (new staticNATCollectTargetIdentsFromKeys, mirroring the
+    #6479 staticNATMappedPortOperandsFromKeys slot-classification walk): walk the
+    whole key stream of the static-nat node AND every child, plus a bare keyword's
+    grandchild values, classifying each position as a keyword or a consumed value
+    slot. prefix-name's value is an opaque name ALWAYS consumed (registers even when
+    named "mapped-port"); prefix/nptv6-prefix's IP value can never be a modifier, so
+    a following mapped-port/routing-instance is a modifier carrier (registers no
+    target); mapped-port/routing-instance consume their operand. Register every
+    distinct (keyword,value) identity; ThenTargetCount = the distinct count.
+    INVARIANT B preserved (all count 1): 4 single-target types collapsed+hier, the
+    #5523 restate idiom, prefix<ip> mapped-port, target+routing-instance, inet
+    alone, and the canonical separate-set-line modifier carrier. PARENT-RED: revert
+    the counter to the old first-pair read (build stays GREEN) -> the 5 new
+    escaping reject tests go clean-assertion RED ("strict CompileConfig must reject
+    a multi-target static-nat rule"); the accept locks stay GREEN under both
+    counters. Firsthand probe table: 4 escaping shapes count=2 REJECT [multi-target
+    gate]; 5 invariant-B shapes count=1 ACCEPT. go build ./... , go vet
+    ./pkg/config/ , gofmt, FULL pkg/config suite, TestHeatmapNotStale all GREEN
+    (no LOC bucket shift).
+- **File(s)**: pkg/config/compiler_nat_static.go,
+    pkg/config/static_nat_multitarget_6483_test.go, docs/config-schema.md, _Log.md
+
+## 2026-07-24 — #6484 round-2: V1/V2 sibling-mapped-port regression tests
+
+- **Timestamp**: 2026-07-24 (fix/6483-multitarget-static-nat)
+- **Action**: Add two regression accept subtests for the #1 regression-risk
+  shape flagged in the team-lead ground-truth matrix: REAL Junos
+  `static-nat { prefix-name POOL; mapped-port 8080; }` (V1) and
+  `static-nat { prefix 10.0.0.1/32; mapped-port 8080; }` (V2) — where mapped-port
+  is a SIBLING child of the target, not a grandchild. Both must stay ONE target
+  (the target child's Keys are len 2 so it never enters the grandchild loop; the
+  mapped-port sibling is skipped by staticNATCollectTargetIdentsFromKeys).
+  Firsthand-verified count=1/ACCEPT for the full V1/V2/V3/P1/B1/B2/B3 matrix
+  before adding. Test-only, no code change. gofmt + vet + full multitarget suite
+  green.
+- **File(s)**: pkg/config/static_nat_multitarget_6483_test.go, _Log.md
+
+## 2026-07-24 — #6483/#6484 round-2: static-NAT target counter packed-value + nested-modifier fold
+
+- **Timestamp**: 2026-07-24 (fix/6483-multitarget-static-nat)
+- **Action**: Fold two CONFIRMED Codex findings into the distinct-target counter
+  (staticNATCollectTargetIdentsFromKeys / staticNATCollectTargetIdents). FINDING 1
+  (packed/bracketed multi-value ESCAPE): a lexer-collapsed bracketed list `prefix
+  [ X Y ]` / `prefix-name [ A B ]` / `nptv6-prefix [ P6a P6b ]` (#2419 →
+  Keys=["prefix","X","Y"]) consumed only the FIRST value after a target keyword;
+  the rest fell through → counted 1 → escaped the >1 gate. Fix: after a target
+  keyword register EVERY packed value as a distinct (keyword,value) identity —
+  greedy value run bounded by the first keyword lexeme (new helper
+  isStaticNATKeywordLexeme); an IP value can never be a lexeme so prefix/nptv6
+  stop correctly, and a prefix-name's FIRST token is always consumed as the opaque
+  name (pool may be NAMED "mapped-port") with only later keyword lexemes ending the
+  packed-name run. FINDING 2 (nested-modifier FALSE-REJECT): a bare hierarchical
+  `prefix-name { POOL; mapped-port 8080; }` registered EVERY grandchild of the
+  name-valued keyword as a target (POOL + mapped-port = 2) → false-rejected a valid
+  single-target rule origin/master accepted. Fix: in the grandchild walk consume
+  only the FIRST grandchild of a name-valued bare keyword as the name and skip a
+  LATER modifier grandchild (mapped-port/routing-instance) — `gi == 0` guard on the
+  modifier check. Firsthand probe over the full {prefix,prefix-name,nptv6,inet} ×
+  {single-flat, single-hier, hier-nested-MP, bracketed/packed, cross-combos}
+  matrix: exactly the 4 target shapes flipped (3 bracketed 1→2 REJECT, the
+  nested-MP 2→1 ACCEPT); every invariant-B shape (restate idiom, modifier carrier,
+  inline-MP, named-mapped-port, routing-instance trailer, inet-alone, 6 cross
+  combos) unchanged. PARENT-RED: neutralize the packed loops → the 3 bracketed
+  reject tests go clean-assertion RED ("strict CompileConfig must reject a
+  multi-target static-nat rule"); neutralize the gi==0 grandchild guard → the
+  nested-modifier accept test goes RED ("declares 2 static-nat translation
+  targets"). go build ./..., go vet ./pkg/config/, gofmt, FULL pkg/config suite
+  (13s), TestHeatmapNotStale all GREEN (no LOC bucket shift).
+- **File(s)**: pkg/config/compiler_nat_static.go,
+    pkg/config/static_nat_multitarget_6483_test.go, docs/config-schema.md, _Log.md

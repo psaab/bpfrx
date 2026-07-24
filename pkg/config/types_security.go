@@ -995,6 +995,22 @@ type StaticNATRule struct {
 	// load / peer-sync path (#1960 no-brick) keeps MappedPort==0 (plain 1:1,
 	// no bogus port).
 	MappedPortPresent bool `json:"-"`
+	// ThenTargetCount is how many mutually-exclusive translation TARGETS the
+	// winning `then {}` block declares (prefix / prefix-name / nptv6-prefix /
+	// inet), counted from the AST during compile by staticNATThenTargetCount
+	// (#6483). A well-formed rule declares EXACTLY ONE. Because prefix / inet /
+	// nptv6-prefix all land in the shared Then field (a later target overwrites an
+	// earlier one), the final field state cannot reveal a multi-target rule; this
+	// count, taken before the fields collapse, can. validateStaticNATSingleTarget-
+	// Strict rejects a rule with >1 (both a prefix AND a prefix-name, an inet
+	// sibling plus a prefix sibling, two prefixes, …) — invalid Junos the compiler
+	// otherwise silently accepted by honoring one target and dropping the rest,
+	// which also let a malformed mapped-port on a dropped target slip through (the
+	// #6479/C179-038 residual). A zero-target rule is the empty-target gate's
+	// domain (#4290); this gates only the >1 case. Compile-only (`json:"-"`):
+	// derived state recomputed on every compile (last `then` block wins, #3850),
+	// never serialized to the dataplane / peer-sync wire.
+	ThenTargetCount int `json:"-"`
 }
 
 // LimitSessionScreen configures per-IP session limiting.

@@ -2140,6 +2140,69 @@ func validateStaticNATInetTargetStrict(cfg *Config) error {
 	return nil
 }
 
+// validateStaticNATSingleTargetStrict (#6483) hard-rejects a static-NAT rule
+// that declares MORE THAN ONE translation target. A Junos static-nat rule maps
+// to EXACTLY ONE of `prefix <ip>` | `prefix-name <name>` | `nptv6-prefix <p6>` |
+// `inet`; authoring two or more (e.g. `then static-nat prefix <ip>` plus `then
+// static-nat prefix-name <pool>`, or an `inet` sibling alongside a `prefix`
+// sibling) is invalid.
+//
+// The compiler otherwise silently ACCEPTED such a rule: the compileNATStatic
+// child loop honors the FIRST target it matches by a fixed priority
+// (nptv6-prefix > prefix-name > prefix > inet) and drops the rest, and because
+// prefix / inet / nptv6-prefix all land in the shared Then field a later target
+// simply overwrites an earlier one — so the rule compiled to a single arbitrary
+// target with no operator feedback (`inet` + `prefix` even installs as a plain
+// prefix rule, evading the #5859 inet reject). Dropping a target this way also
+// dropped any `mapped-port` that rode ONLY on the discarded target — the
+// #6479/C179-038 residual — because that target's node was never the one whose
+// modifier the mapped-port fold read. Rejecting the multi-target rule outright is
+// the correct Junos-faithful closure and forecloses that residual as a side
+// effect (the rule never compiles, so no dropped-target modifier can slip).
+//
+// ThenTargetCount is taken from the AST during compile (staticNATThenTargetCount)
+// BEFORE the fields collapse, so it sees every declared target regardless of
+// shape (flat-set targets collapse onto one static-nat node's children; the
+// hierarchical `then { static-nat {…} static-nat {…} }` shape spreads them across
+// siblings) and regardless of the last-wins overwrite. A count of exactly one is
+// the well-formed case; zero is the empty-target gate's domain
+// (validateStaticNATThenTargetStrict, #4290) and is not re-diagnosed here.
+//
+// Strict on commit / commit-check (hard reject so the malformed rule is
+// operator-visible); the call site downgrades to a warning on the tolerant load
+// / peer-sync path (opts.lenientFirewallRefs, #1960 no-brick) — a config an older
+// binary persisted, or a peer authored, before this gate existed still boots, and
+// the dataplane is no worse off than before the gate (the compiler still lowers
+// the single honored target). Rule-sets are walked in slice order for a
+// deterministic first-reported offender, mirroring the sibling static-NAT target
+// gates.
+func validateStaticNATSingleTargetStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			if rule.ThenTargetCount > 1 {
+				return fmt.Errorf(
+					"static NAT rule-set %q rule %q declares %d static-nat "+
+						"translation targets (prefix/prefix-name/nptv6-prefix/inet); a "+
+						"static-nat rule has exactly one — the compiler would otherwise "+
+						"honor one target and silently drop the rest (and any mapped-port "+
+						"riding only on a dropped target, the #6479 residual). Keep a "+
+						"single target per rule",
+					rs.Name, rule.Name, rule.ThenTargetCount)
+			}
+		}
+	}
+	return nil
+}
+
 // natThenTerminalActionCount returns how many mutually-exclusive NAT-terminal
 // translation actions a resolved NATThen carries: source-nat `interface`,
 // `off`, or a `pool <name>` for source NAT; `off` or a `pool <name>` for

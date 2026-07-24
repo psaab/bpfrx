@@ -485,12 +485,27 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 						poolPort = uint16(pool.Port)
 					}
 
-					// Determine protocol string for the snapshot. A port-based
-					// rule (an exact port OR a range constraint) defaults to TCP
-					// when the rule did not pin a protocol, exactly as before.
-					proto := term.proto
-					if proto == "" && (dstPort != 0 || len(matchDstPorts) > 0) {
-						proto = "tcp" // default for port-based DNAT
+					// Determine the protocol(s) to key this snapshot under. A
+					// port-based rule (an exact port OR a range constraint) that
+					// did NOT pin a protocol matches BOTH TCP and UDP, exactly as
+					// Junos does for a bare `match destination-port` (#6462): emit
+					// one snapshot per protocol below so UDP to the VIP:port is
+					// translated too. Before #6462 the builder defaulted such a
+					// rule to TCP only — a UDP (proto 17) packet hit none of the
+					// TCP-keyed entries and was silently NOT translated (a silent
+					// UDP-service outage — DNS/SIP/VPN — plus an observability lie:
+					// `show security nat destination` still listed the rule). When
+					// a protocol IS pinned it is honored verbatim; a protocol-less
+					// rule with NO port constraint stays a single match-any
+					// (empty-protocol) entry. TCP and UDP are emitted explicitly
+					// rather than under PROTO_ANY: ports exist only for TCP/UDP so
+					// PROTO_ANY would wrongly translate ICMP/other, and the Rust
+					// lookup probes (proto,dst_ip,dst_port) but never
+					// (PROTO_ANY,dst_ip,dst_port), so a single PROTO_ANY+port row
+					// could not be found by a UDP packet anyway.
+					protos := []string{term.proto}
+					if term.proto == "" && (dstPort != 0 || len(matchDstPorts) > 0) {
+						protos = []string{"tcp", "udp"} // bare dest-port matches both (Junos)
 					}
 
 					// #3450: poolAddr is the validated single-host IP (CIDR
@@ -518,36 +533,47 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 						if !ok {
 							continue
 						}
-						out = append(out, DestinationNATRuleSnapshot{
-							Name:                rule.Name,
-							FromZone:            rs.FromZone,
-							FromInterface:       rs.FromInterface,
-							FromRoutingInstance: rs.FromRoutingInstance,
-							SourceAddresses:     sourceAddrs,
-							DestinationAddress:  base,
-							DestinationPrefix:   prefix,
-							DestinationPort:     dstPort,
-							// #3449: a multi-port range rides this field as
-							// one [Low,High] constraint instead of (High-Low+1)
-							// per-port entries; empty for a single/exact port.
-							MatchDestinationPorts: matchDstPorts,
-							Protocol:              proto,
-							PoolAddress:           poolAddr,
-							PoolPort:              poolPort,
-							// #3437: carry the application's source-port and
-							// ICMP type/code constraints so the DNAT match is no
-							// wider than the referenced application.
-							MatchSourcePorts: term.srcPorts,
-							MatchICMPType:    term.icmpType,
-							MatchICMPCode:    term.icmpCode,
-							// #3844: a `then destination-nat off` exemption. When
-							// set, the Rust DnatTable treats a match as
-							// no-translate and short-circuits later DNAT rules;
-							// the pool fields are unused. PoolAddress is empty
-							// for an off entry.
-							Off:       isOff,
-							CounterID: ruleCounterID,
-						})
+						// #6462: one snapshot per protocol (see `protos` above).
+						// For a bare `match destination-port` with no configured
+						// protocol this installs BOTH a TCP- and a UDP-keyed row
+						// for (base, dstPort) so a UDP packet to the VIP:port is
+						// translated, mirroring Junos. Both rows share the rule's
+						// single CounterID exactly like an explicit
+						// `match protocol [ tcp udp ]` (#3431): a packet is either
+						// TCP or UDP, so it hits exactly one row and the shared
+						// counter increments once — no double-count.
+						for _, proto := range protos {
+							out = append(out, DestinationNATRuleSnapshot{
+								Name:                rule.Name,
+								FromZone:            rs.FromZone,
+								FromInterface:       rs.FromInterface,
+								FromRoutingInstance: rs.FromRoutingInstance,
+								SourceAddresses:     sourceAddrs,
+								DestinationAddress:  base,
+								DestinationPrefix:   prefix,
+								DestinationPort:     dstPort,
+								// #3449: a multi-port range rides this field as
+								// one [Low,High] constraint instead of (High-Low+1)
+								// per-port entries; empty for a single/exact port.
+								MatchDestinationPorts: matchDstPorts,
+								Protocol:              proto,
+								PoolAddress:           poolAddr,
+								PoolPort:              poolPort,
+								// #3437: carry the application's source-port and
+								// ICMP type/code constraints so the DNAT match is no
+								// wider than the referenced application.
+								MatchSourcePorts: term.srcPorts,
+								MatchICMPType:    term.icmpType,
+								MatchICMPCode:    term.icmpCode,
+								// #3844: a `then destination-nat off` exemption. When
+								// set, the Rust DnatTable treats a match as
+								// no-translate and short-circuits later DNAT rules;
+								// the pool fields are unused. PoolAddress is empty
+								// for an off entry.
+								Off:       isOff,
+								CounterID: ruleCounterID,
+							})
+						}
 					}
 				}
 			}
