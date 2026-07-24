@@ -246,14 +246,55 @@ func reconcileInterfaceAddresses(ifaceName string, desired []string) {
 	}
 }
 
+// compileZones programs the zone/interface dataplane maps and derives the
+// systemd-networkd interface model. The work is split into four cohesive
+// concerns, each lifted into a helper so the ordering contract is explicit
+// and behavior-preserving:
+//
+//   - programZoneMaps: per-zone dataplane config + per-interface map
+//     programming and host setup (the rename -> address -> bring-down order
+//     is preserved inside mapZoneInterface);
+//   - buildInterfaceNetworkdModels / buildFabricBondModels /
+//     buildBridgeDomainModels: the networkd managed-interface model, threaded
+//     through a shared `seen` set so each interface is emitted exactly once;
+//   - stripUnmanagedInterfaces: bring down / address-strip unconfigured NICs.
+//
+// This is a decomposition of a former ~900-line function; the composed
+// behavior is identical (#6426).
 func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error {
-	// Track written keys for populate-before-clear: write new entries first,
-	// then delete stale ones that are no longer in the config.
-	writtenIfaceZone := make(map[IfaceZoneKey]bool)
-	writtenVlanIface := make(map[uint32]bool)
+	st, err := programZoneMaps(dp, cfg, result)
+	if err != nil {
+		return err
+	}
 
-	// Build interface -> routing table ID map from routing instances.
-	// Forwarding instances use the default table (0), so skip them.
+	// Auto-add HOST_INBOUND_GRE to zones carrying GRE tunnel transport.
+	applyTunnelHostInbound(dp, cfg, result)
+
+	// Store pending XDP ifindexes for deferred attachment after all compile phases.
+	result.pendingXDP = st.xdpIfindexes
+	result.tunnelIfindexes = st.tunnelIfindexes
+
+	// Collect managed interface info for networkd config generation. The `seen`
+	// set is threaded through every model builder so an interface is emitted
+	// once and the unmanaged strip skips already-managed names — preserving the
+	// monolithic loop's shared-map semantics.
+	seen := make(map[string]bool)
+	buildInterfaceNetworkdModels(cfg, result, seen)
+	buildFabricBondModels(cfg, result, seen)
+	buildBridgeDomainModels(cfg, result, seen)
+	stripUnmanagedInterfaces(cfg, result, seen)
+
+	// Delete stale zone/VLAN map entries no longer in the config.
+	dp.DeleteStaleIfaceZone(st.writtenIfaceZone)
+	dp.DeleteStaleVlanIface(st.writtenVlanIface)
+
+	return nil
+}
+
+// buildIfaceTableIDMap builds the interface -> routing-table-ID map from the
+// configured routing instances. Forwarding instances use the default table
+// (0), so they are skipped.
+func buildIfaceTableIDMap(cfg *config.Config) map[string]uint32 {
 	ifaceTableID := make(map[string]uint32)
 	for _, ri := range cfg.RoutingInstances {
 		if ri.InstanceType == "forwarding" {
@@ -263,17 +304,105 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			ifaceTableID[ifaceName] = uint32(ri.TableID)
 		}
 	}
+	return ifaceTableID
+}
 
-	// Track which physical interfaces have already had one-time parent setup.
-	attached := make(map[int]bool)
-	// Track which interfaces already have a deferred XDP attachment queued.
-	attachedXDP := make(map[int]bool)
-	// Collect ifindexes for deferred XDP attachment.
-	var xdpIfindexes []int
-	// Tunnel interfaces need XDP for ingress but must NOT be in
-	// redirect_capable or tx_ports — bpf_redirect_map sends the full
-	// Ethernet frame, but POINTOPOINT tunnels expect raw IP.
-	tunnelIfindexes := make(map[int]bool)
+// zoneMapState accumulates the dataplane map-programming side effects of the
+// zone->interface loop (programZoneMaps / mapZoneInterface). Lifting these
+// shared accumulators into an explicit struct is what lets the per-interface
+// mapping move out of compileZones without changing behavior: every field is
+// the same local the monolithic loop carried across zones and interfaces. In
+// particular the attached / attachedXDP dedup maps MUST persist across the
+// whole loop (a phys interface referenced by two zones is set up once),
+// exactly as before. xdpIfindexes / tunnelIfindexes are handed back to the
+// caller for result.pendingXDP / result.tunnelIfindexes.
+type zoneMapState struct {
+	// writtenIfaceZone / writtenVlanIface track written keys for
+	// populate-before-clear: write new entries first, then delete stale ones
+	// that are no longer in the config.
+	writtenIfaceZone map[IfaceZoneKey]bool
+	writtenVlanIface map[uint32]bool
+	// attached tracks physical interfaces that already had one-time parent setup.
+	attached map[int]bool
+	// attachedXDP tracks interfaces that already have a deferred XDP attachment queued.
+	attachedXDP map[int]bool
+	// xdpIfindexes collects ifindexes for deferred XDP attachment.
+	xdpIfindexes []int
+	// tunnelIfindexes: tunnel interfaces need XDP for ingress but must NOT be in
+	// redirect_capable or tx_ports — bpf_redirect_map sends the full Ethernet
+	// frame, but POINTOPOINT tunnels expect raw IP.
+	tunnelIfindexes map[int]bool
+}
+
+func newZoneMapState() *zoneMapState {
+	return &zoneMapState{
+		writtenIfaceZone: make(map[IfaceZoneKey]bool),
+		writtenVlanIface: make(map[uint32]bool),
+		attached:         make(map[int]bool),
+		attachedXDP:      make(map[int]bool),
+		tunnelIfindexes:  make(map[int]bool),
+	}
+}
+
+// buildZoneConfig compiles the per-zone dataplane ZoneConfig (screen-profile
+// ID, host-inbound-traffic flags, TCP-RST) for a single security zone.
+func buildZoneConfig(zone *config.ZoneConfig, name string, zid uint16, result *CompileResult) (ZoneConfig, error) {
+	// Write zone_config
+	zc := ZoneConfig{
+		ZoneID: zid,
+	}
+
+	// Look up screen profile ID for this zone
+	if zone.ScreenProfile != "" {
+		if sid, ok := result.ScreenIDs[zone.ScreenProfile]; ok {
+			zc.ScreenProfileID = sid
+			slog.Info("zone screen profile assigned",
+				"zone", name, "screen", zone.ScreenProfile, "id", sid)
+		} else {
+			return ZoneConfig{}, fmt.Errorf("screen profile %q not found for zone %q",
+				zone.ScreenProfile, name)
+		}
+	}
+
+	// Compile host-inbound-traffic flags
+	if zone.HostInboundTraffic != nil {
+		var flags uint32
+		for _, svc := range zone.HostInboundTraffic.SystemServices {
+			if f, ok := HostInboundServiceFlags[svc]; ok {
+				flags |= f
+			} else {
+				slog.Warn("unknown host-inbound system-service",
+					"service", svc, "zone", name)
+			}
+		}
+		for _, proto := range zone.HostInboundTraffic.Protocols {
+			if f, ok := HostInboundProtocolFlags[proto]; ok {
+				flags |= f
+			} else {
+				slog.Warn("unknown host-inbound protocol",
+					"protocol", proto, "zone", name)
+			}
+		}
+		zc.HostInbound = flags
+		slog.Info("host-inbound-traffic compiled",
+			"zone", name, "flags", fmt.Sprintf("0x%x", flags))
+	}
+
+	if zone.TCPRst {
+		zc.TCPRst = 1
+	}
+
+	return zc, nil
+}
+
+// programZoneMaps walks the security zones and programs every zone/interface
+// dataplane map, returning the accumulated map-programming state so the caller
+// can publish the deferred XDP/tunnel ifindex sets and delete stale entries.
+func programZoneMaps(dp DataPlane, cfg *config.Config, result *CompileResult) (*zoneMapState, error) {
+	st := newZoneMapState()
+
+	// Interface -> routing table ID map from the routing instances.
+	ifaceTableID := buildIfaceTableIDMap(cfg)
 
 	for name, zone := range cfg.Security.Zones {
 		// A nil zone value is reachable on the tolerant/programmatic and
@@ -286,344 +415,320 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		}
 		zid := result.ZoneIDs[name]
 
-		// Write zone_config
-		zc := ZoneConfig{
-			ZoneID: zid,
+		zc, err := buildZoneConfig(zone, name, zid, result)
+		if err != nil {
+			return nil, err
 		}
-
-		// Look up screen profile ID for this zone
-		if zone.ScreenProfile != "" {
-			if sid, ok := result.ScreenIDs[zone.ScreenProfile]; ok {
-				zc.ScreenProfileID = sid
-				slog.Info("zone screen profile assigned",
-					"zone", name, "screen", zone.ScreenProfile, "id", sid)
-			} else {
-				return fmt.Errorf("screen profile %q not found for zone %q",
-					zone.ScreenProfile, name)
-			}
-		}
-
-		// Compile host-inbound-traffic flags
-		if zone.HostInboundTraffic != nil {
-			var flags uint32
-			for _, svc := range zone.HostInboundTraffic.SystemServices {
-				if f, ok := HostInboundServiceFlags[svc]; ok {
-					flags |= f
-				} else {
-					slog.Warn("unknown host-inbound system-service",
-						"service", svc, "zone", name)
-				}
-			}
-			for _, proto := range zone.HostInboundTraffic.Protocols {
-				if f, ok := HostInboundProtocolFlags[proto]; ok {
-					flags |= f
-				} else {
-					slog.Warn("unknown host-inbound protocol",
-						"protocol", proto, "zone", name)
-				}
-			}
-			zc.HostInbound = flags
-			slog.Info("host-inbound-traffic compiled",
-				"zone", name, "flags", fmt.Sprintf("0x%x", flags))
-		}
-
-		if zone.TCPRst {
-			zc.TCPRst = 1
-		}
-
 		if err := dp.SetZoneConfig(zid, zc); err != nil {
-			return fmt.Errorf("set zone config %s: %w", name, err)
+			return nil, fmt.Errorf("set zone config %s: %w", name, err)
 		}
 
 		// Map interfaces to zone
 		for _, ifaceRef := range zone.Interfaces {
-			physName, cfgName, unitNum, vlanID := resolveInterfaceRef(ifaceRef, cfg)
-
-			// Get the physical interface (cached to avoid redundant syscalls)
-			physIface, err := result.cachedInterfaceByName(physName)
-			if err != nil {
-				slog.Warn("interface not found, skipping",
-					"interface", physName, "zone", name, "err", err)
-				continue
+			if err := st.mapZoneInterface(dp, cfg, result, name, zone, zid, ifaceRef, ifaceTableID); err != nil {
+				return nil, err
 			}
-
-			if vlanID > 0 {
-				// VLAN sub-interface: create it, populate vlan_iface_map
-				subIfindex, err := ensureVLANSubInterface(physName, vlanID)
-				if err != nil {
-					slog.Warn("VLAN sub-interface failed, skipping",
-						"parent", physName, "vlan_id", vlanID, "zone", name, "err", err)
-					continue
-				}
-
-				if err := dp.SetVlanIfaceInfo(subIfindex, physIface.Index, uint16(vlanID)); err != nil {
-					return fmt.Errorf("set vlan_iface_info %s.%d: %w",
-						physName, vlanID, err)
-				}
-				writtenVlanIface[uint32(subIfindex)] = true
-
-				// Reconcile addresses on sub-interface (removes stale, adds missing).
-				// DHCP-managed and RETH sub-interfaces are skipped — DHCP client
-				// manages DHCP addresses, VRRP manages RETH VIP addresses.
-				subName := fmt.Sprintf("%s.%d", physName, vlanID)
-				var addrs []string
-				isDHCPSub := false
-				isReth := false
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
-					if unit, ok := ifCfg.Units[unitNum]; ok {
-						addrs = unit.Addresses
-						isDHCPSub = unit.DHCP || unit.DHCPv6
-					}
-					if ifCfg.RedundancyGroup > 0 {
-						isReth = true
-					}
-				}
-				if !isDHCPSub && !isReth {
-					reconcileInterfaceAddresses(subName, addrs)
-				}
-
-				// Apply unit-level MTU to VLAN sub-interface
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
-					if unit, ok := ifCfg.Units[unitNum]; ok && unit.MTU > 0 {
-						if nl, err := result.cachedLinkByName(subName); err == nil {
-							if nl.Attrs().MTU != unit.MTU {
-								if err := netlink.LinkSetMTU(nl, unit.MTU); err != nil {
-									slog.Warn("failed to set VLAN sub-interface MTU",
-										"name", subName, "mtu", unit.MTU, "err", err)
-								} else {
-									slog.Info("set VLAN sub-interface MTU", "name", subName, "mtu", unit.MTU)
-								}
-							}
-						}
-					}
-				}
-
-				slog.Info("VLAN sub-interface configured",
-					"parent", physName, "vlan_id", vlanID,
-					"sub_ifindex", subIfindex, "zone", name)
-
-				// Native GRE on VLAN transport needs XDP on the child interface
-				// itself; packets can ingress via ge-*.VID without ever running
-				// the parent's driver XDP hook. VLAN children do not support the
-				// fast path reliably here, so keep them on generic XDP only.
-				if !attachedXDP[subIfindex] {
-					xdpIfindexes = append(xdpIfindexes, subIfindex)
-					result.genericXDPIfindexes[subIfindex] = true
-					attachedXDP[subIfindex] = true
-				}
-			}
-
-			// Set zone mapping using composite key {physIfindex, vlanID}
-			tableID := ifaceTableID[ifaceRef] // 0 if not in any routing instance
-			var izFlags uint8
-			var rgID uint8
-			var screenFlags uint32
-			if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
-				if ifCfg.Tunnel != nil {
-					izFlags |= IfaceFlagTunnel
-				}
-				// Check per-unit tunnel
-				if unit, ok := ifCfg.Units[unitNum]; ok && unit.Tunnel != nil {
-					izFlags |= IfaceFlagTunnel
-				}
-				if ifCfg.RedundancyGroup > 0 {
-					rgID = uint8(ifCfg.RedundancyGroup)
-				} else if ifCfg.RedundantParent != "" {
-					// Physical RETH member: inherit RG from the RETH parent.
-					// Without this, check_egress_rg_active() in BPF returns
-					// rg_id=0 for RETH member VLAN sub-interfaces, bypassing
-					// the HA active/inactive check and preventing fabric
-					// redirect after RG failover.
-					if reth, ok := cfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok && reth != nil && reth.RedundancyGroup > 0 {
-						rgID = uint8(reth.RedundancyGroup)
-					}
-				}
-			}
-			if zone.ScreenProfile != "" {
-				profile, ok := cfg.Security.Screen[zone.ScreenProfile]
-				if !ok {
-					return fmt.Errorf("screen profile %q not found for zone %q",
-						zone.ScreenProfile, name)
-				}
-				screenFlags = buildScreenConfig(
-					profile,
-					cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie",
-				).Flags
-			}
-			if izFlags&IfaceFlagTunnel != 0 {
-				tunnelIfindexes[physIface.Index] = true
-			} else {
-				// Optimistically set native XDP flag for non-tunnel
-				// interfaces.  Cleared in needGeneric fallback below.
-				izFlags |= IfaceFlagNativeXDP
-			}
-			if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID, izFlags, rgID, screenFlags); err != nil {
-				return fmt.Errorf("set zone for %s vlan %d (ifindex %d): %w",
-					physName, vlanID, physIface.Index, err)
-			}
-			writtenIfaceZone[IfaceZoneKey{Ifindex: uint32(physIface.Index), VlanID: uint16(vlanID)}] = true
-
-			// Add physical interface to tx_ports and attach TC (once per phys iface).
-			// XDP attachment is deferred to after the loop so we can ensure
-			// all interfaces use the same XDP mode (native vs generic).
-			if !attached[physIface.Index] {
-				// Skip tx_ports for tunnel interfaces — bpf_redirect_map
-				// sends Ethernet frames but tunnels expect raw IP.
-				if tunnelIfindexes[physIface.Index] {
-					slog.Info("skipping tx_port for tunnel interface",
-						"name", physName, "ifindex", physIface.Index)
-				} else if err := dp.AddTxPort(physIface.Index); err != nil {
-					return fmt.Errorf("add tx port %s: %w", physName, err)
-				}
-
-				// Disable VLAN RX offload so XDP sees VLAN tags in packet data
-				// (otherwise NIC strips them into skb->vlan_tci which XDP can't read).
-				// Check current state first — toggling rxvlan on iavf VFs causes a
-				// driver reset that drops in-flight packets (kills active TCP sessions).
-				// #5268: if the offload cannot be disabled AND this parent carries
-				// configured VLAN subinterfaces, FAIL ACTIVATION CLOSED — proceeding
-				// to shim attachment would let HW-stripped tagged traffic inherit the
-				// parent's zone (cross-zone bypass). A plain parent (no 802.1Q units)
-				// tolerates the failure (the disable-failure is still logged inside
-				// ensureRxVlanOff).
-				if err := rxVlanOffloadActivationError(
-					cfg, cfgName, physName, result.ensureRxVlanOff(physName),
-				); err != nil {
-					return err
-				}
-
-				// Single cached netlink lookup for MTU, speed/duplex, and UP/DOWN.
-				nl, nlErr := result.cachedLinkByIndex(physIface.Index)
-
-				// Apply interface-level MTU from config
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil && ifCfg.MTU > 0 && nlErr == nil {
-					if nl.Attrs().MTU != ifCfg.MTU {
-						if err := netlink.LinkSetMTU(nl, ifCfg.MTU); err != nil {
-							slog.Warn("failed to set MTU",
-								"name", physName, "mtu", ifCfg.MTU, "err", err)
-						} else {
-							slog.Info("set interface MTU", "name", physName, "mtu", ifCfg.MTU)
-						}
-					}
-				}
-
-				// Apply interface speed/duplex via ethtool if configured
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
-					result.applyEthtool(physName, ifCfg)
-				}
-
-				// Tune ring buffers and txqueuelen BEFORE XDP attachment
-				// (ethtool -G can reset the NIC, disrupting attached programs).
-				if nlErr == nil {
-					result.tuneInterfaceBuffers(nl)
-				}
-
-				// Bring the interface UP so XDP can process traffic,
-				// unless the interface is administratively disabled.
-				// Note: For DPDK-bound ports, LinkSetDown has no effect because
-				// DPDK takes over the NIC via VFIO/UIO, bypassing the kernel
-				// driver. DPDK ports are disabled by not including them in the
-				// worker's poll set (the zone map lookup will miss, causing drop).
-				isDisabled := false
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil && ifCfg.Disable {
-					isDisabled = true
-					if nlErr == nil {
-						if err := netlink.LinkSetDown(nl); err != nil {
-							slog.Warn("failed to bring disabled interface down",
-								"name", physName, "err", err)
-						} else {
-							slog.Info("interface administratively disabled", "name", physName)
-						}
-					}
-				} else if nlErr == nil {
-					if err := netlink.LinkSetUp(nl); err != nil {
-						slog.Warn("failed to bring interface up",
-							"name", physName, "err", err)
-					}
-				}
-
-				// Skip XDP/TC attachment for disabled interfaces — they are
-				// administratively down and should not process traffic.
-				if isDisabled {
-					slog.Info("skipping XDP/TC attachment for disabled interface",
-						"name", physName, "ifindex", physIface.Index)
-				} else {
-					// Defer actual XDP/TC attachment to after all compile phases
-					// so link.Update() switches to programs with fully-populated maps.
-					if !attachedXDP[physIface.Index] {
-						xdpIfindexes = append(xdpIfindexes, physIface.Index)
-						attachedXDP[physIface.Index] = true
-					}
-					// Skip TC egress for tunnel interfaces — kernel forwards
-					// the inner packet to the tunnel device, and TC egress
-					// would see it with ingress_ifindex != 0 and drop it.
-					// Tunnels need XDP for ingress (decapsulated traffic)
-					// but not TC for egress (encapsulation is kernel work).
-					if !tunnelIfindexes[physIface.Index] {
-						result.pendingTC = append(result.pendingTC, physIface.Index)
-					} else {
-						slog.Info("skipping TC for tunnel interface",
-							"name", physName, "ifindex", physIface.Index)
-					}
-				}
-				attached[physIface.Index] = true
-			}
-
-			// Reconcile addresses for non-VLAN, non-DHCP, non-RETH, non-fabric-parent interfaces.
-			// DHCP-managed interfaces are skipped — the DHCP client manages their addresses.
-			// RETH interfaces are skipped — VRRP manages their VIP addresses.
-			// Fabric parents are skipped — addresses go on the IPVLAN overlay (fab0/fab1).
-			if vlanID == 0 {
-				var addrs []string
-				isDHCP := false
-				isReth := false
-				isFabricParent := false
-				var unitMTU int
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
-					if unit, ok := ifCfg.Units[unitNum]; ok {
-						addrs = unit.Addresses
-						isDHCP = unit.DHCP || unit.DHCPv6
-						unitMTU = unit.MTU
-					}
-					if ifCfg.RedundancyGroup > 0 {
-						isReth = true
-					}
-					if ifCfg.LocalFabricMember != "" {
-						isFabricParent = true
-					}
-				}
-				if !isDHCP && !isReth && !isFabricParent {
-					reconcileInterfaceAddresses(physName, addrs)
-				}
-				// Apply unit-level MTU (overrides interface-level MTU)
-				if unitMTU > 0 {
-					if nl, err := result.cachedLinkByName(physName); err == nil {
-						if nl.Attrs().MTU != unitMTU {
-							if err := netlink.LinkSetMTU(nl, unitMTU); err != nil {
-								slog.Warn("failed to set unit MTU",
-									"name", physName, "mtu", unitMTU, "err", err)
-							} else {
-								slog.Info("set unit MTU", "name", physName, "unit", unitNum, "mtu", unitMTU)
-							}
-						}
-					}
-				}
-			}
-
-			slog.Info("zone interface configured",
-				"zone", name, "interface", ifaceRef,
-				"phys_ifindex", physIface.Index, "vlan_id", vlanID,
-				"zone_id", zid)
 		}
 	}
 
-	// Auto-add HOST_INBOUND_GRE to zones carrying GRE tunnel transport.
-	applyTunnelHostInbound(dp, cfg, result)
+	return st, nil
+}
 
-	// Store pending XDP ifindexes for deferred attachment after all compile phases.
-	result.pendingXDP = xdpIfindexes
-	result.tunnelIfindexes = tunnelIfindexes
+// mapZoneInterface maps one zone interface reference into the dataplane:
+// resolves the physical/VLAN interface, programs the zone map, performs the
+// one-time per-phys host setup (tx_port, rxvlan, MTU, ethtool, buffers,
+// UP/DOWN, deferred XDP/TC), and reconciles addresses. It mutates st in place
+// (the accumulators persist across the whole zone loop) and returns an error
+// on a hard failure; a soft skip (interface not found, VLAN create failed)
+// returns nil so the caller advances to the next interface.
+func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, result *CompileResult, name string, zone *config.ZoneConfig, zid uint16, ifaceRef string, ifaceTableID map[string]uint32) error {
+	physName, cfgName, unitNum, vlanID := resolveInterfaceRef(ifaceRef, cfg)
 
+	// Get the physical interface (cached to avoid redundant syscalls)
+	physIface, err := result.cachedInterfaceByName(physName)
+	if err != nil {
+		slog.Warn("interface not found, skipping",
+			"interface", physName, "zone", name, "err", err)
+		return nil
+	}
+
+	if vlanID > 0 {
+		// VLAN sub-interface: create it, populate vlan_iface_map
+		subIfindex, err := ensureVLANSubInterface(physName, vlanID)
+		if err != nil {
+			slog.Warn("VLAN sub-interface failed, skipping",
+				"parent", physName, "vlan_id", vlanID, "zone", name, "err", err)
+			return nil
+		}
+
+		if err := dp.SetVlanIfaceInfo(subIfindex, physIface.Index, uint16(vlanID)); err != nil {
+			return fmt.Errorf("set vlan_iface_info %s.%d: %w",
+				physName, vlanID, err)
+		}
+		st.writtenVlanIface[uint32(subIfindex)] = true
+
+		// Reconcile addresses on sub-interface (removes stale, adds missing).
+		// DHCP-managed and RETH sub-interfaces are skipped — DHCP client
+		// manages DHCP addresses, VRRP manages RETH VIP addresses.
+		subName := fmt.Sprintf("%s.%d", physName, vlanID)
+		var addrs []string
+		isDHCPSub := false
+		isReth := false
+		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
+			if unit, ok := ifCfg.Units[unitNum]; ok {
+				addrs = unit.Addresses
+				isDHCPSub = unit.DHCP || unit.DHCPv6
+			}
+			if ifCfg.RedundancyGroup > 0 {
+				isReth = true
+			}
+		}
+		if !isDHCPSub && !isReth {
+			reconcileInterfaceAddresses(subName, addrs)
+		}
+
+		// Apply unit-level MTU to VLAN sub-interface
+		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
+			if unit, ok := ifCfg.Units[unitNum]; ok && unit.MTU > 0 {
+				if nl, err := result.cachedLinkByName(subName); err == nil {
+					if nl.Attrs().MTU != unit.MTU {
+						if err := netlink.LinkSetMTU(nl, unit.MTU); err != nil {
+							slog.Warn("failed to set VLAN sub-interface MTU",
+								"name", subName, "mtu", unit.MTU, "err", err)
+						} else {
+							slog.Info("set VLAN sub-interface MTU", "name", subName, "mtu", unit.MTU)
+						}
+					}
+				}
+			}
+		}
+
+		slog.Info("VLAN sub-interface configured",
+			"parent", physName, "vlan_id", vlanID,
+			"sub_ifindex", subIfindex, "zone", name)
+
+		// Native GRE on VLAN transport needs XDP on the child interface
+		// itself; packets can ingress via ge-*.VID without ever running
+		// the parent's driver XDP hook. VLAN children do not support the
+		// fast path reliably here, so keep them on generic XDP only.
+		if !st.attachedXDP[subIfindex] {
+			st.xdpIfindexes = append(st.xdpIfindexes, subIfindex)
+			result.genericXDPIfindexes[subIfindex] = true
+			st.attachedXDP[subIfindex] = true
+		}
+	}
+
+	// Set zone mapping using composite key {physIfindex, vlanID}
+	tableID := ifaceTableID[ifaceRef] // 0 if not in any routing instance
+	var izFlags uint8
+	var rgID uint8
+	var screenFlags uint32
+	if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
+		if ifCfg.Tunnel != nil {
+			izFlags |= IfaceFlagTunnel
+		}
+		// Check per-unit tunnel
+		if unit, ok := ifCfg.Units[unitNum]; ok && unit.Tunnel != nil {
+			izFlags |= IfaceFlagTunnel
+		}
+		if ifCfg.RedundancyGroup > 0 {
+			rgID = uint8(ifCfg.RedundancyGroup)
+		} else if ifCfg.RedundantParent != "" {
+			// Physical RETH member: inherit RG from the RETH parent.
+			// Without this, check_egress_rg_active() in BPF returns
+			// rg_id=0 for RETH member VLAN sub-interfaces, bypassing
+			// the HA active/inactive check and preventing fabric
+			// redirect after RG failover.
+			if reth, ok := cfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok && reth != nil && reth.RedundancyGroup > 0 {
+				rgID = uint8(reth.RedundancyGroup)
+			}
+		}
+	}
+	if zone.ScreenProfile != "" {
+		profile, ok := cfg.Security.Screen[zone.ScreenProfile]
+		if !ok {
+			return fmt.Errorf("screen profile %q not found for zone %q",
+				zone.ScreenProfile, name)
+		}
+		screenFlags = buildScreenConfig(
+			profile,
+			cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie",
+		).Flags
+	}
+	if izFlags&IfaceFlagTunnel != 0 {
+		st.tunnelIfindexes[physIface.Index] = true
+	} else {
+		// Optimistically set native XDP flag for non-tunnel
+		// interfaces.  Cleared in needGeneric fallback below.
+		izFlags |= IfaceFlagNativeXDP
+	}
+	if err := dp.SetZone(physIface.Index, uint16(vlanID), zid, tableID, izFlags, rgID, screenFlags); err != nil {
+		return fmt.Errorf("set zone for %s vlan %d (ifindex %d): %w",
+			physName, vlanID, physIface.Index, err)
+	}
+	st.writtenIfaceZone[IfaceZoneKey{Ifindex: uint32(physIface.Index), VlanID: uint16(vlanID)}] = true
+
+	// Add physical interface to tx_ports and attach TC (once per phys iface).
+	// XDP attachment is deferred to after the loop so we can ensure
+	// all interfaces use the same XDP mode (native vs generic).
+	if !st.attached[physIface.Index] {
+		// Skip tx_ports for tunnel interfaces — bpf_redirect_map
+		// sends Ethernet frames but tunnels expect raw IP.
+		if st.tunnelIfindexes[physIface.Index] {
+			slog.Info("skipping tx_port for tunnel interface",
+				"name", physName, "ifindex", physIface.Index)
+		} else if err := dp.AddTxPort(physIface.Index); err != nil {
+			return fmt.Errorf("add tx port %s: %w", physName, err)
+		}
+
+		// Disable VLAN RX offload so XDP sees VLAN tags in packet data
+		// (otherwise NIC strips them into skb->vlan_tci which XDP can't read).
+		// Check current state first — toggling rxvlan on iavf VFs causes a
+		// driver reset that drops in-flight packets (kills active TCP sessions).
+		// #5268: if the offload cannot be disabled AND this parent carries
+		// configured VLAN subinterfaces, FAIL ACTIVATION CLOSED — proceeding
+		// to shim attachment would let HW-stripped tagged traffic inherit the
+		// parent's zone (cross-zone bypass). A plain parent (no 802.1Q units)
+		// tolerates the failure (the disable-failure is still logged inside
+		// ensureRxVlanOff).
+		if err := rxVlanOffloadActivationError(
+			cfg, cfgName, physName, result.ensureRxVlanOff(physName),
+		); err != nil {
+			return err
+		}
+
+		// Single cached netlink lookup for MTU, speed/duplex, and UP/DOWN.
+		nl, nlErr := result.cachedLinkByIndex(physIface.Index)
+
+		// Apply interface-level MTU from config
+		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil && ifCfg.MTU > 0 && nlErr == nil {
+			if nl.Attrs().MTU != ifCfg.MTU {
+				if err := netlink.LinkSetMTU(nl, ifCfg.MTU); err != nil {
+					slog.Warn("failed to set MTU",
+						"name", physName, "mtu", ifCfg.MTU, "err", err)
+				} else {
+					slog.Info("set interface MTU", "name", physName, "mtu", ifCfg.MTU)
+				}
+			}
+		}
+
+		// Apply interface speed/duplex via ethtool if configured
+		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
+			result.applyEthtool(physName, ifCfg)
+		}
+
+		// Tune ring buffers and txqueuelen BEFORE XDP attachment
+		// (ethtool -G can reset the NIC, disrupting attached programs).
+		if nlErr == nil {
+			result.tuneInterfaceBuffers(nl)
+		}
+
+		// Bring the interface UP so XDP can process traffic,
+		// unless the interface is administratively disabled.
+		// Note: For DPDK-bound ports, LinkSetDown has no effect because
+		// DPDK takes over the NIC via VFIO/UIO, bypassing the kernel
+		// driver. DPDK ports are disabled by not including them in the
+		// worker's poll set (the zone map lookup will miss, causing drop).
+		isDisabled := false
+		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil && ifCfg.Disable {
+			isDisabled = true
+			if nlErr == nil {
+				if err := netlink.LinkSetDown(nl); err != nil {
+					slog.Warn("failed to bring disabled interface down",
+						"name", physName, "err", err)
+				} else {
+					slog.Info("interface administratively disabled", "name", physName)
+				}
+			}
+		} else if nlErr == nil {
+			if err := netlink.LinkSetUp(nl); err != nil {
+				slog.Warn("failed to bring interface up",
+					"name", physName, "err", err)
+			}
+		}
+
+		// Skip XDP/TC attachment for disabled interfaces — they are
+		// administratively down and should not process traffic.
+		if isDisabled {
+			slog.Info("skipping XDP/TC attachment for disabled interface",
+				"name", physName, "ifindex", physIface.Index)
+		} else {
+			// Defer actual XDP/TC attachment to after all compile phases
+			// so link.Update() switches to programs with fully-populated maps.
+			if !st.attachedXDP[physIface.Index] {
+				st.xdpIfindexes = append(st.xdpIfindexes, physIface.Index)
+				st.attachedXDP[physIface.Index] = true
+			}
+			// Skip TC egress for tunnel interfaces — kernel forwards
+			// the inner packet to the tunnel device, and TC egress
+			// would see it with ingress_ifindex != 0 and drop it.
+			// Tunnels need XDP for ingress (decapsulated traffic)
+			// but not TC for egress (encapsulation is kernel work).
+			if !st.tunnelIfindexes[physIface.Index] {
+				result.pendingTC = append(result.pendingTC, physIface.Index)
+			} else {
+				slog.Info("skipping TC for tunnel interface",
+					"name", physName, "ifindex", physIface.Index)
+			}
+		}
+		st.attached[physIface.Index] = true
+	}
+
+	// Reconcile addresses for non-VLAN, non-DHCP, non-RETH, non-fabric-parent interfaces.
+	// DHCP-managed interfaces are skipped — the DHCP client manages their addresses.
+	// RETH interfaces are skipped — VRRP manages their VIP addresses.
+	// Fabric parents are skipped — addresses go on the IPVLAN overlay (fab0/fab1).
+	if vlanID == 0 {
+		var addrs []string
+		isDHCP := false
+		isReth := false
+		isFabricParent := false
+		var unitMTU int
+		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
+			if unit, ok := ifCfg.Units[unitNum]; ok {
+				addrs = unit.Addresses
+				isDHCP = unit.DHCP || unit.DHCPv6
+				unitMTU = unit.MTU
+			}
+			if ifCfg.RedundancyGroup > 0 {
+				isReth = true
+			}
+			if ifCfg.LocalFabricMember != "" {
+				isFabricParent = true
+			}
+		}
+		if !isDHCP && !isReth && !isFabricParent {
+			reconcileInterfaceAddresses(physName, addrs)
+		}
+		// Apply unit-level MTU (overrides interface-level MTU)
+		if unitMTU > 0 {
+			if nl, err := result.cachedLinkByName(physName); err == nil {
+				if nl.Attrs().MTU != unitMTU {
+					if err := netlink.LinkSetMTU(nl, unitMTU); err != nil {
+						slog.Warn("failed to set unit MTU",
+							"name", physName, "mtu", unitMTU, "err", err)
+					} else {
+						slog.Info("set unit MTU", "name", physName, "unit", unitNum, "mtu", unitMTU)
+					}
+				}
+			}
+		}
+	}
+
+	slog.Info("zone interface configured",
+		"zone", name, "interface", ifaceRef,
+		"phys_ifindex", physIface.Index, "vlan_id", vlanID,
+		"zone_id", zid)
+
+	return nil
+}
+
+// buildInterfaceNetworkdModels derives the networkd managed-interface model
+// from the configured interfaces (RETH member merge, VLAN parents/children,
+// fabric IPVLAN parents, VRRP link-local base addresses). Entries are appended
+// to result.ManagedInterfaces and names recorded in seen for dedup / the
+// unmanaged strip.
+func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, seen map[string]bool) {
 	// Collect managed interface info for networkd config generation.
 	// Iterate over configured interfaces (not zones) to get a clean
 	// per-interface view including VLAN parent and sub-interface entries.
@@ -640,7 +745,6 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		clusterNodeID = cfg.Chassis.Cluster.NodeID
 	}
 	rethToPhys := cfg.RethToPhysical()
-	seen := make(map[string]bool)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
 		if ifCfg == nil {
 			continue
@@ -922,7 +1026,11 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			}
 		}
 	}
+}
 
+// buildFabricBondModels emits networkd bond + member entries for multi-member
+// fabric interfaces (vSRX single-member IPVLAN fabric is handled elsewhere).
+func buildFabricBondModels(cfg *config.Config, result *CompileResult, seen map[string]bool) {
 	// Generate networkd .netdev + .network files for fabric bonds with multiple
 	// members. This makes the bond persistent across reboots via systemd-networkd
 	// (the routing package also creates the bond via netlink at runtime).
@@ -971,7 +1079,11 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			})
 		}
 	}
+}
 
+// buildBridgeDomainModels emits bridge .netdev/.network entries for each bridge
+// domain and sets BridgeMaster on the VLAN sub-interfaces that belong to one.
+func buildBridgeDomainModels(cfg *config.Config, result *CompileResult, seen map[string]bool) {
 	// Bridge domains: generate bridge .netdev + .network entries and set
 	// BridgeMaster on VLAN sub-interfaces that belong to a bridge domain.
 	// Build vlanID → bridge device name map for bridge member assignment.
@@ -1027,7 +1139,14 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			}
 		}
 	}
+}
 
+// stripUnmanagedInterfaces discovers every system interface and marks the
+// unconfigured ones unmanaged: bring them down and remove non-link-local
+// addresses so traffic cannot leak through an unconfigured path. Daemon-owned
+// devices, the #1922 protected set, and (#1956) leave-alone unmapped NICs are
+// skipped.
+func stripUnmanagedInterfaces(cfg *config.Config, result *CompileResult, seen map[string]bool) {
 	// Discover all system interfaces and mark unconfigured ones as unmanaged.
 	// Unmanaged interfaces are brought down and have addresses removed to
 	// prevent traffic leaking through unconfigured paths.
@@ -1164,12 +1283,6 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			slog.Info("brought down unmanaged interface", "name", name)
 		}
 	}
-
-	// Delete stale zone/VLAN map entries no longer in the config.
-	dp.DeleteStaleIfaceZone(writtenIfaceZone)
-	dp.DeleteStaleVlanIface(writtenVlanIface)
-
-	return nil
 }
 
 // applyTunnelHostInbound auto-adds HOST_INBOUND_GRE to any security zone
