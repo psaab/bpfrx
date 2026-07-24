@@ -36,9 +36,12 @@
   (neutralize → RED → restore → GREEN).
 - **Validation**: cargo build clean; policy::tests 183 passed; flowless (61)
   and forwarding_build (114) suites green; full `make test-rust` green.
-  docs/junos-cli-reference.md unchanged — the strict commit gate already
-  rejects blank scope elements, so the operator-visible commit contract is
-  untouched (#6464 hardens only the snapshot-decode backstop).
+  docs/junos-cli-reference.md unchanged — no committed config can emit a
+  blank scope element: the compiler emit path strips blanks before
+  validation (`firewallMatchValues` skips empty tokens; `sortDedupZones`
+  drops them), so the operator-visible commit contract is untouched (#6464
+  hardens only the snapshot-decode backstop against corrupt / hand-built /
+  mixed-version-peer snapshots).
 
 
 

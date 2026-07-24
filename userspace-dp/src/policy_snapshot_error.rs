@@ -546,8 +546,10 @@ pub(crate) enum SnapshotIntegrityError {
     /// the default-deny `PolicyState`) is action-agnostic: it never turns a deny
     /// into a pass nor a permit into match-any. The empty token and the special
     /// `any` / `junos-host` zone names always resolve (see
-    /// `resolve_policy_zone_id` / `build_global_zone_scope`) and so never trip
-    /// this.
+    /// `resolve_policy_zone_id`) and so never trip this. An empty ELEMENT inside
+    /// a plural `match_*_zones` list DOES trip this via `build_global_zone_scope`
+    /// (#6464); only the empty singular field is exempt (dropped by
+    /// `effective_match_zones` as an omitted scope).
     UnresolvableZoneReference { rule_id: String, zone: String },
     /// #3771 (M4): a `RouteSnapshot` carried a NON-EMPTY `family` that does not
     /// match the address family of its `destination` prefix (e.g. family="inet6"
