@@ -23,12 +23,24 @@
 - **File(s)**: pkg/configstore/store_persist.go,
   pkg/configstore/archive_offlock_6403_test.go, pkg/configstore/README.md
 - **Validation**: `go build ./...`, `go vet ./pkg/configstore/`, gofmt clean;
-  `go test ./pkg/configstore/ -race` GREEN; full `go test ./...` GREEN. Two new
+  `go test ./pkg/configstore/ -race` GREEN; full `go test ./...` GREEN. Two
   fail-on-revert tests
   (`TestArchiveConfigSeedsFromDirBeforeClaimingSeq`,
   `TestArchiveConfigClaimSeqAtomicVsConcurrentReseed`) assert the REAL rotation
   outcome (fresh archive survives, oldest pre-existing pruned); both go clean-
   assertion RED when the `s.archiveSeq.Store(seed)` seed is neutralized.
+- **Fold (Codex MINOR, review round)**: added a third deterministic test
+  `TestArchiveConfigLockIsExclusiveAcrossSeedClaim` that PINS the exclusive
+  `s.mu.Lock` (vs `RLock`) — the two seed tests above still pass under an
+  RLock+seed regression because they exercise a single call. It blocks the first
+  `ArchiveConfig` inside its seed scan via the `archiveDirReader` seam (holding
+  the lock) and asserts a second concurrent call cannot reach its own scan
+  within a bounded 500ms window (blocked on `s.mu.Lock()`); under `RLock` the
+  second acquires the shared lock and proceeds, so `secondScanEntered` fires and
+  the assertion goes clean RED. Parent-RED for it: revert
+  `s.mu.Lock`→`s.mu.RLock` (+ paired `Unlock`→`RUnlock`) keeping the seed store —
+  the new test RED, the two seed tests stay GREEN. Verified firsthand; new test
+  stable over 20 `-race` runs (no flakiness).
 
 ## 2026-07-23 — #6165: gate the ~1s desired-state forwarding reconcile with the required-protocol check
 
