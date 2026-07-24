@@ -60372,6 +60372,85 @@ top.
     pkg/api/sessions_pagination_canonical_5649_test.go,
     docs/refactoring-audit-current.txt, _Log.md
 - **Timestamp**: 2026-07-24
+- **Action**: #6467 — next-table ip-rule 100-rule cap was Warn-only (no
+    aggregated error) AND the userspace FIB mirrored ALL config next-table
+    leaks uncapped, so leak #101+ existed in the userspace FIB but not the
+    kernel — a slow-path packet matching #101+ resolved into the target VRF on
+    the AF_XDP fast path but the main table in the kernel (verdict split).
+    FIX (Go control-plane): (1) pkg/routing/rules.go nextTableManager.Apply now
+    aggregates a degraded error naming how many next-table routes past the cap
+    are not leaked (mirroring the rib-group :358 and PBR :611 caps) instead of
+    slog.Warn+break; the loop is index-based to count the dropped tail. (2)
+    pkg/dataplane/userspace/routes.go buildRouteSnapshots caps GLOBAL
+    config-static next-table leaks at config.NextTableRuleWindow via a shared
+    v4-then-v6 counter, matching ApplyNextTableRules's shared priority counter,
+    so both planes truncate the identical tail. (3) SSOT: promoted the window
+    to exported config.NextTableRuleWindow + config.NextTableRulePriorityBase
+    (types_system.go, mirroring the #4479 PBR band); pkg/config's commit-gate
+    maxNextTableRules (#5854), pkg/routing's new maxNextTableRules, and the FIB
+    mirror all derive from it — no lockstep drift. FAIL-ON-REVERT:
+    TestNextTableApplyCapAggregatesDegradedError (rules_6467_test.go) asserts
+    non-nil error naming "next-table rule limit" + "50 next-table route(s)";
+    TestBuildRouteSnapshotsCapsConfigStaticNextTableLeaks
+    (routes_6467_test.go) asserts the FIB publishes <= 100 leaks; existing
+    TestNextTableRulesPriorityCap/over-limit flipped to expect the degraded
+    error. Confirmed parent-RED by neutralizing the errs-append to slog.Warn
+    (routing cap tests RED at rules_6467_test.go:48 + rules_test.go:582, clean
+    assertion, not compile break) then restoring GREEN. Updated
+    docs/rib-group-route-leaking.md (#6467 apply-side + FIB reconcile + SSOT).
+    Regenerated docs/refactoring-audit-current.txt (rules.go 1534->1566,
+    types_system.go 1610->1632). go build ./..., go vet, gofmt -l clean,
+    go test ./pkg/routing/... ./pkg/config/... ./pkg/dataplane/... GREEN,
+    heatmap canary GREEN (TMPDIR=/dev/shm).
+- **File(s)**: pkg/config/types_system.go,
+    pkg/config/compiler_validate_strict_routing_rulewindows.go,
+    pkg/routing/rules.go, pkg/routing/rules_test.go,
+    pkg/routing/rules_6467_test.go, pkg/dataplane/userspace/routes.go,
+    pkg/dataplane/userspace/routes_6467_test.go,
+    docs/rib-group-route-leaking.md, docs/refactoring-audit-current.txt, _Log.md
+- **Timestamp**: 2026-07-24
+- **Action**: #6486 FOLD (both hostile reviewers — Claude rev6486 MINOR + Codex
+    MAJOR — found the same FIB/applier eligibility divergence). My #6486 FIB cap
+    counted + published a snapshot for EVERY global next-table route, but the
+    applier (pkg/routing/rules.go) SKIPS a route whose target instance is unknown
+    (tableIDs miss) or whose CIDR fails net.ParseCIDR (no prio++). So dangling/
+    invalid routes consumed FIB window slots + published ghost leaks the kernel
+    never installs: measured 50 ghost + 100 valid -> kernel installs 100 valid,
+    FIB published 50 ghost + only 50 valid (50 valid MISSING). FOLD (Go-only):
+    (1) PRIMARY pkg/dataplane/userspace/routes.go buildRouteSnapshots — build a
+    definedInstances name set (mirroring the applier's tableIDs) and gate the
+    GLOBAL next-table count+publish on definedInstances membership AND
+    net.ParseCIDR(route.Destination), so the FIB publishes EXACTLY the valid set
+    the applier installs (no ghost, valid tail present up to the window). (2)
+    SECONDARY pkg/routing/rules.go — the degraded-error dropped-count scan now
+    counts only ELIGIBLE tail routes (known instance + parseable CIDR) so "N not
+    leaked" is accurate, not inflated by routes that never install. (3) MINOR
+    rules_test.go TestNextTableRulesPriorityCap — replaced hardcoded 100/150/+100
+    with config.NextTableRuleWindow SSOT. MEASURED post-fold: FIB ghost=0
+    valid=100 == applier installed=100 (equal). Tests: added
+    TestBuildRouteSnapshotsFIBEligibilityMirrorsApplier (routes_6467_test.go, 50
+    ghost + 120 valid -> asserts 0 ghost + full window valid) and
+    TestNextTableApplyDroppedCountCountsOnlyEligible (rules_6467_test.go, tail 50
+    valid + 30 ghost -> drop count names 50 not 80). Modernized two #3770 dedup/
+    sort fixtures (routes_dedupe_3770_test.go) that used UNREALISTIC qualified
+    undefined-instance next-table names ("blue.inet.0") — now bare names + defined
+    instances (the parser stores bare names via parseNextTableInstance; the
+    applier's own tableIDs lookup would skip qualified names). PARENT-RED:
+    neutralized ONLY the definedInstances membership skip (kept _ = definedInstances
+    to avoid unused-var) -> TestBuildRouteSnapshotsFIBEligibilityMirrorsApplier RED
+    at routes_6467_test.go:166 ("FIB published 50 ghost next-table leaks ... the
+    FIB must mirror the applier's eligibility") + :172 ("FIB published 50 valid ...
+    want 100 ... squeeze out valid leaks"), clean assertions, not a compile break;
+    restored GREEN. Updated docs/rib-group-route-leaking.md (#6467 eligibility
+    mirror paragraph). Regenerated docs/refactoring-audit-current.txt (rules.go
+    1566->1581). go build ./..., go vet, gofmt -l clean; go test ./pkg/routing/...
+    ./pkg/config/... ./pkg/dataplane/... GREEN; heatmap canary GREEN
+    (TMPDIR=/dev/shm, GOCACHE=/dev/shm/gc-6467b).
+- **File(s)**: pkg/dataplane/userspace/routes.go,
+    pkg/dataplane/userspace/routes_6467_test.go,
+    pkg/dataplane/userspace/routes_dedupe_3770_test.go, pkg/routing/rules.go,
+    pkg/routing/rules_test.go, pkg/routing/rules_6467_test.go,
+    docs/rib-group-route-leaking.md, docs/refactoring-audit-current.txt, _Log.md
 - **Action**: #6462 — DNAT bare `match destination-port` with no `match
     protocol` installed a TCP-only entry, so UDP to the VIP:port was silently
     not translated (Junos matches a bare destination-port across BOTH tcp and
@@ -60536,3 +60615,40 @@ top.
     pkg/config/dup_nat_ruleset_names_6454_test.go, pkg/config/compiler.go,
     pkg/config/compiler_opts.go, docs/config-schema.md,
     docs/refactoring-audit-current.txt, _Log.md
+## 2026-07-24 — #6469 swanctl render-belt completeness (endpoints + proposals)
+- **Timestamp**: 2026-07-24
+- **Action**: Sanitize EVERY remaining raw-`%s` swanctl render slot that
+  carries peer/operator-influenced free text, so the render belt in
+  `renderConfig` (`policy.go`) is complete. A validation-bypassed path (HA
+  peer-sync of a pre-fix config, direct IPsecConfig construction, a config
+  persisted before the fix) could carry an embedded newline and inject a
+  live swanctl directive. Wrapped four Fprintf sites in
+  `sanitizeSwanctlValue`:
+  - `local_addrs` / `remote_addrs` (resolved endpoint from
+    resolveRemoteAddr — the Gateways-map shape took gw.Address /
+    gw.DynamicHostname verbatim; the legacy inline vpn.Gateway shape was
+    already filtered by config.IsUsableIPsecEndpoint).
+  - `proposals` (IKE, ikeProposals) / `esp_proposals` (ESP, espProposals)
+    — buildIKEProposal* / buildESPProposal append prop.EncryptionAlg /
+    prop.AuthAlg VERBATIM on the unknown-algorithm fall-through
+    (normalizeAuthAlg default branch; normalizeEncAlg generic gcm strip),
+    so a control char survives. esp_proposals sits inside children{} where
+    an injected `updown = <script>` runs as ROOT — a strictly worse vector
+    than the endpoint one (the FOLD gap: the original PR's "last raw-%s
+    surface" claim was FALSE — a hostile review caught these two siblings).
+  All four are UNQUOTED list slots → sanitize alone (NO escapeSwanctlQuoted,
+  which is for the quoted id/cert/secret slots). Legit values byte-
+  identical: `.`/`,`/`:`/`%`/`-` preserved, so single/comma-list/IPv6/`%any`
+  endpoints and dashed multi-proposal lists render unchanged. Slot-
+  classification sweep confirmed the remaining slots are safe by
+  construction (auth / dpd_action = fixed enums; id/certs/secret already
+  belted; names sanitized; dpd_delay/rekey_time/if_id_* = integers).
+  Fail-on-revert tests: 4 endpoint vectors + 2 proposal vectors (IKE
+  `proposals` newline; ESP `esp_proposals` updown→root) + endpoint and
+  proposal over-escape guards. Parent-RED confirmed firsthand per slot —
+  revert proposals wrap → "proposal injection NOT neutralized: reauth_time
+  = 0 rendered as a live directive line"; revert esp_proposals wrap →
+  "... updown = /tmp/pwn.sh rendered as a live directive line". go build /
+  vet / gofmt / pkg-ipsec-suite / heatmap GREEN.
+- **File(s)**: pkg/ipsec/policy.go,
+    pkg/ipsec/swanctl_addr_sanitize_6469_test.go, pkg/ipsec/README.md, _Log.md
