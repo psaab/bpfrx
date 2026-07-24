@@ -74,6 +74,9 @@ reviewer (joins at /engineer on the code PR).
 | r23 | Codex | codex companion task-mrzidzng-o7br27 (session 019f963b-e63a-7683-be11-7b73d526b21c) | NEEDS-REVISION (2 MAJOR, 3 MINOR) |
 | r23 | AGY | agy print-mode direct (agy-plan-r23.md) | PLAN-READY (attack-2 cites the wrong lines for the transient pin — see claude-smr-plan-r23.md + agy-plan-r23.md header note) |
 | r23 | Claude SMR | in-conversation (claude-smr-plan-r23.md) | PLAN-READY-WITH-NITS (0 MAJOR, 1 MINOR — the (d-i) transient boundary, converging with Codex M1) |
+| r24 | Codex | codex companion task-mrzjrwtg-0bq72q (session 019f965f-707a-76f2-bd78-5baa34dbfe6f) | NEEDS-REVISION (2 MAJOR, 4 MINOR) |
+| r24 | AGY | agy print-mode direct (agy-plan-r24.md) | PLAN-READY (0 findings) |
+| r24 | Claude SMR | in-conversation (claude-smr-plan-r24.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR — write-failure doctrine + operator-ownership pins, subsumed by Codex M1/m3) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 

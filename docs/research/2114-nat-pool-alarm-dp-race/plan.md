@@ -1,9 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v24 — r23 findings folded (Codex NEEDS-REVISION
-  2M/3m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m — its
-  m1 converged with Codex M1 on the (d-i) transient boundary);
-  pending convergence review r24
+- **Status**: DRAFT v25 — r24 findings folded (Codex NEEDS-REVISION
+  2M/4m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/2m — its
+  m1/m2 were subsumed by the Codex M1 write-failure doctrine + the
+  m3 ownership pin); pending convergence review r25
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -707,6 +707,50 @@
   `ConfigPersistDegraded()` is a DERIVED value
   (`persistDegraded || mask ≠ 0 || enum ≠ OK`), not a snapshot
   field.
+  v25: r24 convergence — the doctrine contradictions are resolved
+  (Codex 2M/4m; AGY PLAN-READY; SMR PLAN-READY-WITH-NITS — its two
+  nits are subsumed by (a) and (e)): (a) the permanent-error state
+  machine is unified (Codex M1, verified the self-contradiction:
+  (w-u)/(d-i) require repair writes after PERMANENT read failures
+  while the taxonomy terminalized every such debt): terminalization
+  is SCOPED to CONTENT-DEPENDENT debts (the R-kind read-back
+  tombstone — a permanent read makes its action impossible, and
+  auto-erasure would hide a corruption the operator should inspect);
+  CONTENT-INDEPENDENT debts (W-kind restore from `s.armedRecord`,
+  D-kind synthesized tombstone) are EXEMPT — their purpose is
+  precisely to overwrite a provably-superseded unreadable record;
+  and WRITE failures on ANY debt kind NEVER terminalize (retain +
+  capped-backoff retry + degraded health — a read-only filesystem
+  loops at 503, the intended loud posture; the invalid-master-key
+  case fails both read and write and loops degraded until the
+  operator repairs the key). (b) The downgrade oracle is corrected
+  (Codex M2, verified: recovery assigns `s.active = rec.PrevTree`
+  ALWAYS — the synthetic `PrevTree` = current tree is content-right
+  either way; `FirstCommit=true` on the OLD reader forces
+  `compiled=nil`, `everCommitted=false`, `committed=0` →
+  FIRST-COMMIT/BOOTSTRAP handling, NOT an empty-tree revert as v24
+  claimed): the regression now asserts serialized `FirstCommit=false`
+  + `compiled` present + `committed=1` + NON-bootstrap boot class,
+  with the `FirstCommit=true` variant landing in bootstrap handling
+  to prove the pin load-bearing. (c) The (w-u) restore failure is
+  phase-qualified (Codex m1): PRE-rename → unreadable record stands
+  → D's (d-i); POST-rename → live C VISIBLE → W stays owed ((w-a))
+  and D's mandatory re-read reaches (d-iii) READABLE → clear as
+  moot; phase regressions for both legs. (d) The residual wording is
+  corrected (Codex m4): the crash must land INSIDE the seconds-wide
+  retry window for the loss to materialize — there is NO post-crash
+  heal (the process-local W debt dies with the process; the window's
+  crash-recovery file is lost outright). (e) The operator-ownership
+  posture is pinned (Codex m3 = SMR m2): confirm.json is STORE-OWNED
+  — a repaired record is CLASSIFIED, never trusted; sanctioned
+  remediations are REMOVAL (confirmed absence) or
+  repair-to-valid-then-classify; an arm/restore overwriting a
+  differing record is intentional (the single-Store invariant covers
+  processes; this pin covers hand edits). (f) The remaining schema
+  copies are unified (Codex m2): §5.1 and the x14/x21 copies all
+  carry the exact three-value breakdown with the aggregate DERIVED
+  (`persistDegraded || mask ≠ 0 || enum ≠ OK`) and the four-level
+  precedence.
 
 ---
 
@@ -1678,10 +1722,17 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   eager rule. PRIORITY: W runs BEFORE the slot-keyed D-kind debt
   (D2's restore-priority generalized): a successful restore installs
   the live record over the slot, subsuming D as moot (the
-  superseded-unreadable target is gone); a restore FAILURE returns
-  the slot to D's (d-i) path (tombstone+delete of the unreadable
-  record; the W debt retries from absence next pass) — with a crash
-  regression driving W-before-D and D-after-restore-failure. MERGE semantics
+  superseded-unreadable target is gone); a restore FAILURE is
+  qualified by PHASE (r24 Codex m1): PRE-rename → the unreadable
+  record stands → the slot returns to D's (d-i) path
+  (tombstone+delete of the unreadable record; the W debt retries
+  from absence next pass); POST-rename → the LIVE record C is
+  VISIBLE on the slot → the W debt remains owed (C visible, not
+  durable — (w-a) makes it durable next pass) AND the D-kind
+  retry's mandatory re-read reaches (d-iii) READABLE → clears D as
+  moot (the slot now provably holds C, not the superseded
+  unreadable record) — phase regressions for both legs, including
+  the slot-keyed D composition. MERGE semantics
   (r19 Codex m1): for the same record, tombstone-required dominates
   delete-finishing — a removal debt needing tombstone+delete and a
   removal debt needing only the delete-finish merge into the
@@ -1797,11 +1848,35 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   PLUS the deterministic crypto/envelope failures (corrupt envelope,
   authentication failure, unsupported PRF, invalid observed master-key
   length, `crypto.go:307-356,366-395,409-453`) → TERMINAL for THAT
-  DEBT: the confirm-record debt stops retrying (no infinite
+  DEBT — SCOPED to CONTENT-DEPENDENT debts (r24 Codex M1, verified the
+  self-contradiction: (w-u) and (d-i) require REPAIR WRITES after
+  permanent read failures while this branch said every such debt
+  terminalizes): the terminalization applies ONLY to debts whose
+  action needs the record's CONTENT (the R-kind read-back tombstone —
+  a permanent read error makes its read-mutate-write impossible, and
+  auto-erasure would hide a corruption the operator should inspect).
+  CONTENT-INDEPENDENT debts are EXEMPT BY CONSTRUCTION: the W-kind
+  restore (content = `s.armedRecord`, in memory) and the D-kind
+  synthesized tombstone (content = synthesized) need NO read — and
+  their whole purpose is to overwrite a provably-superseded
+  unreadable record (the (ii-b) eager rule applies only where a newer
+  durable config landed AFTER the record's window, so the record is
+  stale by construction and repair-and-recover has no value — unlike
+  the R-kind terminal case, where the corrupt record's owner is known
+  but the operator's repair-or-remove decision is the point).
+  Terminal for a content-dependent debt means: the confirm-record
+  debt stops retrying (no infinite
   capped-backoff loop) while the singleton retry loop KEEPS healing
   `persistDegraded` — `persistRetryLoop` also owns active-config
   persistence (`store_persist.go:402-465`), so stopping the loop
-  outright is unsafe (r16 Codex M4's per-debt correction). The
+  outright is unsafe (r16 Codex M4's per-debt correction). WRITE
+  failures, on ANY debt kind, NEVER terminalize (r24 Codex M1's
+  ownership pin: a failed tombstone/restore/delete write retains the
+  debt and retries with capped backoff and degraded health — a
+  read-only filesystem loops at 503, the intended loud posture, until
+  the operator remediates; the invalid-master-key-length case makes
+  BOTH the read and the write fail permanently, and the debt loops
+  degraded — loudly — until master.key is repaired). The
   classification is MECHANICAL, not string-matching (r16 Codex item-5
   follow-through, verified: today only the malformed-JSON path wraps
   — the zero-deadline and nil-rollback-target gates construct PLAIN
@@ -1865,13 +1940,24 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   `HashBasis` = `"canonical-v1"` — pinned to the hash's actual basis,
   never a "current" default; `ArmID` = fresh crypto/rand; `FirstCommit` =
   FALSE — LOAD-BEARING, with the rationale stated precisely (r23
-  Codex m2's correction): on the NEW reader the `Resolved` check
+  Codex m2 + r24 Codex M2's oracle correction, verified against the
+  recovery code): on the NEW reader the `Resolved` check
   precedes work item H in the total order, so H never sees this
-  record; the load-bearing case is the OLD (pre-H2) reader, which
-  IGNORES `Resolved` — a `FirstCommit=true` record whose 60 s
-  deadline has passed would take the OLD reader's EXPIRED-first-
-  commit path (`store_persist.go:171-194,231-247`) and revert to the
-  EMPTY tree instead of the no-op revert to `PrevTree`. The write is the full fsatomic cycle,
+  record. On the OLD (pre-H2) reader, which IGNORES `Resolved`, an
+  expired record takes the expired-during-downtime path, which
+  assigns `s.active = rec.PrevTree` ALWAYS
+  (`store_persist.go:166-172`) — with the synthetic `PrevTree` being
+  the current tree, the CONTENT is right either way; the
+  `FirstCommit` branch then decides the POSTURE: `FirstCommit=true`
+  forces `compiled=nil`, `everCommitted=false`, and a `committed=0`
+  marker (`store_persist.go:176-184`), re-classifying the boot into
+  FIRST-COMMIT/BOOTSTRAP handling (`ActiveConfig()==nil` +
+  `!everCommitted` → bootstrap-from-file import) — breaking the
+  committed/runtime posture even though the tree content is
+  identical; `FirstCommit=false` takes the else branch
+  (`store_persist.go:185-194`): compile `PrevTree` (== the current
+  tree), `compiled` set, `everCommitted=true`, `committed=1` — a
+  true no-op. The write is the full fsatomic cycle,
   so its dir-fsync doubles as the replacement's durability barrier
   on POST-rename converge paths (same-directory, as r16-r17). A
   replay of this record drops at the Resolved-first recovery check —
@@ -1886,9 +1972,14 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   exists to prevent, accepted once on a downgrade path),
   self-limiting (the timer fires once; the record is consumed), and
   covered by a downgrade-shape regression scoped precisely (r23
-  Codex m2): NORMAL content → the old reader's legacy-basis compare
-  binds (canonical == legacy for normal content) → re-arms → reverts
-  to the identical tree → consumes the record; EXCEPTIONAL content
+  Codex m2 + r24 Codex M2's oracle): NORMAL content → the old
+  reader's legacy-basis compare binds (canonical == legacy for
+  normal content) → re-arms → and the assertions are the POSTURE,
+  not just the tree: serialized `FirstCommit=false`, `compiled`
+  present, `everCommitted=true`, `committed=1` marker, and a
+  NON-bootstrap boot class (a `FirstCommit=true` variant of the
+  record must instead land in the bootstrap handling above —
+  proving the pin is load-bearing); EXCEPTIONAL content
   (where the bases diverge per the earlier rounds' analysis) → the
   old reader's hash check mismatches → stale-drop — both safe, and
   the test asserts each leg.
@@ -2029,7 +2120,16 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   confirmed absence (barrier re-drive above) and
   performs the clear in-process (no restart required for the
   debt-origin case; the boot-origin case defers record action to the
-  next boot per the continuation kinds). Manual
+  next boot per the continuation kinds). The OWNERSHIP posture is
+  pinned (r24 Codex m3 = SMR m2): confirm.json is STORE-OWNED — a
+  repaired record is CLASSIFIED (re-validated through the normal
+  total order), never trusted on the operator's say-so; the
+  sanctioned remediations are REMOVAL (confirmed absence clears via
+  the barrier re-drive) or repair-to-a-valid-record followed by
+  classification — and an arm or restore overwriting a differing
+  record is intentional (the Store owns the slot; the single-Store
+  invariant at `daemon.go:1042-1053` covers processes, and this pin
+  covers hand edits). Manual
   remediation is documented loudly in the journal and the
   `pkg/configstore/README.md` contract prose.
 - **Election-neutral terminal-503 policy — stated explicitly, with a
@@ -2334,11 +2434,16 @@ record long gone); (x20) FAIL-CLOSED ROUTING (r18 Codex M6 = SMR M1 + r19 Codex 
 `classifyLoadError` fail-closed mapping (`bootstrap_test.go:10-36`
 legs), confirm.json-named diagnostic, pinned retry envelope (initial
 read + ≤3 retries, 100/200/400 ms, `LoadContext(ctx)`); (x21)
-THREE-FIELD HEALTH PRECEDENCE (r18 Codex M7/m5 + r19 Codex m4): all
-three causes in
-the snapshot, /health precedence terminal > confirm-persist (generic
-removal/rewrite message + debt-kind detail) >
-active-persist, gauge aggregate OR, Config → NewServer plumbing
+HEALTH SNAPSHOT PRECEDENCE (r18 Codex M7/m5 + r19 Codex m4 + r20
+Codex m2 + r23 Codex m3): the exact three-value breakdown
+`{ActivePersistDegraded, ConfirmDebtKindMask
+(REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
+(OK|TerminalUnreadable|RestartRecoveryOwed)}` with the aggregate
+DERIVED (`persistDegraded || mask ≠ 0 || enum ≠ OK`);
+/health precedence TerminalUnreadable > RestartRecoveryOwed >
+ConfirmDebt (generic removal/rewrite/slot-delete message + mask
+detail) > ActivePersist; the gauge consumes the derived aggregate OR;
+Config → NewServer plumbing
 pinned. This closes the
 master's re-arm-after-confirmed residual for the whole confirm-type
 class AND the post-durability replacement finalize — the two places a
@@ -2594,10 +2699,13 @@ coexistence) is deleted as incoherent (r1 B3).
   clock seam) then fail-`Load` with
   the NEW `ErrConfirmStateUnreadable` sentinel routed fail-closed
   through `classifyLoadError`, and the
-  typed `ConfigPersistDegradedState()` snapshot accessor
-  (aggregate bool + `ConfirmDebtKindMask (REMOVAL|REWRITE|SLOT_DELETE)` +
-  `ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed)`)
-  with precedence TerminalUnreadable > RestartRecoveryOwed >
+  typed `ConfigPersistDegradedState()` snapshot accessor returning the
+  exact three-value breakdown `{ActivePersistDegraded bool,
+  `ConfirmDebtKindMask (REMOVAL|REWRITE|SLOT_DELETE)`,
+  `ConfirmRecordState (OK|TerminalUnreadable|RestartRecoveryOwed)`}`
+  with the aggregate `ConfigPersistDegraded()` DERIVED
+  (`persistDegraded || mask ≠ 0 || enum ≠ OK`), and precedence
+  TerminalUnreadable > RestartRecoveryOwed >
   ConfirmDebt > ActivePersist; the
   SyncApply finalize ordering in `store.go`; the hedge-the-cause
   stale-drop diagnostic (`store_persist.go:159-165`).
@@ -2965,9 +3073,11 @@ Preserved exactly:
     — never silently cleared), and the restore-failure arm-persistence
     residual (a LIVE window's restore fails, the dead record's R-kind
     delete succeeds, and a crash lands before the next W pass — the
-    live window is left recordless for seconds until the W retry
-    restores it, materially master's own best-effort arm-write-failure
-    posture, `store_commit.go:548-553`), and
+    crash must land INSIDE the seconds-wide retry window for the loss
+    to materialize; there is NO post-crash heal — the process-local W
+    debt is gone with the process and the window's crash-recovery file
+    is lost outright, materially master's own best-effort
+    arm-write-failure posture, `store_commit.go:548-553`), and
     the PERMANENT-class boot-read residual (a deterministically
     corrupt record at boot proceeds degraded with the latch — an
     unconfirmed config may stand, LOUDLY, until operator action;
@@ -3247,12 +3357,18 @@ Preserved exactly:
      `classifyLoadError` fail-closed mapping (NOT
      `loadOtherError` — `bootstrap_test.go:10-36` legs); the fatal
      diagnostic names confirm.json; (x14) TYPED HEALTH CHANNEL (r17
-     Codex M6/m2 + r18 M7 + r19 m4): `ConfigPersistDegradedState()`
-     carries all THREE causes;
-     /health precedence terminal > confirm-persist (generic
-     removal/rewrite message + debt-kind detail) > active-persist;
-     the gauge stays the aggregate OR;
-     descriptor/option/wiring comments name all three causes; (x15) TAXONOMY BOUNDARY (r17 Codex M4): master-key
+     Codex M6/m2 + r18 M7 + r19 m4 + r20 Codex m2 + r23 Codex m3):
+     `ConfigPersistDegradedState()` returns the exact three-value
+     breakdown `{ActivePersistDegraded bool, ConfirmDebtKindMask
+     (REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
+     (OK|TerminalUnreadable|RestartRecoveryOwed)}`; the aggregate
+     `ConfigPersistDegraded()` is DERIVED
+     (`persistDegraded || mask ≠ 0 || enum ≠ OK`);
+     /health renders by precedence TerminalUnreadable >
+     RestartRecoveryOwed > ConfirmDebt (generic
+     removal/rewrite/slot-delete message + mask detail) > ActivePersist;
+     the gauge consumes the derived aggregate OR;
+     descriptor/option/wiring comments name all the causes; (x15) TAXONOMY BOUNDARY (r17 Codex M4): master-key
      IO → TRANSIENT retry, no latch; invalid observed key length +
      envelope/auth/PRF/parse → PERMANENT latch; (x16) SAME-RECORD
      DOMINANCE (r18 Codex M2 + r19 Codex M1): W_B + R_B coexisting
@@ -3371,7 +3487,7 @@ Preserved exactly:
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r24)
+## 11. Open questions for adversarial review (r25)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
@@ -3660,7 +3776,28 @@ revert-to-EMPTY path), and the health schema unified (the snapshot is
 exactly `{ActivePersistDegraded, ConfirmDebtKindMask
 (REMOVAL|REWRITE|SLOT_DELETE), ConfirmRecordState
 (OK|TerminalUnreadable|RestartRecoveryOwed)}` with the aggregate a
-DERIVED value, not a snapshot field).
+DERIVED value, not a snapshot field); r24 additions: the
+permanent-error state machine unified (terminalization SCOPED to
+content-dependent debts — the R-kind read-back tombstone;
+content-INDEPENDENT debts (W restore, D synthesized tombstone) EXEMPT
+— their purpose is to overwrite a provably-superseded unreadable
+record; WRITE failures on ANY debt kind NEVER terminalize — retain +
+capped-backoff retry + degraded health, the intended loud posture),
+the downgrade oracle corrected (recovery assigns `s.active =
+rec.PrevTree` ALWAYS; `FirstCommit=true` on the OLD reader forces
+`compiled=nil` + `everCommitted=false` + `committed=0` → bootstrap
+handling, NOT an empty-tree revert; the regression asserts
+`FirstCommit=false` + compiled + `committed=1` + non-bootstrap boot
+class), the (w-u) restore failure phase-qualified (PRE-rename → D's
+(d-i); POST-rename → live C visible, W stays owed, D's re-read
+reaches (d-iii) → clear as moot), the residual wording corrected
+(the crash must land INSIDE the seconds-wide retry window — NO
+post-crash heal; the process-local W debt dies with the process),
+the operator-ownership posture pinned (confirm.json is STORE-OWNED;
+a repaired record is CLASSIFIED, never trusted; sanctioned
+remediations are removal or repair-to-valid-then-classify), and the
+remaining schema copies unified (exact three-value breakdown with
+the aggregate DERIVED and the four-level precedence).
 
 Still open:
 
