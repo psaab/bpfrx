@@ -141,11 +141,31 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, map[string
 			b.WriteString("    aggressive = yes\n")
 		}
 
+		// local_addrs / remote_addrs carry the endpoint address list
+		// (a real IP / dotted hostname, an IPv6 literal, a comma-
+		// separated multi-address list, or the responder-only "%any").
+		// Run them through sanitizeSwanctlValue for parity with the
+		// local_ts / remote_ts belt below and the id / PSK belts above:
+		// these are UNQUOTED list slots, so an embedded control
+		// character — a newline in particular — would otherwise inject an
+		// arbitrary `key = value` line (downgrade `version`, flip
+		// `aggressive`, add `also`/`children`) into the connection block.
+		// sanitizeSwanctlValue collapses the newline to a space, keeping
+		// the whole value on one line so a tampered address renders inert
+		// instead of live. It touches nothing in a legitimate address
+		// (letters, digits, `.`, `:`, `,`, `%` are all preserved), so a
+		// valid single/comma-list/IPv6 endpoint is byte-identical. The
+		// commit-time gate (validateIPsecEndpointsStrict) rejects such a
+		// value; this render belt is the by-construction backstop for a
+		// path that reaches render without local commit (HA peer-sync,
+		// direct IPsecConfig construction, a config persisted before the
+		// fix). Unquoted, so NO escapeSwanctlQuoted — that belt is for the
+		// quoted id / cert / secret slots only (#6469).
 		if localAddr != "" {
-			fmt.Fprintf(&b, "    local_addrs = %s\n", localAddr)
+			fmt.Fprintf(&b, "    local_addrs = %s\n", sanitizeSwanctlValue(localAddr))
 		}
 		if remoteAddr != "" {
-			fmt.Fprintf(&b, "    remote_addrs = %s\n", remoteAddr)
+			fmt.Fprintf(&b, "    remote_addrs = %s\n", sanitizeSwanctlValue(remoteAddr))
 		}
 
 		// NAT traversal

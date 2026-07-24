@@ -607,6 +607,31 @@ all files stay in `package ipsec`, so the public API is unchanged.
   rejected an embedded newline in ANY value at commit — the #4098 gate
   adds the traffic-selector-specific shape check (malformed / mis-scoped
   selector) and the render-side belt.
+- **Endpoint `local_addrs`/`remote_addrs` sanitize (#6469).** The
+  connection `local_addrs = <value>` / `remote_addrs = <value>` lines
+  (the resolved peer/local endpoint from `resolveRemoteAddr` — a gateway
+  `address`/`dynamic hostname`, a `local-address`, an
+  `external-interface`-derived local IP, or the legacy inline
+  `vpn.Gateway`) are now run through `sanitizeSwanctlValue` at the two
+  `policy.go` render sites, closing the last raw-`%s` swanctl-injection
+  surface. These are UNQUOTED comma-list slots, so — exactly like the
+  `local_ts`/`remote_ts` belt above — the sanitize alone is the right
+  form (NO `escapeSwanctlQuoted`, which is for the quoted `id`/`certs`/
+  `secret` slots): an embedded newline collapses to a space, keeping a
+  tampered endpoint inert on one line instead of injecting a live
+  `version`/`aggressive`/`also` directive into the connection block. A
+  legitimate endpoint is byte-identical (`.`, `,`, `:`, `%` are all
+  preserved, so a single address, a comma-separated multi-address list,
+  an IPv6 literal, and the responder-only `%any` sentinel render
+  unchanged). The commit-time gate (`validateIPsecEndpointsStrict`)
+  rejects a control-char endpoint at commit; this render belt is the
+  by-construction backstop for a validation-bypassed path (HA peer-sync
+  of a pre-fix config, a directly-constructed `IPsecConfig`, or a config
+  persisted before the fix), matching the #1798/#2126/#4098 belt
+  doctrine. The legacy inline `vpn.Gateway` shape is independently
+  filtered by `config.IsUsableIPsecEndpoint` (a control-char value is not
+  a usable endpoint → the VPN is skipped), but the Gateways-map shape
+  took `address`/`dynamic hostname` verbatim — that was the gap.
 - **Injective child-section naming (#5122).** Each traffic selector
   renders one swanctl child section named `<conn>-<sanitizeChildName(ts)>`
   (`effectiveTrafficSelectors` in `policy.go`). `sanitizeChildName` maps

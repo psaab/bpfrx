@@ -60511,3 +60511,21 @@ top.
   (13s), TestHeatmapNotStale all GREEN (no LOC bucket shift).
 - **File(s)**: pkg/config/compiler_nat_static.go,
     pkg/config/static_nat_multitarget_6483_test.go, docs/config-schema.md, _Log.md
+
+## 2026-07-24 — #6469 swanctl local_addrs/remote_addrs sanitize (render belt)
+- **Timestamp**: 2026-07-24
+- **Action**: Close the last raw-`%s` swanctl-injection surface. The
+  connection `local_addrs`/`remote_addrs` render sites interpolated the
+  resolved endpoint verbatim; a validation-bypassed path (HA peer-sync of a
+  pre-fix config, direct IPsecConfig construction) could carry an embedded
+  newline and inject a live swanctl directive into the connection block.
+  Wrapped both `policy.go` Fprintf sites in `sanitizeSwanctlValue` — parity
+  with the `local_ts`/`remote_ts` unquoted-list belt (sanitize alone, NO
+  `escapeSwanctlQuoted`, which is for the quoted id/cert/secret slots). Legit
+  single/comma-list/IPv6/`%any` endpoints render byte-identical. New
+  fail-on-revert test (4 injection vectors: gw.Address, gw.DynamicHostname,
+  gw.LocalAddress, vpn.LocalAddr) + over-escape guard; parent-RED confirmed
+  firsthand (revert → "injection NOT neutralized: reauth_time = 0 rendered as
+  a live directive line"). go build/vet/gofmt/pkg-ipsec-suite/heatmap GREEN.
+- **File(s)**: pkg/ipsec/policy.go,
+    pkg/ipsec/swanctl_addr_sanitize_6469_test.go, pkg/ipsec/README.md, _Log.md
