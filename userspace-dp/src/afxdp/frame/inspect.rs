@@ -51,6 +51,207 @@ pub(crate) const MAX_IPV6_EXT_HEADERS: usize = 8;
 // no L4/fragment status — hiding the SYN from the screens and the flow
 // from forwarding (an ext-header IDS evasion). All walkers here MUST
 // keep the same set so the screen, meta, and fragment paths agree.
+// #6435: they now share one WALKER too — `walk_ipv6_ext_chain` below is
+// the single loop every L4 resolver / fragment predicate in this file
+// (and, via the `crate::afxdp` re-export, the NAT64 and embedded-ICMP
+// walkers) folds into its own verdict, so the set above can never drift
+// between copies again. `screen/extract.rs` keeps its own walk: it
+// extracts screen-specific state (routing-header type, fragment info)
+// into its parse struct and fails with a screen-specific `Err`, a
+// different contract than L4 resolution.
+
+/// #6435: terminal verdict of the one shared IPv6 extension-header walk
+/// ([`walk_ipv6_ext_chain`]). Every wrapper folds this into its own
+/// return type (`Option<usize>` L4 offset, `Option<(usize, u8)>`, or a
+/// fail-closed `bool`); the walk itself exists exactly once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtChainOutcome {
+    /// Resolved to a non-extension terminal header within the bound:
+    /// `(l4_offset, l4_protocol)`, with `l4_offset` relative to the
+    /// start of the walked buffer (the IPv6 header start when `l3 == 0`).
+    L4(usize, u8),
+    /// No-Next-Header (59) reached: a valid terminal with no L4 header.
+    NoNextHeader,
+    /// The walk stopped before any terminal: a short read, a declared
+    /// length overrunning the buffer, or an offset overflow. The
+    /// pre-#6435 hand-written walkers returned their fail-closed value
+    /// (`None` / `false`) on each of these; the wrappers keep folding
+    /// them to the same verdict.
+    Truncated,
+    /// Still on an extension header after `MAX_IPV6_EXT_HEADERS`
+    /// iterations — the over-limit, uninspectable chain the #2292
+    /// walkers fail closed on and #4743's `ipv6_ext_chain_over_limit`
+    /// reports.
+    OverLimit,
+}
+
+/// The FIRST Fragment (44) header a walked chain declared, recorded by
+/// [`walk_ipv6_ext_chain`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExtChainFragment {
+    /// The raw 8 header bytes when they lay within the buffer; `None`
+    /// when the buffer truncates the header, so the offset/M/ident bits
+    /// are unreadable. The distinction preserves the pre-#6435
+    /// predicates: `ipv6_is_non_first_fragment` / NAT64's
+    /// `ipv6_fragment_header` fail closed on unreadable bytes, while
+    /// `ipv6_is_any_fragment` reports the DECLARED header even then
+    /// (that predicate matched on the declared type without reading the
+    /// header).
+    pub bytes: Option<[u8; 8]>,
+}
+
+/// Result of [`walk_ipv6_ext_chain`]: the terminal verdict plus the
+/// first Fragment header sighted along the way, when the chain declared
+/// one. Only the FIRST Fragment header is recorded — a (hostile) chain
+/// with a second Fragment header keeps the first sighting, matching the
+/// stop-at-first-fragment pre-#6435 predicates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExtChainWalk {
+    pub outcome: ExtChainOutcome,
+    pub fragment: Option<ExtChainFragment>,
+}
+
+/// #6435: the single IPv6 extension-header chain walk shared by every
+/// forwarding / NAT64 / embedded-ICMP L4 resolver, chain classifier, and
+/// fragment predicate. `buf` is the buffer to walk and `l3` the offset
+/// of the IPv6 header inside it (`0` for an L3-relative packet slice,
+/// `frame_l3_offset(frame)` for a full frame). The walk starts at the
+/// fixed header's Next Header byte (`buf[l3 + 6]`) and the first
+/// extension header (`l3 + 40`); a buffer too short for the fixed
+/// 40-byte header yields [`ExtChainOutcome::Truncated`].
+///
+/// The loop body is the exact shape every pre-#6435 copy hand-mirrored:
+/// the #4517 generic length-prefixed set advances `(HdrExtLen + 1) * 8`,
+/// AH (51) advances `(len + 2) * 4` (RFC 4302), Fragment (44) advances a
+/// fixed 8 bytes, ESP (50) is deliberately NOT walked (encrypted payload,
+/// unreadable inner next-header — it falls to the terminal `L4` verdict
+/// like any real upper-layer protocol), No-Next-Header (59) is its own
+/// verdict, every advance re-validates against `buf.len()`, and a chain
+/// still on an extension header after `MAX_IPV6_EXT_HEADERS` iterations
+/// is [`ExtChainOutcome::OverLimit`] (#2292/#4743 fail-closed).
+///
+/// The walk ALWAYS runs to a terminal (or the bound), even past a
+/// Fragment header: the first Fragment header is RECORDED in
+/// [`ExtChainWalk::fragment`] instead of stopping the walk, so one loop
+/// serves both the L4 resolvers (which walk past first/atomic fragments)
+/// and the fragment predicates (which read only the recorded sighting —
+/// see the type's doc for the verdict-equivalence argument).
+/// `#[inline(always)]` keeps the shared body folded into each caller per
+/// the repo hot-path convention (in-crate, LTO off, codegen-units 16 —
+/// explicit attrs are required for cross-CGU inlining); the common
+/// no-extension-header packet still exits on the first match arm.
+#[inline(always)]
+pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
+    let mut fragment = None;
+    if buf.len() < l3 + 40 {
+        return ExtChainWalk {
+            outcome: ExtChainOutcome::Truncated,
+            fragment,
+        };
+    }
+    let mut protocol = buf[l3 + 6];
+    let mut offset = l3 + 40;
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
+        match protocol {
+            // #4517: generic length-prefixed EHs (see the set at
+            // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
+            // Mobility/HIP/Shim6/experimental.
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
+                let Some(opt) = buf.get(offset..offset + 2) else {
+                    return ExtChainWalk {
+                        outcome: ExtChainOutcome::Truncated,
+                        fragment,
+                    };
+                };
+                protocol = opt[0];
+                let Some(next) = offset.checked_add((usize::from(opt[1]) + 1) * 8) else {
+                    return ExtChainWalk {
+                        outcome: ExtChainOutcome::Truncated,
+                        fragment,
+                    };
+                };
+                offset = next;
+                if buf.len() < offset {
+                    return ExtChainWalk {
+                        outcome: ExtChainOutcome::Truncated,
+                        fragment,
+                    };
+                }
+            }
+            51 => {
+                let Some(opt) = buf.get(offset..offset + 2) else {
+                    return ExtChainWalk {
+                        outcome: ExtChainOutcome::Truncated,
+                        fragment,
+                    };
+                };
+                protocol = opt[0];
+                let Some(next) = offset.checked_add((usize::from(opt[1]) + 2) * 4) else {
+                    return ExtChainWalk {
+                        outcome: ExtChainOutcome::Truncated,
+                        fragment,
+                    };
+                };
+                offset = next;
+                if buf.len() < offset {
+                    return ExtChainWalk {
+                        outcome: ExtChainOutcome::Truncated,
+                        fragment,
+                    };
+                }
+            }
+            44 => {
+                let header = buf.get(offset..offset + 8);
+                // Record the FIRST declared Fragment header before the
+                // byte-validated advance below: a chain that declares but
+                // truncates the header still reports the declaration
+                // (bytes: None), preserving `ipv6_is_any_fragment`'s
+                // declares-match semantics.
+                if fragment.is_none() {
+                    fragment = Some(ExtChainFragment {
+                        bytes: header.and_then(|h| <[u8; 8]>::try_from(h).ok()),
+                    });
+                }
+                let Some(frag) = header else {
+                    return ExtChainWalk {
+                        outcome: ExtChainOutcome::Truncated,
+                        fragment,
+                    };
+                };
+                protocol = frag[0];
+                let Some(next) = offset.checked_add(8) else {
+                    return ExtChainWalk {
+                        outcome: ExtChainOutcome::Truncated,
+                        fragment,
+                    };
+                };
+                offset = next;
+                if buf.len() < offset {
+                    return ExtChainWalk {
+                        outcome: ExtChainOutcome::Truncated,
+                        fragment,
+                    };
+                }
+            }
+            59 => {
+                return ExtChainWalk {
+                    outcome: ExtChainOutcome::NoNextHeader,
+                    fragment,
+                };
+            }
+            _ => {
+                return ExtChainWalk {
+                    outcome: ExtChainOutcome::L4(offset, protocol),
+                    fragment,
+                };
+            }
+        }
+    }
+    ExtChainWalk {
+        outcome: ExtChainOutcome::OverLimit,
+        fragment,
+    }
+}
 
 pub(in crate::afxdp) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     if frame.len() < 14 {
@@ -82,50 +283,19 @@ pub(in crate::afxdp) fn frame_l4_offset(frame: &[u8], addr_family: u8) -> Option
             Some(l3 + ihl)
         }
         libc::AF_INET6 => {
-            if frame.len() < l3 + 40 {
-                return None;
-            }
-            let mut protocol = *frame.get(l3 + 6)?;
-            let mut offset = l3 + 40;
-            for _ in 0..MAX_IPV6_EXT_HEADERS {
-                match protocol {
-                    // #4517: generic length-prefixed EHs (see the set at
-                    // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
-                    // Mobility/HIP/Shim6/experimental.
-                    0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                        let opt = frame.get(offset..offset + 2)?;
-                        protocol = opt[0];
-                        offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
-                        if frame.len() < offset {
-                            return None;
-                        }
-                    }
-                    51 => {
-                        let opt = frame.get(offset..offset + 2)?;
-                        protocol = opt[0];
-                        offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
-                        if frame.len() < offset {
-                            return None;
-                        }
-                    }
-                    44 => {
-                        let frag = frame.get(offset..offset + 8)?;
-                        protocol = frag[0];
-                        offset = offset.checked_add(8)?;
-                        if frame.len() < offset {
-                            return None;
-                        }
-                    }
-                    59 => return None,
-                    _ => return Some(offset),
-                }
-            }
-            // #2292: still on an extension header at the bound — fail
-            // CLOSED (None → caller drops) instead of surrendering the
-            // ext-header offset as a fake L4 offset. Matches the screen
-            // path (`screen/extract.rs`), which returns
+            // #2292: only a resolved terminal L4 within the bound yields
+            // an offset — every other verdict fails CLOSED (None → caller
+            // drops). In particular an OverLimit chain (still on an
+            // extension header at the MAX_IPV6_EXT_HEADERS bound) no
+            // longer surrenders the unconsumed ext-header offset as a
+            // fake L4 offset; this matches the screen path
+            // (`screen/extract.rs`), which returns
             // `Err(TruncatedIpv6ExtChain)` on the same over-bound chain.
-            None
+            // #6435: the walk itself is the shared `walk_ipv6_ext_chain`.
+            match walk_ipv6_ext_chain(frame, l3).outcome {
+                ExtChainOutcome::L4(offset, _) => Some(offset),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -140,8 +310,9 @@ pub(in crate::afxdp) fn frame_l4_offset(frame: &[u8], addr_family: u8) -> Option
 /// terminates on a real L4 within the bound or a non-IPv6 packet. This is the
 /// gate for the explicit fail-closed drop: before #4743 an over-limit chain was
 /// forwarded flowless (`l4_present = false`), an ext-header IDS-evasion; now it
-/// is dropped and counted (`ipv6_ext_header_dropped`). Mirrors the walk in
-/// `frame_l4_offset` exactly so the two agree on what "over-limit" means.
+/// is dropped and counted (`ipv6_ext_header_dropped`). #6435: folds the shared
+/// `walk_ipv6_ext_chain` — only its `OverLimit` verdict is "over-limit", so this
+/// gate and `frame_l4_offset` agree by construction on what "over-limit" means.
 pub(in crate::afxdp) fn ipv6_ext_chain_over_limit(frame: &[u8], addr_family: u8) -> bool {
     if addr_family as i32 != libc::AF_INET6 {
         return false;
@@ -149,61 +320,13 @@ pub(in crate::afxdp) fn ipv6_ext_chain_over_limit(frame: &[u8], addr_family: u8)
     let Some(l3) = frame_l3_offset(frame) else {
         return false;
     };
-    if frame.len() < l3 + 40 {
-        return false; // truncated base header — not "over-limit"
-    }
-    let mut protocol = frame[l3 + 6];
-    let mut offset = l3 + 40;
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            // #4517 generic length-prefixed EHs (see the set at MAX_IPV6_EXT_HEADERS).
-            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                let Some(opt) = frame.get(offset..offset + 2) else {
-                    return false;
-                };
-                protocol = opt[0];
-                let Some(next) = offset.checked_add((usize::from(opt[1]) + 1) * 8) else {
-                    return false;
-                };
-                offset = next;
-                if frame.len() < offset {
-                    return false;
-                }
-            }
-            51 => {
-                let Some(opt) = frame.get(offset..offset + 2) else {
-                    return false;
-                };
-                protocol = opt[0];
-                let Some(next) = offset.checked_add((usize::from(opt[1]) + 2) * 4) else {
-                    return false;
-                };
-                offset = next;
-                if frame.len() < offset {
-                    return false;
-                }
-            }
-            44 => {
-                let Some(frag) = frame.get(offset..offset + 8) else {
-                    return false;
-                };
-                protocol = frag[0];
-                let Some(next) = offset.checked_add(8) else {
-                    return false;
-                };
-                offset = next;
-                if frame.len() < offset {
-                    return false;
-                }
-            }
-            // No-Next-Header (59) is a valid terminal; any other value is a
-            // real L4 reached within the bound. Neither is over-limit.
-            _ => return false,
-        }
-    }
-    // Completed MAX_IPV6_EXT_HEADERS iterations still on an extension header:
-    // over-limit / uninspectable.
-    true
+    // A truncated base header (frame shorter than l3 + 40) walks to
+    // `Truncated`, not `OverLimit` — preserved from the pre-#6435 gate's
+    // explicit "truncated base header — not over-limit" early return.
+    matches!(
+        walk_ipv6_ext_chain(frame, l3).outcome,
+        ExtChainOutcome::OverLimit
+    )
 }
 
 pub(in crate::afxdp) fn packet_rel_l4_offset(packet: &[u8], addr_family: u8) -> Option<usize> {
@@ -219,46 +342,14 @@ pub(in crate::afxdp) fn packet_rel_l4_offset(packet: &[u8], addr_family: u8) -> 
             Some(ihl)
         }
         libc::AF_INET6 => {
-            if packet.len() < 40 {
-                return None;
+            // #2292: fail-CLOSED on every non-L4 verdict, including
+            // OverLimit at the bound (see frame_l4_offset). #6435: the
+            // walk is the shared `walk_ipv6_ext_chain` over the
+            // L3-relative slice.
+            match walk_ipv6_ext_chain(packet, 0).outcome {
+                ExtChainOutcome::L4(offset, _) => Some(offset),
+                _ => None,
             }
-            let mut protocol = *packet.get(6)?;
-            let mut offset = 40usize;
-            for _ in 0..MAX_IPV6_EXT_HEADERS {
-                match protocol {
-                    // #4517: generic length-prefixed EHs (see the set at
-                    // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
-                    // Mobility/HIP/Shim6/experimental.
-                    0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                        let opt = packet.get(offset..offset + 2)?;
-                        protocol = opt[0];
-                        offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
-                        if packet.len() < offset {
-                            return None;
-                        }
-                    }
-                    51 => {
-                        let opt = packet.get(offset..offset + 2)?;
-                        protocol = opt[0];
-                        offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
-                        if packet.len() < offset {
-                            return None;
-                        }
-                    }
-                    44 => {
-                        let frag = packet.get(offset..offset + 8)?;
-                        protocol = frag[0];
-                        offset = offset.checked_add(8)?;
-                        if packet.len() < offset {
-                            return None;
-                        }
-                    }
-                    59 => return None,
-                    _ => return Some(offset),
-                }
-            }
-            // #2292: fail-CLOSED at the bound (see frame_l4_offset).
-            None
         }
         _ => None,
     }
@@ -285,50 +376,17 @@ pub(in crate::afxdp) fn packet_rel_l4_offset_and_protocol(
             Some((ihl, packet[9]))
         }
         libc::AF_INET6 => {
-            if packet.len() < 40 {
-                return None;
+            // #2292: fail-CLOSED on every non-L4 verdict. Before #2292 the
+            // at-bound fall-through returned `Some((offset, protocol))`
+            // where `protocol` was the unconsumed extension-header type
+            // (0/43/51/60), which callers (GRE inner-parse, tunnel
+            // local-origin metadata, NDP/TCP-flag helpers) then trusted as
+            // a real L4 protocol. #6435: the walk is the shared
+            // `walk_ipv6_ext_chain` over the L3-relative slice.
+            match walk_ipv6_ext_chain(packet, 0).outcome {
+                ExtChainOutcome::L4(offset, protocol) => Some((offset, protocol)),
+                _ => None,
             }
-            let mut protocol = *packet.get(6)?;
-            let mut offset = 40usize;
-            for _ in 0..MAX_IPV6_EXT_HEADERS {
-                match protocol {
-                    // #4517: generic length-prefixed EHs (see the set at
-                    // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
-                    // Mobility/HIP/Shim6/experimental.
-                    0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                        let opt = packet.get(offset..offset + 2)?;
-                        protocol = opt[0];
-                        offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
-                        if packet.len() < offset {
-                            return None;
-                        }
-                    }
-                    51 => {
-                        let opt = packet.get(offset..offset + 2)?;
-                        protocol = opt[0];
-                        offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
-                        if packet.len() < offset {
-                            return None;
-                        }
-                    }
-                    44 => {
-                        let frag = packet.get(offset..offset + 8)?;
-                        protocol = frag[0];
-                        offset = offset.checked_add(8)?;
-                        if packet.len() < offset {
-                            return None;
-                        }
-                    }
-                    59 => return None,
-                    _ => return Some((offset, protocol)),
-                }
-            }
-            // #2292: fail-CLOSED at the bound. Previously this returned
-            // `Some((offset, protocol))` where `protocol` was the
-            // unconsumed extension-header type (0/43/51/60), which
-            // callers (GRE inner-parse, tunnel local-origin metadata,
-            // NDP/TCP-flag helpers) then trusted as a real L4 protocol.
-            None
         }
         _ => None,
     }
@@ -360,54 +418,20 @@ pub(in crate::afxdp) fn ipv4_is_non_first_fragment(packet: &[u8]) -> bool {
 /// unlike the defect-2 fix this is a separate predicate so the shared
 /// `packet_rel_l4_offset_and_protocol` (read by GRE decap / tunnel
 /// local-origin to FORWARD fragments) stays unchanged.
+/// #6435: folds the shared `walk_ipv6_ext_chain`'s recorded first
+/// Fragment-header sighting. A declared-but-truncated Fragment header
+/// (bytes unreadable) fails closed (`false`), exactly like the pre-#6435
+/// walker's `packet.get(offset..offset + 8)` else-return. The shared walk
+/// continues past the Fragment header to the chain terminal, but this
+/// predicate reads only the recorded FIRST sighting, so a (hostile)
+/// double-Fragment chain still judges by the first header — identical to
+/// the pre-#6435 stop-at-first-fragment walk.
 #[inline]
 pub(in crate::afxdp) fn ipv6_is_non_first_fragment(packet: &[u8]) -> bool {
-    if packet.len() < 40 {
-        return false;
-    }
-    let mut protocol = packet[6];
-    let mut offset = 40usize;
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            // #4517: generic length-prefixed EHs (see the set at
-            // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
-            // Mobility/HIP/Shim6/experimental.
-            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                let Some(opt) = packet.get(offset..offset + 2) else {
-                    return false;
-                };
-                protocol = opt[0];
-                let Some(next) = offset.checked_add((usize::from(opt[1]) + 1) * 8) else {
-                    return false;
-                };
-                offset = next;
-                if packet.len() < offset {
-                    return false;
-                }
-            }
-            51 => {
-                let Some(opt) = packet.get(offset..offset + 2) else {
-                    return false;
-                };
-                protocol = opt[0];
-                let Some(next) = offset.checked_add((usize::from(opt[1]) + 2) * 4) else {
-                    return false;
-                };
-                offset = next;
-                if packet.len() < offset {
-                    return false;
-                }
-            }
-            44 => {
-                let Some(frag) = packet.get(offset..offset + 8) else {
-                    return false;
-                };
-                return (u16::from_be_bytes([frag[2], frag[3]]) & 0xFFF8) != 0;
-            }
-            _ => return false,
-        }
-    }
-    false
+    walk_ipv6_ext_chain(packet, 0)
+        .fragment
+        .and_then(|frag| frag.bytes)
+        .is_some_and(|b| (u16::from_be_bytes([b[2], b[3]]) & 0xFFF8) != 0)
 }
 
 /// #1852: family-dispatched non-first-fragment predicate over the
@@ -445,49 +469,16 @@ pub(in crate::afxdp) fn ipv4_is_any_fragment(packet: &[u8]) -> bool {
 /// the first fragment (offset 0, M=1). Walks the extension-header chain
 /// (bounded by `MAX_IPV6_EXT_HEADERS`) and returns `true` as soon as a fragment
 /// header is found. Packets with no fragment header return `false`.
+/// #6435: folds the shared `walk_ipv6_ext_chain`'s recorded first
+/// Fragment-header sighting. The DECLARATION alone matches — a chain that
+/// declares a Fragment header whose 8 bytes are then truncated still
+/// returns `true`, exactly like the pre-#6435 predicate's `44 => return
+/// true` arm, which matched on the declared type without reading the
+/// header bytes. Only the FIRST sighting is consulted, matching the
+/// pre-#6435 stop-at-first-fragment walk on a double-Fragment chain.
 #[inline]
 pub(in crate::afxdp) fn ipv6_is_any_fragment(packet: &[u8]) -> bool {
-    if packet.len() < 40 {
-        return false;
-    }
-    let mut protocol = packet[6];
-    let mut offset = 40usize;
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            // #4517: generic length-prefixed EHs (see the set at
-            // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
-            // Mobility/HIP/Shim6/experimental.
-            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                let Some(opt) = packet.get(offset..offset + 2) else {
-                    return false;
-                };
-                protocol = opt[0];
-                let Some(next) = offset.checked_add((usize::from(opt[1]) + 1) * 8) else {
-                    return false;
-                };
-                offset = next;
-                if packet.len() < offset {
-                    return false;
-                }
-            }
-            51 => {
-                let Some(opt) = packet.get(offset..offset + 2) else {
-                    return false;
-                };
-                protocol = opt[0];
-                let Some(next) = offset.checked_add((usize::from(opt[1]) + 2) * 4) else {
-                    return false;
-                };
-                offset = next;
-                if packet.len() < offset {
-                    return false;
-                }
-            }
-            44 => return true,
-            _ => return false,
-        }
-    }
-    false
+    walk_ipv6_ext_chain(packet, 0).fragment.is_some()
 }
 
 /// #2362: family-dispatched ANY-fragment predicate over the L3-relative packet
@@ -592,12 +583,35 @@ fn ip_declared_end(frame: &[u8], l3_offset: usize, addr_family: u8) -> Option<us
 /// bound never rejects legitimate traffic.
 const TCP_FLAGS_DECLARED_MIN: usize = 14;
 
+/// #2362 fold A + fold B unified (#6435): the ONE per-packet match-input
+/// builder for both metadata flavors. The input-filter path
+/// (`poll_descriptor/filter.rs`, `host_inbound_policy.rs`, `pbr.rs`,
+/// `forward_request.rs`, `neighbor_dispatch.rs`, `coordinator/inject.rs`)
+/// carries a `UserspaceDpMeta`; the TX-selection / CoS classification path
+/// (`tx/cos_classify.rs`, #2362 fold B) carries a `ForwardPacketMeta`. Both
+/// used to have byte-identical private copies (`term_match_extra_from_frame`
+/// vs `..._fwd`, kept in sync by a "MUST stay identical" comment on a
+/// fail-closed security gate); #6435 collapses them onto this single generic
+/// builder via the same `impl Into<ForwardPacketMeta>` channel
+/// `live_frame_ports_from_meta_bytes` already uses, so the #5568
+/// declared-datagram derivation below can never drift between copies again.
+/// The `From<UserspaceDpMeta> for ForwardPacketMeta` conversion is lossless
+/// for every field this builder reads (`l3_offset`, `l4_offset`,
+/// `addr_family`, `protocol`, `tcp_flags`).
+///
+/// Same fragment-safe contract on both paths: a non-first fragment forces
+/// the L4-derived fields to 0 (its bytes are payload) while keeping the
+/// L3-only `is_fragment` bit. The CoS path already routes a non-first
+/// fragment to the default queue with no flow_key (#2357), so in practice
+/// this builder is invoked on first/atomic packets there — the gate is
+/// defense-in-depth and identical for both callers.
 #[inline]
 pub(in crate::afxdp) fn term_match_extra_from_frame(
     frame: &[u8],
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
 ) -> crate::filter::TermMatchExtra<'_> {
     use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP};
+    let meta = meta.into();
     // #5568: derive EVERY scalar L4/fragment input from the IP-DECLARED datagram
     // end, not the physical frame. The shim stamps `l3_offset`/`l4_offset` from
     // the raw frame, so attacker-controlled Ethernet padding beyond the declared
@@ -696,82 +710,6 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
         // yields None → fail closed. `frame.get` is also None if the frame is
         // shorter than l4_offset, in which case the matcher's bounds check fails
         // closed too.
-        flex_l4: if non_first_fragment {
-            None
-        } else {
-            declared_end.and_then(|end| frame.get(l4..end))
-        },
-    }
-}
-
-/// #2362 fold B: the `ForwardPacketMeta` flavor of `term_match_extra_from_frame`,
-/// for the TX-selection / CoS classification path (`tx/cos_classify.rs`), which
-/// carries a `ForwardPacketMeta` rather than the full `UserspaceDpMeta`. Same
-/// fragment-safe contract: a non-first fragment forces the L4-derived fields to
-/// 0 (its bytes are payload) while keeping the L3-only `is_fragment` bit. The
-/// CoS path already routes a non-first fragment to the default queue with no
-/// flow_key (#2357), so in practice this builder is invoked on first/atomic
-/// packets — the gate is defense-in-depth and keeps the two builders identical.
-#[inline]
-pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
-    frame: &[u8],
-    meta: ForwardPacketMeta,
-) -> crate::filter::TermMatchExtra<'_> {
-    use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP};
-    // #5568: the ForwardPacketMeta builder MUST stay identical to
-    // `term_match_extra_from_frame` — derive every scalar from the IP-declared
-    // datagram end, not the physical frame, so a CoS-action byte/scalar match on
-    // this TX-selection path cannot read Ethernet slack.
-    let l3 = meta.l3_offset as usize;
-    let l4 = meta.l4_offset as usize;
-    let declared_end = ip_declared_end(frame, l3, meta.addr_family);
-    let l3_declared = declared_end.and_then(|end| frame.get(l3..end));
-    let is_fragment = l3_declared.is_some_and(|packet| is_any_fragment(packet, meta.addr_family));
-    let non_first_fragment =
-        l3_declared.is_some_and(|packet| is_non_first_fragment(packet, meta.addr_family));
-    // #2449 + #5568: see `term_match_extra_from_frame` — declared-end-bounded
-    // ICMP type/code presence and TCP-flags presence. Physical `frame.len()` is
-    // NOT consulted, so padding beyond a short declared length cannot manufacture
-    // an L4 scalar.
-    let icmp_type_code_present = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
-        && !non_first_fragment
-        && declared_end.is_some_and(|end| l4.saturating_add(2) <= end);
-    let l4_truncated_icmp = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
-        && !non_first_fragment
-        && !icmp_type_code_present;
-    let tcp_flags_present = meta.protocol == PROTO_TCP
-        && !non_first_fragment
-        && declared_end.is_some_and(|end| l4.saturating_add(TCP_FLAGS_DECLARED_MIN) <= end);
-    let l4_truncated_tcp =
-        meta.protocol == PROTO_TCP && !non_first_fragment && !tcp_flags_present;
-    let (tcp_flags, icmp_type, icmp_code) = if non_first_fragment {
-        (0, 0, 0)
-    } else if icmp_type_code_present {
-        (
-            meta.tcp_flags,
-            frame.get(l4).copied().unwrap_or(0),
-            frame.get(l4.wrapping_add(1)).copied().unwrap_or(0),
-        )
-    } else if l4_truncated_tcp {
-        (0, 0, 0)
-    } else if l4_truncated_icmp {
-        (0, 0, 0)
-    } else {
-        (meta.tcp_flags, 0, 0)
-    };
-    crate::filter::TermMatchExtra {
-        tcp_flags,
-        is_fragment,
-        icmp_type,
-        icmp_code,
-        l4_present: !non_first_fragment && !l4_truncated_icmp && !l4_truncated_tcp,
-        // #3077 / #5150: L3 header slice for flexible-match-range (see the
-        // input-filter builder above), clamped to the IP-declared datagram end.
-        // Same fail-closed-on-too-short/None bounds check applies.
-        flex_l3: l3_declared,
-        // #3232 / #5150: L4 header slice for a layer-4 flexible-match-range (see
-        // the input-filter builder above), clamped to the IP-declared datagram
-        // end. None on a non-first fragment so a layer-4 flex term fails closed.
         flex_l4: if non_first_fragment {
             None
         } else {

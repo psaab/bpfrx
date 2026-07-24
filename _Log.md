@@ -1,3 +1,42 @@
+## 2026-07-24 — #6435: SSOT the IPv6 ext-header walk + TermMatchExtra builder
+
+- **Timestamp**: 2026-07-24 (fix/6435-ipv6-ext-walk-ssot)
+- **Action**: Refactor (behavior-preserving). frame/inspect.rs hand-mirrored
+  the IPv6 extension-header walk 6x in-file (+ 3 in nat64.rs, 1 in
+  icmp_embed/parse.rs) and carried two byte-identical TermMatchExtra
+  builders kept in sync by a "MUST stay identical" comment on the #5568
+  fail-closed gate. Introduced one #[inline(always)] `walk_ipv6_ext_chain`
+  core returning an `ExtChainOutcome` verdict (L4 / NoNextHeader / Truncated
+  / OverLimit) plus the recorded FIRST Fragment-header sighting (declaration
+  always recorded, raw bytes when readable); every wrapper folds the verdict.
+  nat64 + icmp_embed adopt via the pub(crate) `crate::afxdp` re-export
+  channel (#4435 precedent). `term_match_extra_from_frame` is now generic
+  over `impl Into<ForwardPacketMeta>` (the live_frame_ports_from_meta_bytes
+  channel); the `_fwd` twin is retired. Keep-outs: nat64_v6_translation_
+  ineligible (#5625 per-type verdicts) and screen/extract.rs (screen-specific
+  state + Err type) deliberately keep their own loops.
+- **Files**: userspace-dp/src/afxdp/frame/inspect.rs (core + 6 wrapper folds
+  + unified builder), frame/mod.rs + afxdp/mod.rs (re-export channel),
+  nat64.rs (3 walkers adopt), afxdp/icmp_embed/parse.rs (parse_embedded_v6_l4
+  adopts), afxdp/tx/cos_classify.rs (caller rename),
+  frame/tests_ipv6_ext_walk.rs (NEW, 7 preservation pins),
+  frame/tests_fragment_term_extra.rs (2 call-site renames, assertions
+  byte-identical), frame/README.md + filter/README.md (module contract docs).
+- **Fail-on-revert**: the existing prop-test differential harness
+  (parse_offset_consistency_mangled_ext cross-checks the walkers on mangled
+  chains), the nat64 #4435 parity tests, and the filter/frame suites pass
+  UNMODIFIED. New pins cover the subtle pre-#6435 edges (declared-but-
+  truncated Fragment, double-Fragment first-sighting, over-limit keeps the
+  sighting, NoNextHeader != over-limit, meta-flavor TermMatchExtra
+  differential). Neutralize-proved firsthand: botched is_any fold (require
+  readable bytes) → ext_walk_declared_but_truncated RED at :148; record-LAST
+  fragment → ext_walk_double_fragment RED at :204. Restored → GREEN.
+- **Validation**: cargo build clean (warning count 160 == master baseline);
+  cargo test -- --test-threads=1 full suite GREEN (4167 bin + 91 integration,
+  2 pre-existing #[ignore] CoS benches); release build (LTO off,
+  codegen-units 16) has NO out-of-line walk_ipv6_ext_chain symbol — the
+  #[inline(always)] core folds into every caller across CGUs.
+
 ## 2026-07-23 — #5557 (advance): host-inbound service-token case-fold in the junos-host coarse shield
 
 - **Timestamp**: 2026-07-23 (fix/5557-hostinbound-service-token-case)

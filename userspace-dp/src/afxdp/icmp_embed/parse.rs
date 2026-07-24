@@ -115,76 +115,40 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v4(
 }
 
 /// Fragment-aware IPv6 extension-chain walk for QUOTED (embedded)
-/// packets inside ICMPv6 errors (#1838 / plan §5.7). Walks the chain
-/// like `packet_rel_l4_offset_and_protocol(.., AF_INET6)` but, on the
-/// fragment header (44), reads the fragment-offset bits and returns
-/// `None` unless they are zero: a quoted NON-FIRST fragment has no L4
-/// header, and reading "ports" from its payload bytes would enable
+/// packets inside ICMPv6 errors (#1838 / plan §5.7). #6435: folds the ONE
+/// canonical walker (`walk_ipv6_ext_chain`, shared with the forwarding
+/// path's `packet_rel_l4_offset_and_protocol(.., AF_INET6)`) and, on the
+/// recorded first Fragment header (44), reads the fragment-offset bits and
+/// returns `None` unless they are zero: a quoted NON-FIRST fragment has no
+/// L4 header, and reading "ports" from its payload bytes would enable
 /// false NAT/session matches (the bug class the old fixed-40 read
 /// accidentally avoided by leaving proto = 44). First and atomic
 /// fragments (offset 0) are allowed. Returns the L4 offset relative
 /// to the embedded IPv6 header plus the final L4 protocol.
 pub(in crate::afxdp::icmp_embed) fn parse_embedded_v6_l4(packet: &[u8]) -> Option<(usize, u8)> {
-    if packet.len() < 40 {
+    let walk = walk_ipv6_ext_chain(packet, 0);
+    // #1838: a quoted NON-FIRST fragment has no L4 header in the quoted
+    // bytes. A declared-but-truncated Fragment header (offset bits
+    // unreadable) is NOT rejected here — it fails closed on the
+    // `Truncated` outcome below instead, exactly like the pre-#6435
+    // walker's `packet.get(offset..offset + 8)?` (both yield `None`).
+    if let Some(frag) = walk.fragment
+        && frag
+            .bytes
+            .is_some_and(|b| (u16::from_be_bytes([b[2], b[3]]) & 0xFFF8) != 0)
+    {
         return None;
     }
-    let mut protocol = *packet.get(6)?;
-    let mut offset = 40usize;
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            // #4517: generic length-prefixed IPv6 extension headers —
-            // HbH (0) / Routing (43) / DestOpt (60) / Mobility (135) /
-            // HIP (139) / Shim6 (140) / experimental (253/254), all with
-            // the `(HdrExtLen + 1) * 8` advance. Kept in parity with
-            // `packet_rel_l4_offset_and_protocol` so an ICMPv6 error that
-            // quotes an exotic-EH inner packet still resolves the embedded
-            // L4 and matches its session. ESP (50) stays unwalked.
-            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
-                let opt = packet.get(offset..offset + 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            51 => {
-                let opt = packet.get(offset..offset + 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            44 => {
-                let frag = packet.get(offset..offset + 8)?;
-                // Fragment Offset = upper 13 bits of bytes 2..4
-                // (RFC 8200 §4.5). Non-zero => non-first fragment =>
-                // no L4 header in the quoted bytes.
-                if (u16::from_be_bytes([frag[2], frag[3]]) & 0xFFF8) != 0 {
-                    return None;
-                }
-                protocol = frag[0];
-                offset = offset.checked_add(8)?;
-                if packet.len() < offset {
-                    return None;
-                }
-            }
-            59 => return None,
-            _ => return Some((offset, protocol)),
-        }
+    // #4533: every non-L4 verdict fails CLOSED (None) — an over-bound
+    // chain (`OverLimit`, still on an extension header at the
+    // MAX_IPV6_EXT_HEADERS bound) never surrenders the unconsumed
+    // ext-header offset/type as a fake embedded L4, aligning this walker
+    // with the #2292 forwarding walker and the #4435 NAT64 walkers by
+    // construction (#6435: they now share the loop, not just the bound).
+    match walk.outcome {
+        ExtChainOutcome::L4(offset, protocol) => Some((offset, protocol)),
+        _ => None,
     }
-    // #4533: still on an extension header at the MAX_IPV6_EXT_HEADERS
-    // bound — fail CLOSED (None) instead of surrendering the ext-header
-    // offset/type as a fake embedded L4. This aligns the embedded-ICMP
-    // walker with the #2292 forwarding walker (`frame/inspect.rs`) and
-    // the #4435 nat64 walkers, all of which return None on an
-    // over-bound chain. A quoted inner packet with more extension
-    // headers than the bound therefore resolves no embedded L4 and
-    // cannot drive a bogus embedded-session/NAT match. The bound was
-    // also bumped from a stale 6 to the shared MAX_IPV6_EXT_HEADERS (8)
-    // so a legitimate quoted packet with up to 7 extension headers still
-    // parses (parity with the siblings).
-    None
 }
 
 /// Parse the embedded IPv6 header starting at `embedded_ip_start`.

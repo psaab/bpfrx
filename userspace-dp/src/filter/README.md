@@ -506,8 +506,11 @@ exactly one of these two classes:
 The `tcp_flags_mask` / `tcp_flags_forbidden` / `is_fragment` / `icmp_type` /
 `icmp_code` inputs (and the #3077 `flex_match` L3 slice, `flex_l3`) are
 carried in a small `TermMatchExtra` built once per packet at the filter-eval
-call sites (`term_match_extra_from_frame` and its `ForwardPacketMeta` /
-meta-only variants). `flex_l3` borrows the live frame's L3 header, so
+call sites (`term_match_extra_from_frame` — one unified builder since #6435,
+generic over `impl Into<ForwardPacketMeta>` so the input-filter
+`UserspaceDpMeta` and TX-selection `ForwardPacketMeta` callers share it, the
+byte-identical `_fwd` twin retired — and the meta-only
+`term_match_extra_from_meta`). `flex_l3` borrows the live frame's L3 header, so
 `TermMatchExtra` is parameterized by a lifetime; the deferred CoS/TX-selection
 snapshot drops the borrow (`to_static()` → `flex_l3 = None`) and the flex term
 fails closed there (the frame may be recycled). The builder is fragment-safe:
@@ -538,7 +541,8 @@ than spuriously matching `icmp-type 0` / `icmp-code 0`.
 **#5568 (SCALAR declared-length bound).** #2449 keyed the ICMP presence test on
 the physical `frame.len()`; #5568 keys EVERY scalar L4/fragment input on the
 IP-DECLARED datagram end (`ip_declared_end` — the same SSOT that bounds the
-#5150 flex slices), computed FIRST in both frame builders. The shim stamps
+#5150 flex slices), computed FIRST in the frame builder (one unified builder
+for both metadata flavors since #6435). The shim stamps
 `l3_offset`/`l4_offset` from the raw frame, so without this, attacker-controlled
 Ethernet padding beyond the declared IP length manufactures a scalar match out of
 slack. Concretely: (a) the fragment walkers (`is_any_fragment` /

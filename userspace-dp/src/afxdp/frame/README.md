@@ -265,8 +265,9 @@ inspect or rewrite a packet sitting in a UMEM frame.
   from inside the extension header — operator-visible RST and zero-window
   diagnostics (cos queue service, rx telemetry, tx transmit, frame build
   corruption check, tunnel inner inspection) were false on those flows.
-  The walker is bounded (≤6 iterations), allocation-free (no per-packet
-  heap), and fails safe — a truncated/malformed/looping chain yields
+  The walker is bounded (`MAX_IPV6_EXT_HEADERS` (8) iterations, #2292),
+  allocation-free (no per-packet heap), and fails safe — a
+  truncated/malformed/looping chain yields
   "no RST" / "flags unknown" (false / None) rather than panicking or
   reading OOB. Today these helpers are diagnostics-only, but routing them
   through the shared walker means the next caller cannot reintroduce the
@@ -275,17 +276,30 @@ inspect or rewrite a packet sitting in a UMEM frame.
   userspace dataplane still has FIVE distinct Ethernet-L2 offset parsers
   (`afxdp/parser.rs::parse_eth_offsets` [learning], `inspect.rs::frame_l3_offset`
   [forwarding], `cos/ecn.rs::ethernet_l3` [CoS ECN], `nat64.rs::frame_l3_offset`
-  [NAT64], `afxdp/icmp.rs::ingress_reply_l2` [ICMP reply VID]) and THREE IPv6
-  extension-header walkers (`inspect.rs::packet_rel_l4_offset_and_protocol`
-  [#2148, forwarding/GRE], `screen/extract.rs` [#2189, fail-closed], and
-  `icmp_embed/parse.rs::parse_embedded_v6_l4` [#1838, embedded; #4533
-  fail-closed]). All three now share the `MAX_IPV6_EXT_HEADERS` (8) bound
-  AND fail CLOSED when the chain is still on an extension header at that
-  bound — `inspect.rs` returns `None` (#2292), `screen/extract.rs` returns
-  `Err` (drop, #2189), and `parse_embedded_v6_l4` returns `None` (#4533,
-  previously a stale-6 bound with a post-loop `Some((offset, ext_type))`
-  fall-through that surrendered a bogus embedded L4). The
-  CANONICAL CONTRACT they MUST agree on:
+  [NAT64], `afxdp/icmp.rs::ingress_reply_l2` [ICMP reply VID]). The IPv6
+  extension-header walk, by contrast, is ONE shared loop since #6435:
+  `inspect.rs::walk_ipv6_ext_chain` (an `#[inline(always)]` core returning an
+  `ExtChainOutcome` verdict — `L4` / `NoNextHeader` / `Truncated` /
+  `OverLimit` — plus the recorded first Fragment-header sighting). Every
+  forwarding L4 resolver (`frame_l4_offset`, `packet_rel_l4_offset`,
+  `packet_rel_l4_offset_and_protocol`), the #4743 over-limit gate
+  (`ipv6_ext_chain_over_limit`), both fragment predicates
+  (`ipv6_is_non_first_fragment` / `ipv6_is_any_fragment`), the NAT64
+  resolvers (`ipv6_l4_offset_and_protocol`, `ipv6_is_non_first_fragment`,
+  `ipv6_fragment_header`), and the embedded-ICMP resolver
+  (`icmp_embed/parse.rs::parse_embedded_v6_l4`, #1838) FOLD that one walk,
+  so the #4517 ext-header set, the AH `(len + 2) * 4` arithmetic, and the
+  fail-closed-at-the-bound posture (#2292/#4435/#4533) can never drift
+  between copies again. Two walkers deliberately keep their own loops:
+  `screen/extract.rs` (#2189 — it extracts screen-specific state into its
+  parse struct and fails with a screen-specific `Err`, a different
+  contract than L4 resolution) and `nat64.rs::nat64_v6_translation_ineligible`
+  (#5625 — per-type translation-eligibility verdicts incl. the Routing
+  Segments-Left read, not an L4-resolution walk). All of them share the
+  `MAX_IPV6_EXT_HEADERS` (8) bound AND fail CLOSED when the chain is
+  still on an extension header at that bound — the shared walk yields
+  `OverLimit` (its wrappers return `None`/`false`), `screen/extract.rs`
+  returns `Err` (drop, #2189). The CANONICAL CONTRACT they MUST agree on:
   - **L2**: untagged → l3 = 14; a single 0x8100 (802.1Q) OR 0x88a8 (802.1ad)
     tag → l3 = 18 (the inner ethertype, possibly still a VLAN TPID for a
     QinQ double tag, is returned as-is). A QinQ DOUBLE tag is NOT unwound in
@@ -314,11 +328,12 @@ inspect or rewrite a packet sitting in a UMEM frame.
     the walk STOPS at it. Before #4517 the exotic length-prefixed headers fell
     to the terminal `_` arm, so a chain like `HOP → MOBILITY → FRAGMENT → TCP`
     was classified proto=135 with no L4/fragment status — the screens never saw
-    the SYN and forwarding never saw the flow (an ext-header IDS evasion). All
-    walkers (the five in `inspect.rs`, `screen/extract.rs`, the three in
-    `nat64.rs`, and `icmp_embed/parse.rs::parse_embedded_v6_l4`) MUST keep the
-    SAME set or the screen, meta, forwarding, and NAT64 paths disagree on the
-    same packet.
+    the SYN and forwarding never saw the flow (an ext-header IDS evasion).
+    Since #6435 the forwarding/fragment/NAT64/embedded-ICMP walkers share the
+    ONE `walk_ipv6_ext_chain` loop, so they recognize the same set by
+    construction; the two deliberate keep-outs (`screen/extract.rs`,
+    `nat64_v6_translation_ineligible`) MUST keep the SAME set or the screen,
+    meta, forwarding, and NAT64 paths disagree on the same packet.
   PR-1 of #2150 fixed the three parsers that DISAGREED on a single 0x88a8
   tag / ext-headered NDP (`parse_eth_offsets` treated 0x88a8 as the inner
   ethertype → l3=14; `nat64::frame_l3_offset` treated it as untagged →
