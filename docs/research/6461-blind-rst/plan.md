@@ -1,13 +1,22 @@
 # #6461 — blind off-path TCP RST/FIN demotes a live session with no sequence validation
 
-**Status: DRAFT v2 — redesigned after round-1 hostile review (Codex PLAN NO, Claude SMR PLAN NO, AGY partial); pending round-2 review**
+**Status: DRAFT v3 — revised after round-2 AGY review (PLAN NO, 2 blockers folded); Codex round-2 in flight**
 
 v1 → v2: round-1 review killed v1's architecture (attacker-writable trust
 anchor, missed reverse-NAT constructor, invalid cross-store serial merge).
-v2 is redesigned around a single two-direction anchor on the canonical
+v2 was redesigned around a single two-direction anchor on the canonical
 forward entry, plausibility-gated anchor updates, pre-packet validation,
-and constructor gating at every packet-derived install. The v1 doc is in
-git history (c676ac96b); round-1 reviews sit alongside this file.
+and constructor gating.
+v2 → v3: round-2 AGY found (a) `account_packet` never runs for
+LocalDelivery dispositions, so v2 left host-inbound flows (BGP/IKE/SSH to
+the firewall — the exact victims the issue names) with a frozen install-time
+anchor; (b) v2's born-alive reverse install after a refused close seed was
+an attacker-mintable junk-entry vector; (c) `FWD_SLACK` consumed the wrong
+direction's advertised window. v3: anchor updates run in BOTH
+`lookup_with_origin` (every slow-path session hit incl. LocalDelivery) AND
+`account_packet` (cache-hit bulk); a refused close seed SKIPS the reverse
+install entirely; `FWD_SLACK` derives from `wnd(O)`; the anchor-stall
+analysis is made precise. Round-1/2 review docs sit alongside this file.
 
 Research branch: `research/6461-blind-rst`. Plan-only deliverable; no
 production code is changed by this branch. Implementation begins only after
@@ -313,25 +322,44 @@ entries carry no anchor; a missing forward entry (e.g. FabricRedirect flows
 with no local forward entry — the same missing-companion case
 `account_packet` tolerates) means no anchor → fail-open.
 
-### 5.2 Anchor updates: plausibility-gated slides at the chokepoint
+### 5.2 Anchor updates: plausibility-gated slides at the two chokepoints
 
-Update sites (both already call `account_packet` per packet):
+Two update sites, one store, one gating rule — together they cover every
+TCP forwarding class:
 
-- (a) flow-cache hit path (`flow_cache_hit.rs:312`) — TCP only: read the 8
-  bytes at `packet_frame[meta.l4_offset+4 .. +12]` → `(seq, ack)`;
+- (a) **`account_packet`** (`flow_cache_hit.rs:312` and
+  `poll_descriptor/mod.rs:3497`) — covers the cache-hit bulk AND the
+  ForwardCandidate/FabricRedirect slow-path forward build. TCP only: read
+  the 8 bytes at `packet_frame[meta.l4_offset+4 .. +12]` → `(seq, ack)`;
   `seg_len` from IP-declared length (§5.3). **The active frame is
   `packet_frame`, NOT `raw_frame`** — native GRE builds a synthetic
   decapped frame and the meta offsets index into it
   (`flow_cache_hit.rs:65-103`); reading `raw_frame` would parse the GRE
   outer header.
-- (b) slow-path forward build (`poll_descriptor/mod.rs:3497`) — same read
-  via a shared helper (§5.3) so both sites share one formula (style rule
-  3).
+- (b) **`lookup_with_origin`** — covers every slow-path session hit that
+  never reaches (or precedes) the cache: control segments, pre-cache
+  packets, NAT64/NPTv6, and — round-2 AGY B1 — **LocalDelivery**, whose
+  per-packet `to-zone junos-host` re-evaluation
+  (`poll_descriptor/mod.rs:1744+`, #3706/#3485) runs through
+  `resolve_flow_session_decision` → `lookup_session_across_scopes` on every
+  host-inbound packet. `account_packet` is gated on
+  ForwardCandidate|FabricRedirect (`poll_descriptor/mod.rs:3478-3481`) and
+  LocalDelivery is neither, so WITHOUT this site the anchor of a
+  firewall-destined BGP/SSH/IKE session would freeze at its install-time
+  seed and every post-handshake legitimate close would soft-refuse — the
+  exact management flows the issue names as victims. A firewall-originated
+  flow's outbound direction is kernel-TX (unseen at AF_XDP); its anchor
+  side is pinned by the inbound ACK stream (cross-direction leg, §5.4).
 - (c) install time — the creating packet seeds the anchor for its direction
-  (adopt unconditionally, set validity bit): SYN seeds `isn+1` (SYN-with-
-  data/TFO seeds `isn + SEG.LEN`), a mid-stream pickup seeds from its first
+  (adopt unconditionally, set validity bit): SYN seeds `isn + SEG.LEN`
+  (TFO/SYN-with-data included), a mid-stream pickup seeds from its first
   segment. An attacker-invented pickup flow anchors itself — killing a flow
   you yourself created is no loss; victim flows anchor from victim traffic.
+
+Reverse-direction samples fold onto the canonical forward entry exactly as
+`account_packet` folds counters today (`mod.rs:1177-1211`); lookup-path
+updates on a reverse hit use the same post-borrow companion hop the close
+marking uses (§5.5).
 
 **Gating rule (round-1 Codex B1 — the trust anchor must not be
 attacker-jumpable):** an ordinary (non-close) sample `s = seq + seg_len`
@@ -341,10 +369,26 @@ accepted iff `!valid` (seed) or `s.wrapping_sub(seq_hi) <= FWD_SLACK`
 `seq_hi` is a no-op via max). Jumpy samples — a poison ACK-only segment
 planted ahead of the window — are ignored *for tracking* (still forwarded;
 the endpoint's own TCP deals with them). `ack_hi` updates gate identically.
-The anchor can therefore only slide at the speed of plausible data
-(≤ FWD_SLACK per packet, contiguous), never jump. Anchor-walking requires a
-contiguous fake-data stream (≥ window/MSS packets) — data-injection-
-equivalent effort (§2).
+
+**Stall analysis (round-2 AGY B2, made precise):** on a per-packet-tracked
+path every forwarded packet is a sample, so `seq_hi` advances essentially
+contiguously — the gap between the anchor and the next new-sequence sample
+is bounded by the *reordering extent* of the path (in practice ≪ 64 KiB),
+NOT by in-flight size. The anchor can fall >`FWD_SLACK` behind only when
+(a) observation is interrupted (an untracked stretch — the covered classes
+are fixed by sites (a)+(b); the documented residuals in §7 stay) or
+(b) reordering extent exceeds `FWD_SLACK` (512 KiB of in-flight reordering
+is pathological on real networks). When it does happen, every later legit
+close soft-refuses: delivery unaffected, endpoints tear down, the entry
+idles out on its ordinary timeout — a table-pressure cost, never a broken
+connection. **No re-anchor escape hatch**: an "N contiguous rejected
+samples → re-anchor" rule reopens the staging weakness at ~N+1 packets of
+contiguous fake data (send 16 contiguous fake segments ahead of the window,
+re-anchor, then RST at the new position) — injection-equivalent effort
+defeats the purpose of the hatch only if the hatch is expensive, and it
+cannot be made expensive without also stalling the legitimate case it
+exists for. The residual is accepted and documented, not engineered
+around.
 
 **Ordering:** on a closing-flag packet, validation (§5.4) reads the
 pre-packet anchor; the packet's own sample updates the anchor afterwards,
@@ -380,10 +424,13 @@ fn close_seq_plausible(anchor: &TcpSeqAnchor, dir_is_reverse: bool,
 ```
 
 For a closing segment in direction D (opposite O), with
-`BACK_SLACK = 64 KiB` and `FWD_SLACK = clamp(2 × wnd(D), 64 KiB, 512 KiB)`
-(the raw 16-bit wnd understates scaled windows; the double-and-cap keeps
-the total acceptance interval in [128 KiB, ~1.1 MiB] — honest arithmetic in
-§2/§8, no dead clamp this time):
+`BACK_SLACK = 64 KiB` and `FWD_SLACK = clamp(2 × wnd(O), 64 KiB, 512 KiB)`
+— **`wnd(O)` is the window the OPPOSITE direction's packets advertise**:
+D's outstanding-at-abort data is bounded by O's receive window (D's
+effective SEND window), not by D's own advertisement (round-2 AGY F4 — v2
+consumed `wnd(D)`, the wrong input). The raw 16-bit wnd understates scaled
+windows; the double-and-cap keeps the total acceptance interval in
+[128 KiB, ~1.1 MiB] — honest arithmetic in §2/§8, no dead clamp:
 
 1. **ESTABLISHED:** accept iff
    `seg.seq ∈ [seq_hi(D) − BACK_SLACK, seq_hi(D) + FWD_SLACK]`
@@ -393,10 +440,12 @@ the total acceptance interval in [128 KiB, ~1.1 MiB] — honest arithmetic in
    the asymmetric-routing case (a direction never observed has no
    `seq_hi(D)` validity bit; the opposite ACK stream still pins it).
 2. **OPENING** (`!established`): accept iff (`ACK` set and
-   `seg.ack == peer_isn + peer_seg_len_seen`, the RFC 5961 SYN-SENT rule —
-   accepts the Linux/Windows `seq=0, ack=isn+1` connection-refused RST,
-   round-1 AGY Q6) **or** `seg.seq == dir_isn + dir_seg_len_seen`
-   (self-abort). Missing handshake baseline → fail-open.
+   `seg.ack ==` the seeded peer-side `seq_hi` value — i.e.
+   `peer_isn + SEG.LEN`, covering TFO/SYN-with-data, since the seed at
+   §5.2(c) already folds the SYN's payload into `seq_hi`; this accepts the
+   Linux/Windows `seq=0, ack=isn+SEG.LEN` connection-refused RST, round-1
+   AGY Q6 / round-2 AGY F6) **or** `seg.seq ==` the seeded own-side
+   `seq_hi` (self-abort). Missing handshake baseline → fail-open.
 3. **No valid baseline in any form** (HA-imported entry never locally
    observed) → fail-open (demote as today).
 4. All comparisons RFC 1982 wrapping; the membership test is
@@ -441,18 +490,25 @@ wire-driven `update_session` callers (no packet) skip validation.
 ### 5.6 Constructor gating (the two-packet bypass, round-1 Codex B2)
 
 `install_reverse_session_from_forward_match` (`shared_ops.rs:857-865`)
-holds the `forward_match` in hand — whose entry carries the anchor. Before
-installing the reverse companion with the current packet's flags:
+holds the `forward_match` in hand — whose entry carries the anchor. When
+the current packet is closing-flagged, validate it (§5.4) against the
+FORWARD entry's anchor first (the cross-direction legs cover a
+reverse-direction close — `ack_hi(fwd)` pins the reverse stream's
+position):
 
-- If the packet is closing-flagged: validate it (§5.4) against the FORWARD
-  entry's anchor (cross-direction legs cover a reverse-direction close —
-  `ack_hi(fwd)` pins the reverse stream's position).
-  - Accept → install with `closing`/`reset` seeded as today (legit one-way
-    server RST keeps the #3046 2s fast reap on this path).
-  - Refuse → install with `closing=false, reset=false` (born ALIVE; the
-    packet is still forwarded). The forward companion is never marked from
-    an unvalidated seed; a later close on the reverse entry revalidates
-    against the same forward anchor and fails the same way.
+- **Accept** → install with `closing`/`reset` seeded as today (a legit
+  one-way server RST keeps the #3046 2 s fast reap on this path).
+- **Refuse** → **skip the install entirely** (round-2 AGY F3). The packet
+  is still forwarded (the synthesized decision is returned regardless, the
+  #1861 §5.4 pattern), but NO reverse entry is minted. v2's born-alive
+  install let an attacker mint junk reverse entries at the full established
+  timeout (300 s default) on a miss path the #4400 guard does not cover —
+  a table-pressure vector strictly worse than master's born-dying 2 s
+  entries. Skip-install removes it: the attacker gains no state at all; the
+  next legitimate reply re-synthesizes the companion and revalidates
+  against the same forward anchor; the forward companion is never marked
+  from an unvalidated seed. A legit close we misjudged (stale anchor)
+  costs only a re-synth on the next reply packet.
 - The fabric-return seed (site 6) is already close-free (#4453); primary
   miss installs (site 3) are #4400-guarded; tunnel UpsertLocal (site 5) is
   trusted-local; wire re-import (site 4) carries no packet.
