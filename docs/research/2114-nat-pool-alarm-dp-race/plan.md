@@ -1,8 +1,9 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v17 — r16 findings folded (Codex NEEDS-REVISION
-  4M/3m; AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/1m);
-  pending convergence review r17
+- **Status**: DRAFT v18 — r17 findings folded (Codex NEEDS-REVISION
+  6M/3m; AGY PLAN-READY; Claude SMR NEEDS-REVISION 6M/4m converging
+  with Codex on independent verification); pending convergence review
+  r18
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -378,6 +379,72 @@
   policy stated explicitly and the health response gains a distinct
   terminal confirm-record message (`pkg/api/health.go` — `pkg/api`
   IS touched after all, declaration corrected).
+  v18: r17 convergence — the durability barrier is GENERALIZED from a
+  finalize-time observation into a failure-phase classification on
+  every replacement path (Codex M1, verified the single-failure hole:
+  SyncApply treats a POST-rename `writeActive` error as plain
+  not-durable and defers with NO tombstone attempt,
+  `store.go:738-746`, so one post-rename failure + one restart inside
+  the retry window replays B + binding-A — contradicting the x7
+  closure; the same shape exists at `store_commit.go:917-937` and
+  `store_persist.go:196-227`): all three replacement paths now
+  classify with the existing `isPostRenameDurabilityFailure` check —
+  PRE-rename → retain per #5473 (the replacement is INVISIBLE; the
+  record is the rollback intent); POST-rename → immediately attempt
+  the tombstone barrier via `resolveConfirmRemovalLocked` (success
+  PROVES the replacement durable — that is #5473's precondition, with
+  the tombstone success as the durability witness; failure retains
+  BOTH debts). The #5473 tests' observable retention expectations
+  change (the record now survives until the barrier, not until the
+  retry heals; the invariant "survives until the replacement is
+  durable" is preserved) and the m1-broadened residual is restated
+  (active POST + tombstone failure in ANY phase + restart before a
+  successful barrier). The identity model gains its missing edges
+  (Codex M2, verified: `Load`'s absent-DB and compile-failed returns
+  never `ReadConfirm`, `store_persist.go:26-42,81-113`, and a plain
+  commit does not resolve an orphan record,
+  `store_commit.go:678-682`): `Load` reads confirm.json on EVERY
+  outcome and seeds a THREE-STATE identity (Present(ArmID) / Absent /
+  unreadable→terminal latch) — "" is then only ever a PRESENT legacy
+  record's value; the orphan lifecycle is documented (next successful
+  boot's stale-drop or first keyed resolution). The debt-set claim is
+  corrected (Codex M3 = SMR M3, independently walked: R_A + W_B + R_B
+  CAN coexist inside one retry sleep): the retry carries a KEYED SET
+  (multiple removal debts, one per unresolved resolution; at most one
+  rewrite debt, re-keyed by the latest arm outcome) with STRICT
+  per-pass convergence (complete-own-record or stale-clear once the
+  current record is durable) — the false ≤1+1 bound is deleted. The
+  terminal machine is repaired at both ends (Codex M4): master-key IO
+  is reclassified TRANSIENT (a plain `os.ReadFile`,
+  `crypto.go:446-449` — only invalid OBSERVED key length is
+  deterministic-permanent), and the remediation transition gains a
+  LIVE observer — the terminal latch keeps the singleton loop alive
+  in PROBE-ONLY mode (read-only `ReadConfirm` per pass: a clean read
+  clears the latch and re-arms the debt's retry; a confirmed absence
+  clears and drops), and the boundary made MECHANICAL via a shared
+  `ConfirmRecordPermanentError` sentinel (the zero-deadline and
+  nil-target #5637 gates were plain `fmt.Errorf`, `db.go:271-280`). The boot transient hole is closed (Codex M5,
+  verified master's pre-existing #4577 violation:
+  `store_persist.go:140-145` log-and-return lets an unconfirmed
+  config stand for the process's lifetime): TRANSIENT boot read
+  failures retry bounded INSIDE Load and then FAIL Load (fail-closed,
+  systemd `RestartSec=1` re-drives); PERMANENT-class keeps
+  proceed+latch+503 (failing Load forever on a deterministically
+  corrupt record would brick the node; the louder hammer —
+  auto-revert on a corrupt record — is considered and rejected). The
+  health channel becomes cause-bearing (Codex M6, verified
+  `ConfigPersistDegradedFn func() bool` is the only signal,
+  `server.go:139,338,424`): a typed snapshot accessor with a
+  precedence rule (terminal confirm-record > active-persist) feeds
+  the distinct /health message; the gauge stays the aggregate OR, and
+  the Prometheus descriptor + option + wiring comments
+  (`metrics_descriptors.go:625-630`, `server.go:132-140`,
+  `daemon_run_servers.go:370-374`, `metrics.go:951-957`) join the
+  sweep (Codex m2), as do the SyncApply source-doc confirmations
+  (`store.go:716-717`, `pkg/configstore/README.md:663-672`, Codex m3).
+  SMR r17 m1 folded: the rewrite debt is raised ONLY by the ARM path
+  (`writeConfirmState`); a post-rename failure of a resolution-side
+  or retry-side `WriteConfirm` retains the ORIGINATING debt.
 
 ---
 
@@ -1056,20 +1123,41 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   (ii) REPLACEMENT/ROLLBACK resolutions (timeout rollback
   `store_commit.go:867-937`, boot-recovery revert
   `store_persist.go:171-227`, SyncApply supersede `store.go:738-760`):
-  the record IS the rollback intent UNTIL the replacement is durable —
-  these paths RETAIN it pre-durability (#5473: retention +
-  `confirmResolvePendingPersist` debt on replacement-write failure)
-  and reach `resolveConfirmRemovalLocked` ONLY after the replacement
-  lands durably (`clearConfirmResolutionPendingLocked`,
-  `store_persist.go:414-428`, or the direct durable-success call) —
-  where the finalize TOMBSTONES before deleting, like every other
-  path. The crash window between durable-replacement and removal is
-  thereby closed: pre-v16 it left a binding record that recovery could
-  re-arm into reverting a NEWER durable config (r15 Codex M2 — the
-  failed-SyncApply case: durable B + A's record with B==C content or a
-  legacy empty hash → revert of the synced config the peer holds →
-  #4378-class divergence). "No tombstone on replacement paths" now
-  means exactly: no tombstone UNTIL the replacement is durable.
+  the record IS the rollback intent UNTIL the replacement is durable,
+  and these paths reach `resolveConfirmRemovalLocked` EITHER after the
+  replacement lands durably (`clearConfirmResolutionPendingLocked`,
+  `store_persist.go:414-428`, or the direct durable-success call) OR
+  IMMEDIATELY on a POST-rename replacement-write failure — the
+  failure-phase classification every replacement path now performs
+  (r17 Codex M1): the existing `isPostRenameDurabilityFailure` check
+  (`store_commit.go:181` precedent) splits writeActive failures into
+  PRE-rename (the replacement is INVISIBLE — RETAIN the record per
+  #5473, `confirmResolvePendingPersist` debt, NO tombstone attempt)
+  and POST-rename (the replacement is VISIBLE — immediately attempt
+  the tombstone barrier: a successful tombstone `WriteConfirm` PROVES
+  the replacement durable, which is exactly #5473's precondition, so
+  the finalize proceeds; a failed attempt retains BOTH debts —
+  `persistDegraded` for the active write + the keyed removal debt).
+  Pre-v18 the paths treated a post-rename failure as plain
+  not-durable and deferred with no tombstone attempt
+  (`store.go:738-746`, `store_commit.go:917-937`,
+  `store_persist.go:196-227`), leaving a SINGLE-failure restart hole:
+  one post-rename writeActive failure + one restart inside the retry
+  window replays the visible replacement B next to a binding
+  pending-shaped A (SyncApply-identical content, byte-identical
+  edit-back, or a legacy empty hash) → re-arm → the timer reverts B →
+  the #4378-class divergence r15 Codex M2 named. The classification
+  closes it: the record now survives until the barrier, not until
+  the retry heals — #5473's invariant "the recovery record survives
+  until the replacement config is DURABLE on disk" is preserved, with
+  the tombstone success as the durability WITNESS — and the #5473
+  tests' observable retention expectations are updated accordingly
+  (retention now only when the barrier attempt ALSO fails). The
+  residual crash window is thereby shrunk to the m1-broadened
+  irreducible set below. "No tombstone on replacement paths" now
+  means exactly: no tombstone UNTIL the replacement is durable — or
+  is PROVEN durable by the barrier the post-rename failure
+  immediately triggers.
   (iii) CLASS 0 — factory reset (`factory_reset.go:252-268`): terminal
   wipe of active state AND confirm.json under a reset generation; no
   tombstone, nothing to resolve.
@@ -1091,11 +1179,14 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   — still covering the in-flight callback race, `:717-726` +
   `PromoteRollback`'s gen check `:860`); (3) best-effort delete with
   the keyed retry below. On replacement paths the in-memory resolution
-  happened at the rollback/supersede itself; the finalize at
-  post-durability performs (1) and (3) only (the in-memory side is long
-  settled — the tombstone's job there is purely to make the
-  already-fulfilled intent visible so a lingering record can never
-  replay). Tombstone-write FAILURE: proceed with the in-memory side and
+  happened at the rollback/supersede itself; the finalize performs
+  (1) and (3) only (the in-memory side is long settled — the
+  tombstone's job there is purely to make the already-fulfilled intent
+  visible so a lingering record can never replay), and it runs EITHER
+  at post-durability OR immediately on a POST-rename replacement-write
+  failure (r17 Codex M1's classification — the immediate attempt is
+  the durability barrier; a PRE-rename failure attempts nothing and
+  retains per #5473). Tombstone-write FAILURE: proceed with the in-memory side and
   retain retry debt (re-driving tombstone→delete) — making the confirm
   itself durability-gated would invert a disk failure into a rollback
   of a confirmed config, which is strictly worse. The irreducible
@@ -1125,18 +1216,39 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   timer window, NOT the disk (r15 Codex M4: the in-memory pending state
   otherwise carries NO disk identity, `store.go:168-179`).
   (b) `s.onDiskArmID` — KNOWN-ON-DISK RECORD identity, updated ONLY by
-  write outcomes and recovery: a fully successful durable `WriteConfirm`
+  write outcomes and Load: a fully successful durable `WriteConfirm`
   (arm write, tombstone write, or rewrite) → the written record's ArmID;
   a PRE-rename `WriteConfirm` failure → UNCHANGED (the prior record
   stands, `fsatomic.go:45-55`); a POST-rename failure → the VISIBLE
-  record's ArmID + a rewrite debt keyed on that identity (next bullet);
-  readable recovery → `rec.ArmID`; unreadable → empty (plus the terminal
-  latch, taxonomy bullet below). A LEGACY record (no `ArmID` field)
-  unmarshals with `ArmID = ""`, so the empty string is a MATCHABLE
-  LEGACY SENTINEL, not a third state: a debt keyed `""` matches the
-  legacy record's own empty field (tombstone+delete — correct), and a
-  later real arm mismatches (`"" != B.ArmID` → the mismatch branch —
-  correct); only a NEWLY ARMED record ever carries a non-empty key.
+  record's ArmID — and the REWRITE DEBT is raised ONLY by the ARM path
+  (`writeConfirmState`, r17 SMR m1's pin: a post-rename failure of a
+  RESOLUTION-side or RETRY-side `WriteConfirm` retains the ORIGINATING
+  debt, which re-drives the same write next pass — no second debt is
+  raised for the same record); Load seeding below. A LEGACY record (no
+  `ArmID` field) unmarshals with `ArmID = ""`, so the empty string is a
+  MATCHABLE LEGACY SENTINEL, not a third state: a debt keyed `""`
+  matches the legacy record's own empty field (tombstone+delete —
+  correct), and a later real arm mismatches (`"" != B.ArmID` → the
+  mismatch branch — correct); only a NEWLY ARMED record ever carries a
+  non-empty key.
+  (c) LOAD SEEDING ON EVERY OUTCOME (r17 Codex M2, verified:
+  `store_persist.go:26-42` absent-DB and `:81-113` compile-failed
+  returns never `ReadConfirm` — only the success path reaches
+  `recoverPendingConfirmLocked` at :113 — so "" conflated
+  never-observed with the legacy sentinel, and a plain commit does NOT
+  resolve an orphan record: `clearPendingConfirmLocked` returns early
+  with no in-memory window, `store_commit.go:678-682`): `Load` reads
+  confirm.json on EVERY outcome (absent-DB, compile-failed, success)
+  and seeds a THREE-STATE identity — PRESENT(ArmID) / ABSENT /
+  unreadable (→ the terminal latch, taxonomy bullet) — so "" is only
+  ever a PRESENT legacy record's value, never "not observed". The
+  absent-DB path logs a PRESENT orphan loudly and leaves it keyed: its
+  lifecycle is the next successful boot's stale-drop (GuardedHash
+  mismatch) or the first keyed resolution that targets it — never a
+  phantom-empty debt that would durably PRESERVE it (the r17 Codex M2
+  chain: orphan A + unresolved-by-plain-commit + B-arm-pre-rename
+  failure + B-resolution read error now keys the debt on A, so the
+  retry MATCHES and tombstones it).
   Debts key on `onDiskArmID`, NEVER on `armedArmID` and never on a fresh
   disk read at debt-construction time (a resolution-time READ ERROR must
   still construct the right debt, r15 Codex M4). A resolution keys its
@@ -1189,13 +1301,25 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   on-disk record). Composition with the other two debts is ordered, not
   concurrent: `persistRetryLoop` (`store_persist.go:414-428`) heals
   `persistDegraded` FIRST (the active write), then
-  `clearConfirmResolutionPendingLocked` finalizes the deferred removal;
-  the confirm-side retry carries a keyed debt SET (at most one removal
-  debt + one rewrite debt — a second removal debt requires a second
-  resolution, whose own tombstone write first clears any pending rewrite
-  debt on the same record by establishing its durability) and each debt
-  resolves by the four-state rules above, in either order, without one
-  destroying the other's record.
+  `clearConfirmResolutionPendingLocked` finalizes the deferred removal.
+  The confirm-side retry carries a KEYED DEBT SET — NOT a bounded pair
+  (r17 Codex M3 = SMR M3, independently walked: R_A from A's resolution
+  + W_B from B's post-rename arm failure + R_B from B's resolution whose
+  tombstone fails post-rename — all inside ONE retry sleep, since the
+  singleton sleeps OUTSIDE the lock, `store_persist.go:402-405` — the
+  v17 "≤1 removal + 1 rewrite" bound is FALSE and is deleted): the set
+  holds MULTIPLE removal debts (one per unresolved resolution) + AT
+  MOST ONE rewrite debt (re-keyed by the latest arm outcome), and it
+  converges by STRICT per-pass reduction: each pass processes every
+  debt by the four-state rules — a debt either completes its own
+  record's action (match → tombstone→delete; rewrite → durable) or
+  goes STALE and clears once the current on-disk record is durably
+  established (mismatch branch) — so every pass strictly shrinks the
+  set and no debt ever acts on a record its key does not name. A
+  rewrite debt whose record is made durable by ANOTHER write (a second
+  resolution's tombstone, a mismatch-branch rewrite) clears on its
+  next pass — its purpose is satisfied, the redundant rewrite is
+  harmless.
 - **Post-rename FINALIZE durability barrier — stated honestly (r16
   Codex M1, verified: master's post-rename commit branches call
   `clearConfirmResolutionPendingLocked` with the replacement only
@@ -1214,69 +1338,123 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   debts — `persistDegraded` keeps owing the active write AND the keyed
   removal debt owes tombstone→delete — and any later successful
   `WriteConfirm` on either side re-establishes the barrier. Admitted
-  irreducible residual: BOTH the active write and the tombstone write
-  fail POST-rename AND power is lost before any retry lands a directory
-  fsync — the namespace can then replay to a combination where A's
-  record survives untombstoned while B's rename is lost (or vice
-  versa); recovery treats that exactly as today's post-rename crash
-  (re-arm or stale-drop by GuardedHash). That residual exists on master
-  TODAY for the active write alone; the plan shrinks it to the
-  double-failure intersection and states it instead of hiding it. The
+  irreducible residual (r17 Codex m1's broadening — the v17 "both fail
+  post-rename" framing was too narrow): the replacement write fails
+  POST-rename AND the tombstone attempt fails in ANY phase (pre- OR
+  post-rename) AND a restart/power loss lands before any retry
+  completes a directory barrier — the namespace can then replay to a
+  combination where A's record survives untombstoned while B's rename
+  is lost (or vice versa); recovery treats that exactly as today's
+  post-rename crash (re-arm or stale-drop by GuardedHash). That
+  residual exists on master TODAY for the active write alone; the
+  plan shrinks it to the replacement-failure ∧ barrier-failure
+  intersection and states it instead of hiding it. The
   new regression (x8) drives the REAL post-rename seam — a writeActive
   whose rename lands and whose directory fsync genuinely fails — NOT
   the #5473 tests' seam, which first completes a successful durable
   `WriteActive` and only then fabricates the typed error
   (`confirm_rollback_durable_5473_test.go:334-349`, r16 Codex M1's
   test-blindness finding).
-- **TYPED errors — FULL permanent taxonomy, PER-DEBT terminal state,
-  boot reconstruction, pinned remediation (r16 Codex M4, subsuming r15
+- **TYPED errors — permanent taxonomy with the CORRECT boundary,
+  PER-DEBT terminal state, a LIVE probe observer, boot reconstruction,
+  pinned remediation (r16 Codex M4 + r17 Codex M4/M5, subsuming r15
   Codex m1).** The retry's READ ERROR branch distinguishes TWO classes
   across the ENTIRE `ReadConfirm` error set, not just the #5637 gates:
-  (a) TRANSIENT IO (open/read/dir errors, short reads) → retain + retry
-  with backoff; (b) PERMANENT — the #5637 semantic parse gates
+  (a) TRANSIENT — open/read/dir errors, short reads, AND master-key IO
+  (r17 Codex M4's boundary correction: `readMasterKey` is a plain
+  `os.ReadFile`, `crypto.go:446-449` — a missing mount or EACCES is
+  recoverable, so key-IO failures retain + retry like any other IO
+  error; only an invalid OBSERVED key length, `:452,:461`, is
+  deterministic); (b) PERMANENT — the #5637 semantic parse gates
   (malformed JSON, zero deadline, nil rollback target, `db.go:226-281`)
-  PLUS the crypto/envelope permanent failures (corrupt envelope,
-  authentication failure, unsupported PRF, invalid master-key length,
-  master-key IO, `crypto.go:307-356,366-395,409-453`) → TERMINAL for
-  THAT DEBT: the confirm-record debt stops retrying (no infinite
+  PLUS the deterministic crypto/envelope failures (corrupt envelope,
+  authentication failure, unsupported PRF, invalid observed master-key
+  length, `crypto.go:307-356,366-395,409-453`) → TERMINAL for THAT
+  DEBT: the confirm-record debt stops retrying (no infinite
   capped-backoff loop) while the singleton retry loop KEEPS healing
   `persistDegraded` — `persistRetryLoop` also owns active-config
   persistence (`store_persist.go:402-465`), so stopping the loop
-  outright is unsafe (r16 Codex M4's per-debt correction). The terminal
+  outright is unsafe (r16 Codex M4's per-debt correction). The
+  classification is MECHANICAL, not string-matching (r16 Codex item-5
+  follow-through, verified: today only the malformed-JSON path wraps
+  — the zero-deadline and nil-rollback-target gates construct PLAIN
+  `fmt.Errorf` values with no sentinel, `db.go:271-280`): the #5637
+  gates and the deterministic crypto/envelope failures gain a shared
+  `ConfirmRecordPermanentError` sentinel wrapper (`errors.As` at the
+  call sites), and every `ReadConfirm` error NOT carrying it is
+  transient by construction. The terminal
   latch is a distinct `confirmRecordTerminal` flag folded into
   `ConfigPersistDegraded` (`store_persist.go:342-353`), so health stays
-  503 + the #1799 gauge reads 1. BOOT RECONSTRUCTION: recovery's
-  `ReadConfirm` failure currently logs and returns BARE
-  (`store_persist.go:140-144`) — a restart would launder a corrupt
-  terminal record from 503 to healthy because health derives solely
-  from in-memory flags; the recovery read-failure path now sets the
-  terminal latch on a PERMANENT-class error at boot (transient-class
-  keeps master's log-and-return — the record may be readable next
-  boot). REMEDIATION/CLEAR transition pinned: the operator inspects,
-  repairs, or removes confirm.json; the next clean `ReadConfirm`
-  (repaired record) or CONFIRMED ABSENCE (record removed — verified by
-  an actual read, not assumed) clears the latch and re-arms the retry
-  if any non-terminal debt remains. Manual remediation is documented
-  loudly in the journal and the `pkg/configstore/README.md` contract
-  prose.
-- **Election-neutral terminal-503 policy — stated explicitly (r16 Codex
-  m3).** A permanent HTTP 503 from the degraded latch does NOT gate
-  internal HA promotion: config-persist degradation is wired ONLY to the
-  REST health endpoint (`daemon_run_servers.go:370-374`,
-  `api/health.go:65-71`); cluster health annotations are DIAGNOSTIC ONLY
+  503 + the #1799 gauge reads 1. THE LIVE OBSERVER (r17 Codex M4,
+  verified the v17 gap: the only production `ReadConfirm` is boot
+  recovery, `store_persist.go:140`, and the singleton EXITS when
+  neither degradation flag is set, `:405-412` — a lone terminal latch
+  never cleared in-process): the terminal latch keeps the singleton
+  loop ALIVE in PROBE-ONLY mode — a READ-ONLY `ReadConfirm` per pass,
+  NO writes — until the latch clears: a CLEAN READ (operator repaired
+  the record, or the transient-looking cause resolved) clears the
+  latch AND re-arms the debt's retry from the now-readable record; a
+  CONFIRMED ABSENCE (record removed — observed by the probe's actual
+  read, never assumed) clears the latch and drops the debt. The
+  loop-exit condition gains "and no terminal latch set". BOOT
+  RECONSTRUCTION + the r17 Codex M5 hardening: master's recovery
+  read-failure path logs and returns BARE (`store_persist.go:140-145`)
+  while `Load` SUCCEEDS — a TRANSIENT boot read error silently loses
+  the rollback window for the process's lifetime, a pre-existing #4577
+  violation (an unconfirmed config stands with no timer, no debt, no
+  retry) that v17 had enshrined. The boot path now splits by class:
+  TRANSIENT → bounded retry INSIDE `Load` (before manager
+  construction), and still-failing → `Load` FAILS (fail-closed —
+  systemd `RestartSec=1` re-drives the boot into a readable disk;
+  proceeding is exactly the never-stand violation); PERMANENT →
+  proceed + set the terminal latch + 503 + runbook (failing `Load`
+  forever on a deterministically corrupt record would brick the node —
+  the admitted residual is "unconfirmed stands, LOUDLY, until operator
+  action" for the permanent class only; the larger hammer —
+  auto-revert to the last rollback archive on a corrupt record — is
+  considered and REJECTED as out of scope: discarding the operator's
+  active config on a corrupt confirm record is a far bigger semantic
+  change than this PR carries). REMEDIATION/CLEAR transition pinned:
+  the operator inspects, repairs, or removes confirm.json; the probe
+  observes the clean `ReadConfirm` or the confirmed absence and
+  performs the clear in-process (no restart required). Manual
+  remediation is documented loudly in the journal and the
+  `pkg/configstore/README.md` contract prose.
+- **Election-neutral terminal-503 policy — stated explicitly, with a
+  CAUSE-BEARING channel (r16 Codex m3 + r17 Codex M6/m2).** A permanent
+  HTTP 503 from the degraded latch does NOT gate internal HA promotion:
+  config-persist degradation surfaces to operators via the REST health
+  endpoint AND the Prometheus gauge (`daemon_run_servers.go:370-374`,
+  `api/health.go:65-71`, `api/metrics.go:951-957` — r17 Codex m2: the
+  v17 "wired ONLY to REST health" was false, the same callback drives
+  the gauge); cluster health annotations are DIAGNOSTIC ONLY
   and election-neutral (`pkg/cluster/readiness.go:20-24` — annotate
   health without perturbing the failover math; manual failover stays
   gated solely by `ConfigStale()`), and crash takeover bypasses the
   readiness gate by design (`pkg/cluster/election.go:427-432` — a dead
   peer means the survivor promotes immediately). The 503 exists for
   operators and load balancers, never for the cluster's own election.
-  The health response ITSELF gains a distinct message for the terminal
-  confirm-record case — today's single string ("active configuration
+  The CAUSE-BEARING CHANNEL (r17 Codex M6, verified:
+  `ConfigPersistDegradedFn func() bool` is the ONLY signal,
+  `server.go:139,338,424` — the bool-only channel cannot carry the
+  distinct message v17 promised): the store gains a typed snapshot
+  accessor `ConfigPersistDegradedState()` returning
+  `{ActivePersistDegraded, ConfirmRecordTerminal bool}` (the aggregate
+  `ConfigPersistDegraded()` stays the OR for the gauge), wired through
+  a NEW functional option `ConfigPersistDegradedStateFn`;
+  `api/health.go` selects the response text by PRECEDENCE — terminal
+  confirm-record corruption wins ("commit-confirmed recovery record is
+  unreadable/corrupt; operator remediation required — see journal")
+  over the existing active-persist message ("active configuration
   failed to persist to disk; restart would load stale config",
-  `api/health.go:65-71`) would misdescribe a terminal confirm-record
-  corruption (the ACTIVE config is fine; the rollback record is not), so
-  `api/health.go` maps the terminal latch to its own response text
-  (`pkg/api` IS touched — §5.1 corrected).
+  `api/health.go:65-71`) — because today's single string would
+  misdescribe a terminal confirm-record corruption (the ACTIVE config
+  is fine; the rollback record is not). The Prometheus descriptor
+  (`metrics_descriptors.go:625-630`), the option doc
+  (`server.go:132-140`), and the wiring comment
+  (`daemon_run_servers.go:370-374`) are updated to name BOTH causes
+  (aggregate semantics), closing r17 Codex m2 (`pkg/api` IS touched —
+  §5.1 corrected).
 - **Tombstone write = READ-MUTATE-WRITE, full record (r12 Claude SMR m2
   = AGY Attack 2; inventory r13-corrected).** The tombstone is the
   EXISTING record read back, `Resolved` set, rewritten via the same
@@ -1309,7 +1487,11 @@ confirmed config AT LOAD — immediate divergence. Fix (configstore,
   expired-revert executes); `HashBasis` → it compares on its own legacy
   basis (faithful to its build); `ArmID` → inert (only the new build's
   keyed debt consumes it).
-- **Recovery total order (AGY r12, verified)**: ReadConfirm parse gate
+- **Recovery total order (AGY r12, verified; r17-extended)**: the
+  `Load`-time confirm.json read happens on EVERY `Load` outcome
+  (identity seeding) → read-failure class split (TRANSIENT → bounded
+  retry → fail `Load`; PERMANENT → terminal latch + proceed) →
+  ReadConfirm parse gate
   → `rec.Resolved` check (tombstone → drop) → GuardedHash mismatch
   (dual-basis → stale-drop) → expired (existing revert) → work item H
   (unexpired FirstCommit+cluster → revert-at-Load) → re-arm.
@@ -1358,30 +1540,61 @@ byte-identical plain-commit supersession (edit-away/edit-back) with
 injected removal failure + restart → the TOMBSTONED record is dropped
 (stale-drop would have bound); a legacy empty-`GuardedHash` record
 superseded + removal failure → tombstoned → dropped; REPLACEMENT-class
-resolutions (timeout rollback, SyncApply supersede) assert NO
-tombstone is written UNTIL the replacement is durable (the #5473 tests
-stand unchanged) AND that the post-durability finalize
-(`clearConfirmResolutionPendingLocked`) DOES tombstone before deleting
-— covering the r15 failed-SyncApply divergence (durable B + lingering
-binding A → recovery drops A, never reverts the synced config);
+resolutions (timeout rollback, SyncApply supersede, boot-recovery
+revert) assert the FAILURE-PHASE CLASSIFICATION (r17 Codex M1): a
+PRE-rename replacement-write failure writes NO tombstone and retains
+per #5473, while a POST-rename failure immediately attempts the
+tombstone barrier — success finalizes (the barrier proves the
+replacement durable), failure retains BOTH debts — and the
+post-durability finalize (`clearConfirmResolutionPendingLocked`) DOES
+tombstone before deleting, covering the r15 failed-SyncApply
+divergence (durable B + lingering binding A → recovery drops A, never
+reverts the synced config) — the #5473 tests' retention expectations
+are UPDATED to the new observable semantics (retention only when the
+barrier attempt also fails), the invariant preserved;
 factory reset erases state+record with no tombstone; (x8) REAL
 post-rename seam (r16 Codex M1): drive `writeActive` with a GENUINE
-directory-fsync failure (the rename lands; the fsync fails — NOT the
-`modalWriteActive` fabricate-after-durable-success seam,
+directory-fsync failure (the rename lands; the fsync fails — via
+`fsatomic.SetAfterRenameSyncDirForTesting`, `test_seams.go:9-32`, NOT
+the `modalWriteActive` fabricate-after-durable-success seam,
 `confirm_rollback_durable_5473_test.go:334-349`) → the finalize's
 successful tombstone `WriteConfirm` acts as the same-directory
 durability barrier (no durable A-removal without a barrier write;
 tombstone-durable ⟹ replacement-durable), and a tombstone-write
-failure retains BOTH debts; (x9) BOOT RECONSTRUCTION (r16 Codex M4): a
+failure retains BOTH debts; (x9) BOOT RECONSTRUCTION (r16 Codex M4 +
+r17 Codex M5): a
 PERMANENT-class corrupt confirm.json at boot sets the terminal latch at
 recovery — health stays 503 ACROSS the restart (no laundering via the
-bare return, `store_persist.go:140-144`) — while a transient-class read
-error keeps master's log-and-return; remediation (repair/remove +
-clean `ReadConfirm` or confirmed absence) clears the latch; (x10)
+bare return, `store_persist.go:140-144`) — while a TRANSIENT-class boot
+read error retries bounded inside `Load` and then FAILS `Load`
+(fail-closed, (x13)); remediation (repair/remove + the probe's clean
+`ReadConfirm` or confirmed absence, (x12)) clears the latch IN-PROCESS; (x10)
 health response (r16 Codex m3): the terminal confirm-record state
 renders the DISTINCT message, never "active configuration failed to
 persist to disk", and the 503 remains election-neutral (no promotion
-gate, crash takeover ungated). This closes the
+gate, crash takeover ungated); (x11) LOAD
+SEEDING (r17 Codex M2): absent-DB / compile-failed / success `Load`
+outcomes ALL seed the three-state identity (Present(ArmID) / Absent /
+unreadable→latch) — the orphan chain (orphan A + plain commit + B
+pre-rename arm failure + B resolution read error) now keys the debt
+on A so the retry tombstones it, never preserves it; (x12) PROBE
+OBSERVER (r17 Codex M4): a terminal-latched debt keeps the singleton
+ALIVE probe-only — operator repair → clean probe read → latch clears
++ debt retry re-arms IN-PROCESS (no restart); operator removal →
+confirmed absence → latch clears + debt drops; the loop still exits
+when no debt and no latch remain; (x13) BOOT FAIL-CLOSED (r17 Codex
+M5): a TRANSIENT boot `ReadConfirm` failure retries bounded inside
+`Load` then FAILS `Load` (no manager construction, systemd re-drives)
+— an unconfirmed config never stands from a lost read; a
+PERMANENT-class boot failure proceeds with the latch + 503;
+(x14) TYPED HEALTH CHANNEL (r17 Codex M6/m2):
+`ConfigPersistDegradedState()` carries both causes; /health renders
+the terminal confirm-record message with PRECEDENCE over the
+active-persist message; the gauge stays the aggregate OR; the
+descriptor/option/wiring comments name both causes; (x15) TAXONOMY
+BOUNDARY (r17 Codex M4): master-key IO (missing mount/EACCES) →
+TRANSIENT retry (no latch); invalid observed key length + envelope/
+auth/PRF/parse classes → PERMANENT latch. This closes the
 master's re-arm-after-confirmed residual for the whole confirm-type
 class AND the post-durability replacement finalize — the two places a
 lingering record's replay is unsafe.
@@ -1569,35 +1782,49 @@ coexistence) is deleted as incoherent (r1 B3).
   the factored expired-branch FirstCommit revert helper + the canonical
   binding capture at Load.
 - `pkg/configstore/store_commit.go` + `db.go` + `store.go` +
-  `store_persist.go` (r11-r16): the `canonicalConfigHash` binding at
+  `store_persist.go` (r11-r17): the `canonicalConfigHash` binding at
   the sole arm site (`writeConfirmState`); the additive `Resolved` +
   `HashBasis` + `ArmID` fields on `confirmRecord` (per the
   `db.go:200-205` additive-evolution contract — NO envelope bump, none
   exists for confirm.json); the TWO-FIELD in-memory identity
   (`armedArmID` window identity — arm stores, recovery restores,
   resolution clears; `onDiskArmID` known-on-disk identity — updated
-  ONLY by write outcomes + recovery); the read-mutate-write tombstone
-  helper (the ONLY tombstone producer — its output always passes the
-  #5637 gate; NO-OP on absent record); the uniform tombstone-first
-  ordering at EVERY `resolveConfirmRemovalLocked` call site
-  (replacement paths retain the record pre-durability per #5473 and
-  tombstone at the post-durability finalize — whose tombstone write
-  doubles as the same-directory durability barrier for the
-  replacement's active.json rename; factory reset untouched); the
-  `onDiskArmID`-keyed four-state typed-error debt SET + retry table
-  (removal debt + B-rewrite debt with the A/B/C supersession
-  transitions, the rewrite-on-match/never-on-mismatch pin, and the
-  PER-DEBT terminal state over the FULL permanent `ReadConfirm`
-  taxonomy — #5637 parse gates + crypto/envelope/auth/PRF/master-key);
-  the `confirmRecordTerminal` latch folded into `ConfigPersistDegraded`
-  with boot reconstruction at the recovery read-failure path and the
-  pinned remediation/clear transition; the SyncApply finalize
-  ordering in `store.go`; the hedge-the-cause stale-drop diagnostic
-  (`store_persist.go:159-165`).
-- `pkg/api/health.go` (r16 Codex m3 — `pkg/api` IS touched): the
-  terminal confirm-record latch maps to a DISTINCT 503 response message
-  (today's single "active configuration failed to persist" string would
-  misdescribe it).
+  ONLY by write outcomes + the EVERY-outcome `Load` seeding:
+  Present(ArmID) / Absent / unreadable→latch); the read-mutate-write
+  tombstone helper (the ONLY tombstone producer — its output always
+  passes the #5637 gate; NO-OP on absent record); the uniform
+  tombstone-first ordering at EVERY `resolveConfirmRemovalLocked`
+  call site; the FAILURE-PHASE CLASSIFICATION on all three replacement
+  paths (PRE-rename → retain per #5473, no tombstone attempt;
+  POST-rename → immediate tombstone barrier attempt via the existing
+  `isPostRenameDurabilityFailure` check — success proves the
+  replacement durable, failure retains both debts; the finalize's
+  tombstone write doubles as the same-directory durability barrier
+  for the replacement's active.json rename; factory reset untouched;
+  the #5473 tests updated to the new observable retention semantics);
+  the `onDiskArmID`-keyed four-state typed-error debt SET + retry
+  table (MULTIPLE removal debts + at most one rewrite debt with the
+  A/B/C supersession transitions, the rewrite-on-match/never-on-
+  mismatch pin, STRICT per-pass convergence, and the PER-DEBT terminal
+  state over the permanent `ReadConfirm` taxonomy — #5637 parse gates
+  + envelope/auth/PRF/invalid-key-length behind a new
+  `ConfirmRecordPermanentError` sentinel, with master-key IO
+  classified TRANSIENT); the `confirmRecordTerminal` latch folded into
+  `ConfigPersistDegraded` with boot reconstruction, the LIVE
+  probe-only observer (the latch keeps the singleton alive read-only:
+  clean read → clear + re-arm; confirmed absence → clear + drop), the
+  TRANSIENT-boot bounded-retry-then-fail-`Load` hardening, and the
+  typed `ConfigPersistDegradedState()` snapshot accessor; the
+  SyncApply finalize ordering in `store.go`; the hedge-the-cause
+  stale-drop diagnostic (`store_persist.go:159-165`).
+- `pkg/api` (r16 Codex m3 + r17 Codex M6/m2 — `pkg/api` IS touched):
+  the new `ConfigPersistDegradedStateFn` functional option
+  (`server.go`) wired from the store's typed snapshot;
+  `api/health.go` renders the DISTINCT terminal confirm-record 503
+  message with precedence over the active-persist message;
+  `metrics.go` keeps the gauge on the aggregate OR;
+  `metrics_descriptors.go` + the option/wiring comments name both
+  causes.
 - `pkg/fwdstatus/sampler.go`: `CachedStatusProvider` interface; `NewSampler`
   + `Sampler.dp` retyped; `sample()` direct call.
 - `pkg/dataplane/retirement_boundary_canary_test.go`: matcher extension
@@ -1760,7 +1987,16 @@ classification snapshot.
   `pkg/configstore/README.md:417-449` contract prose and the
   `ConfigPersistDegraded` doc comment (`store_persist.go:342-353`), and
   the health-response string gains its terminal confirm-record variant
-  (`api/health.go:65-71`). The irrecoverable cross-version cases are documented in
+  (`api/health.go:65-71`). The r17 additions (Codex m2/m3): the
+  SyncApply confirm-type source terminology — "Treat the sync as the
+  confirmation" (`store.go:716-717`) and the matching
+  `pkg/configstore/README.md:663-672` prose — is reworded to the
+  replacement-class framing (supersede-on-sync with the #5473/#5835
+  ordering), and the aggregate-cause surfaces
+  (`metrics_descriptors.go:625-630`, `server.go:132-140`,
+  `daemon_run_servers.go:370-374`) name BOTH degradation causes
+  (active-persist retry pending AND terminal confirm-record
+  corruption). The irrecoverable cross-version cases are documented in
   the same comments, AND the stale-drop diagnostic text at
   `store_persist.go:159-165` is updated to hedge the cause
   ("superseded OR basis-incompatible", r14 Codex m3).
@@ -1858,27 +2094,39 @@ Preserved exactly:
     apply re-attaches AF_XDP, bumps the dataplane `config_generation`
     the flow cache keys on, reloads FRR, and can restart heartbeat).
     Replacement/rollback paths retain the record as intent ONLY until
-    the replacement is durable (#5473) and then tombstone at the
-    finalize like every other path; factory reset is a terminal wipe.
-    The TWO-FIELD (`armedArmID` window identity + `onDiskArmID`
-    known-on-disk identity) ArmID-keyed, four-state, typed-error
-    removal debt makes the retry act only on the record it resolved, in
-    every `WriteConfirm` failure phase — with the current record's
-    durability established BEFORE any stale debt is cleared, and the
-    finalize's tombstone write doubling as the same-directory durability
-    barrier for the replacement's active.json rename (tombstone-durable
-    ⟹ replacement-durable). The irreducible residuals are
-    documented, not hidden: tombstone-write failure + crash before
-    retry (hazard detonates AT the deadline or the next boot's expired
-    branch), the double-post-rename-failure namespace replay (both the
-    active write and the tombstone write fail post-rename + power loss
-    before any directory fsync — master's active-write residual, shrunk
-    to the intersection), exceptional-content cross-version windows
-    (information lost at persistence — admitted with hedge-the-cause
-    diagnostics), and terminal-degraded corrupt records (PER-DEBT
-    terminal latch over the full permanent taxonomy, boot-reconstructed
-    at recovery, election-neutral, manual remediation, loudly surfaced
-    — never silently cleared).
+    the replacement is durable (#5473) — with the r17 failure-phase
+    classification: a PRE-rename replacement-write failure retains
+    (the replacement is invisible; the record is the rollback intent),
+    a POST-rename failure immediately attempts the tombstone barrier
+    (success PROVES the replacement durable — the #5473 precondition,
+    with the tombstone success as witness), and every path tombstones
+    at the finalize like every other path; factory reset is a terminal
+    wipe. The TWO-FIELD (`armedArmID` window identity + `onDiskArmID`
+    known-on-disk identity, seeded by `Load` on EVERY outcome)
+    ArmID-keyed, four-state, typed-error debt SET makes the retry act
+    only on the record it resolved, in every `WriteConfirm` failure
+    phase — with the current record's durability established BEFORE
+    any stale debt is cleared, strict per-pass convergence, and the
+    finalize's tombstone write doubling as the same-directory
+    durability barrier for the replacement's active.json rename
+    (tombstone-durable ⟹ replacement-durable). The irreducible
+    residuals are documented, not hidden: tombstone-write failure +
+    crash before retry (hazard detonates AT the deadline or the next
+    boot's expired branch), the replacement-POST ∧ barrier-failure
+    namespace replay (the replacement write fails post-rename AND the
+    tombstone attempt fails in ANY phase + restart/power loss before
+    any successful directory barrier — master's active-write residual,
+    shrunk to the intersection), exceptional-content cross-version
+    windows (information lost at persistence — admitted with
+    hedge-the-cause diagnostics), terminal-degraded corrupt records
+    (PER-DEBT terminal latch over the permanent taxonomy with
+    master-key IO classified transient, boot-reconstructed at
+    recovery, kept under a LIVE probe-only observer, election-neutral,
+    manual remediation, loudly surfaced — never silently cleared), and
+    the PERMANENT-class boot-read residual (a deterministically
+    corrupt record at boot proceeds degraded with the latch — an
+    unconfirmed config may stand, LOUDLY, until operator action;
+    transient boot reads fail `Load` closed instead).
 
 ## 8. Risk assessment
 
@@ -2080,14 +2328,21 @@ Preserved exactly:
      tombstoned record dropped; legacy empty-GuardedHash record
      superseded + removal failure → tombstoned → dropped;
      REPLACEMENT-class resolutions (timeout rollback, SyncApply
-     supersede) assert NO tombstone UNTIL the replacement is durable
-     (the #5473 tests stand unchanged) AND the post-durability
-     finalize DOES tombstone before deleting (the failed-SyncApply
-     divergence — durable B + lingering binding A — dropped, never
-     reverting the synced config); factory reset erases state+record
-     tombstone-free; (x8) REAL post-rename seam (r16 Codex M1): a
+     supersede, boot-recovery revert) assert the FAILURE-PHASE
+     CLASSIFICATION (r17 Codex M1): PRE-rename replacement-write
+     failure → NO tombstone, retained per #5473; POST-rename failure
+     → immediate tombstone barrier attempt (success finalizes;
+     failure retains BOTH debts); the post-durability finalize DOES
+     tombstone before deleting (the failed-SyncApply divergence —
+     durable B + lingering binding A — dropped, never reverting the
+     synced config); the #5473 tests' retention expectations are
+     UPDATED to the new observable semantics; factory reset erases
+     state+record tombstone-free; (x8) REAL post-rename seam (r16
+     Codex M1): a
      `writeActive` whose rename lands and whose directory fsync
-     GENUINELY fails (not the `modalWriteActive`
+     GENUINELY fails (via `fsatomic.SetAfterRenameSyncDirForTesting`,
+     `test_seams.go:9-32` — the selective seam that fails active.json's
+     dir-fsync while confirm.json's succeeds, NOT the `modalWriteActive`
      fabricate-after-durable-success seam) → the finalize's successful
      tombstone `WriteConfirm` is the same-directory durability barrier
      (tombstone-durable ⟹ replacement-durable; no durable A-removal
@@ -2095,11 +2350,30 @@ Preserved exactly:
      debts; (x9) BOOT RECONSTRUCTION (r16 Codex M4): permanent-class
      corrupt confirm.json at boot → terminal latch set at recovery,
      health 503 ACROSS restart (no laundering); transient-class →
-     log-and-return preserved; remediation (clean `ReadConfirm` or
-     confirmed absence) clears the latch; (x10) health response (r16
+     bounded retry then fail-`Load` per (x13); remediation (clean
+     `ReadConfirm` or confirmed absence) clears the latch IN-PROCESS
+     per (x12); (x10) health response (r16
      Codex m3): terminal confirm-record state renders the DISTINCT
      message, and the 503 remains election-neutral (no promotion gate,
-     crash takeover ungated).
+     crash takeover ungated); (x11) LOAD SEEDING (r17 Codex M2): all
+     three `Load` outcomes (absent-DB, compile-failed, success) seed
+     the three-state identity; the orphan chain (orphan A + plain
+     commit + B pre-rename arm failure + B resolution read error)
+     keys the debt on A → retry tombstones it, never preserves it;
+     (x12) PROBE OBSERVER (r17 Codex M4): terminal-latched debt keeps
+     the singleton ALIVE probe-only — operator repair → clean probe →
+     latch clears + debt re-arms IN-PROCESS; operator removal →
+     confirmed absence → latch clears + debt drops; loop exits only
+     with no debt AND no latch; (x13) BOOT FAIL-CLOSED (r17 Codex M5):
+     TRANSIENT boot `ReadConfirm` failure → bounded retry inside
+     `Load` → `Load` FAILS (no manager construction); PERMANENT-class
+     → proceed + latch + 503; (x14) TYPED HEALTH CHANNEL (r17 Codex
+     M6/m2): `ConfigPersistDegradedState()` carries both causes;
+     /health renders the terminal message with PRECEDENCE; the gauge
+     stays the aggregate OR; descriptor/option/wiring comments name
+     both causes; (x15) TAXONOMY BOUNDARY (r17 Codex M4): master-key
+     IO → TRANSIENT retry, no latch; invalid observed key length +
+     envelope/auth/PRF/parse → PERMANENT latch.
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
    `setDataplane`) and `daemon_forwarding_status_test.go` (rewrite against
    the narrowed adapter: `ProjectsMapStats`/`UsesUserspaceStatusAdapter`
@@ -2150,7 +2424,7 @@ Preserved exactly:
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r17)
+## 11. Open questions for adversarial review (r18)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
@@ -2302,7 +2576,40 @@ stated explicitly + a distinct terminal confirm-record health message
 contradiction repaired (SyncApply is unequivocally replacement-class),
 and the NAT64 churn citation corrected (flow-cache eviction at lookup
 `flow_cache.rs:992-999` with NAT64 excluded :385-393; fragment
-associations age under their own `nat64.rs` generation guard).
+associations age under their own `nat64.rs` generation guard); r17
+additions: the durability barrier GENERALIZED into a failure-phase
+classification on every replacement path (PRE-rename → retain per
+#5473 with NO tombstone attempt; POST-rename → immediate tombstone
+barrier attempt via the existing `isPostRenameDurabilityFailure`
+check — success proves the replacement durable and is #5473's
+witness, failure retains both debts; the #5473 tests' observable
+retention expectations updated), closing the single-failure
+SyncApply restart hole Codex proved against the x7 closure; the
+identity model's missing edges closed (`Load` reads confirm.json on
+EVERY outcome — absent-DB, compile-failed, success — seeding a
+three-state Present(ArmID)/Absent/latch identity so "" is only ever
+a PRESENT legacy record's value; the orphan-record lifecycle
+documented); the debt-set claim corrected (the false ≤1+1 bound
+deleted — MULTIPLE removal debts + at most one rewrite debt, STRICT
+per-pass convergence); the terminal machine repaired at both ends
+(master-key IO reclassified TRANSIENT — only invalid OBSERVED key
+length is permanent; the remediation transition gains a LIVE
+probe-only observer: the latch keeps the singleton alive read-only,
+a clean read clears + re-arms, a confirmed absence clears + drops);
+the pre-existing transient-boot #4577 hole closed (bounded retry
+inside `Load`, then `Load` FAILS — fail-closed; PERMANENT-class
+keeps proceed+latch+503 with the bricking alternative and the
+auto-revert hammer both rejected); the health channel made
+cause-bearing (`ConfigPersistDegradedState()` typed snapshot + a new
+functional option; /health precedence terminal-confirm-record >
+active-persist; the gauge stays the aggregate OR with the
+descriptor/option/wiring comments updated to name both causes); the
+residual broadened to replacement-POST ∧ barrier-failure-in-any-phase
+∧ restart; the SyncApply confirm-type source terminology swept
+(`store.go:716-717`, `pkg/configstore/README.md:663-672`); SMR r17
+m1 folded (the rewrite debt is raised ONLY by the arm path — a
+post-rename failure of a resolution-side or retry-side `WriteConfirm`
+retains the ORIGINATING debt).
 
 Still open:
 
