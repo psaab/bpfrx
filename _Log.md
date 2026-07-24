@@ -1,3 +1,46 @@
+## 2026-07-24 — #6457: flow-cache invalidation on control-plane session delete (clear/cluster-stale/HA DeleteSynced)
+
+- **Timestamp**: 2026-07-24 (fix/6457-flowcache-delete-invalidate)
+- **Action**: Close the fail-open where a control-plane session delete never
+  invalidated the per-worker flow cache. The stage-12 hit path validates only
+  config/fib generation, RG epoch/lease, and the neighbor-MAC epoch — never
+  session existence — and none of the three delete flows that funnel through
+  `WorkerCommand::DeleteSynced` (operator `clear security flow session [all]`,
+  cluster-stale sweep `BatchDeleteSessions`, HA DeleteSynced propagation via
+  `delete_synced_session_gen` / `replicate_session_delete`) bumps any of those
+  stamps. A revoked-but-continuously-active 5-tuple kept HITTING its cached
+  RewriteDescriptor: forwarded with no session row, no policy re-eval, no
+  `show security flow session` visibility, no HA sync — the operator's
+  revocation primitive silently defeated. Fix extends the #3776 GC-reap
+  invalidation pattern: `handle_delete_synced` records every deleted key
+  (unconditionally — a stale descriptor outlives its table entry) into the
+  new `WorkerCommandResults.deleted_synced_keys`; the worker loop (the only
+  site with `&mut bindings`, same constraint as the #941 vacate dispatch)
+  drains it through `invalidate_flow_cache_slots_for_deleted_sessions`,
+  calling `flow_cache.invalidate_slot(&key, binding.ifindex)` on every
+  binding. Zero per-packet cost: cold control path only, hit path untouched.
+- **Files**: userspace-dp/src/afxdp/session_glue/commands/delete_synced.rs
+  (record the key), userspace-dp/src/afxdp/session_glue/mod.rs
+  (WorkerCommandResults.deleted_synced_keys + dispatch accumulator),
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs (dispatch +
+  invalidate_flow_cache_slots_for_deleted_sessions + tests; reap test module
+  renamed flow_cache_invalidation_tests with parameterized fixtures),
+  userspace-dp/src/afxdp/session_glue/tests.rs (record-half tests),
+  userspace-dp/src/session/README.md (new "Flow-cache invalidation on
+  control-plane delete (#6457)" section).
+- **Fail-on-revert**: session_glue `delete_synced_records_key_for_flow_cache_
+  invalidation` + `delete_synced_records_key_even_when_session_already_absent`
+  (RED when the `deleted_keys.push` is removed — verified); loop_body
+  `delete_synced_flow_cache_slot_is_invalidated`,
+  `delete_synced_snat_descriptor_is_not_reused`,
+  `delete_synced_invalidation_walks_every_binding` (RED when the helper's
+  invalidate_slot loop is gutted — verified; the #3776 reap tests stayed
+  GREEN under both probes).
+- **Validation**: cargo build green; targeted tests 8/8 green; full
+  `cargo test --release --bins --tests -- --test-threads=1` green
+  (4164 bin + 91 integration, 0 failed). No Go files touched (the delete
+  IPC fan-out in pkg/dataplane/userspace already routes per-key deletes to
+  the helper; the missing half was helper-side).
 ## 2026-07-24 — #6459/#6463/#6477: fail-close partial filter port/address lists on the tolerant path
 
 - **Timestamp**: 2026-07-24 (fix/6459-filter-fail-closed-markers)
