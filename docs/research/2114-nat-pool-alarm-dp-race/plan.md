@@ -1,8 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v9 — r8 findings folded (Codex NEEDS-REVISION 3M/4m;
-  AGY PLAN-READY 0M/0m; Claude SMR NEEDS-REVISION 1M/2m);
-  pending convergence review r9
+- **Status**: DRAFT v10 — r9 findings folded (Codex NEEDS-REVISION 3M/3m;
+  AGY PLAN-READY; Claude SMR PLAN-READY-WITH-NITS 0M/2m);
+  pending convergence review r10
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -50,6 +50,42 @@
   (`var _` assertion :10, userspace wrapper :52-75, `userspaceStatusProbe`
   :83-87); §5.1 "no other package touched" corrected (work item H touches
   `pkg/configstore`).
+  v10: r9 convergence — the shutdown fence is REDESIGNED as a deterministic
+  double guard (Codex M1, verified: ctx cancellation starts gRPC/HTTP
+  teardown immediately — `grpcapi/server.go:489-491`,
+  `api/listener.go:64-72` — while `stopping` was only published in
+  PHASE 7's `runShutdownSequence`, so a gate-released rollback could see
+  `stopping=false` and apply against ctx-driven server teardown, incl.
+  `reconcileWebManagement` at `daemon_apply.go:208`): the executor's
+  under-applySem guard becomes `d.stopping.Load() || d.runCtx.Err() !=
+  nil` where `runCtx` is Run's signal context stored at Run entry
+  (`d.daemonCtx` is the never-cancelled parent, #5807 — context
+  cancellation is synchronous, so the `Err()` check has no scheduling
+  race); `runShutdownSequence` still publishes `stopping` for the
+  non-ctx path (interactive CLI exit). Invariant 11 restated honestly
+  (Codex M2, verified `applyCloseoutDrainTimeout = 5s` at
+  `daemon_run_shutdown.go:15`): the guard orders ENTRY absolutely; an
+  in-flight rollback at signal time is bounded-drain-covered and beyond
+  the 5 s budget can overlap teardown exactly as on master today —
+  pre-existing, admitted, not worsened. Work item H's predicate switches
+  from a raw-tree scan to the AUTHORITATIVE compiled topology (Codex M3,
+  verified: `ActiveConfig()` returns `s.compiled`,
+  `store_format.go:55-60`; the compiler prunes `inactive:` subtrees and
+  expands apply-groups before compilation, `config/compiler.go:2257-2268`
+  — a raw scan false-positives on `inactive: chassis cluster` and
+  false-negatives on group-inherited cluster): `rec.FirstCommit &&
+  s.compiled != nil && s.compiled.Chassis.Cluster != nil` (`s.compiled`
+  is set at `store_persist.go:111` before recovery at :113), plus
+  apply-groups-positive and inactive-negative tests. Residuals: fence
+  test gains an actual-path leg driving the real `runShutdownSequence`
+  publication (pattern `daemon_shutdown_wiring_5523_test.go:113-129`);
+  the two-outcomes recovery-contract docs (`store_persist.go:127-135`,
+  `pkg/configstore/README.md:417-449`) join the §5.5 sweep; the
+  monotonic single-use lifecycle of `stopping`/`startupDoneOnce`/
+  `startupOK` is documented (Run called once per Daemon,
+  `cmd/xpfd/main.go:490-507`). Claude SMR r9 nits folded: fence check
+  joins the `isResetting()` early-return; the guard path gets DISTINCT
+  journal/slog text from the expired branch.
 
 ---
 
@@ -359,33 +395,52 @@ if !d.startupOK.Load() {
 }
 _ = d.applySem.Acquire(context.Background(), 1)
 defer d.applySem.Release(1)
-// r8 shutdown-admission fence (Codex M1, verified): shutdown drains
-// applySem ONCE and releases it (`daemon_run_shutdown.go:50-53`) before
-// tearing down managers/dataplane (:95-230). A gate-released waiter that
-// loses the drain race would otherwise re-acquire applySem AFTER the
-// drain and run the full non-cancellable rollback against live teardown
-// (the timer goroutine is not wg-joined, `store_commit.go:815-823`).
-// runShutdownSequence publishes d.stopping BEFORE its applySem drain; the
-// executor re-checks the fence UNDER applySem so the drain's
-// acquire/release linearizes the admission decision: any executor
-// entering its critical section after the drain sees stopping=true and
-// abandons. The persisted confirm record is re-resolved on the next
-// boot's expired-window path, same as the startup-failure abandon.
-if d.stopping.Load() {
+// r8/r9 shutdown-admission guard (Codex r8 M1 + r9 M1, both verified):
+// shutdown drains applySem ONCE and releases it (`daemon_run_shutdown.go:
+// 50-53`) before tearing down managers/dataplane (:95-230), and ctx
+// cancellation starts gRPC/HTTP teardown IMMEDIATELY at signal time
+// (`grpcapi/server.go:489-491`, `api/listener.go:64-72`) — BEFORE PHASE 7
+// ever runs. A gate-released waiter that only consulted a PHASE-7 flag
+// could therefore apply against ctx-driven server teardown (the apply
+// path touches the listeners, `reconcileWebManagement`
+// `daemon_apply.go:208`). The guard is a DOUBLE check under applySem —
+// deterministic, no scheduling race:
+//   - d.runCtx.Err(): Run's SIGNAL context stored on the Daemon at Run
+//     entry (d.daemonCtx is the never-cancelled parent, #5807 — checking
+//     it would never fire). Context cancellation is synchronous: if the
+//     signal landed before this check, Err() != nil, guaranteed.
+//   - d.stopping: published by runShutdownSequence BEFORE its applySem
+//     drain — covers the non-ctx path (interactive CLI exit returns from
+//     PHASE 6 WITHOUT ctx cancellation, `daemon_run.go:741-748`).
+// Placement (r9 SMR m1): the double guard JOINS the existing
+// d.isResetting() early-return (daemon_apply_commit.go:634-638) — one
+// combined admission check immediately after applySem acquisition. The
+// persisted confirm record is re-resolved on the next boot's
+// expired-window path, same as the startup-failure abandon.
+if d.stopping.Load() || d.runCtx.Err() != nil {
     slog.Warn("commit-confirmed rollback abandoned: daemon shutdown in progress; " +
         "the persisted confirm record is re-resolved on the next boot (expired-window path)")
     return
 }
 ```
 
-- **`stopping` fence publication**: a new `stopping atomic.Bool` on
-  `Daemon` (no general shutdown flag exists today — only `resetting` for
-  factory reset, `daemon_apply_reset.go:18`), set by `runShutdownSequence`
-  BEFORE its applySem drain block. An executor already INSIDE its critical
-  section when shutdown starts is drained by the existing bounded drain
-  (documented tradeoff, `daemon_run_shutdown.go:46-49`); the fence orders
-  every later acquirer. `isResetting()` stays as the factory-reset guard;
-  the fence is the ordinary-shutdown sibling.
+- **`stopping` fence publication + `runCtx` storage**: `stopping` is a
+  new `atomic.Bool` on `Daemon` (no general shutdown flag exists today —
+  only `resetting` for factory reset, `daemon_apply_reset.go:18`), set by
+  `runShutdownSequence` BEFORE its applySem drain block. `runCtx` is a new
+  field storing Run's signal context at Run entry (Run is called exactly
+  once per Daemon, `cmd/xpfd/main.go:490-507`). An executor already INSIDE
+  its critical section when the signal lands is covered by the existing
+  bounded drain — see invariant 11 for the HONEST bound on that statement
+  (r9 Codex M2). `isResetting()` stays as the factory-reset guard.
+- **Monotonic single-use lifecycle (r9 Codex m3)**: `stopping`,
+  `startupDone`/`startupDoneOnce`, and `startupOK` are single-use
+  monotonic state — set/closed at most once per Daemon lifetime and never
+  reset. The fields carry a contract comment: Run is single-use per
+  Daemon (production calls it once, `cmd/xpfd/main.go:490-507`); a second
+  Run would observe a stale published outcome and a raised fence.
+  Document-only (no runtime guard) — matches the Daemon's existing
+  single-use lifecycle for `startTime`/`daemonCtx`.
 - **Panic/unwind safety (r8 Codex m1)**: a `Run`-scoped
   `defer d.finishStartup(false)` covers a panic out of a phase
   (`daemon_run.go:799` bypasses the explicit failure returns at :828/:832)
@@ -416,12 +471,16 @@ if d.stopping.Load() {
   early is strictly cleaner). The waiter wakes and abandons. No leak on any
   path; no context-cancellation semantics involved. Plus the Run-scoped
   `defer d.finishStartup(false)` above for panic/unwind.
-- **Signal-during-PHASE-5 (r8-rewritten, Codex M1)**: a rollback released
-  by `finishStartup(true)` while a shutdown is pending is NOT safely
-  "applySem-ordered" — shutdown drains applySem once and releases it
-  (`daemon_run_shutdown.go:50-53`), so the waiter could re-acquire after
-  the drain and apply against live teardown. The `stopping` fence above
-  closes this: published before the drain, re-checked under applySem.
+- **Signal-during-PHASE-5 (r8-rewritten, r9-hardened, Codex M1×2)**: a
+  rollback released by `finishStartup(true)` while a shutdown is pending
+  is NOT safely "applySem-ordered" — shutdown drains applySem once and
+  releases it (`daemon_run_shutdown.go:50-53`), AND ctx cancellation
+  starts gRPC/HTTP teardown at signal time (`grpcapi/server.go:489-491`,
+  `api/listener.go:64-72`), before PHASE 7 ever publishes a flag. The
+  double guard above closes both arms: `runCtx.Err()` catches the
+  signal-cancelled case synchronously; `stopping` catches the
+  non-ctx interactive-exit path. The honest in-flight bound is invariant
+  11.
 - **Test-fixture migration (r8-completed, Codex m2 + Claude SMR m1)**:
   existing executor fixtures construct `Daemon` directly and must
   initialize the outcome (closed + OK): `rollback_resync_test.go:31,81`,
@@ -488,7 +547,19 @@ BEFORE the unexpired re-arm (:229+):
 // silently confirm it (#4577). Resolve the window NOW, at the only safe
 // point — Load, before manager construction — by running the SAME revert
 // the expired branch's FirstCommit leg runs.
-if rec.FirstCommit && recoveredActiveHasCluster(s.active) {
+//
+// Predicate on the COMPILED topology (r9 Codex M3, verified): runtime
+// cluster construction keys on ActiveConfig() == s.compiled
+// (store_format.go:55-60, daemon_run_bringup.go:161-164). The compiler
+// prunes `inactive:` subtrees FIRST and expands apply-groups
+// (config/compiler.go:2257-2268) — a RAW tree scan false-positives on
+// `inactive: chassis cluster` (dormant stanza; no runtime would be
+// constructed; reverting would be WRONG) and false-negatives on a
+// group-inherited cluster (no literal stanza in the raw tree; the hybrid
+// would proceed). s.compiled is set at store_persist.go:111 before
+// recovery runs at :113 (the compile-failed path returns early at :108
+// and never reaches recovery).
+if rec.FirstCommit && s.compiled != nil && s.compiled.Chassis.Cluster != nil {
     // revert-at-Load: s.active = empty prevTree, s.compiled = nil,
     // persistMarkerCommitted/everCommitted = false,
     // writeActiveMarker(prevTree, false) with the #5473 durable-removal
@@ -500,6 +571,13 @@ The implementation REUSES the expired branch's FirstCommit revert body
 (:177-184 + the shared persist/removal/candidate/journal tail) — factor
 it into a helper both branches call rather than duplicating it; the
 guard's observable end state is identical to an expired-window recovery.
+Journal/log distinguishability (r9 SMR m2): the guard path uses DISTINCT
+journal detail + slog text from the expired branch's "commit-confirmed
+window expired while the daemon was down" (`store_persist.go:222-227`) —
+the guard fires on UNEXPIRED records, and the journal must record the
+real trigger ("confirm-confirmed recovery: FirstCommit+cluster record
+resolved by Load-time revert; remaining window abandoned (#2114)") rather
+than a false expired-during-downtime entry.
 
 Tests (configstore/daemon seams, no cluster needed): (i) UNEXPIRED legacy
 empty-`GuardedHash` FirstCommit+cluster record → guard fires: active
@@ -515,7 +593,15 @@ reviewers required; (v) recurrence test: synthesize the post-hybrid state
 (`everCommitted=false`, live `d.cluster`, bootstrap mode) → a cluster
 `commit confirmed` persists a fresh nonempty-hash FirstCommit record →
 recovery → guard fires — proving the invariant terminates the
-regeneration chain at the next boot. The BROADER cluster-runtime
+regeneration chain at the next boot; (vi) COMPILED-topology positive
+(r9): the cluster stanza arrives ONLY via `apply-groups` (no literal
+`chassis cluster` in the raw tree) → compiled config has
+`Chassis.Cluster != nil` → guard FIRES; (vii) COMPILED-topology negative
+(r9): the raw tree carries `inactive: chassis cluster` (pruned by the
+compiler, `config/compiler.go:2257-2268`) → compiled
+`Chassis.Cluster == nil` → guard does NOT fire, normal re-arm — a
+raw-scan implementation false-positives on both directions and fails
+these. The BROADER cluster-runtime
 lifecycle question (should `enterBootstrapMode` stop cluster comms when
 `d.cluster != nil`) stays a follow-up issue.
 
@@ -781,6 +867,12 @@ classification snapshot.
   `docs/ha-no-hitless-restart.md:22`, `docs/rib-group-route-leaking.md:94`
   (the /engineer pass greps `docs/` for `d\.dp` and updates or justifies
   each hit).
+- Recovery-contract docs for work item H's third outcome (r9 Codex m2):
+  the "Two outcomes" comment at `store_persist.go:127-135` (expired →
+  revert, future → re-arm) gains the third outcome (unexpired
+  FirstCommit+cluster → revert-at-Load, remaining window abandoned), and
+  the matching contract prose at `pkg/configstore/README.md:417-449` is
+  updated in the same commit.
 - `_Log.md` entries for every implementation edit (CLAUDE.md).
 
 ## 6. Public API preservation
@@ -836,12 +928,26 @@ Preserved exactly:
 10. **Retirement boundary**: the canary's invariant (daemon holds a
     `dataplane.RuntimeDataPlane` built by `NewRuntimeDataPlane`) preserved
     through the redesigned matcher; both-direction canary self-tests (§4).
-11. **Shutdown-admission fence (r8)**: `stopping` is published BEFORE the
-    shutdown applySem drain and re-checked by the rollback executor UNDER
-    applySem — the drain's acquire/release linearizes admission, so no
-    rollback enters its critical section against live teardown. The
-    abandoned timer's persisted record re-resolves on the next boot's
-    expired-window path (same semantics as the startup-failure abandon).
+11. **Shutdown-admission guard (r8/r9)**: the double guard
+    (`d.stopping.Load() || d.runCtx.Err() != nil`, checked by the executor
+    UNDER applySem, joining the `isResetting()` early-return) orders
+    ENTRY absolutely: after ctx cancellation OR after
+    `runShutdownSequence`'s pre-drain `stopping` publication, no rollback
+    newly enters its critical section (context cancellation is
+    synchronous — the `Err()` arm has no scheduling race; the flag arm is
+    linearized by the drain's acquire/release). HONEST BOUND (r9 Codex
+    M2, verified `applyCloseoutDrainTimeout = 5s`,
+    `daemon_run_shutdown.go:15,50-58`): a rollback ALREADY in flight when
+    the signal lands is bounded-drain-covered for ≤5 s; beyond the drain
+    budget the shutdown proceeds (`:54-58`, logged) and the rollback —
+    deliberately non-cancellable `context.Background()` work — can
+    overlap manager/dataplane teardown. That overlap exists on master
+    today for every commit-confirmed timer (the executor has no shutdown
+    guard at all); the guard eliminates the ENTRY class and does not
+    worsen the IN-FLIGHT class. Closing the in-flight class would require
+    a cancellable apply — out of scope. The abandoned timer's persisted
+    record re-resolves on the next boot's expired-window path (same
+    semantics as the startup-failure abandon).
 12. **#4577 confirm contract (r8)**: an unconfirmed config must NEVER
     stand. Work item H's revert-at-Load honors it for the
     FirstCommit+cluster class by resolving the window EARLY (revert
@@ -960,15 +1066,22 @@ Preserved exactly:
      intact AND a LATE-MANAGER milestone initialized (`snmpBootReady`
      true / LLDP manager non-nil — a close placed immediately after
      phase 4 fails this).
-     (d) SHUTDOWN-FENCE test (r8, Codex M1): with the gate OPEN
-     (post-startup), publish `d.stopping` (mirroring
+     (d) SHUTDOWN-GUARD test (r8/r9, Codex M1×2): with the gate OPEN
+     (post-startup): leg 1 — publish `d.stopping` (mirroring
      `runShutdownSequence`'s pre-drain publication), fire the executor —
-     it must pass the gate, acquire applySem, observe the fence, and
-     ABANDON with zero `PromoteRollback`/apply side effects; the persisted
-     record is left for the next boot. Second leg: an executor already
+     it must pass the gate, acquire applySem, observe the guard, and
+     ABANDON with zero `PromoteRollback`/apply side effects; leg 2 —
+     same via the `runCtx` arm (cancel a stored signal context; the
+     executor observes `runCtx.Err() != nil` and abandons — deterministic,
+     no flag publication involved); leg 3 (r9 Codex m1 — ACTUAL-PATH
+     ordering, pattern `daemon_shutdown_wiring_5523_test.go:113-129`):
+     drive the REAL `runShutdownSequence` in a goroutine and assert
+     `d.stopping` is observed published BEFORE the drain block — a
+     reverted/misordered production Store fails this leg, which the
+     manual-publication legs cannot catch; leg 4 — an executor already
      inside its critical section blocks the drain until it releases
      (pre-existing bounded-drain behavior, unchanged).
-   - Work item H tests (r8-reworked; configstore/daemon seams, no
+   - Work item H tests (r8/r9-reworked; configstore/daemon seams, no
      cluster): (i) UNEXPIRED legacy empty-`GuardedHash`
      FirstCommit+cluster record → guard reverts AT LOAD: active = empty
      tree, `everCommitted=false`, record removed (or removal debt
@@ -982,7 +1095,10 @@ Preserved exactly:
      synthesize the post-hybrid state (`everCommitted=false`, live
      `d.cluster`, bootstrap mode) → cluster `commit confirmed` persists a
      fresh nonempty-hash FirstCommit record → recovery → guard fires
-     (Codex M3).
+     (Codex M3); (vi) COMPILED-topology positive (r9 Codex M3): cluster
+     stanza arrives ONLY via `apply-groups` → guard FIRES; (vii)
+     COMPILED-topology negative: raw tree carries
+     `inactive: chassis cluster` → guard does NOT fire, normal re-arm.
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
    `setDataplane`) and `daemon_forwarding_status_test.go` (rewrite against
    the narrowed adapter: `ProjectsMapStats`/`UsesUserspaceStatusAdapter`
@@ -1033,7 +1149,7 @@ Preserved exactly:
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r9)
+## 11. Open questions for adversarial review (r10)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
@@ -1075,7 +1191,18 @@ negative case and the recurrence test; broader cluster-lifecycle work
 defers to a follow-up; fwdstatus deletion inventory completed (`var _`
 assertion, userspace wrapper, `userspaceStatusProbe`) with a
 negative-satisfaction unit test; §5.1 package-touch list corrected
-(work item H touches `pkg/configstore`).
+(work item H touches `pkg/configstore`); r9 additions: the shutdown
+guard is a DETERMINISTIC DOUBLE CHECK (`d.stopping.Load() ||
+d.runCtx.Err() != nil` under applySem — ctx-driven server teardown at
+signal time made a PHASE-7-only flag insufficient; interactive-exit
+keeps the flag arm), invariant 11's honest in-flight bound (5 s drain,
+pre-existing overlap admitted), work item H's predicate on the
+AUTHORITATIVE compiled topology (apply-groups positive / inactive
+negative tests (vi)/(vii)), fence-test actual-path leg (5523 pattern),
+recovery-contract docs join the sweep (`store_persist.go:127-135`,
+`pkg/configstore/README.md:417-449`), monotonic single-use lifecycle
+documented, fence check joins `isResetting()`, distinct guard-path
+journal/slog text.
 
 Still open:
 
