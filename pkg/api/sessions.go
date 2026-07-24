@@ -1539,28 +1539,46 @@ func protoName(p uint8) string {
 // they are opaque to clients.
 
 func encodePageTokenV4(key dataplane.SessionKey) string {
-	b := make([]byte, 13)
+	// Emit exactly binary.Size(key) bytes so the token is byte-identical to the
+	// gRPC surface's canonical key layout (#5649): the trailing pad bytes are
+	// zero-filled by make and the decoder requires this exact length.
+	b := make([]byte, binary.Size(key))
 	copy(b[0:4], key.SrcIP[:])
 	copy(b[4:8], key.DstIP[:])
 	binary.NativeEndian.PutUint16(b[8:10], key.SrcPort)
 	binary.NativeEndian.PutUint16(b[10:12], key.DstPort)
 	b[12] = key.Protocol
+	// pad bytes b[13:16]
 	return base64.RawURLEncoding.EncodeToString([]byte("v4:" + hex.EncodeToString(b)))
 }
 
 func encodePageTokenV6(key dataplane.SessionKeyV6) string {
-	b := make([]byte, 37)
+	// Emit exactly binary.Size(key) bytes — see encodePageTokenV4 (#5649).
+	b := make([]byte, binary.Size(key))
 	copy(b[0:16], key.SrcIP[:])
 	copy(b[16:32], key.DstIP[:])
 	binary.NativeEndian.PutUint16(b[32:34], key.SrcPort)
 	binary.NativeEndian.PutUint16(b[34:36], key.DstPort)
 	b[36] = key.Protocol
+	// pad bytes b[37:40]
 	return base64.RawURLEncoding.EncodeToString([]byte("v6:" + hex.EncodeToString(b)))
 }
+
+// maxPageTokenLen caps the encoded page_token before any base64/hex decode
+// (#5649, C181-C11 — ported from the gRPC surface). The longest legitimate
+// token is "v6:" plus the hex of a SessionKeyV6 (base64 of ~83 bytes, under
+// 128); anything larger is noncanonical. Without this cap a caller could send a
+// token near the HTTP body limit and force transient base64/hex allocations
+// many times the key size before the ABI prefix decode discards the excess. 256
+// leaves ample headroom for the real formats while rejecting the amplification.
+const maxPageTokenLen = 256
 
 // parseSessionPageToken returns the token kind ("v4", "v6", "v6start") and
 // the raw key bytes (nil for "v6start").
 func parseSessionPageToken(token string) (kind string, keyBytes []byte, err error) {
+	if len(token) > maxPageTokenLen {
+		return "", nil, fmt.Errorf("page_token too long: %d bytes", len(token))
+	}
 	raw, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
 		return "", nil, fmt.Errorf("invalid page_token encoding: %w", err)
@@ -1588,8 +1606,12 @@ func parseSessionPageToken(token string) (kind string, keyBytes []byte, err erro
 
 func decodeSessionKeyV4(b []byte) (dataplane.SessionKey, error) {
 	var key dataplane.SessionKey
-	if len(b) < 13 {
-		return key, fmt.Errorf("v4 key too short: %d", len(b))
+	// #5649 (C181-C11, ported from gRPC): require the EXACT ABI key length. A `<`
+	// check accepted trailing bytes, so many distinct oversized tokens hex-decoded
+	// to the same cursor (a noncanonical opaque token) and amplified allocations.
+	// The encoder always emits exactly binary.Size(key) bytes.
+	if len(b) != binary.Size(key) {
+		return key, fmt.Errorf("v4 key wrong length: %d (want %d)", len(b), binary.Size(key))
 	}
 	copy(key.SrcIP[:], b[0:4])
 	copy(key.DstIP[:], b[4:8])
@@ -1601,8 +1623,10 @@ func decodeSessionKeyV4(b []byte) (dataplane.SessionKey, error) {
 
 func decodeSessionKeyV6(b []byte) (dataplane.SessionKeyV6, error) {
 	var key dataplane.SessionKeyV6
-	if len(b) < 37 {
-		return key, fmt.Errorf("v6 key too short: %d", len(b))
+	// #5649 (C181-C11, ported from gRPC): exact ABI key length — see
+	// decodeSessionKeyV4.
+	if len(b) != binary.Size(key) {
+		return key, fmt.Errorf("v6 key wrong length: %d (want %d)", len(b), binary.Size(key))
 	}
 	copy(key.SrcIP[:], b[0:16])
 	copy(key.DstIP[:], b[16:32])
