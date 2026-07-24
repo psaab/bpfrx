@@ -98,3 +98,79 @@ func TestBuildRouteSnapshotsUncappedBelowWindow(t *testing.T) {
 		t.Fatalf("expected all %d next-table leaks published below the cap, got %d", n, leaks)
 	}
 }
+
+// TestBuildRouteSnapshotsFIBEligibilityMirrorsApplier is the #6467-fold
+// fail-on-revert guard. The FIB window counter/publisher must apply the SAME
+// eligibility the applier does: the applier (pkg/routing nextTableManager.Apply)
+// SKIPS a next-table route whose target instance is unknown (`tableIDs` miss) or
+// whose destination fails net.ParseCIDR — no prio++, no ip rule, no window slot
+// consumed. Before the fold the FIB counted AND published EVERY global
+// next-table route, so M dangling routes before the boundary consumed M window
+// slots and published M ghost leaks the kernel never installs — squeezing M
+// valid leaks out of the window (FIB missing valid leaks the kernel HAS while
+// carrying ghosts the kernel LACKS).
+//
+// Canonical case: M dangling (unknown-instance) routes BEFORE N valid routes
+// that exceed the window. The FIB's published next-table set must equal the
+// valid set the applier installs — ZERO ghost entries, and the FULL window of
+// valid leaks present (not squeezed out by ghosts eating the budget).
+//
+// RED-on-revert: dropping the definedInstances eligibility skip in
+// buildRouteSnapshots makes the FIB publish 50 ghost + only 50 valid (the ghosts
+// eat half the window), so BOTH assertions fail with a clean message.
+func TestBuildRouteSnapshotsFIBEligibilityMirrorsApplier(t *testing.T) {
+	orig := ruleListFn
+	t.Cleanup(func() { ruleListFn = orig })
+	// Isolate the config-static path: the kernel-dump path publishes only what
+	// the kernel actually holds (valid rules), so no ghosts arrive from there.
+	ruleListFn = func(family int) ([]netlink.Rule, error) { return nil, nil }
+
+	const ghosts = 50                             // dangling: target instance NOT defined
+	const valid = config.NextTableRuleWindow + 20 // exceeds the window, so the cap fires on valid routes
+
+	cfg := &config.Config{}
+	cfg.RoutingInstances = []*config.RoutingInstanceConfig{{Name: "blue", TableID: 100}}
+	// M dangling next-table routes BEFORE the boundary (unknown instance).
+	for i := 0; i < ghosts; i++ {
+		cfg.RoutingOptions.StaticRoutes = append(cfg.RoutingOptions.StaticRoutes,
+			&config.StaticRoute{
+				Destination: fmt.Sprintf("172.16.%d.0/24", i),
+				NextTable:   "ghost-vr", // NOT a defined RoutingInstance
+			})
+	}
+	// N valid next-table routes exceeding the window.
+	for i := 0; i < valid; i++ {
+		cfg.RoutingOptions.StaticRoutes = append(cfg.RoutingOptions.StaticRoutes,
+			&config.StaticRoute{
+				Destination: fmt.Sprintf("10.%d.%d.0/24", i/256, i%256),
+				NextTable:   "blue",
+			})
+	}
+
+	routes, err := buildRouteSnapshots(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("buildRouteSnapshots: %v", err)
+	}
+	ghostLeaks, validLeaks := 0, 0
+	for _, r := range routes {
+		switch r.NextTable {
+		case "ghost-vr":
+			ghostLeaks++
+		case "blue":
+			validLeaks++
+		}
+	}
+	// The applier skips dangling targets (tableIDs miss, no prio++), so the
+	// kernel installs ZERO ghost leaks. The FIB must match — no ghost snapshots.
+	if ghostLeaks != 0 {
+		t.Errorf("FIB published %d ghost next-table leaks (dangling instance) the "+
+			"kernel never installs — the FIB must mirror the applier's eligibility (#6467)", ghostLeaks)
+	}
+	// The ghosts consume NO window slot, so the full window of valid leaks is
+	// present (not squeezed out). N > window, so exactly the window's worth.
+	if validLeaks != config.NextTableRuleWindow {
+		t.Errorf("FIB published %d valid next-table leaks, want %d — dangling routes "+
+			"must not consume window slots and squeeze out valid leaks the kernel "+
+			"installs (#6467)", validLeaks, config.NextTableRuleWindow)
+	}
+}

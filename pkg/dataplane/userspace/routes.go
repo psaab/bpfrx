@@ -64,6 +64,24 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 	// (XDP_PASS / IPsec-reinjected / non-native-XDP fabric) packet resolves in
 	// the main table, a kernel/dataplane verdict split for the same flow.
 	nextTableLeakCount := 0
+	// #6467 fold: the applier (pkg/routing nextTableManager.Apply) only installs
+	// an ip rule — and only advances its window counter (prio++) — for a global
+	// next-table route whose target names a DEFINED routing instance AND whose
+	// destination parses as a CIDR; it `continue`s otherwise. The FIB mirror MUST
+	// apply the SAME eligibility. Otherwise a dangling (unknown-instance) or
+	// unparseable route consumes a FIB window slot and publishes a ghost leak the
+	// kernel never installs — squeezing a valid leak out of the window (FIB
+	// missing a leak the kernel HAS) while carrying a ghost the kernel LACKS.
+	// Build the defined-instance name set once, mirroring the applier's tableIDs
+	// map (keyed by instance name, membership-only — a TableID value is not
+	// required, matching `tableIDs[sr.NextTable]` returning ok for any defined
+	// instance).
+	definedInstances := make(map[string]struct{}, len(cfg.RoutingInstances))
+	for _, inst := range cfg.RoutingInstances {
+		if inst != nil {
+			definedInstances[inst.Name] = struct{}{}
+		}
+	}
 	addRoutes := func(table, family string, routes []*config.StaticRoute, perInstance bool) {
 		for _, route := range routes {
 			if route == nil {
@@ -97,6 +115,17 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 			// per-instance case is skipped above), so this is the only leak class
 			// that must be bounded here.
 			if !perInstance && route.NextTable != "" {
+				// Eligibility gate mirroring the applier (rules.go ~136-147): an
+				// unknown-instance target or an unparseable destination installs no
+				// kernel ip rule and consumes no window slot there, so skip it here
+				// too — no ghost snapshot, no window-slot consumption. Only an
+				// eligible route counts against and publishes into the capped window.
+				if _, ok := definedInstances[route.NextTable]; !ok {
+					continue
+				}
+				if _, _, err := net.ParseCIDR(route.Destination); err != nil {
+					continue
+				}
 				if nextTableLeakCount >= config.NextTableRuleWindow {
 					continue
 				}

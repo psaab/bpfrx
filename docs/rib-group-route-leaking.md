@@ -183,6 +183,21 @@ FIB config-static path caps GLOBAL next-table leaks at the **same** window,
 counting v4 then v6 in the same order as `ApplyNextTableRules`, so both planes
 truncate the identical tail.
 
+The FIB mirror also applies the applier's **eligibility** exactly. The applier
+installs an ip rule — and advances its window counter — ONLY for a next-table
+route whose target names a **defined** routing instance (`tableIDs[sr.NextTable]`
+hit; the compiler stores the bare instance name via `parseNextTableInstance`)
+AND whose destination parses as a CIDR; it `continue`s (no `prio++`) otherwise.
+`buildRouteSnapshots` now gates on the SAME predicate (a `definedInstances` name
+set + `net.ParseCIDR`). Without it a dangling (unknown-instance) or unparseable
+next-table route consumed a FIB window slot and published a **ghost** leak the
+kernel never installs — squeezing a valid leak out of the window (the FIB
+missing a leak the kernel HAS while carrying one it LACKS). The applier's
+degraded-error drop count likewise counts only **eligible** tail routes so the
+"N not leaked" figure is accurate rather than inflated by routes that would
+never install. Measured on 50 dangling + 100 valid routes: both planes now hold
+100 valid leaks and 0 ghosts.
+
 The rib-group window size (`maxRibGroupLeakRules` = 1000) is duplicated in
 `pkg/config` with a keep-in-sync comment because `pkg/config` cannot import
 `pkg/routing` (that would be an import cycle — `pkg/routing` imports

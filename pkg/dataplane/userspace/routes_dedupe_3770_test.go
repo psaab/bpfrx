@@ -57,9 +57,15 @@ func TestRouteSnapshotDedupeKeepsDiscardAndConnected(t *testing.T) {
 // apply its preference tie-break.
 func TestRouteSnapshotDedupeKeepsDistinctPreference(t *testing.T) {
 	cfg := &config.Config{}
+	// The target instance must be DEFINED and named by its bare instance name:
+	// the compiler stores route.NextTable as the bare name (parseNextTableInstance
+	// strips the ".inet[6].0" suffix), and the #6467 eligibility gate now skips a
+	// next-table route whose target is not a defined instance — mirroring the
+	// applier, which likewise skips it (no ip rule).
+	cfg.RoutingInstances = []*config.RoutingInstanceConfig{{Name: "blue", TableID: 100}}
 	cfg.RoutingOptions.StaticRoutes = []*config.StaticRoute{
-		{Destination: "10.5.0.0/16", NextTable: "blue.inet.0", Preference: 5},
-		{Destination: "10.5.0.0/16", NextTable: "blue.inet.0", Preference: 0},
+		{Destination: "10.5.0.0/16", NextTable: "blue", Preference: 5},
+		{Destination: "10.5.0.0/16", NextTable: "blue", Preference: 0},
 	}
 	routes, err := buildRouteSnapshots(cfg, nil, nil)
 	if err != nil {
@@ -67,7 +73,7 @@ func TestRouteSnapshotDedupeKeepsDistinctPreference(t *testing.T) {
 	}
 	count := 0
 	for _, r := range routes {
-		if r.Table == "inet.0" && r.Destination == "10.5.0.0/16" && r.NextTable == "blue.inet.0" {
+		if r.Table == "inet.0" && r.Destination == "10.5.0.0/16" && r.NextTable == "blue" {
 			count++
 		}
 	}
@@ -85,15 +91,22 @@ func TestRouteSnapshotDedupeKeepsDistinctPreference(t *testing.T) {
 // with the two entries in opposite input order must yield an identical
 // snapshot.
 func TestRouteSnapshotSortIsDeterministic(t *testing.T) {
+	// Both targets DEFINED and referenced by bare instance name (the compiler
+	// strips the ".inet[6].0" suffix; the #6467 eligibility gate skips a
+	// next-table route whose target is not a defined instance, mirroring the
+	// applier). The dedupe/sort mechanics under test are unchanged.
+	instances := []*config.RoutingInstanceConfig{{Name: "aaa", TableID: 100}, {Name: "bbb", TableID: 101}}
 	forward := &config.Config{}
+	forward.RoutingInstances = instances
 	forward.RoutingOptions.StaticRoutes = []*config.StaticRoute{
-		{Destination: "10.5.0.0/16", NextTable: "aaa.inet.0"},
-		{Destination: "10.5.0.0/16", NextTable: "bbb.inet.0"},
+		{Destination: "10.5.0.0/16", NextTable: "aaa"},
+		{Destination: "10.5.0.0/16", NextTable: "bbb"},
 	}
 	reverse := &config.Config{}
+	reverse.RoutingInstances = instances
 	reverse.RoutingOptions.StaticRoutes = []*config.StaticRoute{
-		{Destination: "10.5.0.0/16", NextTable: "bbb.inet.0"},
-		{Destination: "10.5.0.0/16", NextTable: "aaa.inet.0"},
+		{Destination: "10.5.0.0/16", NextTable: "bbb"},
+		{Destination: "10.5.0.0/16", NextTable: "aaa"},
 	}
 
 	got1, err := buildRouteSnapshots(forward, nil, nil)
@@ -114,8 +127,8 @@ func TestRouteSnapshotSortIsDeterministic(t *testing.T) {
 			order = append(order, r.NextTable)
 		}
 	}
-	if len(order) != 2 || order[0] != "aaa.inet.0" || order[1] != "bbb.inet.0" {
-		t.Fatalf("next-table tie-break order = %v, want [aaa.inet.0 bbb.inet.0]", order)
+	if len(order) != 2 || order[0] != "aaa" || order[1] != "bbb" {
+		t.Fatalf("next-table tie-break order = %v, want [aaa bbb]", order)
 	}
 }
 

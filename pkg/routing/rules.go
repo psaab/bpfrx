@@ -169,11 +169,26 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 		// tolerant-load / peer-sync path where that gate is downgraded to a
 		// warning.
 		if prio >= nextTableRulePriority+maxNextTableRules {
+			// Count only ELIGIBLE routes past the cap — those the applier WOULD
+			// have installed (known instance + parseable CIDR). An
+			// unknown-instance or unparseable route is skipped above (no prio++),
+			// so it never consumes a window slot and is not a "dropped leak"; the
+			// tableIDs + net.ParseCIDR gates here mirror the per-route eligibility
+			// checks at the top of this loop so the "N not leaked" count is
+			// accurate rather than inflated by routes that would never install
+			// (#6467).
 			dropped := 0
 			for _, rem := range routes[i:] {
-				if rem != nil && rem.NextTable != "" {
-					dropped++
+				if rem == nil || rem.NextTable == "" {
+					continue
 				}
+				if _, ok := tableIDs[rem.NextTable]; !ok {
+					continue
+				}
+				if _, _, err := net.ParseCIDR(rem.Destination); err != nil {
+					continue
+				}
+				dropped++
 			}
 			errs = append(errs, fmt.Errorf(
 				"next-table rule limit (%d) reached; %d next-table route(s) beyond "+

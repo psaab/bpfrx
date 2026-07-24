@@ -38,8 +38,8 @@
 [WATCH]      1608  userspace-dp/src/afxdp/tx/dispatch/mod.rs
 [WATCH]      1606  pkg/cmdtree/tree.go
 [WATCH]      1600  userspace-dp/src/afxdp/coordinator/wg_control.rs
+[WATCH]      1581  pkg/routing/rules.go
 [WATCH]      1575  pkg/dataplane/userspace/eventstream.go
-[WATCH]      1566  pkg/routing/rules.go
 [WATCH]      1541  userspace-xdp/src/lib.rs
 [WATCH]      1532  userspace-dp/src/afxdp/tx/cos_classify.rs
 [WATCH]      1519  pkg/dataplane/compiler_iface.go

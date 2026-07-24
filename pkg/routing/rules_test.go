@@ -558,18 +558,18 @@ func TestNextTableRulesPriorityCap(t *testing.T) {
 	}
 	instances := []*config.RoutingInstanceConfig{{Name: "dmz-vr", TableID: 101}}
 
-	// Exactly at the window size: all 100 admitted, none beyond range.
+	// Exactly at the window size: all admitted, none beyond range.
 	t.Run("at-limit", func(t *testing.T) {
 		ops := newFakeRuleOps()
 		nt := &nextTableManager{ops: ops}
-		if err := nt.Apply(mkRoutes(100), instances); err != nil {
+		if err := nt.Apply(mkRoutes(config.NextTableRuleWindow), instances); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
 		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
-		if total != 100 {
-			t.Fatalf("expected all 100 routes programmed at the limit, got %d", total)
+		if total != config.NextTableRuleWindow {
+			t.Fatalf("expected all %d routes programmed at the limit, got %d", config.NextTableRuleWindow, total)
 		}
-		assertAllRulesInRange(t, ops, nextTableRulePriority, nextTableRulePriority+100)
+		assertAllRulesInRange(t, ops, nextTableRulePriority, nextTableRulePriority+config.NextTableRuleWindow)
 	})
 
 	// One over the window: cap fires, only 100 admitted, none out of range,
@@ -578,25 +578,26 @@ func TestNextTableRulesPriorityCap(t *testing.T) {
 	t.Run("over-limit", func(t *testing.T) {
 		ops := newFakeRuleOps()
 		nt := &nextTableManager{ops: ops}
-		if err := nt.Apply(mkRoutes(150), instances); err == nil {
+		over := config.NextTableRuleWindow + 50
+		if err := nt.Apply(mkRoutes(over), instances); err == nil {
 			t.Fatal("over-limit Apply must return a degraded error naming the cap (#6467)")
 		}
 		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
-		if total != 100 {
-			t.Fatalf("expected cap to hold at 100 programmed rules, got %d", total)
+		if total != config.NextTableRuleWindow {
+			t.Fatalf("expected cap to hold at %d programmed rules, got %d", config.NextTableRuleWindow, total)
 		}
-		assertAllRulesInRange(t, ops, nextTableRulePriority, nextTableRulePriority+100)
+		assertAllRulesInRange(t, ops, nextTableRulePriority, nextTableRulePriority+config.NextTableRuleWindow)
 
 		// Re-apply must leave no residue: every programmed rule is inside
 		// clear()'s window, so clear-then-add keeps the count stable. A
-		// leaked rule at prio >= 200 would survive clear() and grow the set.
-		// The degraded error still surfaces on every over-limit apply.
-		if err := nt.Apply(mkRoutes(150), instances); err == nil {
+		// leaked rule at prio >= the window top would survive clear() and grow
+		// the set. The degraded error still surfaces on every over-limit apply.
+		if err := nt.Apply(mkRoutes(over), instances); err == nil {
 			t.Fatal("re-apply over-limit must still surface the degraded error (#6467)")
 		}
 		total = ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
-		if total != 100 {
-			t.Fatalf("re-apply leaked rules: expected 100, got %d", total)
+		if total != config.NextTableRuleWindow {
+			t.Fatalf("re-apply leaked rules: expected %d, got %d", config.NextTableRuleWindow, total)
 		}
 	})
 }

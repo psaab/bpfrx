@@ -60408,3 +60408,46 @@ top.
     pkg/routing/rules_6467_test.go, pkg/dataplane/userspace/routes.go,
     pkg/dataplane/userspace/routes_6467_test.go,
     docs/rib-group-route-leaking.md, docs/refactoring-audit-current.txt, _Log.md
+- **Timestamp**: 2026-07-24
+- **Action**: #6486 FOLD (both hostile reviewers — Claude rev6486 MINOR + Codex
+    MAJOR — found the same FIB/applier eligibility divergence). My #6486 FIB cap
+    counted + published a snapshot for EVERY global next-table route, but the
+    applier (pkg/routing/rules.go) SKIPS a route whose target instance is unknown
+    (tableIDs miss) or whose CIDR fails net.ParseCIDR (no prio++). So dangling/
+    invalid routes consumed FIB window slots + published ghost leaks the kernel
+    never installs: measured 50 ghost + 100 valid -> kernel installs 100 valid,
+    FIB published 50 ghost + only 50 valid (50 valid MISSING). FOLD (Go-only):
+    (1) PRIMARY pkg/dataplane/userspace/routes.go buildRouteSnapshots — build a
+    definedInstances name set (mirroring the applier's tableIDs) and gate the
+    GLOBAL next-table count+publish on definedInstances membership AND
+    net.ParseCIDR(route.Destination), so the FIB publishes EXACTLY the valid set
+    the applier installs (no ghost, valid tail present up to the window). (2)
+    SECONDARY pkg/routing/rules.go — the degraded-error dropped-count scan now
+    counts only ELIGIBLE tail routes (known instance + parseable CIDR) so "N not
+    leaked" is accurate, not inflated by routes that never install. (3) MINOR
+    rules_test.go TestNextTableRulesPriorityCap — replaced hardcoded 100/150/+100
+    with config.NextTableRuleWindow SSOT. MEASURED post-fold: FIB ghost=0
+    valid=100 == applier installed=100 (equal). Tests: added
+    TestBuildRouteSnapshotsFIBEligibilityMirrorsApplier (routes_6467_test.go, 50
+    ghost + 120 valid -> asserts 0 ghost + full window valid) and
+    TestNextTableApplyDroppedCountCountsOnlyEligible (rules_6467_test.go, tail 50
+    valid + 30 ghost -> drop count names 50 not 80). Modernized two #3770 dedup/
+    sort fixtures (routes_dedupe_3770_test.go) that used UNREALISTIC qualified
+    undefined-instance next-table names ("blue.inet.0") — now bare names + defined
+    instances (the parser stores bare names via parseNextTableInstance; the
+    applier's own tableIDs lookup would skip qualified names). PARENT-RED:
+    neutralized ONLY the definedInstances membership skip (kept _ = definedInstances
+    to avoid unused-var) -> TestBuildRouteSnapshotsFIBEligibilityMirrorsApplier RED
+    at routes_6467_test.go:166 ("FIB published 50 ghost next-table leaks ... the
+    FIB must mirror the applier's eligibility") + :172 ("FIB published 50 valid ...
+    want 100 ... squeeze out valid leaks"), clean assertions, not a compile break;
+    restored GREEN. Updated docs/rib-group-route-leaking.md (#6467 eligibility
+    mirror paragraph). Regenerated docs/refactoring-audit-current.txt (rules.go
+    1566->1581). go build ./..., go vet, gofmt -l clean; go test ./pkg/routing/...
+    ./pkg/config/... ./pkg/dataplane/... GREEN; heatmap canary GREEN
+    (TMPDIR=/dev/shm, GOCACHE=/dev/shm/gc-6467b).
+- **File(s)**: pkg/dataplane/userspace/routes.go,
+    pkg/dataplane/userspace/routes_6467_test.go,
+    pkg/dataplane/userspace/routes_dedupe_3770_test.go, pkg/routing/rules.go,
+    pkg/routing/rules_test.go, pkg/routing/rules_6467_test.go,
+    docs/rib-group-route-leaking.md, docs/refactoring-audit-current.txt, _Log.md
