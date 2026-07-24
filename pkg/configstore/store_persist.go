@@ -712,31 +712,80 @@ func (s *Store) ResumeArchival() {
 // concurrent QuiesceArchival JOINs an in-flight synchronous write before the
 // wipe — the fence alone cannot close the write-after-wipe window.
 func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
-	// Capture the fence check, the text, timestamp, the monotonic seq AND the
-	// writer registration (archiveWG.Add) together under the lock. The seq/ts
-	// capture matches the commit path (#3441 H4, Codex MAJOR): the previous
-	// code called time.Now() AFTER releasing the lock, an ordering race that
-	// could mislabel the archive relative to a concurrent commit.
+	// Capture the fence check, the seed scan, the text, timestamp, the monotonic
+	// seq AND the writer registration (archiveWG.Add) together under the store
+	// WRITE lock. The seq/ts capture matches the commit path (#3441 H4, Codex
+	// MAJOR): the previous code called time.Now() AFTER releasing the lock, an
+	// ordering race that could mislabel the archive relative to a concurrent
+	// commit.
+	//
+	// #6403: hold the WRITE lock (not RLock) across the seed scan + seq claim,
+	// and seed the shared monotonic counter from THIS dir's on-disk max BEFORE
+	// claiming a seq, so the archive we write always outranks every pre-existing
+	// archive in the same dir. Two coupled hazards this closes:
+	//
+	//   1. Off-lock reseed overtakes the claimed seq. Under the old RLock the
+	//      seq was claimed and the lock released, then the actual write ran
+	//      off-lock. A concurrent SetArchiveConfig (write lock) that switched to
+	//      a dir with a higher on-disk max reseeds archiveSeq UPWARD; because
+	//      the shared counter is process-global, a subsequent writer to THIS dir
+	//      would then claim a seq far above ours, and rotateArchives (#5523
+	//      seq-ordered retention) prunes our fresh-but-low-seq archive as stale.
+	//      Claiming under the write lock makes the seed+claim mutually exclusive
+	//      with that reseed — the counter cannot be bumped between our seed and
+	//      our claim, and two concurrent ArchiveConfig calls no longer race the
+	//      Load→Store→Add seed as they could under a shared RLock.
+	//   2. Stale shared counter vs THIS dir. archiveSeq tracks whatever dir
+	//      SetArchiveConfig last seeded (possibly a different or empty dir), so
+	//      it can sit BELOW the on-disk max of the dir passed here — which is a
+	//      PARAMETER, decoupled from s.archiveDir. Writing at that low seq drops
+	//      a below-max archive that rotateArchives immediately prunes as stale.
+	//      Seeding from archiveDir here — monotonic-up, mirroring
+	//      ensureArchiveSeededLocked / #6404 for the commit path — guarantees the
+	//      claimed seq outranks the dir's existing contents.
+	//
+	// The seed scan is a bounded ReadDir under the lock, exactly what the commit
+	// path already does via ensureArchiveSeededLocked; only the WRITE stays
+	// off-lock (below), so a long archival I/O still never blocks
+	// reconcile/QuiesceArchival (#6185) — the lock-widening #6403 warns against
+	// is holding s.mu across the WRITE, not this scan+claim.
 	//
 	// #6185: the fence read and the Add(1) run under s.mu guarded by
 	// !archiveFenced, exactly like the async launch guard, so the Add/Wait
 	// ordering stays race-free: QuiesceArchival sets archiveFenced under s.mu
 	// (write lock) before it Wait()s, and that write lock is mutually exclusive
-	// with this RLock — so a concurrent QuiesceArchival either observes this
-	// writer in archiveWG and JOINs it (we Added before it took the write lock)
-	// or sets the fence first and we no-op (we read fenced=true and never Add).
-	// The counter can never rise from zero concurrently with Wait.
-	s.mu.RLock()
+	// with the lock we hold here — so a concurrent QuiesceArchival either
+	// observes this writer in archiveWG and JOINs it (we Added before it took
+	// the lock) or sets the fence first and we no-op (we read fenced=true and
+	// never Add). The counter can never rise from zero concurrently with Wait.
+	s.mu.Lock()
 	if s.archiveFenced.Load() {
 		// A factory reset is erasing the archive directory; do not recreate it.
-		s.mu.RUnlock()
+		s.mu.Unlock()
 		return nil
+	}
+	// #6403: seed the shared counter from THIS dir before claiming the seq.
+	if seed, err := maxArchiveSeq(archiveDir); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			// A genuine scan error (mount/permission) leaves the on-disk max
+			// UNKNOWN, so a claimed seq cannot be guaranteed to outrank the
+			// dir's contents; writing anyway could drop a below-max archive that
+			// rotateArchives prunes as stale. Fail the SYNCHRONOUS call so the
+			// caller learns it could not safely archive, and register NO writer
+			// in archiveWG (none runs). A nonexistent dir is NOT an error — first
+			// use holds no pre-existing archives, so seq 0 is correct and
+			// writeArchive's MkdirAll creates the dir.
+			s.mu.Unlock()
+			return fmt.Errorf("archive seq reseed scan of %s: %w", archiveDir, err)
+		}
+	} else if seed > s.archiveSeq.Load() {
+		s.archiveSeq.Store(seed)
 	}
 	data := s.active.Format()
 	ts := time.Now()
 	seq := s.archiveSeq.Add(1)
 	s.archiveWG.Add(1)
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	// The write happens off-lock (writeArchive never touches s.mu, so a
 	// concurrent QuiesceArchival Wait()ing on archiveWG cannot deadlock on the
 	// store lock), and Done fires only after it completes so the JOIN covers
