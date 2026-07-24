@@ -270,25 +270,53 @@ func (b *bondManager) createLocked(name string, ifc *config.InterfaceConfig, sig
 	//     KEEP-ing a partial bond forever.
 	// No LinkDel/LinkAdd is issued on the adopt path — the same code path
 	// serves both a restart adoption and an in-place partial completion.
+	//
+	// #6402: the adopt path must FIRST re-assert the found link is actually a
+	// bond before adopting it. LinkByName resolves the NAME, not the type: a
+	// same-name FOREIGN link (an external actor's device, or a leftover of a
+	// different type after a name collision) would otherwise be brought up and
+	// tracked as a satisfied bond while NO bond device carries the fabric/RETH
+	// members — the LAG silently does not exist yet the reconcile reports
+	// success. This is the last member of the post-create/adopt readback
+	// identity-assertion family: the #6396 create readback re-asserts
+	// *netlink.Bond, xfrm/VRF gate both create and adopt, and this closes the
+	// bond adopt gap. Reclaim the name via delete+recreate (mirroring the xfrm
+	// #5523 adopt gate and the vrfTable→recreate adopt path) rather than
+	// adopting the foreign link. If the delete fails the kernel link is still
+	// present, so a LinkAdd below would EEXIST — surface the delete failure so
+	// the commit fails closed and the next reconcile retries the delete first,
+	// exactly like the #5119 changed-signature and xfrm #5310 recreate paths.
 	if existing, err := b.ops.LinkByName(name); err == nil {
-		var errs []error
-		trackSig := sig
-		observed, ok := b.observedMembers(existing)
-		if ok && !membersCoverDesired(ifc, observed) {
-			enslaved, memberErrs := b.enslaveMembers(name, existing, ifc.FabricMembers, observed)
-			errs = append(errs, memberErrs...)
-			for _, m := range enslaved {
-				observed[m] = true
+		if _, isBond := existing.(*netlink.Bond); isBond {
+			var errs []error
+			trackSig := sig
+			observed, ok := b.observedMembers(existing)
+			if ok && !membersCoverDesired(ifc, observed) {
+				enslaved, memberErrs := b.enslaveMembers(name, existing, ifc.FabricMembers, observed)
+				errs = append(errs, memberErrs...)
+				for _, m := range enslaved {
+					observed[m] = true
+				}
+				trackSig = sigWithMembers(sig, observed)
 			}
-			trackSig = sigWithMembers(sig, observed)
+			b.bonds[name] = trackSig
+			slog.Debug("bond already exists", "name", name, "complete", trackSig == sig)
+			if err := b.ops.LinkSetUp(existing); err != nil {
+				slog.Warn("failed to bring up existing bond", "name", name, "err", err)
+				errs = append(errs, fmt.Errorf("bond %s: bring up existing: %w", name, err))
+			}
+			return errors.Join(errs...)
 		}
-		b.bonds[name] = trackSig
-		slog.Debug("bond already exists", "name", name, "complete", trackSig == sig)
-		if err := b.ops.LinkSetUp(existing); err != nil {
-			slog.Warn("failed to bring up existing bond", "name", name, "err", err)
-			errs = append(errs, fmt.Errorf("bond %s: bring up existing: %w", name, err))
+		// A same-name FOREIGN (non-bond) link wears the bond's name. Do NOT
+		// adopt it: reclaim the name via delete+recreate and fall through to
+		// the create path below. On a delete failure the kernel link is still
+		// present, so a LinkAdd below would EEXIST — return the delete error so
+		// the commit fails closed and the next reconcile retries the delete.
+		slog.Info("link with bond name is not a bond interface, recreating",
+			"name", name, "type", existing.Type())
+		if err := b.deleteLocked(name); err != nil {
+			return err
 		}
-		return errors.Join(errs...)
 	}
 
 	bond := netlink.NewLinkBond(netlink.LinkAttrs{Name: name})
