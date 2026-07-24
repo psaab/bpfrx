@@ -60431,6 +60431,21 @@ top.
 - **File(s)**: pkg/config/compiler_nat_static.go,
     pkg/config/static_nat_multitarget_6483_test.go, docs/config-schema.md, _Log.md
 
+## 2026-07-24 — #6484 round-2: V1/V2 sibling-mapped-port regression tests
+
+- **Timestamp**: 2026-07-24 (fix/6483-multitarget-static-nat)
+- **Action**: Add two regression accept subtests for the #1 regression-risk
+  shape flagged in the team-lead ground-truth matrix: REAL Junos
+  `static-nat { prefix-name POOL; mapped-port 8080; }` (V1) and
+  `static-nat { prefix 10.0.0.1/32; mapped-port 8080; }` (V2) — where mapped-port
+  is a SIBLING child of the target, not a grandchild. Both must stay ONE target
+  (the target child's Keys are len 2 so it never enters the grandchild loop; the
+  mapped-port sibling is skipped by staticNATCollectTargetIdentsFromKeys).
+  Firsthand-verified count=1/ACCEPT for the full V1/V2/V3/P1/B1/B2/B3 matrix
+  before adding. Test-only, no code change. gofmt + vet + full multitarget suite
+  green.
+- **File(s)**: pkg/config/static_nat_multitarget_6483_test.go, _Log.md
+
 ## 2026-07-24 — #6483/#6484 round-2: static-NAT target counter packed-value + nested-modifier fold
 
 - **Timestamp**: 2026-07-24 (fix/6483-multitarget-static-nat)

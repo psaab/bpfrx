@@ -415,6 +415,30 @@ func TestStaticNATMultiTarget6483_AcceptSingleTargets(t *testing.T) {
 					rule r1 { match { destination-address 203.0.113.1/32; destination-port 80; }
 						then { static-nat { prefix 10.0.0.1/32 { mapped-port 8080; } } } } } } } }`))
 	})
+	t.Run("prefix_name_hier_sibling_mapped_port", func(t *testing.T) {
+		// REAL Junos (#1 regression risk): `static-nat { prefix-name POOL;
+		// mapped-port 8080; }` — mapped-port is a SIBLING child of the prefix-name
+		// target, NOT a grandchild. The prefix-name child has Keys len 2 so it never
+		// enters the grandchild loop; the mapped-port sibling is skipped by
+		// staticNATCollectTargetIdentsFromKeys. Must stay ONE target.
+		assertSingleTargetAccept(t, mtBuildHier(t,
+			`security { zones { security-zone untrust; }
+				nat { static { rule-set rs1 { from { zone untrust; }
+					rule r1 { match { destination-address 203.0.113.1/32; destination-port 80; }
+						then { static-nat { prefix-name POOL; mapped-port 8080; } } } } } } }`,
+			"set security address-book global address POOL 10.0.0.9/32"))
+	})
+	t.Run("prefix_hier_sibling_mapped_port", func(t *testing.T) {
+		// REAL Junos (#1 regression risk): `static-nat { prefix 10.0.0.1/32;
+		// mapped-port 8080; }` — mapped-port sibling of the prefix target. Must stay
+		// ONE target (the prefix child's Keys are len 2; the mapped-port sibling
+		// registers no target).
+		assertSingleTargetAccept(t, mtBuildHier(t,
+			`security { zones { security-zone untrust; }
+				nat { static { rule-set rs1 { from { zone untrust; }
+					rule r1 { match { destination-address 203.0.113.1/32; destination-port 80; }
+						then { static-nat { prefix 10.0.0.1/32; mapped-port 8080; } } } } } } }`))
+	})
 }
 
 // TestStaticNATMultiTarget6483_SingleInetNotFlaggedMulti proves a lone `inet`
