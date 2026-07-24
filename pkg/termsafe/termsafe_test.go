@@ -1,4 +1,4 @@
-package cli
+package termsafe
 
 import (
 	"strings"
@@ -10,10 +10,12 @@ import (
 // hasTerminalControl reports whether s still carries any byte or rune a
 // terminal would interpret as a control: a C0 byte (0x00-0x1F), DEL (0x7F), a
 // C1 control rune (0x80-0x9F), or an invalid UTF-8 byte. It is the security
-// invariant sanitizeForDisplay must guarantee about its output. C0/DEL are
+// invariant SanitizeForDisplay must guarantee about its output. C0/DEL are
 // checked at the byte level (they are never UTF-8 continuation or lead bytes,
 // so this cannot false-positive on multibyte runes); C1 is checked at the rune
 // level so a legitimate continuation byte in 0x80-0x9F is not mistaken for one.
+// SanitizeForDisplay escapes newline/tab too (they must not appear mid-cell in
+// a table), so a bare sanitized field legitimately has no control byte at all.
 func hasTerminalControl(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if b := s[i]; b < 0x20 || b == 0x7f {
@@ -37,7 +39,7 @@ func hasTerminalControl(s string) bool {
 // guard: a device-supplied DHCP lease hostname carrying terminal escape
 // sequences (OSC 52 clipboard write, CSI erase, a lone C1 CSI introducer, an
 // invalid UTF-8 byte) must never reach the operator's terminal as raw control
-// bytes. Neutralizing sanitizeForDisplay to a pass-through fails this on a
+// bytes. Neutralizing SanitizeForDisplay to a pass-through fails this on a
 // clean assertion (the raw ESC/BEL bytes reappear in the output).
 func TestSanitizeForDisplayStripsEscapeSequences(t *testing.T) {
 	cases := []struct {
@@ -52,15 +54,15 @@ func TestSanitizeForDisplayStripsEscapeSequences(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := sanitizeForDisplay(tc.in)
+			out := SanitizeForDisplay(tc.in)
 			if hasTerminalControl(out) {
-				t.Fatalf("sanitizeForDisplay(%q) = %q: output still contains raw terminal control bytes",
+				t.Fatalf("SanitizeForDisplay(%q) = %q: output still contains raw terminal control bytes",
 					tc.in, out)
 			}
 			// The escaped form must be visible so the operator sees what was
 			// sent rather than a silently swallowed byte.
 			if strings.ContainsRune(tc.in, 0x1b) && !strings.Contains(out, `\x1b`) {
-				t.Fatalf("sanitizeForDisplay(%q) = %q: ESC was not rendered as a visible \\x1b escape",
+				t.Fatalf("SanitizeForDisplay(%q) = %q: ESC was not rendered as a visible \\x1b escape",
 					tc.in, out)
 			}
 		})
@@ -83,8 +85,17 @@ func TestSanitizeForDisplayPreservesLegitimate(t *testing.T) {
 		"",              // empty is trivially safe
 	}
 	for _, in := range clean {
-		if got := sanitizeForDisplay(in); got != in {
-			t.Errorf("sanitizeForDisplay(%q) = %q, want unchanged", in, got)
+		if got := SanitizeForDisplay(in); got != in {
+			t.Errorf("SanitizeForDisplay(%q) = %q, want unchanged", in, got)
 		}
+	}
+	// DisplaySafe must agree with the fast-path decision.
+	for _, in := range clean {
+		if !DisplaySafe(in) {
+			t.Errorf("DisplaySafe(%q) = false, want true", in)
+		}
+	}
+	if DisplaySafe("x\x1by") {
+		t.Errorf("DisplaySafe(%q) = true, want false", "x\x1by")
 	}
 }
