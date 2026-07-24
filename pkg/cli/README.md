@@ -167,6 +167,23 @@ presenter's rendered output is byte-identical:
   when the daemon hookups are absent (test/standalone).
 - `fwdSampler` (forwarding CPU stats) can be `nil` — every show handler
   null-checks it.
+- Device-originated strings printed to the operator's terminal MUST pass
+  through `sanitizeForDisplay` (`display_sanitize.go`, #6468). A DHCP lease
+  hostname (option 12) and client hardware address are supplied by a device on
+  a served segment and stored opaque by Kea; the DHCP-DDNS forward record name
+  is built from that same hostname. Printed raw they can smuggle terminal
+  escape sequences (OSC 52 clipboard write, CSI erase/redraw) that the terminal
+  acts on — clipboard hijack and output spoofing. The helper backslash-escapes
+  C0/DEL/C1 control bytes and invalid UTF-8 while passing legitimate multibyte
+  UTF-8 through unchanged. It is applied at the render sites in
+  `show_services_dhcp.go` (lease `Hostname`/`HWAddress`) and
+  `show_services_ddns.go` (owned-record `FQDN`). LLDP neighbor fields are
+  already sanitized at the ingest boundary (`lldp.sanitizeTLVString`); the
+  DHCPv6 DUID view is the firewall's own self-generated identity, not
+  device-controlled. The sibling gRPC text renderer
+  (`pkg/grpcapi/server_show_dhcp_lldp_snmp.go`) feeds the remote `cli` the same
+  raw lease fields and needs the same guard, but `pkg/cli` imports `pkg/grpcapi`
+  (not the reverse), so a shared fix there needs a leaf helper package.
 - Session filters (`session_filter.go`) serve BOTH show and clear. The
   clear path must call `validate()` (unknown zone/pool names are
   command errors — an inert filter degrades into clear-nothing or, via

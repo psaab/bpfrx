@@ -174,8 +174,10 @@ func (c *CLI) showDHCPDynamicDNS(detail bool) error {
 				if r.PTRPending {
 					pending = "PTR"
 				}
+				// FQDN is built from the device-supplied DHCP client hostname
+				// (option 12) — escape terminal control sequences (#6468).
 				fmt.Printf("    %-32s %-6s %-39s %-26s %s\n",
-					r.FQDN, r.ForwardType, r.Address, r.PTRName, pending)
+					sanitizeForDisplay(r.FQDN), r.ForwardType, r.Address, r.PTRName, pending)
 			}
 		}
 	}
