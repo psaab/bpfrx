@@ -1637,7 +1637,7 @@ pub(in crate::afxdp) struct CoSTimerWheelScratch {
 ///     readers compute percentiles independently and a brief skew
 ///     just rounds the p50/p99 into an adjacent bucket.
 pub(in crate::afxdp) struct CoSQueueOwnerProfile {
-    pub(in crate::afxdp) drain_latency_hist: [AtomicU64; super::umem::DRAIN_HIST_BUCKETS],
+    pub(in crate::afxdp) drain_latency_hist: [AtomicU64; super::binding_state::DRAIN_HIST_BUCKETS],
     pub(in crate::afxdp) drain_invocations: AtomicU64,
     /// #760 instrumentation. Bytes the shaped drain actually
     /// submitted on behalf of this queue. Divide by a scrape window

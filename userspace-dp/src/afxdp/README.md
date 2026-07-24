@@ -560,8 +560,19 @@ sync.
   GRE/WG outer, TSO) still take a bare VID where VID 0 == untagged is
   the intended semantic (no PCP source on those paths) — `From<u16>`
   reproduces the legacy bytes exactly.
-- `umem/` — UMEM allocator, fill ring, completion ring. Frames are
-  4 KB (`UMEM_FRAME_SIZE = 4096`); index is `addr >> 12`.
+- `umem/` — UMEM memory region: `MmapArea` (raw `mmap`) and the
+  `WorkerUmem` / `WorkerUmemPool` per-queue handle + free-frame pool.
+  Frames are 4 KB (`UMEM_FRAME_SIZE = 4096`); index is `addr >> 12`.
+  #6436 moved the per-binding runtime-state cluster out to
+  `binding_state/`; `umem/` is now only the memory region.
+- `binding_state/` — `BindingLiveState` per-binding atomics cluster
+  (#6436): ring state + forwarding/session/screen/NAT counters,
+  cacheline-isolated owner/peer telemetry profiles, the cross-worker
+  redirect TX inbox (bounded lock-free MPSC + linearizable admission
+  counter + `PendingTxAdmission` RAII token), the latency-histogram
+  primitives (`bucket_index_for_ns` + wire-contract bucket counts),
+  the HA session-delta RPC-fallback buffer with its #5290
+  loss-of-sync latch, and the snapshot/debug-state renderers.
 - `tx/` — TX ring management, batched enqueue, TSO segmentation
   (`tx/tcp_segmentation.rs` after PR #1199), per-binding TX counters.
   - `tx/dispatch/` — the per-tick forwarding dispatcher

@@ -1360,12 +1360,12 @@ fn aggregate_cos_statuses_sums_owner_profile_across_workers_coherently() {
             worker_instances: 1,
             exact: true,
             drain_latency_hist: {
-                let mut v = vec![0; super::super::umem::DRAIN_HIST_BUCKETS];
+                let mut v = vec![0; super::super::binding_state::DRAIN_HIST_BUCKETS];
                 v[0] = 5;
                 v
             },
             redirect_acquire_hist: {
-                let mut v = vec![0; super::super::umem::DRAIN_HIST_BUCKETS];
+                let mut v = vec![0; super::super::binding_state::DRAIN_HIST_BUCKETS];
                 v[1] = 3;
                 v
             },
@@ -1386,12 +1386,12 @@ fn aggregate_cos_statuses_sums_owner_profile_across_workers_coherently() {
             worker_instances: 1,
             exact: true,
             drain_latency_hist: {
-                let mut v = vec![0; super::super::umem::DRAIN_HIST_BUCKETS];
+                let mut v = vec![0; super::super::binding_state::DRAIN_HIST_BUCKETS];
                 v[7] = 11;
                 v
             },
             redirect_acquire_hist: {
-                let mut v = vec![0; super::super::umem::DRAIN_HIST_BUCKETS];
+                let mut v = vec![0; super::super::binding_state::DRAIN_HIST_BUCKETS];
                 v[2] = 13;
                 v
             },

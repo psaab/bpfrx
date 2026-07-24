@@ -3745,7 +3745,13 @@ fn parse_port_spec(spec: &str) -> Option<Vec<PortRange>> {
 // parse_port_spec MORE lenient than both Go gates — a parser divergence on a
 // security leaf (#3606). Reject any token that is not a bare run of ASCII
 // decimal digits so all three parsers agree.
-fn parse_port_u16(tok: &str) -> Option<u16> {
+//
+// #6477: this is the SHARED digit-only helper — the firewall-filter compiler
+// (filter/compiler.rs `parse_port_spec`) routes through it too, so all FOUR
+// port parsers (Go commit gate, Go capability gate, policy-side Rust,
+// filter-side Rust) agree on the same canonical-token acceptance set. Keep it
+// the single source of truth for "is this token a canonical port number".
+pub(crate) fn parse_port_u16(tok: &str) -> Option<u16> {
     if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }

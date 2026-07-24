@@ -531,6 +531,7 @@
   },
   "firewall_term_snapshot": {
     "action": "",
+    "address_unrepresentable": false,
     "count": "",
     "destination_addresses": [],
     "destination_constrained": false,
@@ -551,6 +552,7 @@
     "name": "",
     "next_term": false,
     "policer": "",
+    "ports_unrepresentable": false,
     "protocols": [],
     "routing_instance": "",
     "source_addresses": [],

@@ -419,6 +419,52 @@ already invalidate via the generation/epoch stamp checks
 (`flow_cache.rs` lookup); the reap path is the gap those checks do not
 cover because a plain idle-timeout reap bumps neither.
 
+## Flow-cache invalidation on control-plane delete (#6457)
+
+The same stale-descriptor exposure existed on every control-plane session
+delete. Three flows funnel through `WorkerCommand::DeleteSynced` —
+the operator's `clear security flow session [all]` (Go
+`ClearAllSessions` / singular `DeleteSession`), the cluster-stale sweep
+(`BatchDeleteSessions`), and HA DeleteSynced propagation from the peer
+(`delete_synced_session_gen` fan-out plus cross-worker
+`replicate_session_delete`) — and none of them bumps config/fib
+generation, RG epoch, or RG lease. `handle_delete_synced` dropped the
+session (NAT/NAT64 release, session-map/conntrack delete) without
+touching the flow cache, so a revoked-but-continuously-active 5-tuple
+kept HITTING its cached `RewriteDescriptor` on the owning worker:
+forwarded indefinitely with no session row, no policy re-evaluation, no
+`show security flow session` visibility, and no HA sync — the operator's
+explicit revocation primitive silently defeated on the fast path
+(fail-open). Only continuously-active flows survived (an idle gap lets
+the #3776 GC reap fire); a commit/RG change also flushed the stale slot
+via the stamp checks.
+
+`handle_delete_synced` now records every deleted key —
+UNCONDITIONALLY, even when the worker's session table has no entry,
+because a stale cached descriptor outlives the table entry it was seeded
+from — into `WorkerCommandResults.deleted_synced_keys`
+(`apply_worker_commands` has no `BindingWorker` access, the same
+constraint that put the #941 vacate dispatch in the worker loop). The
+worker loop drains the list through
+`invalidate_flow_cache_slots_for_deleted_sessions`
+(`afxdp/worker/loop_body/mod.rs`), which calls
+`flow_cache.invalidate_slot(&key, binding.ifindex)` on every binding of
+the worker — the same same-thread, key+ifindex-precise eviction as the
+reap path, and `delete_synced_session_gen` fans out the forward AND
+reverse keys so both directions are covered. The cost is one Vec push
+per delete plus one `invalidate_slot` set-walk per binding per delete —
+bounded by the control-plane delete rate, zero per-packet cost: the hit
+path is untouched and ticks with no deletes skip the walk entirely.
+
+Regression coverage: `afxdp/session_glue/tests.rs` pins the
+unconditional key record (`delete_synced_records_key_*` — RED if the
+push is removed) and `afxdp/worker/loop_body/mod.rs`'s
+`flow_cache_invalidation_tests` pin the eviction
+(`delete_synced_flow_cache_slot_is_invalidated`,
+`delete_synced_snat_descriptor_is_not_reused`,
+`delete_synced_invalidation_walks_every_binding` — RED if the
+invalidate loop is removed).
+
 ## Per-session byte/packet accounting (#2501)
 
 Each `SessionEntry` carries a `SessionCounters` (`fwd_packets`, `fwd_bytes`,
