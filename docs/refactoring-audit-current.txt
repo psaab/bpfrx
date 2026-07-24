@@ -2,16 +2,15 @@
 [REFACTOR]   3666  userspace-dp/src/policy.rs
 [REFACTOR]   3437  userspace-dp/src/nat64.rs
 [REFACTOR]   2800  pkg/config/compiler_validate_strict_nat.go
-[REFACTOR]   2761  pkg/config/compiler.go
 [REFACTOR]   2383  userspace-dp/src/nat/allocator.rs
 [REFACTOR]   2288  pkg/ddns/surface_a.go
 [REFACTOR]   2257  pkg/policymatch/policymatch.go
 [REFACTOR]   2225  userspace-dp/src/afxdp/neighbor.rs
-[REFACTOR]   2197  pkg/config/compiler_uniformgates.go
 [REFACTOR]   2191  pkg/daemon/daemon_nft.go
 [REFACTOR]   2191  userspace-dp/src/session/mod.rs
 [REFACTOR]   2166  userspace-dp/src/afxdp/cos/queue_service/mod.rs
 [REFACTOR]   2157  pkg/config/compiler_system.go
+[REFACTOR]   2080  pkg/config/compiler_opts.go
 [REFACTOR]   2062  pkg/dataplane/userspace/manager_ha.go
 [REFACTOR]   2017  userspace-dp/src/afxdp/frame/mod.rs
 [REFACTOR]   2004  userspace-dp/src/afxdp/frame/inspect.rs
