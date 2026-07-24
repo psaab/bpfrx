@@ -1,3 +1,36 @@
+## 2026-07-23 — #6426: decompose pkg/dataplane compileZones god-function
+
+- **Timestamp**: 2026-07-23 (refactor/6426-compilezones)
+- **Action**: Behavior-preserving decomposition of compileZones
+  (compiler_iface.go, ~925 LOC fusing four concerns) into a 33-line
+  orchestrator plus focused helpers. Zone-map programming lifted into
+  programZoneMaps + (st *zoneMapState) mapZoneInterface + buildZoneConfig
+  + buildIfaceTableIDMap; the shared loop accumulators (writtenIfaceZone/
+  writtenVlanIface/attached/attachedXDP/xdpIfindexes/tunnelIfindexes) moved
+  into an explicit zoneMapState so the per-interface body lifts without
+  changing behavior (the attached/attachedXDP dedup persists across the
+  whole loop, as before). The networkd-model concern split into
+  buildInterfaceNetworkdModels / buildFabricBondModels /
+  buildBridgeDomainModels, and the unmanaged-interface strip into
+  stripUnmanagedInterfaces — all threaded through the shared `seen` set.
+  compileZones is LIVE (result.ManagedInterfaces feeds networkd.Apply;
+  pendingXDP/pendingTC/tunnelIfindexes drive XDP/TC attach), so this is a
+  decomposition, not a deletion. Moved bodies are byte-identical to the
+  originals modulo documented edits (st.* accumulator prefixes; two
+  interface-skip continue -> return nil; one screen-profile error return
+  -> 2-value; reindent) — proven mechanically before running tests.
+  Interface-management ordering (rename -> address -> bring-down) and phase
+  ordering preserved. No new file, no new import -> #1373 retirement
+  allowlist/canary untouched. Regenerated the refactoring-audit heatmap
+  (compiler_iface.go grew 1404->1517 with helper scaffolding, crossing the
+  [WATCH] line — the honest signal).
+- **Validation**: full `go test ./...` GREEN (retirement-boundary + legacy
+  BPF manifest canaries, compiler_rxvlan_failclosed_5268 real-compileZones
+  driver, refactoraudit heatmap-staleness); go build ./... + go vet
+  ./pkg/dataplane/ clean; gofmt-clean.
+- **File(s)**: pkg/dataplane/compiler_iface.go,
+  docs/refactoring-audit-current.txt, _Log.md
+
 ## 2026-07-23 — #6423: split the lenient-gate apparatus into cohesive sibling files
 
 - **Timestamp**: 2026-07-23 (refactor/6423-config-lenient-gate)
