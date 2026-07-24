@@ -74,32 +74,44 @@ func applyStaticNATFromScope(rs *StaticNATRuleSet, s natMatchScope) {
 // because `static-nat` is a children:nil schema leaf, so this in-leaf token
 // bypasses the schema value validator.
 //
-// Returns (port, malformedRaw):
-//   - keyword absent:            (0, "")
-//   - present, numeric value:    (<port>, "")
-//   - present, non-numeric value: (0, "<raw token>")
+// Returns (port, raw, present):
+//   - keyword absent:                 (0, "",        false)
+//   - present, valid numeric value:   (<port>, "<n>", true)
+//   - present, non-numeric value:     (0, "<token>", true)
+//   - present, empty operand:         (0, "",        true)
+//   - present, no operand (bare):     (0, "",        true)
 //
-// The malformedRaw return is how a PRESENT-but-non-numeric mapped-port is
-// distinguished from an ABSENT one (C179-038). Before this the helper folded
-// both to a bare 0, so `mapped-port notaport` compiled clean to MappedPort==0
-// (== "no port translation") with no diagnostic — even though a WELL-FORMED
-// value in the same position without a `match destination-port` IS rejected at
-// strict commit-check, so a garbage token was treated more leniently than a
-// valid one. The caller records malformedRaw on the rule and the strict gate
-// (validateNATHostMaskStrict) rejects it; the lenient load / peer-sync path
-// keeps MappedPort==0 so the dataplane still installs a plain 1:1 (no bogus
-// port), matching the pre-fix fail-closed behaviour.
-func staticNATMappedPortFromKeys(keys []string) (port int, malformedRaw string) {
-	for i := 0; i+1 < len(keys); i++ {
-		if keys[i] == "mapped-port" {
-			raw := keys[i+1]
-			if p, err := strconv.Atoi(raw); err == nil {
-				return p, ""
-			}
-			return 0, raw
+// `present` is the explicit presence signal (C179-038 + fold). MappedPort==0
+// alone cannot distinguish an ABSENT mapped-port from a PRESENT-but-malformed
+// one — the literal "0", a non-numeric token, an empty operand, and a bare
+// keyword all parse (or fail to parse) to 0 — and raw=="" cannot distinguish
+// absent from present-but-empty. Before the presence signal these
+// sentinel-collision siblings compiled clean to MappedPort==0 (== "no port
+// translation") with no diagnostic, even though a WELL-FORMED value in the same
+// position without a `match destination-port` IS rejected at strict
+// commit-check, so garbage was treated more leniently than a valid value. The
+// caller records all three fields; the strict gate (validateNATHostMaskStrict)
+// rejects a present-but-not-1-65535 port and names the raw token, while the
+// lenient load / peer-sync path keeps MappedPort==0 so the dataplane still
+// installs a plain 1:1 (no bogus port), matching the pre-fix fail-closed
+// behaviour.
+func staticNATMappedPortFromKeys(keys []string) (port int, raw string, present bool) {
+	for i := 0; i < len(keys); i++ {
+		if keys[i] != "mapped-port" {
+			continue
 		}
+		present = true
+		// A bare trailing `mapped-port` (keyword is the last key) has no
+		// operand: leave port=0, raw="" but still report present=true.
+		if i+1 < len(keys) {
+			raw = keys[i+1]
+			if p, err := strconv.Atoi(raw); err == nil {
+				port = p
+			}
+		}
+		return port, raw, present
 	}
-	return 0, ""
+	return 0, "", false
 }
 
 // staticNATRoutingInstanceFromKeys scans a collapsed static-nat `then` leaf's
@@ -248,6 +260,7 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 				rule.IsNPTv6 = false
 				rule.MappedPort = 0
 				rule.MappedPortRaw = ""
+				rule.MappedPortPresent = false
 				// #4290 / #4292: reset the named-target reference and the
 				// translation-target routing-instance alongside the other
 				// then-set fields so only the LAST then-block's spec survives.
@@ -284,7 +297,7 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// mapped-port <port>` onto this one leaf's Keys
 							// (`static-nat` is a children:nil schema leaf), so
 							// scan for the keyword + value pair.
-							rule.MappedPort, rule.MappedPortRaw = staticNATMappedPortFromKeys(t.Keys)
+							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortFromKeys(t.Keys)
 						} else if pn := t.FindChild("prefix"); pn != nil {
 							rule.Then = nodeVal(pn)
 							// #2491: `then static-nat prefix <ip> mapped-port
@@ -293,20 +306,22 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// because `static-nat` is a children:nil schema
 							// leaf, so the modifier rides on the prefix leaf,
 							// not a sibling `mapped-port` node. Scan pn.Keys.
-							rule.MappedPort, rule.MappedPortRaw = staticNATMappedPortFromKeys(pn.Keys)
+							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortFromKeys(pn.Keys)
 							// Hierarchical shape `static-nat { prefix X;
 							// mapped-port P; }` carries it as a sibling child.
-							// A non-numeric sibling value is recorded as
-							// malformed (mirroring the collapsed-keys helper)
-							// so the strict gate rejects it instead of the
-							// value collapsing silently to MappedPort==0.
-							if rule.MappedPort == 0 && rule.MappedPortRaw == "" {
+							// Consult the sibling ONLY when the collapsed keys
+							// did not carry a mapped-port (else the flat-set
+							// value wins). Record presence + the raw token even
+							// for an empty / non-numeric sibling value so the
+							// strict gate rejects it instead of the value
+							// collapsing silently to MappedPort==0.
+							if !rule.MappedPortPresent {
 								if mp := t.FindChild("mapped-port"); mp != nil {
+									rule.MappedPortPresent = true
 									raw := nodeVal(mp)
+									rule.MappedPortRaw = raw
 									if p, err := strconv.Atoi(raw); err == nil {
 										rule.MappedPort = p
-									} else if raw != "" {
-										rule.MappedPortRaw = raw
 									}
 								}
 							}

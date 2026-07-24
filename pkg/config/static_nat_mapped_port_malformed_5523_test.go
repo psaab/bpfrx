@@ -16,10 +16,11 @@ import (
 // (TestStaticNATMappedPortWithoutMatchPortRejected). A garbage token was thus
 // treated more leniently than a valid one.
 //
-// Fail-on-revert: remove the `rule.MappedPortRaw != ""` guard in
-// validateNATHostMaskStrict (or revert staticNATMappedPortFromKeys to drop the
-// malformed-raw return) → MappedPortRaw is never surfaced → CompileConfig
-// succeeds → this test goes RED on a clean assertion.
+// Fail-on-revert: neutralize the unified presence gate in
+// validateNATHostMaskStrict (`rule.MappedPortPresent && (MappedPort < 1 ||
+// MappedPort > 65535)`) or revert staticNATMappedPortFromKeys to drop the
+// presence/raw returns → the malformed token is never surfaced →
+// CompileConfig succeeds → this test goes RED on a clean assertion.
 func TestStaticNATMappedPortMalformedRejected(t *testing.T) {
 	tree := &ConfigTree{}
 	lines := []string{
@@ -92,5 +93,156 @@ func TestStaticNATMappedPortMalformedLenientWarns(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a lenient warning naming the malformed mapped-port, got %v", cfg.Warnings)
+	}
+}
+
+// buildMappedPortTree assembles a static-NAT rule tree from the shared base
+// lines plus the case-specific tail lines, using the flat-set ParseSetCommand
+// + SetPath idiom (NOT NewParser, which merges newline-separated set lines).
+func buildMappedPortTree(t *testing.T, tail []string) *ConfigTree {
+	t.Helper()
+	base := []string{
+		"set security zones security-zone untrust",
+		"set security nat static rule-set rs1 from zone untrust",
+		"set security nat static rule-set rs1 rule r1 match destination-address 203.0.113.1/32",
+	}
+	tree := &ConfigTree{}
+	for _, line := range append(append([]string{}, base...), tail...) {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	return tree
+}
+
+// TestStaticNATMappedPortPresenceGate is the #6479 fold: Codex found the
+// C179-038 fix (a `MappedPortRaw string` + a strict reject for a NON-EMPTY raw
+// token) left three sentinel-collision siblings SILENTLY ACCEPTED (strict
+// reject=false, no warning), all the same class as C179-038 — a PRESENT
+// mapped-port that becomes a no-port-translation 1:1 with no diagnostic:
+//
+//   - `mapped-port 0`  — Atoi("0")==(0,nil) → MappedPort==0 (the "absent"
+//     sentinel), so the `MappedPort != 0` range gate was skipped even though 0
+//     is outside the advertised 1-65535.
+//   - `mapped-port ""` — the quoted-empty operand is a real retained token but
+//     Atoi("")=err → MappedPortRaw=="" (the "absent" sentinel), so the
+//     `MappedPortRaw != ""` gate was skipped.
+//   - bare `mapped-port` (no operand) — the keyword-present-with-no-value case
+//     set nothing at all.
+//
+// The fold adds an explicit MappedPortPresent signal (set whenever the
+// keyword appears, regardless of operand) so ONE unified gate —
+// `MappedPortPresent && (MappedPort < 1 || MappedPort > 65535)` — rejects every
+// present-but-not-valid-1-65535 mapped-port and names the offending token
+// (MappedPortRaw, or "(missing value)" for the empty/bare cases). A valid
+// in-range port with a matching `match destination-port`, and an absent
+// mapped-port, are still accepted; the lenient load / peer-sync path (#1960
+// no-brick) downgrades the reject to a warning and keeps MappedPort==0 for a
+// truly-malformed token so the dataplane installs a plain 1:1.
+//
+// Coverage spans BOTH AST shapes reachable from flat-set: the collapsed
+// single-line form (`... prefix <ip> mapped-port <tok>` folds onto the prefix
+// leaf's Keys) and the hierarchical sibling form (two `then static-nat` set
+// lines build a `static-nat { prefix X; mapped-port P; }` node with distinct
+// children, exercising the compiler's t.FindChild("mapped-port") path).
+//
+// Fail-on-revert: guard the unified presence gate false (keep the fields read)
+// → the 0 / "" / bare / 70000 / sibling cases all go RED on clean assertions.
+func TestStaticNATMappedPortPresenceGate(t *testing.T) {
+	// flat is a single collapsed `then static-nat prefix <ip> <tail>` set line.
+	flat := func(tail string) []string {
+		return []string{"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.5/32 " + tail}
+	}
+	// flatMatch pairs a `match destination-port` with the collapsed then-line so
+	// an in-range or out-of-range NUMERIC port is isolated from the separate
+	// mapped-port-without-match-port gate.
+	flatMatch := func(tail string) []string {
+		return []string{
+			"set security nat static rule-set rs1 rule r1 match destination-port 8080",
+			"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.5/32 " + tail,
+		}
+	}
+	// sibling emits two separate `then static-nat` set lines so the parser
+	// builds the hierarchical sibling shape (prefix + mapped-port as distinct
+	// children of static-nat) rather than collapsing onto one leaf's Keys.
+	sibling := func(val string) []string {
+		return []string{
+			"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.5/32",
+			"set security nat static rule-set rs1 rule r1 then static-nat mapped-port " + val,
+		}
+	}
+
+	cases := []struct {
+		name        string
+		tail        []string
+		wantReject  bool
+		wantSubstr  string // token / placeholder the strict error + lenient warning must name
+		wantMapZero bool   // lenient path must keep MappedPort==0 (truly-malformed)
+	}{
+		// Collapsed single-line (flat) malformed — the sentinel-collision core.
+		{"flatZero", flat("mapped-port 0"), true, `"0"`, true},
+		{"flatEmpty", flat(`mapped-port ""`), true, "(missing value)", true},
+		{"flatBare", flat("mapped-port"), true, "(missing value)", true},
+		{"flatNonNumeric", flat("mapped-port notaport"), true, `"notaport"`, true},
+		// Numeric but out of range — carries a match-port so only the range gate
+		// fires. MappedPort parses to 70000 (not zeroed), so wantMapZero=false.
+		{"flatOutOfRange", flatMatch("mapped-port 70000"), true, `"70000"`, false},
+		// Hierarchical sibling malformed — the FindChild("mapped-port") path.
+		{"siblingNonNumeric", sibling("notaport"), true, `"notaport"`, true},
+		{"siblingZero", sibling("0"), true, `"0"`, true},
+		// Accepted: a valid in-range port WITH a matching match destination-port.
+		{"validWithMatchPort", flatMatch("mapped-port 8080"), false, "", false},
+		// Accepted: no mapped-port keyword at all (plain host 1:1).
+		{"absent", []string{"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.5/32"}, false, "", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Strict commit-check.
+			_, err := CompileConfig(buildMappedPortTree(t, tc.tail))
+			if tc.wantReject {
+				if err == nil {
+					t.Fatalf("strict CompileConfig must reject %s", tc.name)
+				}
+				if !strings.Contains(err.Error(), "mapped-port") {
+					t.Fatalf("strict error must mention mapped-port, got %v", err)
+				}
+				if tc.wantSubstr != "" && !strings.Contains(err.Error(), tc.wantSubstr) {
+					t.Fatalf("strict error must name %s, got %v", tc.wantSubstr, err)
+				}
+			} else if err != nil {
+				t.Fatalf("strict CompileConfig must accept %s, got %v", tc.name, err)
+			}
+
+			// Lenient load / peer-sync path (#1960 no-brick).
+			cfg, errL := CompileConfigLenient(buildMappedPortTree(t, tc.tail))
+			if errL != nil {
+				t.Fatalf("lenient compile must not hard-error for %s, got %v", tc.name, errL)
+			}
+			if tc.wantReject {
+				var found bool
+				for _, w := range cfg.Warnings {
+					if strings.Contains(w, "mapped-port") && strings.Contains(w, tc.wantSubstr) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatalf("lenient path must warn naming %s for %s, got %v", tc.wantSubstr, tc.name, cfg.Warnings)
+				}
+			}
+			if tc.wantMapZero {
+				if len(cfg.Security.NAT.Static) != 1 || len(cfg.Security.NAT.Static[0].Rules) != 1 {
+					t.Fatalf("expected exactly 1 static NAT rule for %s", tc.name)
+				}
+				if got := cfg.Security.NAT.Static[0].Rules[0].MappedPort; got != 0 {
+					t.Fatalf("lenient path must keep MappedPort==0 (no bogus port) for %s, got %d", tc.name, got)
+				}
+			}
+		})
 	}
 }

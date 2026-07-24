@@ -1421,40 +1421,50 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					return nil, err
 				}
 			}
-			// C179-038: a PRESENT-but-non-numeric `then static-nat mapped-port
-			// <token>` rides inside the children:nil static-nat leaf, bypassing
-			// the schema value validator, so the compiler recorded the raw
-			// token on MappedPortRaw (MappedPort stayed 0). Reject it at strict
-			// commit-check — otherwise a garbage token collapses silently to
-			// MappedPort==0 ("no port translation") and is accepted even though
-			// a well-formed value in the same position IS rejected (the
-			// mapped-port-without-match-port gate below). The lenient load /
-			// peer-sync path downgrades this to a warning and the dataplane
-			// installs a plain 1:1 (MappedPort==0, no bogus port).
-			if rule.MappedPortRaw != "" {
+			// C179-038 + fold: a PRESENT `then static-nat mapped-port <token>`
+			// rides inside the children:nil static-nat leaf, bypassing the
+			// schema value validator. The compiler records an explicit presence
+			// signal (MappedPortPresent) plus the parsed port (MappedPort, 0
+			// when absent OR malformed) and the raw token (MappedPortRaw). This
+			// ONE gate rejects every present-but-not-1-65535 sibling the earlier
+			// string/int sentinels let slip: a non-numeric token ("notaport"),
+			// an empty operand (`mapped-port ""`), a bare keyword with no
+			// operand, the literal "0", and an out-of-range number ("70000").
+			// All previously collapsed to MappedPort==0-or-out-of-range with no
+			// diagnostic under the old `MappedPortRaw != ""` / `MappedPort != 0`
+			// gates (MappedPort==0 conflated "absent" with "present-but-
+			// malformed"; MappedPortRaw=="" conflated "absent" with "present-
+			// but-empty"), so the value silently degraded to "no port
+			// translation" even though a WELL-FORMED value in the same position
+			// without a `match destination-port` IS rejected. The lenient load /
+			// peer-sync path (#1960 no-brick) downgrades this to a warning and
+			// the dataplane installs a plain 1:1 (MappedPort==0, no bogus port).
+			// MappedPortPresent is compile-only (json:"-") and never reaches the
+			// dataplane.
+			if rule.MappedPortPresent && (rule.MappedPort < 1 || rule.MappedPort > 65535) {
+				token := "(missing value)"
+				if rule.MappedPortRaw != "" {
+					token = fmt.Sprintf("%q", rule.MappedPortRaw)
+				}
 				if err := emitSuffix(fmt.Sprintf(
-					"security nat static rule-set %q rule %q then static-nat mapped-port %q is not a valid port number (1-65535)",
-					rs.Name, rule.Name, rule.MappedPortRaw),
+					"security nat static rule-set %q rule %q then static-nat mapped-port %s is not a valid port number (1-65535)",
+					rs.Name, rule.Name, token),
 					" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
 					return nil, err
 				}
 			}
-			if rule.MappedPort != 0 {
-				if rule.MappedPort < 1 || rule.MappedPort > 65535 {
-					if err := emitSuffix(fmt.Sprintf(
-						"security nat static rule-set %q rule %q then static-nat mapped-port %d is out of range (1-65535)",
-						rs.Name, rule.Name, rule.MappedPort),
-						" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
-						return nil, err
-					}
-				}
-				if rule.MatchDestinationPort == 0 {
-					if err := emitSuffix(fmt.Sprintf(
-						"security nat static rule-set %q rule %q then static-nat mapped-port %d requires a matching `match destination-port`",
-						rs.Name, rule.Name, rule.MappedPort),
-						" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
-						return nil, err
-					}
+			// A VALID in-range mapped-port still requires a matching `match
+			// destination-port`: without an external port to match, the port
+			// rewrite has no inbound trigger and the reverse SNAT cannot recover
+			// the original port. Guarded on MappedPort != 0 so it does not
+			// double-fire on a malformed mapped-port (MappedPort==0), which the
+			// presence gate above already rejected.
+			if rule.MappedPort != 0 && rule.MatchDestinationPort == 0 {
+				if err := emitSuffix(fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat mapped-port %d requires a matching `match destination-port`",
+					rs.Name, rule.Name, rule.MappedPort),
+					" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
+					return nil, err
 				}
 			}
 		}

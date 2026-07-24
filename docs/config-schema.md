@@ -3526,15 +3526,25 @@ reserved for whole-dataplane selection where a rewrite shim
     SetPath grouping is preserved); the
     `mapped-port` token therefore bypasses the schema value validator and
     is validated in the compiler (`validateNATHostMaskStrict`,
-    `compiler_nat.go`): it is range-checked (1..65535), a NON-NUMERIC value
-    is rejected as malformed (C179-038 — before this a garbage token
-    collapsed silently to `MappedPort==0`/"no port translation", so it was
+    `compiler_nat.go`): the compiler records an explicit presence signal
+    (`StaticNATRule.MappedPortPresent`) alongside the parsed port and the
+    raw token, and a PRESENT mapped-port whose value is not a valid
+    1..65535 port is rejected as malformed (C179-038 + fold). One gate
+    covers every sentinel-collision sibling: a non-numeric token
+    (`notaport`), an empty operand (`mapped-port ""`), a bare `mapped-port`
+    with no operand, the literal `0`, and an out-of-range number
+    (`70000`). Before the presence signal these all collapsed silently to
+    `MappedPort==0`/"no port translation" (the int/string sentinels could
+    not tell "absent" from "present-but-malformed"), so a garbage token was
     accepted even though a well-formed value in the same position without a
-    `match destination-port` is rejected; the raw token is carried on
-    `StaticNATRule.MappedPortRaw` so the strict gate can name it), it is
-    rejected when it has no matching `match destination-port` (the reverse
-    SNAT could not recover the original port), AND the mirror half-config —
-    a `match destination-port` with no `mapped-port` (#2769) — is rejected. The port-match-without-
+    `match destination-port` is rejected. The strict error names the
+    offending token from `MappedPortRaw` (or `(missing value)` when the
+    operand is empty/bare); `MappedPortRaw` and `MappedPortPresent` are
+    compile-only (`json:"-"`) and never cross the dataplane wire. A valid
+    in-range mapped-port is still rejected when it has no matching `match
+    destination-port` (the reverse SNAT could not recover the original
+    port), AND the mirror half-config — a `match destination-port` with no
+    `mapped-port` (#2769) — is rejected. The port-match-without-
     mapped-port form is a port-scoped 1:1 (no port translation); rejecting
     it at strict commit-check forces the operator to either drop the port
     match (a whole-address 1:1) or add a `mapped-port` (a port forward). If
