@@ -9,7 +9,6 @@
 | r2 | Codex (gpt-5.5 via codex-companion) | task-mrzfkngy-ocvr2e (17m30s, turn failed at final assembly — content-filter infra error; partial output = PASS_TO_KERNEL finding); resumed task-mrzg8a40-gwcq3m (session 019f95f3-c124-7c60-9d1b-198b9629c197, 8m44s, completed) | PLAN NO (4 BLOCKER, 5 HIGH, 1 MEDIUM) | codex-plan-r2.md |
 | r2 | AGY convergence pass on v3 (direct binary) | out2 (headless command-permission denial, 303B), out3 (built-in-tools-only retry, full) | PLAN NO (1 BLOCKER post-failover kill, 1 HIGH seed race, 1 MEDIUM arithmetic; all 6 r2 folds verified resolved) | agy-plan-r2.md |
 | r2 | Claude SMR | in-conversation | PLAN NO (2 BLOCKER: no-baseline fail-open + materialize constructor; 1 HIGH seed race; 1 MEDIUM arithmetic) | claude-smr-plan-r2.md |
-
 | r3 | Codex (gpt-5.5 via codex-companion, resumed session) | task-mrzhtb46-hwfisv (26m05s, completed; session 019f95f3-…-198b9629c197) | PLAN NO (4 BLOCKER, 4 HIGH, 2 MEDIUM) | codex-plan-r3.md |
 | r3 | AGY (direct binary, built-in-tools-only preamble) | r3-agy-out1 (single run, full coverage) | PLAN YES (1 MEDIUM: OPENING windowed-vs-exact; 1 LOW accepted residual) | agy-plan-r3.md |
 | r3 | Claude SMR | in-conversation | PLAN NO for v4.2 — all ten Codex findings confirmed + folded into v5; one documented dissent (segment-wide weak auth kept; per-field deadlock proof) | claude-smr-plan-r3.md |
