@@ -349,7 +349,18 @@ the RG0 config-sync authority). A non-authority's sessions carry the
 authority-independent seed epoch, so the guard is inert for the reverse
 direction in an active/active deployment (fail-OPEN). Closing it requires a
 bidirectional config-generation namespace that #5274 deliberately scoped out (a
-design-heavy change, not part of #6284 item 2); it remains tracked on #6284.
+design-heavy change, not part of #6284 item 2). #6284's residual-COVERAGE gap
+is closed (item 2 by #6366, item 1 by #6418); the substantive hardening of this
+inert direction is tracked separately as a future enhancement on #6419.
+
+Both halves of this directional correctness are regression-pinned by
+`sync_config_epoch_active_active_6284_test.go`: the SAME frozen non-authority
+epoch is REFUSED at a receiver that applied a newer config (the protected
+config-authority → peer direction) and ADMITTED at the config authority (whose
+receive high-water never advances — the inert fail-OPEN reverse direction), and
+the sender-side root cause is pinned too (`recordAppliedConfigGen` advances the
+receive high-water but never the send-stamp `configGenCounter`, so a
+non-authority stamps its synced-out sessions with the frozen boot-seed epoch).
 
 ### RT_FLOW Session Id (#5212)
 
