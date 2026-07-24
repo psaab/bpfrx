@@ -1413,7 +1413,15 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// forward). The dataplane backstop (static_nat.rs) keeps the
 			// reverse SNAT scoped to the matched port if the rule slips through
 			// the lenient load / peer-sync path.
-			if rule.MatchDestinationPort != 0 && rule.MappedPort == 0 {
+			//
+			// #6479 fold: guard on !MappedPortPresent so this fires ONLY on a
+			// TRUE absence. A PRESENT-but-malformed mapped-port (`mapped-port
+			// 0`/``/bare/`notaport`) also lands at MappedPort==0, but it is the
+			// presence gate below that owns that case (naming the bad token).
+			// Without this guard both gates fire — two warnings in lenient mode,
+			// and in strict the misleading "requires a mapped-port" message
+			// (emitted first) wins over the accurate "not a valid port number".
+			if rule.MatchDestinationPort != 0 && rule.MappedPort == 0 && !rule.MappedPortPresent {
 				if err := emitSuffix(fmt.Sprintf(
 					"security nat static rule-set %q rule %q match destination-port %d requires a matching `then static-nat mapped-port` (a port match without a port translation either broadens or scopes the reverse source-NAT in a non-obvious way; drop the port match for a whole-address 1:1, or add a mapped-port for a port forward)",
 					rs.Name, rule.Name, rule.MatchDestinationPort),

@@ -67,51 +67,86 @@ func applyStaticNATFromScope(rs *StaticNATRuleSet, s natMatchScope) {
 	}
 }
 
-// staticNATMappedPortFromKeys extracts the `mapped-port <port>` modifier
+// staticNATMappedPortFromKeys extracts the `mapped-port <port>` modifier(s)
 // from a flat-set static-NAT leaf's collapsed Keys (#2491). The lexer
 // collapses `then static-nat prefix <ip> mapped-port <port>` onto one node
 // whose Keys are `["static-nat","prefix","<ip>","mapped-port","<port>"]`
 // because `static-nat` is a children:nil schema leaf, so this in-leaf token
 // bypasses the schema value validator.
 //
-// Returns (port, raw, present):
-//   - keyword absent:                 (0, "",        false)
-//   - present, valid numeric value:   (<port>, "<n>", true)
-//   - present, non-numeric value:     (0, "<token>", true)
-//   - present, empty operand:         (0, "",        true)
-//   - present, no operand (bare):     (0, "",        true)
-//
-// `present` is the explicit presence signal (C179-038 + fold). MappedPort==0
-// alone cannot distinguish an ABSENT mapped-port from a PRESENT-but-malformed
-// one — the literal "0", a non-numeric token, an empty operand, and a bare
-// keyword all parse (or fail to parse) to 0 — and raw=="" cannot distinguish
-// absent from present-but-empty. Before the presence signal these
-// sentinel-collision siblings compiled clean to MappedPort==0 (== "no port
-// translation") with no diagnostic, even though a WELL-FORMED value in the same
-// position without a `match destination-port` IS rejected at strict
-// commit-check, so garbage was treated more leniently than a valid value. The
-// caller records all three fields; the strict gate (validateNATHostMaskStrict)
-// rejects a present-but-not-1-65535 port and names the raw token, while the
-// lenient load / peer-sync path keeps MappedPort==0 so the dataplane still
-// installs a plain 1:1 (no bogus port), matching the pre-fix fail-closed
-// behaviour.
+// It scans EVERY `mapped-port` occurrence (not just the first) and folds them
+// through combineMappedPortOperands so a contradictory duplicate fails closed;
+// a bare trailing keyword contributes an empty operand. The (port, raw,
+// present) triple feeds the strict gate (validateNATHostMaskStrict): present is
+// the explicit presence signal (C179-038 + fold) that MappedPort==0 and raw==""
+// cannot carry on their own (the literal "0", a non-numeric token, an empty
+// operand, and a bare keyword all collapse to port 0 / raw "").
 func staticNATMappedPortFromKeys(keys []string) (port int, raw string, present bool) {
+	var operands []string
 	for i := 0; i < len(keys); i++ {
 		if keys[i] != "mapped-port" {
 			continue
 		}
-		present = true
 		// A bare trailing `mapped-port` (keyword is the last key) has no
-		// operand: leave port=0, raw="" but still report present=true.
+		// operand — record an empty operand so combine flags it malformed
+		// (present=true, raw="") rather than dropping the occurrence.
 		if i+1 < len(keys) {
-			raw = keys[i+1]
-			if p, err := strconv.Atoi(raw); err == nil {
-				port = p
-			}
+			operands = append(operands, keys[i+1])
+		} else {
+			operands = append(operands, "")
 		}
-		return port, raw, present
 	}
-	return 0, "", false
+	return combineMappedPortOperands(operands)
+}
+
+// combineMappedPortOperands folds one-or-more `mapped-port` operands (the
+// tokens trailing each `mapped-port` keyword, in AST order) into the
+// (port, raw, present) triple the strict gate (validateNATHostMaskStrict)
+// consumes. It is shared by the flat collapsed-keys scan
+// (staticNATMappedPortFromKeys) and the hierarchical sibling scan in
+// compileNATStatic so BOTH AST shapes fail closed identically.
+//
+// Returns (C179-038 + #6479 fold):
+//   - no operands:                    (0, "",          false) — keyword absent.
+//   - every operand a valid 1-65535:  (last, "<last>", true) — last-wins, the
+//     Junos duplicate-stanza rule; a single valid token is the common case.
+//   - ANY operand malformed (empty, bare, non-numeric, or out-of-range):
+//     (0, "<first non-empty bad token>", true) — FAIL CLOSED. A contradictory
+//     duplicate (`mapped-port 8080 mapped-port notaport`) is rejected, not
+//     silently reduced to the one good value; raw names the offending token
+//     (or "" → the strict gate prints "(missing value)" for an empty/bare one).
+//
+// A malformed operand zeroes the port even when another occurrence is valid, so
+// the strict gate's `MappedPort < 1` branch rejects and no bogus port ever
+// reaches the dataplane; the lenient load / peer-sync path keeps MappedPort==0
+// (a plain 1:1, matching the pre-fix fail-closed behaviour).
+func combineMappedPortOperands(operands []string) (port int, raw string, present bool) {
+	if len(operands) == 0 {
+		return 0, "", false
+	}
+	present = true
+	haveBad := false
+	badRaw := ""
+	lastValidPort := 0
+	lastValidRaw := ""
+	for _, op := range operands {
+		if p, err := strconv.Atoi(op); err == nil && p >= 1 && p <= 65535 {
+			lastValidPort = p
+			lastValidRaw = op
+			continue
+		}
+		haveBad = true
+		// Prefer the first NON-EMPTY bad token for the diagnostic; an
+		// all-empty/bare set leaves badRaw=="" → the gate prints
+		// "(missing value)".
+		if badRaw == "" && op != "" {
+			badRaw = op
+		}
+	}
+	if haveBad {
+		return 0, badRaw, true
+	}
+	return lastValidPort, lastValidRaw, true
 }
 
 // staticNATRoutingInstanceFromKeys scans a collapsed static-nat `then` leaf's
@@ -308,21 +343,25 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// not a sibling `mapped-port` node. Scan pn.Keys.
 							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortFromKeys(pn.Keys)
 							// Hierarchical shape `static-nat { prefix X;
-							// mapped-port P; }` carries it as a sibling child.
-							// Consult the sibling ONLY when the collapsed keys
-							// did not carry a mapped-port (else the flat-set
-							// value wins). Record presence + the raw token even
-							// for an empty / non-numeric sibling value so the
-							// strict gate rejects it instead of the value
+							// mapped-port P; }` carries the modifier as a
+							// sibling child. Consult siblings ONLY when the
+							// collapsed keys did not carry a mapped-port (else
+							// the flat-set value wins). Scan ALL sibling
+							// `mapped-port` nodes (not just FindChild's first)
+							// so a contradictory duplicate fails closed through
+							// combineMappedPortOperands, and record presence +
+							// the raw token even for an empty / non-numeric
+							// sibling so the strict gate rejects it instead of
 							// collapsing silently to MappedPort==0.
 							if !rule.MappedPortPresent {
-								if mp := t.FindChild("mapped-port"); mp != nil {
-									rule.MappedPortPresent = true
-									raw := nodeVal(mp)
-									rule.MappedPortRaw = raw
-									if p, err := strconv.Atoi(raw); err == nil {
-										rule.MappedPort = p
+								var sibOps []string
+								for _, c := range t.Children {
+									if c.Name() == "mapped-port" {
+										sibOps = append(sibOps, nodeVal(c))
 									}
+								}
+								if len(sibOps) > 0 {
+									rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = combineMappedPortOperands(sibOps)
 								}
 							}
 						} else if t.FindChild("inet") != nil || (len(t.Keys) >= 2 && t.Keys[1] == "inet") {

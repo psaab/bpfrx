@@ -3547,8 +3547,22 @@ reserved for whole-dataplane selection where a rewrite shim
     `mapped-port` (#2769) — is rejected. The port-match-without-
     mapped-port form is a port-scoped 1:1 (no port translation); rejecting
     it at strict commit-check forces the operator to either drop the port
-    match (a whole-address 1:1) or add a `mapped-port` (a port forward). If
-    such a rule slips through the lenient load / peer-sync path, the Rust
+    match (a whole-address 1:1) or add a `mapped-port` (a port forward).
+    Two refinements land in the #6479 fold. First, every `mapped-port`
+    occurrence is scanned across BOTH AST shapes (the collapsed-keys leaf
+    and the hierarchical `static-nat { prefix X; mapped-port P; }` sibling
+    form) via `combineMappedPortOperands`, not just the first: duplicate
+    operands are last-wins ONLY when they are all valid in-range numbers; a
+    contradictory duplicate (e.g. `mapped-port 8080 mapped-port notaport`)
+    fails closed — any malformed occurrence zeroes the port and the strict
+    gate names the bad token. Second, the port-match-without-mapped-port
+    (#2769) gate is guarded on `!MappedPortPresent` so it fires ONLY on a
+    true absence: a present-but-malformed mapped-port that also carries a
+    `match destination-port` is owned solely by the presence gate (which
+    names the token), never double-reported by the absence gate — which,
+    emitting first, would otherwise mask the accurate "not a valid port
+    number" message in strict mode and add a second warning in lenient mode.
+    If such a rule slips through the lenient load / peer-sync path, the Rust
     dataplane backstop (`static_nat.rs from_snapshots`) keys the reverse
     SNAT on `(internal_ip, Some(match_dst_port))` rather than
     `(internal_ip, None)`, keeping the source translation scoped to the one

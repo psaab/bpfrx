@@ -175,6 +175,14 @@ func TestStaticNATMappedPortPresenceGate(t *testing.T) {
 			"set security nat static rule-set rs1 rule r1 then static-nat mapped-port " + val,
 		}
 	}
+	// siblingBare is the sibling shape with a BARE `mapped-port` (no operand at
+	// all) — a distinct set-line shape from sibling(`""`)'s empty quoted operand.
+	siblingBare := func() []string {
+		return []string{
+			"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.5/32",
+			"set security nat static rule-set rs1 rule r1 then static-nat mapped-port",
+		}
+	}
 
 	cases := []struct {
 		name        string
@@ -188,14 +196,30 @@ func TestStaticNATMappedPortPresenceGate(t *testing.T) {
 		{"flatEmpty", flat(`mapped-port ""`), true, "(missing value)", true},
 		{"flatBare", flat("mapped-port"), true, "(missing value)", true},
 		{"flatNonNumeric", flat("mapped-port notaport"), true, `"notaport"`, true},
-		// Numeric but out of range — carries a match-port so only the range gate
-		// fires. MappedPort parses to 70000 (not zeroed), so wantMapZero=false.
-		{"flatOutOfRange", flatMatch("mapped-port 70000"), true, `"70000"`, false},
-		// Hierarchical sibling malformed — the FindChild("mapped-port") path.
+		// Numeric but out of range — carries a match-port so the mapped-port-
+		// without-match-port gate stays quiet. #6479 fold: out-of-range is now
+		// folded to malformed, so MappedPort is zeroed (fail-closed) → wantMapZero.
+		{"flatOutOfRange", flatMatch("mapped-port 70000"), true, `"70000"`, true},
+		// Hierarchical sibling malformed — the sibling scan path.
 		{"siblingNonNumeric", sibling("notaport"), true, `"notaport"`, true},
 		{"siblingZero", sibling("0"), true, `"0"`, true},
+		// #6479 fold NIT 2 (sibling coverage Codex noted was missing): the
+		// empty / bare / out-of-range sibling shapes all fail closed too.
+		{"siblingEmpty", sibling(`""`), true, "(missing value)", true},
+		{"siblingBare", siblingBare(), true, "(missing value)", true},
+		{"siblingOutOfRange", sibling("70000"), true, `"70000"`, true},
+		// #6479 fold NIT 2 (scan-all, not first-wins): a contradictory flat
+		// duplicate fails closed — a malformed occurrence ANYWHERE zeroes the
+		// port and names the bad token, never silently reduced to the good one.
+		{"dupValidThenBad", flat("mapped-port 8080 mapped-port notaport"), true, `"notaport"`, true},
+		{"dupBadThenValid", flat("mapped-port notaport mapped-port 8080"), true, `"notaport"`, true},
+		{"dupValidThenBare", flat("mapped-port 8080 mapped-port"), true, "(missing value)", true},
+		{"dupValidThenOutOfRange", flat("mapped-port 8080 mapped-port 70000"), true, `"70000"`, true},
 		// Accepted: a valid in-range port WITH a matching match destination-port.
 		{"validWithMatchPort", flatMatch("mapped-port 8080"), false, "", false},
+		// Accepted: a duplicate where BOTH operands are valid — last-wins (9090)
+		// with a matching match destination-port (#6479 fold).
+		{"dupBothValid", flatMatch("mapped-port 8080 mapped-port 9090"), false, "", false},
 		// Accepted: no mapped-port keyword at all (plain host 1:1).
 		{"absent", []string{"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.5/32"}, false, "", false},
 	}
@@ -244,5 +268,70 @@ func TestStaticNATMappedPortPresenceGate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestStaticNATMappedPortDoubleWarnGate is the #6479 fold NIT 1: a PRESENT-but-
+// malformed `mapped-port` that lands at MappedPort==0 (`mapped-port 0`) PAIRED
+// WITH a `match destination-port` must be owned SOLELY by the presence gate
+// (which names the offending token), NOT double-reported by the #2769
+// match-port-without-mapped-port inverse gate. Before the fold both gates fired
+// on MappedPort==0: two warnings on the lenient path, and — because the #2769
+// gate emits FIRST — the misleading "requires a matching `then static-nat
+// mapped-port`" message won over the accurate "not a valid port number" one in
+// strict mode. The fold guards the #2769 gate on !MappedPortPresent so it fires
+// only on a TRUE absence.
+//
+// Fail-on-revert: drop `&& !rule.MappedPortPresent` from the #2769 gate →
+// strict names the wrong (requires-mapped-port) message and the lenient path
+// emits two mapped-port warnings → the message/count assertions go RED.
+func TestStaticNATMappedPortDoubleWarnGate(t *testing.T) {
+	// Present-but-malformed (`mapped-port 0`) WITH a matching match-port.
+	malformedWithMatch := []string{
+		"set security nat static rule-set rs1 rule r1 match destination-port 8080",
+		"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.5/32 mapped-port 0",
+	}
+	// Strict: the accurate malformed-token message wins; the misleading #2769
+	// "requires a matching" message must NOT appear.
+	_, err := CompileConfig(buildMappedPortTree(t, malformedWithMatch))
+	if err == nil {
+		t.Fatalf("strict CompileConfig must reject a malformed mapped-port paired with a match-port")
+	}
+	if !strings.Contains(err.Error(), "not a valid port number") {
+		t.Fatalf("strict error must be the malformed-token message, got %v", err)
+	}
+	if !strings.Contains(err.Error(), `"0"`) {
+		t.Fatalf(`strict error must name the malformed token "0", got %v`, err)
+	}
+	if strings.Contains(err.Error(), "requires a matching") {
+		t.Fatalf("strict error must NOT double-fire the #2769 requires-mapped-port gate, got %v", err)
+	}
+	// Lenient: EXACTLY ONE mapped-port warning (the presence gate), not two.
+	cfg, errL := CompileConfigLenient(buildMappedPortTree(t, malformedWithMatch))
+	if errL != nil {
+		t.Fatalf("lenient compile must not hard-error, got %v", errL)
+	}
+	var n int
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "mapped-port") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("lenient path must emit exactly ONE mapped-port warning, got %d: %v", n, cfg.Warnings)
+	}
+
+	// The genuine ABSENCE case (match-port with NO mapped-port at all) must
+	// STILL be rejected by the #2769 inverse gate (MappedPortPresent==false).
+	absent := []string{
+		"set security nat static rule-set rs1 rule r1 match destination-port 8080",
+		"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.5/32",
+	}
+	_, errA := CompileConfig(buildMappedPortTree(t, absent))
+	if errA == nil {
+		t.Fatalf("strict CompileConfig must still reject a match-port with no mapped-port")
+	}
+	if !strings.Contains(errA.Error(), "requires a matching") {
+		t.Fatalf("true-absence must be rejected by the #2769 requires-mapped-port gate, got %v", errA)
 	}
 }
