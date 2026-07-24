@@ -1,8 +1,8 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v11 — r10 findings folded (Codex NEEDS-REVISION
-  3M/4m; AGY PLAN-READY-WITH-NITS 0M/3m; Claude SMR NEEDS-REVISION
-  2M/4m); pending convergence review r11
+- **Status**: DRAFT v12 — r11 findings folded (Codex NEEDS-REVISION
+  2M/2m, M3 adjudication ACCEPTED; AGY PLAN-READY; Claude SMR
+  PLAN-READY conditional); pending convergence review r12
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -128,6 +128,45 @@
   semantics — rejected, with a `loadAndBootstrapConfig` regression
   asserting no-hybrid + import parity). Docs sweep gains
   `pkg/configstore/db.go:161-168` (Codex m4).
+  v12: r11 convergence — two more binding-layer defects folded (both
+  verified pre-existing on master, both bypassing work item H):
+  (a) RESOLUTION TOMBSTONE (Codex M1, verified: confirm paths —
+  `ConfirmPendingOnDemotion` `store_commit.go:777-792` et al — confirm
+  WITHOUT changing active content, so a lingering record's GuardedHash
+  still matches after a failed durable removal; the retry-debt comment
+  itself documents the window, `:596-608` "a restart before the
+  background retry heals could resurrect a stale rollback"; recovery
+  then re-arms an ALREADY-CONFIRMED window on master today — and H
+  would revert it at Load, recreating the #4378 standby divergence).
+  Resolution paths now write a `Resolved: true` TOMBSTONE into
+  confirm.json BEFORE deletion (retry debt re-drives
+  tombstone→removal); recovery treats a Resolved record exactly like
+  the stale-drop (remove + return; no re-arm, no H). A crash between
+  arm and tombstone-write is genuinely pending (re-arm — correct); a
+  crash after the tombstone is resolved (drop — correct). Closes the
+  master's re-arm-after-confirmed residual for ALL record classes, not
+  just H's.
+  (b) CANONICAL BINDING BASIS (Codex M2, verified: `hasControlChars`
+  rejects only C0/DEL — invalid UTF-8 passes commit validation,
+  `freetext.go:57-65`; the lexer preserves quoted bytes verbatim,
+  `lexer.go:296+`; `json.MarshalIndent` normalizes invalid UTF-8 to
+  U+FFFD, so the arm-time hash of the RAW promoted tree diverges from
+  ANY decoded-tree hash — even the v11 pre-migration capture —
+  stale-dropping a LIVE record on restart). The binding is re-derived
+  as `canonicalConfigHash(tree) = sha256(Format(jsonRoundTrip(tree)))`
+  at BOTH the arm sites (`store_commit.go:543-549`, SyncApply
+  `:407-437`) and the recovery capture: the round-trip normalizes at
+  arm exactly as the Load decode does. Terminology corrected (Codex
+  m1): "canonical (round-tripped) decoded-tree `Format()` basis", not
+  "on-disk bytes" (encryption randomizes file bytes regardless,
+  `db.go:435-450`, `crypto.go:262-298`). Regression viii strengthened
+  (Codex m2): arm through the PRODUCTION `CommitConfirmed` path and
+  verify the persisted record against a freshly decoded
+  `ReadActiveMeta` tree — hand-constructed files stay blind to
+  serialization divergence. The tombstone record-schema change rides
+  the existing envelope versioning (`wrapEnvelope`, `db.go:443-450`);
+  the /engineer pass decides the writer-version bump (pre-floor
+  readers fail closed by design).
 
 ---
 
@@ -650,33 +689,92 @@ real trigger ("confirm-confirmed recovery: FirstCommit+cluster record
 resolved by Load-time revert; remaining window abandoned (#2114)") rather
 than a false expired-during-downtime entry.
 
-**GuardedHash binding: capture the pre-migration hash (r10 Codex M2 —
-verified PRE-EXISTING #5835 gap, in scope because H depends on the same
-binding).** Load mutates the on-disk tree BEFORE recovery:
-`rewriteRetiredDataplaneType` (`store_persist.go:65`) drops retired
-`dataplane-type` leaves WITHOUT an Inactive check
-(`isRetiredDataplaneLeaf`, `dataplane_retire.go:215-224`), and
-`SanitizeTreeControlChars` scrubs values in place (:75-82). Recovery then
-compares `rec.GuardedHash` against `journalConfigHash(s.active)` computed
-over the MUTATED tree (:159), while the commit persisted the hash of the
-RAW promoted tree (`store_commit.go:543-549`). A current-build
-commit-confirmed whose candidate carries `inactive: system
-dataplane-type ebpf` commits cleanly (the compiler prunes inactive
-subtrees BEFORE validation, `config/compiler.go:2257-2268`), but the
-reboot-time rewrite deletes that leaf, the hashes diverge, and the record
-is dropped as STALE — the unconfirmed config silently stands. That is a
-master #4577 violation TODAY for every record class, and in the r8
-recurrence state it additionally bypasses this guard. Fix (same commit as
-H): `Store.Load` computes `journalConfigHash(tree)` over the ON-DISK tree
-BEFORE any migration (`:65`, `:75`) and recovery binds `GuardedHash`
-against that pre-migration hash (threaded as a parameter, not recomputed
-from `s.active`). The migrated tree still drives compilation and the
-guard's `s.compiled` predicate — only the BINDING basis changes. The
-alternative (make the retire rewrite skip inactive leaves) is rejected:
-it changes migration behavior for no additional safety, and the sanitize
-pass would remain a divergence source. Regression: an unexpired
-FirstCommit+cluster record whose active config carries an inactive
-retired leaf → guard FIRES (not stale-drop).
+**GuardedHash binding: canonical (round-tripped) basis (r10 Codex M2 +
+r11 Codex M2 — verified PRE-EXISTING #5835 gaps, in scope because H
+depends on the same binding).** TWO independent divergences between the
+arm-time and recovery-time hash bases exist on master:
+
+1. **Load migrations (r10)**: Load mutates the on-disk tree BEFORE
+   recovery — `rewriteRetiredDataplaneType` (`store_persist.go:65`)
+   drops retired `dataplane-type` leaves WITHOUT an Inactive check
+   (`isRetiredDataplaneLeaf`, `dataplane_retire.go:215-224`), and
+   `SanitizeTreeControlChars` scrubs values in place (:75-82). Recovery
+   then compares `rec.GuardedHash` against `journalConfigHash(s.active)`
+   computed over the MUTATED tree (:159), while the commit persisted the
+   hash of the RAW promoted tree (`store_commit.go:543-549`). A
+   current-build candidate carrying `inactive: system dataplane-type
+   ebpf` commits cleanly (the compiler prunes inactive subtrees BEFORE
+   validation, `config/compiler.go:2257-2268`), the reboot-time rewrite
+   deletes the leaf, the hashes diverge, and the record is dropped as
+   STALE — the unconfirmed config silently stands.
+2. **Invalid UTF-8 normalization (r11)**: `hasControlChars` rejects only
+   C0/DEL (`freetext.go:57-65`); the lexer preserves quoted bytes
+   verbatim (`lexer.go:296+`); and `json.MarshalIndent` — the DB
+   persistence format (`db.go:435-457`) — normalizes INVALID UTF-8 to
+   U+FFFD. A free scalar (e.g. interface `description`) carrying a raw
+   `0xff` byte commits fine, persists normalized, and the arm-time hash
+   over the RAW promoted tree diverges from ANY decoded-tree hash —
+   including the r10 pre-migration capture — stale-dropping a LIVE
+   record on restart.
+
+Both are master #4577 violations TODAY for every record class, and in
+the r8 recurrence state both bypass this guard. Fix (same commit as H):
+bind via the CANONICAL representation at BOTH ends —
+`canonicalConfigHash(tree) = sha256(Format(jsonRoundTrip(tree)))` —
+computed at the arm sites (`store_commit.go:543-549` + the SyncApply
+arm, `:407-437`) and at the recovery capture (Load, over the decoded
+tree BEFORE migrations at `:65`/`:75`, threaded as a parameter — the
+decode itself is the first round-trip leg, so the recovery basis is
+already canonical). The arm-side round-trip normalizes invalid UTF-8
+exactly as the Load decode does; the pre-migration capture removes the
+migration divergence. The migrated tree still drives compilation and
+the guard's `s.compiled` predicate — only the BINDING basis changes.
+Terminology (r11 Codex m1): the basis is the "canonical (round-tripped)
+decoded-tree `Format()`" — NOT "on-disk bytes" (the envelope + optional
+AES-GCM encryption randomizes file bytes regardless, `db.go:443-450`,
+`crypto.go:262-298`). The alternative (reject invalid UTF-8 at commit
+validation) is rejected: a new commit-rejection class is a behavior
+change beyond this PR's scope, and the sanitize/retire migrations would
+remain divergent. Regressions: (viii-strong, r11 Codex m2) arm through
+the PRODUCTION `CommitConfirmed` path with a candidate carrying an
+inactive retired leaf AND an invalid-UTF-8 description → verify the
+persisted record's GuardedHash against a freshly decoded
+`ReadActiveMeta` tree, then restart → recovery binds (NO stale-drop)
+and the guard fires on its own predicate; hand-constructed fixture
+files are forbidden for this regression (they stay blind to
+serialization divergence).
+
+**Work item H2 — resolution tombstone (r11 Codex M1 — verified
+PRE-EXISTING, in scope because H's correctness depends on resolution
+identity).** Every confirm path resolves a pending window by DELETING
+confirm.json (`resolveConfirmRemovalLocked`, `store_commit.go:575-590`)
+without changing active content — so after a failed durable removal
+(retry debt retained, `:596-608`, which itself documents "a restart
+before the background retry heals could resurrect a stale rollback"),
+the lingering record's GuardedHash STILL MATCHES the active tree:
+recovery cannot distinguish "window pending" from "window RESOLVED but
+deletion failed". On master TODAY, recovery re-arms such a record and
+the timer later rolls back an ALREADY-CONFIRMED config
+(`ConfirmPendingOnDemotion`, `:777-792`, exists precisely to prevent
+the #4378 standby divergence — a crash in the retry window reopens it).
+For FirstCommit+cluster records, work item H would instead revert the
+confirmed config AT LOAD — immediate divergence. Fix (configstore,
+~40 LoC + tests): the resolution paths write a `Resolved: true`
+TOMBSTONE into confirm.json BEFORE attempting deletion (one extra
+durable write per resolution — rare, bounded); the retry loop re-drives
+tombstone→removal; recovery checks `rec.Resolved` FIRST and treats a
+tombstoned record exactly like the stale-drop (remove + return — no
+re-arm, no H, no rollback). Crash between arm and tombstone = genuinely
+pending (re-arm — correct); crash after tombstone = resolved (drop —
+correct). The record-schema change rides the existing envelope
+versioning (`wrapEnvelope`, `db.go:443-450`); the /engineer pass
+decides the writer-version bump (pre-floor readers fail closed by
+design). Regression: demotion-confirm + injected deletion failure +
+restart → recovery drops the tombstoned record (no re-arm, no H, no
+rollback of the confirmed config; the #4378
+`commit_confirm_demote_4378_test.go:5-17,50-72` divergence stays
+closed). This closes the master's re-arm-after-confirmed residual for
+ALL record classes, not just H's.
 
 **bootstrapFromFile interaction — DOCUMENTED CONSISTENCY, suppression
 rejected (r10 Codex M3, adjudicated).** After the guard's revert,
@@ -726,11 +824,14 @@ regeneration chain at the next boot; (vi) COMPILED-topology positive
 compiler, `config/compiler.go:2257-2268`) → compiled
 `Chassis.Cluster == nil` → guard does NOT fire, normal re-arm — a
 raw-scan implementation false-positives on both directions and fails
-these; (viii) HASH-BINDING regression (r10): inactive retired leaf in
-the active config → pre-migration binding holds, guard fires (see the
-GuardedHash paragraph); (ix) bootstrapFromFile parity regression (r10):
-no hybrid, import identical to the expired path (see the
-bootstrapFromFile paragraph). The BROADER cluster-runtime
+these; (viii) CANONICAL-BINDING regression (r10/r11): production-armed
+record with an inactive retired leaf AND an invalid-UTF-8 description →
+binding holds across restart, guard fires (see the GuardedHash
+paragraph); (ix) bootstrapFromFile parity regression (r10): no hybrid,
+import identical to the expired path (see the bootstrapFromFile
+paragraph); (x) RESOLUTION-TOMBSTONE regression (r11): demotion-confirm
++ deletion failure + restart → tombstoned record dropped, no re-arm, no
+H (see work item H2). The BROADER cluster-runtime
 lifecycle question (should `enterBootstrapMode` stop cluster comms when
 `d.cluster != nil`) stays a follow-up issue.
 
@@ -855,7 +956,12 @@ coexistence) is deleted as incoherent (r1 B3).
   drain.
 - `pkg/configstore/store_persist.go` (r8 correction — work item H DOES
   touch configstore): the permanent FirstCommit+cluster recovery guard +
-  the factored expired-branch FirstCommit revert helper.
+  the factored expired-branch FirstCommit revert helper + the canonical
+  binding capture at Load.
+- `pkg/configstore/store_commit.go` + `db.go` (r11): the
+  `canonicalConfigHash` binding at the arm sites; the `Resolved`
+  tombstone field on `confirmRecord`, the tombstone-write in the
+  resolution paths, and the retry loop's tombstone→removal re-drive.
 - `pkg/fwdstatus/sampler.go`: `CachedStatusProvider` interface; `NewSampler`
   + `Sampler.dp` retyped; `sample()` direct call.
 - `pkg/dataplane/retirement_boundary_canary_test.go`: matcher extension
@@ -997,15 +1103,19 @@ classification snapshot.
   (the /engineer pass greps `docs/` for `d\.dp` and updates or justifies
   each hit).
 - Recovery-contract docs for work item H's third outcome (r9 Codex m2,
-  r10 Codex m4): the "Two outcomes" comment at `store_persist.go:127-135`
-  (expired → revert, future → re-arm) gains the third outcome (unexpired
-  FirstCommit+cluster → revert-at-Load, remaining window abandoned), and
-  the matching contract prose at `pkg/configstore/README.md:417-449` and
-  the `confirmRecord` doc at `pkg/configstore/db.go:161-168` ("Store.Load
-  re-arms the timer when the deadline is still in the future") are
-  updated in the same commit. The pre-migration hash-binding fix (r10)
-  also updates the #5835 binding comment at `store_commit.go:543-548` to
-  name the on-disk-bytes basis.
+  r10 Codex m4, r11): the "Two outcomes" comment at
+  `store_persist.go:127-135` (expired → revert, future → re-arm) gains
+  the third outcome (unexpired FirstCommit+cluster → revert-at-Load,
+  remaining window abandoned), and the matching contract prose at
+  `pkg/configstore/README.md:417-449` and the `confirmRecord` doc at
+  `pkg/configstore/db.go:161-168` ("Store.Load re-arms the timer when
+  the deadline is still in the future") are updated in the same commit.
+  The canonical-binding fix (r10/r11) updates the #5835 binding comment
+  at `store_commit.go:543-548` to name the canonical basis, and the
+  tombstone (r11) updates the `confirmRecord` struct doc
+  (`db.go:161-168`) and the `resolveConfirmRemovalLocked` /
+  `noteConfirmRemoveFailureLocked` comments (`store_commit.go:575-608`)
+  for the tombstone→removal retry semantics.
 - `_Log.md` entries for every implementation edit (CLAUDE.md).
 
 ## 6. Public API preservation
@@ -1085,13 +1195,18 @@ Preserved exactly:
     apply — out of scope. The abandoned timer's persisted record
     re-resolves on the next boot's expired-window path (same semantics as
     the startup-failure abandon).
-12. **#4577 confirm contract (r8)**: an unconfirmed config must NEVER
-    stand. Work item H's revert-at-Load honors it for the
+12. **#4577 confirm contract (r8/r10/r11)**: an unconfirmed config must
+    NEVER stand, and a CONFIRMED config must never be rolled back. Work
+    item H's revert-at-Load honors the first half for the
     FirstCommit+cluster class by resolving the window EARLY (revert
     before manager construction) rather than by keeping the config; the
     operator's remaining confirm window is sacrificed for this narrow
     hybrid-generating class, loudly and on purpose. Expired records keep
-    the existing expired-branch behavior bit-for-bit.
+    the existing expired-branch behavior bit-for-bit. The second half is
+    enforced by the canonical binding (no live record is stale-dropped
+    over a serialization divergence) AND the resolution tombstone (no
+    resolved record is re-armed or reverted — a confirm is durable
+    identity, not content equality).
 
 ## 8. Risk assessment
 
@@ -1242,16 +1357,25 @@ Preserved exactly:
      stanza arrives ONLY via `apply-groups` → guard FIRES; (vii)
      COMPILED-topology negative: raw tree carries
      `inactive: chassis cluster` → guard does NOT fire, normal re-arm;
-     (viii) HASH-BINDING regression (r10 Codex M2): unexpired
-     FirstCommit+cluster record whose active config carries
-     `inactive: system dataplane-type ebpf` → the pre-migration hash
-     binding MATCHES (no stale-drop) and the guard FIRES — a
-     `s.active`-recomputed binding misclassifies as stale and fails;
+     (viii) CANONICAL-BINDING regression (r10, strengthened r11 Codex
+     m2): arm through the PRODUCTION `CommitConfirmed` path with a
+     candidate carrying `inactive: system dataplane-type ebpf` AND an
+     invalid-UTF-8 interface description → verify the persisted record's
+     GuardedHash equals the canonical hash of a freshly decoded
+     `ReadActiveMeta` tree → restart → recovery BINDS (no stale-drop)
+     and the guard fires on its own predicate — hand-constructed fixture
+     files forbidden (they stay blind to serialization divergence);
      (ix) bootstrapFromFile parity regression (r10 Codex M3
      adjudication): post-guard boot never enters the
      bootstrap-with-live-cluster hybrid, and the seed-file import
      behavior is identical to the expired-window path (same
-     `shouldBootstrapFromFile` decision, distinct journal trail).
+     `shouldBootstrapFromFile` decision, distinct journal trail);
+     (x) RESOLUTION-TOMBSTONE regression (r11 Codex M1): demotion-confirm
+     + injected confirm.json deletion failure + restart → recovery drops
+     the TOMBSTONED record (no re-arm, no H, no rollback of the
+     confirmed config — the #4378 divergence stays closed); a second leg
+     crashes BETWEEN arm and tombstone → genuinely pending → normal
+     re-arm.
 3. Update `daemon_natpoolalarm_race_test.go` (`writeDPFor` →
    `setDataplane`) and `daemon_forwarding_status_test.go` (rewrite against
    the narrowed adapter: `ProjectsMapStats`/`UsesUserspaceStatusAdapter`
@@ -1302,7 +1426,7 @@ Preserved exactly:
   past the next boot; the lifecycle redesign is a pre-existing policy
   question, not a `d.dp` publication concern.
 
-## 11. Open questions for adversarial review (r11)
+## 11. Open questions for adversarial review (r12)
 
 Resolved in v2-v9 (for the record): A2 deletion; atomic cell choice;
 sampler-only adapter — now STRUCTURAL via `CachedStatusProvider`;
@@ -1366,7 +1490,17 @@ pre-migration binding capture (closing the verified pre-existing #5835
 inactive-retired-leaf stale-drop that also bypasses H), the
 bootstrapFromFile DOCUMENTED-CONSISTENCY adjudication (import
 suppression rejected; parity regression (ix)), `db.go:161-168` into the
-docs sweep.
+docs sweep; r11 additions: the RESOLUTION TOMBSTONE (work item H2 —
+resolution paths write `Resolved: true` into confirm.json BEFORE
+deletion, recovery drops tombstoned records, closing the verified
+master re-arm-after-confirmed residual for ALL record classes and
+protecting H from reverting a confirmed config; Codex + AGY both
+ACCEPTED the M3 bootstrapFromFile adjudication), the CANONICAL binding
+basis (`canonicalConfigHash = sha256(Format(jsonRoundTrip(tree)))` at
+both arm and recovery — closing the invalid-UTF-8 divergence Codex
+proved against the v11 pre-migration capture), terminology corrected to
+"canonical decoded-tree Format() basis", regression viii strengthened
+to arm through the production commit path.
 
 Still open:
 

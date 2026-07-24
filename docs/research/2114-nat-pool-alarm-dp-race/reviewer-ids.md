@@ -29,6 +29,15 @@ reviewer (joins at /engineer on the code PR).
 | r8 | Codex | codex companion task-mryhteof-3r6csp (session 019f9292-9b88-7513-b7ff-c9ea0c3a9e46; worktree cwd) | NEEDS-REVISION (3 MAJOR, 4 MINOR) |
 | r8 | AGY | agy print-mode direct (agy-plan-r8.md; resumed from prior session) | PLAN-READY (0 MAJOR, 0 MINOR) |
 | r8 | Claude SMR | in-conversation (claude-smr-plan-r8.md) | NEEDS-REVISION (1 MAJOR, 2 MINOR) |
+| r9 | Codex | codex companion task-mryjc32b-vc6cwg (session 019f92b9-8718-7663-bfcc-f125a96b436d) | NEEDS-REVISION (3 MAJOR, 3 MINOR) |
+| r9 | AGY | agy print-mode direct (agy-plan-r9.md) | PLAN-READY (soft pass — cited unimplemented plan items) |
+| r9 | Claude SMR | in-conversation (claude-smr-plan-r9.md) | PLAN-READY-WITH-NITS (0 MAJOR, 2 MINOR) |
+| r10 | Codex | codex companion task-mrykb2ts-9b11zc (session 019f92d2-71cc-7061-8907-47af35e317d1) | NEEDS-REVISION (3 MAJOR, 4 MINOR) |
+| r10 | AGY | agy print-mode direct (agy-plan-r10.md) | PLAN-READY-WITH-NITS (0 MAJOR, 3 MINOR) |
+| r10 | Claude SMR | in-conversation (claude-smr-plan-r10.md) | NEEDS-REVISION (2 MAJOR, 4 MINOR) |
+| r11 | Codex | codex companion task-mrylebih-92b79h (session 019f92ee-618f-7c41-bca8-87f9026d37c5) | NEEDS-REVISION (2 MAJOR, 2 MINOR; M3 adjudication ACCEPTED) |
+| r11 | AGY | agy print-mode direct (agy-plan-r11.md) | PLAN-READY (M3 adjudication ACCEPTED) |
+| r11 | Claude SMR | in-conversation (claude-smr-plan-r11.md) | PLAN-READY (conditional on M3) |
 
 ## AGY infra notes (retry log, per feedback_codex_infra_must_retry)
 
