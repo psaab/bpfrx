@@ -322,3 +322,31 @@ func resolveFilterPortTokens(in []string, term *FirewallFilterTerm) []string {
 	}
 	return out
 }
+
+// recordFilterAddrTokens records every literal firewall-filter address token
+// that is NOT a parseable IP/CIDR on term.UnknownAddresses (#6463) — the
+// deferred-reject channel mirroring term.UnknownPorts (#3205). The token is
+// kept VERBATIM in the term's address list (the caller appends the values
+// unconditionally), so the compiled term is unchanged from the pre-#6463
+// shape; the record exists so the snapshot builder can set the
+// AddressUnrepresentable wire marker on the tolerant load / peer-sync path —
+// the Rust parse_address drops such a token per-token, and a
+// PARTIALLY-malformed list would otherwise silently narrow a discard/reject
+// term to only the surviving prefixes (fail-open via fall-through to the
+// implicit accept). `any` and the empty string are NO-CONSTRAINT placeholders
+// (the matcher's addr_is_real / parse_address drop them); they are NOT
+// malformed and are not recorded — exactly the skip the strict gate
+// (validateFilterAddressLiteralsStrict) applies before classifying. The
+// classifier (classifyFilterAddrFamily) is the single source of truth shared
+// with that gate, so "recorded here" and "rejected at strict commit" can never
+// drift apart.
+func recordFilterAddrTokens(term *FirewallFilterTerm, values []string) {
+	for _, v := range values {
+		if v == "" || v == "any" {
+			continue
+		}
+		if _, ok := classifyFilterAddrFamily(v); !ok {
+			term.UnknownAddresses = append(term.UnknownAddresses, v)
+		}
+	}
+}

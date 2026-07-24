@@ -6866,3 +6866,89 @@ fn refresh_owner_rgs_skips_hainactive_hold_clock_5152() {
          HOLD clock — the legitimate promotion refresh still fires"
     );
 }
+
+// === #6457: DeleteSynced records the deleted key for flow-cache invalidation ==
+//
+// The per-worker flow cache (the stage-12 hit path in
+// `poll_descriptor/flow_cache_hit.rs`) validates only config/fib generation,
+// RG epoch/lease, and the neighbor-MAC epoch — never session existence. A
+// control-plane delete bumps none of those stamps, so without an explicit
+// eviction a revoked-but-still-active 5-tuple kept HITTING its cached
+// `RewriteDescriptor` and forwarded with no live session: the operator
+// `clear security flow session` revocation primitive, the cluster-stale
+// sweep (`BatchDeleteSessions`), and HA DeleteSynced propagation were all
+// silently defeated on the fast path (fail-open). `handle_delete_synced`
+// therefore records every deleted key into
+// `WorkerCommandResults.deleted_synced_keys`; the worker loop drains that
+// list into per-binding `flow_cache.invalidate_slot` calls (the
+// `invalidate_flow_cache_slots_for_deleted_sessions` half is pinned in
+// `afxdp/worker/loop_body/mod.rs::flow_cache_invalidation_tests`).
+// Deleting the `deleted_keys.push` turns both tests here RED.
+
+#[test]
+fn delete_synced_records_key_for_flow_cache_invalidation() {
+    let mut sessions = SessionTable::new();
+    let forwarding = test_forwarding_state();
+    let key = test_key();
+    assert!(sessions.install_with_protocol_with_origin(
+        key.clone(),
+        test_decision(),
+        test_metadata(),
+        SessionOrigin::ForwardFlow,
+        1_000_000,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+    let mut deleted_keys: Vec<SessionKey> = Vec::new();
+
+    super::commands::handle_delete_synced(
+        &mut sessions,
+        -1,
+        &forwarding,
+        key.clone(),
+        2_000_000,
+        &mut deleted_keys,
+    );
+
+    assert!(
+        sessions.entry_with_origin(&key).is_none(),
+        "the session itself must be dropped (pre-existing delete contract)"
+    );
+    assert_eq!(
+        deleted_keys,
+        vec![key],
+        "#6457: the deleted key must be recorded so the worker loop can \
+         invalidate its flow-cache slot — without the record the revoked \
+         tuple keeps hitting the stale cached permit (fail-open)"
+    );
+}
+
+#[test]
+fn delete_synced_records_key_even_when_session_already_absent() {
+    // The stale-slot survival shape of the bug: the table entry is already
+    // gone (an earlier delete, or a GC reap observed on this worker) while
+    // the cached descriptor lives on. Gating the record on the table lookup
+    // would leave that stale permit in place, so the record is
+    // unconditional — the `delete_live_session_key` arm must record too.
+    let mut sessions = SessionTable::new();
+    let forwarding = test_forwarding_state();
+    let key = test_key();
+    let mut deleted_keys: Vec<SessionKey> = Vec::new();
+
+    super::commands::handle_delete_synced(
+        &mut sessions,
+        -1,
+        &forwarding,
+        key.clone(),
+        2_000_000,
+        &mut deleted_keys,
+    );
+
+    assert_eq!(
+        deleted_keys,
+        vec![key],
+        "#6457: the record must fire even with no table entry — a stale \
+         flow-cache slot outlives its table entry (that survival is the \
+         bug), so the invalidate must not gate on the lookup"
+    );
+}
