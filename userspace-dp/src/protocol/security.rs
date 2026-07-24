@@ -306,6 +306,35 @@ pub(crate) struct FirewallTermSnapshot {
     // keeps wire parity with an older control plane that omits the field (#1961).
     #[serde(rename = "dscp_match_unrepresentable", default)]
     pub dscp_match_unrepresentable: bool,
+    // ports_unrepresentable (#6459) is set by the Go control plane when the
+    // term carried a `from {source,destination}-port[-except]` token it could
+    // not resolve to a number (an unknown service name, a malformed range, or
+    // a non-canonical token such as "+80"; recorded on term.UnknownPorts). The
+    // token is kept VERBATIM in the wire port lists, and the pre-fix filter
+    // compiler dropped it PER-TOKEN (`filter_map(parse_port_spec)`): a
+    // PARTIALLY-unresolvable list then built a matcher over only the surviving
+    // subset — a `then discard`/`reject` term silently enforced a NARROWER
+    // port set than the operator wrote (fail-OPEN via fall-through to the
+    // implicit accept). With this flag the filter compiler raises
+    // SnapshotIntegrityError::UnrepresentableFilterPorts and rejects the whole
+    // snapshot. serde(default) keeps wire parity with an older control plane
+    // that omits the field (#1961).
+    #[serde(rename = "ports_unrepresentable", default)]
+    pub ports_unrepresentable: bool,
+    // address_unrepresentable (#6463) is set by the Go control plane when the
+    // term carried a literal `from source-address` / `destination-address`
+    // token that is not a parseable IP/CIDR (classifyFilterAddrFamily rejects
+    // it; recorded on term.UnknownAddresses). The pre-fix `parse_address`
+    // dropped such a token PER-TOKEN (its `Err(_)` arm pushed nothing): a
+    // PARTIALLY-malformed list then matched only the surviving prefixes — a
+    // `then discard`/`reject` term silently enforced a NARROWER address set
+    // than the operator wrote (fail-OPEN via fall-through to the implicit
+    // accept). With this flag the filter compiler raises
+    // SnapshotIntegrityError::UnrepresentableFilterAddress and rejects the
+    // whole snapshot. serde(default) keeps wire parity with an older control
+    // plane that omits the field (#1961).
+    #[serde(rename = "address_unrepresentable", default)]
+    pub address_unrepresentable: bool,
     // flex_match is the Junos `from flexible-match-range` byte-offset match
     // (#3077). It was parsed + compiled for the retired legacy dataplane but
     // dropped on the userspace wire, so the byte-offset constraint vanished and
