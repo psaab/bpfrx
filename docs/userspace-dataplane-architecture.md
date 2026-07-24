@@ -1333,7 +1333,20 @@ a dangling policy->zone reference the Rust `UnresolvableZoneReference` preflight
 rejects wholesale. Because the ip-monitoring actuator updates FRR *before* the
 publish, that reject would strand the kernel/FRR on the new routes while userspace
 kept the old FIB, unable to converge; the shared scrub keeps both paths in
-lockstep so neither can drift.
+lockstep so neither can drift. The shared core additionally **refuses the
+republish outright when the passed `cfg` content-differs from the inherited
+`m.lastSnapshot.Config`** (#6480), mirroring the route-overlay path's
+`routeOnlyPublishHybrid` skew guard (#5680). This closes a fold-introduced
+fail-open: during a config-skew window the daemon can reconcile the scheduler to
+the newly promoted config B (the store promotes B before applying, and the apply
+path continues on a transient dataplane error) while the OLD snapshot A is still
+live. Rebuilding + scrubbing the policies against B's quarantine set while
+inheriting A's `next.Zones` can drop a policy whose zone is still a live member of
+A's zones — a snapshot the preflight *accepts* but whose missing rule lets traffic
+fall through to the inherited default policy (a full Compile of B would instead
+drop the quarantined zone and stay fail-closed). Refusing on skew retains the
+prior snapshot and reconverges once B's full apply lands
+(`m.lastSnapshot.Config == cfg`), under the existing #3780 retry semantics.
 #1377 now preserves unusable pool-mode source-NAT rules in the snapshot and
 fails closed at the `poll_descriptor.rs` source-NAT call sites for missing
 pools, empty pools, invalid pool inputs, wrong-family-only pools, or allocator

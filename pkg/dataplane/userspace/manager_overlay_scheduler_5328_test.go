@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -507,5 +508,172 @@ func TestPublishRouteOverlaySnapshotReadsFreshSchedulerStateNotStale5328(t *test
 		t.Fatal("published permit still INACTIVE after a fresh OPEN-window publish: the " +
 			"route-overlay rebuild read a STALE scheduler state instead of the freshly-passed " +
 			"{workhours:true} (#5328 A6-b2-F4 / #6480)")
+	}
+}
+
+// skewCfgA6480 builds config A: zones {trust, z214} with NO StableZoneID
+// collision (z214 alone folds to nothing else here), so a FULL build keeps z214
+// a live zone and keeps the scheduled trust->z214 DENY. This is the applied /
+// inherited config a scheduler republish copies its Zones/Interfaces from.
+func skewCfgA6480(t *testing.T) *config.Config {
+	t.Helper()
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust"},
+		"z214":  {Name: "z214"},
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{
+		{FromZone: "trust", ToZone: "z214", Policies: []*config.Policy{{
+			Name:          "trust-z214-deny",
+			SchedulerName: "workhours",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{"any"},
+			},
+			Action: config.PolicyDeny,
+		}}},
+	}
+	cfg.Schedulers = map[string]*config.SchedulerConfig{"workhours": {Name: "workhours"}}
+	return cfg
+}
+
+// skewCfgB6480 builds config B: config A PLUS the colliding zone z174. Under B,
+// z174/z214 fold to the SAME StableZoneID and the later-sorting z214 is
+// quarantined, so B's quarantine set is {z214} while A's is empty. B carries the
+// same scheduled trust->z214 deny; a full Compile of B would drop z214 from Zones
+// AND drop the deny (fail-closed). B content-differs from A only by the added
+// zone, so relative to a snapshot built from A it is a genuine config-generation
+// skew.
+func skewCfgB6480(t *testing.T) *config.Config {
+	t.Helper()
+	if config.StableZoneID("z174") != config.StableZoneID("z214") {
+		t.Fatalf("test premise broken: z174/z214 no longer collide under the frozen fold")
+	}
+	cfg := skewCfgA6480(t)
+	cfg.Security.Zones["z174"] = &config.ZoneConfig{Name: "z174"}
+	return cfg
+}
+
+// TestUpdatePolicyScheduleStateRefusesConfigSkew6480 pins the fold-introduced
+// fail-open the #6480 round-2 fix opened on the scheduler-only republish path and
+// this fold closes. rebuildScheduledPolicySectionsLocked rebuilds+scrubs policies
+// against the PASSED cfg while inheriting next.Zones/next.Interfaces from
+// m.lastSnapshot. During a config-skew window the daemon reconciles the scheduler
+// to store.ActiveConfig() (the NEWLY promoted config B) while a transient apply
+// failure left the OLD snapshot (config A) live: the store promotes B before
+// applying (store_commit.go), and daemon_apply_dataplane.go continues on a
+// dataplane apply error yet still reconciles the scheduler to B.
+//
+// A has zones {trust, z214} (no collision) with a live scheduled trust->z214
+// DENY; B adds colliding z174 so B's quarantine set is {z214}. WITHOUT the guard
+// the scheduler tick copies A's Zones {trust, z214} but scrubs the rebuilt
+// policies with B's {z214} quarantine, DROPPING the trust->z214 deny while z214
+// stays a live zone in next.Zones — the Rust preflight accepts the snapshot and
+// traffic to z214 falls through to the inherited default PERMIT (fail-OPEN). A
+// full Compile of B would instead drop z214 from Zones + unzone its iface
+// (fail-closed). The route-overlay path already refuses this skew
+// (routeOnlyPublishHybrid, #5680); this fold mirrors that refusal inside the
+// shared rebuildScheduledPolicySectionsLocked so BOTH partial-republish paths are
+// safe.
+//
+// FAIL-ON-REVERT (clean assertion): removing the routeOnlyPublishHybrid skew
+// guard from rebuildScheduledPolicySectionsLocked lets the skew republish SUCCEED
+// — UpdatePolicyScheduleState returns nil, bumps m.generation to 6, and advances
+// m.lastSnapshot.Config to cfgB while shipping the fail-open snapshot — so the
+// phase-(a) err / generation / lastSnapshot assertions go RED. The same-config
+// phase (b) proves the guard does not over-refuse the common (pointer-identical)
+// path and still refreshes scheduler bits.
+func TestUpdatePolicyScheduleStateRefusesConfigSkew6480(t *testing.T) {
+	stubRuleListHermetic(t)
+	dir, err := os.MkdirTemp("", "x6480skew")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	controlSock := filepath.Join(dir, "control.sock")
+
+	cfgA := skewCfgA6480(t)
+	cfgB := skewCfgB6480(t)
+
+	m := New()
+	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+	m.cfg.ControlSocket = controlSock
+	m.generation = 5
+	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
+
+	// Seed lastSnapshot from config A with the window OPEN: A has no collision, so
+	// z214 is a live zone and the trust->z214 deny is present + ACTIVE. The builder
+	// stamps snapshot.Config = cfgA (pointer), which the same-config phase relies on.
+	m.lastSnapshot, err = buildSnapshotWithSchedulerState(
+		cfgA, config.UserspaceConfig{ControlSocket: controlSock}, 5, 0,
+		map[string]bool{"workhours": true}, nil, nil)
+	if err != nil {
+		t.Fatalf("build lastSnapshot: %v", err)
+	}
+	if m.lastSnapshot.Config != cfgA {
+		t.Fatal("precondition: seeded snapshot must carry cfgA by pointer")
+	}
+	assertNoDanglingZoneRef5328(t, m.lastSnapshot)
+	if !schedPolicyPresent5328(m.lastSnapshot.Policies, "trust-z214-deny") {
+		t.Fatal("precondition: config-A seed must keep the trust->z214 deny (z214 not quarantined)")
+	}
+	// z214 must be a LIVE zone in the seed — the fail-open hinges on it surviving
+	// in the inherited next.Zones while B's quarantine would drop the deny.
+	z214Live := false
+	for _, z := range m.lastSnapshot.Zones {
+		if z.Name == "z214" {
+			z214Live = true
+		}
+	}
+	if !z214Live {
+		t.Fatal("precondition: z214 must be a live zone in the config-A seed")
+	}
+
+	// Arm the control server for exactly ONE publish — the same-config phase (b).
+	// The skew phase (a) must ship NOTHING (the guard refuses before any
+	// apply_snapshot); on revert it WOULD ship the fail-open snapshot and consume
+	// this slot, but the phase-(a) assertions fail first.
+	reqs := startArmControlServer(t, controlSock, 1)
+
+	// Phase (a): SKEW — call with cfgB (quarantines z214, a zone A still has live).
+	// The guard must REFUSE and retain the prior snapshot.
+	skewErr := m.UpdatePolicyScheduleState(cfgB, map[string]bool{"workhours": false})
+	if skewErr == nil {
+		t.Fatal("UpdatePolicyScheduleState accepted a config-skew republish: the rebuilt " +
+			"policies were scrubbed with cfgB's quarantine {z214} against cfgA's inherited " +
+			"Zones (z214 live), shipping a fail-open snapshot (#6480)")
+	}
+	if !strings.Contains(skewErr.Error(), "refusing scheduled-policy republish") {
+		t.Fatalf("skew refusal error = %q, want the #6480 scheduled-policy skew guard", skewErr)
+	}
+	// Prior snapshot retained (fail-closed): generation not advanced, lastSnapshot
+	// still config A. On revert both flip (generation->6, Config->cfgB).
+	if m.generation != 5 {
+		t.Fatalf("generation advanced to %d on a refused skew republish (want 5): a fail-open "+
+			"snapshot was published (#6480)", m.generation)
+	}
+	if m.lastSnapshot == nil || m.lastSnapshot.Config != cfgA {
+		t.Fatal("refused skew republish advanced lastSnapshot past the applied config A (#6480)")
+	}
+
+	// Phase (b): SAME CONFIG — call with cfgA (pointer-identical to the applied
+	// snapshot's config), window CLOSED. The guard's pointer fast path admits it;
+	// the republish must succeed and refresh the scheduler bits.
+	if err := m.UpdatePolicyScheduleState(cfgA, map[string]bool{"workhours": false}); err != nil {
+		t.Fatalf("same-config scheduler republish was wrongly refused: %v", err)
+	}
+	req := <-reqs
+	if req.Snapshot == nil {
+		t.Fatal("same-config republish shipped no snapshot")
+	}
+	assertNoDanglingZoneRef5328(t, req.Snapshot)
+	if !schedPolicyPresent5328(req.Snapshot.Policies, "trust-z214-deny") {
+		t.Fatal("same-config republish dropped the trust->z214 deny (A has no quarantine)")
+	}
+	// Scheduler bits refreshed: the CLOSED window must render the deny INACTIVE.
+	if !schedPolicyInactive5328(t, req.Snapshot.Policies, "trust-z214-deny") {
+		t.Fatal("same-config republish did not refresh scheduler bits: the CLOSED-window deny " +
+			"is still ACTIVE (Inactive=false) (#6480 phase-b regression guard)")
 	}
 }

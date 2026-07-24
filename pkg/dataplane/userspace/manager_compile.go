@@ -460,6 +460,31 @@ func (m *Manager) publishSnapshotFailClosedLocked(publishSnap *ConfigSnapshot, s
 // build error is returned wrapped; both callers retain the prior snapshot
 // (fail-closed) and surface a retry.
 func (m *Manager) rebuildScheduledPolicySectionsLocked(next *ConfigSnapshot, cfg *config.Config, activeState map[string]bool) error {
+	// #6480 (config-skew fail-open guard): this helper rebuilds next.Policies
+	// from cfg and scrubs them against cfg's StableZoneID quarantine set, but
+	// next.Zones / next.Interfaces were inherited verbatim from m.lastSnapshot
+	// (the APPLIED config). If cfg's zone generation differs from that applied
+	// config, the scrub can drop a policy whose to/from zone is STILL a live
+	// member of the inherited next.Zones — shipping a snapshot the Rust
+	// UnresolvableZoneReference preflight ACCEPTS yet whose missing rule lets
+	// traffic fall through to the inherited default policy (a fail-OPEN a full
+	// Compile of cfg would instead render fail-closed by ALSO dropping the
+	// quarantined zone and unzoning its interface). The route-overlay caller
+	// already refuses this exact skew at its call site (routeOnlyPublishHybrid,
+	// #5680); the scheduler-only caller (UpdatePolicyScheduleState) had no prior
+	// guard, so enforce it HERE so BOTH partial-republish paths are protected.
+	// routeOnlyPublishHybrid is parameterized on the applied config, so it doubles
+	// as the general "cfg content-differs from applied" skew predicate. next.Config
+	// was already set to cfg by both callers, so compare cfg against the INHERITED
+	// snapshot's config (m.lastSnapshot.Config), NEVER next.Config (a cfg==cfg
+	// tautology). On divergence retain the prior snapshot; the caller surfaces a
+	// retry and the next tick reconverges once cfg's full apply lands
+	// (m.lastSnapshot.Config == cfg) — the #3780 retry semantics already handle it.
+	if m.lastSnapshot != nil && routeOnlyPublishHybrid(cfg, m.lastSnapshot.Config) {
+		return fmt.Errorf("refusing scheduled-policy republish: cfg carries a zone/policy " +
+			"generation the inherited dataplane snapshot does not reflect; rebuilding and " +
+			"scrubbing against it could drop a live-zone policy and ship a fail-open snapshot (#6480)")
+	}
 	feedOverlay := cloneFeedOverlay(m.feedOverlay)
 	// #2514: an unresolvable address-book content-ID collision must not panic the
 	// daemon — surface it as an error so the caller retains the prior snapshot.
