@@ -3550,24 +3550,47 @@ reserved for whole-dataplane selection where a rewrite shim
     match (a whole-address 1:1) or add a `mapped-port` (a port forward).
     Two refinements land in the #6479 fold. First,
     `staticNATMappedPortForNode` gathers every `mapped-port` operand
-    attached to a `then static-nat` node — the collapsed-keys `prefix`
-    leaf, a hierarchical `static-nat { prefix X; mapped-port P; }` sibling,
-    AND every child of a duplicate split across two
-    `then static-nat prefix <ip> mapped-port <p>` set lines — into ONE list
-    folded through `combineMappedPortOperands` exactly once. Duplicate
-    operands are last-wins ONLY when they are all valid in-range numbers
-    (`mapped-port 8080 mapped-port 9090` → 9090); a contradictory duplicate
-    in ANY shape or ACROSS nodes (e.g. `mapped-port 8080 mapped-port
-    notaport`) fails closed — any malformed occurrence zeroes the port and
-    the strict gate names the bad token, with no first-wins gate that could
-    let a later malformed duplicate slip past an earlier valid one. The scan
-    is grammar-POSITION-aware (`staticNATMappedPortOperandsFromKeys`): a
-    `mapped-port` token that is the free-form VALUE of an immediately
-    preceding `routing-instance <ri>` or `prefix <addr>` is NOT a modifier,
-    so a translation-target routing-instance NAMED `mapped-port`
-    (`then static-nat prefix <ip> routing-instance mapped-port`, #4292)
-    compiles clean instead of being falsely rejected as a bare mapped-port
-    (the fold-introduced false positive this refinement closes). Second, the
+    attached to a `then static-nat` node across EVERY Junos AST shape, into
+    ONE list folded through `combineMappedPortOperands` exactly once:
+      - the collapsed one-line `prefix <ip> mapped-port <port>` leaf;
+      - the CANONICAL separate-set-line form — Juniper documents mapped-port
+        as a sub-statement of `prefix`, authored as two set lines
+        (`... prefix 10.0.0.5/32` + `... prefix mapped-port 8080`) that
+        SetPath collapses to a distinct leaf `Keys=["prefix","mapped-port",
+        "8080"]`, mapped-port immediately following the literal `prefix`;
+      - the CANONICAL hierarchical nested form — `prefix <ip> { mapped-port
+        P; }` / `prefix { <ip>; mapped-port P; }`, where mapped-port is a
+        CHILD of the `prefix` node (a grandchild of `static-nat`), scanned
+        via the target child's `Children`, not just its `Keys`;
+      - a `prefix-name <name> mapped-port <port>` target (#4290) — the
+        prefix-name compile branch feeds `staticNATMappedPortForNode` too,
+        so a prefix-name-scoped mapped-port is gated identically;
+      - a hierarchical `static-nat { prefix X; mapped-port P; }` sibling,
+        scanning ALL operands of a packed `mapped-port a mapped-port b`
+        child (not just the first);
+      - AND every child of a duplicate split across two
+        `then static-nat prefix <ip> mapped-port <p>` set lines.
+    Duplicate operands are last-wins ONLY when they are all valid in-range
+    numbers (`mapped-port 8080 mapped-port 9090` → 9090); a contradictory
+    duplicate in ANY shape or ACROSS nodes (e.g. `mapped-port 8080
+    mapped-port notaport`) fails closed — any malformed occurrence zeroes
+    the port and the strict gate names the bad token, with no first-wins
+    gate that could let a later malformed duplicate slip past an earlier
+    valid one. The scan is grammar-POSITION-aware
+    (`staticNATMappedPortOperandsFromKeys`): a `mapped-port` token is
+    skipped ONLY when it is the free-form VALUE of an immediately preceding
+    NAME-valued keyword (`mappedPortNameValuedKeywords`: `routing-instance`,
+    `prefix-name`, `nptv6-prefix`) whose value could legally be the literal
+    string `mapped-port`, so a translation-target routing-instance NAMED
+    `mapped-port` (`... routing-instance mapped-port`, #4292) or a
+    prefix-name entry NAMED `mapped-port` compiles clean instead of being
+    falsely rejected as a bare mapped-port. It is NOT skipped after `prefix`,
+    whose value is ALWAYS an IP and can never be the string `mapped-port`:
+    `prefix mapped-port <port>` is the canonical modifier. A round-4
+    over-defensive addition of `prefix` to the skip set broke that canonical
+    form — it both false-rejected the clean rule (it looked like a
+    match-port with no mapped-port) and reopened the C179-038 fail-open for
+    a canonical malformed value; #6479 removes it. Second, the
     port-match-without-mapped-port (#2769) gate is guarded on
     `!MappedPortPresent` so it fires ONLY on a
     true absence: a present-but-malformed mapped-port that also carries a

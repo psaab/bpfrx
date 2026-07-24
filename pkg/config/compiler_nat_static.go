@@ -67,6 +67,34 @@ func applyStaticNATFromScope(rs *StaticNATRuleSet, s natMatchScope) {
 	}
 }
 
+// mappedPortNameValuedKeywords is the set of static-NAT `then` keywords whose
+// following token is an operator-chosen NAME (not an IP), so that name could
+// legally be the literal string "mapped-port". A `mapped-port` token that is the
+// VALUE of one of these keywords is NOT a mapped-port modifier and must be
+// skipped by the operand scan (#6479):
+//
+//   - `routing-instance <ri>` — a translation-target routing-instance may be
+//     NAMED "mapped-port" (#4292).
+//   - `prefix-name <name>` — a `then static-nat prefix-name` reference names a
+//     global address-book entry (#4290) that may be NAMED "mapped-port".
+//   - `nptv6-prefix <prefix>` — its value is a prefix, never "mapped-port", so
+//     the skip never fires in practice; listed for defensive grammar symmetry
+//     with the other free-form-value keywords (NPTv6 carries no mapped-port).
+//
+// `prefix` is deliberately ABSENT: a `prefix` value is ALWAYS an IP/CIDR and can
+// NEVER be the string "mapped-port", so a `mapped-port` token immediately after
+// the literal `prefix` keyword is ALWAYS the genuine modifier — the canonical
+// separate-set-line Junos form `prefix <ip>` + `prefix mapped-port <port>`
+// collapses to Keys `["prefix","mapped-port","<port>"]` and MUST be recovered.
+// Including `prefix` here (a round-4 over-defensive addition) dropped that real
+// modifier and both false-rejected the canonical clean rule AND reopened the
+// C179-038 fail-open for a canonical malformed value; #6479 removes it.
+var mappedPortNameValuedKeywords = map[string]struct{}{
+	"routing-instance": {},
+	"prefix-name":      {},
+	"nptv6-prefix":     {},
+}
+
 // staticNATMappedPortOperandsFromKeys returns the operand token trailing each
 // GENUINE `mapped-port` modifier in a static-NAT `then` node's collapsed Keys,
 // in AST order (#2491, #6479 grammar-position fix). The lexer collapses
@@ -77,26 +105,27 @@ func applyStaticNATFromScope(rs *StaticNATRuleSet, s natMatchScope) {
 // value validator and must be recovered here.
 //
 // A `mapped-port` token is a modifier ONLY in modifier position. It is SKIPPED
-// when it is the free-form VALUE of an immediately preceding `routing-instance`
-// or `prefix` keyword: both take an arbitrary following token that can legally
-// be the literal string "mapped-port" (a translation-target routing-instance
-// NAMED "mapped-port", #4292; or a prefix value that is that string). Treating
-// such a value as a bare mapped-port modifier would falsely reject an otherwise
-// clean rule — the #6479 fold-introduced false positive this guard closes. A
-// genuine modifier with no trailing operand (a bare `mapped-port` at the end of
-// the key list) contributes an EMPTY operand so combineMappedPortOperands flags
-// it malformed rather than dropping the occurrence.
+// only when it is the free-form VALUE of an immediately preceding NAME-valued
+// keyword (mappedPortNameValuedKeywords: routing-instance / prefix-name /
+// nptv6-prefix) — those take an arbitrary following token that can legally be
+// the literal string "mapped-port". It is NOT skipped after `prefix`, whose
+// value is always an IP: `prefix mapped-port <port>` is the canonical modifier
+// (the #6479 regression this restores). A genuine modifier with no trailing
+// operand (a bare `mapped-port` at the end of the key list) contributes an EMPTY
+// operand so combineMappedPortOperands flags it malformed rather than dropping
+// the occurrence.
 func staticNATMappedPortOperandsFromKeys(keys []string) []string {
 	var operands []string
 	for i := 0; i < len(keys); i++ {
 		if keys[i] != "mapped-port" {
 			continue
 		}
-		// Grammar-position guard: a "mapped-port" immediately following
-		// `routing-instance` or `prefix` is that keyword's VALUE, not the
-		// modifier keyword — it is never a mapped-port operand source.
-		if i > 0 && (keys[i-1] == "routing-instance" || keys[i-1] == "prefix") {
-			continue
+		// Grammar-position guard: a "mapped-port" immediately following a
+		// NAME-valued keyword is that keyword's VALUE, not the modifier keyword.
+		if i > 0 {
+			if _, nameValued := mappedPortNameValuedKeywords[keys[i-1]]; nameValued {
+				continue
+			}
 		}
 		if i+1 < len(keys) {
 			operands = append(operands, keys[i+1])
@@ -107,19 +136,53 @@ func staticNATMappedPortOperandsFromKeys(keys []string) []string {
 	return operands
 }
 
+// mappedPortNodeOperands returns every operand attached to a `mapped-port`
+// NODE (a sibling or nested `mapped-port` child of the static-nat / prefix
+// node), across both shapes the parser can produce:
+//
+//   - packed / flat Keys: `mapped-port <p>` → Keys=["mapped-port","<p>"], and a
+//     packed duplicate `mapped-port a mapped-port b` collapses onto one leaf's
+//     Keys=["mapped-port","a","mapped-port","b"]. staticNATMappedPortOperands-
+//     FromKeys walks ALL of them (scan-all, not first-wins), so a malformed
+//     second operand fails closed.
+//   - hierarchical value-as-child: `mapped-port { <p>; }` → Keys=["mapped-port"]
+//     with the operand carried as a child. The key scan yields a single "" (bare
+//     keyword) placeholder; replace it with the child value(s) so the operand is
+//     recovered rather than mis-flagged as an empty (missing) value.
+func mappedPortNodeOperands(c *Node) []string {
+	ops := staticNATMappedPortOperandsFromKeys(c.Keys)
+	if len(c.Children) > 0 && len(ops) == 1 && ops[0] == "" {
+		ops = ops[:0]
+		for _, gc := range c.Children {
+			ops = append(ops, gc.Name())
+		}
+	}
+	return ops
+}
+
 // staticNATMappedPortForNode folds every genuine `mapped-port` modifier operand
-// attached to a static-nat `then` node — across BOTH AST shapes AND across
+// attached to a static-nat `then` node — across EVERY AST shape AND across
 // duplicate target children — into the (port, raw, present) triple the strict
 // gate (validateNATHostMaskStrict) consumes (#2491, C179-038, #6479 fold).
 //
-// It gathers operands from the node's own collapsed Keys, from each `mapped-port`
-// sibling child (the hierarchical `static-nat { prefix X; mapped-port P; }`
-// shape), and — grammar-position-aware — from each target child leaf's Keys (the
-// collapsed `prefix <ip> mapped-port <port>` flat-set shape, INCLUDING every
-// child of a cross-node duplicate authored as two `then static-nat prefix <ip>
-// mapped-port <p>` set lines). It then folds the WHOLE operand list through
-// combineMappedPortOperands ONCE, so last-wins applies when every occurrence is
-// a valid 1-65535 and a malformed occurrence in ANY shape or ANY duplicate fails
+// It gathers operands from:
+//   - the static-nat node's own collapsed Keys (the `then static-nat prefix <ip>
+//     mapped-port <port>` shape that lands on t.Keys);
+//   - each `mapped-port` sibling child (the hierarchical `static-nat { prefix X;
+//     mapped-port P; }` shape), scanning ALL of its operands (a packed
+//     `mapped-port a mapped-port b` duplicate fails closed, not first-wins);
+//   - each target child (`prefix`/`prefix-name` <val>) — BOTH the collapsed
+//     modifier on its Keys (the flat-set `prefix <ip> mapped-port <port>` and
+//     the canonical separate-set-line `prefix mapped-port <port>` shapes) AND a
+//     mapped-port nested inside its Children (the canonical HIERARCHICAL
+//     `prefix <ip> { mapped-port P; }` / `prefix { <ip>; mapped-port P; }`
+//     shapes) — grammar-aware, so a `mapped-port` that is really a
+//     routing-instance/prefix-name VALUE is skipped.
+//
+// Every child of a cross-node duplicate (two `then static-nat prefix <ip>
+// mapped-port <p>` set lines) is scanned, then the WHOLE operand list folds
+// through combineMappedPortOperands ONCE: last-wins when every occurrence is a
+// valid 1-65535, and a malformed occurrence in ANY shape or ANY duplicate fails
 // closed. There is no first-wins gate that could let a later malformed duplicate
 // slip past an earlier valid one (the #6479 cross-node first-wins bug).
 //
@@ -131,16 +194,22 @@ func staticNATMappedPortForNode(t *Node) (port int, raw string, present bool) {
 	operands := staticNATMappedPortOperandsFromKeys(t.Keys)
 	for _, c := range t.Children {
 		if c.Name() == "mapped-port" {
-			// Hierarchical sibling: the operand is the child leaf's value
-			// (nodeVal handles the value-in-Keys and value-as-child shapes).
-			operands = append(operands, nodeVal(c))
+			// Hierarchical sibling `mapped-port <p>` (possibly packed).
+			operands = append(operands, mappedPortNodeOperands(c)...)
 			continue
 		}
-		// A target child leaf (`prefix <ip> [mapped-port <p>] [routing-instance
-		// <ri>]`), scanned grammar-aware so a `mapped-port` that is really a
-		// routing-instance/prefix VALUE is skipped. Every child of a cross-node
-		// duplicate is scanned, so a malformed later duplicate fails closed.
+		// A target child (`prefix`/`prefix-name` <val> [mapped-port <p>]
+		// [routing-instance <ri>]). The modifier may ride on the child's
+		// collapsed Keys (flat-set) OR nest inside the child's Children (the
+		// canonical hierarchical `prefix <ip> { mapped-port P; }` shape). Scan
+		// BOTH — grammar-aware — so a malformed operand in either shape, and in
+		// every child of a cross-node duplicate, fails closed.
 		operands = append(operands, staticNATMappedPortOperandsFromKeys(c.Keys)...)
+		for _, gc := range c.Children {
+			if gc.Name() == "mapped-port" {
+				operands = append(operands, mappedPortNodeOperands(gc)...)
+			}
+		}
 	}
 	return combineMappedPortOperands(operands)
 }
@@ -369,9 +438,21 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// keyword fell through, leaving Then=="" (empty
 							// translation target, silent broken static NAT).
 							rule.ThenPrefixName = t.Keys[2]
+							// #6479: a prefix-name target carries the SAME optional
+							// `mapped-port <port>` modifier as a literal prefix
+							// (`prefix-name FOO mapped-port 8080`). Collect + gate it
+							// identically so a malformed prefix-name mapped-port fails
+							// closed instead of silently dropping — the C179-038 class,
+							// reopened for the prefix-name shape. The scan is grammar-
+							// aware: a prefix-name entry NAMED "mapped-port" is the
+							// name value, not a modifier, and registers no port.
+							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortForNode(t)
 						} else if pn := t.FindChild("prefix-name"); pn != nil {
 							// static-nat { prefix-name NAME; }
 							rule.ThenPrefixName = nodeVal(pn)
+							// #6479: gate a prefix-name mapped-port identically (see
+							// the collapsed-keys branch above).
+							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortForNode(t)
 						} else if len(t.Keys) >= 3 && t.Keys[1] == "prefix" {
 							rule.Then = t.Keys[2]
 							// #2491 / #6479: recover the optional `mapped-port
@@ -379,27 +460,33 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							// <ip> mapped-port <port>` onto this leaf's Keys
 							// (`static-nat` is a children:nil schema leaf).
 							// staticNATMappedPortForNode folds every occurrence
-							// — here and on any sibling/duplicate child —
+							// — here and on any sibling/nested/duplicate child —
 							// through one combine so a malformed operand in any
 							// shape fails closed, and skips a `mapped-port` that
-							// is actually a routing-instance/prefix VALUE.
+							// is actually a routing-instance/prefix-name VALUE.
 							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortForNode(t)
 						} else if pn := t.FindChild("prefix"); pn != nil {
 							rule.Then = nodeVal(pn)
 							// #2491 / C179-038 / #6479: recover the `mapped-port
-							// <port>` modifier(s) across every AST shape at once.
+							// <port>` modifier(s) across EVERY AST shape at once.
 							// The modifier may ride on the `prefix` child's
 							// collapsed Keys (`["prefix","<ip>","mapped-port",
-							// "<port>"]`), on a distinct `mapped-port` sibling
-							// child (`static-nat { prefix X; mapped-port P; }`),
-							// or be split across DUPLICATE `then static-nat
-							// prefix <ip> mapped-port <p>` children (two set
-							// lines). staticNATMappedPortForNode folds them all
-							// through one combine — fail-closed on any malformed
-							// occurrence, no first-wins gate — and skips a
-							// `mapped-port` that is a routing-instance/prefix
-							// VALUE (a routing-instance NAMED "mapped-port" no
-							// longer false-rejects).
+							// "<port>"]`), on the canonical separate-set-line
+							// `prefix mapped-port <port>` leaf, NESTED inside the
+							// prefix child's Children (the hierarchical `prefix
+							// <ip> { mapped-port P; }` / `prefix { <ip>;
+							// mapped-port P; }` shapes), on a distinct
+							// `mapped-port` sibling child (`static-nat { prefix X;
+							// mapped-port P; }`), or be split across DUPLICATE
+							// `then static-nat prefix <ip> mapped-port <p>`
+							// children (two set lines). staticNATMappedPortForNode
+							// folds them all through one combine — fail-closed on
+							// any malformed occurrence, no first-wins gate — and
+							// skips a `mapped-port` that is a routing-instance/
+							// prefix-name VALUE (a routing-instance or prefix-name
+							// NAMED "mapped-port" no longer false-rejects). It does
+							// NOT skip after `prefix`, whose value is always an IP,
+							// so `prefix mapped-port <port>` is recovered (#6479).
 							rule.MappedPort, rule.MappedPortRaw, rule.MappedPortPresent = staticNATMappedPortForNode(t)
 						} else if t.FindChild("inet") != nil || (len(t.Keys) >= 2 && t.Keys[1] == "inet") {
 							// static-nat { inet; } — NAT64 translation
