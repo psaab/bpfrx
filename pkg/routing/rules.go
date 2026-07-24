@@ -27,8 +27,22 @@ type ruleOps interface {
 }
 
 // nextTableRulePriority is the base priority for next-table ip rules.
-// Lower values = higher priority. We use 100-199 range for next-table rules.
-const nextTableRulePriority = 100
+// Lower values = higher priority. We use the 100-199 range for next-table
+// rules. The base + window are the SSOT in pkg/config (NextTableRulePriorityBase
+// / NextTableRuleWindow) so the install cap here, the commit-time gate
+// (pkg/config maxNextTableRules), and the userspace FIB mirror
+// (pkg/dataplane/userspace/routes.go) all cap at the same boundary (#6467).
+const nextTableRulePriority = config.NextTableRulePriorityBase
+
+// maxNextTableRules bounds the number of next-table inter-VRF leak ip rules the
+// applier installs, matching the nextTableRulePriority window clear() scans
+// ([nextTableRulePriority, nextTableRulePriority+maxNextTableRules)). A larger
+// next-table set is truncated and reported as a degraded apply (mirroring
+// maxPBRRules / maxRibGroupLeakRules) rather than silently dropping later leaks
+// with a bare Warn (#6467). The userspace FIB config-static mirror caps at the
+// SAME value (config.NextTableRuleWindow) so the kernel ip-rule table and the
+// userspace dataplane FIB agree on which leaks survive truncation.
+const maxNextTableRules = config.NextTableRuleWindow
 
 // ribGroupRulePriority is the LEGACY base priority for the pre-#3876
 // rib-group `from all lookup <sourceTable>` blanket rules. It sat AFTER the
@@ -115,7 +129,7 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 	}
 
 	prio := nextTableRulePriority
-	for _, sr := range routes {
+	for i, sr := range routes {
 		if sr.NextTable == "" {
 			continue
 		}
@@ -138,15 +152,48 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 		}
 
 		// Hard-cap the priority inside the window that clear() scans
-		// (nextTableRulePriority .. nextTableRulePriority+100). A rule
-		// programmed at or beyond the upper bound would never be removed
-		// on a later apply and would leak permanently. Stop programming
-		// further next-table routes once the window is exhausted, matching
-		// the pbrManager cap pattern below. ValidateConfig emits a
-		// commit-time warning before this point is ever reached.
-		if prio >= nextTableRulePriority+100 {
-			slog.Warn("next-table rule limit reached; ignoring further next-table routes",
-				"limit", 100, "destination", sr.Destination, "instance", sr.NextTable)
+		// ([nextTableRulePriority, nextTableRulePriority+maxNextTableRules)).
+		// A rule programmed at or beyond the upper bound would never be
+		// removed on a later apply and would leak permanently. Stop
+		// programming further next-table routes once the window is exhausted,
+		// matching the pbrManager cap pattern below.
+		//
+		// #6467: aggregate a degraded error (mirroring the rib-group and PBR
+		// caps below) instead of a bare Warn+break. A silent truncation let
+		// Apply report success while dropping a security-relevant inter-VRF
+		// routing control AND diverging the kernel from the userspace FIB
+		// (which mirrors the same cap). Name how many next-table routes past
+		// the cap are not leaked so the operator sees the degraded result.
+		// The strict commit gate (validateRoutingRuleWindowsStrict, #5854)
+		// rejects an over-subscribed config up front; this belt catches the
+		// tolerant-load / peer-sync path where that gate is downgraded to a
+		// warning.
+		if prio >= nextTableRulePriority+maxNextTableRules {
+			// Count only ELIGIBLE routes past the cap — those the applier WOULD
+			// have installed (known instance + parseable CIDR). An
+			// unknown-instance or unparseable route is skipped above (no prio++),
+			// so it never consumes a window slot and is not a "dropped leak"; the
+			// tableIDs + net.ParseCIDR gates here mirror the per-route eligibility
+			// checks at the top of this loop so the "N not leaked" count is
+			// accurate rather than inflated by routes that would never install
+			// (#6467).
+			dropped := 0
+			for _, rem := range routes[i:] {
+				if rem == nil || rem.NextTable == "" {
+					continue
+				}
+				if _, ok := tableIDs[rem.NextTable]; !ok {
+					continue
+				}
+				if _, _, err := net.ParseCIDR(rem.Destination); err != nil {
+					continue
+				}
+				dropped++
+			}
+			errs = append(errs, fmt.Errorf(
+				"next-table rule limit (%d) reached; %d next-table route(s) beyond "+
+					"the limit are not leaked — reduce the number of next-table routes",
+				maxNextTableRules, dropped))
 			break
 		}
 
@@ -191,7 +238,7 @@ func (n *nextTableManager) clear() error {
 			continue
 		}
 		for _, r := range rules {
-			if r.Priority >= nextTableRulePriority && r.Priority < nextTableRulePriority+100 {
+			if r.Priority >= nextTableRulePriority && r.Priority < nextTableRulePriority+maxNextTableRules {
 				if err := n.ops.RuleDel(&r); err != nil {
 					if isRuleAlreadyGone(err) {
 						// The rule is already absent (ENOENT / no such
