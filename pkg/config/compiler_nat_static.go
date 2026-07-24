@@ -504,6 +504,28 @@ var staticNATModifierKeywords = map[string]struct{}{
 	"routing-instance": {},
 }
 
+// isStaticNATKeywordLexeme reports whether tok is a static-nat grammar keyword —
+// a translation-target keyword, a trailing modifier keyword, or the "static-nat"
+// leaf name — as opposed to an operand VALUE. The bracketed/packed multi-value
+// target scan (staticNATCollectTargetIdentsFromKeys) uses it to end a value run:
+// after a `prefix`/`nptv6-prefix`/`prefix-name` keyword its IP prefix or address-
+// book name value can appear one-or-more times (a lexer-collapsed bracketed list,
+// #2419), and the run terminates at the first token that is a grammar keyword —
+// a trailing modifier or a new target — which a bracketed value list never
+// contains. For prefix/nptv6-prefix the value is an IP that can never equal one
+// of these lexemes; for prefix-name the FIRST value is consumed unconditionally
+// (a pool may be NAMED "mapped-port"/"prefix"), so the lexeme test only bounds
+// the SECOND-and-later packed values.
+func isStaticNATKeywordLexeme(tok string) bool {
+	if _, ok := staticNATTargetKeywords[tok]; ok {
+		return true
+	}
+	if _, ok := staticNATModifierKeywords[tok]; ok {
+		return true
+	}
+	return tok == "static-nat"
+}
+
 // staticNATCollectTargetIdentsFromKeys walks a collapsed static-nat key slice —
 // a target child's Keys (`["prefix","<ip>","prefix-name","POOL"]`), the static-nat
 // node's own Keys, or a hierarchical bare keyword's Keys (`["prefix"]`) — in
@@ -516,18 +538,27 @@ var staticNATModifierKeywords = map[string]struct{}{
 // `Keys[1]`/`Keys[2]` read) let a genuine multi-target rule whose targets collapse
 // onto ONE node/child count as one and escape the >1 gate.
 //
+// A lexer-collapsed bracketed list (`prefix [ X Y ]` → ["prefix","X","Y"], #2419)
+// packs SEVERAL target values after ONE keyword; each value is a DISTINCT target,
+// so the scan registers EVERY packed value, not just the first (the pre-#6484
+// single-value read let `prefix [ X Y ]` count 1 and escape the >1 gate).
+//
 // Per-token roles:
 //   - `inet`                     → identity "inet"; NO value slot (i += 1).
-//   - `prefix <ip>` /
-//     `nptv6-prefix <p6>`        → identity "<kw>\x00<ip>"; the value is an IP that
-//     can never be a modifier keyword, so a FOLLOWING mapped-port/routing-instance
-//     is a MODIFIER CARRIER (the canonical separate-set-line `prefix mapped-port
-//     <p>` form) — register nothing, advance one, and let the modifier consume its
-//     own operand. Otherwise consume the IP value (i += 2).
-//   - `prefix-name <name>`       → identity "prefix-name\x00<name>"; the value is an
-//     OPAQUE address-book name that may be literally "mapped-port"/"routing-
-//     instance"/"prefix", so it is ALWAYS consumed as the value (i += 2) — never
-//     re-classified as a modifier that would erase the target (#6479 name-slot).
+//   - `prefix <ip> [<ip>...]` /
+//     `nptv6-prefix <p6> [...]`  → identity "<kw>\x00<ip>" for EACH value. The
+//     value is an IP that can never be a keyword lexeme. If the token right after
+//     the keyword is a modifier the node is a MODIFIER CARRIER (the canonical
+//     separate-set-line `prefix mapped-port <p>` form) — register nothing and let
+//     the modifier consume its own operand. Otherwise consume EVERY following
+//     non-keyword token as a distinct packed IP value, stopping at the first
+//     trailing modifier or new target keyword.
+//   - `prefix-name <name> [...]` → identity "prefix-name\x00<name>" for EACH name.
+//     The FIRST token is the OPAQUE address-book name — always consumed as the
+//     value, even if it reads "mapped-port"/"routing-instance"/"prefix" (a pool may
+//     be so named), never re-classified as a modifier that would erase the target
+//     (#6479 name-slot). Further non-keyword tokens are additional packed names,
+//     each a distinct target; the run stops at the first modifier/target keyword.
 //   - `mapped-port <p>` /
 //     `routing-instance <ri>`    → a MODIFIER; consume its operand (i += 2),
 //     register no target. Consuming routing-instance's opaque-name operand keeps a
@@ -541,21 +572,41 @@ func staticNATCollectTargetIdentsFromKeys(keys []string, set map[string]struct{}
 			set["inet"] = struct{}{} // no value slot
 			i++
 		case tok == "prefix-name":
-			// Name-valued target: the next token is an opaque name, consumed
-			// verbatim even if it reads "mapped-port" (a pool may be so named).
-			if i+1 < len(keys) {
-				set["prefix-name\x00"+keys[i+1]] = struct{}{}
-			}
-			i += 2
-		case tok == "prefix" || tok == "nptv6-prefix":
-			if i+1 < len(keys) {
-				if _, mod := staticNATModifierKeywords[keys[i+1]]; mod {
-					i++ // modifier carrier (`prefix mapped-port <p>`): not a target
-					continue
+			// Name-valued target. The FIRST token after the keyword is ALWAYS the
+			// opaque address-book name — consumed verbatim even if it reads
+			// "mapped-port"/"prefix" (a pool may be so named). Any FURTHER
+			// non-keyword tokens are additional bracketed/packed name values
+			// (`prefix-name [ A B ]` collapses to ["prefix-name","A","B"], #2419),
+			// each a DISTINCT target; a trailing modifier or new target keyword
+			// ends the name run (a bracketed value list contains no keyword).
+			i++
+			if i < len(keys) {
+				set["prefix-name\x00"+keys[i]] = struct{}{}
+				i++
+				for i < len(keys) && !isStaticNATKeywordLexeme(keys[i]) {
+					set["prefix-name\x00"+keys[i]] = struct{}{}
+					i++
 				}
-				set[tok+"\x00"+keys[i+1]] = struct{}{}
 			}
-			i += 2 // consume the IP value slot
+		case tok == "prefix" || tok == "nptv6-prefix":
+			i++
+			if i < len(keys) {
+				if _, mod := staticNATModifierKeywords[keys[i]]; mod {
+					// Modifier carrier (`prefix mapped-port <p>`, the canonical
+					// separate-set-line form): NO prefix value on this node — the
+					// value rode a restate line. Register nothing; the modifier
+					// case below consumes its own operand.
+					break
+				}
+				// First IP value + any further bracketed/packed IP values
+				// (`prefix [ X Y ]` → ["prefix","X","Y"]), each a DISTINCT target.
+				// An IP prefix can never be a keyword lexeme, so the run stops at
+				// the first trailing modifier or new target keyword.
+				for i < len(keys) && !isStaticNATKeywordLexeme(keys[i]) {
+					set[tok+"\x00"+keys[i]] = struct{}{}
+					i++
+				}
+			}
 		case tok == "mapped-port" || tok == "routing-instance":
 			i += 2 // modifier consumes its own operand; not a target
 		default:
@@ -585,12 +636,15 @@ func staticNATCollectTargetIdentsFromKeys(keys []string, set map[string]struct{}
 // node's own Keys AND every child's Keys through the grammar-role-aware
 // staticNATCollectTargetIdentsFromKeys (so the one-line
 // `prefix <ip> prefix-name POOL` / `prefix <ip> inet` / `prefix <ip> prefix <ip2>`
-// collapse — where two targets land on ONE child's Keys — is counted), and
-// expands the hierarchical value-as-child shape (`prefix { <ip>; <ip2>; }`, where
-// each grandchild is a distinct prefix value). A MODIFIER CARRIER (`prefix
+// collapse — where two targets land on ONE child's Keys — is counted, as is a
+// lexer-collapsed bracketed list `prefix [ X Y ]` / `prefix-name [ A B ]`, #2419),
+// and expands the hierarchical value-as-child shape (`prefix { <ip>; <ip2>; }`,
+// where each grandchild is a distinct prefix value). A MODIFIER CARRIER (`prefix
 // mapped-port <port>`) and a modifier riding a target (`prefix <ip> mapped-port
-// <p>`, target `routing-instance <ri>`) are NOT extra targets — the walk consumes
-// them — matching how staticNATMappedPortForNode reads the same node.
+// <p>`, target `routing-instance <ri>`, or a `prefix-name { POOL; mapped-port P; }`
+// block whose nested mapped-port is a modifier — NOT a second name) are NOT extra
+// targets — the walk consumes them — matching how staticNATMappedPortForNode reads
+// the same node.
 func staticNATCollectTargetIdents(t *Node, set map[string]struct{}) {
 	// The static-nat node's own Keys (a shape that would collapse the target onto
 	// ["static-nat","prefix","<ip>", ...]); the leading "static-nat" is a harmless
@@ -607,20 +661,32 @@ func staticNATCollectTargetIdents(t *Node, set map[string]struct{}) {
 		staticNATCollectTargetIdentsFromKeys(c.Keys, set)
 		// Hierarchical value-as-child: a bare target keyword `prefix { <ip>; ... }`
 		// carries its value(s) as grandchildren (child Keys are just ["prefix"]).
-		// EACH grandchild value is a distinct target (two `prefix { X; Y; }` grand-
-		// children = two prefixes → count 2). Skipped when the value rides inline on
-		// the child's Keys (len >= 2), because then any grandchild is a nested
-		// modifier (`prefix <ip> { mapped-port P; }`), not another value.
+		// Each VALUE grandchild is a distinct target (two `prefix { X; Y; }` grand-
+		// children = two prefixes → count 2), but a nested MODIFIER grandchild
+		// (`mapped-port`/`routing-instance`) is skipped — so `prefix-name { POOL;
+		// mapped-port 8080; }` is ONE target, not two (the #6484 second finding).
+		// Skipped entirely when the value rides inline on the child's Keys (len >=
+		// 2), because then any grandchild is a nested modifier (`prefix <ip> {
+		// mapped-port P; }`), not another value.
 		kw := c.Name()
 		if _, isTarget := staticNATTargetKeywords[kw]; !isTarget || kw == "inet" || len(c.Keys) >= 2 {
 			continue
 		}
 		nameValued := kw == "prefix-name" // opaque names; "mapped-port" is legal
-		for _, gc := range c.Children {
+		for gi, gc := range c.Children {
 			gname := gc.Name()
-			if !nameValued {
+			// A nested modifier grandchild (`mapped-port <p>` / `routing-instance
+			// <ri>`) is NOT a target value. For prefix/nptv6-prefix (IP-valued) a
+			// modifier can never be confused with a value, so skip it wherever it
+			// appears. For prefix-name the FIRST grandchild is the OPAQUE pool name
+			// — a pool may be NAMED "mapped-port", so it is consumed unconditionally;
+			// only a LATER modifier grandchild is the genuine modifier and is
+			// skipped. Without the gi>0 guard a bare `prefix-name { POOL;
+			// mapped-port 8080; }` registered both POOL and mapped-port and
+			// FALSE-REJECTED a valid single-target rule (the #6484 second finding).
+			if !(nameValued && gi == 0) {
 				if _, mod := staticNATModifierKeywords[gname]; mod {
-					continue // a nested `mapped-port { P; }` modifier, not a prefix value
+					continue // a nested modifier grandchild, not a target value
 				}
 			}
 			set[kw+"\x00"+gname] = struct{}{}

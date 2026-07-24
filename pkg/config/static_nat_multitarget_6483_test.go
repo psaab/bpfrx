@@ -227,6 +227,93 @@ func TestStaticNATMultiTarget6484_RejectPrefixPlusPrefixNameNamedMappedPort(t *t
 	})
 }
 
+// --- #6484 round-2: PACKED/BRACKETED multi-value target (Codex finding 1) ----
+//
+// A Junos bracketed list `prefix [ X Y ]` is collapsed by the lexer (#2419) onto
+// ONE leaf's Keys ["prefix","X","Y"]; the same for prefix-name / nptv6-prefix. The
+// round-1 counter consumed only the FIRST value after the keyword and let the rest
+// fall through, so a genuine 2-target packed list counted 1 and ESCAPED the >1
+// gate. The full-traversal walk now registers EVERY packed value as a distinct
+// target identity, so these reject.
+//
+// PARENT-RED: revert the packed-value fix (restore the single-value read in
+// staticNATCollectTargetIdentsFromKeys — count only keys[i+1] and advance i+=2)
+// and each of these goes clean-assertion RED (strict CompileConfig returns nil for
+// a rule that must reject: `prefix [ X Y ]` counts 1).
+
+func TestStaticNATMultiTarget6484_RejectBracketedMultiPrefix(t *testing.T) {
+	// `prefix [ 10.0.0.1/32 10.0.0.2/32 ]` → Keys ["prefix","10.0.0.1/32",
+	// "10.0.0.2/32"]. Two distinct prefix identities → reject. Both /32 host masks
+	// so the host-mask gate passes and the cardinality gate owns the rejection.
+	assertMultiTargetReject(t, func() *ConfigTree {
+		return buildFlat(t,
+			"set security nat static rule-set rs1 rule r1 then static-nat prefix [ 10.0.0.1/32 10.0.0.2/32 ]")
+	})
+}
+
+func TestStaticNATMultiTarget6484_RejectBracketedMultiPrefixName(t *testing.T) {
+	// `prefix-name [ POOL POOL2 ]` → Keys ["prefix-name","POOL","POOL2"]. The FIRST
+	// token is the opaque name (always consumed), every FURTHER non-keyword token is
+	// an additional packed name — two distinct prefix-name identities → reject. Both
+	// pools are defined so no undefined-prefix-name gate fires first.
+	assertMultiTargetReject(t, func() *ConfigTree {
+		return buildFlat(t,
+			"set security address-book global address POOL 10.0.0.9/32",
+			"set security address-book global address POOL2 10.0.0.8/32",
+			"set security nat static rule-set rs1 rule r1 then static-nat prefix-name [ POOL POOL2 ]")
+	})
+}
+
+func TestStaticNATMultiTarget6484_RejectBracketedMultiNptv6(t *testing.T) {
+	// `nptv6-prefix [ P6a P6b ]` → Keys ["nptv6-prefix","P6a","P6b"]. Two distinct
+	// nptv6-prefix identities → reject. Built with a v6 match of EQUAL prefix length
+	// (else the nptv6-length gate, not cardinality, would fire) and no mapped-port.
+	assertMultiTargetReject(t, func() *ConfigTree {
+		tree := &ConfigTree{}
+		for _, line := range []string{
+			"set security zones security-zone untrust",
+			"set security nat static rule-set rs1 from zone untrust",
+			"set security nat static rule-set rs1 rule r1 match destination-address 2001:db8:1::/48",
+			"set security nat static rule-set rs1 rule r1 then static-nat nptv6-prefix [ 2001:db8:2::/48 2001:db8:3::/48 ]",
+		} {
+			path, err := ParseSetCommand(line)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", line, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", line, err)
+			}
+		}
+		return tree
+	})
+}
+
+// --- #6484 round-2: hierarchical prefix-name + nested mapped-port (finding 2) -
+//
+// A bare hierarchical `prefix-name { POOL; mapped-port 8080; }` is ONE target
+// (prefix-name POOL) plus a mapped-port MODIFIER — NOT two targets. The round-1
+// grandchild walk registered EVERY grandchild of a name-valued bare keyword as a
+// target, counting POOL and mapped-port as two, and FALSE-REJECTED a valid
+// single-target rule that origin/master accepted. The grandchild walk now consumes
+// only the FIRST grandchild as the opaque name and skips a later modifier
+// grandchild, so this accepts (count 1).
+//
+// PARENT-RED: revert the grandchild-modifier-skip (drop the `gi == 0` guard so a
+// name-valued keyword's modifier grandchild is registered as a target again) and
+// this goes RED — the rule false-rejects with ThenTargetCount==2.
+
+func TestStaticNATMultiTarget6484_AcceptHierPrefixNameNestedMappedPort(t *testing.T) {
+	// `match destination-port 80` satisfies the #2769 with-mapped-port gate so the
+	// well-formed 8080 is not caught there; POOL resolves so the empty-target gate
+	// does not fire — the count-1 accept is genuine, not masked by an earlier gate.
+	assertSingleTargetAccept(t, mtBuildHier(t,
+		`security { zones { security-zone untrust; }
+			nat { static { rule-set rs1 { from { zone untrust; }
+				rule r1 { match { destination-address 203.0.113.1/32; destination-port 80; }
+					then { static-nat { prefix-name { POOL; mapped-port 8080; } } } } } } } }`,
+		"set security address-book global address POOL 10.0.0.9/32"))
+}
+
 // --- single-target ACCEPT (each of the four, collapsed + hierarchical) ------
 
 func TestStaticNATMultiTarget6483_AcceptSingleTargets(t *testing.T) {

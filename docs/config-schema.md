@@ -1978,18 +1978,32 @@ onto a SINGLE child's Keys, and a hierarchical `prefix { <ip>; <ip2>; }` carries
 two prefix values as grandchildren of ONE `prefix` keyword — all counted 1 and
 ACCEPTED on master (the #6484 MAJOR). The full traversal registers every distinct
 `(keyword, value)` identity across the whole leaf, so these now count 2 and
-reject. Two role subtleties make the walk correct: (1) a `prefix-name` value is an
-OPAQUE address-book name that is ALWAYS its value — so `prefix-name mapped-port`
+reject. A **lexer-collapsed bracketed list** `prefix [ X Y ]` / `prefix-name
+[ A B ]` / `nptv6-prefix [ P6a P6b ]` (#2419 strips the brackets onto one leaf's
+Keys — `["prefix","X","Y"]`) is the same escape in packed form: the round-2
+counter registers EVERY packed value after a target keyword as a distinct target,
+not just the first, so a two-value bracketed list rejects (the round-1 walk
+consumed only the first value and let the rest fall through — a residual #6484
+escape). Two role subtleties make the walk correct: (1) a `prefix-name` value is
+an OPAQUE address-book name that is ALWAYS its value — so `prefix-name mapped-port`
 (a pool literally NAMED "mapped-port") registers a genuine target, not a modifier
 carrier (the pre-#6484 counter wrongly pre-filtered a value equal to a modifier
-keyword and DISCARDED that target — the Codex second finding); (2) a `prefix` /
-`nptv6-prefix` value is an IP that can never be a modifier keyword, so a FOLLOWING
-`mapped-port` / `routing-instance` IS a modifier carrier (the canonical
-separate-set-line `prefix mapped-port <port>` form) and registers no second
-target. Counting DISTINCT identities (not occurrences) keeps the canonical
-"restate the target to attach a mapped-port" form — `then static-nat prefix-name
-N` + `then static-nat prefix-name N mapped-port 8080` — a single target (both
-restatements share identity `prefix-name\x00N`). Rejecting the multi-target rule
+keyword and DISCARDED that target). For a packed prefix-name the FIRST token is
+always consumed as the name; only a FOLLOWING keyword lexeme ends the packed-name
+run. (2) a `prefix` / `nptv6-prefix` value is an IP that can never be a modifier
+keyword, so a FOLLOWING `mapped-port` / `routing-instance` IS a modifier carrier
+(the canonical separate-set-line `prefix mapped-port <port>` form) and registers
+no second target. The grandchild walk applies the SAME slot classification: for a
+bare hierarchical `prefix-name { POOL; mapped-port 8080; }` the FIRST grandchild
+is the opaque name (`POOL`) and a LATER modifier grandchild (`mapped-port` /
+`routing-instance`) is skipped — so the rule counts ONE target, not two. The
+round-1 grandchild walk registered EVERY grandchild of a name-valued bare keyword
+as a target, counting `POOL` and `mapped-port` as two and FALSE-REJECTING a valid
+single-target rule that origin/master accepted (the round-2 second finding).
+Counting DISTINCT identities (not occurrences) keeps the canonical "restate the
+target to attach a mapped-port" form — `then static-nat prefix-name N` + `then
+static-nat prefix-name N mapped-port 8080` — a single target (both restatements
+share identity `prefix-name\x00N`). Rejecting the multi-target rule
 outright is the Junos-faithful closure and FORECLOSES the #6479 dropped-target
 mapped-port residual as a side effect (the rule never compiles, so no
 dropped-target modifier can slip). The gate runs in `runTailGates` AFTER the

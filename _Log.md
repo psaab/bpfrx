@@ -60430,3 +60430,37 @@ top.
     (no LOC bucket shift).
 - **File(s)**: pkg/config/compiler_nat_static.go,
     pkg/config/static_nat_multitarget_6483_test.go, docs/config-schema.md, _Log.md
+
+## 2026-07-24 — #6483/#6484 round-2: static-NAT target counter packed-value + nested-modifier fold
+
+- **Timestamp**: 2026-07-24 (fix/6483-multitarget-static-nat)
+- **Action**: Fold two CONFIRMED Codex findings into the distinct-target counter
+  (staticNATCollectTargetIdentsFromKeys / staticNATCollectTargetIdents). FINDING 1
+  (packed/bracketed multi-value ESCAPE): a lexer-collapsed bracketed list `prefix
+  [ X Y ]` / `prefix-name [ A B ]` / `nptv6-prefix [ P6a P6b ]` (#2419 →
+  Keys=["prefix","X","Y"]) consumed only the FIRST value after a target keyword;
+  the rest fell through → counted 1 → escaped the >1 gate. Fix: after a target
+  keyword register EVERY packed value as a distinct (keyword,value) identity —
+  greedy value run bounded by the first keyword lexeme (new helper
+  isStaticNATKeywordLexeme); an IP value can never be a lexeme so prefix/nptv6
+  stop correctly, and a prefix-name's FIRST token is always consumed as the opaque
+  name (pool may be NAMED "mapped-port") with only later keyword lexemes ending the
+  packed-name run. FINDING 2 (nested-modifier FALSE-REJECT): a bare hierarchical
+  `prefix-name { POOL; mapped-port 8080; }` registered EVERY grandchild of the
+  name-valued keyword as a target (POOL + mapped-port = 2) → false-rejected a valid
+  single-target rule origin/master accepted. Fix: in the grandchild walk consume
+  only the FIRST grandchild of a name-valued bare keyword as the name and skip a
+  LATER modifier grandchild (mapped-port/routing-instance) — `gi == 0` guard on the
+  modifier check. Firsthand probe over the full {prefix,prefix-name,nptv6,inet} ×
+  {single-flat, single-hier, hier-nested-MP, bracketed/packed, cross-combos}
+  matrix: exactly the 4 target shapes flipped (3 bracketed 1→2 REJECT, the
+  nested-MP 2→1 ACCEPT); every invariant-B shape (restate idiom, modifier carrier,
+  inline-MP, named-mapped-port, routing-instance trailer, inet-alone, 6 cross
+  combos) unchanged. PARENT-RED: neutralize the packed loops → the 3 bracketed
+  reject tests go clean-assertion RED ("strict CompileConfig must reject a
+  multi-target static-nat rule"); neutralize the gi==0 grandchild guard → the
+  nested-modifier accept test goes RED ("declares 2 static-nat translation
+  targets"). go build ./..., go vet ./pkg/config/, gofmt, FULL pkg/config suite
+  (13s), TestHeatmapNotStale all GREEN (no LOC bucket shift).
+- **File(s)**: pkg/config/compiler_nat_static.go,
+    pkg/config/static_nat_multitarget_6483_test.go, docs/config-schema.md, _Log.md
