@@ -74,7 +74,7 @@ fn drain_latency_hist_increments_on_recorded_drain() {
     // #709: exercise the hist-update path in isolation. We do not
     // call `drain_shaped_tx` here (requires a fully-constructed
     // BindingWorker fixture); instead, we recreate the exact shape
-    // umem/mod.rs::bucket_index_for_ns uses + fetch_add — and assert
+    // binding_state/latency.rs::bucket_index_for_ns uses + fetch_add — and assert
     // the bucket landed in the right slot.
     let live = BindingLiveState::new();
     let delta_ns = 1500u64; // bucket 1 ([1024, 2048))

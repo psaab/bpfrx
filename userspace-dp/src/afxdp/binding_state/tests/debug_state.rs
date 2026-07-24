@@ -79,7 +79,7 @@ fn flush_v_min_scratches_sums_and_zeros_per_queue_counters() {
     let mut interfaces = std::collections::BTreeMap::new();
     interfaces.insert(1, runtime);
 
-    crate::afxdp::umem::flush_v_min_scratches_into(
+    crate::afxdp::binding_state::flush_v_min_scratches_into(
         interfaces.values_mut(),
         &hard_cap,
         &throttles,
@@ -160,7 +160,7 @@ fn flush_v_min_scratches_no_op_when_all_zero() {
     let mut interfaces = std::collections::BTreeMap::new();
     interfaces.insert(1, runtime);
 
-    crate::afxdp::umem::flush_v_min_scratches_into(
+    crate::afxdp::binding_state::flush_v_min_scratches_into(
         interfaces.values_mut(),
         &hard_cap,
         &throttles,
