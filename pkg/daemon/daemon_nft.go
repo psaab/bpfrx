@@ -124,6 +124,18 @@ const (
 // enforcement silently. Boot / DHCP re-applies go through applyConfig(), which
 // only logs the error, so a transient nft failure cannot brick startup; the next
 // clean commit re-renders.
+//
+// Cold-boot fail-closed fence (#6476, mirroring the host-inbound #5644 fence):
+// on COLD BOOT both nft tables are absent — there is no prior lo0 generation to
+// retain — so a failed real InstallLo0 would leave the host input path OPEN with
+// only a WARN (the boot apply only logs+discards the error), publishing host
+// services / VIP / HA-ready over an unenforced RE-protection path. When no
+// protecting xpf_lo0 table has loaded this boot (lo0Enforced false), a failed
+// install therefore installs a fail-closed fence that denies host-bound traffic
+// to firewall-local addresses (minus lifelines) instead of proceeding open. On a
+// DAY-2 failure (lo0Enforced true) the atomic replaceTable retained the prior
+// real lo0 filter, so no fence is needed — the operator's filter (not per-
+// destination-address scoped) still governs every local address.
 func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 	filterV4 := cfg.System.Lo0FilterInputV4
 	filterV6 := cfg.System.Lo0FilterInputV6
@@ -134,10 +146,19 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 		// the kernel: surface it so the commit fails closed rather than reporting that
 		// the lo0 filter was removed when it was not (#6387 PR-3: via netlink).
 		if err := nftInstaller.DeleteTable(xnft.Lo0TableName); err != nil {
+			// Teardown FAILED: a stale xpf_lo0 table (real filter OR a prior fence)
+			// may still be installed. Surface the failure (fail closed) and do NOT
+			// clear lo0Enforced — a later failed install must keep retaining rather
+			// than fence over a live table (mirrors the host-inbound #5790 teardown
+			// semantics).
 			err = tagNftInstallErr(err)
 			slog.Warn("failed to delete stale lo0 filter table", "err", err)
 			return fmt.Errorf("delete stale lo0 nftables table: %w", err)
 		}
+		// Teardown SUCCEEDED: no xpf_lo0 table is installed now. Clear the historical
+		// gate so a later enforceable generation whose first real load fails takes the
+		// cold-boot fence path rather than assuming a retained table (#5790 parity).
+		d.lo0Enforced.Store(false)
 		return nil
 	}
 
@@ -150,9 +171,71 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 	if err := nftInstaller.InstallLo0(spec); err != nil {
 		err = tagNftInstallErr(err)
 		slog.Warn("failed to apply lo0 filter", "err", err)
+		// #6476 cold-boot fail-closed fence. On cold boot no prior xpf_lo0 table
+		// exists to retain, so a failed real install here would leave the RE input
+		// path OPEN. Gate on the historical state and, when no protecting table has
+		// loaded, install a fence that denies host-bound traffic to the firewall-
+		// local addresses (minus lifelines) rendered from this snapshot. On a day-2
+		// failure (lo0Enforced true) the atomic replaceTable retained the prior real
+		// lo0 filter, which — unlike the address-scoped host-inbound table — still
+		// governs every local address, so no fence is installed.
+		if !d.lo0Enforced.Load() {
+			views := dpuserspace.BuildZoneHostInboundViews(cfg)
+			unzonedV4, unzonedV6 := dpuserspace.BuildUnzonedHostInboundAddrs(cfg)
+			wgListenPorts := cfg.WireGuardListenPorts()
+			if fenceErr := d.installLo0ColdBootFence(views, unzonedV4, unzonedV6, wgListenPorts); fenceErr != nil {
+				return errors.Join(fmt.Errorf("apply lo0 nftables filter: %w", err), fenceErr)
+			}
+		}
 		return fmt.Errorf("apply lo0 nftables filter: %w", err)
 	}
+	// A real lo0 filter is now installed. Record the historical success so a later
+	// failed install retains that exact generation and skips the cold-boot fence.
+	d.lo0Enforced.Store(true)
 	slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6)
+	return nil
+}
+
+// installLo0ColdBootFence installs the #6476 lo0 cold-boot fail-closed fence: a
+// minimal xpf_lo0 table that DENIES host-bound traffic to every firewall-local
+// address in its rendered snapshot (views + the addressed-but-unzoned set),
+// admitting only the mandatory L3 / return traffic (established/related, raw
+// ESP+AH, IPv6 ND, v4/v6 PMTUD+error, and the configured WireGuard listen
+// port(s)). It is the lo0-table analogue of installHostInboundColdBootFence and
+// shares the SAME FenceSpec + fence builder, differing only in the target table
+// (xpf_lo0 at lo0FilterPriority). It is attempted only when the real lo0 install
+// failed and lo0Enforced is false.
+//
+// Safety: the fence drops only to the SAME lifeline-excluded address sets the
+// host-inbound fence uses (fxp0/em0/fab* and their addresses are subtracted by
+// BuildZoneHostInboundViews / BuildUnzonedHostInboundAddrs), so it can never
+// strand management or break HA. It carries no named counters (a fence is
+// transient). After a successful install, lo0Enforced is set true only when this
+// snapshot contains an address-scoped DROP; a successful zero-drop shell leaves it
+// false so a later failed real invocation can retry with a better snapshot
+// (mirrors the host-inbound #5759 zero-drop retry). On failure (nft itself is
+// broken) the error is returned and joined into the commit result.
+func (d *Daemon) installLo0ColdBootFence(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) error {
+	fenceHasScopedDrop := hostInboundHasEnforceableView(views) || len(unzonedV4) > 0 || len(unzonedV6) > 0
+	spec := xnft.FenceSpec{Views: toNftViews(views), UnzonedV4: unzonedV4, UnzonedV6: unzonedV6, WGListenPorts: wgListenPorts}
+	if err := nftInstaller.InstallLo0ColdBootFence(spec); err != nil {
+		err = tagNftInstallErr(err)
+		slog.Error("COLD-BOOT FAIL-OPEN GUARD: lo0 install failed AND the fail-closed "+
+			"fence could not be installed; host-bound services may be reachable without "+
+			"the lo0 RE-protection filter until the next successful commit re-renders it",
+			"err", err)
+		return fmt.Errorf("install lo0 cold-boot fail-closed fence: %w", err)
+	}
+	if fenceHasScopedDrop {
+		d.lo0Enforced.Store(true)
+		slog.Warn("lo0 real install failed; fallback succeeded with address-scoped DROPs for its rendered snapshot",
+			"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
+			"fenced_unzoned_v6", len(unzonedV6))
+	} else {
+		slog.Warn("lo0 real install failed; fallback succeeded with zero address-scoped DROPs; lo0Enforced remains false and another fallback requires a later failed real invocation reaching lo0 while false",
+			"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
+			"fenced_unzoned_v6", len(unzonedV6))
+	}
 	return nil
 }
 
@@ -561,21 +644,45 @@ func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInb
 // on any line rejects the WHOLE payload (atomic load), retaining only the exact
 // prior generation, if one exists — exactly like the real builder.
 func buildHostInboundFencePayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) string {
-	var rules []string
-	rules = append(rules, "add table inet xpf_hostinbound")
-	rules = append(rules, "delete table inet xpf_hostinbound")
-	rules = append(rules, "table inet xpf_hostinbound {")
-	rules = append(rules, "  chain input {")
 	// Same hook/priority as the real host-inbound chain so the fence occupies the
 	// same evaluation slot (#3364).
-	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", nftHostInboundPriority))
+	return buildFenceTablePayload(xnft.HostInboundTableName, nftHostInboundPriority, views, unzonedV4, unzonedV6, wgListenPorts)
+}
+
+// buildLo0FencePayload assembles the #6476 lo0 cold-boot fail-closed fence
+// payload (see installLo0ColdBootFence). It is the SAME fence body as
+// buildHostInboundFencePayload — mandatory admits then a catch-all DROP for every
+// firewall-local address the real ruleset would scope, NO per-service accepts, NO
+// named counters — but rendered into the xpf_lo0 table at the lo0 filter priority
+// (0), the same slot the real lo0 RE-protection filter occupies, so a later
+// successful InstallLo0 atomically replaces it. It shares buildFenceTablePayload
+// with the host-inbound fence so the two fence oracles can never drift. Used by
+// the T1 parity gate to prove the netlink InstallLo0ColdBootFence is
+// bit-equivalent. Empty address inputs intentionally produce a zero-drop shell.
+func buildLo0FencePayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) string {
+	return buildFenceTablePayload(xnft.Lo0TableName, nftLo0FilterPriority, views, unzonedV4, unzonedV6, wgListenPorts)
+}
+
+// buildFenceTablePayload renders a fail-closed cold-boot fence into the named
+// inet table at the given hook-input priority: the shared mandatory admits
+// (hostInboundFenceMandatoryAdmits) then a catch-all DROP for every firewall-local
+// address the real ruleset would scope — per host-inbound-configured zone
+// (default-deny parity, #3405) and the addressed-but-unzoned set (#4420 HI-2).
+// These sets are already lifeline-excluded, so the fence never denies management /
+// cluster-control traffic. During the fence window even a `system-services all`
+// zone is denied (maximally fail-closed); the next clean commit restores the real
+// accepts. It is the single body shared by the host-inbound fence
+// (xpf_hostinbound, priority 10, #5644) and the lo0 fence (xpf_lo0, priority 0,
+// #6476) so their admit/deny posture can never diverge. Empty address inputs
+// intentionally produce a zero-drop table shell.
+func buildFenceTablePayload(tableName string, priority int, views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) string {
+	var rules []string
+	rules = append(rules, "add table inet "+tableName)
+	rules = append(rules, "delete table inet "+tableName)
+	rules = append(rules, "table inet "+tableName+" {")
+	rules = append(rules, "  chain input {")
+	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", priority))
 	rules = append(rules, hostInboundFenceMandatoryAdmits(wgListenPorts)...)
-	// Catch-all DROP for every firewall-local address the real ruleset would scope
-	// — per host-inbound-configured zone (default-deny parity, #3405) and the
-	// addressed-but-unzoned set (#4420 HI-2). These sets are already
-	// lifeline-excluded, so the fence never denies management / cluster-control
-	// traffic. During the fence window even a `system-services all` zone is denied
-	// (maximally fail-closed); the next clean commit restores the real accepts.
 	for _, v := range views {
 		if len(v.V4Addrs) > 0 {
 			rules = append(rules, "    ip daddr "+nftAddrSet(v.V4Addrs)+" drop")

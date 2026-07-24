@@ -42,6 +42,12 @@ type Installer interface {
 	// InstallColdBootFence installs the #5644 cold-boot fail-closed fence
 	// (the xpf_hostinbound table reduced to mandatory admits + address drops).
 	InstallColdBootFence(spec FenceSpec) error
+	// InstallLo0ColdBootFence installs the #6476 lo0 cold-boot fail-closed fence:
+	// the SAME fence body as InstallColdBootFence (mandatory admits + firewall-
+	// local address drops) but in the xpf_lo0 table at the lo0 filter priority, so
+	// a failed boot-time InstallLo0 does not leave the RE-protection input path
+	// open. A later successful InstallLo0 atomically replaces it (same table).
+	InstallLo0ColdBootFence(spec FenceSpec) error
 	// InstallGapFence installs the #5789 additive coverage-gap fence.
 	InstallGapFence(spec GapFenceSpec) error
 	// InstallLo0 installs the lo0 loopback input filter (#3445/#3392).
@@ -80,6 +86,19 @@ func (in *netlinkInstaller) InstallHostInbound(spec HostInboundSpec) error {
 
 func (in *netlinkInstaller) InstallColdBootFence(spec FenceSpec) error {
 	return in.replaceTable(HostInboundTableName, hostInboundPriority, func(p *nlPlan) {
+		buildHostInboundFenceNetlink(p, spec)
+	})
+}
+
+// InstallLo0ColdBootFence installs the #6476 lo0 cold-boot fence: the SAME fence
+// body as InstallColdBootFence (buildHostInboundFenceNetlink — mandatory admits
+// plus firewall-local address DROPs) but into the xpf_lo0 table at the lo0 filter
+// priority. Reusing the shared fence builder keeps the two fences bit-identical
+// in rule shape; only the table wrapper (name + priority, produced generically by
+// replaceTable) differs, so a later successful InstallLo0 atomically replaces the
+// fence with the operator's real RE-protection filter.
+func (in *netlinkInstaller) InstallLo0ColdBootFence(spec FenceSpec) error {
+	return in.replaceTable(Lo0TableName, lo0FilterPriority, func(p *nlPlan) {
 		buildHostInboundFenceNetlink(p, spec)
 	})
 }

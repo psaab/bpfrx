@@ -593,6 +593,25 @@ type Daemon struct {
 	// be covered" (cold boot).
 	hostInboundCoveredAddrs map[string]struct{}
 
+	// lo0Enforced is the process-local historical gate for the #6476 lo0
+	// cold-boot fence, mirroring hostInboundEnforced. It records whether a
+	// protecting xpf_lo0 table has ever been established this boot: a successful
+	// real InstallLo0 Stores true, and a successful address-scoped cold-boot fence
+	// (installLo0ColdBootFence) also Stores true. A successful no-filter TEARDOWN
+	// Stores false (the table is deleted, so the "a protecting table exists"
+	// premise no longer holds and a later failed install must re-fence). A teardown
+	// FAILURE (a table may still be installed) does NOT clear it. False lets a
+	// failed InstallLo0 install the cold-boot fence rather than proceed with the RE
+	// input path open; true means the atomic replaceTable retained the prior real
+	// lo0 filter on a day-2 failure (fail-closed by retention), so no fence is
+	// needed. Unlike host-inbound there is no day-2 gap fence: the operator's lo0
+	// filter is not per-destination-address scoped (its terms, including the usual
+	// catch-all discard, govern every local address), so a retained generation has
+	// no per-address coverage gap for a newly-appeared address. Production access is
+	// serialized under applySem (via applyLo0Filter); atomic.Bool matches the
+	// hostInboundEnforced type.
+	lo0Enforced atomic.Bool
+
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
 	//

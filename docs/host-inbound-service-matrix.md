@@ -501,6 +501,57 @@ coverage gap + additive gap fence (#5789),
 the program-only-then-address paths) plus the three-chain priority invariant in
 `pkg/daemon/nft_chain_priority_test.go`.
 
+### lo0 RE-protection cold-boot fence (#6476)
+
+The operator's `interfaces lo0 unit 0 family inet filter input <name>`
+(the Junos protect-RE pattern) lowers to the `inet xpf_lo0` input chain — the
+authoritative, operator-authored control-plane firewall, evaluated at hook-input
+priority 0 (strictly BEFORE the `xpf_hostinbound` backstop at 10). Before #6476
+it had the SAME cold-boot fail-open the host-inbound table closed in #5644: on a
+COLD BOOT no prior `xpf_lo0` table exists to retain, and the boot apply reaches
+`applyLo0Filter` through `applyConfig` (which only logs+discards the error), so a
+failed `InstallLo0` left the RE input path with **no** lo0 filter and only a WARN,
+while host service / VIP / HA-ready were published. Host-inbound (priority 10) may
+still gate, so exposure is partial — but any service protected ONLY via the lo0
+filter is unenforced.
+
+The fix mirrors the host-inbound cold-boot fence for the lo0 table:
+
+- `d.lo0Enforced` (a `Daemon` atomic bool) is the lo0 analogue of
+  `hostInboundEnforced`: a successful real `InstallLo0` stores true; a successful
+  address-scoped `installLo0ColdBootFence` stores true; a successful no-filter
+  TEARDOWN stores false (the `xpf_lo0` table is deleted, so a later failed install
+  must re-fence rather than assume a retained table); a teardown FAILURE does not
+  clear it. `applySem`-serialized like `hostInboundEnforced`.
+- `installLo0ColdBootFence` / `buildLo0FencePayload` (`daemon_nft.go`) build the
+  fence from the SAME lifeline-excluded firewall-local address sets
+  (`BuildZoneHostInboundViews` + `BuildUnzonedHostInboundAddrs`) and the SAME
+  `buildFenceTablePayload` body as the host-inbound cold-boot fence — mandatory L3
+  / return admits (`ct established,related`, raw ESP/AH, IPv6 ND, v4/v6
+  PMTUD+error, the configured WireGuard listen port) then a catch-all
+  `<fam> daddr <addrs> drop`, no per-service accept and no named counters — but
+  rendered into the `xpf_lo0` table at priority 0, the same slot the real lo0
+  filter occupies, so a later successful `InstallLo0` **atomically replaces** it.
+  Netlink install is `Installer.InstallLo0ColdBootFence` (T1 parity gate:
+  `lo0_cold_boot_fence`).
+- **No day-2 gap fence (the deliberate divergence from #5789).** Unlike the
+  auto-generated, per-destination-address-scoped `xpf_hostinbound` table, the
+  operator's lo0 filter is hand-authored and NOT per-destination scoped — its
+  terms (typically ending in a catch-all `discard`) govern every firewall-local
+  address, including one that appears later. So on a DAY-2 failure
+  (`lo0Enforced` true) the atomic `replaceTable` retains the prior real filter
+  and that retained generation still covers new addresses; no additive gap fence
+  is installed (or needed). The cold-boot fence alone closes the issue.
+- A zero-drop fence (an addressless boot snapshot) leaves `lo0Enforced` false so a
+  later failed real invocation can retry with an address-scoped snapshot; a
+  catastrophic double-failure (real load AND fence both fail) joins both errors,
+  fires the `COLD-BOOT FAIL-OPEN GUARD` ERROR log, and leaves `lo0Enforced` false.
+
+Fail-on-revert proof: `pkg/daemon/lo0_coldboot_fence_6476_test.go`. The
+lo0-first-then-host-inbound priority ordering (0 < 10) is pinned by
+`pkg/daemon/nft_chain_priority_test.go`; the fence's netlink/exec-nft parity by
+the `lo0_cold_boot_fence` case in `daemon_nft_netlink_parity_test.go`.
+
 ### Per-interface / per-family refinement (#3710)
 
 The zone-level signal above **collapses**: `AddresslessEnforcingZones` marks a

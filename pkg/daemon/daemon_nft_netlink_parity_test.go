@@ -92,6 +92,17 @@ func runNftNetlinkParityInner(t *testing.T) {
 		parityCheck(t, xnft.HostInboundTableName, oracle, func() error { return inst.InstallColdBootFence(spec) })
 	})
 
+	t.Run("lo0_cold_boot_fence", func(t *testing.T) {
+		// #6476: the lo0 cold-boot fence is the SAME fence body as the host-inbound
+		// fence but in the xpf_lo0 table at priority 0. It shares FenceSpec /
+		// buildFenceTablePayload with cold_boot_fence, so this case proves the
+		// xpf_lo0 table wrapper (name + priority) composes with the shared fence
+		// rules bit-identically to the netlink InstallLo0ColdBootFence.
+		oracle := buildLo0FencePayload(views, unzonedV4, unzonedV6, wg)
+		spec := xnft.FenceSpec{Views: toNftViews(views), UnzonedV4: unzonedV4, UnzonedV6: unzonedV6, WGListenPorts: wg}
+		parityCheck(t, xnft.Lo0TableName, oracle, func() error { return inst.InstallLo0ColdBootFence(spec) })
+	})
+
 	t.Run("gap_fence", func(t *testing.T) {
 		uncoveredV4 := []string{"10.0.1.1", "10.0.9.1"}
 		uncoveredV6 := []string{"2001:db8:1::1"}

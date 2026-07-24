@@ -60652,3 +60652,33 @@ top.
   vet / gofmt / pkg-ipsec-suite / heatmap GREEN.
 - **File(s)**: pkg/ipsec/policy.go,
     pkg/ipsec/swanctl_addr_sanitize_6469_test.go, pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-07-24
+- **Action**: #6476 daemon(nft) — lo0 RE-protection cold-boot fail-closed
+    fence. The `inet xpf_lo0` input filter (Junos protect-RE) had no
+    cold-boot fence: on cold boot no prior table exists to retain, and the
+    boot apply reaches `applyLo0Filter` via `applyConfig` (logs+discards the
+    error), so a failed `InstallLo0` left the RE input path OPEN with only a
+    WARN while host service/VIP/HA-ready were published (the exact fail-open
+    #5644 closed for host-inbound). Mirrored #5644 for lo0: new
+    `d.lo0Enforced` gate; on a failed `InstallLo0` while false,
+    `installLo0ColdBootFence` installs a deny-all fence scoped to the SAME
+    lifeline-excluded firewall-local address sets and SAME
+    `buildFenceTablePayload` body as the host-inbound fence, into the
+    `xpf_lo0` table at priority 0 (so a later successful `InstallLo0`
+    atomically replaces it) via new `Installer.InstallLo0ColdBootFence`. NO
+    day-2 gap fence (deliberate #5789 divergence): the operator's lo0 filter
+    is not per-destination-address scoped, so a retained generation already
+    governs new addresses. Extracted `buildFenceTablePayload` so the two
+    fence oracles share one body; added a `lo0_cold_boot_fence` T1 parity
+    case. Parent-RED confirmed firsthand — neutralize the fence install →
+    "cold-boot lo0 install failure must install exactly one fail-closed lo0
+    fence, got 0". go build / vet / gofmt / pkg-daemon + pkg-nftables suites
+    / heatmap GREEN.
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/daemon.go,
+    pkg/nftables/netlink_installer.go,
+    pkg/daemon/daemon_nft_netlink_testhelper_test.go,
+    pkg/daemon/daemon_nft_netlink_parity_test.go,
+    pkg/daemon/lo0_coldboot_fence_6476_test.go,
+    docs/host-inbound-service-matrix.md,
+    docs/refactoring-audit-current.txt, _Log.md
