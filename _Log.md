@@ -1,3 +1,32 @@
+## 2026-07-23 — #5557 (advance): host-inbound service-token case-fold in the junos-host coarse shield
+
+- **Timestamp**: 2026-07-23 (fix/5557-hostinbound-service-token-case)
+- **Action**: Case-fold host-inbound `system-services` tokens in the junos-host
+  coarse `application any` shield so it matches enforcement, which lower-cases
+  every token (unionHostInboundTokens/lowerTokens in pkg/dataplane/userspace and
+  the Rust classify_system_service). A lenient-loaded UPPER-case `IKE`/`IPSEC`/
+  `ALL`/`IDENT-RESET` full-admits on the wire, but `junosHostZoneExemptNetdevs`
+  compared the raw case (`s == "ike"`, `HostInboundFullAdmitService("ALL")`) and
+  so left CoarseAdmitsIKE/CoarseIdentResets false — the coarse shield then
+  DROPPED the very IKE/NAT-T (udp 500/4500) and ident (tcp 113) traffic the
+  host-inbound gate admits (#5557 A3 survivor; distinct from the seven #6393
+  items). The sibling protocol path in the same file already normalizes
+  (junosHostAppL4), so this closes the one un-normalized host-inbound match.
+- **Files**: pkg/config/host_inbound_tokens.go (HostInboundFullAdmitService now
+  case/space-folds — this also fixes the #3226 commit full-admit advisory
+  silently skipping an upper-case `ALL`), pkg/config/junos_host_deny.go
+  (junosHostSvcAdmitsIKE + the note() ident-reset loop lower-case each token),
+  pkg/config/junos_host_deny_case_5557_test.go (fail-on-revert).
+- **Fail-on-revert**: TestJunosHostExemptionFlagsCaseInsensitive_5557 (upper-case
+  IKE/IPsec/ALL/Any-Service set CoarseAdmitsIKE; IDENT-RESET sets
+  CoarseIdentResets; IKE scopes an IKEExemptNetdev) and
+  TestHostInboundFullAdmitServiceCaseInsensitive_5557. Neutralize by reverting
+  the three case-folds (junosHostSvcAdmitsIKE, note() loop,
+  HostInboundFullAdmitService) → both go RED via clean assertion.
+- **Validation**: build + vet + gofmt clean; go test ./pkg/config ./pkg/daemon
+  ./pkg/nftables ./pkg/dataplane/userspace green; full `go test ./...` green.
+  Revert-verified firsthand (neutralize → RED → restore → GREEN).
+
 ## 2026-07-23 — #6446: fix -race data race on configstore test log buffer
 
 - **Timestamp**: 2026-07-23 (fix/6446-configstore-race)
